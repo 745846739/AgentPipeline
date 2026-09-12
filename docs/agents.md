@@ -179,12 +179,16 @@ system = """
 ## 技术方案
 ## 涉及文件
 | 文件路径 | 改动类型 | 说明 |
+## 验收标准
+- AC-1: {可验收的完成判据}
+- AC-2: ...
 ## 风险点
 
 ## submit_metadata 字段（architect-design.execute）
 - affected_files: 涉及的源码文件路径列表
 - new_symbols: 本次新增的公开符号列表 [{name, kind, module_path, file_path}]
 - conflict_warnings: 文件/符号重叠警告
+- acceptance_criteria: [{id, description}] 验收标准清单（与 design.md「验收标准」节一一对应，决策 136；下游 test-design 的场景经 design_refs 引用、sync-check 机械校验引用完整性、review 逐条对照）
 """
 
 user = """
@@ -193,7 +197,7 @@ user = """
 """
 ```
 
-> **backtrack 重入的 blockers 注入（决策 126）：** sync-check backtrack 时把双方 blockers 写入任务目录 `backtrack-feedback.md`（与游标归档同一事务）。重入后：execute 的 user prompt 追加 `{sync_blockers}` 段（该文件内容，注明"上一轮 develop-design / test-design 认为设计不足以支撑开发/测试，请针对这些阻塞项修订设计"）；validate_input 的 user prompt 同步追加一行提示读取。首轮执行时两处均为空、不渲染。
+> **backtrack / 重规划重入的反馈注入（决策 126 / 138）：** sync-check backtrack 时把双方 blockers 写入任务目录 `backtrack-feedback.md`（与游标归档同一事务）；develop / test 的 `retry_exhausted` 经"带失败摘要回架构设计"（决策 138）重入时，系统在同一事务内把重试历史摘要写入 `retry-feedback.md`。重入后：execute 的 user prompt 追加「上游反馈」段（`backtrack-feedback.md` 与 `retry-feedback.md` 的内容，注明来源与诉求——上一轮设计不足以支撑开发/测试，或实现反复失败疑似设计问题，请针对性修订设计，含验收标准）；validate_input 的 user prompt 同步追加一行提示读取。首轮执行时两处均为空、不渲染。
 
 **validate_output：**
 
@@ -204,6 +208,7 @@ system = """
 ## 检查标准
 - 包含完整的技术方案
 - 涉及文件列表明确
+- 验收标准编号清单完整、每条可验收（决策 136）
 - 数据流和模块边界清晰
 - 风险点有对应措施
 
@@ -351,9 +356,10 @@ system = """
 - 边界条件
 - 异常流程
 - 权限/并发场景（如适用）
+- high 优先级场景必须引用 design.md 验收标准编号（design_refs，决策 136）
 
 ## submit_metadata 字段
-- test_scenarios: TestScenario[]（场景清单）
+- test_scenarios: TestScenario[]（场景清单；每项含 design_refs: 引用的验收标准 id 列表，决策 136）
 """
 
 user = """
@@ -372,6 +378,7 @@ system = """
 - 覆盖正常流程、边界条件、异常流程
 - 每个场景有清晰的前置条件、步骤、预期结果
 - 优先级分配合理
+- high 场景的 design_refs 引用的验收标准编号真实存在（决策 136；引用悬空会被 sync-check 机械校验拦下）
 
 ## 输出
 1. 读取 test-scenarios.md
@@ -421,17 +428,23 @@ user = """
 
 ```python
 system = """
-你是代码评审 agent。评审变更代码和单元测试。
+你是代码评审 agent。评审变更代码和单元测试，并对照设计文档检查实现是否符合设计。
 
 ## 输出步骤
 1. 读取变更文件和单元测试文件（通过 read_file）
-2. 执行代码评审
-3. 调用 write_file 将评审报告写入 review-report.md
-4. 调用 submit_metadata 返回元数据
+2. 读取设计文档与测试场景（路径由系统注入，决策 133；对应文件不存在时按决策 115 降级——本任务跳过该设计阶段，评审不含该维度）
+3. 执行代码评审：逐条对照设计文档的需求概述与验收标准检查实现符合性；逐个检查单元测试断言是否真实覆盖行为（防"自写自测"的弱测试，决策 133）
+4. 调用 write_file 将评审报告写入 review-report.md
+5. 调用 submit_metadata 返回元数据
 
 ## 评审报告格式（review-report.md）
 # 代码评审报告
 ## 总体评价（approved: true/false）
+## 设计符合性
+- AC-1: {符合 / 偏离：说明}
+- ...
+## 测试质量
+- {测试文件}: {断言是否真实覆盖行为，指出弱断言 / 恒真用例}
 ## 逐文件评审
 ### {file_path}
 - 问题：...
@@ -440,12 +453,14 @@ system = """
 
 ## submit_metadata 字段
 - approved: boolean
-- required_changes: FileChangeSpec[]（approved=false 时）
+- required_changes: FileChangeSpec[]（approved=false 时；允许包含设计符合性与测试质量问题）
 """
 
 user = """
 变更文件列表：{changed_files}
 单元测试文件：{unit_test_files}
+设计文档：{design_doc_path}
+测试场景文档：{test_scenarios_path}
 请逐一读取并评审。
 """
 ```
@@ -565,6 +580,8 @@ async def run_node_with_retry(stage, node_type, user_prompt, max_retries=agent_r
 
 > **伪阶段调用的心跳归属（决策 88 / 100）:** 伪阶段是在某个正式节点的执行过程中**同步**发起的第二个 LLM 调用（`conflict_check` 在 `architect-design.execute` 内，决策 60/67）。它的流式 token、工具活动必须计入**父节点的心跳**——写入同一条 `kanban_node_runs` 的 `last_activity_at`，使用同一 `process_group_id`。否则 `node_idle_timeout_sec`（默认 300s）会在比对期间把 architect-design.execute 误判为超时并杀掉。同时给 `conflict_check` 设一个较短的阶段级 `max_duration_sec`，避免它把父节点拖到 `node_max_duration_sec` 上限。**但观测上伪阶段有自己独立的 run 行与会话行**（`agent_type = "pseudo:conflict_check"`，`parent_run_id` 指向父 run，`cursor_id` 继承父游标），因此用户能看到它为什么判定 `duplicate_risk`；计量不重复计入——`kanban_tasks.total_tokens` = 所有 run 行求和，父 run 的 `prompt_tokens` **不含**子行。
 
+> **复判伪阶段的心跳归属（决策 134）：** `validator_cross_check` 在 agent 型 validate_output 节点内**同步**发起（首判不合格时），与 conflict_check 同模式：流式 token 与工具活动计入父节点心跳（同一 `kanban_node_runs.last_activity_at` 与 `process_group_id`），观测上有独立 run / 会话行（`agent_type = "pseudo:validator_cross_check"`，`parent_run_id` 指向 validate_output 的 run，`cursor_id` 继承父游标），用户可对照查看首判与复判两侧结论；其失败视为父节点失败，不触发独立节点级重试。
+
 > **系统命令也要刷新心跳（决策 100）：** merge 阶段的合入闸门要跑单元 + 集成测试，最长可到 `test_command_timeout_sec`（默认 600s），超过 `node_idle_timeout_sec`（默认 300s）。因此 `run_recorded_command`（§12.4.4）在命令**开始与结束**时都要刷新所属 run 的 `last_activity_at`，长命令执行期间也按输出行周期刷新。否则闸门会被空闲超时误判。
 
 **对话历史对比：**
@@ -602,12 +619,14 @@ async def run_node_with_retry(stage, node_type, user_prompt, max_retries=agent_r
 │   └── analyze.md
 ├── conflict_check/             # 伪阶段：语义冲突比对（决策 67）
 │   └── compare.md
+├── validator_cross_check/      # 伪阶段：validate_output 异族复判（决策 134）
+│   └── judge.md
 └── common/
     ├── tool_usage.md
     └── format_rules.md
 ```
 
-> **伪阶段说明：** `project_analysis` 与 `conflict_check` 不进入 kanban 图，没有 StageIO / checkpoint / pending，仅复用阶段配置机制（provider / model / prompt / 白名单校验）。
+> **伪阶段说明：** `project_analysis`、`conflict_check` 与 `validator_cross_check` 不进入 kanban 图，没有 StageIO / checkpoint / pending，仅复用阶段配置机制（provider / model / prompt / 白名单校验）。
 
 ### 10.6 阶段级 Agent 配置
 
@@ -733,7 +752,7 @@ interface StageAgentConfig {
 | tools | `基线 mandatory_tools ∪ 阶段 tools − forbidden_tools` | 不能移除 mandatory_tools |
 | skills | `基线 mandatory_skills ∪ 阶段 skills` | 不能移除 mandatory_skills；引用的 skill 必须存在，否则 fail fast |
 
-**校验时机：** 启动时（配置加载）一次性校验所有**注册阶段**的阶段配置，**fail fast**——发现违规配置直接拒绝启动并报错，不允许运行时才暴露。伪阶段（`project_analysis` / `conflict_check`）按各自要求单独校验（决策 87）：`project_analysis` 的 persona **允许为空**（省略时只输出确定性探测的事实清单，决策 78）；`conflict_check` 必须做语义比对，persona **强制存在且非空**。其余校验（厂商适配器支持、工具并集、超时覆盖）与正式阶段完全一致。
+**校验时机：** 启动时（配置加载）一次性校验所有**注册阶段**的阶段配置，**fail fast**——发现违规配置直接拒绝启动并报错，不允许运行时才暴露。伪阶段（`project_analysis` / `conflict_check` / `validator_cross_check`）按各自要求单独校验（决策 87 / 134）：`project_analysis` 的 persona **允许为空**（省略时只输出确定性探测的事实清单，决策 78）；`conflict_check` 必须做语义比对，persona **强制存在且非空**；`validator_cross_check` persona 同样**强制存在且非空**，且 `cross_family_judge = true` 时必须已配置 provider，否则配置加载 fail fast。其余校验（厂商适配器支持、工具并集、超时覆盖）与正式阶段完全一致。
 
 **DB 中不受支持的 provider 行（决策 103）：** 启动时遍历 `providers` 表，若某行的厂商 ∉ `supported_adapters`（例如升级后适配器被移除，或手工改库），**不崩溃**——把该行 `enabled` 置 0 并在 UI 告警；只有当某个 `stage_configs` 仍引用它时，配置加载才 fail fast，报"不支持的厂商，需代码适配"。这是**非对称处理**：坏数据降级、被引用的坏数据拒绝启动。
 
@@ -767,7 +786,7 @@ def validate_stage_config(cfg: StageAgentConfig, baseline: SystemBaseline, provi
 
 [server]
 host = "127.0.0.1"
-port = 3847
+port = 8787
 
 [pipeline]
 validate_retry_max = 3
@@ -779,33 +798,36 @@ tool_timeout_sec = 60
 test_command_timeout_sec = 600
 max_concurrent_tasks = 5
 semantic_conflict_check = true
+cross_family_judge = false
 allow_dirty_worktree_merge = false
 
 [logging]
 level = "info"
 format = "pretty"
 file = "~/.agentpipeline/logs/agentpipeline.log"
+# v1 未实现（executor 阶段落地），当前仅 level 生效
 
 [prompts]
 dir = "~/.agentpipeline/prompts"
 ```
 
-**阶段级 Agent 配置**存储在 SQLite 数据库中，通过前端界面配置。每个阶段可独立设置 provider（引用 `providers` 表的 `provider_id`）、tools、skills、超时覆盖。系统最小基线（mandatory_tools、mandatory_skills、`file_tool_policy`）在代码中硬编码，不可覆盖。模型上下文窗口随 `providers` 表的一行存在一起（决策 46 / 111）——**阶段不单独存 model**，换模型即换 `provider_id`，这样 L0 容量预估（§12.13.3）查找窗口大小的路径唯一。
+**阶段级 Agent 配置**存储在 SQLite 数据库中，通过前端界面配置。每个阶段可独立设置 provider（引用 `providers` 表的 `provider_id`）、tools、skills、超时覆盖。系统最小基线（mandatory_tools、mandatory_skills、`file_tool_policy`）在代码中硬编码，不可覆盖。模型上下文窗口随 `providers` 表的一行存在一起（决策 46 / 111）——**阶段不单独存 model**，换模型即换 `provider_id`，这样 L0 容量预估（§12.13.3）查找窗口大小的路径唯一。伪阶段（`project_analysis` / `conflict_check` / `validator_cross_check`）复用同一配置机制（决策 67 / 87 / 134）；`cross_family_judge = true` 时 `validator_cross_check` 必须已配置 provider，否则配置加载 fail fast。
 
 **首启引导：** 未配置任何 provider / API key 时，创建任务返回明确错误（提示先配置 provider），不使用隐式默认模型（决策 56）。
 
 #### 10.6.6 模型分级策略
 
-validate 节点是**判断型任务**（读产出 → 返回 readiness + blockers），不需要强模型；execute 节点是**生成型任务**，需要强模型。
+validate 节点是**判断型任务**（读产出 → 返回 readiness + blockers），execute 节点是**生成型任务**，需要强模型。**校验比生成更难做对**：生成错了会被拦下重试，校验漏检就是静默放行、错误流向下游（决策 134 的动机）——因此校验档位不应低于生成档位，且**推荐与同阶段 execute 使用不同 vendor** 的模型，避免同源偏差（self-preference bias：judge 偏爱自己风格的产出）。
 
 | 节点类型 | 推荐模型档位 | 理由 |
 |---|---|---|
-| validate_input / validate_output（agent 型） | 快速/便宜模型 | 判断题，输出短 |
+| validate_input / validate_output（agent 型） | 与同阶段 execute **不同 vendor** 的模型，档位同级或更高（决策 134） | 判断题输出短，但漏检代价是错误放大；异族配置消同源偏差 |
 | execute（architect / develop / test） | 强模型 | 生成质量直接决定产出质量 |
 | review.execute | 强模型 | 需要发现深层问题 |
+| validator_cross_check（伪阶段，决策 134） | 强档（与 review.execute 同级） | 复判是裁决性判断，全流程最难的判断之一 |
 | sync-check | 不调 LLM | 纯代码逻辑 |
 | develop / test 的 validate_output | 不调 LLM | 纯代码执行测试 + 路由（决策 62） |
-| project_analysis / conflict_check（伪阶段） | 便宜模型（validate 档位）（决策 67） | 结构化分析，不需要强生成能力 |
+| project_analysis / conflict_check（伪阶段） | 便宜模型（决策 67） | 结构化分析，不需要强生成能力 |
 
 **注意：** 换模型会改变 prompt cache 的命中（不同模型缓存独立），节点级覆盖时应保持同一节点的模型稳定，不要在同一节点的多次重试间切换模型。
 

@@ -1,0 +1,916 @@
+//! 任务端点（§11.7；决策 27 / 35 / 49 / 56 / 91 / 98 / 101 / 105 / 116 / 119 / 125 / 129）。
+
+use agentpipeline_core::actions::allowed_actions;
+use agentpipeline_core::agent::tools::{CommandFinish, CommandRecorder, CommandStart};
+use agentpipeline_core::git::Git;
+use agentpipeline_core::storage::decisions::{MergeDecision, ResumeAction};
+use agentpipeline_core::storage::tasks::{NewTask, TaskFilter};
+use agentpipeline_core::types::{
+    CommandSource, Node, NodeCursor, PendingKind, ReviewMode, Stage, TaskStatus,
+};
+use axum::extract::{Path, Query, State};
+use axum::http::StatusCode;
+use axum::response::sse::{Event, Sse};
+use axum::response::IntoResponse;
+use axum::Json;
+use futures::StreamExt;
+use serde::Deserialize;
+use serde_json::json;
+
+use crate::state::{map_core_error, ApiError, ApiResult, AppState};
+
+fn cursors_json(cursors: &[NodeCursor]) -> Vec<serde_json::Value> {
+    cursors
+        .iter()
+        .map(|c| {
+            json!({
+                "cursor_id": c.cursor_id,
+                "branch": c.branch,
+                "stage": c.stage,
+                "node": c.node,
+                "status": c.status,
+                "validate_attempts": c.validate_attempts,
+                "skipped_to_join": c.skipped_to_join,
+                "pending_reason": c.pending_reason,
+            })
+        })
+        .collect()
+}
+
+// ─────────────────────────────── 创建 / 列表 / 详情 ───────────────────────────────
+
+#[derive(Debug, Deserialize)]
+pub struct CreateTaskBody {
+    pub project_id: String,
+    pub title: String,
+    #[serde(default)]
+    pub description: String,
+    #[serde(default)]
+    pub depends_on: Vec<String>,
+    #[serde(default)]
+    pub review_mode: Option<String>,
+    #[serde(default)]
+    pub model_override: Option<String>,
+}
+
+/// `POST /tasks`：一律以 `queued`（有依赖则 `waiting`）落库（决策 98）。
+pub async fn create(
+    State(state): State<AppState>,
+    Json(body): Json<CreateTaskBody>,
+) -> ApiResult<impl IntoResponse> {
+    if state
+        .store
+        .get_project(&body.project_id)
+        .await
+        .map_err(map_core_error)?
+        .is_none()
+    {
+        return Err(ApiError::bad_request(format!(
+            "项目不存在：{}",
+            body.project_id
+        )));
+    }
+
+    // 未配置 provider 时创建任务返回明确错误（决策 56）
+    let providers = state.store.load_providers().await.map_err(map_core_error)?;
+    if !providers.iter().any(|p| p.enabled) {
+        return Err(ApiError::bad_request(
+            "尚未配置任何可用的 provider，请先在设置中添加（决策 56）",
+        ));
+    }
+
+    // 循环依赖检测（决策 27）
+    let task_id = ulid::Ulid::new().to_string();
+    if state
+        .store
+        .would_create_cycle(&task_id, &body.depends_on)
+        .await
+        .map_err(map_core_error)?
+    {
+        return Err(ApiError::bad_request(
+            "依赖关系构成环路，拒绝创建（决策 27）",
+        ));
+    }
+    for dep in &body.depends_on {
+        if state.store.get_task(dep).await.is_err() {
+            return Err(ApiError::bad_request(format!("依赖任务不存在：{dep}")));
+        }
+    }
+
+    let mut new_task = NewTask::new(task_id.clone(), body.title, body.project_id);
+    new_task.description = body.description;
+    new_task.depends_on = body.depends_on;
+    new_task.review_mode = match body.review_mode.as_deref() {
+        Some("human") => ReviewMode::Human,
+        _ => ReviewMode::Agent,
+    };
+    new_task.model_override = body.model_override;
+
+    let task = state
+        .store
+        .create_task(&new_task)
+        .await
+        .map_err(map_core_error)?;
+    Ok((StatusCode::CREATED, Json(json!({ "task": task }))))
+}
+
+#[derive(Debug, Deserialize)]
+pub struct TaskQuery {
+    pub project_id: Option<String>,
+    pub status: Option<String>,
+    #[serde(default)]
+    pub include_archived: bool,
+}
+
+/// `GET /tasks`：看板唯一数据源，每条带分支级摘要（决策 101）。
+pub async fn list(
+    State(state): State<AppState>,
+    Query(query): Query<TaskQuery>,
+) -> ApiResult<impl IntoResponse> {
+    let filter = TaskFilter {
+        project_id: query.project_id,
+        status: match query.status.as_deref() {
+            Some(s) => Some(
+                s.parse::<TaskStatus>()
+                    .map_err(|e| ApiError::bad_request(e.to_string()))?,
+            ),
+            None => None,
+        },
+        include_archived: query.include_archived,
+    };
+    let tasks = state
+        .store
+        .list_tasks(&filter)
+        .await
+        .map_err(map_core_error)?;
+
+    let mut out = Vec::new();
+    for task in tasks {
+        let cursors = state
+            .store
+            .load_live_cursors(&task.id)
+            .await
+            .map_err(map_core_error)?;
+        let mut value =
+            serde_json::to_value(&task).map_err(|e| ApiError::internal(e.to_string()))?;
+        value["branches"] = json!(cursors_json(&cursors));
+        value["blocks"] = json!(state
+            .store
+            .dependents_of(&task.id)
+            .await
+            .map_err(map_core_error)?);
+        out.push(value);
+    }
+    Ok(Json(json!({ "tasks": out })))
+}
+
+/// `GET /tasks/{id}`：状态 + 游标 + `allowed_actions`（决策 49 / 76）。
+pub async fn detail(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+) -> ApiResult<impl IntoResponse> {
+    let task = state.store.get_task(&id).await.map_err(map_core_error)?;
+    let cursors = state
+        .store
+        .load_live_cursors(&id)
+        .await
+        .map_err(map_core_error)?;
+    let actions = state
+        .store
+        .allowed_actions_for_task(&id)
+        .await
+        .map_err(map_core_error)?;
+    let depends_on = state
+        .store
+        .dependencies_of(&id)
+        .await
+        .map_err(map_core_error)?;
+
+    let blocks = state
+        .store
+        .dependents_of(&id)
+        .await
+        .map_err(map_core_error)?;
+
+    Ok(Json(json!({
+        "task": task,
+        "cursors": cursors_json(&cursors),
+        "allowed_actions": actions,
+        "depends_on": depends_on,
+        "blocks": blocks,
+    })))
+}
+
+// ─────────────────────────────── resume（决策 91 / 49 / §3）───────────────────────────────
+
+#[derive(Debug, Deserialize)]
+pub struct ResumeBody {
+    pub action: String,
+    #[serde(default)]
+    pub cursor_id: Option<String>,
+    #[serde(default)]
+    pub target_stage: Option<String>,
+    #[serde(default)]
+    pub target_node: Option<String>,
+    #[serde(default)]
+    pub input: Option<String>,
+}
+
+/// `POST /tasks/{id}/resume`
+pub async fn resume(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    Json(body): Json<ResumeBody>,
+) -> ApiResult<impl IntoResponse> {
+    let _task = state.store.get_task(&id).await.map_err(map_core_error)?;
+
+    // 游标解析（决策 91）：恰好一条可省略；多条缺失 → 409
+    let cursor = match body.cursor_id.as_deref() {
+        Some(cursor_id) => state
+            .store
+            .get_cursor(cursor_id)
+            .await
+            .map_err(map_core_error)?,
+        None => state
+            .store
+            .resolve_sole_cursor(&id)
+            .await
+            .map_err(map_core_error)?
+            .ok_or_else(|| {
+                ApiError::conflict("该任务有多条活跃游标，必须显式提供 cursor_id（决策 91）")
+            })?,
+    };
+    if cursor.task_id != id {
+        return Err(ApiError::bad_request("cursor_id 不属于该任务"));
+    }
+
+    let action = ResumeAction::parse(&body.action).map_err(map_core_error)?;
+
+    // 动作必须在当前 pending 的允许集合内（决策 49）
+    if let Some(reason) = &cursor.pending_reason {
+        if !agentpipeline_core::actions::is_action_allowed(reason, &body.action) {
+            return Err(ApiError::bad_request(format!(
+                "动作 {} 不在当前 pending 的允许集合内",
+                body.action
+            )));
+        }
+    }
+
+    let target = match (body.target_stage.as_deref(), body.target_node.as_deref()) {
+        (Some(stage), Some(node)) => Some((
+            stage.parse::<Stage>().map_err(map_core_error)?,
+            node.parse().map_err(map_core_error)?,
+        )),
+        _ => None,
+    };
+
+    // `pending_resume_cooldown_sec` 防连点（§3）：必须**在写入本次 user_resume 流水之前**
+    // 判定，否则刚写入的这条会让间隔恒为 0，第一次 resume 就被误判为连点。
+    let cooldown = state.settings.pending_resume_cooldown_sec as i64;
+    let since_last = state
+        .store
+        .seconds_since_last_user_resume(&id)
+        .await
+        .map_err(map_core_error)?;
+    let within_cooldown = matches!(since_last, Some(secs) if secs < cooldown);
+
+    state
+        .store
+        .apply_resume(&cursor, action, target, body.input.as_deref())
+        .await
+        .map_err(map_core_error)?;
+
+    // 决策 130⑤：dependency_failed 的 continue = 清 pending + 置回 queued 交还**准入**，
+    // 不直接 spawn executor（避免绕过 max_concurrent_tasks）。
+    let dependency_continue = action == ResumeAction::Continue
+        && cursor
+            .pending_reason
+            .as_ref()
+            .is_some_and(|r| r.kind == PendingKind::DependencyFailed);
+
+    let mut spawned = false;
+    if !within_cooldown && !dependency_continue {
+        (state.resume_hook)(&id);
+        spawned = true;
+    }
+
+    Ok(Json(json!({
+        "ok": true,
+        "action": action.as_str(),
+        "cursor_id": cursor.cursor_id,
+        "spawned": spawned,
+    })))
+}
+
+// ─────────────────────────────── 旁路动作 ───────────────────────────────
+
+/// `POST /tasks/{id}/retry`（决策 125 / 117）
+pub async fn retry(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+) -> ApiResult<impl IntoResponse> {
+    let task = state.store.get_task(&id).await.map_err(map_core_error)?;
+    if !task.status.is_terminal() {
+        return Err(ApiError::bad_request(
+            "只有终态任务可以重试（决策 70 / 125）",
+        ));
+    }
+    // 决策 125：worktree 里留有半成品，而 init.execute 的幂等策略是"已存在则复用"，
+    // 不会清场——retry 必须显式 `git reset --hard {base_ref}` + `git clean -fdx`
+    //（记 system 命令，run_id 可空，决策 99）。worktree 不存在则跳过（幂等）。
+    if let Some(worktree) = task.worktree_path.clone() {
+        let project = state
+            .store
+            .get_project(&task.project_id)
+            .await
+            .map_err(map_core_error)?
+            .ok_or_else(|| ApiError::internal(format!("任务 {} 的项目不存在", task.project_id)))?;
+        let wt = std::path::Path::new(&worktree);
+        if wt.exists() {
+            let base_ref = Git
+                .base_ref(
+                    std::path::Path::new(&project.local_path),
+                    &project.default_branch,
+                )
+                .await
+                .map_err(map_core_error)?;
+            let cmd_id = state
+                .store
+                .record_start(CommandStart {
+                    task_id: id.clone(),
+                    run_id: None,
+                    stage: Stage::Init,
+                    node: Node::Execute,
+                    source: CommandSource::System,
+                    command: format!("git reset --hard {base_ref} && git clean -fdx"),
+                    cwd: worktree.clone(),
+                })
+                .await
+                .map_err(map_core_error)?;
+            let outcome = Git.reset_hard_clean(wt, &base_ref).await;
+            let finish = match &outcome {
+                Ok(()) => CommandFinish {
+                    exit_code: Some(0),
+                    ..Default::default()
+                },
+                Err(e) => CommandFinish {
+                    exit_code: Some(1),
+                    stderr_preview: Some(e.to_string()),
+                    ..Default::default()
+                },
+            };
+            state
+                .store
+                .record_finish(cmd_id, finish)
+                .await
+                .map_err(map_core_error)?;
+            outcome.map_err(|e| ApiError::internal(format!("worktree 重置失败：{e}")))?;
+        }
+    }
+    state
+        .store
+        .reset_cursors_to_init(&id)
+        .await
+        .map_err(map_core_error)?;
+    // 置回 queued 重新走准入（决策 117）
+    state
+        .store
+        .set_task_status(&id, TaskStatus::Queued)
+        .await
+        .map_err(map_core_error)?;
+    state
+        .store
+        .insert_transition(
+            &id,
+            NodeCursor::BRANCH_MAIN,
+            None,
+            (Stage::Init, agentpipeline_core::types::Node::Execute),
+            agentpipeline_core::types::TransitionTrigger::UserResume,
+            Some("用户重试"),
+        )
+        .await
+        .map_err(map_core_error)?;
+    Ok(Json(json!({ "ok": true, "status": "queued" })))
+}
+
+/// 决策 3 / §12.1：任务终态后回收 worktree 与分支。
+///
+/// 幂等——§12.1"worktree 已不存在时跳过删除，不报错"；清理失败只告警，
+/// 不改变已落定的终态。
+async fn cleanup_worktree_and_branch(state: &AppState, task_id: &str) {
+    let Ok(task) = state.store.get_task(task_id).await else {
+        return;
+    };
+    let Some(worktree) = task.worktree_path else {
+        return;
+    };
+    let Ok(project) = state.store.get_project(&task.project_id).await else {
+        return;
+    };
+    let Some(project) = project else { return };
+    let repo = std::path::Path::new(&project.local_path);
+    let wt = std::path::Path::new(&worktree);
+    if wt.exists() {
+        if let Err(e) = Git.remove_worktree(repo, wt, true).await {
+            tracing::warn!(task = task_id, error = %e, "worktree 清理失败");
+        }
+    }
+    let branch = agentpipeline_core::git::branch_name(task_id);
+    if let Err(e) = Git.delete_branch(repo, &branch).await {
+        tracing::warn!(task = task_id, error = %e, "分支清理失败");
+    }
+}
+
+/// `POST /tasks/{id}/cancel`
+pub async fn cancel(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+) -> ApiResult<impl IntoResponse> {
+    let notified = state.store.cancel_task(&id).await.map_err(map_core_error)?;
+    // §12.1 取消流程 ③④：强制清理 worktree 与分支
+    cleanup_worktree_and_branch(&state, &id).await;
+    // 通知依赖任务（§12.3）
+    for dependent in &notified {
+        state
+            .sse
+            .publish(agentpipeline_core::sse::SseEvent::Pending {
+                task_id: dependent.clone(),
+                branch: NodeCursor::BRANCH_MAIN.to_string(),
+                cursor_id: grouped_cursor(&state, dependent).await?,
+                reason: agentpipeline_core::types::PendingReason::new(
+                    agentpipeline_core::types::PendingKind::DependencyFailed,
+                    Stage::Init,
+                    agentpipeline_core::types::Node::Execute,
+                    format!("依赖任务 {id} 已取消"),
+                ),
+            });
+    }
+    state
+        .sse
+        .publish(agentpipeline_core::sse::SseEvent::TaskCancelled {
+            task_id: id.clone(),
+            branch: NodeCursor::BRANCH_MAIN.to_string(),
+        });
+    Ok(Json(json!({ "ok": true, "notified": notified })))
+}
+
+async fn grouped_cursor(state: &AppState, task_id: &str) -> ApiResult<String> {
+    Ok(state
+        .store
+        .load_live_cursors(task_id)
+        .await
+        .map_err(map_core_error)?
+        .first()
+        .map(|c| c.cursor_id.clone())
+        .unwrap_or_default())
+}
+
+/// `POST /tasks/{id}/archive`：软删除（决策 34）。
+pub async fn archive(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+) -> ApiResult<impl IntoResponse> {
+    let task = state.store.get_task(&id).await.map_err(map_core_error)?;
+    if !task.status.is_terminal() {
+        return Err(ApiError::bad_request("只有终态任务可以归档（决策 34）"));
+    }
+    // git.rs 的回收策略（决策 3）：取消 / 归档同样清理 worktree 与分支
+    cleanup_worktree_and_branch(&state, &id).await;
+    state
+        .store
+        .archive_task(&id)
+        .await
+        .map_err(map_core_error)?;
+    Ok(Json(json!({ "ok": true })))
+}
+
+#[derive(Debug, Deserialize)]
+pub struct SplitBody {
+    pub tasks: Vec<SplitTask>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct SplitTask {
+    pub title: String,
+    #[serde(default)]
+    pub description: String,
+    #[serde(default)]
+    pub depends_on: Vec<String>,
+}
+
+/// `POST /tasks/{id}/split`（决策 105）：按用户给定方案创建 N 个新任务 + 原任务置 cancelled。
+pub async fn split(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    Json(body): Json<SplitBody>,
+) -> ApiResult<impl IntoResponse> {
+    let original = state.store.get_task(&id).await.map_err(map_core_error)?;
+    if body.tasks.is_empty() {
+        return Err(ApiError::bad_request("split 至少需要一个新任务"));
+    }
+    let mut created = Vec::new();
+    for spec in body.tasks {
+        let new_id = ulid::Ulid::new().to_string();
+        if state
+            .store
+            .would_create_cycle(&new_id, &spec.depends_on)
+            .await
+            .map_err(map_core_error)?
+        {
+            return Err(ApiError::bad_request("拆分子任务的依赖构成环路"));
+        }
+        let mut new_task = NewTask::new(new_id.clone(), spec.title, original.project_id.clone());
+        new_task.description = spec.description;
+        new_task.depends_on = spec.depends_on;
+        new_task.review_mode = original.review_mode;
+        let task = state
+            .store
+            .create_task(&new_task)
+            .await
+            .map_err(map_core_error)?;
+        created.push(task.id);
+    }
+    state
+        .store
+        .mark_terminal(&id, TaskStatus::Cancelled)
+        .await
+        .map_err(map_core_error)?;
+    Ok(Json(json!({ "ok": true, "created": created })))
+}
+
+#[derive(Debug, Deserialize)]
+pub struct ModelOverrideBody {
+    pub provider_id: String,
+}
+
+/// `POST /tasks/{id}/model-override`（决策 105 / 129）：只影响本任务，过白名单校验。
+pub async fn model_override(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    Json(body): Json<ModelOverrideBody>,
+) -> ApiResult<impl IntoResponse> {
+    let provider = state
+        .store
+        .get_provider(&body.provider_id)
+        .await
+        .map_err(map_core_error)?
+        .ok_or_else(|| ApiError::bad_request("provider 不存在"))?;
+    if !provider.enabled {
+        return Err(ApiError::bad_request("provider 已被禁用"));
+    }
+    if !agentpipeline_core::config::SUPPORTED_ADAPTERS.contains(&provider.vendor.as_str()) {
+        return Err(ApiError::bad_request(format!(
+            "不支持的 vendor：{}",
+            provider.vendor
+        )));
+    }
+    state
+        .store
+        .set_task_model_override(&id, Some(&body.provider_id))
+        .await
+        .map_err(map_core_error)?;
+    Ok(Json(
+        json!({ "ok": true, "model_override": body.provider_id }),
+    ))
+}
+
+#[derive(Debug, Deserialize)]
+pub struct ReviewBody {
+    pub approved: bool,
+    /// 用户评论：打回时随流转原因带给 develop（§12.5 "rejected → develop.execute（带用户评论）"）。
+    #[serde(default)]
+    pub comments: Option<String>,
+}
+
+/// `POST /tasks/{id}/review`（决策 2 / 124）：human 模式 approve → test / reject → develop。
+pub async fn review(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    Json(body): Json<ReviewBody>,
+) -> ApiResult<impl IntoResponse> {
+    let task = state.store.get_task(&id).await.map_err(map_core_error)?;
+    if task.review_mode != ReviewMode::Human {
+        return Err(ApiError::bad_request(
+            "该任务不是人工评审模式（review_mode = agent）",
+        ));
+    }
+    let cursor = state
+        .store
+        .apply_human_review(&id, body.approved, body.comments.as_deref())
+        .await
+        .map_err(map_core_error)?;
+    (state.resume_hook)(&id);
+    Ok(Json(json!({
+        "ok": true,
+        "approved": body.approved,
+        "stage": cursor.stage,
+        "node": cursor.node,
+    })))
+}
+
+#[derive(Debug, Deserialize)]
+pub struct MergeDecisionBody {
+    pub decision: String,
+}
+
+/// `POST /tasks/{id}/merge/decision`（决策 119）：单事务写 approval + 清 pending + 置游标。
+pub async fn merge_decision(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    Json(body): Json<MergeDecisionBody>,
+) -> ApiResult<impl IntoResponse> {
+    let decision = MergeDecision::parse(&body.decision).map_err(map_core_error)?;
+    let cursor = state
+        .store
+        .apply_merge_decision(&id, decision)
+        .await
+        .map_err(map_core_error)?;
+    (state.resume_hook)(&id);
+    Ok(Json(json!({
+        "ok": true,
+        "decision": body.decision,
+        "cursor": {
+            "cursor_id": cursor.cursor_id,
+            "stage": cursor.stage,
+            "node": cursor.node,
+        }
+    })))
+}
+
+// ─────────────────────────────── 只读视图 ───────────────────────────────
+
+/// `GET /tasks/{id}/stream`：**唯一** SSE 通道（决策 76）。
+pub async fn stream(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+) -> ApiResult<Sse<impl futures::Stream<Item = Result<Event, std::convert::Infallible>>>> {
+    let _task = state.store.get_task(&id).await.map_err(map_core_error)?;
+    let receiver = state.sse.subscribe();
+    let stream = tokio_stream::wrappers::BroadcastStream::new(receiver).filter_map(move |item| {
+        let task_id = id.clone();
+        async move {
+            match item {
+                Ok(event) if event.task_id() == task_id => {
+                    Some(Ok(Event::default().event("message").data(event.to_json())))
+                }
+                _ => None,
+            }
+        }
+    });
+    Ok(Sse::new(stream))
+}
+
+/// `GET /tasks/{id}/flow`：流转时间线（历史查询，决策 76）。
+pub async fn flow(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+) -> ApiResult<impl IntoResponse> {
+    let transitions = state
+        .store
+        .list_transitions(&id)
+        .await
+        .map_err(map_core_error)?;
+    let cursors = state
+        .store
+        .load_live_cursors(&id)
+        .await
+        .map_err(map_core_error)?;
+    Ok(Json(json!({
+        "transitions": transitions,
+        "cursors": cursors_json(&cursors),
+    })))
+}
+
+/// `GET /tasks/{id}/metrics`：token 汇总 + 阶段聚合（决策 130 ②）。
+pub async fn metrics(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+) -> ApiResult<impl IntoResponse> {
+    let task = state.store.get_task(&id).await.map_err(map_core_error)?;
+    let runs = state.store.list_runs(&id).await.map_err(map_core_error)?;
+    Ok(Json(json!({
+        "total_tokens": agentpipeline_core::metrics::total_tokens(&runs),
+        "total_calls": agentpipeline_core::metrics::total_calls(&runs),
+        "stored_total_tokens": task.total_tokens,
+        "stored_total_calls": task.total_calls,
+        "stages": agentpipeline_core::metrics::stage_metrics(&runs)
+            .into_iter()
+            .map(|m| json!({
+                "stage": m.stage,
+                "total_runs": m.total_runs,
+                "avg_duration_ms": m.avg_duration_ms,
+                "retry_rate": m.retry_rate,
+            }))
+            .collect::<Vec<_>>(),
+        "validate_first_pass_rate": agentpipeline_core::metrics::validate_first_pass_rate(&runs),
+    })))
+}
+
+/// `GET /metrics`：全局统计。
+pub async fn global_metrics(State(state): State<AppState>) -> ApiResult<impl IntoResponse> {
+    let tasks = state
+        .store
+        .list_tasks(&TaskFilter {
+            include_archived: true,
+            ..Default::default()
+        })
+        .await
+        .map_err(map_core_error)?;
+    let statuses: Vec<TaskStatus> = tasks.iter().map(|t| t.status).collect();
+    let aggregation = state
+        .store
+        .stage_aggregation()
+        .await
+        .map_err(map_core_error)?;
+    Ok(Json(json!({
+        "tasks": tasks.len(),
+        "success_rate": agentpipeline_core::metrics::success_rate(&statuses),
+        "stage_aggregation": aggregation
+            .into_iter()
+            .map(|(stage, avg_duration, retry_rate, total)| json!({
+                "stage": stage,
+                "avg_duration_ms": avg_duration,
+                "retry_rate": retry_rate,
+                "total_runs": total,
+            }))
+            .collect::<Vec<_>>(),
+        "escape_events": state
+            .store
+            .escape_events_by_stage()
+            .await
+            .map_err(map_core_error)?,
+    })))
+}
+
+/// `GET /tasks/{id}/conversations`
+pub async fn conversations(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+) -> ApiResult<impl IntoResponse> {
+    let conversations = state
+        .store
+        .list_conversations(&id)
+        .await
+        .map_err(map_core_error)?;
+    // 列表只给摘要（§12.4.3）
+    let summaries: Vec<serde_json::Value> = conversations
+        .into_iter()
+        .map(|c| {
+            json!({
+                "run_id": c.run_id,
+                "stage": c.stage,
+                "node": c.node,
+                "attempt": c.attempt,
+                "agent_type": c.agent_type,
+                "parent_run_id": c.parent_run_id,
+                "prompt_tokens": c.prompt_tokens,
+                "completion_tokens": c.completion_tokens,
+            })
+        })
+        .collect();
+    Ok(Json(json!({ "conversations": summaries })))
+}
+
+/// `GET /tasks/{id}/conversations/{run_id}`
+pub async fn conversation(
+    State(state): State<AppState>,
+    Path((id, run_id)): Path<(String, i64)>,
+) -> ApiResult<impl IntoResponse> {
+    state
+        .store
+        .get_conversation(&id, run_id)
+        .await
+        .map_err(map_core_error)?
+        .map(|c| Json(json!({ "conversation": c })))
+        .ok_or_else(|| ApiError::not_found(format!("没有 run {run_id} 的会话")))
+}
+
+#[derive(Debug, Deserialize)]
+pub struct CommandQuery {
+    pub stage: Option<String>,
+    pub node: Option<String>,
+}
+
+/// `GET /tasks/{id}/commands`
+pub async fn commands(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    Query(query): Query<CommandQuery>,
+) -> ApiResult<impl IntoResponse> {
+    let stage = match query.stage {
+        Some(s) => Some(s.parse::<Stage>().map_err(map_core_error)?),
+        None => None,
+    };
+    let node = match query.node {
+        Some(s) => Some(s.parse().map_err(map_core_error)?),
+        None => None,
+    };
+    let commands = state
+        .store
+        .list_commands(&id, stage, node)
+        .await
+        .map_err(map_core_error)?;
+    Ok(Json(json!({ "commands": commands })))
+}
+
+/// `GET /tasks/{id}/commands/{cmd_id}`（命令必须属于该任务——不允许跨任务读取）。
+pub async fn command(
+    State(state): State<AppState>,
+    Path((id, cmd_id)): Path<(String, i64)>,
+) -> ApiResult<impl IntoResponse> {
+    let command = state
+        .store
+        .get_command(cmd_id)
+        .await
+        .map_err(map_core_error)?
+        .ok_or_else(|| ApiError::not_found(format!("命令不存在：{cmd_id}")))?;
+    if command.task_id != id {
+        return Err(ApiError::not_found(format!(
+            "命令 {cmd_id} 不属于任务 {id}"
+        )));
+    }
+    Ok(Json(json!({ "command": command })))
+}
+
+/// `GET /tasks/{id}/commands/{cmd_id}/output`：完整 stdout（从卸载文件读取）。
+pub async fn command_output(
+    State(state): State<AppState>,
+    Path((id, cmd_id)): Path<(String, i64)>,
+) -> ApiResult<impl IntoResponse> {
+    let command = state
+        .store
+        .get_command(cmd_id)
+        .await
+        .map_err(map_core_error)?
+        .ok_or_else(|| ApiError::not_found(format!("命令不存在：{cmd_id}")))?;
+    if command.task_id != id {
+        return Err(ApiError::not_found(format!(
+            "命令 {cmd_id} 不属于任务 {id}"
+        )));
+    }
+    match command.stdout_path {
+        Some(path) => {
+            let content = std::fs::read_to_string(&path)
+                .map_err(|e| ApiError::not_found(format!("卸载文件不可读：{e}")))?;
+            Ok((StatusCode::OK, content))
+        }
+        // 未卸载：回落到 preview
+        None => Ok((
+            StatusCode::OK,
+            command
+                .stdout_preview
+                .unwrap_or_else(|| "（该命令未卸载完整输出，只有 preview）".to_string()),
+        )),
+    }
+}
+
+/// `GET /tasks/{id}/files/{path}`：读取任务产出文件。
+pub async fn file(
+    State(state): State<AppState>,
+    Path((id, rel_path)): Path<(String, String)>,
+) -> ApiResult<impl IntoResponse> {
+    let _task = state.store.get_task(&id).await.map_err(map_core_error)?;
+    let path = state.home.task_dir(&id).join(&rel_path);
+    // 只允许读任务目录内的文件（目录逃逸防护）
+    let root = state.home.task_dir(&id);
+    let resolved = path
+        .canonicalize()
+        .map_err(|_| ApiError::not_found(format!("文件不存在：{rel_path}")))?;
+    let root_resolved = root
+        .canonicalize()
+        .map_err(|e| ApiError::internal(e.to_string()))?;
+    if !resolved.starts_with(&root_resolved) {
+        return Err(ApiError::forbidden("路径越出任务目录"));
+    }
+    let content = std::fs::read_to_string(&resolved)
+        .map_err(|e| ApiError::not_found(format!("文件不可读：{e}")))?;
+    Ok((
+        StatusCode::OK,
+        [(
+            axum::http::header::CONTENT_TYPE,
+            "text/plain; charset=utf-8",
+        )],
+        content,
+    ))
+}
+
+/// 供外部断言使用：任务当前的动作集。
+pub async fn actions_of(state: &AppState, task_id: &str) -> ApiResult<Vec<serde_json::Value>> {
+    let task = state
+        .store
+        .get_task(task_id)
+        .await
+        .map_err(map_core_error)?;
+    Ok(allowed_actions(
+        &agentpipeline_core::types::PendingReason::new(
+            agentpipeline_core::types::PendingKind::UserDecision,
+            task.current_stage,
+            task.current_node,
+            "",
+        ),
+        None,
+    )
+    .into_iter()
+    .map(|a| serde_json::to_value(a).unwrap_or_default())
+    .collect())
+}

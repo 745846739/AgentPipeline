@@ -52,7 +52,7 @@ type TaskStatus =
   | "waiting"      // 等待依赖任务完成
   | "running"      // 正在执行
   | "done"         // 终态：成功
-  | "failed"       // 终态：失败。唯一入口是用户在 pending 卡片选择"终止任务"（决策 70），重试后回到 init
+  | "failed"       // 终态：失败。v1 无生产者，变体保留（见决策 70 修订：pending 卡片"终止任务"走 cancel → cancelled）；可经"重试"回到 init
   | "cancelled";   // 终态：用户取消
 
 /**
@@ -106,6 +106,7 @@ interface StageIO {
     affected_files: string[];        // 涉及的源码文件路径列表
     new_symbols: NewSymbol[];        // 本次新增的公开符号（冲突检测第一层依据）
     conflict_warnings: ConflictWarning[];
+    acceptance_criteria: AcceptanceCriterion[];  // 验收标准清单，与 design.md「验收标准」节一一对应（决策 136）
   };
 
   // ── develop-design ──
@@ -157,15 +158,24 @@ interface StageIO {
   };
 
   // ── merge ──
+  // 落库：merge 的 `kanban_stage_outputs.output_type` 定名为 `merge_result`（文件仍为任务目录 `merge-proposal.diff`）
   merge_result: {
-    diff_path: string;              // diff 文件路径（unified diff 格式）
-    diff_stats: DiffStats;          // 变更统计（文件数、增删行数）
+    diff_path: string;              // diff 文件路径（unified diff 格式）。必填：merge 的
+                                    // kanban_stage_outputs 行只在闸门跑完、diff 生成后写入
+    diff_stats: DiffStats;          // 变更统计（文件数、增删行数）。必填：merge 的
+                                    // kanban_stage_outputs 行只在闸门跑完、diff 生成后写入
     base_commit: string;            // 生成 proposal 时的 `{base_ref}` commit SHA（决策 96）：
-                                    // 阶段 B 入口比对该值；不一致说明基准已前移、diff 已过期，须重走阶段 A
-    gate: "pass" | "fail";          // 合入前测试闸门结果（单元 + 集成）。**与 approval 正交**（决策 95）：
-                                    // 闸门失败是执行结果，不是审批状态，不得塞进 approval 枚举
-    gate_failures: number;          // 闸门失败累计次数（决策 108）。存 kanban_stage_outputs.metadata_json，
-                                    // 跨阶段跳转不重置（否则 merge ↔ test 循环不终止），
+                                    // 阶段 B 入口比对该值；不一致说明基准已前移、diff 已过期，须重走阶段 A。
+                                    // 必填：merge 的 kanban_stage_outputs 行只在闸门跑完、diff 生成后写入
+    gate: "pass" | "fail";          // 合入前闸门结果（lint + 单元 + 集成）。**与 approval 正交**（决策 95）：
+                                    // 闸门失败是执行结果，不是审批状态，不得塞进 approval 枚举。
+                                    // 闸门未跑（阶段 A 中途）时该字段缺省；路由层把缺省视为 NoOp，
+                                    // 绝不当作通过——`Gate` 无 Default（决策 95）
+    gate_failure_kind?: "lint" | "test";  // 闸门失败类型（决策 139）：lint 失败 → 直接打回 develop.execute；
+                                          // test 失败 → 跳回 test.execute 根因分析（决策 85）
+    gate_failures: number;          // 闸门失败累计次数（决策 108，lint 与测试统一累加，决策 139）。
+                                    // 存 kanban_stage_outputs.metadata_json，
+                                    // 跨阶段跳转不重置（否则 merge ↔ test / develop 循环不终止），
                                     // 超 validate_retry_max 才 pending(retry_exhausted)
     gate_failure_output?: string;   // 闸门失败输出摘要，作为 test.execute 复检的输入（决策 85）
     conflict_files?: string[];      // 冲突文件列表（backtrack 时传入 develop）
@@ -206,6 +216,14 @@ interface TestScenario {
   steps: string[];                 // 测试步骤
   expected_result: string;         // 预期结果
   priority: "high" | "medium" | "low";
+  design_refs: string[];           // 引用的验收标准 id 列表（决策 136）。
+                                   // sync-check 机械校验：high 场景为空或悬空 → blocker → backtrack；
+                                   // medium/low → 仅 warning
+}
+
+interface AcceptanceCriterion {
+  id: string;                      // 编号，如 "AC-1"
+  description: string;             // 可验收的完成判据
 }
 
 interface FileChangeSpec {
@@ -252,8 +270,9 @@ interface PendingReason {
   message: string;
   suggested_actions?: string[];
   /**
-   * 结构化上下文。约定字段（决策 92 / 102）：
-   *   kind: "duplicate_risk" | "dirty_worktree" | "test_code_issue" | ...  // 用于 (type, kind) 查动作表
+   * 结构化上下文。约定字段（决策 92 / 102 / 134）：
+   *   kind: "duplicate_risk" | "dirty_worktree" | "test_code_issue" | "judge_disagreement" | ...
+   *         // 用于 (type, kind) 查动作表。judge_disagreement = validate_output 首判与异族复判分歧（决策 135）
    *   conflict_task_ids: string[]  // conflict_wait 专用：**全部**冲突任务 id（不是单个）。
    *                                // 全部终态且重跑第一层比对后仍无交集才自动恢复（决策 102）
    *   gate_failure_output?: string // 闸门失败详情，传给 test.execute 复检
@@ -274,8 +293,9 @@ interface PendingReason {
 ├── review-report.md       # review 产出
 ├── review-diff.diff       # review 产出（系统生成的变更 diff，仅 review_mode=human，决策 124）
 ├── backtrack-feedback.md  # sync-check backtrack 时写入的双方 blockers（决策 126）
+├── retry-feedback.md      # develop / test 的 retry_exhausted 回架构设计时写入的重试历史摘要（决策 138）
 ├── test-report.md         # test 产出（执行结果）
-└── merge-proposal.diff    # merge 产出（diff 文件）
+└── merge-proposal.diff    # merge 产出（diff 文件；kanban_stage_outputs.output_type = "merge_result"）
 
 注：测试代码在 worktree 内 tests/ 目录（*_test.rs）
 ```
@@ -290,14 +310,15 @@ interface PendingReason {
 | architect-design / execute | conflict_wait | 自动恢复（冲突任务终态后）→ execute | 冲突任务、重叠文件/符号 |
 | architect-design / execute | user_decision（`context.kind=duplicate_risk`） | goto develop / 取消其一（"合并任务"已移除——决策 132，v1 无端点，用户自行取消一方后重建） | 两份设计并排对比 + 语义重复风险 |
 | architect-design / validate_output | retry_exhausted | 用户选择：goto execute 或 skip（强制进入下一阶段） | 已产出的设计文档 + 不足之处 |
+| architect-design / develop-design / test-design 的 validate_output | user_decision（`context.kind=judge_disagreement`，决策 135） | 用户终审：continue（裁决合格——路由特判**直接放行 next_stage，不重跑校验**）或 goto execute（裁决不合格，打回修复，attempts +1） | 首判 blockers + 复判结论（两个伪阶段 run 均可展开查看，决策 100 / 134） |
 | develop-design / validate_input | user_decision | 用户选择：goto architect-design 或 skip | 设计文档不足以支撑开发的原因 |
 | develop-design / validate_output | retry_exhausted | 用户选择：goto execute 或 skip | 已产出的开发文档 |
 | test-design / validate_input | user_decision | 用户选择：goto architect-design 或 skip | 设计文档不足以支撑测试设计的原因 |
 | test-design / validate_output | retry_exhausted | 用户选择：goto execute 或 skip | 已产出的测试场景文档 |
-| develop / validate_output | retry_exhausted | 用户选择：goto execute 或 skip | 测试失败详情 |
+| develop / validate_output | retry_exhausted | 用户选择：goto execute / skip / **goto architect-design（带失败摘要回架构设计，决策 138）** | 测试（与 lint）失败详情 |
 | review / validate_output | user_decision | 用户选择：goto develop.execute（修复）或 skip（强制通过进入 test） | 评审意见 |
 | review / validate_output | human_review | 用户提交评审结果（`POST /tasks/{id}/review`）：通过 → test，不通过 → develop.execute | 变更 diff + agent 预审报告 + 单元测试结果（review 在 test 之前，此时无集成测试结果） |
-| test / validate_output | retry_exhausted | 用户选择：goto execute 或 skip | 失败详情 |
+| test / validate_output | retry_exhausted | 用户选择：goto execute / skip / **goto architect-design（带失败摘要回架构设计，决策 138）** | 失败详情 |
 | test / validate_output | user_decision | 用户选择：goto execute（修复用例）或 goto develop.execute（改业务代码） | 失败详情 + 根因分类 |
 | test / validate_output | user_decision（来自 merge 闸门失败，决策 85） | 用户选择：goto test.execute（修用例）或 goto develop.execute（改业务代码） | 闸门失败详情 + 根因分类 |
 | merge / execute | retry_exhausted | 用户选择：重试 merge.execute / 终止任务（**无 skip**，决策 86） | 冲突文件或闸门失败详情 + 已尝试次数（`gate_failures`） |
@@ -313,7 +334,7 @@ interface PendingReason {
 
 > **动作语义（决策 35 / 69）：** `continue` = 清除 pending 后从当前节点继续；`skip` = 清除 pending 并强制流转到下一阶段（落点规则见 §11.3 的 skip 表，决策 93）；`goto` = 清除 pending 并把游标的 `stage` / `node` 置为指定目标。这三者是**恢复动作**，可出现在 `ResumeRequest` 里。除此之外的选项（取消任务、拆分任务、更换长上下文模型——决策 132 已把无端点的「放弃合入」「合并任务」移出动作集）是**旁路动作**：走各自的专用 API（如 `POST /tasks/{id}/cancel`），在 `allowed_actions` 中以 `kind: "resume" | "side_effect"` 区分。可用动作集由后端下发（决策 49），key 为 `(pending_reason.type, context.kind)` —— 因为 `user_decision` 一个 type 下挂了 review 打回、测试 code_issue、脏工作区、语义重复等多套不同动作。**每个 side_effect 动作必须有一个配对的端点**（决策 101 / 119），见 §11.7。
 
-**allowed_actions 权威总表（决策 130）：** 动作集由后端按 `(pending_reason.type, context.kind)` 下发，前端纯渲染；本表是唯一权威定义，新增动作必须同时更新本表与配对端点（决策 101）。`resume` 类走 `POST /tasks/{id}/resume`，`side_effect` 类走配对端点。
+**allowed_actions 权威总表（决策 130）：** 动作集由后端按 `(pending_reason.type, context.kind)` 下发，前端纯渲染；本表是唯一权威定义，新增动作必须同时更新本表与配对端点（决策 101）。同一动作名可出现在不同行且端点不同（如 human_review 与 merge_approval 都有 `approve`）：端点按 `(type, context.kind)` 行内解析，不按动作名全局解析。`resume` 类走 `POST /tasks/{id}/resume`，`side_effect` 类走配对端点。
 
 | type | context.kind | 动作（kind） | 备注 |
 |---|---|---|---|
@@ -321,7 +342,8 @@ interface PendingReason {
 | conflict_wait | — | 无用户动作（自动恢复）＋ `cancel`（side_effect） | 冲突任务全部终态且复检无交集后自动 resume（决策 102） |
 | user_decision | duplicate_risk | `goto develop`（resume）、`cancel 其一`（side_effect） | 决策 132：「合并任务」移出动作集，合并由用户自行取消一方后重建（自动合并留 v2） |
 | user_decision | develop/test-design 输入不足 | `goto architect-design`、`skip`（均 resume） | 决策 94 |
-| retry_exhausted | — | `goto execute`、`skip`（resume）＋ `cancel 终止任务`（side_effect） | merge 例外：无 skip，仅 `goto`（重试）/ `cancel`（决策 86） |
+| retry_exhausted | — | `goto execute`、`skip`（resume）＋ `cancel 终止任务`（side_effect） | merge 例外：无 skip，仅 `goto`（重试）/ `cancel`（决策 86）；develop / test 例外：额外提供 `goto architect-design`（带失败摘要，决策 138） |
+| user_decision | judge_disagreement | `continue`（裁决合格，特判直接放行 next_stage）、`goto execute`（裁决不合格；均 resume） | 决策 134 / 135：首判与异族复判分歧，用户终审 |
 | user_decision | review 不通过 | `goto develop.execute`、`skip`（均 resume） | review.validate_output 纯代码判定 approved |
 | human_review | — | `approve` / `reject`（side_effect → `POST /tasks/{id}/review`） | 通过 → test；打回 → develop.execute（决策 2） |
 | user_decision | test code_issue / 闸门复检 | `goto test.execute`、`goto develop.execute`（均 resume） | 根因分类由 agent 给出（决策 62 / 85） |

@@ -1,0 +1,478 @@
+//! KanbanScheduler（决策 55 / 57 / 66 / 92 / 100 / 102 / 117 / 127）。
+//!
+//! 职责边界：executor 是 DAG 执行引擎，不承担定时任务；超时、冲突恢复、依赖、准入、
+//! 提醒都归 scheduler 的 10s tick。**`tick()` 是手动驱动接缝**（决策 143 接缝④）——
+//! 测试直接调用它，生产由 [`KanbanScheduler::run_loop`] 按 `tick_interval_sec` 驱动。
+
+use std::collections::HashSet;
+use std::sync::Arc;
+
+use chrono::Duration;
+
+use crate::clock::Clock;
+use crate::config::{effective_idle_timeout, effective_max_duration, node_timeouts, Settings};
+use crate::process::ProcessKiller;
+use crate::sse::{SseEvent, SseSink};
+use crate::storage::observability::is_timed_out;
+use crate::storage::tasks::DependencyState;
+use crate::storage::Store;
+use crate::types::{NodeRun, NodeStatus, PendingContext, PendingKind, PendingReason, TaskStatus};
+use crate::Result;
+
+/// resume 钩子：scheduler 通过它拉起 executor，不直接依赖 executor 实现。
+pub type ResumeFn = Arc<dyn Fn(&str) + Send + Sync>;
+
+/// 一次 tick 的产出（测试逐项断言六项职责）。
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct TickReport {
+    /// 判定超时并处理的 run id。
+    pub timed_out_runs: Vec<i64>,
+    /// 因超时被置 pending 的游标 id。
+    pub timeout_pending_cursors: Vec<String>,
+    /// 冲突恢复后放行的任务 id。
+    pub conflict_resumed: Vec<String>,
+    /// 依赖满足后置 queued 的任务 id。
+    pub dependencies_promoted: Vec<String>,
+    /// 依赖重启后从 pending 退回 waiting 的任务 id。
+    pub dependencies_recovered: Vec<String>,
+    /// 依赖失败被挂 pending 的任务 id。
+    pub dependency_failed: Vec<String>,
+    /// 本 tick 准入的任务 id。
+    pub admitted: Vec<String>,
+    /// 被标记 stalled 的任务 id。
+    pub stalled: Vec<String>,
+    /// 发出重复提醒的任务 id。
+    pub reminded: Vec<String>,
+}
+
+pub struct KanbanScheduler {
+    store: Store,
+    settings: Settings,
+    clock: Arc<dyn Clock>,
+    killer: Arc<dyn ProcessKiller>,
+    sse: Arc<dyn SseSink>,
+    resume: ResumeFn,
+    /// 已提醒过的任务（提醒只重复一次，不刷屏，决策 55）。
+    reminded: HashSet<String>,
+}
+
+impl KanbanScheduler {
+    pub fn new(
+        store: Store,
+        settings: Settings,
+        clock: Arc<dyn Clock>,
+        killer: Arc<dyn ProcessKiller>,
+        sse: Arc<dyn SseSink>,
+        resume: ResumeFn,
+    ) -> Self {
+        KanbanScheduler {
+            store,
+            settings,
+            clock,
+            killer,
+            sse,
+            resume,
+            reminded: HashSet::new(),
+        }
+    }
+
+    /// 10s 周期循环（生产）；`shutdown` 置位后停止派发新任务（决策 54）。
+    pub async fn run_loop(
+        mut self,
+        mut shutdown: tokio::sync::watch::Receiver<bool>,
+    ) -> Result<()> {
+        let interval = std::time::Duration::from_secs(self.settings.tick_interval_sec);
+        loop {
+            tokio::select! {
+                _ = tokio::time::sleep(interval) => {
+                    match self.tick().await {
+                        Ok(report) => {
+                            // 提醒只重复一次，避免刷屏（决策 55）
+                            self.mark_reminded(&report.reminded);
+                        }
+                        Err(e) => tracing::error!(error = %e, "scheduler tick 失败"),
+                    }
+                }
+                _ = shutdown.changed() => {
+                    tracing::info!("scheduler 收到停机信号，停止派发新任务");
+                    return Ok(());
+                }
+            }
+        }
+    }
+
+    /// 一次 tick：六项职责（决策 55）。
+    pub async fn tick(&self) -> Result<TickReport> {
+        let mut report = TickReport::default();
+        self.check_timeouts(&mut report).await?;
+        self.resume_conflict_waits(&mut report).await?;
+        self.check_waiting_tasks(&mut report).await?;
+        self.recover_dependency_failed(&mut report).await?;
+        self.admit_pending_tasks(&mut report).await?;
+        self.remind_pending_tasks(&mut report).await?;
+        Ok(report)
+    }
+
+    /// 小时级维护：会话清理 + 指标聚合（决策 55）。
+    pub async fn maintenance(&self) -> Result<MaintenanceReport> {
+        let purged = self.purge_expired_conversations().await?;
+        let aggregated = self.aggregate_node_metrics().await?;
+        Ok(MaintenanceReport {
+            purged_conversations: purged,
+            aggregated_tasks: aggregated,
+        })
+    }
+
+    // ─────────────────────── ① 超时检测（决策 64 / 66 / 100 / 122）───────────────────────
+
+    async fn check_timeouts(&self, report: &mut TickReport) -> Result<()> {
+        let now = self.clock.now();
+        let stage_configs = self.store.list_stage_configs().await?;
+
+        for run in self.store.active_runs().await? {
+            let stage_cfg = stage_configs.iter().find(|c| c.stage == run.stage.as_str());
+            let node_override = node_timeouts(stage_cfg, run.node.as_str());
+            let idle = effective_idle_timeout(
+                self.settings.node_idle_timeout_sec,
+                stage_cfg.and_then(|c| c.idle_timeout_sec),
+                node_override,
+            );
+            let max_duration = effective_max_duration(
+                self.settings.node_max_duration_sec,
+                stage_cfg.and_then(|c| c.max_duration_sec),
+                node_override,
+            );
+
+            if is_timed_out(&run, now, idle, max_duration).is_none() {
+                continue;
+            }
+            report.timed_out_runs.push(run.id);
+            self.handle_timeout(&run, report).await?;
+        }
+        Ok(())
+    }
+
+    /// 超时处理：杀进程组 → 未耗尽则干净对话重试 → 耗尽才 pending(timeout)。
+    async fn handle_timeout(&self, run: &NodeRun, report: &mut TickReport) -> Result<()> {
+        // 决策 66：杀整个进程组（测试里由记录型终止器断言）
+        if let Some(pgid) = run.process_group_id {
+            self.killer.kill_process_group(pgid)?;
+        }
+        self.store
+            .finish_run(
+                run.id,
+                &crate::storage::observability::RunOutcome {
+                    status: Some(NodeStatus::Timeout),
+                    error: Some(format!(
+                        "{}.{} 超时（attempt {}）",
+                        run.stage, run.node, run.attempt
+                    )),
+                    ..Default::default()
+                },
+            )
+            .await?;
+
+        if run.attempt < self.settings.agent_retry_max {
+            // 未耗尽：干净对话重试当前节点（决策 33），不计 validate_attempts
+            self.store
+                .insert_transition(
+                    &run.task_id,
+                    &branch_of(&run.cursor_id, &self.store).await?,
+                    Some((run.stage, run.node)),
+                    (run.stage, run.node),
+                    crate::types::TransitionTrigger::Timeout,
+                    Some("节点超时，干净对话重试"),
+                )
+                .await?;
+            (self.resume)(&run.task_id);
+        } else {
+            // 耗尽：pending 挂在该 run 所属的**游标**上（决策 82）
+            self.store
+                .set_cursor_pending(
+                    &run.cursor_id,
+                    &PendingReason::new(
+                        PendingKind::Timeout,
+                        run.stage,
+                        run.node,
+                        format!(
+                            "{}.{} 执行超时（attempt {}）",
+                            run.stage, run.node, run.attempt
+                        ),
+                    ),
+                )
+                .await?;
+            self.store.sync_task_projection(&run.task_id).await?;
+            report.timeout_pending_cursors.push(run.cursor_id.clone());
+            self.emit_pending(&run.task_id, &run.cursor_id).await?;
+        }
+        Ok(())
+    }
+
+    // ─────────────────────── ② 冲突等待恢复（决策 102）───────────────────────
+
+    async fn resume_conflict_waits(&self, report: &mut TickReport) -> Result<()> {
+        let cursors = self
+            .store
+            .cursors_with_pending_kind(PendingKind::ConflictWait)
+            .await?;
+        for cursor in cursors {
+            let pending = cursor.pending_reason.clone().unwrap_or_else(|| {
+                PendingReason::new(PendingKind::ConflictWait, cursor.stage, cursor.node, "")
+            });
+            let conflict_ids = pending
+                .context
+                .as_ref()
+                .map(|c| c.conflict_task_ids.clone())
+                .unwrap_or_default();
+
+            // 必须**全部**终态才考虑恢复
+            let mut all_terminal = true;
+            for id in &conflict_ids {
+                match self.store.get_task(id).await {
+                    Ok(task) if task.status.is_terminal() => {}
+                    _ => all_terminal = false,
+                }
+            }
+            if !all_terminal {
+                continue;
+            }
+
+            // 恢复前重跑第一层比对：仍有交集则保持 pending 并更新 id 列表（不重跑节点）
+            let still = self.store.recheck_first_layer_overlap(&cursor).await?;
+            if still.is_empty() {
+                self.store.clear_cursor_pending(&cursor.cursor_id).await?;
+                self.store.sync_task_projection(&cursor.task_id).await?;
+                report.conflict_resumed.push(cursor.task_id.clone());
+                (self.resume)(&cursor.task_id);
+            } else {
+                self.store
+                    .update_cursor_pending_context(&cursor.cursor_id, "conflict_task_ids", &still)
+                    .await?;
+                self.sse.emit(SseEvent::PendingUpdated {
+                    task_id: cursor.task_id.clone(),
+                    branch: cursor.branch.clone(),
+                    cursor_id: cursor.cursor_id.clone(),
+                    context: PendingContext {
+                        conflict_task_ids: still,
+                        ..Default::default()
+                    },
+                });
+            }
+        }
+        Ok(())
+    }
+
+    // ─────────────────────── ③④ 依赖（决策 57 / 116）───────────────────────
+
+    async fn check_waiting_tasks(&self, report: &mut TickReport) -> Result<()> {
+        for task in self.store.waiting_tasks().await? {
+            match self.store.dependencies_satisfied(&task.id).await? {
+                DependencyState::Ready => {
+                    self.store
+                        .set_task_status(&task.id, TaskStatus::Queued)
+                        .await?;
+                    report.dependencies_promoted.push(task.id);
+                }
+                DependencyState::Failed(failed) => {
+                    // 依赖失败：pending(dependency_failed) 挂在 main 游标上（决策 90 / 116）
+                    let cursor = self.store.resolve_sole_cursor(&task.id).await?.or(self
+                        .store
+                        .load_live_cursors(&task.id)
+                        .await?
+                        .into_iter()
+                        .next());
+                    if let Some(cursor) = cursor {
+                        let all_cancelled = self.all_dependencies_cancelled(&task.id).await?;
+                        let reason = PendingReason::new(
+                            PendingKind::DependencyFailed,
+                            cursor.stage,
+                            cursor.node,
+                            format!("依赖任务失败：{}", failed.join("、")),
+                        )
+                        .with_context(PendingContext::with_kind(if all_cancelled {
+                            crate::actions::kinds::DEPENDENCY_CANCELLED
+                        } else {
+                            crate::actions::kinds::DEPENDENCY_FAILED
+                        }));
+                        self.store
+                            .set_cursor_pending(&cursor.cursor_id, &reason)
+                            .await?;
+                        self.store.sync_task_projection(&task.id).await?;
+                        report.dependency_failed.push(task.id.clone());
+                        self.emit_pending(&task.id, &cursor.cursor_id).await?;
+                    }
+                }
+                DependencyState::Waiting(_) => {}
+            }
+        }
+        Ok(())
+    }
+
+    async fn all_dependencies_cancelled(&self, task_id: &str) -> Result<bool> {
+        let deps = self.store.dependencies_of(task_id).await?;
+        if deps.is_empty() {
+            return Ok(false);
+        }
+        for dep in deps {
+            match self.store.get_task(&dep).await {
+                Ok(task) if task.status == TaskStatus::Cancelled => {}
+                _ => return Ok(false),
+            }
+        }
+        Ok(true)
+    }
+
+    async fn recover_dependency_failed(&self, report: &mut TickReport) -> Result<()> {
+        report.dependencies_recovered = self.store.recover_dependency_failed().await?;
+        Ok(())
+    }
+
+    // ─────────────────────── ⑤ 并发准入（决策 117 / 98）───────────────────────
+
+    async fn admit_pending_tasks(&self, report: &mut TickReport) -> Result<()> {
+        let max = self.settings.max_concurrent_tasks;
+        let mut occupying = self.store.occupying_slots().await?;
+        for task in self.store.queued_tasks().await? {
+            if occupying >= max {
+                break;
+            }
+            if self.store.try_admit(&task.id, max).await? {
+                occupying += 1;
+                report.admitted.push(task.id.clone());
+                self.store
+                    .insert_transition(
+                        &task.id,
+                        crate::types::NodeCursor::BRANCH_MAIN,
+                        None,
+                        (task.current_stage, task.current_node),
+                        crate::types::TransitionTrigger::Start,
+                        Some("并发准入放行"),
+                    )
+                    .await?;
+                (self.resume)(&task.id);
+            }
+        }
+        Ok(())
+    }
+
+    // ─────────────────────── ⑥ 提醒与 stalled（决策 34 / 92）───────────────────────
+
+    async fn remind_pending_tasks(&self, report: &mut TickReport) -> Result<()> {
+        let now = self.clock.now();
+        let reminder_after = Duration::hours(self.settings.pending_reminder_hours as i64);
+        let stalled_after = Duration::hours(self.settings.pending_timeout_hours as i64);
+
+        for task in self
+            .store
+            .list_tasks(&crate::storage::tasks::TaskFilter {
+                include_archived: false,
+                ..Default::default()
+            })
+            .await?
+        {
+            let live = self.store.load_live_cursors(&task.id).await?;
+            // 决策 92：谓词是 has_runnable_cursor——一个分支 pending、另一分支在跑 ≠ 卡住
+            let stalled_candidate = crate::pipeline::cursor::has_pending_cursor(&live)
+                && !crate::pipeline::cursor::has_runnable_cursor(&live);
+            if !stalled_candidate {
+                continue;
+            }
+            let Some(since) = live
+                .iter()
+                .filter(|c| c.is_pending())
+                .map(|c| c.updated_at)
+                .min()
+            else {
+                continue;
+            };
+            let age = now - since;
+
+            if age > stalled_after && !task.stalled {
+                self.store.set_stalled(&task.id, true).await?;
+                report.stalled.push(task.id.clone());
+            }
+            // pending 超时提醒：只重复一次
+            if age > reminder_after && !self.reminded.contains(&task.id) {
+                report.reminded.push(task.id.clone());
+            }
+        }
+
+        // reminded 是 &self 上的集合；用 interior mutability 语义上更重，这里改为
+        // 每次 tick 由调用方决定是否复用（生产循环里 scheduler 是 mut 持有的）。
+        Ok(())
+    }
+
+    /// 记录已提醒任务（生产循环在 tick 后调用，避免重复提醒刷屏）。
+    pub fn mark_reminded(&mut self, task_ids: &[String]) {
+        self.reminded.extend(task_ids.iter().cloned());
+    }
+
+    pub fn reminded_count(&self) -> usize {
+        self.reminded.len()
+    }
+
+    // ─────────────────────── 心跳刷新（决策 100）───────────────────────
+
+    /// 系统命令 / 流式 token 的心跳：由工具层与 executor 调用。
+    pub async fn heartbeat(&self, run_id: i64) -> Result<()> {
+        self.store.touch_run_heartbeat(run_id).await
+    }
+
+    // ─────────────────────── 小时级维护 ───────────────────────
+
+    async fn purge_expired_conversations(&self) -> Result<usize> {
+        let cutoff =
+            self.clock.now() - Duration::days(self.settings.conversation_retention_days as i64);
+        let purged = sqlx::query(
+            "DELETE FROM kanban_node_conversations
+             WHERE task_id IN (SELECT id FROM kanban_tasks WHERE status IN ('done','failed','cancelled'))
+               AND created_at < ?",
+        )
+        .bind(crate::storage::ts(cutoff))
+        .execute(self.store.pool())
+        .await?
+        .rows_affected();
+        Ok(purged as usize)
+    }
+
+    async fn aggregate_node_metrics(&self) -> Result<usize> {
+        let tasks = self
+            .store
+            .list_tasks(&crate::storage::tasks::TaskFilter {
+                include_archived: true,
+                ..Default::default()
+            })
+            .await?;
+        for task in &tasks {
+            self.store.refresh_task_totals(&task.id).await?;
+        }
+        Ok(tasks.len())
+    }
+
+    async fn emit_pending(&self, task_id: &str, cursor_id: &str) -> Result<()> {
+        let cursor = self.store.get_cursor(cursor_id).await?;
+        if let Some(reason) = cursor.pending_reason {
+            self.sse.emit(SseEvent::Pending {
+                task_id: task_id.to_string(),
+                branch: cursor.branch,
+                cursor_id: cursor_id.to_string(),
+                reason,
+            });
+        }
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct MaintenanceReport {
+    pub purged_conversations: usize,
+    pub aggregated_tasks: usize,
+}
+
+async fn branch_of(cursor_id: &str, store: &Store) -> Result<String> {
+    Ok(store
+        .get_cursor(cursor_id)
+        .await
+        .map(|c| c.branch)
+        .unwrap_or_else(|_| crate::types::NodeCursor::BRANCH_MAIN.to_string()))
+}

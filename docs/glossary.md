@@ -24,6 +24,7 @@
 | **Tool** | agent 可调用的函数。内置 7 个：`write_file`（写文件）、`edit_file`（局部编辑）、`read_file`（读文件）、`delete_file`（删文件）、`list_dir`（列目录）、`run_command`（执行 shell 命令）、`submit_metadata`（提交结构化元数据）。扩展工具：`spawn_sub_agent`（默认关闭） |
 | **Context** | agent 的对话上下文（messages 列表）。有四级压缩机制控制长度 |
 | **ContextManager** | 管理 agent 对话上下文的组件，负责 token 计数、摘要压缩、硬限制截断 |
+| **validator_cross_check** | 异族复判伪阶段（决策 134）：`cross_family_judge = true` 时，agent 型 validate_output 首判不合格即由它用不同 vendor 的强档模型复判一次；复判合格 → 分歧上交（决策 135），复判不合格 → 维持原路径打回。独立 run/会话行（决策 100 模式） |
 
 ### 状态相关
 
@@ -36,6 +37,7 @@
 | **Resume** | 从 pending 恢复执行。用户操作后按**恢复动作**（continue / skip / goto）清除 pending_reason，流水线从 checkpoint 继续；取消 / 拆分等**旁路动作**走各自专用 API（决策 69） |
 | **Stalled** | pending 超过 `pending_timeout_hours` 的标志位，看板高亮。不是独立 TaskStatus |
 | **Archived** | 终态任务的软删除，通过 `archived_at` 时间戳表示。不是独立 TaskStatus |
+| **judge_disagreement** | validate_output 首判"不合格"而异族复判"合格"时的 pending context.kind（决策 135）。用户终审：continue 特判直接放行（不重跑校验），或 goto execute 打回（attempts +1） |
 
 ### Git 相关
 
@@ -59,6 +61,9 @@
 | **Sync-Check** | develop-design 和 test-design 并行分支的汇聚判断。双方都通过 → proceed；任一方有 blocker → backtrack 回退 architect-design。**不占游标行**，是游标无关的屏障（决策 107） |
 | **Backtrack** | 回退到 architect-design 重新设计。由 sync-check 触发 |
 | **打回** | review 不通过或 merge 冲突时，回退到 develop 阶段修复 |
+| **验收标准（Acceptance Criteria）** | architect 在 design.md「验收标准」节产出的编号完成判据（AC-1、AC-2…），随 submit_metadata 以 `acceptance_criteria` 提交（决策 136）。test-design 经 `design_refs` 引用、sync-check 机械校验引用完整性、review 逐条对照——把"自报 readiness"换成可核对证据 |
+| **design_refs** | TestScenario 引用验收标准 id 的字段（决策 136）。high 场景缺失/悬空 → sync-check 判 blocker → backtrack；medium/low → 仅 warning |
+| **Retry Feedback** | develop / test 的 retry_exhausted 选"带失败摘要回架构设计"时，系统写入任务目录 `retry-feedback.md` 的重试历史摘要（决策 138），architect 重入时注入 prompt（与决策 126 的 backtrack-feedback.md 同构） |
 
 ### 存储相关
 
@@ -83,6 +88,15 @@
 | **Merge Approval** | merge 阶段等待用户在 GUI 审核 diff 并决定是否合入的状态。用户点击"合入"（`POST /tasks/{id}/merge/decision`，决策 119）后由 `merge.execute` 阶段 B 执行实际合并 |
 | **Conflict Wait** | architect 阶段检出文件/符号与活跃任务重叠后进入的 pending，冲突任务终态后自动恢复，属自动串行化 |
 | **Duplicate Risk** | 语义层重复风险（不同文件实现同类功能），由 `conflict_check` 伪阶段判定，高风险转 pending(user_decision) |
+| **逃逸率（Escaped Rate）** | 各闸门的漏检度量（决策 137）：下游质量事件数（review 打回、merge 闸门失败）÷ 上游闸门放行数，按阶段聚合。v1 只提供查询口径，不做自动归因（`escaped_from` 推断列留 v2） |
+
+### 测试相关
+
+| 术语 | 定义 |
+|---|---|
+| **测试设计（testing.md）** | AgentPipeline **系统自身**的测试设计（决策 140，落 `docs/testing.md`）。与流水线阶段 `test-design`（为任务设计业务测试场景，决策 136）是两回事：前者测本系统，后者是本系统的一个阶段 |
+| **testkit** | 测试基建 crate（`crates/testkit`，决策 146）：用系统 git CLI 搭建场景仓库（unborn HEAD / 脏工作区 / 冲突 / 多语言项目等 8 类），供集成与 E2E 测试复用 |
+| **FakeAgent** | 脚本化 LLM 替身（决策 142 / 148）：对 LLM 调用口抽 trait，按 `(stage, node)` 播放 tool_calls 脚本并可注入失败形态；**只替换 LLM 响应流，工具层真实执行**（FileToolPolicy / 脱敏 / 卸载 / 命令记录都真走）。伪阶段同样脚本化；真 LLM 仅 `#[ignore]` 手动冒烟。prompt 只测组装（golden + `prompt_template_hash`），不测效果（B.6 v2） |
 
 ### 配置相关
 
@@ -91,7 +105,9 @@
 | **Config** | 全局配置（TOML），包含 retry 参数、timeout、日志、prompt 目录等。位于 `~/.agentpipeline/config.toml`，**不含** provider / model / API key 等界面可改的配置（决策 22 / 56） |
 | **StageConfig** | 每个 stage 的独立配置，包含 provider（`provider_id` 引用）、tools、skills、超时覆盖（决策 111：不单列 model）。存 DB，界面可改 |
 | **AGENTS.md** | 项目上下文文件，每个 agent 启动时加载，拼入 system prompt 的固定段落，提供项目约定和规范 |
-| **伪阶段（Pseudo-stage）** | 不进入 kanban 图、无 StageIO/checkpoint/pending 的单次 agent 调用（`project_analysis`、`conflict_check`），仅复用阶段配置与白名单校验 |
+| **伪阶段（Pseudo-stage）** | 不进入 kanban 图、无 StageIO/checkpoint/pending 的单次 agent 调用（`project_analysis`、`conflict_check`、`validator_cross_check`），仅复用阶段配置与白名单校验 |
+| **cross_family_judge** | 全局开关（默认 false，决策 134）：开启后 agent 型 validate_output 首判不合格时调用 `validator_cross_check` 异族复判；开启但伪阶段未配置 provider → 配置加载 fail fast |
+| **lint_command** | 项目级可选静态检查命令（决策 139）。develop.validate_output 先 lint 后测试（都过才放行），merge 闸门同跑；lint 失败是确定性错误，直接打回 develop，不走 test.execute 根因分析 |
 
 ### API 与安全相关
 

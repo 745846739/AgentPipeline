@@ -201,7 +201,10 @@ pub fn route(cursor: &NodeCursor, ctx: &RouteContext) -> EdgeKind {
 }
 
 fn route_after_validate_output(cursor: &NodeCursor, ctx: &RouteContext) -> EdgeKind {
-    // 按游标自身的 attempts 判定，不受其他分支影响（决策 82）
+    // 按游标自身的 attempts 判定，不受其他分支影响（决策 82）。
+    // 注：`cross_family_judge = true` 时，agent 型 validate_output 首判不合格在节点内先经
+    // validator_cross_check 复判（决策 134）——复判合格则根本不进入本路由，而是走
+    // pending(user_decision, judge_disagreement)（决策 135）；能进到这里说明两侧一致不合格。
     if cursor.validate_attempts >= ctx.settings.validate_retry_max {
         EdgeKind::Pending
     } else {
@@ -230,9 +233,20 @@ fn route_merge(ctx: &RouteContext) -> EdgeKind {
     if ctx.merge.approval == Approval::Pending {
         return EdgeKind::NoOp;
     }
-    // ② 闸门失败与审批状态**正交**（决策 95）：先看 gate，再看 approval
-    if ctx.merge.gate == Gate::Fail {
-        return EdgeKind::GotoTest;   // → test.execute 重新分析根因（决策 85）
+    // ② 闸门未跑 ≠ 通过：`Gate` 无 Default（决策 95），缺省视为 NoOp，绝不当作通过
+    let Some(gate) = ctx.merge.gate else { return EdgeKind::NoOp; };
+    // ③ 决策 85/108：耗尽收口，否则 merge↔test/develop 无限循环
+    if gate == Gate::Fail && ctx.merge.gate_failures >= ctx.validate_retry_max {
+        return EdgeKind::Pending(PendingKind::RetryExhausted);
+    }
+    // ④ 闸门失败与审批状态**正交**（决策 95）：先看 gate，再看 approval
+    if gate == Gate::Fail {
+        // 闸门失败分流（决策 139）：lint 失败是确定性错误，直接打回 develop；
+        // 测试失败需要 agent 分辨 test_issue / code_issue，跳回 test.execute（决策 85）
+        return match ctx.merge.gate_failure_kind {
+            GateFailureKind::Lint => EdgeKind::KickbackDevelop,
+            GateFailureKind::Test => EdgeKind::GotoTest,
+        };
     }
     match ctx.merge.approval {
         Approval::Approved => EdgeKind::Next,   // → done（阶段 B 已在 execute 内完成合入）
@@ -546,7 +560,7 @@ SQLite 数据库位于 `~/.agentpipeline/data/agentpipeline.db`，WAL 模式，�
 CREATE TABLE IF NOT EXISTS kanban_tasks (
     id TEXT PRIMARY KEY,
     title TEXT NOT NULL,
-    description TEXT,
+    description TEXT NOT NULL DEFAULT '',
     project_id TEXT NOT NULL,
     status TEXT NOT NULL DEFAULT 'queued',  -- 决策 98：一律 queued/waiting 落库，准入后置 running
     current_stage TEXT NOT NULL,           -- 焦点游标 projection
@@ -558,6 +572,7 @@ CREATE TABLE IF NOT EXISTS kanban_tasks (
     total_tokens INTEGER NOT NULL DEFAULT 0,
     total_calls INTEGER NOT NULL DEFAULT 0,
     review_mode TEXT NOT NULL DEFAULT 'agent',  -- agent | human
+    model_override TEXT,                   -- 任务级 provider 覆盖（决策 105）
     archived_at TEXT,                      -- 归档时间（软删除，决策 34）
     stalled INTEGER NOT NULL DEFAULT 0,    -- pending 超时标志（决策 34）
     executor_owner TEXT,                   -- 当前 executor 持有者（乐观锁，决策 36）
@@ -601,7 +616,7 @@ CREATE TABLE IF NOT EXISTS kanban_stage_outputs (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     task_id TEXT NOT NULL,
     stage TEXT NOT NULL,
-    output_type TEXT NOT NULL,         -- "design_doc" | "dev_doc" | ...
+    output_type TEXT NOT NULL,         -- "design_doc" | "dev_doc" | "merge_result" | "review_diff" | ...
     file_path TEXT NOT NULL,
     metadata_json TEXT,                -- 路由依据（readiness/approved/changed_files 等）
     created_at TEXT NOT NULL,
@@ -629,6 +644,8 @@ CREATE TABLE IF NOT EXISTS kanban_node_runs (
     error TEXT,
     process_group_id INTEGER,          -- 超时时杀进程组用（决策 66）
     last_activity_at TEXT,             -- 空闲超时心跳（决策 64/66）
+    prompt_template_hash TEXT,         -- prompt 版本标注（决策 137）：最终组装 system prompt 的 SHA-256
+                                       -- 前 16 位（含用户 prompts/ 覆盖后的内容），指标按版本对比
     started_at TEXT NOT NULL,
     finished_at TEXT,
     FOREIGN KEY (task_id) REFERENCES kanban_tasks(id),
@@ -644,6 +661,8 @@ CREATE TABLE IF NOT EXISTS kanban_projects (
     default_branch TEXT NOT NULL DEFAULT 'main',
     language TEXT,                        -- 检测到的编程语言
     test_framework TEXT,                  -- 检测到的测试框架
+    lint_command TEXT,                    -- 可选静态检查命令（决策 139）；project_analysis 探测候选、
+                                          -- 用户确认时预填。未配置则闸门跳过 lint 环节，不阻塞
     agents_md_path TEXT,                  -- AGENTS.md 路径（如果存在）
     created_at TEXT NOT NULL
 );
@@ -687,7 +706,7 @@ CREATE TABLE IF NOT EXISTS stage_configs (
 );
 ```
 
-> **其余表的位置：** `kanban_transitions`（§12.4.2）、`kanban_node_conversations`（§12.4.3）、`kanban_node_commands`（§12.4.4）分列在可观测性各节，此处不重复。全部表由 sqlx migrations 统一管理（决策 13）。
+> **其余表的位置：** `kanban_transitions`（§12.4.2）、`kanban_node_conversations`（§12.4.3）、`kanban_node_commands`（§12.4.4）分列在可观测性各节，此处不重复。`kanban_project_analyses`（决策 130⑦）：`analysis_id TEXT PRIMARY KEY`、`project_id TEXT NOT NULL REFERENCES kanban_projects(id)`、`status TEXT NOT NULL`、`result_json`、`error`、`created_at`、`updated_at`——配套 `POST /projects/analyze` 异步 202 + `GET /projects/{id}/analysis` 轮询。全部表由 sqlx migrations 统一管理（决策 13）。
 
 ### 11.6 进程中断恢复
 
@@ -753,3 +772,16 @@ executor checkpoint 机制天然支持：
 | `GET /metrics` | GET | 全局统计（成功率、平均耗时、token 消耗） |
 
 > **`allowed_actions` 与端点的配对（决策 101 / 119）：** 前端对 `allowed_actions` 纯渲染，因此每个 `side_effect` 动作都必须有对应端点——`cancel` → `POST /tasks/{id}/cancel`、`split_task` → `POST /tasks/{id}/split`、`更换长上下文模型` → `POST /tasks/{id}/model-override`、`合入 / 返回修改` → `POST /tasks/{id}/merge/decision`（决策 119）。新增 side_effect 动作时必须同时新增端点，否则前端会出现点不动的按钮。
+
+### 11.8 可测试性接缝（决策 143）
+
+测试设计（[testing.md](testing.md) §3.1）要求实现预留四条接缝，生产代码只依赖 trait、不感知测试形态：
+
+| 接缝 | 生产实现 | 测试实现 |
+|---|---|---|
+| `Clock` trait | 系统时钟（超时 / 心跳 / tick 的唯一时钟源语义不变，决策 64） | 假时钟：手动推进 / `tokio::time::pause` |
+| `AGENTPIPELINE_HOME` 环境变量 | 默认 `~/.agentpipeline/` | 每测试独占临时目录 |
+| 进程组终止器 trait | 真杀进程组（决策 66） | 记录调用，不真杀 |
+| scheduler `tick()` | 10s 周期驱动 | 测试中手动调用 |
+
+> **实现顺序要求：四个接缝先于业务模块落地**——后补接缝要翻全部模块签名。逐项用例目录见 testing.md。

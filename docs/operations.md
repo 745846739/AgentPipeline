@@ -30,7 +30,7 @@
 |---|---|
 | init.execute | `git worktree add {worktree_path} -b kanban/{task_id} {base}`（`{base}` = `{base_ref}` 在 init 时的 HEAD，有 remote 时先 fetch） |
 | 各阶段执行 | 在 worktree 内读写代码 |
-| merge 阶段 B | 建临时 worktree（`--detach` 指向 `{default_branch}`）执行合入，完成后移除 |
+| merge 阶段 B | git2 内存合入（ff 优先，否则双亲 merge commit），结果直接写回 `{default_branch}`（决策 97，2026-09-12 git2 重写，不再建临时 worktree） |
 | merge 成功 / done | `git worktree remove {worktree_path}`，删除分支 |
 | 任务取消 | 同上，强制删除（`--force`） |
 | 任务重试 | 复用已有 worktree，不重建 |
@@ -95,7 +95,7 @@ pub async fn reset_task_for_retry(db: &SqlitePool, task_id: &str) -> Result<()> 
 
 > **游标模型的表述（决策 90 / 113）：** checkpoint 现在就是 `kanban_node_cursors` 的行集合，所以"重置 checkpoint"的准确说法是**把游标重置为单条 main 行**（`stage=init, node=execute`）。终态任务保留游标行供审计；"重试"将旧行归档（`status=archived`）后插入新的单条 main 行——游标行**永不物理删除**，`kanban_node_runs.cursor_id` 的外键因此不悬空。
 
-> **retry 的 worktree 重置（决策 125）：** failed 可在任意阶段终止，worktree 里留有半成品；init.execute 的幂等策略是"已存在则复用"，不会清场。因此 retry 的 reset 事务显式执行 `git reset --hard {base_ref}` + `git clean -fdx`（经 `run_recorded_command` 记 system 命令），把工作区恢复到任务分支起点——否则 develop agent 会在脏工作区上开工，与"重试 = 从头走"的语义冲突。
+> **retry 的 worktree 重置（决策 125）：** failed 可在任意阶段终止，worktree 里留有半成品；init.execute 的幂等策略是"已存在则复用"，不会清场。因此 retry 的 reset 事务显式把工作区恢复到任务分支起点（reset --hard + clean -fdx，2026-09-12 起走 git2 实现，`kanban_node_commands` 仍记录对应逻辑命令行供审计）——否则 develop agent 会在脏工作区上开工，与"重试 = 从头走"的语义冲突。
 
 ### 12.4 可观测性
 
@@ -112,6 +112,7 @@ pub async fn reset_task_for_retry(db: &SqlitePool, task_id: &str) -> Result<()> 
 | attempt | 重试率分析 |
 | status | 成功率分析 |
 | error | 失败原因归类 |
+| prompt_template_hash | 按 prompt 版本对比指标（决策 137） |
 
 > **不调 LLM 的节点也落 run 行（决策 99 / 114）：** 纯代码阶段（`init` / `sync-check` / `merge` / `done`）与纯代码 `validate_output`（`develop` / `test`）都没有 agent 调用，但**同样写入 `kanban_node_runs`**（`agent_type = "system"`，token 为 0，`last_activity_at` 由系统命令刷新），否则超时检测与耗时统计会漏掉这几段、系统测试命令（最长 600s）没有所属 run 供命令表挂靠与心跳刷新，且"每个节点执行都有记录"不再成立。因此决策 63 的 1:1 关系要**收窄为：调用 LLM 的 run 才与会话 1:1**；`agent_type = "system"` 的 run 没有会话行。
 
@@ -124,6 +125,8 @@ pub async fn reset_task_for_retry(db: &SqlitePool, task_id: &str) -> Result<()> 
 | 阶段平均耗时 | `AVG(duration_ms) GROUP BY stage` | 找瓶颈 |
 | 阶段重试率 | `attempt > 1 的比例` | 找 prompt 质量问题 |
 | validate 通过率 | `validate_output 首次通过的比例` | 找上游质量问题 |
+| 各闸门逃逸率 | 下游质量事件数 ÷ 上游闸门放行数（按阶段聚合，决策 137） | 定位"哪个闸门在漏检"：review 打回 / merge 闸门失败归属到本应拦住它的上游 validate 闸门，用于校准 validator prompt 与模型档位（决策 133 / 134） |
+| prompt 版本对比 | 按 `prompt_template_hash` 分组的重试率 / validate 通过率（决策 137） | 验证 prompt 改动是否真的有效 |
 | 单任务成本 | `SUM(prompt_tokens + completion_tokens)` | 成本核算 |
 | 任务成功率 | `done / (done + failed + cancelled)` | 整体健康度 |
 | 打回次数分布 | 按打回来源统计 | 找流程薄弱环节 |
@@ -141,6 +144,19 @@ FROM kanban_node_runs
 WHERE started_at > datetime('now', '-7 days')
 GROUP BY stage
 ORDER BY avg_duration DESC;
+
+-- 各闸门逃逸率（决策 137）：下游质量事件相对上游放行量的比例
+-- 下游质量事件 = review 打回（kanban_transitions.trigger='kickback'，to_stage='develop'，
+--               来源 review）+ merge 闸门失败（metadata_json 的 gate='fail'）；
+-- 上游放行量 = 对应 validate_output 的 normal 流转次数。
+-- v1 不做自动归因到具体上游闸门（escaped_from 推断列留 v2），只按阶段对比悬殊度。
+SELECT
+    t.from_stage AS escaped_from_hint,
+    COUNT(*) AS escape_events
+FROM kanban_transitions t
+WHERE t.trigger = 'kickback'
+  AND t.created_at > datetime('now', '-30 days')
+GROUP BY t.from_stage;
 ```
 
 **Trace 关联：** 使用 `tracing` + `tracing-subscriber`，节点 span 带上 `task_id` / `stage` / `node`，全链路可追溯。
@@ -172,7 +188,7 @@ CREATE TABLE IF NOT EXISTS kanban_transitions (
 | `normal` | 正常流转（validate_output 通过 → 下一阶段） |
 | `retry` | validate_output 判定不通过 → 回到 execute 重试（validate_attempts +1） |
 | `node_retry` | 节点级 agent loop 整体失败（元数据校验失败 / 超时 / 崩溃）→ 干净对话重试同一节点（决策 33） |
-| `kickback` | 跨阶段打回（review 不通过 → develop、sync-check backtrack → architect、merge 冲突 → develop） |
+| `kickback` | 跨阶段打回（review 不通过 → develop、sync-check backtrack → architect、merge 冲突 → develop、merge 闸门 lint 失败 → develop（决策 139））；`retry_exhausted` 的 `goto architect-design` 同记为本类（决策 138） |
 | `user_resume` | 用户操作后恢复（补充信息 / 跳过 / 回退） |
 | `auto_resume` | 调度器自动恢复（冲突任务终态 / 依赖恢复） |
 | `timeout` | 超时触发重试 |
@@ -390,11 +406,11 @@ CREATE TABLE IF NOT EXISTS kanban_node_commands (
 | 阶段.节点 | 系统执行的命令 |
 |---|---|
 | init.execute | `git worktree add`、`git branch` |
-| develop.validate_output | 按 `test_framework` 构建的单元测试命令（如 `cargo test` / `pytest` / `npm test`） |
+| develop.validate_output | `lint_command`（如已配置，决策 139）+ 按 `test_framework` 构建的单元测试命令（如 `cargo test` / `pytest` / `npm test`） |
 | review.validate_output | 无（纯代码判断 approved） |
 | test.execute | 按 `test_framework` 构建的集成测试命令（由 agent 通过 `run_command` 触发，agent 驱动的命令） |
 | test.validate_output | 无（读 `test_result` 元数据判断） |
-| merge.execute | `git fetch`、`git rebase`、单元测试 + 集成测试命令、生成 diff、合入（ff / `--no-ff`） |
+| merge.execute | `git fetch`、`git rebase`、lint（如已配置）+ 单元测试 + 集成测试命令、生成 diff、合入（ff / `--no-ff`） |
 | done.execute | `git worktree remove`、`git branch -D` |
 | 取消 / 归档 | `git worktree remove --force`、`git branch -D` |
 
@@ -654,8 +670,9 @@ async fn recover_dependency_failed(&self) -> Result<()> {
 | `pending_updated` | pending 内容变化 | 更新卡片 |
 | `stage_changed` | 阶段切换 | 更新看板列 |
 | `task_done` / `task_failed` / `task_cancelled` | 终态 | 提示用户，更新看板 |
+| `stalled` | 任务停滞超过阈值（pending 超过 `pending_timeout_hours`，置 `stalled = 1`） | 任务卡停滞高亮（见 §12.9 附近对 stalled 的描述） |
 
-> **会话流式事件（决策 123，排掉前端差距①⑤）：** `conversation_delta` 事件体含 `run_id` / `agent_type` / `branch` / `role` / `text`，并带 `prompt_tokens` / `completion_tokens` 增量（流式 token 计数的唯一来源）；`tool_event` 事件体含 `run_id` / `branch` / `tool` / `phase(start|end)` / 参数摘要与结果行数。SSE 只是渲染通道，落库仍走 §12.4.3 的会话写入。
+> **会话流式事件（决策 123，排掉前端差距①⑤）：** `conversation_delta` 事件体含 `run_id` / `agent_type` / `branch` / `role` / `text`，并带 `prompt_tokens` / `completion_tokens` 增量（流式 token 计数的唯一来源）；`tool_event` 事件体含 `run_id` / `branch` / `tool` / `phase(start|end|error)`（error 为实现侧扩展：工具被 FileToolPolicy 拒绝或执行失败）/ 参数摘要与结果行数。SSE 只是渲染通道，落库仍走 §12.4.3 的会话写入。
 
 **离线通知（v2 预留）：** Webhook / 邮件 / 飞书 / Slack 等外部渠道不在 v1 范围（决策 65），完整设计见附录 B。v1 只做 SSE 应用内通知，但保留 `NotificationPolicy` 结构。**职责划分（决策 130）：SSE 全量推送、不做 cooldown 合并**——它是状态同步通道，吞事件会丢状态；cooldown / quiet_hours 只作用于前端 toast 通知层（与 frontend-design §9.1 对齐）。
 
@@ -761,6 +778,7 @@ interface KanbanProject {
   default_branch: string;       // 默认 "main"，用于 worktree 基准与 merge 目标
   language: string;             // 检测到的编程语言（rust/python/typescript 等）
   test_framework: string;       // 检测到的测试框架（cargo_test/pytest/npm_test 等）
+  lint_command?: string;        // 可选静态检查命令（决策 139），探测候选、用户确认时预填
   agents_md_path?: string;      // AGENTS.md 路径（如果存在）
   created_at: string;
 }
@@ -774,10 +792,11 @@ interface KanbanProject {
   → **确定性探测（代码，不调 LLM）**：
       (1) 检测语言（Cargo.toml → Rust，package.json → Node，pyproject.toml → Python）
       (2) 检测测试框架（cargo test / pytest / npm test）
-      (3) 检测 AGENTS.md 是否存在
-      (4) 检测默认分支名（git symbolic-ref refs/remotes/origin/HEAD，无 remote 时取当前分支）
-      (5) 检测目录结构（src/、lib/、tests/）
-      (6) 检测 .gitignore
+      (3) 检测 lint 工具（clippy.toml / ruff.toml / eslint 配置等 → 预填 lint_command，决策 139）
+      (4) 检测 AGENTS.md 是否存在
+      (5) 检测默认分支名（git symbolic-ref refs/remotes/origin/HEAD，无 remote 时取当前分支）
+      (6) 检测目录结构（src/、lib/、tests/）
+      (7) 检测 .gitignore
   → POST /projects/analyze 触发 project_analysis 伪阶段，agent 基于上述事实清单生成
     人读的分析摘要并标注可疑项（如"检测到多套测试框架，请确认"）
   → 展示分析结果到前端
@@ -785,7 +804,7 @@ interface KanbanProject {
   → 存入 kanban_projects 表
 ```
 
-> **职责划分（决策 78）：** 上述六项探测全部是确定性判断，按 G7 用代码实现——更省钱、可单测、结果稳定。`project_analysis` 伪阶段（决策 48）保留，但 agent 的职责收窄为"基于事实清单写摘要 + 标注可疑项"；prompt 可省略（省略时只展示事实清单）。
+> **职责划分（决策 78，探测清单经决策 139 扩为七项）：** 上述探测全部是确定性判断，按 G7 用代码实现——更省钱、可单测、结果稳定。`project_analysis` 伪阶段（决策 48）保留，但 agent 的职责收窄为"基于事实清单写摘要 + 标注可疑项"；prompt 可省略（省略时只展示事实清单）。
 
 **任务创建流程：**
 

@@ -49,3 +49,12 @@ v1 的自适应 P50/P90 仅用于进度展示与告警（决策 66）。若将�
 | 多项目目录维度 | 当前路径不含 project_id，靠前端过滤（决策 58） |
 | 系统级沙箱 | v1 只有 `FileToolPolicy`（文件工具层面），shell 不受限（决策 104 / 19 修订）；OS 级 confinement 延后 |
 | 密钥加密存储 | v1 明文（决策 112），仅靠目录权限；加密方案已评估并否决 |
+| 逃逸率自动归因（`escaped_from`） | v1 只提供逃逸率查询口径（决策 137）；把下游质量事件自动推断归属到具体上游闸门的标签列留 v2——推断准确率未经验证，不固化数据模型 |
+
+### B.6 离线回放 eval（prompt 回归测试）
+
+v1 已落 `prompt_template_hash`（决策 137），指标可按 prompt 版本对比；本项把"事后对比"升级为"事前拦截"：从历史终态任务中筛选 golden set（任务描述 + 任务目录产出 + 实际判定结果），用当前 prompt 模板离线重放关键判定节点（validate_input / validate_output / review.execute），对比判定结论与历史实际，输出通过率报告。改动 prompt 后先跑 eval 再投入使用，防止 prompt 回归。素材基础 v1 已具备：会话全量落库（§12.4.3）+ prompt 版本标注（决策 137）。
+
+### B.7 post-merge 验证与 revert 任务模板
+
+v1 合入即 done（决策 59），合入后的质量由 merge 闸门前置保障，无合入后验证。预留两项：① **post-merge smoke**——合入后可选触发轻量验证任务（复用 test 阶段的执行子集，针对合入后的 `default_branch` 跑冒烟测试）；② **revert 任务模板**——以 `git revert <merge-commit>` 为 init 基底的一键回滚任务类型，复用现有流水线走完整的 develop / review / test / merge 链路，回滚本身也受闸门保护。二者均不改 v1 状态机。

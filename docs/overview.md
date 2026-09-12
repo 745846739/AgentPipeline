@@ -24,11 +24,11 @@ graph TD
 
     test --> merge
     merge -->|审批通过并合入| done
-    merge -->|返回修改 / 冲突打回| develop
+    merge -->|返回修改 / 冲突打回 / 闸门 lint 失败| develop
     merge -->|测试闸门失败| test
 ```
 
-> **并发说明：** `develop-design` 与 `test-design` 并行执行——各自一条独立游标（决策 80），两者都只读 `design.md`，互不依赖，一个分支阻塞不影响另一个跑完本阶段。sync-check 在两条游标都到达边界后汇聚判断（G5），之后进入 develop → review → test 串行链路。review 不通过则打回到 develop 形成循环。merge 时无法自动解决的冲突同样打回 develop；merge 的测试闸门失败则回到 `test.execute` 重新分析根因（决策 85），不直接打回 develop。
+> **并发说明：** `develop-design` 与 `test-design` 并行执行——各自一条独立游标（决策 80），两者都只读 `design.md`，互不依赖，一个分支阻塞不影响另一个跑完本阶段。sync-check 在两条游标都到达边界后汇聚判断（G5），之后进入 develop → review → test 串行链路。review 不通过则打回到 develop 形成循环。merge 时无法自动解决的冲突同样打回 develop；merge 的闸门失败按类型分流（决策 139）：测试失败回到 `test.execute` 重新分析根因（决策 85），lint 失败直接打回 `develop.execute`。
 
 ### 1.2 单阶段内部结构
 
@@ -54,7 +54,7 @@ graph TD
 | execute | 执行成功 | validate_output | 正常流转 |
 | execute | 执行失败（节点级重试耗尽） | pending | timeout / agent 错误。先按 `agent_retry_max` 干净对话重试，耗尽才 pending（G13 / §11.4） |
 | validate_output | 产出合格 | next_stage | 进入下一阶段 |
-| validate_output | 产出不合格 | execute | 重试，prompt 追加反馈 |
+| validate_output | 产出不合格 | execute | 重试，prompt 追加反馈。`cross_family_judge = true` 时，agent 型 validate_output（architect-design / develop-design / test-design）首判不合格先经 `validator_cross_check` 伪阶段异族复判（决策 134）：复判也不合格才走上边打回；复判合格 → pending(user_decision, judge_disagreement) 由用户终审（决策 135），不经本表条件边 |
 | validate_output | 重试耗尽 | pending | retry_exhausted |
 
 > **节点集例外说明：**
@@ -112,6 +112,7 @@ graph TD
 | `keep_recent_rounds` | 5 | 压缩时保留最近 N 轮完整对话 |
 | `context_hard_limit_ratio` | 0.9 | 硬上限，超过则强制压缩或降级模型 |
 | `semantic_conflict_check` | true | 开启 architect 阶段的第二层语义冲突比对（§6） |
+| `cross_family_judge` | false | 开启后 agent 型 validate_output 首判不合格时调用 `validator_cross_check` 伪阶段异族复判（决策 134 / 135）；开启但伪阶段未配置 provider → 配置加载 fail fast |
 | `conflict_overlap_threshold` | 0 | `affected_files` 交集判定冲突的最小重叠文件数，0 表示任一交集即冲突 |
 | `max_concurrent_tasks` | 5 | 同时执行的任务数上限（决策 21 / 36），在 scheduler `start_task` 处准入；名额占用 = `status ∈ {running, pending}`（决策 117） |
 | `allow_dirty_worktree_merge` | false | 允许在目标分支工作区不干净时合入；false 时进入 pending 由用户决定 |
