@@ -807,6 +807,23 @@ pub async fn conversation(
         .ok_or_else(|| ApiError::not_found(format!("没有 run {run_id} 的会话")))
 }
 
+/// `GET /tasks/{id}/conversations/{run_id}/messages`（§12.4.3）：仅返回 messages 数组。
+///
+/// 按任务隔离：查询以 `task_id + run_id` 为条件，不属于该任务的 run 一律 404，
+/// 不泄露其他任务数据（与 `command` 同姿态）。
+pub async fn conversation_messages(
+    State(state): State<AppState>,
+    Path((id, run_id)): Path<(String, i64)>,
+) -> ApiResult<impl IntoResponse> {
+    let conversation = state
+        .store
+        .get_conversation(&id, run_id)
+        .await
+        .map_err(map_core_error)?
+        .ok_or_else(|| ApiError::not_found(format!("任务 {id} 没有 run {run_id} 的会话")))?;
+    Ok(Json(conversation.messages_json))
+}
+
 #[derive(Debug, Deserialize)]
 pub struct CommandQuery {
     pub stage: Option<String>,

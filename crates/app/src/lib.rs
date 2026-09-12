@@ -64,6 +64,10 @@ pub fn build_router(state: AppState) -> Router {
             "/tasks/{id}/conversations/{run_id}",
             get(routes::tasks::conversation),
         )
+        .route(
+            "/tasks/{id}/conversations/{run_id}/messages",
+            get(routes::tasks::conversation_messages),
+        )
         .route("/tasks/{id}/commands", get(routes::tasks::commands))
         .route("/tasks/{id}/commands/{cmd_id}", get(routes::tasks::command))
         .route(

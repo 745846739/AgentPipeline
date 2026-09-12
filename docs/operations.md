@@ -362,6 +362,8 @@ CREATE TABLE IF NOT EXISTS kanban_node_conversations (
 | `GET /tasks/{id}/conversations/{run_id}` | 单个节点会话完整内容 |
 | `GET /tasks/{id}/conversations/{run_id}/messages` | 仅返回 messages 数组（供前端渲染） |
 
+> **messages 端点的隔离语义：** 响应体直接是 messages 数组；查询恒以 `task_id + run_id` 为条件，run 不存在、或存在但不属于该 task 时一律 404，不泄露其他任务数据（与 `GET /tasks/{id}/commands/{cmd_id}` 同姿态）。前端会话查看器仍走整条会话端点 `{run_id}`——它需要同一行里的 `metadata_json` 渲染「提交的元数据」卡片，且已按 run 惰性加载（选中才拉取，不进列表）；`/messages` 端点供只需要消息数组的按需场景使用。
+
 **存储与保留策略：**
 
 | 策略 | 说明 |
