@@ -9,241 +9,16 @@
 //!
 //! FakeAgent 只替换 LLM 响应流；工具层、git、命令记录全部真实执行（决策 148）。
 
-use std::sync::Arc;
+mod common;
 
-use agentpipeline_core::config::Settings;
 use agentpipeline_core::git::Git;
-use agentpipeline_core::pipeline::Executor;
-use agentpipeline_core::scheduler::KanbanScheduler;
 use agentpipeline_core::storage::decisions::MergeDecision;
-use agentpipeline_core::storage::Store;
 use agentpipeline_core::types::{
-    AcceptanceCriterion, Approval, ArchitectExecuteMetadata, CodeChanges, CursorStatus,
-    DevelopDesignMetadata, Gate, MergeResult, Node, NodeStatus, PendingKind, Project, ReviewResult,
-    Stage, TaskStatus, TestDesignMetadata, TestResult, TestScenario, TransitionTrigger,
-    ValidateInputMetadata, ValidateOutputMetadata,
+    Approval, CursorStatus, Gate, MergeResult, Node, NodeStatus, PendingKind, Stage, TaskStatus,
+    TransitionTrigger,
 };
-use testkit::{FakeAgent, ManualClock, RecordingKiller, Repo, Script, SseRecorder, TestHome};
-
-/// 构造一份文档必填字段齐全的 merge metadata（§4.2：该行只在闸门跑完、diff 生成后写入）。
-fn merge_row(diff_path: &str, base_commit: &str) -> MergeResult {
-    MergeResult {
-        diff_path: diff_path.into(),
-        diff_stats: agentpipeline_core::types::DiffStats {
-            files_changed: 1,
-            insertions: 0,
-            deletions: 0,
-            file_details: Vec::new(),
-        },
-        base_commit: base_commit.into(),
-        gate: None,
-        gate_failure_kind: None,
-        gate_failures: 0,
-        gate_failure_output: None,
-        conflict_files: Vec::new(),
-        approval: Approval::None,
-        status: agentpipeline_core::types::MergeStatus::PendingApproval,
-    }
-}
-
-struct Flow {
-    _home: TestHome,
-    repo: Repo,
-    store: Store,
-    clock: ManualClock,
-    killer: RecordingKiller,
-    sse: SseRecorder,
-    agent: FakeAgent,
-    executor: Executor,
-    resumes: std::sync::Arc<std::sync::atomic::AtomicUsize>,
-}
-
-impl Flow {
-    async fn new() -> Self {
-        let home = TestHome::new().unwrap();
-        let clock = ManualClock::fixed();
-        let store = Store::open(home.home().clone(), Arc::new(clock.clone()))
-            .await
-            .unwrap();
-        let repo = Repo::clean().unwrap();
-        // test_framework 配原始命令 `true`：系统闸门零噪声通过（fixture 不是可构建工程）
-        let project = Project {
-            id: "p1".into(),
-            name: "示例".into(),
-            local_path: repo.path().display().to_string(),
-            default_branch: "main".into(),
-            language: None,
-            test_framework: Some("true".into()),
-            lint_command: None,
-            agents_md_path: None,
-            created_at: store.now(),
-        };
-        store.create_project(&project).await.unwrap();
-
-        let sse = SseRecorder::new();
-        let killer = RecordingKiller::new();
-        let agent = FakeAgent::new(Script::new());
-        let executor = Executor::new(
-            store.clone(),
-            Settings::default(),
-            Arc::new(sse.clone()),
-            Arc::new(agent.clone()),
-            Arc::new(killer.clone()),
-        );
-        Flow {
-            _home: home,
-            repo,
-            store,
-            clock,
-            killer,
-            sse,
-            agent,
-            executor,
-            resumes: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
-        }
-    }
-
-    fn scheduler(&self) -> KanbanScheduler {
-        let resumes = self.resumes.clone();
-        KanbanScheduler::new(
-            self.store.clone(),
-            Settings::default(),
-            Arc::new(self.clock.clone()),
-            Arc::new(self.killer.clone()),
-            Arc::new(self.sse.clone()),
-            Arc::new(move |_t: &str| {
-                resumes.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-            }),
-        )
-    }
-
-    async fn sole_cursor(&self, task_id: &str) -> agentpipeline_core::types::NodeCursor {
-        self.store
-            .resolve_sole_cursor(task_id)
-            .await
-            .unwrap()
-            .expect("串行阶段恒有单条 main 游标")
-    }
-}
-
-/// FakeAgent 脚本：设计三分支 + develop/review/test 的最小闭环（真写代码 + 真提交）。
-fn happy_script(script: &mut Script, task_id: &str) {
-    use agentpipeline_core::types as t;
-
-    script
-        .for_node(Stage::ArchitectDesign, Node::ValidateInput)
-        .submit(&ValidateInputMetadata {
-            readiness: true,
-            blockers: vec![],
-        });
-    script
-        .for_node(Stage::ArchitectDesign, Node::Execute)
-        .write_file("design.md", "# 设计\n## 验收标准\n- AC-1 能登录\n")
-        .submit(&ArchitectExecuteMetadata {
-            readiness: true,
-            affected_files: vec!["src/lib.rs".into()],
-            new_symbols: vec![],
-            acceptance_criteria: vec![AcceptanceCriterion {
-                id: "AC-1".into(),
-                description: "能登录".into(),
-            }],
-            ..Default::default()
-        });
-    script
-        .for_node(Stage::ArchitectDesign, Node::ValidateOutput)
-        .submit(&ValidateOutputMetadata {
-            passed: true,
-            ..Default::default()
-        });
-
-    script
-        .for_node(Stage::DevelopDesign, Node::ValidateInput)
-        .submit(&ValidateInputMetadata {
-            readiness: true,
-            blockers: vec![],
-        });
-    script
-        .for_node(Stage::DevelopDesign, Node::Execute)
-        .write_file("dev-plan.md", "# 开发计划\n")
-        .submit(&DevelopDesignMetadata {
-            readiness: true,
-            dev_doc_path: Some("dev-plan.md".into()),
-            ..Default::default()
-        });
-    script
-        .for_node(Stage::DevelopDesign, Node::ValidateOutput)
-        .submit(&ValidateOutputMetadata {
-            passed: true,
-            ..Default::default()
-        });
-
-    script
-        .for_node(Stage::TestDesign, Node::ValidateInput)
-        .submit(&ValidateInputMetadata {
-            readiness: true,
-            blockers: vec![],
-        });
-    script
-        .for_node(Stage::TestDesign, Node::Execute)
-        .write_file("test-scenarios.md", "# 测试场景\n")
-        .submit(&TestDesignMetadata {
-            readiness: true,
-            blockers: vec![],
-            test_scenarios_path: Some("test-scenarios.md".into()),
-            test_scenarios: vec![TestScenario {
-                id: "S-1".into(),
-                name: "登录成功".into(),
-                description: "登录".into(),
-                preconditions: vec![],
-                steps: vec![],
-                expected_result: "成功".into(),
-                priority: t::ScenarioPriority::High,
-                design_refs: vec!["AC-1".into()],
-            }],
-        });
-    script
-        .for_node(Stage::TestDesign, Node::ValidateOutput)
-        .submit(&ValidateOutputMetadata {
-            passed: true,
-            ..Default::default()
-        });
-
-    script
-        .for_node(Stage::Develop, Node::Execute)
-        .write_file(
-            "src/lib.rs",
-            "pub fn add(a: i32, b: i32) -> i32 { a + b }\n#[test]\nfn adds() { assert_eq!(add(1, 2), 3); }\n",
-        )
-        .write_file("tests/acceptance.rs", "#[test]\nfn ok() {}\n")
-        .run_command(&format!(
-            "git add -A && git -c user.name=f -c user.email=f@l commit -m 'feat: task {task_id}'"
-        ))
-        .submit(&CodeChanges {
-            branch_name: format!("kanban/{task_id}"),
-            changed_files: vec![],
-            unit_test_files: vec![],
-        });
-    script
-        .for_node(Stage::Review, Node::Execute)
-        .write_file(
-            "review-report.md",
-            "# 评审报告\n## 设计符合性\n通过\n## 测试质量\n通过\n",
-        )
-        .submit(&ReviewResult {
-            approved: true,
-            review_report_path: Some("review-report.md".into()),
-            required_changes: vec![],
-        });
-    script
-        .for_node(Stage::Test, Node::Execute)
-        .write_file("test-report.md", "# 测试报告\n全部通过\n")
-        .submit(&TestResult {
-            passed: true,
-            test_report_path: Some("test-report.md".into()),
-            failures: vec![],
-            gate_recheck: false,
-        });
-}
+use common::{full_pass_script, merge_row, Flow};
+use testkit::Script;
 
 #[tokio::test]
 async fn happy_path_full_flow() {
@@ -251,7 +26,7 @@ async fn happy_path_full_flow() {
     let base_commit = f.repo.head("main");
     // FakeAgent 脚本驱动全流程
     let mut script = Script::new();
-    happy_script(&mut script, "t1");
+    full_pass_script(&mut script, "t1");
     f.agent.set_script(script);
 
     // ── 创建：queued + 同事务 main 游标（决策 90 / 98）──
@@ -290,7 +65,7 @@ async fn happy_path_full_flow() {
     assert_eq!(merge.gate, Some(Gate::Pass));
     assert!(merge.diff_stats.files_changed >= 1);
     let proposal =
-        std::fs::read_to_string(f._home.home().task_file("t1", "merge-proposal.diff")).unwrap();
+        std::fs::read_to_string(f.home.home().task_file("t1", "merge-proposal.diff")).unwrap();
     assert!(proposal.contains("src/lib.rs"));
     // 基准未变 → 可合入（决策 96 的前置条件）
     assert_eq!(
@@ -307,7 +82,7 @@ async fn happy_path_full_flow() {
         "test-report.md",
     ] {
         assert!(
-            f._home.home().task_file("t1", doc).exists(),
+            f.home.home().task_file("t1", doc).exists(),
             "{doc} 应存在于任务目录"
         );
     }
@@ -329,7 +104,7 @@ async fn happy_path_full_flow() {
     // ── 终态断言 ──
     let task = f.store.get_task("t1").await.unwrap();
     assert_eq!(task.status, TaskStatus::Done);
-    let worktree = f._home.home().worktree_path("t1");
+    let worktree = f.home.home().worktree_path("t1");
     assert!(!worktree.exists(), "worktree 应被清理");
     assert!(!f.repo.branch_exists("kanban/t1"), "任务分支应被删除");
     assert!(
@@ -433,7 +208,7 @@ async fn base_moved_invalidates_approval_and_reruns_phase_a() {
     let f = Flow::new().await;
     testkit::seed_task(&f.store, "t1", "p1").await.unwrap();
     f.scheduler().tick().await.unwrap();
-    let worktree = f._home.home().worktree_path("t1");
+    let worktree = f.home.home().worktree_path("t1");
     Git.init_worktree(f.repo.path(), "t1", &worktree, "main")
         .await
         .unwrap();
@@ -532,7 +307,7 @@ async fn retry_resets_worktree_and_requeues_for_admission() {
     let f = Flow::new().await;
     testkit::seed_task(&f.store, "t1", "p1").await.unwrap();
     f.scheduler().tick().await.unwrap();
-    let worktree = f._home.home().worktree_path("t1");
+    let worktree = f.home.home().worktree_path("t1");
     Git.init_worktree(f.repo.path(), "t1", &worktree, "main")
         .await
         .unwrap();

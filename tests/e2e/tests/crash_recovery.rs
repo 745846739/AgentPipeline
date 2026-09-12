@@ -11,140 +11,17 @@
 //! - `executor_owner` 残留阻断再 claim，`clear_executor_owners` 后可重新准入；
 //! - 节点级幂等重跑：已完成的上游节点不重跑，产出不重复（G8/G9）。
 
-use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::Arc;
-use std::time::{Duration, Instant};
+mod common;
 
-use agentpipeline_core::config::Settings;
-use agentpipeline_core::pipeline::Executor;
-use agentpipeline_core::scheduler::KanbanScheduler;
 use agentpipeline_core::storage::decisions::MergeDecision;
-use agentpipeline_core::storage::Store;
 use agentpipeline_core::types::{
     AcceptanceCriterion, ArchitectExecuteMetadata, CodeChanges, CursorStatus,
-    DevelopDesignMetadata, Node, Project, ReviewResult, Stage, TaskStatus, TestDesignMetadata,
-    TestResult, TestScenario, ValidateInputMetadata, ValidateOutputMetadata,
+    DevelopDesignMetadata, Node, ReviewResult, Stage, TaskStatus, TestDesignMetadata, TestResult,
+    TestScenario, ValidateInputMetadata, ValidateOutputMetadata,
 };
+use common::Flow;
 use testkit::script::NodeScript;
-use testkit::{FakeAgent, ManualClock, RecordingKiller, Repo, Script, SseRecorder, TestHome};
-
-struct Flow {
-    _home: TestHome,
-    repo: Repo,
-    store: Store,
-    clock: ManualClock,
-    killer: RecordingKiller,
-    sse: SseRecorder,
-    agent: FakeAgent,
-    resumes: Arc<AtomicUsize>,
-}
-
-impl Flow {
-    async fn new() -> Self {
-        let home = TestHome::new().unwrap();
-        let clock = ManualClock::fixed();
-        let store = Store::open(home.home().clone(), Arc::new(clock.clone()))
-            .await
-            .unwrap();
-        let repo = Repo::clean().unwrap();
-        store
-            .create_project(&Project {
-                id: "p1".into(),
-                name: "示例".into(),
-                local_path: repo.path().display().to_string(),
-                default_branch: "main".into(),
-                language: None,
-                // 闸门命令零噪声通过（fixture 不是可构建工程）
-                test_framework: Some("true".into()),
-                lint_command: None,
-                agents_md_path: None,
-                created_at: store.now(),
-            })
-            .await
-            .unwrap();
-
-        let sse = SseRecorder::new();
-        let killer = RecordingKiller::new();
-        let agent = FakeAgent::new(Script::new());
-        Flow {
-            _home: home,
-            repo,
-            store,
-            clock,
-            killer,
-            sse,
-            agent,
-            resumes: Arc::new(AtomicUsize::new(0)),
-        }
-    }
-
-    /// 每次新建 executor，模拟"进程重启后重建执行器"（进程内注册表随之清空，
-    /// 但 DB `executor_owner` 残留照旧——正是决策 127 要清的现场）。
-    fn executor(&self) -> Executor {
-        Executor::new(
-            self.store.clone(),
-            Settings::default(),
-            Arc::new(self.sse.clone()),
-            Arc::new(self.agent.clone()),
-            Arc::new(self.killer.clone()),
-        )
-    }
-
-    fn scheduler(&self) -> KanbanScheduler {
-        let resumes = self.resumes.clone();
-        KanbanScheduler::new(
-            self.store.clone(),
-            Settings::default(),
-            Arc::new(self.clock.clone()),
-            Arc::new(self.killer.clone()),
-            Arc::new(self.sse.clone()),
-            Arc::new(move |_t: &str| {
-                resumes.fetch_add(1, Ordering::SeqCst);
-            }),
-        )
-    }
-
-    async fn seed_and_admit(&self, task_id: &str) {
-        testkit::seed_task(&self.store, task_id, "p1")
-            .await
-            .unwrap();
-        let report = self.scheduler().tick().await.unwrap();
-        assert_eq!(report.admitted, vec![task_id.to_string()]);
-        assert_eq!(
-            self.store.get_task(task_id).await.unwrap().status,
-            TaskStatus::Running
-        );
-    }
-
-    fn spawn_executor(
-        &self,
-        task_id: &str,
-    ) -> tokio::task::JoinHandle<agentpipeline_core::Result<()>> {
-        let executor = self.executor();
-        let id = task_id.to_string();
-        tokio::spawn(async move { executor.run(&id).await })
-    }
-
-    /// 启动 executor 并轮询直到指定节点被调用（FakeAgent 脚本挂起），然后 abort。
-    /// 返回被中断节点的调用次数——abort 发生在 LLM 调用进行中。
-    async fn run_until_node_then_abort(&self, task_id: &str, stage: Stage, node: Node) -> u32 {
-        let handle = self.spawn_executor(task_id);
-        let deadline = Instant::now() + Duration::from_secs(30);
-        while self.agent.calls_for(stage, node) == 0 {
-            assert!(
-                Instant::now() < deadline,
-                "30s 内未到达中断节点 {stage}.{node}；调用序列 = {:?}；任务状态 = {:?}",
-                self.agent.call_log(),
-                self.store.get_task(task_id).await.map(|t| t.status)
-            );
-            tokio::time::sleep(Duration::from_millis(10)).await;
-        }
-        let calls = self.agent.calls_for(stage, node);
-        handle.abort();
-        let _ = handle.await; // 等取消完成：进程内执行器守卫随之释放
-        calls
-    }
-}
+use testkit::Script;
 
 // ─────────────────────────── 脚本（与 E2E-01 同构，可在指定节点注入挂起）───────────────────────────
 
@@ -330,7 +207,7 @@ async fn interrupted_node_resumes_after_restart_and_owner_cleanup() {
 
     // 重启：换一份"无挂起"脚本，从 develop.execute 续跑
     f.agent.set_script(pipeline_script("t1", &[]));
-    f.executor().run("t1").await.unwrap();
+    f.fresh_executor().run("t1").await.unwrap();
 
     // 停在 merge 阶段 A（设计行为）
     let task = f.store.get_task("t1").await.unwrap();
@@ -339,7 +216,7 @@ async fn interrupted_node_resumes_after_restart_and_owner_cleanup() {
         .apply_merge_decision("t1", MergeDecision::Approve)
         .await
         .unwrap();
-    f.executor().run("t1").await.unwrap();
+    f.fresh_executor().run("t1").await.unwrap();
 
     // 到达终态
     assert_eq!(
@@ -417,7 +294,7 @@ async fn parallel_branches_recover_independently_and_join_survives_restart() {
 
     // 重启续跑：两分支各自从中断节点补完 → join 恰执行一次 → 下游 continue
     f.agent.set_script(pipeline_script("t2", &[]));
-    f.executor().run("t2").await.unwrap();
+    f.fresh_executor().run("t2").await.unwrap();
 
     assert_eq!(
         f.store
@@ -435,7 +312,7 @@ async fn parallel_branches_recover_independently_and_join_survives_restart() {
         .apply_merge_decision("t2", MergeDecision::Approve)
         .await
         .unwrap();
-    f.executor().run("t2").await.unwrap();
+    f.fresh_executor().run("t2").await.unwrap();
     assert_eq!(
         f.store.get_task("t2").await.unwrap().status,
         TaskStatus::Done
@@ -509,7 +386,7 @@ async fn waiting_join_survives_restart_and_join_advances_when_sibling_ready() {
 
     // 重启：develop-design 分支就位 → join（sync-check）恰执行一次
     f.agent.set_script(pipeline_script("t3", &[]));
-    f.executor().run("t3").await.unwrap();
+    f.fresh_executor().run("t3").await.unwrap();
 
     assert_eq!(
         f.store

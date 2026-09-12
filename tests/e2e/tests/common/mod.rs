@@ -2,20 +2,26 @@
 //! testkit fixture + 临时 home + 手动 tick / 假时钟。
 //!
 //! FakeAgent 只替换 LLM 响应流；工具层、git、命令记录全部真实执行（决策 148）。
+//!
+//! **FakeAgent 脚本队列按 attempt 投喂的注记（票 19 文末测试基建注记）：** agent loop
+//! 会一直消耗同节点脚本队列直到队列干涸才收尾，因此「多轮行为」（例如首轮失败 →
+//! 重试成功）必须用 `set_script` 分轮投喂，队列不会自动按 attempt 切片。
+//! 另：executor 注册表以 task_id 为**进程全局**键，同进程并发用例须用互不相同的 task_id。
 #![allow(dead_code)]
 
-use std::sync::atomic::AtomicUsize;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use agentpipeline_core::config::Settings;
 use agentpipeline_core::pipeline::Executor;
 use agentpipeline_core::scheduler::KanbanScheduler;
 use agentpipeline_core::storage::Store;
 use agentpipeline_core::types::{
-    AcceptanceCriterion, Approval, ArchitectExecuteMetadata, CodeChanges, DevelopDesignMetadata,
-    DiffStats, MergeResult, MergeStatus, Node, NodeCursor, Project, ReviewResult, ScenarioPriority,
-    Stage, TestDesignMetadata, TestResult, TestScenario, ValidateInputMetadata,
-    ValidateOutputMetadata,
+    AcceptanceCriterion, Approval, ArchitectExecuteMetadata, CodeChanges, CursorStatus,
+    DevelopDesignMetadata, DiffStats, MergeResult, MergeStatus, Node, NodeCursor, PendingReason,
+    Project, ReviewResult, ScenarioPriority, Stage, TaskStatus, TestDesignMetadata, TestResult,
+    TestScenario, ValidateInputMetadata, ValidateOutputMetadata,
 };
 use testkit::{FakeAgent, ManualClock, RecordingKiller, Repo, Script, SseRecorder, TestHome};
 
@@ -104,8 +110,26 @@ impl Flow {
             Arc::new(self.killer.clone()),
             Arc::new(self.sse.clone()),
             Arc::new(move |_t: &str| {
-                resumes.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                resumes.fetch_add(1, Ordering::SeqCst);
             }),
+        )
+    }
+
+    /// 新建一个 executor（不复用 `self.executor`）。
+    ///
+    /// 崩溃恢复场景（E2E-13）用它模拟「进程重启后重建执行器」：进程内注册表随之清空，
+    /// 但 DB 的 `executor_owner` 残留照旧——正是决策 127 要清理的现场。
+    pub fn fresh_executor(&self) -> Executor {
+        self.fresh_executor_with(self.settings.clone())
+    }
+
+    pub fn fresh_executor_with(&self, settings: Settings) -> Executor {
+        Executor::new(
+            self.store.clone(),
+            settings,
+            Arc::new(self.sse.clone()),
+            Arc::new(self.agent.clone()),
+            Arc::new(self.killer.clone()),
         )
     }
 
@@ -113,6 +137,41 @@ impl Flow {
     pub async fn admit(&self, task_id: &str) {
         let report = self.scheduler().tick().await.unwrap();
         assert_eq!(report.admitted, vec![task_id.to_string()]);
+    }
+
+    /// seed 任务 + 准入 + 断言进入 running（崩溃恢复用例的前置）。
+    pub async fn seed_and_admit(&self, task_id: &str) {
+        testkit::seed_task(&self.store, task_id, "p1")
+            .await
+            .unwrap();
+        let report = self.scheduler().tick().await.unwrap();
+        assert_eq!(report.admitted, vec![task_id.to_string()]);
+        assert_eq!(
+            self.store.get_task(task_id).await.unwrap().status,
+            TaskStatus::Running
+        );
+    }
+
+    /// 启动 executor 并轮询直到指定节点被调用（FakeAgent 脚本挂起），然后 abort。
+    /// 返回被中断节点的调用次数——abort 发生在 LLM 调用进行中。
+    pub async fn run_until_node_then_abort(&self, task_id: &str, stage: Stage, node: Node) -> u32 {
+        let executor = self.fresh_executor();
+        let id = task_id.to_string();
+        let handle = tokio::spawn(async move { executor.run(&id).await });
+        let deadline = Instant::now() + Duration::from_secs(30);
+        while self.agent.calls_for(stage, node) == 0 {
+            assert!(
+                Instant::now() < deadline,
+                "30s 内未到达中断节点 {stage}.{node}；调用序列 = {:?}；任务状态 = {:?}",
+                self.agent.call_log(),
+                self.store.get_task(task_id).await.map(|t| t.status)
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        let calls = self.agent.calls_for(stage, node);
+        handle.abort();
+        let _ = handle.await; // 等取消完成：进程内执行器守卫随之释放
+        calls
     }
 
     pub async fn live_cursors(&self, task_id: &str) -> Vec<NodeCursor> {
@@ -129,15 +188,58 @@ impl Flow {
             .unwrap_or_else(|| panic!("游标 {branch} 应存在"))
     }
 
+    /// 恰好一条活跃游标（串行阶段恒为 main）。
     pub async fn sole_cursor(&self, task_id: &str) -> NodeCursor {
         let live = self.live_cursors(task_id).await;
         assert_eq!(live.len(), 1, "应只有一条活跃游标：{live:?}");
         live.into_iter().next().unwrap()
     }
 
-    /// develop / review / test 的最小闭环（真写代码 + 真提交）。
-    pub fn implementation_script(&self, script: &mut Script, task_id: &str) {
-        implementation_ok(script, task_id);
+    /// sync-check 落库的 SyncDecision（stage output metadata）。
+    pub async fn sync_decision(&self, task_id: &str) -> serde_json::Value {
+        self.store
+            .stage_output_metadata(task_id, Stage::SyncCheck, "sync_decision")
+            .await
+            .unwrap()
+            .expect("sync_decision 产出应存在")
+    }
+
+    /// 该任务当前挂着的待办（取第一条 pending 游标的理由）。
+    ///
+    /// 读 pending 的 `context`（含 `kind`）——票 05 / 06 断言动作集与警告上下文用。
+    pub async fn pending_of(&self, task_id: &str) -> PendingReason {
+        self.store
+            .load_live_cursors(task_id)
+            .await
+            .unwrap()
+            .into_iter()
+            .filter(|c| c.status == CursorStatus::Pending)
+            .find_map(|c| c.pending_reason)
+            .unwrap_or_else(|| panic!("任务 {task_id} 应有 pending 游标"))
+    }
+
+    /// 某 `(stage, node)` 的全部 LLM 请求（按发生顺序），用于断言重入 prompt。
+    pub fn requests_for(
+        &self,
+        stage: Stage,
+        node: Node,
+    ) -> Vec<agentpipeline_core::agent::client::LlmRequest> {
+        self.agent
+            .request_log()
+            .into_iter()
+            .filter(|r| r.stage == stage && r.node == node)
+            .collect()
+    }
+
+    /// 某 `(stage, node)` 第 `index` 次（0 基）请求的 user prompt。
+    ///
+    /// 重入反馈注入（票 07 / 08）按「第几次请求」断言首轮与重入的差异。
+    pub fn user_prompt_at(&self, stage: Stage, node: Node, index: usize) -> String {
+        self.requests_for(stage, node)
+            .get(index)
+            .unwrap_or_else(|| panic!("{stage}.{node} 第 {index} 次请求应存在"))
+            .user_prompt
+            .clone()
     }
 
     /// 直接推出一个 merge_result 行（阶段 A 后置状态构造用）。

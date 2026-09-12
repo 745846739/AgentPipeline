@@ -14,176 +14,21 @@
 //! 各用例让流程停在紧随 join 的自然暂停点（脚本耗尽 → pending(retry_exhausted)
 //! 或 info_insufficient），并经由 sync_decision 产出、run 行与请求快照断言。
 
-use std::sync::Arc;
+mod common;
 
-use agentpipeline_core::config::Settings;
-use agentpipeline_core::pipeline::Executor;
-use agentpipeline_core::scheduler::KanbanScheduler;
 use agentpipeline_core::storage::decisions::ResumeAction;
-use agentpipeline_core::storage::Store;
 use agentpipeline_core::types::{
-    AcceptanceCriterion, ArchitectExecuteMetadata, CursorStatus, DevelopDesignMetadata, Node,
-    NodeCursor, PendingKind, Project, ScenarioPriority, Stage, TaskStatus, TestDesignMetadata,
-    TestScenario, TransitionTrigger, ValidateInputMetadata, ValidateOutputMetadata,
+    CursorStatus, DevelopDesignMetadata, Node, NodeCursor, PendingKind, ScenarioPriority, Stage,
+    TaskStatus, TestDesignMetadata, TestScenario, TransitionTrigger, ValidateInputMetadata,
+    ValidateOutputMetadata,
 };
-use testkit::{FakeAgent, ManualClock, RecordingKiller, Repo, Script, SseRecorder, TestHome};
-
-struct Flow {
-    _home: TestHome,
-    _repo: Repo,
-    store: Store,
-    clock: ManualClock,
-    killer: RecordingKiller,
-    sse: SseRecorder,
-    agent: FakeAgent,
-    executor: Executor,
-    resumes: std::sync::Arc<std::sync::atomic::AtomicUsize>,
-}
-
-impl Flow {
-    async fn new() -> Self {
-        let home = TestHome::new().unwrap();
-        let clock = ManualClock::fixed();
-        let store = Store::open(home.home().clone(), Arc::new(clock.clone()))
-            .await
-            .unwrap();
-        let repo = Repo::clean().unwrap();
-        // test_framework 配原始命令 `true`：系统闸门零噪声通过（fixture 不是可构建工程）
-        let project = Project {
-            id: "p1".into(),
-            name: "示例".into(),
-            local_path: repo.path().display().to_string(),
-            default_branch: "main".into(),
-            language: None,
-            test_framework: Some("true".into()),
-            lint_command: None,
-            agents_md_path: None,
-            created_at: store.now(),
-        };
-        store.create_project(&project).await.unwrap();
-
-        let sse = SseRecorder::new();
-        let killer = RecordingKiller::new();
-        let agent = FakeAgent::new(Script::new());
-        let executor = Executor::new(
-            store.clone(),
-            Settings::default(),
-            Arc::new(sse.clone()),
-            Arc::new(agent.clone()),
-            Arc::new(killer.clone()),
-        );
-        Flow {
-            _home: home,
-            _repo: repo,
-            store,
-            clock,
-            killer,
-            sse,
-            agent,
-            executor,
-            resumes: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
-        }
-    }
-
-    fn scheduler(&self) -> KanbanScheduler {
-        let resumes = self.resumes.clone();
-        KanbanScheduler::new(
-            self.store.clone(),
-            Settings::default(),
-            Arc::new(self.clock.clone()),
-            Arc::new(self.killer.clone()),
-            Arc::new(self.sse.clone()),
-            Arc::new(move |_t: &str| {
-                resumes.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-            }),
-        )
-    }
-
-    async fn admit(&self, task_id: &str) {
-        let report = self.scheduler().tick().await.unwrap();
-        assert_eq!(report.admitted, vec![task_id.to_string()]);
-    }
-
-    async fn live_cursor(&self, task_id: &str, branch: &str) -> NodeCursor {
-        self.store
-            .load_live_cursors(task_id)
-            .await
-            .unwrap()
-            .into_iter()
-            .find(|c| c.branch == branch)
-            .unwrap_or_else(|| panic!("游标 {branch} 应存在"))
-    }
-
-    async fn sole_live_cursor(&self, task_id: &str) -> NodeCursor {
-        let live = self.store.load_live_cursors(task_id).await.unwrap();
-        assert_eq!(live.len(), 1, "应只有一条活跃游标：{live:?}");
-        live.into_iter().next().unwrap()
-    }
-
-    /// sync-check 落库的 SyncDecision（stage output metadata）。
-    async fn sync_decision(&self, task_id: &str) -> serde_json::Value {
-        self.store
-            .stage_output_metadata(task_id, Stage::SyncCheck, "sync_decision")
-            .await
-            .unwrap()
-            .expect("sync_decision 产出应存在")
-    }
-}
+use common::{architect_ok, dev_design_ok, Flow};
+use testkit::Script;
 
 // ─────────────────────────── 脚本片段 ───────────────────────────
 
-/// architect-design 三节点正常通过（design.md 带 AC-1，供 design_refs 引用）。
-fn architect_ok(script: &mut Script) {
-    script
-        .for_node(Stage::ArchitectDesign, Node::ValidateInput)
-        .submit(&ValidateInputMetadata {
-            readiness: true,
-            blockers: vec![],
-        });
-    script
-        .for_node(Stage::ArchitectDesign, Node::Execute)
-        .write_file("design.md", "# 设计\n## 验收标准\n- AC-1 能登录\n")
-        .submit(&ArchitectExecuteMetadata {
-            readiness: true,
-            affected_files: vec!["src/lib.rs".into()],
-            new_symbols: vec![],
-            acceptance_criteria: vec![AcceptanceCriterion {
-                id: "AC-1".into(),
-                description: "能登录".into(),
-            }],
-            ..Default::default()
-        });
-    script
-        .for_node(Stage::ArchitectDesign, Node::ValidateOutput)
-        .submit(&ValidateOutputMetadata {
-            passed: true,
-            ..Default::default()
-        });
-}
-
-fn dev_design_ok(script: &mut Script) {
-    script
-        .for_node(Stage::DevelopDesign, Node::ValidateInput)
-        .submit(&ValidateInputMetadata {
-            readiness: true,
-            blockers: vec![],
-        });
-    script
-        .for_node(Stage::DevelopDesign, Node::Execute)
-        .write_file("dev-plan.md", "# 开发计划\n")
-        .submit(&DevelopDesignMetadata {
-            readiness: true,
-            dev_doc_path: Some("dev-plan.md".into()),
-            ..Default::default()
-        });
-    script
-        .for_node(Stage::DevelopDesign, Node::ValidateOutput)
-        .submit(&ValidateOutputMetadata {
-            passed: true,
-            ..Default::default()
-        });
-}
-
+/// test-design 通过，但场景用 Medium 优先级且 `design_refs` 为空——sync-check 的
+/// design_refs 完整性校验（决策 136）因此不产生悬空 blocker，join 场景可干净推进。
 fn test_design_ok(script: &mut Script) {
     script
         .for_node(Stage::TestDesign, Node::ValidateInput)
@@ -236,7 +81,7 @@ async fn e2e_11_architect_skip_splits_into_parallel_branches() {
     f.admit("js1").await;
     f.executor.run("js1").await.unwrap();
 
-    let cursor = f.sole_live_cursor("js1").await;
+    let cursor = f.sole_cursor("js1").await;
     assert_eq!(
         cursor.pending_reason.as_ref().unwrap().kind,
         PendingKind::InfoInsufficient
@@ -355,7 +200,7 @@ async fn e2e_11_develop_design_skip_marks_skipped_to_join_and_proceeds() {
         2,
         "两条分支游标归档（决策 113）"
     );
-    let main = f.sole_live_cursor("js2").await;
+    let main = f.sole_cursor("js2").await;
     assert_eq!((main.stage, main.node), (Stage::Develop, Node::Execute));
 
     // 下游 prompt 降级语义（决策 115）：develop.execute 的 system prompt 显式写明
@@ -429,7 +274,7 @@ async fn e2e_11_test_design_skip_is_readiness_true_without_refs_check() {
         .await
         .unwrap()
         .is_none());
-    let main = f.sole_live_cursor("js3").await;
+    let main = f.sole_cursor("js3").await;
     assert_eq!((main.stage, main.node), (Stage::Develop, Node::Execute));
 }
 
@@ -504,7 +349,7 @@ async fn e2e_12_pending_branch_resumes_then_join_proceeds() {
             .is_some(),
         "真实执行的分支有产出行（对比 skip 场景）"
     );
-    let main = f.sole_live_cursor("js4").await;
+    let main = f.sole_cursor("js4").await;
     assert_eq!((main.stage, main.node), (Stage::Develop, Node::Execute));
     let all = f.store.load_all_cursors("js4").await.unwrap();
     assert_eq!(
@@ -574,7 +419,7 @@ async fn e2e_02_sync_check_backtrack_resets_to_architect_and_marks_docs_stale() 
     f.executor.run("js5").await.unwrap();
 
     // main 游标回到 architect-design.validate_input（决策 83）
-    let main = f.sole_live_cursor("js5").await;
+    let main = f.sole_cursor("js5").await;
     assert_eq!(
         (main.stage, main.node),
         (Stage::ArchitectDesign, Node::ValidateInput),
@@ -600,7 +445,7 @@ async fn e2e_02_sync_check_backtrack_resets_to_architect_and_marks_docs_stale() 
         .unwrap();
     f.executor.run("js5").await.unwrap();
 
-    let main = f.sole_live_cursor("js5").await;
+    let main = f.sole_cursor("js5").await;
     assert_eq!(
         main.pending_reason.as_ref().unwrap().kind,
         PendingKind::InfoInsufficient
@@ -647,20 +492,17 @@ async fn e2e_02_sync_check_backtrack_resets_to_architect_and_marks_docs_stale() 
         .unwrap();
     assert!(!design.stale, "design.md 不标过期");
     assert!(
-        f._home.home().task_file("js5", "dev-plan.md").exists(),
+        f.home.home().task_file("js5", "dev-plan.md").exists(),
         "文件保留供回溯"
     );
     assert!(
-        f._home
-            .home()
-            .task_file("js5", "test-scenarios.md")
-            .exists(),
+        f.home.home().task_file("js5", "test-scenarios.md").exists(),
         "文件保留供回溯"
     );
 
     // 决策 126：blockers 写入 backtrack-feedback.md
     let feedback =
-        std::fs::read_to_string(f._home.home().task_file("js5", "backtrack-feedback.md")).unwrap();
+        std::fs::read_to_string(f.home.home().task_file("js5", "backtrack-feedback.md")).unwrap();
     assert!(
         feedback.contains("缺少数据流定义"),
         "dev blockers 进反馈文件"
