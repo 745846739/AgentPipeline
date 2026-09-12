@@ -55,6 +55,12 @@ pub trait CommandRecorder: Send + Sync + 'static {
     ) -> BoxFuture<'static, Result<()>>;
     /// 刷新所属 run 的 `last_activity_at`（决策 100：长命令不得被空闲超时误杀）。
     fn touch_heartbeat(&self, run_id: Option<i64>) -> BoxFuture<'static, Result<()>>;
+
+    /// 回填 run 的真实进程组 id（决策 66 / 票 17）：scheduler 超时时据此杀整个进程组。
+    /// 默认空实现——不关心 pgid 的记录器（含测试替身）无需改。
+    fn set_process_group(&self, _run_id: i64, _pgid: i32) -> BoxFuture<'static, Result<()>> {
+        Box::pin(async { Ok(()) })
+    }
 }
 
 /// 工具调用上下文。
@@ -353,15 +359,25 @@ impl ToolExecutor {
         // 决策 100：运行期间周期心跳——600s 级命令不被 300s 空闲超时误杀
         let heartbeat = self.spawn_command_heartbeat(ctx.run_id);
         let started = Instant::now();
-        let output = tokio::time::timeout(
-            std::time::Duration::from_secs(timeout_sec),
-            tokio::process::Command::new("sh")
-                .arg("-c")
-                .arg(&command)
-                .current_dir(&cwd)
-                .output(),
-        )
-        .await;
+        // 独立进程组启动（票 17 / 决策 66）：捕获真实 pgid 回填 node_runs，
+        // 超时回调终止器杀整个进程组（此前 kill(0) 是 no-op）。
+        let mut child_pgid: Option<i32> = None;
+        let output = match crate::process::spawn_in_own_process_group(&command, &cwd) {
+            Ok(child) => {
+                child_pgid = child.id().map(|id| id as i32);
+                if let (Some(rec), Some(run_id), Some(pgid)) =
+                    (self.recorder.as_ref(), ctx.run_id, child_pgid)
+                {
+                    rec.set_process_group(run_id, pgid).await?;
+                }
+                tokio::time::timeout(
+                    std::time::Duration::from_secs(timeout_sec),
+                    child.wait_with_output(),
+                )
+                .await
+            }
+            Err(e) => Ok(Err(e)),
+        };
         if let Some(task) = &heartbeat {
             task.abort();
         }
@@ -409,8 +425,11 @@ impl ToolExecutor {
         }
 
         if timed_out {
-            // 超时由节点级重试处理；这里只需把失败形态交给 agent loop
-            self.killer.kill_process_group(0)?; // 无 pgid 时为 no-op，真实 pgid 由进程管理器提供
+            // 超时由节点级重试处理；这里把失败形态交给 agent loop，并杀掉整个进程组
+            //（pgid 已在启动时捕获并回填 node_runs，决策 66 / 票 17）
+            if let Some(pgid) = child_pgid {
+                self.killer.kill_process_group(pgid)?;
+            }
         }
 
         Ok(ToolOutcome::ok(in_context))

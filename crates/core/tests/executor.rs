@@ -553,6 +553,66 @@ async fn concurrent_executors_deduplicate_on_the_same_task() {
     );
 }
 
+/// `try_run` 必须把「被在跑的 executor 挡下」报告给调用方，否则 resume 钩子无法重试，
+/// 审批/恢复请求落在旧 executor 退出窗口内会被静默丢弃（任务永久 pending）。
+#[tokio::test]
+async fn try_run_reports_skip_so_the_resume_hook_can_retry() {
+    let ctx = setup("true", Settings::default()).await;
+    let (tx, rx) = tokio::sync::oneshot::channel::<()>();
+    let calls = Arc::new(AtomicUsize::new(0));
+    let agent = BlockingAgentSimple {
+        gate: Arc::new(tokio::sync::Mutex::new(Some(rx))),
+        calls: calls.clone(),
+    };
+    let llm: Arc<dyn LlmClient> = Arc::new(agent);
+
+    let ex1 = Arc::new(Executor::new(
+        ctx.store.clone(),
+        Settings::default(),
+        Arc::new(ctx.sse.clone()),
+        llm.clone(),
+        Arc::new(ctx.killer.clone()),
+    ));
+    let ex2 = Executor::new(
+        ctx.store.clone(),
+        Settings::default(),
+        Arc::new(ctx.sse.clone()),
+        llm.clone(),
+        Arc::new(ctx.killer.clone()),
+    );
+
+    testkit::seed_task(&ctx.store, "t4", "p1").await.unwrap();
+    admit(&ctx, "t4").await;
+
+    let jh = {
+        let e = ex1.clone();
+        tokio::spawn(async move { e.run("t4").await })
+    };
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while calls.load(Ordering::SeqCst) == 0 {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("第一个 executor 应进行到第一次 LLM 调用");
+
+    // 旧 executor 未退出 → 本次未执行（调用方据此重试）
+    assert!(
+        !ex2.try_run("t4").await.unwrap(),
+        "已有 executor 在跑时必须报告「未执行」"
+    );
+    assert_eq!(calls.load(Ordering::SeqCst), 1, "不得并发跑第二个节点");
+
+    drop(tx);
+    jh.await.unwrap().unwrap();
+
+    // 旧 executor 退出后重试 → 真正取得执行权（即便任务已无可推进节点也应报告 true）
+    assert!(
+        ex2.try_run("t4").await.unwrap(),
+        "旧 executor 退出后重试应取得执行权"
+    );
+}
+
 // ─────────────────────────── 节点重试耗尽（决策 33 / G13）───────────────────────────
 
 #[tokio::test]
@@ -794,4 +854,798 @@ async fn prompt_assembly_consumes_templates_stage_configs_and_agents_md() {
         .unwrap();
     let hash = run.prompt_template_hash.as_ref().expect("模板哈希已落库");
     assert_eq!(hash.len(), 16);
+}
+
+// ──────────────────── 闸门失败 → test 复检 → 重跑闸门（票 15 / 决策 85 / 109）────────────────────
+
+#[tokio::test]
+async fn merge_gate_failure_routes_to_test_recheck_then_reruns_gate() {
+    use agentpipeline_core::storage::decisions::ResumeAction;
+    use agentpipeline_core::types::GateFailureKind;
+
+    let ctx = setup("true", Settings::default()).await;
+    // 有状态闸门命令：第 1 次（develop 闸门）通过、第 2 次（merge 闸门首跑）失败、
+    // 第 3 次（复检后重跑 merge 闸门）通过。
+    let home_root = ctx._home.home().root().to_path_buf();
+    let gate = home_root.join("gate.sh");
+    std::fs::write(
+        &gate,
+        format!(
+            "#!/bin/sh\n\
+             d=\"{}\"\n\
+             n=$(cat \"$d\" 2>/dev/null || echo 0)\n\
+             n=$((n+1))\n\
+             echo $n > \"$d\"\n\
+             if [ \"$n\" -eq 2 ]; then\n\
+               echo \"GATE_FAIL_OUTPUT: integration test_login failed\"\n\
+               exit 1\n\
+             fi\n\
+             exit 0\n",
+            home_root.join("gate-count").display()
+        ),
+    )
+    .unwrap();
+    ctx.store
+        .update_project(
+            "p1",
+            None,
+            None,
+            Some(&format!("sh {}", gate.display())),
+            None,
+        )
+        .await
+        .unwrap();
+
+    let mut script = Script::new();
+    design_scripts(&mut script);
+    implementation_scripts(&mut script, "t7");
+    ctx.agent.set_script(script);
+    testkit::seed_task(&ctx.store, "t7", "p1").await.unwrap();
+    admit(&ctx, "t7").await;
+
+    // run #1：merge 测试闸门失败 → GotoTest → test.execute 复检（脚本已耗尽 → pending 收尾）
+    ctx.executor.run("t7").await.unwrap();
+
+    let merge = ctx.store.merge_metadata("t7").await.unwrap().unwrap();
+    assert_eq!(merge.gate, Some(Gate::Fail));
+    assert_eq!(merge.gate_failure_kind, Some(GateFailureKind::Test));
+    assert_eq!(merge.gate_failures, 1);
+    let transitions = ctx.store.list_transitions("t7").await.unwrap();
+    assert!(
+        transitions.iter().any(|t| t.to_stage == Stage::Test
+            && t.to_node == Node::Execute
+            && t.trigger == TransitionTrigger::Kickback),
+        "应有 merge → test.execute 的 kickback 流转：{transitions:?}"
+    );
+    let live = ctx.store.load_live_cursors("t7").await.unwrap();
+    assert_eq!(live[0].stage, Stage::Test);
+    assert_eq!(live[0].node, Node::Execute);
+    assert_eq!(
+        live[0].pending_reason.as_ref().unwrap().kind,
+        PendingKind::RetryExhausted
+    );
+
+    // run #2：复检脚本（agent 未自报 gate_recheck）→ 系统置位 → test.validate_output 放行 → merge 重跑闸门通过
+    let mut recheck = Script::new();
+    recheck
+        .for_node(Stage::Test, Node::Execute)
+        .submit(&TestResult {
+            passed: true,
+            test_report_path: Some("test-report.md".into()),
+            failures: vec![],
+            gate_recheck: false,
+        });
+    ctx.agent.set_script(recheck);
+    let cursor = ctx
+        .store
+        .load_live_cursors("t7")
+        .await
+        .unwrap()
+        .into_iter()
+        .next()
+        .unwrap();
+    ctx.store
+        .apply_resume(&cursor, ResumeAction::Continue, None, None)
+        .await
+        .unwrap();
+    ctx.executor.run("t7").await.unwrap();
+
+    // 复检 prompt 注入闸门完整日志（决策 85 / 109）
+    let requests = ctx.agent.request_log();
+    let first = requests
+        .iter()
+        .find(|r| r.stage == Stage::Test && r.node == Node::Execute)
+        .expect("首轮 test.execute");
+    assert!(
+        !first.user_prompt.contains("## 合入闸门失败复检上下文"),
+        "首轮不渲染复检段（首轮为空不渲染）"
+    );
+    let recheck_req = requests
+        .iter()
+        .rev()
+        .find(|r| r.stage == Stage::Test && r.node == Node::Execute)
+        .expect("复检 test.execute");
+    assert!(
+        recheck_req
+            .user_prompt
+            .contains("## 合入闸门失败复检上下文"),
+        "{}",
+        recheck_req.user_prompt
+    );
+    assert!(recheck_req.user_prompt.contains("GATE_FAIL_OUTPUT"));
+
+    // 系统置位 test_result.gate_recheck = true（决策 109）
+    let test_meta = ctx
+        .store
+        .stage_output_metadata("t7", Stage::Test, "test_report")
+        .await
+        .unwrap()
+        .expect("test_result 元数据");
+    assert_eq!(test_meta["gate_recheck"], true);
+
+    // 闸门重跑通过 → proposal 待审批
+    let merge = ctx.store.merge_metadata("t7").await.unwrap().unwrap();
+    assert_eq!(merge.gate, Some(Gate::Pass));
+    assert_eq!(merge.approval, Approval::Pending);
+    assert_eq!(
+        ctx.store.get_task("t7").await.unwrap().status,
+        TaskStatus::Pending
+    );
+    let actions = ctx.store.allowed_actions_for_task("t7").await.unwrap();
+    let names: Vec<&str> = actions.iter().map(|a| a.action.as_str()).collect();
+    assert!(names.contains(&"approve") && names.contains(&"return"));
+}
+
+// ──────────────────── conflict_check 语义第二层（票 16 / 决策 60 / 67 / 100）────────────────────
+
+#[tokio::test]
+async fn architect_semantic_conflict_check_pends_with_duplicate_risk() {
+    use agentpipeline_core::pipeline::pseudo::ConflictCheckResult;
+    use agentpipeline_core::types::{DuplicateRisk, NewSymbol, SymbolKind};
+
+    let ctx = setup("true", Settings::default()).await;
+
+    // 先准入本任务，再播种另一条活跃任务（避免 scheduler 一次准入两条）
+    let mut script = Script::new();
+    script
+        .for_node(Stage::ArchitectDesign, Node::ValidateInput)
+        .submit(&ValidateInputMetadata {
+            readiness: true,
+            blockers: vec![],
+        });
+    script
+        .for_node(Stage::ArchitectDesign, Node::Execute)
+        .write_file("design.md", "# 设计\n")
+        .submit(&ArchitectExecuteMetadata {
+            readiness: true,
+            affected_files: vec!["src/t.rs".into()],
+            new_symbols: vec![NewSymbol {
+                name: "login_b".into(),
+                kind: SymbolKind::Function,
+                module_path: "auth".into(),
+                file_path: "src/t.rs".into(),
+            }],
+            ..Default::default()
+        });
+    script
+        .for_pseudo("pseudo:conflict_check")
+        .submit(&ConflictCheckResult {
+            duplicate_risk: DuplicateRisk::High,
+            reason: Some("两边都在实现登录".into()),
+        });
+    ctx.agent.set_script(script);
+
+    testkit::seed_task(&ctx.store, "tc-b", "p1").await.unwrap();
+    admit(&ctx, "tc-b").await;
+
+    // 另一条活跃任务：同模块 auth、符号名不同、受影响文件不重叠
+    testkit::seed_task(&ctx.store, "tc-a", "p1").await.unwrap();
+    ctx.store
+        .upsert_stage_output(
+            "tc-a",
+            Stage::ArchitectDesign,
+            "design_doc",
+            "design.md",
+            Some(&serde_json::json!({
+                "readiness": true,
+                "affected_files": ["src/other.rs"],
+                "new_symbols": [{
+                    "name": "login_a",
+                    "kind": "function",
+                    "module_path": "auth",
+                    "file_path": "src/other.rs"
+                }],
+                "acceptance_criteria": []
+            })),
+        )
+        .await
+        .unwrap();
+
+    ctx.executor.run("tc-b").await.unwrap();
+
+    let live = ctx.store.load_live_cursors("tc-b").await.unwrap();
+    assert_eq!(live[0].stage, Stage::ArchitectDesign);
+    assert_eq!(live[0].node, Node::Execute);
+    let reason = live[0].pending_reason.as_ref().unwrap();
+    assert_eq!(reason.kind, PendingKind::UserDecision);
+    let ctx_reason = reason.context.as_ref().unwrap();
+    assert_eq!(ctx_reason.kind.as_deref(), Some("duplicate_risk"));
+    assert!(
+        ctx_reason.conflict_task_ids.contains(&"tc-a".to_string()),
+        "全部冲突任务 id 应记录：{:?}",
+        ctx_reason.conflict_task_ids
+    );
+
+    // 伪阶段独立 run + 会话行，cursor_id 继承父游标（决策 100 / 113）
+    let runs = ctx.store.list_runs("tc-b").await.unwrap();
+    let pseudo = runs
+        .iter()
+        .find(|r| r.agent_type == "pseudo:conflict_check")
+        .expect("伪阶段 run 应落库");
+    assert_eq!(pseudo.cursor_id, live[0].cursor_id);
+    assert_eq!(pseudo.stage, Stage::ArchitectDesign);
+    assert_eq!(pseudo.node, Node::Execute);
+    assert!(pseudo.parent_run_id.is_some(), "parent_run_id 指向父 run");
+    assert!(
+        ctx.store
+            .get_conversation("tc-b", pseudo.id)
+            .await
+            .unwrap()
+            .is_some(),
+        "伪阶段应有独立会话行"
+    );
+    // total_calls 计入伪阶段（决策 130②）
+    assert!(ctx.store.get_task("tc-b").await.unwrap().total_calls >= 2);
+}
+
+// ──────────────────── validator_cross_check 异族复判（票 16 / 决策 134 / 135）────────────────────
+
+/// 造出「agent 型 validate_output 首判不合格 + 异族复判合格」的 judge_disagreement pending。
+async fn judge_disagreement_ctx(task_id: &str) -> Ctx {
+    use agentpipeline_core::pipeline::pseudo::CrossCheckResult;
+
+    let settings = Settings {
+        cross_family_judge: true,
+        ..Default::default()
+    };
+    let ctx = setup("true", settings).await;
+    let mut script = Script::new();
+    script
+        .for_node(Stage::ArchitectDesign, Node::ValidateInput)
+        .submit(&ValidateInputMetadata {
+            readiness: true,
+            blockers: vec![],
+        });
+    script
+        .for_node(Stage::ArchitectDesign, Node::Execute)
+        .submit(&ArchitectExecuteMetadata {
+            readiness: true,
+            ..Default::default()
+        });
+    script
+        .for_node(Stage::ArchitectDesign, Node::ValidateOutput)
+        .submit(&ValidateOutputMetadata {
+            passed: false,
+            blockers: vec!["设计不完整".into()],
+            feedback: None,
+        });
+    script
+        .for_pseudo("pseudo:validator_cross_check")
+        .submit(&CrossCheckResult {
+            passed: true,
+            blockers: vec!["复判认为合格".into()],
+        });
+    ctx.agent.set_script(script);
+    testkit::seed_task(&ctx.store, task_id, "p1").await.unwrap();
+    admit(&ctx, task_id).await;
+    ctx.executor.run(task_id).await.unwrap();
+    ctx
+}
+
+#[tokio::test]
+async fn validator_cross_check_disagreement_pends_and_continue_advances_stage() {
+    use agentpipeline_core::storage::decisions::ResumeAction;
+
+    let ctx = judge_disagreement_ctx("td-continue").await;
+    let cursor = ctx
+        .store
+        .load_live_cursors("td-continue")
+        .await
+        .unwrap()
+        .into_iter()
+        .next()
+        .unwrap();
+    let reason = cursor.pending_reason.as_ref().unwrap();
+    assert_eq!(reason.kind, PendingKind::UserDecision);
+    assert_eq!(
+        reason.context.as_ref().unwrap().kind.as_deref(),
+        Some("judge_disagreement")
+    );
+
+    // 复判伪阶段独立 run 落库，父 run 指向 validate_output（决策 100）
+    let runs = ctx.store.list_runs("td-continue").await.unwrap();
+    let pseudo = runs
+        .iter()
+        .find(|r| r.agent_type == "pseudo:validator_cross_check")
+        .expect("复判 run 应落库");
+    assert!(pseudo.parent_run_id.is_some());
+    assert_eq!(pseudo.stage, Stage::ArchitectDesign);
+    assert_eq!(pseudo.node, Node::ValidateOutput);
+
+    // continue = 用户裁决合格 → 特判直接放行下一阶段，不重跑 validate_output（决策 135）
+    let calls_before = ctx
+        .agent
+        .calls_for(Stage::ArchitectDesign, Node::ValidateOutput);
+    ctx.store
+        .apply_resume(&cursor, ResumeAction::Continue, None, None)
+        .await
+        .unwrap();
+    let live = ctx.store.load_live_cursors("td-continue").await.unwrap();
+    assert_eq!(live.len(), 2, "architect 放行应分裂到两条设计分支");
+    let stages: Vec<Stage> = live.iter().map(|c| c.stage).collect();
+    assert!(stages.contains(&Stage::DevelopDesign));
+    assert!(stages.contains(&Stage::TestDesign));
+    assert!(live.iter().all(|c| c.status == CursorStatus::Active));
+    assert_eq!(
+        ctx.agent
+            .calls_for(Stage::ArchitectDesign, Node::ValidateOutput),
+        calls_before,
+        "continue 放行不得重跑校验"
+    );
+}
+
+#[tokio::test]
+async fn validator_cross_check_disagreement_goto_execute_increments_attempts() {
+    use agentpipeline_core::storage::decisions::ResumeAction;
+
+    let ctx = judge_disagreement_ctx("td-goto").await;
+    let cursor = ctx
+        .store
+        .load_live_cursors("td-goto")
+        .await
+        .unwrap()
+        .into_iter()
+        .next()
+        .unwrap();
+    ctx.store
+        .apply_resume(
+            &cursor,
+            ResumeAction::Goto,
+            Some((Stage::ArchitectDesign, Node::Execute)),
+            None,
+        )
+        .await
+        .unwrap();
+    let live = ctx.store.get_cursor(&cursor.cursor_id).await.unwrap();
+    assert_eq!(live.stage, Stage::ArchitectDesign);
+    assert_eq!(live.node, Node::Execute);
+    assert_eq!(live.status, CursorStatus::Active);
+    assert_eq!(
+        live.validate_attempts, 1,
+        "goto execute → attempts +1（决策 135）"
+    );
+}
+
+// ──────────────────── project_analysis LLM 摘要（票 16 / 决策 48 / 78 / 130）────────────────────
+#[tokio::test]
+async fn project_analysis_merges_llm_summary_into_facts() {
+    use agentpipeline_core::pipeline::pseudo::ProjectAnalysisResult;
+
+    let ctx = setup("true", Settings::default()).await;
+    let mut script = Script::new();
+    script
+        .for_pseudo("pseudo:project_analysis")
+        .submit(&ProjectAnalysisResult {
+            summary: "这是一个 Rust 项目".into(),
+            suspicious: vec!["检测到多套测试框架".into()],
+        });
+    ctx.agent.set_script(script);
+
+    let project = ctx.store.get_project("p1").await.unwrap().unwrap();
+    let facts = serde_json::json!({
+        "language": "rust",
+        "test_framework": "cargo",
+        "suspicious": []
+    });
+    let merged = ctx
+        .executor
+        .project_analysis(&project, facts)
+        .await
+        .unwrap();
+    assert_eq!(merged["summary"], "这是一个 Rust 项目");
+    assert_eq!(merged["suspicious"][0], "检测到多套测试框架");
+    assert_eq!(merged["language"], "rust", "确定性探测事实必须保留");
+}
+
+// ──────────────────── §6 执行器循环：单游标失败隔离 / join 恰一次（决策 89 / 107）────────────────────
+
+#[tokio::test]
+async fn single_branch_node_failure_is_isolated_to_that_cursor() {
+    // 决策 89：一条游标的节点失败只把该游标置 pending，另一分支继续跑完停在 join。
+    let ctx = setup("true", Settings::default()).await;
+    let mut script = Script::new();
+    script
+        .for_node(Stage::ArchitectDesign, Node::ValidateInput)
+        .submit(&ValidateInputMetadata {
+            readiness: true,
+            blockers: vec![],
+        });
+    script
+        .for_node(Stage::ArchitectDesign, Node::Execute)
+        .write_file("design.md", "# 设计\n")
+        .submit(&ArchitectExecuteMetadata {
+            readiness: true,
+            ..Default::default()
+        });
+    script
+        .for_node(Stage::ArchitectDesign, Node::ValidateOutput)
+        .submit(&ValidateOutputMetadata {
+            passed: true,
+            ..Default::default()
+        });
+    // develop-design.validate_input 永远给不出可解析元数据 → 节点重试耗尽（节点失败）
+    script
+        .for_node(Stage::DevelopDesign, Node::ValidateInput)
+        .text("没有元数据");
+    // test-design 正常走完 → 停在 join 边界
+    script
+        .for_node(Stage::TestDesign, Node::ValidateInput)
+        .submit(&ValidateInputMetadata {
+            readiness: true,
+            blockers: vec![],
+        });
+    script
+        .for_node(Stage::TestDesign, Node::Execute)
+        .write_file("test-scenarios.md", "# 测试场景\n")
+        .submit(&TestDesignMetadata {
+            readiness: true,
+            ..Default::default()
+        });
+    script
+        .for_node(Stage::TestDesign, Node::ValidateOutput)
+        .submit(&ValidateOutputMetadata {
+            passed: true,
+            ..Default::default()
+        });
+    ctx.agent.set_script(script);
+
+    testkit::seed_task(&ctx.store, "t-isolate", "p1")
+        .await
+        .unwrap();
+    admit(&ctx, "t-isolate").await;
+    ctx.executor.run("t-isolate").await.unwrap();
+
+    let live = ctx.store.load_live_cursors("t-isolate").await.unwrap();
+    let dev = live
+        .iter()
+        .find(|c| c.branch == NodeCursor::BRANCH_DEVELOP_DESIGN)
+        .expect("develop-design 分支");
+    let test = live
+        .iter()
+        .find(|c| c.branch == NodeCursor::BRANCH_TEST_DESIGN)
+        .expect("test-design 分支");
+    assert_eq!(dev.status, CursorStatus::Pending, "失败游标只阻塞自己");
+    assert_eq!(
+        dev.pending_reason.as_ref().unwrap().kind,
+        PendingKind::RetryExhausted
+    );
+    assert_eq!(
+        test.status,
+        CursorStatus::WaitingJoin,
+        "另一分支不受失败影响，跑完停在 join"
+    );
+    // 节点失败不向上传播：另一分支的 run 全部成功
+    let test_runs = ctx
+        .store
+        .list_runs_at("t-isolate", Stage::TestDesign, Node::ValidateOutput)
+        .await
+        .unwrap();
+    assert_eq!(test_runs.len(), 1);
+    assert_eq!(test_runs[0].status, NodeStatus::Success);
+    // 有 pending 不汇聚（决策 83 / 107）
+    assert!(ctx
+        .store
+        .list_runs_at("t-isolate", Stage::SyncCheck, Node::Execute)
+        .await
+        .unwrap()
+        .is_empty());
+    assert_eq!(
+        ctx.store.get_task("t-isolate").await.unwrap().status,
+        TaskStatus::Pending
+    );
+}
+
+#[tokio::test]
+async fn advance_join_runs_exactly_once_even_across_repeated_runs() {
+    // 决策 107 / G5：所有游标到界后 join 恰执行一次；再次调用 run 不重复汇聚。
+    let ctx = setup("true", Settings::default()).await;
+    let mut script = Script::new();
+    script
+        .for_node(Stage::ArchitectDesign, Node::ValidateInput)
+        .submit(&ValidateInputMetadata {
+            readiness: false,
+            blockers: vec!["占位".into()],
+        });
+    ctx.agent.set_script(script);
+    testkit::seed_task(&ctx.store, "t-join-once", "p1")
+        .await
+        .unwrap();
+    admit(&ctx, "t-join-once").await;
+
+    // 直接造出「两分支都到界」的 join-ready 状态
+    let split = ctx.store.split_cursors("t-join-once").await.unwrap();
+    for c in &split {
+        ctx.store
+            .set_cursor_waiting_join(&c.cursor_id)
+            .await
+            .unwrap();
+    }
+    // sync-check 后脚本耗尽 → pending(retry_exhausted) 停在 develop.execute
+    ctx.agent.set_script(Script::new());
+    ctx.executor.run("t-join-once").await.unwrap();
+    assert_eq!(
+        ctx.store
+            .list_runs_at("t-join-once", Stage::SyncCheck, Node::Execute)
+            .await
+            .unwrap()
+            .len(),
+        1
+    );
+
+    // 再次 run：不得再落第二条 sync-check run
+    ctx.executor.run("t-join-once").await.unwrap();
+    assert_eq!(
+        ctx.store
+            .list_runs_at("t-join-once", Stage::SyncCheck, Node::Execute)
+            .await
+            .unwrap()
+            .len(),
+        1,
+        "join 只执行一次"
+    );
+}
+
+// ──────────────────── G13：工具失败分层，单次工具失败不触发节点重试（决策 33）────────────────────
+
+#[tokio::test]
+async fn tool_failure_within_budget_does_not_retry_the_node() {
+    let ctx = setup("true", Settings::default()).await;
+    let mut script = Script::new();
+    script
+        .for_node(Stage::ArchitectDesign, Node::ValidateInput)
+        .submit(&ValidateInputMetadata {
+            readiness: true,
+            blockers: vec![],
+        });
+    // execute：第 1 次 write_file 调用失败（fail_tool_n 注入），随后提交合法元数据
+    script
+        .for_node(Stage::ArchitectDesign, Node::Execute)
+        .write_file("design.md", "# 设计\n")
+        .fail_tool_n("write_file", 1)
+        .submit(&ArchitectExecuteMetadata {
+            readiness: true,
+            ..Default::default()
+        });
+    ctx.agent.set_script(script);
+
+    testkit::seed_task(&ctx.store, "t-toolfail", "p1")
+        .await
+        .unwrap();
+    admit(&ctx, "t-toolfail").await;
+    ctx.executor.run("t-toolfail").await.unwrap();
+
+    // 工具失败在 agent loop 内消化：节点只跑一次且成功（无 agent_retry）
+    let runs = ctx
+        .store
+        .list_runs_at("t-toolfail", Stage::ArchitectDesign, Node::Execute)
+        .await
+        .unwrap();
+    assert_eq!(runs.len(), 1, "单次工具失败不触发节点重试（G13）");
+    assert_eq!(runs[0].status, NodeStatus::Success);
+    // 失败以 tool_event error 形态外发（决策 123）
+    let errors = ctx
+        .sse
+        .events()
+        .into_iter()
+        .filter(|e| {
+            matches!(
+                e,
+                SseEvent::ToolEvent { phase: agentpipeline_core::sse::ToolPhase::Error, tool, .. }
+                    if tool == "write_file"
+            )
+        })
+        .count();
+    assert_eq!(errors, 1, "工具失败应发 error 事件");
+    assert!(ctx.sse.count_of(SseEventType::ToolEvent) >= 2);
+}
+
+// ──────────────────── 超长工具结果：L1 裁剪 / L2 卸载（决策 110）────────────────────
+
+#[tokio::test]
+async fn long_tool_result_triggers_l1_trim() {
+    // 300 行输出 > L1 阈值（前 50 + 后 100）；未达 L2 阈值 → 裁剪保留在会话中
+    let ctx = setup("true", Settings::default()).await;
+    let mut script = Script::new();
+    script
+        .for_node(Stage::ArchitectDesign, Node::ValidateInput)
+        .submit(&ValidateInputMetadata {
+            readiness: true,
+            blockers: vec![],
+        });
+    script
+        .for_node(Stage::ArchitectDesign, Node::Execute)
+        .long_tool_result(300)
+        .submit(&ArchitectExecuteMetadata {
+            readiness: true,
+            ..Default::default()
+        });
+    ctx.agent.set_script(script);
+    testkit::seed_task(&ctx.store, "t-l1", "p1").await.unwrap();
+    admit(&ctx, "t-l1").await;
+    ctx.executor.run("t-l1").await.unwrap();
+
+    let run = ctx
+        .store
+        .list_runs_at("t-l1", Stage::ArchitectDesign, Node::Execute)
+        .await
+        .unwrap()
+        .into_iter()
+        .next()
+        .unwrap();
+    let conv = ctx
+        .store
+        .get_conversation("t-l1", run.id)
+        .await
+        .unwrap()
+        .expect("会话行");
+    let raw = conv.messages_json.to_string();
+    assert!(raw.contains("已省略"), "L1 裁剪标记应进入会话：{raw:.300}");
+    assert!(!raw.contains("已卸载"), "300 行未到 L2 阈值");
+}
+
+#[tokio::test]
+async fn long_tool_result_triggers_l2_offload_to_disk() {
+    // 20000 行 ≈ 10 万字符 ≫ offload_threshold_tokens(4000 token) → L2 卸载落盘
+    let ctx = setup("true", Settings::default()).await;
+    let mut script = Script::new();
+    script
+        .for_node(Stage::ArchitectDesign, Node::ValidateInput)
+        .submit(&ValidateInputMetadata {
+            readiness: true,
+            blockers: vec![],
+        });
+    script
+        .for_node(Stage::ArchitectDesign, Node::Execute)
+        .long_tool_result(20_000)
+        .submit(&ArchitectExecuteMetadata {
+            readiness: true,
+            ..Default::default()
+        });
+    ctx.agent.set_script(script);
+    testkit::seed_task(&ctx.store, "t-l2", "p1").await.unwrap();
+    admit(&ctx, "t-l2").await;
+    ctx.executor.run("t-l2").await.unwrap();
+
+    let run = ctx
+        .store
+        .list_runs_at("t-l2", Stage::ArchitectDesign, Node::Execute)
+        .await
+        .unwrap()
+        .into_iter()
+        .next()
+        .unwrap();
+    let conv = ctx
+        .store
+        .get_conversation("t-l2", run.id)
+        .await
+        .unwrap()
+        .expect("会话行");
+    let raw = conv.messages_json.to_string();
+    assert!(raw.contains("已卸载"), "L2 卸载标记应进入会话");
+    // 卸载文件真实落盘（决策 148：L2 卸载真落盘）
+    let ctx_dir = ctx._home.home().context_dir("t-l2");
+    assert!(
+        ctx_dir.exists(),
+        "context 目录应存在：{}",
+        ctx_dir.display()
+    );
+    let files: Vec<_> = std::fs::read_dir(&ctx_dir)
+        .unwrap()
+        .filter_map(|e| e.ok())
+        .collect();
+    assert!(!files.is_empty(), "离线文件应真实落盘");
+    let any_content = files.iter().any(|f| {
+        std::fs::read_to_string(f.path())
+            .map(|s| s.contains("19999") || s.contains("20000"))
+            .unwrap_or(false)
+    });
+    assert!(any_content, "卸载文件应含完整输出（尾部行）");
+}
+
+// ──────────────────── 配置 fail fast（决策 47 / 103 / 134）────────────────────
+
+#[tokio::test]
+async fn cross_family_judge_without_provider_refuses_startup() {
+    use agentpipeline_core::config::{validate_startup, StartupInputs};
+    use agentpipeline_core::types::{Provider, StageConfig};
+
+    let provider = Provider {
+        id: "p1".into(),
+        vendor: "deepseek".into(),
+        model: "deepseek-chat".into(),
+        context_window: 64_000,
+        base_url: None,
+        api_key: None,
+        enabled: true,
+        created_at: chrono::Utc::now(),
+        updated_at: chrono::Utc::now(),
+    };
+    // 开关开但没注册 validator_cross_check 伪阶段 → 拒绝启动（决策 134 ⑤）
+    let err = validate_startup(&StartupInputs {
+        settings: Settings {
+            cross_family_judge: true,
+            ..Default::default()
+        },
+        providers: vec![provider.clone()],
+        stage_configs: vec![],
+        available_skills: vec![],
+        home_root: None,
+    })
+    .unwrap_err();
+    assert!(
+        matches!(err, agentpipeline_core::Error::Config(_)),
+        "{err:?}"
+    );
+
+    // 注册了伪阶段但没配 provider → 同样拒绝
+    let err = validate_startup(&StartupInputs {
+        settings: Settings {
+            cross_family_judge: true,
+            ..Default::default()
+        },
+        providers: vec![provider],
+        stage_configs: vec![StageConfig {
+            stage: "validator_cross_check".into(),
+            ..Default::default()
+        }],
+        available_skills: vec![],
+        home_root: None,
+    })
+    .unwrap_err();
+    assert!(
+        matches!(err, agentpipeline_core::Error::Config(_)),
+        "{err:?}"
+    );
+}
+
+#[tokio::test]
+async fn referenced_missing_skill_refuses_startup() {
+    use agentpipeline_core::config::{validate_startup, StartupInputs};
+    use agentpipeline_core::types::{Provider, StageConfig};
+
+    let inputs = StartupInputs {
+        settings: Settings::default(),
+        providers: vec![Provider {
+            id: "p1".into(),
+            vendor: "deepseek".into(),
+            model: "deepseek-chat".into(),
+            context_window: 64_000,
+            base_url: None,
+            api_key: None,
+            enabled: true,
+            created_at: chrono::Utc::now(),
+            updated_at: chrono::Utc::now(),
+        }],
+        stage_configs: vec![StageConfig {
+            stage: "develop".into(),
+            provider_id: Some("p1".into()),
+            skills_json: Some(serde_json::json!(["definitely-not-installed"])),
+            ..Default::default()
+        }],
+        available_skills: vec!["rtk".into()],
+        home_root: None,
+    };
+    let err = validate_startup(&inputs).unwrap_err();
+    assert!(matches!(err, agentpipeline_core::Error::Config(_)));
+    assert!(err.to_string().contains("skill"), "{err}");
 }

@@ -426,6 +426,15 @@ impl Store {
             .find(|c| c.stage == stage))
     }
 
+    /// 删除阶段覆盖（回到系统默认，决策 22）。返回是否确实删了一行。
+    pub async fn delete_stage_config(&self, stage: &str) -> Result<bool> {
+        let result = sqlx::query("DELETE FROM stage_configs WHERE stage = ?")
+            .bind(stage)
+            .execute(self.pool())
+            .await?;
+        Ok(result.rows_affected() > 0)
+    }
+
     /// 启动校验：加载 DB 配置 → fail fast 或降级（决策 47 / 103 / 134）。
     ///
     /// 不受支持的 vendor **降级 `enabled = 0`**（不崩溃）；被阶段引用的则 fail fast。

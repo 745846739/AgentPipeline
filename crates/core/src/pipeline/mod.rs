@@ -4,6 +4,7 @@ pub mod cursor;
 pub mod executor;
 pub mod graph;
 pub mod landing;
+pub mod pseudo;
 pub mod routes;
 
 pub use cursor::{

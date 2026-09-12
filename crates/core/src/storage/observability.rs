@@ -163,6 +163,16 @@ impl Store {
         Ok(())
     }
 
+    /// 回填 run 的真实进程组 id（决策 66 / 票 17：超时时 scheduler 杀整个进程组）。
+    pub async fn set_run_process_group(&self, run_id: i64, pgid: i32) -> Result<()> {
+        sqlx::query("UPDATE kanban_node_runs SET process_group_id = ? WHERE id = ?")
+            .bind(pgid)
+            .bind(run_id)
+            .execute(self.pool())
+            .await?;
+        Ok(())
+    }
+
     /// 补记 prompt 版本标注（决策 137：最终组装 system prompt 的 SHA-256 前 16 位）。
     pub async fn set_run_template_hash(&self, run_id: i64, hash: &str) -> Result<()> {
         sqlx::query("UPDATE kanban_node_runs SET prompt_template_hash = ? WHERE id = ?")
@@ -208,6 +218,14 @@ impl Store {
             .bind(node.as_str())
             .fetch_all(self.pool())
             .await?;
+        rows.into_iter().map(RunRow::into_run).collect()
+    }
+
+    /// 全量 run 行：全局指标用。口径由 [`crate::metrics`] 的纯函数定义，
+    /// 这里只取数、不在 SQL 里重算，避免「口径契约」在 SQL 与 Rust 之间漂移（决策 137）。
+    pub async fn all_runs(&self) -> Result<Vec<NodeRun>> {
+        let sql = format!("SELECT {RUN_COLUMNS} FROM kanban_node_runs");
+        let rows: Vec<RunRow> = sqlx::query_as(&sql).fetch_all(self.pool()).await?;
         rows.into_iter().map(RunRow::into_run).collect()
     }
 
@@ -739,6 +757,11 @@ impl CommandRecorder for Store {
             }
             Ok(())
         })
+    }
+
+    fn set_process_group(&self, run_id: i64, pgid: i32) -> BoxFuture<'static, Result<()>> {
+        let store = self.clone();
+        Box::pin(async move { store.set_run_process_group(run_id, pgid).await })
     }
 }
 

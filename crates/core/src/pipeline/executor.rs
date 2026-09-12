@@ -35,15 +35,17 @@ use crate::agent::{
     BUILTIN_TOOLS,
 };
 use crate::config::Settings;
-use crate::git::{Git, RebaseOutcome};
+use crate::git::Git;
 use crate::home::Home;
+use crate::pipeline::pseudo::{ConflictCheckResult, CrossCheckResult, PseudoStage};
 use crate::process::ProcessKiller;
 use crate::sse::{SseEvent, SseSink, ToolPhase};
 use crate::storage::observability::{NewRun, RunOutcome};
 use crate::types::{
-    Approval, CommandSource, DiffStats, EdgeKind, Gate, GateFailureKind, MergeResult, MergeStatus,
-    Node, NodeCursor, NodeStatus, PendingContext, PendingKind, PendingReason, Project, ReviewMode,
-    Stage, StageConfig, SyncDecision, SyncDecisionKind, Task, TestResult,
+    Approval, CommandSource, DiffStats, DuplicateRisk, EdgeKind, Gate, GateFailureKind,
+    MergeResult, MergeStatus, Node, NodeCursor, NodeStatus, PendingContext, PendingKind,
+    PendingReason, Project, ReviewMode, Stage, StageConfig, SyncDecision, SyncDecisionKind, Task,
+    TestResult,
 };
 use crate::{Error, Result};
 
@@ -118,19 +120,30 @@ impl Executor {
         }
     }
 
-    /// 入口：抢占单执行者 → 跑循环 → 释放。
+    /// 入口：抢占单执行者 → 跑循环 → 释放。已有 executor 在跑时立即返回（决策 36）。
     pub async fn run(&self, task_id: &str) -> Result<()> {
+        self.try_run(task_id).await.map(|_| ())
+    }
+
+    /// 同 [`Executor::run`]，但把「是否真正取得执行权」报告给调用方：
+    /// `false` = 已有 executor 在跑同一任务（或 DB 乐观锁被跨进程占用），本次未执行任何节点。
+    ///
+    /// 生产 resume 钩子需要这个信号：resume / 审批请求若正好落在旧 executor
+    /// 「已读完游标、尚未释放注册表」的窗口内，一次性 spawn 会被**静默丢弃**，
+    /// 任务永久停在 pending。钩子据 `false` 做有界重试（旧 executor 退出是毫秒级）。
+    pub async fn try_run(&self, task_id: &str) -> Result<bool> {
         let _guard = match try_acquire(task_id) {
             Some(g) => g,
-            None => return Ok(()), // 已有 executor 在跑，直接返回（决策 36）
+            None => return Ok(false), // 已有 executor 在跑，直接返回（决策 36）
         };
         let owner = format!("executor:{}", ulid::Ulid::new());
         if !self.store.try_claim_executor(task_id, &owner).await? {
-            return Ok(()); // DB 乐观锁被占（跨进程场景），跳过
+            return Ok(false); // DB 乐观锁被占（跨进程场景），跳过
         }
         let result = self.run_inner(task_id).await;
         self.store.release_executor(task_id).await?;
-        result
+        result?;
+        Ok(true)
     }
 
     /// 核心循环（§11.2 伪码）。
@@ -487,14 +500,22 @@ impl Executor {
         let wt = Path::new(worktree);
         let base_ref = Git.base_ref(repo, &project.default_branch).await?;
 
-        // (2) rebase 到基准（决策 74 / 96）
-        match Git.rebase_onto(wt, &base_ref).await? {
-            RebaseOutcome::Conflict { files } => {
-                // 无法自动解决 → 系统先 abort 恢复干净状态，再打回 develop（决策 74）
-                Git.rebase_abort(wt).await?;
+        // (2) rebase 到基准（决策 74 / 96 / pipeline-spec §6）
+        let mut auto_resolved: Vec<String> = Vec::new();
+        match rebase_onto_with_auto_resolve(wt, &base_ref).await? {
+            AutoRebaseOutcome::Clean { .. } => {}
+            AutoRebaseOutcome::AutoResolved { files, .. } => {
+                tracing::info!(
+                    task = %task.id,
+                    files = ?files,
+                    "rebase 冲突已自动解决，继续合入流程（pipeline-spec §6）"
+                );
+                auto_resolved = files;
+            }
+            AutoRebaseOutcome::Conflict { files } => {
+                // 无法机械判定：helper 已 rebase --abort，按决策 74 打回 develop
                 return Ok(PhaseA::Conflict(files));
             }
-            RebaseOutcome::Clean { .. } => {}
         }
         let base_commit = Git.rev_parse(repo, &base_ref).await?;
 
@@ -548,7 +569,7 @@ impl Executor {
                 gate_failure_kind: None,
                 gate_failures: 0,
                 gate_failure_output: None,
-                conflict_files: Vec::new(),
+                conflict_files: auto_resolved.clone(),
                 approval: Approval::Pending,
                 status: MergeStatus::PendingApproval,
             };
@@ -605,20 +626,26 @@ impl Executor {
             &RunTokens::default(),
         )
         .await?;
-        result?;
-        Ok(NodeOutput::Route(crate::pipeline::MetadataView::default()))
+        match result? {
+            PhaseB::Merged => Ok(NodeOutput::Route(crate::pipeline::MetadataView::default())),
+            // 挂起必须走 NodeOutput::Pending：由 advance_cursor 统一落 pending 并**不推进游标**。
+            // 若这里返回 Route，route_merge 会因 approval=approved 放行到 done，
+            // 造成「游标已终态但 pending 仍在」的矛盾状态（决策 61 / 132）。
+            PhaseB::DirtyWorktree(reason) => Ok(NodeOutput::Pending(reason)),
+        }
     }
 
     async fn merge_phase_b_inner(
         &self,
         task: &Task,
         project: &Project,
-        cursor: &NodeCursor,
+        _cursor: &NodeCursor,
         stored: &mut MergeResult,
-    ) -> Result<()> {
+    ) -> Result<PhaseB> {
         let repo = Path::new(&project.local_path);
 
-        // (1) 目标分支工作区干净检查（决策 61 / 132）：不自动 stash
+        // (1) 目标分支工作区干净检查（决策 61 / 132）：不自动 stash。
+        // 只返回挂起意图，由调用方经 NodeOutput::Pending 落库（否则游标会被推进到 done）。
         if !self.settings.allow_dirty_worktree_merge && Git.is_dirty(repo).await? {
             let reason = PendingReason::new(
                 PendingKind::UserDecision,
@@ -629,11 +656,7 @@ impl Executor {
             .with_context(PendingContext::with_kind(
                 crate::actions::kinds::DIRTY_WORKTREE,
             ));
-            self.store
-                .set_cursor_pending(&cursor.cursor_id, &reason)
-                .await?;
-            self.store.sync_task_projection(&task.id).await?;
-            return Ok(());
+            return Ok(PhaseB::DirtyWorktree(reason));
         }
 
         // (2) 合入（git2 内存合入 + update-ref 语义写回，决策 73 / 97）
@@ -657,7 +680,7 @@ impl Executor {
         self.store
             .upsert_merge_result(&task.id, &stored.diff_path, stored)
             .await?;
-        Ok(())
+        Ok(PhaseB::Merged)
     }
 
     // ─────────────────────── 纯代码 validate_output（决策 62）───────────────────────
@@ -939,6 +962,7 @@ impl Executor {
                 cursor.stage,
                 cursor.node,
             ),
+            gate_recheck: self.gate_recheck_segment(task, cursor).await?,
             ..Default::default()
         };
         let user_prompt = build_user_prompt(
@@ -1058,6 +1082,55 @@ impl Executor {
         };
         kind.validate(&value)?;
 
+        // decision 134 / 135：agent 型 validate_output 首判不合格 → 同步调用异族复判。
+        // 复判合格（与首判分歧）→ 节点内直接 pending(user_decision, judge_disagreement)，
+        // **不进入路由**（路由只看到两侧一致不合格）。
+        let mut judge_disagreement: Option<PendingReason> = None;
+        if kind == AgentNodeKind::DesignValidateOutput && self.settings.cross_family_judge {
+            let first: crate::types::ValidateOutputMetadata =
+                serde_json::from_value(value.clone())?;
+            if !first.passed {
+                let prompt = format!(
+                    "请复核上游 validate_output 对 {} 阶段产出「不合格」的判定。\n\
+                     阶段：{}\n节点：{}\n首判元数据：{}\n\
+                     若你认为产出实际合格，请 submit_metadata passed=true；否则 passed=false。",
+                    cursor.stage, cursor.stage, cursor.node, value
+                );
+                let (cross_value, _cross_tokens) = self
+                    .call_pseudo_stage(
+                        task,
+                        cursor,
+                        run_id,
+                        attempt,
+                        PseudoStage::ValidatorCrossCheck,
+                        prompt,
+                    )
+                    .await?;
+                let cross: CrossCheckResult = parse_metadata(&cross_value)?;
+                if matches!(
+                    crate::pipeline::resolve_validate_output(true, false, Some(cross.passed)),
+                    crate::pipeline::ValidateOutcome::JudgeDisagreement
+                ) {
+                    let detail = if cross.blockers.is_empty() {
+                        String::new()
+                    } else {
+                        format!("（复判备注：{}）", cross.blockers.join("；"))
+                    };
+                    judge_disagreement = Some(
+                        PendingReason::new(
+                            PendingKind::UserDecision,
+                            cursor.stage,
+                            cursor.node,
+                            format!("异族复判与首判分歧：首判不合格、复判合格，请用户终审{detail}"),
+                        )
+                        .with_context(PendingContext::with_kind(
+                            crate::actions::kinds::JUDGE_DISAGREEMENT,
+                        )),
+                    );
+                }
+            }
+        }
+
         // 会话落库（§12.4.3；1:1 对调 LLM 的 run，决策 99）
         let msgs = serde_json::to_value(&messages)?;
         self.store
@@ -1077,8 +1150,410 @@ impl Executor {
             .await?;
         self.store.refresh_task_totals(&task.id).await?;
 
-        let output = kind.post_process(self, task, value).await?;
+        // 分歧路径在节点内直接置 pending，不经 post_process / 路由（决策 135）
+        if let Some(reason) = judge_disagreement {
+            return Ok((NodeOutput::Pending(reason), tokens));
+        }
+
+        let output = kind
+            .post_process(self, task, cursor, run_id, attempt, value)
+            .await?;
         Ok((output, tokens))
+    }
+
+    // ─────────────────────── 伪阶段（决策 48 / 60 / 67 / 88 / 100 / 113 / 134）───────────────────────
+
+    /// 同步调用一个伪阶段（不占游标）：落独立 run + 会话行，心跳归父 run。
+    ///
+    /// `run.agent_type = pseudo:*`（FakeAgent 据此路由脚本）；`cursor_id` 继承父游标
+    /// （决策 113）；`agent_type` 非 `system` → 计入 `total_calls`（决策 130 ②）。
+    async fn call_pseudo_stage(
+        &self,
+        task: &Task,
+        cursor: &NodeCursor,
+        parent_run_id: i64,
+        attempt: u32,
+        pseudo: PseudoStage,
+        user_prompt: String,
+    ) -> Result<(serde_json::Value, RunTokens)> {
+        let project = self.project(&task.project_id).await?;
+        let home = self.store.home().clone();
+        let worktree = task
+            .worktree_path
+            .clone()
+            .unwrap_or_else(|| home.worktree_path(&task.id).display().to_string());
+        let task_dir = home.task_dir(&task.id).display().to_string();
+        let stage_cfg = self.store.get_stage_config(pseudo.stage_key()).await?;
+
+        // persona：persona_path 优先，否则内嵌（决策 7 / 87）；persona_append 追加
+        let mut persona = match stage_cfg.as_ref().and_then(|c| c.persona_path.as_deref()) {
+            Some(path) => {
+                let p = home.root().join(path);
+                std::fs::read_to_string(&p).map_err(|e| {
+                    Error::Config(format!(
+                        "伪阶段 {} 的 persona_path 不可读：{}（{e}）",
+                        pseudo.stage_key(),
+                        p.display()
+                    ))
+                })?
+            }
+            None => pseudo.embedded_persona().to_string(),
+        };
+        if let Some(append) = stage_cfg.as_ref().and_then(|c| c.persona_append.as_deref()) {
+            if !append.trim().is_empty() {
+                persona.push_str(&format!("\n\n{append}"));
+            }
+        }
+        let system_prompt = build_system_prompt(
+            &load_agents_context(
+                Path::new(&project.local_path),
+                project.language.as_deref(),
+                project.test_framework.as_deref(),
+            ),
+            &persona,
+            &workdirs_line(&worktree, &task_dir),
+            &[],
+        );
+
+        let run_id = self
+            .store
+            .insert_run(&NewRun {
+                task_id: task.id.clone(),
+                cursor_id: cursor.cursor_id.clone(),
+                stage: cursor.stage,
+                node: cursor.node,
+                attempt,
+                agent_type: pseudo.agent_type().to_string(),
+                parent_run_id: Some(parent_run_id),
+                prompt_template_hash: None,
+                process_group_id: None,
+            })
+            .await?;
+
+        let provider_id = crate::storage::catalog::resolve_provider_id(
+            None,
+            task.model_override.as_deref(),
+            stage_cfg.as_ref(),
+            None,
+        );
+        let request = LlmRequest {
+            stage: cursor.stage,
+            node: cursor.node,
+            attempt,
+            system_prompt,
+            user_prompt,
+            messages: Vec::new(),
+            tools: vec![pseudo.submit_tool()],
+            temperature: stage_cfg.as_ref().and_then(|c| c.temperature),
+            max_tokens: stage_cfg.as_ref().and_then(|c| c.max_tokens),
+            provider_id,
+            run: Some(crate::agent::client::RunContext {
+                task_id: task.id.clone(),
+                branch: cursor.branch.clone(),
+                run_id,
+                agent_type: pseudo.agent_type().to_string(),
+            }),
+        };
+
+        let started = Instant::now();
+        let response = match self.llm.complete(request).await {
+            Ok(r) => r,
+            Err(e) => {
+                self.store
+                    .finish_run(
+                        run_id,
+                        &RunOutcome {
+                            status: Some(NodeStatus::Failed),
+                            duration_ms: started.elapsed().as_millis() as u64,
+                            error: Some(e.to_string()),
+                            ..Default::default()
+                        },
+                    )
+                    .await?;
+                return Err(e);
+            }
+        };
+        // 心跳写父 run（决策 88：伪阶段不得让父节点被空闲超时误杀）
+        let _ = self.store.touch_run_heartbeat(parent_run_id).await;
+        let mut tokens = RunTokens::default();
+        tokens.add(&response);
+        self.store
+            .finish_run(
+                run_id,
+                &RunOutcome {
+                    status: Some(NodeStatus::Success),
+                    duration_ms: started.elapsed().as_millis() as u64,
+                    prompt_tokens: tokens.prompt,
+                    completion_tokens: tokens.completion,
+                    cache_read_tokens: tokens.cache_read,
+                    cache_write_tokens: tokens.cache_write,
+                    ..Default::default()
+                },
+            )
+            .await?;
+
+        let extracted = crate::agent::metadata::extract_metadata(&response);
+        let value = extracted.value.ok_or_else(|| {
+            Error::Validation(
+                extracted
+                    .error
+                    .unwrap_or_else(|| "伪阶段缺少结构化元数据".into()),
+            )
+        })?;
+        // 伪阶段独立会话行（决策 100）
+        let msgs = serde_json::to_value(vec![Message::assistant(
+            response.content.clone(),
+            response.tool_calls.clone(),
+        )])?;
+        self.store
+            .insert_conversation(
+                &task.id,
+                run_id,
+                cursor.stage,
+                cursor.node,
+                attempt,
+                pseudo.agent_type(),
+                Some(parent_run_id),
+                &msgs,
+                Some(&value),
+                tokens.prompt,
+                tokens.completion,
+            )
+            .await?;
+        self.store.refresh_task_totals(&task.id).await?;
+        Ok((value, tokens))
+    }
+
+    /// project_analysis 伪阶段（decision 48 / 78 / 130）：确定性探测事实由调用方给出，
+    /// 伪阶段只负责写人读摘要并标注可疑项，**合并**进分析结果。
+    ///
+    /// 项目级调用没有 task / 游标，故不落 run 行（v1 的 app 接线由票 17/20 完成）。
+    pub async fn project_analysis(
+        &self,
+        project: &Project,
+        mut facts: serde_json::Value,
+    ) -> Result<serde_json::Value> {
+        let stage_cfg = self
+            .store
+            .get_stage_config(PseudoStage::ProjectAnalysis.stage_key())
+            .await?;
+        let persona = match stage_cfg.as_ref().and_then(|c| c.persona_path.as_deref()) {
+            Some(path) => std::fs::read_to_string(self.store.home().root().join(path))
+                .map_err(|e| Error::Config(format!("project_analysis persona_path 不可读：{e}")))?,
+            None => PseudoStage::ProjectAnalysis.embedded_persona().to_string(),
+        };
+        let system_prompt = build_system_prompt(
+            &load_agents_context(
+                Path::new(&project.local_path),
+                project.language.as_deref(),
+                project.test_framework.as_deref(),
+            ),
+            &persona,
+            &workdirs_line(&project.local_path, &project.local_path),
+            &[],
+        );
+        let user_prompt = format!(
+            "以下是确定性探测得到的事实清单（JSON）：\n{facts}\n\n\
+             请写一段人读摘要（summary）并列出可疑项（suspicious），用 submit_metadata 返回。"
+        );
+        let provider_id =
+            crate::storage::catalog::resolve_provider_id(None, None, stage_cfg.as_ref(), None);
+        let request = LlmRequest {
+            stage: Stage::Init,
+            node: Node::Execute,
+            attempt: 1,
+            system_prompt,
+            user_prompt,
+            messages: Vec::new(),
+            tools: vec![PseudoStage::ProjectAnalysis.submit_tool()],
+            temperature: stage_cfg.as_ref().and_then(|c| c.temperature),
+            max_tokens: stage_cfg.as_ref().and_then(|c| c.max_tokens),
+            provider_id,
+            run: Some(crate::agent::client::RunContext {
+                task_id: String::new(),
+                branch: String::new(),
+                run_id: 0,
+                agent_type: PseudoStage::ProjectAnalysis.agent_type().to_string(),
+            }),
+        };
+        let response = self.llm.complete(request).await?;
+        let extracted = crate::agent::metadata::extract_metadata(&response);
+        let value = extracted.value.ok_or_else(|| {
+            Error::Validation(
+                extracted
+                    .error
+                    .unwrap_or_else(|| "project_analysis 缺少结构化元数据".into()),
+            )
+        })?;
+        let result: crate::pipeline::pseudo::ProjectAnalysisResult = parse_metadata(&value)?;
+        if let Some(obj) = facts.as_object_mut() {
+            obj.insert("summary".into(), serde_json::Value::String(result.summary));
+            obj.insert(
+                "suspicious".into(),
+                serde_json::to_value(result.suspicious)?,
+            );
+        }
+        Ok(facts)
+    }
+
+    /// 语义第二层冲突检测（决策 60 / 67）：模块路径重叠但符号名无交集时，
+    /// 同步调 `conflict_check`；`duplicate_risk = high` → pending(user_decision, duplicate_risk)。
+    async fn semantic_conflict_check(
+        &self,
+        task: &Task,
+        cursor: &NodeCursor,
+        run_id: i64,
+        attempt: u32,
+    ) -> Result<Option<PendingReason>> {
+        let mine = self.store.overlap_keys(&task.id).await?;
+        let mut candidates: Vec<(String, String, Vec<String>, Vec<String>)> = Vec::new();
+        for other in self
+            .store
+            .list_tasks(&crate::storage::tasks::TaskFilter {
+                include_archived: false,
+                ..Default::default()
+            })
+            .await?
+        {
+            if other.id == task.id || !other.status.is_active() {
+                continue;
+            }
+            let theirs = self.store.overlap_keys(&other.id).await?;
+            let module_overlap = mine
+                .symbols
+                .iter()
+                .any(|(m, _)| theirs.symbols.iter().any(|(tm, _)| module_overlaps(m, tm)));
+            let symbol_overlap = mine.symbols.iter().any(|s| theirs.symbols.contains(s));
+            let file_overlap = mine.files.iter().any(|f| theirs.files.contains(f));
+            // 模块路径重叠、符号名无交集、文件也无交集 → 需要语义层判断
+            if module_overlap && !symbol_overlap && !file_overlap {
+                candidates.push((
+                    other.id.clone(),
+                    other.title.clone(),
+                    theirs.files.clone(),
+                    theirs
+                        .symbols
+                        .iter()
+                        .map(|(m, n)| format!("{m}::{n}"))
+                        .collect(),
+                ));
+            }
+        }
+        if candidates.is_empty() {
+            return Ok(None);
+        }
+        let ids: Vec<String> = candidates.iter().map(|c| c.0.clone()).collect();
+        let mut prompt = format!(
+            "本任务「{}」的架构设计新增符号所在模块与以下活跃任务重叠，但符号名无交集。\n\
+             请判断是否存在语义重复（同一功能被两个任务各自实现，duplicate_risk = high）。\n\n\
+             本任务新增符号：\n",
+            task.title
+        );
+        for (m, n) in &mine.symbols {
+            prompt.push_str(&format!("- {m}::{n}\n"));
+        }
+        prompt.push_str("\n候选任务：\n");
+        for (id, title, files, symbols) in &candidates {
+            prompt.push_str(&format!(
+                "- 「{title}」（{id}）：文件 [{}]；符号 [{}]\n",
+                files.join("、"),
+                symbols.join("、")
+            ));
+        }
+        prompt
+            .push_str("\n请 submit_metadata 返回 duplicate_risk（low / medium / high）与 reason。");
+        let (value, _tokens) = self
+            .call_pseudo_stage(
+                task,
+                cursor,
+                run_id,
+                attempt,
+                PseudoStage::ConflictCheck,
+                prompt,
+            )
+            .await?;
+        let result: ConflictCheckResult = parse_metadata(&value)?;
+        if result.duplicate_risk != crate::types::DuplicateRisk::High {
+            return Ok(None);
+        }
+        let detail = result
+            .reason
+            .as_deref()
+            .map(|r| format!("：{r}"))
+            .unwrap_or_default();
+        Ok(Some(
+            PendingReason::new(
+                PendingKind::UserDecision,
+                Stage::ArchitectDesign,
+                Node::Execute,
+                format!(
+                    "语义重复风险（模块路径重叠、符号名无交集）{detail}；冲突任务：{}",
+                    ids.join("、")
+                ),
+            )
+            .with_context(PendingContext {
+                kind: Some(crate::actions::kinds::DUPLICATE_RISK.to_string()),
+                conflict_task_ids: ids,
+                ..Default::default()
+            }),
+        ))
+    }
+
+    /// decision 85 / 109：test.execute 被 merge 测试闸门打回时，prompt 注入闸门完整日志
+    /// + 失败用例，让 agent 重新判定 `failure_cause`。首轮（无闸门失败）为空不渲染。
+    async fn gate_recheck_segment(
+        &self,
+        task: &Task,
+        cursor: &NodeCursor,
+    ) -> Result<Option<String>> {
+        if cursor.stage != Stage::Test || cursor.node != Node::Execute {
+            return Ok(None);
+        }
+        let Some(merge) = self.store.merge_metadata(&task.id).await? else {
+            return Ok(None);
+        };
+        if merge.gate != Some(Gate::Fail)
+            || !matches!(merge.gate_failure_kind, Some(GateFailureKind::Test) | None)
+        {
+            return Ok(None);
+        }
+        let mut out = String::new();
+        if let Some(log) = merge
+            .gate_failure_output
+            .as_deref()
+            .filter(|s| !s.trim().is_empty())
+        {
+            out.push_str("### 闸门失败输出\n");
+            out.push_str(log.trim());
+            out.push('\n');
+        }
+        if let Some(meta) = self
+            .store
+            .stage_output_metadata(&task.id, Stage::Test, OUTPUT_TEST_REPORT)
+            .await?
+        {
+            if let Ok(t) = serde_json::from_value::<TestResult>(meta) {
+                if !t.failures.is_empty() {
+                    out.push_str("### 上一轮失败用例\n");
+                    for f in &t.failures {
+                        out.push_str(&format!(
+                            "- {}：{}（{}）\n",
+                            f.test_name,
+                            f.error_message,
+                            match f.failure_cause {
+                                crate::types::FailureCause::TestIssue => "test_issue",
+                                crate::types::FailureCause::CodeIssue => "code_issue",
+                            }
+                        ));
+                    }
+                }
+            }
+        }
+        if out.trim().is_empty() {
+            return Ok(None);
+        }
+        out.push_str("\n请基于以上闸门输出，为每个失败用例重新标注 failure_cause（test_issue / code_issue）。");
+        Ok(Some(out))
     }
 
     // ─────────────────────── join（决策 83 / 107 / G5）───────────────────────────────
@@ -1586,8 +2061,8 @@ impl Executor {
 
     // ─────────────────────── 闸门命令执行（决策 62 / 139）───────────────────────────────
 
-    /// 跑系统命令并记录 `kanban_node_commands`（source=system）。返回 exit code；
-    /// 启动失败是节点错误，非零退出是**闸门结果**而非节点错误。
+    /// 跑系统命令并记录 `kanban_node_commands`（source=system）。返回
+    /// `(exit code, 输出预览)`；启动失败是节点错误，非零退出是**闸门结果**而非节点错误。
     async fn run_system_command(
         &self,
         task: &Task,
@@ -1596,7 +2071,7 @@ impl Executor {
         node: Node,
         command: &str,
         cwd: &Path,
-    ) -> Result<i32> {
+    ) -> Result<(i32, String)> {
         let sanitized = crate::agent::sanitize::sanitize_command_line(command);
         let command_id = self
             .store
@@ -1632,40 +2107,50 @@ impl Executor {
             Ok(Err(e)) => return Err(Error::Git(format!("闸门命令启动失败：{e}"))),
             Err(_) => {
                 // 超时按闸门失败处理（exit = -1），错误信息进输出
+                let note = format!("命令超时（{}s）", self.settings.test_command_timeout_sec);
                 self.store
                     .record_finish(
                         command_id,
                         CommandFinish {
                             exit_code: Some(-1),
                             stdout_preview: None,
-                            stderr_preview: Some(format!(
-                                "命令超时（{}s）",
-                                self.settings.test_command_timeout_sec
-                            )),
+                            stderr_preview: Some(note.clone()),
                             duration_ms,
                             ..Default::default()
                         },
                     )
                     .await?;
-                return Ok(-1);
+                return Ok((-1, note));
             }
         };
         let stdout = crate::agent::sanitize::sanitize_text(&stdout);
         let stderr = crate::agent::sanitize::sanitize_text(&stderr);
+        let stdout_preview = crate::agent::tools::head_tail(&stdout, 50, 100);
+        let stderr_preview = crate::agent::tools::head_tail(&stderr, 50, 100);
         self.store
             .record_finish(
                 command_id,
                 CommandFinish {
                     exit_code: Some(exit_code),
-                    stdout_preview: Some(crate::agent::tools::head_tail(&stdout, 50, 100)),
-                    stderr_preview: Some(crate::agent::tools::head_tail(&stderr, 50, 100)),
+                    stdout_preview: Some(stdout_preview.clone()),
+                    stderr_preview: Some(stderr_preview.clone()),
                     duration_ms,
                     ..Default::default()
                 },
             )
             .await?;
         self.store.touch_run_heartbeat(run_id).await?;
-        Ok(exit_code)
+        // 闸门失败输出进 prompt（决策 109）：stdout + stderr 预览合并
+        let combined = match (
+            stdout_preview.trim().is_empty(),
+            stderr_preview.trim().is_empty(),
+        ) {
+            (false, false) => format!("{stdout_preview}\n{stderr_preview}"),
+            (false, true) => stdout_preview,
+            (true, false) => stderr_preview,
+            (true, true) => String::new(),
+        };
+        Ok((exit_code, combined))
     }
 
     /// develop / merge 共用的闸门：lint（如配置）+ 测试（决策 139）。
@@ -1682,27 +2167,27 @@ impl Executor {
     ) -> Result<GateOutcome> {
         if include_lint {
             if let Some(lint) = &project.lint_command {
-                let code = self
+                let (code, output) = self
                     .run_system_command(task, run_id, stage, node, lint, cwd)
                     .await?;
                 if code != 0 {
                     return Ok(GateOutcome {
                         passed: false,
                         failure_kind: GateFailureKind::Lint,
-                        output: format!("lint 命令 `{lint}` 退出码 {code}"),
+                        output: gate_output("lint", lint, code, &output),
                     });
                 }
             }
         }
         let test = test_command_for(project.test_framework.as_deref());
-        let code = self
+        let (code, output) = self
             .run_system_command(task, run_id, stage, node, &test, cwd)
             .await?;
         if code != 0 {
             return Ok(GateOutcome {
                 passed: false,
                 failure_kind: GateFailureKind::Test,
-                output: format!("测试命令 `{test}` 退出码 {code}"),
+                output: gate_output("测试", &test, code, &output),
             });
         }
         Ok(GateOutcome {
@@ -1882,6 +2367,12 @@ enum PhaseA {
     Conflict(Vec<String>),
 }
 
+/// 阶段 B 的结果：合入完成，或脏工作区挂起等用户处理（决策 61 / 132）。
+enum PhaseB {
+    Merged,
+    DirtyWorktree(PendingReason),
+}
+
 /// agent 节点种类：元数据类型与后处理按此分发（决策 38）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum AgentNodeKind {
@@ -1941,6 +2432,9 @@ impl AgentNodeKind {
         &self,
         ex: &Executor,
         task: &Task,
+        cursor: &NodeCursor,
+        run_id: i64,
+        attempt: u32,
         value: serde_json::Value,
     ) -> Result<NodeOutput> {
         use crate::pipeline::MetadataView;
@@ -1969,10 +2463,27 @@ impl AgentNodeKind {
                         Some(&value),
                     )
                     .await?;
-                // 两层冲突检测的第一层（决策 53 / 60 / 71 / 102；第二层归票 16）
+                // 两层冲突检测的第一层（决策 53 / 60 / 71 / 102）
                 let conflicts = ex.store.first_layer_conflicts(&task.id).await?;
-                if !conflicts.is_empty() {
-                    let ids: Vec<String> = conflicts.iter().map(|w| w.task_id.clone()).collect();
+                // 只有文件/符号真交集（High）才 conflict_wait；纯 name 重合是 Low，
+                // 只告警不阻塞（决策 71② / 120）。
+                let hard: Vec<_> = conflicts
+                    .iter()
+                    .filter(|w| w.duplicate_risk == Some(DuplicateRisk::High))
+                    .collect();
+                for warning in conflicts
+                    .iter()
+                    .filter(|w| w.duplicate_risk == Some(DuplicateRisk::Low))
+                {
+                    tracing::warn!(
+                        task = %task.id,
+                        other = %warning.task_id,
+                        symbols = ?warning.overlapping_symbols,
+                        "纯符号名重合：仅告警，不触发 conflict_wait（决策 71② / 120）"
+                    );
+                }
+                if !hard.is_empty() {
+                    let ids: Vec<String> = hard.iter().map(|w| w.task_id.clone()).collect();
                     let reason = PendingReason::new(
                         PendingKind::ConflictWait,
                         Stage::ArchitectDesign,
@@ -1984,6 +2495,16 @@ impl AgentNodeKind {
                         ..Default::default()
                     });
                     return Ok(NodeOutput::Pending(reason));
+                }
+                // 第二层：模块路径重叠但符号名无交集 → conflict_check 语义比对（决策 60 / 67）。
+                // 命中 high → pending(user_decision, duplicate_risk)（决策 60 / 132）。
+                if ex.settings.semantic_conflict_check {
+                    if let Some(reason) = ex
+                        .semantic_conflict_check(task, cursor, run_id, attempt)
+                        .await?
+                    {
+                        return Ok(NodeOutput::Pending(reason));
+                    }
                 }
                 MetadataView::default()
             }
@@ -2054,18 +2575,27 @@ impl AgentNodeKind {
                 MetadataView::default()
             }
             AgentNodeKind::TestExecute => {
-                let m: crate::types::TestResult = serde_json::from_value(value.clone())?;
+                let mut m: crate::types::TestResult = serde_json::from_value(value.clone())?;
                 let path = m
                     .test_report_path
                     .clone()
                     .unwrap_or_else(|| "test-report.md".into());
+                // decision 109：被 merge 测试闸门打回后的复检，系统置 `gate_recheck = true`
+                if let Some(merge) = ex.store.merge_metadata(&task.id).await? {
+                    if merge.gate == Some(Gate::Fail)
+                        && matches!(merge.gate_failure_kind, Some(GateFailureKind::Test) | None)
+                    {
+                        m.gate_recheck = true;
+                    }
+                }
+                let persisted = serde_json::to_value(&m)?;
                 ex.store
                     .upsert_stage_output(
                         &task.id,
                         Stage::Test,
                         OUTPUT_TEST_REPORT,
                         &path,
-                        Some(&value),
+                        Some(&persisted),
                     )
                     .await?;
                 // test 的判定在 validate_output（纯代码）做
@@ -2125,6 +2655,14 @@ fn tool_defs(kind: AgentNodeKind, declared: &[String]) -> Vec<ToolDef> {
 }
 
 // ─────────────────────── prompt 组装辅助（票 12：§10.3 / G3 / G6 / G12）───────────────────────
+
+/// 模块路径是否重叠（决策 60 第二层：模块路径重叠但符号名无交集）。
+fn module_overlaps(a: &str, b: &str) -> bool {
+    if a.is_empty() || b.is_empty() {
+        return false;
+    }
+    a == b || a.starts_with(&format!("{b}::")) || b.starts_with(&format!("{a}::"))
+}
 
 /// G12 工作目录行（system 的「工作目录」段与 user 的「环境路径」段共用，防漂移）。
 fn workdirs_line(worktree: &str, task_dir: &str) -> String {
@@ -2234,6 +2772,16 @@ fn pending_message(kind: PendingKind) -> &'static str {
     }
 }
 
+/// 闸门失败输出（决策 109）：命令 + 退出码 + stdout/stderr 预览，注入 test.execute 复检 prompt。
+fn gate_output(kind: &str, command: &str, code: i32, output: &str) -> String {
+    let output = output.trim();
+    if output.is_empty() {
+        format!("{kind}命令 `{command}` 退出码 {code}")
+    } else {
+        format!("{kind}命令 `{command}` 退出码 {code}\n{output}")
+    }
+}
+
 /// 测试框架 → 系统闸门命令（§6：按 test_framework 动态构建）。
 /// 未配置 → `true`（跳过闸门环节，不阻塞）；带空格的值视作原始命令。
 pub fn test_command_for(framework: Option<&str>) -> String {
@@ -2273,6 +2821,182 @@ fn placeholder_merge() -> MergeResult {
         approval: Approval::None,
         status: MergeStatus::PendingApproval,
     }
+}
+
+/// rebase + 自动解决冲突的结果（pipeline-spec §6，票 15）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AutoRebaseOutcome {
+    /// 无冲突，rebase 完成。
+    Clean { head: String },
+    /// 冲突全部被机械自动解决，rebase 完成并记录了被解决的文件。
+    AutoResolved { head: String, files: Vec<String> },
+    /// 存在无法机械判定的冲突：已 `rebase --abort` 恢复干净状态，调用方按决策 74 打回 develop。
+    Conflict { files: Vec<String> },
+}
+
+/// 在 worktree 内 rebase 到 `base_ref`，并尝试自动解决冲突（pipeline-spec §6）。
+///
+/// 仅自动解决**无歧义**的冲突（三方合并可机械判定）：某侧与 merge-base 相同
+/// （只有另一侧改动）或两侧内容相同（含同名同内容的新增文件）。其余返回
+/// [`AutoRebaseOutcome::Conflict`]（内部已 abort，worktree 干净）。
+pub async fn rebase_onto_with_auto_resolve(
+    worktree: &Path,
+    base_ref: &str,
+) -> Result<AutoRebaseOutcome> {
+    let wt = worktree.to_path_buf();
+    let base_ref = base_ref.to_string();
+    tokio::task::spawn_blocking(move || -> Result<AutoRebaseOutcome> {
+        use crate::git::git2;
+        let repo = git2::Repository::open(&wt).map_err(|e| Error::Git(e.to_string()))?;
+        let sig = git2::Signature::now("AgentPipeline", "agentpipeline@localhost")
+            .map_err(|e| Error::Git(e.to_string()))?;
+        let base_commit = repo
+            .revparse_single(&base_ref)
+            .and_then(|o| o.peel_to_commit())
+            .map_err(|e| Error::Git(e.to_string()))?;
+        let head_id = repo
+            .head()
+            .map_err(|e| Error::Git(e.to_string()))?
+            .target()
+            .ok_or_else(|| Error::Git("rebase 起点 HEAD 无指向".into()))?;
+        // 已包含基准：与 `git rebase` no-op 语义一致
+        if head_id == base_commit.id()
+            || repo
+                .graph_descendant_of(head_id, base_commit.id())
+                .map_err(|e| Error::Git(e.to_string()))?
+        {
+            return Ok(AutoRebaseOutcome::Clean {
+                head: head_id.to_string(),
+            });
+        }
+        let base_annotated = repo
+            .find_annotated_commit(base_commit.id())
+            .map_err(|e| Error::Git(e.to_string()))?;
+        let mut rebase = repo
+            .rebase(
+                None,
+                Some(&base_annotated),
+                Some(&base_annotated),
+                Some(&mut git2::RebaseOptions::new()),
+            )
+            .map_err(|e| Error::Git(e.to_string()))?;
+        let mut resolved: Vec<String> = Vec::new();
+
+        // 处理当前索引冲突：可机械解决则写入并返回 Ok(())；否则返回 Err(files) 触发 abort。
+        let handle_conflicts = |repo: &git2::Repository,
+                                index: &mut git2::Index,
+                                resolved: &mut Vec<String>|
+         -> Result<std::result::Result<(), Vec<String>>> {
+            let conflicts: Vec<git2::IndexConflict> = index
+                .conflicts()
+                .map_err(|e| Error::Git(e.to_string()))?
+                .collect::<std::result::Result<Vec<_>, _>>()
+                .map_err(|e| Error::Git(e.to_string()))?;
+            let mut hard: Vec<String> = Vec::new();
+            for c in conflicts {
+                let path = c
+                    .our
+                    .as_ref()
+                    .or(c.their.as_ref())
+                    .or(c.ancestor.as_ref())
+                    .map(|e| e.path.clone())
+                    .ok_or_else(|| Error::Git("rebase 冲突条目缺少路径".into()))?;
+                let ancestor = c.ancestor.as_ref().map(|e| e.id);
+                let ours = c.our.as_ref().map(|e| e.id);
+                let theirs = c.their.as_ref().map(|e| e.id);
+                let chosen: Option<git2::Oid> = if ours == theirs {
+                    ours
+                } else if ancestor == ours {
+                    theirs
+                } else if ancestor == theirs {
+                    ours
+                } else {
+                    hard.push(String::from_utf8_lossy(&path).to_string());
+                    continue;
+                };
+                let rel = std::str::from_utf8(&path)
+                    .map_err(|e| Error::Git(format!("冲突路径非 UTF-8：{e}")))?
+                    .to_string();
+                match chosen {
+                    Some(id) => {
+                        let blob = repo.find_blob(id).map_err(|e| Error::Git(e.to_string()))?;
+                        std::fs::write(wt.join(&rel), blob.content())?;
+                        index
+                            .add_path(Path::new(&rel))
+                            .map_err(|e| Error::Git(e.to_string()))?;
+                    }
+                    None => {
+                        let abs = wt.join(&rel);
+                        if abs.exists() {
+                            std::fs::remove_file(&abs)?;
+                        }
+                        index
+                            .remove_path(Path::new(&rel))
+                            .map_err(|e| Error::Git(e.to_string()))?;
+                    }
+                }
+                resolved.push(rel);
+            }
+            if hard.is_empty() {
+                Ok(Ok(()))
+            } else {
+                Ok(Err(hard))
+            }
+        };
+
+        macro_rules! step_or_abort {
+            ($commit:expr) => {{
+                let mut index = repo.index().map_err(|e| Error::Git(e.to_string()))?;
+                if index.has_conflicts() {
+                    match handle_conflicts(&repo, &mut index, &mut resolved)? {
+                        Ok(()) => {
+                            index.write().map_err(|e| Error::Git(e.to_string()))?;
+                        }
+                        Err(files) => {
+                            let _ = rebase.abort();
+                            return Ok(AutoRebaseOutcome::Conflict { files });
+                        }
+                    }
+                }
+                if $commit {
+                    match rebase.commit(None, &sig, None) {
+                        Ok(_) => {}
+                        // 补丁已包含于基准（add/add 同内容等）→ libgit2 报 Applied，跳过即可
+                        Err(e) if e.code() == git2::ErrorCode::Applied => {}
+                        Err(e) => return Err(Error::Git(format!("rebase 提交失败：{e}"))),
+                    }
+                }
+            }};
+        }
+
+        loop {
+            match rebase.next() {
+                Some(Ok(_op)) => step_or_abort!(true),
+                Some(Err(e)) if e.code() == git2::ErrorCode::Conflict => step_or_abort!(true),
+                Some(Err(e)) => return Err(Error::Git(e.to_string())),
+                None => break,
+            }
+        }
+        rebase
+            .finish(Some(&sig))
+            .map_err(|e| Error::Git(format!("rebase 收尾失败：{e}")))?;
+        let head = repo
+            .head()
+            .map_err(|e| Error::Git(e.to_string()))?
+            .target()
+            .ok_or_else(|| Error::Git("rebase 完成后 HEAD 无指向".into()))?
+            .to_string();
+        if resolved.is_empty() {
+            Ok(AutoRebaseOutcome::Clean { head })
+        } else {
+            Ok(AutoRebaseOutcome::AutoResolved {
+                head,
+                files: resolved,
+            })
+        }
+    })
+    .await
+    .map_err(|e| Error::Git(format!("rebase 自动解决任务失败：{e}")))?
 }
 
 /// 从 `git diff --stat` 输出解析汇总行（files_changed / insertions / deletions）。
@@ -2374,5 +3098,27 @@ mod tests {
             backtrack_feedback_segment(&home, "t1", Stage::ArchitectDesign, Node::ValidateInput),
             None
         );
+    }
+
+    #[test]
+    fn module_overlap_detection() {
+        assert!(module_overlaps("auth", "auth"));
+        assert!(module_overlaps("crate::auth", "crate::auth::login"));
+        assert!(module_overlaps("crate::auth::login", "crate::auth"));
+        assert!(!module_overlaps("auth", "billing"));
+        // 前缀相同但不是模块边界（auth vs authorize）不算重叠
+        assert!(!module_overlaps("auth", "authorize"));
+        assert!(!module_overlaps("", "auth"));
+    }
+
+    #[test]
+    fn gate_output_includes_log_when_present() {
+        assert_eq!(
+            gate_output("测试", "cargo test", 1, "  "),
+            "测试命令 `cargo test` 退出码 1"
+        );
+        let with_log = gate_output("测试", "cargo test", 1, "FAILED: test_login\n");
+        assert!(with_log.contains("退出码 1"));
+        assert!(with_log.contains("FAILED: test_login"));
     }
 }

@@ -340,6 +340,88 @@ async fn project_probing_is_code_based_and_stable() {
     assert!(Git::agents_md_path(repo.path()).is_some());
 }
 
+// ─────────────────────────── rebase 冲突自动解决（票 15 / pipeline-spec §6）───────────────────────────
+
+#[tokio::test]
+async fn rebase_conflict_auto_resolves_identical_modification() {
+    use agentpipeline_core::pipeline::executor::{
+        rebase_onto_with_auto_resolve, AutoRebaseOutcome,
+    };
+
+    // 两侧把同一文件改成完全相同的字节——三方合并可机械判定（ours == theirs）。
+    let repo = Repo::clean().unwrap();
+    repo.branch("topic");
+    repo.write("src/lib.rs", "pub fn same() {}\n");
+    repo.commit_all("feat: topic 改成 same");
+    repo.checkout("main");
+    repo.write("src/lib.rs", "pub fn same() {}\n");
+    repo.commit_all("feat: main 也改成 same");
+
+    let home = TestHome::new().unwrap();
+    let worktree = home.home().worktree_path("t1");
+    let wt = worktree.display().to_string();
+    repo.git(&["worktree", "add", "-b", "kanban/t1", &wt, "topic"]);
+
+    let outcome = rebase_onto_with_auto_resolve(&worktree, "main")
+        .await
+        .unwrap();
+    match outcome {
+        AutoRebaseOutcome::AutoResolved { files, head } => {
+            assert_eq!(files, vec!["src/lib.rs".to_string()]);
+            assert!(!head.is_empty());
+        }
+        AutoRebaseOutcome::Clean { .. } => {
+            // libgit2 直接判定补丁已应用（等价于自动解决）——同样可接受
+        }
+        other => panic!("同名同内容修改不应打回：{other:?}"),
+    }
+    assert_eq!(
+        std::fs::read_to_string(worktree.join("src/lib.rs")).unwrap(),
+        "pub fn same() {}\n"
+    );
+    assert!(
+        agentpipeline_core::git::git2::Repository::open(&worktree)
+            .unwrap()
+            .open_rebase(None)
+            .is_err(),
+        "自动解决后 rebase 中断态应已收尾"
+    );
+    assert!(Git
+        .contains(&worktree, "HEAD", &repo.head("main"))
+        .await
+        .unwrap());
+}
+
+#[tokio::test]
+async fn rebase_hard_conflict_is_not_auto_resolved() {
+    use agentpipeline_core::pipeline::executor::{
+        rebase_onto_with_auto_resolve, AutoRebaseOutcome,
+    };
+
+    // 两侧改同一行且内容不同 → 不可机械判定 → Conflict（内部已 abort）
+    let repo = Repo::clean().unwrap();
+    repo.conflict_hard().unwrap();
+    let home = TestHome::new().unwrap();
+    let worktree = home.home().worktree_path("t1");
+    let wt = worktree.display().to_string();
+    repo.git(&["worktree", "add", "-b", "kanban/t1", &wt, "topic"]);
+
+    match rebase_onto_with_auto_resolve(&worktree, "main")
+        .await
+        .unwrap()
+    {
+        AutoRebaseOutcome::Conflict { files } => {
+            assert_eq!(files, vec!["shared.txt".to_string()]);
+        }
+        other => panic!("硬冲突不得被自动解决：{other:?}"),
+    }
+    // abort 后已跟踪文件回到干净状态，且中断态清除
+    assert!(agentpipeline_core::git::git2::Repository::open(&worktree)
+        .unwrap()
+        .open_rebase(None)
+        .is_err());
+}
+
 /// 在 worktree 内提交（fixture 语义与生产一致：agent 在 worktree 里提交）。
 fn commit_worktree(worktree: &std::path::Path, message: &str) -> String {
     run_git(worktree, &["add", "-A"]);

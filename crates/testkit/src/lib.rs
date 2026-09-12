@@ -17,7 +17,8 @@ pub mod mock_llm;
 pub mod script;
 
 pub use assertions::{
-    assert_cursor_at, command_count, cursor_counts, live_cursor_for_branch, run_count, SseRecorder,
+    assert_cursor_at, backdate_run, command_count, cursor_counts, live_cursor_for_branch,
+    llm_run_count, run_count, SseRecorder,
 };
 pub use clock::ManualClock;
 pub use git_fixture::{Language, Repo};

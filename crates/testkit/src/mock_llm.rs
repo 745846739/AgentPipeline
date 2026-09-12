@@ -6,8 +6,12 @@
 
 use std::sync::{Arc, Mutex};
 
+use agentpipeline_core::agent::templates::system_template;
+use agentpipeline_core::types::{Node, Stage};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
+
+use crate::script::{Script, Step};
 
 /// 一条脚本化响应。
 #[derive(Clone)]
@@ -58,8 +62,13 @@ impl RecordedRequest {
     }
 }
 
+/// 动态响应器：按请求现场决定响应（票 17 的真实二进制冒烟用 `Script` 驱动）。
+pub type Responder = Arc<dyn Fn(&RecordedRequest) -> MockRoute + Send + Sync>;
+
 struct Shared {
     routes: Vec<MockRoute>,
+    /// 有响应器时优先于静态路由（`from_script` 用）。
+    responder: Option<Responder>,
     requests: Mutex<Vec<RecordedRequest>>,
 }
 
@@ -73,14 +82,53 @@ pub struct MockLlm {
 impl MockLlm {
     /// 启动：监听 127.0.0.1 随机端口，路由按声明顺序取首个前缀命中，未命中返回 404。
     pub async fn start(routes: Vec<MockRoute>) -> Self {
+        let shared = Arc::new(Shared {
+            routes,
+            responder: None,
+            requests: Mutex::new(Vec::new()),
+        });
+        Self::serve(shared).await
+    }
+
+    /// 动态响应器版本：每个请求现场调用 `responder`（优先级高于静态路由）。
+    pub async fn start_responder(responder: Responder) -> Self {
+        let shared = Arc::new(Shared {
+            routes: Vec::new(),
+            responder: Some(responder),
+            requests: Mutex::new(Vec::new()),
+        });
+        Self::serve(shared).await
+    }
+
+    /// 用 [`Script`] 驱动一个 OpenAI 兼容的流式 mock server（票 17）。
+    ///
+    /// 用 system prompt 里的节点 persona（内嵌 §10.3 模板 / 伪阶段 persona）
+    /// 反查 `(stage, node)` 或 `pseudo:*`，再消费脚本下一步——与 FakeAgent
+    /// 同一份 `Script`，因此真实二进制走的是与 L2/L4 相同的场景脚本。
+    pub async fn from_script(script: Script) -> Self {
+        let script = Arc::new(Mutex::new(script));
+        let responder: Responder = Arc::new(move |request: &RecordedRequest| {
+            let system = request_system_prompt(&request.body).unwrap_or_default();
+            let body = if let Some(agent_type) = pseudo_agent_type(&system) {
+                let step = script.lock().unwrap().take_next_pseudo(agent_type);
+                render_step(step)
+            } else if let Some((stage, node)) = node_for_system(&system) {
+                let step = script.lock().unwrap().take_next(stage, node);
+                render_step(step)
+            } else {
+                // 认不出的请求（如未脚本化节点）：当作脚本耗尽，干净收尾。
+                sse_text("（脚本已结束）")
+            };
+            MockRoute::sse("/", body)
+        });
+        Self::start_responder(responder).await
+    }
+
+    async fn serve(shared: Arc<Shared>) -> Self {
         let listener = TcpListener::bind(("127.0.0.1", 0))
             .await
             .expect("绑定 mock 端口");
         let url = format!("http://{}", listener.local_addr().unwrap());
-        let shared = Arc::new(Shared {
-            routes,
-            requests: Mutex::new(Vec::new()),
-        });
         let task_shared = shared.clone();
         let handle = tokio::spawn(async move {
             loop {
@@ -114,11 +162,14 @@ async fn serve_once(mut stream: TcpStream, shared: &Shared) -> std::io::Result<(
     let Some(request) = request else {
         return Ok(());
     };
-    let route = shared
-        .routes
-        .iter()
-        .find(|r| request.path.starts_with(&r.path))
-        .cloned();
+    let route = match &shared.responder {
+        Some(responder) => Some(responder(&request)),
+        None => shared
+            .routes
+            .iter()
+            .find(|r| request.path.starts_with(&r.path))
+            .cloned(),
+    };
     shared.requests.lock().unwrap().push(request);
     let Some(route) = route else {
         write_response(
@@ -131,6 +182,105 @@ async fn serve_once(mut stream: TcpStream, shared: &Shared) -> std::io::Result<(
         return Ok(());
     };
     write_response(&mut stream, route.status, &route.content_type, &route.body).await
+}
+
+/// 12 个 agent 节点（与 §10.3 内嵌模板一一对应）。
+const AGENT_NODES: [(Stage, Node); 12] = [
+    (Stage::ArchitectDesign, Node::ValidateInput),
+    (Stage::ArchitectDesign, Node::Execute),
+    (Stage::ArchitectDesign, Node::ValidateOutput),
+    (Stage::DevelopDesign, Node::ValidateInput),
+    (Stage::DevelopDesign, Node::Execute),
+    (Stage::DevelopDesign, Node::ValidateOutput),
+    (Stage::TestDesign, Node::ValidateInput),
+    (Stage::TestDesign, Node::Execute),
+    (Stage::TestDesign, Node::ValidateOutput),
+    (Stage::Develop, Node::Execute),
+    (Stage::Review, Node::Execute),
+    (Stage::Test, Node::Execute),
+];
+
+/// 伪阶段 persona 首句 → `agent_type`（票 16 的伪阶段请求据此路由 `Script` 的伪阶段队列）。
+const PSEUDO_MARKERS: [(&str, &str); 2] = [
+    ("你是设计语义冲突比对 agent", "pseudo:conflict_check"),
+    ("你是独立复核 agent", "pseudo:validator_cross_check"),
+];
+
+/// 取出 OpenAI 兼容请求体里第一条 system message 的内容。
+fn request_system_prompt(body: &str) -> Option<String> {
+    let value: serde_json::Value = serde_json::from_str(body).ok()?;
+    value
+        .get("messages")?
+        .get(0)?
+        .get("content")?
+        .as_str()
+        .map(String::from)
+}
+
+/// 用 system prompt 里的节点 persona 首句反查 `(stage, node)`。
+fn node_for_system(system: &str) -> Option<(Stage, Node)> {
+    AGENT_NODES.iter().copied().find(|(stage, node)| {
+        let first = system_template(*stage, *node)
+            .lines()
+            .next()
+            .unwrap_or_default();
+        !first.is_empty() && system.contains(first)
+    })
+}
+
+/// 用 system prompt 里的伪阶段 persona 首句反查 `agent_type`。
+fn pseudo_agent_type(system: &str) -> Option<&'static str> {
+    PSEUDO_MARKERS
+        .iter()
+        .find(|(marker, _)| system.contains(marker))
+        .map(|(_, agent_type)| *agent_type)
+}
+
+/// 一步脚本 → 一段 OpenAI 兼容 SSE。
+fn render_step(step: Option<Step>) -> String {
+    match step {
+        Some(Step::Tool { name, arguments }) => sse_tool(&name, &arguments.to_string()),
+        Some(Step::Submit(value)) => sse_tool("submit_metadata", &value.to_string()),
+        Some(Step::Text(text)) => sse_text(&text),
+        // Stall：不写 [DONE]，连接关闭即流结束（与 FakeAgent 的「永不返回」近似）
+        Some(Step::Stall) => String::new(),
+        None => sse_text("（脚本已结束）"),
+    }
+}
+
+fn sse_tool(name: &str, arguments: &str) -> String {
+    let chunk = serde_json::json!({
+        "choices": [{
+            "index": 0,
+            "delta": {
+                "role": "assistant",
+                "tool_calls": [{
+                    "index": 0,
+                    "id": format!("call_{}", ulid::Ulid::new()),
+                    "type": "function",
+                    "function": {"name": name, "arguments": arguments}
+                }]
+            },
+            "finish_reason": "tool_calls"
+        }]
+    });
+    sse_with_usage(&chunk)
+}
+
+fn sse_text(text: &str) -> String {
+    let chunk = serde_json::json!({
+        "choices": [{
+            "index": 0,
+            "delta": {"role": "assistant", "content": text},
+            "finish_reason": "stop"
+        }]
+    });
+    sse_with_usage(&chunk)
+}
+
+fn sse_with_usage(chunk: &serde_json::Value) -> String {
+    let usage = serde_json::json!({"usage": {"prompt_tokens": 10, "completion_tokens": 5}});
+    format!("data: {chunk}\n\ndata: {usage}\n\ndata: [DONE]\n\n")
 }
 
 async fn read_request(stream: &mut TcpStream) -> std::io::Result<Option<RecordedRequest>> {

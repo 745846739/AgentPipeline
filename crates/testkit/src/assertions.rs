@@ -133,3 +133,24 @@ pub async fn live_cursor_for_branch(
         .into_iter()
         .find(|c| c.branch == branch))
 }
+
+/// 把 run 的 `started_at` / `last_activity_at` 回拨（超时链 E2E-14 用；决策 64 / 66）。
+///
+/// `idle_secs_ago` 只影响空闲超时读数，`started_secs_ago` 影响绝对超时。
+pub async fn backdate_run(
+    store: &Store,
+    run_id: i64,
+    started_secs_ago: i64,
+    idle_secs_ago: i64,
+) -> Result<()> {
+    let now = store.now();
+    let started = now - chrono::Duration::seconds(started_secs_ago);
+    let activity = now - chrono::Duration::seconds(idle_secs_ago);
+    sqlx::query("UPDATE kanban_node_runs SET started_at = ?, last_activity_at = ? WHERE id = ?")
+        .bind(agentpipeline_core::storage::ts(started))
+        .bind(agentpipeline_core::storage::ts(activity))
+        .bind(run_id)
+        .execute(store.pool())
+        .await?;
+    Ok(())
+}

@@ -28,10 +28,14 @@ pub enum Step {
     Stall,
 }
 
-/// 按 `(stage, node)` 组织的脚本。
+/// 按 `(stage, node)` 组织的脚本；伪阶段按 `agent_type`（`pseudo:*`）单独排队（testing.md §3.2 ⑥）。
 #[derive(Debug, Default, Clone)]
 pub struct Script {
     steps: HashMap<(Stage, Node), VecDeque<Step>>,
+    pseudo_steps: HashMap<String, VecDeque<Step>>,
+    /// 工具失败注入规则（testing.md §3.2 ② / G13）：`(stage, node, tool)` 的
+    /// 第 `n` 次调用（1-based）换成必然失败的参数，其余同名调用真实执行。
+    fail_rules: HashMap<(Stage, Node, String), u32>,
 }
 
 impl Script {
@@ -45,6 +49,15 @@ impl Script {
         self
     }
 
+    /// 为某个伪阶段（`agent_type`，如 `pseudo:conflict_check`）追加步骤。
+    pub fn push_pseudo(&mut self, agent_type: &str, step: Step) -> &mut Self {
+        self.pseudo_steps
+            .entry(agent_type.to_string())
+            .or_default()
+            .push_back(step);
+        self
+    }
+
     /// 链式脚本构建入口。
     pub fn for_node(&mut self, stage: Stage, node: Node) -> NodeScript<'_> {
         NodeScript {
@@ -52,6 +65,32 @@ impl Script {
             stage,
             node,
         }
+    }
+
+    /// 伪阶段的链式脚本构建入口。
+    pub fn for_pseudo<'a>(&'a mut self, agent_type: &'a str) -> PseudoScript<'a> {
+        PseudoScript {
+            script: self,
+            agent_type,
+        }
+    }
+
+    /// 工具失败注入（testing.md §3.2 ② / G13 / 决策 33）：`(stage, node)` 内某个工具的
+    /// **第 `n` 次**调用（1-based）被替换为必然失败的参数，其余调用照常真实执行。
+    ///
+    /// 失败形态：把参数换成 JSON 字符串，工具层解析参数时缺必填字段 → `Err`，
+    /// 由 agent loop 按 `tool_retry_max` 分层计数（单次失败不触发节点重试）。
+    pub fn fail_tool_n(&mut self, stage: Stage, node: Node, tool: &str, n: u32) -> &mut Self {
+        assert!(n >= 1, "fail_tool_n 的 n 从 1 开始");
+        self.fail_rules.insert((stage, node, tool.to_string()), n);
+        self
+    }
+
+    /// 命中规则的调用序号（`None` = 不注入失败）。
+    pub fn fail_tool_at(&self, stage: Stage, node: Node, tool: &str) -> Option<u32> {
+        self.fail_rules
+            .get(&(stage, node, tool.to_string()))
+            .copied()
     }
 
     /// 剩余步骤数。
@@ -62,8 +101,17 @@ impl Script {
             .unwrap_or(0)
     }
 
+    /// 伪阶段剩余步骤数。
+    pub fn remaining_pseudo(&self, agent_type: &str) -> usize {
+        self.pseudo_steps
+            .get(agent_type)
+            .map(VecDeque::len)
+            .unwrap_or(0)
+    }
+
     pub fn is_empty(&self) -> bool {
         self.steps.values().all(VecDeque::is_empty)
+            && self.pseudo_steps.values().all(VecDeque::is_empty)
     }
 
     /// 已声明的 `(stage, node)` 列表。
@@ -77,6 +125,23 @@ impl Script {
         self.steps
             .get_mut(&(stage, node))
             .and_then(|q| q.pop_front())
+    }
+
+    fn pop_pseudo(&mut self, agent_type: &str) -> Option<Step> {
+        self.pseudo_steps
+            .get_mut(agent_type)
+            .and_then(|q| q.pop_front())
+    }
+
+    /// 取出并消费某个 `(stage, node)` 的下一步——供 mock HTTP 脚本服务器复用
+    /// （票 17：真实二进制冒烟用 `Script` 驱动 `mock_llm`）。
+    pub fn take_next(&mut self, stage: Stage, node: Node) -> Option<Step> {
+        self.pop(stage, node)
+    }
+
+    /// 取出并消费某个伪阶段（`agent_type` 形如 `pseudo:*`）的下一步。
+    pub fn take_next_pseudo(&mut self, agent_type: &str) -> Option<Step> {
+        self.pop_pseudo(agent_type)
     }
 }
 
@@ -125,6 +190,24 @@ impl NodeScript<'_> {
         })
     }
 
+    /// 声明式工具失败注入（§3.2 ② / G13）：本节点该工具第 `n` 次调用失败。
+    ///
+    /// 与 [`NodeScript::failing_tool`] 不同，这里不改变脚本队列——真实调用照常声明，
+    /// 由 [`FakeAgent`] 在运行时把第 `n` 次换成必然失败的参数。
+    pub fn fail_tool_n(self, tool: &str, n: u32) -> Self {
+        self.script.fail_tool_n(self.stage, self.node, tool, n);
+        self
+    }
+
+    /// 超长工具结果注入（§3.2 ⑤）：追加一个真实执行的 `run_command`——`seq 1 <lines>`。
+    ///
+    /// 行数 > 150 触发 L1 裁剪（`trim_run_command` 前 50 + 后 100 行）；
+    /// 字符数超过 `offload_threshold_tokens × 4`（默认 4000 token ≈ 16000 字符）
+    /// 触发 L2 卸载（写 `context_dir` 并替换为预览，决策 110）。
+    pub fn long_tool_result(self, lines: u64) -> Self {
+        self.run_command(&format!("seq 1 {lines}"))
+    }
+
     /// 类型化 `submit_metadata`（参数由 serde 结构体序列化，决策 38）。
     pub fn submit<T: Serialize>(self, value: &T) -> Self {
         let json = serde_json::to_value(value).expect("元数据可序列化");
@@ -152,11 +235,45 @@ impl NodeScript<'_> {
     }
 }
 
+/// 单个伪阶段的脚本构建器（`agent_type` 形如 `pseudo:conflict_check`）。
+pub struct PseudoScript<'a> {
+    script: &'a mut Script,
+    agent_type: &'a str,
+}
+
+impl PseudoScript<'_> {
+    /// 类型化 `submit_metadata`（result 结构体由 serde 序列化）。
+    pub fn submit<T: Serialize>(self, value: &T) -> Self {
+        let json = serde_json::to_value(value).expect("元数据可序列化");
+        self.push(Step::Submit(json))
+    }
+
+    pub fn submit_raw(self, value: serde_json::Value) -> Self {
+        self.push(Step::Submit(value))
+    }
+
+    /// 纯文本回复（伪阶段也可走文本 JSON 解析）。
+    pub fn text(self, text: &str) -> Self {
+        self.push(Step::Text(text.to_string()))
+    }
+
+    pub fn stall(self) -> Self {
+        self.push(Step::Stall)
+    }
+
+    pub fn push(self, step: Step) -> Self {
+        self.script.push_pseudo(self.agent_type, step);
+        self
+    }
+}
+
 struct Inner {
     script: Script,
     calls: Vec<(Stage, Node)>,
     /// 每次调用的请求快照（按发生顺序；断言 prompt 组装 / 配置透传用）。
     requests: Vec<LlmRequest>,
+    /// 各 `(stage, node, tool)` 已发出的工具调用计数（`fail_tool_n` 判定用）。
+    tool_calls: HashMap<(Stage, Node, String), u32>,
     prompt_tokens: u32,
     completion_tokens: u32,
 }
@@ -174,6 +291,7 @@ impl FakeAgent {
                 script,
                 calls: Vec::new(),
                 requests: Vec::new(),
+                tool_calls: HashMap::new(),
                 prompt_tokens: 0,
                 completion_tokens: 0,
             })),
@@ -225,13 +343,38 @@ impl LlmClient for FakeAgent {
         Box::pin(async move {
             // 注意：MutexGuard 不跨 await（保持 future 为 Send）
             let (stage, node) = (request.stage, request.node);
+            // 伪阶段请求的 `run.agent_type` 形如 `pseudo:*`，按它路由独立脚本队列
+            let pseudo_type = request
+                .run
+                .as_ref()
+                .map(|r| r.agent_type.clone())
+                .filter(|a| a.starts_with("pseudo:"));
             let step = {
                 let mut inner = agent.inner.lock().unwrap();
                 inner.calls.push((stage, node));
                 inner.requests.push(request);
                 inner.prompt_tokens += 10;
                 inner.completion_tokens += 5;
-                inner.script.pop(stage, node)
+                let popped = match &pseudo_type {
+                    Some(agent_type) => inner.script.pop_pseudo(agent_type),
+                    None => inner.script.pop(stage, node),
+                };
+                match popped {
+                    // fail_tool_n：把该工具第 n 次调用换成必然失败的参数（其余真实执行）
+                    Some(Step::Tool { name, arguments }) if pseudo_type.is_none() => {
+                        let key = (stage, node, name.clone());
+                        let next = inner.tool_calls.get(&key).copied().unwrap_or(0) + 1;
+                        inner.tool_calls.insert(key, next);
+                        let fail = inner.script.fail_tool_at(stage, node, &name) == Some(next);
+                        let arguments = if fail {
+                            failing_arguments(arguments)
+                        } else {
+                            arguments
+                        };
+                        Some(Step::Tool { name, arguments })
+                    }
+                    other => other,
+                }
             };
 
             match step {
@@ -279,6 +422,11 @@ fn tool_call(name: String, arguments: serde_json::Value) -> ToolCall {
         name,
         arguments: arguments.to_string(),
     }
+}
+
+/// 必然失败的参数（§3.2 ②）：换成 JSON 字符串，工具层解析后缺一切必填字段 → `Err`。
+fn failing_arguments(_original: serde_json::Value) -> serde_json::Value {
+    serde_json::json!("__agentpipeline__fail_tool_n__")
 }
 
 #[cfg(test)]
@@ -380,6 +528,94 @@ mod tests {
         assert!(timed.is_err(), "Stall 步应当永不返回");
     }
 
+    #[tokio::test]
+    async fn fail_tool_n_fails_only_the_nth_call_of_that_tool() {
+        // §3.2 ② / G13：第 2 次 run_command 调用被换成必然失败形态，1 / 3 次真实执行
+        let mut script = Script::new();
+        script
+            .for_node(Stage::Develop, Node::Execute)
+            .run_command("echo one")
+            .run_command("echo two")
+            .run_command("echo three")
+            .fail_tool_n("run_command", 2);
+        let agent = FakeAgent::new(script);
+
+        let mut calls = Vec::new();
+        for _ in 0..3 {
+            let resp = agent
+                .complete(request(Stage::Develop, Node::Execute))
+                .await
+                .unwrap();
+            assert_eq!(resp.tool_calls[0].name, "run_command");
+            calls.push(
+                serde_json::from_str::<serde_json::Value>(&resp.tool_calls[0].arguments).unwrap(),
+            );
+        }
+        assert_eq!(calls[0]["command"], "echo one");
+        assert_eq!(calls[2]["command"], "echo three");
+        assert!(
+            calls[1].is_string(),
+            "第 2 次应是失败注入形态（JSON 字符串缺 command）：{:?}",
+            calls[1]
+        );
+
+        // 规则只在命中的那次生效，后续调用不再注入
+        let fourth = agent
+            .complete(request(Stage::Develop, Node::Execute))
+            .await
+            .unwrap();
+        assert!(fourth.tool_calls.is_empty(), "队列已耗尽 → 收尾响应");
+    }
+
+    #[tokio::test]
+    async fn fail_tool_n_is_scoped_to_stage_node_and_tool() {
+        let mut script = Script::new();
+        // 规则只挂在 Develop.Execute.run_command 上
+        script.fail_tool_n(Stage::Develop, Node::Execute, "run_command", 1);
+        script
+            .for_node(Stage::Develop, Node::Execute)
+            .run_command("echo a");
+        script
+            .for_node(Stage::Test, Node::Execute)
+            .run_command("echo b");
+        let agent = FakeAgent::new(script);
+
+        // 不同节点：不注入
+        let test = agent
+            .complete(request(Stage::Test, Node::Execute))
+            .await
+            .unwrap();
+        let test_args: serde_json::Value =
+            serde_json::from_str(&test.tool_calls[0].arguments).unwrap();
+        assert_eq!(test_args["command"], "echo b");
+
+        // 命中节点：注入
+        let dev = agent
+            .complete(request(Stage::Develop, Node::Execute))
+            .await
+            .unwrap();
+        let dev_args: serde_json::Value =
+            serde_json::from_str(&dev.tool_calls[0].arguments).unwrap();
+        assert!(dev_args.is_string());
+    }
+
+    #[tokio::test]
+    async fn long_tool_result_emits_real_seq_command() {
+        // §3.2 ⑤：超长工具结果注入 = 真实执行的 seq 命令
+        let mut script = Script::new();
+        script
+            .for_node(Stage::Develop, Node::Execute)
+            .long_tool_result(300);
+        let agent = FakeAgent::new(script);
+        let resp = agent
+            .complete(request(Stage::Develop, Node::Execute))
+            .await
+            .unwrap();
+        assert_eq!(resp.tool_calls[0].name, "run_command");
+        let args: serde_json::Value = serde_json::from_str(&resp.tool_calls[0].arguments).unwrap();
+        assert_eq!(args["command"], "seq 1 300");
+    }
+
     #[test]
     fn declared_nodes_lists_all_scripts() {
         let mut script = Script::new();
@@ -387,5 +623,38 @@ mod tests {
         script.for_node(Stage::Test, Node::Execute).text("b");
         assert_eq!(script.declared_nodes().len(), 2);
         assert_eq!(script.remaining(Stage::Develop, Node::Execute), 1);
+    }
+
+    #[tokio::test]
+    async fn pseudo_steps_route_by_agent_type() {
+        // testing.md §3.2 ⑥：伪阶段脚本按 `run.agent_type = pseudo:*` 独立路由
+        let mut script = Script::new();
+        script
+            .for_pseudo("pseudo:conflict_check")
+            .submit_raw(serde_json::json!({"duplicate_risk": "high"}));
+        script
+            .for_node(Stage::ArchitectDesign, Node::Execute)
+            .text("主节点");
+        let agent = FakeAgent::new(script);
+
+        let mut pseudo = request(Stage::ArchitectDesign, Node::Execute);
+        pseudo.run = Some(agentpipeline_core::agent::client::RunContext {
+            task_id: "t".into(),
+            branch: "main".into(),
+            run_id: 1,
+            agent_type: "pseudo:conflict_check".into(),
+        });
+        let resp = agent.complete(pseudo).await.unwrap();
+        assert_eq!(resp.tool_calls[0].name, "submit_metadata");
+        let args: serde_json::Value = serde_json::from_str(&resp.tool_calls[0].arguments).unwrap();
+        assert_eq!(args["duplicate_risk"], "high");
+
+        // 主节点请求仍走自己的队列，未被伪阶段脚本吃掉
+        let main = agent
+            .complete(request(Stage::ArchitectDesign, Node::Execute))
+            .await
+            .unwrap();
+        assert_eq!(main.content.as_deref(), Some("主节点"));
+        assert!(agent.script_is_empty());
     }
 }

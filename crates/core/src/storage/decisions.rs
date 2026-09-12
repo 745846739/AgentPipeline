@@ -7,7 +7,7 @@ use sqlx::Row;
 
 use super::{decode_pending, parse_ts, ts, Store};
 use crate::pipeline::landing::{
-    entry_node, next_stages, skip_landing, stage_has_node, SkipLanding,
+    entry_node, next_is_join, next_stages, skip_landing, stage_has_node, SkipLanding,
 };
 use crate::types::{
     Approval, CursorStatus, MergeResult, Node, NodeCursor, PendingKind, PendingReason, Stage,
@@ -228,6 +228,16 @@ impl Store {
     ) -> Result<()> {
         match action {
             ResumeAction::Continue => {
+                let ctx_kind = cursor
+                    .pending_reason
+                    .as_ref()
+                    .and_then(|r| r.context.as_ref())
+                    .and_then(|c| c.kind.as_deref())
+                    .map(str::to_string);
+                // decision 135：judge_disagreement 的 continue = 用户裁决「合格」，
+                // 特判**直接放行到下一阶段入口**，不重跑 validate_output（用户裁决即终审）。
+                let is_judge_disagreement =
+                    ctx_kind.as_deref() == Some(crate::actions::kinds::JUDGE_DISAGREEMENT);
                 // dependency_failed 的 continue 特殊：忽略失败依赖，置回 queued 重新准入（决策 116）
                 let is_dependency_failed = cursor
                     .pending_reason
@@ -235,7 +245,9 @@ impl Store {
                     .map(|r| r.kind == PendingKind::DependencyFailed)
                     .unwrap_or(false);
                 self.clear_cursor_pending(&cursor.cursor_id).await?;
-                if is_dependency_failed {
+                if is_judge_disagreement {
+                    self.advance_after_judge_continue(cursor).await?;
+                } else if is_dependency_failed {
                     self.set_task_status(&cursor.task_id, crate::types::TaskStatus::Queued)
                         .await?;
                 }
@@ -263,26 +275,41 @@ impl Store {
                 self.reset_cursor_attempts(&cursor.cursor_id).await?;
             }
             ResumeAction::Goto => {
+                let is_judge_disagreement = cursor
+                    .pending_reason
+                    .as_ref()
+                    .and_then(|r| r.context.as_ref())
+                    .and_then(|c| c.kind.as_deref())
+                    == Some(crate::actions::kinds::JUDGE_DISAGREEMENT);
                 let (stage, node) = target.ok_or_else(|| {
                     Error::Validation("goto 必须提供 target_stage / target_node".into())
                 })?;
-                if stage == Stage::SyncCheck {
-                    return Err(Error::Validation(
-                        "sync-check 不占游标行，不能作为 goto 目标（决策 107）".into(),
-                    ));
+                if is_judge_disagreement && stage == cursor.stage && node == Node::Execute {
+                    // decision 135：裁决不合格 → 打回本阶段 execute，`validate_attempts` +1
+                    // （不走 goto 入口校验，落点就是同阶段的 Execute）。
+                    self.clear_cursor_pending(&cursor.cursor_id).await?;
+                    self.set_cursor_stage(&cursor.cursor_id, stage, node)
+                        .await?;
+                    self.increment_cursor_attempts(&cursor.cursor_id).await?;
+                } else {
+                    if stage == Stage::SyncCheck {
+                        return Err(Error::Validation(
+                            "sync-check 不占游标行，不能作为 goto 目标（决策 107）".into(),
+                        ));
+                    }
+                    // 决策 69：goto 落点 = entry_node(stage)。任意节点（如 merge.validate_input、
+                    // 不存在的节点组合）都是对状态机完整性的破坏，必须拒绝。
+                    let expected = entry_node(stage);
+                    if node != expected || !stage_has_node(stage, node) {
+                        return Err(Error::Validation(format!(
+                            "goto 落点必须是 {stage} 的入口节点 {expected}（决策 69）"
+                        )));
+                    }
+                    self.clear_cursor_pending(&cursor.cursor_id).await?;
+                    self.set_cursor_stage(&cursor.cursor_id, stage, node)
+                        .await?;
+                    self.reset_cursor_attempts(&cursor.cursor_id).await?;
                 }
-                // 决策 69：goto 落点 = entry_node(stage)。任意节点（如 merge.validate_input、
-                // 不存在的节点组合）都是对状态机完整性的破坏，必须拒绝。
-                let expected = entry_node(stage);
-                if node != expected || !stage_has_node(stage, node) {
-                    return Err(Error::Validation(format!(
-                        "goto 落点必须是 {stage} 的入口节点 {expected}（决策 69）"
-                    )));
-                }
-                self.clear_cursor_pending(&cursor.cursor_id).await?;
-                self.set_cursor_stage(&cursor.cursor_id, stage, node)
-                    .await?;
-                self.reset_cursor_attempts(&cursor.cursor_id).await?;
             }
         }
 
@@ -412,6 +439,32 @@ impl Store {
             .iter()
             .map(|s| (*s, entry_node(*s)))
             .collect()
+    }
+
+    /// decision 135：judge_disagreement 的 continue = 用户裁决「合格」，放行到下一阶段入口。
+    ///
+    /// 复用游标落点语义：architect-design 分裂到两条设计分支；并行分支到 join 边界
+    /// （`waiting_join`）；其余串行阶段到下一阶段入口。不重跑 validate_output。
+    async fn advance_after_judge_continue(&self, cursor: &NodeCursor) -> Result<()> {
+        let landings = Store::next_landing(cursor.stage);
+        match landings.as_slice() {
+            [] => Err(Error::Cursor(format!(
+                "阶段 {} 没有下一阶段，judge_disagreement continue 无处放行（决策 135）",
+                cursor.stage
+            ))),
+            [_] if next_is_join(cursor.stage) => {
+                self.set_cursor_waiting_join(&cursor.cursor_id).await
+            }
+            [(stage, node)] => {
+                self.set_cursor_stage(&cursor.cursor_id, *stage, *node)
+                    .await?;
+                self.reset_cursor_attempts(&cursor.cursor_id).await
+            }
+            _ => {
+                self.split_cursors(&cursor.task_id).await?;
+                Ok(())
+            }
+        }
     }
 }
 

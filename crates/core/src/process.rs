@@ -3,11 +3,50 @@
 //! 超时路径必须断言"杀了进程组"，但测试里没有真进程可杀。把终止动作抽成 trait：
 //! 生产实现真杀，测试实现只记录调用。
 
+use std::path::Path;
+
 use crate::Result;
 
 pub trait ProcessKiller: Send + Sync + 'static {
     /// 向进程组发送终止信号（先 TERM，必要时 KILL）。
     fn kill_process_group(&self, pgid: i32) -> Result<()>;
+}
+
+/// 在**独立进程组**里启动 `sh -c <command>`（决策 66 / 票 17）。
+///
+/// Unix 下 `process_group(0)` 让子进程成为新进程组组长，于是
+/// `child.id()` 即进程组 id（pgid）——超时时 `kill(-pgid)` 能连子孙进程一起收。
+/// 不引 libc：`tokio::process::Command::process_group` 内部走
+/// `std::os::unix::process::CommandExt::process_group`。
+#[cfg(unix)]
+pub fn spawn_in_own_process_group(
+    command: &str,
+    cwd: &Path,
+) -> std::io::Result<tokio::process::Child> {
+    let mut cmd = tokio::process::Command::new("sh");
+    cmd.arg("-c").arg(command).current_dir(cwd);
+    // spawn() 不自动接管 stdio（不同于 output()）：必须显式管道化，
+    // 否则 wait_with_output 读回空内容。
+    cmd.stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped());
+    // 0 = 以自身 pid 新建进程组（setsid 的轻量等价物，无需 libc）
+    cmd.process_group(0);
+    cmd.spawn()
+}
+
+/// 非 Unix 兜底：无进程组语义，原样 spawn（本项目只跑 macOS / Linux）。
+#[cfg(not(unix))]
+pub fn spawn_in_own_process_group(
+    command: &str,
+    cwd: &Path,
+) -> std::io::Result<tokio::process::Child> {
+    let mut cmd = tokio::process::Command::new("sh");
+    cmd.arg("-c").arg(command).current_dir(cwd);
+    cmd.stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped());
+    cmd.spawn()
 }
 
 /// 生产实现：真正的进程组终止（决策 66）。
