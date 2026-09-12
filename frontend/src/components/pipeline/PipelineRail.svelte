@@ -7,8 +7,8 @@
    * 三种密度：spine（看板列头脊线）/ hero（任务详情）/ mini（卡片迷你轨，9 刻度）。
    */
   interface Props {
-    variant: 'spine' | 'hero' | 'mini';
-    /** spine / hero：各站点状态。 */
+    variant: 'spine' | 'hero' | 'mini' | 'vrail';
+    /** spine / hero / vrail：各站点状态。 */
     stations?: StationView[];
     /** mini：9 刻度状态。 */
     dots?: MiniDotState[];
@@ -71,6 +71,24 @@
         return 'lb';
     }
   }
+
+  /** 移动版纵向站点状态类（theme-3 §8：完成 / 当前 / 等待 / 失败）。 */
+  function vClass(state: string): string {
+    switch (state) {
+      case 'done':
+        return 'done';
+      case 'go':
+      case 'dev':
+      case 'test':
+        return 'cur';
+      case 'warn':
+        return 'pen';
+      case 'stop':
+        return 'fail';
+      default:
+        return 'idle';
+    }
+  }
 </script>
 
 {#if variant === 'mini'}
@@ -80,6 +98,20 @@
       {#if i < tokens.length - 1}<span class="s {tokenLitsSegment(t) ? 'lit' : ''}"></span>{/if}
     {/each}
   </div>
+{:else if variant === 'vrail'}
+  <!-- 移动版纵向脊线（theme-3 §8）：站段三态 + [dev]/[tst] 文字标签 -->
+  <ul class="vrail" aria-label={ariaLabel}>
+    {#each stations as s (s.key)}
+      <li class="vst {vClass(s.state)}">
+        <span class="vmk">{glyph(s.state)}</span>
+        <span class="vname">{s.label}</span>
+        {#if s.parallel}
+          <span class="vsub"><b class="bl">[{s.parallel}]</b></span>
+        {/if}
+        {#if s.count !== undefined}<span class="vmeta">{s.count}</span>{/if}
+      </li>
+    {/each}
+  </ul>
 {:else}
   <div class="rail {variant}" role="img" aria-label={ariaLabel}>
     <div class="railline">
@@ -192,6 +224,21 @@
   }
   .rail.mini .s.lit {
     background: var(--lit);
+  }
+
+  /* ── 移动版（theme-3 §8）：迷你轨放至 15px/12px；横向脊线由纵向段落取代 ── */
+  @media (max-width: 479px) {
+    .rail.mini {
+      min-height: 18px;
+      margin: 8px 0 7px;
+    }
+    .rail.mini .d {
+      width: 15px;
+      font-size: 12px;
+    }
+    .rail.spine {
+      display: none;
+    }
   }
 
   /* ── 字符线路行（脊线 / hero） ── */
@@ -337,6 +384,101 @@
 
   @media (prefers-reduced-motion: reduce) {
     .stn .mk.w {
+      animation: none;
+    }
+  }
+
+  /* ── 移动版纵向脊线（hero 的窄屏转写，theme-3 §8） ── */
+  .vrail {
+    list-style: none;
+    margin: 0;
+  }
+  .vst {
+    position: relative;
+    display: flex;
+    align-items: center;
+    gap: 9px;
+    min-height: 32px;
+    padding-left: 30px;
+  }
+  .vst::before {
+    content: '';
+    position: absolute;
+    left: 9px;
+    top: 0;
+    bottom: 0;
+    width: var(--spin-w);
+    background: var(--hairline);
+  }
+  .vmk {
+    position: absolute;
+    left: 0;
+    top: 50%;
+    transform: translateY(-50%);
+    width: 19px;
+    text-align: center;
+    background: var(--bg);
+    font-size: 12.5px;
+    line-height: 1;
+    color: var(--text-4);
+  }
+  .vname {
+    font-size: 13px;
+    color: var(--text-2);
+  }
+  .vmeta,
+  .vsub {
+    margin-left: auto;
+    font-size: 11.5px;
+    color: var(--text-3);
+    white-space: nowrap;
+    font-variant-numeric: tabular-nums;
+  }
+  .vsub .bl {
+    color: var(--text-3);
+    font-weight: 600;
+    font-size: 11px;
+  }
+  .vst.done::before {
+    background: var(--spin-lit);
+  }
+  .vst.done .vmk {
+    color: var(--text-3);
+  }
+  .vst.done .vname {
+    color: var(--text-3);
+  }
+  .vst.cur::before {
+    background: var(--spin-lit);
+  }
+  .vst.cur .vmk {
+    color: var(--text-hi);
+    animation: breath 2.4s ease-in-out infinite;
+  }
+  .vst.cur .vname {
+    color: var(--text-hi);
+    font-weight: 600;
+  }
+  .vst.pen::before {
+    background: var(--spin-pen);
+  }
+  .vst.pen .vmk {
+    color: var(--pending);
+    animation: breath 2.4s ease-in-out infinite;
+  }
+  .vst.pen .vname {
+    color: var(--pending);
+    font-weight: 600;
+  }
+  .vst.fail .vmk {
+    color: var(--stop);
+  }
+  .vst.cur .vmeta,
+  .vst.pen .vmeta {
+    color: var(--text-hi);
+  }
+  @media (prefers-reduced-motion: reduce) {
+    .vst .vmk {
       animation: none;
     }
   }

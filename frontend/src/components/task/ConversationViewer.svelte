@@ -300,4 +300,76 @@
     color: var(--text-3);
     font-size: 12px;
   }
+
+  /* ── 移动版（<480px）：电文流（theme-3 §8，原型 .msg/.sysbox/.userbox/.assistant/.toolcard） ── */
+  @media (max-width: 479px) {
+    .runrow {
+      flex-wrap: nowrap;
+      overflow-x: auto;
+      padding-bottom: 2px;
+      -webkit-overflow-scrolling: touch;
+    }
+    .runchip {
+      flex: none;
+      display: inline-flex;
+      align-items: center;
+      min-height: 30px;
+      padding: 0 9px;
+      font-size: 11.5px;
+      white-space: nowrap;
+    }
+    .convhead {
+      display: block;
+    }
+    .convhead h3 {
+      font-size: 13px;
+      font-weight: 600;
+    }
+    .convhead .m {
+      margin-top: 3px;
+      font-size: 11.5px;
+    }
+    .msg {
+      margin-bottom: 14px;
+    }
+    .who {
+      font-size: 11px;
+      margin-bottom: 4px;
+    }
+    .sysbox {
+      padding: 8px 10px;
+      font-size: 12.5px;
+      max-height: none;
+    }
+    .userbox {
+      font-size: 12.5px;
+      overflow-wrap: break-word;
+    }
+    .assistant :global(p),
+    .assistant :global(.md) :global(p) {
+      font-size: 14px;
+      max-width: none;
+      margin: 2px 0 9px;
+    }
+    .assistant :global(.md) {
+      font-size: 14px;
+    }
+    .toolcard {
+      flex-wrap: wrap;
+      gap: 2px 10px;
+      padding: 5px 0 5px 10px;
+      margin: 6px 0;
+      max-width: none;
+      font-size: 12.5px;
+    }
+    .toolcard .fn {
+      overflow: visible;
+      overflow-wrap: break-word;
+      text-overflow: clip;
+      white-space: normal;
+    }
+    .toolcard .res {
+      font-size: 12px;
+    }
+  }
 </style>

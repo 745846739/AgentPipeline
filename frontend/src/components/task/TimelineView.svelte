@@ -102,4 +102,40 @@
     color: var(--text-3);
     font-size: 12px;
   }
+
+  /* ── 移动版（<480px）：时间线折行为块（theme-3 §8 原型 .trow） ── */
+  @media (max-width: 479px) {
+    .tline {
+      max-width: none;
+      font-size: 13px;
+    }
+    .trow {
+      display: block;
+      padding: 7px 0;
+      border-bottom: 1px solid var(--hairline);
+    }
+    .trow:last-child {
+      border-bottom: 0;
+    }
+    .t {
+      width: auto;
+      font-size: 11.5px;
+    }
+    .tr {
+      display: inline;
+      width: auto;
+      margin-left: 8px;
+      font-size: 12.5px;
+    }
+    .to {
+      display: block;
+      margin-top: 1px;
+      word-break: break-all;
+    }
+    .why {
+      display: block;
+      margin-top: 2px;
+      font-size: 12px;
+    }
+  }
 </style>

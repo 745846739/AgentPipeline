@@ -51,16 +51,18 @@
   <div class="cmds">
     {#each commands as command (command.id)}
       <button type="button" class="cmd" onclick={() => toggle(command)}>
-        <span class={command.exit_code === null || command.exit_code === 0 ? 'ok' : 'bad'}>
-          {command.exit_code === null ? '…' : command.exit_code === 0 ? '✓' : '✗'}
+        <span class="cmd-l1">
+          <span class={command.exit_code === null || command.exit_code === 0 ? 'ok' : 'bad'}>
+            {command.exit_code === null ? '…' : command.exit_code === 0 ? '✓' : '✗'}
+          </span>
+          <span class="tm">{formatClock(command.started_at)}</span>
+          <span class="src">{command.source === 'system' ? 'sys' : 'agent'}</span>
+          <span class="ms">{command.duration_ms !== null ? formatDuration(command.duration_ms) : '—'}</span>
+          <span class="ex {command.exit_code && command.exit_code !== 0 ? 'bad' : ''}">
+            exit {command.exit_code ?? '—'}
+          </span>
         </span>
-        <span class="tm">{formatClock(command.started_at)}</span>
-        <span class="src">{command.source === 'system' ? 'sys' : 'agent'}</span>
-        <span class="c" title={command.command}>{command.command}</span>
-        <span class="ms">{command.duration_ms !== null ? formatDuration(command.duration_ms) : '—'}</span>
-        <span class="ex {command.exit_code && command.exit_code !== 0 ? 'bad' : ''}">
-          exit {command.exit_code ?? '—'}
-        </span>
+        <span class="cmd-l2"><span class="c" title={command.command}>{command.command}</span></span>
       </button>
       {#if expanded === command.id}
         {#if loading === command.id}
@@ -155,5 +157,71 @@
   .empty {
     color: var(--text-3);
     font-size: 12px;
+  }
+
+  /* 桌面：两行容器不生成盒子，用 order 还原原列序（ok · tm · src · 命令 · ms · ex · 输出） */
+  .cmd-l1,
+  .cmd-l2 {
+    display: contents;
+  }
+  .cmd .c {
+    order: 1;
+  }
+  .cmd .ms {
+    order: 2;
+  }
+  .cmd .ex {
+    order: 3;
+  }
+
+  /* ── 移动版（<480px）：命令表两行制（theme-3 §8 转写 4） ── */
+  @media (max-width: 479px) {
+    .cmds {
+      max-width: none;
+    }
+    .cmd {
+      flex-wrap: wrap;
+      align-items: center;
+      gap: 2px 9px;
+      padding: 9px 2px;
+      border-bottom: 1px solid var(--hairline);
+    }
+    .cmd:last-child {
+      border-bottom: 0;
+    }
+    .cmd .cmd-l1 {
+      display: flex;
+      flex: 1 0 100%;
+    }
+    .cmd .cmd-l1 .ms,
+    .cmd .cmd-l1 .ex {
+      order: 0;
+    }
+    .cmd .cmd-l1 .ms {
+      width: auto;
+      margin-left: auto;
+    }
+    .cmd .cmd-l1 .ex {
+      width: auto;
+    }
+    .cmd .cmd-l2 {
+      display: flex;
+      flex: 1 0 100%;
+      margin-top: 3px;
+    }
+    .cmd .cmd-l2 .c {
+      overflow: visible;
+      text-overflow: clip;
+      white-space: pre-wrap;
+      word-break: break-all;
+      font-size: 13px;
+      color: var(--text);
+      line-height: 1.5;
+    }
+    .cmdout {
+      margin: 8px 0 12px 0;
+      max-height: none;
+      font-size: 12.5px;
+    }
   }
 </style>

@@ -71,7 +71,9 @@
         <div class="hint error">{current.error}</div>
       {:else if current.content !== null}
         {#if isDiff}
-          <DiffView parsed={parsedDiff} raw={current.content} />
+          <div class="diff-scroll">
+            <DiffView parsed={parsedDiff} raw={current.content} />
+          </div>
         {:else if selected.endsWith('.md')}
           <MarkdownView source={current.content} />
         {:else}
@@ -144,5 +146,48 @@
   }
   .hint.error {
     color: var(--stop);
+  }
+  /* 桌面：diff 包装层不生成盒子（移动版横滚容器） */
+  .diff-scroll {
+    display: contents;
+  }
+
+  /* ── 移动版（<480px）：文件列表两行制 + diff 横滚（theme-3 §8） ── */
+  @media (max-width: 479px) {
+    .diff-scroll {
+      display: block;
+    }
+    .fileview {
+      flex-direction: column;
+      gap: 0;
+    }
+    .list {
+      width: 100%;
+      margin-bottom: 8px;
+    }
+    .cmd {
+      padding: 9px 2px;
+      border-bottom: 1px solid var(--hairline);
+      gap: 9px;
+    }
+    .cmd:last-child {
+      border-bottom: 0;
+    }
+    .cmd .c {
+      overflow: visible;
+      text-overflow: clip;
+      white-space: normal;
+      word-break: break-all;
+      font-size: 13px;
+      color: var(--text-hi);
+    }
+    .content {
+      max-height: none;
+      padding: 12px 0 0;
+      border-top: 1px solid var(--pane);
+    }
+    .chead {
+      font-size: 12px;
+    }
   }
 </style>

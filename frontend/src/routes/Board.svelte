@@ -1,10 +1,11 @@
 <script lang="ts">
+  import { onDestroy, onMount } from 'svelte';
   import type { AllowedAction } from '../api/types';
   import BoardColumn from '../components/board/BoardColumn.svelte';
   import PipelineRail from '../components/pipeline/PipelineRail.svelte';
   import { router } from '../router.svelte';
   import { board } from '../stores/board.svelte';
-  import { BOARD_COLUMNS, buildSpineStations, columnForTask } from '../lib/pipeline';
+  import { BOARD_COLUMNS, buildSpineStations, columnForTask, formatTokens } from '../lib/pipeline';
 
   const tasksByColumn = $derived.by(() => {
     const map = new Map<string, typeof board.visibleTasks>();
@@ -16,7 +17,38 @@
     return map;
   });
 
+  /** 未过滤的整列任务：移动版脊线/段头状态与 hide-cards 判定用（桌面不读）。 */
+  const allByColumn = $derived.by(() => {
+    const map = new Map<string, typeof board.tasks>();
+    for (const col of BOARD_COLUMNS) map.set(col.key, []);
+    for (const task of board.tasks) {
+      const key = columnForTask(task);
+      map.get(key)?.push(task);
+    }
+    return map;
+  });
+
   const stations = $derived(buildSpineStations(board.visibleTasks));
+
+  const runningCount = $derived(board.tasks.filter((t) => t.status === 'running').length);
+  const totalTokens = $derived(board.tasks.reduce((sum, t) => sum + (t.total_tokens ?? 0), 0));
+
+  /** 底栏本地时钟（§3 顶栏/底栏 = tmux 状态行）。 */
+  let clock = $state('');
+  let timer: ReturnType<typeof setInterval> | null = null;
+
+  function tickClock() {
+    clock = new Date().toLocaleTimeString('zh-CN', { hour12: false });
+  }
+
+  onMount(() => {
+    tickClock();
+    timer = setInterval(tickClock, 1000);
+  });
+
+  onDestroy(() => {
+    if (timer) clearInterval(timer);
+  });
 
   function openTask(id: string) {
     router.navigate(`/task/${id}`);
@@ -54,6 +86,7 @@
           <BoardColumn
             {column}
             tasks={tasksByColumn.get(column.key) ?? []}
+            allTasks={allByColumn.get(column.key) ?? []}
             actionsFor={(id) => board.pendingActions[id] ?? []}
             cursorsFor={(id) => board.pendingCursors[id] ?? []}
             actionBusy={board.actionBusy}
@@ -65,6 +98,13 @@
     </div>
   </div>
 </div>
+
+<!-- 移动版底部载波行（theme-3 §8）：桌面隐藏，仅窄屏出现 -->
+<footer class="carrier board-carrier">
+  <span class="carrier-pend">⏸ <b class="pen">*{board.pendingCount}</b> 待处理</span>
+  <span>▶ <b>{runningCount}</b> 执行中</span>
+  <span class="right">本时辰 <b>{formatTokens(totalTokens)}</b> tok · {clock}</span>
+</footer>
 
 <style>
   /* tmux 窗格阵列：列间共享 1px 框线，无间隙（theme-3 §3.2） */
@@ -101,5 +141,51 @@
     color: var(--text-4);
     font-size: 12.5px;
     padding: 6px 4px 12px;
+  }
+  /* 载波行桌面不呈现（app.css 仅在窄屏给 .carrier 规则） */
+  .board-carrier {
+    display: none;
+  }
+  .carrier-pend {
+    display: inline-flex;
+    align-items: center;
+    gap: 4px;
+    color: var(--text-3);
+    white-space: nowrap;
+  }
+  .board-carrier b {
+    font-weight: 600;
+    color: var(--text-2);
+  }
+  .board-carrier .pen {
+    color: var(--pending);
+  }
+  .board-carrier .right {
+    margin-left: auto;
+    color: var(--text-2);
+    white-space: nowrap;
+  }
+
+  /* ── 移动版：窗格阵列 → 纵向电报纸带（theme-3 §8） ── */
+  @media (max-width: 479px) {
+    .hscroll {
+      overflow-x: visible;
+    }
+    .hinner {
+      width: auto;
+    }
+    .boardpad {
+      padding: 0 12px calc(52px + var(--safeb));
+    }
+    .panes {
+      display: block;
+      width: auto;
+      border: 0;
+    }
+    .board-carrier {
+      display: flex;
+      align-items: center;
+      gap: 14px;
+    }
   }
 </style>

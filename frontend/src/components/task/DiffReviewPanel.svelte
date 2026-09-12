@@ -14,6 +14,8 @@
     /** 加载中（首次拉取 diff）。 */
     loading?: boolean;
     busy?: boolean;
+    /** 仅渲染动作行（窄屏底部动作坞复用，theme-3 §8 转写 3）。 */
+    actionsOnly?: boolean;
     onaction?: (action: AllowedAction, opts: { cursorId?: string; input?: string }) => void;
     onreload?: () => void;
   }
@@ -27,6 +29,7 @@
     cursors = [],
     loading = false,
     busy = false,
+    actionsOnly = false,
     onaction,
     onreload,
   }: Props = $props();
@@ -43,51 +46,56 @@
 </script>
 
 <div class="diffpanel">
-  <div class="diffhead">
-    {#if stats}
-      <span class="big mono">
-        <span class="a">+{stats.insertions}</span>
-        <span class="d">−{stats.deletions}</span>
-        · {stats.files_changed} 个文件
-      </span>
-    {:else}
-      <span class="big mono dim">— diff 统计不可用</span>
-    {/if}
-    {#if onreload}
-      <button type="button" class="btn quiet" onclick={onreload}>重新加载 diff</button>
-    {/if}
-  </div>
-
-  {#if stale}
-    <div class="notice">基准已前移，diff 重新生成中；合入审批已由后端重置。</div>
-  {/if}
-  {#if error}
-    <div class="error">{error}</div>
-  {/if}
-
-  {#if stats && stats.file_details.length > 0}
-    <div class="breakdown mono">
-      {#each stats.file_details as f (f.path)}
-        <span class="fdetail">
-          <span class="path">{f.path}</span>
-          <span class="a">+{f.additions}</span>
-          <span class="d">−{f.deletions}</span>
+  {#if !actionsOnly}
+    <div class="diffhead">
+      {#if stats}
+        <span class="big mono">
+          <span class="a">+{stats.insertions}</span>
+          <span class="d">−{stats.deletions}</span>
+          · {stats.files_changed} 个文件
         </span>
-      {/each}
+      {:else}
+        <span class="big mono dim">— diff 统计不可用</span>
+      {/if}
+      {#if onreload}
+        <button type="button" class="btn quiet" onclick={onreload}>重新加载 diff</button>
+      {/if}
     </div>
+
+    {#if stale}
+      <div class="notice">基准已前移，diff 重新生成中；合入审批已由后端重置。</div>
+    {/if}
+    {#if error}
+      <div class="error">{error}</div>
+    {/if}
+
+    {#if stats && stats.file_details.length > 0}
+      <div class="breakdown mono">
+        {#each stats.file_details as f (f.path)}
+          <span class="fdetail">
+            <span class="path">{f.path}</span>
+            <span class="a">+{f.additions}</span>
+            <span class="d">−{f.deletions}</span>
+          </span>
+        {/each}
+      </div>
+    {/if}
+
+    {#if loading}
+      <div class="hint">正在加载 diff…</div>
+    {:else}
+      <div class="diff-scroll">
+        <DiffView parsed={diff} {raw} />
+      </div>
+    {/if}
   {/if}
 
-  {#if loading}
-    <div class="hint">正在加载 diff…</div>
-  {:else}
-    <DiffView parsed={diff} {raw} />
-  {/if}
-
-  <div class="actions">
+  <div class="actions" class:dock-acts={actionsOnly}>
     {#each returnChanges as action (action.action + (action.cursor_id ?? ''))}
       <button
         type="button"
         class="btn"
+        class:quiet={actionsOnly}
         disabled={busy}
         onclick={() => onaction?.(action, { cursorId: cursorIdFor(action) })}
       >
@@ -176,5 +184,39 @@
   .hint {
     color: var(--text-3);
     font-size: 12px;
+  }
+  /* 桌面：diff 包装层不生成盒子，与移动版横滚容器共用同一 DOM */
+  .diff-scroll {
+    display: contents;
+  }
+
+  /* ── 移动版（<480px）：动作进底部坞，diff 横滚（theme-3 §8） ── */
+  @media (max-width: 479px) {
+    .diffpanel {
+      max-width: none;
+    }
+    .diff-scroll {
+      display: block;
+    }
+    .actions.dock-acts {
+      display: flex;
+      gap: 8px;
+      margin-top: 0;
+    }
+    /* 主动作（合入）居左、旁路（返回修改）居右，同原型动作坞 */
+    .actions.dock-acts .btn {
+      order: 2;
+    }
+    .actions.dock-acts .btn.solid {
+      order: 1;
+    }
+    .diffhead .big {
+      font-size: 13px;
+    }
+    .notice {
+      display: block;
+      padding: 6px 10px;
+      line-height: 1.6;
+    }
   }
 </style>

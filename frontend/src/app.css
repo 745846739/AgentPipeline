@@ -454,4 +454,134 @@ textarea.input {
   .input {
     font-size: 16px;
   }
+
+  /* 纵向脊线：站段三态（深色 1px / 浅色 3px） */
+  .spine-rule {
+    position: absolute;
+    left: 50%;
+    top: 0;
+    bottom: 0;
+    width: var(--spin-w);
+    transform: translateX(-50%);
+    background: var(--spin);
+  }
+  .spine-rule.live {
+    background: var(--spin-lit);
+  }
+  .spine-rule.pen {
+    background: var(--spin-pen);
+  }
+
+  /* 段头：字段条（浅色款即纸上绿杠） */
+  .sec-head {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    padding: 6px 6px 7px 12px;
+    background: var(--head-band);
+    border-bottom: 1px solid var(--pane);
+  }
+  .sec-name {
+    font-size: 12px;
+    font-weight: 600;
+    letter-spacing: 0.08em;
+    text-transform: uppercase;
+    color: var(--text-3);
+  }
+  .sec-rule {
+    flex: 1;
+    height: 1px;
+    background: var(--pane);
+  }
+  .sec-n {
+    font-size: 11px;
+    color: var(--text-4);
+    font-variant-numeric: tabular-nums;
+  }
+
+  /* 状态标记在窄屏略放大 */
+  .st {
+    font-size: 11px;
+  }
+
+  /* 常驻底栏（载波行）：安全区内边距 */
+  .carrier {
+    position: fixed;
+    left: 0;
+    right: 0;
+    bottom: 0;
+    z-index: 30;
+    display: flex;
+    align-items: center;
+    gap: 14px;
+    height: calc(34px + var(--safeb));
+    padding: 0 12px var(--safeb);
+    background: var(--bar-band);
+    border-top: 1px solid var(--pane);
+    font-size: 12px;
+    color: var(--text-3);
+  }
+  .carrier .pen {
+    color: var(--pending);
+  }
+  .carrier .right {
+    margin-left: auto;
+    color: var(--text-2);
+  }
+
+  /* pending 常驻底部动作坞 */
+  .dock {
+    position: fixed;
+    left: 0;
+    right: 0;
+    bottom: 0;
+    z-index: 31;
+    background: var(--bg);
+    border-top: 1px solid var(--pending);
+    padding: 8px 12px calc(9px + var(--safeb));
+  }
+  .dock-tag {
+    font-size: 11px;
+    font-weight: 600;
+    color: var(--pending);
+    margin-bottom: 7px;
+  }
+  .dock-acts {
+    display: flex;
+    gap: 8px;
+  }
+  .dock-acts .btn {
+    flex: 1;
+    min-height: 48px;
+    white-space: nowrap;
+  }
+  .dock-done {
+    font-size: 12px;
+    color: var(--go);
+  }
+
+  /* 命令表两行制：上行元信息，下行命令本体（不截断可换行） */
+  .cmd-l1 {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    font-size: 11px;
+    color: var(--text-4);
+  }
+  .cmd-l2 {
+    margin-top: 2px;
+    font-size: 12px;
+    color: var(--text-2);
+    white-space: pre-wrap;
+    word-break: break-all;
+  }
+
+  /* Diff 不折行，横向滚动 */
+  .diff-scroll {
+    overflow-x: auto;
+  }
+  .diff-scroll .dl {
+    min-width: max-content;
+    white-space: pre;
+  }
 }

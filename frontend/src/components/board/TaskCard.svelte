@@ -230,4 +230,77 @@
     color: var(--text-hi);
     font-weight: 500;
   }
+
+  /* ── 移动版：电文行组（theme-3 §8，原型 .tg） ── */
+  @media (max-width: 479px) {
+    .card {
+      padding: 10px 0 11px 12px;
+      border-bottom: 1px solid var(--hairline);
+    }
+    /* pending 由脊线/段头承担信号，卡上不再加琥珀左缘 */
+    .card.warn {
+      box-shadow: none;
+    }
+    .card.stopped {
+      box-shadow: inset 2px 0 0 var(--stop);
+    }
+    .card-title {
+      font-size: 14px;
+      line-height: 1.45;
+    }
+    .card.warn .card-title::before {
+      content: '! ';
+    }
+    .dur {
+      font-size: 12px;
+    }
+    :global(.card .card-top .stalltag) {
+      font-size: 11px;
+      letter-spacing: 0.05em;
+    }
+    .pillrow {
+      margin: 6px 0 7px;
+    }
+    /* 分支/状态行按 .tg-st 字号（13px，次文本） */
+    .pillrow :global(.pill) {
+      font-size: 13px;
+      color: var(--text-2);
+      border: 0;
+      padding: 0;
+      gap: 6px;
+      align-items: baseline;
+    }
+    .pillrow :global(.pill .bl) {
+      font-size: 11px;
+      font-weight: 600;
+    }
+    .pillrow :global(.pill .mono) {
+      color: var(--text-2);
+    }
+    .reason {
+      margin: 9px 0 8px;
+      font-size: 13px;
+      line-height: 1.6;
+      padding-left: 10px;
+    }
+    .rlabel {
+      font-size: 12.5px;
+    }
+    .ctxlink {
+      font-size: 13px;
+      color: var(--text-2);
+    }
+    .tagline {
+      margin-top: 6px;
+      font-size: 12.5px;
+    }
+    .actions {
+      margin-top: 10px;
+    }
+    .meta {
+      font-size: 12px;
+      gap: 10px;
+      margin-top: 8px;
+    }
+  }
 </style>
