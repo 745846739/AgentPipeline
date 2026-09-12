@@ -88,6 +88,7 @@ const OUTPUT_REVIEW_REPORT: &str = "review_report";
 const OUTPUT_TEST_REPORT: &str = "test_report";
 const OUTPUT_CODE_CHANGES: &str = "code_changes";
 const OUTPUT_SYNC_DECISION: &str = "sync_decision";
+const OUTPUT_REVIEW_DIFF: &str = "review_diff";
 
 // ─────────────────────────────── 执行器 ───────────────────────────────
 
@@ -2053,6 +2054,116 @@ impl Executor {
 
     // ─────────────────────── 游标推进（§11.2 advance_cursor）───────────────────────────────
 
+    /// 决策 124 / 票 13：人工评审前生成 `git diff {base_ref}..kanban/{task_id}`。
+    ///
+    /// 记为系统来源命令（落 `kanban_node_commands`，`source = system`），写任务目录
+    /// `review-diff.diff`（覆盖写入可重入）并落 stage output（`output_type = review_diff`），
+    /// 经既有文件下发端点取回。
+    ///
+    /// 基准不可达 / 缺分支名时不阻断评审——落空 diff 并记 `generated = false`，
+    /// 让面板走「无 diff 时降级」而非整个节点失败（票据要求降级不报错）。
+    async fn write_review_diff(&self, task: &Task, cursor: &NodeCursor) -> Result<()> {
+        let project = self.project(&task.project_id).await?;
+        let repo = Path::new(&project.local_path);
+        let path = "review-diff.diff";
+        let (run_id, attempt) = self.begin_run(task, cursor, "system").await?;
+        let started = Instant::now();
+
+        let base_ref = Git.base_ref(repo, &project.default_branch).await?;
+        let branch = task.branch_name.clone();
+        let (diff, generated) = match &branch {
+            Some(branch) => {
+                let range = format!("{base_ref}..{branch}");
+                match Git.diff_range(repo, &range).await {
+                    Ok(d) => (d, true),
+                    Err(e) => {
+                        tracing::warn!(task = %task.id, error = %e, "review-diff 生成失败，落空 diff 降级");
+                        (String::new(), false)
+                    }
+                }
+            }
+            None => {
+                tracing::warn!(task = %task.id, "人工评审缺少 branch_name，落空 diff");
+                (String::new(), false)
+            }
+        };
+
+        // 记为系统来源命令（决策 124：source = system），命令文本即等价 git 调用，
+        // 让审计面能看出这次 diff 是怎么来的。
+        let command = match &branch {
+            Some(b) => format!("git diff {base_ref}..{b}"),
+            None => "git diff（缺 branch_name）".to_string(),
+        };
+        self.record_system_command(task, run_id, cursor, &command, &diff, generated)
+            .await?;
+
+        self.store.home().ensure_task_dirs(&task.id)?;
+        std::fs::write(self.store.home().task_file(&task.id, path), &diff)?;
+        self.store
+            .upsert_stage_output(
+                &task.id,
+                Stage::Review,
+                OUTPUT_REVIEW_DIFF,
+                path,
+                Some(&serde_json::json!({
+                    "base_ref": base_ref,
+                    "branch": branch.clone(),
+                    "bytes": diff.len(),
+                    "generated": generated,
+                })),
+            )
+            .await?;
+        self.finish_run(
+            run_id,
+            task,
+            cursor,
+            attempt,
+            false,
+            started.elapsed().as_millis() as u64,
+            None,
+            &RunTokens::default(),
+        )
+        .await?;
+        Ok(())
+    }
+
+    /// 把一条系统来源命令 + 结果写入 `kanban_node_commands`（决策 124 的「记为系统来源命令」）。
+    async fn record_system_command(
+        &self,
+        task: &Task,
+        run_id: i64,
+        cursor: &NodeCursor,
+        command: &str,
+        output: &str,
+        ok: bool,
+    ) -> Result<()> {
+        let command_id = self
+            .store
+            .record_start(CommandStart {
+                task_id: task.id.clone(),
+                run_id: Some(run_id),
+                stage: cursor.stage,
+                node: cursor.node,
+                source: CommandSource::System,
+                command: crate::agent::sanitize::sanitize_command_line(command),
+                cwd: self.store.home().root().display().to_string(),
+            })
+            .await?;
+        let preview = crate::agent::tools::head_tail(output, 50, 100);
+        self.store
+            .record_finish(
+                command_id,
+                CommandFinish {
+                    exit_code: Some(if ok { 0 } else { 1 }),
+                    stdout_preview: Some(crate::agent::sanitize::sanitize_text(&preview)),
+                    duration_ms: 0,
+                    ..Default::default()
+                },
+            )
+            .await?;
+        Ok(())
+    }
+
     async fn advance_cursor(
         &self,
         task: &Task,
@@ -2064,6 +2175,10 @@ impl Executor {
             && cursor.node == Node::ValidateOutput
             && task.review_mode == ReviewMode::Human
         {
+            // 决策 124 / 票 13：人工评审前由系统生成 `git diff {base_ref}..kanban/{task_id}`
+            // （记为系统来源命令），写任务目录 `review-diff.diff` 并落 stage output
+            // （output_type = review_diff），经既有文件下发端点交给任务详情评审面板。
+            self.write_review_diff(task, cursor).await?;
             self.pend_cursor(cursor, PendingKind::HumanReview, "等待人工评审")
                 .await?;
             return Ok(());

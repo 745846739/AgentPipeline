@@ -233,6 +233,37 @@ async fn e2e_04_human_review_pends_then_reject_goes_to_develop() {
         cursor.pending_reason.as_ref().unwrap().kind,
         PendingKind::HumanReview
     );
+
+    // 决策 124 / 票 13：人工评审前系统生成 review-diff.diff（基准 → 任务分支），
+    // 落 stage output（output_type = review_diff），经 /files/{path} 可取。
+    let diff_path = f.home.home().task_file("t4r", "review-diff.diff");
+    assert!(diff_path.exists(), "人工评审前应生成 review-diff.diff");
+    let diff = std::fs::read_to_string(&diff_path).unwrap();
+    assert!(
+        diff.contains("src/lib.rs"),
+        "diff 应为基准到任务分支的真实差异：{diff}"
+    );
+    let out = f
+        .store
+        .get_stage_output("t4r", Stage::Review, "review_diff")
+        .await
+        .unwrap()
+        .expect("review_diff stage output 应存在");
+    assert_eq!(out.file_path, "review-diff.diff");
+    // 记为系统来源命令（决策 124）
+    let commands = f.store.list_commands("t4r", None, None).await.unwrap();
+    assert!(
+        commands.iter().any(
+            |c| c.source == agentpipeline_core::types::CommandSource::System
+                && c.command.contains("git diff")
+        ),
+        "应记一条系统来源的 git diff 命令：{:?}",
+        commands
+            .iter()
+            .map(|c| (&c.command, c.source))
+            .collect::<Vec<_>>()
+    );
+
     // 动作集：approve / reject，端点按行配对（决策 101）
     let actions = f.store.allowed_actions_for_task("t4r").await.unwrap();
     let names: Vec<&str> = actions.iter().map(|a| a.action.as_str()).collect();
