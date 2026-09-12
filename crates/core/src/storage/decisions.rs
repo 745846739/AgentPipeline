@@ -226,6 +226,9 @@ impl Store {
         target: Option<(Stage, Node)>,
         input: Option<&str>,
     ) -> Result<()> {
+        // 本次 resume 的流转原因（决策 79 的用户补充输入 / 决策 116 的 dependency_overridden
+        // 警告都写进**同一条** user_resume 流转行，不重复插行）。
+        let mut reason: Option<String> = input.map(str::to_string);
         match action {
             ResumeAction::Continue => {
                 let ctx_kind = cursor
@@ -248,6 +251,22 @@ impl Store {
                 if is_judge_disagreement {
                     self.advance_after_judge_continue(cursor).await?;
                 } else if is_dependency_failed {
+                    // 决策 130 ⑤：清 pending + 置回 queued 交还准入（不直接 spawn）。
+                    // 决策 116 / 票 06：这一步等于用户**主动忽略失败依赖**，必须在观测面
+                    // 留下 `dependency_overridden` 警告（含被忽略的依赖任务 id），
+                    // 否则事后无法从审计面看出这个任务是踩着失败依赖上路的。
+                    let ignored = match self.dependencies_satisfied(&cursor.task_id).await? {
+                        crate::storage::tasks::DependencyState::Failed(ids) => ids,
+                        _ => Vec::new(),
+                    };
+                    let detail = if ignored.is_empty() {
+                        "（未记录 id）".to_string()
+                    } else {
+                        ignored.join("、")
+                    };
+                    reason = Some(format!(
+                        "dependency_overridden：忽略失败依赖 {detail}（决策 116）"
+                    ));
                     self.set_task_status(&cursor.task_id, crate::types::TaskStatus::Queued)
                         .await?;
                 } else if cursor
@@ -342,14 +361,14 @@ impl Store {
             }
         }
 
-        // 用户补充信息落库为流转原因（决策 79）
+        // 流转原因（决策 79 的用户补充输入 / 决策 116 的 dependency_overridden 警告）
         self.insert_transition(
             &cursor.task_id,
             &cursor.branch,
             Some((cursor.stage, cursor.node)),
             (cursor.stage, cursor.node),
             TransitionTrigger::UserResume,
-            input,
+            reason.as_deref(),
         )
         .await?;
         self.sync_task_projection(&cursor.task_id).await?;

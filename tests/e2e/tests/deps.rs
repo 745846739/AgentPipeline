@@ -7,7 +7,9 @@ mod common;
 
 use agentpipeline_core::config::Settings;
 use agentpipeline_core::storage::decisions::ResumeAction;
-use agentpipeline_core::types::{Node, PendingKind, ReviewMode, Stage, TaskStatus};
+use agentpipeline_core::types::{
+    Node, PendingKind, ReviewMode, Stage, TaskStatus, TransitionTrigger,
+};
 use common::Flow;
 
 // ─────────────────────────── E2E-19 ───────────────────────────
@@ -80,6 +82,21 @@ async fn e2e_19_dep_failed_pends_main_cursor_continue_and_retry_recover() {
         "continue → queued（决策 116）"
     );
 
+    // 决策 116 / 票 06：continue 必须在观测面留下 `dependency_overridden` 警告，
+    // 含被忽略的依赖任务 id——否则事后看不出这个任务是踩着失败依赖上路的。
+    let transitions = f.store.list_transitions("w19b").await.unwrap();
+    assert!(
+        transitions.iter().any(|t| {
+            t.trigger == TransitionTrigger::UserResume
+                && t.reason
+                    .as_deref()
+                    .unwrap_or("")
+                    .contains("dependency_overridden")
+                && t.reason.as_deref().unwrap_or("").contains("dep")
+        }),
+        "continue 应落 dependency_overridden 警告且含依赖 id：{transitions:?}"
+    );
+
     // 依赖重试转 running → 从 pending 退回 waiting（决策 57）：用新的依赖方建模
     testkit::seed_task(&f.store, "dep2", "p1").await.unwrap();
     testkit::seed_task_full(&f.store, "w19d", "p1", ReviewMode::Agent, &["dep2"])
@@ -134,6 +151,24 @@ async fn e2e_19_dep_cancelled_drops_wait_for_retry_action() {
         "依赖已取消 → 无「等待依赖重试」（决策 116）"
     );
     assert_eq!(names, vec!["continue", "cancel"]);
+
+    // 决策 116 / 票 06：cancelled 分支的 continue 同样落 dependency_overridden 警告
+    f.store
+        .apply_resume(&cursor, ResumeAction::Continue, None, None)
+        .await
+        .unwrap();
+    let transitions = f.store.list_transitions("w19c").await.unwrap();
+    assert!(
+        transitions.iter().any(|t| {
+            t.trigger == TransitionTrigger::UserResume
+                && t.reason
+                    .as_deref()
+                    .unwrap_or("")
+                    .contains("dependency_overridden")
+                && t.reason.as_deref().unwrap_or("").contains("dep-x")
+        }),
+        "cancelled 分支 continue 也应落警告且含依赖 id：{transitions:?}"
+    );
 }
 
 // ─────────────────────────── E2E-20 ───────────────────────────
