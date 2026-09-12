@@ -10,3 +10,6 @@ frontend/node_modules/
 frontend/dist/
 frontend/test-results/
 frontend/playwright-report/
+
+# 并行子代理工作树（临时）
+.worktrees/
