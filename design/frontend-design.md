@@ -3,7 +3,9 @@
 > 本文扩展 §12.11 前端交互设计，落地为可实现的前端规格。遵循既有决策：16（Svelte + TS + Vite）、
 > 79（v1 只发看板）、76（单 SSE 通道）、153（传输层 Tauri 防御约束）、84（并行分支消歧）、49/69/101（allowed_actions 纯渲染）、
 > 92（列归属与焦点游标）、34（stalled / archived 表示）、65（v1 只做应用内通知）。
-> 视觉方向如有调整，以本文 + `design/prototype.html` 为准。
+> 交互骨架与页面元素以本文为准（§4–§7）；**视觉方向以主题三「终端 · 调度电报」为准**
+> （[theme-3-terminal.md](theme-3-terminal.md)、[prototype-terminal.html](prototype-terminal.html)）。
+> 本文 §3 的「夜间调度台」视觉语言已随 [deprecated/prototype.html](deprecated/prototype.html) 归档。
 
 ---
 

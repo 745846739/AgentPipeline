@@ -1,9 +1,9 @@
 # 主题四 · 蓝图「晒图房」
 
-> 状态：规格先行，原型未产出（先文档后原型，2026-09-12）。
+> 状态：**已归档**（2026-09-12 选型收敛至主题三「终端 · 调度电报」）；本文不再演进。
 > 交互与信息架构一律沿用 [frontend-design.md](frontend-design.md)（路由、五页签、待办 dossier、
 > `allowed_actions` 纯渲染（决策 69/101）、异步按钮、卡片禁拖）；本文只定义该交互骨架上的
-> 第四套视觉语言。页面元素与 [prototype.html](prototype.html) / [prototype-minimal.html](prototype-minimal.html)
+> 第四套视觉语言。页面元素与 [deprecated/prototype.html](deprecated/prototype.html) / [deprecated/prototype-minimal.html](deprecated/prototype-minimal.html)（已归档）
 > 同一套（8 列看板、详情三视图、顶栏过滤、demo 切换器）；sync-check 全站不展示（决策 107）。
 
 ## 1. 设计概念
@@ -145,7 +145,7 @@
   （格网底、贴图反白区、图签块）。
 - 字体经 CDN（Chakra Petch / IBM Plex Mono）；`prefers-color-scheme` 不做暗色变体
   （蓝图本体即深色）；决策 16 技术栈不变。
-- 原型：[prototype-blueprint.html](prototype-blueprint.html)（与既有两款同一套三视图；
+- 原型：[deprecated/prototype-blueprint.html](deprecated/prototype-blueprint.html)（与既有两款同一套三视图；
   支持 `#v-board` / `#v-run` / `#v-approve` hash 直达）。
 
 ## 7. 何时选它
