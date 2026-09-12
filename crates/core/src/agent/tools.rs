@@ -135,6 +135,32 @@ pub struct ToolExecutor {
     killer: Arc<dyn ProcessKiller>,
     /// `run_command` 运行期间的心跳周期（决策 100）；默认 5s，测试可调短。
     command_heartbeat_interval: Duration,
+    /// 流式输出去向（决策 100 / §12.4.4，票 14）：`run_command` 按行推送命令输出。
+    /// `None` = 不推流（纯单测 / 无订阅者场景），行为与既有缓冲一致。
+    sse: Option<CommandSse>,
+}
+
+/// 命令输出推流的上下文（票 14）：SSE 去向 + 事件里要带的任务/分支。
+#[derive(Clone)]
+pub struct CommandSse {
+    pub sink: Arc<dyn crate::sse::SseSink>,
+    pub task_id: String,
+    pub branch: String,
+}
+
+/// 单行推流上限（票 14 的节流策略之一）：超长行截断并标注，避免一行撑爆事件。
+pub const STREAM_MAX_LINE_CHARS: usize = 4_000;
+/// 单条命令最多推送的行数（票 14 的节流策略之二）：高频输出超过后停止推流并标注，
+/// **完整输出仍全量缓冲**用于命令记录与回填——推流是观测面，不是数据来源。
+pub const STREAM_MAX_LINES: usize = 2_000;
+
+/// 逐行收集的命令输出（票 14）：完整缓冲 + 推流计数。
+#[derive(Debug, Clone, Default)]
+struct CollectedOutput {
+    stdout: String,
+    stderr: String,
+    /// 已推送的行数（用于节流；两条流合计）。
+    streamed_lines: usize,
 }
 
 /// 心跳默认周期：远小于 300s 空闲超时，600s 级测试命令也能存活（决策 100）。
@@ -154,11 +180,18 @@ impl ToolExecutor {
             recorder: None,
             killer,
             command_heartbeat_interval: COMMAND_HEARTBEAT_INTERVAL,
+            sse: None,
         }
     }
 
     pub fn with_recorder(mut self, recorder: Arc<dyn CommandRecorder>) -> Self {
         self.recorder = Some(recorder);
+        self
+    }
+
+    /// 注入命令输出流式去向（决策 100 / 票 14）：长命令按行推 `command_output`。
+    pub fn with_sse(mut self, sse: CommandSse) -> Self {
+        self.sse = Some(sse);
         self
     }
 
@@ -392,6 +425,9 @@ impl ToolExecutor {
         // 独立进程组启动（票 17 / 决策 66）：捕获真实 pgid 回填 node_runs，
         // 超时回调终止器杀整个进程组（此前 kill(0) 是 no-op）。
         let mut child_pgid: Option<i32> = None;
+        // 逐行读 + 按行推流（票 14 / 决策 100 / §12.4.4）：输出经管道进入后台收集任务，
+        // 完整内容全量缓冲用于落库与回填（推流是观测面，不改变 kanban_node_commands 口径）。
+        let collected = std::sync::Arc::new(std::sync::Mutex::new(CollectedOutput::default()));
         let output = match crate::process::spawn_in_own_process_group(&command, &cwd) {
             Ok(child) => {
                 child_pgid = child.id().map(|id| id as i32);
@@ -400,11 +436,9 @@ impl ToolExecutor {
                 {
                     rec.set_process_group(run_id, pgid).await?;
                 }
-                tokio::time::timeout(
-                    std::time::Duration::from_secs(timeout_sec),
-                    child.wait_with_output(),
-                )
-                .await
+                // 流式收集：stdout / stderr 各起一条读行任务，边读边推 event
+                let collect = self.spawn_streaming_collector(child, command_id, collected.clone());
+                tokio::time::timeout(std::time::Duration::from_secs(timeout_sec), collect).await
             }
             Err(e) => Ok(Err(e)),
         };
@@ -414,19 +448,24 @@ impl ToolExecutor {
 
         let duration_ms = started.elapsed().as_millis() as u64;
         let (exit_code, stdout, stderr, timed_out) = match output {
-            Ok(Ok(out)) => (
-                out.status.code(),
-                String::from_utf8_lossy(&out.stdout).to_string(),
-                String::from_utf8_lossy(&out.stderr).to_string(),
-                false,
-            ),
+            Ok(Ok(status)) => {
+                let out = collected.lock().unwrap().clone();
+                (status.code(), out.stdout, out.stderr, false)
+            }
             Ok(Err(e)) => (None, String::new(), format!("命令启动失败：{e}"), false),
-            Err(_) => (
-                None,
-                String::new(),
-                format!("命令超时（{timeout_sec}s）"),
-                true,
-            ),
+            Err(_) => {
+                // 超时：杀掉整个进程组，已收到的输出仍保留（推流过的部分不丢）
+                let out = collected.lock().unwrap().clone();
+                if let Some(pgid) = child_pgid {
+                    let _ = self.killer.kill_process_group(pgid);
+                }
+                (
+                    None,
+                    out.stdout,
+                    format!("命令超时（{timeout_sec}s）"),
+                    true,
+                )
+            }
         };
 
         // 决策 118：输出脱敏在**回填 messages 之前**执行
@@ -463,6 +502,93 @@ impl ToolExecutor {
         }
 
         Ok(ToolOutcome::ok(in_context))
+    }
+
+    /// 逐行读子进程输出、全量缓冲并**按行推流**（票 14 / 决策 100 / §12.4.4）。
+    ///
+    /// 返回子进程退出状态；stdout / stderr 的完整内容写进 `collected`。
+    /// 推流只作用于观测面：超长行截断、超高频停止推流，均**不影响**缓冲的完整输出
+    /// （`kanban_node_commands` 的落库口径不变）。无 `sse` 或无 `command_id` 时
+    /// 退化为纯缓冲（不阻塞、不漏内容，短命令与无订阅者场景不退化）。
+    async fn spawn_streaming_collector(
+        &self,
+        mut child: tokio::process::Child,
+        command_id: Option<i64>,
+        collected: std::sync::Arc<std::sync::Mutex<CollectedOutput>>,
+    ) -> std::io::Result<std::process::ExitStatus> {
+        use tokio::io::{AsyncBufReadExt, BufReader};
+        let stdout_pipe = child
+            .stdout
+            .take()
+            .map(|p| Box::new(p) as Box<dyn tokio::io::AsyncRead + Unpin + Send>);
+        let stderr_pipe = child
+            .stderr
+            .take()
+            .map(|p| Box::new(p) as Box<dyn tokio::io::AsyncRead + Unpin + Send>);
+        let sse = self.sse.clone();
+
+        let pump = |pipe: Option<Box<dyn tokio::io::AsyncRead + Unpin + Send>>,
+                    is_stderr: bool,
+                    collected: std::sync::Arc<std::sync::Mutex<CollectedOutput>>,
+                    sse: Option<CommandSse>| async move {
+            let Some(pipe) = pipe else { return };
+            let mut lines = BufReader::new(pipe).lines();
+            while let Ok(Some(line)) = lines.next_line().await {
+                // 1) 完整缓冲（未脱敏原样；脱敏在回填前统一做，保持既有顺序）
+                {
+                    let mut c = collected.lock().unwrap();
+                    if is_stderr {
+                        c.stderr.push_str(&line);
+                        c.stderr.push('\n');
+                    } else {
+                        c.stdout.push_str(&line);
+                        c.stdout.push('\n');
+                    }
+                    // 2) 推流（受节流约束）
+                    if let (Some(sse), Some(cmd_id)) = (sse.as_ref(), command_id) {
+                        if c.streamed_lines < STREAM_MAX_LINES {
+                            c.streamed_lines += 1;
+                            drop(c);
+                            let chunk = if line.chars().count() > STREAM_MAX_LINE_CHARS {
+                                let head: String =
+                                    line.chars().take(STREAM_MAX_LINE_CHARS).collect();
+                                format!("{head}…[本行超长已截断]")
+                            } else {
+                                line.clone()
+                            };
+                            // 推流内容同样脱敏（§12.4.4：四条路径一致）
+                            let chunk = sanitize_text(&chunk);
+                            sse.sink.emit(crate::sse::SseEvent::CommandOutput {
+                                task_id: sse.task_id.clone(),
+                                branch: sse.branch.clone(),
+                                command_id: cmd_id,
+                                chunk,
+                            });
+                            continue;
+                        }
+                        // 超过行数上限：只推一次「已停止推流」标注
+                        if c.streamed_lines == STREAM_MAX_LINES {
+                            c.streamed_lines += 1;
+                            drop(c);
+                            sse.sink.emit(crate::sse::SseEvent::CommandOutput {
+                                task_id: sse.task_id.clone(),
+                                branch: sse.branch.clone(),
+                                command_id: cmd_id,
+                                chunk: format!(
+                                    "…[输出超过 {STREAM_MAX_LINES} 行，已停止推流；完整内容以命令记录为准]"
+                                ),
+                            });
+                        }
+                    }
+                }
+            }
+        };
+
+        tokio::join!(
+            pump(stdout_pipe, false, collected.clone(), sse.clone()),
+            pump(stderr_pipe, true, collected, sse)
+        );
+        child.wait().await
     }
 
     /// 周期心跳任务：命令结束（含超时）时由调用方 abort（决策 100）。
