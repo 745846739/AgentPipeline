@@ -8,6 +8,7 @@
 
 pub mod routes;
 pub mod runtime;
+pub mod serve;
 pub mod state;
 pub mod stream;
 

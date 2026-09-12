@@ -43,23 +43,47 @@ fn http(method: &str, port: u16, path: &str, body: Option<&str>) -> std::io::Res
     Ok((status, body))
 }
 
-fn free_port() -> u16 {
-    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-    listener.local_addr().unwrap().port()
-}
-
-async fn spawn_server(port: u16, home: &TestHome) -> Child {
+/// 启动真二进制并以 `--port 0` 绑定，读回内核分配的真实端口（决策 153⑤）。
+///
+/// 取代原先「先探测空闲端口再释放」的 `free_port()`：探测-释放-再绑定之间存在
+/// 竞争窗口，端口可能被别的进程抢走。`--port 0` 由内核原子分配，就绪行给出真值。
+async fn spawn_server(home: &TestHome) -> (Child, u16) {
     let bin = env!("CARGO_BIN_EXE_agent-pipeline");
-    Command::new(bin)
+    let mut child = Command::new(bin)
         .arg("serve")
         .arg("--port")
-        .arg(port.to_string())
+        .arg("0")
         .env("AGENTPIPELINE_HOME", home.path())
         .env("RUST_LOG", "warn")
-        .stdout(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
+        // 用例中途 panic（断言失败 / 超时）时 drop 掉 Child 即回收子进程，
+        // 否则会留下仍在监听随机端口的孤儿服务，且其临时 home 已被删除。
+        .kill_on_drop(true)
         .spawn()
-        .expect("二进制可启动")
+        .expect("二进制可启动");
+
+    let stdout = child.stdout.take().expect("stdout 已管道化");
+    let port = tokio::time::timeout(Duration::from_secs(20), read_ready_port(stdout))
+        .await
+        .expect("20s 内应打印就绪行（含真实端口）");
+    (child, port)
+}
+
+/// 从子进程 stdout 读就绪行 `AGENTPIPELINE_READY port=<n>`，返回真实端口。
+async fn read_ready_port(stdout: tokio::process::ChildStdout) -> u16 {
+    use tokio::io::{AsyncBufReadExt, BufReader};
+    let mut lines = BufReader::new(stdout).lines();
+    while let Some(line) = lines.next_line().await.transpose() {
+        let line = line.expect("读取子进程 stdout");
+        if let Some(rest) = line.trim().strip_prefix("AGENTPIPELINE_READY port=") {
+            return rest
+                .trim()
+                .parse::<u16>()
+                .unwrap_or_else(|_| panic!("就绪行端口不可解析：{line}"));
+        }
+    }
+    panic!("子进程在退出前未打印就绪行");
 }
 
 async fn wait_until_ready(port: u16) {
@@ -85,8 +109,7 @@ fn send_sigint(pid: u32) {
 #[tokio::test]
 async fn binary_starts_serves_and_exits_gracefully_on_sigint() {
     let home = TestHome::new().unwrap();
-    let port = free_port();
-    let mut child = spawn_server(port, &home).await;
+    let (mut child, port) = spawn_server(&home).await;
     wait_until_ready(port).await;
 
     // 家目录骨架按 §12.14 建立，且数据库落在临时 home 内（不碰真实 ~/.agentpipeline）
@@ -346,8 +369,7 @@ async fn real_binary_advances_task_to_terminal_with_mock_llm() {
         .unwrap();
     testkit::seed_task(&store, "t1", "p1").await.unwrap();
 
-    let port = free_port();
-    let mut child = spawn_server(port, &home).await;
+    let (mut child, port) = spawn_server(&home).await;
     wait_until_ready(port).await;
 
     // tick（1s）准入 → resume 钩子拉起 executor → mock 驱动到 done。
@@ -400,8 +422,7 @@ async fn real_binary_advances_task_to_terminal_with_mock_llm() {
 #[tokio::test]
 async fn second_binary_on_same_port_fails_fast_with_clear_error() {
     let home = TestHome::new().unwrap();
-    let port = free_port();
-    let mut first = spawn_server(port, &home).await;
+    let (mut first, port) = spawn_server(&home).await;
     wait_until_ready(port).await;
 
     let bin = env!("CARGO_BIN_EXE_agent-pipeline");
