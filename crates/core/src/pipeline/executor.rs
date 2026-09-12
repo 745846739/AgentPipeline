@@ -1051,18 +1051,17 @@ impl Executor {
         // L0 容量预估（决策 110 / 票 04）：窗口来自解析后的 provider 行
         // （`providers.context_window`，决策 46 / 111）。无可用 provider（FakeAgent /
         // 纯代码场景）时跳过分档——不臆造窗口；provider 存在但窗口未登记则显式失败。
-        let capacity = match self
+        let capacity = self
             .model_context_window(task, cursor, stage_cfg.as_ref())
             .await?
-        {
-            Some(model_window) => Some(crate::agent::context::estimate_context_capacity(
-                model_window,
-                &system_prompt,
-                &user_prompt,
-                &self.settings,
-            )),
-            None => None,
-        };
+            .map(|model_window| {
+                crate::agent::context::estimate_context_capacity(
+                    model_window,
+                    &system_prompt,
+                    &user_prompt,
+                    &self.settings,
+                )
+            });
 
         loop {
             // L3 按轮压缩（决策 105）：估算当前 messages 是否超过软限，超了就规则化压缩。
@@ -1776,6 +1775,7 @@ impl Executor {
     ///
     /// 返回 `Some(reason)` 表示调用方应立即把该节点的输出收口为这个 pending；
     /// `None` 表示预算内或压缩后已回到预算内，可继续本轮 LLM 调用。
+    #[allow(clippy::too_many_arguments)]
     async fn enforce_context_budget(
         &self,
         task: &Task,
@@ -2569,7 +2569,6 @@ impl Executor {
                     stdout_preview: Some(stdout_preview.clone()),
                     stderr_preview: Some(stderr_preview.clone()),
                     duration_ms,
-                    ..Default::default()
                 },
             )
             .await?;

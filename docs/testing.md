@@ -177,7 +177,7 @@ harness = FakeAgent（§3.2）+ testkit fixture（§3.3）+ 临时 home + 手动
 | 组件 | @testing-library/svelte | PendingActions（按所属游标取 cursor_id——决策 91）；DiffReviewPanel（无「拒绝」——决策 23）；StalledBadge（决策 34） |
 | E2E | playwright（只 Chromium） | **真 axum 后端 + FakeAgent**（临时 home），两条：① happy path（看板 → 详情 → 页签 → diff 审批合入）；② pending → dossier 面板 → resume（琥珀面板、顶栏待办计数） |
 
-**前端测试状态（2026-09-12，票 20–22）：** 单元层已落地并全绿（`frontend/`，85 个 vitest：`reduce.ts` 归约表逐事件、SSE 连接层主动重连、`allowed_actions` 渲染分组与 cursor_id、NotificationPolicy、provider 掩码保存规则、analyze 轮询、metrics 字段映射、stage_configs payload）。组件层以 vitest + DOM 断言覆盖 PendingActions / DiffReviewPanel / StalledBadge。**playwright 两条 E2E 尚未执行**（需真 axum 后端 + FakeAgent 的临时 home harness，未接线）。
+**前端测试状态（2026-09-13，票 18 收尾）：** 单元层已落地并全绿（`frontend/`，85 个 vitest：`reduce.ts` 归约表逐事件、SSE 连接层主动重连、`allowed_actions` 渲染分组与 cursor_id、NotificationPolicy、provider 掩码保存规则、analyze 轮询、metrics 字段映射、stage_configs payload）。组件层以 vitest + DOM 断言覆盖 PendingActions / DiffReviewPanel / StalledBadge。**playwright 两条 E2E 已执行**（票 18）：用例在 `frontend/e2e/happy-path.spec.ts` 与 `frontend/e2e/pending-resume.spec.ts`，harness `frontend/e2e/harness.ts`（临时 home + 手写 OpenAI 兼容 mock LLM + 真 `serve --port 0` 就绪行回读 + Vite 代理），跑法 `just frontend-e2e`（或 `cd frontend && npx playwright test --project=chromium`），只 Chromium（决策 144）。
 
 ## 10. 质量闸门与 traceability（决策 147）
 
@@ -210,7 +210,7 @@ harness = FakeAgent（§3.2）+ testkit fixture（§3.3）+ 临时 home + 手动
 
 ## 11. 实现状态（2026-09-12，票 15–22 后）
 
-票 01–22 全部实现（**已记录的行为级缺口见文末**，非静默遗漏）：骨架 + executor + prompt 模板消费 + 生产 LLM 适配器 + merge 收尾（rebase 自动合并 / `gate_recheck` 注入）+ 三个伪阶段 + 生产进程接线 + 崩溃恢复 + E2E 矩阵 + 前端三页。质量闸门全绿：`cargo fmt --check`、`clippy --workspace --all-targets -- -D warnings`、`cargo test --workspace` = **418 个用例全过**（另有 1 个 `#[ignore]` 真 LLM 冒烟）；前端 `frontend/` = **85 个 vitest 全过** + `svelte-check` 0 error/0 warning + `npm run build` 成功。
+票 01–22 全部实现（**已记录的行为级缺口见文末**，非静默遗漏）：骨架 + executor + prompt 模板消费 + 生产 LLM 适配器 + merge 收尾（rebase 自动合并 / `gate_recheck` 注入）+ 三个伪阶段 + 生产进程接线 + 崩溃恢复 + E2E 矩阵 + 前端三页。质量闸门全绿：`cargo fmt --check`、`clippy --workspace --all-targets -- -D warnings`、`cargo test --workspace` = **476 个用例全过**（另有 1 个 `#[ignore]` 真 LLM 冒烟）；前端 `frontend/` = **85 个 vitest 全过** + 2 条 playwright E2E 全过 + `svelte-check` 0 error/0 warning + `npm run build` 成功。
 
 **workspace 布局**（与 project-structure 决策一致，`crates/core` 的包名改为 `agentpipeline-core`——包名 `core` 会在宏展开里遮蔽 Rust 内置 `core`）：
 
@@ -242,18 +242,27 @@ justfile         lint / test / unit / integration / api / e2e / smoke
 
 **尚未实现（下一步）：**
 
-1. **票面剩余**：无（票 01–22 全部 done）。`gate_recheck` 置位与闸门输出注入（决策 109）已随票 15 落地；judge_disagreement 的 continue 特判放行（决策 135）已随票 16 落地；E2E-16 design_refs 场景已随票 19 落地。
-2. **行为级缺口（文档已定义、当前无生产者）**：`task_failed`（v1 执行路径无 failed 终态，见票 11 注记①）；`review_diff` 产出（决策 124）；review 打回后 `required_changes` / 重试摘要注入 develop prompt（`PromptSegments.retry_feedback` 无生产者，决策 133）；`context_overflow`（决策 105/110 的 L4 兜底）executor 无生产者；`dependency_overridden` 警告（决策 116）；info_insufficient 补充输入注入重入 prompt（决策 79）；review / test `code_issue` 的 pending 丢 `context.kind`（`allowed_actions` 落通用 `(user_decision, _)` 行）；retry 的会话归档（§12.2 需会话表加 archived 标记列）；`GET /tasks/{id}/conversations/{run_id}/messages` 端点（§12.4.3 有定义）。完整清单与复现见票 19 文末「生产 gap」。（`conversation_delta` / `tool_event` 生产者已随票 13 落地。）
-
-**代码评审记录的偏差与遗留（2026-09-12，两轴评审）：**
-- **决策 100 偏差**：`Executor::project_analysis` 是伪阶段但不落独立 run / 会话行（项目级无游标，`RunContext { task_id: "", run_id: 0 }`）——决策 100 的「伪阶段独立观测」对它是空的，也不计入 `total_calls`。task 内伪阶段（conflict_check / validator_cross_check）已按决策 100/113 落库。
-- **决策 109 偏差**：`gate_recheck` 注入的是 `head_tail` 预览（命令 + 退出码 + 首尾各 50/100 行），不是决策要求的「`kanban_node_commands` 完整日志」。
-- **决策 153⑤ 未实现**：`serve` 仍在 `crates/app/src/main.rs`（未沉 lib），端口绑定不支持 `127.0.0.1:0`；冒烟测试用「先探测再释放」的 `free_port()` 绕开，有竞争窗口。桌面壳接线时一并做。
-- **playwright 两条 E2E 未执行**（见 §9）：需真 axum 后端 + FakeAgent 的临时 home harness。
-- **结构性待清理**（非行为缺陷）：merge 的 rebase 自动合并逻辑住在 `pipeline/executor.rs` 而非 `git.rs`（票 15 为遵守文件所有权所致）；`tests/e2e` 的 `Flow` 脚手架在 `crash_recovery.rs` / `happy_path.rs` / `join_and_skip.rs` 各有副本（`common/mod.rs` 未回灌）；前端 action→endpoint 映射在 `lib/actions.ts` 与 `lib/actionSubmit.ts` 各写一份；`storage/decisions.rs::advance_after_judge_continue` 复刻了 `advance_cursor` 的落点逻辑。
+1. **票面剩余**：无。票 01–22 与 `.scratch/agentpipeline-v1-closeout/` 的票 01–18 全部实现（见下方「收尾批次」）。
+2. **行为级缺口（文档已定义、当前无生产者）**：仅剩 `task_failed` 终态——决策 70 已裁决 `failed` 变体保留但 v1 无生产者，用户主动终止走 cancel → `cancelled`，系统级失败终态留待有真实生产者时启用（非缺口）。其余原缺口均已关闭：
+   - `review_diff` 产出（决策 124）→ 票 13，人工评审前生成 `review-diff.diff` + stage output；
+   - review 打回后 `required_changes` 注入 develop prompt（决策 133）→ 票 07；
+   - 重试摘要回架构设计注入（决策 138）与 info_insufficient 补充输入注入（决策 79）→ 票 08；
+   - `context_overflow`（决策 105 / 110 的 L4 兜底）→ 票 04，E2E-22 走真实执行路径触发；
+   - `dependency_overridden` 警告（决策 116）→ 票 06；
+   - review / test `code_issue` 的 pending 补 `context.kind`（决策 130 ①）→ 票 05；
+   - retry 的会话归档（§12.2）→ 票 11（迁移 0003 加 `archived_at`）；
+   - `GET /tasks/{id}/conversations/{run_id}/messages` 端点（§12.4.3）→ 票 12；
+   - 项目级伪阶段独立观测行（决策 100 / 130②）→ 票 10（迁移 0004 放开归属）。
 3. **真 LLM 冒烟**（`#[ignore]`）——已落地（`crates/core/tests/llm_smoke.rs`，`AGENTPIPELINE_SMOKE_*` 环境变量驱动，验收流式 + 计量 + 结构化输出解析）；未用 rig，生产适配器为手写 reqwest 实现（`crates/core/src/agent/providers/`），`client.rs` 的「rig 适配层」注释以本条为准。
-4. **文档已定义、实现留空的配置面**：`[logging] format / file`（agents.md §10.6.5 已标注 v1 未实现）；`adaptive_timeout_enabled` 已解析未消费；`PromptsConfig.dir` 未接入；`run_command` 的输出流式 SSE（决策 100 / §12.4.4；周期心跳已随票 13 落地）；脱敏的环境变量值模式（§12.4.4）；上下文 L1 read_file 尾部、L2 泛化到全部工具、L3 按轮计数、L4 接线（§12.13）；`model_context_window` 注册表（决策 110）。
-5. **测试基建注记**：FakeAgent 的 agent loop 会耗尽同节点脚本队列（每 attempt 吃到队列干涸为止），多轮行为测试须按 `set_script` 分轮投喂（`tests/e2e/tests/join_and_skip.rs` 头注）；executor 注册表以 task_id 为进程全局键，同进程并发测试须用互不相同的 task_id。
+4. **文档已定义、实现留空的配置面**：全部接线完毕（票 16 / 17 / 04 / 14 / 15）——`[logging] format / file`、`prompts.dir`、`adaptive_timeout_enabled`（告警侧）、`run_command` 输出流式 SSE、脱敏的环境变量值、上下文 L2 泛化 / L3 按轮 / L4 接线、`model_context_window`（provider 行）。
+5. **测试基建注记**：FakeAgent 的 agent loop 会耗尽同节点脚本队列（每 attempt 吃到队列干涸为止），多轮行为测试须按 `set_script` 分轮投喂（`tests/e2e/tests/common/mod.rs` 头注）；executor 注册表以 task_id 为进程全局键，同进程并发测试须用互不相同的 task_id。
+
+**收尾批次（`.scratch/agentpipeline-v1-closeout/`，2026-09-13）：** 票 01–18 全部实现，§11 原「代码评审记录的偏差与遗留」逐条关闭：
+- 决策 100 偏差 → 票 10（项目级 run / 会话行，迁移 0004）；
+- 决策 109 偏差 → 票 09（闸门完整日志落 `gate-output-{stage}.log`，复检读全文）；
+- 决策 153⑤ 未实现 → 票 02（`serve` 沉 lib + `127.0.0.1:0` 回读端口 + 就绪行）；
+- playwright 两条 E2E 未执行 → 票 18（`frontend/e2e/`，只 Chromium，`just frontend-e2e`）；
+- 结构性待清理四处 → 票 01（e2e `Flow` 回灌公共模块）/ 票 03（rebase 逻辑回 git 层、action→endpoint 单一事实来源、judge continue 落点复用 `StageLanding`）。
 
 **git 层技术选型（2026-09-12 用户裁决）：** 决策 12（git2 + `spawn_blocking`）与决策 146 原文（生产走系统 git CLI）此前互斥，用户拍板统一 git2——生产 git 层（`crates/core/src/git.rs`）已全部重写为 git2，testkit fixture 保留系统 git CLI 仅作测试脚手架（决策 146 已改旧行）；merge 阶段 B 随之改为内存合入（决策 73 / 97 已补注），git 链路 14 条测试全部在 git2 实现上通过。
 
