@@ -34,6 +34,31 @@ fn write_stateful_gate(flow: &Flow, name: &str, fail_on: &[u32], output: &str) -
     format!("sh {}", script.display())
 }
 
+/// 同上，但失败时输出 200 行：中间行会被首尾预览（50/100）裁掉，
+/// 用来验证决策 109 / 票 09 的「注入完整日志」而非预览。
+fn write_verbose_gate(flow: &Flow, name: &str, fail_on: &[u32], middle_marker: &str) -> String {
+    let home = flow.home.home().root().to_path_buf();
+    let script = home.join(format!("{name}.sh"));
+    let counter = home.join(format!("{name}-count"));
+    // 第 1..=80 行为噪声，第 90 行为 middle_marker（落在首尾预览的省略区），其后为噪声
+    let body = format!(
+        "i=1\nwhile [ \"$i\" -le 80 ]; do echo \"noise line $i\"; i=$((i+1)); done\necho \"{middle_marker}\"\ni=91\nwhile [ \"$i\" -le 200 ]; do echo \"noise line $i\"; i=$((i+1)); done\nexit 1\n"
+    );
+    let fail_clauses = fail_on
+        .iter()
+        .map(|n| format!("if [ \"$n\" -eq {n} ]; then {body} fi\n"))
+        .collect::<String>();
+    std::fs::write(
+        &script,
+        format!(
+            "#!/bin/sh\nd=\"{}\"\nn=$(cat \"$d\" 2>/dev/null || echo 0)\nn=$((n+1))\necho $n > \"$d\"\n{fail_clauses}exit 0\n",
+            counter.display()
+        ),
+    )
+    .unwrap();
+    format!("sh {}", script.display())
+}
+
 /// 把项目 test_framework 换成状态化闸门命令。
 async fn set_test_framework(flow: &Flow, command: &str) {
     flow.store
@@ -47,8 +72,10 @@ async fn set_test_framework(flow: &Flow, command: &str) {
 #[tokio::test]
 async fn e2e_06a_merge_test_gate_failure_rechecks_via_test_then_passes() {
     let f = Flow::new().await;
-    // 第 1 次（develop 闸门）通过，第 2 次（merge 闸门首跑）失败，第 3 次（复检后重跑）通过
-    let gate = write_stateful_gate(&f, "gate", &[2], "GATE_FAIL_OUTPUT: test_login failed");
+    // 第 1 次（develop 闸门）通过，第 2 次（merge 闸门首跑）失败，第 3 次（复检后重跑）通过。
+    // 失败输出 200 行，中间标记行会被首尾预览裁掉 → 验证注入的是完整日志（票 09）。
+    const MIDDLE: &str = "GATE_MIDDLE_LINE_MUST_BE_INJECTED";
+    let gate = write_verbose_gate(&f, "gate", &[2], MIDDLE);
     set_test_framework(&f, &gate).await;
 
     let mut script = Script::new();
@@ -99,8 +126,8 @@ async fn e2e_06a_merge_test_gate_failure_rechecks_via_test_then_passes() {
             .iter()
             .skip(1)
             .any(|r| r.user_prompt.contains("合入闸门失败复检上下文")
-                && r.user_prompt.contains("GATE_FAIL_OUTPUT")),
-        "复检 prompt 应含闸门输出：{:?}",
+                && r.user_prompt.contains(MIDDLE)),
+        "复检 prompt 应含**完整日志**（含被预览裁掉的中间行）：{:?}",
         test_reqs
             .iter()
             .map(|r| r.user_prompt.clone())

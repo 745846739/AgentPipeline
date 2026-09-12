@@ -1576,14 +1576,34 @@ impl Executor {
             return Ok(None);
         }
         let mut out = String::new();
-        if let Some(log) = merge
-            .gate_failure_output
-            .as_deref()
-            .filter(|s| !s.trim().is_empty())
-        {
-            out.push_str("### 闸门失败输出\n");
-            out.push_str(log.trim());
-            out.push('\n');
+        // 决策 109 / 票 09：读闸门命令的**完整日志**（含被首尾预览裁掉的中间行），
+        // 不再是 head/tail 预览。日志文件路径按 merge 闸门所在 stage 命名（覆盖写入可重入）；
+        // 读取不到时回退 metadata 里的预览并显式标注（不静默）。
+        let gate_log_path = self.store.home().task_file(
+            &task.id,
+            &format!("gate-output-{}.log", Stage::Merge.as_str()),
+        );
+        let full_log = std::fs::read_to_string(&gate_log_path)
+            .ok()
+            .filter(|s| !s.trim().is_empty());
+        match full_log {
+            Some(log) => {
+                out.push_str("### 闸门失败完整日志\n");
+                out.push_str(&truncate_gate_log(&log, GATE_INJECTION_LIMIT));
+                out.push('\n');
+            }
+            None => {
+                // 完整日志缺失（异常路径）：退回 metadata 预览并显式说明，**不静默**
+                if let Some(log) = merge
+                    .gate_failure_output
+                    .as_deref()
+                    .filter(|s| !s.trim().is_empty())
+                {
+                    out.push_str("### 闸门失败输出（完整日志不可读，以下为首尾预览）\n");
+                    out.push_str(log.trim());
+                    out.push('\n');
+                }
+            }
         }
         if let Some(meta) = self
             .store
@@ -2243,11 +2263,26 @@ impl Executor {
         let stderr = crate::agent::sanitize::sanitize_text(&stderr);
         let stdout_preview = crate::agent::tools::head_tail(&stdout, 50, 100);
         let stderr_preview = crate::agent::tools::head_tail(&stderr, 50, 100);
+        // 决策 109 / 票 09：闸门命令的**完整** stdout/stderr 落可读路径（路径确定、覆盖
+        // 写入可重入），复检段读全文而非首尾预览。按 stage 命名，同一阶段的闸门重跑覆盖同一文件。
+        let full_path = self
+            .store
+            .home()
+            .task_file(&task.id, &format!("gate-output-{}.log", stage.as_str()));
+        self.store.home().ensure_task_dirs(&task.id)?;
+        let full_log = match (stdout.is_empty(), stderr.is_empty()) {
+            (false, false) => format!("[stdout]\n{stdout}\n[stderr]\n{stderr}"),
+            (false, true) => stdout.clone(),
+            (true, false) => stderr.clone(),
+            (true, true) => String::new(),
+        };
+        std::fs::write(&full_path, &full_log)?;
         self.store
             .record_finish(
                 command_id,
                 CommandFinish {
                     exit_code: Some(exit_code),
+                    stdout_path: Some(full_path.display().to_string()),
                     stdout_preview: Some(stdout_preview.clone()),
                     stderr_preview: Some(stderr_preview.clone()),
                     duration_ms,
@@ -2256,7 +2291,9 @@ impl Executor {
             )
             .await?;
         self.store.touch_run_heartbeat(run_id).await?;
-        // 闸门失败输出进 prompt（决策 109）：stdout + stderr 预览合并
+        // merge metadata 里的 `gate_failure_output` 保持原有的命令摘要 + 首尾预览（体积有界，
+        // UI / 观测面消费）；**完整日志**已落上方 `full_path`，复检段按确定路径读全文
+        // （决策 109 / 票 09）。
         let combined = match (
             stdout_preview.trim().is_empty(),
             stderr_preview.trim().is_empty(),
@@ -2922,6 +2959,30 @@ fn gate_output(kind: &str, command: &str, code: i32, output: &str) -> String {
     }
 }
 
+/// 闸门复检注入体积上界（决策 109 / 票 09）：约 120k 字符。
+///
+/// 决策要求注入 `kanban_node_commands` 的**完整日志**；但注入必须有上界，否则一份
+/// 超大闸门日志会挤爆复检 prompt。超限时**显式**保留首尾并写明省略了多少字符
+/// （并给出完整日志路径），**不静默回退到预览**——票据明确禁止无声降级。
+const GATE_INJECTION_LIMIT: usize = 120_000;
+
+/// 显式截断：保留首尾并标注省略量（不静默丢内容）。
+fn truncate_gate_log(log: &str, limit: usize) -> String {
+    if log.chars().count() <= limit {
+        return log.to_string();
+    }
+    // 按字符切（日志可能含中文），避免在 UTF-8 边界截断
+    let head_n = limit * 2 / 3;
+    let tail_n = limit - head_n;
+    let chars: Vec<char> = log.chars().collect();
+    let head: String = chars[..head_n].iter().collect();
+    let tail: String = chars[chars.len() - tail_n..].iter().collect();
+    format!(
+        "{head}\n\n...[闸门日志超长：已省略中间 {} 字符；完整日志见上方 stdout_path]...\n\n{tail}",
+        chars.len() - limit
+    )
+}
+
 /// 测试框架 → 系统闸门命令（§6：按 test_framework 动态构建）。
 /// 未配置 → `true`（跳过闸门环节，不阻塞）；带空格的值视作原始命令。
 pub fn test_command_for(framework: Option<&str>) -> String {
@@ -3084,5 +3145,37 @@ mod tests {
         let with_log = gate_output("测试", "cargo test", 1, "FAILED: test_login\n");
         assert!(with_log.contains("退出码 1"));
         assert!(with_log.contains("FAILED: test_login"));
+    }
+
+    #[test]
+    fn gate_log_under_limit_is_returned_verbatim() {
+        // 未超限：完整保留（含中间行，票据要求读全文而非首尾预览）
+        let log = "line1\n".repeat(10);
+        assert_eq!(truncate_gate_log(&log, 1000), log);
+    }
+
+    #[test]
+    fn gate_log_over_limit_truncates_with_explicit_notice() {
+        // 超限：显式截断并标注省略量，保留首尾，**不静默**丢内容
+        let mid = "MIDDLE_OMITTED_MARKER\n";
+        let log = format!("HEAD\n{}{}", mid.repeat(50), "TAIL\n");
+        let out = truncate_gate_log(&log, 100);
+        assert!(out.starts_with("HEAD"), "保留首部");
+        assert!(out.ends_with("TAIL\n"), "保留尾部");
+        assert!(out.contains("闸门日志超长"), "应有显式省略标注");
+        assert!(out.contains("已省略中间"), "标注应写明省略量");
+        assert!(out.len() < log.len(), "截断后应变短");
+        // 中间行确实被省略（这正是首尾预览会丢的那段）
+        assert!(!out.contains(&mid.repeat(50)));
+    }
+
+    #[test]
+    fn gate_log_truncation_is_char_boundary_safe() {
+        // 中文字符不得被按字节切开（否则输出非法 UTF-8 / 乱码）
+        let log = "中".repeat(500);
+        let out = truncate_gate_log(&log, 100);
+        assert!(out.is_char_boundary(out.len()));
+        assert!(out.chars().all(|c| c == '中'
+            || ".\n[闸门日志超长：已省略中间 400 字符；完整日志见上方 stdout_path]".contains(c)));
     }
 }
