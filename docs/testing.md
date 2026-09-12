@@ -177,7 +177,9 @@ harness = FakeAgent（§3.2）+ testkit fixture（§3.3）+ 临时 home + 手动
 | 组件 | @testing-library/svelte | PendingActions（按所属游标取 cursor_id——决策 91）；DiffReviewPanel（无「拒绝」——决策 23）；StalledBadge（决策 34） |
 | E2E | playwright（只 Chromium） | **真 axum 后端 + FakeAgent**（临时 home），两条：① happy path（看板 → 详情 → 页签 → diff 审批合入）；② pending → dossier 面板 → resume（琥珀面板、顶栏待办计数） |
 
-**前端测试状态（2026-09-13，票 18 收尾）：** 单元层已落地并全绿（`frontend/`，85 个 vitest：`reduce.ts` 归约表逐事件、SSE 连接层主动重连、`allowed_actions` 渲染分组与 cursor_id、NotificationPolicy、provider 掩码保存规则、analyze 轮询、metrics 字段映射、stage_configs payload）。组件层以 vitest + DOM 断言覆盖 PendingActions / DiffReviewPanel / StalledBadge。**playwright 两条 E2E 已执行**（票 18）：用例在 `frontend/e2e/happy-path.spec.ts` 与 `frontend/e2e/pending-resume.spec.ts`，harness `frontend/e2e/harness.ts`（临时 home + 手写 OpenAI 兼容 mock LLM + 真 `serve --port 0` 就绪行回读 + Vite 代理），跑法 `just frontend-e2e`（或 `cd frontend && npx playwright test --project=chromium`），只 Chromium（决策 144）。
+**前端测试状态（2026-09-13，票 18 收尾）：** 单元层已落地并全绿（`frontend/`，85 个 vitest：`reduce.ts` 归约表逐事件、SSE 连接层主动重连、`allowed_actions` 渲染分组与 cursor_id、NotificationPolicy、provider 掩码保存规则、analyze 轮询、metrics 字段映射、stage_configs payload）。组件层以 vitest + DOM 断言覆盖 PendingActions / DiffReviewPanel / StalledBadge。**playwright 两条 E2E 已执行**（票 18）：用例在 `frontend/e2e/happy-path.spec.ts` 与 `frontend/e2e/pending-resume.spec.ts`，harness `frontend/e2e/harness.ts`（临时 home + 真 `serve --port 0` 就绪行回读 + Vite 代理），跑法 `just frontend-e2e`（或 `cd frontend && npx playwright test --project=chromium`），只 Chromium（决策 144）。
+
+> **与决策 151 的显式偏差：** 决策 151 要求「复用 E2E harness、**不维护独立 mock server**」，票 18 的实现未复用 testkit 的 FakeAgent，而是在 `frontend/e2e/harness.ts` 里写了一个 Node 侧的 OpenAI 兼容 SSE mock（按 persona 反查 `(stage, node)`、按轮投喂）。**理由**：playwright 进程（Node）无法直接调用 Rust 的 `testkit::MockLlm`，复用需要一个额外的 Rust helper 二进制并纳入 playwright 的构建前置；v1 以「少一个构建步骤、harness 自包含」优先。**代价**：存在第二份 mock 实现，可能与 Rust 侧契约漂移——它仍必须发出真实适配器能解析的 OpenAI SSE，故「SSE 事件格式 ↔ 前端归约」这条契约仍被覆盖，但**契约漂移风险由本注记显式承担**（后续若把 testkit 的 mock 抽成 helper 二进制，应删掉 Node mock）。决策 151 的其余要求（真 axum 后端、`AGENTPIPELINE_HOME` 指临时目录、两条冒烟）均满足。
 
 ## 10. 质量闸门与 traceability（决策 147）
 
