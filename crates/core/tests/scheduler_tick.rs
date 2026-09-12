@@ -705,13 +705,21 @@ async fn maintenance_refreshes_totals_and_purges_expired_conversations() {
 
     // 会话保留期内不清理
     assert_eq!(report.purged_conversations, 0);
-    assert_eq!(h.store.list_conversations("t1").await.unwrap().len(), 1);
+    assert_eq!(
+        h.store.list_conversations("t1", false).await.unwrap().len(),
+        1
+    );
 
     // 超过 conversation_retention_days(30) → 终态任务的会话被清理
     h.clock.advance_secs(31 * 24 * 3600);
     let report = scheduler.maintenance().await.unwrap();
     assert_eq!(report.purged_conversations, 1);
-    assert!(h.store.list_conversations("t1").await.unwrap().is_empty());
+    assert!(h
+        .store
+        .list_conversations("t1", false)
+        .await
+        .unwrap()
+        .is_empty());
 }
 
 // ─────────────────────── 第一层冲突判定（决策 71 / 102）───────────────────────

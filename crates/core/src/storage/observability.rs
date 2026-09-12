@@ -567,10 +567,12 @@ impl Store {
             prompt_tokens: i64,
             completion_tokens: i64,
             created_at: String,
+            archived_at: Option<String>,
         }
         let row: Option<Row> = sqlx::query_as(
             "SELECT id, task_id, run_id, stage, node, attempt, agent_type, parent_run_id,
-                    messages_json, metadata_json, prompt_tokens, completion_tokens, created_at
+                    messages_json, metadata_json, prompt_tokens, completion_tokens, created_at,
+                    archived_at
              FROM kanban_node_conversations WHERE task_id = ? AND run_id = ?",
         )
         .bind(task_id)
@@ -595,20 +597,93 @@ impl Store {
                 prompt_tokens: r.prompt_tokens as u32,
                 completion_tokens: r.completion_tokens as u32,
                 created_at: parse_ts(&r.created_at)?,
+                archived_at: r.archived_at.map(|s| parse_ts(&s)).transpose()?,
             }),
             None => None,
         })
     }
 
-    pub async fn list_conversations(&self, task_id: &str) -> Result<Vec<NodeConversation>> {
-        let runs = self.list_runs(task_id).await?;
-        let mut out = Vec::new();
-        for run in runs {
-            if let Some(conv) = self.get_conversation(task_id, run.id).await? {
-                out.push(conv);
-            }
+    /// 归档任务的全部会话（重试时标记旧 attempt，§12.2 / 决策 113 同构）。
+    ///
+    /// 只更新 `archived_at`，绝不物理删除：历史仍可查，`run_id` 外键不悬空。
+    /// 返回被标记的行数。
+    pub async fn archive_conversations(&self, task_id: &str) -> Result<u64> {
+        let affected = sqlx::query(
+            "UPDATE kanban_node_conversations SET archived_at = ?
+             WHERE task_id = ? AND archived_at IS NULL",
+        )
+        .bind(ts(self.now()))
+        .bind(task_id)
+        .execute(self.pool())
+        .await?
+        .rows_affected();
+        Ok(affected)
+    }
+
+    /// 会话列表：默认只返回未归档行；`include_archived = true` 时取回全部历史 attempt
+    /// （含被重试归档的旧会话，§12.2）。
+    ///
+    /// 归档判定在 SQL 层（`archived_at IS NULL`），不再依赖 run 列表，避免与
+    /// 「重试后旧 run 仍在」的现实混淆。
+    pub async fn list_conversations(
+        &self,
+        task_id: &str,
+        include_archived: bool,
+    ) -> Result<Vec<NodeConversation>> {
+        #[derive(FromRow)]
+        struct Row {
+            id: i64,
+            task_id: String,
+            run_id: i64,
+            stage: String,
+            node: String,
+            attempt: i64,
+            agent_type: String,
+            parent_run_id: Option<i64>,
+            messages_json: String,
+            metadata_json: Option<String>,
+            prompt_tokens: i64,
+            completion_tokens: i64,
+            created_at: String,
+            archived_at: Option<String>,
         }
-        Ok(out)
+        let mut sql = String::from(
+            "SELECT id, task_id, run_id, stage, node, attempt, agent_type, parent_run_id,
+                    messages_json, metadata_json, prompt_tokens, completion_tokens, created_at,
+                    archived_at
+             FROM kanban_node_conversations WHERE task_id = ?",
+        );
+        if !include_archived {
+            sql.push_str(" AND archived_at IS NULL");
+        }
+        sql.push_str(" ORDER BY id");
+        let rows: Vec<Row> = sqlx::query_as(&sql)
+            .bind(task_id)
+            .fetch_all(self.pool())
+            .await?;
+        rows.into_iter()
+            .map(|r| {
+                Ok(NodeConversation {
+                    id: r.id,
+                    task_id: r.task_id,
+                    run_id: r.run_id,
+                    stage: decode_stage(&r.stage)?,
+                    node: decode_node(&r.node)?,
+                    attempt: r.attempt as u32,
+                    agent_type: r.agent_type,
+                    parent_run_id: r.parent_run_id,
+                    messages_json: serde_json::from_str(&r.messages_json)?,
+                    metadata_json: r
+                        .metadata_json
+                        .map(|s| serde_json::from_str(&s))
+                        .transpose()?,
+                    prompt_tokens: r.prompt_tokens as u32,
+                    completion_tokens: r.completion_tokens as u32,
+                    created_at: parse_ts(&r.created_at)?,
+                    archived_at: r.archived_at.map(|s| parse_ts(&s)).transpose()?,
+                })
+            })
+            .collect()
     }
 
     // ─────────────────────────── 命令日志（§12.4.4）───────────────────────────

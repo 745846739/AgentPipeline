@@ -69,6 +69,8 @@ type TaskStatus =
  *   - 终态：游标行保留（审计与 checkpoint 回放用）；"重试"时归档全部旧行、插入单条 main 游标指向 init.execute。
  *   - 游标行**永不物理删除**（决策 113）：kanban_node_runs.cursor_id 的 NOT NULL 外键因此永不悬空；
  *     归档行不受 partial UNIQUE 约束，同一分支之后可插入新行（新行新 cursor_id）。
+ *   - **会话行同构归档**（§12.2）：`kanban_node_conversations.archived_at` 是会话行的归档标记，
+ *     重试把旧会话标记归档（不物理删除，run_id 外键不悬空），列表默认只返回未归档行。
  *   - 注意：并行区间不存在**活跃的** main 游标（已被改写为 develop-design）。
  */
 interface NodeCursor {

@@ -969,6 +969,9 @@ pub struct NodeConversation {
     pub prompt_tokens: u32,
     pub completion_tokens: u32,
     pub created_at: DateTime<Utc>,
+    /// 重试时旧会话被标记的时间（§12.2 / 决策 113 的同构：归档不物理删除）。
+    /// `None` = 未归档，参与新执行；`Some` = 历史 attempt，仍可查。
+    pub archived_at: Option<DateTime<Utc>>,
 }
 
 /// 命令日志（§12.4.4）。

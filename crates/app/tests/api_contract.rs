@@ -636,6 +636,71 @@ async fn retry_requires_terminal_and_requeues() {
 }
 
 #[tokio::test]
+async fn retry_archives_old_conversations_and_default_list_excludes_them() {
+    // §12.2 / 决策 113 同构：重试归档旧会话；列表默认过滤，include_archived 可取回
+    let api = api().await;
+    seed(&api, "t1").await;
+    let cursor = api.state.store.load_live_cursors("t1").await.unwrap()[0].clone();
+    let store = &api.state.store;
+    let run = store
+        .insert_run(&agentpipeline_core::storage::observability::NewRun {
+            task_id: "t1".into(),
+            cursor_id: cursor.cursor_id.clone(),
+            stage: Stage::ArchitectDesign,
+            node: agentpipeline_core::types::Node::Execute,
+            attempt: 1,
+            agent_type: "main".into(),
+            parent_run_id: None,
+            prompt_template_hash: None,
+            process_group_id: None,
+        })
+        .await
+        .unwrap();
+    store
+        .insert_conversation(
+            "t1",
+            run,
+            Stage::ArchitectDesign,
+            agentpipeline_core::types::Node::Execute,
+            1,
+            "main",
+            None,
+            &serde_json::json!([{"role": "user", "content": "旧 attempt"}]),
+            None,
+            10,
+            5,
+        )
+        .await
+        .unwrap();
+
+    // 未重试前默认可见
+    let (_, body) = get(&api, "/tasks/t1/conversations").await;
+    assert_eq!(body["conversations"].as_array().unwrap().len(), 1);
+
+    store.mark_terminal("t1", TaskStatus::Failed).await.unwrap();
+    let (status, body) = post(&api, "/tasks/t1/retry", serde_json::json!({})).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+
+    // 默认列表不混入旧 attempt
+    let (_, body) = get(&api, "/tasks/t1/conversations").await;
+    assert!(
+        body["conversations"].as_array().unwrap().is_empty(),
+        "默认列表应过滤已归档会话：{body}"
+    );
+
+    // 历史可按参数取回
+    let (_, body) = get(&api, "/tasks/t1/conversations?include_archived=true").await;
+    let conversations = body["conversations"].as_array().unwrap();
+    assert_eq!(conversations.len(), 1);
+    assert!(conversations[0]["archived_at"].is_string(), "应带归档时间");
+
+    // 不物理删除：整条会话仍可取回
+    let (status, body) = get(&api, &format!("/tasks/t1/conversations/{run}")).await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(body["conversation"]["archived_at"].is_string());
+}
+
+#[tokio::test]
 async fn cancel_marks_terminal_and_notifies_dependents() {
     let api = api().await;
     let project_id = seed(&api, "dep").await;

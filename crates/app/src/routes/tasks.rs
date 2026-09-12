@@ -372,6 +372,13 @@ pub async fn retry(
         .reset_cursors_to_init(&id)
         .await
         .map_err(map_core_error)?;
+    // §12.2 / 决策 113 同构：旧 attempt 的会话标记归档（不物理删除，历史仍可查），
+    // 新执行落新会话行，查看器默认不再把历次 attempt 混在一起。
+    state
+        .store
+        .archive_conversations(&id)
+        .await
+        .map_err(map_core_error)?;
     // 置回 queued 重新走准入（决策 117）
     state
         .store
@@ -749,13 +756,21 @@ pub async fn global_metrics(State(state): State<AppState>) -> ApiResult<impl Int
 }
 
 /// `GET /tasks/{id}/conversations`
+#[derive(Debug, Deserialize)]
+pub struct ConversationListQuery {
+    /// 取回历史 attempt（含被重试归档的旧会话，§12.2）；默认只返回未归档。
+    #[serde(default)]
+    pub include_archived: bool,
+}
+
 pub async fn conversations(
     State(state): State<AppState>,
     Path(id): Path<String>,
+    Query(query): Query<ConversationListQuery>,
 ) -> ApiResult<impl IntoResponse> {
     let conversations = state
         .store
-        .list_conversations(&id)
+        .list_conversations(&id, query.include_archived)
         .await
         .map_err(map_core_error)?;
     // 列表只给摘要（§12.4.3）
@@ -771,6 +786,7 @@ pub async fn conversations(
                 "parent_run_id": c.parent_run_id,
                 "prompt_tokens": c.prompt_tokens,
                 "completion_tokens": c.completion_tokens,
+                "archived_at": c.archived_at,
             })
         })
         .collect();

@@ -76,7 +76,7 @@ POST /tasks/{id}/cancel
 | 场景 | 处理 |
 |---|---|
 | 取消后重新创建任务 | 新 task_id，全新游标和会话，与旧任务无关联 |
-| 失败后点击"重试" | 同一 task_id，但需清理：旧游标全部归档、插入单条 main 游标指向 `init.execute`（决策 90 / 113）、`kanban_node_conversations`（旧会话归档保留供审计，不参与新执行）；任务置回 `queued` 重新走准入（决策 117）。`failed` 状态经此回到 `init`（决策 70） |
+| 失败后点击"重试" | 同一 task_id，但需清理：旧游标全部归档、插入单条 main 游标指向 `init.execute`（决策 90 / 113）、`kanban_node_conversations`（旧会话写 `archived_at` 归档保留供审计，列表默认过滤，不参与新执行，决策 113 同构）；任务置回 `queued` 重新走准入（决策 117）。`failed` 状态经此回到 `init`（决策 70） |
 | 阶段内 validate 重试 | 节点级独立对话（§10.4），天然不复用 |
 | merge 闸门打回 test | test 游标重入 `test.execute`，`test_result.gate_recheck = true`；`gate_failures` 保留在 merge metadata（决策 85 / 108 / 109） |
 
@@ -85,13 +85,15 @@ POST /tasks/{id}/cancel
 
 pub async fn reset_task_for_retry(db: &SqlitePool, task_id: &str) -> Result<()> {
     // 重试前重置执行态，历史产出保留但不复用
-    db.archive_conversations(task_id).await?;     // 旧会话标记 archived
+    db.archive_conversations(task_id).await?;     // 旧会话写 archived_at（不物理删除）
     db.reset_cursors(task_id).await?;             // 归档全部游标行，插入单条 main 指向 init.execute（决策 90 / 113）
     db.reset_task_state(task_id, "init", "execute").await?;  // validate_attempts 归零
     reset_worktree_to_base(task_id).await?;       // git reset --hard {base_ref} + git clean -fdx（决策 125）
     Ok(())
 }
 ```
+
+> **重试的会话归档（决策 113 同构）：** `kanban_node_conversations.archived_at` 是会话行的归档标记列（迁移 `0003_conversations_archived.sql`）。重试把该任务全部旧会话标记 `archived_at`，**行仍物理保留**（`run_id` 外键因此不悬空，历史随时可查）；`GET /tasks/{id}/conversations` 默认只返回未归档行，传 `?include_archived=true` 可取回历次 attempt。终态任务的会话保留策略（`conversation_retention_days` 到期清理，§12.4.3）不受影响：清理按 `created_at` 删除，与归档标记互不干扰。
 
 > **游标模型的表述（决策 90 / 113）：** checkpoint 现在就是 `kanban_node_cursors` 的行集合，所以"重置 checkpoint"的准确说法是**把游标重置为单条 main 行**（`stage=init, node=execute`）。终态任务保留游标行供审计；"重试"将旧行归档（`status=archived`）后插入新的单条 main 行——游标行**永不物理删除**，`kanban_node_runs.cursor_id` 的外键因此不悬空。
 
@@ -261,6 +263,7 @@ CREATE TABLE IF NOT EXISTS kanban_node_conversations (
     prompt_tokens INTEGER NOT NULL DEFAULT 0,
     completion_tokens INTEGER NOT NULL DEFAULT 0,
     created_at TEXT NOT NULL,
+    archived_at TEXT,                   -- 重试归档标记（决策 113 同构）：非 NULL = 历史 attempt，列表默认过滤
     FOREIGN KEY (task_id) REFERENCES kanban_tasks(id),
     FOREIGN KEY (run_id) REFERENCES kanban_node_runs(id)
 );
@@ -355,7 +358,7 @@ CREATE TABLE IF NOT EXISTS kanban_node_conversations (
 
 | 接口 | 说明 |
 |---|---|
-| `GET /tasks/{id}/conversations` | 列出所有节点会话摘要（stage/node/attempt/耗时/token/状态） |
+| `GET /tasks/{id}/conversations` | 列出节点会话摘要；默认只返回未归档行，`?include_archived=true` 取回含重试归档的历史 attempt（§12.2 / 决策 113 同构） |
 | `GET /tasks/{id}/conversations/{run_id}` | 单个节点会话完整内容 |
 | `GET /tasks/{id}/conversations/{run_id}/messages` | 仅返回 messages 数组（供前端渲染） |
 
@@ -366,6 +369,7 @@ CREATE TABLE IF NOT EXISTS kanban_node_conversations (
 | 落库时机 | 每次节点尝试结束后写入（成功或失败都写；一次尝试 = 一行，决策 63） |
 | 内容裁剪 | 超过 `conversation_max_chars`（默认 200k 字符）的 messages 截断，保留首尾 |
 | 保留期限 | 终态任务保留 `conversation_retention_days`（默认 30 天），到期清理 |
+| 重试归档 | 重试把旧会话写 `archived_at`（不物理删除），列表默认过滤、`?include_archived=true` 取回（§12.2，决策 113 同构） |
 | 进行中任务 | 不清理，保证随时可查 |
 | 敏感信息 | tool 调用参数中的 API key / token 用 `***` 脱敏后存储 |
 
