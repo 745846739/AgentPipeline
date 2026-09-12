@@ -1274,4 +1274,111 @@ mod tests {
         assert!(!out.content.contains("已卸载"));
         assert!(out.content.contains("fn main"));
     }
+
+    /// 简单 SSE 录制器（只关心 command_output，验证推流路径）。
+    #[derive(Default, Clone)]
+    struct SseRecorder {
+        chunks: Arc<std::sync::Mutex<Vec<String>>>,
+    }
+    impl crate::sse::SseSink for SseRecorder {
+        fn emit(&self, event: crate::sse::SseEvent) {
+            if let crate::sse::SseEvent::CommandOutput { chunk, .. } = event {
+                self.chunks.lock().unwrap().push(chunk);
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn run_command_streams_output_lines_before_completion() {
+        // 票 14 / 决策 100：命令执行期间按行推送 command_output，
+        // 而不是等进程结束一次性缓冲。命令先输出再睡，推流应早于结束发生。
+        let s = setup(Stage::Develop);
+        let sse = SseRecorder::default();
+        // command_id 由 recorder 分配——没有 recorder 就没有 command_id，也就没有推流
+        // （这正是「无订阅者 / 无命令记录时不推流」的退化路径）。
+        let recorder = Arc::new(RecordingRecorder::default());
+        let executor = ToolExecutor::new(
+            s.home.clone(),
+            FileToolPolicy::new(vec![s.worktree.clone(), s.task_dir.clone()]),
+            Settings::default(),
+            Arc::new(NoKiller),
+        )
+        .with_recorder(recorder)
+        .with_sse(crate::agent::tools::CommandSse {
+            sink: Arc::new(sse.clone()),
+            task_id: "t1".into(),
+            branch: "main".into(),
+        });
+        // 输出 → 睡 0.4s → 再输出：推流分两次，逐行到达
+        let out = executor
+            .execute(
+                &call(
+                    "run_command",
+                    serde_json::json!({"command": "echo first; sleep 0.4; echo second"}),
+                ),
+                &s.ctx,
+            )
+            .await
+            .unwrap();
+        // 完整输出仍全量回填（推流不改变回填口径）
+        assert!(out.content.contains("first") && out.content.contains("second"));
+        let chunks = sse.chunks.lock().unwrap().clone();
+        assert!(
+            chunks.iter().any(|c| c.contains("first")),
+            "应推送首行：{chunks:?}"
+        );
+        assert!(
+            chunks.iter().any(|c| c.contains("second")),
+            "应推送后续行：{chunks:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn command_streaming_sanitizes_chunks() {
+        // §12.4.4 / 票 14：推流路径同样脱敏，不出现「先推明文后脱敏」的窗口。
+        let s = setup(Stage::Develop);
+        let sse = SseRecorder::default();
+        let executor = ToolExecutor::new(
+            s.home.clone(),
+            FileToolPolicy::new(vec![s.worktree.clone(), s.task_dir.clone()]),
+            Settings::default(),
+            Arc::new(NoKiller),
+        )
+        .with_recorder(Arc::new(RecordingRecorder::default()))
+        .with_sse(crate::agent::tools::CommandSse {
+            sink: Arc::new(sse.clone()),
+            task_id: "t1".into(),
+            branch: "main".into(),
+        });
+        executor
+            .execute(
+                &call(
+                    "run_command",
+                    serde_json::json!({"command": "export API_TOKEN=abc123secret; echo done"}),
+                ),
+                &s.ctx,
+            )
+            .await
+            .unwrap();
+        let chunks = sse.chunks.lock().unwrap().clone();
+        assert!(
+            !chunks.iter().any(|c| c.contains("abc123secret")),
+            "推流内容应已脱敏：{chunks:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn command_without_sse_still_buffers_fully() {
+        // 无订阅者场景不退化（票 14）：不推流但完整输出照常回填。
+        let s = setup(Stage::Develop);
+        let out = s
+            .executor
+            .execute(
+                &call("run_command", serde_json::json!({"command": "echo hello"})),
+                &s.ctx,
+            )
+            .await
+            .unwrap();
+        assert!(out.content.contains("hello"));
+    }
 }

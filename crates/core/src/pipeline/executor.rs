@@ -986,7 +986,13 @@ impl Executor {
             self.settings.clone(),
             self.killer.clone(),
         )
-        .with_recorder(Arc::new(self.store.clone()));
+        .with_recorder(Arc::new(self.store.clone()))
+        // 命令输出按行推流（票 14 / 决策 100）：长命令期间前端能看到增量输出。
+        .with_sse(crate::agent::tools::CommandSse {
+            sink: self.sse.clone(),
+            task_id: task.id.clone(),
+            branch: cursor.branch.clone(),
+        });
 
         // 阶段配置消费（§10.6.3 / 决策 22 / 46 / 111）：persona、采样参数、工具与技能增量
         let stage_cfg = self.store.get_stage_config(cursor.stage.as_str()).await?;

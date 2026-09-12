@@ -23,7 +23,7 @@ async fn wait_for_active_run(flow: &Flow, task_id: &str) -> agentpipeline_core::
                 .await
                 .unwrap()
                 .into_iter()
-                .find(|r| r.task_id == task_id)
+                .find(|r| r.task_id.as_deref() == Some(task_id))
             {
                 return run;
             }

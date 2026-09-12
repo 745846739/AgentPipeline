@@ -9,8 +9,8 @@ use agentpipeline_core::config::Settings;
 use agentpipeline_core::pipeline::pseudo::CrossCheckResult;
 use agentpipeline_core::storage::decisions::ResumeAction;
 use agentpipeline_core::types::{
-    ArchitectExecuteMetadata, CursorStatus, Node, PendingKind, PendingReason, ScenarioPriority,
-    Stage, TestDesignMetadata, TestScenario, ValidateInputMetadata, ValidateOutputMetadata,
+    ArchitectExecuteMetadata, Node, PendingKind, ScenarioPriority, Stage, TestDesignMetadata,
+    TestScenario, ValidateInputMetadata, ValidateOutputMetadata,
 };
 use common::{architect_ok, Flow};
 use testkit::Script;
