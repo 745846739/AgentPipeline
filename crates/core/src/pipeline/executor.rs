@@ -1019,16 +1019,29 @@ impl Executor {
             .await?;
         // user prompt：§10.3 节点模板 + G12 环境路径块 + 可选追加段（首轮为空不渲染）
         let segments = PromptSegments {
-            backtrack_feedback: backtrack_feedback_segment(
+            backtrack_feedback: architect_reentry_segment(
                 &home,
                 &task.id,
                 cursor.stage,
                 cursor.node,
+                "backtrack-feedback.md",
             ),
-            user_input: user_input_segment(&home, &task.id, cursor.stage, cursor.node),
+            user_input: architect_reentry_segment(
+                &home,
+                &task.id,
+                cursor.stage,
+                cursor.node,
+                "user-input.md",
+            ),
             gate_recheck: self.gate_recheck_segment(task, cursor).await?,
             review_required_changes: self.review_required_changes_segment(task, cursor).await?,
-            retry_feedback: retry_feedback_segment(&home, &task.id, cursor.stage, cursor.node),
+            retry_feedback: architect_reentry_segment(
+                &home,
+                &task.id,
+                cursor.stage,
+                cursor.node,
+                "retry-feedback.md",
+            ),
         };
         let user_prompt = build_user_prompt(
             &format!(
@@ -1832,13 +1845,20 @@ impl Executor {
         if !crate::agent::context::over_hard_limit(estimate(messages), capacity) {
             return Ok(None);
         }
-        // L4 兜底：子代理兜底仅在阶段配置声明了该工具时可用（决策 45：默认关闭）
+        // L4 兜底（决策 105 / 148⑦）：首选是分批 / 拆子代理，但那需要真正实现分批执行；
+        // v1 **未实现**分批与子代理拆分，因此**一律**挂 pending(context_overflow) 交用户处置。
+        // 关键：绝不能因为「首选动作未实现」就放行继续跑——那会让超硬限的节点无限循环。
         let spawn_sub_agent = declared_tools.iter().any(|t| t == "spawn_sub_agent");
         let plan = crate::agent::context::plan_l4(cursor.stage, cursor.node, spawn_sub_agent);
-        let Some(kind) = crate::agent::context::l4_pending_kind(plan) else {
-            // 开启了子代理（批处理 / 拆子代理）→ 本票不实现拆分执行，按未开启收口
-            return Ok(None);
-        };
+        if plan.action != crate::agent::context::L4Action::PendingContextOverflow {
+            tracing::warn!(
+                task = %task.id,
+                stage = %cursor.stage,
+                node = %cursor.node,
+                action = ?plan.action,
+                "L4 首选动作（分批 / 子代理拆分）v1 未实现，按未开启收口为 pending(context_overflow)"
+            );
+        }
         tracing::warn!(
             task = %task.id,
             stage = %cursor.stage,
@@ -1846,7 +1866,7 @@ impl Executor {
             "压缩后仍超硬限，挂 pending(context_overflow)（§12.13 L4）"
         );
         Ok(Some(PendingReason::new(
-            kind,
+            crate::types::PendingKind::ContextOverflow,
             cursor.stage,
             cursor.node,
             "上下文压缩后仍超过硬限，请拆分任务 / 换长上下文模型 / 取消",
@@ -3104,43 +3124,23 @@ fn workdirs_line(worktree: &str, task_dir: &str) -> String {
     format!("worktree：{worktree}\n任务目录：{task_dir}")
 }
 
-/// 决策 126：backtrack blockers 写在任务目录 `backtrack-feedback.md`，
-/// architect-design 重入（validate_input / execute）的 user prompt 注入该内容；
-/// 首轮（文件尚不存在）为空不渲染。
-fn backtrack_feedback_segment(
+/// architect-design 重入时从任务目录注入的反馈文件段（首轮为空不渲染）。
+///
+/// 三处注入同构、只差文件名（决策 126 / 79 / 138），共用此读取器：
+/// - `backtrack-feedback.md`：sync-check backtrack 的双方 blockers（决策 126）；
+/// - `user-input.md`：`info_insufficient` 的用户补充输入（决策 79 / 票 08）；
+/// - `retry-feedback.md`：develop / test 重试耗尽回架构设计的失败摘要（决策 138）。
+fn architect_reentry_segment(
     home: &Home,
     task_id: &str,
     stage: Stage,
     node: Node,
+    file: &str,
 ) -> Option<String> {
     if stage != Stage::ArchitectDesign || !matches!(node, Node::ValidateInput | Node::Execute) {
         return None;
     }
-    std::fs::read_to_string(home.task_file(task_id, "backtrack-feedback.md"))
-        .ok()
-        .filter(|s| !s.trim().is_empty())
-}
-
-/// decision 79 / 票 08：`info_insufficient` 的补充输入注入 validate_input 重入 prompt。
-///
-/// 补充输入在 resume 时落任务目录 `user-input.md`，重入 architect-design
-/// validate_input / execute 时注入；首轮无该文件 → 不渲染。
-fn user_input_segment(home: &Home, task_id: &str, stage: Stage, node: Node) -> Option<String> {
-    if stage != Stage::ArchitectDesign || !matches!(node, Node::ValidateInput | Node::Execute) {
-        return None;
-    }
-    std::fs::read_to_string(home.task_file(task_id, "user-input.md"))
-        .ok()
-        .filter(|s| !s.trim().is_empty())
-}
-
-/// decision 138 / 票 08：develop / test 的 `retry_exhausted` 回架构设计时，系统把重试历史
-/// 摘要写入任务目录 `retry-feedback.md`；architect-design 重入时注入（首轮为空不渲染）。
-fn retry_feedback_segment(home: &Home, task_id: &str, stage: Stage, node: Node) -> Option<String> {
-    if stage != Stage::ArchitectDesign || !matches!(node, Node::ValidateInput | Node::Execute) {
-        return None;
-    }
-    std::fs::read_to_string(home.task_file(task_id, "retry-feedback.md"))
+    std::fs::read_to_string(home.task_file(task_id, file))
         .ok()
         .filter(|s| !s.trim().is_empty())
 }
@@ -3368,7 +3368,13 @@ mod tests {
 
         // 首轮：反馈文件不存在 → 不渲染（决策 126「首轮为空不渲染」）
         assert_eq!(
-            backtrack_feedback_segment(&home, "t1", Stage::ArchitectDesign, Node::ValidateInput),
+            architect_reentry_segment(
+                &home,
+                "t1",
+                Stage::ArchitectDesign,
+                Node::ValidateInput,
+                "backtrack-feedback.md"
+            ),
             None
         );
 
@@ -3377,32 +3383,55 @@ mod tests {
             "dev blockers：[\"缺少数据流定义\"]\n",
         )
         .unwrap();
-        assert!(backtrack_feedback_segment(
+        assert!(architect_reentry_segment(
             &home,
             "t1",
             Stage::ArchitectDesign,
-            Node::ValidateInput
+            Node::ValidateInput,
+            "backtrack-feedback.md"
         )
         .is_some());
-        assert!(
-            backtrack_feedback_segment(&home, "t1", Stage::ArchitectDesign, Node::Execute)
-                .is_some()
-        );
+        assert!(architect_reentry_segment(
+            &home,
+            "t1",
+            Stage::ArchitectDesign,
+            Node::Execute,
+            "backtrack-feedback.md"
+        )
+        .is_some());
 
         // 决策 126 的注入范围只有 validate_input / execute
         assert_eq!(
-            backtrack_feedback_segment(&home, "t1", Stage::ArchitectDesign, Node::ValidateOutput),
+            architect_reentry_segment(
+                &home,
+                "t1",
+                Stage::ArchitectDesign,
+                Node::ValidateOutput,
+                "backtrack-feedback.md"
+            ),
             None
         );
         assert_eq!(
-            backtrack_feedback_segment(&home, "t1", Stage::Develop, Node::Execute),
+            architect_reentry_segment(
+                &home,
+                "t1",
+                Stage::Develop,
+                Node::Execute,
+                "backtrack-feedback.md"
+            ),
             None
         );
 
         // 空文件（纯空白）不渲染
         std::fs::write(home.task_file("t1", "backtrack-feedback.md"), "  \n").unwrap();
         assert_eq!(
-            backtrack_feedback_segment(&home, "t1", Stage::ArchitectDesign, Node::ValidateInput),
+            architect_reentry_segment(
+                &home,
+                "t1",
+                Stage::ArchitectDesign,
+                Node::ValidateInput,
+                "backtrack-feedback.md"
+            ),
             None
         );
     }

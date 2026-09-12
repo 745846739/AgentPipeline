@@ -251,7 +251,8 @@ CREATE TABLE IF NOT EXISTS kanban_transitions (
 ```sql
 CREATE TABLE IF NOT EXISTS kanban_node_conversations (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
-    task_id TEXT NOT NULL,
+    task_id TEXT,                       -- 任务级会话的所属任务；项目级伪阶段为 NULL
+    project_id TEXT,                    -- 项目级伪阶段（project_analysis）的归属（票 10）；任务级为 NULL
     run_id INTEGER NOT NULL,            -- 关联 kanban_node_runs.id（决策 77）
     stage TEXT NOT NULL,
     node TEXT NOT NULL,
@@ -265,7 +266,9 @@ CREATE TABLE IF NOT EXISTS kanban_node_conversations (
     created_at TEXT NOT NULL,
     archived_at TEXT,                   -- 重试归档标记（决策 113 同构）：非 NULL = 历史 attempt，列表默认过滤
     FOREIGN KEY (task_id) REFERENCES kanban_tasks(id),
-    FOREIGN KEY (run_id) REFERENCES kanban_node_runs(id)
+    FOREIGN KEY (project_id) REFERENCES kanban_projects(id),
+    FOREIGN KEY (run_id) REFERENCES kanban_node_runs(id),
+    CHECK ((task_id IS NOT NULL) <> (project_id IS NOT NULL))   -- 归属恰好其一（决策 100 / 票 10）
 );
 ```
 
@@ -521,7 +524,7 @@ command_finished (exit_code=0, duration_ms=3200)
 | `GET /tasks/{id}/commands/{cmd_id}/output` | 完整 stdout（从卸载文件读取） |
 
 **安全：**
-- 命令**脱敏**：URL 中的 credentials、`--token` 参数、环境变量值替换为 `***` 后存储
+- 命令**脱敏**：URL 中的 credentials、`--token` 参数、**敏感名环境变量**（名含 `TOKEN`/`SECRET`/`KEY`/`PASSWORD`/`PASSWD`/`CREDENTIAL`/`AUTH` 的 `NAME=value`、`export NAME=value`、`$NAME`/`${NAME}` 展开）替换为 `***` 后存储（票 15 / 决策 118：按**变量名**判定；`PATH=`、纯数字、已含 `***` 的值与 `FOO=secret` 这类非敏感名保留，取舍见 `crates/core/src/agent/sanitize.rs` 模块文档）
 - 输出脱敏：正则过滤疑似密钥（`sk-*`、`ghp_*`、长 base64）——在结果**回填 agent messages 之前**执行（决策 118）：agent 看到的即脱敏后文本，落库与 context 同源，密钥既不进日志也不进会话；误伤面（合法长 base64 被打码）为已知代价
 - **cwd 约束（如实描述，决策 104）：** `cwd` 默认取 worktree，这**只是卫生默认值，不构成安全边界**。v1 **不做系统级沙箱**，`run_command` 的 shell 不受限——agent 可以通过 `cd`、绝对路径、子 shell 等方式访问任务目录与 worktree 之外的任何路径。跨任务污染与读取本机明文密钥（§12.14）**系统不阻止**，只能靠本表的命令日志事后审计。文件工具（`read_file` / `write_file` / `edit_file` / `delete_file` / `list_dir`）**受** `FileToolPolicy` 强制约束（§10.6.2）。
 
@@ -994,9 +997,12 @@ pub fn extract_metadata(response: &AgentResponse) -> Result<(Option<serde_json::
 ```rust
 // crates/core/src/agent/context.rs
 
-pub fn estimate_context_capacity(model: &str, system_prompt: &str, user_prompt: &str) -> ContextCapacity {
-    // 窗口大小来自 provider/model 配置（存 DB，界面可改），内置注册表为默认值（决策 46）
-    let window = model_context_window(model);
+pub fn estimate_context_capacity(model_window: usize, system_prompt: &str, user_prompt: &str, settings: &Settings) -> ContextCapacity {
+    // 窗口大小取自解析后的 provider 行（`providers.context_window`，决策 46 / 111 / 110：
+    // provider 表即注册表，前端可改）。无可用 provider（测试 FakeAgent / 纯代码场景）
+    // 时跳过分档——**不臆造窗口**；provider 存在但 context_window 未登记（0）则显式失败，
+    // 不静默取默认（决策 110）。
+    let window = model_window;
     let reserved_system = count_tokens(system_prompt);
     let reserved_user = count_tokens(user_prompt);
     ContextCapacity {
@@ -1105,6 +1111,10 @@ L3 后仍超限时的降级路径：
 ```
 
 **子代理拆分是首选兜底**（§12.8），但需在阶段配置中开启 `spawn_sub_agent`：把"读 20 个文件"拆成 5 个子代理各读 4 个并返回摘要，父代理只接收摘要，context 天然可控。未开启时直接进入 `pending(context_overflow)`。
+
+> **v1 实现（票 04）**：分批执行与子代理拆分**尚未实现**，因此压缩后仍超硬限时**一律**挂 `pending(context_overflow)` 交用户处置（即使阶段配置开了 `spawn_sub_agent` 也走这条——首选动作未实现时**不放行继续跑**，否则超硬限节点会无限循环）。用户动作集为「拆分任务 / 换模型 / 取消」（决策 105）。
+
+**闸门复检注入的体积上界（票 09）：** 复检段读闸门命令的完整日志（`gate-output-{stage}.log`）；注入上限 120k 字符，超限按「首 ⅔ + 尾 ⅓」截断并在正文里写明省略字符数与完整日志路径（**不静默回退到首尾预览**）。
 
 #### 12.13.4 各节点的上下文策略
 

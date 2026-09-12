@@ -173,22 +173,34 @@ pub async fn analyze(
         // 项目级伪阶段的独立观测行（票 10 / 决策 48 / 100）：无任务、无游标，
         // 以 project_id 归属；`agent_type = pseudo:project_analysis` 非 system，
         // 因此计入全局 total_calls（决策 130 ②）。
+        // 落库失败**显式告警**（观测面缺失必须可见，不静默吞掉）。
+        let run_id = match store
+            .insert_project_run(&NewProjectRun {
+                project_id: project.id.clone(),
+                stage: Stage::Init,
+                node: Node::Execute,
+                attempt: 1,
+                agent_type: PseudoStage::ProjectAnalysis.agent_type().to_string(),
+            })
+            .await
+        {
+            Ok(id) => Some(id),
+            Err(e) => {
+                tracing::warn!(
+                    project = %project.id,
+                    error = %e,
+                    "project_analysis 观测 run 落库失败，本次分析缺少独立观测行"
+                );
+                None
+            }
+        };
         let result = match executor {
             Some(ex) => {
-                let run_id = store
-                    .insert_project_run(&NewProjectRun {
-                        project_id: project.id.clone(),
-                        stage: Stage::Init,
-                        node: Node::Execute,
-                        attempt: 1,
-                        agent_type: PseudoStage::ProjectAnalysis.agent_type().to_string(),
-                    })
-                    .await;
                 let started = std::time::Instant::now();
                 match ex.project_analysis(&project, facts.clone()).await {
                     Ok(merged) => {
                         // 会话行：摘要属于观测面，metadata 存完整合并结果（含 summary）
-                        if let Ok(run_id) = run_id {
+                        if let Some(run_id) = run_id {
                             let _ = store
                                 .finish_run(
                                     run_id,
@@ -225,7 +237,7 @@ pub async fn analyze(
                     Err(e) => {
                         // LLM 不可用：既有降级不回退——保留确定事实 + 记摘要错误；
                         // run 行按决策 100 收尾为失败（不落会话，与 task 级伪阶段一致）。
-                        if let Ok(run_id) = run_id {
+                        if let Some(run_id) = run_id {
                             let _ = store
                                 .finish_run(
                                     run_id,

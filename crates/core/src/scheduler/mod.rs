@@ -133,6 +133,12 @@ impl KanbanScheduler {
     async fn check_timeouts(&self, report: &mut TickReport) -> Result<()> {
         let now = self.clock.now();
         let stage_configs = self.store.list_stage_configs().await?;
+        // 历史 run 全量取一次，供自适应告警复用（票 17）——不要在每个 run 上重扫。
+        let history = if self.settings.adaptive_timeout_enabled {
+            Some(self.store.all_runs().await?)
+        } else {
+            None
+        };
 
         for run in self.store.active_runs().await? {
             // 项目级伪阶段 run（票 10）无任务 / 游标，不属于节点超时语义，跳过
@@ -155,8 +161,9 @@ impl KanbanScheduler {
 
             // 决策 66 / 票 17：自适应 P50/P90 **只用于告警**——在任何超时判定之前
             // 独立跑一遍，且不把分位数传给 `is_timed_out`。
-            if self.settings.adaptive_timeout_enabled {
-                self.maybe_alert_slow_run(&run, now, report).await?;
+            if let Some(history) = &history {
+                self.maybe_alert_slow_run(&run, now, history, report)
+                    .await?;
             }
 
             if is_timed_out(&run, now, idle, max_duration).is_none() {
@@ -176,14 +183,13 @@ impl KanbanScheduler {
         &self,
         run: &NodeRun,
         now: chrono::DateTime<chrono::Utc>,
+        history: &[NodeRun],
         report: &mut TickReport,
     ) -> Result<()> {
         let Some(task_id) = run.task_id.clone() else {
             return Ok(());
         };
-        // 该节点全部历史 run（成功样本由 metrics 口径筛出）
-        let history = self.store.all_runs().await?;
-        let Some(p) = crate::metrics::duration_percentiles(&history, run.stage, run.node) else {
+        let Some(p) = crate::metrics::duration_percentiles(history, run.stage, run.node) else {
             return Ok(()); // 冷启动 / 样本不足：不展示、不告警
         };
         let elapsed_ms = (now - run.started_at).num_milliseconds().max(0) as u64;

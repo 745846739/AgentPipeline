@@ -627,10 +627,13 @@ CREATE TABLE IF NOT EXISTS kanban_stage_outputs (
 );
 
 -- 节点执行记录（可观测性，决策 63）：主代理会话与 run 1:1
+-- 归属二选一（票 10 / 决策 100）：任务级 run 有 task_id + cursor_id；
+-- 项目级伪阶段（project_analysis）无任务无游标，改以 project_id 归属。
 CREATE TABLE IF NOT EXISTS kanban_node_runs (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
-    task_id TEXT NOT NULL,
-    cursor_id TEXT NOT NULL,           -- 归属哪条游标（决策 80/82）；游标行只归档不删除，外键永不悬空（决策 113）
+    task_id TEXT,                      -- 任务级 run 的所属任务；项目级伪阶段为 NULL
+    cursor_id TEXT,                    -- 归属哪条游标（决策 80/82）；游标行只归档不删除，外键永不悬空（决策 113）
+    project_id TEXT,                   -- 项目级伪阶段的归属（票 10）；任务级为 NULL
     stage TEXT NOT NULL,
     node TEXT NOT NULL,
     attempt INTEGER NOT NULL DEFAULT 1,
@@ -651,7 +654,9 @@ CREATE TABLE IF NOT EXISTS kanban_node_runs (
     finished_at TEXT,
     FOREIGN KEY (task_id) REFERENCES kanban_tasks(id),
     FOREIGN KEY (cursor_id) REFERENCES kanban_node_cursors(cursor_id),
-    FOREIGN KEY (parent_run_id) REFERENCES kanban_node_runs(id)
+    FOREIGN KEY (project_id) REFERENCES kanban_projects(id),
+    FOREIGN KEY (parent_run_id) REFERENCES kanban_node_runs(id),
+    CHECK ((task_id IS NOT NULL) <> (project_id IS NOT NULL))   -- 归属恰好其一（决策 100 / 票 10）
 );
 
 -- 项目管理
