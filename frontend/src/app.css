@@ -1,0 +1,268 @@
+/* ─────────────────────────────────────────────────────────────
+   AgentPipeline · 夜间调度台
+   design/frontend-design.md §3 视觉令牌（唯一权威来源）
+   ───────────────────────────────────────────────────────────── */
+
+:root {
+  /* §3.1 色彩 */
+  --ink-900: #0c121b; /* 页面底色，港湾蓝黑 */
+  --ink-800: #111a26; /* 面板 / 卡片 */
+  --ink-700: #16212f; /* 悬浮 / 二级面板 */
+  --line: #223246; /* 描边、分隔线 */
+  --line-soft: #1b2838; /* 弱分隔、轨道暗段 */
+  --text-hi: #e9eff7; /* 主文本 */
+  --text-2: #9db0c5; /* 次文本 */
+  --text-3: #64788f; /* 弱文本、占位 */
+
+  --signal-go: #3fd68f; /* running / 通过 / 游标亮段 */
+  --signal-caution: #f2b33d; /* pending / stalled（唯一告警色） */
+  --signal-stop: #e5544b; /* failed / 打回 / 破坏性动作 */
+  --signal-done: #7c93ac; /* done（刻意退后） */
+
+  --branch-dev: #4cc3e0; /* develop-design 支线 */
+  --branch-test: #a78bfa; /* test-design 支线 */
+
+  --diff-add: #7ee2b0;
+  --diff-add-bg: #16342a;
+  --diff-del: #f0918a;
+  --diff-del-bg: #3a2320;
+
+  /* §3.2 字体 */
+  --font-ui: 'Barlow', 'PingFang SC', 'Hiragino Sans GB', 'Noto Sans SC', -apple-system,
+    BlinkMacSystemFont, 'Segoe UI', sans-serif;
+  --font-cond: 'Barlow Semi Condensed', 'Barlow', 'PingFang SC', 'Noto Sans SC', sans-serif;
+  --font-mono: 'JetBrains Mono', 'SF Mono', Menlo, Consolas, monospace;
+
+  /* §3.3 形状与密度（全局只有两档圆角） */
+  --r-panel: 6px;
+  --r-pill: 3px;
+  --rail-col-width: 280px;
+  --rail-col-gap: 12px;
+  --detail-max: 980px;
+}
+
+* {
+  margin: 0;
+  padding: 0;
+  box-sizing: border-box;
+}
+
+html {
+  -webkit-font-smoothing: antialiased;
+  text-rendering: optimizeLegibility;
+}
+
+body {
+  background: var(--ink-900);
+  color: var(--text-hi);
+  font-family: var(--font-ui);
+  font-size: 13px; /* 基准 */
+  line-height: 1.55;
+}
+
+button {
+  font-family: inherit;
+  font-size: inherit;
+  color: inherit;
+  background: none;
+  border: none;
+  cursor: pointer;
+}
+
+a {
+  color: var(--branch-dev);
+  text-decoration: none;
+  cursor: pointer;
+}
+a:hover {
+  text-decoration: underline;
+}
+
+input,
+textarea,
+select {
+  font-family: inherit;
+  font-size: inherit;
+  color: var(--text-hi);
+}
+
+/* 可执行物专用等宽（§2 原则 4） */
+.mono {
+  font-family: var(--font-mono);
+  font-variant-numeric: tabular-nums;
+}
+.num {
+  font-variant-numeric: tabular-nums;
+}
+.cond {
+  font-family: var(--font-cond);
+  font-weight: 600;
+  letter-spacing: 0.03em;
+}
+
+/* ── 通用控件 ── */
+.panel {
+  background: var(--ink-800);
+  border: 1px solid var(--line);
+  border-radius: var(--r-panel);
+}
+
+.btn {
+  padding: 5px 11px;
+  border-radius: var(--r-pill);
+  font-size: 12px;
+  font-weight: 500;
+  border: 1px solid var(--line);
+  color: var(--text-2);
+  background: var(--ink-700);
+  transition: border-color 0.15s, color 0.15s, background 0.15s;
+}
+.btn:hover:not(:disabled) {
+  color: var(--text-hi);
+  border-color: var(--text-3);
+}
+.btn:disabled {
+  opacity: 0.45;
+  cursor: not-allowed;
+}
+.btn.solid {
+  background: var(--signal-caution);
+  border-color: var(--signal-caution);
+  color: #1a1206;
+}
+.btn.solid:hover:not(:disabled) {
+  background: #f7c45e;
+  border-color: #f7c45e;
+  color: #1a1206;
+}
+.btn.quiet {
+  border-color: transparent;
+  background: transparent;
+  color: var(--text-3);
+}
+.btn.danger {
+  color: var(--signal-stop);
+  border-color: transparent;
+}
+.btn.danger:hover:not(:disabled) {
+  border-color: var(--signal-stop);
+}
+.btn.block {
+  width: 100%;
+  text-align: center;
+}
+.btn .spin {
+  display: inline-block;
+  width: 9px;
+  height: 9px;
+  margin-right: 6px;
+  border: 1.5px solid currentColor;
+  border-top-color: transparent;
+  border-radius: 50%;
+  animation: btn-spin 0.7s linear infinite;
+}
+@keyframes btn-spin {
+  to {
+    transform: rotate(360deg);
+  }
+}
+
+.input {
+  width: 100%;
+  background: var(--ink-900);
+  border: 1px solid var(--line);
+  border-radius: var(--r-pill);
+  color: var(--text-hi);
+  font-size: 12px;
+  padding: 6px 9px;
+}
+.input::placeholder {
+  color: var(--text-3);
+}
+.input:focus {
+  outline: none;
+  border-color: var(--text-3);
+}
+textarea.input {
+  resize: vertical;
+  min-height: 60px;
+  line-height: 1.5;
+}
+
+/* 焦点可达（§11.7 打磨） */
+:focus-visible {
+  outline: 2px solid var(--branch-dev);
+  outline-offset: 1px;
+}
+
+/* pending 琥珀呼吸（§3.4） */
+@keyframes breath {
+  0%,
+  100% {
+    opacity: 1;
+  }
+  50% {
+    opacity: 0.4;
+  }
+}
+.warn-dot {
+  animation: breath 2.4s ease-in-out infinite;
+}
+
+/* 流式尾随光标 */
+@keyframes blink {
+  50% {
+    opacity: 0;
+  }
+}
+.streaming::after {
+  content: '▍';
+  color: var(--signal-go);
+  animation: blink 1s steps(2) infinite;
+}
+
+/* 轨道自绘（唯一主动效，§3.4） */
+@keyframes rail-draw {
+  to {
+    stroke-dashoffset: 0;
+  }
+}
+.rail-draw {
+  stroke-dasharray: 1200;
+  stroke-dashoffset: 1200;
+  animation: rail-draw 0.6s ease-out forwards;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    animation: none !important;
+    transition: none !important;
+  }
+  .rail-draw {
+    stroke-dashoffset: 0;
+  }
+}
+
+/* 滚动条（夜间调度台） */
+::-webkit-scrollbar {
+  width: 10px;
+  height: 10px;
+}
+::-webkit-scrollbar-thumb {
+  background: var(--line);
+  border-radius: 5px;
+}
+::-webkit-scrollbar-track {
+  background: transparent;
+}
+
+.visually-hidden {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  overflow: hidden;
+  clip: rect(0 0 0 0);
+  white-space: nowrap;
+}

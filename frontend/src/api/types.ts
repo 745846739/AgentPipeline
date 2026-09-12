@@ -1,0 +1,561 @@
+/**
+ * 前端 TS 类型 —— 与 docs/data-model.md §4 及 crates/core/src/types.rs、
+ * crates/app/src/routes/*.rs 的**实际** JSON 序列化逐字段对齐。
+ *
+ * 注意（与 docs 的偏差，实现时以代码为准）：
+ * - `GET /tasks` 的每条任务在 Task 之上附加 `branches`（游标摘要）与 `blocks`；
+ *   `GET /tasks/{id}` 把 `cursors` / `allowed_actions` / `depends_on` / `blocks` 平铺在顶层。
+ * - 游标摘要不含 task_id / created_at（见 routes/tasks.rs 的 `cursors_json`）。
+ * - `messages_json` 是 OpenAI 风格的 Message[]（crates/core/src/agent/client.rs）。
+ */
+
+export type TaskStatus =
+  | 'queued'
+  | 'waiting'
+  | 'running'
+  | 'pending'
+  | 'done'
+  | 'failed'
+  | 'cancelled';
+
+export type Stage =
+  | 'init'
+  | 'architect-design'
+  | 'develop-design'
+  | 'test-design'
+  | 'sync-check'
+  | 'develop'
+  | 'review'
+  | 'test'
+  | 'merge'
+  | 'done';
+
+export type Node = 'validate_input' | 'execute' | 'validate_output';
+
+export type CursorStatus = 'active' | 'waiting_join' | 'pending' | 'archived';
+
+export type PendingKind =
+  | 'info_insufficient'
+  | 'conflict_wait'
+  | 'retry_exhausted'
+  | 'user_decision'
+  | 'merge_approval'
+  | 'human_review'
+  | 'dependency_failed'
+  | 'context_overflow'
+  | 'timeout';
+
+export type ReviewMode = 'agent' | 'human';
+
+export type TransitionTrigger =
+  | 'normal'
+  | 'retry'
+  | 'node_retry'
+  | 'kickback'
+  | 'user_resume'
+  | 'auto_resume'
+  | 'timeout'
+  | 'start';
+
+export type CommandSource = 'agent' | 'system';
+
+export interface PendingContext {
+  /** duplicate_risk | dirty_worktree | test_code_issue | judge_disagreement | ... */
+  kind?: string;
+  /** conflict_wait 专用：全部冲突任务 id（决策 102）。 */
+  conflict_task_ids?: string[];
+  /** 闸门失败详情（决策 85）。 */
+  gate_failure_output?: string;
+  /** 其余自由字段平铺。 */
+  [key: string]: unknown;
+}
+
+/** 决策 130：动作表 key = (type, context.kind)。 */
+export interface PendingReason {
+  type: PendingKind;
+  stage: Stage;
+  node: Node;
+  message: string;
+  suggested_actions?: string[];
+  context?: PendingContext;
+}
+
+export interface Task {
+  id: string;
+  project_id: string;
+  title: string;
+  description: string;
+  status: TaskStatus;
+  /** 焦点游标投影（决策 80/92），只供看板展示与筛选。 */
+  current_stage: Stage;
+  current_node: Node;
+  validate_attempts: number;
+  pending_reason: PendingReason | null;
+  worktree_path: string | null;
+  branch_name: string | null;
+  total_tokens: number;
+  total_calls: number;
+  review_mode: ReviewMode;
+  model_override: string | null;
+  archived_at: string | null;
+  stalled: boolean;
+  executor_owner: string | null;
+  created_at: string;
+  updated_at: string;
+}
+
+/** `cursors_json` 的形态（routes/tasks.rs）。 */
+export interface BranchCursor {
+  cursor_id: string;
+  branch: string;
+  stage: Stage;
+  node: Node;
+  status: CursorStatus;
+  validate_attempts: number;
+  skipped_to_join: boolean;
+  pending_reason: PendingReason | null;
+}
+
+/** `GET /tasks` 列表项的附加字段。 */
+export interface TaskListItem extends Task {
+  branches: BranchCursor[];
+  blocks: string[];
+}
+
+export type ActionKind = 'resume' | 'side_effect' | 'wait';
+
+export interface ActionTarget {
+  stage: Stage;
+  node: Node;
+  node_kind?: string;
+}
+
+/** 后端下发的动作项（crates/core/src/actions.rs）。前端纯渲染。 */
+export interface AllowedAction {
+  action: string;
+  kind: ActionKind;
+  label: string;
+  cursor_id?: string;
+  requires_input?: boolean;
+  target?: ActionTarget;
+}
+
+export interface TaskDetail {
+  task: Task;
+  cursors: BranchCursor[];
+  allowed_actions: AllowedAction[];
+  depends_on: string[];
+  blocks: string[];
+}
+
+export interface Transition {
+  id: number;
+  task_id: string;
+  branch: string;
+  from_stage: Stage | null;
+  from_node: Node | null;
+  to_stage: Stage;
+  to_node: Node;
+  trigger: TransitionTrigger;
+  reason: string | null;
+  created_at: string;
+}
+
+export interface FlowResponse {
+  transitions: Transition[];
+  cursors: BranchCursor[];
+}
+
+export interface ConversationSummary {
+  run_id: number;
+  stage: Stage;
+  node: Node;
+  attempt: number;
+  agent_type: string;
+  parent_run_id: number | null;
+  prompt_tokens: number;
+  completion_tokens: number;
+}
+
+export interface ToolCallWire {
+  id: string;
+  type: string;
+  function: { name: string; arguments: string };
+}
+
+export interface ChatMessage {
+  role: 'system' | 'user' | 'assistant' | 'tool';
+  content?: string | null;
+  tool_calls?: ToolCallWire[];
+  tool_call_id?: string | null;
+  name?: string | null;
+}
+
+export interface NodeConversation {
+  id: number;
+  task_id: string;
+  run_id: number;
+  stage: Stage;
+  node: Node;
+  attempt: number;
+  agent_type: string;
+  parent_run_id: number | null;
+  messages_json: ChatMessage[];
+  metadata_json: unknown;
+  prompt_tokens: number;
+  completion_tokens: number;
+  created_at: string;
+}
+
+export interface NodeCommand {
+  id: number;
+  task_id: string;
+  run_id: number | null;
+  stage: Stage;
+  node: Node;
+  source: CommandSource;
+  command: string;
+  cwd: string;
+  exit_code: number | null;
+  stdout_path: string | null;
+  stdout_preview: string | null;
+  stderr_preview: string | null;
+  duration_ms: number | null;
+  started_at: string;
+  finished_at: string | null;
+}
+
+export interface Project {
+  id: string;
+  name: string;
+  local_path: string;
+  default_branch: string;
+  language: string | null;
+  test_framework: string | null;
+  lint_command: string | null;
+  agents_md_path: string | null;
+  created_at: string;
+}
+
+export type FileDiffStatus = 'added' | 'modified' | 'deleted';
+
+export interface FileDiffDetail {
+  path: string;
+  additions: number;
+  deletions: number;
+  status: FileDiffStatus;
+}
+
+export interface DiffStats {
+  files_changed: number;
+  insertions: number;
+  deletions: number;
+  file_details: FileDiffDetail[];
+}
+
+export interface Provider {
+  id: string;
+  vendor: string;
+  model: string;
+  context_window: number;
+  base_url: string | null;
+  /** 读接口只回显 `***`（决策 112）。 */
+  api_key: string | null;
+  enabled: boolean;
+}
+
+export interface CreateTaskPayload {
+  project_id: string;
+  title: string;
+  description?: string;
+  depends_on?: string[];
+  review_mode?: ReviewMode;
+  model_override?: string;
+}
+
+export interface ResumePayload {
+  action: string;
+  cursor_id?: string;
+  target_stage?: Stage;
+  target_node?: Node;
+  input?: string;
+}
+
+/* ─────────────── SSE 事件（crates/core/src/sse.rs，决策 76/84/123）─────────────── */
+
+export type ToolPhase = 'start' | 'end' | 'error';
+
+export interface SseBase {
+  type: SseEventType;
+  task_id: string;
+  branch: string;
+}
+
+export type SseEventType =
+  | 'node_started'
+  | 'node_finished'
+  | 'stage_changed'
+  | 'cursor_changed'
+  | 'pending'
+  | 'pending_updated'
+  | 'command_started'
+  | 'command_output'
+  | 'command_finished'
+  | 'conversation_delta'
+  | 'tool_event'
+  | 'stalled'
+  | 'task_cancelled'
+  | 'task_done'
+  | 'task_failed';
+
+export interface NodeStartedEvent extends SseBase {
+  type: 'node_started';
+  stage: Stage;
+  node: Node;
+  attempt: number;
+  run_id: number;
+}
+export interface NodeFinishedEvent extends SseBase {
+  type: 'node_finished';
+  stage: Stage;
+  node: Node;
+  attempt: number;
+  run_id: number;
+  status: string;
+  duration_ms: number;
+  prompt_tokens: number;
+  completion_tokens: number;
+}
+export interface StageChangedEvent extends SseBase {
+  type: 'stage_changed';
+  from_stage: Stage | null;
+  from_node: Node | null;
+  to_stage: Stage;
+  to_node: Node;
+  trigger: string;
+  reason: string | null;
+}
+export interface CursorChangedEvent extends SseBase {
+  type: 'cursor_changed';
+  cursor_id: string;
+  status: string;
+  stage: Stage;
+  node: Node;
+}
+export interface PendingEvent extends SseBase {
+  type: 'pending';
+  cursor_id: string;
+  reason: PendingReason;
+}
+export interface PendingUpdatedEvent extends SseBase {
+  type: 'pending_updated';
+  cursor_id: string;
+  context: PendingContext;
+}
+export interface CommandStartedEvent extends SseBase {
+  type: 'command_started';
+  command_id: number;
+  command: string;
+  source: string;
+}
+export interface CommandOutputEvent extends SseBase {
+  type: 'command_output';
+  command_id: number;
+  chunk: string;
+}
+export interface CommandFinishedEvent extends SseBase {
+  type: 'command_finished';
+  command_id: number;
+  exit_code: number | null;
+  duration_ms: number;
+}
+export interface ConversationDeltaEvent extends SseBase {
+  type: 'conversation_delta';
+  run_id: number;
+  agent_type: string;
+  role: string;
+  text: string;
+  prompt_tokens: number;
+  completion_tokens: number;
+}
+export interface ToolEventEvent extends SseBase {
+  type: 'tool_event';
+  run_id: number;
+  tool: string;
+  phase: ToolPhase;
+  args_summary: string;
+}
+export interface StalledEvent extends SseBase {
+  type: 'stalled';
+  pending_hours: number;
+}
+export interface TaskCancelledEvent extends SseBase {
+  type: 'task_cancelled';
+}
+export interface TaskDoneEvent extends SseBase {
+  type: 'task_done';
+}
+export interface TaskFailedEvent extends SseBase {
+  type: 'task_failed';
+}
+
+export type SseEvent =
+  | NodeStartedEvent
+  | NodeFinishedEvent
+  | StageChangedEvent
+  | CursorChangedEvent
+  | PendingEvent
+  | PendingUpdatedEvent
+  | CommandStartedEvent
+  | CommandOutputEvent
+  | CommandFinishedEvent
+  | ConversationDeltaEvent
+  | ToolEventEvent
+  | StalledEvent
+  | TaskCancelledEvent
+  | TaskDoneEvent
+  | TaskFailedEvent;
+
+/* ─────────────── 配置与指标（票 22，crates/app/src/routes/{providers,projects,tasks}.rs）─────────────── */
+
+/** `POST /providers` 请求体（ProviderBody）。`id` 缺省由后端生成。 */
+export interface ProviderCreatePayload {
+  id?: string;
+  vendor: string;
+  model: string;
+  context_window: number;
+  base_url?: string;
+  api_key?: string;
+  enabled?: boolean;
+}
+
+/**
+ * `PATCH /providers/{id}` 请求体（PatchProvider）。
+ * 未提供的字段保持原值；`api_key` 传 `***` 后端也视为不修改（本前端更严格：直接省略）。
+ */
+export interface ProviderPatchPayload {
+  vendor?: string;
+  model?: string;
+  context_window?: number;
+  base_url?: string;
+  api_key?: string;
+  enabled?: boolean;
+}
+
+/** `POST /projects`（CreateProject）。`local_path` 创建后不可改（决策 29）。 */
+export interface ProjectCreatePayload {
+  name: string;
+  local_path: string;
+  default_branch?: string;
+}
+
+/** `PATCH /projects/{id}`（PatchProject）：面向前端可编辑字段。 */
+export interface ProjectPatchPayload {
+  name?: string;
+  default_branch?: string;
+  test_framework?: string;
+  lint_command?: string;
+}
+
+/** `kanban_project_analyses.status`（catalog.rs：running → done | failed）。 */
+export type AnalysisStatus = 'running' | 'done' | 'failed';
+
+/** 分析结果 JSON（routes/projects.rs::analyze 的 spawn 结果体）。 */
+export interface ProjectAnalysisResult {
+  language: string | null;
+  test_framework: string | null;
+  lint_command: string | null;
+  agents_md_path: string | null;
+  has_gitignore: boolean;
+  default_branch: string;
+  suspicious: unknown[];
+}
+
+/** `GET /projects/{id}/analysis`。 */
+export interface ProjectAnalysis {
+  analysis_id: string;
+  status: AnalysisStatus | string;
+  result: ProjectAnalysisResult | null;
+  error: string | null;
+}
+
+/** `POST /projects/analyze` → 202。 */
+export interface AnalyzeResponse {
+  analysis_id: string;
+}
+
+/** 阶段级聚合行（core metrics::StageMetric 的序列化形态）。 */
+export interface StageMetric {
+  stage: Stage;
+  total_runs: number;
+  avg_duration_ms: number;
+  /** attempt > 1 的比例（0..1）。 */
+  retry_rate: number;
+}
+
+/**
+ * `GET /metrics`（routes/tasks.rs::global_metrics）。
+ * `escape_events` 是 `Vec<(Option<String>, i64)>` → JSON 元组数组 `[stage|null, count]`。
+ */
+export interface GlobalMetrics {
+  tasks: number;
+  success_rate: number | null;
+  stage_aggregation: StageMetric[];
+  escape_events: Array<[string | null, number]>;
+  /** 全局首过率：validate_output 首次 attempt 即通过的比例（`crates/core/src/metrics.rs` 口径）。 */
+  validate_first_pass_rate?: number | null;
+  /** 全量 run 行 token 求和（prompt + completion）。 */
+  total_tokens?: number;
+  /** 全部 LLM run 行数（不含 `agent_type = "system"`，决策 130②）。 */
+  total_calls?: number;
+}
+
+/** `GET /tasks/{id}/metrics`（routes/tasks.rs::metrics）。 */
+export interface TaskMetrics {
+  total_tokens: number;
+  total_calls: number;
+  /** 任务表持久化的累计值；与实时求和可能短暂不一致（观测值）。 */
+  stored_total_tokens: number;
+  stored_total_calls: number;
+  stages: StageMetric[];
+  validate_first_pass_rate: number | null;
+}
+
+/* ─────────────── stage_configs（crates/app/src/routes/stage_configs.rs，票 22）─────────────── */
+
+/**
+ * 阶段级 agent 配置行（crates/core/src/types.rs::StageConfig）。
+ * 字段是**扁平**的；未设置的 Option 序列化为 `null`（非省略）。
+ */
+export interface StageConfig {
+  /** 真实阶段或伪阶段键（conflict_check / validator_cross_check / project_analysis）。 */
+  stage: string;
+  provider_id: string | null;
+  temperature: number | null;
+  max_tokens: number | null;
+  persona_path: string | null;
+  persona_append: string | null;
+  tools_json: unknown | null;
+  skills_json: unknown | null;
+  idle_timeout_sec: number | null;
+  max_duration_sec: number | null;
+  node_overrides_json: unknown | null;
+  updated_at: string;
+}
+
+/**
+ * `PUT /stage-configs/{stage}` 请求体（PutStageConfig）。
+ * **整条替换**：省略的字段被清空为默认（不是「保持原值」）。
+ */
+export interface StageConfigPutPayload {
+  provider_id?: string;
+  temperature?: number;
+  max_tokens?: number;
+  persona_path?: string;
+  persona_append?: string;
+  tools_json?: unknown;
+  skills_json?: unknown;
+  idle_timeout_sec?: number;
+  max_duration_sec?: number;
+  node_overrides_json?: unknown;
+}
