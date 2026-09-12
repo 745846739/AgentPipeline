@@ -4,7 +4,9 @@
 
 **Blocked by:** 11（执行器）、13（生产适配器）
 
-**Status:** ready-for-agent
+**Status:** done
+
+完成记录：`crates/app/src/runtime.rs` 接线 `KanbanScheduler.run_loop`（`tick_interval_sec`）+ 小时级 maintenance + 共享 shutdown watch（SIGINT 一次停全部，决策 54/55）；`main.rs` 组装 `ProductionLlm`/`Executor`/`RealProcessKiller` 并注入真实 `resume_hook`（review/merge-decision/resume 端点到执行器）；`run_command` 以独立进程组启动并回填真实 pgid（`process.rs` 新增 `spawn_in_own_process_group`，`CommandRecorder::set_process_group`，决策 66）。验收：`real_binary_advances_task_to_terminal_with_mock_llm`（真二进制 + mock LLM 到 done）、`run_command_records_real_process_group_id`。遗留：`run_command` 的流式输出 SSE（决策 100）仍未做（票面未要求）。
 
 - [ ] 启动即跑 run_loop（tick_interval_sec）与 maintenance 定时器；SIGINT 一并停掉（决策 54/55）
 - [ ] resume/review/merge-decision 端点经 resume_hook 真正驱动 executor；dependency_failed continue 例外不 spawn（决策 130⑤）

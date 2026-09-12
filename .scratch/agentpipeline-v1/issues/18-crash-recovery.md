@@ -4,7 +4,9 @@
 
 **Blocked by:** 17（生产接线）
 
-**Status:** ready-for-agent
+**Status:** done
+
+完成记录：新增 `tests/e2e/tests/crash_recovery.rs`（E2E-13，全 in-process，决策 152）：① `interrupted_node_resumes_after_restart_and_owner_cleanup`（develop.execute 中途 abort → 游标停中断节点 → `clear_executor_owners` 后可再 claim → 续跑至 done，上游节点不重跑、design_doc 产出唯一）；② `parallel_branches_recover_independently_and_join_survives_restart`（两分支各自中断/恢复，join 恰一次）；③ `waiting_join_survives_restart_and_join_advances_when_sibling_ready`（waiting_join 跨重启保留，另一分支就位后 join 推进）。遗留：SIGINT 信号本身按决策 152 仍不自动化（留手动）。
 
 - [ ] kill -9 注入测试（testkit killer 思路扩展到进程级）：重启后任务从各游标中断节点续跑至终态
 - [ ] 并行任务：两游标独立恢复，互不影响（决策 80）

@@ -4,7 +4,7 @@
 
 **Blocked by:** None（can start immediately）
 
-**Status:** ready-for-agent
+**Status:** done — `frontend/` Vite+Svelte5+TS 脚手架、18 令牌与 §3 字体/形状、8 列看板（双轨合并列 + 分支药丸 + 9 站迷你轨）、顶栏过滤与待办下拉、fetch 流式 SSE + reduce.ts（§9.1 逐事件）+ 退避重连/visibilitychange、NotificationPolicy（cooldown/quiet_hours/cancelled）落地；vitest 45 用例、svelte-check 0 错 0 警、vite build 全绿。playwright 两条冒烟按票注暂不跑（后端 E2E 基建属票 19/21）。
 
 - [ ] Vite + Svelte + TS 脚手架，视觉令牌对齐 design/frontend-design.md §3.1
 - [ ] 看板列 + 并行槽位 + 分支药丸渲染（数据源 GET /tasks 的 branches 摘要）
