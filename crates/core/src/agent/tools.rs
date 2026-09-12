@@ -921,6 +921,62 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn env_var_values_are_sanitized_in_output_and_command_log() {
+        // 票 15 / §12.4.4：环境变量值脱敏在**输出回填**与**命令记录**两条路径一致。
+        let s = setup(Stage::Develop);
+        let recorder = Arc::new(RecordingRecorder::default());
+        let executor = ToolExecutor::new(
+            s.home.clone(),
+            FileToolPolicy::new(vec![s.worktree.clone(), s.task_dir.clone()]),
+            Settings::default(),
+            Arc::new(NoKiller),
+        )
+        .with_recorder(recorder.clone());
+        // 命令自身含敏感环境变量赋值；输出回显同样的赋值
+        let out = executor
+            .execute(
+                &call(
+                    "run_command",
+                    serde_json::json!({"command": "export API_TOKEN=abc123value; echo \"API_TOKEN=abc123value PATH=$PATH\""}),
+                ),
+                &s.ctx,
+            )
+            .await
+            .unwrap();
+        // 工具结果（回填 agent messages）不含明文
+        assert!(
+            !out.content.contains("abc123value"),
+            "工具结果未脱敏：{}",
+            out.content
+        );
+        assert!(out.content.contains("API_TOKEN=***"));
+        // 命令记录同样不含明文
+        let starts = recorder.starts.lock().unwrap();
+        assert!(!starts[0].command.contains("abc123value"));
+        assert!(starts[0].command.contains("API_TOKEN=***"));
+    }
+
+    #[tokio::test]
+    async fn benign_env_var_values_survive_command_output() {
+        // 票 15：无害变量（PATH / 纯数字 / 非敏感名）不被误伤，输出原样保留。
+        let s = setup(Stage::Develop);
+        let out = s
+            .executor
+            .execute(
+                &call(
+                    "run_command",
+                    serde_json::json!({"command": "echo \"PATH=/usr/bin FOO=secret RETRIES=3\""}),
+                ),
+                &s.ctx,
+            )
+            .await
+            .unwrap();
+        assert!(out.content.contains("PATH=/usr/bin"));
+        assert!(out.content.contains("FOO=secret"));
+        assert!(out.content.contains("RETRIES=3"));
+    }
+
+    #[tokio::test]
     async fn large_output_is_offloaded_to_context_dir() {
         let s = setup(Stage::Develop);
         let settings = Settings {

@@ -1,14 +1,44 @@
 //! 脱敏（决策 118，§12.4.4）。
 //!
 //! 时机是硬要求（决策 118）：输出脱敏在结果**回填 agent messages 之前**执行——
-//! agent 看到的工具结果即脱敏后文本，落库与 context 同源。
-//! 误伤面（合法长 base64 被打码）是已知代价。
+//! agent 看到的工具结果即脱敏后文本，落库与 context 同源。四条路径共用本模块：
+//! 工具命令输出、命令记录（`kanban_node_commands.command`）、系统命令、工具结果。
+//!
+//! **脱敏契约（含取舍，代码本身看不出的约束）：**
+//! 1. 密钥形态（`sk-*` / `ghp_*` / 长 base64）、URL 内嵌凭据、`--token/--api-key/
+//!    --password/--secret` 取值一律打码；合法长 base64 被误伤是已知代价（决策 118）。
+//! 2. 环境变量按**变量名**判定，而非按值：仅当变量名含 `TOKEN / SECRET / KEY /
+//!    PASSWORD / PASSWD / CREDENTIAL / AUTH`（大小写不敏感，子串匹配）时，才把
+//!    `NAME=value`、`export NAME=value`、`${NAME}` / `$NAME` 展开打码。因此
+//!    `FOO=secret` 这类无害变量名**不会**被打码，即便值恰好叫 secret——这是为避免
+//!    过度打码（`PATH=`、纯数字、日志字段）而显式接受的假阴性；`GIT_AUTHOR_*` /
+//!    `*KEYBOARD*` 等含 `AUTH` / `KEY` 的无害名会被误伤，是同一取舍的另一面。
+//! 3. 值已是 `***` 时再打一次结果不变（幂等），无需特判。
+//! 4. `set -x` 的 `+ NAME=value` 形式可覆盖；但 shell 展开后的回显（`echo $TOKEN`
+//!    打印成 `echo abc`）在脱敏层无从还原——这是已知边界，不在此处兜底。
 
 use std::sync::OnceLock;
 
 use regex::Regex;
 
 const MASK: &str = "***";
+
+/// 变量名里出现即视为敏感的关键词（大小写不敏感，子串匹配；契约见模块文档）。
+const SECRET_NAME_HINTS: &[&str] = &[
+    "TOKEN",
+    "SECRET",
+    "KEY",
+    "PASSWORD",
+    "PASSWD",
+    "CREDENTIAL",
+    "AUTH",
+];
+
+/// 变量名是否含敏感标记。
+fn name_looks_secret(name: &str) -> bool {
+    let upper = name.to_ascii_uppercase();
+    SECRET_NAME_HINTS.iter().any(|hint| upper.contains(hint))
+}
 
 fn key_regexes() -> &'static [Regex] {
     static RES: OnceLock<Vec<Regex>> = OnceLock::new();
@@ -22,6 +52,33 @@ fn key_regexes() -> &'static [Regex] {
             Regex::new(r"[A-Za-z0-9+/]{40,}={0,2}").unwrap(),
         ]
     })
+}
+
+/// 环境变量赋值 / 展开的正则（契约与取舍见模块文档；按变量名判定）。
+fn env_regexes() -> &'static [Regex] {
+    static RES: OnceLock<Vec<Regex>> = OnceLock::new();
+    RES.get_or_init(|| {
+        vec![
+            // `NAME=value` / `export NAME=value`；值可为单双引号串或非空白串。
+            // 值首字符排除 `=`，避免把代码里的 `token == y` 误当成赋值。
+            // 变量名交给 name_looks_secret 判定，非敏感名原样返回。
+            Regex::new(
+                r#"(?P<prefix>\b(?:export\s+)?(?P<name>[A-Za-z_][A-Za-z0-9_]*)=)(?P<val>"(?:[^"\\]|\\.)*"|'(?:[^'\\]|\\.)*'|[^\s=]\S*)"#,
+            )
+            .unwrap(),
+            // `${NAME}` / `$NAME` 展开（保留 $ / ${} 形态便于审计）。
+            Regex::new(r"(?P<open>\$\{|\$)(?P<name>[A-Za-z_][A-Za-z0-9_]*)(?P<close>\})?")
+                .unwrap(),
+        ]
+    })
+}
+
+/// 值本身是否「无害」：纯数字或已是 `***`。
+///
+/// 取舍（模块文档已述）：纯数字值不打码，避免 `MAX_TOKENS=4096` / `AUTH_TIMEOUT=30`
+/// 这类数值配置被误伤；代价是全数字的弱口令（如 `PASSWORD=123456`）也不会打码。
+fn value_is_harmless(val: &str) -> bool {
+    val == MASK || val.chars().all(|c| c.is_ascii_digit())
 }
 
 fn credential_regexes() -> &'static [Regex] {
@@ -39,9 +96,35 @@ fn credential_regexes() -> &'static [Regex] {
     })
 }
 
-/// 文本脱敏：密钥形态与长 base64 一律替换为 `***`。
+/// 文本脱敏：密钥形态、URL / flag 凭据、敏感环境变量值一律替换为 `***`。
 pub fn sanitize_text(text: &str) -> String {
     let mut out = text.to_string();
+    // 环境变量先过：`TOKEN=sk-xxx` 若先走 key 正则会留下 `TOKEN=***`，
+    // 结果虽同，但放在前面让「按名判定」的意图对 `TOKEN=plainvalue` 也成立。
+    for re in env_regexes() {
+        out = re
+            .replace_all(&out, |caps: &regex::Captures| {
+                let name = caps.name("name").map(|m| m.as_str()).unwrap_or_default();
+                if !name_looks_secret(name) {
+                    return caps[0].to_string();
+                }
+                if let Some(prefix) = caps.name("prefix") {
+                    // NAME=value / export NAME=value
+                    let val = caps.name("val").map(|m| m.as_str()).unwrap_or_default();
+                    if value_is_harmless(val) {
+                        caps[0].to_string()
+                    } else {
+                        format!("{}{MASK}", prefix.as_str())
+                    }
+                } else {
+                    // ${NAME} / $NAME 展开：保留 $ / ${} 形态
+                    let open = caps.name("open").map(|m| m.as_str()).unwrap_or("$");
+                    let close = caps.name("close").map(|m| m.as_str()).unwrap_or("");
+                    format!("{open}{MASK}{close}")
+                }
+            })
+            .to_string();
+    }
     for re in credential_regexes() {
         out = re
             .replace_all(&out, |caps: &regex::Captures| {
@@ -168,5 +251,64 @@ mod tests {
             "sk-abcdefghijklmnop12345678".into(),
         ]);
         assert!(out.contains("cargo publish --token ***"));
+    }
+
+    /// 环境变量值脱敏表（票 15 / §12.4.4）：按名判定，逐行锁定行为。
+    #[test]
+    fn masks_env_values_by_name_table() {
+        let cases: &[(&str, &str)] = &[
+            // 敏感名：赋值 / export / 引号 / 展开，一律打码
+            ("API_TOKEN=abc123", "API_TOKEN=***"),
+            ("export TOKEN=abc", "export TOKEN=***"),
+            ("export API_KEY='sk-live-123'", "export API_KEY=***"),
+            ("SECRET=\"a b c\"", "SECRET=***"),
+            ("DB_PASSWORD=hunter2", "DB_PASSWORD=***"),
+            ("MY_CREDENTIAL=x", "MY_CREDENTIAL=***"),
+            // 变量展开：TOKEN 命中，HOME / FOO 不命中
+            ("${TOKEN}", "${***}"),
+            ("$TOKEN", "$***"),
+            ("${HOME}/x", "${HOME}/x"),
+            ("$FOO", "$FOO"),
+            // 无害名（含 criterion 1 的 FOO=secret）：按名判定不误伤
+            ("FOO=secret", "FOO=secret"),
+            ("MODE=debug", "MODE=debug"),
+            ("PATH=/usr/bin:/bin", "PATH=/usr/bin:/bin"),
+            // 敏感名但无害值：纯数字保留（明确取舍，见 value_is_harmless）
+            ("AUTH_TIMEOUT=30", "AUTH_TIMEOUT=30"),
+            ("MAX_TOKENS=4096", "MAX_TOKENS=4096"),
+            // 已 *** 幂等：再打一次结果不变
+            ("TOKEN=***", "TOKEN=***"),
+            ("export SECRET=***", "export SECRET=***"),
+            // set -x 追踪：`+ NAME=value` 形态同样覆盖（前缀 `+ ` 原样保留）
+            ("+ export API_TOKEN=abc123", "+ export API_TOKEN=***"),
+            ("+ DB_PASSWORD=hunter2", "+ DB_PASSWORD=***"),
+            // 已知误伤（契约已述）：含 AUTH / KEY 子串的无害名会被打码
+            ("GIT_AUTHOR_NAME=Alice", "GIT_AUTHOR_NAME=***"),
+        ];
+        for (input, want) in cases {
+            assert_eq!(&sanitize_text(input), want, "输入 {input:?}");
+        }
+    }
+
+    /// 赋值模式的误伤边界：比较运算 / 无关文本不应被打码。
+    #[test]
+    fn env_assignment_does_not_mangle_comparisons() {
+        // `token == y` 不是赋值（值首字符是 `=`）
+        assert_eq!(
+            sanitize_text("if token == y { ok }"),
+            "if token == y { ok }"
+        );
+        // `--token=x` 由 flag 正则处理，不因赋值正则漏打
+        let out = sanitize_command_line("run --token=abc123value");
+        assert!(!out.contains("abc123value"));
+        assert!(out.contains("--token=***"));
+    }
+
+    /// 敏感名 + 密钥形态组合：先按名打码，密钥形态正则不会残留片段。
+    #[test]
+    fn env_and_key_regexes_compose() {
+        let out = sanitize_text("export GITHUB_TOKEN=sk-abcdefghijklmnop12345678");
+        assert!(!out.contains("sk-abcdefghijklmnop12345678"));
+        assert_eq!(out, "export GITHUB_TOKEN=***");
     }
 }
