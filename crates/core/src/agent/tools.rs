@@ -178,16 +178,46 @@ impl ToolExecutor {
 
     /// 执行一次工具调用。
     pub async fn execute(&self, call: &ToolCall, ctx: &ToolCallContext) -> Result<ToolOutcome> {
-        match call.name.as_str() {
-            "write_file" => self.write_file(call, ctx).await,
-            "edit_file" => self.edit_file(call, ctx).await,
-            "read_file" => self.read_file(call, ctx).await,
-            "delete_file" => self.delete_file(call, ctx).await,
-            "list_dir" => self.list_dir(call, ctx).await,
-            "run_command" => self.run_command(call, ctx).await,
-            "submit_metadata" => self.submit_metadata(call),
-            other => Err(Error::Validation(format!("未知工具：{other}"))),
+        let outcome = match call.name.as_str() {
+            "write_file" => self.write_file(call, ctx).await?,
+            "edit_file" => self.edit_file(call, ctx).await?,
+            "read_file" => self.read_file(call, ctx).await?,
+            "delete_file" => self.delete_file(call, ctx).await?,
+            "list_dir" => self.list_dir(call, ctx).await?,
+            "run_command" => self.run_command(call, ctx).await?,
+            "submit_metadata" => self.submit_metadata(call)?,
+            other => return Err(Error::Validation(format!("未知工具：{other}"))),
+        };
+        self.apply_l2_offload(call, ctx, outcome)
+    }
+
+    /// L2 大结果卸载**覆盖全部工具**（决策 110 / 票 04）：任何工具结果超过
+    /// `offload_threshold_tokens` 一律落盘、context 只留预览 + 路径。
+    ///
+    /// `run_command` 在自身路径里已按 stdout/stderr 语义卸载（保留退出码与失败行），
+    /// 此处跳过避免二次卸载；`submit_metadata` 是极小 JSON，无需处理。
+    fn apply_l2_offload(
+        &self,
+        call: &ToolCall,
+        ctx: &ToolCallContext,
+        outcome: ToolOutcome,
+    ) -> Result<ToolOutcome> {
+        if matches!(call.name.as_str(), "run_command" | "submit_metadata") {
+            return Ok(outcome);
         }
+        if !needs_offload(&outcome.content, &self.settings) {
+            return Ok(outcome);
+        }
+        let dir = self.home.context_dir(&ctx.task_id);
+        std::fs::create_dir_all(&dir)?;
+        let path = dir.join(format!("{}.txt", ulid::Ulid::new()));
+        std::fs::write(&path, &outcome.content)?;
+        let tokens = count_tokens(&outcome.content);
+        let preview = head_tail(&outcome.content, 30, 30);
+        Ok(ToolOutcome {
+            content: offload_replacement(&call.name, &path.display().to_string(), tokens, &preview),
+            metadata: outcome.metadata,
+        })
     }
 
     fn args(call: &ToolCall) -> Result<serde_json::Value> {
@@ -1057,5 +1087,65 @@ mod tests {
         assert!(out.contains("l499"));
         assert!(out.contains("省略 496 行"));
         assert!(!out.contains("l100"));
+    }
+
+    #[tokio::test]
+    async fn l2_offload_covers_non_command_tools() {
+        // 票 04 / 决策 110：L2 卸载覆盖**全部工具**，不再只对 run_command 生效。
+        // read_file 显式要求大 limit 时 L1 不裁剪（用户点名要这么多行），
+        // 结果超 offload_threshold_tokens → 落盘 + 只留预览。
+        let s = setup(Stage::Develop);
+        let long = (0..20_000)
+            .map(|i| format!("line {i} of a very long file"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        std::fs::write(s.worktree.join("big.rs"), &long).unwrap();
+
+        let out = s
+            .executor
+            .execute(
+                &call(
+                    "read_file",
+                    serde_json::json!({"path": "big.rs", "limit": 20_000}),
+                ),
+                &s.ctx,
+            )
+            .await
+            .unwrap();
+        assert!(
+            out.content.contains("已卸载"),
+            "read_file 超阈值结果应走 L2 卸载：{}",
+            &out.content[..out.content.len().min(200)]
+        );
+        // 卸载文件真实落盘且含完整内容
+        let ctx_dir = s.home.context_dir("t1");
+        let files: Vec<_> = std::fs::read_dir(&ctx_dir)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .collect();
+        assert!(!files.is_empty(), "L2 卸载文件应落盘");
+        assert!(
+            files.iter().any(|f| std::fs::read_to_string(f.path())
+                .map(|c| c.contains("line 19999"))
+                .unwrap_or(false)),
+            "卸载文件应含完整内容"
+        );
+    }
+
+    #[tokio::test]
+    async fn l2_offload_skips_small_results() {
+        // 未超阈值的小结果原样返回（L2 不误伤）
+        let s = setup(Stage::Develop);
+        std::fs::write(s.worktree.join("small.rs"), "fn main() {}\n").unwrap();
+        let out = s
+            .executor
+            .execute(
+                &call("read_file", serde_json::json!({"path": "small.rs"})),
+                &s.ctx,
+            )
+            .await
+            .unwrap();
+        assert!(!out.content.contains("已卸载"));
+        assert!(out.content.contains("fn main"));
     }
 }

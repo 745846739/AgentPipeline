@@ -101,6 +101,29 @@ impl Flow {
         self.scheduler_with(self.settings.clone())
     }
 
+    /// 预置一个 enabled provider，并把 `context_window` 设为给定值（决策 46 / 110）。
+    ///
+    /// FakeAgent 场景默认不落 provider 行——此时 executor 跳过 L0 分档（不臆造窗口）。
+    /// 需要真实触发 L0/L3/L4 的用例（E2E-22）用它显式登记窗口。
+    pub async fn seed_provider(&self, id: &str, context_window: u32) {
+        use agentpipeline_core::types::Provider;
+        let now = self.store.now();
+        self.store
+            .upsert_provider(&Provider {
+                id: id.into(),
+                vendor: "openai".into(),
+                model: "mock".into(),
+                context_window,
+                base_url: Some("http://127.0.0.1:1/v1".into()),
+                api_key: Some("sk-test".into()),
+                enabled: true,
+                created_at: now,
+                updated_at: now,
+            })
+            .await
+            .unwrap();
+    }
+
     pub fn scheduler_with(&self, settings: Settings) -> KanbanScheduler {
         let resumes = self.resumes.clone();
         KanbanScheduler::new(

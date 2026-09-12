@@ -1041,7 +1041,43 @@ impl Executor {
         let mut submitted: Option<serde_json::Value> = None;
         let mut tokens = RunTokens::default();
 
+        // L0 容量预估（决策 110 / 票 04）：窗口来自解析后的 provider 行
+        // （`providers.context_window`，决策 46 / 111）。无可用 provider（FakeAgent /
+        // 纯代码场景）时跳过分档——不臆造窗口；provider 存在但窗口未登记则显式失败。
+        let capacity = match self
+            .model_context_window(task, cursor, stage_cfg.as_ref())
+            .await?
+        {
+            Some(model_window) => Some(crate::agent::context::estimate_context_capacity(
+                model_window,
+                &system_prompt,
+                &user_prompt,
+                &self.settings,
+            )),
+            None => None,
+        };
+
         loop {
+            // L3 按轮压缩（决策 105）：估算当前 messages 是否超过软限，超了就规则化压缩。
+            // 压缩本身不调 LLM（§12.13.3 规则表），压缩发生时有可观测记录。
+            if let Some(capacity) = capacity {
+                if let Some(reason) = self
+                    .enforce_context_budget(
+                        task,
+                        cursor,
+                        capacity,
+                        &system_prompt,
+                        &user_prompt,
+                        &declared_tools,
+                        &mut messages,
+                    )
+                    .await?
+                {
+                    // L4：压缩后仍超硬限 → 本节点收口为 pending(context_overflow)
+                    return Ok((NodeOutput::Pending(reason), tokens));
+                }
+            }
+
             let req = LlmRequest {
                 stage: cursor.stage,
                 node: cursor.node,
@@ -1682,6 +1718,132 @@ impl Executor {
             }
         }
         Ok(Some(out))
+    }
+
+    /// 解析本次 LLM 调用的模型上下文窗口（决策 110 / 票 04）。
+    ///
+    /// 窗口来源是 `providers.context_window`（决策 46 / 111：随 provider 行存在一起，
+    /// 前端可改）——「注册表」就是 provider 表本身。解析顺序与生产适配器一致
+    /// （决策 129 四级：节点级 > 任务覆盖 > 阶段配置 > 系统默认首个 enabled）。
+    ///
+    /// 返回 `Ok(None)` 仅表示**根本没有可用 provider**（测试注入 FakeAgent / 纯代码场景）——
+    /// 此时没有窗口可估，跳过 L0/L3/L4 分档，**不臆造一个窗口值**。
+    /// 一旦解析到 provider 但窗口未登记（为 0），**显式失败**，不静默取默认（决策 110）。
+    async fn model_context_window(
+        &self,
+        task: &Task,
+        cursor: &NodeCursor,
+        stage_cfg: Option<&StageConfig>,
+    ) -> Result<Option<usize>> {
+        let node_override =
+            crate::storage::catalog::node_provider_override(stage_cfg, cursor.node.as_str());
+        let providers = self.store.load_providers().await?;
+        let resolved = crate::storage::catalog::resolve_provider_id(
+            node_override.as_deref(),
+            task.model_override.as_deref(),
+            stage_cfg,
+            providers.iter().find(|p| p.enabled).map(|p| p.id.as_str()),
+        );
+        let Some(provider_id) = resolved else {
+            return Ok(None);
+        };
+        let provider = providers
+            .into_iter()
+            .find(|p| p.id == provider_id)
+            .ok_or_else(|| {
+                Error::Config(format!(
+                    "provider {provider_id} 未注册，无法确定模型上下文窗口（决策 110）"
+                ))
+            })?;
+        if provider.context_window == 0 {
+            return Err(Error::Config(format!(
+                "provider {}（{}）未登记 context_window，无法进行 L0 容量预估（决策 110）",
+                provider.id, provider.model
+            )));
+        }
+        Ok(Some(provider.context_window as usize))
+    }
+
+    /// 每轮 loop 前的上下文预算检查（决策 105 / 票 04）：超软限 → L3 按轮压缩；
+    /// 压缩后仍超硬限 → L4 兜底（子代理关闭时返回待挂的 pending 理由）。
+    ///
+    /// 返回 `Some(reason)` 表示调用方应立即把该节点的输出收口为这个 pending；
+    /// `None` 表示预算内或压缩后已回到预算内，可继续本轮 LLM 调用。
+    async fn enforce_context_budget(
+        &self,
+        task: &Task,
+        cursor: &NodeCursor,
+        capacity: crate::agent::context::ContextCapacity,
+        system_prompt: &str,
+        user_prompt: &str,
+        declared_tools: &[String],
+        messages: &mut Vec<Message>,
+    ) -> Result<Option<PendingReason>> {
+        let estimate = |msgs: &[Message]| {
+            crate::agent::context::count_tokens(user_prompt)
+                + crate::agent::context::count_tokens(system_prompt)
+                + msgs
+                    .iter()
+                    .map(|m| {
+                        // 上下文里既有文本，也有 assistant 的 tool_calls 参数
+                        // （模型自己发出的 payload 同样占窗口，漏算会低估）
+                        let text =
+                            crate::agent::context::count_tokens(m.content.as_deref().unwrap_or(""));
+                        let args: usize = m
+                            .tool_calls
+                            .iter()
+                            .map(|c| {
+                                crate::agent::context::count_tokens(&c.name)
+                                    + crate::agent::context::count_tokens(&c.arguments)
+                            })
+                            .sum();
+                        text + args
+                    })
+                    .sum::<usize>()
+        };
+
+        if !crate::agent::context::should_compact(estimate(messages), capacity) {
+            return Ok(None);
+        }
+        // L3：规则化按轮压缩（不调 LLM，§12.13.3 规则表）
+        let before = messages.len();
+        let outcome =
+            crate::agent::context::compact_messages(messages, self.settings.keep_recent_rounds);
+        let after = outcome.messages.len();
+        *messages = outcome.messages;
+        // 压缩发生时有可观测记录（票面要求）
+        tracing::info!(
+            task = %task.id,
+            stage = %cursor.stage,
+            node = %cursor.node,
+            before,
+            after,
+            compacted = outcome.compacted_messages,
+            "上下文超过软限，已按轮压缩（§12.13 L3）"
+        );
+
+        if !crate::agent::context::over_hard_limit(estimate(messages), capacity) {
+            return Ok(None);
+        }
+        // L4 兜底：子代理兜底仅在阶段配置声明了该工具时可用（决策 45：默认关闭）
+        let spawn_sub_agent = declared_tools.iter().any(|t| t == "spawn_sub_agent");
+        let plan = crate::agent::context::plan_l4(cursor.stage, cursor.node, spawn_sub_agent);
+        let Some(kind) = crate::agent::context::l4_pending_kind(plan) else {
+            // 开启了子代理（批处理 / 拆子代理）→ 本票不实现拆分执行，按未开启收口
+            return Ok(None);
+        };
+        tracing::warn!(
+            task = %task.id,
+            stage = %cursor.stage,
+            node = %cursor.node,
+            "压缩后仍超硬限，挂 pending(context_overflow)（§12.13 L4）"
+        );
+        Ok(Some(PendingReason::new(
+            kind,
+            cursor.stage,
+            cursor.node,
+            "上下文压缩后仍超过硬限，请拆分任务 / 换长上下文模型 / 取消",
+        )))
     }
 
     // ─────────────────────── join（决策 83 / 107 / G5）───────────────────────────────

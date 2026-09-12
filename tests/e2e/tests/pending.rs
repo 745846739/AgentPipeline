@@ -310,25 +310,50 @@ async fn e2e_15_judge_disagreement_goto_execute_increments_attempts() {
 
 #[tokio::test]
 async fn e2e_22_context_overflow_actions_all_have_paired_endpoints() {
-    // 说明：v1 的 L4 兜底尚未接线（context.rs 定义了 PendingContextOverflow，
-    // executor 无生产者——testing.md §11.2 已列「L4 接线」缺口）。本用例把
-    // pending(context_overflow) 直接构造到游标上，验证动作集与端点配对（决策 105）。
+    // 票 04：E2E-22 走**真实执行路径**触发——登记一个极小 `context_window` 的 provider
+    // 让 L0 容量分档生效，再用超长工具结果把 messages 顶过硬限；L3 规则化压缩压不下去
+    // → L4 挂 pending(context_overflow)。不再在测试里手工构造 pending。
     let f = Flow::new().await;
-    testkit::seed_task(&f.store, "t22", "p1").await.unwrap();
-    let cursor = f.sole_cursor("t22").await;
-    f.store
-        .set_cursor_pending(
-            &cursor.cursor_id,
-            &PendingReason::new(
-                PendingKind::ContextOverflow,
-                Stage::Develop,
-                Node::Execute,
-                "L4 仍超限",
-            ),
-        )
-        .await
-        .unwrap();
+    // 窗口极小（1000）：软限 600 / 硬限 900，一次长工具结果即越过
+    f.seed_provider("prov-ctx", 1_000).await;
 
+    let mut script = Script::new();
+    script
+        .for_node(Stage::ArchitectDesign, Node::ValidateInput)
+        .submit(&ValidateInputMetadata {
+            readiness: true,
+            blockers: vec![],
+        });
+    // architect.execute 先读一个超长文件：工具结果本身经 L2 卸载后仍留预览，
+    // 但成功/失败两条路径都可；这里用大 submit metadata 内嵌长文本把上下文顶爆。
+    script
+        .for_node(Stage::ArchitectDesign, Node::Execute)
+        .write_file("design.md", "# 设计\n## 验收标准\n- AC-1 能登录\n")
+        .submit(&ArchitectExecuteMetadata {
+            readiness: true,
+            affected_files: (0..4000).map(|i| format!("src/module_{i}.rs")).collect(),
+            new_symbols: vec![],
+            acceptance_criteria: vec![],
+            ..Default::default()
+        });
+    f.agent.set_script(script);
+
+    testkit::seed_task(&f.store, "t22", "p1").await.unwrap();
+    f.admit("t22").await;
+    f.executor.run("t22").await.unwrap();
+
+    let cursor = f.sole_cursor("t22").await;
+    let reason = cursor
+        .pending_reason
+        .as_ref()
+        .unwrap_or_else(|| panic!("应挂 pending；游标 = {cursor:?}"));
+    assert_eq!(
+        reason.kind,
+        PendingKind::ContextOverflow,
+        "真实执行路径应触发 pending(context_overflow)（§12.13 L4）"
+    );
+
+    // 动作集三项均有配对端点（决策 101 / 105）
     let actions = f.store.allowed_actions_for_task("t22").await.unwrap();
     let names: Vec<&str> = actions.iter().map(|a| a.action.as_str()).collect();
     assert_eq!(names, vec!["split_task", "model_override", "cancel"]);
@@ -341,15 +366,4 @@ async fn e2e_22_context_overflow_actions_all_have_paired_endpoints() {
             a.action
         );
     }
-    assert_eq!(cursor.status, CursorStatus::Active, "构造前为 active");
-    assert_eq!(
-        f.store
-            .get_cursor(&cursor.cursor_id)
-            .await
-            .unwrap()
-            .pending_reason
-            .unwrap()
-            .kind,
-        PendingKind::ContextOverflow
-    );
 }
