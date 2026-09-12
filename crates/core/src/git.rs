@@ -436,7 +436,11 @@ impl Git {
                 .target()
                 .ok_or_else(|| Error::Git("rebase 起点 HEAD 无指向".into()))?;
             // 已包含基准：与 `git rebase` no-op 语义一致
-            if head_id == base_commit.id() || repo.graph_descendant_of(head_id, base_commit.id()).map_err(gerr)? {
+            if head_id == base_commit.id()
+                || repo
+                    .graph_descendant_of(head_id, base_commit.id())
+                    .map_err(gerr)?
+            {
                 return Ok(AutoRebaseOutcome::Clean {
                     head: head_id.to_string(),
                 });

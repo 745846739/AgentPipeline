@@ -259,10 +259,7 @@ mod tests {
     #[test]
     fn stage_landing_full_table() {
         // 跨阶段落点唯一查表（票 03）：executor 的 Next 与 judge continue 共用。
-        assert_eq!(
-            stage_landing(Stage::ArchitectDesign),
-            StageLanding::Split
-        );
+        assert_eq!(stage_landing(Stage::ArchitectDesign), StageLanding::Split);
         for stage in [Stage::DevelopDesign, Stage::TestDesign] {
             assert_eq!(stage_landing(stage), StageLanding::JoinBoundary, "{stage}");
         }

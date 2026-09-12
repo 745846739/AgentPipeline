@@ -361,7 +361,8 @@ async fn rebase_conflict_auto_resolves_identical_modification() {
     let wt = worktree.display().to_string();
     repo.git(&["worktree", "add", "-b", "kanban/t1", &wt, "topic"]);
 
-    let outcome = Git.rebase_onto_with_auto_resolve(&worktree, "main")
+    let outcome = Git
+        .rebase_onto_with_auto_resolve(&worktree, "main")
         .await
         .unwrap();
     match outcome {
@@ -404,7 +405,8 @@ async fn rebase_hard_conflict_is_not_auto_resolved() {
     let wt = worktree.display().to_string();
     repo.git(&["worktree", "add", "-b", "kanban/t1", &wt, "topic"]);
 
-    match Git.rebase_onto_with_auto_resolve(&worktree, "main")
+    match Git
+        .rebase_onto_with_auto_resolve(&worktree, "main")
         .await
         .unwrap()
     {
