@@ -113,6 +113,124 @@ impl Harness {
             .await
             .unwrap();
     }
+
+    /// 造一条**已完成**的成功 run（给定耗时），供自适应分位数采样（票 17）。
+    async fn finished_run(&self, task_id: &str, cursor_id: &str, duration_ms: u64) -> i64 {
+        let run_id = self
+            .store
+            .insert_run(&NewRun {
+                task_id: task_id.into(),
+                cursor_id: cursor_id.into(),
+                stage: Stage::Develop,
+                node: Node::Execute,
+                attempt: 1,
+                agent_type: "main".into(),
+                parent_run_id: None,
+                prompt_template_hash: None,
+                process_group_id: None,
+            })
+            .await
+            .unwrap();
+        self.store
+            .finish_run(
+                run_id,
+                &RunOutcome {
+                    status: Some(NodeStatus::Success),
+                    duration_ms,
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        run_id
+    }
+}
+
+// ─────────────────────── 票 17：自适应超时告警（决策 66）───────────────────────
+
+#[tokio::test]
+async fn adaptive_timeout_off_by_default_yields_no_alerts() {
+    // 开关关闭 → 零行为变化：即便历史样本齐全、当前 run 极慢，也不产告警。
+    let h = Harness::new().await;
+    h.seed_task("t-adaptive-off").await;
+    h.mark_running("t-adaptive-off").await;
+    let cursor = h.store.load_live_cursors("t-adaptive-off").await.unwrap()[0].clone();
+    // 5 条成功历史（1s 级）
+    for _ in 0..5 {
+        h.finished_run("t-adaptive-off", &cursor.cursor_id, 1_000)
+            .await;
+    }
+    h.running_run("t-adaptive-off", &cursor.cursor_id, 1, 10_000, 0, None)
+        .await;
+
+    let settings = Settings::default();
+    assert!(!settings.adaptive_timeout_enabled, "缺省关闭");
+    let report = h.scheduler(settings).tick().await.unwrap();
+    assert!(
+        report.slow_run_alerts.is_empty(),
+        "关闭时不得产告警：{:?}",
+        report.slow_run_alerts
+    );
+}
+
+#[tokio::test]
+async fn adaptive_timeout_enabled_alerts_only_when_past_three_times_p90() {
+    let h = Harness::new().await;
+    h.seed_task("t-adaptive-on").await;
+    h.mark_running("t-adaptive-on").await;
+    let cursor = h.store.load_live_cursors("t-adaptive-on").await.unwrap()[0].clone();
+    // 历史：5 条成功、每次 1s → P90 = 1000ms，告警线 3000ms
+    for _ in 0..5 {
+        h.finished_run("t-adaptive-on", &cursor.cursor_id, 1_000)
+            .await;
+    }
+    // 当前 run 已跑 10s（> 3×P90）且心跳新鲜（不触发空闲超时）
+    h.running_run("t-adaptive-on", &cursor.cursor_id, 1, 10, 0, None)
+        .await;
+
+    let settings = Settings {
+        adaptive_timeout_enabled: true,
+        ..Default::default()
+    };
+    let report = h.scheduler(settings).tick().await.unwrap();
+    assert_eq!(report.slow_run_alerts.len(), 1, "应产一条慢运行告警");
+    let (task_id, detail) = &report.slow_run_alerts[0];
+    assert_eq!(task_id, "t-adaptive-on");
+    assert!(
+        detail.contains("P90") && detail.contains("3 倍"),
+        "告警内容应含分位数依据：{detail}"
+    );
+    // 告警不影响超时判定：run 仍在跑（未进 timed_out）
+    assert!(
+        report.timed_out_runs.is_empty(),
+        "慢运行告警不得被当作超时处理"
+    );
+}
+
+#[tokio::test]
+async fn adaptive_timeout_cold_start_does_not_alert() {
+    // 冷启动样本不足（< 最低样本量）→ 不展示、不告警
+    let h = Harness::new().await;
+    h.seed_task("t-adaptive-cold").await;
+    h.mark_running("t-adaptive-cold").await;
+    let cursor = h.store.load_live_cursors("t-adaptive-cold").await.unwrap()[0].clone();
+    // 只有 2 条历史（不足 5）
+    for _ in 0..2 {
+        h.finished_run("t-adaptive-cold", &cursor.cursor_id, 1_000)
+            .await;
+    }
+    h.running_run("t-adaptive-cold", &cursor.cursor_id, 1, 10, 0, None)
+        .await;
+    let settings = Settings {
+        adaptive_timeout_enabled: true,
+        ..Default::default()
+    };
+    let report = h.scheduler(settings).tick().await.unwrap();
+    assert!(
+        report.slow_run_alerts.is_empty(),
+        "冷启动样本不足不得告警：{:?}",
+        report.slow_run_alerts
+    );
 }
 
 // ─────────────────────── ① 超时（决策 33 / 64 / 66 / 100 / 122）───────────────────────

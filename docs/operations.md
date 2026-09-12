@@ -1146,7 +1146,7 @@ CONTEXT_ALERTS = {
 }
 ```
 
-**自适应超时估算（决策 66）：** 从 `kanban_node_runs` 统计每个 `(stage, node)` 的 P50/P90 耗时，**只取成功运行**（排除 failed/timeout，避免失败样本污染阈值）。用途限于进度展示与告警：前端进度条显示"已运行 4m12s（该节点 P90 为 3m40s）"，超过 3×P90 发一条 SSE 告警。强制超时阈值始终取配置值，`adaptive_timeout_enabled = false` 时完全关闭该估算。
+**自适应超时估算（决策 66）：** 从 `kanban_node_runs` 统计每个 `(stage, node)` 的 P50/P90 耗时，**只取成功运行**（排除 failed/timeout，避免失败样本污染阈值）。采样口径（票 17 落地）：窗口取该节点**最近 20 次成功运行**，样本数 < 5 时（冷启动）不展示也不告警。用途限于进度展示与告警：超过该节点 **3×P90** 时记一条告警（`tick` 报告 `slow_run_alerts` + `tracing::warn`）。**强制超时阈值始终取配置值**（`effective_idle_timeout` / `effective_max_duration`），自适应分位数绝不作为超时判定输入——挂死节点会自我抬高阈值（附录 B.4 的反馈回路）。`adaptive_timeout_enabled = false`（缺省）时完全关闭该估算，零行为变化。
 
 ### 12.14 本地数据保护
 

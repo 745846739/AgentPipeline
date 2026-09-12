@@ -43,6 +43,11 @@ pub struct TickReport {
     pub stalled: Vec<String>,
     /// 发出重复提醒的任务 id。
     pub reminded: Vec<String>,
+    /// 自适应超时的「运行显著偏慢」告警（决策 66 / 票 17）：`(task_id, 描述)`。
+    ///
+    /// **纯告警**：不影响任何超时判定（自适应值不作强制阈值，决策 66 边界）。
+    /// `adaptive_timeout_enabled = false` 时该列表恒为空。
+    pub slow_run_alerts: Vec<(String, String)>,
 }
 
 pub struct KanbanScheduler {
@@ -148,12 +153,49 @@ impl KanbanScheduler {
                 node_override,
             );
 
+            // 决策 66 / 票 17：自适应 P50/P90 **只用于告警**——在任何超时判定之前
+            // 独立跑一遍，且不把分位数传给 `is_timed_out`。
+            if self.settings.adaptive_timeout_enabled {
+                self.maybe_alert_slow_run(&run, now, report).await?;
+            }
+
             if is_timed_out(&run, now, idle, max_duration).is_none() {
                 continue;
             }
             report.timed_out_runs.push(run.id);
             self.handle_timeout(&run, report).await?;
         }
+        Ok(())
+    }
+
+    /// 自适应超时告警（决策 66 / 票 17）：运行时长超过该节点历史 **3×P90** 时记一条告警。
+    ///
+    /// 采样走 [`crate::metrics::duration_percentiles`]（仅成功运行、窗口 20、最少 5 样本；
+    /// 冷启动无数据不告警）。**绝不参与超时判定**——强制阈值始终取配置值。
+    async fn maybe_alert_slow_run(
+        &self,
+        run: &NodeRun,
+        now: chrono::DateTime<chrono::Utc>,
+        report: &mut TickReport,
+    ) -> Result<()> {
+        let Some(task_id) = run.task_id.clone() else {
+            return Ok(());
+        };
+        // 该节点全部历史 run（成功样本由 metrics 口径筛出）
+        let history = self.store.all_runs().await?;
+        let Some(p) = crate::metrics::duration_percentiles(&history, run.stage, run.node) else {
+            return Ok(()); // 冷启动 / 样本不足：不展示、不告警
+        };
+        let elapsed_ms = (now - run.started_at).num_milliseconds().max(0) as u64;
+        if !crate::metrics::should_alert_slow(elapsed_ms, p) {
+            return Ok(());
+        }
+        let detail = format!(
+            "{}.{} 已运行 {}ms，超过该节点 P90（{}ms）的 3 倍（P50 {}ms，样本 {}）",
+            run.stage, run.node, elapsed_ms, p.p90_ms, p.p50_ms, p.samples
+        );
+        tracing::warn!(task = %task_id, run = run.id, "{detail}");
+        report.slow_run_alerts.push((task_id, detail));
         Ok(())
     }
 
