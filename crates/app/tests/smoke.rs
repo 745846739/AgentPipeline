@@ -7,9 +7,16 @@
 
 use std::io::{Read, Write};
 use std::net::TcpStream;
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use testkit::TestHome;
+use agentpipeline_core::clock::SystemClock;
+use agentpipeline_core::types::{
+    AcceptanceCriterion, ArchitectExecuteMetadata, CodeChanges, DevelopDesignMetadata, Node,
+    Project, Provider, ReviewResult, Stage, TestDesignMetadata, TestResult, TestScenario,
+    ValidateInputMetadata, ValidateOutputMetadata,
+};
+use testkit::{MockLlm, Repo, Script, TestHome};
 use tokio::process::{Child, Command};
 
 /// 极简 HTTP/1.1 客户端（冒烟只需读状态码与 body，不引 reqwest）。
@@ -168,6 +175,226 @@ async fn binary_starts_serves_and_exits_gracefully_on_sigint() {
         }
     };
     assert!(status.success(), "优雅退出应为 0，实际 {:?}", status.code());
+}
+
+/// 写一份启动即用的 pipeline 配置（缩短 tick 周期，让冒烟在秒级看到准入）。
+fn write_pipeline_config(home: &TestHome, tick_interval_sec: u64) {
+    let cfg = format!("[pipeline]\ntick_interval_sec = {tick_interval_sec}\n");
+    std::fs::write(home.home().config_path(), cfg).unwrap();
+}
+
+/// 与 E2E-01 同构的最小闭环脚本：真实二进制经 mock LLM 走完
+/// init → architect → 并行设计 → sync-check → develop → review → test → merge → done。
+fn pipeline_script(script: &mut Script, task_id: &str) {
+    script
+        .for_node(Stage::ArchitectDesign, Node::ValidateInput)
+        .submit(&ValidateInputMetadata {
+            readiness: true,
+            blockers: vec![],
+        });
+    script
+        .for_node(Stage::ArchitectDesign, Node::Execute)
+        .write_file("design.md", "# 设计\n## 验收标准\n- AC-1 能登录\n")
+        .submit(&ArchitectExecuteMetadata {
+            readiness: true,
+            affected_files: vec!["src/lib.rs".into()],
+            new_symbols: vec![],
+            acceptance_criteria: vec![AcceptanceCriterion {
+                id: "AC-1".into(),
+                description: "能登录".into(),
+            }],
+            ..Default::default()
+        });
+    script
+        .for_node(Stage::ArchitectDesign, Node::ValidateOutput)
+        .submit(&ValidateOutputMetadata {
+            passed: true,
+            ..Default::default()
+        });
+    script
+        .for_node(Stage::DevelopDesign, Node::ValidateInput)
+        .submit(&ValidateInputMetadata {
+            readiness: true,
+            blockers: vec![],
+        });
+    script
+        .for_node(Stage::DevelopDesign, Node::Execute)
+        .write_file("dev-plan.md", "# 开发计划\n")
+        .submit(&DevelopDesignMetadata {
+            readiness: true,
+            dev_doc_path: Some("dev-plan.md".into()),
+            ..Default::default()
+        });
+    script
+        .for_node(Stage::DevelopDesign, Node::ValidateOutput)
+        .submit(&ValidateOutputMetadata {
+            passed: true,
+            ..Default::default()
+        });
+    script
+        .for_node(Stage::TestDesign, Node::ValidateInput)
+        .submit(&ValidateInputMetadata {
+            readiness: true,
+            blockers: vec![],
+        });
+    script
+        .for_node(Stage::TestDesign, Node::Execute)
+        .write_file("test-scenarios.md", "# 测试场景\n")
+        .submit(&TestDesignMetadata {
+            readiness: true,
+            blockers: vec![],
+            test_scenarios_path: Some("test-scenarios.md".into()),
+            test_scenarios: vec![TestScenario {
+                id: "S-1".into(),
+                name: "登录成功".into(),
+                description: "登录".into(),
+                preconditions: vec![],
+                steps: vec![],
+                expected_result: "成功".into(),
+                priority: agentpipeline_core::types::ScenarioPriority::High,
+                design_refs: vec!["AC-1".into()],
+            }],
+        });
+    script
+        .for_node(Stage::TestDesign, Node::ValidateOutput)
+        .submit(&ValidateOutputMetadata {
+            passed: true,
+            ..Default::default()
+        });
+    script
+        .for_node(Stage::Develop, Node::Execute)
+        .write_file(
+            "src/lib.rs",
+            "pub fn add(a: i32, b: i32) -> i32 { a + b }\n#[test]\nfn adds() { assert_eq!(add(1, 2), 3); }\n",
+        )
+        .run_command(&format!(
+            "git add -A && git -c user.name=f -c user.email=f@f commit -m 'feat: task {task_id}'"
+        ))
+        .submit(&CodeChanges {
+            branch_name: format!("kanban/{task_id}"),
+            changed_files: vec![],
+            unit_test_files: vec![],
+        });
+    script
+        .for_node(Stage::Review, Node::Execute)
+        .write_file(
+            "review-report.md",
+            "# 评审报告\n## 设计符合性\n通过\n## 测试质量\n通过\n",
+        )
+        .submit(&ReviewResult {
+            approved: true,
+            review_report_path: Some("review-report.md".into()),
+            required_changes: vec![],
+        });
+    script
+        .for_node(Stage::Test, Node::Execute)
+        .write_file("test-report.md", "# 测试报告\n全部通过\n")
+        .submit(&TestResult {
+            passed: true,
+            test_report_path: Some("test-report.md".into()),
+            failures: vec![],
+            gate_recheck: false,
+        });
+}
+
+/// 真实二进制端到端（票 17 验收）：创建任务 → tick 循环自动准入 → executor
+/// 经 mock LLM 推进到终态 done。mock 只替换 LLM 响应流，工具 / git / 命令全真跑。
+#[tokio::test]
+async fn real_binary_advances_task_to_terminal_with_mock_llm() {
+    let home = TestHome::new().unwrap();
+    write_pipeline_config(&home, 1);
+    let repo = Repo::clean().unwrap();
+
+    let mut script = Script::new();
+    pipeline_script(&mut script, "t1");
+    // 伪阶段（票 16）：语义冲突比对给 low，单任务不进入 conflict_wait
+    script
+        .for_pseudo("pseudo:conflict_check")
+        .submit_raw(serde_json::json!({"duplicate_risk": "low", "reason": null}));
+    let mock = MockLlm::from_script(script).await;
+
+    // 预置 DB（同库同迁移）：provider 指向 mock，项目指真实 git 仓库
+    let store = home.store(Arc::new(SystemClock)).await.unwrap();
+    let now = store.now();
+    store
+        .upsert_provider(&Provider {
+            id: "prov".into(),
+            vendor: "openai".into(),
+            model: "mock".into(),
+            context_window: 8000,
+            base_url: Some(mock.url.clone()),
+            api_key: Some("sk-test".into()),
+            enabled: true,
+            created_at: now,
+            updated_at: now,
+        })
+        .await
+        .unwrap();
+    store
+        .create_project(&Project {
+            id: "p1".into(),
+            name: "smoke".into(),
+            local_path: repo.path().display().to_string(),
+            default_branch: "main".into(),
+            language: None,
+            test_framework: Some("true".into()),
+            lint_command: None,
+            agents_md_path: None,
+            created_at: now,
+        })
+        .await
+        .unwrap();
+    testkit::seed_task(&store, "t1", "p1").await.unwrap();
+
+    let port = free_port();
+    let mut child = spawn_server(port, &home).await;
+    wait_until_ready(port).await;
+
+    // tick（1s）准入 → resume 钩子拉起 executor → mock 驱动到 done。
+    // agent 评审模式在 merge 阶段 A 后按设计停在 pending(merge_approval)，
+    // 需经端点审批（决策 119）才走阶段 B 合入。
+    let deadline = Instant::now() + Duration::from_secs(120);
+    let mut last = String::new();
+    let mut approved = false;
+    loop {
+        assert!(
+            Instant::now() < deadline,
+            "任务未在 120s 内到终态；最后响应：{last}"
+        );
+        let (status, body) = http("GET", port, "/tasks/t1", None).unwrap();
+        last = body.clone();
+        if status == 200 && body.contains("\"status\":\"pending\"") && !approved {
+            assert!(
+                body.contains("merge_approval"),
+                "应在 merge_approval 暂停：{body}"
+            );
+            let (decide_status, decide_body) = http(
+                "POST",
+                port,
+                "/tasks/t1/merge/decision",
+                Some(r#"{"decision":"approve"}"#),
+            )
+            .unwrap();
+            assert_eq!(decide_status, 200, "审批应成功：{decide_body}");
+            approved = true;
+        }
+        if status == 200 && body.contains("\"status\":\"done\"") {
+            break;
+        }
+        assert!(
+            !body.contains("\"status\":\"failed\"") && !body.contains("\"status\":\"cancelled\""),
+            "任务不应失败/取消：{body}"
+        );
+        tokio::time::sleep(Duration::from_millis(300)).await;
+    }
+    assert!(approved, "应经过 merge_approval 审批");
+
+    // 节点 run 落库（证明 executor 真跑，而非仅准入后停住）
+    let runs = store.list_runs("t1").await.unwrap();
+    assert!(runs.len() >= 10, "应有完整节点 run 行：{}", runs.len());
+
+    send_sigint(child.id().unwrap());
+    let _ = tokio::time::timeout(Duration::from_secs(10), child.wait()).await;
 }
 
 #[tokio::test]

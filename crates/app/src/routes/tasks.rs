@@ -722,9 +722,15 @@ pub async fn global_metrics(State(state): State<AppState>) -> ApiResult<impl Int
         .stage_aggregation()
         .await
         .map_err(map_core_error)?;
+    // 全局 token / 调用数 / validate 首过率：复用 metrics 纯函数口径（决策 130② / 137），
+    // 不在端点里另写一套 SQL 聚合（§12.4.1 的口径是契约）。
+    let runs = state.store.all_runs().await.map_err(map_core_error)?;
     Ok(Json(json!({
         "tasks": tasks.len(),
         "success_rate": agentpipeline_core::metrics::success_rate(&statuses),
+        "validate_first_pass_rate": agentpipeline_core::metrics::validate_first_pass_rate(&runs),
+        "total_tokens": agentpipeline_core::metrics::total_tokens(&runs),
+        "total_calls": agentpipeline_core::metrics::total_calls(&runs),
         "stage_aggregation": aggregation
             .into_iter()
             .map(|(stage, avg_duration, retry_rate, total)| json!({

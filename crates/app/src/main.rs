@@ -5,8 +5,10 @@ use std::sync::Arc;
 use agentpipeline_core::clock::SystemClock;
 use agentpipeline_core::config::Config;
 use agentpipeline_core::home::{check_permissions, Home};
+use agentpipeline_core::sse::SseBus;
 use agentpipeline_core::storage::Store;
 use anyhow::Context;
+use app::runtime::Runtime;
 use app::{build_router, AppState};
 
 #[tokio::main]
@@ -87,7 +89,20 @@ async fn serve(port_override: Option<u16>) -> anyhow::Result<()> {
     // CLI --port > [server] port（§10.6.5 的配置此前被硬编码架空，决策 128 修订同批对齐）
     let server = config.server.clone();
     let port = port_override.unwrap_or(server.port);
-    let state = AppState::new(store, home, settings, port);
+
+    // 停机信号（决策 54）：一处广播，三处消费——axum、tick 循环、维护循环。
+    let (shutdown_tx, mut shutdown_rx) = tokio::sync::watch::channel(false);
+
+    // 生产运行时（票 17）：真实 LLM + executor + scheduler（决策 55）。
+    let sse = Arc::new(SseBus::default());
+    let runtime = Runtime::new(store.clone(), settings.clone(), sse.clone());
+    runtime.spawn_tick_loop(store.clone(), settings.clone(), shutdown_tx.subscribe());
+    runtime.spawn_maintenance_loop(store.clone(), settings.clone(), shutdown_tx.subscribe());
+
+    let state = AppState::new(store, home, settings, port)
+        .with_sse(sse)
+        .with_executor(runtime.executor())
+        .with_resume_hook(runtime.resume_hook.clone());
     let router = build_router(state);
 
     let addr = tokio::net::lookup_host((server.host.as_str(), port))
@@ -102,7 +117,6 @@ async fn serve(port_override: Option<u16>) -> anyhow::Result<()> {
 
     // 优雅关闭（决策 54）：第一次 SIGINT 停止派发新任务并在节点边界退出；
     // 第二次立即退出。
-    let (shutdown_tx, mut shutdown_rx) = tokio::sync::watch::channel(false);
     tokio::spawn(async move {
         let mut signals = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt())
             .expect("注册 SIGINT");

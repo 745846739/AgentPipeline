@@ -30,6 +30,14 @@ struct Api {
 }
 
 async fn api() -> Api {
+    api_with(Settings {
+        pending_resume_cooldown_sec: 5,
+        ..Default::default()
+    })
+    .await
+}
+
+async fn api_with(settings: Settings) -> Api {
     let home = TestHome::new().unwrap();
     let (store, _clock) = home.setup().await.unwrap();
     let repo = Repo::clean().unwrap();
@@ -51,10 +59,6 @@ async fn api() -> Api {
         .unwrap();
 
     // 端口 0 会让 allowed_origins 变成 http://127.0.0.1:0；测试显式用 PORT
-    let settings = Settings {
-        pending_resume_cooldown_sec: 5,
-        ..Default::default()
-    };
     let resumes = Arc::new(AtomicUsize::new(0));
     let hook_resumes = resumes.clone();
     let state = AppState::new(store, home.home().clone(), settings, PORT).with_resume_hook(
@@ -108,6 +112,21 @@ async fn post(api: &Api, uri: &str, body: Value) -> (StatusCode, Value) {
 
 async fn get(api: &Api, uri: &str) -> (StatusCode, Value) {
     call(api, request("GET", uri).body(Body::empty()).unwrap()).await
+}
+
+async fn put(api: &Api, uri: &str, body: Value) -> (StatusCode, Value) {
+    call(
+        api,
+        request("PUT", uri)
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from(body.to_string()))
+            .unwrap(),
+    )
+    .await
+}
+
+async fn delete(api: &Api, uri: &str) -> (StatusCode, Value) {
+    call(api, request("DELETE", uri).body(Body::empty()).unwrap()).await
 }
 
 async fn seed(api: &Api, task_id: &str) -> String {
@@ -1099,10 +1118,44 @@ async fn flow_metrics_and_conversations_endpoints() {
     assert_eq!(status, StatusCode::OK);
     assert!(body["cursors"].as_array().unwrap().len() == 1);
 
+    // 两条 validate_output run：attempt 1 通过 + attempt 2 通过 → 首过率 0.5
+    for attempt in [1u32, 2u32] {
+        let id = store
+            .insert_run(&agentpipeline_core::storage::observability::NewRun {
+                task_id: "t1".into(),
+                cursor_id: cursor.cursor_id.clone(),
+                stage: Stage::ArchitectDesign,
+                node: agentpipeline_core::types::Node::ValidateOutput,
+                attempt,
+                agent_type: "main".into(),
+                parent_run_id: None,
+                prompt_template_hash: None,
+                process_group_id: None,
+            })
+            .await
+            .unwrap();
+        store
+            .finish_run(
+                id,
+                &agentpipeline_core::storage::observability::RunOutcome {
+                    status: Some(agentpipeline_core::types::NodeStatus::Success),
+                    duration_ms: 3,
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+    }
+
     // 全局指标
     let (status, body) = get(&api, "/metrics").await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(body["tasks"], 1);
+    // 全局 token / 调用数 / 首过率复用 metrics 纯函数口径（决策 130② / 137），
+    // 与任务级指标同源：3 条 LLM run（1 伪 + 2 validate）、system run 不计。
+    assert_eq!(body["total_tokens"], 150, "{body}");
+    assert_eq!(body["total_calls"], 3, "{body}");
+    assert_eq!(body["validate_first_pass_rate"], 0.5, "{body}");
 }
 
 #[tokio::test]
@@ -1428,5 +1481,249 @@ async fn retry_resets_worktree_and_records_the_system_command() {
         api.state.store.get_task("t1").await.unwrap().status,
         TaskStatus::Queued,
         "置回 queued 重新走准入（决策 117）"
+    );
+}
+
+// ─────────────────── 阶段级 agent 配置（决策 22 / 46 / 66 / 111 / 129）───────────────────
+
+#[tokio::test]
+async fn stage_config_round_trips_and_resets_to_default() {
+    let api = api().await;
+
+    let (status, body) = put(
+        &api,
+        "/stage-configs/develop",
+        serde_json::json!({
+            "provider_id": "p-default",
+            "temperature": 0.2,
+            "max_tokens": 4096,
+            "idle_timeout_sec": 120
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["stage_config"]["stage"], "develop");
+    assert_eq!(body["stage_config"]["provider_id"], "p-default");
+    assert_eq!(body["stage_config"]["max_tokens"], 4096);
+
+    let (status, body) = get(&api, "/stage-configs").await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let list = body["stage_configs"].as_array().unwrap();
+    assert_eq!(list.len(), 1, "{body}");
+    assert_eq!(list[0]["stage"], "develop");
+
+    // 整条替换：缺省字段清空
+    let (status, _) = put(
+        &api,
+        "/stage-configs/develop",
+        serde_json::json!({"max_tokens": 2048}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let cfg = api
+        .state
+        .store
+        .get_stage_config("develop")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(cfg.provider_id, None, "PUT 是整条替换，未给字段回默认");
+    assert_eq!(cfg.max_tokens, Some(2048));
+
+    let (status, _) = delete(&api, "/stage-configs/develop").await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(api
+        .state
+        .store
+        .get_stage_config("develop")
+        .await
+        .unwrap()
+        .is_none());
+
+    let (status, _) = delete(&api, "/stage-configs/develop").await;
+    assert_eq!(status, StatusCode::NOT_FOUND, "重复删除应 404");
+}
+
+#[tokio::test]
+async fn stage_config_accepts_pseudo_stage_keys_but_rejects_unknown() {
+    let api = api().await;
+
+    let (status, body) = put(
+        &api,
+        "/stage-configs/project_analysis",
+        serde_json::json!({"provider_id": "p-default"}),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "伪阶段键应可配置（决策 67/87）：{body}"
+    );
+
+    let (status, body) = put(&api, "/stage-configs/nope", serde_json::json!({})).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    assert!(
+        body["error"].as_str().unwrap().contains("未知阶段"),
+        "{body}"
+    );
+}
+
+#[tokio::test]
+async fn stage_config_rejects_unusable_provider_and_persona() {
+    let api = api().await;
+
+    let (status, body) = put(
+        &api,
+        "/stage-configs/review",
+        serde_json::json!({"provider_id": "missing-provider"}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    assert!(
+        body["error"].as_str().unwrap().contains("provider"),
+        "{body}"
+    );
+
+    let (status, body) = put(
+        &api,
+        "/stage-configs/review",
+        serde_json::json!({"persona_path": "personas/no-such-file.md"}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    assert!(
+        body["error"].as_str().unwrap().contains("persona_path"),
+        "{body}"
+    );
+
+    // 校验失败不得落库
+    assert!(api
+        .state
+        .store
+        .get_stage_config("review")
+        .await
+        .unwrap()
+        .is_none());
+}
+
+#[tokio::test]
+async fn stage_config_delete_refused_when_cross_family_judge_requires_it() {
+    // 与启动同源的校验（决策 134⑤）：删掉被开关依赖的伪阶段配置 → 拒绝
+    let api = api_with(Settings {
+        pending_resume_cooldown_sec: 5,
+        cross_family_judge: true,
+        ..Default::default()
+    })
+    .await;
+
+    // 开关开启却没有配置 → 写入其他阶段也应被拒（整体校验）
+    let (status, body) = put(
+        &api,
+        "/stage-configs/develop",
+        serde_json::json!({"provider_id": "p-default"}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+
+    let (status, body) = put(
+        &api,
+        "/stage-configs/validator_cross_check",
+        serde_json::json!({"provider_id": "p-default"}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+
+    let (status, body) = delete(&api, "/stage-configs/validator_cross_check").await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    assert!(
+        api.state
+            .store
+            .get_stage_config("validator_cross_check")
+            .await
+            .unwrap()
+            .is_some(),
+        "被拒绝的删除不得落库"
+    );
+}
+
+// ─────────────────── project_analysis 伪阶段接入 analyze（决策 48 / 130⑦ / 78）───────────────────
+
+#[tokio::test]
+async fn analyze_merges_project_analysis_llm_summary_into_result() {
+    use agentpipeline_core::pipeline::pseudo::ProjectAnalysisResult;
+    use agentpipeline_core::pipeline::Executor;
+    use testkit::{FakeAgent, RecordingKiller, Script};
+
+    let api = api().await;
+    let project_id = seed(&api, "t-analyze").await;
+
+    let mut script = Script::new();
+    script
+        .for_pseudo("pseudo:project_analysis")
+        .submit(&ProjectAnalysisResult {
+            summary: "Rust 单仓服务，用 cargo 测试".into(),
+            suspicious: vec!["没有 CI 配置".into()],
+        });
+
+    // 注入带脚本化 LLM 的执行器（生产实现是 ProductionLlm，替换边界只到 LLM 响应流）
+    let executor = Arc::new(Executor::new(
+        api.state.store.clone(),
+        api.state.settings.clone(),
+        api.state.sse.clone(),
+        Arc::new(FakeAgent::new(script)),
+        Arc::new(RecordingKiller::new()),
+    ));
+    let mut state = api.state.clone();
+    state.executor = Some(executor);
+    let router = build_router(state);
+
+    let (status, body) = json_body(
+        router
+            .clone()
+            .oneshot(
+                request("POST", "/projects/analyze")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        serde_json::json!({ "project_id": project_id }).to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(status, StatusCode::ACCEPTED, "{body}");
+
+    // 异步分析：轮询到终态
+    let mut analysis = Value::Null;
+    for _ in 0..200 {
+        let (_, body) = json_body(
+            router
+                .clone()
+                .oneshot(
+                    request("GET", &format!("/projects/{project_id}/analysis"))
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap(),
+        )
+        .await;
+        if body["status"] == "done" || body["status"] == "failed" {
+            analysis = body;
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+
+    assert_eq!(analysis["status"], "done", "{analysis}");
+    assert_eq!(
+        analysis["result"]["summary"],
+        "Rust 单仓服务，用 cargo 测试"
+    );
+    assert_eq!(analysis["result"]["suspicious"][0], "没有 CI 配置");
+    assert!(
+        analysis["result"]["language"].is_string(),
+        "确定性探测事实必须保留：{analysis}"
     );
 }

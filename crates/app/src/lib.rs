@@ -7,6 +7,7 @@
 //! - `api_key` 读接口只回显 `***`（决策 112）。
 
 pub mod routes;
+pub mod runtime;
 pub mod state;
 pub mod stream;
 
@@ -76,6 +77,12 @@ pub fn build_router(state: AppState) -> Router {
         .route(
             "/providers/{id}",
             patch(routes::providers::patch).delete(routes::providers::delete),
+        )
+        // ── 阶段级 agent 配置（决策 22 / 46 / 66）──
+        .route("/stage-configs", get(routes::stage_configs::list))
+        .route(
+            "/stage-configs/{stage}",
+            axum::routing::put(routes::stage_configs::put).delete(routes::stage_configs::delete),
         )
         // ── 全局指标 ──
         .route("/metrics", get(routes::tasks::global_metrics))

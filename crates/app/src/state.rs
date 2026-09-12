@@ -4,6 +4,7 @@ use std::sync::Arc;
 
 use agentpipeline_core::config::Settings;
 use agentpipeline_core::home::Home;
+use agentpipeline_core::pipeline::Executor;
 use agentpipeline_core::sse::SseBus;
 use agentpipeline_core::storage::Store;
 use axum::http::StatusCode;
@@ -24,6 +25,9 @@ pub struct AppState {
     pub settings: Settings,
     pub sse: Arc<SseBus>,
     pub resume_hook: ResumeHook,
+    /// 生产执行器：`POST /projects/analyze` 的 `project_analysis` 伪阶段（决策 48 / 130⑦）
+    /// 需要它。L3 契约测试不注入（`None`）时退化为纯代码探测。
+    pub executor: Option<Arc<Executor>>,
     /// 绑定端口，用于跨源防护的本机 origin 判定（决策 128）。
     pub port: u16,
 }
@@ -36,12 +40,26 @@ impl AppState {
             settings,
             sse: Arc::new(SseBus::default()),
             resume_hook: Arc::new(|_| {}),
+            executor: None,
             port,
         }
     }
 
     pub fn with_resume_hook(mut self, hook: ResumeHook) -> Self {
         self.resume_hook = hook;
+        self
+    }
+
+    /// 注入生产执行器（`project_analysis` 伪阶段用）。
+    pub fn with_executor(mut self, executor: Arc<Executor>) -> Self {
+        self.executor = Some(executor);
+        self
+    }
+
+    /// 复用外部 SSE 总线（票 17：scheduler / executor 的推送必须与端点的
+    /// `/tasks/{id}/stream` 订阅同源，否则前端收不到节点事件）。
+    pub fn with_sse(mut self, sse: Arc<SseBus>) -> Self {
+        self.sse = sse;
         self
     }
 

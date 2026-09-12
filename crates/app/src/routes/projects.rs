@@ -152,13 +152,14 @@ pub async fn analyze(
         .await
         .map_err(map_core_error)?;
 
-    // 探测是纯代码（决策 78）；真实现里摘要由 project_analysis 伪阶段补
+    // 探测是纯代码（决策 78）；摘要由 project_analysis 伪阶段补（决策 48 / 130⑦）
     let store = state.store.clone();
+    let executor = state.executor.clone();
     let id = analysis_id.clone();
     let path = std::path::PathBuf::from(&project.local_path);
     tokio::spawn(async move {
         let language = Git::detect_language(&path);
-        let result = json!({
+        let facts = json!({
             "language": language,
             "test_framework": Git::detect_test_framework(&path, language.as_deref()),
             "lint_command": Git::detect_lint_command(&path, language.as_deref()),
@@ -167,6 +168,19 @@ pub async fn analyze(
             "default_branch": project.default_branch,
             "suspicious": [],
         });
+        // 摘要属观测面：LLM 不可用时保留纯代码事实并显式记下原因，不让整个分析失败
+        // （与「执行语义字段报错、观测字段降级」的既有取向一致）。
+        let result = match executor {
+            Some(ex) => match ex.project_analysis(&project, facts.clone()).await {
+                Ok(merged) => merged,
+                Err(e) => {
+                    let mut degraded = facts;
+                    degraded["summary_error"] = json!(e.to_string());
+                    degraded
+                }
+            },
+            None => facts,
+        };
         let _ = store.finish_analysis(&id, Some(&result), None).await;
     });
 
