@@ -1082,7 +1082,10 @@ async fn architect_semantic_conflict_check_pends_with_duplicate_risk() {
         .iter()
         .find(|r| r.agent_type == "pseudo:conflict_check")
         .expect("伪阶段 run 应落库");
-    assert_eq!(pseudo.cursor_id, live[0].cursor_id);
+    assert_eq!(
+        pseudo.cursor_id.as_deref(),
+        Some(live[0].cursor_id.as_str())
+    );
     assert_eq!(pseudo.stage, Stage::ArchitectDesign);
     assert_eq!(pseudo.node, Node::Execute);
     assert!(pseudo.parent_run_id.is_some(), "parent_run_id 指向父 run");

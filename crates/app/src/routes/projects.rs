@@ -1,7 +1,9 @@
 //! 项目端点（决策 24 / 29 / 61 / 78 / 101 / 130）。
 
 use agentpipeline_core::git::Git;
-use agentpipeline_core::types::Project;
+use agentpipeline_core::pipeline::pseudo::PseudoStage;
+use agentpipeline_core::storage::observability::{NewProjectRun, RunOutcome};
+use agentpipeline_core::types::{Node, NodeStatus, Project, Stage};
 use axum::extract::{Path, State};
 use axum::http::StatusCode;
 use axum::response::IntoResponse;
@@ -168,17 +170,81 @@ pub async fn analyze(
             "default_branch": project.default_branch,
             "suspicious": [],
         });
-        // 摘要属观测面：LLM 不可用时保留纯代码事实并显式记下原因，不让整个分析失败
-        // （与「执行语义字段报错、观测字段降级」的既有取向一致）。
+        // 项目级伪阶段的独立观测行（票 10 / 决策 48 / 100）：无任务、无游标，
+        // 以 project_id 归属；`agent_type = pseudo:project_analysis` 非 system，
+        // 因此计入全局 total_calls（决策 130 ②）。
         let result = match executor {
-            Some(ex) => match ex.project_analysis(&project, facts.clone()).await {
-                Ok(merged) => merged,
-                Err(e) => {
-                    let mut degraded = facts;
-                    degraded["summary_error"] = json!(e.to_string());
-                    degraded
+            Some(ex) => {
+                let run_id = store
+                    .insert_project_run(&NewProjectRun {
+                        project_id: project.id.clone(),
+                        stage: Stage::Init,
+                        node: Node::Execute,
+                        attempt: 1,
+                        agent_type: PseudoStage::ProjectAnalysis.agent_type().to_string(),
+                    })
+                    .await;
+                let started = std::time::Instant::now();
+                match ex.project_analysis(&project, facts.clone()).await {
+                    Ok(merged) => {
+                        // 会话行：摘要属于观测面，metadata 存完整合并结果（含 summary）
+                        if let Ok(run_id) = run_id {
+                            let _ = store
+                                .finish_run(
+                                    run_id,
+                                    &RunOutcome {
+                                        status: Some(NodeStatus::Success),
+                                        duration_ms: started.elapsed().as_millis() as u64,
+                                        ..Default::default()
+                                    },
+                                )
+                                .await;
+                            let summary = merged
+                                .get("summary")
+                                .and_then(|s| s.as_str())
+                                .unwrap_or_default()
+                                .to_string();
+                            let messages = json!([{ "role": "assistant", "content": summary }]);
+                            let _ = store
+                                .insert_project_conversation(
+                                    &project.id,
+                                    run_id,
+                                    Stage::Init,
+                                    Node::Execute,
+                                    1,
+                                    PseudoStage::ProjectAnalysis.agent_type(),
+                                    &messages,
+                                    Some(&merged),
+                                    0,
+                                    0,
+                                )
+                                .await;
+                        }
+                        merged
+                    }
+                    Err(e) => {
+                        // LLM 不可用：既有降级不回退——保留确定事实 + 记摘要错误；
+                        // run 行按决策 100 收尾为失败（不落会话，与 task 级伪阶段一致）。
+                        if let Ok(run_id) = run_id {
+                            let _ = store
+                                .finish_run(
+                                    run_id,
+                                    &RunOutcome {
+                                        status: Some(NodeStatus::Failed),
+                                        duration_ms: started.elapsed().as_millis() as u64,
+                                        error: Some(e.to_string()),
+                                        ..Default::default()
+                                    },
+                                )
+                                .await;
+                        }
+                        let mut degraded = facts;
+                        degraded["summary_error"] = json!(e.to_string());
+                        degraded
+                    }
                 }
-            },
+            }
+            // 无执行器 = 纯代码探测，没有 LLM 调用，不落 run（total_calls 不计）。
             None => facts,
         };
         let _ = store.finish_analysis(&id, Some(&result), None).await;

@@ -130,6 +130,11 @@ impl KanbanScheduler {
         let stage_configs = self.store.list_stage_configs().await?;
 
         for run in self.store.active_runs().await? {
+            // 项目级伪阶段 run（票 10）无任务 / 游标，不属于节点超时语义，跳过
+            // （其生命周期由 analyze 端点收尾，不以 executor 超时处置）。
+            if run.task_id.is_none() || run.cursor_id.is_none() {
+                continue;
+            }
             let stage_cfg = stage_configs.iter().find(|c| c.stage == run.stage.as_str());
             let node_override = node_timeouts(stage_cfg, run.node.as_str());
             let idle = effective_idle_timeout(
@@ -154,6 +159,11 @@ impl KanbanScheduler {
 
     /// 超时处理：杀进程组 → 未耗尽则干净对话重试 → 耗尽才 pending(timeout)。
     async fn handle_timeout(&self, run: &NodeRun, report: &mut TickReport) -> Result<()> {
+        // 调用方已跳过项目级 run；这里再兜一层，避免无任务 / 游标时误用空值。
+        let (Some(task_id), Some(cursor_id)) = (run.task_id.as_deref(), run.cursor_id.as_deref())
+        else {
+            return Ok(());
+        };
         // 决策 66：杀整个进程组（测试里由记录型终止器断言）
         if let Some(pgid) = run.process_group_id {
             self.killer.kill_process_group(pgid)?;
@@ -176,20 +186,20 @@ impl KanbanScheduler {
             // 未耗尽：干净对话重试当前节点（决策 33），不计 validate_attempts
             self.store
                 .insert_transition(
-                    &run.task_id,
-                    &branch_of(&run.cursor_id, &self.store).await?,
+                    task_id,
+                    &branch_of(cursor_id, &self.store).await?,
                     Some((run.stage, run.node)),
                     (run.stage, run.node),
                     crate::types::TransitionTrigger::Timeout,
                     Some("节点超时，干净对话重试"),
                 )
                 .await?;
-            (self.resume)(&run.task_id);
+            (self.resume)(task_id);
         } else {
             // 耗尽：pending 挂在该 run 所属的**游标**上（决策 82）
             self.store
                 .set_cursor_pending(
-                    &run.cursor_id,
+                    cursor_id,
                     &PendingReason::new(
                         PendingKind::Timeout,
                         run.stage,
@@ -201,9 +211,9 @@ impl KanbanScheduler {
                     ),
                 )
                 .await?;
-            self.store.sync_task_projection(&run.task_id).await?;
-            report.timeout_pending_cursors.push(run.cursor_id.clone());
-            self.emit_pending(&run.task_id, &run.cursor_id).await?;
+            self.store.sync_task_projection(task_id).await?;
+            report.timeout_pending_cursors.push(cursor_id.to_string());
+            self.emit_pending(task_id, cursor_id).await?;
         }
         Ok(())
     }

@@ -28,6 +28,20 @@ pub struct NewRun {
     pub process_group_id: Option<i32>,
 }
 
+/// 新建**项目级** run 的输入（票 10 / 决策 100）。
+///
+/// `project_analysis` 没有任务、没有游标，归属改以 `project_id` 表达；
+/// `task_id` / `cursor_id` 落 NULL（schema 由迁移 0004 放开为可空）。
+#[derive(Debug, Clone)]
+pub struct NewProjectRun {
+    pub project_id: String,
+    pub stage: Stage,
+    pub node: Node,
+    pub attempt: u32,
+    /// 伪阶段名，如 `pseudo:project_analysis`（决策 130 ②：非 `system` 计入 `total_calls`）。
+    pub agent_type: String,
+}
+
 /// run 收尾信息。
 #[derive(Debug, Clone, Default)]
 pub struct RunOutcome {
@@ -44,8 +58,9 @@ pub struct RunOutcome {
 #[derive(Debug, FromRow)]
 struct RunRow {
     id: i64,
-    task_id: String,
-    cursor_id: String,
+    task_id: Option<String>,
+    cursor_id: Option<String>,
+    project_id: Option<String>,
     stage: String,
     node: String,
     attempt: i64,
@@ -71,6 +86,7 @@ impl RunRow {
             id: self.id,
             task_id: self.task_id,
             cursor_id: self.cursor_id,
+            project_id: self.project_id,
             stage: decode_stage(&self.stage)?,
             node: decode_node(&self.node)?,
             attempt: self.attempt as u32,
@@ -94,7 +110,7 @@ impl RunRow {
 }
 
 const RUN_COLUMNS: &str =
-    "id, task_id, cursor_id, stage, node, attempt, agent_type, parent_run_id, \
+    "id, task_id, cursor_id, project_id, stage, node, attempt, agent_type, parent_run_id, \
      status, prompt_tokens, completion_tokens, cache_read_tokens, cache_write_tokens, duration_ms, \
      error, process_group_id, last_activity_at, prompt_template_hash, started_at, finished_at";
 
@@ -104,11 +120,11 @@ impl Store {
         let now = self.now();
         let id: i64 = sqlx::query_scalar(
             "INSERT INTO kanban_node_runs
-             (task_id, cursor_id, stage, node, attempt, agent_type, parent_run_id, status,
+             (task_id, cursor_id, project_id, stage, node, attempt, agent_type, parent_run_id, status,
               prompt_tokens, completion_tokens, cache_read_tokens, cache_write_tokens,
               duration_ms, error, process_group_id, last_activity_at, prompt_template_hash,
               started_at, finished_at)
-             VALUES (?, ?, ?, ?, ?, ?, ?, 'running', 0, 0, 0, 0, 0, NULL, ?, ?, ?, ?, NULL)
+             VALUES (?, ?, NULL, ?, ?, ?, ?, ?, 'running', 0, 0, 0, 0, 0, NULL, ?, ?, ?, ?, NULL)
              RETURNING id",
         )
         .bind(&new_run.task_id)
@@ -121,6 +137,33 @@ impl Store {
         .bind(new_run.process_group_id)
         .bind(ts(now))
         .bind(&new_run.prompt_template_hash)
+        .bind(ts(now))
+        .fetch_one(self.pool())
+        .await?;
+        Ok(id)
+    }
+
+    /// 落一行**项目级**伪阶段 run（票 10 / 决策 100）。
+    ///
+    /// `task_id` / `cursor_id` 为 NULL、`project_id` 归属项目；
+    /// `CHECK` 约束保证归属二选一。用户可在项目分析详情里查看该 run。
+    pub async fn insert_project_run(&self, new_run: &NewProjectRun) -> Result<i64> {
+        let now = self.now();
+        let id: i64 = sqlx::query_scalar(
+            "INSERT INTO kanban_node_runs
+             (task_id, cursor_id, project_id, stage, node, attempt, agent_type, parent_run_id, status,
+              prompt_tokens, completion_tokens, cache_read_tokens, cache_write_tokens,
+              duration_ms, error, process_group_id, last_activity_at, prompt_template_hash,
+              started_at, finished_at)
+             VALUES (NULL, NULL, ?, ?, ?, ?, ?, NULL, 'running', 0, 0, 0, 0, 0, NULL, NULL, ?, NULL, ?, NULL)
+             RETURNING id",
+        )
+        .bind(&new_run.project_id)
+        .bind(new_run.stage.as_str())
+        .bind(new_run.node.as_str())
+        .bind(new_run.attempt as i64)
+        .bind(&new_run.agent_type)
+        .bind(ts(now))
         .bind(ts(now))
         .fetch_one(self.pool())
         .await?;
@@ -197,6 +240,17 @@ impl Store {
             format!("SELECT {RUN_COLUMNS} FROM kanban_node_runs WHERE task_id = ? ORDER BY id");
         let rows: Vec<RunRow> = sqlx::query_as(&sql)
             .bind(task_id)
+            .fetch_all(self.pool())
+            .await?;
+        rows.into_iter().map(RunRow::into_run).collect()
+    }
+
+    /// 某项目的项目级伪阶段 run（`project_analysis`，票 10 / 决策 100）。
+    pub async fn list_project_runs(&self, project_id: &str) -> Result<Vec<NodeRun>> {
+        let sql =
+            format!("SELECT {RUN_COLUMNS} FROM kanban_node_runs WHERE project_id = ? ORDER BY id");
+        let rows: Vec<RunRow> = sqlx::query_as(&sql)
+            .bind(project_id)
             .fetch_all(self.pool())
             .await?;
         rows.into_iter().map(RunRow::into_run).collect()
@@ -526,9 +580,9 @@ impl Store {
         let truncated = truncate_messages_json(messages, self.conversation_max_chars);
         let id: i64 = sqlx::query_scalar(
             "INSERT INTO kanban_node_conversations
-             (task_id, run_id, stage, node, attempt, agent_type, parent_run_id, messages_json,
-              metadata_json, prompt_tokens, completion_tokens, created_at)
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) RETURNING id",
+             (task_id, project_id, run_id, stage, node, attempt, agent_type, parent_run_id,
+              messages_json, metadata_json, prompt_tokens, completion_tokens, created_at)
+             VALUES (?, NULL, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) RETURNING id",
         )
         .bind(task_id)
         .bind(run_id)
@@ -547,30 +601,52 @@ impl Store {
         Ok(id)
     }
 
+    /// 落一行**项目级**伪阶段会话（票 10 / 决策 100）：`project_id` 归属项目，
+    /// `task_id` 为 NULL，`run_id` 指向项目级 run。
+    #[allow(clippy::too_many_arguments)]
+    pub async fn insert_project_conversation(
+        &self,
+        project_id: &str,
+        run_id: i64,
+        stage: Stage,
+        node: Node,
+        attempt: u32,
+        agent_type: &str,
+        messages: &serde_json::Value,
+        metadata: Option<&serde_json::Value>,
+        prompt_tokens: u32,
+        completion_tokens: u32,
+    ) -> Result<i64> {
+        let truncated = truncate_messages_json(messages, self.conversation_max_chars);
+        let id: i64 = sqlx::query_scalar(
+            "INSERT INTO kanban_node_conversations
+             (task_id, project_id, run_id, stage, node, attempt, agent_type, parent_run_id,
+              messages_json, metadata_json, prompt_tokens, completion_tokens, created_at)
+             VALUES (NULL, ?, ?, ?, ?, ?, ?, NULL, ?, ?, ?, ?, ?) RETURNING id",
+        )
+        .bind(project_id)
+        .bind(run_id)
+        .bind(stage.as_str())
+        .bind(node.as_str())
+        .bind(attempt as i64)
+        .bind(agent_type)
+        .bind(truncated.to_string())
+        .bind(metadata.map(|m| m.to_string()))
+        .bind(prompt_tokens as i64)
+        .bind(completion_tokens as i64)
+        .bind(ts(self.now()))
+        .fetch_one(self.pool())
+        .await?;
+        Ok(id)
+    }
+
     pub async fn get_conversation(
         &self,
         task_id: &str,
         run_id: i64,
     ) -> Result<Option<NodeConversation>> {
-        #[derive(FromRow)]
-        struct Row {
-            id: i64,
-            task_id: String,
-            run_id: i64,
-            stage: String,
-            node: String,
-            attempt: i64,
-            agent_type: String,
-            parent_run_id: Option<i64>,
-            messages_json: String,
-            metadata_json: Option<String>,
-            prompt_tokens: i64,
-            completion_tokens: i64,
-            created_at: String,
-            archived_at: Option<String>,
-        }
-        let row: Option<Row> = sqlx::query_as(
-            "SELECT id, task_id, run_id, stage, node, attempt, agent_type, parent_run_id,
+        let row: Option<ConversationRow> = sqlx::query_as(
+            "SELECT id, task_id, project_id, run_id, stage, node, attempt, agent_type, parent_run_id,
                     messages_json, metadata_json, prompt_tokens, completion_tokens, created_at,
                     archived_at
              FROM kanban_node_conversations WHERE task_id = ? AND run_id = ?",
@@ -579,28 +655,26 @@ impl Store {
         .bind(run_id)
         .fetch_optional(self.pool())
         .await?;
-        Ok(match row {
-            Some(r) => Some(NodeConversation {
-                id: r.id,
-                task_id: r.task_id,
-                run_id: r.run_id,
-                stage: decode_stage(&r.stage)?,
-                node: decode_node(&r.node)?,
-                attempt: r.attempt as u32,
-                agent_type: r.agent_type,
-                parent_run_id: r.parent_run_id,
-                messages_json: serde_json::from_str(&r.messages_json)?,
-                metadata_json: r
-                    .metadata_json
-                    .map(|s| serde_json::from_str(&s))
-                    .transpose()?,
-                prompt_tokens: r.prompt_tokens as u32,
-                completion_tokens: r.completion_tokens as u32,
-                created_at: parse_ts(&r.created_at)?,
-                archived_at: r.archived_at.map(|s| parse_ts(&s)).transpose()?,
-            }),
-            None => None,
-        })
+        row.map(ConversationRow::into_conversation).transpose()
+    }
+
+    /// 项目级伪阶段会话（票 10 / 决策 100）：按 `project_id + run_id` 取。
+    pub async fn get_project_conversation(
+        &self,
+        project_id: &str,
+        run_id: i64,
+    ) -> Result<Option<NodeConversation>> {
+        let row: Option<ConversationRow> = sqlx::query_as(
+            "SELECT id, task_id, project_id, run_id, stage, node, attempt, agent_type, parent_run_id,
+                    messages_json, metadata_json, prompt_tokens, completion_tokens, created_at,
+                    archived_at
+             FROM kanban_node_conversations WHERE project_id = ? AND run_id = ?",
+        )
+        .bind(project_id)
+        .bind(run_id)
+        .fetch_optional(self.pool())
+        .await?;
+        row.map(ConversationRow::into_conversation).transpose()
     }
 
     /// 归档任务的全部会话（重试时标记旧 attempt，§12.2 / 决策 113 同构）。
@@ -630,25 +704,8 @@ impl Store {
         task_id: &str,
         include_archived: bool,
     ) -> Result<Vec<NodeConversation>> {
-        #[derive(FromRow)]
-        struct Row {
-            id: i64,
-            task_id: String,
-            run_id: i64,
-            stage: String,
-            node: String,
-            attempt: i64,
-            agent_type: String,
-            parent_run_id: Option<i64>,
-            messages_json: String,
-            metadata_json: Option<String>,
-            prompt_tokens: i64,
-            completion_tokens: i64,
-            created_at: String,
-            archived_at: Option<String>,
-        }
         let mut sql = String::from(
-            "SELECT id, task_id, run_id, stage, node, attempt, agent_type, parent_run_id,
+            "SELECT id, task_id, project_id, run_id, stage, node, attempt, agent_type, parent_run_id,
                     messages_json, metadata_json, prompt_tokens, completion_tokens, created_at,
                     archived_at
              FROM kanban_node_conversations WHERE task_id = ?",
@@ -657,32 +714,31 @@ impl Store {
             sql.push_str(" AND archived_at IS NULL");
         }
         sql.push_str(" ORDER BY id");
-        let rows: Vec<Row> = sqlx::query_as(&sql)
+        let rows: Vec<ConversationRow> = sqlx::query_as(&sql)
             .bind(task_id)
             .fetch_all(self.pool())
             .await?;
         rows.into_iter()
-            .map(|r| {
-                Ok(NodeConversation {
-                    id: r.id,
-                    task_id: r.task_id,
-                    run_id: r.run_id,
-                    stage: decode_stage(&r.stage)?,
-                    node: decode_node(&r.node)?,
-                    attempt: r.attempt as u32,
-                    agent_type: r.agent_type,
-                    parent_run_id: r.parent_run_id,
-                    messages_json: serde_json::from_str(&r.messages_json)?,
-                    metadata_json: r
-                        .metadata_json
-                        .map(|s| serde_json::from_str(&s))
-                        .transpose()?,
-                    prompt_tokens: r.prompt_tokens as u32,
-                    completion_tokens: r.completion_tokens as u32,
-                    created_at: parse_ts(&r.created_at)?,
-                    archived_at: r.archived_at.map(|s| parse_ts(&s)).transpose()?,
-                })
-            })
+            .map(ConversationRow::into_conversation)
+            .collect()
+    }
+
+    /// 某项目的项目级伪阶段会话列表（票 10 / 决策 100）。
+    pub async fn list_project_conversations(
+        &self,
+        project_id: &str,
+    ) -> Result<Vec<NodeConversation>> {
+        let rows: Vec<ConversationRow> = sqlx::query_as(
+            "SELECT id, task_id, project_id, run_id, stage, node, attempt, agent_type, parent_run_id,
+                    messages_json, metadata_json, prompt_tokens, completion_tokens, created_at,
+                    archived_at
+             FROM kanban_node_conversations WHERE project_id = ? ORDER BY id",
+        )
+        .bind(project_id)
+        .fetch_all(self.pool())
+        .await?;
+        rows.into_iter()
+            .map(ConversationRow::into_conversation)
             .collect()
     }
 
@@ -727,6 +783,50 @@ impl Store {
         .fetch_optional(self.pool())
         .await?;
         row.map(CommandRow::into_command).transpose()
+    }
+}
+
+#[derive(Debug, FromRow)]
+struct ConversationRow {
+    id: i64,
+    task_id: Option<String>,
+    project_id: Option<String>,
+    run_id: i64,
+    stage: String,
+    node: String,
+    attempt: i64,
+    agent_type: String,
+    parent_run_id: Option<i64>,
+    messages_json: String,
+    metadata_json: Option<String>,
+    prompt_tokens: i64,
+    completion_tokens: i64,
+    created_at: String,
+    archived_at: Option<String>,
+}
+
+impl ConversationRow {
+    fn into_conversation(self) -> Result<NodeConversation> {
+        Ok(NodeConversation {
+            id: self.id,
+            task_id: self.task_id,
+            project_id: self.project_id,
+            run_id: self.run_id,
+            stage: decode_stage(&self.stage)?,
+            node: decode_node(&self.node)?,
+            attempt: self.attempt as u32,
+            agent_type: self.agent_type,
+            parent_run_id: self.parent_run_id,
+            messages_json: serde_json::from_str(&self.messages_json)?,
+            metadata_json: self
+                .metadata_json
+                .map(|s| serde_json::from_str(&s))
+                .transpose()?,
+            prompt_tokens: self.prompt_tokens as u32,
+            completion_tokens: self.completion_tokens as u32,
+            created_at: parse_ts(&self.created_at)?,
+            archived_at: self.archived_at.map(|s| parse_ts(&s)).transpose()?,
+        })
     }
 }
 

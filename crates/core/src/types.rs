@@ -819,11 +819,18 @@ impl NodeCursor {
 }
 
 /// 节点执行记录（决策 63 / 99 / 114）。
+///
+/// 归属二选一（票 10）：任务级 run 有 `task_id` + `cursor_id`，项目级伪阶段
+/// （`project_analysis`）无任务无游标，改以 `project_id` 归属——两者恰有其一非空。
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct NodeRun {
     pub id: i64,
-    pub task_id: String,
-    pub cursor_id: String,
+    /// 任务级 run 的所属任务；项目级伪阶段为 `None`。
+    pub task_id: Option<String>,
+    /// 任务级 run 的继承游标（决策 113）；项目级伪阶段为 `None`。
+    pub cursor_id: Option<String>,
+    /// 项目级 run 的所属项目（`project_analysis`）；任务级为 `None`。
+    pub project_id: Option<String>,
     pub stage: Stage,
     pub node: Node,
     pub attempt: u32,
@@ -954,10 +961,16 @@ impl FromStr for TransitionTrigger {
 }
 
 /// 节点会话（§12.4.3）。1:1 只对调 LLM 的 run 成立（决策 99）。
+///
+/// 归属二选一（票 10）：任务级会话有 `task_id`，项目级伪阶段（`project_analysis`）
+/// 改以 `project_id` 归属（决策 100：伪阶段独立观测）。
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct NodeConversation {
     pub id: i64,
-    pub task_id: String,
+    /// 任务级会话的所属任务；项目级伪阶段为 `None`。
+    pub task_id: Option<String>,
+    /// 项目级会话的所属项目；任务级为 `None`。
+    pub project_id: Option<String>,
     pub run_id: i64,
     pub stage: Stage,
     pub node: Node,

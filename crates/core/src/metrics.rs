@@ -22,6 +22,9 @@ pub fn total_tokens(runs: &[NodeRun]) -> u64 {
 }
 
 /// 任务累计 LLM 调用次数 = 调 LLM 的 run 行数（排除 `agent_type = "system"`，决策 130 ②）。
+///
+/// 项目级伪阶段 run（`pseudo:project_analysis`，无任务以 `project_id` 归属，票 10）
+/// 一并计入——它同样调了 LLM；`system` run 仍不计。
 pub fn total_calls(runs: &[NodeRun]) -> u64 {
     runs.iter().filter(|r| is_llm_run(r)).count() as u64
 }
@@ -142,8 +145,9 @@ mod tests {
     ) -> NodeRun {
         NodeRun {
             id: 1,
-            task_id: "t1".into(),
-            cursor_id: "c1".into(),
+            task_id: Some("t1".into()),
+            cursor_id: Some("c1".into()),
+            project_id: None,
             stage,
             node,
             attempt,
@@ -155,6 +159,33 @@ mod tests {
             cache_read_tokens: 0,
             cache_write_tokens: 0,
             duration_ms,
+            error: None,
+            process_group_id: None,
+            last_activity_at: None,
+            prompt_template_hash: None,
+            started_at: Utc::now(),
+            finished_at: None,
+        }
+    }
+
+    /// 项目级伪阶段 run：无任务 / 游标，以 `project_id` 归属（票 10 / 决策 100）。
+    fn project_run(agent_type: &str, tokens: (u32, u32)) -> NodeRun {
+        NodeRun {
+            id: 2,
+            task_id: None,
+            cursor_id: None,
+            project_id: Some("p1".into()),
+            stage: Stage::Init,
+            node: Node::Execute,
+            attempt: 1,
+            agent_type: agent_type.into(),
+            parent_run_id: None,
+            status: NodeStatus::Success,
+            prompt_tokens: tokens.0,
+            completion_tokens: tokens.1,
+            cache_read_tokens: 0,
+            cache_write_tokens: 0,
+            duration_ms: 1,
             error: None,
             process_group_id: None,
             last_activity_at: None,
@@ -208,6 +239,19 @@ mod tests {
         ];
         assert_eq!(total_calls(&runs), 3);
         assert_eq!(runs.iter().filter(|r| !is_llm_run(r)).count(), 2);
+    }
+
+    #[test]
+    fn total_calls_counts_project_level_pseudo_run() {
+        // 票 10 / 决策 130 ②：项目级 project_analysis 伪阶段（agent_type = pseudo:*，
+        // 非 system）也调了 LLM，必须计入 total_calls。
+        let runs = vec![
+            run(Stage::Develop, Node::Execute, "main", 1, 10, (1, 1)),
+            project_run("pseudo:project_analysis", (10, 5)),
+        ];
+        assert_eq!(total_calls(&runs), 2, "项目级伪阶段应计入 total_calls");
+        assert_eq!(total_tokens(&runs), 17, "项目级伪阶段 token 也计入总和");
+        assert!(is_llm_run(&project_run("pseudo:project_analysis", (0, 0))));
     }
 
     #[test]

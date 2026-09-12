@@ -1850,4 +1850,127 @@ async fn analyze_merges_project_analysis_llm_summary_into_result() {
         analysis["result"]["language"].is_string(),
         "确定性探测事实必须保留：{analysis}"
     );
+
+    // 票 10 / 决策 100：项目级伪阶段落独立 run + 会话行（无任务、project_id 归属）
+    let runs = api
+        .state
+        .store
+        .list_project_runs(&project_id)
+        .await
+        .unwrap();
+    assert_eq!(runs.len(), 1, "应落一行项目级伪阶段 run");
+    assert_eq!(runs[0].agent_type, "pseudo:project_analysis");
+    assert!(runs[0].task_id.is_none() && runs[0].cursor_id.is_none());
+    assert_eq!(
+        runs[0].status,
+        agentpipeline_core::types::NodeStatus::Success
+    );
+    let conversation = api
+        .state
+        .store
+        .get_project_conversation(&project_id, runs[0].id)
+        .await
+        .unwrap()
+        .expect("应落一行项目级伪阶段会话");
+    assert_eq!(conversation.agent_type, "pseudo:project_analysis");
+
+    // 决策 130 ②：项目级伪阶段计入全局 total_calls（非 system）
+    let all = api.state.store.all_runs().await.unwrap();
+    assert_eq!(agentpipeline_core::metrics::total_calls(&all), 1);
+}
+
+#[tokio::test]
+async fn analyze_keeps_facts_and_records_summary_error_when_llm_unavailable() {
+    // 验收：LLM 不可用时的既有降级不回退——保留确定事实 + 记 summary_error，
+    // 且 run 行按决策 100 收尾为 failed（不落会话），整个分析仍 done。
+    use agentpipeline_core::agent::client::{AgentResponse, LlmClient, LlmRequest};
+    use agentpipeline_core::pipeline::Executor;
+    use futures::future::BoxFuture;
+    use testkit::RecordingKiller;
+
+    struct Unavailable;
+    impl LlmClient for Unavailable {
+        fn complete(
+            &self,
+            _request: LlmRequest,
+        ) -> BoxFuture<'static, agentpipeline_core::Result<AgentResponse>> {
+            Box::pin(async { Err(agentpipeline_core::Error::Llm("provider 不可用".into())) })
+        }
+    }
+
+    let api = api().await;
+    let project_id = seed(&api, "t-degraded").await;
+
+    let executor = Arc::new(Executor::new(
+        api.state.store.clone(),
+        api.state.settings.clone(),
+        api.state.sse.clone(),
+        Arc::new(Unavailable),
+        Arc::new(RecordingKiller::new()),
+    ));
+    let mut state = api.state.clone();
+    state.executor = Some(executor);
+    let router = build_router(state);
+
+    let (status, _) = json_body(
+        router
+            .clone()
+            .oneshot(
+                request("POST", "/projects/analyze")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        serde_json::json!({ "project_id": project_id }).to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(status, StatusCode::ACCEPTED);
+
+    let mut analysis = Value::Null;
+    for _ in 0..200 {
+        let (_, body) = json_body(
+            router
+                .clone()
+                .oneshot(
+                    request("GET", &format!("/projects/{project_id}/analysis"))
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap(),
+        )
+        .await;
+        if body["status"] == "done" || body["status"] == "failed" {
+            analysis = body;
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+
+    assert_eq!(analysis["status"], "done", "降级不使分析失败：{analysis}");
+    assert!(
+        analysis["result"]["summary_error"].is_string(),
+        "应记下摘要错误原因：{analysis}"
+    );
+    assert!(
+        analysis["result"]["language"].is_string(),
+        "确定性探测事实必须保留：{analysis}"
+    );
+
+    // run 行仍落库并收尾为 failed（决策 100：失败等同父节点失败）
+    let runs = api
+        .state
+        .store
+        .list_project_runs(&project_id)
+        .await
+        .unwrap();
+    assert_eq!(runs.len(), 1);
+    assert_eq!(
+        runs[0].status,
+        agentpipeline_core::types::NodeStatus::Failed
+    );
+    assert!(runs[0].error.is_some(), "失败原因应写入 run 行");
 }

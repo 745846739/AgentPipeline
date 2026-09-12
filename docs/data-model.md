@@ -26,7 +26,7 @@ interface Task {
 
   // ── 成本 ──
   total_tokens: number;        // 累计 token（= 该任务所有 kanban_node_runs 行求和，决策 100）
-  total_calls: number;         // 累计 LLM 调用次数 = 调 LLM 的 run 行数（main + 子代理 + 伪阶段，不含 agent_type="system"；决策 130）
+  total_calls: number;         // 累计 LLM 调用次数 = 调 LLM 的 run 行数（main + 子代理 + 伪阶段，不含 agent_type="system"；决策 130。含项目级伪阶段，见 §4.3）
 
   // ── 依赖 ──
   depends_on: string[];        // 前置任务 ID 列表
@@ -67,7 +67,8 @@ type TaskStatus =
  *   - 合并：sync-check 通过后，一个事务内把两条分支行置 status="archived"、插入单条 main 行指向 develop.execute。
  *   - 回退：backtrack 同事务内归档两条分支行、插入单条 main 行指向 architect-design.validate_input。
  *   - 终态：游标行保留（审计与 checkpoint 回放用）；"重试"时归档全部旧行、插入单条 main 游标指向 init.execute。
- *   - 游标行**永不物理删除**（决策 113）：kanban_node_runs.cursor_id 的 NOT NULL 外键因此永不悬空；
+ *   - 游标行**永不物理删除**（决策 113）：kanban_node_runs.cursor_id 的外键因此永不悬空；
+ *     项目级伪阶段 run 的 cursor_id 为 NULL（无游标，见 §4.3，迁移 0004）；
  *     归档行不受 partial UNIQUE 约束，同一分支之后可插入新行（新行新 cursor_id）。
  *   - **会话行同构归档**（§12.2）：`kanban_node_conversations.archived_at` 是会话行的归档标记，
  *     重试把旧会话标记归档（不物理删除，run_id 外键不悬空），列表默认只返回未归档行。
@@ -301,6 +302,54 @@ interface PendingReason {
 
 注：测试代码在 worktree 内 tests/ 目录（*_test.rs）
 ```
+
+### 4.3 项目级伪阶段的 run / 会话行口径（票 10 / 决策 48 / 78 / 100 / 130 ②）
+
+`project_analysis` 是**项目级伪阶段**：由 `POST /projects/analyze` 触发（决策 48 / 130 ⑦），
+没有任务、没有游标。task 内伪阶段（`conflict_check` / `validator_cross_check`）按决策 100
+落独立 run + 会话行，`task_id` / `cursor_id` 都有值；项目级这条需要另定落库口径。
+
+**选型：扩展现有 `kanban_node_runs` / `kanban_node_conversations`（迁移 0004），
+不新开 `kanban_project_runs` 表。** 理由：
+
+1. `total_calls` / `total_tokens` / 阶段聚合等口径都由 `metrics` 纯函数对 run 行取数
+   （决策 130 ② / 137）。同表才能让项目级伪阶段自动进入既有口径，无需第二套聚合与
+   「两表相加」的取数逻辑（避免口径在多个抽取器之间漂移）。
+2. 独立表会把 `kanban_node_commands.run_id`、会话 1:1 关系（决策 99）的外键目标
+   分裂成两个，观测查询需要 `UNION`，`run_id` 也不再是全局唯一句柄。
+3. 代价是一次 SQLite 表重建（见下），但迁移一次性、逻辑与既有行等价。
+
+**列口径（`task_id` / `cursor_id` 放开为可空，新增可空 `project_id`）：**
+
+| 行种类 | `task_id` | `cursor_id` | `project_id` | `agent_type` |
+|---|---|---|---|---|
+| task 节点 run / 会话 | 非空 | 非空 | NULL | `main` / 子代理 / `system` |
+| task 内伪阶段 | 非空 | 非空（继承父游标，决策 113） | NULL | `pseudo:*` |
+| **项目级伪阶段** | **NULL** | **NULL** | **非空** | `pseudo:project_analysis` |
+
+- **外键**：`task_id` → `kanban_tasks`、`cursor_id` → `kanban_node_cursors`、
+  `project_id` → `kanban_projects`，均保持 FK；NULL 在 SQLite 中不受外键约束，
+  故项目行天然不悬空。
+- **归属二选一**：`CHECK ((task_id IS NOT NULL) <> (project_id IS NOT NULL))`——
+  **不使用哨兵值**（如 `task_id = ''`）：SQLite 会在 `PRAGMA foreign_keys = true`
+  下直接以 `FOREIGN KEY constraint failed` 拒绝，外键不可伪造。
+- **`parent_run_id`**：项目级伪阶段无父 run，为 NULL（task 内伪阶段才指向父 run）。
+- **迁移实现**：SQLite 不支持 `ALTER COLUMN` 去 NOT NULL / 加 CHECK，只能重建表——
+  建新表 → 拷旧行 → **先删子表**（`kanban_node_commands` / `kanban_node_conversations`
+  都外键引用 runs，否则父表无法删）→ 删旧 runs → 改名 → 重建索引。
+  整段由 sqlx 包在单事务内执行（要么全成、要么全回滚）。
+  项目级 run 的 `stage` 复用 `init`、`node` 复用 `execute`（伪阶段不占正式节点）。
+
+**`total_calls` 口径（决策 130 ②）：计入。** 口径是「调了 LLM 的 run 行数
+（main + 子代理 + 伪阶段，不含 `agent_type = "system"`）」。`project_analysis` 确实调了
+LLM（`agent_type = pseudo:project_analysis` ≠ `system`），因此**计入**；未注入 executor
+的纯代码探测不落 run，**不计入**。`total_tokens` 同理按行求和（决策 100）。
+该口径由 `metrics::total_calls` 单测与 `crates/core/tests/project_analysis_observation.rs`
+钉住。
+
+**LLM 不可用降级不回退**：摘要属观测面——LLM 失败时保留纯代码探测事实并记
+`summary_error`；run 行仍落库并收尾为 `failed`（含 `error`），不落会话行
+（与 task 级伪阶段失败路径一致），整个分析仍为 `done`。
 
 ---
 
