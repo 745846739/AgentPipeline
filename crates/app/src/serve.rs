@@ -73,14 +73,14 @@ pub async fn serve(port_override: Option<u16>) -> anyhow::Result<ServerHandle> {
     }
 
     // 日志初始化（§10.6.5 / 票 16）：level + format + file 三者生效；
-    // 文件目录在此创建并收紧权限（0700 / 0600，§12.14）。
-    init_tracing(&config, &home)?;
+    // 文件目录在此创建并收紧权限（0700 / 0600，§12.14）。失败不阻断启动。
+    init_tracing(&config, &home);
 
     // `[prompts] dir` 覆盖接入（票 16）：executor 经 `Home::prompts_dir` 取模板目录，
-    // 覆盖目录不存在时也照常回落内嵌 persona（决策 7）。
+    // 覆盖目录尚未存在时也照常回落内嵌 persona（决策 7）。
     let home = match config.prompts.resolved_dir(home.root()) {
         Some(dir) => {
-            prepare_prompts_dir(&dir)?;
+            prepare_prompts_dir(&dir);
             home.with_prompts_dir(Some(dir))
         }
         None => home,
@@ -151,10 +151,17 @@ pub async fn serve(port_override: Option<u16>) -> anyhow::Result<ServerHandle> {
 /// - `file`：同时写入该文件（`~` 可展开、相对路径按 home 根解析）；目录自动创建并
 ///   收紧到 0700、文件 0600（§12.14）。文件无法创建时**不**阻断启动，改为把原因
 ///   打到标准错误——日志初始化失败不该让服务起不来。
-pub fn init_tracing(config: &Config, home: &Home) -> anyhow::Result<()> {
+pub fn init_tracing(config: &Config, home: &Home) {
     let subscriber = build_subscriber(config, home);
-    let _ = tracing::subscriber::set_global_default(subscriber);
-    Ok(())
+    // 已注册（测试进程里的第二次调用）不视为错误。
+    if tracing::subscriber::set_global_default(subscriber).is_ok() {
+        tracing::info!(
+            level = %config.logging.level,
+            format = config.logging.effective_format().as_str(),
+            file = ?config.logging.resolved_file(home.root()),
+            "日志已初始化"
+        );
+    }
 }
 
 /// 按 `[logging]` 构造 subscriber（与全局注册分离，便于测试用 `with_default` 捕获）。
@@ -295,14 +302,19 @@ fn open_log_file(path: &std::path::Path) -> anyhow::Result<std::fs::File> {
 }
 
 /// 准备 `[prompts] dir` 覆盖目录：不存在则创建；仅新建时收紧 0700（§12.14）。
-fn prepare_prompts_dir(dir: &std::path::Path) -> anyhow::Result<()> {
+///
+/// 尽力而为：创建失败只告警——目录缺失时 `resolve_persona` 本就会回落内嵌 persona，
+/// 不该因覆盖目录建不出来而拒绝启动。
+fn prepare_prompts_dir(dir: &std::path::Path) {
     let created = !dir.exists();
-    std::fs::create_dir_all(dir)
-        .with_context(|| format!("创建 prompts 目录失败：{}", dir.display()))?;
-    if created {
-        restrict_permissions(dir);
+    match std::fs::create_dir_all(dir) {
+        Ok(()) => {
+            if created {
+                restrict_permissions(dir);
+            }
+        }
+        Err(e) => eprintln!("警告：创建 prompts 覆盖目录 {} 失败：{e}", dir.display()),
     }
-    Ok(())
 }
 
 #[cfg(test)]
@@ -427,20 +439,26 @@ mod tests {
 
     #[test]
     fn log_file_failure_does_not_block_startup() {
-        // 父路径是文件而非目录 → 目录创建必然失败；初始化仍不得 panic / 报错
+        // 父路径是文件而非目录 → 目录创建必然失败；初始化仍不得 panic
         let tmp = tempfile::tempdir().unwrap();
         let blocker = tmp.path().join("not-a-dir");
         std::fs::write(&blocker, "x").unwrap();
         let home = Home::new(blocker);
         let cfg = logging_config("[logging]\nfile = \"logs/x.log\"\n");
-        init_tracing(&cfg, &home).unwrap();
+        init_tracing(&cfg, &home);
     }
 
     #[test]
     fn prepare_prompts_dir_creates_override_directory() {
         let tmp = tempfile::tempdir().unwrap();
         let dir = tmp.path().join("custom-prompts");
-        prepare_prompts_dir(&dir).unwrap();
+        prepare_prompts_dir(&dir);
         assert!(dir.is_dir());
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(&dir).unwrap().permissions().mode() & 0o777;
+            assert_eq!(mode, 0o700, "新建覆盖目录应为 0700（§12.14）");
+        }
     }
 }
