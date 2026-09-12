@@ -30,10 +30,10 @@
   });
 
   const statusClass = $derived.by(() => {
-    if (isPending) return kind === 'main' ? 'st-warn' : 'st-pend';
-    if (cursor.status === 'waiting_join') return 'st-dim';
-    if (cursor.status === 'archived') return 'st-dim';
-    return 'st-go';
+    if (isPending) return 'wait';
+    if (cursor.status === 'waiting_join') return 'dim';
+    if (cursor.status === 'archived') return 'dim';
+    return 'run';
   });
 
   function handle() {
@@ -43,56 +43,57 @@
 
 <button
   type="button"
-  class="pill {kind} {isPending ? 'pend' : ''} {selected ? 'selected' : ''}"
+  class="pill {isPending ? 'pend' : ''} {selected ? 'selected' : ''}"
   onclick={handle}
   title="cursor_id: {cursor.cursor_id}"
 >
+  <b class="bl">[{kind === 'main' ? 'main' : kind}]</b>
   <span class="mono">{cursor.branch} · {cursor.node}</span>
-  <span class={statusClass}>{statusText}</span>
+  <span class="st {statusClass}">{statusText}</span>
 </button>
 
 <style>
+  /* 分支不用色相，用 [dev]/[tst] 文字标签（决策 84）；状态与文字双编码。 */
   .pill {
     display: inline-flex;
     align-items: center;
     gap: 6px;
     align-self: flex-start;
-    font-family: var(--font-mono);
+    font-family: var(--font-code);
     font-size: 10.5px;
     padding: 2px 7px;
     border-radius: var(--r-pill);
-    background: var(--ink-700);
+    background: transparent;
     color: var(--text-2);
-    border: 1px solid transparent;
+    border: 1px solid var(--hairline);
   }
-  .pill.dev {
-    color: var(--branch-dev);
-    background: rgba(76, 195, 224, 0.08);
+  .pill:hover {
+    border-color: var(--text-2);
+    color: var(--text-hi);
   }
-  .pill.test {
-    color: var(--branch-test);
-    background: rgba(167, 139, 250, 0.08);
-  }
-  .pill.dev.pend {
-    background: rgba(76, 195, 224, 0.14);
-  }
-  .pill.test.pend {
-    background: rgba(167, 139, 250, 0.14);
+  .bl {
+    font-weight: 600;
+    font-size: 10px;
+    letter-spacing: 0.04em;
+    color: var(--text-3);
   }
   .pill.selected {
-    border-color: currentColor;
+    border-color: var(--text-hi);
+    color: var(--text-hi);
   }
-  .st-go {
-    color: var(--signal-go);
+  .pill.pend {
+    border-color: var(--pending);
   }
-  .st-warn,
-  .pill.warn {
-    color: var(--signal-caution);
+  .st.run {
+    color: var(--go);
   }
-  .st-pend {
-    color: var(--signal-caution);
+  .st.wait {
+    color: var(--pending);
   }
-  .st-dim {
-    color: var(--text-3);
+  .st.stop {
+    color: var(--stop);
+  }
+  .st.dim {
+    color: var(--text-4);
   }
 </style>

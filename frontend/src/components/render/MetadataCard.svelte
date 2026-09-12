@@ -38,8 +38,8 @@
 
 <style>
   .meta-card {
-    background: var(--ink-800);
-    border: 1px solid var(--line-soft);
+    background: var(--panel);
+    border: 1px solid var(--pane);
     border-radius: var(--r-panel);
     padding: 10px 12px;
     margin: 8px 0;
@@ -55,7 +55,7 @@
     display: flex;
     gap: 12px;
     padding: 3px 0;
-    border-bottom: 1px solid var(--line-soft);
+    border-bottom: 1px solid var(--hairline);
     font-size: 12px;
   }
   .row:last-child {
@@ -68,14 +68,14 @@
     font-size: 11px;
   }
   .val {
-    color: var(--text-2);
+    color: var(--text-hi);
     white-space: pre-wrap;
     word-break: break-word;
   }
   .raw {
     font-family: var(--font-mono);
     font-size: 11px;
-    color: var(--text-2);
+    color: var(--text-hi);
     white-space: pre-wrap;
     max-height: 280px;
     overflow: auto;

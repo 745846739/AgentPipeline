@@ -11,15 +11,15 @@
 
 <style>
   .code {
-    background: var(--ink-800);
-    border: 1px solid var(--line-soft);
+    background: var(--panel);
+    border: 1px solid var(--pane);
     border-radius: var(--r-panel);
     padding: 10px 12px;
     overflow: auto;
     font-family: var(--font-mono);
     font-size: 11.5px;
     line-height: 1.7;
-    color: var(--text-2);
+    color: var(--text);
     white-space: pre;
   }
 </style>

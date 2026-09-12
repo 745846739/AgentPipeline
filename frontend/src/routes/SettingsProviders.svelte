@@ -212,18 +212,25 @@
   {:else if providers.length === 0}
     <div class="banner">还没有 provider。新增一行后，任务的阶段模型才会被解析。</div>
   {:else}
-    <ul class="rows">
+    <div class="list">
+      <div class="list-head">
+        <span>provider</span>
+        <span class="col-n">{providers.length}</span>
+      </div>
+      <ul class="rows">
       {#each providers as p (p.id)}
         {@const supported = isSupportedAdapter(p.vendor)}
-        <li class="row panel" class:unsupported={!supported}>
+        <li class="row" class:unsupported={!supported}>
           <div class="main">
             <div class="line1">
               <span class="vendor mono">{p.vendor}</span>
               <span class="model mono">{p.model}</span>
-              <span class="status {p.enabled ? 'on' : 'off'}">
-                {p.enabled ? 'enabled' : 'disabled'}
-              </span>
-              {#if !supported}<span class="warn-chip">不受支持 · 决策 103</span>{/if}
+              {#if p.enabled}
+                <span class="st run">[ON]</span>
+              {:else}
+                <span class="st dim">[OFF]</span>
+              {/if}
+              {#if !supported}<span class="warn-tag">! 不受支持 · 决策 103</span>{/if}
             </div>
             <div class="line2 mono">
               <span>ctx {p.context_window.toLocaleString('en-US')}</span>
@@ -267,7 +274,8 @@
           </div>
         </li>
       {/each}
-    </ul>
+      </ul>
+    </div>
   {/if}
 
   <!-- stage_configs 编辑器（决策 22 / 46 / 66 / 111 / 129）：GET 列表 / PUT 整条替换 / DELETE 撤销覆盖。 -->
@@ -300,9 +308,14 @@
     {:else if stageConfigs.length === 0}
       <div class="banner">还没有阶段覆盖。所有阶段都在用系统默认配置。</div>
     {:else}
-      <ul class="rows">
+      <div class="list">
+        <div class="list-head">
+          <span>阶段配置</span>
+          <span class="col-n">{stageConfigs.length}</span>
+        </div>
+        <ul class="rows">
         {#each stageConfigs as sc (sc.stage)}
-          <li class="row panel" class:pseudo={isPseudoStage(sc.stage)}>
+          <li class="row" class:pseudo={isPseudoStage(sc.stage)}>
             <div class="main">
               <div class="line1">
                 <span class="vendor mono">{stageKeyLabel(sc.stage)}</span>
@@ -351,7 +364,8 @@
             </div>
           </li>
         {/each}
-      </ul>
+        </ul>
+      </div>
     {/if}
   </section>
 </div>
@@ -390,39 +404,72 @@
   }
   .banner {
     padding: 10px 12px;
-    border: 1px solid var(--line);
-    border-radius: var(--r-panel);
+    border: 1px solid var(--pane);
+    border-radius: 0;
     color: var(--text-3);
     font-size: 12px;
   }
   .banner.error {
-    border-color: var(--signal-stop);
-    color: var(--signal-stop);
+    border-color: var(--stop);
+    color: var(--stop);
+  }
+  .list {
+    border: 1px solid var(--pane);
+    background: var(--bg);
+    margin-top: 4px;
+  }
+  .list-head {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    gap: 8px;
+    padding: 9px 12px;
+    border-bottom: 1px solid var(--pane);
+    background: var(--head-band);
+    font-size: 10.5px;
+    font-weight: 600;
+    letter-spacing: 0.08em;
+    text-transform: uppercase;
+    color: var(--text-3);
+  }
+  .col-n {
+    color: var(--text-4);
+    font-weight: 400;
   }
   .rows {
     list-style: none;
     display: flex;
     flex-direction: column;
-    gap: 8px;
-    margin-top: 4px;
   }
   .row {
     display: flex;
     align-items: flex-start;
     justify-content: space-between;
     gap: 12px;
-    padding: 10px 12px;
+    padding: 11px 12px 12px;
+    border-bottom: 1px solid var(--hairline);
+    transition: background 0.12s;
   }
+  .row:last-child {
+    border-bottom: 0;
+  }
+  .row:hover {
+    background: var(--hover-bg);
+  }
+  /* 决策 103：不受支持的适配器降级灰显 + 琥珀告警，不崩 */
   .row.unsupported {
-    opacity: 0.72;
-    border-color: var(--signal-caution);
+    color: var(--text-4);
+  }
+  .row.unsupported .vendor,
+  .row.unsupported .model {
+    color: var(--text-4);
   }
   .main {
     min-width: 0;
   }
   .line1 {
     display: flex;
-    align-items: center;
+    align-items: baseline;
     gap: 10px;
     flex-wrap: wrap;
   }
@@ -434,38 +481,25 @@
     color: var(--text-2);
     font-size: 12px;
   }
-  .status {
-    font-family: var(--font-mono);
+  .warn-tag {
     font-size: 10.5px;
-  }
-  .status.on {
-    color: var(--signal-go);
-  }
-  .status.off {
-    color: var(--text-3);
-  }
-  .warn-chip {
-    font-size: 10.5px;
-    color: var(--signal-caution);
-    border: 1px solid var(--signal-caution);
-    border-radius: var(--r-pill);
-    padding: 0 5px;
+    color: var(--pending);
   }
   .line2 {
     display: flex;
     gap: 14px;
     flex-wrap: wrap;
-    margin-top: 4px;
-    font-size: 11px;
+    margin-top: 5px;
+    font-size: 10.5px;
     color: var(--text-3);
   }
   .warn-text {
     margin-top: 5px;
-    font-size: 11.5px;
-    color: var(--signal-caution);
+    font-size: 11px;
+    color: var(--pending);
   }
   .warn-text.stop {
-    color: var(--signal-stop);
+    color: var(--stop);
   }
   .acts {
     display: flex;
@@ -494,7 +528,8 @@
   .sc-hint {
     margin-bottom: 12px;
   }
+  /* 伪阶段不再用分支色相（决策 84）：左缘亮度阶 + [伪] 文字标记 */
   .row.pseudo {
-    border-left: 2px solid var(--branch-test);
+    border-left: 2px solid var(--text-3);
   }
 </style>

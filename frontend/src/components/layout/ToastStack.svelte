@@ -11,7 +11,7 @@
 <div class="toasts" aria-live="polite">
   {#each notifications.toasts as toast (toast.id)}
     <div class="toast {toast.cls}">
-      <span class="dot"></span>
+      <span class="dot {toast.cls === 'pending' ? 'warn-dot' : ''}"></span>
       <button type="button" class="body" onclick={() => openTask(toast.taskId, toast.id)}>
         <span class="title">{toast.title}</span>
         {#if toast.message}<span class="msg">{toast.message}</span>{/if}
@@ -43,31 +43,32 @@
     align-items: flex-start;
     gap: 8px;
     text-align: left;
-    background: var(--ink-800);
-    border: 1px solid var(--line);
-    border-radius: var(--r-panel);
+    background: var(--panel);
+    border: 1px solid var(--pane);
+    border-radius: 0;
     padding: 10px 12px;
   }
   .toast.pending {
-    border-color: var(--signal-caution);
+    border-color: var(--pending);
   }
   .toast.failed {
-    border-color: var(--signal-stop);
+    border-color: var(--stop);
   }
   .dot {
-    width: 6px;
-    height: 6px;
-    border-radius: 50%;
     margin-top: 5px;
     flex: none;
-    background: var(--signal-done);
+    color: var(--done);
+    font-size: 10px;
+    line-height: 1;
+  }
+  .dot::before {
+    content: '●';
   }
   .toast.pending .dot {
-    background: var(--signal-caution);
-    animation: breath 2.4s ease-in-out infinite;
+    color: var(--pending);
   }
   .toast.failed .dot {
-    background: var(--signal-stop);
+    color: var(--stop);
   }
   .body {
     display: flex;
@@ -84,7 +85,7 @@
   }
   .msg {
     color: var(--text-3);
-    font-size: 11.5px;
+    font-size: 11px;
     overflow: hidden;
     text-overflow: ellipsis;
     white-space: nowrap;

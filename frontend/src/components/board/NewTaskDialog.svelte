@@ -118,7 +118,7 @@
     position: fixed;
     inset: 0;
     z-index: 60;
-    background: rgba(6, 10, 16, 0.62);
+    background: var(--overlay);
     display: flex;
     align-items: center;
     justify-content: center;
@@ -126,10 +126,12 @@
   .dialog {
     width: 480px;
     max-width: calc(100vw - 32px);
-    padding: 18px 20px;
+    padding: 16px 18px;
+    border-radius: 0;
+    box-shadow: none;
   }
   .head {
-    font-size: 15px;
+    font-size: 13px;
     color: var(--text-hi);
     margin-bottom: 14px;
   }
@@ -139,13 +141,14 @@
   }
   .field > span {
     display: block;
-    font-size: 11.5px;
-    color: var(--text-3);
+    font-size: 11px;
+    color: var(--text-4);
+    letter-spacing: 0.04em;
     margin-bottom: 4px;
   }
   .error {
-    color: var(--signal-stop);
-    font-size: 12px;
+    color: var(--stop);
+    font-size: 11.5px;
     margin: 4px 0 8px;
   }
   .actions {

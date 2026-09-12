@@ -47,17 +47,19 @@
 
 <style>
   .tokmeter {
+    clear: both;
     text-align: right;
     font-family: var(--font-mono);
-    font-size: 11px;
+    font-size: 10.5px;
+    font-variant-numeric: tabular-nums;
     color: var(--text-3);
     padding: 6px 0;
   }
   .tokmeter b {
-    color: var(--signal-go);
+    color: var(--text-hi);
     font-weight: 500;
   }
   .live {
-    color: var(--signal-go);
+    color: var(--go);
   }
 </style>

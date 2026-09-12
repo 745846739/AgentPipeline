@@ -172,9 +172,14 @@
   {:else if projects.length === 0}
     <div class="banner">还没有项目。新建一个本地 git 仓库后才能创建任务。</div>
   {:else}
-    <ul class="rows">
+    <div class="list">
+      <div class="list-head">
+        <span>项目</span>
+        <span class="col-n">{projects.length}</span>
+      </div>
+      <ul class="rows">
       {#each projects as p (p.id)}
-        <li class="row panel">
+        <li class="row">
           <div class="main">
             <div class="line1">
               <span class="name">{p.name}</span>
@@ -227,7 +232,8 @@
           </div>
         </li>
       {/each}
-    </ul>
+      </ul>
+    </div>
   {/if}
 
   {#if analysisFor}
@@ -236,8 +242,10 @@
     {:else if analysis}
       <AnalysisChecklist {analysis} onclose={() => (analysisFor = null)} />
     {:else}
-      <section class="analysis panel">
-        <div class="running"><span class="dot"></span>正在触发 project_analysis 伪阶段…</div>
+      <section class="analysis">
+        <div class="running">
+          <span class="st run">[RUN]</span>正在触发 project_analysis 伪阶段…
+        </div>
       </section>
     {/if}
   {/if}
@@ -277,29 +285,58 @@
   }
   .banner {
     padding: 10px 12px;
-    border: 1px solid var(--line);
-    border-radius: var(--r-panel);
+    border: 1px solid var(--pane);
+    border-radius: 0;
     color: var(--text-3);
     font-size: 12px;
     margin-top: 10px;
   }
   .banner.error {
-    border-color: var(--signal-stop);
-    color: var(--signal-stop);
+    border-color: var(--stop);
+    color: var(--stop);
+  }
+  .list {
+    border: 1px solid var(--pane);
+    background: var(--bg);
+    margin-top: 4px;
+  }
+  .list-head {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    gap: 8px;
+    padding: 9px 12px;
+    border-bottom: 1px solid var(--pane);
+    background: var(--head-band);
+    font-size: 10.5px;
+    font-weight: 600;
+    letter-spacing: 0.08em;
+    text-transform: uppercase;
+    color: var(--text-3);
+  }
+  .col-n {
+    color: var(--text-4);
+    font-weight: 400;
   }
   .rows {
     list-style: none;
     display: flex;
     flex-direction: column;
-    gap: 8px;
-    margin-top: 4px;
   }
   .row {
     display: flex;
     align-items: flex-start;
     justify-content: space-between;
     gap: 12px;
-    padding: 10px 12px;
+    padding: 11px 12px 12px;
+    border-bottom: 1px solid var(--hairline);
+    transition: background 0.12s;
+  }
+  .row:last-child {
+    border-bottom: 0;
+  }
+  .row:hover {
+    background: var(--hover-bg);
   }
   .main {
     min-width: 0;
@@ -311,7 +348,7 @@
   }
   .name {
     color: var(--text-hi);
-    font-size: 13px;
+    font-size: 12.5px;
     font-weight: 500;
   }
   .branch {
@@ -328,14 +365,14 @@
     display: flex;
     gap: 14px;
     flex-wrap: wrap;
-    margin-top: 4px;
-    font-size: 11px;
+    margin-top: 5px;
+    font-size: 10.5px;
     color: var(--text-3);
   }
   .row-err {
     margin-top: 5px;
     font-size: 11.5px;
-    color: var(--signal-stop);
+    color: var(--stop);
     white-space: pre-wrap;
   }
   .acts {
@@ -351,6 +388,8 @@
   .analysis {
     padding: 12px 14px;
     margin-top: 10px;
+    border: 1px solid var(--pane);
+    background: var(--panel);
   }
   .running {
     display: flex;
@@ -358,12 +397,5 @@
     gap: 8px;
     font-size: 12px;
     color: var(--text-2);
-  }
-  .running .dot {
-    width: 7px;
-    height: 7px;
-    border-radius: 50%;
-    background: var(--signal-go);
-    animation: breath 1.4s ease-in-out infinite;
   }
 </style>

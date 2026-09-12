@@ -173,6 +173,35 @@ export function miniRailState(task: MiniRailInput): MiniDotState[] {
   return dots;
 }
 
+/* ─────────────────────────────── 字符迷你轨 ─────────────────────────────── */
+
+/**
+ * 迷你轨字符记号（theme-3 §3 共享元素映射）。
+ * 结构靠字符，不靠盒子：f 未到 / p 已过 / d 完成 / c 当前 / v 当前分叉
+ * / w 等待 / x 失败 / t test 未决。
+ */
+export type RailToken = 'f' | 'p' | 'd' | 'c' | 'v' | 'w' | 'x' | 't';
+
+const DOT_TO_TOKEN: Record<MiniDotState, RailToken> = {
+  idle: 'f',
+  past: 'p',
+  done: 'd',
+  cur: 'c',
+  'cur-warn': 'w',
+  'cur-stop': 'x',
+  dev: 'v',
+  tst: 't',
+};
+
+export function railTokens(dots: MiniDotState[]): RailToken[] {
+  return dots.map((d) => DOT_TO_TOKEN[d]);
+}
+
+/** 该记号之后连接段点亮（已过 / 完成 / 当前分叉）。 */
+export function tokenLitsSegment(token: RailToken): boolean {
+  return token === 'p' || token === 'd' || token === 'v';
+}
+
 /** 该任务是否在并行区间（决定卡片渲染双药丸）。 */
 export function isInParallel(task: MiniRailInput): boolean {
   if (task.current_stage === 'develop-design' || task.current_stage === 'test-design') return true;
@@ -203,30 +232,36 @@ interface Geometry {
   y: number;
 }
 
-/** 脊线坐标（看板列头挂站点，列中心 = 160 + 292i）。 */
+/**
+ * 脊线站点坐标：列宽 264px、列间共享 1px 框线，站点落在列中心
+ * （列 i 中心 = 132 + 264i；并行区间是一个列两个侧站，共用 x = 660）。
+ */
 const SPINE_GEOM: Record<string, Geometry> = {
-  init: { x: 160, y: 62 },
-  'architect-design': { x: 452, y: 62 },
-  'develop-design': { x: 744, y: 38 },
-  'test-design': { x: 744, y: 86 },
-  develop: { x: 1036, y: 62 },
-  review: { x: 1328, y: 62 },
-  test: { x: 1620, y: 62 },
-  merge: { x: 1912, y: 62 },
-  done: { x: 2204, y: 62 },
+  init: { x: 132, y: 62 },
+  'architect-design': { x: 396, y: 62 },
+  'develop-design': { x: 660, y: 22 },
+  'test-design': { x: 660, y: 50 },
+  develop: { x: 924, y: 62 },
+  review: { x: 1188, y: 62 },
+  test: { x: 1452, y: 62 },
+  merge: { x: 1716, y: 62 },
+  done: { x: 1980, y: 62 },
 };
 
-/** hero 坐标。 */
+/**
+ * hero 坐标：详情内容区最宽 1040px，主站均匀分布，并行区间双侧站共用 x。
+ * y 仅用于侧站上下分行（主站恒 62，由 .stn 的 top:29px 决定）。
+ */
 const HERO_GEOM: Record<string, Geometry> = {
-  init: { x: 70, y: 66 },
-  'architect-design': { x: 196, y: 66 },
-  'develop-design': { x: 320, y: 40 },
-  'test-design': { x: 320, y: 92 },
-  develop: { x: 560, y: 66 },
-  review: { x: 710, y: 66 },
-  test: { x: 860, y: 66 },
-  merge: { x: 1010, y: 66 },
-  done: { x: 1090, y: 66 },
+  init: { x: 60, y: 62 },
+  'architect-design': { x: 165, y: 62 },
+  'develop-design': { x: 365, y: 22 },
+  'test-design': { x: 365, y: 50 },
+  develop: { x: 565, y: 62 },
+  review: { x: 690, y: 62 },
+  test: { x: 815, y: 62 },
+  merge: { x: 940, y: 62 },
+  done: { x: 1030, y: 62 },
 };
 
 export const RAIL_LABELS: Record<string, string> = {

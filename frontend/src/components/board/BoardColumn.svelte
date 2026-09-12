@@ -20,7 +20,7 @@
 
 <section class="col">
   <div class="col-head">
-    <span class="col-name cond">{column.label}</span>
+    <span class="col-name">{column.label}</span>
     {#if tasks.length > 0}<span class="col-n">{tasks.length}</span>{/if}
   </div>
 
@@ -44,27 +44,35 @@
   .col {
     width: var(--rail-col-width);
     flex: none;
+    border-right: 1px solid var(--pane);
+    display: flex;
+    flex-direction: column;
+  }
+  .col:last-child {
+    border-right: 0;
   }
   .col-head {
     display: flex;
-    align-items: baseline;
+    justify-content: space-between;
+    align-items: center;
     gap: 8px;
-    padding: 2px 4px 10px;
-  }
-  .col-name {
-    font-size: 12.5px;
-    color: var(--text-2);
+    padding: 9px 12px;
+    border-bottom: 1px solid var(--pane);
+    background: var(--head-band);
+    font-size: 10.5px;
+    font-weight: 600;
+    letter-spacing: 0.08em;
+    text-transform: uppercase;
+    color: var(--text-3);
   }
   .col-n {
-    font-family: var(--font-mono);
-    font-size: 11px;
-    color: var(--text-3);
+    color: var(--text-4);
+    font-weight: 400;
+    font-variant-numeric: tabular-nums;
   }
   .col-empty {
-    border: 1px dashed var(--line);
-    border-radius: var(--r-panel);
-    padding: 18px 14px;
-    color: var(--text-3);
-    font-size: 12px;
+    padding: 14px 12px;
+    color: var(--text-4);
+    font-size: 11.5px;
   }
 </style>

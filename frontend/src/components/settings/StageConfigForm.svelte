@@ -163,12 +163,11 @@
   }
   .replace-note {
     font-size: 11.5px;
-    color: var(--signal-caution);
+    color: var(--pending);
     line-height: 1.6;
     margin-bottom: 10px;
     padding: 7px 10px;
-    border: 1px solid var(--signal-caution);
-    border-radius: var(--r-panel);
+    border: 1px solid var(--pending);
   }
   .grid {
     display: grid;
@@ -194,7 +193,7 @@
     opacity: 0.6;
   }
   .error {
-    color: var(--signal-stop);
+    color: var(--stop);
     font-size: 12px;
     margin-top: 8px;
     white-space: pre-wrap;

@@ -57,12 +57,12 @@
 </script>
 
 <aside class="dossier" aria-label="待办">
-  <div class="dtag cond">等待你处理 · {pendingLabel(reason)}</div>
+  <div class="dtag">⏸ 等你拍板 · {pendingLabel(reason)}</div>
   <div class="msg">{reason.message}</div>
 
   {#if conflicts.length > 0}
     <div class="ctx">
-      冲突任务：{conflicts.join('、')}
+      冲突任务：<b>{conflicts.join('、')}</b>
     </div>
   {/if}
   {#if reason.context?.kind}
@@ -70,6 +70,7 @@
   {/if}
 
   {#if pendingType === 'merge_approval'}
+    <div class="grp">恢复动作</div>
     <DiffReviewPanel
       {diff}
       raw={rawDiff}
@@ -83,6 +84,7 @@
       onreload={onreloaddiff}
     />
   {:else if pendingType === 'human_review'}
+    <div class="grp">人工评审</div>
     <ReviewForm
       {diff}
       raw={rawDiff}
@@ -95,6 +97,7 @@
       onreload={onreloaddiff}
     />
   {:else}
+    <div class="grp">恢复动作</div>
     <PendingActions
       {actions}
       {cursors}
@@ -121,45 +124,68 @@
 
 <style>
   .dossier {
+    grid-column: 2;
+    grid-row: 1 / span 3;
     align-self: start;
     position: sticky;
-    top: 64px;
-    background: var(--ink-800);
-    border: 1px solid var(--signal-caution);
-    border-radius: var(--r-panel);
-    padding: 14px 16px;
+    top: 56px;
+    background: var(--panel);
+    border: 1px solid var(--pane);
+    padding: 13px 15px;
     max-height: calc(100vh - 84px);
     overflow: auto;
   }
   .dtag {
     font-size: 11px;
-    color: var(--signal-caution);
+    font-weight: 600;
+    color: var(--pending);
     margin-bottom: 8px;
   }
   .msg {
-    font-size: 12.5px;
+    font-size: 11.5px;
     color: var(--text-hi);
-    margin-bottom: 10px;
+    margin-bottom: 9px;
   }
   .ctx {
-    font-size: 12px;
+    font-size: 11px;
     color: var(--text-2);
     margin-bottom: 6px;
+    line-height: 1.8;
+  }
+  .ctx b {
+    color: var(--go);
+    font-weight: 500;
   }
   .dim {
-    color: var(--text-3);
-    font-size: 11px;
+    color: var(--text-4);
   }
   .trigger {
     margin-top: 10px;
   }
+  .grp {
+    font-size: 10px;
+    color: var(--text-4);
+    letter-spacing: 0.08em;
+    margin: 12px 0 7px;
+    text-transform: uppercase;
+  }
   .linklike {
-    color: var(--branch-dev);
-    font-size: 12px;
+    color: var(--text-hi);
+    font-size: 11px;
     padding: 0;
     text-align: left;
-  }
-  .linklike:hover {
     text-decoration: underline;
+    text-underline-offset: 3px;
+  }
+  .dossier :global(.btn) {
+    display: block;
+    width: 100%;
+    text-align: left;
+    margin-bottom: 6px;
+  }
+  .dossier :global(.actions) {
+    flex-direction: column;
+    align-items: stretch;
+    justify-content: flex-start;
   }
 </style>

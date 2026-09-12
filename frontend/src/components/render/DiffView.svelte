@@ -44,9 +44,9 @@
     align-items: center;
     gap: 8px;
     font-family: var(--font-mono);
-    font-size: 12px;
+    font-size: 11.5px;
     font-weight: 500;
-    color: var(--text-2);
+    color: var(--text-hi);
     margin-bottom: 6px;
   }
   .path {
@@ -64,8 +64,9 @@
     flex: none;
   }
   .st.modified {
-    color: var(--branch-dev);
-    background: rgba(76, 195, 224, 0.1);
+    color: var(--text-2);
+    background: var(--panel);
+    border: 1px solid var(--pane);
   }
   .st.added {
     color: var(--diff-add);
@@ -82,7 +83,7 @@
     flex: none;
   }
   .dbody {
-    border: 1px solid var(--line-soft);
+    border: 1px solid var(--pane);
     border-radius: var(--r-panel);
     overflow: auto;
     max-height: 520px;
@@ -104,13 +105,13 @@
     color: var(--diff-del);
   }
   .dl.hunk {
-    color: var(--branch-dev);
-    background: var(--ink-800);
+    color: var(--text-2);
+    background: var(--panel);
   }
   .dl.meta {
     color: var(--text-3);
-    background: var(--ink-800);
-    border-bottom: 1px solid var(--line-soft);
+    background: var(--panel);
+    border-bottom: 1px solid var(--hairline);
   }
   .raw {
     font-family: var(--font-mono);

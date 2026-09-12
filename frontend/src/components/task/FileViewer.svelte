@@ -98,17 +98,17 @@
     gap: 10px;
     width: 100%;
     text-align: left;
-    padding: 7px 10px;
-    border-radius: var(--r-panel);
+    padding: 4px 8px;
     font-size: 11.5px;
     color: var(--text-2);
+    cursor: pointer;
   }
   .cmd:hover,
   .cmd.active {
-    background: var(--ink-800);
+    background: var(--hover-bg);
   }
   .cmd.active .c {
-    color: var(--branch-dev);
+    color: var(--text-hi);
   }
   .c {
     flex: 1;
@@ -136,13 +136,13 @@
     margin-bottom: 10px;
   }
   .degraded {
-    color: var(--signal-stop);
+    color: var(--stop);
   }
   .hint {
     color: var(--text-3);
     font-size: 12px;
   }
   .hint.error {
-    color: var(--signal-stop);
+    color: var(--stop);
   }
 </style>

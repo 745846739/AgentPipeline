@@ -16,7 +16,10 @@
 
 {#if message.role === 'system'}
   <details class="sys">
-    <summary class="who sys">SYSTEM ▾ <span class="dim">折叠 · {lineCount(message.content)} 行</span></summary>
+    <summary class="sys-sum">
+      <span class="who sys">SYSTEM</span>
+      <span class="dim">折叠 · {lineCount(message.content)} 行</span>
+    </summary>
     <div class="sysbox">{message.content ?? ''}</div>
   </details>
 {:else if message.role === 'user'}
@@ -52,40 +55,59 @@
   }
   .who {
     font-family: var(--font-cond);
-    font-size: 10.5px;
+    font-size: 10px;
     font-weight: 600;
-    letter-spacing: 0.05em;
+    letter-spacing: 0.1em;
     color: var(--text-3);
     margin-bottom: 3px;
   }
+  .who::after {
+    content: ' ▸';
+    color: var(--text-4);
+  }
+  .who.sys {
+    color: var(--text-4);
+  }
   .who.as {
-    color: var(--signal-go);
+    color: var(--text-hi);
   }
-  .dim {
-    font-weight: 400;
-    color: var(--text-3);
-  }
-  .sys summary {
+  .sys-sum {
+    display: flex;
+    align-items: baseline;
+    gap: 8px;
     cursor: pointer;
     list-style: none;
   }
-  .sysbox {
-    border: 1px solid var(--line-soft);
-    background: var(--ink-800);
-    border-radius: var(--r-panel);
-    padding: 8px 12px;
+  .sys-sum::-webkit-details-marker {
+    display: none;
+  }
+  .dim {
+    font-weight: 400;
+    letter-spacing: 0;
     color: var(--text-3);
-    font-size: 12px;
-    white-space: pre-wrap;
+    font-size: 11px;
+  }
+  .sysbox {
+    border: 1px dashed var(--pane);
+    padding: 6px 10px;
+    color: var(--text-3);
+    font-size: 11.5px;
     font-family: var(--font-mono);
+    white-space: pre-wrap;
     max-height: 320px;
     overflow: auto;
+    cursor: pointer;
   }
   .userbox {
     color: var(--text-2);
     white-space: pre-wrap;
     font-family: var(--font-ui);
-    font-size: 13px;
+    font-size: 12px;
     line-height: 1.6;
+  }
+  /* 助手段落最大 76ch：提高特异性压过 MarkdownView 自身的 .md（80ch），
+     不改 MarkdownView 的公共宽度，也不波及同列的 ToolCallCard。 */
+  .msg.assistant :global(.md) {
+    max-width: 76ch;
   }
 </style>

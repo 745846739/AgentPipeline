@@ -58,7 +58,7 @@
     position: fixed;
     inset: 0;
     z-index: 60;
-    background: rgba(6, 10, 16, 0.62);
+    background: var(--overlay);
     display: flex;
     align-items: center;
     justify-content: center;
@@ -69,7 +69,8 @@
     padding: 18px 20px;
   }
   .head {
-    font-size: 15px;
+    font-size: 13px;
+    color: var(--text-hi);
     margin-bottom: 8px;
   }
   .hint {
@@ -78,7 +79,7 @@
     margin-bottom: 10px;
   }
   .error {
-    color: var(--signal-stop);
+    color: var(--stop);
     font-size: 12px;
     margin-top: 6px;
   }

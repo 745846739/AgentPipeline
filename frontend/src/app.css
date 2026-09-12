@@ -1,44 +1,141 @@
 /* ─────────────────────────────────────────────────────────────
-   AgentPipeline · 夜间调度台
-   design/frontend-design.md §3 视觉令牌（唯一权威来源）
+   AgentPipeline · 主题三「终端 · 调度电报」
+   design/theme-3-terminal.md §2 视觉令牌（唯一权威来源）
+   深色为默认；浅色「绿杠电报纸」经 html[data-theme="light"] 覆盖。
+   语义命名对齐 design/frontend-design.md §3；旧夜间调度台名保留为
+   惰性别名（var 惰性求值 → 自动跟随主题），供逐组件迁移期过渡。
    ───────────────────────────────────────────────────────────── */
 
 :root {
-  /* §3.1 色彩 */
-  --ink-900: #0c121b; /* 页面底色，港湾蓝黑 */
-  --ink-800: #111a26; /* 面板 / 卡片 */
-  --ink-700: #16212f; /* 悬浮 / 二级面板 */
-  --line: #223246; /* 描边、分隔线 */
-  --line-soft: #1b2838; /* 弱分隔、轨道暗段 */
-  --text-hi: #e9eff7; /* 主文本 */
-  --text-2: #9db0c5; /* 次文本 */
-  --text-3: #64788f; /* 弱文本、占位 */
+  /* §2.1 色彩 — 深色磷光 */
+  --bg: #0a0f0b; /* 磷光黑绿，页面底色 */
+  --panel: #0d130f; /* 窗格底 / hover 行底 */
+  --wash: #141c16; /* 交互态再深一档 */
+  --pane: #23392b; /* 窗格 1px 框线 */
+  --hairline: #16241b; /* 弱分隔、电文行分隔 */
+  --text-hi: #d6f2dc; /* 亮磷光：标题、当前游标、可执行物 */
+  --text: #a6d8b2; /* 正文 */
+  --text-2: #6fa481; /* 次文本 */
+  --text-3: #5e9673; /* 弱文本、列头、站点标签 */
+  --text-4: #49775a; /* 占位/装饰刻度，不承载必读信息 */
 
-  --signal-go: #3fd68f; /* running / 通过 / 游标亮段 */
-  --signal-caution: #f2b33d; /* pending / stalled（唯一告警色） */
-  --signal-stop: #e5544b; /* failed / 打回 / 破坏性动作 */
-  --signal-done: #7c93ac; /* done（刻意退后） */
+  --go: #8ff0a8; /* running：反白底色 */
+  --go-ink: #07120a; /* 反白前景 */
+  --go-hi: #a5f5bc; /* 主动作 hover */
+  --pending: #ffb454; /* pending / stalled（全站唯一告警） */
+  --stop: #ff7a70; /* failed / 打回 / 破坏性动作 */
+  --done: #6fa481; /* done 刻意退后 */
 
-  --branch-dev: #4cc3e0; /* develop-design 支线 */
-  --branch-test: #a78bfa; /* test-design 支线 */
+  --diff-add: #6fe08f;
+  --diff-add-bg: #0f2417;
+  --diff-del: #ff8a7a;
+  --diff-del-bg: #2a1414;
 
-  --diff-add: #7ee2b0;
-  --diff-add-bg: #16342a;
-  --diff-del: #f0918a;
-  --diff-del-bg: #3a2320;
+  /* 线路三档 + 分支（分支不用色相，用亮度阶） */
+  --br: #2e4a3a;
+  --br-done: #3f6a4e;
+  --lit: #33553f;
+  --dash: #2e4a3a;
 
-  /* §3.2 字体 */
-  --font-ui: 'Barlow', 'PingFang SC', 'Hiragino Sans GB', 'Noto Sans SC', -apple-system,
-    BlinkMacSystemFont, 'Segoe UI', sans-serif;
-  --font-cond: 'Barlow Semi Condensed', 'Barlow', 'PingFang SC', 'Noto Sans SC', sans-serif;
-  --font-mono: 'JetBrains Mono', 'SF Mono', Menlo, Consolas, monospace;
+  --input: #070c08;
+  --overlay: rgba(3, 7, 4, 0.74);
+  --pending-tint: rgba(255, 180, 84, 0.1);
+  --bracket: var(--text-4);
 
-  /* §3.3 形状与密度（全局只有两档圆角） */
-  --r-panel: 6px;
-  --r-pill: 3px;
-  --rail-col-width: 280px;
-  --rail-col-gap: 12px;
-  --detail-max: 980px;
+  /* 浅色款四处组件级覆盖的语义口（深色即"无"） */
+  --rail-band: none;
+  --rail-band-size: auto;
+  --rail-band-pos: 0 0;
+  --head-band: var(--bg);
+  --bar-band: var(--bg);
+  --mask-bg: var(--bg);
+  --hover-bg: var(--panel);
+  --spin-w: 1px;
+
+  /* 移动版脊线三态 */
+  --spin: #23392b;
+  --spin-lit: #3f6a4e;
+  --spin-pen: #a8762a;
+  --safeb: env(safe-area-inset-bottom, 0px);
+  --frame: 430px;
+
+  /* §2.2 字体：全站唯一字体 Fira Code，连字关闭 */
+  --font-code: 'Fira Code', 'SF Mono', Menlo, 'PingFang SC', 'Hiragino Sans GB', 'Noto Sans SC',
+    monospace;
+  --font-ui: var(--font-code);
+  --font-cond: var(--font-code);
+  --font-mono: var(--font-code);
+
+  /* §2.3 形状与密度：圆角 0，无投影 */
+  --r-panel: 0;
+  --r-pill: 0;
+  --rail-col-width: 264px;
+  --rail-col-gap: 0px;
+  --detail-max: 960px;
+
+  /* 迁移期惰性别名（夜间调度台 → 终端） */
+  --ink-900: var(--bg);
+  --ink-800: var(--panel);
+  --ink-700: var(--wash);
+  --line: var(--pane);
+  --line-soft: var(--hairline);
+  --signal-go: var(--go);
+  --signal-caution: var(--pending);
+  --signal-stop: var(--stop);
+  --signal-done: var(--done);
+  --branch-dev: var(--text);
+  --branch-test: var(--text-3);
+}
+
+/* §2.5 浅色变体「绿杠电报纸」：层级靠墨度，不靠亮度 */
+html[data-theme='light'] {
+  --bg: #f1f5ee;
+  --panel: #dde9d9;
+  --wash: #d6e4d2;
+  --pane: #a9c0a4;
+  --hairline: #d7e2d3;
+  --text-hi: #0c1f14;
+  --text: #23402e;
+  --text-2: #47614f;
+  --text-3: #4c6656;
+  --text-4: #6c8173;
+
+  --go: #1e6b41;
+  --go-ink: #f1f5ee;
+  --go-hi: #175633;
+  --pending: #8c5a0a;
+  --stop: #a32a1f;
+  --done: #47614f;
+
+  --diff-add: #1d6a3c;
+  --diff-add-bg: #deeddd;
+  --diff-del: #9e2a1e;
+  --diff-del-bg: #f6e0dc;
+
+  --br: #8fb29a;
+  --br-done: #5e8f6c;
+  --lit: #93b69d;
+  --dash: #93b69d;
+
+  --input: #f7faf5;
+  --overlay: rgba(12, 31, 20, 0.38);
+  --pending-tint: rgba(140, 90, 10, 0.1);
+  --bracket: var(--text-3);
+
+  /* 四处组件级覆盖：轨道带 / 列头带 / 底栏 / 站点遮罩底 */
+  --rail-band: linear-gradient(var(--pane), var(--pane)), linear-gradient(var(--pane), var(--pane)),
+    linear-gradient(var(--panel), var(--panel));
+  --rail-band-size: 100% 1px, 100% 1px, 100% 62px;
+  --rail-band-pos: 0 0, 0 61px, 0 0;
+  --head-band: var(--panel);
+  --bar-band: var(--panel);
+  --mask-bg: var(--panel);
+  --hover-bg: var(--wash);
+  --spin-w: 3px;
+
+  --spin: #cfe0ca;
+  --spin-lit: #5e9370;
+  --spin-pen: #b3812f;
 }
 
 * {
@@ -53,11 +150,37 @@ html {
 }
 
 body {
-  background: var(--ink-900);
-  color: var(--text-hi);
-  font-family: var(--font-ui);
-  font-size: 13px; /* 基准 */
-  line-height: 1.55;
+  background: var(--bg);
+  color: var(--text);
+  font-family: var(--font-code);
+  font-size: 12.5px; /* 基准（§2.2 字阶） */
+  line-height: 1.6;
+  /* 连字全站关闭：命令与 diff 必须逐字符可读（§2.2） */
+  font-feature-settings: 'calt' 0, 'liga' 0;
+  /* 底部状态行（固定 30px）+ 余量 */
+  padding-bottom: 44px;
+}
+
+/* 可执行物：亮度提升，从不弱于正文（§1 原则 4 的终端转译） */
+.mono,
+code,
+kbd,
+samp {
+  font-family: var(--font-mono);
+  font-variant-numeric: tabular-nums;
+}
+.num {
+  font-variant-numeric: tabular-nums;
+}
+.cond {
+  font-family: var(--font-cond);
+  font-weight: 600;
+  letter-spacing: 0.06em;
+}
+
+b,
+strong {
+  font-weight: 600;
 }
 
 button {
@@ -70,12 +193,14 @@ button {
 }
 
 a {
-  color: var(--branch-dev);
+  color: var(--text);
   text-decoration: none;
   cursor: pointer;
 }
 a:hover {
+  color: var(--text-hi);
   text-decoration: underline;
+  text-underline-offset: 3px;
 }
 
 input,
@@ -86,66 +211,82 @@ select {
   color: var(--text-hi);
 }
 
-/* 可执行物专用等宽（§2 原则 4） */
-.mono {
-  font-family: var(--font-mono);
-  font-variant-numeric: tabular-nums;
-}
-.num {
-  font-variant-numeric: tabular-nums;
-}
-.cond {
-  font-family: var(--font-cond);
-  font-weight: 600;
-  letter-spacing: 0.03em;
+::selection {
+  background: var(--go);
+  color: var(--go-ink);
 }
 
 /* ── 通用控件 ── */
 .panel {
-  background: var(--ink-800);
-  border: 1px solid var(--line);
+  background: var(--panel);
+  border: 1px solid var(--pane);
   border-radius: var(--r-panel);
 }
 
+/* 方括号按钮：括号由 CSS 生成，不进 DOM/无障碍名（§3 共享元素映射） */
 .btn {
-  padding: 5px 11px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 4px;
+  padding: 3px 6px;
+  border: 1px solid var(--pane);
   border-radius: var(--r-pill);
-  font-size: 12px;
-  font-weight: 500;
-  border: 1px solid var(--line);
-  color: var(--text-2);
-  background: var(--ink-700);
-  transition: border-color 0.15s, color 0.15s, background 0.15s;
+  font-size: 11.5px;
+  color: var(--text);
+  line-height: 1.5;
+  transition: color 0.12s, border-color 0.12s, background 0.12s;
+}
+.btn::before {
+  content: '[ ';
+  color: var(--bracket);
+}
+.btn::after {
+  content: ' ]';
+  color: var(--bracket);
 }
 .btn:hover:not(:disabled) {
   color: var(--text-hi);
-  border-color: var(--text-3);
+  border-color: var(--text-2);
+}
+.btn:hover:not(:disabled)::before,
+.btn:hover:not(:disabled)::after {
+  color: var(--text-2);
 }
 .btn:disabled {
-  opacity: 0.45;
+  opacity: 0.55;
   cursor: not-allowed;
 }
 .btn.solid {
-  background: var(--signal-caution);
-  border-color: var(--signal-caution);
-  color: #1a1206;
+  background: var(--go);
+  border-color: var(--go);
+  color: var(--go-ink);
+  font-weight: 600;
+}
+.btn.solid::before,
+.btn.solid::after {
+  color: var(--go-ink);
+  opacity: 0.55;
 }
 .btn.solid:hover:not(:disabled) {
-  background: #f7c45e;
-  border-color: #f7c45e;
-  color: #1a1206;
+  background: var(--go-hi);
+  border-color: var(--go-hi);
+  color: var(--go-ink);
 }
 .btn.quiet {
   border-color: transparent;
-  background: transparent;
   color: var(--text-3);
 }
-.btn.danger {
-  color: var(--signal-stop);
+.btn.quiet:hover:not(:disabled) {
+  color: var(--text-hi);
   border-color: transparent;
 }
+.btn.danger {
+  border-color: transparent;
+  color: var(--stop);
+}
 .btn.danger:hover:not(:disabled) {
-  border-color: var(--signal-stop);
+  border-color: var(--stop);
 }
 .btn.block {
   width: 100%;
@@ -153,35 +294,27 @@ select {
 }
 .btn .spin {
   display: inline-block;
-  width: 9px;
-  height: 9px;
-  margin-right: 6px;
-  border: 1.5px solid currentColor;
-  border-top-color: transparent;
-  border-radius: 50%;
-  animation: btn-spin 0.7s linear infinite;
-}
-@keyframes btn-spin {
-  to {
-    transform: rotate(360deg);
-  }
+  width: 7px;
+  height: 11px;
+  background: currentColor;
+  animation: blink 0.7s steps(2) infinite;
 }
 
 .input {
   width: 100%;
-  background: var(--ink-900);
-  border: 1px solid var(--line);
+  background: var(--input);
+  border: 1px solid var(--pane);
   border-radius: var(--r-pill);
   color: var(--text-hi);
   font-size: 12px;
   padding: 6px 9px;
 }
 .input::placeholder {
-  color: var(--text-3);
+  color: var(--text-4);
 }
 .input:focus {
   outline: none;
-  border-color: var(--text-3);
+  border-color: var(--text-2);
 }
 textarea.input {
   resize: vertical;
@@ -189,48 +322,80 @@ textarea.input {
   line-height: 1.5;
 }
 
-/* 焦点可达（§11.7 打磨） */
-:focus-visible {
-  outline: 2px solid var(--branch-dev);
-  outline-offset: 1px;
+/* 状态文字标记：反白 / 琥珀 / 红 / 弱（与颜色双编码） */
+.st {
+  font-weight: 600;
+  font-size: 10px;
+  letter-spacing: 0.06em;
+  font-style: normal;
+}
+.st.run {
+  background: var(--go);
+  color: var(--go-ink);
+  padding: 0 5px;
+}
+.st.wait {
+  color: var(--pending);
+}
+.st.stop {
+  color: var(--stop);
+}
+.st.dim {
+  color: var(--text-4);
 }
 
-/* pending 琥珀呼吸（§3.4） */
+/* 提示条（diff 基准前移等） */
+.notice {
+  font-size: 11px;
+  color: var(--pending);
+  border: 1px dashed var(--pending);
+  padding: 2px 10px;
+}
+
+/* 焦点环 = 1px 反白描边（终端"选中"语义，不用系统 outline，§5） */
+:focus-visible {
+  outline: 1px solid var(--text-hi);
+  outline-offset: 2px;
+}
+
+/* pending 琥珀呼吸（§2.4，2.4s） */
 @keyframes breath {
   0%,
   100% {
     opacity: 1;
   }
   50% {
-    opacity: 0.4;
+    opacity: 0.45;
   }
 }
 .warn-dot {
   animation: breath 2.4s ease-in-out infinite;
 }
 
-/* 流式尾随光标 */
+/* 流式尾随方块光标（§2.4） */
 @keyframes blink {
   50% {
     opacity: 0;
   }
 }
 .streaming::after {
-  content: '▍';
-  color: var(--signal-go);
-  animation: blink 1s steps(2) infinite;
+  content: '▊';
+  color: var(--text-hi);
+  animation: blink 0.9s steps(2) infinite;
 }
 
-/* 轨道自绘（唯一主动效，§3.4） */
-@keyframes rail-draw {
-  to {
-    stroke-dashoffset: 0;
+/* 节点完成一次 120ms 反白闪（§2.4） */
+@keyframes flash {
+  0% {
+    background: var(--go);
+    color: var(--go-ink);
+  }
+  100% {
+    background: transparent;
   }
 }
-.rail-draw {
-  stroke-dasharray: 1200;
-  stroke-dashoffset: 1200;
-  animation: rail-draw 0.6s ease-out forwards;
+.node-finish {
+  animation: flash 0.12s linear;
 }
 
 @media (prefers-reduced-motion: reduce) {
@@ -240,22 +405,30 @@ textarea.input {
     animation: none !important;
     transition: none !important;
   }
-  .rail-draw {
-    stroke-dashoffset: 0;
+  html {
+    scroll-behavior: auto;
   }
 }
 
-/* 滚动条（夜间调度台） */
+/* 滚动条（终端无装饰，窄条） */
 ::-webkit-scrollbar {
   width: 10px;
   height: 10px;
 }
 ::-webkit-scrollbar-thumb {
-  background: var(--line);
-  border-radius: 5px;
+  background: var(--pane);
+  border-radius: 0;
 }
 ::-webkit-scrollbar-track {
   background: transparent;
+}
+
+/* 横向滚动条隐藏（移动版过滤行 / 页签 / 运行条） */
+.no-scrollbar {
+  scrollbar-width: none;
+}
+.no-scrollbar::-webkit-scrollbar {
+  display: none;
 }
 
 .visually-hidden {
@@ -265,4 +438,20 @@ textarea.input {
   overflow: hidden;
   clip: rect(0 0 0 0);
   white-space: nowrap;
+}
+
+/* ── 移动版基线（§8：可点目标 ≥44px、输入 16px 防 iOS 聚焦缩放） ── */
+@media (max-width: 479px) {
+  body {
+    font-size: 14px;
+    line-height: 1.62;
+  }
+  .btn {
+    min-height: 44px;
+    padding: 4px 10px;
+    font-size: 12.5px;
+  }
+  .input {
+    font-size: 16px;
+  }
 }

@@ -82,9 +82,8 @@
   .cmd {
     display: flex;
     align-items: center;
-    gap: 12px;
-    padding: 7px 10px;
-    border-radius: var(--r-panel);
+    gap: 10px;
+    padding: 4px 8px;
     font-family: var(--font-mono);
     font-size: 11.5px;
     color: var(--text-2);
@@ -93,29 +92,27 @@
     text-align: left;
   }
   .cmd:hover {
-    background: var(--ink-800);
+    background: var(--hover-bg);
   }
   .ok {
-    color: var(--signal-go);
+    color: var(--go);
     flex: none;
   }
   .bad {
-    color: var(--signal-stop);
+    color: var(--stop);
     flex: none;
   }
   .tm {
-    color: var(--text-3);
-    width: 60px;
+    color: var(--text-4);
+    width: 62px;
     flex: none;
   }
   .src {
     flex: none;
-    width: 38px;
+    width: 36px;
     font-size: 9.5px;
-    padding: 1px 0;
     text-align: center;
-    border-radius: var(--r-pill);
-    border: 1px solid var(--line);
+    border: 1px solid var(--pane);
     color: var(--text-3);
   }
   .c {
@@ -126,18 +123,21 @@
   }
   .ms {
     color: var(--text-3);
+    width: 52px;
     flex: none;
+    text-align: right;
   }
   .ex {
     color: var(--text-3);
+    width: 44px;
     flex: none;
+    text-align: right;
   }
   .cmdout {
-    border: 1px solid var(--line-soft);
-    border-radius: var(--r-panel);
-    background: var(--ink-800);
-    margin: 4px 0 12px 30px;
-    padding: 10px 14px;
+    border-left: 2px solid var(--pane);
+    background: var(--panel);
+    margin: 4px 0 12px 26px;
+    padding: 8px 12px;
     font-family: var(--font-mono);
     font-size: 11.5px;
     color: var(--text-2);
@@ -150,7 +150,7 @@
     color: var(--text-3);
   }
   .cmdout .fin {
-    color: var(--signal-go);
+    color: var(--go);
   }
   .empty {
     color: var(--text-3);

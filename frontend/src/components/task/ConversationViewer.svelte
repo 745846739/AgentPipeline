@@ -1,10 +1,9 @@
 <script lang="ts">
   import type { ChatMessage, ConversationSummary, NodeConversation } from '../../api/types';
   import type { LiveDelta, LiveTool } from '../../realtime/reduce';
-  import { formatTokens } from '../../lib/format';
-  import MessageBubble from '../render/MessageBubble.svelte';
+  import { summarizeArgs, lineCount, truncate, formatTokens } from '../../lib/format';
+  import MarkdownView from '../render/MarkdownView.svelte';
   import MetadataCard from '../render/MetadataCard.svelte';
-  import ToolCallCard from '../render/ToolCallCard.svelte';
 
   interface Props {
     conversations: ConversationSummary[];
@@ -58,11 +57,52 @@
   const selectedTools = $derived(liveTools.filter((t) => t.run_id === selectedRunId));
 </script>
 
-<div class="runrow">
+{#snippet toolcard(tool: string, argsSummary: string, resultSummary?: string, phase = 'end')}
+  <div class="toolcard">
+    <span class="fn mono"><b>{tool}</b>({argsSummary})</span>
+    {#if resultSummary}<span class="res {phase}">{resultSummary}</span>{/if}
+  </div>
+{/snippet}
+
+{#snippet messageBlock(message: ChatMessage, streaming: boolean)}
+  {#if message.role === 'system'}
+    <details class="sys">
+      <summary class="sys-sum">
+        <span class="who sys">SYSTEM</span>
+        <span class="dim">折叠 · {lineCount(message.content)} 行</span>
+      </summary>
+      <div class="sysbox mono">{message.content ?? ''}</div>
+    </details>
+  {:else if message.role === 'user'}
+    <div class="msg">
+      <div class="who">YOU</div>
+      <pre class="userbox">{message.content ?? ''}</pre>
+    </div>
+  {:else if message.role === 'assistant'}
+    <div class="msg assistant">
+      <div class="who as">AGT</div>
+      {#if message.content}
+        <MarkdownView source={message.content} />
+      {/if}
+      {#each message.tool_calls ?? [] as call (call.id)}
+        {@render toolcard(call.function.name, summarizeArgs(call.function.arguments))}
+      {/each}
+      {#if streaming}<p class="streaming"></p>{/if}
+    </div>
+  {:else}
+    <div class="msg">
+      <div class="who">TOOL</div>
+      {@render toolcard(message.name ?? 'tool', message.tool_call_id ? `call ${message.tool_call_id}` : '', message.content ? truncate(message.content, 60) : undefined)}
+    </div>
+  {/if}
+{/snippet}
+
+<div class="runrow no-scrollbar">
   {#each sorted as c (c.run_id)}
     <button
       type="button"
-      class="runchip {selectedRunId === c.run_id ? 'now' : ''}"
+      class="runchip"
+      class:now={selectedRunId === c.run_id}
       onclick={() => onselect(c.run_id)}
     >
       {c.stage} · {c.node}{c.attempt > 1 ? ` · 尝试 ${c.attempt}` : ''}
@@ -92,7 +132,7 @@
     {#if conversation}
       {#each conversation.messages_json as message, i (i)}
         {#if message.role !== 'tool' || message.content}
-          <MessageBubble {message} />
+          {@render messageBlock(message, false)}
         {/if}
       {/each}
       {#if conversation.metadata_json}
@@ -101,10 +141,10 @@
     {/if}
 
     {#each mergedDeltas as message, i (i)}
-      <MessageBubble {message} streaming={i === mergedDeltas.length - 1} />
+      {@render messageBlock(message, i === mergedDeltas.length - 1)}
     {/each}
     {#each selectedTools as t, i (i)}
-      <ToolCallCard tool={t.tool} argsSummary={t.args_summary} resultSummary={t.phase} phase={t.phase} />
+      {@render toolcard(t.tool, t.args_summary, t.phase, t.phase)}
     {/each}
 
     {#if !conversation && mergedDeltas.length === 0 && selectedTools.length === 0}
@@ -121,42 +161,140 @@
     margin-bottom: 14px;
   }
   .runchip {
-    font-family: var(--font-mono);
     font-size: 10.5px;
-    padding: 3px 9px;
-    border-radius: var(--r-pill);
-    border: 1px solid var(--line);
+    padding: 2px 8px;
+    border: 1px solid var(--pane);
     color: var(--text-3);
   }
   .runchip:hover {
     color: var(--text-2);
   }
   .runchip.now {
-    color: var(--signal-go);
-    border-color: var(--signal-go);
+    background: var(--panel);
+    color: var(--text-hi);
+    border-color: var(--text-2);
   }
   .sub {
-    color: var(--branch-test);
+    color: var(--text-4);
   }
   .convhead {
     display: flex;
     justify-content: space-between;
     align-items: baseline;
     padding-bottom: 8px;
-    border-bottom: 1px solid var(--line-soft);
+    border-bottom: 1px solid var(--hairline);
     margin-bottom: 12px;
   }
   .convhead h3 {
-    font-size: 13px;
-    color: var(--text-2);
+    font-size: 12px;
+    color: var(--text-hi);
   }
   .convhead .m {
     font-family: var(--font-mono);
-    font-size: 11px;
+    font-size: 10.5px;
     color: var(--text-3);
   }
   .live {
-    color: var(--signal-go);
+    color: var(--go);
+  }
+  .msg {
+    margin-bottom: 13px;
+  }
+  .who {
+    font-size: 10px;
+    font-weight: 600;
+    letter-spacing: 0.1em;
+    color: var(--text-3);
+    margin-bottom: 3px;
+  }
+  .who::after {
+    content: ' ▸';
+    color: var(--text-4);
+  }
+  .who.sys {
+    color: var(--text-4);
+  }
+  .who.as {
+    color: var(--text-hi);
+  }
+  .dim {
+    font-weight: 400;
+    letter-spacing: 0;
+    color: var(--text-4);
+  }
+  .sys summary {
+    cursor: pointer;
+    list-style: none;
+  }
+  .sys-sum {
+    display: flex;
+    align-items: baseline;
+    gap: 8px;
+  }
+  .sys-sum .who {
+    margin-bottom: 0;
+  }
+  .sys summary::-webkit-details-marker {
+    display: none;
+  }
+  .sysbox {
+    border: 1px dashed var(--pane);
+    padding: 6px 10px;
+    color: var(--text-3);
+    font-size: 11.5px;
+    cursor: pointer;
+    white-space: pre-wrap;
+    max-height: 320px;
+    overflow: auto;
+  }
+  .userbox {
+    color: var(--text-2);
+    white-space: pre-wrap;
+    font-size: 12px;
+    font-family: var(--font-mono);
+  }
+  .assistant :global(p),
+  .assistant :global(.md) :global(p) {
+    color: var(--text);
+    margin: 2px 0 8px;
+    max-width: 76ch;
+    font-size: 12.5px;
+  }
+  .assistant :global(.md) {
+    color: var(--text);
+    font-size: 12.5px;
+  }
+  .toolcard {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    border-left: 2px solid var(--pane);
+    padding: 3px 0 3px 12px;
+    margin: 5px 0;
+    max-width: 680px;
+    font-size: 11px;
+    color: var(--text-2);
+  }
+  .toolcard .fn {
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+  .toolcard .fn b {
+    color: var(--text-hi);
+    font-weight: 500;
+  }
+  .toolcard .res {
+    margin-left: auto;
+    font-size: 10.5px;
+    color: var(--text-3);
+    flex: none;
+  }
+  .toolcard .res.end {
+    color: var(--go);
+  }
+  .toolcard .res.error {
+    color: var(--stop);
   }
   .empty {
     color: var(--text-3);

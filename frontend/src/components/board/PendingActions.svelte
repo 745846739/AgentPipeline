@@ -18,12 +18,8 @@
 
 <script lang="ts">
   import type { AllowedAction, BranchCursor, PendingKind } from '../../api/types';
-  import {
-    allowsFreeInput,
-    groupActionsByBranch,
-    sideEffectEnabled,
-  } from '../../lib/actions';
-  import BranchPill from '../pipeline/BranchPill.svelte';
+  import { allowsFreeInput, groupActionsByBranch, sideEffectEnabled } from '../../lib/actions';
+  import { branchKind } from '../../lib/pipeline';
 
   interface Props {
     actions: AllowedAction[];
@@ -63,6 +59,12 @@
   function busy(action: AllowedAction, groupCursorId: string): boolean {
     return isBusy?.(action, fallbackCursorId(groupCursorId)) ?? false;
   }
+
+  /** 分支文字标签（决策 84：不用色相，用 [dev]/[tst]/main）。 */
+  function branchLabel(branch: string): string {
+    const kind = branchKind(branch);
+    return kind === 'main' ? 'main' : `[${kind}]`;
+  }
 </script>
 
 {#if !actions || actions.length === 0}
@@ -72,13 +74,7 @@
     <div class="group">
       {#if groups.length > 1 || group.cursorId}
         <div class="head">
-          {#if group.cursorId}
-            <BranchPill
-              cursor={cursors.find((c) => c.cursor_id === group.cursorId) ?? syntheticCursor(group.cursorId, group.branch)}
-            />
-          {:else}
-            <span class="branch mono">{group.branch}</span>
-          {/if}
+          <span class="head-label">{branchLabel(group.branch)}</span>
         </div>
       {/if}
 
@@ -155,14 +151,18 @@
   .head {
     margin-bottom: 6px;
   }
-  .branch {
-    font-size: 11px;
+  .head-label {
+    font-size: 10px;
+    font-weight: 600;
+    letter-spacing: 0.04em;
     color: var(--text-3);
   }
   .grp-label {
-    font-size: 11px;
-    color: var(--text-3);
-    margin: 8px 0 5px;
+    font-size: 10px;
+    color: var(--text-4);
+    letter-spacing: 0.08em;
+    text-transform: uppercase;
+    margin: 12px 0 7px;
   }
   .item {
     margin-bottom: 6px;
@@ -178,7 +178,7 @@
     margin-bottom: 6px;
   }
   .none {
-    font-size: 12px;
+    font-size: 11.5px;
     color: var(--text-3);
   }
 </style>

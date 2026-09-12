@@ -129,12 +129,12 @@
   }
   .hint {
     margin-top: 8px;
-    font-size: 11.5px;
+    font-size: 11px;
     color: var(--text-3);
     line-height: 1.6;
   }
   .error {
-    color: var(--signal-stop);
+    color: var(--stop);
     font-size: 12px;
     margin-top: 8px;
     white-space: pre-wrap;

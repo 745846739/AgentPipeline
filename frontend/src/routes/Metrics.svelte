@@ -229,15 +229,15 @@
   }
   .banner {
     padding: 10px 12px;
-    border: 1px solid var(--line);
-    border-radius: var(--r-panel);
+    border: 1px solid var(--pane);
+    border-radius: 0;
     color: var(--text-3);
     font-size: 12px;
     margin-top: 10px;
   }
   .banner.error {
-    border-color: var(--signal-stop);
-    color: var(--signal-stop);
+    border-color: var(--stop);
+    color: var(--stop);
   }
   .charts {
     display: flex;
@@ -251,6 +251,9 @@
   }
   .note {
     padding: 12px 14px;
+    background: var(--panel);
+    border: 1px solid var(--pane);
+    border-radius: 0;
   }
   .note-head {
     font-size: 13px;
@@ -265,6 +268,9 @@
   .task {
     margin-top: 24px;
     padding: 14px 16px;
+    background: var(--panel);
+    border: 1px solid var(--pane);
+    border-radius: 0;
   }
   .task-head {
     font-size: 13px;
@@ -287,7 +293,7 @@
     color: var(--text-2);
   }
   .task-summary .drift {
-    color: var(--signal-caution);
+    color: var(--pending);
   }
   .drift-note {
     margin-top: 5px;

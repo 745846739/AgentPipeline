@@ -58,8 +58,11 @@
   >
   <div class="card-top">
     <span class="card-title">{task.title}</span>
-    {#if task.stalled}<StalledBadge hours={hours} />{/if}
-    <span class="dur">{isTerminal ? '—' : formatDuration(durationMs)}</span>
+    {#if task.stalled}
+      <StalledBadge hours={hours} />
+    {:else}
+      <span class="dur">{isTerminal ? '—' : formatDuration(durationMs)}</span>
+    {/if}
   </div>
 
   <PipelineRail variant="mini" {dots} ariaLabel="任务迷你轨道" />
@@ -113,25 +116,33 @@
 <style>
   .card {
     position: relative;
-    background: var(--ink-800);
-    border: 1px solid var(--line);
-    border-radius: var(--r-panel);
-    padding: 12px 12px 10px;
-    margin-bottom: 10px;
+    padding: 11px 12px 12px;
+    border-bottom: 1px solid var(--hairline);
     cursor: pointer;
-    transition: border-color 0.15s;
+    transition: background 0.12s;
+  }
+  .card:last-child {
+    border-bottom: 0;
   }
   .card:hover {
-    border-color: var(--text-3);
+    background: var(--hover-bg);
   }
-  .card:focus-visible {
-    border-color: var(--text-3);
+  .card.warn {
+    box-shadow: inset 2px 0 0 var(--pending);
+  }
+  .card.stopped {
+    box-shadow: inset 2px 0 0 var(--stop);
+  }
+  .card.stalled {
+    background: var(--panel);
+  }
+  .card.stalled:hover {
+    background: var(--wash);
   }
   .card-link {
     position: absolute;
     inset: 0;
     z-index: 1;
-    border-radius: var(--r-panel);
   }
   .card-link:hover {
     text-decoration: none;
@@ -140,25 +151,6 @@
     position: relative;
     z-index: 0;
   }
-  .card::before {
-    content: '';
-    position: absolute;
-    left: -1px;
-    top: 10px;
-    bottom: 10px;
-    width: 2px;
-    border-radius: 1px;
-    background: transparent;
-  }
-  .card.warn::before {
-    background: var(--signal-caution);
-  }
-  .card.stopped::before {
-    background: var(--signal-stop);
-  }
-  .card.stalled {
-    border-color: var(--signal-caution);
-  }
   .card-top {
     display: flex;
     justify-content: space-between;
@@ -166,44 +158,54 @@
     gap: 8px;
   }
   .card-title {
+    min-width: 0;
     font-weight: 500;
-    font-size: 13.5px;
-    letter-spacing: 0.01em;
-    overflow: hidden;
-    text-overflow: ellipsis;
+    font-size: 12.5px;
+    color: var(--text-hi);
+  }
+  .card.warn .card-title::before {
+    content: '! ';
+    color: var(--pending);
+    font-weight: 600;
   }
   .card.mute .card-title {
     color: var(--text-2);
+    font-weight: 400;
   }
   .dur {
-    font-family: var(--font-mono);
+    flex: none;
     font-size: 11px;
     color: var(--text-3);
-    flex: none;
+    font-variant-numeric: tabular-nums;
   }
   .pillrow {
     display: flex;
     flex-direction: column;
     gap: 4px;
-    margin-bottom: 8px;
+    margin: 8px 0;
   }
   .reason {
     margin: 8px 0;
-    font-size: 12px;
+    font-size: 11.5px;
     color: var(--text-2);
-    border-left: 2px solid var(--line);
-    padding-left: 8px;
+    border-left: 2px solid var(--hairline);
+    padding-left: 10px;
   }
   .reason.warn {
-    border-color: var(--signal-caution);
+    border-left-color: var(--pending);
   }
   .rlabel {
-    color: var(--signal-caution);
+    color: var(--pending);
+    font-weight: 600;
     font-size: 11px;
   }
+  .rlabel::before {
+    content: '> ';
+  }
   .ctxlink {
-    font-size: 11.5px;
-    margin: 4px 0;
+    margin: 2px 0 4px;
+    font-size: 11px;
+    color: var(--text-3);
   }
   .actions {
     margin-top: 8px;
@@ -211,9 +213,6 @@
     z-index: 2;
   }
   .tagline {
-    display: flex;
-    gap: 8px;
-    align-items: center;
     margin-top: 6px;
     font-size: 11px;
     color: var(--text-3);
@@ -221,14 +220,14 @@
   .meta {
     display: flex;
     gap: 10px;
-    font-family: var(--font-mono);
+    flex-wrap: wrap;
+    margin-top: 7px;
     font-size: 10.5px;
     color: var(--text-3);
-    margin-top: 8px;
-    flex-wrap: wrap;
+    font-variant-numeric: tabular-nums;
   }
   .meta b {
-    color: var(--text-2);
+    color: var(--text-hi);
     font-weight: 500;
   }
 </style>

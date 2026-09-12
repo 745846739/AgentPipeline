@@ -34,71 +34,72 @@
 <div class="hscroll">
   <div class="hinner">
     <PipelineRail variant="spine" {stations} />
+
+    <div class="boardpad">
+      {#if board.error}
+        <div class="banner error">加载失败：{board.error}</div>
+      {/if}
+      {#if board.connectionState === 'error'}
+        <div class="banner">实时流已断开，正在重连…（看板仍每 10s 对齐一次）</div>
+      {/if}
+
+      {#if board.projects.length === 0 && !board.loading}
+        <div class="board-empty">还没有项目。到「设置 · 项目」添加一个本地 git 仓库，然后新建任务。</div>
+      {:else if board.visibleTasks.length === 0 && !board.loading}
+        <div class="board-empty">新建第一个任务，流水线从 init 开始拍发。</div>
+      {/if}
+
+      <main class="panes">
+        {#each BOARD_COLUMNS as column (column.key)}
+          <BoardColumn
+            {column}
+            tasks={tasksByColumn.get(column.key) ?? []}
+            actionsFor={(id) => board.pendingActions[id] ?? []}
+            cursorsFor={(id) => board.pendingCursors[id] ?? []}
+            actionBusy={board.actionBusy}
+            onopen={openTask}
+            onaction={onAction}
+          />
+        {/each}
+      </main>
+    </div>
   </div>
 </div>
 
-<main class="board">
-  {#if board.error}
-    <div class="banner error">加载失败：{board.error}</div>
-  {/if}
-  {#if board.connectionState === 'error'}
-    <div class="banner">实时流已断开，正在重连…（看板仍每 10s 对齐一次）</div>
-  {/if}
-
-  {#if board.projects.length === 0 && !board.loading}
-    <div class="board-empty">还没有项目。到「设置 · 项目」添加一个本地 git 仓库，然后新建任务。</div>
-  {:else if board.visibleTasks.length === 0 && !board.loading}
-    <div class="board-empty">新建第一个任务，流水线会从 init 开始走。</div>
-  {/if}
-
-  {#each BOARD_COLUMNS as column (column.key)}
-    <BoardColumn
-      {column}
-      tasks={tasksByColumn.get(column.key) ?? []}
-      actionsFor={(id) => board.pendingActions[id] ?? []}
-      cursorsFor={(id) => board.pendingCursors[id] ?? []}
-      actionBusy={board.actionBusy}
-      onopen={openTask}
-      onaction={onAction}
-    />
-  {/each}
-</main>
-
 <style>
+  /* tmux 窗格阵列：列间共享 1px 框线，无间隙（theme-3 §3.2） */
   .hscroll {
     overflow-x: auto;
-    background: var(--ink-900);
+    background: var(--bg);
   }
   .hinner {
-    width: max-content;
+    width: 2144px;
   }
-  .board {
+  .boardpad {
+    padding: 0 16px 8px;
+  }
+  .panes {
     display: flex;
-    gap: var(--rail-col-gap);
-    padding: 16px 20px 40px;
-    align-items: flex-start;
+    border: 1px solid var(--pane);
+    background: var(--bg);
+    width: 2112px;
+    align-items: stretch;
   }
   .banner {
-    position: sticky;
-    left: 0;
-    flex: none;
-    width: calc(100vw - 40px);
-    background: var(--ink-800);
-    border: 1px solid var(--line);
-    border-radius: var(--r-panel);
+    background: var(--panel);
+    border: 1px solid var(--pane);
     padding: 8px 12px;
     font-size: 12px;
     color: var(--text-2);
+    margin-bottom: 8px;
   }
   .banner.error {
-    border-color: var(--signal-stop);
-    color: var(--signal-stop);
+    border-color: var(--stop);
+    color: var(--stop);
   }
   .board-empty {
-    flex: none;
-    width: calc(100vw - 40px);
-    color: var(--text-3);
+    color: var(--text-4);
     font-size: 12.5px;
-    padding: 6px 4px;
+    padding: 6px 4px 12px;
   }
 </style>

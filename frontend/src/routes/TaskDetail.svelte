@@ -148,13 +148,19 @@
     {#if task}
       <div class="d-head">
         <h1 class="d-title">{task.title}</h1>
-        <div class="d-meta">
-          <span class:pending={isPending} class:run={!isPending && !isTerminal}>
-            {isPending ? `⏸ pending · ${pendingLabel(pendingReason)}` : task.status}
-            {#if focalCursor && !isTerminal}· {focalCursor.branch}.{focalCursor.node}{/if}
+        <div class="dmeta">
+          <span class="status" class:pending={isPending} class:run={!isPending && !isTerminal}>
+            {#if isPending}
+              ⏸ pending · {pendingLabel(pendingReason)}
+            {:else}
+              {#if task.status === 'running'}<span class="st run">[RUN]</span>{/if}
+              {task.status}
+              {#if focalCursor && !isTerminal}· {focalCursor.branch}.{focalCursor.node}{/if}
+            {/if}
           </span>
           <span>⏱ {formatDuration(Math.max(0, Date.parse(task.updated_at) - Date.parse(task.created_at)))}</span>
           <span>{formatTokens(task.total_tokens)} tok · {task.total_calls} 次调用</span>
+          <span class="mono">{task.id}</span>
           {#if task.branch_name}<span>{task.branch_name}</span>{/if}
           <span>评审：{task.review_mode}</span>
           {#if task.model_override}<span class="mono">model: {task.model_override}</span>{/if}
@@ -176,27 +182,25 @@
       <div class="hero-rail">
         <PipelineRail variant="hero" stations={heroStations} />
       </div>
-      <div class="legend">
-        <span>节点状态</span><i>✓ 已完成</i><i>● 执行中</i><i>○ 未开始</i><i>⏸ pending</i><i>✗ 失败</i><i>↩ 已打回</i>
-      </div>
+      <div class="legend">节点状态 ─ ✓ 已完成 · ● 执行中 · ○ 未开始 · ⏸ pending · ✗ 失败 · ↩ 已打回</div>
 
       {#if detail.terminal}
         <div class="terminal {detail.terminal}">任务已{detail.terminal === 'done' ? '完成' : detail.terminal === 'failed' ? '失败' : '取消'}。</div>
       {/if}
 
       <nav class="tabs">
-        <button type="button" class="tab" class:on={tab === 'timeline'} onclick={() => (tab = 'timeline')}>时间线</button>
+        <button type="button" class="tab" class:on={tab === 'timeline'} onclick={() => (tab = 'timeline')}>[时间线]</button>
         <button type="button" class="tab" class:on={tab === 'conversation'} onclick={() => (tab = 'conversation')}>
-          会话 <span class="c">{detail.conversations.length}</span>
+          [会话]
         </button>
         <button type="button" class="tab" class:on={tab === 'commands'} onclick={() => (tab = 'commands')}>
-          命令与输出 <span class="c">{detail.commands.length}</span>
+          [命令与输出 {detail.commands.length}]
         </button>
-        <button type="button" class="tab" class:on={tab === 'files'} onclick={() => (tab = 'files')}>产出文件</button>
+        <button type="button" class="tab" class:on={tab === 'files'} onclick={() => (tab = 'files')}>[产出文件]</button>
         {#if showDiffTab}
-          <button type="button" class="tab" class:on={tab === 'diff'} onclick={() => (tab = 'diff')}>Diff</button>
+          <button type="button" class="tab" class:on={tab === 'diff'} onclick={() => (tab = 'diff')}>[Diff]</button>
         {:else}
-          <button type="button" class="tab dis" disabled>Diff · merge 后生成</button>
+          <button type="button" class="tab dis" disabled>[Diff ─ merge 后生成]</button>
         {/if}
       </nav>
 
@@ -294,52 +298,57 @@
 
 <style>
   .detail {
-    max-width: 1200px;
+    max-width: var(--detail-max);
     margin: 0 auto;
-    padding: 20px 24px 60px;
+    padding: 18px 20px 40px;
   }
   .detail.split {
     max-width: 1240px;
     display: grid;
-    grid-template-columns: minmax(0, 1fr) 360px;
-    gap: 20px;
+    grid-template-columns: minmax(0, 1fr) 320px;
+    gap: 18px;
+    align-items: start;
+  }
+  .detail.split .main {
+    display: contents;
+  }
+  .detail.split .main > * {
+    grid-column: 1;
   }
   .crumb {
-    display: inline-flex;
-    align-items: center;
-    gap: 6px;
+    display: inline-block;
     color: var(--text-3);
-    font-size: 12px;
+    font-size: 11.5px;
     margin-bottom: 10px;
   }
   .crumb:hover {
-    color: var(--text-2);
+    color: var(--text-hi);
   }
   .d-head {
     display: flex;
     align-items: baseline;
     gap: 14px;
     flex-wrap: wrap;
-    margin-bottom: 4px;
+    margin-bottom: 6px;
   }
   .d-title {
-    font-size: 20px;
+    font-size: 16px;
     font-weight: 600;
-    letter-spacing: 0.01em;
+    color: var(--text-hi);
   }
-  .d-meta {
+  .dmeta {
     display: flex;
     gap: 14px;
     font-family: var(--font-mono);
-    font-size: 11.5px;
+    font-size: 11px;
     color: var(--text-3);
     flex-wrap: wrap;
   }
-  .d-meta .run {
-    color: var(--signal-go);
+  .dmeta .status.run {
+    color: var(--text-hi);
   }
-  .d-meta .pending {
-    color: var(--signal-caution);
+  .dmeta .status.pending {
+    color: var(--pending);
   }
   .bypass {
     display: flex;
@@ -349,43 +358,35 @@
     margin: 18px 0 6px;
   }
   .legend {
-    display: flex;
-    gap: 14px;
-    font-size: 11px;
-    color: var(--text-3);
-    margin: 2px 0 14px;
-  }
-  .legend i {
-    font-style: normal;
-    font-family: var(--font-mono);
+    font-size: 10.5px;
+    color: var(--text-4);
+    margin: 4px 0 14px;
   }
   .terminal {
     padding: 8px 12px;
-    border-radius: var(--r-panel);
-    border: 1px solid var(--line);
+    border: 1px solid var(--pane);
     font-size: 12px;
     margin-bottom: 12px;
     color: var(--text-2);
   }
   .terminal.failed {
-    border-color: var(--signal-stop);
-    color: var(--signal-stop);
+    border-color: var(--stop);
+    color: var(--stop);
   }
   .terminal.done {
-    border-color: var(--signal-done);
+    border-color: var(--done);
   }
   .tabs {
     display: flex;
     gap: 2px;
-    border-bottom: 1px solid var(--line-soft);
-    margin-bottom: 16px;
+    border-bottom: 1px solid var(--pane);
+    margin: 10px 0 16px;
   }
   .tab {
-    padding: 8px 14px;
+    padding: 5px 12px;
     color: var(--text-3);
-    font-weight: 500;
-    font-size: 13px;
-    border-bottom: 2px solid transparent;
+    font-size: 11.5px;
+    border-bottom: 1px solid transparent;
     margin-bottom: -1px;
   }
   .tab:hover:not(.dis) {
@@ -393,16 +394,10 @@
   }
   .tab.on {
     color: var(--text-hi);
-    border-color: var(--signal-go);
-  }
-  .tab .c {
-    font-family: var(--font-mono);
-    font-size: 10.5px;
-    color: var(--text-3);
-    margin-left: 4px;
+    background: var(--panel);
   }
   .tab.dis {
-    opacity: 0.45;
+    color: var(--text-4);
     cursor: default;
   }
   .hint {
@@ -411,9 +406,8 @@
   }
   .banner {
     padding: 8px 12px;
-    border-radius: var(--r-panel);
-    border: 1px solid var(--signal-stop);
-    color: var(--signal-stop);
+    border: 1px solid var(--stop);
+    color: var(--stop);
     font-size: 12px;
     margin-bottom: 10px;
   }

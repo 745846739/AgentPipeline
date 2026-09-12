@@ -13,8 +13,8 @@
 
 <style>
   .md {
-    color: var(--text-hi);
-    font-size: 13px;
+    color: var(--text);
+    font-size: 12.5px;
     line-height: 1.65;
     max-width: 80ch;
   }
@@ -22,20 +22,20 @@
   .md :global(h2),
   .md :global(h3),
   .md :global(h4) {
-    font-family: var(--font-cond);
+    font-family: var(--font-code);
     font-weight: 600;
     letter-spacing: 0.02em;
     color: var(--text-hi);
     margin: 1.1em 0 0.45em;
   }
   .md :global(h1) {
-    font-size: 18px;
+    font-size: 17px;
   }
   .md :global(h2) {
-    font-size: 16px;
+    font-size: 15px;
   }
   .md :global(h3) {
-    font-size: 14px;
+    font-size: 13.5px;
   }
   .md :global(p) {
     margin: 0.45em 0;
@@ -50,14 +50,14 @@
   .md :global(code) {
     font-family: var(--font-mono);
     font-size: 11.5px;
-    background: var(--ink-700);
+    background: var(--pane);
     padding: 1px 5px;
     border-radius: var(--r-pill);
-    color: var(--text-2);
+    color: var(--text);
   }
   .md :global(pre) {
-    background: var(--ink-800);
-    border: 1px solid var(--line-soft);
+    background: var(--panel);
+    border: 1px solid var(--pane);
     border-radius: var(--r-panel);
     padding: 10px 12px;
     overflow-x: auto;
@@ -66,22 +66,24 @@
   .md :global(pre code) {
     background: none;
     padding: 0;
-    color: var(--text-2);
+    color: var(--text);
     line-height: 1.7;
   }
   .md :global(blockquote) {
-    border-left: 2px solid var(--line);
+    border-left: 2px solid var(--pane);
     padding-left: 10px;
     margin: 0.6em 0;
     color: var(--text-2);
   }
   .md :global(hr) {
     border: none;
-    border-top: 1px solid var(--line-soft);
+    border-top: 1px solid var(--hairline);
     margin: 1em 0;
   }
   .md :global(a) {
-    color: var(--branch-dev);
+    color: var(--text-hi);
+    text-decoration: underline;
+    text-underline-offset: 3px;
   }
   .md :global(strong) {
     color: var(--text-hi);

@@ -7,6 +7,10 @@
 
   let newTaskOpen = $state(false);
 
+  const sessionName = $derived(
+    board.projects.find((p) => p.id === board.projectId)?.name ?? 'AgentPipeline',
+  );
+
   function openTask(id: string) {
     board.pendingOpen = false;
     router.navigate(`/task/${id}`);
@@ -14,7 +18,9 @@
 </script>
 
 <header class="topbar">
-  <a class="wordmark" href="#/" onclick={() => router.navigate('/')}>Agent<em>Pipeline</em></a>
+  <a class="wordmark" href="#/" onclick={() => router.navigate('/')}>agentpipeline</a>
+
+  <span class="sess">0:{sessionName}</span>
 
   <nav class="appnav" aria-label="页面导航">
     <a
@@ -55,11 +61,15 @@
     {#each FILTERS as f (f)}
       <button
         type="button"
-        class="chip {board.filter === f ? 'on' : ''} {f === 'pending' ? 'pending' : ''}"
+        class="chip {board.filter === f ? 'on' : ''} {f === 'pending' ? 'pend' : ''}"
         onclick={() => board.setFilter(f)}
       >
         {FILTER_LABELS[f]}
-        {#if board.countFor(f) > 0}<span class="c">{board.countFor(f)}</span>{/if}
+        {#if board.countFor(f) > 0}
+          <span class="c"
+            >{#if f === 'pending'}<i class="star">*</i>{/if}{board.countFor(f)}</span
+          >
+        {/if}
       </button>
     {/each}
   </nav>
@@ -71,7 +81,7 @@
       aria-expanded={board.pendingOpen}
       onclick={() => board.togglePendingDropdown()}
     >
-      待处理 <span class="c">{board.pendingCount}</span>
+      待处理 <span class="c"><i class="star">*</i>{board.pendingCount}</span>
     </button>
     {#if board.pendingOpen}
       <div class="dropdown panel" role="menu">
@@ -90,7 +100,9 @@
     {/if}
   </div>
 
-  <button type="button" class="btn-new" onclick={() => (newTaskOpen = true)}>＋ 新建任务</button>
+  <button type="button" class="btn btn-new" onclick={() => (newTaskOpen = true)}>
+    <i>n</i> 新建任务
+  </button>
 </header>
 
 <NewTaskDialog open={newTaskOpen} onclose={() => (newTaskOpen = false)} />
@@ -102,27 +114,27 @@
     z-index: 20;
     display: flex;
     align-items: center;
-    gap: 20px;
-    height: 48px;
-    padding: 0 20px;
-    background: rgba(12, 18, 27, 0.92);
-    backdrop-filter: blur(8px);
-    border-bottom: 1px solid var(--line-soft);
+    gap: 14px;
+    height: 38px;
+    padding: 0 16px;
+    background: var(--bg);
+    border-bottom: 1px solid var(--pane);
   }
   .wordmark {
+    background: var(--go);
+    color: var(--go-ink);
+    padding: 1px 8px;
     font-weight: 600;
-    font-size: 15px;
-    letter-spacing: 0.02em;
-    color: var(--text-hi);
-    text-decoration: none;
+    font-size: 12px;
     white-space: nowrap;
   }
   .wordmark:hover {
     text-decoration: none;
   }
-  .wordmark em {
-    font-style: normal;
-    color: var(--text-3);
+  .sess {
+    color: var(--text-2);
+    font-size: 12px;
+    white-space: nowrap;
   }
   .appnav {
     display: flex;
@@ -130,29 +142,26 @@
     flex: none;
   }
   .navlink {
-    padding: 4px 10px;
-    border-radius: var(--r-pill);
+    padding: 2px 8px;
     color: var(--text-3);
-    font-size: 12px;
-    font-weight: 500;
+    font-size: 11.5px;
     white-space: nowrap;
   }
   .navlink:hover {
     color: var(--text-2);
-    background: var(--ink-700);
+    background: var(--hover-bg);
     text-decoration: none;
   }
   .navlink.on {
     color: var(--text-hi);
-    background: var(--ink-700);
+    background: var(--panel);
   }
   .proj select {
-    background: var(--ink-800);
-    border: 1px solid var(--line);
-    border-radius: var(--r-pill);
+    background: var(--input);
+    border: 1px solid var(--pane);
     color: var(--text-2);
-    font-size: 12.5px;
-    padding: 3px 8px;
+    font-size: 11.5px;
+    padding: 2px 6px;
   }
   .filters {
     display: flex;
@@ -160,41 +169,39 @@
     margin-left: auto;
   }
   .chip {
-    padding: 4px 10px;
-    border-radius: var(--r-pill);
+    padding: 2px 8px;
     color: var(--text-3);
-    font-size: 12px;
-    font-weight: 500;
+    font-size: 11.5px;
     white-space: nowrap;
   }
   .chip:hover {
     color: var(--text-2);
-    background: var(--ink-700);
   }
   .chip.on {
+    background: var(--panel);
     color: var(--text-hi);
-    background: var(--ink-700);
+    border: 1px solid var(--pane);
+    padding: 1px 7px;
   }
   .chip .c {
-    font-family: var(--font-mono);
-    font-size: 11px;
+    color: var(--text-4);
+    margin-left: 2px;
+    font-variant-numeric: tabular-nums;
   }
-  .chip.pending .c {
-    color: var(--signal-caution);
+  .chip .star {
+    font-style: normal;
+    color: var(--pending);
   }
   .pending-wrap {
     position: relative;
   }
   .pending-count {
-    color: var(--text-2);
-    background: rgba(242, 179, 61, 0.08);
-  }
-  .pending-count .c {
-    color: var(--signal-caution);
+    color: var(--text-3);
+    background: var(--pending-tint);
   }
   .dropdown {
     position: absolute;
-    top: 34px;
+    top: 28px;
     right: 0;
     width: 360px;
     max-height: 60vh;
@@ -206,7 +213,7 @@
   .dd-empty {
     padding: 10px 12px;
     color: var(--text-3);
-    font-size: 12px;
+    font-size: 11.5px;
   }
   .dd-item {
     display: grid;
@@ -215,17 +222,15 @@
     width: 100%;
     text-align: left;
     padding: 8px 10px;
-    border-radius: var(--r-panel);
   }
   .dd-item:hover {
-    background: var(--ink-700);
+    background: var(--hover-bg);
   }
-  .dd-dot {
-    width: 6px;
-    height: 6px;
-    border-radius: 50%;
-    background: var(--signal-caution);
-    margin-top: 5px;
+  .dd-dot::before {
+    content: '!';
+    color: var(--pending);
+    font-weight: 600;
+    font-size: 10.5px;
   }
   .dd-title {
     color: var(--text-hi);
@@ -234,22 +239,17 @@
   .dd-msg {
     grid-column: 2;
     color: var(--text-3);
-    font-size: 11.5px;
+    font-size: 11px;
     overflow: hidden;
     text-overflow: ellipsis;
     white-space: nowrap;
   }
   .btn-new {
     margin-left: 4px;
-    padding: 6px 14px;
-    border-radius: var(--r-pill);
-    background: var(--ink-700);
-    border: 1px solid var(--line);
-    font-weight: 500;
-    font-size: 12.5px;
     white-space: nowrap;
   }
-  .btn-new:hover {
-    border-color: var(--text-3);
+  .btn-new i {
+    font-style: normal;
+    color: var(--text-3);
   }
 </style>

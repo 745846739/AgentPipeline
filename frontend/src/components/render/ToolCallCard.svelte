@@ -17,24 +17,22 @@
   .toolcard {
     display: flex;
     align-items: center;
-    gap: 8px;
-    background: var(--ink-800);
-    border: 1px solid var(--line-soft);
-    border-radius: var(--r-panel);
-    padding: 6px 10px;
-    margin: 6px 0;
-    max-width: 640px;
+    gap: 10px;
+    border-left: 2px solid var(--pane);
+    padding: 3px 0 3px 12px;
+    margin: 5px 0;
+    max-width: 680px;
+    font-size: 11px;
+    color: var(--text-2);
   }
   .fn {
     font-family: var(--font-mono);
-    font-size: 11.5px;
-    color: var(--text-2);
     overflow: hidden;
     text-overflow: ellipsis;
     white-space: nowrap;
   }
   .fn b {
-    color: var(--branch-dev);
+    color: var(--text-hi);
     font-weight: 500;
   }
   .res {
@@ -45,9 +43,12 @@
     flex: none;
   }
   .res.end {
-    color: var(--signal-go);
+    color: var(--go);
+  }
+  .res.ok {
+    color: var(--go);
   }
   .res.error {
-    color: var(--signal-stop);
+    color: var(--stop);
   }
 </style>

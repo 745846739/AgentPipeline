@@ -139,9 +139,8 @@
   .warn {
     margin-top: 10px;
     padding: 7px 10px;
-    border-radius: var(--r-panel);
-    border: 1px solid var(--signal-caution);
-    color: var(--signal-caution);
+    border: 1px solid var(--pending);
+    color: var(--pending);
     font-size: 11.5px;
     line-height: 1.5;
   }
@@ -155,11 +154,11 @@
   }
   .hint {
     margin-top: 8px;
-    font-size: 11.5px;
+    font-size: 11px;
     color: var(--text-3);
   }
   .error {
-    color: var(--signal-stop);
+    color: var(--stop);
     font-size: 12px;
     margin-top: 8px;
   }

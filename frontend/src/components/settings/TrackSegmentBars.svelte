@@ -55,8 +55,8 @@
 
 <style>
   .chart {
-    background: var(--ink-800);
-    border: 1px solid var(--line);
+    background: var(--panel);
+    border: 1px solid var(--pane);
     border-radius: var(--r-panel);
     padding: 12px 14px 14px;
   }
@@ -82,14 +82,14 @@
   .plot {
     position: relative;
   }
-  /* 轨道线：贯穿所有站点圆点（圆点以 ink-800 挖空覆盖） */
+  /* 轨道线：贯穿所有站点圆点（圆点以 panel 底挖空覆盖） */
   .rail-line {
     position: absolute;
     left: 0;
     right: 0;
     top: 22px;
     height: 1px;
-    background: var(--line);
+    background: var(--hairline);
   }
   .cols {
     position: relative;
@@ -106,11 +106,11 @@
   .lbl {
     height: 16px;
     max-width: 100%;
-    font-family: var(--font-cond);
+    font-family: var(--font-code);
     font-size: 10.5px;
     font-weight: 600;
     letter-spacing: 0.02em;
-    color: var(--text-2);
+    color: var(--text-3);
     white-space: nowrap;
     overflow: hidden;
     text-overflow: ellipsis;
@@ -121,62 +121,64 @@
     z-index: 1;
     width: 9px;
     height: 9px;
-    border-radius: 50%;
-    background: var(--ink-800);
+    border-radius: 0;
+    background: var(--panel);
     border: 2px solid var(--text-3);
   }
   .dot.go {
-    border-color: var(--signal-go);
+    border-color: var(--go);
   }
   .dot.caution {
-    border-color: var(--signal-caution);
+    border-color: var(--pending);
   }
   .dot.stop {
-    border-color: var(--signal-stop);
+    border-color: var(--stop);
   }
   .dot.done {
-    border-color: var(--signal-done);
+    border-color: var(--done);
   }
+  /* 分支不再是色相，降为亮度阶 */
   .dot.dev {
-    border-color: var(--branch-dev);
+    border-color: var(--text-2);
   }
   .dot.test {
-    border-color: var(--branch-test);
+    border-color: var(--text-3);
   }
   .track {
     width: 100%;
     height: 6px;
     margin-top: 8px;
-    border-radius: var(--r-pill);
-    background: var(--line-soft);
+    border-radius: 0;
+    background: var(--hairline);
     overflow: hidden;
   }
   .fill {
     height: 100%;
-    border-radius: var(--r-pill);
-    background: var(--signal-go);
+    border-radius: 0;
+    background: var(--go);
     min-width: 2px;
     transition: width 0.3s ease-out;
   }
   .fill.caution {
-    background: var(--signal-caution);
+    background: var(--pending);
   }
   .fill.stop {
-    background: var(--signal-stop);
+    background: var(--stop);
   }
   .fill.done {
-    background: var(--signal-done);
+    background: var(--done);
   }
   .fill.dev {
-    background: var(--branch-dev);
+    background: var(--text-2);
   }
   .fill.test {
-    background: var(--branch-test);
+    background: var(--text-3);
   }
   .val {
     margin-top: 5px;
     font-size: 10.5px;
     color: var(--text-2);
+    font-variant-numeric: tabular-nums;
     white-space: nowrap;
   }
   @media (prefers-reduced-motion: reduce) {

@@ -35,7 +35,7 @@
         <span class="to">
           {t.to_stage}.{t.to_node}
           {#if branchKind(t.branch) !== 'main'}
-            <span class="bbadge {branchKind(t.branch)}">∥ {branchKind(t.branch)}</span>
+            <span class="bbadge {branchKind(t.branch)}">{branchKind(t.branch) === 'dev' ? '[dev]' : '[tst]'}</span>
           {/if}
           {#if isCurrent(t)}<span class="cur">← 当前</span>{/if}
           {#if t.reason}<span class="why">（{t.reason}）</span>{/if}
@@ -50,32 +50,31 @@
     font-family: var(--font-mono);
     font-size: 11.5px;
     color: var(--text-2);
-    max-width: 760px;
+    max-width: 820px;
   }
   .trow {
     display: flex;
-    gap: 14px;
-    padding: 5px 8px;
-    border-radius: var(--r-pill);
+    gap: 12px;
+    padding: 3px 8px;
   }
   .trow:hover {
-    background: var(--ink-800);
+    background: var(--hover-bg);
   }
   .t {
-    color: var(--text-3);
+    color: var(--text-4);
     flex: none;
-    width: 64px;
+    width: 66px;
   }
   .tr {
     flex: none;
-    width: 88px;
+    width: 96px;
     color: var(--text-3);
   }
   .tr.warn {
-    color: var(--signal-caution);
+    color: var(--pending);
   }
   .tr.stop {
-    color: var(--signal-stop);
+    color: var(--stop);
   }
   .to {
     flex: 1;
@@ -83,25 +82,21 @@
     word-break: break-word;
   }
   .why {
-    color: var(--text-3);
+    color: var(--text-4);
   }
   .cur {
-    color: var(--signal-go);
+    color: var(--go);
   }
   .bbadge {
-    font-family: var(--font-cond);
     font-size: 10px;
     font-weight: 600;
+    letter-spacing: 0.06em;
     padding: 0 5px;
-    border-radius: var(--r-pill);
+    border: 1px solid var(--pane);
   }
-  .bbadge.dev {
-    color: var(--branch-dev);
-    background: rgba(76, 195, 224, 0.1);
-  }
+  .bbadge.dev,
   .bbadge.test {
-    color: var(--branch-test);
-    background: rgba(167, 139, 250, 0.1);
+    color: var(--text-3);
   }
   .empty {
     color: var(--text-3);

@@ -17,10 +17,16 @@
   const items = $derived(analysis.result ? analysisChecklist(analysis.result) : []);
 </script>
 
-<section class="analysis panel">
+<section class="analysis">
   <header class="head">
     <span class="cond">项目分析 · 核对清单</span>
-    <span class="status {analysis.status}">{analysisStatusLabel(analysis.status)}</span>
+    {#if analysis.status === 'done'}
+      <span class="st run">{analysisStatusLabel(analysis.status)}</span>
+    {:else if analysis.status === 'failed'}
+      <span class="st stop">{analysisStatusLabel(analysis.status)}</span>
+    {:else}
+      <span class="st wait">{analysisStatusLabel(analysis.status)}</span>
+    {/if}
     <button type="button" class="btn quiet" onclick={onclose}>收起</button>
   </header>
 
@@ -42,7 +48,7 @@
   {:else if analysis.status === 'failed'}
     <div class="error">{analysis.error ?? '分析失败，未返回原因。'}</div>
   {:else}
-    <div class="running"><span class="dot"></span>正在探测仓库事实，稍候…</div>
+    <div class="running"><span class="st run">[RUN]</span>正在探测仓库事实，稍候…</div>
   {/if}
 </section>
 
@@ -50,6 +56,8 @@
   .analysis {
     padding: 12px 14px;
     margin-top: 10px;
+    background: var(--panel);
+    border: 1px solid var(--pane);
   }
   .head {
     display: flex;
@@ -64,17 +72,6 @@
   .head .btn {
     margin-left: auto;
   }
-  .status {
-    font-family: var(--font-mono);
-    font-size: 10.5px;
-    color: var(--text-3);
-  }
-  .status.done {
-    color: var(--signal-go);
-  }
-  .status.failed {
-    color: var(--signal-stop);
-  }
   .lead {
     font-size: 11.5px;
     color: var(--text-3);
@@ -84,23 +81,24 @@
     list-style: none;
     display: grid;
     grid-template-columns: 1fr 1fr;
-    gap: 4px 18px;
+    gap: 0 18px;
   }
   .checklist li {
     display: grid;
     grid-template-columns: 16px 96px 1fr;
     align-items: baseline;
     font-size: 12px;
-    padding: 2px 0;
+    padding: 3px 0;
+    border-bottom: 1px solid var(--hairline);
   }
   .checklist li.missing {
     color: var(--text-3);
   }
   .mark {
-    color: var(--signal-go);
+    color: var(--go);
   }
   .checklist li.missing .mark {
-    color: var(--signal-caution);
+    color: var(--text-4);
   }
   .label {
     color: var(--text-2);
@@ -122,16 +120,9 @@
     color: var(--text-2);
     padding: 4px 0;
   }
-  .running .dot {
-    width: 7px;
-    height: 7px;
-    border-radius: 50%;
-    background: var(--signal-go);
-    animation: breath 1.4s ease-in-out infinite;
-  }
   .error {
     font-size: 12px;
-    color: var(--signal-stop);
+    color: var(--stop);
     white-space: pre-wrap;
   }
   .foot {

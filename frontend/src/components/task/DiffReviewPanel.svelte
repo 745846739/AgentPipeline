@@ -119,11 +119,11 @@
     display: flex;
     gap: 16px;
     align-items: baseline;
-    margin-bottom: 10px;
+    margin-bottom: 12px;
     flex-wrap: wrap;
   }
   .diffhead .big {
-    font-size: 13px;
+    font-size: 12.5px;
   }
   .diffhead .a {
     color: var(--diff-add);
@@ -136,15 +136,14 @@
   }
   .notice {
     display: inline-block;
-    font-size: 12px;
-    color: var(--signal-caution);
-    border: 1px dashed var(--signal-caution);
-    border-radius: var(--r-pill);
-    padding: 3px 10px;
+    font-size: 11px;
+    color: var(--pending);
+    border: 1px dashed var(--pending);
+    padding: 2px 10px;
     margin-bottom: 10px;
   }
   .error {
-    color: var(--signal-stop);
+    color: var(--stop);
     font-size: 12px;
     margin-bottom: 8px;
   }

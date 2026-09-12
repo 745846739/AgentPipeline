@@ -1,69 +1,25 @@
 <script lang="ts">
   import type { MiniDotState, StationView } from '../../lib/pipeline';
+  import { railTokens, tokenLitsSegment } from '../../lib/pipeline';
 
+  /**
+   * 字符轨道（theme-3 §3 共享元素映射）：结构靠字符与亮度，不靠盒子与 SVG。
+   * 三种密度：spine（看板列头脊线）/ hero（任务详情）/ mini（卡片迷你轨，9 刻度）。
+   */
   interface Props {
     variant: 'spine' | 'hero' | 'mini';
     /** spine / hero：各站点状态。 */
     stations?: StationView[];
     /** mini：9 刻度状态。 */
     dots?: MiniDotState[];
-    /** mini 轨一行 9 站；游标点加光晕。 */
     ariaLabel?: string;
   }
 
   let { variant, stations = [], dots = [], ariaLabel = '流水线轨道' }: Props = $props();
 
-  const SPINE_PATHS = [
-    { d: 'M160 62 H452', cls: 'track' },
-    { d: 'M452 62 C500 62 520 38 568 38 H920 C968 38 988 62 1036 62', cls: 'track dev' },
-    { d: 'M452 62 C500 62 520 86 568 86 H920 C968 86 988 62 1036 62', cls: 'track test' },
-    { d: 'M1036 62 H1328', cls: 'track' },
-    { d: 'M1328 62 H1620', cls: 'track' },
-    { d: 'M1620 62 H1912', cls: 'track' },
-    { d: 'M1912 62 H2204', cls: 'track' },
-  ];
-  const SPINE_RETURNS = [
-    'M985 74 C985 98 452 98 452 74',
-    'M1328 74 C1328 104 1036 104 1036 74',
-    'M1912 74 C1912 104 1620 104 1620 74',
-    'M1912 78 C1912 110 1036 110 1036 78',
-  ];
+  const tokens = $derived(railTokens(dots));
 
-  const HERO_PATHS = [
-    { d: 'M70 66 H196', cls: 'track' },
-    { d: 'M196 66 C240 66 262 40 306 40 H334 C378 40 400 66 444 66', cls: 'track dev' },
-    { d: 'M196 66 C240 66 262 92 306 92 H334 C378 92 400 66 444 66', cls: 'track test' },
-    { d: 'M444 66 H710', cls: 'track' },
-    { d: 'M710 66 H860', cls: 'track' },
-    { d: 'M860 66 H1010', cls: 'track' },
-    { d: 'M1010 66 H1090', cls: 'track' },
-  ];
-  const HERO_RETURNS = [
-    'M470 78 C470 108 196 108 196 78',
-    'M710 78 C710 108 560 108 560 78',
-    'M1010 78 C1010 108 860 108 860 78',
-    'M1010 82 C1010 114 560 114 560 82',
-  ];
-
-  function stationClass(state: string): string {
-    switch (state) {
-      case 'done':
-        return 'station-done';
-      case 'go':
-        return 'station-go';
-      case 'warn':
-        return 'station-warn';
-      case 'stop':
-        return 'station-stop';
-      case 'dev':
-        return 'station-dev';
-      case 'test':
-        return 'station-test';
-      default:
-        return '';
-    }
-  }
-
+  /** 站点标记字符：与 frontend-design §6.1 图例逐字一致。 */
   function glyph(state: string): string {
     switch (state) {
       case 'done':
@@ -82,188 +38,306 @@
     }
   }
 
-  function labelClass(state: string): string {
-    if (state === 'idle') return 'st-label dim';
-    if (state === 'warn') return 'st-label warn';
-    if (state === 'go') return 'st-label go';
-    if (state === 'dev') return 'st-label dev';
-    if (state === 'test') return 'st-label test';
-    return 'st-label';
+  /** 标记色彩阶（亮度编码 + 状态例外色）。 */
+  function mkClass(state: string): string {
+    switch (state) {
+      case 'done':
+        return 'd';
+      case 'go':
+        return 'c';
+      case 'warn':
+        return 'w';
+      case 'stop':
+        return 'x';
+      case 'dev':
+      case 'test':
+        return 'p';
+      default:
+        return '';
+    }
+  }
+
+  function lbClass(state: string): string {
+    switch (state) {
+      case 'idle':
+        return 'lb dim';
+      case 'done':
+        return 'lb dim';
+      case 'go':
+        return 'lb hot';
+      case 'warn':
+        return 'lb pen';
+      default:
+        return 'lb';
+    }
   }
 </script>
 
 {#if variant === 'mini'}
-  <div class="minirail" role="img" aria-label={ariaLabel}>
-    {#each dots as dot, i (i)}
-      <span class="dot {dot}"></span>
-      {#if i < dots.length - 1}<span class="seg {dot === 'past' || dot === 'done' ? 'lit' : ''}"></span>{/if}
+  <div class="rail mini" role="img" aria-label={ariaLabel}>
+    {#each tokens as t, i (i)}
+      <span class="d {t}"></span>
+      {#if i < tokens.length - 1}<span class="s {tokenLitsSegment(t) ? 'lit' : ''}"></span>{/if}
     {/each}
   </div>
-{:else if variant === 'spine'}
-  <svg class="rail rail-spine" viewBox="0 0 2364 118" preserveAspectRatio="xMinYMid meet" role="img" aria-label="看板轨道脊线">
-    {#each SPINE_RETURNS as d (d)}<path class="return" {d} />{/each}
-    {#each SPINE_PATHS as p (p.d)}<path class="{p.cls} rail-draw" d={p.d} />{/each}
-    {#each stations as s (s.key)}
-      <g>
-        <circle class="station {stationClass(s.state)}" cx={s.x} cy={s.y} r={s.parallel ? 4 : 5} />
-        {#if s.label}<text class={labelClass(s.state)} x={s.x} y={s.y - 26}>{s.label}</text>{/if}
-        {#if s.count !== undefined}<text class="st-count" x={s.x} y={s.y + 28}>{s.count}</text>{/if}
-      </g>
-    {/each}
-  </svg>
 {:else}
-  <svg class="rail rail-hero" viewBox="0 0 1160 120" preserveAspectRatio="xMidYMid meet" role="img" aria-label="流水线轨道">
-    {#each HERO_RETURNS as d, i (i)}<path class="return" {d} />{/each}
-    {#each HERO_PATHS as p, i (i)}<path class="{p.cls} rail-draw" d={p.d} />{/each}
-    {#each stations as s (s.key)}
-      <g>
-        <circle class="station {stationClass(s.state)}" cx={s.x} cy={s.y} r={s.parallel ? 4 : 5} />
-        {#if s.label}
-          <text class={labelClass(s.state)} x={s.x} y={s.y - 26}>
-            {s.label} {glyph(s.state)}
-          </text>
+  <div class="rail {variant}" role="img" aria-label={ariaLabel}>
+    <div class="railline">
+      {#if variant === 'spine'}
+        <div class="ln" style="left:132px;width:1848px;top:36px"></div>
+        <div class="ln br" style="left:396px;width:528px;top:22px"></div>
+        <div class="ln br" style="left:396px;width:528px;top:50px"></div>
+        <div class="ln vt" style="left:396px;top:22px"></div>
+        <div class="ln vt" style="left:924px;top:22px"></div>
+        <div class="ret" style="left:396px;width:264px;top:76px"><i>↩</i></div>
+        <div class="ret" style="left:924px;width:264px;top:88px"><i>↩</i></div>
+        <div class="ret" style="left:1452px;width:264px;top:76px"><i>↩</i></div>
+        <div class="ret" style="left:924px;width:792px;top:100px"><i>↩</i></div>
+      {:else}
+        <div class="ln" style="left:60px;width:970px;top:36px"></div>
+        <div class="ln br" style="left:165px;width:400px;top:22px"></div>
+        <div class="ln br" style="left:165px;width:400px;top:50px"></div>
+        <div class="ln vt" style="left:165px;top:22px"></div>
+        <div class="ln vt" style="left:565px;top:22px"></div>
+        <div class="ret" style="left:165px;width:200px;top:72px"><i>↩</i></div>
+        <div class="ret" style="left:565px;width:125px;top:84px"><i>↩</i></div>
+        <div class="ret" style="left:815px;width:125px;top:72px"><i>↩</i></div>
+        <div class="ret" style="left:565px;width:375px;top:96px"><i>↩</i></div>
+      {/if}
+
+      {#each stations as s (s.key)}
+        {#if s.parallel}
+          <div
+            class="stn side {s.parallel === 'dev' ? 'up' : 'dn'}"
+            style="left:{s.x}px;top:{s.y}px"
+          >
+            <span class="mk {mkClass(s.state)}">{glyph(s.state)}</span>
+            <span class="lb"
+              ><b>[{s.parallel === 'dev' ? 'dev' : 'tst'}]</b>{s.label}</span
+            >
+          </div>
+        {:else}
+          <div class="stn" style="left:{s.x}px">
+            <span class="mk {mkClass(s.state)}">{glyph(s.state)}</span>
+            <span class={lbClass(s.state)}>{s.label}</span>
+            {#if s.count !== undefined}<span class="ct">{s.count}</span>{/if}
+          </div>
         {/if}
-      </g>
-    {/each}
-  </svg>
+      {/each}
+    </div>
+  </div>
 {/if}
 
 <style>
-  .rail-spine {
-    display: block;
-    width: 2364px;
-    height: 118px;
-    border-bottom: 1px solid var(--line-soft);
-  }
-  .rail-hero {
-    display: block;
-    width: 100%;
-    height: 120px;
-  }
-  .track {
-    stroke: var(--line);
-    stroke-width: 2;
-    fill: none;
-    stroke-linecap: round;
-  }
-  .track.dev {
-    stroke: var(--branch-dev);
-    opacity: 0.85;
-  }
-  .track.test {
-    stroke: var(--branch-test);
-    opacity: 0.85;
-  }
-  .return {
-    stroke: var(--text-3);
-    stroke-width: 1.2;
-    fill: none;
-    stroke-dasharray: 2 5;
-    opacity: 0.5;
-  }
-  .station {
-    fill: var(--ink-900);
-    stroke: var(--text-3);
-    stroke-width: 2;
-  }
-  .station-done {
-    stroke: var(--signal-done);
-  }
-  .station-go {
-    stroke: var(--signal-go);
-  }
-  .station-warn {
-    stroke: var(--signal-caution);
-    animation: breath 2.4s ease-in-out infinite;
-  }
-  .station-stop {
-    stroke: var(--signal-stop);
-  }
-  .station-dev {
-    stroke: var(--branch-dev);
-  }
-  .station-test {
-    stroke: var(--branch-test);
-  }
-  .st-label {
-    font-family: var(--font-cond);
-    font-size: 11.5px;
-    font-weight: 600;
-    fill: var(--text-2);
-    text-anchor: middle;
-    letter-spacing: 0.03em;
-  }
-  .st-label.dim {
-    fill: var(--text-3);
-  }
-  .st-label.warn {
-    fill: var(--signal-caution);
-  }
-  .st-label.go {
-    fill: var(--signal-go);
-  }
-  .st-label.dev {
-    fill: var(--branch-dev);
-  }
-  .st-label.test {
-    fill: var(--branch-test);
-  }
-  .st-count {
-    font-family: var(--font-mono);
-    font-size: 9.5px;
-    fill: var(--text-3);
-    text-anchor: middle;
-  }
-
-  /* 迷你轨（卡片 16px 密度） */
-  .minirail {
+  /* ── 迷你轨（卡片身份特征，9 刻度） ── */
+  .rail.mini {
     display: flex;
     align-items: center;
-    margin: 10px 0 8px;
+    min-height: 15px;
+    margin: 8px 0 7px;
   }
-  .minirail .seg {
-    flex: 1;
-    height: 1.5px;
-    background: var(--line);
-  }
-  .minirail .seg.lit {
-    background: var(--signal-done);
-  }
-  .minirail .dot {
-    width: 5px;
-    height: 5px;
-    border-radius: 50%;
-    background: var(--line);
+  .rail.mini .d {
     flex: none;
+    width: 13px;
+    text-align: center;
+    font-size: 10.5px;
+    line-height: 1;
+    color: var(--text-4);
   }
-  .minirail .dot.past,
-  .minirail .dot.done {
-    background: var(--signal-done);
+  .rail.mini .d::before {
+    content: '○';
   }
-  .minirail .dot.cur {
-    width: 8px;
-    height: 8px;
-    background: var(--signal-go);
-    box-shadow: 0 0 6px var(--signal-go);
+  .rail.mini .d.p {
+    color: var(--text-2);
   }
-  .minirail .dot.cur-warn {
-    width: 8px;
-    height: 8px;
-    background: var(--signal-caution);
-    box-shadow: 0 0 6px var(--signal-caution);
+  .rail.mini .d.p::before {
+    content: '●';
   }
-  .minirail .dot.cur-stop {
-    width: 8px;
-    height: 8px;
-    background: var(--signal-stop);
-    box-shadow: 0 0 6px var(--signal-stop);
+  .rail.mini .d.d {
+    color: var(--text-3);
   }
-  .minirail .dot.dev {
-    background: var(--branch-dev);
-    box-shadow: 0 0 5px var(--branch-dev);
+  .rail.mini .d.d::before {
+    content: '●';
   }
-  .minirail .dot.tst {
-    background: var(--branch-test);
-    box-shadow: 0 0 5px var(--branch-test);
+  .rail.mini .d.c,
+  .rail.mini .d.v {
+    color: var(--text-hi);
+  }
+  .rail.mini .d.c::before,
+  .rail.mini .d.v::before {
+    content: '◆';
+  }
+  .rail.mini .d.w {
+    color: var(--pending);
+  }
+  .rail.mini .d.w::before {
+    content: '◆';
+  }
+  .rail.mini .d.x {
+    color: var(--stop);
+  }
+  .rail.mini .d.x::before {
+    content: '◆';
+  }
+  .rail.mini .d.t {
+    color: var(--text-3);
+  }
+  .rail.mini .d.t::before {
+    content: '◇';
+  }
+  .rail.mini .s {
+    flex: 1;
+    height: 1px;
+    background: var(--hairline);
+  }
+  .rail.mini .s.lit {
+    background: var(--lit);
+  }
+
+  /* ── 字符线路行（脊线 / hero） ── */
+  .rail.spine,
+  .rail.hero {
+    position: relative;
+    background-image: var(--rail-band);
+    background-size: var(--rail-band-size);
+    background-position: var(--rail-band-pos);
+    background-repeat: no-repeat;
+  }
+  .rail.spine {
+    width: 2144px;
+    height: 116px;
+    /* 与 .boardpad 的 16px 内缩对齐：站点 x=132+264i 即列中心 */
+    padding: 14px 0 0 16px;
+  }
+  .rail.hero {
+    width: 100%;
+    max-width: 1040px;
+    height: 106px;
+    padding: 14px 0 0;
+  }
+  .railline {
+    position: relative;
+    height: 102px;
+  }
+  .ln {
+    position: absolute;
+    height: 1px;
+    background: var(--text-2);
+  }
+  .ln.dim {
+    background: var(--hairline);
+  }
+  .ln.br {
+    background: var(--br);
+  }
+  .ln.br.done {
+    background: var(--br-done);
+  }
+  .ln.vt {
+    width: 1px;
+    height: 29px;
+  }
+  .ret {
+    position: absolute;
+    border-top: 1px dashed var(--dash);
+    color: var(--text-4);
+    font-size: 9.5px;
+    line-height: 1;
+  }
+  .ret i {
+    font-style: normal;
+    position: absolute;
+    left: 0;
+    top: -7px;
+    background: var(--mask-bg);
+    padding-right: 3px;
+  }
+  .stn {
+    position: absolute;
+    top: 29px;
+    transform: translateX(-50%);
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    gap: 1px;
+    text-align: center;
+  }
+  .stn .mk {
+    font-size: 13px;
+    line-height: 1;
+    color: var(--text-4);
+  }
+  .stn .mk.p {
+    color: var(--text-2);
+  }
+  .stn .mk.d {
+    color: var(--text-3);
+  }
+  .stn .mk.c {
+    color: var(--text-hi);
+  }
+  .stn .mk.w {
+    color: var(--pending);
+    animation: breath 2.4s ease-in-out infinite;
+  }
+  .stn .mk.x {
+    color: var(--stop);
+  }
+  .stn .lb {
+    font-size: 11px;
+    font-weight: 600;
+    letter-spacing: 0.04em;
+    color: var(--text-3);
+    white-space: nowrap;
+  }
+  .stn .lb.dim {
+    color: var(--text-4);
+  }
+  .stn .lb.hot {
+    color: var(--text-hi);
+  }
+  .stn .lb.pen {
+    color: var(--pending);
+  }
+  .stn .ct {
+    font-size: 9.5px;
+    color: var(--text-4);
+    font-variant-numeric: tabular-nums;
+  }
+  /* 并行分岔侧站：两条分支共用同一 x，上下分行 */
+  .stn.side {
+    transform: translate(-6px, -50%);
+  }
+  .stn.side .mk {
+    display: block;
+  }
+  .stn.side .lb {
+    position: absolute;
+    left: 16px;
+    white-space: nowrap;
+    background: var(--mask-bg);
+    padding: 0 4px;
+    font-size: 10.5px;
+    font-weight: 600;
+    letter-spacing: 0.04em;
+    color: var(--text-3);
+  }
+  .stn.side.up .lb {
+    bottom: 9px;
+  }
+  /* 下轨标签同样右伸：原型的 right:16px 会向左越过前一站标签（theme-3 §8 已知缺陷） */
+  .stn.side.dn .lb {
+    top: 9px;
+  }
+  .stn.side .lb b {
+    color: var(--text-4);
+    font-weight: 500;
+    margin-right: 4px;
+  }
+
+  @media (prefers-reduced-motion: reduce) {
+    .stn .mk.w {
+      animation: none;
+    }
   }
 </style>
