@@ -51,4 +51,25 @@
   .res.error {
     color: var(--stop);
   }
+
+  /* 移动版（<480px）：工具卡折行（theme-3 §8） */
+  @media (max-width: 479px) {
+    .toolcard {
+      flex-wrap: wrap;
+      gap: 2px 10px;
+      padding: 5px 0 5px 10px;
+      margin: 6px 0;
+      max-width: none;
+      font-size: 12.5px;
+    }
+    .fn {
+      overflow: visible;
+      overflow-wrap: break-word;
+      text-overflow: clip;
+      white-space: normal;
+    }
+    .res {
+      font-size: 12px;
+    }
+  }
 </style>

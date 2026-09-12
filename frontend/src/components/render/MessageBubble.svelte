@@ -17,19 +17,19 @@
 {#if message.role === 'system'}
   <details class="sys">
     <summary class="sys-sum">
-      <span class="who sys">SYSTEM</span>
+      <span class="who sys">SYS</span>
       <span class="dim">折叠 · {lineCount(message.content)} 行</span>
     </summary>
     <div class="sysbox">{message.content ?? ''}</div>
   </details>
 {:else if message.role === 'user'}
   <div class="msg">
-    <div class="who">USER</div>
+    <div class="who">YOU</div>
     <pre class="userbox">{message.content ?? ''}</pre>
   </div>
 {:else if message.role === 'assistant'}
   <div class="msg assistant">
-    <div class="who as">ASSISTANT</div>
+    <div class="who as">AGT</div>
     {#if message.content}
       <MarkdownView source={message.content} />
     {/if}
@@ -44,7 +44,7 @@
     <ToolCallCard
       tool={message.name ?? 'tool'}
       argsSummary={message.tool_call_id ? `call ${message.tool_call_id}` : ''}
-      resultSummary={truncate(message.content ?? '', 60)}
+      resultSummary={message.content ? truncate(message.content, 60) : undefined}
     />
   </div>
 {/if}
@@ -109,5 +109,29 @@
      不改 MarkdownView 的公共宽度，也不波及同列的 ToolCallCard。 */
   .msg.assistant :global(.md) {
     max-width: 76ch;
+  }
+
+  /* 移动版（<480px）：电文流（theme-3 §8） */
+  @media (max-width: 479px) {
+    .msg {
+      margin-bottom: 14px;
+    }
+    .who {
+      font-size: 11px;
+      margin-bottom: 4px;
+    }
+    .sysbox {
+      padding: 8px 10px;
+      font-size: 12.5px;
+      max-height: none;
+    }
+    .userbox {
+      font-size: 12.5px;
+      overflow-wrap: break-word;
+    }
+    .msg.assistant :global(.md) {
+      max-width: none;
+      font-size: 14px;
+    }
   }
 </style>
