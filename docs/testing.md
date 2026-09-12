@@ -92,7 +92,7 @@ workspace 成员 `crates/testkit`，供 L2 / L4 复用：
 | FileToolPolicy | realpath（/tmp→/private/tmp）、deny_paths（`.env*`、`*.pem`、`id_rsa*`）、拒绝写符号链接、deny 优先 allow、workdir_bound | 104 |
 | 脱敏 | `sk-*` / `ghp_*` / 长 base64 正则；`sanitize_command`（`--token`、URL 凭证）；**回填 messages 之前**执行 | 118 / §12.4.4 |
 | 上下文 | L1 各工具裁剪（read 头 200 行 / run_command 错误行保留 / list_dir 200 项）；L2 阈值 4000 唯一；L3 压缩规则表逐行；L4 spawn 关闭→`pending(context_overflow)` | §12.13 / 110 |
-| prompt 组装 | golden（insta）：`[基线前言][AGENTS.md][persona][格式规则]` 顺序；AGENTS.md 缺省注入非空默认；`prompts/` 覆盖生效；user prompt 追加段（gate_recheck / backtrack-feedback / retry-feedback，**首轮为空不渲染**）；`{test_command}` / `{test_file_convention}` 变量；`prompt_template_hash` 稳定与变化 | 51 / 28 / 7 / 109 / 126 / 138 / 31 / 137 |
+| prompt 组装 | golden（insta）：`[基线前言][工作目录(G12)][AGENTS.md(G3)][persona][技能清单][格式规则]` 顺序；AGENTS.md 加载与缺省注入非空默认；`prompts/` 覆盖生效；`stage_configs.persona_path`（相对 home 解析、存在且非空）与 `persona_append` 生效；内置 §10.3 十二个 agent 节点模板（system+user）全部内嵌且只引用已声明变量；SystemBaseline 工具并集（mandatory 不可移除、forbidden 剔除）；`stage_configs` 的 temperature / max_tokens 透传 `LlmRequest`；user prompt 追加段（gate_recheck / backtrack-feedback / retry-feedback，**首轮为空不渲染**）；`{test_command}` / `{design_doc_path}` 等模板变量；`prompt_template_hash` 稳定、对覆盖与路径变化敏感 | 51 / 28 / 7 / 109 / 126 / 138 / 31 / 137 / §10.3 / §10.6 |
 | allowed_actions | 权威总表逐行（`(type, context.kind)`→动作集）；**端点配对静态检查**：每个 side_effect 动作必须映射到已注册路由，新增动作忘配端点直接红 | 130 / 101 / 119 |
 | 焦点游标 | 投影规则：pending 优先 / `updated_at` 最新 / 双 pending 取最新 | 92 / 130 |
 | 指标 | 逃逸率口径、阶段聚合 SQL、`total_tokens`=Σruns、`total_calls`=LLM run 数（不含 system） | 137 / 100 / 130 |

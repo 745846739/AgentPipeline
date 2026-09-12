@@ -438,6 +438,8 @@ impl Store {
             stage_configs,
             // 决策 47：对"真实可用"的 skill 集合 fail fast——以 PATH 可执行文件为准
             available_skills: crate::config::discover_available_skills(),
+            // §10.6.4：persona_path 相对 home 根解析，启动时一并校验存在且非空
+            home_root: Some(self.home().root().to_path_buf()),
         })?;
         for id in &report.demoted_providers {
             self.set_provider_enabled(id, false).await?;

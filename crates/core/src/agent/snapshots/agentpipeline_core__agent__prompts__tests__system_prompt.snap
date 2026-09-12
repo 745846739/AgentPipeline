@@ -4,6 +4,10 @@ expression: prompt
 ---
 你是 AgentPipeline 的节点 agent。严格按输出格式要求调用工具，不要臆测文件内容——需要时用 read_file 读取。禁止修改本阶段产出之外的任何文件。
 
+## 工作目录
+worktree：/home/u/.agentpipeline/worktrees/t1
+任务目录：/home/u/.agentpipeline/tasks/t1
+
 ## 项目上下文
 仓库：/repo
 语言：Rust

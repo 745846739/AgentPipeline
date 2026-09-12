@@ -195,6 +195,10 @@ pub struct LlmRequest {
     pub user_prompt: String,
     pub messages: Vec<Message>,
     pub tools: Vec<ToolDef>,
+    /// 阶段配置采样参数（§10.6.3 / 决策 46），None 时由适配器取默认值。
+    pub temperature: Option<f64>,
+    /// 阶段配置最大输出 token（§10.6.3 / 决策 46），None 时由适配器取默认值。
+    pub max_tokens: Option<u32>,
 }
 
 /// LLM 客户端接缝。

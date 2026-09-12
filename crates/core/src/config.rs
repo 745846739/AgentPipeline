@@ -308,6 +308,9 @@ pub struct StartupInputs {
     pub stage_configs: Vec<StageConfig>,
     /// 本机可用的 skill 名（配置里引用不存在的 skill → fail fast）。
     pub available_skills: Vec<String>,
+    /// home 根目录（§10.6.4：`persona_path` 相对路径按它解析；
+    /// 提供时校验 persona_path 存在且非空，None 则跳过该文件系统检查）。
+    pub home_root: Option<std::path::PathBuf>,
 }
 
 /// 启动校验结果。
@@ -321,6 +324,7 @@ pub struct StartupReport {
 /// - `cross_family_judge = true` 但 `validator_cross_check` 伪阶段没有可用 provider → 拒绝启动；
 /// - 阶段引用的 provider 不存在 / 被禁用 / vendor 不受支持 → 拒绝启动；
 /// - 引用的 skill 不存在 → 拒绝启动；
+/// - 提供 `home_root` 时：阶段 `persona_path` 不可读或内容为空 → 拒绝启动（§10.6.4）；
 /// - provider 表里 vendor 不受支持但**未被引用** → 降级 `enabled = 0`，只报告不报错。
 pub fn validate_startup(inputs: &StartupInputs) -> Result<StartupReport> {
     let mut report = StartupReport::default();
@@ -379,6 +383,25 @@ pub fn validate_startup(inputs: &StartupInputs) -> Result<StartupReport> {
                         cfg.stage
                     )));
                 }
+            }
+        }
+        // §10.6.4：persona「必须存在且非空」在启动时校验（运行时 resolve_stage_persona
+        // 仍有同样检查兜底——手工改库可绕过启动校验）
+        if let (Some(root), Some(path)) = (&inputs.home_root, cfg.persona_path.as_deref()) {
+            let p = root.join(path);
+            let content = std::fs::read_to_string(&p).map_err(|e| {
+                Error::Config(format!(
+                    "阶段 {} 的 persona_path 不可读：{}（{e}）",
+                    cfg.stage,
+                    p.display()
+                ))
+            })?;
+            if content.trim().is_empty() {
+                return Err(Error::Config(format!(
+                    "阶段 {} 的 persona_path 内容为空：{}",
+                    cfg.stage,
+                    p.display()
+                )));
             }
         }
     }
@@ -535,6 +558,7 @@ mod tests {
             providers: vec![provider("p1", "deepseek", true)],
             stage_configs: vec![],
             available_skills: vec![],
+            home_root: None,
         };
         let err = validate_startup(&inputs).unwrap_err();
         assert!(matches!(err, Error::Config(_)));
@@ -578,5 +602,40 @@ mod tests {
             ..Default::default()
         };
         assert!(validate_startup(&inputs).is_err());
+    }
+
+    #[test]
+    fn persona_path_checked_at_startup_when_home_root_given() {
+        let tmp = tempfile::tempdir().unwrap();
+        let good = tmp.path().join("persona.md");
+        std::fs::write(&good, "有效 persona").unwrap();
+        let base = StartupInputs {
+            stage_configs: vec![StageConfig {
+                stage: "review".into(),
+                persona_path: Some("persona.md".into()),
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+
+        // home_root 未提供 → 跳过文件系统检查
+        assert!(validate_startup(&StartupInputs { ..base.clone() }).is_ok());
+
+        // 文件有效 → 通过
+        let inputs = StartupInputs {
+            home_root: Some(tmp.path().to_path_buf()),
+            ..base.clone()
+        };
+        assert!(validate_startup(&inputs).is_ok());
+
+        // 文件为空 → fail fast（§10.6.4：persona 必须存在且非空）
+        std::fs::write(&good, "  \n").unwrap();
+        let err = validate_startup(&inputs).unwrap_err();
+        assert!(err.to_string().contains("内容为空"), "{err}");
+
+        // 文件缺失 → fail fast
+        std::fs::remove_file(&good).unwrap();
+        let err = validate_startup(&inputs).unwrap_err();
+        assert!(err.to_string().contains("不可读"), "{err}");
     }
 }

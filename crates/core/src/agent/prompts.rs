@@ -32,17 +32,49 @@ pub fn default_agents_context(
     )
 }
 
-/// 组装 system prompt：`[基线前言][AGENTS.md][persona][格式规则]`。
-pub fn build_system_prompt(agents_context: &str, persona: &str) -> String {
+/// 加载项目上下文（G3）：优先读 `{project_root}/AGENTS.md`，缺失或为空时
+/// 回退到非空默认上下文（决策 51）。
+pub fn load_agents_context(
+    project_root: &Path,
+    language: Option<&str>,
+    test_framework: Option<&str>,
+) -> String {
+    match std::fs::read_to_string(project_root.join("AGENTS.md")) {
+        Ok(content) if !content.trim().is_empty() => {
+            format!("## 项目上下文（AGENTS.md）\n{}", content.trim())
+        }
+        _ => default_agents_context(project_root, language, test_framework),
+    }
+}
+
+/// 组装 system prompt：
+/// `[基线前言][工作目录(G12)][AGENTS.md(G3)][persona][技能清单][格式规则]`。
+/// 固定前缀保证 prompt cache 稳定命中（§12.13.5）；worktree / 任务目录是任务级
+/// 常量，不破坏同一任务内重试的缓存。
+pub fn build_system_prompt(
+    agents_context: &str,
+    persona: &str,
+    workdirs: &str,
+    skills: &[String],
+) -> String {
     let agents = if agents_context.trim().is_empty() {
         default_agents_context(Path::new("(未提供)"), None, None)
     } else {
         agents_context.to_string()
     };
-    format!(
-        "{BASELINE_PREAMBLE}\n\n{agents}\n\n{}\n\n{FORMAT_RULES}",
+    let mut out = format!(
+        "{BASELINE_PREAMBLE}\n\n## 工作目录\n{workdirs}\n\n{agents}\n\n{}\n\n",
         persona.trim()
-    )
+    );
+    if !skills.is_empty() {
+        out.push_str("## 已启用技能\n");
+        for s in skills {
+            out.push_str(&format!("- {s}\n"));
+        }
+        out.push('\n');
+    }
+    out.push_str(FORMAT_RULES);
+    out
 }
 
 /// persona 解析结果。
@@ -78,17 +110,33 @@ pub fn resolve_persona(
     }
 }
 
-/// 模板变量替换上下文（决策 31）。
+/// 模板变量替换上下文（决策 31 / §10.3 / G12）。
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct TemplateVars {
     /// 目标项目的测试命令（`{test_command}`）。
     pub test_command: String,
     /// 测试文件命名惯例（`{test_file_convention}`）。
     pub test_file_convention: String,
+    /// 目标项目测试框架（`{test_framework}`）。
+    pub test_framework: String,
     /// worktree 绝对路径（G12：必须显式告知，不允许 agent 猜测）。
     pub worktree_path: String,
     /// 任务目录绝对路径（G12）。
     pub task_dir: String,
+    /// 任务标题（`{task_title}`）。
+    pub task_title: String,
+    /// 任务描述（`{task_description}`）。
+    pub task_description: String,
+    /// 设计文档绝对路径（`{design_doc_path}`；缺失时为降级说明，决策 115）。
+    pub design_doc_path: String,
+    /// 开发方案绝对路径（`{dev_doc_path}`）。
+    pub dev_doc_path: String,
+    /// 测试场景文档绝对路径（`{test_scenarios_path}`）。
+    pub test_scenarios_path: String,
+    /// 变更文件列表（`{changed_files}`，每行一个路径）。
+    pub changed_files: String,
+    /// 单元测试文件列表（`{unit_test_files}`，每行一个路径）。
+    pub unit_test_files: String,
 }
 
 /// 渲染模板变量。
@@ -96,8 +144,16 @@ pub fn render_template(template: &str, vars: &TemplateVars) -> String {
     template
         .replace("{test_command}", &vars.test_command)
         .replace("{test_file_convention}", &vars.test_file_convention)
+        .replace("{test_framework}", &vars.test_framework)
         .replace("{worktree_path}", &vars.worktree_path)
         .replace("{task_dir}", &vars.task_dir)
+        .replace("{task_title}", &vars.task_title)
+        .replace("{task_description}", &vars.task_description)
+        .replace("{design_doc_path}", &vars.design_doc_path)
+        .replace("{dev_doc_path}", &vars.dev_doc_path)
+        .replace("{test_scenarios_path}", &vars.test_scenarios_path)
+        .replace("{changed_files}", &vars.changed_files)
+        .replace("{unit_test_files}", &vars.unit_test_files)
 }
 
 /// user prompt 的可选追加段（决策 109 / 126 / 138）。
@@ -164,14 +220,29 @@ mod tests {
 
     #[test]
     fn system_prompt_section_order_is_golden() {
-        let prompt = build_system_prompt("## 项目上下文\n仓库 X", "PERSONA_BODY");
+        let prompt = build_system_prompt(
+            "## 项目上下文\n仓库 X",
+            "PERSONA_BODY",
+            "worktree：/wt\n任务目录：/td",
+            &["rtk".to_string()],
+        );
         let i_baseline = prompt.find(BASELINE_PREAMBLE).unwrap();
+        let i_workdirs = prompt.find("## 工作目录").unwrap();
         let i_agents = prompt.find("## 项目上下文").unwrap();
         let i_persona = prompt.find("PERSONA_BODY").unwrap();
+        let i_skills = prompt.find("## 已启用技能").unwrap();
         let i_format = prompt.find("## 输出格式").unwrap();
-        assert!(i_baseline < i_agents);
+        assert!(i_baseline < i_workdirs);
+        assert!(i_workdirs < i_agents);
         assert!(i_agents < i_persona);
-        assert!(i_persona < i_format);
+        assert!(i_persona < i_skills);
+        assert!(i_skills < i_format);
+    }
+
+    #[test]
+    fn system_prompt_without_skills_has_no_skills_section() {
+        let prompt = build_system_prompt("ctx", "persona", "worktree：/wt", &[]);
+        assert!(!prompt.contains("## 已启用技能"));
     }
 
     #[test]
@@ -179,13 +250,15 @@ mod tests {
         let prompt = build_system_prompt(
             "## 项目上下文\n仓库：/repo\n语言：Rust\n测试框架：cargo",
             "你是架构设计 agent。",
+            "worktree：/home/u/.agentpipeline/worktrees/t1\n任务目录：/home/u/.agentpipeline/tasks/t1",
+            &[],
         );
         insta::assert_snapshot!("system_prompt", prompt);
     }
 
     #[test]
     fn missing_agents_md_injects_non_empty_default() {
-        let prompt = build_system_prompt("", "persona");
+        let prompt = build_system_prompt("", "persona", "worktree：/wt", &[]);
         assert!(prompt.contains("本仓库无 AGENTS.md"));
         assert!(prompt.contains("项目根路径："));
         // 默认上下文里的字段有兜底，不会是空串
@@ -196,6 +269,32 @@ mod tests {
             default_agents_context(Path::new("/repo"), Some("Rust"), Some("cargo"))
                 .contains("测试框架：cargo")
         );
+    }
+
+    // ── AGENTS.md 加载（G3）──
+
+    #[test]
+    fn agents_md_content_becomes_agents_context() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(
+            tmp.path().join("AGENTS.md"),
+            "# 项目约定\n- 用 just test 跑测试",
+        )
+        .unwrap();
+        let ctx = load_agents_context(tmp.path(), Some("Rust"), Some("cargo"));
+        assert!(ctx.starts_with("## 项目上下文（AGENTS.md）"));
+        assert!(ctx.contains("# 项目约定"));
+        assert!(ctx.contains("just test"));
+    }
+
+    #[test]
+    fn missing_or_blank_agents_md_falls_back_to_default() {
+        let tmp = tempfile::tempdir().unwrap();
+        let ctx = load_agents_context(tmp.path(), Some("Rust"), None);
+        assert!(ctx.contains("本仓库无 AGENTS.md"));
+
+        std::fs::write(tmp.path().join("AGENTS.md"), "   \n").unwrap();
+        assert!(load_agents_context(tmp.path(), None, None).contains("本仓库无 AGENTS.md"));
     }
 
     // ── prompts/ 覆盖生效 ──
@@ -255,18 +354,35 @@ mod tests {
         let vars = TemplateVars {
             test_command: "cargo test -- --test-threads=1".into(),
             test_file_convention: "tests/*_test.rs".into(),
+            test_framework: "cargo".into(),
             worktree_path: "/home/u/.agentpipeline/worktrees/t1".into(),
             task_dir: "/home/u/.agentpipeline/tasks/t1".into(),
+            task_title: "登录功能".into(),
+            task_description: "实现登录".into(),
+            design_doc_path: "/home/u/.agentpipeline/tasks/t1/design.md".into(),
+            dev_doc_path: "/home/u/.agentpipeline/tasks/t1/dev-plan.md".into(),
+            test_scenarios_path: "/home/u/.agentpipeline/tasks/t1/test-scenarios.md".into(),
+            changed_files: "src/login.rs".into(),
+            unit_test_files: "tests/login_test.rs".into(),
         };
         let rendered = render_template(
-            "跑 {test_command}；文件放 {test_file_convention}；工作区 {worktree_path}；产出 {task_dir}",
+            "跑 {test_command}；文件放 {test_file_convention}；框架 {test_framework}；\
+             工作区 {worktree_path}；产出 {task_dir}；标题 {task_title}；描述 {task_description}；\
+             设计 {design_doc_path}；方案 {dev_doc_path}；场景 {test_scenarios_path}；\
+             变更 {changed_files}；测试 {unit_test_files}",
             &vars,
         );
         assert!(rendered.contains("cargo test -- --test-threads=1"));
         assert!(rendered.contains("tests/*_test.rs"));
+        assert!(rendered.contains("框架 cargo"));
         assert!(rendered.contains("/home/u/.agentpipeline/worktrees/t1"));
         assert!(rendered.contains("/home/u/.agentpipeline/tasks/t1"));
+        assert!(rendered.contains("标题 登录功能"));
+        assert!(rendered.contains("设计 /home/u/.agentpipeline/tasks/t1/design.md"));
+        assert!(rendered.contains("变更 src/login.rs"));
+        assert!(rendered.contains("测试 tests/login_test.rs"));
         assert!(!rendered.contains("{test_command}"));
+        assert!(!rendered.contains("{design_doc_path}"));
     }
 
     #[test]
@@ -356,18 +472,24 @@ mod tests {
 
     #[test]
     fn template_hash_is_stable_and_changes_with_content() {
-        let a = build_system_prompt("ctx", "persona");
-        let b = build_system_prompt("ctx", "persona");
+        let a = build_system_prompt("ctx", "persona", "worktree：/wt", &[]);
+        let b = build_system_prompt("ctx", "persona", "worktree：/wt", &[]);
         assert_eq!(prompt_template_hash(&a), prompt_template_hash(&b));
         assert_eq!(prompt_template_hash(&a).len(), 16);
 
         // 用户覆盖 persona → hash 变化（指标可按版本对比）
-        let c = build_system_prompt("ctx", "persona 改了");
+        let c = build_system_prompt("ctx", "persona 改了", "worktree：/wt", &[]);
         assert_ne!(prompt_template_hash(&a), prompt_template_hash(&c));
 
         // AGENTS.md 内容不同也改变 hash
-        let d = build_system_prompt("ctx 2", "persona");
+        let d = build_system_prompt("ctx 2", "persona", "worktree：/wt", &[]);
         assert_ne!(prompt_template_hash(&a), prompt_template_hash(&d));
+
+        // 工作目录 / 技能清单属于最终组装内容，同样进入 hash（决策 137）
+        let e = build_system_prompt("ctx", "persona", "worktree：/other", &[]);
+        let f = build_system_prompt("ctx", "persona", "worktree：/wt", &["rtk".to_string()]);
+        assert_ne!(prompt_template_hash(&a), prompt_template_hash(&e));
+        assert_ne!(prompt_template_hash(&a), prompt_template_hash(&f));
     }
 
     #[test]

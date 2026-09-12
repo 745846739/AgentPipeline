@@ -23,22 +23,27 @@ use futures::StreamExt;
 use crate::agent::client::{LlmClient, LlmRequest, Message, ToolDef};
 use crate::agent::metadata::parse_metadata;
 use crate::agent::prompts::{
-    build_system_prompt, build_user_prompt, default_agents_context, prompt_template_hash,
+    build_system_prompt, build_user_prompt, load_agents_context, prompt_template_hash,
     render_template, resolve_persona, PromptSegments, TemplateVars,
 };
+use crate::agent::templates::{system_template, user_template};
 use crate::agent::tools::{
     CommandFinish, CommandRecorder, CommandStart, ToolCallContext, ToolExecutor,
 };
-use crate::agent::{file_policy::FileToolPolicy, submit_metadata_tool, BUILTIN_TOOLS};
+use crate::agent::{
+    effective_skills, effective_tools, file_policy::FileToolPolicy, submit_metadata_tool,
+    BUILTIN_TOOLS,
+};
 use crate::config::Settings;
 use crate::git::{Git, RebaseOutcome};
+use crate::home::Home;
 use crate::process::ProcessKiller;
 use crate::sse::{SseEvent, SseSink};
 use crate::storage::observability::{NewRun, RunOutcome};
 use crate::types::{
     Approval, CommandSource, DiffStats, EdgeKind, Gate, GateFailureKind, MergeResult, MergeStatus,
     Node, NodeCursor, NodeStatus, PendingContext, PendingKind, PendingReason, Project, ReviewMode,
-    Stage, SyncDecision, SyncDecisionKind, Task, TestResult,
+    Stage, StageConfig, SyncDecision, SyncDecisionKind, Task, TestResult,
 };
 use crate::{Error, Result};
 
@@ -809,6 +814,54 @@ impl Executor {
         )))
     }
 
+    /// 组装 §10.3 / G12 模板变量。上游产出取已登记的 stage output 路径；
+    /// 缺失时回退到任务目录下的规范文件名（agent 自行探测存在性，决策 115）。
+    async fn template_vars(
+        &self,
+        task: &Task,
+        project: &Project,
+        worktree: &str,
+        task_dir: &str,
+    ) -> Result<TemplateVars> {
+        let framework = project.test_framework.as_deref();
+        let stored_path = |output: Option<crate::types::StageOutput>, default: &str| {
+            output
+                .map(|o| format!("{task_dir}/{}", o.file_path))
+                .unwrap_or_else(|| format!("{task_dir}/{default}"))
+        };
+        let design = self
+            .store
+            .get_stage_output(&task.id, Stage::ArchitectDesign, OUTPUT_DESIGN_DOC)
+            .await?;
+        let dev = self
+            .store
+            .get_stage_output(&task.id, Stage::DevelopDesign, OUTPUT_DEV_DOC)
+            .await?;
+        let scenarios = self
+            .store
+            .get_stage_output(&task.id, Stage::TestDesign, OUTPUT_TEST_SCENARIOS)
+            .await?;
+        let code_changes = self
+            .store
+            .stage_output_metadata(&task.id, Stage::Develop, OUTPUT_CODE_CHANGES)
+            .await?;
+        let (changed, unit_tests) = code_changes_lists(code_changes.as_ref());
+        Ok(TemplateVars {
+            test_command: test_command_for(framework),
+            test_file_convention: test_file_convention(framework).to_string(),
+            test_framework: framework.unwrap_or("未知").to_string(),
+            worktree_path: worktree.to_string(),
+            task_dir: task_dir.to_string(),
+            task_title: task.title.clone(),
+            task_description: task.description.clone(),
+            design_doc_path: stored_path(design, "design.md"),
+            dev_doc_path: stored_path(dev, "dev-plan.md"),
+            test_scenarios_path: stored_path(scenarios, "test-scenarios.md"),
+            changed_files: changed,
+            unit_test_files: unit_tests,
+        })
+    }
+
     /// 单次 agent attempt：prompt 组装 → 工具循环 → 元数据抽取 → 节点后处理。
     /// 返回（结论，prompt tokens，completion tokens）。
     async fn agent_attempt(
@@ -837,29 +890,36 @@ impl Executor {
         )
         .with_recorder(Arc::new(self.store.clone()));
 
+        // 阶段配置消费（§10.6.3 / 决策 22 / 46 / 111）：persona、采样参数、工具与技能增量
+        let stage_cfg = self.store.get_stage_config(cursor.stage.as_str()).await?;
+        let persona = resolve_stage_persona(&home, stage_cfg.as_ref(), cursor.stage, cursor.node)?;
+        let declared_tools =
+            json_string_list(stage_cfg.as_ref().and_then(|c| c.tools_json.as_ref()));
+        let skills = effective_skills(&json_string_list(
+            stage_cfg.as_ref().and_then(|c| c.skills_json.as_ref()),
+        ));
+
+        // system prompt：[基线前言][工作目录(G12)][AGENTS.md(G3)][persona][技能][格式规则]
         let system_prompt = build_system_prompt(
-            &default_agents_context(
+            &load_agents_context(
                 Path::new(&project.local_path),
                 project.language.as_deref(),
                 project.test_framework.as_deref(),
             ),
-            &resolve_persona(
-                &home.prompts_dir(),
-                cursor.stage,
-                cursor.node,
-                &embedded_persona(cursor.stage, cursor.node),
-            )
-            .content,
+            &persona,
+            &workdirs_line(&worktree, &task_dir),
+            &skills,
         );
-        let vars = TemplateVars {
-            test_command: test_command_for(project.test_framework.as_deref()),
-            test_file_convention: test_file_convention(project.test_framework.as_deref())
-                .to_string(),
-            worktree_path: worktree.clone(),
-            task_dir: task_dir.clone(),
-        };
+        let vars = self
+            .template_vars(task, project, &worktree, &task_dir)
+            .await?;
+        // user prompt：§10.3 节点模板 + G12 环境路径块 + 可选追加段（首轮为空不渲染）
         let user_prompt = build_user_prompt(
-            &render_template(&user_prompt_main(task, kind), &vars),
+            &format!(
+                "{}\n\n## 环境路径\n{}",
+                render_template(user_template(cursor.stage, cursor.node), &vars),
+                workdirs_line(&worktree, &task_dir)
+            ),
             &PromptSegments::default(),
         );
         let template_hash = prompt_template_hash(&system_prompt);
@@ -881,7 +941,9 @@ impl Executor {
                 system_prompt: system_prompt.clone(),
                 user_prompt: user_prompt.clone(),
                 messages: messages.clone(),
-                tools: tool_defs(kind),
+                tools: tool_defs(kind, &declared_tools),
+                temperature: stage_cfg.as_ref().and_then(|c| c.temperature),
+                max_tokens: stage_cfg.as_ref().and_then(|c| c.max_tokens),
             };
             let response = self.llm.complete(req).await?;
             total_prompt_tokens += response.prompt_tokens;
@@ -1906,17 +1968,24 @@ impl AgentNodeKind {
     }
 }
 
-/// `submit_metadata` + 内置工具定义（真实适配层据此下发；FakeAgent 不消费）。
-fn tool_defs(kind: AgentNodeKind) -> Vec<ToolDef> {
-    let mut defs: Vec<ToolDef> = BUILTIN_TOOLS
-        .iter()
-        .filter(|n| **n != "submit_metadata")
-        .map(|name| ToolDef {
-            name: (*name).into(),
+/// 有效工具定义：基线并集（G6）内且 v1 已实现的内置工具 + `submit_metadata`
+/// schema 工具（决策 38：与校验同源，不可移除）。声明了未实现的工具只告警不阻塞。
+fn tool_defs(kind: AgentNodeKind, declared: &[String]) -> Vec<ToolDef> {
+    let mut defs: Vec<ToolDef> = Vec::new();
+    for name in effective_tools(declared) {
+        if name == "submit_metadata" {
+            continue; // 最后以 schema 形式追加
+        }
+        if !BUILTIN_TOOLS.contains(&name.as_str()) {
+            tracing::warn!(tool = %name, "阶段声明的工具在 v1 未实现，已忽略");
+            continue;
+        }
+        defs.push(ToolDef {
+            name,
             description: String::new(),
             parameters: serde_json::json!({"type": "object"}),
-        })
-        .collect();
+        });
+    }
     let schema_tool: ToolDef = match kind {
         AgentNodeKind::ValidateInput => {
             submit_metadata_tool::<crate::types::ValidateInputMetadata>("提交输入充分性判定")
@@ -1947,59 +2016,85 @@ fn tool_defs(kind: AgentNodeKind) -> Vec<ToolDef> {
     defs
 }
 
-// ─────────────────────────────── prompt 内容（票 12 将替换为 §10.3 正式模板）───────────────────────────────
+// ─────────────────────── prompt 组装辅助（票 12：§10.3 / G3 / G6 / G12）───────────────────────
 
-fn embedded_persona(stage: Stage, node: Node) -> String {
-    match (stage, node) {
-        (Stage::ArchitectDesign, Node::ValidateInput) => {
-            "评估任务描述是否足以开始架构设计，用 submit_metadata 提交 readiness 与 blockers。".into()
-        }
-        (Stage::ArchitectDesign, Node::Execute) => {
-            "产出 design.md 写入任务目录（含「验收标准」编号清单），并用 submit_metadata 提交 affected_files / new_symbols / acceptance_criteria。".into()
-        }
-        (Stage::ArchitectDesign, Node::ValidateOutput) => {
-            "读取 design.md 验证是否满足输入要求，用 submit_metadata 提交 passed 与反馈。".into()
-        }
-        (Stage::DevelopDesign, Node::ValidateInput) => {
-            "评估 design.md 是否足以支撑开发，用 submit_metadata 提交 readiness 与 blockers。".into()
-        }
-        (Stage::DevelopDesign, Node::Execute) => {
-            "基于 design.md 产出 dev-plan.md 写入任务目录，并用 submit_metadata 提交结论。".into()
-        }
-        (Stage::DevelopDesign, Node::ValidateOutput) => {
-            "读取 dev-plan.md 验证是否符合要求，用 submit_metadata 提交 passed 与反馈。".into()
-        }
-        (Stage::TestDesign, Node::ValidateInput) => {
-            "评估 design.md 是否足以支撑测试场景设计，用 submit_metadata 提交 readiness 与 blockers。".into()
-        }
-        (Stage::TestDesign, Node::Execute) => {
-            "基于 design.md 产出 test-scenarios.md（业务场景，不写测试代码），并用 submit_metadata 提交 test_scenarios（含 design_refs）。".into()
-        }
-        (Stage::TestDesign, Node::ValidateOutput) => {
-            "读取 test-scenarios.md 验证场景完整性，用 submit_metadata 提交 passed 与反馈。".into()
-        }
-        (Stage::Develop, Node::Execute) => {
-            "在工作区内实现业务代码与单元测试（文件先清后写），提交代码后用 submit_metadata 提交 CodeChanges。".into()
-        }
-        (Stage::Review, Node::Execute) => {
-            "评审变更与测试，产出 review-report.md（含「设计符合性」「测试质量」两节），用 submit_metadata 提交 approved。".into()
-        }
-        (Stage::Test, Node::Execute) => {
-            "编写集成测试到工作区并执行，产出 test-report.md，用 submit_metadata 提交 TestResult（失败用例标注 failure_cause）。".into()
-        }
-        _ => "完成当前节点的职责，用 submit_metadata 提交结论。".into(),
-    }
+/// G12 工作目录行（system 的「工作目录」段与 user 的「环境路径」段共用，防漂移）。
+fn workdirs_line(worktree: &str, task_dir: &str) -> String {
+    format!("worktree：{worktree}\n任务目录：{task_dir}")
 }
 
-fn user_prompt_main(task: &Task, kind: AgentNodeKind) -> String {
-    match kind {
-        AgentNodeKind::ValidateInput | AgentNodeKind::DesignValidateOutput => {
-            format!("任务描述：{}\n任务目录：{{task_dir}}\n工作区：{{worktree_path}}", task.description)
+/// persona 解析（决策 7 / §10.6.3）：`stage_configs.persona_path` 显式指定优先，
+/// 其次 `prompts/{stage}/{node}.md` 用户覆盖，最后内嵌 §10.3 模板；
+/// `persona_append` 追加为额外指令段。
+fn resolve_stage_persona(
+    home: &Home,
+    stage_cfg: Option<&StageConfig>,
+    stage: Stage,
+    node: Node,
+) -> Result<String> {
+    let embedded = system_template(stage, node);
+    let mut content = match stage_cfg.and_then(|c| c.persona_path.as_deref()) {
+        Some(path) => {
+            // 相对路径按 home 根解析；绝对路径原样使用
+            let p = home.root().join(path);
+            let read = std::fs::read_to_string(&p).map_err(|e| {
+                Error::Config(format!(
+                    "阶段 {stage} 的 persona_path 不可读：{}（{e}）",
+                    p.display()
+                ))
+            })?;
+            if read.trim().is_empty() {
+                return Err(Error::Config(format!(
+                    "阶段 {stage} 的 persona_path 内容为空：{}",
+                    p.display()
+                )));
+            }
+            read
         }
-        _ => format!(
-            "任务描述：{}\n任务目录：{{task_dir}}\n工作区：{{worktree_path}}\n测试命令：{{test_command}}",
-            task.description
-        ),
+        None => resolve_persona(&home.prompts_dir(), stage, node, embedded).content,
+    };
+    if let Some(append) = stage_cfg.and_then(|c| c.persona_append.as_deref()) {
+        if !append.trim().is_empty() {
+            content.push_str(&format!("\n\n{append}"));
+        }
+    }
+    Ok(content)
+}
+
+/// 阶段配置里的字符串数组字段（tools_json / skills_json）。
+fn json_string_list(value: Option<&serde_json::Value>) -> Vec<String> {
+    value
+        .and_then(|v| v.as_array())
+        .map(|a| {
+            a.iter()
+                .filter_map(|x| x.as_str().map(str::to_string))
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// 从 code_changes stage output 提取变更文件 / 单元测试文件列表（每行一个路径）。
+/// 缺失时给降级说明（决策 115 / 133：评审与测试模板需容忍上游阶段被跳过）。
+fn code_changes_lists(value: Option<&serde_json::Value>) -> (String, String) {
+    const MISSING: &str = "（缺失：本任务跳过了对应阶段，按决策 115 降级处理）";
+    let Some(value) = value else {
+        return (MISSING.into(), MISSING.into());
+    };
+    let changes: Option<crate::types::CodeChanges> = serde_json::from_value(value.clone()).ok();
+    let join = |specs: &[crate::types::FileChangeSpec]| {
+        if specs.is_empty() {
+            MISSING.to_string()
+        } else {
+            specs
+                .iter()
+                .map(|s| s.path.clone())
+                .collect::<Vec<_>>()
+                .join("\n")
+        }
+    };
+    match changes {
+        Some(c) => (join(&c.changed_files), join(&c.unit_test_files)),
+        None => (MISSING.into(), MISSING.into()),
     }
 }
 

@@ -155,6 +155,8 @@ impl NodeScript<'_> {
 struct Inner {
     script: Script,
     calls: Vec<(Stage, Node)>,
+    /// 每次调用的请求快照（按发生顺序；断言 prompt 组装 / 配置透传用）。
+    requests: Vec<LlmRequest>,
     prompt_tokens: u32,
     completion_tokens: u32,
 }
@@ -171,6 +173,7 @@ impl FakeAgent {
             inner: Arc::new(Mutex::new(Inner {
                 script,
                 calls: Vec::new(),
+                requests: Vec::new(),
                 prompt_tokens: 0,
                 completion_tokens: 0,
             })),
@@ -185,6 +188,11 @@ impl FakeAgent {
     /// 全部调用记录（按发生顺序）。
     pub fn call_log(&self) -> Vec<(Stage, Node)> {
         self.inner.lock().unwrap().calls.clone()
+    }
+
+    /// 全部请求快照（按发生顺序）。
+    pub fn request_log(&self) -> Vec<LlmRequest> {
+        self.inner.lock().unwrap().requests.clone()
     }
 
     pub fn calls_for(&self, stage: Stage, node: Node) -> u32 {
@@ -216,12 +224,14 @@ impl LlmClient for FakeAgent {
         let agent = self.clone();
         Box::pin(async move {
             // 注意：MutexGuard 不跨 await（保持 future 为 Send）
+            let (stage, node) = (request.stage, request.node);
             let step = {
                 let mut inner = agent.inner.lock().unwrap();
-                inner.calls.push((request.stage, request.node));
+                inner.calls.push((stage, node));
+                inner.requests.push(request);
                 inner.prompt_tokens += 10;
                 inner.completion_tokens += 5;
-                inner.script.pop(request.stage, request.node)
+                inner.script.pop(stage, node)
             };
 
             match step {
@@ -281,6 +291,8 @@ mod tests {
             user_prompt: "user".into(),
             messages: vec![],
             tools: vec![],
+            temperature: None,
+            max_tokens: None,
         }
     }
 

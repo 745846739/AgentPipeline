@@ -625,3 +625,126 @@ fn diff_stat_summary_is_parsed() {
     assert_eq!(stats.insertions, 2);
     assert_eq!(stats.deletions, 0);
 }
+
+// ──────────────────── prompt 组装消费模板 / 配置（票 12）────────────────────
+
+#[tokio::test]
+async fn prompt_assembly_consumes_templates_stage_configs_and_agents_md() {
+    let ctx = setup("true", Settings::default()).await;
+    // G3：项目 AGENTS.md 进入 system prompt
+    std::fs::write(
+        ctx.repo.path().join("AGENTS.md"),
+        "项目约定：提交前跑 just test",
+    )
+    .unwrap();
+
+    // 阶段配置消费（§10.6.3 / 决策 22 / 46 / 111）
+    ctx.store
+        .upsert_stage_config(&agentpipeline_core::types::StageConfig {
+            stage: "architect-design".into(),
+            provider_id: None,
+            temperature: Some(0.25),
+            max_tokens: Some(1234),
+            persona_path: None,
+            persona_append: Some("附加要求：所有注释用中文。".into()),
+            tools_json: Some(serde_json::json!(["read_file", "not_implemented_tool"])),
+            skills_json: None,
+            idle_timeout_sec: None,
+            max_duration_sec: None,
+            node_overrides_json: None,
+            updated_at: ctx.store.now(),
+        })
+        .await
+        .unwrap();
+    // review 用 persona_path 显式指定 persona（相对 home 根解析，§10.6.3）
+    let review_persona = ctx._home.home().root().join("review-persona.md");
+    std::fs::write(&review_persona, "你是资深评审，聚焦回归风险。").unwrap();
+    ctx.store
+        .upsert_stage_config(&agentpipeline_core::types::StageConfig {
+            stage: "review".into(),
+            provider_id: None,
+            temperature: None,
+            max_tokens: None,
+            persona_path: Some("review-persona.md".into()),
+            persona_append: None,
+            tools_json: None,
+            skills_json: None,
+            idle_timeout_sec: None,
+            max_duration_sec: None,
+            node_overrides_json: None,
+            updated_at: ctx.store.now(),
+        })
+        .await
+        .unwrap();
+
+    let mut script = Script::new();
+    design_scripts(&mut script);
+    implementation_scripts(&mut script, "t6");
+    ctx.agent.set_script(script);
+    testkit::seed_task(&ctx.store, "t6", "p1").await.unwrap();
+    admit(&ctx, "t6").await;
+    ctx.executor.run("t6").await.unwrap();
+
+    let requests = ctx.agent.request_log();
+    let vi = requests
+        .iter()
+        .find(|r| r.stage == Stage::ArchitectDesign && r.node == Node::ValidateInput)
+        .expect("architect validate_input 请求");
+
+    // G3：AGENTS.md 内容注入；内嵌 §10.3 模板生效（不再是一句话 persona）
+    assert!(vi.system_prompt.contains("项目约定：提交前跑 just test"));
+    assert!(vi
+        .system_prompt
+        .contains("判断任务信息是否足够进行架构设计"));
+    // persona_append 追加为额外指令段
+    assert!(vi.system_prompt.contains("附加要求：所有注释用中文。"));
+    // G12：system 与 user prompt 都显式包含任务目录绝对路径
+    let task_dir = ctx._home.home().task_dir("t6").display().to_string();
+    assert!(vi.system_prompt.contains("## 工作目录"));
+    assert!(vi.system_prompt.contains(&task_dir));
+    assert!(vi.user_prompt.contains("## 环境路径"));
+    assert!(vi.user_prompt.contains(&task_dir));
+    // 阶段配置采样参数透传给 LLM 适配层
+    assert_eq!(vi.temperature, Some(0.25));
+    assert_eq!(vi.max_tokens, Some(1234));
+    // 工具并集语义：mandatory 一个不少，声明未实现的被忽略
+    assert!(vi.tools.iter().any(|t| t.name == "submit_metadata"));
+    assert!(vi.tools.iter().any(|t| t.name == "read_file"));
+    assert!(!vi.tools.iter().any(|t| t.name == "not_implemented_tool"));
+
+    // §10.3 user 模板变量：validate_output 拿到设计文档绝对路径
+    let vo = requests
+        .iter()
+        .find(|r| r.stage == Stage::ArchitectDesign && r.node == Node::ValidateOutput)
+        .expect("architect validate_output 请求");
+    assert!(vo.user_prompt.contains(&format!("{task_dir}/design.md")));
+
+    // persona_path 显式指定的 persona 覆盖内嵌模板（§10.6.3）
+    let re = requests
+        .iter()
+        .find(|r| r.stage == Stage::Review && r.node == Node::Execute)
+        .expect("review execute 请求");
+    assert!(re.system_prompt.contains("你是资深评审，聚焦回归风险。"));
+    assert!(!re.system_prompt.contains("你是代码评审 agent。"));
+
+    // test.execute 的 user prompt：测试命令（§10.3 模板）+ 场景文档路径
+    let te = requests
+        .iter()
+        .find(|r| r.stage == Stage::Test && r.node == Node::Execute)
+        .expect("test execute 请求");
+    assert!(te.user_prompt.contains("测试命令：true"));
+    assert!(te
+        .user_prompt
+        .contains(&format!("{task_dir}/test-scenarios.md")));
+    // 共享脚本的 CodeChanges 未列文件 → 决策 115 降级说明而非空白
+    assert!(te.user_prompt.contains("按决策 115 降级处理"));
+
+    // prompt_template_hash 反映最终组装内容（决策 137）
+    let runs = ctx.store.list_runs("t6").await.unwrap();
+    let run = runs
+        .iter()
+        .find(|r| r.stage == Stage::ArchitectDesign && r.node == Node::ValidateInput)
+        .unwrap();
+    let hash = run.prompt_template_hash.as_ref().expect("模板哈希已落库");
+    assert_eq!(hash.len(), 16);
+}
