@@ -15,7 +15,7 @@ pub use executor::Executor;
 pub use graph::{build_pipeline_graph, PipelineGraph};
 pub use landing::{
     entry_node, next_is_join, next_stages, nodes_for_stage, skip_landing, stage_has_node,
-    SkipLanding, JOIN_STAGE,
+    stage_landing, SkipLanding, StageLanding, JOIN_STAGE,
 };
 pub use routes::{
     resolve_validate_output, route, route_after_validate_output, route_by_readiness,

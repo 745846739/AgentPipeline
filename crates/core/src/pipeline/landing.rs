@@ -51,6 +51,37 @@ pub fn next_stages(stage: Stage) -> &'static [Stage] {
     }
 }
 
+/// 跨阶段推进的落点分类——游标「走出本阶段」时的**唯一查表**。
+///
+/// 两个调用方共用它，避免同一张落点表被复刻两份（票 03）：
+/// - executor 的 `apply_edge`（`EdgeKind::Next` 的跨阶段分支）；
+/// - `advance_after_judge_continue`（决策 135：用户裁决合格，越过本阶段剩余节点）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StageLanding {
+    /// 并行分裂点：architect-design → develop-design ∥ test-design（决策 90）。
+    Split,
+    /// 下一阶段是 join 边界 → 本游标置 `waiting_join`（决策 107）。
+    JoinBoundary,
+    /// 串行下一阶段入口（决策 69）。
+    StageEntry(Stage, Node),
+    /// 无下一阶段（done 之后）。
+    Terminal,
+}
+
+/// 按阶段查跨阶段落点（不涉及阶段内的 validate_input → execute → validate_output）。
+pub fn stage_landing(stage: Stage) -> StageLanding {
+    let nexts = next_stages(stage);
+    if nexts.len() > 1 {
+        StageLanding::Split
+    } else if next_is_join(stage) {
+        StageLanding::JoinBoundary
+    } else if let Some(&next) = nexts.first() {
+        StageLanding::StageEntry(next, entry_node(next))
+    } else {
+        StageLanding::Terminal
+    }
+}
+
 /// join 节点：sync-check 是游标无关的屏障，不占游标行（决策 107）。
 pub const JOIN_STAGE: Stage = Stage::SyncCheck;
 
@@ -222,6 +253,56 @@ mod tests {
         for stage in ALL_STAGES {
             let expect = matches!(stage, Stage::DevelopDesign | Stage::TestDesign);
             assert_eq!(next_is_join(stage), expect, "{stage}");
+        }
+    }
+
+    #[test]
+    fn stage_landing_full_table() {
+        // 跨阶段落点唯一查表（票 03）：executor 的 Next 与 judge continue 共用。
+        assert_eq!(
+            stage_landing(Stage::ArchitectDesign),
+            StageLanding::Split
+        );
+        for stage in [Stage::DevelopDesign, Stage::TestDesign] {
+            assert_eq!(stage_landing(stage), StageLanding::JoinBoundary, "{stage}");
+        }
+        assert_eq!(
+            stage_landing(Stage::Init),
+            StageLanding::StageEntry(Stage::ArchitectDesign, Node::ValidateInput)
+        );
+        assert_eq!(
+            stage_landing(Stage::Develop),
+            StageLanding::StageEntry(Stage::Review, Node::Execute)
+        );
+        assert_eq!(
+            stage_landing(Stage::Review),
+            StageLanding::StageEntry(Stage::Test, Node::Execute)
+        );
+        assert_eq!(
+            stage_landing(Stage::Test),
+            StageLanding::StageEntry(Stage::Merge, Node::Execute)
+        );
+        assert_eq!(
+            stage_landing(Stage::Merge),
+            StageLanding::StageEntry(Stage::Done, Node::Execute)
+        );
+        // sync-check 不占游标行：它是 join 屏障，不是游标的下一阶段入口
+        assert_eq!(
+            stage_landing(Stage::SyncCheck),
+            StageLanding::StageEntry(Stage::Develop, Node::Execute)
+        );
+        assert_eq!(stage_landing(Stage::Done), StageLanding::Terminal);
+    }
+
+    #[test]
+    fn stage_entry_landing_matches_next_landing() {
+        // 两者必须同源：StageLanding::StageEntry 的落点 = next_landing 的唯一元素。
+        for stage in ALL_STAGES {
+            if let StageLanding::StageEntry(s, n) = stage_landing(stage) {
+                let landings = next_stages(stage);
+                assert_eq!(landings.len(), 1, "{stage}");
+                assert_eq!((s, n), (landings[0], entry_node(landings[0])), "{stage}");
+            }
         }
     }
 }

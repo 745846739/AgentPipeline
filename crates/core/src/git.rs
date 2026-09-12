@@ -33,6 +33,17 @@ pub enum RebaseOutcome {
     Conflict { files: Vec<String> },
 }
 
+/// rebase + 自动解决冲突的结果（pipeline-spec §6，票 15）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AutoRebaseOutcome {
+    /// 无冲突，rebase 完成。
+    Clean { head: String },
+    /// 冲突全部被机械自动解决，rebase 完成并记录了被解决的文件。
+    AutoResolved { head: String, files: Vec<String> },
+    /// 存在无法机械判定的冲突：已 `rebase --abort` 恢复干净状态，调用方按决策 74 打回 develop。
+    Conflict { files: Vec<String> },
+}
+
 /// 合入结果（决策 73 / 97）。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MergeOutcome {
@@ -394,6 +405,161 @@ impl Git {
                     .map_err(|e| Error::Git(format!("rebase --abort 失败：{e}")))?;
             }
             Ok(())
+        })
+        .await
+    }
+
+    /// 在 worktree 内 rebase 到 `base_ref`，并尝试自动解决冲突（pipeline-spec §6，票 15）。
+    ///
+    /// 仅自动解决**无歧义**的冲突（三方合并可机械判定）：某侧与 merge-base 相同
+    /// （只有另一侧改动）或两侧内容相同（含同名同内容的新增文件）。其余返回
+    /// [`AutoRebaseOutcome::Conflict`]（内部已 abort，worktree 干净）。
+    ///
+    /// 该逻辑住在 git 层（票 03）：执行器只消费结果，不再内嵌 git 细节。
+    pub async fn rebase_onto_with_auto_resolve(
+        &self,
+        worktree: &Path,
+        base_ref: &str,
+    ) -> Result<AutoRebaseOutcome> {
+        let wt = worktree.to_path_buf();
+        let base_ref = base_ref.to_string();
+        blocking(move || {
+            let repo = open(&wt)?;
+            let sig = committer()?;
+            let base_commit = repo
+                .revparse_single(&base_ref)
+                .and_then(|o| o.peel_to_commit())
+                .map_err(gerr)?;
+            let head_id = repo
+                .head()
+                .map_err(gerr)?
+                .target()
+                .ok_or_else(|| Error::Git("rebase 起点 HEAD 无指向".into()))?;
+            // 已包含基准：与 `git rebase` no-op 语义一致
+            if head_id == base_commit.id() || repo.graph_descendant_of(head_id, base_commit.id()).map_err(gerr)? {
+                return Ok(AutoRebaseOutcome::Clean {
+                    head: head_id.to_string(),
+                });
+            }
+            let base_annotated = repo.find_annotated_commit(base_commit.id()).map_err(gerr)?;
+            let mut rebase = repo
+                .rebase(
+                    None,
+                    Some(&base_annotated),
+                    Some(&base_annotated),
+                    Some(&mut git2::RebaseOptions::new()),
+                )
+                .map_err(gerr)?;
+            let mut resolved: Vec<String> = Vec::new();
+
+            // 处理当前索引冲突：可机械解决则写入并返回 Ok(())；否则返回 Err(files) 触发 abort。
+            let handle_conflicts = |repo: &git2::Repository,
+                                    index: &mut git2::Index,
+                                    resolved: &mut Vec<String>|
+             -> Result<std::result::Result<(), Vec<String>>> {
+                let conflicts: Vec<git2::IndexConflict> = index
+                    .conflicts()
+                    .map_err(gerr)?
+                    .collect::<std::result::Result<Vec<_>, _>>()
+                    .map_err(gerr)?;
+                let mut hard: Vec<String> = Vec::new();
+                for c in conflicts {
+                    let path = c
+                        .our
+                        .as_ref()
+                        .or(c.their.as_ref())
+                        .or(c.ancestor.as_ref())
+                        .map(|e| e.path.clone())
+                        .ok_or_else(|| Error::Git("rebase 冲突条目缺少路径".into()))?;
+                    let ancestor = c.ancestor.as_ref().map(|e| e.id);
+                    let ours = c.our.as_ref().map(|e| e.id);
+                    let theirs = c.their.as_ref().map(|e| e.id);
+                    let chosen: Option<git2::Oid> = if ours == theirs {
+                        ours
+                    } else if ancestor == ours {
+                        theirs
+                    } else if ancestor == theirs {
+                        ours
+                    } else {
+                        hard.push(String::from_utf8_lossy(&path).to_string());
+                        continue;
+                    };
+                    let rel = std::str::from_utf8(&path)
+                        .map_err(|e| Error::Git(format!("冲突路径非 UTF-8：{e}")))?
+                        .to_string();
+                    match chosen {
+                        Some(id) => {
+                            let blob = repo.find_blob(id).map_err(gerr)?;
+                            std::fs::write(wt.join(&rel), blob.content())?;
+                            index.add_path(Path::new(&rel)).map_err(gerr)?;
+                        }
+                        None => {
+                            let abs = wt.join(&rel);
+                            if abs.exists() {
+                                std::fs::remove_file(&abs)?;
+                            }
+                            index.remove_path(Path::new(&rel)).map_err(gerr)?;
+                        }
+                    }
+                    resolved.push(rel);
+                }
+                if hard.is_empty() {
+                    Ok(Ok(()))
+                } else {
+                    Ok(Err(hard))
+                }
+            };
+
+            macro_rules! step_or_abort {
+                ($commit:expr) => {{
+                    let mut index = repo.index().map_err(gerr)?;
+                    if index.has_conflicts() {
+                        match handle_conflicts(&repo, &mut index, &mut resolved)? {
+                            Ok(()) => {
+                                index.write().map_err(gerr)?;
+                            }
+                            Err(files) => {
+                                let _ = rebase.abort();
+                                return Ok(AutoRebaseOutcome::Conflict { files });
+                            }
+                        }
+                    }
+                    if $commit {
+                        match rebase.commit(None, &sig, None) {
+                            Ok(_) => {}
+                            // 补丁已包含于基准（add/add 同内容等）→ libgit2 报 Applied，跳过即可
+                            Err(e) if e.code() == git2::ErrorCode::Applied => {}
+                            Err(e) => return Err(Error::Git(format!("rebase 提交失败：{e}"))),
+                        }
+                    }
+                }};
+            }
+
+            loop {
+                match rebase.next() {
+                    Some(Ok(_op)) => step_or_abort!(true),
+                    Some(Err(e)) if e.code() == git2::ErrorCode::Conflict => step_or_abort!(true),
+                    Some(Err(e)) => return Err(gerr(e)),
+                    None => break,
+                }
+            }
+            rebase
+                .finish(Some(&sig))
+                .map_err(|e| Error::Git(format!("rebase 收尾失败：{e}")))?;
+            let head = repo
+                .head()
+                .map_err(gerr)?
+                .target()
+                .ok_or_else(|| Error::Git("rebase 完成后 HEAD 无指向".into()))?
+                .to_string();
+            if resolved.is_empty() {
+                Ok(AutoRebaseOutcome::Clean { head })
+            } else {
+                Ok(AutoRebaseOutcome::AutoResolved {
+                    head,
+                    files: resolved,
+                })
+            }
         })
         .await
     }

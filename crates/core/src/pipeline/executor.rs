@@ -502,9 +502,9 @@ impl Executor {
 
         // (2) rebase 到基准（决策 74 / 96 / pipeline-spec §6）
         let mut auto_resolved: Vec<String> = Vec::new();
-        match rebase_onto_with_auto_resolve(wt, &base_ref).await? {
-            AutoRebaseOutcome::Clean { .. } => {}
-            AutoRebaseOutcome::AutoResolved { files, .. } => {
+        match Git.rebase_onto_with_auto_resolve(wt, &base_ref).await? {
+            crate::git::AutoRebaseOutcome::Clean { .. } => {}
+            crate::git::AutoRebaseOutcome::AutoResolved { files, .. } => {
                 tracing::info!(
                     task = %task.id,
                     files = ?files,
@@ -512,7 +512,7 @@ impl Executor {
                 );
                 auto_resolved = files;
             }
-            AutoRebaseOutcome::Conflict { files } => {
+            crate::git::AutoRebaseOutcome::Conflict { files } => {
                 // 无法机械判定：helper 已 rebase --abort，按决策 74 打回 develop
                 return Ok(PhaseA::Conflict(files));
             }
@@ -1881,71 +1881,76 @@ impl Executor {
                         .await?;
                     self.emit_cursor_changed(task_id, &cursor.branch).await?;
                 } else {
-                    let nexts = crate::pipeline::next_stages(cursor.stage);
-                    if nexts.len() > 1 {
-                        // 并行分裂点（architect-design → develop-design ∥ test-design，决策 90）
-                        self.store.split_cursors(task_id).await?;
-                        self.store
-                            .insert_transition(
-                                task_id,
-                                &cursor.branch,
-                                Some((cursor.stage, cursor.node)),
-                                (Stage::DevelopDesign, Node::ValidateInput),
-                                crate::types::TransitionTrigger::Normal,
-                                Some("游标分裂（决策 90）"),
-                            )
-                            .await?;
-                        for branch in [
-                            NodeCursor::BRANCH_DEVELOP_DESIGN,
-                            NodeCursor::BRANCH_TEST_DESIGN,
-                        ] {
-                            self.emit_cursor_changed(task_id, branch).await?;
+                    // 跨阶段落点：与 `advance_after_judge_continue` 共用同一张查表（票 03）
+                    match crate::pipeline::stage_landing(cursor.stage) {
+                        crate::pipeline::StageLanding::Split => {
+                            // 并行分裂点（architect-design → develop-design ∥ test-design，决策 90）
+                            self.store.split_cursors(task_id).await?;
+                            self.store
+                                .insert_transition(
+                                    task_id,
+                                    &cursor.branch,
+                                    Some((cursor.stage, cursor.node)),
+                                    (Stage::DevelopDesign, Node::ValidateInput),
+                                    crate::types::TransitionTrigger::Normal,
+                                    Some("游标分裂（决策 90）"),
+                                )
+                                .await?;
+                            for branch in [
+                                NodeCursor::BRANCH_DEVELOP_DESIGN,
+                                NodeCursor::BRANCH_TEST_DESIGN,
+                            ] {
+                                self.emit_cursor_changed(task_id, branch).await?;
+                            }
                         }
-                    } else if crate::pipeline::next_is_join(cursor.stage) {
-                        // 下一阶段是 join：本游标置 waiting_join（决策 107，唯一写入路径）
-                        self.store
-                            .set_cursor_waiting_join(&cursor.cursor_id)
-                            .await?;
-                        self.store
-                            .insert_transition(
-                                task_id,
-                                &cursor.branch,
-                                Some((cursor.stage, cursor.node)),
-                                (crate::pipeline::JOIN_STAGE, Node::Execute),
-                                crate::types::TransitionTrigger::Normal,
-                                Some("到达 join 边界"),
-                            )
-                            .await?;
-                        self.emit_cursor_changed(task_id, &cursor.branch).await?;
-                    } else if let Some(&next) = nexts.first() {
-                        let from = (cursor.stage, cursor.node);
-                        let to = (next, crate::pipeline::entry_node(next));
-                        self.store
-                            .set_cursor_stage(&cursor.cursor_id, to.0, to.1)
-                            .await?;
-                        self.store
-                            .insert_transition(
-                                task_id,
-                                &cursor.branch,
-                                Some(from),
-                                to,
-                                crate::types::TransitionTrigger::Normal,
-                                None,
-                            )
-                            .await?;
-                        self.sse.emit(SseEvent::StageChanged {
-                            task_id: task_id.clone(),
-                            branch: cursor.branch.clone(),
-                            from_stage: Some(from.0),
-                            from_node: Some(from.1),
-                            to_stage: to.0,
-                            to_node: to.1,
-                            trigger: "normal".into(),
-                            reason: None,
-                        });
-                        self.emit_cursor_changed(task_id, &cursor.branch).await?;
+                        crate::pipeline::StageLanding::JoinBoundary => {
+                            // 下一阶段是 join：本游标置 waiting_join（决策 107，唯一写入路径）
+                            self.store
+                                .set_cursor_waiting_join(&cursor.cursor_id)
+                                .await?;
+                            self.store
+                                .insert_transition(
+                                    task_id,
+                                    &cursor.branch,
+                                    Some((cursor.stage, cursor.node)),
+                                    (crate::pipeline::JOIN_STAGE, Node::Execute),
+                                    crate::types::TransitionTrigger::Normal,
+                                    Some("到达 join 边界"),
+                                )
+                                .await?;
+                            self.emit_cursor_changed(task_id, &cursor.branch).await?;
+                        }
+                        crate::pipeline::StageLanding::StageEntry(next, next_node) => {
+                            let from = (cursor.stage, cursor.node);
+                            let to = (next, next_node);
+                            self.store
+                                .set_cursor_stage(&cursor.cursor_id, to.0, to.1)
+                                .await?;
+                            self.store
+                                .insert_transition(
+                                    task_id,
+                                    &cursor.branch,
+                                    Some(from),
+                                    to,
+                                    crate::types::TransitionTrigger::Normal,
+                                    None,
+                                )
+                                .await?;
+                            self.sse.emit(SseEvent::StageChanged {
+                                task_id: task_id.clone(),
+                                branch: cursor.branch.clone(),
+                                from_stage: Some(from.0),
+                                from_node: Some(from.1),
+                                to_stage: to.0,
+                                to_node: to.1,
+                                trigger: "normal".into(),
+                                reason: None,
+                            });
+                            self.emit_cursor_changed(task_id, &cursor.branch).await?;
+                        }
+                        // 无下一阶段（done 之后）→ 无流转，终态判定在主循环
+                        crate::pipeline::StageLanding::Terminal => {}
                     }
-                    // nexts 为空（done 之后）→ 无流转，终态判定在主循环
                 }
             }
             EdgeKind::KickbackDevelop => {
@@ -2821,182 +2826,6 @@ fn placeholder_merge() -> MergeResult {
         approval: Approval::None,
         status: MergeStatus::PendingApproval,
     }
-}
-
-/// rebase + 自动解决冲突的结果（pipeline-spec §6，票 15）。
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum AutoRebaseOutcome {
-    /// 无冲突，rebase 完成。
-    Clean { head: String },
-    /// 冲突全部被机械自动解决，rebase 完成并记录了被解决的文件。
-    AutoResolved { head: String, files: Vec<String> },
-    /// 存在无法机械判定的冲突：已 `rebase --abort` 恢复干净状态，调用方按决策 74 打回 develop。
-    Conflict { files: Vec<String> },
-}
-
-/// 在 worktree 内 rebase 到 `base_ref`，并尝试自动解决冲突（pipeline-spec §6）。
-///
-/// 仅自动解决**无歧义**的冲突（三方合并可机械判定）：某侧与 merge-base 相同
-/// （只有另一侧改动）或两侧内容相同（含同名同内容的新增文件）。其余返回
-/// [`AutoRebaseOutcome::Conflict`]（内部已 abort，worktree 干净）。
-pub async fn rebase_onto_with_auto_resolve(
-    worktree: &Path,
-    base_ref: &str,
-) -> Result<AutoRebaseOutcome> {
-    let wt = worktree.to_path_buf();
-    let base_ref = base_ref.to_string();
-    tokio::task::spawn_blocking(move || -> Result<AutoRebaseOutcome> {
-        use crate::git::git2;
-        let repo = git2::Repository::open(&wt).map_err(|e| Error::Git(e.to_string()))?;
-        let sig = git2::Signature::now("AgentPipeline", "agentpipeline@localhost")
-            .map_err(|e| Error::Git(e.to_string()))?;
-        let base_commit = repo
-            .revparse_single(&base_ref)
-            .and_then(|o| o.peel_to_commit())
-            .map_err(|e| Error::Git(e.to_string()))?;
-        let head_id = repo
-            .head()
-            .map_err(|e| Error::Git(e.to_string()))?
-            .target()
-            .ok_or_else(|| Error::Git("rebase 起点 HEAD 无指向".into()))?;
-        // 已包含基准：与 `git rebase` no-op 语义一致
-        if head_id == base_commit.id()
-            || repo
-                .graph_descendant_of(head_id, base_commit.id())
-                .map_err(|e| Error::Git(e.to_string()))?
-        {
-            return Ok(AutoRebaseOutcome::Clean {
-                head: head_id.to_string(),
-            });
-        }
-        let base_annotated = repo
-            .find_annotated_commit(base_commit.id())
-            .map_err(|e| Error::Git(e.to_string()))?;
-        let mut rebase = repo
-            .rebase(
-                None,
-                Some(&base_annotated),
-                Some(&base_annotated),
-                Some(&mut git2::RebaseOptions::new()),
-            )
-            .map_err(|e| Error::Git(e.to_string()))?;
-        let mut resolved: Vec<String> = Vec::new();
-
-        // 处理当前索引冲突：可机械解决则写入并返回 Ok(())；否则返回 Err(files) 触发 abort。
-        let handle_conflicts = |repo: &git2::Repository,
-                                index: &mut git2::Index,
-                                resolved: &mut Vec<String>|
-         -> Result<std::result::Result<(), Vec<String>>> {
-            let conflicts: Vec<git2::IndexConflict> = index
-                .conflicts()
-                .map_err(|e| Error::Git(e.to_string()))?
-                .collect::<std::result::Result<Vec<_>, _>>()
-                .map_err(|e| Error::Git(e.to_string()))?;
-            let mut hard: Vec<String> = Vec::new();
-            for c in conflicts {
-                let path = c
-                    .our
-                    .as_ref()
-                    .or(c.their.as_ref())
-                    .or(c.ancestor.as_ref())
-                    .map(|e| e.path.clone())
-                    .ok_or_else(|| Error::Git("rebase 冲突条目缺少路径".into()))?;
-                let ancestor = c.ancestor.as_ref().map(|e| e.id);
-                let ours = c.our.as_ref().map(|e| e.id);
-                let theirs = c.their.as_ref().map(|e| e.id);
-                let chosen: Option<git2::Oid> = if ours == theirs {
-                    ours
-                } else if ancestor == ours {
-                    theirs
-                } else if ancestor == theirs {
-                    ours
-                } else {
-                    hard.push(String::from_utf8_lossy(&path).to_string());
-                    continue;
-                };
-                let rel = std::str::from_utf8(&path)
-                    .map_err(|e| Error::Git(format!("冲突路径非 UTF-8：{e}")))?
-                    .to_string();
-                match chosen {
-                    Some(id) => {
-                        let blob = repo.find_blob(id).map_err(|e| Error::Git(e.to_string()))?;
-                        std::fs::write(wt.join(&rel), blob.content())?;
-                        index
-                            .add_path(Path::new(&rel))
-                            .map_err(|e| Error::Git(e.to_string()))?;
-                    }
-                    None => {
-                        let abs = wt.join(&rel);
-                        if abs.exists() {
-                            std::fs::remove_file(&abs)?;
-                        }
-                        index
-                            .remove_path(Path::new(&rel))
-                            .map_err(|e| Error::Git(e.to_string()))?;
-                    }
-                }
-                resolved.push(rel);
-            }
-            if hard.is_empty() {
-                Ok(Ok(()))
-            } else {
-                Ok(Err(hard))
-            }
-        };
-
-        macro_rules! step_or_abort {
-            ($commit:expr) => {{
-                let mut index = repo.index().map_err(|e| Error::Git(e.to_string()))?;
-                if index.has_conflicts() {
-                    match handle_conflicts(&repo, &mut index, &mut resolved)? {
-                        Ok(()) => {
-                            index.write().map_err(|e| Error::Git(e.to_string()))?;
-                        }
-                        Err(files) => {
-                            let _ = rebase.abort();
-                            return Ok(AutoRebaseOutcome::Conflict { files });
-                        }
-                    }
-                }
-                if $commit {
-                    match rebase.commit(None, &sig, None) {
-                        Ok(_) => {}
-                        // 补丁已包含于基准（add/add 同内容等）→ libgit2 报 Applied，跳过即可
-                        Err(e) if e.code() == git2::ErrorCode::Applied => {}
-                        Err(e) => return Err(Error::Git(format!("rebase 提交失败：{e}"))),
-                    }
-                }
-            }};
-        }
-
-        loop {
-            match rebase.next() {
-                Some(Ok(_op)) => step_or_abort!(true),
-                Some(Err(e)) if e.code() == git2::ErrorCode::Conflict => step_or_abort!(true),
-                Some(Err(e)) => return Err(Error::Git(e.to_string())),
-                None => break,
-            }
-        }
-        rebase
-            .finish(Some(&sig))
-            .map_err(|e| Error::Git(format!("rebase 收尾失败：{e}")))?;
-        let head = repo
-            .head()
-            .map_err(|e| Error::Git(e.to_string()))?
-            .target()
-            .ok_or_else(|| Error::Git("rebase 完成后 HEAD 无指向".into()))?
-            .to_string();
-        if resolved.is_empty() {
-            Ok(AutoRebaseOutcome::Clean { head })
-        } else {
-            Ok(AutoRebaseOutcome::AutoResolved {
-                head,
-                files: resolved,
-            })
-        }
-    })
-    .await
-    .map_err(|e| Error::Git(format!("rebase 自动解决任务失败：{e}")))?
 }
 
 /// 从 `git diff --stat` 输出解析汇总行（files_changed / insertions / deletions）。

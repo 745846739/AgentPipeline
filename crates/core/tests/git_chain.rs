@@ -344,9 +344,8 @@ async fn project_probing_is_code_based_and_stable() {
 
 #[tokio::test]
 async fn rebase_conflict_auto_resolves_identical_modification() {
-    use agentpipeline_core::pipeline::executor::{
-        rebase_onto_with_auto_resolve, AutoRebaseOutcome,
-    };
+    use agentpipeline_core::git::AutoRebaseOutcome;
+    use agentpipeline_core::git::Git;
 
     // 两侧把同一文件改成完全相同的字节——三方合并可机械判定（ours == theirs）。
     let repo = Repo::clean().unwrap();
@@ -362,7 +361,7 @@ async fn rebase_conflict_auto_resolves_identical_modification() {
     let wt = worktree.display().to_string();
     repo.git(&["worktree", "add", "-b", "kanban/t1", &wt, "topic"]);
 
-    let outcome = rebase_onto_with_auto_resolve(&worktree, "main")
+    let outcome = Git.rebase_onto_with_auto_resolve(&worktree, "main")
         .await
         .unwrap();
     match outcome {
@@ -394,9 +393,8 @@ async fn rebase_conflict_auto_resolves_identical_modification() {
 
 #[tokio::test]
 async fn rebase_hard_conflict_is_not_auto_resolved() {
-    use agentpipeline_core::pipeline::executor::{
-        rebase_onto_with_auto_resolve, AutoRebaseOutcome,
-    };
+    use agentpipeline_core::git::AutoRebaseOutcome;
+    use agentpipeline_core::git::Git;
 
     // 两侧改同一行且内容不同 → 不可机械判定 → Conflict（内部已 abort）
     let repo = Repo::clean().unwrap();
@@ -406,7 +404,7 @@ async fn rebase_hard_conflict_is_not_auto_resolved() {
     let wt = worktree.display().to_string();
     repo.git(&["worktree", "add", "-b", "kanban/t1", &wt, "topic"]);
 
-    match rebase_onto_with_auto_resolve(&worktree, "main")
+    match Git.rebase_onto_with_auto_resolve(&worktree, "main")
         .await
         .unwrap()
     {

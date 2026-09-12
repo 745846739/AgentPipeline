@@ -7,7 +7,7 @@ use sqlx::Row;
 
 use super::{decode_pending, parse_ts, ts, Store};
 use crate::pipeline::landing::{
-    entry_node, next_is_join, next_stages, skip_landing, stage_has_node, SkipLanding,
+    entry_node, next_stages, skip_landing, stage_has_node, SkipLanding,
 };
 use crate::types::{
     Approval, CursorStatus, MergeResult, Node, NodeCursor, PendingKind, PendingReason, Stage,
@@ -443,27 +443,26 @@ impl Store {
 
     /// decision 135：judge_disagreement 的 continue = 用户裁决「合格」，放行到下一阶段入口。
     ///
-    /// 复用游标落点语义：architect-design 分裂到两条设计分支；并行分支到 join 边界
-    /// （`waiting_join`）；其余串行阶段到下一阶段入口。不重跑 validate_output。
+    /// 落点判定**复用** [`crate::pipeline::stage_landing`]（票 03：不再复刻游标落点逻辑），
+    /// 与 executor 的 `EdgeKind::Next` 跨阶段分支同源。不重跑 validate_output。
     async fn advance_after_judge_continue(&self, cursor: &NodeCursor) -> Result<()> {
-        let landings = Store::next_landing(cursor.stage);
-        match landings.as_slice() {
-            [] => Err(Error::Cursor(format!(
-                "阶段 {} 没有下一阶段，judge_disagreement continue 无处放行（决策 135）",
-                cursor.stage
-            ))),
-            [_] if next_is_join(cursor.stage) => {
-                self.set_cursor_waiting_join(&cursor.cursor_id).await
-            }
-            [(stage, node)] => {
-                self.set_cursor_stage(&cursor.cursor_id, *stage, *node)
-                    .await?;
-                self.reset_cursor_attempts(&cursor.cursor_id).await
-            }
-            _ => {
+        match crate::pipeline::stage_landing(cursor.stage) {
+            crate::pipeline::StageLanding::Split => {
                 self.split_cursors(&cursor.task_id).await?;
                 Ok(())
             }
+            crate::pipeline::StageLanding::JoinBoundary => {
+                self.set_cursor_waiting_join(&cursor.cursor_id).await
+            }
+            crate::pipeline::StageLanding::StageEntry(stage, node) => {
+                self.set_cursor_stage(&cursor.cursor_id, stage, node)
+                    .await?;
+                self.reset_cursor_attempts(&cursor.cursor_id).await
+            }
+            crate::pipeline::StageLanding::Terminal => Err(Error::Cursor(format!(
+                "阶段 {} 没有下一阶段，judge_disagreement continue 无处放行（决策 135）",
+                cursor.stage
+            ))),
         }
     }
 }
