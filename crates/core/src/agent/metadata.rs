@@ -176,6 +176,7 @@ mod tests {
             }],
             prompt_tokens: 10,
             completion_tokens: 5,
+            ..Default::default()
         }
     }
 

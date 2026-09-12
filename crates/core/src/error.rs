@@ -32,6 +32,10 @@ pub enum Error {
     #[error("校验错误：{0}")]
     Validation(String),
 
+    /// 生产 LLM 适配器调用失败（HTTP 错误 / 响应解析失败 / provider 配置缺失，票 13）。
+    #[error("LLM 调用失败：{0}")]
+    Llm(String),
+
     #[error("IO 错误：{0}")]
     Io(#[from] std::io::Error),
 

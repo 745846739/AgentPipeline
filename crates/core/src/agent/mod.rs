@@ -6,6 +6,7 @@ pub mod context;
 pub mod file_policy;
 pub mod metadata;
 pub mod prompts;
+pub mod providers;
 pub mod sanitize;
 pub mod templates;
 pub mod tools;

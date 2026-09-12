@@ -6,7 +6,7 @@
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use futures::future::BoxFuture;
 
@@ -127,7 +127,12 @@ pub struct ToolExecutor {
     settings: Settings,
     recorder: Option<Arc<dyn CommandRecorder>>,
     killer: Arc<dyn ProcessKiller>,
+    /// `run_command` 运行期间的心跳周期（决策 100）；默认 5s，测试可调短。
+    command_heartbeat_interval: Duration,
 }
+
+/// 心跳默认周期：远小于 300s 空闲超时，600s 级测试命令也能存活（决策 100）。
+pub const COMMAND_HEARTBEAT_INTERVAL: Duration = Duration::from_secs(5);
 
 impl ToolExecutor {
     pub fn new(
@@ -142,11 +147,18 @@ impl ToolExecutor {
             settings,
             recorder: None,
             killer,
+            command_heartbeat_interval: COMMAND_HEARTBEAT_INTERVAL,
         }
     }
 
     pub fn with_recorder(mut self, recorder: Arc<dyn CommandRecorder>) -> Self {
         self.recorder = Some(recorder);
+        self
+    }
+
+    /// 测试用：调短 `run_command` 的周期心跳。
+    pub fn with_command_heartbeat_interval(mut self, interval: Duration) -> Self {
+        self.command_heartbeat_interval = interval;
         self
     }
 
@@ -338,6 +350,8 @@ impl ToolExecutor {
 
         let timeout_sec =
             effective_run_command_timeout(&self.settings, ctx.stage, explicit_timeout);
+        // 决策 100：运行期间周期心跳——600s 级命令不被 300s 空闲超时误杀
+        let heartbeat = self.spawn_command_heartbeat(ctx.run_id);
         let started = Instant::now();
         let output = tokio::time::timeout(
             std::time::Duration::from_secs(timeout_sec),
@@ -348,6 +362,9 @@ impl ToolExecutor {
                 .output(),
         )
         .await;
+        if let Some(task) = &heartbeat {
+            task.abort();
+        }
 
         let duration_ms = started.elapsed().as_millis() as u64;
         let (exit_code, stdout, stderr, timed_out) = match output {
@@ -397,6 +414,23 @@ impl ToolExecutor {
         }
 
         Ok(ToolOutcome::ok(in_context))
+    }
+
+    /// 周期心跳任务：命令结束（含超时）时由调用方 abort（决策 100）。
+    fn spawn_command_heartbeat(&self, run_id: Option<i64>) -> Option<tokio::task::JoinHandle<()>> {
+        let recorder = self.recorder.clone()?;
+        let interval = self.command_heartbeat_interval;
+        Some(tokio::spawn(async move {
+            let mut tick = tokio::time::interval(interval);
+            tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            tick.tick().await; // interval 的首次 tick 立即完成，跳过（起止心跳已覆盖）
+            loop {
+                tick.tick().await;
+                if recorder.touch_heartbeat(run_id).await.is_err() {
+                    break;
+                }
+            }
+        }))
     }
 
     /// 输出裁剪 + 卸载，返回（进 context 的文本，卸载路径）。
@@ -795,6 +829,30 @@ mod tests {
 
         // 命令开始与结束都刷新心跳（决策 100）
         assert_eq!(*recorder.heartbeats.lock().unwrap(), 2);
+    }
+
+    #[tokio::test]
+    async fn run_command_touches_heartbeat_periodically_during_long_commands() {
+        // 决策 100：长命令（如 600s 测试）靠运行期周期心跳躲过 300s 空闲超时
+        let s = setup(Stage::Develop);
+        let recorder = Arc::new(RecordingRecorder::default());
+        let executor = ToolExecutor::new(
+            s.home.clone(),
+            FileToolPolicy::new(vec![s.worktree.clone(), s.task_dir.clone()]),
+            Settings::default(),
+            Arc::new(NoKiller),
+        )
+        .with_recorder(recorder.clone())
+        .with_command_heartbeat_interval(std::time::Duration::from_millis(50));
+        executor
+            .execute(
+                &call("run_command", serde_json::json!({"command": "sleep 0.3"})),
+                &s.ctx,
+            )
+            .await
+            .unwrap();
+        // 起止各一次 + 运行期间若干次
+        assert!(*recorder.heartbeats.lock().unwrap() >= 4, "周期心跳未生效");
     }
 
     #[tokio::test]

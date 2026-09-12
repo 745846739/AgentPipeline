@@ -13,11 +13,15 @@ pub mod clock;
 pub mod git_fixture;
 pub mod home;
 pub mod killer;
+pub mod mock_llm;
 pub mod script;
 
-pub use assertions::{assert_cursor_at, command_count, run_count, SseRecorder};
+pub use assertions::{
+    assert_cursor_at, command_count, cursor_counts, live_cursor_for_branch, run_count, SseRecorder,
+};
 pub use clock::ManualClock;
 pub use git_fixture::{Language, Repo};
 pub use home::{seed_project, seed_task, seed_task_full, EnvGuard, TestHome};
 pub use killer::RecordingKiller;
+pub use mock_llm::{MockLlm, MockRoute, RecordedRequest};
 pub use script::{FakeAgent, Script, Step};

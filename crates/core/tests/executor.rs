@@ -323,6 +323,53 @@ async fn executor_drives_full_happy_path_to_done() {
 // ─────────────────────────── 分支 pending 隔离（决策 89 / 82）───────────────────────────
 
 #[tokio::test]
+async fn tool_events_are_emitted_around_real_tool_execution() {
+    // 决策 123：tool_event（start / end + 参数摘要）由 executor 的工具循环发射
+    let ctx = setup("true", Settings::default()).await;
+    // 注册表以 task_id 为进程全局键：与并行的 happy path 测试错开
+    let task_id = "t-tool-events";
+    let mut script = Script::new();
+    design_scripts(&mut script);
+    implementation_scripts(&mut script, task_id);
+    ctx.agent.set_script(script);
+    testkit::seed_task(&ctx.store, task_id, "p1").await.unwrap();
+    admit(&ctx, task_id).await;
+
+    ctx.executor.run(task_id).await.unwrap();
+
+    let tool_events: Vec<SseEvent> = ctx
+        .sse
+        .events()
+        .into_iter()
+        .filter(|e| e.event_type() == SseEventType::ToolEvent)
+        .collect();
+    assert!(
+        !tool_events.is_empty(),
+        "工具事件应有生产者：{:?}",
+        ctx.sse.type_sequence()
+    );
+
+    // start / end 成对：write_file 的 start 在 end 之前，摘要只含参数概要
+    let starts: Vec<&SseEvent> = tool_events
+        .iter()
+        .filter(|e| matches!(e, SseEvent::ToolEvent { phase: agentpipeline_core::sse::ToolPhase::Start, tool, .. } if tool == "write_file"))
+        .collect();
+    let ends: Vec<&SseEvent> = tool_events
+        .iter()
+        .filter(|e| matches!(e, SseEvent::ToolEvent { phase: agentpipeline_core::sse::ToolPhase::End, tool, .. } if tool == "write_file"))
+        .collect();
+    assert_eq!(starts.len(), ends.len(), "start/end 应成对");
+    assert!(
+        matches!(
+            starts.first(),
+            Some(SseEvent::ToolEvent { args_summary, .. }) if args_summary.contains("design.md")
+        ),
+        "参数摘要应含文件名：{:?}",
+        starts.first()
+    );
+}
+
+#[tokio::test]
 async fn one_branch_pending_does_not_stop_the_other() {
     let ctx = setup("true", Settings::default()).await;
     let mut script = Script::new();

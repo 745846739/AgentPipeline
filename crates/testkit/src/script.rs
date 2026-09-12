@@ -240,18 +240,21 @@ impl LlmClient for FakeAgent {
                     tool_calls: vec![tool_call(name, arguments)],
                     prompt_tokens: 10,
                     completion_tokens: 5,
+                    ..Default::default()
                 }),
                 Some(Step::Submit(value)) => Ok(AgentResponse {
                     content: None,
                     tool_calls: vec![tool_call("submit_metadata".into(), value)],
                     prompt_tokens: 10,
                     completion_tokens: 5,
+                    ..Default::default()
                 }),
                 Some(Step::Text(text)) => Ok(AgentResponse {
                     content: Some(text),
                     tool_calls: Vec::new(),
                     prompt_tokens: 10,
                     completion_tokens: 5,
+                    ..Default::default()
                 }),
                 // 不返回：由节点级超时包装终止（决策 64 / 148 ④）
                 Some(Step::Stall) => {
@@ -263,6 +266,7 @@ impl LlmClient for FakeAgent {
                     tool_calls: Vec::new(),
                     prompt_tokens: 10,
                     completion_tokens: 5,
+                    ..Default::default()
                 }),
             }
         })
@@ -293,6 +297,8 @@ mod tests {
             tools: vec![],
             temperature: None,
             max_tokens: None,
+            provider_id: None,
+            run: None,
         }
     }
 

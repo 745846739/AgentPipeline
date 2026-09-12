@@ -38,7 +38,7 @@ use crate::config::Settings;
 use crate::git::{Git, RebaseOutcome};
 use crate::home::Home;
 use crate::process::ProcessKiller;
-use crate::sse::{SseEvent, SseSink};
+use crate::sse::{SseEvent, SseSink, ToolPhase};
 use crate::storage::observability::{NewRun, RunOutcome};
 use crate::types::{
     Approval, CommandSource, DiffStats, EdgeKind, Gate, GateFailureKind, MergeResult, MergeStatus,
@@ -292,7 +292,7 @@ impl Executor {
             result.is_err(),
             started.elapsed().as_millis() as u64,
             result.as_ref().err().map(|e| e.to_string()),
-            (0, 0),
+            &RunTokens::default(),
         )
         .await?;
         result?;
@@ -334,7 +334,7 @@ impl Executor {
             result.is_err(),
             started.elapsed().as_millis() as u64,
             result.as_ref().err().map(|e| e.to_string()),
-            (0, 0),
+            &RunTokens::default(),
         )
         .await?;
         result?;
@@ -469,7 +469,7 @@ impl Executor {
             failed,
             started.elapsed().as_millis() as u64,
             result.as_ref().err().map(|e| e.to_string()),
-            (0, 0),
+            &RunTokens::default(),
         )
         .await?;
         result
@@ -602,7 +602,7 @@ impl Executor {
             result.is_err(),
             started.elapsed().as_millis() as u64,
             result.as_ref().err().map(|e| e.to_string()),
-            (0, 0),
+            &RunTokens::default(),
         )
         .await?;
         result?;
@@ -687,7 +687,7 @@ impl Executor {
             gate.as_ref().map(|g| !g.passed).unwrap_or(true),
             started.elapsed().as_millis() as u64,
             gate.as_ref().err().map(|e| e.to_string()),
-            (0, 0),
+            &RunTokens::default(),
         )
         .await?;
         let gate = gate?;
@@ -707,8 +707,17 @@ impl Executor {
                 Error::Validation("test.validate_output 缺少 test_result 元数据".into())
             })?;
         let result: TestResult = serde_json::from_value(meta)?;
-        self.finish_run(run_id, task, cursor, attempt, false, 0, None, (0, 0))
-            .await?;
+        self.finish_run(
+            run_id,
+            task,
+            cursor,
+            attempt,
+            false,
+            0,
+            None,
+            &RunTokens::default(),
+        )
+        .await?;
         Ok(NodeOutput::Route(
             crate::pipeline::MetadataView::from_test_result(&result),
         ))
@@ -726,8 +735,17 @@ impl Executor {
             .get("approved")
             .and_then(|v| v.as_bool())
             .ok_or_else(|| Error::Validation("评审元数据缺少 approved 字段".into()))?;
-        self.finish_run(run_id, task, cursor, attempt, false, 0, None, (0, 0))
-            .await?;
+        self.finish_run(
+            run_id,
+            task,
+            cursor,
+            attempt,
+            false,
+            0,
+            None,
+            &RunTokens::default(),
+        )
+        .await?;
         Ok(NodeOutput::Route(crate::pipeline::MetadataView::passed(
             approved,
         )))
@@ -775,7 +793,7 @@ impl Executor {
                 .agent_attempt(task, &project, cursor, kind, run_id, attempt)
                 .await
             {
-                Ok((output, prompt_tokens, completion_tokens)) => {
+                Ok((output, tokens)) => {
                     // run 行与 NodeFinished 事件的 token 计量（决策 100）
                     self.finish_run(
                         run_id,
@@ -785,7 +803,7 @@ impl Executor {
                         false,
                         started.elapsed().as_millis() as u64,
                         None,
-                        (prompt_tokens, completion_tokens),
+                        &tokens,
                     )
                     .await?;
                     self.store.refresh_task_totals(&task.id).await?;
@@ -801,7 +819,7 @@ impl Executor {
                         true,
                         started.elapsed().as_millis() as u64,
                         Some(last_error.clone()),
-                        (0, 0),
+                        &RunTokens::default(),
                     )
                     .await?;
                     // 干净对话重试：messages 不跨 attempt 保留（决策 33）
@@ -863,7 +881,7 @@ impl Executor {
     }
 
     /// 单次 agent attempt：prompt 组装 → 工具循环 → 元数据抽取 → 节点后处理。
-    /// 返回（结论，prompt tokens，completion tokens）。
+    /// 返回（结论，token 计量）。
     async fn agent_attempt(
         &self,
         task: &Task,
@@ -872,7 +890,7 @@ impl Executor {
         kind: AgentNodeKind,
         run_id: i64,
         attempt: u32,
-    ) -> Result<(NodeOutput, u32, u32)> {
+    ) -> Result<(NodeOutput, RunTokens)> {
         let home = self.store.home().clone();
         home.ensure_task_dirs(&task.id)?;
         let worktree = task
@@ -939,8 +957,7 @@ impl Executor {
         let mut messages: Vec<Message> = Vec::new();
         let mut tool_failures = 0u32;
         let mut submitted: Option<serde_json::Value> = None;
-        let mut total_prompt_tokens = 0u32;
-        let mut total_completion_tokens = 0u32;
+        let mut tokens = RunTokens::default();
 
         loop {
             let req = LlmRequest {
@@ -953,10 +970,17 @@ impl Executor {
                 tools: tool_defs(kind, &declared_tools),
                 temperature: stage_cfg.as_ref().and_then(|c| c.temperature),
                 max_tokens: stage_cfg.as_ref().and_then(|c| c.max_tokens),
+                // 任务级 provider 覆盖（决策 105）；阶段配置 / 系统默认由生产适配器解析
+                provider_id: task.model_override.clone(),
+                run: Some(crate::agent::client::RunContext {
+                    task_id: task.id.clone(),
+                    branch: cursor.branch.clone(),
+                    run_id,
+                    agent_type: "main".into(),
+                }),
             };
             let response = self.llm.complete(req).await?;
-            total_prompt_tokens += response.prompt_tokens;
-            total_completion_tokens += response.completion_tokens;
+            tokens.add(&response);
             messages.push(Message::assistant(
                 response.content.clone(),
                 response.tool_calls.clone(),
@@ -967,6 +991,8 @@ impl Executor {
                 break;
             }
             for call in &response.tool_calls {
+                let summary = args_summary(&call.arguments);
+                self.emit_tool_event(task, cursor, run_id, &call.name, ToolPhase::Start, &summary);
                 let ctx = ToolCallContext {
                     task_id: task.id.clone(),
                     stage: cursor.stage,
@@ -983,8 +1009,26 @@ impl Executor {
                             submitted = Some(m);
                         }
                         messages.push(Message::tool_result(call, outcome.content));
+                        self.emit_tool_event(
+                            task,
+                            cursor,
+                            run_id,
+                            &call.name,
+                            ToolPhase::End,
+                            &summary,
+                        );
                     }
                     Err(e) => {
+                        // error 阶段的 args_summary 仍是参数摘要（决策 123）；
+                        // 错误详情走 messages 的 tool_result（已脱敏）
+                        self.emit_tool_event(
+                            task,
+                            cursor,
+                            run_id,
+                            &call.name,
+                            ToolPhase::Error,
+                            &summary,
+                        );
                         // G13：工具失败在 agent loop 内重试，只计 tool_retry_max 次
                         tool_failures += 1;
                         messages.push(Message::tool_result(call, format!("工具执行失败：{e}")));
@@ -1027,14 +1071,14 @@ impl Executor {
                 None,
                 &msgs,
                 Some(&value),
-                total_prompt_tokens,
-                total_completion_tokens,
+                tokens.prompt,
+                tokens.completion,
             )
             .await?;
         self.store.refresh_task_totals(&task.id).await?;
 
         let output = kind.post_process(self, task, value).await?;
-        Ok((output, total_prompt_tokens, total_completion_tokens))
+        Ok((output, tokens))
     }
 
     // ─────────────────────── join（决策 83 / 107 / G5）───────────────────────────────
@@ -1726,7 +1770,7 @@ impl Executor {
         failed: bool,
         duration_ms: u64,
         error: Option<String>,
-        tokens: (u32, u32),
+        tokens: &RunTokens,
     ) -> Result<()> {
         self.store
             .finish_run(
@@ -1739,8 +1783,10 @@ impl Executor {
                     }),
                     duration_ms,
                     error,
-                    prompt_tokens: tokens.0,
-                    completion_tokens: tokens.1,
+                    prompt_tokens: tokens.prompt,
+                    completion_tokens: tokens.completion,
+                    cache_read_tokens: tokens.cache_read,
+                    cache_write_tokens: tokens.cache_write,
                     ..Default::default()
                 },
             )
@@ -1758,14 +1804,66 @@ impl Executor {
                 "success".into()
             },
             duration_ms,
-            prompt_tokens: tokens.0,
-            completion_tokens: tokens.1,
+            prompt_tokens: tokens.prompt,
+            completion_tokens: tokens.completion,
         });
         Ok(())
     }
 }
 
 // ─────────────────────────────── 节点输出 ───────────────────────────────
+
+/// 一次 agent attempt 的 token 计量（决策 46：prompt / completion / cache 落 run 行）。
+#[derive(Debug, Clone, Copy, Default)]
+struct RunTokens {
+    prompt: u32,
+    completion: u32,
+    cache_read: u32,
+    cache_write: u32,
+}
+
+impl RunTokens {
+    fn add(&mut self, response: &crate::agent::client::AgentResponse) {
+        self.prompt += response.prompt_tokens;
+        self.completion += response.completion_tokens;
+        self.cache_read += response.cache_read_tokens;
+        self.cache_write += response.cache_write_tokens;
+    }
+}
+
+impl Executor {
+    /// 决策 123 的 `tool_event` 发射（start / end / error 三态共用一个出口）。
+    fn emit_tool_event(
+        &self,
+        task: &Task,
+        cursor: &NodeCursor,
+        run_id: i64,
+        tool: &str,
+        phase: ToolPhase,
+        args_summary: &str,
+    ) {
+        self.sse.emit(SseEvent::ToolEvent {
+            task_id: task.id.clone(),
+            branch: cursor.branch.clone(),
+            run_id,
+            tool: tool.to_string(),
+            phase,
+            args_summary: args_summary.to_string(),
+        });
+    }
+}
+
+/// `tool_event` 的参数摘要（决策 123：只给摘要，不外发全量参数）。
+fn args_summary(text: &str) -> String {
+    const LIMIT: usize = 120;
+    let compact: String = text.chars().filter(|c| !c.is_whitespace()).collect();
+    if compact.chars().count() <= LIMIT {
+        compact
+    } else {
+        let cut: String = compact.chars().take(LIMIT).collect();
+        format!("{cut}…")
+    }
+}
 
 /// 节点执行结论：大多数走路由；少数（merge 冲突打回 / 决策 135 分歧）直接给边或 pending。
 /// `Edge` 的第二个字段覆盖默认流转原因（如冲突文件清单）。

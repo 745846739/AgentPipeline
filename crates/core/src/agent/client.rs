@@ -1,7 +1,8 @@
 //! LLM 调用接缝（决策 142 / 143）与消息模型。
 //!
-//! 生产实现走 rig 适配层；测试实现是 testkit 的 FakeAgent——**只替换 LLM 响应流，
-//! 工具层全部真实执行**（决策 148）。因此这里的 trait 是测试边界，不是工具边界。
+//! 生产实现是 [`crate::agent::providers::ProductionLlm`]（OpenAI 兼容 + Anthropic 两族，
+//! 票 13）；测试实现是 testkit 的 FakeAgent——**只替换 LLM 响应流，工具层全部真实执行**
+//! （决策 148）。因此这里的 trait 是测试边界，不是工具边界。
 
 use futures::future::BoxFuture;
 use schemars::JsonSchema;
@@ -151,6 +152,14 @@ pub struct AgentResponse {
     pub prompt_tokens: u32,
     #[serde(default)]
     pub completion_tokens: u32,
+    /// 缓存命中的 prompt token（决策 46；OpenAI `cached_tokens` / Anthropic
+    /// `cache_read_input_tokens`）。是 `prompt_tokens` 的子集。
+    #[serde(default)]
+    pub cache_read_tokens: u32,
+    /// 写入缓存的 prompt token（决策 46；Anthropic `cache_creation_input_tokens`，
+    /// OpenAI 无对应字段恒为 0）。是 `prompt_tokens` 的子集。
+    #[serde(default)]
+    pub cache_write_tokens: u32,
 }
 
 /// 工具定义（`submit_metadata` 的 parameters 由各阶段 serde 结构体派生，决策 38）。
@@ -185,6 +194,16 @@ pub fn submit_metadata_tool<T: JsonSchema>(description: impl Into<String>) -> To
     }
 }
 
+/// 流式与心跳所需的 run 上下文（决策 64 / 123）：生产适配器据此发射
+/// `conversation_delta` 并刷新 `last_activity_at`；FakeAgent 忽略。
+#[derive(Debug, Clone, PartialEq)]
+pub struct RunContext {
+    pub task_id: String,
+    pub branch: String,
+    pub run_id: i64,
+    pub agent_type: String,
+}
+
 /// 一次节点调用的请求（节点级独立对话，决策 33）。
 #[derive(Debug, Clone)]
 pub struct LlmRequest {
@@ -199,6 +218,10 @@ pub struct LlmRequest {
     pub temperature: Option<f64>,
     /// 阶段配置最大输出 token（§10.6.3 / 决策 46），None 时由适配器取默认值。
     pub max_tokens: Option<u32>,
+    /// 任务级 provider 覆盖（决策 105）优先于阶段配置（生产适配器解析，票 13）。
+    pub provider_id: Option<String>,
+    /// 流式 run 上下文（决策 123）；None = 无流式（FakeAgent / 纯单元场景）。
+    pub run: Option<RunContext>,
 }
 
 /// LLM 客户端接缝。
