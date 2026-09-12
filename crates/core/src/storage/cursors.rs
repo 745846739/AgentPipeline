@@ -190,6 +190,18 @@ impl Store {
         node: Node,
         branch: &str,
     ) -> Result<NodeCursor> {
+        self.replace_cursors_with_main_and_mark_stale(task_id, stage, node, branch, &[])
+            .await
+    }
+
+    async fn replace_cursors_with_main_and_mark_stale(
+        &self,
+        task_id: &str,
+        stage: Stage,
+        node: Node,
+        branch: &str,
+        stale_stages: &[Stage],
+    ) -> Result<NodeCursor> {
         let now = self.now();
         let mut tx = self.pool().begin().await?;
         sqlx::query(
@@ -217,6 +229,21 @@ impl Store {
         .bind(ts(now))
         .execute(&mut *tx)
         .await?;
+
+        // 决策 83：backtrack 的「标记为过期」与游标归档同一事务（pipeline-spec §6）；
+        // 文件保留供回溯，下次执行覆盖写入时由 upsert 清除
+        for stale in stale_stages {
+            sqlx::query(
+                "UPDATE kanban_stage_outputs SET stale = 1, updated_at = ?
+                 WHERE task_id = ? AND stage = ?",
+            )
+            .bind(ts(now))
+            .bind(task_id)
+            .bind(stale.as_str())
+            .execute(&mut *tx)
+            .await?;
+        }
+
         tx.commit().await?;
         self.get_cursor(&cursor_id).await
     }
@@ -232,13 +259,15 @@ impl Store {
         .await
     }
 
-    /// 回退（backtrack）：两条分支一起重置到 architect-design.validate_input（决策 83）。
+    /// 回退（backtrack）：两条分支一起重置到 architect-design.validate_input（决策 83），
+    /// 同一事务内把 develop-design / test-design 的产出标过期（决策 83）。
     pub async fn backtrack_cursors(&self, task_id: &str) -> Result<NodeCursor> {
-        self.replace_cursors_with_main(
+        self.replace_cursors_with_main_and_mark_stale(
             task_id,
             Stage::ArchitectDesign,
             Node::ValidateInput,
             NodeCursor::BRANCH_MAIN,
+            &[Stage::DevelopDesign, Stage::TestDesign],
         )
         .await
     }

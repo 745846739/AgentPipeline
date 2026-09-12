@@ -619,6 +619,7 @@ CREATE TABLE IF NOT EXISTS kanban_stage_outputs (
     output_type TEXT NOT NULL,         -- "design_doc" | "dev_doc" | "merge_result" | "review_diff" | ...
     file_path TEXT NOT NULL,
     metadata_json TEXT,                -- 路由依据（readiness/approved/changed_files 等）
+    stale INTEGER NOT NULL DEFAULT 0,  -- 决策 83：backtrack 标过期（文件保留，覆盖写入时清除）
     created_at TEXT NOT NULL,
     updated_at TEXT NOT NULL,
     FOREIGN KEY (task_id) REFERENCES kanban_tasks(id),

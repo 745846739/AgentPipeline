@@ -886,6 +886,8 @@ pub struct StageOutput {
     pub output_type: String,
     pub file_path: String,
     pub metadata_json: Option<serde_json::Value>,
+    /// 决策 83：backtrack 把设计文档标记为过期（文件保留供回溯，覆盖写入时清除）。
+    pub stale: bool,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
 }

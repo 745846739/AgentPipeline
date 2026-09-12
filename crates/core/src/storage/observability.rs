@@ -240,11 +240,12 @@ impl Store {
         let now = self.now();
         sqlx::query(
             "INSERT INTO kanban_stage_outputs
-             (task_id, stage, output_type, file_path, metadata_json, created_at, updated_at)
-             VALUES (?, ?, ?, ?, ?, ?, ?)
+             (task_id, stage, output_type, file_path, metadata_json, stale, created_at, updated_at)
+             VALUES (?, ?, ?, ?, ?, 0, ?, ?)
              ON CONFLICT(task_id, stage, output_type) DO UPDATE SET
                  file_path = excluded.file_path,
                  metadata_json = excluded.metadata_json,
+                 stale = 0,
                  updated_at = excluded.updated_at",
         )
         .bind(task_id)
@@ -273,11 +274,12 @@ impl Store {
             output_type: String,
             file_path: String,
             metadata_json: Option<String>,
+            stale: i64,
             created_at: String,
             updated_at: String,
         }
         let row: Option<Row> = sqlx::query_as(
-            "SELECT id, task_id, stage, output_type, file_path, metadata_json, created_at, updated_at
+            "SELECT id, task_id, stage, output_type, file_path, metadata_json, stale, created_at, updated_at
              FROM kanban_stage_outputs WHERE task_id = ? AND stage = ? AND output_type = ?",
         )
         .bind(task_id)
@@ -296,6 +298,7 @@ impl Store {
                     .metadata_json
                     .map(|s| serde_json::from_str(&s))
                     .transpose()?,
+                stale: r.stale != 0,
                 created_at: parse_ts(&r.created_at)?,
                 updated_at: parse_ts(&r.updated_at)?,
             }),
@@ -324,11 +327,12 @@ impl Store {
             output_type: String,
             file_path: String,
             metadata_json: Option<String>,
+            stale: i64,
             created_at: String,
             updated_at: String,
         }
         let rows: Vec<Row> = sqlx::query_as(
-            "SELECT id, task_id, stage, output_type, file_path, metadata_json, created_at, updated_at
+            "SELECT id, task_id, stage, output_type, file_path, metadata_json, stale, created_at, updated_at
              FROM kanban_stage_outputs WHERE task_id = ? ORDER BY id",
         )
         .bind(task_id)
@@ -346,6 +350,7 @@ impl Store {
                         .metadata_json
                         .map(|s| serde_json::from_str(&s))
                         .transpose()?,
+                    stale: r.stale != 0,
                     created_at: parse_ts(&r.created_at)?,
                     updated_at: parse_ts(&r.updated_at)?,
                 })

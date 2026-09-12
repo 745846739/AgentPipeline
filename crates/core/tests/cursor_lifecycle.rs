@@ -179,6 +179,55 @@ async fn backtrack_resets_both_branches_to_architect_validate_input() {
 }
 
 #[tokio::test]
+async fn backtrack_marks_design_outputs_stale_and_upsert_clears() {
+    // 决策 83：标过期与游标归档同事务；文件保留供回溯，覆盖写入时清除
+    let (_home, store, _task) = with_task().await;
+    for (stage, output_type) in [
+        (Stage::ArchitectDesign, "design_doc"),
+        (Stage::DevelopDesign, "dev_doc"),
+        (Stage::TestDesign, "test_scenarios"),
+    ] {
+        store
+            .upsert_stage_output("t1", stage, output_type, "x.md", None)
+            .await
+            .unwrap();
+    }
+
+    store.backtrack_cursors("t1").await.unwrap();
+
+    let dev = store
+        .get_stage_output("t1", Stage::DevelopDesign, "dev_doc")
+        .await
+        .unwrap()
+        .unwrap();
+    let test = store
+        .get_stage_output("t1", Stage::TestDesign, "test_scenarios")
+        .await
+        .unwrap()
+        .unwrap();
+    let design = store
+        .get_stage_output("t1", Stage::ArchitectDesign, "design_doc")
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(dev.stale, "dev_doc 应标过期");
+    assert!(test.stale, "test_scenarios 应标过期");
+    assert!(!design.stale, "design_doc 不标过期");
+
+    // 下次执行覆盖写入 → upsert 清除过期标记（决策 83「下次执行覆盖写入」）
+    store
+        .upsert_stage_output("t1", Stage::DevelopDesign, "dev_doc", "dev-plan.md", None)
+        .await
+        .unwrap();
+    let dev = store
+        .get_stage_output("t1", Stage::DevelopDesign, "dev_doc")
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(!dev.stale, "覆盖写入应清除过期标记");
+}
+
+#[tokio::test]
 async fn retry_reset_archives_everything_and_starts_from_init() {
     let (_home, store, _task) = with_task().await;
     store.split_cursors("t1").await.unwrap();

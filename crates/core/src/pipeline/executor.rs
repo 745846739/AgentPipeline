@@ -914,13 +914,22 @@ impl Executor {
             .template_vars(task, project, &worktree, &task_dir)
             .await?;
         // user prompt：§10.3 节点模板 + G12 环境路径块 + 可选追加段（首轮为空不渲染）
+        let segments = PromptSegments {
+            backtrack_feedback: backtrack_feedback_segment(
+                &home,
+                &task.id,
+                cursor.stage,
+                cursor.node,
+            ),
+            ..Default::default()
+        };
         let user_prompt = build_user_prompt(
             &format!(
                 "{}\n\n## 环境路径\n{}",
                 render_template(user_template(cursor.stage, cursor.node), &vars),
                 workdirs_line(&worktree, &task_dir)
             ),
-            &PromptSegments::default(),
+            &segments,
         );
         let template_hash = prompt_template_hash(&system_prompt);
         self.store
@@ -1039,8 +1048,9 @@ impl Executor {
         let main = if decision.decision == SyncDecisionKind::Proceed {
             self.store.merge_cursors_to_develop(&task.id).await?
         } else {
+            // backtrack_cursors 单事务内归档双游标 + 插回 main + 设计文档标过期
+            //（决策 83，pipeline-spec §6）；双方 blockers 写任务目录 backtrack-feedback.md（决策 126）
             let main = self.store.backtrack_cursors(&task.id).await?;
-            // 双方 blockers 写任务目录 backtrack-feedback.md（决策 126）
             let feedback = format!(
                 "# backtrack 反馈\n\ndev blockers：{:?}\ntest blockers：{:?}\n",
                 decision.dev_blockers, decision.test_blockers
@@ -2023,6 +2033,23 @@ fn workdirs_line(worktree: &str, task_dir: &str) -> String {
     format!("worktree：{worktree}\n任务目录：{task_dir}")
 }
 
+/// 决策 126：backtrack blockers 写在任务目录 `backtrack-feedback.md`，
+/// architect-design 重入（validate_input / execute）的 user prompt 注入该内容；
+/// 首轮（文件尚不存在）为空不渲染。
+fn backtrack_feedback_segment(
+    home: &Home,
+    task_id: &str,
+    stage: Stage,
+    node: Node,
+) -> Option<String> {
+    if stage != Stage::ArchitectDesign || !matches!(node, Node::ValidateInput | Node::Execute) {
+        return None;
+    }
+    std::fs::read_to_string(home.task_file(task_id, "backtrack-feedback.md"))
+        .ok()
+        .filter(|s| !s.trim().is_empty())
+}
+
 /// persona 解析（决策 7 / §10.6.3）：`stage_configs.persona_path` 显式指定优先，
 /// 其次 `prompts/{stage}/{node}.md` 用户覆盖，最后内嵌 §10.3 模板；
 /// `persona_append` 追加为额外指令段。
@@ -2198,4 +2225,56 @@ fn meta_str_list(meta: Option<&serde_json::Value>, key: &str) -> Vec<String> {
                 .collect()
         })
         .unwrap_or_default()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn backtrack_feedback_only_injected_for_architect_reentry() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let home = Home::new(tmp.path());
+        std::fs::create_dir_all(home.task_dir("t1")).unwrap();
+
+        // 首轮：反馈文件不存在 → 不渲染（决策 126「首轮为空不渲染」）
+        assert_eq!(
+            backtrack_feedback_segment(&home, "t1", Stage::ArchitectDesign, Node::ValidateInput),
+            None
+        );
+
+        std::fs::write(
+            home.task_file("t1", "backtrack-feedback.md"),
+            "dev blockers：[\"缺少数据流定义\"]\n",
+        )
+        .unwrap();
+        assert!(backtrack_feedback_segment(
+            &home,
+            "t1",
+            Stage::ArchitectDesign,
+            Node::ValidateInput
+        )
+        .is_some());
+        assert!(
+            backtrack_feedback_segment(&home, "t1", Stage::ArchitectDesign, Node::Execute)
+                .is_some()
+        );
+
+        // 决策 126 的注入范围只有 validate_input / execute
+        assert_eq!(
+            backtrack_feedback_segment(&home, "t1", Stage::ArchitectDesign, Node::ValidateOutput),
+            None
+        );
+        assert_eq!(
+            backtrack_feedback_segment(&home, "t1", Stage::Develop, Node::Execute),
+            None
+        );
+
+        // 空文件（纯空白）不渲染
+        std::fs::write(home.task_file("t1", "backtrack-feedback.md"), "  \n").unwrap();
+        assert_eq!(
+            backtrack_feedback_segment(&home, "t1", Stage::ArchitectDesign, Node::ValidateInput),
+            None
+        );
+    }
 }

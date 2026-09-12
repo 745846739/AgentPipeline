@@ -187,26 +187,27 @@ harness = FakeAgent（§3.2）+ testkit fixture（§3.3）+ 临时 home + 手动
 
 | 决策 | 测试锚点 | 实现状态 |
 |---|---|---|
-| 85 / 108 / 109 | E2E-06a / 06b / 08 / 09 | 85/108 已有用例（§5 route_merge 闸门耗尽收口、E2E-09 的 `gate_failures` 保留、L3/E2E 的 upsert 跳过计数）；109 与 E2E-06a/06b 待 executor |
+| 85 / 108 / 109 | E2E-06a / 06b / 08 / 09 | 85/108 已有用例（§5 route_merge 闸门耗尽收口、E2E-09 的 `gate_failures` 保留、L3/E2E 的 upsert 跳过计数）；109 的 `gate_recheck` 注入与 E2E-06a/06b 待票 15 / 19 |
 | 121 / 95 | §5 routes 单测、E2E-01 | 已有用例 |
-| 139 | E2E-07、§5 routes 单测 | routes 部分已有用例（lint→KickbackDevelop）；E2E-07 待 executor |
-| 90 / 113 | §6 游标生命周期、E2E-01 / 08 / 13 | 生命周期已有用例；E2E-13 待 executor |
-| 93 / 115 | §5 落点表单测、E2E-11 | 93 已有用例；115 与 E2E-11 待 executor |
-| 82 / 89 | §6 executor 循环、E2E-12 | 待 executor |
-| 96 / 97 / 74 | E2E-05 / 09、§6 git 链路 | 97 / 74 已有用例；96 的比对逻辑与 E2E-05 待 executor（E2E-09 已覆盖保留语义） |
-| 64 / 66 / 100 / 88 | §6 超时/心跳、E2E-14 | 64 / 66 已有用例；88 / 100 的系统命令心跳待 executor |
-| 134 / 135 | E2E-15、§6 配置 fail fast | fail fast 已有用例；`resolve_validate_output` 单测已有；E2E-15 与 135 的 continue 特判待 executor |
-| 136 | E2E-16、§5（sync-check 校验若可纯函数化则加单测） | 待 executor（design_refs 校验本体未实现） |
+| 139 | E2E-07、§5 routes 单测 | routes 部分已有用例（lint→KickbackDevelop）；E2E-07 待票 19 |
+| 90 / 113 | §6 游标生命周期、E2E-01 / 08 / 13 | 生命周期已有用例；E2E-13 待票 18 |
+| 83 / 126 / 43 | E2E-02（backtrack 链：双游标归档 / 设计文档标过期 / 反馈文件落盘 / 重入 prompt 注入 / attempts 归零） | 已有用例 |
+| 93 / 115 | §5 落点表单测、E2E-11 | 已有用例（E2E-11：architect 分裂、双分支 skip → `skipped_to_join`、决策 115 降级断言） |
+| 82 / 89 | §6 executor 循环、E2E-12 | 已有用例（L2 executor 循环 + E2E-12 尾段 resume→join） |
+| 96 / 97 / 74 | E2E-05 / 09、§6 git 链路 | 97 / 74 已有用例；96 的执行侧比对已接线（merge 阶段 B 入口），端到端场景待票 19 |
+| 64 / 66 / 100 / 88 | §6 超时/心跳、E2E-14 | 64 / 66 / 88 已有用例（假时钟超时链 + executor 系统命令起止心跳）；E2E-14 待票 19；agent `run_command` 周期心跳随票 13 |
+| 134 / 135 | E2E-15、§6 配置 fail fast | fail fast 已有用例；`resolve_validate_output` 单测已有；E2E-15 与 135 的 continue 特判待票 16 / 19 |
+| 136 | E2E-16、§5 | 校验本体已实现（`compute_sync_decision`，E2E-02/11 间接覆盖 proceed/warning 侧）；E2E-16 高悬空场景待票 19 |
 | 128 | §7 跨源防护矩阵 | 已有用例（严格相等 + 前缀伪装拒绝，2026-09-12 收紧） |
 | 118 / 104 | §5 脱敏 / FileToolPolicy 单测 | 已有用例 |
-| 91 / 119 | §7 resume / merge-decision、E2E-04 | 91 / 119 已有用例；E2E-04 待 executor |
-| 117 / 98 | §6 准入、E2E-20 | 准入已有用例；E2E-20 待 executor |
+| 91 / 119 | §7 resume / merge-decision、E2E-04 | 91 / 119 已有用例；E2E-04 待票 19 |
+| 117 / 98 | §6 准入、E2E-20 | 准入已有用例；E2E-20 待票 19 |
 | 130⑤ / 69 / 71② / 125 / 3 | §7 回归（dependency continue 不 spawn / goto 入口节点 / 纯 name warning / retry reset / cancel 清理）、§6 | 已有用例（2026-09-12 偏离修复回归） |
 | …… | 其余决策随实现逐条填入 | — |
 
 ## 11. 实现状态（2026-09-12）
 
-骨架已落地，质量闸门全绿：`cargo fmt --check`、`clippy --workspace --all-targets -- -D warnings`、`cargo test --workspace` = **304 个用例全过**（`just lint test`）。
+骨架 + executor + prompt 模板消费已落地，质量闸门全绿：`cargo fmt --check`、`clippy --workspace --all-targets -- -D warnings`、`cargo test --workspace` = **334 个用例全过**（`just lint test`）。
 
 **workspace 布局**（与 project-structure 决策一致，`crates/core` 的包名改为 `agentpipeline-core`——包名 `core` 会在宏展开里遮蔽 Rust 内置 `core`）：
 
@@ -222,22 +223,22 @@ justfile         lint / test / unit / integration / api / e2e / smoke
 
 | 层 | 位置 | 用例数 | 覆盖 |
 |---|---|---|---|
-| L1 单元 | `crates/core/src/**`（in-crate） | 194 | routes 全 `EdgeKind`（含 sync-check backtrack、merge 闸门耗尽收口、code_gate 通过即放行、review 不通过→user_decision）、落点表逐行、metadata 三级降级、FileToolPolicy（realpath / deny / symlink）、脱敏、L1 裁剪 / L2 唯一阈值 / L3 压缩规则表 / L4 兜底、prompt 组装 golden + `prompt_template_hash`、allowed_actions 权威表 + 端点按行配对静态检查、焦点投影、指标口径、SSE 事件体（`stage_changed` / `task_done` / `task_failed` / `task_cancelled`）、工具真实执行（test-report.md 落任务目录） |
-| L2 集成 | `crates/core/tests/` | 58 | 游标生命周期（创建 / 分裂 / 合并 / 回退 / 重试 / partial UNIQUE / 永不物理删除 / run 外键不悬空 / **损坏行 fail fast** / **cancel 只挂未启动依赖方**）、git 链路（init / rebase / 冲突 abort / ff 与非 ff 合入 + `update-ref` 写回 / reset --hard + clean / 清理幂等 / unborn HEAD 明确报错 / 非 origin remote 的基准回落）、scheduler tick 六项职责（超时链 + 进程组终止器 + 节点/阶段/全局超时层级、冲突恢复含复检、依赖三态与恢复、准入、stalled 谓词 `has_runnable_cursor`、**纯 name 重合降级 warning**） |
+| L1 单元 | `crates/core/src/**`（in-crate） | 210 | routes 全 `EdgeKind`（含 sync-check backtrack、merge 闸门耗尽收口、code_gate 通过即放行、review 不通过→user_decision）、落点表逐行、metadata 三级降级、FileToolPolicy（realpath / deny / symlink）、脱敏、L1 裁剪 / L2 唯一阈值 / L3 压缩规则表 / L4 兜底、prompt 组装 golden（§10.3 十二节点内嵌模板 + AGENTS.md + stage_configs 消费 + `prompt_template_hash`，票 12）、backtrack 反馈注入范围（决策 126：仅 architect validate_input / execute、首轮不渲染）、allowed_actions 权威表 + 端点按行配对静态检查、焦点投影、指标口径、SSE 事件体（`stage_changed` / `task_done` / `task_cancelled`）、工具真实执行（test-report.md 落任务目录） |
+| L2 集成 | `crates/core/tests/` | 67 | 游标生命周期（创建 / 分裂 / 合并 / 回退 / 重试 / partial UNIQUE / 永不物理删除 / run 外键不悬空 / **损坏行 fail fast** / **cancel 只挂未启动依赖方** / **backtrack 标过期同事务 + upsert 清除**）、git 链路（init / rebase / 冲突 abort / ff 与非 ff 合入 + `update-ref` 写回 / reset --hard + clean / 清理幂等 / unborn HEAD 明确报错 / 非 origin remote 的基准回落）、scheduler tick 六项职责（超时链 + 进程组终止器 + 节点/阶段/全局超时层级、冲突恢复含复检、依赖三态与恢复、准入、stalled 谓词 `has_runnable_cursor`、**纯 name 重合降级 warning**）、executor 循环（FakeAgent 驱动完整 happy path + sync-check system run 恰一次、单分支 pending 不阻断另一分支、单执行者双保险、元数据失败干净对话重试、会话截断、prompt 组装消费） |
 | L3 API | `crates/app/tests/api_contract.rs` | 28 | POST/GET /tasks 与过滤、循环依赖与 provider fail fast、`GET /tasks/{id}` 的 allowed_actions 与 blocks、resume 的 409 / 动作集 / 冷却防连点 / **dependency continue 不 spawn** / **goto 入口节点校验**、merge/decision（approve 与 return）、人工评审（**comments 进流转原因**）、retry（**worktree 硬重置 + system 命令入账**）/ cancel / archive / split / model-override、项目 CRUD 与 202 异步分析、provider `***` 回显、**跨源防护矩阵全覆盖**（自定义头 / 无 Origin / 本机 Origin 严格相等 / 恶意 Origin 与**前缀伪装** 403 / 同源 Referer 带路径放行 / GET 不受影响）、SSE 通道、会话与命令 API（**按 task 隔离**，含卸载输出）、任务产出文件与目录逃逸防护 |
 | 冒烟 | `crates/app/tests/smoke.rs` | 2 | E2E-00：spawn 真二进制 → 就绪 → 0700 目录权限 → 无 provider 创建任务明确报错 → SIGINT 优雅退出（退出码 0）；端口占用明确报错 |
-| L4 E2E | `tests/e2e/tests/happy_path.rs` | 4 | E2E-01 happy path（游标分裂 → join → 合并 → 归档序列、真 git worktree / 提交 / ff 合入、`default_branch` 前进、worktree 与分支清理、system run 落库、token 与调用次数汇总、命令日志、流转时间线）、E2E-09 基准前移使 approval 失效、决策 108 的 `gate_failures` 不被 upsert 清零、E2E-08 的 retry 段（worktree 硬重置 + 重新准入） |
+| L4 E2E | `tests/e2e/tests/` | 9 | `happy_path.rs`：E2E-01 happy path（游标分裂 → join → 合并 → 归档序列、真 git worktree / 提交 / ff 合入、`default_branch` 前进、worktree 与分支清理、system run 落库、token 与调用次数汇总、命令日志、流转时间线）、E2E-09 基准前移使 approval 失效、决策 108 的 `gate_failures` 不被 upsert 清零、E2E-08 的 retry 段（worktree 硬重置 + 重新准入）。`join_and_skip.rs`：E2E-02 sync-check backtrack（双游标归档 → main 指 architect.validate_input、设计文档标过期、`backtrack-feedback.md` 落盘、重入 prompt 含反馈段、attempts 归零）、E2E-11 skip 矩阵（architect skip → 分裂；develop-design / test-design skip → `waiting_join`+`skipped_to_join`、sync-check 视 readiness=true、不伪造产出元数据、下游 prompt 决策 115 降级）、E2E-12 尾段（pending 分支 resume 后 join 恰一次） |
 | testkit | `crates/testkit/src/**` | 16 | 临时 home、假时钟、记录型终止器、git fixture（干净 / unborn / remote / 脏 / 可自动合并 / 不可自动合并 / 多语言 / symlink 陷阱）、FakeAgent 脚本能力、断言助手 |
 
 **2026-09-12 偏离修复（文档-实现对齐 pass）：** 依据文档权威裁决，修正了已实现代码与文档相悖的行为——路由四处（code_gate 先判通过、merge 闸门耗尽进 `pending(retry_exhausted)`、review 不通过进 user_decision、sync-check backtrack 用独立 `EdgeKind::Backtrack`）、goto 落点校验、cancel_task 只对未启动依赖挂 dependency_failed、dependency_failed 的 continue 不 spawn、cancel/archive 回收 worktree 与分支、retry 的 `git reset --hard` + `clean -fdx`（记 system 命令）、纯 name 重合降级 warning、test 阶段 `test-report.md` 写任务目录、跨源严格相等（含 `localhost`）、db 文件 0600 + `-wal`/`-shm` 纳管 + 检查前 realpath、git.rs 三处（unborn 判定 / origin 基准 / 兜底删除的 worktree 标记核验）、skills 校验改对真实 PATH 可执行集合、`[server] host/port` 接线、SSE 线协议命名（§12.7）、human_review 动作名 `approve`/`reject`（端点按行配对）、`NodeStatus` 更名、`MergeResult` 必填字段 + `gate` 无 Default（缺行 ≠ 通过）、merge `output_type` 定名 `merge_result`、损坏数据 fail-fast 分类（执行语义字段报错，观测字段 warn + 兜底）。文档同步修订：决策 70 / 128（改旧行）、§11.5 schema 补全、SSE 表补 `stalled`、agents.md 配置示例对齐。
 
 **尚未实现（下一步）：**
 
-1. **executor（`crates/core/src/pipeline/executor.rs`）与 agent loop 接线**——FakeAgent 已具备（类型化脚本、工具失败注入、元数据劣化、Stall 心跳停跳、心跳/流式节奏、伪阶段脚本），但"驱动游标逐节点执行"的循环尚未落地。`main.rs` 也尚未启动 `KanbanScheduler`（超时 / 准入 / 提醒只有 tick 单测）。因此 §6 的 executor 循环行、§8 的 25 条 E2E 中除上述 4 条外的场景（06a/06b/07/11/12/13/14/15/16/17/18/19/21/22/23/24）都还没有。当前 E2E 用例按**阶段边界**手动推进，每次推进都走 store 的真实迁移 API，executor 落地后可原样换成 `run_executor(task_id)`。
-2. **前端（`web/`）**——`reduce.ts` 归约表逐事件单测、组件测试与 playwright 两条冒烟（决策 150 / 151）未开始。
+1. **票面剩余**：13 生产 LLM 适配器（rig 接缝已留位，`main.rs` 尚未启动 `KanbanScheduler`）；15 收尾（rebase 冲突的自动合并尝试、`gate_recheck` prompt 注入、闸门循环 E2E）；16 伪阶段执行；17 生产进程接线；18 崩溃恢复；19 E2E 矩阵剩余场景；20–22 前端（0%）。
+2. **行为级缺口（文档已定义、当前无生产者）**：SSE `conversation_delta` / `tool_event`（等票 13 流式）；`task_failed`（v1 执行路径无 failed 终态，见票 11 注记①）；`review_diff` 产出（决策 124）；`gate_recheck` 置位与闸门输出注入（决策 109）；judge_disagreement 的 continue 特判放行（决策 135）；design_refs 校验本体已在 `compute_sync_decision` 实现，E2E-16 场景待票 19；retry 的会话归档（§12.2 需会话表加 archived 标记列）；`GET /tasks/{id}/conversations/{run_id}/messages` 端点（§12.4.3 有定义）。
 3. **真 LLM 冒烟**（`#[ignore]`，rig 适配层）——未开始；`LlmClient` 接缝已就位，生产适配器位置留空。
-4. **随 executor 一起落地的行为**（文档已定义、当前无生产者）：SSE 生产侧只发 `pending` / `pending_updated` / `task_cancelled`（`stage_changed` 等其余事件类型已定义无发布点）；sync-check backtrack 的「`dev-plan.md` / `test-scenarios.md` 标过期」（决策 83）；`review_diff` 产出（决策 124）；`gate_recheck` 置位与闸门输出注入（决策 109）；judge_disagreement 的 continue 特判放行（决策 135）；design_refs 完整性校验（决策 136）；`base_commit` 基准校验接线（决策 96）；retry 的会话归档（§12.2 需要会话表加 archived 标记列）；`GET /tasks/{id}/conversations/{run_id}/messages` 端点（§12.4.3 有定义）。
-5. **文档已定义、实现留空的配置面**：`[logging] format / file`（agents.md §10.6.5 已标注 v1 未实现）；`conversation_max_chars` / `adaptive_timeout_enabled` / `allow_dirty_worktree_merge` 已解析未消费；`PromptsConfig.dir` 未接入；`run_command` 的周期性心跳与输出流式 SSE（决策 100 / §12.4.4）；脱敏的环境变量值模式（§12.4.4）；上下文 L1 read_file 尾部、L2 泛化到全部工具、L3 按轮计数、L4 接线（§12.13）；内嵌默认 prompt 模板与 `persona.path/append` 生效（§10.3 / §10.6.3）；tools 并集 / forbidden_tools / 伪阶段 persona 校验（§10.6.4）；`model_context_window` 注册表（决策 110）。
+4. **文档已定义、实现留空的配置面**：`[logging] format / file`（agents.md §10.6.5 已标注 v1 未实现）；`adaptive_timeout_enabled` 已解析未消费；`PromptsConfig.dir` 未接入；`run_command` 的周期性心跳与输出流式 SSE（决策 100 / §12.4.4）；脱敏的环境变量值模式（§12.4.4）；上下文 L1 read_file 尾部、L2 泛化到全部工具、L3 按轮计数、L4 接线（§12.13）；`model_context_window` 注册表（决策 110）。
+5. **测试基建注记**：FakeAgent 的 agent loop 会耗尽同节点脚本队列（每 attempt 吃到队列干涸为止），多轮行为测试须按 `set_script` 分轮投喂（`tests/e2e/tests/join_and_skip.rs` 头注）；executor 注册表以 task_id 为进程全局键，同进程并发测试须用互不相同的 task_id。
 
 **git 层技术选型（2026-09-12 用户裁决）：** 决策 12（git2 + `spawn_blocking`）与决策 146 原文（生产走系统 git CLI）此前互斥，用户拍板统一 git2——生产 git 层（`crates/core/src/git.rs`）已全部重写为 git2，testkit fixture 保留系统 git CLI 仅作测试脚手架（决策 146 已改旧行）；merge 阶段 B 随之改为内存合入（决策 73 / 97 已补注），git 链路 14 条测试全部在 git2 实现上通过。
 
