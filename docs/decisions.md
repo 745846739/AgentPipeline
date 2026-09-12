@@ -4,7 +4,7 @@
 
 ## 13. 已确认的设计决策
 
-本节记录所有已确认的设计决策。**决策 89–112 来自第四次评审（g4），113–120 来自第五次评审（g5），121–132 来自第六次评审（g6），133–139 来自第七次评审（g7，2026-09-12，防错误放大改进点落文档），140–152 来自测试设计评审（t1，2026-09-12，AgentPipeline 自身的测试设计）**；10 / 19 / 26 / 42 / 46 / 56 / 62 / 69 / 70 / 71 / 73 / 78 / 85 / 90 / 93 / 98 / 99 被后续决策修订，修订关系在各行显式标注。
+本节记录所有已确认的设计决策。**决策 89–112 来自第四次评审（g4），113–120 来自第五次评审（g5），121–132 来自第六次评审（g6），133–139 来自第七次评审（g7，2026-09-12，防错误放大改进点落文档），140–152 来自测试设计评审（t1，2026-09-12，AgentPipeline 自身的测试设计），153 来自桌面化传输层评估（2026-09-12）**；10 / 11 / 19 / 26 / 42 / 46 / 56 / 62 / 69 / 70 / 71 / 73 / 78 / 85 / 90 / 93 / 98 / 99 被后续决策修订，修订关系在各行显式标注。
 
 | # | 决策 | 结论 | 来源 |
 |---|---|---|---|
@@ -160,3 +160,4 @@
 | 150 | 测试工具选型 | Rust：insta 快照（prompt 组装 golden——决策 51 / 28 / 7 / 109 / 126 / 138 的组装规则与 `prompt_template_hash` 稳定性）；`#[tokio::test(start_paused)]` + 注入 Clock 验超时；不引 proptest（解析器日后需要再补）。前端：vitest + @testing-library/svelte（重点 `reduce.ts` 归约表逐事件、allowed_actions 渲染、PendingActions 交互）；playwright 只 Chromium | t1-Q11 |
 | 151 | 前端 E2E 走真后端 | playwright 冒烟跑**真 axum 后端 + FakeAgent**（`AGENTPIPELINE_HOME` 指临时目录），复用 E2E harness、不维护独立 mock server——顺带覆盖「SSE 事件格式 ↔ 前端归约」契约。冒烟两条：① happy path（看板 → 详情 → 时间线/会话/命令页签 → diff 审批合入）；② pending → dossier 面板 → resume（琥珀面板、顶栏待办计数、按游标取 cursor_id——决策 91） | t1-Q12 |
 | 152 | 中断恢复测试形态 | 全部恢复测试 in-process：spawn executor → 节点中途 abort → 重跑 `run_executor` 断言从游标恢复；决策 127 的 `executor_owner` 残留用直接写库模拟 kill -9 现场；决策 54 只测 shutdown 标志语义（节点边界退出、状态保持 running），SIGINT 信号本身留 `#[ignore]` 手动用例。不 spawn 真二进制做 kill -9（慢且 flaky） | t1-Q13 |
+| 153 | 桌面端传输层防线（Tauri 防御约束） | 桌面化形态定为 **Tauri 只当外壳与打包器，传输层复用 HTTP + SSE（决策 76），不重写为 Tauri IPC**（修订决策 11"后期可替换为 Tauri IPC"的预案——重写 = 全部路由与流式通道换传输层、L3 契约测试与前端 SSE 归约作废，收益仅省一个本地回环端口）。v1 仍纯 Web（决策 16 不变），本决策只固化实现期必须守住的约束（违者桌面化返工）：① 前端保持**纯 API 客户端**，一切数据经 HTTP + SSE，不假设部署形态；② SSE 消费用 **fetch 流式读取**而非 `EventSource`——后者无法携带自定义头，跨源过不了决策 128 防护，fetch 流式可带 `X-AgentPipeline` 头；③ 决策 128 的 `X-AgentPipeline` 自定义头旁路**不得移除**——桌面 webview origin（`tauri://localhost` / Windows `http://tauri.localhost`）的写请求靠它放行；④ API base 地址收敛到**单一配置点**：默认同源相对路径，留注入覆盖口（桌面壳注入 `http://127.0.0.1:{port}`）；⑤ 起服逻辑沉入 lib 并支持随机端口（`127.0.0.1:0`）绑定，不埋死在二进制入口；桌面壳首选由壳导航至本机 origin（同源零 CORS），Tauri asset 协议直连为备选（服务端需补 CORS）。桌面壳落地时另需三项非传输件：关闭触发抽象（SIGINT 只是触发器之一，shutdown watch channel 复用）、单实例锁、启动恢复（决策 127）照跑。前端侧约束落 frontend-design.md §4，桌面项留附录 B.5 | 用户（2026-09-12 桌面化评估）；修订 11 |

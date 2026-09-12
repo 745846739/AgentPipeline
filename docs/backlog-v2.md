@@ -45,7 +45,7 @@ v1 的自适应 P50/P90 仅用于进度展示与告警（决策 66）。若将�
 |---|---|
 | `human_if_risk` review 模式 | v1 只支持 `agent` / `human`（决策 25） |
 | 远程仓库 push / PR | v1 纯本地合并（决策 6）；合入后可选 push 但不建 PR |
-| 桌面端 Tauri 包装 | v1 纯 Web（决策 16） |
+| 桌面端 Tauri 包装 | v1 纯 Web（决策 16）；形态已定：Tauri 只当外壳与打包器，传输层复用 HTTP + SSE、不重写为 Tauri IPC（决策 153，实现期防御约束见 frontend-design.md §4） |
 | 多项目目录维度 | 当前路径不含 project_id，靠前端过滤（决策 58） |
 | 系统级沙箱 | v1 只有 `FileToolPolicy`（文件工具层面），shell 不受限（决策 104 / 19 修订）；OS 级 confinement 延后 |
 | 密钥加密存储 | v1 明文（决策 112），仅靠目录权限；加密方案已评估并否决 |
