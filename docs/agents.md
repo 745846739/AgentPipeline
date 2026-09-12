@@ -802,14 +802,21 @@ cross_family_judge = false
 allow_dirty_worktree_merge = false
 
 [logging]
-level = "info"
-format = "pretty"
+level = "info"                       # EnvFilter 表达式；非法值回退 info，不阻断启动
+format = "pretty"                    # pretty（缺省）| compact | json
 file = "~/.agentpipeline/logs/agentpipeline.log"
-# v1 未实现（executor 阶段落地），当前仅 level 生效
+# 不写 file 只输出到标准输出。file 的 ~ 会展开、相对路径按 home 根解析；
+# 目录自动创建为 0700、文件 0600（§12.14）。文件打不开时降级为仅标准输出，不阻断启动。
+# 已废弃：旧键 json_file（bool）。json_file = true 等价 format = "json"。
+# 两者同时配置属冲突 → 配置加载 fail fast（决策 47 / 103 / 134 姿态）。
 
 [prompts]
-dir = "~/.agentpipeline/prompts"
+dir = "~/.agentpipeline/prompts"     # 覆盖 prompt 模板目录；缺省回落 {home}/prompts
 ```
+
+> **配置校验姿态（票 16）：** `config.toml` 中未知的 section / 键一律**拒绝启动**
+> （`deny_unknown_fields`），不静默忽略——与决策 47 / 103 / 134 的 fail fast 姿态一致。
+> `[logging]` 的 `format` 与已废弃 `json_file` 同时出现同样报错。
 
 **阶段级 Agent 配置**存储在 SQLite 数据库中，通过前端界面配置。每个阶段可独立设置 provider（引用 `providers` 表的 `provider_id`）、tools、skills、超时覆盖。系统最小基线（mandatory_tools、mandatory_skills、`file_tool_policy`）在代码中硬编码，不可覆盖。模型上下文窗口随 `providers` 表的一行存在一起（决策 46 / 111）——**阶段不单独存 model**，换模型即换 `provider_id`，这样 L0 容量预估（§12.13.3）查找窗口大小的路径唯一。伪阶段（`project_analysis` / `conflict_check` / `validator_cross_check`）复用同一配置机制（决策 67 / 87 / 134）；`cross_family_judge = true` 时 `validator_cross_check` 必须已配置 provider，否则配置加载 fail fast。
 

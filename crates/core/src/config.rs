@@ -3,7 +3,7 @@
 //! config.toml 只保留 `[server]` / `[pipeline]` / `[logging]` / `[prompts]`（决策 56）；
 //! provider 与阶段配置存 DB（决策 22 / 111）。
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
@@ -75,7 +75,7 @@ impl Default for Settings {
 
 /// config.toml 的可选覆盖层（未写的项取 [`Settings::default`]）。
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
-#[serde(default)]
+#[serde(default, deny_unknown_fields)]
 pub struct PipelineOverrides {
     pub validate_retry_max: Option<u32>,
     pub agent_retry_max: Option<u32>,
@@ -141,7 +141,7 @@ impl PipelineOverrides {
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[serde(default)]
+#[serde(default, deny_unknown_fields)]
 pub struct ServerConfig {
     pub port: u16,
     /// 绑定地址（§10.6.5：`[server] host`）。只允许 IP 字面量。
@@ -157,20 +157,106 @@ impl Default for ServerConfig {
     }
 }
 
+/// `[logging] format` 的取值（§10.6.5，票 16）。
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum LogFormat {
+    /// 多行、带缩进的人读格式（缺省）。
+    #[default]
+    Pretty,
+    /// 单行紧凑格式。
+    Compact,
+    /// 每行一条 JSON（供机器采集）。
+    Json,
+}
+
+impl LogFormat {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            LogFormat::Pretty => "pretty",
+            LogFormat::Compact => "compact",
+            LogFormat::Json => "json",
+        }
+    }
+}
+
+/// `[logging]`（§10.6.5，票 16 修正键名）。
+///
+/// 键名与文档一致：`level` / `format` / `file`。旧代码结构体的 `json_file`
+/// 作为**已废弃键**保留兼容（见 [`LoggingConfig::json_file`]）。
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[serde(default)]
+#[serde(default, deny_unknown_fields)]
 pub struct LoggingConfig {
     pub level: String,
-    pub json_file: bool,
+    /// 日志格式；未设置时由 `json_file` 推导，最终缺省 `pretty`。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub format: Option<LogFormat>,
+    /// 日志文件路径（`~` 可展开，相对路径按 home 根解析）；空 = 不落文件。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub file: Option<String>,
+    /// **已废弃**（决策 56 时代的旧键）：`json_file = true` 等价 `format = "json"`。
+    /// 与 `format` 同时出现属冲突配置 → 解析期 fail fast（`Config::from_toml`）。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub json_file: Option<bool>,
 }
 
 impl Default for LoggingConfig {
     fn default() -> Self {
         LoggingConfig {
             level: "info".to_string(),
-            json_file: true,
+            format: None,
+            file: None,
+            json_file: None,
         }
     }
+}
+
+impl LoggingConfig {
+    /// 有效格式：显式 `format` 优先；否则由旧键 `json_file` 推导；最终 `pretty`。
+    pub fn effective_format(&self) -> LogFormat {
+        match (self.format, self.json_file) {
+            (Some(f), _) => f,
+            (None, Some(true)) => LogFormat::Json,
+            (None, Some(false)) => LogFormat::Pretty,
+            (None, None) => LogFormat::Pretty,
+        }
+    }
+
+    /// 解析后的日志文件路径；未配置或空白 → `None`（只写标准输出）。
+    pub fn resolved_file(&self, home_root: &Path) -> Option<PathBuf> {
+        let raw = self.file.as_deref()?.trim();
+        if raw.is_empty() {
+            return None;
+        }
+        Some(resolve_config_path(raw, home_root))
+    }
+}
+
+/// 展开配置里的路径（§10.6.4 同口径）：
+/// - `~` / `~/x` → 用户家目录；
+/// - 绝对路径原样；
+/// - 相对路径按 `home_root` 解析。
+pub fn resolve_config_path(raw: &str, home_root: &Path) -> PathBuf {
+    let raw = raw.trim();
+    if raw == "~" {
+        return user_home_dir();
+    }
+    if let Some(rest) = raw.strip_prefix("~/") {
+        return user_home_dir().join(rest);
+    }
+    let p = Path::new(raw);
+    if p.is_absolute() {
+        p.to_path_buf()
+    } else {
+        home_root.join(p)
+    }
+}
+
+/// 用户家目录（`$HOME`；缺失时回退当前目录，与 [`crate::home::agentpipeline_home`] 同口径）。
+fn user_home_dir() -> PathBuf {
+    std::env::var_os("HOME")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("."))
 }
 
 /// 发现"可用 skill"（决策 47）：skill 的语义是"用户机器上装了对应的外部工具"
@@ -209,15 +295,26 @@ pub fn discover_available_skills() -> Vec<String> {
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
-#[serde(default)]
+#[serde(default, deny_unknown_fields)]
 pub struct PromptsConfig {
-    /// 覆盖 prompt 的目录；缺省时用 `{home}/prompts`。
+    /// 覆盖 prompt 的目录；缺省时用 `{home}/prompts`（票 16：已接入 `Home::prompts_dir`）。
     pub dir: Option<String>,
+}
+
+impl PromptsConfig {
+    /// 解析后的覆盖目录；未配置或空白 → `None`（回落 `{home}/prompts`）。
+    pub fn resolved_dir(&self, home_root: &Path) -> Option<PathBuf> {
+        let raw = self.dir.as_deref()?.trim();
+        if raw.is_empty() {
+            return None;
+        }
+        Some(resolve_config_path(raw, home_root))
+    }
 }
 
 /// 完整配置。
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
-#[serde(default)]
+#[serde(default, deny_unknown_fields)]
 pub struct Config {
     pub server: ServerConfig,
     pub pipeline: PipelineOverrides,
@@ -227,8 +324,27 @@ pub struct Config {
 
 impl Config {
     /// 从 TOML 文本解析。
+    ///
+    /// 未知键由 `deny_unknown_fields` 直接拒绝（沿用既有 fail fast 姿态，决策 47 /
+    /// 103 / 134）；解析后做**跨字段冲突校验**（如 `format` 与已废弃的 `json_file`
+    /// 同时出现），不静默取其一。
     pub fn from_toml(text: &str) -> Result<Self> {
-        toml::from_str(text).map_err(|e| Error::Config(format!("config.toml 解析失败：{e}")))
+        let cfg: Config = toml::from_str(text)
+            .map_err(|e| Error::Config(format!("config.toml 解析失败：{e}")))?;
+        cfg.validate()?;
+        Ok(cfg)
+    }
+
+    /// 跨字段一致性校验（决策 47 / 103 / 134 的 fail fast 姿态）。
+    pub fn validate(&self) -> Result<()> {
+        if self.logging.format.is_some() && self.logging.json_file.is_some() {
+            return Err(Error::Config(
+                "[logging] 的 `format` 与已废弃的 `json_file` 不能同时配置；\
+                 请只保留 `format`（json_file 仅为旧配置兼容）"
+                    .into(),
+            ));
+        }
+        Ok(())
     }
 
     /// 从文件加载；文件不存在时用默认配置（首次启动）。
@@ -462,6 +578,126 @@ mod tests {
         // 其余保持默认
         assert_eq!(s.validate_retry_max, 3);
         assert_eq!(s.test_command_timeout_sec, 600);
+    }
+
+    // ── 票 16：`[logging]` 键名与文档一致（format / file）──
+
+    #[test]
+    fn logging_keys_match_docs_format_and_file() {
+        let cfg = Config::from_toml(
+            r#"
+            [logging]
+            level = "debug"
+            format = "json"
+            file = "logs/agentpipeline.log"
+            "#,
+        )
+        .unwrap();
+        assert_eq!(cfg.logging.level, "debug");
+        assert_eq!(cfg.logging.format, Some(LogFormat::Json));
+        assert_eq!(cfg.logging.file.as_deref(), Some("logs/agentpipeline.log"));
+        assert_eq!(cfg.logging.effective_format(), LogFormat::Json);
+    }
+
+    #[test]
+    fn logging_defaults_to_pretty_without_file() {
+        let cfg = Config::from_toml("[logging]\nlevel = \"warn\"\n").unwrap();
+        assert_eq!(cfg.logging.effective_format(), LogFormat::Pretty);
+        assert!(cfg
+            .logging
+            .resolved_file(Path::new("/home/u/.agentpipeline"))
+            .is_none());
+        // 缺省不再默认 json（旧结构体 json_file = true 的语义不再无条件继承）
+        assert_eq!(LoggingConfig::default().level, "info");
+    }
+
+    #[test]
+    fn logging_unknown_key_is_rejected_not_silently_ignored() {
+        // 姿态明确：未知键 fail fast（沿用决策 47 / 103 / 134）
+        let err = Config::from_toml("[logging]\nlevel = \"info\"\nbogus = 1\n").unwrap_err();
+        assert!(matches!(err, Error::Config(_)), "{err}");
+        let err = Config::from_toml("[logging]\njson_fil = true\n").unwrap_err();
+        assert!(err.to_string().contains("解析失败"), "{err}");
+    }
+
+    #[test]
+    fn logging_deprecated_json_file_still_parses_and_maps_to_json() {
+        // 旧键兼容：json_file = true ≡ format = "json"（废弃但可读）
+        let cfg = Config::from_toml("[logging]\njson_file = true\n").unwrap();
+        assert_eq!(cfg.logging.effective_format(), LogFormat::Json);
+        let cfg = Config::from_toml("[logging]\njson_file = false\n").unwrap();
+        assert_eq!(cfg.logging.effective_format(), LogFormat::Pretty);
+    }
+
+    #[test]
+    fn logging_format_and_deprecated_json_file_conflict_fails_fast() {
+        let err =
+            Config::from_toml("[logging]\nformat = \"compact\"\njson_file = true\n").unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("json_file"), "{msg}");
+        assert!(msg.contains("不能同时配置"), "{msg}");
+    }
+
+    #[test]
+    fn logging_file_path_resolution_expands_tilde_and_relative() {
+        let home = Path::new("/home/u/.agentpipeline");
+
+        let cfg = Config::from_toml("[logging]\nfile = \"/var/log/ap.log\"\n").unwrap();
+        assert_eq!(
+            cfg.logging.resolved_file(home).unwrap(),
+            PathBuf::from("/var/log/ap.log")
+        );
+
+        // 相对路径按 home 根解析
+        let cfg = Config::from_toml("[logging]\nfile = \"logs/ap.log\"\n").unwrap();
+        assert_eq!(
+            cfg.logging.resolved_file(home).unwrap(),
+            home.join("logs/ap.log")
+        );
+
+        // 空白 = 不落文件
+        let cfg = Config::from_toml("[logging]\nfile = \"   \"\n").unwrap();
+        assert!(cfg.logging.resolved_file(home).is_none());
+    }
+
+    #[test]
+    fn prompts_dir_resolution_matches_home_semantics() {
+        let home = Path::new("/home/u/.agentpipeline");
+
+        let cfg = Config::from_toml("[prompts]\ndir = \"/custom/prompts\"\n").unwrap();
+        assert_eq!(
+            cfg.prompts.resolved_dir(home).unwrap(),
+            PathBuf::from("/custom/prompts")
+        );
+
+        let cfg = Config::from_toml("[prompts]\ndir = \"my-prompts\"\n").unwrap();
+        assert_eq!(
+            cfg.prompts.resolved_dir(home).unwrap(),
+            home.join("my-prompts")
+        );
+
+        // 未配置 / 空白 → None（Home 回落 {home}/prompts）
+        assert!(Config::from_toml("")
+            .unwrap()
+            .prompts
+            .resolved_dir(home)
+            .is_none());
+        let cfg = Config::from_toml("[prompts]\ndir = \"  \"\n").unwrap();
+        assert!(cfg.prompts.resolved_dir(home).is_none());
+    }
+
+    #[test]
+    fn prompts_unknown_key_is_rejected() {
+        let err = Config::from_toml("[prompts]\ndir = \"x\"\nnope = 1\n").unwrap_err();
+        assert!(matches!(err, Error::Config(_)), "{err}");
+    }
+
+    #[test]
+    fn unknown_top_level_and_section_keys_are_rejected() {
+        // 未知 section 与未知 pipeline 键都不静默忽略
+        assert!(Config::from_toml("[mystery]\nx = 1\n").is_err());
+        assert!(Config::from_toml("[pipeline]\nnot_a_key = 1\n").is_err());
+        assert!(Config::from_toml("[server]\nport = 1\nbogus = true\n").is_err());
     }
 
     #[test]

@@ -25,6 +25,9 @@ pub fn agentpipeline_home() -> PathBuf {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Home {
     root: PathBuf,
+    /// `[prompts] dir` 的解析结果（§10.6.5、票 16）：`Some` 时覆盖默认
+    /// `{root}/prompts`，供 executor 的 persona 覆盖查找使用；`None` 回落默认。
+    prompts_override: Option<PathBuf>,
 }
 
 impl Home {
@@ -34,7 +37,18 @@ impl Home {
     }
 
     pub fn new(root: impl Into<PathBuf>) -> Self {
-        Home { root: root.into() }
+        Home {
+            root: root.into(),
+            prompts_override: None,
+        }
+    }
+
+    /// 设置 `[prompts] dir` 覆盖（已解析为绝对路径；`None` 回落默认目录）。
+    ///
+    /// 链式构造：`Home::from_env().with_prompts_dir(cfg.prompts.dir.as_deref())`。
+    pub fn with_prompts_dir(mut self, dir: Option<impl Into<PathBuf>>) -> Self {
+        self.prompts_override = dir.map(Into::into);
+        self
     }
 
     pub fn root(&self) -> &Path {
@@ -59,8 +73,14 @@ impl Home {
     }
 
     /// 用户可覆盖的 prompt 模板目录（决策 7）。
+    ///
+    /// 票 16：`[prompts] dir` 设置时返回该覆盖目录（`prompts_root` 兜底默认），
+    /// 否则回落 `{root}/prompts`。
     pub fn prompts_dir(&self) -> PathBuf {
-        self.root.join("prompts")
+        crate::agent::prompts::prompts_root(
+            &self.root.join("prompts"),
+            self.prompts_override.as_deref(),
+        )
     }
 
     pub fn tasks_dir(&self) -> PathBuf {
@@ -218,6 +238,23 @@ mod tests {
         assert!(home.prompts_dir().is_dir());
         assert!(home.tasks_dir().is_dir());
         assert!(home.worktrees_dir().is_dir());
+    }
+
+    #[test]
+    fn prompts_dir_falls_back_to_home_prompts() {
+        let home = Home::new("/tmp/xyz-home");
+        assert_eq!(home.prompts_dir(), PathBuf::from("/tmp/xyz-home/prompts"));
+    }
+
+    #[test]
+    fn prompts_dir_override_wins_over_default() {
+        // 票 16：`[prompts] dir` 覆盖后，executor 经 home.prompts_dir() 读覆盖目录
+        let home = Home::new("/tmp/xyz-home").with_prompts_dir(Some("/custom/prompts"));
+        assert_eq!(home.prompts_dir(), PathBuf::from("/custom/prompts"));
+
+        // None 回落默认
+        let home = Home::new("/tmp/xyz-home").with_prompts_dir(None::<PathBuf>);
+        assert_eq!(home.prompts_dir(), PathBuf::from("/tmp/xyz-home/prompts"));
     }
 
     #[cfg(unix)]

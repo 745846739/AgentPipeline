@@ -318,6 +318,39 @@ mod tests {
     }
 
     #[test]
+    fn prompts_root_prefers_config_dir_and_falls_back_to_home() {
+        // 票 16：`[prompts] dir` 覆盖目录优先；未配置回落 {home}/prompts
+        let home_prompts = Path::new("/home/u/.agentpipeline/prompts");
+        assert_eq!(
+            prompts_root(home_prompts, Some(Path::new("/custom/prompts"))),
+            PathBuf::from("/custom/prompts")
+        );
+        assert_eq!(prompts_root(home_prompts, None), home_prompts);
+    }
+
+    #[test]
+    fn overridden_prompts_root_is_what_resolve_persona_reads() {
+        // 覆盖目录中存在 persona 时，resolve_persona 必须读到它而不是内嵌默认
+        let home = tempfile::tempdir().unwrap();
+        let custom = tempfile::tempdir().unwrap();
+        let dir = custom.path().join("develop");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("execute.md"), "自定义目录 persona").unwrap();
+
+        let root = prompts_root(&home.path().join("prompts"), Some(custom.path()));
+        let got = resolve_persona(&root, Stage::Develop, Node::Execute, "内嵌 persona");
+        assert!(got.from_override);
+        assert_eq!(got.content, "自定义目录 persona");
+
+        // 覆盖目录里没有该文件 → 回落内嵌默认（不因目录缺失而报错）
+        let empty = tempfile::tempdir().unwrap();
+        let root = prompts_root(&home.path().join("prompts"), Some(empty.path()));
+        let got = resolve_persona(&root, Stage::Develop, Node::Execute, "内嵌 persona");
+        assert!(!got.from_override);
+        assert_eq!(got.content, "内嵌 persona");
+    }
+
+    #[test]
     fn embedded_persona_used_when_no_override() {
         let tmp = tempfile::tempdir().unwrap();
         let got = resolve_persona(tmp.path(), Stage::Develop, Node::Execute, "内嵌 persona");
