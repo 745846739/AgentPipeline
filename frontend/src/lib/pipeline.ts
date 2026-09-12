@@ -249,19 +249,19 @@ const SPINE_GEOM: Record<string, Geometry> = {
 };
 
 /**
- * hero 坐标：详情内容区最宽 1040px，主站均匀分布，并行区间双侧站共用 x。
- * y 仅用于侧站上下分行（主站恒 62，由 .stn 的 top:29px 决定）。
+ * hero 坐标：详情内容区 max-width 960（--detail-max）含 20px 内边距 → 可用 920px。
+ * 末站 done=895 使标签（约 28px 宽）止于 ~909，不出容器；并行双侧站共用 x。
  */
 const HERO_GEOM: Record<string, Geometry> = {
-  init: { x: 60, y: 62 },
-  'architect-design': { x: 165, y: 62 },
-  'develop-design': { x: 365, y: 22 },
-  'test-design': { x: 365, y: 50 },
-  develop: { x: 565, y: 62 },
-  review: { x: 690, y: 62 },
-  test: { x: 815, y: 62 },
-  merge: { x: 940, y: 62 },
-  done: { x: 1030, y: 62 },
+  init: { x: 50, y: 62 },
+  'architect-design': { x: 145, y: 62 },
+  'develop-design': { x: 320, y: 22 },
+  'test-design': { x: 320, y: 50 },
+  develop: { x: 500, y: 62 },
+  review: { x: 610, y: 62 },
+  test: { x: 715, y: 62 },
+  merge: { x: 820, y: 62 },
+  done: { x: 895, y: 62 },
 };
 
 export const RAIL_LABELS: Record<string, string> = {

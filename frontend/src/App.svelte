@@ -1,6 +1,7 @@
 <script lang="ts">
   import { onDestroy, onMount } from 'svelte';
   import TopBar from './components/layout/TopBar.svelte';
+  import StatusLine from './components/layout/StatusLine.svelte';
   import ToastStack from './components/layout/ToastStack.svelte';
   import Board from './routes/Board.svelte';
   import Metrics from './routes/Metrics.svelte';
@@ -42,6 +43,7 @@
 {/if}
 
 <ToastStack />
+<StatusLine />
 
 <style>
   .notfound {

@@ -1,6 +1,6 @@
 <script lang="ts">
   import type { MiniDotState, StationView } from '../../lib/pipeline';
-  import { railTokens, tokenLitsSegment } from '../../lib/pipeline';
+  import { RAIL_LABELS, railTokens, tokenLitsSegment } from '../../lib/pipeline';
 
   /**
    * 字符轨道（theme-3 §3 共享元素映射）：结构靠字符与亮度，不靠盒子与 SVG。
@@ -89,6 +89,55 @@
         return 'idle';
     }
   }
+
+  /** 并行分支的纵向状态字符（✓ 完成 / ◆ 当前 / ⏸ 等待 / ✗ 失败 / ○ 未开始）。 */
+  function vMark(state: string): string {
+    switch (state) {
+      case 'done':
+        return '✓';
+      case 'go':
+      case 'dev':
+      case 'test':
+        return '◆';
+      case 'warn':
+        return '⏸';
+      case 'stop':
+        return '✗';
+      default:
+        return '○';
+    }
+  }
+
+  /**
+   * 纵向 8 行（theme-3 §8 / 原型）：desktop 的 9 站里并行双站合并为一行
+   * `develop-design ∥ test-design`，分支状态收进 vsub（`[dev]✓ [tst]✓`）。
+   */
+  const vrailRows = $derived.by(() => {
+    const rows: {
+      key: string;
+      label: string;
+      state: string;
+      count?: number;
+      branches?: { kind: string; state: string }[];
+    }[] = [];
+    for (const s of stations) {
+      if (s.parallel) {
+        const prev = rows[rows.length - 1];
+        if (prev && prev.branches) {
+          prev.branches.push({ kind: s.parallel, state: s.state });
+          continue;
+        }
+      }
+      rows.push({
+        key: s.key,
+        label: s.parallel ? RAIL_LABELS['develop-design'] + ' ∥ ' + RAIL_LABELS['test-design'] : s.label,
+        state: s.state,
+        count: s.count,
+        branches: s.parallel ? [{ kind: s.parallel, state: s.state }] : undefined,
+      });
+    }
+    return rows;
+  });
 </script>
 
 {#if variant === 'mini'}
@@ -99,16 +148,21 @@
     {/each}
   </div>
 {:else if variant === 'vrail'}
-  <!-- 移动版纵向脊线（theme-3 §8）：站段三态 + [dev]/[tst] 文字标签 -->
+  <!-- 移动版纵向脊线（theme-3 §8）：8 站（并行双站合并为一行）+ 站段三态 -->
   <ul class="vrail" aria-label={ariaLabel}>
-    {#each stations as s (s.key)}
-      <li class="vst {vClass(s.state)}">
-        <span class="vmk">{glyph(s.state)}</span>
-        <span class="vname">{s.label}</span>
-        {#if s.parallel}
-          <span class="vsub"><b class="bl">[{s.parallel}]</b></span>
+    {#each vrailRows as row (row.key)}
+      <li class="vst {vClass(row.state)}">
+        <span class="vmk">{vMark(row.state)}</span>
+        <span class="vname">{row.label}</span>
+        {#if row.branches}
+          <span class="vsub"
+            >{#each row.branches as b, i (b.kind)}<b class="bl" style={i > 0 ? 'margin-left:7px' : ''}
+              >[{b.kind}]</b
+            >{vMark(b.state)}{/each}</span
+          >
+        {:else if row.count !== undefined}
+          <span class="vmeta">{row.count}</span>
         {/if}
-        {#if s.count !== undefined}<span class="vmeta">{s.count}</span>{/if}
       </li>
     {/each}
   </ul>
@@ -126,15 +180,15 @@
         <div class="ret" style="left:1452px;width:264px;top:76px"><i>↩</i></div>
         <div class="ret" style="left:924px;width:792px;top:100px"><i>↩</i></div>
       {:else}
-        <div class="ln" style="left:60px;width:970px;top:36px"></div>
-        <div class="ln br" style="left:165px;width:400px;top:22px"></div>
-        <div class="ln br" style="left:165px;width:400px;top:50px"></div>
-        <div class="ln vt" style="left:165px;top:22px"></div>
-        <div class="ln vt" style="left:565px;top:22px"></div>
-        <div class="ret" style="left:165px;width:200px;top:72px"><i>↩</i></div>
-        <div class="ret" style="left:565px;width:125px;top:84px"><i>↩</i></div>
-        <div class="ret" style="left:815px;width:125px;top:72px"><i>↩</i></div>
-        <div class="ret" style="left:565px;width:375px;top:96px"><i>↩</i></div>
+        <div class="ln" style="left:50px;width:845px;top:36px"></div>
+        <div class="ln br" style="left:145px;width:355px;top:22px"></div>
+        <div class="ln br" style="left:145px;width:355px;top:50px"></div>
+        <div class="ln vt" style="left:145px;top:22px"></div>
+        <div class="ln vt" style="left:500px;top:22px"></div>
+        <div class="ret" style="left:145px;width:165px;top:72px"><i>↩</i></div>
+        <div class="ret" style="left:500px;width:110px;top:84px"><i>↩</i></div>
+        <div class="ret" style="left:715px;width:105px;top:72px"><i>↩</i></div>
+        <div class="ret" style="left:500px;width:320px;top:96px"><i>↩</i></div>
       {/if}
 
       {#each stations as s (s.key)}
@@ -258,7 +312,7 @@
   }
   .rail.hero {
     width: 100%;
-    max-width: 1040px;
+    max-width: var(--detail-max);
     height: 106px;
     padding: 14px 0 0;
   }

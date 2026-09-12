@@ -57,7 +57,6 @@
   --spin-lit: #3f6a4e;
   --spin-pen: #a8762a;
   --safeb: env(safe-area-inset-bottom, 0px);
-  --frame: 430px;
 
   /* §2.2 字体：全站唯一字体 Fira Code，连字关闭 */
   --font-code: 'Fira Code', 'SF Mono', Menlo, 'PingFang SC', 'Hiragino Sans GB', 'Noto Sans SC',
@@ -70,21 +69,7 @@
   --r-panel: 0;
   --r-pill: 0;
   --rail-col-width: 264px;
-  --rail-col-gap: 0px;
   --detail-max: 960px;
-
-  /* 迁移期惰性别名（夜间调度台 → 终端） */
-  --ink-900: var(--bg);
-  --ink-800: var(--panel);
-  --ink-700: var(--wash);
-  --line: var(--pane);
-  --line-soft: var(--hairline);
-  --signal-go: var(--go);
-  --signal-caution: var(--pending);
-  --signal-stop: var(--stop);
-  --signal-done: var(--done);
-  --branch-dev: var(--text);
-  --branch-test: var(--text-3);
 }
 
 /* §2.5 浅色变体「绿杠电报纸」：层级靠墨度，不靠亮度 */
@@ -504,39 +489,14 @@ textarea.input {
     font-size: 11px;
   }
 
-  /* 常驻底栏（载波行）：安全区内边距 */
-  .carrier {
-    position: fixed;
-    left: 0;
-    right: 0;
-    bottom: 0;
-    z-index: 30;
-    display: flex;
-    align-items: center;
-    gap: 14px;
-    height: calc(34px + var(--safeb));
-    padding: 0 12px var(--safeb);
-    background: var(--bar-band);
-    border-top: 1px solid var(--pane);
-    font-size: 12px;
-    color: var(--text-3);
-  }
-  .carrier .pen {
-    color: var(--pending);
-  }
-  .carrier .right {
-    margin-left: auto;
-    color: var(--text-2);
-  }
-
-  /* pending 常驻底部动作坞 */
+  /* pending 常驻底部动作坞（浅色款同底栏走 --bar-band，theme-3 §2.5） */
   .dock {
     position: fixed;
     left: 0;
     right: 0;
     bottom: 0;
     z-index: 31;
-    background: var(--bg);
+    background: var(--bar-band);
     border-top: 1px solid var(--pending);
     padding: 8px 12px calc(9px + var(--safeb));
   }

@@ -15,16 +15,25 @@
   const isPending = $derived(cursor.status === 'pending');
 
   const statusText = $derived.by(() => {
-    if (isPending) {
-      const t = cursor.pending_reason?.type;
-      if (t === 'merge_approval') return '⏸ 等待审批';
-      if (t === 'human_review') return '⏸ 等待评审';
-      return '⏸ 等待决定';
-    }
+    if (isPending) return '[WAIT]';
+    if (cursor.status === 'active') return '[RUN]';
     if (cursor.status === 'waiting_join') return '等待汇合';
     if (cursor.status === 'archived') return '已归档';
+    return cursor.status;
+  });
+
+  /** 悬停说明（文字标记之外的可读语义，不占视觉层级）。 */
+  const statusHint = $derived.by(() => {
+    if (isPending) {
+      const t = cursor.pending_reason?.type;
+      if (t === 'merge_approval') return '等待审批';
+      if (t === 'human_review') return '等待评审';
+      return '等待决定';
+    }
+    if (cursor.status === 'waiting_join') return '等待并行分支汇合';
+    if (cursor.status === 'archived') return '游标已归档';
     if (cursor.status === 'active') {
-      return cursor.node === 'execute' ? '● 执行中' : '● 可继续';
+      return cursor.node === 'execute' ? '执行中' : '可继续';
     }
     return cursor.status;
   });
@@ -45,7 +54,7 @@
   type="button"
   class="pill {isPending ? 'pend' : ''} {selected ? 'selected' : ''}"
   onclick={handle}
-  title="cursor_id: {cursor.cursor_id}"
+  title="cursor_id: {cursor.cursor_id} · {statusHint}"
 >
   <b class="bl">[{kind === 'main' ? 'main' : kind}]</b>
   <span class="mono">{cursor.branch} · {cursor.node}</span>
