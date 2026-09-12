@@ -69,6 +69,25 @@ async fn e2e_21_info_insufficient_requires_input_then_reruns_validate_input() {
     f.agent.set_script(rerun);
     f.executor.run("t21").await.unwrap();
 
+    // 决策 79 / 票 08：补充输入注入 validate_input 重入的 user prompt（不只落流转原因）。
+    let vi_prompts: Vec<String> = f
+        .requests_for(Stage::ArchitectDesign, Node::ValidateInput)
+        .into_iter()
+        .map(|r| r.user_prompt)
+        .collect();
+    assert!(
+        !vi_prompts[0].contains("用户补充输入"),
+        "首轮（无补充输入）不渲染该段：{}",
+        vi_prompts[0]
+    );
+    assert!(
+        vi_prompts
+            .iter()
+            .skip(1)
+            .any(|p| p.contains("用户补充输入") && p.contains(input)),
+        "重入 prompt 应含补充输入：{vi_prompts:?}"
+    );
+
     assert!(
         f.agent
             .calls_for(Stage::ArchitectDesign, Node::ValidateInput)

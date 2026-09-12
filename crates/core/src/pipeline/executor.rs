@@ -1018,8 +1018,10 @@ impl Executor {
                 cursor.stage,
                 cursor.node,
             ),
+            user_input: user_input_segment(&home, &task.id, cursor.stage, cursor.node),
             gate_recheck: self.gate_recheck_segment(task, cursor).await?,
-            ..Default::default()
+            review_required_changes: self.review_required_changes_segment(task, cursor).await?,
+            retry_feedback: retry_feedback_segment(&home, &task.id, cursor.stage, cursor.node),
         };
         let user_prompt = build_user_prompt(
             &format!(
@@ -1609,6 +1611,56 @@ impl Executor {
             return Ok(None);
         }
         out.push_str("\n请基于以上闸门输出，为每个失败用例重新标注 failure_cause（test_issue / code_issue）。");
+        Ok(Some(out))
+    }
+
+    /// 决策 133 / pipeline-spec §6：review 打回循环中，develop.execute 重入的 user prompt
+    /// 追加 review 的必须修改项。
+    ///
+    /// 只在 `(Develop, Execute)` 渲染；修改项取自评审产出（review 报告 metadata），
+    /// 不重新推断。首轮进入 develop 时尚无评审产出 → 不渲染；评审不通过但
+    /// `required_changes` 为空 → 显式降级为「本次无结构化修改项」，不静默留空段。
+    async fn review_required_changes_segment(
+        &self,
+        task: &Task,
+        cursor: &NodeCursor,
+    ) -> Result<Option<String>> {
+        if cursor.stage != Stage::Develop || cursor.node != Node::Execute {
+            return Ok(None);
+        }
+        let Some(meta) = self
+            .store
+            .stage_output_metadata(&task.id, Stage::Review, OUTPUT_REVIEW_REPORT)
+            .await?
+        else {
+            return Ok(None); // 首轮：review 尚未执行
+        };
+        let Ok(review) = serde_json::from_value::<crate::types::ReviewResult>(meta) else {
+            return Ok(None);
+        };
+        // 评审通过 → 不是打回，不渲染该段
+        if review.approved {
+            return Ok(None);
+        }
+        let source = review
+            .review_report_path
+            .as_deref()
+            .unwrap_or("review-report.md");
+        let mut out = format!("来源：评审报告 `{source}`（review 判定不通过）\n");
+        if review.required_changes.is_empty() {
+            // 显式降级：不让 agent 误以为「没有要求」
+            out.push_str("本次无结构化修改项——请阅读上述评审报告，按其文字结论修改。\n");
+        } else {
+            out.push_str("本轮必须修改：\n");
+            for change in &review.required_changes {
+                let action = match change.action {
+                    crate::types::FileAction::Create => "新增",
+                    crate::types::FileAction::Modify => "修改",
+                    crate::types::FileAction::Delete => "删除",
+                };
+                out.push_str(&format!("- {action} `{}`\n", change.path));
+            }
+        }
         Ok(Some(out))
     }
 
@@ -2746,6 +2798,30 @@ fn backtrack_feedback_segment(
         return None;
     }
     std::fs::read_to_string(home.task_file(task_id, "backtrack-feedback.md"))
+        .ok()
+        .filter(|s| !s.trim().is_empty())
+}
+
+/// decision 79 / 票 08：`info_insufficient` 的补充输入注入 validate_input 重入 prompt。
+///
+/// 补充输入在 resume 时落任务目录 `user-input.md`，重入 architect-design
+/// validate_input / execute 时注入；首轮无该文件 → 不渲染。
+fn user_input_segment(home: &Home, task_id: &str, stage: Stage, node: Node) -> Option<String> {
+    if stage != Stage::ArchitectDesign || !matches!(node, Node::ValidateInput | Node::Execute) {
+        return None;
+    }
+    std::fs::read_to_string(home.task_file(task_id, "user-input.md"))
+        .ok()
+        .filter(|s| !s.trim().is_empty())
+}
+
+/// decision 138 / 票 08：develop / test 的 `retry_exhausted` 回架构设计时，系统把重试历史
+/// 摘要写入任务目录 `retry-feedback.md`；architect-design 重入时注入（首轮为空不渲染）。
+fn retry_feedback_segment(home: &Home, task_id: &str, stage: Stage, node: Node) -> Option<String> {
+    if stage != Stage::ArchitectDesign || !matches!(node, Node::ValidateInput | Node::Execute) {
+        return None;
+    }
+    std::fs::read_to_string(home.task_file(task_id, "retry-feedback.md"))
         .ok()
         .filter(|s| !s.trim().is_empty())
 }

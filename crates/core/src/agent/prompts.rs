@@ -156,7 +156,7 @@ pub fn render_template(template: &str, vars: &TemplateVars) -> String {
         .replace("{unit_test_files}", &vars.unit_test_files)
 }
 
-/// user prompt 的可选追加段（决策 109 / 126 / 138）。
+/// user prompt 的可选追加段（决策 79 / 109 / 126 / 133 / 138）。
 ///
 /// 约定：**首轮为空不渲染**——空段不产生额外的标题与空行。
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -165,6 +165,10 @@ pub struct PromptSegments {
     pub gate_recheck: Option<String>,
     /// sync-check backtrack 的双方 blockers（决策 126）。
     pub backtrack_feedback: Option<String>,
+    /// `info_insufficient` 的用户补充输入（决策 79）。
+    pub user_input: Option<String>,
+    /// review 打回后 develop 重入必须修改项（决策 133）。
+    pub review_required_changes: Option<String>,
     /// develop / test 重试耗尽的失败摘要（决策 138）。
     pub retry_feedback: Option<String>,
 }
@@ -178,6 +182,11 @@ pub fn build_user_prompt(main: &str, segments: &PromptSegments) -> String {
             segments.gate_recheck.as_deref(),
         ),
         ("## 上游回溯反馈", segments.backtrack_feedback.as_deref()),
+        ("## 用户补充输入", segments.user_input.as_deref()),
+        (
+            "## 评审必须修改项",
+            segments.review_required_changes.as_deref(),
+        ),
         ("## 重试历史摘要", segments.retry_feedback.as_deref()),
     ] {
         if let Some(body) = body {
@@ -482,6 +491,7 @@ mod tests {
             gate_recheck: Some("   ".into()),
             backtrack_feedback: None,
             retry_feedback: Some(String::new()),
+            ..Default::default()
         };
         let out = build_user_prompt("主 prompt", &seg);
         assert_eq!(out, "主 prompt");
@@ -492,13 +502,39 @@ mod tests {
         let seg = PromptSegments {
             gate_recheck: Some("A".into()),
             backtrack_feedback: Some("B".into()),
+            review_required_changes: Some("D".into()),
+            user_input: Some("E".into()),
             retry_feedback: Some("C".into()),
         };
         let out = build_user_prompt("主", &seg);
         let a = out.find("## 合入闸门失败复检上下文").unwrap();
         let b = out.find("## 上游回溯反馈").unwrap();
+        let e = out.find("## 用户补充输入").unwrap();
+        let d = out.find("## 评审必须修改项").unwrap();
         let c = out.find("## 重试历史摘要").unwrap();
-        assert!(a < b && b < c);
+        assert!(a < b && b < e && e < d && d < c);
+    }
+
+    #[test]
+    fn review_required_changes_segment_rendered() {
+        let seg = PromptSegments {
+            review_required_changes: Some("修改 `src/lib.rs`".into()),
+            ..Default::default()
+        };
+        let out = build_user_prompt("主 prompt", &seg);
+        assert!(out.contains("## 评审必须修改项"));
+        assert!(out.contains("src/lib.rs"));
+    }
+
+    #[test]
+    fn user_input_segment_rendered() {
+        let seg = PromptSegments {
+            user_input: Some("部署环境是生产 k8s".into()),
+            ..Default::default()
+        };
+        let out = build_user_prompt("主 prompt", &seg);
+        assert!(out.contains("## 用户补充输入"));
+        assert!(out.contains("生产 k8s"));
     }
 
     // ── prompt_template_hash（决策 137）──

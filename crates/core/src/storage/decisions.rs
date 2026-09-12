@@ -250,6 +250,22 @@ impl Store {
                 } else if is_dependency_failed {
                     self.set_task_status(&cursor.task_id, crate::types::TaskStatus::Queued)
                         .await?;
+                } else if cursor
+                    .pending_reason
+                    .as_ref()
+                    .map(|r| r.kind == PendingKind::InfoInsufficient)
+                    .unwrap_or(false)
+                {
+                    // 决策 79 / 票 08：info_insufficient 的补充输入不只是流转原因——
+                    // 落任务目录 `user-input.md`，architect-design 重入时注入 prompt。
+                    // 空输入不落文件（重入 prompt 该段不渲染）。
+                    if let Some(input) = input.map(str::trim).filter(|s| !s.is_empty()) {
+                        self.home().ensure_task_dirs(&cursor.task_id)?;
+                        std::fs::write(
+                            self.home().task_file(&cursor.task_id, "user-input.md"),
+                            format!("# 用户补充输入\n\n{input}\n"),
+                        )?;
+                    }
                 }
             }
             ResumeAction::Skip => {
@@ -305,6 +321,19 @@ impl Store {
                             "goto 落点必须是 {stage} 的入口节点 {expected}（决策 69）"
                         )));
                     }
+                    // 决策 138：develop / test 的 retry_exhausted 走「带失败摘要回架构设计修订」时，
+                    // 先把重试历史摘要落任务目录 `retry-feedback.md`。**先写文件再动游标**：
+                    // 写失败即中止，不出现「游标已回架构但摘要缺失」的半截状态。
+                    if stage == Stage::ArchitectDesign
+                        && matches!(cursor.stage, Stage::Develop | Stage::Test)
+                        && cursor
+                            .pending_reason
+                            .as_ref()
+                            .map(|r| r.kind == PendingKind::RetryExhausted)
+                            .unwrap_or(false)
+                    {
+                        self.write_retry_feedback(cursor).await?;
+                    }
                     self.clear_cursor_pending(&cursor.cursor_id).await?;
                     self.set_cursor_stage(&cursor.cursor_id, stage, node)
                         .await?;
@@ -325,6 +354,83 @@ impl Store {
         .await?;
         self.sync_task_projection(&cursor.task_id).await?;
         Ok(())
+    }
+
+    /// decision 138 / 票 08：把重试历史摘要写入任务目录 `retry-feedback.md`。
+    ///
+    /// 内容 = 该阶段各次 attempt 的 run 结果（失败原因）+ 最近一次 validate_output
+    /// 的 blockers。与 `backtrack-feedback.md` 同构，由 architect-design 重入时注入 prompt。
+    async fn write_retry_feedback(&self, cursor: &NodeCursor) -> Result<()> {
+        let stage = cursor.stage;
+        let mut out = format!("# 重试历史摘要（{stage} 重试耗尽）\n\n");
+        out.push_str("## 各次 attempt 的失败原因\n");
+        let runs = self
+            .list_runs_at(&cursor.task_id, stage, Node::Execute)
+            .await?;
+        if runs.is_empty() {
+            out.push_str("（无 run 记录）\n");
+        } else {
+            for run in &runs {
+                let outcome = match run.status {
+                    crate::types::NodeStatus::Failed => run
+                        .error
+                        .clone()
+                        .map(|e| format!("失败：{e}"))
+                        .unwrap_or_else(|| "失败".into()),
+                    crate::types::NodeStatus::Success => "成功".into(),
+                    crate::types::NodeStatus::Timeout => "超时".into(),
+                    crate::types::NodeStatus::Running => "未完成".into(),
+                };
+                out.push_str(&format!(
+                    "- attempt {}：{outcome}（{}ms）\n",
+                    run.attempt, run.duration_ms
+                ));
+            }
+        }
+        out.push_str("\n## 最近一次产出校验的 blockers\n");
+        let blockers = self
+            .last_validate_output_blockers(&cursor.task_id, stage)
+            .await?;
+        if blockers.is_empty() {
+            out.push_str("（无结构化 blockers）\n");
+        } else {
+            for b in blockers {
+                out.push_str(&format!("- {b}\n"));
+            }
+        }
+        self.home().ensure_task_dirs(&cursor.task_id)?;
+        std::fs::write(
+            self.home().task_file(&cursor.task_id, "retry-feedback.md"),
+            out,
+        )?;
+        Ok(())
+    }
+
+    /// 最近一条 `validate_output` 产出的 blockers（无则空）。
+    async fn last_validate_output_blockers(
+        &self,
+        task_id: &str,
+        stage: Stage,
+    ) -> Result<Vec<String>> {
+        let raw: Option<String> = sqlx::query_scalar(
+            "SELECT metadata_json FROM kanban_stage_outputs
+             WHERE task_id = ? AND stage = ? AND output_type LIKE '%validate%'
+             ORDER BY id DESC LIMIT 1",
+        )
+        .bind(task_id)
+        .bind(stage.as_str())
+        .fetch_optional(self.pool())
+        .await?;
+        Ok(raw
+            .and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok())
+            .and_then(|v| {
+                v.get("blockers").and_then(|b| b.as_array()).map(|arr| {
+                    arr.iter()
+                        .filter_map(|x| x.as_str().map(str::to_string))
+                        .collect()
+                })
+            })
+            .unwrap_or_default())
     }
 
     /// 距上次用户 resume 的秒数（`pending_resume_cooldown_sec` 防连点，§3）。

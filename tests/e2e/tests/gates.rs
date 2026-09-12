@@ -11,7 +11,7 @@ use agentpipeline_core::types::{
     Approval, FailureCause, Gate, GateFailureKind, Node, PendingKind, Stage, TaskStatus,
     TestFailure, TestResult, TransitionTrigger,
 };
-use common::{full_pass_script, Flow};
+use common::{design_ok, full_pass_script, Flow};
 use testkit::Script;
 
 /// 有状态闸门脚本：第 `fail_on` 次调用退出 1（含匹配输出），其余退出 0。
@@ -281,6 +281,95 @@ async fn e2e_06b_gate_failure_code_issue_pends_for_user_then_goto_develop() {
     assert_eq!(
         after.validate_attempts, 0,
         "跨阶段跳转 attempts 归零（决策 43）"
+    );
+}
+
+// ─────────────────────────── 票 08：retry_exhausted 回架构设计 ───────────────────────────
+
+/// decision 138 / 票 08：develop 的 `retry_exhausted` 选「带失败摘要回架构设计修订」时，
+/// 系统把重试历史写任务目录 `retry-feedback.md`，architect 重入的 prompt 注入该内容。
+#[tokio::test]
+async fn retry_exhausted_to_architect_writes_retry_feedback_and_injects_on_reentry() {
+    let f = Flow::new().await;
+    // 设计通过；develop.execute 脚本耗尽 → agent_retry_max 次重试全无元数据 → pending(retry_exhausted)
+    let mut script = Script::new();
+    design_ok(&mut script);
+    f.agent.set_script(script);
+    testkit::seed_task(&f.store, "t8r", "p1").await.unwrap();
+    f.admit("t8r").await;
+    f.executor.run("t8r").await.unwrap();
+
+    let cursor = f.sole_cursor("t8r").await;
+    assert_eq!((cursor.stage, cursor.node), (Stage::Develop, Node::Execute));
+    assert_eq!(
+        cursor.pending_reason.as_ref().unwrap().kind,
+        PendingKind::RetryExhausted
+    );
+    // 动作集含「带失败摘要回架构设计修订」（决策 138）
+    let actions = f.store.allowed_actions_for_task("t8r").await.unwrap();
+    let labels: Vec<&str> = actions.iter().map(|a| a.label.as_str()).collect();
+    assert!(
+        labels.contains(&"带失败摘要回架构设计修订"),
+        "动作集应含回架构设计修订：{labels:?}"
+    );
+
+    // 选该动作 → goto architect-design.validate_input
+    let goto = actions
+        .iter()
+        .find(|a| a.label == "带失败摘要回架构设计修订")
+        .unwrap();
+    let target = goto.target.as_ref().expect("goto 应带落点");
+    f.store
+        .apply_resume(
+            &cursor,
+            ResumeAction::Goto,
+            Some((target.stage, target.node)),
+            None,
+        )
+        .await
+        .unwrap();
+
+    // 决策 138：与游标置位同事务写入 retry-feedback.md（先写文件再动游标）
+    let feedback_path = f.home.home().task_file("t8r", "retry-feedback.md");
+    assert!(feedback_path.exists(), "retry-feedback.md 应已落盘");
+    let feedback = std::fs::read_to_string(&feedback_path).unwrap();
+    assert!(
+        feedback.contains("重试历史摘要") && feedback.contains("attempt"),
+        "摘要应含各次 attempt 记录：{feedback}"
+    );
+    let after = f.store.get_cursor(&cursor.cursor_id).await.unwrap();
+    assert_eq!(
+        (after.stage, after.node),
+        (Stage::ArchitectDesign, Node::ValidateInput)
+    );
+
+    // architect 重入：prompt 注入 retry-feedback（首轮不渲染，已在首轮断言隐含）
+    let mut reentry = Script::new();
+    reentry
+        .for_node(Stage::ArchitectDesign, Node::ValidateInput)
+        .submit(&agentpipeline_core::types::ValidateInputMetadata {
+            readiness: true,
+            blockers: vec![],
+        });
+    f.agent.set_script(reentry);
+    f.executor.run("t8r").await.unwrap();
+
+    let vi_prompts: Vec<String> = f
+        .requests_for(Stage::ArchitectDesign, Node::ValidateInput)
+        .into_iter()
+        .map(|r| r.user_prompt)
+        .collect();
+    assert!(
+        !vi_prompts[0].contains("重试历史摘要"),
+        "首轮（无 retry-feedback.md）不渲染该段：{}",
+        vi_prompts[0]
+    );
+    assert!(
+        vi_prompts
+            .iter()
+            .skip(vi_prompts.len() - 1)
+            .any(|p| p.contains("重试历史摘要")),
+        "重入 prompt 应注入重试历史摘要：{vi_prompts:?}"
     );
 }
 

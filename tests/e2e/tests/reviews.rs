@@ -154,6 +154,25 @@ async fn e2e_03_review_rejection_pends_then_goto_develop_and_re_review_passes() 
     f.agent.set_script(rework);
     f.executor.run("t3").await.unwrap();
 
+    // 决策 133 / 票 07：develop 重入的 user prompt 含本轮必须修改项；首轮不渲染该段。
+    let dev_prompts: Vec<String> = f
+        .requests_for(Stage::Develop, Node::Execute)
+        .into_iter()
+        .map(|r| r.user_prompt)
+        .collect();
+    assert!(
+        !dev_prompts[0].contains("评审必须修改项"),
+        "首轮 develop 不渲染必须修改项段（无上游打回）：{}",
+        dev_prompts[0]
+    );
+    assert!(
+        dev_prompts
+            .iter()
+            .skip(1)
+            .any(|p| p.contains("评审必须修改项") && p.contains("src/lib.rs")),
+        "review 打回后 develop 重入 prompt 应含必须修改项：{dev_prompts:?}"
+    );
+
     assert_eq!(
         f.store
             .list_runs_at("t3", Stage::Review, Node::ValidateOutput)
