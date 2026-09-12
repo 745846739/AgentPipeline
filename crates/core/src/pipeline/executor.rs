@@ -248,7 +248,25 @@ impl Executor {
         kind: PendingKind,
         message: impl Into<String>,
     ) -> Result<()> {
-        let reason = PendingReason::new(kind, cursor.stage, cursor.node, message);
+        self.pend_cursor_with_context(cursor, kind, message, None)
+            .await
+    }
+
+    /// 同上，但带 `context`（决策 130 ①）：`context.kind` 决定 `allowed_actions`
+    /// 走哪一行专用动作集，缺失则落到 `(user_decision, _)` 通用兜底行。
+    ///
+    /// review 打回（`review`）与 test 闸门 code_issue / 复检（`test_code_issue` /
+    /// `gate_recheck`）必须经此带上 kind，否则「打回开发修复」「修改测试用例」等
+    /// 权威表里写好的动作永远下发不出来（票 05）。
+    async fn pend_cursor_with_context(
+        &self,
+        cursor: &NodeCursor,
+        kind: PendingKind,
+        message: impl Into<String>,
+        context: Option<PendingContext>,
+    ) -> Result<()> {
+        let mut reason = PendingReason::new(kind, cursor.stage, cursor.node, message);
+        reason.context = context;
         self.store
             .set_cursor_pending(&cursor.cursor_id, &reason)
             .await?;
@@ -260,6 +278,44 @@ impl Executor {
             reason,
         });
         Ok(())
+    }
+
+    /// 路由产出 `Pending` 时，按「待办来源」补 `context.kind`（决策 130 ① / 票 05）。
+    ///
+    /// 只有两类待办需要补，其余返回 `None`（走通用兜底行，语义不变）：
+    /// - review 打回：`(Review, ValidateOutput)` 判不通过 → `review`；
+    /// - test 闸门：`(Test, ValidateOutput)` 存在 code_issue → `test_code_issue`；
+    ///   若本轮是 merge 测试闸门打回后的复检（`gate_recheck = true`）→ `gate_recheck`。
+    async fn pending_context_for(
+        &self,
+        task: &Task,
+        cursor: &NodeCursor,
+        kind: PendingKind,
+    ) -> Result<Option<PendingContext>> {
+        if kind != PendingKind::UserDecision {
+            return Ok(None);
+        }
+        match (cursor.stage, cursor.node) {
+            (Stage::Review, Node::ValidateOutput) => Ok(Some(PendingContext::with_kind(
+                crate::actions::kinds::REVIEW,
+            ))),
+            (Stage::Test, Node::ValidateOutput) => {
+                // 复检标记取自本轮 test 产出（executor 在 test.execute 落库时置位，决策 109）
+                let gate_recheck = self
+                    .store
+                    .stage_output_metadata(&task.id, Stage::Test, OUTPUT_TEST_REPORT)
+                    .await?
+                    .and_then(|m| m.get("gate_recheck").and_then(|v| v.as_bool()))
+                    .unwrap_or(false);
+                let kind = if gate_recheck {
+                    crate::actions::kinds::GATE_RECHECK
+                } else {
+                    crate::actions::kinds::TEST_CODE_ISSUE
+                };
+                Ok(Some(PendingContext::with_kind(kind)))
+            }
+            _ => Ok(None),
+        }
     }
 
     // ─────────────────────── 节点分发 ───────────────────────
@@ -1847,7 +1903,10 @@ impl Executor {
             }
             EdgeKind::Pending(kind) => {
                 let message = pending_message(kind);
-                self.pend_cursor(cursor, kind, message).await?;
+                // 决策 130 ① / 票 05：为两类待办补上 `context.kind`，让权威表的专用动作行生效。
+                let context = self.pending_context_for(task, cursor, kind).await?;
+                self.pend_cursor_with_context(cursor, kind, message, context)
+                    .await?;
             }
             EdgeKind::Next => {
                 // 阶段内推进（§1.2 图内边）：validate_input → execute → validate_output

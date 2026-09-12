@@ -144,6 +144,55 @@ async fn e2e_06a_merge_test_gate_failure_rechecks_via_test_then_passes() {
 
 // ─────────────────────────── E2E-06b ───────────────────────────
 
+/// 非闸门复检的直接路径：test.execute 首次即报 code_issue → `test_code_issue`。
+///
+/// 与 E2E-06b 区分：那条是 merge 测试闸门打回后的复检（kind = `gate_recheck`）；
+/// 本条不经 merge 闸门，是 test 阶段自身的代码问题（kind = `test_code_issue`）。
+#[tokio::test]
+async fn e2e_06b_direct_code_issue_pends_with_test_code_issue_kind() {
+    let f = Flow::new().await;
+    let mut script = Script::new();
+    // 全流程脚本，只在 test.execute 覆盖为失败（含 code_issue）
+    full_pass_script(&mut script, "t6c");
+    script
+        .for_node(Stage::Test, Node::Execute)
+        .write_file("test-report.md", "# 测试报告\n业务代码未实现\n")
+        .submit(&TestResult {
+            passed: false,
+            test_report_path: Some("test-report.md".into()),
+            failures: vec![TestFailure {
+                test_name: "login".into(),
+                error_message: "业务代码未实现".into(),
+                failure_cause: FailureCause::CodeIssue,
+            }],
+            gate_recheck: false,
+        });
+    f.agent.set_script(script);
+    testkit::seed_task(&f.store, "t6c", "p1").await.unwrap();
+    f.admit("t6c").await;
+    f.executor.run("t6c").await.unwrap();
+
+    let cursor = f.sole_cursor("t6c").await;
+    assert_eq!(
+        (cursor.stage, cursor.node),
+        (Stage::Test, Node::ValidateOutput)
+    );
+    assert_eq!(
+        cursor.pending_reason.as_ref().unwrap().kind,
+        PendingKind::UserDecision
+    );
+    let pending = f.pending_of("t6c").await;
+    assert_eq!(
+        pending.context.as_ref().and_then(|c| c.kind.as_deref()),
+        Some("test_code_issue"),
+        "非复检的直接 code_issue 带 context.kind = test_code_issue"
+    );
+    // 动作集同权威表 test_code_issue 行
+    let actions = f.store.allowed_actions_for_task("t6c").await.unwrap();
+    let labels: Vec<&str> = actions.iter().map(|a| a.label.as_str()).collect();
+    assert_eq!(labels, vec!["修改测试用例", "修改业务代码"]);
+}
+
 #[tokio::test]
 async fn e2e_06b_gate_failure_code_issue_pends_for_user_then_goto_develop() {
     let f = Flow::new().await;
@@ -190,6 +239,31 @@ async fn e2e_06b_gate_failure_code_issue_pends_for_user_then_goto_develop() {
         cursor.pending_reason.as_ref().unwrap().kind,
         PendingKind::UserDecision,
         "存在 code_issue → pending(user_decision)"
+    );
+
+    // 决策 130 ① / 票 05：test 闸门 code_issue 带 `context.kind`，动作集落到
+    // 「修改测试用例 / 修改业务代码」而非通用兜底行。本场景的 test 是**被 merge
+    // 测试闸门打回后的复检**（`gate_recheck = true`，决策 109）→ kind = gate_recheck。
+    let pending = f.pending_of("t6b").await;
+    assert_eq!(
+        pending.context.as_ref().and_then(|c| c.kind.as_deref()),
+        Some("gate_recheck"),
+        "闸门复检路径带 context.kind = gate_recheck"
+    );
+    let actions = f.store.allowed_actions_for_task("t6b").await.unwrap();
+    let labels: Vec<&str> = actions.iter().map(|a| a.label.as_str()).collect();
+    assert_eq!(labels, vec!["修改测试用例", "修改业务代码"]);
+    let t0 = actions[0].target.as_ref().expect("goto 应带落点");
+    assert_eq!(
+        (t0.stage, t0.node),
+        (Stage::Test, Node::Execute),
+        "修改测试用例回 test.execute"
+    );
+    let t1 = actions[1].target.as_ref().expect("goto 应带落点");
+    assert_eq!(
+        (t1.stage, t1.node),
+        (Stage::Develop, Node::Execute),
+        "修改业务代码回 develop.execute"
     );
 
     // 用户裁决「修改业务代码」→ goto develop.execute（决策 85 动作集）

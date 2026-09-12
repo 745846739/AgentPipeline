@@ -70,6 +70,33 @@ async fn e2e_03_review_rejection_pends_then_goto_develop_and_re_review_passes() 
         cursor.pending_reason.as_ref().unwrap().kind,
         PendingKind::UserDecision
     );
+
+    // 决策 130 ① / 票 05：review 打回必须带 `context.kind = review`，否则
+    // allowed_actions 落 `(user_decision, _)` 通用兜底行（skip / cancel）。
+    let pending = f.pending_of("t3").await;
+    assert_eq!(
+        pending.context.as_ref().and_then(|c| c.kind.as_deref()),
+        Some("review"),
+        "review 打回带 context.kind = review"
+    );
+    let actions = f.store.allowed_actions_for_task("t3").await.unwrap();
+    let names: Vec<&str> = actions.iter().map(|a| a.action.as_str()).collect();
+    assert_eq!(
+        names,
+        vec!["goto", "skip"],
+        "权威表 review 行：打回开发修复 / 强制通过评审"
+    );
+    let labels: Vec<&str> = actions.iter().map(|a| a.label.as_str()).collect();
+    assert_eq!(labels, vec!["打回开发修复", "强制通过评审"]);
+    // 打回落点 = develop.execute（决策 130 ①）
+    let goto = &actions[0];
+    let target = goto.target.as_ref().expect("goto 应带落点");
+    assert_eq!(
+        (target.stage, target.node),
+        (Stage::Develop, Node::Execute),
+        "打回开发修复落 develop.execute"
+    );
+
     // review.execute 只跑一次（不通过不是节点重试）
     assert_eq!(
         f.store
