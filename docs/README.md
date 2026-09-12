@@ -24,3 +24,4 @@ Kanban 式流水线驱动的本地多 agent 开发管线：init → architect-de
 - **章节编号**：`§4.2` 这类引用按上表"原章节"列定位到对应文件（如 §4.2 → data-model.md）。
 - **决策编号**：`决策 85` 一律指 [decisions.md](decisions.md) 的 #85，编号只增不改、被修订时在行内标注。
 - **前端规格**：交互与视觉定稿在 [design/frontend-design.md](../design/frontend-design.md)（原型 [design/prototype.html](../design/prototype.html)）；operations.md §12.11 是前端与流水线之间的契约侧（流式、组件复用）。
+- **主题方案**：五款候选——① 夜间调度台（[prototype.html](../design/prototype.html)）、② 日间时刻表（[prototype-minimal.html](../design/prototype-minimal.html)）、③ 终端「调度电报」（[theme-3-terminal.md](../design/theme-3-terminal.md) / [prototype-terminal.html](../design/prototype-terminal.html)）、④ 蓝图「晒图房」（[theme-4-blueprint.md](../design/theme-4-blueprint.md) / [prototype-blueprint.html](../design/prototype-blueprint.html)）、⑤ 车间「工单板」（[theme-5-workshop.md](../design/theme-5-workshop.md) / [prototype-workshop.html](../design/prototype-workshop.html)）。五款共用同一交互骨架与页面元素，选型未定。
