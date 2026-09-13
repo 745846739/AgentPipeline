@@ -183,7 +183,8 @@ harness = FakeAgent（§3.2）+ testkit fixture（§3.3）+ 临时 home + 手动
 
 ## 10. 质量闸门与 traceability（决策 147）
 
-**justfile：** `just lint`（`fmt --check` + `clippy -D warnings`，提交前必过）、`just test`（cargo test + vitest）、`just e2e`（L4 矩阵）、`just smoke`。
+**justfile：** `just lint`（`fmt --check` + `clippy -D warnings`，提交前必过）、`just test`（`cargo test --workspace`，即 L1 单元 + L2 集成 + L3 API + L4 场景 + 冒烟，**只覆盖 Rust**；另有 `just unit` / `integration` / `api` / `e2e` / `smoke` 分层子集与 `just fmt`）、`just frontend-e2e`（前端 playwright 双冒烟）。
+**前端测试不在 just 配方内**：单元层 vitest 与 `svelte-check` / `build` 直接在 `frontend/` 下跑（`npm test` = `vitest run`、`npm run check`、`npm run build`）——`just test` 不会跑它们。
 
 **逐分支覆盖（不做全局数字门）：** `route_merge` 每个 `EdgeKind`、游标状态机每次合法迁移（active / waiting_join / pending / archived 之间）各有用例。
 

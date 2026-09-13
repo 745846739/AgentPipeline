@@ -7,7 +7,7 @@ Kanban 式流水线驱动的本地多 agent 开发管线：`init → architect-d
 ## 环境
 
 - Rust 1.80+（当前验证于 1.98）
-- 系统 `git` CLI（worktree / rebase / 合入都走 CLI，与测试 fixture 同路径）
+- `git` 能力由 **git2（libgit2 绑定）** 提供，无需系统 git（决策 12；测试 fixture 仍走系统 git CLI 作脚手架，决策 146 修订）
 - SQLite 由 sqlx 内嵌编译，无需单独安装
 
 ## 构建与运行
@@ -32,7 +32,7 @@ just e2e           # L4 场景
 just smoke         # 启动冒烟（spawn 真二进制）
 ```
 
-当前状态：**290 个用例全过**，`fmt` / `clippy -D warnings` 干净。
+当前状态：**476 个用例全过**（另有 1 个 `#[ignore]` 真 LLM 冒烟），`fmt` / `clippy -D warnings` 干净。前端另有 85 个 vitest + 2 条 playwright E2E，在 `frontend/` 下单独跑（见 [docs/testing.md](docs/testing.md) §9）。
 
 ## 代码结构
 
@@ -42,7 +42,7 @@ crates/core/     核心库
   agent/         LLM 接缝、工具执行、结构化输出解析、FileToolPolicy、上下文压缩、prompt 组装
   storage/       SQLite（sqlx migrations）、游标生命周期、冲突比对、旁路动作事务
   scheduler/     KanbanScheduler.tick 六项职责
-  git.rs         系统 git CLI 封装（worktree / rebase / 合入写回 / 重置清理 / 项目探测）
+  git.rs         git2 封装（worktree / rebase / 合入写回 / 重置清理 / 项目探测，决策 12）
   actions.rs     allowed_actions 权威表与端点配对
   sse.rs         唯一事件流的类型契约
 crates/app/      二进制 + axum router（lib 形态供 tower oneshot 测试）
