@@ -3,6 +3,7 @@
   import type { ParsedDiff } from '../../lib/diff';
   import { pendingLabel } from '../../lib/pipeline';
   import PendingActions from '../board/PendingActions.svelte';
+  import Sprite from '../render/Sprite.svelte';
   import DiffReviewPanel from './DiffReviewPanel.svelte';
   import ReviewForm from './ReviewForm.svelte';
   interface Props {
@@ -10,7 +11,7 @@
     cursors: BranchCursor[];
     actions: AllowedAction[];
     busy?: boolean;
-    /** 窄屏（<480px）：dossier 转固定底部动作坞（theme-3 §8 转写 3）。 */
+    /** 窄屏（<480px）：dossier 转固定底部动作坞（theme-6 §5 转写 3）。 */
     dock?: boolean;
     /** dock 实际高度回传：详情内容据此留出底边距，避免被固定坞遮住。 */
     ondockheight?: (height: number) => void;
@@ -60,7 +61,7 @@
   );
   const conflicts = $derived(reason.context?.conflict_task_ids ?? []);
 
-  /** dock 模式：量取固定动作坞高度，供详情内容留出底边距（theme-3 §8 转写 3）。 */
+  /** dock 模式：量取固定动作坞高度，供详情内容留出底边距（theme-6 §5 转写 3）。 */
   let dockH = $state(0);
   $effect(() => {
     if (dock) ondockheight?.(dockH);
@@ -79,9 +80,14 @@
     <div class="ctx mono dim">kind = {reason.context.kind}</div>
   {/if}
   {#if reason.context?.diagnostic}
-    <!-- 主流程票 03：原始诊断与 message 分离渲染——可操作提示为主，原始串供排查 -->
+    <!-- 主流程票 03：原始诊断与 message 分离渲染——可操作提示为主，原始串供排查。
+         像素主题（票 07）：诊断仍是对话框里逐字可见的次级行，样式不得吞掉它。 -->
     <div class="ctx mono dim">诊断：{reason.context.diagnostic}</div>
   {/if}
+{/snippet}
+
+{#snippet foreman()}
+  <i class="dface" aria-hidden="true"><Sprite name="foreman" /></i>
 {/snippet}
 
 {#if dock}
@@ -139,97 +145,139 @@
     </div>
   </aside>
 {:else}
+  <!-- 急停对话框（决策 169 / theme-6-pixel.md §3）：奶油双线框 + 压在框沿上的琥珀名牌
+       tab（FF 式）+ 闪烁 ▼ 光标 + 左侧 16×16 工头头像。恢复动作 = 对话框菜单项按钮。 -->
   <aside class="dossier" aria-label="待办">
     <div class="dtag">⏸ 等你拍板 · {pendingLabel(reason)}</div>
-    {@render infoBlock()}
+    {@render foreman()}
+    <div class="dmain">
+      {@render infoBlock()}
 
-    {#if pendingType === 'merge_approval'}
-      <div class="grp">恢复动作</div>
-      <DiffReviewPanel
-        {diff}
-        raw={rawDiff}
-        stale={diffStale}
-        error={diffError}
-        loading={diffLoading}
-        {actions}
-        {cursors}
-        {busy}
-        {onaction}
-        onreload={onreloaddiff}
-      />
-    {:else if pendingType === 'human_review'}
-      <div class="grp">人工评审</div>
-      <ReviewForm
-        {diff}
-        raw={rawDiff}
-        {reviewReport}
-        {unitTestReport}
-        stale={diffStale}
-        {busy}
-        error={diffError}
-        onsubmit={onsubmitreview}
-        onreload={onreloaddiff}
-      />
-    {:else}
-      <div class="grp">恢复动作</div>
-      <PendingActions
-        {actions}
-        {cursors}
-        {pendingType}
-        {onaction}
-        disabled={busy}
-        isBusy={() => busy}
-      />
-    {/if}
+      {#if pendingType === 'merge_approval'}
+        <div class="grp">恢复动作</div>
+        <DiffReviewPanel
+          {diff}
+          raw={rawDiff}
+          stale={diffStale}
+          error={diffError}
+          loading={diffLoading}
+          {actions}
+          {cursors}
+          {busy}
+          {onaction}
+          onreload={onreloaddiff}
+        />
+      {:else if pendingType === 'human_review'}
+        <div class="grp">人工评审</div>
+        <ReviewForm
+          {diff}
+          raw={rawDiff}
+          {reviewReport}
+          {unitTestReport}
+          stale={diffStale}
+          {busy}
+          error={diffError}
+          onsubmit={onsubmitreview}
+          onreload={onreloaddiff}
+        />
+      {:else}
+        <!-- 恢复动作 / 旁路动作的分组头由 PendingActions 逐组渲染，不在此重复。 -->
+        <PendingActions
+          {actions}
+          {cursors}
+          {pendingType}
+          {onaction}
+          disabled={busy}
+          isBusy={() => busy}
+        />
+      {/if}
 
-    {#if triggerCursor}
-      <div class="ctx trigger">
-        触发节点：
-        <button type="button" class="linklike" onclick={() => ongotoconversation?.(triggerCursor.stage, triggerCursor.node)}>
-          {triggerCursor.stage}.{triggerCursor.node} ▸
-        </button>
+      {#if triggerCursor}
+        <div class="ctx trigger">
+          触发节点：
+          <button type="button" class="linklike" onclick={() => ongotoconversation?.(triggerCursor.stage, triggerCursor.node)}>
+            {triggerCursor.stage}.{triggerCursor.node} ▸
+          </button>
+        </div>
+      {/if}
+
+      <div class="ctx">
+        <button type="button" class="linklike" onclick={() => onopenfiles?.()}>查看产出文件 ▸</button>
       </div>
-    {/if}
-
-    <div class="ctx">
-      <button type="button" class="linklike" onclick={() => onopenfiles?.()}>查看产出文件 ▸</button>
     </div>
   </aside>
 {/if}
 
 <style>
+  /* ── 急停对话框（原型 .dossier）：双线框 = 琥珀外框 + panel 空隙 + pane 内框 ── */
   .dossier {
     grid-column: 2;
     grid-row: 1 / span 3;
     align-self: start;
     position: sticky;
     top: 56px;
+    margin-top: 20px; /* 给压在框沿上的名牌 tab 留出空间 */
     background: var(--panel);
-    border: 1px solid var(--pane);
-    padding: 13px 15px;
-    max-height: calc(100vh - 84px);
-    overflow: auto;
+    border: 2px solid var(--pending);
+    box-shadow:
+      inset 0 0 0 2px var(--panel),
+      inset 0 0 0 4px var(--pane),
+      4px 4px 0 var(--ink);
+    padding: 12px 14px;
+    display: flex;
+    gap: 12px;
+    align-items: flex-start;
   }
+  /* 名牌 tab：绝对定位，压在琥珀外框上（FF 式），框线被 panel 底盖住 */
   .dtag {
-    font-size: 11px;
-    font-weight: 600;
+    position: absolute;
+    top: -16px;
+    left: 6px;
+    background: var(--panel);
+    border: 2px solid var(--pending);
     color: var(--pending);
-    margin-bottom: 8px;
+    padding: 0 8px;
+    line-height: 1.5;
+    white-space: nowrap;
+  }
+  /* ▼ 闪烁光标：原型 .dialog::after；全站四处允许动画之一 */
+  .dossier::after {
+    content: '▼';
+    position: absolute;
+    right: 6px;
+    bottom: 2px;
+    color: var(--pending);
+    font-size: 12px;
+    line-height: 1;
+    animation: blink 1s steps(2) infinite;
+  }
+  .dface {
+    flex: none;
+    display: block;
+    width: 48px;
+    height: 48px;
+    line-height: 0;
+  }
+  .dmain {
+    flex: 1;
+    min-width: 0;
+    max-height: calc(100vh - 160px);
+    overflow: auto;
+    padding-bottom: 4px; /* 不压住右下角的 ▼ */
   }
   .msg {
-    font-size: 11.5px;
     color: var(--text-hi);
     margin-bottom: 9px;
+    overflow-wrap: anywhere;
   }
   .ctx {
-    font-size: 11px;
     color: var(--text-2);
     margin-bottom: 6px;
     line-height: 1.8;
+    overflow-wrap: anywhere;
   }
   .ctx b {
     color: var(--go);
-    font-weight: 500;
   }
   .dim {
     color: var(--text-4);
@@ -238,15 +286,13 @@
     margin-top: 10px;
   }
   .grp {
-    font-size: 10px;
+    font-size: 12px;
     color: var(--text-4);
     letter-spacing: 0.08em;
     margin: 12px 0 7px;
-    text-transform: uppercase;
   }
   .linklike {
     color: var(--text-hi);
-    font-size: 11px;
     padding: 0;
     text-align: left;
     text-decoration: underline;
@@ -264,42 +310,49 @@
     justify-content: flex-start;
   }
 
-  /* ── 移动版底部动作坞（<480px，theme-3 §8 转写 3）：dossier 内容进坞 ── */
+  /* ── 移动版底部动作坞（<480px，theme-6 §5 转写 3）：dossier 内容进坞 ──
+     完整移动转写见票 11，此处只保证不破。 */
   .dock {
     max-height: 72vh;
     overflow: auto;
   }
   .dock .dock-tag {
-    font-size: 12.5px;
+    position: relative;
+    color: var(--pending);
+    margin-bottom: 8px;
+  }
+  /* 坞内的 ▼ 光标（原型 .dock-tag::after） */
+  .dock .dock-tag::after {
+    content: '▼';
+    float: right;
+    animation: blink 1s steps(2) infinite;
   }
   .dock .msg {
-    font-size: 13px;
     color: var(--text-hi);
     line-height: 1.7;
     margin-bottom: 7px;
+    overflow-wrap: anywhere;
   }
   .dock .ctx {
     margin: 7px 0 0;
-    font-size: 12.5px;
     color: var(--text-2);
     line-height: 1.85;
+    overflow-wrap: anywhere;
   }
   .dock .ctx b {
     color: var(--go);
-    font-weight: 500;
   }
   .dock .dim {
     color: var(--text-4);
   }
   .dock .linklike {
     color: var(--text-hi);
-    font-size: 12.5px;
     padding: 0;
     text-align: left;
     text-decoration: underline;
     text-underline-offset: 3px;
   }
-  /* 坞内动作可点目标 ≥48px（§8 触控） */
+  /* 坞内动作可点目标 ≥48px（§5 触控） */
   .dock :global(.btn) {
     min-height: 48px;
   }
