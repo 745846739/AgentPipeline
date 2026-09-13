@@ -47,8 +47,12 @@
 
   /** 该任务是否已耗尽重试（后端权威信号：pending 类型 retry_exhausted）。 */
   const exhausted = $derived(reason?.type === 'retry_exhausted');
-  /** 运行中的货箱才带 boss 尝试条（尝试数只在"还在跑"时有意义）。 */
-  const showBoss = $derived(task.status === 'running');
+  /**
+   * boss 尝试条的出现条件：**运行中**（尝试数在跑时有意义）**或已耗尽重试**
+   * （后者状态是 pending——「最后一次机会也没了」正是最该看到这条红的地方）。
+   * 只按 `running` 会漏掉它，让「整条转红」永远不可达（票 05 的招牌行为之一）。
+   */
+  const showBoss = $derived(task.status === 'running' || exhausted);
   const attempts = $derived(
     Math.max(task.validate_attempts, ...visibleCursors.map((c) => c.validate_attempts), 0),
   );
@@ -346,7 +350,7 @@
       padding-bottom: 11px;
     }
     .card-title {
-      font-size: 14px;
+      font-size: 12px;
     }
     .pillrow :global(.pill) {
       border: 0;

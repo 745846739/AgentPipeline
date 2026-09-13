@@ -131,17 +131,135 @@ function collectSourceFiles(dir: string): string[] {
   return out;
 }
 
+/** 剥掉注释，避免注释里的说明性数值被当成代码。 */
+function stripComments(text: string): string {
+  return text.replace(/\/\*[\s\S]*?\*\//g, '').replace(/\/\/[^\n]*/g, '');
+}
+
+/**
+ * 像素纪律的**全站**扫描（不止 app.css）。
+ *
+ * 票 03–12 把规则逐个落到各组件，但 `app.css` 之外的 `<style>` 块此前不受护栏约束——
+ * 结果是 `ReviewForm` 的 1px 边框、多个组件的 13px 字号一路活到最后（code-review 发现）。
+ * 这里对**全部组件与脚本**再跑一遍同口径的三条：圆角 0、描边 2px 一档、字号 12 的整数倍。
+ */
+describe('像素纪律：全站组件（不止 app.css）', () => {
+  const files = collectSourceFiles(srcRoot);
+
+  it('圆角恒为 0 或它的语义 token', () => {
+    const bad: string[] = [];
+    for (const file of files) {
+      const rel = relative(srcRoot, file).replaceAll('\\', '/');
+      const text = stripComments(readFileSync(file, 'utf8'));
+      for (const m of text.matchAll(/border-radius\s*:\s*([^;]+);/g)) {
+        const v = m[1].trim();
+        if (v !== '0' && v !== 'var(--r-panel)' && v !== 'var(--r-pill)') bad.push(`${rel}: ${v}`);
+      }
+    }
+    expect(bad).toEqual([]);
+  });
+
+  it('描边宽度只有 2px 一档（4px 仅限伪阶段左缘，§3.1）', () => {
+    const bad: string[] = [];
+    for (const file of files) {
+      const rel = relative(srcRoot, file).replaceAll('\\', '/');
+      const text = stripComments(readFileSync(file, 'utf8'));
+      for (const m of text.matchAll(/\bborder(?:-(?:top|right|bottom|left))?\s*:\s*([^;]+);/g)) {
+        const v = m[1].trim();
+        const width = v.match(/^(\d+)px/);
+        if (width && width[1] !== '2') {
+          // 唯一例外：台账页的伪阶段行左缘 4px 亮度阶（§3.1 明确要求）
+          if (width[1] === '4' && /border-left/.test(m[0])) continue;
+          bad.push(`${rel}: ${v}`);
+        }
+        if (/^(thin|medium|thick)\b/.test(v)) bad.push(`${rel}: ${v}`);
+      }
+    }
+    expect(bad).toEqual([]);
+  });
+
+  it('字号只取 12 的整数倍（16px 仅限移动输入框防 iOS 聚焦缩放，§5）', () => {
+    const bad: string[] = [];
+    for (const file of files) {
+      const rel = relative(srcRoot, file).replaceAll('\\', '/');
+      const text = stripComments(readFileSync(file, 'utf8'));
+      for (const m of text.matchAll(/font-size\s*:\s*([0-9.]+)px/g)) {
+        const v = Number.parseFloat(m[1]);
+        if (v === 16) continue; // §5 移动款输入框
+        if (v % 12 !== 0) bad.push(`${rel}: ${m[1]}px`);
+      }
+    }
+    expect(bad).toEqual([]);
+  });
+
+  it('无需缓动：动画只用 steps() 或 opacity 翻转', () => {
+    const bad: string[] = [];
+    for (const file of files) {
+      const rel = relative(srcRoot, file).replaceAll('\\', '/');
+      const text = stripComments(readFileSync(file, 'utf8'));
+      for (const line of text.split('\n')) {
+        if (/\b(ease|ease-in|ease-out|ease-in-out|cubic-bezier)\b/.test(line)) {
+          bad.push(`${rel}: ${line.trim().slice(0, 60)}`);
+        }
+      }
+    }
+    expect(bad).toEqual([]);
+  });
+
+  it('sprite 图元不在组件里内联手绘（必须走 Sprite.svelte + 契约表）', () => {
+    const bad: string[] = [];
+    for (const file of files) {
+      const rel = relative(srcRoot, file).replaceAll('\\', '/');
+      if (rel === 'components/render/Sprite.svelte') continue;
+      const text = readFileSync(file, 'utf8');
+      // 组件自绘像素图元的特征：8×8 / 16×16 的 crispEdges svg 里直接写 rect。
+      // 挥锤小人（WORKER_FRAMES）是契约里的受控帧，允许由宿主渲染。
+      if (/shape-rendering="crispEdges"/.test(text) && /<rect\b/.test(text)) {
+        if (/WORKER_FRAMES/.test(text)) continue;
+        bad.push(rel);
+      }
+    }
+    expect(bad).toEqual([]);
+  });
+
+  it('动画预算：只有 §4 登记的语义位（键名白名单）', () => {
+    // 规格 §4 只允许四处语义位 + 实现期登记的游标心跳：
+    // 链节步进 / ▼ 光标 / 方块光标 / 小人挥锤 / 当前游标心跳。
+    // 它们在 CSS 里落成这几个 keyframes 名；出现新名字就说明加了新动画位，
+    // 必须回 theme-6-pixel.md §4 修订后在这里登记。
+    const allowedKeyframes = new Set([
+      'beltstep', // 链节步进
+      'blink', // ▼ 光标 / 方块光标 / 急停灯闪烁（同一「闪烁」位的复用）
+      'wA',
+      'wB', // 小人挥锤双帧
+      'heartbeat', // 当前游标心跳（§3.2 偏离表第 4 行）
+      'flash', // 节点完成一次反白闪（离散，非新位）
+    ]);
+    const found = new Set<string>();
+    for (const file of files) {
+      const text = stripComments(readFileSync(file, 'utf8'));
+      for (const m of text.matchAll(/@keyframes\s+([A-Za-z][\w-]*)/g)) found.add(m[1]);
+    }
+    const extra = [...found].filter((k) => !allowedKeyframes.has(k));
+    expect(extra).toEqual([]);
+  });
+
+  it('动画一律离散步进（steps 或 opacity 翻转，无缓动）——由上面的全站缓动扫描覆盖', () => {
+    // 这条是上面的补充断言：确保确有 steps() 在用（防止有人把所有动画删成 none 也算"过"）。
+    const all = files.map((f) => readFileSync(f, 'utf8')).join('\n');
+    expect(all).toMatch(/steps\(2\)/);
+  });
+});
+
 describe('像素纪律：token 块之外的裸十六进制颜色', () => {
   // 白名单：
   //  - contract.ts / css-parity.test.ts 自身 = token 的唯一事实源，颜色必须写在这里；
   //  - 工头脸块固定肤色（§2.4 偏差②明确要求字面值，非 token，与主题无关）。
   const ALLOW_FILES = new Set(['theme/contract.ts', 'theme/contract.test.ts', 'theme/css-parity.test.ts']);
+  // 白名单只剩二维码白底：工头脸块的固定肤色已收进契约（`LIGHT_DEVIATIONS.foremanFace`），
+  // Sprite.svelte 里没有裸色值——原先那条白名单是死的（allowlist 里写了、代码里没有），
+  // 留着会让人误以为组件里真有字面色。
   const ALLOWLIST: Array<{ file: string; hex: string; why: string }> = [
-    {
-      file: 'components/render/Sprite.svelte',
-      hex: '#E3C7A6',
-      why: '工头脸块固定肤色（§2.4 偏差②）',
-    },
     {
       file: 'routes/Share.svelte',
       hex: '#fff',

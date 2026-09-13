@@ -1,5 +1,5 @@
 import type { BranchCursor, Stage, TaskStatus } from '../api/types';
-import type { CrateState, SpriteName } from '../theme/contract';
+import { STATE_STYLES, type CrateState, type SpriteName } from '../theme/contract';
 
 /**
  * 流水线静态拓扑（决策 107：sync-check 全站不展示）。
@@ -150,19 +150,31 @@ export const COLUMN_SPRITES: Record<ColumnKey, SpriteName> = {
 
 /** 列状态 → 小节奏（run 快挥 / wait 慢挥 / idle 站立）。 */
 export function workerRhythm(state: StationState): 'run' | 'wait' | 'idle' {
-  if (state === 'warn') return 'wait';
-  if (state === 'go' || state === 'dev' || state === 'test') return 'run';
-  return 'idle';
+  // `StationState` 是轨道站点的词表（比货箱状态多 done/stop/dev/test），先归一到契约的
+  // `CrateState`，再读 `STATE_STYLES.worker`——节奏的**定义**在契约里，这里只做词表转换，
+  // 不在生产侧再抄一份映射（否则「唯一事实源」只是名义上的）。
+  const normalized: CrateState =
+    state === 'warn'
+      ? 'pending'
+      : state === 'go' || state === 'dev' || state === 'test'
+        ? 'running'
+        : state === 'stop'
+          ? 'failed'
+          : state === 'done'
+            ? 'done'
+            : 'queued';
+  return STATE_STYLES[normalized].worker;
 }
 
 /** 货箱状态 → 量表 tone（四盏信号灯语义，不引第二套色）。 */
+/** 货箱状态 → 量表 tone（四盏信号灯语义，不引第二套色）。灯色由契约给出。 */
 export function crateTone(state: CrateState): 'go' | 'warn' | 'stop' | 'dim' {
-  switch (state) {
-    case 'running':
+  switch (STATE_STYLES[state].lamp) {
+    case '--go':
       return 'go';
-    case 'pending':
+    case '--pending':
       return 'warn';
-    case 'failed':
+    case '--stop':
       return 'stop';
     default:
       return 'dim';

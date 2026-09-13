@@ -203,13 +203,6 @@ select {
   background-size: 4px 4px;
 }
 
-/* ── 通用控件（像素钮与像素框的完整改造见票 03） ── */
-.panel {
-  background: var(--panel);
-  border: 2px solid var(--pane);
-  border-radius: var(--r-panel);
-}
-
 /* ── 通用控件：像素钮 / 像素框 / 工位标签盒（票 03） ── */
 .panel {
   background: var(--panel);

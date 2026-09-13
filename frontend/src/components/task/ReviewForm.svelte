@@ -105,7 +105,7 @@
     max-width: 980px;
   }
   .title {
-    font-size: 13px;
+    font-size: 12px;
     color: var(--text-2);
     margin-bottom: 12px;
   }
@@ -141,14 +141,14 @@
   }
   .notice {
     display: inline-block;
-    font-size: 11px;
+    font-size: 12px;
     color: var(--pending);
-    border: 1px dashed var(--pending);
+    border: 2px solid var(--pending);
     padding: 2px 10px;
     margin-bottom: 10px;
   }
   .small {
-    font-size: 11px;
+    font-size: 12px;
     padding: 2px 8px;
     margin-bottom: 6px;
   }

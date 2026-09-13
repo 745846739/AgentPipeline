@@ -131,7 +131,7 @@
     box-shadow: none;
   }
   .head {
-    font-size: 13px;
+    font-size: 12px;
     color: var(--text-hi);
     margin-bottom: 14px;
   }
@@ -141,14 +141,14 @@
   }
   .field > span {
     display: block;
-    font-size: 11px;
+    font-size: 12px;
     color: var(--text-4);
     letter-spacing: 0.04em;
     margin-bottom: 4px;
   }
   .error {
     color: var(--stop);
-    font-size: 11.5px;
+    font-size: 12px;
     margin: 4px 0 8px;
   }
   .actions {

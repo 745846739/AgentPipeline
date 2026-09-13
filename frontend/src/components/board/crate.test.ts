@@ -9,9 +9,40 @@ import { describe, expect, it } from 'vitest';
 import { GEOMETRY, SPRITES, bossFilled, bossExhausted, gaugeFilled } from '../../theme/contract';
 import { COLUMN_SPRITES, crateState, crateTone, workerRhythm } from '../../lib/pipeline';
 import { BOARD_COLUMNS } from '../../lib/pipeline';
+import type { TaskListItem } from '../../api/types';
 import Gauge from '../render/Gauge.svelte';
 import Sprite from '../render/Sprite.svelte';
 import BossBar from './BossBar.svelte';
+import TaskCard from './TaskCard.svelte';
+
+/** 最小可用任务（只填 TaskCard 会读到的字段）。 */
+function task(overrides: Partial<TaskListItem> = {}): TaskListItem {
+  return {
+    id: 't-1',
+    project_id: 'p-1',
+    title: '货箱',
+    description: '',
+    status: 'running',
+    current_stage: 'develop',
+    current_node: 'execute',
+    validate_attempts: 0,
+    pending_reason: null,
+    worktree_path: null,
+    branch_name: null,
+    total_tokens: 1000,
+    total_calls: 3,
+    review_mode: 'agent',
+    model_override: null,
+    archived_at: null,
+    stalled: false,
+    executor_owner: null,
+    created_at: '2026-09-13T00:00:00Z',
+    updated_at: '2026-09-13T00:01:00Z',
+    branches: [],
+    blocks: [],
+    ...overrides,
+  };
+}
 
 describe('token 量表（Gauge）', () => {
   it('渲染 16 段，点亮段数由 token 数折算', () => {
@@ -62,6 +93,60 @@ describe('boss 战尝试条（BossBar）', () => {
   it('后端权威下发 retry_exhausted 时强制转红（不依赖镜像分母）', () => {
     const { container } = render(BossBar, { props: { used: 1, limit: 9, exhausted: true } });
     expect(container.querySelector('.segs.red')).not.toBeNull();
+  });
+});
+
+describe('货箱卡上的 boss 条可见性（票 05 招牌行为的可达性）', () => {
+  it('运行中的货箱带 boss 条', () => {
+    const { container } = render(TaskCard, {
+      props: { task: task({ status: 'running', validate_attempts: 1 }) },
+    });
+    expect(container.querySelector('.bossbar')).not.toBeNull();
+  });
+
+  it('耗尽重试的 pending 货箱也带 boss 条，且整条转红', () => {
+    // 关键回归点：retry_exhausted 的状态是 pending（不是 running）。若按 running 门槛，
+    // 「最后一次尝试整条转红」这条招牌行为在真应用里永远不可达——这里钉住它。
+    const { container } = render(TaskCard, {
+      props: {
+        task: task({
+          status: 'pending',
+          validate_attempts: 3,
+          pending_reason: {
+            type: 'retry_exhausted',
+            stage: 'develop',
+            node: 'execute',
+            message: '重试耗尽',
+          },
+        }),
+      },
+    });
+    expect(container.querySelector('.bossbar')).not.toBeNull();
+    expect(container.querySelector('.segs.red')).not.toBeNull();
+  });
+
+  it('其它 pending 类型不带 boss 条（不把每次等人拍板都画成 boss 战）', () => {
+    const { container } = render(TaskCard, {
+      props: {
+        task: task({
+          status: 'pending',
+          pending_reason: {
+            type: 'merge_approval',
+            stage: 'merge',
+            node: 'execute',
+            message: '等待审批合入',
+          },
+        }),
+      },
+    });
+    expect(container.querySelector('.bossbar')).toBeNull();
+  });
+
+  it('queued / waiting 不带 boss 条', () => {
+    for (const status of ['queued', 'waiting'] as const) {
+      const { container } = render(TaskCard, { props: { task: task({ status }) } });
+      expect(container.querySelector('.bossbar'), status).toBeNull();
+    }
   });
 });
 

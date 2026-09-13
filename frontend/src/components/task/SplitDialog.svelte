@@ -69,7 +69,7 @@
     padding: 18px 20px;
   }
   .head {
-    font-size: 13px;
+    font-size: 12px;
     color: var(--text-hi);
     margin-bottom: 8px;
   }

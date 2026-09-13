@@ -55,6 +55,6 @@
   .notfound {
     padding: 30px 20px;
     color: var(--text-3);
-    font-size: 12.5px;
+    font-size: 12px;
   }
 </style>
