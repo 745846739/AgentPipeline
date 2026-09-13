@@ -1,9 +1,9 @@
 # 主题三 · 终端「调度电报」
 
 > 状态：深色 / 浅色桌面款 + 深色 / 浅色移动款均已产出（2026-09-12）。
-> 交互与信息架构一律沿用 [frontend-design.md](frontend-design.md)（路由、五页签、待办 dossier、
+> 交互与信息架构一律沿用 [frontend-design.md](../frontend-design.md)（路由、五页签、待办 dossier、
 > `allowed_actions` 纯渲染（决策 69/101）、异步按钮、卡片禁拖）；本文只定义该交互骨架上的
-> 第三套视觉语言。页面元素与 [deprecated/prototype.html](deprecated/prototype.html) / [deprecated/prototype-minimal.html](deprecated/prototype-minimal.html)（已归档）
+> 第三套视觉语言。页面元素与 [prototype.html](prototype.html) / [prototype-minimal.html](prototype-minimal.html)（已归档）
 > 同一套（8 列看板、详情三视图、顶栏过滤、demo 切换器）；sync-check 全站不展示（决策 107）。
 
 ## 1. 设计概念

@@ -120,7 +120,7 @@
     padding: 6px 4px 12px;
   }
 
-  /* ── 移动版：窗格阵列 → 纵向电报纸带（theme-3 §8） ── */
+  /* ── 移动版：工位阵列 → 纵向站点带（§5 移动款） ── */
   @media (max-width: 479px) {
     .hscroll {
       overflow-x: visible;

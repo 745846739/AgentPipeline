@@ -167,7 +167,7 @@
   /* 消息 / 工具卡样式归 render/ 共享件（MessageBubble / ToolCallCard）所有，
      此处不再复刻——frontend-design.md §8「渲染件复用」。 */
 
-  /* ── 移动版（<480px）：运行条横向滚动（theme-3 §8） ── */
+  /* ── 移动版（<480px）：运行条横向滚动（§5 移动款） ── */
   @media (max-width: 479px) {
     .runrow {
       flex-wrap: nowrap;

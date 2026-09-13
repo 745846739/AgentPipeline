@@ -15,7 +15,7 @@ Kanban 式流水线驱动的本地多 agent 开发管线：init → architect-de
 | [implementation.md](implementation.md) | petgraph DAG + executor、KanbanScheduler、数据库表、进程中断恢复、关键接口 | §11 | 写实现代码 |
 | [operations.md](operations.md) | worktree 隔离、成本、取消、可观测性、人机协作、依赖、通知、锁、上下文管理等 14 项横切设计 | §12 | 处理横切关注点 |
 | [testing.md](testing.md) | 测试设计（t1 新增，决策 140–152）：风险优先级、可测试性接缝、FakeAgent/testkit 基建、单元/集成/API/E2E 用例目录、质量闸门与决策↔测试映射 | — | 写实现代码前定接缝、写测试时查用例 |
-| [decisions.md](decisions.md) | 已确认设计决策 #1–#152（只追加，修订关系显式标注） | §13 | 查"为什么这样定" |
+| [decisions.md](decisions.md) | 已确认设计决策 #1–#169（只追加，修订关系显式标注） | §13 | 查"为什么这样定" |
 | [glossary.md](glossary.md) | 领域术语表 | 附录 A | 遇到不认识的术语 |
 | [backlog-v2.md](backlog-v2.md) | v2 预留（MCP、对话 agent、离线通知等） | 附录 B | 规划 v2 |
 
@@ -23,5 +23,5 @@ Kanban 式流水线驱动的本地多 agent 开发管线：init → architect-de
 
 - **章节编号**：`§4.2` 这类引用按上表"原章节"列定位到对应文件（如 §4.2 → data-model.md）。
 - **决策编号**：`决策 85` 一律指 [decisions.md](decisions.md) 的 #85，编号只增不改、被修订时在行内标注。
-- **前端规格**：交互骨架与页面元素定稿在 [design/frontend-design.md](../design/frontend-design.md)（§4–§7；视觉方向以主题三为准）；operations.md §12.11 是前端与流水线之间的契约侧（流式、组件复用）。
-- **主题方案**：选型已定为主题三「终端 · 调度电报」——深色/浅色桌面 + 深色/浅色移动四款原型（[theme-3-terminal.md](../design/theme-3-terminal.md)、[prototype-terminal.html](../design/prototype-terminal.html)、[prototype-terminal-light.html](../design/prototype-terminal-light.html)、[prototype-terminal-mobile.html](../design/prototype-terminal-mobile.html)、[prototype-terminal-mobile-light.html](../design/prototype-terminal-mobile-light.html)）；其余四款候选（夜间调度台 / 日间时刻表 / 蓝图「晒图房」/ 车间「工单板」）已归档至 [design/deprecated/](../design/deprecated/README.md)。
+- **前端规格**：交互骨架与页面元素定稿在 [design/frontend-design.md](../design/frontend-design.md)（§4–§7）；视觉方向以**主题六「像素机房 · 夜班流水线」**为准（[theme-6-pixel.md](../design/theme-6-pixel.md)，决策 169）。operations.md §12.11 是前端与流水线之间的契约侧（流式、组件复用）。
+- **主题方案**：选型已定为主题六「像素机房 · 夜班流水线」——深色「夜班靛」/ 浅色「掌机背光」× 桌面/移动四款原型（[theme-6-pixel.md](../design/theme-6-pixel.md)、[prototype-pixel.html](../design/prototype-pixel.html)、[prototype-pixel-light.html](../design/prototype-pixel-light.html)、[prototype-pixel-mobile.html](../design/prototype-pixel-mobile.html)、[prototype-pixel-mobile-light.html](../design/prototype-pixel-mobile-light.html)）；主题三「终端 · 调度电报」与其余四款候选（夜间调度台 / 日间时刻表 / 蓝图「晒图房」/ 车间「工单板」）均已归档至 [design/deprecated/](../design/deprecated/README.md)。

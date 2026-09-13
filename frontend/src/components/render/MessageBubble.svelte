@@ -112,7 +112,7 @@
     max-width: 76ch;
   }
 
-  /* 移动版（<480px）：电文流（theme-3 §8） */
+  /* 移动版（<480px）：消息流（§5 移动款） */
   @media (max-width: 479px) {
     .msg {
       margin-bottom: 14px;

@@ -407,7 +407,7 @@
     background: var(--go);
     border-color: var(--go);
   }
-  /* hero 当前游标：灯的心跳微光（离散步进，取代主题三的滑动圆点 + 柔光） */
+  /* hero 当前游标：灯的心跳微光（离散步进，取代字符时代的滑动圆点 + 柔光） */
   @keyframes heartbeat {
     0%,
     100% {

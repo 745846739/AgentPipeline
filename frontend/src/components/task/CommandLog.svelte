@@ -183,7 +183,7 @@
     order: 3;
   }
 
-  /* ── 移动版（<480px）：命令表两行制（theme-3 §8 转写 4） ── */
+  /* ── 移动版（<480px）：命令表两行制（§5 移动款） ── */
   @media (max-width: 479px) {
     .cmds {
       max-width: none;

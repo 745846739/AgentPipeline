@@ -14,7 +14,7 @@
     /** 加载中（首次拉取 diff）。 */
     loading?: boolean;
     busy?: boolean;
-    /** 仅渲染动作行（窄屏底部动作坞复用，theme-3 §8 转写 3）。 */
+    /** 仅渲染动作行（窄屏底部动作坞复用，§5 转写 3）。 */
     actionsOnly?: boolean;
     onaction?: (action: AllowedAction, opts: { cursorId?: string; input?: string }) => void;
     onreload?: () => void;
@@ -191,7 +191,7 @@
     display: contents;
   }
 
-  /* ── 移动版（<480px）：动作进底部坞，diff 横滚（theme-3 §8） ── */
+  /* ── 移动版（<480px）：动作进底部坞，diff 横滚（§5 移动款） ── */
   @media (max-width: 479px) {
     .diffpanel {
       max-width: none;

@@ -13,7 +13,7 @@
     stale?: boolean;
     busy?: boolean;
     error?: string | null;
-    /** 窄屏底部动作坞复用：只渲染意见输入 + 动作（theme-3 §8 转写 3）。 */
+    /** 窄屏底部动作坞复用：只渲染意见输入 + 动作（§5 转写 3）。 */
     actionsOnly?: boolean;
     onsubmit?: (approved: boolean, comments?: string) => void;
     onreload?: () => void;

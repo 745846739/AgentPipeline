@@ -52,7 +52,7 @@
     color: var(--stop);
   }
 
-  /* 移动版（<480px）：工具卡折行（theme-3 §8） */
+  /* 移动版（<480px）：工具卡折行（§5 移动款） */
   @media (max-width: 479px) {
     .toolcard {
       flex-wrap: wrap;

@@ -28,7 +28,7 @@
   let providers = $state<Provider[]>([]);
   let dialogError = $state<string | null>(null);
   let bypassBusy = $state<string | null>(null);
-  /** 窄屏（<480px）：hero 轨道转纵向脊线（theme-3 §8）。 */
+  /** 窄屏（<480px）：hero 轨道转纵向脊线（§5 移动款）。 */
   let isMobile = $state(
     typeof window !== 'undefined' && window.matchMedia('(max-width: 479px)').matches,
   );
@@ -536,7 +536,7 @@
     margin-bottom: 10px;
   }
 
-  /* ── 移动版（<480px）：电报纸带 · 标题行 + 纵向脊线 + 分段页签 + 动作坞（theme-3 §8） ── */
+  /* ── 移动版（<480px）：站点带 · 标题行 + 纵向脊线 + 分段页签 + 动作坞（§5 移动款） ── */
   @media (max-width: 479px) {
     .detail {
       padding: 0 12px calc(30px + var(--safeb));

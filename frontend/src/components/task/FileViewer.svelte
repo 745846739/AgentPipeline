@@ -155,7 +155,7 @@
     display: contents;
   }
 
-  /* ── 移动版（<480px）：文件列表两行制 + diff 横滚（theme-3 §8） ── */
+  /* ── 移动版（<480px）：文件列表两行制 + diff 横滚（§5 移动款） ── */
   @media (max-width: 479px) {
     .diff-scroll {
       display: block;

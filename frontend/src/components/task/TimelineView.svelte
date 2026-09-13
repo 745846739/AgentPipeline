@@ -105,7 +105,7 @@
     font-size: 12px;
   }
 
-  /* ── 移动版（<480px）：时间线折行为块（theme-3 §8 原型 .trow） ── */
+  /* ── 移动版（<480px）：时间线折行为块（§5 移动款） ── */
   @media (max-width: 479px) {
     .tline {
       max-width: none;

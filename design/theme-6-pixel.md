@@ -89,11 +89,15 @@ queued / waiting 无灯灰字。层级只靠硬投影与描边亮度，不引入
 
 ### 2.3 形状与密度
 
-- 圆角 0；描边 2px 一档；硬投影 `4px 4px 0 var(--ink)`，按压态 `translate(4px,4px)` + 去投影。
+> 以下数值与**冻结原型的实测值**对齐（原稿若与原型不符，以原型为准；逐处对账见 §3.2 末表）。
+
+- 圆角 0；描边 2px 一档；硬投影三处：容器 `4px 4px 0 var(--ink)`、小控件
+  `3px 3px 0 var(--ink)`、wordmark 文字 `3px 3px 0 var(--ink)`；按压态为对应距离的
+  `translate` + 去投影。
 - 货箱顶盖带：6px 高的 2×2 dither 条，是「这东西是实体」的材质提示，每张货箱一条。
-- 列宽 264px × 8；详情页 `max-width: 1000px`；dossier 右栏 320px。
-- 传送带：8px 高，`repeating-linear-gradient(90deg, … 0 8px, transparent 8px 16px)` 画出
-  像素链节；运行中工位两侧的链节以 `steps(2)` 步进位移。
+- 列宽 264px × 8；详情页 `max-width: 1000px`；dossier 右栏 340px（分栏后整体 1240px）。
+- 传送带：**6px 高**，`repeating-linear-gradient(90deg, … 0 6px, transparent 6px 12px)`
+  画出像素链节（周期 12px）；运行中工位两侧的链节以 `steps(2)` 步进位移。
 - 像素图元：8×8 工位图标（SVG `shape-rendering: crispEdges`，`currentColor` 随列头状态）
   + 16×16 工头头像（琥珀安全帽 + 绿背心，只出现在 dossier 对话框）+ 8×8 挥锤小人双帧
   （抬起 / 落锤+火花）。图元只允许来自本文的 sprite 表，新增图标需回到本文修订。
@@ -213,6 +217,23 @@ node scripts/derive-light.mjs design/prototype-pixel-mobile.html design/prototyp
 | 指标 `chart` / `plot` / `cols` / `mdot` | `routes/Metrics.svelte` + `components/settings/TrackSegmentBars.svelte` | 9 站点列，灯与条同色 |
 | 详情 hero / 页签 `detail` / `d-head` / `tabs` / `tab` | `routes/TaskDetail.svelte` + `components/pipeline/PipelineRail.svelte`（hero 变奏） | 五页签 = 工位标签盒 |
 | sprite 表 `sp[data-s]` | 主题契约模块的 sprite 表 + `components/render/Sprite.svelte` | 15 枚；只允许来自受控表，新增回本文修订 |
+| 量表 `.gauge` | `components/render/Gauge.svelte` | 16 段共用件（底栏总量 / 货箱 meta 行）；`tone` 取四盏信号灯语义 |
+| boss 条 `.bossbar` | `components/board/BossBar.svelte` | 20 段；`exhausted` 时整条转红 |
+| 主题契约（token / 几何 / sprite / 状态映射） | `frontend/src/theme/contract.ts` | **本 effort 唯一新接缝**（决策 169）；`app.css` 是它的手工镜像，由 `theme/css-parity.test.ts` 锁死 |
+| 像素主题 e2e | `frontend/e2e/pixel-theme.spec.ts`（6 条）+ `e2e/screenshots.spec.ts`（真应用截图，默认 skip） | 断言真应用上算出来的样式；截图是证据不是门 |
+
+**实现期与原型的有意偏离（已登记）**：实现与冻结原型（参照物冻结点提交 `612cc07`）的差异如下，
+均为"原型措辞/示例与规格正文冲突，取规格正文与冻结原型的一致解释"：
+
+| 处 | 原型 | 实现 | 依据 |
+|---|---|---|---|
+| 传送带链节高 | **6px**（`.belt{height:6px}`、6px 亮 / 6px 暗） | 6px | 规格 §2.3 原文写 8px 是原型定稿前的措辞，§5 移动款独立写 6px；**冻结原型为准**，§2.3 已同步改写 |
+| dossier 右栏宽 | **340px**（`.detail.split{grid-template-columns:1fr 340px}`） | 340px | 规格 §2.3 原文写 320px，冻结原型为 340px；**原型为准**，§2.3 已同步改写 |
+| 硬投影档位 | 容器 `4px 4px 0`、小控件 `3px 3px 0`、wordmark 文字 `3px 3px 0` 三处 | 同 | 规格原文「阴影只有 4px 一档」与原型不符；原型实际有三处，**原型为准**，§2.3 已同步改写 |
+| 刻度盘段色 | `.mdot.dev` 用 `--t2` 而 `fill.dev` 用 `--belt-lit`（同一图元两色） | 灯与条同色（`--belt-lit`） | 规格 §3.1 明确要求「灯与横条同色」；原型此处自相矛盾，**规格为准** |
+| 详情当前游标 | 只有实心绿灯（无滑动圆点元素） | 绿灯 + 离散心跳 | 规格 §5「当前游标保留滑动圆点」是主题三残留措辞；冻结原型用灯 + 心跳表达，**原型为准** |
+| boss 条分母 | 原型写死 `尝试 2/3` | 契约镜像 `retryLimitMirror: 3` + 后端 `retry_exhausted` 权威转红 | 该值无端点下发且本 effort 不改端点（规格 Out of Scope）；代价与将来改法写在 `contract.ts` |
+
 
 ## 4. 选型注意
 
