@@ -2,8 +2,8 @@
   import type { AllowedAction, BranchCursor, TaskListItem } from '../../api/types';
   import type { BoardColumnDef } from '../../lib/pipeline';
   import { COLUMN_SPRITES, EMPTY_HINTS, workerRhythm } from '../../lib/pipeline';
-  import { WORKER_FRAMES } from '../../theme/contract';
   import Sprite from '../render/Sprite.svelte';
+  import Worker from '../pipeline/Worker.svelte';
   import TaskCard from './TaskCard.svelte';
 
   interface Props {
@@ -80,32 +80,7 @@
         <i class="sp {lampClass(stationState)}"><Sprite name={COLUMN_SPRITES[column.key]} /></i
         >{column.label}
       </span>
-      <span class="worker {rhythm}" aria-hidden="true">
-        <svg
-          class="f1"
-          viewBox="0 0 8 8"
-          width="16"
-          height="16"
-          shape-rendering="crispEdges"
-          fill="currentColor"
-        >
-          {#each WORKER_FRAMES.raised as r, i (i)}
-            <rect x={r.x} y={r.y} width={r.w} height={r.h} />
-          {/each}
-        </svg>
-        <svg
-          class="f2"
-          viewBox="0 0 8 8"
-          width="16"
-          height="16"
-          shape-rendering="crispEdges"
-          fill="currentColor"
-        >
-          {#each WORKER_FRAMES.struck as r, i (i)}
-            <rect x={r.x} y={r.y} width={r.w} height={r.h} />
-          {/each}
-        </svg>
-      </span>
+      <Worker {rhythm} />
       <i class="col-rule sec-rule"></i>
       <span class="sec-n col-n col-n-desk">{tasks.length}</span>
     </div>
@@ -143,70 +118,9 @@
     color: var(--stop);
   }
 
-  /* 列头小人：run 快挥 0.6s / wait 慢挥 1.8s / idle 站立；双帧离散翻转 */
-  .worker {
-    position: relative;
-    display: inline-block;
-    width: 16px;
-    height: 16px;
-    margin-left: 8px;
-    flex: none;
-  }
-  .worker svg {
-    position: absolute;
-    inset: 0;
-  }
-  .worker .f2 {
-    opacity: 0;
-  }
-  .worker.run {
-    color: var(--go);
-  }
-  .worker.wait {
-    color: var(--pending);
-  }
-  .worker.idle {
-    color: var(--text-4);
-  }
-  @keyframes wA {
-    0%,
-    50% {
-      opacity: 1;
-    }
-    50.01%,
-    100% {
-      opacity: 0;
-    }
-  }
-  @keyframes wB {
-    0%,
-    50% {
-      opacity: 0;
-    }
-    50.01%,
-    100% {
-      opacity: 1;
-    }
-  }
-  .worker.run .f1 {
-    animation: wA 0.6s steps(2) infinite;
-  }
-  .worker.run .f2 {
-    animation: wB 0.6s steps(2) infinite;
-  }
-  .worker.wait .f1 {
-    animation: wA 1.8s steps(2) infinite;
-  }
-  .worker.wait .f2 {
-    animation: wB 1.8s steps(2) infinite;
-  }
-  .col.don .worker {
+  /* 列的完成态小人色（图元与节奏都在共享的 `components/pipeline/Worker.svelte` 里） */
+  .col.don :global(.worker) {
     color: var(--done);
-  }
-  @media (prefers-reduced-motion: reduce) {
-    .worker svg {
-      animation: none !important;
-    }
   }
 
   .col {

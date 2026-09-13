@@ -6,19 +6,19 @@
 
 **Blocked by:** None（can start immediately）
 
-**Status:** ready-for-agent
+**Status:** done（2026-09-14）
 
-- [ ] 把当前未提交的原型工作落一个独立提交作为**参照物冻结点**：四份 `prototype-pixel*.html`、
+- [x] 把当前未提交的原型工作落一个独立提交作为**参照物冻结点**：四份 `prototype-pixel*.html`、
       `scripts/derive-light.mjs`、`design/theme-6-pixel.md` 的 §2.4 / §3.1 增补、
       `.scratch/shots/capture-pixel.mjs`。提交信息说明它是参照物、后续实现以它为准
-- [ ] `design/theme-6-pixel.md` 由**提案**升格为**现行视觉规格**（改写头部状态行），
+- [x] `design/theme-6-pixel.md` 由**提案**升格为**现行视觉规格**（改写头部状态行），
       并补一节「实现映射」登记原型 class ↔ 前端组件的对应关系
-- [ ] `design/frontend-design.md` §3「视觉语言 / Design Tokens」改为指向主题六；
+- [x] `design/frontend-design.md` §3「视觉语言 / Design Tokens」改为指向主题六；
       §6 的「视觉方向以主题三为准」改为以主题六为准。**§4–§7、§9.2 的交互骨架与约束清单逐字保留**
-- [ ] `docs/decisions.md` 追加一条决策，登记：① 视觉方向切换为主题六；② 主题三退役；
+- [x] `docs/decisions.md` 追加一条决策，登记：① 视觉方向切换为主题六；② 主题三退役；
       ③ 唯一新接缝 = 主题契约模块；④ 像素字体自托管入库。并在同一行显式标注**决策 84**
       （分支消歧由 `[dev]`/`[tst]` 文字标签改为徽章色相，语义与动作集下发不变）
-- [ ] 决策中登记**决策 156/168 的连带影响**：字体入库使 `dist` 约增 0.9MB、dmg 随之增大，
+- [x] 决策中登记**决策 156/168 的连带影响**：字体入库使 `dist` 约增 0.9MB、dmg 随之增大，
       属可接受代价
 
 **注意：** 本票不删任何文件、不改任何代码——归档与链接清扫在末票（13），避免中途仓库出现

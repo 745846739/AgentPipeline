@@ -191,7 +191,7 @@ harness = FakeAgent（§3.2）+ testkit fixture（§3.3）+ 临时 home + 手动
 ④ 详情 hero 9 站（无 sync-check）+ 站点名非字符字形 + 工位标签盒 active 是 wash 实底；
 ⑤ 完成横幅（trophy sprite + diff 摘要真数字、点「收下」关闭、刷新不重弹）；
 ⑥ 移动款（顶栏 138px、6px 纵向链节脊线、灯可跳段且 `scroll-margin-top: 148px`、槽位不缩、触控目标）。
-另：`e2e/screenshots.spec.ts` 在真应用上产出 **7 路由 × 深浅 + 移动 3 视图 × 深浅** 的可重生成截图
+另：`e2e/screenshots.spec.ts` 在真应用上产出 **6 路由 × 深浅 + 移动 3 视图 × 深浅** 的可重生成截图
 （`.scratch/shots/app/*.png`），**默认 skip**，需 `AGENTPIPELINE_SHOTS=1` 才跑——截图是证据不是门
 （像素字体跨机渲染差异会引入 flaky 门，故不做字节级 golden 回放）。
 
