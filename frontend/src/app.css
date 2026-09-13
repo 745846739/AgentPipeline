@@ -59,23 +59,6 @@
   /* 移动版安全区 */
   --safeb: env(safe-area-inset-bottom, 0px);
 
-  /* ── 以下为主题三遗留口，待所属票迁移后删除（票 03/04/05/06/11） ── */
-  --bracket: var(--text-4); /* 票 03：方括号按钮装饰移除 */
-  --head-band: var(--bg); /* 票 11：移动段头带 */
-  --bar-band: var(--bg); /* 票 04：底栏带 */
-  --mask-bg: var(--bg); /* 票 04：信号灯缩略条遮罩底 */
-  --lit: var(--belt-lit); /* 票 04：缩略条亮线 */
-  --spin: var(--pane); /* 票 11：纵向脊线三态 */
-  --spin-lit: var(--belt-lit);
-  --spin-pen: var(--pending);
-  --spin-w: 6px;
-  --br: var(--pane); /* 票 05：字符线路行 */
-  --br-done: var(--belt-lit);
-  --dash: var(--text-4);
-  --rail-band: none;
-  --rail-band-size: auto;
-  --rail-band-pos: 0 0;
-
   /* §2.2 字体：全站唯一字族（缝合像素 12px 等宽），连字关闭 */
   --font-px: 'Fusion Pixel 12px Monospaced Simplified Chinese', 'SF Mono', Menlo, 'PingFang SC',
     monospace;
@@ -659,13 +642,13 @@ textarea.input {
     bottom: 0;
     width: 6px;
     transform: translateX(-50%);
-    background: repeating-linear-gradient(180deg, var(--spin) 0 6px, transparent 6px 12px);
+    background: repeating-linear-gradient(180deg, var(--pane) 0 6px, transparent 6px 12px);
   }
   .spine-rule.live {
-    background: repeating-linear-gradient(180deg, var(--spin-lit) 0 6px, transparent 6px 12px);
+    background: repeating-linear-gradient(180deg, var(--belt-lit) 0 6px, transparent 6px 12px);
   }
   .spine-rule.pen {
-    background: repeating-linear-gradient(180deg, var(--spin-pen) 0 6px, transparent 6px 12px);
+    background: repeating-linear-gradient(180deg, var(--pending) 0 6px, transparent 6px 12px);
     opacity: 0.45;
   }
 
@@ -675,7 +658,7 @@ textarea.input {
     align-items: center;
     gap: 8px;
     padding: 6px 6px 7px 12px;
-    background: var(--head-band);
+    background: var(--bg);
     border-bottom: 2px solid var(--hairline);
   }
   .sec-name {
@@ -701,7 +684,7 @@ textarea.input {
     right: 0;
     bottom: 0;
     z-index: 31;
-    background: var(--bar-band);
+    background: var(--bg);
     border-top: 2px solid var(--pending);
     padding: 8px 12px calc(9px + var(--safeb));
   }

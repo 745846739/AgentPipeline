@@ -1,6 +1,7 @@
 <script lang="ts">
   import type { MiniDotState, StationView } from '../../lib/pipeline';
   import { RAIL_LABELS, railTokens, tokenLitsSegment } from '../../lib/pipeline';
+  import { WORKER_FRAMES } from '../../theme/contract';
 
   /**
    * 传送带轨道（决策 169 / theme-6-pixel.md §3）：像素灯 + 链节取代字符线路行。
@@ -128,6 +129,35 @@
       <li class="vst {vClass(row.state)}">
         <span class="vmk"><i class="lamp {lampClass(row.state)}"></i></span>
         <span class="vname">{row.label}</span>
+        <!-- 小人随站（§5 转写 4）：只在当前站出现（在跑 / 急停） -->
+        {#if row.state === 'go' || row.state === 'dev' || row.state === 'test' || row.state === 'warn'}
+          <span class="worker {row.state === 'warn' ? 'wait' : 'run'}" aria-hidden="true">
+            <svg
+              class="f1"
+              viewBox="0 0 8 8"
+              width="16"
+              height="16"
+              shape-rendering="crispEdges"
+              fill="currentColor"
+            >
+              {#each WORKER_FRAMES.raised as r, i (i)}
+                <rect x={r.x} y={r.y} width={r.w} height={r.h} />
+              {/each}
+            </svg>
+            <svg
+              class="f2"
+              viewBox="0 0 8 8"
+              width="16"
+              height="16"
+              shape-rendering="crispEdges"
+              fill="currentColor"
+            >
+              {#each WORKER_FRAMES.struck as r, i (i)}
+                <rect x={r.x} y={r.y} width={r.w} height={r.h} />
+              {/each}
+            </svg>
+          </span>
+        {/if}
         {#if row.branches}
           <span class="vsub"
             >{#each row.branches as b, i (b.kind)}<b
@@ -259,6 +289,32 @@
     }
     to {
       background-position: 12px 0;
+    }
+  }
+  /* 急停灯闪烁 + 小人双帧翻转（离散 opacity，§2.3 原则 4） */
+  @keyframes blink {
+    50% {
+      opacity: 0;
+    }
+  }
+  @keyframes wA {
+    0%,
+    50% {
+      opacity: 1;
+    }
+    50.01%,
+    100% {
+      opacity: 0;
+    }
+  }
+  @keyframes wB {
+    0%,
+    50% {
+      opacity: 0;
+    }
+    50.01%,
+    100% {
+      opacity: 1;
     }
   }
   .rail.spine {
@@ -507,5 +563,44 @@
   .vst.cur .vmeta,
   .vst.pen .vmeta {
     color: var(--text-hi);
+  }
+
+  /* 详情窄屏的小人（§5 转写 4）：只在当前站出现，与列头同一套双帧与节奏 */
+  .vrail .worker {
+    position: relative;
+    display: inline-block;
+    width: 16px;
+    height: 16px;
+    flex: none;
+  }
+  .vrail .worker svg {
+    position: absolute;
+    inset: 0;
+  }
+  .vrail .worker .f2 {
+    opacity: 0;
+  }
+  .vrail .worker.run {
+    color: var(--go);
+  }
+  .vrail .worker.wait {
+    color: var(--pending);
+  }
+  .vrail .worker.run .f1 {
+    animation: wA 0.6s steps(2) infinite;
+  }
+  .vrail .worker.run .f2 {
+    animation: wB 0.6s steps(2) infinite;
+  }
+  .vrail .worker.wait .f1 {
+    animation: wA 1.8s steps(2) infinite;
+  }
+  .vrail .worker.wait .f2 {
+    animation: wB 1.8s steps(2) infinite;
+  }
+  @media (prefers-reduced-motion: reduce) {
+    .vrail .worker svg {
+      animation: none !important;
+    }
   }
 </style>

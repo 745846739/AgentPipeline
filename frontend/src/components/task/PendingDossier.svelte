@@ -310,8 +310,9 @@
     justify-content: flex-start;
   }
 
-  /* ── 移动版底部动作坞（<480px，theme-6 §5 转写 3）：dossier 内容进坞 ──
-     完整移动转写见票 11，此处只保证不破。 */
+  /* ── 移动版底部动作坞（<480px，theme-6 §5 转写 3）：对话框式常驻动作坞 ──
+     dossier 的对话框内容（含工头头像）留在正文流，恢复动作下沉为固定底部坞；
+     坞带琥珀顶框 + ▼ 光标（对话框语汇），异步按钮点击即禁用。 */
   .dock {
     max-height: 72vh;
     overflow: auto;
@@ -321,10 +322,11 @@
     color: var(--pending);
     margin-bottom: 8px;
   }
-  /* 坞内的 ▼ 光标（原型 .dock-tag::after） */
+  /* 坞内的 ▼ 光标（原型 .dock-tag::after）：琥珀，离散闪烁 */
   .dock .dock-tag::after {
     content: '▼';
     float: right;
+    color: var(--pending);
     animation: blink 1s steps(2) infinite;
   }
   .dock .msg {

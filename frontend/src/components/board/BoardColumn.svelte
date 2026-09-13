@@ -72,7 +72,7 @@
   const hideCards = $derived(tasks.length === 0 && spineTasks.length > 0);
 </script>
 
-<section class="col {colState} {hideCards ? 'hide-cards' : ''}">
+<section class="col {colState} {hideCards ? 'hide-cards' : ''}" id={`s-${column.key}`}>
   <div class="col-spine"><i class="spine-rule {colState}"></i></div>
   <div class="col-main">
     <div class="col-head sec-head">
@@ -277,6 +277,8 @@
       flex-direction: row;
       align-items: stretch;
       border-right: 0;
+      /* 点灯跳段时不被 138px 顶栏压住（§5 转写 5 的连带定值） */
+      scroll-margin-top: 148px;
     }
     .col-spine {
       display: block;
@@ -300,7 +302,7 @@
       gap: 8px;
       padding: 6px 6px 7px 12px;
       min-height: 32px;
-      background: var(--head-band);
+      background: var(--bg);
       border-bottom: 2px solid var(--hairline);
       letter-spacing: normal;
       color: var(--text-3);

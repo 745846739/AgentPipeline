@@ -55,6 +55,15 @@
     board.pendingOpen = false;
     router.navigate(`/task/${id}`);
   }
+
+  /**
+   * 点信号灯缩略条跳段（移动原型 `.rn` + `scrollIntoView`）。
+   * 站点带带 `scroll-margin-top: 148px`，故跳到顶时不会被 138px 的顶栏压住。
+   */
+  function jumpToStation(key: string) {
+    if (typeof document === 'undefined') return;
+    document.getElementById(`s-${key}`)?.scrollIntoView({ block: 'start' });
+  }
 </script>
 
 <header class="top">
@@ -66,9 +75,15 @@
 
       <nav class="railnav" aria-label="站点状态缩略">
         {#each railCells as cell (cell.key)}
-          <span class="rn {cell.state}" title={cell.label} aria-hidden="true">
+          <!-- 点灯跳段（移动原型 `.rn` → `scrollIntoView`）；桌面隐藏 -->
+          <button
+            type="button"
+            class="rn {cell.state}"
+            aria-label="跳到 {cell.label}"
+            onclick={() => jumpToStation(cell.key)}
+          >
             <span class="mk"></span>
-          </span>
+          </button>
         {/each}
       </nav>
     </div>
