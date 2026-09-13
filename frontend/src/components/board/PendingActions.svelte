@@ -60,10 +60,19 @@
     return isBusy?.(action, fallbackCursorId(groupCursorId)) ?? false;
   }
 
-  /** 分支文字标签（决策 84：不用色相，用 [dev]/[tst]/main）。 */
+  /**
+   * 分支文字标签（决策 169 对决策 84 的手段变更）：分支身份 = 徽章色相
+   * （--branch-dev 蓝 / --branch-tst 紫）+ 文字双编码 `[dev]`/`[tst]`；
+   * main 中性。色相不单独承载语义，仍与文字一起出现。
+   */
   function branchLabel(branch: string): string {
     const kind = branchKind(branch);
     return kind === 'main' ? 'main' : `[${kind}]`;
+  }
+
+  /** 组头分支色相类（与 BranchPill 同一套 token）。 */
+  function branchClass(branch: string): string {
+    return branchKind(branch);
   }
 </script>
 
@@ -74,7 +83,7 @@
     <div class="group">
       {#if groups.length > 1 || group.cursorId}
         <div class="head">
-          <span class="head-label">{branchLabel(group.branch)}</span>
+          <span class="head-label {branchClass(group.branch)}">{branchLabel(group.branch)}</span>
         </div>
       {/if}
 
@@ -152,16 +161,21 @@
     margin-bottom: 6px;
   }
   .head-label {
-    font-size: 10px;
-    font-weight: 600;
+    font-size: 12px;
     letter-spacing: 0.04em;
     color: var(--text-3);
   }
+  /* 分支身份 = 徽章色相（与 BranchPill 同一套 token，决策 169） */
+  .head-label.dev {
+    color: var(--branch-dev);
+  }
+  .head-label.test {
+    color: var(--branch-tst);
+  }
   .grp-label {
-    font-size: 10px;
+    font-size: 12px;
     color: var(--text-4);
     letter-spacing: 0.08em;
-    text-transform: uppercase;
     margin: 12px 0 7px;
   }
   .item {

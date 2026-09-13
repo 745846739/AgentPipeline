@@ -1,4 +1,5 @@
 import type { BranchCursor, Stage, TaskStatus } from '../api/types';
+import type { CrateState, SpriteName } from '../theme/contract';
 
 /**
  * 流水线静态拓扑（决策 107：sync-check 全站不展示）。
@@ -109,6 +110,63 @@ export function branchKind(branch: string): BranchKind {
 export function branchShort(branch: string): string {
   const kind = branchKind(branch);
   return kind === 'main' ? 'main' : kind;
+}
+
+/* ───────────────────── 像素主题：货箱 / 工位（决策 169） ───────────────────── */
+
+/** 货箱状态 → 契约 `STATE_STYLES` 的键（灯 / 描边 / 小人节奏的唯一入口）。 */
+export function crateState(task: { status: TaskStatus; stalled?: boolean }): CrateState {
+  switch (task.status) {
+    case 'running':
+      return 'running';
+    case 'pending':
+      return 'pending';
+    case 'failed':
+    case 'cancelled':
+      return 'failed';
+    case 'done':
+      return 'done';
+    case 'queued':
+      return 'queued';
+    default:
+      return 'waiting';
+  }
+}
+
+/**
+ * 列 → 工位 sprite（theme-6-pixel.md §3 与冻结原型列头逐列一致）。
+ * 图元只来自契约 sprite 表；改这里等于改规格，须回 theme-6 修订。
+ */
+export const COLUMN_SPRITES: Record<ColumnKey, SpriteName> = {
+  init: 'flag',
+  'architect-design': 'gem',
+  design: 'hammer',
+  develop: 'gear',
+  review: 'lens',
+  test: 'shield',
+  merge: 'merge',
+  done: 'trophy',
+};
+
+/** 列状态 → 小节奏（run 快挥 / wait 慢挥 / idle 站立）。 */
+export function workerRhythm(state: StationState): 'run' | 'wait' | 'idle' {
+  if (state === 'warn') return 'wait';
+  if (state === 'go' || state === 'dev' || state === 'test') return 'run';
+  return 'idle';
+}
+
+/** 货箱状态 → 量表 tone（四盏信号灯语义，不引第二套色）。 */
+export function crateTone(state: CrateState): 'go' | 'warn' | 'stop' | 'dim' {
+  switch (state) {
+    case 'running':
+      return 'go';
+    case 'pending':
+      return 'warn';
+    case 'failed':
+      return 'stop';
+    default:
+      return 'dim';
+  }
 }
 
 /* ─────────────────────────────── 迷你轨 ─────────────────────────────── */

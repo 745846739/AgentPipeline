@@ -78,6 +78,18 @@ export const GEOMETRY = {
   /** boss 战尝试条段数（20 段，最后一次尝试整条转红）。 */
   bossSegments: 20,
   bossSegmentHeight: 10,
+  /**
+   * boss 条分母的**镜像默认值**（`Settings::validate_retry_max` 缺省 3，
+   * crates/core/src/config.rs）。
+   *
+   * 诚实说明：该值**没有端点下发**（本 effort 是纯前端视觉替换，规格 Out of Scope
+   * 明确不改任何端点），故这里镜像后端缺省，与「app.css 手工镜像 token」同一姿态。
+   * 代价：用户把 `validate_retry_max` 改成非 3 的值后，运行中进度条的**分母会偏**。
+   * 但最要紧的那条信号不受影响——「是不是最后一次」由后端下发的
+   * `pending_reason.type === 'retry_exhausted'` 权威给出，届时整条转红。
+   * 若日后加了端点，删掉本常量改读接口即可（前端只有货箱量表一处消费）。
+   */
+  retryLimitMirror: 3,
   /** 道具栏槽位边长。 */
   slot: 34,
   /** 看板列宽 × 列数。 */

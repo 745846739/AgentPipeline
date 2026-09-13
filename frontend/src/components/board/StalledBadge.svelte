@@ -16,9 +16,8 @@
     display: inline-block;
     flex: none;
     color: var(--pending);
-    font-size: 9.5px;
-    font-weight: 600;
-    letter-spacing: 0.05em;
+    font-size: 12px;
+    letter-spacing: 0.04em;
     white-space: nowrap;
   }
 </style>

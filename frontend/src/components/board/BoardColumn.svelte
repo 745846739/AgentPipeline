@@ -1,7 +1,9 @@
 <script lang="ts">
   import type { AllowedAction, BranchCursor, TaskListItem } from '../../api/types';
   import type { BoardColumnDef } from '../../lib/pipeline';
-  import { EMPTY_HINTS } from '../../lib/pipeline';
+  import { COLUMN_SPRITES, EMPTY_HINTS, workerRhythm } from '../../lib/pipeline';
+  import { WORKER_FRAMES } from '../../theme/contract';
+  import Sprite from '../render/Sprite.svelte';
   import TaskCard from './TaskCard.svelte';
 
   interface Props {
@@ -33,34 +35,79 @@
   const spineTasks = $derived(allTasks ?? tasks);
   const hasPending = $derived(spineTasks.some((t) => t.status === 'pending'));
   const hasRunning = $derived(spineTasks.some((t) => t.status === 'running'));
-  /** 脊线三态（theme-3 §8）：pending 优先于 running，其余为无车。 */
-  const spineState = $derived(hasPending ? 'pen' : hasRunning ? 'live' : '');
+  const hasFailed = $derived(
+    spineTasks.some((t) => t.status === 'failed' || t.status === 'cancelled'),
+  );
+  const allDone = $derived(spineTasks.length > 0 && spineTasks.every((t) => t.status === 'done'));
 
   /**
-   * 段头站点字标（移动版）：live / pending 为 `◆`，整列完成 `●`，
-   * 空列 `○`——与原型 `.spmk` 逐字一致。
+   * 站段三态（优先序与契约 `STATE_STYLES` 一致）：急停琥珀 > 在跑绿 > 失败红 > 归档灰 > 空。
    */
-  const mark = $derived(
-    hasPending || hasRunning
-      ? '◆'
-      : spineTasks.length > 0 && spineTasks.every((t) => t.status === 'done')
-        ? '●'
-        : '○',
+  const colState = $derived(
+    hasPending
+      ? 'pen'
+      : hasRunning
+        ? 'live'
+        : hasFailed
+          ? 'fail'
+          : allDone
+            ? 'don'
+            : 'idle',
   );
+
+  /** 列头信号灯状态（契约 `StationState` 词表）。 */
+  const stationState = $derived(
+    hasPending ? 'warn' : hasRunning ? 'go' : hasFailed ? 'stop' : allDone ? 'done' : 'idle',
+  );
+
+  /** 挥锤小人节奏：run 快挥 / wait 慢挥 / idle 站立（帧切换为离散 opacity 翻转）。 */
+  const rhythm = $derived(workerRhythm(stationState));
+
+  /** 工位图标着色阶（与契约 `STATE_STYLES.lamp` 同源）：仅失败列换告警色，其余中性。 */
+  function lampClass(state: string): string {
+    return state === 'stop' ? 'fail' : '';
+  }
 
   /** 该列有任务但被当前过滤全部滤掉（移动版隐藏卡与空态，保留脊线/段头）。 */
   const hideCards = $derived(tasks.length === 0 && spineTasks.length > 0);
 </script>
 
-<section class="col {spineState} {hideCards ? 'hide-cards' : ''}">
-  <div class="col-spine"><i class="spine-rule {spineState}"></i></div>
+<section class="col {colState} {hideCards ? 'hide-cards' : ''}">
+  <div class="col-spine"><i class="spine-rule {colState}"></i></div>
   <div class="col-main">
     <div class="col-head sec-head">
-      <span class="spmk {spineState}">{mark}</span>
-      <span class="col-name sec-name">{column.label}</span>
+      <span class="col-name sec-name">
+        <i class="sp {lampClass(stationState)}"><Sprite name={COLUMN_SPRITES[column.key]} /></i
+        >{column.label}
+      </span>
+      <span class="worker {rhythm}" aria-hidden="true">
+        <svg
+          class="f1"
+          viewBox="0 0 8 8"
+          width="16"
+          height="16"
+          shape-rendering="crispEdges"
+          fill="currentColor"
+        >
+          {#each WORKER_FRAMES.raised as r, i (i)}
+            <rect x={r.x} y={r.y} width={r.w} height={r.h} />
+          {/each}
+        </svg>
+        <svg
+          class="f2"
+          viewBox="0 0 8 8"
+          width="16"
+          height="16"
+          shape-rendering="crispEdges"
+          fill="currentColor"
+        >
+          {#each WORKER_FRAMES.struck as r, i (i)}
+            <rect x={r.x} y={r.y} width={r.w} height={r.h} />
+          {/each}
+        </svg>
+      </span>
       <i class="col-rule sec-rule"></i>
-      {#if tasks.length > 0}<span class="col-n sec-n col-n-desk">{tasks.length}</span>{/if}
-      {#if spineTasks.length > 0}<span class="sec-n col-n-mob">{spineTasks.length}</span>{/if}
+      <span class="sec-n col-n col-n-desk">{tasks.length}</span>
     </div>
 
     <div class="col-body">
@@ -83,10 +130,89 @@
 </section>
 
 <style>
+  /* 工位图标随列头状态取色（currentColor），形状保持 8×8 脆边 */
+  .sp {
+    display: inline-block;
+    line-height: 0;
+    margin-right: 6px;
+    vertical-align: -3px;
+    color: var(--text-3);
+  }
+  /* 已归档 / 失败列的工位图标用告警色（原型 `.col.arch .col-head .sp`） */
+  .sp.fail {
+    color: var(--stop);
+  }
+
+  /* 列头小人：run 快挥 0.6s / wait 慢挥 1.8s / idle 站立；双帧离散翻转 */
+  .worker {
+    position: relative;
+    display: inline-block;
+    width: 16px;
+    height: 16px;
+    margin-left: 8px;
+    flex: none;
+  }
+  .worker svg {
+    position: absolute;
+    inset: 0;
+  }
+  .worker .f2 {
+    opacity: 0;
+  }
+  .worker.run {
+    color: var(--go);
+  }
+  .worker.wait {
+    color: var(--pending);
+  }
+  .worker.idle {
+    color: var(--text-4);
+  }
+  @keyframes wA {
+    0%,
+    50% {
+      opacity: 1;
+    }
+    50.01%,
+    100% {
+      opacity: 0;
+    }
+  }
+  @keyframes wB {
+    0%,
+    50% {
+      opacity: 0;
+    }
+    50.01%,
+    100% {
+      opacity: 1;
+    }
+  }
+  .worker.run .f1 {
+    animation: wA 0.6s steps(2) infinite;
+  }
+  .worker.run .f2 {
+    animation: wB 0.6s steps(2) infinite;
+  }
+  .worker.wait .f1 {
+    animation: wA 1.8s steps(2) infinite;
+  }
+  .worker.wait .f2 {
+    animation: wB 1.8s steps(2) infinite;
+  }
+  .col.don .worker {
+    color: var(--done);
+  }
+  @media (prefers-reduced-motion: reduce) {
+    .worker svg {
+      animation: none !important;
+    }
+  }
+
   .col {
     width: var(--rail-col-width);
     flex: none;
-    border-right: 1px solid var(--pane);
+    border-right: 2px solid var(--pane);
     display: flex;
     flex-direction: column;
   }
@@ -96,7 +222,6 @@
   /* 移动版专属装饰：桌面不参与布局（display:contents 让内容拍平进 .col 弹性列）。 */
   .col-spine,
   .col-rule,
-  .spmk,
   .col-n-mob {
     display: none;
   }
@@ -108,28 +233,44 @@
     display: flex;
     justify-content: space-between;
     align-items: center;
-    gap: 8px;
-    padding: 9px 12px;
-    border-bottom: 1px solid var(--pane);
-    background: var(--head-band);
-    font-size: 10.5px;
-    font-weight: 600;
+    gap: 6px;
+    padding: 8px 12px;
+    border-bottom: 2px solid var(--pane);
+    background: var(--bg);
+    font-size: 12px;
     letter-spacing: 0.08em;
-    text-transform: uppercase;
     color: var(--text-3);
   }
+  .col-name {
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    flex: 1;
+  }
+  /* 工位图标与名称同行，名称不换行 */
   .col-n {
     color: var(--text-4);
-    font-weight: 400;
     font-variant-numeric: tabular-nums;
   }
   .col-empty {
-    padding: 14px 12px;
+    margin: 12px;
+    padding: 10px 12px;
+    border: 2px solid var(--pane);
     color: var(--text-4);
-    font-size: 11.5px;
+    font-size: 12px;
+  }
+  /* 待处理列：站点灯与名称转琥珀（全站唯一告警） */
+  .col.pen .col-name {
+    color: var(--pending);
+  }
+  .col.pen .sp {
+    color: var(--pending);
+  }
+  .col.live .col-name {
+    color: var(--text-hi);
   }
 
-  /* ── 移动版：段落（脊线 + 段头字段条 + 电文行组，theme-3 §8） ── */
+  /* ── 移动版：段落（脊线 + 段头字段条 + 货箱行组；完整转写见票 11） ── */
   @media (max-width: 479px) {
     .col {
       width: 100%;
@@ -152,8 +293,6 @@
     .col-body {
       display: block;
     }
-    /* .sec-head 提供字段条内边距/底色/下框线（app.css 共享原语）；
-       显式覆盖桌面基础规则的同名属性，避免作用域高特异性胜出 */
     .col-head {
       position: relative;
       z-index: 1;
@@ -162,42 +301,14 @@
       padding: 6px 6px 7px 12px;
       min-height: 32px;
       background: var(--head-band);
-      border-bottom: 1px solid var(--pane);
-      font-size: inherit;
-      font-weight: inherit;
+      border-bottom: 2px solid var(--hairline);
       letter-spacing: normal;
-      text-transform: none;
       color: var(--text-3);
-    }
-    .spmk {
-      display: block;
-      position: absolute;
-      left: -26px;
-      top: 50%;
-      transform: translateY(-50%);
-      width: 26px;
-      text-align: center;
-      background: var(--mask-bg);
-      font-size: 13px;
-      line-height: 1;
-      color: var(--text-3);
-    }
-    .spmk.pen {
-      color: var(--pending);
-      animation: breath 2.4s ease-in-out infinite;
-    }
-    .spmk.live {
-      color: var(--text-hi);
     }
     .col-name {
       flex: none;
       white-space: nowrap;
-    }
-    .col.live .col-name {
-      color: var(--text-hi);
-    }
-    .col.pen .col-name {
-      color: var(--pending);
+      letter-spacing: 0.08em;
     }
     .col-rule {
       display: block;
@@ -205,17 +316,12 @@
     .col-n-desk {
       display: none;
     }
-    .col-n-mob {
-      display: inline;
-    }
     .col-empty {
-      padding: 2px 0 6px;
-      font-size: 12.5px;
+      margin: 10px 0 6px;
+      padding: 0;
+      border: 0;
+      font-size: 12px;
       color: var(--text-4);
-    }
-    .col-empty::before {
-      content: '-- 列空 -- ';
-      color: var(--text-3);
     }
     .col.hide-cards .col-body {
       display: none;

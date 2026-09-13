@@ -2,6 +2,8 @@
   import type { AllowedAction, BranchCursor, TaskListItem } from '../../api/types';
   import {
     branchShort,
+    crateState,
+    crateTone,
     formatDuration,
     formatTokens,
     miniRailState,
@@ -11,8 +13,10 @@
   } from '../../lib/pipeline';
   import PipelineRail from '../pipeline/PipelineRail.svelte';
   import BranchPill from '../pipeline/BranchPill.svelte';
+  import Gauge from '../render/Gauge.svelte';
   import PendingActions from './PendingActions.svelte';
   import StalledBadge from './StalledBadge.svelte';
+  import BossBar from './BossBar.svelte';
 
   interface Props {
     task: TaskListItem;
@@ -29,22 +33,38 @@
   const visibleCursors = $derived(
     (cursors.length ? cursors : task.branches).filter((c) => c.status !== 'archived'),
   );
+  const state = $derived(crateState(task));
+  const tone = $derived(crateTone(state));
   const isPending = $derived(task.status === 'pending');
   const isTerminal = $derived(
     task.status === 'done' || task.status === 'failed' || task.status === 'cancelled',
   );
   const durationMs = $derived(taskDuration(task));
   const hours = $derived(stalledHours(task));
-  const reason = $derived(task.pending_reason ?? visibleCursors.find((c) => c.pending_reason)?.pending_reason ?? null);
+  const reason = $derived(
+    task.pending_reason ?? visibleCursors.find((c) => c.pending_reason)?.pending_reason ?? null,
+  );
+
+  /** 该任务是否已耗尽重试（后端权威信号：pending 类型 retry_exhausted）。 */
+  const exhausted = $derived(reason?.type === 'retry_exhausted');
+  /** 运行中的货箱才带 boss 尝试条（尝试数只在"还在跑"时有意义）。 */
+  const showBoss = $derived(task.status === 'running');
+  const attempts = $derived(
+    Math.max(task.validate_attempts, ...visibleCursors.map((c) => c.validate_attempts), 0),
+  );
 
   function isBusy(action: AllowedAction, cursorId?: string): boolean {
-    return actionBusy === `${task.id}:${action.action}` || actionBusy === `${action.action}:${cursorId ?? ''}`;
+    return (
+      actionBusy === `${task.id}:${action.action}` ||
+      actionBusy === `${action.action}:${cursorId ?? ''}`
+    );
   }
 </script>
 
-<article
-  class="card {isPending || task.stalled ? 'warn' : ''} {task.status === 'failed' || task.status === 'cancelled' ? 'stopped' : ''} {task.stalled ? 'stalled' : ''} {isTerminal && task.status === 'done' ? 'mute' : ''}"
->
+<!-- 货箱（决策 169 / theme-6-pixel.md §3）：2px 描边盒 + dither 顶盖带 + 4px 硬投影。
+     一张货箱 = 一枚灯 + 一种描边色；灯是实心像素方块，绝不作大面积底色。 -->
+<article class="card {state}">
+  <i class="lamp {state}" aria-hidden="true"></i>
   <a
     class="card-link"
     href={`#/task/${task.id}`}
@@ -76,8 +96,8 @@
   {/if}
 
   {#if isPending && reason}
-    <div class="reason warn">
-      <span class="rlabel cond">{pendingLabel(reason)}</span><br />
+    <div class="reason">
+      <span class="rlabel">{pendingLabel(reason)}</span><br />
       {reason.message}
     </div>
   {/if}
@@ -97,6 +117,10 @@
     <div class="ctxlink"><span>前往详情处理 ▸</span></div>
   {/if}
 
+  {#if showBoss}
+    <BossBar used={attempts} {exhausted} />
+  {/if}
+
   {#if task.status === 'waiting'}
     <div class="tagline">等待依赖完成</div>
   {:else if task.status === 'queued'}
@@ -104,6 +128,7 @@
   {/if}
 
   <div class="meta">
+    <Gauge tokens={task.total_tokens} {tone} />
     <span><b>{formatTokens(task.total_tokens)}</b> tok</span>
     <span><b>{task.total_calls}</b> 次调用</span>
     {#if task.branch_name}<span>{task.branch_name}</span>{/if}
@@ -114,33 +139,86 @@
 </article>
 
 <style>
+  /* 货箱：2px 描边 + 4px 硬投影；顶盖 6px dither 带是"这东西是实体"的材质提示 */
   .card {
     position: relative;
-    padding: 11px 12px 12px;
-    border-bottom: 1px solid var(--hairline);
+    border: 2px solid var(--pane);
+    background: var(--panel);
+    box-shadow: 4px 4px 0 var(--ink);
+    margin: 12px;
+    padding: 0 0 10px;
     cursor: pointer;
-    transition: background 0.12s;
   }
-  .card:last-child {
-    border-bottom: 0;
+  .card::before {
+    content: '';
+    position: absolute;
+    top: 0;
+    left: 0;
+    right: 0;
+    height: 6px;
+    background-image: conic-gradient(
+      var(--wash) 25%,
+      transparent 0 50%,
+      var(--wash) 0 75%,
+      transparent 0
+    );
+    background-size: 4px 4px;
+  }
+  .card > * {
+    position: relative;
+  }
+  .card > .card-link {
+    position: absolute;
+  }
+  .card > :first-child:not(.card-link):not(.lamp) {
+    margin-top: 8px;
   }
   .card:hover {
-    background: var(--hover-bg);
+    border-color: var(--text-2);
   }
-  .card.warn {
-    box-shadow: inset 2px 0 0 var(--pending);
+  /* 一枚灯 + 一种描边色：pending 琥珀 / failed 红 / queued·waiting 无灯 */
+  .card.pending {
+    border-color: var(--pending);
+    box-shadow:
+      inset 4px 0 0 var(--pending),
+      4px 4px 0 var(--ink);
   }
-  .card.stopped {
-    box-shadow: inset 2px 0 0 var(--stop);
+  .card.failed {
+    border-color: var(--stop);
+    box-shadow:
+      inset 4px 0 0 var(--stop),
+      4px 4px 0 var(--ink);
   }
-  .card.stalled {
-    background: var(--panel);
+  .card.done {
+    box-shadow: none;
   }
-  .card.stalled:hover {
-    background: var(--wash);
+  .card.done:hover {
+    border-color: var(--text-4);
+  }
+  /* 灯：实心像素方块，压在顶盖带右端 */
+  .lamp {
+    position: absolute;
+    top: 14px;
+    right: 10px;
+    width: 8px;
+    height: 8px;
+    background: var(--done);
+  }
+  .lamp.running {
+    background: var(--go);
+  }
+  .lamp.pending {
+    background: var(--pending);
+  }
+  .lamp.failed {
+    background: var(--stop);
+  }
+  .lamp.queued,
+  .lamp.waiting {
+    background: transparent;
+    border: 2px solid var(--text-4);
   }
   .card-link {
-    position: absolute;
     inset: 0;
     z-index: 1;
   }
@@ -148,7 +226,6 @@
     text-decoration: none;
   }
   .card > :not(.card-link) {
-    position: relative;
     z-index: 0;
   }
   .card-top {
@@ -156,25 +233,25 @@
     justify-content: space-between;
     align-items: baseline;
     gap: 8px;
+    padding: 14px 12px 0;
   }
   .card-title {
     min-width: 0;
-    font-weight: 500;
-    font-size: 12.5px;
+    font-size: 12px;
+    line-height: 1.5;
     color: var(--text-hi);
   }
-  .card.warn .card-title::before {
-    content: '! ';
+  /* 急停货箱：标题前缀 ?!（与琥珀左缘条对应的双编码） */
+  .card.pending .card-title::before {
+    content: '?! ';
     color: var(--pending);
-    font-weight: 600;
   }
-  .card.mute .card-title {
+  .card.done .card-title {
     color: var(--text-2);
-    font-weight: 400;
   }
   .dur {
     flex: none;
-    font-size: 11px;
+    font-size: 12px;
     color: var(--text-3);
     font-variant-numeric: tabular-nums;
   }
@@ -182,29 +259,23 @@
     display: flex;
     flex-direction: column;
     gap: 4px;
-    margin: 8px 0;
+    margin: 8px 12px;
   }
   .reason {
-    margin: 8px 0;
-    font-size: 11.5px;
+    margin: 8px 12px;
+    font-size: 12px;
+    line-height: 1.7;
     color: var(--text-2);
-    border-left: 2px solid var(--hairline);
-    padding-left: 10px;
-  }
-  .reason.warn {
-    border-left-color: var(--pending);
   }
   .rlabel {
     color: var(--pending);
-    font-weight: 600;
-    font-size: 11px;
   }
   .rlabel::before {
     content: '> ';
   }
   .ctxlink {
-    margin: 2px 0 4px;
-    font-size: 11px;
+    margin: 2px 12px 4px;
+    font-size: 12px;
     color: var(--text-3);
   }
   /* 必须压过整卡导航链接（`.card-link`，z-index 1）。上面 `.card > :not(.card-link)`
@@ -213,99 +284,48 @@
      卡片动作按钮被链接覆盖，点击只跳详情（Playwright 报 element intercepts pointer events），
      即「看板卡上的动作按钮点不动」这个用户可见缺陷。 */
   .card > .actions {
-    margin-top: 8px;
+    margin: 8px 12px 0;
     position: relative;
     z-index: 2;
   }
   .tagline {
+    padding: 0 12px;
     margin-top: 6px;
-    font-size: 11px;
+    font-size: 12px;
     color: var(--text-3);
   }
   .meta {
     display: flex;
+    align-items: center;
     gap: 10px;
     flex-wrap: wrap;
-    margin-top: 7px;
-    font-size: 10.5px;
+    margin: 8px 12px 10px;
+    font-size: 12px;
     color: var(--text-3);
     font-variant-numeric: tabular-nums;
   }
   .meta b {
     color: var(--text-hi);
-    font-weight: 500;
   }
 
-  /* ── 移动版：电文行组（theme-3 §8，原型 .tg） ── */
+  /* ── 移动版：货箱行组（完整转写见票 11） ── */
   @media (max-width: 479px) {
     .card {
-      padding: 10px 0 11px 12px;
-      border-bottom: 1px solid var(--hairline);
-    }
-    /* pending 由脊线/段头承担信号，卡上不再加琥珀左缘 */
-    .card.warn {
-      box-shadow: none;
-    }
-    .card.stopped {
-      box-shadow: inset 2px 0 0 var(--stop);
+      margin: 0 0 10px;
+      padding-bottom: 11px;
     }
     .card-title {
       font-size: 14px;
-      line-height: 1.45;
     }
-    .card.warn .card-title::before {
-      content: '! ';
-    }
-    .dur {
-      font-size: 12px;
-    }
-    :global(.card .card-top .stalltag) {
-      font-size: 11px;
-      letter-spacing: 0.05em;
-    }
-    .pillrow {
-      margin: 6px 0 7px;
-    }
-    /* 分支/状态行按 .tg-st 字号（13px，次文本） */
     .pillrow :global(.pill) {
-      font-size: 13px;
-      color: var(--text-2);
       border: 0;
       padding: 0;
       gap: 6px;
       align-items: baseline;
     }
-    .pillrow :global(.pill .bl) {
-      font-size: 11px;
-      font-weight: 600;
-    }
-    .pillrow :global(.pill .mono) {
-      color: var(--text-2);
-    }
-    .reason {
-      margin: 9px 0 8px;
-      font-size: 13px;
-      line-height: 1.6;
-      padding-left: 10px;
-    }
-    .rlabel {
-      font-size: 12.5px;
-    }
-    .ctxlink {
-      font-size: 13px;
-      color: var(--text-2);
-    }
-    .tagline {
-      margin-top: 6px;
-      font-size: 12.5px;
-    }
-    .actions {
-      margin-top: 10px;
-    }
     .meta {
       font-size: 12px;
-      gap: 10px;
-      margin-top: 8px;
+      margin: 8px 12px 0;
     }
   }
 </style>

@@ -172,12 +172,20 @@ test.describe('前端 E2E ⑧：并发第二任务', () => {
       const devCursor = cursors.find((c) => c.branch === 'develop-design')!;
       const testCursor = cursors.find((c) => c.branch === 'test-design')!;
 
-      // ── 看板卡：动作按分支分组，组头是 [dev] / [test]（决策 84：用字标不用色相） ──
+      // ── 看板卡：动作按分支分组，组头带分支身份 ──
+      // 像素主题（决策 169 对决策 84 的手段变更）：分支消歧由 `[dev]`/`[tst]` **文字标签**
+      // 改为**徽章色相**（`--branch-dev` 蓝 / `--branch-tst` 紫）+ 文字双编码。
+      // 语义不变（按分支分组、逐游标下发动作），变更的只是视觉手段——故这里断言分支身份
+      // 与其徽章色，而不是方括号字面量。
       await page.goto(`${app.webBase}/#/`);
       await settleBundle(page, bundle);
       const card = page.locator('article.card', { hasText: title });
       await expect(card).toBeVisible({ timeout: 60_000 });
-      await expect(card.locator('.head-label')).toHaveText(['[dev]', '[test]']);
+      const headLabels = card.locator('.head-label');
+      await expect(headLabels).toHaveText(['[dev]', '[test]']);
+      // 徽章色相 = 分支身份（蓝 dev / 紫 tst），与文字双编码
+      await expect(headLabels.nth(0)).toHaveCSS('color', 'rgb(89, 167, 255)');
+      await expect(headLabels.nth(1)).toHaveCSS('color', 'rgb(192, 139, 255)');
       // 后端下发的动作**总是**带 cursor_id，故决策 91 的「多游标选择器」兜底不渲染——
       // 这是安全方向（用户不可能把分支选错），此处一并钉住。
       await expect(card.locator('.picker')).toHaveCount(0);

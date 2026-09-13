@@ -14,6 +14,9 @@
   const kind = $derived(branchKind(cursor.branch));
   const isPending = $derived(cursor.status === 'pending');
 
+  /** 分支徽章文字（与色相双编码，决策 169）：main 中性，dev / tst 带分支身份。 */
+  const branchBadge = $derived(kind === 'main' ? 'main' : `[${kind}]`);
+
   const statusText = $derived.by(() => {
     if (isPending) return '[WAIT]';
     if (cursor.status === 'active') return '[RUN]';
@@ -52,39 +55,52 @@
 
 <button
   type="button"
-  class="pill {isPending ? 'pend' : ''} {selected ? 'selected' : ''}"
+  class="pill {kind} {isPending ? 'pend' : ''} {selected ? 'selected' : ''}"
   onclick={handle}
   title="cursor_id: {cursor.cursor_id} · {statusHint}"
 >
-  <b class="bl">[{kind === 'main' ? 'main' : kind}]</b>
+  <b class="bl">{branchBadge}</b>
   <span class="mono">{cursor.branch} · {cursor.node}</span>
   <span class="st {statusClass}">{statusText}</span>
 </button>
 
 <style>
-  /* 分支不用色相，用 [dev]/[tst] 文字标签（决策 84）；状态与文字双编码。 */
+  /* 分支身份 = 徽章色相（蓝 dev / 紫 tst，决策 169 对决策 84 的手段变更）
+     + 文字双编码（[dev] / [tst] 仍在），色相不单独承载语义。 */
   .pill {
     display: inline-flex;
     align-items: center;
     gap: 6px;
     align-self: flex-start;
     font-family: var(--font-code);
-    font-size: 10.5px;
+    font-size: 12px;
     padding: 2px 7px;
     border-radius: var(--r-pill);
     background: transparent;
     color: var(--text-2);
-    border: 1px solid var(--hairline);
+    border: 2px solid var(--hairline);
   }
   .pill:hover {
     border-color: var(--text-2);
     color: var(--text-hi);
   }
   .bl {
-    font-weight: 600;
-    font-size: 10px;
+    font-size: 12px;
     letter-spacing: 0.04em;
     color: var(--text-3);
+  }
+  /* 徽章色相：仅开发设计 / 测试设计两条分支（main 保持中性） */
+  .pill.dev .bl {
+    color: var(--branch-dev);
+  }
+  .pill.test .bl {
+    color: var(--branch-tst);
+  }
+  .pill.pend.dev {
+    border-color: var(--branch-dev);
+  }
+  .pill.pend.test {
+    border-color: var(--branch-tst);
   }
   .pill.selected {
     border-color: var(--text-hi);

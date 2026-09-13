@@ -3,8 +3,9 @@
   import { RAIL_LABELS, railTokens, tokenLitsSegment } from '../../lib/pipeline';
 
   /**
-   * 字符轨道（theme-3 §3 共享元素映射）：结构靠字符与亮度，不靠盒子与 SVG。
+   * 传送带轨道（决策 169 / theme-6-pixel.md §3）：像素灯 + 链节取代字符线路行。
    * 三种密度：spine（看板列头脊线）/ hero（任务详情）/ mini（卡片迷你轨，9 刻度）。
+   * 站点状态一律用灯表达（亮 / 半亮 / 空 / 琥珀 / 红），不再靠字符字形。
    */
   interface Props {
     variant: 'spine' | 'hero' | 'mini' | 'vrail';
@@ -19,27 +20,8 @@
 
   const tokens = $derived(railTokens(dots));
 
-  /** 站点标记字符：与 frontend-design §6.1 图例逐字一致。 */
-  function glyph(state: string): string {
-    switch (state) {
-      case 'done':
-        return '✓';
-      case 'go':
-        return '●';
-      case 'warn':
-        return '⏸';
-      case 'stop':
-        return '✗';
-      case 'dev':
-      case 'test':
-        return '●';
-      default:
-        return '○';
-    }
-  }
-
-  /** 标记色彩阶（亮度编码 + 状态例外色）。 */
-  function mkClass(state: string): string {
+  /** 灯状态类：与契约 `STATE_STYLES.lamp` 的取色同源（d 完成 / p 已过 / c 在跑 / w 琥珀 / x 红）。 */
+  function lampClass(state: string): string {
     switch (state) {
       case 'done':
         return 'd';
@@ -57,10 +39,14 @@
     }
   }
 
+  /** 迷你轨刻度：p 已过 / d 完成 / c 当前 / v 分叉 / w 琥珀 / x 红 / t test 未决 / f 未到。 */
+  function miniClass(t: string): string {
+    return t === 'd' ? 'dd' : t;
+  }
+
   function lbClass(state: string): string {
     switch (state) {
       case 'idle':
-        return 'lb dim';
       case 'done':
         return 'lb dim';
       case 'go':
@@ -72,7 +58,7 @@
     }
   }
 
-  /** 移动版纵向站点状态类（theme-3 §8：完成 / 当前 / 等待 / 失败）。 */
+  /** 移动版纵向站点状态类（完成 / 当前 / 等待 / 失败）。 */
   function vClass(state: string): string {
     switch (state) {
       case 'done':
@@ -90,27 +76,9 @@
     }
   }
 
-  /** 并行分支的纵向状态字符（✓ 完成 / ◆ 当前 / ⏸ 等待 / ✗ 失败 / ○ 未开始）。 */
-  function vMark(state: string): string {
-    switch (state) {
-      case 'done':
-        return '✓';
-      case 'go':
-      case 'dev':
-      case 'test':
-        return '◆';
-      case 'warn':
-        return '⏸';
-      case 'stop':
-        return '✗';
-      default:
-        return '○';
-    }
-  }
-
   /**
-   * 纵向 8 行（theme-3 §8 / 原型）：desktop 的 9 站里并行双站合并为一行
-   * `develop-design ∥ test-design`，分支状态收进 vsub（`[dev]✓ [tst]✓`）。
+   * 纵向 8 行（原型移动款）：desktop 的 9 站里并行双站合并为一行
+   * `develop-design ∥ test-design`，分支状态收进 vsub。
    */
   const vrailRows = $derived.by(() => {
     const rows: {
@@ -130,7 +98,9 @@
       }
       rows.push({
         key: s.key,
-        label: s.parallel ? RAIL_LABELS['develop-design'] + ' ∥ ' + RAIL_LABELS['test-design'] : s.label,
+        label: s.parallel
+          ? RAIL_LABELS['develop-design'] + ' ∥ ' + RAIL_LABELS['test-design']
+          : s.label,
         state: s.state,
         count: s.count,
         branches: s.parallel ? [{ kind: s.parallel, state: s.state }] : undefined,
@@ -141,24 +111,26 @@
 </script>
 
 {#if variant === 'mini'}
+  <!-- 卡片迷你轨道：9 刻度像素方块 + 链节，游标处点亮（§3「看板卡」） -->
   <div class="rail mini" role="img" aria-label={ariaLabel}>
     {#each tokens as t, i (i)}
-      <span class="d {t}"></span>
-      {#if i < tokens.length - 1}<span class="s {tokenLitsSegment(t) ? 'lit' : ''}"></span>{/if}
+      <i class="d {miniClass(t)}"></i>
+      {#if i < tokens.length - 1}<i class="s {tokenLitsSegment(t) ? 'lit' : ''}"></i>{/if}
     {/each}
   </div>
 {:else if variant === 'vrail'}
-  <!-- 移动版纵向脊线（theme-3 §8）：8 站（并行双站合并为一行）+ 站段三态 -->
+  <!-- 移动版纵向脊线：8 站（并行双站合并为一行）+ 站段三态（完整转写见票 11） -->
   <ul class="vrail" aria-label={ariaLabel}>
     {#each vrailRows as row (row.key)}
       <li class="vst {vClass(row.state)}">
-        <span class="vmk">{vMark(row.state)}</span>
+        <span class="vmk"><i class="lamp {lampClass(row.state)}"></i></span>
         <span class="vname">{row.label}</span>
         {#if row.branches}
           <span class="vsub"
-            >{#each row.branches as b, i (b.kind)}<b class="bl" style={i > 0 ? 'margin-left:7px' : ''}
-              >[{b.kind}]</b
-            >{vMark(b.state)}{/each}</span
+            >{#each row.branches as b, i (b.kind)}<b
+                class="bl {b.kind === 'test' ? 't' : ''}"
+                style={i > 0 ? 'margin-left:7px' : ''}>[{b.kind}]</b
+              >{/each}</span
           >
         {:else if row.count !== undefined}
           <span class="vmeta">{row.count}</span>
@@ -170,21 +142,23 @@
   <div class="rail {variant}" role="img" aria-label={ariaLabel}>
     <div class="railline">
       {#if variant === 'spine'}
-        <div class="ln" style="left:132px;width:1848px;top:36px"></div>
-        <div class="ln br" style="left:396px;width:528px;top:22px"></div>
-        <div class="ln br" style="left:396px;width:528px;top:50px"></div>
-        <div class="ln vt" style="left:396px;top:22px"></div>
-        <div class="ln vt" style="left:924px;top:22px"></div>
+        <!-- 主链节带 + 并行双带（在 develop 前合流） -->
+        <div class="belt" style="left:132px;width:1848px;top:36px"></div>
+        <div class="belt br" style="left:396px;width:528px;top:22px"></div>
+        <div class="belt br" style="left:396px;width:528px;top:50px"></div>
+        <div class="belt vt" style="left:396px;top:22px"></div>
+        <div class="belt vt" style="left:924px;top:22px"></div>
+        <!-- 回流带（打回路径，虚线） -->
         <div class="ret" style="left:396px;width:264px;top:76px"><i>↩</i></div>
         <div class="ret" style="left:924px;width:264px;top:88px"><i>↩</i></div>
         <div class="ret" style="left:1452px;width:264px;top:76px"><i>↩</i></div>
         <div class="ret" style="left:924px;width:792px;top:100px"><i>↩</i></div>
       {:else}
-        <div class="ln" style="left:50px;width:845px;top:36px"></div>
-        <div class="ln br" style="left:145px;width:355px;top:22px"></div>
-        <div class="ln br" style="left:145px;width:355px;top:50px"></div>
-        <div class="ln vt" style="left:145px;top:22px"></div>
-        <div class="ln vt" style="left:500px;top:22px"></div>
+        <div class="belt" style="left:50px;width:845px;top:36px"></div>
+        <div class="belt br" style="left:145px;width:355px;top:22px"></div>
+        <div class="belt br" style="left:145px;width:355px;top:50px"></div>
+        <div class="belt vt" style="left:145px;top:22px"></div>
+        <div class="belt vt" style="left:500px;top:22px"></div>
         <div class="ret" style="left:145px;width:165px;top:72px"><i>↩</i></div>
         <div class="ret" style="left:500px;width:110px;top:84px"><i>↩</i></div>
         <div class="ret" style="left:715px;width:105px;top:72px"><i>↩</i></div>
@@ -193,18 +167,13 @@
 
       {#each stations as s (s.key)}
         {#if s.parallel}
-          <div
-            class="stn side {s.parallel === 'dev' ? 'up' : 'dn'}"
-            style="left:{s.x}px;top:{s.y}px"
-          >
-            <span class="mk {mkClass(s.state)}">{glyph(s.state)}</span>
-            <span class="lb"
-              ><b>[{s.parallel === 'dev' ? 'dev' : 'tst'}]</b>{s.label}</span
-            >
+          <div class="stn side {s.parallel === 'dev' ? 'up' : 'dn'}" style="left:{s.x}px;top:{s.y}px">
+            <i class="lamp {lampClass(s.state)}"></i>
+            <span class="lb {s.parallel === 'test' ? 't' : ''}">{s.label}</span>
           </div>
         {:else}
           <div class="stn" style="left:{s.x}px">
-            <span class="mk {mkClass(s.state)}">{glyph(s.state)}</span>
+            <i class="lamp {lampClass(s.state)}"></i>
             <span class={lbClass(s.state)}>{s.label}</span>
             {#if s.count !== undefined}<span class="ct">{s.count}</span>{/if}
           </div>
@@ -215,94 +184,75 @@
 {/if}
 
 <style>
-  /* ── 迷你轨（卡片身份特征，9 刻度） ── */
+  /* ── 迷你轨（卡片身份特征，9 刻度）：像素方块 + 链节，取代字符 ●○◆ ── */
   .rail.mini {
     display: flex;
     align-items: center;
-    min-height: 15px;
+    min-height: 12px;
     margin: 8px 0 7px;
   }
   .rail.mini .d {
     flex: none;
-    width: 13px;
-    text-align: center;
-    font-size: 10.5px;
-    line-height: 1;
-    color: var(--text-4);
+    width: 6px;
+    height: 6px;
+    background: var(--pane);
   }
-  .rail.mini .d::before {
-    content: '○';
-  }
-  .rail.mini .d.p {
-    color: var(--text-2);
-  }
-  .rail.mini .d.p::before {
-    content: '●';
-  }
-  .rail.mini .d.d {
-    color: var(--text-3);
-  }
-  .rail.mini .d.d::before {
-    content: '●';
+  .rail.mini .d.p,
+  .rail.mini .d.dd {
+    background: var(--belt-lit);
   }
   .rail.mini .d.c,
   .rail.mini .d.v {
-    color: var(--text-hi);
-  }
-  .rail.mini .d.c::before,
-  .rail.mini .d.v::before {
-    content: '◆';
+    background: var(--go);
   }
   .rail.mini .d.w {
-    color: var(--pending);
-  }
-  .rail.mini .d.w::before {
-    content: '◆';
+    background: var(--pending);
   }
   .rail.mini .d.x {
-    color: var(--stop);
-  }
-  .rail.mini .d.x::before {
-    content: '◆';
+    background: var(--stop);
   }
   .rail.mini .d.t {
-    color: var(--text-3);
-  }
-  .rail.mini .d.t::before {
-    content: '◇';
+    background: transparent;
+    border: 2px solid var(--pane);
   }
   .rail.mini .s {
     flex: 1;
-    height: 1px;
-    background: var(--hairline);
+    height: 4px;
+    background: var(--pane);
   }
   .rail.mini .s.lit {
-    background: var(--lit);
+    background: var(--belt-lit);
   }
 
-  /* ── 移动版（theme-3 §8）：迷你轨放至 15px/12px；横向脊线由纵向段落取代 ── */
+  /* ── 移动版：脊线由纵向段落取代（横向脊线隐藏） ── */
   @media (max-width: 479px) {
     .rail.mini {
-      min-height: 18px;
+      min-height: 12px;
       margin: 8px 0 7px;
     }
     .rail.mini .d {
-      width: 15px;
-      font-size: 12px;
+      width: 8px;
+      height: 8px;
     }
     .rail.spine {
       display: none;
     }
   }
 
-  /* ── 字符线路行（脊线 / hero） ── */
+  /* ── 传送带（脊线 / hero）：像素链节 + 信号灯 ── */
   .rail.spine,
   .rail.hero {
     position: relative;
-    background-image: var(--rail-band);
-    background-size: var(--rail-band-size);
-    background-position: var(--rail-band-pos);
     background-repeat: no-repeat;
+  }
+  /* 运行中工位两侧链节以离散步进位移（唯一动画位之一，§2.3 原则 4） */
+  @keyframes beltstep {
+    from {
+      background-position: 0 0;
+    }
+    to {
+      background-position: 12px 0;
+    }
   }
   .rail.spine {
     width: 2144px;
@@ -320,76 +270,83 @@
     position: relative;
     height: 102px;
   }
-  .ln {
+  /* 链节带：6px 高，6px 亮 / 6px 暗（周期 12px），硬边像素条 */
+  .belt {
     position: absolute;
-    height: 1px;
-    background: var(--text-2);
+    height: 6px;
+    background: repeating-linear-gradient(90deg, var(--pane) 0 6px, transparent 6px 12px);
   }
-  .ln.dim {
-    background: var(--hairline);
+  .belt.br {
+    background: repeating-linear-gradient(90deg, var(--branch-dev) 0 6px, transparent 6px 12px);
+    opacity: 0.55;
   }
-  .ln.br {
-    background: var(--br);
-  }
-  .ln.br.done {
-    background: var(--br-done);
-  }
-  .ln.vt {
-    width: 1px;
+  .belt.vt {
+    width: 6px;
     height: 29px;
+    background: repeating-linear-gradient(180deg, var(--pane) 0 6px, transparent 6px 12px);
   }
+  /* 回流带：打回路径，虚线，出现打回任务时由宿主加 .lit 点亮为红 */
   .ret {
     position: absolute;
-    border-top: 1px dashed var(--dash);
+    height: 2px;
+    background: repeating-linear-gradient(90deg, var(--text-4) 0 6px, transparent 6px 12px);
     color: var(--text-4);
-    font-size: 9.5px;
+    font-size: 12px;
     line-height: 1;
   }
   .ret i {
     font-style: normal;
     position: absolute;
     left: 0;
-    top: -7px;
-    background: var(--mask-bg);
-    padding-right: 3px;
+    top: -6px;
+    background: var(--bg);
+    padding-right: 4px;
   }
+  /* 站点：12px 信号灯方块 + 工位名。top 使灯心正落在链节带中线（y=36）上。 */
   .stn {
     position: absolute;
-    top: 29px;
+    top: 30px;
     transform: translateX(-50%);
     display: flex;
     flex-direction: column;
     align-items: center;
-    gap: 1px;
+    gap: 4px;
     text-align: center;
   }
-  .stn .mk {
-    font-size: 13px;
-    line-height: 1;
-    color: var(--text-4);
+  .lamp {
+    display: block;
+    width: 12px;
+    height: 12px;
+    border: 2px solid var(--pane);
+    background: var(--bg);
   }
-  .stn .mk.p {
-    color: var(--text-2);
+  .lamp.d {
+    background: var(--done);
+    border-color: var(--done);
   }
-  .stn .mk.d {
-    color: var(--text-3);
+  .lamp.p {
+    background: var(--belt-lit);
+    border-color: var(--belt-lit);
   }
-  .stn .mk.c {
-    color: var(--text-hi);
+  .lamp.c {
+    background: var(--go);
+    border-color: var(--go);
   }
-  .stn .mk.w {
-    color: var(--pending);
-    animation: breath 2.4s ease-in-out infinite;
+  .lamp.w {
+    background: var(--pending);
+    border-color: var(--pending);
+    animation: blink 1s steps(2) infinite;
   }
-  .stn .mk.x {
-    color: var(--stop);
+  .lamp.x {
+    background: var(--stop);
+    border-color: var(--stop);
   }
   .stn .lb {
-    font-size: 11px;
-    font-weight: 600;
-    letter-spacing: 0.04em;
+    font-size: 12px;
+    letter-spacing: 0.08em;
     color: var(--text-3);
     white-space: nowrap;
+    line-height: 1.2;
   }
   .stn .lb.dim {
     color: var(--text-4);
@@ -401,48 +358,50 @@
     color: var(--pending);
   }
   .stn .ct {
-    font-size: 9.5px;
-    color: var(--text-4);
+    display: inline-block;
+    font-size: 12px;
+    line-height: 1.2;
+    color: var(--text-3);
+    border: 2px solid var(--pane);
+    padding: 0 4px;
     font-variant-numeric: tabular-nums;
+  }
+  .stn .ct.pen {
+    color: var(--pending);
+    border-color: var(--pending);
   }
   /* 并行分岔侧站：两条分支共用同一 x，上下分行 */
   .stn.side {
     transform: translate(-6px, -50%);
-  }
-  .stn.side .mk {
-    display: block;
+    top: 0;
   }
   .stn.side .lb {
     position: absolute;
-    left: 16px;
+    left: 18px;
     white-space: nowrap;
-    background: var(--mask-bg);
-    padding: 0 4px;
-    font-size: 10.5px;
-    font-weight: 600;
+    background: var(--bg);
+    font-size: 12px;
     letter-spacing: 0.04em;
     color: var(--text-3);
   }
   .stn.side.up .lb {
-    bottom: 9px;
+    bottom: 2px;
   }
-  /* 下轨标签同样右伸：原型的 right:16px 会向左越过前一站标签（theme-3 §8 已知缺陷） */
+  /* 下轨标签同样右伸：原型的 right:16px 会向左越过前一站标签 */
   .stn.side.dn .lb {
-    top: 9px;
+    top: 2px;
   }
-  .stn.side .lb b {
-    color: var(--text-4);
-    font-weight: 500;
-    margin-right: 4px;
+  .stn.side .lb.t {
+    color: var(--branch-tst);
   }
 
   @media (prefers-reduced-motion: reduce) {
-    .stn .mk.w {
+    .lamp.w {
       animation: none;
     }
   }
 
-  /* ── 移动版纵向脊线（hero 的窄屏转写，theme-3 §8） ── */
+  /* ── 移动版纵向脊线（hero 的窄屏转写；完整转写见票 11） ── */
   .vrail {
     list-style: none;
     margin: 0;
@@ -455,85 +414,63 @@
     min-height: 32px;
     padding-left: 30px;
   }
+  /* 站段脊线 = 6px 纵向链节；三态与桌面链节同色 */
   .vst::before {
     content: '';
     position: absolute;
     left: 9px;
     top: 0;
     bottom: 0;
-    width: var(--spin-w);
-    background: var(--hairline);
+    width: 6px;
+    background: repeating-linear-gradient(180deg, var(--pane) 0 6px, transparent 6px 12px);
   }
   .vmk {
     position: absolute;
     left: 0;
     top: 50%;
     transform: translateY(-50%);
-    width: 19px;
-    text-align: center;
-    background: var(--bg);
-    font-size: 12.5px;
-    line-height: 1;
-    color: var(--text-4);
+    width: 24px;
+    display: flex;
+    justify-content: center;
   }
   .vname {
-    font-size: 13px;
+    font-size: 12px;
     color: var(--text-2);
   }
   .vmeta,
   .vsub {
     margin-left: auto;
-    font-size: 11.5px;
+    font-size: 12px;
     color: var(--text-3);
     white-space: nowrap;
     font-variant-numeric: tabular-nums;
   }
   .vsub .bl {
-    color: var(--text-3);
-    font-weight: 600;
-    font-size: 11px;
+    color: var(--branch-dev);
+    font-size: 12px;
   }
-  .vst.done::before {
-    background: var(--spin-lit);
+  .vsub .bl.t {
+    color: var(--branch-tst);
   }
-  .vst.done .vmk {
-    color: var(--text-3);
+  .vst.done::before,
+  .vst.cur::before {
+    background: repeating-linear-gradient(180deg, var(--belt-lit) 0 6px, transparent 6px 12px);
+  }
+  .vst.pen::before {
+    background: repeating-linear-gradient(180deg, var(--pending) 0 6px, transparent 6px 12px);
+    opacity: 0.45;
   }
   .vst.done .vname {
     color: var(--text-3);
   }
-  .vst.cur::before {
-    background: var(--spin-lit);
-  }
-  .vst.cur .vmk {
-    color: var(--text-hi);
-    animation: breath 2.4s ease-in-out infinite;
-  }
   .vst.cur .vname {
     color: var(--text-hi);
-    font-weight: 600;
-  }
-  .vst.pen::before {
-    background: var(--spin-pen);
-  }
-  .vst.pen .vmk {
-    color: var(--pending);
-    animation: breath 2.4s ease-in-out infinite;
   }
   .vst.pen .vname {
     color: var(--pending);
-    font-weight: 600;
-  }
-  .vst.fail .vmk {
-    color: var(--stop);
   }
   .vst.cur .vmeta,
   .vst.pen .vmeta {
     color: var(--text-hi);
-  }
-  @media (prefers-reduced-motion: reduce) {
-    .vst .vmk {
-      animation: none;
-    }
   }
 </style>

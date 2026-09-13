@@ -83,27 +83,28 @@
 </div>
 
 <style>
-  /* tmux 窗格阵列：列间共享 1px 框线，无间隙（theme-3 §3.2） */
+  /* 工位阵列：列间共享 2px 框线，无间隙（§2.3 描边只有 2px 一档）
+     总宽 = 8×264（列）+ 7×2（列间框线）+ 2×2（阵列边框）= 2130，与冻结原型一致 */
   .hscroll {
     overflow-x: auto;
     background: var(--bg);
   }
   .hinner {
-    width: 2144px;
+    width: 2162px;
   }
   .boardpad {
     padding: 0 16px 8px;
   }
   .panes {
     display: flex;
-    border: 1px solid var(--pane);
+    border: 2px solid var(--pane);
     background: var(--bg);
-    width: 2112px;
+    width: 2130px;
     align-items: stretch;
   }
   .banner {
     background: var(--panel);
-    border: 1px solid var(--pane);
+    border: 2px solid var(--pane);
     padding: 8px 12px;
     font-size: 12px;
     color: var(--text-2);
@@ -115,7 +116,7 @@
   }
   .board-empty {
     color: var(--text-4);
-    font-size: 12.5px;
+    font-size: 12px;
     padding: 6px 4px 12px;
   }
 
