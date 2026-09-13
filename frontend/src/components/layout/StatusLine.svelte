@@ -2,10 +2,13 @@
   import { onDestroy, onMount } from 'svelte';
   import { board } from '../../stores/board.svelte';
   import { formatTokens } from '../../lib/pipeline';
+  import { GEOMETRY, gaugeFilled } from '../../theme/contract';
+  import Gauge from '../render/Gauge.svelte';
 
   /**
-   * 底部状态行（theme-3 §3 共享元素映射 / §2.5 覆盖③）。
-   * 桌面为 tmux 状态行；窄屏同一条，作移动版载波行（§8 视图 0）。
+   * 底部车间看板条（决策 169 / theme-6-pixel.md §3）。
+   * 桌面为常驻看板条；窄屏同一条作载波行（§5 移动原型 `.carrier`），带安全区内边距。
+   * 状态用实心像素灯 + 文字双编码，字符标记（⏸ / ▶ / 中点）已退役。
    */
   let clock = $state('');
   let timer: ReturnType<typeof setInterval> | null = null;
@@ -15,8 +18,12 @@
   const queued = $derived(board.countFor('queued'));
   const done = $derived(board.countFor('done'));
   const totalTokens = $derived(board.tasks.reduce((sum, t) => sum + (t.total_tokens ?? 0), 0));
+  /** 量表接近满格（≥14/16 段）时转琥珀——与原型 `.gauge.g-warn` 的用法一致。 */
+  const tokenTone = $derived(
+    gaugeFilled(totalTokens) >= GEOMETRY.gaugeSegments - 2 ? 'warn' : 'go',
+  );
 
-  /* 深浅两款是同一份电文的两种材料（§2.5），切换即换 token。 */
+  /* 深浅两款是像素机房的两套配色：夜班靛 / 掌机背光（§2.1 / §2.4）。 */
   const STORAGE_KEY = 'agentpipeline.theme';
   let theme = $state<'dark' | 'light'>('dark');
 
@@ -54,21 +61,37 @@
 </script>
 
 <footer class="statusline" aria-label="流水线状态">
-  {#if board.pendingCount > 0}
-    <span>⏸ <b class="pen">*{board.pendingCount}</b> 待处理</span>
-  {/if}
-  <span>▶ <b>{running}</b> 执行中</span>
-  <span class="sum dep">等依赖 {waiting} · 排队 {queued} · 已完成 {done}</span>
-  <span>本时辰 <b>{formatTokens(totalTokens)}</b> tok</span>
-  <span class="sum keys">? 键位</span>
-  <button type="button" class="theme-tog" onclick={toggleTheme} title="切换深色 / 浅色（同一份电文的两种材料）">
-    [{theme === 'dark' ? '浅色' : '深色'}]
+  <span class="cell">
+    <span class="lamp pen" aria-hidden="true"></span><b class="pen">{board.pendingCount}</b> 待处理
+  </span>
+  <span class="sep" aria-hidden="true">▪</span>
+  <span class="cell">
+    <span class="lamp go" aria-hidden="true"></span><b>{running}</b> 执行中
+  </span>
+  <span class="sep dep" aria-hidden="true">▪</span>
+  <span class="cell dep">等依赖 <b>{waiting}</b></span>
+  <span class="sep dep" aria-hidden="true">▪</span>
+  <span class="cell dep">排队 <b>{queued}</b></span>
+  <span class="sep dep" aria-hidden="true">▪</span>
+  <span class="cell dep">已完成 <b>{done}</b></span>
+  <span class="sep" aria-hidden="true">▪</span>
+  <span class="cell tok">
+    <Gauge tokens={totalTokens} tone={tokenTone} /> 总量 <b>{formatTokens(totalTokens)}</b> tok
+  </span>
+  <button
+    type="button"
+    class="theme-tog"
+    onclick={toggleTheme}
+    aria-label={theme === 'dark' ? '切换到浅色主题' : '切换到深色主题'}
+    title="切换像素机房配色（夜班靛 / 掌机背光）"
+  >
+    <span class="sw" aria-hidden="true"></span>{theme === 'dark' ? '浅色' : '深色'}
   </button>
   <span class="clock">{clock}</span>
 </footer>
 
 <style>
-  /* 桌面 tmux 状态行（§3.1）；窄屏由 app.css 的 .carrier 规则接管 */
+  /* 车间看板条：2px 顶描边、分隔符 ▪、灯 + 文字双编码（§3） */
   .statusline {
     position: fixed;
     left: 0;
@@ -77,29 +100,61 @@
     z-index: 30;
     display: flex;
     align-items: center;
-    gap: 16px;
-    height: 30px;
+    gap: 12px;
+    height: 36px;
     padding: 0 16px;
-    background: var(--bar-band);
-    border-top: 1px solid var(--pane);
-    font-size: 11px;
+    background: var(--bg);
+    border-top: 2px solid var(--pane);
+    font-size: 12px;
     color: var(--text-3);
+  }
+  .cell {
+    display: inline-flex;
+    align-items: center;
+    gap: 5px;
+    white-space: nowrap;
   }
   .statusline b {
     color: var(--text-2);
-    font-weight: 500;
     font-variant-numeric: tabular-nums;
   }
-  .statusline .pen {
+  .statusline .pen,
+  .statusline b.pen {
     color: var(--pending);
   }
+  /* 实心像素灯（一枚灯 = 一个状态；不作大面积底色） */
+  .lamp {
+    width: 8px;
+    height: 8px;
+    background: var(--text-4);
+  }
+  .lamp.pen {
+    background: var(--pending);
+  }
+  .lamp.go {
+    background: var(--go);
+  }
+  .sep {
+    color: var(--text-4);
+  }
+  .tok {
+    gap: 6px;
+  }
   .theme-tog {
+    display: inline-flex;
+    align-items: center;
+    gap: 5px;
     color: var(--text-3);
-    font-size: 11px;
-    letter-spacing: 0.04em;
+    white-space: nowrap;
   }
   .theme-tog:hover {
     color: var(--text-hi);
+  }
+  .theme-tog .sw {
+    width: 8px;
+    height: 8px;
+    background: var(--go);
+    border: 2px solid var(--ink);
   }
   .statusline .clock {
     margin-left: auto;
@@ -108,24 +163,18 @@
   }
 
   @media (max-width: 479px) {
-    /* 窄屏：载波行（§8 视图 0），安全区内边距 */
+    /* 窄屏：载波行（§5 视图 0），安全区内边距；次级汇总收进桌面款 */
     .statusline {
-      height: calc(34px + var(--safeb));
+      min-height: calc(40px + var(--safeb));
+      height: auto;
       padding: 0 12px var(--safeb);
-      font-size: 12px;
-      gap: 14px;
+      gap: 12px;
     }
-    /* 窄屏收掉次级汇总与键位提示，保留待处理 / 执行中 / token */
-    .statusline .dep,
-    .statusline .keys {
+    .statusline .dep {
       display: none;
     }
     .statusline .theme-tog {
-      min-height: 30px;
-      font-size: 12px;
-    }
-    .statusline .clock {
-      margin-left: auto;
+      min-height: 40px;
     }
   }
 </style>

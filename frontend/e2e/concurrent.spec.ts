@@ -141,7 +141,10 @@ test.describe('前端 E2E ⑧：并发第二任务', () => {
       await expect(yiCard.getByRole('button', { name: '合入' })).toBeVisible();
 
       // ── 顶栏待办计数 = 2（多任务 pending 累加，而非单任务时的 0/1） ──
-      await expect(page.locator('.pending-count .c')).toHaveText(/\*2/, { timeout: 60_000 });
+      // 像素主题（决策 169）：计数徽章是纯数字，`*` 字面量退役；断言同一行为。
+      const pendingCount = page.locator('.pending-count');
+      await expect(pendingCount).toContainText('待处理', { timeout: 60_000 });
+      await expect(pendingCount.locator('.c')).toHaveText('2');
 
       expectBundleHealthy(bundle);
     } finally {
