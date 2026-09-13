@@ -27,13 +27,16 @@ axum 同源托管 UI 与 API，浏览器打开 `http://127.0.0.1:8787` 即用（
 ### 桌面形态（Tauri 壳，决策 156）
 
 ```bash
-make desktop       # 出 AgentPipeline.app（crates/desktop/target/release/bundle/macos/）
+make desktop       # 出 dmg（crates/desktop/target/release/bundle/dmg/）
 make desktop-run   # debug 壳直接跑，窗口导航到内嵌同源服务
 ```
 
 桌面壳只是外壳：壳内调用 `app::serve(ServeOptions)`（`port_override = Some(0)`）随机端口起服，窗口加载
 `http://127.0.0.1:{port}`（同源零 CORS），传输层与 web 形态完全一致（决策 153）。
-壳是独立 workspace（自带 Cargo.lock），tauri 依赖树不进 `just lint / test` 闸门。
+壳是独立 workspace（自带 Cargo.lock），tauri 依赖树不进 `make check-lint` / `make check-test` 闸门。
+
+打包边界（决策 168）：`bundle.targets` 只列 `dmg`——dmg 里已含 `.app`（拖入「应用程序」即得，
+本机开发也不必再从 `bundle/macos/` 取），故不再额外落一份裸 `.app` 到产物目录。
 
 数据全部落在 `~/.agentpipeline/`（可用环境变量 `AGENTPIPELINE_HOME` 覆盖，测试即靠它隔离）。
 首次启动后到 `POST /providers` 配置一个 provider，才能创建任务（未配置时创建任务会明确报错，决策 56）。
@@ -72,26 +75,29 @@ AGENTPIPELINE_LAN=1 make desktop-run
 
 ## 质量闸门
 
-**提交前必过**（决策 147 / 166）：`just default` = `lint` + `test` + `frontend` + `frontend-e2e`。
+**提交前必过**（决策 147 / 166）：`make check` = `lint` + `test` + `frontend` + `e2e`。
 
 ```bash
-just default       # 提交前必过：以下四项全跑
-just lint          # cargo fmt --check + cargo clippy -D warnings
-just test          # 全量测试（L1 单元 + L2 集成 + L3 API + L4 场景 + 冒烟）
-just frontend      # 前端：vitest + svelte-check + vite build
-just frontend-e2e  # 前端 E2E（playwright 17 例；前置产物新鲜度守卫）
+make check           # 提交前必过：以下四项全跑
+make check-lint      # cargo fmt --check + cargo clippy -D warnings
+make check-test      # 全量测试（L1 单元 + L2 集成 + L3 API + L4 场景 + 冒烟）
+make check-frontend  # 前端：vitest + svelte-check + vite build
+make check-e2e       # 前端 E2E（playwright 17 例；前置产物新鲜度守卫）
 # 分层子集
-just unit          # 只跑单元层
-just integration   # core 的 L2 集成（游标 / git / scheduler）
-just api           # L3 API 契约（in-process axum router）
-just e2e           # L4 场景
-just smoke         # 启动冒烟（spawn 真二进制）
+make unit            # 只跑单元层
+make integration     # core 的 L2 集成（游标 / git / scheduler）
+make api             # L3 API 契约（in-process axum router）
+make e2e             # L4 场景
+make smoke           # 启动冒烟（spawn 真二进制）
+make fmt             # 格式化（写回）
 ```
 
-**未装 `just` 时**用 Makefile 的镜像入口（语义与 justfile 对齐，以 justfile 为准）：
-`make check` / `check-lint` / `check-test` / `check-frontend` / `check-e2e`。
+**Makefile 是闸门的唯一权威定义**（决策 168）：原先并存的 `justfile` 已删除——
+开发机上未装 `just`，两份定义只会在改动时漂移，而 Makefile 是实际被执行的入口。
+`justfile` 独有的分层目标（`unit` / `integration` / `api` / `e2e` / `smoke` / `fmt`）
+已按原语义搬进 Makefile，名字不变。
 
-**产物新鲜度守卫（决策 166）：** `frontend-e2e` 跑用例前先确保被测对象是当前源码——
+**产物新鲜度守卫（决策 166）：** `check-e2e` 跑用例前先确保被测对象是当前源码——
 前端源码比 `frontend/dist` 新则重建 dist，随后 `cargo build -p app`（dist 变化经
 `crates/app/build.rs` 的 `rerun-if-changed` 传递，二进制必然跟着重编）。没有这一步，
 改了代码不重建就会得到「旧二进制的绿」。
@@ -100,7 +106,7 @@ just smoke         # 启动冒烟（spawn 真二进制）
 
 当前状态：**Rust 515 个用例全过**（另有 2 个 `#[ignore]` 真 LLM 冒烟：单节点 + 全流程），
 `fmt` / `clippy -D warnings` 干净；前端 **96 个 vitest 全过** + `svelte-check` 0 error /
-0 warning + **17 条 playwright E2E 全过**（`make check-e2e` / `just frontend-e2e`）。
+0 warning + **17 条 playwright E2E 全过**（`make check-e2e`）。
 
 ## 代码结构
 

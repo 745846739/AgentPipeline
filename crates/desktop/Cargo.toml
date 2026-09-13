@@ -6,7 +6,7 @@ rust-version = "1.80"
 license = "MIT"
 description = "AgentPipeline 桌面壳：Tauri 2 外壳，传输层复用内嵌 axum 同源服务（决策 153 / 156）"
 
-# 独立 workspace（决策 156）：不进根 workspace——tauri 依赖树不进 just lint / test
+# 独立 workspace（决策 156）：不进根 workspace——tauri 依赖树不进 make check-lint / check-test
 # 的编译成本（决策 155 的闸门轻量原则），本 crate 自带 Cargo.lock。
 [workspace]
 
