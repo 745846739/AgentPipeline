@@ -227,64 +227,77 @@ select {
   border-radius: var(--r-panel);
 }
 
-/* 方括号按钮：括号由 CSS 生成，不进 DOM/无障碍名（票 03 移除装饰） */
+/* ── 通用控件：像素钮 / 像素框 / 工位标签盒（票 03） ── */
+.panel {
+  background: var(--panel);
+  border: 2px solid var(--pane);
+  border-radius: var(--r-panel);
+  box-shadow: 4px 4px 0 var(--ink);
+}
+
+/* 像素钮：2px 描边 + 3px 硬投影；按压 = 位移消影（§2.3）
+   主动作 = go 实心 + `▶` 前缀。方括号装饰已移除（票 03）——装饰不进可访问名。 */
 .btn {
   display: inline-flex;
   align-items: center;
   justify-content: center;
   gap: 4px;
-  padding: 3px 6px;
+  padding: 2px 10px;
   border: 2px solid var(--pane);
   border-radius: var(--r-pill);
-  font-size: 12px;
+  background: var(--panel);
   color: var(--text);
-  line-height: 1.5;
-}
-.btn::before {
-  content: '[ ';
-  color: var(--bracket);
-}
-.btn::after {
-  content: ' ]';
-  color: var(--bracket);
+  font-size: 12px;
+  line-height: 1.6;
+  box-shadow: 3px 3px 0 var(--ink);
 }
 .btn:hover:not(:disabled) {
   color: var(--text-hi);
   border-color: var(--text-2);
 }
-.btn:hover:not(:disabled)::before,
-.btn:hover:not(:disabled)::after {
-  color: var(--text-2);
+/* 按压：位移 + 去投影（像素实体触感）；离散，无过渡 */
+.btn:active:not(:disabled) {
+  transform: translate(3px, 3px);
+  box-shadow: none;
 }
 .btn:disabled {
   opacity: 0.55;
   cursor: not-allowed;
 }
+/* 主动作：go 实心 + ▶ 前缀（前缀由 CSS 生成，故仍会进入可访问名——
+   e2e 的 getByRole 用非精确匹配，前缀不影响命中；见票 03 说明）。 */
 .btn.solid {
   background: var(--go);
   border-color: var(--go);
   color: var(--go-ink);
 }
-.btn.solid::before,
-.btn.solid::after {
-  color: var(--go-ink);
-  opacity: 0.55;
+.btn.solid::before {
+  content: '▶ ';
 }
 .btn.solid:hover:not(:disabled) {
   background: var(--go-hi);
   border-color: var(--go-hi);
   color: var(--go-ink);
 }
+/* quiet / danger 是弱化的次级动作：无投影、无实底 */
 .btn.quiet {
   border-color: transparent;
+  background: none;
+  box-shadow: none;
   color: var(--text-3);
 }
 .btn.quiet:hover:not(:disabled) {
   color: var(--text-hi);
   border-color: transparent;
 }
+.btn.quiet:active:not(:disabled),
+.btn.danger:active:not(:disabled) {
+  transform: none;
+}
 .btn.danger {
   border-color: transparent;
+  background: none;
+  box-shadow: none;
   color: var(--stop);
 }
 .btn.danger:hover:not(:disabled) {
@@ -302,6 +315,7 @@ select {
   animation: blink 0.7s steps(2) infinite;
 }
 
+/* 输入 / 选择 / 文本域：2px 描边像素框，圆角 0；焦点态是描边亮一档（非柔光） */
 .input {
   width: 100%;
   background: var(--input);
@@ -309,7 +323,7 @@ select {
   border-radius: var(--r-pill);
   color: var(--text-hi);
   font-size: 12px;
-  padding: 6px 9px;
+  padding: 4px 8px;
 }
 .input::placeholder {
   color: var(--text-4);
@@ -321,19 +335,28 @@ select {
 textarea.input {
   resize: vertical;
   min-height: 60px;
-  line-height: 1.5;
+  line-height: 1.6;
 }
 
-/* 状态文字标记：反白 / 琥珀 / 红 / 弱（与颜色双编码，详表见票 03） */
+/* 状态文字标记：像素双编码——颜色 + 前置方形灯（不靠色相单独承载，§2.1 规则）。
+   `.st.dim` 的灯是空心描边（未点亮），`.st.run` 是实心绿。 */
 .st {
   font-size: 12px;
   letter-spacing: 0.08em;
   font-style: normal;
+  white-space: nowrap;
+}
+.st::before {
+  content: '';
+  display: inline-block;
+  width: 8px;
+  height: 8px;
+  margin-right: 5px;
+  background: currentColor;
+  vertical-align: baseline;
 }
 .st.run {
-  background: var(--go);
-  color: var(--go-ink);
-  padding: 0 5px;
+  color: var(--go);
 }
 .st.wait {
   color: var(--pending);
@@ -344,13 +367,57 @@ textarea.input {
 .st.dim {
   color: var(--text-4);
 }
+.st.dim::before {
+  background: transparent;
+  border: 2px solid var(--text-4);
+}
 
-/* 提示条（diff 基准前移等） */
+/* 提示条（diff 基准前移等）：琥珀是全站唯一告警 */
 .notice {
   font-size: 12px;
   color: var(--pending);
-  border: 2px dashed var(--pending);
-  padding: 2px 10px;
+  border: 2px solid var(--pending);
+  padding: 1px 10px;
+}
+
+/* 工位标签盒（页签基元）：active = wash 实底 + 描边上浮；禁用 = dither 底（§3）
+   供详情五页签与移动款页导航共用。 */
+.tabs {
+  display: flex;
+  gap: 6px;
+  border-bottom: 2px solid var(--pane);
+  padding-bottom: 8px;
+}
+.tab {
+  border: 2px solid var(--pane);
+  background: var(--bg);
+  color: var(--text-3);
+  padding: 2px 12px;
+  line-height: 1.6;
+}
+.tab:hover:not(:disabled) {
+  color: var(--text);
+}
+.tab.on {
+  background: var(--wash);
+  border-color: var(--text-2);
+  color: var(--text-hi);
+}
+.tab:disabled,
+.tab.dis {
+  color: var(--text-4);
+  cursor: default;
+  background-image: conic-gradient(
+    var(--wash) 25%,
+    transparent 0 50%,
+    var(--wash) 0 75%,
+    transparent 0
+  );
+  background-size: 4px 4px;
+}
+.tab .c {
+  color: var(--text-4);
+  margin-left: 3px;
 }
 
 /* pending 琥珀急停灯闪烁（离散帧步进，§2.3 原则 4） */

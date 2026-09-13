@@ -44,8 +44,10 @@
     gap: 8px;
     text-align: left;
     background: var(--panel);
-    border: 1px solid var(--pane);
+    border: 2px solid var(--pane);
     border-radius: 0;
+    /* 像素框硬投影（§2.3） */
+    box-shadow: 4px 4px 0 var(--ink);
     padding: 10px 12px;
   }
   .toast.pending {
@@ -54,21 +56,19 @@
   .toast.failed {
     border-color: var(--stop);
   }
+  /* 状态灯：实心像素方块（与 .st 同一套双编码），琥珀是唯一告警 */
   .dot {
     margin-top: 5px;
     flex: none;
-    color: var(--done);
-    font-size: 10px;
-    line-height: 1;
-  }
-  .dot::before {
-    content: '●';
+    width: 8px;
+    height: 8px;
+    background: var(--done);
   }
   .toast.pending .dot {
-    color: var(--pending);
+    background: var(--pending);
   }
   .toast.failed .dot {
-    color: var(--stop);
+    background: var(--stop);
   }
   .body {
     display: flex;
@@ -81,20 +81,23 @@
   }
   .title {
     color: var(--text-hi);
-    font-size: 12.5px;
+    font-size: 12px;
   }
   .msg {
     color: var(--text-3);
-    font-size: 11px;
+    font-size: 12px;
     overflow: hidden;
     text-overflow: ellipsis;
     white-space: nowrap;
   }
   .close {
     color: var(--text-3);
-    font-size: 14px;
+    font-size: 12px;
     line-height: 1;
     padding: 0 2px;
     flex: none;
+  }
+  .close:hover {
+    color: var(--text-hi);
   }
 </style>
