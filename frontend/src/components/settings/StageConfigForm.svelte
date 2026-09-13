@@ -155,19 +155,21 @@
 <style>
   .sc-form {
     padding: 14px 16px;
+    margin-bottom: 14px;
   }
   .form-head {
-    font-size: 13px;
+    font-size: 12px;
+    letter-spacing: 0.08em;
     color: var(--text-hi);
     margin-bottom: 10px;
   }
   .replace-note {
-    font-size: 11.5px;
+    font-size: 12px;
     color: var(--pending);
     line-height: 1.6;
     margin-bottom: 10px;
     padding: 7px 10px;
-    border: 1px solid var(--pending);
+    border: 2px solid var(--pending);
   }
   .grid {
     display: grid;
@@ -182,7 +184,7 @@
   }
   .field > span {
     display: block;
-    font-size: 11px;
+    font-size: 12px;
     color: var(--text-3);
     margin-bottom: 4px;
   }
@@ -203,5 +205,11 @@
     justify-content: flex-end;
     gap: 8px;
     margin-top: 12px;
+  }
+
+  @media (max-width: 479px) {
+    .grid {
+      grid-template-columns: 1fr;
+    }
   }
 </style>

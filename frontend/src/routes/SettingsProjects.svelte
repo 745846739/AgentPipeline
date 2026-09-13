@@ -5,6 +5,7 @@
     deleteProject,
     getProjectAnalysis,
     listProjects,
+    listTasks,
     startProjectAnalysis,
     updateProject,
   } from '../api/client';
@@ -27,6 +28,14 @@
   let loading = $state(true);
   let error = $state<string | null>(null);
 
+  /**
+   * 各项目的活跃任务数（决策 101：有活跃任务的项目不可删）。
+   * 后端删除时会再判一次并 409——这里先判是为了**在按钮上就禁掉并说明原因**，
+   * 而不是让用户点一次才知道。取数失败时留空（不误禁，后端仍是最后一道闸）。
+   */
+  const ACTIVE_STATUSES = new Set(['queued', 'waiting', 'running', 'pending']);
+  let activeCounts = $state<Record<string, number>>({});
+
   type Editing = { mode: 'new' } | { mode: 'edit'; project: Project };
   let editing = $state<Editing | null>(null);
   let saving = $state(false);
@@ -42,11 +51,26 @@
   let analysis = $state<ProjectAnalysis | null>(null);
   let analysisError = $state<string | null>(null);
 
+  async function loadActiveCounts() {
+    try {
+      const tasks = await listTasks({ include_archived: false });
+      const counts: Record<string, number> = {};
+      for (const t of tasks) {
+        if (ACTIVE_STATUSES.has(t.status)) counts[t.project_id] = (counts[t.project_id] ?? 0) + 1;
+      }
+      activeCounts = counts;
+    } catch {
+      // 活跃计数取不到不阻断列表；删除仍由后端 409 兜底
+      activeCounts = {};
+    }
+  }
+
   async function load() {
     loading = true;
     error = null;
     try {
       projects = await listProjects();
+      await loadActiveCounts();
     } catch (err) {
       error = (err as Error).message;
     } finally {
@@ -144,13 +168,13 @@
 
 <div class="page">
   <a class="crumb" href="#/">← 看板</a>
-  <header class="head">
-    <h1 class="cond">设置 · 项目</h1>
+  <div class="p-head">
+    <h1 class="p-title">设置 · 项目</h1>
     <button type="button" class="btn solid" onclick={openNew}>＋ 新建项目</button>
-  </header>
+  </div>
 
-  <p class="hint">
-    本地路径是项目唯一事实来源（决策 29）。创建时立即校验 git 仓库（决策 61）；删除有活跃任务的项目会被拒绝并给出原因（决策 101）。
+  <p class="hintline">
+    本地路径是项目唯一事实来源（决策 29）。创建时立即校验 git 仓库（决策 61）；<b>删除有活跃任务的项目会被拒绝并给出原因</b>（决策 101）。
   </p>
 
   {#if editing}
@@ -172,66 +196,72 @@
   {:else if projects.length === 0}
     <div class="banner">还没有项目。新建一个本地 git 仓库后才能创建任务。</div>
   {:else}
-    <div class="list">
-      <div class="list-head">
+    <div class="reg">
+      <div class="reg-head">
         <span>项目</span>
-        <span class="col-n">{projects.length}</span>
+        <span class="n">▪ {projects.length}</span>
       </div>
-      <ul class="rows">
-      {#each projects as p (p.id)}
-        <li class="row">
-          <div class="main">
-            <div class="line1">
-              <span class="name">{p.name}</span>
-              <span class="branch mono">{p.default_branch}</span>
+      <ul class="reg-rows">
+        {#each projects as p (p.id)}
+          {@const active = activeCounts[p.id] ?? 0}
+          <li class="reg-row row">
+            <div class="reg-main">
+              <div class="reg-l1">
+                <span class="reg-name">{p.name}</span>
+                <span class="reg-sub mono">{p.default_branch}</span>
+              </div>
+              <div class="reg-path mono">{p.local_path}</div>
+              <div class="reg-l2 mono">
+                <span>lang {p.language ?? '—'}</span>
+                <span>test {p.test_framework ?? '—'}</span>
+                <span>lint {p.lint_command ?? '—'}</span>
+                <span>AGENTS.md {p.agents_md_path ?? '—'}</span>
+              </div>
+              {#if active > 0}
+                <div class="reg-err">该项目有 {active} 个活跃任务，不能删除（决策 101）。</div>
+              {/if}
+              {#if rowError?.id === p.id}<div class="reg-err">{rowError.message}</div>{/if}
             </div>
-            <div class="path mono">{p.local_path}</div>
-            <div class="line2 mono">
-              <span>lang {p.language ?? '—'}</span>
-              <span>test {p.test_framework ?? '—'}</span>
-              <span>lint {p.lint_command ?? '—'}</span>
-              <span>AGENTS.md {p.agents_md_path ?? '—'}</span>
+            <div class="reg-acts">
+              {#if confirmingDelete === p.id}
+                <span class="reg-sub">确认删除？</span>
+                <button
+                  type="button"
+                  class="btn danger"
+                  disabled={deleteBusy === p.id || active > 0}
+                  onclick={() => remove(p)}
+                >
+                  {#if deleteBusy === p.id}<span class="spin"></span>{/if}删除
+                </button>
+                <button type="button" class="btn quiet" onclick={() => (confirmingDelete = null)}>
+                  取消
+                </button>
+              {:else}
+                <button type="button" class="btn" onclick={() => openEdit(p)}>编辑</button>
+                <button
+                  type="button"
+                  class="btn"
+                  disabled={analyzingId === p.id}
+                  onclick={() => analyze(p)}
+                >
+                  {#if analyzingId === p.id}<span class="spin"></span>{/if}分析
+                </button>
+                <button
+                  type="button"
+                  class="btn danger"
+                  disabled={active > 0}
+                  title={active > 0 ? `该项目有 ${active} 个活跃任务，不能删除（决策 101）` : undefined}
+                  onclick={() => {
+                    rowError = null;
+                    confirmingDelete = p.id;
+                  }}
+                >
+                  删除
+                </button>
+              {/if}
             </div>
-            {#if rowError?.id === p.id}<div class="row-err">{rowError.message}</div>{/if}
-          </div>
-          <div class="acts">
-            {#if confirmingDelete === p.id}
-              <span class="confirm">确认删除？</span>
-              <button
-                type="button"
-                class="btn danger"
-                disabled={deleteBusy === p.id}
-                onclick={() => remove(p)}
-              >
-                {#if deleteBusy === p.id}<span class="spin"></span>{/if}删除
-              </button>
-              <button type="button" class="btn quiet" onclick={() => (confirmingDelete = null)}>
-                取消
-              </button>
-            {:else}
-              <button type="button" class="btn" onclick={() => openEdit(p)}>编辑</button>
-              <button
-                type="button"
-                class="btn"
-                disabled={analyzingId === p.id}
-                onclick={() => analyze(p)}
-              >
-                {#if analyzingId === p.id}<span class="spin"></span>{/if}分析
-              </button>
-              <button
-                type="button"
-                class="btn danger"
-                onclick={() => {
-                  rowError = null;
-                  confirmingDelete = p.id;
-                }}
-              >
-                删除
-              </button>
-            {/if}
-          </div>
-        </li>
-      {/each}
+          </li>
+        {/each}
       </ul>
     </div>
   {/if}
@@ -244,7 +274,7 @@
     {:else}
       <section class="analysis">
         <div class="running">
-          <span class="st run">[RUN]</span>正在触发 project_analysis 伪阶段…
+          <span class="st run">分析中</span>正在触发 project_analysis 伪阶段…
         </div>
       </section>
     {/if}
@@ -257,36 +287,9 @@
     margin: 0 auto;
     padding: 20px 24px 60px;
   }
-  .crumb {
-    display: inline-flex;
-    color: var(--text-3);
-    font-size: 12px;
-    margin-bottom: 10px;
-  }
-  .crumb:hover {
-    color: var(--text-2);
-  }
-  .head {
-    display: flex;
-    align-items: center;
-    justify-content: space-between;
-    gap: 14px;
-    margin-bottom: 8px;
-  }
-  h1 {
-    font-size: 18px;
-    color: var(--text-hi);
-  }
-  .hint {
-    font-size: 11.5px;
-    color: var(--text-3);
-    line-height: 1.6;
-    margin-bottom: 14px;
-  }
   .banner {
     padding: 10px 12px;
-    border: 1px solid var(--pane);
-    border-radius: 0;
+    border: 2px solid var(--pane);
     color: var(--text-3);
     font-size: 12px;
     margin-top: 10px;
@@ -295,100 +298,10 @@
     border-color: var(--stop);
     color: var(--stop);
   }
-  .list {
-    border: 1px solid var(--pane);
-    background: var(--bg);
-    margin-top: 4px;
-  }
-  .list-head {
-    display: flex;
-    justify-content: space-between;
-    align-items: center;
-    gap: 8px;
-    padding: 9px 12px;
-    border-bottom: 1px solid var(--pane);
-    background: var(--head-band);
-    font-size: 10.5px;
-    font-weight: 600;
-    letter-spacing: 0.08em;
-    text-transform: uppercase;
-    color: var(--text-3);
-  }
-  .col-n {
-    color: var(--text-4);
-    font-weight: 400;
-  }
-  .rows {
-    list-style: none;
-    display: flex;
-    flex-direction: column;
-  }
-  .row {
-    display: flex;
-    align-items: flex-start;
-    justify-content: space-between;
-    gap: 12px;
-    padding: 11px 12px 12px;
-    border-bottom: 1px solid var(--hairline);
-    transition: background 0.12s;
-  }
-  .row:last-child {
-    border-bottom: 0;
-  }
-  .row:hover {
-    background: var(--hover-bg);
-  }
-  .main {
-    min-width: 0;
-  }
-  .line1 {
-    display: flex;
-    align-items: baseline;
-    gap: 10px;
-  }
-  .name {
-    color: var(--text-hi);
-    font-size: 12.5px;
-    font-weight: 500;
-  }
-  .branch {
-    color: var(--text-3);
-    font-size: 11px;
-  }
-  .path {
-    color: var(--text-2);
-    font-size: 11.5px;
-    margin-top: 2px;
-    word-break: break-all;
-  }
-  .line2 {
-    display: flex;
-    gap: 14px;
-    flex-wrap: wrap;
-    margin-top: 5px;
-    font-size: 10.5px;
-    color: var(--text-3);
-  }
-  .row-err {
-    margin-top: 5px;
-    font-size: 11.5px;
-    color: var(--stop);
-    white-space: pre-wrap;
-  }
-  .acts {
-    display: flex;
-    align-items: center;
-    gap: 6px;
-    flex: none;
-  }
-  .confirm {
-    font-size: 11.5px;
-    color: var(--text-2);
-  }
   .analysis {
     padding: 12px 14px;
     margin-top: 10px;
-    border: 1px solid var(--pane);
+    border: 2px solid var(--pane);
     background: var(--panel);
   }
   .running {

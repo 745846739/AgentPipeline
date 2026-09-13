@@ -153,9 +153,11 @@
 <style>
   .prov-form {
     padding: 14px 16px;
+    margin-bottom: 14px;
   }
   .form-head {
-    font-size: 13px;
+    font-size: 12px;
+    letter-spacing: 0.08em;
     color: var(--text-hi);
     margin-bottom: 12px;
   }
@@ -172,17 +174,17 @@
   }
   .field > span {
     display: block;
-    font-size: 11px;
+    font-size: 12px;
     color: var(--text-3);
     margin-bottom: 4px;
   }
   .warn {
     margin-top: 10px;
     padding: 7px 10px;
-    border: 1px solid var(--pending);
+    border: 2px solid var(--pending);
     color: var(--pending);
-    font-size: 11.5px;
-    line-height: 1.5;
+    font-size: 12px;
+    line-height: 1.6;
   }
   .enabled {
     display: flex;
@@ -194,20 +196,22 @@
   }
   .hint {
     margin-top: 8px;
-    font-size: 11px;
+    font-size: 12px;
     color: var(--text-3);
+    line-height: 1.6;
   }
   .error {
     color: var(--stop);
     font-size: 12px;
     margin-top: 8px;
   }
+  /* 「测试连接」结果行（决策 160）：绿 = 通，红 = 不通，琥珀 = 未定 */
   .test-result {
     margin-top: 8px;
     padding: 7px 10px;
-    font-size: 11.5px;
-    line-height: 1.5;
-    border: 1px solid var(--pending);
+    font-size: 12px;
+    line-height: 1.6;
+    border: 2px solid var(--pending);
   }
   .test-result.ok {
     border-color: var(--go);
@@ -217,7 +221,7 @@
   }
   .test-result .dim {
     color: var(--text-4);
-    font-size: 10.5px;
+    font-size: 12px;
     word-break: break-all;
   }
   .actions {
@@ -225,5 +229,11 @@
     justify-content: flex-end;
     gap: 8px;
     margin-top: 12px;
+  }
+
+  @media (max-width: 479px) {
+    .grid {
+      grid-template-columns: 1fr;
+    }
   }
 </style>
