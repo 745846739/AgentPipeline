@@ -112,6 +112,11 @@ async fn binary_starts_serves_and_exits_gracefully_on_sigint() {
     let (mut child, port) = spawn_server(&home).await;
     wait_until_ready(port).await;
 
+    // 决策 155：单二进制同源托管前端——内嵌时回 index.html，未内嵌时回构建提示页
+    let (status, body) = http("GET", port, "/", None).unwrap();
+    assert_eq!(status, 200, "{body}");
+    assert!(body.contains("AgentPipeline"), "{body}");
+
     // 家目录骨架按 §12.14 建立，且数据库落在临时 home 内（不碰真实 ~/.agentpipeline）
     assert!(home.home().db_path().exists(), "数据库应建在临时 home");
     assert!(home.home().tasks_dir().exists());

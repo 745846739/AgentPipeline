@@ -13,9 +13,16 @@ Kanban 式流水线驱动的本地多 agent 开发管线：`init → architect-d
 ## 构建与运行
 
 ```bash
-cargo build --release
-./target/release/agent-pipeline serve --port 8787
+make build    # 前端依赖（按需）→ vite build → 内嵌 dist → cargo build --release
+make run      # 等价于 build + 启动
 ```
+
+产物是单二进制 `./target/release/agent-pipeline`：前端 dist 在编译期内嵌（决策 155），
+axum 同源托管 UI 与 API，浏览器打开 `http://127.0.0.1:8787` 即用（端口见配置 `[server]`，
+`--port` 可覆盖）。手动等价：`cd frontend && npm ci && npm run build && cargo build --release`。
+
+- 不装 Node 也能 `cargo build --release`：API 照常可用，访问 `/` 会得到「前端未构建」提示页（决策 155）。
+- 前端热更开发：`cd frontend && npm run dev`（vite 把 API 代理到本机 axum，见 frontend/vite.config.ts）。
 
 数据全部落在 `~/.agentpipeline/`（可用环境变量 `AGENTPIPELINE_HOME` 覆盖，测试即靠它隔离）。
 首次启动后到 `POST /providers` 配置一个 provider，才能创建任务（未配置时创建任务会明确报错，决策 56）。
@@ -32,7 +39,7 @@ just e2e           # L4 场景
 just smoke         # 启动冒烟（spawn 真二进制）
 ```
 
-当前状态：**476 个用例全过**（另有 1 个 `#[ignore]` 真 LLM 冒烟），`fmt` / `clippy -D warnings` 干净。前端另有 85 个 vitest + 2 条 playwright E2E，在 `frontend/` 下单独跑（见 [docs/testing.md](docs/testing.md) §9）。
+当前状态：**481 个用例全过**（另有 1 个 `#[ignore]` 真 LLM 冒烟），`fmt` / `clippy -D warnings` 干净。前端另有 85 个 vitest + 2 条 playwright E2E，在 `frontend/` 下单独跑（见 [docs/testing.md](docs/testing.md) §9）。
 
 ## 代码结构
 

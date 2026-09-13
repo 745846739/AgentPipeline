@@ -1974,3 +1974,92 @@ async fn analyze_keeps_facts_and_records_summary_error_when_llm_unavailable() {
     );
     assert!(runs[0].error.is_some(), "失败原因应写入 run 行");
 }
+
+// ── 前端静态资源同源托管（决策 155）──────────────────────────────
+
+/// oneshot 后取原始字节（静态资源不是 JSON，不复用 `json_body`）。
+async fn raw(response: axum::response::Response) -> (StatusCode, Vec<u8>) {
+    let status = response.status();
+    let bytes = axum::body::to_bytes(response.into_body(), 8 * 1024 * 1024)
+        .await
+        .unwrap();
+    (status, bytes.to_vec())
+}
+
+async fn get_raw(api: &Api, uri: &str) -> (StatusCode, Vec<u8>) {
+    let response = api
+        .router
+        .clone()
+        .oneshot(request("GET", uri).body(Body::empty()).unwrap())
+        .await
+        .unwrap();
+    raw(response).await
+}
+
+#[tokio::test]
+async fn root_serves_embedded_frontend_or_build_hint() {
+    let api = api().await;
+    let (status, bytes) = get_raw(&api, "/").await;
+    let body = String::from_utf8_lossy(&bytes).into_owned();
+    assert_eq!(status, 200, "{body}");
+    assert!(body.contains("AgentPipeline"), "{body}");
+    if app::assets::EMBEDDED_ASSETS.is_empty() {
+        assert!(
+            body.contains("make build"),
+            "未内嵌时应返回构建提示页：{body}"
+        );
+    } else {
+        assert!(
+            body.contains("/assets/"),
+            "内嵌时应返回构建产物 index.html：{body}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn embedded_assets_are_served_verbatim_with_mime() {
+    let api = api().await;
+    let Some((name, expected)) = app::assets::EMBEDDED_ASSETS.first() else {
+        // 未内嵌（无 dist 的构建环境）：未知资产契约恒为 404
+        let (status, _) = get_raw(&api, "/assets/index-000000.js").await;
+        assert_eq!(status, 404);
+        return;
+    };
+
+    let response = api
+        .router
+        .clone()
+        .oneshot(
+            request("GET", &format!("/{name}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let content_type = response
+        .headers()
+        .get(header::CONTENT_TYPE)
+        .expect("应有 Content-Type")
+        .to_str()
+        .unwrap()
+        .to_owned();
+    let (status, bytes) = raw(response).await;
+
+    assert_eq!(status, 200);
+    assert_eq!(&bytes, *expected, "资产应原样回放");
+    let ext = name.rsplit('.').next().unwrap_or("");
+    let expect_mime = match ext {
+        "html" => "text/html; charset=utf-8",
+        "js" => "text/javascript; charset=utf-8",
+        "css" => "text/css; charset=utf-8",
+        _ => return,
+    };
+    assert_eq!(content_type, expect_mime);
+}
+
+#[tokio::test]
+async fn unknown_asset_returns_404() {
+    let api = api().await;
+    let (status, _) = get_raw(&api, "/assets/deadbeef-not-here.js").await;
+    assert_eq!(status, 404);
+}

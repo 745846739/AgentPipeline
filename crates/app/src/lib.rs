@@ -4,8 +4,10 @@
 //! - 路由构建与二进制启动分离——L3 测试用 tower oneshot 直接打 in-process router，不 spawn 二进制
 //!   （决策 144）；
 //! - 跨源防护中间件（决策 128）：只拦写请求；SSE 是纯 GET，不受影响；
+//! - 前端 dist 由 build.rs 内嵌并同源托管（决策 155）；dist 缺失时退化为构建提示页；
 //! - `api_key` 读接口只回显 `***`（决策 112）。
 
+pub mod assets;
 pub mod routes;
 pub mod runtime;
 pub mod serve;
@@ -95,5 +97,8 @@ pub fn build_router(state: AppState) -> Router {
             state.clone(),
             stream::cross_origin_guard,
         ))
+        // 前端静态资源同源托管（决策 155）：放在防护层之后注册——全 GET/HEAD，
+        // 防护只拦写请求，静态路由不进跨源矩阵。
+        .merge(assets::static_routes())
         .with_state(state)
 }
