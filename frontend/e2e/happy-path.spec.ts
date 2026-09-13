@@ -136,7 +136,10 @@ test.describe('前端 E2E ①：happy path（看板 → 详情 → 页签 → di
     expect(gateOut).toContain('PASS');
 
     // 终态后顶栏待办计数归零（面板消失由 pending 状态驱动）
-    await expect(page.locator('.pending-count .c')).toHaveText(/\*0/, { timeout: 30_000 });
+    // 像素主题（决策 169）：计数徽章是纯数字且语义为「待处理」；`*` 字面量退役。
+    const pendingCount = page.locator('.pending-count');
+    await expect(pendingCount).toContainText('待处理', { timeout: 30_000 });
+    await expect(pendingCount.locator('.c')).toHaveText('0');
     expectBundleHealthy(bundle);
   });
 });

@@ -75,7 +75,11 @@ test.describe('前端 E2E ②：pending → dossier 面板 → resume', () => {
     await expect(dossier.locator('.msg')).toContainText('设计输入信息不足');
 
     // ── 顶栏待办计数 = 1 ──
-    await expect(page.locator('.pending-count .c')).toHaveText(/\*1/, { timeout: 60_000 });
+    // 像素主题（决策 169）：计数徽章是纯数字，`*` 字面量退役；断言的是同一**行为**——
+    // 「顶栏待办计数入口显示 1，且语义是待处理」。
+    const pendingCount = page.locator('.pending-count');
+    await expect(pendingCount).toContainText('待处理', { timeout: 60_000 });
+    await expect(pendingCount.locator('.c')).toHaveText('1');
 
     // ── resume：`requires_input` 动作带自由输入（决策 79） ──
     const textarea = dossier.locator('textarea.input');
@@ -102,6 +106,6 @@ test.describe('前端 E2E ②：pending → dossier 面板 → resume', () => {
       120_000,
     );
     await expect(dossier.locator('.dtag')).toContainText('合并提案', { timeout: 60_000 });
-    await expect(page.locator('.pending-count .c')).toHaveText(/\*1/, { timeout: 30_000 });
+    await expect(pendingCount.locator('.c')).toHaveText('1');
   });
 });
