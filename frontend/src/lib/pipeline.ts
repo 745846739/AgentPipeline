@@ -307,19 +307,22 @@ const SPINE_GEOM: Record<string, Geometry> = {
 };
 
 /**
- * hero 坐标：详情内容区 max-width 960（--detail-max）含 20px 内边距 → 可用 920px。
- * 末站 done=895 使标签（约 28px 宽）止于 ~909，不出容器；并行双侧站共用 x。
+ * hero 坐标：逐字对齐冻结原型 `design/prototype-pixel.html` 的 `#v-run .hrail`
+ * （9 站，左边距 56px 起、站距约 106px，末站 done=798）。详情内容区 max-width 1000
+ * 含 20px 内边距 → 可用 960px；末站标签（约 28px 宽）止于 ~812，不出容器。
+ * 主站灯排在顶部一行（x 有效、y 仅对并行侧站有意义），主带 y=76；
+ * 并行双带 y=62 / y=90（原型 twin belts），侧站 y 即两条分带中线。
  */
 const HERO_GEOM: Record<string, Geometry> = {
-  init: { x: 50, y: 62 },
-  'architect-design': { x: 145, y: 62 },
-  'develop-design': { x: 320, y: 22 },
-  'test-design': { x: 320, y: 50 },
-  develop: { x: 500, y: 62 },
-  review: { x: 610, y: 62 },
-  test: { x: 715, y: 62 },
-  merge: { x: 820, y: 62 },
-  done: { x: 895, y: 62 },
+  init: { x: 56, y: 62 },
+  'architect-design': { x: 162, y: 62 },
+  'develop-design': { x: 272, y: 62 },
+  'test-design': { x: 272, y: 90 },
+  develop: { x: 374, y: 62 },
+  review: { x: 480, y: 62 },
+  test: { x: 586, y: 62 },
+  merge: { x: 692, y: 62 },
+  done: { x: 798, y: 62 },
 };
 
 export const RAIL_LABELS: Record<string, string> = {

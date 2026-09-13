@@ -45,8 +45,10 @@ test.describe('前端 E2E ⑦：日志对话可信 + 刷新恢复', () => {
         'merge_approval',
         120_000,
       );
-      // 全程未刷新：计数文本应已反映落库的命令（SSE live 路径）
-      await expect(tabButton).not.toContainText('[命令与输出 0]');
+      // 全程未刷新：计数徽章应已反映落库的命令（SSE live 路径）。
+      // 像素主题（票 06 / 决策 169）：页签 = 工位标签盒，计数是页签内的 `.c` 徽章，
+      // 定位按可访问名「命令与输出」（无方括号）；断言徽章非 0，不删原断言语义。
+      await expect(tabButton.locator('.c')).not.toHaveText('0');
 
       // ── 命令与输出内容：展开第一条 git 命令，内容可识别 ──
       await tabButton.click();
@@ -56,7 +58,7 @@ test.describe('前端 E2E ⑦：日志对话可信 + 刷新恢复', () => {
       await expect(page.locator('.cmd, li, .row', { hasText: "commit -m 'feat: task" })).toBeVisible();
 
       // ── 会话内容：review.execute 的对话含脚本 text 步骤的原文 ──
-      await page.getByRole('button', { name: /\[会话\]/ }).click();
+      await page.getByRole('button', { name: /会话/ }).click();
       const reviewChip = page.locator('.runchip', { hasText: 'review' }).first();
       await reviewChip.click();
       await expect(

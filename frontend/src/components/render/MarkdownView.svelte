@@ -14,28 +14,29 @@
 <style>
   .md {
     color: var(--text);
-    font-size: 12.5px;
+    font-size: 12px;
     line-height: 1.65;
     max-width: 80ch;
   }
+  /* 像素字体无字重轴：层级靠字号倍数与亮度阶；标题 24px 起步（§2.2） */
   .md :global(h1),
   .md :global(h2),
   .md :global(h3),
   .md :global(h4) {
     font-family: var(--font-code);
-    font-weight: 600;
     letter-spacing: 0.02em;
     color: var(--text-hi);
     margin: 1.1em 0 0.45em;
   }
   .md :global(h1) {
-    font-size: 17px;
+    font-size: 24px;
   }
   .md :global(h2) {
-    font-size: 15px;
+    font-size: 24px;
   }
   .md :global(h3) {
-    font-size: 13.5px;
+    font-size: 12px;
+    letter-spacing: 0.08em;
   }
   .md :global(p) {
     margin: 0.45em 0;
@@ -49,7 +50,7 @@
   }
   .md :global(code) {
     font-family: var(--font-mono);
-    font-size: 11.5px;
+    font-size: 12px;
     background: var(--pane);
     padding: 1px 5px;
     border-radius: var(--r-pill);
@@ -57,7 +58,7 @@
   }
   .md :global(pre) {
     background: var(--panel);
-    border: 1px solid var(--pane);
+    border: 2px solid var(--pane);
     border-radius: var(--r-panel);
     padding: 10px 12px;
     overflow-x: auto;
@@ -77,7 +78,7 @@
   }
   .md :global(hr) {
     border: none;
-    border-top: 1px solid var(--hairline);
+    border-top: 2px solid var(--hairline);
     margin: 1em 0;
   }
   .md :global(a) {
@@ -87,6 +88,5 @@
   }
   .md :global(strong) {
     color: var(--text-hi);
-    font-weight: 600;
   }
 </style>

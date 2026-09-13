@@ -101,7 +101,7 @@
     width: 100%;
     text-align: left;
     padding: 4px 8px;
-    font-size: 11.5px;
+    font-size: 12px;
     color: var(--text-2);
     cursor: pointer;
   }
@@ -122,6 +122,7 @@
     color: var(--text-3);
     flex: none;
   }
+  /* 内容区：像素框（2px 描边 + 硬投影），与台账盒同材质 */
   .content {
     flex: 1;
     min-width: 0;
@@ -133,9 +134,11 @@
     display: flex;
     justify-content: space-between;
     align-items: baseline;
-    font-size: 11.5px;
+    font-size: 12px;
     color: var(--text-3);
     margin-bottom: 10px;
+    padding-bottom: 8px;
+    border-bottom: 2px solid var(--pane);
   }
   .degraded {
     color: var(--stop);
@@ -156,6 +159,11 @@
   @media (max-width: 479px) {
     .diff-scroll {
       display: block;
+      overflow-x: auto;
+    }
+    .diff-scroll :global(.dl) {
+      min-width: max-content;
+      white-space: pre;
     }
     .fileview {
       flex-direction: column;
@@ -167,7 +175,7 @@
     }
     .cmd {
       padding: 9px 2px;
-      border-bottom: 1px solid var(--hairline);
+      border-bottom: 2px solid var(--hairline);
       gap: 9px;
     }
     .cmd:last-child {
@@ -178,13 +186,17 @@
       text-overflow: clip;
       white-space: normal;
       word-break: break-all;
-      font-size: 13px;
+      font-size: 12px;
       color: var(--text-hi);
     }
     .content {
       max-height: none;
       padding: 12px 0 0;
-      border-top: 1px solid var(--pane);
+      border-top: 2px solid var(--pane);
+      border-left: 0;
+      border-right: 0;
+      border-bottom: 0;
+      box-shadow: none;
     }
     .chead {
       font-size: 12px;

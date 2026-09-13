@@ -59,7 +59,9 @@ test.describe('前端 E2E ①：happy path（看板 → 详情 → 页签 → di
     await expect(page.locator('h1.d-title')).toHaveText(title);
 
     // ── 页签切换：时间线 → 会话 → 命令与输出 → 产出文件 ──
-    for (const label of ['[会话]', '[命令与输出', '[产出文件]']) {
+    // 像素主题（票 06 / 决策 169）：页签 = 工位标签盒，方括号装饰退役；
+    // 按可访问名（去掉方括号后的标签文本）定位，不断言装饰字符。
+    for (const label of ['会话', '命令与输出', '产出文件']) {
       const tab = page.locator('nav.tabs button.tab', { hasText: label });
       await tab.click();
       await expect(tab).toHaveClass(/on/);
@@ -73,8 +75,8 @@ test.describe('前端 E2E ①：happy path（看板 → 详情 → 页签 → di
     await expect(dossier).toBeVisible({ timeout: 60_000 });
     await expect(dossier.locator('.dtag')).toContainText('合并提案');
 
-    // ── Diff 页签：切过去并点击「合入」 ──
-    const diffTab = page.locator('nav.tabs button.tab', { hasText: '[Diff]' });
+    // ── Diff 页签：切过去并点击「合入」（像素主题：按可访问名「Diff」，无方括号） ──
+    const diffTab = page.locator('nav.tabs button.tab', { hasText: 'Diff' });
     await expect(diffTab).toBeEnabled({ timeout: 60_000 });
     await diffTab.click();
     // diff 面板在页签区与 dossier 各有一处（同一组件两处渲染），限定页签容器内那个

@@ -20,6 +20,9 @@
 
   const tokens = $derived(railTokens(dots));
 
+  /** 有工位在跑（hero）：链节离散步进 + 当前灯心跳微光（票 06）。 */
+  const running = $derived(stations.some((s) => s.state === 'go' || s.state === 'dev' || s.state === 'test'));
+
   /** 灯状态类：与契约 `STATE_STYLES.lamp` 的取色同源（d 完成 / p 已过 / c 在跑 / w 琥珀 / x 红）。 */
   function lampClass(state: string): string {
     switch (state) {
@@ -140,7 +143,7 @@
   </ul>
 {:else}
   <div class="rail {variant}" role="img" aria-label={ariaLabel}>
-    <div class="railline">
+    <div class="railline" class:run={variant === 'hero' && running}>
       {#if variant === 'spine'}
         <!-- 主链节带 + 并行双带（在 develop 前合流） -->
         <div class="belt" style="left:132px;width:1848px;top:36px"></div>
@@ -154,15 +157,18 @@
         <div class="ret" style="left:1452px;width:264px;top:76px"><i>↩</i></div>
         <div class="ret" style="left:924px;width:792px;top:100px"><i>↩</i></div>
       {:else}
-        <div class="belt" style="left:50px;width:845px;top:36px"></div>
-        <div class="belt br" style="left:145px;width:355px;top:22px"></div>
-        <div class="belt br" style="left:145px;width:355px;top:50px"></div>
-        <div class="belt vt" style="left:145px;top:22px"></div>
-        <div class="belt vt" style="left:500px;top:22px"></div>
-        <div class="ret" style="left:145px;width:165px;top:72px"><i>↩</i></div>
-        <div class="ret" style="left:500px;width:110px;top:84px"><i>↩</i></div>
-        <div class="ret" style="left:715px;width:105px;top:72px"><i>↩</i></div>
-        <div class="ret" style="left:500px;width:320px;top:96px"><i>↩</i></div>
+        <!-- hero：与冻结原型 #v-run .hrail 逐行对齐——主站灯在顶行，主带 y=76，
+             并行双带 y=62/90（twin belts），回流带 116/132/148 -->
+        <div class="belt" style="left:56px;width:742px;top:76px"></div>
+        <div class="belt br" style="left:162px;width:212px;top:62px"></div>
+        <div class="belt br" style="left:162px;width:212px;top:90px"></div>
+        <div class="belt vt" style="left:162px;top:62px"></div>
+        <div class="belt vt" style="left:374px;top:62px"></div>
+        <!-- 回流带（打回路径，虚线） -->
+        <div class="ret" style="left:162px;width:212px;top:116px"><i>↩</i></div>
+        <div class="ret" style="left:374px;width:106px;top:132px"><i>↩</i></div>
+        <div class="ret" style="left:586px;width:106px;top:116px"><i>↩</i></div>
+        <div class="ret" style="left:374px;width:318px;top:148px"><i>↩</i></div>
       {/if}
 
       {#each stations as s (s.key)}
@@ -172,7 +178,7 @@
             <span class="lb {s.parallel === 'test' ? 't' : ''}">{s.label}</span>
           </div>
         {:else}
-          <div class="stn" style="left:{s.x}px">
+          <div class="stn" class:cur={s.state === 'go'} style="left:{s.x}px">
             <i class="lamp {lampClass(s.state)}"></i>
             <span class={lbClass(s.state)}>{s.label}</span>
             {#if s.count !== undefined}<span class="ct">{s.count}</span>{/if}
@@ -245,7 +251,8 @@
     position: relative;
     background-repeat: no-repeat;
   }
-  /* 运行中工位两侧链节以离散步进位移（唯一动画位之一，§2.3 原则 4） */
+  /* 运行中工位两侧链节以离散步进位移（唯一动画位之一，§2.3 原则 4）
+     步长 = 一个亮/暗块周期（12px），steps(2) 离散到 6px 块边界 */
   @keyframes beltstep {
     from {
       background-position: 0 0;
@@ -263,8 +270,15 @@
   .rail.hero {
     width: 100%;
     max-width: var(--detail-max);
-    height: 106px;
-    padding: 14px 0 0;
+    height: 168px;
+    padding: 6px 0 0;
+  }
+  /* hero 站灯排在顶行、链节带在其下（冻结原型 #v-run .hrail 的层级） */
+  .rail.hero .railline {
+    height: 162px;
+  }
+  .rail.hero .stn {
+    top: 0;
   }
   .railline {
     position: relative;
@@ -275,6 +289,11 @@
     position: absolute;
     height: 6px;
     background: repeating-linear-gradient(90deg, var(--pane) 0 6px, transparent 6px 12px);
+  }
+  /* 运行中工位两侧链节以离散步进位移（唯一动画位之一，§2.3 原则 4）；
+     只动水平链节带，纵向连接带（.vt）与回流带不参与 */
+  .railline.run .belt:not(.vt) {
+    animation: beltstep 0.6s steps(2) infinite;
   }
   .belt.br {
     background: repeating-linear-gradient(90deg, var(--branch-dev) 0 6px, transparent 6px 12px);
@@ -332,6 +351,19 @@
     background: var(--go);
     border-color: var(--go);
   }
+  /* hero 当前游标：灯的心跳微光（离散步进，取代主题三的滑动圆点 + 柔光） */
+  @keyframes heartbeat {
+    0%,
+    100% {
+      opacity: 1;
+    }
+    50% {
+      opacity: 0.4;
+    }
+  }
+  .rail.hero .stn.cur .lamp.c {
+    animation: heartbeat 1.2s steps(2) infinite;
+  }
   .lamp.w {
     background: var(--pending);
     border-color: var(--pending);
@@ -387,7 +419,8 @@
   .stn.side.up .lb {
     bottom: 2px;
   }
-  /* 下轨标签同样右伸：原型的 right:16px 会向左越过前一站标签 */
+  /* 下轨标签右伸（原型 .stn.side.dn .lb 用 right:16px 会向左越过前一站标签，
+     此处统一右伸为 left:18px，是票 05 登记的既有偏差） */
   .stn.side.dn .lb {
     top: 2px;
   }
@@ -396,7 +429,9 @@
   }
 
   @media (prefers-reduced-motion: reduce) {
-    .lamp.w {
+    .lamp.w,
+    .rail.hero .stn.cur .lamp.c,
+    .railline.run .belt {
       animation: none;
     }
   }

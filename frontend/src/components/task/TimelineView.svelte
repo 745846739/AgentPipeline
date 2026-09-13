@@ -48,7 +48,7 @@
 <style>
   .tline {
     font-family: var(--font-mono);
-    font-size: 11.5px;
+    font-size: 12px;
     color: var(--text-2);
     max-width: 820px;
   }
@@ -87,16 +87,18 @@
   .cur {
     color: var(--go);
   }
+  /* 分支徽标：2px 描边像素块；分支身份靠色相（蓝 / 紫）+ 文字双编码（决策 84 / 169） */
   .bbadge {
-    font-size: 10px;
-    font-weight: 600;
+    font-size: 12px;
     letter-spacing: 0.06em;
     padding: 0 5px;
-    border: 1px solid var(--pane);
+    border: 2px solid currentColor;
   }
-  .bbadge.dev,
+  .bbadge.dev {
+    color: var(--branch-dev);
+  }
   .bbadge.test {
-    color: var(--text-3);
+    color: var(--branch-tst);
   }
   .empty {
     color: var(--text-3);
@@ -107,25 +109,25 @@
   @media (max-width: 479px) {
     .tline {
       max-width: none;
-      font-size: 13px;
+      font-size: 12px;
     }
     .trow {
       display: block;
       padding: 7px 0;
-      border-bottom: 1px solid var(--hairline);
+      border-bottom: 2px solid var(--hairline);
     }
     .trow:last-child {
       border-bottom: 0;
     }
     .t {
       width: auto;
-      font-size: 11.5px;
+      font-size: 12px;
     }
     .tr {
       display: inline;
       width: auto;
       margin-left: 8px;
-      font-size: 12.5px;
+      font-size: 12px;
     }
     .to {
       display: block;

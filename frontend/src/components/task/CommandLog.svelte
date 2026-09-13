@@ -52,9 +52,7 @@
     {#each commands as command (command.id)}
       <button type="button" class="cmd" onclick={() => toggle(command)}>
         <span class="cmd-l1">
-          <span class={command.exit_code === null || command.exit_code === 0 ? 'ok' : 'bad'}>
-            {command.exit_code === null ? '…' : command.exit_code === 0 ? '✓' : '✗'}
-          </span>
+          <i class={command.exit_code === null || command.exit_code === 0 ? 'ok' : 'bad'}></i>
           <span class="tm">{formatClock(command.started_at)}</span>
           <span class="src">{command.source === 'system' ? 'sys' : 'agent'}</span>
           <span class="ms">{command.duration_ms !== null ? formatDuration(command.duration_ms) : '—'}</span>
@@ -81,13 +79,14 @@
   .cmds {
     max-width: 900px;
   }
+  /* 桌面单表多列：命令 · 时间 · 来源徽标 · 耗时 · 退出码；移动款两行制见下方 */
   .cmd {
     display: flex;
     align-items: center;
     gap: 10px;
     padding: 4px 8px;
     font-family: var(--font-mono);
-    font-size: 11.5px;
+    font-size: 12px;
     color: var(--text-2);
     cursor: pointer;
     width: 100%;
@@ -96,25 +95,31 @@
   .cmd:hover {
     background: var(--hover-bg);
   }
-  .ok {
-    color: var(--go);
+  /* 退出码信号灯：8px 实心像素方块（绿灯 = 成功，红灯 = 非零），不用字符 ✓/✗ */
+  .ok,
+  .bad {
     flex: none;
+    width: 8px;
+    height: 8px;
+  }
+  .ok {
+    background: var(--go);
   }
   .bad {
-    color: var(--stop);
-    flex: none;
+    background: var(--stop);
   }
   .tm {
     color: var(--text-4);
     width: 62px;
     flex: none;
   }
+  /* source = agent | system 仍用徽标区分，但共用一表 */
   .src {
     flex: none;
-    width: 36px;
-    font-size: 9.5px;
+    width: 42px;
+    font-size: 12px;
     text-align: center;
-    border: 1px solid var(--pane);
+    border: 2px solid var(--pane);
     color: var(--text-3);
   }
   .c {
@@ -131,22 +136,26 @@
   }
   .ex {
     color: var(--text-3);
-    width: 44px;
+    width: 64px;
     flex: none;
     text-align: right;
   }
+  .ex.bad {
+    color: var(--stop);
+  }
+  /* 输出块：2px 左缘像素条 + 货箱面底，等宽不折行可横滚 */
   .cmdout {
     border-left: 2px solid var(--pane);
     background: var(--panel);
     margin: 4px 0 12px 26px;
     padding: 8px 12px;
     font-family: var(--font-mono);
-    font-size: 11.5px;
+    font-size: 12px;
     color: var(--text-2);
     max-width: 840px;
     white-space: pre-wrap;
-    max-height: 360px;
     overflow: auto;
+    max-height: 360px;
   }
   .cmdout .ln {
     color: var(--text-3);
@@ -184,7 +193,7 @@
       align-items: center;
       gap: 2px 9px;
       padding: 9px 2px;
-      border-bottom: 1px solid var(--hairline);
+      border-bottom: 2px solid var(--hairline);
     }
     .cmd:last-child {
       border-bottom: 0;
@@ -214,14 +223,14 @@
       text-overflow: clip;
       white-space: pre-wrap;
       word-break: break-all;
-      font-size: 13px;
+      font-size: 12px;
       color: var(--text);
       line-height: 1.5;
     }
     .cmdout {
       margin: 8px 0 12px 0;
       max-height: none;
-      font-size: 12.5px;
+      font-size: 12px;
     }
   }
 </style>
