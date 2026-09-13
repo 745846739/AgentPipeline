@@ -53,6 +53,11 @@
   let scDeleteBusy = $state<string | null>(null);
   let scRowError = $state<{ stage: string; message: string } | null>(null);
 
+  /** 每行的掩码状态：密钥已配置显示 `***`，未配置显示「未设置」（决策 112）。 */
+  function keyText(p: Provider): string {
+    return p.api_key ? API_KEY_MASK : '未设置';
+  }
+
   async function load() {
     loading = true;
     error = null;
@@ -182,15 +187,14 @@
 
 <div class="page">
   <a class="crumb" href="#/">← 看板</a>
-  <header class="head">
-    <h1 class="cond">设置 · 模型与密钥</h1>
+  <div class="p-head">
+    <h1 class="p-title">设置 · 模型与密钥</h1>
     <button type="button" class="btn solid" onclick={openNew}>＋ 新增 provider</button>
-  </header>
+  </div>
 
-  <p class="hint">
-    provider 行 =（vendor, model, context_window）（决策 111）。api_key 明文存储，读接口只回显
-    <span class="mono">{API_KEY_MASK}</span>；密钥明文存于本机
-    <span class="mono">~/.agentpipeline</span>，目录权限 <span class="mono">0700</span>（决策 112 / §12.14）。
+  <p class="hintline">
+    provider 行 =（vendor, model, context_window）（决策 111）。api_key 明文存储，读接口只回显 <b>{API_KEY_MASK}</b>；
+    密钥明文存于本机 <b>~/.agentpipeline</b>，目录权限 <b>0700</b>（决策 112 / §12.14）。
   </p>
 
   {#if editing}
@@ -212,131 +216,130 @@
   {:else if providers.length === 0}
     <div class="banner">还没有 provider。新增一行后，任务的阶段模型才会被解析。</div>
   {:else}
-    <div class="list">
-      <div class="list-head">
+    <div class="reg">
+      <div class="reg-head">
         <span>provider</span>
-        <span class="col-n">{providers.length}</span>
+        <span class="n">▪ {providers.length}</span>
       </div>
-      <ul class="rows">
-      {#each providers as p (p.id)}
-        {@const supported = isSupportedAdapter(p.vendor)}
-        <li class="row" class:unsupported={!supported}>
-          <div class="main">
-            <div class="line1">
-              <span class="vendor mono">{p.vendor}</span>
-              <span class="model mono">{p.model}</span>
-              {#if p.enabled}
-                <span class="st run">[ON]</span>
-              {:else}
-                <span class="st dim">[OFF]</span>
-              {/if}
-              {#if !supported}<span class="warn-tag">! 不受支持 · 决策 103</span>{/if}
-            </div>
-            <div class="line2 mono">
-              <span>ctx {p.context_window.toLocaleString('en-US')}</span>
-              <span>base_url {p.base_url ?? '默认'}</span>
-              <span>api_key {p.api_key ? API_KEY_MASK : '未设置'}</span>
-            </div>
-            {#if !supported}
-              <div class="warn-text">
-                该厂商不在 supported_adapters 内：此行走降级灰显，被 stage_configs 引用时配置加载会拒绝启动。
+      <ul class="reg-rows">
+        {#each providers as p (p.id)}
+          {@const supported = isSupportedAdapter(p.vendor)}
+          <li class="reg-row row" class:dead={!supported}>
+            <div class="reg-main">
+              <div class="reg-l1">
+                <span class="reg-name mono">{p.vendor}</span>
+                <span class="reg-sub mono">{p.model}</span>
+                {#if p.enabled}
+                  <span class="st run">[ON]</span>
+                {:else}
+                  <span class="st dim">[OFF]</span>
+                {/if}
+                {#if !supported}<span class="warnnote inline">! 不受支持 · 决策 103</span>{/if}
               </div>
-            {/if}
-            {#if rowError?.id === p.id}<div class="warn-text stop">{rowError.message}</div>{/if}
-          </div>
-          <div class="acts">
-            {#if confirmingDelete === p.id}
-              <span class="confirm">确认删除？</span>
-              <button
-                type="button"
-                class="btn danger"
-                disabled={deleteBusy === p.id}
-                onclick={() => remove(p)}
-              >
-                {#if deleteBusy === p.id}<span class="spin"></span>{/if}删除
-              </button>
-              <button type="button" class="btn quiet" onclick={() => (confirmingDelete = null)}>
-                取消
-              </button>
-            {:else}
-              <button type="button" class="btn" onclick={() => openEdit(p)}>编辑</button>
-              <button
-                type="button"
-                class="btn danger"
-                onclick={() => {
-                  rowError = null;
-                  confirmingDelete = p.id;
-                }}
-              >
-                删除
-              </button>
-            {/if}
-          </div>
-        </li>
-      {/each}
+              <div class="reg-l2 mono">
+                <span>ctx {p.context_window.toLocaleString('en-US')}</span>
+                <span>base_url {p.base_url ?? '默认'}</span>
+                <span>api_key {keyText(p)}</span>
+              </div>
+              {#if !supported}
+                <div class="warnnote">
+                  该厂商不在 supported_adapters 内：此行走降级灰显，被 stage_configs 引用时配置加载会拒绝启动。
+                </div>
+              {/if}
+              {#if rowError?.id === p.id}<div class="reg-err">{rowError.message}</div>{/if}
+            </div>
+            <div class="reg-acts">
+              {#if confirmingDelete === p.id}
+                <span class="reg-sub">确认删除？</span>
+                <button
+                  type="button"
+                  class="btn danger"
+                  disabled={deleteBusy === p.id}
+                  onclick={() => remove(p)}
+                >
+                  {#if deleteBusy === p.id}<span class="spin"></span>{/if}删除
+                </button>
+                <button type="button" class="btn quiet" onclick={() => (confirmingDelete = null)}>
+                  取消
+                </button>
+              {:else}
+                <button type="button" class="btn" onclick={() => openEdit(p)}>编辑</button>
+                <button
+                  type="button"
+                  class="btn danger"
+                  onclick={() => {
+                    rowError = null;
+                    confirmingDelete = p.id;
+                  }}
+                >
+                  删除
+                </button>
+              {/if}
+            </div>
+          </li>
+        {/each}
       </ul>
     </div>
   {/if}
 
   <!-- stage_configs 编辑器（决策 22 / 46 / 66 / 111 / 129）：GET 列表 / PUT 整条替换 / DELETE 撤销覆盖。 -->
-  <section class="stage-configs">
-    <header class="sc-head">
-      <h2 class="cond">阶段配置（stage_configs）</h2>
-      <button type="button" class="btn" onclick={openNewStageConfig}>＋ 新增阶段配置</button>
-    </header>
-    <p class="hint sc-hint">
-      阶段 provider 优先于全局默认（决策 129）。保存为<strong>整条替换</strong>：留空字段清空为默认。写入会跑启动校验，非法配置（provider 缺失/禁用/厂商不支持、persona 不可读、会破坏启动的改动）被拒并回显原因（决策 47 / 103）。
-    </p>
+  <div class="sub-head">
+    <h2>阶段配置</h2>
+    <button type="button" class="btn" onclick={openNewStageConfig}>＋ 新增阶段配置</button>
+  </div>
+  <p class="hintline">
+    阶段 provider 优先于全局默认（决策 129）。保存为<b>整条替换</b>：留空字段清空为默认。写入会跑启动校验，非法配置（provider 缺失/禁用/厂商不支持、persona 不可读、会破坏启动的改动）被拒并回显原因（决策 47 / 103）。
+  </p>
 
-    {#if scEditing}
-      {#key scEditing.mode === 'new' ? 'sc-new' : scEditing.config.stage}
-        <StageConfigForm
-          config={scEditing.mode === 'edit' ? scEditing.config : null}
-          {providers}
-          submitting={scSaving}
-          error={scFormError}
-          onsubmit={submitStageConfig}
-          oncancel={() => (scEditing = null)}
-        />
-      {/key}
-    {/if}
+  {#if scEditing}
+    {#key scEditing.mode === 'new' ? 'sc-new' : scEditing.config.stage}
+      <StageConfigForm
+        config={scEditing.mode === 'edit' ? scEditing.config : null}
+        {providers}
+        submitting={scSaving}
+        error={scFormError}
+        onsubmit={submitStageConfig}
+        oncancel={() => (scEditing = null)}
+      />
+    {/key}
+  {/if}
 
-    {#if scError}
-      <div class="banner error">{scError}</div>
-    {:else if scLoading}
-      <div class="banner">正在加载阶段配置…</div>
-    {:else if stageConfigs.length === 0}
-      <div class="banner">还没有阶段覆盖。所有阶段都在用系统默认配置。</div>
-    {:else}
-      <div class="list">
-        <div class="list-head">
-          <span>阶段配置</span>
-          <span class="col-n">{stageConfigs.length}</span>
-        </div>
-        <ul class="rows">
+  {#if scError}
+    <div class="banner error">{scError}</div>
+  {:else if scLoading}
+    <div class="banner">正在加载阶段配置…</div>
+  {:else if stageConfigs.length === 0}
+    <div class="banner">还没有阶段覆盖。所有阶段都在用系统默认配置。</div>
+  {:else}
+    <div class="reg">
+      <div class="reg-head">
+        <span>阶段配置</span>
+        <span class="n">▪ {stageConfigs.length}</span>
+      </div>
+      <ul class="reg-rows">
         {#each stageConfigs as sc (sc.stage)}
-          <li class="row" class:pseudo={isPseudoStage(sc.stage)}>
-            <div class="main">
-              <div class="line1">
-                <span class="vendor mono">{stageKeyLabel(sc.stage)}</span>
-                <span class="model mono">provider {sc.provider_id ?? '默认'}</span>
-                <span class="model mono">
+          <li class="reg-row row" class:pseudo={isPseudoStage(sc.stage)}>
+            <div class="reg-main">
+              <div class="reg-l1">
+                <span class="reg-name mono">{stageKeyLabel(sc.stage)}</span>
+                <span class="reg-sub mono">provider {sc.provider_id ?? '默认'}</span>
+                <span class="reg-sub mono">
                   temp {sc.temperature ?? '默认'} · max_tokens {sc.max_tokens ?? '默认'}
                 </span>
               </div>
-              <div class="line2 mono">
+              <div class="reg-l2 mono">
                 <span>persona {sc.persona_path ?? '—'}</span>
                 <span>tools {sc.tools_json ? '已配置' : '—'}</span>
                 <span>skills {sc.skills_json ? '已配置' : '—'}</span>
                 <span>updated {formatDateTime(sc.updated_at)}</span>
               </div>
               {#if scRowError?.stage === sc.stage}
-                <div class="warn-text stop">{scRowError.message}</div>
+                <div class="reg-err">{scRowError.message}</div>
               {/if}
             </div>
-            <div class="acts">
+            <div class="reg-acts">
               {#if scConfirmingDelete === sc.stage}
-                <span class="confirm">确认撤销覆盖？</span>
+                <span class="reg-sub">确认撤销覆盖？</span>
                 <button
                   type="button"
                   class="btn danger"
@@ -364,10 +367,9 @@
             </div>
           </li>
         {/each}
-        </ul>
-      </div>
-    {/if}
-  </section>
+      </ul>
+    </div>
+  {/if}
 </div>
 
 <style>
@@ -376,36 +378,9 @@
     margin: 0 auto;
     padding: 20px 24px 60px;
   }
-  .crumb {
-    display: inline-flex;
-    color: var(--text-3);
-    font-size: 12px;
-    margin-bottom: 10px;
-  }
-  .crumb:hover {
-    color: var(--text-2);
-  }
-  .head {
-    display: flex;
-    align-items: center;
-    justify-content: space-between;
-    gap: 14px;
-    margin-bottom: 8px;
-  }
-  h1 {
-    font-size: 18px;
-    color: var(--text-hi);
-  }
-  .hint {
-    font-size: 11.5px;
-    color: var(--text-3);
-    line-height: 1.6;
-    margin-bottom: 14px;
-  }
   .banner {
     padding: 10px 12px;
-    border: 1px solid var(--pane);
-    border-radius: 0;
+    border: 2px solid var(--pane);
     color: var(--text-3);
     font-size: 12px;
   }
@@ -413,123 +388,11 @@
     border-color: var(--stop);
     color: var(--stop);
   }
-  .list {
-    border: 1px solid var(--pane);
-    background: var(--bg);
-    margin-top: 4px;
+  .warnnote.inline {
+    margin-top: 0;
   }
-  .list-head {
-    display: flex;
-    justify-content: space-between;
-    align-items: center;
-    gap: 8px;
-    padding: 9px 12px;
-    border-bottom: 1px solid var(--pane);
-    background: var(--head-band);
-    font-size: 10.5px;
-    font-weight: 600;
-    letter-spacing: 0.08em;
-    text-transform: uppercase;
-    color: var(--text-3);
-  }
-  .col-n {
-    color: var(--text-4);
-    font-weight: 400;
-  }
-  .rows {
-    list-style: none;
-    display: flex;
-    flex-direction: column;
-  }
-  .row {
-    display: flex;
-    align-items: flex-start;
-    justify-content: space-between;
-    gap: 12px;
-    padding: 11px 12px 12px;
-    border-bottom: 1px solid var(--hairline);
-    transition: background 0.12s;
-  }
-  .row:last-child {
-    border-bottom: 0;
-  }
-  .row:hover {
-    background: var(--hover-bg);
-  }
-  /* 决策 103：不受支持的适配器降级灰显 + 琥珀告警，不崩 */
-  .row.unsupported {
-    color: var(--text-4);
-  }
-  .row.unsupported .vendor,
-  .row.unsupported .model {
-    color: var(--text-4);
-  }
-  .main {
-    min-width: 0;
-  }
-  .line1 {
-    display: flex;
-    align-items: baseline;
-    gap: 10px;
-    flex-wrap: wrap;
-  }
-  .vendor {
-    color: var(--text-hi);
-    font-size: 12.5px;
-  }
-  .model {
-    color: var(--text-2);
-    font-size: 12px;
-  }
-  .warn-tag {
-    font-size: 10.5px;
-    color: var(--pending);
-  }
-  .line2 {
-    display: flex;
-    gap: 14px;
-    flex-wrap: wrap;
-    margin-top: 5px;
-    font-size: 10.5px;
-    color: var(--text-3);
-  }
-  .warn-text {
-    margin-top: 5px;
-    font-size: 11px;
-    color: var(--pending);
-  }
-  .warn-text.stop {
-    color: var(--stop);
-  }
-  .acts {
-    display: flex;
-    align-items: center;
-    gap: 6px;
-    flex: none;
-  }
-  .confirm {
-    font-size: 11.5px;
-    color: var(--text-2);
-  }
-  .stage-configs {
-    margin-top: 26px;
-  }
-  .sc-head {
-    display: flex;
-    align-items: center;
-    justify-content: space-between;
-    gap: 14px;
-    margin-bottom: 6px;
-  }
-  .sc-head h2 {
-    font-size: 14px;
-    color: var(--text-hi);
-  }
-  .sc-hint {
-    margin-bottom: 12px;
-  }
-  /* 伪阶段不再用分支色相（决策 84）：左缘亮度阶 + [伪] 文字标记 */
+  /* 决策 84：伪阶段用左缘 4px --text-3 亮度阶 + 名称后缀「（伪阶段）」，不用分支色相 */
   .row.pseudo {
-    border-left: 2px solid var(--text-3);
+    border-left: 4px solid var(--text-3);
   }
 </style>

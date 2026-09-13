@@ -100,9 +100,11 @@
 <style>
   .proj-form {
     padding: 14px 16px;
+    margin-bottom: 14px;
   }
   .form-head {
-    font-size: 13px;
+    font-size: 12px;
+    letter-spacing: 0.08em;
     color: var(--text-hi);
     margin-bottom: 12px;
   }
@@ -119,7 +121,7 @@
   }
   .field > span {
     display: block;
-    font-size: 11px;
+    font-size: 12px;
     color: var(--text-3);
     margin-bottom: 4px;
   }
@@ -129,7 +131,7 @@
   }
   .hint {
     margin-top: 8px;
-    font-size: 11px;
+    font-size: 12px;
     color: var(--text-3);
     line-height: 1.6;
   }
@@ -144,5 +146,11 @@
     justify-content: flex-end;
     gap: 8px;
     margin-top: 12px;
+  }
+
+  @media (max-width: 479px) {
+    .grid {
+      grid-template-columns: 1fr;
+    }
   }
 </style>
