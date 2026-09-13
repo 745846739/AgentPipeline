@@ -13,7 +13,10 @@ import type {
   Provider,
   ProviderCreatePayload,
   ProviderPatchPayload,
+  ProviderTestPayload,
+  ConnectionTestResult,
   ResumePayload,
+  ServerInfo,
   StageConfig,
   StageConfigPutPayload,
   TaskDetail,
@@ -265,6 +268,14 @@ export function deleteProvider(id: string): Promise<void> {
   return request<void>(`/providers/${encodeURIComponent(id)}`, { method: 'DELETE' });
 }
 
+/** 连通性探针（决策 160）：探测成功/失败都返回 200，结论在结果体里。 */
+export function testProvider(payload: ProviderTestPayload): Promise<ConnectionTestResult> {
+  return request<{ test: ConnectionTestResult }>('/providers/test', {
+    method: 'POST',
+    body: payload,
+  }).then((d) => d.test);
+}
+
 /* projects（决策 24 / 29 / 61 / 78 / 101 / 130）。 */
 
 export function createProject(payload: ProjectCreatePayload): Promise<Project> {
@@ -327,4 +338,21 @@ export function putStageConfig(
 
 export function deleteStageConfig(stage: string): Promise<void> {
   return request<void>(`/stage-configs/${encodeURIComponent(stage)}`, { method: 'DELETE' });
+}
+
+/* server-info（决策 167）：局域网分享地址枚举与二维码。 */
+
+/** 服务自述：候选局域网地址 + 当前是否仅回环绑定。 */
+export function getServerInfo(): Promise<ServerInfo> {
+  return request<ServerInfo>('/server-info');
+}
+
+/**
+ * 二维码 SVG 的 `<img src>` 地址。
+ *
+ * 用 `apiUrl` 而非裸相对路径：桌面壳 / 跨源注入形态下 base 非空，裸路径会指错。
+ * 服务端只接受本服务自己的地址（决策 167），故 `url` 必须来自 `getServerInfo`。
+ */
+export function qrSvgUrl(url: string): string {
+  return apiUrl(`/server-info/qr.svg?url=${encodeURIComponent(url)}`);
 }

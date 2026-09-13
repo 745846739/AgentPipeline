@@ -196,6 +196,11 @@
       <div class="banner error">{taskDetail.error}</div>
     {/if}
 
+    {#if taskDetail.actionError}
+      <!-- 动作提交失败必须可见（主流程票 03）：吞掉它 = 用户点「重试」毫无反应的死面板 -->
+      <div class="banner error">动作提交失败：{taskDetail.actionError}</div>
+    {/if}
+
     {#if task}
       {#if isMobile}
         <div class="bar-row">

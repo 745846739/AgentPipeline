@@ -105,19 +105,51 @@ impl MockLlm {
     /// 用 system prompt 里的节点 persona（内嵌 §10.3 模板 / 伪阶段 persona）
     /// 反查 `(stage, node)` 或 `pseudo:*`，再消费脚本下一步——与 FakeAgent
     /// 同一份 `Script`，因此真实二进制走的是与 L2/L4 相同的场景脚本。
+    ///
+    /// `Submit` 步之后紧跟一次**无工具调用**的收尾文本（主流程票 08）：真实模型
+    /// 提交 `submit_metadata` 后不会再发工具调用，agent loop 随之收束；若 mock
+    /// 继续吐队列里的下一步，节点一次 run 会把整个队列吃完，重启重放（票 08）
+    /// 将无步可用。同一节点的重放因此消费第二份脚本即可。
     pub async fn from_script(script: Script) -> Self {
-        let script = Arc::new(Mutex::new(script));
+        struct ScriptState {
+            script: Script,
+            /// 刚为该节点/伪阶段吐过 Submit 步——下一请求回收尾文本。
+            just_submitted_nodes: std::collections::HashSet<(Stage, Node)>,
+            just_submitted_pseudo: std::collections::HashSet<String>,
+        }
+        let state = Arc::new(Mutex::new(ScriptState {
+            script,
+            just_submitted_nodes: Default::default(),
+            just_submitted_pseudo: Default::default(),
+        }));
         let responder: Responder = Arc::new(move |request: &RecordedRequest| {
             let system = request_system_prompt(&request.body).unwrap_or_default();
-            let body = if let Some(agent_type) = pseudo_agent_type(&system) {
-                let step = script.lock().unwrap().take_next_pseudo(agent_type);
-                render_step(step)
-            } else if let Some((stage, node)) = node_for_system(&system) {
-                let step = script.lock().unwrap().take_next(stage, node);
-                render_step(step)
-            } else {
-                // 认不出的请求（如未脚本化节点）：当作脚本耗尽，干净收尾。
-                sse_text("（脚本已结束）")
+            let body = {
+                let mut state = state.lock().unwrap();
+                if let Some(agent_type) = pseudo_agent_type(&system) {
+                    if state.just_submitted_pseudo.remove(agent_type) {
+                        sse_text("（已提交元数据）")
+                    } else {
+                        let step = state.script.take_next_pseudo(agent_type);
+                        if matches!(step, Some(Step::Submit(_))) {
+                            state.just_submitted_pseudo.insert(agent_type.to_string());
+                        }
+                        render_step(step)
+                    }
+                } else if let Some((stage, node)) = node_for_system(&system) {
+                    if state.just_submitted_nodes.remove(&(stage, node)) {
+                        sse_text("（已提交元数据）")
+                    } else {
+                        let step = state.script.take_next(stage, node);
+                        if matches!(step, Some(Step::Submit(_))) {
+                            state.just_submitted_nodes.insert((stage, node));
+                        }
+                        render_step(step)
+                    }
+                } else {
+                    // 认不出的请求（如未脚本化节点）：当作脚本耗尽，干净收尾。
+                    sse_text("（脚本已结束）")
+                }
             };
             MockRoute::sse("/", body)
         });

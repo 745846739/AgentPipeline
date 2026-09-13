@@ -1,4 +1,9 @@
-import type { Provider, ProviderCreatePayload, ProviderPatchPayload } from '../api/types';
+import type {
+  Provider,
+  ProviderCreatePayload,
+  ProviderPatchPayload,
+  ProviderTestPayload,
+} from '../api/types';
 
 /**
  * provider 表单的纯逻辑（决策 103 / 111 / 112）。
@@ -99,5 +104,26 @@ export function buildProviderCreate(draft: ProviderDraft): ProviderCreatePayload
   if (baseUrl) payload.base_url = baseUrl;
   const key = draft.api_key.trim();
   if (key && !isApiKeyMask(key)) payload.api_key = key;
+  return payload;
+}
+
+/**
+ * 测试连接（决策 160）请求体规则——与保存规则同源，掩码绝不回传真值：
+ * - 编辑态（providerId 非空）且输入框仍是 `***` → 省略 api_key，后端按 id 沿用已存密钥；
+ * - 新增态必须已填 key 才带上（探针端点对未命中 id 且缺 key 返回 400）。
+ */
+export function buildProviderTest(
+  draft: ProviderDraft,
+  providerId: string | null,
+): ProviderTestPayload {
+  const payload: ProviderTestPayload = {
+    vendor: draft.vendor.trim(),
+    model: draft.model.trim(),
+  };
+  if (providerId) payload.id = providerId;
+  const key = draft.api_key.trim();
+  if (key && !isApiKeyMask(key)) payload.api_key = key;
+  const base = draft.base_url.trim();
+  if (base) payload.base_url = base;
   return payload;
 }

@@ -3,12 +3,20 @@
  *
  * 断言「琥珀面板」（dossier 的 `--pending` 色）与顶栏待办计数，然后提交 resume，
  * 断言该 pending 被清除且流水线继续推进（信息不足 → 合并提案）。
- * 真 axum 后端 + mock LLM + 临时 home；只 Chromium（决策 144）。
+ * 真 axum 后端 + mock LLM + 临时 home；页面加载**编译期内嵌的真实 bundle**
+ * （主流程票 01）；只 Chromium（决策 144）。
  */
 
 import { expect, test } from '@playwright/test';
 
-import { startApp, waitForTask, pendingTypeOf, type App } from './harness';
+import {
+  startApp,
+  waitForTask,
+  pendingTypeOf,
+  watchBundle,
+  settleBundle,
+  type App,
+} from './harness';
 import {
   NODE,
   ValidateInput,
@@ -45,10 +53,15 @@ test.describe('前端 E2E ②：pending → dossier 面板 → resume', () => {
   });
 
   test('琥珀 dossier 面板 + 顶栏待办计数，resume 后该 pending 清除并继续推进', async ({ page }) => {
+    // 真实产物守卫（主流程票 01）。
+    const bundle = watchBundle(page);
+
     // ── 等真后端把任务推进到 pending(info_insufficient) ──
     await waitForTask(app, (t) => pendingTypeOf(t) === 'info_insufficient', 'info_insufficient');
 
     await page.goto(`${app.webBase}/#/task/${app.taskId}`);
+    // 内嵌产物健康先于业务断言（主流程票 01）：产物坏掉时立刻报根因，而非等 60s 超时。
+    await settleBundle(page, bundle);
 
     // ── 琥珀 dossier 面板：文案 + `--pending` 色（#ffb454） ──
     const dossier = page.locator('aside.dossier');

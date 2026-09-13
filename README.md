@@ -38,9 +38,29 @@ make desktop-run   # debug 壳直接跑，窗口导航到内嵌同源服务
 数据全部落在 `~/.agentpipeline/`（可用环境变量 `AGENTPIPELINE_HOME` 覆盖，测试即靠它隔离）。
 首次启动后到 `POST /providers` 配置一个 provider，才能创建任务（未配置时创建任务会明确报错，决策 56）。
 
+### 手机扫码访问（决策 167）
+
+桌面壳或 web 形态都能让手机通过局域网接入：打开应用内「**手机访问**」页（`#/share`）扫二维码即可。
+
+```bash
+# web：绑定全网卡后，到「手机访问」页扫码
+./target/release/agent-pipeline serve --host 0.0.0.0
+
+# 桌面壳：设环境变量开启局域网（默认仍只绑回环）
+AGENTPIPELINE_LAN=1 make desktop-run
+```
+
+手机加载的页面与 API **同源**（内嵌 dist 同源托管，决策 155），因此**无需** `--allowed-origin`：
+跨源防护（决策 128）只拦异源写请求，同源写请求恒带客户端头，天然通过。
+地址由后端枚举网卡择优给出（私网优先、VPN/Docker 虚拟网卡降级，决策 167）；
+若只绑了回环地址，页面会提示「127.0.0.1 在手机上指向手机自己」并给出开启步骤。
+
+> ⚠ v1 无鉴权：同网段的任何设备都能调用全部接口（含触发真实 LLM 调用的写操作）。
+> 请勿在公共 Wi-Fi 下开启；更稳妥可用 SSH 隧道 / Tailscale。
+
 ### 局域网访问（决策 157）
 
-写操作受跨源防护（决策 128），开放局域网需同时绑定 `0.0.0.0` 并**显式放行**访问端页面的 origin：
+若要让**另一台电脑的浏览器**直接打开本机页面（页面 origin 与 API 不同源），才需要显式放行该 origin：
 
 ```bash
 ./target/release/agent-pipeline serve --host 0.0.0.0 --allowed-origin http://192.168.1.10:8787
@@ -52,9 +72,15 @@ make desktop-run   # debug 壳直接跑，窗口导航到内嵌同源服务
 
 ## 质量闸门
 
+**提交前必过**（决策 147 / 166）：`just default` = `lint` + `test` + `frontend` + `frontend-e2e`。
+
 ```bash
-just lint          # cargo fmt --check + cargo clippy -D warnings（提交前必过）
-just test          # 全量测试（L1 + L2 + L3 + 冒烟 + L4）
+just default       # 提交前必过：以下四项全跑
+just lint          # cargo fmt --check + cargo clippy -D warnings
+just test          # 全量测试（L1 单元 + L2 集成 + L3 API + L4 场景 + 冒烟）
+just frontend      # 前端：vitest + svelte-check + vite build
+just frontend-e2e  # 前端 E2E（playwright 17 例；前置产物新鲜度守卫）
+# 分层子集
 just unit          # 只跑单元层
 just integration   # core 的 L2 集成（游标 / git / scheduler）
 just api           # L3 API 契约（in-process axum router）
@@ -62,7 +88,19 @@ just e2e           # L4 场景
 just smoke         # 启动冒烟（spawn 真二进制）
 ```
 
-当前状态：**481 个用例全过**（另有 1 个 `#[ignore]` 真 LLM 冒烟），`fmt` / `clippy -D warnings` 干净。前端另有 85 个 vitest + 2 条 playwright E2E，在 `frontend/` 下单独跑（见 [docs/testing.md](docs/testing.md) §9）。
+**未装 `just` 时**用 Makefile 的镜像入口（语义与 justfile 对齐，以 justfile 为准）：
+`make check` / `check-lint` / `check-test` / `check-frontend` / `check-e2e`。
+
+**产物新鲜度守卫（决策 166）：** `frontend-e2e` 跑用例前先确保被测对象是当前源码——
+前端源码比 `frontend/dist` 新则重建 dist，随后 `cargo build -p app`（dist 变化经
+`crates/app/build.rs` 的 `rerun-if-changed` 传递，二进制必然跟着重编）。没有这一步，
+改了代码不重建就会得到「旧二进制的绿」。
+
+**本项目无 CI**（无 `.github/workflows/`）：闸门靠本地执行，这是当前形态而非遗漏。
+
+当前状态：**Rust 515 个用例全过**（另有 2 个 `#[ignore]` 真 LLM 冒烟：单节点 + 全流程），
+`fmt` / `clippy -D warnings` 干净；前端 **96 个 vitest 全过** + `svelte-check` 0 error /
+0 warning + **17 条 playwright E2E 全过**（`make check-e2e` / `just frontend-e2e`）。
 
 ## 代码结构
 

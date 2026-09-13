@@ -100,7 +100,7 @@ impl Store {
             MergeDecision::Return => (Stage::Develop, Node::Execute),
         };
 
-        let mut tx = self.pool().begin().await?;
+        let mut tx = self.begin_write().await?;
         sqlx::query(
             "INSERT INTO kanban_stage_outputs
              (task_id, stage, output_type, file_path, metadata_json, created_at, updated_at)
@@ -148,6 +148,10 @@ impl Store {
         .await?;
 
         tx.commit().await?;
+        // 任务投影必须同步：否则 /tasks/{id} 在执行器下次写库前一直报
+        // 旧的 merge_approval——UI/轮询方会把「返回修改后的过渡态」当成仍待审批，
+        // 对着陈旧状态再次提交决策（主流程票 06 的 e2e 打红：二次合入 404）。
+        self.sync_task_projection(task_id).await?;
         self.get_cursor(&cursor.cursor_id).await
     }
 
@@ -185,7 +189,7 @@ impl Store {
             reason.push_str(c);
         }
 
-        let mut tx = self.pool().begin().await?;
+        let mut tx = self.begin_write().await?;
         sqlx::query(
             "UPDATE kanban_node_cursors
              SET stage = ?, node = ?, status = 'active', pending_reason_json = NULL,
@@ -213,6 +217,9 @@ impl Store {
         .execute(&mut *tx)
         .await?;
         tx.commit().await?;
+        // 同 apply_merge_decision：决策落库后立刻同步任务投影，不让 UI/轮询方
+        // 读到已失效的 human_review（主流程票 06）。
+        self.sync_task_projection(task_id).await?;
         self.get_cursor(&cursor.cursor_id).await
     }
 

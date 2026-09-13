@@ -1,5 +1,13 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
-import { ApiError, deleteStageConfig, listStageConfigs, putStageConfig } from './client';
+import {
+  ApiError,
+  deleteStageConfig,
+  getServerInfo,
+  listStageConfigs,
+  putStageConfig,
+  qrSvgUrl,
+} from './client';
+import { CLIENT_HEADER, setApiBase } from './config';
 
 function jsonResponse(body: unknown, status = 200): Response {
   return new Response(JSON.stringify(body), {
@@ -53,5 +61,43 @@ describe('stage_configs 客户端（票 22）', () => {
     expect(getHeaders['X-AgentPipeline']).toBeUndefined();
     expect(calls[0][0]).toBe('/stage-configs/review');
     expect(calls[0][1].method).toBe('PUT');
+  });
+});
+
+describe('server-info 客户端（决策 167）', () => {
+  it('getServerInfo 走同源相对路径且不带写头（纯 GET）', async () => {
+    const fetchMock = vi.fn(async () =>
+      jsonResponse({
+        host: '0.0.0.0',
+        port: 8787,
+        loopback_only: false,
+        addresses: [{ interface: 'en0', url: 'http://192.168.1.10:8787', preferred: true }],
+      }),
+    );
+    vi.stubGlobal('fetch', fetchMock);
+
+    const info = await getServerInfo();
+
+    const calls = fetchMock.mock.calls as unknown as Array<[string, RequestInit]>;
+    expect(calls[0][0]).toBe('/server-info');
+    const headers = calls[0][1].headers as Record<string, string>;
+    expect(headers[CLIENT_HEADER]).toBeUndefined();
+    expect(info.addresses[0].preferred).toBe(true);
+    expect(info.loopback_only).toBe(false);
+  });
+
+  it('qrSvgUrl 把地址正确转义进 query（含冒号与斜杠）', () => {
+    setApiBase(null);
+    expect(qrSvgUrl('http://192.168.1.10:8787')).toBe(
+      '/server-info/qr.svg?url=http%3A%2F%2F192.168.1.10%3A8787',
+    );
+  });
+
+  it('qrSvgUrl 跟随注入的 api base（桌面壳形态）', () => {
+    setApiBase('http://127.0.0.1:9100');
+    expect(qrSvgUrl('http://127.0.0.1:9100')).toBe(
+      'http://127.0.0.1:9100/server-info/qr.svg?url=http%3A%2F%2F127.0.0.1%3A9100',
+    );
+    setApiBase(null);
   });
 });

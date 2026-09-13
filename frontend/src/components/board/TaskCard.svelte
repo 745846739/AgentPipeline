@@ -207,7 +207,12 @@
     font-size: 11px;
     color: var(--text-3);
   }
-  .actions {
+  /* 必须压过整卡导航链接（`.card-link`，z-index 1）。上面 `.card > :not(.card-link)`
+     把卡片子元素统一归零，那条规则特异性 (0,2,0) 高于 `.actions` (0,1,0)，所以这里
+     也用 `.card > .actions` 取同等特异性、靠源码顺序取胜。主流程票 09 实测：不修则
+     卡片动作按钮被链接覆盖，点击只跳详情（Playwright 报 element intercepts pointer events），
+     即「看板卡上的动作按钮点不动」这个用户可见缺陷。 */
+  .card > .actions {
     margin-top: 8px;
     position: relative;
     z-index: 2;

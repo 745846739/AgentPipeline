@@ -105,6 +105,12 @@ pub async fn serve(options: ServeOptions) -> anyhow::Result<ServerHandle> {
     if cleared > 0 {
         tracing::info!(cleared, "已清理残留的 executor 持有者");
     }
+    // 恢复流程第二步（决策 127 补全，主流程票 08）：孤儿 running 任务归队，
+    // 否则调度器（准入只认 queued）不会接管，任务在重启后永久挂起。
+    let requeued = store.requeue_running_tasks().await?;
+    if !requeued.is_empty() {
+        tracing::info!(count = requeued.len(), tasks = ?requeued, "已将中断的 running 任务归队待调度");
+    }
 
     // 配置 fail fast（决策 47 / 103 / 134）
     let report = store.validate_startup(&settings).await?;
@@ -145,6 +151,7 @@ pub async fn serve(options: ServeOptions) -> anyhow::Result<ServerHandle> {
         .with_sse(sse)
         .with_executor(runtime.executor())
         .with_resume_hook(runtime.resume_hook.clone())
+        .with_bind_host(host.clone())
         .with_allowed_origins(extra_origins);
     let router = build_router(state);
 

@@ -30,6 +30,9 @@ pub struct AppState {
     pub executor: Option<Arc<Executor>>,
     /// 绑定端口，用于跨源防护的本机 origin 判定（决策 128）。
     pub port: u16,
+    /// 实际绑定地址（决策 167）：`/server-info` 据它判断手机能否直连
+    /// （仅回环绑定时分享页要给出「如何开启局域网访问」的指引）。
+    pub bind_host: String,
     /// 配置 / CLI 注入的额外放行 origin（决策 157），与缺省本机集合合并。
     pub extra_allowed_origins: Vec<String>,
 }
@@ -44,8 +47,16 @@ impl AppState {
             resume_hook: Arc::new(|_| {}),
             executor: None,
             port,
+            bind_host: "127.0.0.1".to_string(),
             extra_allowed_origins: Vec::new(),
         }
+    }
+
+    /// 注入实际绑定地址（决策 167）。serve 路径必须调用，否则 `/server-info`
+    /// 会把局域网绑定误报为仅回环。
+    pub fn with_bind_host(mut self, host: impl Into<String>) -> Self {
+        self.bind_host = host.into();
+        self
     }
 
     pub fn with_resume_hook(mut self, hook: ResumeHook) -> Self {

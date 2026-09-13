@@ -14,6 +14,7 @@
 //! testkit 的场景仓库搭建仍走系统 git CLI（决策 146 修订：那只是测试脚手架）。
 
 use std::path::{Path, PathBuf};
+use std::sync::{Mutex, OnceLock};
 
 use crate::{Error, Result};
 
@@ -73,9 +74,69 @@ fn open(path: &Path) -> Result<git2::Repository> {
     git2::Repository::open(path).map_err(gerr)
 }
 
+/// 建 worktree 的跨任务互斥锁（按仓库路径分桶）。
+///
+/// **为什么必须有：**libgit2 建 worktree 时对**共享的** `{repo}/.git/worktrees`
+/// 目录先 `path_exists` 再 `mkdir(GIT_MKDIR_EXCL)`（worktree.c 的 TOCTOU），两个任务
+/// 同时启动（决策 98 准入允许的常态用法）会双双看到"不存在"、各建一次，后者拿到
+/// `EEXIST`：init 阶段直接报 `failed to make directory '.../.git/worktrees': directory
+/// exists`，任务挂在 init 重试耗尽——用户看到的是任务一创建就失败。主流程票 09 的
+/// 浏览器并发用例实测挂在这里。
+///
+/// 锁粒度按 `{repo}/.git` 路径取，与 `.git/worktrees` 的共享范围一致：不同仓库互不
+/// 阻塞，同仓库串行。libgit2 侧无法加锁（无开关），故在调用侧串行化这个窗口。
+fn worktree_creation_lock(repo: &Path) -> &'static Mutex<()> {
+    static LOCKS: OnceLock<Mutex<std::collections::HashMap<PathBuf, &'static Mutex<()>>>> =
+        OnceLock::new();
+    let locks = LOCKS.get_or_init(|| Mutex::new(std::collections::HashMap::new()));
+    let mut map = locks.lock().unwrap_or_else(|e| e.into_inner());
+    map.entry(repo.to_path_buf())
+        .or_insert_with(|| Box::leak(Box::new(Mutex::new(()))))
+}
+
+/// 在[`worktree_creation_lock`]保护下执行 `f`（同步上下文；调用方在 spawn_blocking 里）。
+fn with_worktree_lock<T>(repo: &Path, f: impl FnOnce() -> Result<T>) -> Result<T> {
+    let lock = worktree_creation_lock(repo);
+    let _guard = lock.lock().unwrap_or_else(|e| e.into_inner());
+    f()
+}
+
 /// 流水线提交者身份（与原 CLI `-c user.name/email` 一致）。
 fn committer() -> Result<git2::Signature<'static>> {
     git2::Signature::now("AgentPipeline", "agentpipeline@localhost").map_err(gerr)
+}
+
+/// 合入把引用前移后，把**检出了该分支的工作区**同步到新 tip。
+///
+/// 为什么必须做：内存合入（决策 73 / 97）只写 `refs/heads/{default_branch}`，
+/// 不碰索引与工作区。若该分支在某个工作区被检出（用户的**项目主仓库**就是这种情形），
+/// 引用前移后索引/工作区仍停在旧提交 → `git status` 出现**已暂存**的改动（用户一
+/// `git commit` 就把合入回滚掉），磁盘上仍是旧代码，且决策 61 的「目标分支工作区
+/// 不干净」检查会让**下一个任务在 merge 处被误判为脏**并挂起——合入成功反而破坏了
+/// 下一次合入。
+///
+/// 实现取「硬同步」姿态：`checkout_head(force)` + 索引读回 HEAD。合入前调用方已按
+/// 决策 61 校验过工作区干净（`allow_dirty_worktree_merge = false` 为默认），因此
+/// 这里不会丢弃用户未提交的改动；force 只用于覆盖「引用已前移、索引尚未更新」这一
+/// 由本次合入自身造成的差异。
+fn sync_checked_out_worktree(repo: &git2::Repository, default_ref: &str) -> Result<()> {
+    let branch_name = default_ref
+        .strip_prefix("refs/heads/")
+        .unwrap_or(default_ref);
+    // 只有「HEAD 正指向该分支」的工作区才需要同步；否则（纯裸仓库 / 分支未被检出，
+    // 例如另一任务正在自己的 worktree 里工作）不得触碰任何工作区。
+    let head_is_default = repo
+        .head()
+        .ok()
+        .and_then(|h| h.shorthand().map(|s| s == branch_name))
+        .unwrap_or(false);
+    if !head_is_default {
+        return Ok(());
+    }
+    let mut opts = git2::build::CheckoutBuilder::new();
+    opts.force();
+    repo.checkout_head(Some(&mut opts)).map_err(gerr)?;
+    Ok(())
 }
 
 /// 解析 diff range（`a..b` / `a...b` / `..b` / `a..`，空侧为 HEAD）。
@@ -292,26 +353,34 @@ impl Git {
             if let Some(parent) = worktree.parent() {
                 std::fs::create_dir_all(parent)?;
             }
-            let branch = branch_name(&task_id);
-            let base_commit = repo
-                .revparse_single(&base)
-                .and_then(|o| o.peel_to_commit())
-                .map_err(gerr)?;
-            // 分支已存在（重试场景）→ 复用已有分支
-            if repo.find_branch(&branch, git2::BranchType::Local).is_err() {
-                repo.branch(&branch, &base_commit, false).map_err(gerr)?;
-            }
-            let branch_ref = repo
-                .find_reference(&format!("refs/heads/{branch}"))
-                .map_err(gerr)?;
-            let mut opts = git2::WorktreeAddOptions::new();
-            opts.reference(Some(&branch_ref));
-            // worktree 名与 CLI 一致：取路径末段
-            let name = worktree
-                .file_name()
-                .and_then(|n| n.to_str())
-                .ok_or_else(|| Error::Git(format!("非法 worktree 路径：{}", worktree.display())))?;
-            repo.worktree(name, &worktree, Some(&opts)).map_err(gerr)?;
+            // 建 worktree 的窗口必须按仓库串行（见 worktree_creation_lock）：
+            // libgit2 对共享的 `.git/worktrees` 先查后建，跨任务并发会撞 EEXIST。
+            with_worktree_lock(&project, || {
+                let branch = branch_name(&task_id);
+                let base_commit = repo
+                    .revparse_single(&base)
+                    .and_then(|o| o.peel_to_commit())
+                    .map_err(gerr)?;
+                // 分支已存在（重试场景）→ 复用已有分支
+                if repo.find_branch(&branch, git2::BranchType::Local).is_err() {
+                    repo.branch(&branch, &base_commit, false).map_err(gerr)?;
+                }
+                let branch_ref = repo
+                    .find_reference(&format!("refs/heads/{branch}"))
+                    .map_err(gerr)?;
+                let mut opts = git2::WorktreeAddOptions::new();
+                opts.reference(Some(&branch_ref));
+                // worktree 名与 CLI 一致：取路径末段
+                let name = worktree
+                    .file_name()
+                    .and_then(|n| n.to_str())
+                    .ok_or_else(|| {
+                        Error::Git(format!("非法 worktree 路径：{}", worktree.display()))
+                    })?
+                    .to_string();
+                repo.worktree(&name, &worktree, Some(&opts)).map_err(gerr)?;
+                Ok(())
+            })?;
             Ok(base)
         })
         .await
@@ -615,6 +684,7 @@ impl Git {
             {
                 repo.reference(&default_ref, source_id, true, "AgentPipeline merge (ff)")
                     .map_err(gerr)?;
+                sync_checked_out_worktree(&repo, &default_ref)?;
                 return Ok(MergeOutcome {
                     fast_forward: true,
                     commit: source_id.to_string(),
@@ -653,6 +723,7 @@ impl Git {
                     &[&default_commit, &source_commit],
                 )
                 .map_err(|e| Error::Git(format!("合入失败：{e}")))?;
+            sync_checked_out_worktree(&repo, &default_ref)?;
             Ok(MergeOutcome {
                 fast_forward: false,
                 commit: commit_id.to_string(),

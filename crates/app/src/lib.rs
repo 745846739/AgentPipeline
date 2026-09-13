@@ -5,9 +5,11 @@
 //!   （决策 144）；
 //! - 跨源防护中间件（决策 128）：只拦写请求；SSE 是纯 GET，不受影响；
 //! - 前端 dist 由 build.rs 内嵌并同源托管（决策 155）；dist 缺失时退化为构建提示页；
+//! - `/server-info` 暴露局域网访问地址与二维码（决策 167），供手机扫码接入；
 //! - `api_key` 读接口只回显 `***`（决策 112）。
 
 pub mod assets;
+pub mod lan;
 pub mod routes;
 pub mod runtime;
 pub mod serve;
@@ -85,6 +87,8 @@ pub fn build_router(state: AppState) -> Router {
             "/providers/{id}",
             patch(routes::providers::patch).delete(routes::providers::delete),
         )
+        // 连通性探针（决策 160）：建任务前验证密钥 / 模型 / 地址
+        .route("/providers/test", post(routes::providers::test))
         // ── 阶段级 agent 配置（决策 22 / 46 / 66）──
         .route("/stage-configs", get(routes::stage_configs::list))
         .route(
@@ -93,6 +97,9 @@ pub fn build_router(state: AppState) -> Router {
         )
         // ── 全局指标 ──
         .route("/metrics", get(routes::tasks::global_metrics))
+        // ── 服务自述与局域网分享（决策 167）：纯 GET，无状态变更 ──
+        .route("/server-info", get(routes::server_info::info))
+        .route("/server-info/qr.svg", get(routes::server_info::qr_svg))
         .layer(axum::middleware::from_fn_with_state(
             state.clone(),
             stream::cross_origin_guard,

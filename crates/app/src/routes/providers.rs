@@ -146,3 +146,72 @@ pub async fn delete(
         .map_err(map_core_error)?;
     Ok(Json(json!({ "ok": true })))
 }
+
+/// `POST /providers/test` 的请求体：允许**未保存**的表单值直接探测。
+///
+/// `id` 命中已存 provider 时作为基底——表单回显的 `api_key = "***"`（决策 112）
+/// 不覆盖真值；显式传入的新密钥则覆盖。`id` 缺失时必须有显式 `api_key`。
+#[derive(Debug, Deserialize)]
+pub struct TestProviderBody {
+    #[serde(default)]
+    pub id: Option<String>,
+    pub vendor: String,
+    pub model: String,
+    #[serde(default)]
+    pub base_url: Option<String>,
+    #[serde(default)]
+    pub api_key: Option<String>,
+}
+
+/// `POST /providers/test`：连通性探针（决策 160，主流程票 03）。
+///
+/// 响应体是 [`ConnectionTest`]，**只含结论不含密钥**——决策 112 的掩码语义
+/// 不因本端点弱化。探测成功/失败都是 200（它测的是配置，不是本端点）。
+pub async fn test(
+    State(state): State<AppState>,
+    Json(body): Json<TestProviderBody>,
+) -> ApiResult<impl IntoResponse> {
+    let stored = match &body.id {
+        Some(id) => state.store.get_provider(id).await.map_err(map_core_error)?,
+        None => None,
+    };
+    let (vendor, model, base_url, api_key) = match &stored {
+        Some(p) => (
+            body.vendor.clone(),
+            body.model.clone(),
+            body.base_url.clone().or_else(|| p.base_url.clone()),
+            match body.api_key.as_deref() {
+                None | Some("***") => p.api_key.clone(),
+                Some(k) => Some(k.to_string()),
+            },
+        ),
+        None => {
+            let api_key = body.api_key.clone().filter(|k| k != "***");
+            if api_key.is_none() {
+                return Err(ApiError::bad_request(
+                    "缺少 api_key：未命中已存 provider 时必须显式提供（或传 id 沿用已存密钥）",
+                ));
+            }
+            (
+                body.vendor.clone(),
+                body.model.clone(),
+                body.base_url.clone(),
+                api_key,
+            )
+        }
+    };
+    let provider = Provider {
+        id: body.id.unwrap_or_else(|| "test".into()),
+        vendor,
+        model,
+        // 探针不消费 context_window，给个占位即可
+        context_window: stored.as_ref().map_or(8000, |p| p.context_window),
+        base_url,
+        api_key,
+        enabled: true,
+        created_at: state.store.now(),
+        updated_at: state.store.now(),
+    };
+    let result = agentpipeline_core::agent::providers::test_provider_connection(&provider).await;
+    Ok(Json(json!({ "test": result })))
+}

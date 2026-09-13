@@ -128,7 +128,7 @@ impl Store {
     /// 并插入 test-design 行。partial unique 保证幂等。
     pub async fn split_cursors(&self, task_id: &str) -> Result<Vec<NodeCursor>> {
         let now = self.now();
-        let mut tx = self.pool().begin().await?;
+        let mut tx = self.begin_write().await?;
 
         // 幂等：已分裂则直接返回两条分支游标
         let existing: Vec<CursorRow> = sqlx::query_as(&format!(
@@ -203,7 +203,7 @@ impl Store {
         stale_stages: &[Stage],
     ) -> Result<NodeCursor> {
         let now = self.now();
-        let mut tx = self.pool().begin().await?;
+        let mut tx = self.begin_write().await?;
         sqlx::query(
             "UPDATE kanban_node_cursors SET status = 'archived', updated_at = ?
              WHERE task_id = ? AND status != 'archived'",

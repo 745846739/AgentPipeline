@@ -78,6 +78,10 @@
   {#if reason.context?.kind}
     <div class="ctx mono dim">kind = {reason.context.kind}</div>
   {/if}
+  {#if reason.context?.diagnostic}
+    <!-- 主流程票 03：原始诊断与 message 分离渲染——可操作提示为主，原始串供排查 -->
+    <div class="ctx mono dim">诊断：{reason.context.diagnostic}</div>
+  {/if}
 {/snippet}
 
 {#if dock}

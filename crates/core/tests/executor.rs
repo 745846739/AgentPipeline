@@ -320,6 +320,50 @@ async fn executor_drives_full_happy_path_to_done() {
         .any(|t| t.trigger == TransitionTrigger::UserResume));
 }
 
+// ─────────────────────────── merge「返回修改」的投影同步（主流程票 06）───────────────────────────
+
+#[tokio::test]
+async fn merge_return_updates_task_projection_immediately() {
+    // 决策 119 的 return 打回 develop.execute。回归点：apply_merge_decision 落库后
+    // 任务投影必须立刻翻转——否则 /tasks/{id}（与看板）在执行器下次写库前一直显示
+    // 旧的「等待审批合入」，用户对着陈旧状态再次提交决策（浏览器 e2e 实测二次合入 404）。
+    let ctx = setup("true", Settings::default()).await;
+    let task_id = "t-merge-return";
+    let mut script = Script::new();
+    design_scripts(&mut script);
+    implementation_scripts(&mut script, task_id);
+    ctx.agent.set_script(script);
+    testkit::seed_task(&ctx.store, task_id, "p1").await.unwrap();
+    admit(&ctx, task_id).await;
+
+    ctx.executor.run(task_id).await.unwrap();
+    let task = ctx.store.get_task(task_id).await.unwrap();
+    assert_eq!(task.status, TaskStatus::Pending);
+    assert_eq!(task.current_stage, Stage::Merge);
+
+    ctx.store
+        .apply_merge_decision(task_id, MergeDecision::Return)
+        .await
+        .unwrap();
+
+    // 投影立刻翻转（不再等执行器）：游标在 develop.execute，pending 已清
+    let task = ctx.store.get_task(task_id).await.unwrap();
+    assert_eq!(task.current_stage, Stage::Develop, "投影应显示打回后的落点");
+    assert_eq!(task.current_node, Node::Execute);
+    assert_eq!(
+        task.status,
+        TaskStatus::Running,
+        "pending 已清，任务回到执行态"
+    );
+
+    // 动作面一致：merge_approval 的动作集不再可用
+    let actions = ctx.store.allowed_actions_for_task(task_id).await.unwrap();
+    assert!(
+        !actions.iter().any(|a| a.action == "approve"),
+        "返回修改后不应再呈现合入动作"
+    );
+}
+
 // ─────────────────────────── 分支 pending 隔离（决策 89 / 82）───────────────────────────
 
 #[tokio::test]

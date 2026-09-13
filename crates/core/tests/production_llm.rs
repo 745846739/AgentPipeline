@@ -392,8 +392,15 @@ async fn http_error_surfaces_status_and_body_preview() {
 
     let client = ProductionLlm::new(store.clone(), Arc::new(SseRecorder::new()));
     let err = client.complete(request(run_id, vec![])).await.unwrap_err();
-    assert!(err.to_string().contains("401"), "{err}");
-    assert!(err.to_string().contains("invalid api key"), "{err}");
+    // 主流程票 03：401 归因为鉴权失败。message 只留中文可操作提示；
+    // 原始状态与返回体**保留**在 `llm_classified().raw`（经 executor 进
+    // pending.context.diagnostic，前端 dossier 渲染）——可诊断性不倒退，只是换了位置。
+    let (kind, raw) = err.llm_classified().expect("401 应可归因");
+    assert_eq!(kind, "llm_auth");
+    assert!(raw.contains("401"), "{raw}");
+    assert!(raw.contains("invalid api key"), "{raw}");
+    let msg = err.to_string();
+    assert!(msg.contains("api_key"), "message 应含可操作提示：{msg}");
     mock.shutdown().await;
 }
 

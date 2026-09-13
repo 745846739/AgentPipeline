@@ -50,6 +50,10 @@
       {#if board.error}
         <div class="banner error">加载失败：{board.error}</div>
       {/if}
+      {#if board.actionError}
+        <!-- 动作提交失败必须可见（主流程票 03）：吞掉它 = 用户点「重试」毫无反应的死面板 -->
+        <div class="banner error">动作提交失败：{board.actionError}</div>
+      {/if}
       {#if board.connectionState === 'error'}
         <div class="banner">实时流已断开，正在重连…（看板仍每 10s 对齐一次）</div>
       {/if}

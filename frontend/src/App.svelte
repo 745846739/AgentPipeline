@@ -7,6 +7,7 @@
   import Metrics from './routes/Metrics.svelte';
   import SettingsProjects from './routes/SettingsProjects.svelte';
   import SettingsProviders from './routes/SettingsProviders.svelte';
+  import Share from './routes/Share.svelte';
   import TaskDetail from './routes/TaskDetail.svelte';
   import { router } from './router.svelte';
   import { board } from './stores/board.svelte';
@@ -38,6 +39,8 @@
   <SettingsProviders />
 {:else if route.name === 'metrics'}
   <Metrics />
+{:else if route.name === 'share'}
+  <Share />
 {:else}
   <div class="notfound">页面不存在：{notFoundPath}</div>
 {/if}

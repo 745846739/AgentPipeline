@@ -1,4 +1,4 @@
-//! 桌面壳入口（决策 153 / 156）：Tauri 只当外壳与窗口管理，传输层零改动。
+//! 桌面壳入口（决策 153 / 156 / 167）：Tauri 只当外壳与窗口管理，传输层零改动。
 //!
 //! 壳只做三件事：
 //! 1. 起服——复用 `app::serve(ServeOptions::default())`（决策 153⑤ / 157），
@@ -9,15 +9,31 @@
 //!    axum 优雅退出；启动恢复（决策 127）由 `serve()` 内部照跑。
 //!
 //! 单实例锁（决策 153 非传输件）：tauri-plugin-single-instance，二次启动聚焦既有窗口。
+//!
+//! **局域网访问（决策 167）**：默认仍只绑回环（缺省姿态不变，决策 128/157）。
+//! 设 `AGENTPIPELINE_LAN=1` 时改绑 `0.0.0.0`，窗口仍走回环访问（`0.0.0.0` 包含
+//! 回环，故本机体验不变），手机经「手机访问」页扫码接入。
 
 use app::serve::ServeOptions;
 use tauri::Manager;
 
+/// 局域网模式的开关环境变量（决策 167）。
+const LAN_ENV: &str = "AGENTPIPELINE_LAN";
+
 fn main() {
+    // 局域网模式：显式 opt-in，默认关（服务能触发真实 LLM 调用，不默认对外）。
+    let lan = matches!(
+        std::env::var(LAN_ENV).ok().as_deref(),
+        Some("1") | Some("true")
+    );
+    let host = if lan { "0.0.0.0".to_string() } else { "127.0.0.1".to_string() };
+
     // 起服在 Tauri run loop 之前：端口就绪后窗口才有地址可去。
     // serve 失败直接退出——桌面壳没有比后端更早成功的道理。
+    // 窗口地址恒为本机回环：绑 0.0.0.0 时回环仍是同一服务的入口。
     let handle = tauri::async_runtime::block_on(app::serve::serve(ServeOptions {
         port_override: Some(0),
+        host_override: Some(host),
         ..ServeOptions::default()
     }))
     .expect("AgentPipeline 服务启动失败");

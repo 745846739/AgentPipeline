@@ -69,6 +69,12 @@
         class:on={router.route.name === 'settings-providers'}
         onclick={() => router.navigate('/settings/providers')}>模型与密钥</a
       >
+      <a
+        href="#/share"
+        class="navlink"
+        class:on={router.route.name === 'share'}
+        onclick={() => router.navigate('/share')}>手机访问</a
+      >
     </nav>
 
     {#if board.projects.length > 0}

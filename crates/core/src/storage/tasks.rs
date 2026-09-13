@@ -118,7 +118,7 @@ impl Store {
         } else {
             TaskStatus::Waiting
         };
-        let mut tx = self.pool().begin().await?;
+        let mut tx = self.begin_write().await?;
 
         sqlx::query(
             "INSERT INTO kanban_tasks
@@ -459,6 +459,27 @@ impl Store {
         .await?
         .rows_affected();
         Ok(affected as usize)
+    }
+
+    /// 启动恢复（决策 127 补全，主流程票 08）：把中断留下的孤儿 `running` 任务归队
+    /// `queued`。调度器准入只认 `queued`（`try_admit`），光清 `executor_owner`
+    /// 不归队的话任务会在重启后永久挂起。单机单进程（决策 127 同一前提），
+    /// 启动瞬间不存在合法持有者，running 必为 kill -9 / 停机残留。
+    /// 返回归队任务 id，供日志与测试断言。
+    pub async fn requeue_running_tasks(&self) -> Result<Vec<String>> {
+        let ids: Vec<String> = sqlx::query_scalar(
+            "SELECT id FROM kanban_tasks WHERE status = 'running' AND archived_at IS NULL",
+        )
+        .fetch_all(self.pool())
+        .await?;
+        if ids.is_empty() {
+            return Ok(ids);
+        }
+        sqlx::query("UPDATE kanban_tasks SET status = 'queued', updated_at = ? WHERE status = 'running' AND archived_at IS NULL")
+            .bind(ts(self.now()))
+            .execute(self.pool())
+            .await?;
+        Ok(ids)
     }
 
     /// 标记 / 取消 stalled（决策 34）。

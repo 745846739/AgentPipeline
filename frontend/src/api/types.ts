@@ -66,6 +66,8 @@ export interface PendingContext {
   conflict_task_ids?: string[];
   /** 闸门失败详情（决策 85）。 */
   gate_failure_output?: string;
+  /** 原始诊断（主流程票 03）：provider 配置类失败时的原始错误串，供排查。 */
+  diagnostic?: string;
   /** 其余自由字段平铺。 */
   [key: string]: unknown;
 }
@@ -429,6 +431,25 @@ export interface ProviderCreatePayload {
   enabled?: boolean;
 }
 
+/** `POST /providers/test` 请求体（决策 160）。`api_key` 缺省/掩码 = 后端按 id 沿用已存密钥。 */
+export interface ProviderTestPayload {
+  id?: string;
+  vendor: string;
+  model: string;
+  base_url?: string;
+  api_key?: string;
+}
+
+/** `POST /providers/test` 结果：**不含 api_key**（决策 112 掩码语义不因探针弱化）。 */
+export interface ConnectionTestResult {
+  ok: boolean;
+  latency_ms: number;
+  /** 失败时的可归因类别（llm_auth / …）；未知情形缺省。 */
+  kind?: string;
+  message: string;
+  raw?: string;
+}
+
 /**
  * `PATCH /providers/{id}` 请求体（PatchProvider）。
  * 未提供的字段保持原值；`api_key` 传 `***` 后端也视为不修改（本前端更严格：直接省略）。
@@ -558,4 +579,26 @@ export interface StageConfigPutPayload {
   idle_timeout_sec?: number;
   max_duration_sec?: number;
   node_overrides_json?: unknown;
+}
+
+/* ─────────────── server-info（crates/app/src/routes/server_info.rs，决策 167）─────────────── */
+
+/** `GET /server-info` 的单个候选地址。 */
+export interface ServerAddress {
+  /** 网卡名（诊断用，如 `en0` / `utun3`）。 */
+  interface: string;
+  /** 手机可直接访问的完整 URL（含端口）。 */
+  url: string;
+  /** 是否被判定为大概率可连（分享页把首选放大显示）。 */
+  preferred: boolean;
+}
+
+/** `GET /server-info`：局域网分享所需的服务自述。 */
+export interface ServerInfo {
+  /** 实际绑定地址（`0.0.0.0` 表示全网卡）。 */
+  host: string;
+  port: number;
+  /** 仅绑定回环时为 true——手机连不上，分享页需给出开启指引。 */
+  loopback_only: boolean;
+  addresses: ServerAddress[];
 }

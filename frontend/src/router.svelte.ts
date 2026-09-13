@@ -3,7 +3,7 @@
  *
  * `/`          看板
  * `/task/:id`  任务详情
- * `/settings/projects` · `/settings/providers` · `/metrics`（票 22）
+ * `/settings/projects` · `/settings/providers` · `/metrics` · `/share`（票 22 / 决策 167）
  */
 
 export type Route =
@@ -12,6 +12,7 @@ export type Route =
   | { name: 'settings-projects' }
   | { name: 'settings-providers' }
   | { name: 'metrics' }
+  | { name: 'share' }
   | { name: 'not-found'; path: string };
 
 export function parseRoute(hash: string): Route {
@@ -22,6 +23,7 @@ export function parseRoute(hash: string): Route {
   if (path === '/settings/projects') return { name: 'settings-projects' };
   if (path === '/settings/providers') return { name: 'settings-providers' };
   if (path === '/metrics') return { name: 'metrics' };
+  if (path === '/share') return { name: 'share' };
   return { name: 'not-found', path };
 }
 

@@ -99,6 +99,22 @@ impl Store {
         &self.pool
     }
 
+    /// 开启一个**写事务**（`BEGIN IMMEDIATE`）。
+    ///
+    /// 为什么不直接用 `pool.begin()`：那是 deferred 事务——若事务内**先读后写**，
+    /// 而两次操作之间另一个连接提交了写，SQLite 返回 `SQLITE_BUSY_SNAPSHOT`（code 517）。
+    /// 它**不是锁等待**，`busy_timeout` 对同一个快照重试多少次都不会成功，事务直接失败。
+    /// 单任务串行时读-写之间没有竞争者，所以从未暴露；但同项目并发跑多个任务
+    /// （决策 98 准入允许）是常态用法，主流程票 09 的浏览器用例③ 实测挂在这里：
+    /// 并发执行器的多步事务里报「database is locked」→ 节点被重试耗尽。
+    ///
+    /// `BEGIN IMMEDIATE` 在建事务时就取写锁，把冲突变成**普通锁等待**（由
+    /// `busy_timeout` 兜住），从根上消掉快照升级失败这一类。代价是事务并行度下降，
+    /// 与本应用「单机单进程 + SQLite」的定位一致（决策 13 / 127）。
+    pub(crate) async fn begin_write(&self) -> Result<sqlx::Transaction<'static, sqlx::Sqlite>> {
+        Ok(self.pool().begin_with("BEGIN IMMEDIATE").await?)
+    }
+
     pub fn home(&self) -> &Home {
         &self.home
     }

@@ -672,6 +672,34 @@ async fn executor_claim_is_exclusive_and_startup_clears_residue() {
 }
 
 #[tokio::test]
+async fn startup_recovery_requeues_orphaned_running_tasks() {
+    // 决策 127 补全（主流程票 08）：kill -9 只清 executor_owner 不够——
+    // 调度器准入只认 queued，孤儿 running 不归队就会在重启后永久挂起。
+    let (_home, store, _task) = with_task().await;
+    store.try_claim_executor("t1", "owner-a").await.unwrap();
+    store
+        .set_task_status("t1", TaskStatus::Running)
+        .await
+        .unwrap();
+
+    let requeued = store.requeue_running_tasks().await.unwrap();
+    assert_eq!(requeued, vec!["t1".to_string()]);
+    let task = store.get_task("t1").await.unwrap();
+    assert_eq!(task.status, TaskStatus::Queued);
+
+    // 非 running 任务不受影响；重复归队是空操作
+    store
+        .set_task_status("t1", TaskStatus::Pending)
+        .await
+        .unwrap();
+    assert!(store.requeue_running_tasks().await.unwrap().is_empty());
+    assert_eq!(
+        store.get_task("t1").await.unwrap().status,
+        TaskStatus::Pending
+    );
+}
+
+#[tokio::test]
 async fn double_connection_admission_serializes() {
     // 决策 36 / §12.10：双连接竞争同一个名额
     let (home, store) = setup().await;
@@ -855,4 +883,44 @@ async fn cancel_only_pends_not_yet_started_dependents() {
         queued_cursor.pending_reason.as_ref().unwrap().kind,
         PendingKind::DependencyFailed
     );
+}
+
+// ─────────── 并发写的快照冲突（主流程票 09 暴露的真实缺陷）───────────
+
+/// 两个任务在同一项目并发推进（决策 98 准入允许的常态用法）时，存储层的多步
+/// 读-写事务必须能共存。
+///
+/// 回归的是 `SQLITE_BUSY_SNAPSHOT`（code 517）：`pool.begin()` 发的是 deferred
+/// `BEGIN`，事务内**先读后写**且中途其他连接提交，SQLite 会拒绝这次快照升级——
+/// 它不是锁等待，`busy_timeout` 重试同一个快照永远失败，事务直接报
+/// 「database is locked」。修复：写事务统一走 `begin_write()`（`BEGIN IMMEDIATE`），
+/// 建事务即取写锁，冲突退化为普通锁等待。
+///
+/// 单任务串行时读-写之间没有竞争者，因此此前从未暴露；票 09 的浏览器用例让两个
+/// 任务同时跑，节点因此被重试耗尽（用户可见：任务无故挂 retry_exhausted）。
+#[tokio::test]
+async fn concurrent_writers_do_not_fail_with_busy_snapshot() {
+    let (home, store) = setup().await;
+    let repo = home.scratch_dir("proj");
+    seed_project(&store, "p1", "示例", &repo, "main")
+        .await
+        .unwrap();
+    for id in ["t-a", "t-b"] {
+        seed_task(&store, id, "p1").await.unwrap();
+    }
+
+    // 反复并发跑「读游标 → 写游标」的多步事务；修复前必有一侧报 517。
+    for _ in 0..25 {
+        let (a, b) = tokio::join!(store.split_cursors("t-a"), store.split_cursors("t-b"));
+        a.expect("t-a 的分裂事务不应因并发写失败");
+        b.expect("t-b 的分裂事务不应因并发写失败");
+        // 复原成「未分裂」以便下一轮重跑同一路径（幂等分支会提前返回，测不到冲突）；
+        // replace_cursors_with_main 自身在单事务内归档全部活跃行并插入新 main。
+        for id in ["t-a", "t-b"] {
+            store
+                .replace_cursors_with_main(id, Stage::Init, Node::Execute, NodeCursor::BRANCH_MAIN)
+                .await
+                .unwrap();
+        }
+    }
 }

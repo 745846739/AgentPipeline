@@ -209,11 +209,17 @@ impl Executor {
                         }
                     }
                     Err(node_error) => {
-                        // 单游标失败不传播（决策 89）
-                        self.pend_cursor(
+                        // 单游标失败不传播（决策 89）。
+                        // 可归因的 LLM 配置类失败（主流程票 03）：message 用中文可操作提示，
+                        // 原始诊断进 pending.context.diagnostic（不拼进 message）。
+                        let context = node_error
+                            .llm_classified()
+                            .map(|(_kind, raw)| PendingContext::with_diagnostic(raw));
+                        self.pend_cursor_with_context(
                             &cursor,
                             PendingKind::RetryExhausted,
                             node_error.to_string(),
+                            context,
                         )
                         .await?;
                     }
@@ -842,6 +848,10 @@ impl Executor {
         let project = self.project(&task.project_id).await?;
 
         let mut last_error = String::new();
+        // 可归因的 LLM 配置类失败（主流程票 03）：跨 attempt 保留最近一次的
+        // (类别, 原始诊断)，耗尽后随重试耗尽错误一起带给 pending——否则它会被
+        // 下面那层 `Error::Validation` 包装吞掉，用户只剩一段没有任何指引的文本。
+        let mut last_classified: Option<(String, String)> = None;
         for _ in 0..self.settings.agent_retry_max {
             let attempt = self
                 .next_attempt(&task.id, cursor.stage, cursor.node)
@@ -890,6 +900,9 @@ impl Executor {
                     return Ok(output);
                 }
                 Err(e) => {
+                    last_classified = e
+                        .llm_classified()
+                        .map(|(k, r)| (k.to_string(), r.to_string()));
                     last_error = e.to_string();
                     self.finish_run(
                         run_id,
@@ -906,10 +919,22 @@ impl Executor {
                 }
             }
         }
-        Err(Error::Validation(format!(
-            "agent 节点 {}.{} 重试耗尽：{last_error}",
-            cursor.stage, cursor.node
-        )))
+        // 分类信息穿透重试耗尽包装（主流程票 03）：message 保持「哪个节点 + 可操作提示」，
+        // 原始诊断仍由 run_inner 写进 pending.context.diagnostic。
+        match last_classified {
+            Some((kind, raw)) => Err(Error::LlmClassified {
+                kind,
+                message: format!(
+                    "agent 节点 {}.{} 重试耗尽：{last_error}",
+                    cursor.stage, cursor.node
+                ),
+                raw,
+            }),
+            None => Err(Error::Validation(format!(
+                "agent 节点 {}.{} 重试耗尽：{last_error}",
+                cursor.stage, cursor.node
+            ))),
+        }
     }
 
     /// 组装 §10.3 / G12 模板变量。上游产出取已登记的 stage output 路径；

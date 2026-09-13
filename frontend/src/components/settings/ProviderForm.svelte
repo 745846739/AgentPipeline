@@ -1,9 +1,11 @@
 <script lang="ts">
   import { untrack } from 'svelte';
-  import type { Provider } from '../../api/types';
+  import type { ConnectionTestResult, Provider } from '../../api/types';
+  import { testProvider } from '../../api/client';
   import {
     API_KEY_MASK,
     SUPPORTED_ADAPTERS,
+    buildProviderTest,
     draftFromProvider,
     emptyProviderDraft,
     isSupportedAdapter,
@@ -36,6 +38,25 @@
 
   let localError = $state<string | null>(null);
   const shownError = $derived(error ?? localError);
+
+  // 「测试连接」（决策 160）：建任务前验证密钥 / 模型 / 地址，不必保存草稿
+  let testing = $state(false);
+  let testResult = $state<ConnectionTestResult | null>(null);
+  let testError = $state<string | null>(null);
+
+  async function runTest() {
+    localError = null;
+    testResult = null;
+    testError = null;
+    testing = true;
+    try {
+      testResult = await testProvider(buildProviderTest(draft, provider?.id ?? null));
+    } catch (err) {
+      testError = (err as Error).message;
+    } finally {
+      testing = false;
+    }
+  }
 
   function submit(e: SubmitEvent) {
     e.preventDefault();
@@ -101,7 +122,26 @@
 
   {#if shownError}<div class="error">{shownError}</div>{/if}
 
+  {#if testError}<div class="error">测试连接失败：{testError}</div>{/if}
+  {#if testResult}
+    <div class="test-result" class:ok={testResult.ok} class:fail={!testResult.ok}>
+      <b>{testResult.ok ? '✓' : '✗'} {testResult.message}</b>
+      <span class="mono dim">（{testResult.latency_ms}ms）</span>
+      {#if testResult.raw}
+        <div class="mono dim">诊断：{testResult.raw}</div>
+      {/if}
+    </div>
+  {/if}
   <div class="actions">
+    <button
+      type="button"
+      class="btn quiet"
+      disabled={testing || submitting || !supported || !draft.model.trim()}
+      onclick={runTest}
+    >
+      {#if testing}<span class="spin"></span>{/if}
+      测试连接
+    </button>
     <button type="button" class="btn quiet" disabled={submitting} onclick={oncancel}>取消</button>
     <button type="submit" class="btn solid" disabled={submitting}>
       {#if submitting}<span class="spin"></span>{/if}
@@ -161,6 +201,24 @@
     color: var(--stop);
     font-size: 12px;
     margin-top: 8px;
+  }
+  .test-result {
+    margin-top: 8px;
+    padding: 7px 10px;
+    font-size: 11.5px;
+    line-height: 1.5;
+    border: 1px solid var(--pending);
+  }
+  .test-result.ok {
+    border-color: var(--go);
+  }
+  .test-result.fail {
+    border-color: var(--stop);
+  }
+  .test-result .dim {
+    color: var(--text-4);
+    font-size: 10.5px;
+    word-break: break-all;
   }
   .actions {
     display: flex;

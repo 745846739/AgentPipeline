@@ -6,6 +6,7 @@
 
 use serde::{Deserialize, Serialize};
 
+use crate::pipeline::landing::entry_node;
 use crate::types::{PendingKind, PendingReason, Stage};
 
 /// 动作分层（决策 69）。
@@ -229,7 +230,10 @@ pub fn allowed_actions(reason: &PendingReason, cursor_id: Option<&str>) -> Vec<A
             ]
         }
         (PendingKind::RetryExhausted, _) => vec![
-            AllowedAction::goto("重试执行", reason.stage, Node::Execute),
+            // 落点必须是阶段入口节点（决策 69 / 159），否则 resume 端点 400、按钮点不动：
+            // merge / develop / test 的入口恰好是 Execute，设计类阶段是 ValidateInput——
+            // 此前硬编码 Execute，设计类阶段的「重试执行」在端点上必然被拒（决策 159）。
+            AllowedAction::goto("重试执行", reason.stage, entry_node(reason.stage)),
             AllowedAction::resume("skip", "强制进入下一阶段"),
             AllowedAction::side_effect("cancel", "终止任务"),
         ],
@@ -390,6 +394,36 @@ mod tests {
     fn retry_exhausted_default_has_skip_and_cancel() {
         let r = reason(PendingKind::RetryExhausted, Stage::ArchitectDesign, None);
         assert_eq!(actions_of(&r), vec!["goto", "skip", "cancel"]);
+    }
+
+    #[test]
+    fn retry_exhausted_goto_lands_on_stage_entry_for_every_stage() {
+        // 决策 69：goto 落点必须是入口节点，否则 resume 端点 400、按钮点不动。
+        // 回归（主流程票 03）：设计类阶段入口是 ValidateInput，此前硬编码 Execute
+        // 导致 architect-design 的「重试执行」在端点上必然被拒。
+        for stage in [
+            Stage::Init,
+            Stage::ArchitectDesign,
+            Stage::DevelopDesign,
+            Stage::TestDesign,
+            Stage::Develop,
+            Stage::Review,
+            Stage::Test,
+            Stage::Merge,
+        ] {
+            let r = reason(PendingKind::RetryExhausted, stage, None);
+            let goto = allowed_actions(&r, None)
+                .into_iter()
+                .find(|a| a.action == "goto")
+                .unwrap_or_else(|| panic!("{stage}: retry_exhausted 缺 goto"));
+            let target = goto.target.as_ref().unwrap();
+            assert_eq!(target.stage, stage, "{stage}: 重试应落回本阶段");
+            assert_eq!(
+                target.node,
+                entry_node(stage),
+                "{stage}: goto 落点必须是本阶段入口节点（决策 69）"
+            );
+        }
     }
 
     #[test]

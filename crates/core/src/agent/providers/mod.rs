@@ -37,6 +37,93 @@ pub const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(1);
 /// 错误信息里携带的响应体上限。
 const ERROR_BODY_PREVIEW: usize = 500;
 
+/// provider 配置类失败的**可归因类别**（主流程票 03）。
+///
+/// 用户配错模型或密钥是真实使用中最高频的失败；此前它只表现为原始错误串
+/// （英文 HTTP 状态 + 供应商返回体片段）配上通用文案「重试耗尽，需要用户介入」，
+/// 用户既不知道哪一步失败、也不知道该改什么。分类后由 `pending.message` 给中文
+/// 可操作指引，原始错误串作为诊断信息保留在 `pending.context.diagnostic`（不丢）。
+///
+/// **未知情形一律 `None`**：宁可退回原始错误串，也不把未识别的错误误标成已知类别
+/// （误标会给出**错误**的修复指引，比不给指引更糟）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LlmErrorKind {
+    /// 鉴权失败（401 / 403）——密钥错误、过期、或项目无权限。
+    Auth,
+    /// 模型不存在 / 无该模型权限（404，或错误体指明 model）。
+    ModelNotFound,
+    /// 连不上（DNS / 连接被拒 / TLS / 超时）——base_url 写错或网络不通。
+    Network,
+    /// 超出上下文窗口（400 + 长度/上下文相关错误体）。
+    ContextWindow,
+}
+
+impl LlmErrorKind {
+    /// 面向用户的中文可操作提示（写进 `pending.message`）。
+    pub fn advice(self) -> &'static str {
+        match self {
+            LlmErrorKind::Auth => {
+                "provider 鉴权失败：请到「设置 · 模型与密钥」检查 api_key 是否正确、是否过期"
+            }
+            LlmErrorKind::ModelNotFound => {
+                "provider 模型不可用：请到「设置 · 模型与密钥」确认 model 名称与账号权限"
+            }
+            LlmErrorKind::Network => "连不上 provider：请检查 base_url 是否正确、网络是否可达",
+            LlmErrorKind::ContextWindow => {
+                "请求超出模型上下文窗口：请换用更大上下文窗口的模型，或调大 context_window 配置"
+            }
+        }
+    }
+
+    /// 稳定标识（写入 `pending.context.kind` 与诊断，便于断言与检索）。
+    pub fn as_str(self) -> &'static str {
+        match self {
+            LlmErrorKind::Auth => "llm_auth",
+            LlmErrorKind::ModelNotFound => "llm_model_not_found",
+            LlmErrorKind::Network => "llm_network",
+            LlmErrorKind::ContextWindow => "llm_context_window",
+        }
+    }
+
+    /// 按 HTTP 状态与错误体判定类别；未识别返回 `None`。
+    pub fn from_http(status: u16, body: &str) -> Option<Self> {
+        let lower = body.to_ascii_lowercase();
+        let has = |needles: &[&str]| needles.iter().any(|n| lower.contains(n));
+        match status {
+            401 | 403 => Some(LlmErrorKind::Auth),
+            404 => Some(LlmErrorKind::ModelNotFound),
+            // 400 区域：模型名错误与超长是两种不同的用户动作，按错误体区分
+            400 => {
+                if has(&[
+                    "model_not_found",
+                    "does not exist",
+                    "unknown model",
+                    "no such model",
+                ]) || (lower.contains("model") && has(&["not found", "invalid"]))
+                {
+                    Some(LlmErrorKind::ModelNotFound)
+                } else if has(&[
+                    "context_length",
+                    "context window",
+                    "too long",
+                    "maximum context",
+                    "max_tokens",
+                    "token limit",
+                ]) {
+                    Some(LlmErrorKind::ContextWindow)
+                } else {
+                    None
+                }
+            }
+            429 => None, // 限流：可重试，不属配置错误
+            _ => None,
+        }
+    }
+}
+
+/// 把「HTTP 请求失败」的错误归类为网络类：连接 / DNS / TLS / 超时。
+const NETWORK_KIND: LlmErrorKind = LlmErrorKind::Network;
+
 /// vendor 是否走 OpenAI 兼容协议（deepseek 与 openai 同族）。
 pub fn is_openai_compatible(vendor: &str) -> bool {
     matches!(vendor, "openai" | "deepseek")
@@ -177,17 +264,24 @@ impl ProductionLlm {
         let url = format!("{}{}", base_url(provider), adapter.endpoint_path());
         let body = adapter.build_body(provider, request)?;
         let builder = adapter.apply_auth(self.http.post(&url).json(&body), provider);
-        let response = builder
-            .send()
-            .await
-            .map_err(|e| Error::Llm(format!("HTTP 请求失败：{e}")))?;
+        let response = builder.send().await.map_err(|e| Error::LlmClassified {
+            kind: NETWORK_KIND.as_str().to_string(),
+            message: NETWORK_KIND.advice().to_string(),
+            raw: format!("HTTP 请求失败：{e}"),
+        })?;
         let status = response.status();
         if !status.is_success() {
             let text = response.text().await.unwrap_or_default();
-            return Err(Error::Llm(format!(
-                "HTTP {status}：{}",
-                preview(&text, ERROR_BODY_PREVIEW)
-            )));
+            let raw = format!("HTTP {status}：{}", preview(&text, ERROR_BODY_PREVIEW));
+            return Err(match LlmErrorKind::from_http(status.as_u16(), &text) {
+                Some(kind) => Error::LlmClassified {
+                    kind: kind.as_str().to_string(),
+                    message: kind.advice().to_string(),
+                    raw,
+                },
+                // 未识别：保留原始串（宁可给不出指引，不给出错误指引）
+                None => Error::Llm(raw),
+            });
         }
 
         let mut stream = response.bytes_stream();
@@ -340,6 +434,144 @@ pub(crate) fn adapter_family(vendor: &str) -> Result<&'static dyn Adapter> {
     }
 }
 
+/// 「测试连接」探针结果（主流程票 03）。
+///
+/// **不含 api_key**——决策 112 的掩码语义不因本探针弱化；`raw` 是供应商错误体
+/// 预览，本就不含密钥。
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct ConnectionTest {
+    pub ok: bool,
+    pub latency_ms: u64,
+    /// 失败时的可归因类别（`llm_auth` / `llm_model_not_found` / …）；未知情形 None。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub kind: Option<String>,
+    /// 中文可读结论（成功 / 分类提示 / 配置本身的问题）。
+    pub message: String,
+    /// 原始诊断（失败时保留，供排查）。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub raw: Option<String>,
+}
+
+/// provider「测试连接」探针（决策 160）：对给定配置发一次最小真实流式请求
+/// （`max_tokens = 1`），按 [`LlmErrorKind`] 归类失败，让用户在建任务前就能
+/// 发现密钥 / 模型 / 地址配错。探针自带 15s 总超时，配置页不被挂死。
+pub async fn test_provider_connection(provider: &Provider) -> ConnectionTest {
+    let started = Instant::now();
+    let latency = |started: Instant| started.elapsed().as_millis() as u64;
+    let adapter = match adapter_family(&provider.vendor) {
+        Ok(a) => a,
+        Err(e) => {
+            return ConnectionTest {
+                ok: false,
+                latency_ms: 0,
+                kind: None,
+                message: e.to_string(),
+                raw: None,
+            }
+        }
+    };
+    let http = match Client::builder()
+        .connect_timeout(Duration::from_secs(5))
+        .timeout(Duration::from_secs(15))
+        .build()
+    {
+        Ok(c) => c,
+        Err(e) => {
+            return ConnectionTest {
+                ok: false,
+                latency_ms: 0,
+                kind: None,
+                message: format!("HTTP 客户端构建失败：{e}"),
+                raw: None,
+            }
+        }
+    };
+    let request = LlmRequest {
+        stage: crate::types::Stage::Init,
+        node: crate::types::Node::Execute,
+        attempt: 0,
+        system_prompt: String::new(),
+        user_prompt: "ping".into(),
+        messages: vec![],
+        tools: vec![],
+        temperature: None,
+        max_tokens: Some(1),
+        provider_id: None,
+        run: None,
+    };
+    let body = match adapter.build_body(provider, &request) {
+        Ok(b) => b,
+        Err(e) => {
+            return ConnectionTest {
+                ok: false,
+                latency_ms: latency(started),
+                kind: None,
+                message: e.to_string(),
+                raw: None,
+            }
+        }
+    };
+    let url = format!("{}{}", base_url(provider), adapter.endpoint_path());
+    let builder = adapter.apply_auth(http.post(&url).json(&body), provider);
+    let response = match builder.send().await {
+        Ok(r) => r,
+        Err(e) => {
+            return ConnectionTest {
+                ok: false,
+                latency_ms: latency(started),
+                kind: Some(NETWORK_KIND.as_str().to_string()),
+                message: NETWORK_KIND.advice().to_string(),
+                raw: Some(format!("HTTP 请求失败：{e}")),
+            }
+        }
+    };
+    let status = response.status();
+    if !status.is_success() {
+        let text = response.text().await.unwrap_or_default();
+        let raw = format!("HTTP {status}：{}", preview(&text, ERROR_BODY_PREVIEW));
+        let (kind, message) = match LlmErrorKind::from_http(status.as_u16(), &text) {
+            Some(k) => (Some(k.as_str().to_string()), k.advice().to_string()),
+            None => (None, format!("连接失败：HTTP {status}")),
+        };
+        return ConnectionTest {
+            ok: false,
+            latency_ms: latency(started),
+            kind,
+            message,
+            raw: Some(raw),
+        };
+    }
+    // 成功：把（max_tokens=1 的）响应体读完再下结论，半途断流也算失败。
+    let bytes = match response.bytes().await {
+        Ok(b) => b,
+        Err(e) => {
+            return ConnectionTest {
+                ok: false,
+                latency_ms: latency(started),
+                kind: Some(NETWORK_KIND.as_str().to_string()),
+                message: NETWORK_KIND.advice().to_string(),
+                raw: Some(format!("读取响应失败：{e}")),
+            }
+        }
+    };
+    if bytes.is_empty() {
+        return ConnectionTest {
+            ok: false,
+            latency_ms: latency(started),
+            kind: None,
+            message: "连接成功但响应为空，请核对 base_url 是否指向模型服务".into(),
+            raw: None,
+        };
+    }
+    ConnectionTest {
+        ok: true,
+        latency_ms: latency(started),
+        kind: None,
+        message: "连接成功".into(),
+        raw: None,
+    }
+}
+
 /// 流式工具调用的聚合槽。
 #[derive(Default)]
 struct ToolAccum {
@@ -462,5 +694,62 @@ mod tests {
             );
         }
         assert!(adapter_family("mystery-llm").is_err());
+    }
+
+    #[test]
+    fn llm_error_classification_covers_the_configurable_failures() {
+        // 主流程票 03：用户能配错的每一类都要有归因与可操作提示
+        use LlmErrorKind as K;
+
+        // 鉴权：401 / 403，与错误体无关
+        assert_eq!(K::from_http(401, "{}"), Some(K::Auth));
+        assert_eq!(K::from_http(403, "permission denied"), Some(K::Auth));
+        // 模型不存在：404，或 400 体里指明 model
+        assert_eq!(K::from_http(404, "Not Found"), Some(K::ModelNotFound));
+        assert_eq!(
+            K::from_http(400, r#"{"error":{"code":"model_not_found"}}"#),
+            Some(K::ModelNotFound)
+        );
+        // 超长：400 + 上下文相关错误体
+        assert_eq!(
+            K::from_http(400, "This model's maximum context length is 8192 tokens"),
+            Some(K::ContextWindow)
+        );
+        // 未知情形必须退回原始串——不给错误指引比不给指引更糟
+        assert_eq!(K::from_http(400, "weird vendor body"), None);
+        assert_eq!(
+            K::from_http(429, "rate limited"),
+            None,
+            "限流可重试，不属配置错误"
+        );
+        assert_eq!(K::from_http(500, "internal"), None);
+
+        // 每个已知类别都有中文提示，且提示里不泄漏原始返回体
+        for kind in [K::Auth, K::ModelNotFound, K::Network, K::ContextWindow] {
+            let advice = kind.advice();
+            assert!(!advice.is_empty(), "{kind:?} 缺少可操作提示");
+            assert!(advice.contains('：'), "提示应含指引冒号：{advice}");
+        }
+        // 稳定标识：进 pending.context.diagnostic 之外的 kind 字段，供断言与检索
+        assert_eq!(K::Auth.as_str(), "llm_auth");
+        assert_eq!(K::Network.as_str(), "llm_network");
+    }
+
+    #[test]
+    fn classified_error_keeps_raw_diagnostic_separate_from_message() {
+        // 主流程票 03：原始串进 context.diagnostic，message 只留中文可操作提示
+        let err = Error::LlmClassified {
+            kind: "llm_auth".into(),
+            message: "provider 鉴权失败：请到「设置 · 模型与密钥」检查 api_key".into(),
+            raw: "HTTP 401：{\"error\":{\"message\":\"Incorrect API key\"}}".into(),
+        };
+        assert_eq!(
+            err.to_string(),
+            "provider 鉴权失败：请到「设置 · 模型与密钥」检查 api_key",
+            "Display = 用户看到的 message，不含原始串"
+        );
+        let (kind, raw) = err.llm_classified().expect("应可取回分类与原始诊断");
+        assert_eq!(kind, "llm_auth");
+        assert!(raw.contains("Incorrect API key"), "raw 应保留原始返回体");
     }
 }

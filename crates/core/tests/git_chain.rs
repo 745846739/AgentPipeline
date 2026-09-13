@@ -255,6 +255,45 @@ async fn merge_detects_dirty_target_worktree() {
     assert!(Git.is_dirty(ctx.repo.path()).await.unwrap());
 }
 
+#[tokio::test]
+async fn merge_leaves_default_branch_worktree_consistent() {
+    // 回归：合入把 `refs/heads/main` 前移后，**被检出的主工作区必须同步**。
+    //
+    // 缺陷形态（2026-09-13 由主流程 e2e 暴露）：内存合并只移动引用，索引与工作区
+    // 停在旧提交 → `git status` 出现**已暂存**的 M/D（用户 `git commit` 会**回滚合入**），
+    // 磁盘上仍是旧代码（`npm test` 直接失败），且下一个任务在 merge 处被决策 61 的
+    // 「工作区不干净」拦下——合入成功反而污染了下一次合入。
+    let ctx = setup();
+    init(&ctx).await;
+    std::fs::write(ctx.worktree.join("src/lib.rs"), "pub fn add() {}\n").unwrap();
+    let topic_commit = commit_worktree(&ctx.worktree, "feat: 新功能");
+
+    let outcome = Git
+        .merge_into_default_branch(ctx.repo.path(), "main", "kanban/t1")
+        .await
+        .unwrap();
+    assert!(outcome.fast_forward);
+    assert_eq!(ctx.repo.head("main"), topic_commit, "引用应前移");
+
+    // 合入后主仓库不得留下陈旧索引 / 陈旧工作区
+    assert!(
+        !ctx.repo.is_dirty(),
+        "合入后主工作区应干净，实际 status：\n{}",
+        ctx.repo.git(&["status", "--porcelain"])
+    );
+    assert_eq!(
+        ctx.repo.git(&["show", "HEAD:src/lib.rs"]),
+        "pub fn add() {}\n",
+        "HEAD 内容应为合入后的版本"
+    );
+    // 工作区文件本身也要是新内容（用户直接看磁盘时不会看到旧代码）
+    assert_eq!(
+        std::fs::read_to_string(ctx.repo.path().join("src/lib.rs")).unwrap(),
+        "pub fn add() {}\n",
+        "磁盘上的工作区文件应为合入后的内容"
+    );
+}
+
 // ─────────────────────────── 重试重置与清理（决策 125 / 3）───────────────────────────
 
 #[tokio::test]
@@ -444,4 +483,51 @@ fn run_git(cwd: &std::path::Path, args: &[&str]) -> String {
         String::from_utf8_lossy(&out.stderr)
     );
     String::from_utf8_lossy(&out.stdout).to_string()
+}
+
+// ─────────── 并发建 worktree（主流程票 09 暴露的真实缺陷）───────────
+
+/// 同项目两个任务**同时**启动（决策 98 准入允许的常态用法）必须都能建出 worktree。
+///
+/// 回归的是 libgit2 的 TOCTOU：`worktree.c` 对**共享的** `{repo}/.git/worktrees`
+/// 目录先 `path_exists` 再 `mkdir(GIT_MKDIR_EXCL)`。两个任务各起一个
+/// `init_worktree` 时双双看到"不存在"、各建一次，后者拿到 `EEXIST`——
+/// init 阶段直接报 `failed to make directory '.../.git/worktrees': directory exists`，
+/// 任务挂在 init 重试耗尽（用户可见：任务一创建就失败，且**只**在同时建两个任务时）。
+///
+/// 修复：调用侧按仓库路径串行化这个窗口（`worktree_creation_lock`）。
+#[tokio::test]
+async fn concurrent_worktree_creation_in_same_repo_does_not_race() {
+    let home = TestHome::new().unwrap();
+    let repo = Repo::clean().unwrap();
+
+    let mut handles = Vec::new();
+    for i in 0..4 {
+        let task_id = format!("t{i}");
+        let worktree = home.home().worktree_path(&task_id);
+        let repo_path = repo.path().to_path_buf();
+        handles.push(tokio::spawn(async move {
+            Git.init_worktree(&repo_path, &task_id, &worktree, "main")
+                .await
+        }));
+    }
+    for (i, handle) in handles.into_iter().enumerate() {
+        let result = handle.await.expect("spawn_blocking 不应 panic");
+        result.unwrap_or_else(|e| panic!("任务 t{i} 的 worktree 创建不应失败：{e}"));
+    }
+
+    // 四个 worktree 都真的建出来，且共享的 .git/worktrees 下登记齐全
+    for i in 0..4 {
+        assert!(
+            home.home()
+                .worktree_path(&format!("t{i}"))
+                .join("src/lib.rs")
+                .exists(),
+            "t{i} 的 worktree 应检出主干内容"
+        );
+    }
+    let listed = repo.worktree_list();
+    for i in 0..4 {
+        assert!(listed.contains(&format!("t{i}")), "worktree 列表应含 t{i}");
+    }
 }

@@ -1023,6 +1023,115 @@ async fn provider_read_api_masks_api_key_and_patch_keeps_secret() {
     assert_eq!(raw.api_key.as_deref(), Some("sk-new-key-abcdefghijkl"));
 }
 
+// ─────────────────────── provider 测试连接（决策 160）───────────────────────
+
+#[tokio::test]
+async fn provider_test_classifies_auth_failure_and_never_echoes_key() {
+    let api = api().await;
+    let mock = testkit::mock_llm::MockLlm::start(vec![testkit::mock_llm::MockRoute::json(
+        "/chat/completions",
+        401,
+        r#"{"error":{"message":"invalid api key"}}"#,
+    )])
+    .await;
+
+    let (status, body) = post(
+        &api,
+        "/providers/test",
+        serde_json::json!({
+            "id": "p-default",
+            "vendor": "deepseek",
+            "model": "deepseek-chat",
+            "base_url": mock.url,
+            "api_key": "***",
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let test = &body["test"];
+    assert_eq!(test["ok"], false);
+    assert_eq!(test["kind"], "llm_auth");
+    assert!(test["message"].as_str().unwrap().contains("鉴权失败"));
+    let raw = test["raw"].as_str().unwrap();
+    assert!(raw.contains("401"), "{raw}");
+    assert!(raw.contains("invalid api key"), "{raw}");
+    // 决策 112：掩码语义不因探针弱化——响应与原始密钥无关
+    assert!(
+        !body.to_string().contains("sk-super-secret-value-123456"),
+        "测试连接不得回传 api_key"
+    );
+    mock.shutdown().await;
+}
+
+#[tokio::test]
+async fn provider_test_success_reuses_stored_key_without_echoing() {
+    let api = api().await;
+    let mock = testkit::mock_llm::MockLlm::start(vec![testkit::mock_llm::MockRoute::sse(
+        "/chat/completions",
+        "data: {\"choices\":[{\"delta\":{\"content\":\"hi\"}}]}\n\ndata: [DONE]\n\n",
+    )])
+    .await;
+
+    // 表单回显值 "***" + id 命中 → 后端用已存密钥发探针
+    let (status, body) = post(
+        &api,
+        "/providers/test",
+        serde_json::json!({
+            "id": "p-default",
+            "vendor": "deepseek",
+            "model": "deepseek-chat",
+            "base_url": mock.url,
+            "api_key": "***",
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["test"]["ok"], true, "{}", body);
+    assert_eq!(body["test"]["message"], "连接成功");
+
+    let requests = mock.requests().await;
+    assert_eq!(requests.len(), 1);
+    let auth = requests[0].header("authorization").expect("探针应带密钥");
+    assert_eq!(auth, "Bearer sk-super-secret-value-123456");
+    assert!(
+        !body.to_string().contains("sk-super-secret-value-123456"),
+        "响应不得回显密钥"
+    );
+    mock.shutdown().await;
+}
+
+#[tokio::test]
+async fn provider_test_without_id_requires_explicit_key() {
+    let api = api().await;
+    let (status, body) = post(
+        &api,
+        "/providers/test",
+        serde_json::json!({
+            "vendor": "deepseek",
+            "model": "deepseek-chat",
+            "api_key": "***",
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert!(body["error"].as_str().unwrap().contains("api_key"));
+
+    // 未知 vendor 在适配器族白名单（决策 103）处被挡，给可读结论而非 500
+    let (status, body) = post(
+        &api,
+        "/providers/test",
+        serde_json::json!({
+            "vendor": "not-a-vendor",
+            "model": "m",
+            "api_key": "sk-x",
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["test"]["ok"], false);
+    assert!(body["test"]["message"].as_str().unwrap().contains("vendor"));
+}
+
 // ─────────────────────────── 跨源防护矩阵（决策 128）───────────────────────────
 
 #[tokio::test]
@@ -2109,4 +2218,106 @@ async fn unknown_asset_returns_404() {
     let api = api().await;
     let (status, _) = get_raw(&api, "/assets/deadbeef-not-here.js").await;
     assert_eq!(status, 404);
+}
+
+/* ─────────── 局域网分享端点（决策 167）：/server-info 与 /server-info/qr.svg ─────────── */
+
+#[tokio::test]
+async fn server_info_reports_bind_host_port_and_loopback_flag() {
+    let api = api().await;
+    let (status, body) = get(&api, "/server-info").await;
+    assert_eq!(status, 200);
+    // 契约测试的 AppState 由 AppState::new 构造，缺省 bind_host = 127.0.0.1
+    assert_eq!(body["host"], "127.0.0.1");
+    assert_eq!(body["port"], PORT);
+    assert_eq!(
+        body["loopback_only"], true,
+        "缺省绑定是回环，分享页据此提示如何开启局域网访问"
+    );
+    assert!(
+        body["addresses"].is_array(),
+        "addresses 恒为数组（枚举不到时为空表，不是 null）：{body}"
+    );
+}
+
+#[tokio::test]
+async fn server_info_reports_lan_bind_as_not_loopback_only() {
+    // 绑 0.0.0.0 时 loopback_only 必须为 false，否则分享页会一直显示「请绑 0.0.0.0」的死循环指引
+    let home = TestHome::new().unwrap();
+    let (store, _clock) = home.setup().await.unwrap();
+    let state = AppState::new(store, home.home().clone(), Settings::default(), PORT)
+        .with_bind_host("0.0.0.0");
+    let router = build_router(state);
+
+    let response = router
+        .oneshot(request("GET", "/server-info").body(Body::empty()).unwrap())
+        .await
+        .unwrap();
+    let (status, body) = json_body(response).await;
+    assert_eq!(status, 200);
+    assert_eq!(body["host"], "0.0.0.0");
+    assert_eq!(body["loopback_only"], false);
+}
+
+#[tokio::test]
+async fn qr_svg_renders_for_a_loopback_url() {
+    let api = api().await;
+    let url = format!("http://127.0.0.1:{PORT}");
+    let response = api
+        .router
+        .clone()
+        .oneshot(
+            request("GET", &format!("/server-info/qr.svg?url={url}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 200);
+    let content_type = response
+        .headers()
+        .get(header::CONTENT_TYPE)
+        .expect("应有 Content-Type")
+        .to_str()
+        .unwrap()
+        .to_owned();
+    assert_eq!(content_type, "image/svg+xml; charset=utf-8");
+    assert_eq!(
+        response
+            .headers()
+            .get(header::CACHE_CONTROL)
+            .map(|v| v.to_str().unwrap()),
+        Some("no-store"),
+        "二维码随端口变化，不得缓存"
+    );
+    let (_, bytes) = raw(response).await;
+    let svg = String::from_utf8(bytes).unwrap();
+    assert!(svg.starts_with("<?xml"), "应是 SVG：{svg:.60}");
+    assert!(svg.contains("<path"), "应含二维码模块");
+}
+
+#[tokio::test]
+async fn qr_svg_rejects_arbitrary_urls() {
+    // 只允许编码本服务自己的地址：否则这个端点成了「用你的服务生成任意二维码」的图床
+    let api = api().await;
+    let (status, body) = get(
+        &api,
+        "/server-info/qr.svg?url=http%3A%2F%2Fevil.example%2Fphish",
+    )
+    .await;
+    assert_eq!(status, 400, "外部 URL 必须被拒绝：{body}");
+}
+
+#[tokio::test]
+async fn server_info_endpoints_are_reachable_without_client_header() {
+    // 两个端点都是纯 GET：不携带 X-AgentPipeline 也必须可达（手机首次加载页面时还没有它）
+    let api = api().await;
+    let (status, _) = get(&api, "/server-info").await;
+    assert_eq!(status, 200);
+    let (status, _) = get(
+        &api,
+        &format!("/server-info/qr.svg?url=http%3A%2F%2F127.0.0.1%3A{PORT}"),
+    )
+    .await;
+    assert_eq!(status, 200);
 }

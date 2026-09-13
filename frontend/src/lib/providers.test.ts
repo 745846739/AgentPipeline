@@ -4,6 +4,7 @@ import {
   API_KEY_MASK,
   buildProviderCreate,
   buildProviderPatch,
+  buildProviderTest,
   draftFromProvider,
   emptyProviderDraft,
   isApiKeyMask,
@@ -94,5 +95,28 @@ describe('provider 表单校验', () => {
     expect(validateProviderDraft({ ...base, model: '' })).toMatch(/模型/);
     expect(validateProviderDraft({ ...base, context_window: 0 })).toMatch(/正整数/);
     expect(validateProviderDraft({ ...base, context_window: 1.5 })).toMatch(/正整数/);
+  });
+});
+
+describe('buildProviderTest（决策 160：测试连接）', () => {
+  it('编辑态掩码不回传：省略 api_key，由后端按 id 沿用已存密钥', () => {
+    const draft = { ...emptyProviderDraft(), api_key: API_KEY_MASK };
+    const payload = buildProviderTest(draft, 'p-1');
+    expect(payload.id).toBe('p-1');
+    expect(payload.api_key).toBeUndefined();
+    expect(payload.vendor).toBe('openai');
+  });
+
+  it('编辑态输入新 key 则覆盖；新增态不带 id', () => {
+    const edited = buildProviderTest({ ...emptyProviderDraft(), api_key: 'sk-new' }, 'p-1');
+    expect(edited.api_key).toBe('sk-new');
+    const fresh = buildProviderTest({ ...emptyProviderDraft(), api_key: 'sk-new' }, null);
+    expect(fresh.id).toBeUndefined();
+    expect(fresh.api_key).toBe('sk-new');
+  });
+
+  it('base_url 空串省略', () => {
+    const payload = buildProviderTest(emptyProviderDraft(), null);
+    expect(payload.base_url).toBeUndefined();
   });
 });

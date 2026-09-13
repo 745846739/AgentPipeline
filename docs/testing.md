@@ -53,7 +53,7 @@
 | ⑥ | 伪阶段脚本：conflict_check 给 duplicate_risk 等级、validator_cross_check 给合格/不合格 | 60 / 67 / 134 / 135 |
 | ⑦ | 子代理**不**脚本化 | 45（默认关闭；L4 走 `pending(context_overflow)`，开启路径实现后补） |
 
-**真 LLM 冒烟（`#[ignore]`，手动跑）：** architect-design.execute 一次真调用，断言 rig 适配 + 结构化输出解析可用。需要真 key，不进任何自动门。
+**真 LLM 冒烟（`#[ignore]`，手动跑）：两条**——① 单节点：architect-design.execute 一次真调用，断言 rig 适配 + 结构化输出解析可用；② 全流程（主流程票 04）：真 key + 真模型驱动完整主流程到 `pending(merge_approval)`，fixture 为真实可构建小工程使闸门真跑，断言每节点有 run 行、`submit_metadata` 在真模型返回格式下可解析、token > 0、无节点落 `retry_exhausted`，失败时输出定位诊断（哪个 `(stage, node)` 的什么错误）。运行：`AGENTPIPELINE_SMOKE_*` 环境变量（见 `crates/core/tests/llm_smoke.rs` 头部说明）。两条都需真 key，**不进任何自动门**（决策 142）。
 
 ### 3.3 testkit（决策 146）
 
@@ -69,6 +69,10 @@ workspace 成员 `crates/testkit`，供 L2 / L4 复用：
 ### 3.4 DB 测试策略（决策 145）
 
 默认每测试一个**临时文件库** + 全量 sqlx migrations（真实行为优先，WAL / busy_timeout 可测）；内存库仅限纯查询逻辑。并发场景（决策 36 乐观锁、§12.10 写锁串行化）显式开双连接测。
+
+> **`BEGIN IMMEDIATE` 与 `SQLITE_BUSY_SNAPSHOT`（决策 163①）：** SQLite 的 deferred `BEGIN` 在「事务内先读后写、中途其他连接提交」时返回 `SQLITE_BUSY_SNAPSHOT`（code 517）——它不是锁等待，`busy_timeout` 重试同一快照永不成功。写事务统一走 `Store::begin_write()`（`BEGIN IMMEDIATE`，建事务即取写锁）后，冲突退化为普通锁等待。任何**新增的多步读-写事务**都必须用它；钉住用例 `cursor_lifecycle.rs::concurrent_writers_do_not_fail_with_busy_snapshot`。
+>
+> **并发建 worktree 必须按仓库串行（决策 163②）：** libgit2 对共享的 `{repo}/.git/worktrees` 先 `path_exists` 再 `mkdir(GIT_MKDIR_EXCL)`，同仓库多任务同时启动会撞 `EEXIST`。`git.rs::worktree_creation_lock` 按仓库路径分桶串行化该窗口；钉住用例 `git_chain.rs::concurrent_worktree_creation_in_same_repo_does_not_race`。
 
 ## 4. 分层总览（决策 144）
 
@@ -176,16 +180,39 @@ harness = FakeAgent（§3.2）+ testkit fixture（§3.3）+ 临时 home + 手动
 |---|---|---|
 | 单元 | vitest | `reduce.ts` 归约表逐事件（design §9.1 每行：列归属 / 信号色 / 待办计数 / dossier 开合）；allowed_actions 渲染分组（resume / side_effect、`requires_input`）；NotificationPolicy（cooldown、quiet_hours、cancelled 不弹） |
 | 组件 | @testing-library/svelte | PendingActions（按所属游标取 cursor_id——决策 91）；DiffReviewPanel（无「拒绝」——决策 23）；StalledBadge（决策 34） |
-| E2E | playwright（只 Chromium） | **真 axum 后端 + FakeAgent**（临时 home），两条：① happy path（看板 → 详情 → 页签 → diff 审批合入）；② pending → dossier 面板 → resume（琥珀面板、顶栏待办计数） |
+| E2E | playwright（只 Chromium） | **真 axum 后端 + FakeAgent**（临时 home），**八条 17 例**：① happy path（看板 → 详情 → 页签 → diff 审批合入 → **校验合入到 main 的代码符合任务目标**）；② pending → dossier 面板 → resume（琥珀面板、顶栏待办计数）；③ 闸门真跑与失败分流（**真实 Node 工程**，闸门真执行 `npm test`）；④ provider 配错可理解可恢复（中文提示 + 原始诊断 + 「测试连接」）；⑤ UI 三步创建（×5）；⑥ 人工评审分支 + 合并「返回修改」（×3）；⑦ 日志/对话内容 + 刷新恢复（×2）；⑧ 并发第二任务（×3：互不阻塞 / 多游标分支归属 / 基准前移）。页面加载**编译期内嵌的真实 bundle**（主流程票 01） |
 
-**前端测试状态（2026-09-13，票 18 收尾）：** 单元层已落地并全绿（`frontend/`，85 个 vitest：`reduce.ts` 归约表逐事件、SSE 连接层主动重连、`allowed_actions` 渲染分组与 cursor_id、NotificationPolicy、provider 掩码保存规则、analyze 轮询、metrics 字段映射、stage_configs payload）。组件层以 vitest + DOM 断言覆盖 PendingActions / DiffReviewPanel / StalledBadge。**playwright 两条 E2E 已执行**（票 18）：用例在 `frontend/e2e/happy-path.spec.ts` 与 `frontend/e2e/pending-resume.spec.ts`，harness `frontend/e2e/harness.ts`（临时 home + 真 `serve --port 0` 就绪行回读 + Vite 代理），跑法 `just frontend-e2e`（或 `cd frontend && npx playwright test --project=chromium`），只 Chromium（决策 144）。
+**主流程端到端补齐（2026-09-13，`.scratch/agentpipeline-mainflow-e2e/`）：** 详见该目录 spec 与票面。**全部 13 票 done**：01 / 02 / 03 / 04 / 05 / 06 / 07 / 08 / 09 / 10 / 11 / 12 / 13（其中 04 为 `#[ignore]` 真模型冒烟、10 为闸门扩展；08 / 11 / 12 / 13 为过程中暴露并修复的真实缺陷，09 一次暴露 3 个）。
+
+- **票 01 · 浏览器走真实产物**：`webBase` = `apiBase`（后端同源托管内嵌 dist，决策 155），不再经 Vite dev server——此前两条用例**从未加载过用户实际会加载的那份产物**。新增 `watchBundle` / `settleBundle` 守卫（静态资源非 2xx、页面未捕获异常、产物类 `console.error` 在业务断言**之前**裁决）+ `assertEmbeddedBundle` 前置守卫（未内嵌产物时直接提示先 `npm run build && cargo build`，而非静默退化成假绿）；`App` 新增 `repoDir` 供用例用 `git -C <repoDir> show main:<path>` 断言合入产物。
+  - **不可用 `waitForLoadState('networkidle')`**：看板与任务详情常驻 SSE 流，连接永不空闲，必然超时；用 `load`（`type="module"` 脚本是 deferred，`load` 会等其执行完）。
+  - happy path 增加**合入产物断言**：`main` 上 `src/lib.js` 含脚本写入的实现（且初始「未实现」占位已被替换）、`tests/acceptance.js` 存在、`main` 最新提交主题为该任务提交、任务分支已删除（决策 3）。设计文档 `design.md` 是**任务产物**（落任务目录、不进主干，见 `tools.rs` 的 `task_dir` 语义），故经任务产出文件 API 读取并断言含验收标准 `AC-1`。
+- **票 02 · 闸门真跑**：fixture 从「无语言标记空仓库」改为**真实 Node 工程**（`package.json` + 零依赖 `node run-tests.js`，实测约 0.4s）——此前因无语言标记，闸门命令退化为 `true`，闸门成了空操作，而它是主流程必然经过的一环。新增 `expectGateReallyRan`（命令记录里必须有系统测试命令）与 `findFailedGateCommand`（退出码非 0 的失败证据）；新用例 `gate.spec.ts` 覆盖「失败被观测 → 修复后恢复 → 推进到 merge_approval」。
+- **两条守卫都做过反向验证**：故意打坏 `index.html` 的资源引用 → 票 01 守卫 1.1s 报 404 根因（而非 60s 超时）；故意把 fixture 退化成无语言标记 → 票 02 守卫报「闸门未真正执行测试命令」。守卫本身是被验过的，不是文档里的一句话。
+- **票 11 · 本轮暴露并修复的真实缺陷**：合入只移动 `refs/heads/{default}`、不同步被检出的工作区 → 用户主仓库留下**已暂存**的 M/D（一次 `git commit` 即回滚合入）、磁盘是旧代码、且下一个任务会被决策 61 误判为脏工作区而挂起。修复见决策 158 与 `issues/11-merge-worktree-stale.md`；缺陷由 `git_chain.rs::merge_leaves_default_branch_worktree_consistent` 钉住（修复前红）。
+- **票 03 · provider 配错可理解、可恢复**：新增 `provider-misconfig.spec.ts`（E2E-④）——坏 provider（恒 401 mock）→ 断言面板给中文可操作提示（`.msg` 不混原始英文串）、原始诊断保留在 `.ctx`（`PendingContext.diagnostic`，分类信息经 `agent_node` 的重试耗尽包装穿透，见决策 03 的 `LlmErrorKind`）→ `fixProvider()` + 重试 → 推进到 merge_approval。配套「测试连接」端点（`POST /providers/test`，决策 160：对未保存表单值发最小真实请求，成功/失败都 200，掩码语义不弱化）与 provider 表单按钮，L3 契约用例 ×3 + vitest ×3。
+- **票 12 · 本轮暴露并修复的真实缺陷**：设计类阶段（architect-design 等）的 `retry_exhausted`「重试执行」goto 落点硬编码 Execute，被 resume 端点的决策 69 入口校验必然 400，而前端把动作错误吞掉 → 用户视角死按钮（触发面是主流程第一步：provider 配错恰挂在 `architect-design.validate_input`）。修复见决策 159 与 `issues/12-retry-goto-deadend.md`；由 `actions.rs::retry_exhausted_goto_lands_on_stage_entry_for_every_stage` 钉住，TaskDetail / Board 补「动作提交失败」横幅。
+- **票 05 · UI 三步创建**：`create-flow.spec.ts`（E2E-⑤×5）——空 home 的两处空状态引导、走 UI 建 provider（列表只回显掩码 + 「测试连接」）、建项目（坏路径先得明确报错）、建任务（跳详情 + 描述真的进 prompt）、依赖任务 ID 字段解析。harness 为此增 `seedless`（不播种）与 `prompts()`（读 mock 记录的新节点运行请求）。
+- **票 06 · 人工评审分支 + 合并「返回修改」**：`review-branch.spec.ts`（E2E-⑥×3）——human 模式面板三件套、approve/reject 同端点反结论断言、打回意见进流转原因、merge「返回修改」→ 二次推进 → done。harness 增 `reviewMode` 与 `backendLogs()`。过程中暴露缺陷票 13（决策 161）。
+- **票 07 · 日志/对话内容 + 刷新恢复**：`logs-reload.spec.ts`（E2E-⑦×2）——命令内容与对话文本可断言（`text` 步骤须置 `submit` 之后，否则工具循环被纯文本提前终止）、无刷新实时推进、刷新恢复 pending 面板、`setOffline` 断网容错 + 收敛、刷新后合入到 done。
+- **票 08 · 真进程重启恢复**：`crates/app/tests/restart_recovery.rs`（Rust spawn 形态，票面降级预案；**不推翻决策 152**，补其未覆盖的进程边界）——并行分支窗口 `SIGKILL` → 同 home 重启 → 归队续跑到 done，join 恰一次、无 worktree / 分支残留。暴露孤儿 `running` 挂起缺陷（决策 162）+ mock `Submit` 后收尾文本修正。
+- **票 09 · 并发第二任务**：`concurrent.spec.ts`（E2E-⑧×3）——双任务互不阻塞 + 看板多卡归位 + 双 pending 待办计数（`*2`）/ 并行双分支分组渲染 `['[dev]','[test]']` + resume 带对 `cursor_id`（决策 91）/ 基准前移后 approval 重置、重走阶段 A 再审批（决策 96）。harness 增 `additionalTasks` 与**按任务 id 路由**（决策 165；任务标题只出现在 architect prompt，dev/review/test 段落按 id 才分得清是哪个任务）。**一次暴露 3 个串行测试不可见的缺陷**：看板卡动作按钮被整卡导航链接覆盖（决策 164，用户点按钮只跳详情）、SQLite `BUSY_SNAPSHOT`（决策 163①）、libgit2 建 worktree 的 TOCTOU（决策 163②）。
+- **票 04 · 真模型全流程冒烟**：`llm_smoke.rs::real_llm_drives_full_flow_to_merge_approval`（`#[ignore]`，不进任何自动门）——真 key + 真模型驱动完整主流程，断言 12 节点各有 run 行 / `submit_metadata` 在真模型格式下可解析 / token 计量 > 0 / 闸门 `npm test` 真跑且退出码 0 / 无 `retry_exhausted`。**实测一轮通过**：本地 OpenAI 兼容代理 + `deepseek-flash`，570s / 794k tokens / 26 runs，途中自动应答 3 次 `UserDecision`。修了冒烟装置三处缺陷：goto 候选固定取首个导致 `gate_recheck` 死循环（改为按序轮换）、失败命令只打退出码丢掉真实原因（补 stdout/stderr 尾部与阶段元数据）、设计文档断言不认绝对路径（两根兜底 + 列实际文件）。详见票面。
+- **票 10 · 纳入闸门 + 产物新鲜度守卫**：`scripts/e2e-artifacts.sh` 守卫两层陈旧（前端源码 vs `dist` → 重建 dist；随后 `cargo build -p app` 增量重编，`frontend/dist` 在 `build.rs` 的 `rerun-if-changed` 里）；`just default` 聚合 `lint + test + frontend + frontend-e2e`，Makefile 镜像 `check-*`（`just` 未必安装）。守卫经反向验证：改源码不构建 → 触发重建；注入必败断言 → `make check-e2e` 退出码 2。无 CI 已显式记录。见决策 166。
+
+**playwright 八条 E2E**：`happy-path`（①）/ `pending-resume`（②）/ `gate`（③）/ `provider-misconfig`（④）/ `create-flow`（⑤×5）/ `review-branch`（⑥×3）/ `logs-reload`（⑦×2）/ `concurrent`（⑧×3），**17 passed**，全过。
+
+**前端测试状态（2026-09-13，票 18 收尾 + 主流程补齐）：** 单元层已落地并全绿（`frontend/`，vitest，**96 passed / 13 files**：`reduce.ts` 归约表逐事件、SSE 连接层主动重连、`allowed_actions` 渲染分组与 cursor_id、NotificationPolicy、provider 掩码保存与测试连接规则、analyze 轮询、metrics 字段映射、stage_configs payload）。组件层以 vitest + DOM 断言覆盖 PendingActions / DiffReviewPanel / StalledBadge（`svelte-check` 0 error / 0 warning）。**playwright 八条 E2E 已执行 → 17 passed**：用例在 `frontend/e2e/`（`happy-path` / `pending-resume` / `gate` / `provider-misconfig` / `create-flow` / `review-branch` / `logs-reload` / `concurrent`），harness `frontend/e2e/harness.ts`（临时 home + 真 `serve --port 0` 就绪行回读 + 同源内嵌产物 + 按任务路由脚本），跑法 `just frontend-e2e`（或未装 just 时 `make check-e2e`），只 Chromium（决策 144）。
 
 > **与决策 151 的显式偏差：** 决策 151 要求「复用 E2E harness、**不维护独立 mock server**」，票 18 的实现未复用 testkit 的 FakeAgent，而是在 `frontend/e2e/harness.ts` 里写了一个 Node 侧的 OpenAI 兼容 SSE mock（按 persona 反查 `(stage, node)`、按轮投喂）。**理由**：playwright 进程（Node）无法直接调用 Rust 的 `testkit::MockLlm`，复用需要一个额外的 Rust helper 二进制并纳入 playwright 的构建前置；v1 以「少一个构建步骤、harness 自包含」优先。**代价**：存在第二份 mock 实现，可能与 Rust 侧契约漂移——它仍必须发出真实适配器能解析的 OpenAI SSE，故「SSE 事件格式 ↔ 前端归约」这条契约仍被覆盖，但**契约漂移风险由本注记显式承担**（后续若把 testkit 的 mock 抽成 helper 二进制，应删掉 Node mock）。决策 151 的其余要求（真 axum 后端、`AGENTPIPELINE_HOME` 指临时目录、两条冒烟）均满足。
 
 ## 10. 质量闸门与 traceability（决策 147）
 
-**justfile：** `just lint`（`fmt --check` + `clippy -D warnings`，提交前必过）、`just test`（`cargo test --workspace`，即 L1 单元 + L2 集成 + L3 API + L4 场景 + 冒烟，**只覆盖 Rust**；另有 `just unit` / `integration` / `api` / `e2e` / `smoke` 分层子集与 `just fmt`）、`just frontend-e2e`（前端 playwright 双冒烟）。
-**前端测试不在 just 配方内**：单元层 vitest 与 `svelte-check` / `build` 直接在 `frontend/` 下跑（`npm test` = `vitest run`、`npm run check`、`npm run build`）——`just test` 不会跑它们。
+**justfile：** `just lint`（`fmt --check` + `clippy -D warnings`）、`just test`（`cargo test --workspace`，即 L1 单元 + L2 集成 + L3 API + L4 场景 + 冒烟，**只覆盖 Rust**；另有 `just unit` / `integration` / `api` / `e2e` / `smoke` 分层子集与 `just fmt`）。
+
+**提交前必过 = `just default`（决策 166，扩展 147）：** `lint` + `test` + `frontend` + `frontend-e2e` 四项聚合（`just frontend` = vitest / svelte-check / vite build，直接在 `frontend/` 下跑 `npm test` / `npm run check` / `npm run build`；`frontend-e2e` = playwright，前置 **产物新鲜度守卫** `scripts/e2e-artifacts.sh`）。守卫解决两层陈旧：前端源码比 `frontend/dist` 新则重建 dist；随后 `cargo build -p app` 增量重编（`frontend/dist` 的每个文件都在 `crates/app/build.rs` 的 `rerun-if-changed` 里，故 dist 一变必然重编内嵌资产表）。未装 `just` 时用 Makefile 镜像入口 `make check` / `check-e2e`（语义对齐，以 justfile 为准）。
+
+**本项目无 CI**（无 `.github/workflows/`，无 git remote）：闸门靠本地执行，这是当前形态而非遗漏。
 
 **逐分支覆盖（不做全局数字门）：** `route_merge` 每个 `EdgeKind`、游标状态机每次合法迁移（active / waiting_join / pending / archived 之间）各有用例。
 

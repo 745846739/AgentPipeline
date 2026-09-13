@@ -36,6 +36,21 @@ pub enum Error {
     #[error("LLM 调用失败：{0}")]
     Llm(String),
 
+    /// 可归因的 LLM 配置类失败（主流程票 03）：`message` 是中文可操作提示，
+    /// `raw` 保留原始诊断（进 `pending.context.diagnostic`，不进 message）。
+    ///
+    /// 与 `Llm` 的区别：`Llm` 是「发生了什么」；`LlmClassified` 还回答了
+    /// 「该去改什么」。未识别的错误一律仍走 `Llm`——宁可退回原始串，不误标类别。
+    #[error("{message}")]
+    LlmClassified {
+        /// 稳定标识（`llm_auth` / `llm_model_not_found` / `llm_network` / `llm_context_window`）。
+        kind: String,
+        /// 中文可操作提示（写入 `pending.message`）。
+        message: String,
+        /// 原始错误串（HTTP 状态 + 供应商返回体预览），供排查。
+        raw: String,
+    },
+
     #[error("IO 错误：{0}")]
     Io(#[from] std::io::Error),
 
@@ -50,6 +65,14 @@ impl Error {
     /// API 层是否需要把这个错误映射为 409。
     pub fn is_conflict(&self) -> bool {
         matches!(self, Error::Conflict(_))
+    }
+
+    /// 若为可归因的 LLM 配置类失败，返回 `(类别标识, 原始诊断)`（主流程票 03）。
+    pub fn llm_classified(&self) -> Option<(&str, &str)> {
+        match self {
+            Error::LlmClassified { kind, raw, .. } => Some((kind, raw)),
+            _ => None,
+        }
     }
 }
 

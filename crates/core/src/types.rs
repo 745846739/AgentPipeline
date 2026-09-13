@@ -341,6 +341,10 @@ pub struct PendingContext {
     /// 闸门失败详情，传给 test.execute 复检（决策 85）。
     #[serde(skip_serializing_if = "Option::is_none")]
     pub gate_failure_output: Option<String>,
+    /// 原始诊断（主流程票 03）：provider 配置类失败时保留原始错误串。
+    /// 与 `message` 分离——message 是中文可操作提示，raw 供排查，不拼进 message。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub diagnostic: Option<String>,
     /// 其余自由字段，序列化时平铺进 context。
     #[serde(flatten, default, skip_serializing_if = "serde_json::Map::is_empty")]
     pub extra: serde_json::Map<String, serde_json::Value>,
@@ -350,6 +354,14 @@ impl PendingContext {
     pub fn with_kind(kind: &str) -> Self {
         PendingContext {
             kind: Some(kind.to_string()),
+            ..Default::default()
+        }
+    }
+
+    /// 带原始诊断（主流程票 03）：不设置 `kind`，避免影响 `allowed_actions` 的路由键。
+    pub fn with_diagnostic(raw: impl Into<String>) -> Self {
+        PendingContext {
+            diagnostic: Some(raw.into()),
             ..Default::default()
         }
     }
