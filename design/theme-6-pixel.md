@@ -1,9 +1,12 @@
 # 主题六 · 像素机房「夜班流水线」
 
-> 状态：**提案**（2026-09-13 新增，待选型；现行视觉为主题三「终端 · 调度电报」）。
+> 状态：**现行视觉规格**（2026-09-13 由提案升格，决策 169；主题三「终端 · 调度电报」退役，
+> 见 [deprecated/](deprecated/README.md)）。本文是前端视觉的**唯一权威**——实现与本规格不一致
+> 时以本文为准，改视觉先改本文。
 > 交互与信息架构一律沿用 [frontend-design.md](frontend-design.md)（路由、五页签、待办 dossier、
 > `allowed_actions` 纯渲染（决策 69/101）、异步按钮、卡片禁拖）；本文只定义该交互骨架上的
-> 第六套视觉语言。页面元素与 [prototype-terminal.html](prototype-terminal.html) 同一套
+> 第六套视觉语言。页面元素与原 `prototype-terminal.html`（现
+> [deprecated/prototype-terminal.html](deprecated/prototype-terminal.html)）同一套
 > （8 列看板、详情三视图、顶栏过滤、demo 切换器；sync-check 全站不展示，决策 107），
 > 并补齐 `frontend-design.md` §4 余下四个路由（项目 / 模型与密钥 / 全局指标 / 手机访问），
 > 像素版实现见 [prototype-pixel.html](prototype-pixel.html)（桌面 7 视图）与
@@ -190,6 +193,26 @@ node scripts/derive-light.mjs design/prototype-pixel-mobile.html design/prototyp
 | 首过率缺数据 | 不画 0 冒充真实值：整条改用一句话说明（`frontend-design.md` §7） |
 | 手机访问 | `qrbox`：二维码恒白底（扫描器依赖明暗对比，浅色主题也不例外），旁边 `picked` 地址块 + 复制钮；多网卡地址上下排成 `alt-item`，末位 `tag`「推荐」；仅回环绑定时不画二维码，改用 `gate` 指引块（`--host 0.0.0.0` / `AGENTPIPELINE_LAN=1`，决策 167） |
 | 原型 QR | 后端渲染真 QR（决策 167），原型只画一枚固定种子（20260913）的 21×21 像素示意：三角定位符 + 伪随机码点，**前端不引 QR 库** |
+
+### 3.2 实现映射（原型 class ↔ 前端组件）
+
+组件与原型同构：**原型是验收参照**（截图对照），下面是逐项对应关系。实现与原型有意偏离
+之处必须在本表登记（末票核对）。
+
+| 原型视图 / 区块 | 前端组件 | 备注 |
+|---|---|---|
+| 顶栏 `topbar` / `slots` / `slot` / `pnav` | `components/layout/TopBar.svelte` | 道具栏槽位 + 页面导航行；待办计数入口交互不变（决策 92） |
+| 底栏 `statusbar` / `tokmeter` | `components/layout/StatusLine.svelte` | 车间看板条；主题切换钮并入此行 |
+| 列 `col` / `col-head` / `stn` / `worker` | `components/board/BoardColumn.svelte` | 工位 sprite + 挥锤小人 + 计数 |
+| 货箱 `card` / `card-top` / `bossbar` / `segs` | `components/board/TaskCard.svelte` | dither 顶盖带 + 16 段量表 + 20 段 boss 条 |
+| 轨道 / 传送带 `belt` / `track` / `stn` | `components/pipeline/PipelineRail.svelte` | 三变奏共用同一套链节与信号灯原语 |
+| 分支徽章 `tag` / `dev` / `tst` | `components/pipeline/BranchPill.svelte` | 分支身份 = 色相（蓝 / 紫）+ 文字双编码（决策 84 标注） |
+| 急停对话框 `dialog` / `dface` / `dtag` / `dtxt` / `actions` | `components/task/PendingDossier.svelte` + `components/board/PendingActions.svelte` | 双线框 + 琥珀名牌 tab + ▼ 光标 + 工头头像 |
+| 完成反馈（奖杯横幅） | 新增 `components/layout/CompletionBanner.svelte` | 奖杯 sprite + diff 摘要 + 「收下」；无入场动画 |
+| 台账页 `crumb` / `p-title` / `reg` / `reg-row` / `checklist` | `routes/SettingsProjects.svelte` / `SettingsProviders.svelte` / `Share.svelte` + `components/settings/*` | 见 §3.1 |
+| 指标 `chart` / `plot` / `cols` / `mdot` | `routes/Metrics.svelte` + `components/settings/TrackSegmentBars.svelte` | 9 站点列，灯与条同色 |
+| 详情 hero / 页签 `detail` / `d-head` / `tabs` / `tab` | `routes/TaskDetail.svelte` + `components/pipeline/PipelineRail.svelte`（hero 变奏） | 五页签 = 工位标签盒 |
+| sprite 表 `sp[data-s]` | 主题契约模块的 sprite 表 + `components/render/Sprite.svelte` | 15 枚；只允许来自受控表，新增回本文修订 |
 
 ## 4. 选型注意
 

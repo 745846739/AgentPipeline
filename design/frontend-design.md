@@ -3,9 +3,11 @@
 > 本文扩展 §12.11 前端交互设计，落地为可实现的前端规格。遵循既有决策：16（Svelte + TS + Vite）、
 > 79（v1 只发看板）、76（单 SSE 通道）、153（传输层 Tauri 防御约束）、84（并行分支消歧）、49/69/101（allowed_actions 纯渲染）、
 > 92（列归属与焦点游标）、34（stalled / archived 表示）、65（v1 只做应用内通知）。
-> 交互骨架与页面元素以本文为准（§4–§7）；**视觉方向以主题三「终端 · 调度电报」为准**
-> （[theme-3-terminal.md](theme-3-terminal.md)、[prototype-terminal.html](prototype-terminal.html)）。
-> 本文 §3 的「夜间调度台」视觉语言已随 [deprecated/prototype.html](deprecated/prototype.html) 归档。
+> 交互骨架与页面元素以本文为准（§4–§7）；**视觉方向以主题六「像素机房 · 夜班流水线」为准**
+> （[theme-6-pixel.md](theme-6-pixel.md)、[prototype-pixel.html](prototype-pixel.html)，决策 169）。
+> 主题三「终端 · 调度电报」已退役（[deprecated/](deprecated/README.md)），其终端专属 token
+> 已从 `app.css` 删除。本文 §3 的「夜间调度台」视觉语言已随
+> [deprecated/prototype.html](deprecated/prototype.html) 归档。
 
 ---
 
@@ -45,7 +47,17 @@
 
 ## 3. 视觉语言（Design Tokens）
 
-### 3.1 色彩
+> **视觉方向以主题六「像素机房 · 夜班流水线」为准**（决策 169）：本节的具体 token、字体、
+> 形状与动效以 [theme-6-pixel.md](theme-6-pixel.md) §2 为唯一权威——
+> 深色「夜班靛」/ 浅色「掌机背光」两套，缝合像素 12px 单一字族，圆角恒 0、描边 2px 一档、
+> 硬投影 `4px 4px 0`、字阶只取 12 / 24 / 36、dither 是全站唯一「渐变」、
+> 动画只有四处且一律帧步进（`steps()`）。实现侧的事实源是 `frontend/src/theme/` 的主题契约模块，
+> 与 `app.css` 互为镜像（由解析测试锁死一致性）。
+>
+> 下文 §3.1–§3.4 是**主题一「夜间调度台」的历史记录**（已归档，
+> 见 [deprecated/prototype.html](deprecated/prototype.html)），保留仅为沿革参考，不再权威。
+
+### 3.1 色彩（历史：夜间调度台）
 
 | Token | 值 | 语义 |
 |---|---|---|
