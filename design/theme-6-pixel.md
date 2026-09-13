@@ -5,7 +5,10 @@
 > `allowed_actions` 纯渲染（决策 69/101）、异步按钮、卡片禁拖）；本文只定义该交互骨架上的
 > 第六套视觉语言。页面元素与 [prototype-terminal.html](prototype-terminal.html) 同一套
 > （8 列看板、详情三视图、顶栏过滤、demo 切换器；sync-check 全站不展示，决策 107），
-> 像素版实现见 [prototype-pixel.html](prototype-pixel.html)。
+> 并补齐 `frontend-design.md` §4 余下四个路由（项目 / 模型与密钥 / 全局指标 / 手机访问），
+> 像素版实现见 [prototype-pixel.html](prototype-pixel.html)（桌面 7 视图）与
+> [prototype-pixel-mobile.html](prototype-pixel-mobile.html)（移动 8 视图）。
+> 四个台账页的组件映射见 §3.1。
 
 ## 1. 设计概念
 
@@ -91,6 +94,9 @@ queued / waiting 无灯灰字。层级只靠硬投影与描边亮度，不引入
 - 像素图元：8×8 工位图标（SVG `shape-rendering: crispEdges`，`currentColor` 随列头状态）
   + 16×16 工头头像（琥珀安全帽 + 绿背心，只出现在 dossier 对话框）+ 8×8 挥锤小人双帧
   （抬起 / 落锤+火花）。图元只允许来自本文的 sprite 表，新增图标需回到本文修订。
+  **sprite 表**（`prototype-pixel.html` 的 `SPRITES`）：`flag` / `gem` / `hammer` / `flask`
+  / `gear` / `lens` / `shield` / `merge` / `trophy` / `chest` / `alert` + 台账页三枚
+  `chart`（指标）/ `key`（模型与密钥）/ `phone`（手机访问）+ `foreman`（16×16 工头头像）。
 - **列头小人**：每个工位一名，动画速度与颜色随状态——执行中绿锤 0.6s 快挥、
   急停琥珀锤 1.8s 慢挥、空闲 / 排队灰锤静止站立（帧切换为离散 opacity 翻转）。
 - token 量表：16 段像素 HP 条（每段 5×10px，间隙 2px），满格 ≈ 64k tok，颜色随状态灯
@@ -138,6 +144,20 @@ queued / waiting 无灯灰字。层级只靠硬投影与描边亮度，不引入
 2. **工头头像肤色固定**：脸块不用 `--text-hi`（浅色下变墨块），固定 `#E3C7A6`，
    眼睛保持 `--ink`。
 
+**生成方式（不再手抄）。** 浅色款是深色款的纯 token 变换：头部三行（color-scheme /
+标题 / 注释）+ 色彩 token 块 + 上面两处偏差，别无差异。四份文件由
+[scripts/derive-light.mjs](../scripts/derive-light.mjs) 从深色款生成，避免手抄漂移
+（仓库根执行）：
+
+```bash
+node scripts/derive-light.mjs design/prototype-pixel.html        design/prototype-pixel-light.html        desktop
+node scripts/derive-light.mjs design/prototype-pixel-mobile.html design/prototype-pixel-mobile-light.html mobile
+```
+
+脚本对每处替换都要求命中，否则报错退出（宁可失败也不产出半成品）。**正确性依据**：
+用 git 里的旧深色款跑同一脚本，逐字节还原出既有浅色款——变换清单是完备的。
+截图由 `.scratch/shots/capture-pixel.mjs` 重新生成（30 张：桌面 7 视图 × 深浅 + 移动 8 视图 × 深浅）。
+
 ## 3. 组件映射
 
 | 组件（frontend-design.md） | 像素机房实现 |
@@ -153,6 +173,23 @@ queued / waiting 无灯灰字。层级只靠硬投影与描边亮度，不引入
 | Tab | 工位标签盒：active = wash 实底 + 描边上浮；禁用 = dither 底 |
 | 底部状态行 | 车间看板条：2px 顶描边；token 总量用量表；分隔符 `▪`（不用中点） |
 | 完成反馈 | 顶部居中**任务完成横幅**：奖杯 sprite + 「任务完成」+ diff 摘要 + 「收下」按钮 |
+| 设置 / 指标页 | **车间台账**：与看板同一套 `--pane` 描边盒（2px）+ 硬投影；表格行 = 台账行（`reg-row`），行首名称亮纸白、副值灰、末列动作钮。详见 §3.1 |
+
+### 3.1 台账页（设置 · 项目 / 模型与密钥 / 全局指标 / 手机访问）
+
+四个页面共享同一套组件，只换内容（`frontend-design.md` §4 的四个路由）：
+
+| 组件 | 像素机房实现 |
+|---|---|
+| 页头 | `crumb`（← 看板）+ 24px `p-title` + 右侧动作钮；导入语用 `hintline`（弱灰，内嵌 `<b>` 提亮） |
+| 台账表 | `reg` 2px 描边盒 + `reg-head`（列头条，`▪` 分隔计数）+ `reg-row`（`--wash` 行分隔，hover 换 `--panel`）；行内一/二行 meta 用 `reg-l1`/`reg-l2` |
+| 行内降级 | 决策 103 的"不受支持 vendor"整行 `--t4` 灰显 + `! 不受支持 · 决策 103` 琥珀标；恢复中的删除确认用 `reg-sub`「确认删除？」 |
+| 伪阶段行 | 决策 84：左缘 4px `--t3` 亮度阶 + 名称后缀「（伪阶段）」，不用分支色相 |
+| 核对清单 | `checklist` 描边盒，两列网格（移动款单列）；缺项 `mk` 用 `—` + `--t4`，值写「未探测到」而不是假装通过 |
+| 指标条形图 | `chart` 盒 + `plot`（绝对定位 `rail-line` 链节）+ `cols`（站点列：标签 / 12px 灯 / 10px `track` 横条 / 数值）；`mdot` 灯与 `fill` 条同色（go / caution / stop / done / dev / test）。移动款 9 站放不进 430px：`plot` 横向滚动，站点不缩不折 |
+| 首过率缺数据 | 不画 0 冒充真实值：整条改用一句话说明（`frontend-design.md` §7） |
+| 手机访问 | `qrbox`：二维码恒白底（扫描器依赖明暗对比，浅色主题也不例外），旁边 `picked` 地址块 + 复制钮；多网卡地址上下排成 `alt-item`，末位 `tag`「推荐」；仅回环绑定时不画二维码，改用 `gate` 指引块（`--host 0.0.0.0` / `AGENTPIPELINE_LAN=1`，决策 167） |
+| 原型 QR | 后端渲染真 QR（决策 167），原型只画一枚固定种子（20260913）的 21×21 像素示意：三角定位符 + 伪随机码点，**前端不引 QR 库** |
 
 ## 4. 选型注意
 
@@ -175,12 +212,13 @@ queued / waiting 无灯灰字。层级只靠硬投影与描边亮度，不引入
 
 | 视图 | 结构 |
 |---|---|
-| 0 传送带（看板） | 顶栏铭牌行 + 信号灯缩略条（点灯跳段）→ 道具栏过滤行（横向滚动）→ 8 段纵向站点带（链节脊线 + 站头：sprite + 小人 + 计数 + 货箱）→ 任务完成横幅 → 底部载波行 |
+| 0 传送带（看板） | 顶栏铭牌行 + 信号灯缩略条（点灯跳段）→ 页面导航行（指标 / 项目 / 模型与密钥 / 手机访问）→ 道具栏过滤行（横向滚动）→ 8 段纵向站点带（链节脊线 + 站头：sprite + 小人 + 计数 + 货箱）→ 任务完成横幅 → 底部载波行 |
 | 1 待处理 | 按等待时长收拢的收件箱（最久在最上）；此页无脊线，琥珀左缘保留在货箱上 |
 | 2 详情 · 执行中 | 纵向轨道 hero（当前站带挥锤小人）→ 分段页签 → 内容；命令表两行制 |
 | 3 详情 · 待审批 | 纵向轨道 hero → 工头对话框 → Diff 页签 → **常驻底部动作坞**（对话框式，琥珀顶框 + ▼） |
+| 4 项目 / 5 模型与密钥 / 6 指标 / 7 手机访问 | 台账页同桌面款（§3.1）：页头行（← 看板 + 标题）→ 页面导航行 → 单据盒。差异只有三处：台账行由横向左右栏折成纵向（动作钮另起一行均分）；指标 9 站条形图 `plot` 横向滚动、站点不缩不折；手机访问的二维码与地址纵向堆叠、地址项改 44px 触控行。默认 `#v-board` 无高亮，台账页以 `.pnav.on` 标出当前位置 |
 
-四条移动专属转写：
+五条移动专属转写：
 
 1. **传送带竖转。** 站点脊线 = 6px 纵向链节（`repeating-linear-gradient(180deg …)`），
    三态与桌面链节同色：未点亮 pane、已通过 belt-lit、急停琥珀半透明；
@@ -191,4 +229,7 @@ queued / waiting 无灯灰字。层级只靠硬投影与描边亮度，不引入
    恢复动作下沉为固定底部动作坞；异步按钮点击即禁用、回执后坞内收尾。
 4. **小人随站。** 挥锤小人挂在站头（桌面的列头位置），节奏与颜色规则不变；
    详情页只在当前站出现小人。
+5. **页面导航进顶栏。** 桌面款把四个台账页签铺成顶栏下的第二行；移动款折成 `.pagenav`
+   横向滚动行，**与顶栏同 sticky**（顶栏因此长到 138px）。连带两处定值：站点带
+   `scroll-margin-top` 96 → 148px、任务完成横幅 `top` 104 → 148px，否则横幅会压在顶栏下。
 

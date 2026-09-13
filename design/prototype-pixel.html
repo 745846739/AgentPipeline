@@ -36,9 +36,15 @@ b,strong{font-weight:400;color:var(--t-hi)}
 .dither{background-image:conic-gradient(var(--wash) 25%,transparent 0 50%,var(--wash) 0 75%,transparent 0);
   background-size:4px 4px}
 
-/* ───────── 顶栏：车间铭牌排 ───────── */
-.topbar{position:sticky;top:0;z-index:20;display:flex;align-items:center;gap:14px;
-  height:46px;padding:0 16px;background:var(--bg);border-bottom:2px solid var(--pane)}
+/* ───────── 顶栏：车间铭牌排 + 页面铭牌排 ───────── */
+.top{position:sticky;top:0;z-index:20;background:var(--bg);border-bottom:2px solid var(--pane)}
+.topbar{display:flex;align-items:center;gap:14px;height:46px;padding:0 16px}
+/* 页面铭牌排：与真实顶栏 .appnav 同构（指标 / 项目 / 模型与密钥 / 手机访问） */
+.navbar{display:flex;align-items:center;gap:6px;padding:0 16px 6px;
+  overflow-x:auto;scrollbar-width:none}
+.navbar::-webkit-scrollbar{display:none}
+.navbar .chip{flex:none;display:inline-flex;align-items:center}
+.navbar .chip .sp{margin-right:5px;vertical-align:-3px}
 .logo{flex:none;width:12px;height:12px;background:var(--go);border:2px solid var(--ink);
   box-shadow:7px 5px 0 0 var(--pending);margin-right:9px}
 .wordmark{font-size:24px;color:var(--t-hi);letter-spacing:.08em;line-height:1;
@@ -133,7 +139,7 @@ b,strong{font-weight:400;color:var(--t-hi)}
 .bossbar .segs i{flex:1;height:10px;background:var(--wash)}
 .bossbar .segs i.f{background:var(--go)}
 /* 任务完成横幅（奖杯） */
-.qtoast{position:fixed;top:58px;left:50%;transform:translateX(-50%);z-index:35;
+.qtoast{position:fixed;top:86px;left:50%;transform:translateX(-50%);z-index:35;
   display:flex;align-items:center;gap:12px;padding:10px 14px;
   background:var(--panel);border:2px solid var(--go);box-shadow:4px 4px 0 var(--ink)}
 .qtoast .sp{color:var(--go)}
@@ -346,7 +352,7 @@ b,strong{font-weight:400;color:var(--t-hi)}
 
 /* 待办 dossier：操作台对话框 */
 .detail.split{max-width:1240px;display:grid;grid-template-columns:1fr 340px;gap:18px;align-items:start}
-.dossier{grid-column:2;grid-row:1 / span 3;position:sticky;top:60px;
+.dossier{grid-column:2;grid-row:1 / span 3;position:sticky;top:86px;
   border:2px solid var(--pending);background:var(--panel);
   box-shadow:inset 0 0 0 2px var(--panel),inset 0 0 0 4px var(--pane),4px 4px 0 var(--ink);
   padding:12px 14px;display:flex;gap:12px}
@@ -360,6 +366,119 @@ b,strong{font-weight:400;color:var(--t-hi)}
 .dossier .ctx a{color:var(--t-hi);text-decoration:underline;text-underline-offset:3px;cursor:pointer}
 .dossier .grp{color:var(--t4);letter-spacing:.08em;margin:12px 0 7px}
 .dossier .btn{display:block;width:100%;text-align:left;margin-bottom:8px}
+
+/* ───────── 设置 / 指标：车间台账 ───────── */
+.page{max-width:1000px;margin:0 auto;padding:18px 20px 44px}
+.p-head{display:flex;align-items:baseline;justify-content:space-between;gap:14px;margin:6px 0 8px}
+.p-title{font-size:24px;color:var(--t-hi);line-height:1.2}
+.hintline{color:var(--t3);line-height:1.8;margin-bottom:14px;max-width:86ch}
+.hintline b{color:var(--t-hi)}
+/* 台账表：2px 描边盒 + 列头条 */
+.reg{border:2px solid var(--pane);background:var(--bg)}
+.reg-head{display:flex;justify-content:space-between;align-items:center;gap:8px;
+  padding:6px 12px;border-bottom:2px solid var(--pane);background:var(--panel);
+  color:var(--t3);letter-spacing:.08em}
+.reg-head .n{color:var(--t4)}
+.reg-rows{list-style:none}
+.reg-row{display:flex;align-items:flex-start;justify-content:space-between;gap:12px;
+  padding:10px 12px;border-bottom:2px solid var(--wash)}
+.reg-row:last-child{border-bottom:0}
+.reg-row:hover{background:var(--panel)}
+.reg-main{min-width:0;flex:1}
+.reg-l1{display:flex;align-items:baseline;gap:10px;flex-wrap:wrap}
+.reg-name{color:var(--t-hi)}
+.reg-sub{color:var(--t3)}
+.reg-l2{display:flex;gap:14px;flex-wrap:wrap;margin-top:4px;color:var(--t3)}
+.reg-path{margin-top:3px;color:var(--t2);word-break:break-all}
+.reg-acts{display:flex;align-items:center;gap:8px;flex:none}
+.reg-err{margin-top:5px;color:var(--stop);white-space:pre-wrap}
+.reg-row.dead{color:var(--t4)}
+.reg-row.dead .reg-name{color:var(--t4)}
+.reg-row.pseudo{border-left:4px solid var(--t3)}
+.warnnote{margin-top:5px;color:var(--pending);line-height:1.7}
+.warnnote.stop{color:var(--stop)}
+.sub-head{display:flex;align-items:center;justify-content:space-between;gap:14px;margin:26px 0 6px}
+.sub-head h2{font-size:24px;color:var(--t-hi)}
+.blank{margin-top:10px;padding:10px 12px;border:2px solid var(--pane);color:var(--t3)}
+.blank.err{border-color:var(--stop);color:var(--stop)}
+/* 核对清单（项目分析结果） */
+.checklist{border:2px solid var(--pane);background:var(--bg);margin-top:10px}
+.checklist .sub-head{margin:0;padding:6px 12px;border-bottom:2px solid var(--pane);background:var(--panel)}
+.checklist .sub-head h2{font-size:12px;letter-spacing:.08em}
+.checklist ul{list-style:none;display:grid;grid-template-columns:1fr 1fr}
+.checklist li{display:grid;grid-template-columns:16px 96px 1fr;align-items:baseline;
+  gap:0;padding:4px 12px;border-bottom:2px solid var(--wash);border-right:2px solid var(--wash)}
+.checklist li.miss{color:var(--t4)}
+.checklist .mk{color:var(--go)}
+.checklist li.miss .mk{color:var(--t4)}
+.checklist .lb{color:var(--t2)}
+.checklist .vl{color:var(--t-hi);overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.checklist li.miss .vl{color:var(--t3)}
+.checklist .foot{display:flex;align-items:center;gap:12px;padding:10px 12px}
+.checklist .foot .btn{margin-left:auto}
+/* 指标：站点分段条形图（挂在传送带站点下） */
+.chart{border:2px solid var(--pane);background:var(--panel);padding:12px 14px;margin-bottom:12px}
+.chart-head{display:flex;align-items:baseline;gap:10px;margin-bottom:12px}
+.chart-head h2{color:var(--t-hi)}
+.chart-empty{color:var(--t3);padding:4px 0}
+.plot{position:relative}
+.plot .rail-line{position:absolute;left:0;right:0;top:20px;height:6px;background:var(--pane)}
+.cols{position:relative;display:grid;grid-template-columns:repeat(var(--n,1),minmax(0,1fr));gap:6px}
+.cols .c{display:flex;flex-direction:column;align-items:center;min-width:0}
+.cols .lb{max-width:100%;color:var(--t3);white-space:nowrap;overflow:hidden;
+  text-overflow:ellipsis;letter-spacing:.02em}
+.cols .mdot{position:relative;z-index:1;width:12px;height:12px;margin:2px 0;
+  border:2px solid var(--t3);background:var(--panel)}
+.cols .mdot.go{border-color:var(--go)} .cols .mdot.caution{border-color:var(--pending)}
+.cols .mdot.stop{border-color:var(--stop)} .cols .mdot.done{border-color:var(--done)}
+.cols .mdot.dev{border-color:var(--t2)} .cols .mdot.test{border-color:var(--t3)}
+.cols .track{width:100%;height:10px;margin-top:8px;border:2px solid var(--pane);background:var(--bg)}
+.cols .track .fill{display:block;height:100%;min-width:2px;background:var(--go)}
+.cols .track .fill.caution{background:var(--pending)}
+.cols .track .fill.stop{background:var(--stop)}
+.cols .track .fill.done{background:var(--done)}
+.cols .track .fill.dev{background:var(--belt-lit)}
+.cols .track .fill.test{background:var(--t3)}
+.cols .v{margin-top:5px;color:var(--t2);white-space:nowrap}
+.excl{color:var(--t3);margin-top:8px}
+.msum{display:flex;gap:16px;flex-wrap:wrap;margin:12px 0 0;color:var(--t2)}
+.msum .drift{color:var(--pending)}
+.drift-note{margin-top:5px;color:var(--t3)}
+.subform{display:flex;gap:8px;align-items:center;flex-wrap:wrap}
+.minput{background:var(--bg);border:2px solid var(--pane);color:var(--t-hi);
+  padding:2px 8px;min-width:280px;line-height:1.6}
+.minput::placeholder{color:var(--t4)}
+.minput:focus{outline:none;border-color:var(--t2)}
+.pbtns{display:flex;gap:8px;flex-wrap:wrap;margin-top:10px}
+/* 手机访问：服务地址牌 + 二维码 */
+.qrbox{display:flex;gap:20px;align-items:flex-start;flex-wrap:wrap;
+  border:2px solid var(--pane);background:var(--panel);padding:16px}
+.qr-qr{flex:none;width:240px;height:240px;background:#fff;border:2px solid var(--pane);
+  display:grid;place-items:center;color:#111;font-size:12px;text-align:center;line-height:1.6}
+.qr-side{flex:1;min-width:260px}
+.picked{background:var(--bg);border:2px solid var(--pane);color:var(--t-hi);
+  padding:8px 10px;margin-bottom:10px;word-break:break-all}
+.qr-cap{margin-top:12px;color:var(--t3);line-height:1.8}
+.alt{margin-top:18px;border-top:2px solid var(--wash);padding-top:12px}
+.alt-head{color:var(--t3);letter-spacing:.08em;margin-bottom:8px}
+.alt-l{list-style:none}
+.alt-item{display:flex;align-items:center;gap:10px;width:100%;text-align:left;
+  border:2px solid transparent;color:var(--t1);padding:3px 8px}
+.alt-item:hover{background:var(--wash)}
+.alt-item.on{border-color:var(--go)}
+.iface{color:var(--t3);min-width:56px;flex:none}
+.alt-item .u{flex:1;word-break:break-all}
+.alt-item .tag{flex:none;color:var(--go);border:2px solid var(--go);padding:0 5px}
+.gate{border:2px solid var(--pane);background:var(--panel);padding:16px;line-height:1.85}
+.gate-head{color:var(--pending);font-size:24px;margin-bottom:10px}
+.gate pre{background:var(--bg);border:2px solid var(--pane);padding:10px 12px;
+  overflow-x:auto;margin:8px 0 14px}
+.gate code{color:var(--t-hi)}
+.gate .how{color:var(--t3);margin:12px 0 4px}
+.gate .note{margin-top:14px;color:var(--t3)}
+.gate .hi{color:var(--t-hi)}
+.gate .warn{margin-top:16px;border-top:2px solid var(--wash);padding-top:12px;
+  color:var(--pending);line-height:1.85}
 
 /* 原型切换器 */
 .demo{position:fixed;right:16px;bottom:48px;z-index:40;display:flex;gap:6px;padding:6px;
@@ -379,7 +498,8 @@ b,strong{font-weight:400;color:var(--t-hi)}
 
 <!-- ═══════════ 视图 1：看板（8 工位，无 sync-check） ═══════════ -->
 <div class="view on" id="v-board">
-  <header class="topbar">
+  <header class="top">
+    <div class="topbar">
     <span class="logo" aria-hidden="true"></span>
     <span class="wordmark">AGENTPIPELINE</span>
     <span class="sess">本机夜班</span>
@@ -392,6 +512,13 @@ b,strong{font-weight:400;color:var(--t-hi)}
       <button class="slot" title="已完成"><i class="sp" data-s="trophy"></i><span class="cb">1</span></button>
     </nav>
     <button class="btn-new">新建任务</button>
+    </div>
+    <nav class="navbar" aria-label="页面导航">
+      <button class="chip" onclick="show('v-metrics')"><i class="sp" data-s="chart"></i>指标</button>
+      <button class="chip" onclick="show('v-projects')"><i class="sp" data-s="chest"></i>项目</button>
+      <button class="chip" onclick="show('v-providers')"><i class="sp" data-s="key"></i>模型与密钥</button>
+      <button class="chip" onclick="show('v-share')"><i class="sp" data-s="phone"></i>手机访问</button>
+    </nav>
   </header>
 
   <div class="hscroll"><div class="hinner">
@@ -551,11 +678,19 @@ b,strong{font-weight:400;color:var(--t-hi)}
 
 <!-- ═══════════ 视图 2：详情 · 执行中 ═══════════ -->
 <div class="view" id="v-run">
-  <header class="topbar">
+  <header class="top">
+    <div class="topbar">
     <span class="logo" aria-hidden="true"></span>
     <span class="wordmark">AGENTPIPELINE</span>
     <span class="sess">本机夜班</span>
     <nav class="filters"><button class="chip on" onclick="show('v-board')">← 返回看板</button></nav>
+    </div>
+    <nav class="navbar" aria-label="页面导航">
+      <button class="chip" onclick="show('v-metrics')"><i class="sp" data-s="chart"></i>指标</button>
+      <button class="chip" onclick="show('v-projects')"><i class="sp" data-s="chest"></i>项目</button>
+      <button class="chip" onclick="show('v-providers')"><i class="sp" data-s="key"></i>模型与密钥</button>
+      <button class="chip" onclick="show('v-share')"><i class="sp" data-s="phone"></i>手机访问</button>
+    </nav>
   </header>
   <div class="detail">
     <a class="crumb" onclick="show('v-board')">看板</a>
@@ -685,11 +820,19 @@ error: could not compile `agentpipeline` due to 1 previous error
 
 <!-- ═══════════ 视图 3：详情 · 待审批 ═══════════ -->
 <div class="view" id="v-approve">
-  <header class="topbar">
+  <header class="top">
+    <div class="topbar">
     <span class="logo" aria-hidden="true"></span>
     <span class="wordmark">AGENTPIPELINE</span>
     <span class="sess">本机夜班</span>
     <nav class="filters"><button class="chip on" onclick="show('v-board')">← 返回看板</button></nav>
+    </div>
+    <nav class="navbar" aria-label="页面导航">
+      <button class="chip" onclick="show('v-metrics')"><i class="sp" data-s="chart"></i>指标</button>
+      <button class="chip" onclick="show('v-projects')"><i class="sp" data-s="chest"></i>项目</button>
+      <button class="chip" onclick="show('v-providers')"><i class="sp" data-s="key"></i>模型与密钥</button>
+      <button class="chip" onclick="show('v-share')"><i class="sp" data-s="phone"></i>手机访问</button>
+    </nav>
   </header>
   <div class="detail split">
     <div style="grid-column:1;grid-row:1">
@@ -806,6 +949,441 @@ error: could not compile `agentpipeline` due to 1 previous error
   </div>
 </div>
 
+<!-- ═══════════ 视图 4：设置 · 项目（台位台账） ═══════════ -->
+<div class="view" id="v-projects">
+  <header class="top">
+    <div class="topbar">
+    <span class="logo" aria-hidden="true"></span>
+    <span class="wordmark">AGENTPIPELINE</span>
+    <span class="sess">本机夜班</span>
+    <nav class="filters"><button class="chip on" onclick="show('v-board')">← 返回看板</button></nav>
+    </div>
+    <nav class="navbar" aria-label="页面导航">
+      <button class="chip" onclick="show('v-metrics')"><i class="sp" data-s="chart"></i>指标</button>
+      <button class="chip on" onclick="show('v-projects')"><i class="sp" data-s="chest"></i>项目</button>
+      <button class="chip" onclick="show('v-providers')"><i class="sp" data-s="key"></i>模型与密钥</button>
+      <button class="chip" onclick="show('v-share')"><i class="sp" data-s="phone"></i>手机访问</button>
+    </nav>
+  </header>
+  <div class="page">
+    <a class="crumb" onclick="show('v-board')">看板</a>
+    <div class="p-head">
+      <h1 class="p-title">设置 · 项目</h1>
+      <button class="btn solid">＋ 新建项目</button>
+    </div>
+    <p class="hintline">本地路径是项目唯一事实来源（决策 29）。创建时立即校验 git 仓库（决策 61）；
+      删除有活跃任务的项目会被拒绝并给出原因（决策 101）。</p>
+
+    <div class="reg">
+      <div class="reg-head"><span>项目</span><span class="n">3</span></div>
+      <ul class="reg-rows">
+        <li class="reg-row">
+          <div class="reg-main">
+            <div class="reg-l1"><span class="reg-name">agentpipeline</span><span class="reg-sub">main</span></div>
+            <div class="reg-path">~/Documents/AgentPipeline</div>
+            <div class="reg-l2"><span>lang Rust</span><span>test cargo test</span>
+              <span>lint cargo clippy -- -D warnings</span><span>AGENTS.md AGENTS.md</span></div>
+          </div>
+          <div class="reg-acts">
+            <button class="btn">编辑</button>
+            <button class="btn">分析</button>
+            <button class="btn danger">删除</button>
+          </div>
+        </li>
+        <li class="reg-row">
+          <div class="reg-main">
+            <div class="reg-l1"><span class="reg-name">kanban-web</span><span class="reg-sub">main</span></div>
+            <div class="reg-path">~/Projects/kanban-web</div>
+            <div class="reg-l2"><span>lang TypeScript</span><span>test vitest run</span>
+              <span>lint eslint .</span><span>AGENTS.md —</span></div>
+          </div>
+          <div class="reg-acts">
+            <span class="reg-sub">确认删除？</span>
+            <button class="btn danger" disabled>删除</button>
+            <button class="btn quiet">取消</button>
+          </div>
+        </li>
+        <li class="reg-row">
+          <div class="reg-main">
+            <div class="reg-l1"><span class="reg-name">docs-site</span><span class="reg-sub">trunk</span></div>
+            <div class="reg-path">~/Projects/docs-site</div>
+            <div class="reg-l2"><span>lang Markdown</span><span>test —</span><span>lint —</span><span>AGENTS.md AGENTS.md</span></div>
+            <div class="reg-err">该项目有 2 个活跃任务，不能删除（决策 101）。</div>
+          </div>
+          <div class="reg-acts">
+            <button class="btn">编辑</button>
+            <button class="btn">分析</button>
+            <button class="btn danger">删除</button>
+          </div>
+        </li>
+      </ul>
+    </div>
+
+    <!-- 项目分析 · 核对清单（伪阶段探测事实 → 供确认，决策 78） -->
+    <section class="checklist">
+      <div class="sub-head">
+        <h2>项目分析 · 核对清单</h2>
+        <span class="st run">分析完成</span>
+        <button class="btn quiet">收起</button>
+      </div>
+      <p class="hintline" style="padding:8px 12px 0">以下为 project_analysis 探测到的事实，确认无误后即可创建任务（决策 78）。</p>
+      <ul>
+        <li><span class="mk">✓</span><span class="lb">语言</span><span class="vl">Rust</span></li>
+        <li><span class="mk">✓</span><span class="lb">默认分支</span><span class="vl">main</span></li>
+        <li><span class="mk">✓</span><span class="lb">测试框架</span><span class="vl">cargo test</span></li>
+        <li class="miss"><span class="mk">—</span><span class="lb">Lint 命令</span><span class="vl">未探测到</span></li>
+        <li><span class="mk">✓</span><span class="lb">AGENTS.md</span><span class="vl">AGENTS.md</span></li>
+        <li><span class="mk">✓</span><span class="lb">.gitignore</span><span class="vl">已存在</span></li>
+        <li class="miss"><span class="mk">—</span><span class="lb">可疑项</span><span class="vl">1 项待人工核对</span></li>
+      </ul>
+      <div class="foot">
+        <span class="reg-sub">确认仅为本页核对记录，不改后端配置。</span>
+        <button class="btn solid">确认清单</button>
+      </div>
+    </section>
+  </div>
+</div>
+
+<!-- ═══════════ 视图 5：设置 · 模型与密钥（机台名册） ═══════════ -->
+<div class="view" id="v-providers">
+  <header class="top">
+    <div class="topbar">
+    <span class="logo" aria-hidden="true"></span>
+    <span class="wordmark">AGENTPIPELINE</span>
+    <span class="sess">本机夜班</span>
+    <nav class="filters"><button class="chip on" onclick="show('v-board')">← 返回看板</button></nav>
+    </div>
+    <nav class="navbar" aria-label="页面导航">
+      <button class="chip" onclick="show('v-metrics')"><i class="sp" data-s="chart"></i>指标</button>
+      <button class="chip" onclick="show('v-projects')"><i class="sp" data-s="chest"></i>项目</button>
+      <button class="chip on" onclick="show('v-providers')"><i class="sp" data-s="key"></i>模型与密钥</button>
+      <button class="chip" onclick="show('v-share')"><i class="sp" data-s="phone"></i>手机访问</button>
+    </nav>
+  </header>
+  <div class="page">
+    <a class="crumb" onclick="show('v-board')">看板</a>
+    <div class="p-head">
+      <h1 class="p-title">设置 · 模型与密钥</h1>
+      <button class="btn solid">＋ 新增 provider</button>
+    </div>
+    <p class="hintline">provider 行 =（vendor, model, context_window）（决策 111）。api_key 明文存储，
+      读接口只回显 <b>***</b>；密钥明文存于本机 <b>~/.agentpipeline</b>，目录权限 <b>0700</b>（决策 112 / §12.14）。</p>
+
+    <div class="reg">
+      <div class="reg-head"><span>provider</span><span class="n">4</span></div>
+      <ul class="reg-rows">
+        <li class="reg-row">
+          <div class="reg-main">
+            <div class="reg-l1"><span class="reg-name">anthropic</span><span class="reg-sub">claude-sonnet-4</span>
+              <span class="st run">[ON]</span></div>
+            <div class="reg-l2"><span>ctx 200,000</span><span>base_url 默认</span><span>api_key ***</span></div>
+          </div>
+          <div class="reg-acts"><button class="btn">编辑</button><button class="btn danger">删除</button></div>
+        </li>
+        <li class="reg-row">
+          <div class="reg-main">
+            <div class="reg-l1"><span class="reg-name">deepseek</span><span class="reg-sub">deepseek-chat</span>
+              <span class="st run">[ON]</span></div>
+            <div class="reg-l2"><span>ctx 128,000</span><span>base_url 默认</span><span>api_key ***</span></div>
+          </div>
+          <div class="reg-acts"><button class="btn">编辑</button><button class="btn danger">删除</button></div>
+        </li>
+        <li class="reg-row">
+          <div class="reg-main">
+            <div class="reg-l1"><span class="reg-name">openai</span><span class="reg-sub">gpt-4o-mini</span>
+              <span class="st dim">[OFF]</span></div>
+            <div class="reg-l2"><span>ctx 128,000</span><span>base_url 默认</span><span>api_key 未设置</span></div>
+          </div>
+          <div class="reg-acts"><button class="btn">编辑</button><button class="btn danger">删除</button></div>
+        </li>
+        <!-- 决策 103：supported_adapters 之外的行降级灰显 + 告警，不崩 -->
+        <li class="reg-row dead">
+          <div class="reg-main">
+            <div class="reg-l1"><span class="reg-name">legacy-vendor</span><span class="reg-sub">hand-rolled</span>
+              <span class="st dim">[OFF]</span><span class="reg-err" style="margin:0">! 不受支持 · 决策 103</span></div>
+            <div class="reg-l2"><span>ctx 8,192</span><span>base_url http://127.0.0.1:11434</span><span>api_key ***</span></div>
+            <div class="warnnote">该厂商不在 supported_adapters 内：此行走降级灰显，被 stage_configs 引用时配置加载会拒绝启动。</div>
+          </div>
+          <div class="reg-acts"><button class="btn">编辑</button><button class="btn danger">删除</button></div>
+        </li>
+      </ul>
+    </div>
+
+    <!-- 阶段配置（stage_configs）：PUT 整条替换 / DELETE 撤销覆盖（决策 22 / 46 / 66 / 111 / 129） -->
+    <div class="sub-head">
+      <h2>阶段配置</h2>
+      <button class="btn">＋ 新增阶段配置</button>
+    </div>
+    <p class="hintline">阶段 provider 优先于全局默认（决策 129）。保存为<b>整条替换</b>：留空字段清空为默认。
+      写入会跑启动校验，非法配置（provider 缺失/禁用/厂商不支持、persona 不可读、会破坏启动的改动）被拒并回显原因（决策 47 / 103）。</p>
+
+    <div class="reg">
+      <div class="reg-head"><span>阶段配置</span><span class="n">3</span></div>
+      <ul class="reg-rows">
+        <li class="reg-row">
+          <div class="reg-main">
+            <div class="reg-l1"><span class="reg-name">develop</span><span class="reg-sub">provider anthropic</span>
+              <span class="reg-sub">temp 0.2 · max_tokens 8192</span></div>
+            <div class="reg-l2"><span>persona —</span><span>tools 已配置</span><span>skills —</span>
+              <span>updated 2026-09-13 14:02:11</span></div>
+          </div>
+          <div class="reg-acts"><button class="btn">编辑</button><button class="btn danger">删除</button></div>
+        </li>
+        <!-- 伪阶段：不用分支色相（决策 84），左缘亮度阶 + （伪阶段）文字标记 -->
+        <li class="reg-row pseudo">
+          <div class="reg-main">
+            <div class="reg-l1"><span class="reg-name">conflict_check（伪阶段）</span><span class="reg-sub">provider 默认</span>
+              <span class="reg-sub">temp 默认 · max_tokens 默认</span></div>
+            <div class="reg-l2"><span>persona —</span><span>tools —</span><span>skills —</span>
+              <span>updated 2026-09-12 09:41:07</span></div>
+          </div>
+          <div class="reg-acts"><button class="btn">编辑</button><button class="btn danger">删除</button></div>
+        </li>
+        <li class="reg-row pseudo">
+          <div class="reg-main">
+            <div class="reg-l1"><span class="reg-name">project_analysis（伪阶段）</span><span class="reg-sub">provider deepseek</span>
+              <span class="reg-sub">temp 0 · max_tokens 4096</span></div>
+            <div class="reg-l2"><span>persona —</span><span>tools 已配置</span><span>skills —</span>
+              <span>updated 2026-09-13 09:45:33</span></div>
+          </div>
+          <div class="reg-acts"><span class="reg-sub">确认撤销覆盖？</span>
+            <button class="btn danger" disabled>删除</button><button class="btn quiet">取消</button></div>
+        </li>
+      </ul>
+    </div>
+  </div>
+</div>
+
+<!-- ═══════════ 视图 6：全局指标（车间灯板） ═══════════ -->
+<div class="view" id="v-metrics">
+  <header class="top">
+    <div class="topbar">
+    <span class="logo" aria-hidden="true"></span>
+    <span class="wordmark">AGENTPIPELINE</span>
+    <span class="sess">本机夜班</span>
+    <nav class="filters"><button class="chip on" onclick="show('v-board')">← 返回看板</button></nav>
+    </div>
+    <nav class="navbar" aria-label="页面导航">
+      <button class="chip on" onclick="show('v-metrics')"><i class="sp" data-s="chart"></i>指标</button>
+      <button class="chip" onclick="show('v-projects')"><i class="sp" data-s="chest"></i>项目</button>
+      <button class="chip" onclick="show('v-providers')"><i class="sp" data-s="key"></i>模型与密钥</button>
+      <button class="chip" onclick="show('v-share')"><i class="sp" data-s="phone"></i>手机访问</button>
+    </nav>
+  </header>
+  <div class="page">
+    <a class="crumb" onclick="show('v-board')">看板</a>
+    <div class="p-head">
+      <h1 class="p-title">全局指标</h1>
+      <button class="btn" disabled>刷新</button>
+    </div>
+    <p class="hintline">统计口径见 core metrics（决策 130 / 137）：成功率 = done ÷（done+failed+cancelled）；
+      重试率 = attempt &gt; 1 的 run 占比；逃逸事件 = trigger = kickback 的流转数；
+      首过率 = validate_output 首次 attempt 即通过的比例。共 14 个任务，逃逸事件 3 次，
+      total_tokens 1,284,000 · calls 6,412。</p>
+
+    <!-- 站点分段条形图：横条挂在传送带站点下（design §7），无 KPI 卡片横排 -->
+    <section class="chart">
+      <div class="chart-head"><h2>成功率</h2><span class="reg-sub">done ÷ (done + failed + cancelled)</span></div>
+      <div class="plot">
+        <div class="rail-line"></div>
+        <div class="cols" style="--n:1">
+          <div class="c"><span class="lb">成功率</span><span class="mdot go"></span>
+            <div class="track"><span class="fill go" style="width:78.6%"></span></div>
+            <span class="v">78.6%</span></div>
+        </div>
+      </div>
+    </section>
+
+    <section class="chart">
+      <div class="chart-head"><h2>各阶段平均耗时</h2><span class="reg-sub">横条按最长阶段归一</span></div>
+      <div class="plot">
+        <div class="rail-line"></div>
+        <div class="cols" style="--n:9">
+          <div class="c"><span class="lb">init</span><span class="mdot dev"></span>
+            <div class="track"><span class="fill dev" style="width:8.2%"></span></div><span class="v">1m02s</span></div>
+          <div class="c"><span class="lb">architect</span><span class="mdot dev"></span>
+            <div class="track"><span class="fill dev" style="width:33.2%"></span></div><span class="v">4m10s</span></div>
+          <div class="c"><span class="lb">dev-design</span><span class="mdot dev"></span>
+            <div class="track"><span class="fill dev" style="width:53.0%"></span></div><span class="v">6m40s</span></div>
+          <div class="c"><span class="lb">test-design</span><span class="mdot dev"></span>
+            <div class="track"><span class="fill dev" style="width:26.5%"></span></div><span class="v">3m20s</span></div>
+          <div class="c"><span class="lb">develop</span><span class="mdot dev"></span>
+            <div class="track"><span class="fill dev" style="width:100%"></span></div><span class="v">12m34s</span></div>
+          <div class="c"><span class="lb">review</span><span class="mdot dev"></span>
+            <div class="track"><span class="fill dev" style="width:16.6%"></span></div><span class="v">2m05s</span></div>
+          <div class="c"><span class="lb">test</span><span class="mdot dev"></span>
+            <div class="track"><span class="fill dev" style="width:70.4%"></span></div><span class="v">8m51s</span></div>
+          <div class="c"><span class="lb">merge</span><span class="mdot dev"></span>
+            <div class="track"><span class="fill dev" style="width:25.5%"></span></div><span class="v">3m12s</span></div>
+          <div class="c"><span class="lb">done</span><span class="mdot dev"></span>
+            <div class="track"><span class="fill dev" style="width:0%"></span></div><span class="v">0ms</span></div>
+        </div>
+      </div>
+    </section>
+
+    <section class="chart">
+      <div class="chart-head"><h2>各阶段重试率</h2><span class="reg-sub">attempt &gt; 1 的比例</span></div>
+      <div class="plot">
+        <div class="rail-line"></div>
+        <div class="cols" style="--n:9">
+          <div class="c"><span class="lb">init</span><span class="mdot caution"></span>
+            <div class="track"><span class="fill caution" style="width:0%"></span></div><span class="v">0.0%</span></div>
+          <div class="c"><span class="lb">architect</span><span class="mdot caution"></span>
+            <div class="track"><span class="fill caution" style="width:12.5%"></span></div><span class="v">12.5%</span></div>
+          <div class="c"><span class="lb">dev-design</span><span class="mdot caution"></span>
+            <div class="track"><span class="fill caution" style="width:25.0%"></span></div><span class="v">25.0%</span></div>
+          <div class="c"><span class="lb">test-design</span><span class="mdot caution"></span>
+            <div class="track"><span class="fill caution" style="width:0%"></span></div><span class="v">0.0%</span></div>
+          <div class="c"><span class="lb">develop</span><span class="mdot caution"></span>
+            <div class="track"><span class="fill caution" style="width:33.3%"></span></div><span class="v">33.3%</span></div>
+          <div class="c"><span class="lb">review</span><span class="mdot caution"></span>
+            <div class="track"><span class="fill caution" style="width:0%"></span></div><span class="v">0.0%</span></div>
+          <div class="c"><span class="lb">test</span><span class="mdot caution"></span>
+            <div class="track"><span class="fill caution" style="width:14.3%"></span></div><span class="v">14.3%</span></div>
+          <div class="c"><span class="lb">merge</span><span class="mdot caution"></span>
+            <div class="track"><span class="fill caution" style="width:0%"></span></div><span class="v">0.0%</span></div>
+          <div class="c"><span class="lb">done</span><span class="mdot caution"></span>
+            <div class="track"><span class="fill caution" style="width:0%"></span></div><span class="v">0.0%</span></div>
+        </div>
+      </div>
+    </section>
+
+    <section class="chart">
+      <div class="chart-head"><h2>逃逸事件（kickback 按来源阶段）</h2><span class="reg-sub">触发打回的流转数；条长按最大阶段归一</span></div>
+      <div class="plot">
+        <div class="rail-line"></div>
+        <div class="cols" style="--n:2">
+          <div class="c"><span class="lb">architect</span><span class="mdot stop"></span>
+            <div class="track"><span class="fill stop" style="width:100%"></span></div><span class="v">2</span></div>
+          <div class="c"><span class="lb">develop</span><span class="mdot stop"></span>
+            <div class="track"><span class="fill stop" style="width:50%"></span></div><span class="v">1</span></div>
+        </div>
+      </div>
+    </section>
+
+    <section class="chart">
+      <div class="chart-head"><h2>首过率</h2><span class="reg-sub">validate_output 首次 attempt 即通过的比例</span></div>
+      <div class="plot">
+        <div class="rail-line"></div>
+        <div class="cols" style="--n:1">
+          <div class="c"><span class="lb">首过率</span><span class="mdot done"></span>
+            <div class="track"><span class="fill done" style="width:66.7%"></span></div><span class="v">66.7%</span></div>
+        </div>
+      </div>
+    </section>
+
+    <p class="excl">已从轨道图排除非站点阶段（决策 107）：sync-check。</p>
+
+    <!-- 任务级指标：GET /tasks/{id}/metrics -->
+    <section class="chart" style="margin-top:24px">
+      <div class="chart-head"><h2>任务级指标</h2></div>
+      <div class="subform">
+        <input class="minput" placeholder="任务 ID（ULID）">
+        <button class="btn">载入</button>
+      </div>
+      <div class="msum">
+        <span>total_tokens 45,200</span>
+        <span>total_calls 214</span>
+        <span>stored_tokens 45,200</span>
+        <span class="drift">stored_calls 211</span>
+      </div>
+      <p class="drift-note">stored_* 是任务表持久化值，与按 run 求和存在差异（决策 100 的父/子行口径或未落库更新）。</p>
+      <div style="margin-top:12px">
+        <section class="chart" style="margin-bottom:12px">
+          <div class="chart-head"><h2>阶段平均耗时</h2></div>
+          <div class="plot">
+            <div class="rail-line"></div>
+            <div class="cols" style="--n:4">
+              <div class="c"><span class="lb">architect</span><span class="mdot dev"></span>
+                <div class="track"><span class="fill dev" style="width:33.2%"></span></div><span class="v">4m10s</span></div>
+              <div class="c"><span class="lb">develop</span><span class="mdot dev"></span>
+                <div class="track"><span class="fill dev" style="width:100%"></span></div><span class="v">12m34s</span></div>
+              <div class="c"><span class="lb">review</span><span class="mdot dev"></span>
+                <div class="track"><span class="fill dev" style="width:16.6%"></span></div><span class="v">2m05s</span></div>
+              <div class="c"><span class="lb">test</span><span class="mdot dev"></span>
+                <div class="track"><span class="fill dev" style="width:70.4%"></span></div><span class="v">8m51s</span></div>
+            </div>
+          </div>
+        </section>
+        <section class="chart" style="margin-bottom:0">
+          <div class="chart-head"><h2>阶段重试率</h2></div>
+          <div class="plot">
+            <div class="rail-line"></div>
+            <div class="cols" style="--n:4">
+              <div class="c"><span class="lb">architect</span><span class="mdot caution"></span>
+                <div class="track"><span class="fill caution" style="width:12.5%"></span></div><span class="v">12.5%</span></div>
+              <div class="c"><span class="lb">develop</span><span class="mdot caution"></span>
+                <div class="track"><span class="fill caution" style="width:33.3%"></span></div><span class="v">33.3%</span></div>
+              <div class="c"><span class="lb">review</span><span class="mdot caution"></span>
+                <div class="track"><span class="fill caution" style="width:0%"></span></div><span class="v">0.0%</span></div>
+              <div class="c"><span class="lb">test</span><span class="mdot caution"></span>
+                <div class="track"><span class="fill caution" style="width:14.3%"></span></div><span class="v">14.3%</span></div>
+            </div>
+          </div>
+        </section>
+      </div>
+    </section>
+  </div>
+</div>
+
+<!-- ═══════════ 视图 7：手机访问（扫码上工） ═══════════ -->
+<div class="view" id="v-share">
+  <header class="top">
+    <div class="topbar">
+    <span class="logo" aria-hidden="true"></span>
+    <span class="wordmark">AGENTPIPELINE</span>
+    <span class="sess">本机夜班</span>
+    <nav class="filters"><button class="chip on" onclick="show('v-board')">← 返回看板</button></nav>
+    </div>
+    <nav class="navbar" aria-label="页面导航">
+      <button class="chip" onclick="show('v-metrics')"><i class="sp" data-s="chart"></i>指标</button>
+      <button class="chip" onclick="show('v-projects')"><i class="sp" data-s="chest"></i>项目</button>
+      <button class="chip" onclick="show('v-providers')"><i class="sp" data-s="key"></i>模型与密钥</button>
+      <button class="chip on" onclick="show('v-share')"><i class="sp" data-s="phone"></i>手机访问</button>
+    </nav>
+  </header>
+  <div class="page">
+    <a class="crumb" onclick="show('v-board')">看板</a>
+    <div class="p-head"><h1 class="p-title">手机访问</h1></div>
+
+    <div class="qrbox">
+      <div class="qr-qr" id="qr">二维码由后端渲染<br>（决策 167）</div>
+      <div class="qr-side">
+        <div class="chart-head"><span class="reg-name">扫码在手机上打开</span><span class="reg-sub" style="border:2px solid var(--pane);padding:0 5px">:7830</span></div>
+        <div class="picked">http://192.168.1.24:7830</div>
+        <button class="btn">复制地址</button>
+        <p class="qr-cap">手机需与电脑在同一局域网（同一 Wi-Fi）。扫码后可直接使用看板与任务详情，实时进度经 SSE 推送。</p>
+      </div>
+    </div>
+
+    <div class="alt">
+      <div class="alt-head">其他网卡地址（首选不通时可换一个试试）</div>
+      <ul class="alt-l">
+        <li><button class="alt-item on"><span class="iface">en0</span><span class="u">http://192.168.1.24:7830</span><span class="tag">推荐</span></button></li>
+        <li><button class="alt-item"><span class="iface">utun3</span><span class="u">http://100.84.12.7:7830</span></button></li>
+        <li><button class="alt-item"><span class="iface">bridge0</span><span class="u">http://172.18.0.1:7830</span></button></li>
+      </ul>
+    </div>
+
+    <p class="warnnote" style="margin-top:18px;border-top:2px solid var(--wash);padding-top:12px">⚠ 同一网段的任何设备都能访问本服务的全部接口（v1 无鉴权），请勿在公共 Wi-Fi 下开启。用完可重启服务回到仅回环绑定。</p>
+
+    <!-- 备用姿态：服务只绑回环时同一页的内容（默认姿态，决策 167） -->
+    <section class="gate" style="margin-top:20px">
+      <div class="gate-head">仅回环绑定时</div>
+      <p>手机和电脑不在同一个地址空间：<b>127.0.0.1</b> 在手机上指向手机自己，扫码必然打不开。
+        要让手机访问，需要让服务监听局域网网卡。</p>
+      <p class="how">命令行启动时绑定全网卡：</p>
+      <pre><code>agent-pipeline serve --host 0.0.0.0</code></pre>
+      <p class="how">或在配置文件里改：</p>
+      <pre><code>[server]
+host = "0.0.0.0"</code></pre>
+      <p class="note">手机加载的页面与 API <span class="hi">同源</span>，因此无需额外放行 origin（跨源防护只拦异源写请求，同源写请求自带客户端头，决策 128 / 153③）。</p>
+      <p class="note">桌面应用默认也只绑回环；设环境变量 <b>AGENTPIPELINE_LAN=1</b> 启动桌面壳即可开启局域网访问（决策 167）。</p>
+      <p class="warn">⚠ 服务能触发真实 LLM 调用并读取全部会话，开放局域网前请确认所在网段可信（更稳妥可用 SSH 隧道 / Tailscale）。</p>
+    </section>
+  </div>
+</div>
+
 <!-- 底部状态行（车间看板条） -->
 <footer class="statusbar">
   <span>⏸ <b class="pen">*3</b> 待处理</span>
@@ -828,6 +1406,10 @@ error: could not compile `agentpipeline` due to 1 previous error
   <button class="on" data-v="v-board">0:看板</button>
   <button data-v="v-run">1:详情·执行中</button>
   <button data-v="v-approve">2:详情·待审批</button>
+  <button data-v="v-projects">3:项目</button>
+  <button data-v="v-providers">4:模型与密钥</button>
+  <button data-v="v-metrics">5:指标</button>
+  <button data-v="v-share">6:手机访问</button>
 </div>
 
 <script>
@@ -851,6 +1433,10 @@ const SPRITES={
   trophy:P(8,16,'<rect x="2" y="1" width="4" height="3"/><rect x="1" y="1" width="1" height="2"/><rect x="6" y="1" width="1" height="2"/><rect x="3" y="4" width="2" height="1"/><rect x="2" y="5" width="4" height="2"/>'),
   chest:P(8,16,'<rect x="1" y="1" width="6" height="2"/><rect x="1" y="3" width="6" height="4"/><rect x="3" y="4" width="2" height="2" fill="var(--bg)"/>'),
   alert:P(8,16,'<rect x="3" y="0" width="2" height="5"/><rect x="3" y="6" width="2" height="2"/>'),
+  /* 台账 / 灯板 / 扫码三枚页签图元（theme-6-pixel.md §2.3 sprite 表） */
+  chart:P(8,16,'<rect x="0" y="6" width="2" height="2"/><rect x="3" y="3" width="2" height="5"/><rect x="6" y="0" width="2" height="8"/>'),
+  key:P(8,16,'<rect x="0" y="2" width="4" height="4"/><rect x="2" y="3" width="2" height="2" fill="var(--bg)"/><rect x="4" y="3" width="4" height="1"/><rect x="6" y="4" width="1" height="1"/><rect x="4" y="5" width="2" height="1"/>'),
+  phone:P(8,16,'<rect x="2" y="0" width="4" height="8"/><rect x="3" y="1" width="2" height="5" fill="var(--bg)"/><rect x="3" y="7" width="2" height="1"/>'),
   foreman:P(16,48,
     '<rect x="5" y="0" width="6" height="2" fill="var(--pending)"/>'+
     '<rect x="3" y="2" width="10" height="2" fill="var(--pending)"/>'+
@@ -899,7 +1485,35 @@ function wireTabs(tid){
   });
 }
 wireTabs('tabs-run');wireTabs('tabs-ap');
-if(location.hash&&document.querySelector('.demo button[data-v="'+location.hash.slice(1)+'"]'))show(location.hash.slice(1));
+/* 二维码占位：真实 QR 由后端 /server-info/qr.svg 渲染（决策 167），原型只画一枚
+   21×21 的像素示意（三角定位符 + 固定种子的伪随机码点），避免前端引 QR 库。 */
+(function(){
+  const box=document.getElementById('qr');if(!box)return;
+  const N=21,S=8,seed=20260913;let s=seed;
+  const rnd=()=>((s=(s*1103515245+12345)&0x7fffffff)>>>16)&1;
+  const finder=(x,y)=>{
+    for(let j=0;j<7;j++)for(let i=0;i<7;i++){
+      const edge=j===0||j===6||i===0||i===6, core=j>=2&&j<=4&&i>=2&&i<=4;
+      if(edge||core)rect(x+i,y+j);
+    }
+  };
+  let out='';
+  const rect=(x,y)=>out+=`<rect x="${x*S}" y="${y*S}" width="${S}" height="${S}"/>`;
+  for(let y=0;y<N;y++)for(let x=0;x<N;x++){
+    const inFinder=(x<7&&y<7)||(x>=N-7&&y<7)||(x<7&&y>=N-7);
+    if(inFinder)continue;
+    if(rnd())rect(x,y);
+  }
+  finder(0,0);finder(N-7,0);finder(0,N-7);
+  box.innerHTML=`<svg viewBox="0 0 ${N*S} ${N*S}" width="220" height="220" shape-rendering="crispEdges" fill="#111" aria-label="扫码访问 http://192.168.1.24:7830">${out}</svg>`;
+})();
+/* hash 直达 + 前进/后退（与移动款一致） */
+function fromHash(){
+  const id=location.hash.slice(1);
+  if(document.querySelector('.demo button[data-v="'+id+'"]'))show(id);
+}
+fromHash();
+window.addEventListener('hashchange',fromHash);
 </script>
 </body>
 </html>
