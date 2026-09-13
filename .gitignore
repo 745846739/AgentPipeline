@@ -18,5 +18,5 @@ crates/desktop/gen/schemas/
 # 并行子代理工作树（临时）
 .worktrees/
 
-# 原型截图（可由 .scratch/shots/capture.mjs / capture-pixel.mjs 重新生成，不入库）
-.scratch/shots/*.png
+# 原型截图与真应用截图（可由 .scratch/shots/capture*.mjs / e2e/screenshots.spec.ts 重新生成，不入库）
+.scratch/shots/**/*.png

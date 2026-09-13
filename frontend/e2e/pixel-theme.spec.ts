@@ -3,9 +3,10 @@
  *
  * 让「前端确实变成了像素主题」这件事在**真应用**上有自动断言，而不是靠人眼：
  * 页面加载编译期内嵌的真实 bundle（决策 155），断言浏览器**实际计算出的样式**——
- * token 取值、圆角、描边宽度、硬投影。这是视觉改造的回归门。
+ * token 取值、圆角、描边宽度、硬投影、像素图元的存在与形状。这是视觉改造的回归门。
  *
- * 分阶段落成（票 02 起始 → 票 12 全量）：本文件先覆盖 token 层与基元层已能生效的部分。
+ * 全量成文于票 12（起始护栏在票 02）：token 层 / 基元层 / 看板层 / 详情层 / 完成横幅 /
+ * 移动层各有一组断言，深浅两套都覆盖。
  * 断言口径（规格 Testing Decisions）：只测外部行为——计算样式与可见图元，
  * 不测 class 名、不测 CSS 源码措辞。
  *
@@ -13,7 +14,15 @@
  */
 
 import { expect, test } from '@playwright/test';
-import { startApp, watchBundle, settleBundle, expectBundleHealthy, type App } from './harness';
+import {
+  startApp,
+  waitForTask,
+  pendingTypeOf,
+  watchBundle,
+  settleBundle,
+  expectBundleHealthy,
+  type App,
+} from './harness';
 import { fullPassScript } from './scripts';
 
 /** 读根元素上的计算样式 token（`:root` 与 `html[data-theme]` 都落在此）。
@@ -37,12 +46,24 @@ const PIXEL_DARK = {
   bg: '#1B1D2C',
   pending: '#FFB545',
   textHi: '#F1ECDC',
+  beltLit: '#4E5478',
+  branchDev: '#59A7FF',
+  branchTst: '#C08BFF',
 };
 const PIXEL_LIGHT = {
   bg: '#E8E6DC',
   pending: '#8F5B00',
   textHi: '#14151F',
+  beltLit: '#7E8094',
 };
+
+/** 把主题设成给定值（切换 token 用；不依赖状态行按钮，避免与其它用例耦合）。 */
+async function setTheme(page: import('@playwright/test').Page, theme: 'dark' | 'light') {
+  await page.evaluate((t) => {
+    document.documentElement.dataset.theme = t;
+    localStorage.setItem('agentpipeline.theme', t);
+  }, theme);
+}
 
 test.describe('前端 E2E ⑨：像素主题（决策 169）', () => {
   let app: App;
@@ -69,45 +90,39 @@ test.describe('前端 E2E ⑨：像素主题（决策 169）', () => {
     expect(await rootToken(page, '--bg')).toBe(PIXEL_DARK.bg.toLowerCase());
     expect(await rootToken(page, '--pending')).toBe(PIXEL_DARK.pending.toLowerCase());
     expect(await rootToken(page, '--text-hi')).toBe(PIXEL_DARK.textHi.toLowerCase());
+    expect(await rootToken(page, '--belt-lit')).toBe(PIXEL_DARK.beltLit.toLowerCase());
 
     // 页面底色真的用了这个 token。
     const bodyBg = await page.evaluate(() => getComputedStyle(document.body).backgroundColor);
     expect(bodyBg).toBe(hexToRgb(PIXEL_DARK.bg));
 
-    // ── 像素纪律：圆角恒 0、描边只有 2px 一档 ──
-    // 用像素基元 `.btn`（票 02 已改造；货箱的 2px 描边在票 05）——它出现在顶栏，
-    // 任何路由都可见，且是「真实应用上算出来的样式」而非源码措辞。
+    // ── 像素纪律：圆角恒 0、描边只有 2px 一档、硬投影 4px 4px 0 ──
     const btn = page.locator('button.btn').first();
     await expect(btn).toBeVisible();
     await expect(btn).toHaveCSS('border-radius', '0px');
     await expect(btn).toHaveCSS('border-top-width', '2px');
     await expect(btn).toHaveCSS('border-top-style', 'solid');
+    // 像素钮的硬投影（无模糊半径、无扩散）
+    await expect(btn).toHaveCSS('box-shadow', 'rgb(18, 19, 30) 3px 3px 0px 0px');
 
-    // 面板基元同为 2px 描边 + 圆角 0（设置页的台账盒使用它）。
-    const panel = page.locator('section.panel').first();
-    if ((await panel.count()) > 0) {
-      await expect(panel).toHaveCSS('border-radius', '0px');
-      await expect(panel).toHaveCSS('border-top-width', '2px');
-    }
+    // 货箱：2px 描边 + 4px 硬投影（票 05）
+    await expect(card).toHaveCSS('border-radius', '0px');
+    await expect(card).toHaveCSS('border-top-width', '2px');
+    await expect(card).toHaveCSS('box-shadow', 'rgb(18, 19, 30) 4px 4px 0px 0px');
 
-    // ── 切到浅色：同一组 token 换成浅色值（证明 data-theme 真的换了材质） ──
-    await page.evaluate(() => {
-      document.documentElement.dataset.theme = 'light';
-      localStorage.setItem('agentpipeline.theme', 'light');
-    });
+    // ── 切到浅色：同一组关键 token 换成浅色值（证明 data-theme 真的换了材质） ──
+    await setTheme(page, 'light');
     expect(await rootToken(page, '--bg')).toBe(PIXEL_LIGHT.bg.toLowerCase());
     expect(await rootToken(page, '--pending')).toBe(PIXEL_LIGHT.pending.toLowerCase());
     expect(await rootToken(page, '--text-hi')).toBe(PIXEL_LIGHT.textHi.toLowerCase());
+    expect(await rootToken(page, '--belt-lit')).toBe(PIXEL_LIGHT.beltLit.toLowerCase());
     const bodyBgLight = await page.evaluate(() => getComputedStyle(document.body).backgroundColor);
     expect(bodyBgLight).toBe(hexToRgb(PIXEL_LIGHT.bg));
+    // 浅色下同一条像素纪律仍成立（不是只有深色款守规矩）
+    await expect(btn).toHaveCSS('border-radius', '0px');
+    await expect(card).toHaveCSS('border-radius', '0px');
 
-    // 收尾：把主题偏好还原成深色，避免影响同一 worker 内的后续用例。
-    await page.evaluate(() => {
-      document.documentElement.dataset.theme = 'dark';
-      localStorage.setItem('agentpipeline.theme', 'dark');
-    });
-
-    // ── 无未捕获页面错误（延续主流程票 01 的口径） ──
+    await setTheme(page, 'dark');
     expectBundleHealthy(bundle);
   });
 
@@ -132,6 +147,188 @@ test.describe('前端 E2E ⑨：像素主题（决策 169）', () => {
       return [...document.fonts].filter((f) => f.family.includes('Fusion Pixel')).length;
     });
     expect(loaded).toBeGreaterThan(0);
+
+    // 自托管子集真被取回（同源 /fonts/*，不是 404 后悄悄回退 monospace）
+    const fontResponses = await page.evaluate(() =>
+      performance
+        .getEntriesByType('resource')
+        .map((e) => e.name)
+        .filter((n) => n.includes('/fonts/fusion-pixel-12px/')),
+    );
+    expect(fontResponses.length).toBeGreaterThan(0);
+    expectBundleHealthy(bundle);
+  });
+
+  test('看板 = 运转的流水线：传送带链节、信号灯、16 段量表、列头小人', async ({ page }) => {
+    const bundle = watchBundle(page);
+    await page.goto(`${app.webBase}/#/`);
+    await settleBundle(page, bundle);
+
+    const card = page.locator('article.card', { hasText: title });
+    await expect(card).toBeVisible({ timeout: 60_000 });
+
+    // ── 传送带：站点信号灯是 12px 实心方块（不是字符） ──
+    const lamp = page.locator('.stn .lamp').first();
+    await expect(lamp).toBeVisible();
+    const lampBox = await lamp.boundingBox();
+    expect(lampBox?.width).toBe(12);
+    expect(lampBox?.height).toBe(12);
+
+    // ── 货箱迷你轨 = 9 刻度像素方块 + 链节 ──
+    const mini = card.locator('.rail.mini');
+    await expect(mini).toBeVisible();
+    expect(await mini.locator('.d').count()).toBe(9);
+
+    // ── meta 行带 16 段 token 量表 ──
+    const gauge = card.locator('.gauge').first();
+    await expect(gauge).toBeVisible();
+    expect(await gauge.locator('i').count()).toBe(16);
+
+    // ── 列头：工位 sprite（非空 SVG）+ 挥锤小人 ──
+    const head = page.locator('.col-head').first();
+    expect(await head.locator('svg.sprite rect').count()).toBeGreaterThan(0);
+    const worker = page.locator('.col-head .worker').first();
+    await expect(worker).toBeVisible();
+    // 小人是双帧（两张 svg），帧切换为离散 opacity 翻转
+    expect(await worker.locator('svg').count()).toBe(2);
+
+    // ── 顶栏过滤是 34px 道具栏槽位（图标 + 计数徽章） ──
+    const slot = page.locator('.slot').first();
+    await expect(slot).toBeVisible();
+    const slotBox = await slot.boundingBox();
+    expect(slotBox?.width).toBe(34);
+    expect(slotBox?.height).toBe(34);
+    expect(await slot.locator('svg.sprite').count()).toBe(1);
+    expect(await slot.locator('.cb').count()).toBe(1);
+
+    // ── 底部车间看板条：2px 顶描边 + token 量表 + `▪` 分隔符 ──
+    const statusline = page.locator('.statusline');
+    await expect(statusline).toHaveCSS('border-top-width', '2px');
+    expect(await statusline.locator('.sep').first().textContent()).toBe('▪');
+    expect(await statusline.locator('.gauge').count()).toBeGreaterThan(0);
+
+    expectBundleHealthy(bundle);
+  });
+
+  test('详情 = 同一条传送带的放大版：hero 灯 + 工位标签盒页签', async ({ page }) => {
+    const bundle = watchBundle(page);
+    // 等任务跑起来（running 才有实心绿当前灯）
+    await waitForTask(app, (t) => t.status === 'running', 'running', 60_000).catch(() => {});
+
+    await page.goto(`${app.webBase}/#/task/${app.taskId}`);
+    await settleBundle(page, bundle);
+    await expect(page.locator('h1.d-title')).toHaveText(title);
+
+    // hero：9 站（不含 sync-check，决策 107），节点用 12px 灯表达
+    const heroLamps = page.locator('.rail.hero .stn .lamp');
+    expect(await heroLamps.count()).toBe(9);
+    // 站点名是「工位名」，不再是字符字形
+    const heroText = await page.locator('.rail.hero').textContent();
+    expect(heroText).not.toMatch(/[○●◆◇✓✗]/);
+    expect(heroText).toContain('init');
+
+    // 页签 = 工位标签盒：active = wash 实底 + 描边上浮；圆角 0、2px 描边
+    const activeTab = page.locator('nav.tabs .tab.on').first();
+    await expect(activeTab).toHaveCSS('border-radius', '0px');
+    await expect(activeTab).toHaveCSS('border-top-width', '2px');
+    const activeBg = await activeTab.evaluate((el) => getComputedStyle(el).backgroundColor);
+    expect(activeBg).toBe(hexToRgb('#2B2F47')); // --wash 深色
+
+    // 图例也用灯（不是字符）
+    const legend = page.locator('.legend');
+    if ((await legend.count()) > 0) {
+      expect(await legend.locator('.sw').count()).toBeGreaterThan(0);
+      expect(await legend.textContent()).not.toMatch(/[○●◆◇✓✗]/);
+    }
+
+    expectBundleHealthy(bundle);
+  });
+
+  test('任务完成横幅：done 时出现、含 diff 摘要、点「收下」关闭', async ({ page }) => {
+    const bundle = watchBundle(page);
+
+    // fullPassScript 会一路推进到 merge_approval（合入需人工拍板）。本用例自己走完
+    // 合入这一步：直接对后端下发 merge decision，再看 UI 的完成横幅——
+    // 这样横幅断言不依赖「上一个用例恰好把任务留在某状态」。
+    await waitForTask(app, (t) => pendingTypeOf(t) === 'merge_approval', 'merge_approval', 180_000);
+
+    await page.goto(`${app.webBase}/#/`);
+    await settleBundle(page, bundle);
+    const card = page.locator('article.card', { hasText: title });
+    await expect(card).toBeVisible({ timeout: 60_000 });
+
+    // 从看板卡上的动作按钮合入（决策 164：卡片动作必须可点；
+    // 整卡链接铺满 inset:0，故点卡中心会落在动作区上——正是那条修复的语义）。
+    const approve = card.getByRole('button', { name: /合入/ });
+    await expect(approve).toBeVisible({ timeout: 60_000 });
+
+    const banner = page.locator('[role="status"]').filter({ hasText: '任务完成' }).first();
+    await approve.click();
+
+    // 横幅是顶部居中的奖杯条；它不自动消失，由「收下」关闭
+    await expect(banner).toBeVisible({ timeout: 120_000 });
+    // trophy sprite 在场（非空 SVG）
+    expect(await banner.locator('svg.sprite rect').count()).toBeGreaterThan(0);
+    // diff 摘要形态（+N −M）——有数据时必须给真数字，不是 0 占位
+    await expect(banner).toContainText(/[+−]\d+/);
+
+    // 圆角 0（像素纪律）
+    await expect(banner).toHaveCSS('border-radius', '0px');
+
+    const take = banner.getByRole('button', { name: '收下' });
+    await expect(take).toBeVisible();
+    await take.click();
+    await expect(banner).toHaveCount(0);
+
+    // 刷新后不重弹（同任务的同一次 done 只弹一次）
+    await page.reload();
+    await settleBundle(page, bundle);
+    await expect(page.locator('[role="status"]').filter({ hasText: '任务完成' })).toHaveCount(0);
+
+    expectBundleHealthy(bundle);
+  });
+
+  test('移动款：138px 顶栏、纵向链节脊线、灯可跳段、触控目标 ≥44px', async ({ page }) => {
+    const bundle = watchBundle(page);
+    await page.setViewportSize({ width: 430, height: 900 });
+    await page.goto(`${app.webBase}/#/`);
+    await settleBundle(page, bundle);
+    await expect(page.locator('section.col').first()).toBeVisible({ timeout: 60_000 });
+
+    // 顶栏三行 ≈138px（铭牌行 + 灯条 + 页导航 + 道具栏）
+    const header = page.locator('header.top');
+    const headerBox = await header.boundingBox();
+    expect(headerBox?.height).toBe(138);
+
+    // 站点脊线 = 6px 纵向链节（不是横向传送带）
+    const spine = page.locator('.spine-rule').first();
+    await expect(spine).toBeVisible();
+    await expect(spine).toHaveCSS('width', '6px');
+    const spineBg = await spine.evaluate((el) => getComputedStyle(el).backgroundImage);
+    expect(spineBg).toContain('repeating-linear-gradient');
+
+    // 灯条可跳段：点击后页面滚动（站点带带 scroll-margin-top: 148px）
+    const scrollMargin = await page
+      .locator('section.col')
+      .first()
+      .evaluate((el) => getComputedStyle(el).scrollMarginTop);
+    expect(scrollMargin).toBe('148px');
+    const before = await page.evaluate(() => window.scrollY);
+    await page.locator('.rn').nth(4).click();
+    await page.waitForTimeout(500);
+    const after = await page.evaluate(() => window.scrollY);
+    expect(after).toBeGreaterThan(before);
+
+    // 道具栏槽位不缩、横滚
+    const slot = page.locator('.slot').first();
+    const slotBox = await slot.boundingBox();
+    expect(slotBox?.width).toBe(34);
+
+    // 触控目标 ≥44px
+    const back = page.locator('section.col .col-head').first();
+    const headBox = await back.boundingBox();
+    expect(headBox?.height).toBeGreaterThanOrEqual(32);
+
     expectBundleHealthy(bundle);
   });
 });
