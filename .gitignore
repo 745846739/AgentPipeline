@@ -7,6 +7,8 @@ web/test-results
 web/playwright-report
 .insta-pending
 frontend/node_modules/
+# 前端子目录里可能被工具生成的依赖缓存（vitest/vite 会在就近目录建 .vite）
+**/node_modules/
 frontend/dist/
 frontend/test-results/
 frontend/playwright-report/
