@@ -20,6 +20,7 @@ import type {
   NodeConversation,
 } from '../api/types';
 import { parseUnifiedDiff, type ParsedDiff } from '../lib/diff';
+import { completion } from './completion.svelte';
 import { notifications } from './notifications.svelte';
 import { notificationClassForEvent } from '../lib/notificationPolicy';
 import { StreamManager } from '../realtime/connection';
@@ -90,6 +91,9 @@ class TaskDetailStore {
         pendingReason: detail.task.pending_reason,
         refetchRequested: false,
       };
+      // 完成横幅触发源：详情页 SSE 之外的对齐 refetch（票 08）。
+      // 首次装载即已是 done → 无迁移，不弹（刷新不重弹）。
+      completion.observeAll([{ id: taskId, status: detail.task.status, title: detail.task.title }]);
       const [flow, conversations, commands] = await Promise.all([
         getFlow(taskId),
         getConversations(taskId),
@@ -118,6 +122,10 @@ class TaskDetailStore {
   handleEvent(event: Parameters<typeof reduceTaskDetail>[1]): void {
     const previousPending = this.state.pendingReason?.type;
     this.state = reduceTaskDetail(this.state, event);
+    // 完成横幅触发源：详情页 SSE 终态事件（不等 refetch）。failed / cancelled 不弹。
+    if (event.type === 'task_done') {
+      completion.note(event.task_id, 'done', this.state.task?.title);
+    }
     // 长耗时按钮：SSE 回执到达即复位（§12.11）
     this.clearBusy();
 

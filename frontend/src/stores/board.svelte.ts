@@ -4,6 +4,7 @@ import { submitAllowedAction } from '../lib/actionSubmit';
 import { notificationClassForEvent } from '../lib/notificationPolicy';
 import { StreamManager } from '../realtime/connection';
 import { emptyBoardState, reduceBoard } from '../realtime/reduce';
+import { completion } from './completion.svelte';
 import { notifications } from './notifications.svelte';
 
 /** 顶栏状态过滤（design §4）。 */
@@ -61,6 +62,9 @@ class BoardStore {
         include_archived: this.includeArchived,
       });
       this.tasks = all;
+      // 完成横幅的触发源 A：轮询对齐看到「非 done → done」迁移（票 08；
+      // 首屏装载没有迁移，刷新后不重弹）。
+      completion.observeAll(all);
       this.streamManager.sync(this.activeTaskIds);
       void this.loadPendingActions();
     } catch (err) {
@@ -167,6 +171,11 @@ class BoardStore {
   /** SSE 事件 → board 归约（§9.1 左列）。 */
   handleEvent(event: Parameters<typeof reduceBoard>[1]): void {
     this.tasks = reduceBoard(emptyBoardState(this.tasks), event).tasks;
+    // 完成横幅的触发源 B：SSE 终态事件即时弹出（不等 400ms 轮询兜底）。
+    if (event.type === 'task_done') {
+      const task = this.tasks.find((t) => t.id === event.task_id);
+      completion.note(event.task_id, 'done', task?.title);
+    }
     const cls = notificationClassForEvent(event);
     if (cls) {
       const task = this.tasks.find((t) => t.id === event.task_id);
