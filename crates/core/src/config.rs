@@ -146,6 +146,12 @@ pub struct ServerConfig {
     pub port: u16,
     /// 绑定地址（§10.6.5：`[server] host`）。只允许 IP 字面量。
     pub host: String,
+    /// 额外放行的跨源写 origin 白名单（决策 157）。缺省恒含
+    /// `http://127.0.0.1:{port}` / `http://localhost:{port}`（决策 128），本键
+    /// 用于局域网等**显式扩权**；值须为 `scheme://host[:port]`，尾部斜杠在
+    /// 归一时剥除，非法值 fail fast（决策 134）。
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub allowed_origins: Vec<String>,
 }
 
 impl Default for ServerConfig {
@@ -153,8 +159,29 @@ impl Default for ServerConfig {
         ServerConfig {
             port: 8787,
             host: "127.0.0.1".to_string(),
+            allowed_origins: Vec::new(),
         }
     }
+}
+
+/// 归一并校验一个跨源白名单 origin（决策 157）：`scheme://host[:port]`，小写化、
+/// 剥尾部斜杠。`[server] allowed_origins`（解析期）与 CLI `--allowed-origin`
+/// （启动期）共用，非法值一律报错。
+pub fn normalize_origin(raw: &str) -> std::result::Result<String, String> {
+    let trimmed = raw.trim().trim_end_matches('/');
+    let (scheme, rest) = trimmed
+        .split_once("://")
+        .ok_or_else(|| format!("origin 缺少 scheme（需 http:// 或 https://）：{raw:?}"))?;
+    let scheme = scheme.to_lowercase();
+    if scheme != "http" && scheme != "https" {
+        return Err(format!("origin scheme 仅支持 http/https：{raw:?}"));
+    }
+    if rest.is_empty() || rest.contains(['/', '\\', ' ', '?', '#']) {
+        return Err(format!(
+            "origin 只能是 scheme://host[:port]，不含路径：{raw:?}"
+        ));
+    }
+    Ok(format!("{scheme}://{rest}").to_lowercase())
 }
 
 /// `[logging] format` 的取值（§10.6.5，票 16）。
@@ -343,6 +370,10 @@ impl Config {
                  请只保留 `format`（json_file 仅为旧配置兼容）"
                     .into(),
             ));
+        }
+        for origin in &self.server.allowed_origins {
+            normalize_origin(origin)
+                .map_err(|e| Error::Config(format!("[server] allowed_origins 校验失败：{e}")))?;
         }
         Ok(())
     }
@@ -698,6 +729,47 @@ mod tests {
         assert!(Config::from_toml("[mystery]\nx = 1\n").is_err());
         assert!(Config::from_toml("[pipeline]\nnot_a_key = 1\n").is_err());
         assert!(Config::from_toml("[server]\nport = 1\nbogus = true\n").is_err());
+    }
+
+    // ── 决策 157：[server] allowed_origins ──
+
+    #[test]
+    fn allowed_origins_parse_and_normalize() {
+        let cfg = Config::from_toml(
+            r#"
+            [server]
+            allowed_origins = ["HTTP://192.168.1.10:8787/", "https://ap.example.local"]
+            "#,
+        )
+        .unwrap();
+        // 原值按用户写法保留；归一（小写化 / 剥尾斜杠）发生在 serve 注入前
+        assert_eq!(
+            cfg.server.allowed_origins,
+            vec!["HTTP://192.168.1.10:8787/", "https://ap.example.local"]
+        );
+        assert_eq!(
+            normalize_origin("HTTP://192.168.1.10:8787/").unwrap(),
+            "http://192.168.1.10:8787"
+        );
+        assert_eq!(
+            normalize_origin("  https://AP.Example.local  ").unwrap(),
+            "https://ap.example.local"
+        );
+    }
+
+    #[test]
+    fn allowed_origins_invalid_values_fail_fast() {
+        for bad in [
+            "ftp://192.168.1.10:8787", // scheme 不支持
+            "192.168.1.10:8787",       // 缺 scheme
+            "http://host/path",        // 带路径
+        ] {
+            let toml = format!("[server]\nallowed_origins = [\"{bad}\"]\n");
+            assert!(
+                Config::from_toml(&toml).is_err(),
+                "非法 origin 应 fail fast：{bad}"
+            );
+        }
     }
 
     #[test]

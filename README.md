@@ -24,8 +24,31 @@ axum 同源托管 UI 与 API，浏览器打开 `http://127.0.0.1:8787` 即用（
 - 不装 Node 也能 `cargo build --release`：API 照常可用，访问 `/` 会得到「前端未构建」提示页（决策 155）。
 - 前端热更开发：`cd frontend && npm run dev`（vite 把 API 代理到本机 axum，见 frontend/vite.config.ts）。
 
+### 桌面形态（Tauri 壳，决策 156）
+
+```bash
+make desktop       # 出 AgentPipeline.app（crates/desktop/target/release/bundle/macos/）
+make desktop-run   # debug 壳直接跑，窗口导航到内嵌同源服务
+```
+
+桌面壳只是外壳：壳内调用 `app::serve(ServeOptions)`（`port_override = Some(0)`）随机端口起服，窗口加载
+`http://127.0.0.1:{port}`（同源零 CORS），传输层与 web 形态完全一致（决策 153）。
+壳是独立 workspace（自带 Cargo.lock），tauri 依赖树不进 `just lint / test` 闸门。
+
 数据全部落在 `~/.agentpipeline/`（可用环境变量 `AGENTPIPELINE_HOME` 覆盖，测试即靠它隔离）。
 首次启动后到 `POST /providers` 配置一个 provider，才能创建任务（未配置时创建任务会明确报错，决策 56）。
+
+### 局域网访问（决策 157）
+
+写操作受跨源防护（决策 128），开放局域网需同时绑定 `0.0.0.0` 并**显式放行**访问端页面的 origin：
+
+```bash
+./target/release/agent-pipeline serve --host 0.0.0.0 --allowed-origin http://192.168.1.10:8787
+```
+
+`--allowed-origin` 可重复（配置文件等价写法 `[server] allowed_origins = [...]`，非法值启动即报错）；
+`127.0.0.1` / `localhost` 恒放行，前缀伪装（`...:8787.evil.com`）始终被拦。
+注意：服务能触发真实 LLM 调用并读取全部会话，暴露到局域网前请自行评估网段安全（更稳妥可用 SSH 隧道 / Tailscale）。
 
 ## 质量闸门
 

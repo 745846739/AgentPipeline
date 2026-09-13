@@ -1,0 +1,21 @@
+{
+  "$schema": "https://schema.tauri.app/config/2",
+  "productName": "AgentPipeline",
+  "version": "0.1.0",
+  "identifier": "com.agentpipeline.desktop",
+  "build": {
+    "frontendDist": "./shell-assets"
+  },
+  "app": {
+    "withGlobalTauri": false,
+    "windows": [],
+    "security": {
+      "csp": null
+    }
+  },
+  "bundle": {
+    "active": true,
+    "targets": ["app"],
+    "icon": ["icons/icon.png", "icons/icon.icns"]
+  }
+}

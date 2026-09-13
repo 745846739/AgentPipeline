@@ -1,0 +1,22 @@
+[package]
+name = "agent-pipeline-desktop"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.80"
+license = "MIT"
+description = "AgentPipeline 桌面壳：Tauri 2 外壳，传输层复用内嵌 axum 同源服务（决策 153 / 156）"
+
+# 独立 workspace（决策 156）：不进根 workspace——tauri 依赖树不进 just lint / test
+# 的编译成本（决策 155 的闸门轻量原则），本 crate 自带 Cargo.lock。
+[workspace]
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+app = { path = "../app" }
+tauri = { version = "2", features = [] }
+tauri-plugin-single-instance = "2"
+# ServerHandle 的公开字段类型（watch::Sender / JoinHandle）来自 tokio，
+# 壳代码直接触碰这些类型，必须显式声明依赖。
+tokio = { version = "1", default-features = false }

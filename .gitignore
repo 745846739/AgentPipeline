@@ -11,6 +11,10 @@ frontend/dist/
 frontend/test-results/
 frontend/playwright-report/
 
+# 桌面壳独立 workspace 的构建产物（决策 156；Cargo.lock / shell-assets / icons 入库）
+crates/desktop/target/
+crates/desktop/gen/schemas/
+
 # 并行子代理工作树（临时）
 .worktrees/
 

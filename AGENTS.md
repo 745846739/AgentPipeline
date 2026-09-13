@@ -2,7 +2,7 @@
 
 AgentPipeline：kanban 式流水线驱动的本地多 agent 开发管线（init → architect-design → develop-design / test-design 并行 → sync-check → develop → review → test → merge → done）。
 
-设计文档入口见 [docs/README.md](docs/README.md)（含章节编号 §N ↔ 文件对照表）；术语表 [docs/glossary.md](docs/glossary.md)；决策日志 [docs/decisions.md](docs/decisions.md)（#1–155，只追加）。改代码前先读 [docs/testing.md](docs/testing.md) 的用例目录与四条可测试性接缝（决策 143）。
+设计文档入口见 [docs/README.md](docs/README.md)（含章节编号 §N ↔ 文件对照表）；术语表 [docs/glossary.md](docs/glossary.md)；决策日志 [docs/decisions.md](docs/decisions.md)（#1–157，只追加）。改代码前先读 [docs/testing.md](docs/testing.md) 的用例目录与四条可测试性接缝（决策 143）。
 
 ## Agent skills
 

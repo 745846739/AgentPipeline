@@ -38,6 +38,10 @@ async fn api() -> Api {
 }
 
 async fn api_with(settings: Settings) -> Api {
+    api_with_origins(settings, Vec::new()).await
+}
+
+async fn api_with_origins(settings: Settings, extra_origins: Vec<String>) -> Api {
     let home = TestHome::new().unwrap();
     let (store, _clock) = home.setup().await.unwrap();
     let repo = Repo::clean().unwrap();
@@ -61,11 +65,11 @@ async fn api_with(settings: Settings) -> Api {
     // 端口 0 会让 allowed_origins 变成 http://127.0.0.1:0；测试显式用 PORT
     let resumes = Arc::new(AtomicUsize::new(0));
     let hook_resumes = resumes.clone();
-    let state = AppState::new(store, home.home().clone(), settings, PORT).with_resume_hook(
-        Arc::new(move |_task_id| {
+    let state = AppState::new(store, home.home().clone(), settings, PORT)
+        .with_resume_hook(Arc::new(move |_task_id| {
             hook_resumes.fetch_add(1, Ordering::SeqCst);
-        }),
-    );
+        }))
+        .with_allowed_origins(extra_origins);
     let router = build_router(state.clone());
     Api {
         _home: home,
@@ -1092,6 +1096,49 @@ async fn cross_origin_guard_matrix() {
         StatusCode::OK,
         "SSE / GET 不受跨源防护影响（决策 128）"
     );
+}
+
+/// 决策 157：配置 / CLI 扩权的 origin 放行，且只放行**精确匹配**的那一个——
+/// 未配置的局域网 origin 与前缀伪装仍被拦。
+async fn post_retry_with_origin(api: &Api, origin: &str) -> (StatusCode, Value) {
+    call(
+        api,
+        request("POST", "/tasks/t1/retry")
+            .header(header::ORIGIN, origin)
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from("{}"))
+            .unwrap(),
+    )
+    .await
+}
+
+#[tokio::test]
+async fn cross_origin_allows_configured_extra_origin_only() {
+    let api = api_with_origins(
+        Settings {
+            pending_resume_cooldown_sec: 5,
+            ..Default::default()
+        },
+        vec!["http://192.168.1.50:8787".into()],
+    )
+    .await;
+    seed(&api, "t1").await;
+
+    // ① 配置过的局域网 origin → 过
+    let (status, _) = post_retry_with_origin(&api, "http://192.168.1.50:8787").await;
+    assert_ne!(status, StatusCode::FORBIDDEN, "扩权 origin 应放行");
+
+    // ② 缺省本机 origin 仍放行
+    let (status, _) = post_retry_with_origin(&api, "http://localhost:8787").await;
+    assert_ne!(status, StatusCode::FORBIDDEN);
+
+    // ③ 未配置的局域网 origin → 403
+    let (status, body) = post_retry_with_origin(&api, "http://192.168.1.51:8787").await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
+
+    // ④ 扩权 origin 的前缀伪装仍拦
+    let (status, body) = post_retry_with_origin(&api, "http://192.168.1.50:8787.evil.com").await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
 }
 
 // ─────────────────────────── SSE 通道（决策 76 / 84 / 123）───────────────────────────

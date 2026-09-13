@@ -7,7 +7,7 @@
 use std::sync::Arc;
 
 use agentpipeline_core::clock::SystemClock;
-use agentpipeline_core::config::{Config, LogFormat};
+use agentpipeline_core::config::{normalize_origin, Config, LogFormat};
 use agentpipeline_core::home::{
     check_permissions, restrict_file_permissions, restrict_permissions, Home,
 };
@@ -51,11 +51,23 @@ pub async fn bind_listener(
     Ok((listener, bound))
 }
 
+/// serve 的启动参数（决策 157）：CLI 覆盖项与扩权 origin；`None` / 空表回落配置文件。
+#[derive(Debug, Default, Clone)]
+pub struct ServeOptions {
+    /// CLI `--port`；`0` = 内核随机分配。
+    pub port_override: Option<u16>,
+    /// CLI `--host`（局域网访问用 `0.0.0.0`）；缺省回落 `[server] host`。
+    pub host_override: Option<String>,
+    /// CLI `--allowed-origin` 注入的额外放行 origin（已归一）；
+    /// 与 `[server] allowed_origins` 取并集，缺省本机集合恒在（决策 128）。
+    pub extra_allowed_origins: Vec<String>,
+}
+
 /// 以给定配置启动服务，返回可读回真实端口的句柄。
 ///
-/// `port_override` 为 `None` 时回落 `[server] port`（§10.6.5）；`0` 表示由内核分配，
-/// 真实端口经 [`ServerHandle::port`] 与启动日志给出（决策 153⑤）。
-pub async fn serve(port_override: Option<u16>) -> anyhow::Result<ServerHandle> {
+/// [`ServeOptions::port_override`] 为 `None` 时回落 `[server] port`（§10.6.5）；
+/// `0` 表示由内核分配，真实端口经 [`ServerHandle::port`] 与启动日志给出（决策 153⑤）。
+pub async fn serve(options: ServeOptions) -> anyhow::Result<ServerHandle> {
     let home = Home::from_env();
     home.ensure_dirs()?;
     let config = Config::load(&home.config_path())?;
@@ -100,9 +112,21 @@ pub async fn serve(port_override: Option<u16>) -> anyhow::Result<ServerHandle> {
         tracing::warn!(?report.demoted_providers, "不受支持的 vendor 已降级 enabled=0");
     }
 
-    // CLI --port > [server] port（§10.6.5 的配置此前被硬编码架空，决策 128 修订同批对齐）
+    // CLI --port / --host > [server] port / host（§10.6.5 的配置此前被硬编码架空，
+    // 决策 128 修订同批对齐；决策 157 补 allowed_origins 并集）
     let server = config.server.clone();
-    let port = port_override.unwrap_or(server.port);
+    let port = options.port_override.unwrap_or(server.port);
+    let host = options.host_override.clone().unwrap_or(server.host.clone());
+    let mut extra_origins =
+        Vec::with_capacity(server.allowed_origins.len() + options.extra_allowed_origins.len());
+    for raw in server
+        .allowed_origins
+        .iter()
+        .chain(options.extra_allowed_origins.iter())
+    {
+        extra_origins
+            .push(normalize_origin(raw).map_err(|e| anyhow::anyhow!("allowed_origin 无效：{e}"))?);
+    }
 
     // 停机信号（决策 54）：一处广播，三处消费——axum、tick 循环、维护循环。
     let (shutdown_tx, mut shutdown_rx) = tokio::sync::watch::channel(false);
@@ -115,12 +139,13 @@ pub async fn serve(port_override: Option<u16>) -> anyhow::Result<ServerHandle> {
 
     // 先绑定再建 state：端口 0 时把内核分配的真实端口交给 AppState，
     // 决策 128 的本机 origin 白名单必须用真实端口（用 0 会拒掉桌面壳的同源请求）。
-    let (listener, bound) = bind_listener(&server.host, port).await?;
+    let (listener, bound) = bind_listener(&host, port).await?;
 
     let state = AppState::new(store, home, settings, bound.port())
         .with_sse(sse)
         .with_executor(runtime.executor())
-        .with_resume_hook(runtime.resume_hook.clone());
+        .with_resume_hook(runtime.resume_hook.clone())
+        .with_allowed_origins(extra_origins);
     let router = build_router(state);
 
     tracing::info!(%bound, port = bound.port(), "AgentPipeline 已启动");

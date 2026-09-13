@@ -30,6 +30,8 @@ pub struct AppState {
     pub executor: Option<Arc<Executor>>,
     /// 绑定端口，用于跨源防护的本机 origin 判定（决策 128）。
     pub port: u16,
+    /// 配置 / CLI 注入的额外放行 origin（决策 157），与缺省本机集合合并。
+    pub extra_allowed_origins: Vec<String>,
 }
 
 impl AppState {
@@ -42,6 +44,7 @@ impl AppState {
             resume_hook: Arc::new(|_| {}),
             executor: None,
             port,
+            extra_allowed_origins: Vec::new(),
         }
     }
 
@@ -63,12 +66,21 @@ impl AppState {
         self
     }
 
-    /// 本机允许的 origin 集合（决策 128）。
+    /// 注入额外放行的跨源写 origin（决策 157：局域网 / 桌面壳显式扩权）。
+    /// 传入值应已过 `normalize_origin` 归一。
+    pub fn with_allowed_origins(mut self, origins: Vec<String>) -> Self {
+        self.extra_allowed_origins = origins;
+        self
+    }
+
+    /// 本机允许的 origin 集合（决策 128）：缺省本机两个 + 配置 / CLI 扩权（决策 157）。
     pub fn allowed_origins(&self) -> Vec<String> {
-        vec![
+        let mut origins = vec![
             format!("http://127.0.0.1:{}", self.port),
             format!("http://localhost:{}", self.port),
-        ]
+        ];
+        origins.extend(self.extra_allowed_origins.iter().cloned());
+        origins
     }
 }
 
