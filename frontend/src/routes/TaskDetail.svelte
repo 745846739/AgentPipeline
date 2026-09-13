@@ -58,6 +58,9 @@
     detail.cursors.find((c) => c.status !== 'archived') ?? detail.cursors[0],
   );
   const pendingType = $derived(pendingReason?.type ?? null);
+  const durationMs = $derived(
+    task ? Math.max(0, Date.parse(task.updated_at) - Date.parse(task.created_at)) : 0,
+  );
   const showDiffTab = $derived(
     pendingType === 'merge_approval' ||
       pendingType === 'human_review' ||
@@ -160,11 +163,11 @@
 
 {#snippet statusMarker()}
   {#if isPending}
-    ⏸ pending · {pendingLabel(pendingReason)}
+    <span class="st wait">pending</span> ▪ {pendingLabel(pendingReason)}
   {:else if task?.status === 'running'}
-    <span class="st run">[RUN]</span>
+    <span class="st run">running</span>
   {:else}
-    {task?.status}
+    <span class="st dim">{task?.status}</span>
   {/if}
 {/snippet}
 
@@ -213,13 +216,13 @@
         <div class="dmeta">
           <span class="status" class:pending={isPending} class:run={!isPending && !isTerminal}>
             {#if isPending}
-              ⏸ pending · {pendingLabel(pendingReason)}
+              <span class="st wait">pending</span> ▪ {pendingLabel(pendingReason)}
             {:else}
-              {task.status}
+              <span class="st {isTerminal ? 'dim' : 'run'}">{task.status}</span>
               {#if focalCursor && !isTerminal}· {focalCursor.branch}.{focalCursor.node}{/if}
             {/if}
           </span>
-          <span>⏱ {formatDuration(Math.max(0, Date.parse(task.updated_at) - Date.parse(task.created_at)))}</span>
+          <span>{formatDuration(durationMs)}</span>
           <span>{formatTokens(task.total_tokens)} tok · {task.total_calls} 次调用</span>
           <span class="mono">{task.id}</span>
         </div>
@@ -230,17 +233,18 @@
           <div class="dmeta">
             <span class="status" class:pending={isPending} class:run={!isPending && !isTerminal}>
               {#if isPending}
-                ⏸ pending · {pendingLabel(pendingReason)}
+                <span class="st wait">pending</span>
+                <span class="sep">▪</span>{pendingLabel(pendingReason)}
               {:else}
-                {#if task.status === 'running'}<span class="st run">[RUN]</span>{/if}
-                {task.status}
+                <span class="st {isTerminal ? 'dim' : 'run'}">{task.status}</span>
                 {#if focalCursor && !isTerminal}· {focalCursor.branch}.{focalCursor.node}{/if}
               {/if}
             </span>
-            <span>⏱ {formatDuration(Math.max(0, Date.parse(task.updated_at) - Date.parse(task.created_at)))}</span>
-            <span>{formatTokens(task.total_tokens)} tok · {task.total_calls} 次调用</span>
+            <span class="big num">{formatDuration(durationMs)}</span>
+            <span class="big num">{formatTokens(task.total_tokens)}<span class="unit">tok</span></span>
+            <span>{task.total_calls} 次调用</span>
             <span class="mono">{task.id}</span>
-            {#if task.branch_name}<span>{task.branch_name}</span>{/if}
+            {#if task.branch_name}<span class="mono">{task.branch_name}</span>{/if}
             <span>评审：{task.review_mode}</span>
             {#if task.model_override}<span class="mono">model: {task.model_override}</span>{/if}
           </div>
@@ -251,25 +255,36 @@
       <div class="hero-rail">
         <PipelineRail variant={isMobile ? 'vrail' : 'hero'} stations={heroStations} />
       </div>
-      <div class="legend">节点状态 ─ ✓ 已完成 · ● 执行中 · ○ 未开始 · ⏸ pending · ✗ 失败 · ↩ 已打回</div>
+      {#if !isMobile}
+        <!-- 图例：灯即状态（不使用 ✓ ● ○ 字符；与 hero 同一套信号灯图元） -->
+        <div class="legend">
+          <span class="lbl">灯</span>
+          <i class="sw d"></i><span class="lg">已完成</span>
+          <i class="sw c"></i><span class="lg">执行中</span>
+          <i class="sw idle"></i><span class="lg">未开始</span>
+          <i class="sw w"></i><span class="lg">急停</span>
+          <i class="sw x"></i><span class="lg">失败</span>
+          <span class="lg dash">↩ 已打回</span>
+        </div>
+      {/if}
 
       {#if detail.terminal}
         <div class="terminal {detail.terminal}">任务已{detail.terminal === 'done' ? '完成' : detail.terminal === 'failed' ? '失败' : '取消'}。</div>
       {/if}
 
-      <nav class="tabs" class:no-scrollbar={isMobile}>
-        <button type="button" class="tab" class:on={tab === 'timeline'} onclick={() => (tab = 'timeline')}>[时间线]</button>
+      <nav class="tabs" class:no-scrollbar={isMobile} aria-label="任务详情页签">
+        <button type="button" class="tab" class:on={tab === 'timeline'} onclick={() => (tab = 'timeline')}>时间线</button>
         <button type="button" class="tab" class:on={tab === 'conversation'} onclick={() => (tab = 'conversation')}>
-          [会话]
+          会话
         </button>
         <button type="button" class="tab" class:on={tab === 'commands'} onclick={() => (tab = 'commands')}>
-          [命令与输出 {detail.commands.length}]
+          命令与输出<span class="c">{detail.commands.length}</span>
         </button>
-        <button type="button" class="tab" class:on={tab === 'files'} onclick={() => (tab = 'files')}>[产出文件]</button>
+        <button type="button" class="tab" class:on={tab === 'files'} onclick={() => (tab = 'files')}>产出文件</button>
         {#if showDiffTab}
-          <button type="button" class="tab" class:on={tab === 'diff'} onclick={() => (tab = 'diff')}>[Diff]</button>
+          <button type="button" class="tab" class:on={tab === 'diff'} onclick={() => (tab = 'diff')}>Diff</button>
         {:else}
-          <button type="button" class="tab dis" disabled>[Diff ─ merge 后生成]</button>
+          <button type="button" class="tab dis" disabled>Diff ─ merge 后生成</button>
         {/if}
       </nav>
 
@@ -389,11 +404,12 @@
   .crumb {
     display: inline-block;
     color: var(--text-3);
-    font-size: 11.5px;
+    font-size: 12px;
     margin-bottom: 10px;
   }
   .crumb:hover {
     color: var(--text-hi);
+    text-decoration: none;
   }
   .d-head {
     display: flex;
@@ -402,18 +418,34 @@
     flex-wrap: wrap;
     margin-bottom: 6px;
   }
+  /* 标题 24px（字阶只取 12 的整数倍），像素字体无字重轴 */
   .d-title {
-    font-size: 16px;
-    font-weight: 600;
+    font-size: 24px;
     color: var(--text-hi);
+    line-height: 1.2;
   }
   .dmeta {
     display: flex;
+    align-items: baseline;
     gap: 14px;
-    font-family: var(--font-mono);
-    font-size: 11px;
+    font-size: 12px;
     color: var(--text-3);
     flex-wrap: wrap;
+  }
+  /* 大数字（时长 / token）24px 起步，配 12px 灰注（§2.2） */
+  .dmeta .big {
+    font-size: 24px;
+    line-height: 1.2;
+    color: var(--text-hi);
+  }
+  .dmeta .big .unit {
+    font-size: 12px;
+    color: var(--text-3);
+    margin-left: 2px;
+  }
+  .dmeta .sep {
+    color: var(--text-4);
+    margin: 0 3px;
   }
   .dmeta .status.run {
     color: var(--text-hi);
@@ -428,14 +460,53 @@
   .hero-rail {
     margin: 18px 0 6px;
   }
+  /* 图例：灯即状态（与 hero 信号灯同尺寸/同色，不用字符记号） */
   .legend {
-    font-size: 10.5px;
+    display: flex;
+    align-items: center;
+    flex-wrap: wrap;
+    gap: 4px 6px;
+    font-size: 12px;
     color: var(--text-4);
     margin: 4px 0 14px;
   }
+  .legend .lbl {
+    margin-right: 4px;
+  }
+  .legend .sw {
+    display: inline-block;
+    width: 12px;
+    height: 12px;
+    border: 2px solid var(--pane);
+    background: var(--bg);
+    vertical-align: -1px;
+  }
+  .legend .sw + .lg {
+    margin-right: 6px;
+  }
+  .legend .sw.d {
+    background: var(--done);
+    border-color: var(--done);
+  }
+  .legend .sw.c {
+    background: var(--go);
+    border-color: var(--go);
+  }
+  .legend .sw.w {
+    background: var(--pending);
+    border-color: var(--pending);
+  }
+  .legend .sw.x {
+    background: var(--stop);
+    border-color: var(--stop);
+  }
+  .legend .dash {
+    color: var(--text-4);
+    margin-left: 6px;
+  }
   .terminal {
     padding: 8px 12px;
-    border: 1px solid var(--pane);
+    border: 2px solid var(--pane);
     font-size: 12px;
     margin-bottom: 12px;
     color: var(--text-2);
@@ -447,37 +518,19 @@
   .terminal.done {
     border-color: var(--done);
   }
+  /* 页签：工位标签盒基元在 app.css（票 03）；此处只补详情页的排布 */
   .tabs {
-    display: flex;
-    gap: 2px;
-    border-bottom: 1px solid var(--pane);
     margin: 10px 0 16px;
-  }
-  .tab {
-    padding: 5px 12px;
-    color: var(--text-3);
-    font-size: 11.5px;
-    border-bottom: 1px solid transparent;
-    margin-bottom: -1px;
-  }
-  .tab:hover:not(.dis) {
-    color: var(--text-2);
-  }
-  .tab.on {
-    color: var(--text-hi);
-    background: var(--panel);
-  }
-  .tab.dis {
-    color: var(--text-4);
-    cursor: default;
   }
   .hint {
     color: var(--text-3);
     font-size: 12px;
   }
+  /* 横幅（断线 / 加载失败 / 动作提交失败，决策 159）：像素框，必须可见 */
   .banner {
     padding: 8px 12px;
-    border: 1px solid var(--stop);
+    border: 2px solid var(--stop);
+    background: var(--panel);
     color: var(--stop);
     font-size: 12px;
     margin-bottom: 10px;
@@ -511,7 +564,7 @@
       min-height: 42px;
       padding: 0 12px;
       margin: 0 -12px;
-      border-bottom: 1px solid var(--hairline);
+      border-bottom: 2px solid var(--hairline);
     }
     .back {
       flex: none;
@@ -519,7 +572,7 @@
       align-items: center;
       min-height: 42px;
       color: var(--text-3);
-      font-size: 13px;
+      font-size: 12px;
     }
     .back:hover {
       color: var(--text-hi);
@@ -528,7 +581,7 @@
     .d-title.bt {
       flex: 1;
       min-width: 0;
-      font-size: 15px;
+      font-size: 12px;
       color: var(--text-hi);
       overflow: hidden;
       text-overflow: ellipsis;
@@ -537,8 +590,7 @@
     .bar-row .mark {
       flex: none;
       color: var(--text-3);
-      font-weight: 600;
-      font-size: 11px;
+      font-size: 12px;
       letter-spacing: 0.06em;
       white-space: nowrap;
     }
@@ -548,9 +600,6 @@
     .bar-row .mark.run {
       color: var(--text-hi);
     }
-    .bar-row .mark .st.run {
-      font-size: 11px;
-    }
 
     .dmeta {
       display: flex;
@@ -558,12 +607,15 @@
       gap: 2px 13px;
       margin: 0 -12px;
       padding: 0 12px 8px;
-      font-size: 11.5px;
+      font-size: 12px;
       color: var(--text-3);
       font-variant-numeric: tabular-nums;
     }
     .dmeta > span {
       white-space: nowrap;
+    }
+    .dmeta .big {
+      font-size: 12px;
     }
     .dmeta .status.run {
       color: var(--text-hi);
@@ -578,16 +630,10 @@
     .hero-rail {
       margin: 12px 0 14px;
     }
-    .legend {
-      display: none;
-    }
 
-    /* 分段页签：横向滚动、可点 ≥42px、激活 2px 底边 */
+    /* 页签：基元复用 app.css 的 .tabs/.tab，移动版只加横滚与触控高度（完整转写见票 11） */
     .tabs {
-      display: flex;
-      gap: 2px;
       overflow-x: auto;
-      border-bottom: 1px solid var(--pane);
       margin: 0 0 14px;
       -webkit-overflow-scrolling: touch;
     }
@@ -597,19 +643,7 @@
       align-items: center;
       min-height: 42px;
       padding: 0 12px;
-      color: var(--text-3);
-      font-size: 13px;
       white-space: nowrap;
-      border-bottom: 2px solid transparent;
-      margin-bottom: -1px;
-    }
-    .tab.on {
-      color: var(--text-hi);
-      background: none;
-      border-bottom-color: var(--text-hi);
-    }
-    .tab.dis {
-      color: var(--text-4);
     }
   }
 </style>

@@ -39,14 +39,14 @@
 <style>
   .meta-card {
     background: var(--panel);
-    border: 1px solid var(--pane);
+    border: 2px solid var(--pane);
     border-radius: var(--r-panel);
     padding: 10px 12px;
     margin: 8px 0;
     max-width: 760px;
   }
   .title {
-    font-size: 11px;
+    font-size: 12px;
     color: var(--text-3);
     letter-spacing: 0.05em;
     margin-bottom: 6px;
@@ -55,7 +55,7 @@
     display: flex;
     gap: 12px;
     padding: 3px 0;
-    border-bottom: 1px solid var(--hairline);
+    border-bottom: 2px solid var(--hairline);
     font-size: 12px;
   }
   .row:last-child {
@@ -65,7 +65,7 @@
     flex: none;
     width: 180px;
     color: var(--text-3);
-    font-size: 11px;
+    font-size: 12px;
   }
   .val {
     color: var(--text-hi);
@@ -74,7 +74,7 @@
   }
   .raw {
     font-family: var(--font-mono);
-    font-size: 11px;
+    font-size: 12px;
     color: var(--text-hi);
     white-space: pre-wrap;
     max-height: 280px;

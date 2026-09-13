@@ -131,7 +131,8 @@
     flex-wrap: wrap;
   }
   .diffhead .big {
-    font-size: 12.5px;
+    font-size: 24px;
+    color: var(--text-hi);
   }
   .diffhead .a {
     color: var(--diff-add);
@@ -144,9 +145,9 @@
   }
   .notice {
     display: inline-block;
-    font-size: 11px;
+    font-size: 12px;
     color: var(--pending);
-    border: 1px dashed var(--pending);
+    border: 2px solid var(--pending);
     padding: 2px 10px;
     margin-bottom: 10px;
   }
@@ -159,7 +160,7 @@
     display: flex;
     flex-wrap: wrap;
     gap: 4px 14px;
-    font-size: 10.5px;
+    font-size: 12px;
     color: var(--text-3);
     margin-bottom: 10px;
   }
@@ -211,7 +212,7 @@
       order: 1;
     }
     .diffhead .big {
-      font-size: 13px;
+      font-size: 24px;
     }
     .notice {
       display: block;

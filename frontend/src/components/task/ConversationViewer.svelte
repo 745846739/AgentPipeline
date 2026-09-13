@@ -121,17 +121,18 @@
     flex-wrap: wrap;
     margin-bottom: 14px;
   }
+  /* run 药丸 = 工位标签盒的小号变体：2px 描边，当前 = wash 实底 + 描边上浮 */
   .runchip {
-    font-size: 10.5px;
+    font-size: 12px;
     padding: 2px 8px;
-    border: 1px solid var(--pane);
+    border: 2px solid var(--pane);
     color: var(--text-3);
   }
   .runchip:hover {
-    color: var(--text-2);
+    color: var(--text);
   }
   .runchip.now {
-    background: var(--panel);
+    background: var(--wash);
     color: var(--text-hi);
     border-color: var(--text-2);
   }
@@ -143,7 +144,7 @@
     justify-content: space-between;
     align-items: baseline;
     padding-bottom: 8px;
-    border-bottom: 1px solid var(--hairline);
+    border-bottom: 2px solid var(--pane);
     margin-bottom: 12px;
   }
   .convhead h3 {
@@ -152,7 +153,7 @@
   }
   .convhead .m {
     font-family: var(--font-mono);
-    font-size: 10.5px;
+    font-size: 12px;
     color: var(--text-3);
   }
   .live {
@@ -180,19 +181,17 @@
       align-items: center;
       min-height: 30px;
       padding: 0 9px;
-      font-size: 11.5px;
       white-space: nowrap;
     }
     .convhead {
       display: block;
     }
     .convhead h3 {
-      font-size: 13px;
-      font-weight: 600;
+      font-size: 12px;
     }
     .convhead .m {
       margin-top: 3px;
-      font-size: 11.5px;
+      font-size: 12px;
     }
   }
 </style>

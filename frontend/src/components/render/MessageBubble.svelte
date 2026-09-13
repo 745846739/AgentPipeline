@@ -53,10 +53,10 @@
   .msg {
     margin-bottom: 14px;
   }
+  /* 发言者行：弱灰小字 + 前缀 `▸`（装饰由 CSS 生成，是亮度编码不是状态字形） */
   .who {
     font-family: var(--font-cond);
-    font-size: 10px;
-    font-weight: 600;
+    font-size: 12px;
     letter-spacing: 0.1em;
     color: var(--text-3);
     margin-bottom: 3px;
@@ -82,16 +82,17 @@
     display: none;
   }
   .dim {
-    font-weight: 400;
     letter-spacing: 0;
     color: var(--text-3);
-    font-size: 11px;
+    font-size: 12px;
   }
+  /* system 折叠块 = 像素框（与原型 .sysbox 一致） */
   .sysbox {
-    border: 1px dashed var(--pane);
+    border: 2px solid var(--pane);
+    background: var(--bg);
     padding: 6px 10px;
     color: var(--text-3);
-    font-size: 11.5px;
+    font-size: 12px;
     font-family: var(--font-mono);
     white-space: pre-wrap;
     max-height: 320px;
@@ -117,21 +118,21 @@
       margin-bottom: 14px;
     }
     .who {
-      font-size: 11px;
+      font-size: 12px;
       margin-bottom: 4px;
     }
     .sysbox {
       padding: 8px 10px;
-      font-size: 12.5px;
+      font-size: 12px;
       max-height: none;
     }
     .userbox {
-      font-size: 12.5px;
+      font-size: 12px;
       overflow-wrap: break-word;
     }
     .msg.assistant :global(.md) {
       max-width: none;
-      font-size: 14px;
+      font-size: 12px;
     }
   }
 </style>

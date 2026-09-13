@@ -44,8 +44,7 @@
     align-items: center;
     gap: 8px;
     font-family: var(--font-mono);
-    font-size: 11.5px;
-    font-weight: 500;
+    font-size: 12px;
     color: var(--text-hi);
     margin-bottom: 6px;
   }
@@ -54,19 +53,19 @@
     text-overflow: ellipsis;
     white-space: nowrap;
   }
+  /* 文件状态徽标：2px 描边像素块（增 / 删用印刷色，其余中性） */
   .st {
     font-family: var(--font-cond);
-    font-size: 10px;
-    font-weight: 600;
+    font-size: 12px;
     letter-spacing: 0.05em;
-    padding: 1px 6px;
+    padding: 0 6px;
     border-radius: var(--r-pill);
     flex: none;
   }
   .st.modified {
     color: var(--text-2);
     background: var(--panel);
-    border: 1px solid var(--pane);
+    border: 2px solid var(--pane);
   }
   .st.added {
     color: var(--diff-add);
@@ -78,22 +77,24 @@
   }
   .fstat {
     margin-left: auto;
-    font-size: 10.5px;
+    font-size: 12px;
     color: var(--text-3);
     flex: none;
   }
+  /* diff 体：2px 描边盒，等宽、不折行可横滚（增删行用 --diff-add* / --diff-del* 印刷色） */
   .dbody {
-    border: 1px solid var(--pane);
+    border: 2px solid var(--pane);
     border-radius: var(--r-panel);
     overflow: auto;
     max-height: 520px;
     font-family: var(--font-mono);
-    font-size: 11.5px;
+    font-size: 12px;
     line-height: 1.7;
   }
   .dl {
     padding: 0 12px;
     white-space: pre;
+    min-width: max-content;
     color: var(--text-3);
   }
   .dl.add {
@@ -111,11 +112,11 @@
   .dl.meta {
     color: var(--text-3);
     background: var(--panel);
-    border-bottom: 1px solid var(--hairline);
+    border-bottom: 2px solid var(--hairline);
   }
   .raw {
     font-family: var(--font-mono);
-    font-size: 11.5px;
+    font-size: 12px;
     white-space: pre-wrap;
     color: var(--text-2);
   }

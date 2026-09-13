@@ -14,6 +14,7 @@
 </div>
 
 <style>
+  /* 工具卡：2px 左缘像素条（像素纪律：描边只有 2px 一档，不用原型 4px） */
   .toolcard {
     display: flex;
     align-items: center;
@@ -22,7 +23,7 @@
     padding: 3px 0 3px 12px;
     margin: 5px 0;
     max-width: 680px;
-    font-size: 11px;
+    font-size: 12px;
     color: var(--text-2);
   }
   .fn {
@@ -33,12 +34,11 @@
   }
   .fn b {
     color: var(--text-hi);
-    font-weight: 500;
   }
   .res {
     margin-left: auto;
     font-family: var(--font-mono);
-    font-size: 10.5px;
+    font-size: 12px;
     color: var(--text-3);
     flex: none;
   }
@@ -60,7 +60,7 @@
       padding: 5px 0 5px 10px;
       margin: 6px 0;
       max-width: none;
-      font-size: 12.5px;
+      font-size: 12px;
     }
     .fn {
       overflow: visible;
