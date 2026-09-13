@@ -3,20 +3,21 @@
   <head>
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover" />
-    <title>AgentPipeline · 调度电报</title>
+    <meta name="color-scheme" content="dark light" />
+    <title>AgentPipeline · 像素机房</title>
     <script>
-      // 主题三浅色变体「绿杠电报纸」：本地记忆，避免首屏闪回深色
+      // 深浅两套像素主题：本地记忆，避免首屏闪回深色（决策 169，键名沿用既有约定）
       try {
         var t = localStorage.getItem('agentpipeline.theme');
         if (t === 'light' || t === 'dark') document.documentElement.dataset.theme = t;
+        document.documentElement.style.colorScheme =
+          document.documentElement.dataset.theme === 'light' ? 'light' : 'dark';
       } catch (e) {}
     </script>
-    <link rel="preconnect" href="https://fonts.googleapis.com" />
-    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
-    <link
-      href="https://fonts.googleapis.com/css2?family=Fira+Code:wght@400;500;600&display=swap"
-      rel="stylesheet"
-    />
+    <!-- 缝合像素 12px 等宽：自托管 78 个 woff2 子集（同源 /fonts/…），随 dist 内嵌进
+         单二进制（决策 155 / 169）。font-display: block——字体本地加载毫秒级，
+         不让像素身份走「先 monospace 再换」。 -->
+    <link rel="stylesheet" href="/fonts/fusion-pixel-12px/fusion-pixel-12px.css" />
   </head>
   <body>
     <div id="app"></div>

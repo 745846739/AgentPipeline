@@ -63,11 +63,14 @@ test.describe('前端 E2E ②：pending → dossier 面板 → resume', () => {
     // 内嵌产物健康先于业务断言（主流程票 01）：产物坏掉时立刻报根因，而非等 60s 超时。
     await settleBundle(page, bundle);
 
-    // ── 琥珀 dossier 面板：文案 + `--pending` 色（#ffb454） ──
+    // ── 琥珀 dossier 面板：文案 + `--pending` 色 ──
+    // 像素主题（决策 169）：琥珀仍是全站唯一告警色，值由主题三的 #ffb454 换成
+    // 像素主题的 #FFB545（theme-6-pixel.md §2.1）。断言的**行为**不变——
+    // 「pending 面板是琥珀」，只是换成了像素主题的琥珀 token 值。
     const dossier = page.locator('aside.dossier');
     await expect(dossier).toBeVisible({ timeout: 60_000 });
     await expect(dossier.locator('.dtag')).toContainText('信息不足');
-    await expect(dossier.locator('.dtag')).toHaveCSS('color', 'rgb(255, 180, 84)');
+    await expect(dossier.locator('.dtag')).toHaveCSS('color', 'rgb(255, 181, 69)');
     // dossier 的正文是后端下发的 pending message（blockers 不进这个字段）
     await expect(dossier.locator('.msg')).toContainText('设计输入信息不足');
 

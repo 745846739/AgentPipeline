@@ -1,126 +1,125 @@
 /* ─────────────────────────────────────────────────────────────
-   AgentPipeline · 主题三「终端 · 调度电报」
-   design/theme-3-terminal.md §2 视觉令牌（唯一权威来源）
-   深色为默认；浅色「绿杠电报纸」经 html[data-theme="light"] 覆盖。
-   语义命名对齐 design/frontend-design.md §3；旧夜间调度台名保留为
-   惰性别名（var 惰性求值 → 自动跟随主题），供逐组件迁移期过渡。
+   AgentPipeline · 主题六「像素机房 · 夜班流水线」（决策 169）
+   design/theme-6-pixel.md §2 视觉令牌 —— 唯一权威来源。
+
+   本文件是 `src/theme/contract.ts` 的**手工镜像**：色彩 token 的值由
+   `src/theme/css-parity.test.ts` 逐条比对契约，防漂移（决策 169 不引入代码生成——
+   app.css 还承载全站基元与移动版规则，整体生成化会让手改 CSS 变成危险操作）。
+
+   深色「夜班靛」为默认；浅色「掌机背光」经 html[data-theme='light'] 覆盖。
+   语义命名沿用既有约定（--bg / --panel / --wash / --pane / --text-hi / --text …），
+   使组件与既有测试的语义口不变。
    ───────────────────────────────────────────────────────────── */
 
 :root {
-  /* §2.1 色彩 — 深色磷光 */
-  --bg: #0a0f0b; /* 磷光黑绿，页面底色 */
-  --panel: #0d130f; /* 窗格底 / hover 行底 */
-  --wash: #141c16; /* 交互态再深一档 */
-  --pane: #23392b; /* 窗格 1px 框线 */
-  --hairline: #16241b; /* 弱分隔、电文行分隔 */
-  --text-hi: #d6f2dc; /* 亮磷光：标题、当前游标、可执行物 */
-  --text: #a6d8b2; /* 正文 */
-  --text-2: #6fa481; /* 次文本 */
-  --text-3: #5e9673; /* 弱文本、列头、站点标签 */
-  --text-4: #49775a; /* 占位/装饰刻度，不承载必读信息 */
+  /* 色彩 — 深色「夜班靛」（contract.ts DARK_COLORS） */
+  --bg: #1b1d2c; /* 夜班靛：页面底色（带蓝紫的厂房夜灯色温，不是纯黑） */
+  --panel: #232639; /* 货箱面 / 对话框底 / hover 行底 */
+  --wash: #2b2f47; /* 交互再深一档：active tab、dither 用色 */
+  --pane: #3e4363; /* 2px 描边、传送带未点亮段 */
+  --ink: #12131e; /* 硬投影专用墨色（比 bg 深两档） */
+  --hairline: #232639; /* 弱分隔（移动款 / 台账行） */
 
-  --go: #8ff0a8; /* running：反白底色 */
-  --go-ink: #07120a; /* 反白前景 */
-  --go-hi: #a5f5bc; /* 主动作 hover */
-  --pending: #ffb454; /* pending / stalled（全站唯一告警） */
-  --stop: #ff7a70; /* failed / 打回 / 破坏性动作 */
-  --done: #6fa481; /* done 刻意退后 */
+  --text-hi: #f1ecdc; /* 暖纸白：标题、可执行物、当前游标（对 bg ≥ 12:1） */
+  --text: #c7c3b4; /* 正文 */
+  --text-2: #918e9f; /* 次文本（≥ 4.5:1） */
+  --text-3: #6e6c82; /* 弱文本、列头；done 的退后灰 */
+  --text-4: #55536b; /* 占位 / 装饰刻度，不承载必读信息 */
 
-  --diff-add: #6fe08f;
-  --diff-add-bg: #0f2417;
-  --diff-del: #ff8a7a;
-  --diff-del-bg: #2a1414;
+  --go: #55d97c; /* 信号灯绿「执行中」；主动作实心钮 */
+  --go-hi: #6fe693; /* 主动作 hover */
+  --go-ink: #0b2314; /* 实心钮前景 */
+  --pending: #ffb545; /* 急停琥珀：等拍板、stalled、待办计数（全站唯一告警） */
+  --stop: #ff6157; /* 失败红：打回、破坏性动作 */
+  --done: #6e6c82; /* 归档灰，刻意退后 */
 
-  /* 线路三档 + 分支（分支不用色相，用亮度阶） */
-  --br: #2e4a3a;
-  --br-done: #3f6a4e;
-  --lit: #33553f;
-  --dash: #2e4a3a;
+  --branch-dev: #59a7ff; /* develop-design 徽章蓝（仅徽章，不作状态） */
+  --branch-tst: #c08bff; /* test-design 徽章紫（同上） */
 
-  --input: #070c08;
-  --overlay: rgba(3, 7, 4, 0.74);
-  --pending-tint: rgba(255, 180, 84, 0.1);
-  --bracket: var(--text-4);
+  --diff-add: #57d97c; /* 货单印刷绿 */
+  --diff-add-bg: #16301f;
+  --diff-del: #ff7b6e; /* 货单印刷红 */
+  --diff-del-bg: #361a20;
 
-  /* 浅色款四处组件级覆盖的语义口（深色即"无"） */
-  --rail-band: none;
-  --rail-band-size: auto;
-  --rail-band-pos: 0 0;
-  --head-band: var(--bg);
-  --bar-band: var(--bg);
-  --mask-bg: var(--bg);
-  --hover-bg: var(--panel);
-  --spin-w: 1px;
+  --belt-lit: #4e5478; /* 传送带已通过段（亮度阶，不用色相） */
 
-  /* 移动版脊线三态 */
-  --spin: #23392b;
-  --spin-lit: #3f6a4e;
-  --spin-pen: #a8762a;
-  --safeb: env(safe-area-inset-bottom, 0px);
+  /* 非色彩语义口（沿用既有命名，组件与测试的语义口不变） */
+  --input: #12131e; /* 输入框底（比 pane 深） */
+  --overlay: rgba(18, 19, 30, 0.76);
+  --pending-tint: rgba(255, 181, 69, 0.1);
+  --hover-bg: var(--wash);
 
-  /* §2.2 字体：全站唯一字体 Fira Code，连字关闭 */
-  --font-code: 'Fira Code', 'SF Mono', Menlo, 'PingFang SC', 'Hiragino Sans GB', 'Noto Sans SC',
-    monospace;
-  --font-ui: var(--font-code);
-  --font-cond: var(--font-code);
-  --font-mono: var(--font-code);
-
-  /* §2.3 形状与密度：圆角 0，无投影 */
+  /* §2.3 形状与密度：圆角恒 0；描边只有 2px 一档 */
   --r-panel: 0;
   --r-pill: 0;
   --rail-col-width: 264px;
-  --detail-max: 960px;
+  --detail-max: 1000px;
+  --dossier-w: 340px;
+
+  /* 移动版安全区 */
+  --safeb: env(safe-area-inset-bottom, 0px);
+
+  /* ── 以下为主题三遗留口，待所属票迁移后删除（票 03/04/05/06/11） ── */
+  --bracket: var(--text-4); /* 票 03：方括号按钮装饰移除 */
+  --head-band: var(--bg); /* 票 11：移动段头带 */
+  --bar-band: var(--bg); /* 票 04：底栏带 */
+  --mask-bg: var(--bg); /* 票 04：信号灯缩略条遮罩底 */
+  --lit: var(--belt-lit); /* 票 04：缩略条亮线 */
+  --spin: var(--pane); /* 票 11：纵向脊线三态 */
+  --spin-lit: var(--belt-lit);
+  --spin-pen: var(--pending);
+  --spin-w: 6px;
+  --br: var(--pane); /* 票 05：字符线路行 */
+  --br-done: var(--belt-lit);
+  --dash: var(--text-4);
+  --rail-band: none;
+  --rail-band-size: auto;
+  --rail-band-pos: 0 0;
+
+  /* §2.2 字体：全站唯一字族（缝合像素 12px 等宽），连字关闭 */
+  --font-px: 'Fusion Pixel 12px Monospaced Simplified Chinese', 'SF Mono', Menlo, 'PingFang SC',
+    monospace;
+  --font-code: var(--font-px);
+  --font-ui: var(--font-px);
+  --font-cond: var(--font-px);
+  --font-mono: var(--font-px);
 }
 
-/* §2.5 浅色变体「绿杠电报纸」：层级靠墨度，不靠亮度 */
+/* 浅色变体「掌机背光」（contract.ts LIGHT_COLORS）：层级靠墨度，不靠亮度 */
 html[data-theme='light'] {
-  --bg: #f1f5ee;
-  --panel: #dde9d9;
-  --wash: #d6e4d2;
-  --pane: #a9c0a4;
-  --hairline: #d7e2d3;
-  --text-hi: #0c1f14;
-  --text: #23402e;
-  --text-2: #47614f;
-  --text-3: #4c6656;
-  --text-4: #6c8173;
+  --bg: #e8e6dc;
+  --panel: #f6f4ea;
+  --wash: #dedbce;
+  --pane: #9a97a8;
+  --ink: #2a2b3a;
+  --hairline: #d8d5c8;
 
-  --go: #1e6b41;
-  --go-ink: #f1f5ee;
-  --go-hi: #175633;
-  --pending: #8c5a0a;
-  --stop: #a32a1f;
-  --done: #47614f;
+  --text-hi: #14151f;
+  --text: #2f3040;
+  --text-2: #55566a;
+  --text-3: #7a7b8e;
+  --text-4: #9a9bac;
 
-  --diff-add: #1d6a3c;
-  --diff-add-bg: #deeddd;
-  --diff-del: #9e2a1e;
-  --diff-del-bg: #f6e0dc;
+  --go: #1f7a3c;
+  --go-hi: #175f2f;
+  --go-ink: #f6f4ea;
+  --pending: #8f5b00;
+  --stop: #b3271e;
+  --done: #7a7b8e;
 
-  --br: #8fb29a;
-  --br-done: #5e8f6c;
-  --lit: #93b69d;
-  --dash: #93b69d;
+  --branch-dev: #1d5fa8;
+  --branch-tst: #6f3bb8;
 
-  --input: #f7faf5;
-  --overlay: rgba(12, 31, 20, 0.38);
-  --pending-tint: rgba(140, 90, 10, 0.1);
-  --bracket: var(--text-3);
+  --diff-add: #1d6b3c;
+  --diff-add-bg: #ddebdd;
+  --diff-del: #a02c22;
+  --diff-del-bg: #f4deda;
 
-  /* 四处组件级覆盖：轨道带 / 列头带 / 底栏 / 站点遮罩底 */
-  --rail-band: linear-gradient(var(--pane), var(--pane)), linear-gradient(var(--pane), var(--pane)),
-    linear-gradient(var(--panel), var(--panel));
-  --rail-band-size: 100% 1px, 100% 1px, 100% 62px;
-  --rail-band-pos: 0 0, 0 61px, 0 0;
-  --head-band: var(--panel);
-  --bar-band: var(--panel);
-  --mask-bg: var(--panel);
-  --hover-bg: var(--wash);
-  --spin-w: 3px;
+  --belt-lit: #7e8094;
 
-  --spin: #cfe0ca;
-  --spin-lit: #5e9370;
-  --spin-pen: #b3812f;
+  --input: #f6f4ea;
+  --overlay: rgba(42, 43, 58, 0.42);
+  --pending-tint: rgba(143, 91, 0, 0.1);
 }
 
 * {
@@ -130,23 +129,24 @@ html[data-theme='light'] {
 }
 
 html {
-  -webkit-font-smoothing: antialiased;
+  /* §2.2 保脆：像素字体禁用平滑，否则字形会被插值糊掉 */
+  -webkit-font-smoothing: none;
+  font-smooth: never;
   text-rendering: optimizeLegibility;
 }
 
 body {
   background: var(--bg);
   color: var(--text);
-  font-family: var(--font-code);
-  font-size: 12.5px; /* 基准（§2.2 字阶） */
+  font-family: var(--font-px);
+  font-size: 12px; /* §2.2 基准 */
   line-height: 1.6;
-  /* 连字全站关闭：命令与 diff 必须逐字符可读（§2.2） */
+  /* 连字全站关闭：命令与 diff 必须逐字符可读 */
   font-feature-settings: 'calt' 0, 'liga' 0;
-  /* 底部状态行（固定 30px）+ 余量 */
-  padding-bottom: 44px;
+  /* 底部状态行（桌面 34px）+ 余量 */
+  padding-bottom: 46px;
 }
 
-/* 可执行物：亮度提升，从不弱于正文（§1 原则 4 的终端转译） */
 .mono,
 code,
 kbd,
@@ -159,13 +159,14 @@ samp {
 }
 .cond {
   font-family: var(--font-cond);
-  font-weight: 600;
-  letter-spacing: 0.06em;
+  letter-spacing: 0.08em;
 }
 
+/* 像素字体无字重轴：b/strong 只提亮，不加粗、不换字号（§2.2） */
 b,
 strong {
-  font-weight: 600;
+  font-weight: 400;
+  color: var(--text-hi);
 }
 
 button {
@@ -201,26 +202,43 @@ select {
   color: var(--go-ink);
 }
 
-/* ── 通用控件 ── */
+/* 焦点环 = 2px 硬描边（§2.2；1px 与描边档不符） */
+:focus-visible {
+  outline: 2px solid var(--text-hi);
+  outline-offset: 2px;
+}
+
+/* ── 全站唯一「渐变」：2×2 棋盘 dither ──
+   只允许出现在货箱顶盖带与已归档工位两处（§2.1 规则）。 */
+.dither {
+  background-image: conic-gradient(
+    var(--wash) 25%,
+    transparent 0 50%,
+    var(--wash) 0 75%,
+    transparent 0
+  );
+  background-size: 4px 4px;
+}
+
+/* ── 通用控件（像素钮与像素框的完整改造见票 03） ── */
 .panel {
   background: var(--panel);
-  border: 1px solid var(--pane);
+  border: 2px solid var(--pane);
   border-radius: var(--r-panel);
 }
 
-/* 方括号按钮：括号由 CSS 生成，不进 DOM/无障碍名（§3 共享元素映射） */
+/* 方括号按钮：括号由 CSS 生成，不进 DOM/无障碍名（票 03 移除装饰） */
 .btn {
   display: inline-flex;
   align-items: center;
   justify-content: center;
   gap: 4px;
   padding: 3px 6px;
-  border: 1px solid var(--pane);
+  border: 2px solid var(--pane);
   border-radius: var(--r-pill);
-  font-size: 11.5px;
+  font-size: 12px;
   color: var(--text);
   line-height: 1.5;
-  transition: color 0.12s, border-color 0.12s, background 0.12s;
 }
 .btn::before {
   content: '[ ';
@@ -246,7 +264,6 @@ select {
   background: var(--go);
   border-color: var(--go);
   color: var(--go-ink);
-  font-weight: 600;
 }
 .btn.solid::before,
 .btn.solid::after {
@@ -288,7 +305,7 @@ select {
 .input {
   width: 100%;
   background: var(--input);
-  border: 1px solid var(--pane);
+  border: 2px solid var(--pane);
   border-radius: var(--r-pill);
   color: var(--text-hi);
   font-size: 12px;
@@ -307,11 +324,10 @@ textarea.input {
   line-height: 1.5;
 }
 
-/* 状态文字标记：反白 / 琥珀 / 红 / 弱（与颜色双编码） */
+/* 状态文字标记：反白 / 琥珀 / 红 / 弱（与颜色双编码，详表见票 03） */
 .st {
-  font-weight: 600;
-  font-size: 10px;
-  letter-spacing: 0.06em;
+  font-size: 12px;
+  letter-spacing: 0.08em;
   font-style: normal;
 }
 .st.run {
@@ -331,45 +347,30 @@ textarea.input {
 
 /* 提示条（diff 基准前移等） */
 .notice {
-  font-size: 11px;
+  font-size: 12px;
   color: var(--pending);
-  border: 1px dashed var(--pending);
+  border: 2px dashed var(--pending);
   padding: 2px 10px;
 }
 
-/* 焦点环 = 1px 反白描边（终端"选中"语义，不用系统 outline，§5） */
-:focus-visible {
-  outline: 1px solid var(--text-hi);
-  outline-offset: 2px;
-}
-
-/* pending 琥珀呼吸（§2.4，2.4s） */
-@keyframes breath {
-  0%,
-  100% {
-    opacity: 1;
-  }
-  50% {
-    opacity: 0.45;
-  }
-}
-.warn-dot {
-  animation: breath 2.4s ease-in-out infinite;
-}
-
-/* 流式尾随方块光标（§2.4） */
+/* pending 琥珀急停灯闪烁（离散帧步进，§2.3 原则 4） */
 @keyframes blink {
   50% {
     opacity: 0;
   }
 }
+.warn-dot {
+  animation: blink 1s steps(2) infinite;
+}
+
+/* 流式尾随方块光标 */
 .streaming::after {
   content: '▊';
   color: var(--text-hi);
   animation: blink 0.9s steps(2) infinite;
 }
 
-/* 节点完成一次 120ms 反白闪（§2.4） */
+/* 节点完成一次反白闪（离散） */
 @keyframes flash {
   0% {
     background: var(--go);
@@ -380,7 +381,7 @@ textarea.input {
   }
 }
 .node-finish {
-  animation: flash 0.12s linear;
+  animation: flash 0.12s steps(2);
 }
 
 @media (prefers-reduced-motion: reduce) {
@@ -395,7 +396,7 @@ textarea.input {
   }
 }
 
-/* 滚动条（终端无装饰，窄条） */
+/* 滚动条：方角窄条，用 --pane（无装饰） */
 ::-webkit-scrollbar {
   width: 10px;
   height: 10px;
@@ -425,71 +426,65 @@ textarea.input {
   white-space: nowrap;
 }
 
-/* ── 移动版基线（§8：可点目标 ≥44px、输入 16px 防 iOS 聚焦缩放） ── */
+/* ── 移动版基线（§5：可点目标 ≥44px、输入 16px 防 iOS 聚焦缩放） ── */
 @media (max-width: 479px) {
   body {
-    font-size: 14px;
+    font-size: 12px;
     line-height: 1.62;
   }
   .btn {
     min-height: 44px;
     padding: 4px 10px;
-    font-size: 12.5px;
+    font-size: 12px;
   }
   .input {
     font-size: 16px;
   }
 
-  /* 纵向脊线：站段三态（深色 1px / 浅色 3px） */
+  /* 纵向脊线：站段三态（6px 纵向链节；完整转写见票 11） */
   .spine-rule {
     position: absolute;
     left: 50%;
     top: 0;
     bottom: 0;
-    width: var(--spin-w);
+    width: 6px;
     transform: translateX(-50%);
-    background: var(--spin);
+    background: repeating-linear-gradient(180deg, var(--spin) 0 6px, transparent 6px 12px);
   }
   .spine-rule.live {
-    background: var(--spin-lit);
+    background: repeating-linear-gradient(180deg, var(--spin-lit) 0 6px, transparent 6px 12px);
   }
   .spine-rule.pen {
-    background: var(--spin-pen);
+    background: repeating-linear-gradient(180deg, var(--spin-pen) 0 6px, transparent 6px 12px);
+    opacity: 0.45;
   }
 
-  /* 段头：字段条（浅色款即纸上绿杠） */
+  /* 段头：字段条 */
   .sec-head {
     display: flex;
     align-items: center;
     gap: 8px;
     padding: 6px 6px 7px 12px;
     background: var(--head-band);
-    border-bottom: 1px solid var(--pane);
+    border-bottom: 2px solid var(--hairline);
   }
   .sec-name {
     font-size: 12px;
-    font-weight: 600;
     letter-spacing: 0.08em;
-    text-transform: uppercase;
     color: var(--text-3);
   }
   .sec-rule {
     flex: 1;
-    height: 1px;
-    background: var(--pane);
+    height: 2px;
+    background: var(--hairline);
   }
   .sec-n {
-    font-size: 11px;
+    font-size: 12px;
     color: var(--text-4);
     font-variant-numeric: tabular-nums;
   }
 
-  /* 状态标记在窄屏略放大 */
-  .st {
-    font-size: 11px;
-  }
-
-  /* pending 常驻底部动作坞（浅色款同底栏走 --bar-band，theme-3 §2.5） */
+  /* pending 常驻底部动作坞 */
   .dock {
     position: fixed;
     left: 0;
@@ -497,12 +492,11 @@ textarea.input {
     bottom: 0;
     z-index: 31;
     background: var(--bar-band);
-    border-top: 1px solid var(--pending);
+    border-top: 2px solid var(--pending);
     padding: 8px 12px calc(9px + var(--safeb));
   }
   .dock-tag {
-    font-size: 11px;
-    font-weight: 600;
+    font-size: 12px;
     color: var(--pending);
     margin-bottom: 7px;
   }
@@ -525,7 +519,7 @@ textarea.input {
     display: flex;
     align-items: center;
     gap: 8px;
-    font-size: 11px;
+    font-size: 12px;
     color: var(--text-4);
   }
   .cmd-l2 {

@@ -17,17 +17,24 @@ use crate::state::AppState;
 // include! 于 item 位置粘贴 OUT_DIR/frontend_assets.rs，其内即 EMBEDDED_ASSETS 的 static 定义。
 include!(concat!(env!("OUT_DIR"), "/frontend_assets.rs"));
 
-/// 前端静态路由：入口页 + 构建产物（hash 文件名走 `/assets/{*path}`，dist 根层
-/// 其他文件如 favicon 按表逐个注册）。
+/// 前端静态路由：入口页 + 构建产物。
+///
+/// `/assets/{*path}` 走通配（Vite 的 hash 产物）；dist 里的其他文件——根层的
+/// favicon 与**嵌套目录**（如主题六自托管的 `fonts/fusion-pixel-12px/*.woff2`，
+/// 决策 169）——按各自的字面路径逐个注册。用字面路由而非根层通配，是为了不引入
+/// `/{*path}` 兜底：那会改变 API 未命中时的 404 响应形态（决策 155 的合并路由器）。
 pub fn static_routes() -> Router<AppState> {
     let mut router = Router::new()
         .route("/", get(index))
         .route("/assets/{*path}", get(asset));
     for (name, _) in EMBEDDED_ASSETS {
-        if !name.contains('/')
-            && name
-                .bytes()
-                .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'-' | b'_'))
+        // `assets/` 前缀已由上面的通配路由覆盖，避免重复注册。
+        if name.starts_with("assets/") || name.contains('{') || name.contains('}') {
+            continue;
+        }
+        if name
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'-' | b'_' | b'/'))
         {
             // 字面路由没有路径参数，不能走 `Path` extractor（会 500），按名分发
             router = router.route(&format!("/{name}"), get(move || serve_named(name)));
@@ -172,5 +179,43 @@ mod tests {
             }
             None => assert!(EMBEDDED_ASSETS.is_empty(), "index 查不到时表应为空"),
         }
+    }
+
+    #[test]
+    fn mime_covers_self_hosted_font_subsets() {
+        // 主题六把像素字体的 78 个 woff2 子集入库（决策 169），且随 dist 内嵌。
+        let key = "fonts/fusion-pixel-12px/Fusion-Pixel-12px-Monospaced-Simplified-Chinese.Basic-Latin.woff2";
+        assert_eq!(mime_for(key), "font/woff2");
+        assert_eq!(
+            mime_for("fonts/fusion-pixel-12px/fusion-pixel-12px.css"),
+            "text/css; charset=utf-8"
+        );
+    }
+
+    /// 嵌套字体路径必须被注册成路由（决策 169）：`static_routes` 只看根层字面名时，
+    /// `GET /fonts/…/x.woff2` 会 404，自托管字体静默回退成系统 monospace。
+    /// 这里对**注册集合**做断言（不启服务），内嵌 dist 存在时逐条核对。
+    #[test]
+    fn nested_font_assets_are_routed() {
+        let fonts: Vec<&str> = EMBEDDED_ASSETS
+            .iter()
+            .map(|(name, _)| *name)
+            .filter(|n| n.starts_with("fonts/"))
+            .collect();
+        if fonts.is_empty() {
+            // dist 缺失（未构建前端）时资产表为空——不是本用例的被测对象。
+            assert!(EMBEDDED_ASSETS.is_empty(), "有资产却无字体：主题字体未入库");
+            return;
+        }
+        for name in &fonts {
+            assert!(
+                name.bytes()
+                    .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'-' | b'_' | b'/')),
+                "{name} 含不可路由字符，static_routes 会跳过它"
+            );
+            assert!(lookup(name).is_some(), "{name} 应在资产表内可查");
+        }
+        // assets/ 前缀仍由通配路由覆盖，不应被逐条注册（避免重复路由 panic）。
+        assert!(!fonts.iter().any(|n| n.starts_with("assets/")));
     }
 }
