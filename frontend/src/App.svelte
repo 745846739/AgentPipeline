@@ -3,6 +3,7 @@
   import TopBar from './components/layout/TopBar.svelte';
   import StatusLine from './components/layout/StatusLine.svelte';
   import ToastStack from './components/layout/ToastStack.svelte';
+  import CompletionBanner from './components/layout/CompletionBanner.svelte';
   import Board from './routes/Board.svelte';
   import Metrics from './routes/Metrics.svelte';
   import SettingsProjects from './routes/SettingsProjects.svelte';
@@ -46,6 +47,8 @@
 {/if}
 
 <ToastStack />
+<!-- 完成横幅跨路由常驻（看板与详情都会触发）；层叠见组件说明：居中顶部 z35 < toast z70 -->
+<CompletionBanner />
 <StatusLine />
 
 <style>
