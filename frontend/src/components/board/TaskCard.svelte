@@ -96,9 +96,11 @@
   {/if}
 
   {#if isPending && reason}
-    <div class="reason">
-      <span class="rlabel">{pendingLabel(reason)}</span><br />
-      {reason.message}
+    <!-- 急停对话框（决策 169 / theme-6-pixel.md §3）：双线框 + 压在框沿上的琥珀名牌
+         tab + ▼ 闪烁光标。`.reason` 只作层叠占位，语义与断言口不变。 -->
+    <div class="reason dialog warn">
+      <div class="dname">{pendingLabel(reason)}</div>
+      <span class="dtxt">{reason.message}</span>
     </div>
   {/if}
 
@@ -261,17 +263,46 @@
     gap: 4px;
     margin: 8px 12px;
   }
+  /* 看板货箱上的急停对话框（原型 `.dialog.warn`）：琥珀外框 + bg 空隙 + pane 内框，
+     名牌 tab 压在框沿上，右下角 ▼ 闪烁光标。 */
   .reason {
-    margin: 8px 12px;
+    position: relative;
+    margin: 18px 12px 8px;
+    padding: 8px 10px;
+    background: var(--bg);
+    border: 2px solid var(--pending);
+    box-shadow:
+      inset 0 0 0 2px var(--bg),
+      inset 0 0 0 4px var(--pane);
     font-size: 12px;
-    line-height: 1.7;
+    line-height: 1.6;
     color: var(--text-2);
   }
-  .rlabel {
+  .reason::after {
+    content: '▼';
+    position: absolute;
+    right: 6px;
+    bottom: 0;
     color: var(--pending);
+    font-size: 12px;
+    line-height: 1;
+    animation: blink 1s steps(2) infinite;
   }
-  .rlabel::before {
-    content: '> ';
+  .dname {
+    position: absolute;
+    top: -16px;
+    left: 6px;
+    background: var(--bg);
+    border: 2px solid var(--pending);
+    color: var(--pending);
+    padding: 0 8px;
+    line-height: 1.5;
+    white-space: nowrap;
+  }
+  .dtxt {
+    display: block;
+    color: var(--text-2);
+    overflow-wrap: anywhere;
   }
   .ctxlink {
     margin: 2px 12px 4px;
