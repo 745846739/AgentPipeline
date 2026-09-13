@@ -1,0 +1,1010 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="color-scheme" content="light">
+<title>AgentPipeline · 移动原型 · 像素机房「掌机背光」浅色</title>
+<!-- 主题六「像素机房」移动版浅色款「掌机背光」：与 prototype-pixel-mobile.html 同一套 token 与内容
+     （9 张货箱、8 站轨道、同一套状态标记），把横向传送带转写为纵向传送带。
+     结构：顶栏线路条（信号灯缩略导航）→ 道具栏过滤行 → 纵向站点带（像素脊线 + 列头小人 + 货箱）→ 底部载波行；
+     详情页：纵向轨道 hero → 分段页签；pending 动作改成常驻底部动作坞（对话框式）。
+     规格见 theme-6-pixel.md §5。 -->
+<link rel="preconnect" href="https://cdn.jsdelivr.net" crossorigin>
+<link href="https://cdn.jsdelivr.net/npm/@vp-tw/cjk-web-fonts-fusion-pixel-font/dist/12px/monospaced/latin/Fusion-Pixel-12px-Monospaced-Latin.css" rel="stylesheet">
+<link href="https://cdn.jsdelivr.net/npm/@vp-tw/cjk-web-fonts-fusion-pixel-font/dist/12px/monospaced/zh_hans/Fusion-Pixel-12px-Monospaced-Simplified-Chinese.css" rel="stylesheet">
+<style>
+:root{
+    --bg:#E8E6DC; --panel:#F6F4EA; --wash:#DEDBCE; --pane:#9A97A8; --ink:#2A2B3A;
+  --t-hi:#14151F; --t1:#2F3040; --t2:#55566A; --t3:#7A7B8E; --t4:#9A9BAC;
+  --go:#1F7A3C; --go-hi:#175F2F; --go-ink:#F6F4EA;
+  --pending:#8F5B00; --stop:#B3271E; --done:#7A7B8E;
+  --dev:#1D5FA8; --tst:#6F3BB8;
+  --diff-a:#1D6B3C; --diff-a-bg:#DDEBDD; --diff-d:#A02C22; --diff-d-bg:#F4DEDA;
+  --belt-lit:#7E8094;
+  --hairline:#D8D5C8;
+  --px:"Fusion Pixel 12px Monospaced Latin","Fusion Pixel 12px Monospaced Simplified Chinese",monospace;
+  --safeb:env(safe-area-inset-bottom,0px);
+  --frame:430px;
+}
+*{margin:0;padding:0;box-sizing:border-box}
+html{-webkit-font-smoothing:none;font-smooth:never;-webkit-text-size-adjust:100%}
+body{background:var(--bg);color:var(--t1);font-family:var(--px);font-size:12px;
+  line-height:1.7;-webkit-tap-highlight-color:transparent;padding-bottom:0}
+button{font-family:inherit;font-size:12px;color:inherit;background:none;border:none;
+  cursor:pointer;touch-action:manipulation}
+input{font-family:inherit}
+a{color:inherit}
+b,strong{font-weight:400;color:var(--t-hi)}
+:focus-visible{outline:2px solid var(--t-hi);outline-offset:2px}
+.view{display:none}.view.on{display:block}
+.sp{display:inline-block;line-height:0}
+.dither{background-image:conic-gradient(var(--wash) 25%,transparent 0 50%,var(--wash) 0 75%,transparent 0);
+  background-size:4px 4px}
+
+/* ───────── 顶栏：车间铭牌行 + 信号灯缩略条 + 道具栏 ───────── */
+.bar{position:sticky;top:0;z-index:20;background:var(--bg);border-bottom:2px solid var(--pane)}
+.bar-top{display:flex;align-items:center;gap:8px;height:44px;padding:0 12px;
+  border-bottom:2px solid var(--hairline,#2B2F47)}
+.logo{flex:none;width:12px;height:12px;background:var(--go);border:2px solid var(--ink);
+  box-shadow:7px 5px 0 0 var(--pending);margin-right:6px}
+.wordmark{flex:none;font-size:12px;color:var(--t-hi);letter-spacing:.08em;line-height:1;
+}
+.sess{flex:none;color:var(--t4)}
+/* 信号灯缩略条：点灯跳段 */
+.railnav{display:flex;align-items:center;flex:1;min-width:0;margin-left:2px}
+.rn{position:relative;flex:1;min-width:0;height:44px;display:grid;place-items:center}
+.rn::before{content:"";position:absolute;left:0;right:0;top:50%;height:4px;margin-top:-2px;
+  background:repeating-linear-gradient(90deg,var(--pane) 0 4px,transparent 4px 8px)}
+.rn .mk{position:relative;z-index:1;width:10px;height:10px;border:2px solid var(--pane);background:var(--bg)}
+.rn.don .mk{background:var(--done);border-color:var(--done)}
+.rn.live .mk{background:var(--go);border-color:var(--go)}
+.rn.pen .mk{background:var(--pending);border-color:var(--pending)}
+.rn.on{outline:2px solid var(--t-hi);outline-offset:-2px}
+/* 道具栏（横向滚动） */
+.slots{display:flex;gap:6px;overflow-x:auto;padding:8px 12px;scrollbar-width:none}
+.slots::-webkit-scrollbar{display:none}
+.slot{flex:none;width:34px;height:34px;border:2px solid var(--pane);background:var(--panel);
+  display:grid;place-items:center;color:var(--t2);position:relative}
+.slot:hover{color:var(--t1)}
+.slot.on{border-color:var(--t-hi);color:var(--t-hi);background:var(--wash)}
+.slot .cb{position:absolute;right:-5px;bottom:-5px;background:var(--bg);
+  border:2px solid var(--pane);color:var(--t3);padding:0 2px;line-height:1.2}
+.slot.pend{color:var(--pending)}
+.slot.pend .cb{color:var(--pending);border-color:var(--pending)}
+/* 详情 / 待处理页标题行 */
+.bar-row{display:flex;align-items:center;gap:10px;min-height:44px;padding:0 12px}
+.back{flex:none;min-height:44px;color:var(--t3)}
+.back::before{content:"← "}
+.back:active{color:var(--t-hi)}
+.bt{flex:1;min-width:0;color:var(--t-hi);overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.pend-n{flex:none;color:var(--pending)}
+.dmeta{display:flex;flex-wrap:wrap;gap:2px 13px;padding:0 12px 8px;color:var(--t3)}
+.dmeta>span{white-space:nowrap}
+.dmeta .run{color:var(--go)} .dmeta .warn{color:var(--pending)}
+
+/* ───────── 纵向传送带：站点带 ───────── */
+.tape{padding:2px 12px calc(56px + var(--safeb))}
+.sec{display:flex;scroll-margin-top:96px}
+.spine{position:relative;flex:none;width:26px}
+.spine::before{content:"";position:absolute;left:10px;top:0;bottom:0;width:6px;
+  background:repeating-linear-gradient(180deg,var(--pane) 0 6px,transparent 6px 12px)}
+.sec.live .spine::before{background:repeating-linear-gradient(180deg,var(--belt-lit) 0 6px,transparent 6px 12px)}
+.sec.pen .spine::before{background:repeating-linear-gradient(180deg,var(--pending) 0 6px,transparent 6px 12px);opacity:.45}
+.sec-body{flex:1;min-width:0;padding-bottom:10px}
+.sec-head{position:relative;display:flex;align-items:center;gap:8px;min-height:36px;padding:6px 0 7px}
+.spmk{position:absolute;left:-20px;top:50%;transform:translateY(-50%);
+  width:12px;height:12px;border:2px solid var(--pane);background:var(--bg)}
+.sec.live .spmk{background:var(--go);border-color:var(--go)}
+.sec.pen .spmk{background:var(--pending);border-color:var(--pending)}
+.sec.don .spmk{background:var(--done);border-color:var(--done)}
+.sec-name{flex:none;display:inline-flex;align-items:center;color:var(--t3);white-space:nowrap;
+  letter-spacing:.06em}
+.sec-name .sp{margin-right:5px}
+.sec.live .sec-name{color:var(--t-hi)}
+.sec.pen .sec-name{color:var(--pending)}
+.rule{flex:1;min-width:8px;height:2px;background:var(--hairline,#2B2F47)}
+.sec-n{flex:none;color:var(--t4)}
+.sec-empty{margin:4px 0 6px;padding:8px 10px;border:2px solid var(--pane);color:var(--t4);
+  background-image:conic-gradient(var(--wash) 25%,transparent 0 50%,var(--wash) 0 75%,transparent 0);
+  background-size:4px 4px}
+.sec.hide-cards .tg{display:none}
+/* 列头小人（复用桌面帧与节奏） */
+.worker{position:relative;display:inline-block;width:16px;height:16px;flex:none}
+.worker svg{position:absolute;inset:0}
+.worker .f2{opacity:0}
+.worker.run{color:var(--go)}
+.worker.wait{color:var(--pending)}
+.worker.idle{color:var(--t4)}
+.worker.run .f1{animation:wA .6s infinite}
+.worker.run .f2{animation:wB .6s infinite}
+.worker.wait .f1{animation:wA 1.8s infinite}
+.worker.wait .f2{animation:wB 1.8s infinite}
+@keyframes wA{0%,50%{opacity:1}50.01%,100%{opacity:0}}
+@keyframes wB{0%,50%{opacity:0}50.01%,100%{opacity:1}}
+
+/* ───────── 货箱（卡片） ───────── */
+.tg{position:relative;border:2px solid var(--pane);background:var(--panel);
+  box-shadow:3px 3px 0 var(--ink);margin:8px 0 12px;padding:9px 11px 11px;cursor:pointer}
+.tg::before{content:'';position:absolute;top:0;left:0;right:0;height:6px;
+  background-image:conic-gradient(var(--wash) 25%,transparent 0 50%,var(--wash) 0 75%,transparent 0);
+  background-size:4px 4px}
+.tg>*{position:relative}
+.tg>:first-child{margin-top:6px}
+.tg:active{border-color:var(--t2)}
+.tg.warn{border-color:var(--pending);box-shadow:inset 4px 0 0 var(--pending),3px 3px 0 var(--ink)}
+.tg.stopped{border-color:var(--stop);box-shadow:inset 4px 0 0 var(--stop),3px 3px 0 var(--ink)}
+.tg.mute{box-shadow:none}
+.tg.mute:active{border-color:var(--t4)}
+.tg-top{display:flex;align-items:baseline;gap:10px}
+.tg-title{flex:1;min-width:0;color:var(--t-hi);line-height:1.5}
+.tg.warn .tg-title::before{content:'?! ';color:var(--pending)}
+.tg.mute .tg-title{color:var(--t2)}
+.stall{flex:none;color:var(--pending);white-space:nowrap}
+.dur{flex:none;color:var(--t3)}
+.tagline{margin-top:6px;color:var(--t3)}
+.tagline b{color:var(--t2)}
+.waitfor{flex:none;color:var(--pending);white-space:nowrap}
+
+/* 迷你传送带（横向） */
+.rail{display:flex;align-items:center;min-height:10px;margin:8px 0 2px}
+.rail .d{flex:none;width:10px;height:10px;border:2px solid var(--pane);background:var(--panel)}
+.rail .d.p{background:var(--belt-lit);border-color:var(--belt-lit)}
+.rail .d.dd{background:var(--done);border-color:var(--done)}
+.rail .d.c,.rail .d.v{background:var(--go);border-color:var(--go)}
+.rail .d.w{background:var(--pending);border-color:var(--pending)}
+.rail .d.x{background:var(--stop);border-color:var(--stop)}
+.rail .d.t{background:transparent}
+.rail .s{flex:1;height:4px;background:var(--pane)}
+.rail .s.lit{background:var(--belt-lit)}
+.prow{display:flex;align-items:center;gap:8px}
+.prow .bl{flex:none;color:var(--dev)}
+.prow .bl.t{color:var(--tst)}
+.prow .rail{flex:1;margin:4px 0}
+
+/* 状态灯字 */
+.st::before{content:'';display:inline-block;width:8px;height:8px;margin-right:5px;background:currentColor}
+.st.run{color:var(--go)} .st.wait{color:var(--pending)}
+.st.stop{color:var(--stop)} .st.dim{color:var(--t4)}
+.st.dim::before{background:transparent;border:2px solid var(--t4)}
+.tg-st{color:var(--t2);line-height:1.9}
+.tg-st .note{color:var(--t4);white-space:nowrap}
+
+/* 急停对话框（RPG 名牌） */
+.dialog{position:relative;margin:14px 0 4px;padding:8px 10px;background:var(--bg);
+  border:2px solid var(--pending);
+  box-shadow:inset 0 0 0 2px var(--bg),inset 0 0 0 4px var(--pane)}
+.dialog::after{content:'▼';position:absolute;right:6px;bottom:0;color:var(--pending);
+  animation:blink 1s steps(2) infinite}
+.dname{position:absolute;top:-16px;left:6px;background:var(--bg);
+  border:2px solid var(--pending);color:var(--pending);padding:0 8px;line-height:1.5}
+.dtxt{display:block;color:var(--t2)}
+.ctxlink{margin:4px 0 0}
+.ctxlink a{color:var(--t1);text-decoration:underline;text-underline-offset:3px}
+.ctxlink a::before{content:'▸ ';color:var(--t3)}
+.ainput{display:block;width:100%;margin:10px 0 2px;background:var(--bg);
+  border:2px solid var(--pane);color:var(--t-hi);font-size:16px;padding:8px 10px}
+.ainput::placeholder{color:var(--t4)}
+.ainput:focus{outline:none;border-color:var(--t2)}
+.acts{display:flex;flex-wrap:wrap;gap:8px;margin-top:10px}
+.btn{display:inline-flex;align-items:center;justify-content:center;min-height:44px;
+  padding:2px 12px;border:2px solid var(--pane);background:var(--panel);
+  color:var(--t1);box-shadow:3px 3px 0 var(--ink);text-align:center}
+.btn:hover{color:var(--t-hi);border-color:var(--t2)}
+.btn:active{transform:translate(3px,3px);box-shadow:none}
+.btn.solid{background:var(--go);border-color:var(--go);color:var(--go-ink)}
+.btn.solid::before{content:'▶ '}
+.btn.solid:active{transform:translate(3px,3px);box-shadow:none}
+.btn.quiet{border-color:transparent;background:none;box-shadow:none;color:var(--t3)}
+.btn.quiet:active{transform:none}
+.btn.danger{border-color:transparent;background:none;box-shadow:none;color:var(--stop)}
+.btn[disabled]{opacity:.55;pointer-events:none}
+.meta{margin-top:8px;color:var(--t3)}
+.meta b{color:var(--t-hi)}
+.diffstat{margin-top:6px;color:var(--t3)}
+.diffstat .a{color:var(--diff-a)} .diffstat .d{color:var(--diff-d)}
+
+/* token 量表 + boss 战尝试条 */
+.gauge{display:inline-flex;gap:2px;vertical-align:-1px;margin-right:6px}
+.gauge i{width:5px;height:10px;background:var(--pane)}
+.gauge i.f{background:var(--go)}
+.gauge.g-warn i.f{background:var(--pending)}
+.gauge.g-dim i.f{background:var(--done)}
+.gauge.g-stop i.f{background:var(--stop)}
+.bossbar{display:flex;align-items:center;gap:8px;margin:10px 0 0}
+.bossbar .bl2{flex:none;color:var(--t-hi)}
+.bossbar .segs{flex:1;display:flex;gap:2px;border:2px solid var(--pane);
+  background:var(--bg);padding:2px}
+.bossbar .segs i{flex:1;height:10px;background:var(--wash)}
+.bossbar .segs i.f{background:var(--go)}
+
+/* 待处理页导语 */
+.wait-lead{padding:10px 0 10px;margin-bottom:10px;border-bottom:2px solid var(--pane)}
+.wait-n{color:var(--t-hi)}
+.wait-n b{color:var(--pending)}
+.wait-sub{margin-top:4px;color:var(--t3)}
+
+/* ───────── 底部载波行 ───────── */
+.carrier{position:fixed;left:0;right:0;bottom:0;z-index:30;display:flex;align-items:center;gap:14px;
+  min-height:calc(40px + var(--safeb));padding:0 12px var(--safeb);
+  background:var(--bg);border-top:2px solid var(--pane);color:var(--t3)}
+.carrier b{color:var(--t2)}
+.carrier .cbtn{display:inline-flex;align-items:center;min-height:40px;color:var(--pending)}
+.carrier .cmeta{margin-left:auto;display:inline-flex;align-items:center}
+.carrier .pen{color:var(--pending)}
+.sep{color:var(--t4)}
+
+/* ───────── 详情页 ───────── */
+.detail{padding:12px 12px calc(30px + var(--safeb))}
+.view.docked .detail{padding-bottom:calc(132px + var(--safeb))}
+/* 纵向轨道 hero：站点灯 + 竖向链节 + 当前站小人 */
+.vrail{list-style:none;margin:0 0 12px}
+.vst{position:relative;display:flex;align-items:center;gap:9px;min-height:36px;padding-left:36px}
+.vst::before{content:"";position:absolute;left:12px;top:0;bottom:0;width:6px;margin-left:-3px;
+  background:repeating-linear-gradient(180deg,var(--pane) 0 6px,transparent 6px 12px)}
+.vst.done::before{background:repeating-linear-gradient(180deg,var(--belt-lit) 0 6px,transparent 6px 12px)}
+.vst.cur::before,.vst.pen::before{background:repeating-linear-gradient(180deg,var(--go) 0 6px,transparent 6px 12px)}
+.vst.pen::before{background:repeating-linear-gradient(180deg,var(--pending) 0 6px,transparent 6px 12px);opacity:.45}
+.vmk{position:absolute;left:3px;top:50%;transform:translateY(-50%);width:12px;height:12px;z-index:1;
+  border:2px solid var(--pane);background:var(--bg)}
+.vst.done .vmk{background:var(--done);border-color:var(--done)}
+.vst.cur .vmk{background:var(--go);border-color:var(--go)}
+.vst.pen .vmk{background:var(--pending);border-color:var(--pending)}
+.vst.fail .vmk{background:var(--stop);border-color:var(--stop)}
+.vname{color:var(--t2);white-space:nowrap}
+.vst.done .vname{color:var(--t3)}
+.vst.cur .vname{color:var(--t-hi)}
+.vst.pen .vname{color:var(--pending)}
+.vmeta{margin-left:auto;color:var(--t3);white-space:nowrap}
+.vst.cur .vmeta{color:var(--t-hi)}
+.vsub{margin-left:auto;color:var(--t3);white-space:nowrap}
+.vsub .bl{color:var(--t3);margin-right:3px}
+
+/* 待办内容（对话框式，含工头头像） */
+.asks{position:relative;border:2px solid var(--pending);background:var(--panel);
+  box-shadow:inset 0 0 0 2px var(--panel),inset 0 0 0 4px var(--pane),3px 3px 0 var(--ink);
+  padding:12px 14px;margin-bottom:12px;display:flex;gap:12px}
+.asks .dface{flex:none;width:48px;height:48px}
+.asks .dmain{flex:1;min-width:0}
+.asks .dtag{color:var(--pending);margin-bottom:7px}
+.asks .dtag::after{content:'▼';float:right;animation:blink 1s steps(2) infinite}
+.asks .msg{color:var(--t-hi);line-height:1.7}
+.asks .ctx{margin-top:7px;color:var(--t2);line-height:1.85}
+.asks .ctx b{color:var(--go)}
+.asks .ctx a{color:var(--t-hi);text-decoration:underline;text-underline-offset:3px}
+
+/* 分段页签 */
+.tabs{display:flex;gap:6px;overflow-x:auto;border-bottom:2px solid var(--pane);
+  margin:0 0 14px;padding-bottom:8px;scrollbar-width:none}
+.tabs::-webkit-scrollbar{display:none}
+.tab{flex:none;display:inline-flex;align-items:center;min-height:42px;padding:0 12px;
+  border:2px solid var(--pane);background:var(--bg);color:var(--t3);white-space:nowrap}
+.tab.on{background:var(--wash);border-color:var(--t2);color:var(--t-hi)}
+.tab.dis{color:var(--t4);cursor:default;
+  background-image:conic-gradient(var(--wash) 25%,transparent 0 50%,var(--wash) 0 75%,transparent 0);
+  background-size:4px 4px}
+.tab .c{color:var(--t4);margin-left:3px}
+.pane{display:none}.pane.on{display:block}
+
+/* 会话 */
+.runrow{display:flex;gap:6px;overflow-x:auto;margin-bottom:14px;padding-bottom:2px;scrollbar-width:none}
+.runrow::-webkit-scrollbar{display:none}
+.runchip{flex:none;display:inline-flex;align-items:center;min-height:30px;padding:0 9px;
+  border:2px solid var(--pane);color:var(--t3);white-space:nowrap}
+.runchip.now{color:var(--t-hi);border-color:var(--t2);background:var(--wash)}
+.convhead{padding-bottom:8px;border-bottom:2px solid var(--pane);margin-bottom:12px}
+.convhead h3{color:var(--t-hi)}
+.convhead .m{margin-top:3px;color:var(--t3)}
+.msg{margin-bottom:14px}
+.msg .who{color:var(--t3);margin-bottom:4px;letter-spacing:.1em}
+.msg .who.as{color:var(--t-hi)}
+.msg .who span{letter-spacing:0;color:var(--t4)}
+.sysbox{border:2px solid var(--pane);background:var(--bg);padding:8px 10px;color:var(--t3);cursor:pointer}
+.userbox{color:var(--t2);white-space:pre-wrap;overflow-wrap:break-word}
+.assistant p{color:var(--t1);margin:2px 0 9px}
+.toolcard{display:flex;flex-wrap:wrap;gap:2px 10px;border-left:4px solid var(--pane);
+  padding:4px 0 4px 10px;margin:6px 0;color:var(--t2)}
+.toolcard .fn{overflow-wrap:break-word}
+.toolcard .fn b{color:var(--t-hi)}
+.toolcard .res{margin-left:auto;color:var(--t3);white-space:nowrap}
+.toolcard .res.ok{color:var(--go)}
+.attempt-sep{display:flex;align-items:center;gap:10px;margin:18px 0 12px;color:var(--stop)}
+.attempt-sep::before,.attempt-sep::after{content:"";flex:1;height:2px;
+  background:repeating-linear-gradient(90deg,var(--pane) 0 6px,transparent 6px 12px)}
+.attempt-sep .mono{cursor:pointer;color:var(--t3)}
+.retry-hint{margin-top:6px;color:var(--t3)}
+.streaming::after{content:'▊';color:var(--go);animation:blink .9s steps(2) infinite}
+@keyframes blink{50%{opacity:0}}
+.tokmeter{margin-top:10px;text-align:right;color:var(--t3)}
+.tokmeter b{color:var(--t-hi)}
+
+/* 时间线 */
+.tline{color:var(--t2)}
+.trow{padding:7px 0;border-bottom:2px solid var(--hairline,#232639)}
+.trow:last-child{border-bottom:0}
+.trow .t{color:var(--t4);margin-right:8px}
+.trow .tr{color:var(--t3);margin-right:8px}
+.trow .tr.warn{color:var(--pending)} .trow .tr.stop{color:var(--stop)}
+.trow .to{display:block;margin-top:1px;color:var(--t2);word-break:break-all}
+.trow .why{display:block;margin-top:2px;color:var(--t4)}
+.bb{border:2px solid var(--pane);padding:0 3px;color:var(--t3)}
+.trow .cur{color:var(--go)}
+
+/* 命令表：两行制 */
+.cmd{padding:9px 2px;border-bottom:2px solid var(--hairline,#232639);cursor:pointer}
+.cmd:last-child{border-bottom:0}
+.cmd:active{background:var(--panel)}
+.cmd-l1{display:flex;align-items:center;gap:9px;color:var(--t3)}
+.cmd-l1 .ok,.cmd-l1 .ng{flex:none;width:8px;height:8px}
+.cmd-l1 .ok{background:var(--go)} .cmd-l1 .ng{background:var(--stop)}
+.cmd-l1 .tm{color:var(--t4)}
+.cmd-l1 .sp{margin-left:auto;white-space:nowrap}
+.cmd-l2{margin-top:3px;color:var(--t1);overflow-wrap:break-word;line-height:1.6}
+.cmd-l2 .fn{color:var(--t-hi)}
+.cmdout{border-left:4px solid var(--pane);background:var(--panel);margin:8px 0 12px;
+  padding:9px 11px;color:var(--t2);white-space:pre-wrap;word-break:break-word}
+.cmdout .ln{color:var(--t3)}
+.cmdout .fin{color:var(--go)} .cmdout .fin.ng{color:var(--stop)}
+
+/* Diff */
+.diffhead{margin-bottom:10px}
+.diffhead .big .a{color:var(--diff-a)} .diffhead .big .d{color:var(--diff-d)}
+.notice{display:block;margin-top:8px;color:var(--pending);border:2px solid var(--pending);
+  padding:6px 10px;line-height:1.6}
+.dfile{margin-bottom:14px}
+.dfile h4{color:var(--t-hi);margin-bottom:6px;line-height:1.5}
+.dfile h4 .st2{color:var(--t3);border:2px solid var(--pane);padding:0 5px;margin-left:6px}
+.dfile h4 .pm{color:var(--t3);margin-left:6px}
+.dbody{border:2px solid var(--pane);overflow-x:auto;-webkit-overflow-scrolling:touch}
+.dl{padding:0 10px;white-space:pre;min-width:max-content;color:var(--t3);line-height:1.8}
+.dl.add{background:var(--diff-a-bg);color:var(--diff-a)}
+.dl.del{background:var(--diff-d-bg);color:var(--diff-d)}
+.dl.hunk{color:var(--t2);
+  background-image:conic-gradient(var(--wash) 25%,transparent 0 50%,var(--wash) 0 75%,transparent 0);
+  background-size:4px 4px}
+
+/* 底部动作坞（对话框式） */
+.dock{position:fixed;left:0;right:0;bottom:0;z-index:30;background:var(--bg);
+  border-top:2px solid var(--pending);padding:10px 12px calc(10px + var(--safeb))}
+.dock-tag{color:var(--pending);margin-bottom:8px}
+.dock-tag::after{content:'▼';float:right;animation:blink 1s steps(2) infinite}
+.dock-acts{display:flex;gap:8px}
+.dock-acts .btn{flex:1;min-height:48px;white-space:nowrap}
+.dock-acts .btn.quiet{border-color:var(--pane);background:var(--panel);color:var(--t1);box-shadow:3px 3px 0 var(--ink)}
+.dock-done{color:var(--go)}
+
+/* 任务完成横幅 */
+.qtoast{position:fixed;top:104px;left:12px;right:12px;z-index:35;
+  display:flex;align-items:center;gap:12px;padding:10px 14px;
+  background:var(--panel);border:2px solid var(--go);box-shadow:4px 4px 0 var(--ink)}
+.qtoast .sp{color:var(--go)}
+.qtoast .sp svg{width:24px;height:24px}
+.qtoast .qt{color:var(--pending)}
+.qtoast .btn{margin-left:auto}
+
+/* 原型切换器 */
+.demo{position:fixed;right:10px;bottom:calc(50px + var(--safeb));z-index:50;
+  display:flex;flex-direction:column;align-items:flex-end;gap:4px}
+.demo-menu{display:none;flex-direction:column;gap:4px;padding:5px;background:var(--bg);
+  border:2px solid var(--pane);box-shadow:3px 3px 0 var(--ink)}
+.demo.open .demo-menu{display:flex}
+.demo-tog{min-height:36px;padding:0 10px;color:var(--t3);
+  border:2px solid var(--pane);background:var(--bg)}
+.demo-menu button{min-height:38px;padding:0 11px;color:var(--t3);text-align:left;white-space:nowrap;
+  border:2px solid transparent}
+.demo-menu button.on{background:var(--go);color:var(--go-ink)}
+body.docked .demo{bottom:calc(118px + var(--safeb))}
+
+@media (prefers-reduced-motion:reduce){
+  *,*::before,*::after{animation:none!important;transition:none!important}
+}
+/* 宽屏：把移动版放回手机框内查看 */
+@media (min-width:480px){
+  body{max-width:var(--frame);margin:0 auto;min-height:100vh;
+    border-left:2px solid var(--pane);border-right:2px solid var(--pane)}
+  .carrier,.dock{left:50%;right:auto;width:var(--frame);transform:translateX(-50%)}
+  .demo{right:calc(50% - var(--frame)/2 + 10px)}
+}
+</style>
+</head>
+
+<body>
+
+<!-- ═══════════ 视图 1：纵向传送带（看板，8 站） ═══════════ -->
+<div class="view on" id="v-board">
+  <header class="bar">
+    <div class="bar-top">
+      <span class="logo" aria-hidden="true"></span>
+      <span class="wordmark">AGENTPIPELINE</span>
+      <span class="sess">本机夜班</span>
+      <nav class="railnav" id="railnav">
+        <button class="rn idle" data-sec="s-init" aria-label="init"><span class="mk"></span></button>
+        <button class="rn pen" data-sec="s-arch" aria-label="architect-design"><span class="mk"></span></button>
+        <button class="rn live" data-sec="s-des" aria-label="develop-design 与 test-design"><span class="mk"></span></button>
+        <button class="rn live" data-sec="s-dev" aria-label="develop"><span class="mk"></span></button>
+        <button class="rn live" data-sec="s-rev" aria-label="review"><span class="mk"></span></button>
+        <button class="rn idle" data-sec="s-test" aria-label="test"><span class="mk"></span></button>
+        <button class="rn pen" data-sec="s-merge" aria-label="merge"><span class="mk"></span></button>
+        <button class="rn don" data-sec="s-done" aria-label="done"><span class="mk"></span></button>
+      </nav>
+    </div>
+    <nav class="slots" id="filters">
+      <button class="slot on" data-f="all" title="全部"><i class="sp" data-s="chest"></i><span class="cb">10</span></button>
+      <button class="slot" data-f="running" title="执行中"><i class="sp" data-s="gear"></i><span class="cb">3</span></button>
+      <button class="slot pend" data-f="pending" title="待处理"><i class="sp" data-s="alert"></i><span class="cb">3</span></button>
+      <button class="slot" data-f="blocked" title="等依赖"><i class="sp" data-s="merge"></i><span class="cb">1</span></button>
+      <button class="slot" data-f="queued" title="排队"><i class="sp" data-s="flag"></i><span class="cb">1</span></button>
+      <button class="slot" data-f="done" title="已完成"><i class="sp" data-s="trophy"></i><span class="cb">1</span></button>
+    </nav>
+  </header>
+
+  <main class="tape" id="tape">
+
+    <section class="sec" id="s-init">
+      <div class="spine"></div>
+      <div class="sec-body">
+        <h2 class="sec-head"><span class="spmk"></span><span class="sec-name"><i class="sp" data-s="flag"></i>init</span><span class="worker idle"></span><i class="rule"></i><span class="sec-n">2</span></h2>
+        <article class="tg mute" data-status="blocked" tabindex="0" data-go="v-run">
+          <div class="tg-top"><h3 class="tg-title">实现飞书通知渠道</h3><span class="dur">—</span></div>
+          <div class="rail" data-dots="f f f f f f f f f"></div>
+          <div class="tagline">等待依赖 <b>实现用户登录</b> 完成</div>
+        </article>
+        <article class="tg mute" data-status="queued" tabindex="0" data-go="v-run">
+          <div class="tg-top"><h3 class="tg-title">任务成本月度报表</h3><span class="dur">—</span></div>
+          <div class="tagline">排队等待并发名额（3 / 5）</div>
+        </article>
+      </div>
+    </section>
+
+    <section class="sec pen" id="s-arch">
+      <div class="spine"></div>
+      <div class="sec-body">
+        <h2 class="sec-head"><span class="spmk"></span><span class="sec-name"><i class="sp" data-s="gem"></i>architect-design</span><span class="worker wait"></span><i class="rule"></i><span class="sec-n">2</span></h2>
+        <article class="tg warn" data-status="pending" tabindex="0" data-go="v-run">
+          <div class="tg-top"><h3 class="tg-title">实现任务依赖拓扑排序</h3><span class="stall">STALLED 3d</span></div>
+          <div class="rail" data-dots="p w f f f f f f f"></div>
+          <div class="tg-st">architect-design · execute <span class="st wait">WAIT</span> <span class="note">等待决定</span></div>
+          <div class="dialog"><div class="dname">语义重复风险</div><span class="dtxt">与「任务依赖循环检测」的新增符号重叠：TopoSort、detect_cycle。</span></div>
+          <div class="ctxlink"><a>并排对比两份设计</a></div>
+          <div class="acts">
+            <button class="btn">继续进入开发</button>
+            <button class="btn quiet">取消其一</button>
+          </div>
+          <div class="meta"><span class="gauge g-warn" data-f="2"></span><b>9.1k</b> tok ▪ 4m02s</div>
+        </article>
+        <article class="tg warn" data-status="pending" tabindex="0" data-go="v-run">
+          <div class="tg-top"><h3 class="tg-title">重构会话压缩模块</h3><span class="dur">3m12s</span></div>
+          <div class="rail" data-dots="p w f f f f f f f"></div>
+          <div class="tg-st">architect-design · validate_input</div>
+          <div class="dialog"><div class="dname">信息不足</div><span class="dtxt">设计缺少数据流定义：请补充鉴权 Token 的存储位置与过期策略。</span></div>
+          <input class="ainput" placeholder="补充说明后继续…">
+          <div class="acts">
+            <button class="btn solid">补充说明并继续</button>
+          </div>
+          <div class="meta"><span class="gauge g-warn" data-f="2"></span><b>8.4k</b> tok ▪ 214 次调用</div>
+        </article>
+      </div>
+    </section>
+
+    <section class="sec live" id="s-des">
+      <div class="spine"></div>
+      <div class="sec-body">
+        <h2 class="sec-head"><span class="spmk"></span><span class="sec-name"><i class="sp" data-s="hammer"></i>develop-design ∥ test-design</span><span class="worker run"></span><i class="rule"></i><span class="sec-n">1</span></h2>
+        <article class="tg" data-status="running" tabindex="0" data-go="v-run">
+          <div class="tg-top"><h3 class="tg-title">增加任务依赖循环检测</h3><span class="dur">6m40s</span></div>
+          <div class="prow"><span class="bl">[dev]</span><div class="rail" data-dots="p p v f f f f f f"></div></div>
+          <div class="prow"><span class="bl t">[tst]</span><div class="rail" data-dots="p p f t f f f f f"></div></div>
+          <div class="tg-st">develop-design · execute <span class="st run">RUN</span><br>test-design · validate_output <span class="st dim">等待汇合</span></div>
+          <div class="meta"><span class="gauge" data-f="6"></span><b>22.1k</b> tok ▪ kanban/t-0047</div>
+        </article>
+      </div>
+    </section>
+
+    <section class="sec live" id="s-dev">
+      <div class="spine"></div>
+      <div class="sec-body">
+        <h2 class="sec-head"><span class="spmk"></span><span class="sec-name"><i class="sp" data-s="gear"></i>develop</span><span class="worker run"></span><i class="rule"></i><span class="sec-n">2</span></h2>
+        <article class="tg" data-status="running" tabindex="0" data-go="v-run">
+          <div class="tg-top"><h3 class="tg-title">实现用户登录</h3><span class="dur">12m34s</span></div>
+          <div class="rail" data-dots="p p p p c f f f f"></div>
+          <div class="tg-st">develop · execute <span class="st run">RUN</span> <span class="note">第 2 次尝试</span></div>
+          <div class="bossbar"><span class="bl2">尝试 2/3</span><div class="segs" data-f="13"></div></div>
+          <div class="meta"><span class="gauge" data-f="11"></span><b>45.2k</b> tok ▪ 214 次调用 ▪ kanban/t-0042</div>
+        </article>
+        <article class="tg stopped" data-status="ended" tabindex="0" data-go="v-run">
+          <div class="tg-top"><h3 class="tg-title">优化看板首屏渲染</h3><span class="dur">8m51s</span></div>
+          <div class="rail" data-dots="p p p p x f f f f"></div>
+          <div class="tg-st">develop · execute <span class="st stop">FAIL</span></div>
+          <div class="acts"><button class="btn danger">重试（回到 init）</button></div>
+          <div class="meta"><span class="gauge g-stop" data-f="8"></span><b>31.7k</b> tok ▪ kanban/t-0039</div>
+        </article>
+      </div>
+    </section>
+
+    <section class="sec live" id="s-rev">
+      <div class="spine"></div>
+      <div class="sec-body">
+        <h2 class="sec-head"><span class="spmk"></span><span class="sec-name"><i class="sp" data-s="lens"></i>review</span><span class="worker run"></span><i class="rule"></i><span class="sec-n">1</span></h2>
+        <article class="tg" data-status="running" tabindex="0" data-go="v-run">
+          <div class="tg-top"><h3 class="tg-title">统一错误处理与重试语义</h3><span class="dur">2m05s</span></div>
+          <div class="rail" data-dots="p p p p p c f f f"></div>
+          <div class="tg-st">review · execute <span class="st run">RUN</span> <span class="note">agent 评审中</span></div>
+          <div class="meta"><span class="gauge" data-f="3"></span><b>9.8k</b> tok ▪ kanban/t-0044</div>
+        </article>
+      </div>
+    </section>
+
+    <section class="sec" id="s-test">
+      <div class="spine"></div>
+      <div class="sec-body">
+        <h2 class="sec-head"><span class="spmk"></span><span class="sec-name"><i class="sp" data-s="shield"></i>test</span><span class="worker idle"></span><i class="rule"></i></h2>
+        <div class="sec-empty">评审通过的任务会在这里跑集成测试。</div>
+      </div>
+    </section>
+
+    <section class="sec pen" id="s-merge">
+      <div class="spine"></div>
+      <div class="sec-body">
+        <h2 class="sec-head"><span class="spmk"></span><span class="sec-name"><i class="sp" data-s="merge"></i>merge</span><span class="worker wait"></span><i class="rule"></i><span class="sec-n">1</span></h2>
+        <article class="tg warn" data-status="pending" tabindex="0" data-go="v-approve">
+          <div class="tg-top"><h3 class="tg-title">实现 worktree 清理策略</h3><span class="dur">18m22s</span></div>
+          <div class="rail" data-dots="p p p p p p p w f"></div>
+          <div class="tg-st">merge · execute <span class="st wait">WAIT</span> <span class="note">等待审批</span></div>
+          <div class="dialog"><div class="dname">合并提案</div><span class="dtxt">合入 main 前请审核 diff。</span></div>
+          <div class="diffstat"><span class="a">+312</span> <span class="d">−87</span> ▪ 9 个文件</div>
+          <div class="acts">
+            <button class="btn solid">审核并合入</button>
+            <button class="btn quiet">返回修改</button>
+          </div>
+          <div class="meta"><span class="gauge g-warn" data-f="15"></span><b>61.9k</b> tok ▪ kanban/t-0041</div>
+        </article>
+      </div>
+    </section>
+
+    <section class="sec don" id="s-done">
+      <div class="spine"></div>
+      <div class="sec-body">
+        <h2 class="sec-head"><span class="spmk"></span><span class="sec-name"><i class="sp" data-s="trophy"></i>done</span><span class="worker idle"></span><i class="rule"></i><span class="sec-n">1</span></h2>
+        <article class="tg mute" data-status="done" tabindex="0" data-go="v-run">
+          <div class="tg-top"><h3 class="tg-title">接入 SQLite 迁移</h3><span class="dur">26m40s</span></div>
+          <div class="rail" data-dots="d d d d d d d d d"></div>
+          <div class="diffstat"><span class="a">+542</span> <span class="d">−13</span> ▪ 6 个文件 ▪ 已合入 main</div>
+          <div class="meta"><span class="gauge g-dim" data-f="7"></span><b>28.4k</b> tok ▪ kanban/t-0038</div>
+        </article>
+      </div>
+    </section>
+
+  </main>
+
+  <!-- 任务完成横幅 -->
+  <div class="qtoast">
+    <i class="sp" data-s="trophy" aria-hidden="true"></i>
+    <span><span class="qt">任务完成</span> ▪ 接入 SQLite 迁移</span>
+    <button class="btn">收下</button>
+  </div>
+
+  <footer class="carrier">
+    <button class="cbtn" onclick="show('v-wait')">⏸ <b class="pen">*3</b> 待处理</button>
+    <span class="sep">▪</span>
+    <span>▶ <b>3</b> 执行中</span>
+    <span class="cmeta"><span class="gauge g-warn" data-f="14"></span> 61.9k tok</span>
+  </footer>
+</div>
+
+<!-- ═══════════ 视图 2：待处理（按等待时长收拢，最久在最上） ═══════════ -->
+<div class="view" id="v-wait">
+  <header class="bar">
+    <div class="bar-row">
+      <button class="back" onclick="show('v-board')">看板</button>
+      <span class="bt">待处理</span>
+      <span class="pend-n">*3</span>
+    </div>
+  </header>
+
+  <main class="tape">
+    <div class="wait-lead">
+      <div class="wait-n">等你拍板 <b>3</b> 条</div>
+      <div class="wait-sub">最长等待 3d 4h ▪ 按等待时长排列，最久的在最上。</div>
+    </div>
+
+    <article class="tg warn" data-go="v-run" tabindex="0">
+      <div class="tg-top"><h3 class="tg-title">实现任务依赖拓扑排序</h3><span class="waitfor">等待 3d 4h</span></div>
+      <div class="rail" data-dots="p w f f f f f f f"></div>
+      <div class="tg-st">architect-design · execute <span class="st wait">WAIT</span> <span class="note">等待决定</span></div>
+      <div class="dialog"><div class="dname">语义重复风险</div><span class="dtxt">与「任务依赖循环检测」的新增符号重叠：TopoSort、detect_cycle。</span></div>
+      <div class="ctxlink"><a>并排对比两份设计</a></div>
+      <div class="acts">
+        <button class="btn solid">继续进入开发</button>
+        <button class="btn quiet">取消其一</button>
+      </div>
+      <div class="meta"><span class="gauge g-warn" data-f="2"></span><b>9.1k</b> tok ▪ 4m02s ▪ kanban/t-0047</div>
+    </article>
+
+    <article class="tg warn" data-go="v-run" tabindex="0">
+      <div class="tg-top"><h3 class="tg-title">重构会话压缩模块</h3><span class="waitfor">等待 2h 11m</span></div>
+      <div class="rail" data-dots="p w f f f f f f f"></div>
+      <div class="tg-st">architect-design · validate_input <span class="st wait">WAIT</span> <span class="note">信息不足</span></div>
+      <div class="dialog"><div class="dname">信息不足</div><span class="dtxt">设计缺少数据流定义：请补充鉴权 Token 的存储位置与过期策略。</span></div>
+      <input class="ainput" placeholder="补充说明后继续…">
+      <div class="acts">
+        <button class="btn solid">补充说明并继续</button>
+      </div>
+      <div class="meta"><span class="gauge g-warn" data-f="2"></span><b>8.4k</b> tok ▪ 214 次调用 ▪ kanban/t-0045</div>
+    </article>
+
+    <article class="tg warn" data-go="v-approve" tabindex="0">
+      <div class="tg-top"><h3 class="tg-title">实现 worktree 清理策略</h3><span class="waitfor">等待 18m</span></div>
+      <div class="rail" data-dots="p p p p p p p w f"></div>
+      <div class="tg-st">merge · execute <span class="st wait">WAIT</span> <span class="note">等待审批</span></div>
+      <div class="dialog"><div class="dname">合并提案</div><span class="dtxt">合入 main 前请审核 diff。</span></div>
+      <div class="diffstat"><span class="a">+312</span> <span class="d">−87</span> ▪ 9 个文件 ▪ 测试闸门 pass ▪ 评审 approved</div>
+      <div class="acts">
+        <button class="btn solid">审核并合入</button>
+        <button class="btn quiet">返回修改</button>
+      </div>
+      <div class="meta"><span class="gauge g-warn" data-f="15"></span><b>61.9k</b> tok ▪ kanban/t-0041</div>
+    </article>
+  </main>
+
+  <footer class="carrier">
+    <button class="cbtn" onclick="show('v-board')">← 传送带</button>
+    <span class="sep">▪</span>
+    <span>▶ <b>3</b> 执行中</span>
+    <span class="cmeta"><span class="gauge g-warn" data-f="14"></span> 61.9k tok</span>
+  </footer>
+</div>
+
+<!-- ═══════════ 视图 3：详情 · 执行中 ═══════════ -->
+<div class="view" id="v-run">
+  <header class="bar">
+    <div class="bar-row">
+      <button class="back" onclick="show('v-board')">看板</button>
+      <span class="bt">实现用户登录</span>
+      <span class="st run">RUN</span>
+    </div>
+    <div class="dmeta">
+      <span class="run">■ running ▪ develop.execute（第 2 次尝试）</span>
+      <span>⏱ 12m34s</span>
+      <span><span class="gauge" data-f="11"></span>45.2k tok ▪ 214 次调用</span>
+      <span>kanban/t-0042</span>
+      <span>评审：agent</span>
+    </div>
+  </header>
+
+  <div class="detail">
+    <ol class="vrail">
+      <li class="vst done"><span class="vmk"></span><span class="vname">init</span><span class="vmeta">14:02</span></li>
+      <li class="vst done"><span class="vmk"></span><span class="vname">architect-design</span><span class="vmeta">2 次尝试</span></li>
+      <li class="vst done"><span class="vmk"></span><span class="vname">develop-design ∥ test-design</span><span class="vsub"><span class="bl">[dev]</span>✓<span class="bl" style="margin-left:7px">[tst]</span>✓</span></li>
+      <li class="vst cur"><span class="vmk"></span><span class="vname">develop</span><span class="worker run"></span><span class="vmeta">12m34s ▪ 第 2 次</span></li>
+      <li class="vst"><span class="vmk"></span><span class="vname">review</span></li>
+      <li class="vst"><span class="vmk"></span><span class="vname">test</span></li>
+      <li class="vst"><span class="vmk"></span><span class="vname">merge</span></li>
+      <li class="vst"><span class="vmk"></span><span class="vname">done</span></li>
+    </ol>
+
+    <nav class="tabs" id="tabs-run">
+      <button class="tab" data-pane="p-timeline">时间线</button>
+      <button class="tab on" data-pane="p-conv">会话</button>
+      <button class="tab" data-pane="p-cmds">命令与输出 <span class="c">6</span></button>
+      <button class="tab" data-pane="p-files">产出文件</button>
+      <button class="tab dis">Diff ─ merge 后生成</button>
+    </nav>
+
+    <div class="pane" id="p-timeline">
+      <div class="tline">
+        <div class="trow"><span class="t">14:02:11</span><span class="tr">start</span><span class="to">init.execute</span></div>
+        <div class="trow"><span class="t">14:02:13</span><span class="tr">normal</span><span class="to">architect-design.validate_input</span></div>
+        <div class="trow"><span class="t">14:02:25</span><span class="tr">normal</span><span class="to">architect-design.execute</span></div>
+        <div class="trow"><span class="t">14:03:50</span><span class="tr">retry</span><span class="to">architect-design.execute</span><span class="why">（validate_output 不通过：缺少数据流定义）</span></div>
+        <div class="trow"><span class="t">14:05:28</span><span class="tr">normal</span><span class="to">develop-design.validate_input <span class="bb">[dev]</span></span></div>
+        <div class="trow"><span class="t">14:05:28</span><span class="tr">normal</span><span class="to">test-design.validate_input <span class="bb">[tst]</span></span></div>
+        <div class="trow"><span class="t">14:07:05</span><span class="tr stop">node_retry</span><span class="to">develop-design.execute <span class="bb">[dev]</span></span><span class="why">（submit_metadata 格式错误，干净对话重来）</span></div>
+        <div class="trow"><span class="t">14:09:46</span><span class="tr">normal</span><span class="to">develop.execute <span class="bb cur">← 当前</span></span></div>
+      </div>
+    </div>
+
+    <div class="pane on" id="p-conv">
+      <div class="runrow">
+        <span class="runchip">architect · execute · 尝试 2/2</span>
+        <span class="runchip">architect · validate_output</span>
+        <span class="runchip">develop-design · execute · dev</span>
+        <span class="runchip">test-design · execute · test</span>
+        <span class="runchip now">develop · execute · 尝试 2/3 ■</span>
+      </div>
+      <div class="convhead">
+        <h3>develop · execute · 尝试 2/3</h3>
+        <div class="m">12.4k tok ▪ 38.2s ▪ claude-sonnet</div>
+      </div>
+      <div class="msg">
+        <div class="who">SYSTEM <span>折叠 ▪ 2.1k tok</span></div>
+        <div class="sysbox">你是开发方案 agent。根据设计文档输出详细开发方案…（点击展开完整 System Prompt）</div>
+      </div>
+      <div class="msg">
+        <div class="who">USER</div>
+        <div class="userbox">任务标题：实现用户登录
+任务描述：接入邮箱 + 密码登录，签发 JWT，中间件校验…
+设计文档：~/.agentpipeline/tasks/t-0042/design.md
+工作区：~/.agentpipeline/worktrees/t-0042</div>
+      </div>
+      <div class="msg assistant">
+        <div class="who as">AGENT</div>
+        <p>我先读取设计文档，确认鉴权模块的边界。</p>
+        <div class="toolcard"><span class="fn"><b>read_file</b>(path="design.md")</span><span class="res ok">✓ 3.2k chars</span></div>
+        <p>设计边界清楚了。单元测试走内联 #[test]，集成测试放 tests/。开始写 auth 模块。</p>
+        <div class="toolcard"><span class="fn"><b>write_file</b>(path="src/auth/mod.rs")</span><span class="res ok">✓ 214 行</span></div>
+        <div class="toolcard"><span class="fn"><b>write_file</b>(path="src/auth/middleware.rs")</span><span class="res ok">✓ 96 行</span></div>
+        <div class="toolcard"><span class="fn"><b>run_command</b>("cargo test auth")</span><span class="res ok">✓ exit 0 ▪ 18.4s</span></div>
+        <p>单测全绿。已写入 auth 模块与中间件，正在补 JWT 签发逻辑，随后跑全量测试。</p>
+        <p class="streaming">接下来把鉴权中间件挂到 axum router 的受保护路由上…</p>
+      </div>
+      <div class="tokmeter">本次尝试 <b>12.4k</b> tok ▪ 全任务 <b>45.2k</b> tok</div>
+      <div class="attempt-sep">尝试 1/3 ▪ ✗ validate_output 未通过</div>
+      <div class="retry-hint">2 个单元测试失败 ▪ <span class="ctxlink" style="display:inline"><a>查看完整对话</a></span></div>
+    </div>
+
+    <div class="pane" id="p-cmds">
+      <div class="cmd"><div class="cmd-l1"><span class="ok"></span><span class="tm">15:01:03</span><span class="src">sys</span><span class="sp">0.8s ▪ exit 0</span></div><div class="cmd-l2">git worktree add ~/.agentpipeline/worktrees/t-0042 -b kanban/t-0042</div></div>
+      <div class="cmd"><div class="cmd-l1"><span class="ok"></span><span class="tm">15:01:08</span><span class="src">sys</span><span class="sp">18.4s ▪ exit 0</span></div><div class="cmd-l2">cargo test -- --test-threads=1</div></div>
+      <div class="cmd"><div class="cmd-l1"><span class="ok"></span><span class="tm">15:01:40</span><span class="src">agt</span><span class="sp">6.2s ▪ exit 0</span></div><div class="cmd-l2">cargo test auth</div></div>
+      <div class="cmd"><div class="cmd-l1"><span class="ng"></span><span class="tm">15:02:11</span><span class="src">agt</span><span class="sp">12.1s ▪ exit 1</span></div><div class="cmd-l2">cargo clippy -- -D warnings</div></div>
+      <div class="cmdout">$ cargo clippy -- -D warnings
+<span class="ln">warning: unused variable: `claims`
+  --&gt; src/auth/middleware.rs:42:9</span>
+error: could not compile `agentpipeline` due to 1 previous error
+<span class="fin ng">[exit 1]  12.1s</span></div>
+      <div class="cmd"><div class="cmd-l1"><span class="ok"></span><span class="tm">15:02:40</span><span class="src">agt</span><span class="sp">11.8s ▪ exit 0</span></div><div class="cmd-l2">cargo clippy -- -D warnings</div></div>
+    </div>
+
+    <div class="pane" id="p-files">
+      <div class="cmd"><div class="cmd-l2"><span class="fn">design.md</span></div><div class="cmd-l1"><span class="src">架构设计 ▪ 2.1k 字</span><span class="sp">查看 ▸</span></div></div>
+      <div class="cmd"><div class="cmd-l2"><span class="fn">dev-plan.md</span></div><div class="cmd-l1"><span class="src">开发方案 ▪ 1.4k 字</span><span class="sp">查看 ▸</span></div></div>
+      <div class="cmd"><div class="cmd-l2"><span class="fn">test-scenarios.md</span></div><div class="cmd-l1"><span class="src">测试场景 ▪ 6 个场景</span><span class="sp">查看 ▸</span></div></div>
+      <div class="sec-empty" style="margin-top:10px">Diff 未生成 ▪ 合入提案在 merge 阶段生成并送审。</div>
+    </div>
+  </div>
+</div>
+
+<!-- ═══════════ 视图 4：详情 · 待审批（对话框 + 常驻动作坞） ═══════════ -->
+<div class="view docked" id="v-approve">
+  <header class="bar">
+    <div class="bar-row">
+      <button class="back" onclick="show('v-board')">看板</button>
+      <span class="bt">实现 worktree 清理策略</span>
+      <span class="st wait">WAIT</span>
+    </div>
+    <div class="dmeta">
+      <span class="warn">■ pending ▪ merge_approval</span>
+      <span>⏱ 18m22s</span>
+      <span><span class="gauge g-warn" data-f="15"></span>61.9k tok</span>
+      <span>kanban/t-0041</span>
+    </div>
+  </header>
+
+  <div class="detail">
+    <ol class="vrail">
+      <li class="vst done"><span class="vmk"></span><span class="vname">init</span></li>
+      <li class="vst done"><span class="vmk"></span><span class="vname">architect-design</span></li>
+      <li class="vst done"><span class="vmk"></span><span class="vname">develop-design ∥ test-design</span><span class="vsub"><span class="bl">[dev]</span>✓<span class="bl" style="margin-left:7px">[tst]</span>✓</span></li>
+      <li class="vst done"><span class="vmk"></span><span class="vname">develop</span></li>
+      <li class="vst done"><span class="vmk"></span><span class="vname">review</span></li>
+      <li class="vst done"><span class="vmk"></span><span class="vname">test</span><span class="vmeta">42 passed ▪ 0 failed</span></li>
+      <li class="vst pen"><span class="vmk"></span><span class="vname">merge</span><span class="worker wait"></span><span class="vmeta">等你拍板</span></li>
+      <li class="vst"><span class="vmk"></span><span class="vname">done</span></li>
+    </ol>
+
+    <div class="asks">
+      <i class="sp dface" data-s="foreman" aria-hidden="true"></i>
+      <div class="dmain">
+        <div class="dtag">⏸ 等你拍板 ▪ merge_approval</div>
+        <div class="msg">&gt; 合并提案已生成，审核 diff 后决定是否合入 main。</div>
+        <div class="ctx">测试闸门：<b>pass</b> ▪ 单元 + 集成全绿<br>agent 评审：<b>approved</b> ▪ <a>查看评审报告</a></div>
+      </div>
+    </div>
+
+    <nav class="tabs" id="tabs-ap">
+      <button class="tab on" data-pane="a-diff">Diff</button>
+      <button class="tab" data-pane="a-cmds">命令与输出 <span class="c">11</span></button>
+      <button class="tab" data-pane="a-files">产出文件</button>
+    </nav>
+
+    <div class="pane on" id="a-diff">
+      <div class="diffhead">
+        <span class="big"><span class="a">+312</span> <span class="d">−87</span> ▪ 9 个文件</span>
+        <span class="notice">基准已前移时，diff 会自动重新生成并重新审批</span>
+      </div>
+      <div class="dfile">
+        <h4>src/scheduler/worktree.rs <span class="st2">修改</span><span class="pm">+96 −31</span></h4>
+        <div class="dbody">
+          <div class="dl hunk">@@ -41,10 +41,18 @@ impl WorktreeCleaner {</div>
+          <div class="dl">     /// 任务终态后回收 worktree 与隔离分支</div>
+          <div class="dl del">-    pub fn cleanup(task_id: &amp;str) -&gt; Result&lt;()&gt; {</div>
+          <div class="dl del">-        fs::remove_dir_all(worktree_path(task_id))?;</div>
+          <div class="dl add">+    pub async fn cleanup(task_id: &amp;str, policy: CleanupPolicy) -&gt; Result&lt;()&gt; {</div>
+          <div class="dl add">+    let path = worktree_path(task_id);</div>
+          <div class="dl add">+    if policy == CleanupPolicy::KeepOnFailure &amp;&amp; !is_merged(task_id)? {</div>
+          <div class="dl add">+        tracing::warn!(task_id, "未合入，保留 worktree 供排查");</div>
+          <div class="dl add">+        return Ok(());</div>
+          <div class="dl add">+    }</div>
+          <div class="dl add">+    spawn_blocking(move || git_remove_worktree(&amp;path)).await??;</div>
+          <div class="dl">     Ok(())</div>
+          <div class="dl"> }</div>
+        </div>
+      </div>
+      <div class="dfile">
+        <h4>src/scheduler/mod.rs <span class="st2">修改</span><span class="pm">+18 −7</span></h4>
+        <div class="dbody">
+          <div class="dl hunk">@@ -112,6 +112,12 @@ async fn finish_task(</div>
+          <div class="dl add">+    let policy = settings.worktree_cleanup_policy;</div>
+          <div class="dl add">+    WorktreeCleaner::cleanup(&amp;task.id, policy).await?;</div>
+        </div>
+      </div>
+    </div>
+
+    <div class="pane" id="a-cmds">
+      <div class="cmd"><div class="cmd-l1"><span class="ok"></span><span class="tm">16:40:02</span><span class="src">sys</span><span class="sp">0.9s ▪ exit 0</span></div><div class="cmd-l2">git fetch origin</div></div>
+      <div class="cmd"><div class="cmd-l1"><span class="ok"></span><span class="tm">16:40:03</span><span class="src">sys</span><span class="sp">3.2s ▪ exit 0</span></div><div class="cmd-l2">git rebase origin/main</div></div>
+      <div class="cmd"><div class="cmd-l1"><span class="ok"></span><span class="tm">16:40:08</span><span class="src">sys</span><span class="sp">41.7s ▪ exit 0</span></div><div class="cmd-l2">cargo test -- --test-threads=1</div></div>
+      <div class="cmd"><div class="cmd-l1"><span class="ok"></span><span class="tm">16:40:52</span><span class="src">sys</span><span class="sp">0.3s ▪ exit 0</span></div><div class="cmd-l2">git diff main..kanban/t-0041 &gt; merge-proposal.diff</div></div>
+    </div>
+
+    <div class="pane" id="a-files">
+      <div class="cmd"><div class="cmd-l2"><span class="fn">review-report.md</span></div><div class="cmd-l1"><span class="src">总体评价：approved</span><span class="sp">查看 ▸</span></div></div>
+      <div class="cmd"><div class="cmd-l2"><span class="fn">test-report.md</span></div><div class="cmd-l1"><span class="src">执行结果：42 passed ▪ 0 failed</span><span class="sp">查看 ▸</span></div></div>
+      <div class="cmd"><div class="cmd-l2"><span class="fn">merge-proposal.diff</span></div><div class="cmd-l1"><span class="src">unified diff ▪ 9 个文件</span><span class="sp">查看 ▸</span></div></div>
+    </div>
+  </div>
+
+  <footer class="dock" id="dock">
+    <div class="dock-tag">⏸ 等你拍板 ▪ merge_approval</div>
+    <div class="dock-acts">
+      <button class="btn solid" id="dock-merge">合入 main（ff 优先）</button>
+      <button class="btn quiet">返回修改</button>
+    </div>
+  </footer>
+</div>
+
+<!-- 原型视图切换 -->
+<div class="demo" id="demo">
+  <div class="demo-menu">
+    <button class="on" data-v="v-board">0 传送带</button>
+    <button data-v="v-wait">1 待处理</button>
+    <button data-v="v-run">2 详情·执行中</button>
+    <button data-v="v-approve">3 详情·待审批</button>
+  </div>
+  <button class="demo-tog" id="demo-tog">窗口 ▾</button>
+</div>
+
+<script>
+/* ── 视图切换 ── */
+function show(id){
+  document.querySelectorAll('.view').forEach(v=>v.classList.toggle('on',v.id===id));
+  document.querySelectorAll('.demo-menu button').forEach(b=>b.classList.toggle('on',b.dataset.v===id));
+  document.body.classList.toggle('docked',id==='v-approve');
+  if(history.replaceState)history.replaceState(null,'','#'+id);
+  window.scrollTo(0,0);
+}
+document.querySelectorAll('.demo-menu button').forEach(b=>b.onclick=()=>show(b.dataset.v));
+document.getElementById('demo-tog').onclick=()=>document.getElementById('demo').classList.toggle('open');
+
+/* ── 像素图元 ── */
+const P=(vb,wh,body)=>`<svg viewBox="0 0 ${vb} ${vb}" width="${wh}" height="${wh}" shape-rendering="crispEdges" fill="currentColor" aria-hidden="true">${body}</svg>`;
+const SPRITES={
+  flag:P(8,16,'<rect x="2" y="0" width="1" height="8"/><rect x="3" y="0" width="4" height="2"/><rect x="3" y="2" width="3" height="1"/><rect x="3" y="3" width="2" height="1"/>'),
+  gem:P(8,16,'<rect x="3" y="0" width="2" height="1"/><rect x="2" y="1" width="4" height="1"/><rect x="1" y="2" width="6" height="1"/><rect x="2" y="3" width="4" height="1"/><rect x="3" y="4" width="2" height="1"/><rect x="2" y="6" width="4" height="2"/>'),
+  hammer:P(8,16,'<rect x="1" y="1" width="6" height="3"/><rect x="3" y="4" width="2" height="4"/>'),
+  gear:P(8,16,'<rect x="3" y="0" width="2" height="8"/><rect x="0" y="3" width="8" height="2"/><rect x="1" y="1" width="1" height="1"/><rect x="6" y="1" width="1" height="1"/><rect x="1" y="6" width="1" height="1"/><rect x="6" y="6" width="1" height="1"/>'),
+  lens:P(8,16,'<rect x="2" y="1" width="3" height="1"/><rect x="1" y="2" width="1" height="3"/><rect x="4" y="2" width="1" height="3"/><rect x="2" y="4" width="3" height="1"/><rect x="5" y="5" width="1" height="1"/><rect x="6" y="6" width="1" height="1"/>'),
+  shield:P(8,16,'<rect x="1" y="1" width="6" height="2"/><rect x="2" y="3" width="4" height="1"/><rect x="3" y="4" width="2" height="2"/>'),
+  merge:P(8,16,'<rect x="1" y="1" width="1" height="1"/><rect x="2" y="2" width="1" height="1"/><rect x="6" y="1" width="1" height="1"/><rect x="5" y="2" width="1" height="1"/><rect x="3" y="3" width="2" height="1"/><rect x="3" y="4" width="2" height="3"/>'),
+  trophy:P(8,16,'<rect x="2" y="1" width="4" height="3"/><rect x="1" y="1" width="1" height="2"/><rect x="6" y="1" width="1" height="2"/><rect x="3" y="4" width="2" height="1"/><rect x="2" y="5" width="4" height="2"/>'),
+  chest:P(8,16,'<rect x="1" y="1" width="6" height="2"/><rect x="1" y="3" width="6" height="4"/><rect x="3" y="4" width="2" height="2" fill="var(--bg)"/>'),
+  alert:P(8,16,'<rect x="3" y="0" width="2" height="5"/><rect x="3" y="6" width="2" height="2"/>'),
+  foreman:P(16,48,
+    '<rect x="5" y="0" width="6" height="2" fill="var(--pending)"/>'+
+    '<rect x="3" y="2" width="10" height="2" fill="var(--pending)"/>'+
+    '<rect x="4" y="4" width="8" height="5" fill="#E3C7A6"/>'+
+    '<rect x="5" y="6" width="2" height="2" fill="var(--ink)"/>'+
+    '<rect x="9" y="6" width="2" height="2" fill="var(--ink)"/>'+
+    '<rect x="3" y="9" width="10" height="5" fill="var(--go)"/>'+
+    '<rect x="2" y="9" width="1" height="3" fill="var(--go)"/>'+
+    '<rect x="13" y="9" width="1" height="3" fill="var(--go)"/>'+
+    '<rect x="4" y="14" width="3" height="2" fill="var(--t2)"/>'+
+    '<rect x="9" y="14" width="3" height="2" fill="var(--t2)"/>'),
+};
+document.querySelectorAll('.sp[data-s]').forEach(el=>{el.innerHTML=SPRITES[el.dataset.s]||''});
+/* 列头小人双帧：挥锤抬起 / 落锤+火花 */
+const W1='<rect x="3" y="1" width="2" height="2"/><rect x="3" y="3" width="2" height="3"/><rect x="2" y="6" width="1" height="2"/><rect x="4" y="6" width="1" height="2"/><rect x="5" y="2" width="1" height="1"/><rect x="6" y="0" width="2" height="2"/><rect x="6" y="2" width="1" height="1"/>';
+const W2='<rect x="3" y="1" width="2" height="2"/><rect x="3" y="3" width="2" height="3"/><rect x="2" y="6" width="1" height="2"/><rect x="4" y="6" width="1" height="2"/><rect x="5" y="4" width="1" height="1"/><rect x="6" y="5" width="2" height="1"/><rect x="6" y="7" width="1" height="1"/>';
+document.querySelectorAll('.worker').forEach(el=>{
+  el.innerHTML=P(8,16,W1).replace('<svg ','<svg class="f1" ')+P(8,16,W2).replace('<svg ','<svg class="f2" ');
+});
+/* token 量表 + boss 战尝试条 */
+document.querySelectorAll('.gauge').forEach(g=>{
+  const f=+g.dataset.f||0;let h='';
+  for(let i=0;i<16;i++)h+=`<i class="${i<f?'f':''}"></i>`;
+  g.innerHTML=h;
+});
+document.querySelectorAll('.bossbar .segs').forEach(s=>{
+  const f=+s.dataset.f||0;let h='';
+  for(let i=0;i<20;i++)h+=`<i class="${i<f?'f':''}"></i>`;
+  s.innerHTML=h;
+});
+
+/* ── 迷你传送带渲染 ── */
+document.querySelectorAll('.rail[data-dots]').forEach(r=>{
+  const dots=r.dataset.dots.trim().split(/\s+/);
+  r.innerHTML=dots.map((s,i)=>
+    `<i class="d ${s==='d'?'dd':s}"></i>`+(i<dots.length-1?`<i class="s ${'pdv'.includes(s)?'lit':''}"></i>`:'')
+  ).join('');
+});
+
+/* ── 分段页签 ── */
+function wireTabs(tid){
+  const root=document.getElementById(tid).parentElement;
+  const tabs=root.querySelectorAll('#'+tid+' .tab:not(.dis)');
+  tabs.forEach(t=>t.onclick=()=>{
+    tabs.forEach(x=>x.classList.remove('on'));t.classList.add('on');
+    root.querySelectorAll('.pane').forEach(p=>p.classList.remove('on'));
+    const pane=root.querySelector('#'+t.dataset.pane);if(pane)pane.classList.add('on');
+  });
+}
+wireTabs('tabs-run');wireTabs('tabs-ap');
+
+/* ── 道具栏过滤：筛卡 + 空站收拢（脊线保持连续） ── */
+const tape=document.getElementById('tape');
+document.querySelectorAll('#filters .slot').forEach(slot=>{
+  slot.onclick=()=>{
+    document.querySelectorAll('#filters .slot').forEach(s=>s.classList.remove('on'));
+    slot.classList.add('on');
+    const f=slot.dataset.f;
+    tape.querySelectorAll('.tg[data-status]').forEach(tg=>{
+      tg.hidden=!(f==='all'||tg.dataset.status===f);
+    });
+    tape.querySelectorAll('.sec').forEach(sec=>{
+      const cards=[...sec.querySelectorAll('.tg[data-status]')];
+      sec.classList.toggle('hide-cards',f!=='all'&&cards.every(c=>c.hidden));
+    });
+  };
+});
+
+/* ── 信号灯缩略条：点灯跳段 ── */
+document.querySelectorAll('.rn').forEach(b=>b.onclick=()=>{
+  const sec=document.getElementById(b.dataset.sec);
+  if(sec)sec.scrollIntoView({block:'start'});
+});
+
+/* ── 卡片进详情（按钮/输入框除外）；键盘 Enter 同效 ── */
+document.querySelectorAll('.tg').forEach(tg=>{
+  const go=e=>{
+    if(e.target.closest('button,input,a'))return;
+    show(tg.dataset.go||'v-run');
+  };
+  tg.addEventListener('click',go);
+  tg.addEventListener('keydown',e=>{if(e.key==='Enter'){e.preventDefault();go(e);}});
+});
+
+/* ── 动作坞：异步按钮（点击即禁用，回执后收尾） ── */
+const dock=document.getElementById('dock');
+document.getElementById('dock-merge').addEventListener('click',e=>{
+  const b=e.currentTarget;
+  b.disabled=true;b.textContent='… 合入中';
+  setTimeout(()=>{
+    dock.innerHTML='<div class="dock-done">✓ 已合入 main ▪ ff 优先 ▪ 14:03:02</div>';
+    document.body.classList.remove('docked');
+  },900);
+});
+
+/* iOS 上让 :active 生效 */
+document.addEventListener('touchstart',()=>{},{passive:true});
+
+/* hash 直达 */
+const fromHash=()=>{
+  const id=location.hash.slice(1);
+  if(document.querySelector('.demo-menu button[data-v="'+id+'"]'))show(id);
+};
+fromHash();
+window.addEventListener('hashchange',fromHash);
+</script>
+</body>
+</html>

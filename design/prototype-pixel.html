@@ -1,0 +1,905 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<meta name="color-scheme" content="dark">
+<title>AgentPipeline · 看板原型 · 像素机房「夜班流水线」</title>
+<!-- 主题六「像素机房 · 夜班流水线」提案：与 prototype-terminal.html 同一套页面元素与内容。
+     夜靛底、暖纸白文字、缝合像素 12px 单一字族（字号只取 12 的整数倍）、
+     2px 描边 + 4px 硬投影、棋盘 dither、急停 RPG 对话框、帧步进动画。
+     规格见 theme-6-pixel.md；状态语义沿用全站四灯（绿=执行 琥珀=等人 红=失败 灰=归档）。 -->
+<link rel="preconnect" href="https://cdn.jsdelivr.net" crossorigin>
+<link href="https://cdn.jsdelivr.net/npm/@vp-tw/cjk-web-fonts-fusion-pixel-font/dist/12px/monospaced/latin/Fusion-Pixel-12px-Monospaced-Latin.css" rel="stylesheet">
+<link href="https://cdn.jsdelivr.net/npm/@vp-tw/cjk-web-fonts-fusion-pixel-font/dist/12px/monospaced/zh_hans/Fusion-Pixel-12px-Monospaced-Simplified-Chinese.css" rel="stylesheet">
+<style>
+:root{
+  --bg:#1B1D2C; --panel:#232639; --wash:#2B2F47; --pane:#3E4363; --ink:#12131E;
+  --t-hi:#F1ECDC; --t1:#C7C3B4; --t2:#918E9F; --t3:#6E6C82; --t4:#55536B;
+  --go:#55D97C; --go-hi:#6FE693; --go-ink:#0B2314;
+  --pending:#FFB545; --stop:#FF6157; --done:#6E6C82;
+  --dev:#59A7FF; --tst:#C08BFF;
+  --diff-a:#57D97C; --diff-a-bg:#16301F; --diff-d:#FF7B6E; --diff-d-bg:#361A20;
+  --belt-lit:#4E5478;
+  --px:"Fusion Pixel 12px Monospaced Latin","Fusion Pixel 12px Monospaced Simplified Chinese",monospace;
+}
+*{margin:0;padding:0;box-sizing:border-box}
+html{-webkit-font-smoothing:none;font-smooth:never}
+body{background:var(--bg);color:var(--t1);font-family:var(--px);font-size:12px;
+  line-height:1.6;padding-bottom:64px}
+button{font-family:inherit;font-size:12px;color:inherit;background:none;border:none;cursor:pointer}
+input{font-family:inherit}
+a{color:inherit}
+b,strong{font-weight:400;color:var(--t-hi)}
+:focus-visible{outline:2px solid var(--t-hi);outline-offset:2px}
+/* 全站唯一"渐变"：2×2 棋盘 dither */
+.dither{background-image:conic-gradient(var(--wash) 25%,transparent 0 50%,var(--wash) 0 75%,transparent 0);
+  background-size:4px 4px}
+
+/* ───────── 顶栏：车间铭牌排 ───────── */
+.topbar{position:sticky;top:0;z-index:20;display:flex;align-items:center;gap:14px;
+  height:46px;padding:0 16px;background:var(--bg);border-bottom:2px solid var(--pane)}
+.logo{flex:none;width:12px;height:12px;background:var(--go);border:2px solid var(--ink);
+  box-shadow:7px 5px 0 0 var(--pending);margin-right:9px}
+.wordmark{font-size:24px;color:var(--t-hi);letter-spacing:.08em;line-height:1;
+  text-shadow:3px 3px 0 var(--ink)}
+.sess{color:var(--t3);font-size:12px}
+.filters{display:flex;gap:6px;margin-left:auto}
+.chip{border:2px solid transparent;color:var(--t2);padding:1px 8px;line-height:1.5}
+.chip:hover{color:var(--t1)}
+.chip.on{background:var(--wash);border-color:var(--pane);color:var(--t-hi)}
+.chip.on::before{content:'▶ ';color:var(--go)}
+.chip .c{display:inline-block;min-width:14px;text-align:center;color:var(--t3);
+  border:2px solid var(--pane);padding:0 2px;margin-left:4px;line-height:1.3}
+.chip.on .c{color:var(--t2)}
+.chip.pend .c{color:var(--pending);border-color:var(--pending)}
+.btn-new{margin-left:10px;border:2px solid var(--pane);background:var(--panel);
+  color:var(--t1);padding:2px 10px;box-shadow:3px 3px 0 var(--ink)}
+.btn-new:hover{color:var(--t-hi);border-color:var(--t2)}
+.btn-new:active{transform:translate(3px,3px);box-shadow:none}
+
+/* ───────── 传送带（轨道脊线） ───────── */
+.hscroll{overflow-x:auto}
+.hinner{width:2130px}
+.railwrap{position:relative;height:168px;width:2130px;padding-top:6px}
+.belt{position:absolute;height:6px;background:var(--pane)}
+.belt.lit{background:var(--belt-lit)}
+.belt.vt{width:6px;height:34px}
+.ret{position:absolute;height:2px;color:var(--t4);font-size:12px;line-height:1;
+  background:repeating-linear-gradient(90deg,var(--t4) 0 6px,transparent 6px 12px)}
+.ret i{font-style:normal;position:absolute;left:0;top:-6px;background:var(--bg);padding-right:4px}
+.stn{position:absolute;top:0;transform:translateX(-50%);
+  display:flex;flex-direction:column;align-items:center;gap:4px;text-align:center}
+.stn .lamp{width:12px;height:12px;border:2px solid var(--pane);background:var(--bg)}
+.stn .lamp.d{background:var(--done);border-color:var(--done)}
+.stn .lamp.p{background:var(--belt-lit);border-color:var(--belt-lit)}
+.stn .lamp.c{background:var(--go);border-color:var(--go)}
+.stn .lamp.w{background:var(--pending);border-color:var(--pending)}
+.stn .lamp.x{background:var(--stop);border-color:var(--stop)}
+.stn .lb{font-size:12px;letter-spacing:.08em;color:var(--t3);white-space:nowrap;line-height:1.2}
+.stn .lb.hot{color:var(--t-hi)} .stn .lb.pen{color:var(--pending)}
+.stn .ct{display:inline-block;font-size:12px;line-height:1.2;color:var(--t3);
+  border:2px solid var(--pane);padding:0 4px;margin-top:2px}
+.stn .ct.pen{color:var(--pending);border-color:var(--pending)}
+.stn.side{transform:translate(-6px,-50%);top:0}
+.stn.side .lb{position:absolute;left:18px;white-space:nowrap;background:var(--bg);
+  padding:0 4px;font-size:12px;letter-spacing:.06em;color:var(--t3)}
+.stn.side.up .lb{bottom:2px}
+.stn.side.dn .lb{top:2px;left:auto;right:18px}
+.stn.side .lb b{color:var(--t4);margin-right:4px}
+
+/* ───────── 看板：工位阵列 ───────── */
+.boardpad{padding:6px 16px 8px}
+.panes{display:flex;border:2px solid var(--pane);background:var(--bg);width:2130px}
+.col{width:264px;flex:none;border-right:2px solid var(--pane);display:flex;flex-direction:column}
+.col:last-child{border-right:0}
+.col-head{display:flex;justify-content:space-between;align-items:center;gap:6px;
+  padding:8px 12px;border-bottom:2px solid var(--pane);
+  font-size:12px;letter-spacing:.08em;color:var(--t3)}
+.col-head .hn{overflow:hidden;text-overflow:ellipsis;white-space:nowrap;flex:1}
+.col-n{color:var(--t4)}
+.sp{display:inline-block;line-height:0}
+.col-head .hn .sp{margin-right:6px;vertical-align:-3px}
+.col.arch .col-head .sp{color:var(--pending)}
+/* 列头小人：run=快挥锤 wait=慢挥锤 idle=站立 */
+.worker{position:relative;display:inline-block;width:16px;height:16px;margin-left:8px;flex:none}
+.worker svg{position:absolute;inset:0}
+.worker .f2{opacity:0}
+.worker.run{color:var(--go)}
+.worker.wait{color:var(--pending)}
+.worker.idle{color:var(--t4)}
+.worker.run .f1{animation:wA .6s infinite}
+.worker.run .f2{animation:wB .6s infinite}
+.worker.wait .f1{animation:wA 1.8s infinite}
+.worker.wait .f2{animation:wB 1.8s infinite}
+@keyframes wA{0%,50%{opacity:1}50.01%,100%{opacity:0}}
+@keyframes wB{0%,50%{opacity:0}50.01%,100%{opacity:1}}
+/* 道具栏式过滤 */
+.slots{display:flex}
+.slot{width:34px;height:34px;border:2px solid var(--pane);background:var(--panel);
+  display:grid;place-items:center;color:var(--t2);margin-left:-2px;position:relative}
+.slot:first-child{margin-left:0}
+.slot:hover{color:var(--t1)}
+.slot.on{border-color:var(--t-hi);color:var(--t-hi);background:var(--wash);z-index:1}
+.slot .cb{position:absolute;right:-5px;bottom:-5px;background:var(--bg);
+  border:2px solid var(--pane);color:var(--t3);padding:0 2px;line-height:1.2}
+.slot.pend{color:var(--pending)}
+.slot.pend .cb{color:var(--pending);border-color:var(--pending)}
+/* boss 战尝试条 */
+.bossbar{display:flex;align-items:center;gap:8px;margin:10px 12px 0}
+.bossbar .bl2{flex:none;color:var(--t-hi)}
+.bossbar .segs{flex:1;display:flex;gap:2px;border:2px solid var(--pane);
+  background:var(--bg);padding:2px}
+.bossbar .segs i{flex:1;height:10px;background:var(--wash)}
+.bossbar .segs i.f{background:var(--go)}
+/* 任务完成横幅（奖杯） */
+.qtoast{position:fixed;top:58px;left:50%;transform:translateX(-50%);z-index:35;
+  display:flex;align-items:center;gap:12px;padding:10px 14px;
+  background:var(--panel);border:2px solid var(--go);box-shadow:4px 4px 0 var(--ink)}
+.qtoast .sp{color:var(--go)}
+.qtoast .sp svg{width:24px;height:24px}
+.qtoast .qt{color:var(--pending)}
+.col.arch .col-head{color:var(--pending)}
+.col-empty{margin:12px;padding:10px 12px;border:2px solid var(--pane);color:var(--t4);
+  background-image:conic-gradient(var(--wash) 25%,transparent 0 50%,var(--wash) 0 75%,transparent 0);
+  background-size:4px 4px}
+
+/* 货箱（卡片） */
+.card{position:relative;border:2px solid var(--pane);background:var(--panel);
+  box-shadow:4px 4px 0 var(--ink);margin:12px;cursor:pointer}
+.card::before{content:'';position:absolute;top:0;left:0;right:0;height:6px;
+  background-image:conic-gradient(var(--wash) 25%,transparent 0 50%,var(--wash) 0 75%,transparent 0);
+  background-size:4px 4px}
+.card>*{position:relative}
+.card>:first-child{margin-top:8px}
+.card:hover{border-color:var(--t2)}
+.card.warn{border-color:var(--pending);
+  box-shadow:inset 4px 0 0 var(--pending),4px 4px 0 var(--ink)}
+.card.stopped{border-color:var(--stop);
+  box-shadow:inset 4px 0 0 var(--stop),4px 4px 0 var(--ink)}
+.card.mute{box-shadow:none;border-color:var(--pane)}
+.card.mute:hover{border-color:var(--t4)}
+.card-top{display:flex;justify-content:space-between;align-items:baseline;gap:8px;
+  padding:0 12px}
+.card-title{color:var(--t-hi);font-size:12px;line-height:1.5}
+.card.warn .card-title::before{content:'?! ';color:var(--pending)}
+.card.mute .card-title{color:var(--t2)}
+.stalltag{flex:none;color:var(--pending);letter-spacing:.04em}
+.dur{font-size:12px;color:var(--t3)}
+.tagline{padding:0 12px;margin-top:6px;color:var(--t3)}
+.tagline b{color:var(--t2)}
+
+/* 迷你传送带：像素方块 + 链节 */
+.rail{display:flex;align-items:center;min-height:10px;margin:8px 12px 2px}
+.rail .d{flex:none;width:10px;height:10px;border:2px solid var(--pane);background:var(--panel)}
+.rail .d.p{background:var(--belt-lit);border-color:var(--belt-lit)}
+.rail .d.dd{background:var(--done);border-color:var(--done)}
+.rail .d.c,.rail .d.v{background:var(--go);border-color:var(--go)}
+.rail .d.w{background:var(--pending);border-color:var(--pending)}
+.rail .d.x{background:var(--stop);border-color:var(--stop)}
+.rail .d.t{background:transparent}
+.rail .s{flex:1;height:4px;background:var(--pane)}
+.rail .s.lit{background:var(--belt-lit)}
+.prow{display:flex;align-items:center;gap:8px;padding:0 12px}
+.prow .bl{flex:none;color:var(--dev);letter-spacing:.04em}
+.prow .bl.t{color:var(--tst)}
+.prow .rail{flex:1;margin:4px 0}
+
+/* 状态灯字（RUN/WAIT/FAIL） */
+.pill{display:block;padding:0 12px;color:var(--t2);line-height:1.8}
+.st::before{content:'';display:inline-block;width:8px;height:8px;margin-right:5px;
+  background:currentColor;vertical-align:baseline}
+.st.run{color:var(--go)} .st.wait{color:var(--pending)}
+.st.stop{color:var(--stop)} .st.dim{color:var(--t4)}
+.st.dim::before{background:transparent;border:2px solid var(--t4)}
+.pill .note{color:var(--t4)}
+
+/* token 量表：16 段像素 HP 条，满格 ≈ 64k tok */
+.gauge{display:inline-flex;gap:2px;vertical-align:-1px;margin-right:6px}
+.gauge i{width:5px;height:10px;background:var(--pane)}
+.gauge i.f{background:var(--go)}
+.gauge.g-warn i.f{background:var(--pending)}
+.gauge.g-dim i.f{background:var(--done)}
+.gauge.g-stop i.f{background:var(--stop)}
+
+/* 急停对话框（pending 理由）：RPG 名牌 + 正文 + ▼ 光标 */
+.dialog{position:relative;margin:16px 12px 4px;padding:8px 10px;background:var(--bg);
+  border:2px solid var(--t2);box-shadow:inset 0 0 0 2px var(--bg),inset 0 0 0 4px var(--pane)}
+.dialog::after{content:'▼';position:absolute;right:6px;bottom:0;color:var(--pending);
+  font-size:12px;line-height:1;animation:blink 1s steps(2) infinite}
+.dialog.warn{border-color:var(--pending)}
+.dname{position:absolute;top:-16px;left:6px;background:var(--bg);
+  border:2px solid var(--pending);color:var(--pending);padding:0 8px;line-height:1.5}
+.dtxt{display:block;color:var(--t2)}
+.rlabel{color:var(--pending)}
+.ctxlink{margin:4px 12px 0;font-size:12px}
+.ctxlink a{color:var(--t1);text-decoration:underline;text-underline-offset:3px;cursor:pointer}
+.ctxlink a::before{content:'▸ ';color:var(--t3)}
+.ctxlink a:hover{color:var(--t-hi)}
+.ainput{display:block;width:calc(100% - 24px);margin:8px 12px 2px;background:var(--bg);
+  border:2px solid var(--pane);color:var(--t-hi);font-size:12px;padding:4px 8px}
+.ainput::placeholder{color:var(--t4)}
+.ainput:focus{outline:none;border-color:var(--t2)}
+
+/* 像素钮 */
+.actions{display:flex;flex-wrap:wrap;gap:8px;margin:10px 12px 2px}
+.btn{display:inline-block;border:2px solid var(--pane);background:var(--panel);
+  color:var(--t1);padding:2px 10px;line-height:1.6;box-shadow:3px 3px 0 var(--ink)}
+.btn:hover{color:var(--t-hi);border-color:var(--t2)}
+.btn:active{transform:translate(3px,3px);box-shadow:none}
+.btn.solid{background:var(--go);border-color:var(--go);color:var(--go-ink)}
+.btn.solid::before{content:'▶ '}
+.btn.solid:hover{background:var(--go-hi);border-color:var(--go-hi);color:var(--go-ink)}
+.btn.quiet{border-color:transparent;background:none;box-shadow:none;color:var(--t3)}
+.btn.quiet:hover{color:var(--t-hi)}
+.btn.quiet:active{transform:none}
+.btn.danger{border-color:transparent;background:none;box-shadow:none;color:var(--stop)}
+.btn.danger:hover{border-color:var(--stop)}
+.btn.danger:active{transform:none}
+.meta{margin:8px 12px 10px;color:var(--t3)}
+.meta b{color:var(--t-hi)}
+.diffstat{margin:6px 12px 0;color:var(--t3)}
+.diffstat .a{color:var(--diff-a)} .diffstat .d{color:var(--diff-d)}
+
+/* ───────── 底部状态行：车间看板条 ───────── */
+.statusbar{position:fixed;left:0;right:0;bottom:0;z-index:30;height:36px;
+  display:flex;align-items:center;gap:16px;padding:0 16px;
+  background:var(--bg);border-top:2px solid var(--pane);color:var(--t3)}
+.statusbar b{color:var(--t2)}
+.statusbar .pen{color:var(--pending)}
+.statusbar .sep{color:var(--t4)}
+.statusbar .clock{margin-left:auto;color:var(--t2)}
+
+/* ───────── 详情页 ───────── */
+.detail{max-width:1000px;margin:0 auto;padding:18px 20px 40px}
+.crumb{display:inline-block;color:var(--t3);margin-bottom:10px;cursor:pointer}
+.crumb::before{content:'← '}
+.crumb:hover{color:var(--t-hi)}
+.d-head{display:flex;align-items:baseline;gap:14px;flex-wrap:wrap;margin-bottom:6px}
+.d-title{font-size:24px;color:var(--t-hi);line-height:1.2}
+.d-meta{display:flex;gap:14px;font-size:12px;color:var(--t3);flex-wrap:wrap}
+.d-meta .run{color:var(--go)} .d-meta .warn{color:var(--pending)}
+.legend{font-size:12px;color:var(--t4);margin:8px 0 14px}
+.legend .sw{display:inline-block;width:8px;height:8px;margin:0 3px 0 10px;vertical-align:baseline}
+.legend .sw:first-child{margin-left:0}
+.hrail{position:relative;height:168px;width:100%;max-width:960px;margin:6px 0 0}
+.tabs{display:flex;gap:6px;border-bottom:2px solid var(--pane);margin:10px 0 16px;padding-bottom:8px}
+.tab{border:2px solid var(--pane);background:var(--bg);color:var(--t3);padding:2px 12px;line-height:1.6}
+.tab:hover{color:var(--t1)}
+.tab.on{background:var(--wash);border-color:var(--t2);color:var(--t-hi)}
+.tab.dis{color:var(--t4);cursor:default;
+  background-image:conic-gradient(var(--wash) 25%,transparent 0 50%,var(--wash) 0 75%,transparent 0);
+  background-size:4px 4px}
+.tab .c{color:var(--t4);margin-left:3px}
+.pane{display:none}.pane.on{display:block}
+
+/* 会话 */
+.runrow{display:flex;gap:8px;flex-wrap:wrap;margin-bottom:14px}
+.runchip{border:2px solid var(--pane);color:var(--t3);padding:1px 8px}
+.runchip.now{color:var(--t-hi);border-color:var(--t2);background:var(--wash)}
+.convhead{display:flex;justify-content:space-between;align-items:baseline;
+  padding-bottom:8px;border-bottom:2px solid var(--pane);margin-bottom:12px}
+.convhead h3{font-size:12px;color:var(--t-hi)}
+.convhead .m{font-size:12px;color:var(--t3)}
+.msg{margin-bottom:13px}
+.msg .who{color:var(--t3);margin-bottom:3px;letter-spacing:.1em}
+.msg .who.as{color:var(--t-hi)}
+.sysbox{border:2px solid var(--pane);background:var(--bg);padding:6px 10px;color:var(--t3);cursor:pointer}
+.userbox{color:var(--t2);white-space:pre-wrap}
+.assistant p{color:var(--t1);margin:2px 0 8px;max-width:76ch}
+.toolcard{display:flex;align-items:center;gap:10px;border-left:4px solid var(--pane);
+  padding:2px 0 2px 12px;margin:5px 0;max-width:680px;color:var(--t2)}
+.toolcard .fn b{color:var(--t-hi)}
+.toolcard .res{margin-left:auto;font-size:12px;color:var(--t3)}
+.toolcard .res.ok{color:var(--go)}
+.attempt-sep{display:flex;align-items:center;gap:10px;margin:18px 0 12px;color:var(--stop)}
+.attempt-sep::before,.attempt-sep::after{content:'';flex:1;height:2px;
+  background:repeating-linear-gradient(90deg,var(--pane) 0 6px,transparent 6px 12px)}
+.attempt-sep .mono{cursor:pointer;color:var(--t3)}
+.attempt-sep .mono:hover{color:var(--t-hi)}
+.streaming::after{content:'▊';color:var(--go);animation:blink .9s steps(2) infinite}
+@keyframes blink{50%{opacity:0}}
+.tokmeter{clear:both;text-align:right;color:var(--t3);padding:6px 0}
+.tokmeter b{color:var(--t-hi)}
+
+/* 时间线 */
+.tline{max-width:820px;color:var(--t2)}
+.trow{display:flex;gap:12px;padding:3px 8px}
+.trow:hover{background:var(--panel)}
+.trow .t{color:var(--t4);flex:none;width:72px}
+.trow .tr{flex:none;width:96px;color:var(--t3)}
+.trow .tr.warn{color:var(--pending)} .trow .tr.stop{color:var(--stop)}
+.trow .to{flex:1;color:var(--t2)}
+.trow .why{color:var(--t4)}
+.bb{border:2px solid var(--pane);padding:0 3px;color:var(--t3)}
+
+/* 命令表 */
+.cmds{max-width:900px}
+.cmd{display:flex;align-items:center;gap:10px;padding:4px 8px;color:var(--t2);cursor:pointer}
+.cmd:hover{background:var(--panel)}
+.cmd .ok,.cmd .ng{flex:none;width:8px;height:8px}
+.cmd .ok{background:var(--go)} .cmd .ng{background:var(--stop)}
+.cmd .tm{color:var(--t4);width:66px;flex:none}
+.cmd .src{flex:none;width:34px;text-align:center;color:var(--t3);border:2px solid var(--pane)}
+.cmd .c{flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.cmd .ms{color:var(--t3);width:52px;flex:none;text-align:right}
+.cmd .ex{color:var(--t3);width:44px;flex:none;text-align:right}
+.cmdout{border-left:4px solid var(--pane);background:var(--panel);
+  margin:4px 0 12px 26px;padding:8px 12px;color:var(--t2);max-width:840px}
+.cmdout .ln{color:var(--t3)} .cmdout .fin{color:var(--go)}
+
+/* Diff */
+.diffhead{display:flex;gap:16px;align-items:baseline;margin-bottom:12px;flex-wrap:wrap}
+.diffhead .big .a{color:var(--diff-a)} .diffhead .big .d{color:var(--diff-d)}
+.notice{color:var(--pending);border:2px solid var(--pending);padding:1px 10px}
+.dfile{margin-bottom:14px}
+.dfile h4{color:var(--t-hi);margin-bottom:6px}
+.dfile h4 .st2{color:var(--t3);border:2px solid var(--pane);padding:0 5px;margin-left:8px}
+.dfile h4 .pm{color:var(--t3);margin-left:8px}
+.dbody{border:2px solid var(--pane);overflow:hidden;line-height:1.7}
+.dl{padding:0 12px;white-space:pre;color:var(--t3)}
+.dl.add{background:var(--diff-a-bg);color:var(--diff-a)}
+.dl.del{background:var(--diff-d-bg);color:var(--diff-d)}
+.dl.hunk{color:var(--t2);
+  background-image:conic-gradient(var(--wash) 25%,transparent 0 50%,var(--wash) 0 75%,transparent 0);
+  background-size:4px 4px}
+
+/* 待办 dossier：操作台对话框 */
+.detail.split{max-width:1240px;display:grid;grid-template-columns:1fr 340px;gap:18px;align-items:start}
+.dossier{grid-column:2;grid-row:1 / span 3;position:sticky;top:60px;
+  border:2px solid var(--pending);background:var(--panel);
+  box-shadow:inset 0 0 0 2px var(--panel),inset 0 0 0 4px var(--pane),4px 4px 0 var(--ink);
+  padding:12px 14px;display:flex;gap:12px}
+.dossier .dface{flex:none;width:48px;height:48px}
+.dossier .dmain{flex:1;min-width:0}
+.dossier .dtag{color:var(--pending);margin-bottom:8px}
+.dossier .dtag::after{content:'▼';float:right;animation:blink 1s steps(2) infinite}
+.dossier .msg{color:var(--t-hi);margin-bottom:9px}
+.dossier .ctx{color:var(--t2);margin-bottom:6px;line-height:1.8}
+.dossier .ctx b{color:var(--go)}
+.dossier .ctx a{color:var(--t-hi);text-decoration:underline;text-underline-offset:3px;cursor:pointer}
+.dossier .grp{color:var(--t4);letter-spacing:.08em;margin:12px 0 7px}
+.dossier .btn{display:block;width:100%;text-align:left;margin-bottom:8px}
+
+/* 原型切换器 */
+.demo{position:fixed;right:16px;bottom:48px;z-index:40;display:flex;gap:6px;padding:6px;
+  background:var(--bg);border:2px solid var(--pane);box-shadow:4px 4px 0 var(--ink)}
+.demo span{color:var(--t4);align-self:center;padding:0 4px}
+.demo button{border:2px solid var(--pane);color:var(--t3);padding:1px 8px}
+.demo button:hover{color:var(--t-hi)}
+.demo button.on{background:var(--go);border-color:var(--go);color:var(--go-ink)}
+.view{display:none}.view.on{display:block}
+
+@media (prefers-reduced-motion:reduce){
+  *,*::before,*::after{animation:none!important;transition:none!important}
+}
+</style>
+</head>
+<body>
+
+<!-- ═══════════ 视图 1：看板（8 工位，无 sync-check） ═══════════ -->
+<div class="view on" id="v-board">
+  <header class="topbar">
+    <span class="logo" aria-hidden="true"></span>
+    <span class="wordmark">AGENTPIPELINE</span>
+    <span class="sess">本机夜班</span>
+    <nav class="filters slots">
+      <button class="slot on" title="全部"><i class="sp" data-s="chest"></i><span class="cb">10</span></button>
+      <button class="slot" title="执行中"><i class="sp" data-s="gear"></i><span class="cb">3</span></button>
+      <button class="slot pend" title="待处理"><i class="sp" data-s="alert"></i><span class="cb">3</span></button>
+      <button class="slot" title="等依赖"><i class="sp" data-s="merge"></i><span class="cb">1</span></button>
+      <button class="slot" title="排队"><i class="sp" data-s="flag"></i><span class="cb">1</span></button>
+      <button class="slot" title="已完成"><i class="sp" data-s="trophy"></i><span class="cb">1</span></button>
+    </nav>
+    <button class="btn-new">新建任务</button>
+  </header>
+
+  <div class="hscroll"><div class="hinner">
+    <div class="railwrap">
+      <!-- 主带 134→1982；双带并轨 398→926；回流带（↩） -->
+      <div class="belt" style="left:134px;width:1848px;top:76px"></div>
+      <div class="belt lit" style="left:398px;width:528px;top:62px"></div>
+      <div class="belt lit" style="left:398px;width:528px;top:90px"></div>
+      <div class="belt vt" style="left:398px;top:62px"></div>
+      <div class="belt vt" style="left:920px;top:62px"></div>
+      <div class="ret" style="left:398px;width:528px;top:116px"><i>↩</i></div>
+      <div class="ret" style="left:920px;width:528px;top:132px"><i>↩</i></div>
+      <div class="ret" style="left:1454px;width:264px;top:116px"><i>↩</i></div>
+      <div class="ret" style="left:920px;width:792px;top:148px"><i>↩</i></div>
+      <!-- 工位信号灯 -->
+      <div class="stn" style="left:134px"><span class="lamp"></span><span class="lb">init</span><span class="ct">2</span></div>
+      <div class="stn" style="left:398px"><span class="lamp w"></span><span class="lb pen">architect-design</span><span class="ct pen">2</span></div>
+      <div class="stn side up" style="left:660px;top:62px"><span class="lamp"></span><span class="lb"><b>[dev]</b>develop-design</span></div>
+      <div class="stn side dn" style="left:660px;top:90px"><span class="lamp"></span><span class="lb"><b>[tst]</b>test-design</span></div>
+      <div class="stn" style="left:926px"><span class="lamp c"></span><span class="lb hot">develop</span><span class="ct">2</span></div>
+      <div class="stn" style="left:1190px"><span class="lamp c"></span><span class="lb hot">review</span><span class="ct">1</span></div>
+      <div class="stn" style="left:1454px"><span class="lamp"></span><span class="lb">test</span></div>
+      <div class="stn" style="left:1718px"><span class="lamp w"></span><span class="lb pen">merge</span><span class="ct pen">1</span></div>
+      <div class="stn" style="left:1982px"><span class="lamp d"></span><span class="lb">done</span><span class="ct">1</span></div>
+    </div>
+
+    <div class="boardpad"><main class="panes">
+
+      <!-- init -->
+      <section class="col">
+        <div class="col-head"><span class="hn"><i class="sp" data-s="flag"></i>init</span><span class="worker idle"></span><span class="col-n">2</span></div>
+        <div class="card mute">
+          <div class="card-top"><span class="card-title">实现飞书通知渠道</span><span class="dur">—</span></div>
+          <div class="rail" data-dots="f f f f f f f f f"></div>
+          <div class="tagline">等待依赖 <b>实现用户登录</b> 完成</div>
+        </div>
+        <div class="card mute">
+          <div class="card-top"><span class="card-title">任务成本月度报表</span><span class="dur">—</span></div>
+          <div class="tagline">排队等待并发名额（3 / 5）</div>
+        </div>
+      </section>
+
+      <!-- architect-design -->
+      <section class="col arch">
+        <div class="col-head"><span class="hn"><i class="sp" data-s="gem"></i>architect-design</span><span class="worker wait"></span><span class="col-n">2</span></div>
+        <div class="card warn">
+          <div class="card-top"><span class="card-title">实现任务依赖拓扑排序</span><span class="stalltag">STALLED 3d</span></div>
+          <div class="rail" data-dots="p w f f f f f f f"></div>
+          <div class="pill">architect-design · execute <span class="st wait">WAIT</span> <span class="note">等待决定</span></div>
+          <div class="dialog warn"><div class="dname">语义重复风险</div><span class="dtxt">与「任务依赖循环检测」的新增符号重叠：TopoSort、detect_cycle。</span></div>
+          <div class="ctxlink"><a>并排对比两份设计</a></div>
+          <div class="actions">
+            <button class="btn">继续进入开发</button>
+            <button class="btn quiet">取消其一</button>
+          </div>
+          <div class="meta"><span class="gauge g-warn" data-f="2"></span><b>9.1k</b> tok ▪ 4m02s</div>
+        </div>
+        <div class="card warn">
+          <div class="card-top"><span class="card-title">重构会话压缩模块</span><span class="dur">3m12s</span></div>
+          <div class="rail" data-dots="p w f f f f f f f"></div>
+          <div class="pill">architect-design · validate_input</div>
+          <div class="dialog warn"><div class="dname">信息不足</div><span class="dtxt">设计缺少数据流定义：请补充鉴权 Token 的存储位置与过期策略。</span></div>
+          <input class="ainput" placeholder="补充说明后继续…">
+          <div class="actions">
+            <button class="btn solid">补充说明并继续</button>
+          </div>
+          <div class="meta"><span class="gauge g-warn" data-f="2"></span><b>8.4k</b> tok ▪ 214 次调用</div>
+        </div>
+      </section>
+
+      <!-- develop-design ∥ test-design -->
+      <section class="col">
+        <div class="col-head"><span class="hn"><i class="sp" data-s="hammer"></i>develop-design ∥ test-design</span><span class="worker run"></span><span class="col-n">1</span></div>
+        <div class="card">
+          <div class="card-top"><span class="card-title">增加任务依赖循环检测</span><span class="dur">6m40s</span></div>
+          <div class="prow"><span class="bl">[dev]</span><div class="rail" data-dots="p p v f f f f f f"></div></div>
+          <div class="prow"><span class="bl t">[tst]</span><div class="rail" data-dots="p p f t f f f f f"></div></div>
+          <div class="pill">develop-design · execute <span class="st run">RUN</span><br>test-design · validate_output <span class="st dim">等待汇合</span></div>
+          <div class="meta"><span class="gauge" data-f="6"></span><b>22.1k</b> tok ▪ kanban/t-0047</div>
+        </div>
+      </section>
+
+      <!-- develop -->
+      <section class="col">
+        <div class="col-head"><span class="hn"><i class="sp" data-s="gear"></i>develop</span><span class="worker run"></span><span class="col-n">2</span></div>
+        <div class="card">
+          <div class="card-top"><span class="card-title">实现用户登录</span><span class="dur">12m34s</span></div>
+          <div class="rail" data-dots="p p p p c f f f f"></div>
+          <div class="pill">develop · execute <span class="st run">RUN</span> <span class="note">第 2 次尝试</span></div>
+          <div class="bossbar"><span class="bl2">尝试 2/3</span><div class="segs" data-f="13"></div></div>
+          <div class="meta"><span class="gauge" data-f="11"></span><b>45.2k</b> tok ▪ 214 次调用 ▪ kanban/t-0042</div>
+        </div>
+        <div class="card stopped">
+          <div class="card-top"><span class="card-title">优化看板首屏渲染</span><span class="dur">8m51s</span></div>
+          <div class="rail" data-dots="p p p p x f f f f"></div>
+          <div class="pill">develop · execute <span class="st stop">FAIL</span></div>
+          <div class="actions"><button class="btn danger">重试（回到 init）</button></div>
+          <div class="meta"><span class="gauge g-stop" data-f="8"></span><b>31.7k</b> tok ▪ kanban/t-0039</div>
+        </div>
+      </section>
+
+      <!-- review -->
+      <section class="col">
+        <div class="col-head"><span class="hn"><i class="sp" data-s="lens"></i>review</span><span class="worker run"></span><span class="col-n">1</span></div>
+        <div class="card">
+          <div class="card-top"><span class="card-title">统一错误处理与重试语义</span><span class="dur">2m05s</span></div>
+          <div class="rail" data-dots="p p p p p c f f f"></div>
+          <div class="pill">review · execute <span class="st run">RUN</span> <span class="note">agent 评审中</span></div>
+          <div class="meta"><span class="gauge" data-f="3"></span><b>9.8k</b> tok ▪ kanban/t-0044</div>
+        </div>
+      </section>
+
+      <!-- test -->
+      <section class="col">
+        <div class="col-head"><span class="hn"><i class="sp" data-s="shield"></i>test</span><span class="worker idle"></span></div>
+        <div class="col-empty">评审通过的任务会在这里跑集成测试。</div>
+      </section>
+
+      <!-- merge -->
+      <section class="col">
+        <div class="col-head"><span class="hn"><i class="sp" data-s="merge"></i>merge</span><span class="worker wait"></span><span class="col-n">1</span></div>
+        <div class="card warn">
+          <div class="card-top"><span class="card-title">实现 worktree 清理策略</span><span class="dur">18m22s</span></div>
+          <div class="rail" data-dots="p p p p p p p w f"></div>
+          <div class="pill">merge · execute <span class="st wait">WAIT</span> <span class="note">等待审批</span></div>
+          <div class="dialog warn"><div class="dname">合并提案</div><span class="dtxt">合入 main 前请审核 diff。</span></div>
+          <div class="diffstat"><span class="a">+312</span> <span class="d">−87</span> ▪ 9 个文件</div>
+          <div class="actions">
+            <button class="btn solid">审核并合入</button>
+            <button class="btn quiet">返回修改</button>
+          </div>
+          <div class="meta"><span class="gauge g-warn" data-f="15"></span><b>61.9k</b> tok ▪ kanban/t-0041</div>
+        </div>
+      </section>
+
+      <!-- done -->
+      <section class="col">
+        <div class="col-head"><span class="hn"><i class="sp" data-s="trophy"></i>done</span><span class="worker idle"></span><span class="col-n">1</span></div>
+        <div class="card mute">
+          <div class="card-top"><span class="card-title">接入 SQLite 迁移</span><span class="dur">26m40s</span></div>
+          <div class="rail" data-dots="d d d d d d d d d"></div>
+          <div class="diffstat"><span class="a">+542</span> <span class="d">−13</span> ▪ 6 个文件 ▪ 已合入 main</div>
+          <div class="meta"><span class="gauge g-dim" data-f="7"></span><b>28.4k</b> tok ▪ kanban/t-0038</div>
+        </div>
+      </section>
+
+    </main></div>
+  </div></div>
+
+  <!-- 任务完成横幅（demo 静态展示） -->
+  <div class="qtoast">
+    <i class="sp" data-s="trophy" aria-hidden="true"></i>
+    <span><span class="qt">任务完成</span> ▪ 接入 SQLite 迁移 ▪ +542 −13 ▪ 已合入 main</span>
+    <button class="btn">收下</button>
+  </div>
+</div>
+
+<!-- ═══════════ 视图 2：详情 · 执行中 ═══════════ -->
+<div class="view" id="v-run">
+  <header class="topbar">
+    <span class="logo" aria-hidden="true"></span>
+    <span class="wordmark">AGENTPIPELINE</span>
+    <span class="sess">本机夜班</span>
+    <nav class="filters"><button class="chip on" onclick="show('v-board')">← 返回看板</button></nav>
+  </header>
+  <div class="detail">
+    <a class="crumb" onclick="show('v-board')">看板</a>
+    <div class="d-head">
+      <h1 class="d-title">实现用户登录</h1>
+      <div class="d-meta">
+        <span class="run">■ running ▪ develop.execute（第 2 次尝试）</span>
+        <span>⏱ 12m34s</span>
+        <span><span class="gauge" data-f="11"></span>45.2k tok ▪ 214 次调用</span>
+        <span>kanban/t-0042</span>
+        <span>评审：agent</span>
+      </div>
+    </div>
+
+    <div class="hrail">
+      <div class="belt" style="left:56px;width:318px;top:76px"></div>
+      <div class="belt" style="left:374px;width:424px;top:76px"></div>
+      <div class="belt lit" style="left:162px;width:212px;top:62px"></div>
+      <div class="belt lit" style="left:162px;width:212px;top:90px"></div>
+      <div class="belt vt" style="left:162px;top:62px"></div>
+      <div class="belt vt" style="left:368px;top:62px"></div>
+      <div class="ret" style="left:162px;width:212px;top:116px"><i>↩</i></div>
+      <div class="ret" style="left:374px;width:106px;top:132px"><i>↩</i></div>
+      <div class="ret" style="left:586px;width:106px;top:116px"><i>↩</i></div>
+      <div class="ret" style="left:374px;width:318px;top:148px"><i>↩</i></div>
+      <div class="stn" style="left:56px"><span class="lamp d"></span><span class="lb">init ✓</span></div>
+      <div class="stn" style="left:162px"><span class="lamp d"></span><span class="lb">architect ✓</span></div>
+      <div class="stn side up" style="left:272px;top:62px"><span class="lamp d"></span><span class="lb">dev-design ✓</span></div>
+      <div class="stn side dn" style="left:272px;top:90px"><span class="lamp d"></span><span class="lb">test-design ✓</span></div>
+      <div class="stn" style="left:374px"><span class="lamp c"></span><span class="lb hot">develop ●</span></div>
+      <div class="stn" style="left:480px"><span class="lamp"></span><span class="lb">review ○</span></div>
+      <div class="stn" style="left:586px"><span class="lamp"></span><span class="lb">test ○</span></div>
+      <div class="stn" style="left:692px"><span class="lamp"></span><span class="lb">merge ○</span></div>
+      <div class="stn" style="left:798px"><span class="lamp"></span><span class="lb">done ○</span></div>
+    </div>
+    <div class="legend">灯
+      <span class="sw" style="background:var(--done)"></span>已完成
+      <span class="sw" style="background:var(--go)"></span>执行中
+      <span class="sw" style="border:2px solid var(--pane);width:4px;height:4px"></span>未开始
+      <span class="sw" style="background:var(--pending)"></span>急停
+      <span class="sw" style="background:var(--stop)"></span>失败
+      ↩ 已打回</div>
+
+    <nav class="tabs" id="tabs-run">
+      <button class="tab" data-pane="p-timeline">时间线</button>
+      <button class="tab on" data-pane="p-conv">会话</button>
+      <button class="tab" data-pane="p-cmds">命令与输出 <span class="c">6</span></button>
+      <button class="tab" data-pane="p-files">产出文件</button>
+      <button class="tab dis">Diff ─ merge 后生成</button>
+    </nav>
+
+    <div class="pane" id="p-timeline">
+      <div class="tline">
+        <div class="trow"><span class="t">14:02:11</span><span class="tr">start</span><span class="to">init.execute</span></div>
+        <div class="trow"><span class="t">14:02:13</span><span class="tr">normal</span><span class="to">architect-design.validate_input</span></div>
+        <div class="trow"><span class="t">14:02:25</span><span class="tr">normal</span><span class="to">architect-design.execute</span></div>
+        <div class="trow"><span class="t">14:03:50</span><span class="tr">retry</span><span class="to">architect-design.execute</span><span class="why">（validate_output 不通过：缺少数据流定义）</span></div>
+        <div class="trow"><span class="t">14:05:28</span><span class="tr">normal</span><span class="to">develop-design.validate_input <span class="bb">[dev]</span></span></div>
+        <div class="trow"><span class="t">14:05:28</span><span class="tr">normal</span><span class="to">test-design.validate_input <span class="bb">[tst]</span></span></div>
+        <div class="trow"><span class="t">14:07:05</span><span class="tr stop">node_retry</span><span class="to">develop-design.execute <span class="bb">[dev]</span></span><span class="why">（submit_metadata 格式错误，干净对话重来）</span></div>
+        <div class="trow"><span class="t">14:09:46</span><span class="tr">normal</span><span class="to">develop.execute <span class="bb" style="color:var(--go)">← 当前</span></span></div>
+      </div>
+    </div>
+
+    <div class="pane on" id="p-conv">
+      <div class="runrow">
+        <span class="runchip">architect · execute · 尝试 2/2</span>
+        <span class="runchip">architect · validate_output</span>
+        <span class="runchip">develop-design · execute · dev</span>
+        <span class="runchip">test-design · execute · test</span>
+        <span class="runchip now">develop · execute · 尝试 2/3 ■</span>
+      </div>
+      <div class="convhead">
+        <h3>develop · execute · 尝试 2/3</h3>
+        <span class="m">12.4k tok ▪ 38.2s ▪ claude-sonnet</span>
+      </div>
+      <div class="msg">
+        <div class="who">SYSTEM <span style="letter-spacing:0;color:var(--t4)">折叠 ▪ 2.1k tok</span></div>
+        <div class="sysbox">你是开发方案 agent。根据设计文档输出详细开发方案…（点击展开完整 System Prompt）</div>
+      </div>
+      <div class="msg">
+        <div class="who">USER</div>
+        <div class="userbox">任务标题：实现用户登录
+任务描述：接入邮箱 + 密码登录，签发 JWT，中间件校验…
+设计文档：~/.agentpipeline/tasks/t-0042/design.md
+工作区：~/.agentpipeline/worktrees/t-0042</div>
+      </div>
+      <div class="msg assistant">
+        <div class="who as">AGENT</div>
+        <p>我先读取设计文档，确认鉴权模块的边界。</p>
+        <div class="toolcard"><span class="fn"><b>read_file</b>(path="design.md")</span><span class="res ok">✓ 3.2k chars</span></div>
+        <p>设计边界清楚了。单元测试走内联 #[test]，集成测试放 tests/。开始写 auth 模块。</p>
+        <div class="toolcard"><span class="fn"><b>write_file</b>(path="src/auth/mod.rs")</span><span class="res ok">✓ 214 行</span></div>
+        <div class="toolcard"><span class="fn"><b>write_file</b>(path="src/auth/middleware.rs")</span><span class="res ok">✓ 96 行</span></div>
+        <div class="toolcard"><span class="fn"><b>run_command</b>("cargo test auth")</span><span class="res ok">✓ exit 0 ▪ 18.4s</span></div>
+        <p>单测全绿。已写入 auth 模块与中间件，正在补 JWT 签发逻辑，随后跑全量测试。</p>
+        <p class="streaming">接下来把鉴权中间件挂到 axum router 的受保护路由上…</p>
+      </div>
+      <div class="tokmeter">本次尝试 <b>12.4k</b> tok ▪ 全任务 <b>45.2k</b> tok</div>
+      <div class="attempt-sep">尝试 1/3 ▪ ✗ validate_output 未通过：2 个单元测试失败 <span class="mono">查看完整对话 ▸</span></div>
+    </div>
+
+    <div class="pane" id="p-cmds">
+      <div class="cmds">
+        <div class="cmd"><span class="ok"></span><span class="tm">15:01:03</span><span class="src">sys</span><span class="c">git worktree add ~/.agentpipeline/worktrees/t-0042 -b kanban/t-0042</span><span class="ms">0.8s</span><span class="ex">exit 0</span></div>
+        <div class="cmd"><span class="ok"></span><span class="tm">15:01:08</span><span class="src">sys</span><span class="c">cargo test -- --test-threads=1</span><span class="ms">18.4s</span><span class="ex">exit 0</span></div>
+        <div class="cmd"><span class="ok"></span><span class="tm">15:01:40</span><span class="src">agt</span><span class="c">cargo test auth</span><span class="ms">6.2s</span><span class="ex">exit 0</span></div>
+        <div class="cmd"><span class="ng"></span><span class="tm">15:02:11</span><span class="src">agt</span><span class="c">cargo clippy -- -D warnings</span><span class="ms">12.1s</span><span class="ex" style="color:var(--stop)">exit 1</span></div>
+        <div class="cmdout">$ cargo clippy -- -D warnings
+warning: unused variable: `claims`
+  --> src/auth/middleware.rs:42:9
+error: could not compile `agentpipeline` due to 1 previous error
+<span class="fin">[exit 1]  12.1s</span></div>
+        <div class="cmd"><span class="ok"></span><span class="tm">15:02:40</span><span class="src">agt</span><span class="c">cargo clippy -- -D warnings</span><span class="ms">11.8s</span><span class="ex">exit 0</span></div>
+      </div>
+    </div>
+
+    <div class="pane" id="p-files">
+      <div class="cmds">
+        <div class="cmd"><span class="c">design.md</span><span class="ms" style="width:auto">架构设计 ▪ 2.1k 字</span><span class="ex" style="width:auto">查看 ▸</span></div>
+        <div class="cmd"><span class="c">dev-plan.md</span><span class="ms" style="width:auto">开发方案 ▪ 1.4k 字</span><span class="ex" style="width:auto">查看 ▸</span></div>
+        <div class="cmd"><span class="c">test-scenarios.md</span><span class="ms" style="width:auto">测试场景 ▪ 6 个场景</span><span class="ex" style="width:auto">查看 ▸</span></div>
+      </div>
+    </div>
+  </div>
+</div>
+
+<!-- ═══════════ 视图 3：详情 · 待审批 ═══════════ -->
+<div class="view" id="v-approve">
+  <header class="topbar">
+    <span class="logo" aria-hidden="true"></span>
+    <span class="wordmark">AGENTPIPELINE</span>
+    <span class="sess">本机夜班</span>
+    <nav class="filters"><button class="chip on" onclick="show('v-board')">← 返回看板</button></nav>
+  </header>
+  <div class="detail split">
+    <div style="grid-column:1;grid-row:1">
+      <a class="crumb" onclick="show('v-board')">看板</a>
+      <div class="d-head">
+        <h1 class="d-title">实现 worktree 清理策略</h1>
+        <div class="d-meta">
+          <span class="warn">■ pending ▪ merge_approval</span>
+          <span>⏱ 18m22s</span>
+          <span><span class="gauge g-warn" data-f="15"></span>61.9k tok</span>
+          <span>kanban/t-0041</span>
+        </div>
+      </div>
+    </div>
+
+    <div style="grid-column:1;grid-row:2">
+      <div class="hrail">
+        <div class="belt" style="left:56px;width:636px;top:76px"></div>
+        <div class="belt" style="left:692px;width:106px;top:76px"></div>
+        <div class="belt lit" style="left:162px;width:212px;top:62px"></div>
+        <div class="belt lit" style="left:162px;width:212px;top:90px"></div>
+        <div class="belt vt" style="left:162px;top:62px"></div>
+        <div class="belt vt" style="left:368px;top:62px"></div>
+        <div class="ret" style="left:162px;width:212px;top:116px"><i>↩</i></div>
+        <div class="ret" style="left:374px;width:106px;top:132px"><i>↩</i></div>
+        <div class="ret" style="left:586px;width:106px;top:116px"><i>↩</i></div>
+        <div class="ret" style="left:374px;width:318px;top:148px"><i>↩</i></div>
+        <div class="stn" style="left:56px"><span class="lamp d"></span><span class="lb">init ✓</span></div>
+        <div class="stn" style="left:162px"><span class="lamp d"></span><span class="lb">architect ✓</span></div>
+        <div class="stn side up" style="left:272px;top:62px"><span class="lamp d"></span><span class="lb">dev-design ✓</span></div>
+        <div class="stn side dn" style="left:272px;top:90px"><span class="lamp d"></span><span class="lb">test-design ✓</span></div>
+        <div class="stn" style="left:374px"><span class="lamp d"></span><span class="lb">develop ✓</span></div>
+        <div class="stn" style="left:480px"><span class="lamp d"></span><span class="lb">review ✓</span></div>
+        <div class="stn" style="left:586px"><span class="lamp d"></span><span class="lb">test ✓</span></div>
+        <div class="stn" style="left:692px"><span class="lamp w"></span><span class="lb pen">merge ⏸</span></div>
+        <div class="stn" style="left:798px"><span class="lamp"></span><span class="lb">done ○</span></div>
+      </div>
+      <div class="legend">灯
+        <span class="sw" style="background:var(--done)"></span>已完成
+        <span class="sw" style="background:var(--go)"></span>执行中
+        <span class="sw" style="border:2px solid var(--pane);width:4px;height:4px"></span>未开始
+        <span class="sw" style="background:var(--pending)"></span>急停
+        <span class="sw" style="background:var(--stop)"></span>失败
+        ↩ 已打回</div>
+    </div>
+
+    <div style="grid-column:1;grid-row:3">
+      <nav class="tabs" id="tabs-ap">
+        <button class="tab on" data-pane="a-diff">Diff</button>
+        <button class="tab" data-pane="a-cmds">命令与输出 <span class="c">11</span></button>
+        <button class="tab" data-pane="a-files">产出文件</button>
+      </nav>
+      <div class="pane on" id="a-diff">
+        <div class="diffhead">
+          <span class="big"><span class="a">+312</span> <span class="d">−87</span> ▪ 9 个文件</span>
+          <span class="notice">基准已前移时，diff 会自动重新生成并重新审批</span>
+        </div>
+        <div class="dfile">
+          <h4>src/scheduler/worktree.rs <span class="st2">修改</span><span class="pm">+96 −31</span></h4>
+          <div class="dbody">
+            <div class="dl hunk">@@ -41,10 +41,18 @@ impl WorktreeCleaner {</div>
+            <div class="dl">     /// 任务终态后回收 worktree 与隔离分支</div>
+            <div class="dl del">-    pub fn cleanup(task_id: &amp;str) -&gt; Result&lt;()&gt; {</div>
+            <div class="dl del">-        fs::remove_dir_all(worktree_path(task_id))?;</div>
+            <div class="dl add">+    pub async fn cleanup(task_id: &amp;str, policy: CleanupPolicy) -&gt; Result&lt;()&gt; {</div>
+            <div class="dl add">+    let path = worktree_path(task_id);</div>
+            <div class="dl add">+    if policy == CleanupPolicy::KeepOnFailure &amp;&amp; !is_merged(task_id)? {</div>
+            <div class="dl add">+        tracing::warn!(task_id, "未合入，保留 worktree 供排查");</div>
+            <div class="dl add">+        return Ok(());</div>
+            <div class="dl add">+    }</div>
+            <div class="dl add">+    spawn_blocking(move || git_remove_worktree(&amp;path)).await??;</div>
+            <div class="dl">     Ok(())</div>
+            <div class="dl"> }</div>
+          </div>
+        </div>
+        <div class="dfile">
+          <h4>src/scheduler/mod.rs <span class="st2">修改</span><span class="pm">+18 −7</span></h4>
+          <div class="dbody">
+            <div class="dl hunk">@@ -112,6 +112,12 @@ async fn finish_task(</div>
+            <div class="dl add">+    let policy = settings.worktree_cleanup_policy;</div>
+            <div class="dl add">+    WorktreeCleaner::cleanup(&amp;task.id, policy).await?;</div>
+          </div>
+        </div>
+      </div>
+      <div class="pane" id="a-cmds">
+        <div class="cmds">
+          <div class="cmd"><span class="ok"></span><span class="tm">16:40:02</span><span class="src">sys</span><span class="c">git fetch origin</span><span class="ms">0.9s</span><span class="ex">exit 0</span></div>
+          <div class="cmd"><span class="ok"></span><span class="tm">16:40:03</span><span class="src">sys</span><span class="c">git rebase origin/main</span><span class="ms">3.2s</span><span class="ex">exit 0</span></div>
+          <div class="cmd"><span class="ok"></span><span class="tm">16:40:08</span><span class="src">sys</span><span class="c">cargo test -- --test-threads=1</span><span class="ms">41.7s</span><span class="ex">exit 0</span></div>
+          <div class="cmd"><span class="ok"></span><span class="tm">16:40:52</span><span class="src">sys</span><span class="c">git diff main..kanban/t-0041 &gt; merge-proposal.diff</span><span class="ms">0.3s</span><span class="ex">exit 0</span></div>
+        </div>
+      </div>
+      <div class="pane" id="a-files">
+        <div class="cmds">
+          <div class="cmd"><span class="c">review-report.md</span><span class="ms" style="width:auto">总体评价：approved</span><span class="ex" style="width:auto">查看 ▸</span></div>
+          <div class="cmd"><span class="c">test-report.md</span><span class="ms" style="width:auto">执行结果：42 passed ▪ 0 failed</span><span class="ex" style="width:auto">查看 ▸</span></div>
+          <div class="cmd"><span class="c">merge-proposal.diff</span><span class="ms" style="width:auto">unified diff ▪ 9 个文件</span><span class="ex" style="width:auto">查看 ▸</span></div>
+        </div>
+      </div>
+    </div>
+
+    <!-- 待办 dossier：操作台对话框 -->
+    <aside class="dossier">
+      <i class="sp dface" data-s="foreman" aria-hidden="true"></i>
+      <div class="dmain">
+      <div class="dtag">⏸ 等你拍板 ▪ merge_approval</div>
+      <div class="msg">&gt; 合并提案已生成，审核 diff 后决定是否合入 main。</div>
+      <div class="ctx">测试闸门：<b>pass</b> ▪ 单元 + 集成全绿<br>agent 评审：<b>approved</b> ▪ <a>查看评审报告</a></div>
+      <div class="grp">恢复动作</div>
+      <button class="btn solid">合入 main（ff 优先）</button>
+      <button class="btn">返回修改（回 develop）</button>
+      </div>
+    </aside>
+  </div>
+</div>
+
+<!-- 底部状态行（车间看板条） -->
+<footer class="statusbar">
+  <span>⏸ <b class="pen">*3</b> 待处理</span>
+  <span class="sep">▪</span>
+  <span>▶ <b>3</b> 执行中</span>
+  <span class="sep">▪</span>
+  <span>等依赖 <b>1</b></span>
+  <span class="sep">▪</span>
+  <span>排队 <b>1</b></span>
+  <span class="sep">▪</span>
+  <span>已完成 <b>1</b></span>
+  <span class="sep">▪</span>
+  <span><span class="gauge g-warn" data-f="14"></span> 本时辰 <b>61.9k</b> tok</span>
+  <span class="clock">14:02:11</span>
+</footer>
+
+<!-- 原型视图切换 -->
+<div class="demo">
+  <span>窗口</span>
+  <button class="on" data-v="v-board">0:看板</button>
+  <button data-v="v-run">1:详情·执行中</button>
+  <button data-v="v-approve">2:详情·待审批</button>
+</div>
+
+<script>
+function show(id){
+  document.querySelectorAll('.view').forEach(v=>v.classList.toggle('on',v.id===id));
+  document.querySelectorAll('.demo button').forEach(b=>b.classList.toggle('on',b.dataset.v===id));
+  if(history.replaceState)history.replaceState(null,'','#'+id);
+}
+document.querySelectorAll('.demo button').forEach(b=>b.onclick=()=>show(b.dataset.v));
+/* 像素图元：8×8 工位图标（currentColor）与 16×16 工头头像，shape-rendering 强制脆边 */
+const P=(vb,wh,body)=>`<svg viewBox="0 0 ${vb} ${vb}" width="${wh}" height="${wh}" shape-rendering="crispEdges" fill="currentColor" aria-hidden="true">${body}</svg>`;
+const SPRITES={
+  flag:P(8,16,'<rect x="2" y="0" width="1" height="8"/><rect x="3" y="0" width="4" height="2"/><rect x="3" y="2" width="3" height="1"/><rect x="3" y="3" width="2" height="1"/>'),
+  gem:P(8,16,'<rect x="3" y="0" width="2" height="1"/><rect x="2" y="1" width="4" height="1"/><rect x="1" y="2" width="6" height="1"/><rect x="2" y="3" width="4" height="1"/><rect x="3" y="4" width="2" height="1"/><rect x="2" y="6" width="4" height="2"/>'),
+  hammer:P(8,16,'<rect x="1" y="1" width="6" height="3"/><rect x="3" y="4" width="2" height="4"/>'),
+  flask:P(8,16,'<rect x="3" y="0" width="2" height="3"/><rect x="2" y="3" width="4" height="2"/><rect x="1" y="5" width="6" height="3"/>'),
+  gear:P(8,16,'<rect x="3" y="0" width="2" height="8"/><rect x="0" y="3" width="8" height="2"/><rect x="1" y="1" width="1" height="1"/><rect x="6" y="1" width="1" height="1"/><rect x="1" y="6" width="1" height="1"/><rect x="6" y="6" width="1" height="1"/>'),
+  lens:P(8,16,'<rect x="2" y="1" width="3" height="1"/><rect x="1" y="2" width="1" height="3"/><rect x="4" y="2" width="1" height="3"/><rect x="2" y="4" width="3" height="1"/><rect x="5" y="5" width="1" height="1"/><rect x="6" y="6" width="1" height="1"/>'),
+  shield:P(8,16,'<rect x="1" y="1" width="6" height="2"/><rect x="2" y="3" width="4" height="1"/><rect x="3" y="4" width="2" height="2"/>'),
+  merge:P(8,16,'<rect x="1" y="1" width="1" height="1"/><rect x="2" y="2" width="1" height="1"/><rect x="6" y="1" width="1" height="1"/><rect x="5" y="2" width="1" height="1"/><rect x="3" y="3" width="2" height="1"/><rect x="3" y="4" width="2" height="3"/>'),
+  trophy:P(8,16,'<rect x="2" y="1" width="4" height="3"/><rect x="1" y="1" width="1" height="2"/><rect x="6" y="1" width="1" height="2"/><rect x="3" y="4" width="2" height="1"/><rect x="2" y="5" width="4" height="2"/>'),
+  chest:P(8,16,'<rect x="1" y="1" width="6" height="2"/><rect x="1" y="3" width="6" height="4"/><rect x="3" y="4" width="2" height="2" fill="var(--bg)"/>'),
+  alert:P(8,16,'<rect x="3" y="0" width="2" height="5"/><rect x="3" y="6" width="2" height="2"/>'),
+  foreman:P(16,48,
+    '<rect x="5" y="0" width="6" height="2" fill="var(--pending)"/>'+
+    '<rect x="3" y="2" width="10" height="2" fill="var(--pending)"/>'+
+    '<rect x="4" y="4" width="8" height="5" fill="var(--t-hi)"/>'+
+    '<rect x="5" y="6" width="2" height="2" fill="var(--ink)"/>'+
+    '<rect x="9" y="6" width="2" height="2" fill="var(--ink)"/>'+
+    '<rect x="3" y="9" width="10" height="5" fill="var(--go)"/>'+
+    '<rect x="2" y="9" width="1" height="3" fill="var(--go)"/>'+
+    '<rect x="13" y="9" width="1" height="3" fill="var(--go)"/>'+
+    '<rect x="4" y="14" width="3" height="2" fill="var(--t2)"/>'+
+    '<rect x="9" y="14" width="3" height="2" fill="var(--t2)"/>'),
+};
+document.querySelectorAll('.sp[data-s]').forEach(el=>{el.innerHTML=SPRITES[el.dataset.s]||''});
+/* 列头小人双帧：挥锤抬起 / 落锤+火花，帧切换为离散步进 */
+const W1='<rect x="3" y="1" width="2" height="2"/><rect x="3" y="3" width="2" height="3"/><rect x="2" y="6" width="1" height="2"/><rect x="4" y="6" width="1" height="2"/><rect x="5" y="2" width="1" height="1"/><rect x="6" y="0" width="2" height="2"/><rect x="6" y="2" width="1" height="1"/>';
+const W2='<rect x="3" y="1" width="2" height="2"/><rect x="3" y="3" width="2" height="3"/><rect x="2" y="6" width="1" height="2"/><rect x="4" y="6" width="1" height="2"/><rect x="5" y="4" width="1" height="1"/><rect x="6" y="5" width="2" height="1"/><rect x="6" y="7" width="1" height="1"/>';
+document.querySelectorAll('.worker').forEach(el=>{
+  el.innerHTML=P(8,16,W1).replace('<svg ','<svg class="f1" ')+P(8,16,W2).replace('<svg ','<svg class="f2" ');
+});
+/* boss 战尝试条：data-f = 已用尝试折算的点亮段数（20 段） */
+document.querySelectorAll('.bossbar .segs').forEach(s=>{
+  const f=+s.dataset.f||0;let h='';
+  for(let i=0;i<20;i++)h+=`<i class="${i<f?'f':''}"></i>`;
+  s.innerHTML=h;
+});
+/* token 量表：16 段，data-f = 已点亮段数 */
+document.querySelectorAll('.gauge').forEach(g=>{
+  const f=+g.dataset.f||0;let h='';
+  for(let i=0;i<16;i++)h+=`<i class="${i<f?'f':''}"></i>`;
+  g.innerHTML=h;
+});
+/* 迷你传送带渲染：data-dots="p|c|w|x|f|v|t|d …"，段在已达节点左侧点亮 */
+document.querySelectorAll('.rail[data-dots]').forEach(r=>{
+  const dots=r.dataset.dots.trim().split(/\s+/);
+  r.innerHTML=dots.map((s,i)=>
+    `<i class="d ${s==='d'?'dd':s}"></i>`+(i<dots.length-1?`<i class="s ${'pdv'.includes(s)?'lit':''}"></i>`:'')
+  ).join('');
+});
+function wireTabs(tid){
+  const tabs=document.querySelectorAll('#'+tid+' .tab:not(.dis)');
+  tabs.forEach(t=>t.onclick=()=>{
+    tabs.forEach(x=>x.classList.remove('on'));t.classList.add('on');
+    const root=document.getElementById(tid).parentElement;
+    root.querySelectorAll('.pane').forEach(p=>p.classList.remove('on'));
+    const pane=root.querySelector('#'+t.dataset.pane);if(pane)pane.classList.add('on');
+  });
+}
+wireTabs('tabs-run');wireTabs('tabs-ap');
+if(location.hash&&document.querySelector('.demo button[data-v="'+location.hash.slice(1)+'"]'))show(location.hash.slice(1));
+</script>
+</body>
+</html>
