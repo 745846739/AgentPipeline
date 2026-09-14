@@ -825,12 +825,19 @@ file = "~/.agentpipeline/logs/agentpipeline.log"
 
 [prompts]
 dir = "~/.agentpipeline/prompts"     # 覆盖 prompt 模板目录；缺省回落 {home}/prompts
+
+[skills]
+dir = "~/.agentpipeline/skills"      # 覆盖技能根；缺省回落 {home}/skills（决策 172）
+# 可直接指到已有的技能生态目录，如 ~/.zcode/skills——该目录下的 {name}/SKILL.md
+# 被发现、校验并可用；未配置时行为与之前逐字相同。
+# 覆盖目录由用户自己维护：本系统不会创建它，也不会改它的权限。
+# 技能文件 frontmatter 里若写了 name，必须与所在目录同名，否则启动 fail fast。
 ```
 
-> **配置校验姿态（票 16）：** `config.toml` 中未知的 section / 键一律**拒绝启动**
+> **配置校验姿态（票 16 / 决策 172）：** `config.toml` 中未知的 section / 键一律**拒绝启动**
 > （`deny_unknown_fields` 施加于 `Config` / `ServerConfig` / `PipelineOverrides` /
-> `LoggingConfig` / `PromptsConfig`），不静默忽略——与决策 47 / 103 / 134 的 fail fast 姿态一致。
-> `[logging]` 的 `format` 与已废弃 `json_file` 同时出现同样报错。
+> `LoggingConfig` / `PromptsConfig` / `SkillsConfig`），不静默忽略——与决策 47 / 103 / 134
+> 的 fail fast 姿态一致。`[logging]` 的 `format` 与已废弃 `json_file` 同时出现同样报错。
 >
 > **升级注意（行为变化）：** 此前拼错或多余的键会被静默忽略、按默认值运行；现在**启动即报错**。
 > 这是有意的收紧——静默忽略会让「配置写了却没生效」无从察觉。
@@ -846,7 +853,7 @@ dir = "~/.agentpipeline/prompts"     # 覆盖 prompt 模板目录；缺省回落
 }
 ```
 
-`validate_input` 因此拿到「把设计树走到没有悬空分支、只把**决定**问用户（事实自己查）、经 `submit_metadata.blockers` 提问」的指引；`execute` 拿到「不再提问、把已定内容综合成 `design.md`（保留 §10.3 必需节与验收标准编号清单）」的指引。想用自己版本的技能，把文件放到 `~/.agentpipeline/skills/grilling/SKILL.md` 即覆盖内嵌（同名覆盖，正文进 prompt）。回滚：`DELETE /stage-configs/architect-design` 撤销该阶段覆盖，行为回到内嵌默认。
+`validate_input` 因此拿到「把设计树走到没有悬空分支、只把**决定**问用户（事实自己查）、经 `submit_metadata.blockers` 提问」的指引；`execute` 拿到「不再提问、把已定内容综合成 `design.md`（保留 §10.3 必需节与验收标准编号清单）」的指引。想用自己版本的技能，把文件放到 `~/.agentpipeline/skills/grilling/SKILL.md` 即覆盖内嵌（同名覆盖，正文进 prompt）；也可以把 `[skills] dir` 指到已有生态目录（如 `~/.zcode/skills`）整体换掉技能根（决策 172）。技能 `SKILL.md` 的 frontmatter 里若写了 `name`，必须与所在目录同名，否则启动 fail fast。回滚：`DELETE /stage-configs/architect-design` 撤销该阶段覆盖，行为回到内嵌默认。
 
 **首启引导：** 未配置任何 provider / API key 时，创建任务返回明确错误（提示先配置 provider），不使用隐式默认模型（决策 56）。
 

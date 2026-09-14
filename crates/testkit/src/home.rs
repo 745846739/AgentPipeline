@@ -39,6 +39,14 @@ impl TestHome {
         self.home.root()
     }
 
+    /// 返回一个技能根被覆盖的家目录句柄（决策 172：`[skills] dir` 指到外部技能生态目录）。
+    ///
+    /// 覆盖目录**不**随家目录骨架建立——这是真实语义（`~/.zcode/skills` 由用户自己维护），
+    /// 调用方自行准备其内容。
+    pub fn home_with_skills_dir(&self, dir: impl Into<PathBuf>) -> Home {
+        self.home.clone().with_skills_dir(Some(dir))
+    }
+
     /// 临时目录根（放 fixture 仓库等）。
     pub fn scratch(&self) -> PathBuf {
         self.dir.path().join("scratch")

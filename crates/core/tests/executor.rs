@@ -35,9 +35,31 @@ struct Ctx {
 
 /// 建项目（test_framework 用原始命令 `true`，让系统闸门零噪声通过）。
 async fn setup(framework: &str, settings: Settings) -> Ctx {
+    setup_impl(framework, settings, None).await
+}
+
+/// 同 [`setup`]，但技能根被 `[skills] dir` 覆盖到外部目录（决策 172）。
+async fn setup_with_skills_dir(
+    framework: &str,
+    settings: Settings,
+    skills_dir: &std::path::Path,
+) -> Ctx {
+    setup_impl(framework, settings, Some(skills_dir.to_path_buf())).await
+}
+
+async fn setup_impl(
+    framework: &str,
+    settings: Settings,
+    skills_dir: Option<std::path::PathBuf>,
+) -> Ctx {
     let home = TestHome::new().unwrap();
     let clock = ManualClock::fixed();
-    let store = Store::open(home.home().clone(), Arc::new(clock.clone()))
+    // 技能根覆盖经 `Home` 注入 —— executor 与启动校验都读同一处（决策 172）
+    let home_handle = match &skills_dir {
+        Some(dir) => home.home_with_skills_dir(dir.clone()),
+        None => home.home().clone(),
+    };
+    let store = Store::open(home_handle, Arc::new(clock.clone()))
         .await
         .unwrap();
     let repo = Repo::clean().unwrap();
@@ -1041,6 +1063,70 @@ async fn stage_level_skills_still_apply_and_union_with_node_level() {
     assert!(!ex.system_prompt.contains("### grilling"));
 }
 
+/// 票 01（决策 172）：`[skills] dir` 指到外部技能根后，该目录下的技能全链路可用
+/// ——被发现、被启动校验放行、正文进入 system prompt。
+#[tokio::test]
+async fn external_skills_dir_is_discovered_and_injected() {
+    // 外部技能根：不在临时 home 之下（模拟 `~/.zcode/skills`）
+    let external = tempfile::tempdir().unwrap();
+    let skill_dir = external.path().join("my-grill");
+    std::fs::create_dir_all(&skill_dir).unwrap();
+    std::fs::write(
+        skill_dir.join("SKILL.md"),
+        "---\nname: my-grill\ndescription: 外部技能\n---\n\n外部技能正文：拷问用户",
+    )
+    .unwrap();
+
+    let ctx = setup_with_skills_dir("true", Settings::default(), external.path()).await;
+
+    // 启动校验：外部目录的技能进入可用集且正文校验通过
+    // （store 持有的 Home 就是被覆盖的那个，与 executor 读同一处）
+    let names =
+        agentpipeline_core::config::discover_available_skills(&ctx.store.home().skills_dir());
+    assert!(
+        names.iter().any(|n| n == "my-grill"),
+        "外部技能应被发现：{names:?}"
+    );
+
+    ctx.store
+        .upsert_stage_config(&agentpipeline_core::types::StageConfig {
+            stage: "architect-design".into(),
+            node_overrides_json: Some(serde_json::json!({
+                "validate_input": {"skills": ["my-grill"]}
+            })),
+            updated_at: ctx.store.now(),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+
+    let mut script = Script::new();
+    design_scripts(&mut script);
+    implementation_scripts(&mut script, "t-external-skills");
+    ctx.agent.set_script(script);
+    testkit::seed_task(&ctx.store, "t-external-skills", "p1")
+        .await
+        .unwrap();
+    admit(&ctx, "t-external-skills").await;
+    ctx.executor.run("t-external-skills").await.unwrap();
+
+    let requests = ctx.agent.request_log();
+    let vi = requests
+        .iter()
+        .find(|r| r.stage == Stage::ArchitectDesign && r.node == Node::ValidateInput)
+        .expect("architect validate_input 请求");
+    assert!(
+        vi.system_prompt.contains("### my-grill"),
+        "外部技能正文应进 system prompt：{}",
+        vi.system_prompt
+    );
+    assert!(
+        vi.system_prompt.contains("外部技能正文：拷问用户"),
+        "{}",
+        vi.system_prompt
+    );
+}
+
 // ──────────────────── 闸门失败 → test 复检 → 重跑闸门（票 15 / 决策 85 / 109）────────────────────
 
 #[tokio::test]
@@ -1886,7 +1972,9 @@ async fn empty_knowledge_skill_body_refuses_startup() {
     use agentpipeline_core::types::StageConfig;
 
     let home = tempfile::tempdir().unwrap();
-    let skill_dir = home.path().join("skills").join("my-skill");
+    // 技能根 = `{home}/skills`（决策 172：skills_root 就是技能根本身）
+    let skills_root = home.path().join("skills");
+    let skill_dir = skills_root.join("my-skill");
     std::fs::create_dir_all(&skill_dir).unwrap();
     std::fs::write(skill_dir.join("SKILL.md"), "   \n").unwrap();
 
@@ -1900,9 +1988,37 @@ async fn empty_knowledge_skill_body_refuses_startup() {
         }],
         available_skills: vec!["my-skill".into()],
         home_root: None,
-        skills_root: Some(home.path().to_path_buf()),
+        skills_root: Some(skills_root),
         ..Default::default()
     };
     let err = validate_startup(&inputs).unwrap_err();
     assert!(err.to_string().contains("正文为空"), "{err}");
+}
+
+/// frontmatter `name` 与目录名不一致 → 启动拒绝（决策 172，对齐 Agent Skills 规范）。
+#[tokio::test]
+async fn mismatched_frontmatter_name_refuses_startup() {
+    use agentpipeline_core::config::{validate_startup, StartupInputs};
+
+    let home = tempfile::tempdir().unwrap();
+    let skills_root = home.path().join("skills");
+    let skill_dir = skills_root.join("grilling");
+    std::fs::create_dir_all(&skill_dir).unwrap();
+    std::fs::write(
+        skill_dir.join("SKILL.md"),
+        "---\nname: something-else\n---\n\n正文",
+    )
+    .unwrap();
+
+    let inputs = StartupInputs {
+        available_skills: vec!["grilling".into()],
+        skills_root: Some(skills_root),
+        ..Default::default()
+    };
+    let err = validate_startup(&inputs).unwrap_err();
+    let msg = err.to_string();
+    assert!(
+        msg.contains("grilling") && msg.contains("something-else"),
+        "报错须点明目录名与 frontmatter name：{msg}"
+    );
 }

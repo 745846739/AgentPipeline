@@ -70,10 +70,10 @@ async fn validate_prospective(
             .into_iter()
             .filter(|c| removed != Some(c.stage.as_str()))
             .collect(),
-        available_skills: discover_available_skills(state.home.root()),
+        available_skills: discover_available_skills(&state.home.skills_dir()),
         home_root: Some(state.home.root().to_path_buf()),
-        // 决策 170：知识型技能的正文也必须存在且非空
-        skills_root: Some(state.home.root().to_path_buf()),
+        // 决策 170 / 172：知识型技能的正文必须存在且非空，frontmatter name 须与目录名一致
+        skills_root: Some(state.home.skills_dir()),
     };
     validate_startup(&inputs).map_err(|e| ApiError::bad_request(e.to_string()))?;
     Ok(())

@@ -10,18 +10,25 @@
 //! | 来源 | 判定 | 正文 |
 //! |---|---|---|
 //! | 内嵌默认 | [`EMBEDDED_SKILLS`]（决策 7 的内嵌 persona 先例） | 有 |
-//! | 用户 markdown | `{home}/skills/{name}/SKILL.md`（镜像 ZCode 布局，可直接拷贝） | 有，同名覆盖内嵌 |
+//! | 用户 markdown | `{skills_root}/{name}/SKILL.md`（镜像 ZCode 布局，可直接拷贝） | 有，同名覆盖内嵌 |
 //! | 外部工具 | PATH 中可执行文件（决策 47 原语义） | 无，只列名字 |
 //!
+//! **技能根唯一**（决策 172，修订决策 47）：默认 `{home}/skills`，可由 `[skills] dir`
+//! 覆盖（如指到 `~/.zcode/skills`）——本模块的每个入口都接收**技能根**本身，不再自己
+//! 拼 `skills` 目录名；覆盖解析见 [`crate::config::SkillsConfig::resolved_dir`]。
+//!
 //! 正文的「必须存在且非空」在启动校验（[`crate::config::validate_startup`]）与运行时
-//! [`resolve`] 双重把关，口径与 §10.6.4 的 `persona_path` 一致。
+//! [`resolve`] 双重把关，口径与 §10.6.4 的 `persona_path` 一致；frontmatter 的 `name`
+//! 与目录名不一致同样在启动时 fail fast（[`validate_names`]）。
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 use crate::error::{Error, Result};
 
-/// 用户技能目录名（`{home}/skills`）。镜像 ZCode 的 `~/.zcode/skills/{name}/SKILL.md`。
+/// 默认技能目录名（`{home}/skills`）。镜像 ZCode 的 `~/.zcode/skills/{name}/SKILL.md`。
+///
+/// 技能根本身是**唯一入口**（决策 172）：默认由它拼出，`[skills] dir` 配置时整体替换。
 pub const SKILLS_DIR: &str = "skills";
 
 /// 技能文件名（ZCode 布局，可直接把现有 skill 目录拷进来）。
@@ -121,8 +128,26 @@ pub enum SkillSource {
     Tool,
     /// 内嵌默认正文（[`EMBEDDED_SKILLS`]）。
     Embedded,
-    /// 用户 markdown 覆盖（`{home}/skills/{name}/SKILL.md`）。
+    /// 用户 markdown 覆盖（`{skills_root}/{name}/SKILL.md`）。
     Markdown { path: PathBuf },
+}
+
+/// frontmatter 的四个键（决策 172②：解析但不做语义检查）。
+///
+/// 逐行 `key: value` 轻量解析，**不引 YAML 依赖**；缺失 / 畸形一律按缺省处理，
+/// 只有 `name` 与目录名不符才是 fail fast（那也是 [`Skill`] 的构造条件，不在此处）。
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct SkillFrontmatter {
+    /// `description`——进技能目录（渐进披露只给名字 + 描述）。
+    pub description: Option<String>,
+    /// `disable-model-invocation: true`——不被自动注入（选型 D）。
+    pub disable_model_invocation: bool,
+    /// `license`——**只解析不生效**（决策 172：无工具权限授予层）。
+    pub license: Option<String>,
+    /// `allowed-tools`——同上，只解析不生效（规范标记实验性）。
+    pub allowed_tools: Option<String>,
+    /// frontmatter 里显式写的 `name`（规范要求与父目录同名，见 [`validate_names`]）。
+    pub name: Option<String>,
 }
 
 /// 一个可用技能。
@@ -130,6 +155,8 @@ pub enum SkillSource {
 pub struct Skill {
     pub name: String,
     pub source: SkillSource,
+    /// frontmatter 解析结果（工具型技能为空缺省）。
+    pub frontmatter: SkillFrontmatter,
 }
 
 /// 解析后的技能：正文 `None` 表示工具型技能（只列名字）。
@@ -174,16 +201,18 @@ fn path_tool_names() -> Vec<String> {
     names.into_iter().collect()
 }
 
-/// `{home}/skills` 下 `{name}/SKILL.md` 的路径。
-pub fn skill_file_path(home_root: &Path, name: &str) -> PathBuf {
-    home_root.join(SKILLS_DIR).join(name).join(SKILL_FILE)
+/// 技能根下 `{name}/SKILL.md` 的路径。
+///
+/// `skills_root` 就是技能根**本身**（默认 `{home}/skills`，可由 `[skills] dir` 覆盖），
+/// 不含 `skills` 目录名（决策 172）。
+pub fn skill_file_path(skills_root: &Path, name: &str) -> PathBuf {
+    skills_root.join(name).join(SKILL_FILE)
 }
 
-/// 用户技能目录下的技能名（含 `SKILL.md` 的子目录）。按名字排序。
-fn markdown_skill_paths(home_root: &Path) -> BTreeMap<String, PathBuf> {
+/// 技能根下的技能名（含 `SKILL.md` 的子目录）。按名字排序。
+fn markdown_skill_paths(skills_root: &Path) -> BTreeMap<String, PathBuf> {
     let mut out = BTreeMap::new();
-    let dir = home_root.join(SKILLS_DIR);
-    let Ok(entries) = std::fs::read_dir(&dir) else {
+    let Ok(entries) = std::fs::read_dir(skills_root) else {
         return out;
     };
     for entry in entries.flatten() {
@@ -199,11 +228,11 @@ fn markdown_skill_paths(home_root: &Path) -> BTreeMap<String, PathBuf> {
     out
 }
 
-/// 发现全部可用技能（内嵌 ∪ 用户 markdown ∪ PATH 工具），名字去重。
+/// 发现全部可用技能（内嵌 ∪ 技能根 markdown ∪ PATH 工具），名字去重。
 ///
-/// 用户 markdown 同名覆盖内嵌（来源记为 [`SkillSource::Markdown`]）。
-pub fn discover(home_root: &Path) -> Vec<Skill> {
-    let markdown = markdown_skill_paths(home_root);
+/// 技能根下的同名文件覆盖内嵌（来源记为 [`SkillSource::Markdown`]）。
+pub fn discover(skills_root: &Path) -> Vec<Skill> {
+    let markdown = markdown_skill_paths(skills_root);
 
     let mut out: Vec<Skill> = Vec::new();
     for (name, _) in EMBEDDED_SKILLS {
@@ -211,10 +240,12 @@ pub fn discover(home_root: &Path) -> Vec<Skill> {
             Some(path) => out.push(Skill {
                 name: name.to_string(),
                 source: SkillSource::Markdown { path: path.clone() },
+                frontmatter: read_frontmatter(path),
             }),
             None => out.push(Skill {
                 name: name.to_string(),
                 source: SkillSource::Embedded,
+                frontmatter: SkillFrontmatter::default(),
             }),
         }
     }
@@ -227,6 +258,7 @@ pub fn discover(home_root: &Path) -> Vec<Skill> {
         out.push(Skill {
             name: name.clone(),
             source: SkillSource::Markdown { path: path.clone() },
+            frontmatter: read_frontmatter(path),
         });
     }
 
@@ -237,6 +269,7 @@ pub fn discover(home_root: &Path) -> Vec<Skill> {
             out.push(Skill {
                 name,
                 source: SkillSource::Tool,
+                frontmatter: SkillFrontmatter::default(),
             });
         }
     }
@@ -245,40 +278,122 @@ pub fn discover(home_root: &Path) -> Vec<Skill> {
 }
 
 /// 全部可用技能名（启动校验与 `PUT /stage-configs` 用）。
-pub fn skill_names(home_root: &Path) -> Vec<String> {
-    discover(home_root).into_iter().map(|s| s.name).collect()
+pub fn skill_names(skills_root: &Path) -> Vec<String> {
+    discover(skills_root).into_iter().map(|s| s.name).collect()
 }
 
-/// 剥离 YAML frontmatter（`---` 包围块），只做文本处理，不引 YAML 依赖。
+/// 读取并解析一个技能文件的 frontmatter（读不到 → 全缺省，不报错）。
+fn read_frontmatter(path: &Path) -> SkillFrontmatter {
+    match std::fs::read_to_string(path) {
+        Ok(raw) => parse_frontmatter(&raw).0,
+        Err(_) => SkillFrontmatter::default(),
+    }
+}
+
+/// 拆出 frontmatter 块与正文。
 ///
-/// frontmatter 必须在文件开头，并以单独一行的 `---` 收尾；不构成 frontmatter 时原样返回。
-fn strip_frontmatter(raw: &str) -> String {
+/// frontmatter 必须在文件开头，并以单独一行的 `---`（或 `...`）收尾；不构成 frontmatter
+/// 时返回 `(None, raw.trim_start())`。**未闭合按无 frontmatter 处理**——不 fail fast，
+/// 正文照读（决策 172②：加载器不因内容拒绝合法 markdown）。
+///
+/// 正文经 `lines()` 重组，因此行尾统一为 `\n`（与既有剥离行为逐字相同——正文进
+/// system prompt，行尾差异会改 `prompt_template_hash`，决策 137）。
+///
+/// 第二个返回值是「开头 `---` 是否为独立一行」——正文剥离沿用历史的宽松口径（只看
+/// 前缀），但**键的解释与 `name` 校验只认规范的 frontmatter 块**，否则一段以水平线
+/// `---` 开头的正文会被误读成 frontmatter，把无害的 Markdown 升级成启动失败。
+fn split_frontmatter(raw: &str) -> (Option<String>, String, bool) {
     let trimmed = raw.trim_start();
     let Some(rest) = trimmed.strip_prefix("---") else {
-        return trimmed.to_string();
+        return (None, trimmed.to_string(), false);
     };
-    let Some(end) = rest
-        .lines()
+    // 规范的 frontmatter：开头 `---` 自成一行（`---\n` / `---\r\n` / 整个文件就是 `---`）
+    let well_formed = rest.is_empty() || rest.starts_with('\n') || rest.starts_with("\r\n");
+    let lines: Vec<&str> = rest.lines().collect();
+    let Some(end) = lines
+        .iter()
         .position(|l| l.trim_end() == "---" || l.trim_end() == "...")
     else {
-        return trimmed.to_string();
+        return (None, trimmed.to_string(), false);
     };
-    rest.lines()
-        .skip(end + 1)
-        .collect::<Vec<_>>()
-        .join("\n")
-        .trim_start()
-        .to_string()
+    let block = lines[..end].join("\n");
+    let body = lines[end + 1..].join("\n").trim_start().to_string();
+    (Some(block), body, well_formed)
 }
 
-/// 读取一个知识型技能的正文（内嵌或用户文件）。
+/// 解析 frontmatter 四键（决策 172②）：逐行 `key: value`，无 YAML 依赖。
+///
+/// 值只做最朴素的 trim 与去引号；布尔只认 `true` / `false`，其余按缺省。
+/// 返回（解析结果，正文）。
+pub fn parse_frontmatter(raw: &str) -> (SkillFrontmatter, String) {
+    let (block, body, well_formed) = split_frontmatter(raw);
+    let Some(block) = block.filter(|_| well_formed) else {
+        return (SkillFrontmatter::default(), body);
+    };
+    let mut fm = SkillFrontmatter::default();
+    for line in block.lines() {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        let Some((key, value)) = line.split_once(':') else {
+            continue;
+        };
+        let key = key.trim();
+        let value = unquote(value.trim());
+        match key {
+            "description" => fm.description = Some(value),
+            "disable-model-invocation" => {
+                fm.disable_model_invocation = value == "true";
+            }
+            "license" => fm.license = Some(value),
+            "allowed-tools" => fm.allowed_tools = Some(value),
+            "name" => fm.name = Some(value),
+            _ => {} // 其余键（如 argument-hint）忽略，不 fail fast
+        }
+    }
+    (fm, body)
+}
+
+/// 去掉值两端成对的引号（`"x"` / `'x'` → `x`）。
+fn unquote(value: &str) -> String {
+    let bytes = value.as_bytes();
+    if bytes.len() >= 2 {
+        let (first, last) = (bytes[0], bytes[bytes.len() - 1]);
+        if (first == b'"' && last == b'"') || (first == b'\'' && last == b'\'') {
+            return value[1..value.len() - 1].to_string();
+        }
+    }
+    value.to_string()
+}
+
+/// 校验技能根下每个技能的 frontmatter `name`（写了就必须与目录名一致）。
+///
+/// 对齐 Agent Skills 规范「name 必须与父目录同名」；名字是唯一身份，这条不变量不能被
+/// frontmatter 悄悄覆盖（决策 172）。不一致 → [`Error::Config`]，供启动校验调用。
+pub fn validate_names(skills_root: &Path) -> Result<()> {
+    for (name, path) in markdown_skill_paths(skills_root) {
+        let fm = read_frontmatter(&path);
+        if let Some(declared) = fm.name.as_deref() {
+            if !declared.is_empty() && declared != name {
+                return Err(Error::Config(format!(
+                    "技能 {name} 的 frontmatter name 与目录名不一致：{declared}（\
+                     名字是唯一身份，须与父目录同名）"
+                )));
+            }
+        }
+    }
+    Ok(())
+}
+
+/// 读取一个知识型技能的正文（内嵌或技能根下的用户文件）。
 ///
 /// `name` 必须存在于 [`discover`] 的结果中。工具型技能返回 `Ok(None)`。
-fn body_of(home_root: &Path, name: &str) -> Result<Option<String>> {
-    let path = skill_file_path(home_root, name);
+fn body_of(skills_root: &Path, name: &str) -> Result<Option<String>> {
+    let path = skill_file_path(skills_root, name);
     match std::fs::read_to_string(&path) {
         Ok(raw) => {
-            let body = strip_frontmatter(&raw).trim().to_string();
+            let body = parse_frontmatter(&raw).1.trim().to_string();
             if body.is_empty() {
                 return Err(Error::Config(format!(
                     "技能 {name} 的正文为空：{}",
@@ -296,8 +411,9 @@ fn body_of(home_root: &Path, name: &str) -> Result<Option<String>> {
 
 /// 解析声明的一组技能为「名字 + 可选正文」，保持声明顺序、去重。
 ///
+/// `skills_root` 是技能根本身（默认 `{home}/skills`，`[skills] dir` 可覆盖）。
 /// 正文为空（用户文件写了空内容）→ [`Error::Config`]，与 `persona_path` 同口径。
-pub fn resolve(home_root: &Path, declared: &[String]) -> Result<Vec<ResolvedSkill>> {
+pub fn resolve(skills_root: &Path, declared: &[String]) -> Result<Vec<ResolvedSkill>> {
     let mut out: Vec<ResolvedSkill> = Vec::new();
     for name in declared {
         if out.iter().any(|s| &s.name == name) {
@@ -305,7 +421,7 @@ pub fn resolve(home_root: &Path, declared: &[String]) -> Result<Vec<ResolvedSkil
         }
         out.push(ResolvedSkill {
             name: name.clone(),
-            body: body_of(home_root, name)?,
+            body: body_of(skills_root, name)?,
         });
     }
     Ok(out)
@@ -319,8 +435,13 @@ mod tests {
         tempfile::tempdir().unwrap()
     }
 
+    /// 默认技能根（`{home}/skills`）——与 `Home::skills_dir` 同构，避免测试里散落拼路径。
+    fn root_of(home: &Path) -> PathBuf {
+        home.join(SKILLS_DIR)
+    }
+
     fn write_skill(root: &Path, name: &str, content: &str) {
-        let dir = root.join(SKILLS_DIR).join(name);
+        let dir = root.join(name);
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(dir.join(SKILL_FILE), content).unwrap();
     }
@@ -328,7 +449,7 @@ mod tests {
     #[test]
     fn embedded_skills_are_discovered_without_any_home_files() {
         let home = tmp();
-        let names = skill_names(home.path());
+        let names = skill_names(&root_of(home.path()));
         assert!(names.contains(&"grilling".to_string()));
         assert!(names.contains(&"to-spec".to_string()));
     }
@@ -336,7 +457,11 @@ mod tests {
     #[test]
     fn embedded_skills_carry_bodies() {
         let home = tmp();
-        let resolved = resolve(home.path(), &["grilling".into(), "to-spec".into()]).unwrap();
+        let resolved = resolve(
+            &root_of(home.path()),
+            &["grilling".into(), "to-spec".into()],
+        )
+        .unwrap();
         assert_eq!(resolved.len(), 2);
         // 正文是流水线原生版本：grilling 讲 pending 回路，to-spec 守决策 136
         let grilling = resolved[0].body.as_deref().unwrap();
@@ -350,11 +475,11 @@ mod tests {
     #[test]
     fn user_markdown_overrides_embedded_body() {
         let home = tmp();
-        write_skill(home.path(), "grilling", "用户自己的拷问流程");
-        let resolved = resolve(home.path(), &["grilling".into()]).unwrap();
+        write_skill(&root_of(home.path()), "grilling", "用户自己的拷问流程");
+        let resolved = resolve(&root_of(home.path()), &["grilling".into()]).unwrap();
         assert_eq!(resolved[0].body.as_deref(), Some("用户自己的拷问流程"));
         // 来源登记为 Markdown 覆盖
-        let found = discover(home.path());
+        let found = discover(&root_of(home.path()));
         let s = found.iter().find(|s| s.name == "grilling").unwrap();
         assert!(matches!(s.source, SkillSource::Markdown { .. }), "{s:?}");
     }
@@ -363,43 +488,65 @@ mod tests {
     fn frontmatter_is_stripped_from_user_file() {
         let home = tmp();
         write_skill(
-            home.path(),
+            &root_of(home.path()),
             "grilling",
-            "---\nname: grill-me\ndescription: x\n---\n\n正文从这里开始",
+            "---\nname: grilling\ndescription: x\n---\n\n正文从这里开始",
         );
-        let resolved = resolve(home.path(), &["grilling".into()]).unwrap();
+        let resolved = resolve(&root_of(home.path()), &["grilling".into()]).unwrap();
         assert_eq!(resolved[0].body.as_deref(), Some("正文从这里开始"));
     }
 
     #[test]
     fn empty_user_file_is_config_error() {
         let home = tmp();
-        write_skill(home.path(), "grilling", "   \n");
-        let err = resolve(home.path(), &["grilling".into()]).unwrap_err();
+        write_skill(&root_of(home.path()), "grilling", "   \n");
+        let err = resolve(&root_of(home.path()), &["grilling".into()]).unwrap_err();
         assert!(matches!(err, Error::Config(_)), "{err:?}");
         assert!(err.to_string().contains("正文为空"), "{err}");
+    }
+
+    /// CRLF 文件的正文行尾统一为 `\n`——与既有剥离行为逐字相同。
+    ///
+    /// 正文进 system prompt，行尾差异会改 `prompt_template_hash`（决策 137），
+    /// 因此这条不是洁癖而是兼容性要求（票 01：未配置时行为零变化）。
+    #[test]
+    fn crlf_body_line_endings_are_normalized() {
+        let home = tmp();
+        write_skill(
+            &root_of(home.path()),
+            "win-skill",
+            "---\r\nname: win-skill\r\ndescription: x\r\n---\r\n\r\n第一行\r\n第二行\r\n",
+        );
+        let resolved = resolve(&root_of(home.path()), &["win-skill".into()]).unwrap();
+        let body = resolved[0].body.as_deref().unwrap();
+        assert_eq!(body, "第一行\n第二行", "行尾应统一为 \\n：{body:?}");
+        assert!(!body.contains('\r'), "{body:?}");
     }
 
     #[test]
     fn tool_skill_has_no_body() {
         let home = tmp();
-        // 工具型技能（PATH 可执行文件）不在 HOME 里，正文为 None——用未声明的名字验证
-        let resolved = resolve(home.path(), &["definitely-not-a-knowledge-skill".into()]).unwrap();
+        // 工具型技能（PATH 可执行文件）不在技能根里，正文为 None——用未声明的名字验证
+        let resolved = resolve(
+            &root_of(home.path()),
+            &["definitely-not-a-knowledge-skill".into()],
+        )
+        .unwrap();
         assert!(resolved[0].body.is_none());
     }
 
     #[test]
     fn unknown_markdown_dir_without_skill_file_is_ignored() {
         let home = tmp();
-        std::fs::create_dir_all(home.path().join(SKILLS_DIR).join("not-a-skill")).unwrap();
-        assert!(!skill_names(home.path()).contains(&"not-a-skill".to_string()));
+        std::fs::create_dir_all(root_of(home.path()).join("not-a-skill")).unwrap();
+        assert!(!skill_names(&root_of(home.path())).contains(&"not-a-skill".to_string()));
     }
 
     #[test]
     fn resolve_dedups_and_preserves_declaration_order() {
         let home = tmp();
         let resolved = resolve(
-            home.path(),
+            &root_of(home.path()),
             &["to-spec".into(), "grilling".into(), "to-spec".into()],
         )
         .unwrap();
@@ -411,7 +558,142 @@ mod tests {
 
     #[test]
     fn skill_file_path_matches_zcode_layout() {
-        let p = skill_file_path(Path::new("/home/u/.agentpipeline"), "grilling");
+        // 技能根就是 `{home}/skills` 时（生产默认），布局与 ZCode 一致
+        let p = skill_file_path(
+            &Path::new("/home/u/.agentpipeline").join(SKILLS_DIR),
+            "grilling",
+        );
         assert!(p.ends_with("skills/grilling/SKILL.md"), "{}", p.display());
+    }
+
+    /// 票 01：技能根本身可直接落在任意目录（`[skills] dir` 覆盖后就是这种形态）。
+    #[test]
+    fn discovery_uses_skills_root_verbatim() {
+        let external = tmp();
+        write_skill(external.path(), "my-skill", "外部技能正文");
+        // 技能根 = 外部目录本身，不是 `{外部目录}/skills`
+        let resolved = resolve(external.path(), &["my-skill".into()]).unwrap();
+        assert_eq!(resolved[0].body.as_deref(), Some("外部技能正文"));
+        assert!(skill_names(external.path()).contains(&"my-skill".to_string()));
+        assert!(validate_names(external.path()).is_ok());
+    }
+
+    // ── 票 02：frontmatter 四键解析 ──
+
+    #[test]
+    fn frontmatter_reads_four_keys() {
+        let raw = "---\nname: s\ndescription: 描述文本\ndisable-model-invocation: true\n\
+                   license: Apache-2.0\nallowed-tools: read_file, list_dir\n---\n\n正文";
+        let (fm, body) = parse_frontmatter(raw);
+        assert_eq!(fm.name.as_deref(), Some("s"));
+        assert_eq!(fm.description.as_deref(), Some("描述文本"));
+        assert!(fm.disable_model_invocation);
+        assert_eq!(fm.license.as_deref(), Some("Apache-2.0"));
+        assert_eq!(fm.allowed_tools.as_deref(), Some("read_file, list_dir"));
+        assert_eq!(body.trim(), "正文");
+    }
+
+    #[test]
+    fn frontmatter_quoted_values_are_unquoted() {
+        let raw = "---\ndescription: \"带: 冒号的描述\"\n---\n\n正文";
+        let (fm, _) = parse_frontmatter(raw);
+        assert_eq!(fm.description.as_deref(), Some("带: 冒号的描述"));
+    }
+
+    #[test]
+    fn frontmatter_missing_keys_default() {
+        let raw = "---\nname: s\n---\n\n正文";
+        let (fm, body) = parse_frontmatter(raw);
+        assert_eq!(fm.description, None);
+        assert!(!fm.disable_model_invocation, "缺失按缺省，不是 true");
+        assert_eq!(fm.license, None);
+        assert_eq!(fm.allowed_tools, None);
+        assert_eq!(body.trim(), "正文");
+    }
+
+    #[test]
+    fn frontmatter_boolean_only_accepts_true() {
+        // 只有字面 `true` 生效；`yes` / `1` / 任意值都按缺省（false）
+        for value in ["yes", "1", "True", "true-ish"] {
+            let raw = format!("---\ndisable-model-invocation: {value}\n---\n\n正文");
+            let (fm, _) = parse_frontmatter(&raw);
+            assert!(!fm.disable_model_invocation, "值 {value} 不应生效");
+        }
+        let (fm, _) = parse_frontmatter("---\ndisable-model-invocation: true\n---\n\n正文");
+        assert!(fm.disable_model_invocation);
+    }
+
+    /// 开头的破折号不是独立一行时（如四连横线 `----` 的水平线），不得被解释为 frontmatter。
+    ///
+    /// 剥离口径沿用历史的宽松前缀判定（正文照旧剥），但键的解释与 `name` 校验只认规范块
+    /// ——否则一段正常 Markdown 会因正文里的 `name:` 字面文本被判名字不符而拒绝启动。
+    #[test]
+    fn non_standalone_dashes_are_not_treated_as_frontmatter() {
+        // `----` 是水平线（4 个破折号），不是 frontmatter 起始标记
+        let raw = "----\nname: 这是正文里的字面文本\n---\n\n正文";
+        let (fm, _body) = parse_frontmatter(raw);
+        assert_eq!(
+            fm,
+            SkillFrontmatter::default(),
+            "非独立一行的破折号不得被解释为 frontmatter"
+        );
+
+        // 经 validate_names 也不应因此报错（目录名刻意与正文里的 name 不同）
+        let home = tmp();
+        write_skill(&root_of(home.path()), "grilling", raw);
+        assert!(
+            validate_names(&root_of(home.path())).is_ok(),
+            "正文里的 name: 文本不得触发名字一致性校验"
+        );
+    }
+
+    #[test]
+    fn unclosed_frontmatter_is_not_an_error_and_body_still_reads() {
+        let raw = "---\nname: s\ndescription: 未闭合\n\n正文仍然可读";
+        let (fm, body) = parse_frontmatter(raw);
+        assert_eq!(
+            fm,
+            SkillFrontmatter::default(),
+            "未闭合按无 frontmatter 处理"
+        );
+        assert_eq!(body.trim(), raw.trim(), "未闭合时原文即正文");
+
+        // 经 resolve 也不报错（正文非空）
+        let home = tmp();
+        write_skill(&root_of(home.path()), "s", raw);
+        let resolved = resolve(&root_of(home.path()), &["s".into()]).unwrap();
+        assert!(resolved[0].body.as_deref().unwrap().contains("未闭合"));
+    }
+
+    #[test]
+    fn skill_without_frontmatter_block_is_all_defaults() {
+        let raw = "直接就是正文，没有 frontmatter";
+        let (fm, body) = parse_frontmatter(raw);
+        assert_eq!(fm, SkillFrontmatter::default());
+        assert_eq!(body.trim(), raw);
+    }
+
+    #[test]
+    fn frontmatter_name_matching_dir_passes_but_mismatch_fails() {
+        let home = tmp();
+        write_skill(
+            &root_of(home.path()),
+            "grilling",
+            "---\nname: grilling\n---\n\n正文",
+        );
+        assert!(validate_names(&root_of(home.path())).is_ok());
+
+        write_skill(
+            &root_of(home.path()),
+            "to-spec",
+            "---\nname: something-else\n---\n\n正文",
+        );
+        let err = validate_names(&root_of(home.path())).unwrap_err();
+        assert!(matches!(err, Error::Config(_)), "{err:?}");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("to-spec") && msg.contains("something-else"),
+            "{msg}"
+        );
     }
 }

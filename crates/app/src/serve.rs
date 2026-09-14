@@ -98,6 +98,14 @@ pub async fn serve(options: ServeOptions) -> anyhow::Result<ServerHandle> {
         None => home,
     };
 
+    // `[skills] dir` 覆盖接入（决策 172）：技能根整体替换，executor 与启动校验
+    // 都经 `Home::skills_dir` 取它。若指到已有技能生态目录（如 `~/.zcode/skills`），
+    // 不应新建也不应改其权限——只有默认技能根才随家目录骨架建立（见 `ensure_dirs`）。
+    let home = match config.skills.resolved_dir(home.root()) {
+        Some(dir) => home.with_skills_dir(Some(dir)),
+        None => home,
+    };
+
     let store = Store::open(home.clone(), Arc::new(SystemClock)).await?;
 
     // 恢复流程第一步（决策 127）：清理 kill -9 残留的 executor_owner
@@ -337,6 +345,10 @@ fn open_log_file(path: &std::path::Path) -> anyhow::Result<std::fs::File> {
 ///
 /// 尽力而为：创建失败只告警——目录缺失时 `resolve_persona` 本就会回落内嵌 persona，
 /// 不该因覆盖目录建不出来而拒绝启动。
+///
+/// 技能根（`[skills] dir`）**不走这里**：它常指向用户已有的技能生态目录
+/// （`~/.zcode/skills`），新建或改权限都不是本系统该做的事（决策 172）；技能根不存在
+/// 只是「没有可用技能」，无需预备。
 fn prepare_prompts_dir(dir: &std::path::Path) {
     let created = !dir.exists();
     match std::fs::create_dir_all(dir) {

@@ -286,14 +286,17 @@ fn user_home_dir() -> PathBuf {
         .unwrap_or_else(|| PathBuf::from("."))
 }
 
-/// 发现"可用 skill"（决策 47，**已由决策 170 修订**——语义扩展为三类来源）。
+/// 发现"可用 skill"（决策 47，**已由决策 170 / 172 修订**——三类来源）。
 ///
 /// 保留决策 47 的工具语义（`rtk` / `codegraph` 等 CLI，以 PATH 可执行文件名为准），
-/// 并加入两类**知识型**技能：内嵌默认与 `{home}/skills/{name}/SKILL.md` 用户覆盖。
+/// 并加入两类**知识型**技能：内嵌默认与技能根下的 `{name}/SKILL.md` 用户覆盖。
 /// 名字是唯一身份，同名用户文件覆盖内嵌。技能正文的注入见
 /// [`crate::agent::skills::resolve`] 与 [`crate::agent::prompts::build_system_prompt`]。
-pub fn discover_available_skills(home_root: &Path) -> Vec<String> {
-    crate::agent::skills::skill_names(home_root)
+///
+/// `skills_root` 是技能根**本身**（默认 `{home}/skills`，可由 `[skills] dir` 覆盖，
+/// 决策 172）——本函数与 [`crate::agent::skills::discover`] 走同一入口，不新增发现路径。
+pub fn discover_available_skills(skills_root: &Path) -> Vec<String> {
+    crate::agent::skills::skill_names(skills_root)
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
@@ -314,6 +317,30 @@ impl PromptsConfig {
     }
 }
 
+/// `[skills]`：技能根覆盖（决策 172，修订决策 47）。
+///
+/// 照 [`PromptsConfig`] 的先例：相对路径按 home 根解析、`~` 展开、空白 → `None`。
+/// 未配置时技能根仍是 `{home}/skills`，行为逐字不变。
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
+#[serde(default, deny_unknown_fields)]
+pub struct SkillsConfig {
+    /// 覆盖技能根的目录；缺省时用 `{home}/skills`。
+    ///
+    /// 典型用法是把它指到已有的技能生态目录，如 `~/.zcode/skills`。
+    pub dir: Option<String>,
+}
+
+impl SkillsConfig {
+    /// 解析后的技能根；未配置或空白 → `None`（回落 `{home}/skills`）。
+    pub fn resolved_dir(&self, home_root: &Path) -> Option<PathBuf> {
+        let raw = self.dir.as_deref()?.trim();
+        if raw.is_empty() {
+            return None;
+        }
+        Some(resolve_config_path(raw, home_root))
+    }
+}
+
 /// 完整配置。
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
@@ -322,6 +349,7 @@ pub struct Config {
     pub pipeline: PipelineOverrides,
     pub logging: LoggingConfig,
     pub prompts: PromptsConfig,
+    pub skills: SkillsConfig,
 }
 
 impl Config {
@@ -481,7 +509,8 @@ pub struct StartupInputs {
     /// home 根目录（§10.6.4：`persona_path` 相对路径按它解析；
     /// 提供时校验 persona_path 存在且非空，None 则跳过该文件系统检查）。
     pub home_root: Option<std::path::PathBuf>,
-    /// 技能根目录（决策 170：`{home}`；提供时校验知识型技能正文存在且非空，
+    /// 技能根目录（决策 170 / 172：默认 `{home}/skills`，可由 `[skills] dir` 覆盖；
+    /// 提供时校验知识型技能正文存在且非空、frontmatter `name` 与目录名一致，
     /// `None` 则跳过该文件系统检查——老调用点无需改动）。
     pub skills_root: Option<std::path::PathBuf>,
 }
@@ -498,11 +527,18 @@ pub struct StartupReport {
 /// - 阶段引用的 provider 不存在 / 被禁用 / vendor 不受支持 → 拒绝启动；
 /// - 引用的 skill 不存在 → 拒绝启动（阶段级与节点级都校验，节点级报错指明节点，决策 170）；
 /// - 提供 `home_root` 时：阶段 `persona_path` 不可读或内容为空 → 拒绝启动（§10.6.4）；
-/// - 提供 `skills_root` 时：知识型技能的正文不可读或为空 → 拒绝启动（决策 170）；
+/// - 提供 `skills_root` 时：知识型技能的正文不可读或为空 → 拒绝启动（决策 170），
+///   且 frontmatter `name` 与目录名不一致 → 拒绝启动（决策 172）；
 /// - provider 表里 vendor 不受支持但**未被引用** → 降级 `enabled = 0`，只报告不报错。
 pub fn validate_startup(inputs: &StartupInputs) -> Result<StartupReport> {
     let mut report = StartupReport::default();
     let mut usable: Vec<&Provider> = Vec::new();
+
+    // frontmatter `name` 必须与目录名一致（决策 172：名字是唯一身份，不被 frontmatter
+    // 悄悄覆盖）。与技能正文的检查同口径——提供技能根才做文件系统校验。
+    if let Some(root) = &inputs.skills_root {
+        crate::agent::skills::validate_names(root)?;
+    }
 
     for p in &inputs.providers {
         if SUPPORTED_ADAPTERS.contains(&p.vendor.as_str()) {
@@ -760,6 +796,57 @@ mod tests {
     #[test]
     fn prompts_unknown_key_is_rejected() {
         let err = Config::from_toml("[prompts]\ndir = \"x\"\nnope = 1\n").unwrap_err();
+        assert!(matches!(err, Error::Config(_)), "{err}");
+    }
+
+    // ── 决策 172：[skills] dir 覆盖技能根 ──
+
+    #[test]
+    fn skills_dir_resolution_matches_prompts_semantics() {
+        let home = Path::new("/home/u/.agentpipeline");
+
+        // 绝对路径原样
+        let cfg = Config::from_toml("[skills]\ndir = \"/opt/shared/skills\"\n").unwrap();
+        assert_eq!(
+            cfg.skills.resolved_dir(home).unwrap(),
+            PathBuf::from("/opt/shared/skills")
+        );
+
+        // 相对路径接在 home 下
+        let cfg = Config::from_toml("[skills]\ndir = \"my-skills\"\n").unwrap();
+        assert_eq!(
+            cfg.skills.resolved_dir(home).unwrap(),
+            home.join("my-skills")
+        );
+
+        // 未配置 / 空白 → None（Home 回落 {home}/skills，行为逐字不变）
+        assert!(Config::from_toml("")
+            .unwrap()
+            .skills
+            .resolved_dir(home)
+            .is_none());
+        let cfg = Config::from_toml("[skills]\ndir = \"   \"\n").unwrap();
+        assert!(cfg.skills.resolved_dir(home).is_none());
+    }
+
+    #[test]
+    fn skills_dir_expands_tilde() {
+        // `~/.zcode/skills` 是这一项的主要用法（决策 172）
+        let cfg = Config::from_toml("[skills]\ndir = \"~/.zcode/skills\"\n").unwrap();
+        let resolved = cfg
+            .skills
+            .resolved_dir(Path::new("/home/u/.agentpipeline"))
+            .unwrap();
+        assert!(
+            resolved.is_absolute() && resolved.ends_with(".zcode/skills"),
+            "{}",
+            resolved.display()
+        );
+    }
+
+    #[test]
+    fn skills_unknown_key_is_rejected() {
+        let err = Config::from_toml("[skills]\ndir = \"x\"\nnope = 1\n").unwrap_err();
         assert!(matches!(err, Error::Config(_)), "{err}");
     }
 

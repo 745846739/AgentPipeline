@@ -28,6 +28,9 @@ pub struct Home {
     /// `[prompts] dir` 的解析结果（§10.6.5、票 16）：`Some` 时覆盖默认
     /// `{root}/prompts`，供 executor 的 persona 覆盖查找使用；`None` 回落默认。
     prompts_override: Option<PathBuf>,
+    /// `[skills] dir` 的解析结果（决策 172）：`Some` 时覆盖默认 `{root}/skills`
+    /// （技能根**本身**），`None` 回落默认。
+    skills_override: Option<PathBuf>,
 }
 
 impl Home {
@@ -40,6 +43,7 @@ impl Home {
         Home {
             root: root.into(),
             prompts_override: None,
+            skills_override: None,
         }
     }
 
@@ -48,6 +52,14 @@ impl Home {
     /// 链式构造：`Home::from_env().with_prompts_dir(cfg.prompts.dir.as_deref())`。
     pub fn with_prompts_dir(mut self, dir: Option<impl Into<PathBuf>>) -> Self {
         self.prompts_override = dir.map(Into::into);
+        self
+    }
+
+    /// 设置 `[skills] dir` 覆盖（已解析为绝对路径；`None` 回落默认技能根）。
+    ///
+    /// 链式构造：`Home::from_env().with_skills_dir(cfg.skills.dir.as_deref())`。
+    pub fn with_skills_dir(mut self, dir: Option<impl Into<PathBuf>>) -> Self {
+        self.skills_override = dir.map(Into::into);
         self
     }
 
@@ -83,12 +95,15 @@ impl Home {
         )
     }
 
-    /// 用户技能目录（决策 170）：`{root}/skills/{name}/SKILL.md`。
+    /// 技能根（决策 170 / 172）：默认 `{root}/skills`，`[skills] dir` 设置时整体替换。
     ///
-    /// 内嵌技能正文在二进制里（[`crate::agent::skills::EMBEDDED_SKILLS`]），此目录用于
-    /// 用户覆盖与自定义——同名文件覆盖内嵌。
+    /// 返回的是技能根**本身**（其下直接是 `{name}/SKILL.md`）——调用方不再拼
+    /// `skills` 目录名。内嵌技能正文在二进制里
+    /// （[`crate::agent::skills::EMBEDDED_SKILLS`]），此目录用于用户覆盖与自定义。
     pub fn skills_dir(&self) -> PathBuf {
-        self.root.join(crate::agent::skills::SKILLS_DIR)
+        self.skills_override
+            .clone()
+            .unwrap_or_else(|| self.root.join(crate::agent::skills::SKILLS_DIR))
     }
 
     pub fn tasks_dir(&self) -> PathBuf {
@@ -120,13 +135,17 @@ impl Home {
     }
 
     /// 建立家目录骨架；权限收紧到 0700（§12.14）。
+    ///
+    /// 建的是**默认**技能根 `{root}/skills`，不是 `skills_dir()` 的返回值：`[skills] dir`
+    /// 常指到用户自己维护的生态目录（如 `~/.zcode/skills`），本系统不该新建它、更不该
+    /// 改它的权限（决策 172）。覆盖目录里没有技能时只是「没有可用技能」。
     pub fn ensure_dirs(&self) -> Result<()> {
         for dir in [
             self.root.clone(),
             self.data_dir(),
             self.logs_dir(),
             self.prompts_dir(),
-            self.skills_dir(),
+            self.root.join(crate::agent::skills::SKILLS_DIR),
             self.tasks_dir(),
             self.worktrees_dir(),
         ] {
@@ -264,6 +283,41 @@ mod tests {
         // None 回落默认
         let home = Home::new("/tmp/xyz-home").with_prompts_dir(None::<PathBuf>);
         assert_eq!(home.prompts_dir(), PathBuf::from("/tmp/xyz-home/prompts"));
+    }
+
+    #[test]
+    fn skills_dir_falls_back_to_home_skills() {
+        // 决策 172：未配置时技能根仍是 `{home}/skills`，行为逐字不变
+        let home = Home::new("/tmp/xyz-home");
+        assert_eq!(home.skills_dir(), PathBuf::from("/tmp/xyz-home/skills"));
+    }
+
+    #[test]
+    fn skills_dir_override_wins_over_default() {
+        // `[skills] dir` 覆盖后，executor 与启动校验都经 home.skills_dir() 取技能根
+        let home = Home::new("/tmp/xyz-home").with_skills_dir(Some("/custom/skills"));
+        assert_eq!(home.skills_dir(), PathBuf::from("/custom/skills"));
+
+        // None 回落默认
+        let home = Home::new("/tmp/xyz-home").with_skills_dir(None::<PathBuf>);
+        assert_eq!(home.skills_dir(), PathBuf::from("/tmp/xyz-home/skills"));
+    }
+
+    #[test]
+    fn ensure_dirs_never_touches_overridden_skills_dir() {
+        // 决策 172：覆盖目录是用户自己的生态目录（`~/.zcode/skills`），家目录骨架
+        // 不得新建它、更不得改它的权限——只建默认技能根。
+        let tmp = tempfile::tempdir().unwrap();
+        let external = tmp.path().join("external-skills");
+        let home = Home::new(tmp.path().join("home")).with_skills_dir(Some(external.clone()));
+        home.ensure_dirs().unwrap();
+
+        assert!(
+            !external.exists(),
+            "覆盖的技能根不得被 ensure_dirs 创建：{}",
+            external.display()
+        );
+        assert!(home.root().join("skills").is_dir(), "默认技能根仍应建立");
     }
 
     #[cfg(unix)]

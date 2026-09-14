@@ -445,13 +445,13 @@ impl Store {
             settings: settings.clone(),
             providers: providers.clone(),
             stage_configs,
-            // 决策 47 / 170：对"真实可用"的 skill 集合 fail fast
-            // ——PATH 可执行文件 ∪ 内嵌知识型技能 ∪ {home}/skills 用户覆盖
-            available_skills: crate::config::discover_available_skills(self.home().root()),
+            // 决策 47 / 170 / 172：对"真实可用"的 skill 集合 fail fast
+            // ——PATH 可执行文件 ∪ 内嵌知识型技能 ∪ 技能根下的用户覆盖
+            available_skills: crate::config::discover_available_skills(&self.home().skills_dir()),
             // §10.6.4：persona_path 相对 home 根解析，启动时一并校验存在且非空
             home_root: Some(self.home().root().to_path_buf()),
-            // 决策 170：知识型技能的正文也必须存在且非空
-            skills_root: Some(self.home().root().to_path_buf()),
+            // 决策 170 / 172：知识型技能的正文必须存在且非空，frontmatter name 须与目录名一致
+            skills_root: Some(self.home().skills_dir()),
         })?;
         for id in &report.demoted_providers {
             self.set_provider_enabled(id, false).await?;
