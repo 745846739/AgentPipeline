@@ -723,7 +723,7 @@ interface SystemBaseline {
 
 **技能声明字段形态**（决策 172④）：`string | {name, mode, trusted}` 的混合数组。裸字符串按 `{mode: "full", trusted: false}` 解释（**向后兼容今天的配置行，零迁移**）；对象形态的 `mode` 缺省 `full`、`trusted` 缺省 `false`。**未信任技能不得以 `full` 模式保存**——写入/启动校验直接拒绝，须显式确认信任或改用 `mode: "name"`。这道信任门**只对显式对象生效**：裸字符串是信任概念出现之前手写的配置行，一视同仁会使既有配置全部失效。
 
-**节点级技能：** 阶段级 `skills_json` 无法区分节点，而同一阶段的不同节点职责可能互斥（architect-design 的 `validate_input` 提问、`execute` 写 `design.md`、`validate_output` 校验）。因此技能也可在 `node_overrides_json[node].skills` 声明——见 §10.6.3。有效集 = `mandatory_skills ∪ 阶段级 skills_json ∪ 节点级 skills`（**只增不减**，同名技能保留首次出现形态：阶段级优先）。
+**节点级技能：** 阶段级 `skills_json` 无法区分节点，而同一阶段的不同节点职责可能互斥（architect-design 的 `validate_input` 提问、`execute` 写 `design.md`、`validate_output` 校验）。因此技能也可在 `node_overrides_json[node].skills` 声明——见 §10.6.3。有效集 = `mandatory_skills ∪ 阶段级 skills_json ∪ 节点级 skills`（**只增不减**；同名技能的 `mode` / `trusted` 由**更具体的一层**决定，即节点级覆盖阶段级，位置保持首次出现处以维持声明顺序）。
 
 **`Skill` 工具（决策 172③）**——按名加载技能正文，**作为 tool result 进 `messages`**，不进 system prompt（因此不改 `prompt_template_hash`）。工具名与上游同名是功能性决定：上游技能的正文里写着 `Call the Skill tool with "grilling"`，同名使这些正文**无需改写即可执行**。三条边界：
 
@@ -758,7 +758,7 @@ interface StageAgentConfig {
 
   // ── 能力（增量） ──
   tools?: string[];                // 声明的工具（与基线取并集）
-  skills?: string[];               // 加载的 skill（与基线取并集；可含知识型技能，其正文注入 prompt，决策 170）
+  skills?: SkillDecl[];            // 加载的 skill（与基线取并集）；形态见下方「技能声明字段形态」（决策 172④）
   mcp_servers?: string[];          // 启用的 MCP（与基线取并集）
 
   // ── 节点级覆盖 ──
@@ -766,10 +766,13 @@ interface StageAgentConfig {
     [node: string]: Partial<StageAgentConfig> & {
       idle_timeout_sec?: number;   // 覆盖全局 node_idle_timeout_sec（决策 66）
       max_duration_sec?: number;   // 覆盖全局 node_max_duration_sec
-      skills?: string[];           // 该节点专属技能（与阶段级取并集，决策 170）
+      skills?: SkillDecl[];        // 该节点专属技能（与阶段级取并集，决策 170；形态同上）
     };
   };
 }
+
+// 技能声明：裸字符串 = { name, mode: "full", trusted: false }（旧配置行零迁移）
+type SkillDecl = string | { name: string; mode: "full" | "name"; trusted?: boolean };
 ```
 
 > **节点级 `skills` 的存在理由（决策 170）：** 阶段级 `skills` 是整阶段生效的，而同一阶段的节点职责可能互斥。典型用例——architect-design 的 `validate_input` 需要「拷问」（`grilling`：把设计树走到没有悬空分支、只把决定问用户），`execute` 需要「综合成规格」（`to-spec`：不再提问、把已定内容写成 `design.md`）。若只在阶段级声明，写文件的节点也会拿到「不断向用户提问」的指引，二者只能互相打架。
@@ -781,7 +784,7 @@ interface StageAgentConfig {
 | provider | 阶段引用 `provider_id`（无则用系统默认） | 该行的厂商必须 ∈ `supported_adapters` **且** 该行 `enabled = 1`，否则**加载时拒绝**（决策 103 / 111） |
 | provider（运行时解析） | `node_overrides > task.model_override > 阶段 provider > 全局默认`（决策 129） | `model_override` 引用的 provider_id 在设置时（`POST /tasks/{id}/model-override`）须过同一校验 |
 | persona | 阶段 prompt + 基线强制前言 | 必须存在且非空 |
-| tools | `基线 mandatory_tools ∪ 阶段 tools − forbidden_tools` | 不能移除 mandatory_tools |
+| tools | `基线 mandatory_tools ∪ 阶段 tools − forbidden_tools`；节点存在名字态 / 目录态技能时自动并入 `Skill`（决策 172③，否则那批技能是断腿的指针） | 不能移除 mandatory_tools |
 | skills | `基线 mandatory_skills ∪ 阶段 skills ∪ 节点级 skills`（决策 170，只增不减） | 不能移除 mandatory_skills；引用的 skill 名字必须存在，否则 fail fast；知识型技能的**正文必须存在且非空**，否则 fail fast（与 `persona_path` 同口径） |
 
 **校验时机：** 启动时（配置加载）一次性校验所有**注册阶段**的阶段配置，**fail fast**——发现违规配置直接拒绝启动并报错，不允许运行时才暴露。伪阶段（`project_analysis` / `conflict_check` / `validator_cross_check`）按各自要求单独校验（决策 87 / 134）：`project_analysis` 的 persona **允许为空**（省略时只输出确定性探测的事实清单，决策 78）；`conflict_check` 必须做语义比对，persona **强制存在且非空**；`validator_cross_check` persona 同样**强制存在且非空**，且 `cross_family_judge = true` 时必须已配置 provider，否则配置加载 fail fast。其余校验（厂商适配器支持、工具并集、超时覆盖）与正式阶段完全一致。

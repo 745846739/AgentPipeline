@@ -286,12 +286,12 @@ fn user_home_dir() -> PathBuf {
         .unwrap_or_else(|| PathBuf::from("."))
 }
 
-/// 发现"可用 skill"（决策 47，**已由决策 170 / 172 修订**——三类来源）。
+/// 发现"可用 skill"（决策 47，**已由决策 170 / 172 修订**——两类来源）。
 ///
 /// 保留决策 47 的工具语义（`rtk` / `codegraph` 等 CLI，以 PATH 可执行文件名为准），
-/// 并加入两类**知识型**技能：内嵌默认与技能根下的 `{name}/SKILL.md` 用户覆盖。
-/// 名字是唯一身份，同名用户文件覆盖内嵌。技能正文的注入见
-/// [`crate::agent::skills::resolve`] 与 [`crate::agent::prompts::build_system_prompt`]。
+/// 并加入**用户 markdown** 知识型技能（技能根下的 `{name}/SKILL.md`；内嵌技能已随
+/// 决策 172① 退场）。技能正文的注入见 [`crate::agent::skills::resolve`] 与
+/// [`crate::agent::prompts::build_system_prompt`]。
 ///
 /// `skills_root` 是技能根**本身**（默认 `{home}/skills`，可由 `[skills] dir` 覆盖，
 /// 决策 172）——本函数与 [`crate::agent::skills::discover`] 走同一入口，不新增发现路径。

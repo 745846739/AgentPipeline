@@ -105,7 +105,7 @@
 | **Config** | 全局配置（TOML），包含 retry 参数、timeout、日志、prompt 目录等。位于 `~/.agentpipeline/config.toml`，**不含** provider / model / API key 等界面可改的配置（决策 22 / 56） |
 | **StageConfig** | 每个 stage 的独立配置，包含 provider（`provider_id` 引用）、tools、skills、超时覆盖（决策 111：不单列 model）。存 DB，界面可改 |
 | **技能（skill）** | 阶段或节点声明、被注入上下文的知识/流程指引（决策 170，修订决策 47；决策 172 修订）。名字是唯一身份，两类来源：**用户 markdown**（`~/.agentpipeline/skills/{name}/SKILL.md`，技能根可由 `[skills] dir` 覆盖）、**PATH 外部工具**（决策 47 原语义，如 `rtk`，只有名字无正文）。**内嵌技能已退场**（决策 172①）：二进制不含任何技能正文，技能一律由用户安装到本地。渲染分**三态**（决策 172④）：全文态（正文进 system prompt）、名字态（只列名字，正文由 `Skill` 工具按需拉取）、目录态（未被声明的可用技能只给名字 + 描述，渐进披露）。正文「存在且非空」、frontmatter `name` 与目录名一致、兄弟文件存在，三者都在启动与 `PUT /stage-configs` 时 fail fast（与 `persona_path` 同口径）。与 MCP 的分工：skill 是知识，MCP 是可调用能力（backlog §B.1） |
-| **节点级技能** | 写在 `StageConfig.node_overrides_json[node].skills` 的技能声明（决策 170）。解决「同一阶段不同节点需要不同知识」——如 architect-design 的 validate_input 要拷问、execute 要综合成规格。字段形态为 `string \| {name, mode, trusted}` 混合数组（决策 172④）。有效集 = `mandatory ∪ 阶段级 skills_json ∪ 节点级`（只增不减，同名保留首次出现形态） |
+| **节点级技能** | 写在 `StageConfig.node_overrides_json[node].skills` 的技能声明（决策 170）。解决「同一阶段不同节点需要不同知识」——如 architect-design 的 validate_input 要拷问、execute 要综合成规格。字段形态为 `string \| {name, mode, trusted}` 混合数组（决策 172④）。有效集 = `mandatory ∪ 阶段级 skills_json ∪ 节点级`（只增不减；同名技能的 `mode` / `trusted` 由**更具体的一层**决定，即节点级 > 阶段级，保留首次出现的位置以维持声明顺序） |
 | **AGENTS.md** | 项目上下文文件，每个 agent 启动时加载，拼入 system prompt 的固定段落，提供项目约定和规范 |
 | **伪阶段（Pseudo-stage）** | 不进入 kanban 图、无 StageIO/checkpoint/pending 的单次 agent 调用（`project_analysis`、`conflict_check`、`validator_cross_check`），仅复用阶段配置与白名单校验 |
 | **cross_family_judge** | 全局开关（默认 false，决策 134）：开启后 agent 型 validate_output 首判不合格时调用 `validator_cross_check` 异族复判；开启但伪阶段未配置 provider → 配置加载 fail fast |

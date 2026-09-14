@@ -27,15 +27,37 @@ pub fn effective_tools(declared: &[String]) -> Vec<String> {
 /// 在启动校验 [`crate::config::validate_startup`]，这里只做并集）。
 ///
 /// **只增不减**（§10.6.4）：节点级声明由调用方先并入 `declared`，本函数不削减任何一项
-/// ——基线为空（决策 172：内嵌技能退场），故实际等于 阶段级 ∪ 节点级。同名技能保留
-/// **首次出现**的形态（阶段级在前），节点级不能改写阶段级已声明技能的 `mode` / `trusted`。
+/// ——基线为空（决策 172①：内嵌技能退场），故实际等于 阶段级 ∪ 节点级。
+///
+/// **同名技能由更具体的一层决定**（`declared` 里阶段级在前、节点级在后）。这既贴合
+/// `node_overrides_json` 的 override 语义，也与同表的 `idle_timeout_sec` 一致
+/// （节点级 > 阶段级 > 全局，决策 66）——节点级声明 `mode: "name"` 却仍被阶段级的
+/// `full` 压住，等于让「节点专属技能」这个功能对同名技能失效。保留**首次出现的位置**，
+/// 使渲染顺序与声明顺序一致。这不违反「只增不减」：技能仍在集合里，变的只是注入形态。
+///
+/// 注意覆盖方向**不能**绕过信任门：未信任 + `full` 的声明在 [`crate::config::parse_skill_decls`]
+/// 就被拒绝，走不到这里。
+///
+/// 基线 [`BASELINE_MANDATORY_SKILLS`] 目前为空（决策 172①：内嵌技能退场，推荐默认改由
+/// 配置界面承载），但仍按并集语义参与——与 [`effective_tools`] 对
+/// [`BASELINE_MANDATORY_TOOLS`] 的处理对称，保住「mandatory 不可移除」这条机制
+/// （§10.6.2 的约束语义同样覆盖技能）。
 pub fn effective_skills(
     declared: &[crate::agent::skills::SkillDecl],
 ) -> Vec<crate::agent::skills::SkillDecl> {
-    let mut out: Vec<crate::agent::skills::SkillDecl> = Vec::new();
+    use crate::agent::skills::SkillDecl;
+    let mut out: Vec<SkillDecl> = BASELINE_MANDATORY_SKILLS
+        .iter()
+        .map(|n| SkillDecl::from_bare(*n))
+        .collect();
     for d in declared {
-        if !out.iter().any(|s| s.name == d.name) {
-            out.push(d.clone());
+        match out.iter_mut().find(|s| s.name == d.name) {
+            // 后声明的（更具体的一层）改写形态，位置不变
+            Some(existing) => {
+                existing.mode = d.mode;
+                existing.trusted = d.trusted;
+            }
+            None => out.push(d.clone()),
         }
     }
     out
@@ -124,7 +146,7 @@ mod tests {
     /// 决策 172④：节点级声明**只增不减**，同名技能保留首次出现的形态
     /// （阶段级在前 → 节点级无法改写其 mode/trusted，也不能削减它）。
     #[test]
-    fn effective_skills_is_union_and_first_wins() {
+    fn effective_skills_is_union_and_more_specific_wins() {
         use crate::agent::skills::{SkillDecl, SkillMode};
         let node_level = SkillDecl {
             name: "grilling".into(),
@@ -133,12 +155,31 @@ mod tests {
         };
         let got = effective_skills(&[
             SkillDecl::from_bare("grilling"), // 阶段级：full
-            node_level.clone(),               // 节点级同名：应被忽略
+            node_level.clone(),               // 节点级同名：改写形态
             SkillDecl::from_bare("to-spec"),
         ]);
-        assert_eq!(got.len(), 2, "同名去重：{got:?}");
-        assert_eq!(got[0], SkillDecl::from_bare("grilling"), "阶段级形态优先");
-        assert_eq!(got[1].name, "to-spec");
+        assert_eq!(got.len(), 2, "同名去重且不削减：{got:?}");
+        assert_eq!(got[0].name, "grilling");
+        // 位置保持首次出现处，形态取更具体的一层
+        assert_eq!(got[0].mode, SkillMode::Name, "节点级形态应生效");
+        assert!(got[0].trusted);
+        assert_eq!(got[1].name, "to-spec", "其余技能保持声明顺序");
+    }
+
+    /// 反向顺序（节点级在前）不应「反被阶段级压回」——覆盖只由**更具体的一层**决定，
+    /// 而调用方保证了阶段级在前。这里钉住「后出现的赢」这条机械规则，避免实现漂移。
+    #[test]
+    fn effective_skills_last_declaration_wins() {
+        use crate::agent::skills::{SkillDecl, SkillMode};
+        let stage_level = SkillDecl {
+            name: "x".into(),
+            mode: SkillMode::Full,
+            trusted: true,
+        };
+        let got = effective_skills(&[SkillDecl::from_bare("x"), stage_level]);
+        assert_eq!(got.len(), 1);
+        assert_eq!(got[0].mode, SkillMode::Full, "后声明者改写形态");
+        assert!(got[0].trusted);
     }
 
     #[test]

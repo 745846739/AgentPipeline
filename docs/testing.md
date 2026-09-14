@@ -250,7 +250,7 @@ harness = FakeAgent（§3.2）+ testkit fixture（§3.3）+ 临时 home + 手动
 | 117 / 98 | §6 准入、E2E-20 | 准入已有用例；E2E-20 已有用例（票 19） |
 | 130⑤ / 69 / 71② / 125 / 3 | §7 回归（dependency continue 不 spawn / goto 入口节点 / 纯 name warning / retry reset / cancel 清理）、§6 | 已有用例（2026-09-12 偏离修复回归） |
 | 153 | §7 跨源防护矩阵（`X-AgentPipeline` 放行 = 桌面 webview 旁路）、E2E-00 启动冒烟（serve 沉 lib + 随机端口绑定的接线验证） | 跨源侧已有用例（随 128）；其余约束随前端（票 20–22）与桌面壳接线 |
-| 170 | §5 `skills.rs` 单测（三类发现 / 同名覆盖 / frontmatter 剥离 / 空正文拒绝）、`prompts.rs` 两种渲染 + hash 敏感、`config.rs::node_skills_*`、§6 `executor.rs::node_scoped_skills_inject_different_bodies_per_node` 与 `stage_level_skills_still_apply_and_union_with_node_level`、§7 `stage_config_accepts_node_scoped_skills_and_rejects_unknown` / `stage_config_rejects_empty_knowledge_skill_body` | 已有用例（markdown 技能 + 节点级技能，2026-09-14） |
+| 170 / 172 | §5 `skills.rs` 单测（两类发现 / 同名让位 / frontmatter 剥离 / 空正文拒绝 / 三态渲染 / 兄弟展开）、`prompts.rs` 三种渲染 + hash 只对全文态敏感、`config.rs::node_skills_*` 与技能声明形态校验、§6 `executor.rs::node_scoped_skills_inject_different_bodies_per_node` 与 `stage_level_skills_still_apply_and_union_with_node_level`、`skill_tool_injects_body_into_next_round_messages`、§7 `stage_config_accepts_node_scoped_skills_and_rejects_unknown` / `stage_config_validates_skill_declaration_shapes` / `stage_config_rejects_skill_with_missing_sibling` / `stage_config_rejects_empty_knowledge_skill_body` | 已有用例（markdown 技能 + 节点级技能 2026-09-14；决策 172 的运行时补齐同批：`Skill` 工具、三态、兄弟展开、声明形态） |
 | 171 | §5 `config.rs::default_server_port_is_8788`（缺省 `port` 与 `host` 钉住；缺省绑定与跨源白名单均由 `port` 派生） | 已有用例（默认端口 8787→8788，2026-09-14） |
 | …… | 其余决策随实现逐条填入 | — |
 

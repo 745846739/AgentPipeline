@@ -245,7 +245,7 @@ fn markdown_skill_paths(skills_root: &Path) -> BTreeMap<String, PathBuf> {
 
 /// 发现全部可用技能（技能根 markdown ∪ PATH 工具），名字去重。
 ///
-/// 两类来源同名时**知识型让位给工具型以外的方向**：有正文的更具体，工具型只列名字。
+/// 两类来源同名时**让位给知识型**：有正文的更具体，工具型只列名字。
 /// 内嵌来源已退场（决策 172①，票 04），本函数不再有「内嵌 ∪ 用户覆盖」那一层。
 pub fn discover(skills_root: &Path) -> Vec<Skill> {
     let mut out: Vec<Skill> = markdown_skill_paths(skills_root)
@@ -512,7 +512,7 @@ pub fn catalogue(skills_root: &Path, declared: &[String]) -> Vec<ResolvedSkill> 
 ///
 /// 缺失的引用**在展开结果里显式标注**而不是静默删除——这是给模型看的：它会知道这里少
 /// 了一节，而不是以为技能就长这样。`Err` 只用于调用方明确要求「残缺即失败」的场景
-/// （见 [`load_body_strict`]）。
+/// （见 [`expand_siblings_strict`]）。
 pub fn expand_siblings(skills_root: &Path, name: &str, body: &str) -> String {
     let dir = skills_root.join(name);
     // 目录不可 canonicalize（技能不存在等）时按无引用处理——正文已由调用方校验过

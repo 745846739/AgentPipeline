@@ -33,7 +33,7 @@
 | 23 | Merge proposal | 只有"合入"和"返回修改"，移除"拒绝"按钮 | g1-R6 |
 | 24 | 项目创建 | agent 静态分析（语言、测试框架、AGENTS.md 等），用户确认（探测部分改由代码实现，见决策 78） | g1-R5 |
 | 25 | review_mode | v1 只支持 `agent` 和 `human`，`human_if_risk` 延后 | g1-R7 |
-| 26 | Agent 工具 | **已由决策 45 修订**：7 个内置工具（write_file / edit_file / read_file / delete_file / list_dir / run_command / submit_metadata）+ 扩展工具 spawn_sub_agent（默认关闭） | g1-R7 |
+| 26 | Agent 工具 | **已由决策 45 修订**：7 个内置工具（write_file / edit_file / read_file / delete_file / list_dir / run_command / submit_metadata）+ 扩展工具 spawn_sub_agent（默认关闭）。**再经决策 172③ 修订为 8 个**：新增 `Skill`（不进 `MANDATORY_TOOLS`，由阶段声明启用，或存在名字态 / 目录态技能时自动放行） | g1-R7 |
 | 27 | 循环依赖检测 | API 层（POST /tasks）检测，返回 400 | g1-R5 |
 | 28 | AGENTS.md 加载 | 从 worktree 根目录读取，不存在时用默认上下文（非空，见决策 51） | g1-R5 |
 | 29 | 项目关联模型 | 以本地仓库路径为唯一事实来源；删除"关联 git remote URL"表述与中心化 `~/.agentpipeline/repo/` 目录 | g2-R1 |
@@ -52,7 +52,7 @@
 | 42 | Task 记录创建 | 由 `POST /tasks` API 层创建（含循环依赖检测与初始状态判定——初始状态后由决策 98 修订为 queued / waiting）；init.execute 只建 worktree 并推进 stage | g2-R2 |
 | 43 | validate_attempts 重置 | 任何跨阶段跳转（normal next / kickback / backtrack / 打回）重置为 0；语义为"当前阶段内 validate_output 打回 execute 的次数" | g2-R2 |
 | 44 | merge 合入执行位置 | 用户批准后 resume 重新进入 `merge.execute`，检测到已批准则执行真正的合并 | g2-R2 |
-| 45 | 内置工具集 | 7 个内置工具（write_file / edit_file / read_file / delete_file / list_dir / run_command / submit_metadata）；`spawn_sub_agent` 为可开关扩展工具，默认关闭；`offload_threshold_tokens` 默认 4000（**由决策 110 成为唯一的工具结果阈值**）（修订决策 26） | g2-R2 |
+| 45 | 内置工具集 | 7 个内置工具（write_file / edit_file / read_file / delete_file / list_dir / run_command / submit_metadata）；`spawn_sub_agent` 为可开关扩展工具，默认关闭；`offload_threshold_tokens` 默认 4000（**由决策 110 成为唯一的工具结果阈值**）（修订决策 26）。**由决策 172③ 修订**：内置工具增至 **8 个**（新增 `Skill`）；`spawn_sub_agent` 由「关闭的扩展工具」改判为**只读子代理**（重开决策 154；实现见票 08） | g2-R2 |
 | 46 | 模型上下文窗口 | 随 `providers` 表的一行存 DB（界面可改），内置注册表提供默认值；从 config.toml 移除 `context_window_size`。**由决策 111 补充**：阶段只引用 `provider_id`，不再单列 model，`context_window` 查找路径唯一 | g2-R2 |
 | 47 | mandatory_skills | 默认空，skills 全部走用户配置；rtk / codegraph 作为示例配置写入文档；skill 不存在时 fail fast。**已由决策 170 修订**：skill 语义由「PATH 外部 CLI」（只有名字进 prompt）扩展为三类来源（内嵌知识与用户 markdown **携带正文并注入 prompt**），并新增节点级声明；PATH 工具型技能的原语义保留不变。**再经决策 172 修订**：内嵌来源移除、技能根经 `[skills] dir` 可覆盖，`disable-model-invocation` 进入语义 | g2-R2 |
 | 48 | 项目分析 | 实现为伪阶段 `project_analysis`（复用 L2 阶段配置与白名单校验，无 checkpoint / pending），由 `POST /projects/analyze` 触发 | g2-R2 |
