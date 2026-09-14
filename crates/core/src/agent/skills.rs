@@ -1,15 +1,15 @@
-//! 技能（skill）发现与解析（决策 170，修订决策 47）。
+//! 技能（skill）发现与解析（决策 170 / 172，修订决策 47）。
 //!
 //! 决策 47 把 skill 定义为「用户机器上装了对应的外部工具」（PATH 可执行文件名），
 //! 只把**名字**列进 system prompt。本模块在保留该语义的前提下扩展出第二类技能：
-//! **携带 markdown 正文、正文注入 prompt** 的知识型技能（与 MCP 的分工见 backlog §B.1：
+//! **携带 markdown 正文** 的知识型技能（与 MCP 的分工见 backlog §B.1：
 //! skill 是知识/流程指引，MCP 是可调用能力）。
 //!
 //! 技能的**唯一身份是名字**——两类来源同名即同一个技能，用户文件覆盖内嵌默认：
 //!
 //! | 来源 | 判定 | 正文 |
 //! |---|---|---|
-//! | 内嵌默认 | [`EMBEDDED_SKILLS`]（决策 7 的内嵌 persona 先例） | 有 |
+//! | 内嵌默认 | [`EMBEDDED_SKILLS`]（决策 7 的内嵌 persona 先例，票 04 起退场） | 有 |
 //! | 用户 markdown | `{skills_root}/{name}/SKILL.md`（镜像 ZCode 布局，可直接拷贝） | 有，同名覆盖内嵌 |
 //! | 外部工具 | PATH 中可执行文件（决策 47 原语义） | 无，只列名字 |
 //!
@@ -20,6 +20,11 @@
 //! 正文的「必须存在且非空」在启动校验（[`crate::config::validate_startup`]）与运行时
 //! [`resolve`] 双重把关，口径与 §10.6.4 的 `persona_path` 一致；frontmatter 的 `name`
 //! 与目录名不一致同样在启动时 fail fast（[`validate_names`]）。
+//!
+//! **三态渲染**（决策 172④，票 05）：技能在 prompt 里的呈现分三种形态，由 [`SkillRender`]
+//! 表达——全文态（正文进 prompt）、名字态（只列名字，正文交给 `Skill` 工具按需拉取）、
+//! 目录态（[`catalogue`]：未被声明的可用技能，只给名字 + 描述，是渐进披露的落点）。
+//! 形态由配置声明（[`SkillDecl`]）决定，**名字仍是唯一身份**：同一个技能换形态不换身份。
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -132,6 +137,71 @@ pub enum SkillSource {
     Markdown { path: PathBuf },
 }
 
+/// 技能注入形态（决策 172④，票 05）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum SkillMode {
+    /// 全文注入：正文进 system prompt（裸字符串的默认解释，也是今天的行为）。
+    #[default]
+    Full,
+    /// 名字态：只把名字列进 prompt，正文由 `Skill` 工具按需拉取（票 06）。
+    Name,
+}
+
+impl SkillMode {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            SkillMode::Full => "full",
+            SkillMode::Name => "name",
+        }
+    }
+
+    /// 解析配置里的字面量；未知值 → `None`（由调用方报错并定位到阶段/节点）。
+    pub fn parse(raw: &str) -> Option<Self> {
+        match raw {
+            "full" => Some(SkillMode::Full),
+            "name" => Some(SkillMode::Name),
+            _ => None,
+        }
+    }
+}
+
+/// 一条技能声明（`string | {name, mode, trusted}` 混合数组的元素，决策 172④）。
+///
+/// 名字是唯一身份，`mode` / `trusted` 是同名技能的**形态**而非身份的一部分。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SkillDecl {
+    pub name: String,
+    pub mode: SkillMode,
+    /// 信任标记。未信任技能不得全文注入（写入侧拒绝，见
+    /// [`crate::config::parse_skill_decls`]）。
+    pub trusted: bool,
+}
+
+impl SkillDecl {
+    /// 裸字符串的向后兼容解释（决策 172④）：`{mode: "full", trusted: false}`。
+    ///
+    /// 「未信任不得全文注入」这道门**只对显式对象声明生效**——裸字符串是信任概念
+    /// 出现之前手写的配置行，若一并拒绝则今天所有配置行都会失效，与「零迁移」冲突。
+    pub fn from_bare(name: impl Into<String>) -> Self {
+        Self {
+            name: name.into(),
+            mode: SkillMode::Full,
+            trusted: false,
+        }
+    }
+}
+
+/// 一个已解析技能的**渲染形态**（决策 172④，票 05：三态）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SkillRender {
+    /// 全文态：`### {name}` + 正文进 system prompt。
+    Full { body: String },
+    /// 名字态：`- {name}`；正文由 `Skill` 工具按需拉取，**不进** system prompt。
+    Name,
+    /// 目录态：`- {name}: {description}`——仅在可用池、未被声明，是渐进披露的落点。
+    Catalogue { description: Option<String> },
+}
+
 /// frontmatter 的四个键（决策 172②：解析但不做语义检查）。
 ///
 /// 逐行 `key: value` 轻量解析，**不引 YAML 依赖**；缺失 / 畸形一律按缺省处理，
@@ -159,11 +229,37 @@ pub struct Skill {
     pub frontmatter: SkillFrontmatter,
 }
 
-/// 解析后的技能：正文 `None` 表示工具型技能（只列名字）。
+/// 解析后的技能：名字 + 渲染形态。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ResolvedSkill {
     pub name: String,
-    pub body: Option<String>,
+    pub render: SkillRender,
+}
+
+impl ResolvedSkill {
+    /// 全文态（正文进 prompt）。
+    pub fn full(name: impl Into<String>, body: impl Into<String>) -> Self {
+        Self {
+            name: name.into(),
+            render: SkillRender::Full { body: body.into() },
+        }
+    }
+
+    /// 名字态（只有名字；正文由 `Skill` 工具按需拉取）。
+    pub fn name_only(name: impl Into<String>) -> Self {
+        Self {
+            name: name.into(),
+            render: SkillRender::Name,
+        }
+    }
+
+    /// 目录态（渐进披露：名字 + 描述）。
+    pub fn catalogue(name: impl Into<String>, description: Option<String>) -> Self {
+        Self {
+            name: name.into(),
+            render: SkillRender::Catalogue { description },
+        }
+    }
 }
 
 /// 扫描 PATH 得到可执行文件名（决策 47）。
@@ -409,22 +505,67 @@ fn body_of(skills_root: &Path, name: &str) -> Result<Option<String>> {
     }
 }
 
-/// 解析声明的一组技能为「名字 + 可选正文」，保持声明顺序、去重。
+/// 解析声明的一组技能为「名字 + 渲染形态」，保持声明顺序、去重（决策 172④，票 05）。
 ///
 /// `skills_root` 是技能根本身（默认 `{home}/skills`，`[skills] dir` 可覆盖）。
-/// 正文为空（用户文件写了空内容）→ [`Error::Config`]，与 `persona_path` 同口径。
-pub fn resolve(skills_root: &Path, declared: &[String]) -> Result<Vec<ResolvedSkill>> {
+///
+/// - `mode = full`：读正文，正文为空（用户文件写了空内容）→ [`Error::Config`]，
+///   与 `persona_path` 同口径；
+/// - `mode = name`：**不读正文**——名字态的正文由 `Skill` 工具按需拉取（票 06），
+///   这里读进来反而会把正文带进 system prompt，破坏 `prompt_template_hash` 对
+///   名字态的钝感（票 05 的显式要求）。
+///
+/// 工具型技能（PATH 可执行文件，无正文）在名字态与全文态下都只渲染名字：它本来就没有
+/// 正文可注入，这是决策 47 的原语义。
+pub fn resolve(skills_root: &Path, declared: &[SkillDecl]) -> Result<Vec<ResolvedSkill>> {
     let mut out: Vec<ResolvedSkill> = Vec::new();
-    for name in declared {
-        if out.iter().any(|s| &s.name == name) {
+    for decl in declared {
+        if out.iter().any(|s| s.name == decl.name) {
             continue;
         }
+        let render = match decl.mode {
+            SkillMode::Name => SkillRender::Name,
+            SkillMode::Full => match body_of(skills_root, &decl.name)? {
+                Some(body) => SkillRender::Full { body },
+                None => SkillRender::Name, // 工具型技能：只有名字（决策 47）
+            },
+        };
         out.push(ResolvedSkill {
-            name: name.clone(),
-            body: body_of(skills_root, name)?,
+            name: decl.name.clone(),
+            render,
         });
     }
     Ok(out)
+}
+
+/// 技能**目录**（渐进披露，决策 172④，票 05）：技能根下**未被声明**、且未被
+/// `disable-model-invocation` 排除的 markdown 技能，渲染为 `- {name}: {description}`。
+///
+/// 三条准入：
+/// - **只收技能根下的 markdown 技能**。工具型技能（PATH 可执行文件）没有正文可加载
+///   ——列进「按需加载」的目录等于向模型广告它拿不到的能力，且 PATH 下可执行文件动辄
+///   上千，与本段「省上下文」的初衷相反（决策 47 的工具型技能仍按原语义由阶段声明列出
+///   名字）。内嵌技能同样不收：它正在退场（决策 172①，票 04），目录语义定在**最终形态**
+///   上，票 04 删内嵌时本函数零改动——这正是 expand–contract 想要的收敛点。
+/// - 被声明的技能由 [`resolve`] 以全文/名字态渲染，**不再重复出现在目录里**，否则同一
+///   技能在 prompt 里出现两次。
+/// - `disable-model-invocation: true` 不进目录（选型 D）：上游 27 个技能中 14 个带此键，
+///   正是不该静默常驻的那批。
+///
+/// 目录态**不含正文**，因此对 `prompt_template_hash` 只是「有哪些技能可用」级别的敏感，
+/// 与正文变更无关（决策 137 / 票 05）。
+pub fn catalogue(skills_root: &Path, declared: &[String]) -> Vec<ResolvedSkill> {
+    // 直接扫技能根，不走 [`discover`]——后者会顺带枚举整个 PATH 找可执行文件，而目录态
+    // 只收 markdown 技能。本函数在**每次 agent attempt** 的 prompt 组装路径上，不该为
+    // 一批注定被过滤掉的名字付目录扫描的代价。
+    markdown_skill_paths(skills_root)
+        .into_iter()
+        .filter(|(name, _)| !declared.contains(name))
+        .filter_map(|(name, path)| {
+            let fm = read_frontmatter(&path);
+            (!fm.disable_model_invocation).then(|| ResolvedSkill::catalogue(name, fm.description))
+        })
+        .collect()
 }
 
 #[cfg(test)]
@@ -446,6 +587,19 @@ mod tests {
         std::fs::write(dir.join(SKILL_FILE), content).unwrap();
     }
 
+    /// 裸字符串声明（按 `{mode: full, trusted: false}` 解释，决策 172④）。
+    fn decls(names: &[&str]) -> Vec<SkillDecl> {
+        names.iter().map(|n| SkillDecl::from_bare(*n)).collect()
+    }
+
+    /// 全文态声明的正文（断言用）。
+    fn full_body(skill: &ResolvedSkill) -> &str {
+        match &skill.render {
+            SkillRender::Full { body } => body,
+            other => panic!("期望全文态，实际 {other:?}"),
+        }
+    }
+
     #[test]
     fn embedded_skills_are_discovered_without_any_home_files() {
         let home = tmp();
@@ -457,17 +611,13 @@ mod tests {
     #[test]
     fn embedded_skills_carry_bodies() {
         let home = tmp();
-        let resolved = resolve(
-            &root_of(home.path()),
-            &["grilling".into(), "to-spec".into()],
-        )
-        .unwrap();
+        let resolved = resolve(&root_of(home.path()), &decls(&["grilling", "to-spec"])).unwrap();
         assert_eq!(resolved.len(), 2);
         // 正文是流水线原生版本：grilling 讲 pending 回路，to-spec 守决策 136
-        let grilling = resolved[0].body.as_deref().unwrap();
+        let grilling = full_body(&resolved[0]);
         assert!(grilling.contains("info_insufficient"), "{grilling}");
         assert!(grilling.contains("frontier"), "{grilling}");
-        let to_spec = resolved[1].body.as_deref().unwrap();
+        let to_spec = full_body(&resolved[1]);
         assert!(to_spec.contains("验收标准"), "{to_spec}");
         assert!(to_spec.contains("acceptance_criteria"), "{to_spec}");
     }
@@ -476,8 +626,8 @@ mod tests {
     fn user_markdown_overrides_embedded_body() {
         let home = tmp();
         write_skill(&root_of(home.path()), "grilling", "用户自己的拷问流程");
-        let resolved = resolve(&root_of(home.path()), &["grilling".into()]).unwrap();
-        assert_eq!(resolved[0].body.as_deref(), Some("用户自己的拷问流程"));
+        let resolved = resolve(&root_of(home.path()), &decls(&["grilling"])).unwrap();
+        assert_eq!(full_body(&resolved[0]), "用户自己的拷问流程");
         // 来源登记为 Markdown 覆盖
         let found = discover(&root_of(home.path()));
         let s = found.iter().find(|s| s.name == "grilling").unwrap();
@@ -492,15 +642,15 @@ mod tests {
             "grilling",
             "---\nname: grilling\ndescription: x\n---\n\n正文从这里开始",
         );
-        let resolved = resolve(&root_of(home.path()), &["grilling".into()]).unwrap();
-        assert_eq!(resolved[0].body.as_deref(), Some("正文从这里开始"));
+        let resolved = resolve(&root_of(home.path()), &decls(&["grilling"])).unwrap();
+        assert_eq!(full_body(&resolved[0]), "正文从这里开始");
     }
 
     #[test]
     fn empty_user_file_is_config_error() {
         let home = tmp();
         write_skill(&root_of(home.path()), "grilling", "   \n");
-        let err = resolve(&root_of(home.path()), &["grilling".into()]).unwrap_err();
+        let err = resolve(&root_of(home.path()), &decls(&["grilling"])).unwrap_err();
         assert!(matches!(err, Error::Config(_)), "{err:?}");
         assert!(err.to_string().contains("正文为空"), "{err}");
     }
@@ -517,22 +667,23 @@ mod tests {
             "win-skill",
             "---\r\nname: win-skill\r\ndescription: x\r\n---\r\n\r\n第一行\r\n第二行\r\n",
         );
-        let resolved = resolve(&root_of(home.path()), &["win-skill".into()]).unwrap();
-        let body = resolved[0].body.as_deref().unwrap();
+        let resolved = resolve(&root_of(home.path()), &decls(&["win-skill"])).unwrap();
+        let body = full_body(&resolved[0]);
         assert_eq!(body, "第一行\n第二行", "行尾应统一为 \\n：{body:?}");
         assert!(!body.contains('\r'), "{body:?}");
     }
 
     #[test]
-    fn tool_skill_has_no_body() {
+    fn tool_skill_renders_as_name_only() {
         let home = tmp();
-        // 工具型技能（PATH 可执行文件）不在技能根里，正文为 None——用未声明的名字验证
+        // 工具型技能（PATH 可执行文件）不在技能根里，无正文——用未声明的名字验证。
+        // 决策 47 原语义：只列名字（与「名字态」渲染相同，但语义是「无正文可注入」）。
         let resolved = resolve(
             &root_of(home.path()),
-            &["definitely-not-a-knowledge-skill".into()],
+            &decls(&["definitely-not-a-knowledge-skill"]),
         )
         .unwrap();
-        assert!(resolved[0].body.is_none());
+        assert_eq!(resolved[0].render, SkillRender::Name);
     }
 
     #[test]
@@ -547,13 +698,149 @@ mod tests {
         let home = tmp();
         let resolved = resolve(
             &root_of(home.path()),
-            &["to-spec".into(), "grilling".into(), "to-spec".into()],
+            &decls(&["to-spec", "grilling", "to-spec"]),
         )
         .unwrap();
         assert_eq!(
             resolved.iter().map(|s| s.name.as_str()).collect::<Vec<_>>(),
             vec!["to-spec", "grilling"]
         );
+    }
+
+    // ── 票 05（决策 172④）：二档注入与三态渲染 ──
+
+    /// 名字态**不读正文**：即便技能文件不存在也应成功（正文由 `Skill` 工具按需拉取）。
+    ///
+    /// 这是名字态相对全文态的关键差别——它把「技能是否可注入」与「文件是否在当前
+    /// 技能根下」解耦。若这里读了正文，一个尚未安装的技能会让整个节点启动失败。
+    #[test]
+    fn name_mode_does_not_read_body() {
+        let home = tmp();
+        let resolved = resolve(
+            &root_of(home.path()),
+            &[SkillDecl {
+                name: "not-installed".into(),
+                mode: SkillMode::Name,
+                trusted: true,
+            }],
+        )
+        .unwrap();
+        assert_eq!(resolved[0].render, SkillRender::Name);
+    }
+
+    /// 同一个技能，全文态读到正文、名字态不读——两档的差别正是「正文进不进 prompt」。
+    #[test]
+    fn full_and_name_modes_differ_only_in_body() {
+        let home = tmp();
+        write_skill(&root_of(home.path()), "s", "技能正文");
+        let full = resolve(&root_of(home.path()), &[SkillDecl::from_bare("s")]).unwrap();
+        assert_eq!(full_body(&full[0]), "技能正文");
+        let name = resolve(
+            &root_of(home.path()),
+            &[SkillDecl {
+                name: "s".into(),
+                mode: SkillMode::Name,
+                trusted: true,
+            }],
+        )
+        .unwrap();
+        assert_eq!(name[0].render, SkillRender::Name, "名字态不带正文");
+    }
+
+    /// 目录态（渐进披露）：未被声明的 markdown 技能 + `description`，且**不含正文**。
+    #[test]
+    fn catalogue_lists_undeclared_markdown_skills_with_description() {
+        let home = tmp();
+        write_skill(
+            &root_of(home.path()),
+            "available",
+            "---\ndescription: 可用的技能\n---\n\n正文",
+        );
+        write_skill(&root_of(home.path()), "declared", "已声明的正文");
+        let cat = catalogue(&root_of(home.path()), &["declared".to_string()]);
+        assert_eq!(cat.len(), 1, "已声明的技能不进目录：{cat:?}");
+        assert_eq!(cat[0].name, "available");
+        assert_eq!(
+            cat[0].render,
+            SkillRender::Catalogue {
+                description: Some("可用的技能".into())
+            }
+        );
+    }
+
+    /// 目录态**只含名字**——把正文塞进目录等于渐进披露失效（票 05 的核心动机）。
+    #[test]
+    fn catalogue_never_carries_body() {
+        let home = tmp();
+        write_skill(
+            &root_of(home.path()),
+            "big",
+            "很长很长的正文".repeat(100).as_str(),
+        );
+        let cat = catalogue(&root_of(home.path()), &[]);
+        for s in &cat {
+            assert!(
+                matches!(s.render, SkillRender::Catalogue { .. }),
+                "目录项不得是全文态：{s:?}"
+            );
+        }
+    }
+
+    /// 选型 D：`disable-model-invocation: true` 的技能不进目录（不被自动注入）。
+    #[test]
+    fn disable_model_invocation_skills_are_excluded_from_catalogue() {
+        let home = tmp();
+        write_skill(
+            &root_of(home.path()),
+            "manual-only",
+            "---\ndescription: 手动触发\ndisable-model-invocation: true\n---\n\n正文",
+        );
+        write_skill(
+            &root_of(home.path()),
+            "auto-ok",
+            "---\ndescription: 可自动注入\n---\n\n正文",
+        );
+        let cat = catalogue(&root_of(home.path()), &[]);
+        let names: Vec<&str> = cat.iter().map(|s| s.name.as_str()).collect();
+        assert!(
+            !names.contains(&"manual-only"),
+            "带 disable-model-invocation 的技能不得进目录：{names:?}"
+        );
+        assert!(names.contains(&"auto-ok"), "{names:?}");
+    }
+
+    /// 工具型技能（PATH 可执行文件）不进目录：没有正文可加载，列进去是广告拿不到的能力。
+    ///
+    /// 用 `sh`（几乎必然存在于 PATH）验证——它绝不可能是技能根下的 markdown 技能。
+    #[test]
+    fn tool_type_skills_are_not_in_catalogue() {
+        let home = tmp();
+        // 前提：`sh` 确实是 PATH 里的可执行文件，否则本用例无意义
+        assert!(
+            skill_names(&root_of(home.path())).contains(&"sh".to_string()),
+            "前提失败：PATH 里没有 sh"
+        );
+        let cat = catalogue(&root_of(home.path()), &[]);
+        assert!(
+            !cat.iter().any(|s| s.name == "sh"),
+            "工具型技能不得进目录（无正文可加载）"
+        );
+    }
+
+    /// 票 03：断言对象从内嵌常量换为用户目录技能——同一组行为在**用户文件**上成立。
+    #[test]
+    fn user_directory_skills_behave_like_embedded_did() {
+        let home = tmp();
+        write_skill(&root_of(home.path()), "my-grill", "把设计树走完再动手");
+        write_skill(
+            &root_of(home.path()),
+            "my-spec",
+            "综合成规格，验收标准要编号",
+        );
+        let resolved = resolve(&root_of(home.path()), &decls(&["my-grill", "my-spec"])).unwrap();
+        assert_eq!(resolved.len(), 2);
+        assert!(full_body(&resolved[0]).contains("设计树"));
+        assert!(full_body(&resolved[1]).contains("验收标准"));
     }
 
     #[test]
@@ -572,8 +859,8 @@ mod tests {
         let external = tmp();
         write_skill(external.path(), "my-skill", "外部技能正文");
         // 技能根 = 外部目录本身，不是 `{外部目录}/skills`
-        let resolved = resolve(external.path(), &["my-skill".into()]).unwrap();
-        assert_eq!(resolved[0].body.as_deref(), Some("外部技能正文"));
+        let resolved = resolve(external.path(), &decls(&["my-skill"])).unwrap();
+        assert_eq!(full_body(&resolved[0]), "外部技能正文");
         assert!(skill_names(external.path()).contains(&"my-skill".to_string()));
         assert!(validate_names(external.path()).is_ok());
     }
@@ -661,8 +948,8 @@ mod tests {
         // 经 resolve 也不报错（正文非空）
         let home = tmp();
         write_skill(&root_of(home.path()), "s", raw);
-        let resolved = resolve(&root_of(home.path()), &["s".into()]).unwrap();
-        assert!(resolved[0].body.as_deref().unwrap().contains("未闭合"));
+        let resolved = resolve(&root_of(home.path()), &decls(&["s"])).unwrap();
+        assert!(full_body(&resolved[0]).contains("未闭合"));
     }
 
     #[test]

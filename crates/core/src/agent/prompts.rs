@@ -52,15 +52,21 @@ pub fn load_agents_context(
 /// 固定前缀保证 prompt cache 稳定命中（§12.13.5）；worktree / 任务目录是任务级
 /// 常量，不破坏同一任务内重试的缓存。
 ///
-/// 技能段（决策 170）：无正文的工具型技能仍渲染为 `- {name}` 子弹（决策 47 原样）；
-/// 有正文的知识型技能渲染为 `### {name}` + 正文，正文进 prompt 因此
-/// `prompt_template_hash` 对其敏感（决策 137）。
+/// 技能段（决策 170 / 172）分三态渲染：
+/// - **全文态**：`### {name}` + 正文，正文进 prompt 因此 `prompt_template_hash` 对其敏感
+///   （决策 137）；
+/// - **名字态**：`- {name}`，正文由 `Skill` 工具按需拉取（票 06），**不进** prompt，
+///   故 hash 对它的正文变化钝感（票 05 的显式要求）；
+/// - **目录态**：`- {name}: {description}`，渐进披露——让模型知道有哪些能力可用，
+///   而不必预载全部正文。
 pub fn build_system_prompt(
     agents_context: &str,
     persona: &str,
     workdirs: &str,
     skills: &[crate::agent::skills::ResolvedSkill],
 ) -> String {
+    use crate::agent::skills::SkillRender;
+
     let agents = if agents_context.trim().is_empty() {
         default_agents_context(Path::new("(未提供)"), None, None)
     } else {
@@ -73,10 +79,20 @@ pub fn build_system_prompt(
     if !skills.is_empty() {
         out.push_str("## 已启用技能\n");
         for s in skills {
-            // 工具型技能只有名字（决策 47）；知识型技能注入正文（决策 170）
-            match s.body.as_deref().filter(|b| !b.trim().is_empty()) {
-                Some(body) => out.push_str(&format!("### {}\n{}\n", s.name, body.trim())),
-                None => out.push_str(&format!("- {}\n", s.name)),
+            match &s.render {
+                SkillRender::Full { body } if !body.trim().is_empty() => {
+                    out.push_str(&format!("### {}\n{}\n", s.name, body.trim()));
+                }
+                SkillRender::Full { .. } => out.push_str(&format!("- {}\n", s.name)),
+                SkillRender::Name => out.push_str(&format!("- {}\n", s.name)),
+                SkillRender::Catalogue { description } => match description
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|d| !d.is_empty())
+                {
+                    Some(d) => out.push_str(&format!("- {}: {d}\n", s.name)),
+                    None => out.push_str(&format!("- {}\n", s.name)),
+                },
             }
         }
         out.push('\n');
@@ -235,18 +251,17 @@ mod tests {
 
     /// 工具型技能（只有名字，无正文；决策 47）。
     fn tool_skill(name: &str) -> crate::agent::skills::ResolvedSkill {
-        crate::agent::skills::ResolvedSkill {
-            name: name.to_string(),
-            body: None,
-        }
+        crate::agent::skills::ResolvedSkill::name_only(name)
     }
 
-    /// 知识型技能（注入正文；决策 170）。
+    /// 知识型技能（全文注入；决策 170 / 172）。
     fn knowledge_skill(name: &str, body: &str) -> crate::agent::skills::ResolvedSkill {
-        crate::agent::skills::ResolvedSkill {
-            name: name.to_string(),
-            body: Some(body.to_string()),
-        }
+        crate::agent::skills::ResolvedSkill::full(name, body)
+    }
+
+    /// 目录态技能（渐进披露：名字 + 描述；决策 172④ / 票 05）。
+    fn catalogue_skill(name: &str, desc: Option<&str>) -> crate::agent::skills::ResolvedSkill {
+        crate::agent::skills::ResolvedSkill::catalogue(name, desc.map(str::to_string))
     }
 
     // ── 组装顺序 golden ──
@@ -320,6 +335,115 @@ mod tests {
         let a = build_system_prompt("ctx", "p", "wt", &[tool_skill("grilling")]);
         let b = build_system_prompt("ctx", "p", "wt", &[knowledge_skill("grilling", "正文")]);
         assert_ne!(prompt_template_hash(&a), prompt_template_hash(&b));
+    }
+
+    // ── 票 05（决策 172④）：三态渲染 ──
+
+    /// 目录态渲染为 `- {name}: {description}`——名字 + 描述，**不含正文**。
+    #[test]
+    fn catalogue_skill_renders_name_and_description() {
+        let prompt = build_system_prompt(
+            "ctx",
+            "persona",
+            "worktree：/wt",
+            &[catalogue_skill("research", Some("调研一个主题"))],
+        );
+        assert!(
+            prompt.contains("## 已启用技能\n- research: 调研一个主题\n"),
+            "{prompt}"
+        );
+        assert!(!prompt.contains("### research"), "{prompt}");
+    }
+
+    /// 目录态无 `description` 时退化为普通子弹（不渲染空冒号）。
+    #[test]
+    fn catalogue_skill_without_description_is_bare_bullet() {
+        let prompt = build_system_prompt(
+            "ctx",
+            "persona",
+            "worktree：/wt",
+            &[catalogue_skill("mystery", None)],
+        );
+        assert!(prompt.contains("- mystery\n"), "{prompt}");
+        assert!(!prompt.contains("mystery:"), "{prompt}");
+    }
+
+    /// 票 05 的 hash 要求：`prompt_template_hash` **只对全文态敏感**。
+    ///
+    /// 从真实技能根解析（经 [`crate::agent::skills::resolve`]）才有意义——名字态若在解析
+    /// 时顺手读了正文，这条就会红。同一个技能换一份正文：
+    /// 名字态 hash 不变（正文不进 prompt），全文态 hash 变（正文进 prompt）。
+    #[test]
+    fn hash_is_sensitive_to_body_only_in_full_mode() {
+        use crate::agent::skills::{resolve, SkillDecl, SkillMode};
+
+        let render = |mode: SkillMode, body: &str| {
+            let root = tempfile::tempdir().unwrap();
+            let dir = root.path().join("s");
+            std::fs::create_dir_all(&dir).unwrap();
+            std::fs::write(dir.join("SKILL.md"), body).unwrap();
+            let decl = SkillDecl {
+                name: "s".into(),
+                mode,
+                trusted: true,
+            };
+            let skills = resolve(root.path(), &[decl]).unwrap();
+            build_system_prompt("ctx", "p", "wt", &skills)
+        };
+
+        // 名字态：正文不进 prompt，换正文 hash 不变
+        let name_a = render(SkillMode::Name, "正文甲");
+        let name_b = render(SkillMode::Name, "正文乙");
+        assert!(!name_a.contains("正文甲"), "{name_a}");
+        assert_eq!(
+            prompt_template_hash(&name_a),
+            prompt_template_hash(&name_b),
+            "名字态的正文变化不得造成 hash 抖动（票 05）"
+        );
+
+        // 全文态：正文进 prompt，换正文 hash 必变
+        let full_a = render(SkillMode::Full, "正文甲");
+        let full_b = render(SkillMode::Full, "正文乙");
+        assert!(full_a.contains("正文甲"), "{full_a}");
+        assert_ne!(
+            prompt_template_hash(&full_a),
+            prompt_template_hash(&full_b),
+            "全文态对正文必须敏感（决策 137）"
+        );
+    }
+
+    /// 目录态不含正文，故目录项的描述变化不影响正文级敏感度（构造上就不带正文）。
+    #[test]
+    fn catalogue_state_never_carries_body() {
+        let prompt = build_system_prompt(
+            "ctx",
+            "p",
+            "wt",
+            &[
+                catalogue_skill("s", Some("描述")),
+                catalogue_skill("t", None),
+            ],
+        );
+        assert!(prompt.contains("- s: 描述"), "{prompt}");
+        assert!(prompt.contains("- t\n"), "{prompt}");
+        assert!(!prompt.contains("### "), "目录态不得有正文标题：{prompt}");
+    }
+
+    /// 三态并存时的段落顺序：声明的（全文 / 名字）在前，目录项在后。
+    #[test]
+    fn catalogue_after_declared_skills() {
+        let prompt = build_system_prompt(
+            "ctx",
+            "persona",
+            "worktree：/wt",
+            &[
+                knowledge_skill("enabled", "已启用正文"),
+                catalogue_skill("available", Some("可选")),
+            ],
+        );
+        let heading = prompt.find("### enabled").unwrap();
+        let bullet = prompt.find("- available: 可选").unwrap();
+        assert!(heading < bullet, "声明的技能应排在目录之前：{prompt}");
     }
 
     #[test]

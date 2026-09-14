@@ -25,8 +25,28 @@ pub fn effective_tools(declared: &[String]) -> Vec<String> {
 
 /// 有效 skill 集：`(基线 mandatory ∪ 阶段声明)`（引用不存在 skill 的 fail fast
 /// 在启动校验 [`crate::config::validate_startup`]，这里只做并集）。
-pub fn effective_skills(declared: &[String]) -> Vec<String> {
-    effective_set(&BASELINE_MANDATORY_SKILLS, &[], declared)
+///
+/// **只增不减**（§10.6.4）：节点级声明由调用方先并入 `declared`，本函数不削减任何一项
+/// ——基线为空（决策 172：内嵌技能退场），故实际等于 阶段级 ∪ 节点级。同名技能保留
+/// **首次出现**的形态（阶段级在前），节点级不能改写阶段级已声明技能的 `mode` / `trusted`。
+pub fn effective_skills(
+    declared: &[crate::agent::skills::SkillDecl],
+) -> Vec<crate::agent::skills::SkillDecl> {
+    let mut out: Vec<crate::agent::skills::SkillDecl> = Vec::new();
+    for d in declared {
+        if !out.iter().any(|s| s.name == d.name) {
+            out.push(d.clone());
+        }
+    }
+    out
+}
+
+/// 有效技能名（启动校验与 `PUT /stage-configs` 的存在性检查用）。
+pub fn effective_skill_names(declared: &[crate::agent::skills::SkillDecl]) -> Vec<String> {
+    effective_skills(declared)
+        .into_iter()
+        .map(|d| d.name)
+        .collect()
 }
 
 fn effective_set(mandatory: &[&str], forbidden: &[&str], declared: &[String]) -> Vec<String> {
@@ -89,8 +109,36 @@ mod tests {
 
     #[test]
     fn skills_union_with_empty_baseline() {
+        use crate::agent::skills::SkillDecl;
         assert!(effective_skills(&[]).is_empty());
-        assert_eq!(effective_skills(&declared(&["rtk"])), declared(&["rtk"]));
+        assert_eq!(
+            effective_skills(&[SkillDecl::from_bare("rtk")]),
+            vec![SkillDecl::from_bare("rtk")]
+        );
+        assert_eq!(
+            effective_skill_names(&[SkillDecl::from_bare("rtk")]),
+            vec!["rtk".to_string()]
+        );
+    }
+
+    /// 决策 172④：节点级声明**只增不减**，同名技能保留首次出现的形态
+    /// （阶段级在前 → 节点级无法改写其 mode/trusted，也不能削减它）。
+    #[test]
+    fn effective_skills_is_union_and_first_wins() {
+        use crate::agent::skills::{SkillDecl, SkillMode};
+        let node_level = SkillDecl {
+            name: "grilling".into(),
+            mode: SkillMode::Name,
+            trusted: true,
+        };
+        let got = effective_skills(&[
+            SkillDecl::from_bare("grilling"), // 阶段级：full
+            node_level.clone(),               // 节点级同名：应被忽略
+            SkillDecl::from_bare("to-spec"),
+        ]);
+        assert_eq!(got.len(), 2, "同名去重：{got:?}");
+        assert_eq!(got[0], SkillDecl::from_bare("grilling"), "阶段级形态优先");
+        assert_eq!(got[1].name, "to-spec");
     }
 
     #[test]

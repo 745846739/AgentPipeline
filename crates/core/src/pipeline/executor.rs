@@ -1024,17 +1024,24 @@ impl Executor {
         let persona = resolve_stage_persona(&home, stage_cfg.as_ref(), cursor.stage, cursor.node)?;
         let declared_tools =
             json_string_list(stage_cfg.as_ref().and_then(|c| c.tools_json.as_ref()));
-        // 技能：阶段级 ∪ 节点级（决策 170），再解析成「名字 + 正文」——知识型技能
-        // 的正文注入 system prompt，工具型技能只有名字（决策 47）。技能根经
-        // `Home::skills_dir` 取（默认 `{home}/skills`，`[skills] dir` 可覆盖，决策 172）。
-        let mut declared_skills =
-            json_string_list(stage_cfg.as_ref().and_then(|c| c.skills_json.as_ref()));
-        declared_skills.extend(crate::config::node_skills(
+        // 技能：阶段级 ∪ 节点级（决策 170 / 172④），再解析成渲染形态——全文态注入正文、
+        // 名字态只列名字（正文交给 `Skill` 工具按需拉取，票 06）、目录态给出「还有哪些
+        // 技能可用」（渐进披露）。技能根经 `Home::skills_dir` 取（默认 `{home}/skills`，
+        // `[skills] dir` 可覆盖，决策 172）。
+        let skills_root = home.skills_dir();
+        let mut declared = crate::config::stage_skills(stage_cfg.as_ref())?;
+        declared.extend(crate::config::node_skills(
             stage_cfg.as_ref(),
             cursor.node.as_str(),
+        )?);
+        let declared = effective_skills(&declared);
+        let declared_names = crate::agent::baseline::effective_skill_names(&declared);
+        // 声明的技能排在目录之前（保持 golden 顺序「先看已启用的」）
+        let mut skills = crate::agent::skills::resolve(&skills_root, &declared)?;
+        skills.extend(crate::agent::skills::catalogue(
+            &skills_root,
+            &declared_names,
         ));
-        let skills =
-            crate::agent::skills::resolve(&home.skills_dir(), &effective_skills(&declared_skills))?;
 
         // system prompt：[基线前言][工作目录(G12)][AGENTS.md(G3)][persona][技能][格式规则]
         let system_prompt = build_system_prompt(

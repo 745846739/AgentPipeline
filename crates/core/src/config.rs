@@ -438,18 +438,99 @@ pub fn node_timeouts(stage_cfg: Option<&StageConfig>, node: &str) -> NodeTimeout
 /// §10.6.4 并集规则）。这一层解决的是「同一阶段的不同节点需要不同知识」——
 /// 例如 architect-design 的 validate_input 要拷问、execute 要综合成规格，而
 /// `skills_json` 是阶段级的、无法区分节点。
-pub fn node_skills(stage_cfg: Option<&StageConfig>, node: &str) -> Vec<String> {
-    stage_cfg
+///
+/// 字段形态为 `string | {name, mode, trusted}` 混合数组（决策 172④，票 05）；
+/// 非法形态（非字符串元素、未知 `mode`、未信任 + full）→ [`Error::Config`]，
+/// 且报文定位到阶段与节点。
+pub fn node_skills(
+    stage_cfg: Option<&StageConfig>,
+    node: &str,
+) -> Result<Vec<crate::agent::skills::SkillDecl>> {
+    let Some(value) = stage_cfg
         .and_then(|c| c.node_overrides_json.as_ref())
         .and_then(|v| v.get(node))
         .and_then(|n| n.get("skills"))
-        .and_then(|v| v.as_array())
-        .map(|a| {
-            a.iter()
-                .filter_map(|x| x.as_str().map(str::to_string))
-                .collect()
-        })
-        .unwrap_or_default()
+    else {
+        return Ok(Vec::new());
+    };
+    let stage = stage_cfg.map(|c| c.stage.as_str()).unwrap_or("(未知阶段)");
+    parse_skill_decls(value, &format!("阶段 {stage} 节点 {node}"))
+}
+
+/// 阶段级技能声明（`skills_json`，决策 172④，票 05）。
+pub fn stage_skills(
+    stage_cfg: Option<&StageConfig>,
+) -> Result<Vec<crate::agent::skills::SkillDecl>> {
+    let Some(value) = stage_cfg.and_then(|c| c.skills_json.as_ref()) else {
+        return Ok(Vec::new());
+    };
+    let stage = stage_cfg.map(|c| c.stage.as_str()).unwrap_or("(未知阶段)");
+    parse_skill_decls(value, &format!("阶段 {stage}"))
+}
+
+/// 解析技能声明数组（决策 172④，票 05）：字段形态由 `string[]` 扩展为
+/// `string | {name, mode, trusted}` 的混合数组。
+///
+/// - 裸字符串 → `{mode: "full", trusted: false}`（**向后兼容今天的配置行**，零迁移）；
+/// - 对象形态：`mode` 缺省为 `full`，`trusted` 缺省为 `false`；
+/// - **既不是字符串也不是对象的元素按「不是声明」忽略**（沿用票 01 的宽松口径，
+///   `42` / `null` 这类杂值不因本票改变行为）；但对象一旦成形，字段就必须合法——
+///   缺 `name`、`mode` 非法、未信任 + full 一律 [`Error::Config`]，`where_` 把报错
+///   定位到阶段 / 节点。
+///
+/// **未信任技能不得以 `full` 保存**（选型 D）：写入时拒绝并报错。这道门只对**显式对象**
+/// 生效——裸字符串是信任概念出现之前手写的配置行，若一并拒绝则今天所有配置行都会失效，
+/// 与票面的「零迁移」冲突；它们按 `full` 解释且不加信任位。
+pub fn parse_skill_decls(
+    value: &serde_json::Value,
+    where_: &str,
+) -> Result<Vec<crate::agent::skills::SkillDecl>> {
+    use crate::agent::skills::{SkillDecl, SkillMode};
+
+    let Some(items) = value.as_array() else {
+        // 非数组（含旧版单字符串形态）按空处理——工具型字段的既有宽松口径（票 01）
+        return Ok(Vec::new());
+    };
+    let mut out = Vec::new();
+    for item in items {
+        // 裸字符串：向后兼容路径
+        if let Some(name) = item.as_str() {
+            out.push(SkillDecl::from_bare(name));
+            continue;
+        }
+        let Some(obj) = item.as_object() else {
+            continue; // 杂值不是声明，忽略（票 01 口径不变）
+        };
+        let name = obj
+            .get("name")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| Error::Config(format!("{where_} 的技能声明缺少 name：{item}")))?
+            .to_string();
+        let mode = match obj.get("mode").and_then(|v| v.as_str()) {
+            None => SkillMode::Full,
+            Some(raw) => SkillMode::parse(raw).ok_or_else(|| {
+                Error::Config(format!(
+                    "{where_} 的技能 {name} 的 mode 非法：{raw}（须为 full 或 name）"
+                ))
+            })?,
+        };
+        let trusted = obj
+            .get("trusted")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
+        if mode == SkillMode::Full && !trusted {
+            return Err(Error::Config(format!(
+                "{where_} 的技能 {name} 未受信任，不得以 full 模式注入全文；\
+                 请先确认信任，或改用 mode = \"name\"（决策 172④）"
+            )));
+        }
+        out.push(SkillDecl {
+            name,
+            mode,
+            trusted,
+        });
+    }
+    Ok(out)
 }
 
 /// `run_command` 的超时上限（决策 75）：显式传值时取该值；未传时 test / merge 阶段取
@@ -470,32 +551,41 @@ pub fn effective_run_command_timeout(
 
 // ─────────────────────── 启动校验（fail fast，决策 47 / 103 / 134）───────────────────────
 
-/// 一个 JSON 值里的字符串数组（非数组 / 非字符串元素一律忽略）。
-fn json_array_strings(value: Option<&serde_json::Value>) -> Option<Vec<String>> {
-    value.and_then(|v| v.as_array()).map(|a| {
-        a.iter()
-            .filter_map(|x| x.as_str().map(str::to_string))
-            .collect()
-    })
-}
-
-/// 阶段声明的全部技能：阶段级 `skills_json` + 节点级 `node_overrides_json[node].skills`（决策 170）。
+/// 阶段声明的全部技能：阶段级 `skills_json` + 节点级 `node_overrides_json[node].skills`
+/// （决策 170 / 172④）。
 ///
-/// 返回 `(定位说明, 技能名)`，定位说明用于报错——节点级要指明是哪个节点。
-fn declared_skills(cfg: &StageConfig) -> Vec<(String, String)> {
-    let mut out: Vec<(String, String)> = json_array_strings(cfg.skills_json.as_ref())
-        .unwrap_or_default()
-        .into_iter()
-        .map(|s| (format!("阶段 {}", cfg.stage), s))
-        .collect();
+/// 返回 `(定位说明, 技能声明)`，定位说明用于报错——节点级要指明是哪个节点。
+/// 非法声明形态（未知 `mode`、未信任 + full）在此直接 fail fast。
+fn declared_skills(cfg: &StageConfig) -> Result<Vec<(String, crate::agent::skills::SkillDecl)>> {
+    let stage = cfg.stage.as_str();
+    let mut out: Vec<(String, crate::agent::skills::SkillDecl)> =
+        parse_skill_decls_opt(cfg.skills_json.as_ref(), &format!("阶段 {stage}"))?
+            .into_iter()
+            .map(|d| (format!("阶段 {stage}"), d))
+            .collect();
     if let Some(overrides) = cfg.node_overrides_json.as_ref().and_then(|v| v.as_object()) {
-        for (node, value) in overrides {
-            for skill in json_array_strings(value.get("skills")).unwrap_or_default() {
-                out.push((format!("阶段 {} 节点 {node}", cfg.stage), skill));
+        // 节点按名排序，报错顺序稳定（BTreeMap 的迭代序已有序，这里是显式保证）
+        let mut nodes: Vec<&String> = overrides.keys().collect();
+        nodes.sort();
+        for node in nodes {
+            let where_ = format!("阶段 {stage} 节点 {node}");
+            for decl in parse_skill_decls_opt(overrides[node].get("skills"), &where_)? {
+                out.push((where_.clone(), decl));
             }
         }
     }
-    out
+    Ok(out)
+}
+
+/// [`parse_skill_decls`] 的空安全包装：字段缺席按空数组处理。
+fn parse_skill_decls_opt(
+    value: Option<&serde_json::Value>,
+    where_: &str,
+) -> Result<Vec<crate::agent::skills::SkillDecl>> {
+    match value {
+        Some(v) => parse_skill_decls(v, where_),
+        None => Ok(Vec::new()),
+    }
 }
 
 /// 启动校验的输入（provider / 阶段配置来自 DB）。
@@ -585,18 +675,24 @@ pub fn validate_startup(inputs: &StartupInputs) -> Result<StartupReport> {
                 )));
             }
         }
-        // 技能校验（决策 47 / 170）：阶段级与节点级声明过同一套检查——
-        // ① 名字必须存在于可用技能集；② 知识型技能的正文必须存在且非空。
-        for (where_, skill) in declared_skills(cfg) {
-            if !inputs.available_skills.iter().any(|s| s == &skill) {
+        // 技能校验（决策 47 / 170 / 172④）：阶段级与节点级声明过同一套检查——
+        // ① 声明形态合法（未知 mode / 未信任 + full → 拒绝，见 parse_skill_decls）；
+        // ② 名字必须存在于可用技能集；③ 知识型技能的正文必须存在且非空。
+        for (where_, decl) in declared_skills(cfg)? {
+            let skill = &decl.name;
+            if !inputs.available_skills.iter().any(|s| s == skill) {
                 return Err(Error::Config(format!(
                     "{where_} 引用了不存在的 skill：{skill}"
                 )));
             }
-            // 提供技能根时校验正文（工具型技能无正文，`resolve` 返回 None 不报错）
+            // 提供技能根时校验正文（工具型技能无正文，`resolve` 返回 None 不报错）。
+            // 名字态不读正文（票 05）——正文由 `Skill` 工具按需拉取，此处不校验其存在性。
             if let Some(root) = &inputs.skills_root {
-                crate::agent::skills::resolve(root, std::slice::from_ref(&skill))
-                    .map_err(|e| Error::Config(format!("{where_} 的 skill {skill} 不可用：{e}")))?;
+                if decl.mode == crate::agent::skills::SkillMode::Full {
+                    crate::agent::skills::resolve(root, std::slice::from_ref(&decl)).map_err(
+                        |e| Error::Config(format!("{where_} 的 skill {skill} 不可用：{e}")),
+                    )?;
+                }
             }
         }
         // §10.6.4：persona「必须存在且非空」在启动时校验（运行时 resolve_stage_persona
@@ -1027,6 +1123,7 @@ mod tests {
     #[test]
     fn node_skills_reads_per_node_declaration() {
         // 决策 170：节点级技能声明（`node_overrides_json[node].skills`）
+        use crate::agent::skills::{SkillDecl, SkillMode};
         let cfg = StageConfig {
             stage: "architect-design".into(),
             node_overrides_json: Some(serde_json::json!({
@@ -1036,18 +1133,31 @@ mod tests {
             })),
             ..Default::default()
         };
-        assert_eq!(node_skills(Some(&cfg), "validate_input"), vec!["grilling"]);
-        assert_eq!(node_skills(Some(&cfg), "execute"), vec!["to-spec"]);
+        // 裸字符串按 `{mode: full, trusted: false}` 解释（决策 172④：零迁移）
+        assert_eq!(
+            node_skills(Some(&cfg), "validate_input").unwrap(),
+            vec![SkillDecl::from_bare("grilling")]
+        );
+        assert_eq!(
+            node_skills(Some(&cfg), "execute").unwrap(),
+            vec![SkillDecl {
+                name: "to-spec".into(),
+                mode: SkillMode::Full,
+                trusted: false
+            }]
+        );
         // 只配了超时的节点没有技能
-        assert!(node_skills(Some(&cfg), "validate_output").is_empty());
+        assert!(node_skills(Some(&cfg), "validate_output")
+            .unwrap()
+            .is_empty());
         // 未声明的节点 / 无配置 / 无 stage_cfg 一律空（只增不减，不报错）
-        assert!(node_skills(Some(&cfg), "init").is_empty());
-        assert!(node_skills(None, "execute").is_empty());
+        assert!(node_skills(Some(&cfg), "init").unwrap().is_empty());
+        assert!(node_skills(None, "execute").unwrap().is_empty());
         let empty = StageConfig {
             stage: "develop".into(),
             ..Default::default()
         };
-        assert!(node_skills(Some(&empty), "execute").is_empty());
+        assert!(node_skills(Some(&empty), "execute").unwrap().is_empty());
     }
 
     #[test]
@@ -1060,8 +1170,121 @@ mod tests {
             })),
             ..Default::default()
         };
-        assert!(node_skills(Some(&cfg), "validate_input").is_empty());
-        assert_eq!(node_skills(Some(&cfg), "execute"), vec!["to-spec"]);
+        assert!(node_skills(Some(&cfg), "validate_input")
+            .unwrap()
+            .is_empty());
+        assert_eq!(
+            node_skills(Some(&cfg), "execute").unwrap(),
+            vec![crate::agent::skills::SkillDecl::from_bare("to-spec")],
+            "杂值不是声明，忽略（票 01 宽松口径不变）"
+        );
+    }
+
+    // ── 票 05（决策 172④）：混合数组解析与信任门 ──
+
+    #[test]
+    fn bare_strings_are_backward_compatible_full_untrusted() {
+        // 旧配置行（纯字符串数组）行为逐字不变：零迁移
+        let decls = parse_skill_decls(&serde_json::json!(["a", "b"]), "阶段 develop").unwrap();
+        assert_eq!(
+            decls,
+            vec![
+                crate::agent::skills::SkillDecl::from_bare("a"),
+                crate::agent::skills::SkillDecl::from_bare("b"),
+            ]
+        );
+    }
+
+    #[test]
+    fn object_form_reads_mode_and_trusted() {
+        use crate::agent::skills::SkillMode;
+        let decls = parse_skill_decls(
+            &serde_json::json!([
+                {"name": "a", "mode": "name", "trusted": true},
+                {"name": "b", "mode": "name"},
+                {"name": "c", "trusted": true}
+            ]),
+            "阶段 develop",
+        )
+        .unwrap();
+        assert_eq!(decls[0].mode, SkillMode::Name);
+        assert!(decls[0].trusted);
+        assert_eq!(decls[1].mode, SkillMode::Name);
+        assert!(!decls[1].trusted);
+        // mode 缺省 full；trusted 显式为 true 时允许全文注入
+        assert_eq!(decls[2].mode, SkillMode::Full);
+        assert!(decls[2].trusted);
+        assert_eq!(decls[2].name, "c");
+    }
+
+    /// 信任门只对**显式对象**生效：`{"name": "d"}`（full + trusted 缺省 false）被拒绝，
+    /// 而同样的技能写成裸字符串 `"d"` 则放行。
+    ///
+    /// 这不是漏洞而是「零迁移」的必要条件：信任概念出现之前手写的配置行全是裸字符串，
+    /// 若把信任门一视同仁地施加于它们，升级后今天所有配置行都会失效。裸字符串因此被当作
+    /// 「用户在自己机器上手写的既有配置」，与「刚从市场装来、尚未信任」的新对象分开对待。
+    #[test]
+    fn trust_gate_applies_to_object_form_only() {
+        use crate::agent::skills::SkillDecl;
+        // 显式对象 + full + 未信任 → 拒绝
+        let err =
+            parse_skill_decls(&serde_json::json!([{"name": "d"}]), "阶段 develop").unwrap_err();
+        assert!(
+            err.to_string().contains("d") && err.to_string().contains("信任"),
+            "{err}"
+        );
+        // 裸字符串同义声明 → 放行（旧配置行零迁移）
+        assert_eq!(
+            parse_skill_decls(&serde_json::json!(["d"]), "阶段 develop").unwrap(),
+            vec![SkillDecl::from_bare("d")]
+        );
+    }
+
+    #[test]
+    fn invalid_mode_is_rejected_with_location() {
+        let err = parse_skill_decls(
+            &serde_json::json!([{"name": "a", "mode": "half"}]),
+            "阶段 develop 节点 execute",
+        )
+        .unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("half") && msg.contains("full") && msg.contains("name"),
+            "{msg}"
+        );
+        assert!(msg.contains("节点 execute"), "报错须定位到节点：{msg}");
+    }
+
+    #[test]
+    fn untrusted_full_injection_is_rejected() {
+        // 选型 D：未信任技能不得全文注入（写入时拒绝）
+        let err = parse_skill_decls(
+            &serde_json::json!([{"name": "evil", "mode": "full", "trusted": false}]),
+            "阶段 develop",
+        )
+        .unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("evil") && msg.contains("信任"), "{msg}");
+
+        // 未信任 + name 模式是允许的（正文由 Skill 工具按需拉取）
+        assert!(parse_skill_decls(
+            &serde_json::json!([{"name": "ok", "mode": "name", "trusted": false}]),
+            "阶段 develop"
+        )
+        .is_ok());
+        // 已信任 + full 也允许
+        assert!(parse_skill_decls(
+            &serde_json::json!([{"name": "ok", "mode": "full", "trusted": true}]),
+            "阶段 develop"
+        )
+        .is_ok());
+    }
+
+    #[test]
+    fn object_without_name_is_rejected() {
+        let err =
+            parse_skill_decls(&serde_json::json!([{"mode": "name"}]), "阶段 develop").unwrap_err();
+        assert!(err.to_string().contains("name"), "{err}");
     }
 
     #[test]

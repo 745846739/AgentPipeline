@@ -707,12 +707,22 @@ interface SystemBaseline {
 | 来源 | 判定 | 是否携带正文 |
 |---|---|---|
 | 内嵌默认 | 二进制内 `EMBEDDED_SKILLS`（`crates/core/src/agent/skills.rs`；决策 7 的内嵌 persona 先例） | 有 |
-| 用户 markdown | `~/.agentpipeline/skills/{name}/SKILL.md`（镜像 ZCode 布局，可直接拷贝；**同名覆盖内嵌**） | 有 |
+| 用户 markdown | `{skills_root}/{name}/SKILL.md`（镜像 ZCode 布局，可直接拷贝；**同名覆盖内嵌**；技能根默认 `~/.agentpipeline/skills`，可由 `[skills] dir` 覆盖，决策 172） | 有 |
 | PATH 外部工具 | PATH 中的可执行文件（决策 47 原语义，如 `rtk` / `codegraph`） | 无，只列名字 |
 
-**知识型技能的正文注入 system prompt**（`## 已启用技能` 段：工具型渲染为 `- {name}`，知识型渲染为 `### {name}` + 正文），因此 `prompt_template_hash` 对正文敏感（决策 137）。正文「存在且非空」在启动与 `PUT /stage-configs` 时 **fail fast**（与 §10.6.4 的 `persona_path` 同口径）；工具型技能未安装却被引用时同样 fail fast，与 MCP 处理一致。
+**三态渲染**（决策 172④，票 05）——`## 已启用技能` 段里的每个技能按下表之一呈现，形态由声明里的 `mode` 决定：
 
-**节点级技能：** 阶段级 `skills_json` 无法区分节点，而同一阶段的不同节点职责可能互斥（architect-design 的 `validate_input` 提问、`execute` 写 `design.md`、`validate_output` 校验）。因此技能也可在 `node_overrides_json[node].skills` 声明——见 §10.6.3。有效集 = `mandatory_skills ∪ 阶段级 skills_json ∪ 节点级 skills`（**只增不减**）。
+| 形态 | 渲染 | 何时用 |
+|---|---|---|
+| 全文态 | `### {name}` + 正文 | `mode: "full"`（裸字符串的默认解释） |
+| 名字态 | `- {name}` | `mode: "name"`——正文由 `Skill` 工具按需拉取，不进 system prompt |
+| 目录态 | `- {name}: {description}` | 未被声明、仅在可用池的技能（渐进披露的落点） |
+
+**只有全文态的正文进 system prompt**，因此 `prompt_template_hash` **只对全文态敏感**（决策 137）：名字态与目录态换正文不会造成 hash 抖动。目录态**不含正文**，`disable-model-invocation: true` 的技能不进目录（选型 D）。正文「存在且非空」在启动与 `PUT /stage-configs` 时 **fail fast**（与 §10.6.4 的 `persona_path` 同口径）；工具型技能未安装却被引用时同样 fail fast，与 MCP 处理一致。
+
+**技能声明字段形态**（决策 172④）：`string | {name, mode, trusted}` 的混合数组。裸字符串按 `{mode: "full", trusted: false}` 解释（**向后兼容今天的配置行，零迁移**）；对象形态的 `mode` 缺省 `full`、`trusted` 缺省 `false`。**未信任技能不得以 `full` 模式保存**——写入/启动校验直接拒绝，须显式确认信任或改用 `mode: "name"`。这道信任门**只对显式对象生效**：裸字符串是信任概念出现之前手写的配置行，一视同仁会使既有配置全部失效。
+
+**节点级技能：** 阶段级 `skills_json` 无法区分节点，而同一阶段的不同节点职责可能互斥（architect-design 的 `validate_input` 提问、`execute` 写 `design.md`、`validate_output` 校验）。因此技能也可在 `node_overrides_json[node].skills` 声明——见 §10.6.3。有效集 = `mandatory_skills ∪ 阶段级 skills_json ∪ 节点级 skills`（**只增不减**，同名技能保留首次出现形态：阶段级优先）。
 
 **约束语义：** 阶段配置只能让 agent **能力更强或更聚焦**，不能让 agent **绕过系统保障**。例如阶段可以增加工具，但不能移除 `submit_metadata`；可以选择白名单内的 provider，但不能自选白名单外的。
 

@@ -1127,6 +1127,213 @@ async fn external_skills_dir_is_discovered_and_injected() {
     );
 }
 
+// ──────────────────── 二档注入与目录态（票 05 / 决策 172④）────────────────────
+
+/// 在技能根下写一个知识型技能（票 05 起断言对象一律是**用户目录技能**）。
+fn write_user_skill(root: &std::path::Path, name: &str, description: &str, body: &str) {
+    let dir = root.join(name);
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(
+        dir.join("SKILL.md"),
+        format!("---\nname: {name}\ndescription: {description}\n---\n\n{body}"),
+    )
+    .unwrap();
+}
+
+/// 名字态（`mode = "name"`）不把正文带进 system prompt——正文由 `Skill` 工具按需拉取。
+///
+/// 这是二档注入的全部意义：常驻上下文只背名字，几十个技能不会把窗口挤满（选型 D）。
+#[tokio::test]
+async fn name_mode_injects_name_without_body() {
+    let external = tempfile::tempdir().unwrap();
+    write_user_skill(
+        external.path(),
+        "long-skill",
+        "很长的技能",
+        "机密正文不应进 prompt",
+    );
+    let ctx = setup_with_skills_dir("true", Settings::default(), external.path()).await;
+    ctx.store
+        .upsert_stage_config(&agentpipeline_core::types::StageConfig {
+            stage: "architect-design".into(),
+            node_overrides_json: Some(serde_json::json!({
+                "validate_input": {"skills": [
+                    {"name": "long-skill", "mode": "name", "trusted": true}
+                ]}
+            })),
+            updated_at: ctx.store.now(),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+
+    let mut script = Script::new();
+    design_scripts(&mut script);
+    implementation_scripts(&mut script, "t-skill-name-mode");
+    ctx.agent.set_script(script);
+    testkit::seed_task(&ctx.store, "t-skill-name-mode", "p1")
+        .await
+        .unwrap();
+    admit(&ctx, "t-skill-name-mode").await;
+    ctx.executor.run("t-skill-name-mode").await.unwrap();
+
+    let requests = ctx.agent.request_log();
+    let vi = requests
+        .iter()
+        .find(|r| r.stage == Stage::ArchitectDesign && r.node == Node::ValidateInput)
+        .expect("architect validate_input 请求");
+    assert!(
+        vi.system_prompt.contains("- long-skill"),
+        "名字态应列出名字：{}",
+        vi.system_prompt
+    );
+    assert!(
+        !vi.system_prompt.contains("机密正文不应进 prompt"),
+        "名字态不得把正文带进 prompt：{}",
+        vi.system_prompt
+    );
+    assert!(
+        !vi.system_prompt.contains("### long-skill"),
+        "名字态不是全文态：{}",
+        vi.system_prompt
+    );
+}
+
+/// 目录态（渐进披露）：**未被声明**的可用技能进 prompt 时只有名字 + 描述，没有正文。
+///
+/// 这是票 05 新增的唯一可见输出，也是「模型知道有哪些能力可用、但不必预载全部正文」的落点。
+#[tokio::test]
+async fn undeclared_skills_appear_as_catalogue_without_body() {
+    let external = tempfile::tempdir().unwrap();
+    // 未声明：应出现在目录里
+    write_user_skill(external.path(), "available", "可选的技能", "可选的机密正文");
+    // 已声明为名字态：应只按名字态出现，不重复进目录
+    write_user_skill(external.path(), "declared", "已声明的技能", "已声明正文");
+    // disable-model-invocation：不进目录（选型 D）
+    {
+        let dir = external.path().join("manual-only");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("SKILL.md"),
+            "---\nname: manual-only\ndescription: 手动触发\ndisable-model-invocation: true\n---\n\n正文",
+        )
+        .unwrap();
+    }
+
+    let ctx = setup_with_skills_dir("true", Settings::default(), external.path()).await;
+    ctx.store
+        .upsert_stage_config(&agentpipeline_core::types::StageConfig {
+            stage: "architect-design".into(),
+            node_overrides_json: Some(serde_json::json!({
+                "validate_input": {"skills": ["declared"]}
+            })),
+            updated_at: ctx.store.now(),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+
+    let mut script = Script::new();
+    design_scripts(&mut script);
+    implementation_scripts(&mut script, "t-skill-catalogue");
+    ctx.agent.set_script(script);
+    testkit::seed_task(&ctx.store, "t-skill-catalogue", "p1")
+        .await
+        .unwrap();
+    admit(&ctx, "t-skill-catalogue").await;
+    ctx.executor.run("t-skill-catalogue").await.unwrap();
+
+    let requests = ctx.agent.request_log();
+    let vo = requests
+        .iter()
+        .find(|r| r.stage == Stage::ArchitectDesign && r.node == Node::ValidateOutput)
+        .expect("architect validate_output 请求");
+    let p = &vo.system_prompt;
+
+    // 目录项：名字 + 描述。`declared` 是 **validate_input 的节点级声明**，
+    // 在 validate_output 这个节点上它是未声明的 → 也以目录态出现（节点级作用域的直接体现）。
+    assert!(p.contains("- available: 可选的技能"), "{p}");
+    assert!(p.contains("- declared: 已声明的技能"), "{p}");
+    // 目录态不含正文
+    assert!(!p.contains("可选的机密正文"), "目录态不得含正文：{p}");
+    assert!(!p.contains("已声明正文"), "目录态不得含正文：{p}");
+    // disable-model-invocation 不进目录
+    assert!(
+        !p.contains("manual-only"),
+        "手动触发技能不得自动进目录：{p}"
+    );
+
+    // validate_input 是声明所在节点：`declared` 在这里按全文态（裸字符串）注入，
+    // 且**不再**以目录项重复出现
+    let vi = requests
+        .iter()
+        .find(|r| r.stage == Stage::ArchitectDesign && r.node == Node::ValidateInput)
+        .expect("architect validate_input 请求");
+    assert!(
+        vi.system_prompt.contains("### declared"),
+        "{}",
+        vi.system_prompt
+    );
+    assert!(
+        !vi.system_prompt.contains("- declared: 已声明的技能"),
+        "已声明的技能不得重复进目录：{}",
+        vi.system_prompt
+    );
+    assert!(
+        vi.system_prompt.contains("- available: 可选的技能"),
+        "{}",
+        vi.system_prompt
+    );
+}
+
+/// 旧配置行（纯字符串数组）行为逐字不变：裸字符串按 `{mode: full, trusted: false}` 解释，
+/// 正文照进 prompt——**零迁移**（决策 172④）。
+#[tokio::test]
+async fn legacy_string_array_declarations_still_inject_full_body() {
+    let external = tempfile::tempdir().unwrap();
+    write_user_skill(external.path(), "legacy", "老技能", "老配置行的正文");
+    let ctx = setup_with_skills_dir("true", Settings::default(), external.path()).await;
+    ctx.store
+        .upsert_stage_config(&agentpipeline_core::types::StageConfig {
+            stage: "architect-design".into(),
+            // 旧格式：纯字符串数组，无对象、无 mode/trusted
+            node_overrides_json: Some(serde_json::json!({
+                "validate_input": {"skills": ["legacy"]}
+            })),
+            updated_at: ctx.store.now(),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+
+    let mut script = Script::new();
+    design_scripts(&mut script);
+    implementation_scripts(&mut script, "t-skill-legacy");
+    ctx.agent.set_script(script);
+    testkit::seed_task(&ctx.store, "t-skill-legacy", "p1")
+        .await
+        .unwrap();
+    admit(&ctx, "t-skill-legacy").await;
+    ctx.executor.run("t-skill-legacy").await.unwrap();
+
+    let vi = ctx
+        .agent
+        .request_log()
+        .into_iter()
+        .find(|r| r.stage == Stage::ArchitectDesign && r.node == Node::ValidateInput)
+        .expect("architect validate_input 请求");
+    assert!(
+        vi.system_prompt.contains("### legacy"),
+        "旧配置行仍是全文态：{}",
+        vi.system_prompt
+    );
+    assert!(
+        vi.system_prompt.contains("老配置行的正文"),
+        "{}",
+        vi.system_prompt
+    );
+}
+
 // ──────────────────── 闸门失败 → test 复检 → 重跑闸门（票 15 / 决策 85 / 109）────────────────────
 
 #[tokio::test]
