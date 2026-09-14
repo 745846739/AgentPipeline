@@ -526,7 +526,12 @@ pub fn resolve(skills_root: &Path, declared: &[SkillDecl]) -> Result<Vec<Resolve
         let render = match decl.mode {
             SkillMode::Name => SkillRender::Name,
             SkillMode::Full => match body_of(skills_root, &decl.name)? {
-                Some(body) => SkillRender::Full { body },
+                // 全文态**也**展开兄弟文件（票 07）：否则全文态下兄弟引用仍是死指针。
+                // 缺失即 fail fast——本函数在启动校验与 prompt 组装两处都用，残缺的技能包
+                // 必须在启动时暴露，而不是让 agent 拿着少一节的正文开工。
+                Some(body) => SkillRender::Full {
+                    body: expand_siblings_strict(skills_root, &decl.name, &body)?,
+                },
                 None => SkillRender::Name, // 工具型技能：只有名字（决策 47）
             },
         };
@@ -568,6 +573,173 @@ pub fn catalogue(skills_root: &Path, declared: &[String]) -> Vec<ResolvedSkill> 
         .collect()
 }
 
+/// 兄弟文件**一级**展开（决策 172③，票 07）：把正文里的相对 markdown 引用内联。
+///
+/// 上游技能用 `[tests.md](tests.md)`、`[UI.md](UI.md)` 这类引用指向同目录的兄弟文件
+/// （`tdd/tests.md`、`prototype/UI.md`…）。这些文件此前既不进 prompt、agent 也读不到
+/// ——文件工具被 [`crate::agent::file_policy::FileToolPolicy`] 锁在 worktree + 任务目录内，
+/// 于是引用是**双向死指针**。展开走加载器而非放宽文件读根：技能根与 `{home}/data/`
+/// （provider 密钥明文存储，决策 112）同父。
+///
+/// 三条规则：
+/// - **只展开一级**（对齐 Agent Skills 规范「Keep file references one level deep」）：
+///   被内联的文件里的引用**不再展开**，否则链式加载失控、体积不可预测；
+/// - **目标必须在技能目录之内**：拒绝 `../` 穿越与绝对路径（[`resolve_sibling`]）；
+/// - **非 `.md` 引用不展开**（`scripts/*.py` 保留原样）：本系统没有脚本执行语义，
+///   内联一段 Python 反而让技能作者误以为它会被执行。
+///
+/// 缺失的引用**在展开结果里显式标注**而不是静默删除——这是给模型看的：它会知道这里少
+/// 了一节，而不是以为技能就长这样。`Err` 只用于调用方明确要求「残缺即失败」的场景
+/// （见 [`load_body_strict`]）。
+pub fn expand_siblings(skills_root: &Path, name: &str, body: &str) -> String {
+    let dir = skills_root.join(name);
+    // 目录不可 canonicalize（技能不存在等）时按无引用处理——正文已由调用方校验过
+    let Ok(canonical_dir) = dir.canonicalize() else {
+        return body.to_string();
+    };
+    expand_once(&canonical_dir, name, body)
+}
+
+/// 同 [`expand_siblings`]，但**缺失的兄弟文件是错误**。
+///
+/// 用于启动校验与 `Skill` 工具路径：技能包残缺必须 fail fast / 明确报错，报文带
+/// 技能名 + 缺失文件名（票 07 的验收项），否则技能作者看到的只是「少了一节」。
+pub fn expand_siblings_strict(skills_root: &Path, name: &str, body: &str) -> Result<String> {
+    let missing = missing_siblings(skills_root, name, body);
+    if let Some(target) = missing.first() {
+        return Err(Error::Config(format!(
+            "技能 {name} 引用的兄弟文件缺失：{target}"
+        )));
+    }
+    Ok(expand_siblings(skills_root, name, body))
+}
+
+/// 列出正文里引用了、但**读不到**的兄弟文件（按出现顺序）。
+///
+/// 与 [`expand_once`] 共用同一套「什么算兄弟引用」的判定：非 `.md` 不算、越界路径不算
+/// （它们要么本就不该被展开，要么是恶意的，都不该被报成「缺失」）。
+pub fn missing_siblings(skills_root: &Path, name: &str, body: &str) -> Vec<String> {
+    let dir = skills_root.join(name);
+    let Ok(canonical_dir) = dir.canonicalize() else {
+        return Vec::new();
+    };
+    let mut out = Vec::new();
+    for cap in sibling_link_regex().captures_iter(body) {
+        let target = cap.get(1).map(|m| m.as_str()).unwrap_or("");
+        if !target.ends_with(".md") {
+            continue;
+        }
+        match resolve_sibling(&canonical_dir, target) {
+            // 越界是拒绝展开，不是「缺失」——不报成缺文件
+            SiblingTarget::OutOfBounds => {}
+            SiblingTarget::InBounds(path) if !path.is_file() => out.push(target.to_string()),
+            SiblingTarget::InBounds(_) => {}
+        }
+    }
+    out
+}
+
+/// 实际的展开实现：`base` 是**已 canonicalize** 的技能目录。
+fn expand_once(base: &Path, name: &str, body: &str) -> String {
+    let re = sibling_link_regex();
+    let mut out = String::with_capacity(body.len());
+    let mut last = 0usize;
+    for cap in re.captures_iter(body) {
+        let whole = cap.get(0).expect("整体匹配");
+        let target = cap.get(1).map(|m| m.as_str()).unwrap_or("");
+        // 非 .md 引用：原样保留（不展开、不执行）
+        if !target.ends_with(".md") {
+            continue;
+        }
+        // 越界路径：保留原样文本，不让它变成一次任意文件读
+        let path = match resolve_sibling(base, target) {
+            SiblingTarget::OutOfBounds => continue,
+            SiblingTarget::InBounds(p) => p,
+        };
+        let replacement = match std::fs::read_to_string(&path) {
+            Ok(raw) => {
+                let inner = parse_frontmatter(&raw).1.trim().to_string();
+                // 内联内容里的引用**不再展开**（只一级）——原样带进结果
+                format!(
+                    "{}\n\n### 参考：{target}\n\n{inner}\n",
+                    whole.as_str().trim_end()
+                )
+            }
+            Err(_) => format!(
+                "{}（⚠ 兄弟文件缺失：技能 {name} 引用的 {target} 读不到）",
+                whole.as_str()
+            ),
+        };
+        out.push_str(&body[last..whole.start()]);
+        out.push_str(&replacement);
+        last = whole.end();
+    }
+    out.push_str(&body[last..]);
+    out
+}
+
+/// 兄弟文件的相对引用正则：`[任意文本](目标)`。
+///
+/// 目标里排掉 `#`（锚点）与空白；`/` 仍会匹配进来，由 [`resolve_sibling`] 统一拒绝——
+/// 「同目录兄弟文件」的判定只在一处，正则不重复表达安全规则。
+fn sibling_link_regex() -> &'static regex::Regex {
+    use std::sync::OnceLock;
+    static RE: OnceLock<regex::Regex> = OnceLock::new();
+    RE.get_or_init(|| regex::Regex::new(r"\[[^\]]*\]\(([^)#\s]+)\)").expect("兄弟文件引用正则合法"))
+}
+
+/// 兄弟文件引用的解析结果。
+enum SiblingTarget {
+    /// 词法上落在技能目录内（文件是否存在另行判定）。
+    InBounds(PathBuf),
+    /// 越界：绝对路径、`..` 穿越，或符号链接指向目录之外。
+    OutOfBounds,
+}
+
+/// 把引用目标解析成技能目录内的路径；越界返回 [`SiblingTarget::OutOfBounds`]。
+///
+/// **`base` 必须是已 canonicalize 的技能目录**（调用方保证）。
+///
+/// 两道判定缺一不可：
+/// - **词法规范化**先消掉 `.` / `..`：文件可能还不存在，此时 `canonicalize` 会失败，
+///   不能靠它做越界判定。逐段消费 path components，每走一步都要求仍在 `base` 之下。
+/// - **canonicalize 复检**（文件存在时）兜住**符号链接逃逸**：字面上 `link.md` 就在技能
+///   目录内，但它可能是一个指向 `/etc/passwd` 的软链。
+///
+/// 「不存在」与「越界」严格分开：前者是技能包残缺（要报错），后者是恶意/误写
+/// （不展开、不读、不报缺失）。
+fn resolve_sibling(base: &Path, target: &str) -> SiblingTarget {
+    use std::path::Component;
+
+    if target.is_empty() {
+        return SiblingTarget::OutOfBounds;
+    }
+    let mut normalized = base.to_path_buf();
+    for comp in Path::new(target).components() {
+        match comp {
+            Component::Normal(c) => normalized.push(c),
+            Component::CurDir => {}
+            Component::ParentDir => {
+                if !normalized.pop() || !normalized.starts_with(base) {
+                    return SiblingTarget::OutOfBounds;
+                }
+            }
+            // 绝对路径（`/`）与平台前缀：一律越界
+            Component::RootDir | Component::Prefix(_) => return SiblingTarget::OutOfBounds,
+        }
+    }
+    if !normalized.starts_with(base) {
+        return SiblingTarget::OutOfBounds;
+    }
+    match normalized.canonicalize() {
+        // 存在：canonicalize 后再查一次，拦符号链接逃逸
+        Ok(real) if !real.starts_with(base) => SiblingTarget::OutOfBounds,
+        Ok(real) => SiblingTarget::InBounds(real),
+        // 不存在：词法上在界内，交给缺失判定
+        Err(_) => SiblingTarget::InBounds(normalized),
+    }
+}
+
 /// 按名加载一个技能的正文（`Skill` 工具与名字态渲染的共用取数口，决策 172③，票 06）。
 ///
 /// 与 [`resolve`] 的区别在**用途与失败语义**：
@@ -597,11 +769,15 @@ pub fn load_body(skills_root: &Path, name: &str) -> Result<String> {
         Some(s) if matches!(s.source, SkillSource::Tool) => Err(Error::Config(format!(
             "技能 {name} 是 PATH 工具型技能，没有可注入的正文（它只有名字）"
         ))),
-        Some(_) => body_of(skills_root, name)?.ok_or_else(|| {
-            Error::Config(format!(
-                "技能 {name} 的正文不可读（既无用户文件也无内嵌正文）"
-            ))
-        }),
+        Some(_) => {
+            let body = body_of(skills_root, name)?.ok_or_else(|| {
+                Error::Config(format!(
+                    "技能 {name} 的正文不可读（既无用户文件也无内嵌正文）"
+                ))
+            })?;
+            // 兄弟文件缺失 → 明确报错（票 07），报文带技能名 + 缺失文件名
+            expand_siblings_strict(skills_root, name, &body)
+        }
     }
 }
 
@@ -952,6 +1128,163 @@ mod tests {
         let home = tmp();
         let body = load_body(&root_of(home.path()), "grilling").unwrap();
         assert!(body.contains("frontier"), "{body}");
+    }
+
+    // ── 票 07：兄弟文件一级展开 ──
+
+    /// 在技能目录下写一个兄弟文件（支持嵌套路径）。
+    fn write_sibling(root: &Path, skill: &str, file: &str, content: &str) {
+        let path = root.join(skill).join(file);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(path, content).unwrap();
+    }
+
+    #[test]
+    fn sibling_reference_is_inlined() {
+        let home = tmp();
+        let root = root_of(home.path());
+        write_skill(&root, "tdd", "主文档：先写测试\n\n[tests.md](tests.md)\n");
+        write_sibling(&root, "tdd", "tests.md", "# 测试写法\n\n一个用例一件事");
+        let body = load_body(&root, "tdd").unwrap();
+        assert!(body.contains("主文档：先写测试"), "{body}");
+        assert!(body.contains("一个用例一件事"), "兄弟文件应被内联：{body}");
+        assert!(body.contains("### 参考：tests.md"), "{body}");
+    }
+
+    /// **只展开一级**：被内联文件里的引用保持原样，不继续展开
+    /// （否则链式加载失控，体积不可预测）。
+    #[test]
+    fn sibling_expansion_is_one_level_only() {
+        let home = tmp();
+        let root = root_of(home.path());
+        write_skill(&root, "outer", "[mid.md](mid.md)\n");
+        write_sibling(&root, "outer", "mid.md", "中层\n\n[deep.md](deep.md)\n");
+        write_sibling(&root, "outer", "deep.md", "深层内容不该出现");
+        let body = load_body(&root, "outer").unwrap();
+        assert!(body.contains("中层"), "{body}");
+        assert!(
+            !body.contains("深层内容不该出现"),
+            "深层引用不得被展开：{body}"
+        );
+        // 深层引用保留原样文本（让 reader 知道还有这一节）
+        assert!(body.contains("[deep.md](deep.md)"), "{body}");
+    }
+
+    /// `../` 穿越被拒绝——保留原样文本，且**不读**技能目录外的文件。
+    #[test]
+    fn parent_traversal_is_not_expanded() {
+        let home = tmp();
+        let root = root_of(home.path());
+        write_skill(&root, "evil", "[sec](../../secret.md)\n");
+        // 技能根之外放一个「机密」文件
+        std::fs::write(home.path().join("secret.md"), "机密内容").unwrap();
+        let body = load_body(&root, "evil").unwrap();
+        assert!(!body.contains("机密内容"), "不得读技能目录之外：{body}");
+        assert!(body.contains("../../secret.md"), "引用保持原样：{body}");
+    }
+
+    /// 绝对路径引用同样不展开。
+    #[test]
+    fn absolute_path_reference_is_not_expanded() {
+        let home = tmp();
+        let root = root_of(home.path());
+        let outside = home.path().join("outside.md");
+        std::fs::write(&outside, "外部内容").unwrap();
+        write_skill(&root, "abs", &format!("[x]({})\n", outside.display()));
+        let body = load_body(&root, "abs").unwrap();
+        assert!(!body.contains("外部内容"), "{body}");
+    }
+
+    /// 缺失的兄弟文件 → `Error::Config`，报文带**技能名 + 缺失文件名**（票 07 验收项）。
+    #[test]
+    fn missing_sibling_is_config_error_with_skill_and_file() {
+        let home = tmp();
+        let root = root_of(home.path());
+        write_skill(&root, "broken", "[gone.md](gone.md)\n");
+        let err = load_body(&root, "broken").unwrap_err();
+        assert!(matches!(err, Error::Config(_)), "{err:?}");
+        let msg = err.to_string();
+        assert!(msg.contains("broken"), "须含技能名：{msg}");
+        assert!(msg.contains("gone.md"), "须含缺失文件名：{msg}");
+    }
+
+    /// 非 `.md` 引用**不展开、不执行**，保留原样文本。
+    ///
+    /// 本系统没有脚本执行语义，内联一段 Python 会让技能作者误以为它会被跑起来。
+    #[test]
+    fn non_markdown_reference_is_left_alone() {
+        let home = tmp();
+        let root = root_of(home.path());
+        write_skill(&root, "scripty", "见 [run.py](scripts/run.py)\n");
+        write_sibling(&root, "scripty", "scripts/run.py", "print('不该被内联')");
+        let body = load_body(&root, "scripty").unwrap();
+        assert!(
+            body.contains("[run.py](scripts/run.py)"),
+            "非 md 引用保持原样：{body}"
+        );
+        assert!(!body.contains("不该被内联"), "{body}");
+    }
+
+    /// 全文态**也**展开兄弟文件（票 07 的显式要求）——否则全文态下引用仍是死指针。
+    #[test]
+    fn full_mode_expansion_inlines_siblings() {
+        let home = tmp();
+        let root = root_of(home.path());
+        write_skill(&root, "full-skill", "主文\n\n[sib.md](sib.md)\n");
+        write_sibling(&root, "full-skill", "sib.md", "兄弟正文");
+        let resolved = resolve(&root, &decls(&["full-skill"])).unwrap();
+        let body = full_body(&resolved[0]);
+        assert!(body.contains("兄弟正文"), "全文态也应展开：{body}");
+    }
+
+    /// 全文态下缺失的兄弟文件同样 fail fast（技能包残缺必须在启动时暴露）。
+    #[test]
+    fn full_mode_missing_sibling_is_config_error() {
+        let home = tmp();
+        let root = root_of(home.path());
+        write_skill(&root, "full-broken", "[nope.md](nope.md)\n");
+        let err = resolve(&root, &decls(&["full-broken"])).unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("full-broken") && msg.contains("nope.md"),
+            "{msg}"
+        );
+    }
+
+    /// 名字态**不展开也不需要兄弟文件**——正文根本不在 prompt 里（票 05 与票 07 的交界）。
+    #[test]
+    fn name_mode_does_not_require_siblings() {
+        let home = tmp();
+        let root = root_of(home.path());
+        write_skill(
+            &root,
+            "deferred",
+            "[not-installed-yet.md](not-installed-yet.md)\n",
+        );
+        let resolved = resolve(
+            &root,
+            &[SkillDecl {
+                name: "deferred".into(),
+                mode: SkillMode::Name,
+                trusted: true,
+            }],
+        )
+        .unwrap();
+        assert_eq!(resolved[0].render, SkillRender::Name);
+    }
+
+    /// 符号链接指向技能目录之外 → 不展开（canonicalize 后前缀比较兜住字面判定的漏洞）。
+    #[cfg(unix)]
+    #[test]
+    fn symlink_escaping_skill_dir_is_not_expanded() {
+        let home = tmp();
+        let root = root_of(home.path());
+        let outside = home.path().join("outside.md");
+        std::fs::write(&outside, "外部机密").unwrap();
+        write_skill(&root, "linky", "[escape.md](escape.md)\n");
+        std::os::unix::fs::symlink(&outside, root.join("linky").join("escape.md")).unwrap();
+        let body = load_body(&root, "linky").unwrap();
+        assert!(!body.contains("外部机密"), "符号链接逃逸不得被展开：{body}");
     }
 
     #[test]

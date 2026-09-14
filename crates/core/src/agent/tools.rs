@@ -1242,6 +1242,57 @@ mod tests {
         assert!(out.metadata.is_none(), "Skill 不是 submit_metadata");
     }
 
+    /// 票 07：`Skill` 工具返回的正文**含一级展开的兄弟文件**。
+    ///
+    /// 上游技能的 `[tests.md](tests.md)` 是双向死指针（文件工具读不到技能目录），
+    /// 展开走加载器；二级引用不递归。
+    #[tokio::test]
+    async fn skill_tool_inlines_siblings_one_level() {
+        let s = setup(Stage::ArchitectDesign);
+        write_home_skill(&s, "tdd", "主文档\n\n[tests.md](tests.md)");
+        let dir = s.home.skills_dir().join("tdd");
+        std::fs::write(
+            dir.join("tests.md"),
+            "兄弟：一个用例一件事\n[deep.md](deep.md)",
+        )
+        .unwrap();
+        std::fs::write(dir.join("deep.md"), "二级内容不该出现").unwrap();
+
+        let out = s
+            .executor
+            .execute(&call("Skill", serde_json::json!({"name": "tdd"})), &s.ctx)
+            .await
+            .unwrap();
+        assert!(out.content.contains("主文档"), "{}", out.content);
+        assert!(
+            out.content.contains("一个用例一件事"),
+            "一级兄弟文件应内联：{}",
+            out.content
+        );
+        assert!(
+            !out.content.contains("二级内容不该出现"),
+            "二级引用不得展开：{}",
+            out.content
+        );
+    }
+
+    /// 缺失的兄弟文件 → 工具返回错误文本（走文本通道，不触发 `tool_retry_max`）。
+    #[tokio::test]
+    async fn skill_tool_missing_sibling_returns_text() {
+        let s = setup(Stage::ArchitectDesign);
+        write_home_skill(&s, "broken", "[gone.md](gone.md)");
+        let out = s
+            .executor
+            .execute(
+                &call("Skill", serde_json::json!({"name": "broken"})),
+                &s.ctx,
+            )
+            .await
+            .expect("技能包残缺不得走 Err 通道");
+        assert!(out.content.contains("gone.md"), "{}", out.content);
+        assert!(out.content.contains("broken"), "{}", out.content);
+    }
+
     /// 未知技能名**不是工具失败**——返回说明文本让模型自行纠正（票 06）。
     ///
     /// 若走 `Err`，agent loop 会把它算进 `tool_retry_max`（决策 33），模型写错一个名字
