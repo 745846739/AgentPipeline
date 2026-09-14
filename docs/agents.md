@@ -702,13 +702,14 @@ interface SystemBaseline {
 
 **最小基线包含：** AGENTS.md 加载（G3）、工作目录告知（G12）、结构化输出校验（§12.12）、token 计量（§12.2）、会话审计（§12.4.3）、**文件工具路径策略**（`file_tool_policy`，决策 104）。
 
-**技能（决策 170，修订决策 47）：** `mandatory_skills` 默认空。技能的**名字是唯一身份**，三类来源：
+**技能（决策 170 / 172，修订决策 47）：** `mandatory_skills` 默认空。技能的**名字是唯一身份**，两类来源：
 
 | 来源 | 判定 | 是否携带正文 |
 |---|---|---|
-| 内嵌默认 | 二进制内 `EMBEDDED_SKILLS`（`crates/core/src/agent/skills.rs`；决策 7 的内嵌 persona 先例） | 有 |
-| 用户 markdown | `{skills_root}/{name}/SKILL.md`（镜像 ZCode 布局，可直接拷贝；**同名覆盖内嵌**；技能根默认 `~/.agentpipeline/skills`，可由 `[skills] dir` 覆盖，决策 172） | 有 |
+| 用户 markdown | `{skills_root}/{name}/SKILL.md`（镜像 ZCode 布局，可直接拷贝；技能根默认 `~/.agentpipeline/skills`，可由 `[skills] dir` 覆盖，决策 172） | 有 |
 | PATH 外部工具 | PATH 中的可执行文件（决策 47 原语义，如 `rtk` / `codegraph`） | 无，只列名字 |
+
+> **内嵌技能已退场**（决策 172①，票 04）：二进制不再携带任何技能正文，两个流水线原生改写版（`grilling` / `to-spec`）随之移除。技能一律由用户从来源安装到本地，**不经二进制分发**——这同时解掉上游内容的再分发授权问题（27 个上游技能里只有 1 个带许可声明，而本仓是 MIT）。推荐默认改由配置界面承载（票 16）。因此**引用一个不存在的技能名现在是启动失败**，而不是静默降级成一个没有正文的名字。
 
 **三态渲染**（决策 172④，票 05）——`## 已启用技能` 段里的每个技能按下表之一呈现，形态由声明里的 `mode` 决定：
 
@@ -862,16 +863,16 @@ dir = "~/.agentpipeline/skills"      # 覆盖技能根；缺省回落 {home}/ski
 
 **阶段级 Agent 配置**存储在 SQLite 数据库中，通过前端界面配置。每个阶段可独立设置 provider（引用 `providers` 表的 `provider_id`）、tools、skills、超时覆盖。系统最小基线（mandatory_tools、mandatory_skills、`file_tool_policy`）在代码中硬编码，不可覆盖。模型上下文窗口随 `providers` 表的一行存在一起（决策 46 / 111）——**阶段不单独存 model**，换模型即换 `provider_id`，这样 L0 容量预估（§12.13.3）查找窗口大小的路径唯一。伪阶段（`project_analysis` / `conflict_check` / `validator_cross_check`）复用同一配置机制（决策 67 / 87 / 134）；`cross_family_judge = true` 时 `validator_cross_check` 必须已配置 provider，否则配置加载 fail fast。
 
-**节点级技能配置示例（决策 170）——给 architect-design 配「拷问 + 综合成规格」：** 内嵌技能 `grilling` / `to-spec` 开箱可用，无需先放文件；在 `node_overrides_json` 里按节点声明即可（`PUT /stage-configs/architect-design` 整条替换该阶段配置）：
+**节点级技能配置示例（决策 170 / 172）——给 architect-design 配「拷问 + 综合成规格」：** 技能来自用户目录（内嵌技能已退场，决策 172①），故先用设置页导入或手工放置 `~/.agentpipeline/skills/{name}/SKILL.md`，再在 `node_overrides_json` 里按节点声明（`PUT /stage-configs/architect-design` 整条替换该阶段配置）：
 
 ```json
 {
   "validate_input": { "skills": ["grilling"] },
-  "execute":        { "skills": ["to-spec"] }
+  "execute":        { "skills": [{ "name": "to-spec", "mode": "name", "trusted": true }] }
 }
 ```
 
-`validate_input` 因此拿到「把设计树走到没有悬空分支、只把**决定**问用户（事实自己查）、经 `submit_metadata.blockers` 提问」的指引；`execute` 拿到「不再提问、把已定内容综合成 `design.md`（保留 §10.3 必需节与验收标准编号清单）」的指引。想用自己版本的技能，把文件放到 `~/.agentpipeline/skills/grilling/SKILL.md` 即覆盖内嵌（同名覆盖，正文进 prompt）；也可以把 `[skills] dir` 指到已有生态目录（如 `~/.zcode/skills`）整体换掉技能根（决策 172）。技能 `SKILL.md` 的 frontmatter 里若写了 `name`，必须与所在目录同名，否则启动 fail fast。回滚：`DELETE /stage-configs/architect-design` 撤销该阶段覆盖，行为回到内嵌默认。
+`validate_input` 因此拿到「把设计树走到没有悬空分支、只把**决定**问用户（事实自己查）、经 `submit_metadata.blockers` 提问」的指引；`execute` 声明为**名字态**，正文不进 system prompt，由 agent 需要时调 `Skill` 工具按需拉取（决策 172③）。也可以把 `[skills] dir` 指到已有生态目录（如 `~/.zcode/skills`）整体换掉技能根（决策 172）。技能 `SKILL.md` 的 frontmatter 里若写了 `name`，必须与所在目录同名；引用的兄弟文件（`[tests.md](tests.md)`）必须存在且在该技能目录内——两条都在启动与 `PUT /stage-configs` 时 fail fast。回滚：`DELETE /stage-configs/architect-design` 撤销该阶段覆盖。
 
 **首启引导：** 未配置任何 provider / API key 时，创建任务返回明确错误（提示先配置 provider），不使用隐式默认模型（决策 56）。
 

@@ -5,13 +5,17 @@
 //! **携带 markdown 正文** 的知识型技能（与 MCP 的分工见 backlog §B.1：
 //! skill 是知识/流程指引，MCP 是可调用能力）。
 //!
-//! 技能的**唯一身份是名字**——两类来源同名即同一个技能，用户文件覆盖内嵌默认：
+//! 技能的**唯一身份是名字**——两类来源同名即同一个技能，有正文的知识型更具体：
 //!
 //! | 来源 | 判定 | 正文 |
 //! |---|---|---|
-//! | 内嵌默认 | [`EMBEDDED_SKILLS`]（决策 7 的内嵌 persona 先例，票 04 起退场） | 有 |
-//! | 用户 markdown | `{skills_root}/{name}/SKILL.md`（镜像 ZCode 布局，可直接拷贝） | 有，同名覆盖内嵌 |
+//! | 用户 markdown | `{skills_root}/{name}/SKILL.md`（镜像 ZCode 布局，可直接拷贝） | 有 |
 //! | 外部工具 | PATH 中可执行文件（决策 47 原语义） | 无，只列名字 |
+//!
+//! **内嵌技能已退场**（决策 172①，票 04）：二进制不再携带任何技能正文，两个流水线原生
+//! 改写版（`grilling` / `to-spec`）随之移除。技能一律由用户从来源安装到本地，不经二进制
+//! 分发——这同时解掉上游内容的再分发授权问题（27 个上游技能里只有 1 个带许可声明，而本仓
+//! 是 MIT）。推荐默认改由配置界面承载（票 16），`BASELINE_MANDATORY_SKILLS` 仍为空。
 //!
 //! **技能根唯一**（决策 172，修订决策 47）：默认 `{home}/skills`，可由 `[skills] dir`
 //! 覆盖（如指到 `~/.zcode/skills`）——本模块的每个入口都接收**技能根**本身，不再自己
@@ -39,101 +43,16 @@ pub const SKILLS_DIR: &str = "skills";
 /// 技能文件名（ZCode 布局，可直接把现有 skill 目录拷进来）。
 pub const SKILL_FILE: &str = "SKILL.md";
 
-/// 内嵌默认技能（决策 170）：用户目录同名文件可覆盖。
-///
-/// 这两个是**流水线原生**版本，不是 ZCode 版本的照搬——ZCode 的 `grill-me` 只是
-/// 「Call the Skill tool with "grilling"」的调度存根（本系统没有 Skill 工具），而
-/// `grilling` 协议的同步多轮对话也无法直接落在本流水线的异步 pending 回路上，
-/// 因此改写为经 `submit_metadata.blockers` → `pending(info_insufficient)` → resume
-/// 表达提问的版本（决策 79 / 94）。
-pub const EMBEDDED_SKILLS: [(&str, &str); 2] =
-    [("grilling", GRILLING_BODY), ("to-spec", TO_SPEC_BODY)];
-
-const GRILLING_BODY: &str = r#"# 拷问：把设计树走完再动手
-
-把这次任务的需求当作一棵**设计树**：每个决定都会分叉出挂在它下面的决定。
-你的职责是在动手设计之前，把这棵树走到没有悬空的分支。
-
-## 事实自己查，决定问用户
-
-- **事实**（仓库里有什么、用什么测试框架、现有接口长什么样）是你的活：用 `read_file` /
-  `list_dir` 去查，**不要**把能在仓库里查到答案的问题甩给用户。
-- **决定**（业务口径、取舍、优先级）是用户的：这些才进 blockers。
-
-## 提问方式：一轮一个 frontier
-
-`frontier` 是「当前所有前置决定都已敲定、现在就能问」的那些问题。一轮只问 frontier，
-不要问那些答案依赖另一个未决问题的（那是下一轮）。这也符合本节点的机制——你只有一个
-出口，一次 pending 就是一轮。
-
-**你唯一的出口是 `submit_metadata`，不能写任何文件**（写 `design.md` 是 execute 的事）：
-
-- frontier 非空 → `readiness: false`，`blockers` 里逐个列出问题，格式：
-
-  `Q1 <问题标题>：<问题正文>。建议：<你的推荐答案与理由>`
-
-  给推荐答案是硬要求——用户是在审批，不是在填空。问题要编号，一次给全 frontier。
-- frontier 为空 → `readiness: true`，`blockers: []`，可以进入设计。
-
-## 循环怎么继续
-
-`readiness: false` 会让本节点进入 `pending(info_insufficient)`，用户补充后会**重新回到
-本节点**——你会拿到上一轮的问答上下文。此时重新计算 frontier：已敲定的决定会把 frontier
-向外推，露出下一批问题。重复，直到 frontier 为空。
-
-## 何时算走完
-
-树上每个分支都访问过、没有静默假设了，就算走完。**不要**在用户确认走完之前开始设计，
-也**不要**为了凑轮次把已经能从仓库查到的答案再问一遍。"#;
-
-const TO_SPEC_BODY: &str = r#"# 综合成规格：把已定内容写成 design.md
-
-前置信息已经充分（validate_input 通过），现在**不要再提问**，把已经谈定的内容综合成设计文档。
-
-## 正文骨架
-
-在 §10.3 规定的 design.md 格式基础上，按下面的结构组织（**必需节一个都不能少**，
-尤其是「验收标准」——决策 136 要求它是编号清单，下游 test-design / sync-check / review
-都机械对照它）：
-
-```
-# {task_title}
-
-## 需求概述          （从用户视角讲问题）
-## 技术方案          （从用户视角讲解法）
-## 用户故事          （编号清单：As a <角色>, I want a <能力>, so that <收益>；尽量覆盖全）
-## 实现决策          （模块划分、接口改动、schema、契约、关键交互都在这里）
-## 涉及文件          | 文件路径 | 改动类型 | 说明 |      （§10.3 必需）
-## 验收标准          - AC-1: ... （§10.3 必需，编号清单，每条可验收，决策 136）
-## 测试决策          （测什么、在哪测、参照仓内已有的同类测试）
-## 不做的范围        （显式写清 out of scope）
-## 风险点            （每条风险配对应措施）
-```
-
-**不要**在「实现决策」里写具体文件路径或代码片段——它们很快会过期。唯一例外是某个
-原型片段比文字更精确地编码了决定（状态机、reducer、schema、类型形状），那就内联那几行，
-并标注它来自原型。
-
-## 产出方式
-
-1. 用 `write_file` 把文档写入 `design.md`（覆盖写入）。
-2. 用 `submit_metadata` 提交元数据——字段与 §10.3 一致，一个都不能少：
-   `affected_files`、`new_symbols`、`conflict_warnings`、`acceptance_criteria`
-   （`[{id, description}]`，与 design.md「验收标准」节**一一对应**）。
-
-## 口径
-
-术语用项目词汇表里的话，涉及架构的地方尊重既有 ADR。判断结论必须给依据，不要只给结论。
-不要写执行步骤流水账——那是 develop-design 的活。"#;
-
 /// 技能来源。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SkillSource {
     /// PATH 中的可执行文件（决策 47 原语义）。只有名字，没有正文。
     Tool,
-    /// 内嵌默认正文（[`EMBEDDED_SKILLS`]）。
-    Embedded,
-    /// 用户 markdown 覆盖（`{skills_root}/{name}/SKILL.md`）。
+    /// 用户 markdown（`{skills_root}/{name}/SKILL.md`）。
+    ///
+    /// 内嵌来源已随决策 172① 退场（票 04）：技能一律由用户从来源安装到本地，不经二进制
+    /// 分发——这同时解掉上游内容的再分发授权问题（27 个上游技能里只有 1 个带许可声明，
+    /// 而本仓是 MIT）。
     Markdown { path: PathBuf },
 }
 
@@ -324,39 +243,19 @@ fn markdown_skill_paths(skills_root: &Path) -> BTreeMap<String, PathBuf> {
     out
 }
 
-/// 发现全部可用技能（内嵌 ∪ 技能根 markdown ∪ PATH 工具），名字去重。
+/// 发现全部可用技能（技能根 markdown ∪ PATH 工具），名字去重。
 ///
-/// 技能根下的同名文件覆盖内嵌（来源记为 [`SkillSource::Markdown`]）。
+/// 两类来源同名时**知识型让位给工具型以外的方向**：有正文的更具体，工具型只列名字。
+/// 内嵌来源已退场（决策 172①，票 04），本函数不再有「内嵌 ∪ 用户覆盖」那一层。
 pub fn discover(skills_root: &Path) -> Vec<Skill> {
-    let markdown = markdown_skill_paths(skills_root);
-
-    let mut out: Vec<Skill> = Vec::new();
-    for (name, _) in EMBEDDED_SKILLS {
-        match markdown.get(name) {
-            Some(path) => out.push(Skill {
-                name: name.to_string(),
-                source: SkillSource::Markdown { path: path.clone() },
-                frontmatter: read_frontmatter(path),
-            }),
-            None => out.push(Skill {
-                name: name.to_string(),
-                source: SkillSource::Embedded,
-                frontmatter: SkillFrontmatter::default(),
-            }),
-        }
-    }
-
-    let embedded: Vec<&str> = EMBEDDED_SKILLS.iter().map(|(n, _)| *n).collect();
-    for (name, path) in &markdown {
-        if embedded.contains(&name.as_str()) {
-            continue; // 已在上面以 Markdown 来源登记
-        }
-        out.push(Skill {
-            name: name.clone(),
+    let mut out: Vec<Skill> = markdown_skill_paths(skills_root)
+        .into_iter()
+        .map(|(name, path)| Skill {
             source: SkillSource::Markdown { path: path.clone() },
-            frontmatter: read_frontmatter(path),
-        });
-    }
+            frontmatter: read_frontmatter(&path),
+            name,
+        })
+        .collect();
 
     let taken: Vec<String> = out.iter().map(|s| s.name.clone()).collect();
     for name in path_tool_names() {
@@ -482,27 +381,46 @@ pub fn validate_names(skills_root: &Path) -> Result<()> {
     Ok(())
 }
 
-/// 读取一个知识型技能的正文（内嵌或技能根下的用户文件）。
+/// 读取一个知识型技能的正文（技能根下的用户文件）。
 ///
-/// `name` 必须存在于 [`discover`] 的结果中。工具型技能返回 `Ok(None)`。
-fn body_of(skills_root: &Path, name: &str) -> Result<Option<String>> {
-    let path = skill_file_path(skills_root, name);
-    match std::fs::read_to_string(&path) {
-        Ok(raw) => {
-            let body = parse_frontmatter(&raw).1.trim().to_string();
-            if body.is_empty() {
-                return Err(Error::Config(format!(
-                    "技能 {name} 的正文为空：{}",
-                    path.display()
-                )));
-            }
-            Ok(Some(body))
+/// 三态返回，覆盖票 04 要求的三条路径：
+/// - **用户文件可读且非空** → `Ok(Some(body))`；
+/// - **PATH 工具型技能** → `Ok(None)`（只有名字，决策 47 原语义）；
+/// - **名字不存在、或知识型技能的文件读不到 / 正文为空** → [`Error::Config`]。
+///
+/// 第三条是关键：内嵌兜底删除后，**不得**出现「名字存在但静默降级成空子弹」的路径
+/// （票 04 显式禁止）——那样 agent 会拿到一个没有任何正文的技能名，而配置方以为它生效了。
+///
+/// `markdown` 是预先算好的技能根索引、`tool_names` 是 PATH 可执行文件名（**按需惰性求值**：
+/// 只有「技能根里找不到这个名字」时才需要扫 PATH 来区分工具型与不存在，见 [`path_tool_names`]）。
+fn body_of(
+    skills_root: &Path,
+    name: &str,
+    markdown: &BTreeMap<String, PathBuf>,
+    tool_names: &mut Option<Vec<String>>,
+) -> Result<Option<String>> {
+    if !markdown.contains_key(name) {
+        // 技能根里没有：只有在 PATH 里找到才算工具型技能，否则是名字写错了
+        let tools = tool_names.get_or_insert_with(path_tool_names);
+        if tools.iter().any(|t| t == name) {
+            return Ok(None);
         }
-        Err(_) => match EMBEDDED_SKILLS.iter().find(|(n, _)| *n == name) {
-            Some((_, body)) => Ok(Some(body.trim().to_string())),
-            None => Ok(None), // 工具型技能：只有名字
-        },
     }
+    let path = skill_file_path(skills_root, name);
+    let raw = std::fs::read_to_string(&path).map_err(|e| {
+        Error::Config(format!(
+            "技能 {name} 的正文不可读：{}（{e}）",
+            path.display()
+        ))
+    })?;
+    let body = parse_frontmatter(&raw).1.trim().to_string();
+    if body.is_empty() {
+        return Err(Error::Config(format!(
+            "技能 {name} 的正文为空：{}",
+            path.display()
+        )));
+    }
+    Ok(Some(body))
 }
 
 /// 解析声明的一组技能为「名字 + 渲染形态」，保持声明顺序、去重（决策 172④，票 05）。
@@ -518,6 +436,9 @@ fn body_of(skills_root: &Path, name: &str) -> Result<Option<String>> {
 /// 工具型技能（PATH 可执行文件，无正文）在名字态与全文态下都只渲染名字：它本来就没有
 /// 正文可注入，这是决策 47 的原语义。
 pub fn resolve(skills_root: &Path, declared: &[SkillDecl]) -> Result<Vec<ResolvedSkill>> {
+    // 技能根索引只算一次；PATH 扫描惰性（只有遇到技能根里没有的名字才需要它）
+    let markdown = markdown_skill_paths(skills_root);
+    let mut tool_names: Option<Vec<String>> = None;
     let mut out: Vec<ResolvedSkill> = Vec::new();
     for decl in declared {
         if out.iter().any(|s| s.name == decl.name) {
@@ -525,15 +446,17 @@ pub fn resolve(skills_root: &Path, declared: &[SkillDecl]) -> Result<Vec<Resolve
         }
         let render = match decl.mode {
             SkillMode::Name => SkillRender::Name,
-            SkillMode::Full => match body_of(skills_root, &decl.name)? {
-                // 全文态**也**展开兄弟文件（票 07）：否则全文态下兄弟引用仍是死指针。
-                // 缺失即 fail fast——本函数在启动校验与 prompt 组装两处都用，残缺的技能包
-                // 必须在启动时暴露，而不是让 agent 拿着少一节的正文开工。
-                Some(body) => SkillRender::Full {
-                    body: expand_siblings_strict(skills_root, &decl.name, &body)?,
-                },
-                None => SkillRender::Name, // 工具型技能：只有名字（决策 47）
-            },
+            SkillMode::Full => {
+                match body_of(skills_root, &decl.name, &markdown, &mut tool_names)? {
+                    // 全文态**也**展开兄弟文件（票 07）：否则全文态下兄弟引用仍是死指针。
+                    // 缺失即 fail fast——本函数在启动校验与 prompt 组装两处都用，残缺的技能包
+                    // 必须在启动时暴露，而不是让 agent 拿着少一节的正文开工。
+                    Some(body) => SkillRender::Full {
+                        body: expand_siblings_strict(skills_root, &decl.name, &body)?,
+                    },
+                    None => SkillRender::Name, // 工具型技能：只有名字（决策 47）
+                }
+            }
         };
         out.push(ResolvedSkill {
             name: decl.name.clone(),
@@ -550,8 +473,7 @@ pub fn resolve(skills_root: &Path, declared: &[SkillDecl]) -> Result<Vec<Resolve
 /// - **只收技能根下的 markdown 技能**。工具型技能（PATH 可执行文件）没有正文可加载
 ///   ——列进「按需加载」的目录等于向模型广告它拿不到的能力，且 PATH 下可执行文件动辄
 ///   上千，与本段「省上下文」的初衷相反（决策 47 的工具型技能仍按原语义由阶段声明列出
-///   名字）。内嵌技能同样不收：它正在退场（决策 172①，票 04），目录语义定在**最终形态**
-///   上，票 04 删内嵌时本函数零改动——这正是 expand–contract 想要的收敛点。
+///   名字）。
 /// - 被声明的技能由 [`resolve`] 以全文/名字态渲染，**不再重复出现在目录里**，否则同一
 ///   技能在 prompt 里出现两次。
 /// - `disable-model-invocation: true` 不进目录（选型 D）：上游 27 个技能中 14 个带此键，
@@ -761,24 +683,33 @@ fn resolve_sibling(base: &Path, target: &str) -> SiblingTarget {
 pub fn load_body(skills_root: &Path, name: &str) -> Result<String> {
     // 先确认名字在可用池里，以便区分「没这个技能」与「有这个技能但它是工具型 / 被禁用」
     let known = discover(skills_root).into_iter().find(|s| s.name == name);
-    match known {
-        None => Err(Error::Config(format!("技能不存在：{name}"))),
-        Some(s) if s.frontmatter.disable_model_invocation => Err(Error::Config(format!(
+    let skill = known.ok_or_else(|| Error::Config(format!("技能不存在：{name}")))?;
+    if skill.frontmatter.disable_model_invocation {
+        return Err(Error::Config(format!(
             "技能 {name} 声明了 disable-model-invocation，不允许模型自动调用"
-        ))),
-        Some(s) if matches!(s.source, SkillSource::Tool) => Err(Error::Config(format!(
-            "技能 {name} 是 PATH 工具型技能，没有可注入的正文（它只有名字）"
-        ))),
-        Some(_) => {
-            let body = body_of(skills_root, name)?.ok_or_else(|| {
-                Error::Config(format!(
-                    "技能 {name} 的正文不可读（既无用户文件也无内嵌正文）"
-                ))
-            })?;
-            // 兄弟文件缺失 → 明确报错（票 07），报文带技能名 + 缺失文件名
-            expand_siblings_strict(skills_root, name, &body)
-        }
+        )));
     }
+    // `discover` 已定位到文件，直接读它——不必再走一遍「区分工具型与不存在」的判定
+    let SkillSource::Markdown { path } = &skill.source else {
+        return Err(Error::Config(format!(
+            "技能 {name} 是 PATH 工具型技能，没有可注入的正文（它只有名字）"
+        )));
+    };
+    let raw = std::fs::read_to_string(path).map_err(|e| {
+        Error::Config(format!(
+            "技能 {name} 的正文不可读：{}（{e}）",
+            path.display()
+        ))
+    })?;
+    let body = parse_frontmatter(&raw).1.trim().to_string();
+    if body.is_empty() {
+        return Err(Error::Config(format!(
+            "技能 {name} 的正文为空：{}",
+            path.display()
+        )));
+    }
+    // 兄弟文件缺失 → 明确报错（票 07），报文带技能名 + 缺失文件名
+    expand_siblings_strict(skills_root, name, &body)
 }
 
 #[cfg(test)]
@@ -897,14 +828,35 @@ mod tests {
     #[test]
     fn tool_skill_renders_as_name_only() {
         let home = tmp();
-        // 工具型技能（PATH 可执行文件）不在技能根里，无正文——用未声明的名字验证。
+        // 工具型技能（PATH 可执行文件）不在技能根里，无正文——用真实存在于 PATH 的名字验证。
         // 决策 47 原语义：只列名字（与「名字态」渲染相同，但语义是「无正文可注入」）。
-        let resolved = resolve(
+        let root = root_of(home.path());
+        assert!(
+            skill_names(&root).contains(&"sh".to_string()),
+            "前提失败：PATH 里没有 sh"
+        );
+        let resolved = resolve(&root, &decls(&["sh"])).unwrap();
+        assert_eq!(resolved[0].render, SkillRender::Name);
+    }
+
+    /// 票 04：**名字不存在**不再是「静默降级成名字态」，而是 fail fast。
+    ///
+    /// 内嵌兜底删除后这条区别才显形——之前 `definitely-not-a-knowledge-skill` 会经
+    /// 「非内嵌 → 工具型」的默认分支静默降级，agent 拿到一个没有正文的技能名，
+    /// 而配置方以为它生效了。票 04 显式禁止这条路径。
+    #[test]
+    fn unknown_skill_name_is_config_error_not_silent_name_only() {
+        let home = tmp();
+        let err = resolve(
             &root_of(home.path()),
             &decls(&["definitely-not-a-knowledge-skill"]),
         )
-        .unwrap();
-        assert_eq!(resolved[0].render, SkillRender::Name);
+        .unwrap_err();
+        assert!(matches!(err, Error::Config(_)), "{err:?}");
+        assert!(
+            err.to_string().contains("definitely-not-a-knowledge-skill"),
+            "{err}"
+        );
     }
 
     #[test]
@@ -917,11 +869,10 @@ mod tests {
     #[test]
     fn resolve_dedups_and_preserves_declaration_order() {
         let home = tmp();
-        let resolved = resolve(
-            &root_of(home.path()),
-            &decls(&["to-spec", "grilling", "to-spec"]),
-        )
-        .unwrap();
+        let root = root_of(home.path());
+        write_skill(&root, "to-spec", "综合成规格");
+        write_skill(&root, "grilling", "拷问协议");
+        let resolved = resolve(&root, &decls(&["to-spec", "grilling", "to-spec"])).unwrap();
         assert_eq!(
             resolved.iter().map(|s| s.name.as_str()).collect::<Vec<_>>(),
             vec!["to-spec", "grilling"]

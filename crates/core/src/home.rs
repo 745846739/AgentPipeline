@@ -98,8 +98,7 @@ impl Home {
     /// 技能根（决策 170 / 172）：默认 `{root}/skills`，`[skills] dir` 设置时整体替换。
     ///
     /// 返回的是技能根**本身**（其下直接是 `{name}/SKILL.md`）——调用方不再拼
-    /// `skills` 目录名。内嵌技能正文在二进制里
-    /// （[`crate::agent::skills::EMBEDDED_SKILLS`]），此目录用于用户覆盖与自定义。
+    /// `skills` 目录名。内嵌技能已随决策 172① 退场（票 04），这里是技能的唯一来源。
     pub fn skills_dir(&self) -> PathBuf {
         self.skills_override
             .clone()
