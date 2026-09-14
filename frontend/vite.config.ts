@@ -2,9 +2,9 @@ import { defineConfig } from 'vitest/config';
 import { svelte } from '@sveltejs/vite-plugin-svelte';
 
 // 决策 16：Vite + Svelte 5（runes）+ TS。无 SvelteKit。
-// 代理目标默认本机 axum 8787；该端口被占用时用 `VITE_API_PROXY_TARGET` 覆盖
+// 代理目标默认本机 axum 8788；该端口被占用时用 `VITE_API_PROXY_TARGET` 覆盖
 // （端口必须是后端 `serve --port` 实际绑定的那个）。
-const apiTarget = process.env.VITE_API_PROXY_TARGET ?? 'http://127.0.0.1:8787';
+const apiTarget = process.env.VITE_API_PROXY_TARGET ?? 'http://127.0.0.1:8788';
 
 export default defineConfig({
   plugins: [svelte()],

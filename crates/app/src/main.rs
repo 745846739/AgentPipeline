@@ -39,7 +39,7 @@ fn print_help() {
     println!("  --host <IP>                覆盖 [server] host（局域网访问用 0.0.0.0）");
     println!("  --allowed-origin <ORIGIN>  额外放行的跨源写 origin，可重复（决策 157）：");
     println!("                             局域网浏览器要操作写接口，需放行其页面 origin，");
-    println!("                             如 --allowed-origin http://192.168.1.10:8787");
+    println!("                             如 --allowed-origin http://192.168.1.10:8788");
 }
 
 /// serve 参数解析（决策 157）：`--port` / `--host` 覆盖配置文件；`--allowed-origin`

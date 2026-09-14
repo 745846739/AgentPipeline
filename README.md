@@ -18,7 +18,7 @@ make run      # 等价于 build + 启动
 ```
 
 产物是单二进制 `./target/release/agent-pipeline`：前端 dist 在编译期内嵌（决策 155），
-axum 同源托管 UI 与 API，浏览器打开 `http://127.0.0.1:8787` 即用（端口见配置 `[server]`，
+axum 同源托管 UI 与 API，浏览器打开 `http://127.0.0.1:8788` 即用（端口见配置 `[server]`，
 `--port` 可覆盖）。手动等价：`cd frontend && npm ci && npm run build && cargo build --release`。
 
 - 不装 Node 也能 `cargo build --release`：API 照常可用，访问 `/` 会得到「前端未构建」提示页（决策 155）。
@@ -66,11 +66,11 @@ AGENTPIPELINE_LAN=1 make desktop-run
 若要让**另一台电脑的浏览器**直接打开本机页面（页面 origin 与 API 不同源），才需要显式放行该 origin：
 
 ```bash
-./target/release/agent-pipeline serve --host 0.0.0.0 --allowed-origin http://192.168.1.10:8787
+./target/release/agent-pipeline serve --host 0.0.0.0 --allowed-origin http://192.168.1.10:8788
 ```
 
 `--allowed-origin` 可重复（配置文件等价写法 `[server] allowed_origins = [...]`，非法值启动即报错）；
-`127.0.0.1` / `localhost` 恒放行，前缀伪装（`...:8787.evil.com`）始终被拦。
+`127.0.0.1` / `localhost` 恒放行，前缀伪装（`...:8788.evil.com`）始终被拦。
 注意：服务能触发真实 LLM 调用并读取全部会话，暴露到局域网前请自行评估网段安全（更稳妥可用 SSH 隧道 / Tailscale）。
 
 ## 质量闸门

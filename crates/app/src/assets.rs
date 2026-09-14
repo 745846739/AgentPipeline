@@ -146,7 +146,7 @@ pub const MISSING_FRONTEND_HTML: &str = r#"<!doctype html>
     <pre><code>make build          # 前端构建 + 内嵌 + release 构建
 make run            # 构建并直接启动</code></pre>
     <p>手动等价：<code>cd frontend &amp;&amp; npm ci &amp;&amp; npm run build</code> 后重新 <code>cargo build --release</code>。</p>
-    <p>前端热更开发：<code>cd frontend &amp;&amp; npm run dev</code>（vite 把 API 代理到本机 axum，默认 127.0.0.1:8787）。</p>
+    <p>前端热更开发：<code>cd frontend &amp;&amp; npm run dev</code>（vite 把 API 代理到本机 axum，默认 127.0.0.1:8788）。</p>
   </body>
 </html>
 "#;

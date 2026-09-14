@@ -157,7 +157,7 @@ pub struct ServerConfig {
 impl Default for ServerConfig {
     fn default() -> Self {
         ServerConfig {
-            port: 8787,
+            port: 8788,
             host: "127.0.0.1".to_string(),
             allowed_origins: Vec::new(),
         }
@@ -618,6 +618,15 @@ mod tests {
         assert_eq!(s.conflict_overlap_threshold, 0);
         assert_eq!(s.max_concurrent_tasks, 5);
         assert!(!s.allow_dirty_worktree_merge);
+    }
+
+    /// 默认端口是「唯一事实源」（决策 171）：缺省绑定与跨源白名单的两个本机 origin
+    /// 都由它派生，改动必须在此显式反映，否则局域网 / 桌面壳的放行集合会静默漂移。
+    #[test]
+    fn default_server_port_is_8788() {
+        let server = ServerConfig::default();
+        assert_eq!(server.port, 8788);
+        assert_eq!(server.host, "127.0.0.1");
     }
 
     #[test]

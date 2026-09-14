@@ -799,7 +799,7 @@ def validate_stage_config(cfg: StageAgentConfig, baseline: SystemBaseline, provi
 
 [server]
 host = "127.0.0.1"
-port = 8787
+port = 8788
 
 [pipeline]
 validate_retry_max = 3
