@@ -568,6 +568,43 @@ pub fn catalogue(skills_root: &Path, declared: &[String]) -> Vec<ResolvedSkill> 
         .collect()
 }
 
+/// 按名加载一个技能的正文（`Skill` 工具与名字态渲染的共用取数口，决策 172③，票 06）。
+///
+/// 与 [`resolve`] 的区别在**用途与失败语义**：
+/// - `resolve` 在 prompt 组装路径上，声明过的名字必然已过启动校验，读不到就是坏配置；
+/// - 本函数在**工具调用**路径上，名字来自模型（可能写错、可能指向未声明的技能），
+///   因此返回 `Result` 让调用方把「找不到」变成给模型的错误文本，而非 fail fast——
+///   模型据此自我纠正（票 06 的核心行为）。
+///
+/// 工具型技能（PATH 可执行文件）没有正文，报错时**说清是为什么**：只说「找不到」会让
+/// 模型反复重试同一个名字。
+///
+/// **`disable-model-invocation: true` 的技能不加载**（票 06 / 选型 D）：该键的语义就是
+/// 「别让模型自动调用我」。它与 `catalogue` 的过滤是同一条规则的两面——目录不广告它、
+/// 工具也不给它开后门，否则模型从别处看到名字就能绕过这个开关。
+///
+/// **信任态是「声明」的属性而非技能文件的属性**（决策 172④⑥）：未信任技能**可以**被
+/// 本工具加载（这正是 `mode: "name"` 的用法——不进 system prompt、按需拉取，见 spec §6），
+/// 信任门约束的是**全文注入**那条路径，在 [`crate::config::parse_skill_decls`] 里把关。
+pub fn load_body(skills_root: &Path, name: &str) -> Result<String> {
+    // 先确认名字在可用池里，以便区分「没这个技能」与「有这个技能但它是工具型 / 被禁用」
+    let known = discover(skills_root).into_iter().find(|s| s.name == name);
+    match known {
+        None => Err(Error::Config(format!("技能不存在：{name}"))),
+        Some(s) if s.frontmatter.disable_model_invocation => Err(Error::Config(format!(
+            "技能 {name} 声明了 disable-model-invocation，不允许模型自动调用"
+        ))),
+        Some(s) if matches!(s.source, SkillSource::Tool) => Err(Error::Config(format!(
+            "技能 {name} 是 PATH 工具型技能，没有可注入的正文（它只有名字）"
+        ))),
+        Some(_) => body_of(skills_root, name)?.ok_or_else(|| {
+            Error::Config(format!(
+                "技能 {name} 的正文不可读（既无用户文件也无内嵌正文）"
+            ))
+        }),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -841,6 +878,80 @@ mod tests {
         assert_eq!(resolved.len(), 2);
         assert!(full_body(&resolved[0]).contains("设计树"));
         assert!(full_body(&resolved[1]).contains("验收标准"));
+    }
+
+    // ── 票 06（决策 172③）：按需加载正文（`Skill` 工具取数口） ──
+
+    #[test]
+    fn load_body_reads_user_skill() {
+        let home = tmp();
+        write_skill(
+            &root_of(home.path()),
+            "grill",
+            "---\nname: grill\ndescription: x\n---\n\n拷问协议的正文",
+        );
+        let body = load_body(&root_of(home.path()), "grill").unwrap();
+        assert_eq!(body, "拷问协议的正文", "frontmatter 须剥掉");
+    }
+
+    /// 未声明的技能也能加载——这是渐进披露的自动触发路径（票 06）。
+    #[test]
+    fn load_body_works_for_undeclared_skill() {
+        let home = tmp();
+        write_skill(&root_of(home.path()), "undeclared", "池子里的技能");
+        assert_eq!(
+            load_body(&root_of(home.path()), "undeclared").unwrap(),
+            "池子里的技能"
+        );
+    }
+
+    /// **未知技能名返回 `Err`（不是 panic、不是空串）**，由 `Skill` 工具转成给模型的
+    /// 错误文本——模型据此自我纠正，而不是让节点 fail fast（票 06）。
+    #[test]
+    fn load_body_unknown_name_is_error_with_name() {
+        let home = tmp();
+        let err = load_body(&root_of(home.path()), "no-such-skill").unwrap_err();
+        assert!(matches!(err, Error::Config(_)), "{err:?}");
+        assert!(err.to_string().contains("no-such-skill"), "{err}");
+    }
+
+    /// 工具型技能没有正文可注入——报错要说清原因，否则模型会反复重试同一个名字。
+    #[test]
+    fn load_body_rejects_tool_type_skill_with_reason() {
+        let home = tmp();
+        assert!(
+            skill_names(&root_of(home.path())).contains(&"sh".to_string()),
+            "前提失败：PATH 里没有 sh"
+        );
+        let err = load_body(&root_of(home.path()), "sh").unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("工具型"), "须说明是工具型技能：{msg}");
+    }
+
+    /// `disable-model-invocation: true` 的技能不允许模型自动调用（选型 D）。
+    ///
+    /// 与 `catalogue` 的过滤是同一条规则的两面：目录不广告它，工具也不给它开后门。
+    #[test]
+    fn load_body_refuses_disable_model_invocation_skill() {
+        let home = tmp();
+        write_skill(
+            &root_of(home.path()),
+            "manual-only",
+            "---\ndescription: 手动触发\ndisable-model-invocation: true\n---\n\n正文",
+        );
+        let err = load_body(&root_of(home.path()), "manual-only").unwrap_err();
+        assert!(
+            err.to_string().contains("disable-model-invocation"),
+            "{err}"
+        );
+    }
+
+    /// 内嵌技能的正文仍可加载（用户目录无同名文件时的兜底，票 04 前有效）。
+    #[test]
+    fn load_body_falls_back_to_embedded() {
+        let home = tmp();
+        let body = load_body(&root_of(home.path()), "grilling").unwrap();
+        assert!(body.contains("frontier"), "{body}");
     }
 
     #[test]

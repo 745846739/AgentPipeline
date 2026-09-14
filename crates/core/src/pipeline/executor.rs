@@ -32,7 +32,7 @@ use crate::agent::tools::{
 };
 use crate::agent::{
     effective_skills, effective_tools, file_policy::FileToolPolicy, submit_metadata_tool,
-    BUILTIN_TOOLS,
+    BUILTIN_TOOLS, SKILL_TOOL,
 };
 use crate::config::Settings;
 use crate::git::Git;
@@ -1144,7 +1144,7 @@ impl Executor {
                 system_prompt: system_prompt.clone(),
                 user_prompt: user_prompt.clone(),
                 messages: messages.clone(),
-                tools: tool_defs(kind, &declared_tools),
+                tools: tool_defs(kind, &declared_tools, &skills),
                 temperature: stage_cfg.as_ref().and_then(|c| c.temperature),
                 max_tokens: stage_cfg.as_ref().and_then(|c| c.max_tokens),
                 // 任务级 provider 覆盖（决策 105）；阶段配置 / 系统默认由生产适配器解析
@@ -3112,7 +3112,21 @@ impl AgentNodeKind {
 
 /// 有效工具定义：基线并集（G6）内且 v1 已实现的内置工具 + `submit_metadata`
 /// schema 工具（决策 38：与校验同源，不可移除）。声明了未实现的工具只告警不阻塞。
-fn tool_defs(kind: AgentNodeKind, declared: &[String]) -> Vec<ToolDef> {
+///
+/// `Skill`（决策 172③，票 06）**不进 [`MANDATORY_TOOLS`]**：它由阶段声明启用。但名字态与
+/// 目录态技能的存在意义就是「正文由 `Skill` 工具按需拉取」——若阶段声明了任一非全文态
+/// 技能却没声明 `Skill`，那批技能就是断腿的指针。因此这里给一条**自动放行**：只要有技能
+/// 不处于全文态，就补上 `Skill` 工具定义，不要求用户在两处各配一遍。
+fn tool_defs(
+    kind: AgentNodeKind,
+    declared: &[String],
+    skills: &[crate::agent::skills::ResolvedSkill],
+) -> Vec<ToolDef> {
+    use crate::agent::skills::SkillRender;
+
+    let needs_skill_tool = skills
+        .iter()
+        .any(|s| matches!(s.render, SkillRender::Name | SkillRender::Catalogue { .. }));
     let mut defs: Vec<ToolDef> = Vec::new();
     for name in effective_tools(declared) {
         if name == "submit_metadata" {
@@ -3127,6 +3141,10 @@ fn tool_defs(kind: AgentNodeKind, declared: &[String]) -> Vec<ToolDef> {
             description: String::new(),
             parameters: serde_json::json!({"type": "object"}),
         });
+    }
+    // 有名字态 / 目录态技能 → 自动带上 `Skill`（渐进披露的按需拉取入口）
+    if needs_skill_tool && !defs.iter().any(|d| d.name == SKILL_TOOL) {
+        defs.push(skill_tool_def());
     }
     let schema_tool: ToolDef = match kind {
         AgentNodeKind::ValidateInput => {
@@ -3156,6 +3174,29 @@ fn tool_defs(kind: AgentNodeKind, declared: &[String]) -> Vec<ToolDef> {
     };
     defs.push(schema_tool);
     defs
+}
+
+/// `Skill` 工具的 tool 定义（决策 172③，票 06）。
+///
+/// 描述里点明「用技能目录里列出的名字」——渐进披露的闭环：模型从目录态看到可用技能，
+/// 再凭名字来这里取正文。
+fn skill_tool_def() -> ToolDef {
+    ToolDef {
+        name: SKILL_TOOL.to_string(),
+        description: "按名字加载一个技能的正文（技能目录里列出的名字）。\
+                      上游技能正文里的 `Call the Skill tool` 说的就是这个工具。"
+            .to_string(),
+        parameters: serde_json::json!({
+            "type": "object",
+            "properties": {
+                "name": {
+                    "type": "string",
+                    "description": "技能名（见 system prompt 的技能目录）"
+                }
+            },
+            "required": ["name"]
+        }),
+    }
 }
 
 // ─────────────────────── prompt 组装辅助（票 12：§10.3 / G3 / G6 / G12）───────────────────────

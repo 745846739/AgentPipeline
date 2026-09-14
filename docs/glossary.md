@@ -21,7 +21,7 @@
 |------|------|
 | **Agent** | 一个 LLM 调用单元，有独立的 system prompt、tool 集合和对话上下文。每个 node 执行时创建一个新的 agent 调用 |
 | **Provider** | LLM 服务提供者（DeepSeek、OpenAI、Anthropic 等）。按阶段可配置不同 provider |
-| **Tool** | agent 可调用的函数。内置 7 个：`write_file`（写文件）、`edit_file`（局部编辑）、`read_file`（读文件）、`delete_file`（删文件）、`list_dir`（列目录）、`run_command`（执行 shell 命令）、`submit_metadata`（提交结构化元数据）。扩展工具：`spawn_sub_agent`（默认关闭） |
+| **Tool** | agent 可调用的函数。内置 8 个：`write_file`（写文件）、`edit_file`（局部编辑）、`read_file`（读文件）、`delete_file`（删文件）、`list_dir`（列目录）、`run_command`（执行 shell 命令）、`submit_metadata`（提交结构化元数据）、`Skill`（按名加载技能正文，决策 172③）。扩展工具：`spawn_sub_agent`（默认关闭）。`Skill` 与其余 7 个的区别是它**不进基线强制集**——由阶段声明启用，且当该节点存在名字态 / 目录态技能时自动放行 |
 | **Context** | agent 的对话上下文（messages 列表）。有四级压缩机制控制长度 |
 | **ContextManager** | 管理 agent 对话上下文的组件，负责 token 计数、摘要压缩、硬限制截断 |
 | **validator_cross_check** | 异族复判伪阶段（决策 134）：`cross_family_judge = true` 时，agent 型 validate_output 首判不合格即由它用不同 vendor 的强档模型复判一次；复判合格 → 分歧上交（决策 135），复判不合格 → 维持原路径打回。独立 run/会话行（决策 100 模式） |

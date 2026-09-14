@@ -170,8 +170,27 @@ pub struct ToolDef {
     pub parameters: serde_json::Value,
 }
 
-/// 7 个内置工具（决策 45）。`spawn_sub_agent` 是默认关闭的扩展工具。
-pub const BUILTIN_TOOLS: [&str; 7] = [
+/// 8 个内置工具（决策 45 / 172③）。`spawn_sub_agent` 是默认关闭的扩展工具。
+///
+/// `Skill`（决策 172③，票 06）与上游同名是**功能性决定而非命名偏好**：上游技能的正文里
+/// 写着 `Call the Skill tool with "grilling"`，工具同名使这些正文**无需改写即可执行**。
+pub const BUILTIN_TOOLS: [&str; 8] = [
+    "write_file",
+    "edit_file",
+    "read_file",
+    "delete_file",
+    "list_dir",
+    "run_command",
+    "submit_metadata",
+    "Skill",
+];
+
+/// 系统最小基线里不可移除的工具（§10.6.2）。
+///
+/// 就是 [`BUILTIN_TOOLS`] 去掉 `Skill`：`Skill` 是**能力增量**，由阶段声明启用
+/// （决策 172③ 明确它不进 `MANDATORY_TOOLS`）——渐进披露下大量技能在池子里，
+/// 不该无条件把「按名拉取技能」这个动作塞给每个节点。
+pub const MANDATORY_TOOLS: [&str; 7] = [
     "write_file",
     "edit_file",
     "read_file",
@@ -181,8 +200,8 @@ pub const BUILTIN_TOOLS: [&str; 7] = [
     "submit_metadata",
 ];
 
-/// 系统最小基线里不可移除的工具（决策 10.6.2）。
-pub const MANDATORY_TOOLS: [&str; 7] = BUILTIN_TOOLS;
+/// `Skill` 工具名（决策 172③）。与上游同名，使上游技能正文无需改写即可执行。
+pub const SKILL_TOOL: &str = "Skill";
 
 /// 从阶段的 serde 结构体派生 `submit_metadata` 的 tool 定义（决策 38：schema 与校验同源）。
 pub fn submit_metadata_tool<T: JsonSchema>(description: impl Into<String>) -> ToolDef {
@@ -279,9 +298,22 @@ mod tests {
     }
 
     #[test]
-    fn builtin_tool_set_matches_decision_45() {
-        assert_eq!(BUILTIN_TOOLS.len(), 7);
+    fn builtin_tool_set_matches_decision_45_and_172() {
+        assert_eq!(BUILTIN_TOOLS.len(), 8, "决策 172③：7 → 8（+ Skill）");
         assert!(BUILTIN_TOOLS.contains(&"submit_metadata"));
+        assert!(BUILTIN_TOOLS.contains(&SKILL_TOOL));
         assert!(!BUILTIN_TOOLS.contains(&"spawn_sub_agent"));
+    }
+
+    /// 决策 172③：`Skill` **不进** `MANDATORY_TOOLS`——它由阶段声明启用，
+    /// 不是每个节点都该拿到的能力。
+    #[test]
+    fn skill_tool_is_not_mandatory() {
+        assert_eq!(MANDATORY_TOOLS.len(), 7);
+        assert!(
+            !MANDATORY_TOOLS.contains(&SKILL_TOOL),
+            "Skill 不得进入基线强制工具"
+        );
+        assert!(MANDATORY_TOOLS.contains(&"submit_metadata"));
     }
 }

@@ -724,6 +724,12 @@ interface SystemBaseline {
 
 **节点级技能：** 阶段级 `skills_json` 无法区分节点，而同一阶段的不同节点职责可能互斥（architect-design 的 `validate_input` 提问、`execute` 写 `design.md`、`validate_output` 校验）。因此技能也可在 `node_overrides_json[node].skills` 声明——见 §10.6.3。有效集 = `mandatory_skills ∪ 阶段级 skills_json ∪ 节点级 skills`（**只增不减**，同名技能保留首次出现形态：阶段级优先）。
 
+**`Skill` 工具（决策 172③）**——按名加载技能正文，**作为 tool result 进 `messages`**，不进 system prompt（因此不改 `prompt_template_hash`）。工具名与上游同名是功能性决定：上游技能的正文里写着 `Call the Skill tool with "grilling"`，同名使这些正文**无需改写即可执行**。三条边界：
+
+- **由阶段声明启用**，不在 `MANDATORY_TOOLS` 里；但当一个节点存在名字态 / 目录态技能时自动放行（否则那批技能就是断腿的指针）。
+- **未知技能名返回错误文本而非 `Err`**：`Err` 会被算作工具失败并累计 `tool_retry_max`，模型写错一个名字就能打挂整个节点；返回文本让模型自行纠正。
+- **读技能根（loader 侧），不经 `FileToolPolicy`**：技能根与 `{home}/data/`（provider 密钥明文存储，决策 112）同父，放宽为 agent 可读等于交出密钥。`disable-model-invocation: true` 的技能不加载（目录不广告它，工具也不给它开后门）。
+
 **约束语义：** 阶段配置只能让 agent **能力更强或更聚焦**，不能让 agent **绕过系统保障**。例如阶段可以增加工具，但不能移除 `submit_metadata`；可以选择白名单内的 provider，但不能自选白名单外的。
 
 #### 10.6.3 阶段可配置项

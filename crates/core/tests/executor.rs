@@ -1334,6 +1334,100 @@ async fn legacy_string_array_declarations_still_inject_full_body() {
     );
 }
 
+// ──────────────────── `Skill` 工具（票 06 / 决策 172③）────────────────────
+
+/// 模型请求 `Skill` → 工具返回正文 → **下一轮的 `messages` 里出现该正文**。
+///
+/// 这是票 06 的核心可观察行为：正文走 `messages`（tool result）而非 system prompt。
+#[tokio::test]
+async fn skill_tool_injects_body_into_next_round_messages() {
+    let external = tempfile::tempdir().unwrap();
+    write_user_skill(external.path(), "grill", "拷问协议", "把设计树走完再动手");
+    let ctx = setup_with_skills_dir("true", Settings::default(), external.path()).await;
+
+    // validate_input 声明为**名字态**：正文不进 system prompt，只能靠 `Skill` 工具取
+    ctx.store
+        .upsert_stage_config(&agentpipeline_core::types::StageConfig {
+            stage: "architect-design".into(),
+            node_overrides_json: Some(serde_json::json!({
+                "validate_input": {"skills": [
+                    {"name": "grill", "mode": "name", "trusted": true}
+                ]}
+            })),
+            updated_at: ctx.store.now(),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+
+    let mut script = Script::new();
+    // 第一轮：模型请求加载技能；第二轮：正常走完（design_scripts 补齐其余节点）
+    script
+        .for_node(Stage::ArchitectDesign, Node::ValidateInput)
+        .push(testkit::Step::Tool {
+            name: "Skill".into(),
+            arguments: serde_json::json!({"name": "grill"}),
+        });
+    design_scripts(&mut script);
+    // design_scripts 会把 validate_input 的 submit 追加在 Skill 调用之后——顺序符合预期
+    implementation_scripts(&mut script, "t-skill-tool");
+    ctx.agent.set_script(script);
+    testkit::seed_task(&ctx.store, "t-skill-tool", "p1")
+        .await
+        .unwrap();
+    admit(&ctx, "t-skill-tool").await;
+    ctx.executor.run("t-skill-tool").await.unwrap();
+
+    let requests = ctx.agent.request_log();
+    let vi: Vec<_> = requests
+        .iter()
+        .filter(|r| r.stage == Stage::ArchitectDesign && r.node == Node::ValidateInput)
+        .collect();
+    assert!(
+        vi.len() >= 2,
+        "应有第二轮请求（工具结果回灌）：{}",
+        vi.len()
+    );
+
+    // 第一轮：system prompt 只有名字（名字态），正文不在里面
+    assert!(
+        vi[0].system_prompt.contains("- grill"),
+        "{}",
+        vi[0].system_prompt
+    );
+    assert!(
+        !vi[0].system_prompt.contains("把设计树走完再动手"),
+        "名字态正文不得进 system prompt：{}",
+        vi[0].system_prompt
+    );
+
+    // 第二轮：正文已作为 tool result 进入 messages
+    let second = vi[1];
+    let tool_results: Vec<&str> = second
+        .messages
+        .iter()
+        .filter(|m| m.role == agentpipeline_core::agent::Role::Tool)
+        .filter_map(|m| m.content.as_deref())
+        .collect();
+    assert!(
+        tool_results
+            .iter()
+            .any(|c| c.contains("把设计树走完再动手")),
+        "下一轮 messages 里应出现技能正文：{tool_results:?}"
+    );
+    // 正文仍不进 system prompt
+    assert!(
+        !second.system_prompt.contains("把设计树走完再动手"),
+        "{}",
+        second.system_prompt
+    );
+    // 正文不进 system prompt ⇒ prompt_template_hash 不变（票 06 的显式要求）
+    assert_eq!(
+        vi[0].system_prompt, second.system_prompt,
+        "调用前后 system prompt 必须逐字相同"
+    );
+}
+
 // ──────────────────── 闸门失败 → test 复检 → 重跑闸门（票 15 / 决策 85 / 109）────────────────────
 
 #[tokio::test]

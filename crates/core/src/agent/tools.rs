@@ -219,6 +219,7 @@ impl ToolExecutor {
             "list_dir" => self.list_dir(call, ctx).await?,
             "run_command" => self.run_command(call, ctx).await?,
             "submit_metadata" => self.submit_metadata(call)?,
+            "Skill" => self.skill(call)?,
             other => return Err(Error::Validation(format!("未知工具：{other}"))),
         };
         self.apply_l2_offload(call, ctx, outcome)
@@ -377,6 +378,33 @@ impl ToolExecutor {
             content: "{\"success\":true}".to_string(),
             metadata: Some(value),
         })
+    }
+
+    /// `Skill` 工具（决策 172③，票 06）：按名取技能正文，作为 **tool result** 进 `messages`。
+    ///
+    /// **不走 `Err` 通道**——未知技能名返回一段说明文本而非 `Error`。理由在 agent loop 的
+    /// 分层里：`Err` 会被算作工具失败并累计到 `tool_retry_max`（决策 33），模型写错一个技能名
+    /// 就可能把整个节点打挂；而票 06 明确要求这种情况**让模型自行纠正**。返回文本既进上下文
+    /// 又不触发失败计数，模型下一轮换个名字即可。
+    ///
+    /// 读的是**技能根**（loader 侧），不经 [`FileToolPolicy`]——技能根与 `{home}/data/`
+    /// （provider 密钥明文存储，决策 112）同父，放宽为 agent 可读等于交出密钥。
+    fn skill(&self, call: &ToolCall) -> Result<ToolOutcome> {
+        let args: serde_json::Value = serde_json::from_str(&call.arguments)
+            .map_err(|e| Error::Validation(format!("Skill 参数解析失败：{e}")))?;
+        let name = args.get("name").and_then(|v| v.as_str()).unwrap_or("");
+        if name.trim().is_empty() {
+            return Ok(ToolOutcome::ok(
+                "Skill 工具需要 {name} 参数（技能名）。请用技能目录里列出的名字重试。",
+            ));
+        }
+        match crate::agent::skills::load_body(&self.home.skills_dir(), name) {
+            Ok(body) => Ok(ToolOutcome::ok(body)),
+            Err(e) => Ok(ToolOutcome::ok(format!(
+                "无法加载技能 {name}：{e}。\
+                 请从技能目录里选一个名字重试；若该技能尚未安装，请先安装再调用。"
+            ))),
+        }
     }
 
     async fn run_command(&self, call: &ToolCall, ctx: &ToolCallContext) -> Result<ToolOutcome> {
@@ -1190,6 +1218,93 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(out.metadata.unwrap()["readiness"], true);
+    }
+
+    // ── 票 06（决策 172③）：`Skill` 工具 ──
+
+    /// 在技能根（`{home}/skills`）下写一个用户技能。
+    fn write_home_skill(s: &Setup, name: &str, content: &str) {
+        let dir = s.home.skills_dir().join(name);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("SKILL.md"), content).unwrap();
+    }
+
+    #[tokio::test]
+    async fn skill_tool_returns_skill_body() {
+        let s = setup(Stage::ArchitectDesign);
+        write_home_skill(&s, "grill", "拷问协议：把设计树走完");
+        let out = s
+            .executor
+            .execute(&call("Skill", serde_json::json!({"name": "grill"})), &s.ctx)
+            .await
+            .unwrap();
+        assert_eq!(out.content, "拷问协议：把设计树走完");
+        assert!(out.metadata.is_none(), "Skill 不是 submit_metadata");
+    }
+
+    /// 未知技能名**不是工具失败**——返回说明文本让模型自行纠正（票 06）。
+    ///
+    /// 若走 `Err`，agent loop 会把它算进 `tool_retry_max`（决策 33），模型写错一个名字
+    /// 就可能把整个节点打挂。
+    #[tokio::test]
+    async fn skill_tool_unknown_name_returns_text_not_error() {
+        let s = setup(Stage::ArchitectDesign);
+        let out = s
+            .executor
+            .execute(&call("Skill", serde_json::json!({"name": "nope"})), &s.ctx)
+            .await
+            .expect("未知技能名不得走 Err 通道");
+        assert!(out.content.contains("nope"), "{}", out.content);
+        assert!(out.content.contains("无法加载"), "{}", out.content);
+    }
+
+    /// 缺 `name` 参数同样返回可读文本，而不是 `Err`。
+    #[tokio::test]
+    async fn skill_tool_missing_name_returns_text() {
+        let s = setup(Stage::ArchitectDesign);
+        let out = s
+            .executor
+            .execute(&call("Skill", serde_json::json!({})), &s.ctx)
+            .await
+            .expect("缺参不得走 Err 通道");
+        assert!(out.content.contains("name"), "{}", out.content);
+    }
+
+    /// 技能根**不经** `FileToolPolicy`——`read_file` 读技能根会被拒，`Skill` 工具能读。
+    ///
+    /// 这条同时钉住决策 172 的安全边界：技能根与 `{home}/data/`（provider 密钥明文存储，
+    /// 决策 112）同父，**不得**被放宽为 agent 可读；兄弟文件走加载器展开而非放宽文件策略。
+    #[tokio::test]
+    async fn skill_tool_reads_skill_root_that_file_policy_refuses() {
+        let s = setup(Stage::ArchitectDesign);
+        write_home_skill(&s, "secret-ish", "技能正文");
+        let skill_path = s.home.skills_dir().join("secret-ish").join("SKILL.md");
+
+        // 文件工具被策略挡住（技能根不在 worktree / 任务目录内）
+        assert!(
+            s.executor
+                .execute(
+                    &call(
+                        "read_file",
+                        serde_json::json!({"path": skill_path.display().to_string()})
+                    ),
+                    &s.ctx,
+                )
+                .await
+                .is_err(),
+            "read_file 不得读技能根"
+        );
+
+        // 而 Skill 工具（loader 侧）能取到正文
+        let out = s
+            .executor
+            .execute(
+                &call("Skill", serde_json::json!({"name": "secret-ish"})),
+                &s.ctx,
+            )
+            .await
+            .unwrap();
+        assert_eq!(out.content, "技能正文");
     }
 
     #[tokio::test]
