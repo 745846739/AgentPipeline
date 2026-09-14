@@ -8,14 +8,14 @@
 
 **Blocked by:** None (can start immediately)
 
-**Status:** ready-for-agent
+**Status:** done
 
-- [ ] `next_attempt` 加 `agent_type = 'main'`（或等价）过滤，使 `attempt` 只统计真实 agent 尝试
-- [ ] 子代理（`agent_type = "subagent"`，票 08）同样不计入父节点的 `attempt`
-- [ ] 受影响指标的语义复核：重试率（`attempt > 1`）与一次通过率（`attempt == 1`）——
+- [x] `next_attempt` 加 `agent_type = 'main'`（或等价）过滤，使 `attempt` 只统计真实 agent 尝试
+- [x] 子代理（`agent_type = "subagent"`，票 08）同样不计入父节点的 `attempt`
+- [x] 受影响指标的语义复核：重试率（`attempt > 1`）与一次通过率（`attempt == 1`）——
       修正后数值会变，确认这是期望的（伪阶段不该被算成一次重试）
-- [ ] 用例：伪阶段触发后 `attempt` 不虚增 / 重试率指标反映真实重试次数
-- [ ] 既有测试全绿（若有测试依赖旧的虚增数值，一并修正并说明）
+- [x] 用例：伪阶段触发后 `attempt` 不虚增 / 重试率指标反映真实重试次数
+- [x] 既有测试全绿（若有测试依赖旧的虚增数值，一并修正并说明）
 
 **Notes（实现提示）:**
 - 修正方向明确（过滤 `agent_type`），但须核对所有读 `attempt` 的地方：run 行、会话行、

@@ -12,18 +12,18 @@ CI 全绿——迁移完的测试用用户目录 fixture，未迁移的仍用内
 
 **Blocked by:** None (can start immediately)
 
-**Status:** ready-for-agent
+**Status:** done
 
-- [ ] `skills.rs` 的 21 处：改为临时 home + `write_skill()` 辅助构造知识型技能，断言三类发现 /
+- [x] `skills.rs` 的 21 处：改为临时 home + `write_skill()` 辅助构造知识型技能，断言三类发现 /
       同名覆盖 / 去重保序 / 两种渲染等**行为**不变（断言对象从内嵌常量换为用户文件）
-- [ ] `config.rs` 7 处：节点级技能声明的校验用例改用用户目录技能，保留「定位到节点」的报错断言
-- [ ] `prompts.rs` 6 处：段落顺序、`### {name}` / `- {name}` 两种渲染、`prompt_template_hash`
+- [x] `config.rs` 7 处：节点级技能声明的校验用例改用用户目录技能，保留「定位到节点」的报错断言
+- [x] `prompts.rs` 6 处：段落顺序、`### {name}` / `- {name}` 两种渲染、`prompt_template_hash`
       对正文敏感的用例改用用户技能
-- [ ] `tests/executor.rs` 13 处：节点级技能注入（同阶段两节点各含对方没有的正文）、阶段级与节点级
+- [x] `tests/executor.rs` 13 处：节点级技能注入（同阶段两节点各含对方没有的正文）、阶段级与节点级
       并集——改用真实用户目录技能，保留「同阶段两节点注入不同正文」的核心断言
-- [ ] `api_contract.rs` 3 处：`PUT /stage-configs` 的技能字段用例改用用户目录技能
-- [ ] 迁移后**内嵌技能相关断言的意图一条不少**（用 grep 对照迁移前后断言清单）
-- [ ] 全仓测试保持通过（`cargo test --workspace`）
+- [x] `api_contract.rs` 3 处：`PUT /stage-configs` 的技能字段用例改用用户目录技能
+- [x] 迁移后**内嵌技能相关断言的意图一条不少**（用 grep 对照迁移前后断言清单）
+- [x] 全仓测试保持通过（`cargo test --workspace`）
 
 **Notes（实现提示）:**
 - 不新建测试辅助层：`skills.rs` 的 `write_skill(root, name, content)` 已存在，提升为跨文件可复用的

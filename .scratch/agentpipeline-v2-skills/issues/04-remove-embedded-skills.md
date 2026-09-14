@@ -8,15 +8,15 @@
 
 **Blocked by:** 03（契约迁移——迁移未落地就删内嵌，那批按名字钉住 `grilling` / `to-spec` 的断言会同时变红，中间无绿灯）
 
-**Status:** ready-for-agent
+**Status:** done
 
-- [ ] `EMBEDDED_SKILLS` 常量与两个改写正文（`GRILLING_BODY` / `TO_SPEC_BODY`）删除
-- [ ] `SkillSource::Embedded` 变体删除；`discover` / `body_of` / `resolve` 相应分支收敛
-- [ ] 技能来源只剩「用户 markdown ∪ PATH 工具型」，`discover` 的两类合并逻辑与同名让位规则保留
-- [ ] `body_of` 在用户目录找不到文件时**不再有内嵌兜底**：知识型技能名不存在 → 启动校验 fail fast；
+- [x] `EMBEDDED_SKILLS` 常量与两个改写正文（`GRILLING_BODY` / `TO_SPEC_BODY`）删除
+- [x] `SkillSource::Embedded` 变体删除；`discover` / `body_of` / `resolve` 相应分支收敛
+- [x] 技能来源只剩「用户 markdown ∪ PATH 工具型」，`discover` 的两类合并逻辑与同名让位规则保留
+- [x] `body_of` 在用户目录找不到文件时**不再有内嵌兜底**：知识型技能名不存在 → 启动校验 fail fast；
       PATH 工具型 → 仍返回 `None`（只列名字）。**不得**出现「名字存在但静默降级成空子弹」的路径
-- [ ] 全仓 `grep` 确认无 `EMBEDDED_SKILLS` / `Embedded` 残留引用
-- [ ] 全仓测试通过（`cargo test --workspace`、`cargo clippy --workspace --all-targets -- -D warnings`）
+- [x] 全仓 `grep` 确认无 `EMBEDDED_SKILLS` / `Embedded` 残留引用
+- [x] 全仓测试通过（`cargo test --workspace`、`cargo clippy --workspace --all-targets -- -D warnings`）
 
 **Notes（实现提示）:**
 - 移除内嵌**不影响默认行为**：`BASELINE_MANDATORY_SKILLS` 为空、且 `stage_configs` 无种子行，

@@ -9,18 +9,18 @@
 
 **Blocked by:** 05（二档注入——名字态与目录态是它的主要使用场景）
 
-**Status:** ready-for-agent
+**Status:** done
 
-- [ ] `BUILTIN_TOOLS` 由 7 项扩为 8 项（`Skill`）；**不加入 `MANDATORY_TOOLS`**，由阶段声明启用
-- [ ] 工具分发 `match` 增一条：解析技能名 → 取正文 → 作为 tool result 返回
-- [ ] 调用后**下一轮 `LlmRequest.messages` 里出现该技能正文**（这是本票的核心可观察行为）
-- [ ] 未声明的技能也能被加载（渐进披露的自动触发路径）；但 `disable-model-invocation: true`
+- [x] `BUILTIN_TOOLS` 由 7 项扩为 8 项（`Skill`）；**不加入 `MANDATORY_TOOLS`**，由阶段声明启用
+- [x] 工具分发 `match` 增一条：解析技能名 → 取正文 → 作为 tool result 返回
+- [x] 调用后**下一轮 `LlmRequest.messages` 里出现该技能正文**（这是本票的核心可观察行为）
+- [x] 未声明的技能也能被加载（渐进披露的自动触发路径）；但 `disable-model-invocation: true`
       与未信任技能除外
-- [ ] 未知技能名 → 工具返回错误文本（**不** fail fast，让模型自行纠正）
-- [ ] 正文不进 system prompt：调用前后 `prompt_template_hash` 不变
-- [ ] `tool_defs` 的放行闸只认 `BUILTIN_TOOLS`（非内置声明仍只 warn 忽略），故该常量是本工具
+- [x] 未知技能名 → 工具返回错误文本（**不** fail fast，让模型自行纠正）
+- [x] 正文不进 system prompt：调用前后 `prompt_template_hash` 不变
+- [x] `tool_defs` 的放行闸只认 `BUILTIN_TOOLS`（非内置声明仍只 warn 忽略），故该常量是本工具
       唯一的启用点
-- [ ] 集成用例：FakeAgent 脚本驱动「模型请求 `Skill` → 工具返回正文 → 下一轮 messages 含正文」
+- [x] 集成用例：FakeAgent 脚本驱动「模型请求 `Skill` → 工具返回正文 → 下一轮 messages 含正文」
 
 **Notes（实现提示）:**
 - tool result 的注入路径已存在（工具结果 `push` 进 `messages`），本票不需要改造 agent loop——
