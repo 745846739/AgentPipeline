@@ -1500,6 +1500,81 @@ async fn validator_cross_check_disagreement_goto_execute_increments_attempts() {
     );
 }
 
+/// 决策 172 / 票 14：伪阶段 run 复用父节点的 stage/node，**不得**虚增该节点的 `attempt`。
+///
+/// 复现路径：validator_cross_check 在 `architect-design.validate_output` 坐标下落一行
+/// （`agent_type = pseudo:*`），随后 goto execute 打回、该节点重跑一遍。旧口径下
+/// `next_attempt` 把伪阶段那行也算成一次尝试，第二次 validate_output 会拿到 `attempt = 3`
+/// ——序号里凭空跳掉一个 2。修正后节点自身的 attempt 序列是连续的 1、2。
+#[tokio::test]
+async fn pseudo_stage_run_does_not_inflate_next_attempt() {
+    use agentpipeline_core::storage::decisions::ResumeAction;
+    use agentpipeline_core::types::Node;
+
+    let ctx = judge_disagreement_ctx("td-attempt").await;
+
+    // 前提：复判伪阶段确实在 validate_output 坐标下落了 run（决策 100 / 134）
+    let before = ctx.store.list_runs("td-attempt").await.unwrap();
+    let cross = before
+        .iter()
+        .find(|r| r.agent_type == "pseudo:validator_cross_check")
+        .expect("复判 run 应落库");
+    assert_eq!(cross.stage, Stage::ArchitectDesign);
+    assert_eq!(cross.node, Node::ValidateOutput);
+
+    // 用户裁决「不合格」→ 打回 execute 重跑（决策 135）
+    let cursor = ctx
+        .store
+        .load_live_cursors("td-attempt")
+        .await
+        .unwrap()
+        .into_iter()
+        .next()
+        .unwrap();
+    ctx.store
+        .apply_resume(
+            &cursor,
+            ResumeAction::Goto,
+            Some((Stage::ArchitectDesign, Node::Execute)),
+            None,
+        )
+        .await
+        .unwrap();
+
+    // 第二轮脚本：execute 再产出，validate_output 这次通过
+    let mut script = Script::new();
+    script
+        .for_node(Stage::ArchitectDesign, Node::Execute)
+        .submit(&ArchitectExecuteMetadata {
+            readiness: true,
+            ..Default::default()
+        });
+    script
+        .for_node(Stage::ArchitectDesign, Node::ValidateOutput)
+        .submit(&ValidateOutputMetadata {
+            passed: true,
+            blockers: vec![],
+            feedback: None,
+        });
+    ctx.agent.set_script(script);
+    // 第二轮不得再触发复判（本次 validate_output 直接通过）
+    ctx.executor.run("td-attempt").await.unwrap();
+
+    let runs = ctx.store.list_runs("td-attempt").await.unwrap();
+    let mut attempts: Vec<u32> = runs
+        .iter()
+        .filter(|r| r.agent_type == "main" && r.stage == Stage::ArchitectDesign)
+        .filter(|r| r.node == Node::ValidateOutput)
+        .map(|r| r.attempt)
+        .collect();
+    attempts.sort_unstable();
+    assert_eq!(
+        attempts,
+        vec![1, 2],
+        "复判伪阶段不得把第二次 validate_output 顶成 attempt 3（决策 172）"
+    );
+}
+
 // ──────────────────── project_analysis LLM 摘要（票 16 / 决策 48 / 78 / 130）────────────────────
 #[tokio::test]
 async fn project_analysis_merges_llm_summary_into_facts() {

@@ -2694,8 +2694,17 @@ impl Executor {
             .ok_or_else(|| Error::Task(format!("项目不存在：{project_id}")))
     }
 
+    /// 下一个 `attempt` 序号 = 该 `(task, stage, node)` 上**节点自身**的 run 行数 + 1。
+    ///
+    /// 只数节点自身的 run（决策 172，票 14）：伪阶段 / 子代理复用父节点的 stage/node，
+    /// 计入会把一次没重试的节点顶成 `attempt > 1`。取数口径见
+    /// [`crate::storage::Store::count_node_owning_runs`]。
     async fn next_attempt(&self, task_id: &str, stage: Stage, node: Node) -> Result<u32> {
-        Ok(self.store.list_runs_at(task_id, stage, node).await?.len() as u32 + 1)
+        Ok(self
+            .store
+            .count_node_owning_runs(task_id, stage, node)
+            .await?
+            + 1)
     }
 
     async fn begin_run(

@@ -275,6 +275,30 @@ impl Store {
         rows.into_iter().map(RunRow::into_run).collect()
     }
 
+    /// 某 `(task, stage, node)` 上**节点自身**的 run 行数（决策 172，票 14）。
+    ///
+    /// `attempt` 的唯一取数口：伪阶段与子代理的 run 复用父节点的 stage/node，若一并计入，
+    /// 一次没重试的节点会被顶成 `attempt > 1`（虚增重试率、错位会话行）。
+    /// 白名单见 [`crate::metrics::is_node_owning_run`]。
+    pub async fn count_node_owning_runs(
+        &self,
+        task_id: &str,
+        stage: Stage,
+        node: Node,
+    ) -> Result<u32> {
+        let count: i64 = sqlx::query_scalar(&format!(
+            "SELECT COUNT(*) FROM kanban_node_runs
+             WHERE task_id = ? AND stage = ? AND node = ? AND agent_type IN ({})",
+            metrics::NODE_OWNING_AGENT_TYPES_SQL
+        ))
+        .bind(task_id)
+        .bind(stage.as_str())
+        .bind(node.as_str())
+        .fetch_one(self.pool())
+        .await?;
+        Ok(count as u32)
+    }
+
     /// 全量 run 行：全局指标用。口径由 [`crate::metrics`] 的纯函数定义，
     /// 这里只取数、不在 SQL 里重算，避免「口径契约」在 SQL 与 Rust 之间漂移（决策 137）。
     pub async fn all_runs(&self) -> Result<Vec<NodeRun>> {
@@ -285,7 +309,7 @@ impl Store {
 
     /// 指标：阶段聚合（纯 SQL，口径与 [`crate::metrics::stage_metrics`] 一致）。
     pub async fn stage_aggregation(&self) -> Result<Vec<(String, f64, f64, i64)>> {
-        let rows: Vec<(String, f64, f64, i64)> = sqlx::query_as(metrics::STAGE_AGGREGATION_SQL)
+        let rows: Vec<(String, f64, f64, i64)> = sqlx::query_as(&metrics::stage_aggregation_sql())
             .fetch_all(self.pool())
             .await?;
         Ok(rows)

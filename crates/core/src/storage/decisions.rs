@@ -390,9 +390,14 @@ impl Store {
         let stage = cursor.stage;
         let mut out = format!("# 重试历史摘要（{stage} 重试耗尽）\n\n");
         out.push_str("## 各次 attempt 的失败原因\n");
-        let runs = self
+        // 只列节点自身的 run（决策 172，票 14）：伪阶段 / 子代理复用父节点的 stage/node，
+        // 计入会让摘要里出现与父 run 同 attempt 号的重影行。
+        let runs: Vec<crate::types::NodeRun> = self
             .list_runs_at(&cursor.task_id, stage, Node::Execute)
-            .await?;
+            .await?
+            .into_iter()
+            .filter(|r| crate::metrics::is_node_owning_run(&r.agent_type))
+            .collect();
         if runs.is_empty() {
             out.push_str("（无 run 记录）\n");
         } else {

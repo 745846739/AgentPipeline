@@ -34,6 +34,23 @@ pub fn is_llm_run(run: &NodeRun) -> bool {
     run.agent_type != "system"
 }
 
+/// 该 run 是否代表**节点自身**的一次尝试（决策 172，票 14）。
+///
+/// `attempt` 与重试率只统计这类 run。伪阶段（`pseudo:*`）与子代理（`subagent`）是挂在
+/// 父节点坐标（同 `stage` / `node`）下的**辅助调用**，计入就会虚增：伪阶段复用父节点的
+/// stage/node，一次没重试的节点会被它顶成 `attempt > 1`，于是重试率把没重试的节点算成
+/// 重试、`validate_first_pass_rate` 把复判 run 算成一次首过。
+///
+/// 采**白名单**而非黑名单：将来新增的辅助 agent 类型默认不计入节点尝试（宁少勿虚增）。
+/// `system`（纯代码节点）是节点自身的执行，必须计入——`init` / `merge` 等节点会重复执行，
+/// 其 `attempt` 语义与 `main` 无异。
+pub fn is_node_owning_run(agent_type: &str) -> bool {
+    agent_type == "main" || agent_type == "system"
+}
+
+/// [`is_node_owning_run`] 的 SQL 形式（口径只此一处，避免 Rust 与 SQL 漂移，决策 137）。
+pub const NODE_OWNING_AGENT_TYPES_SQL: &str = "'main', 'system'";
+
 /// 任务成功率 = done / (done + failed + cancelled)（§12.4.1）。
 pub fn success_rate(statuses: &[TaskStatus]) -> Option<f64> {
     let done = statuses.iter().filter(|s| **s == TaskStatus::Done).count() as f64;
@@ -70,7 +87,11 @@ pub struct StageMetric {
     pub stage: Stage,
     pub total_runs: u64,
     pub avg_duration_ms: f64,
-    /// attempt > 1 的比例。
+    /// `attempt > 1` 的比例。
+    ///
+    /// 分母是**节点自身的 run**（[`is_node_owning_run`]）——伪阶段 / 子代理不是重试，
+    /// 计入会把没重试的节点算成重试（决策 172，票 14）。`total_runs` / 耗时仍含全部 run：
+    /// 伪阶段是真实发生的 LLM 调用，其耗时属于该阶段的实际开销。
     pub retry_rate: f64,
 }
 
@@ -85,22 +106,34 @@ pub fn stage_metrics(runs: &[NodeRun]) -> Vec<StageMetric> {
         .map(|(stage, rs)| {
             let total = rs.len() as f64;
             let avg = rs.iter().map(|r| r.duration_ms as f64).sum::<f64>() / total;
-            let retried = rs.iter().filter(|r| r.attempt > 1).count() as f64;
+            let owning: Vec<&&NodeRun> = rs
+                .iter()
+                .filter(|r| is_node_owning_run(&r.agent_type))
+                .collect();
+            let retried = owning.iter().filter(|r| r.attempt > 1).count() as f64;
             StageMetric {
                 stage,
                 total_runs: rs.len() as u64,
                 avg_duration_ms: avg,
-                retry_rate: retried / total,
+                retry_rate: if owning.is_empty() {
+                    0.0
+                } else {
+                    retried / owning.len() as f64
+                },
             }
         })
         .collect()
 }
 
 /// validate 通过率（首次通过比例，§12.4.1）。
+///
+/// 同样只统计节点自身的 run（决策 172，票 14）：异族复判会以 `pseudo:*` 在
+/// `validate_output` 坐标下落一行，计入分母会把它当成一次「未首过」。
 pub fn validate_first_pass_rate(runs: &[NodeRun]) -> Option<f64> {
     let validates: Vec<&NodeRun> = runs
         .iter()
         .filter(|r| r.node == crate::types::Node::ValidateOutput)
+        .filter(|r| is_node_owning_run(&r.agent_type))
         .collect();
     if validates.is_empty() {
         return None;
@@ -113,14 +146,26 @@ pub fn validate_first_pass_rate(runs: &[NodeRun]) -> Option<f64> {
 }
 
 /// §12.4.1 的阶段聚合 SQL（L2 直接执行，验证与 [`stage_metrics`] 同口径）。
-pub const STAGE_AGGREGATION_SQL: &str = "\
-SELECT stage,
-       AVG(duration_ms) AS avg_duration,
-       AVG(CASE WHEN attempt > 1 THEN 1.0 ELSE 0.0 END) AS retry_rate,
-       COUNT(*) AS total_runs
-FROM kanban_node_runs
-GROUP BY stage
-ORDER BY avg_duration DESC";
+///
+/// `retry_rate` 只在节点自身的 run 上求平均——`AVG` 忽略 NULL，故非节点 run 走 `ELSE NULL`
+/// 即被排除；`COALESCE` 兜住「该阶段只有伪阶段 run」这一退化情形，与
+/// [`stage_metrics`] 返回 0.0 对齐。`COUNT(*)` / `AVG(duration_ms)` 仍覆盖全部 run。
+///
+/// 由 [`NODE_OWNING_AGENT_TYPES_SQL`] 拼出白名单（函数而非常量：口径只此一处，
+/// 避免 Rust 判定与 SQL 白名单各写一遍而漂移，决策 137）。
+pub fn stage_aggregation_sql() -> String {
+    format!(
+        "SELECT stage, \
+         AVG(duration_ms) AS avg_duration, \
+         COALESCE(AVG(CASE WHEN agent_type IN ({types}) THEN \
+             (CASE WHEN attempt > 1 THEN 1.0 ELSE 0.0 END) END), 0.0) AS retry_rate, \
+         COUNT(*) AS total_runs \
+         FROM kanban_node_runs \
+         GROUP BY stage \
+         ORDER BY avg_duration DESC",
+        types = NODE_OWNING_AGENT_TYPES_SQL
+    )
+}
 
 /// §12.4.1 的逃逸率 SQL（决策 137）。
 pub const ESCAPE_RATE_SQL: &str = "\
@@ -354,6 +399,79 @@ mod tests {
         assert_eq!(test.retry_rate, 0.0);
     }
 
+    /// 决策 172 / 票 14：伪阶段不算重试。
+    ///
+    /// 修正前 `retry_rate` 的分母含伪阶段 run，且伪阶段复用父节点的 stage/node——
+    /// 一次没重试的节点会被顶成「该阶段 1/2 的 run attempt > 1」。
+    #[test]
+    fn pseudo_stage_runs_do_not_inflate_retry_rate() {
+        let runs = vec![
+            // 一次成功的 architect 节点执行（attempt = 1）
+            run(Stage::ArchitectDesign, Node::Execute, "main", 1, 10, (1, 1)),
+            // 挂同一坐标的伪阶段 run，attempt 被旧口径数成 2
+            run(
+                Stage::ArchitectDesign,
+                Node::Execute,
+                "pseudo:conflict_check",
+                2,
+                1,
+                (1, 1),
+            ),
+        ];
+        let agg = stage_metrics(&runs);
+        let arch = agg
+            .iter()
+            .find(|m| m.stage == Stage::ArchitectDesign)
+            .unwrap();
+        assert_eq!(
+            arch.retry_rate, 0.0,
+            "伪阶段不是重试，retry_rate 必须按节点自身 run 计算"
+        );
+        assert_eq!(arch.total_runs, 2, "total_runs 仍含全部 run（含伪阶段）");
+    }
+
+    /// 子代理同样不计入重试率（决策 172，票 14 / 08）。
+    #[test]
+    fn subagent_runs_do_not_inflate_retry_rate() {
+        let runs = vec![
+            run(Stage::Develop, Node::Execute, "main", 1, 10, (1, 1)),
+            run(Stage::Develop, Node::Execute, "subagent", 2, 5, (1, 1)),
+        ];
+        let agg = stage_metrics(&runs);
+        let dev = agg.iter().find(|m| m.stage == Stage::Develop).unwrap();
+        assert_eq!(dev.retry_rate, 0.0);
+    }
+
+    #[test]
+    fn is_node_owning_run_whitelists_main_and_system_only() {
+        assert!(is_node_owning_run("main"));
+        assert!(is_node_owning_run("system"), "纯代码节点是节点自身的执行");
+        assert!(!is_node_owning_run("subagent"));
+        assert!(!is_node_owning_run("pseudo:conflict_check"));
+        assert!(
+            !is_node_owning_run("pseudo:validator_cross_check"),
+            "复判不是节点尝试"
+        );
+        // 未知类型默认不计入（宁少勿虚增）
+        assert!(!is_node_owning_run("future_helper"));
+    }
+
+    /// 只有伪阶段 run 的阶段：`retry_rate` 不因分母为空而 NaN/panic（SQL 侧 COALESCE 对齐）。
+    #[test]
+    fn stage_with_only_pseudo_runs_has_zero_retry_rate() {
+        let runs = vec![run(
+            Stage::ArchitectDesign,
+            Node::Execute,
+            "pseudo:conflict_check",
+            1,
+            5,
+            (1, 1),
+        )];
+        let agg = stage_metrics(&runs);
+        assert_eq!(agg[0].retry_rate, 0.0);
+        assert_eq!(agg[0].total_runs, 1);
+    }
+
     #[test]
     fn validate_first_pass_rate_metric() {
         let runs = vec![
@@ -386,11 +504,42 @@ mod tests {
         assert_eq!(validate_first_pass_rate(&[]), None);
     }
 
+    /// 决策 134 / 172：异族复判的 run 挂在 `validate_output` 坐标下，不得计入首过率分母。
+    #[test]
+    fn cross_check_run_is_not_a_validate_attempt() {
+        let runs = vec![
+            run(
+                Stage::ArchitectDesign,
+                Node::ValidateOutput,
+                "main",
+                1,
+                1,
+                (0, 0),
+            ),
+            run(
+                Stage::ArchitectDesign,
+                Node::ValidateOutput,
+                "pseudo:validator_cross_check",
+                1,
+                1,
+                (0, 0),
+            ),
+        ];
+        assert_eq!(
+            validate_first_pass_rate(&runs),
+            Some(1.0),
+            "复判 run 不是一次 validate 尝试"
+        );
+    }
+
     #[test]
     fn sql_constants_target_the_right_tables() {
-        assert!(STAGE_AGGREGATION_SQL.contains("kanban_node_runs"));
-        assert!(STAGE_AGGREGATION_SQL.contains("GROUP BY stage"));
-        assert!(STAGE_AGGREGATION_SQL.contains("attempt > 1"));
+        let sql = stage_aggregation_sql();
+        assert!(sql.contains("kanban_node_runs"));
+        assert!(sql.contains("GROUP BY stage"));
+        assert!(sql.contains("attempt > 1"));
+        // 决策 172 / 票 14：白名单由 NODE_OWNING_AGENT_TYPES_SQL 拼出（口径只此一处）
+        assert!(sql.contains(NODE_OWNING_AGENT_TYPES_SQL), "{sql}");
         assert!(ESCAPE_RATE_SQL.contains("kanban_transitions"));
         assert!(ESCAPE_RATE_SQL.contains("'kickback'"));
     }
