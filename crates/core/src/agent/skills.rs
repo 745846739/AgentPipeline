@@ -813,35 +813,43 @@ mod tests {
         }
     }
 
+    /// 技能根下的技能被发现（票 03：断言对象是**用户目录技能**，不再依赖内嵌常量）。
     #[test]
-    fn embedded_skills_are_discovered_without_any_home_files() {
+    fn user_skills_are_discovered_from_the_root() {
         let home = tmp();
-        let names = skill_names(&root_of(home.path()));
+        let root = root_of(home.path());
+        write_skill(&root, "grilling", "拷问协议");
+        write_skill(&root, "to-spec", "综合成规格");
+        let names = skill_names(&root);
         assert!(names.contains(&"grilling".to_string()));
         assert!(names.contains(&"to-spec".to_string()));
     }
 
+    /// 全文态把**用户文件的正文**注入 prompt——这是内嵌正文退场后仍然成立的行为。
+    ///
+    /// 原用例断言的是内嵌改写版的正文特征（`info_insufficient` / `acceptance_criteria`）。
+    /// 正文本身随票 04 删除，但它要保证的**行为**（声明即注入、逐字进入 prompt）不变，
+    /// 故改为对用户目录 fixture 断言。
     #[test]
-    fn embedded_skills_carry_bodies() {
+    fn full_mode_skills_carry_their_user_bodies() {
         let home = tmp();
-        let resolved = resolve(&root_of(home.path()), &decls(&["grilling", "to-spec"])).unwrap();
+        let root = root_of(home.path());
+        write_skill(&root, "grilling", "拷问：经 pending 回路提问");
+        write_skill(&root, "to-spec", "综合成规格，验收标准要编号");
+        let resolved = resolve(&root, &decls(&["grilling", "to-spec"])).unwrap();
         assert_eq!(resolved.len(), 2);
-        // 正文是流水线原生版本：grilling 讲 pending 回路，to-spec 守决策 136
-        let grilling = full_body(&resolved[0]);
-        assert!(grilling.contains("info_insufficient"), "{grilling}");
-        assert!(grilling.contains("frontier"), "{grilling}");
-        let to_spec = full_body(&resolved[1]);
-        assert!(to_spec.contains("验收标准"), "{to_spec}");
-        assert!(to_spec.contains("acceptance_criteria"), "{to_spec}");
+        assert_eq!(full_body(&resolved[0]), "拷问：经 pending 回路提问");
+        assert_eq!(full_body(&resolved[1]), "综合成规格，验收标准要编号");
     }
 
+    /// 同名用户文件优先于内嵌默认（票 04 前两者并存，票 04 后只剩用户文件）。
     #[test]
-    fn user_markdown_overrides_embedded_body() {
+    fn user_markdown_supplies_the_skill_body() {
         let home = tmp();
         write_skill(&root_of(home.path()), "grilling", "用户自己的拷问流程");
         let resolved = resolve(&root_of(home.path()), &decls(&["grilling"])).unwrap();
         assert_eq!(full_body(&resolved[0]), "用户自己的拷问流程");
-        // 来源登记为 Markdown 覆盖
+        // 来源登记为用户 markdown
         let found = discover(&root_of(home.path()));
         let s = found.iter().find(|s| s.name == "grilling").unwrap();
         assert!(matches!(s.source, SkillSource::Markdown { .. }), "{s:?}");
@@ -1122,12 +1130,17 @@ mod tests {
         );
     }
 
-    /// 内嵌技能的正文仍可加载（用户目录无同名文件时的兜底，票 04 前有效）。
+    /// 用户目录技能可被按名加载（票 03/06：不再依赖内嵌兜底）。
     #[test]
-    fn load_body_falls_back_to_embedded() {
+    fn load_body_reads_the_user_file() {
         let home = tmp();
+        write_skill(
+            &root_of(home.path()),
+            "grilling",
+            "---\nname: grilling\n---\n\n拷问：经 pending 回路提问",
+        );
         let body = load_body(&root_of(home.path()), "grilling").unwrap();
-        assert!(body.contains("frontier"), "{body}");
+        assert_eq!(body, "拷问：经 pending 回路提问");
     }
 
     // ── 票 07：兄弟文件一级展开 ──

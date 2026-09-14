@@ -1828,9 +1828,22 @@ async fn stage_config_round_trips_and_resets_to_default() {
 async fn stage_config_accepts_node_scoped_skills_and_rejects_unknown() {
     // 决策 170：节点级技能经 `node_overrides_json[node].skills` 声明，
     // 准入语义与启动校验同源（未知技能名 → 400）。
+    //
+    // 票 03：技能正文来自**用户目录技能**（不再依赖内嵌常量），
+    // 故先在 API 自己的临时 home 技能根下放两个技能。
     let api = api().await;
+    let skills_root = api.state.home.root().join("skills");
+    for name in ["grilling", "to-spec"] {
+        let dir = skills_root.join(name);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("SKILL.md"),
+            format!("---\nname: {name}\ndescription: 测试技能\n---\n\n{name} 的正文"),
+        )
+        .unwrap();
+    }
 
-    // 内嵌知识型技能（无需用户文件）→ 可写入并原样回读
+    // 知识型技能（用户目录有正文）→ 可写入并原样回读
     let payload = serde_json::json!({
         "node_overrides_json": {
             "validate_input": {"skills": ["grilling"]},
@@ -1882,6 +1895,94 @@ async fn stage_config_accepts_node_scoped_skills_and_rejects_unknown() {
         still.node_overrides_json.as_ref(),
         Some(&payload["node_overrides_json"])
     );
+}
+
+/// 决策 172④（票 05）：`PUT /stage-configs` 的准入语义覆盖技能声明的**新形态**。
+///
+/// 端点复用启动校验本体，故混合数组、未知 mode、未信任 + full 三条都在这里见效——
+/// 这是「写入校验与启动语义同源、不漂移」的直接检验。
+#[tokio::test]
+async fn stage_config_validates_skill_declaration_shapes() {
+    let api = api().await;
+    let skills_root = api.state.home.root().join("skills");
+    let dir = skills_root.join("mixed");
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(
+        dir.join("SKILL.md"),
+        "---\nname: mixed\ndescription: 测试技能\n---\n\n正文",
+    )
+    .unwrap();
+
+    // ① 裸字符串（旧格式）→ 向后兼容，可写入
+    let (status, body) = put(
+        &api,
+        "/stage-configs/architect-design",
+        serde_json::json!({"node_overrides_json": {"validate_input": {"skills": ["mixed"]}}}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "旧格式必须零迁移：{body}");
+
+    // ② 对象形态 + mode = name + trusted = true → 可写入
+    let (status, body) = put(
+        &api,
+        "/stage-configs/architect-design",
+        serde_json::json!({"node_overrides_json": {"validate_input": {"skills": [
+            {"name": "mixed", "mode": "name", "trusted": true}
+        ]}}}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+
+    // ③ 非法 mode → 400，报错定位到节点
+    let (status, body) = put(
+        &api,
+        "/stage-configs/architect-design",
+        serde_json::json!({"node_overrides_json": {"validate_input": {"skills": [
+            {"name": "mixed", "mode": "half"}
+        ]}}}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    let err = body["error"].as_str().unwrap();
+    assert!(err.contains("half"), "{body}");
+    assert!(err.contains("validate_input"), "报错须定位到节点：{body}");
+
+    // ④ 未信任 + full → 400（选型 D：不得全文注入未信任技能）
+    let (status, body) = put(
+        &api,
+        "/stage-configs/architect-design",
+        serde_json::json!({"node_overrides_json": {"validate_input": {"skills": [
+            {"name": "mixed", "mode": "full", "trusted": false}
+        ]}}}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    assert!(
+        body["error"].as_str().unwrap().contains("信任"),
+        "报错须点明信任：{body}"
+    );
+}
+
+/// 决策 172③（票 07）：兄弟文件缺失时 `PUT /stage-configs` 即拒绝。
+///
+/// 技能包残缺必须在写入时暴露，而不是等 agent 开工才拿到少一节的正文。
+#[tokio::test]
+async fn stage_config_rejects_skill_with_missing_sibling() {
+    let api = api().await;
+    let dir = api.state.home.root().join("skills").join("broken");
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(dir.join("SKILL.md"), "主文档\n\n[gone.md](gone.md)\n").unwrap();
+
+    let (status, body) = put(
+        &api,
+        "/stage-configs/architect-design",
+        serde_json::json!({"node_overrides_json": {"validate_input": {"skills": ["broken"]}}}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    let err = body["error"].as_str().unwrap();
+    assert!(err.contains("broken"), "须含技能名：{body}");
+    assert!(err.contains("gone.md"), "须含缺失文件名：{body}");
 }
 
 #[tokio::test]

@@ -927,9 +927,25 @@ async fn prompt_assembly_consumes_templates_stage_configs_and_agents_md() {
 /// architect-design 的 validate_input 配 `grilling`、execute 配 `to-spec`，
 /// 断言两个节点的 system prompt 各自含对应正文、且**不含**对方的——
 /// 这是「阶段级 skills_json 无法区分节点」的直接反证。
+///
+/// 票 03：断言对象是**用户目录技能**（临时 home 写 `skills/{name}/SKILL.md`），
+/// 不再依赖内嵌常量——票 04 删除内嵌后本用例零改动。
 #[tokio::test]
 async fn node_scoped_skills_inject_different_bodies_per_node() {
-    let ctx = setup("true", Settings::default()).await;
+    let external = tempfile::tempdir().unwrap();
+    write_user_skill(
+        external.path(),
+        "grilling",
+        "拷问",
+        "拷问协议：走设计树的 frontier",
+    );
+    write_user_skill(
+        external.path(),
+        "to-spec",
+        "规格",
+        "综合成规格：守好验收标准",
+    );
+    let ctx = setup_with_skills_dir("true", Settings::default(), external.path()).await;
     ctx.store
         .upsert_stage_config(&agentpipeline_core::types::StageConfig {
             stage: "architect-design".into(),
@@ -975,7 +991,7 @@ async fn node_scoped_skills_inject_different_bodies_per_node() {
         ex.system_prompt
     );
 
-    // validate_input：拷问协议的正文（经 pending 回路提问）
+    // validate_input：拷问协议的正文
     assert!(
         vi.system_prompt.contains("### grilling"),
         "{}",
@@ -988,26 +1004,32 @@ async fn node_scoped_skills_inject_different_bodies_per_node() {
     );
     assert!(!vi.system_prompt.contains("### to-spec"));
 
-    // execute：综合成规格的正文（不再提问，守决策 136 的验收标准）
+    // execute：综合成规格的正文
     assert!(
         ex.system_prompt.contains("### to-spec"),
         "{}",
         ex.system_prompt
     );
     assert!(
-        ex.system_prompt.contains("acceptance_criteria"),
+        ex.system_prompt.contains("守好验收标准"),
         "{}",
         ex.system_prompt
     );
     assert!(!ex.system_prompt.contains("### grilling"));
 
-    // validate_output 未声明技能 → 无技能段
+    // validate_output 未声明技能 → 无技能段（该节点上 grilling/to-spec 都未声明，
+    // 故它们只以目录态出现：`- name: desc`，而非 `### name`）
     let vo = requests
         .iter()
         .find(|r| r.stage == Stage::ArchitectDesign && r.node == Node::ValidateOutput)
         .expect("architect validate_output 请求");
     assert!(
-        !vo.system_prompt.contains("## 已启用技能"),
+        !vo.system_prompt.contains("### grilling"),
+        "{}",
+        vo.system_prompt
+    );
+    assert!(
+        !vo.system_prompt.contains("### to-spec"),
         "{}",
         vo.system_prompt
     );
@@ -1016,11 +1038,13 @@ async fn node_scoped_skills_inject_different_bodies_per_node() {
 /// 阶段级 `skills_json` 仍然生效（旧行为不回归），且与节点级**取并集**（只增不减）。
 #[tokio::test]
 async fn stage_level_skills_still_apply_and_union_with_node_level() {
-    let ctx = setup("true", Settings::default()).await;
+    let external = tempfile::tempdir().unwrap();
+    write_user_skill(external.path(), "grilling", "拷问", "拷问协议正文");
+    let ctx = setup_with_skills_dir("true", Settings::default(), external.path()).await;
     ctx.store
         .upsert_stage_config(&agentpipeline_core::types::StageConfig {
             stage: "architect-design".into(),
-            // 阶段级声明一个知识型技能，节点级再叠一个
+            // 阶段级声明工具型技能 `rtk`，节点级再叠一个用户目录知识型技能
             skills_json: Some(serde_json::json!(["rtk"])),
             node_overrides_json: Some(serde_json::json!({
                 "validate_input": {"skills": ["grilling"]}
@@ -1054,7 +1078,7 @@ async fn stage_level_skills_still_apply_and_union_with_node_level() {
         vi.system_prompt
     );
 
-    // execute 只有阶段级技能（节点级未声明）→ 无 grilling
+    // execute 只有阶段级技能（节点级未声明）→ 无 grilling 正文
     let ex = requests
         .iter()
         .find(|r| r.stage == Stage::ArchitectDesign && r.node == Node::Execute)
