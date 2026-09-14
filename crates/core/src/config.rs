@@ -286,39 +286,14 @@ fn user_home_dir() -> PathBuf {
         .unwrap_or_else(|| PathBuf::from("."))
 }
 
-/// 发现"可用 skill"（决策 47）：skill 的语义是"用户机器上装了对应的外部工具"
-/// （rtk / codegraph 等 CLI），以 PATH 中可执行文件的文件名为准。
-pub fn discover_available_skills() -> Vec<String> {
-    let mut names = std::collections::BTreeSet::new();
-    if let Some(paths) = std::env::var_os("PATH") {
-        for dir in std::env::split_paths(&paths) {
-            let Ok(entries) = std::fs::read_dir(&dir) else {
-                continue;
-            };
-            for entry in entries.flatten() {
-                let is_executable = entry.metadata().map(|m| m.is_file()).unwrap_or(false) && {
-                    #[cfg(unix)]
-                    {
-                        use std::os::unix::fs::PermissionsExt;
-                        entry
-                            .metadata()
-                            .map(|m| m.permissions().mode() & 0o111 != 0)
-                            .unwrap_or(false)
-                    }
-                    #[cfg(not(unix))]
-                    {
-                        true
-                    }
-                };
-                if is_executable {
-                    if let Some(name) = entry.file_name().to_str() {
-                        names.insert(name.to_string());
-                    }
-                }
-            }
-        }
-    }
-    names.into_iter().collect()
+/// 发现"可用 skill"（决策 47，**已由决策 170 修订**——语义扩展为三类来源）。
+///
+/// 保留决策 47 的工具语义（`rtk` / `codegraph` 等 CLI，以 PATH 可执行文件名为准），
+/// 并加入两类**知识型**技能：内嵌默认与 `{home}/skills/{name}/SKILL.md` 用户覆盖。
+/// 名字是唯一身份，同名用户文件覆盖内嵌。技能正文的注入见
+/// [`crate::agent::skills::resolve`] 与 [`crate::agent::prompts::build_system_prompt`]。
+pub fn discover_available_skills(home_root: &Path) -> Vec<String> {
+    crate::agent::skills::skill_names(home_root)
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
@@ -429,6 +404,26 @@ pub fn node_timeouts(stage_cfg: Option<&StageConfig>, node: &str) -> NodeTimeout
     }
 }
 
+/// 从阶段配置读**节点级**技能声明（`node_overrides_json[node].skills`，决策 170）。
+///
+/// 语义与阶段级 `skills_json` 一致，有效集 = `mandatory ∪ 阶段级 ∪ 节点级`（只增不减，
+/// §10.6.4 并集规则）。这一层解决的是「同一阶段的不同节点需要不同知识」——
+/// 例如 architect-design 的 validate_input 要拷问、execute 要综合成规格，而
+/// `skills_json` 是阶段级的、无法区分节点。
+pub fn node_skills(stage_cfg: Option<&StageConfig>, node: &str) -> Vec<String> {
+    stage_cfg
+        .and_then(|c| c.node_overrides_json.as_ref())
+        .and_then(|v| v.get(node))
+        .and_then(|n| n.get("skills"))
+        .and_then(|v| v.as_array())
+        .map(|a| {
+            a.iter()
+                .filter_map(|x| x.as_str().map(str::to_string))
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
 /// `run_command` 的超时上限（决策 75）：显式传值时取该值；未传时 test / merge 阶段取
 /// `test_command_timeout_sec`，其余阶段取 `tool_timeout_sec`。
 pub fn effective_run_command_timeout(
@@ -447,6 +442,34 @@ pub fn effective_run_command_timeout(
 
 // ─────────────────────── 启动校验（fail fast，决策 47 / 103 / 134）───────────────────────
 
+/// 一个 JSON 值里的字符串数组（非数组 / 非字符串元素一律忽略）。
+fn json_array_strings(value: Option<&serde_json::Value>) -> Option<Vec<String>> {
+    value.and_then(|v| v.as_array()).map(|a| {
+        a.iter()
+            .filter_map(|x| x.as_str().map(str::to_string))
+            .collect()
+    })
+}
+
+/// 阶段声明的全部技能：阶段级 `skills_json` + 节点级 `node_overrides_json[node].skills`（决策 170）。
+///
+/// 返回 `(定位说明, 技能名)`，定位说明用于报错——节点级要指明是哪个节点。
+fn declared_skills(cfg: &StageConfig) -> Vec<(String, String)> {
+    let mut out: Vec<(String, String)> = json_array_strings(cfg.skills_json.as_ref())
+        .unwrap_or_default()
+        .into_iter()
+        .map(|s| (format!("阶段 {}", cfg.stage), s))
+        .collect();
+    if let Some(overrides) = cfg.node_overrides_json.as_ref().and_then(|v| v.as_object()) {
+        for (node, value) in overrides {
+            for skill in json_array_strings(value.get("skills")).unwrap_or_default() {
+                out.push((format!("阶段 {} 节点 {node}", cfg.stage), skill));
+            }
+        }
+    }
+    out
+}
+
 /// 启动校验的输入（provider / 阶段配置来自 DB）。
 #[derive(Debug, Clone, Default)]
 pub struct StartupInputs {
@@ -458,6 +481,9 @@ pub struct StartupInputs {
     /// home 根目录（§10.6.4：`persona_path` 相对路径按它解析；
     /// 提供时校验 persona_path 存在且非空，None 则跳过该文件系统检查）。
     pub home_root: Option<std::path::PathBuf>,
+    /// 技能根目录（决策 170：`{home}`；提供时校验知识型技能正文存在且非空，
+    /// `None` 则跳过该文件系统检查——老调用点无需改动）。
+    pub skills_root: Option<std::path::PathBuf>,
 }
 
 /// 启动校验结果。
@@ -470,8 +496,9 @@ pub struct StartupReport {
 /// 启动校验（§6「配置 fail fast」）：
 /// - `cross_family_judge = true` 但 `validator_cross_check` 伪阶段没有可用 provider → 拒绝启动；
 /// - 阶段引用的 provider 不存在 / 被禁用 / vendor 不受支持 → 拒绝启动；
-/// - 引用的 skill 不存在 → 拒绝启动；
+/// - 引用的 skill 不存在 → 拒绝启动（阶段级与节点级都校验，节点级报错指明节点，决策 170）；
 /// - 提供 `home_root` 时：阶段 `persona_path` 不可读或内容为空 → 拒绝启动（§10.6.4）；
+/// - 提供 `skills_root` 时：知识型技能的正文不可读或为空 → 拒绝启动（决策 170）；
 /// - provider 表里 vendor 不受支持但**未被引用** → 降级 `enabled = 0`，只报告不报错。
 pub fn validate_startup(inputs: &StartupInputs) -> Result<StartupReport> {
     let mut report = StartupReport::default();
@@ -522,14 +549,18 @@ pub fn validate_startup(inputs: &StartupInputs) -> Result<StartupReport> {
                 )));
             }
         }
-        if let Some(skills) = cfg.skills_json.as_ref().and_then(|v| v.as_array()) {
-            for skill in skills.iter().filter_map(|v| v.as_str()) {
-                if !inputs.available_skills.iter().any(|s| s == skill) {
-                    return Err(Error::Config(format!(
-                        "阶段 {} 引用了不存在的 skill：{skill}",
-                        cfg.stage
-                    )));
-                }
+        // 技能校验（决策 47 / 170）：阶段级与节点级声明过同一套检查——
+        // ① 名字必须存在于可用技能集；② 知识型技能的正文必须存在且非空。
+        for (where_, skill) in declared_skills(cfg) {
+            if !inputs.available_skills.iter().any(|s| s == &skill) {
+                return Err(Error::Config(format!(
+                    "{where_} 引用了不存在的 skill：{skill}"
+                )));
+            }
+            // 提供技能根时校验正文（工具型技能无正文，`resolve` 返回 None 不报错）
+            if let Some(root) = &inputs.skills_root {
+                crate::agent::skills::resolve(root, std::slice::from_ref(&skill))
+                    .map_err(|e| Error::Config(format!("{where_} 的 skill {skill} 不可用：{e}")))?;
             }
         }
         // §10.6.4：persona「必须存在且非空」在启动时校验（运行时 resolve_stage_persona
@@ -867,6 +898,7 @@ mod tests {
             stage_configs: vec![],
             available_skills: vec![],
             home_root: None,
+            skills_root: None,
         };
         let err = validate_startup(&inputs).unwrap_err();
         assert!(matches!(err, Error::Config(_)));
@@ -894,6 +926,46 @@ mod tests {
             ..Default::default()
         };
         assert!(validate_startup(&inputs).is_err());
+    }
+
+    #[test]
+    fn node_skills_reads_per_node_declaration() {
+        // 决策 170：节点级技能声明（`node_overrides_json[node].skills`）
+        let cfg = StageConfig {
+            stage: "architect-design".into(),
+            node_overrides_json: Some(serde_json::json!({
+                "validate_input": {"skills": ["grilling"]},
+                "execute": {"skills": ["to-spec"]},
+                "validate_output": {"idle_timeout_sec": 60}
+            })),
+            ..Default::default()
+        };
+        assert_eq!(node_skills(Some(&cfg), "validate_input"), vec!["grilling"]);
+        assert_eq!(node_skills(Some(&cfg), "execute"), vec!["to-spec"]);
+        // 只配了超时的节点没有技能
+        assert!(node_skills(Some(&cfg), "validate_output").is_empty());
+        // 未声明的节点 / 无配置 / 无 stage_cfg 一律空（只增不减，不报错）
+        assert!(node_skills(Some(&cfg), "init").is_empty());
+        assert!(node_skills(None, "execute").is_empty());
+        let empty = StageConfig {
+            stage: "develop".into(),
+            ..Default::default()
+        };
+        assert!(node_skills(Some(&empty), "execute").is_empty());
+    }
+
+    #[test]
+    fn node_skills_ignores_non_array_and_non_string_entries() {
+        let cfg = StageConfig {
+            stage: "architect-design".into(),
+            node_overrides_json: Some(serde_json::json!({
+                "validate_input": {"skills": "grilling"},
+                "execute": {"skills": ["to-spec", 42, null]}
+            })),
+            ..Default::default()
+        };
+        assert!(node_skills(Some(&cfg), "validate_input").is_empty());
+        assert_eq!(node_skills(Some(&cfg), "execute"), vec!["to-spec"]);
     }
 
     #[test]

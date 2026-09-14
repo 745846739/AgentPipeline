@@ -8,6 +8,7 @@ pub mod metadata;
 pub mod prompts;
 pub mod providers;
 pub mod sanitize;
+pub mod skills;
 pub mod templates;
 pub mod tools;
 
@@ -26,5 +27,6 @@ pub use prompts::{
     prompt_template_hash, render_template, resolve_persona, PromptSegments, TemplateVars,
     BASELINE_PREAMBLE, FORMAT_RULES,
 };
+pub use skills::{ResolvedSkill, Skill, SkillSource};
 pub use templates::{system_template, user_template};
 pub use tools::{CommandFinish, CommandRecorder, CommandStart, ToolCallContext, ToolExecutor};

@@ -1825,6 +1825,89 @@ async fn stage_config_round_trips_and_resets_to_default() {
 }
 
 #[tokio::test]
+async fn stage_config_accepts_node_scoped_skills_and_rejects_unknown() {
+    // 决策 170：节点级技能经 `node_overrides_json[node].skills` 声明，
+    // 准入语义与启动校验同源（未知技能名 → 400）。
+    let api = api().await;
+
+    // 内嵌知识型技能（无需用户文件）→ 可写入并原样回读
+    let payload = serde_json::json!({
+        "node_overrides_json": {
+            "validate_input": {"skills": ["grilling"]},
+            "execute": {"skills": ["to-spec"]}
+        }
+    });
+    let (status, body) = put(&api, "/stage-configs/architect-design", payload.clone()).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(
+        body["stage_config"]["node_overrides_json"]["validate_input"]["skills"][0],
+        "grilling"
+    );
+
+    let cfg = api
+        .state
+        .store
+        .get_stage_config("architect-design")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        cfg.node_overrides_json.as_ref(),
+        Some(&payload["node_overrides_json"])
+    );
+
+    // 未知技能名 → 400，且报错定位到节点
+    let (status, body) = put(
+        &api,
+        "/stage-configs/architect-design",
+        serde_json::json!({
+            "node_overrides_json": {"validate_input": {"skills": ["no-such-skill"]}}
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    let err = body["error"].as_str().unwrap();
+    assert!(err.contains("no-such-skill"), "{body}");
+    assert!(err.contains("validate_input"), "报错须定位到节点：{body}");
+
+    // 拒绝后原配置不变（写入校验通过才落库）
+    let still = api
+        .state
+        .store
+        .get_stage_config("architect-design")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        still.node_overrides_json.as_ref(),
+        Some(&payload["node_overrides_json"])
+    );
+}
+
+#[tokio::test]
+async fn stage_config_rejects_empty_knowledge_skill_body() {
+    // 决策 170：知识型技能正文为空的用户文件 → 拒绝（与 persona_path 同口径）
+    let api = api().await;
+    let skill_dir = api.state.home.root().join("skills").join("blank-skill");
+    std::fs::create_dir_all(&skill_dir).unwrap();
+    std::fs::write(skill_dir.join("SKILL.md"), "  \n").unwrap();
+
+    let (status, body) = put(
+        &api,
+        "/stage-configs/architect-design",
+        serde_json::json!({
+            "node_overrides_json": {"validate_input": {"skills": ["blank-skill"]}}
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    assert!(
+        body["error"].as_str().unwrap().contains("正文为空"),
+        "{body}"
+    );
+}
+
+#[tokio::test]
 async fn stage_config_accepts_pseudo_stage_keys_but_rejects_unknown() {
     let api = api().await;
 

@@ -51,11 +51,15 @@ pub fn load_agents_context(
 /// `[基线前言][工作目录(G12)][AGENTS.md(G3)][persona][技能清单][格式规则]`。
 /// 固定前缀保证 prompt cache 稳定命中（§12.13.5）；worktree / 任务目录是任务级
 /// 常量，不破坏同一任务内重试的缓存。
+///
+/// 技能段（决策 170）：无正文的工具型技能仍渲染为 `- {name}` 子弹（决策 47 原样）；
+/// 有正文的知识型技能渲染为 `### {name}` + 正文，正文进 prompt 因此
+/// `prompt_template_hash` 对其敏感（决策 137）。
 pub fn build_system_prompt(
     agents_context: &str,
     persona: &str,
     workdirs: &str,
-    skills: &[String],
+    skills: &[crate::agent::skills::ResolvedSkill],
 ) -> String {
     let agents = if agents_context.trim().is_empty() {
         default_agents_context(Path::new("(未提供)"), None, None)
@@ -69,7 +73,11 @@ pub fn build_system_prompt(
     if !skills.is_empty() {
         out.push_str("## 已启用技能\n");
         for s in skills {
-            out.push_str(&format!("- {s}\n"));
+            // 工具型技能只有名字（决策 47）；知识型技能注入正文（决策 170）
+            match s.body.as_deref().filter(|b| !b.trim().is_empty()) {
+                Some(body) => out.push_str(&format!("### {}\n{}\n", s.name, body.trim())),
+                None => out.push_str(&format!("- {}\n", s.name)),
+            }
         }
         out.push('\n');
     }
@@ -225,6 +233,22 @@ mod tests {
         }
     }
 
+    /// 工具型技能（只有名字，无正文；决策 47）。
+    fn tool_skill(name: &str) -> crate::agent::skills::ResolvedSkill {
+        crate::agent::skills::ResolvedSkill {
+            name: name.to_string(),
+            body: None,
+        }
+    }
+
+    /// 知识型技能（注入正文；决策 170）。
+    fn knowledge_skill(name: &str, body: &str) -> crate::agent::skills::ResolvedSkill {
+        crate::agent::skills::ResolvedSkill {
+            name: name.to_string(),
+            body: Some(body.to_string()),
+        }
+    }
+
     // ── 组装顺序 golden ──
 
     #[test]
@@ -233,7 +257,7 @@ mod tests {
             "## 项目上下文\n仓库 X",
             "PERSONA_BODY",
             "worktree：/wt\n任务目录：/td",
-            &["rtk".to_string()],
+            &[tool_skill("rtk")],
         );
         let i_baseline = prompt.find(BASELINE_PREAMBLE).unwrap();
         let i_workdirs = prompt.find("## 工作目录").unwrap();
@@ -252,6 +276,50 @@ mod tests {
     fn system_prompt_without_skills_has_no_skills_section() {
         let prompt = build_system_prompt("ctx", "persona", "worktree：/wt", &[]);
         assert!(!prompt.contains("## 已启用技能"));
+    }
+
+    // ── 技能正文注入（决策 170）──
+
+    #[test]
+    fn tool_skill_renders_as_bare_bullet() {
+        // 决策 47 原样：工具型技能仍只是一行 `- name`
+        let prompt = build_system_prompt("ctx", "persona", "worktree：/wt", &[tool_skill("rtk")]);
+        assert!(prompt.contains("## 已启用技能\n- rtk\n"), "{prompt}");
+        assert!(!prompt.contains("### rtk"), "{prompt}");
+    }
+
+    #[test]
+    fn knowledge_skill_body_is_injected() {
+        let prompt = build_system_prompt(
+            "ctx",
+            "persona",
+            "worktree：/wt",
+            &[knowledge_skill("grilling", "把设计树走完再动手")],
+        );
+        assert!(prompt.contains("## 已启用技能"), "{prompt}");
+        assert!(prompt.contains("### grilling"), "{prompt}");
+        assert!(prompt.contains("把设计树走完再动手"), "{prompt}");
+    }
+
+    #[test]
+    fn mixed_skills_render_both_forms_in_declaration_order() {
+        let prompt = build_system_prompt(
+            "ctx",
+            "persona",
+            "worktree：/wt",
+            &[tool_skill("rtk"), knowledge_skill("to-spec", "综合成规格")],
+        );
+        let bullet = prompt.find("- rtk").unwrap();
+        let heading = prompt.find("### to-spec").unwrap();
+        assert!(bullet < heading, "保持声明顺序：{prompt}");
+    }
+
+    #[test]
+    fn skill_body_changes_prompt_hash() {
+        // 正文进 prompt，故 hash 对正文敏感（决策 137）
+        let a = build_system_prompt("ctx", "p", "wt", &[tool_skill("grilling")]);
+        let b = build_system_prompt("ctx", "p", "wt", &[knowledge_skill("grilling", "正文")]);
+        assert_ne!(prompt_template_hash(&a), prompt_template_hash(&b));
     }
 
     #[test]
@@ -556,7 +624,7 @@ mod tests {
 
         // 工作目录 / 技能清单属于最终组装内容，同样进入 hash（决策 137）
         let e = build_system_prompt("ctx", "persona", "worktree：/other", &[]);
-        let f = build_system_prompt("ctx", "persona", "worktree：/wt", &["rtk".to_string()]);
+        let f = build_system_prompt("ctx", "persona", "worktree：/wt", &[tool_skill("rtk")]);
         assert_ne!(prompt_template_hash(&a), prompt_template_hash(&e));
         assert_ne!(prompt_template_hash(&a), prompt_template_hash(&f));
     }

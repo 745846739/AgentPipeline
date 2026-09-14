@@ -1024,9 +1024,16 @@ impl Executor {
         let persona = resolve_stage_persona(&home, stage_cfg.as_ref(), cursor.stage, cursor.node)?;
         let declared_tools =
             json_string_list(stage_cfg.as_ref().and_then(|c| c.tools_json.as_ref()));
-        let skills = effective_skills(&json_string_list(
-            stage_cfg.as_ref().and_then(|c| c.skills_json.as_ref()),
+        // 技能：阶段级 ∪ 节点级（决策 170），再解析成「名字 + 正文」——知识型技能
+        // 的正文注入 system prompt，工具型技能只有名字（决策 47）。
+        let mut declared_skills =
+            json_string_list(stage_cfg.as_ref().and_then(|c| c.skills_json.as_ref()));
+        declared_skills.extend(crate::config::node_skills(
+            stage_cfg.as_ref(),
+            cursor.node.as_str(),
         ));
+        let skills =
+            crate::agent::skills::resolve(home.root(), &effective_skills(&declared_skills))?;
 
         // system prompt：[基线前言][工作目录(G12)][AGENTS.md(G3)][persona][技能][格式规则]
         let system_prompt = build_system_prompt(

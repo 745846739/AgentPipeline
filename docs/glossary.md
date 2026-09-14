@@ -104,6 +104,8 @@
 |------|------|
 | **Config** | 全局配置（TOML），包含 retry 参数、timeout、日志、prompt 目录等。位于 `~/.agentpipeline/config.toml`，**不含** provider / model / API key 等界面可改的配置（决策 22 / 56） |
 | **StageConfig** | 每个 stage 的独立配置，包含 provider（`provider_id` 引用）、tools、skills、超时覆盖（决策 111：不单列 model）。存 DB，界面可改 |
+| **技能（skill）** | 阶段或节点声明、被注入 system prompt 的**知识/流程指引**（决策 170，修订决策 47）。名字是唯一身份，三类来源：**内嵌默认**（二进制内，`agent/skills.rs` 的 `EMBEDDED_SKILLS`）、**用户 markdown**（`~/.agentpipeline/skills/{name}/SKILL.md`，同名覆盖内嵌）、**PATH 外部工具**（决策 47 原语义，如 `rtk`，只有名字无正文）。知识型技能的**正文注入 prompt**（`## 已启用技能` 段），工具型只列 `- {name}`；正文「存在且非空」在启动与 `PUT /stage-configs` 时 fail fast（与 `persona_path` 同口径）。与 MCP 的分工：skill 是知识，MCP 是可调用能力（backlog §B.1） |
+| **节点级技能** | 写在 `StageConfig.node_overrides_json[node].skills` 的技能声明（决策 170）。解决「同一阶段不同节点需要不同知识」——如 architect-design 的 validate_input 要拷问、execute 要综合成规格。有效集 = `mandatory ∪ 阶段级 skills_json ∪ 节点级`（只增不减） |
 | **AGENTS.md** | 项目上下文文件，每个 agent 启动时加载，拼入 system prompt 的固定段落，提供项目约定和规范 |
 | **伪阶段（Pseudo-stage）** | 不进入 kanban 图、无 StageIO/checkpoint/pending 的单次 agent 调用（`project_analysis`、`conflict_check`、`validator_cross_check`），仅复用阶段配置与白名单校验 |
 | **cross_family_judge** | 全局开关（默认 false，决策 134）：开启后 agent 型 validate_output 首判不合格时调用 `validator_cross_check` 异族复判；开启但伪阶段未配置 provider → 配置加载 fail fast |

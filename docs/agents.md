@@ -9,7 +9,7 @@
 1. **文件与元数据分离。** agent 通过 `write_file` tool 写入产出文件，通过 `submit_metadata` tool 返回结构化元数据。文件内容不进 state，元数据用于流转判断。
 2. **每个节点独立对话。** 每次 agent 调用使用独立的对话上下文，主 history 只保留最终结果。
 3. **validate_input / validate_output 复用同一个 agent，prompt 不同。** 例外：`develop` / `test` 的 validate_output 为纯代码，不调用 agent（决策 62）。
-4. **AGENTS.md 注入位置固定。** 拼入 system prompt，段落顺序为 `[基线前言][AGENTS.md][persona][格式规则]`；AGENTS.md 不存在时注入非空默认上下文（项目根路径 + 语言/测试框架 + "本仓库无 AGENTS.md"）。固定前缀保证 prompt cache 稳定命中（§12.13.5）。
+4. **AGENTS.md 注入位置固定。** 拼入 system prompt，完整段落顺序为 `[基线前言][工作目录][AGENTS.md][persona][技能清单][格式规则]`（工作目录为 G12 的绝对路径段；技能清单承载技能正文，决策 170）；AGENTS.md 不存在时注入非空默认上下文（项目根路径 + 语言/测试框架 + "本仓库无 AGENTS.md"）。固定前缀保证 prompt cache 稳定命中（§12.13.5）。
 
 ### 10.2 Tool 定义
 
@@ -541,7 +541,7 @@ async def run_node_with_retry(stage, node_type, user_prompt, max_retries=agent_r
     # max_retries = agent_retry_max（决策 33）：
     # 覆盖 loop 整体失败——元数据解析/校验失败、空闲/绝对超时、agent 崩溃
     last_error = None
-    system_prompt = build_system_prompt(stage, node_type)  # [基线前言][AGENTS.md][persona][格式规则]
+    system_prompt = build_system_prompt(stage, node_type)  # [基线前言][工作目录][AGENTS.md][persona][技能清单][格式规则]
 
     for attempt in range(max_retries):
         messages = [
@@ -702,7 +702,17 @@ interface SystemBaseline {
 
 **最小基线包含：** AGENTS.md 加载（G3）、工作目录告知（G12）、结构化输出校验（§12.12）、token 计量（§12.2）、会话审计（§12.4.3）、**文件工具路径策略**（`file_tool_policy`，决策 104）。
 
-**技能示例配置：** `mandatory_skills` 默认空。若用户的机器上装有 `rtk`（Rust Token Killer，CLI 输出压缩）或 `codegraph`（代码知识图谱）等外部工具对应的 skill，可在配置中显式启用作为示例。skill 未安装却被引用时 **fail fast**，与 MCP 处理一致。
+**技能（决策 170，修订决策 47）：** `mandatory_skills` 默认空。技能的**名字是唯一身份**，三类来源：
+
+| 来源 | 判定 | 是否携带正文 |
+|---|---|---|
+| 内嵌默认 | 二进制内 `EMBEDDED_SKILLS`（`crates/core/src/agent/skills.rs`；决策 7 的内嵌 persona 先例） | 有 |
+| 用户 markdown | `~/.agentpipeline/skills/{name}/SKILL.md`（镜像 ZCode 布局，可直接拷贝；**同名覆盖内嵌**） | 有 |
+| PATH 外部工具 | PATH 中的可执行文件（决策 47 原语义，如 `rtk` / `codegraph`） | 无，只列名字 |
+
+**知识型技能的正文注入 system prompt**（`## 已启用技能` 段：工具型渲染为 `- {name}`，知识型渲染为 `### {name}` + 正文），因此 `prompt_template_hash` 对正文敏感（决策 137）。正文「存在且非空」在启动与 `PUT /stage-configs` 时 **fail fast**（与 §10.6.4 的 `persona_path` 同口径）；工具型技能未安装却被引用时同样 fail fast，与 MCP 处理一致。
+
+**节点级技能：** 阶段级 `skills_json` 无法区分节点，而同一阶段的不同节点职责可能互斥（architect-design 的 `validate_input` 提问、`execute` 写 `design.md`、`validate_output` 校验）。因此技能也可在 `node_overrides_json[node].skills` 声明——见 §10.6.3。有效集 = `mandatory_skills ∪ 阶段级 skills_json ∪ 节点级 skills`（**只增不减**）。
 
 **约束语义：** 阶段配置只能让 agent **能力更强或更聚焦**，不能让 agent **绕过系统保障**。例如阶段可以增加工具，但不能移除 `submit_metadata`；可以选择白名单内的 provider，但不能自选白名单外的。
 
@@ -729,7 +739,7 @@ interface StageAgentConfig {
 
   // ── 能力（增量） ──
   tools?: string[];                // 声明的工具（与基线取并集）
-  skills?: string[];               // 加载的 skill（与基线取并集）
+  skills?: string[];               // 加载的 skill（与基线取并集；可含知识型技能，其正文注入 prompt，决策 170）
   mcp_servers?: string[];          // 启用的 MCP（与基线取并集）
 
   // ── 节点级覆盖 ──
@@ -737,10 +747,13 @@ interface StageAgentConfig {
     [node: string]: Partial<StageAgentConfig> & {
       idle_timeout_sec?: number;   // 覆盖全局 node_idle_timeout_sec（决策 66）
       max_duration_sec?: number;   // 覆盖全局 node_max_duration_sec
+      skills?: string[];           // 该节点专属技能（与阶段级取并集，决策 170）
     };
   };
 }
 ```
+
+> **节点级 `skills` 的存在理由（决策 170）：** 阶段级 `skills` 是整阶段生效的，而同一阶段的节点职责可能互斥。典型用例——architect-design 的 `validate_input` 需要「拷问」（`grilling`：把设计树走到没有悬空分支、只把决定问用户），`execute` 需要「综合成规格」（`to-spec`：不再提问、把已定内容写成 `design.md`）。若只在阶段级声明，写文件的节点也会拿到「不断向用户提问」的指引，二者只能互相打架。
 
 #### 10.6.4 合并与校验规则
 
@@ -750,7 +763,7 @@ interface StageAgentConfig {
 | provider（运行时解析） | `node_overrides > task.model_override > 阶段 provider > 全局默认`（决策 129） | `model_override` 引用的 provider_id 在设置时（`POST /tasks/{id}/model-override`）须过同一校验 |
 | persona | 阶段 prompt + 基线强制前言 | 必须存在且非空 |
 | tools | `基线 mandatory_tools ∪ 阶段 tools − forbidden_tools` | 不能移除 mandatory_tools |
-| skills | `基线 mandatory_skills ∪ 阶段 skills` | 不能移除 mandatory_skills；引用的 skill 必须存在，否则 fail fast |
+| skills | `基线 mandatory_skills ∪ 阶段 skills ∪ 节点级 skills`（决策 170，只增不减） | 不能移除 mandatory_skills；引用的 skill 名字必须存在，否则 fail fast；知识型技能的**正文必须存在且非空**，否则 fail fast（与 `persona_path` 同口径） |
 
 **校验时机：** 启动时（配置加载）一次性校验所有**注册阶段**的阶段配置，**fail fast**——发现违规配置直接拒绝启动并报错，不允许运行时才暴露。伪阶段（`project_analysis` / `conflict_check` / `validator_cross_check`）按各自要求单独校验（决策 87 / 134）：`project_analysis` 的 persona **允许为空**（省略时只输出确定性探测的事实清单，决策 78）；`conflict_check` 必须做语义比对，persona **强制存在且非空**；`validator_cross_check` persona 同样**强制存在且非空**，且 `cross_family_judge = true` 时必须已配置 provider，否则配置加载 fail fast。其余校验（厂商适配器支持、工具并集、超时覆盖）与正式阶段完全一致。
 
@@ -823,6 +836,17 @@ dir = "~/.agentpipeline/prompts"     # 覆盖 prompt 模板目录；缺省回落
 > 这是有意的收紧——静默忽略会让「配置写了却没生效」无从察觉。
 
 **阶段级 Agent 配置**存储在 SQLite 数据库中，通过前端界面配置。每个阶段可独立设置 provider（引用 `providers` 表的 `provider_id`）、tools、skills、超时覆盖。系统最小基线（mandatory_tools、mandatory_skills、`file_tool_policy`）在代码中硬编码，不可覆盖。模型上下文窗口随 `providers` 表的一行存在一起（决策 46 / 111）——**阶段不单独存 model**，换模型即换 `provider_id`，这样 L0 容量预估（§12.13.3）查找窗口大小的路径唯一。伪阶段（`project_analysis` / `conflict_check` / `validator_cross_check`）复用同一配置机制（决策 67 / 87 / 134）；`cross_family_judge = true` 时 `validator_cross_check` 必须已配置 provider，否则配置加载 fail fast。
+
+**节点级技能配置示例（决策 170）——给 architect-design 配「拷问 + 综合成规格」：** 内嵌技能 `grilling` / `to-spec` 开箱可用，无需先放文件；在 `node_overrides_json` 里按节点声明即可（`PUT /stage-configs/architect-design` 整条替换该阶段配置）：
+
+```json
+{
+  "validate_input": { "skills": ["grilling"] },
+  "execute":        { "skills": ["to-spec"] }
+}
+```
+
+`validate_input` 因此拿到「把设计树走到没有悬空分支、只把**决定**问用户（事实自己查）、经 `submit_metadata.blockers` 提问」的指引；`execute` 拿到「不再提问、把已定内容综合成 `design.md`（保留 §10.3 必需节与验收标准编号清单）」的指引。想用自己版本的技能，把文件放到 `~/.agentpipeline/skills/grilling/SKILL.md` 即覆盖内嵌（同名覆盖，正文进 prompt）。回滚：`DELETE /stage-configs/architect-design` 撤销该阶段覆盖，行为回到内嵌默认。
 
 **首启引导：** 未配置任何 provider / API key 时，创建任务返回明确错误（提示先配置 provider），不使用隐式默认模型（决策 56）。
 

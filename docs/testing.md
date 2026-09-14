@@ -97,7 +97,7 @@ workspace 成员 `crates/testkit`，供 L2 / L4 复用：
 | FileToolPolicy | realpath（/tmp→/private/tmp）、deny_paths（`.env*`、`*.pem`、`id_rsa*`）、拒绝写符号链接、deny 优先 allow、workdir_bound | 104 |
 | 脱敏 | `sk-*` / `ghp_*` / 长 base64 正则；`sanitize_command`（`--token`、URL 凭证）；**回填 messages 之前**执行 | 118 / §12.4.4 |
 | 上下文 | L1 各工具裁剪（read 头 200 行 / run_command 错误行保留 / list_dir 200 项）；L2 阈值 4000 唯一；L3 压缩规则表逐行；L4 spawn 关闭→`pending(context_overflow)` | §12.13 / 110 |
-| prompt 组装 | golden（insta）：`[基线前言][工作目录(G12)][AGENTS.md(G3)][persona][技能清单][格式规则]` 顺序；AGENTS.md 加载与缺省注入非空默认；`prompts/` 覆盖生效；`stage_configs.persona_path`（相对 home 解析、存在且非空）与 `persona_append` 生效；内置 §10.3 十二个 agent 节点模板（system+user）全部内嵌且只引用已声明变量；SystemBaseline 工具并集（mandatory 不可移除、forbidden 剔除）；`stage_configs` 的 temperature / max_tokens 透传 `LlmRequest`；user prompt 追加段（gate_recheck / backtrack-feedback / retry-feedback，**首轮为空不渲染**）；`{test_command}` / `{design_doc_path}` 等模板变量；`prompt_template_hash` 稳定、对覆盖与路径变化敏感 | 51 / 28 / 7 / 109 / 126 / 138 / 31 / 137 / §10.3 / §10.6 |
+| prompt 组装 | golden（insta）：`[基线前言][工作目录(G12)][AGENTS.md(G3)][persona][技能清单][格式规则]` 顺序；AGENTS.md 加载与缺省注入非空默认；`prompts/` 覆盖生效；`stage_configs.persona_path`（相对 home 解析、存在且非空）与 `persona_append` 生效；内置 §10.3 十二个 agent 节点模板（system+user）全部内嵌且只引用已声明变量；SystemBaseline 工具并集（mandatory 不可移除、forbidden 剔除）；`stage_configs` 的 temperature / max_tokens 透传 `LlmRequest`；user prompt 追加段（gate_recheck / backtrack-feedback / retry-feedback，**首轮为空不渲染**）；`{test_command}` / `{design_doc_path}` 等模板变量；`prompt_template_hash` 稳定、对覆盖与路径变化敏感、**对技能正文敏感**（决策 170，`skill_body_changes_prompt_hash`）；技能三类发现与同名覆盖（`skills.rs`）、工具型 `- {name}` 与知识型 `### {name}` + 正文两种渲染（`prompts.rs::knowledge_skill_body_is_injected` / `tool_skill_renders_as_bare_bullet`）、**节点级技能注入**（`executor.rs::node_scoped_skills_inject_different_bodies_per_node` 断言同阶段两节点各含对方没有的正文） | 51 / 28 / 7 / 109 / 126 / 138 / 31 / 137 / 170 / §10.3 / §10.6 |
 | allowed_actions | 权威总表逐行（`(type, context.kind)`→动作集）；**端点配对静态检查**：每个 side_effect 动作必须映射到已注册路由，新增动作忘配端点直接红 | 130 / 101 / 119 |
 | 焦点游标 | 投影规则：pending 优先 / `updated_at` 最新 / 双 pending 取最新 | 92 / 130 |
 | 指标 | 逃逸率口径、阶段聚合 SQL、`total_tokens`=Σruns、`total_calls`=LLM run 数（不含 system） | 137 / 100 / 130 |
@@ -118,7 +118,7 @@ workspace 成员 `crates/testkit`，供 L2 / L4 复用：
 | git 链路 | init（有 remote 先 fetch、以 `origin/{default_branch}` 为基准）；merge A（rebase + `base_commit` 记录 + 闸门）；merge B（内存合入 / ff 与 `--no-ff` / 引用写回）；retry reset（`--hard` + `clean -fdx`）；cancel 清理幂等；unborn HEAD 明确报错 | 41 / 96 / 97 / 73 / 125 / 61 |
 | 心跳 | 系统命令起止刷新 `last_activity_at`（600s 命令在 300s idle 下存活）；伪阶段心跳归父 run；流式 token 心跳 | 100 / 88 / 134 |
 | DB 并发 | `try_claim_executor` 双连接竞争；DbWriter 写串行化 | 36 / §12.10 |
-| 配置 fail fast | `cross_family_judge=true` 无 provider → 拒绝启动；不支持 vendor → 降级 `enabled=0`、被引用才 fail fast；skill 不存在 fail fast | 134 / 103 / 47 |
+| 配置 fail fast | `cross_family_judge=true` 无 provider → 拒绝启动；不支持 vendor → 降级 `enabled=0`、被引用才 fail fast；skill 名字不存在 fail fast；知识型技能**正文为空** fail fast（`skills.rs::empty_user_file_is_config_error`、`executor.rs::empty_knowledge_skill_body_refuses_startup`）；节点级技能名字不存在时报错须**定位到节点**（`executor.rs::missing_node_skill_refuses_startup_with_node_in_message`） | 134 / 103 / 47 / 170 |
 
 ## 7. API 契约测试（L3）
 
@@ -250,6 +250,7 @@ harness = FakeAgent（§3.2）+ testkit fixture（§3.3）+ 临时 home + 手动
 | 117 / 98 | §6 准入、E2E-20 | 准入已有用例；E2E-20 已有用例（票 19） |
 | 130⑤ / 69 / 71② / 125 / 3 | §7 回归（dependency continue 不 spawn / goto 入口节点 / 纯 name warning / retry reset / cancel 清理）、§6 | 已有用例（2026-09-12 偏离修复回归） |
 | 153 | §7 跨源防护矩阵（`X-AgentPipeline` 放行 = 桌面 webview 旁路）、E2E-00 启动冒烟（serve 沉 lib + 随机端口绑定的接线验证） | 跨源侧已有用例（随 128）；其余约束随前端（票 20–22）与桌面壳接线 |
+| 170 | §5 `skills.rs` 单测（三类发现 / 同名覆盖 / frontmatter 剥离 / 空正文拒绝）、`prompts.rs` 两种渲染 + hash 敏感、`config.rs::node_skills_*`、§6 `executor.rs::node_scoped_skills_inject_different_bodies_per_node` 与 `stage_level_skills_still_apply_and_union_with_node_level`、§7 `stage_config_accepts_node_scoped_skills_and_rejects_unknown` / `stage_config_rejects_empty_knowledge_skill_body` | 已有用例（markdown 技能 + 节点级技能，2026-09-14） |
 | …… | 其余决策随实现逐条填入 | — |
 
 ## 11. 实现状态（2026-09-12，票 15–22 后）

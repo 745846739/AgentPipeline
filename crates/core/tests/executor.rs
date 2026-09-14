@@ -900,6 +900,147 @@ async fn prompt_assembly_consumes_templates_stage_configs_and_agents_md() {
     assert_eq!(hash.len(), 16);
 }
 
+/// 节点级技能注入（决策 170）：同一阶段的不同节点拿到**不同**技能正文。
+///
+/// architect-design 的 validate_input 配 `grilling`、execute 配 `to-spec`，
+/// 断言两个节点的 system prompt 各自含对应正文、且**不含**对方的——
+/// 这是「阶段级 skills_json 无法区分节点」的直接反证。
+#[tokio::test]
+async fn node_scoped_skills_inject_different_bodies_per_node() {
+    let ctx = setup("true", Settings::default()).await;
+    ctx.store
+        .upsert_stage_config(&agentpipeline_core::types::StageConfig {
+            stage: "architect-design".into(),
+            node_overrides_json: Some(serde_json::json!({
+                "validate_input": {"skills": ["grilling"]},
+                "execute": {"skills": ["to-spec"]}
+            })),
+            updated_at: ctx.store.now(),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+
+    let mut script = Script::new();
+    design_scripts(&mut script);
+    implementation_scripts(&mut script, "t-node-skills");
+    ctx.agent.set_script(script);
+    testkit::seed_task(&ctx.store, "t-node-skills", "p1")
+        .await
+        .unwrap();
+    admit(&ctx, "t-node-skills").await;
+    ctx.executor.run("t-node-skills").await.unwrap();
+
+    let requests = ctx.agent.request_log();
+    let vi = requests
+        .iter()
+        .find(|r| r.stage == Stage::ArchitectDesign && r.node == Node::ValidateInput)
+        .expect("architect validate_input 请求");
+    let ex = requests
+        .iter()
+        .find(|r| r.stage == Stage::ArchitectDesign && r.node == Node::Execute)
+        .expect("architect execute 请求");
+
+    // 两个节点都带上了「已启用技能」段，但内容各不同
+    assert!(
+        vi.system_prompt.contains("## 已启用技能"),
+        "{}",
+        vi.system_prompt
+    );
+    assert!(
+        ex.system_prompt.contains("## 已启用技能"),
+        "{}",
+        ex.system_prompt
+    );
+
+    // validate_input：拷问协议的正文（经 pending 回路提问）
+    assert!(
+        vi.system_prompt.contains("### grilling"),
+        "{}",
+        vi.system_prompt
+    );
+    assert!(
+        vi.system_prompt.contains("frontier"),
+        "{}",
+        vi.system_prompt
+    );
+    assert!(!vi.system_prompt.contains("### to-spec"));
+
+    // execute：综合成规格的正文（不再提问，守决策 136 的验收标准）
+    assert!(
+        ex.system_prompt.contains("### to-spec"),
+        "{}",
+        ex.system_prompt
+    );
+    assert!(
+        ex.system_prompt.contains("acceptance_criteria"),
+        "{}",
+        ex.system_prompt
+    );
+    assert!(!ex.system_prompt.contains("### grilling"));
+
+    // validate_output 未声明技能 → 无技能段
+    let vo = requests
+        .iter()
+        .find(|r| r.stage == Stage::ArchitectDesign && r.node == Node::ValidateOutput)
+        .expect("architect validate_output 请求");
+    assert!(
+        !vo.system_prompt.contains("## 已启用技能"),
+        "{}",
+        vo.system_prompt
+    );
+}
+
+/// 阶段级 `skills_json` 仍然生效（旧行为不回归），且与节点级**取并集**（只增不减）。
+#[tokio::test]
+async fn stage_level_skills_still_apply_and_union_with_node_level() {
+    let ctx = setup("true", Settings::default()).await;
+    ctx.store
+        .upsert_stage_config(&agentpipeline_core::types::StageConfig {
+            stage: "architect-design".into(),
+            // 阶段级声明一个知识型技能，节点级再叠一个
+            skills_json: Some(serde_json::json!(["rtk"])),
+            node_overrides_json: Some(serde_json::json!({
+                "validate_input": {"skills": ["grilling"]}
+            })),
+            updated_at: ctx.store.now(),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+
+    let mut script = Script::new();
+    design_scripts(&mut script);
+    implementation_scripts(&mut script, "t-skills-union");
+    ctx.agent.set_script(script);
+    testkit::seed_task(&ctx.store, "t-skills-union", "p1")
+        .await
+        .unwrap();
+    admit(&ctx, "t-skills-union").await;
+    ctx.executor.run("t-skills-union").await.unwrap();
+
+    let requests = ctx.agent.request_log();
+    let vi = requests
+        .iter()
+        .find(|r| r.stage == Stage::ArchitectDesign && r.node == Node::ValidateInput)
+        .expect("architect validate_input 请求");
+    // 阶段级工具型技能（`- rtk`）与节点级知识型技能（`### grilling`）并存
+    assert!(vi.system_prompt.contains("- rtk"), "{}", vi.system_prompt);
+    assert!(
+        vi.system_prompt.contains("### grilling"),
+        "{}",
+        vi.system_prompt
+    );
+
+    // execute 只有阶段级技能（节点级未声明）→ 无 grilling
+    let ex = requests
+        .iter()
+        .find(|r| r.stage == Stage::ArchitectDesign && r.node == Node::Execute)
+        .expect("architect execute 请求");
+    assert!(ex.system_prompt.contains("- rtk"), "{}", ex.system_prompt);
+    assert!(!ex.system_prompt.contains("### grilling"));
+}
+
 // ──────────────────── 闸门失败 → test 复检 → 重跑闸门（票 15 / 决策 85 / 109）────────────────────
 
 #[tokio::test]
@@ -1637,6 +1778,7 @@ async fn cross_family_judge_without_provider_refuses_startup() {
         stage_configs: vec![],
         available_skills: vec![],
         home_root: None,
+        skills_root: None,
     })
     .unwrap_err();
     assert!(
@@ -1657,6 +1799,7 @@ async fn cross_family_judge_without_provider_refuses_startup() {
         }],
         available_skills: vec![],
         home_root: None,
+        skills_root: None,
     })
     .unwrap_err();
     assert!(
@@ -1691,8 +1834,75 @@ async fn referenced_missing_skill_refuses_startup() {
         }],
         available_skills: vec!["rtk".into()],
         home_root: None,
+        skills_root: None,
     };
     let err = validate_startup(&inputs).unwrap_err();
     assert!(matches!(err, agentpipeline_core::Error::Config(_)));
     assert!(err.to_string().contains("skill"), "{err}");
+}
+
+/// 节点级技能引用了不存在的技能名 → 同样 fail fast（决策 170），
+/// 且报错要指明是哪个阶段、哪个节点。
+#[tokio::test]
+async fn missing_node_skill_refuses_startup_with_node_in_message() {
+    use agentpipeline_core::config::{validate_startup, StartupInputs};
+    use agentpipeline_core::types::{Provider, StageConfig};
+
+    let inputs = StartupInputs {
+        settings: Settings::default(),
+        providers: vec![Provider {
+            id: "p1".into(),
+            vendor: "deepseek".into(),
+            model: "deepseek-chat".into(),
+            context_window: 64_000,
+            base_url: None,
+            api_key: None,
+            enabled: true,
+            created_at: chrono::Utc::now(),
+            updated_at: chrono::Utc::now(),
+        }],
+        stage_configs: vec![StageConfig {
+            stage: "architect-design".into(),
+            provider_id: Some("p1".into()),
+            node_overrides_json: Some(serde_json::json!({
+                "validate_input": {"skills": ["no-such-skill"]}
+            })),
+            ..Default::default()
+        }],
+        available_skills: vec!["grilling".into()],
+        home_root: None,
+        skills_root: None,
+    };
+    let err = validate_startup(&inputs).unwrap_err();
+    let msg = err.to_string();
+    assert!(msg.contains("no-such-skill"), "{msg}");
+    assert!(msg.contains("validate_input"), "报错须定位到节点：{msg}");
+}
+
+/// 知识型技能正文为空（用户写了空文件）→ 启动拒绝（决策 170，同 persona_path 口径）。
+#[tokio::test]
+async fn empty_knowledge_skill_body_refuses_startup() {
+    use agentpipeline_core::config::{validate_startup, StartupInputs};
+    use agentpipeline_core::types::StageConfig;
+
+    let home = tempfile::tempdir().unwrap();
+    let skill_dir = home.path().join("skills").join("my-skill");
+    std::fs::create_dir_all(&skill_dir).unwrap();
+    std::fs::write(skill_dir.join("SKILL.md"), "   \n").unwrap();
+
+    let inputs = StartupInputs {
+        stage_configs: vec![StageConfig {
+            stage: "architect-design".into(),
+            node_overrides_json: Some(serde_json::json!({
+                "validate_input": {"skills": ["my-skill"]}
+            })),
+            ..Default::default()
+        }],
+        available_skills: vec!["my-skill".into()],
+        home_root: None,
+        skills_root: Some(home.path().to_path_buf()),
+        ..Default::default()
+    };
+    let err = validate_startup(&inputs).unwrap_err();
+    assert!(err.to_string().contains("正文为空"), "{err}");
 }

@@ -83,6 +83,14 @@ impl Home {
         )
     }
 
+    /// 用户技能目录（决策 170）：`{root}/skills/{name}/SKILL.md`。
+    ///
+    /// 内嵌技能正文在二进制里（[`crate::agent::skills::EMBEDDED_SKILLS`]），此目录用于
+    /// 用户覆盖与自定义——同名文件覆盖内嵌。
+    pub fn skills_dir(&self) -> PathBuf {
+        self.root.join(crate::agent::skills::SKILLS_DIR)
+    }
+
     pub fn tasks_dir(&self) -> PathBuf {
         self.root.join("tasks")
     }
@@ -118,6 +126,7 @@ impl Home {
             self.data_dir(),
             self.logs_dir(),
             self.prompts_dir(),
+            self.skills_dir(),
             self.tasks_dir(),
             self.worktrees_dir(),
         ] {
