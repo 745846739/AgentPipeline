@@ -1,2 +1,16 @@
-[env]
-CARGO_INCREMENTAL = "0"
+[build]
+# 开发机是 4 线程（2 物理核）/ 8 GB 内存。cargo 默认并发会同时拉起 3–4 个
+# rustc（每个 RSS 约 300–450 MB，峰值叠加 1.5 GB 上下），在 8 GB 机器上直接
+# 触发内存压缩与换页，反而拖慢总吞吐。压到物理核数。
+jobs = 2
+# 低内存机器上增量编译额外占内存与磁盘；保持关闭（原有设置）。
+incremental = false
+
+# rustc 1.98 的 dev/test 默认是 debuginfo=2 + split-debuginfo=unpacked，
+# 调试信息是单个 rustc 内存占用与链接时间的大头。保留行号（panic 回溯与
+# 测试失败仍可定位到行），去掉类型级调试信息。
+[profile.dev]
+debug = "line-tables-only"
+
+[profile.test]
+debug = "line-tables-only"
