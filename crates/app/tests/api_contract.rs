@@ -7,6 +7,7 @@
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 
+use agentpipeline_core::agent::market::MarketClient;
 use agentpipeline_core::agent::tools::CommandRecorder;
 use agentpipeline_core::config::Settings;
 use agentpipeline_core::sse::{SseEvent, SseEventType};
@@ -17,7 +18,8 @@ use axum::http::{header, Request, StatusCode};
 use axum::Router;
 use serde_json::Value;
 use testkit::{
-    seed_project, seed_task, seed_task_full, skill_zip, write_skill_dir, zip_bytes, Repo, TestHome,
+    entry, entry_with_wrong_digest, seed_project, seed_task, seed_task_full, skill_zip,
+    write_skill_dir, zip_bytes, FakeMarket, Repo, TestHome,
 };
 use tower::ServiceExt;
 
@@ -44,6 +46,23 @@ async fn api_with(settings: Settings) -> Api {
 }
 
 async fn api_with_origins(settings: Settings, extra_origins: Vec<String>) -> Api {
+    api_full(settings, extra_origins, None, Vec::new()).await
+}
+
+/// 注入技能市场客户端的 harness（票 10）。
+///
+/// 市场端点契约必须能**完全离线**地跑：注入 testkit 的 `FakeMarket`，于是「摘要不符」
+/// 「来源未放行」这些真网络没法稳定复现的路径都成了确定性用例。
+async fn api_with_market(client: Arc<dyn MarketClient>, sources: Vec<String>) -> Api {
+    api_full(Settings::default(), Vec::new(), Some(client), sources).await
+}
+
+async fn api_full(
+    settings: Settings,
+    extra_origins: Vec<String>,
+    market: Option<Arc<dyn MarketClient>>,
+    market_sources: Vec<String>,
+) -> Api {
     let home = TestHome::new().unwrap();
     let (store, _clock) = home.setup().await.unwrap();
     let repo = Repo::clean().unwrap();
@@ -71,7 +90,8 @@ async fn api_with_origins(settings: Settings, extra_origins: Vec<String>) -> Api
         .with_resume_hook(Arc::new(move |_task_id| {
             hook_resumes.fetch_add(1, Ordering::SeqCst);
         }))
-        .with_allowed_origins(extra_origins);
+        .with_allowed_origins(extra_origins)
+        .with_market(market, market_sources);
     let router = build_router(state.clone());
     Api {
         _home: home,
@@ -2854,4 +2874,362 @@ async fn import_flat_zip_without_name_is_rejected() {
         body["error"].as_str().unwrap().contains("显式指定技能名"),
         "{body}"
     );
+}
+
+// ═══════════════════ 技能市场：远程 registry（决策 172⑤，票 10）═══════════════════
+//
+// 全部**离线**：客户端由 `AppState` 注入 testkit 的 `FakeMarket`。这组用例钉住票面要求的
+// 五条路径（正常安装 / 摘要不符 / 来源未放行 / 索引畸形 / 网络失败）外加票 09 不受影响。
+
+const MARKET_SRC: &str = "https://skills.example.com";
+
+fn market_sources() -> Vec<String> {
+    vec![MARKET_SRC.to_string()]
+}
+
+/// 造一个「索引与内容一致」的 fake，并把它装进一个 api。
+async fn api_with_one_skill(name: &str, body: &str) -> (Api, Vec<u8>) {
+    let bytes = skill_zip(name, body, &[("tests.md", "兄弟文件")]);
+    let e = entry(name, MARKET_SRC, &bytes);
+    let fake = FakeMarket::with_entries(vec![e.clone()]).serving(&e.url, &bytes);
+    (
+        api_with_market(Arc::new(fake), market_sources()).await,
+        bytes,
+    )
+}
+
+/// ① 正常安装：搜索能看到候选，安装后落盘且出现在 `GET /skills`。
+#[tokio::test]
+async fn market_search_lists_then_install_lands_the_skill() {
+    let (api, _bytes) = api_with_one_skill("market-grill", "市场来的正文").await;
+
+    let (status, body) = get(&api, "/market/search").await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let names: Vec<&str> = body["skills"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|s| s["name"].as_str().unwrap())
+        .collect();
+    assert_eq!(names, vec!["market-grill"]);
+    // 候选带完整五字段，界面据此展示装前信息
+    assert_eq!(body["skills"][0]["version"], "1.0.0");
+    assert_eq!(body["skills"][0]["sha256"].as_str().unwrap().len(), 64);
+    assert_eq!(body["skills"][0]["source"], MARKET_SRC);
+
+    let (status, body) = post(
+        &api,
+        "/market/install",
+        serde_json::json!({"name": "market-grill"}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["skill"]["name"], "market-grill");
+    assert_eq!(body["skill"]["sibling_count"], 1);
+    // 落盘走票 09 的同一入口，故布局与本地导入一致
+    assert!(skills_root(&api).join("market-grill/SKILL.md").is_file());
+    assert!(skills_root(&api).join("market-grill/tests.md").is_file());
+
+    let (status, body) = get(&api, "/skills").await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(body["skills"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|s| s["name"] == "market-grill"));
+}
+
+/// 关键词筛选：命中名字或描述，未命中的不出现。
+#[tokio::test]
+async fn market_search_filters_by_keyword() {
+    let bytes_a = skill_zip("grill-me", "A", &[]);
+    let bytes_b = skill_zip("to-spec", "B", &[]);
+    let a = entry("grill-me", MARKET_SRC, &bytes_a);
+    let b = entry("to-spec", MARKET_SRC, &bytes_b);
+    let fake = FakeMarket::with_entries(vec![a.clone(), b.clone()])
+        .serving(&a.url, &bytes_a)
+        .serving(&b.url, &bytes_b);
+    let api = api_with_market(Arc::new(fake), market_sources()).await;
+
+    let (status, body) = get(&api, "/market/search?q=grill").await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let names: Vec<&str> = body["skills"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|s| s["name"].as_str().unwrap())
+        .collect();
+    assert_eq!(names, vec!["grill-me"]);
+}
+
+/// ② 摘要不符 → 400，报文**同时给出期望值与实际值**，且不落盘。
+#[tokio::test]
+async fn market_install_rejects_digest_mismatch() {
+    let bytes = skill_zip("tampered", "被篡改的正文", &[]);
+    // 索引钉一个与内容不符的摘要
+    let e = entry_with_wrong_digest(
+        "tampered",
+        MARKET_SRC,
+        &format!("{MARKET_SRC}/skills/tampered-1.0.0.zip"),
+    );
+    let fake = FakeMarket::with_entries(vec![e.clone()]).serving(&e.url, &bytes);
+    let api = api_with_market(Arc::new(fake), market_sources()).await;
+
+    let (status, body) = post(
+        &api,
+        "/market/install",
+        serde_json::json!({"name": "tampered"}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    let msg = body["error"].as_str().unwrap();
+    assert!(msg.contains("摘要不符"), "{msg}");
+    assert!(msg.contains(&"a".repeat(64)), "须给出期望值：{msg}");
+    assert!(
+        msg.contains(&agentpipeline_core::agent::market::sha256_hex(&bytes)),
+        "须给出实际值：{msg}"
+    );
+    assert!(!skills_root(&api).join("tampered").exists(), "不得落盘");
+}
+
+/// ③ 来源未放行 → 400；未放行的条目**搜索时就不出现**。
+#[tokio::test]
+async fn market_rejects_unallowed_source() {
+    let bytes = skill_zip("rogue", "陌生来源的正文", &[]);
+    let mut e = entry("rogue", "https://evil.example", &bytes);
+    e.url = "https://evil.example/skills/rogue-1.0.0.zip".into();
+    let fake = FakeMarket::with_entries(vec![e.clone()]).serving(&e.url, &bytes);
+    let api = api_with_market(Arc::new(fake), market_sources()).await;
+
+    // 搜索侧：装不上的东西不该出现在候选里
+    let (status, body) = get(&api, "/market/search").await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert!(
+        body["skills"].as_array().unwrap().is_empty(),
+        "未放行来源不得进候选：{body}"
+    );
+
+    // 安装侧：即使绕过搜索直接点名，也必须拒绝
+    let (status, body) = post(
+        &api,
+        "/market/install",
+        serde_json::json!({"name": "rogue"}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    assert!(body["error"].as_str().unwrap().contains("未放行"), "{body}");
+    assert!(!skills_root(&api).join("rogue").exists());
+}
+
+/// `source` 放行但**下载地址**指向别处的条目：搜索侧不出现，安装侧也被拒。
+///
+/// 两侧同口径——候选侧存在的意义就是「看不到装不上的东西」。CDN 场景下这类条目是常见的
+/// （索引与包不同源），故这条路径必须有测试。
+#[tokio::test]
+async fn market_rejects_an_entry_whose_download_url_is_unlisted() {
+    let bytes = skill_zip("cdn-skill", "正文", &[]);
+    let mut e = entry("cdn-skill", MARKET_SRC, &bytes);
+    e.url = "https://cdn.evil.example/cdn-skill.zip".into();
+    let fake = FakeMarket::with_entries(vec![e.clone()]).serving(&e.url, &bytes);
+    let api = api_with_market(Arc::new(fake), market_sources()).await;
+
+    let (status, body) = get(&api, "/market/search").await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert!(
+        body["skills"].as_array().unwrap().is_empty(),
+        "下载地址未放行的条目不得进候选：{body}"
+    );
+
+    let (status, body) = post(
+        &api,
+        "/market/install",
+        serde_json::json!({"name": "cdn-skill"}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    assert!(body["error"].as_str().unwrap().contains("未放行"), "{body}");
+    assert!(!skills_root(&api).join("cdn-skill").exists());
+}
+
+/// 空白名单（默认）= 不允许任何远程安装，报文说明怎么开——不是 500。
+#[tokio::test]
+async fn market_with_no_configured_source_is_refused_actionably() {
+    let api = api().await;
+    let (status, body) = get(&api, "/market/search").await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    let msg = body["error"].as_str().unwrap();
+    assert!(msg.contains("allowed_sources"), "须说清怎么开：{msg}");
+    assert!(
+        msg.contains("本地导入不受影响"),
+        "须说明离线能力仍在：{msg}"
+    );
+}
+
+/// ④ 索引畸形 → 400（**不与网络失败混淆**，状态码也分开）。
+#[tokio::test]
+async fn market_reports_malformed_index_distinctly() {
+    let fake = FakeMarket::malformed_index("<html>404</html>");
+    let api = api_with_market(Arc::new(fake), market_sources()).await;
+
+    let (status, body) = get(&api, "/market/search").await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    let msg = body["error"].as_str().unwrap();
+    assert!(msg.contains("JSON"), "{msg}");
+    assert!(!msg.contains("网络"), "不得与网络失败混淆：{msg}");
+}
+
+/// ⑤ 网络失败 → **502**（下游不可达），与四类 400 区分开。
+#[tokio::test]
+async fn market_reports_network_failure_distinctly() {
+    let fake = FakeMarket::index_unreachable();
+    let api = api_with_market(Arc::new(fake), market_sources()).await;
+
+    let (status, body) = get(&api, "/market/search").await;
+    assert_eq!(status, StatusCode::BAD_GATEWAY, "{body}");
+    let msg = body["error"].as_str().unwrap();
+    assert!(msg.contains("网络失败"), "{msg}");
+    assert!(!msg.contains("摘要不符"), "不得混淆：{msg}");
+    assert!(!msg.contains("未放行"), "不得混淆：{msg}");
+}
+
+/// 索引里没有该技能 → 404（而不是一个含糊的 400）。
+#[tokio::test]
+async fn market_unknown_skill_is_not_found() {
+    let bytes = skill_zip("known", "正文", &[]);
+    let e = entry("known", MARKET_SRC, &bytes);
+    let fake = FakeMarket::with_entries(vec![e.clone()]).serving(&e.url, &bytes);
+    let api = api_with_market(Arc::new(fake), market_sources()).await;
+
+    let (status, body) = post(
+        &api,
+        "/market/install",
+        serde_json::json!({"name": "unknown"}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND, "{body}");
+    assert!(
+        body["error"].as_str().unwrap().contains("unknown"),
+        "{body}"
+    );
+}
+
+/// 同名已存在 → 409（票 09 的冲突语义），显式 `overwrite` 才覆盖。
+#[tokio::test]
+async fn market_install_same_name_requires_explicit_overwrite() {
+    let (api, _) = api_with_one_skill("dup", "市场来的正文").await;
+    // 先本地装一个同名技能
+    let local = skill_zip("dup", "本地已有的正文", &[]);
+    let (status, body) = post_zip(&api, "/skills/import", local).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+
+    let (status, body) = post(&api, "/market/install", serde_json::json!({"name": "dup"})).await;
+    assert_eq!(status, StatusCode::CONFLICT, "{body}");
+    let content = std::fs::read_to_string(skills_root(&api).join("dup/SKILL.md")).unwrap();
+    assert!(content.contains("本地已有的正文"), "未确认不得覆盖");
+
+    // 显式覆盖后市场版本生效
+    let (status, body) = post(
+        &api,
+        "/market/install",
+        serde_json::json!({"name": "dup", "overwrite": true}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let content = std::fs::read_to_string(skills_root(&api).join("dup/SKILL.md")).unwrap();
+    assert!(content.contains("市场来的正文"), "{content}");
+}
+
+/// 票 09 的穿越防护在**市场路径**上同样生效：摘要对得上的恶意包也被拒。
+///
+/// 这是「落盘只实现一次」的价值——远程包不比本地上传的包享有更宽的路。
+#[tokio::test]
+async fn market_package_still_undergoes_traversal_defense() {
+    let evil = zip_bytes(&[
+        ("s/SKILL.md", "---\nname: s\n---\n\n正文"),
+        ("../escaped.md", "逃逸"),
+    ]);
+    let e = entry("s", MARKET_SRC, &evil);
+    let fake = FakeMarket::with_entries(vec![e.clone()]).serving(&e.url, &evil);
+    let api = api_with_market(Arc::new(fake), market_sources()).await;
+
+    let (status, body) = post(&api, "/market/install", serde_json::json!({"name": "s"})).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    assert!(body["error"].as_str().unwrap().contains("穿越"), "{body}");
+    assert!(!api._home.home().root().join("escaped.md").exists());
+    assert!(!skills_root(&api).join("escaped.md").exists());
+}
+
+/// 票面验收：**本机无网时票 09 不受影响**——市场失败不阻塞任何本地导入路径。
+///
+/// 用一个「拉索引必失败」的 fake 模拟无网，然后照常走扫描 / 目录导入 / 列表。
+#[tokio::test]
+async fn offline_market_does_not_block_local_import() {
+    let fake = FakeMarket::index_unreachable();
+    let api = api_with_market(Arc::new(fake), market_sources()).await;
+
+    // 市场侧确实失败（网络错误，502）
+    let (status, _) = get(&api, "/market/search").await;
+    assert_eq!(status, StatusCode::BAD_GATEWAY);
+
+    // 本地侧照常：扫描 → 目录导入 → 列表
+    let source = api._home.scratch_dir("offline-market-src");
+    write_skill_dir(&source, "offline-local", "离线正文", &[]);
+    let (status, body) = get(&api, &format!("/skills/scan?root={}", source.display())).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let (status, body) = post(
+        &api,
+        "/skills/import-dir",
+        serde_json::json!({"paths": [source.join("offline-local")]}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["succeeded"], 1, "{body}");
+    let (status, body) = get(&api, "/skills").await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert!(body["skills"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|s| s["name"] == "offline-local"));
+}
+
+/// 摘要不符的响应体把**原始诊断**放在 `detail` 里，与面向用户的 `error` 分开。
+///
+/// `Error::Market` 的 `raw`（期望 / 实际摘要）若丢了，用户截屏报障时唯一的线索就没了。
+#[tokio::test]
+async fn market_error_body_carries_a_separate_detail_field() {
+    let bytes = skill_zip("tampered", "被篡改的正文", &[]);
+    let e = entry_with_wrong_digest(
+        "tampered",
+        MARKET_SRC,
+        &format!("{MARKET_SRC}/skills/tampered-1.0.0.zip"),
+    );
+    let fake = FakeMarket::with_entries(vec![e.clone()]).serving(&e.url, &bytes);
+    let api = api_with_market(Arc::new(fake), market_sources()).await;
+
+    let (status, body) = post(
+        &api,
+        "/market/install",
+        serde_json::json!({"name": "tampered"}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    // `error` 是给人看的中文提示，`detail` 是期望/实际摘要这类诊断
+    let detail = body["detail"].as_str().unwrap_or_default();
+    assert!(detail.contains("expected ="), "{body}");
+    assert!(detail.contains("actual ="), "{body}");
+    assert!(
+        !body["error"].as_str().unwrap().contains("expected ="),
+        "诊断不该混进面向用户的报文：{body}"
+    );
+}
+
+/// 网络失败的 502 同样带 `detail`。
+#[tokio::test]
+async fn market_network_error_body_also_carries_detail() {
+    let fake = FakeMarket::index_unreachable();
+    let api = api_with_market(Arc::new(fake), market_sources()).await;
+    let (status, body) = get(&api, "/market/search").await;
+    assert_eq!(status, StatusCode::BAD_GATEWAY, "{body}");
+    assert!(body["detail"].as_str().is_some(), "{body}");
 }

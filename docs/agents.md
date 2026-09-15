@@ -723,6 +723,20 @@ interface SystemBaseline {
 - **卸载不检查引用**：`DELETE /skills/{name}` 允许删掉仍被配置引用的技能，引用完整性由启动校验与 `PUT /stage-configs` 的 fail fast 兜住（技能名是唯一身份，不得静默降级）。`GET /skills` 的 `declared_in` 字段负责在动手前告知后果。工具型技能（PATH 可执行文件）不可卸载；
 - **全程离线**：本组端点不依赖任何网络。
 
+**从远程 registry 安装**（决策 172⑤，票 10）——`GET /market/search?q=` 查候选，`POST /market/install {name, overwrite}` 下载并安装：
+
+- **索引格式**（本票定义）：`GET {source}/index.json`，`{"skills": [...]}`，每条含 `name` / `version` / `sha256` / `source` / `description` / `url` 六字段。`url` 允许与索引**不同源**（CDN 常见），正因如此安装时会**单独校验 `url` 的 origin 也在白名单内**；
+- **来源白名单**：`[market] allowed_sources`（见 §10.6.5），**默认空 = 不允许任何远程安装**。照 Claude Code `strictKnownMarketplaces` / Codex `allowed_sources` 的姿态——忘配的代价是装不上（用户立刻发现），配宽的代价是静默装上陌生来源。判定按 **origin**（`scheme://host[:port]`），不接受带路径的写法（那会让用户以为放行了一个前缀）。**非回环来源必须 `https`**（回环放行 `http`，便于本机起 registry 开发）——明文 http 下 `sha256` 挡不住中间人：攻击者可同时替换索引与包，使校验自洽通过。未放行来源的技能**连搜索候选都不进**，用户看不到装不上的东西（搜索与安装同口径：`source` 与下载地址的 origin **都**要放行）；
+- **摘要校验**：`sha256` 的**权威值是从下载字节现算的**，不采信传输层声明（若采信，一个被控制的客户端可以同时改内容与声称值，校验形同虚设）。不符即拒绝安装，报文**同时给出期望值与实际值**（原始诊断进响应体的 `detail` 字段，与面向用户的 `error` 分开）；
+- **不跟随 HTTP 重定向**（`Policy::none()`）——reqwest 缺省会跟最多 10 跳**跨源**跳转，而白名单判定看的是请求 URL：不关掉它，一个**已放行**的来源只要回一个 302 就能把内容指到任意别处（内网元数据端点之类），白名单当场失效。来源方若需要 CDN，应把该 origin 直接写进索引条目的 `url`（那时它会被正常校验）。core 侧另有一道**独立**判定：复检字节的**实际来源** origin；
+- **下载体积有上限**（64 MiB，与本地导入端点的 `DefaultBodyLimit` 同值）——声明式 `Content-Length` 早退 + 流式累加兜底，使远程与本地两条路对内存的消耗同量级；
+- **落盘复用票 09 的同一入口**（`SkillPackage::from_zip` + `install`），因此结构校验、同名冲突、路径穿越防护一处生效、两处受益——**远程包不比本地上传的包享有更宽的路**；
+- **五类失败互不混淆**：`market_network`（502，下游不可达，该重试）/ `market_not_found`（404，索引里没这个技能，该换名字）/ `market_digest_mismatch` 与 `market_source_not_allowed`、`market_index_malformed`（400，拒绝安装，该改请求或配置）。混在一起的代价是用户不知道该改什么：几种动作毫无交集；
+- **可测试性接缝**：市场客户端 trait（`MarketClient`）是本 effort **唯一新增的接缝**（决策 143）。生产用 `HttpMarketClient`（reqwest，复用既有 HTTP 栈，不引入第二套）；测试用 testkit 的 `FakeMarket` 提供固定索引与字节，**五条路径全部不打真网络**；
+- **本机无网时票 09 不受影响**：市场失败不阻塞任何本地导入路径（有专门的契约用例钉这一点）。
+
+> **摘要 ≠ 安全**（本票明确不做的部分）：摘要校验**只能**证明「没被改过」，证明不了「内容是善意的」。签名与人工审核队列不在本批——善意性由票 11 的装前预览与信任标记承担。用户若误以为摘要=安全，就会跳过票 11 的预览直接装，所以这条边界写在这里与 `market.rs` 的模块头（错误提示只报事实与动作，不复述这段定位说明）。
+
 **三态渲染**（决策 172④，票 05）——`## 已启用技能` 段里的每个技能按下表之一呈现，形态由声明里的 `mode` 决定：
 
 | 形态 | 渲染 | 何时用 |
@@ -866,12 +880,19 @@ dir = "~/.agentpipeline/skills"      # 覆盖技能根；缺省回落 {home}/ski
 # 被发现、校验并可用；未配置时行为与之前逐字相同。
 # 覆盖目录由用户自己维护：本系统不会创建它，也不会改它的权限。
 # 技能文件 frontmatter 里若写了 name，必须与所在目录同名，否则启动 fail fast。
+
+[market]
+# 技能市场的来源白名单（决策 172⑤，票 10）。**默认空 = 不允许任何远程安装**。
+# 判定按 origin（scheme://host[:port]），不接受带路径的写法；列表第一个来源同时用作
+# 索引地址（{source}/index.json）。未放行的来源在搜索与安装两侧都被拒。
+# allowed_sources = ["https://skills.example.com"]
 ```
 
 > **配置校验姿态（票 16 / 决策 172）：** `config.toml` 中未知的 section / 键一律**拒绝启动**
 > （`deny_unknown_fields` 施加于 `Config` / `ServerConfig` / `PipelineOverrides` /
-> `LoggingConfig` / `PromptsConfig` / `SkillsConfig`），不静默忽略——与决策 47 / 103 / 134
-> 的 fail fast 姿态一致。`[logging]` 的 `format` 与已废弃 `json_file` 同时出现同样报错。
+> `LoggingConfig` / `PromptsConfig` / `SkillsConfig` / `MarketConfig`），不静默忽略——与决策
+> 47 / 103 / 134 的 fail fast 姿态一致。`[logging]` 的 `format` 与已废弃 `json_file` 同时出现
+> 同样报错。
 >
 > **升级注意（行为变化）：** 此前拼错或多余的键会被静默忽略、按默认值运行；现在**启动即报错**。
 > 这是有意的收紧——静默忽略会让「配置写了却没生效」无从察觉。

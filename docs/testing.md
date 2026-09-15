@@ -36,9 +36,10 @@
 | `AGENTPIPELINE_HOME` 环境变量 | 默认 `~/.agentpipeline/` | 每测试独占临时目录 | 家目录硬编码 → 无法并行、无法隔离 |
 | 进程组终止器 trait | `kill_process_group` 真杀 | 记录调用 | 测试无可杀进程组，但超时路径仍要断言「杀了」 |
 | scheduler `tick()` 手动驱动 | 10s 周期 | 测试直接调用 | tick 六项职责（决策 55）逐项验证 |
+| **市场客户端 trait**（决策 172⑤，票 10） | `HttpMarketClient`（reqwest，复用既有 HTTP 栈；`Policy::none()` 不跟随重定向） | testkit 的 `FakeMarket`：固定索引与字节，**不打真网络** | 市场有四条真网络**无法稳定复现**的失败路径（摘要不符 / 来源未放行 / 索引畸形 / 网络失败），而票面要求它们互不混淆——只有把网络出口换成 trait 才能钉住 |
 | **主题契约模块**（决策 169） | `frontend/src/theme/contract.ts`（token / 几何常量 / 15 枚 sprite / 状态映射的唯一事实源）+ 手工镜像的 `app.css` | `theme/contract.test.ts`（纯数据断言）+ `theme/css-parity.test.ts`（读 `app.css` 两个 token 块与契约**逐条比对**，并扫描全部组件禁止 token 块外裸十六进制颜色）+ playwright 在真应用上断言计算样式 | 30+ token 与 15 枚 sprite 的漂移**人工对照不现实**；`app.css` 是手工镜像（不引入代码生成——它还承载全站基元与移动版规则，整体生成化会让手改 CSS 变危险操作），镜像与事实源之间必须由机器发现不一致 |
 
-> 接缝只做可替换、不改语义：超时判定仍以 `Clock` 读数为唯一时钟源（决策 64）。**实现顺序要求：前四个接缝先于业务模块落地**（后补要翻全部模块签名）。第 5 条接缝（决策 169）同守此界——主题契约只承载**视觉数据**，不承载状态或业务语义，状态语义仍在 `stores` 与 `realtime/reduce.ts`。
+> 接缝只做可替换、不改语义：超时判定仍以 `Clock` 读数为唯一时钟源（决策 64）。**实现顺序要求：前四个接缝先于业务模块落地**（后补要翻全部模块签名）。第 5 条接缝（决策 172⑤，`MarketClient`）与第 6 条（决策 169，主题契约）同守此界——主题契约只承载**视觉数据**，不承载状态或业务语义，状态语义仍在 `stores` 与 `realtime/reduce.ts`。
 
 ### 3.2 FakeAgent（决策 142 / 148）
 
@@ -261,6 +262,7 @@ harness = FakeAgent（§3.2）+ testkit fixture（§3.3）+ 临时 home + 手动
 | 171 | §5 `config.rs::default_server_port_is_8788`（缺省 `port` 与 `host` 钉住；缺省绑定与跨源白名单均由 `port` 派生） | 已有用例（默认端口 8787→8788，2026-09-14） |
 | 172③（票 08·只读子代理） | §6 `executor.rs::subagent_tool_set_is_read_only`（**安全断言**：子代理工具集恰为 `read_file` / `list_dir`）、`subagent_does_not_inherit_declared_tools`（阶段声明也扩不了权）、`subagent_run_row_carries_parent_and_agent_type`、`subagent_tokens_are_counted_once_on_its_own_run`、`parent_spawns_readonly_subagent_and_gets_summary_back`、`spawn_sub_agent_absent_unless_declared`；§5 `tools.rs::spawn_sub_agent_*` 四条（未启用 / 缺参 / 缺 run 上下文 / 正常摘要）；§6 `scheduler_tick.rs::subagent_runs_are_not_swept_as_node_timeouts`（子代理 run 不得被超时扫描当节点 run 处置） | 已有用例（只读子代理，2026-09-15） |
 | 172⑤（票 09·技能导入） | §5 `skill_import.rs` 单测 30 条——结构校验（含 `SKILL.md` / 正文非空 / frontmatter `name` 一致）、**路径穿越**（`..` / 绝对路径 / 深层穿越 / 反斜杠伪装，外加「穿越包不在技能根外留下任何文件」的断言）、同名冲突默认拒绝 + 报出来源 + 显式覆盖整目录替换、目录扫描（描述 / `exists` / 杂物不进清单）、批量逐项结果（一项坏不中断整批）、卸载（含工具型技能拒绝、路径穿越名拒绝）；§7 `api_contract.rs` 十一条（合法 zip 落盘带兄弟文件 / 缺 `SKILL.md` 400 且不落盘 / 穿越 400 / 同名 409 → 确认后覆盖 / 扫描清单 / 扫描描述 / 扫描目录不存在 400 / 批量逐项 / **卸载后引用 fail fast** / 卸载未知 404 / 无网全链路可用）；testkit `skill_fixture.rs` 提供技能目录与 zip fixture（票 11 / 15 复用） | 已有用例（技能导入，2026-09-15） |
+| 172⑤（票 10·远程 registry） | §5 `market.rs` 单测 18 条——索引解析（五字段往返 / 缺字段 / 非 JSON / 缺 `skills` 数组 / 摘要非 64 位十六进制 / `source` 非合法 origin，全部 fail fast 而非静默跳过）、搜索（名字 + 描述命中 / 未放行来源不进候选 / 空白名单返回空）、来源白名单（**默认空拒绝一切** / 未放行拒绝并给出可操作报文 / 按 origin 判定，端口不同与后缀伪装都不成立）、摘要校验（命中通过 / 不符时**同时报出期望值与实际值** / 传输层谎报被拒 / sha256 对 NIST 向量）、`origin_of`（仅 http/https、带 userinfo 与 `file://` 拒绝）；§6 `tests/market.rs` 十二条（正常安装落盘 / 摘要不符拒绝且不落盘 / 来源未放行拒绝 + **下载地址跨源同样拒绝** / 索引畸形 / 网络失败且三类报文分得开 / 未知技能 not_found / **穿越包即使摘要对得上也被拒** / 同名冲突默认拒绝 / **传输层摘要是不可信的**——索引钉诚实摘要、传输送换过的字节并谎称摘要相符，必须拒 / **字节实际来源须放行**（挡重定向）/ 索引里的不可落盘名字在**下载前**被拒 / 空白名单在**拉索引前**被拒）；§5 `config.rs` 五条（`[market]` 默认空 / 归一去重保序 / 非法来源 fail fast / 未知键拒绝）；§7 `api_contract.rs` 十四条（搜索 + 安装落盘 / 关键词筛选 / 摘要不符 400 报期望与实际 / 未放行来源在搜索与安装两侧都被拒 / 空白名单 400 且说明怎么开 / 索引畸形 400 / **网络失败 502** / 未知技能 404 / 同名 409 → 确认后覆盖 / 穿越 400 / **市场失败不阻塞本地导入** / 跨源下载地址在搜索与安装两侧都被拒 / `detail` 字段带原始诊断且不混进 `error`）；testkit `market_fixture.rs` 提供 `FakeMarket`（唯一新增接缝，五条路径全部不打真网络） | 已有用例（远程 registry，2026-09-15） |
 | …… | 其余决策随实现逐条填入 | — |
 
 ## 11. 实现状态（2026-09-12，票 15–22 后）

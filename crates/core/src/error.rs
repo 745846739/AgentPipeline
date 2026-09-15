@@ -51,6 +51,22 @@ pub enum Error {
         raw: String,
     },
 
+    /// 技能市场失败（票 10）：带**可归因的类别**，四类互不混淆。
+    ///
+    /// 网络失败该重试、摘要不符该怀疑中间人、来源未放行该改配置、索引畸形该找 registry
+    /// 维护者——四种动作毫无交集，混成一个「市场错误」等于没报错。类别常量见
+    /// [`crate::agent::market`] 的 `KIND_*`。
+    #[error("{message}")]
+    Market {
+        /// 稳定标识（`market_network` / `market_digest_mismatch` /
+        /// `market_source_not_allowed` / `market_index_malformed` / `market_not_found`）。
+        kind: String,
+        /// 中文可操作提示（面向用户）。
+        message: String,
+        /// 原始诊断（HTTP 状态 / 期望与实际摘要 / 索引片段），供排查。
+        raw: String,
+    },
+
     #[error("IO 错误：{0}")]
     Io(#[from] std::io::Error),
 
@@ -71,6 +87,17 @@ impl Error {
     pub fn llm_classified(&self) -> Option<(&str, &str)> {
         match self {
             Error::LlmClassified { kind, raw, .. } => Some((kind, raw)),
+            _ => None,
+        }
+    }
+
+    /// 若为技能市场失败，返回 `(类别标识, 原始诊断)`（票 10）。
+    ///
+    /// 与 [`Error::llm_classified`] 并列：市场失败也带稳定类别，调用方（API 层分类映射、
+    /// 测试断言）不该各自手写一遍 `match Error::Market { .. }`。
+    pub fn market_kind(&self) -> Option<(&str, &str)> {
+        match self {
+            Error::Market { kind, raw, .. } => Some((kind, raw)),
             _ => None,
         }
     }

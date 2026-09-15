@@ -373,6 +373,15 @@ fn sanitize_skill_name(raw: &str) -> std::result::Result<String, String> {
     Ok(name)
 }
 
+/// 校验一个技能名能否用作技能根下的目录名；不合法时返回中文原因。
+///
+/// 供**落盘之外的入口**复用同一条名字不变量——票 10 的市场路径要在**下载之前**就否掉一个
+/// 不可能落盘的名字（否则白烧一次下载，最后才在落盘时失败）。判定用的就是 `install` 内部
+/// 同一个 [`sanitize_skill_name`]，故两处不会漂移。
+pub fn check_skill_name(raw: &str) -> std::result::Result<String, String> {
+    sanitize_skill_name(raw)
+}
+
 /// 归档噪声：macOS 打包产生的元数据，不属于技能内容。
 ///
 /// 留着它们会被当成兄弟文件落进技能目录，票 07 的展开还会对 `.DS_Store` 之类做无意义的

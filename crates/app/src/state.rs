@@ -2,6 +2,7 @@
 
 use std::sync::Arc;
 
+use agentpipeline_core::agent::market::MarketClient;
 use agentpipeline_core::config::Settings;
 use agentpipeline_core::home::Home;
 use agentpipeline_core::pipeline::Executor;
@@ -35,6 +36,14 @@ pub struct AppState {
     pub bind_host: String,
     /// 配置 / CLI 注入的额外放行 origin（决策 157），与缺省本机集合合并。
     pub extra_allowed_origins: Vec<String>,
+    /// 技能市场客户端（决策 172⑤，票 10——本 effort 唯一新增接缝）。
+    ///
+    /// **缺省 `None`**：没有它时市场端点返回明确的「未配置来源」错误，而不是 panic 或
+    /// 静默成功。生产在 `serve` 里按 `[market] allowed_sources` 注入；L3 契约测试注入
+    /// testkit 的 `FakeMarket`，因此端点契约能在**完全离线**的前提下被钉住。
+    pub market: Option<Arc<dyn MarketClient>>,
+    /// `[market] allowed_sources` 归一后的白名单（空白名单 = 不允许远程安装）。
+    pub market_sources: Vec<String>,
 }
 
 impl AppState {
@@ -49,7 +58,22 @@ impl AppState {
             port,
             bind_host: "127.0.0.1".to_string(),
             extra_allowed_origins: Vec::new(),
+            market: None,
+            market_sources: Vec::new(),
         }
+    }
+
+    /// 注入技能市场客户端与放行来源（票 10）。
+    ///
+    /// `client` 为 `None` 是合法状态（白名单为空 = 不装远程技能），端点会给出可操作报文。
+    pub fn with_market(
+        mut self,
+        client: Option<Arc<dyn MarketClient>>,
+        sources: Vec<String>,
+    ) -> Self {
+        self.market = client;
+        self.market_sources = sources;
+        self
     }
 
     /// 注入实际绑定地址（决策 167）。serve 路径必须调用，否则 `/server-info`
@@ -100,6 +124,13 @@ impl AppState {
 pub struct ApiError {
     pub status: StatusCode,
     pub message: String,
+    /// 原始诊断（不进 `message`，单独一栏给排查用）。
+    ///
+    /// 沿用「面向用户的话」与「诊断原始串」分开的既有姿态（决策见 `Error::LlmClassified`）：
+    /// `message` 是中文可操作提示，`detail` 是期望/实际摘要、HTTP 状态这类技术细节。
+    /// 响应体里作为额外字段下发（前端只读 `error`，故不破坏既有契约），用户截屏报障时
+    /// 不用再去翻日志。
+    pub detail: Option<String>,
 }
 
 impl ApiError {
@@ -107,6 +138,7 @@ impl ApiError {
         ApiError {
             status: StatusCode::BAD_REQUEST,
             message: msg.into(),
+            detail: None,
         }
     }
 
@@ -114,6 +146,7 @@ impl ApiError {
         ApiError {
             status: StatusCode::NOT_FOUND,
             message: msg.into(),
+            detail: None,
         }
     }
 
@@ -121,6 +154,7 @@ impl ApiError {
         ApiError {
             status: StatusCode::CONFLICT,
             message: msg.into(),
+            detail: None,
         }
     }
 
@@ -128,6 +162,7 @@ impl ApiError {
         ApiError {
             status: StatusCode::FORBIDDEN,
             message: msg.into(),
+            detail: None,
         }
     }
 
@@ -135,13 +170,40 @@ impl ApiError {
         ApiError {
             status: StatusCode::INTERNAL_SERVER_ERROR,
             message: msg.into(),
+            detail: None,
         }
+    }
+
+    /// 下游（远程 registry）不可达（票 10）。
+    ///
+    /// 与 400 分开是因为**责任方不同**：400 是「你的请求有问题」，502 是「请求没问题，
+    /// 但对面没应答」——用户该做的动作也不同（改配置 vs 稍后重试）。票面要求四类市场失败
+    /// 互不混淆，这条让网络失败在 HTTP 状态码上也独立出来。
+    pub fn bad_gateway(msg: impl Into<String>) -> Self {
+        ApiError {
+            status: StatusCode::BAD_GATEWAY,
+            message: msg.into(),
+            detail: None,
+        }
+    }
+
+    /// 附上原始诊断（见 [`ApiError::detail`]）。
+    pub fn with_detail(mut self, detail: impl Into<String>) -> Self {
+        let detail = detail.into();
+        if !detail.is_empty() {
+            self.detail = Some(detail);
+        }
+        self
     }
 }
 
 impl IntoResponse for ApiError {
     fn into_response(self) -> Response {
-        (self.status, Json(json!({ "error": self.message }))).into_response()
+        let body = match &self.detail {
+            Some(detail) => json!({ "error": self.message, "detail": detail }),
+            None => json!({ "error": self.message }),
+        };
+        (self.status, Json(body)).into_response()
     }
 }
 

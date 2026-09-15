@@ -341,6 +341,67 @@ impl SkillsConfig {
     }
 }
 
+/// `[market]`：技能市场的来源白名单（决策 172⑤，票 10）。
+///
+/// 照 Claude Code `strictKnownMarketplaces` / Codex `allowed_sources` 的姿态：**默认空**，
+/// 即默认不允许从任何远程来源安装。这是保守方向上的默认——忘配的代价是装不上（用户立刻
+/// 发现并去配置），配宽的代价是静默装上陌生来源。
+///
+/// ## 只放行 https（回环除外）
+///
+/// 白名单是这个模块唯一的安全控制，而 `sha256` **在明文 http 上挡不住中间人**：攻击者可以
+/// 同时替换索引与包，使摘要自洽——校验通过，内容却是攻击者的。故非回环来源一律要求 `https`；
+/// 回环（`127.0.0.1` / `localhost` / `[::1]`）放行 `http`，让本地起一个 registry 做开发与
+/// 测试不必自签证书（回环流量不出本机，中间人不在威胁模型里）。
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
+#[serde(default, deny_unknown_fields)]
+pub struct MarketConfig {
+    /// 放行的来源 origin（`scheme://host[:port]`，照 `[server] allowed_origins` 的写法）。
+    ///
+    /// 列表的**第一个**来源同时用作索引地址（`{source}/index.json`）。
+    pub allowed_sources: Vec<String>,
+}
+
+impl MarketConfig {
+    /// 归一后的放行来源集合（顺序保留、去重）。
+    ///
+    /// 用户把同一来源写两遍是常见手误，去重后不表现为「索引取第一个」这种隐式行为差异。
+    pub fn resolved_sources(&self) -> Vec<String> {
+        let mut out: Vec<String> = Vec::new();
+        for raw in &self.allowed_sources {
+            if let Ok(origin) = normalize_origin(raw) {
+                if !out.contains(&origin) {
+                    out.push(origin);
+                }
+            }
+        }
+        out
+    }
+}
+
+/// 校验一个市场来源 origin 的传输安全性（见 [`MarketConfig`] 的模块说明）。
+///
+/// 返回中文原因（不合法时）。判定用 origin 里的 host，不看路径——来源本来就只能是 origin。
+pub fn check_market_source_scheme(origin: &str) -> std::result::Result<(), String> {
+    let Some(rest) = origin.strip_prefix("http://") else {
+        return Ok(()); // https（normalize_origin 已保证只有这两种）或已归一的其他形态
+    };
+    // `http://` 只允许回环：本机起 registry 做开发时不必自签证书
+    let authority = rest.split(['/', '?', '#']).next().unwrap_or(rest);
+    let host = if let Some(v6) = authority.strip_prefix('[') {
+        v6.split(']').next().unwrap_or("").to_string()
+    } else {
+        authority.split(':').next().unwrap_or("").to_string()
+    };
+    if host == "127.0.0.1" || host == "localhost" || host == "::1" {
+        return Ok(());
+    }
+    Err(format!(
+        "非回环来源必须用 https：{origin}。明文 http 挡不住中间人——\
+         攻击者可同时替换索引与技能包，使 sha256 校验自洽通过"
+    ))
+}
+
 /// 完整配置。
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
@@ -350,6 +411,7 @@ pub struct Config {
     pub logging: LoggingConfig,
     pub prompts: PromptsConfig,
     pub skills: SkillsConfig,
+    pub market: MarketConfig,
 }
 
 impl Config {
@@ -377,6 +439,15 @@ impl Config {
         for origin in &self.server.allowed_origins {
             normalize_origin(origin)
                 .map_err(|e| Error::Config(format!("[server] allowed_origins 校验失败：{e}")))?;
+        }
+        // 技能市场来源同样在解析期 fail fast：写错的 origin 若放过去，表现为「安装时来源未放行」
+        // 这种运行期错误，用户得回头猜配置哪里错了（票 10 的四类失败要分得开）
+        for source in &self.market.allowed_sources {
+            let origin = normalize_origin(source)
+                .map_err(|e| Error::Config(format!("[market] allowed_sources 校验失败：{e}")))?;
+            // 传输安全也在解析期拦：明文 http 上 sha256 挡不住中间人（见 `MarketConfig` 说明）
+            check_market_source_scheme(&origin)
+                .map_err(|e| Error::Config(format!("[market] allowed_sources 校验失败：{e}")))?;
         }
         Ok(())
     }
@@ -979,6 +1050,71 @@ mod tests {
     #[test]
     fn skills_unknown_key_is_rejected() {
         let err = Config::from_toml("[skills]\ndir = \"x\"\nnope = 1\n").unwrap_err();
+        assert!(matches!(err, Error::Config(_)), "{err}");
+    }
+
+    // ── 决策 172⑤：`[market] allowed_sources` 来源白名单（票 10）──
+
+    /// **默认空 = 不允许远程安装**（保守方向上的默认，票面显式要求）。
+    #[test]
+    fn market_defaults_to_no_allowed_source() {
+        let cfg = Config::from_toml("").unwrap();
+        assert!(cfg.market.allowed_sources.is_empty());
+        assert!(cfg.market.resolved_sources().is_empty());
+    }
+
+    /// 写入的来源被归一（大小写 / 尾斜杠），重复项去重且**保留顺序**。
+    #[test]
+    fn market_sources_are_normalized_deduped_and_ordered() {
+        let cfg = Config::from_toml(
+            "[market]\nallowed_sources = [\"https://Skills.Example.com/\", \"https://second.example\", \"https://skills.example.com\"]\n",
+        )
+        .unwrap();
+        assert_eq!(
+            cfg.market.resolved_sources(),
+            vec![
+                "https://skills.example.com".to_string(),
+                "https://second.example".to_string(),
+            ]
+        );
+    }
+
+    /// 非法来源（带路径 / 缺 scheme）fail fast，不静默丢弃。
+    #[test]
+    fn market_rejects_illegal_source() {
+        // 带路径的写法会被拒——它会让用户以为「放行了一个前缀」
+        let err = Config::from_toml("[market]\nallowed_sources = [\"https://x.example/path\"]\n")
+            .unwrap_err();
+        assert!(matches!(err, Error::Config(_)), "{err}");
+        assert!(Config::from_toml("[market]\nallowed_sources = [\"not-an-origin\"]\n").is_err());
+    }
+
+    /// 非回环来源必须 https：明文 http 上 sha256 挡不住中间人（攻击者同时换索引与包）。
+    #[test]
+    fn market_rejects_plain_http_for_non_loopback_sources() {
+        let err =
+            Config::from_toml("[market]\nallowed_sources = [\"http://skills.example.com\"]\n")
+                .unwrap_err();
+        assert!(matches!(err, Error::Config(_)), "{err}");
+        assert!(err.to_string().contains("https"), "{err}");
+
+        // 回环放行 http（本机起 registry 做开发不必自签证书）
+        assert!(
+            Config::from_toml("[market]\nallowed_sources = [\"http://127.0.0.1:8788\"]\n").is_ok()
+        );
+        assert!(
+            Config::from_toml("[market]\nallowed_sources = [\"http://localhost:8788\"]\n").is_ok()
+        );
+        // https 一律放行
+        assert!(Config::from_toml(
+            "[market]\nallowed_sources = [\"https://skills.example.com\"]\n"
+        )
+        .is_ok());
+    }
+
+    #[test]
+    fn market_unknown_key_is_rejected() {
+        let err = Config::from_toml("[market]\nallowed_sources = []\nnope = 1\n").unwrap_err();
         assert!(matches!(err, Error::Config(_)), "{err}");
     }
 

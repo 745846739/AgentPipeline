@@ -1,5 +1,6 @@
 //! 路由模块。
 
+pub mod market;
 pub mod projects;
 pub mod providers;
 pub mod server_info;

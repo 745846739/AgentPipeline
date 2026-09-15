@@ -100,6 +100,9 @@ pub fn build_router(state: AppState) -> Router {
         // ── 技能市场（决策 172⑤，票 09）：本地导入 / 目录扫描 / 卸载。全程离线 ──
         // 子 router 自带 state（import 路由要单独放宽请求体上限），故先 merge 再进防护层。
         .merge(routes::skills::routes(state.clone()))
+        // ── 技能市场：远程 registry（票 10）。来源白名单默认空 = 不允许远程安装；
+        // 客户端由 AppState 注入（生产 HttpMarketClient / 测试 FakeMarket），故契约测试离线 ──
+        .merge(routes::market::routes(state.clone()))
         // ── 服务自述与局域网分享（决策 167）：纯 GET，无状态变更 ──
         .route("/server-info", get(routes::server_info::info))
         .route("/server-info/qr.svg", get(routes::server_info::qr_svg))

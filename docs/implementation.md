@@ -781,6 +781,8 @@ executor checkpoint 机制天然支持：
 | `POST /skills/import-dir` | POST | 从一个或多个本地技能目录导入（`{paths: [], overwrite}`），**逐项返回结果**，一项失败不中断整批（票 09） |
 | `GET /skills/scan` | GET | 扫描一个本地技能根（`?root=~/.zcode/skills`）列出可导入技能：名字 + `description` + `exists`（票 09） |
 | `DELETE /skills/{name}` | DELETE | 卸载技能（删技能根下 `{name}/`）。**不检查引用**——仍被引用的卸载后由启动校验与 `PUT /stage-configs` fail fast 兜住；工具型技能（PATH 可执行文件）拒绝卸载（票 09） |
+| `GET /market/search` | GET | 查远程 registry 的候选（`?q=` 关键词命中名字或描述）。**未放行来源的条目不进候选**；返回 `{skills, sources, query}`，每条含 `name`/`version`/`sha256`/`source`/`description`/`url`（决策 172⑤，票 10） |
+| `POST /market/install` | POST | 从远程 registry 安装技能（`{name, overwrite}`）：索引查条目 → 来源放行 → **下载地址 origin 也放行** → 下载 → `sha256` 校验 → 落盘（复用票 09）。状态码按类别分：`market_network` → 502、`market_not_found` → 404、摘要不符 / 来源未放行 / 索引畸形 → 400、同名未确认 → 409（票 10） |
 
 > **技能市场全程离线（票 09）：** 五个导入 / 扫描 / 卸载端点不依赖任何网络，本机无网时功能完整。
 > 上传走**原始字节**而非 multipart / base64——`multipart` 要新引 `multer` 一棵树，base64 要一个
@@ -788,6 +790,12 @@ executor checkpoint 机制天然支持：
 > **路径穿越**是本组端点的主要风险：zip 条目名过两道独立判定（自己的 `sanitize_rel_path` +
 > `zip` crate 的 `enclosed_name`），落盘前实数校验目标在技能根之内（见
 > `crates/core/src/agent/skill_import.rs` 模块头）。票 10 的远程 registry 复用同一落盘入口。
+
+> **市场客户端的注入姿态（票 10）：** `AppState.market: Option<Arc<dyn MarketClient>>` ——
+> 生产在 `serve` 里按 `[market] allowed_sources` 注入 `HttpMarketClient`（reqwest，复用既有
+> HTTP 栈）；L3 契约测试注入 testkit 的 `FakeMarket`，因此「摘要不符」「来源未放行」这些
+> 真网络没法稳定复现的路径都成了**确定性、离线**的用例。白名单为空时 `market` 为 `None`
+> 是**合法状态**（= 不装远程技能），端点返回一条说明怎么开的 400，而不是 500。
 
 > **`allowed_actions` 与端点的配对（决策 101 / 119）：** 前端对 `allowed_actions` 纯渲染，因此每个 `side_effect` 动作都必须有对应端点——`cancel` → `POST /tasks/{id}/cancel`、`split_task` → `POST /tasks/{id}/split`、`更换长上下文模型` → `POST /tasks/{id}/model-override`、`合入 / 返回修改` → `POST /tasks/{id}/merge/decision`（决策 119）。新增 side_effect 动作时必须同时新增端点，否则前端会出现点不动的按钮。
 
@@ -801,5 +809,16 @@ executor checkpoint 机制天然支持：
 | `AGENTPIPELINE_HOME` 环境变量 | 默认 `~/.agentpipeline/` | 每测试独占临时目录 |
 | 进程组终止器 trait | 真杀进程组（决策 66） | 记录调用，不真杀 |
 | scheduler `tick()` | 10s 周期驱动 | 测试中手动调用 |
+
+**第五条接缝（决策 172⑤ 修订决策 143，票 10）：** 技能市场的网络出口加一条 `MarketClient` trait。
+（测试设计侧的同一条接缝见 [testing.md](testing.md) §3.1 的权威表；决策 169 的主题契约随之成为第六条。）
+
+| 接缝 | 生产实现 | 测试实现 |
+|---|---|---|
+| `MarketClient` trait | `HttpMarketClient`（reqwest，复用既有 HTTP 栈；`Policy::none()` 不跟随重定向） | testkit 的 `FakeMarket`：固定索引与字节，**不打真网络** |
+
+> 这是 v2 技能 effort **唯一新增**的接缝（决策 143 的「接缝数不随功能数线性增长」）。加它的
+> 理由与四条老接缝同构：市场有四条**真网络无法稳定复现**的失败路径（摘要不符 / 来源未放行 /
+> 索引畸形 / 网络失败），而票面要求它们互不混淆——只有把出口换成 trait，这些路径才能被钉住。
 
 > **实现顺序要求：四个接缝先于业务模块落地**——后补接缝要翻全部模块签名。逐项用例目录见 testing.md。

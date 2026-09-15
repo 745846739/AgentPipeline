@@ -6,6 +6,7 @@
 
 use std::sync::Arc;
 
+use agentpipeline_core::agent::market::{HttpMarketClient, MarketClient};
 use agentpipeline_core::clock::SystemClock;
 use agentpipeline_core::config::{normalize_origin, Config, LogFormat};
 use agentpipeline_core::home::{
@@ -155,12 +156,21 @@ pub async fn serve(options: ServeOptions) -> anyhow::Result<ServerHandle> {
     // 决策 128 的本机 origin 白名单必须用真实端口（用 0 会拒掉桌面壳的同源请求）。
     let (listener, bound) = bind_listener(&host, port).await?;
 
+    // 技能市场（票 10）：白名单非空才装客户端，`{source}/index.json` 取第一个来源。
+    // 空 = 不允许远程安装（保守默认）——此时 AppState.market 仍是 None，端点会给出
+    // 一条「怎么开」的报文而不是 500。
+    let market_sources = config.market.resolved_sources();
+    let market_client: Option<Arc<dyn MarketClient>> = match market_sources.first() {
+        Some(source) => Some(Arc::new(HttpMarketClient::new(source)?)),
+        None => None,
+    };
     let state = AppState::new(store, home, settings, bound.port())
         .with_sse(sse)
         .with_executor(runtime.executor())
         .with_resume_hook(runtime.resume_hook.clone())
         .with_bind_host(host.clone())
-        .with_allowed_origins(extra_origins);
+        .with_allowed_origins(extra_origins)
+        .with_market(market_client, market_sources);
     let router = build_router(state);
 
     tracing::info!(%bound, port = bound.port(), "AgentPipeline 已启动");
