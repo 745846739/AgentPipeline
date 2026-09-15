@@ -58,6 +58,14 @@ const SUB_AGENT_PERSONA: &str = "你是一个只读检索子代理。你的唯�
 /// 否则会持续烧 token 直到外层超时。
 pub const SUB_AGENT_MAX_ROUNDS: usize = 12;
 
+/// 子代理**运行期间**的心跳周期（票 08）。
+///
+/// 子代理的 run 行不参与节点超时判定（见 `scheduler` 的 `is_node_owning_run` 过滤），
+/// 但**父 run 参与**。子代理若一次 LLM 调用卡住超过 `node_idle_timeout_sec`（默认
+/// 300s），父 run 的 `last_activity_at` 就会变陈旧，父节点被误判超时——正是那道过滤
+/// 想避免的后果。所以子代理运行期间必须持续给父 run 打心跳，而不是只在每轮响应后打。
+const SUB_AGENT_HEARTBEAT_INTERVAL: Duration = Duration::from_secs(5);
+
 /// 子代理运行的构造参数（避免构造点长成一排位置参数）。
 ///
 /// `Clone` 是必需的：`SubAgentRunner::run` 返回 `BoxFuture<'static>`，future 必须
@@ -92,7 +100,10 @@ pub struct SubAgentRunnerConfig {
     pub max_duration: Duration,
 }
 
-/// 子代理一次运行的 token 计量（与 executor 的 `RunTokens` 同口径，决策 100）。
+/// 一次 agent 调用的 token 计量（决策 46：prompt / completion / cache 落 run 行）。
+///
+/// 父节点与子代理共用这一个类型——两边的口径必须一致（都落 `kanban_node_runs`
+/// 的同名列），各写一份迟早会漂移。
 #[derive(Debug, Clone, Copy, Default)]
 pub struct RunTokens {
     pub prompt: u32,
@@ -102,7 +113,7 @@ pub struct RunTokens {
 }
 
 impl RunTokens {
-    fn add(&mut self, response: &AgentResponse) {
+    pub fn add(&mut self, response: &AgentResponse) {
         self.prompt += response.prompt_tokens;
         self.completion += response.completion_tokens;
         self.cache_read += response.cache_read_tokens;
@@ -136,14 +147,6 @@ impl StoreSubAgentRunner {
                 parameters: serde_json::json!({"type": "object"}),
             })
             .collect()
-    }
-
-    /// 检查该 agent_type 是否出现在子代理可用工具里（测试与文档的自证）。
-    ///
-    /// 单独成函数是为了让「子代理拿不到 run_command」这条断言有一个**实现侧的**
-    /// 落点，而不是只在测试里硬编码字符串。
-    pub fn allows_tool(name: &str) -> bool {
-        SUB_AGENT_TOOLS.contains(&name)
     }
 }
 
@@ -195,13 +198,17 @@ impl SubAgentRunner for StoreSubAgentRunner {
             // 子代理的只读工具执行器：路径策略与父节点同源（同样锁在 worktree + 任务
             // 目录），但**不注入** `with_recorder` / `with_sse` / `with_sub_agent`——
             // 记录器会以子代理名义记命令（子代理跑不了命令），另两者是父节点专有能力。
+            //
+            // `with_allowed_tools` 是安全边界的真正落点：只把 tool 定义少给几个是不够的，
+            // 模型无视定义硬发 `run_command` 时必须在**执行点**被拒。
             let policy = FileToolPolicy::new(vec![cfg.worktree_path.clone(), cfg.task_dir.clone()]);
             let tools = ToolExecutor::new(
                 cfg.home.clone(),
                 policy,
                 cfg.settings.clone(),
                 cfg.killer.clone(),
-            );
+            )
+            .with_allowed_tools(&SUB_AGENT_TOOLS);
             let ctx = ToolCallContext {
                 task_id: cfg.task_id.clone(),
                 stage: cfg.stage,
@@ -289,6 +296,18 @@ impl StoreSubAgentRunner {
     /// 烧掉 `tool_retry_max`。
     async fn run_loop(&self, session: &mut SubAgentSession, task: &str) -> Result<String> {
         session.transcript.push(Message::user(task.to_string()));
+        // 运行期间持续给**父 run** 打心跳：单次 LLM 调用可能长过 node_idle_timeout_sec，
+        // 只在每轮响应后打会在那段时间留下空窗，父节点被误判超时（票 08）。
+        let heartbeat = tokio::spawn(keep_parent_run_alive(
+            self.cfg.store.clone(),
+            self.cfg.parent_run_id,
+        ));
+        let result = self.run_rounds(session, task).await;
+        heartbeat.abort();
+        result
+    }
+
+    async fn run_rounds(&self, session: &mut SubAgentSession, task: &str) -> Result<String> {
         for _ in 0..SUB_AGENT_MAX_ROUNDS {
             let req = LlmRequest {
                 stage: self.cfg.stage,
@@ -312,8 +331,7 @@ impl StoreSubAgentRunner {
             };
             let response = self.cfg.llm.complete(req).await?;
             session.tokens.lock().unwrap().add(&response);
-            // 心跳写父 run（决策 88 同一种做法）：子代理在跑，父节点就没闲着，
-            // 不能让父节点因空闲超时被误杀。
+            // 每轮响应后再打一次：心跳任务本身有周期，这里补一次使活动记录更及时。
             let _ = self
                 .cfg
                 .store
@@ -350,6 +368,25 @@ impl StoreSubAgentRunner {
 }
 
 /// 收尾子代理 run 行（决策 100：token 记在子代理自己的 run 行上，父 run 不重复累加）。
+/// 子代理运行期间持续给父 run 打心跳，直到被 abort（票 08）。
+///
+/// 父 run 参与节点超时判定，而子代理的一次 LLM 调用可能长过 `node_idle_timeout_sec`；
+/// 缺了这个心跳，父节点会因为「子代理在跑、父 run 看似无活动」被误判超时。
+/// 与 `run_command` 的周期心跳同一种做法（决策 100）。
+async fn keep_parent_run_alive(store: Store, parent_run_id: i64) {
+    let mut tick = tokio::time::interval(SUB_AGENT_HEARTBEAT_INTERVAL);
+    tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    tick.tick().await; // interval 首次 tick 立即完成，调用方已打过一次，跳过
+    loop {
+        tick.tick().await;
+        if store.touch_run_heartbeat(parent_run_id).await.is_err() {
+            // 心跳写失败（库不可用等）不该打死子代理——父节点的超时判定自成一路，
+            // 这里静默退出即可，真出问题会在别处显形。
+            return;
+        }
+    }
+}
+
 async fn finish_run(
     store: &Store,
     run_id: i64,

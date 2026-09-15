@@ -2854,3 +2854,101 @@ async fn spawn_sub_agent_absent_unless_declared() {
         );
     }
 }
+
+/// 票 08（安全，回归）：子代理的工具集是**强制**的，不只是「广告里没写」。
+///
+/// 模型完全可能无视 tool 定义直接发一个 `run_command` tool_call——工具分发只按名字
+/// 路由，因此仅限制 advertised defs 等于没有边界。这条用例让子代理**真的**去调
+/// `run_command` 与 `write_file`，断言两者都被拒绝、且磁盘上没留下痕迹。
+#[tokio::test]
+async fn subagent_cannot_execute_tools_outside_its_readonly_set() {
+    let ctx = setup("true", Settings::default()).await;
+    declare_sub_agent(&ctx).await;
+
+    let worktree = ctx.store.home().worktree_path("t-enforce");
+    std::fs::create_dir_all(&worktree).unwrap();
+
+    let mut script = Script::new();
+    design_scripts(&mut script);
+    script
+        .for_node(Stage::Develop, Node::Execute)
+        .push(testkit::Step::Tool {
+            name: "spawn_sub_agent".into(),
+            arguments: serde_json::json!({"task": "去跑命令并写文件"}),
+        })
+        .write_file(
+            "src/lib.rs",
+            "pub fn add(a: i32, b: i32) -> i32 { a + b }\n#[test]\nfn adds() { assert_eq!(add(1, 2), 3); }\n",
+        )
+        .write_file("tests/acceptance.rs", "#[test]\nfn ok() {}\n")
+        .run_command(
+            "git add -A && git -c user.name=f -c user.email=f@l commit -m 'feat: task t-enforce'",
+        )
+        .submit(&CodeChanges {
+            branch_name: "kanban/t-enforce".into(),
+            changed_files: vec![],
+            unit_test_files: vec![],
+        });
+    script
+        .for_node(Stage::Review, Node::Execute)
+        .submit(&ReviewResult {
+            approved: true,
+            review_report_path: Some("review-report.md".into()),
+            required_changes: vec![],
+        });
+    script
+        .for_node(Stage::Test, Node::Execute)
+        .submit(&TestResult {
+            passed: true,
+            test_report_path: Some("test-report.md".into()),
+            failures: vec![],
+            gate_recheck: false,
+        });
+    // 子代理无视自己的只读工具集，硬发写文件与跑命令
+    script.push_subagent(testkit::Step::Tool {
+        name: "write_file".into(),
+        arguments: serde_json::json!({"path": "SUBAGENT_WROTE.txt", "content": "越权"}),
+    });
+    script.push_subagent(testkit::Step::Tool {
+        name: "run_command".into(),
+        arguments: serde_json::json!({"command": "echo pwned > SUBAGENT_RAN.txt"}),
+    });
+    script.push_subagent(testkit::Step::Text("摘要".into()));
+
+    ctx.agent.set_script(script);
+    testkit::seed_task(&ctx.store, "t-enforce", "p1")
+        .await
+        .unwrap();
+    admit(&ctx, "t-enforce").await;
+    ctx.executor.run("t-enforce").await.unwrap();
+
+    // ① 写文件被拒：worktree 里不得出现子代理写的文件
+    assert!(
+        !worktree.join("SUBAGENT_WROTE.txt").exists(),
+        "子代理不得写文件——工具须被强制拒绝，而不是只在 tool 定义里缺席"
+    );
+    // ② 跑命令被拒：磁盘上不得留下命令副作用
+    assert!(
+        !worktree.join("SUBAGENT_RAN.txt").exists(),
+        "子代理不得执行命令"
+    );
+    // ③ 两次越权都作为 tool_result 文本回到子代理（不烧父节点的 tool_retry_max）
+    let requests = ctx.agent.request_log();
+    let sub_reqs: Vec<_> = requests
+        .iter()
+        .filter(|r| r.run.as_ref().is_some_and(|c| c.agent_type == "subagent"))
+        .collect();
+    let refusal = sub_reqs
+        .last()
+        .expect("应有子代理请求")
+        .messages
+        .iter()
+        .filter(|m| m.role == agentpipeline_core::agent::Role::Tool)
+        .filter_map(|m| m.content.as_deref())
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(
+        refusal.contains("write_file") || refusal.contains("只读"),
+        "越权调用须有可归因的拒绝文本：{refusal}"
+    );
+}

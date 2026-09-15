@@ -65,19 +65,12 @@ pub trait CommandRecorder: Send + Sync + 'static {
 
 /// 子代理调用的入参（决策 172③，票 08）。
 ///
-/// 只带**每次调用不同**的东西：子任务文本与父 run。任务 / 分支 / attempt / 只读工具集
+/// 只带**每次调用不同**的东西：子任务文本。任务 / 分支 / attempt / 父 run / 只读工具集
 /// 这些「同一次节点执行内固定」的信息由 [`SubAgentRunner`] 的实现持有——它是按
-/// attempt 构造的，天然知道自己在哪个节点的哪一次执行里。
+/// attempt 构造的，天然知道自己在哪个节点、哪一次执行、属于哪个父 run 里。
 pub struct SubAgentRequest {
     /// 父代理给出的子任务描述。
     pub task: String,
-    /// 父 run：子代理的 run 行以它为 `parent_run_id`，心跳也刷它。
-    pub parent_run_id: i64,
-    /// 父节坐标：子代理落 run / 会话行复用同一 stage / node，归属靠 `parent_run_id` 区分。
-    pub stage: Stage,
-    pub node: Node,
-    pub worktree_path: PathBuf,
-    pub task_dir: PathBuf,
 }
 
 /// 子代理执行接缝（决策 172③，票 08）。
@@ -170,6 +163,12 @@ pub struct ToolExecutor {
     /// 子代理执行器（决策 172③，票 08）。`None` = `spawn_sub_agent` 不可用
     /// ——默认关闭即由此表达，而非让工具层假装支持。
     sub_agent: Option<Arc<dyn SubAgentRunner>>,
+    /// **强制**的工具白名单（决策 172③，票 08）。`None` = 无限制（父节点的常态）。
+    ///
+    /// 这是子代理只读边界的真正落点。只限制「广告出去的 tool 定义」是不够的：
+    /// [`Self::execute`] 按 `call.name` 路由，模型完全可以无视 tool 定义直接发一个
+    /// `run_command`，那样它就真被跑掉了。故边界必须落在**执行点**。
+    allow: Option<&'static [&'static str]>,
 }
 
 /// 命令输出推流的上下文（票 14）：SSE 去向 + 事件里要带的任务/分支。
@@ -214,6 +213,7 @@ impl ToolExecutor {
             command_heartbeat_interval: COMMAND_HEARTBEAT_INTERVAL,
             sse: None,
             sub_agent: None,
+            allow: None,
         }
     }
 
@@ -225,6 +225,15 @@ impl ToolExecutor {
     /// 注入子代理执行器（决策 172③，票 08）。不注入即 `spawn_sub_agent` 不可用。
     pub fn with_sub_agent(mut self, runner: Arc<dyn SubAgentRunner>) -> Self {
         self.sub_agent = Some(runner);
+        self
+    }
+
+    /// 把工具集**收窄**为给定的白名单（决策 172③，票 08）。
+    ///
+    /// 与「只少给几个 tool 定义」不同：越界的调用在 [`Self::execute`] 处被拒，模型
+    /// 就算硬发也执行不了。子代理的只读边界靠它成立。
+    pub fn with_allowed_tools(mut self, allow: &'static [&'static str]) -> Self {
+        self.allow = Some(allow);
         self
     }
 
@@ -249,7 +258,19 @@ impl ToolExecutor {
     }
 
     /// 执行一次工具调用。
+    ///
+    /// 白名单（[`Self::with_allowed_tools`]）在**这里**生效——先于任何分发。只靠
+    /// tool 定义约束是纸糊的：模型可以无视定义直接发 `run_command`。
     pub async fn execute(&self, call: &ToolCall, ctx: &ToolCallContext) -> Result<ToolOutcome> {
+        if let Some(allow) = self.allow {
+            if !allow.contains(&call.name.as_str()) {
+                return Err(Error::Validation(format!(
+                    "工具 {} 不在本次调用的允许集内（只读子代理仅允许：{}）",
+                    call.name,
+                    allow.join(" / ")
+                )));
+            }
+        }
         let outcome = match call.name.as_str() {
             "write_file" => self.write_file(call, ctx).await?,
             "edit_file" => self.edit_file(call, ctx).await?,
@@ -369,21 +390,16 @@ impl ToolExecutor {
                 "spawn_sub_agent 需要 {task} 参数（子任务描述）。请补充后重试。",
             ));
         }
-        // run_id 是子代理归属父 run 的唯一凭据：没有它就无法落 parent_run_id，
-        // 宁可明确拒绝也不要落一行无父的孤儿 run。
-        let Some(parent_run_id) = ctx.run_id else {
+        // 父 run 由运行器自己持有（它按 attempt 构造）。这里仍要求 ctx 带 run_id：
+        // 缺它说明调用不在节点执行的上下文里，那种情况不该派生（会落无父的孤儿 run）。
+        if ctx.run_id.is_none() {
             return Ok(ToolOutcome::ok(
                 "spawn_sub_agent 需要所属 run 上下文（当前调用没有 run_id），无法派生。",
             ));
-        };
+        }
         let summary = runner
             .run(SubAgentRequest {
                 task: task.to_string(),
-                parent_run_id,
-                stage: ctx.stage,
-                node: ctx.node,
-                worktree_path: ctx.worktree_path.clone(),
-                task_dir: ctx.task_dir.clone(),
             })
             .await?;
         Ok(ToolOutcome::ok(summary))

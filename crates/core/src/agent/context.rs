@@ -435,8 +435,14 @@ pub struct L4Plan {
 /// [`crate::pipeline::subagent`] 的**只读子代理工具**是两件事——后者（票 08）是模型
 /// 在对话中主动调用的能力，不参与 L4 判定，也没有改变本节的现状。
 ///
-/// `BatchByNode` / `SpawnSubAgents` 至今**没有实现**，executor 一律按
+/// `BatchByNode` / `SpawnSubAgents` 从未实现，executor 一律按
 /// `pending(context_overflow)` 收口（决策 148 ⑦ / 154：L4 兜底只有两级）。
+///
+/// **既存偏差（非票 08 引入，且票 08 未改动它）**：决策 154① 裁定删除
+/// `L4Plan` / `L4Action` / `plan_l4` / `l4_pending_kind` 这一组，但它们在
+/// `84d2c8f`（2026-09-12）随执行器落地后**始终未被删除**；executor 只读 `plan.action`
+/// 来打一条 warn，`force_keep_recent_rounds` 与 `l4_pending_kind` 仍只有测试引用。
+/// 该清理不属于票 08（本票只改注释、不动语义），登记为既存瑕疵。
 pub fn plan_l4(stage: Stage, node: Node, spawn_sub_agent_enabled: bool) -> L4Plan {
     let action = match (stage, node) {
         (Stage::Test, Node::Execute) | (Stage::Review, Node::Execute) => L4Action::BatchByNode,

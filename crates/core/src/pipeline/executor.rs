@@ -2846,23 +2846,7 @@ impl Executor {
 
 // ─────────────────────────────── 节点输出 ───────────────────────────────
 
-/// 一次 agent attempt 的 token 计量（决策 46：prompt / completion / cache 落 run 行）。
-#[derive(Debug, Clone, Copy, Default)]
-struct RunTokens {
-    prompt: u32,
-    completion: u32,
-    cache_read: u32,
-    cache_write: u32,
-}
-
-impl RunTokens {
-    fn add(&mut self, response: &crate::agent::client::AgentResponse) {
-        self.prompt += response.prompt_tokens;
-        self.completion += response.completion_tokens;
-        self.cache_read += response.cache_read_tokens;
-        self.cache_write += response.cache_write_tokens;
-    }
-}
+use crate::pipeline::subagent::RunTokens;
 
 impl Executor {
     /// 决策 123 的 `tool_event` 发射（start / end / error 三态共用一个出口）。

@@ -52,7 +52,7 @@
 | ④ | 心跳与流式节奏控制（停跳 / 慢滴） | 64 / 66 / 100（空闲/绝对超时、心跳源） |
 | ⑤ | 超长工具结果注入 | §12.13 L1 裁剪 / L2 卸载（110）/ L3 压缩 / L4 兜底 |
 | ⑥ | 伪阶段脚本：conflict_check 给 duplicate_risk 等级、validator_cross_check 给合格/不合格 | 60 / 67 / 134 / 135 |
-| ⑦ | 子代理**不**脚本化 | 45（默认关闭；L4 走 `pending(context_overflow)`，开启路径实现后补） |
+| ⑦ | 子代理**可**脚本化（票 08） | `Script::push_subagent` 单列一个队列——子代理复用父节点的 `(stage, node)`，共用一个队列会让它悄悄吃掉父节点的一步。见 §10 决策 172③ 行 |
 
 **真 LLM 冒烟（`#[ignore]`，手动跑）：两条**——① 单节点：architect-design.execute 一次真调用，断言 rig 适配 + 结构化输出解析可用；② 全流程（主流程票 04）：真 key + 真模型驱动完整主流程到 `pending(merge_approval)`，fixture 为真实可构建小工程使闸门真跑，断言每节点有 run 行、`submit_metadata` 在真模型返回格式下可解析、token > 0、无节点落 `retry_exhausted`，失败时输出定位诊断（哪个 `(stage, node)` 的什么错误）。运行：`AGENTPIPELINE_SMOKE_*` 环境变量（见 `crates/core/tests/llm_smoke.rs` 头部说明）。两条都需真 key，**不进任何自动门**（决策 142）。
 

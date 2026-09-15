@@ -151,11 +151,6 @@ impl Script {
         self.subagent_steps.pop_front()
     }
 
-    /// 子代理脚本剩余步数（票 08）。
-    pub fn remaining_subagent(&self) -> usize {
-        self.subagent_steps.len()
-    }
-
     /// 取出并消费某个 `(stage, node)` 的下一步——供 mock HTTP 脚本服务器复用
     /// （票 17：真实二进制冒烟用 `Script` 驱动 `mock_llm`）。
     pub fn take_next(&mut self, stage: Stage, node: Node) -> Option<Step> {
