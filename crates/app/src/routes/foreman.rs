@@ -36,7 +36,13 @@ const SESSION_PAGE_LIMIT: usize = 500;
 ///
 /// `total_tokens` 由**落库的 token 列求和**得出，不是另存一个计数器：计数器会与实际
 /// 行数漂移（崩在写计数器之前就永久偏了），而求和永远等于台账里真实存在的东西。
+///
+/// 未接线时与另外两个端点**一样**回 503：读会话本身只需要库，但这个能力的三个入口
+/// 是同一件事的三面——一个「能读历史、发不出话」的页面比一句「未接线」更难排查。
 pub async fn session(State(state): State<AppState>) -> ApiResult<impl IntoResponse> {
+    if state.foreman.is_none() {
+        return Err(foreman_unwired());
+    }
     let store = state.store.clone();
     let messages = store
         .list_foreman_messages(SESSION_PAGE_LIMIT)
@@ -99,6 +105,9 @@ pub async fn send(
 pub async fn stream(
     State(state): State<AppState>,
 ) -> ApiResult<Sse<impl futures::Stream<Item = Result<Event, std::convert::Infallible>>>> {
+    if state.foreman.is_none() {
+        return Err(foreman_unwired());
+    }
     let receiver = state.sse.subscribe();
     let stream =
         tokio_stream::wrappers::BroadcastStream::new(receiver).filter_map(|item| async move {

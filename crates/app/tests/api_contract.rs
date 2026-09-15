@@ -4338,17 +4338,27 @@ async fn empty_home_can_converse_through_the_api() {
         .contains("先建一个项目"));
 }
 
-/// 未接线时是 503 而不是 500：服务是好的，是这个能力这次没被接上。
+/// 未接线时三个端点**一律** 503 而不是 500：服务是好的，是这个能力这次没被接上。
+///
+/// 三个入口是同一件事的三面——留下一个「能读历史、发不出话」的页面比一句「未接线」
+/// 更难排查（而且读会话虽然只需要库，页面拿到历史后第一件事就是发话）。
 #[tokio::test]
 async fn foreman_endpoints_report_503_when_unwired() {
     let api = api_full(Settings::default(), Vec::new(), None, Vec::new()).await;
+
     let (status, body) = get(&api, "/foreman/session").await;
-    // 读会话不依赖 runner（它直接读表），故仍应 200——接线与否只影响「能不能说话」。
-    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{body}");
+    assert!(body["error"].as_str().unwrap().contains("未接线"));
 
     let (status, body) = post(&api, "/foreman/messages", json!({"text": "在吗"})).await;
     assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{body}");
     assert!(body["error"].as_str().unwrap().contains("未接线"));
+
+    let (status, _) = get(&api, "/foreman/stream").await;
+    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+    // 未接线时不落任何一行会话——拒绝发生在写之前。
+    let store = api.state.store.clone();
+    assert!(store.list_foreman_messages(10).await.unwrap().is_empty());
 }
 
 /// 空消息被拒且不入账（400，不是 500）。

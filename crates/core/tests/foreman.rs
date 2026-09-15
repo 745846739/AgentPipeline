@@ -306,10 +306,16 @@ async fn the_llm_request_carries_the_foreman_identity_and_a_placeholder_stage() 
     // 阶段枚举**没有**新增变体（决策 182①）：占位阶段是既有的 Init。
     assert_eq!(req.stage, Stage::Init);
     // 工具集只有两个只读台账工具——没有走 effective_tools（那条路会并入 run_command）。
+    //
+    // 断言打的是**白名单常量**而不是字面量：`FOREMAN_TOOLS` 是安全边界，而 `tool_defs()`
+    // 是「广告给模型的那一份」，两者各写一次名字就会漂移——漂移的表现是模型看得见一个
+    // 调用就被拒的工具（或反过来，一个能调但没人告诉它的工具），两种都很难从现象定位。
     let names: Vec<&str> = req.tools.iter().map(|t| t.name.as_str()).collect();
-    assert_eq!(names.len(), 2);
-    assert!(names.contains(&"read_task"));
-    assert!(names.contains(&"read_conversation"));
+    assert_eq!(
+        names,
+        FOREMAN_TOOLS.to_vec(),
+        "广告的工具集必须与白名单逐字一致"
+    );
     for forbidden in [
         "read_file",
         "list_dir",

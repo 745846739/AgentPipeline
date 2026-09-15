@@ -68,8 +68,9 @@ AGENTPIPELINE_LAN=1 make desktop-run
 > `POST /pairing/reset` 一键重置换一枚；配对 URL 的形状是 `{base}/?pair={token}`。
 > **默认回环绑定（本机使用）不要求任何配对**。两点仍需注意：只读页面里的会话与任务内容是明文展示的、
 > 同网段可看；且服务端这层之外没有别的防线，请勿在公共 Wi-Fi 下开启，更稳妥可用 SSH 隧道 / Tailscale。
-> 前端消费 `?pair=` 这条链路的**现状**（服务端已就绪、前端尚未接）记在
-> [docs/operations.md](docs/operations.md) §12.16。
+> 前端消费 `?pair=` 这条链路（`main.ts` 启动时收取 → localStorage → 从地址栏抹掉 → 之后作为
+> `X-AgentPipeline-Token` 头带上，含只读 GET），以及令牌与局域网态势的完整交代，
+> 记在 [docs/operations.md](docs/operations.md) §12.16。
 
 ### 局域网访问（决策 157）
 

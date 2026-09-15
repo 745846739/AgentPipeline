@@ -362,7 +362,20 @@
   <!-- ── 状态区：当前急停 + 值班板。钉在第一屏，不随时间线滚动（票 04） ── -->
   <section class="zone-status" aria-label="值班台">
     {#if loadError}
-      <div class="blank error">{loadError}</div>
+      <div class="blank error">
+        <p>{loadError}</p>
+        <!-- 配对入口在**两条**失败路径上都要给（票 07）：读会话与发话各自会撞 403，
+             只在其中一处给链接，另一处的使用者就只看到一句「这台设备还没配对」而无处可去。 -->
+        {#if needsPairing(loadError)}
+          <p class="note">
+            去看板顶栏的<a
+              class="crumb"
+              href="#/share"
+              onclick={() => router.navigate('/share')}>手机访问</a
+            >页，在已配对的设备上重扫一次二维码即可。
+          </p>
+        {/if}
+      </div>
     {/if}
 
     {#each pending as task (task.id)}
