@@ -116,8 +116,8 @@ make fmt             # 格式化（写回）
 **本项目无 CI**（无 `.github/workflows/`）：闸门靠本地执行，这是当前形态而非遗漏。
 
 当前状态：**Rust 848 个用例全过**（另有 2 个 `#[ignore]` 真 LLM 冒烟：单节点 + 全流程），
-`fmt` / `clippy -D warnings` 干净；前端 **280 个 vitest 全过** + `svelte-check` 0 error /
-0 warning + **31 条 playwright E2E 全过**（共 33 例，2 例截图证据默认 skip，见下）（`make check-e2e`）。
+`fmt` / `clippy -D warnings` 干净；前端 **290 个 vitest 全过** + `svelte-check` 0 error /
+0 warning + **33 条 playwright E2E 全过**（共 35 例，2 例截图证据默认 skip，见下）（`make check-e2e`）。
 
 ## 代码结构
 

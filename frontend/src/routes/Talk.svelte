@@ -21,6 +21,13 @@
     pendingLabel,
     taskDuration,
   } from '../lib/pipeline';
+  import {
+    isFoldable,
+    isStopOpen,
+    resolveOpenStop,
+    stopActionCount,
+    toggleOpenStop,
+  } from '../lib/talkStops';
   import { TaskStream, type StreamStatus } from '../realtime/connection';
   import {
     appendForemanDelta,
@@ -33,15 +40,23 @@
   import Sprite from '../components/render/Sprite.svelte';
   import Gauge from '../components/render/Gauge.svelte';
   import PendingActions from '../components/board/PendingActions.svelte';
+  import DiffReviewPanel from '../components/task/DiffReviewPanel.svelte';
   import { router } from '../router.svelte';
 
   /**
-   * 对讲台（theme-6-pixel.md §3.3；决策 174 / 182）。版面**三分区**（票 04）：
-   * 状态区（当前急停 + 值班板）／对话时间线（值班长的话、值班员的话、工位回执）／输入坞。
+   * 对讲台（theme-6-pixel.md §3.3；决策 174 / 182 / 183）。版面**三分区**（票 04）：
+   * 状态区（当前急停）／对话时间线（值班长的话、值班员的话、工位回执）／输入坞。
+   * 值班板是**独立的一块**——桌面右栏、窄屏收成时间线之上的横向灯条，不在状态区里。
    *
    * **整页钉在视口内，时间线是唯一会滚的区域**：一个两小时前挂起的急停被对话顶出视野
    * 是本页最不能出的错，故不靠 sticky 逐段救，而是把「会长的部分」与「不能动的部分」
    * 放在两个不同的滚动容器里。
+   *
+   * **但状态区自己也有上限**（桌面 46vh / 窄屏 38vh，超高时区内滚），而一张急停轮内联着
+   * 后端下发的动作集，最高的形状（带补充输入的 resume）约 330px——13″ 上可用只有约
+   * 344px，**展开一张就已经占满整个区**。故急停轮折叠（决策 183）：**只有一张时不动**
+   * （单急停版面与折叠前一致），两张以上**一张都不展开**、全部收成一行约 36px 的摘要条；
+   * 人点「展开恢复动作」才展开那一张，且同时只展开一张（判据在 `lib/talkStops.ts`）。
    *
    * **对面是真的会说话的值班长**（`/foreman/session` + `/foreman/messages` + `/foreman/stream`）：
    * 对话不依赖任务——空看板（无项目无任务）也照样能问它话。
@@ -75,6 +90,16 @@
   const pending = $derived(board.pendingTasks);
   /** 空看板：装载完成之后一个任务都没有（装载中不算——那会把「还没读到」说成「空」）。 */
   const emptyBoard = $derived(!board.loading && board.tasks.length === 0);
+
+  /**
+   * 展开的那张急停（决策 183）。`undefined` = 还没选过（跟随默认：**只有一张时展开它，
+   * 两张以上一张都不展开**）、`null` = 人显式收起、否则是那张的 id。三态的判据在
+   * `lib/talkStops.ts`，此处只持状态。
+   */
+  let chosenStop = $state<string | null | undefined>(undefined);
+  const stopIds = $derived(pending.map((t) => t.id));
+  const foldable = $derived(isFoldable(stopIds));
+  const openStop = $derived(resolveOpenStop(stopIds, chosenStop));
 
   /** 8 工位的值班灯：按列聚合，与看板列头同一套词表与 sprite（`BOARD_COLUMNS`）。 */
   const crew = $derived(
@@ -359,7 +384,8 @@
     </div>
   </div>
 
-  <!-- ── 状态区：当前急停 + 值班板。钉在第一屏，不随时间线滚动（票 04） ── -->
+  <!-- ── 状态区：当前急停。钉在第一屏，不随时间线滚动（票 04）。值班板不在本区
+       ——桌面是右栏、窄屏是时间线之上的横向灯条 ── -->
   <section class="zone-status" aria-label="值班台">
     {#if loadError}
       <div class="blank error">
@@ -380,39 +406,90 @@
 
     {#each pending as task (task.id)}
       {@const detail = details[task.id]}
-      <!-- 急停轮：全站唯一"响"的一处（琥珀框 + ▼ + 恢复动作） -->
-      <article class="turn warn">
-        <div class="dtag">⏸ 等你拍板 · {pendingLabel(task.pending_reason)}</div>
+      {@const count = stopActionCount(detail)}
+      {@const open = isStopOpen(foldable, openStop, task.id)}
+      <!-- 急停轮：全站唯一"响"的一处（琥珀框 + ▼ + 恢复动作）。折叠只收动作区，不收身份：
+           折叠行的框色 / 硬投影 / ▼ 与展开行完全相同（决策 183） -->
+      <article class="turn warn" class:folded={!open}>
         <!-- 名牌是发言者：这一轮是操作台在报"卡住了、要你按键"，不是值班长在说话
              （值班长的话一律没有按钮，见 §3.3 的四条纪律） -->
         <div class="dname">操作台</div>
-        <p>
-          「{task.title}」走到 {task.current_stage}，{task.pending_reason?.message ?? '需要你决定'}。
-        </p>
-        <div class="ctx">
-          状态：<b>{task.status}</b> ▪ 已跑 {formatDuration(taskDuration(task))} ▪
-          <Gauge tokens={task.total_tokens} tone="warn" /> {formatTokens(task.total_tokens)} tok
-        </div>
 
-        <div class="grp">恢复动作</div>
-        {#if detail}
-          <PendingActions
-            actions={detail.actions}
-            cursors={detail.cursors}
-            pendingType={task.pending_reason?.type}
-            disabled={board.actionBusy !== null}
-            isBusy={(a) => board.actionBusy === `${task.id}:${a.action}`}
-            onaction={(a, opts) => handleAction(task.id, a, opts)}
-          />
+        {#if open}
+          <div class="dtag">⏸ 等你拍板 · {pendingLabel(task.pending_reason)}</div>
+          <p>
+            「{task.title}」走到 {task.current_stage}，{task.pending_reason?.message ?? '需要你决定'}。
+          </p>
+          <div class="ctx">
+            状态：<b>{task.status}</b> ▪ 已跑 {formatDuration(taskDuration(task))} ▪
+            <Gauge tokens={task.total_tokens} tone="warn" /> {formatTokens(task.total_tokens)} tok
+          </div>
+
+          <!-- 合并审批走 DiffReviewPanel 的**动作行**，与任务详情页（`PendingDossier` /
+               Diff 页签）同一套渲染：后端把 approve / return 都归为 `side_effect`，
+               交给 PendingActions 会两颗都落进「旁路动作」——全站最重要的一颗
+               「合入」于是长成一行弱化灰字，看不出它才是主动作（原型 `.acts` 里它是
+               实心绿钮 `btn solid`，`返回修改` 才是 `btn quiet`）。
+               其余 pending 类型仍交 PendingActions：那里才有游标选择与 resume 的自由输入。 -->
+          {#if detail && task.pending_reason?.type === 'merge_approval'}
+            <DiffReviewPanel
+              actionsOnly
+              diff={null}
+              raw={null}
+              actions={detail.actions}
+              cursors={detail.cursors}
+              busy={board.actionBusy !== null}
+              onaction={(a, opts) => handleAction(task.id, a, opts)}
+            />
+          {:else if detail}
+            <PendingActions
+              actions={detail.actions}
+              cursors={detail.cursors}
+              pendingType={task.pending_reason?.type}
+              disabled={board.actionBusy !== null}
+              isBusy={(a) => board.actionBusy === `${task.id}:${a.action}`}
+              onaction={(a, opts) => handleAction(task.id, a, opts)}
+            />
+          {:else}
+            <!-- 详情没到（拉取失败）：只给去看详情的路，不假装动作集是空的 -->
+            <button type="button" class="btn" onclick={() => router.navigate(`/task/${task.id}`)}>
+              打开任务详情
+            </button>
+          {/if}
+
+          {#if board.actionError && board.actionBusy === null}
+            <div class="ctx err">{board.actionError}</div>
+          {/if}
+
+          {#if foldable}
+            <button
+              type="button"
+              class="expander"
+              aria-expanded={open}
+              onclick={() => (chosenStop = toggleOpenStop(openStop, task.id))}
+            >
+              收起 ▾
+            </button>
+          {/if}
         {:else}
-          <!-- 详情没到（拉取失败）：只给去看详情的路，不假装动作集是空的 -->
-          <button type="button" class="btn" onclick={() => router.navigate(`/task/${task.id}`)}>
-            打开任务详情
-          </button>
-        {/if}
-
-        {#if board.actionError && board.actionBusy === null}
-          <div class="ctx err">{board.actionError}</div>
+          <!-- 摘要条（约 36px）：两张以上急停时未展开的那些仍留在第一屏上——**默认态就是
+               「都看得到」**。这一行三块：琥珀的「等你拍板 + 类型」、「标题 · N 个动作」、
+               展开钮。动作个数是「动作集仍在后端下发、仍在这一轮里」的可见证据；详情没到
+               时不报数（不把「还没读到」说成「没有」——决策 182①） -->
+          <div class="srow">
+            <span class="dtag">⏸ 等你拍板 · {pendingLabel(task.pending_reason)}</span>
+            <span class="st">
+              「{task.title}」{#if count !== null}· {count} 个动作{/if}
+            </span>
+            <button
+              type="button"
+              class="expander"
+              aria-expanded={open}
+              onclick={() => (chosenStop = toggleOpenStop(openStop, task.id))}
+            >
+              展开恢复动作 ▸
+            </button>
+          </div>
         {/if}
       </article>
     {/each}
@@ -703,6 +780,48 @@
     line-height: 1;
     animation: blink 1s steps(2) infinite;
   }
+  /* ── 摘要条：两张以上急停时，未展开的那些收成一行（决策 183）。
+     只收动作区（那块约 158px 是卡片高度的主要来源），**不收身份**——框色、4px 硬投影、
+     ▼ 与展开行完全一致，故「全站唯一的响」在两种形态下是同一个东西，也不新增动画位 ── */
+  .turn.warn.folded {
+    padding: 6px 12px 7px;
+  }
+  .srow {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    flex-wrap: wrap;
+  }
+  .st {
+    flex: 1;
+    min-width: 0;
+    color: var(--text-2);
+    overflow-wrap: anywhere;
+  }
+  /* 展开/收起钮：与「查看产出文件 ▸」同一手法（`.linklike`）——正文色 + 下划线。
+     刻意**不长成像素钮**：像素钮是给后端下发动作的，折叠是呈现，两者混同会让人
+     以为折叠也在改状态（§3.3 边界） */
+  .expander {
+    color: var(--text-3);
+    text-decoration: underline;
+    text-underline-offset: 3px;
+  }
+  .srow .expander {
+    flex: none;
+  }
+  /* 摘要条里的琥珀标签：与展开行同一个 `.dtag`，只去掉它作为块级首行时的那 8px 下边距
+     （摘要条是**一行**，不是「标签一行 + 正文一行」） */
+  .srow .dtag {
+    flex: none;
+    margin-bottom: 0;
+  }
+  .turn > .expander {
+    display: block;
+    margin-top: 9px;
+  }
+  .expander:hover {
+    color: var(--pending);
+  }
   .dtag {
     color: var(--pending);
     margin-bottom: 8px;
@@ -718,12 +837,6 @@
   }
   .ctx.err {
     color: var(--stop);
-  }
-  .grp {
-    font-size: 12px;
-    color: var(--text-4);
-    letter-spacing: 0.08em;
-    margin: 12px 0 7px;
   }
   .dim {
     color: var(--text-4);

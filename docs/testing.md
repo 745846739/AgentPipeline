@@ -187,10 +187,10 @@ harness = FakeAgent（§3.2）+ testkit fixture（§3.3）+ 临时 home + 手动
 
 | 层 | 工具 | 用例 |
 |---|---|---|
-| 单元 | vitest | `reduce.ts` 归约表逐事件（design §9.1 每行：列归属 / 信号色 / 待办计数 / dossier 开合）；allowed_actions 渲染分组（resume / side_effect、`requires_input`）；NotificationPolicy（cooldown、quiet_hours、cancelled 不弹）；**值班长流式归约 `realtime/foreman.test.ts`（6 条，决策 182③）**：增量按到达顺序累积且期间保持流式态、非工头 / 非增量事件旁落（返回同一 state）、收尾把非空回话收敛为回话并熄灭方块光标、收尾时空 / 全空白回话**不清掉已到达的文字**、断流时已收到的部分原文保留只多一个说明、开新一轮丢掉上一轮的残留 |
+| 单元 | vitest | `reduce.ts` 归约表逐事件（design §9.1 每行：列归属 / 信号色 / 待办计数 / dossier 开合）；allowed_actions 渲染分组（resume / side_effect、`requires_input`）；NotificationPolicy（cooldown、quiet_hours、cancelled 不弹）；**值班长流式归约 `realtime/foreman.test.ts`（6 条，决策 182③）**：增量按到达顺序累积且期间保持流式态、非工头 / 非增量事件旁落（返回同一 state）、收尾把非空回话收敛为回话并熄灭方块光标、收尾时空 / 全空白回话**不清掉已到达的文字**、断流时已收到的部分原文保留只多一个说明、开新一轮丢掉上一轮的残留；**状态区急停折叠判据 `lib/talkStops.test.ts`（10 条，决策 183）**：一张急停不折叠、**两张以上一张都不展开**、一张时展开它自己、无急停时无展开项、显式收起不弹回、选中项仍在则保持、选中项被处理掉后回落到默认且不悬空、翻转一次只换一张、**展开判据对单张恒展开**、详情没到不报动作数 |
 | 组件 | @testing-library/svelte | PendingActions（按所属游标取 cursor_id——决策 91）；DiffReviewPanel（无「拒绝」——决策 23）；StalledBadge（决策 34）；**像素原语 `crate.test.ts`（票 05 / 决策 169）**：量表 16 段与点亮折算、boss 条 20 段与最后一次转红、`retry_exhausted` 权威强制转红、六态映射（灯 / 描边 / 小人节奏）、sprite 非空 SVG + `currentColor` + 工头固定肤色 |
 | **契约** | vitest（纯数据 + 解析） | **主题契约模块（票 02 / 决策 169，本 effort 唯一新接缝）**：`theme/contract.test.ts` 几何常量与 theme-6 §2.3 逐项一致、15 枚 sprite 网格合法、六态映射齐备、深浅两套 token 名一致、量表折算边界；`theme/css-parity.test.ts` 读 `app.css` 抽两个 token 块与契约**逐条比对** + 扫描全部组件**禁止 token 块之外出现裸十六进制颜色**（像素纪律的可机器检查形式，白名单两处并注明理由） |
-| E2E | playwright（只 Chromium） | **真 axum 后端 + FakeAgent**（临时 home），**十条 33 例**：① happy path（看板 → 详情 → 页签 → diff 审批合入 → **校验合入到 main 的代码符合任务目标**）；② pending → dossier 面板 → resume（琥珀面板、顶栏待办计数）；③ 闸门真跑与失败分流（**真实 Node 工程**，闸门真执行 `npm test`）；④ provider 配错可理解可恢复（中文提示 + 原始诊断 + 「测试连接」）；⑤ UI 三步创建（×5）；⑥ 人工评审分支 + 合并「返回修改」（×3）；⑦ 日志/对话内容 + 刷新恢复（×2）；⑧ 并发第二任务（×3：互不阻塞 / 多游标分支归属 / 基准前移）；**⑨ 像素主题（×6，票 12 / 决策 169）**；**⑩ 对讲台（×8，决策 176 / 182）**。页面加载**编译期内嵌的真实 bundle**（主流程票 01） |
+| E2E | playwright（只 Chromium） | **真 axum 后端 + FakeAgent**（临时 home），**十条 35 例**：① happy path（看板 → 详情 → 页签 → diff 审批合入 → **校验合入到 main 的代码符合任务目标**）；② pending → dossier 面板 → resume（琥珀面板、顶栏待办计数）；③ 闸门真跑与失败分流（**真实 Node 工程**，闸门真执行 `npm test`）；④ provider 配错可理解可恢复（中文提示 + 原始诊断 + 「测试连接」）；⑤ UI 三步创建（×5）；⑥ 人工评审分支 + 合并「返回修改」（×3）；⑦ 日志/对话内容 + 刷新恢复（×2）；⑧ 并发第二任务（×3：互不阻塞 / 多游标分支归属 / 基准前移）；**⑨ 像素主题（×6，票 12 / 决策 169）**；**⑩ 对讲台（×10，决策 176 / 182 / 183）**。页面加载**编译期内嵌的真实 bundle**（主流程票 01） |
 
 **像素主题 e2e（票 12 / 决策 169）——`pixel-theme.spec.ts` 六条，全部断言真应用上算出来的样式：**
 ① 深浅两套 token 计算值 + 切换真的换 token + 圆角 0 / 2px 描边 / `4px 4px 0` 硬投影；
@@ -199,16 +199,19 @@ harness = FakeAgent（§3.2）+ testkit fixture（§3.3）+ 临时 home + 手动
 ④ 详情 hero 9 站（无 sync-check）+ 站点名非字符字形 + 工位标签盒 active 是 wash 实底；
 ⑤ 完成横幅（trophy sprite + diff 摘要真数字、点「收下」关闭、刷新不重弹）；
 ⑥ 移动款（顶栏 138px、6px 纵向链节脊线、灯可跳段且 `scroll-margin-top: 148px`、槽位不缩、触控目标）。
-**对讲台 e2e（决策 176 / 182）——`talk.spec.ts` 八条**：① 路由可达（`#/talk` 与原型写法
+**对讲台 e2e（决策 176 / 182 / 183）——`talk.spec.ts` 十条**：① 路由可达（`#/talk` 与原型写法
 `#v-talk` 都落到对讲台、不落 not-found；顶栏入口图标按 chip 节奏 16px）；② 值班板 8 工位（与看板列一一对应、
 各一枚 8px 灯，读数与看板同源）；③ 状态区的急停轮是**真数据渲染**的对话框（任务标题、中文理由短标签而**不暴露内部枚举**、
 后端下发的恢复动作可下发且下发后该轮消失）；④ 移动款顶栏仍为 **138px**（§5 两处
-148px 定值的依据）、值班板收成对话之上的横向灯条；⑤ **给值班长发话**：Enter 发送、回话真的来自脚本、
-**回话里没有按钮**；⑥ 长对话**滚到底之后急停仍在第一屏**（状态区不随时间线滚动）；⑦ **没有项目也没有任务时输入是真的、
-发送能拿到值班长的回话**（空 home 的验收锚点，用户故事 11）；⑧ 发送失败：错误轮进时间线、人说过的话仍在台账里、
-**输入框内容保留**（决策 182②）。**这条套件的存在理由**：对讲台是「**和值班长说话**」——
-⑦ 钉住「不依赖任务」，⑤ 钉住「值班长只说话、不动手」，⑥ 钉住「全站唯一该响的信号不随时间线滚走」，
-②③ 正面钉住「内容来自后端真实读数、动作来自 `allowed_actions`（决策 101 纯渲染）」。
+148px 定值的依据）、值班板收成对话之上的横向灯条；⑤⑥ **两张急停同挂**（决策 183）：两张都**完整落在状态区可见
+范围内**、状态区自己不需要区内滚动（几何断言；桌面取 1280×720 这最紧的一档，手机取 430×900 的 38vh 断点）、
+默认**一张都不展开**、点开那张后后端下发的恢复动作仍内联可下发、收起后回到默认形态；⑦ **给值班长发话**：
+Enter 发送、回话真的来自脚本、**回话里没有按钮**；⑧ 长对话**滚到底之后急停仍在第一屏**（状态区不随时间线滚动）；
+⑨ **没有项目也没有任务时输入是真的、发送能拿到值班长的回话**（空 home 的验收锚点，用户故事 11）；
+⑩ 发送失败：错误轮进时间线、人说过的话仍在台账里、**输入框内容保留**（决策 182②）。**这条套件的存在理由**：
+对讲台是「**和值班长说话**」——⑨ 钉住「不依赖任务」，⑦ 钉住「值班长只说话、不动手」，
+⑧ 钉住「全站唯一该响的信号不随时间线滚走」，⑤⑥ 钉住「多张急停同挂时最老的那张不滚出第一屏」
+（把「静默滚出」换成「主动展开」），②③ 正面钉住「内容来自后端真实读数、动作来自 `allowed_actions`（决策 101 纯渲染）」。
 
 另：`e2e/screenshots.spec.ts` 在真应用上产出 **7 路由 × 深浅 + 移动 3 视图 × 深浅** 的可重生成截图
 （`.scratch/shots/app/*.png`），**默认 skip**，需 `AGENTPIPELINE_SHOTS=1` 才跑——截图是证据不是门
@@ -232,7 +235,7 @@ harness = FakeAgent（§3.2）+ testkit fixture（§3.3）+ 临时 home + 手动
 - **票 04 · 真模型全流程冒烟**：`llm_smoke.rs::real_llm_drives_full_flow_to_merge_approval`（`#[ignore]`，不进任何自动门）——真 key + 真模型驱动完整主流程，断言 12 节点各有 run 行 / `submit_metadata` 在真模型格式下可解析 / token 计量 > 0 / 闸门 `npm test` 真跑且退出码 0 / 无 `retry_exhausted`。**实测一轮通过**：本地 OpenAI 兼容代理 + `deepseek-flash`，570s / 794k tokens / 26 runs，途中自动应答 3 次 `UserDecision`。修了冒烟装置三处缺陷：goto 候选固定取首个导致 `gate_recheck` 死循环（改为按序轮换）、失败命令只打退出码丢掉真实原因（补 stdout/stderr 尾部与阶段元数据）、设计文档断言不认绝对路径（两根兜底 + 列实际文件）。详见票面。
 - **票 10 · 纳入闸门 + 产物新鲜度守卫**：`scripts/e2e-artifacts.sh` 守卫两层陈旧（前端源码 vs `dist` → 重建 dist；随后 `cargo build -p app` 增量重编，`frontend/dist` 在 `build.rs` 的 `rerun-if-changed` 里）；`make check` 聚合 `lint + test + frontend + e2e`（决策 168 起 Makefile 是唯一权威，justfile 已删除）。守卫经反向验证：改源码不构建 → 触发重建；注入必败断言 → `make check-e2e` 退出码 2。无 CI 已显式记录。见决策 166 / 168。
 
-**playwright 八条 E2E（本批）**：`happy-path`（①）/ `pending-resume`（②）/ `gate`（③）/ `provider-misconfig`（④）/ `create-flow`（⑤×5）/ `review-branch`（⑥×3）/ `logs-reload`（⑦×2）/ `concurrent`（⑧×3），**17 passed**，全过。加上此后的 `pixel-theme.spec.ts`（6 条，决策 169）与 `talk.spec.ts`（8 条，决策 176 / 182），现行 E2E 共 **十条 33 例**（另有 `screenshots.spec.ts` 2 例默认 skip，见 §9）。
+**playwright 八条 E2E（本批）**：`happy-path`（①）/ `pending-resume`（②）/ `gate`（③）/ `provider-misconfig`（④）/ `create-flow`（⑤×5）/ `review-branch`（⑥×3）/ `logs-reload`（⑦×2）/ `concurrent`（⑧×3），**17 passed**，全过。加上此后的 `pixel-theme.spec.ts`（6 条，决策 169）与 `talk.spec.ts`（10 条，决策 176 / 182 / 183），现行 E2E 共 **十条 35 例**（另有 `screenshots.spec.ts` 2 例默认 skip，见 §9）。
 
 **前端测试状态（2026-09-13，票 18 收尾 + 主流程补齐）：** 单元层已落地并全绿（`frontend/`，vitest，**96 passed / 13 files**：`reduce.ts` 归约表逐事件、SSE 连接层主动重连、`allowed_actions` 渲染分组与 cursor_id、NotificationPolicy、provider 掩码保存与测试连接规则、analyze 轮询、metrics 字段映射、stage_configs payload）。组件层以 vitest + DOM 断言覆盖 PendingActions / DiffReviewPanel / StalledBadge（`svelte-check` 0 error / 0 warning）。**playwright 八条 E2E 已执行 → 17 passed**：用例在 `frontend/e2e/`（`happy-path` / `pending-resume` / `gate` / `provider-misconfig` / `create-flow` / `review-branch` / `logs-reload` / `concurrent`），harness `frontend/e2e/harness.ts`（临时 home + 真 `serve --port 0` 就绪行回读 + 同源内嵌产物 + 按任务路由脚本），跑法 `make check-e2e`，只 Chromium（决策 144）。
 
@@ -278,6 +281,7 @@ harness = FakeAgent（§3.2）+ testkit fixture（§3.3）+ 临时 home + 手动
 | 180（票 13·会话续接） | §6 `executor.rs::attempts_start_with_an_empty_conversation_by_default`（**补锁既有行为**：改动前全仓没有一条用例钉住「每次 attempt 对话为空」）、`resume_continuation_carries_the_previous_attempt_messages`（开启后重入带上上一轮的工具往来；且 `messages` 里不混入 system）、`clean_retry_after_a_tool_failure_stays_empty_even_with_continuation_on`（决策 33 不变）、`continued_run_links_back_so_tokens_are_not_double_counted`（必要条件二：`continued_from_run_id` 指向历史 run，`total_tokens` 排除被续接的历史，落库任务总量与函数口径同源）、`context_overflow_path_writes_a_conversation_row`（必要条件一：真实执行路径触发 L4 后该 run 有会话行）；§5 `context.rs::l3_anchor_ignores_the_loaded_history_and_takes_the_current_round`（压缩锚点边界：载入的历史里的 user 消息不当锚点，锚点取本轮第一条；`current_start = 0` 与原行为逐字等价——既有 `l3_summary_inserted_after_first_user_message` 不动） | 已有用例（会话续接，2026-09-15） |
 | 181（票 11 / 15 / 16·预览与推荐） | §7 `api_contract.rs` 十六条——预览三项返回 / **特征命中列出具体行号**（对着源文件可定位）/ 未信任 + 全文 400 且报文可操作且不落库 / 信任转换生效（阶段级 + 节点级两处都转、之后全文可存）/ 撤销信任撞全文 400 且配置一字未动 / 无引用时 `changed: 0` 如实回报 / **装前预览不落盘** / 未安装 404；推荐清单按阶段下发并标注装没装 / 一键安装落盘 + 写配置（name + 未信任）/ 正文有特征也进得来但**只能名字态** / 既有声明逐字保留且重复安装不重复追加（已在技能根里则**不重新下载**、只补启用那一步，`note` 如实说明）、**已安装技能可直接启用**（未配市场来源也能落进配置） / 技能不存在 404 且不写配置 / 未配置来源 400 可操作 / 伪阶段 400 / 停用后配置行移除；§5 `config.rs` 七条（信任转换就地改写 / 裸字符串物化 / **降信任撞全文拒绝而非静默降级** / 节点级覆盖 / 无关技能不动配置 / 转换后仍过写入门）；§5 `skill_preview.rs` 十条（三类特征分行命中 / 大小写不敏感 / 一行两类 / 宽松匹配的对照样本 / 推荐映射与手动触发型排除）；前端 vitest `stageConfigs.test.ts`（混合数组读写 / 旧格式零迁移往返 / 未信任不可切全文 / 撤销信任撞全文拒绝 / 节点级技能写回保留其余键 / 空列表删键） | 已有用例（装前预览 + 信任转换 + 推荐与一键安装，2026-09-15） |
 | 176 / 182 | §6 `tests/foreman.rs`（21 条：快照字段与原因原文 / 历史字符预算 / 会话循环与收口 / **工具白名单在执行点生效** / 指标不动 / 保留期清理）+ `tests/pairing.rs`（5 条：生成即持久化 / 重置换枚）；§7 `/foreman/*` 六条（会话、空 home 对话、503 未接线、空消息、流式送达且任务流零干扰）+ `/pairing/*` 七条（缺令牌 403、带令牌通过、回环豁免、只读 GET 不护、读取口仅回环、重置使旧令牌失效、缺省回环绑定不要求令牌）；§5 `peer.rs` / `stream.rs` / `server_info.rs` 的对端地址与配对比较；§9 `realtime/foreman.test.ts`（归约 6 条）+ e2e `talk.spec.ts`（8 条，含空 home 可对话、回话里没有按钮、急停滚动后仍在第一屏） | 已有用例（对讲台与配对令牌，2026-09-16） |
+| 183 | §9 `lib/talkStops.test.ts`（10 条：一张不折叠 / **两张以上一张都不展开** / 一张时展开它自己 / 无急停无展开项 / 显式收起不弹回 / 选中项仍在则保持 / 选中项被处理掉后回落到默认且不悬空 / 翻转一次只换一张 / **展开判据对单张恒展开** / 详情没到不报动作数）+ §9 e2e `talk.spec.ts` 两条（**几何断言**：两张急停都完整落在状态区可见范围内、状态区不需要区内滚动——桌面 1280×720 与手机 430×900 的 38vh 两档；默认一张都不展开；点开后后端下发的「补充信息并继续」与「取消任务」两钮都在；**在已有一张展开时点另一张会换过去（同时只展开一张）**；收起回到默认形态） | 已有用例（状态区急停折叠，2026-09-15） |
 | …… | 其余决策随实现逐条填入 | — |
 
 ## 11. 实现状态（2026-09-12，票 15–22 后）

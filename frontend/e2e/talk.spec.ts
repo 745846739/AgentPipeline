@@ -1,19 +1,22 @@
 /**
- * 前端 E2E ⑩：对讲台（`#/talk`，决策 174 / 182 / theme-6-pixel.md §3.3）。
+ * 前端 E2E ⑩：对讲台（`#/talk`，决策 174 / 182 / 183 / theme-6-pixel.md §3.3）。
  *
  * **版面前提在票 04 被推翻重写**：本页不再是「真实状态的只读转述」（旧稿把它写成
  * 「不是可自由对话的 chat，输入口只是一段说明」），而是一个**任务无关**的自由对话界面
  * （用户原话：「对话不需要依赖任务」）。三分区是它的硬要求：
- * 状态区（急停 + 值班板）钉在第一屏、对话时间线会滚、输入坞钉底。
+ * 状态区（急停）钉在第一屏、对话时间线会滚、输入坞钉底；值班板是独立的一块
+ * （桌面右栏、窄屏收成时间线之上的横向灯条），**不在状态区里**。
  *
  * 断言口径与其它像素主题用例一致：只测**外部行为**——路由可达、真数据渲染、
- * 急停那轮的后端下发动作可下发、给值班长发话后它的回复里没有按钮。
+ * 急停那轮的后端下发动作可下发、给值班长发话后它的回复里没有按钮、两张急停同挂时
+ * 两张都留在第一屏（决策 183）。
  */
 
-import { expect, test } from '@playwright/test';
+import { expect, test, type Locator } from '@playwright/test';
 import {
   startApp,
   waitForTask,
+  waitForTaskById,
   pendingTypeOf,
   watchBundle,
   settleBundle,
@@ -216,6 +219,137 @@ test.describe('对讲台 · 版面（票 04）', () => {
     const crewBox = await side.boundingBox();
     const statusBox = await page.locator('.zone-status').boundingBox();
     expect(crewBox?.y ?? 0).toBeLessThan(statusBox?.y ?? 0);
+
+    expectBundleHealthy(bundle);
+  });
+});
+
+/** 状态区里每张急停轮都完整落在状态区的可见范围内（= 没被区内滚动推到第一屏之外）。 */
+async function expectEveryStopInsideZone(zone: Locator): Promise<void> {
+  const zoneBox = await zone.boundingBox();
+  expect(zoneBox).not.toBeNull();
+  const cards = zone.locator('.turn.warn');
+  const n = await cards.count();
+  expect(n).toBeGreaterThan(0);
+  for (let i = 0; i < n; i += 1) {
+    const box = await cards.nth(i).boundingBox();
+    expect(box).not.toBeNull();
+    expect((box?.y ?? 0) + (box?.height ?? 0)).toBeLessThanOrEqual(
+      (zoneBox?.y ?? 0) + (zoneBox?.height ?? 0) + 1,
+    );
+    expect(box?.y ?? 0).toBeGreaterThanOrEqual((zoneBox?.y ?? 0) - 1);
+  }
+}
+
+/**
+ * 状态区**不需要区内滚动**——「所有急停都在第一屏」的最干脆说法。
+ *
+ * 留 4px 余量：急停轮的 `4px 4px 0` 硬投影在 Chromium 里可能被算进 scrollable overflow，
+ * 而 `.zone-status` 的下内边距恰好也是 4px。
+ */
+async function expectZoneNeedsNoScroll(zone: Locator): Promise<void> {
+  const overflow = await zone.evaluate((el) => el.scrollHeight - el.clientHeight);
+  expect(overflow, '状态区被内容撑到需要区内滚动').toBeLessThanOrEqual(4);
+}
+
+/**
+ * 对讲台 · 两张急停同时挂在状态区（决策 183）。
+ *
+ * **这条用例钉的是折叠的存在理由**：一张急停轮内联着后端下发的动作集，最高的一种形状
+ * （`info_insufficient`：带补充输入的 resume + 旁路动作）约 330px，而状态区上限桌面 46vh
+ * 在 13″ 笔记本上可用只有约 344px——**展开一张就已经占满整个区**。不折叠的话，两张同挂时
+ * 最老的那张必然被挤到区内滚动之外，正是 §3.3 说的「本页最不能出的错」。
+ *
+ * 断言口径是**几何**，不是文案：两张都完整落在状态区里、且状态区自己不需要区内滚动。
+ * 两条任务都停在 `info_insufficient`（最高的急停轮形状），故更矮的形状自然也在第一屏。
+ */
+test.describe('对讲台 · 两张急停同时在状态区（决策 183）', () => {
+  let app: App;
+  const titleA = 'E2E 两张急停 A';
+  const titleB = 'E2E 两张急停 B';
+
+  test.beforeAll(async () => {
+    // 两条任务各停在自己的 info_insufficient：mock 按任务标题路由脚本轮，互不消费。
+    // 同项目并发第二任务是既有能力（主流程票 09），这里只是让两条都挂上急停。
+    app = await startApp({
+      script: archBlockerRounds(),
+      title: titleA,
+      additionalTasks: [{ title: titleB, script: archBlockerRounds() }],
+    });
+    for (const id of app.taskIds) {
+      await waitForTaskById(id, app, (t) => pendingTypeOf(t) === 'info_insufficient', id, 180_000);
+    }
+  });
+
+  test.afterAll(async () => {
+    await app?.stop();
+  });
+
+  test('默认一张都不展开：两张都在第一屏，点开后后端下发的动作仍可下发', async ({ page }) => {
+    const bundle = watchBundle(page);
+    // 桌面最紧的一档（也是 playwright 默认视口）：46vh ≈ 331px
+    await page.setViewportSize({ width: 1280, height: 720 });
+    await page.goto(`${app.webBase}/#/talk`);
+    await settleBundle(page, bundle);
+
+    const zone = page.locator('.zone-status');
+    await expect(zone.locator('.turn.warn')).toHaveCount(2, { timeout: 60_000 });
+
+    // **核心几何断言**：两张都在状态区里，且状态区自己不需要区内滚动
+    await expectZoneNeedsNoScroll(zone);
+    await expectEveryStopInsideZone(zone);
+
+    // 两张以上**一张都不展开**：展开一张就占满 13″ 上的状态区，第二张照样掉出第一屏
+    await expect(zone.locator('.turn.warn:not(.folded)')).toHaveCount(0);
+    const rows = zone.locator('.turn.warn.folded');
+    await expect(rows).toHaveCount(2);
+
+    // 折叠只收动作区，**不收身份**：摘要条仍挂琥珀框 + ▼（全站唯一的响不因折叠降级）
+    const row = rows.first();
+    await expect(row.locator('.dtag')).toContainText('信息不足');
+    await expect(row).toContainText('2 个动作'); // 后端下发的那一份，不是前端算的
+    const cursor = await row.evaluate((el) => getComputedStyle(el, '::after').content);
+    expect(cursor).toContain('▼');
+
+    // 点开一张：恢复动作在那一轮里内联（来自后端，一个也没少）
+    const opened = (await row.innerText()).includes(titleA) ? titleA : titleB;
+    await row.getByRole('button', { name: /展开恢复动作/ }).click();
+    const openCard = zone.locator('.turn.warn:not(.folded)');
+    await expect(openCard).toHaveCount(1);
+    await expect(openCard).toContainText(opened);
+    await expect(openCard.getByRole('button', { name: /补充信息并继续/ })).toBeVisible();
+    await expect(openCard.getByRole('button', { name: /取消任务/ })).toBeVisible();
+
+    // **同时只展开一张**：在已有一张展开的情况下点另一张的展开 → 换过去，展开数仍是 1。
+    // 这条是本用例里唯一能挡住「每张各自一个布尔开关」那种退化的断言——只从「全折叠」出发
+    // 点一张、得到计数 1，两种实现都会过
+    await expect(rows).toHaveCount(1);
+    await rows.getByRole('button', { name: /展开恢复动作/ }).click();
+    await expect(zone.locator('.turn.warn:not(.folded)')).toHaveCount(1);
+    await expect(openCard).not.toContainText(opened); // 换成展开的那张是另一张
+    await expect(openCard.getByRole('button', { name: /补充信息并继续/ })).toBeVisible();
+
+    // 收起之后回到「都看得到」的默认形态（人显式收起的态不被自动弹开）
+    await openCard.getByRole('button', { name: /收起/ }).click();
+    await expect(zone.locator('.turn.warn:not(.folded)')).toHaveCount(0);
+    await expect(rows).toHaveCount(2);
+
+    expectBundleHealthy(bundle);
+  });
+
+  test('手机上（≤479px 断点、38vh）两张也都在第一屏', async ({ page }) => {
+    const bundle = watchBundle(page);
+    // 窄屏是最吃紧的一档：状态区收到 38vh（900 × 0.38 ≈ 342px），而钮在移动款有 44px 触控底线
+    await page.setViewportSize({ width: 430, height: 900 });
+    await page.goto(`${app.webBase}/#/talk`);
+    await settleBundle(page, bundle);
+
+    const zone = page.locator('.zone-status');
+    await expect(zone.locator('.turn.warn')).toHaveCount(2, { timeout: 60_000 });
+    await expect(zone.locator('.turn.warn.folded')).toHaveCount(2);
+
+    await expectZoneNeedsNoScroll(zone);
+    await expectEveryStopInsideZone(zone);
 
     expectBundleHealthy(bundle);
   });
