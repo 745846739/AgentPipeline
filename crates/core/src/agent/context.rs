@@ -430,8 +430,13 @@ pub struct L4Plan {
 
 /// L4：L3 后仍超限时的降级路径。
 ///
-/// 子代理是首选兜底，但必须开启 `spawn_sub_agent`；未开启直接
-/// `pending(context_overflow)`（决策 148 ⑦）。
+/// 这里是 **L4 的自动降级**：`spawn_sub_agent_enabled` 表示「阶段声明了
+/// `spawn_sub_agent`」这一事实，用来判断理论上可否自动拆分。注意它与
+/// [`crate::pipeline::subagent`] 的**只读子代理工具**是两件事——后者（票 08）是模型
+/// 在对话中主动调用的能力，不参与 L4 判定，也没有改变本节的现状。
+///
+/// `BatchByNode` / `SpawnSubAgents` 至今**没有实现**，executor 一律按
+/// `pending(context_overflow)` 收口（决策 148 ⑦ / 154：L4 兜底只有两级）。
 pub fn plan_l4(stage: Stage, node: Node, spawn_sub_agent_enabled: bool) -> L4Plan {
     let action = match (stage, node) {
         (Stage::Test, Node::Execute) | (Stage::Review, Node::Execute) => L4Action::BatchByNode,

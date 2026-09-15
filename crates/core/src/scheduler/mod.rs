@@ -146,6 +146,13 @@ impl KanbanScheduler {
             if run.task_id.is_none() || run.cursor_id.is_none() {
                 continue;
             }
+            // 子代理 run（票 08）挂着父节点的 task + cursor，但它**不是节点自身的执行**
+            // ——它是父节点正在进行的工具调用。若按节点 run 处置，父节点还在正常干活时
+            // 就会被判超时、写一条节点级重试 transition，等于把一次并行检索变成父节点的
+            // 伪超时。超时语义只属于节点自身（与票 14 对 `attempt` 的口径同一处）。
+            if !crate::metrics::is_node_owning_run(&run.agent_type) {
+                continue;
+            }
             let stage_cfg = stage_configs.iter().find(|c| c.stage == run.stage.as_str());
             let node_override = node_timeouts(stage_cfg, run.node.as_str());
             let idle = effective_idle_timeout(

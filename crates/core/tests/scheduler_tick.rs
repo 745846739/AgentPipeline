@@ -1027,3 +1027,58 @@ async fn transitions_are_recorded_with_branch() {
         .unwrap();
     assert_eq!(filtered.len(), 1);
 }
+
+/// 票 08：子代理 run 挂着父节点的 task + cursor，但**不是节点自身的执行**——
+/// 超时扫描必须跳过它。否则父节点还在正常干活（子代理在跑），scheduler 就会把
+/// 这次并行检索判成父节点超时，写一条节点级重试 transition、拉起一次伪重试。
+#[tokio::test]
+async fn subagent_runs_are_not_swept_as_node_timeouts() {
+    let h = Harness::new().await;
+    h.seed_task("t1").await;
+    h.mark_running("t1").await;
+    let cursor = h.store.load_live_cursors("t1").await.unwrap()[0].clone();
+
+    // 父节点正常（刚有过活动），子代理已挂了很久且没有自己的心跳
+    // ——子代理的心跳是刷父 run 的（决策 88 同源做法），所以子代理行本身会显得陈旧。
+    let parent = h
+        .running_run("t1", &cursor.cursor_id, 1, 10, 10, None)
+        .await;
+    let sub = h
+        .store
+        .insert_run(&NewRun {
+            task_id: "t1".into(),
+            cursor_id: cursor.cursor_id.clone(),
+            stage: Stage::Develop,
+            node: Node::Execute,
+            attempt: 1,
+            agent_type: "subagent".into(),
+            parent_run_id: Some(parent),
+            prompt_template_hash: None,
+            process_group_id: None,
+        })
+        .await
+        .unwrap();
+    // 把子代理行的时间戳推到远超空闲超时（stale），坐实「按节点语义会被判超时」
+    let long_ago = h.clock.now() - chrono::Duration::seconds(400);
+    sqlx::query("UPDATE kanban_node_runs SET started_at = ?, last_activity_at = ? WHERE id = ?")
+        .bind(agentpipeline_core::storage::ts(long_ago))
+        .bind(agentpipeline_core::storage::ts(long_ago))
+        .bind(sub)
+        .execute(h.store.pool())
+        .await
+        .unwrap();
+
+    let report = h.scheduler(Settings::default()).tick().await.unwrap();
+    assert!(
+        report.timed_out_runs.is_empty(),
+        "子代理 run 不得进超时判定：{:?}",
+        report.timed_out_runs
+    );
+    assert!(report.timeout_pending_cursors.is_empty());
+    assert_eq!(h.resumes.load(Ordering::SeqCst), 0, "不得拉起伪重试");
+
+    // 子代理行仍在自己名下为 running（它的生命周期由父节点的工具调用收尾）
+    let runs = h.store.list_runs("t1").await.unwrap();
+    let sub_row = runs.iter().find(|r| r.id == sub).unwrap();
+    assert_eq!(sub_row.status, NodeStatus::Running);
+}

@@ -6,6 +6,7 @@ pub mod graph;
 pub mod landing;
 pub mod pseudo;
 pub mod routes;
+pub mod subagent;
 
 pub use cursor::{
     focus_cursor, has_pending_cursor, has_runnable_cursor, is_join_ready, live_cursors,

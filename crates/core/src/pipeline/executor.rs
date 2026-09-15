@@ -14,7 +14,7 @@
 //! - agent 节点按 `agent_retry_max` 干净对话重试，耗尽才 pending（决策 33 / G13）。
 
 use std::collections::HashSet;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, LazyLock, Mutex};
 use std::time::Instant;
 
@@ -1024,6 +1024,50 @@ impl Executor {
         let persona = resolve_stage_persona(&home, stage_cfg.as_ref(), cursor.stage, cursor.node)?;
         let declared_tools =
             json_string_list(stage_cfg.as_ref().and_then(|c| c.tools_json.as_ref()));
+
+        // 子代理（决策 172③，票 08）：**只有阶段显式声明才注入运行器**。不声明时
+        // `spawn_sub_agent` 调用会拿到一句「未启用」的说明文本（工具层没有运行器），
+        // 这就是「扩展工具、默认关闭」的落点。节点级超时作为该次调用的上限（票 08）。
+        let sub_agent: Option<Arc<dyn crate::agent::SubAgentRunner>> = declared_tools
+            .iter()
+            .any(|t| t == crate::agent::SPAWN_SUB_AGENT_TOOL)
+            .then(|| {
+                let node_override =
+                    crate::config::node_timeouts(stage_cfg.as_ref(), cursor.node.as_str());
+                let max_duration = crate::config::effective_max_duration(
+                    self.settings.node_max_duration_sec,
+                    stage_cfg.as_ref().and_then(|c| c.max_duration_sec),
+                    node_override,
+                );
+                Arc::new(crate::pipeline::subagent::StoreSubAgentRunner::new(
+                    crate::pipeline::subagent::SubAgentRunnerConfig {
+                        store: self.store.clone(),
+                        settings: self.settings.clone(),
+                        llm: self.llm.clone(),
+                        killer: self.killer.clone(),
+                        home: home.clone(),
+                        task_id: task.id.clone(),
+                        cursor_id: cursor.cursor_id.clone(),
+                        stage: cursor.stage,
+                        node: cursor.node,
+                        attempt,
+                        branch: cursor.branch.clone(),
+                        parent_run_id: run_id,
+                        worktree_path: worktree.clone().into(),
+                        task_dir: task_dir.clone().into(),
+                        project_root: PathBuf::from(&project.local_path),
+                        language: project.language.clone(),
+                        test_framework: project.test_framework.clone(),
+                        temperature: stage_cfg.as_ref().and_then(|c| c.temperature),
+                        max_tokens: stage_cfg.as_ref().and_then(|c| c.max_tokens),
+                        max_duration: std::time::Duration::from_secs(max_duration),
+                    },
+                )) as Arc<dyn crate::agent::SubAgentRunner>
+            });
+        let tools = match sub_agent {
+            Some(runner) => tools.with_sub_agent(runner),
+            None => tools,
+        };
         // 技能：阶段级 ∪ 节点级（决策 170 / 172④），再解析成渲染形态——全文态注入正文、
         // 名字态只列名字（正文交给 `Skill` 工具按需拉取，票 06）、目录态给出「还有哪些
         // 技能可用」（渐进披露）。技能根经 `Home::skills_dir` 取（默认 `{home}/skills`，
@@ -3132,6 +3176,13 @@ fn tool_defs(
         if name == "submit_metadata" {
             continue; // 最后以 schema 形式追加
         }
+        // 扩展工具（决策 172③，票 08）：不是内置工具，但**已实现**且由阶段声明启用。
+        // 不认这一条的话，声明了 `spawn_sub_agent` 会在下面被当作「未实现」丢弃 + warn，
+        // 于是声明与生效之间静默断开。
+        if name == crate::agent::SPAWN_SUB_AGENT_TOOL {
+            defs.push(spawn_sub_agent_tool_def());
+            continue;
+        }
         if !BUILTIN_TOOLS.contains(&name.as_str()) {
             tracing::warn!(tool = %name, "阶段声明的工具在 v1 未实现，已忽略");
             continue;
@@ -3195,6 +3246,29 @@ fn skill_tool_def() -> ToolDef {
                 }
             },
             "required": ["name"]
+        }),
+    }
+}
+
+/// `spawn_sub_agent` 工具的 tool 定义（决策 172③，票 08）。
+///
+/// 描述里明说**只读**：让模型知道子代理能做什么，才不会派它去写文件或跑命令而白等一轮。
+fn spawn_sub_agent_tool_def() -> ToolDef {
+    ToolDef {
+        name: crate::agent::SPAWN_SUB_AGENT_TOOL.to_string(),
+        description: "派生一个只读子代理处理可分解的检索子任务，返回摘要。\
+                      子代理只能 read_file / list_dir，不能写文件或执行命令，也不再派子代理。\
+                      适合「读很多文件、只要结论」的场景——原文留在子代理上下文，父上下文只收摘要。"
+            .to_string(),
+        parameters: serde_json::json!({
+            "type": "object",
+            "properties": {
+                "task": {
+                    "type": "string",
+                    "description": "子任务描述：要检索什么、要回答什么问题、需要什么形态的结论"
+                }
+            },
+            "required": ["task"]
         }),
     }
 }

@@ -13,21 +13,21 @@
 > 本票不依赖技能运行时：它只复用既有 agent 循环与只读工具。排在技能票之后是**排序偏好**
 > （子代理的典型用途是执行技能指令），不是硬依赖——可并行开工。
 
-**Status:** ready-for-agent
+**Status:** done
 
-- [ ] 工具 `spawn_sub_agent` 可用，入参含任务描述，返回摘要文本
-- [ ] 子代理工具集**固定只读**：仅 `read_file` / `list_dir`；无 `run_command` / `write_file` /
+- [x] 工具 `spawn_sub_agent` 可用，入参含任务描述，返回摘要文本
+- [x] 子代理工具集**固定只读**：仅 `read_file` / `list_dir`；无 `run_command` / `write_file` /
       `edit_file` / `delete_file` / `submit_metadata`
-- [ ] **不继承**阶段声明的工具（阶段配置无法给子代理扩权）
-- [ ] 深度限制**一层**：子代理不再获得 `spawn_sub_agent`
-- [ ] 子代理的 prompt 构建复用既有链路（`AGENTS.md` 加载、工作目录、persona 可简化为摘要任务前言）
-- [ ] 落 run 行：`agent_type = "subagent"`、`parent_run_id` 指向父 run（两列均已存在，**无迁移**）
-- [ ] 会话落 `kanban_node_conversations`，同样带 `agent_type` / `parent_run_id`
-- [ ] token 记在**子代理自己的 run 行**上并计入任务总量；父 run **不重复累加**子代理用量
-- [ ] 超时沿用节点级 `node_idle_timeout_sec` / `node_max_duration_sec` 作为该次调用上限
-- [ ] 集成用例：FakeAgent 驱动「父请求派子代理 → 子代理只读工具 → 返回摘要进父 messages」；
+- [x] **不继承**阶段声明的工具（阶段配置无法给子代理扩权）
+- [x] 深度限制**一层**：子代理不再获得 `spawn_sub_agent`
+- [x] 子代理的 prompt 构建复用既有链路（`AGENTS.md` 加载、工作目录、persona 可简化为摘要任务前言）
+- [x] 落 run 行：`agent_type = "subagent"`、`parent_run_id` 指向父 run（两列均已存在，**无迁移**）
+- [x] 会话落 `kanban_node_conversations`，同样带 `agent_type` / `parent_run_id`
+- [x] token 记在**子代理自己的 run 行**上并计入任务总量；父 run **不重复累加**子代理用量
+- [x] 超时沿用节点级 `node_idle_timeout_sec` / `node_max_duration_sec` 作为该次调用上限
+- [x] 集成用例：FakeAgent 驱动「父请求派子代理 → 子代理只读工具 → 返回摘要进父 messages」；
       另有一条断言「子代理拿不到 `run_command`」
-- [ ] **重开决策 154 的边界写清**：只读子代理是新增能力，「L4 兜底只有两级」与「分批 / 拆子代理
+- [x] **重开决策 154 的边界写清**：只读子代理是新增能力，「L4 兜底只有两级」与「分批 / 拆子代理
       不作为上下文超限兜底」的原裁决**不变**
 
 **Notes（实现提示）:**

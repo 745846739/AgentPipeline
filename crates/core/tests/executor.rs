@@ -2422,3 +2422,435 @@ async fn mismatched_frontmatter_name_refuses_startup() {
         "报错须点明目录名与 frontmatter name：{msg}"
     );
 }
+
+// ─────────────────────── 只读子代理（决策 172③，票 08）───────────────────────
+
+/// 给 develop 阶段声明 `spawn_sub_agent`（扩展工具，默认关闭）。
+async fn declare_sub_agent(ctx: &Ctx) {
+    ctx.store
+        .upsert_stage_config(&agentpipeline_core::types::StageConfig {
+            stage: "develop".into(),
+            tools_json: Some(serde_json::json!(["spawn_sub_agent"])),
+            updated_at: ctx.store.now(),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+}
+
+/// 验收（票 08 主用例）：父派子代理 → 子代理用只读工具读文件 → 摘要回灌父 messages。
+#[tokio::test]
+async fn parent_spawns_readonly_subagent_and_gets_summary_back() {
+    let ctx = setup("true", Settings::default()).await;
+    declare_sub_agent(&ctx).await;
+
+    // 子代理要读的文件：真实存在于 worktree（工具层全真执行，决策 148）
+    let worktree = ctx.store.home().worktree_path("t-sub");
+    std::fs::create_dir_all(&worktree).unwrap();
+    std::fs::write(worktree.join("NOTES.md"), "关键结论：入口在 main()\n").unwrap();
+
+    let mut script = Script::new();
+    design_scripts(&mut script);
+    // develop.execute：父先派子代理，再照常写代码提交
+    script
+        .for_node(Stage::Develop, Node::Execute)
+        .push(testkit::Step::Tool {
+            name: "spawn_sub_agent".into(),
+            arguments: serde_json::json!({"task": "读 NOTES.md 并总结入口"}),
+        })
+        .write_file(
+            "src/lib.rs",
+            "pub fn add(a: i32, b: i32) -> i32 { a + b }\n#[test]\nfn adds() { assert_eq!(add(1, 2), 3); }\n",
+        )
+        .write_file("tests/acceptance.rs", "#[test]\nfn ok() {}\n")
+        .run_command(
+            "git add -A && git -c user.name=f -c user.email=f@l commit -m 'feat: task t-sub'",
+        )
+        .submit(&CodeChanges {
+            branch_name: "kanban/t-sub".into(),
+            changed_files: vec![],
+            unit_test_files: vec![],
+        });
+    script
+        .for_node(Stage::Review, Node::Execute)
+        .submit(&ReviewResult {
+            approved: true,
+            review_report_path: Some("review-report.md".into()),
+            required_changes: vec![],
+        });
+    script
+        .for_node(Stage::Test, Node::Execute)
+        .submit(&TestResult {
+            passed: true,
+            test_report_path: Some("test-report.md".into()),
+            failures: vec![],
+            gate_recheck: false,
+        });
+    // 子代理自己的脚本：先 read_file（真实读），再给摘要收口
+    script.push_subagent(testkit::Step::Tool {
+        name: "read_file".into(),
+        arguments: serde_json::json!({"path": "NOTES.md"}),
+    });
+    script.push_subagent(testkit::Step::Text("入口在 main()（源：NOTES.md）".into()));
+
+    ctx.agent.set_script(script);
+    testkit::seed_task(&ctx.store, "t-sub", "p1").await.unwrap();
+    admit(&ctx, "t-sub").await;
+    ctx.executor.run("t-sub").await.unwrap();
+
+    // ① 子代理摘要进入了父的下一轮 messages（tool_result 通道，决策 172③）
+    let requests = ctx.agent.request_log();
+    let develop: Vec<_> = requests
+        .iter()
+        .filter(|r| r.stage == Stage::Develop && r.node == Node::Execute)
+        .collect();
+    let parent_round2 = develop
+        .iter()
+        .find(|r| {
+            r.messages.iter().any(|m| {
+                m.role == agentpipeline_core::agent::Role::Tool
+                    && m.content
+                        .as_deref()
+                        .is_some_and(|c| c.contains("入口在 main()"))
+            })
+        })
+        .expect("父的第二轮 messages 应含子代理摘要");
+    assert!(parent_round2
+        .messages
+        .iter()
+        .any(|m| m.role == agentpipeline_core::agent::Role::Tool));
+}
+
+/// 验收（票 08 安全断言）：子代理的工具集**只有** `read_file` / `list_dir`。
+///
+/// 这条是本票的安全边界：不是「子代理不调 run_command」，而是**它的工具定义里
+/// 根本没有 run_command**——阶段声明什么都改不了。
+#[tokio::test]
+async fn subagent_tool_set_is_read_only() {
+    let ctx = setup("true", Settings::default()).await;
+    declare_sub_agent(&ctx).await;
+
+    let mut script = Script::new();
+    design_scripts(&mut script);
+    script
+        .for_node(Stage::Develop, Node::Execute)
+        .push(testkit::Step::Tool {
+            name: "spawn_sub_agent".into(),
+            arguments: serde_json::json!({"task": "检索"}),
+        })
+        .write_file(
+            "src/lib.rs",
+            "pub fn add(a: i32, b: i32) -> i32 { a + b }\n#[test]\nfn adds() { assert_eq!(add(1, 2), 3); }\n",
+        )
+        .write_file("tests/acceptance.rs", "#[test]\nfn ok() {}\n")
+        .run_command(
+            "git add -A && git -c user.name=f -c user.email=f@l commit -m 'feat: task t-ro'",
+        )
+        .submit(&CodeChanges {
+            branch_name: "kanban/t-ro".into(),
+            changed_files: vec![],
+            unit_test_files: vec![],
+        });
+    script
+        .for_node(Stage::Review, Node::Execute)
+        .submit(&ReviewResult {
+            approved: true,
+            review_report_path: Some("review-report.md".into()),
+            required_changes: vec![],
+        });
+    script
+        .for_node(Stage::Test, Node::Execute)
+        .submit(&TestResult {
+            passed: true,
+            test_report_path: Some("test-report.md".into()),
+            failures: vec![],
+            gate_recheck: false,
+        });
+    script.push_subagent(testkit::Step::Text("摘要".into()));
+
+    ctx.agent.set_script(script);
+    testkit::seed_task(&ctx.store, "t-ro", "p1").await.unwrap();
+    admit(&ctx, "t-ro").await;
+    ctx.executor.run("t-ro").await.unwrap();
+
+    // 子代理那一次请求的工具集：必须是固定只读的两个
+    let requests = ctx.agent.request_log();
+    let sub_req = requests
+        .iter()
+        .find(|r| r.run.as_ref().is_some_and(|c| c.agent_type == "subagent"))
+        .expect("应有子代理 LLM 请求");
+    let names: Vec<&str> = sub_req.tools.iter().map(|t| t.name.as_str()).collect();
+    assert_eq!(
+        names,
+        vec!["read_file", "list_dir"],
+        "子代理工具集必须固定只读"
+    );
+    assert!(
+        !names.contains(&"run_command"),
+        "子代理不得拿到 run_command（无 OS 级沙箱，决策 19 修订 / 104）"
+    );
+    assert!(!names.contains(&"write_file"), "子代理不得写文件");
+    assert!(
+        !names.contains(&"spawn_sub_agent"),
+        "深度固定一层：子代理不再派子代理（决策 9）"
+    );
+
+    // 父节点的工具集里有 run_command（对照组：断言不是「谁都没有」）
+    let parent_req = requests
+        .iter()
+        .find(|r| r.stage == Stage::Develop && r.node == Node::Execute)
+        .expect("应有父请求");
+    assert!(parent_req.tools.iter().any(|t| t.name == "run_command"));
+}
+
+/// 验收（票 08）：`agent_type = "subagent"` + `parent_run_id` 落 run 行。
+#[tokio::test]
+async fn subagent_run_row_carries_parent_and_agent_type() {
+    let ctx = setup("true", Settings::default()).await;
+    declare_sub_agent(&ctx).await;
+
+    let mut script = Script::new();
+    design_scripts(&mut script);
+    script
+        .for_node(Stage::Develop, Node::Execute)
+        .push(testkit::Step::Tool {
+            name: "spawn_sub_agent".into(),
+            arguments: serde_json::json!({"task": "检索"}),
+        })
+        .write_file(
+            "src/lib.rs",
+            "pub fn add(a: i32, b: i32) -> i32 { a + b }\n#[test]\nfn adds() { assert_eq!(add(1, 2), 3); }\n",
+        )
+        .write_file("tests/acceptance.rs", "#[test]\nfn ok() {}\n")
+        .run_command(
+            "git add -A && git -c user.name=f -c user.email=f@l commit -m 'feat: task t-prow'",
+        )
+        .submit(&CodeChanges {
+            branch_name: "kanban/t-prow".into(),
+            changed_files: vec![],
+            unit_test_files: vec![],
+        });
+    script
+        .for_node(Stage::Review, Node::Execute)
+        .submit(&ReviewResult {
+            approved: true,
+            review_report_path: Some("review-report.md".into()),
+            required_changes: vec![],
+        });
+    script
+        .for_node(Stage::Test, Node::Execute)
+        .submit(&TestResult {
+            passed: true,
+            test_report_path: Some("test-report.md".into()),
+            failures: vec![],
+            gate_recheck: false,
+        });
+    script.push_subagent(testkit::Step::Text("摘要".into()));
+
+    ctx.agent.set_script(script);
+    testkit::seed_task(&ctx.store, "t-prow", "p1")
+        .await
+        .unwrap();
+    admit(&ctx, "t-prow").await;
+    ctx.executor.run("t-prow").await.unwrap();
+
+    let runs = ctx.store.list_runs("t-prow").await.unwrap();
+    let subs: Vec<_> = runs.iter().filter(|r| r.agent_type == "subagent").collect();
+    assert_eq!(subs.len(), 1, "恰好一行子代理 run：{runs:?}");
+    let sub = subs[0];
+    let parent = runs
+        .iter()
+        .find(|r| r.id == sub.parent_run_id.expect("子代理必须有 parent_run_id"))
+        .expect("parent_run_id 应指向真实父 run");
+    assert_eq!(parent.agent_type, "main", "父 run 是 main");
+    assert_eq!(parent.stage, Stage::Develop);
+    assert_eq!(parent.node, Node::Execute);
+    assert_eq!(sub.stage, Stage::Develop, "子代理复用父节点坐标");
+    assert_eq!(sub.node, Node::Execute);
+    assert_eq!(sub.attempt, parent.attempt, "子代理不产生自己的 attempt");
+
+    // 会话行同样带 agent_type / parent_run_id，且与父会话分开（决策 77）
+    let convs = ctx.store.list_conversations("t-prow", false).await.unwrap();
+    let sub_conv = convs
+        .iter()
+        .find(|c| c.agent_type == "subagent")
+        .expect("子代理应有独立会话行");
+    assert_eq!(sub_conv.parent_run_id, sub.parent_run_id);
+    assert_eq!(sub_conv.run_id, sub.id);
+}
+
+/// 验收（票 08）：子代理 token 记在自己 run 行，父 run **不重复累加**。
+#[tokio::test]
+async fn subagent_tokens_are_counted_once_on_its_own_run() {
+    let ctx = setup("true", Settings::default()).await;
+    declare_sub_agent(&ctx).await;
+
+    let mut script = Script::new();
+    design_scripts(&mut script);
+    script
+        .for_node(Stage::Develop, Node::Execute)
+        .push(testkit::Step::Tool {
+            name: "spawn_sub_agent".into(),
+            arguments: serde_json::json!({"task": "检索"}),
+        })
+        .write_file(
+            "src/lib.rs",
+            "pub fn add(a: i32, b: i32) -> i32 { a + b }\n#[test]\nfn adds() { assert_eq!(add(1, 2), 3); }\n",
+        )
+        .write_file("tests/acceptance.rs", "#[test]\nfn ok() {}\n")
+        .run_command(
+            "git add -A && git -c user.name=f -c user.email=f@l commit -m 'feat: task t-tok'",
+        )
+        .submit(&CodeChanges {
+            branch_name: "kanban/t-tok".into(),
+            changed_files: vec![],
+            unit_test_files: vec![],
+        });
+    script
+        .for_node(Stage::Review, Node::Execute)
+        .submit(&ReviewResult {
+            approved: true,
+            review_report_path: Some("review-report.md".into()),
+            required_changes: vec![],
+        });
+    script
+        .for_node(Stage::Test, Node::Execute)
+        .submit(&TestResult {
+            passed: true,
+            test_report_path: Some("test-report.md".into()),
+            failures: vec![],
+            gate_recheck: false,
+        });
+    script.push_subagent(testkit::Step::Text("摘要".into()));
+
+    ctx.agent.set_script(script);
+    testkit::seed_task(&ctx.store, "t-tok", "p1").await.unwrap();
+    admit(&ctx, "t-tok").await;
+    ctx.executor.run("t-tok").await.unwrap();
+
+    let runs = ctx.store.list_runs("t-tok").await.unwrap();
+    let sub = runs
+        .iter()
+        .find(|r| r.agent_type == "subagent")
+        .expect("应有子代理 run");
+    // FakeAgent 每次调用 +10 prompt / +5 completion；子代理只跑了一轮 Text
+    assert_eq!(sub.prompt_tokens, 10, "子代理 token 记在自己行上");
+    assert_eq!(sub.completion_tokens, 5);
+    assert_eq!(sub.status, NodeStatus::Success);
+
+    // 任务总量 = 全部 run 行之和（子代理行计入 total_calls）
+    let task_tokens: u64 = runs
+        .iter()
+        .map(|r| r.prompt_tokens as u64 + r.completion_tokens as u64)
+        .sum();
+    let task = ctx.store.get_task("t-tok").await.unwrap();
+    assert_eq!(task.total_tokens, task_tokens, "总量与 run 行求和一致");
+    assert_eq!(
+        task.total_calls,
+        runs.iter().filter(|r| r.agent_type != "system").count() as u64,
+        "子代理计入 total_calls（决策 130②）"
+    );
+}
+
+/// 验收（票 08）：子代理**不继承**阶段声明的工具——阶段开了 run_command 也扩不了权。
+#[tokio::test]
+async fn subagent_does_not_inherit_declared_tools() {
+    let ctx = setup("true", Settings::default()).await;
+    // 阶段显式声明：既开子代理，又额外声明 run_command / write_file
+    ctx.store
+        .upsert_stage_config(&agentpipeline_core::types::StageConfig {
+            stage: "develop".into(),
+            tools_json: Some(serde_json::json!([
+                "spawn_sub_agent",
+                "run_command",
+                "write_file"
+            ])),
+            updated_at: ctx.store.now(),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+
+    let mut script = Script::new();
+    design_scripts(&mut script);
+    script
+        .for_node(Stage::Develop, Node::Execute)
+        .push(testkit::Step::Tool {
+            name: "spawn_sub_agent".into(),
+            arguments: serde_json::json!({"task": "检索"}),
+        })
+        .write_file(
+            "src/lib.rs",
+            "pub fn add(a: i32, b: i32) -> i32 { a + b }\n#[test]\nfn adds() { assert_eq!(add(1, 2), 3); }\n",
+        )
+        .write_file("tests/acceptance.rs", "#[test]\nfn ok() {}\n")
+        .run_command(
+            "git add -A && git -c user.name=f -c user.email=f@l commit -m 'feat: task t-noninh'",
+        )
+        .submit(&CodeChanges {
+            branch_name: "kanban/t-noninh".into(),
+            changed_files: vec![],
+            unit_test_files: vec![],
+        });
+    script
+        .for_node(Stage::Review, Node::Execute)
+        .submit(&ReviewResult {
+            approved: true,
+            review_report_path: Some("review-report.md".into()),
+            required_changes: vec![],
+        });
+    script
+        .for_node(Stage::Test, Node::Execute)
+        .submit(&TestResult {
+            passed: true,
+            test_report_path: Some("test-report.md".into()),
+            failures: vec![],
+            gate_recheck: false,
+        });
+    script.push_subagent(testkit::Step::Text("摘要".into()));
+
+    ctx.agent.set_script(script);
+    testkit::seed_task(&ctx.store, "t-noninh", "p1")
+        .await
+        .unwrap();
+    admit(&ctx, "t-noninh").await;
+    ctx.executor.run("t-noninh").await.unwrap();
+
+    let requests = ctx.agent.request_log();
+    let sub_req = requests
+        .iter()
+        .find(|r| r.run.as_ref().is_some_and(|c| c.agent_type == "subagent"))
+        .expect("应有子代理请求");
+    let names: Vec<&str> = sub_req.tools.iter().map(|t| t.name.as_str()).collect();
+    assert_eq!(
+        names,
+        vec!["read_file", "list_dir"],
+        "阶段声明的工具不得传给子代理"
+    );
+}
+
+/// 验收（票 08）：**未声明** `spawn_sub_agent` 时，工具定义里根本没有它
+/// （默认关闭），父代理不会拿到一个假的指针。
+#[tokio::test]
+async fn spawn_sub_agent_absent_unless_declared() {
+    let ctx = setup("true", Settings::default()).await;
+
+    let mut script = Script::new();
+    design_scripts(&mut script);
+    implementation_scripts(&mut script, "t-nosub");
+    ctx.agent.set_script(script);
+    testkit::seed_task(&ctx.store, "t-nosub", "p1")
+        .await
+        .unwrap();
+    admit(&ctx, "t-nosub").await;
+    ctx.executor.run("t-nosub").await.unwrap();
+
+    let requests = ctx.agent.request_log();
+    for req in &requests {
+        assert!(
+            !req.tools.iter().any(|t| t.name == "spawn_sub_agent"),
+            "未声明时不得出现 spawn_sub_agent：{:?}",
+            req.tools.iter().map(|t| &t.name).collect::<Vec<_>>()
+        );
+    }
+}

@@ -15,7 +15,7 @@ pub mod tools;
 pub use baseline::{effective_skills, effective_tools, BASELINE_FORBIDDEN_TOOLS};
 pub use client::{
     submit_metadata_tool, AgentResponse, LlmClient, LlmRequest, Message, Role, ToolCall, ToolDef,
-    BUILTIN_TOOLS, MANDATORY_TOOLS, SKILL_TOOL,
+    BUILTIN_TOOLS, MANDATORY_TOOLS, SKILL_TOOL, SPAWN_SUB_AGENT_TOOL,
 };
 pub use file_policy::{FileOp, FileToolPolicy};
 pub use metadata::{
@@ -29,4 +29,7 @@ pub use prompts::{
 };
 pub use skills::{ResolvedSkill, Skill, SkillSource};
 pub use templates::{system_template, user_template};
-pub use tools::{CommandFinish, CommandRecorder, CommandStart, ToolCallContext, ToolExecutor};
+pub use tools::{
+    CommandFinish, CommandRecorder, CommandStart, SubAgentRequest, SubAgentRunner, ToolCallContext,
+    ToolExecutor,
+};

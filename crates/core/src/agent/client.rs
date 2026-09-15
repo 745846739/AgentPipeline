@@ -170,10 +170,13 @@ pub struct ToolDef {
     pub parameters: serde_json::Value,
 }
 
-/// 8 个内置工具（决策 45 / 172③）。`spawn_sub_agent` 是默认关闭的扩展工具。
+/// 8 个内置工具（决策 45 / 172③）。
 ///
 /// `Skill`（决策 172③，票 06）与上游同名是**功能性决定而非命名偏好**：上游技能的正文里
 /// 写着 `Call the Skill tool with "grilling"`，工具同名使这些正文**无需改写即可执行**。
+///
+/// `spawn_sub_agent` **不在**此列——它是需要阶段显式声明的扩展工具（见
+/// [`SPAWN_SUB_AGENT_TOOL`]）。
 pub const BUILTIN_TOOLS: [&str; 8] = [
     "write_file",
     "edit_file",
@@ -202,6 +205,14 @@ pub const MANDATORY_TOOLS: [&str; 7] = [
 
 /// `Skill` 工具名（决策 172③）。与上游同名，使上游技能正文无需改写即可执行。
 pub const SKILL_TOOL: &str = "Skill";
+
+/// `spawn_sub_agent` 工具名（决策 172③，票 08）。
+///
+/// **扩展工具而非内置工具**：它不进 [`BUILTIN_TOOLS`]，也不进 [`MANDATORY_TOOLS`]——
+/// 只有阶段显式声明才可用（决策 172③ 明确「不继承阶段声明工具」「不再派子代理」）。
+/// 之所以不列进 [`BUILTIN_TOOLS`]：内置集是「每个 agent 都可能拿到」的语义，
+/// 而子代理是**要显式授予**的能力。
+pub const SPAWN_SUB_AGENT_TOOL: &str = "spawn_sub_agent";
 
 /// 从阶段的 serde 结构体派生 `submit_metadata` 的 tool 定义（决策 38：schema 与校验同源）。
 pub fn submit_metadata_tool<T: JsonSchema>(description: impl Into<String>) -> ToolDef {

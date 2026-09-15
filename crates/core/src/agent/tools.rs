@@ -63,6 +63,35 @@ pub trait CommandRecorder: Send + Sync + 'static {
     }
 }
 
+/// 子代理调用的入参（决策 172③，票 08）。
+///
+/// 只带**每次调用不同**的东西：子任务文本与父 run。任务 / 分支 / attempt / 只读工具集
+/// 这些「同一次节点执行内固定」的信息由 [`SubAgentRunner`] 的实现持有——它是按
+/// attempt 构造的，天然知道自己在哪个节点的哪一次执行里。
+pub struct SubAgentRequest {
+    /// 父代理给出的子任务描述。
+    pub task: String,
+    /// 父 run：子代理的 run 行以它为 `parent_run_id`，心跳也刷它。
+    pub parent_run_id: i64,
+    /// 父节坐标：子代理落 run / 会话行复用同一 stage / node，归属靠 `parent_run_id` 区分。
+    pub stage: Stage,
+    pub node: Node,
+    pub worktree_path: PathBuf,
+    pub task_dir: PathBuf,
+}
+
+/// 子代理执行接缝（决策 172③，票 08）。
+///
+/// 与 [`CommandRecorder`] 同一种做法：工具层只声明「我需要一个能跑子代理的东西」，
+/// 真正的 agent 循环住在 pipeline 层（它才持有 LLM 接缝）。**工具层不认识 LLM**，
+/// 所以子代理不能从工具层自己长出来。
+///
+/// 没有注入实现时 `spawn_sub_agent` 不可用——这正是「默认关闭」的落点：能力由阶段
+/// 声明与 executor 接线共同决定，而不是由工具层假装支持。
+pub trait SubAgentRunner: Send + Sync + 'static {
+    fn run(&self, request: SubAgentRequest) -> BoxFuture<'static, Result<String>>;
+}
+
 /// 工具调用上下文。
 #[derive(Debug, Clone)]
 pub struct ToolCallContext {
@@ -138,6 +167,9 @@ pub struct ToolExecutor {
     /// 流式输出去向（决策 100 / §12.4.4，票 14）：`run_command` 按行推送命令输出。
     /// `None` = 不推流（纯单测 / 无订阅者场景），行为与既有缓冲一致。
     sse: Option<CommandSse>,
+    /// 子代理执行器（决策 172③，票 08）。`None` = `spawn_sub_agent` 不可用
+    /// ——默认关闭即由此表达，而非让工具层假装支持。
+    sub_agent: Option<Arc<dyn SubAgentRunner>>,
 }
 
 /// 命令输出推流的上下文（票 14）：SSE 去向 + 事件里要带的任务/分支。
@@ -181,11 +213,18 @@ impl ToolExecutor {
             killer,
             command_heartbeat_interval: COMMAND_HEARTBEAT_INTERVAL,
             sse: None,
+            sub_agent: None,
         }
     }
 
     pub fn with_recorder(mut self, recorder: Arc<dyn CommandRecorder>) -> Self {
         self.recorder = Some(recorder);
+        self
+    }
+
+    /// 注入子代理执行器（决策 172③，票 08）。不注入即 `spawn_sub_agent` 不可用。
+    pub fn with_sub_agent(mut self, runner: Arc<dyn SubAgentRunner>) -> Self {
+        self.sub_agent = Some(runner);
         self
     }
 
@@ -220,6 +259,7 @@ impl ToolExecutor {
             "run_command" => self.run_command(call, ctx).await?,
             "submit_metadata" => self.submit_metadata(call)?,
             "Skill" => self.skill(call)?,
+            "spawn_sub_agent" => self.spawn_sub_agent(call, ctx).await?,
             other => return Err(Error::Validation(format!("未知工具：{other}"))),
         };
         self.apply_l2_offload(call, ctx, outcome)
@@ -304,6 +344,49 @@ impl ToolExecutor {
         Ok(ToolOutcome::ok(format!(
             "{{\"success\":true,\"path\":\"{rel}\"}}"
         )))
+    }
+
+    /// 派生一个**只读**子代理（决策 172③，票 08）。
+    ///
+    /// 父代理给出子任务描述，子代理在独立 context 里跑完并把**摘要**带回父对话——
+    /// 「读 20 个文件」的原文因此不会进父上下文。工具集由 pipeline 层的运行器固定为
+    /// `read_file` / `list_dir`，**不继承阶段声明的工具**（阶段配置无法给子代理扩权）。
+    ///
+    /// 未注入运行器时返回**错误文本而非 `Err`**：与 `Skill` 工具同一姿态（票 06）——
+    /// `Err` 会被算作工具失败并累计 `tool_retry_max`，模型因此打挂整个节点；返回文本
+    /// 让模型自行改道。
+    async fn spawn_sub_agent(&self, call: &ToolCall, ctx: &ToolCallContext) -> Result<ToolOutcome> {
+        let Some(runner) = &self.sub_agent else {
+            return Ok(ToolOutcome::ok(
+                "spawn_sub_agent 在当前阶段未启用。请直接完成该子任务，\
+                 或在阶段配置的 tools_json 里声明 spawn_sub_agent。",
+            ));
+        };
+        let args = Self::args(call)?;
+        let task = args.get("task").and_then(|v| v.as_str()).unwrap_or("");
+        if task.trim().is_empty() {
+            return Ok(ToolOutcome::ok(
+                "spawn_sub_agent 需要 {task} 参数（子任务描述）。请补充后重试。",
+            ));
+        }
+        // run_id 是子代理归属父 run 的唯一凭据：没有它就无法落 parent_run_id，
+        // 宁可明确拒绝也不要落一行无父的孤儿 run。
+        let Some(parent_run_id) = ctx.run_id else {
+            return Ok(ToolOutcome::ok(
+                "spawn_sub_agent 需要所属 run 上下文（当前调用没有 run_id），无法派生。",
+            ));
+        };
+        let summary = runner
+            .run(SubAgentRequest {
+                task: task.to_string(),
+                parent_run_id,
+                stage: ctx.stage,
+                node: ctx.node,
+                worktree_path: ctx.worktree_path.clone(),
+                task_dir: ctx.task_dir.clone(),
+            })
+            .await?;
+        Ok(ToolOutcome::ok(summary))
     }
 
     async fn read_file(&self, call: &ToolCall, ctx: &ToolCallContext) -> Result<ToolOutcome> {
@@ -1363,9 +1446,88 @@ mod tests {
         let s = setup(Stage::Develop);
         assert!(s
             .executor
-            .execute(&call("spawn_sub_agent", serde_json::json!({})), &s.ctx)
+            .execute(
+                &call("definitely_not_a_tool", serde_json::json!({})),
+                &s.ctx
+            )
             .await
             .is_err());
+    }
+
+    /// 票 08：未注入子代理运行器时，`spawn_sub_agent` **不是**未知工具——
+    /// 它返回说明文本（走文本通道，不烧 `tool_retry_max`），与 `Skill` 的未知技能
+    /// 名同一姿态。这样「工具存在但本轮未启用」与「工具名写错」是两件事。
+    #[tokio::test]
+    async fn spawn_sub_agent_without_runner_returns_text_not_error() {
+        let s = setup(Stage::Develop);
+        let out = s
+            .executor
+            .execute(
+                &call(
+                    "spawn_sub_agent",
+                    serde_json::json!({"task": "找出所有调用点"}),
+                ),
+                &s.ctx,
+            )
+            .await
+            .expect("未启用不得走 Err 通道");
+        assert!(out.content.contains("未启用"), "{}", out.content);
+    }
+
+    /// 票 08：子代理运行器已注入但缺 `task` → 提示补参（仍是文本通道）。
+    #[tokio::test]
+    async fn spawn_sub_agent_requires_task_argument() {
+        let s = setup(Stage::Develop);
+        let executor = s.executor.with_sub_agent(std::sync::Arc::new(NoSubAgent));
+        let out = executor
+            .execute(&call("spawn_sub_agent", serde_json::json!({})), &s.ctx)
+            .await
+            .expect("缺参不得走 Err 通道");
+        assert!(out.content.contains("task"), "{}", out.content);
+    }
+
+    /// 票 08：缺父 run（无 run_id）时拒绝派生——否则会落一行无父的孤儿 run。
+    #[tokio::test]
+    async fn spawn_sub_agent_without_run_id_is_refused() {
+        let s = setup(Stage::Develop);
+        let executor = s.executor.with_sub_agent(std::sync::Arc::new(NoSubAgent));
+        let mut ctx = s.ctx.clone();
+        ctx.run_id = None;
+        let out = executor
+            .execute(
+                &call("spawn_sub_agent", serde_json::json!({"task": "检索"})),
+                &ctx,
+            )
+            .await
+            .expect("缺 run 上下文不得走 Err 通道");
+        assert!(out.content.contains("run_id"), "{}", out.content);
+    }
+
+    /// 票 08：注入运行器后，子代理返回的摘要原样进 tool_result。
+    #[tokio::test]
+    async fn spawn_sub_agent_returns_runner_summary() {
+        let s = setup(Stage::Develop);
+        let executor = s.executor.with_sub_agent(std::sync::Arc::new(NoSubAgent));
+        let out = executor
+            .execute(
+                &call("spawn_sub_agent", serde_json::json!({"task": "检索"})),
+                &s.ctx,
+            )
+            .await
+            .expect("正常路径不得报错");
+        assert_eq!(out.content, "子代理摘要");
+    }
+
+    /// 测试替身：不调 LLM，直接回固定摘要。
+    struct NoSubAgent;
+
+    impl SubAgentRunner for NoSubAgent {
+        fn run(
+            &self,
+            _request: SubAgentRequest,
+        ) -> futures::future::BoxFuture<'static, Result<String>> {
+            Box::pin(async { Ok("子代理摘要".to_string()) })
+        }
     }
 
     #[test]

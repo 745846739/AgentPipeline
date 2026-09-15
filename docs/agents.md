@@ -133,7 +133,11 @@ tools = [
 
 > **`run_command` 超时上限（决策 75）：** `tool_timeout_sec`（默认 60）是**默认值**而非所有命令的上限。`test.execute` 需要由 agent 通过 `run_command` 跑集成测试，60 秒显然不够。规则：agent 显式传 `timeout_sec` 时取该值；未传时，test / merge 阶段取 `test_command_timeout_sec`（默认 600），其余阶段取 `tool_timeout_sec`。系统驱动的测试命令始终用 `test_command_timeout_sec`（决策 66）。
 
-> **`spawn_sub_agent`（扩展工具，默认关闭）：** 子代理用于上下文超限兜底（§12.8 / §12.13 L4）。默认不启用；在阶段配置中开启后，agent 可派生一层子代理。关闭时 §12.13 L4 兜底直接跳到 `pending(context_overflow)`。
+> **`spawn_sub_agent`（扩展工具，需阶段显式声明）：** 派生一个**只读**子代理处理可分解的检索子任务，返回摘要——把「读 20 个文件」的原文挡在父上下文之外（决策 172③，票 08）。三条硬约束：工具集**固定为 `read_file` / `list_dir`**（无 `run_command` / 写文件 / `submit_metadata`）、**不继承阶段声明的工具**、**不再派子代理**（深度一层，决策 9）。子代理各自占一行 run（`agent_type = "subagent"` + `parent_run_id`）与其会话行，token 记在自己行上并计入任务总量，父 run 不重复累加；超时沿用节点级 `node_max_duration_sec`。
+>
+> **与 L4 的关系（决策 154 的边界不变）：** 这是**技能可调用的能力**，不是上下文超限兜底手段——「L4 兜底只有两级」（强制压缩 → `pending(context_overflow)`）与「分批 / 拆子代理不作为 L4 兜底」的原裁决不变。
+>
+> **它不在 `BUILTIN_TOOLS` 里**：内置集是「每个 agent 都可能拿到」的语义，而子代理是要显式授予的能力。未声明时父代理的工具集里根本没有它（默认关闭），不会拿到一个断腿的指针。
 
 ### 10.3 各节点 Prompt 模板
 
@@ -784,7 +788,7 @@ type SkillDecl = string | { name: string; mode: "full" | "name"; trusted?: boole
 | provider | 阶段引用 `provider_id`（无则用系统默认） | 该行的厂商必须 ∈ `supported_adapters` **且** 该行 `enabled = 1`，否则**加载时拒绝**（决策 103 / 111） |
 | provider（运行时解析） | `node_overrides > task.model_override > 阶段 provider > 全局默认`（决策 129） | `model_override` 引用的 provider_id 在设置时（`POST /tasks/{id}/model-override`）须过同一校验 |
 | persona | 阶段 prompt + 基线强制前言 | 必须存在且非空 |
-| tools | `基线 mandatory_tools ∪ 阶段 tools − forbidden_tools`；节点存在名字态 / 目录态技能时自动并入 `Skill`（决策 172③，否则那批技能是断腿的指针） | 不能移除 mandatory_tools |
+| tools | `基线 mandatory_tools ∪ 阶段 tools − forbidden_tools`；节点存在名字态 / 目录态技能时自动并入 `Skill`（决策 172③，否则那批技能是断腿的指针）。扩展工具 `spawn_sub_agent` 只由阶段声明启用，**且其子代理的工具集固定只读、不继承此处并集**（票 08 的安全边界） | 不能移除 mandatory_tools |
 | skills | `基线 mandatory_skills ∪ 阶段 skills ∪ 节点级 skills`（决策 170，只增不减） | 不能移除 mandatory_skills；引用的 skill 名字必须存在，否则 fail fast；知识型技能的**正文必须存在且非空**，否则 fail fast（与 `persona_path` 同口径） |
 
 **校验时机：** 启动时（配置加载）一次性校验所有**注册阶段**的阶段配置，**fail fast**——发现违规配置直接拒绝启动并报错，不允许运行时才暴露。伪阶段（`project_analysis` / `conflict_check` / `validator_cross_check`）按各自要求单独校验（决策 87 / 134）：`project_analysis` 的 persona **允许为空**（省略时只输出确定性探测的事实清单，决策 78）；`conflict_check` 必须做语义比对，persona **强制存在且非空**；`validator_cross_check` persona 同样**强制存在且非空**，且 `cross_family_judge = true` 时必须已配置 provider，否则配置加载 fail fast。其余校验（厂商适配器支持、工具并集、超时覆盖）与正式阶段完全一致。

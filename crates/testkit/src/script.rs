@@ -33,6 +33,10 @@ pub enum Step {
 pub struct Script {
     steps: HashMap<(Stage, Node), VecDeque<Step>>,
     pseudo_steps: HashMap<String, VecDeque<Step>>,
+    /// 子代理的脚步（票 08）：子代理复用父节点的 `(stage, node)`，若与父节点共用队列，
+    /// 父节点的一步会被子代理悄悄吃掉，测试就无法表达「父派子代理 → 子代理干活 →
+    /// 摘要回灌父」这个序列。故单独排队。
+    subagent_steps: VecDeque<Step>,
     /// 工具失败注入规则（testing.md §3.2 ② / G13）：`(stage, node, tool)` 的
     /// 第 `n` 次调用（1-based）换成必然失败的参数，其余同名调用真实执行。
     fail_rules: HashMap<(Stage, Node, String), u32>,
@@ -55,6 +59,15 @@ impl Script {
             .entry(agent_type.to_string())
             .or_default()
             .push_back(step);
+        self
+    }
+
+    /// 为子代理追加步骤（票 08）。
+    ///
+    /// 子代理与父节点共用 `(stage, node)` 坐标，所以不能靠坐标区分——单独排队。
+    /// 这也让「父派子代理 → 子代理跑 N 步 → 摘要回灌父」可以被写成线性脚本。
+    pub fn push_subagent(&mut self, step: Step) -> &mut Self {
+        self.subagent_steps.push_back(step);
         self
     }
 
@@ -112,6 +125,7 @@ impl Script {
     pub fn is_empty(&self) -> bool {
         self.steps.values().all(VecDeque::is_empty)
             && self.pseudo_steps.values().all(VecDeque::is_empty)
+            && self.subagent_steps.is_empty()
     }
 
     /// 已声明的 `(stage, node)` 列表。
@@ -131,6 +145,15 @@ impl Script {
         self.pseudo_steps
             .get_mut(agent_type)
             .and_then(|q| q.pop_front())
+    }
+
+    fn pop_subagent(&mut self) -> Option<Step> {
+        self.subagent_steps.pop_front()
+    }
+
+    /// 子代理脚本剩余步数（票 08）。
+    pub fn remaining_subagent(&self) -> usize {
+        self.subagent_steps.len()
     }
 
     /// 取出并消费某个 `(stage, node)` 的下一步——供 mock HTTP 脚本服务器复用
@@ -349,19 +372,28 @@ impl LlmClient for FakeAgent {
                 .as_ref()
                 .map(|r| r.agent_type.clone())
                 .filter(|a| a.starts_with("pseudo:"));
+            // 子代理请求（票 08）复用父节点的 `(stage, node)`，同样必须走独立队列，
+            // 否则它会吃掉父节点的一步。
+            let is_subagent = request
+                .run
+                .as_ref()
+                .is_some_and(|r| r.agent_type == "subagent");
             let step = {
                 let mut inner = agent.inner.lock().unwrap();
                 inner.calls.push((stage, node));
                 inner.requests.push(request);
                 inner.prompt_tokens += 10;
                 inner.completion_tokens += 5;
-                let popped = match &pseudo_type {
-                    Some(agent_type) => inner.script.pop_pseudo(agent_type),
-                    None => inner.script.pop(stage, node),
+                let popped = match (&pseudo_type, is_subagent) {
+                    (Some(agent_type), _) => inner.script.pop_pseudo(agent_type),
+                    (None, true) => inner.script.pop_subagent(),
+                    (None, false) => inner.script.pop(stage, node),
                 };
                 match popped {
                     // fail_tool_n：把该工具第 n 次调用换成必然失败的参数（其余真实执行）
-                    Some(Step::Tool { name, arguments }) if pseudo_type.is_none() => {
+                    Some(Step::Tool { name, arguments })
+                        if pseudo_type.is_none() && !is_subagent =>
+                    {
                         let key = (stage, node, name.clone());
                         let next = inner.tool_calls.get(&key).copied().unwrap_or(0) + 1;
                         inner.tool_calls.insert(key, next);
