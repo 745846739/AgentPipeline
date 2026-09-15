@@ -148,20 +148,20 @@
         节点级独立于阶段级：合起来是并集（只增不减）。写作 <code>node_overrides_json[node].skills</code>。
       </p>
       {#each SKILL_NODES as node (node)}
+        {@const parsed = nodeSkillsFromJson(draft.node_overrides_json, node)}
         <div class="node">
           <SkillDeclList
-            decls={nodeSkillsFromJson(draft.node_overrides_json, node).decls}
+            decls={parsed.decls}
             available={skills}
             hint={node}
             onchange={(decls) => setNodeSkills(node, decls)}
           />
+          {#if parsed.error}
+            <!-- 每个节点各报各的：只报第一个节点的错会让另两个节点的坏值静默消失 -->
+            <p class="nodes-warn">{node}：{parsed.error}</p>
+          {/if}
         </div>
       {/each}
-      {#if nodeSkillsFromJson(draft.node_overrides_json, SKILL_NODES[0]).error}
-        <p class="nodes-warn">
-          {nodeSkillsFromJson(draft.node_overrides_json, SKILL_NODES[0]).error}
-        </p>
-      {/if}
     </div>
 
     <label class="field">
