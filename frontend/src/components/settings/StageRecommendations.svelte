@@ -168,8 +168,32 @@
   }
 
   @media (max-width: 479px) {
+    /* 台账行折成纵向（§5「台账行由横向左右栏折成纵向」）：名字 + 状态一行、理由一行、
+       安装钮另起一行通栏。**必须逐格点名**：只把模板换成两列（`1fr auto`）而留着四个
+       孩子时，`auto` 列会被理由的 max-content 撑大，`1fr` 的名字列被压到 min-content
+       ——技能名在连字符处断成两行（domain-modeling）、「未安装」也断成「未」+「安装」，
+       而理由仍被挤在窄列里。 */
     .item {
       grid-template-columns: 1fr auto;
+      row-gap: 2px;
+    }
+    .name {
+      grid-column: 1;
+      grid-row: 1;
+    }
+    /* 行号也要定死：理由跨整行，稀疏自动放置会把只定了列的状态格推到理由**下面**，
+       每行多出一行空白（状态与名字同行才是这一格的意图）。 */
+    .state {
+      grid-column: 2;
+      grid-row: 1;
+      text-align: right;
+    }
+    .reason {
+      grid-column: 1 / -1;
+    }
+    .item :global(.btn) {
+      grid-column: 1 / -1;
+      width: 100%;
     }
   }
 </style>

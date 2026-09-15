@@ -163,7 +163,13 @@
   }
 
   @media (max-width: 479px) {
-    /* 窄屏：载波行（§5 视图 0），安全区内边距；次级汇总收进桌面款 */
+    /* 窄屏：载波行（§5 视图 0），安全区内边距；次级汇总收进桌面款。
+       桌面款的五组信号（待处理 / 执行中 / 总量 / 主题 / 时钟）在 430px 上实测要
+       501px：时钟整块、主题钮一部分滚出屏幕外——**静默不可见**，比不看更糟。
+       窄屏只留四组，把两处纯装饰收进桌面款：
+         · 时钟：手机自己的状态栏就在显示时间；
+         · token 量表：数字（`总量 N tok`）仍逐字保留，量表的 16 段约 110px 是这一行
+           放不下的主因。实测四组在 360px 上仍有余量，320px 也不折行。 */
     .statusline {
       min-height: calc(40px + var(--safeb));
       height: auto;
@@ -171,6 +177,12 @@
       gap: 12px;
     }
     .statusline .dep {
+      display: none;
+    }
+    .statusline .clock {
+      display: none;
+    }
+    .statusline .tok :global(.gauge) {
       display: none;
     }
     .statusline .theme-tog {

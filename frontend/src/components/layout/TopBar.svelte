@@ -347,7 +347,13 @@
     border-color: var(--pending);
   }
 
+  /* 项目选择器必须自己当定位包含块：它内部的无障碍标签是 `position: absolute`
+     （`.visually-hidden`），而 `.proj` 未定位时那块绝对定位的盒子会一直往上找到
+     `.top`（sticky）作包含块——于是它落在 `.navbar` 的横向滚动容器**之外**，不被裁剪，
+     把文档的可滚动溢出区撑到它的右缘：移动端整页因此比视口宽（430 视口 → 446/458），
+     并连带一条页面级横向滚动条。定位后标签被关在 `.proj` 里，与滚动容器一起裁剪。 */
   .proj {
+    position: relative;
     margin-left: auto;
     flex: none;
   }

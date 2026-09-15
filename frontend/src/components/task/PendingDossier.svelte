@@ -209,10 +209,12 @@
 {/if}
 
 <style>
-  /* ── 急停对话框（原型 .dossier）：双线框 = 琥珀外框 + panel 空隙 + pane 内框 ── */
+  /* ── 急停对话框（原型 .dossier）：双线框 = 琥珀外框 + panel 空隙 + pane 内框 ──
+     右栏与左栏同处第 1 行：左栏现在是一个整体网格项（`.detail.split .main`），
+     跨多行只会凭空多出零高的隐式行，没有收益。 */
   .dossier {
     grid-column: 2;
-    grid-row: 1 / span 3;
+    grid-row: 1;
     align-self: start;
     position: sticky;
     top: 56px;

@@ -12,7 +12,7 @@
   import SplitDialog from '../components/task/SplitDialog.svelte';
   import TimelineView from '../components/task/TimelineView.svelte';
   import DiffView from '../components/render/DiffView.svelte';
-  import { buildHeroStations, formatDuration, formatTokens, pendingLabel } from '../lib/pipeline';
+  import { buildHeroStations, formatDuration, formatTokens, pendingLabel, statusCode } from '../lib/pipeline';
   import { taskDetail } from '../stores/taskDetail.svelte';
 
   interface Props {
@@ -161,16 +161,6 @@
   }
 </script>
 
-{#snippet statusMarker()}
-  {#if isPending}
-    <span class="st wait">pending</span> ▪ {pendingLabel(pendingReason)}
-  {:else if task?.status === 'running'}
-    <span class="st run">running</span>
-  {:else}
-    <span class="st dim">{task?.status}</span>
-  {/if}
-{/snippet}
-
 {#snippet bypassActions()}
   {#if isTerminal}
     <div class="bypass">
@@ -209,8 +199,10 @@
         <div class="bar-row">
           <a class="back" href="#/">← 看板</a>
           <h1 class="d-title bt">{task.title}</h1>
+          <!-- 标题行只放短码（原型 `.bar-row` 写 WAIT / RUN）：完整状态句在下一行
+               `.dmeta` 里，两处都写全句会让同一件事在屏上出现两遍并挤掉标题 -->
           <span class="mark" class:pending={isPending} class:run={!isPending && !isTerminal}>
-            {@render statusMarker()}
+            {statusCode(task.status)}
           </span>
         </div>
         <div class="dmeta">
@@ -395,11 +387,14 @@
     gap: 18px;
     align-items: start;
   }
+  /* 左栏是**一个**网格项（不是 `display: contents` 把每个孩子各塞一行）。
+     档案盒跨多行时，网格会把它的高度摊到它跨的那几行上——左栏于是被当成「行内居中」，
+     标题与轨道 hero 之间空出约 300px 死区（实测行高 165/213/328 而内容只有 19/72/168），
+     在 1100px 高的视口上把时间线整个顶到折叠线以下。收成一项后多余高度落在行**下边**，
+     左栏照旧自上而下排。 */
   .detail.split .main {
-    display: contents;
-  }
-  .detail.split .main > * {
     grid-column: 1;
+    min-width: 0;
   }
   .crumb {
     display: inline-block;
@@ -548,12 +543,6 @@
     .detail.split {
       display: block;
       max-width: var(--detail-max);
-    }
-    .detail.split .main {
-      display: block;
-    }
-    .detail.split .main > * {
-      grid-column: auto;
     }
 
     /* 标题行：返回 + 标题 + 状态标记 */

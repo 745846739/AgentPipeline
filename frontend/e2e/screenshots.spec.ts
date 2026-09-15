@@ -2,9 +2,9 @@
  * 真应用截图（票 12 / 决策 169）——**证据，不是闸门**。
  *
  * 在既有 harness（真后端 + 同源内嵌产物 + 临时 home，决策 151/155/166）上驱动真应用，
- * 覆盖 6 个路由 × 深浅 + 移动款关键视图，产出可重新生成的截图供评审对照原型
+ * 覆盖 7 个路由 × 深浅 × 桌面/移动两档视口，产出可重新生成的截图供评审对照原型
  * （原型那边是 7 个视图——它在 `detail` 上拆了 run / approve 两屏；真应用 `detail` 只有一个
- * 路由，两种外观由任务状态决定，故路由数是 6）
+ * 路由，两种外观由任务状态决定，故路由数是 6 + 决策 174 的 `#/talk` = 7）
  * （design/prototype-pixel*.html）。
  *
  * **刻意不做字节级 golden 回放**：像素字体跨机渲染存在差异，那会引入 flaky 门。
@@ -86,17 +86,14 @@ test.describe('真应用截图（证据，非闸门）', () => {
     });
   });
 
-  test('移动款关键视图 × 深浅', async ({ page }) => {
+  test('移动款 7 路由 × 深浅', async ({ page }) => {
     const bundle = watchBundle(page);
     await page.setViewportSize({ width: 430, height: 932 });
 
     for (const theme of ['dark', 'light'] as const) {
-      for (const route of [
-        { slug: 'board', hash: '#/' },
-        { slug: 'detail', hash: `#/task/${app.taskId}` },
-        { slug: 'metrics', hash: '#/metrics' },
-      ]) {
-        await page.goto(`${app.webBase}/${route.hash}`);
+      // 与桌面同一张路由表：每个页面都要有移动款证据，不只「关键视图」。
+      for (const route of ROUTES) {
+        await page.goto(`${app.webBase}/${route.hash.replace('__TASK__', app.taskId)}`);
         await settleBundle(page, bundle);
         await page.evaluate((t) => {
           document.documentElement.dataset.theme = t;

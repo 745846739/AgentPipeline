@@ -422,6 +422,22 @@ export function formatStalled(hours: number): string {
   return `已滞留 ${Math.max(1, hours)} 小时`;
 }
 
+/**
+ * 移动款标题行的状态短码（theme-6-pixel.md §5 移动原型 `.bar-row`）。
+ *
+ * 标题行是**一行**（返回 + 标题 + 状态标记），故标记只能是一个词；完整状态句由
+ * 紧随其下的 `.dmeta` 行承担（§5 视图 2/3 的 `■ pending ▪ merge_approval`）。
+ * 两处都写完整句会让同一件事在屏上出现两遍，且把标题挤成省略号。
+ *
+ * 原型钉了 pending / running 两码（`.bar-row` 写 `WAIT` / `RUN`）；其余状态原型没有
+ * 移动款详情样例，取状态名大写——沿用像素主题自己的全大写短码写法，不另造词表。
+ */
+export function statusCode(status: TaskStatus): string {
+  if (status === 'pending') return 'WAIT';
+  if (status === 'running') return 'RUN';
+  return status.toUpperCase();
+}
+
 /** pending 类型的界面短标签（trigger 用词表原样展示于时间线）。 */
 export function pendingLabel(reason: { type: string; context?: { kind?: string } } | null): string {
   if (!reason) return '等待处理';
