@@ -8,6 +8,7 @@ pub mod metadata;
 pub mod prompts;
 pub mod providers;
 pub mod sanitize;
+pub mod skill_import;
 pub mod skills;
 pub mod templates;
 pub mod tools;

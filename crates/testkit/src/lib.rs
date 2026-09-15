@@ -15,6 +15,7 @@ pub mod home;
 pub mod killer;
 pub mod mock_llm;
 pub mod script;
+pub mod skill_fixture;
 
 pub use assertions::{
     assert_cursor_at, backdate_run, command_count, cursor_counts, live_cursor_for_branch,
@@ -26,3 +27,4 @@ pub use home::{seed_project, seed_task, seed_task_full, EnvGuard, TestHome};
 pub use killer::RecordingKiller;
 pub use mock_llm::{MockLlm, MockRoute, RecordedRequest};
 pub use script::{FakeAgent, Script, Step};
+pub use skill_fixture::{skill_zip, write_raw_skill_dir, write_skill_dir, zip_bytes};

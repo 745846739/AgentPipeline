@@ -17,6 +17,7 @@ sqlx.workspace = true
 tempfile.workspace = true
 tokio.workspace = true
 ulid.workspace = true
+zip.workspace = true
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["full", "test-util"] }

@@ -97,6 +97,9 @@ pub fn build_router(state: AppState) -> Router {
         )
         // ── 全局指标 ──
         .route("/metrics", get(routes::tasks::global_metrics))
+        // ── 技能市场（决策 172⑤，票 09）：本地导入 / 目录扫描 / 卸载。全程离线 ──
+        // 子 router 自带 state（import 路由要单独放宽请求体上限），故先 merge 再进防护层。
+        .merge(routes::skills::routes(state.clone()))
         // ── 服务自述与局域网分享（决策 167）：纯 GET，无状态变更 ──
         .route("/server-info", get(routes::server_info::info))
         .route("/server-info/qr.svg", get(routes::server_info::qr_svg))

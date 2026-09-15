@@ -557,24 +557,60 @@ pub fn effective_run_command_timeout(
 /// 返回 `(定位说明, 技能声明)`，定位说明用于报错——节点级要指明是哪个节点。
 /// 非法声明形态（未知 `mode`、未信任 + full）在此直接 fail fast。
 fn declared_skills(cfg: &StageConfig) -> Result<Vec<(String, crate::agent::skills::SkillDecl)>> {
+    // 逐来源解析并**传播第一个错误**：写入路径要 fail fast，且报错顺序稳定
+    let mut out = Vec::new();
+    for (where_, decls) in declared_skill_sources(cfg) {
+        for decl in decls? {
+            out.push((where_.clone(), decl));
+        }
+    }
+    Ok(out)
+}
+
+/// 逐来源（阶段级一处、每个节点级各一处）解析技能声明，**每个来源各自一个 `Result`**。
+///
+/// 拆到这一层是为了让 [`declared_skill_decls`] 能只丢掉**坏的那一处**：早先它调用
+/// [`declared_skills`] 并在出错时 `unwrap_or_default()`，那会把整个阶段配置一并丢掉——
+/// 于是一条坏的节点声明会让 `GET /skills` 的 `declared_in` 对**同阶段其他节点**的技能
+/// 也报成「无人引用」，恰好在「卸载前看后果」这个用途上给出错误的安全感。
+fn declared_skill_sources(
+    cfg: &StageConfig,
+) -> Vec<(String, Result<Vec<crate::agent::skills::SkillDecl>>)> {
     let stage = cfg.stage.as_str();
-    let mut out: Vec<(String, crate::agent::skills::SkillDecl)> =
-        parse_skill_decls_opt(cfg.skills_json.as_ref(), &format!("阶段 {stage}"))?
-            .into_iter()
-            .map(|d| (format!("阶段 {stage}"), d))
-            .collect();
+    let mut out: Vec<(String, Result<Vec<crate::agent::skills::SkillDecl>>)> = vec![(
+        format!("阶段 {stage}"),
+        parse_skill_decls_opt(cfg.skills_json.as_ref(), &format!("阶段 {stage}")),
+    )];
     if let Some(overrides) = cfg.node_overrides_json.as_ref().and_then(|v| v.as_object()) {
         // 节点按名排序，报错顺序稳定（BTreeMap 的迭代序已有序，这里是显式保证）
         let mut nodes: Vec<&String> = overrides.keys().collect();
         nodes.sort();
         for node in nodes {
             let where_ = format!("阶段 {stage} 节点 {node}");
-            for decl in parse_skill_decls_opt(overrides[node].get("skills"), &where_)? {
-                out.push((where_.clone(), decl));
-            }
+            let parsed = parse_skill_decls_opt(overrides[node].get("skills"), &where_);
+            out.push((where_, parsed));
         }
     }
-    Ok(out)
+    out
+}
+
+/// 同 [`declared_skills`]，但**只丢掉解析失败的那一处来源**，不报错。
+///
+/// 供只读的界面路径使用（`GET /skills` 要回答「哪些阶段/节点引用了这个技能」，好让用户在
+/// 卸载前看到后果）。这类查询**不该因为一条坏配置整体失败**——坏配置该由启动校验与
+/// `PUT /stage-configs` 报错（写入路径 fail fast 才是对的）；若这里一并报错，用户反而失去
+/// 了查看「哪条配置坏了」的手段。失败范围也**只限那一处**：好的来源照常返回。
+pub fn declared_skill_decls(cfg: &StageConfig) -> Vec<(String, crate::agent::skills::SkillDecl)> {
+    declared_skill_sources(cfg)
+        .into_iter()
+        .filter_map(|(where_, decls)| decls.ok().map(|d| (where_, d)))
+        .flat_map(|(where_, decls)| {
+            decls
+                .into_iter()
+                .map(move |d| (where_.clone(), d))
+                .collect::<Vec<_>>()
+        })
+        .collect()
 }
 
 /// [`parse_skill_decls`] 的空安全包装：字段缺席按空数组处理。
@@ -1158,6 +1194,40 @@ mod tests {
             ..Default::default()
         };
         assert!(node_skills(Some(&empty), "execute").unwrap().is_empty());
+    }
+
+    /// `declared_skill_decls`（只读界面路径）只丢掉**解析失败的那一处来源**。
+    ///
+    /// 早先它是对整份配置 `unwrap_or_default()`：一条坏的节点声明会让同阶段**其他节点**的技能
+    /// 也报成「无人引用」，恰好在「卸载前看后果」这个用途上给出错误的安全感。
+    #[test]
+    fn declared_skill_decls_drops_only_the_broken_source() {
+        let cfg = StageConfig {
+            stage: "architect-design".into(),
+            // 阶段级合法
+            skills_json: Some(serde_json::json!(["stage-skill"])),
+            node_overrides_json: Some(serde_json::json!({
+                // 坏：未受信任却要 full 注入
+                "validate_input": {"skills": [{"name": "bad", "mode": "full", "trusted": false}]},
+                // 好：同配置里的另一节点
+                "execute": {"skills": ["node-skill"]},
+            })),
+            ..Default::default()
+        };
+        let decls = declared_skill_decls(&cfg);
+        let names: Vec<&str> = decls.iter().map(|(_, d)| d.name.as_str()).collect();
+        assert!(
+            names.contains(&"stage-skill"),
+            "阶段级好声明不该被节点的坏声明连累：{names:?}"
+        );
+        assert!(
+            names.contains(&"node-skill"),
+            "同配置另一节点的好声明不该被连累：{names:?}"
+        );
+        assert!(!names.contains(&"bad"), "{names:?}");
+
+        // 而写入 / 启动路径仍 fail fast（同一份配置经严格版即报错）
+        assert!(declared_skills(&cfg).is_err());
     }
 
     #[test]

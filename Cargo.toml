@@ -47,6 +47,14 @@ tower = { version = "0.5", features = ["util"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 ulid = "1"
+# 技能包（zip）解码（票 09）：**只用它读，不用它写**，故关掉默认特性集
+# （aes-crypto / bzip2 / zstd / lzma / ppmd / time 全是为压缩与加密准备的，本票用不到）。
+# 保留 deflate——`zip -r` 的默认压缩方法，用户上传的包几乎都是它；
+# `zlib-rs` 后端是纯 Rust，不引 C 工具链，避免给本机链接时间再加一笔。
+# 路径穿越**不外包**给它的 `enclosed_name` 全权负责（票 09 的主要风险，见
+# crates/core/src/agent/skill_import.rs）：它拒绝绝对路径与越界 `..`，但我们仍自己过一道
+# 更严的判定，不把安全判定寄托在第三方库的实现细节上。
+zip = { version = "4.2", default-features = false, features = ["deflate-flate2-zlib-rs"] }
 
 agentpipeline-core = { path = "crates/core" }
 testkit = { path = "crates/testkit" }

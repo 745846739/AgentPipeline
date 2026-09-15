@@ -16,7 +16,9 @@ use axum::body::Body;
 use axum::http::{header, Request, StatusCode};
 use axum::Router;
 use serde_json::Value;
-use testkit::{seed_project, seed_task, seed_task_full, Repo, TestHome};
+use testkit::{
+    seed_project, seed_task, seed_task_full, skill_zip, write_skill_dir, zip_bytes, Repo, TestHome,
+};
 use tower::ServiceExt;
 
 const PORT: u16 = 8787;
@@ -2504,4 +2506,352 @@ async fn server_info_endpoints_are_reachable_without_client_header() {
     )
     .await;
     assert_eq!(status, 200);
+}
+
+// ═══════════════════ 技能市场：本地导入 / 扫描 / 卸载（决策 172⑤，票 09）═══════════════════
+//
+// 五条契约用例对应票面列出的验收清单：上传合法 zip 成功 / 缺 `SKILL.md` 拒绝 /
+// 同名未确认拒绝 / 扫描返回清单 / 卸载后引用报错。全部**离线**（无网络调用）。
+
+/// 用原始 zip 字节 POST（请求体就是 zip，不是 multipart，见 routes/skills.rs 模块头注释）。
+async fn post_zip(api: &Api, uri: &str, zip: Vec<u8>) -> (StatusCode, Value) {
+    call(
+        api,
+        request("POST", uri)
+            .header(header::CONTENT_TYPE, "application/zip")
+            .body(Body::from(zip))
+            .unwrap(),
+    )
+    .await
+}
+
+fn skills_root(api: &Api) -> std::path::PathBuf {
+    api.state.home.skills_dir()
+}
+
+/// ① 上传合法 zip → 成功落盘（布局为 `{name}/SKILL.md` + 兄弟文件）。
+#[tokio::test]
+async fn import_zip_installs_skill_with_siblings() {
+    let api = api().await;
+    let zip = skill_zip("grill", "拷问协议正文", &[("tests.md", "兄弟文件")]);
+
+    let (status, body) = post_zip(&api, "/skills/import", zip).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["skill"]["name"], "grill");
+    assert_eq!(body["skill"]["sibling_count"], 1);
+
+    let root = skills_root(&api);
+    assert!(root.join("grill/SKILL.md").is_file());
+    assert!(
+        root.join("grill/tests.md").is_file(),
+        "兄弟文件须一并落盘，否则票 07 的展开会缺文件"
+    );
+    // 装完即可见（`GET /skills` 与启动校验同源）
+    let (status, body) = get(&api, "/skills").await;
+    assert_eq!(status, StatusCode::OK);
+    let names: Vec<&str> = body["skills"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|s| s["name"].as_str().unwrap())
+        .collect();
+    assert!(names.contains(&"grill"), "{body}");
+}
+
+/// ② 缺 `SKILL.md` → 400 拒绝，报文说清缺什么，且**不落盘**。
+#[tokio::test]
+async fn import_zip_without_skill_md_is_rejected() {
+    let api = api().await;
+    let zip = zip_bytes(&[("grill/notes.md", "只有笔记")]);
+
+    let (status, body) = post_zip(&api, "/skills/import", zip).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    assert!(
+        body["error"].as_str().unwrap().contains("SKILL.md"),
+        "{body}"
+    );
+    assert!(
+        !skills_root(&api).join("grill").exists(),
+        "拒绝的包不得留下半份痕迹"
+    );
+}
+
+/// 路径穿越的包被拒绝，且技能根之外不留任何文件（票 09 的主要风险）。
+#[tokio::test]
+async fn import_zip_rejects_path_traversal() {
+    let api = api().await;
+    let zip = zip_bytes(&[("s/SKILL.md", "正文"), ("../escaped.md", "逃逸")]);
+
+    let (status, body) = post_zip(&api, "/skills/import", zip).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    assert!(body["error"].as_str().unwrap().contains("穿越"), "{body}");
+    assert!(!skills_root(&api).join("escaped.md").exists());
+    assert!(!api.state.home.root().join("escaped.md").exists());
+}
+
+/// ③ 同名冲突默认拒绝，报出技能名与当前来源；显式 `overwrite=true` 才覆盖。
+#[tokio::test]
+async fn import_zip_same_name_requires_explicit_overwrite() {
+    let api = api().await;
+    let root = skills_root(&api);
+
+    let (status, _) = post_zip(&api, "/skills/import", skill_zip("dupe", "第一版正文", &[])).await;
+    assert_eq!(status, StatusCode::OK);
+
+    // 未确认 → 409，报文含技能名与当前来源
+    let (status, body) =
+        post_zip(&api, "/skills/import", skill_zip("dupe", "第二版正文", &[])).await;
+    assert_eq!(status, StatusCode::CONFLICT, "{body}");
+    let err = body["error"].as_str().unwrap();
+    assert!(err.contains("dupe"), "报文须含技能名：{body}");
+    assert!(err.contains("SKILL.md"), "报文须含当前来源：{body}");
+
+    // 原内容未被改动
+    assert!(std::fs::read_to_string(root.join("dupe/SKILL.md"))
+        .unwrap()
+        .contains("第一版正文"));
+
+    // 显式确认 → 覆盖成功
+    let (status, body) = post_zip(
+        &api,
+        "/skills/import?overwrite=true",
+        skill_zip("dupe", "第二版正文", &[]),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert!(std::fs::read_to_string(root.join("dupe/SKILL.md"))
+        .unwrap()
+        .contains("第二版正文"));
+}
+
+/// ④ 目录扫描返回清单：名字 + 描述 + 是否已存在。
+#[tokio::test]
+async fn scan_lists_importable_skills_with_existence() {
+    let api = api().await;
+    let source = api._home.scratch_dir("zcode-skills");
+
+    write_skill_dir(&source, "scan-me", "待导入的正文", &[("tests.md", "兄弟")]);
+    // 已在目标技能根里（exists 须为 true）
+    let root = skills_root(&api);
+    std::fs::create_dir_all(root.join("already")).unwrap();
+    std::fs::write(root.join("already/SKILL.md"), "已存在").unwrap();
+    write_skill_dir(&source, "already", "同名的另一份", &[]);
+    // 杂物：没有 SKILL.md 的目录不进清单
+    std::fs::create_dir_all(source.join("junk")).unwrap();
+
+    let (status, body) = get(&api, &format!("/skills/scan?root={}", source.display())).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let skills = body["skills"].as_array().unwrap();
+    let names: Vec<&str> = skills.iter().map(|s| s["name"].as_str().unwrap()).collect();
+    assert!(names.contains(&"scan-me"), "{body}");
+    assert!(!names.contains(&"junk"), "杂物不得进清单：{body}");
+
+    let already = skills.iter().find(|s| s["name"] == "already").unwrap();
+    assert_eq!(already["exists"], true, "已在技能根里须标记：{body}");
+    let scan_me = skills.iter().find(|s| s["name"] == "scan-me").unwrap();
+    assert_eq!(scan_me["exists"], false);
+}
+
+/// 扫描返回 `description`（界面的「可用技能目录」靠它展示）。
+#[tokio::test]
+async fn scan_carries_frontmatter_description() {
+    let api = api().await;
+    let source = api._home.scratch_dir("described");
+    let dir = source.join("desc");
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(
+        dir.join("SKILL.md"),
+        "---\nname: desc\ndescription: 拷问设计树\n---\n\n正文",
+    )
+    .unwrap();
+
+    let (status, body) = get(&api, &format!("/skills/scan?root={}", source.display())).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["skills"][0]["description"], "拷问设计树");
+}
+
+/// 扫描一个不存在的目录 → 400（不是 500，也不是空清单）。
+#[tokio::test]
+async fn scan_of_missing_root_is_rejected() {
+    let api = api().await;
+    let (status, body) = get(&api, "/skills/scan?root=/definitely/not/here").await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+}
+
+/// 目录导入支持批量：逐项结果，一项坏不中断整批。
+#[tokio::test]
+async fn import_dir_reports_per_item_without_aborting_the_batch() {
+    let api = api().await;
+    let source = api._home.scratch_dir("batch");
+    let good = write_skill_dir(&source, "good", "好技能", &[]);
+    let also = write_skill_dir(&source, "also-good", "另一个好技能", &[]);
+    // 坏项：目录里没有 SKILL.md
+    let bad = source.join("bad");
+    std::fs::create_dir_all(&bad).unwrap();
+    std::fs::write(bad.join("readme.md"), "杂物").unwrap();
+
+    let (status, body) = post(
+        &api,
+        "/skills/import-dir",
+        serde_json::json!({
+            "paths": [good, bad, also],
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["succeeded"], 2, "{body}");
+    assert_eq!(body["failed"], 1, "{body}");
+    let results = body["results"].as_array().unwrap();
+    assert_eq!(results.len(), 3, "逐项结果一项不落：{body}");
+    assert_eq!(results[1]["ok"], false, "{body}");
+
+    // 好的两项确实落盘了（一个坏项没有中断整批）
+    let root = skills_root(&api);
+    assert!(root.join("good/SKILL.md").is_file());
+    assert!(root.join("also-good/SKILL.md").is_file());
+}
+
+/// ⑤ 卸载后引用报错——技能名是唯一身份，不得静默降级（票 09 的核心不变量）。
+///
+/// 两条路径都断言：卸载本身成功（**不**因被引用而拒绝，否则制造「想卸载得先改配置、
+/// 想改配置得先卸载」的先后依赖），以及随后的 `PUT /stage-configs` fail fast。
+#[tokio::test]
+async fn uninstall_then_referencing_config_fails_fast() {
+    let api = api().await;
+
+    // 先装一个技能并把它写进阶段配置
+    let (status, _) = post_zip(
+        &api,
+        "/skills/import",
+        skill_zip("referenced", "被引用的技能正文", &[]),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let (status, body) = put(
+        &api,
+        "/stage-configs/architect-design",
+        serde_json::json!({"skills_json": ["referenced"]}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "装着的时候写入应当通过：{body}");
+
+    // `GET /skills` 提前告知「这个技能被哪些配置引用」（卸载前看得到后果）
+    let (_, body) = get(&api, "/skills").await;
+    let entry = body["skills"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|s| s["name"] == "referenced")
+        .unwrap()
+        .clone();
+    let declared = entry["declared_in"].as_array().unwrap();
+    assert!(
+        declared
+            .iter()
+            .any(|d| d.as_str().unwrap().contains("architect-design")),
+        "须报出引用它的阶段：{entry}"
+    );
+
+    // 卸载：允许（引用完整性不在这里拦）
+    let (status, body) = delete(&api, "/skills/referenced").await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert!(!skills_root(&api).join("referenced").exists());
+
+    // 卸载后写入引用它的配置 → 400 fail fast，且报文含技能名
+    let (status, body) = put(
+        &api,
+        "/stage-configs/develop",
+        serde_json::json!({"skills_json": ["referenced"]}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    assert!(
+        body["error"].as_str().unwrap().contains("referenced"),
+        "{body}"
+    );
+}
+
+/// 卸载不存在的技能 → 404；工具型技能（PATH 可执行文件）→ 400。
+#[tokio::test]
+async fn uninstall_unknown_skill_is_404() {
+    let api = api().await;
+    let (status, body) = delete(&api, "/skills/no-such-skill").await;
+    assert_eq!(status, StatusCode::NOT_FOUND, "{body}");
+}
+
+/// 本机无网时票 09 的功能全部可用——本端点组不依赖任何网络（票 09 最后一条验收项）。
+///
+/// 断言的是「导入 / 列表 / 扫描」三段全链路在纯本地路径下跑通，没有需要出网的环节。
+#[tokio::test]
+async fn skill_market_works_fully_offline() {
+    let api = api().await;
+    let source = api._home.scratch_dir("offline-src");
+    write_skill_dir(&source, "offline", "离线正文", &[]);
+
+    // 扫描 → 目录导入 → 列表，全程本地
+    let (status, body) = get(&api, &format!("/skills/scan?root={}", source.display())).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let (status, body) = post(
+        &api,
+        "/skills/import-dir",
+        serde_json::json!({"paths": [source.join("offline")]}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["succeeded"], 1, "{body}");
+    let (status, body) = get(&api, "/skills").await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(body["skills"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|s| s["name"] == "offline"));
+}
+
+/// 空请求体 → 400（而不是把空字节当 zip 解析后报一个难懂的 IO 错）。
+#[tokio::test]
+async fn import_empty_body_is_rejected() {
+    let api = api().await;
+    let (status, body) = post_zip(&api, "/skills/import", Vec::new()).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    assert!(body["error"].as_str().unwrap().contains("为空"), "{body}");
+}
+
+/// 含路径分隔符的技能名被拒（`?name=a/b`）——否则会出现「装得进、列不出、删不掉」的状态。
+#[tokio::test]
+async fn import_rejects_skill_name_with_separator() {
+    let api = api().await;
+    let zip = zip_bytes(&[("SKILL.md", "平铺的正文")]);
+    let (status, body) = post_zip(&api, "/skills/import?name=a%2Fb", zip).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    assert!(
+        body["error"].as_str().unwrap().contains("路径分隔符"),
+        "{body}"
+    );
+    assert!(!skills_root(&api).join("a").exists(), "拒绝后不得落盘");
+}
+
+/// 平铺打包的 zip（`SKILL.md` 在包根）配上显式技能名即可安装。
+#[tokio::test]
+async fn import_flat_zip_with_explicit_name() {
+    let api = api().await;
+    let zip = zip_bytes(&[("SKILL.md", "平铺打包的正文"), ("tests.md", "兄弟")]);
+    let (status, body) = post_zip(&api, "/skills/import?name=flat", zip).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["skill"]["name"], "flat");
+    assert!(skills_root(&api).join("flat/SKILL.md").is_file());
+    assert!(skills_root(&api).join("flat/tests.md").is_file());
+}
+
+/// 平铺 zip 不给名 → 400 并说明「须显式指定技能名」，而不是猜一个名字。
+#[tokio::test]
+async fn import_flat_zip_without_name_is_rejected() {
+    let api = api().await;
+    let zip = zip_bytes(&[("SKILL.md", "平铺的正文")]);
+    let (status, body) = post_zip(&api, "/skills/import", zip).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    assert!(
+        body["error"].as_str().unwrap().contains("显式指定技能名"),
+        "{body}"
+    );
 }

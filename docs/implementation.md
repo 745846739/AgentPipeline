@@ -776,6 +776,18 @@ executor checkpoint 机制天然支持：
 | `GET /projects/{id}/analysis` | GET | 最近一次项目分析的状态与结果（决策 130） |
 | `GET/POST/PATCH/DELETE /providers` | — | provider / model 配置 CRUD（存 DB，决策 22/46）。**`api_key` 为明文内联字段**（决策 112）；读接口只回显 `***`，不返回原值 |
 | `GET /metrics` | GET | 全局统计（成功率、平均耗时、token 消耗） |
+| `GET /skills` | GET | 已安装技能清单（名字 / 描述 / 来源 / `declared_in`——被哪些阶段与节点引用，供卸载前看后果）（决策 172⑤，票 09） |
+| `POST /skills/import` | POST | 上传 **zip 原始字节**（`?name=&overwrite=`）装技能；校验含 `SKILL.md`、frontmatter 可解析、正文非空，落到技能根 `{name}/SKILL.md` + 兄弟文件；同名默认 409 并报出现有来源，`overwrite=true` 才覆盖；`name` 可省略（包为 `{name}/SKILL.md` 布局时自动推断，平铺包须显式给）（票 09） |
+| `POST /skills/import-dir` | POST | 从一个或多个本地技能目录导入（`{paths: [], overwrite}`），**逐项返回结果**，一项失败不中断整批（票 09） |
+| `GET /skills/scan` | GET | 扫描一个本地技能根（`?root=~/.zcode/skills`）列出可导入技能：名字 + `description` + `exists`（票 09） |
+| `DELETE /skills/{name}` | DELETE | 卸载技能（删技能根下 `{name}/`）。**不检查引用**——仍被引用的卸载后由启动校验与 `PUT /stage-configs` fail fast 兜住；工具型技能（PATH 可执行文件）拒绝卸载（票 09） |
+
+> **技能市场全程离线（票 09）：** 五个导入 / 扫描 / 卸载端点不依赖任何网络，本机无网时功能完整。
+> 上传走**原始字节**而非 multipart / base64——`multipart` 要新引 `multer` 一棵树，base64 要一个
+> 编解码依赖并让体积涨 33%，而原始字节零依赖（`fetch(url, {body: file})` 即可）。
+> **路径穿越**是本组端点的主要风险：zip 条目名过两道独立判定（自己的 `sanitize_rel_path` +
+> `zip` crate 的 `enclosed_name`），落盘前实数校验目标在技能根之内（见
+> `crates/core/src/agent/skill_import.rs` 模块头）。票 10 的远程 registry 复用同一落盘入口。
 
 > **`allowed_actions` 与端点的配对（决策 101 / 119）：** 前端对 `allowed_actions` 纯渲染，因此每个 `side_effect` 动作都必须有对应端点——`cancel` → `POST /tasks/{id}/cancel`、`split_task` → `POST /tasks/{id}/split`、`更换长上下文模型` → `POST /tasks/{id}/model-override`、`合入 / 返回修改` → `POST /tasks/{id}/merge/decision`（决策 119）。新增 side_effect 动作时必须同时新增端点，否则前端会出现点不动的按钮。
 
