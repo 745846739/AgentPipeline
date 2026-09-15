@@ -6,7 +6,9 @@ Kanban 式流水线驱动的本地多 agent 开发管线：`init → architect-d
 
 ## 环境
 
-- Rust 1.80+（当前验证于 1.98）
+- Rust 1.80+（当前验证于 1.98）。仓库根的 `rust-toolchain.toml` **钉住精确版本 `1.98.0`**
+  （决策 175）——不用 `stable` 通道：`stable` 会让 rustup 在构建途中把工具链换掉，造成
+  整棵依赖树重编且闸门中断。首次构建会自动下载该版本（一次），此后固定不变。
 - `git` 能力由 **git2（libgit2 绑定）** 提供，无需系统 git（决策 12；测试 fixture 仍走系统 git CLI 作脚手架，决策 146 修订）
 - SQLite 由 sqlx 内嵌编译，无需单独安装
 
@@ -104,9 +106,9 @@ make fmt             # 格式化（写回）
 
 **本项目无 CI**（无 `.github/workflows/`）：闸门靠本地执行，这是当前形态而非遗漏。
 
-当前状态：**Rust 515 个用例全过**（另有 2 个 `#[ignore]` 真 LLM 冒烟：单节点 + 全流程），
-`fmt` / `clippy -D warnings` 干净；前端 **96 个 vitest 全过** + `svelte-check` 0 error /
-0 warning + **17 条 playwright E2E 全过**（`make check-e2e`）。
+当前状态：**Rust 613 个用例全过**（另有 2 个 `#[ignore]` 真 LLM 冒烟：单节点 + 全流程），
+`fmt` / `clippy -D warnings` 干净；前端 **244 个 vitest 全过** + `svelte-check` 0 error /
+0 warning + **27 条 playwright E2E 全过**（共 29 例，2 例截图证据默认 skip，见下）（`make check-e2e`）。
 
 ## 代码结构
 

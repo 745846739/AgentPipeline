@@ -4,6 +4,7 @@
 #   make run           build 后直接启动，浏览器开 http://127.0.0.1:8788（端口见配置 [server]）
 #   make desktop       桌面形态：Tauri 2 壳打包出 dmg（壳内同源起服；决策 168 起只出 dmg）
 #   make desktop-run   桌面调试：debug 壳直接跑（窗口导航到内嵌服务）
+#   make icon          重新生成桌面应用图标（规格 theme-6-pixel.md §2.5）
 #   make clean         清理构建产物（target / frontend/dist / node_modules / desktop target）
 #
 # 质量闸门也在这里（决策 147 / 166，**决策 168 起本文件是闸门的唯一权威定义**：
@@ -24,9 +25,25 @@
 #   make smoke          启动冒烟（spawn 真二进制，E2E-00）
 #   make fmt            格式化（写回，非 check）
 
-.PHONY: build frontend backend run desktop desktop-run clean \
+.PHONY: build frontend backend run desktop desktop-run clean icon \
         check check-lint check-test check-frontend check-e2e \
         unit integration api e2e smoke fmt
+
+# 工具链归一（决策 175）：本机 PATH 里 /opt/local/bin（MacPorts 自带 rust）排在
+# ~/.cargo/bin（rustup）**之前**，裸 `cargo` 会落到另一套 rustc 上；两套 rustc 的
+# 指纹不同，换一套就等于整棵依赖树重编（本机实测 10 分钟以上）。这里把 rustup 的
+# shim 提到最前，配合仓库根的 rust-toolchain.toml 钉住 1.98.0。
+# 用 `:=` 立即展开，取的是本 Makefile 解释时的 PATH，不受各 shell 差异影响。
+export PATH := $(HOME)/.cargo/bin:$(PATH)
+
+# 工具链**进程级**钉住（决策 175 收尾修正）：rustup 的 shim 按**当前目录**查找
+# rust-toolchain.toml，而 cargo 编译第三方 crate 时的工作目录是
+# ~/.cargo/registry/src/.../{crate}/ —— 那些 crate **自带** rust-toolchain.toml
+# （实测 atoi 2.0.0 钉 1.57.0、sqlx 0.8.6 钉 1.78）。于是编译到 atoi 时 rustup
+# 会**当场下载并切到 rustc 1.57.0**，而 1.57 不认识 cargo 传的 `--check-cfg`，
+# 报 `Unrecognized option: 'check-cfg'` 直接失败；且该工具链会被永久装在机器上。
+# RUSTUP_TOOLCHAIN 的优先级**高于**目录文件与环境无关，钉住它可一次性关掉这条路径。
+export RUSTUP_TOOLCHAIN := 1.98.0
 
 check: check-lint check-test check-frontend check-e2e
 
@@ -34,6 +51,10 @@ check-lint:
 	cargo fmt --all -- --check
 	cargo clippy --workspace --all-targets -- -D warnings
 
+# 全量测试是**冷启动最贵的一步**（本机约 10 分钟）：它会为 22 个集成测试文件各
+# 链接一个独立二进制，而每个二进制的链接输入含全部依赖 rlib（本机约 3.3 GB）。
+# 日常改动用分层子目标（unit / integration / api / e2e / smoke）只编一层；
+# 本目标留给提交前的那一次完整验证。
 check-test:
 	cargo test --workspace
 
@@ -59,6 +80,13 @@ frontend:
 
 backend:
 	cargo build --release
+
+# 应用图标（规格 theme-6-pixel.md §2.5）：由 scripts/make-icon.mjs 的 32×32 坐标表生成
+# crates/desktop/icons/{icon.png,icon.icns}。改图改脚本、重跑本目标，不直接改 PNG；
+# 随后 --check 核取色表仍与规格 §2.1 逐字一致。
+icon:
+	node scripts/make-icon.mjs
+	node scripts/make-icon.mjs --check
 
 run: build
 	./target/release/agent-pipeline serve

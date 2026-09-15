@@ -51,5 +51,30 @@ ulid = "1"
 agentpipeline-core = { path = "crates/core" }
 testkit = { path = "crates/testkit" }
 
+# ── 编译 profile：本文件是唯一事实源（决策 175）────────────────────────────
+#
+# 为什么集中在 Cargo.toml 而不再放 .cargo/config.toml：config.toml 里的
+# `[profile.*]` 虽然生效，但它与 Cargo.toml 的 profile 是两个来源；两边各写一半
+# 时，任何一边被编辑都会让**整棵依赖树**换一个 profile 哈希而全量重编。
+# 本机只有 2 物理核，一次整树重编 = 10 分钟以上，故此处的稳定性直接决定闸门耗时。
+#
+# `debug = "line-tables-only"`：保留 panic 回溯的文件名 + 行号（测试失败仍可定位），
+# 去掉类型级调试信息——后者是 rustc 内存占用与链接时间的大头。
+# dev 与 test 两个 profile 必须保持**完全一致**：默认 dev 不带 opt-level 而 test 带
+# opt-level = 1，两者不同就会出现「dev 编一份依赖、test 再编一份」的双份编译。
+[profile.dev]
+opt-level = 1
+debug = "line-tables-only"
+
 [profile.test]
 opt-level = 1
+debug = "line-tables-only"
+
+# 第三方依赖不生成调试信息。调试信息只服务于「读我们自己的代码报错栈」，
+# 而依赖里出现 panic 时，行号对齐 libc/openssl 之类没有实际收益；关掉它同时
+# 缩小 rlib（链接输入）与缩短链接时间——本机的链接时间占总耗时很大一块。
+[profile.dev.package."*"]
+debug = false
+
+[profile.test.package."*"]
+debug = false

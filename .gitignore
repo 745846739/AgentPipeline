@@ -22,3 +22,7 @@ crates/desktop/gen/schemas/
 
 # 原型截图与真应用截图（可由 .scratch/shots/capture*.mjs / e2e/screenshots.spec.ts 重新生成，不入库）
 .scratch/shots/**/*.png
+
+# 本机工具产物，与本项目无关：cargo-sweep 的时间戳文件、ZCode 客户端的会话目录
+sweep.timestamp
+.zcode/

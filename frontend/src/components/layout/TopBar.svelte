@@ -24,6 +24,9 @@
   };
 
   const NAV: Array<{ path: string; route: string; label: string; sprite: SpriteName }> = [
+    // 对讲台（决策 174 / theme-6-pixel.md §3.3）：与看板并列，故排在台账页之前。
+    // 图元复用既有 foreman 头像（不新增 sprite）；它在 34px 页签盒里按 16px 显示。
+    { path: '/talk', route: 'talk', label: '对讲台', sprite: 'foreman' },
     { path: '/metrics', route: 'metrics', label: '指标', sprite: 'chart' },
     { path: '/settings/projects', route: 'settings-projects', label: '项目', sprite: 'chest' },
     { path: '/settings/providers', route: 'settings-providers', label: '模型与密钥', sprite: 'key' },
@@ -320,6 +323,13 @@
     display: inline-flex;
     margin-right: 5px;
     vertical-align: -3px;
+  }
+  /* 工头头像的契约显示尺寸是 48px（dossier 用），塞进 34px 高的导航页签盒会把它
+     撑到 52px，连带移动端顶栏从 138px 涨到 156px，压坏 §5 的 scroll-margin-top
+     与横幅 top = 148px。导航处一律按 chip 节奏缩到 16px（规格 §3.3）。 */
+  .chip .ic :global(svg.sprite) {
+    width: 16px;
+    height: 16px;
   }
   .chip .c {
     display: inline-block;

@@ -9,6 +9,7 @@
   import SettingsProjects from './routes/SettingsProjects.svelte';
   import SettingsProviders from './routes/SettingsProviders.svelte';
   import Share from './routes/Share.svelte';
+  import Talk from './routes/Talk.svelte';
   import TaskDetail from './routes/TaskDetail.svelte';
   import { router } from './router.svelte';
   import { board } from './stores/board.svelte';
@@ -30,6 +31,8 @@
 
 {#if route.name === 'board'}
   <Board />
+{:else if route.name === 'talk'}
+  <Talk />
 {:else if taskId}
   {#key taskId}
     <TaskDetail id={taskId} />

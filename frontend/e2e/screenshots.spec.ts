@@ -33,9 +33,10 @@ test.skip(process.env.AGENTPIPELINE_SHOTS !== '1', '截图是证据不是门；�
 const here = dirname(fileURLToPath(import.meta.url));
 const outDir = resolve(here, '..', '..', '.scratch', 'shots', 'app');
 
-/** 七个路由（`frontend-design.md` §4 + 决策 167 的 `#/share`）。 */
+/** 七个路由（`frontend-design.md` §4 + 决策 167 的 `#/share` + 决策 174 的 `#/talk`）。 */
 const ROUTES: Array<{ slug: string; hash: string }> = [
   { slug: 'board', hash: '#/' },
+  { slug: 'talk', hash: '#/talk' },
   { slug: 'detail', hash: '#/task/__TASK__' },
   { slug: 'metrics', hash: '#/metrics' },
   { slug: 'projects', hash: '#/settings/projects' },

@@ -182,7 +182,7 @@ harness = FakeAgent（§3.2）+ testkit fixture（§3.3）+ 临时 home + 手动
 | 单元 | vitest | `reduce.ts` 归约表逐事件（design §9.1 每行：列归属 / 信号色 / 待办计数 / dossier 开合）；allowed_actions 渲染分组（resume / side_effect、`requires_input`）；NotificationPolicy（cooldown、quiet_hours、cancelled 不弹） |
 | 组件 | @testing-library/svelte | PendingActions（按所属游标取 cursor_id——决策 91）；DiffReviewPanel（无「拒绝」——决策 23）；StalledBadge（决策 34）；**像素原语 `crate.test.ts`（票 05 / 决策 169）**：量表 16 段与点亮折算、boss 条 20 段与最后一次转红、`retry_exhausted` 权威强制转红、六态映射（灯 / 描边 / 小人节奏）、sprite 非空 SVG + `currentColor` + 工头固定肤色 |
 | **契约** | vitest（纯数据 + 解析） | **主题契约模块（票 02 / 决策 169，本 effort 唯一新接缝）**：`theme/contract.test.ts` 几何常量与 theme-6 §2.3 逐项一致、15 枚 sprite 网格合法、六态映射齐备、深浅两套 token 名一致、量表折算边界；`theme/css-parity.test.ts` 读 `app.css` 抽两个 token 块与契约**逐条比对** + 扫描全部组件**禁止 token 块之外出现裸十六进制颜色**（像素纪律的可机器检查形式，白名单两处并注明理由） |
-| E2E | playwright（只 Chromium） | **真 axum 后端 + FakeAgent**（临时 home），**九条 25 例**：① happy path（看板 → 详情 → 页签 → diff 审批合入 → **校验合入到 main 的代码符合任务目标**）；② pending → dossier 面板 → resume（琥珀面板、顶栏待办计数）；③ 闸门真跑与失败分流（**真实 Node 工程**，闸门真执行 `npm test`）；④ provider 配错可理解可恢复（中文提示 + 原始诊断 + 「测试连接」）；⑤ UI 三步创建（×5）；⑥ 人工评审分支 + 合并「返回修改」（×3）；⑦ 日志/对话内容 + 刷新恢复（×2）；⑧ 并发第二任务（×3：互不阻塞 / 多游标分支归属 / 基准前移）；**⑨ 像素主题（×6，票 12 / 决策 169）**。页面加载**编译期内嵌的真实 bundle**（主流程票 01） |
+| E2E | playwright（只 Chromium） | **真 axum 后端 + FakeAgent**（临时 home），**十条 29 例**：① happy path（看板 → 详情 → 页签 → diff 审批合入 → **校验合入到 main 的代码符合任务目标**）；② pending → dossier 面板 → resume（琥珀面板、顶栏待办计数）；③ 闸门真跑与失败分流（**真实 Node 工程**，闸门真执行 `npm test`）；④ provider 配错可理解可恢复（中文提示 + 原始诊断 + 「测试连接」）；⑤ UI 三步创建（×5）；⑥ 人工评审分支 + 合并「返回修改」（×3）；⑦ 日志/对话内容 + 刷新恢复（×2）；⑧ 并发第二任务（×3：互不阻塞 / 多游标分支归属 / 基准前移）；**⑨ 像素主题（×6，票 12 / 决策 169）**；**⑩ 对讲台（×4，决策 174）**。页面加载**编译期内嵌的真实 bundle**（主流程票 01） |
 
 **像素主题 e2e（票 12 / 决策 169）——`pixel-theme.spec.ts` 六条，全部断言真应用上算出来的样式：**
 ① 深浅两套 token 计算值 + 切换真的换 token + 圆角 0 / 2px 描边 / `4px 4px 0` 硬投影；
@@ -191,7 +191,14 @@ harness = FakeAgent（§3.2）+ testkit fixture（§3.3）+ 临时 home + 手动
 ④ 详情 hero 9 站（无 sync-check）+ 站点名非字符字形 + 工位标签盒 active 是 wash 实底；
 ⑤ 完成横幅（trophy sprite + diff 摘要真数字、点「收下」关闭、刷新不重弹）；
 ⑥ 移动款（顶栏 138px、6px 纵向链节脊线、灯可跳段且 `scroll-margin-top: 148px`、槽位不缩、触控目标）。
-另：`e2e/screenshots.spec.ts` 在真应用上产出 **6 路由 × 深浅 + 移动 3 视图 × 深浅** 的可重生成截图
+**对讲台 e2e（决策 174）——`talk.spec.ts` 四条**：① 路由可达（`#/talk` 与原型写法 `#v-talk`
+都落到对讲台、不落 not-found；顶栏入口图标按 chip 节奏 16px）；② 值班板 8 工位（与看板列一一对应、
+各一枚 8px 灯）；③ 待拍板轮是**真数据渲染**的对话框（任务标题、中文理由短标签而**不暴露内部枚举**、
+2px 框、▼ 光标、后端下发的恢复动作可下发且下发后该轮消失）；④ 移动款顶栏仍为 **138px**（§5 两处
+148px 定值的依据）、值班板进单列。**这条套件的存在理由**：对讲台是「真实状态的对话式视图」而非
+自由对话——②③ 正面钉住「内容来自后端真实读数、动作来自 `allowed_actions`（决策 101 纯渲染）」。
+
+另：`e2e/screenshots.spec.ts` 在真应用上产出 **7 路由 × 深浅 + 移动 3 视图 × 深浅** 的可重生成截图
 （`.scratch/shots/app/*.png`），**默认 skip**，需 `AGENTPIPELINE_SHOTS=1` 才跑——截图是证据不是门
 （像素字体跨机渲染差异会引入 flaky 门，故不做字节级 golden 回放）。
 

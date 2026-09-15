@@ -367,6 +367,83 @@ b,strong{font-weight:400;color:var(--t-hi)}
 .dossier .grp{color:var(--t4);letter-spacing:.08em;margin:12px 0 7px}
 .dossier .btn{display:block;width:100%;text-align:left;margin-bottom:8px}
 
+/* ───────── 对讲台：与工头对话 ─────────
+   一列对话 = 一叠**操作台对话框**（每轮直接挂 .dialog，复用其双线框 + 名牌 tab），
+   不新造聊天组件：压在框沿上的名牌就是发言者，故不再另加一行 who。
+   四条纪律：① 对话是竖排的对话框，不是左右交替的气泡——身份由名牌承载，不靠位置；
+   ② 全站唯一的响仍只在急停一处——待拍板那轮挂 .warn（琥珀框 + ▼ + 恢复动作），
+   其余轮次描边收在 pane，靠「名牌亮 / 正文亮」分人，不占新增色；
+   ③ 工位回执是**转述**不是发言，用「左缘 4px 亮度阶 + 无框」（与命令输出同一手法）；
+   ④ 操作台输入框是对话框形的，但描边用 pane、主动作交给既有实心 ▶ 钮。 */
+.talk{max-width:1240px;margin:0 auto;padding:18px 20px 44px;
+  display:grid;grid-template-columns:1fr 340px;gap:18px;align-items:start}
+.talk-head{grid-column:1 / -1;display:flex;align-items:baseline;gap:14px;flex-wrap:wrap}
+.talk-head .tt{font-size:24px;color:var(--t-hi);line-height:1.2}
+.talk-head .ts{display:flex;gap:14px;color:var(--t3);flex-wrap:wrap}
+.talk-head .ts b{color:var(--t-hi)}
+.talk-main{grid-column:1;min-width:0}
+.talk-side{grid-column:2;position:sticky;top:86px}
+/* 单轮发言：对话框本体沿用 .dialog，这里只改它的停靠、留白与默认光标 */
+.turn{margin:26px 0 0;padding:10px 12px 11px;border-color:var(--pane)}
+.turn p{color:var(--t1);white-space:pre-wrap;max-width:76ch;margin-bottom:7px}
+.turn p:last-child{margin-bottom:0}
+/* 名牌 tab：默认收静（pane 框 + 亮字），工头与你的区别只在名牌明暗 */
+.turn .dname{border-color:var(--pane);color:var(--t-hi)}
+.turn.mine p{color:var(--t-hi)}
+.turn.mine .dname{color:var(--t2);left:auto;right:6px}
+/* ▼ 光标默认不画：只有待拍板那一轮点亮（.warn 同时把框转成全站唯一告警琥珀） */
+.turn::after{content:none}
+.turn.warn .dname{border-color:var(--pending);color:var(--pending)}
+.turn.warn::after{content:'▼'}
+.turn .dtag{color:var(--pending);margin-bottom:8px}
+.turn .ctx{color:var(--t2);margin-bottom:6px;line-height:1.8}
+.turn .ctx b{color:var(--go)}
+.turn .ctx a{color:var(--t-hi);text-decoration:underline;text-underline-offset:3px;cursor:pointer}
+.turn .grp{color:var(--t4);letter-spacing:.08em;margin:12px 0 7px}
+.turn .actions{margin:0}
+.turn .dfile{margin-top:12px;margin-bottom:0}
+/* 工位回执：转述，安静 */
+.rcpt{border-left:4px solid var(--pane);background:var(--panel);
+  padding:6px 10px;margin:10px 0 0;max-width:680px}
+.rcpt+.rcpt{margin-top:6px}
+.rcpt-head{display:flex;align-items:center;gap:7px;color:var(--t3)}
+.rcpt-head .nm{color:var(--t2)}
+.rcpt-head .rs{margin-left:auto;flex:none;color:var(--t4)}
+.rcpt-head .rs.live{color:var(--go)}
+.rcpt-head .rs.wait{color:var(--pending)}
+.rcpt .tx{color:var(--t2);white-space:pre-wrap}
+/* 操作台：本视图的输入口，对话框形但安静 */
+.typer{position:relative;margin:28px 0 0;padding:12px 12px 8px;background:var(--bg);
+  border:2px solid var(--pane);
+  box-shadow:inset 0 0 0 2px var(--bg),inset 0 0 0 4px var(--pane)}
+.typer .dname{border-color:var(--pane);color:var(--t3)}
+.typer textarea{display:block;width:100%;height:44px;resize:none;border:0;
+  background:transparent;color:var(--t-hi);font-family:var(--px);font-size:12px;line-height:1.6}
+.typer textarea::placeholder{color:var(--t4)}
+.typer textarea:focus{outline:none}
+.typer-foot{display:flex;align-items:center;gap:10px;margin-top:6px;
+  border-top:2px solid var(--wash);padding-top:8px}
+.typer-foot .hint{color:var(--t4)}
+.typer-foot .btn{margin-left:auto}
+/* 值班板：右栏复用台账盒（2px 描边 + reg-head），只换行内容 */
+.brows{list-style:none}
+.brow{display:flex;align-items:center;gap:9px;padding:5px 12px;
+  border-bottom:2px solid var(--wash);color:var(--t3)}
+.brow:last-child{border-bottom:0}
+.blamp{flex:none;width:8px;height:8px;background:transparent;border:2px solid var(--t4)}
+.blamp.p{background:var(--belt-lit);border-color:var(--belt-lit)}
+.blamp.c{background:var(--go);border-color:var(--go)}
+.blamp.w{background:var(--pending);border-color:var(--pending)}
+.blamp.d{background:var(--done);border-color:var(--done)}
+.brow .bnm{flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.brow.hot .bnm{color:var(--t-hi)}
+.brow.pen .bnm{color:var(--pending)}
+.brow .bc{flex:none;color:var(--t4)}
+.boks{padding:10px 12px;color:var(--t3);line-height:1.9}
+.boks b{color:var(--t-hi)}
+/* 顶栏导航槽里的工头头像：规格里 16×16 头像显示尺寸为 48，此处按 chip 节奏缩到 16 */
+.chip .sp[data-s="foreman"] svg{width:16px;height:16px}
+
 /* ───────── 设置 / 指标：车间台账 ───────── */
 .page{max-width:1000px;margin:0 auto;padding:18px 20px 44px}
 .p-head{display:flex;align-items:baseline;justify-content:space-between;gap:14px;margin:6px 0 8px}
@@ -514,6 +591,7 @@ b,strong{font-weight:400;color:var(--t-hi)}
     <button class="btn-new">新建任务</button>
     </div>
     <nav class="navbar" aria-label="页面导航">
+      <button class="chip" onclick="show('v-talk')"><i class="sp" data-s="foreman"></i>对讲台</button>
       <button class="chip" onclick="show('v-metrics')"><i class="sp" data-s="chart"></i>指标</button>
       <button class="chip" onclick="show('v-projects')"><i class="sp" data-s="chest"></i>项目</button>
       <button class="chip" onclick="show('v-providers')"><i class="sp" data-s="key"></i>模型与密钥</button>
@@ -686,6 +764,7 @@ b,strong{font-weight:400;color:var(--t-hi)}
     <nav class="filters"><button class="chip on" onclick="show('v-board')">← 返回看板</button></nav>
     </div>
     <nav class="navbar" aria-label="页面导航">
+      <button class="chip" onclick="show('v-talk')"><i class="sp" data-s="foreman"></i>对讲台</button>
       <button class="chip" onclick="show('v-metrics')"><i class="sp" data-s="chart"></i>指标</button>
       <button class="chip" onclick="show('v-projects')"><i class="sp" data-s="chest"></i>项目</button>
       <button class="chip" onclick="show('v-providers')"><i class="sp" data-s="key"></i>模型与密钥</button>
@@ -828,6 +907,7 @@ error: could not compile `agentpipeline` due to 1 previous error
     <nav class="filters"><button class="chip on" onclick="show('v-board')">← 返回看板</button></nav>
     </div>
     <nav class="navbar" aria-label="页面导航">
+      <button class="chip" onclick="show('v-talk')"><i class="sp" data-s="foreman"></i>对讲台</button>
       <button class="chip" onclick="show('v-metrics')"><i class="sp" data-s="chart"></i>指标</button>
       <button class="chip" onclick="show('v-projects')"><i class="sp" data-s="chest"></i>项目</button>
       <button class="chip" onclick="show('v-providers')"><i class="sp" data-s="key"></i>模型与密钥</button>
@@ -949,6 +1029,164 @@ error: could not compile `agentpipeline` due to 1 previous error
   </div>
 </div>
 
+<!-- ═══════════ 视图 3：对讲台（与工头对话） ═══════════
+     一列对话 = 一叠操作台对话框。发言者写在名牌 tab 上，回执是转述（左缘亮度阶），
+     待拍板那轮用琥珀框 + ▼ + 恢复动作（沿用 dossier 的三件套，不新造交互）。 -->
+<div class="view" id="v-talk">
+  <header class="top">
+    <div class="topbar">
+    <span class="logo" aria-hidden="true"></span>
+    <span class="wordmark">AGENTPIPELINE</span>
+    <span class="sess">本机夜班</span>
+    <nav class="filters"><button class="chip on" onclick="show('v-board')">← 返回看板</button></nav>
+    </div>
+    <nav class="navbar" aria-label="页面导航">
+      <button class="chip on" onclick="show('v-talk')"><i class="sp" data-s="foreman"></i>对讲台</button>
+      <button class="chip" onclick="show('v-metrics')"><i class="sp" data-s="chart"></i>指标</button>
+      <button class="chip" onclick="show('v-projects')"><i class="sp" data-s="chest"></i>项目</button>
+      <button class="chip" onclick="show('v-providers')"><i class="sp" data-s="key"></i>模型与密钥</button>
+      <button class="chip" onclick="show('v-share')"><i class="sp" data-s="phone"></i>手机访问</button>
+    </nav>
+  </header>
+
+  <div class="talk">
+    <div class="talk-head">
+      <h1 class="tt">对讲台</h1>
+      <div class="ts">
+        <span>对着工头说话，它替你调度 8 个工位</span>
+        <span class="sep">▪</span>
+        <span><span class="gauge g-dim" data-f="8"></span>本次会话 <b>18.4k</b> tok</span>
+      </div>
+    </div>
+
+    <main class="talk-main">
+      <!-- 工头开场：报当前夜班态势 -->
+      <div class="dialog turn">
+        <div class="dname">工头</div>
+        <p>夜班正常。8 个工位里 3 个在跑、3 个急停等人。</p>
+        <p><b>最久的一处</b>是「实现任务依赖拓扑排序」，architect-design 发现与「增加任务依赖循环检测」的新增符号重叠（TopoSort、detect_cycle），已经停了 3 天。</p>
+      </div>
+
+      <!-- 我（工头本人 = 玩家）：右侧对齐的安静对话框 -->
+      <div class="dialog turn mine">
+        <div class="dname">你</div>
+        <p>先别管那个。t-0041「实现 worktree 清理策略」改到哪儿了？</p>
+      </div>
+
+      <div class="dialog turn">
+        <div class="dname">工头</div>
+        <p>已经走到 merge，等你在操作台拍板。它是今晚唯一能收工的货箱。</p>
+        <div class="rcpt">
+          <div class="rcpt-head"><i class="sp" data-s="gem"></i><span class="nm">architect-design</span><span class="rs">✓ 18m22s</span></div>
+          <div class="tx">产出 3 份设计：CleanupPolicy 三态（Always / KeepOnFailure / Never），调用点收敛到 finish_task 一处。</div>
+        </div>
+        <div class="rcpt">
+          <div class="rcpt-head"><i class="sp" data-s="gear"></i><span class="nm">develop</span><span class="rs">✓ rebase 1 次</span></div>
+          <div class="tx">改动 9 个文件（+312 −87）。基准前移过一次，diff 已在审批前重新生成。</div>
+        </div>
+        <div class="rcpt">
+          <div class="rcpt-head"><i class="sp" data-s="shield"></i><span class="nm">test</span><span class="rs live">✓ 42 passed</span></div>
+          <div class="tx">单元 + 集成全绿；worktree 回收的失败路径补了 2 个用例。</div>
+        </div>
+        <p style="margin-top:12px">要我直接把 diff 摊开给你看吗？</p>
+      </div>
+
+      <div class="dialog turn mine">
+        <div class="dname">你</div>
+        <p>摊开。顺带说一下 t-0017 那条为什么卡了三天。</p>
+      </div>
+
+      <!-- 工头摊开 diff：转述给 review 工位并附结论 -->
+      <div class="dialog turn">
+        <div class="dname">工头</div>
+        <p>diff 在下面。t-0017 卡的是设计冲突，不是失败——architect-design 不肯自己拍，</p>
+        <p>它认为两份设计会撞符号，需要你选一个。</p>
+        <div class="dfile" style="margin-top:12px">
+          <h4>src/scheduler/worktree.rs <span class="st2">修改</span><span class="pm">+96 −31</span></h4>
+          <div class="dbody">
+            <div class="dl hunk">@@ -41,10 +41,18 @@ impl WorktreeCleaner {</div>
+            <div class="dl">     /// 任务终态后回收 worktree 与隔离分支</div>
+            <div class="dl del">-    pub fn cleanup(task_id: &amp;str) -&gt; Result&lt;()&gt; {</div>
+            <div class="dl del">-        fs::remove_dir_all(worktree_path(task_id))?;</div>
+            <div class="dl add">+    pub async fn cleanup(task_id: &amp;str, policy: CleanupPolicy) -&gt; Result&lt;()&gt; {</div>
+            <div class="dl add">+    let path = worktree_path(task_id);</div>
+            <div class="dl add">+    if policy == CleanupPolicy::KeepOnFailure &amp;&amp; !is_merged(task_id)? {</div>
+            <div class="dl add">+        tracing::warn!(task_id, "未合入，保留 worktree 供排查");</div>
+            <div class="dl add">+        return Ok(());</div>
+            <div class="dl add">+    }</div>
+            <div class="dl add">+    spawn_blocking(move || git_remove_worktree(&amp;path)).await??;</div>
+            <div class="dl">     Ok(())</div>
+            <div class="dl"> }</div>
+          </div>
+        </div>
+        <div class="rcpt">
+          <div class="rcpt-head"><i class="sp" data-s="lens"></i><span class="nm">review</span><span class="rs wait">⏸ 等你拍板</span></div>
+          <div class="tx">评审结论 approved，但保留策略影响磁盘占用，工位不敢替你决定。</div>
+        </div>
+      </div>
+
+      <!-- 待拍板那一轮：全站唯一"响"的一处 -->
+      <div class="dialog warn turn">
+        <div class="dtag">⏸ 等你拍板 ▪ merge_approval</div>
+        <div class="dname">工头</div>
+        <p>合并提案已生成。审核上面的 diff 后决定是否合入 main。</p>
+        <div class="ctx">测试闸门：<b>pass</b> ▪ 单元 + 集成全绿<br>agent 评审：<b>approved</b> ▪ <a>查看评审报告</a></div>
+        <div class="grp">恢复动作</div>
+        <div class="actions" style="margin:0">
+          <button class="btn solid">合入 main（ff 优先）</button>
+          <button class="btn">返回修改（回 develop）</button>
+        </div>
+      </div>
+
+      <div class="dialog turn mine">
+        <div class="dname">你</div>
+        <p>合入吧。另外把 t-0017 的两份设计并排给我看。</p>
+      </div>
+
+      <div class="dialog turn">
+        <div class="dname">工头</div>
+        <p>t-0041 已合入 main。t-0017 的两份设计我摆到 <a style="color:var(--t-hi);text-decoration:underline;text-underline-offset:3px">对比视图</a> 了，看完在那边的操作台选一个。</p>
+        <div class="rcpt">
+          <div class="rcpt-head"><i class="sp" data-s="merge"></i><span class="nm">merge</span><span class="rs live">▶ 正在收工</span></div>
+          <div class="tx">快进合入 kanban/t-0041 → main，回收 worktree 与隔离分支。</div>
+        </div>
+        <p class="streaming" style="color:var(--t2)">工头正在把 3 条待办重新排序</p>
+      </div>
+
+      <!-- 操作台：输入口 -->
+      <div class="typer">
+        <div class="dname">对工头说</div>
+        <textarea placeholder="例：把今天所有 pending 的货箱按等多久排一下"></textarea>
+        <div class="typer-foot">
+          <span class="hint">Enter 发送 ▪ Shift+Enter 换行 ▪ 说的每句话都会记进审计</span>
+          <button class="btn solid">发送</button>
+        </div>
+      </div>
+    </main>
+
+    <!-- 右栏：值班板（复用台账盒） -->
+    <aside class="talk-side">
+      <div class="reg">
+        <div class="reg-head"><span>值班板</span><span class="n">8 工位</span></div>
+        <ul class="brows">
+          <li class="brow"><span class="blamp"></span><span class="bnm">init</span><span class="bc">2</span></li>
+          <li class="brow pen"><span class="blamp w"></span><span class="bnm">architect-design</span><span class="bc">2</span></li>
+          <li class="brow hot"><span class="blamp c"></span><span class="bnm">develop-design ∥ test-design</span><span class="bc">1</span></li>
+          <li class="brow hot"><span class="blamp c"></span><span class="bnm">develop</span><span class="bc">2</span></li>
+          <li class="brow hot"><span class="blamp c"></span><span class="bnm">review</span><span class="bc">1</span></li>
+          <li class="brow"><span class="blamp"></span><span class="bnm">test</span><span class="bc">0</span></li>
+          <li class="brow pen"><span class="blamp w"></span><span class="bnm">merge</span><span class="bc">1</span></li>
+          <li class="brow"><span class="blamp d"></span><span class="bnm">done</span><span class="bc">1</span></li>
+        </ul>
+        <div class="boks">
+          在跑的 <b>3</b> 个工位会自己回话，不用追问。<br>
+          急停的 <b>3</b> 处只能你来按键。
+        </div>
+      </div>
+    </aside>
+  </div>
+</div>
+
 <!-- ═══════════ 视图 4：设置 · 项目（台位台账） ═══════════ -->
 <div class="view" id="v-projects">
   <header class="top">
@@ -959,6 +1197,7 @@ error: could not compile `agentpipeline` due to 1 previous error
     <nav class="filters"><button class="chip on" onclick="show('v-board')">← 返回看板</button></nav>
     </div>
     <nav class="navbar" aria-label="页面导航">
+      <button class="chip" onclick="show('v-talk')"><i class="sp" data-s="foreman"></i>对讲台</button>
       <button class="chip" onclick="show('v-metrics')"><i class="sp" data-s="chart"></i>指标</button>
       <button class="chip on" onclick="show('v-projects')"><i class="sp" data-s="chest"></i>项目</button>
       <button class="chip" onclick="show('v-providers')"><i class="sp" data-s="key"></i>模型与密钥</button>
@@ -1054,6 +1293,7 @@ error: could not compile `agentpipeline` due to 1 previous error
     <nav class="filters"><button class="chip on" onclick="show('v-board')">← 返回看板</button></nav>
     </div>
     <nav class="navbar" aria-label="页面导航">
+      <button class="chip" onclick="show('v-talk')"><i class="sp" data-s="foreman"></i>对讲台</button>
       <button class="chip" onclick="show('v-metrics')"><i class="sp" data-s="chart"></i>指标</button>
       <button class="chip" onclick="show('v-projects')"><i class="sp" data-s="chest"></i>项目</button>
       <button class="chip on" onclick="show('v-providers')"><i class="sp" data-s="key"></i>模型与密钥</button>
@@ -1164,6 +1404,7 @@ error: could not compile `agentpipeline` due to 1 previous error
     <nav class="filters"><button class="chip on" onclick="show('v-board')">← 返回看板</button></nav>
     </div>
     <nav class="navbar" aria-label="页面导航">
+      <button class="chip" onclick="show('v-talk')"><i class="sp" data-s="foreman"></i>对讲台</button>
       <button class="chip on" onclick="show('v-metrics')"><i class="sp" data-s="chart"></i>指标</button>
       <button class="chip" onclick="show('v-projects')"><i class="sp" data-s="chest"></i>项目</button>
       <button class="chip" onclick="show('v-providers')"><i class="sp" data-s="key"></i>模型与密钥</button>
@@ -1336,6 +1577,7 @@ error: could not compile `agentpipeline` due to 1 previous error
     <nav class="filters"><button class="chip on" onclick="show('v-board')">← 返回看板</button></nav>
     </div>
     <nav class="navbar" aria-label="页面导航">
+      <button class="chip" onclick="show('v-talk')"><i class="sp" data-s="foreman"></i>对讲台</button>
       <button class="chip" onclick="show('v-metrics')"><i class="sp" data-s="chart"></i>指标</button>
       <button class="chip" onclick="show('v-projects')"><i class="sp" data-s="chest"></i>项目</button>
       <button class="chip" onclick="show('v-providers')"><i class="sp" data-s="key"></i>模型与密钥</button>
@@ -1406,10 +1648,11 @@ host = "0.0.0.0"</code></pre>
   <button class="on" data-v="v-board">0:看板</button>
   <button data-v="v-run">1:详情·执行中</button>
   <button data-v="v-approve">2:详情·待审批</button>
-  <button data-v="v-projects">3:项目</button>
-  <button data-v="v-providers">4:模型与密钥</button>
-  <button data-v="v-metrics">5:指标</button>
-  <button data-v="v-share">6:手机访问</button>
+  <button data-v="v-talk">3:对讲台</button>
+  <button data-v="v-projects">4:项目</button>
+  <button data-v="v-providers">5:模型与密钥</button>
+  <button data-v="v-metrics">6:指标</button>
+  <button data-v="v-share">7:手机访问</button>
 </div>
 
 <script>

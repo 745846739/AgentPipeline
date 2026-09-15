@@ -23,6 +23,13 @@ describe('parseRoute', () => {
     expect(parseRoute('#/share')).toEqual({ name: 'share' });
   });
 
+  it('对讲台（决策 174）可被解析，并接受原型的 v-talk 写法', () => {
+    expect(parseRoute('#/talk')).toEqual({ name: 'talk' });
+    // `#v-talk` 是 theme-6-pixel.md §3.3 原型的视图 id：照原型手敲的地址
+    // 不应落到 not-found（对讲台是原型先行、实现补票）。
+    expect(parseRoute('#v-talk')).toEqual({ name: 'talk' });
+  });
+
   it('query 与尾斜杠不影响匹配', () => {
     // hash 路由下分享页可能被带上查询串；parseRoute 只取 ? 之前的部分
     expect(parseRoute('#/share?from=board')).toEqual({ name: 'share' });

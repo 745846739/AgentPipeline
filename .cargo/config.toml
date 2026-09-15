@@ -6,11 +6,13 @@ jobs = 2
 # 低内存机器上增量编译额外占内存与磁盘；保持关闭（原有设置）。
 incremental = false
 
-# rustc 1.98 的 dev/test 默认是 debuginfo=2 + split-debuginfo=unpacked，
-# 调试信息是单个 rustc 内存占用与链接时间的大头。保留行号（panic 回溯与
-# 测试失败仍可定位到行），去掉类型级调试信息。
-[profile.dev]
-debug = "line-tables-only"
-
-[profile.test]
-debug = "line-tables-only"
+# 注意：本文件**不放** [profile.*]（决策 175）。profile 的唯一事实源是根
+# Cargo.toml —— config.toml 的 profile 会覆盖 Cargo.toml，两处各写一半时，
+# 任何一处被改动都会改变**整棵依赖树**的 profile 指纹，从而触发全量重编
+# （本机实测约 10–16 分钟）。看 profile 设置请直接看 Cargo.toml。
+#
+# 也不放 [env] RUSTUP_TOOLCHAIN：cargo **明确禁止**该键（实测报 "setting the
+# `RUSTUP_TOOLCHAIN` environment variable is not supported in the `[env]`
+# configuration table"）——它要先于配置读出来才能选中工具链，属先有鸡后有蛋。
+# 故工具链钉住只能放在 Makefile 的 export（见那里；这是本仓要求经 make 跑闸门的
+# 原因之一，裸 `cargo test` 会踩到依赖自带的 rust-toolchain.toml）。
