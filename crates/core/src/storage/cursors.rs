@@ -349,10 +349,16 @@ impl Store {
     }
 
     /// 清 pending 并恢复为 active（不改变 stage / node）。
+    ///
+    /// 同时置 `resumed_from_pending = 1`（决策 180，票 13）：这是**唯一**的 resume 落点，
+    /// 而「续接上一轮对话」只在该边界成立（不作用于 `agent_retry_max` 的干净重试）。
+    /// `WHERE ... status = 'pending'` 让这个标记只在**确实**翻过一次 pending 时落下——
+    /// 对非 pending 游标调用本方法是 no-op，不该留下标记。
     pub async fn clear_cursor_pending(&self, cursor_id: &str) -> Result<()> {
         sqlx::query(
             "UPDATE kanban_node_cursors
-             SET status = 'active', pending_reason_json = NULL, updated_at = ?
+             SET status = 'active', pending_reason_json = NULL, resumed_from_pending = 1,
+                 updated_at = ?
              WHERE cursor_id = ? AND status = 'pending'",
         )
         .bind(ts(self.now()))
@@ -360,6 +366,28 @@ impl Store {
         .execute(self.pool())
         .await?;
         Ok(())
+    }
+
+    /// 取走并清零游标的「刚被 resume」标记（决策 180，票 13）。
+    ///
+    /// 一次性：读与清在同一条 UPDATE 里完成，避免「读了没清」导致下一次 attempt 又续接一遍。
+    /// 清零是必要的——标记留着会让**后续每一次**进入该节点都试图续接，包括正常的向前推进
+    /// 与回溯重入。
+    ///
+    /// 返回值取自**行是否存在**而不是列值：SQLite 的 `RETURNING` 报的是**更新之后**的值
+    /// （`UPDATE t SET x = 0 ... RETURNING x` 恒为 0，与 PostgreSQL 一致），所以
+    /// `RETURNING resumed_from_pending` 永远读不到 1——续接会静默失效。改成把「标记原本为 1」
+    /// 写进 `WHERE`，命中一行即命中过标记。
+    pub async fn take_cursor_resumed_from_pending(&self, cursor_id: &str) -> Result<bool> {
+        let hit: Option<String> = sqlx::query_scalar(
+            "UPDATE kanban_node_cursors SET resumed_from_pending = 0
+             WHERE cursor_id = ? AND resumed_from_pending = 1
+             RETURNING cursor_id",
+        )
+        .bind(cursor_id)
+        .fetch_optional(self.pool())
+        .await?;
+        Ok(hit.is_some())
     }
 
     /// 并行分支 skip：置 `waiting_join` + `skipped_to_join = 1`（决策 93），

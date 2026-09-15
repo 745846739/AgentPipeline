@@ -12,6 +12,7 @@ use agentpipeline_core::pipeline::Executor;
 use agentpipeline_core::scheduler::KanbanScheduler;
 use agentpipeline_core::sse::{SseEvent, SseEventType};
 use agentpipeline_core::storage::decisions::MergeDecision;
+use agentpipeline_core::storage::decisions::ResumeAction;
 use agentpipeline_core::storage::Store;
 use agentpipeline_core::types::{
     AcceptanceCriterion, Approval, ArchitectExecuteMetadata, CodeChanges, CursorStatus,
@@ -825,6 +826,7 @@ async fn prompt_assembly_consumes_templates_stage_configs_and_agents_md() {
             idle_timeout_sec: None,
             max_duration_sec: None,
             node_overrides_json: None,
+            resume_continuation: None,
             updated_at: ctx.store.now(),
         })
         .await
@@ -845,6 +847,7 @@ async fn prompt_assembly_consumes_templates_stage_configs_and_agents_md() {
             idle_timeout_sec: None,
             max_duration_sec: None,
             node_overrides_json: None,
+            resume_continuation: None,
             updated_at: ctx.store.now(),
         })
         .await
@@ -2950,5 +2953,391 @@ async fn subagent_cannot_execute_tools_outside_its_readonly_set() {
     assert!(
         refusal.contains("write_file") || refusal.contains("只读"),
         "越权调用须有可归因的拒绝文本：{refusal}"
+    );
+}
+
+// ══════════════════ 会话续接（决策 180，票 13）══════════════════
+//
+// 默认关：每次 attempt 干净对话，与续接出现之前逐字相同（决策 33 的语义不变）。
+// 开启后：pending → resume 的边界上，从 `kanban_node_conversations` 读回上一 attempt 的
+// messages 作为起点，信息补充型 pending 不必让 agent 从零重读一遍仓库。
+
+/// 造出「architect-design.validate_input 挂 pending(info_insufficient)」的现场。
+///
+/// round 1 的脚本带一次 `submit_metadata` 工具调用，故会话行里**有** messages 可续接
+/// （否则起点本来就是空的，用例会退化成什么都没证明）。
+async fn info_insufficient_ctx(task_id: &str, continuation: Option<bool>) -> Ctx {
+    let ctx = setup("true", Settings::default()).await;
+    if let Some(on) = continuation {
+        ctx.store
+            .upsert_stage_config(&agentpipeline_core::types::StageConfig {
+                stage: "architect-design".into(),
+                resume_continuation: Some(on),
+                updated_at: ctx.store.now(),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+    }
+    let mut script = Script::new();
+    script
+        .for_node(Stage::ArchitectDesign, Node::ValidateInput)
+        .submit(&ValidateInputMetadata {
+            readiness: false,
+            blockers: vec!["需要明确部署环境".into()],
+        });
+    ctx.agent.set_script(script);
+    testkit::seed_task(&ctx.store, task_id, "p1").await.unwrap();
+    admit(&ctx, task_id).await;
+    ctx.executor.run(task_id).await.unwrap();
+    ctx
+}
+
+/// 补一条**锁住今天行为**的断言：默认（开关未配）每次 attempt 的对话起点为空。
+///
+/// 续接出现之前全仓没有一条用例钉住这件事——没有它，开关会改掉既有语义而无安全网。
+#[tokio::test]
+async fn attempts_start_with_an_empty_conversation_by_default() {
+    let ctx = info_insufficient_ctx("cont-default", None).await;
+    let cursor = ctx
+        .store
+        .load_live_cursors("cont-default")
+        .await
+        .unwrap()
+        .into_iter()
+        .next()
+        .unwrap();
+    assert_eq!(
+        cursor.pending_reason.as_ref().unwrap().kind,
+        PendingKind::InfoInsufficient
+    );
+
+    // 补上输入 → resume → validate_input 重跑
+    let mut rerun = Script::new();
+    rerun
+        .for_node(Stage::ArchitectDesign, Node::ValidateInput)
+        .submit(&ValidateInputMetadata {
+            readiness: true,
+            blockers: vec![],
+        });
+    ctx.agent.set_script(rerun);
+    ctx.store
+        .apply_resume(&cursor, ResumeAction::Continue, None, Some("生产 k8s"))
+        .await
+        .unwrap();
+    ctx.executor.run("cont-default").await.unwrap();
+
+    let requests = ctx.agent.request_log();
+    let vi: Vec<&LlmRequest> = requests
+        .iter()
+        .filter(|r| r.stage == Stage::ArchitectDesign && r.node == Node::ValidateInput)
+        .filter(|r| {
+            r.run
+                .as_ref()
+                .is_some_and(|c| c.agent_type.as_str() == "main")
+        })
+        .collect();
+    assert!(vi.len() >= 2, "validate_input 应重跑：{}", vi.len());
+    // 「起点为空」只能对**每条 run 的首条请求**断言：一次 attempt 内的工具往来会逐轮累加
+    // （第 2 条请求带着本轮自己的 assistant/tool 消息），那不是跨 attempt 的遗留。
+    let mut first_per_run: Vec<(i64, usize)> = Vec::new();
+    for r in &vi {
+        let run_id = r.run.as_ref().expect("主 agent 请求须带 run 上下文").run_id;
+        if first_per_run.last().map(|(id, _)| *id) != Some(run_id) {
+            first_per_run.push((run_id, r.messages.len()));
+        }
+    }
+    assert_eq!(
+        first_per_run.len(),
+        2,
+        "两轮 resume 各一条 run：{first_per_run:?}"
+    );
+    assert!(
+        first_per_run.iter().all(|(_, n)| *n == 0),
+        "默认每次 attempt 的对话起点必须为空（run_id, 首条请求的 messages 数）：{first_per_run:?}"
+    );
+    // 首轮确实产生了会话内容（否则上面那条断言是空转）
+    let convs = ctx
+        .store
+        .list_conversations("cont-default", true)
+        .await
+        .unwrap();
+    assert!(
+        convs
+            .iter()
+            .any(|c| c.agent_type == "main" && c.messages_json.as_array().unwrap().len() >= 2),
+        "首轮须留下可续接的会话行：{convs:?}"
+    );
+}
+
+/// 开启后：resume 重入的第一条请求带着上一轮的 messages。
+#[tokio::test]
+async fn resume_continuation_carries_the_previous_attempt_messages() {
+    let ctx = info_insufficient_ctx("cont-on", Some(true)).await;
+    let cursor = ctx
+        .store
+        .load_live_cursors("cont-on")
+        .await
+        .unwrap()
+        .into_iter()
+        .next()
+        .unwrap();
+
+    let mut rerun = Script::new();
+    rerun
+        .for_node(Stage::ArchitectDesign, Node::ValidateInput)
+        .submit(&ValidateInputMetadata {
+            readiness: true,
+            blockers: vec![],
+        });
+    ctx.agent.set_script(rerun);
+    ctx.store
+        .apply_resume(&cursor, ResumeAction::Continue, None, Some("生产 k8s"))
+        .await
+        .unwrap();
+    ctx.executor.run("cont-on").await.unwrap();
+
+    let requests = ctx.agent.request_log();
+    let vi: Vec<&LlmRequest> = requests
+        .iter()
+        .filter(|r| r.stage == Stage::ArchitectDesign && r.node == Node::ValidateInput)
+        .collect();
+    assert!(vi.len() >= 2, "validate_input 应重跑：{}", vi.len());
+    // 首轮为空起点；重入那一轮带回了上一轮的工具往来
+    assert!(
+        vi[0].messages.is_empty(),
+        "首轮起点为空：{:?}",
+        vi[0].messages
+    );
+    let carried = &vi.last().unwrap().messages;
+    assert!(carried.len() >= 2, "重入须带回上一轮 messages：{carried:?}");
+    // 带回的是**上一轮**的内容：那条 submit_metadata 的 assistant 消息
+    assert!(
+        carried
+            .iter()
+            .any(|m| m.tool_calls.iter().any(|c| c.name == "submit_metadata")),
+        "带回的应是上一轮的工具往来：{carried:?}"
+    );
+    // wire 顺序不依赖它：system / user 仍由 prompt 字段承载（messages 只接在其后）
+    assert!(
+        carried
+            .iter()
+            .all(|m| m.role != agentpipeline_core::agent::client::Role::System),
+        "messages 里不得混入 system（wire 顺序由适配器保证）：{carried:?}"
+    );
+}
+
+/// 干净重试不受续接影响：`agent_retry_max` 的第 2、3 次仍是空起点（决策 33 不变）。
+#[tokio::test]
+async fn clean_retry_after_a_tool_failure_stays_empty_even_with_continuation_on() {
+    let ctx = info_insufficient_ctx("cont-retry", Some(true)).await;
+    let cursor = ctx
+        .store
+        .load_live_cursors("cont-retry")
+        .await
+        .unwrap()
+        .into_iter()
+        .next()
+        .unwrap();
+
+    // 重入这一轮：第 1 次尝试以「元数据始终抽不出」失败，第 2 次成功 → 两次都在同一轮里
+    let mut rerun = Script::new();
+    rerun
+        .for_node(Stage::ArchitectDesign, Node::ValidateInput)
+        .text("这不是结构化元数据，抽取必然失败");
+    ctx.agent.set_script(rerun);
+    ctx.store
+        .apply_resume(&cursor, ResumeAction::Continue, None, None)
+        .await
+        .unwrap();
+    ctx.executor.run("cont-retry").await.unwrap();
+
+    let requests = ctx.agent.request_log();
+    let vi: Vec<&LlmRequest> = requests
+        .iter()
+        .filter(|r| r.stage == Stage::ArchitectDesign && r.node == Node::ValidateInput)
+        .filter(|r| {
+            r.run
+                .as_ref()
+                .is_some_and(|c| c.agent_type.as_str() == "main")
+        })
+        .collect();
+    assert!(vi.len() >= 3, "首轮 + 本轮两次尝试：{}", vi.len());
+    // 按 run 分组看首条请求：三条 run = 首轮 / 本轮的续接尝试 / 本轮的干净重试。
+    // 续接**只**作用于第二条（resume 重入的那次 attempt），第三条必须回到空起点。
+    let mut first_per_run: Vec<(i64, usize)> = Vec::new();
+    for r in &vi {
+        let run_id = r.run.as_ref().expect("主 agent 请求须带 run 上下文").run_id;
+        if first_per_run.last().map(|(id, _)| *id) != Some(run_id) {
+            first_per_run.push((run_id, r.messages.len()));
+        }
+    }
+    assert!(
+        first_per_run.len() >= 3,
+        "首轮 + 续接的那次 + 至少一次干净重试：{first_per_run:?}"
+    );
+    assert_eq!(first_per_run[0].1, 0, "首轮起点为空：{first_per_run:?}");
+    assert!(
+        first_per_run[1].1 > 0,
+        "续接的那次尝试须带回上一轮的对话（否则本用例是空转）：{first_per_run:?}"
+    );
+    assert!(
+        first_per_run[2..].iter().all(|(_, n)| *n == 0),
+        "干净重试的起点必须为空（决策 33）；`agent_retry_max` 有几次就几次：{first_per_run:?}"
+    );
+}
+
+/// 必要条件二：续接的 run 打上 `continued_from_run_id`，任务 token 总量不双算。
+#[tokio::test]
+async fn continued_run_links_back_so_tokens_are_not_double_counted() {
+    use agentpipeline_core::metrics::total_tokens;
+
+    let ctx = info_insufficient_ctx("cont-tokens", Some(true)).await;
+    let cursor = ctx
+        .store
+        .load_live_cursors("cont-tokens")
+        .await
+        .unwrap()
+        .into_iter()
+        .next()
+        .unwrap();
+    let first_run = ctx
+        .store
+        .list_runs("cont-tokens")
+        .await
+        .unwrap()
+        .last()
+        .unwrap()
+        .id;
+
+    let mut rerun = Script::new();
+    rerun
+        .for_node(Stage::ArchitectDesign, Node::ValidateInput)
+        .submit(&ValidateInputMetadata {
+            readiness: true,
+            blockers: vec![],
+        });
+    ctx.agent.set_script(rerun);
+    ctx.store
+        .apply_resume(&cursor, ResumeAction::Continue, None, None)
+        .await
+        .unwrap();
+    ctx.executor.run("cont-tokens").await.unwrap();
+
+    let runs = ctx.store.list_runs("cont-tokens").await.unwrap();
+    let linked: Vec<&agentpipeline_core::types::NodeRun> = runs
+        .iter()
+        .filter(|r| r.continued_from_run_id.is_some())
+        .collect();
+    assert_eq!(linked.len(), 1, "恰有一条 run 记下续接来源：{runs:?}");
+    assert_eq!(
+        linked[0].continued_from_run_id,
+        Some(first_run),
+        "链接须指向被续接的那条历史 run"
+    );
+
+    // 汇总口径排除被续接的历史（FakeAgent 每轮 token 相同，故排除前后差一条的量）
+    let naive: u64 = runs
+        .iter()
+        .map(agentpipeline_core::metrics::run_tokens)
+        .sum();
+    let counted = total_tokens(&runs);
+    assert!(
+        counted < naive,
+        "被续接的历史须从汇总里排除：counted={counted} naive={naive}"
+    );
+    // 落库的任务总量与函数口径同源
+    let task = ctx.store.get_task("cont-tokens").await.unwrap();
+    assert_eq!(task.total_tokens as u64, counted);
+}
+
+/// 必要条件一：`context_overflow` 这条退出路径**补写会话行**。
+///
+/// 它在会话落库之前返回，修复之前「开了续接却读不到上一轮」是一条静默无效的路。
+#[tokio::test]
+async fn context_overflow_path_writes_a_conversation_row() {
+    use agentpipeline_core::types::Provider;
+
+    let ctx = setup("true", Settings::default()).await;
+    // 窗口极小（1000）：软限 600 / 硬限 900，一次大块元数据即越过
+    ctx.store
+        .upsert_provider(&Provider {
+            id: "prov-ctx".into(),
+            vendor: "deepseek".into(),
+            model: "deepseek-chat".into(),
+            context_window: 1_000,
+            base_url: None,
+            api_key: None,
+            enabled: true,
+            created_at: ctx.store.now(),
+            updated_at: ctx.store.now(),
+        })
+        .await
+        .unwrap();
+    ctx.store
+        .upsert_stage_config(&agentpipeline_core::types::StageConfig {
+            stage: "architect-design".into(),
+            provider_id: Some("prov-ctx".into()),
+            resume_continuation: Some(true),
+            updated_at: ctx.store.now(),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+
+    let mut script = Script::new();
+    script
+        .for_node(Stage::ArchitectDesign, Node::ValidateInput)
+        .submit(&ValidateInputMetadata {
+            readiness: true,
+            blockers: vec![],
+        });
+    script
+        .for_node(Stage::ArchitectDesign, Node::Execute)
+        .write_file("design.md", "# 设计\n## 验收标准\n- AC-1 能登录\n")
+        .submit(&ArchitectExecuteMetadata {
+            readiness: true,
+            affected_files: (0..4000).map(|i| format!("src/module_{i}.rs")).collect(),
+            new_symbols: vec![],
+            acceptance_criteria: vec![],
+            ..Default::default()
+        });
+    ctx.agent.set_script(script);
+    testkit::seed_task(&ctx.store, "cont-overflow", "p1")
+        .await
+        .unwrap();
+    admit(&ctx, "cont-overflow").await;
+    ctx.executor.run("cont-overflow").await.unwrap();
+
+    let cursor = ctx
+        .store
+        .load_live_cursors("cont-overflow")
+        .await
+        .unwrap()
+        .into_iter()
+        .next()
+        .unwrap();
+    assert_eq!(
+        cursor.pending_reason.as_ref().unwrap().kind,
+        PendingKind::ContextOverflow,
+        "先确认真的走到了那条退出路径"
+    );
+
+    // 该 run 的会话行存在（修复前它是空的）
+    let runs = ctx.store.list_runs("cont-overflow").await.unwrap();
+    let convs = ctx
+        .store
+        .list_conversations("cont-overflow", true)
+        .await
+        .unwrap();
+    let overflow_run = runs
+        .iter()
+        .find(|r| r.stage == Stage::ArchitectDesign && r.node == Node::Execute)
+        .expect("architect-design.execute 应有 run 行");
+    assert!(
+        convs
+            .iter()
+            .any(|c| c.run_id == overflow_run.id && c.agent_type == "main"),
+        "context_overflow 退出路径须补写会话行（票 13 必要条件一）：{convs:?}"
     );
 }

@@ -858,6 +858,10 @@ pub struct NodeRun {
     pub process_group_id: Option<i32>,
     pub last_activity_at: Option<DateTime<Utc>>,
     pub prompt_template_hash: Option<String>,
+    /// 本 run 续接了哪一条历史 run（决策 180，票 13）。`None` = 干净起跑。
+    ///
+    /// 指标汇总据此排除被续接的历史——否则历史报过的输入 token 会在新 run 里再报一遍。
+    pub continued_from_run_id: Option<i64>,
     pub started_at: DateTime<Utc>,
     pub finished_at: Option<DateTime<Utc>>,
 }
@@ -1101,6 +1105,11 @@ pub struct StageConfig {
     pub max_duration_sec: Option<u64>,
     /// 节点级覆盖（决策 66）：`{"execute": {"idle_timeout_sec": 600}}`。
     pub node_overrides_json: Option<serde_json::Value>,
+    /// pending → resume 重入时是否续接上一 attempt 的对话（决策 180，票 13）。
+    ///
+    /// 缺省 / `None` = **关**：每次 attempt 干净对话，与续接出现之前逐字相同。节点级覆盖走
+    /// `node_overrides_json[node].resume_continuation`，分层照 `idle_timeout_sec`。
+    pub resume_continuation: Option<bool>,
     pub updated_at: DateTime<Utc>,
 }
 

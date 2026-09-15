@@ -23,6 +23,8 @@ use crate::process::ProcessKiller;
 use crate::types::{CommandSource, Node, Stage};
 use crate::{Error, Result};
 
+use super::egress::NetworkPolicy;
+
 /// 命令日志记录的启动信息（§12.4.4）。
 #[derive(Debug, Clone)]
 pub struct CommandStart {
@@ -169,6 +171,11 @@ pub struct ToolExecutor {
     /// [`Self::execute`] 按 `call.name` 路由，模型完全可以无视 tool 定义直接发一个
     /// `run_command`，那样它就真被跑掉了。故边界必须落在**执行点**。
     allow: Option<&'static [&'static str]>,
+    /// `run_command` 的出口策略（决策 179，票 12）。
+    ///
+    /// 构造时从 [`Settings`] 取一次（见 [`Self::new`]），执行点不再读配置——策略与「这次执行
+    /// 用的哪份设置」不会错位。默认姿态保守：空清单 + 不放行全部，只放行回环。
+    egress: NetworkPolicy,
 }
 
 /// 命令输出推流的上下文（票 14）：SSE 去向 + 事件里要带的任务/分支。
@@ -207,6 +214,7 @@ impl ToolExecutor {
         ToolExecutor {
             home,
             policy,
+            egress: NetworkPolicy::from_settings(&settings),
             settings,
             recorder: None,
             killer,
@@ -247,6 +255,19 @@ impl ToolExecutor {
     pub fn with_command_heartbeat_interval(mut self, interval: Duration) -> Self {
         self.command_heartbeat_interval = interval;
         self
+    }
+
+    /// 覆盖 `run_command` 的出口策略（决策 179，票 12）。
+    ///
+    /// 生产路径由 [`Self::new`] 从 [`Settings`] 直接取，没有这一步；它存在是为了让用例
+    /// 能单独钉住策略（尤其是「同一份设置下放行 / 拒绝两种走向」），而不必绕道配置。
+    pub fn with_egress(mut self, egress: NetworkPolicy) -> Self {
+        self.egress = egress;
+        self
+    }
+
+    pub fn egress(&self) -> &NetworkPolicy {
+        &self.egress
     }
 
     pub fn policy(&self) -> &FileToolPolicy {
@@ -523,21 +544,27 @@ impl ToolExecutor {
 
         // 命令脱敏后落库（§12.4.4）
         let sanitized = super::sanitize::sanitize_command_line(&command);
-        let command_id = match &self.recorder {
-            Some(rec) => Some(
-                rec.record_start(CommandStart {
-                    task_id: ctx.task_id.clone(),
-                    run_id: ctx.run_id,
-                    stage: ctx.stage,
-                    node: ctx.node,
-                    source: ctx.command_source,
-                    command: sanitized.clone(),
-                    cwd: cwd.display().to_string(),
-                })
-                .await?,
-            ),
-            None => None,
-        };
+
+        // 出口策略（决策 179，票 12）在**启动进程之前**判定：被拒的命令根本不执行。
+        // 拒绝也要落 `kanban_node_commands`（与放行的命令同表）——审计面必须看得见
+        // 「有过一次被拒的出口尝试」，否则策略只是一次静默失败。
+        if let Err(denied) = self.egress.check(&command) {
+            let id = self.record_command_start(ctx, &sanitized, &cwd).await?;
+            if let (Some(rec), Some(id)) = (self.recorder.as_ref(), id) {
+                rec.record_finish(
+                    id,
+                    CommandFinish {
+                        exit_code: Some(crate::agent::egress::EGRESS_DENIED_EXIT_CODE),
+                        stderr_preview: Some(denied.to_string()),
+                        ..Default::default()
+                    },
+                )
+                .await?;
+            }
+            return Err(denied);
+        }
+
+        let command_id = self.record_command_start(ctx, &sanitized, &cwd).await?;
 
         // 命令开始即刷新心跳（决策 100）
         if let Some(rec) = &self.recorder {
@@ -629,6 +656,33 @@ impl ToolExecutor {
         }
 
         Ok(ToolOutcome::ok(in_context))
+    }
+
+    /// 落一条命令日志的「开始」并返回 id（未接记录器时 `None`）。
+    ///
+    /// 被拒的出口与正常执行**走同一个入口**（决策 179，票 12）：审计面必须看得见每一次
+    /// 尝试，包括被拒的那些——否则策略在日志里完全不可见，只剩模型侧的一次报错。
+    async fn record_command_start(
+        &self,
+        ctx: &ToolCallContext,
+        sanitized: &str,
+        cwd: &Path,
+    ) -> Result<Option<i64>> {
+        let Some(rec) = &self.recorder else {
+            return Ok(None);
+        };
+        Ok(Some(
+            rec.record_start(CommandStart {
+                task_id: ctx.task_id.clone(),
+                run_id: ctx.run_id,
+                stage: ctx.stage,
+                node: ctx.node,
+                source: ctx.command_source,
+                command: sanitized.to_string(),
+                cwd: cwd.display().to_string(),
+            })
+            .await?,
+        ))
     }
 
     /// 逐行读子进程输出、全量缓冲并**按行推流**（票 14 / 决策 100 / §12.4.4）。

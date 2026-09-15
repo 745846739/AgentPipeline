@@ -119,6 +119,11 @@
 | **REST API** | 前后端通信的请求/响应接口（axum 框架），负责 CRUD 操作和控制指令 |
 | **SSE** | Server-Sent Events，服务端单向推送，用于 pipeline 状态实时通知前端 |
 | **API Key** | LLM provider 的访问密钥，前端配置后**明文**存储在 `providers.api_key` 列（决策 112，修订决策 10）。安全性依赖 `~/.agentpipeline` 的目录权限（§12.14），**不防本机 shell** |
+| **信任标记（trusted）** | 技能声明里的信任态（决策 172④，票 05 / 11）：未受信任的技能**不得以 `full` 模式保存**（写入与启动两侧都拒绝），只能以 `name` 模式使用——正文仍可由 `Skill` 工具按需拉取。信任态**不另存一份账**：它是 `SkillDecl` 的字段，界面上的「信任此技能」是就地改写引用该技能的那些声明（决策 181①），否则「这个技能可不可信」会有两个答案，而这是安全相关判定。裸字符串（老配置行）按 `{full, trusted:false}` 解释，**储存时原样写回**（物化成对象会撞上写入门） |
+| **装前预览** | 安装前把三件事摆给用户看（决策 172⑤，票 11）：① 推荐去向（阶段 + 理由）② 注入模式与信任态 ③ 正文特征扫描（`run_command` / 网络调用 / 密钥路径字样，**逐行列出**）。③ **只用于告知、不参与准入**——正则拦不住变形又误伤合法技能，风险由预览 + 信任标记 + 工具层出口控制承担（决策 181③）。`GET /skills/{name}/preview` 看已装的，`POST /skills/preview` 看**包里的字节**（还没落盘） |
+| **只读子代理（`spawn_sub_agent`）** | 扩展工具（决策 172③，票 08；重开决策 154）：派生一个**只读**子代理处理可分解的检索子任务，把「读 20 个文件」的原文挡在父上下文之外。工具集**固定为 `read_file` / `list_dir`**（无 `run_command` / 写文件 / `submit_metadata`）、**不继承阶段声明的工具**、**不再派子代理**（深度一层，决策 9）。边界落在**执行点**（`ToolExecutor::execute` 的工具白名单）而不是 tool 定义上——只限制广告出去的定义是纸糊的，模型可以无视定义直接发一次调用 |
+| **工具层出口控制** | `run_command` 的网络出口策略（决策 179，票 12）：默认 allowlist 且**只放行回环**，未放行的目标被拒并落 `kanban_node_commands`（与放行的命令同表）。只约束 agent **主动经 `run_command` 发起**的调用，**约束不了被启动子进程自行联网——不是安全边界**（残余风险与 OS 级沙箱候选见 operations §12.15） |
+| **会话续接（`resume_continuation`）** | 阶段级 / 节点级开关（决策 180，票 13），**默认关**：pending → resume 重入时从 `kanban_node_conversations` 读回上一 attempt 的 messages 作为起点，信息补充型 pending 不必让 agent 从零重读仓库。只作用于 **pending → resume 边界**，`agent_retry_max` 的干净重试语义（决策 33）不变。三个连带的必要条件：`context_overflow` 退出路径补写会话行、token 双算防护（`continued_from_run_id`）、压缩锚点不认载入的历史 |
 | **FileToolPolicy** | 文件工具的路径策略（决策 104）：约束 6 个文件工具的允许根与 `deny_paths`，判定前 realpath 解析、拒绝写符号链接。**不是系统级沙箱**——shell 不受限 |
 | **spawn_blocking** | tokio 提供的函数，将阻塞操作（如 git2 调用）放到专用线程池执行，避免阻塞异步 runtime |
 

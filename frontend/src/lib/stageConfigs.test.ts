@@ -8,6 +8,17 @@ import {
   stageKeyLabel,
 } from './stageConfigs';
 import { buildStageConfigPut } from './stageConfigs';
+import {
+  addSkillDecl,
+  canSwitchToFull,
+  nodeSkillsFromJson,
+  parseSkillDecls,
+  removeSkillDecl,
+  serializeSkillDecls,
+  setSkillMode,
+  setSkillTrust,
+  withNodeSkills,
+} from './stageConfigs';
 
 function config(overrides: Partial<StageConfig> = {}): StageConfig {
   return {
@@ -22,6 +33,7 @@ function config(overrides: Partial<StageConfig> = {}): StageConfig {
     idle_timeout_sec: null,
     max_duration_sec: null,
     node_overrides_json: null,
+    resume_continuation: null,
     updated_at: '2026-09-12T00:00:00Z',
     ...overrides,
   };
@@ -45,7 +57,7 @@ describe('stage_configs 键与预填', () => {
     expect(draft.temperature).toBe('0.2');
     expect(draft.persona_append).toBe('注意');
     expect(draft.tools_json).toBe(JSON.stringify({ execute: ['read_file'] }, null, 2));
-    expect(draft.skills_json).toBe('');
+    expect(draft.skills).toEqual([]);
   });
 });
 
@@ -71,14 +83,14 @@ describe('buildStageConfigPut（整条替换：留空 = 省略 = 清空）', () 
     const draft = {
       ...emptyStageConfigDraft('test'),
       tools_json: '{"execute":["read_file","run_command"]}',
-      skills_json: 'null',
+      node_overrides_json: 'null',
     };
     const result = buildStageConfigPut(draft);
     expect(result.ok).toBe(true);
     if (!result.ok) return;
     expect(result.payload.tools_json).toEqual({ execute: ['read_file', 'run_command'] });
     // "null" 是显式值（与留空的 omitted 不同）
-    expect(result.payload.skills_json).toBeNull();
+    expect(result.payload.node_overrides_json).toBeNull();
   });
 
   it('整数 / 浮点字段按字段语义解析', () => {
@@ -116,8 +128,182 @@ describe('buildStageConfigPut（整条替换：留空 = 省略 = 清空）', () 
     const result = buildStageConfigPut({
       ...emptyStageConfigDraft(),
       provider_id: 'p1',
-      skills_json: '[',
+      node_overrides_json: '[',
     });
     expect('payload' in result).toBe(false);
+  });
+});
+
+/* ────────────────── 技能声明（决策 172④，票 15）────────────────── */
+
+describe('技能声明：混合数组的读与写', () => {
+  it('裸字符串按 full + 未信任解释，并标记为老格式', () => {
+    const { decls, error } = parseSkillDecls(['rtk']);
+    expect(error).toBeUndefined();
+    expect(decls).toEqual([{ name: 'rtk', mode: 'full', trusted: false, bare: true }]);
+  });
+
+  it('对象形态缺省 mode 为 full、trusted 为 false（与后端 parse_skill_decls 同口径）', () => {
+    const { decls } = parseSkillDecls([
+      { name: 'a' },
+      { name: 'b', mode: 'name' },
+      { name: 'c', mode: 'name', trusted: true },
+    ]);
+    expect(decls.map((d) => [d.mode, d.trusted, d.bare])).toEqual([
+      ['full', false, false],
+      ['name', false, false],
+      ['name', true, false],
+    ]);
+  });
+
+  it('旧格式（纯字符串数组）回填后写回的是**同一份数组**——零迁移', () => {
+    const original = ['grilling', 'tdk'];
+    const { decls } = parseSkillDecls(original);
+    expect(serializeSkillDecls(decls)).toEqual(original);
+  });
+
+  it('裸字符串不得被物化成对象：未信任 + full 会被写入门拒绝', () => {
+    const { decls } = parseSkillDecls(['rtk']);
+    expect(serializeSkillDecls(decls)).toEqual(['rtk']);
+    // 信任之后才有地方放 trusted，此时物化成对象
+    const trusted = setSkillTrust(decls, 0, true);
+    expect(trusted.ok).toBe(true);
+    if (!trusted.ok) return;
+    expect(serializeSkillDecls(trusted.decls)).toEqual([
+      { name: 'rtk', mode: 'full', trusted: true },
+    ]);
+  });
+
+  it('既不是字符串也不是对象的元素被忽略（与后端宽松口径一致）', () => {
+    expect(parseSkillDecls(['ok', 42, null, [], true]).decls).toEqual([
+      { name: 'ok', mode: 'full', trusted: false, bare: true },
+    ]);
+  });
+
+  it('非法输入给出可读原因', () => {
+    expect(parseSkillDecls({ nope: 1 }).error).toContain('数组');
+    expect(parseSkillDecls([{ name: 'x', mode: 'half' }]).error).toContain('half');
+  });
+});
+
+describe('技能声明：控件层的准入', () => {
+  const untrustedName = parseSkillDecls([{ name: 'x', mode: 'name' }]).decls;
+  const trustedFull = parseSkillDecls([{ name: 'y', mode: 'full', trusted: true }]).decls;
+
+  it('未受信任的技能不可切全文，报错要说清怎么办', () => {
+    expect(canSwitchToFull(untrustedName[0])).toBe(false);
+    const result = setSkillMode(untrustedName, 0, 'full');
+    expect(result.ok).toBe(false);
+    if (result.ok) return;
+    expect(result.error).toContain('未受信任');
+    expect(result.error).toContain('信任');
+  });
+
+  it('已信任 / 老格式（裸字符串）可以切全文', () => {
+    expect(canSwitchToFull(trustedFull[0])).toBe(true);
+    expect(canSwitchToFull(parseSkillDecls(['legacy']).decls[0])).toBe(true);
+    expect(setSkillMode(trustedFull, 0, 'name').ok).toBe(true);
+  });
+
+  it('撤销信任撞上全文注入时拒绝，不静默降级', () => {
+    const result = setSkillTrust(trustedFull, 0, false);
+    expect(result.ok).toBe(false);
+    if (result.ok) return;
+    expect(result.error).toContain('全文');
+  });
+
+  it('名字态可以撤销信任（本来就合法）', () => {
+    const result = setSkillTrust(untrustedName, 0, false);
+    expect(result.ok).toBe(true);
+  });
+
+  it('添加 / 移除：重名不加，新增一律先名字态 + 未信任', () => {
+    const added = addSkillDecl([], 'grilling');
+    expect(added).toEqual([{ name: 'grilling', mode: 'name', trusted: false, bare: false }]);
+    expect(addSkillDecl(added, 'grilling')).toBe(added);
+    expect(addSkillDecl(added, '  ')).toBe(added);
+    expect(removeSkillDecl(added, 0)).toEqual([]);
+  });
+});
+
+describe('节点级技能：写回 node_overrides_json', () => {
+  it('只动目标节点的 skills，其余键与其余节点逐字保留', () => {
+    const raw = JSON.stringify({
+      execute: { idle_timeout_sec: 600 },
+      validate_input: { provider_id: 'long-ctx' },
+    });
+    const result = withNodeSkills(raw, 'execute', addSkillDecl([], 'grilling'));
+    expect(result.ok).toBe(true);
+    if (!result.ok) return;
+    const parsed = JSON.parse(result.text);
+    expect(parsed.execute.idle_timeout_sec).toBe(600);
+    expect(parsed.execute.skills).toEqual([
+      { name: 'grilling', mode: 'name', trusted: false },
+    ]);
+    expect(parsed.validate_input).toEqual({ provider_id: 'long-ctx' });
+  });
+
+  it('清空节点级技能时删掉 skills 键（空数组是无意义的声明）', () => {
+    const raw = JSON.stringify({ execute: { skills: ['x'], idle_timeout_sec: 60 } });
+    const result = withNodeSkills(raw, 'execute', []);
+    expect(result.ok).toBe(true);
+    if (!result.ok) return;
+    expect(JSON.parse(result.text)).toEqual({ execute: { idle_timeout_sec: 60 } });
+  });
+
+  it('节点上没有别的键时整条节点对象一并清掉', () => {
+    const raw = JSON.stringify({ execute: { skills: ['x'] } });
+    const result = withNodeSkills(raw, 'execute', []);
+    expect(result.ok).toBe(true);
+    if (!result.ok) return;
+    expect(JSON.parse(result.text)).toEqual({});
+  });
+
+  it('坏 JSON 不猜：拒绝写入并说清原因', () => {
+    const result = withNodeSkills('{oops}', 'execute', []);
+    expect(result.ok).toBe(false);
+    expect(nodeSkillsFromJson('{oops}', 'execute').error).toBeTruthy();
+  });
+
+  it('读取节点级技能（含老格式裸字符串）', () => {
+    const raw = JSON.stringify({ validate_input: { skills: ['grilling'] } });
+    expect(nodeSkillsFromJson(raw, 'validate_input').decls).toEqual([
+      { name: 'grilling', mode: 'full', trusted: false, bare: true },
+    ]);
+    expect(nodeSkillsFromJson(raw, 'execute').decls).toEqual([]);
+  });
+});
+
+describe('草稿 → payload：技能与续接开关', () => {
+  it('技能以混合数组下发；空列表与续接关都走「留空 = 省略」', () => {
+    const empty = buildStageConfigPut(emptyStageConfigDraft());
+    expect(empty.ok).toBe(true);
+    if (!empty.ok) return;
+    expect(empty.payload.skills_json).toBeUndefined();
+    expect(empty.payload.resume_continuation).toBeUndefined();
+
+    const draft = { ...emptyStageConfigDraft(), skills: addSkillDecl([], 'grilling') };
+    const result = buildStageConfigPut(draft);
+    expect(result.ok).toBe(true);
+    if (!result.ok) return;
+    expect(result.payload.skills_json).toEqual([
+      { name: 'grilling', mode: 'name', trusted: false },
+    ]);
+  });
+
+  it('旧配置（纯字符串数组）经草稿一轮往返后形态不变', () => {
+    const draft = draftFromStageConfig(config({ skills_json: ['a', 'b'] }));
+    const result = buildStageConfigPut(draft);
+    expect(result.ok).toBe(true);
+    if (!result.ok) return;
+    expect(result.payload.skills_json).toEqual(['a', 'b']);
+  });
+
+  it('勾上续接开关后如实下发', () => {
+    const draft = { ...emptyStageConfigDraft(), resume_continuation: true };
+    const result = buildStageConfigPut(draft);
+    expect(result.ok).toBe(true);
+    if (!result.ok) return;
+    expect(result.payload.resume_continuation).toBe(true);
   });
 });

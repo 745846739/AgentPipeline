@@ -56,6 +56,15 @@ struct GateOutcome {
     output: String,
 }
 
+/// 一次 pending → resume 边界的续接素材（决策 180，票 13）。
+///
+/// `from_run_id` 是**被续接的那条历史 run**，写进新 run 的 `continued_from_run_id`，
+/// 供指标汇总排除被重复计入的输入 token（票 13 必要条件二）。
+struct Continuation {
+    messages: Vec<Message>,
+    from_run_id: i64,
+}
+
 // ─────────────────────────────── 单执行者注册表（决策 36）───────────────────────────────
 
 static EXECUTOR_REGISTRY: LazyLock<Mutex<HashSet<String>>> =
@@ -852,7 +861,11 @@ impl Executor {
         // (类别, 原始诊断)，耗尽后随重试耗尽错误一起带给 pending——否则它会被
         // 下面那层 `Error::Validation` 包装吞掉，用户只剩一段没有任何指引的文本。
         let mut last_classified: Option<(String, String)> = None;
-        for _ in 0..self.settings.agent_retry_max {
+        // 续接素材只在**进循环之前**取一次（决策 180，票 13）：pending → resume 的标记是
+        // 一次性的（取走即清零），而循环内第 2、3 次是 `agent_retry_max` 的干净重试——
+        // 决策 33 的语义不变，它们拿到的永远是空起点。
+        let continuation = self.take_continuation(cursor).await?;
+        for round in 0..self.settings.agent_retry_max {
             let attempt = self
                 .next_attempt(&task.id, cursor.stage, cursor.node)
                 .await?;
@@ -870,6 +883,13 @@ impl Executor {
                     process_group_id: None,
                 })
                 .await?;
+            // 本 run 续接了哪条历史（决策 180，票 13）：循环只为它续接来源记账，
+            // 干净重试与首跑都不留链接（否则 token 汇总会把无关的历史排掉）。
+            if let Some(c) = &continuation {
+                self.store
+                    .link_run_continuation(run_id, c.from_run_id)
+                    .await?;
+            }
             self.sse.emit(SseEvent::NodeStarted {
                 task_id: task.id.clone(),
                 branch: cursor.branch.clone(),
@@ -879,8 +899,17 @@ impl Executor {
                 run_id,
             });
             let started = Instant::now();
+            let carried: &[Message] = if round == 0 {
+                continuation
+                    .as_ref()
+                    .map(|c| c.messages.as_slice())
+                    .unwrap_or(&[])
+            } else {
+                // agent_retry_max 的干净对话重试（决策 33）不受续接影响
+                &[]
+            };
             match self
-                .agent_attempt(task, &project, cursor, kind, run_id, attempt)
+                .agent_attempt(task, &project, cursor, kind, run_id, attempt, carried)
                 .await
             {
                 Ok((output, tokens)) => {
@@ -985,8 +1014,55 @@ impl Executor {
         })
     }
 
+    /// 取本节点的续接素材（决策 180，票 13）。
+    ///
+    /// 三步都要成立才续接：① 游标**刚从 pending 被 resume**（一次性标记，任何 resume 动作
+    /// 都会置位——continue / skip / goto 都是「在上次停下的地方重入」）；② 该阶段或该节点
+    /// 的开关为真；③ 真有一条上一 attempt 的主 agent 会话行可读。
+    ///
+    /// 第 ③ 条在「开了开关却读不到」时**静默干净起跑**而不报错：这是票 13 必要条件一
+    /// （`context_overflow` 退出路径补写会话行）修掉的那条路——修复之后它不该再发生，
+    /// 但真发生时让节点继续跑仍优于让整条流水线停在一个诊断性错误上。
+    async fn take_continuation(&self, cursor: &NodeCursor) -> Result<Option<Continuation>> {
+        if !self
+            .store
+            .take_cursor_resumed_from_pending(&cursor.cursor_id)
+            .await?
+        {
+            return Ok(None);
+        }
+        let stage_cfg = self.store.get_stage_config(cursor.stage.as_str()).await?;
+        let enabled = crate::config::effective_resume_continuation(
+            stage_cfg.as_ref().and_then(|c| c.resume_continuation),
+            crate::config::node_resume_continuation(stage_cfg.as_ref(), cursor.node.as_str()),
+        );
+        if !enabled {
+            return Ok(None);
+        }
+        let Some(conv) = self
+            .store
+            .latest_own_conversation(&cursor.task_id, cursor.stage, cursor.node)
+            .await?
+        else {
+            return Ok(None);
+        };
+        let messages: Vec<Message> =
+            serde_json::from_value(conv.messages_json.clone()).unwrap_or_default();
+        if messages.is_empty() {
+            return Ok(None);
+        }
+        Ok(Some(Continuation {
+            messages,
+            from_run_id: conv.run_id,
+        }))
+    }
+
     /// 单次 agent attempt：prompt 组装 → 工具循环 → 元数据抽取 → 节点后处理。
     /// 返回（结论，token 计量）。
+    ///
+    /// 参数多于 clippy 的默认阈值：`run_id` / `attempt` / `carried` 三者都是**本次尝试**的
+    /// 入参，绑成结构体只是把同一份信息换个地方写，不改变调用点的可读性。
+    #[allow(clippy::too_many_arguments)]
     async fn agent_attempt(
         &self,
         task: &Task,
@@ -995,6 +1071,7 @@ impl Executor {
         kind: AgentNodeKind,
         run_id: i64,
         attempt: u32,
+        carried: &[Message],
     ) -> Result<(NodeOutput, RunTokens)> {
         let home = self.store.home().clone();
         home.ensure_task_dirs(&task.id)?;
@@ -1140,7 +1217,11 @@ impl Executor {
             .set_run_template_hash(run_id, &template_hash)
             .await?;
 
-        let mut messages: Vec<Message> = Vec::new();
+        let mut messages: Vec<Message> = carried.to_vec();
+        // 压缩锚点的边界（决策 180，票 13 必要条件三）：`carried` 是**上一轮**的对话，
+        // 它里面的 user 消息不得充当「本轮第一条 user 消息」这个锚点——否则载入历史后，
+        // keep 预算会被上一轮的提问占掉。
+        let carried_len = messages.len();
         let mut tool_failures = 0u32;
         let mut submitted: Option<serde_json::Value> = None;
         let mut tokens = RunTokens::default();
@@ -1172,11 +1253,32 @@ impl Executor {
                         &system_prompt,
                         &user_prompt,
                         &declared_tools,
+                        carried_len,
                         &mut messages,
                     )
                     .await?
                 {
                     // L4：压缩后仍超硬限 → 本节点收口为 pending(context_overflow)
+                    //
+                    // 票 13 的必要条件一（决策 180）：这条退出路径在会话落库**之前**返回，
+                    // 于是「开了续接却读不到上一轮」会是一条静默无效的路。先补写会话行，
+                    // 再返回 pending——它正是续接最需要的那个失败现场。
+                    let msgs = serde_json::to_value(&messages)?;
+                    self.store
+                        .insert_conversation(
+                            &task.id,
+                            run_id,
+                            cursor.stage,
+                            cursor.node,
+                            attempt,
+                            "main",
+                            None,
+                            &msgs,
+                            None,
+                            tokens.prompt,
+                            tokens.completion,
+                        )
+                        .await?;
                     return Ok((NodeOutput::Pending(reason), tokens));
                 }
             }
@@ -1881,6 +1983,7 @@ impl Executor {
         system_prompt: &str,
         user_prompt: &str,
         declared_tools: &[String],
+        carried_len: usize,
         messages: &mut Vec<Message>,
     ) -> Result<Option<PendingReason>> {
         let estimate = |msgs: &[Message]| {
@@ -1911,8 +2014,11 @@ impl Executor {
         }
         // L3：规则化按轮压缩（不调 LLM，§12.13.3 规则表）
         let before = messages.len();
-        let outcome =
-            crate::agent::context::compact_messages(messages, self.settings.keep_recent_rounds);
+        let outcome = crate::agent::context::compact_messages_from(
+            messages,
+            self.settings.keep_recent_rounds,
+            carried_len,
+        );
         let after = outcome.messages.len();
         *messages = outcome.messages;
         // 压缩发生时有可观测记录（票面要求）

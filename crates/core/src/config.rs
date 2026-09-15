@@ -41,6 +41,13 @@ pub struct Settings {
     pub conflict_overlap_threshold: usize,
     pub max_concurrent_tasks: usize,
     pub allow_dirty_worktree_merge: bool,
+    /// `run_command` 的出口放行主机（决策 179，票 12）：精确主机 / `*.example.com` / `*`。
+    ///
+    /// **默认空 = 只放行回环**。忘配的代价是某条命令被拒并在报错里说明怎么放行，配宽的代价
+    /// 是静默放行陌生目标——两个方向不对称，故默认取保守侧（票 12 的硬要求）。
+    pub egress_allow_hosts: Vec<String>,
+    /// 显式放行全部出口。默认 `false`：未配置时**不得**静默变成「全部放行」。
+    pub egress_allow_all: bool,
 }
 
 impl Default for Settings {
@@ -69,6 +76,8 @@ impl Default for Settings {
             conflict_overlap_threshold: 0,
             max_concurrent_tasks: 5,
             allow_dirty_worktree_merge: false,
+            egress_allow_hosts: Vec::new(),
+            egress_allow_all: false,
         }
     }
 }
@@ -100,6 +109,8 @@ pub struct PipelineOverrides {
     pub conflict_overlap_threshold: Option<usize>,
     pub max_concurrent_tasks: Option<usize>,
     pub allow_dirty_worktree_merge: Option<bool>,
+    pub egress_allow_hosts: Option<Vec<String>>,
+    pub egress_allow_all: Option<bool>,
 }
 
 impl PipelineOverrides {
@@ -135,6 +146,8 @@ impl PipelineOverrides {
             conflict_overlap_threshold,
             max_concurrent_tasks,
             allow_dirty_worktree_merge,
+            egress_allow_hosts,
+            egress_allow_all,
         );
         s
     }
@@ -449,6 +462,15 @@ impl Config {
             check_market_source_scheme(&origin)
                 .map_err(|e| Error::Config(format!("[market] allowed_sources 校验失败：{e}")))?;
         }
+        // 出口放行清单同样在解析期 fail fast（票 12）：写错的条目若放过去，表现为运行期
+        // 「明明列了还是被拒」，用户得回头猜（与上一条同理）
+        if let Some(hosts) = self.pipeline.egress_allow_hosts.as_ref() {
+            for host in hosts {
+                crate::agent::egress::check_allow_host(host).map_err(|e| {
+                    Error::Config(format!("[pipeline] egress_allow_hosts 校验失败：{e}"))
+                })?;
+            }
+        }
         Ok(())
     }
 
@@ -484,6 +506,27 @@ pub fn effective_idle_timeout(global: u64, stage_override: Option<u64>, node: No
 /// 有效绝对超时 = 节点级 > 阶段级 > 全局（决策 66）。
 pub fn effective_max_duration(global: u64, stage_override: Option<u64>, node: NodeTimeouts) -> u64 {
     node.max_duration_sec.or(stage_override).unwrap_or(global)
+}
+
+/// 从阶段配置读节点级「续接上一轮对话」覆盖（`node_overrides_json[node].resume_continuation`，
+/// 决策 180 / 票 13）。
+pub fn node_resume_continuation(stage_cfg: Option<&StageConfig>, node: &str) -> Option<bool> {
+    stage_cfg
+        .and_then(|c| c.node_overrides_json.as_ref())
+        .and_then(|v| v.get(node))
+        .and_then(|n| n.get("resume_continuation"))
+        .and_then(|v| v.as_bool())
+}
+
+/// 有效续接开关 = 节点级 > 阶段级 > 关（决策 180，分层照 `idle_timeout_sec`）。
+///
+/// 兜底是 `false` 而不是某个可选值：票面要求默认 **false**，默认路径必须与续接出现之前
+/// 逐字相同。「没人配置过」就是关。
+pub fn effective_resume_continuation(
+    stage_override: Option<bool>,
+    node_override: Option<bool>,
+) -> bool {
+    node_override.or(stage_override).unwrap_or(false)
 }
 
 /// 从阶段配置读节点级覆盖（`node_overrides_json`）。
@@ -604,6 +647,147 @@ pub fn parse_skill_decls(
     Ok(out)
 }
 
+// ───────────────────── 信任转换（票 11 的显式动作）─────────────────────
+
+/// 把一份阶段配置里引用 `name` 的声明**全部**改写为「已信任」或「未信任」。
+///
+/// 返回改写过的那份配置；`None` 表示这份配置没引用该技能（**不动它**）。
+///
+/// ## 为什么信任态就地改写而不是另存一份
+///
+/// 信任是 `SkillDecl` 的字段（票 05），且**写入侧有门**：未信任 + `full` 被
+/// [`parse_skill_decls`] 拒绝。若另建一份「信任表」，同一个问题就有了两个答案，而这是
+/// **安全相关**的判定（未信任不得全文注入）——两个答案意味着必然有一条路径判错。故本函数
+/// 只做一件事：把已有的声明换成新的信任态，其余字段（`mode` / 其他技能 / 其他配置项）一律不动。
+///
+/// ## 降信任时 `full` 必须变 `name`，且**不静默降级**
+///
+/// `trusted = false` 撞上一条 `mode: "full"` 声明时，落盘会得到一份**启动时就 fail fast**
+/// 的配置（票 05 的门）。两条路：静默把 `full` 改成 `name`，或拒绝并让用户自己改。
+/// 取**拒绝**——静默改注入模式会悄悄停掉一个正在生效的知识源，与「卸载被引用的技能不得
+/// 静默降级」（票 09）是同一条纪律：**形态变更必须是用户看见的动作**。
+///
+/// 裸字符串声明（`["grill"]`，按 `{full, trusted:false}` 解释）在此**物化**为显式对象：
+/// 它本来就按 `full` 解释，只有变成 `{name, mode:"full", trusted:true}` 才能表达「这条已信任」
+/// ——裸字符串没有地方放 `trusted: true`。这是**语义等价**的改写（`full` 不变），不是降级。
+pub fn set_skill_trust(
+    cfg: &StageConfig,
+    name: &str,
+    trusted: bool,
+) -> Result<Option<StageConfig>> {
+    let mut out = cfg.clone();
+    let mut touched = false;
+
+    // 阶段级 `skills_json` 与每个节点的 `node_overrides_json[node].skills` 走**同一套**改写：
+    // 票 05 的解析器就是这么共用的，两处判定不该分家
+    let stage_where = format!("阶段 {}", cfg.stage);
+    let (next, changed) = rewrite_decls(cfg.skills_json.as_ref(), name, trusted, &stage_where)?;
+    if changed {
+        out.skills_json = next;
+        touched = true;
+    }
+
+    if let Some(overrides) = cfg.node_overrides_json.as_ref().and_then(|v| v.as_object()) {
+        let mut new_overrides = overrides.clone();
+        let mut nodes_touched = false;
+        for (node, node_value) in overrides {
+            let Some(node_obj) = node_value.as_object() else {
+                continue;
+            };
+            let where_ = format!("阶段 {} 节点 {node}", cfg.stage);
+            let (next, changed) = rewrite_decls(node_obj.get("skills"), name, trusted, &where_)?;
+            if !changed {
+                continue;
+            }
+            let mut updated = node_obj.clone();
+            match next {
+                Some(v) => {
+                    updated.insert("skills".to_string(), v);
+                }
+                None => {
+                    updated.remove("skills");
+                }
+            }
+            new_overrides.insert(node.clone(), serde_json::Value::Object(updated));
+            nodes_touched = true;
+        }
+        if nodes_touched {
+            out.node_overrides_json = Some(serde_json::Value::Object(new_overrides));
+            touched = true;
+        }
+    }
+
+    Ok(touched.then_some(out))
+}
+
+/// 改写一份技能声明数组；`None` 表示原本没有该字段且无需新建。
+///
+/// 逐元素判断，**只碰引用 `name` 的那些**：其余元素（含暂时解析不通的杂值）原样保留，
+/// 避免一次信任转换把用户手写的其他内容顺手规范化掉。
+fn rewrite_decls(
+    value: Option<&serde_json::Value>,
+    name: &str,
+    trusted: bool,
+    where_: &str,
+) -> Result<(Option<serde_json::Value>, bool)> {
+    use crate::agent::skills::SkillMode;
+
+    let Some(array) = value.and_then(|v| v.as_array()) else {
+        return Ok((None, false));
+    };
+    let mut changed = false;
+    let mut out: Vec<serde_json::Value> = Vec::with_capacity(array.len());
+    for item in array {
+        // 裸字符串：只有名字相同时才物化（理由见 [`set_skill_trust`] 的文档）
+        let is_bare_hit = item.as_str() == Some(name);
+        let is_obj_hit = item
+            .as_object()
+            .and_then(|o| o.get("name"))
+            .and_then(|v| v.as_str())
+            == Some(name);
+        if !is_bare_hit && !is_obj_hit {
+            out.push(item.clone());
+            continue;
+        }
+        if is_bare_hit {
+            // 裸字符串按 `{full, false}` 解释；改成未信任是无变化的，不改（少写一次盘）
+            if !trusted {
+                out.push(item.clone());
+                continue;
+            }
+            changed = true;
+            out.push(serde_json::json!({
+                "name": name,
+                "mode": "full",
+                "trusted": true,
+            }));
+            continue;
+        }
+        let obj = item.as_object().expect("上面已判定是对象");
+        let mode = obj.get("mode").and_then(|v| v.as_str()).unwrap_or("full");
+        // 降信任撞上全文注入：拒绝，让用户自己决定改成名字态（不静默降级）
+        if !trusted && mode == SkillMode::Full.as_str() {
+            return Err(Error::Config(format!(
+                "{where_} 的技能 {name} 正以 full 模式注入，改为未信任会让这份配置失效\
+                 （未信任不得全文注入，决策 172④）。请先把该处的 mode 改为 \"name\"\
+                 （正文改由 Skill 工具按需拉取），再撤销信任"
+            )));
+        }
+        let already = obj
+            .get("trusted")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
+        if already == trusted {
+            out.push(item.clone());
+            continue;
+        }
+        let mut updated = obj.clone();
+        updated.insert("trusted".to_string(), serde_json::Value::Bool(trusted));
+        changed = true;
+        out.push(serde_json::Value::Object(updated));
+    }
+    Ok((Some(serde_json::Value::Array(out)), changed))
+}
 /// `run_command` 的超时上限（决策 75）：显式传值时取该值；未传时 test / merge 阶段取
 /// `test_command_timeout_sec`，其余阶段取 `tool_timeout_sec`。
 pub fn effective_run_command_timeout(
@@ -1491,6 +1675,139 @@ mod tests {
         let err =
             parse_skill_decls(&serde_json::json!([{"mode": "name"}]), "阶段 develop").unwrap_err();
         assert!(err.to_string().contains("name"), "{err}");
+    }
+
+    // ───────────────────────── 信任转换（票 11）─────────────────────────
+
+    fn cfg_with_skills(skills: serde_json::Value) -> StageConfig {
+        StageConfig {
+            stage: "develop".into(),
+            skills_json: Some(skills),
+            ..Default::default()
+        }
+    }
+
+    /// 显式对象：`trusted` 就地翻成 true，`mode` 与其他技能一概不动。
+    #[test]
+    fn trust_conversion_flips_explicit_object_in_place() {
+        let cfg = cfg_with_skills(serde_json::json!([
+            {"name": "a", "mode": "name", "trusted": false},
+            {"name": "b", "mode": "full", "trusted": true}
+        ]));
+        let out = set_skill_trust(&cfg, "a", true).unwrap().expect("应改写");
+        let decls = parse_skill_decls(out.skills_json.as_ref().unwrap(), "阶段 develop").unwrap();
+        assert_eq!(decls[0].name, "a");
+        assert!(decls[0].trusted, "a 应已信任");
+        assert_eq!(
+            decls[0].mode,
+            crate::agent::skills::SkillMode::Name,
+            "mode 不动"
+        );
+        // b 原样保留
+        assert_eq!(decls[1].name, "b");
+        assert!(decls[1].trusted);
+    }
+
+    /// 裸字符串物化为显式对象：`full` 语义不变，只是多了一个 `trusted: true` 的位置。
+    ///
+    /// 这是**语义等价**改写（裸字符串本就按 `{full, false}` 解释），不是降级。
+    #[test]
+    fn trust_conversion_materializes_bare_string_keeping_full_mode() {
+        let cfg = cfg_with_skills(serde_json::json!(["grill", "other"]));
+        let out = set_skill_trust(&cfg, "grill", true)
+            .unwrap()
+            .expect("应改写");
+        let decls = parse_skill_decls(out.skills_json.as_ref().unwrap(), "阶段 develop").unwrap();
+        assert_eq!(decls[0].name, "grill");
+        assert!(decls[0].trusted);
+        assert_eq!(decls[0].mode, crate::agent::skills::SkillMode::Full);
+        // 另一个裸字符串原样留着（没被顺带规范化）
+        assert_eq!(
+            out.skills_json.as_ref().unwrap()[1],
+            serde_json::json!("other")
+        );
+    }
+
+    /// 未信任 + `full` 是禁止状态：降信任撞上它必须**拒绝**，而不是静默把 full 改成 name。
+    #[test]
+    fn untrusting_a_full_declaration_is_refused_not_silently_downgraded() {
+        let cfg = cfg_with_skills(serde_json::json!([
+            {"name": "a", "mode": "full", "trusted": true}
+        ]));
+        let err = set_skill_trust(&cfg, "a", false).unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("a") && msg.contains("full") && msg.contains("name"),
+            "报文须指出该怎么改：{msg}"
+        );
+        // 原配置未被改动（拒绝时不产生半成品）
+        assert!(cfg.skills_json.as_ref().unwrap()[0]["trusted"]
+            .as_bool()
+            .unwrap());
+    }
+
+    /// 降信任在名字态上是安全的：正文不进 prompt，改回未信任不产生非法配置。
+    #[test]
+    fn untrusting_a_name_mode_declaration_is_allowed() {
+        let cfg = cfg_with_skills(serde_json::json!([
+            {"name": "a", "mode": "name", "trusted": true}
+        ]));
+        let out = set_skill_trust(&cfg, "a", false).unwrap().expect("应改写");
+        let decls = parse_skill_decls(out.skills_json.as_ref().unwrap(), "阶段 develop").unwrap();
+        assert!(!decls[0].trusted);
+        assert_eq!(decls[0].mode, crate::agent::skills::SkillMode::Name);
+    }
+
+    /// 没引用该技能 → 不改（`None`），避免为无关技能写盘。
+    #[test]
+    fn unrelated_skill_leaves_the_config_untouched() {
+        let cfg = cfg_with_skills(serde_json::json!([{"name": "a", "trusted": false}]));
+        assert!(set_skill_trust(&cfg, "other", true).unwrap().is_none());
+    }
+
+    /// 节点级声明与阶段级走同一套改写（票 05 的解析器两处共用，改写也不该分家）。
+    #[test]
+    fn trust_conversion_covers_node_level_declarations() {
+        let cfg = StageConfig {
+            stage: "architect-design".into(),
+            skills_json: Some(serde_json::json!(["grill"])),
+            node_overrides_json: Some(serde_json::json!({
+                "execute": {"skills": [{"name": "grill", "mode": "name", "trusted": false}]},
+                "validate_output": {"idle_timeout_sec": 60}
+            })),
+            ..Default::default()
+        };
+        let out = set_skill_trust(&cfg, "grill", true)
+            .unwrap()
+            .expect("应改写");
+        // 阶段级裸字符串物化
+        assert_eq!(
+            out.skills_json.as_ref().unwrap()[0]["trusted"],
+            serde_json::json!(true)
+        );
+        // 节点级同改
+        assert_eq!(
+            out.node_overrides_json.as_ref().unwrap()["execute"]["skills"][0]["trusted"],
+            serde_json::json!(true)
+        );
+        // 无 skills 的节点的其他字段原样保留
+        assert_eq!(
+            out.node_overrides_json.as_ref().unwrap()["validate_output"]["idle_timeout_sec"],
+            serde_json::json!(60)
+        );
+    }
+
+    /// 反方向同一条门：转换出的配置必须**仍能通过**写入校验。
+    ///
+    /// 这条钉的是「转换后的产物合法」——只断言 JSON 形状不够，得让真正会守门的那位过一遍。
+    #[test]
+    fn converted_config_still_passes_the_write_gate() {
+        let cfg = cfg_with_skills(serde_json::json!([
+            {"name": "a", "mode": "name", "trusted": false}
+        ]));
+        // 只信任、不改 mode：name 态下信任与否都不影响合法性
+        let out = set_skill_trust(&cfg, "a", true).unwrap().unwrap();
+        assert!(parse_skill_decls(out.skills_json.as_ref().unwrap(), "阶段 develop").is_ok());
     }
 
     #[test]

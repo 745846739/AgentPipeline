@@ -3,6 +3,7 @@
 pub mod baseline;
 pub mod client;
 pub mod context;
+pub mod egress;
 pub mod file_policy;
 pub mod market;
 pub mod metadata;
@@ -10,6 +11,7 @@ pub mod prompts;
 pub mod providers;
 pub mod sanitize;
 pub mod skill_import;
+pub mod skill_preview;
 pub mod skills;
 pub mod templates;
 pub mod tools;
@@ -19,6 +21,7 @@ pub use client::{
     submit_metadata_tool, AgentResponse, LlmClient, LlmRequest, Message, Role, ToolCall, ToolDef,
     BUILTIN_TOOLS, MANDATORY_TOOLS, SKILL_TOOL, SPAWN_SUB_AGENT_TOOL,
 };
+pub use egress::{Egress, NetworkPolicy};
 pub use file_policy::{FileOp, FileToolPolicy};
 pub use metadata::{
     extract_metadata, find_last_balanced_json, parse_metadata, retry_prompt, MetadataExtraction,

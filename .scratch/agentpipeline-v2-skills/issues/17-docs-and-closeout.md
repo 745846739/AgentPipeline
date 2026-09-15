@@ -9,22 +9,22 @@
 12（出口控制）、13（会话续接）、14（`attempt` 语义修正——指标口径变了要在文档里写清）、
 16（推荐与一键安装——用户可见行为）
 
-**Status:** ready-for-agent
+**Status:** done
 
-- [ ] §10.6.2 技能来源表更新：内嵌来源移除、`[skills] dir` 覆盖、frontmatter 四键（含
+- [x] §10.6.2 技能来源表更新：内嵌来源移除、`[skills] dir` 覆盖、frontmatter 四键（含
       `disable-model-invocation` 语义）
-- [ ] §10.6.3 `StageAgentConfig` 的技能字段形态更新为混合数组，并补三态渲染说明（目录 / 名字 / 全文）
-- [ ] §10.6.4 合并与校验表更新：技能字段新形态的校验、未信任技能不得全文注入
-- [ ] §10.3 增补 `Skill` 工具与 `spawn_sub_agent` 的说明（含子代理只读工具集、深度一层）
-- [ ] `docs/testing.md` 接缝表增第 6 条：**市场客户端 trait**——本 effort 唯一新接缝，
+- [x] §10.6.3 `StageAgentConfig` 的技能字段形态更新为混合数组，并补三态渲染说明（目录 / 名字 / 全文）
+- [x] §10.6.4 合并与校验表更新：技能字段新形态的校验、未信任技能不得全文注入
+- [x] §10.3 增补 `Skill` 工具与 `spawn_sub_agent` 的说明（含子代理只读工具集、深度一层）
+- [x] `docs/testing.md` 接缝表增第 6 条：**市场客户端 trait**——本 effort 唯一新接缝，
       并写明「技能目录隔离复用 `AGENTPIPELINE_HOME`、技能拉取复用 `LlmClient` / FakeAgent」
-- [ ] `docs/glossary.md` 增补术语：技能目录态 / 名字态 / 全文态、信任标记、只读子代理
-- [ ] `docs/backlog-v2.md` §B.1 的「Skill 与 MCP 的区别」段与技能现状对齐
-- [ ] **决策 172 复核**：确认实现与登记一致，且 47 / 154 / 170 三行的修订标注与实际改动相符；
+- [x] `docs/glossary.md` 增补术语：技能目录态 / 名字态 / 全文态、信任标记、只读子代理
+- [x] `docs/backlog-v2.md` §B.1 的「Skill 与 MCP 的区别」段与技能现状对齐
+- [x] **决策 172 复核**：确认实现与登记一致，且 47 / 154 / 170 三行的修订标注与实际改动相符；
       若有偏差，在 decisions.md 补记（只追加，不改历史行）
-- [ ] 出口控制的**残余风险**写进 `docs/operations.md`（约束不了子进程自行联网；不是安全边界）；
+- [x] 出口控制的**残余风险**写进 `docs/operations.md`（约束不了子进程自行联网；不是安全边界）；
       OS 级沙箱登记为后续决策候选
-- [ ] AGENTS.md 的决策范围引用已更新（`#1–172`）；`.scratch/` effort 的 README 状态与票状态一致
+- [x] AGENTS.md 的决策范围引用已更新（`#1–172`）；`.scratch/` effort 的 README 状态与票状态一致
 
 **Notes（实现提示）:**
 - 本票是收口票，不含新功能；它的价值是防止「实现变了而文档还写着内嵌技能」这类漂移。

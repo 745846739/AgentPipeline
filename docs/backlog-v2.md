@@ -27,6 +27,8 @@ async def build_stage_tools(cfg: StageAgentConfig, baseline: SystemBaseline) -> 
 
 **Skill 与 MCP 的区别：** skill 是注入 prompt 的**知识/流程指引**；MCP 是提供**可调用工具**的外部服务。两者互补：skill 告诉 agent 怎么用，MCP 提供能力。
 
+> **技能现状（2026-09-15 对齐，决策 172 / 181）**：技能的落地形态**不再是「注入 prompt 的一段文本」**——内嵌技能已退场（决策 172①，二进制不含任何正文），来源是**用户 markdown / PATH 工具 / 技能市场**（本地导入 + 远程 registry）；渲染分**三态**（全文 / 名字 / 目录），只有全文态的正文进 system prompt，名字态的正文由 `Skill` 工具（决策 172③）**按需拉取**——`Skill` 因此成了与 MCP 同类的东西：**可调用的能力**，只不过它的返回值是知识而不是动作。上表的 `build_stage_tools` 形态对 MCP 仍成立（MCP 本身仍是 v2 预留）。
+
 ### B.2 对话 agent（自然语言创建 kanban 任务）
 
 v1 不实现。规划形态：复用现有对话窗口（§12.11），新增 `create_task` 工具，把自然语言转成结构化任务（title / description / project_id / depends_on / review_mode），并复用 `POST /tasks` 的全部校验（循环依赖检测、worktree 准入）。v1 仅保留扩展点，不定义模型 / 工具集 / 存储 / UI 归属。

@@ -16,9 +16,23 @@ pub fn run_tokens(run: &NodeRun) -> u64 {
     run.prompt_tokens as u64 + run.completion_tokens as u64
 }
 
-/// 任务累计 token = Σ 所有 run 行（含 system / 子代理 / 伪阶段，决策 100）。
+/// 任务累计 token = Σ 所有 run 行（含 system / 子代理 / 伪阶段，决策 100），
+/// **但排除被续接的历史 run**（决策 180，票 13）。
+///
+/// 续接（`resume_continuation`）会把上一 attempt 的对话重新发一遍，于是历史 run 报过的输入
+/// token 在新 run 里再报一次。上面那条盲求和的规则在续接出现之前是对的；有了续接就要把
+/// 「被后继 run 指为续接来源」的那些排除掉，否则同一个 token 算两遍。
+///
+/// 排除的是**历史那一侧**而不是新 run：新 run 的 `prompt_tokens` 才是当前真实的上下文成本。
 pub fn total_tokens(runs: &[NodeRun]) -> u64 {
-    runs.iter().map(run_tokens).sum()
+    let superseded: std::collections::HashSet<i64> = runs
+        .iter()
+        .filter_map(|r| r.continued_from_run_id)
+        .collect();
+    runs.iter()
+        .filter(|r| !superseded.contains(&r.id))
+        .map(run_tokens)
+        .sum()
 }
 
 /// 任务累计 LLM 调用次数 = 调 LLM 的 run 行数（排除 `agent_type = "system"`，决策 130 ②）。
@@ -272,6 +286,7 @@ mod tests {
             process_group_id: None,
             last_activity_at: None,
             prompt_template_hash: None,
+            continued_from_run_id: None,
             started_at: Utc::now(),
             finished_at: None,
         }
@@ -299,6 +314,7 @@ mod tests {
             process_group_id: None,
             last_activity_at: None,
             prompt_template_hash: None,
+            continued_from_run_id: None,
             started_at: Utc::now(),
             finished_at: None,
         }

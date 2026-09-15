@@ -76,6 +76,7 @@ struct RunRow {
     process_group_id: Option<i64>,
     last_activity_at: Option<String>,
     prompt_template_hash: Option<String>,
+    continued_from_run_id: Option<i64>,
     started_at: String,
     finished_at: Option<String>,
 }
@@ -103,6 +104,7 @@ impl RunRow {
             process_group_id: self.process_group_id.map(|v| v as i32),
             last_activity_at: self.last_activity_at.map(|s| parse_ts(&s)).transpose()?,
             prompt_template_hash: self.prompt_template_hash,
+            continued_from_run_id: self.continued_from_run_id,
             started_at: parse_ts(&self.started_at)?,
             finished_at: self.finished_at.map(|s| parse_ts(&s)).transpose()?,
         })
@@ -112,7 +114,8 @@ impl RunRow {
 const RUN_COLUMNS: &str =
     "id, task_id, cursor_id, project_id, stage, node, attempt, agent_type, parent_run_id, \
      status, prompt_tokens, completion_tokens, cache_read_tokens, cache_write_tokens, duration_ms, \
-     error, process_group_id, last_activity_at, prompt_template_hash, started_at, finished_at";
+     error, process_group_id, last_activity_at, prompt_template_hash, continued_from_run_id, \
+     started_at, finished_at";
 
 impl Store {
     /// 落一行 run（所有节点都落，含 `agent_type = "system"`，决策 99 / 114）。
@@ -745,6 +748,49 @@ impl Store {
         rows.into_iter()
             .map(ConversationRow::into_conversation)
             .collect()
+    }
+
+    /// 某 `(task, stage, node)` 上**主 agent 自己**最近一次的会话行（决策 180，票 13）。
+    ///
+    /// 「自己」由 `agent_type = 'main'` 界定：伪阶段与子代理的 run 复用父节点的 stage/node
+    /// （决策 172 / 票 14），不过滤会把伪阶段的会话当成上一轮对话读回来。
+    ///
+    /// **只看已归档与否不影响取数**：续接要的是「上一 attempt 的 messages」，无论它是否
+    /// 被 `archive_conversations` 标记过（归档是重试路径对**旧尝试**的标记，不是删除）。
+    pub async fn latest_own_conversation(
+        &self,
+        task_id: &str,
+        stage: Stage,
+        node: Node,
+    ) -> Result<Option<NodeConversation>> {
+        let row: Option<ConversationRow> = sqlx::query_as(
+            "SELECT id, task_id, project_id, run_id, stage, node, attempt, agent_type, parent_run_id,
+                    messages_json, metadata_json, prompt_tokens, completion_tokens, created_at,
+                    archived_at
+             FROM kanban_node_conversations
+             WHERE task_id = ? AND stage = ? AND node = ? AND agent_type = 'main'
+             ORDER BY id DESC LIMIT 1",
+        )
+        .bind(task_id)
+        .bind(stage.as_str())
+        .bind(node.as_str())
+        .fetch_optional(self.pool())
+        .await?;
+        row.map(ConversationRow::into_conversation).transpose()
+    }
+
+    /// 记录「本 run 续接了哪条历史 run」（决策 180，票 13）。
+    ///
+    /// 单独一条 UPDATE 而不是往 [`NewRun`] 加字段：续接只发生在主 agent 的
+    /// [`crate::pipeline::executor`] 那一条路径上，其余 20 处构造点（子代理 / 伪阶段 /
+    /// system / 测试）填 `None` 不表达任何信息，改全部构造点是纯噪声。
+    pub async fn link_run_continuation(&self, run_id: i64, from_run_id: i64) -> Result<()> {
+        sqlx::query("UPDATE kanban_node_runs SET continued_from_run_id = ? WHERE id = ?")
+            .bind(from_run_id)
+            .bind(run_id)
+            .execute(self.pool())
+            .await?;
+        Ok(())
     }
 
     /// 某项目的项目级伪阶段会话列表（票 10 / 决策 100）。

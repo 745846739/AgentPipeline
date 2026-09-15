@@ -561,6 +561,8 @@ export interface StageConfig {
   idle_timeout_sec: number | null;
   max_duration_sec: number | null;
   node_overrides_json: unknown | null;
+  /** pending → resume 重入时是否续接上一 attempt 的对话（决策 180）；`null` = 关。 */
+  resume_continuation: boolean | null;
   updated_at: string;
 }
 
@@ -579,6 +581,7 @@ export interface StageConfigPutPayload {
   idle_timeout_sec?: number;
   max_duration_sec?: number;
   node_overrides_json?: unknown;
+  resume_continuation?: boolean;
 }
 
 /* ─────────────── server-info（crates/app/src/routes/server_info.rs，决策 167）─────────────── */
@@ -601,4 +604,82 @@ export interface ServerInfo {
   /** 仅绑定回环时为 true——手机连不上，分享页需给出开启指引。 */
   loopback_only: boolean;
   addresses: ServerAddress[];
+}
+
+/* ─────────────── 技能（crates/app/src/routes/skills.rs，决策 172④⑤ / 票 05 09 11 16）─────────────── */
+
+/** 注入模式（`crates/core/src/agent/skills.rs::SkillMode`）。 */
+export type SkillMode = 'full' | 'name';
+
+/** 显式对象形态的技能声明。 */
+export interface SkillDeclarationObject {
+  name: string;
+  mode: SkillMode;
+  /** 未受信任的技能**不得**以 `full` 保存（票 05 的写入门）。 */
+  trusted: boolean;
+}
+
+/**
+ * `skills_json` 的元素形态（票 05 / 决策 172④）：`string | {name, mode, trusted}`。
+ *
+ * 裸字符串是信任概念出现之前的老写法，按 `{mode: "full", trusted: false}` 解释——
+ * 写回去时必须保持裸字符串，否则会撞上「未信任 + full」的写入门。
+ */
+export type SkillDeclaration = string | SkillDeclarationObject;
+
+/** `GET /skills` 的一项。 */
+export interface SkillSummary {
+  name: string;
+  kind: 'markdown' | 'tool';
+  description: string | null;
+  /** 手动触发型：默认不自动注入（票 16 Notes 的硬约束）。 */
+  disable_model_invocation: boolean;
+  path: string | null;
+  /** 被哪些阶段 / 节点引用（`"阶段 architect-design"` 这类可读串）。 */
+  declared_in: string[];
+}
+
+/** 正文特征命中（票 11 第 ③ 项）：**具体到行**，不是布尔「有风险」。 */
+export interface SkillFeatureHit {
+  kind: 'run_command' | 'network' | 'credentials';
+  label: string;
+  /** 行号（1 起算，对着源文件能直接定位）。 */
+  line: number;
+  text: string;
+}
+
+/** `GET /skills/{name}/preview` 与 `POST /skills/install` 的 `preview` 字段。 */
+export interface SkillPreview {
+  name: string;
+  /** ① 推荐去向。 */
+  recommendations: { stage: string; reason: string }[];
+  /** ② 注入模式与信任态。 */
+  declarations: { declared_in: string; mode: SkillMode; trusted: boolean; bare: boolean }[];
+  /** 尚未被任何配置引用时的默认形态说明。 */
+  defaults: { mode: SkillMode; trusted: boolean; note: string | null };
+  body_available: boolean;
+  /** ③ 正文特征扫描（只用于告知，不参与准入）。 */
+  features: { hits: SkillFeatureHit[]; counts: Record<string, number> };
+  install?: { name: string; description: string | null; sibling_count: number };
+}
+
+/** `GET /skills/recommendations` 的一项推荐技能（票 16）。 */
+export interface RecommendedSkill {
+  name: string;
+  reason: string;
+  installed: boolean;
+  declared_in: string[];
+}
+
+/** 某阶段的推荐清单（票 16）。 */
+export interface RecommendedStage {
+  stage: string;
+  skills: RecommendedSkill[];
+}
+
+/** `POST /skills/install` 的响应。 */
+export interface OneClickInstallResult {
+  skill: { name: string; description: string | null; sibling_count: number };
+  stage_config: StageConfig;
+  preview: SkillPreview;
 }

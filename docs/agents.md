@@ -11,6 +11,8 @@
 3. **validate_input / validate_output 复用同一个 agent，prompt 不同。** 例外：`develop` / `test` 的 validate_output 为纯代码，不调用 agent（决策 62）。
 4. **AGENTS.md 注入位置固定。** 拼入 system prompt，完整段落顺序为 `[基线前言][工作目录][AGENTS.md][persona][技能清单][格式规则]`（工作目录为 G12 的绝对路径段；技能清单承载技能正文，决策 170）；AGENTS.md 不存在时注入非空默认上下文（项目根路径 + 语言/测试框架 + "本仓库无 AGENTS.md"）。固定前缀保证 prompt cache 稳定命中（§12.13.5）。
 
+> **本节之外的两个工具性能力**：`Skill` 工具（按名拉技能正文，决策 172③）与 `spawn_sub_agent`（只读子代理，决策 172③ / 票 08）定义在 §10.2 末尾；`run_command` 的出口策略见 §10.6.4。三者的共同点是**边界落在执行点而不是 tool 定义上**——只限制「广告出去的定义」是纸糊的，模型可以无视定义直接发一次调用。
+
 ### 10.2 Tool 定义
 
 ```python
@@ -737,6 +739,32 @@ interface SystemBaseline {
 
 > **摘要 ≠ 安全**（本票明确不做的部分）：摘要校验**只能**证明「没被改过」，证明不了「内容是善意的」。签名与人工审核队列不在本批——善意性由票 11 的装前预览与信任标记承担。用户若误以为摘要=安全，就会跳过票 11 的预览直接装，所以这条边界写在这里与 `market.rs` 的模块头（错误提示只报事实与动作，不复述这段定位说明）。
 
+**frontmatter 四键**（决策 172，票 02）——`SKILL.md` 的 frontmatter 由文本剥离升级为**解析**，只用四个键，**不引 YAML 依赖**（逐行 `key: value`，值与键都用既有文本口径）：
+
+| 键 | 语义 | 落点 |
+|---|---|---|
+| `description` | 一句话说明 | 目录态渲染成 `- {name}: {description}`（渐进披露的载体） |
+| `disable-model-invocation` | `true` = 手动触发型，**默认不自动注入** | 不进目录态、`Skill` 工具也不给后门。上游 27 个技能里 **14 个**带此键 |
+| `license` | 许可声明（如 `Apache-2.0`） | 只记录不判定——再分发问题由「不内嵌」整体解掉（决策 172①） |
+| `allowed-tools` | 上游规范里的工具授予声明 | **只解析不生效**：本系统没有「工具权限授予」这一层，误当权限会把「声明」读成「授权」 |
+
+`name` 若写了，**必须与所在目录同名**，否则启动 fail fast；未知键忽略（不因内容拒绝任何合法 markdown，决策 172②）。
+
+**装前预览与信任标记**（决策 172④⑤，票 11）——摘要校验只能证明「没被改过」，证明不了「内容是善意的」，故市场准入自带可见性。两个端点共用同一个组装函数（口径一处）：
+
+| 端点 | 场景 |
+|---|---|
+| `GET /skills/{name}/preview` | 已安装技能；技能不在技能根下 → 404 |
+| `POST /skills/preview?name=` | **装前**：请求体是 zip 原始字节（与 `POST /skills/import` 同形态），第 ③ 项扫的是**包里的字节** |
+
+响应恒为三项：**① 推荐去向**（阶段 + 理由，来自 `STAGE_RECOMMENDATIONS`）、**② 注入模式与信任态**（每条引用它的阶段级 / 节点级声明的 `mode` / `trusted` / `bare`；未被引用时给出默认形态与说明）、**③ 正文特征扫描**——`run_command` / 网络调用（`curl` / `wget` / `http(s)://` 字面量 / `fetch(` / `reqwest`）/ 密钥路径（`.env` / `.ssh` / `.pem` / `credentials` / `id_rsa` / `id_ed25519` / `api_key`），**逐行列出**（行号 1 起算 + 该行原文）。
+
+> **③ 是告知，不是准入判定。** 没有任何一条路径会因为扫描命中而拒绝安装：正则既拦不住变形（`c""url`、变量拼接、base64）又会误伤合法技能（`rtk` 正文里有 `curl` 字样）。风险由预览 + 信任标记 + 工具层出口控制（票 12）承担。工具型技能（PATH 可执行文件）没有正文，界面显示「无正文可扫」而不是「未发现特征」——后者是虚假的安心。
+
+**显式信任转换**：`PUT /skills/{name}/trust {"trusted": bool}` 把引用该技能的**每一条**声明（阶段级 + 全部节点级）就地改写，再走 `PUT /stage-configs` 那道校验门落盘（一处不过则一条都不写）。撤销信任撞上 `full` 声明时**拒绝**并给出可操作提示（先把该处改成 `name` 再撤销），**不静默降级**——静默改注入模式会悄悄停掉一个正在生效的知识源。技能未被任何配置引用时返回 `changed: 0` 与说明，不报错。
+
+**阶段推荐与一键安装**（决策 172①，票 16）——推荐清单的投递载体是**界面**：清单是代码内常量（`STAGE_RECOMMENDATIONS`，只放 `阶段 → 技能名 + 理由`，**不内嵌任何正文**），经 `GET /skills/recommendations` 下发并附「装没装」与「被谁引用」，未安装的项界面显示「未安装」而不是报错。筛选判据只有一条硬约束：**不带 `disable-model-invocation`**（手动触发型不该当常驻知识推荐）。`POST /skills/install {stage, name, overwrite}` 把「装到技能根 + 写进该阶段配置」合成一步，**强制不绕过票 11**：写入的声明只能是 `name` 模式 + 未信任，响应体带回完整三项预览。失败四类可归因（技能不存在 404 / 来源未放行 400 / 摘要不符 400 + `detail` / 网络失败 502）。**已安装的技能可直接启用**（票 15 的界面约定）：技能已在技能根里且未显式 `overwrite` 时跳过下载、只写配置，响应里的 `note` 说明未重新下载——同名的字节不被悄悄替换，「已装但没在这个阶段启用」也不再是一条走不通的路。
+
 **三态渲染**（决策 172④，票 05）——`## 已启用技能` 段里的每个技能按下表之一呈现，形态由声明里的 `mode` 决定：
 
 | 形态 | 渲染 | 何时用 |
@@ -793,8 +821,12 @@ interface StageAgentConfig {
       idle_timeout_sec?: number;   // 覆盖全局 node_idle_timeout_sec（决策 66）
       max_duration_sec?: number;   // 覆盖全局 node_max_duration_sec
       skills?: SkillDecl[];        // 该节点专属技能（与阶段级取并集，决策 170；形态同上）
+      resume_continuation?: boolean; // 覆盖阶段级续接开关（决策 180）
     };
   };
+
+  // ── 会话续接（决策 180，票 13）──
+  resume_continuation?: boolean;   // pending → resume 时续接上一 attempt 的对话；默认 false
 }
 
 // 技能声明：裸字符串 = { name, mode: "full", trusted: false }（旧配置行零迁移）
@@ -811,7 +843,10 @@ type SkillDecl = string | { name: string; mode: "full" | "name"; trusted?: boole
 | provider（运行时解析） | `node_overrides > task.model_override > 阶段 provider > 全局默认`（决策 129） | `model_override` 引用的 provider_id 在设置时（`POST /tasks/{id}/model-override`）须过同一校验 |
 | persona | 阶段 prompt + 基线强制前言 | 必须存在且非空 |
 | tools | `基线 mandatory_tools ∪ 阶段 tools − forbidden_tools`；节点存在名字态 / 目录态技能时自动并入 `Skill`（决策 172③，否则那批技能是断腿的指针）。扩展工具 `spawn_sub_agent` 只由阶段声明启用，**且其子代理的工具集固定只读、不继承此处并集**（票 08 的安全边界） | 不能移除 mandatory_tools |
-| skills | `基线 mandatory_skills ∪ 阶段 skills ∪ 节点级 skills`（决策 170，只增不减） | 不能移除 mandatory_skills；引用的 skill 名字必须存在，否则 fail fast；知识型技能的**正文必须存在且非空**，否则 fail fast（与 `persona_path` 同口径） |
+| skills | `基线 mandatory_skills ∪ 阶段 skills ∪ 节点级 skills`（决策 170，只增不减）；同名技能的 `mode` / `trusted` 由更具体的一层决定（节点级覆盖阶段级） | 不能移除 mandatory_skills；引用的 skill 名字必须存在，否则 fail fast；知识型技能的**正文必须存在且非空**，否则 fail fast（与 `persona_path` 同口径）；**未受信任的技能不得以 `full` 保存**（决策 172④）——写入与启动两侧都拒绝，须显式确认信任或改用 `name`。这道门**只对显式对象生效**：裸字符串是信任概念出现之前手写的配置行，一视同仁会使既有配置全部失效（零迁移） |
+| resume_continuation | 节点级 > 阶段级 > **关**（决策 180；照 `idle_timeout_sec` 的分层） | 无——它是一个开关，不改任何既有校验 |
+
+**工具层出口策略（决策 179，票 12）**——`run_command` 的网络出口按 allowlist 放行，**默认只放行回环**（`[pipeline] egress_allow_hosts` / `egress_allow_all`，见 §10.6.5）。它受 `Settings` 控制并经 `ToolExecutor` 的执行点强制，与 §10.6.2 的 `file_tool_policy` 是同构的两件事：**都只约束工具层，都不是系统级沙箱**。被拒的调用落 `kanban_node_commands`（与放行的命令同表）并返回可归因的 `PolicyDenied` 报文。残余风险与 OS 级沙箱候选见 `docs/operations.md` §12.15。
 
 **校验时机：** 启动时（配置加载）一次性校验所有**注册阶段**的阶段配置，**fail fast**——发现违规配置直接拒绝启动并报错，不允许运行时才暴露。伪阶段（`project_analysis` / `conflict_check` / `validator_cross_check`）按各自要求单独校验（决策 87 / 134）：`project_analysis` 的 persona **允许为空**（省略时只输出确定性探测的事实清单，决策 78）；`conflict_check` 必须做语义比对，persona **强制存在且非空**；`validator_cross_check` persona 同样**强制存在且非空**，且 `cross_family_judge = true` 时必须已配置 provider，否则配置加载 fail fast。其余校验（厂商适配器支持、工具并集、超时覆盖）与正式阶段完全一致。
 
@@ -861,6 +896,14 @@ max_concurrent_tasks = 5
 semantic_conflict_check = true
 cross_family_judge = false
 allow_dirty_worktree_merge = false
+
+# run_command 的出口放行主机（决策 179，票 12）。**默认空 = 只放行回环**
+# （localhost / 127.* / ::1）。条目形态：精确主机、`*.example.com`（子域通配，落在点边界上）、
+# `*`。写错在解析期 fail fast。这是「市场下载的技能 + agent 有无限 shell」在工具层的兜底：
+# 只约束 agent 主动经 run_command 发起的调用，**不是安全边界**（残余风险见 §12.15）。
+# egress_allow_hosts = ["api.example.com", "*.internal.example.com"]
+# 显式放行全部出口。默认 false——未配置时不得静默变成「全部放行」。
+# egress_allow_all = false
 
 [logging]
 level = "info"                       # EnvFilter 表达式；非法值回退 info，不阻断启动

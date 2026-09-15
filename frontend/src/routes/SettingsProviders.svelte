@@ -4,14 +4,24 @@
     createProvider,
     deleteProvider,
     deleteStageConfig,
+    installSkillForStage,
     listProviders,
+    listRecommendedSkills,
+    listSkills,
     listStageConfigs,
     putStageConfig,
     updateProvider,
   } from '../api/client';
-  import type { Provider, StageConfig } from '../api/types';
+  import type {
+    Provider,
+    RecommendedStage,
+    SkillPreview,
+    SkillSummary,
+    StageConfig,
+  } from '../api/types';
   import ProviderForm from '../components/settings/ProviderForm.svelte';
   import StageConfigForm from '../components/settings/StageConfigForm.svelte';
+  import StageRecommendations from '../components/settings/StageRecommendations.svelte';
   import {
     API_KEY_MASK,
     buildProviderCreate,
@@ -53,6 +63,54 @@
   let scDeleteBusy = $state<string | null>(null);
   let scRowError = $state<{ stage: string; message: string } | null>(null);
 
+  /* ── 技能目录与推荐（决策 172①④，票 15 / 16）── */
+  let skills = $state<SkillSummary[]>([]);
+  let recommendations = $state<RecommendedStage[]>([]);
+  /** 正在安装的 `阶段:技能名`（按钮上的转圈与禁用）。 */
+  let installing = $state<string | null>(null);
+  let skillError = $state<string | null>(null);
+  /** 最近一次一键安装带回来的三项预览（票 11）。 */
+  let installPreview = $state<SkillPreview | null>(null);
+
+  async function loadSkills() {
+    try {
+      skills = await listSkills();
+    } catch (err) {
+      // 目录取不到不该挡住整页：技能控件退化为「手动输入技能名」
+      skillError = (err as Error).message;
+    }
+  }
+
+  async function loadRecommendations() {
+    try {
+      recommendations = await listRecommendedSkills();
+    } catch (err) {
+      // 推荐清单是锦上添花，取不到就整块不显示（票 16：技能不存在时界面降级）
+      skillError = (err as Error).message;
+      recommendations = [];
+    }
+  }
+
+  /**
+   * 一键安装：装技能 + 写该阶段配置一步完成（票 16）。
+   *
+   * 失败原因由后端分类给出（技能不存在 / 摘要不符 / 来源未放行 / 网络失败），原样回显。
+   * 成功时把 `preview` 交给推荐面板——特征命中当场可见，这是「不绕过票 11 预览」的落点。
+   */
+  async function installRecommended(stage: string, name: string) {
+    installing = `${stage}:${name}`;
+    skillError = null;
+    try {
+      const result = await installSkillForStage(stage, name);
+      installPreview = result.preview;
+      await Promise.all([loadSkills(), loadRecommendations(), loadStageConfigs()]);
+    } catch (err) {
+      skillError = (err as Error).message;
+    } finally {
+      installing = null;
+    }
+  }
+
   /** 每行的掩码状态：密钥已配置显示 `***`，未配置显示「未设置」（决策 112）。 */
   function keyText(p: Provider): string {
     return p.api_key ? API_KEY_MASK : '未设置';
@@ -85,6 +143,8 @@
   onMount(() => {
     void load();
     void loadStageConfigs();
+    void loadSkills();
+    void loadRecommendations();
   });
 
   function openNew() {
@@ -282,6 +342,15 @@
     </div>
   {/if}
 
+  <!-- 推荐技能与一键安装（决策 172①，票 16）：清单来自内置常量，装进来的技能默认未受信任。 -->
+  <StageRecommendations
+    stages={recommendations}
+    busy={installing}
+    preview={installPreview}
+    oninstall={installRecommended}
+  />
+  {#if skillError}<div class="error skills-error">{skillError}</div>{/if}
+
   <!-- stage_configs 编辑器（决策 22 / 46 / 66 / 111 / 129）：GET 列表 / PUT 整条替换 / DELETE 撤销覆盖。 -->
   <div class="sub-head">
     <h2>阶段配置</h2>
@@ -296,6 +365,7 @@
       <StageConfigForm
         config={scEditing.mode === 'edit' ? scEditing.config : null}
         {providers}
+        {skills}
         submitting={scSaving}
         error={scFormError}
         onsubmit={submitStageConfig}
@@ -390,6 +460,15 @@
   }
   .warnnote.inline {
     margin-top: 0;
+  }
+  /* 技能目录 / 推荐清单的失败提示：不挡整页，只提示那一块降级了 */
+  .skills-error {
+    margin-bottom: 14px;
+    padding: 8px 10px;
+    border: 2px solid var(--stop);
+    color: var(--stop);
+    font-size: 12px;
+    line-height: 1.6;
   }
   /* 决策 84：伪阶段用左缘 4px --text-3 亮度阶 + 名称后缀「（伪阶段）」，不用分支色相 */
   .row.pseudo {

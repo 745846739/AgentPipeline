@@ -41,7 +41,7 @@ pub fn routes(state: AppState) -> Router<AppState> {
 ///
 /// 空白名单是**合法配置**（= 不装远程技能），因此这里的报文要说清「怎么开」，
 /// 而不是含糊的「服务器内部错误」。
-fn client(state: &AppState) -> ApiResult<&std::sync::Arc<dyn market::MarketClient>> {
+pub(crate) fn client(state: &AppState) -> ApiResult<&std::sync::Arc<dyn market::MarketClient>> {
     state.market.as_ref().ok_or_else(|| {
         ApiError::bad_request(
             "未配置技能市场来源：请在配置的 [market] allowed_sources 里加入可信来源的 origin\
@@ -146,7 +146,7 @@ pub async fn install(
 /// 分开的意义与 `kind` 本身一致：几种失败对应完全不同的动作。`Error::Market` 的 `raw`
 /// （期望与实际摘要、HTTP 状态、索引片段）经 `with_detail` 作为响应体的 `detail` 字段下发，
 /// 与 `message` 分开——面向用户的话与诊断原始串不该混在一起。
-fn map_market_error(err: agentpipeline_core::Error) -> ApiError {
+pub(crate) fn map_market_error(err: agentpipeline_core::Error) -> ApiError {
     let detail = err.market_kind().map(|(_, raw)| raw.to_string());
     let mapped = match &err {
         agentpipeline_core::Error::Market { kind, message, .. } if kind == market::KIND_NETWORK => {

@@ -924,3 +924,45 @@ async fn concurrent_writers_do_not_fail_with_busy_snapshot() {
         }
     }
 }
+
+// ─────────────── resume 的一次性标记（决策 180，票 13）───────────────
+
+/// 「刚被 resume」标记：只有真翻过一次 pending 的游标才有，且**取走即清零**。
+///
+/// 回归的是一处 SQL 语义陷阱：SQLite 的 `RETURNING` 报的是**更新之后**的值，
+/// 因此 `UPDATE ... SET resumed_from_pending = 0 ... RETURNING resumed_from_pending`
+/// 永远读到 0——续接会静默失效（探针表现为开了开关却读不到上一轮对话，且无任何报错）。
+/// 把「原本为 1」写进 `WHERE` 后按行是否存在判断，才对得上「取走即清零」的语义。
+#[tokio::test]
+async fn resumed_from_pending_flag_is_one_shot() {
+    let (_home, store, _task) = with_task().await;
+    let cursor = store.load_live_cursors("t1").await.unwrap()[0].clone();
+
+    // 没 pending 过：没有标记（对非 pending 游标 clear 是 no-op，不该留下标记）
+    store.clear_cursor_pending(&cursor.cursor_id).await.unwrap();
+    assert!(!store
+        .take_cursor_resumed_from_pending(&cursor.cursor_id)
+        .await
+        .unwrap());
+
+    // 真挂过 pending 再清：第一次取到，第二次清零
+    let reason = PendingReason::new(
+        PendingKind::InfoInsufficient,
+        Stage::Init,
+        Node::Execute,
+        "缺输入",
+    );
+    store
+        .set_cursor_pending(&cursor.cursor_id, &reason)
+        .await
+        .unwrap();
+    store.clear_cursor_pending(&cursor.cursor_id).await.unwrap();
+    assert!(store
+        .take_cursor_resumed_from_pending(&cursor.cursor_id)
+        .await
+        .unwrap());
+    assert!(!store
+        .take_cursor_resumed_from_pending(&cursor.cursor_id)
+        .await
+        .unwrap());
+}

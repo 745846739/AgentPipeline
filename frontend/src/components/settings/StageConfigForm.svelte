@@ -1,13 +1,18 @@
 <script lang="ts">
   import { untrack } from 'svelte';
-  import type { Provider, StageConfig } from '../../api/types';
+  import type { Provider, SkillSummary, StageConfig } from '../../api/types';
   import {
+    SKILL_NODES,
     STAGE_KEYS,
     draftFromStageConfig,
     emptyStageConfigDraft,
+    nodeSkillsFromJson,
     stageKeyLabel,
+    withNodeSkills,
+    type SkillDeclDraft,
     type StageConfigDraft,
   } from '../../lib/stageConfigs';
+  import SkillDeclList from './SkillDeclList.svelte';
 
   /**
    * stage_configs 编辑表单（决策 22 / 46 / 66 / 111 / 129）。
@@ -17,12 +22,14 @@
   interface Props {
     config: StageConfig | null;
     providers: Provider[];
+    /** 可用技能目录（`GET /skills`），技能控件的候选来源。 */
+    skills: SkillSummary[];
     submitting: boolean;
     error: string | null;
     onsubmit: (draft: StageConfigDraft) => void;
     oncancel: () => void;
   }
-  let { config, providers, submitting, error, onsubmit, oncancel }: Props = $props();
+  let { config, providers, skills, submitting, error, onsubmit, oncancel }: Props = $props();
 
   const isNew = untrack(() => config === null);
   let draft = $state<StageConfigDraft>(
@@ -35,6 +42,22 @@
     e.preventDefault();
     localError = null;
     onsubmit(draft);
+  }
+
+  /**
+   * 节点级技能写回 `node_overrides_json` 文本（票 15）。
+   *
+   * 结构化控件与那块自由文本框**共用同一份真相**（那段 JSON 文本）：控件改完立刻回写，
+   * 于是两处不会各说一套。其它键（`idle_timeout_sec` 之类）逐字保留。
+   */
+  function setNodeSkills(node: string, decls: SkillDeclDraft[]) {
+    const result = withNodeSkills(draft.node_overrides_json, node, decls);
+    if (!result.ok) {
+      localError = result.error;
+      return;
+    }
+    localError = null;
+    draft.node_overrides_json = result.text;
   }
 </script>
 
@@ -110,15 +133,36 @@
       ></textarea>
     </label>
 
-    <label class="field">
-      <span>skills_json</span>
-      <textarea
-        class="input mono json"
-        rows="4"
-        bind:value={draft.skills_json}
-        placeholder='["rtk"]'
-      ></textarea>
-    </label>
+    <div class="field wide">
+      <SkillDeclList
+        decls={draft.skills}
+        available={skills}
+        hint="阶段级：本阶段所有节点都会带上（与节点级是并集，只增不减）"
+        onchange={(decls) => (draft.skills = decls)}
+      />
+    </div>
+
+    <div class="field wide nodes">
+      <div class="nodes-head cond">节点级技能</div>
+      <p class="nodes-hint">
+        节点级独立于阶段级：合起来是并集（只增不减）。写作 <code>node_overrides_json[node].skills</code>。
+      </p>
+      {#each SKILL_NODES as node (node)}
+        <div class="node">
+          <SkillDeclList
+            decls={nodeSkillsFromJson(draft.node_overrides_json, node).decls}
+            available={skills}
+            hint={node}
+            onchange={(decls) => setNodeSkills(node, decls)}
+          />
+        </div>
+      {/each}
+      {#if nodeSkillsFromJson(draft.node_overrides_json, SKILL_NODES[0]).error}
+        <p class="nodes-warn">
+          {nodeSkillsFromJson(draft.node_overrides_json, SKILL_NODES[0]).error}
+        </p>
+      {/if}
+    </div>
 
     <label class="field">
       <span>idle_timeout_sec</span>
@@ -128,6 +172,14 @@
     <label class="field">
       <span>max_duration_sec</span>
       <input class="input mono" type="number" min="0" bind:value={draft.max_duration_sec} />
+    </label>
+
+    <label class="field wide check">
+      <input type="checkbox" bind:checked={draft.resume_continuation} />
+      <span>
+        续接上一轮对话（resume_continuation）：pending → resume 重入时读回上一 attempt 的
+        messages。默认关闭——每次尝试干净对话（决策 33 / 180）。
+      </span>
     </label>
 
     <label class="field wide">
@@ -205,6 +257,33 @@
     justify-content: flex-end;
     gap: 8px;
     margin-top: 12px;
+  }
+  .nodes-head {
+    color: var(--text-hi);
+    letter-spacing: 0.08em;
+    margin-bottom: 4px;
+  }
+  .nodes-hint,
+  .nodes-warn {
+    font-size: 12px;
+    color: var(--text-3);
+    line-height: 1.6;
+    margin-bottom: 6px;
+  }
+  .nodes-warn {
+    color: var(--pending);
+  }
+  .node {
+    margin-bottom: 8px;
+  }
+  .check {
+    display: flex;
+    align-items: flex-start;
+    gap: 8px;
+  }
+  .check > span {
+    margin-bottom: 0;
+    line-height: 1.6;
   }
 
   @media (max-width: 479px) {

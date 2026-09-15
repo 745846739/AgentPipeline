@@ -236,6 +236,21 @@ pub struct CompactionOutcome {
 /// - 最近 `keep_recent_rounds` 轮完整保留；
 /// - 更早的轮次按消息形态替换为一行摘要。
 pub fn compact_messages(messages: &[Message], keep_recent_rounds: usize) -> CompactionOutcome {
+    compact_messages_from(messages, keep_recent_rounds, 0)
+}
+
+/// 带「本轮起点」的压缩（决策 180，票 13 必要条件三）。
+///
+/// `current_start` 之下标之前是**载入的历史**（上一 attempt 续接下来的一段），
+/// 它们不得充当「第一条 user 消息」这个锚点：载入历史后那条 user 消息是**上一轮**的提问，
+/// 把它当锚点保下来会占掉 keep 预算，把本轮真正的起点挤成摘要。
+///
+/// `current_start = 0` 时与不带起点完全等价（历史为空）。
+pub fn compact_messages_from(
+    messages: &[Message],
+    keep_recent_rounds: usize,
+    current_start: usize,
+) -> CompactionOutcome {
     if messages.len() <= keep_recent_rounds + 2 {
         return CompactionOutcome {
             messages: messages.to_vec(),
@@ -270,13 +285,19 @@ pub fn compact_messages(messages: &[Message], keep_recent_rounds: usize) -> Comp
     let mut kept: Vec<Message> = Vec::new();
     let mut summary_lines: Vec<String> = Vec::new();
     let mut compacted = 0usize;
+    // 摘要的插入位：本轮第一条 user 之后（没有则末尾）
+    let mut anchor: Option<usize> = None;
 
     for (i, msg) in messages.iter().enumerate() {
-        let must_keep = msg.role == Role::System
-            || (msg.role == Role::User && !kept.iter().any(|m| m.role == Role::User))
-            || i >= keep_from;
+        // 锚点候选：本轮（`i >= current_start`）的第一条 user 消息。载入的历史不算——
+        // 那条是上一轮的提问
+        let is_anchor = msg.role == Role::User && i >= current_start && anchor.is_none();
+        let must_keep = msg.role == Role::System || is_anchor || i >= keep_from;
         if must_keep {
             kept.push(msg.clone());
+            if is_anchor {
+                anchor = Some(kept.len());
+            }
             continue;
         }
         compacted += 1;
@@ -291,13 +312,9 @@ pub fn compact_messages(messages: &[Message], keep_recent_rounds: usize) -> Comp
         format!("[摘要] 已完成的操作：\n{}", summary_lines.join("\n"))
     };
 
-    // 摘要在首条 user 之后、最近轮次之前插入
+    // 摘要在本轮首条 user 之后、最近轮次之前插入
     if !summary.is_empty() {
-        let insert_at = kept
-            .iter()
-            .position(|m| m.role == Role::User)
-            .map(|i| i + 1)
-            .unwrap_or(kept.len());
+        let insert_at = anchor.unwrap_or(kept.len());
         kept.insert(insert_at, Message::user(summary.clone()));
     }
 
@@ -693,6 +710,44 @@ mod tests {
         let out = compact_messages(&messages, 2);
         assert_eq!(out.messages[0].role, Role::System);
         assert_eq!(out.messages[1].role, Role::User);
+        assert!(out.messages[2]
+            .content
+            .as_deref()
+            .unwrap()
+            .starts_with("[摘要]"));
+    }
+
+    /// 载入历史里的 user 消息**不是**本轮的锚点（决策 180，票 13 必要条件三）。
+    ///
+    /// 锚点决定摘要插在哪：插在「本轮第一条 user」之后，本轮的工具往来才能留在摘要之后。
+    /// 续接把上一轮的 messages 载到前面，其中那条 user 消息（若有）会比本轮起点更早，
+    /// 不设边界就会顶掉锚点——本用例把它钉死。
+    ///
+    /// 今天的真线上载入历史里只有 assistant / tool 消息（user prompt 走 `user_prompt`
+    /// 字段，不进 `messages`），故这条边界是**防御性**的：规则本身在此直接钉住，等 `messages`
+    /// 里真出现 user 消息（多轮形态）时立刻生效。
+    #[test]
+    fn l3_anchor_ignores_the_loaded_history_and_takes_the_current_round() {
+        let mut messages = vec![
+            Message::system("sys"),
+            // 载入的历史：上一轮的提问（`current_start = 2` 之前）
+            Message::user("上一轮的提问"),
+            Message::assistant(Some("上一轮的回答".into()), vec![]),
+            // 本轮起点
+            Message::user("本轮提问"),
+        ];
+        for i in 0..8 {
+            messages.push(Message::assistant(Some(format!("r{i}")), vec![]));
+        }
+        let out = compact_messages_from(&messages, 2, 2);
+        assert_eq!(out.messages[0].role, Role::System);
+        assert_eq!(out.messages[1].role, Role::User);
+        assert_eq!(
+            out.messages[1].content.as_deref(),
+            Some("本轮提问"),
+            "锚点须是本轮第一条 user，历史上那条已被压成摘要：{:?}",
+            out.summary
+        );
         assert!(out.messages[2]
             .content
             .as_deref()

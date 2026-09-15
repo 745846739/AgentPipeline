@@ -17,6 +17,10 @@ import type {
   ConnectionTestResult,
   ResumePayload,
   ServerInfo,
+  RecommendedStage,
+  OneClickInstallResult,
+  SkillPreview,
+  SkillSummary,
   StageConfig,
   StageConfigPutPayload,
   TaskDetail,
@@ -338,6 +342,57 @@ export function putStageConfig(
 
 export function deleteStageConfig(stage: string): Promise<void> {
   return request<void>(`/stage-configs/${encodeURIComponent(stage)}`, { method: 'DELETE' });
+}
+
+/* 技能（决策 172④⑤，票 09 / 11 / 16）：清单 / 预览 / 信任转换 / 推荐与一键安装。 */
+
+export function listSkills(): Promise<SkillSummary[]> {
+  return request<{ skills: SkillSummary[] }>('/skills').then((d) => d.skills);
+}
+
+/** 已安装技能的三项预览（推荐去向 / 注入模式与信任态 / 正文特征命中）。 */
+export function previewSkill(name: string): Promise<SkillPreview> {
+  return request<SkillPreview>(`/skills/${encodeURIComponent(name)}/preview`);
+}
+
+/**
+ * 显式信任 / 撤销信任：**按技能名**改写引用它的每一条声明（信任态不另存一份账）。
+ *
+ * 撤销信任撞上全文模式时后端会 400 并给出可操作提示（不静默降级），原样回显即可。
+ *
+ * 与技能控件里的「信任此技能」不是重复：控件一次改**一行**声明（那个阶段 / 节点的），
+ * 本端点一次改**全部**引用（阶段级 + 各节点级），是「整个技能的口径」这个动作。
+ */
+export function setSkillTrust(
+  name: string,
+  trusted: boolean,
+): Promise<{ name: string; trusted: boolean; changed: number; updated_stages: string[]; note: string | null }> {
+  return request(`/skills/${encodeURIComponent(name)}/trust`, {
+    method: 'PUT',
+    body: { trusted },
+  });
+}
+
+/** 各阶段的推荐技能清单（含「装没装」），未安装的项由界面显示「未安装」。 */
+export function listRecommendedSkills(): Promise<RecommendedStage[]> {
+  return request<{ stages: RecommendedStage[] }>('/skills/recommendations').then((d) => d.stages);
+}
+
+/**
+ * 一键安装：技能落到技能根 **且** 写进该阶段配置（一步完成）。
+ *
+ * 失败可归因：技能不存在 → 404、来源未放行 → 400、摘要不符 → 400（带 `detail`）、
+ * 网络失败 → 502。响应里的 `preview` 是票 11 的三项预览，界面据此把特征命中摆给用户看。
+ */
+export function installSkillForStage(
+  stage: string,
+  name: string,
+  overwrite = false,
+): Promise<OneClickInstallResult> {
+  return request<OneClickInstallResult>('/skills/install', {
+    method: 'POST',
+    body: { stage, name, overwrite },
+  });
 }
 
 /* server-info（决策 167）：局域网分享地址枚举与二维码。 */

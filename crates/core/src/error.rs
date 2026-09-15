@@ -21,8 +21,12 @@ pub enum Error {
     #[error("git 错误：{0}")]
     Git(String),
 
-    /// FileToolPolicy 拒绝（决策 104）。不是系统级沙箱，只约束文件工具。
-    #[error("文件工具策略拒绝：{0}")]
+    /// 策略拒绝：文件工具路径（决策 104）与 `run_command` 出口（决策 179，票 12）。
+    ///
+    /// **不是系统级沙箱**：文件侧只约束 6 个文件工具，出口侧只约束 agent 经 `run_command`
+    /// 主动发起的调用（子进程自行联网管不住）。两处都是「让直白动作可见、可拦」，
+    /// 不是边界保证——残余风险见 `docs/operations.md` §12.15。
+    #[error("策略拒绝：{0}")]
     PolicyDenied(String),
 
     /// 需要显式 cursor_id 但缺失/歧义（决策 91）→ API 层映射为 409。
