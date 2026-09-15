@@ -367,3 +367,26 @@ export function parallelBlockerRounds(): NodeScript {
     [NODE.testDesignVI]: [[submit(ValidateInput(false, ['tst 缺性能场景-mark-09c']))]],
   };
 }
+
+/* ─────────────────────────────── 值班长 / 对讲台（票 03 / 04）─────────────────────────────── */
+
+/**
+ * 值班长的脚本槽（对应 testkit 的 `Script::for_foreman()`）：**按「轮」投喂**，
+ * 一轮 = 一次回话。
+ *
+ * 与节点脚本的区别在 mock 的轮判定上：节点用 `messages.length <= 2`（system + user）
+ * 认「新一轮节点运行」，而值班长的每轮请求都带同一段态势快照前言 + 历史对话，
+ * 数量不固定，故 mock 改按「最后一条消息是 user」认新轮——同一次回话里的工具往返
+ * 以 tool 结尾，不会被误判成新轮（否则一次查台账就吃掉下一轮的步骤）。
+ */
+export const FOREMAN = 'foreman';
+
+/** 值班长的两个只读工具（`FOREMAN_TOOLS`）：与真实人格同一张表，多一个都不给。 */
+export const readTask = (taskId: string): Step => tool('read_task', { task_id: taskId });
+export const readConversation = (taskId: string, runId?: number): Step =>
+  tool('read_conversation', { task_id: taskId, run_id: runId ?? null });
+
+/** 值班长脚本，可直接铺进 NodeScript：`{ ...designRounds(), ...foremanScript([[text('…')]]) }`。 */
+export function foremanScript(rounds: Step[][]): NodeScript {
+  return { [FOREMAN]: rounds };
+}

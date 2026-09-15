@@ -4,12 +4,17 @@
 //! - 路由构建与二进制启动分离——L3 测试用 tower oneshot 直接打 in-process router，不 spawn 二进制
 //!   （决策 144）；
 //! - 跨源防护中间件（决策 128）：只拦写请求；SSE 是纯 GET，不受影响；
+//! - 对端地址层（决策 182 / 票 06）：把连接信息归一成 [`peer::PeerAddr`]，排在跨源防护
+//!   之前，供票 07 判定「仅回环可读」；
+//! - 配对令牌层（决策 182㉖㉗㉘ / 票 07）：只在局域网形态拦写请求与 `/foreman/*`，
+//!   排在最后（内层），回环来源豁免；
 //! - 前端 dist 由 build.rs 内嵌并同源托管（决策 155）；dist 缺失时退化为构建提示页；
 //! - `/server-info` 暴露局域网访问地址与二维码（决策 167），供手机扫码接入；
 //! - `api_key` 读接口只回显 `***`（决策 112）。
 
 pub mod assets;
 pub mod lan;
+pub mod peer;
 pub mod routes;
 pub mod runtime;
 pub mod serve;
@@ -97,6 +102,12 @@ pub fn build_router(state: AppState) -> Router {
         )
         // ── 全局指标 ──
         .route("/metrics", get(routes::tasks::global_metrics))
+        // ── 对讲台（决策 182，票 01 / 03）──
+        // 三个端点全部任务无关、项目无关：值班长在首启空 home 上也要答得上话。
+        // 这里**没有任何写动作**——它只说话，动手的键仍在任务详情里由后端下发（决策 101）。
+        .route("/foreman/session", get(routes::foreman::session))
+        .route("/foreman/messages", post(routes::foreman::send))
+        .route("/foreman/stream", get(routes::foreman::stream))
         // ── 技能市场（决策 172⑤，票 09）：本地导入 / 目录扫描 / 卸载。全程离线 ──
         // 子 router 自带 state（import 路由要单独放宽请求体上限），故先 merge 再进防护层。
         .merge(routes::skills::routes(state.clone()))
@@ -106,10 +117,28 @@ pub fn build_router(state: AppState) -> Router {
         // ── 服务自述与局域网分享（决策 167）：纯 GET，无状态变更 ──
         .route("/server-info", get(routes::server_info::info))
         .route("/server-info/qr.svg", get(routes::server_info::qr_svg))
+        // ── 配对（决策 182㉖㉗㉘，票 07）──
+        // 读取口自己判来源是否回环（局域网来源 403）；重置是写请求，局域网形态下由
+        // pairing_guard 护住、回环豁免（丢了令牌必须还能从本机复位）。
+        .route("/pairing/token", get(routes::pairing::token))
+        .route("/pairing/reset", post(routes::pairing::reset))
+        // 配对令牌层（决策 182㉖㉗㉘，票 07）：**必须最后执行**（最内层）——它要读
+        // peer_address 归一后的来源地址，且排在跨源防护之后，只处理已过跨源判定的请求。
+        // axum 的 `Router::layer` 后挂者在外、先执行，故它登记在 cross_origin_guard 之前。
+        .layer(axum::middleware::from_fn_with_state(
+            state.clone(),
+            stream::pairing_guard,
+        ))
         .layer(axum::middleware::from_fn_with_state(
             state.clone(),
             stream::cross_origin_guard,
         ))
+        // 对端地址层（决策 182 / 票 06）：必须在跨源防护**之前**运行——票 07 的配对
+        // 令牌与「仅回环可读」的读取端点都要按来源地址判定（决策 167）。axum 的
+        // `Router::layer` 逐个包裹已登记的路由，后挂的层在外、先于先挂的执行，故它只能
+        // 写在 cross_origin_guard **之后**（写在之前会被后者包在里面、后于它执行）。
+        // 与防护层同样登记在 `merge(assets::static_routes())` 之前 → 覆盖面一致。
+        .layer(axum::middleware::from_fn(peer::peer_address))
         // 前端静态资源同源托管（决策 155）：放在防护层之后注册——全 GET/HEAD，
         // 防护只拦写请求，静态路由不进跨源矩阵。
         .merge(assets::static_routes())

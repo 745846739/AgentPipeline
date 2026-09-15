@@ -121,9 +121,15 @@ impl KanbanScheduler {
     /// 小时级维护：会话清理 + 指标聚合（决策 55）。
     pub async fn maintenance(&self) -> Result<MaintenanceReport> {
         let purged = self.purge_expired_conversations().await?;
+        // 值班长对话走**同一个保留天数**（票 05 / 决策 182）：对讲台不做全仓唯一一张
+        // 不设保留期的表。两者分开计数，使维护报告说得出清掉的是哪一类。
+        let cutoff =
+            self.clock.now() - Duration::days(self.settings.conversation_retention_days as i64);
+        let purged_foreman = self.store.purge_foreman_messages(cutoff).await?;
         let aggregated = self.aggregate_node_metrics().await?;
         Ok(MaintenanceReport {
             purged_conversations: purged,
+            purged_foreman_messages: purged_foreman,
             aggregated_tasks: aggregated,
         })
     }
@@ -531,6 +537,9 @@ impl KanbanScheduler {
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct MaintenanceReport {
     pub purged_conversations: usize,
+    /// 被保留期清掉的值班长会话行（票 05）。与上一项分开计数——它们挂在不同表上，
+    /// 混成一个数就看不出是哪一类在增长。
+    pub purged_foreman_messages: usize,
     pub aggregated_tasks: usize,
 }
 

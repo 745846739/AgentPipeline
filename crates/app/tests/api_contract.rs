@@ -4,22 +4,26 @@
 //! 覆盖：端点契约、跨源防护矩阵（决策 128）、api_key 回显（决策 112）、
 //! resume 游标解析（决策 91）与防连点、merge/decision（决策 119）、人工评审（决策 2）。
 
+use std::net::SocketAddr;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 
+use agentpipeline_core::agent::client::LlmClient;
 use agentpipeline_core::agent::market::MarketClient;
 use agentpipeline_core::agent::tools::CommandRecorder;
 use agentpipeline_core::config::Settings;
+use agentpipeline_core::pipeline::ForemanRunner;
 use agentpipeline_core::sse::{SseEvent, SseEventType};
 use agentpipeline_core::types::{Provider, ReviewMode, Stage, TaskStatus};
 use app::{build_router, AppState};
 use axum::body::Body;
+use axum::extract::ConnectInfo;
 use axum::http::{header, Request, StatusCode};
 use axum::Router;
-use serde_json::Value;
+use serde_json::{json, Value};
 use testkit::{
     entry, entry_with_wrong_digest, seed_project, seed_task, seed_task_full, skill_zip,
-    write_skill_dir, zip_bytes, FakeMarket, Repo, TestHome,
+    write_skill_dir, zip_bytes, FakeAgent, FakeMarket, Repo, Script, TestHome,
 };
 use tower::ServiceExt;
 
@@ -63,6 +67,20 @@ async fn api_full(
     market: Option<Arc<dyn MarketClient>>,
     market_sources: Vec<String>,
 ) -> Api {
+    api_full_bind(settings, extra_origins, market, market_sources, "127.0.0.1").await
+}
+
+/// 指定绑定 host 的 harness。
+///
+/// `bind_host` 决定 `AppState::lan_mode()`——票 07 的配对令牌只在该形态下生效。
+/// 默认 harness（127.0.0.1）必须保持「不要求配对」，故这里显式传入缺省值。
+async fn api_full_bind(
+    settings: Settings,
+    extra_origins: Vec<String>,
+    market: Option<Arc<dyn MarketClient>>,
+    market_sources: Vec<String>,
+    bind_host: &str,
+) -> Api {
     let home = TestHome::new().unwrap();
     let (store, _clock) = home.setup().await.unwrap();
     let repo = Repo::clean().unwrap();
@@ -91,6 +109,7 @@ async fn api_full(
             hook_resumes.fetch_add(1, Ordering::SeqCst);
         }))
         .with_allowed_origins(extra_origins)
+        .with_bind_host(bind_host)
         .with_market(market, market_sources);
     let router = build_router(state.clone());
     Api {
@@ -100,6 +119,21 @@ async fn api_full(
         router,
         resumes,
     }
+}
+
+/// 局域网形态 harness（票 07）：绑 0.0.0.0 → 配对令牌生效。
+async fn api_lan() -> Api {
+    api_full_bind(
+        Settings {
+            pending_resume_cooldown_sec: 5,
+            ..Default::default()
+        },
+        Vec::new(),
+        None,
+        Vec::new(),
+        "0.0.0.0",
+    )
+    .await
 }
 
 fn request(method: &str, uri: &str) -> axum::http::request::Builder {
@@ -1226,6 +1260,287 @@ async fn cross_origin_guard_matrix() {
         status,
         StatusCode::OK,
         "SSE / GET 不受跨源防护影响（决策 128）"
+    );
+}
+
+/// 票 06：对端地址层（决策 182）不得改变既有端点行为。注入 `ConnectInfo`（模拟局域网
+/// 客户端）后，只读 GET 照常 200、恶意 Origin 照常 403——跨源矩阵（决策 128）逐字不变。
+#[tokio::test]
+async fn peer_address_layer_does_not_change_existing_endpoints() {
+    let api = api().await;
+    seed(&api, "t1").await;
+
+    // ① 只读 GET 带来源地址 → 仍是 200
+    let mut req = request("GET", "/tasks").body(Body::empty()).unwrap();
+    req.extensions_mut()
+        .insert(ConnectInfo(std::net::SocketAddr::from((
+            [192, 168, 1, 50],
+            40000,
+        ))));
+    let response = api.router.clone().oneshot(req).await.unwrap();
+    assert_eq!(
+        response.status(),
+        StatusCode::OK,
+        "对端地址层不应影响 GET /tasks"
+    );
+
+    // ② 写请求带伪造 Origin + 来源地址 → 仍被跨源防护 403
+    let mut req = request("POST", "/tasks/t1/retry")
+        .header(header::ORIGIN, "http://evil.example")
+        .header(header::CONTENT_TYPE, "application/json")
+        .body(Body::from("{}"))
+        .unwrap();
+    req.extensions_mut()
+        .insert(ConnectInfo(std::net::SocketAddr::from((
+            [192, 168, 1, 50],
+            40000,
+        ))));
+    let response = api.router.clone().oneshot(req).await.unwrap();
+    assert_eq!(
+        response.status(),
+        StatusCode::FORBIDDEN,
+        "跨源防护矩阵不变（决策 128）"
+    );
+}
+
+// ─────────────────── 配对令牌（决策 182㉖㉗㉘，票 07）───────────────────
+//
+// 令牌只在**局域网绑定**下生效；本机（回环绑定或回环来源）零摩擦。契约测试用
+// `ConnectInfo` 注入来源地址（票 06 的手法）模拟手机，用 `api_lan()` 模拟 `0.0.0.0` 绑定。
+
+/// 局域网来源的写请求（可带配对令牌）。
+fn lan_write(uri: &str, token: Option<&str>) -> Request<Body> {
+    let mut builder = request("POST", uri).header(header::CONTENT_TYPE, "application/json");
+    if let Some(token) = token {
+        builder = builder.header("X-AgentPipeline-Token", token);
+    }
+    let mut req = builder.body(Body::from("{}")).unwrap();
+    req.extensions_mut()
+        .insert(ConnectInfo(SocketAddr::from(([192, 168, 1, 50], 40000))));
+    req
+}
+
+/// 局域网来源的 GET（可带配对令牌）。
+fn lan_get(uri: &str, token: Option<&str>) -> Request<Body> {
+    let mut builder = request("GET", uri);
+    if let Some(token) = token {
+        builder = builder.header("X-AgentPipeline-Token", token);
+    }
+    let mut req = builder.body(Body::empty()).unwrap();
+    req.extensions_mut()
+        .insert(ConnectInfo(SocketAddr::from(([192, 168, 1, 50], 40000))));
+    req
+}
+
+/// 回环来源的写请求（局域网形态下也存在的「本机访问」）。
+fn loopback_write(uri: &str) -> Request<Body> {
+    let mut req = request("POST", uri)
+        .header(header::CONTENT_TYPE, "application/json")
+        .body(Body::from("{}"))
+        .unwrap();
+    req.extensions_mut()
+        .insert(ConnectInfo(SocketAddr::from(([127, 0, 0, 1], 51234))));
+    req
+}
+
+/// 从本机读取当前令牌（读取口仅回环可读）。
+async fn loopback_token(api: &Api) -> String {
+    let (status, body) = get(api, "/pairing/token").await;
+    assert_eq!(status, StatusCode::OK, "本机应能读到令牌：{body}");
+    body["token"].as_str().expect("应返回 token").to_string()
+}
+
+#[tokio::test]
+async fn pairing_lan_loopback_peer_is_exempt() {
+    // 回环豁免：局域网形态下，从本机发出的写请求不要求配对（本机零摩擦）。
+    let api = api_lan().await;
+    seed(&api, "t1").await;
+
+    let response = api
+        .router
+        .clone()
+        .oneshot(loopback_write("/tasks/t1/retry"))
+        .await
+        .unwrap();
+    assert_ne!(
+        response.status(),
+        StatusCode::FORBIDDEN,
+        "回环来源免配对（票 07）"
+    );
+}
+
+#[tokio::test]
+async fn pairing_lan_peer_without_token_is_rejected() {
+    let api = api_lan().await;
+    seed(&api, "t1").await;
+
+    // 写请求：无令牌 → 403
+    let response = api
+        .router
+        .clone()
+        .oneshot(lan_write("/tasks/t1/retry", None))
+        .await
+        .unwrap();
+    let (status, body) = json_body(response).await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
+    assert!(
+        body["error"].as_str().unwrap().contains("配对"),
+        "报文应告诉用户去配对：{body}"
+    );
+
+    // 工头端点是 GET 也要令牌（决策 182㉘：「花钱要凭据」不看请求方法）
+    let response = api
+        .router
+        .clone()
+        .oneshot(lan_get("/foreman/session", None))
+        .await
+        .unwrap();
+    let (status, body) = json_body(response).await;
+    assert_eq!(
+        status,
+        StatusCode::FORBIDDEN,
+        "局域网读工头会话也需令牌：{body}"
+    );
+}
+
+#[tokio::test]
+async fn pairing_lan_peer_with_token_passes() {
+    let api = api_lan().await;
+    seed(&api, "t1").await;
+    let token = loopback_token(&api).await;
+
+    let response = api
+        .router
+        .clone()
+        .oneshot(lan_write("/tasks/t1/retry", Some(&token)))
+        .await
+        .unwrap();
+    assert_ne!(
+        response.status(),
+        StatusCode::FORBIDDEN,
+        "带正确令牌的写请求应放行"
+    );
+
+    // 工头端点：未接线时是 503，但绝不能是 403——配对层已放行
+    let response = api
+        .router
+        .clone()
+        .oneshot(lan_get("/foreman/session", Some(&token)))
+        .await
+        .unwrap();
+    assert_ne!(
+        response.status(),
+        StatusCode::FORBIDDEN,
+        "带令牌的工头 GET 不该被配对层拦"
+    );
+}
+
+#[tokio::test]
+async fn pairing_lan_read_only_get_is_not_guarded() {
+    let api = api_lan().await;
+    seed(&api, "t1").await;
+
+    let response = api
+        .router
+        .clone()
+        .oneshot(lan_get("/tasks", None))
+        .await
+        .unwrap();
+    assert_eq!(
+        response.status(),
+        StatusCode::OK,
+        "只读页照旧可直接分享（看的随便看）"
+    );
+
+    let response = api
+        .router
+        .clone()
+        .oneshot(lan_get("/server-info", None))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+}
+
+#[tokio::test]
+async fn pairing_token_endpoint_is_readable_only_over_loopback() {
+    let api = api_lan().await;
+
+    let response = api
+        .router
+        .clone()
+        .oneshot(lan_get("/pairing/token", None))
+        .await
+        .unwrap();
+    let (status, body) = json_body(response).await;
+    assert_eq!(
+        status,
+        StatusCode::FORBIDDEN,
+        "局域网客户端读不到令牌：{body}"
+    );
+
+    assert!(!loopback_token(&api).await.is_empty(), "回环可读到非空令牌");
+}
+
+#[tokio::test]
+async fn pairing_reset_rotates_and_old_token_stops_working() {
+    let api = api_lan().await;
+    seed(&api, "t1").await;
+    let old = loopback_token(&api).await;
+
+    // 回环豁免使「丢了令牌」也能从本机一键重置
+    let response = api
+        .router
+        .clone()
+        .oneshot(loopback_write("/pairing/reset"))
+        .await
+        .unwrap();
+    let (status, body) = json_body(response).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let new = body["token"]
+        .as_str()
+        .expect("重置应返回新令牌")
+        .to_string();
+    assert_ne!(old, new, "重置必须换令牌");
+
+    let response = api
+        .router
+        .clone()
+        .oneshot(lan_write("/tasks/t1/retry", Some(&old)))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::FORBIDDEN, "旧令牌立即失效");
+
+    let response = api
+        .router
+        .clone()
+        .oneshot(lan_write("/tasks/t1/retry", Some(&new)))
+        .await
+        .unwrap();
+    assert_ne!(response.status(), StatusCode::FORBIDDEN, "新令牌可用");
+
+    assert_eq!(loopback_token(&api).await, new, "读取端点回显同一枚令牌");
+}
+
+#[tokio::test]
+async fn pairing_default_loopback_bind_requires_no_token() {
+    // 默认回环形态 = 本机零摩擦（票 07 的验收项），也证明既有行为矩阵未被改动。
+    let api = api().await;
+    seed(&api, "t1").await;
+
+    let (status, _) = post(&api, "/tasks/t1/retry", serde_json::json!({})).await;
+    assert_ne!(status, StatusCode::FORBIDDEN, "回环绑定不要求配对");
+
+    // 令牌只在**绑定形态**下生效：即使来源地址是局域网，回环绑定也不启用它。
+    let response = api
+        .router
+        .clone()
+        .oneshot(lan_write("/tasks/t1/retry", None))
+        .await
+        .unwrap();
+    assert_ne!(
+        response.status(),
+        StatusCode::FORBIDDEN,
+        "非 LAN 绑定下令牌不生效"
     );
 }
 
@@ -2512,6 +2827,63 @@ async fn qr_svg_rejects_arbitrary_urls() {
     )
     .await;
     assert_eq!(status, 400, "外部 URL 必须被拒绝：{body}");
+}
+
+/// 把 URL 值编码进查询串（只覆盖这些用例用到的字符集）。
+fn encode_query_value(raw: &str) -> String {
+    raw.chars()
+        .map(|c| match c {
+            ':' => "%3A".to_string(),
+            '/' => "%2F".to_string(),
+            '?' => "%3F".to_string(),
+            '=' => "%3D".to_string(),
+            '&' => "%26".to_string(),
+            _ => c.to_string(),
+        })
+        .collect()
+}
+
+async fn qr_status(api: &Api, url: &str) -> StatusCode {
+    let (status, _) = get(
+        api,
+        &format!("/server-info/qr.svg?url={}", encode_query_value(url)),
+    )
+    .await;
+    status
+}
+
+#[tokio::test]
+async fn qr_svg_accepts_whitelisted_origin_with_query() {
+    // 配对 URL（origin + ?pair=）必须能编码成二维码：扫码是手机加入的唯一入口
+    let api = api().await;
+    let paired =
+        app::routes::server_info::pairing_url(&format!("http://127.0.0.1:{PORT}"), "PAIRTOKEN");
+    assert_eq!(
+        qr_status(&api, &paired).await,
+        StatusCode::OK,
+        "白名单 origin 追加 query 应放行（票 07 放宽）"
+    );
+}
+
+#[tokio::test]
+async fn qr_svg_rejects_whitelisted_origin_with_wrong_port() {
+    let api = api().await;
+    let wrong_port = format!("http://127.0.0.1:{}", PORT + 1);
+    assert_eq!(
+        qr_status(&api, &wrong_port).await,
+        StatusCode::BAD_REQUEST,
+        "同主机不同端口是不同 origin"
+    );
+}
+
+#[tokio::test]
+async fn qr_svg_rejects_external_origin_with_query() {
+    let api = api().await;
+    assert_eq!(
+        qr_status(&api, "http://evil.example/?pair=abc").await,
+        StatusCode::BAD_REQUEST,
+        "外站 origin 即便带 query 也必须拒绝"
+    );
 }
 
 #[tokio::test]
@@ -3837,4 +4209,253 @@ async fn disabling_a_recommended_skill_removes_it_from_the_stage_config() {
         agentpipeline_core::config::declared_skill_decls(&stored).is_empty(),
         "停用后配置行里不应再有该技能"
     );
+}
+
+// ─────────────────────────── 对讲台（决策 182，票 01 / 03）───────────────────────────
+
+/// 对讲台 harness：注入 `FakeAgent` + `ForemanRunner`（决策 182：缺省 `None` 时
+/// 三个端点返回 503，故契约测试必须显式接线）。
+///
+/// 与 `api_full` 一样**不建项目、不建任务**——本特性最初的诉求就是
+/// 「对话不需要依赖任务」，契约层的锚点因此是**空 home 下三个端点都可用**。
+async fn api_with_foreman(agent: FakeAgent) -> Api {
+    api_full_with_foreman(
+        Settings {
+            pending_resume_cooldown_sec: 5,
+            ..Default::default()
+        },
+        Some(agent),
+    )
+    .await
+}
+
+async fn api_full_with_foreman(settings: Settings, agent: Option<FakeAgent>) -> Api {
+    let home = TestHome::new().unwrap();
+    let (store, _clock) = home.setup().await.unwrap();
+    let repo = Repo::clean().unwrap();
+    // 配一个 provider：值班长的 provider 解析要落到一个真实存在的行上
+    // （「不配置也能用」指的是**阶段配置**缺行，不是连 provider 都没有）。
+    store
+        .upsert_provider(&Provider {
+            id: "p-default".into(),
+            vendor: "deepseek".into(),
+            model: "deepseek-chat".into(),
+            context_window: 64_000,
+            base_url: None,
+            api_key: Some("sk-super-secret-value-123456".into()),
+            enabled: true,
+            created_at: store.now(),
+            updated_at: store.now(),
+        })
+        .await
+        .unwrap();
+
+    let resumes = Arc::new(AtomicUsize::new(0));
+    let hook_resumes = resumes.clone();
+    let state = AppState::new(store, home.home().clone(), settings, PORT).with_resume_hook(
+        Arc::new(move |_task_id| {
+            hook_resumes.fetch_add(1, Ordering::SeqCst);
+        }),
+    );
+    // 先取好 runner 需要的三个句柄，再消费 `state`——`with_foreman` 会拿走 state，
+    // 在它的实参位置里读 `state.home` 是「移动后借用」。
+    let state = match agent {
+        Some(agent) => {
+            let runner = Arc::new(ForemanRunner::new(
+                state.store.clone(),
+                state.settings.clone(),
+                state.home.clone(),
+                Arc::new(agent) as Arc<dyn LlmClient>,
+            ));
+            state.with_foreman(runner)
+        }
+        None => state,
+    };
+    let router = build_router(state.clone());
+    Api {
+        _home: home,
+        _repo: repo,
+        state,
+        router,
+        resumes,
+    }
+}
+
+/// 空 home 下读会话：形状完整、合计为 0、不报错。
+#[tokio::test]
+async fn foreman_session_is_available_on_an_empty_home() {
+    let api = api_with_foreman(FakeAgent::new(Script::new())).await;
+    let (status, body) = get(&api, "/foreman/session").await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["messages"].as_array().unwrap().len(), 0);
+    assert_eq!(body["total_tokens"], 0);
+    assert_eq!(body["total_calls"], 0);
+    // 身份回执：前端据此确认「对面是谁」，也让人一眼看出这一版有没有接线。
+    assert_eq!(body["foreman"]["agent_type"], "foreman");
+    assert_eq!(body["foreman"]["stage_key"], "foreman");
+    assert_eq!(body["foreman"]["wired"].as_bool(), Some(true));
+}
+
+/// 空 home 下发一句话、拿到回话——**本 spec 的验收锚点**。
+#[tokio::test]
+async fn empty_home_can_converse_through_the_api() {
+    let mut script = Script::new();
+    script
+        .for_foreman()
+        .text("现在什么都没有在跑。先建一个项目，再建任务。");
+    let api = api_with_foreman(FakeAgent::new(script)).await;
+
+    let (status, body) = post(&api, "/foreman/messages", json!({"text": "现在能做什么？"})).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert!(body["reply"].as_str().unwrap().contains("先建一个项目"));
+    // 回话行带 id / 时间戳（由落库产生），前端据此做稳定 key。
+    assert!(body["message"]["id"].as_i64().unwrap() > 0);
+    assert_eq!(body["message"]["role"], "assistant");
+    // 空 home 的快照也落库了（审计：它当时看到的是「什么都没有」这份读数）。
+    assert!(body["message"]["briefing"].is_object());
+    assert_eq!(
+        body["message"]["briefing"]["projects"]
+            .as_array()
+            .unwrap()
+            .len(),
+        0
+    );
+    // 会话合计随之上来——对讲台自报「本次会话 N tok」的来源。
+    assert!(body["total_tokens"].as_u64().unwrap() > 0);
+    assert_eq!(body["total_calls"], 1);
+
+    // 再读一次会话：两句都在，人先说、值班长后答。
+    let (status, body) = get(&api, "/foreman/session").await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let messages = body["messages"].as_array().unwrap();
+    assert_eq!(messages.len(), 2);
+    assert_eq!(messages[0]["role"], "user");
+    assert_eq!(messages[0]["content"], "现在能做什么？");
+    assert_eq!(messages[1]["role"], "assistant");
+    assert!(messages[1]["content"]
+        .as_str()
+        .unwrap()
+        .contains("先建一个项目"));
+}
+
+/// 未接线时是 503 而不是 500：服务是好的，是这个能力这次没被接上。
+#[tokio::test]
+async fn foreman_endpoints_report_503_when_unwired() {
+    let api = api_full(Settings::default(), Vec::new(), None, Vec::new()).await;
+    let (status, body) = get(&api, "/foreman/session").await;
+    // 读会话不依赖 runner（它直接读表），故仍应 200——接线与否只影响「能不能说话」。
+    assert_eq!(status, StatusCode::OK, "{body}");
+
+    let (status, body) = post(&api, "/foreman/messages", json!({"text": "在吗"})).await;
+    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{body}");
+    assert!(body["error"].as_str().unwrap().contains("未接线"));
+}
+
+/// 空消息被拒且不入账（400，不是 500）。
+#[tokio::test]
+async fn foreman_rejects_an_empty_message() {
+    let api = api_with_foreman(FakeAgent::new(Script::new())).await;
+    let (status, body) = post(&api, "/foreman/messages", json!({"text": "   "})).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    let (_, body) = get(&api, "/foreman/session").await;
+    assert_eq!(body["messages"].as_array().unwrap().len(), 0);
+}
+
+/// 流式端点真的把值班长的增量送到订阅者手上（票 03）。
+///
+/// 与任务级 SSE 的测法不同：工头事件的 `task_id` 是空串，**没有** `/tasks/{id}/stream`
+/// 能订阅它，故这里直接订阅 `SseBus`——它同时证明了「复用同一条总线」这个实现选择
+/// （决策 182⑥：不新增事件变体，加一条按身份过滤的路由）。
+#[tokio::test]
+async fn foreman_stream_carries_conversation_deltas_to_subscribers() {
+    let api = api_with_foreman(FakeAgent::new(Script::new())).await;
+    let mut rx = api.state.sse.subscribe();
+
+    // 直接发一条工头增量（生产里由适配器在流式回话时发）。
+    api.state.sse.publish(SseEvent::ConversationDelta {
+        task_id: String::new(),
+        branch: String::new(),
+        run_id: 0,
+        agent_type: "foreman".into(),
+        role: "assistant".into(),
+        text: "半句话".into(),
+        prompt_tokens: 7,
+        completion_tokens: 3,
+    });
+    // 一条任务事件混在同一条总线上——它不该被工头过滤放行。
+    api.state.sse.publish(SseEvent::ConversationDelta {
+        task_id: "t-other".into(),
+        branch: "main".into(),
+        run_id: 42,
+        agent_type: "main".into(),
+        role: "assistant".into(),
+        text: "流水线的话".into(),
+        prompt_tokens: 1,
+        completion_tokens: 1,
+    });
+
+    let first = rx.recv().await.unwrap();
+    assert!(first.is_foreman_event(), "工头增量应被认作工头事件");
+    match &first {
+        SseEvent::ConversationDelta {
+            text,
+            task_id,
+            agent_type,
+            ..
+        } => {
+            assert_eq!(text, "半句话");
+            assert_eq!(task_id, "", "工头事件带空 task id");
+            assert_eq!(agent_type, "foreman");
+        }
+        other => panic!("应是会话增量：{other:?}"),
+    }
+    let second = rx.recv().await.unwrap();
+    assert!(!second.is_foreman_event(), "任务事件不该被工头路由收走");
+
+    // 既有任务级路由对工头事件**零干扰**：空 task id 永不等于真实任务 id。
+    assert_ne!(first.task_id(), "t-other");
+    assert_eq!(first.task_id(), "");
+}
+
+/// 工头事件不会污染某条真实任务的 SSE 流（票 03 的「零干扰」断言）。
+#[tokio::test]
+async fn task_stream_never_receives_foreman_events() {
+    let api = api_with_foreman(FakeAgent::new(Script::new())).await;
+    let task_id = seed(&api, "t-iso").await;
+
+    // 真实任务流按 task id 精确匹配（routes/tasks.rs::stream）。
+    let mut rx = api.state.sse.subscribe();
+    api.state.sse.publish(SseEvent::ConversationDelta {
+        task_id: String::new(),
+        branch: String::new(),
+        run_id: 0,
+        agent_type: "foreman".into(),
+        role: "assistant".into(),
+        text: "值班长说的话".into(),
+        prompt_tokens: 1,
+        completion_tokens: 1,
+    });
+    api.state.sse.publish(SseEvent::ConversationDelta {
+        task_id: task_id.clone(),
+        branch: "main".into(),
+        run_id: 9,
+        agent_type: "main".into(),
+        role: "assistant".into(),
+        text: "这条任务自己的话".into(),
+        prompt_tokens: 1,
+        completion_tokens: 1,
+    });
+
+    // 复刻路由的过滤条件，断言工头那条被丢弃。
+    let mut delivered: Vec<String> = Vec::new();
+    for _ in 0..2 {
+        let event = rx.recv().await.unwrap();
+        if event.task_id() == task_id {
+            match &event {
+                SseEvent::ConversationDelta { text, .. } => delivered.push(text.clone()),
+                other => panic!("不该有别的类型：{other:?}"),
+            }
+        }
+    }
+    assert_eq!(delivered, vec!["这条任务自己的话".to_string()]);
 }

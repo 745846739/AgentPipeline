@@ -41,6 +41,8 @@
 
 > 接缝只做可替换、不改语义：超时判定仍以 `Clock` 读数为唯一时钟源（决策 64）。**实现顺序要求：前四个接缝先于业务模块落地**（后补要翻全部模块签名）。第 5 条接缝（决策 172⑤，`MarketClient`）与第 6 条（决策 169，主题契约）同守此界——主题契约只承载**视觉数据**，不承载状态或业务语义，状态语义仍在 `stores` 与 `realtime/reduce.ts`。
 
+> **唯一的一处扩展（决策 182，不是新接缝）：** FakeAgent 的脚本槽此前有「按 `(stage, node)`」与「按既有伪阶段」两路；**工头既不是阶段、也不是既有伪阶段之一**，故按伪阶段那一路**加一个工头位**（`Script::for_foreman()`，见 §3.2 ⑧）。它是既有接缝（LLM 响应流）里的一个槽位，**不引入新的替换点**——本表不因本特性增行。
+
 ### 3.2 FakeAgent（决策 142 / 148）
 
 **替换边界：只替换 LLM 响应流，工具层全部真实执行**——write_file 真写（临时 home 内）、run_command 真跑、FileToolPolicy 真拦（决策 104）、输出脱敏真过（决策 118）、L2 卸载真落盘、命令真记 `kanban_node_commands`。集成测试因此同时覆盖整个工具子系统；fake 只是「演员」。
@@ -54,6 +56,7 @@
 | ⑤ | 超长工具结果注入 | §12.13 L1 裁剪 / L2 卸载（110）/ L3 压缩 / L4 兜底 |
 | ⑥ | 伪阶段脚本：conflict_check 给 duplicate_risk 等级、validator_cross_check 给合格/不合格 | 60 / 67 / 134 / 135 |
 | ⑦ | 子代理**可**脚本化（票 08） | `Script::push_subagent` 单列一个队列——子代理复用父节点的 `(stage, node)`，共用一个队列会让它悄悄吃掉父节点的一步。见 §10 决策 172③ 行 |
+| ⑧ | 工头**可**脚本化（决策 182，票 01）：`Script::for_foreman()` 同样单列一个队列（`text` / `tool` / `read_task` / `read_conversation` 四种步；值班长**不用 `submit_metadata`** 收口，故没有 Submit 步） | 工头既不是阶段、也不是既有伪阶段之一，故在伪阶段那一路上加一个**槽位**——既有接缝的扩展，不引入新的替换点（§3.1）。**工具真跑**：`read_task` / `read_conversation` 读的是真 SQLite 台账（决策 148 的替换边界不变） |
 
 **真 LLM 冒烟（`#[ignore]`，手动跑）：两条**——① 单节点：architect-design.execute 一次真调用，断言 rig 适配 + 结构化输出解析可用；② 全流程（主流程票 04）：真 key + 真模型驱动完整主流程到 `pending(merge_approval)`，fixture 为真实可构建小工程使闸门真跑，断言每节点有 run 行、`submit_metadata` 在真模型返回格式下可解析、token > 0、无节点落 `retry_exhausted`，失败时输出定位诊断（哪个 `(stage, node)` 的什么错误）。运行：`AGENTPIPELINE_SMOKE_*` 环境变量（见 `crates/core/tests/llm_smoke.rs` 头部说明）。两条都需真 key，**不进任何自动门**（决策 142）。
 
@@ -103,6 +106,7 @@ workspace 成员 `crates/testkit`，供 L2 / L4 复用：
 | 焦点游标 | 投影规则：pending 优先 / `updated_at` 最新 / 双 pending 取最新 | 92 / 130 |
 | 指标 | 逃逸率口径、阶段聚合 SQL、`total_tokens`=Σruns、`total_calls`=LLM run 数（不含 system） | 137 / 100 / 130 |
 | SSE | 事件体 `branch` 字段；`conversation_delta` / `tool_event` 字段完整 | 84 / 123 |
+| 对端地址与配对 | `peer.rs`：ConnectInfo 归一为 `PeerAddr`、**缺省视为回环**（无 ConnectInfo 的 tower oneshot 契约测试不因此变红）、局域网来源读到非回环、`is_loopback_bind` 覆盖各绑定写法；`stream.rs`：令牌比较 `fixed_length_eq`（长度不同即不等、内容不同即不等）；`server_info.rs`：`pairing_url` 形状固定为 `{base}/?pair={token}`、二维码白名单**允许追加 query** 而前缀伪装与异 origin 仍拒、`resolve_qr_target` 原样保留 query | 182⑦ / 167 |
 
 ## 6. 集成测试目录（L2）
 
@@ -120,6 +124,7 @@ workspace 成员 `crates/testkit`，供 L2 / L4 复用：
 | 心跳 | 系统命令起止刷新 `last_activity_at`（600s 命令在 300s idle 下存活）；伪阶段心跳归父 run；流式 token 心跳 | 100 / 88 / 134 |
 | DB 并发 | `try_claim_executor` 双连接竞争；DbWriter 写串行化 | 36 / §12.10 |
 | 配置 fail fast | `cross_family_judge=true` 无 provider → 拒绝启动；不支持 vendor → 降级 `enabled=0`、被引用才 fail fast；skill 名字不存在 fail fast；知识型技能**正文为空** fail fast（`skills.rs::empty_user_file_is_config_error`、`executor.rs::empty_knowledge_skill_body_refuses_startup`）；节点级技能名字不存在时报错须**定位到节点**（`executor.rs::missing_node_skill_refuses_startup_with_node_in_message`） | 134 / 103 / 47 / 170 |
+| 值班长（决策 182，票 01 / 02 / 05） | `tests/foreman.rs` 21 条：空 home 的快照是空班且不报错、待拍板**带 `pending_reason.message` 原文**、项目列表与已完成计数（cancelled 不计入）、在跑 / 待拍板 / 失败三者分组、历史按**字符预算**裁剪而被裁的仍在库里、超预算也至少留最新一条、会话列出按时间序、空 home 可对话且重载后仍在、LLM 请求带工头身份与占位阶段、模型失败时**人的那句话已落库**、空消息不入账、`read_task` / `read_conversation` **真读台账**并回灌给下一轮、越权工具**在执行点被拒**、未知 task_id 回文本而不是让整轮失败、工具集恰为约定的两个（**安全断言**）、对话**不动全局指标**、会话合计由落库列求和、保留期到点被清理（假时钟）、清理计数分列上报、对话**不产生任何 task 行**；`tests/pairing.rs` 5 条：首读生成并持久化、换句柄打开同一 home 读到同一枚（不随启动重生成）、重置换一枚、未生成过也能重置、令牌字符集可安全落在 `?pair=` 查询里 | 182①④⑤⑥⑦ |
 
 ## 7. API 契约测试（L3）
 
@@ -141,6 +146,8 @@ in-process axum router（tower oneshot），不 spawn 二进制：
 | analyze | 202 + `GET /projects/{id}/analysis` 轮询 | 130 |
 | 跨源防护矩阵 | 带 `X-AgentPipeline` → 过；无 Origin/Referer（非浏览器）→ 过；恶意 Origin → 403；GET / SSE 不受影响；**配置扩权（决策 157）**：`[server] allowed_origins` / CLI `--allowed-origin` 注入的 origin 精确放行，未配置局域网 origin 与前缀伪装仍 403 | 128 / 157 |
 | 静态资源（决策 155） | `GET /` 200：内嵌时为构建产物 index.html、未内嵌时为构建提示页（按 `EMBEDDED_ASSETS` 是否为空断言）；`/assets/{*path}` 原样回放 + Content-Type；未知资产 404 | 155 |
+| `/foreman/*`（决策 182） | 空 home 可读会话（响应含身份回执 `agent_type` / `stage_key` / `wired`）；空 home 可经 API 对话（`POST /foreman/messages` 落 user 行 + 取回 assistant 行与合计 token）；**未接线时三个端点 503 而不是 500**；空消息 400 且不落库；`/foreman/stream` 把工头增量送达到订阅者，而 `/tasks/{id}/stream` **收不到**工头事件（零干扰）；`/metrics` 不因对话变化 | 182②③⑥ |
+| `/pairing/*`（决策 182⑦） | 局域网来源：无令牌的写请求 403（报文提示去配对）、**`/foreman/*` 即使 GET 也要令牌**；带正确令牌放行；**回环来源豁免**（局域网形态下本机零摩擦）；只读 GET（看板 / 会话 / 指标）不护；`GET /pairing/token` **仅回环可读**（局域网来源 403）；`POST /pairing/reset` 换一枚且旧令牌随即失效；**默认回环绑定时一切都不要求令牌**；二维码端点接受带 `?pair=` 的 URL（origin 留在白名单内），异 origin 与前缀伪装仍 400 | 182⑦ / 167 / 128 |
 
 ## 8. E2E 场景矩阵（L4，决策 149）
 
@@ -180,10 +187,10 @@ harness = FakeAgent（§3.2）+ testkit fixture（§3.3）+ 临时 home + 手动
 
 | 层 | 工具 | 用例 |
 |---|---|---|
-| 单元 | vitest | `reduce.ts` 归约表逐事件（design §9.1 每行：列归属 / 信号色 / 待办计数 / dossier 开合）；allowed_actions 渲染分组（resume / side_effect、`requires_input`）；NotificationPolicy（cooldown、quiet_hours、cancelled 不弹） |
+| 单元 | vitest | `reduce.ts` 归约表逐事件（design §9.1 每行：列归属 / 信号色 / 待办计数 / dossier 开合）；allowed_actions 渲染分组（resume / side_effect、`requires_input`）；NotificationPolicy（cooldown、quiet_hours、cancelled 不弹）；**值班长流式归约 `realtime/foreman.test.ts`（6 条，决策 182③）**：增量按到达顺序累积且期间保持流式态、非工头 / 非增量事件旁落（返回同一 state）、收尾把非空回话收敛为回话并熄灭方块光标、收尾时空 / 全空白回话**不清掉已到达的文字**、断流时已收到的部分原文保留只多一个说明、开新一轮丢掉上一轮的残留 |
 | 组件 | @testing-library/svelte | PendingActions（按所属游标取 cursor_id——决策 91）；DiffReviewPanel（无「拒绝」——决策 23）；StalledBadge（决策 34）；**像素原语 `crate.test.ts`（票 05 / 决策 169）**：量表 16 段与点亮折算、boss 条 20 段与最后一次转红、`retry_exhausted` 权威强制转红、六态映射（灯 / 描边 / 小人节奏）、sprite 非空 SVG + `currentColor` + 工头固定肤色 |
 | **契约** | vitest（纯数据 + 解析） | **主题契约模块（票 02 / 决策 169，本 effort 唯一新接缝）**：`theme/contract.test.ts` 几何常量与 theme-6 §2.3 逐项一致、15 枚 sprite 网格合法、六态映射齐备、深浅两套 token 名一致、量表折算边界；`theme/css-parity.test.ts` 读 `app.css` 抽两个 token 块与契约**逐条比对** + 扫描全部组件**禁止 token 块之外出现裸十六进制颜色**（像素纪律的可机器检查形式，白名单两处并注明理由） |
-| E2E | playwright（只 Chromium） | **真 axum 后端 + FakeAgent**（临时 home），**十条 29 例**：① happy path（看板 → 详情 → 页签 → diff 审批合入 → **校验合入到 main 的代码符合任务目标**）；② pending → dossier 面板 → resume（琥珀面板、顶栏待办计数）；③ 闸门真跑与失败分流（**真实 Node 工程**，闸门真执行 `npm test`）；④ provider 配错可理解可恢复（中文提示 + 原始诊断 + 「测试连接」）；⑤ UI 三步创建（×5）；⑥ 人工评审分支 + 合并「返回修改」（×3）；⑦ 日志/对话内容 + 刷新恢复（×2）；⑧ 并发第二任务（×3：互不阻塞 / 多游标分支归属 / 基准前移）；**⑨ 像素主题（×6，票 12 / 决策 169）**；**⑩ 对讲台（×4，决策 174）**。页面加载**编译期内嵌的真实 bundle**（主流程票 01） |
+| E2E | playwright（只 Chromium） | **真 axum 后端 + FakeAgent**（临时 home），**十条 33 例**：① happy path（看板 → 详情 → 页签 → diff 审批合入 → **校验合入到 main 的代码符合任务目标**）；② pending → dossier 面板 → resume（琥珀面板、顶栏待办计数）；③ 闸门真跑与失败分流（**真实 Node 工程**，闸门真执行 `npm test`）；④ provider 配错可理解可恢复（中文提示 + 原始诊断 + 「测试连接」）；⑤ UI 三步创建（×5）；⑥ 人工评审分支 + 合并「返回修改」（×3）；⑦ 日志/对话内容 + 刷新恢复（×2）；⑧ 并发第二任务（×3：互不阻塞 / 多游标分支归属 / 基准前移）；**⑨ 像素主题（×6，票 12 / 决策 169）**；**⑩ 对讲台（×8，决策 176 / 182）**。页面加载**编译期内嵌的真实 bundle**（主流程票 01） |
 
 **像素主题 e2e（票 12 / 决策 169）——`pixel-theme.spec.ts` 六条，全部断言真应用上算出来的样式：**
 ① 深浅两套 token 计算值 + 切换真的换 token + 圆角 0 / 2px 描边 / `4px 4px 0` 硬投影；
@@ -192,12 +199,16 @@ harness = FakeAgent（§3.2）+ testkit fixture（§3.3）+ 临时 home + 手动
 ④ 详情 hero 9 站（无 sync-check）+ 站点名非字符字形 + 工位标签盒 active 是 wash 实底；
 ⑤ 完成横幅（trophy sprite + diff 摘要真数字、点「收下」关闭、刷新不重弹）；
 ⑥ 移动款（顶栏 138px、6px 纵向链节脊线、灯可跳段且 `scroll-margin-top: 148px`、槽位不缩、触控目标）。
-**对讲台 e2e（决策 174）——`talk.spec.ts` 四条**：① 路由可达（`#/talk` 与原型写法 `#v-talk`
-都落到对讲台、不落 not-found；顶栏入口图标按 chip 节奏 16px）；② 值班板 8 工位（与看板列一一对应、
-各一枚 8px 灯）；③ 待拍板轮是**真数据渲染**的对话框（任务标题、中文理由短标签而**不暴露内部枚举**、
-2px 框、▼ 光标、后端下发的恢复动作可下发且下发后该轮消失）；④ 移动款顶栏仍为 **138px**（§5 两处
-148px 定值的依据）、值班板进单列。**这条套件的存在理由**：对讲台是「真实状态的对话式视图」而非
-自由对话——②③ 正面钉住「内容来自后端真实读数、动作来自 `allowed_actions`（决策 101 纯渲染）」。
+**对讲台 e2e（决策 176 / 182）——`talk.spec.ts` 八条**：① 路由可达（`#/talk` 与原型写法
+`#v-talk` 都落到对讲台、不落 not-found；顶栏入口图标按 chip 节奏 16px）；② 值班板 8 工位（与看板列一一对应、
+各一枚 8px 灯，读数与看板同源）；③ 状态区的急停轮是**真数据渲染**的对话框（任务标题、中文理由短标签而**不暴露内部枚举**、
+后端下发的恢复动作可下发且下发后该轮消失）；④ 移动款顶栏仍为 **138px**（§5 两处
+148px 定值的依据）、值班板收成对话之上的横向灯条；⑤ **给值班长发话**：Enter 发送、回话真的来自脚本、
+**回话里没有按钮**；⑥ 长对话**滚到底之后急停仍在第一屏**（状态区不随时间线滚动）；⑦ **没有项目也没有任务时输入是真的、
+发送能拿到值班长的回话**（空 home 的验收锚点，用户故事 11）；⑧ 发送失败：错误轮进时间线、人说过的话仍在台账里、
+**输入框内容保留**（决策 182②）。**这条套件的存在理由**：对讲台是「**和值班长说话**」——
+⑦ 钉住「不依赖任务」，⑤ 钉住「值班长只说话、不动手」，⑥ 钉住「全站唯一该响的信号不随时间线滚走」，
+②③ 正面钉住「内容来自后端真实读数、动作来自 `allowed_actions`（决策 101 纯渲染）」。
 
 另：`e2e/screenshots.spec.ts` 在真应用上产出 **7 路由 × 深浅 + 移动 3 视图 × 深浅** 的可重生成截图
 （`.scratch/shots/app/*.png`），**默认 skip**，需 `AGENTPIPELINE_SHOTS=1` 才跑——截图是证据不是门
@@ -221,7 +232,7 @@ harness = FakeAgent（§3.2）+ testkit fixture（§3.3）+ 临时 home + 手动
 - **票 04 · 真模型全流程冒烟**：`llm_smoke.rs::real_llm_drives_full_flow_to_merge_approval`（`#[ignore]`，不进任何自动门）——真 key + 真模型驱动完整主流程，断言 12 节点各有 run 行 / `submit_metadata` 在真模型格式下可解析 / token 计量 > 0 / 闸门 `npm test` 真跑且退出码 0 / 无 `retry_exhausted`。**实测一轮通过**：本地 OpenAI 兼容代理 + `deepseek-flash`，570s / 794k tokens / 26 runs，途中自动应答 3 次 `UserDecision`。修了冒烟装置三处缺陷：goto 候选固定取首个导致 `gate_recheck` 死循环（改为按序轮换）、失败命令只打退出码丢掉真实原因（补 stdout/stderr 尾部与阶段元数据）、设计文档断言不认绝对路径（两根兜底 + 列实际文件）。详见票面。
 - **票 10 · 纳入闸门 + 产物新鲜度守卫**：`scripts/e2e-artifacts.sh` 守卫两层陈旧（前端源码 vs `dist` → 重建 dist；随后 `cargo build -p app` 增量重编，`frontend/dist` 在 `build.rs` 的 `rerun-if-changed` 里）；`make check` 聚合 `lint + test + frontend + e2e`（决策 168 起 Makefile 是唯一权威，justfile 已删除）。守卫经反向验证：改源码不构建 → 触发重建；注入必败断言 → `make check-e2e` 退出码 2。无 CI 已显式记录。见决策 166 / 168。
 
-**playwright 八条 E2E**：`happy-path`（①）/ `pending-resume`（②）/ `gate`（③）/ `provider-misconfig`（④）/ `create-flow`（⑤×5）/ `review-branch`（⑥×3）/ `logs-reload`（⑦×2）/ `concurrent`（⑧×3），**17 passed**，全过。
+**playwright 八条 E2E（本批）**：`happy-path`（①）/ `pending-resume`（②）/ `gate`（③）/ `provider-misconfig`（④）/ `create-flow`（⑤×5）/ `review-branch`（⑥×3）/ `logs-reload`（⑦×2）/ `concurrent`（⑧×3），**17 passed**，全过。加上此后的 `pixel-theme.spec.ts`（6 条，决策 169）与 `talk.spec.ts`（8 条，决策 176 / 182），现行 E2E 共 **十条 33 例**（另有 `screenshots.spec.ts` 2 例默认 skip，见 §9）。
 
 **前端测试状态（2026-09-13，票 18 收尾 + 主流程补齐）：** 单元层已落地并全绿（`frontend/`，vitest，**96 passed / 13 files**：`reduce.ts` 归约表逐事件、SSE 连接层主动重连、`allowed_actions` 渲染分组与 cursor_id、NotificationPolicy、provider 掩码保存与测试连接规则、analyze 轮询、metrics 字段映射、stage_configs payload）。组件层以 vitest + DOM 断言覆盖 PendingActions / DiffReviewPanel / StalledBadge（`svelte-check` 0 error / 0 warning）。**playwright 八条 E2E 已执行 → 17 passed**：用例在 `frontend/e2e/`（`happy-path` / `pending-resume` / `gate` / `provider-misconfig` / `create-flow` / `review-branch` / `logs-reload` / `concurrent`），harness `frontend/e2e/harness.ts`（临时 home + 真 `serve --port 0` 就绪行回读 + 同源内嵌产物 + 按任务路由脚本），跑法 `make check-e2e`，只 Chromium（决策 144）。
 
@@ -266,6 +277,7 @@ harness = FakeAgent（§3.2）+ testkit fixture（§3.3）+ 临时 home + 手动
 | 179（票 12·出口控制） | §5 `egress.rs` 单测 17 条——放行侧：本地命令形态一条不误判（`git add && git commit` / `cargo test` / `npm run build` / `make check-lint`）、**提交信息里的 URL 不算出口**（只看每段首个命令词，全串扫描被明确否决）、回环恒放行；拒绝侧：未放行主机（报错三段式：拒了什么 / 怎么放行 / 不是安全边界）、`curl -d @.env <URL>` 的 exfiltrate 形态、精确主机与端口不敏感、**子域通配落在点边界上**（`*.example.com` 不匹配 `notexample.com`）、git 网络子命令 vs 本地子命令、包管理器 install vs test、解释器 + URL、ssh 家族目标抽取（`user@host` / `host:path` / 单目标）、多段命令任一段命中即拒、`sudo` / `VAR=x` 包装不是隐身衣、**选项的取值不顶掉子命令**（`git -C /tmp/repo push` 仍是出口，`npm --prefix x install` 同理；同形本地子命令仍放行）、`allow_all` 显式开关、`check_allow_host` 解析期校验、`NetworkPolicy::from_settings` 的保守默认；§6 `tests/egress.rs` 三条（**被拒的命令真的没跑**——副作用文件不存在、且落 `kanban_node_commands` 同表并带拒绝原因 / 放行路径照常执行 / `allow_all` 是唯一的全放行入口） | 已有用例（出口控制，2026-09-15） |
 | 180（票 13·会话续接） | §6 `executor.rs::attempts_start_with_an_empty_conversation_by_default`（**补锁既有行为**：改动前全仓没有一条用例钉住「每次 attempt 对话为空」）、`resume_continuation_carries_the_previous_attempt_messages`（开启后重入带上上一轮的工具往来；且 `messages` 里不混入 system）、`clean_retry_after_a_tool_failure_stays_empty_even_with_continuation_on`（决策 33 不变）、`continued_run_links_back_so_tokens_are_not_double_counted`（必要条件二：`continued_from_run_id` 指向历史 run，`total_tokens` 排除被续接的历史，落库任务总量与函数口径同源）、`context_overflow_path_writes_a_conversation_row`（必要条件一：真实执行路径触发 L4 后该 run 有会话行）；§5 `context.rs::l3_anchor_ignores_the_loaded_history_and_takes_the_current_round`（压缩锚点边界：载入的历史里的 user 消息不当锚点，锚点取本轮第一条；`current_start = 0` 与原行为逐字等价——既有 `l3_summary_inserted_after_first_user_message` 不动） | 已有用例（会话续接，2026-09-15） |
 | 181（票 11 / 15 / 16·预览与推荐） | §7 `api_contract.rs` 十六条——预览三项返回 / **特征命中列出具体行号**（对着源文件可定位）/ 未信任 + 全文 400 且报文可操作且不落库 / 信任转换生效（阶段级 + 节点级两处都转、之后全文可存）/ 撤销信任撞全文 400 且配置一字未动 / 无引用时 `changed: 0` 如实回报 / **装前预览不落盘** / 未安装 404；推荐清单按阶段下发并标注装没装 / 一键安装落盘 + 写配置（name + 未信任）/ 正文有特征也进得来但**只能名字态** / 既有声明逐字保留且重复安装不重复追加（已在技能根里则**不重新下载**、只补启用那一步，`note` 如实说明）、**已安装技能可直接启用**（未配市场来源也能落进配置） / 技能不存在 404 且不写配置 / 未配置来源 400 可操作 / 伪阶段 400 / 停用后配置行移除；§5 `config.rs` 七条（信任转换就地改写 / 裸字符串物化 / **降信任撞全文拒绝而非静默降级** / 节点级覆盖 / 无关技能不动配置 / 转换后仍过写入门）；§5 `skill_preview.rs` 十条（三类特征分行命中 / 大小写不敏感 / 一行两类 / 宽松匹配的对照样本 / 推荐映射与手动触发型排除）；前端 vitest `stageConfigs.test.ts`（混合数组读写 / 旧格式零迁移往返 / 未信任不可切全文 / 撤销信任撞全文拒绝 / 节点级技能写回保留其余键 / 空列表删键） | 已有用例（装前预览 + 信任转换 + 推荐与一键安装，2026-09-15） |
+| 176 / 182 | §6 `tests/foreman.rs`（21 条：快照字段与原因原文 / 历史字符预算 / 会话循环与收口 / **工具白名单在执行点生效** / 指标不动 / 保留期清理）+ `tests/pairing.rs`（5 条：生成即持久化 / 重置换枚）；§7 `/foreman/*` 六条（会话、空 home 对话、503 未接线、空消息、流式送达且任务流零干扰）+ `/pairing/*` 七条（缺令牌 403、带令牌通过、回环豁免、只读 GET 不护、读取口仅回环、重置使旧令牌失效、缺省回环绑定不要求令牌）；§5 `peer.rs` / `stream.rs` / `server_info.rs` 的对端地址与配对比较；§9 `realtime/foreman.test.ts`（归约 6 条）+ e2e `talk.spec.ts`（8 条，含空 home 可对话、回话里没有按钮、急停滚动后仍在第一屏） | 已有用例（对讲台与配对令牌，2026-09-16） |
 | …… | 其余决策随实现逐条填入 | — |
 
 ## 11. 实现状态（2026-09-12，票 15–22 后）

@@ -1,8 +1,10 @@
-import { CLIENT_HEADER, apiUrl } from './config';
+import { CLIENT_HEADER, PAIRING_HEADER, PAIRING_QUERY, apiUrl, getPairingToken } from './config';
 import type {
   AnalyzeResponse,
   CreateTaskPayload,
   FlowResponse,
+  ForemanSendResult,
+  ForemanSession,
   GlobalMetrics,
   NodeCommand,
   NodeConversation,
@@ -56,6 +58,12 @@ async function request<T>(path: string, opts: RequestOptions = {}): Promise<T> {
   if (method !== 'GET' && method !== 'HEAD') {
     headers[CLIENT_HEADER] = '1';
   }
+  // 决策 182㉙（票 07）：配对令牌压在**所有**方法上，不只写请求——非回环形态下
+  // 对讲台的读接口（`/foreman/session`、`/foreman/stream`）同样凭它通行，
+  // 而「只写请求带头」会让手机上看得到看板、对讲台却一律 403，那是更难排查的形态。
+  // 未配对时（回环形态的常态）这个头根本不带，本地使用零摩擦。
+  const token = getPairingToken();
+  if (token) headers[PAIRING_HEADER] = token;
   if (opts.body !== undefined) {
     headers['Content-Type'] = 'application/json';
   }
@@ -410,4 +418,55 @@ export function getServerInfo(): Promise<ServerInfo> {
  */
 export function qrSvgUrl(url: string): string {
   return apiUrl(`/server-info/qr.svg?url=${encodeURIComponent(url)}`);
+}
+
+/* 配对令牌（决策 182㉙，票 07）。 */
+
+/**
+ * 读取本服务的配对令牌。
+ *
+ * **只在回环可读**（服务端强制）：这一步是「在一台已配对的设备上生成给手机的链接」，
+ * 手机自己打开分享页时这里会 403——那是设计如此，不是故障。调用方据此降级为
+ * 不带令牌的裸地址（手机能看只读页，只是动手与对话还得先配对）。
+ */
+export function fetchPairingToken(): Promise<{ token: string }> {
+  return request<{ token: string }>('/pairing/token');
+}
+
+/** 一键重置配对：服务端换新令牌，旧令牌立即失效（调用方须同步清掉本地那份）。 */
+export function resetPairing(): Promise<{ token: string }> {
+  return request<{ token: string }>('/pairing/reset', { method: 'POST' });
+}
+
+/**
+ * 把令牌拼进地址（与后端 `server_info.rs::pairing_url` 同一约定）。
+ *
+ * 参数名 `pair` 是前后端**唯一**的约定，改一处就得改另一处；后端的单测钉着它。
+ */
+export function pairedUrl(base: string, token: string): string {
+  return `${base}/?${PAIRING_QUERY}=${encodeURIComponent(token)}`;
+}
+
+/* 值班长 / 对讲台（决策 182，票 01 / 03 / 04）：任务无关的两个读写口。 */
+
+/**
+ * 本会话台账（按 id 升序）。**这是对讲台唯一的权威状态入口**：界面重取它来对齐
+ * 「值班员说了什么 / 值班长回了什么 / 合计烧了多少 token」，不自己攒一份账。
+ * 工头未接线时后端回 503，由 `request` 抛出 `ApiError`。
+ */
+export function getForemanSession(signal?: AbortSignal): Promise<ForemanSession> {
+  return request<ForemanSession>('/foreman/session', { signal });
+}
+
+/**
+ * 说一句话并拿回一次回话。
+ *
+ * **失败时不要清空输入框**：后端在叫模型之前就把 user 行落了库，所以失败是「这句话
+ * 没被答上」而不是「这句话没说」——人应当能改几个字重发（决策 182㉓）。
+ */
+export function sendForemanMessage(text: string): Promise<ForemanSendResult> {
+  return request<ForemanSendResult>('/foreman/messages', {
+    method: 'POST',
+    body: { text },
+  });
 }

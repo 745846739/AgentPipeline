@@ -102,25 +102,45 @@ desktop-run: frontend
 	cd crates/desktop && cargo build
 	./crates/desktop/target/debug/agent-pipeline-desktop
 
+# 分层子集的三个可选参数（都可省略）：
+#
+#   PKG=<crate>    作用域收敛到单个 crate，只编/跑它（unit 层专用，其余层已自带 -p）
+#   TESTS=<文件名> 只编/跑某一个测试文件（`--test <name>`）；默认 `--tests` 编全部。
+#                  这一项省的是**编译与链接**，是大头（本机实测 core 的 L2 全部
+#                  二进制 3m41s vs 单个 market 58s）；FILTER 省的是**执行**，很小
+#   FILTER=<名称>  cargo 的用例名过滤，只跑名字匹配的用例
+#
+# 牙齿检查（停用某个防护 → 确认对应用例变红 → 恢复）用
+# `make integration TESTS=market FILTER=<用例名>`，比 `make integration` 快一个量级。
+#
+# **作用域收敛一律走 PKG，不要写 `make unit -p <crate>`**：make 会把 `-p` 当成
+# 自己的 `--print-data-base` 吞掉——① cargo 收不到作用域参数，实际跑的是整
+# workspace（3 个测试二进制而非 1 个）；② 近 1900 行 make 数据库被 dump 到 stdout；
+# ③ `<crate>` 被当成另一个 target，报 `No rule to make target` 并**以退出码 2
+# 结束**。该调用若串在 `&&` 之后，后面的闸门步骤会被静默截断（实测 2026-09-15：
+# 一个会话用它跑了 14 次，每次都误以为是「只跑 core」）。
+test_filter = $(if $(FILTER),-- $(FILTER),)
+test_scope  = $(if $(TESTS),--test $(TESTS),--tests)
+
 # 只跑单元层（L1）
 unit:
-	cargo test --workspace --lib
+	cargo test $(if $(PKG),-p $(PKG),--workspace) --lib $(test_filter)
 
 # L2 集成（core tests/）
 integration:
-	cargo test -p agentpipeline-core --tests
+	cargo test -p agentpipeline-core $(test_scope) $(test_filter)
 
 # L3 API 契约（in-process axum router）
 api:
-	cargo test -p app --test api_contract
+	cargo test -p app --test api_contract $(test_filter)
 
 # L4 端到端场景
 e2e:
-	cargo test -p e2e
+	cargo test -p e2e $(test_filter)
 
 # 启动冒烟（spawn 真二进制，E2E-00）
 smoke:
-	cargo test -p app --test smoke
+	cargo test -p app --test smoke $(test_filter)
 
 # 格式化（写回）
 fmt:

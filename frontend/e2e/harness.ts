@@ -28,6 +28,7 @@ import { fileURLToPath } from 'node:url';
 import type { Page } from '@playwright/test';
 
 import type { NodeScript, Step } from './scripts';
+import { FOREMAN } from './scripts';
 
 const here = fileURLToPath(new URL('.', import.meta.url));
 const frontendDir = path.resolve(here, '..');
@@ -47,8 +48,18 @@ export interface StartOptions {
   /**
    * **空 home 启动**（主流程票 05）：不播种 provider / 项目 / 任务，
    * 用例全程走 UI 创建三件套。此时 `taskId` 为空串，`fixProvider()` 不可用。
+   *
+   * 与 {@link providerOnly} 的区别：那个留一个可用 provider（值班长答得上话），
+   * 这个连 provider 都不播（首启真的一无所有）。
    */
   seedless?: boolean;
+  /**
+   * **只播 provider，不建项目与任务**（票 04「空看板也能对话」）：
+   * 值班长在任何 home 状态都要答得上话，而它要能答话就至少得有一个可用 provider
+   * ——这正是首启用户的真实处境（刚填完模型与密钥，还没接入项目）。
+   * 此时 `taskId` 为空串，`getTask()` 不可用。
+   */
+  providerOnly?: boolean;
   /** 评审模式（主流程票 06）：`human` 时任务停在 `pending(human_review)`。缺省 agent。 */
   reviewMode?: 'agent' | 'human';
   /**
@@ -122,6 +133,9 @@ const PERSONA_ROUTES: Array<[string, string]> = [
   ['你是设计语义冲突比对 agent', 'pseudo:conflict_check'],
   ['你是独立复核 agent', 'pseudo:validator_cross_check'],
   ['你是项目分析 agent', 'pseudo:project_analysis'],
+  // 值班长（票 01 的对讲台）：人格首句见 crates/core/src/pipeline/foreman.rs::FOREMAN_PERSONA。
+  // 它是个**任务无关**的调用方，没有 stage/node，故按人格路由到独立的 foreman 槽。
+  ['你是夜班车间的值班长', 'foreman'],
 ];
 
 function routeKey(system: string): string | null {
@@ -227,7 +241,13 @@ async function startMockLlm(
       const nodeKey = owner ? `${owner}\u0000${key}` : key;
       // 新节点运行：请求只有 system + user（openai.rs 的 build_body 在上述两条之后再追加
       // 历史 messages）。每见到一次新一轮，轮指针 +1（首次 → 0），步骤指针归零。
-      if (key && messages.length <= 2) {
+      //
+      // 值班长不同：它没有「节点运行」这回事，每轮请求都带同一段态势快照前言 + 历史对话，
+      // 条数不固定，`messages.length <= 2` 对它永不成立。改为按「最后一条是 user」认新轮——
+      // 同一次回话里的工具往返以 tool 收尾，不会被误判成新轮（否则查一次台账就吃掉下一轮）。
+      const lastRole = messages[messages.length - 1]?.role ?? '';
+      const isNewRound = key === FOREMAN ? lastRole === 'user' : messages.length <= 2;
+      if (key && isNewRound) {
         state.round.set(nodeKey, (state.round.get(nodeKey) ?? -1) + 1);
         state.step.set(nodeKey, 0);
         promptLog.push({ system, user });
@@ -505,6 +525,7 @@ export async function startApp(opts: StartOptions): Promise<App> {
     // 5) 播种：provider 指向 mock → 项目指向 fixture 仓库 → 任务
     //    `badProvider` 时 provider 指向坏 mock（任务必然失败）——fixProvider() 后切回脚本流。
     //    `seedless`（主流程票 05）跳过播种：三件套由用例走 UI 创建，此处只留空 home。
+    //    `providerOnly`（票 04）只播 provider：空看板但值班长答得上话（首启态）。
     let providerId: string | null = null;
     let taskId = '';
     const taskIds: string[] = [];
@@ -519,6 +540,8 @@ export async function startApp(opts: StartOptions): Promise<App> {
         enabled: true,
       });
       providerId = seeded.provider.id;
+    }
+    if (!opts.seedless && !opts.providerOnly) {
       const project = await postJson<{ project: { id: string } }>(apiBase, '/projects', {
         name: 'e2e',
         local_path: repoDir,

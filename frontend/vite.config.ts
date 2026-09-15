@@ -18,7 +18,8 @@ export default defineConfig({
     // 前端 api base 默认为同源相对路径（决策 153④），因此这里按路径前缀代理。
     proxy: {
       // skills / market 是票 09–16 新增的端点组：漏在这里的表现是「dev 下 404、打包后正常」
-      '^/(tasks|projects|providers|stage-configs|skills|market|metrics|health|server-info)': {
+      // foreman（票 01 的对讲台三端点）同理。
+      '^/(tasks|projects|providers|stage-configs|skills|market|metrics|health|server-info|foreman)': {
         target: apiTarget,
         changeOrigin: true,
       },

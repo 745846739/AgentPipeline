@@ -37,6 +37,10 @@ pub struct Script {
     /// 父节点的一步会被子代理悄悄吃掉，测试就无法表达「父派子代理 → 子代理干活 →
     /// 摘要回灌父」这个序列。故单独排队。
     subagent_steps: VecDeque<Step>,
+    /// 值班长的脚步（决策 182，票 01）：它既不是阶段、也不是既有伪阶段之一，
+    /// 却同样走 `(Stage::Init, Node::Execute)` 这个占位坐标——共用队列会被
+    /// Init/Execute 的脚本悄悄吃掉。单独排队，理由与子代理那一路完全相同。
+    foreman_steps: VecDeque<Step>,
     /// 工具失败注入规则（testing.md §3.2 ② / G13）：`(stage, node, tool)` 的
     /// 第 `n` 次调用（1-based）换成必然失败的参数，其余同名调用真实执行。
     fail_rules: HashMap<(Stage, Node, String), u32>,
@@ -71,6 +75,12 @@ impl Script {
         self
     }
 
+    /// 为值班长追加步骤（决策 182，票 01）。
+    pub fn push_foreman(&mut self, step: Step) -> &mut Self {
+        self.foreman_steps.push_back(step);
+        self
+    }
+
     /// 链式脚本构建入口。
     pub fn for_node(&mut self, stage: Stage, node: Node) -> NodeScript<'_> {
         NodeScript {
@@ -86,6 +96,11 @@ impl Script {
             script: self,
             agent_type,
         }
+    }
+
+    /// 值班长的链式脚本构建入口（决策 182，票 01）。
+    pub fn for_foreman(&mut self) -> ForemanScript<'_> {
+        ForemanScript { script: self }
     }
 
     /// 工具失败注入（testing.md §3.2 ② / G13 / 决策 33）：`(stage, node)` 内某个工具的
@@ -122,10 +137,16 @@ impl Script {
             .unwrap_or(0)
     }
 
+    /// 值班长剩余步骤数（决策 182）。
+    pub fn remaining_foreman(&self) -> usize {
+        self.foreman_steps.len()
+    }
+
     pub fn is_empty(&self) -> bool {
         self.steps.values().all(VecDeque::is_empty)
             && self.pseudo_steps.values().all(VecDeque::is_empty)
             && self.subagent_steps.is_empty()
+            && self.foreman_steps.is_empty()
     }
 
     /// 已声明的 `(stage, node)` 列表。
@@ -151,6 +172,10 @@ impl Script {
         self.subagent_steps.pop_front()
     }
 
+    fn pop_foreman(&mut self) -> Option<Step> {
+        self.foreman_steps.pop_front()
+    }
+
     /// 取出并消费某个 `(stage, node)` 的下一步——供 mock HTTP 脚本服务器复用
     /// （票 17：真实二进制冒烟用 `Script` 驱动 `mock_llm`）。
     pub fn take_next(&mut self, stage: Stage, node: Node) -> Option<Step> {
@@ -160,6 +185,11 @@ impl Script {
     /// 取出并消费某个伪阶段（`agent_type` 形如 `pseudo:*`）的下一步。
     pub fn take_next_pseudo(&mut self, agent_type: &str) -> Option<Step> {
         self.pop_pseudo(agent_type)
+    }
+
+    /// 取出并消费值班长的下一步（决策 182）。
+    pub fn take_next_foreman(&mut self) -> Option<Step> {
+        self.pop_foreman()
     }
 }
 
@@ -285,6 +315,55 @@ impl PseudoScript<'_> {
     }
 }
 
+/// 值班长的脚本构建器（决策 182，票 01）。
+///
+/// 与 [`PseudoScript`] 分开而不是复用 `for_pseudo`：值班长的请求 `run.agent_type` 是
+/// `"foreman"`，**不带 `pseudo:` 前缀**——它是配置键，不是伪阶段。让它继续按
+/// `pseudo:` 路由会把「值班长」与「流水线内的辅助调用」在测试基建里混成一类，
+/// 而这恰恰是决策 182 明确分开的一件事。
+pub struct ForemanScript<'a> {
+    script: &'a mut Script,
+}
+
+impl ForemanScript<'_> {
+    /// 纯文本回话。值班长**不用** `submit_metadata` 收口（决策 182④），
+    /// 所以这里只需要文本与工具两种步。
+    pub fn text(self, text: &str) -> Self {
+        self.push(Step::Text(text.to_string()))
+    }
+
+    /// 发起一次只读工具调用（工具**真实执行**）。
+    pub fn tool(self, name: &str, arguments: serde_json::Value) -> Self {
+        self.push(Step::Tool {
+            name: name.to_string(),
+            arguments,
+        })
+    }
+
+    /// 查某个任务台账的便捷写法。
+    pub fn read_task(self, task_id: &str) -> Self {
+        self.tool("read_task", serde_json::json!({ "task_id": task_id }))
+    }
+
+    /// 查某次运行回执的便捷写法（`run_id` 省略即「最近一次」）。
+    pub fn read_conversation(self, task_id: &str, run_id: Option<i64>) -> Self {
+        let mut args = serde_json::json!({ "task_id": task_id });
+        if let Some(id) = run_id {
+            args["run_id"] = serde_json::json!(id);
+        }
+        self.tool("read_conversation", args)
+    }
+
+    pub fn stall(self) -> Self {
+        self.push(Step::Stall)
+    }
+
+    pub fn push(self, step: Step) -> Self {
+        self.script.push_foreman(step);
+        self
+    }
+}
+
 struct Inner {
     script: Script,
     calls: Vec<(Stage, Node)>,
@@ -373,21 +452,27 @@ impl LlmClient for FakeAgent {
                 .run
                 .as_ref()
                 .is_some_and(|r| r.agent_type == "subagent");
+            // 值班长请求（决策 182）借 `(Stage::Init, Node::Execute)` 作占位坐标，
+            // 与 Init 的脚本撞坐标——同样必须走独立队列。
+            let is_foreman = request.run.as_ref().is_some_and(|r| {
+                r.agent_type == agentpipeline_core::pipeline::foreman::FOREMAN_AGENT_TYPE
+            });
             let step = {
                 let mut inner = agent.inner.lock().unwrap();
                 inner.calls.push((stage, node));
                 inner.requests.push(request);
                 inner.prompt_tokens += 10;
                 inner.completion_tokens += 5;
-                let popped = match (&pseudo_type, is_subagent) {
-                    (Some(agent_type), _) => inner.script.pop_pseudo(agent_type),
-                    (None, true) => inner.script.pop_subagent(),
-                    (None, false) => inner.script.pop(stage, node),
+                let popped = match (&pseudo_type, is_subagent, is_foreman) {
+                    (Some(agent_type), _, _) => inner.script.pop_pseudo(agent_type),
+                    (None, true, _) => inner.script.pop_subagent(),
+                    (None, false, true) => inner.script.pop_foreman(),
+                    (None, false, false) => inner.script.pop(stage, node),
                 };
                 match popped {
                     // fail_tool_n：把该工具第 n 次调用换成必然失败的参数（其余真实执行）
                     Some(Step::Tool { name, arguments })
-                        if pseudo_type.is_none() && !is_subagent =>
+                        if pseudo_type.is_none() && !is_subagent && !is_foreman =>
                     {
                         let key = (stage, node, name.clone());
                         let next = inner.tool_calls.get(&key).copied().unwrap_or(0) + 1;

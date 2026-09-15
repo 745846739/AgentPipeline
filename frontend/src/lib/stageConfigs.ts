@@ -13,7 +13,7 @@ import type {
  * 非法数字 / 非法 JSON 在提交前拦下并返回可读原因，不把坏值发给后端。
  */
 
-/** 10 个真实阶段 + 3 个伪阶段键（routes/stage_configs.rs::PSEUDO_STAGE_KEYS）。 */
+/** 10 个真实阶段 + 4 个非阶段配置键（routes/stage_configs.rs::PSEUDO_STAGE_KEYS）。 */
 export const STAGE_KEYS = [
   'init',
   'architect-design',
@@ -28,10 +28,21 @@ export const STAGE_KEYS = [
   'conflict_check',
   'validator_cross_check',
   'project_analysis',
+  'foreman',
 ] as const;
 export type StageKey = (typeof STAGE_KEYS)[number];
 
-const PSEUDO_KEYS = new Set(['conflict_check', 'validator_cross_check', 'project_analysis']);
+/**
+ * 不是真实阶段的配置键。`foreman`（值班长，决策 182①）与三个伪阶段并列，
+ * 但它**不是伪阶段**——它不在流水线里，是任务无关的对话角色；
+ * 归在这一组只是为了复用同一个「加备注」的渲染。
+ */
+const PSEUDO_KEYS = new Set([
+  'conflict_check',
+  'validator_cross_check',
+  'project_analysis',
+  'foreman',
+]);
 
 export function isPseudoStage(stage: string): boolean {
   return PSEUDO_KEYS.has(stage);

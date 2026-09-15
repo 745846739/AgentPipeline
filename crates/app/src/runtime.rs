@@ -15,6 +15,7 @@
 use std::sync::Arc;
 use std::time::Duration;
 
+use agentpipeline_core::agent::client::LlmClient;
 use agentpipeline_core::agent::providers::ProductionLlm;
 use agentpipeline_core::clock::SystemClock;
 use agentpipeline_core::config::Settings;
@@ -34,17 +35,24 @@ pub struct Runtime {
     pub resume_hook: ResumeHook,
     pub sse: Arc<SseBus>,
     executor: Arc<Executor>,
+    /// 同一个 LLM 适配器实例既供执行器用、也供值班长用。
+    ///
+    /// 共享而不是各建一个：`ProductionLlm` 的可见状态只有 store 与 sse，
+    /// 两个实例在行为上等价，但各自持有一份就不会有人注意到它们本该是同一个出口
+    /// ——将来给 LLM 出口加限流 / 计量时，两份实例会让其中一份悄悄绕过。
+    llm: Arc<dyn LlmClient>,
 }
 
 impl Runtime {
     /// 构造真实执行链（store 与 sse 均为共享实例）。
     pub fn new(store: Store, settings: Settings, sse: Arc<SseBus>) -> Self {
         let sse_sink: Arc<dyn SseSink> = sse.clone();
+        let llm: Arc<dyn LlmClient> = Arc::new(ProductionLlm::new(store.clone(), sse_sink.clone()));
         let executor = Arc::new(Executor::new(
             store.clone(),
             settings,
             sse_sink.clone(),
-            Arc::new(ProductionLlm::new(store.clone(), sse_sink)),
+            llm.clone(),
             Arc::new(RealProcessKiller),
         ));
 
@@ -84,7 +92,13 @@ impl Runtime {
             resume_hook,
             sse,
             executor,
+            llm,
         }
+    }
+
+    /// 共享 LLM 出口（值班长的回话复用同一实例，决策 182）。
+    pub fn llm(&self) -> Arc<dyn LlmClient> {
+        self.llm.clone()
     }
 
     /// 共享执行器（`/projects/analyze` 的 `project_analysis` 伪阶段复用同一实例）。

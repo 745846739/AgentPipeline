@@ -1,14 +1,19 @@
 //! SQLite 存储层（决策 13：sqlx migrations；决策 145：测试用临时文件库 + 全量迁移）。
 //!
 //! 拆分：`tasks`（任务 / 依赖 / 准入）、`cursors`（游标生命周期，执行状态唯一事实来源）、
-//! `observability`（runs / 会话 / 命令 / 流转 / 阶段产出）、`catalog`（项目 / provider / 阶段配置）。
+//! `observability`（runs / 会话 / 命令 / 流转 / 阶段产出）、`catalog`（项目 / provider / 阶段配置）、
+//! `foreman`（值班长会话——唯一不挂任务的表，决策 182）、`pairing`（配对令牌，票 07）。
 
 pub mod catalog;
 pub mod conflict;
 pub mod cursors;
 pub mod decisions;
+pub mod foreman;
 pub mod observability;
+pub mod pairing;
 pub mod tasks;
+
+pub use foreman::{ForemanMessage, NewForemanMessage};
 
 use std::str::FromStr;
 use std::sync::Arc;

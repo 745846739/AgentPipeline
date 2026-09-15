@@ -20,10 +20,44 @@ use super::sanitize::sanitize_text;
 use crate::config::{effective_run_command_timeout, Settings};
 use crate::home::Home;
 use crate::process::ProcessKiller;
+use crate::storage::Store;
 use crate::types::{CommandSource, Node, Stage};
 use crate::{Error, Result};
 
 use super::egress::NetworkPolicy;
+
+/// 值班长读回执时的消息裁剪（决策 182⑭）：只留最后 N 条，且总量压在字符上限内。
+///
+/// 两次裁剪的必要性不同：条数上限挡住「一次几百轮的会话」，字符上限挡住「一条消息
+/// 本身就有几万字」（`run_command` 的完整输出会整段进 messages）。只做前者会在一条
+/// 巨长的消息上失效，只做后者会让一万条短消息挤满预算。
+fn trim_conversation_messages(messages: &serde_json::Value) -> Vec<serde_json::Value> {
+    use crate::pipeline::foreman::{
+        FOREMAN_CONVERSATION_MAX_CHARS, FOREMAN_CONVERSATION_MAX_MESSAGES,
+    };
+
+    let Some(all) = messages.as_array() else {
+        return Vec::new();
+    };
+    let tail = if all.len() > FOREMAN_CONVERSATION_MAX_MESSAGES {
+        &all[all.len() - FOREMAN_CONVERSATION_MAX_MESSAGES..]
+    } else {
+        &all[..]
+    };
+    let mut kept: Vec<serde_json::Value> = Vec::new();
+    let mut used = 0usize;
+    for msg in tail.iter().rev() {
+        let rendered = msg.get("content").and_then(|c| c.as_str()).unwrap_or("");
+        let cost = rendered.chars().count();
+        if !kept.is_empty() && used + cost > FOREMAN_CONVERSATION_MAX_CHARS {
+            break;
+        }
+        used += cost;
+        kept.push(msg.clone());
+    }
+    kept.reverse();
+    kept
+}
 
 /// 命令日志记录的启动信息（§12.4.4）。
 #[derive(Debug, Clone)]
@@ -176,6 +210,12 @@ pub struct ToolExecutor {
     /// 构造时从 [`Settings`] 取一次（见 [`Self::new`]），执行点不再读配置——策略与「这次执行
     /// 用的哪份设置」不会错位。默认姿态保守：空清单 + 不放行全部，只放行回环。
     egress: NetworkPolicy,
+    /// 台账读句柄（决策 182⑭，票 02）。`None` = `read_task` / `read_conversation` 不可用。
+    ///
+    /// 这两个工具**只面向值班长**：它的输入是人可以随便打的任意文本，故它的能力必须来自
+    /// 一个显式注入的只读句柄，而不是继承流水线节点那套（含文件与命令）的上下文
+    /// ——「不注入即不可用」让「它到底能碰什么」在构造点就看得见。
+    ledger: Option<Store>,
 }
 
 /// 命令输出推流的上下文（票 14）：SSE 去向 + 事件里要带的任务/分支。
@@ -222,6 +262,7 @@ impl ToolExecutor {
             sse: None,
             sub_agent: None,
             allow: None,
+            ledger: None,
         }
     }
 
@@ -242,6 +283,17 @@ impl ToolExecutor {
     /// 就算硬发也执行不了。子代理的只读边界靠它成立。
     pub fn with_allowed_tools(mut self, allow: &'static [&'static str]) -> Self {
         self.allow = Some(allow);
+        self
+    }
+
+    /// 注入台账读句柄（决策 182⑭，票 02）：使 `read_task` / `read_conversation` 可用。
+    ///
+    /// 与 [`Self::with_sub_agent`] 同一种做法——能力由接线决定，不注入即不可用。
+    /// 注入的是 [`Store`] 本身而不是一层新 trait：台账是既有的存储实现，
+    /// 为它再造一个可替换接缝只会多一个「测试里跑的不是真 SQL」的口子，
+    /// 而这两个工具要验的恰恰是「读得到真台账」。
+    pub fn with_ledger(mut self, store: Store) -> Self {
+        self.ledger = Some(store);
         self
     }
 
@@ -302,6 +354,10 @@ impl ToolExecutor {
             "submit_metadata" => self.submit_metadata(call)?,
             "Skill" => self.skill(call)?,
             "spawn_sub_agent" => self.spawn_sub_agent(call, ctx).await?,
+            // 台账只读工具（决策 182⑭，票 02）。它们在白名单里的位置与其余工具相同：
+            // 越权调用在函数开头的白名单检查处就被拒，这里不再重复判定「谁可以调」。
+            "read_task" => self.read_task(call).await?,
+            "read_conversation" => self.read_conversation(call).await?,
             other => return Err(Error::Validation(format!("未知工具：{other}"))),
         };
         self.apply_l2_offload(call, ctx, outcome)
@@ -312,13 +368,20 @@ impl ToolExecutor {
     ///
     /// `run_command` 在自身路径里已按 stdout/stderr 语义卸载（保留退出码与失败行），
     /// 此处跳过避免二次卸载；`submit_metadata` 是极小 JSON，无需处理。
+    ///
+    /// 值班长的两个台账工具同样跳过：卸载要写 `home.context_dir(&ctx.task_id)`，
+    /// 而值班长**没有 task_id**（空串会落到上下文根目录，污染下一个真实任务的文件）。
+    /// 它们的结果在工具内部已按字符上限截断，不会无界增长。
     fn apply_l2_offload(
         &self,
         call: &ToolCall,
         ctx: &ToolCallContext,
         outcome: ToolOutcome,
     ) -> Result<ToolOutcome> {
-        if matches!(call.name.as_str(), "run_command" | "submit_metadata") {
+        if matches!(
+            call.name.as_str(),
+            "run_command" | "submit_metadata" | "read_task" | "read_conversation"
+        ) {
             return Ok(outcome);
         }
         if !needs_offload(&outcome.content, &self.settings) {
@@ -525,6 +588,139 @@ impl ToolExecutor {
                  请从技能目录里选一个名字重试；若该技能尚未安装，请先安装再调用。"
             ))),
         }
+    }
+
+    /// `read_task`（决策 182⑭，票 02）：读某个任务的台账详情。
+    ///
+    /// **不存在时不走 `Err` 通道**，与 [`Self::skill`] 同一理由：模型写错一个任务 id 是
+    /// 最常见的失败，`Err` 会被算作工具失败并累计 `tool_retry_max`（决策 33），
+    /// 一次笔误就能把整次回话打挂。返回一段说明文本既进上下文又不触发失败计数。
+    async fn read_task(&self, call: &ToolCall) -> Result<ToolOutcome> {
+        let Some(store) = &self.ledger else {
+            return Err(Error::Validation(
+                "read_task 不可用：本次调用没有注入台账读句柄".into(),
+            ));
+        };
+        let args = Self::args(call)?;
+        let task_id = args
+            .get("task_id")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .trim()
+            .to_string();
+        if task_id.is_empty() {
+            return Ok(ToolOutcome::ok(
+                "read_task 需要 {task_id} 参数。任务 id 是态势快照里方括号内那串。",
+            ));
+        }
+        // 「任务不存在」在这里是**正常回答**而不是故障：模型可能记错一个 id。
+        // 只吞 `Error::Task`（那是「查无此任务」），其余错误照常上升——把库故障
+        // 也说成「没有这个任务」会让模型继续拿错 id 反复猜。
+        let task = match store.get_task(&task_id).await {
+            Ok(t) => t,
+            Err(Error::Task(_)) => {
+                return Ok(ToolOutcome::ok(format!(
+                    "台账里没有任务 {task_id}。请用态势快照里列出的 id 重试。"
+                )))
+            }
+            Err(e) => return Err(e),
+        };
+        // allowed_actions 由后端权威下发（决策 101）——这里把它**原样**交出去，
+        // 不做筛选也不做解释。值班长能替值班员描述「可按下哪些键」，
+        // 但它自己按不动（写动作仍需人来发）。
+        let cursors = store.load_live_cursors(&task_id).await?;
+        let actions = task
+            .pending_reason
+            .as_ref()
+            .map(|r| crate::actions::allowed_actions(r, None))
+            .unwrap_or_default();
+        let value = serde_json::json!({
+            "task_id": task.id,
+            "title": task.title,
+            "description": task.description,
+            "status": task.status.as_str(),
+            "current_stage": task.current_stage.as_str(),
+            "current_node": task.current_node.as_str(),
+            "pending_reason": task.pending_reason,
+            "allowed_actions": actions,
+            "cursors": cursors.iter().map(|c| serde_json::json!({
+                "branch": c.branch,
+                "stage": c.stage,
+                "node": c.node,
+                "status": c.status.as_str(),
+            })).collect::<Vec<_>>(),
+            "total_tokens": task.total_tokens,
+            "total_calls": task.total_calls,
+            "stalled": task.stalled,
+            "updated_at": task.updated_at.to_rfc3339(),
+        });
+        // `description` 与 `allowed_actions` 都可能很长，而这个结果**不走** L2 卸载
+        // （见 `apply_l2_offload`），所以上限必须在这里落。
+        Ok(ToolOutcome::ok(
+            crate::pipeline::foreman::truncate_tool_result(&serde_json::to_string_pretty(&value)?),
+        ))
+    }
+
+    /// `read_conversation`（决策 182⑭，票 02）：读某次节点运行的会话回执。
+    ///
+    /// `run_id` 缺省取该任务**最近一次**会话——人是按「那个货箱卡哪儿了」提问的，
+    /// 不是按运行 id；让模型非要先查 run 列表才能问，等于把台账的内部编号变成使用门槛。
+    async fn read_conversation(&self, call: &ToolCall) -> Result<ToolOutcome> {
+        let Some(store) = &self.ledger else {
+            return Err(Error::Validation(
+                "read_conversation 不可用：本次调用没有注入台账读句柄".into(),
+            ));
+        };
+        let args = Self::args(call)?;
+        let task_id = args
+            .get("task_id")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .trim()
+            .to_string();
+        if task_id.is_empty() {
+            return Ok(ToolOutcome::ok(
+                "read_conversation 需要 {task_id} 参数（可再加 {run_id}）。",
+            ));
+        }
+        let requested_run = args.get("run_id").and_then(|v| v.as_i64());
+        let run_id = match requested_run {
+            Some(id) => id,
+            None => match store.list_conversations(&task_id, false).await?.last() {
+                Some(last) => last.run_id,
+                None => {
+                    return Ok(ToolOutcome::ok(format!(
+                        "任务 {task_id} 还没有任何节点会话——它可能还没跑到调 LLM 的节点。"
+                    )))
+                }
+            },
+        };
+        let conversation = match store.get_conversation(&task_id, run_id).await? {
+            Some(c) => c,
+            None => {
+                return Ok(ToolOutcome::ok(format!(
+                    "任务 {task_id} 的 {run_id} 号运行没有会话回执（可能是纯代码节点，\
+                     或该运行已被清理）。用 read_task 看它当前停在哪个工位。"
+                )))
+            }
+        };
+        let messages = trim_conversation_messages(&conversation.messages_json);
+        let value = serde_json::json!({
+            "task_id": task_id,
+            "run_id": run_id,
+            "stage": conversation.stage.as_str(),
+            "node": conversation.node.as_str(),
+            "attempt": conversation.attempt,
+            "agent_type": conversation.agent_type,
+            "prompt_tokens": conversation.prompt_tokens,
+            "completion_tokens": conversation.completion_tokens,
+            "messages": messages,
+        });
+        // 消息已按条数与字符双重截断，但包上 stage / agent_type 等字段后仍可能略超上限；
+        // 这里再兜一次（与 `read_task` 同一理由：它不走 L2 卸载）。
+        Ok(ToolOutcome::ok(
+            crate::pipeline::foreman::truncate_tool_result(&serde_json::to_string_pretty(&value)?),
+        ))
     }
 
     async fn run_command(&self, call: &ToolCall, ctx: &ToolCallContext) -> Result<ToolOutcome> {

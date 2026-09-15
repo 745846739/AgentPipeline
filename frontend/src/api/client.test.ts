@@ -2,12 +2,13 @@ import { afterEach, describe, expect, it, vi } from 'vitest';
 import {
   ApiError,
   deleteStageConfig,
+  getForemanSession,
   getServerInfo,
   listStageConfigs,
   putStageConfig,
   qrSvgUrl,
 } from './client';
-import { CLIENT_HEADER, setApiBase } from './config';
+import { CLIENT_HEADER, PAIRING_HEADER, clearPairingToken, setApiBase, setPairingToken } from './config';
 
 function jsonResponse(body: unknown, status = 200): Response {
   return new Response(JSON.stringify(body), {
@@ -99,5 +100,41 @@ describe('server-info 客户端（决策 167）', () => {
       'http://127.0.0.1:9100/server-info/qr.svg?url=http%3A%2F%2F127.0.0.1%3A9100',
     );
     setApiBase(null);
+  });
+});
+
+describe('配对令牌压在请求头上（决策 182㉙，票 07）', () => {
+  it('已配对时所有方法都带头——含只读 GET（对讲台读接口在局域网形态同样受护）', async () => {
+    const calls: Array<{ url: string; init?: RequestInit }> = [];
+    vi.stubGlobal(
+      'fetch',
+      vi.fn(async (url: string, init?: RequestInit) => {
+        calls.push({ url: String(url), init });
+        return jsonResponse({ messages: [], total_tokens: 0, total_calls: 0 });
+      }),
+    );
+    setPairingToken('tok-42');
+    await getForemanSession();
+
+    const headers = calls[0].init?.headers as Record<string, string>;
+    expect(headers[PAIRING_HEADER]).toBe('tok-42');
+    // GET 不带旁路头（决策 128 只拦写请求），但配对头必须在
+    expect(headers[CLIENT_HEADER]).toBeUndefined();
+    clearPairingToken();
+  });
+
+  it('未配对时不带这个头——回环形态零摩擦', async () => {
+    const calls: Array<{ init?: RequestInit }> = [];
+    vi.stubGlobal(
+      'fetch',
+      vi.fn(async (_url: string, init?: RequestInit) => {
+        calls.push({ init });
+        return jsonResponse({ messages: [], total_tokens: 0, total_calls: 0 });
+      }),
+    );
+    clearPairingToken();
+    await getForemanSession();
+    const headers = calls[0].init?.headers as Record<string, string>;
+    expect(PAIRING_HEADER in headers).toBe(false);
   });
 });

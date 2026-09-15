@@ -16,11 +16,17 @@ use std::str::FromStr;
 
 use crate::state::{map_core_error, ApiError, ApiResult, AppState};
 
-/// 阶段键可以是真实阶段，也可以是伪阶段的 `stage_configs` 键（决策 67 / 87）。
-const PSEUDO_STAGE_KEYS: [&str; 3] = [
+/// 阶段键可以是真实阶段，也可以是伪阶段的 `stage_configs` 键（决策 67 / 87），
+/// 外加值班长（决策 182①：它是第 4 个配置 key，但不是 `PseudoStage` 的变体）。
+///
+/// **必须与 `frontend/src/lib/stageConfigs.ts` 的 `PSEUDO_KEYS` 同步**：那份决定设置页
+/// 列不列得出这一行，这份决定后端收不收这一行。不同步的表现是「界面上填好、保存被 400
+/// 拒掉」，而 400 的理由写着「未知阶段」——看的人只会当成界面 bug 去查前端。
+const PSEUDO_STAGE_KEYS: [&str; 4] = [
     "conflict_check",
     "validator_cross_check",
     "project_analysis",
+    agentpipeline_core::pipeline::foreman::FOREMAN_STAGE_KEY,
 ];
 
 fn validate_stage_key(stage: &str) -> Result<(), ApiError> {

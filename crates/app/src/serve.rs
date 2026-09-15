@@ -12,6 +12,7 @@ use agentpipeline_core::config::{normalize_origin, Config, LogFormat};
 use agentpipeline_core::home::{
     check_permissions, restrict_file_permissions, restrict_permissions, Home,
 };
+use agentpipeline_core::pipeline::ForemanRunner;
 use agentpipeline_core::sse::SseBus;
 use agentpipeline_core::storage::Store;
 use anyhow::Context;
@@ -50,6 +51,19 @@ pub async fn bind_listener(
         .local_addr()
         .context("无法读取内核分配的实际端口")?;
     Ok((listener, bound))
+}
+
+/// 把 router 变成能向处理器提供对端地址的 service（决策 182）。
+///
+/// 返回类型本身就是行为事实：裸 `Router` 交给 `axum::serve`（`into_make_service`）时
+/// 对端地址不会进入请求扩展，[`crate::peer::peer_address`] 便没有东西可读——只有
+/// `into_make_service_with_connect_info` 会让 `ConnectInfo<SocketAddr>` 出现（票 07 的
+/// 「仅回环可读」依赖它）。抽成具名函数是为了让这处接线本身可断言、可被下游引用。
+pub fn into_serving_service(
+    router: axum::Router,
+) -> axum::extract::connect_info::IntoMakeServiceWithConnectInfo<axum::Router, std::net::SocketAddr>
+{
+    router.into_make_service_with_connect_info::<std::net::SocketAddr>()
 }
 
 /// serve 的启动参数（决策 157）：CLI 覆盖项与扩权 origin；`None` / 空表回落配置文件。
@@ -164,13 +178,22 @@ pub async fn serve(options: ServeOptions) -> anyhow::Result<ServerHandle> {
         Some(source) => Some(Arc::new(HttpMarketClient::new(source)?)),
         None => None,
     };
+    // 值班长（决策 182）：与执行器共用同一个 LLM 出口。构造在 `AppState::new` 之前
+    // ——那一步会消费掉 store / home / settings。
+    let foreman = Arc::new(ForemanRunner::new(
+        store.clone(),
+        settings.clone(),
+        home.clone(),
+        runtime.llm(),
+    ));
     let state = AppState::new(store, home, settings, bound.port())
         .with_sse(sse)
         .with_executor(runtime.executor())
         .with_resume_hook(runtime.resume_hook.clone())
         .with_bind_host(host.clone())
         .with_allowed_origins(extra_origins)
-        .with_market(market_client, market_sources);
+        .with_market(market_client, market_sources)
+        .with_foreman(foreman);
     let router = build_router(state);
 
     tracing::info!(%bound, port = bound.port(), "AgentPipeline 已启动");
@@ -179,7 +202,7 @@ pub async fn serve(options: ServeOptions) -> anyhow::Result<ServerHandle> {
     println!("AGENTPIPELINE_READY port={}", bound.port());
 
     let server_task = tokio::spawn(async move {
-        axum::serve(listener, router)
+        axum::serve(listener, into_serving_service(router))
             .with_graceful_shutdown(async move {
                 let _ = shutdown_rx.changed().await;
             })
@@ -381,6 +404,15 @@ mod tests {
         let (listener, bound) = bind_listener("127.0.0.1", 0).await.unwrap();
         assert_ne!(bound.port(), 0, "应回读内核分配的真实端口");
         assert_eq!(listener.local_addr().unwrap().port(), bound.port());
+    }
+
+    #[test]
+    fn serving_service_carries_connect_info() {
+        // 类型即断言（票 06）：只有 IntoMakeServiceWithConnectInfo 能绑到这个类型上，
+        // 裸 Router 交进来会在编译期被拒——对端地址正是靠这个返回类型才活到处理器。
+        use axum::extract::connect_info::IntoMakeServiceWithConnectInfo;
+        let _serving: IntoMakeServiceWithConnectInfo<axum::Router, std::net::SocketAddr> =
+            into_serving_service(axum::Router::new());
     }
 
     #[tokio::test]

@@ -74,3 +74,36 @@ describe('TaskStream 主动重连', () => {
     conn.stop();
   });
 });
+
+describe('TaskStream 路径覆盖（票 03：值班长流复用同一解析层）', () => {
+  afterEach(() => {
+    vi.unstubAllGlobals();
+  });
+
+  it('缺省打任务流；给了 path 就打那条（工头流）', async () => {
+    const urls: string[] = [];
+    const fetchMock = vi.fn(async (url: string, init?: RequestInit) => {
+      urls.push(String(url));
+      const stream = openStream(init!.signal!);
+      return new Response(stream.stream, {
+        status: 200,
+        headers: { 'content-type': 'text/event-stream' },
+      });
+    });
+    vi.stubGlobal('fetch', fetchMock);
+
+    const task = new TaskStream('t1', { onEvent: () => {} });
+    task.start();
+    await vi.waitFor(() => expect(urls).toHaveLength(1));
+    task.stop();
+
+    // 工头没有真实 task id（决策 182⑥）：路径必须完全由 path 决定，不能拼出 /tasks//stream
+    const foreman = new TaskStream('', { onEvent: () => {} }, { path: '/foreman/stream' });
+    foreman.start();
+    await vi.waitFor(() => expect(urls).toHaveLength(2));
+    foreman.stop();
+
+    expect(urls[0]).toContain('/tasks/t1/stream');
+    expect(urls[1]).toContain('/foreman/stream');
+  });
+});

@@ -683,3 +683,81 @@ export interface OneClickInstallResult {
   stage_config: StageConfig;
   preview: SkillPreview;
 }
+
+/* ─────────────── 值班长 / 对讲台（crates/app/src/routes/foreman.rs，决策 182）─────────────── */
+
+/** 该轮工具痕迹的一项（`ForemanTrace`）。`args_summary` 是参数摘要，不是原文。 */
+export interface ForemanTrace {
+  tool: string;
+  args_summary: string;
+  ok: boolean;
+}
+
+/** 态势快照里等人拍板的一条：`message` 是 pending 原因**原文**，不是枚举名。 */
+export interface ForemanBriefingPending {
+  task_id: string;
+  title: string;
+  stage: string;
+  kind: string;
+  message: string;
+}
+
+export interface ForemanBriefingRunning {
+  task_id: string;
+  title: string;
+  stage: string;
+}
+
+export interface ForemanBriefingFailed {
+  task_id: string;
+  title: string;
+  stage: string;
+  message: string | null;
+}
+
+export interface ForemanBriefingProject {
+  id: string;
+  name: string;
+}
+
+/**
+ * 该轮注入 prompt 的夜班态势快照（审计用，不是界面数据源）。
+ *
+ * 界面据它把值班长引用的结论**标出来源工位**（`stage`）——快照里的读数与那一轮
+ * 值班长看到的是同一份，故来源可考。
+ */
+export interface ForemanBriefing {
+  pending: ForemanBriefingPending[];
+  running: ForemanBriefingRunning[];
+  failed: ForemanBriefingFailed[];
+  projects: ForemanBriefingProject[];
+  done_count: number;
+}
+
+/** 会话台账的一行。`role` 线上是 `"user" | "assistant"`（后端按串存）。 */
+export interface ForemanMessage {
+  id: number;
+  role: string;
+  content: string;
+  prompt_tokens: number;
+  completion_tokens: number;
+  briefing: ForemanBriefing | null;
+  traces: ForemanTrace[] | null;
+  created_at: string;
+}
+
+/** `GET /foreman/session`：按 id 升序的会话 + 合计；`foreman.wired` 为假时是未接线（503 之外的另一读法）。 */
+export interface ForemanSession {
+  messages: ForemanMessage[];
+  total_tokens: number;
+  total_calls: number;
+  foreman: { agent_type: string; stage_key: string; wired: boolean };
+}
+
+/** `POST /foreman/messages`：`message` 是刚落库的回话行（LLM 失败时整个请求失败，但 user 行已落库）。 */
+export interface ForemanSendResult {
+  message: ForemanMessage | null;
+  reply: string;
+  total_tokens: number;
+  total_calls: number;
+}

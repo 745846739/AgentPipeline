@@ -1,6 +1,8 @@
 //! 路由模块。
 
+pub mod foreman;
 pub mod market;
+pub mod pairing;
 pub mod projects;
 pub mod providers;
 pub mod server_info;

@@ -40,11 +40,15 @@ function config(overrides: Partial<StageConfig> = {}): StageConfig {
 }
 
 describe('stage_configs 键与预填', () => {
-  it('包含 10 个真实阶段 + 3 个伪阶段键', () => {
-    expect(STAGE_KEYS).toHaveLength(13);
+  it('包含 10 个真实阶段 + 4 个非阶段配置键', () => {
+    // 第 4 个是值班长 `foreman`（决策 182①）：与三个伪阶段并列，但**不是伪阶段**
+    // ——它不在流水线里，是任务无关的对话角色。后端 `PSEUDO_STAGE_KEYS` 必须同长。
+    expect(STAGE_KEYS).toHaveLength(14);
     expect(STAGE_KEYS).toContain('sync-check');
     expect(STAGE_KEYS).toContain('validator_cross_check');
+    expect(STAGE_KEYS).toContain('foreman');
     expect(isPseudoStage('project_analysis')).toBe(true);
+    expect(isPseudoStage('foreman')).toBe(true);
     expect(isPseudoStage('develop')).toBe(false);
     expect(stageKeyLabel('conflict_check')).toContain('伪阶段');
   });

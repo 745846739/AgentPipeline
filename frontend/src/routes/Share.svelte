@@ -1,6 +1,6 @@
 <script lang="ts">
   import { onMount } from 'svelte';
-  import { getServerInfo, qrSvgUrl } from '../api/client';
+  import { fetchPairingToken, getServerInfo, pairedUrl, qrSvgUrl, resetPairing } from '../api/client';
   import type { ServerAddress, ServerInfo } from '../api/types';
 
   /**
@@ -20,8 +20,22 @@
   /** 当前选中用于生成二维码的地址（缺省取后端推荐的首项）。 */
   let selected = $state<string | null>(null);
   let copied = $state<string | null>(null);
+  /**
+   * 配对令牌（决策 182㉙）。**取不到是常态而不是错误**：`GET /pairing/token` 只在回环可读
+   * ——手机自己打开这一页时必然 403（那正是这条护栏的意义）。取到时二维码带令牌，
+   * 手机扫一次就配对完；取不到时退回裸地址，手机仍能看只读页。
+   */
+  let token = $state<string | null>(null);
+  let reset = $state(false);
 
   const addresses = $derived(info?.addresses ?? []);
+  /** 二维码/复制栏里那个地址：有令牌就带上，多一个参数不增加任何操作步骤。 */
+  const target = $derived(
+    (() => {
+      const base = selected ?? addresses[0]?.url ?? '';
+      return base && token ? pairedUrl(base, token) : base;
+    })(),
+  );
 
   onMount(async () => {
     try {
@@ -32,7 +46,24 @@
     } finally {
       loading = false;
     }
+    // 令牌单取：它失败不影响这一页的主要用途，故不并进上面那个 try。
+    try {
+      token = (await fetchPairingToken()).token;
+    } catch {
+      token = null;
+    }
   });
+
+  async function doReset() {
+    reset = true;
+    try {
+      token = (await resetPairing()).token;
+    } catch (err) {
+      error = (err as Error).message;
+    } finally {
+      reset = false;
+    }
+  }
 
   async function copy(url: string) {
     try {
@@ -107,8 +138,8 @@ host = "0.0.0.0"</code></pre>
         <!-- 二维码底盒恒白：扫描器依赖明暗对比，浅色主题也不例外（§3.1） -->
         <div class="qr-qr">
           <img
-            src={qrSvgUrl(selected ?? addresses[0].url)}
-            alt="扫码访问 {selected ?? addresses[0].url}"
+            src={qrSvgUrl(target)}
+            alt="扫码访问 {target}"
             width="240"
             height="240"
           />
@@ -118,18 +149,33 @@ host = "0.0.0.0"</code></pre>
             <span class="reg-name">扫码在手机上打开</span>
             <span class="port mono">:{info.port}</span>
           </div>
-          <div class="picked mono">{selected ?? addresses[0].url}</div>
+          <div class="picked mono">{target}</div>
           <button
             type="button"
             class="btn"
-            onclick={() => copy(selected ?? addresses[0].url)}
+            onclick={() => copy(target)}
           >
-            {copied === (selected ?? addresses[0].url) ? '已复制' : '复制地址'}
+            {copied === target ? '已复制' : '复制地址'}
           </button>
           <p class="qr-cap">
             手机需与电脑在同一局域网（同一 Wi-Fi）。扫码后可直接使用看板与任务详情，
             实时进度经 SSE 推送。
           </p>
+          {#if token}
+            <div class="pair">
+              <span class="pair-note">
+                二维码已带上配对令牌：扫这一次，这台手机就能改任务、也能跟值班长说话。
+              </span>
+              <button type="button" class="btn" disabled={reset} onclick={() => void doReset()}>
+                {reset ? '正在重置…' : '重置配对'}
+              </button>
+            </div>
+          {:else}
+            <p class="pair-note">
+              没有取到配对令牌（它只在电脑本机可读）。手机仍能看看板、任务详情与指标，
+              但改任务与对话要先在这台电脑上重新打开本页扫码配对。
+            </p>
+          {/if}
         </div>
       </div>
 
@@ -155,8 +201,9 @@ host = "0.0.0.0"</code></pre>
       {/if}
 
       <p class="warn">
-        ⚠ 同一网段的任何设备都能访问本服务的全部接口（v1 无鉴权），请勿在公共
-        Wi-Fi 下开启。用完可重启服务回到仅回环绑定。
+        ⚠ 同一网段的设备都能看本服务的只读页面（看板 / 会话 / 指标 / 本页）；
+        改任务与跟值班长对话需要配对——二维码里那个令牌就是凭据。
+        怀疑泄露时点「重置配对」，旧令牌立即失效，各设备重扫一次即可。
       </p>
     {/if}
   {/if}
@@ -230,6 +277,25 @@ host = "0.0.0.0"</code></pre>
     margin-top: 12px;
     color: var(--text-3);
     line-height: 1.8;
+  }
+  /* 配对区（决策 182㉙）：与二维码同栏，读的次序是「先扫，扫完就配好了」 */
+  .pair {
+    margin-top: 12px;
+    display: flex;
+    align-items: center;
+    gap: 12px;
+    flex-wrap: wrap;
+  }
+  .pair-note {
+    margin-top: 12px;
+    color: var(--text-3);
+    line-height: 1.8;
+    max-width: 62ch;
+  }
+  .pair .pair-note {
+    margin-top: 0;
+    flex: 1;
+    min-width: 0;
   }
   .alt {
     margin-top: 18px;

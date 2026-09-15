@@ -1,95 +1,292 @@
 <script lang="ts">
-  import type { AllowedAction, BranchCursor, TaskListItem } from '../api/types';
-  import { getConversations, getTask } from '../api/client';
+  import { onMount } from 'svelte';
+  import type {
+    AllowedAction,
+    BranchCursor,
+    ForemanBriefing,
+    ForemanSession,
+    ForemanTrace,
+    SseEvent,
+    Stage,
+    TaskListItem,
+  } from '../api/types';
+  import type { SpriteName } from '../theme/contract';
+  import { getForemanSession, getTask, sendForemanMessage } from '../api/client';
   import { board } from '../stores/board.svelte';
   import {
+    BOARD_COLUMNS,
+    COLUMN_SPRITES,
     formatDuration,
     formatTokens,
     pendingLabel,
     taskDuration,
   } from '../lib/pipeline';
+  import { TaskStream, type StreamStatus } from '../realtime/connection';
+  import {
+    appendForemanDelta,
+    beginForemanStream,
+    emptyForemanStream,
+    failForemanStream,
+    settleForemanStream,
+    type ForemanStreamState,
+  } from '../realtime/foreman';
   import Sprite from '../components/render/Sprite.svelte';
   import Gauge from '../components/render/Gauge.svelte';
   import PendingActions from '../components/board/PendingActions.svelte';
   import { router } from '../router.svelte';
 
   /**
-   * 对讲台（theme-6-pixel.md §3.3「与工头对话」；决策 174）。
+   * 对讲台（theme-6-pixel.md §3.3；决策 174 / 182）。版面**三分区**（票 04）：
+   * 状态区（当前急停 + 值班板）／对话时间线（值班长的话、值班员的话、工位回执）／输入坞。
    *
-   * **不造聊天组件**：一列对话 = 一叠操作台对话框（`.turn` 即对话框本体：
-   * 双线框 + 压在框沿上的名牌 tab = 发言者），故不再另加一行 who，也不做左右交替气泡。全站唯一的响仍只在
-   * 急停一处——待拍板那轮挂 `.warn`（琥珀框 + ▼ + 恢复动作），其余轮次一律收在 `--pane`。
+   * **整页钉在视口内，时间线是唯一会滚的区域**：一个两小时前挂起的急停被对话顶出视野
+   * 是本页最不能出的错，故不靠 sticky 逐段救，而是把「会长的部分」与「不能动的部分」
+   * 放在两个不同的滚动容器里。
    *
-   * **数据全部真实，不编造对话内容**：本页把**已有端点**的读数组织成对话形态——
-   * 工头的发言 = 由 pending 理由 / 各工位会话摘要**确定性拼装**的状态转述（不是 LLM 生成）；
-   * 工位回执 = 各 stage 的会话（`GET /tasks/{id}/conversations`）与命令流。没有真实
-   * agent 人格之前，工头不是一个会说话的后端实体（决策 50 / 附录 B.2 属 v2），
-   * 故此页**是真实状态的对话式视图，不是可自由对话的 chat**——输入口只承载
-   * `requires_input` 的恢复动作（决策 79 的唯一自由输入例外）。
+   * **对面是真的会说话的值班长**（`/foreman/session` + `/foreman/messages` + `/foreman/stream`）：
+   * 对话不依赖任务——空看板（无项目无任务）也照样能问它话。
+   *
+   * **值班长的回复里永远没有按钮**：写动作只在状态区的急停轮里渲染（后端下发的
+   * `allowed_actions`，决策 101）。同一个动作在两处各渲染一颗钮，会让「哪个是真的」
+   * 变成使用者必须思考的问题。空态的「去看板新建任务」是页面固定的**导航钮**，不进动作契约。
+   *
+   * **全站唯一的响仍只在急停一处**：值班长一律收在 `--pane`，不占琥珀档；发送失败走
+   * 时间线里的一轮（红），不弹窗、不 toast。
+   *
+   * **不造聊天组件**：一列对话 = 一叠操作台对话框（`.turn` 即对话框本体，压在框沿上的
+   * 名牌 tab = 发言者），故不另加 who 行，也不做左右交替气泡。
    */
 
   let loading = $state(true);
-  let error = $state<string | null>(null);
+  let loadError = $state<string | null>(null);
+  /** 会话台账（时间线的权威内容；每次回话后重取，不自攒一份账）。 */
+  let session = $state<ForemanSession | null>(null);
+
+  let input = $state('');
+  let sending = $state(false);
+  /** 正在发的那句话（台账里还没有它的回话，故先以乐观轮显示）。 */
+  let pendingText = $state<string | null>(null);
+  let stream = $state<ForemanStreamState>(emptyForemanStream());
+  let streamStatus = $state<StreamStatus>('idle');
+
   /** 每个 pending 任务的详情（allowed_actions 只在详情里下发，决策 101）。 */
-  let details = $state<
-    Record<string, { actions: AllowedAction[]; cursors: BranchCursor[] }>
-  >({});
-  /** 每个 pending 任务的节点运行摘要（工位回执的真实读数）。 */
-  let conversationsByTask = $state<
-    Record<string, Awaited<ReturnType<typeof getConversations>>>
-  >({});
+  let details = $state<Record<string, { actions: AllowedAction[]; cursors: BranchCursor[] }>>({});
 
   const pending = $derived(board.pendingTasks);
-  const running = $derived(board.tasks.filter((t) => t.status === 'running'));
+  /** 空看板：装载完成之后一个任务都没有（装载中不算——那会把「还没读到」说成「空」）。 */
+  const emptyBoard = $derived(!board.loading && board.tasks.length === 0);
 
-  /** 8 工位的值班灯：按列聚合，与看板列头同一套状态语汇。 */
+  /** 8 工位的值班灯：按列聚合，与看板列头同一套词表与 sprite（`BOARD_COLUMNS`）。 */
   const crew = $derived(
-    [
-      { key: 'init', label: 'init', sprite: 'flag' as const },
-      { key: 'architect-design', label: 'architect-design', sprite: 'gem' as const },
-      { key: 'develop-design ∥ test-design', label: 'develop-design ∥ test-design', sprite: 'hammer' as const },
-      { key: 'develop', label: 'develop', sprite: 'gear' as const },
-      { key: 'review', label: 'review', sprite: 'lens' as const },
-      { key: 'test', label: 'test', sprite: 'shield' as const },
-      { key: 'merge', label: 'merge', sprite: 'merge' as const },
-      { key: 'done', label: 'done', sprite: 'trophy' as const },
-    ].map((col) => {
-      const stages =
-        col.key === 'develop-design ∥ test-design'
-          ? ['develop-design', 'test-design']
-          : [col.key];
-      const tasks = board.tasks.filter((t) => stages.includes(t.current_stage));
+    BOARD_COLUMNS.map((col) => {
+      const tasks = board.tasks.filter((t) => col.stages.includes(t.current_stage));
       const pen = tasks.some((t) => t.status === 'pending');
       const live = tasks.some((t) => t.status === 'running');
       const don = tasks.length > 0 && tasks.every((t) => t.status === 'done');
       return {
-        ...col,
+        key: col.key,
+        label: col.label,
+        sprite: COLUMN_SPRITES[col.key],
         count: tasks.length,
         state: pen ? 'warn' : live ? 'run' : don ? 'done' : 'idle',
       };
     }),
   );
 
-  /** 工头开场白：由真实计数确定性拼装（不是模型生成的寒暄）。 */
-  const briefing = $derived.by(() => {
-    const p = pending.length;
-    const r = running.length;
-    if (p === 0 && r === 0) {
-      return '夜班安静。当前没有在跑的任务，也没有等你拍板的事。';
+  interface TurnView {
+    key: string;
+    kind: 'fm' | 'mine' | 'failed';
+    content: string;
+    /** 流式尾随方块光标（既有 `.streaming`，不新增动画位）。 */
+    streaming: boolean;
+    /** 断流/出错：这一轮只有已收到的部分。 */
+    partial: boolean;
+    /** 该轮工具痕迹（台账查读），空数组 = 这一轮没翻台账。 */
+    traces: ForemanTrace[];
+    briefing: ForemanBriefing | null;
+    /** 失败原因是「这台设备还没配对」（票 07）：只有它会挂出配对入口。 */
+    needsPairing: boolean;
+  }
+
+  const turns = $derived.by<TurnView[]>(() => {
+    const out: TurnView[] = (session?.messages ?? []).map((m) => ({
+      key: `m${m.id}`,
+      kind: m.role === 'user' ? 'mine' : 'fm',
+      content: m.content,
+      streaming: false,
+      partial: false,
+      traces: m.traces ?? [],
+      briefing: m.briefing,
+      needsPairing: false,
+    }));
+    if (pendingText) {
+      out.push({
+        key: 'pending',
+        kind: 'mine',
+        content: pendingText,
+        streaming: false,
+        partial: false,
+        traces: [],
+        briefing: null,
+        needsPairing: false,
+      });
     }
-    const bits: string[] = [];
-    if (r > 0) bits.push(`${r} 个在跑`);
-    if (p > 0) bits.push(`${p} 个急停等人`);
-    return `夜班正常。${bits.join('、')}。`;
+    if (sending || stream.text) {
+      out.push({
+        key: 'live',
+        kind: 'fm',
+        // 还没收到第一个增量时不摆空白：给一句"对面在动"的实情，光标说明还在流
+        content: stream.text || '值班长正在查台账…',
+        streaming: stream.streaming,
+        partial: !stream.streaming && stream.text.length > 0,
+        traces: [],
+        briefing: null,
+        needsPairing: false,
+      });
+    }
+    if (stream.error) {
+      out.push({
+        key: 'send-error',
+        kind: 'failed',
+        content: `发送失败：${stream.error}`,
+        streaming: false,
+        partial: false,
+        traces: [],
+        briefing: null,
+        needsPairing: needsPairing(stream.error),
+      });
+    }
+    return out;
   });
 
-  /** 最久的 pending（等最长的在最上，与移动款待处理页同一口径）。 */
-  const oldest = $derived(
-    [...pending].sort((a, b) => Date.parse(a.updated_at) - Date.parse(b.updated_at))[0],
-  );
+  /**
+   * 失败原因是「这台设备还没配对」吗（票 07）。
+   *
+   * 判据是后端的 403 报文原文，而不是 HTTP 状态码：403 在本应用里还被跨源防护用着
+   * （决策 128），只看状态码会把「Origin 不对」也挂上配对入口——那是一条走不通的指引。
+   */
+  function needsPairing(message: string): boolean {
+    return message.includes('还没配对');
+  }
+
+  async function reload(): Promise<boolean> {
+    try {
+      session = await getForemanSession();
+      loadError = null;
+      return true;
+    } catch (err) {
+      loadError = (err as Error).message;
+      return false;
+    } finally {
+      loading = false;
+    }
+  }
+
+  function onStreamEvent(_taskId: string, event: SseEvent) {
+    // 只在等回话期间累积：收尾后到达的尾巴不得再造一轮（回话以台账为准）
+    if (!sending) return;
+    stream = appendForemanDelta(stream, event);
+  }
+
+  let conn: TaskStream | null = null;
+
+  function onVisible() {
+    if (document.visibilityState !== 'visible') return;
+    void reload();
+    conn?.reconnectNow();
+  }
+
+  onMount(() => {
+    void reload();
+    // 复用任务流的分帧 / 退避 / 主动重连（票 03）：工头流只是换了一条路径
+    conn = new TaskStream(
+      '',
+      {
+        onEvent: onStreamEvent,
+        onStatus: (_id, status) => (streamStatus = status),
+      },
+      { path: '/foreman/stream' },
+    );
+    conn.start();
+    document.addEventListener('visibilitychange', onVisible);
+    return () => {
+      document.removeEventListener('visibilitychange', onVisible);
+      conn?.stop();
+      conn = null;
+    };
+  });
+
+  async function send() {
+    const text = input.trim();
+    if (!text || sending) return;
+    sending = true;
+    pendingText = text;
+    stream = beginForemanStream();
+    try {
+      const res = await sendForemanMessage(text);
+      // 回话是权威值：先收敛流式文本（重取台账期间不闪空），再以台账覆盖
+      stream = settleForemanStream(stream, res.reply);
+      input = '';
+      if (await reload()) {
+        pendingText = null;
+        stream = emptyForemanStream();
+      }
+    } catch (err) {
+      // 失败不改输入框内容：后端在叫模型之前已把 user 行落库，人改几个字就能重发
+      // （决策 182㉓）。失败以时间线里的一轮呈现——不弹窗、不 toast。
+      stream = failForemanStream(stream, (err as Error).message);
+      // 重取成功才撤乐观轮：撤了之后这话由台账那一行承担，不靠重取失败时凭空消失
+      if (await reload()) pendingText = null;
+    } finally {
+      sending = false;
+    }
+  }
+
+  function onKeydown(event: KeyboardEvent) {
+    // Enter 发送 / Shift+Enter 换行。`isComposing` 必须挡：中文输入法用 Enter 选字，
+    // 不挡的话选字即发送。
+    if (event.key !== 'Enter' || event.shiftKey || event.isComposing) return;
+    event.preventDefault();
+    void send();
+  }
+
+  /** 值班长的两个只读工具（`FOREMAN_TOOLS`）；未登记的照原样显示。 */
+  const TOOL_LABELS: Record<string, string> = {
+    read_task: '读任务台账',
+    read_conversation: '读工位会话',
+  };
+
+  /** 工位名 → sprite：快照里的 stage 是后端字符串，未登记的值不猜（退回台账箱）。 */
+  function stageSprite(stage: string): SpriteName {
+    const col = BOARD_COLUMNS.find((c) => c.stages.includes(stage as Stage));
+    return col ? COLUMN_SPRITES[col.key] : 'chest';
+  }
 
   /**
-   * 拉取每个 pending 任务的详情与会话摘要。
+   * 工具痕迹 → 回执行（§3.3 纪律 3）。
+   *
+   * 能对上该轮快照里的任务就标出来源**工位**：像素本身不可考，靠 sprite + 工位名双编码。
+   * 对不上（例如查了一次就没了的任务）就只说这是台账查读，不假装知道出处。
+   */
+  function receipt(trace: ForemanTrace, briefing: ForemanBriefing | null): {
+    sprite: SpriteName;
+    workshop: string;
+    label: string;
+  } {
+    const known = [
+      ...(briefing?.pending ?? []),
+      ...(briefing?.running ?? []),
+      ...(briefing?.failed ?? []),
+    ].find((b) => trace.args_summary.includes(b.task_id));
+    return {
+      sprite: known ? stageSprite(known.stage) : 'chest',
+      workshop: known?.stage ?? '台账',
+      label: TOOL_LABELS[trace.tool] ?? trace.tool,
+    };
+  }
+
+  /**
+   * 拉取每个 pending 任务的详情（`allowed_actions` 只在详情下发，决策 101）。
    *
    * **必须随 pending 集合变化重拉，不能只在 onMount 拉一次**：`board.init()` 是异步的
    * （App.svelte 的 onMount 发起），本页 onMount 时 `board.tasks` 往往还是空的——
@@ -97,30 +294,18 @@
    * 按钮，把后端下发的恢复动作整片吞掉（e2e ⑩ 打红即此）。
    */
   async function loadDetails(tasks: TaskListItem[]) {
-    loading = true;
-    error = null;
-    try {
-      const next: Record<string, { actions: AllowedAction[]; cursors: BranchCursor[] }> = {};
-      const convs: Record<string, Awaited<ReturnType<typeof getConversations>>> = {};
-      await Promise.all(
-        tasks.map(async (t) => {
-          try {
-            // allowed_actions 只在详情下发（决策 101）；会话摘要作工位回执读数
-            const [detail, list] = await Promise.all([getTask(t.id), getConversations(t.id)]);
-            next[t.id] = { actions: detail.allowed_actions, cursors: detail.cursors };
-            convs[t.id] = list;
-          } catch {
-            // 单个任务失败不影响整页（与看板补详情同一姿态）
-          }
-        }),
-      );
-      details = next;
-      conversationsByTask = convs;
-    } catch (err) {
-      error = (err as Error).message;
-    } finally {
-      loading = false;
-    }
+    const next: Record<string, { actions: AllowedAction[]; cursors: BranchCursor[] }> = {};
+    await Promise.all(
+      tasks.map(async (t) => {
+        try {
+          const detail = await getTask(t.id);
+          next[t.id] = { actions: detail.allowed_actions, cursors: detail.cursors };
+        } catch {
+          // 单个任务失败不影响整页（与看板补详情同一姿态）
+        }
+      }),
+    );
+    details = next;
   }
 
   /**
@@ -143,8 +328,6 @@
     // 空集合无需拉取：直接清空上一次的读数
     if (!key) {
       details = {};
-      conversationsByTask = {};
-      loading = false;
       return;
     }
     void loadDetails(pending);
@@ -166,135 +349,162 @@
   <div class="talk-head">
     <h1 class="tt">对讲台</h1>
     <div class="ts">
+      <span>{session?.foreman.wired === false ? '值班长未接线' : '值班中'}</span>
+      <span class="sep">▪</span>
       <span>夜班态势：8 工位</span>
+      <span class="sep">▪</span>
+      <span>本次会话 {session ? formatTokens(session.total_tokens) : '—'} tok</span>
       <span class="sep">▪</span>
       <a class="crumb" href="#/" onclick={() => router.navigate('/')}>看板</a>
     </div>
   </div>
 
-  {#if error}
-    <div class="blank error">{error}</div>
-  {/if}
-
-  <main class="talk-main">
-    <!-- 工头开场：由真实计数拼装的状态转述 -->
-    <div class="turn">
-      <div class="dname">工头</div>
-      <p>{briefing}</p>
-      {#if oldest}
-        <p>
-          <b>最久的一处</b>是「{oldest.title}」，
-          {pendingLabel(oldest.pending_reason)}，停在 {oldest.current_stage}。
-        </p>
-      {/if}
-    </div>
-
-    {#if loading && pending.length === 0}
-      <div class="turn">
-        <div class="dname">工头</div>
-        <p>正在读夜班台账…</p>
-      </div>
-    {:else if pending.length === 0 && running.length === 0}
-      <!-- 全空态：开场白已报了「没有待办」，此处不再重复一句，只给下一步 -->
-      <div class="turn">
-        <div class="dname">操作台</div>
-        <p>
-          新建一个任务，流水线会从 init 开始走；走到需要你拍板的地方，这里会出现操作台对话框。
-        </p>
-        <button type="button" class="btn solid" onclick={() => router.navigate('/')}>
-          去看板新建任务
-        </button>
-      </div>
-    {:else}
-      <!-- 每个 pending 任务 = 一轮「等你拍板」的对话框（全站唯一"响"的一处） -->
-      {#each pending as task (task.id)}
-        {@const detail = details[task.id]}
-        {@const convs = conversationsByTask[task.id] ?? []}
-        <div class="turn warn">
-          <div class="dtag">⏸ 等你拍板 · {pendingLabel(task.pending_reason)}</div>
-          <div class="dname">工头</div>
-          <p>
-            「{task.title}」走到 {task.current_stage}，{task.pending_reason?.message ?? '需要你决定'}。
-          </p>
-          <div class="ctx">
-            状态：<b>{task.status}</b> ▪ 已跑 {formatDuration(taskDuration(task))} ▪
-            <Gauge tokens={task.total_tokens} tone="warn" /> {formatTokens(task.total_tokens)} tok
-          </div>
-
-          <!-- 回执：转述各工位读数（真实会话摘要），左缘亮度阶、无框 -->
-          {#if convs.length > 0}
-            <details class="rcpts">
-              <summary class="rcpts-sum">
-                工位回执 <span class="dim">{convs.length} 次节点运行 ▸</span>
-              </summary>
-              {#each convs.slice(-6) as c (c.run_id)}
-                <div class="rcpt">
-                  <div class="rcpt-head">
-                    <Sprite name="gear" size={10} />
-                    <span class="nm">{c.stage}</span>
-                    <span class="dim">{c.agent_type}</span>
-                    <span class="rs">{formatTokens(c.prompt_tokens + c.completion_tokens)} tok</span>
-                  </div>
-                </div>
-              {/each}
-            </details>
-          {/if}
-
-          <div class="grp">恢复动作</div>
-          {#if detail}
-            <PendingActions
-              actions={detail.actions}
-              cursors={detail.cursors}
-              pendingType={task.pending_reason?.type}
-              disabled={board.actionBusy === `${task.id}:${task.pending_reason?.type}`}
-              onaction={(a, opts) => handleAction(task.id, a, opts)}
-            />
-          {:else}
-            <button type="button" class="btn" onclick={() => router.navigate(`/task/${task.id}`)}>
-              打开任务详情
-            </button>
-          {/if}
-
-          {#if board.actionError && board.actionBusy === null}
-            <div class="ctx err">{board.actionError}</div>
-          {/if}
-        </div>
-      {/each}
-
-      {#if running.length > 0}
-        <!-- 在跑的工位：工头报一句进度（真实读数），不占恢复动作 -->
-        <div class="turn">
-          <div class="dname">工头</div>
-          <p>
-            还有 {running.length} 个在跑：{running.map((t) => t.title).join('、')}。
-            它们会自己往下走，走完再叫你。
-          </p>
-          {#each running.slice(0, 4) as t (t.id)}
-            <div class="rcpt">
-              <div class="rcpt-head">
-                <Sprite name="gear" size={10} />
-                <span class="nm">{t.title}</span>
-                <span class="rs live">▶ {t.current_stage}</span>
-              </div>
-            </div>
-          {/each}
-        </div>
-      {/if}
+  <!-- ── 状态区：当前急停 + 值班板。钉在第一屏，不随时间线滚动（票 04） ── -->
+  <section class="zone-status" aria-label="值班台">
+    {#if loadError}
+      <div class="blank error">{loadError}</div>
     {/if}
 
-    <!-- 操作台：本页没有自由对话（决策 79 唯一自由输入是 info_insufficient 的补充说明，
-         已在各轮的恢复动作里）。此处只做指引，不做假输入框。 -->
-    <div class="typer">
-      <div class="dname">操作台</div>
-      <p class="typer-note">
-        自由对话需要一个会说话的工头 agent——决策 50 / 附录 B.2 把它排在 v2，
-        v1 的输入口只承载「信息不足」的补充说明。上面每一轮的恢复动作就是当前可下发的全部动作。
-      </p>
-    </div>
-  </main>
+    {#each pending as task (task.id)}
+      {@const detail = details[task.id]}
+      <!-- 急停轮：全站唯一"响"的一处（琥珀框 + ▼ + 恢复动作） -->
+      <article class="turn warn">
+        <div class="dtag">⏸ 等你拍板 · {pendingLabel(task.pending_reason)}</div>
+        <!-- 名牌是发言者：这一轮是操作台在报"卡住了、要你按键"，不是值班长在说话
+             （值班长的话一律没有按钮，见 §3.3 的四条纪律） -->
+        <div class="dname">操作台</div>
+        <p>
+          「{task.title}」走到 {task.current_stage}，{task.pending_reason?.message ?? '需要你决定'}。
+        </p>
+        <div class="ctx">
+          状态：<b>{task.status}</b> ▪ 已跑 {formatDuration(taskDuration(task))} ▪
+          <Gauge tokens={task.total_tokens} tone="warn" /> {formatTokens(task.total_tokens)} tok
+        </div>
 
-  <!-- 右栏：值班板（复用台账盒语汇） -->
-  <aside class="talk-side">
+        <div class="grp">恢复动作</div>
+        {#if detail}
+          <PendingActions
+            actions={detail.actions}
+            cursors={detail.cursors}
+            pendingType={task.pending_reason?.type}
+            disabled={board.actionBusy !== null}
+            isBusy={(a) => board.actionBusy === `${task.id}:${a.action}`}
+            onaction={(a, opts) => handleAction(task.id, a, opts)}
+          />
+        {:else}
+          <!-- 详情没到（拉取失败）：只给去看详情的路，不假装动作集是空的 -->
+          <button type="button" class="btn" onclick={() => router.navigate(`/task/${task.id}`)}>
+            打开任务详情
+          </button>
+        {/if}
+
+        {#if board.actionError && board.actionBusy === null}
+          <div class="ctx err">{board.actionError}</div>
+        {/if}
+      </article>
+    {/each}
+
+    {#if pending.length === 0}
+      <div class="no-stop">
+        <p>
+          当前没有急停。
+          {board.projects.length === 0 ? '这台机器还没接入项目——先接一个，流水线才有货箱。' : ''}
+        </p>
+        <!-- 导航钮：页面固定，不进后端动作契约（票 04） -->
+        {#if emptyBoard}
+          <button type="button" class="btn" onclick={() => router.navigate('/')}>去看板新建任务</button>
+        {/if}
+      </div>
+    {/if}
+  </section>
+
+  <!-- ── 对话时间线：值班长的话、值班员的话、工位回执。会滚、会长的那部分 ── -->
+  <section class="timeline" aria-label="对话时间线">
+    {#if loading && !session}
+      <div class="quiet">正在读会话台账…</div>
+    {:else if turns.length === 0}
+      <div class="quiet">还没有对话。说一句，值班长就在对面——它与任务无关，空班也答得上。</div>
+    {/if}
+
+    {#each turns as turn (turn.key)}
+      <article
+        class="turn"
+        class:fm={turn.kind === 'fm'}
+        class:mine={turn.kind === 'mine'}
+        class:failed={turn.kind === 'failed'}
+      >
+        <div class="dname">
+          {turn.kind === 'failed' ? '发送失败' : turn.kind === 'mine' ? '值班员' : '值班长'}
+        </div>
+        <p class:streaming={turn.streaming}>{turn.content}</p>
+
+        {#if turn.partial}
+          <p class="dim note">流断了，上面是已经收到的部分；完整回话会在台账里补齐。</p>
+        {/if}
+
+        <!-- 配对入口（决策 182㉙，票 07）：非回环形态下缺令牌时后端回 403，报文里已经说清
+             「这台设备还没配对」。这里补的是**动作**——报文让人知道发生了什么，链接让人知道
+             下一步去哪。只在 403 且报文提到配对时出现，普通失败不挂这个出口。 -->
+        {#if turn.needsPairing}
+          <p class="note">
+            去看板顶栏的<a
+              class="crumb"
+              href="#/share"
+              onclick={() => router.navigate('/share')}>手机访问</a
+            >页，在已配对的设备上重扫一次二维码即可。
+          </p>
+        {/if}
+
+        <!-- 工位回执：转述不是发言（左缘亮度阶 + 无框，形状上就与发言不同）。
+             默认展开：回执是这一轮结论的出处，「可追溯性不因对话而丢失」是四条纪律之一 -->
+        {#if turn.traces.length > 0}
+          <details class="rcpts" open>
+            <summary class="rcpts-sum">
+              工位回执 <span class="dim">{turn.traces.length} 次台账查读 ▸</span>
+            </summary>
+            {#each turn.traces as trace, i (`${turn.key}-t${i}`)}
+              {@const r = receipt(trace, turn.briefing)}
+              <div class="rcpt">
+                <div class="rcpt-head">
+                  <Sprite name={r.sprite} size={10} />
+                  <span class="nm">{r.workshop}</span>
+                  <span class="dim">{r.label}</span>
+                  <span class="dim args">{trace.args_summary}</span>
+                  <span class="rs" class:bad={!trace.ok}>{trace.ok ? '已读' : '未读到'}</span>
+                </div>
+              </div>
+            {/each}
+          </details>
+        {/if}
+      </article>
+    {/each}
+  </section>
+
+  <!-- ── 输入坞：钉底。Enter 发送 / Shift+Enter 换行；发送中禁用 ── -->
+  <form class="typer" onsubmit={(e) => { e.preventDefault(); void send(); }}>
+    <div class="dname">值班员</div>
+    <textarea
+      class="input"
+      rows="2"
+      placeholder="对值班长说一句话（Enter 发送，Shift+Enter 换行）…"
+      bind:value={input}
+      disabled={sending}
+      onkeydown={onKeydown}
+    ></textarea>
+    <div class="typer-foot">
+      <span class="dim hint">
+        {#if sending}
+          值班长正在回话…
+        {:else if streamStatus === 'error'}
+          流断了：回话仍会以台账为准补上。
+        {/if}
+      </span>
+      <button type="submit" class="btn solid" disabled={sending || !input.trim()}>发送</button>
+    </div>
+  </form>
+
+  <!-- ── 值班板：桌面右栏；窄屏收成对话之上的横向灯条（`crew`） ── -->
+  <aside class="talk-side crew">
     <div class="reg">
       <div class="reg-head"><span>值班板</span><span class="n">8 工位</span></div>
       <ul class="brows">
@@ -309,23 +519,31 @@
       <div class="boks">
         在跑的工位会自己往下走，不用追问。<br />
         急停的只能你来按键。
-      </div>    </div>
+      </div>
+    </div>
   </aside>
 </div>
 
 <style>
-  /* 布局与视觉逐条对齐 theme-6-pixel.md §3.3 / 原型 #v-talk */
+  /* 三分区（票 04）：状态区 / 时间线 / 输入坞自上而下。整页钉在视口内，故时间线是
+     唯一会滚的区域——两小时前挂起的急停不会被它顶出视野。 */
   .talk {
     max-width: var(--split-max, 1240px);
     margin: 0 auto;
-    padding: 18px 20px 44px;
+    padding: 14px 20px 12px;
     display: grid;
-    grid-template-columns: 1fr var(--dossier-w, 340px);
-    gap: 18px;
-    align-items: start;
+    grid-template-columns: minmax(0, 1fr) var(--dossier-w, 340px);
+    grid-template-rows: auto auto minmax(0, 1fr) auto;
+    gap: 20px 18px;
+    /* 视口 = 顶栏 + 整页 + 底栏区 46px（body 下边距）。顶栏实测约 78–81px
+       （46px 铭牌行 + 约 33px 页面导航行 + 2px 下框；项目选择器在场时取上限）。
+       **多减一点是刻意的**：宁可让页面矮几像素，也不能让它能滚——整页一旦能滚，
+       「急停钉在第一屏」就只剩口头保证。 */
+    height: calc(100vh - 88px - 46px);
   }
   .talk-head {
     grid-column: 1 / -1;
+    grid-row: 1;
     display: flex;
     align-items: baseline;
     gap: 14px;
@@ -342,16 +560,49 @@
     gap: 14px;
     color: var(--text-3);
     align-items: baseline;
+    flex-wrap: wrap;
   }
   .sep {
     color: var(--text-4);
   }
-  .talk-main {
-    min-width: 0;
+  .crumb {
+    color: var(--text-3);
   }
-  .talk-side {
-    position: sticky;
-    top: 86px;
+  .crumb:hover {
+    color: var(--text-hi);
+  }
+
+  /* ── 状态区：钉在第一屏。上限留出时间线与输入坞的位置，超高时自己滚（急停永不消失） ── */
+  .zone-status {
+    grid-column: 1;
+    grid-row: 2;
+    /* 上留白给压在框沿上的名牌 tab；右留白给急停那轮的 4px 硬投影
+       （纵向一滚，横向的可见溢出会退化成 auto，不留白就多一条横向滚动条） */
+    padding: 20px 6px 4px 2px;
+    max-height: 46vh;
+    overflow-y: auto;
+  }
+  .no-stop {
+    color: var(--text-3);
+    line-height: 1.8;
+    display: flex;
+    align-items: center;
+    gap: 14px;
+    flex-wrap: wrap;
+  }
+
+  /* ── 时间线：唯一会滚的区域 ── */
+  .timeline {
+    grid-column: 1;
+    grid-row: 3;
+    min-height: 0;
+    overflow-y: auto;
+    padding: 20px 2px 6px; /* 上留白同上（名牌 tab） */
+  }
+  .quiet {
+    color: var(--text-3);
+    line-height: 1.8;
+    max-width: 78ch;
   }
 
   /* ── 单轮发言：操作台对话框本体（双线框 + 名牌 tab 即发言者） ──
@@ -367,11 +618,18 @@
       inset 0 0 0 2px var(--bg),
       inset 0 0 0 4px var(--pane);
   }
+  .turn:first-child {
+    margin-top: 0;
+  }
   .turn p {
     color: var(--text);
     margin-bottom: 7px;
     max-width: 76ch;
     overflow-wrap: anywhere;
+  }
+  /* 时间线里的话保留模型自己的换行（回话是排版好的文本，不是装饰） */
+  .timeline .turn p {
+    white-space: pre-wrap;
   }
   .turn p:last-child {
     margin-bottom: 0;
@@ -386,6 +644,26 @@
     padding: 0 8px;
     line-height: 1.5;
     white-space: nowrap;
+  }
+  /* 值班员的话与值班长的话只差名牌停靠与明暗档：不换底色、不换圆角、不加箭头（§3.3 纪律 1） */
+  .turn.mine .dname {
+    left: auto;
+    right: 6px;
+    color: var(--text-2);
+  }
+  .turn.mine p {
+    color: var(--text-2);
+  }
+  /* 发送失败：走失败红一档，仍不占琥珀（全站唯一的响只在急停） */
+  .turn.failed {
+    border-color: var(--stop);
+  }
+  .turn.failed .dname {
+    border-color: var(--stop);
+    color: var(--stop);
+  }
+  .turn.failed p {
+    color: var(--stop);
   }
   /* ▼ 光标默认不画：只有待拍板那一轮点亮（§3.3 纪律 2） */
   .turn::after {
@@ -437,6 +715,9 @@
   .dim {
     color: var(--text-4);
   }
+  .note {
+    font-size: 12px;
+  }
 
   /* ── 工位回执：转述不是发言（左缘 4px 亮度阶 + 无框，与命令输出同一手法） ── */
   .rcpts {
@@ -464,21 +745,30 @@
   }
   .rcpt-head .nm {
     color: var(--text-2);
+    flex: none;
+  }
+  .rcpt-head .args {
+    flex: 1;
+    min-width: 0;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
   }
   .rcpt-head .rs {
     margin-left: auto;
     flex: none;
     color: var(--text-4);
   }
-  .rcpt-head .rs.live {
-    color: var(--go);
+  .rcpt-head .rs.bad {
+    color: var(--stop);
   }
 
-  /* ── 操作台：不做假输入框，只讲清 v1 的边界 ── */
+  /* ── 输入坞：对话框形（双线框），描边 --pane、名牌收 --t3；主动作交给既有实心 ▶ 钮 ── */
   .typer {
+    grid-column: 1;
+    grid-row: 4;
     position: relative;
-    margin: 28px 0 0;
-    padding: 12px 12px 10px;
+    padding: 10px 12px 11px;
     background: var(--bg);
     border: 2px solid var(--pane);
     box-shadow:
@@ -488,13 +778,30 @@
   .typer .dname {
     color: var(--text-3);
   }
-  .typer-note {
-    color: var(--text-3);
-    line-height: 1.8;
-    max-width: 78ch;
+  .typer textarea {
+    resize: none; /* 坞的高度是版面的一部分，不让人拖坏三分区 */
+  }
+  .typer-foot {
+    display: flex;
+    align-items: center;
+    gap: 12px;
+    margin-top: 6px;
+  }
+  .typer-foot .hint {
+    flex: 1;
+    min-width: 0;
   }
 
   /* ── 值班板（复用 .reg 台账盒语汇） ── */
+  .talk-side {
+    grid-column: 2;
+    grid-row: 2 / span 3;
+    align-self: start;
+    position: sticky;
+    top: 48px;
+    max-height: 100%;
+    overflow: auto;
+  }
   .brows {
     list-style: none;
   }
@@ -556,22 +863,64 @@
     padding: 10px 12px;
     border: 2px solid var(--pane);
     color: var(--text-3);
-    margin-top: 10px;
+    margin-bottom: 10px;
   }
   .blank.error {
     border-color: var(--stop);
     color: var(--stop);
   }
 
-  /* 移动款（§5）：右栏值班板收进正文流，单列 */
+  /* 移动款（§5 转写 4）：页头 → 值班灯条 → 状态区 → 竖排对话 → 钉底输入坞 */
   @media (max-width: 479px) {
     .talk {
-      display: block;
-      padding: 12px 12px 30px;
+      display: flex;
+      flex-direction: column;
+      gap: 14px;
+      padding: 10px 12px 12px;
+      /* 移动款顶栏 140px（138 + 2px 下框，e2e ⑩ 钉住这个定值）；底栏区同上。
+         同样多留 4px 余量（理由见桌面款） */
+      height: calc(100vh - 144px - 46px);
     }
+    .talk-head {
+      order: 1;
+    }
+    /* 值班板收成对话之上的横向灯条：横向滚动、不缩不折 */
     .talk-side {
+      order: 2;
       position: static;
-      margin-top: 18px;
+      /* 桌面那条 `align-self: start` 必须撤掉：灯条要靠父宽约束才会横向滚，
+         否则 aside 取 max-content 宽度、把整页撑出横向滚动条 */
+      align-self: stretch;
+      max-height: none;
+      overflow: visible;
+    }
+    .brows {
+      display: flex;
+      overflow-x: auto;
+    }
+    .brow {
+      flex: none;
+      border-bottom: 0;
+      border-right: 2px solid var(--wash);
+    }
+    .brow:last-child {
+      border-right: 0;
+    }
+    .boks {
+      display: none;
+    }
+    .zone-status {
+      order: 3;
+      max-height: 38vh;
+    }
+    .timeline {
+      order: 4;
+      flex: 1;
+      min-height: 0;
+    }
+    .typer {
+      order: 5;
+      flex: none;
     }
     .turn p {
       max-width: none;

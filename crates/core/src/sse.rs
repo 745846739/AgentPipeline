@@ -190,6 +190,23 @@ impl SseEvent {
         }
     }
 
+    /// 是否属于**对讲台**（值班长）的对话流（决策 182⑥）。
+    ///
+    /// 判据只有身份串一处：值班长发的增量事件带 `agent_type = "foreman"` 与**空 task id**。
+    /// 既有的 `/tasks/{id}/stream` 按 task id 精确匹配，空串永不等于真实任务 id，
+    /// 故它对工头事件天然零干扰——这条过滤**不是**用来隔离的（隔离已经成立），
+    /// 而是让新增的 `/foreman/stream` 说得清自己要哪一类事件。
+    ///
+    /// 只认会话增量：工具事件（`tool_event`）的载荷里没有 `agent_type`，
+    /// 无法与流水线节点的工具调用区分。值班长的工具痕迹走**落库的 `traces_json`**
+    /// 而不是实时事件（票 05），这也正是它不需要一个新事件变体的原因。
+    pub fn is_foreman_event(&self) -> bool {
+        matches!(
+            self,
+            SseEvent::ConversationDelta { agent_type, .. } if agent_type == crate::pipeline::foreman::FOREMAN_AGENT_TYPE
+        )
+    }
+
     pub fn task_id(&self) -> &str {
         match self {
             SseEvent::NodeStarted { task_id, .. }

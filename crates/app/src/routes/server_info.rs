@@ -13,6 +13,7 @@ use axum::Json;
 use serde::{Deserialize, Serialize};
 
 use crate::lan;
+use crate::peer::is_loopback_bind;
 use crate::state::AppState;
 
 /// `GET /server-info` 的响应体。
@@ -70,23 +71,16 @@ pub struct QrQuery {
 ///
 /// **只允许编码本服务自己的地址**（决策 167）：这个端点若接受任意 URL，就等于
 /// 给局域网里的任何人一个「用你的服务生成任意二维码」的图床，且分享页的
-/// `<img src>` 会把 URL 写进对方日志。校验方式是比对候选集合 + 回环集合。
+/// `<img src>` 会把 URL 写进对方日志。
+///
+/// 校验口径是 **origin 白名单**（票 07 放宽）：请求 URL 的 `scheme://host:port`
+/// 必须落在候选集合内，**允许追加 query**（配对 URL 就是 `{base}/?pair={token}`），
+/// 也允许追加 path——它们都离不开这个 origin，二维码仍只编码本服务地址。
 pub async fn qr_svg(State(state): State<AppState>, Query(query): Query<QrQuery>) -> Response {
     let allowed = allowed_qr_urls(&state);
-    let target = match query.url {
-        Some(url) => {
-            if !allowed.iter().any(|a| a == &url) {
-                return (StatusCode::BAD_REQUEST, "二维码只允许编码本服务的访问地址")
-                    .into_response();
-            }
-            url
-        }
-        None => match allowed.first() {
-            Some(url) => url.clone(),
-            None => {
-                return (StatusCode::BAD_REQUEST, "没有可用的访问地址").into_response();
-            }
-        },
+    let target = match resolve_qr_target(query.url, &allowed) {
+        Ok(url) => url,
+        Err((status, message)) => return (status, message).into_response(),
     };
 
     match render_svg(&target) {
@@ -107,6 +101,61 @@ pub async fn qr_svg(State(state): State<AppState>, Query(query): Query<QrQuery>)
     }
 }
 
+/// 扫码配对 URL 的形状（票 07）：`{base}/?pair={token}`。
+///
+/// 唯一事实源：分享页（前端）要把手机引到带令牌的地址，后端要把同一形状的 URL 编成
+/// 二维码——参数名与分隔符各写各的就会漂移（前端读 `pair`、后端发 `token` 这类）。
+/// 令牌是 Crockford base32（URL 安全字符），故直接拼接无需转义。
+pub fn pairing_url(base: &str, token: &str) -> String {
+    format!("{base}/?pair={token}")
+}
+
+/// URL 的 origin（`scheme://host:port`）。无 scheme / 无 authority 时 `None`。
+///
+/// 手写而不是引入 `url` crate：本项目不新增依赖，而这里只需要 origin 这一段。
+/// authority 取到第一个 `/ ? #` 为止，故 `host:port@evil.example` 这种带 userinfo 的
+/// 伪装串整体落不进白名单（白名单里只有纯 `host:port`）。
+fn origin_of(url: &str) -> Option<String> {
+    let (scheme, rest) = url.split_once("://")?;
+    if scheme.is_empty() {
+        return None;
+    }
+    let authority = rest.split(['/', '?', '#']).next().unwrap_or("");
+    if authority.is_empty() {
+        return None;
+    }
+    Some(format!("{scheme}://{authority}"))
+}
+
+/// 待编码 URL 是否放行：origin 落在白名单内即可（票 07 放宽，允许 query / path）。
+fn qr_url_allowed(url: &str, allowed: &[String]) -> bool {
+    match origin_of(url) {
+        Some(origin) => allowed.contains(&origin),
+        None => false,
+    }
+}
+
+/// 从请求参数选出要编码的地址。`Err` 是 (状态码, 面向用户的报文)。
+fn resolve_qr_target(
+    requested: Option<String>,
+    allowed: &[String],
+) -> Result<String, (StatusCode, &'static str)> {
+    match requested {
+        Some(url) => {
+            if qr_url_allowed(&url, allowed) {
+                // 原样返回（不只是 origin）：query 里的配对令牌必须进二维码
+                Ok(url)
+            } else {
+                Err((StatusCode::BAD_REQUEST, "二维码只允许编码本服务的访问地址"))
+            }
+        }
+        None => allowed
+            .first()
+            .cloned()
+            .ok_or((StatusCode::BAD_REQUEST, "没有可用的访问地址")),
+    }
+}
+
 /// 把候选地址转成响应项（含端口拼装）。抽成纯函数便于单测。
 fn build_addresses(addresses: &[lan::LanAddress], port: u16) -> Vec<AddressEntry> {
     addresses
@@ -119,18 +168,11 @@ fn build_addresses(addresses: &[lan::LanAddress], port: u16) -> Vec<AddressEntry
         .collect()
 }
 
-/// 绑定 host 是否为回环（决定手机能否直连）。
-fn is_loopback_bind(host: &str) -> bool {
-    matches!(host, "127.0.0.1" | "localhost" | "::1")
-        || host
-            .parse::<std::net::IpAddr>()
-            .is_ok_and(|ip| ip.is_loopback())
-}
-
-/// 允许被编码成二维码的 URL 集合：局域网候选地址 + 回环地址。
+/// 允许被编码成二维码的 origin 集合：局域网候选地址 + 回环地址。
 ///
-/// 回环也在集合内，是为了让「本机打开验证」这件事能复用同一端点（蓝牙 / 扫码
-/// 场景下用户可能只是在同机另一窗口打开）。
+/// 返回的字符串本身就是 origin 形态（`scheme://host:port`），既可直接作为
+/// [`resolve_qr_target`] 的白名单，也可在「未指定 url」时直接当默认地址渲染。
+/// 回环也在集合内，是为了让「本机打开验证」这件事能复用同一端点。
 fn allowed_qr_urls(state: &AppState) -> Vec<String> {
     let mut urls: Vec<String> = build_addresses(&lan::lan_addresses(), state.port)
         .into_iter()
@@ -196,6 +238,78 @@ mod tests {
             .and_then(|s| s.parse().ok())
             .expect("SVG 应含 width 属性");
         assert!(width >= 240, "二维码宽度应 ≥ 240px，实际 {width}");
+    }
+
+    #[test]
+    fn origin_of_extracts_scheme_host_port() {
+        assert_eq!(
+            origin_of("http://192.168.1.10:8787"),
+            Some("http://192.168.1.10:8787".to_string())
+        );
+        assert_eq!(
+            origin_of("http://192.168.1.10:8787/"),
+            Some("http://192.168.1.10:8787".to_string())
+        );
+        assert_eq!(
+            origin_of("http://192.168.1.10:8787/?pair=abc"),
+            Some("http://192.168.1.10:8787".to_string())
+        );
+        assert_eq!(
+            origin_of("http://192.168.1.10:8787?pair=abc"),
+            Some("http://192.168.1.10:8787".to_string())
+        );
+        assert_eq!(origin_of("not-a-url"), None);
+        assert_eq!(origin_of("http://"), None);
+    }
+
+    #[test]
+    fn qr_origin_whitelist_allows_query_but_not_other_origin() {
+        let allowed = vec![
+            "http://192.168.1.10:8787".to_string(),
+            "http://127.0.0.1:8787".to_string(),
+        ];
+        assert!(qr_url_allowed("http://192.168.1.10:8787", &allowed));
+        assert!(
+            qr_url_allowed("http://192.168.1.10:8787/?pair=tok", &allowed),
+            "白名单 origin 追加 query 必须放行（票 07 放宽）"
+        );
+        assert!(
+            !qr_url_allowed("http://192.168.1.10:9999/?pair=tok", &allowed),
+            "端口不同就是不同 origin"
+        );
+        assert!(!qr_url_allowed("http://evil.example/?pair=tok", &allowed));
+        assert!(
+            !qr_url_allowed("http://192.168.1.10:8787.evil.example/?pair=tok", &allowed),
+            "端口后缀伪装不成立"
+        );
+        assert!(
+            !qr_url_allowed("http://user@192.168.1.10:8787/", &allowed),
+            "带 userinfo 的 authority 落不进白名单"
+        );
+    }
+
+    #[test]
+    fn resolve_qr_target_preserves_the_query_string() {
+        let allowed = vec!["http://192.168.1.10:8787".to_string()];
+        let paired = pairing_url("http://192.168.1.10:8787", "01HZYTOKEN");
+        assert_eq!(
+            resolve_qr_target(Some(paired), &allowed).unwrap(),
+            "http://192.168.1.10:8787/?pair=01HZYTOKEN",
+            "返回的是原样 URL，配对令牌必须进二维码"
+        );
+        assert!(resolve_qr_target(Some("http://evil.example/?pair=x".into()), &allowed).is_err());
+        assert_eq!(
+            resolve_qr_target(None, &allowed).unwrap(),
+            "http://192.168.1.10:8787"
+        );
+    }
+
+    #[test]
+    fn pairing_url_shape_is_fixed() {
+        assert_eq!(
+            pairing_url("http://192.168.1.10:8787", "ABC123"),
+            "http://192.168.1.10:8787/?pair=ABC123"
+        );
     }
 
     #[test]

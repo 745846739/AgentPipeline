@@ -2,6 +2,7 @@
 
 pub mod cursor;
 pub mod executor;
+pub mod foreman;
 pub mod graph;
 pub mod landing;
 pub mod pseudo;
@@ -13,6 +14,10 @@ pub use cursor::{
     pending_cursors, project_pending_reason, project_task_status, runnable_cursors,
 };
 pub use executor::Executor;
+pub use foreman::{
+    build_briefing, trim_history, ForemanBriefing, ForemanRunner, ForemanTrace, ForemanTurn,
+    FOREMAN_AGENT_TYPE, FOREMAN_MAX_ROUNDS, FOREMAN_PERSONA, FOREMAN_STAGE_KEY, FOREMAN_TOOLS,
+};
 pub use graph::{build_pipeline_graph, PipelineGraph};
 pub use landing::{
     entry_node, next_is_join, next_stages, nodes_for_stage, skip_landing, stage_has_node,

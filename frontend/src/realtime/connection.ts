@@ -1,4 +1,4 @@
-import { apiUrl } from '../api/config';
+import { PAIRING_HEADER, apiUrl, getPairingToken } from '../api/config';
 import type { SseEvent } from '../api/types';
 
 /**
@@ -22,6 +22,14 @@ export interface TaskStreamHandlers {
 export interface TaskStreamOptions {
   baseDelayMs?: number;
   maxDelayMs?: number;
+  /**
+   * 流地址覆盖（票 03）。
+   *
+   * 值班长的流（`/foreman/stream`）与任务流是同一种 SSE：复用本类的分帧、退避与
+   * 主动重连，只换路径。**不另造第二个解析器**——两套分帧迟早各自漂移，而其中一套
+   * 的分帧错误只在生产的长 delta 上才现形。缺省是任务流地址。
+   */
+  path?: string;
 }
 
 /** 解析 SSE 帧，返回本次 chunk 产生的 data 载荷。纯函数，便于测试。 */
@@ -93,13 +101,21 @@ export class TaskStream {
   }
 
   private async loop(): Promise<void> {
+    // 路径在每次重连时重算：`path` 覆盖是本类唯一按宿主变化的东西
+    const path = this.options.path ?? `/tasks/${encodeURIComponent(this.taskId)}/stream`;
     while (!this.stopped) {
       this.setStatus('connecting');
       this.controller = new AbortController();
       try {
-        const res = await fetch(apiUrl(`/tasks/${encodeURIComponent(this.taskId)}/stream`), {
+        // 每次尝试都重读令牌：SSE 是 fetch 流不是 EventSource（决策 153②），所以头是能带的
+        // ——对讲台在非回环形态下是受护接口，缺它连不上（决策 182㉙）。放在循环内是为了
+        // 「先被 403、随后配对成功」的那条路能在下一次重连上带出新令牌。
+        const token = getPairingToken();
+        const headers: Record<string, string> = { Accept: 'text/event-stream' };
+        if (token) headers[PAIRING_HEADER] = token;
+        const res = await fetch(apiUrl(path), {
           method: 'GET',
-          headers: { Accept: 'text/event-stream' },
+          headers,
           signal: this.controller.signal,
         });
         if (!res.ok || !res.body) {

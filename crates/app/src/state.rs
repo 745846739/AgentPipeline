@@ -5,7 +5,7 @@ use std::sync::Arc;
 use agentpipeline_core::agent::market::MarketClient;
 use agentpipeline_core::config::Settings;
 use agentpipeline_core::home::Home;
-use agentpipeline_core::pipeline::Executor;
+use agentpipeline_core::pipeline::{Executor, ForemanRunner};
 use agentpipeline_core::sse::SseBus;
 use agentpipeline_core::storage::Store;
 use axum::http::StatusCode;
@@ -44,6 +44,13 @@ pub struct AppState {
     pub market: Option<Arc<dyn MarketClient>>,
     /// `[market] allowed_sources` 归一后的白名单（空白名单 = 不允许远程安装）。
     pub market_sources: Vec<String>,
+    /// 值班长运行器（决策 182，票 01）。
+    ///
+    /// **缺省 `None`**：没有它时三个对讲台端点返回 503「未接线」，而不是 panic 或
+    /// 一个静默的空会话。生产在 `serve` 里按 `ProductionLlm` 注入；契约测试注入
+    /// testkit 的 `FakeAgent`，于是「空 home 也能对上话」「越权工具被拒」这些验收锚点
+    /// 都能在**不打真网络**的前提下钉住。
+    pub foreman: Option<Arc<ForemanRunner>>,
 }
 
 impl AppState {
@@ -60,7 +67,14 @@ impl AppState {
             extra_allowed_origins: Vec::new(),
             market: None,
             market_sources: Vec::new(),
+            foreman: None,
         }
+    }
+
+    /// 注入值班长运行器（决策 182，票 01）。
+    pub fn with_foreman(mut self, runner: Arc<ForemanRunner>) -> Self {
+        self.foreman = Some(runner);
+        self
     }
 
     /// 注入技能市场客户端与放行来源（票 10）。
@@ -116,6 +130,15 @@ impl AppState {
         ];
         origins.extend(self.extra_allowed_origins.iter().cloned());
         origins
+    }
+
+    /// 是否处于**局域网形态**（决策 182㉖㉗，票 07）：绑定的不是回环地址。
+    ///
+    /// 配对令牌**只在这个形态下生效**——默认回环形态是本机自己使用，零摩擦是它必须
+    /// 保持的性质。把判定收在这一个具名谓词里，是因为「绑在哪里」这件事同时决定
+    /// `/server-info` 的提示（决策 167）与令牌是否生效（票 07），两处必须同源。
+    pub fn lan_mode(&self) -> bool {
+        !crate::peer::is_loopback_bind(&self.bind_host)
     }
 }
 
