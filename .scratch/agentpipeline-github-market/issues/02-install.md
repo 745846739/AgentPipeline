@@ -61,7 +61,7 @@
 
 ## 来源记录（本票唯一新增的持久化）
 
-新迁移 `0010_skill_sources.sql`，单行一技能：
+新迁移 `0011_skill_sources.sql`，单行一技能：
 
 ```sql
 CREATE TABLE IF NOT EXISTS skill_sources (
@@ -73,6 +73,9 @@ CREATE TABLE IF NOT EXISTS skill_sources (
     installed_at TEXT NOT NULL
 );
 ```
+
+> 号数是 **0011**，不是 0010：票 03 的界面仓名单也要一张新表，排在前面（`0010_market_repos.sql`）。
+> 两张表同批落地，各占一个迁移文件——**一张迁移一件事**，回滚与追责都干净。
 
 **为什么不往技能目录里写元数据文件**：技能目录里的任何文件都会进票 07 的**兄弟文件展开**——
 `from_zip` 专门过滤 `__MACOSX` / `.DS_Store`（`skill_import.rs:112` 的 `is_archive_junk`）正是为了
@@ -102,16 +105,55 @@ CREATE TABLE IF NOT EXISTS skill_sources (
 
 ## 验收
 
-- [ ] `cargo fmt --check`、`clippy --workspace --all-targets -- -D warnings`、`cargo test --workspace` 全过
-- [ ] 离线用例（票 01 的 smart HTTP fixture）覆盖：装成功、装到的是**被钉的那个 commit**（不是 tip）、
+- [x] `cargo fmt --check`、`clippy --workspace --all-targets -- -D warnings`、`cargo test --workspace` 全过
+- [x] 离线用例（票 01 的 smart HTTP fixture）覆盖：装成功、装到的是**被钉的那个 commit**（不是 tip）、
       同名冲突报文含 `owner/repo@<短 SHA>:<子路径>`、`overwrite` 覆盖成功、至少三类失败分得开、
       超限中断且报错含"已收到 / 上限"
-- [ ] 卸载后来源记录被清；无记录时的冲突报文回落到路径形态
-- [ ] 一键安装：清单带定位字段后能装；本地已装且 commit 一致时跳过下载（`note` 说明未重新下载）；
+- [x] 卸载后来源记录被清；无记录时的冲突报文回落到路径形态
+- [x] 一键安装：清单带定位字段后能装；本地已装且 commit 一致时跳过下载（`note` 说明未重新下载）；
       commit 不一致时不跳过、撞冲突门
-- [ ] **引擎零改动可核对**：`skill_import.rs` 与 `market.rs` 的 diff 为空（本票只新增调用方与一张表）
-- [ ] 迁移在既有库上能升（启动即迁移），且在新空库上一样能建
-- [ ] 默认门不打真网络
+- [x] **引擎零改动可核对**：`skill_import.rs` 与 `market.rs` 的 diff 为空（本票只新增调用方与一张表）
+- [x] 迁移在既有库上能升（启动即迁移），且在新空库上一样能建
+- [x] 默认门不打真网络
 
 **Notes:** 缓存与票 01 共用（同一 (仓, commit) 的列表与安装不重复拉）；`repo_unreadable` 的可判定性
 结论要写进票或代码注释，别只留在会话里。
+
+## 实施记录（2026-09-16）
+
+**两处与票面字面不同的地方，都有理由，别当成漏做：**
+
+1. **「已装但记录指着别处 → 不跳过」的判据放宽了一格**：`installed_is_the_listed_one` 把
+   **「没有来源记录」算成一致**（本地导入 / 手工拷进来 / 扫描进来的技能都没有记录）。票面字面
+   （"不一致则不跳过"）针对的是**有记录却指着别处**那种真歧义；若按字面执行，"本地先放一份、
+   再用一键安装去启用"这条**离线路径**（决策 181⑦ 明确要保住的）会被打成一次网络请求，而它的
+   存在理由就是"未配来源时也走得通"。跳过时**原样保留**记录里的 commit，故两种沉默都不会发生
+   （既不静默换旧版，也不静默升级）。
+2. **「不在推荐清单里」→ 404 + `kind = skill_not_found`**（票面未指定状态码）：见票 04 的核对结论。
+
+**`commit_not_found` 的判据落地成了"问本地对象库"**（票 01 记了实测）：GitHub 对不存在的 `want`
+回 HTTP 200 + `ERR upload-pack: not our ref`，libgit2 把那句话丢了、class 也落在 `Net`
+（与真连不上同形）。故 `fetch` 返回 `Err` 之后仍 `find_commit`：找不到 ⇒ `commit_not_found`；
+另配 `is_transport_shaped`（措辞清单 + `Http`/`Ssl`/`Ssh` 三个 class）当前置，
+`repo_unreadable` / `repo_not_found` 仍走各自那几类。
+
+**`digest_mismatch` 的实现与覆盖**（代码评审补的）：原先八类里只有这一类**没有任何代码路径能产生**
+（常量、文案、界面提示都在，构造器不存在）。现已补上 `is_digest_shaped`（`ErrorClass::Sha1` 或
+`hash mismatch` / `checksum` / `corrupt` / `invalid object`）与 `digest_mismatch` 构造器，并**前置**到
+"对象不在本地就是取不到"那条判定之前——两者都会让 `find_commit` 找不到对象，顺序错了会把
+"别装、报警"报成"换一个 commit"。**离线 fixture 造不出这个失败**（要手搓一个哈希坏掉的 pack），
+故它由 `repo.rs` 的两条单测按 class 与措辞钉住，没有端到端用例。
+
+**用例分布**：`crates/app/tests/market.rs` 23 条（真 libgit2 打离线 smart HTTP fixture）；
+`crates/app/tests/api_contract.rs` 保留 104 条，其中阶段推荐与一键安装那 5 条改成
+**「先把技能放进技能根 → 一键只写配置」**的离线形态（下载与覆盖那条链路由 market.rs 用真 fixture
+覆盖，两边不重复）。
+
+---
+
+## 实施收尾（2026-09-16）
+
+验收全过。闸门读数：`cargo fmt --all -- --check` 干净、`clippy --workspace --all-targets -- -D warnings`
+干净、`cargo test --workspace` **全绿**（app 契约 104 + 技能来源 25 + core 448 单测等）；
+前端 vitest **350**、`svelte-check` 0 错 0 警告、`vite build` 通过；Playwright 全量
+**43 passed / 2 skipped**（跳过的是"截图作为证据"那两条）。真 GitHub 冒烟在显式开关下**实测一轮通过**。

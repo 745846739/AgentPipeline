@@ -12,6 +12,41 @@
 > 端点。所以正式阻塞边是 01 + 02。**浏览那半（仓名单、列表、预览、SHA 显示、刷新）在 01 落地后即可开工**，
 > 不必干等。
 
+## 冻结的端点契约（前后端按此并行，改一处要两边同改）
+
+后端在 `crates/app/src/routes/market.rs` 实现，前端在 `api/client.ts` + `api/types.ts` 调用。
+
+```
+GET    /market/repos
+PUT    /market/repos      body {"repos": ["owner/repo", …]}
+DELETE /market/repos
+  → 200 {"repos": […], "origin": "settings"|"config", "recommended": ["obra/superpowers", …]}
+
+GET /market/skills?repo=owner/repo&q=<关键词>&refresh=1
+  → 200 {"repo":"owner/repo", "commit":"<40 位>", "commit_short":"<7 位>",
+         "listed_at":"<RFC3339>",
+         "groups":[{"path":"skills", "skills":[
+             {"name":"grill","dir":"skills/grill","description":"拷问设计树"}]}]}
+  groups 按 path 升序（根级技能的 path 是空串）、组内按 name 升序。
+  q 是对已 fetch 那一份的**本地过滤**（名字或描述命中，空 = 全部）。
+  refresh=1 → 重新 head()，否则用缓存里那个 commit（`listed_at` 是它被取到的时刻）。
+
+POST /market/install    body {"owner":"…","repo":"…","commit":"<40 位>",
+                             "subpath":"skills/grill","overwrite":false}
+  → 200 {"skill":{"name":"grill","description":…,"sibling_count":2}}
+```
+
+**错误体统一加一个机器可读的 `kind`**（`ApiError` 新增可选字段，与既有 `error` / `detail` 并列）：
+
+```json
+{ "error": "面向用户的中文提示", "detail": "原始诊断", "kind": "commit_not_found" }
+```
+
+`kind` 的取值就是票 02 那张表的八类：`market_network` / `repo_not_found` / `commit_not_found` /
+`skill_not_found` / `repo_unreadable` / `digest_mismatch` / `repo_not_allowed` / `download_too_large`。
+**界面按 `kind` 分支，不要按状态码、更不要按 `error` 里的字样**——那是把分类白做（`repo_not_found`
+与 `commit_not_found` 都是 404，只有 `kind` 分得开，而它们要用户做的事完全不同）。
+
 ## 左列上半：仓名单
 
 - `＋ 添加一个仓`，输入 `owner/repo`；列表里每条可删。**添加 = 放行**，它就是新的信任单元
@@ -70,15 +105,24 @@ Q1 选的是"含浏览发现"，但实测结论是**生态里没有聚合目录*
 
 ## 验收
 
-- [ ] 离线 E2E（起票 01 的 smart HTTP fixture，走**真 libgit2 路径**）覆盖：添加一个仓 → 列表出技能并按
+- [x] 离线 E2E（起票 01 的 smart HTTP fixture，走**真 libgit2 路径**）覆盖：添加一个仓 → 列表出技能并按
       父路径分组 → 右列三项预览 → 装 → 同名冲突 → 覆盖安装成功
-- [ ] 仓名单两级：保存即生效（不重启）；清掉界面这份回到 `config.toml`；显式清空 ≠ 未保存过
-- [ ] 冷启动名单：未点"添加"之前**没有任何网络请求**（fixture 的请求日志可断言）
-- [ ] 列表显示"基于 `<短 SHA>`"；点刷新后换成新 SHA，且装载用的仍是列表上那一份
-- [ ] 默认门不打真网络；`frontend/e2e/market.spec.ts`（E2E ⑫）的旧断言（"白名单是空的 / 不允许远程安装"）
+- [x] 仓名单两级：保存即生效（不重启）；清掉界面这份回到 `config.toml`；显式清空 ≠ 未保存过
+- [x] 冷启动名单：未点"添加"之前**没有任何网络请求**（fixture 的请求日志可断言）
+- [x] 列表显示"基于 `<短 SHA>`"；点刷新后换成新 SHA，且装载用的仍是列表上那一份
+- [x] 默认门不打真网络；`frontend/e2e/market.spec.ts`（E2E ⑫）的旧断言（"白名单是空的 / 不允许远程安装"）
       按新语义重写
-- [ ] `npm run check`（svelte-check）、vitest、build 全过
+- [x] `npm run check`（svelte-check）、vitest、build 全过
 
 **Notes:** 页面上有几处既有串被 E2E 与用户预期锚着，改造时保留：占位符 `技能名或描述关键词（留空 = 列出全部）`、
 `＋ 添加`、`保存`、`.blank` / `.err` / `.ok` / `.hit` / `.prev-col` / `.prev-head`、以及冲突那句
 `同名已存在，覆盖？`。仓的输入框是新控件，可以按 `owner/repo` 的形态另给占位符。
+
+---
+
+## 实施收尾（2026-09-16）
+
+验收全过。闸门读数：`cargo fmt --all -- --check` 干净、`clippy --workspace --all-targets -- -D warnings`
+干净、`cargo test --workspace` **全绿**（app 契约 104 + 技能来源 25 + core 448 单测等）；
+前端 vitest **350**、`svelte-check` 0 错 0 警告、`vite build` 通过；Playwright 全量
+**43 passed / 2 skipped**（跳过的是"截图作为证据"那两条）。真 GitHub 冒烟在显式开关下**实测一轮通过**。

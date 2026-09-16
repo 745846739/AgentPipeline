@@ -187,62 +187,108 @@ pub struct Recommendation {
 ///
 /// 每条推荐的技能都在本机 `~/.zcode/skills` 里逐个核过存在性与上述判据。
 /// 这是「推荐」二字的最低要求——推荐一个装上也用不了的技能比不推荐更糟。
-pub const STAGE_RECOMMENDATIONS: &[(&str, &str, &str)] = &[
-    (
-        "architect-design",
-        "grilling",
-        "把「事实自己查、只把决定问用户」拷问到位，产出经得起下游检验的规格",
-    ),
-    (
-        "architect-design",
-        "domain-modeling",
-        "在写设计文档前把术语与边界理清，词汇表与设计文档同源",
-    ),
-    (
-        "develop-design",
-        "codebase-design",
-        "开发方案要落在既有模块的接缝上，深模块词汇直接可用来写方案",
-    ),
-    (
-        "develop-design",
-        "research",
-        "需要外部事实（API / 库行为）时先把一手资料查清，再写方案",
-    ),
-    (
-        "test-design",
-        "tdd",
-        "测试场景设计沿用红-绿-重构的切分方式，场景与用例一一对应",
-    ),
-    (
-        "develop",
-        "tdd",
-        "实现阶段先写测试再写实现，是本流水线对开发节点的既有要求",
-    ),
-    (
-        "develop",
-        "resolving-merge-conflicts",
-        "撞上合并冲突时按既有纪律解决，不靠随手删冲突标记",
-    ),
-    (
-        "review",
-        "code-review",
-        "两轴评审（Standards / Spec）正是 review 节点的职责",
-    ),
-    (
-        "review",
-        "diagnosing-bugs",
-        "评审中发现的疑难缺陷按诊断循环定位，而不是猜着改",
-    ),
-    ("test", "tdd", "集成测试的写法与单元测试同源，避免两套风格"),
+/// 一条阶段推荐。
+///
+/// **为什么是结构体而不是 `(&str, &str, &str)` 元组**（决策 194 补的定位字段）：
+/// 清单的全部意义是"给还没装的人照着装"，而 GitHub 模式下"照着装"需要三样东西——
+/// 哪个仓、仓里哪个目录、哪个 commit。前两样现在就写在这里；commit 由列表在浏览那一刻
+/// 补上（不在清单里钉死，否则清单会随上游漂移而变成一份陈旧的名录）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct StageRecommendation {
+    /// 阶段名（[`crate::types::Stage::as_str`] 的取值）。
+    pub stage: &'static str,
+    pub name: &'static str,
+    pub reason: &'static str,
+    /// 来源仓 `owner/repo`（决策 194 的信任单元）。
+    pub repo: &'static str,
+    /// 技能目录在仓根内的相对路径。
+    ///
+    /// 值是**实测**的，不是推的：`mattpocock/skills` 的 37 个技能全在
+    /// `skills/{类别}/{名字}/SKILL.md`（深度 3 段，实测于 2026-09-16）。
+    /// 写错这个字段的后果是"一键安装报 skill_not_found"，所以它没有"大概"的余地。
+    pub dir: &'static str,
+}
+
+pub const STAGE_RECOMMENDATIONS: &[StageRecommendation] = &[
+    StageRecommendation {
+        stage: "architect-design",
+        name: "grilling",
+        reason: "把「事实自己查、只把决定问用户」拷问到位，产出经得起下游检验的规格",
+        repo: "mattpocock/skills",
+        dir: "skills/productivity/grilling",
+    },
+    StageRecommendation {
+        stage: "architect-design",
+        name: "domain-modeling",
+        reason: "在写设计文档前把术语与边界理清，词汇表与设计文档同源",
+        repo: "mattpocock/skills",
+        dir: "skills/engineering/domain-modeling",
+    },
+    StageRecommendation {
+        stage: "develop-design",
+        name: "codebase-design",
+        reason: "开发方案要落在既有模块的接缝上，深模块词汇直接可用来写方案",
+        repo: "mattpocock/skills",
+        dir: "skills/engineering/codebase-design",
+    },
+    StageRecommendation {
+        stage: "develop-design",
+        name: "research",
+        reason: "需要外部事实（API / 库行为）时先把一手资料查清，再写方案",
+        repo: "mattpocock/skills",
+        dir: "skills/engineering/research",
+    },
+    StageRecommendation {
+        stage: "test-design",
+        name: "tdd",
+        reason: "测试场景设计沿用红-绿-重构的切分方式，场景与用例一一对应",
+        repo: "mattpocock/skills",
+        dir: "skills/engineering/tdd",
+    },
+    StageRecommendation {
+        stage: "develop",
+        name: "tdd",
+        reason: "实现阶段先写测试再写实现，是本流水线对开发节点的既有要求",
+        repo: "mattpocock/skills",
+        dir: "skills/engineering/tdd",
+    },
+    StageRecommendation {
+        stage: "develop",
+        name: "resolving-merge-conflicts",
+        reason: "撞上合并冲突时按既有纪律解决，不靠随手删冲突标记",
+        repo: "mattpocock/skills",
+        dir: "skills/engineering/resolving-merge-conflicts",
+    },
+    StageRecommendation {
+        stage: "review",
+        name: "code-review",
+        reason: "两轴评审（Standards / Spec）正是 review 节点的职责",
+        repo: "mattpocock/skills",
+        dir: "skills/engineering/code-review",
+    },
+    StageRecommendation {
+        stage: "review",
+        name: "diagnosing-bugs",
+        reason: "评审中发现的疑难缺陷按诊断循环定位，而不是猜着改",
+        repo: "mattpocock/skills",
+        dir: "skills/engineering/diagnosing-bugs",
+    },
+    StageRecommendation {
+        stage: "test",
+        name: "tdd",
+        reason: "集成测试的写法与单元测试同源，避免两套风格",
+        repo: "mattpocock/skills",
+        dir: "skills/engineering/tdd",
+    },
 ];
 
 /// 某阶段推荐的技能名（保持 [`STAGE_RECOMMENDATIONS`] 的声明序，去重）。
 pub fn recommended_skill_names(stage: Stage) -> Vec<&'static str> {
     let key = stage.as_str();
     let mut out: Vec<&'static str> = Vec::new();
-    for (s, name, _) in STAGE_RECOMMENDATIONS {
-        if *s == key && !out.contains(name) {
-            out.push(name);
+    for rec in STAGE_RECOMMENDATIONS {
+        if rec.stage == key && !out.contains(&rec.name) {
+            out.push(rec.name);
         }
     }
     out
@@ -255,11 +301,14 @@ pub fn recommendations_for(name: &str) -> Vec<Recommendation> {
     let mut out = Vec::new();
     for stage in crate::types::ALL_STAGES {
         let key = stage.as_str();
-        if let Some((_, _, reason)) = STAGE_RECOMMENDATIONS
+        if let Some(rec) = STAGE_RECOMMENDATIONS
             .iter()
-            .find(|(s, n, _)| *s == key && *n == name)
+            .find(|rec| rec.stage == key && rec.name == name)
         {
-            out.push(Recommendation { stage, reason });
+            out.push(Recommendation {
+                stage,
+                reason: rec.reason,
+            });
         }
     }
     out
@@ -421,11 +470,13 @@ mod tests {
             "wayfinder",
             "to-tickets",
         ];
-        for (stage, name, _) in STAGE_RECOMMENDATIONS {
+        for rec in STAGE_RECOMMENDATIONS {
             assert!(
-                !MANUAL.contains(name),
-                "阶段 {stage} 推荐了手动触发型技能 {name}（带 disable-model-invocation，\
-                 不该当常驻知识推荐）"
+                !MANUAL.contains(&rec.name),
+                "阶段 {} 推荐了手动触发型技能 {}（带 disable-model-invocation，\
+                 不该当常驻知识推荐）",
+                rec.stage,
+                rec.name
             );
         }
     }

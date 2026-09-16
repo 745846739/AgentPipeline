@@ -714,6 +714,9 @@ CREATE TABLE IF NOT EXISTS stage_configs (
 
 > **其余表的位置：** `kanban_transitions`（§12.4.2）、`kanban_node_conversations`（§12.4.3）、`kanban_node_commands`（§12.4.4）分列在可观测性各节，此处不重复。`kanban_project_analyses`（决策 130⑦）：`analysis_id TEXT PRIMARY KEY`、`project_id TEXT NOT NULL REFERENCES kanban_projects(id)`、`status TEXT NOT NULL`、`result_json`、`error`、`created_at`、`updated_at`——配套 `POST /projects/analyze` 异步 202 + `GET /projects/{id}/analysis` 轮询。全部表由 sqlx migrations 统一管理（决策 13）。
 
+> **技能来源相关的表（决策 194）：** 仓名单住 `kanban_market_repos`（迁移 **`0010_market_repos.sql`**：机器级**单行表 + `CHECK (id = 1)`**，与迁移 0008 / 0009 那两张单行表同族）——「显式清空」与「没保存过」必须分得开；装下来的技能来源住 `skill_sources`（迁移 **`0011_skill_sources.sql`**：`name TEXT PRIMARY KEY` + `owner` / `repo` / `commit_sha` / `subpath` / `installed_at`，**一行一技能**，卸载时一并删）。
+> **迁移 `0009_market_sources.sql` 的文件保留、读写它的代码退场**——`sqlx::migrate!` 对每个**已应用过**的迁移文件记校验和，**改动或删除已应用的迁移都会让既有库在启动时报版本不符**（与决策 193 记的是同一条性质）；要连表一起清掉得是一条**新迁移**（`DROP TABLE`）加一次显式的数据处置决定，不是删文件。
+
 ### 11.6 进程中断恢复
 
 executor checkpoint 机制天然支持：
@@ -781,21 +784,30 @@ executor checkpoint 机制天然支持：
 | `POST /skills/import-dir` | POST | 从一个或多个本地技能目录导入（`{paths: [], overwrite}`），**逐项返回结果**，一项失败不中断整批（票 09） |
 | `GET /skills/scan` | GET | 扫描一个本地技能根（`?root=~/.zcode/skills`）列出可导入技能：名字 + `description` + `exists`（票 09） |
 | `DELETE /skills/{name}` | DELETE | 卸载技能（删技能根下 `{name}/`）。**不检查引用**——仍被引用的卸载后由启动校验与 `PUT /stage-configs` fail fast 兜住（票 09；技能只剩技能根下的 markdown 一个来源，决策 185） |
-| `GET /market/search` | GET | 查远程 registry 的候选（`?q=` 关键词命中名字或描述）。**未放行来源的条目不进候选**；返回 `{skills, sources, query}`，每条含 `name`/`version`/`sha256`/`source`/`description`/`url`（决策 172⑤，票 10） |
-| `POST /market/install` | POST | 从远程 registry 安装技能（`{name, overwrite}`）：索引查条目 → 来源放行 → **下载地址 origin 也放行** → 下载 → `sha256` 校验 → 落盘（复用票 09）。状态码按类别分：`market_network` → 502、`market_not_found` → 404、摘要不符 / 来源未放行 / 索引畸形 → 400、同名未确认 → 409（票 10） |
+| `GET /market/repos` | GET | 当前生效的**技能来源仓**名单：`{repos, origin: "settings" \| "config", recommended}`——`origin` 标明这份来自界面保存（住 DB）还是回落 `config.toml` 的 `[market] github_repos`（决策 187 的两级结构，信任单元由决策 194 换成 `owner/repo`）（票 03） |
+| `PUT /market/repos` | PUT | 保存界面这份仓名单（`{"repos": ["owner/repo", …]}`），**保存即生效**（当场换，不重启）；显式空数组 = 不装任何远程技能，与「没保存过」分得开；校验只有一处实现（与配置解析共用）（票 03） |
+| `DELETE /market/repos` | DELETE | 清掉界面这份，回落 `config.toml` 那一级（票 03） |
+| `GET /market/skills` | GET | 列出某仓的技能（`?repo=owner/repo&q=&refresh=1`）：用 `head()` **钉住一个 commit**（只 ls-remote、不下载 pack），按技能目录的父路径分组；`q` 是对**已 fetch 那一份**的本地过滤（不引 GitHub search API）；`refresh=1` 重新 `head()`，否则用缓存里那个 commit。响应含 `commit` / `commit_short` / `listed_at`（票 01 / 03，决策 194 裁决⑤：列表钉住浏览时的 commit） |
+| `POST /market/install` | POST | 从一个钉住的 commit 安装（`{"owner","repo","commit","subpath","overwrite"}`）：`read_skill`（按 (仓, commit) 缓存，与列表共用一份）→ 内存里重打成 `{name}/SKILL.md` 单根包 → `SkillPackage::from_zip` → `install`（**既有落盘入口零改动**）→ 写一行来源记录（`skill_sources`）。`commit` **一路透传、不得中途「取最新」**（「看到的 = 装到的」唯一落点）。**错误体统一带一个机器可读的 `kind`**（与既有 `error` / `detail` 并列）：`market_network` 502 / `repo_not_found` 404 / `commit_not_found` 404 / `skill_not_found` 404 / `repo_unreadable` 401·404 / `digest_mismatch` 400（语义是「git 对象哈希不符」，比旧的字节 sha256 更强）/ `repo_not_allowed` 400 / `download_too_large` 400；同名未确认 409。**界面按 `kind` 分支**，不按状态码也不按 `error` 里的字样（票 01 / 02 / 03，决策 194 裁决⑦） |
+
+> **旧三组市场端点整组退场**（决策 194）：`GET /market/search`、`POST /market/install`（旧请求体 `{name, overwrite}`）、`GET | PUT | DELETE /market/config` 以及 `config.toml` 的 `[market] allowed_sources` 都不再存在——自定 `/index.json` registry 那一层**整层退场**，理由与残留处置见 `docs/agents.md` 的「从 GitHub 仓安装」一节与票 04 的删单。
 
 > **技能市场全程离线（票 09）：** 五个导入 / 扫描 / 卸载端点不依赖任何网络，本机无网时功能完整。
 > 上传走**原始字节**而非 multipart / base64——`multipart` 要新引 `multer` 一棵树，base64 要一个
 > 编解码依赖并让体积涨 33%，而原始字节零依赖（`fetch(url, {body: file})` 即可）。
 > **路径穿越**是本组端点的主要风险：zip 条目名过两道独立判定（自己的 `sanitize_rel_path` +
 > `zip` crate 的 `enclosed_name`），落盘前实数校验目标在技能根之内（见
-> `crates/core/src/agent/skill_import.rs` 模块头）。票 10 的远程 registry 复用同一落盘入口。
+> `crates/core/src/agent/skill_import.rs` 模块头）。从 GitHub 仓安装（决策 194）复用同一落盘入口——
+> 来源侧读出的技能目录重打成 `{name}/SKILL.md` 单根包后才交给它，故远程包不比本地上传的包享有更宽的路。
 
-> **市场客户端的注入姿态（票 10）：** `AppState.market: Option<Arc<dyn MarketClient>>` ——
-> 生产在 `serve` 里按生效来源（界面那份优先于 `[market] allowed_sources`，决策 187）注入 `HttpMarketClient`（reqwest，复用既有
-> HTTP 栈）；L3 契约测试注入 testkit 的 `FakeMarket`，因此「摘要不符」「来源未放行」这些
-> 真网络没法稳定复现的路径都成了**确定性、离线**的用例。白名单为空时 `market` 为 `None`
-> 是**合法状态**（= 不装远程技能），端点返回一条说明怎么开的 400，而不是 500。
+> **仓访问接缝的注入姿态（决策 194，修订决策 143 第五条接缝）：** `crates/core/src/agent/repo.rs`
+> 的 `SkillRepo` trait（`head` / `list_skills` / `read_skill`）是本批**唯一新增的接缝**，生产实现是
+> 走 libgit2 git 通道的 `Libgit2Repo`；L3 契约测试注入 testkit 的**两层离线 fixture**（本地裸仓 /
+> 离线 smart HTTP），因此「commit 取不到」「技能目录不存在」「对象哈希不符」「传输超限与中断」
+> 这些**真网络没法稳定复现**的路径都成了确定性、离线的用例。仓名单为空是**合法状态**
+> （= 不装远程技能），端点返回一条说明怎么开的 400，而不是 500。上一代的自定 registry 客户端
+> （`AppState.market: Option<Arc<dyn MarketClient>>` / `HttpMarketClient` / testkit 的 `FakeMarket`）
+> 随那一层退场（决策 194）。
 
 > **`allowed_actions` 与端点的配对（决策 101 / 119）：** 前端对 `allowed_actions` 纯渲染，因此每个 `side_effect` 动作都必须有对应端点——`cancel` → `POST /tasks/{id}/cancel`、`split_task` → `POST /tasks/{id}/split`、`更换长上下文模型` → `POST /tasks/{id}/model-override`、`合入 / 返回修改` → `POST /tasks/{id}/merge/decision`（决策 119）。新增 side_effect 动作时必须同时新增端点，否则前端会出现点不动的按钮。
 
@@ -810,15 +822,16 @@ executor checkpoint 机制天然支持：
 | 进程组终止器 trait | 真杀进程组（决策 66） | 记录调用，不真杀 |
 | scheduler `tick()` | 10s 周期驱动 | 测试中手动调用 |
 
-**第五条接缝（决策 172⑤ 修订决策 143，票 10）：** 技能市场的网络出口加一条 `MarketClient` trait。
+**第五条接缝（决策 194 修订决策 143 / 177，票 01）：** 换形状——从「网络出口加一条 `MarketClient`」变成「**仓访问加一条 `SkillRepo`**」。**条数仍是五条**，自定 registry 退场后 `MarketClient` 那种「索引 → 下载字节」的形状**没有对应物**（没有索引、没有 `sha256`、字节来自 git 对象库），故新接缝按「仓访问」切。
 （测试设计侧的同一条接缝见 [testing.md](testing.md) §3.1 的权威表；决策 169 的主题契约随之成为第六条。）
 
 | 接缝 | 生产实现 | 测试实现 |
 |---|---|---|
-| `MarketClient` trait | `HttpMarketClient`（reqwest，复用既有 HTTP 栈；`Policy::none()` 不跟随重定向） | testkit 的 `FakeMarket`：固定索引与字节，**不打真网络** |
+| `SkillRepo` trait（`crates/core/src/agent/repo.rs`：`head` / `list_skills` / `read_skill`） | `Libgit2Repo`：`head` 只 ls-remote、**不下载 pack**；`list_skills` / `read_skill` 走 libgit2 的 git 通道（`RemoteRedirect::None` **显式设**、`depth(1)`、字节上限 64 MiB 在流式回调里守） | testkit 的**两层离线 fixture**：本地裸仓（快单测；**不能带 `depth`**——local transport 直接报 `shallow fetch is not supported by the local transport`）与**离线 smart HTTP**（核心用例：真 HTTP 传输 + `depth(1)` + 重定向策略 + 中断），**不打真网络** |
 
 > 这是 v2 技能 effort **唯一新增**的接缝（决策 143 的「接缝数不随功能数线性增长」）。加它的
-> 理由与四条老接缝同构：市场有四条**真网络无法稳定复现**的失败路径（摘要不符 / 来源未放行 /
-> 索引畸形 / 网络失败），而票面要求它们互不混淆——只有把出口换成 trait，这些路径才能被钉住。
+> 理由与四条老接缝同构：这条来源下有多条**真网络无法稳定复现**的失败与策略路径（commit 取不到 /
+> 技能目录不存在 / 对象哈希不符 / 传输超限与中断 / 不跟随跨站重定向），而票面要求它们互不混淆——
+> 只有把仓访问换成 trait，这些路径才能被钉住（决策 194）。
 
 > **实现顺序要求：四个接缝先于业务模块落地**——后补接缝要翻全部模块签名。逐项用例目录见 testing.md。

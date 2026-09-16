@@ -311,6 +311,13 @@ pub async fn uninstall(
 ) -> ApiResult<impl IntoResponse> {
     let root = state.home.skills_dir();
     skill_import::uninstall(&root, &name).map_err(map_core_error)?;
+    // 来源记录一并删（决策 194）：留着的话，下一次同名安装的冲突报文会报一个**已经不存在**
+    // 的技能曾经从哪儿来。停用 / 启用（阶段配置里的引用）与记录无关，不联动。
+    state
+        .store
+        .forget_skill_source(&name)
+        .await
+        .map_err(map_core_error)?;
     Ok(Json(json!({ "ok": true, "name": name })))
 }
 
@@ -567,11 +574,18 @@ pub async fn recommendations(State(state): State<AppState>) -> ApiResult<impl In
                         .find(|r| r.stage == stage)
                         .map(|r| r.reason)
                         .unwrap_or_default();
+                    // 定位字段（决策 194）：清单的全部意义是"给还没装的人照着装"，
+                    // 而 GitHub 模式下"照着装"要知道哪个仓的哪个目录。
+                    let located = skill_preview::STAGE_RECOMMENDATIONS
+                        .iter()
+                        .find(|rec| rec.stage == stage.as_str() && rec.name == name);
                     json!({
                         "name": name,
                         "reason": reason,
                         "installed": installed.iter().any(|n| n == name),
                         "declared_in": declared_in(&configs, name),
+                        "repo": located.map(|rec| rec.repo),
+                        "dir": located.map(|rec| rec.dir),
                     })
                 })
                 .collect();
@@ -640,24 +654,57 @@ pub async fn install_recommended(
         ApiError::bad_request(format!("技能名不能用作目录名（{reason}）：{}", body.name))
     })?;
     let root = state.home.skills_dir();
-    let (info, note) = match (body.overwrite, local_skill_package(&root, &name)) {
-        (false, Some(info)) => (
+    // 清单里这条推荐的**定位**（决策 194）：仓 + 目录。取不到说明这个名字不在清单里
+    // ——那不是错误（用户可以把任意技能放进任意阶段），只是没有可定位的来源。
+    let located = skill_preview::STAGE_RECOMMENDATIONS
+        .iter()
+        .find(|rec| rec.stage == body.stage && rec.name == name)
+        .copied();
+
+    let already_installed = local_skill_package(&root, &name);
+    let recorded = state
+        .store
+        .skill_source(&name)
+        .await
+        .map_err(map_core_error)?;
+
+    // 「已装的那一份**就是**清单指的这份吗」——三种答案，对应三种动作。
+    //
+    // 判据按 `(owner/repo, 子路径)`，**不比 commit**：清单是一个**指针**（仓 + 目录），
+    // 不是一份带版本的名录。它若钉死 commit，那份常量会随上游漂移变成陈旧数据；而"和当前
+    // tip 比"又要为此多发一次网络请求——那正好毁掉这一条分支存在的理由（决策 181⑦：
+    // 未配来源时也能走通，因为一次网络请求都不发生）。跳过时**原样保留**记录里的 commit，
+    // 所以两种沉默都不会发生：既不静默换旧版（没换），也不静默升级（没升）。
+    //
+    // **「没有记录」算一致**（手工拷进来 / 本地导入 / 扫描进来的技能都没有记录）：那是
+    // 决策 181⑦ 原本就要保住的那条路——「已装但没在这个阶段启用」必须走得通，且不许因此
+    // 变成一次网络请求。票 02 的字面（「不一致则不跳过」）针对的是**有记录却指着别处**那种
+    // 真歧义：那一份确知来自别的仓，就不能假装它是清单这份，要让它撞同名冲突由用户裁决。
+    let installed_is_the_listed_one = match (already_installed.as_ref(), located) {
+        // 不在清单里：没有「清单那份」可言，已装的就是用户要启用的那份
+        (Some(_), None) => true,
+        (Some(_), Some(loc)) => match recorded.as_ref() {
+            Some(rec) => rec.matches_slug_and_path(loc.repo, loc.dir),
+            None => true,
+        },
+        (None, _) => false,
+    };
+
+    let (info, note) = match (
+        body.overwrite,
+        already_installed,
+        installed_is_the_listed_one,
+    ) {
+        (false, Some(info), true) => (
             info,
-            Some("技能已在技能根里，本次未重新下载；要替换副本请带 overwrite 显式确认"),
+            Some(
+                "技能已在技能根里，且就是要启用的那一份——本次未重新下载，只写配置。\
+                 要换成清单指向的另一份请带 overwrite 显式确认",
+            ),
         ),
-        _ => {
-            let client = crate::routes::market::client(&state)?.clone();
-            let info = agentpipeline_core::agent::market::install_from_market(
-                client.as_ref(),
-                &root,
-                &name,
-                &state.market_sources,
-                body.overwrite,
-            )
-            .await
-            .map_err(crate::routes::market::map_market_error)?;
-            (info, None)
-        }
+        // 其余三种都走安装：未装（要下载）、显式覆盖（要重装）、已装但**确知**来自别处
+        // （不跳过，让它撞同名冲突，由用户显式裁决——不静默换成旧版，也不静默升级）。
+        _ => install_from_recommendation(&state, &root, &name, located, body.overwrite).await?,
     };
 
     // 写进该阶段配置：只增不减（既有声明逐字保留），新条目只能是 name + 未信任
@@ -698,6 +745,72 @@ pub async fn install_recommended(
         "stage_config": candidate,
         "preview": preview_json(&info.name, &configs_with(&configs, &candidate), scan, body_available),
     })))
+}
+
+/// 按清单的定位（仓 + 目录）取**当前 tip**，再走既有的落盘入口。
+///
+/// 为什么这里取 tip 而不是取某个固定 commit：清单只给"哪一份技能"（仓 + 目录），
+/// 而安装必须落到一个具体 commit 上——`head()` 就是把它定下来的那一步（只走握手，不下 pack）。
+/// 装完之后记录里存的是**这个具体 commit**，于是"我装的是哪一份"从此是确定的。
+async fn install_from_recommendation(
+    state: &AppState,
+    root: &std::path::Path,
+    name: &str,
+    located: Option<skill_preview::StageRecommendation>,
+    overwrite: bool,
+) -> ApiResult<(PackageInfo, Option<&'static str>)> {
+    let Some(loc) = located else {
+        // **404 + `skill_not_found`**，不是 400：这个端点要回答的是"这个技能能不能装"，
+        // 答案与"这个仓里没有那个目录"是同一句话（用户动作同为**换技能**）。决策 194 裁决⑦
+        // 把八类映射同批搬到这个端点上（票 02 明写：不搬就会变成"八类里有两类永远映射不到、
+        // 界面按四类分支"），故这里复用同一个 `kind`，而不是自造第五种。
+        return Err(ApiError::not_found(format!(
+            "技能 {name} 不在推荐清单里，没有可定位的来源仓：请到「设置 · 技能市场」页\
+             从仓列表里安装它，或在配置里声明一个已装好的同名技能"
+        ))
+        .with_kind(agentpipeline_core::agent::repo::KIND_SKILL_NOT_FOUND));
+    };
+    let id = agentpipeline_core::agent::repo::RepoId::parse(loc.repo)
+        .map_err(|e| ApiError::internal(format!("推荐清单里的仓名不合法（{}）：{e}", loc.repo)))?;
+    // 放行判定早于任何网络动作（唯一的安全控制，与 /market/install 同一个函数）。
+    agentpipeline_core::agent::repo::repo_allowed(&id, &state.market_repos())
+        .map_err(crate::routes::market::map_market_error)?;
+
+    let commit = state
+        .repo()
+        .head(&id)
+        .await
+        .map_err(crate::routes::market::map_market_error)?;
+    let package = state
+        .repo()
+        .read_skill(&id, &commit, loc.dir)
+        .await
+        .map_err(crate::routes::market::map_market_error)?;
+    // 冲突报文要与 `/market/install` 同口径：引擎只知道技能根下的路径，而"将要被覆盖的
+    // 是哪一份"要报的是**仓坐标**（决策 194）。两条路共用同一个替换函数。
+    let info = match skill_import::install(root, &package, overwrite) {
+        Ok(info) => info,
+        Err(err) => {
+            return Err(
+                crate::routes::market::conflict_with_origin(state, &package.name, err).await,
+            )
+        }
+    };
+
+    state
+        .store
+        .record_skill_source(&agentpipeline_core::storage::SkillSource {
+            name: info.name.clone(),
+            owner: id.owner.clone(),
+            repo: id.name.clone(),
+            commit_sha: commit.as_str().to_string(),
+            subpath: loc.dir.to_string(),
+            installed_at: state.store.now().to_rfc3339(),
+        })
+        .await
+        .map_err(map_core_error)?;
+
+    Ok((info, None))
 }
 
 /// 技能根里已存在的同名 markdown 技能的包元数据（`{name}/SKILL.md`）。

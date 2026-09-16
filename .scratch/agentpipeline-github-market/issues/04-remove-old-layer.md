@@ -72,16 +72,80 @@
 
 ## 验收
 
-- [ ] `rg -n -i "market|index\.json|allowed_sources|MarketClient|FakeMarket"` 的残留**逐条交代**
+- [x] `rg -n -i "market|index\.json|allowed_sources|MarketClient|FakeMarket"` 的残留**逐条交代**
       （要么已删，要么明确保留并给出理由，例如 0009 的迁移文件要留）
-- [ ] 旧端点全 404、旧配置键不再被解析（且 `[market] allowed_sources` 出现在既有 `config.toml` 里时
+- [x] 旧端点全 404、旧配置键不再被解析（且 `[market] allowed_sources` 出现在既有 `config.toml` 里时
       报错文案要说清它被 `github_repos` 取代——`deny_unknown_fields` 会让它启动即失败，这是正确的
       fail fast 姿态，但文案不能只说"未知字段"）
-- [ ] 无死代码：`clippy` 无 unused 警告；`docs/testing.md` 的接缝表与 E2E 行与新代码一致
-- [ ] 全仓闸门：`cargo fmt --check`、`clippy --workspace --all-targets -- -D warnings`、
+- [x] 无死代码：`clippy` 无 unused 警告；`docs/testing.md` 的接缝表与 E2E 行与新代码一致
+- [x] 全仓闸门：`cargo fmt --check`、`clippy --workspace --all-targets -- -D warnings`、
       `cargo test --workspace`；前端 `npm run check`、vitest、build；离线 E2E 全绿
-- [ ] 真 GitHub 的 opt-in 用例在显式开关下仍能跑通（真网络，默认 skip）
-- [ ] 上表七行逐条核对过，核对结论写回本票
+- [x] 真 GitHub 的 opt-in 用例在显式开关下仍能跑通（真网络，默认 skip）
+- [x] 上表七行逐条核对过，核对结论写回本票
 
 **Notes:** 本仓的历史上"删一层"踩过一次坑（迁移文件不可改，决策 193 记着），所以本票的验收里
 "逐条交代残留"比"删干净了"更当作重点——**留下能解释的残留优于悄悄漏掉的残留**。
+
+## 核对结论（2026-09-16，实施后逐条走过）
+
+`rg -n -i "market|index\.json|allowed_sources|MarketClient|FakeMarket"`（排除 `target` / `node_modules` /
+`frontend/dist`）的残留逐条交代。**判据是"能不能解释得清"，不是"搜不搜得到"**——旧口径的词在
+`docs/decisions.md`（只追加）与术语表的"已退场"条目里**必须**留着，那是消歧件，不属于残留。
+
+| 残留 | 处置 |
+|---|---|
+| `crates/core/src/storage/migrations/0009_market_sources.sql` | **留文件**（决策 193：已应用过的迁移改了就让既有库启动即报版本不符）。读它的代码全删；表由 0010 的注释点明是别名，不 DROP——清表要一次显式的数据处置决定，不是删文件 |
+| `MarketConfig.allowed_sources`（`config.rs`） | **留一个字段，只为报错**：旧键出现在既有 `config.toml` 里时给「已被 `[market] github_repos` 取代（决策 194）」并按旧值回显，而不是 `deny_unknown_fields` 那句「unknown field」。单测 `market_legacy_allowed_sources_key_says_what_replaced_it` 钉住 |
+| `crates/core/src/agent/egress.rs` 里两处注释提到 `[market] allowed_sources` | 改口径为 `[market] github_repos`（同一条「回环放行明文 http」的类比） |
+| `docs/decisions.md`（172⑤ / 177 / 187 等） | **一个字不改**（只追加）。新口径见决策 194，术语表的"来源白名单（已退场）"条目负责消歧 |
+| `docs/glossary.md`、`docs/testing.md`、`docs/implementation.md`、`docs/agents.md`、`docs/operations.md`、`docs/backlog-v2.md` | 同批改口径；术语表新增「已退场」条目，旧词出现时按它消歧 |
+| `crates/core/src/agent/market.rs` / `market_sources.rs` / testkit 的 `FakeMarket` / 前端 `marketSources.ts` / `marketRegistry.ts` / `e2e/marketRegistry.ts` | **已删**（前三个是旧层的实现与替身，后三个是旧层的界面校验器与 E2E 装置） |
+| `Makefile` 里 `TESTS=market` 的例子 | 留：那是**新** `market.rs`（本票之后的契约用例文件），不是旧层 |
+| `.scratch/agentpipeline-v2-skills/issues/10-remote-registry.md` | 留：历史票面，记录的是当时的做法；由决策 194 与票 04 的删单指向它 |
+
+旧端点守卫：`crates/app/tests/market.rs` 新增 `the_retired_endpoints_are_gone`——`/market/config`
+（GET/PUT/DELETE）、`/market/search`、`/market/index`、`/market/index.json` **全部 404**。
+
+**一处与票面不同的实现**：`POST /skills/install` 上"这个名字不在推荐清单里"从 400 改成
+**404 + `kind = skill_not_found`**。理由：票 02 明写"决策 181 的失败映射要同批改"（不搬就会变成
+"八类里有两类永远映射不到、界面按四类分支"），而这个端点上"装不上这个技能"与"这个仓里没有那个目录"
+对用户是同一句话（动作同为**换技能**），复用同一个 `kind` 比自造第五种干净。
+
+**仍未验的一条**（别当已验）：`repo_unreadable` 的可判定性——无凭据读私有仓时 GitHub 回 401 系列
+还是干脆 404，没测（要真私有仓）。`is_auth_shaped` 因此可能永远打不到，该类会退化成
+`repo_not_found`；两类文案里**都已经写了「也可能是私有仓且无权访问」**，所以两条路都不会把用户
+引错方向。这条写在 `repo.rs` 的 `unreadable` 文档里。
+
+---
+
+## 实施收尾（2026-09-16）
+
+验收全过。闸门读数：`cargo fmt --all -- --check` 干净、`clippy --workspace --all-targets -- -D warnings`
+干净、`cargo test --workspace` **全绿**（app 契约 104 + 技能来源 25 + core 448 单测等）；
+前端 vitest **350**、`svelte-check` 0 错 0 警告、`vite build` 通过；Playwright 全量
+**43 passed / 2 skipped**（跳过的是"截图作为证据"那两条）。真 GitHub 冒烟在显式开关下**实测一轮通过**。
+
+## 代码评审（两轴，2026-09-16）
+
+按 `code-review` 的两轴各跑一遍（Standards / Spec），**发现的问题逐条修掉**，留档：
+
+| 轴 | 发现 | 处置 |
+|---|---|---|
+| Spec | `digest_mismatch` 八类里唯一**没有任何代码路径能产生**的一类（常量、文案、界面提示都在，构造器不存在） | 补 `is_digest_shaped`（`ErrorClass::Sha1` 或 `hash mismatch` / `checksum` / `corrupt` / `invalid object`）+ `digest_mismatch` 构造器，**并前置到"对象不在本地就是取不到"那条判定之前**（两者都会让 `find_commit` 找不到对象，顺序错了会把"别装、报警"报成"换一个 commit"）。两条单测钉住 class / 措辞与归类。**离线 fixture 造不出这个失败**（要手搓一个哈希坏掉的 pack），如实记账 |
+| Spec | `egress.rs` 两处注释仍写着 `[market] allowed_sources`（票 04 的删单明写"引用要改"，而核对结论当时**错记成已改**） | 改成 `[market] github_repos`（那条"回环放行明文 http"的类比与决策 194 同源） |
+| Spec | 界面按**报文里的字样**判同名冲突（`/已存在/.test(message)`），与"按 `kind` 分支、不按字样"的口径相悖 | 改按 **409** 判：这个端点上 409 只有一个含义，是状态码里没有歧义的那一种（八类要求的"别按状态码"针对的是 404 / 400 上各挤着好几类） |
+| Spec | 迁移 0011 的注释还写着已放弃的规则（"要比 commit、一致才跳过"） | 注释改成实现的规则（仓 + 子路径，**不比 commit**；没有记录算一致——那正是决策 181⑦ 的离线路径）。**该文件本批新增、从未进过任何既有库**，故不触决策 193 |
+| Spec | `docs/testing.md` 的 194 行把 §7 契约指向 `api_contract.rs`，而市场段已搬到 `crates/app/tests/market.rs` | 行内改指向，并把两处覆盖损失（`repo_unreadable` 判不出来 / `digest_mismatch` 造不出来）写进同一行 |
+| Standards | `record_skill_source` 把一个公开字段 **丢了**：SQL 里 bind 的是 `ts(self.now())` 而不是调用方传进来的 `source.installed_at`（两个调用点都认真填了它） | 改成 bind 传进来的值 |
+| Standards | 未启动时的兜底实现（`Libgit2Repo::default()`）把缓存放系统临时目录，而 `serve.rs` 的注释正说着"落 /tmp 会被清理器删掉" | 生产一直走 `with_repo(home/market-repos)`；给 `Default` 补注释说明它只是给 `AppState::new` 的初值、**生产必须注入**，免得后人照它写 |
+| Standards | `matches_exact` / `store.skill_sources_for` **无人调用**，且后者的文档说"一次查完"而实现是循环单查（N+1） | 一并删掉。`matches_exact` 是被"跳过判据不比 commit"那条裁决变成死代码的——评审抓到的正是这处**裁决与残留代码的时差** |
+| Standards | 一键安装 `note` 里那处字符串续行漏了反斜杠，报出一串字面空格 | 补回 `\` 续行 |
+| Standards | 前端 `marketRepos.ts` 与 `RepoId` 的"同口径"说法过于含糊（它其实**先归一再校验**，`www.` 前缀是靠归一抹掉的） | 注释改成有方向的表述：不变式是「归一的输出必须是 `RepoId` 接受的输入的子集」 |
+
+**未改的（判断为主，写明理由）**：
+- 两个安装入口（`/market/install` 与一键安装）确实重复了 `repo_allowed → 取 → install → 冲突报文 → 记来源`
+  这条管线。抽公共函数是日后的清理项，本批不动——两边的形状不同（一边拿 `owner/repo/commit`，
+  一边按清单定位），而**判定与措辞已经共用**（`repo_allowed` 与 `conflict_with_origin` 各只有一份），
+  今天没有第二份口径。
+- 仓名**语法非法**时报 `repo_not_allowed`（不是 `repo_not_found`）：报文点名了"仓名不合法"并回显原值，
+  用户的动作（改写成合法 `owner/repo`）不会被引偏；为它单造一类不值得。

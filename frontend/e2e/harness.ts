@@ -68,6 +68,30 @@ export interface StartOptions {
    * 各任务消费各自的脚本轮（默认 `script` 归属主任务与未匹配标题的任务）。
    */
   additionalTasks?: Array<{ title: string; script: NodeScript }>;
+  /**
+   * **技能来源是 GitHub 仓**（票 03 / 决策 194）：把用例的仓与后端的 git 接缝一起接上。
+   *
+   * 传了它就会：① 在临时 home 的 `config.toml` 里写 `[market] github_repos`（可由
+   * {@link StartOptions.market.seedConfig} 关掉）；② 给后端子进程加
+   * `AGENTPIPELINE_MARKET_GIT_BASE`（票 01 的测试接缝，取值**只允许 https 或回环 http**）。
+   */
+  market?: {
+    /** `owner/repo` 的前一段。 */
+    owner: string;
+    /** 仓名。 */
+    repo: string;
+    /**
+     * GitHub 的**基础地址**（`AGENTPIPELINE_MARKET_GIT_BASE`，默认 `https://github.com`）。
+     * E2E 填 `gitRepo.ts` 起的离线 smart HTTP 的 `base`（`http://127.0.0.1:<port>`）。
+     */
+    gitBase?: string;
+    /**
+     * 是否把 `owner/repo` 写进 `config.toml` 的 `[market] github_repos`。**默认 true**
+     * ——那是「界面与配置两级关系」的起点（E2E ⑫）。置 false 时 home 里没有 `[market]`，
+     * 用例必须自己经过界面把仓加进去（E2E ⑬ 的「添加 = 放行」）。
+     */
+    seedConfig?: boolean;
+  };
 }
 
 export interface App {
@@ -469,10 +493,13 @@ export async function startApp(opts: StartOptions): Promise<App> {
   // 1) 临时 home + 配置（1s tick 让准入在秒级发生；resume 冷却 0 便于用例驱动）
   mkdirSync(homeDir, { recursive: true });
   mkdirSync(repoDir, { recursive: true });
-  writeFileSync(
-    path.join(homeDir, 'config.toml'),
-    '[pipeline]\ntick_interval_sec = 1\npending_resume_cooldown_sec = 0\n',
-  );
+  const configLines = ['[pipeline]', 'tick_interval_sec = 1', 'pending_resume_cooldown_sec = 0'];
+  // 技能来源的**声明式默认**那一级（`config.toml` 的 `[market] github_repos`，决策 194）。
+  // 界面上的那一份盖过它；清掉界面那份就回到这里——两级关系由 E2E ⑫ 钉住。
+  if (opts.market && opts.market.seedConfig !== false) {
+    configLines.push('[market]', `github_repos = ["${opts.market.owner}/${opts.market.repo}"]`);
+  }
+  writeFileSync(path.join(homeDir, 'config.toml'), `${configLines.join('\n')}\n`);
 
   // 2) fixture 仓库
   makeFixtureRepo(repoDir);
@@ -501,7 +528,13 @@ export async function startApp(opts: StartOptions): Promise<App> {
     const bin = resolveBinary();
     const backend = spawn(bin, ['serve', '--port', '0'], {
       cwd: repoRoot,
-      env: { ...process.env, AGENTPIPELINE_HOME: homeDir, RUST_LOG: process.env.E2E_RUST_LOG ?? 'warn' },
+      env: {
+        ...process.env,
+        AGENTPIPELINE_HOME: homeDir,
+        // 票 01 的测试接缝：GitHub 的基础地址（默认 https://github.com，只允许 https 或回环 http）
+        ...(opts.market?.gitBase ? { AGENTPIPELINE_MARKET_GIT_BASE: opts.market.gitBase } : {}),
+        RUST_LOG: process.env.E2E_RUST_LOG ?? 'warn',
+      },
       stdio: ['ignore', 'pipe', 'pipe'],
     });
     children.push(backend);

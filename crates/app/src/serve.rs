@@ -7,7 +7,7 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use agentpipeline_core::agent::market::{HttpMarketClient, MarketClient};
+use agentpipeline_core::agent::repo::{Libgit2Repo, SkillRepo};
 use agentpipeline_core::clock::SystemClock;
 use agentpipeline_core::config::{normalize_origin, Config, LogFormat};
 use agentpipeline_core::home::{
@@ -375,14 +375,14 @@ pub async fn serve(options: ServeOptions) -> anyhow::Result<ServerHandle> {
     let actual_port = bound.port();
     let (rebind_tx, rebind_rx) = tokio::sync::mpsc::channel::<RebindRequest>(4);
 
-    // 技能市场（票 10）：白名单非空才装客户端，`{source}/index.json` 取第一个来源。
-    // 空 = 不允许远程安装（保守默认）——此时 AppState.market 仍是 None，端点会给出
-    // 一条「怎么开」的报文而不是 500。
-    let market_sources = config.market.resolved_sources();
-    let market_client: Option<Arc<dyn MarketClient>> = match market_sources.first() {
-        Some(source) => Some(Arc::new(HttpMarketClient::new(source)?)),
-        None => None,
-    };
+    // 技能来源（决策 194）：读的是一个 GitHub 仓，URL 由 `owner/repo` 拼，**没有"未配置"形态**
+    // ——故总是注入一个实现。空仓名单是合法配置（= 不从任何仓安装），放行判定读的是仓名单，
+    // 与这个实现无关（端点会给出「怎么开」的报文，而不是 500）。
+    //
+    // 缓存根放在家目录下而不是系统临时目录：取下来的裸仓要跨列表与安装两次请求复用，
+    // 落在 /tmp 里会被系统清理器顺手删掉，表现为「刚列出来的 commit 忽然取不到」。
+    let market_repos = config.market.resolved_repos();
+    let repo: Arc<dyn SkillRepo> = Arc::new(Libgit2Repo::new(home.root().join("market-repos")));
     // 值班长（决策 182）：与执行器共用同一个 LLM 出口。构造在 `AppState::new` 之前
     // ——那一步会消费掉 store / home / settings。
     let foreman = Arc::new(ForemanRunner::new(
@@ -399,7 +399,7 @@ pub async fn serve(options: ServeOptions) -> anyhow::Result<ServerHandle> {
         .with_bind_source(bind_source)
         .with_rebind(rebind_tx)
         .with_allowed_origins(extra_origins)
-        .with_market(market_client, market_sources)
+        .with_repo(repo, market_repos)
         .with_foreman(foreman);
     let router = build_router(state.clone());
 

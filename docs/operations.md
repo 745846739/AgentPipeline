@@ -1187,7 +1187,17 @@ CONTEXT_ALERTS = {
 
 ### 12.15 工具层出口控制与它的残余风险
 
-技能市场（决策 172⑤）把「**下载来的技能** + agent 有无限 shell」这一组合带进了威胁模型（来源白名单可在「设置 · 技能市场」页上改并**当场生效**，决策 187；那份盖过 `config.toml` 的 `[market] allowed_sources`，清掉即回落——两处共用同一个校验函数）：本地导入的技能来自用户自己的机器，不构成同一类风险；市场下载的技能是**第三方的正文**，而它可以在运行时引导 agent 去调 `run_command`。四家主流 agent（Claude Code / Codex / Cursor / Copilot）都用**网络出口控制**兜这一层，本仓此前**零出口控制**。票 12（决策 179）补的就是这一层。
+技能市场（决策 172⑤；来源侧由**决策 194** 换成 GitHub 仓）把「**下载来的技能** + agent 有无限 shell」这一组合带进了威胁模型（仓名单可在「设置 · 技能市场」页上改并**当场生效**，决策 187；那份盖过 `config.toml` 的 `[market] github_repos`，清掉即回落——两处共用同一个校验函数，放行一个 `owner/repo` 等于允许从它下载引导 agent 的正文）：本地导入的技能来自用户自己的机器，不构成同一类风险；从 GitHub 仓装下来的技能是**第三方的正文**，而它可以在运行时引导 agent 去调 `run_command`。四家主流 agent（Claude Code / Codex / Cursor / Copilot）都用**网络出口控制**兜这一层，本仓此前**零出口控制**。票 12（决策 179）补的就是这一层。
+
+> **这一层管的是 agent 经 `run_command` 发起的出口；技能来源仓自己的出网是另一个出口**（服务进程走 libgit2 git 通道，见下面「技能来源仓的出网」），两者不共用配置：前者的放行面是 `egress_allow_hosts`，后者的放行面是**仓名单**。
+
+**技能来源仓的出网（决策 194）：** 下载引导 agent 正文的是**服务进程自己**（libgit2 git 通道），不经 `run_command`，故不受 `egress_allow_hosts` 约束——它由来源侧的固定口径承担，与决策 177②③ 的旧承担者是同两条裁决：
+
+- **出网目标只有 `https://github.com`。** URL 由程序构造，形态唯一：`{base}/{owner}/{repo}.git`，`base` 默认 `https://github.com`。**不存在「用户填 origin」这回事**——用户填的是 `owner/repo`，主机由我们定。这不是洁癖：libgit2 的传输注册表里 `git://` / `http://` / `https://` / `file://` / `ssh://` 全在，**裸文件系统路径也会被 local transport 吃掉**，所以那个字符串不能直接当 URL。决策 177③ 的「非回环必须 https」由此被「URL 只能由我们拼」直接满足；
+- **不跟随跨站重定向**（决策 177② 的承担者换成 git 通道）：libgit2 的 `RemoteRedirect::None` **必须显式设**——`FetchOptions::new()` 的默认是 `Initial`（跟初始请求的跨站重定向），靠默认值会当场破掉这条口径。**它的真实语义是「不跟跨站重定向」**：libgit2 对**同站 http→https 升级**仍然放行（`src/util/net.c` 里只在目标 scheme 不是 https 时才拒跨 scheme 跳转，host 检查被 `allow_offsite` 关掉）。我们只走 https，故这条残余**不可达**——写清是为了不让后人以为 `None` 密不透风；
+- **明文 http 只对回环放行**（与决策 177③ 同一条规则），用于本机 fixture：环境变量 `AGENTPIPELINE_MARKET_GIT_BASE` 是**测试接缝**（与 `AGENTPIPELINE_HOME` 同族，决策 143 姿态），取值受同一条规则约束——回环 http 或任意 https，**不得带路径 / 查询 / 片段**；不设或非法则回落默认。这不是放宽：**放行的仍是 `owner/repo`，主机仍由我们定**，只是那个主机在测试里可以指回本机回环，而回环本来就在 177③ 的放行之列；
+- **下载体积上限 64 MiB 由流式回调在传输中守**：`Progress::received_bytes()` 累加，超限 `return false` 中断（实测回调返回 `false` 会中止并报 `indexer progress callback returned -1`）。**粒度是读块（最小约 64 KB）——它是「边收边判」而不是下载前的门**（下载前的门在这里不存在：`content-length` 不可靠、`HEAD` 也不返回）。上限与本地导入端点的 `DefaultBodyLimit` 同值，使两条路对内存的消耗同量级；超限报文用**我们自己记的那份已收字节数**（中止错误串本身可能什么都没有：`class=None code=User msg=no error`）；
+- **私有仓不做**：无凭据入口，界面上也不放 token 输入框；报错要说清「也可能是无权访问」，不让用户把无权限误读成仓名拼错。日后要做是**纯增量**：`FetchOptions::custom_headers` 能逐字转发 `Authorization`（实测在 `info/refs` 与 `git-upload-pack` 两跳都到了服务端），且凭据可只从环境变量读而不落盘——**不触决策 112 那条「provider 密钥目前明文存储」**。这是「日后」不是「已支持」。
 
 **形态：命令级特征识别，不是网络层拦截。** 按 shell 分隔符切段后只看每段的首个命令词（跳过 `sudo` / `VAR=x` 包装，以及选项**及其取值**——不跳取值时 `git -C /tmp/repo push origin` 的首个非选项 token 是 `/tmp`，会把一条出口判成本地命令），识别五类出口形态：`git` 的网络子命令、包管理器的安装 / 发布子命令、解释器 + URL 字面量、取 URL 的二进制（`curl` / `wget`）、目标写作 `[user@]host[:path]` 的二进制（`ssh` / `scp` / `rsync` / `nc` …）。判定在 `spawn_in_own_process_group` **之前**——被拒的命令根本不执行。
 
@@ -1198,7 +1208,7 @@ CONTEXT_ALERTS = {
 | `egress_allow_hosts` | `[]` | 放行的目标主机：精确主机 / `*.example.com`（子域通配，落在点边界上）/ `*` |
 | `egress_allow_all` | `false` | 显式放行全部出口 |
 
-**默认只放行回环**（`localhost` / `127.*` / `::1`，与技能市场来源的 http 例外同源：流量不出本机，中间人不在威胁模型里）。未配置**不会**静默变成「全部放行」：忘配的代价是某条命令被拒并报出怎么放行（用户立刻发现），配宽的代价是静默放行陌生目标——两个方向的代价不对称，故取保守侧。判不出目标主机的形态（如 `git push origin`）按**拒绝**处理，错的方向是多拦。
+**默认只放行回环**（`localhost` / `127.*` / `::1`，与上面「技能来源仓的出网」里那条「明文 http 只对回环放行」同源：流量不出本机，中间人不在威胁模型里）。未配置**不会**静默变成「全部放行」：忘配的代价是某条命令被拒并报出怎么放行（用户立刻发现），配宽的代价是静默放行陌生目标——两个方向的代价不对称，故取保守侧。判不出目标主机的形态（如 `git push origin`）按**拒绝**处理，错的方向是多拦。
 
 **拒绝是可归因 + 可审计的：** 报错说清三件事（拒了什么、怎么放行、这层不是安全边界），且被拒的调用落 `kanban_node_commands`（与放行的命令**同表**，`exit_code = 1`、`stderr_preview` 写拒绝原因）——审计面必须看得见「有过一次被拒的出口尝试」，否则策略只是一次静默失败。
 

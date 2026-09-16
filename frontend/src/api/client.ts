@@ -1,9 +1,8 @@
 import { CLIENT_HEADER, PAIRING_HEADER, PAIRING_QUERY, apiUrl, getPairingToken } from './config';
 import type {
   AnalyzeResponse,
-  MarketConfig,
-  MarketEntry,
-  MarketInstallResult,
+  MarketRepoConfig,
+  MarketSkillList,
   CreateTaskPayload,
   FlowResponse,
   ForemanSendResult,
@@ -39,10 +38,19 @@ import type {
 
 export class ApiError extends Error {
   readonly status: number;
-  constructor(status: number, message: string) {
+  /**
+   * 后端错误体里的机器可读分类（`{ error, detail, kind }` 的第三项，票 02 的八类市场失败）。
+   *
+   * **界面按它分支**，不按状态码、更不按 `message` 里的字样——`repo_not_found` 与
+   * `commit_not_found` 都是 404，只有 `kind` 分得开，而两者要用户做的事完全不同
+   * （改仓名 vs 换 commit）。其余端点不带这个字段，故是 `undefined`。
+   */
+  readonly kind: string | undefined;
+  constructor(status: number, message: string, kind?: string) {
     super(message);
     this.name = 'ApiError';
     this.status = status;
+    this.kind = kind;
   }
 }
 
@@ -85,13 +93,17 @@ async function request<T>(path: string, opts: RequestOptions = {}): Promise<T> {
 
   if (!res.ok) {
     let message = `${res.status} ${res.statusText}`;
+    let kind: string | undefined;
     try {
-      const data = (await res.json()) as { error?: string };
+      const data = (await res.json()) as { error?: string; kind?: string };
       if (data?.error) message = data.error;
+      // 分类只在这里读一次：市场八类失败要在界面上给出八种不同的动作提示，
+      // 在每处调用点各解一遍错误体是「两处口径漂移」的标准起因。
+      if (typeof data?.kind === 'string' && data.kind !== '') kind = data.kind;
     } catch {
       // 非 JSON 错误体，保留状态文本
     }
-    throw new ApiError(res.status, message);
+    throw new ApiError(res.status, message, kind);
   }
 
   if (opts.text) return (await res.text()) as unknown as T;
@@ -406,47 +418,66 @@ export function installSkillForStage(
   });
 }
 
-/* 技能市场（决策 172⑤ / 177 / 187）：来源白名单的读写 + 搜索 + 安装。 */
+/* 技能市场（决策 194）：仓名单的读写 + 列表 + 从一个钉住的 commit 安装。 */
 
-/** 当前生效的来源白名单与它的来源级别（界面 / 配置文件）。 */
-export function getMarketConfig(): Promise<MarketConfig> {
-  return request<MarketConfig>('/market/config');
+/** 当前生效的仓名单、它的来源级别（界面 / 配置文件）与冷启动推荐名单。 */
+export function getMarketRepos(): Promise<MarketRepoConfig> {
+  return request<MarketRepoConfig>('/market/repos');
 }
 
 /**
- * 保存界面上的来源白名单（决策 187）：**保存完当场生效**，不必重启。
+ * 保存界面上的仓名单（决策 194，继承 187 的两级结构）：**保存完当场生效**，不必重启。
  *
- * 空数组是合法且显式的输入（= 不允许远程安装），与「没保存过」不是一回事——后者读配置文件。
- * 非法来源由后端 400 并说明是哪一项、为什么（校验与 `config.toml` 共用同一个函数）。
+ * 空数组是合法且显式的输入（= 一个仓都不放行，看不到也装不上），与「没保存过」不是一回事
+ * ——后者读 `config.toml` 的 `[market] github_repos`。非法项由后端 400 并说明是哪一项、
+ * 为什么（校验与配置解析共用同一个函数）。
  */
-export function saveMarketConfig(sources: string[]): Promise<MarketConfig> {
-  return request<MarketConfig>('/market/config', { method: 'PUT', body: { sources } });
+export function saveMarketRepos(repos: string[]): Promise<MarketRepoConfig> {
+  return request<MarketRepoConfig>('/market/repos', { method: 'PUT', body: { repos } });
 }
 
-/** 清掉界面那份来源，回到 `config.toml` 的 `[market] allowed_sources`。 */
-export function clearMarketConfig(): Promise<MarketConfig> {
-  return request<MarketConfig>('/market/config', { method: 'DELETE' });
-}
-
-/** 查 registry（省略 `q` = 列出全部已放行来源的技能）。 */
-export function searchMarket(q = ''): Promise<{ skills: MarketEntry[]; sources: string[] }> {
-  return request<{ skills: MarketEntry[]; sources: string[] }>(
-    `/market/search?q=${encodeURIComponent(q)}`,
-  );
+/** 清掉界面那份仓名单，回到 `config.toml` 的 `[market] github_repos`（决策 194 / 187）。 */
+export function clearMarketRepos(): Promise<MarketRepoConfig> {
+  return request<MarketRepoConfig>('/market/repos', { method: 'DELETE' });
 }
 
 /**
- * 从市场装一个技能到技能根（**不**写任何阶段配置——启用是另一件事）。
+ * 列出某个仓里的技能（按父路径分组）。
  *
- * 四类失败分得开：技能不存在 → 404、来源未放行 / 摘要不符 → 400（带 `detail`）、
- * 网络失败 → 502、同名已存在 → 409（`overwrite` 为显式确认）。
+ * `refresh = true` → 重新 `head()` 取 tip；否则用缓存里那个 commit（列表因此**钉住**了
+ * 浏览时那一份，直到用户显式刷新）。`q` 只过滤已 fetch 的那一份，不会去打 GitHub 的搜索
+ * API（票 03 的取舍：跨仓搜索只覆盖已拉下来的仓）——界面因此可以纯本地过滤，见页面组件。
+ */
+export function listMarketSkills(
+  repo: string,
+  q = '',
+  refresh = false,
+): Promise<MarketSkillList> {
+  const params = new URLSearchParams({ repo });
+  if (q !== '') params.set('q', q);
+  if (refresh) params.set('refresh', '1');
+  return request<MarketSkillList>(`/market/skills?${params.toString()}`);
+}
+
+/**
+ * 从一个**钉住的 commit** 装一个技能目录到技能根（**不**写任何阶段配置——启用是另一件事）。
+ *
+ * `commit` 必须由调用方从列表上原样透传，**不得在这里或后端中途「取最新」**：用户看到的是
+ * 某一份，装到的就必须是那一份（决策 194 裁决 ⑤）。
+ *
+ * 八类失败分得开（`kind` 字段，见 {@link ApiError}）：`market_network` / `repo_not_found` /
+ * `commit_not_found` / `skill_not_found` / `repo_unreadable` / `digest_mismatch` /
+ * `repo_not_allowed` / `download_too_large`；同名已存在是 409（`overwrite` 为显式确认）。
  * 落盘之后用 {@link previewSkill} 取三项预览给用户看（正文特征命中要摆在眼前）。
  */
-export function installFromMarket(name: string, overwrite = false): Promise<MarketInstallResult> {
-  return request<MarketInstallResult>('/market/install', {
-    method: 'POST',
-    body: { name, overwrite },
-  });
+export function installFromRepo(payload: {
+  owner: string;
+  repo: string;
+  commit: string;
+  subpath: string;
+  overwrite?: boolean;
+}): Promise<{ skill: { name: string; description: string | null; sibling_count: number } }> {
+  return request('/market/install', { method: 'POST', body: payload });
 }
 
 /* server-info（决策 167）：局域网分享地址枚举与二维码。 */

@@ -130,6 +130,7 @@ fn foreman_unwired() -> ApiError {
         status: StatusCode::SERVICE_UNAVAILABLE,
         message: "对讲台未接线：本次运行没有注入值班长".into(),
         detail: None,
+        kind: None,
     }
 }
 

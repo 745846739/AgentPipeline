@@ -3,21 +3,23 @@
 //! 拆分：`tasks`（任务 / 依赖 / 准入）、`cursors`（游标生命周期，执行状态唯一事实来源）、
 //! `observability`（runs / 会话 / 命令 / 流转 / 阶段产出）、`catalog`（项目 / provider / 阶段配置）、
 //! `foreman`（值班长会话——唯一不挂任务的表，决策 182）、`pairing`（配对令牌，票 07）、
-//! `server_bind`（界面上的绑定开关，决策 186）、`market_sources`（界面上的技能市场来源，
-//! 决策 187）。
+//! `server_bind`（界面上的绑定开关，决策 186）、`market_repos`（界面上的技能来源仓名单，
+//! 决策 194 继承决策 187 的两级结构）、`skill_sources`（已装技能的来源记录，决策 194）。
 
 pub mod catalog;
 pub mod conflict;
 pub mod cursors;
 pub mod decisions;
 pub mod foreman;
-pub mod market_sources;
+pub mod market_repos;
 pub mod observability;
 pub mod pairing;
 pub mod server_bind;
+pub mod skill_sources;
 pub mod tasks;
 
 pub use foreman::{ForemanMessage, NewForemanMessage};
+pub use skill_sources::SkillSource;
 
 use std::str::FromStr;
 use std::sync::Arc;

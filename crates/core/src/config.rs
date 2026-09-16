@@ -353,37 +353,47 @@ impl SkillsConfig {
     }
 }
 
-/// `[market]`：技能市场的来源白名单（决策 172⑤，票 10）。
+/// `[market]`：技能市场的来源**仓名单**（决策 194；此前是 registry 的 origin 白名单，
+/// 见决策 172⑤ / 187）。
 ///
-/// 照 Claude Code `strictKnownMarketplaces` / Codex `allowed_sources` 的姿态：**默认空**，
-/// 即默认不允许从任何远程来源安装。这是保守方向上的默认——忘配的代价是装不上（用户立刻
-/// 发现并去配置），配宽的代价是静默装上陌生来源。
+/// 姿态不变，判定对象变了：**默认空，即默认不从任何仓安装**。这是保守方向上的默认——
+/// 忘配的代价是装不上（用户立刻发现并去配置），配宽的代价是静默从陌生仓装上引导 agent 的正文。
 ///
-/// ## 只放行 https（回环除外）
+/// ## 判定按 `owner/repo`，不再按 origin
 ///
-/// 白名单是这个模块唯一的安全控制，而 `sha256` **在明文 http 上挡不住中间人**：攻击者可以
-/// 同时替换索引与包，使摘要自洽——校验通过，内容却是攻击者的。故非回环来源一律要求 `https`；
-/// 回环（`127.0.0.1` / `localhost` / `[::1]`）放行 `http`，让本地起一个 registry 做开发与
-/// 测试不必自签证书（回环流量不出本机，中间人不在威胁模型里）。
+/// GitHub 模式下字节的来源恒为 `github.com`，按 origin 放行等于放行**全世界任何作者的任何仓**。
+/// 故信任单元是仓名本身，合法性判定收在 [`crate::agent::repo::RepoId::parse`] 一处
+/// （配置解析、界面保存、读取层共用它）。
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
 #[serde(default, deny_unknown_fields)]
 pub struct MarketConfig {
-    /// 放行的来源 origin（`scheme://host[:port]`，照 `[server] allowed_origins` 的写法）。
+    /// 放行的技能来源仓（`owner/repo`，如 `obra/superpowers`）。
     ///
-    /// 列表的**第一个**来源同时用作索引地址（`{source}/index.json`）。
-    pub allowed_sources: Vec<String>,
+    /// 一个仓里可能有很多技能（实测 `wshobson/agents` 有 183 个），放行的粒度就是仓。
+    pub github_repos: Vec<String>,
+
+    /// **已退场的旧键**（决策 194 之前那份 registry 的 origin 白名单）。
+    ///
+    /// 留着这个字段只有一个目的：让它报出**一句能照着改的话**。直接删掉字段的话，
+    /// `deny_unknown_fields` 会让启动失败于「unknown field `allowed_sources`」——那虽然也是
+    /// fail fast（正确的姿态），但用户不知道拿什么替代；而这一页上"改了没生效"的代价特别高
+    /// （它是唯一的安全控制，配错了却以为配上了最坏）。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub allowed_sources: Option<Vec<String>>,
 }
 
 impl MarketConfig {
-    /// 归一后的放行来源集合（顺序保留、去重）。
+    /// 归一后的放行仓集合（顺序保留、按仓名去重）。
     ///
-    /// 用户把同一来源写两遍是常见手误，去重后不表现为「索引取第一个」这种隐式行为差异。
-    pub fn resolved_sources(&self) -> Vec<String> {
+    /// 用户把同一个仓写两遍是常见手误（大小写还常常不一致），去重后不表现为「配了两条却只有一条生效」
+    /// 这种隐式行为差异。比较按大小写不敏感——GitHub 认的是同一个仓。
+    pub fn resolved_repos(&self) -> Vec<String> {
         let mut out: Vec<String> = Vec::new();
-        for raw in &self.allowed_sources {
-            if let Ok(origin) = normalize_origin(raw) {
-                if !out.contains(&origin) {
-                    out.push(origin);
+        for raw in &self.github_repos {
+            if let Ok(id) = crate::agent::repo::RepoId::parse(raw) {
+                let slug = id.slug();
+                if !out.iter().any(|seen| seen.eq_ignore_ascii_case(&slug)) {
+                    out.push(slug);
                 }
             }
         }
@@ -391,49 +401,25 @@ impl MarketConfig {
     }
 }
 
-/// 校验并归一**一组**市场来源（配置与界面共用同一条口径，决策 187）。
+/// 校验并归一**一组**仓名（配置与界面共用同一条口径，决策 187 的两级结构由决策 194 继承）。
 ///
-/// 界面上的来源编辑器与 `config.toml` 的 `[market] allowed_sources` 会写进同一个语义位，
-/// 两处各写一份校验必然漂移——而那正是安全相关的一处（放行一个来源 = 允许从它下载并执行
-/// 引导 agent 的正文）。故归一（大小写 / 尾斜杠）、去重、顺序保留、传输安全四件事收在这
-/// 一个函数里，两处都调它。
+/// 界面上的仓名单编辑器与 `config.toml` 的 `[market] github_repos` 会写进同一个语义位，
+/// 两处各写一份校验必然漂移——而那正是安全相关的一处（放行一个仓 = 允许从它下载引导 agent
+/// 的正文）。故合法性判定收在 [`crate::agent::repo::RepoId::parse`]，这里只做"逐条归一 +
+/// 去重 + 报出是哪一项为什么"。
 ///
-/// 返回归一后的列表；非法项报出**是哪一项、为什么**（用户要照着改）。
-pub fn validate_market_sources(raw: &[String]) -> Result<Vec<String>> {
+/// 非法项**fail fast，不静默丢弃**：丢一条的表现是"我明明配了它却说没放行"。
+pub fn validate_market_repos(raw: &[String]) -> Result<Vec<String>> {
     let mut out: Vec<String> = Vec::new();
     for item in raw {
-        let origin = normalize_origin(item)
-            .map_err(|e| Error::Config(format!("市场来源不合法（{item}）：{e}")))?;
-        check_market_source_scheme(&origin)
-            .map_err(|e| Error::Config(format!("市场来源不合法（{item}）：{e}")))?;
-        if !out.contains(&origin) {
-            out.push(origin);
+        let id = crate::agent::repo::RepoId::parse(item)
+            .map_err(|e| Error::Config(format!("技能来源仓不合法（{item}）：{e}")))?;
+        let slug = id.slug();
+        if !out.iter().any(|seen| seen.eq_ignore_ascii_case(&slug)) {
+            out.push(slug);
         }
     }
     Ok(out)
-}
-
-/// 校验一个市场来源 origin 的传输安全性（见 [`MarketConfig`] 的模块说明）。
-///
-/// 返回中文原因（不合法时）。判定用 origin 里的 host，不看路径——来源本来就只能是 origin。
-pub fn check_market_source_scheme(origin: &str) -> std::result::Result<(), String> {
-    let Some(rest) = origin.strip_prefix("http://") else {
-        return Ok(()); // https（normalize_origin 已保证只有这两种）或已归一的其他形态
-    };
-    // `http://` 只允许回环：本机起 registry 做开发时不必自签证书
-    let authority = rest.split(['/', '?', '#']).next().unwrap_or(rest);
-    let host = if let Some(v6) = authority.strip_prefix('[') {
-        v6.split(']').next().unwrap_or("").to_string()
-    } else {
-        authority.split(':').next().unwrap_or("").to_string()
-    };
-    if host == "127.0.0.1" || host == "localhost" || host == "::1" {
-        return Ok(());
-    }
-    Err(format!(
-        "非回环来源必须用 https：{origin}。明文 http 挡不住中间人——\
-         攻击者可同时替换索引与技能包，使 sha256 校验自洽通过"
-    ))
 }
 
 /// 完整配置。
@@ -474,15 +460,22 @@ impl Config {
             normalize_origin(origin)
                 .map_err(|e| Error::Config(format!("[server] allowed_origins 校验失败：{e}")))?;
         }
-        // 技能市场来源同样在解析期 fail fast：写错的 origin 若放过去，表现为「安装时来源未放行」
-        // 这种运行期错误，用户得回头猜配置哪里错了（票 10 的四类失败要分得开）
-        for source in &self.market.allowed_sources {
-            let origin = normalize_origin(source)
-                .map_err(|e| Error::Config(format!("[market] allowed_sources 校验失败：{e}")))?;
-            // 传输安全也在解析期拦：明文 http 上 sha256 挡不住中间人（见 `MarketConfig` 说明）
-            check_market_source_scheme(&origin)
-                .map_err(|e| Error::Config(format!("[market] allowed_sources 校验失败：{e}")))?;
+        // 已退场的旧键：`[market] allowed_sources`（决策 194 之前那份 registry 的 origin 白名单）。
+        // **拦在这里而不是靠 `deny_unknown_fields`**：那条会报「unknown field `allowed_sources`」，
+        // 虽然也是 fail fast（正确姿态），但用户不知道拿什么替代。报文要把新旧口径说清，
+        // 因为这一页是唯一的安全控制——配错了却以为配上了是最坏的情形。
+        if let Some(old) = self.market.allowed_sources.as_ref() {
+            return Err(Error::Config(format!(
+                "[market] allowed_sources 已被 [market] github_repos 取代（决策 194）：\
+                 技能来源不再是自定的 registry 索引，而是一个 GitHub 仓。\
+                 把那几个来源换算成 owner/repo 写进 github_repos\
+                 （例如 github_repos = [\"obra/superpowers\"]）。旧值仍在配置里：{old:?}"
+            )));
         }
+        // 仓名单同样在解析期 fail fast：写错的仓名若放过去，表现为「安装时来源未放行」
+        // 这种运行期错误，用户得回头猜配置哪里错了（八类失败要分得开）
+        validate_market_repos(&self.market.github_repos)
+            .map_err(|e| Error::Config(format!("[market] github_repos 校验失败：{e}")))?;
         // 出口放行清单同样在解析期 fail fast（票 12）：写错的条目若放过去，表现为运行期
         // 「明明列了还是被拒」，用户得回头猜（与上一条同理）
         if let Some(hosts) = self.pipeline.egress_allow_hosts.as_ref() {
@@ -1264,68 +1257,68 @@ mod tests {
         assert!(matches!(err, Error::Config(_)), "{err}");
     }
 
-    // ── 决策 172⑤：`[market] allowed_sources` 来源白名单（票 10）──
+    // ── 决策 194：`[market] github_repos` 来源仓名单（取代决策 172⑤ 的 origin 白名单）──
 
-    /// **默认空 = 不允许远程安装**（保守方向上的默认，票面显式要求）。
+    /// **默认空 = 不从任何仓安装**（保守方向上的默认，票面显式要求）。
     #[test]
-    fn market_defaults_to_no_allowed_source() {
+    fn market_defaults_to_no_allowed_repo() {
         let cfg = Config::from_toml("").unwrap();
-        assert!(cfg.market.allowed_sources.is_empty());
-        assert!(cfg.market.resolved_sources().is_empty());
+        assert!(cfg.market.github_repos.is_empty());
+        assert!(cfg.market.resolved_repos().is_empty());
     }
 
-    /// 写入的来源被归一（大小写 / 尾斜杠），重复项去重且**保留顺序**。
+    /// 写入的仓名被归一（去粘贴残留），重复项按大小写不敏感去重且**保留顺序**。
     #[test]
-    fn market_sources_are_normalized_deduped_and_ordered() {
+    fn market_repos_are_normalized_deduped_and_ordered() {
         let cfg = Config::from_toml(
-            "[market]\nallowed_sources = [\"https://Skills.Example.com/\", \"https://second.example\", \"https://skills.example.com\"]\n",
+            "[market]\ngithub_repos = [\"Obra/Superpowers\", \"mattpocock/skills\", \"https://github.com/obra/superpowers.git\"]\n",
         )
         .unwrap();
         assert_eq!(
-            cfg.market.resolved_sources(),
+            cfg.market.resolved_repos(),
             vec![
-                "https://skills.example.com".to_string(),
-                "https://second.example".to_string(),
+                "Obra/Superpowers".to_string(),
+                "mattpocock/skills".to_string(),
             ]
         );
     }
 
-    /// 非法来源（带路径 / 缺 scheme）fail fast，不静默丢弃。
+    /// 非法仓名 fail fast，不静默丢弃——丢一条的表现是「我明明配了它却说没放行」。
+    /// 带 scheme / 带路径 / 带 `@` 的写法全拒（URL 由程序拼，输入不许决定走哪条 transport）。
     #[test]
-    fn market_rejects_illegal_source() {
-        // 带路径的写法会被拒——它会让用户以为「放行了一个前缀」
-        let err = Config::from_toml("[market]\nallowed_sources = [\"https://x.example/path\"]\n")
-            .unwrap_err();
-        assert!(matches!(err, Error::Config(_)), "{err}");
-        assert!(Config::from_toml("[market]\nallowed_sources = [\"not-an-origin\"]\n").is_err());
+    fn market_rejects_illegal_repo_names() {
+        for bad in [
+            "[market]\ngithub_repos = [\"https://gitlab.com/obra/superpowers\"]\n",
+            "[market]\ngithub_repos = [\"ssh://git@github.com/obra/x.git\"]\n",
+            "[market]\ngithub_repos = [\"git@github.com:obra/x.git\"]\n",
+            "[market]\ngithub_repos = [\"obra\"]\n",
+            "[market]\ngithub_repos = [\"obra/x/extra\"]\n",
+            "[market]\ngithub_repos = [\"../etc/passwd\"]\n",
+            "[market]\ngithub_repos = [\"\"]\n",
+        ] {
+            let err = Config::from_toml(bad).unwrap_err();
+            assert!(matches!(err, Error::Config(_)), "{bad} → {err}");
+            assert!(err.to_string().contains("github_repos"), "{bad} → {err}");
+        }
     }
 
-    /// 非回环来源必须 https：明文 http 上 sha256 挡不住中间人（攻击者同时换索引与包）。
+    /// 旧键**报一句能照着改的话**，而不是「unknown field」。
+    /// 这一页是唯一的安全控制，配错了却以为配上了是最坏的情形。
     #[test]
-    fn market_rejects_plain_http_for_non_loopback_sources() {
+    fn market_legacy_allowed_sources_key_says_what_replaced_it() {
         let err =
-            Config::from_toml("[market]\nallowed_sources = [\"http://skills.example.com\"]\n")
+            Config::from_toml("[market]\nallowed_sources = [\"https://skills.example.com\"]\n")
                 .unwrap_err();
-        assert!(matches!(err, Error::Config(_)), "{err}");
-        assert!(err.to_string().contains("https"), "{err}");
-
-        // 回环放行 http（本机起 registry 做开发不必自签证书）
-        assert!(
-            Config::from_toml("[market]\nallowed_sources = [\"http://127.0.0.1:8788\"]\n").is_ok()
-        );
-        assert!(
-            Config::from_toml("[market]\nallowed_sources = [\"http://localhost:8788\"]\n").is_ok()
-        );
-        // https 一律放行
-        assert!(Config::from_toml(
-            "[market]\nallowed_sources = [\"https://skills.example.com\"]\n"
-        )
-        .is_ok());
+        let msg = err.to_string();
+        assert!(matches!(err, Error::Config(_)), "{msg}");
+        assert!(msg.contains("github_repos"), "须给出替代键：{msg}");
+        assert!(msg.contains("194"), "须点明是哪条决策改的：{msg}");
+        assert!(msg.contains("skills.example.com"), "须回显旧值：{msg}");
     }
 
     #[test]
     fn market_unknown_key_is_rejected() {
-        let err = Config::from_toml("[market]\nallowed_sources = []\nnope = 1\n").unwrap_err();
+        let err = Config::from_toml("[market]\ngithub_repos = []\nnope = 1\n").unwrap_err();
         assert!(matches!(err, Error::Config(_)), "{err}");
     }
 

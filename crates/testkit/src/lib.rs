@@ -6,8 +6,10 @@
 //! - [`RecordingKiller`]：进程组终止器替身，只记录不真杀（接缝③）；
 //! - [`git_fixture::Repo`]：系统 git CLI 搭建的场景仓库（决策 146）；
 //! - [`FakeAgent`]：脚本化 LLM 替身，**只替换 LLM 响应流，工具层真实执行**（决策 148）；
-//! - [`FakeMarket`]：脚本化技能市场客户端，提供固定索引与字节，**不打真网络**
-//!   （决策 143 唯一新增接缝，票 10）；
+//! - [`repo_fixture`]：技能来源仓的离线 fixture（真 libgit2 打本地裸仓 / 离线 smart HTTP，
+//!   决策 194）；
+//! - [`repo_fixture::RepoFixture`] / [`repo_fixture::SmartHttp`]：GitHub 来源的离线 fixture
+//!   ——临时裸仓 + 离线 smart HTTP（决策 194，票 01）；
 //! - [`SseRecorder`] / 断言助手：事件序列与游标 / run 计数断言。
 
 pub mod assertions;
@@ -15,8 +17,8 @@ pub mod clock;
 pub mod git_fixture;
 pub mod home;
 pub mod killer;
-pub mod market_fixture;
 pub mod mock_llm;
+pub mod repo_fixture;
 pub mod script;
 pub mod skill_fixture;
 
@@ -28,7 +30,7 @@ pub use clock::ManualClock;
 pub use git_fixture::{Language, Repo};
 pub use home::{seed_project, seed_task, seed_task_full, EnvGuard, TestHome};
 pub use killer::RecordingKiller;
-pub use market_fixture::{entry, entry_with_wrong_digest, index_json, FakeMarket};
 pub use mock_llm::{MockLlm, MockRoute, RecordedRequest};
+pub use repo_fixture::{RepoFixture, SmartHttp};
 pub use script::{FakeAgent, Script, Step};
 pub use skill_fixture::{skill_zip, write_raw_skill_dir, write_skill_dir, zip_bytes};

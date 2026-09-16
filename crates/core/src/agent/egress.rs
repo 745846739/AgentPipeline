@@ -25,7 +25,7 @@
 //!
 //! 未配置时**不放行任何外网目标**（回环除外）。这一条是票面的硬要求：忘配的代价是某条命令被拒
 //! 并在报错里说明怎么放行（用户立刻发现），配宽的代价是静默装上陌生来源——两个方向的代价
-//! 不对称，故默认取保守侧。回环放行的理由与 `[market] allowed_sources` 的 http 例外同源：
+//! 不对称，故默认取保守侧。回环放行的理由与 `[market] github_repos` 那条回环例外同源（决策 194；旧键 `allowed_sources` 已退场）：
 //! 流量不出本机，中间人不在威胁模型里。
 //!
 //! ## 已知的绕过面（诚实记账）
@@ -501,7 +501,7 @@ fn deny_message(host: Option<&str>, form: &str, policy: &NetworkPolicy) -> Strin
     )
 }
 
-/// 校验一条 `egress_allow_hosts` 条目（解析期 fail fast，与 `[market] allowed_sources` 同姿态）。
+/// 校验一条 `egress_allow_hosts` 条目（解析期 fail fast，与 `[market] github_repos` 同姿态）。
 pub fn check_allow_host(raw: &str) -> std::result::Result<(), String> {
     let host = raw.trim();
     if host.is_empty() {

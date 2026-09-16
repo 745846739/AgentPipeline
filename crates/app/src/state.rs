@@ -2,7 +2,7 @@
 
 use std::sync::Arc;
 
-use agentpipeline_core::agent::market::MarketClient;
+use agentpipeline_core::agent::repo::{Libgit2Repo, SkillRepo};
 use agentpipeline_core::config::Settings;
 use agentpipeline_core::home::Home;
 use agentpipeline_core::pipeline::{Executor, ForemanRunner};
@@ -63,19 +63,8 @@ pub struct RebindRequest {
 /// 改绑通道的发送端（`serve` 之外不存在，故 `AppState` 里是 `Option`）。
 pub type RebindTx = tokio::sync::mpsc::Sender<RebindRequest>;
 
-/// 界面那一份市场来源的读数（来源白名单 + 它的客户端，决策 187）。
-pub type MarketSnapshot = (Vec<String>, Option<Arc<dyn MarketClient>>);
-
-/// 界面上的技能市场来源（决策 187）：来源白名单 + 由它现搭的客户端。
-///
-/// 与启动时那份（`[market] allowed_sources`）是**两级**关系：界面保存过就用界面这份，
-/// 清掉就回到配置文件。`sources` 为空表是**合法且有意义**的状态（= 不允许远程安装），
-/// 与「没保存过」（`None`）必须分得开——见 `Store::market_sources_override`。
-pub struct MarketRuntime {
-    pub sources: Vec<String>,
-    /// 空表时是 `None`（没有来源就没有客户端，端点给可操作报文而不是 panic）。
-    pub client: Option<Arc<dyn MarketClient>>,
-}
+/// 界面那一份来源仓名单的读数（决策 194）。
+pub type MarketSnapshot = Vec<String>;
 
 #[derive(Clone)]
 pub struct AppState {
@@ -104,19 +93,31 @@ pub struct AppState {
     pub rebind: Option<RebindTx>,
     /// 配置 / CLI 注入的额外放行 origin（决策 157），与缺省本机集合合并。
     pub extra_allowed_origins: Vec<String>,
-    /// 技能市场客户端（决策 172⑤，票 10——本 effort 唯一新增接缝）。
+    /// 技能来源仓的访问层（决策 194——本 effort 唯一新增接缝，取代票 10 的 `MarketClient`）。
     ///
-    /// **缺省 `None`**：没有它时市场端点返回明确的「未配置来源」错误，而不是 panic 或
-    /// 静默成功。生产在 `serve` 里按 `[market] allowed_sources` 注入；L3 契约测试注入
-    /// testkit 的 `FakeMarket`，因此端点契约能在**完全离线**的前提下被钉住。
-    pub market: Option<Arc<dyn MarketClient>>,
-    /// `[market] allowed_sources` 归一后的白名单（空白名单 = 不允许远程安装）。
+    /// **不是 `Option`**：GitHub 模式下它没有"没配就用不了"的形态（URL 由 `owner/repo` 拼，
+    /// 不需要用户先填一个来源地址），所以总是有一个实现。放行与否由**仓名单**判定
+    /// （[`AppState::market_repos`]），与这个实现无关。
+    ///
+    /// 生产在 `serve` 里注入 [`Libgit2Repo`]；L3 契约测试注入一个指向离线 smart HTTP
+    /// fixture 的同一个实现，因此端点契约能在**完全离线**的前提下走**真 libgit2**。
+    pub repo: Arc<dyn SkillRepo>,
+    /// `[market] github_repos` 归一后的仓名单（空名单 = 不从任何仓安装）。
     ///
     /// 启动时那一级；界面保存过之后由 [`AppState::market_override`] 盖过，读经
-    /// [`AppState::market_sources`] / [`AppState::market_client`]（决策 187）。
-    pub market_sources: Vec<String>,
-    /// 界面上的市场来源（决策 187）。`None` = 没保存过 → 用启动时那一级。
-    pub market_override: Arc<std::sync::RwLock<Option<MarketRuntime>>>,
+    /// [`AppState::market_repos`]（决策 187 的两级结构，决策 194 继承）。
+    pub configured_repos: Vec<String>,
+    /// 界面上的仓名单（决策 194）。`None` = 没保存过 → 用启动时那一级；
+    /// `Some(vec![])` = 显式清空（= 不从任何仓安装），与"没保存过"是两回事。
+    pub market_override: Arc<std::sync::RwLock<Option<MarketSnapshot>>>,
+    /// 列表**钉住**的那一份 commit（决策 194）：仓名 → (commit, 取到它的时刻)。
+    ///
+    /// 进程内、不过期。它的全部意义是"两次列表之间不漂移，直到用户显式刷新"——
+    /// 那是"看到的 = 装到的"的落点。不持久化：重启之后重新 `head()` 是对的
+    /// （那时也没有"用户正看着的那一份"了）。
+    ///
+    /// 类型见 [`crate::routes::market::Listings`]。
+    pub listings: crate::routes::market::Listings,
     /// 值班长运行器（决策 182，票 01）。
     ///
     /// **缺省 `None`**：没有它时三个对讲台端点返回 503「未接线」，而不是 panic 或
@@ -140,42 +141,45 @@ impl AppState {
             bind_source: Arc::new(std::sync::RwLock::new(BindSource::Config)),
             rebind: None,
             extra_allowed_origins: Vec::new(),
-            market: None,
-            market_sources: Vec::new(),
+            repo: Arc::new(Libgit2Repo::default()),
+            configured_repos: Vec::new(),
             market_override: Arc::new(std::sync::RwLock::new(None)),
+            listings: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
             foreman: None,
         }
     }
 
-    /// 界面保存过的那一份市场来源（决策 187）；没保存过时 `None`。
+    /// 界面保存过的那一份仓名单（决策 194）；没保存过时 `None`。
+    ///
+    /// 与 [`AppState::market_repos`] 的分工：这个读的是"界面那一级存不存在"，
+    /// 后者读的是"现在生效的是哪一份"。`Some(vec![])` 与 `None` 必须分得开。
     pub fn market_override(&self) -> Option<MarketSnapshot> {
-        self.market_override.read().ok().and_then(|guard| {
-            guard
-                .as_ref()
-                .map(|rt| (rt.sources.clone(), rt.client.clone()))
-        })
+        self.market_override
+            .read()
+            .ok()
+            .and_then(|guard| guard.clone())
     }
 
-    /// 生效的市场来源（界面 > 配置文件，决策 187）。
-    pub fn market_sources(&self) -> Vec<String> {
+    /// 生效的仓名单（界面 > 配置文件，决策 187 / 194）。
+    ///
+    /// **放行判定读的是这一份**——它是本系统唯一的安全控制的输入，故只有这一个读法。
+    pub fn market_repos(&self) -> Vec<String> {
         match self.market_override() {
-            Some((sources, _)) => sources,
-            None => self.market_sources.clone(),
+            Some(repos) => repos,
+            None => self.configured_repos.clone(),
         }
     }
 
-    /// 生效的市场客户端。界面保存过空表 → `None`（不允许远程安装）。
-    pub fn market_client(&self) -> Option<Arc<dyn MarketClient>> {
-        match self.market_override() {
-            Some((_, client)) => client,
-            None => self.market.clone(),
-        }
+    /// 生效的来源仓访问层（决策 194）。**不是 `Option`**：它没有"没配就用不了"的形态，
+    /// 放行与否由仓名单判定，与这个实现无关。
+    pub fn repo(&self) -> Arc<dyn SkillRepo> {
+        Arc::clone(&self.repo)
     }
 
     /// 装上界面保存的那一份（保存端点调用；决策 187）。
-    pub fn set_market_override(&self, sources: Vec<String>, client: Option<Arc<dyn MarketClient>>) {
+    pub fn set_market_override(&self, repos: Vec<String>) {
         if let Ok(mut guard) = self.market_override.write() {
-            *guard = Some(MarketRuntime { sources, client });
+            *guard = Some(repos);
         }
     }
 
@@ -228,16 +232,12 @@ impl AppState {
         self
     }
 
-    /// 注入技能市场客户端与放行来源（票 10）。
+    /// 注入来源仓访问层与 `config.toml` 那一级的仓名单（决策 194）。
     ///
-    /// `client` 为 `None` 是合法状态（白名单为空 = 不装远程技能），端点会给出可操作报文。
-    pub fn with_market(
-        mut self,
-        client: Option<Arc<dyn MarketClient>>,
-        sources: Vec<String>,
-    ) -> Self {
-        self.market = client;
-        self.market_sources = sources;
+    /// 空名单是**合法状态**（= 不从任何仓安装），端点会给出可操作报文。
+    pub fn with_repo(mut self, repo: Arc<dyn SkillRepo>, repos: Vec<String>) -> Self {
+        self.repo = repo;
+        self.configured_repos = repos;
         self
     }
 
@@ -316,6 +316,13 @@ pub struct ApiError {
     /// 响应体里作为额外字段下发（前端只读 `error`，故不破坏既有契约），用户截屏报障时
     /// 不用再去翻日志。
     pub detail: Option<String>,
+    /// **机器可读的失败类别**（决策 194）：八类技能来源失败之一，供界面按类分支。
+    ///
+    /// 为什么必须有这一栏：八类里有几对**状态码相同而用户动作完全不同**
+    /// （`repo_not_found` 与 `commit_not_found` 都是 404，前者要改仓名、后者要换 commit；
+    /// `repo_not_allowed` 与 `download_too_large` 都是 400，一个去加白名单、一个换小仓）。
+    /// 只靠状态码或匹配报文串，界面就只能把它们都渲染成"装不上"——那等于把分类白做了。
+    pub kind: Option<String>,
 }
 
 impl ApiError {
@@ -324,6 +331,7 @@ impl ApiError {
             status: StatusCode::BAD_REQUEST,
             message: msg.into(),
             detail: None,
+            kind: None,
         }
     }
 
@@ -332,6 +340,7 @@ impl ApiError {
             status: StatusCode::NOT_FOUND,
             message: msg.into(),
             detail: None,
+            kind: None,
         }
     }
 
@@ -340,6 +349,7 @@ impl ApiError {
             status: StatusCode::CONFLICT,
             message: msg.into(),
             detail: None,
+            kind: None,
         }
     }
 
@@ -348,6 +358,7 @@ impl ApiError {
             status: StatusCode::FORBIDDEN,
             message: msg.into(),
             detail: None,
+            kind: None,
         }
     }
 
@@ -356,6 +367,7 @@ impl ApiError {
             status: StatusCode::INTERNAL_SERVER_ERROR,
             message: msg.into(),
             detail: None,
+            kind: None,
         }
     }
 
@@ -369,6 +381,7 @@ impl ApiError {
             status: StatusCode::BAD_GATEWAY,
             message: msg.into(),
             detail: None,
+            kind: None,
         }
     }
 
@@ -380,14 +393,28 @@ impl ApiError {
         }
         self
     }
+
+    /// 附上机器可读的失败类别（见 [`ApiError::kind`]）。
+    pub fn with_kind(mut self, kind: impl Into<String>) -> Self {
+        let kind = kind.into();
+        if !kind.is_empty() {
+            self.kind = Some(kind);
+        }
+        self
+    }
 }
 
 impl IntoResponse for ApiError {
     fn into_response(self) -> Response {
-        let body = match &self.detail {
-            Some(detail) => json!({ "error": self.message, "detail": detail }),
-            None => json!({ "error": self.message }),
-        };
+        // `detail` / `kind` 为 `None` 时**不下发该字段**（而不是下发 null）：
+        // 既有前端只读 `error`，这两个是加法的诊断栏。
+        let mut body = json!({ "error": self.message });
+        if let Some(detail) = &self.detail {
+            body["detail"] = json!(detail);
+        }
+        if let Some(kind) = &self.kind {
+            body["kind"] = json!(kind);
+        }
         (self.status, Json(body)).into_response()
     }
 }

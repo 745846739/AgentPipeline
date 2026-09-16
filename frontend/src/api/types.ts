@@ -653,36 +653,59 @@ export interface SkillSummary {
   declared_in: string[];
 }
 
-/* ─────────────── 技能市场（crates/app/src/routes/market.rs，决策 172⑤ / 177 / 187）─────────────── */
+/* ─────────────── 技能市场（crates/app/src/routes/market.rs，决策 194）─────────────── */
 
-/** 来源白名单是谁定的（决策 187）：界面保存的那一份，还是 `config.toml` 的 `[market]`。 */
+/** 仓名单是谁定的（继承决策 187 的两级结构）：界面保存的那一份，还是 `config.toml` 的 `[market]`。 */
 export type MarketOrigin = 'settings' | 'config';
 
-/** `GET / PUT / DELETE /market/config`。 */
-export interface MarketConfig {
-  /** 生效的来源 origin 列表（界面 > 配置文件）；空表 = 不允许远程安装。 */
-  sources: string[];
+/** `GET / PUT / DELETE /market/repos`。 */
+export interface MarketRepoConfig {
+  /**
+   * 生效的仓名单（界面 > 配置文件）；空表 = 不放行任何仓，看不到也装不上任何远程技能。
+   *
+   * `owner/repo` 原样展示（不小写）——它是**信任单元**，用户要认得出自己放行的是哪个仓。
+   */
+  repos: string[];
   origin: MarketOrigin;
-  /** 索引地址 = 列表第一项的 `{source}/index.json`；空表时为 null。 */
-  index_source: string | null;
-  /** 有没有可用的客户端（空表时为 false——端点会给出可操作报文，不是 panic）。 */
-  client_ready: boolean;
+  /**
+   * 冷启动推荐名单（后端内置的公开技能仓）。
+   *
+   * **内置 ≠ 放行**：这些只是**字符串**，在用户点「添加」之前没有任何请求、一个字节都不下载
+   * （票 03 的硬约束：Q6 选仓级白名单的代价曲线不能被便利性侵蚀）。
+   */
+  recommended: string[];
 }
 
-/** `GET /market/search` 的一项候选（未放行来源的条目不进候选）。 */
-export interface MarketEntry {
+/** `GET /market/skills` 的一项技能：`dir` 是仓内该技能目录的路径，`name` 是它的 basename。 */
+export interface MarketSkillRef {
   name: string;
-  version: string;
-  sha256: string;
-  /** 条目自己声明的来源（与放行白名单是两件事，两者都须放行才装得上）。 */
-  source: string;
+  dir: string;
   description: string | null;
-  url: string;
 }
 
-/** `POST /market/install` 的响应。 */
-export interface MarketInstallResult {
-  skill: { name: string; description: string | null; sibling_count: number };
+/**
+ * 按技能目录的父路径分组（父路径是扫描时免费得到的，不读 `marketplace.json`）。
+ *
+ * `path` 是空串时表示技能直接住在仓根（界面把组标题写成「（根）」）。
+ */
+export interface MarketGroup {
+  path: string;
+  skills: MarketSkillRef[];
+}
+
+/**
+ * `GET /market/skills?repo=owner/repo&q=…&refresh=1`。
+ *
+ * `commit` 是**列表当刻**的 tip，界面把它一路透传给安装——「看到的 = 装到的」全靠这一个字段
+ * （否则锚会退化成「安装那一刻的 HEAD」，即 Pulumi 那个移动靶的形态）。
+ * `listed_at` 是它被取到的时刻（不是 commit 的时间）。
+ */
+export interface MarketSkillList {
+  repo: string;
+  commit: string;
+  commit_short: string;
+  listed_at: string;
+  groups: MarketGroup[];
 }
 
 /** 正文特征命中（票 11 第 ③ 项）：**具体到行**，不是布尔「有风险」。 */

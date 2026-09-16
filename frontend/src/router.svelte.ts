@@ -29,7 +29,8 @@ export function parseRoute(hash: string): Route {
   if (task) return { name: 'task', id: decodeURIComponent(task[1]) };
   if (path === '/settings/projects') return { name: 'settings-projects' };
   if (path === '/settings/providers') return { name: 'settings-providers' };
-  // 技能市场（决策 187）：白名单 / 搜索 / 安装。此前只有 config.toml 一条路，界面上无处可改。
+  // 技能市场（决策 194，页骨架承自 187）：仓名单 / 该仓的技能列表 / 安装。
+  // 此前只有 config.toml 一条路，界面上无处可改。
   if (path === '/settings/market') return { name: 'settings-market' };
   if (path === '/metrics') return { name: 'metrics' };
   if (path === '/share') return { name: 'share' };

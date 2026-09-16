@@ -23,9 +23,10 @@ pub trait SkillRepo: Send + Sync + 'static {
     /// 分支 tip（只 ls-remote，不下载 pack）。
     fn head(&self, repo: &RepoId) -> BoxFuture<'static, Result<Oid>>;
     /// 该 commit 下所有技能目录（含 SKILL.md 的目录即技能）。
-    fn list_skills(&self, repo: &RepoId, commit: Oid) -> BoxFuture<'static, Result<Vec<SkillRef>>>;
+    fn list_skills(&self, repo: &RepoId, commit: &Oid) -> BoxFuture<'static, Result<Vec<SkillRef>>>;
     /// 读一个技能目录（含子树）成一个 SkillPackage。
-    fn read_skill(&self, repo: &RepoId, commit: Oid, dir: &str) -> BoxFuture<'static, Result<SkillPackage>>;
+    fn read_skill(&self, repo: &RepoId, commit: &Oid, dir: &str)
+        -> BoxFuture<'static, Result<SkillPackage>>;
 }
 ```
 
@@ -34,15 +35,23 @@ pub trait SkillRepo: Send + Sync + 'static {
 
 ## 实现要点（每条都有实测背书，别当风格偏好）
 
-1. **URL 只能由我们构造，形态只有一种**：`https://github.com/{owner}/{repo}.git`。
-   理由不是洁癖——libgit2 的传输注册表里 `git://` / `http://` / `https://` / `file://` / `ssh://`
-   （还有 `ssh+git://` / `git+ssh://`）全在，而且**裸文件系统路径也会被 local transport 吃掉**
-   （`transport_find_fn` 判的是 `git_fs_path_exists(url) && is_dir(url)`）。用户在「添加一个仓」里
-   填的那个字符串若直接当 URL 用，走哪条 transport 就由它决定。故 `RepoId` 解析必须拒绝：
-   带 scheme、含 `@`、含 `..`、含多余 `/` 或空段、非 ASCII、空 owner/repo。
+1. **URL 只能由我们构造，形态只有一种**：`{base}/{owner}/{repo}.git`，`base` 默认
+   `https://github.com`。理由不是洁癖——libgit2 的传输注册表里 `git://` / `http://` / `https://` /
+   `file://` / `ssh://`（还有 `ssh+git://` / `git+ssh://`）全在，而且**裸文件系统路径也会被
+   local transport 吃掉**（`transport_find_fn` 判的是 `git_fs_path_exists(url) && is_dir(url)`）。
+   用户在「添加一个仓」里填的那个字符串若直接当 URL 用，走哪条 transport 就由它决定。
+   故 `RepoId` 解析必须拒绝：带 scheme、含 `@`、含 `..`、含多余 `/` 或空段、非 ASCII、空 owner/repo。
+   **`base` 的可覆盖只为离线用例**（决策 143 的接缝姿态，与 `AGENTPIPELINE_HOME` 同族）：
+   环境变量 `AGENTPIPELINE_MARKET_GIT_BASE`，取值受与决策 177③ **同一条**规则约束——
+   回环放行明文 `http`（本机起 smart HTTP fixture），非回环必须 `https`，且不得带路径 / 查询 /
+   片段；不设或非法则回落默认。这条不算放宽：**放行的仍是 `owner/repo`，主机仍由我们定**，
+   只是那个主机在测试里可以指回本机回环——而回环本来就在 177③ 的放行之列。
 2. **`commit` 必须是完整 40 位十六进制。** 实测（变体 I）：7 位缩写 SHA 会让 `fetch` **返回 `Ok`
    但什么都不取**——0.74 s、"成功"、无 ref、无对象、无 `shallow` 文件、**无任何错误**。
    不校验就会报"装好了"而其实没装。
+   **同一族还有第二个静默空转陷阱**（实测）：refspec 的源既不是合法 oid 也不是已存在的 ref
+   （`+nonexistent-branch:refs/probe/x`）时，`fetch` 同样返回 **`Ok` 而什么都没取**。
+   故"`Ok` 不等于取到了"这件事要在**取完之后复验**（见第 4 条的 tip 发现），不能只看返回码。
 3. **`follow_redirects(RemoteRedirect::None)` 必须显式设**——`FetchOptions::new()` 的默认是
    `Initial`（跟初始请求的跨站重定向），靠默认值会当场破掉决策 177②。写代码时要知道 `None` 的
    **真实语义是"不跟跨站重定向"**：libgit2 对**同站 http→https 升级**仍然放行（`src/util/net.c`
@@ -52,13 +61,30 @@ pub trait SkillRepo: Send + Sync + 'static {
    报 `cannot redirect from 'www.github.com' to 'github.com'`；而 `Initial` / `All` 下成功。
 4. **取法固定 `depth(1)`**：实测 1.9–2.3 s，`.git` 212 KiB，`.git/shallow` 落盘且内容就是被取的
    tip；树与 blob 完整，只有历史被切（被取的 commit 报 `parents=0`，是 shallow 的 graft 效应）。
-   注意 `Remote::fetch` **不会创建或移动 `HEAD`**（`HEAD` 保持 unborn），只写 `FETCH_HEAD`——
-   别指望 `HEAD` 能告诉你拿到了什么，用 `update_tips` 回调或 refspec 的目标 ref。
+   **tip 发现只能用 `remote.connect(Direction::Fetch)` + `remote.list()`**（实测：4 个 ref，
+   `default_branch()` → `refs/heads/main`，**不传任何字节**——目标 `.git` 20 KB，
+   `objects/pack` 是空目录）。两个反例都要记：
+   - **`Remote::fetch` 不创建也不移动 `HEAD`**：`HEAD` 保持 unborn（仍指向 `refs/heads/master`），
+     取到的 commit 只能经裸 oid 或 `.git/FETCH_HEAD` 走到（`git fsck` 报它 dangling）。别指望 `HEAD`。
+   - **`update_tips` 在匿名 remote + 空 refspec 下不触发**（实测 `remote_anonymous` + 空 refspec
+     一次都没回调）；refspec 映射到了东西（`+refs/heads/main:refs/probe/tip`）才触发。故本票用
+     `list()` 做 tip 发现，`update_tips` 不作为依赖。
+   **`depth(0)` 也通**（实测 42 ms、18 个对象、无 shallow 文件），但 `depth(1)` 才是本票要的
+   形态——整仓历史对读几个技能目录毫无用处。
 5. **字节上限在流式回调里守**：`RemoteCallbacks::transfer_progress` 里读
    `Progress::received_bytes()`（libgit2 的注释就是 "Size of the packfile received up to now"）
    累加，超 64 MiB 就 `return false` 中断——实测回调返回 `false` 会中止并报
    `indexer progress callback returned -1`。**上限与本地导入端点的 `DefaultBodyLimit` 同值**，
    保持两条路对内存的消耗同量级。
+   **粒度要说清：中断只能发生在"一块已经落下来之后"**，不是下载前的门。实测
+   `transfer_progress` 的回调频率是**读块粒度（最小约 64 KB）**——在 1.2 MB 的 pack 上，
+   阈值设成 200 字节时**已经有 66 KB 到了**才被中断。另有两条互相不同的中止错误形态要归一：
+   回调返回 `false` → `indexer progress callback returned -1`；走 `GIT_EUSER` 的那条
+   （`smart_protocol.c`）→ `class=None code=User msg=no error`（**报文里什么都没有**）。
+   故超限必须由**我们自己**在回调里记下"已收到多少"，报错时用自己那份数字，不要指望错误串。
+   好处是这条路径是干净的：被中断的目的地留下一个**合法但空**的仓（无 indexer 临时 pack、
+   无 ref，`git fsck` 干净），不需要额外清理。`received_bytes` 计的是 sideband 字节，
+   **逐次会有漂移**（实测 depth=1 同样内容 1510–1565），故断言不能用等号。
 6. **不落工作区**：`find_commit` → `tree()` → `tree.get_path(dir)` → `find_blob`。
    目录要**递归**——实测 pulumi 的技能目录里 `agents/` 是子树（`agents/openai.yaml`），
    非递归会漏掉兄弟文件，而票 07 的展开依赖它们真的落盘。
@@ -100,6 +126,45 @@ pub trait SkillRepo: Send + Sync + 'static {
 
 ## 离线 fixture（两层，各司其职）
 
+**冻结的 testkit 形状**（`crates/testkit/src/repo_fixture.rs`，前后端并行时按此对接；API 里
+**不出现 core 类型**——testkit 经 dev-dependency 链接的是另一份 core，类型过不来）：
+
+```rust
+pub struct RepoFixture { … }                    // 临时目录里的裸仓 + 一个用于搭内容的工作树
+impl RepoFixture {
+    pub fn new() -> anyhow::Result<Self>;       // init --bare，默认开 allowAnySHA1InWant
+    pub fn add_file(&mut self, rel: &str, contents: &str) -> anyhow::Result<()>;
+    pub fn commit(&mut self, message: &str) -> anyhow::Result<String>; // 返回新 commit 的 40 位 hex
+    pub fn tip(&self) -> anyhow::Result<String>; // 当前分支 tip 的 40 位 hex
+    pub fn dir(&self) -> &std::path::Path;       // 裸仓路径（`git fetch` 它得加 file:// 前缀）
+}
+pub struct SmartHttp { … }
+impl SmartHttp {
+    pub async fn serve(bare: &std::path::Path) -> anyhow::Result<Self>;
+    pub fn url(&self) -> String;                 // "http://127.0.0.1:<port>/repo.git"
+    pub fn requests(&self) -> Vec<String>;       // 收到的请求行（断言"没点添加之前零请求"）
+    pub fn trace(&self) -> Vec<String>;          // 每趟请求的细读（header / 响应 / 在途字节），排查用
+}
+```
+
+**两个只有真写一遍才会知道的服务端事实**（都踩到过，实现期补记）：
+
+1. **`accept()` 返回的 socket 会继承监听 socket 的 `O_NONBLOCK`**（macOS 实测）。
+   于是新连接一出生就是非阻塞的，`read_line` 在客户端数据还没到时**立刻** `EAGAIN` 返回，
+   服务端当场收线，客户端那条请求撞上 FIN/RST，报 `unexpected EOF` / `Broken pipe` /
+   `Connection reset by peer`，而 fixture 这边**一个请求行都没记上**。症状是**偶发**
+   （并发跑约 1/8 用例轮次会中，单跑必过）——最难查的那类红，本票实现期在这上面花的时间
+   比写 fixture 还多。修法是一行：`set_nonblocking(false)`，
+   配一条回归用例 `a_client_that_speaks_late_is_still_served`（连上之后**先沉默 200ms** 再发请求，
+   它**制造**那个时序：accept 先到、请求后到）。
+2. **一趟请求一条连接**（响应里 `Connection: close`）。改成 HTTP/1.1 keep-alive
+   （响应写 `keep-alive` 且不关连接）之后，21 条用例里 **13 条**当场红成 `unexpected EOF`，
+   单跑也必红——libgit2 1.9.7 在这里**靠服务端关连接来标记响应结束**。
+   另外收线要 `shutdown(Write)` 发 FIN 而**不关读半边**：这样客户端迟到的字节还有地方落，
+   不会在 `close()` 那一刻攒成一个 RST（**RST 会把已发出去的响应一起丢掉**，
+   客户端于是看到 `unexpected EOF`）。fixture 的 `trace()` 会记下"响应后另有 N 字节在途"，
+   断言失败时一并报出来。
+
 | 层 | 用什么 | 覆盖什么 | 不能覆盖什么 |
 |---|---|---|---|
 | 快单测 | 本地裸仓（`git clone --bare`） | 扫目录（多形态深度）、递归读子树、三类 not_found、`RepoId` 校验 | **不能带 `depth`**——实测 local transport 直接报 `shallow fetch is not supported by the local transport`（git2 源码里也留着 FIXME「libgit2 doesn't support local shallow clones」），也覆盖不到传输策略 |
@@ -109,8 +174,41 @@ pub trait SkillRepo: Send + Sync + 'static {
 包成一个 HTTP 服务即可，libgit2 能 fetch、能取到 commit 与 blob。**dumb HTTP 不行**：libgit2 硬校验
 响应的 `Content-Type` 必须是 `application/x-git-upload-pack-advertisement`，而
 `git update-server-info` + `python -m http.server` 返回 `application/octet-stream`，实测被拒
-（`invalid content-type`）。fixture 里若要能取**非 HEAD 的旧 commit**，需在裸仓里开
-`uploadpack.allowAnySHA1InWant true`（本机 git 默认 false）。
+（`invalid content-type`）。
+
+**公告体的拼法有一处很容易写错**（实现时踩到并复现）：`# service=git-upload-pack` 这一行**本身也是
+一个 pkt-line**，必须带 4 字节十六进制长度前缀，即 `001e# service=git-upload-pack\n` 后面再跟一个
+flush-pkt `0000`，然后才是 `upload-pack --advertise-refs` 的输出。写成裸文本
+（`# service=git-upload-pack\n` + `0000`）会被客户端把 `# se` 当成十六进制长度，报
+`fatal: protocol error: bad line length character: # se`。长度按 `line.len() + 4` 现算，别写死 `001e`。
+
+**fixture 必须开 `uploadpack.allowAnySHA1InWant true`**（本机 git 默认 false）。不开则按裸 SHA 取
+**任何** commit 都在**客户端**就被拦下——libgit2 的 `fetch.c:148` 报
+`cannot fetch a specific object from the remote repository`，**这一步发生在发出任何 pack 请求之前**，
+所以现象是"还没联网就失败了"，与 GitHub 的行为不同。开了之后实测通过（或开
+`uploadpack.allowReachableSHA1InWant true` 亦可，行为相当）。
+**这不是为了迁就 fixture**：GitHub 的 `octocat/Hello-World.git` 广告里这两个能力位**都在**
+（`allow-tip-sha1-in-want` / `allow-reachable-sha1-in-want`），且已端到端验证过——libgit2 从
+GitHub 取到一个**未被广告的、可达的**旧 commit `553c2077f0edc3d5dc5d17262f6aa498e69d6f8e`（2053 ms）。
+fixture 开这个位就是让本地形态与 GitHub 形态一致。
+
+**失败分类的实现要点（实现期实测补全，2026-09-16）**：拿一个伪造 oid 打真 GitHub，libgit2 给的是
+`class=Net code=GenericError msg=unexpected packet type`——**不是**"对象未被广告"这类干净说法。
+链路上真正发生的事是：GitHub 对一个不存在的 `want` 回 **HTTP 200** + 一条 pkt-line
+`0049ERR upload-pack: not our ref <sha>`（`git http-backend` 不看 `upload-pack` 的退出码，
+只把 stdout 流回去），**而 libgit2 把那句话丢掉了**。
+
+于是分类**不能**靠匹配错误串，也**不能**靠 `ErrorClass`——实测协议层被拒报出来的 class
+**就是 `Net`**，与真连不上同形。落地的判据是**问本地对象库**：`fetch` 返回 `Err` 之后
+`find_commit` 还是找不到那个对象 ⇒ `commit_not_found`。另配一道"这次失败是不是传输层的"
+前置（措辞清单 + `Http` / `Ssl` / `Ssh` 三个 class），让"仓不存在 / 无权访问 / 真断网"
+照旧走各自那几类，不被"对象不在"吃掉。见 `crates/core/src/agent/repo.rs` 的
+`commit_unavailable` / `is_transport_shaped`。
+
+**离线 fixture 也要照这个形态做**：`git upload-pack` 对协议级拒绝是"往 stdout 写 ERR pkt-line
+**然后非零退出**"，fixture 若把它当自己的 500，客户端看到的是 `unexpected http status code: 500`，
+"那个 commit 取不到"就表现成"网络坏了"——八类分得开这件事当场作废。故只有 stdout **一个字都没写**
+时才当 fixture 自己坏了。
 
 **这里有一个覆盖损失要记账，不能装作没少**：离线 fixture 全在本机，所以**仓/commit 不在白名单**
 那类判定打不到 E2E——所以传输与来源判定必须照 `crates/core/src/agent/egress.rs:505` 的
@@ -118,16 +216,19 @@ pub trait SkillRepo: Send + Sync + 'static {
 
 ## 验收
 
-- [ ] `cargo fmt --check`、`clippy --workspace --all-targets -- -D warnings`、`cargo test --workspace` 全过
-- [ ] 离线用例覆盖：ls-remote 取 tip（且断言**没有下载 pack**）；列技能（含 2–3 段与 4–5 段两种深度形态）；
+- [x] `cargo fmt --check`、`clippy --workspace --all-targets -- -D warnings`、`cargo test --workspace` 全过
+- [x] 离线用例覆盖：ls-remote 取 tip（且断言**没有下载 pack**）；列技能（含 2–3 段与 4–5 段两种深度形态）；
       读一个技能目录（含子树兄弟文件）；三类失败 `repo_not_found` / `commit_not_found` / `skill_not_found` 分得开
-- [ ] shallow 路径有离线用例（smart HTTP），断言 `.git/shallow` 存在、且被取的 commit 树可读
-- [ ] 按**旧 commit** 的用例有（fixture 开 `allowAnySHA1InWant`），断言取到的是那个 commit 而不是 tip
-- [ ] `RepoId` / 40 位 hex 的纯函数单测覆盖各种非法输入（scheme、`@`、`..`、缩写 SHA、空段）
-- [ ] 字节上限的用例：小上限下中断，报错含"已收到 / 上限"
-- [ ] 默认门**不打真网络**；打真 GitHub 的用例 opt-in（`test.skip` + 环境变量，照
+- [x] shallow 路径有离线用例（smart HTTP），断言 `.git/shallow` 存在、且被取的 commit 树可读
+- [x] 按**旧 commit** 的用例有（fixture 开 `allowAnySHA1InWant`），断言取到的是那个 commit 而不是 tip
+- [x] `RepoId` / 40 位 hex 的纯函数单测覆盖各种非法输入（scheme、`@`、`..`、缩写 SHA、空段）
+- [x] `AGENTPIPELINE_MARKET_GIT_BASE` 的纯函数单测：默认值、回环 http 放行、非回环 http 拒绝、
+      带路径 / 查询 / 片段的取值拒绝
+- [x] 字节上限的用例：小上限下中断，报错含"已收到 / 上限"，且**数字来自我们自己记的那份**
+      （中止错误串本身可能是空的 `class=None code=User msg=no error`）
+- [x] 默认门**不打真网络**；打真 GitHub 的用例 opt-in（`test.skip` + 环境变量，照
       `frontend/e2e/screenshots.spec.ts` 的先例），且显式开关下能跑通
-- [ ] 引擎零改动可核对：`crates/core/src/agent/skill_import.rs` 与 `market.rs` 的 diff 为空
+- [x] 引擎零改动可核对：`crates/core/src/agent/skill_import.rs` 与 `market.rs` 的 diff 为空
 
 **Notes（给实现者）:**
 - 出网这一层的既有姿态可对照 `crates/core/src/agent/egress.rs`：默认不放行任何外网目标，
@@ -137,3 +238,12 @@ pub trait SkillRepo: Send + Sync + 'static {
   可参考它的写法；但 GitHub 模式下 origin 恒等于 `github.com`，**它不再承担判定作用**（见决策 194）。
 - 真 GitHub 的连通性会偶发中断（历史上 75 s 超时一次、raw 取较大文件超时两次），
   这也是那些用例必须 opt-in 的原因之一。
+
+---
+
+## 实施收尾（2026-09-16）
+
+验收全过。闸门读数：`cargo fmt --all -- --check` 干净、`clippy --workspace --all-targets -- -D warnings`
+干净、`cargo test --workspace` **全绿**（app 契约 104 + 技能来源 25 + core 448 单测等）；
+前端 vitest **350**、`svelte-check` 0 错 0 警告、`vite build` 通过；Playwright 全量
+**43 passed / 2 skipped**（跳过的是"截图作为证据"那两条）。真 GitHub 冒烟在显式开关下**实测一轮通过**。
