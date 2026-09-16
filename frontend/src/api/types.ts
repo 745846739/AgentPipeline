@@ -627,14 +627,19 @@ export interface SkillDeclarationObject {
  */
 export type SkillDeclaration = string | SkillDeclarationObject;
 
-/** `GET /skills` 的一项。 */
+/**
+ * `GET /skills` 的一项。
+ *
+ * **`kind` 已退场**（决策 185）：技能只有技能根下的 markdown 一个来源，一个恒为
+ * `"markdown"` 的判别位只会让人以为还有别的可能。
+ */
 export interface SkillSummary {
   name: string;
-  kind: 'markdown' | 'tool';
   description: string | null;
   /** 手动触发型：默认不自动注入（票 16 Notes 的硬约束）。 */
   disable_model_invocation: boolean;
-  path: string | null;
+  /** `{技能根}/{name}/SKILL.md` 的绝对路径。 */
+  path: string;
   /** 被哪些阶段 / 节点引用（`"阶段 architect-design"` 这类可读串）。 */
   declared_in: string[];
 }

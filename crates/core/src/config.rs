@@ -299,12 +299,11 @@ fn user_home_dir() -> PathBuf {
         .unwrap_or_else(|| PathBuf::from("."))
 }
 
-/// 发现"可用 skill"（决策 47，**已由决策 170 / 172 修订**——两类来源）。
+/// 发现"可用 skill"（决策 47，经决策 170 / 172 扩展、**决策 185 收窄为单一来源**）。
 ///
-/// 保留决策 47 的工具语义（`rtk` / `codegraph` 等 CLI，以 PATH 可执行文件名为准），
-/// 并加入**用户 markdown** 知识型技能（技能根下的 `{name}/SKILL.md`；内嵌技能已随
-/// 决策 172① 退场）。技能正文的注入见 [`crate::agent::skills::resolve`] 与
-/// [`crate::agent::prompts::build_system_prompt`]。
+/// 今天只有**用户 markdown**（技能根下的 `{name}/SKILL.md`；内嵌技能随决策 172① 退场、
+/// PATH 工具型技能随决策 185 退场）。技能正文的注入见 [`crate::agent::skills::resolve`]
+/// 与 [`crate::agent::prompts::build_system_prompt`]。
 ///
 /// `skills_root` 是技能根**本身**（默认 `{home}/skills`，可由 `[skills] dir` 覆盖，
 /// 决策 172）——本函数与 [`crate::agent::skills::discover`] 走同一入口，不新增发现路径。
@@ -966,18 +965,24 @@ pub fn validate_startup(inputs: &StartupInputs) -> Result<StartupReport> {
                 )));
             }
         }
-        // 技能校验（决策 47 / 170 / 172④）：阶段级与节点级声明过同一套检查——
+        // 技能校验（决策 47 / 170 / 172④ / 185）：阶段级与节点级声明过同一套检查——
         // ① 声明形态合法（未知 mode / 未信任 + full → 拒绝，见 parse_skill_decls）；
-        // ② 名字必须存在于可用技能集；③ 知识型技能的正文必须存在且非空。
+        // ② 名字必须存在于可用技能集；③ 全文态技能的正文必须存在且非空。
+        //
+        // 名字的判定**只看技能根**（决策 185）：PATH 里有没有同名可执行文件不影响结果——
+        // 二进制不再是一种技能。报错因此要把这一点说出来，否则从旧版本升上来的配置会看到
+        // 一句「不存在的 skill」而以为文件丢了。
         for (where_, decl) in declared_skills(cfg)? {
             let skill = &decl.name;
             if !inputs.available_skills.iter().any(|s| s == skill) {
                 return Err(Error::Config(format!(
-                    "{where_} 引用了不存在的 skill：{skill}"
+                    "{where_} 引用了不存在的 skill：{skill}（技能只有 markdown 一个来源，\
+                     位于技能根下的 {{name}}/SKILL.md；PATH 里的可执行文件不算技能，\
+                     要用它请让 agent 经 run_command 调用）"
                 )));
             }
-            // 提供技能根时校验正文（工具型技能无正文，`resolve` 返回 None 不报错）。
-            // 名字态不读正文（票 05）——正文由 `Skill` 工具按需拉取，此处不校验其存在性。
+            // 提供技能根时校验正文。名字态不读正文（票 05）——正文由 `Skill` 工具按需拉取，
+            // 此处不校验其存在性。
             if let Some(root) = &inputs.skills_root {
                 if decl.mode == crate::agent::skills::SkillMode::Full {
                     crate::agent::skills::resolve(root, std::slice::from_ref(&decl)).map_err(

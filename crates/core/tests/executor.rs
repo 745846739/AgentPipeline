@@ -1043,12 +1043,16 @@ async fn node_scoped_skills_inject_different_bodies_per_node() {
 async fn stage_level_skills_still_apply_and_union_with_node_level() {
     let external = tempfile::tempdir().unwrap();
     write_user_skill(external.path(), "grilling", "拷问", "拷问协议正文");
+    // 阶段级声明**名字态**技能 `to-spec`（只有名字进 prompt），节点级再叠一个全文态技能
+    write_user_skill(external.path(), "to-spec", "规格", "综合成规格正文");
     let ctx = setup_with_skills_dir("true", Settings::default(), external.path()).await;
     ctx.store
         .upsert_stage_config(&agentpipeline_core::types::StageConfig {
             stage: "architect-design".into(),
-            // 阶段级声明工具型技能 `rtk`，节点级再叠一个用户目录知识型技能
-            skills_json: Some(serde_json::json!(["rtk"])),
+            // 阶段级声明名字态技能 `to-spec`，节点级再叠一个全文态用户技能
+            skills_json: Some(serde_json::json!([
+                {"name": "to-spec", "mode": "name", "trusted": true}
+            ])),
             node_overrides_json: Some(serde_json::json!({
                 "validate_input": {"skills": ["grilling"]}
             })),
@@ -1073,8 +1077,12 @@ async fn stage_level_skills_still_apply_and_union_with_node_level() {
         .iter()
         .find(|r| r.stage == Stage::ArchitectDesign && r.node == Node::ValidateInput)
         .expect("architect validate_input 请求");
-    // 阶段级工具型技能（`- rtk`）与节点级知识型技能（`### grilling`）并存
-    assert!(vi.system_prompt.contains("- rtk"), "{}", vi.system_prompt);
+    // 阶段级名字态技能（`- to-spec`）与节点级全文态技能（`### grilling`）并存
+    assert!(
+        vi.system_prompt.contains("- to-spec"),
+        "{}",
+        vi.system_prompt
+    );
     assert!(
         vi.system_prompt.contains("### grilling"),
         "{}",
@@ -1086,7 +1094,11 @@ async fn stage_level_skills_still_apply_and_union_with_node_level() {
         .iter()
         .find(|r| r.stage == Stage::ArchitectDesign && r.node == Node::Execute)
         .expect("architect execute 请求");
-    assert!(ex.system_prompt.contains("- rtk"), "{}", ex.system_prompt);
+    assert!(
+        ex.system_prompt.contains("- to-spec"),
+        "{}",
+        ex.system_prompt
+    );
     assert!(!ex.system_prompt.contains("### grilling"));
 }
 
@@ -2321,7 +2333,7 @@ async fn referenced_missing_skill_refuses_startup() {
             skills_json: Some(serde_json::json!(["definitely-not-installed"])),
             ..Default::default()
         }],
-        available_skills: vec!["rtk".into()],
+        available_skills: vec!["grilling".into()],
         home_root: None,
         skills_root: None,
     };

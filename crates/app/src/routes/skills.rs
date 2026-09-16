@@ -48,7 +48,7 @@
 
 use agentpipeline_core::agent::skill_import::{self, PackageInfo, ScanEntry, SkillPackage};
 use agentpipeline_core::agent::skill_preview::{self, FeatureKind, FeatureScan};
-use agentpipeline_core::agent::skills::{discover, SkillSource, SKILL_FILE};
+use agentpipeline_core::agent::skills::{discover, SKILL_FILE};
 use agentpipeline_core::types::StageConfig;
 use axum::body::Bytes;
 use axum::extract::{DefaultBodyLimit, Path, Query, State};
@@ -108,17 +108,13 @@ pub async fn list(State(state): State<AppState>) -> ApiResult<impl IntoResponse>
     let skills: Vec<serde_json::Value> = discover(&root)
         .into_iter()
         .map(|s| {
-            // 两类来源只在 `kind` 与 `path` 上不同（工具型技能在 PATH 里，没有技能根下的文件）
-            let (kind, path) = match s.source {
-                SkillSource::Markdown { path } => ("markdown", json!(path.display().to_string())),
-                SkillSource::Tool => ("tool", serde_json::Value::Null),
-            };
+            // 技能只有一个来源（技能根下的 markdown，决策 185），故 `kind` 字段已退场：
+            // 一个恒为 "markdown" 的判别位只会让读契约的人以为还有别的可能。
             json!({
                 "name": s.name,
-                "kind": kind,
                 "description": s.frontmatter.description,
                 "disable_model_invocation": s.frontmatter.disable_model_invocation,
-                "path": path,
+                "path": s.path.display().to_string(),
                 "declared_in": declared_in(&configs, &s.name),
             })
         })
@@ -307,7 +303,7 @@ fn resolve_scan_root(raw: &str) -> std::path::PathBuf {
 
 /// `DELETE /skills/{name}`：卸载技能。
 ///
-/// 技能不存在 → 404；工具型技能（PATH 可执行文件）→ 400（删用户的 PATH 文件是灾难）。
+/// 技能不存在 → 404。
 /// 仍被引用的技能**可以卸载**，见模块头注释。
 pub async fn uninstall(
     State(state): State<AppState>,
@@ -330,8 +326,9 @@ const NEW_SKILL_DEFAULT_NOTE: &str = "该技能尚未被任何阶段或节点引
 
 /// 三项预览的统一组装（两个入口共用，避免装前 / 装后两份口径）。
 ///
-/// `body_available` 为假时第 ③ 项是**空的**而非「无风险」：工具型技能（PATH 可执行文件）
-/// 没有 markdown 正文，界面必须显示「无正文可扫」而不是「未发现特征」——后者是虚假的安心。
+/// `body_available` 为假时第 ③ 项是**空的**而非「无风险」：拿不到正文（装前预览的包里没有
+/// `SKILL.md`，或磁盘上那份读不到）时界面必须显示「无正文可扫」，而不是「未发现特征」——
+/// 后者是虚假的安心。
 fn preview_json(
     name: &str,
     configs: &[StageConfig],
@@ -705,8 +702,7 @@ pub async fn install_recommended(
 
 /// 技能根里已存在的同名 markdown 技能的包元数据（`{name}/SKILL.md`）。
 ///
-/// 只认技能根下的目录：PATH 里的工具型技能没有正文，不能拿来顶替市场包（那会让
-/// 「装一个同名知识技能」变成「声明了一个 PATH 工具」）。名字由调用方先过
+/// 只认技能根下的目录：技能的正文必须真的存在（不存在就没什么可顶替的）。名字由调用方先过
 /// [`skill_import::check_skill_name`]，故这里的 `join` 不会走出技能根。
 fn local_skill_package(root: &std::path::Path, name: &str) -> Option<PackageInfo> {
     let dir = root.join(name);

@@ -32,7 +32,7 @@ pub use prompts::{
     prompt_template_hash, render_template, resolve_persona, PromptSegments, TemplateVars,
     BASELINE_PREAMBLE, FORMAT_RULES,
 };
-pub use skills::{ResolvedSkill, Skill, SkillSource};
+pub use skills::{ResolvedSkill, Skill};
 pub use templates::{system_template, user_template};
 pub use tools::{
     CommandFinish, CommandRecorder, CommandStart, SubAgentRequest, SubAgentRunner, ToolCallContext,

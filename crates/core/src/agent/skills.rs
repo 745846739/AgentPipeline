@@ -1,16 +1,15 @@
-//! 技能（skill）发现与解析（决策 170 / 172，修订决策 47）。
+//! 技能（skill）发现与解析（决策 170 / 172 / 185）。
 //!
-//! 决策 47 把 skill 定义为「用户机器上装了对应的外部工具」（PATH 可执行文件名），
-//! 只把**名字**列进 system prompt。本模块在保留该语义的前提下扩展出第二类技能：
-//! **携带 markdown 正文** 的知识型技能（与 MCP 的分工见 backlog §B.1：
-//! skill 是知识/流程指引，MCP 是可调用能力）。
+//! **技能只有一个来源：用户可读的 markdown**（`{skills_root}/{name}/SKILL.md`，镜像
+//! ZCode 布局，可直接把现有 skill 目录拷进来）。名字是唯一身份，正文是它的内容。
 //!
-//! 技能的**唯一身份是名字**——两类来源同名即同一个技能，有正文的知识型更具体：
-//!
-//! | 来源 | 判定 | 正文 |
-//! |---|---|---|
-//! | 用户 markdown | `{skills_root}/{name}/SKILL.md`（镜像 ZCode 布局，可直接拷贝） | 有 |
-//! | 外部工具 | PATH 中可执行文件（决策 47 原语义） | 无，只列名字 |
+//! **PATH 工具型技能已退场**（决策 185，修订决策 47 原语义）：一度把「PATH 里的可执行
+//! 文件名」也算一种技能（只有名字、没有正文），那是本系统早期把 skill 定义为「机器上装了
+//! 对应的外部 CLI」时的残余。它与业界（Agent Skills 规范）不一致——技能是**知识**，
+//! 不是可执行能力；而且它把「哪些二进制可用」这件事混进了上下文与配置校验。
+//! 今天：**二进制怎么用、能不能用，由 `run_command` 与系统权限决定**，与技能无关。
+//! 因此 [`discover`] 只扫技能根，配置里写一个既不在技能根、又不是 markdown 的名字
+//! 会在启动校验直接失败（[`crate::config::validate_startup`]）。
 //!
 //! **内嵌技能已退场**（决策 172①，票 04）：二进制不再携带任何技能正文，两个流水线原生
 //! 改写版（`grilling` / `to-spec`）随之移除。技能一律由用户从来源安装到本地，不经二进制
@@ -29,6 +28,8 @@
 //! 表达——全文态（正文进 prompt）、名字态（只列名字，正文交给 `Skill` 工具按需拉取）、
 //! 目录态（[`catalogue`]：未被声明的可用技能，只给名字 + 描述，是渐进披露的落点）。
 //! 形态由配置声明（[`SkillDecl`]）决定，**名字仍是唯一身份**：同一个技能换形态不换身份。
+//! 名字态今天的唯一来源是配置里的 `mode: "name"`（工具型技能退场前，它同时承担着
+//! 「无正文可注入」那一种情形）。
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -42,19 +43,6 @@ pub const SKILLS_DIR: &str = "skills";
 
 /// 技能文件名（ZCode 布局，可直接把现有 skill 目录拷进来）。
 pub const SKILL_FILE: &str = "SKILL.md";
-
-/// 技能来源。
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum SkillSource {
-    /// PATH 中的可执行文件（决策 47 原语义）。只有名字，没有正文。
-    Tool,
-    /// 用户 markdown（`{skills_root}/{name}/SKILL.md`）。
-    ///
-    /// 内嵌来源已随决策 172① 退场（票 04）：技能一律由用户从来源安装到本地，不经二进制
-    /// 分发——这同时解掉上游内容的再分发授权问题（27 个上游技能里只有 1 个带许可声明，
-    /// 而本仓是 MIT）。
-    Markdown { path: PathBuf },
-}
 
 /// 技能注入形态（决策 172④，票 05）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -139,12 +127,13 @@ pub struct SkillFrontmatter {
     pub name: Option<String>,
 }
 
-/// 一个可用技能。
+/// 一个可用技能（技能根下的 `{name}/SKILL.md`）。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Skill {
     pub name: String,
-    pub source: SkillSource,
-    /// frontmatter 解析结果（工具型技能为空缺省）。
+    /// `SKILL.md` 的路径。技能只有一个来源，故不再是「来源枚举 + 可能为空的路径」。
+    pub path: PathBuf,
+    /// frontmatter 解析结果。
     pub frontmatter: SkillFrontmatter,
 }
 
@@ -181,41 +170,6 @@ impl ResolvedSkill {
     }
 }
 
-/// 扫描 PATH 得到可执行文件名（决策 47）。
-fn path_tool_names() -> Vec<String> {
-    let mut names = std::collections::BTreeSet::new();
-    let Some(paths) = std::env::var_os("PATH") else {
-        return Vec::new();
-    };
-    for dir in std::env::split_paths(&paths) {
-        let Ok(entries) = std::fs::read_dir(&dir) else {
-            continue;
-        };
-        for entry in entries.flatten() {
-            let is_executable = entry.metadata().map(|m| m.is_file()).unwrap_or(false) && {
-                #[cfg(unix)]
-                {
-                    use std::os::unix::fs::PermissionsExt;
-                    entry
-                        .metadata()
-                        .map(|m| m.permissions().mode() & 0o111 != 0)
-                        .unwrap_or(false)
-                }
-                #[cfg(not(unix))]
-                {
-                    true
-                }
-            };
-            if is_executable {
-                if let Some(name) = entry.file_name().to_str() {
-                    names.insert(name.to_string());
-                }
-            }
-        }
-    }
-    names.into_iter().collect()
-}
-
 /// 技能根下 `{name}/SKILL.md` 的路径。
 ///
 /// `skills_root` 就是技能根**本身**（默认 `{home}/skills`，可由 `[skills] dir` 覆盖），
@@ -243,33 +197,19 @@ fn markdown_skill_paths(skills_root: &Path) -> BTreeMap<String, PathBuf> {
     out
 }
 
-/// 发现全部可用技能（技能根 markdown ∪ PATH 工具），名字去重。
+/// 发现技能根下的全部可用技能，按名字排序。
 ///
-/// 两类来源同名时**让位给知识型**：有正文的更具体，工具型只列名字。
-/// 内嵌来源已退场（决策 172①，票 04），本函数不再有「内嵌 ∪ 用户覆盖」那一层。
+/// **只扫技能根**（决策 185）：PATH 里的可执行文件不再是技能——二进制能不能用由
+/// `run_command` 与系统权限决定，不进技能池，也不参与配置校验。
 pub fn discover(skills_root: &Path) -> Vec<Skill> {
-    let mut out: Vec<Skill> = markdown_skill_paths(skills_root)
+    markdown_skill_paths(skills_root)
         .into_iter()
         .map(|(name, path)| Skill {
-            source: SkillSource::Markdown { path: path.clone() },
             frontmatter: read_frontmatter(&path),
             name,
+            path,
         })
-        .collect();
-
-    let taken: Vec<String> = out.iter().map(|s| s.name.clone()).collect();
-    for name in path_tool_names() {
-        // 工具型与知识型同名时让位给知识型（有正文的更具体）
-        if !taken.contains(&name) {
-            out.push(Skill {
-                name,
-                source: SkillSource::Tool,
-                frontmatter: SkillFrontmatter::default(),
-            });
-        }
-    }
-    out.sort_by(|a, b| a.name.cmp(&b.name));
-    out
+        .collect()
 }
 
 /// 全部可用技能名（启动校验与 `PUT /stage-configs` 用）。
@@ -381,31 +321,17 @@ pub fn validate_names(skills_root: &Path) -> Result<()> {
     Ok(())
 }
 
-/// 读取一个知识型技能的正文（技能根下的用户文件）。
+/// 读取一个技能的正文（技能根下的用户文件）。
 ///
-/// 三态返回，覆盖票 04 要求的三条路径：
-/// - **用户文件可读且非空** → `Ok(Some(body))`；
-/// - **PATH 工具型技能** → `Ok(None)`（只有名字，决策 47 原语义）；
-/// - **名字不存在、或知识型技能的文件读不到 / 正文为空** → [`Error::Config`]。
+/// 两条路径，覆盖票 04 要求的语义：
+/// - **用户文件可读且非空** → `Ok(body)`；
+/// - **文件读不到 / 正文为空** → [`Error::Config`]。
 ///
-/// 第三条是关键：内嵌兜底删除后，**不得**出现「名字存在但静默降级成空子弹」的路径
+/// 第二条是关键：内嵌兜底删除后，**不得**出现「名字存在但静默降级成空子弹」的路径
 /// （票 04 显式禁止）——那样 agent 会拿到一个没有任何正文的技能名，而配置方以为它生效了。
-///
-/// `markdown` 是预先算好的技能根索引、`tool_names` 是 PATH 可执行文件名（**按需惰性求值**：
-/// 只有「技能根里找不到这个名字」时才需要扫 PATH 来区分工具型与不存在，见 [`path_tool_names`]）。
-fn body_of(
-    skills_root: &Path,
-    name: &str,
-    markdown: &BTreeMap<String, PathBuf>,
-    tool_names: &mut Option<Vec<String>>,
-) -> Result<Option<String>> {
-    if !markdown.contains_key(name) {
-        // 技能根里没有：只有在 PATH 里找到才算工具型技能，否则是名字写错了
-        let tools = tool_names.get_or_insert_with(path_tool_names);
-        if tools.iter().any(|t| t == name) {
-            return Ok(None);
-        }
-    }
+/// PATH 工具型技能退场（决策 185）之前，第三种情形「名字只存在于 PATH」在这里被放行成
+/// 名字态；今天它落进第二条：那个名字就是不存在。
+fn body_of(skills_root: &Path, name: &str) -> Result<String> {
     let path = skill_file_path(skills_root, name);
     let raw = std::fs::read_to_string(&path).map_err(|e| {
         Error::Config(format!(
@@ -420,7 +346,7 @@ fn body_of(
             path.display()
         )));
     }
-    Ok(Some(body))
+    Ok(body)
 }
 
 /// 解析声明的一组技能为「名字 + 渲染形态」，保持声明顺序、去重（决策 172④，票 05）。
@@ -432,13 +358,7 @@ fn body_of(
 /// - `mode = name`：**不读正文**——名字态的正文由 `Skill` 工具按需拉取（票 06），
 ///   这里读进来反而会把正文带进 system prompt，破坏 `prompt_template_hash` 对
 ///   名字态的钝感（票 05 的显式要求）。
-///
-/// 工具型技能（PATH 可执行文件，无正文）在名字态与全文态下都只渲染名字：它本来就没有
-/// 正文可注入，这是决策 47 的原语义。
 pub fn resolve(skills_root: &Path, declared: &[SkillDecl]) -> Result<Vec<ResolvedSkill>> {
-    // 技能根索引只算一次；PATH 扫描惰性（只有遇到技能根里没有的名字才需要它）
-    let markdown = markdown_skill_paths(skills_root);
-    let mut tool_names: Option<Vec<String>> = None;
     let mut out: Vec<ResolvedSkill> = Vec::new();
     for decl in declared {
         if out.iter().any(|s| s.name == decl.name) {
@@ -447,14 +367,12 @@ pub fn resolve(skills_root: &Path, declared: &[SkillDecl]) -> Result<Vec<Resolve
         let render = match decl.mode {
             SkillMode::Name => SkillRender::Name,
             SkillMode::Full => {
-                match body_of(skills_root, &decl.name, &markdown, &mut tool_names)? {
-                    // 全文态**也**展开兄弟文件（票 07）：否则全文态下兄弟引用仍是死指针。
-                    // 缺失即 fail fast——本函数在启动校验与 prompt 组装两处都用，残缺的技能包
-                    // 必须在启动时暴露，而不是让 agent 拿着少一节的正文开工。
-                    Some(body) => SkillRender::Full {
-                        body: expand_siblings_strict(skills_root, &decl.name, &body)?,
-                    },
-                    None => SkillRender::Name, // 工具型技能：只有名字（决策 47）
+                let body = body_of(skills_root, &decl.name)?;
+                // 全文态**也**展开兄弟文件（票 07）：否则全文态下兄弟引用仍是死指针。
+                // 缺失即 fail fast——本函数在启动校验与 prompt 组装两处都用，残缺的技能包
+                // 必须在启动时暴露，而不是让 agent 拿着少一节的正文开工。
+                SkillRender::Full {
+                    body: expand_siblings_strict(skills_root, &decl.name, &body)?,
                 }
             }
         };
@@ -467,13 +385,10 @@ pub fn resolve(skills_root: &Path, declared: &[SkillDecl]) -> Result<Vec<Resolve
 }
 
 /// 技能**目录**（渐进披露，决策 172④，票 05）：技能根下**未被声明**、且未被
-/// `disable-model-invocation` 排除的 markdown 技能，渲染为 `- {name}: {description}`。
+/// `disable-model-invocation` 排除的技能，渲染为 `- {name}: {description}`。
 ///
 /// 三条准入：
-/// - **只收技能根下的 markdown 技能**。工具型技能（PATH 可执行文件）没有正文可加载
-///   ——列进「按需加载」的目录等于向模型广告它拿不到的能力，且 PATH 下可执行文件动辄
-///   上千，与本段「省上下文」的初衷相反（决策 47 的工具型技能仍按原语义由阶段声明列出
-///   名字）。
+/// - 只收技能根下的 markdown 技能（技能只有一个来源，决策 185）。
 /// - 被声明的技能由 [`resolve`] 以全文/名字态渲染，**不再重复出现在目录里**，否则同一
 ///   技能在 prompt 里出现两次。
 /// - `disable-model-invocation: true` 不进目录（选型 D）：上游 27 个技能中 14 个带此键，
@@ -482,9 +397,6 @@ pub fn resolve(skills_root: &Path, declared: &[SkillDecl]) -> Result<Vec<Resolve
 /// 目录态**不含正文**，因此对 `prompt_template_hash` 只是「有哪些技能可用」级别的敏感，
 /// 与正文变更无关（决策 137 / 票 05）。
 pub fn catalogue(skills_root: &Path, declared: &[String]) -> Vec<ResolvedSkill> {
-    // 直接扫技能根，不走 [`discover`]——后者会顺带枚举整个 PATH 找可执行文件，而目录态
-    // 只收 markdown 技能。本函数在**每次 agent attempt** 的 prompt 组装路径上，不该为
-    // 一批注定被过滤掉的名字付目录扫描的代价。
     markdown_skill_paths(skills_root)
         .into_iter()
         .filter(|(name, _)| !declared.contains(name))
@@ -670,7 +582,8 @@ fn resolve_sibling(base: &Path, target: &str) -> SiblingTarget {
 ///   因此返回 `Result` 让调用方把「找不到」变成给模型的错误文本，而非 fail fast——
 ///   模型据此自我纠正（票 06 的核心行为）。
 ///
-/// 工具型技能（PATH 可执行文件）没有正文，报错时**说清是为什么**：只说「找不到」会让
+/// 工具型技能已退场（决策 185），故今天只有两种失败：「没这个技能」与「有这个技能但
+/// 它声明了 `disable-model-invocation`」——报错时**说清是哪一种**，只说「找不到」会让
 /// 模型反复重试同一个名字。
 ///
 /// **`disable-model-invocation: true` 的技能不加载**（票 06 / 选型 D）：该键的语义就是
@@ -681,20 +594,17 @@ fn resolve_sibling(base: &Path, target: &str) -> SiblingTarget {
 /// 本工具加载（这正是 `mode: "name"` 的用法——不进 system prompt、按需拉取，见 spec §6），
 /// 信任门约束的是**全文注入**那条路径，在 [`crate::config::parse_skill_decls`] 里把关。
 pub fn load_body(skills_root: &Path, name: &str) -> Result<String> {
-    // 先确认名字在可用池里，以便区分「没这个技能」与「有这个技能但它是工具型 / 被禁用」
-    let known = discover(skills_root).into_iter().find(|s| s.name == name);
-    let skill = known.ok_or_else(|| Error::Config(format!("技能不存在：{name}")))?;
+    // 先确认名字在可用池里，以便区分「没这个技能」与「有这个技能但被禁用」
+    let skill = discover(skills_root)
+        .into_iter()
+        .find(|s| s.name == name)
+        .ok_or_else(|| Error::Config(format!("技能不存在：{name}")))?;
     if skill.frontmatter.disable_model_invocation {
         return Err(Error::Config(format!(
             "技能 {name} 声明了 disable-model-invocation，不允许模型自动调用"
         )));
     }
-    // `discover` 已定位到文件，直接读它——不必再走一遍「区分工具型与不存在」的判定
-    let SkillSource::Markdown { path } = &skill.source else {
-        return Err(Error::Config(format!(
-            "技能 {name} 是 PATH 工具型技能，没有可注入的正文（它只有名字）"
-        )));
-    };
+    let path = &skill.path;
     let raw = std::fs::read_to_string(path).map_err(|e| {
         Error::Config(format!(
             "技能 {name} 的正文不可读：{}（{e}）",
@@ -780,10 +690,10 @@ mod tests {
         write_skill(&root_of(home.path()), "grilling", "用户自己的拷问流程");
         let resolved = resolve(&root_of(home.path()), &decls(&["grilling"])).unwrap();
         assert_eq!(full_body(&resolved[0]), "用户自己的拷问流程");
-        // 来源登记为用户 markdown
+        // 来源登记为技能根下那份文件（技能只有一个来源，决策 185）
         let found = discover(&root_of(home.path()));
         let s = found.iter().find(|s| s.name == "grilling").unwrap();
-        assert!(matches!(s.source, SkillSource::Markdown { .. }), "{s:?}");
+        assert_eq!(s.path, skill_file_path(&root_of(home.path()), "grilling"));
     }
 
     #[test]
@@ -825,38 +735,22 @@ mod tests {
         assert!(!body.contains('\r'), "{body:?}");
     }
 
-    #[test]
-    fn tool_skill_renders_as_name_only() {
-        let home = tmp();
-        // 工具型技能（PATH 可执行文件）不在技能根里，无正文——用真实存在于 PATH 的名字验证。
-        // 决策 47 原语义：只列名字（与「名字态」渲染相同，但语义是「无正文可注入」）。
-        let root = root_of(home.path());
-        assert!(
-            skill_names(&root).contains(&"sh".to_string()),
-            "前提失败：PATH 里没有 sh"
-        );
-        let resolved = resolve(&root, &decls(&["sh"])).unwrap();
-        assert_eq!(resolved[0].render, SkillRender::Name);
-    }
-
     /// 票 04：**名字不存在**不再是「静默降级成名字态」，而是 fail fast。
     ///
     /// 内嵌兜底删除后这条区别才显形——之前 `definitely-not-a-knowledge-skill` 会经
     /// 「非内嵌 → 工具型」的默认分支静默降级，agent 拿到一个没有正文的技能名，
     /// 而配置方以为它生效了。票 04 显式禁止这条路径。
+    ///
+    /// 工具型技能退场（决策 185）后这条口径更硬：**只看技能根**，PATH 里有没有同名
+    /// 可执行文件都不再改变判定（`sh` 几乎必然在 PATH 里，仍必须报错）。
     #[test]
     fn unknown_skill_name_is_config_error_not_silent_name_only() {
         let home = tmp();
-        let err = resolve(
-            &root_of(home.path()),
-            &decls(&["definitely-not-a-knowledge-skill"]),
-        )
-        .unwrap_err();
-        assert!(matches!(err, Error::Config(_)), "{err:?}");
-        assert!(
-            err.to_string().contains("definitely-not-a-knowledge-skill"),
-            "{err}"
-        );
+        for name in ["definitely-not-a-knowledge-skill", "sh"] {
+            let err = resolve(&root_of(home.path()), &decls(&[name])).unwrap_err();
+            assert!(matches!(err, Error::Config(_)), "{err:?}");
+            assert!(err.to_string().contains(name), "{err}");
+        }
     }
 
     #[test]
@@ -981,22 +875,18 @@ mod tests {
         assert!(names.contains(&"auto-ok"), "{names:?}");
     }
 
-    /// 工具型技能（PATH 可执行文件）不进目录：没有正文可加载，列进去是广告拿不到的能力。
+    /// 技能池里不可能混进 PATH 里的可执行文件（决策 185 的直接断言）。
     ///
-    /// 用 `sh`（几乎必然存在于 PATH）验证——它绝不可能是技能根下的 markdown 技能。
+    /// 用 `sh`（几乎必然存在于 PATH）验证：它不在技能根下，就**不该**出现在可用技能池里
+    /// ——这正是「二进制不再算技能」这句话的可执行形态。
     #[test]
-    fn tool_type_skills_are_not_in_catalogue() {
+    fn path_executables_are_not_skills() {
         let home = tmp();
-        // 前提：`sh` 确实是 PATH 里的可执行文件，否则本用例无意义
-        assert!(
-            skill_names(&root_of(home.path())).contains(&"sh".to_string()),
-            "前提失败：PATH 里没有 sh"
-        );
+        let names = skill_names(&root_of(home.path()));
+        assert!(!names.contains(&"sh".to_string()), "{names:?}");
+        assert!(names.is_empty(), "空技能根不应有任何技能：{names:?}");
         let cat = catalogue(&root_of(home.path()), &[]);
-        assert!(
-            !cat.iter().any(|s| s.name == "sh"),
-            "工具型技能不得进目录（无正文可加载）"
-        );
+        assert!(cat.is_empty(), "{cat:?}");
     }
 
     /// 票 03：断言对象从内嵌常量换为用户目录技能——同一组行为在**用户文件**上成立。
@@ -1050,17 +940,17 @@ mod tests {
         assert!(err.to_string().contains("no-such-skill"), "{err}");
     }
 
-    /// 工具型技能没有正文可注入——报错要说清原因，否则模型会反复重试同一个名字。
+    /// 技能池里没有的名字（包括曾经靠 PATH 兜住的那种）报错要说清是「不存在」。
+    ///
+    /// 工具型技能退场（决策 185）后这里只剩一种原因——但报错仍必须带上名字，
+    /// 否则模型只会看到「失败」并反复重试同一个名字。
     #[test]
-    fn load_body_rejects_tool_type_skill_with_reason() {
+    fn load_body_reports_unknown_name() {
         let home = tmp();
-        assert!(
-            skill_names(&root_of(home.path())).contains(&"sh".to_string()),
-            "前提失败：PATH 里没有 sh"
-        );
         let err = load_body(&root_of(home.path()), "sh").unwrap_err();
         let msg = err.to_string();
-        assert!(msg.contains("工具型"), "须说明是工具型技能：{msg}");
+        assert!(msg.contains("技能不存在"), "{msg}");
+        assert!(msg.contains("sh"), "{msg}");
     }
 
     /// `disable-model-invocation: true` 的技能不允许模型自动调用（选型 D）。

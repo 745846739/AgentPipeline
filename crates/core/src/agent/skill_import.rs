@@ -26,13 +26,13 @@
 //! ## 同名冲突默认拒绝
 //!
 //! 技能名是唯一身份（决策 172），同名的第二份来源会让「这个技能是什么」变得不确定。因此
-//! 冲突时**默认拒绝**，错误报文报出冲突技能名与**它当前的来源**（用户 markdown 路径 / PATH
-//! 可执行文件），只有调用方显式传 `overwrite` 才覆盖。
+//! 冲突时**默认拒绝**，错误报文报出冲突技能名与**它当前的来源**（技能根下那份 markdown 的
+//! 路径），只有调用方显式传 `overwrite` 才覆盖。
 
 use std::collections::BTreeMap;
 use std::path::{Component, Path, PathBuf};
 
-use crate::agent::skills::{parse_frontmatter, SkillSource, SKILL_FILE};
+use crate::agent::skills::{parse_frontmatter, SKILL_FILE};
 use crate::error::{Error, Result};
 
 /// 单个技能包/条目的大小上限（16 MiB）。
@@ -439,46 +439,34 @@ fn collect_dir(base: &Path, dir: &Path, out: &mut BTreeMap<String, Vec<u8>>) -> 
     Ok(())
 }
 
-/// 同名冲突时已存在的那份技能的来源（错误报文与冲突分类用）。
+/// 同名冲突时已存在的那份技能的来源（错误报文用）。
+///
+/// 技能只有一个来源——技能根下的 markdown（决策 185，PATH 工具型技能已退场），故这里
+/// 就是一句来源描述；留一个具名类型是因为**报文**要它：「覆盖需显式确认」必须说清
+/// 将要覆盖的是哪一份。
 #[derive(Debug, Clone, PartialEq, Eq)]
-enum ExistingSource {
-    /// 技能根下的 markdown 技能——可被 `overwrite` 替换。
-    Markdown(String),
-    /// PATH 中的可执行文件（工具型技能）——不可替换，只能改名。
-    Tool,
-}
+struct ExistingSource(String);
 
 impl ExistingSource {
     fn describe(&self) -> String {
-        match self {
-            ExistingSource::Markdown(desc) => desc.clone(),
-            ExistingSource::Tool => "PATH 中的同名可执行文件（工具型技能）".to_string(),
-        }
+        self.0.clone()
     }
 }
 
 /// 查同名技能是否已存在及其来源（一次 `discover`，避免调用点重复扫描）。
+///
+/// 返回 `None` 的确切含义：技能根下没有这个技能的 markdown。
 fn existing_source(skills_root: &Path, name: &str) -> Option<ExistingSource> {
     crate::agent::skills::discover(skills_root)
         .into_iter()
         .find(|s| s.name == name)
-        .map(|s| match s.source {
-            SkillSource::Markdown { path } => {
-                ExistingSource::Markdown(format!("技能根下的 {}", path.display()))
-            }
-            SkillSource::Tool => ExistingSource::Tool,
-        })
+        .map(|s| ExistingSource(format!("技能根下的 {}", s.path.display())))
 }
 
 /// 把包安装到技能根（票 09）：校验 → 同名冲突判定 → 落盘。
 ///
 /// `overwrite = false`（默认）时同名即 [`Error::Conflict`]，报文报出冲突技能名与其当前来源；
 /// `true` 时先删掉旧目录再落新包（覆盖是显式确认后的动作，不留旧兄弟文件的残骸）。
-///
-/// **工具型技能的冲突不受 `overwrite` 影响**：`overwrite` 的语义是「替换技能根里那份同名技能」，
-/// 而 PATH 里的可执行文件不归技能根管——删不掉它，装一份同名 markdown 只会把它的名字**遮住**
-/// （知识型优先于工具型），用户以为覆盖了、其实 PATH 里那份还在。这属于必须让用户改名的情形，
-/// 故一律 [`Error::Conflict`]。
 ///
 /// 落盘前对目标目录做 **realpath 校验**（`canonicalize` 后确认仍在技能根内）——技能根自身
 /// 可能是符号链接（如指向另一磁盘），因此比较的是**双方的 realpath**，而不是让技能根保持
@@ -487,14 +475,6 @@ pub fn install(skills_root: &Path, package: &SkillPackage, overwrite: bool) -> R
     let info = package.validate()?;
 
     if let Some(existing) = existing_source(skills_root, &package.name) {
-        // 工具型技能的冲突不受 `overwrite` 影响（见函数文档）
-        if existing == ExistingSource::Tool {
-            return Err(Error::Conflict(format!(
-                "技能 {} 与 PATH 中的可执行文件同名；\
-                 覆盖它需要改名——PATH 文件不归本系统管，装同名知识型技能只会把它遮住",
-                package.name
-            )));
-        }
         if !overwrite {
             return Err(Error::Conflict(format!(
                 "技能 {} 已存在（当前来源：{}）；覆盖需显式确认",
@@ -593,20 +573,12 @@ fn ensure_inside(skills_root: &Path, target: &Path) -> Result<()> {
 /// `PUT /stage-configs` 的 fail fast 兜住（票面显式要求「不得静默降级」）。把引用检查放进
 /// 卸载会制造一个隐蔽的依赖：想卸载得先改配置、想改配置得先卸载。
 ///
-/// 技能不存在 → [`Error::Task`]（API 层映射 404）。工具型技能（PATH 可执行文件）不可卸载
-/// ——它不归我们管，删用户的 PATH 文件是灾难。
+/// 技能不存在 → [`Error::Task`]（API 层映射 404）。
 pub fn uninstall(skills_root: &Path, name: &str) -> Result<()> {
     let name = sanitize_skill_name(name)
         .map_err(|reason| Error::Validation(format!("技能名非法（{reason}）：{name}")))?;
     let target = skills_root.join(&name);
     if !target.is_dir() {
-        // 区分「工具型技能」与「不存在」：前者要明确拒绝，否则用户以为删掉了
-        if let Some(source) = existing_source(skills_root, &name) {
-            return Err(Error::Validation(format!(
-                "技能 {name} 不是可卸载的本地技能（当前来源：{}）",
-                source.describe()
-            )));
-        }
         return Err(Error::Task(format!("技能不存在：{name}")));
     }
     ensure_inside(skills_root, &target)?;
@@ -619,9 +591,9 @@ pub fn uninstall(skills_root: &Path, name: &str) -> Result<()> {
 ///
 /// 返回**名字 + 描述 + 是否已在目标技能根里存在**，供界面逐个预览与勾选。
 ///
-/// 与 [`crate::agent::skills::discover`] 的区别：那个是「本机可用技能」的权威列表（含 PATH
-/// 工具型技能），本函数回答的是「这个目录里有什么可导入的」——因此**只扫 markdown 技能**
-/// （工具型技能没有包可拷），且**不读 PATH**（扫描的是给定目录，不是本机环境）。
+/// 与 [`crate::agent::skills::discover`] 的区别：那个是「本机可用技能」的权威列表（技能根下
+/// 的 markdown），本函数回答的是「**这个目录**里有什么可导入的」——因此扫的是给定目录，
+/// 不是本机技能根，也不读 PATH（技能只有 markdown 一个来源，决策 185）。
 ///
 /// `target_root` 是判断「是否已存在」的参照技能根；传 `None` 表示不判重（`exists` 一律 false）。
 /// 目录里**不含** `SKILL.md` 的子目录被跳过（那不是技能），而非报错——用户目录里杂物很多，
@@ -995,46 +967,6 @@ mod tests {
         );
     }
 
-    /// 工具型技能（PATH 可执行文件）同名也拦截——它的身份同样占用这个名字。
-    #[test]
-    fn conflict_with_path_tool_skill_is_also_rejected() {
-        let home = tmp();
-        let root = home.path().join("skills");
-        std::fs::create_dir_all(&root).unwrap();
-        assert!(
-            crate::agent::skills::skill_names(&root).contains(&"sh".to_string()),
-            "前提失败：PATH 里没有 sh"
-        );
-        let src = skill_dir(home.path(), "sh", "想占用 sh 这个名字的正文");
-        let pkg = SkillPackage::from_dir(&src).unwrap();
-        let err = install(&root, &pkg, false).unwrap_err();
-        assert!(matches!(err, Error::Conflict(_)), "{err:?}");
-        assert!(err.to_string().contains("PATH"), "{err}");
-    }
-
-    /// **`overwrite = true` 也不能把 PATH 工具型技能「覆盖」掉**：删除只可能作用于技能根里的
-    /// 那份，PATH 文件不归本系统管，装了同名 markdown 只会把它遮住——用户以为覆盖了，
-    /// 其实那份还在。这类冲突只能改名，故不受 `overwrite` 影响。
-    #[test]
-    fn overwrite_cannot_shadow_a_path_tool_skill() {
-        let home = tmp();
-        let root = home.path().join("skills");
-        std::fs::create_dir_all(&root).unwrap();
-        assert!(
-            crate::agent::skills::skill_names(&root).contains(&"sh".to_string()),
-            "前提失败：PATH 里没有 sh"
-        );
-        let src = skill_dir(home.path(), "sh", "想遮住 sh 的正文");
-        let pkg = SkillPackage::from_dir(&src).unwrap();
-        let err = install(&root, &pkg, true).unwrap_err();
-        assert!(matches!(err, Error::Conflict(_)), "{err:?}");
-        assert!(
-            !root.join("sh").exists(),
-            "拒绝后不得留下技能目录：{:?}",
-            std::fs::read_dir(&root).map(|d| d.count())
-        );
-    }
-
     /// 技能名含 `/` 被拒绝——否则会出现「装得进、列不出、删不掉」的半成品状态
     /// （`discover` 只扫技能根下一层，而 `uninstall` 拒绝含分隔符的名字）。
     #[test]
@@ -1218,20 +1150,6 @@ mod tests {
         let root = home.path().join("absent-skills");
         let err = uninstall(&root, "anything").unwrap_err();
         assert!(matches!(err, Error::Task(_)), "{err:?}");
-    }
-
-    /// 工具型技能不可卸载（删用户的 PATH 文件是灾难）。
-    #[test]
-    fn uninstall_refuses_tool_type_skill() {
-        let home = tmp();
-        let root = home.path().join("skills");
-        std::fs::create_dir_all(&root).unwrap();
-        assert!(
-            crate::agent::skills::skill_names(&root).contains(&"sh".to_string()),
-            "前提失败：PATH 里没有 sh"
-        );
-        let err = uninstall(&root, "sh").unwrap_err();
-        assert!(err.to_string().contains("工具型"), "{err}");
     }
 
     /// 卸载路径同样拒绝穿越写法。
