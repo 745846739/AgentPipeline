@@ -16,7 +16,8 @@ use agentpipeline_core::config::Settings;
 use agentpipeline_core::metrics;
 use agentpipeline_core::pipeline::foreman::FOREMAN_TOOLS;
 use agentpipeline_core::pipeline::foreman::{
-    build_briefing, trim_history, ForemanRunner, FOREMAN_AGENT_TYPE, FOREMAN_STAGE_KEY,
+    build_briefing, trim_history, ForemanRunner, FOREMAN_AGENT_TYPE, FOREMAN_PERSONA,
+    FOREMAN_STAGE_KEY,
 };
 use agentpipeline_core::storage::foreman::NewForemanMessage;
 use agentpipeline_core::storage::tasks::TaskFilter;
@@ -667,4 +668,25 @@ async fn foreman_conversation_never_creates_task_rows() {
         .await
         .unwrap()
         .is_empty());
+}
+
+// ───────────────────── 名分：人格与界面同一个词（决策 193）─────────────────────
+
+/// 人格里对**人**的称呼必须与界面上那块名牌是同一个词。
+///
+/// 这**不是在测 prompt 的效果**（那属 v2 离线 eval，见本文件抬头）：钉住的是同一个名分不能
+/// 有两个答案。它漂过一次——「工头」曾同时指玩家与对面那个 agent（决策 174 挂标、176 裁决）；
+/// 第二次是人这一侧的名分与权力对不上（`员` < `长`，而拍板权在人手里、对面那个人格还写着
+/// 「你没有动手的权力」），使用者当场读出别扭，故改为**值班经理**（决策 193）。界面那一侧
+/// 由 e2e `talk.spec.ts` 的同一对字符串钉住（两块名牌都断言）。
+#[test]
+fn the_persona_calls_the_human_what_the_ui_does() {
+    assert!(
+        FOREMAN_PERSONA.contains("值班经理"),
+        "人格必须称呼人为值班经理（决策 193）：{FOREMAN_PERSONA}"
+    );
+    assert!(
+        !FOREMAN_PERSONA.contains("值班员"),
+        "旧名分「值班员」不得回潮（决策 193）：{FOREMAN_PERSONA}"
+    );
 }

@@ -491,9 +491,10 @@ export function qrSvgUrl(url: string): string {
 /**
  * 读取本服务的配对令牌。
  *
- * **只在回环可读**（服务端强制）：这一步是「在一台已配对的设备上生成给手机的链接」，
- * 手机自己打开分享页时这里会 403——那是设计如此，不是故障。调用方据此降级为
- * 不带令牌的裸地址（手机能看只读页，只是动手与对话还得先配对）。
+ * **只在回环可读**（服务端强制）：这一步是「在跑服务的这台电脑上生成给手机的链接」，
+ * 手机自己打开分享页、或在电脑上用局域网地址打开分享页，这里都会 403——那是设计如此，
+ * 不是故障。**调用方不据此降级为裸地址**（决策 189）：没有令牌就不画二维码，改给
+ * 「去那台电脑本机打开本页」的指引——那张裸地址的码扫了配不上，却与正常的那张一样。
  */
 export function fetchPairingToken(): Promise<{ token: string }> {
   return request<{ token: string }>('/pairing/token');
@@ -517,7 +518,7 @@ export function pairedUrl(base: string, token: string): string {
 
 /**
  * 本会话台账（按 id 升序）。**这是对讲台唯一的权威状态入口**：界面重取它来对齐
- * 「值班员说了什么 / 值班长回了什么 / 合计烧了多少 token」，不自己攒一份账。
+ * 「值班经理说了什么 / 值班长回了什么 / 合计烧了多少 token」，不自己攒一份账。
  * 工头未接线时后端回 503，由 `request` 抛出 `ApiError`。
  */
 export function getForemanSession(signal?: AbortSignal): Promise<ForemanSession> {

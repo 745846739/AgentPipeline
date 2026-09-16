@@ -1,19 +1,20 @@
 <script lang="ts">
   import { onMount } from 'svelte';
   import {
+    ApiError,
     clearServerLan,
     fetchPairingToken,
     getServerInfo,
-    pairedUrl,
     qrSvgUrl,
     resetPairing,
     setServerLan,
   } from '../api/client';
   import type { ServerAddress, ServerInfo } from '../api/types';
   import { changeLanMode } from '../lib/lanToggle';
+  import { sharePanel } from '../lib/sharePairing';
 
   /**
-   * 局域网分享页（决策 167 / 186）：手机扫码接入。
+   * 局域网分享页（决策 167 / 186 / 189）：手机扫码接入。
    *
    * 页面只做一件事——把「手机能连上的地址」变成一个可扫的二维码。地址由后端
    * 枚举网卡得出（crates/app/src/lan.rs），前端不做任何猜测：多网卡 / VPN 环境下
@@ -23,6 +24,9 @@
    * （决策 186）：绑定可以在运行时改，不必再去改环境变量重启。**这一页跑在
    * localhost，所以那颗钮按得动**——后端只允许回环来源改绑（局域网来源 403）。
    * 二维码由**后端渲染** SVG（决策 167），前端不引 QR 库。
+   *
+   * **取不到配对令牌时也不画码**（决策 189）：那张码里没有令牌，扫了配不上，却与正常的
+   * 那张看起来完全一样。这一条把「骗人的码」换成了「说清要去哪台机器上打开」的指引块。
    */
 
   let info = $state<ServerInfo | null>(null);
@@ -32,26 +36,56 @@
   let selected = $state<string | null>(null);
   let copied = $state<string | null>(null);
   /**
-   * 配对令牌（决策 182㉙）。**取不到是常态而不是错误**：`GET /pairing/token` 只在回环可读
-   * ——手机自己打开这一页时必然 403（那正是这条护栏的意义）。取到时二维码带令牌，
-   * 手机扫一次就配对完；取不到时退回裸地址，手机仍能看只读页。
+   * 配对令牌（决策 182㉙ / 189）。**取不到是常态而不是错误**：`GET /pairing/token` 只在回环
+   * 可读——手机自己打开这一页、或在电脑上用局域网地址打开这一页，必然读到 403（那正是这条
+   * 护栏的意义）。故这里把「没取到」的三种来源分开存：还在读 / 不是从本机打开的 / 别的故障
+   * ——它们的下一步动作不同，混成一个 `null` 就只能给一句谁都对不上的话。
    */
-  let token = $state<string | null>(null);
+  let tokenState = $state<
+    | { kind: 'pending' }
+    | { kind: 'ok'; token: string }
+    | { kind: 'refused' }
+    | { kind: 'failed'; message: string }
+  >({ kind: 'pending' });
   let reset = $state(false);
   /** 正在改绑（按钮转圈）；改绑的判定以重读为准（`lib/lanToggle.ts`）。 */
   let switching = $state(false);
   /** 改绑之后要说的话：成功也可能是「但启动参数说了算」，失败要带原因。 */
   let switchNote = $state<string | null>(null);
   let switchError = $state<string | null>(null);
+  /** 这一页是从哪个 origin 打开的（决策 189）：说清「为什么这里读不到令牌」要用它。 */
+  const origin = typeof window !== 'undefined' ? window.location.origin : '';
 
   const addresses = $derived(info?.addresses ?? []);
-  /** 二维码/复制栏里那个地址：有令牌就带上，多一个参数不增加任何操作步骤。 */
-  const target = $derived(
-    (() => {
-      const base = selected ?? addresses[0]?.url ?? '';
-      return base && token ? pairedUrl(base, token) : base;
-    })(),
+  /**
+   * 二维码/复制栏里那个地址。**没有令牌就不画码**（决策 189）——判定住在
+   * `lib/sharePairing.ts`，那里钉着「裸地址的码扫了也配不上，而它看起来与正常的那张一样」。
+   */
+  const panel = $derived(
+    sharePanel({
+      info,
+      addresses,
+      selected,
+      token: tokenState.kind === 'ok' ? tokenState.token : null,
+    }),
   );
+  /** 有了它才画码（决策 189）：`null` = 这一页拿不到令牌，改画「去哪台机器上打开」的指引。 */
+  const qrTarget = $derived(panel.kind === 'paired-qr' ? panel.target : null);
+
+  /**
+   * 取一次配对令牌，并**把失败分档**：403 是「这一页不是从本机打开的」（这条护栏本身，
+   * 不是故障，报文也不必惊动使用者）；其余才是真故障，原样报出来。
+   */
+  async function loadToken() {
+    try {
+      tokenState = { kind: 'ok', token: (await fetchPairingToken()).token };
+    } catch (err) {
+      tokenState =
+        err instanceof ApiError && err.status === 403
+          ? { kind: 'refused' }
+          : { kind: 'failed', message: (err as Error).message };
+    }
+  }
 
   onMount(async () => {
     try {
@@ -62,12 +96,8 @@
     } finally {
       loading = false;
     }
-    // 令牌单取：它失败不影响这一页的主要用途，故不并进上面那个 try。
-    try {
-      token = (await fetchPairingToken()).token;
-    } catch {
-      token = null;
-    }
+    // 令牌单取：它失败不影响这一页对「手机怎么连上」的回答，故不并进上面那个 try。
+    await loadToken();
   });
 
   /**
@@ -92,11 +122,7 @@
         switchNote = result.note;
         // 改绑会切断 SSE 与在飞请求，令牌与地址都重取一次：这一页的其余部分依赖它们
         selected = result.info.addresses[0]?.url ?? null;
-        try {
-          token = (await fetchPairingToken()).token;
-        } catch {
-          token = null;
-        }
+        await loadToken();
       } else {
         switchError = result.message;
         // 失败也要把真实状态摆回来（它可能已经变了，或本来就是别的）
@@ -114,7 +140,7 @@
   async function doReset() {
     reset = true;
     try {
-      token = (await resetPairing()).token;
+      tokenState = { kind: 'ok', token: (await resetPairing()).token };
     } catch (err) {
       error = (err as Error).message;
     } finally {
@@ -215,34 +241,37 @@ host = "0.0.0.0"</code></pre>
         </p>
       </section>
     {:else}
-      <div class="qrbox">
-        <!-- 二维码底盒恒白：扫描器依赖明暗对比，浅色主题也不例外（§3.1） -->
-        <div class="qr-qr">
-          <img
-            src={qrSvgUrl(target)}
-            alt="扫码访问 {target}"
-            width="240"
-            height="240"
-          />
-        </div>
-        <div class="qr-side">
-          <div class="chart-head">
-            <span class="reg-name">扫码在手机上打开</span>
-            <span class="port mono">:{info.port}</span>
+      {#if tokenState.kind === 'pending'}
+        <div class="banner">正在读取配对令牌…</div>
+      {:else if qrTarget}
+        <div class="qrbox">
+          <!-- 二维码底盒恒白：扫描器依赖明暗对比，浅色主题也不例外（§3.1） -->
+          <div class="qr-qr">
+            <img
+              src={qrSvgUrl(qrTarget)}
+              alt="扫码访问 {qrTarget}"
+              width="240"
+              height="240"
+            />
           </div>
-          <div class="picked mono">{target}</div>
-          <button
-            type="button"
-            class="btn"
-            onclick={() => copy(target)}
-          >
-            {copied === target ? '已复制' : '复制地址'}
-          </button>
-          <p class="qr-cap">
-            手机需与电脑在同一局域网（同一 Wi-Fi）。扫码后可直接使用看板与任务详情，
-            实时进度经 SSE 推送。
-          </p>
-          {#if token}
+          <div class="qr-side">
+            <div class="chart-head">
+              <span class="reg-name">扫码在手机上打开</span>
+              <span class="port mono">:{info.port}</span>
+            </div>
+            <div class="picked mono">{qrTarget}</div>
+            <button
+              type="button"
+              class="btn"
+              onclick={() => copy(qrTarget)}
+            >
+              {copied === qrTarget ? '已复制' : '复制地址'}
+            </button>
+            <p class="qr-cap">
+              手机需与电脑在同一局域网（同一 Wi-Fi）。扫码后可直接使用看板与任务详情，
+              实时进度经 SSE 推送。
+            </p>
+            <!-- 走到这里必定带着令牌（决策 189）：没有令牌的码根本不会画出来 -->
             <div class="pair">
               <span class="pair-note">
                 二维码已带上配对令牌：扫这一次，这台手机就能改任务、也能跟值班长说话。
@@ -251,34 +280,54 @@ host = "0.0.0.0"</code></pre>
                 {reset ? '正在重置…' : '重置配对'}
               </button>
             </div>
+          </div>
+        </div>
+
+        {#if addresses.length > 1}
+          <div class="alt">
+            <div class="alt-head">其他网卡地址（首选不通时可换一个试试）</div>
+            <ul class="alt-l">
+              {#each addresses as a (a.url)}
+                <li>
+                  <button
+                    type="button"
+                    class="alt-item {a.url === selected ? 'on' : ''}"
+                    onclick={() => (selected = a.url)}
+                  >
+                    <span class="iface">{a.interface}</span>
+                    <span class="mono u">{a.url}</span>
+                    {#if isPreferred(a)}<span class="tag">推荐</span>{/if}
+                  </button>
+                </li>
+              {/each}
+            </ul>
+          </div>
+        {/if}
+      {:else}
+        <!-- 决策 189：有地址却没有令牌——不画那张扫了配不上的码，换成说清去哪台机器上打开。
+             判定住在 `lib/sharePairing.ts::sharePanel`，它的模块注释写了这条为什么值得单独钉。 -->
+        <section class="gate">
+          {#if tokenState.kind === 'failed'}
+            <div class="gate-head">读不到配对令牌</div>
+            <p>
+              这一页拿令牌时失败了：<span class="mono">{tokenState.message}</span
+              >。没有令牌的二维码扫了也配不上，所以这里给的是原因而不是一张码。
+            </p>
+            <p class="note">先刷新这一页重试一次；还是失败的话，去跑服务的那台电脑上看日志。</p>
           {:else}
-            <p class="pair-note">
-              没有取到配对令牌（它只在电脑本机可读）。手机仍能看看板、任务详情与指标，
-              但改任务与对话要先在这台电脑上重新打开本页扫码配对。
+            <div class="gate-head">二维码要在这台电脑本机上打开本页才拿得到</div>
+            <p>
+              配对令牌只允许本机读取（这是它作为凭据的前提），而这一页现在是从
+              <span class="mono">{origin}</span> 打开的，读不到它。<b>没有令牌的二维码扫了也配不上</b
+              >，所以这里不再画一张扫不出结果的码。
+            </p>
+            <p class="note">
+              在这台跑服务的电脑上打开
+              <span class="mono">http://127.0.0.1:{info.port}/#/share</span>
+              （桌面应用里就是顶栏的「手机访问」），那一页的二维码才带令牌，扫一次就配好。
             </p>
           {/if}
-        </div>
-      </div>
-
-      {#if addresses.length > 1}
-        <div class="alt">
-          <div class="alt-head">其他网卡地址（首选不通时可换一个试试）</div>
-          <ul class="alt-l">
-            {#each addresses as a (a.url)}
-              <li>
-                <button
-                  type="button"
-                  class="alt-item {a.url === selected ? 'on' : ''}"
-                  onclick={() => (selected = a.url)}
-                >
-                  <span class="iface">{a.interface}</span>
-                  <span class="mono u">{a.url}</span>
-                  {#if isPreferred(a)}<span class="tag">推荐</span>{/if}
-                </button>
-              </li>
-            {/each}
-          </ul>
-        </div>
+        </section>
       {/if}
 
       <p class="warn">
@@ -385,16 +434,13 @@ host = "0.0.0.0"</code></pre>
     gap: 12px;
     flex-wrap: wrap;
   }
-  .pair-note {
-    margin-top: 12px;
-    color: var(--text-3);
-    line-height: 1.8;
-    max-width: 62ch;
-  }
   .pair .pair-note {
     margin-top: 0;
     flex: 1;
     min-width: 0;
+    color: var(--text-3);
+    line-height: 1.8;
+    max-width: 62ch;
   }
   .alt {
     margin-top: 18px;

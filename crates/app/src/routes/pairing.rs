@@ -27,8 +27,10 @@ pub async fn token(
     request: Request,
 ) -> ApiResult<impl IntoResponse> {
     if !peer_is_loopback(request.extensions()) {
+        // 与 `stream.rs::pairing_guard` 的报文同一口径（决策 189）：点名「跑服务的电脑本机」，
+        // 不说「已配对的设备」——后者会让手机上的使用者去重复扫一张它永远拿不到的码。
         return Err(ApiError::forbidden(
-            "配对令牌只能在本机读取：请在已配对的设备上打开手机访问页扫码",
+            "配对令牌只能在本机读取：请在跑服务的电脑本机打开手机访问页扫码",
         ));
     }
     let token = state.store.pairing_token().await.map_err(map_core_error)?;

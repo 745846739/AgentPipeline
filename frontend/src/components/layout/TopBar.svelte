@@ -4,6 +4,7 @@
   import NewTaskDialog from '../board/NewTaskDialog.svelte';
   import Sprite from '../render/Sprite.svelte';
   import { BOARD_COLUMNS, columnForTask } from '../../lib/pipeline';
+  import { onHostMachine } from '../../lib/localPage';
   import type { SpriteName } from '../../theme/contract';
 
   const FILTERS: StatusFilter[] = ['all', 'running', 'pending', 'waiting', 'queued', 'done', 'ended'];
@@ -32,8 +33,17 @@
     { path: '/settings/providers', route: 'settings-providers', label: '模型与密钥', sprite: 'key' },
     // 技能市场（决策 187）：与「模型与密钥」并列的设置页；sprite 复用既有的 merge（来源接入）。
     { path: '/settings/market', route: 'settings-market', label: '技能市场', sprite: 'merge' },
+    // 手机访问（决策 167 / 186）：**只在跑服务的这台机器本机上给这个入口**（决策 190）——
+    // 配对令牌只允许回环来源读，故从手机（或用局域网地址打开的电脑）进这一页只能看到一块
+    // 「去电脑上打开」的指引，摆出这个入口就是送人去白跑一趟。
     { path: '/share', route: 'share', label: '手机访问', sprite: 'phone' },
   ];
+
+  /** 本地判据只在装载时取一次：主机名在一次会话里不会变（决策 190）。 */
+  const onHost = onHostMachine();
+
+  /** 实际渲染的导航项：本机之外的来源不给 `/share`。 */
+  const nav = NAV.filter((item) => item.route !== 'share' || onHost);
 
   let newTaskOpen = $state(false);
 
@@ -146,7 +156,7 @@
   </div>
 
   <nav class="navbar" aria-label="页面导航">
-    {#each NAV as item (item.path)}
+    {#each nav as item (item.path)}
       <a
         href="#{item.path}"
         class="chip navchip"

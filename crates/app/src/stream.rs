@@ -102,7 +102,9 @@ pub async fn pairing_guard(
         .and_then(|value| value.to_str().ok());
     match provided {
         Some(token) if fixed_length_eq(token, &expected) => next.run(request).await,
-        _ => ApiError::forbidden("这台设备还没配对：请在已配对的设备上打开手机访问页扫码")
+        // 报文点名「跑服务的电脑本机」而不是「已配对的设备」（决策 189）：配对码只能在
+        // 回环来源的那一页上生成，原措辞让手机上的使用者去重复扫一张它自己永远拿不到的码。
+        _ => ApiError::forbidden("这台设备还没配对：请在跑服务的电脑本机打开手机访问页扫码")
             .into_response(),
     }
 }

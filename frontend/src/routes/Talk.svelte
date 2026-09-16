@@ -1,5 +1,5 @@
 <script lang="ts">
-  import { onMount } from 'svelte';
+  import { onMount, tick } from 'svelte';
   import type {
     AllowedAction,
     BranchCursor,
@@ -45,19 +45,26 @@
   import { router } from '../router.svelte';
 
   /**
-   * 对讲台（theme-6-pixel.md §3.3；决策 174 / 182 / 183）。版面**三分区**（票 04）：
-   * 状态区（当前急停）／对话时间线（值班长的话、值班员的话、工位回执）／输入坞。
+   * 对讲台（theme-6-pixel.md §3.3；决策 174 / 182 / 183 / 192）。版面**三分区**（票 04）：
+   * 状态区（当前急停）／对话时间线（值班长的话、值班经理的话、工位回执）／输入坞。
    * 值班板是**独立的一块**——桌面右栏、窄屏收成时间线之上的横向灯条，不在状态区里。
    *
-   * **整页钉在视口内，时间线是唯一会滚的区域**：一个两小时前挂起的急停被对话顶出视野
+   * **宽屏整页钉在视口内，时间线是唯一会滚的区域**：一个两小时前挂起的急停被对话顶出视野
    * 是本页最不能出的错，故不靠 sticky 逐段救，而是把「会长的部分」与「不能动的部分」
    * 放在两个不同的滚动容器里。
    *
-   * **但状态区自己也有上限**（桌面 46vh / 窄屏 38vh，超高时区内滚），而一张急停轮内联着
+   * **窄屏（≤479px）反过来：整页随手指滚，只有两样东西钉住**——急停摘要条钉在顶栏下沿、
+   * 输入坞钉在底栏上沿（决策 192，§5 转写 4）。同一个不变式（急停不滚出视野）在手机上由
+   * 「钉住」完成：钉住的东西必须便宜，故**窄屏连单张急停也折成一行摘要条**（`forceFold`），
+   * 一张 376px 的展开轮钉在 900px 的屏幕上等于把整块屏幕钉死。对话区因此拿到的是
+   * 「整块屏幕减去两条钉住物」，而不是钉住物之间的残渣——这是本次改版的全部要点。
+   *
+   * **但状态区自己也有上限**（桌面 46vh，超高时区内滚），而一张急停轮内联着
    * 后端下发的动作集，最高的形状（带补充输入的 resume）约 330px——13″ 上可用只有约
    * 344px，**展开一张就已经占满整个区**。故急停轮折叠（决策 183）：**只有一张时不动**
    * （单急停版面与折叠前一致），两张以上**一张都不展开**、全部收成一行约 36px 的摘要条；
    * 人点「展开恢复动作」才展开那一张，且同时只展开一张（判据在 `lib/talkStops.ts`）。
+   * 窄屏这一档不另写判据，只把 `forceFold` 传成真（决策 192）。
    *
    * **对面是真的会说话的值班长**（`/foreman/session` + `/foreman/messages` + `/foreman/stream`）：
    * 对话不依赖任务——空看板（无项目无任务）也照样能问它话。
@@ -88,19 +95,31 @@
   /** 每个 pending 任务的详情（allowed_actions 只在详情里下发，决策 101）。 */
   let details = $state<Record<string, { actions: AllowedAction[]; cursors: BranchCursor[] }>>({});
 
+  /** 窄屏（≤479px，§5 移动款）：整页滚 + 两条钉住物，见文件头。断点与 app.css 同一档。 */
+  let narrow = $state(
+    typeof window !== 'undefined' && window.matchMedia('(max-width: 479px)').matches,
+  );
+  let narrowMq: MediaQueryList | null = null;
+  let onNarrowChange: ((e: MediaQueryListEvent) => void) | null = null;
+
+  /** 滚动容器（`scrollToNewest` 用）：窄屏是整页，故只绑桌面那个时间线。 */
+  let timelineEl = $state<HTMLElement | undefined>();
+  /** 状态区（展开一张时把它拉回视野，见 `toggleStop`）。 */
+  let zoneEl = $state<HTMLElement | undefined>();
+
   const pending = $derived(board.pendingTasks);
   /** 空看板：装载完成之后一个任务都没有（装载中不算——那会把「还没读到」说成「空」）。 */
   const emptyBoard = $derived(!board.loading && board.tasks.length === 0);
 
   /**
-   * 展开的那张急停（决策 183）。`undefined` = 还没选过（跟随默认：**只有一张时展开它，
-   * 两张以上一张都不展开**）、`null` = 人显式收起、否则是那张的 id。三态的判据在
-   * `lib/talkStops.ts`，此处只持状态。
+   * 展开的那张急停（决策 183）。`undefined` = 还没选过（跟随默认：**宽屏只有一张时展开它，
+   * 两张以上一张都不展开；窄屏恒不展开**）、`null` = 人显式收起、否则是那张的 id。
+   * 三态的判据在 `lib/talkStops.ts`，此处只持状态。
    */
   let chosenStop = $state<string | null | undefined>(undefined);
   const stopIds = $derived(pending.map((t) => t.id));
-  const foldable = $derived(isFoldable(stopIds));
-  const openStop = $derived(resolveOpenStop(stopIds, chosenStop));
+  const foldable = $derived(isFoldable(stopIds, narrow));
+  const openStop = $derived(resolveOpenStop(stopIds, chosenStop, narrow));
 
   /** 8 工位的值班灯：按列聚合，与看板列头同一套词表与 sprite（`BOARD_COLUMNS`）。 */
   const crew = $derived(
@@ -234,13 +253,61 @@
       { path: '/foreman/stream' },
     );
     conn.start();
+    // 窄屏断点与 app.css 同一档（479px）：装置顺序与 TaskDetail 的 mobileMq 一致
+    narrowMq = window.matchMedia('(max-width: 479px)');
+    narrow = narrowMq.matches;
+    onNarrowChange = (e: MediaQueryListEvent) => (narrow = e.matches);
+    narrowMq.addEventListener('change', onNarrowChange);
     document.addEventListener('visibilitychange', onVisible);
     return () => {
       document.removeEventListener('visibilitychange', onVisible);
+      if (narrowMq && onNarrowChange) narrowMq.removeEventListener('change', onNarrowChange);
       conn?.stop();
       conn = null;
     };
   });
+
+  /**
+   * 新的一轮落地后把视口带到它那里。
+   *
+   * **为什么必须有**：窄屏的输入坞钉在底栏上沿，回话落在文档末尾（在屏幕之外）——
+   * 不跟过去的话，人发完话只看得到一个空白的对话区，得自己往下拨。宽屏同理，只是滚的是
+   * 时间线自己（它才是那个滚动容器）。滚动一律瞬时（§1 原则 4：无缓动），故直接写 scrollTop
+   * ——`app.css` 没有 `scroll-behavior: smooth`，赋值即到位。
+   */
+  function scrollToNewest() {
+    if (narrow) {
+      const doc = document.scrollingElement;
+      doc?.scrollTo({ top: doc.scrollHeight });
+      return;
+    }
+    if (timelineEl) timelineEl.scrollTop = timelineEl.scrollHeight;
+  }
+
+  /**
+   * 只在**轮数**变化时滚：流式增量改的是某一轮的内容，不是轮数，故流式期间视口不乱动；
+   * 而发送（乐观轮 + 值班长那一轮进来）与回话落地（台账覆盖）都是轮数变化。
+   */
+  $effect(() => {
+    const n = turns.length;
+    if (n === 0) return;
+    void tick().then(scrollToNewest);
+  });
+
+  /**
+   * 展开／收起一张急停（同时只展开一张，机制在 `lib/talkStops.ts` 的 `toggleOpenStop`）。
+   *
+   * 展开之后要**把人拉回那张轮**：窄屏的状态区此刻刚从「钉住」（贴在顶栏下沿）变回普通块，
+   * 它原本在文档里的位置此刻已经在视口之上——不滚过去，人点了「展开恢复动作」却看不到
+   * 任何动作（那正是本页最不能出的错：要拍板的东西不在眼前）。宽屏整页不滚，这句是空操作。
+   */
+  async function toggleStop(id: string) {
+    const next = toggleOpenStop(openStop, id);
+    chosenStop = next;
+    if (next === null) return;
+    await tick();
+    zoneEl?.scrollIntoView({ block: 'start' });
+  }
 
   async function send() {
     const text = input.trim();
@@ -282,6 +349,15 @@
     event.preventDefault();
     void send();
   }
+
+  /**
+   * 输入框占位语。窄屏那一份短一截，理由不只是省地方：**手机上两个键位提示都是空话**
+   * ——没有 Shift 键，也没有「Enter 发送」之外的选项（软键盘的回车键就是发送）。
+   * 那句说明因此在窄屏挪到提示行去说一件真事（见标记处）。
+   */
+  const placeholder = $derived(
+    narrow ? '对值班长说一句话…' : '对值班长说一句话（Enter 发送，Shift+Enter 换行）…',
+  );
 
   /** 值班长的两个只读工具（`FOREMAN_TOOLS`）；未登记的照原样显示。 */
   const TOOL_LABELS: Record<string, string> = {
@@ -384,29 +460,42 @@
     <div class="ts">
       <span>{session?.foreman.wired === false ? '值班长未接线' : '值班中'}</span>
       <span class="sep">▪</span>
-      <span>夜班态势：8 工位</span>
-      <span class="sep">▪</span>
+      <span class="stat-wide">夜班态势：8 工位</span>
+      <span class="sep stat-wide">▪</span>
       <span>本次会话 {session ? formatTokens(session.total_tokens) : '—'} tok</span>
       <span class="sep">▪</span>
       <a class="crumb" href="#/" onclick={() => router.navigate('/')}>看板</a>
     </div>
   </div>
 
-  <!-- ── 状态区：当前急停。钉在第一屏，不随时间线滚动（票 04）。值班板不在本区
-       ——桌面是右栏、窄屏是时间线之上的横向灯条 ── -->
-  <section class="zone-status" aria-label="值班台">
+  <!-- ── 状态区：当前急停。宽屏钉在第一屏，不随时间线滚动；窄屏默认收成摘要条并钉在
+       顶栏下沿（`.stops` / `.stop-open` 两个类只在 §5 的移动块里有规则，决策 192）。
+       值班板不在本区 ——桌面是右栏、窄屏是时间线之上的横向灯条 ── -->
+  <section
+    class="zone-status"
+    class:stops={pending.length > 0}
+    class:stop-open={openStop !== null}
+    bind:this={zoneEl}
+    aria-label="值班台"
+  >
     {#if loadError}
       <div class="blank error">
         <p>{loadError}</p>
         <!-- 配对入口在**两条**失败路径上都要给（票 07）：读会话与发话各自会撞 403，
-             只在其中一处给链接，另一处的使用者就只看到一句「这台设备还没配对」而无处可去。 -->
+             只在其中一处给链接，另一处的使用者就只看到一句「这台设备还没配对」而无处可去。
+             **但这条指引必须点名「哪台机器」（决策 189）**：原先写的是「在已配对的设备上重扫
+             一次」，而座机上的「手机访问」页在手机上打开是拿不到配对码的（配对令牌只允许回环
+             来源读取），照着这句话做的人会一直停在这一页——指引把使用者的力气导向重复扫码，
+             而不是去找那台电脑。 -->
         {#if needsPairing(loadError)}
           <p class="note">
-            去看板顶栏的<a
+            配对码只在那台跑服务的电脑本机生成：在那台电脑上（桌面应用窗口，或浏览器里的
+            127.0.0.1）打开<a
               class="crumb"
               href="#/share"
               onclick={() => router.navigate('/share')}>手机访问</a
-            >页，在已配对的设备上重扫一次二维码即可。
+            >页扫码即可——手机上打开这一页是拿不到配对码的。若已添加到主屏幕，**换过令牌后要
+            重新添加一次**（图标里记的是当时那条带令牌的地址）。
           </p>
         {/if}
       </div>
@@ -474,7 +563,7 @@
               type="button"
               class="expander"
               aria-expanded={open}
-              onclick={() => (chosenStop = toggleOpenStop(openStop, task.id))}
+              onclick={() => void toggleStop(task.id)}
             >
               收起 ▾
             </button>
@@ -486,14 +575,18 @@
                时不报数（不把「还没读到」说成「没有」——决策 182①） -->
           <div class="srow">
             <span class="dtag">⏸ 等你拍板 · {pendingLabel(task.pending_reason)}</span>
-            <span class="st">
+            <!-- 类名刻意不叫 `st`：那是 app.css 里的全局状态标记（`状态文字标记`，
+                 `::before` 自带一枚 8px 方灯 + `white-space: nowrap`）。撞名的代价是
+                 摘要条上凭空多一枚无意义的灯、且标题不换行——长标题会压到展开钮上
+                 （430px 实测：`.st` 宽 122px、文字 160px，两者重叠 28px） -->
+            <span class="stt">
               「{task.title}」{#if count !== null}· {count} 个动作{/if}
             </span>
             <button
               type="button"
               class="expander"
               aria-expanded={open}
-              onclick={() => (chosenStop = toggleOpenStop(openStop, task.id))}
+              onclick={() => void toggleStop(task.id)}
             >
               展开恢复动作 ▸
             </button>
@@ -516,8 +609,9 @@
     {/if}
   </section>
 
-  <!-- ── 对话时间线：值班长的话、值班员的话、工位回执。会滚、会长的那部分 ── -->
-  <section class="timeline" aria-label="对话时间线">
+  <!-- ── 对话时间线：值班长的话、值班经理的话、工位回执。宽屏它是那个会滚、会长的地方；
+       窄屏整页去滚，它就是页面本身（§5 移动款，决策 192） ── -->
+  <section class="timeline" bind:this={timelineEl} aria-label="对话时间线">
     {#if loading && !session}
       <div class="quiet">正在读会话台账…</div>
     {:else if turns.length === 0}
@@ -532,7 +626,7 @@
         class:failed={turn.kind === 'failed'}
       >
         <div class="dname">
-          {turn.kind === 'failed' ? '发送失败' : turn.kind === 'mine' ? '值班员' : '值班长'}
+          {turn.kind === 'failed' ? '发送失败' : turn.kind === 'mine' ? '值班经理' : '值班长'}
         </div>
         <p class:streaming={turn.streaming}>{turn.content}</p>
 
@@ -542,14 +636,17 @@
 
         <!-- 配对入口（决策 182㉙，票 07）：非回环形态下缺令牌时后端回 403，报文里已经说清
              「这台设备还没配对」。这里补的是**动作**——报文让人知道发生了什么，链接让人知道
-             下一步去哪。只在 403 且报文提到配对时出现，普通失败不挂这个出口。 -->
+             下一步去哪。只在 403 且报文提到配对时出现，普通失败不挂这个出口。
+             措辞点名「哪台机器」（决策 189）：见上方读失败路径的同一条注释。 -->
         {#if turn.needsPairing}
           <p class="note">
-            去看板顶栏的<a
+            配对码只在那台跑服务的电脑本机生成：在那台电脑上（桌面应用窗口，或浏览器里的
+            127.0.0.1）打开<a
               class="crumb"
               href="#/share"
               onclick={() => router.navigate('/share')}>手机访问</a
-            >页，在已配对的设备上重扫一次二维码即可。
+            >页扫码即可——手机上打开这一页是拿不到配对码的。若已添加到主屏幕，**换过令牌后要
+            重新添加一次**（图标里记的是当时那条带令牌的地址）。
           </p>
         {/if}
 
@@ -580,11 +677,11 @@
 
   <!-- ── 输入坞：钉底。Enter 发送 / Shift+Enter 换行；发送中禁用 ── -->
   <form class="typer" onsubmit={(e) => { e.preventDefault(); void send(); }}>
-    <div class="dname">值班员</div>
+    <div class="dname">值班经理</div>
     <textarea
       class="input"
       rows="2"
-      placeholder="对值班长说一句话（Enter 发送，Shift+Enter 换行）…"
+      {placeholder}
       bind:value={input}
       disabled={sending}
       onkeydown={onKeydown}
@@ -597,6 +694,11 @@
           值班长正在回话…
         {:else if streamStatus === 'error'}
           流断了：回话仍会以台账为准补上。
+        {:else if narrow}
+          <!-- 窄屏这一行是**常驻**的（留了高度，见 CSS）：空着就是一条 19px 的死白，
+               拿它说 §3.3 纪律 4 的那件事（说的每句话都进审计）比留白有用。
+               宽屏不写：那里这一行本来就与发送钮同行，不占地方也不缺话说。 -->
+          说的每句话都会记进审计
         {/if}
       </span>
       <button type="submit" class="btn solid" disabled={sending || !input.trim()}>发送</button>
@@ -607,7 +709,7 @@
   <aside class="talk-side crew">
     <div class="reg">
       <div class="reg-head"><span>值班板</span><span class="n">8 工位</span></div>
-      <ul class="brows">
+      <ul class="brows no-scrollbar">
         {#each crew as c (c.key)}
           <li class="brow {c.state === 'warn' ? 'pen' : c.state === 'run' ? 'hot' : ''}">
             <span class="blamp {c.state === 'warn' ? 'w' : c.state === 'run' ? 'c' : c.state === 'done' ? 'd' : ''}"></span>
@@ -745,7 +847,7 @@
     line-height: 1.5;
     white-space: nowrap;
   }
-  /* 值班员的话与值班长的话只差名牌停靠与明暗档：不换底色、不换圆角、不加箭头（§3.3 纪律 1） */
+  /* 值班经理的话与值班长的话只差名牌停靠与明暗档：不换底色、不换圆角、不加箭头（§3.3 纪律 1） */
   .turn.mine .dname {
     left: auto;
     right: 6px;
@@ -802,7 +904,9 @@
     gap: 10px;
     flex-wrap: wrap;
   }
-  .st {
+  /* 摘要条中间那块「「标题」· N 个动作」。**不叫 `st`**——app.css 的同名全局类会同时
+     套上来（`::before` 塞一枚方灯 + `nowrap` 不换行），见标记处的注释。 */
+  .stt {
     flex: 1;
     min-width: 0;
     color: var(--text-2);
@@ -1007,22 +1111,45 @@
   }
 
   /* 移动款（§5 转写 4）：页头 → 值班灯条 → 状态区 → 竖排对话 → 钉底输入坞 */
+  /* ── 窄屏（§5 移动款，决策 192）：**对话是页面本身** ──
+     桌面款把整页钉在视口里、让时间线做唯一的滚动容器；窄屏反过来——整页随手指滚，
+     只有两样东西钉住：急停摘要条（钉在顶栏下沿）与输入坞（钉在底栏上沿）。
+     两个滚动容器在 430px 宽、740–930px 高的屏上是零和的：钉住的部分每多 100px，
+     对话区就少 100px，而对话区正是这一页在手机上唯一的用处。
+     钉住的两样各有代价：急停摘要条实测约 66px/张（宽屏是 376px 的展开轮，见 `forceFold`），
+     输入坞约 113px（宽屏那种「正文一行、提示与按钮又一行」在这里要吃掉 145px）。 */
   @media (max-width: 479px) {
     .talk {
       display: flex;
       flex-direction: column;
       gap: 14px;
-      padding: 10px 12px 12px;
-      /* 移动款顶栏 140px（138 + 2px 下框，e2e ⑩ 钉住这个定值）；底栏区同上。
-         同样多留 4px 余量（理由见桌面款） */
-      height: calc(100vh - 144px - 46px);
+      padding: 10px 12px 0;
+      /* 桌面那条 `height` 必须撤掉：两处一起定高，窄屏就没有「长出去」的余地 */
+      height: auto;
+      /* 视口 = 顶栏 138 + 整页 + 底盘底边距（`app.css` 窄屏把底盘 padding-bottom
+         定成了底栏高度 `--sbar-h`，故这里减的是同一个值）。`min-height` 而非 `height`：
+         内容长了就长出去（整页滚），短了就撑满余下的屏幕——输入坞于是总在底边。
+         底内边距为 0 是**算过**的：让输入坞的底边正好落在底栏顶边（钉住时同一个位置，
+         于是「对话短时悬空 16px、长了又贴上去」那种一跳没有了）。
+         用 `dvh` 而不是 `vh`：手机上 `vh` 取的是地址栏收起时的高度，地址栏在场时
+         整块版面会高出一截，把钉底的输入坞推到屏幕外（`vh` 那行是给不认 `dvh` 的旧内核的）。 */
+      min-height: calc(100vh - 138px - var(--sbar-h));
+      min-height: calc(100dvh - 138px - var(--sbar-h));
     }
     .talk-head {
       order: 1;
+      flex: none;
     }
-    /* 值班板收成对话之上的横向灯条：横向滚动、不缩不折 */
+    /* 标题与元信息同一行：手机上「对讲台」顶栏的页签已经在说，页内不必再铺两行。
+       「夜班态势：8 工位」收进宽屏——它说的就是正下方那条 8 工位的灯条。 */
+    .stat-wide {
+      display: none;
+    }
+    /* 值班板收成对话之上的横向灯条：横向滚动、不缩不折。
+       台账盒的框与头行在窄屏没有意义（它会随手指滚走），只留「值班板」当行首标签。 */
     .talk-side {
       order: 2;
+      flex: none;
       position: static;
       /* 桌面那条 `align-self: start` 必须撤掉：灯条要靠父宽约束才会横向滚，
          否则 aside 取 max-content 宽度、把整页撑出横向滚动条 */
@@ -1030,7 +1157,26 @@
       max-height: none;
       overflow: visible;
     }
+    .talk-side .reg {
+      display: flex;
+      align-items: center;
+      gap: 10px;
+      border: 0;
+      background: none;
+    }
+    .talk-side .reg-head {
+      flex: none;
+      padding: 0;
+      border-bottom: 0;
+      background: none;
+    }
+    /* 「8 工位」不写：下面 8 枚灯自己说得更清楚（与页头收掉的那句是同一件事） */
+    .talk-side .reg-head .n {
+      display: none;
+    }
     .brows {
+      flex: 1;
+      min-width: 0;
       display: flex;
       overflow-x: auto;
     }
@@ -1045,21 +1191,101 @@
     .boks {
       display: none;
     }
+    /* ── 状态区：钉在顶栏下沿的一条（`.stops`） ──
+       桌面那条 38vh 上限（区内滚动）在窄屏撤掉：整页去滚，状态区不再有自己的滚动条。
+       钉住只在**收起时**成立——展开的那一张回到普通文档流（`.stop-open`），否则一张
+       376px 的轮钉在 900px 的屏上就钉死了整块屏幕；展开那一张要看得见由 `toggleStop`
+       滚回它负责。不钉住的是「没急停」的形态：一句「当前没有急停」不值得占一行屏幕。 */
     .zone-status {
       order: 3;
-      max-height: 38vh;
+      flex: none;
+      padding: 20px 6px 6px 2px;
+      max-height: none;
+      overflow: visible;
     }
+    .zone-status:not(.stops) {
+      padding-top: 0;
+    }
+    .zone-status.stops:not(.stop-open) {
+      position: sticky;
+      top: 138px; /* = 窄屏顶栏高度（e2e ⑩ 钉住 138）；下边框把灯条与对话分开 */
+      z-index: 15;
+      background: var(--bg);
+      border-bottom: 2px solid var(--hairline);
+      /* `scrollIntoView` 停的位置（§5 定值：顶栏 138 + 10） */
+      scroll-margin-top: 148px;
+      /* 兜底上限：一张摘要条实测约 **66px**（窄屏两行）+ 26px 间距，五张在 900px 屏上
+         就是 460px——钉住的东西不能没有上界，否则「对话区太小」会以另一种形状回来。
+         到顶之后这条带子自己滚（与桌面那一档同一手法），代价如实写在 §3.3 的残留里：
+         被滚出去的那张不再「一直看得见」。2px 右内边距已在基线上留过（见 `.zone-status`），
+         故纵向一滚不会连带长出横向滚动条。 */
+      max-height: 45vh;
+      overflow-y: auto;
+    }
+    /* 摘要条在窄屏**显式两行**：标签一行，标题与展开钮一行。
+       不显式分行、让 flex 自己折的话，430px 上量到的是「标题被压到 122px 宽、
+       `· 2 个动作` 断在词中间」（标签 138 + 标题 160 + 钮 90 + 两道间距 = 408px > 370px），
+       而标题恰好是这一行唯一要看的东西。 */
+    .srow .dtag {
+      flex: 0 0 100%;
+    }
+    .srow .stt {
+      flex: 1 1 auto;
+    }
+    /* 折下来的那颗钮靠右站 */
+    .srow .expander {
+      margin-left: auto;
+    }
+    /* ── 对话时间线：窄屏它就是页面（没有自己的滚动条，只剩名牌 tab 的上留白） ── */
     .timeline {
       order: 4;
-      flex: 1;
-      min-height: 0;
-    }
-    .typer {
-      order: 5;
-      flex: none;
+      /* 不缩：内容多高就多高——去滚的是整页，不是它；余量归它，输入坞于是贴底 */
+      flex: 1 0 auto;
+      /* 桌面那条 `overflow-y: auto` 也要撤掉：窄屏它一旦成了滚动容器，会长出来的
+         是它自己而不是整页（滚轮到底也翻不过去），与这一档的版面整个相反 */
+      overflow-y: visible;
+      padding: 20px 2px 6px;
     }
     .turn p {
       max-width: none;
+    }
+    /* 手机上每行字数少（约 31 个汉字），行距跟上走：1.6 是按桌面约 76 字符一行配的 */
+    .timeline .turn p {
+      line-height: 1.8;
+    }
+    /* ── 输入坞：钉在底栏上沿 ──
+       一行制：[空心底的输入框][实心发送] 同一行，提示语挪到下一行并**常驻**（出现时才占位
+       会把这颗钉底的框顶得上下跳）。`display: contents` 把桌面的 `.typer-foot` 拆开，
+       两个子元素各归各格——桌面款那一套排版因此逐像素不变，不必改标记。 */
+    .typer {
+      order: 5;
+      flex: none;
+      position: sticky;
+      bottom: var(--sbar-h);
+      z-index: 25;
+      /* 名牌 tab 悬出框沿 16px，给它留出上沿（也给对话留出与输入坞的分界） */
+      margin-top: 26px;
+      display: grid;
+      grid-template-columns: minmax(0, 1fr) auto;
+      grid-template-areas:
+        'field send'
+        'hint hint';
+      gap: 6px 10px;
+    }
+    .typer textarea {
+      grid-area: field;
+    }
+    .typer-foot {
+      display: contents;
+    }
+    .typer-foot .hint {
+      grid-area: hint;
+      min-height: 1.6em;
+    }
+    .typer-foot .btn {
+      grid-area: send;
+      /* 与输入框齐高（44px 是触控底线，2 行输入框在 16px 字号下约 63px） */
+      align-self: stretch;
     }
   }
 </style>

@@ -626,7 +626,7 @@ impl ToolExecutor {
             Err(e) => return Err(e),
         };
         // allowed_actions 由后端权威下发（决策 101）——这里把它**原样**交出去，
-        // 不做筛选也不做解释。值班长能替值班员描述「可按下哪些键」，
+        // 不做筛选也不做解释。值班长能替值班经理描述「可按下哪些键」，
         // 但它自己按不动（写动作仍需人来发）。
         let cursors = store.load_live_cursors(&task_id).await?;
         let actions = task

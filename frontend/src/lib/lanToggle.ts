@@ -1,4 +1,5 @@
 import type { ServerInfo } from '../api/types';
+import { isLoopbackHostname } from './localPage';
 
 /**
  * 「绑定全网卡 / 只绑本机」两颗钮的判据（决策 186）。
@@ -33,10 +34,9 @@ export type LanToggleResult =
 export const LAN_VERIFY_ATTEMPTS = 8;
 export const LAN_VERIFY_INTERVAL_MS = 250;
 
-/** 目标「要绑成回环吗」——与 `ServerInfo.loopback_only` 同一口径。 */
-function isLoopbackHost(host: string): boolean {
-  return host === '127.0.0.1' || host === 'localhost' || host === '::1' || host.startsWith('127.');
-}
+/** 目标「要绑成回环吗」——与 `ServerInfo.loopback_only` 同一口径，判据与顶栏共用一份
+ * （`lib/localPage.ts::isLoopbackHostname`，决策 190）：绑什么算回环只能有一个答案。 */
+const isLoopbackHost = isLoopbackHostname;
 
 /** 传输层失败（连接被切断）而不是服务端的拒绝：只有后者带着一句可读的报文。 */
 function isTransportFailure(err: unknown): boolean {

@@ -93,10 +93,22 @@ async fn asset(Path(path): Path<String>) -> Response {
 const CACHE_NO_CACHE: &str = "no-cache";
 const CACHE_IMMUTABLE: &str = "public, max-age=31536000, immutable";
 
+/// 页面一律声明**不发送 `Referer`**（决策 191）。
+///
+/// 配对令牌现在留在地址栏里（主屏图标与书签要靠它每次启动重新递进来，决策 191 修订了
+/// 182㉙ 的「从地址栏抹掉」），而 `Referer` 会把**含令牌的完整地址**带给任何第三方资源。
+/// 本应用目前不引任何外部资源（字体都自托管），这条是给「以后顺手加了个外链 / 外图」留的
+/// 保险——一个响应头换掉当初抹地址栏的三条理由之一，划算。
+const REFERRER_POLICY: &str = "no-referrer";
+
 fn serve(bytes: &'static [u8], mime: &'static str, cache: &'static str) -> Response {
     (
         StatusCode::OK,
-        [(header::CONTENT_TYPE, mime), (header::CACHE_CONTROL, cache)],
+        [
+            (header::CONTENT_TYPE, mime),
+            (header::CACHE_CONTROL, cache),
+            (header::REFERRER_POLICY, REFERRER_POLICY),
+        ],
         bytes,
     )
         .into_response()
@@ -179,6 +191,21 @@ mod tests {
             }
             None => assert!(EMBEDDED_ASSETS.is_empty(), "index 查不到时表应为空"),
         }
+    }
+
+    /// 配对令牌现在留在地址栏里（决策 191 修订了 182㉙ 的「从地址栏抹掉」），
+    /// 故页面必须声明**不发 `Referer`**——少了这个头，任何第三方资源都会从 `Referer`
+    /// 里拿到含令牌的完整地址。三个静态出口（`index` / `serve_named` / `asset`）都走 `serve`。
+    #[test]
+    fn static_responses_forbid_referer() {
+        let response = serve(b"<html></html>", "text/html; charset=utf-8", CACHE_NO_CACHE);
+        assert_eq!(
+            response
+                .headers()
+                .get(header::REFERRER_POLICY)
+                .and_then(|value| value.to_str().ok()),
+            Some("no-referrer"),
+        );
     }
 
     #[test]

@@ -67,7 +67,7 @@ pub struct SendBody {
 
 /// `POST /foreman/messages`。
 ///
-/// **LLM 失败时值班员说的那句话已经落库**（`ForemanRunner::say` 的第一步）。
+/// **LLM 失败时值班经理说的那句话已经落库**（`ForemanRunner::say` 的第一步）。
 /// 失败返回错误状态，前端据此渲染一条错误轮并**保留输入框内容**，让人改几个字重发
 /// 而不是重打一遍（决策 182㉓）。
 pub async fn send(

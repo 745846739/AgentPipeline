@@ -74,3 +74,34 @@ describe('状态区急停折叠（决策 183）', () => {
     expect(stopActionCount({ actions })).toBe(2);
   });
 });
+
+describe('窄屏：一张也折（决策 192，规格 §5）', () => {
+  it('单张在窄屏折叠', () => {
+    expect(isFoldable(['only'], true)).toBe(true);
+    expect(isFoldable([], true)).toBe(false); // 没有急停就无所谓折叠
+    expect(isFoldable(['a', 'b'], true)).toBe(true);
+  });
+
+  it('窄屏默认一张都不展开——包括只有一张时', () => {
+    expect(defaultOpenStop(['only'], true)).toBe(null);
+    expect(resolveOpenStop(['only'], undefined, true)).toBe(null);
+    expect(resolveOpenStop(['a', 'b'], undefined, true)).toBe(null);
+  });
+
+  it('窄屏下摊开判据只认「人点了展开」那一个 id', () => {
+    expect(isStopOpen(isFoldable(['only'], true), null, 'only')).toBe(false);
+    expect(isStopOpen(isFoldable(['only'], true), 'only', 'only')).toBe(true);
+  });
+
+  it('窄屏下显式收起仍不弹回，选中的那张仍在集合里仍保持', () => {
+    expect(resolveOpenStop(['only'], null, true)).toBe(null);
+    expect(resolveOpenStop(['a', 'b'], 'b', true)).toBe('b');
+    // 被处理掉后回落：窄屏回落到「都不展开」，不是补一个展开项上来
+    expect(resolveOpenStop(['b'], 'a', true)).toBe(null);
+  });
+
+  it('同一份集合：宽屏展开它自己，窄屏收起——差别只来自 forceFold', () => {
+    expect(resolveOpenStop(['only'], undefined, false)).toBe('only');
+    expect(resolveOpenStop(['only'], undefined, true)).toBe(null);
+  });
+});

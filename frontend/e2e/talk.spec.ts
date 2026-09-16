@@ -389,10 +389,13 @@ test.describe('对讲台 · 对话（票 03）', () => {
     const reply = page.locator('.timeline .turn.fm', { hasText: REPLY_MARK }).first();
     await expect(reply).toBeVisible({ timeout: 30_000 });
     await expect(reply.locator('.dname')).toHaveText('值班长');
-    // 值班员说的那句也在时间线里（台账那一行，不是只在输入框里）
-    await expect(
-      page.locator('.timeline .turn.mine', { hasText: '班次问句 · 标记 talk03' }),
-    ).toHaveCount(1);
+    // 值班经理说的那句也在时间线里（台账那一行，不是只在输入框里）
+    const mine = page.locator('.timeline .turn.mine', { hasText: '班次问句 · 标记 talk03' });
+    await expect(mine).toHaveCount(1);
+    // 名分两个词各有各的落点（决策 193）：对面是值班长，人这一侧是值班经理；
+    // 输入坞那块名牌与时间线这块必须同一个词——两处各写各的就会同屏两个称呼
+    await expect(mine.locator('.dname')).toHaveText('值班经理');
+    await expect(page.locator('.typer .dname')).toHaveText('值班经理');
 
     // **值班长的回复里永远没有按钮**（票 04 的硬要求）：写动作只在状态区的急停轮里
     await expect(reply.locator('button')).toHaveCount(0);
@@ -458,6 +461,154 @@ test.describe('对讲台 · 对话（票 03）', () => {
     // 硬要求：一个两小时前挂起的急停滚出视野是本页最不能出的错
     await expect(stopTurn).toBeInViewport();
     await expect(stopTurn).toContainText(title);
+
+    expectBundleHealthy(bundle);
+  });
+});
+
+/**
+ * 对讲台 · 窄屏（决策 192）：版面口径是**整页随手指滚，只有两条钉住物**。
+ *
+ * 宽屏靠「整页钉住 + 时间线是唯一滚动容器」；窄屏反过来——急停摘要条钉在顶栏下沿
+ * （`.zone-status.stops`，`top: 138px`），输入坞钉在底栏上沿（`.typer`，`bottom: var(--sbar-h)`），
+ * 对话从两者之间滚过去。
+ *
+ * **这一组自带装置**（不复用上面那组的）：那组最后一条用例会把唯一的急停按掉（点合入），
+ * 之后再进来就没有 pending 了——几何断言会退化成「空状态区当然不挤」，绿灯但无意义。
+ */
+test.describe('对讲台 · 窄屏（决策 192）', () => {
+  let app: App;
+  const title = 'E2E 窄屏长对话';
+
+  test.beforeAll(async () => {
+    app = await startApp({
+      script: {
+        ...archBlockerRounds(),
+        // 每轮 10 行（同 `FOREMAN_REPLY` 的量级）：三轮就足以让整页在 900px 上滚起来
+        ...foremanScript(
+          Array.from({ length: 6 }, () => [
+            text(
+              [
+                '窄屏标记',
+                '本轮态势：没有需要你处理的事。',
+                ...Array.from({ length: 8 }, (_, i) => `- 工位读数 ${i + 1}：安静。`),
+              ].join('\n'),
+            ),
+          ]),
+        ),
+      },
+      title,
+    });
+    await waitForTask(app, (t) => t.status === 'pending', 'pending', 60_000);
+  });
+
+  test.afterAll(async () => {
+    await app?.stop();
+  });
+
+  /**
+   * 这条钉的是那次改版的**结果**，不是机制：改版前同一装置（430×900、单张急停挂着）
+   * 实测对话区只有 **26px**——钉死的状态区拿走 342px，页头 72px、值班板 67px、输入坞 145px
+   * 再把剩下的分完。所以断言写成**几何**（对话区的高度、两条钉住物的贴合），而不是
+   * 「CSS 里有没有 sticky」——后者在版面塌掉时照样为真。
+   *
+   * 必须排在本组第一条：后面的用例会把对话铺长（那时「不空滚」不再成立，是应该的）。
+   */
+  test('静置版面：对话区拿到整块屏幕、两条钉住物各就各位', async ({ page }) => {
+    const bundle = watchBundle(page);
+    await page.setViewportSize({ width: 430, height: 900 });
+    await page.goto(`${app.webBase}/#/talk`);
+    await settleBundle(page, bundle);
+    await expect(page.locator('.zone-status .turn.warn')).toHaveCount(1, { timeout: 60_000 });
+
+    // ① 单张急停也折成摘要条（宽屏那一档它应当是展开的——同一装置两种版面）
+    await expect(page.locator('.zone-status .turn.warn.folded')).toHaveCount(1);
+    // ② 状态区退出区内滚动：窄屏没有「状态区自己滚」这回事，去滚的是整页
+    const zoneOverflow = await page
+      .locator('.zone-status')
+      .evaluate((el) => el.scrollHeight - el.clientHeight);
+    expect(zoneOverflow, '状态区在窄屏仍然区内滚').toBeLessThanOrEqual(4);
+
+    // ③ **对话区是「整块屏幕减去两条钉住物」**，不是它们之间的残渣
+    const timelineBox = await page.locator('.timeline').boundingBox();
+    expect(timelineBox?.height ?? 0).toBeGreaterThanOrEqual(320);
+
+    // ④ 输入坞钉在底栏（`.statusline`）上沿：底边与底栏顶边不许有缝
+    const typerBox = await page.locator('.typer').boundingBox();
+    const sbarBox = await page.locator('.statusline').boundingBox();
+    expect(typerBox).not.toBeNull();
+    expect(sbarBox).not.toBeNull();
+    expect(
+      Math.abs((typerBox?.y ?? 0) + (typerBox?.height ?? 0) - (sbarBox?.y ?? 0)),
+      '输入坞没有贴在底栏上沿',
+    ).toBeLessThanOrEqual(1);
+
+    // ⑤ 整页不空滚：没有对话时文档高度就是视口高度（多出来的每一像素都是从对话区借的）
+    const stray = await page.evaluate(
+      () =>
+        Math.max(document.documentElement.scrollHeight, document.body.scrollHeight) -
+        window.innerHeight,
+    );
+    expect(stray, '窄屏整页在没有对话时也能滚，说明版面高出了视口').toBeLessThanOrEqual(1);
+
+    expectBundleHealthy(bundle);
+  });
+
+  test('整页滚到底之后，急停摘要条仍钉在顶栏下沿、输入坞仍贴在底栏上沿', async ({ page }) => {
+    const bundle = watchBundle(page);
+    await page.setViewportSize({ width: 430, height: 900 });
+
+    // 铺长（直连；界面发送路径由「空看板也能对话」那条覆盖）
+    for (let i = 1; i <= 3; i += 1) {
+      await sayDirect(app, `窄屏问句-${i}`);
+    }
+    await page.goto(`${app.webBase}/#/talk`);
+    await settleBundle(page, bundle);
+    await expect
+      .poll(() => page.locator('.timeline .turn.fm').count(), { timeout: 30_000 })
+      .toBeGreaterThanOrEqual(3);
+
+    // 窄屏滚的是**整页**（时间线不再是滚动容器）
+    const timelineOverflow = await page
+      .locator('.timeline')
+      .evaluate((el) => el.scrollHeight - el.clientHeight);
+    expect(timelineOverflow, '窄屏的时间线仍是滚动容器').toBeLessThanOrEqual(1);
+    const pageOverflow = await page.evaluate(
+      () => document.documentElement.scrollHeight - window.innerHeight,
+    );
+    expect(pageOverflow, '窄屏的长对话没有把整页撑出滚动').toBeGreaterThan(0);
+
+    // 滚到底
+    const scrolled = await page.evaluate(() => {
+      const d = document.scrollingElement as HTMLElement;
+      d.scrollTop = d.scrollHeight;
+      return d.scrollTop;
+    });
+    expect(scrolled).toBeGreaterThan(0);
+
+    // **硬要求**：滚到底时急停摘要条仍钉在顶栏下沿（顶栏 138px 是 §5 定值）
+    const headerBox = await page.locator('header.top').boundingBox();
+    const zoneBox = await page.locator('.zone-status').boundingBox();
+    expect(zoneBox).not.toBeNull();
+    expect(
+      Math.abs((zoneBox?.y ?? 0) - ((headerBox?.y ?? 0) + (headerBox?.height ?? 0))),
+      '滚到底后急停摘要条没钉在顶栏下沿',
+    ).toBeLessThanOrEqual(2);
+    await expect(page.locator('.zone-status .turn.warn').first()).toBeInViewport();
+    await expect(page.locator('.zone-status .turn.warn').first()).toContainText(title);
+
+    // 输入坞也还在（同一时刻两样都在 = 这一档版面的全部合同）
+    const typerBox = await page.locator('.typer').boundingBox();
+    const sbarBox = await page.locator('.statusline').boundingBox();
+    expect(
+      Math.abs((typerBox?.y ?? 0) + (typerBox?.height ?? 0) - (sbarBox?.y ?? 0)),
+      '滚到底后输入坞没贴在底栏上沿',
+    ).toBeLessThanOrEqual(1);
+    await expect(page.locator('.typer textarea')).toBeInViewport();
+
+    // 滚回顶部：页头回来了（那些是随手指滚的部分）
+    await page.evaluate(() => (document.scrollingElement as HTMLElement).scrollTo({ top: 0 }));
+    await expect(page.locator('.talk-head .tt')).toBeInViewport();
 
     expectBundleHealthy(bundle);
   });

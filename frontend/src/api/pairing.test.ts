@@ -10,11 +10,14 @@ import {
 import { pairedUrl } from './client';
 
 /**
- * 配对令牌的取用与消费（决策 182㉙，票 07）。
+ * 配对令牌的取用与消费（决策 182㉙，**由决策 191 修订**）。
  *
- * 这三件事各自对应一条用户故事，取舍都不是显然的：
+ * 两条各自对应一条用户故事：
  * ① 二维码递过来的 `?pair=` 必须**存下来**（用户故事 14：每次重扫会让人干脆把令牌关掉）；
- * ② 必须**从地址栏抹掉**（否则凭据留在截图、历史与 `Referer` 里）；
+ * ② **参数不从地址栏抹掉**（191）——手机「添加到主屏幕」保存的就是当时那条 URL，而 iOS 的
+ *    主屏 web app 与 Safari 存储隔离，「抹掉」等于让主屏图标每次从零开始配对（实测反馈：
+ *    添加主屏后无法二次访问）。182㉙ 原先要抹掉的三条理由里，`Referer` 那条改由响应头
+ *    `Referrer-Policy: no-referrer` 关掉（`assets.rs`），截图与历史那两条如实留下。
  * ③ 未配对时**不带这个头**（回环形态零摩擦是本设计的前提）。
  */
 
@@ -45,40 +48,35 @@ afterEach(() => {
   clearPairingToken();
 });
 
-describe('配对令牌（决策 182㉙，票 07）', () => {
-  it('从地址栏收下令牌、存本地、并把它抹出地址栏', () => {
+describe('配对令牌（决策 182㉙ / 191）', () => {
+  it('从地址栏收下令牌并存本地（地址栏那份不再被抹掉）', () => {
     stubStorage();
-    const replaced: string[] = [];
-    const token = capturePairingFromLocation(
-      { search: `?${PAIRING_QUERY}=abc123&tab=board`, pathname: '/', hash: '#/talk' },
-      (url) => replaced.push(url),
-    );
+    const token = capturePairingFromLocation({ search: `?${PAIRING_QUERY}=abc123` });
 
     expect(token).toBe('abc123');
     expect(getPairingToken()).toBe('abc123');
-    // 抹掉的是**令牌那一个参数**，其余查询参数与 hash 原样留着
-    expect(replaced).toEqual(['/?tab=board#/talk']);
   });
 
-  it('令牌是唯一参数时地址栏回到干净的 path', () => {
+  it('地址栏里还有别的参数也不影响读取（令牌与它们并存）', () => {
     stubStorage();
-    const replaced: string[] = [];
-    capturePairingFromLocation(
-      { search: `?${PAIRING_QUERY}=abc123`, pathname: '/', hash: '' },
-      (url) => replaced.push(url),
-    );
-    expect(replaced).toEqual(['/']);
+    expect(
+      capturePairingFromLocation({ search: `?${PAIRING_QUERY}=abc123&tab=board` }),
+    ).toBe('abc123');
+    expect(getPairingToken()).toBe('abc123');
   });
 
-  it('地址栏里没有配对参数时不动地址栏，只回已存的那份', () => {
+  it('每一次装载都从 URL 重新存一次——主屏图标与书签靠的就是这一条', () => {
+    // 「以 URL 为准」是 191 的取舍：地址栏里那条是使用者的显式动作（点图标 / 点书签 /
+    // 扫新码），而本地那份可能属于别人或已经陈旧。
+    stubStorage({ 'agentpipeline.pairing': 'old' });
+    expect(capturePairingFromLocation({ search: `?${PAIRING_QUERY}=fresh` })).toBe('fresh');
+    expect(getPairingToken()).toBe('fresh');
+  });
+
+  it('地址栏里没有配对参数时不动已存的那份', () => {
     stubStorage({ 'agentpipeline.pairing': 'kept' });
-    const replaced: string[] = [];
-    const token = capturePairingFromLocation(
-      { search: '?tab=board', pathname: '/', hash: '' },
-      (url) => replaced.push(url),
-    );
-    expect(token).toBe('kept');
-    expect(replaced).toEqual([]);
+    expect(capturePairingFromLocation({ search: '?tab=board' })).toBe('kept');
+    expect(getPairingToken()).toBe('kept');
   });
 
   it('未配对时拿到的就是 null——这是回环形态的常态，不是错误', () => {

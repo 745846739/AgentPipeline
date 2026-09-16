@@ -46,7 +46,7 @@ pub struct NewForemanMessage {
 }
 
 impl NewForemanMessage {
-    /// 值班员说的话：无读数、无快照（它还没被处理）。
+    /// 值班经理说的话：无读数、无快照（它还没被处理）。
     pub fn user(content: impl Into<String>) -> Self {
         NewForemanMessage {
             role: FOREMAN_ROLE_USER.to_string(),
