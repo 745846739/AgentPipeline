@@ -7,7 +7,7 @@
   let { hours }: Props = $props();
 </script>
 
-<span class="stalltag" title="pending 超过 pending_timeout_hours（决策 34）">
+<span class="stalltag" title="等你拍板已经超过超时上限">
   {formatStalled(hours)}
 </span>
 

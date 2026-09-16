@@ -72,8 +72,12 @@ describe('主题契约 · 几何常量（theme-6-pixel.md §2.3）', () => {
     expect(GEOMETRY.crateLid).toBe(6);
   });
 
-  it('唯一媒体断点是 480px（不新增中间断点）', () => {
+  // 决策 196 起断点有两条：480px 是移动款那一条，1400px 是**桌面款内部**的看板钉右档。
+  // 旧口径「唯一媒体断点」由决策 196 显式开例外（`.scratch/agentpipeline-pixel-theme/spec.md`
+  // 的 Out of Scope 那条已就地标注），故这里不再写「唯一」。
+  it('媒体断点两条：移动款 480px + 看板钉右档 1400px', () => {
     expect(GEOMETRY.mobileBreakpoint).toBe(480);
+    expect(GEOMETRY.boardPinBreakpoint).toBe(1400);
   });
 
   it('dither 周期 4px 与量表满格 ≈64k tok', () => {
@@ -186,6 +190,18 @@ describe('主题契约 · 色彩 token（深浅两套覆盖同一组名）', () 
   it('浅色两处偏差已登记', () => {
     expect(LIGHT_DEVIATIONS.wordmarkShadow).toBe('none');
     expect(LIGHT_DEVIATIONS.foremanFace).toBe('#E3C7A6');
+  });
+
+  // 决策 195 ⑤ / §2.6 裁决四：--text-3 提到次级必读档（对比度门在 theme/contrast.test.ts），
+  // --done **原地不动**——它是信号色「归档灰，刻意退后」，提亮会抹掉归档语义并连带改灯 / 量表 /
+  // 条形图。两者曾共用同一字面值，从 195 起不再相同是**预期的**（parity 逐 token 比对不会红）。
+  it('--text-3 提档、--done 不动，且不与 --text-2 合并（决策 195 / §2.6）', () => {
+    expect(DARK_COLORS['--done']).toBe('#6E6C82');
+    expect(LIGHT_COLORS['--done']).toBe('#7A7B8E');
+    expect(DARK_COLORS['--text-3']).not.toBe(DARK_COLORS['--done']);
+    expect(LIGHT_COLORS['--text-3']).not.toBe(LIGHT_COLORS['--done']);
+    expect(DARK_COLORS['--text-3']).not.toBe(DARK_COLORS['--text-2']);
+    expect(LIGHT_COLORS['--text-3']).not.toBe(LIGHT_COLORS['--text-2']);
   });
 });
 

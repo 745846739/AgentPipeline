@@ -40,7 +40,8 @@ export async function submitAllowedAction(
 
   const endpoint = endpointFor(options.pendingType, action.action);
   if (endpoint === null) {
-    throw new Error(`动作 ${action.action} 无配对端点（决策 101）`);
+    // 决策 101：未知 side_effect 在 UI 侧已渲染为禁用，这里只是兜底抛错。
+    throw new Error(`动作 ${action.action} 没有配对的操作端点。`);
   }
 
   switch (endpoint.path) {
@@ -61,6 +62,7 @@ export async function submitAllowedAction(
       return;
     }
     default:
-      throw new Error(`动作 ${action.action} 的端点 ${endpoint.path} 未接线（决策 101）`);
+      // 决策 101：端点表漏接属内部错接线，文案不带编号（决策 199）。
+      throw new Error(`动作 ${action.action} 的端点 ${endpoint.path} 还没有接上。`);
   }
 }

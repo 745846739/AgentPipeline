@@ -4,7 +4,6 @@
   import NewTaskDialog from '../board/NewTaskDialog.svelte';
   import Sprite from '../render/Sprite.svelte';
   import { BOARD_COLUMNS, columnForTask } from '../../lib/pipeline';
-  import { onHostMachine } from '../../lib/localPage';
   import type { SpriteName } from '../../theme/contract';
 
   const FILTERS: StatusFilter[] = ['all', 'running', 'pending', 'waiting', 'queued', 'done', 'ended'];
@@ -24,26 +23,38 @@
     ended: 'hammer',
   };
 
-  const NAV: Array<{ path: string; route: string; label: string; sprite: SpriteName }> = [
+  /**
+   * 页面导航行**三项**（决策 198 / design §4.2）：对讲台 / 指标 / 设置。
+   *
+   * 这是**有意的收缩**——顶栏是「第一屏必须懂」的那一处，原先六项等于让人先学词表再开始用。
+   * 原「项目 / 模型与密钥 / 技能市场 / 手机访问」四项**从顶栏移入设置落地页**（项名逐字不改），
+   * 各自路由不变；收缩**只针对这一行**，顶栏其余部分（wordmark / 项目切换器 / 道具栏过滤槽 /
+   * 「待处理 N」芯片 / 「新建任务」）一字不动——它们不是导航项。
+   *
+   * `routes` 是**高亮判据的集合**（design §4.2 的第三列）：「设置」在落地页与五个设置类页面
+   * （含 `/share`）六处都点亮。
+   */
+  const NAV: Array<{ path: string; routes: string[]; label: string; sprite: SpriteName }> = [
     // 对讲台（决策 174 / theme-6-pixel.md §3.3）：与看板并列，故排在台账页之前。
     // 图元复用既有 foreman 头像（不新增 sprite）；它在 34px 页签盒里按 16px 显示。
-    { path: '/talk', route: 'talk', label: '对讲台', sprite: 'foreman' },
-    { path: '/metrics', route: 'metrics', label: '指标', sprite: 'chart' },
-    { path: '/settings/projects', route: 'settings-projects', label: '项目', sprite: 'chest' },
-    { path: '/settings/providers', route: 'settings-providers', label: '模型与密钥', sprite: 'key' },
-    // 技能市场（决策 187）：与「模型与密钥」并列的设置页；sprite 复用既有的 merge（来源接入）。
-    { path: '/settings/market', route: 'settings-market', label: '技能市场', sprite: 'merge' },
-    // 手机访问（决策 167 / 186）：**只在跑服务的这台机器本机上给这个入口**（决策 190）——
-    // 配对令牌只允许回环来源读，故从手机（或用局域网地址打开的电脑）进这一页只能看到一块
-    // 「去电脑上打开」的指引，摆出这个入口就是送人去白跑一趟。
-    { path: '/share', route: 'share', label: '手机访问', sprite: 'phone' },
+    { path: '/talk', routes: ['talk'], label: '对讲台', sprite: 'foreman' },
+    { path: '/metrics', routes: ['metrics'], label: '指标', sprite: 'chart' },
+    {
+      path: '/settings',
+      routes: [
+        'settings-landing',
+        'settings-projects',
+        'settings-providers',
+        'settings-stages',
+        'settings-market',
+        // 手机访问（决策 167 / 186）也是设置类页面：它现在**只从落地页进**
+        // （「只在本机给入口」的判据在 `SettingsLanding.svelte`，与决策 190 同源）。
+        'share',
+      ],
+      label: '设置',
+      sprite: 'key',
+    },
   ];
-
-  /** 本地判据只在装载时取一次：主机名在一次会话里不会变（决策 190）。 */
-  const onHost = onHostMachine();
-
-  /** 实际渲染的导航项：本机之外的来源不给 `/share`。 */
-  const nav = NAV.filter((item) => item.route !== 'share' || onHost);
 
   let newTaskOpen = $state(false);
 
@@ -106,6 +117,11 @@
     <div class="filters-row">
       <nav class="slots" aria-label="状态过滤">
         {#each FILTERS as f (f)}
+          <!-- 图标 + 词（决策 201）：屏幕上的字才是「一眼扫过去就懂」的那一层，title 与
+               aria-label 只作辅助。第 7 槽标签位用短式「已结束」——34px 行放不下 7 个字，
+               完整式「已结束（失败·取消）」放 title。计数徽章：第 3 槽**不画**（`countFor('pending')`
+               与紧邻的 `pendingCount` 是同一个数，数由「待处理 N」芯片唯一承载），其余六槽保留。 -->
+          {@const label = f === 'ended' ? '已结束' : FILTER_LABELS[f]}
           <button
             type="button"
             class="slot {board.filter === f ? 'on' : ''} {f === 'pending' ? 'pend' : ''}"
@@ -115,7 +131,10 @@
             onclick={() => board.setFilter(f)}
           >
             <Sprite name={SLOT_SPRITES[f]} />
-            <span class="cb">{board.countFor(f)}</span>
+            <span class="lbl">{label}</span>
+            {#if f !== 'pending'}
+              <span class="cb">{board.countFor(f)}</span>
+            {/if}
           </button>
         {/each}
       </nav>
@@ -156,11 +175,11 @@
   </div>
 
   <nav class="navbar" aria-label="页面导航">
-    {#each nav as item (item.path)}
+    {#each NAV as item (item.path)}
       <a
         href="#{item.path}"
         class="chip navchip"
-        class:on={router.route.name === item.route}
+        class:on={item.routes.includes(router.route.name)}
         onclick={() => router.navigate(item.path)}
       >
         <span class="ic"><Sprite name={item.sprite} /></span>{item.label}
@@ -239,7 +258,9 @@
     display: none;
   }
 
-  /* ── 道具栏槽位：34px、2px 描边、右下角计数徽章、选中 = 亮描边 + wash 底 ── */
+  /* ── 道具栏槽位：34px 高、2px 描边、图标 + 词 + 右下角计数徽章、选中 = 亮描边 + wash 底 ──
+     宽随词走（图元 16px + 4px 间距 + 12px 词），**高度仍恒 34px**（决策 201）；
+     待处理槽不画计数徽章（数在紧邻的「待处理 N」芯片上）。 */
   .slots {
     display: flex;
     align-items: center;
@@ -256,17 +277,25 @@
   .slot {
     position: relative;
     flex: none;
-    width: 34px;
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    gap: 4px;
+    min-width: 34px;
     height: 34px;
+    padding: 0 6px;
     margin-left: -2px;
     border: 2px solid var(--pane);
     background: var(--panel);
-    display: grid;
-    place-items: center;
     color: var(--text-2);
   }
   .slot:first-child {
     margin-left: 0;
+  }
+  .slot .lbl {
+    font-size: 12px;
+    line-height: 1;
+    white-space: nowrap;
   }
   .slot:hover {
     color: var(--text-hi);
@@ -290,10 +319,6 @@
   }
   .slot.pend {
     color: var(--pending);
-  }
-  .slot.pend .cb {
-    color: var(--pending);
-    border-color: var(--pending);
   }
 
   /* ── 页面铭牌排：像素芯片（选中态与槽位一致：亮描边 + wash 底） ── */
@@ -508,22 +533,27 @@
       align-items: center;
       gap: 6px;
       /* 3px 上下留白：行高由 44px 触控目标决定 → 50px；顶栏总高
-         = 44(铭牌行) + 50(道具栏行) + 42(页面导航行) + 2(边框) ≈ 138px（§5） */
+         = 44(铭牌行) + 50(道具栏行) + 42(页面导航行) + 2(边框) ≈ 138px（§5）。
+         **这一行自己不再横滚**（决策 201）：横滚收进槽位行（`.slots`），于是紧邻的
+         「待处理 N」与「新建任务」恒定完整可见——它们不再随槽位横滚出屏。 */
       padding: 3px 12px;
-      overflow-x: auto;
-      scrollbar-width: none;
-    }
-    .filters-row::-webkit-scrollbar {
-      display: none;
-    }
-    .slots {
-      flex: none;
-      margin-left: 0;
-      padding: 0;
       overflow: visible;
     }
-    .slot {
+    .slots {
+      /* 槽位行照旧横滚：可伸缩（min-width: 0）+ 自己滚，滚动条照旧隐藏 */
+      flex: 1 1 auto;
+      min-width: 0;
       margin-left: 0;
+      /* 与桌面同值：给计数徽章的 -5px 溢出留出裁剪余量（滚动容器的裁剪边是内边距盒） */
+      padding: 5px 6px 5px 0;
+      overflow-x: auto;
+    }
+    /* 窄屏（<480px）**只给当前选中槽带词**，其余六槽保持 34px 图标槽（决策 201） */
+    .slot .lbl {
+      display: none;
+    }
+    .slot.on .lbl {
+      display: inline;
     }
     .pending-wrap {
       margin-left: 2px;

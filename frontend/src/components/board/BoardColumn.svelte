@@ -82,7 +82,7 @@
       </span>
       <Worker {rhythm} />
       <i class="col-rule sec-rule"></i>
-      <span class="sec-n col-n col-n-desk">{tasks.length}</span>
+      <span class="sec-n col-n col-n-desk" title="此刻停在这一列">{tasks.length}</span>
     </div>
 
     <div class="col-body">
@@ -163,6 +163,8 @@
   }
   /* 工位图标与名称同行，名称不换行 */
   .col-n {
+    /* 存量数字：冻结原型把列头这个数钉在装饰档（原型 `.col-n{color:var(--t4)}`），
+       决策 195 的归位清单里也没有它——故与原型一致，不动；口径由 title 辅助说明 */
     color: var(--text-4);
     font-variant-numeric: tabular-nums;
   }
@@ -170,7 +172,8 @@
     margin: 12px;
     padding: 10px 12px;
     border: 2px solid var(--pane);
-    color: var(--text-4);
+    /* 空列的「下一步做什么」是必读内容，用次级必读档（决策 195），不是装饰档 */
+    color: var(--text-3);
     font-size: 12px;
   }
   /* 待处理列：站点灯与名称转琥珀（全站唯一告警） */
@@ -237,7 +240,7 @@
       padding: 0;
       border: 0;
       font-size: 12px;
-      color: var(--text-4);
+      color: var(--text-3);
     }
     .col.hide-cards .col-body {
       display: none;

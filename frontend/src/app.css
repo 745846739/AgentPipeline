@@ -5,6 +5,8 @@
    本文件是 `src/theme/contract.ts` 的**手工镜像**：色彩 token 的值由
    `src/theme/css-parity.test.ts` 逐条比对契约，防漂移（决策 169 不引入代码生成——
    app.css 还承载全站基元与移动版规则，整体生成化会让手改 CSS 变成危险操作）。
+   改值必须成对改、一次改全（契约两处 + 本文件两处）；视觉规格 §2.6 的对比度门
+   （`src/theme/contrast.ts` + `contrast.test.ts`）也从契约读值，改差会被拦下。
 
    深色「夜班靛」为默认；浅色「掌机背光」经 html[data-theme='light'] 覆盖。
    语义命名沿用既有约定（--bg / --panel / --wash / --pane / --text-hi / --text …），
@@ -20,11 +22,11 @@
   --ink: #12131e; /* 硬投影专用墨色（比 bg 深两档） */
   --hairline: #232639; /* 弱分隔（移动款 / 台账行） */
 
-  --text-hi: #f1ecdc; /* 暖纸白：标题、可执行物、当前游标（对 bg ≥ 12:1） */
-  --text: #c7c3b4; /* 正文 */
+  --text-hi: #f1ecdc; /* 暖纸白：标题、可执行物、当前游标（对 bg / panel 都 ≥ 12:1） */
+  --text: #c7c3b4; /* 正文（≥ 7:1；这条 7:1 只属于这一档） */
   --text-2: #918e9f; /* 次文本（≥ 4.5:1） */
-  --text-3: #6e6c82; /* 弱文本、列头；done 的退后灰 */
-  --text-4: #55536b; /* 占位 / 装饰刻度，不承载必读信息 */
+  --text-3: #8e8ca5; /* 次级必读：列头 / 导入语 / 空态引导 / 元信息 / 占位符（≥ 4.5:1，门见 theme/contrast.ts） */
+  --text-4: #55536b; /* 纯装饰刻度，不承载必读信息（门里豁免） */
 
   --go: #55d97c; /* 信号灯绿「执行中」；主动作实心钮 */
   --go-hi: #6fe693; /* 主动作 hover */
@@ -80,7 +82,7 @@ html[data-theme='light'] {
   --text-hi: #14151f;
   --text: #2f3040;
   --text-2: #55566a;
-  --text-3: #7a7b8e;
+  --text-3: #636477; /* 次级必读（≥ 4.5:1；浅色款的约束面是 --bg） */
   --text-4: #9a9bac;
 
   --go: #1f7a3c;
@@ -255,7 +257,7 @@ select {
   border-color: var(--go-hi);
   color: var(--go-ink);
 }
-/* quiet / danger 是弱化的次级动作：无投影、无实底 */
+/* quiet 是弱化的次级动作：无投影、无实底 */
 .btn.quiet {
   border-color: transparent;
   background: none;
@@ -266,18 +268,26 @@ select {
   color: var(--text-hi);
   border-color: transparent;
 }
-.btn.quiet:active:not(:disabled),
-.btn.danger:active:not(:disabled) {
+.btn.quiet:active:not(:disabled) {
   transform: none;
 }
+/* danger **不是**次级动作（票 04 / 决策 195 的用法规约）：删除这类破坏性动作不得在视觉上
+   比隔壁的「编辑」更轻。它吃与中性钮同一档量级——2px 描边 + 3px 硬投影 + 实底，
+   只把描边与文字换成失败红；按下时的消影位移与 `.btn` 一致（3px = `GEOMETRY.pressShiftControl`）。
+   定档在这里、只此一处：项目页的「删除」、市场页的「覆盖安装」、技能声明的「移除」都吃它。 */
 .btn.danger {
-  border-color: transparent;
-  background: none;
-  box-shadow: none;
+  border-color: var(--stop);
+  background: var(--panel);
+  box-shadow: 3px 3px 0 var(--ink);
   color: var(--stop);
 }
 .btn.danger:hover:not(:disabled) {
   border-color: var(--stop);
+  color: var(--text-hi);
+}
+.btn.danger:active:not(:disabled) {
+  transform: translate(3px, 3px);
+  box-shadow: none;
 }
 .btn.block {
   width: 100%;
@@ -302,7 +312,8 @@ select {
   padding: 4px 8px;
 }
 .input::placeholder {
-  color: var(--text-4);
+  /* 占位符告诉你「这里填什么」——读不到会挡住下一步，故走次级必读档（票 15 归位）。 */
+  color: var(--text-3);
 }
 .input:focus {
   outline: none;
@@ -517,7 +528,8 @@ textarea.input {
 .reg-row.dead .reg-sub {
   color: var(--text-4);
 }
-/* 琥珀告警行（不受支持说明 / 删除拒绝原因）；琥珀是全站唯一告警 */
+/* 琥珀告警行（不受支持厂商的说明）；用途清单见视觉规格 §3.1.1（决策 203）——
+   「删除被拒的原因」走 `.reg-err` 红，不在这里。 */
 .warnnote {
   margin-top: 5px;
   color: var(--pending);
@@ -710,13 +722,14 @@ textarea.input {
     color: var(--go);
   }
 
-  /* 命令表两行制：上行元信息，下行命令本体（不截断可换行） */
+  /* 命令表两行制：上行元信息，下行命令本体（不截断可换行）。
+     元信息行（时间 / 来源 / 时长 / 退出码）是读得到才算数的元信息，走次级必读档（票 15 归位）。 */
   .cmd-l1 {
     display: flex;
     align-items: center;
     gap: 8px;
     font-size: 12px;
-    color: var(--text-4);
+    color: var(--text-3);
   }
   .cmd-l2 {
     margin-top: 2px;

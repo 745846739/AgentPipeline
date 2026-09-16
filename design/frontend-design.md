@@ -9,6 +9,21 @@
 > 已从 `app.css` 删除。本文 §3 的「夜间调度台」视觉语言已随
 > [deprecated/prototype.html](deprecated/prototype.html) 归档。
 
+> **修订（2026-09-16「ux-audit」审计票 20–26 / 决策 198–201）：本文的范围变了——这是规格变更，不是修 bug。**
+> 主题六升格为现行视觉规格时（决策 169），**明文把「交互与信息架构改动」划进 Out of Scope**
+> （原措辞在 `.scratch/agentpipeline-pixel-theme/spec.md` 的 Out of Scope 首条：「路由、五页签、
+> 列语义……全部照旧」）。本次改的正是那一块：
+>
+> | 改了什么 | 本文落点 | 决策 |
+> |---|---|---|
+> | 设置类入口按用途两分、新增设置落地页与阶段配置页、顶栏导航行收到三项、手机访问入口挪位 | §1、§4、§7、§8 | 198 |
+> | 界面正文里的内部决策编号退场，可追溯性交给「行为 / 规则 → 实现位置」表 | §12.1、§12.3 | 199 |
+> | 车间隐喻在首次出现处给一次平实说法 | §12.2 | 200 |
+> | 状态过滤槽加词、同一个数不再在相邻控件上重复 | §4.4 | 201 |
+>
+> **不变的部分写死**：过滤语义与端点一律不动；像素纪律（2px 描边 / 零圆角 / 12 的倍数字阶 /
+> 不新增图元 / 动画预算四处）一字不动；`allowed_actions` 纯渲染与卡片禁拖不动。
+
 ---
 
 ## 1. 定位
@@ -22,7 +37,11 @@
 | 用户 | 在自己机器上跑 agent 流水线的开发者 |
 | 首要工作 | 一眼看清"跑到哪、哪里等人"，并在 pending 时做决策 |
 | 信息密度 | 高：流水线状态 + 流式输出 + 命令日志 + 成本同屏 |
-| v1 范围 | 看板视图 + 任务详情 + 设置（项目 / provider）+ 全局指标（决策 79） |
+| v1 范围 | 看板视图 + 任务详情 + 对讲台 + 设置类页面 + 全局指标（决策 79，经决策 176 / 198 修订）**[1]** |
+
+> **[1] 修订（决策 198）：** 本行的「设置（项目 / provider）」按 §4 展开为**一个设置落地页 +
+> 五个独立设置路由**（项目 / 手机访问 / 模型与密钥 / 阶段配置 / 技能市场）；**指标不是设置**，
+> 留在顶栏。功能面没有新增——变的是入口的分类与位置，不是能力。
 
 ---
 
@@ -110,19 +129,126 @@ pending 琥珀呼吸（2.4s 周期）、流式输出尾随光标。`prefers-redu
 
 ## 4. 信息架构与路由
 
-```
-/                    看板（按 project 过滤；决策 58：前端按 project_id 过滤看板）
-/task/:id            任务详情（轨道 hero + 时间线/会话/命令/产出/Diff）
-/settings/projects   项目管理（创建即 POST /projects + 可选 /projects/analyze）
-/settings/providers  模型与密钥（决策 112：明文存储，读接口回显 ***）
-/metrics             全局指标（GET /metrics）
-```
+> **本节由决策 198 改写**（原文只列五条路由、顶栏常驻一行把六个入口摊在一起）。改动是**有意的
+> 规格变更**：顶栏是「第一屏必须懂」的那一处，六个设置类入口摆在那里等于让人先学词表再开始用。
+> **过滤语义、端点与写操作一律不变**；视觉纪律一字不动。
+
+### 4.1 路由表（唯一权威）
+
+| 路由 | `route.name` | 页面 | 入口 |
+|---|---|---|---|
+| `#/` | `board` | 看板（按 project 过滤；决策 58） | wordmark / 404 的返回入口 |
+| `#/talk` | `talk` | 对讲台（与值班长对话，决策 176 / 182） | 顶栏第 1 项（兼容原型写法 `#v-talk`） |
+| `#/task/:id` | `task` | 任务详情（轨道 hero + 时间线/会话/命令/产出/Diff） | 看板卡片 / 待处理下拉 |
+| `#/metrics` | `metrics` | 全局指标（`GET /metrics`） | 顶栏第 2 项；任务侧入口见 §4.5 |
+| `#/settings` | `settings-landing` | **设置落地页（新）** | 顶栏第 3 项 |
+| `#/settings/projects` | `settings-projects` | 项目（创建即 `POST /projects` + 可选 `/projects/analyze`） | 落地页「谁能进来」 |
+| `#/share` | `share` | 手机访问（局域网扫码接入，决策 167 / 186） | 落地页「谁能进来」的手机访问项（**仅本机渲染**） |
+| `#/settings/providers` | `settings-providers` | 模型与密钥（provider 台账；决策 112：明文存储、读接口回显 `***`） | 落地页「怎么跑」 |
+| `#/settings/stages` | `settings-stages` | **阶段配置（新页，内容从「模型与密钥」页搬出）** | 落地页「怎么跑」 |
+| `#/settings/market` | `settings-market` | 技能市场（决策 187 / 194） | 落地页「怎么跑」 |
+| 其它 | `not-found` | 404（给一条回看板的路） | — |
 
 - 无 SvelteKit，Vite + Svelte 5（runes）+ 轻量 hash 路由（本地应用，无 SEO 诉求）。
 - **传输层 Tauri 防御（决策 153）：** ① 本前端是**纯 API 客户端**，一切数据经 HTTP + SSE，不假设部署形态（桌面化 = Tauri 只当外壳，不走 IPC 重写）；② SSE 消费用 **fetch 流式读取**（可携带自定义头），不用 `EventSource`——它带不了自定义头，跨源过不了决策 128 防护；③ 所有写请求**恒携带** `X-AgentPipeline` 头（决策 128 旁路，桌面 webview origin 靠它放行）；④ API base 收敛**单一配置点**：默认同源相对路径，留注入覆盖口（桌面壳注入 `http://127.0.0.1:{port}`）。
-- 顶栏常驻：wordmark ｜ 项目切换 ｜ 状态过滤（全部 / 执行中 / **待处理 N** / 等依赖 / 排队 / 已完成 / 已结束（失败·取消））｜ 新建任务。
-- **待处理计数**（`has_pending_cursor` 的任务数，决策 92）是顶栏唯一的动态计数入口，
-  点击下拉列出全部 pending 任务（琥珀点 + 阻塞原因摘要），点击进入对应任务。
+
+### 4.2 顶栏：页面导航行三项（定稿，决策 198）
+
+| 序 | 项名（定稿） | 落点 | 高亮判据（`route.name`） |
+|---|---|---|---|
+| 1 | **对讲台** | `#/talk` | `talk` |
+| 2 | **指标** | `#/metrics` | `metrics` |
+| 3 | **设置** | `#/settings` | `settings-landing` / `settings-projects` / `settings-providers` / `settings-stages` / `settings-market` / `share` |
+
+- 这是**有意的收缩**：顶栏是「第一屏必须懂」的那一处，六项让人先学词表再开始用。
+- **收缩只针对页面导航行**（`.navbar`）。顶栏其余部分一字不动：wordmark、项目切换器、
+  道具栏（状态过滤槽，§4.4）、**「待处理 N」芯片**（`has_pending_cursor` 的任务数，决策 92 的
+  唯一动态计数入口，点击下拉列出全部 pending 任务——琥珀点 + 阻塞原因摘要，点击进入对应任务）、
+  「新建任务」。**它们不是导航项**，不受本项影响。
+- 原先挂在顶栏的四个设置类项（项目 / 模型与密钥 / 技能市场 / 手机访问）**改为落地页里的项**，
+  各自路由不变。
+- 移动款的顶栏结构（铭牌行 + 信号灯缩略条 + 道具栏行 + 页面导航行，≈138px）**不变**，
+  只是导航行从六枚 chip 变成三枚；`scroll-margin-top` 与横幅 top 的几何因此**不用改**。
+
+### 4.3 设置落地页（`#/settings`）
+
+**分类法：按用途两分——「谁能进来」/「怎么跑」。** 判据一句话：**决定「边界」的进「谁能进来」，
+决定「跑起来靠什么」的进「怎么跑」。**
+
+| 分类（小节标题） | 分类的一句话（定稿） | 项（定稿） | 项的一句话（定稿） | 落点 |
+|---|---|---|---|---|
+| **谁能进来** | `哪些仓库算工作对象、哪些设备能连进来。` | 项目 | `把本地仓库接进来当工作对象。` | `#/settings/projects` |
+| | | 手机访问 | `让同一局域网里的手机连进来（只在跑服务的这台电脑上配置）。` | `#/share` |
+| **怎么跑** | `跑起来用谁的能力、按什么规矩。` | 模型与密钥 | `配 provider 台账与密钥。` | `#/settings/providers` |
+| | | 阶段配置 | `每个阶段用哪个 provider、带哪些工具与技能。` | `#/settings/stages` |
+| | | 技能市场 | `从 GitHub 仓装技能、看已装技能。` | `#/settings/market` |
+
+- 页面标题 `设置`；导入语 `这台机器上的流水线怎么跑、谁能进来。`
+- **各项仍是独立路由，落地页只是入口**（决策 198）：它不复制任何设置内容，不内嵌表单，
+  不替子页保存状态。
+- **指标不列在落地页**：它不是设置类入口，留在顶栏（第一屏三项之一）。
+- **被拆出来的东西各有其位**：技能市场归技能（`#/settings/market`）、**阶段配置独立成页**
+  （`#/settings/stages`）、provider 台账留在原处（`#/settings/providers`，**只摘掉阶段配置那一段**）。
+- 每个设置子页给一条**返回设置**的路（`← 设置` → `#/settings`），与既有的 `← 看板` 并列。
+- **手机访问项只在跑服务的这台机器本机上渲染**——判据与行为**逐字沿用决策 190**：
+  看**来源是否回环**（`onHostMachine()`），不看视口宽度；被判为非本机时这一项**不渲染**
+  （不是禁用、不是留个空位）；非本机来源直接敲 `#/share` 仍得到那一页既有的指引
+  （决策 189 的「二维码要在这台电脑本机上打开本页才拿得到」，不画扫不出的码）。
+  **规则与后果一个字没改，只是入口的位子从顶栏换到落地页。**
+- 层级：落地页的分类标题与各子页的小节标题**同档**——12px 字阶（字阶只有 12 / 24 / 36），
+  **不与页面标题（24px）同级**（票 09 的口径，两处必须一致）。
+
+### 4.4 状态过滤槽（道具栏，决策 201）
+
+**裁决：图标 + 文字标签。** 七个槽都带词——屏幕上的字才是「一眼扫过去就懂」的那一层，
+`title` 与 `aria-label` 只作辅助。
+
+| # | 槽（过滤桶） | 图元（契约 sprite） | 标签（定稿） | `title` | 计数徽章 |
+|---|---|---|---|---|---|
+| 1 | `all` | `chest` | `全部` | `全部` | 保留 |
+| 2 | `running` | `gear` | `执行中` | `执行中` | 保留 |
+| 3 | `pending` | `alert` | `待处理` | `待处理` | **去掉**（见下） |
+| 4 | `waiting` | `merge` | `等依赖` | `等依赖` | 保留 |
+| 5 | `queued` | `flag` | `排队` | `排队` | 保留 |
+| 6 | `done` | `trophy` | `已完成` | `已完成` | 保留 |
+| 7 | `ended` | `hammer` | `已结束` | `已结束（失败·取消）` | 保留 |
+
+- 词表**逐字取自** `frontend/src/stores/board.svelte.ts` 的 `FILTER_LABELS`，**不新增文案**；
+  唯一的例外是第 7 槽在标签位上用短式 `已结束`（完整式 `已结束（失败·取消）` 放 `title`）
+  ——34px 槽位行放不下 7 个字。
+- 这不是新增的口径：**§5.1 的版面示意里本来就写着词**
+  （`全部 执行中 待处理③ 等依赖 排队 已完成 已结束`）——实现此前只画了图元，没画词。
+- 形态：槽位高度仍 **34px**，宽度随词走（图元 16px + 4px 间距 + 12px 词）；2px `--pane` 描边、
+  相邻槽共享边框（`margin-left: -2px` 照旧）、零圆角、选中态照旧（亮描边 + `--wash` 底）、
+  计数徽章位置照旧。**不新增图元、不新增颜色、不新增动画位。**
+- **窄屏（<480px）只给当前选中槽带词**，其余六槽保持 34px 图标槽（行宽由约 226px 涨到约 250px）。
+  槽位行照旧横滚，但**「待处理 N」芯片与「新建任务」必须完整可见**——430×900 下
+  `新建任务` 的 `getBoundingClientRect().right ≤ 430`，不随槽位横滚出屏。
+- **为什么不是「收进一处」**：过滤是看板第一屏最常用的一次动作，收进下拉要多一次点击，
+  还丢掉「每个桶里有几个」的同屏读数；而这一条修的是「看不懂」，不是「太占地方」。
+- **为什么不是「只保留悬停与读屏名」**：触屏上没有悬停，而「一眼扫过去知道每个桶是什么」
+  正是这条诉求本身。
+- **过滤词表不进隐喻词表（决策 200 / 201）**：那七个词是领域状态词（`TaskStatus` 的中文叫法），
+  它们本身就是平实词、没有第二个叫法；需要认的是七枚**自造图元**，那由主题契约的 sprite 表管，
+  不是术语表管。
+
+**计数去重（定稿规则）：同一个数不得在相邻的两个控件上同时出现。**
+
+| 位 | 处置 |
+|---|---|
+| 第 3 槽的计数徽章 | **去掉**——`countFor('pending')` ≡ `pendingCount`，紧邻的「待处理 N」芯片显示的是同一个数 |
+| 「待处理 N」芯片 | **保留原位**，成为 pending 数的**唯一显示位**（决策 92 的入口与下拉逐字不变） |
+| 第 3 槽的 `title` / `aria-label` | **保留数量**（`aria-label="待处理（3）"` 照旧）——去掉的是**视觉重复**，不是信息 |
+| 其余六槽的徽章 | 保留（各自桶唯一的就地读数） |
+| 底部状态行 | **不去数、不减项**：它在页面另一端固定位置，是「流水线整体态势」的读数（含 token 总量与主题切换），与顶栏中枢不构成相邻同屏重复；五组数与顶栏徽章的重复是「位置即用途」的重复，不是噪声 |
+
+### 4.5 输入与入口
+
+- 依赖任务 ID 用**原生 `datalist`**（不做完整选择器）。
+- 指标页的任务级入口：任务详情放链接 `#/metrics?task=<task_id>`，路由解析出 `query`，
+  指标页据 `query.task` 自动载入并高亮——不再要求手打 ULID。
+- 项目分析入口：`#/settings/projects?project=<id>&analyze=1`，项目页据此自动就位并触发分析；
+  任务侧的链接都走它。
 
 ---
 
@@ -141,6 +267,9 @@ pending 琥珀呼吸（2.4s 周期）、流式输出尾随光标。`prefers-redu
 │  卡片      卡片                卡片（双药丸）                   卡片         │
 └────────────────────────────────────────────────────────────────────────────┘
 ```
+
+> 上图只画顶栏的**道具栏一行**（过滤槽 + 待处理计数 + 新建任务）；它下面的**页面导航行**按
+> §4.2 只有三项（对讲台 / 指标 / 设置），图上不重复画。
 
 - **列 = 阶段**（决策 92 的"独立槽位"）：8 列 = init / architect-design /
   **develop-design ∥ test-design（双轨合并列）** / develop / review / test / merge / done。
@@ -182,6 +311,24 @@ pending 琥珀呼吸（2.4s 周期）、流式输出尾随光标。`prefers-redu
 
 空列不放插画，一句话：如 done 列空 →「还没有任务走到终点。跑完一个任务它会出现。」
 整板空 →「新建第一个任务，流水线会从 init 开始走。」
+
+> **决策 202（2026-09-16「ux-audit」审计票 13）：本节的空态形状由「只写两句」升格为全站唯一的空态规格。**
+> 票 01 的取证判定：本节原先只写了看板的**空列**与**整板空**，主题四 / 主题五各自都有「空态」一行而
+> 主题六那一行丢了；七个页面的空态与 404 从未被定义过形状，于是同一件事长成七个样子（其中看板那句
+> 「到『设置 · 项目』添加一个本地 git 仓库」**指着一个页面却不是链接**）。定稿规则：
+>
+> 1. **形状唯一**——状态（现在是空的、缺什么）→ 下一步（做什么）→ 可选入口（去哪），由
+>    `frontend/src/components/ui/EmptyState.svelte` 一处承载（props `state` / `next?` / `href?` /
+>    `linkLabel?`），七处空态（看板 / 对讲台 / 指标 / 项目 / 模型与密钥 / 技能市场 / 手机访问）
+>    与 404 **全部用它**，不新增第二种写法。
+> 2. **提到另一个页面必须可点**——`href` 给真路由（`#/settings/projects`、`#/` 这类），不是「一段提到
+>    页名的文字」，也不是 `<button>` + `router.navigate`：入口是**路**，用户在地址栏看得见它去哪。
+> 3. **文字用次级必读档**（视觉规格 §2.6 的 `--text-3`，门槛 4.5:1），不用装饰档——空态引导句正是
+>    「读不到就挡住下一步」的典型。
+> 4. **404 一并纳入**——不存在的地址给一条回看板的路，展示的地址不带 `#`。
+>
+> **有意例外（留档）**：手机访问页「读不到配对令牌」那条故障分支**不** EmptyState 化——它是后端报文的
+> 精确文本承载位，进了长句会失去可定位性。形状与色档见视觉规格 §3 的「空态」一行（决策 202 补回）。
 
 ---
 
@@ -231,11 +378,17 @@ pending 琥珀呼吸（2.4s 周期）、流式输出尾随光标。`prefers-redu
 
 ## 7. 设置与全局指标
 
+> **本节由决策 198 改写**：每块设置有自己的位置，不再挤在同一页里；入口的分类见 §4.3。
+
 | 页面 | 要点 |
 |---|---|
-| 项目 | 本地路径为唯一事实来源（决策 29）；创建后引导触发 `POST /projects/analyze`（伪阶段探测事实清单 + agent 摘要，决策 78），结果以核对清单呈现供确认；删除有活跃任务时禁用并说明原因（决策 105） |
-| 模型与密钥 | provider 行 = (vendor, model, context_window)（决策 111）；`api_key` 输入框写后即掩码回显 `***`（决策 112），旁边固定一行提示「密钥明文存于本机 `~/.agentpipeline`，目录权限 0700」；`supported_adapters` 之外的行降级灰显 + 告警，不崩（决策 103） |
-| 全局指标 | GET /metrics：成功率、各阶段平均耗时 / 重试率 / validate 通过率、token 消耗。全部以**轨道分段条形图**呈现（横条挂在轨道站点下），延续"轨道即导航"；无 KPI 卡片横排 |
+| 设置落地页 | `#/settings`：只做入口与分类（谁能进来 / 怎么跑），不承载设置内容（§4.3） |
+| 项目 | 本地路径为唯一事实来源（决策 29）；创建后引导触发 `POST /projects/analyze`（伪阶段探测事实清单 + agent 摘要，决策 78），结果以核对清单呈现供确认；删除被拒时给的是**下一步**（「先去处理那 N 个任务」）而不只是一个理由，且这行只在动手时出现（决策 105；文案见 §12.1） |
+| 手机访问 | 局域网扫码接入 + 运行时改绑 + 「这次绑定是谁定的」（决策 167 / 186 / 189 / 190）；**入口只在跑服务的这台机器本机渲染**（§4.3） |
+| 模型与密钥 | **只剩 provider 台账与密钥提示**（阶段配置已搬去 `#/settings/stages`）：provider 行 = (vendor, model, context_window)（决策 111）；`api_key` 输入框写后即掩码回显 `***`（决策 112），旁边固定一行提示「密钥明文存于本机 `~/.agentpipeline`，目录权限 0700」；`supported_adapters` 之外的行降级灰显 + 告警，不崩（决策 103，界面文案见 §12.1） |
+| 阶段配置 | `#/settings/stages`（**新页，决策 198**）：把「模型与密钥」页里的阶段配置那一段整体搬来——每个阶段用哪个 provider、带哪些工具与技能、超时覆盖（决策 111 / 170 / 172）；小节标题 12px 档，不与页面标题同级（票 09） |
+| 技能市场 | `#/settings/market`：来源仓名单（保存即生效）+ 该仓的技能列表 + 安装后的三项预览（决策 187 / 194） |
+| 全局指标 | GET /metrics：成功率、各阶段平均耗时 / 重试率 / validate 通过率、token 消耗。全部以**轨道分段条形图**呈现（横条挂在轨道站点下），延续"轨道即导航"；无 KPI 卡片横排。第一段用**平实说法**说清每个数是什么、怎么算的（票 27），不带内部编号（§12.1） |
 
 ---
 
@@ -244,19 +397,25 @@ pending 琥珀呼吸（2.4s 周期）、流式输出尾随光标。`prefers-redu
 ```
 frontend/
 ├── src/
-│   ├── routes/            # Board / TaskDetail / SettingsProjects / SettingsProviders / Metrics
+│   ├── routes/            # Board / TaskDetail / Talk / Metrics / Share /
+│   │                      #   SettingsLanding（新，决策 198）/ SettingsProjects / SettingsProviders /
+│   │                      #   SettingsStages（新，决策 198）/ SettingsMarket
 │   ├── api/               # 类型化客户端；TS 类型与 §4 数据模型一一对应（文档已是 TS interface）
 │   ├── realtime/
 │   │   ├── connection.ts  # EventSource 生命周期、退避重连、visibilitychange 处理
 │   │   └── reduce.ts      # SSE 事件 → store 归约（按 branch 分拣，决策 84）
 │   ├── stores/            # board.svelte.ts / taskDetail.svelte.ts / notifications.svelte.ts
+│   ├── lib/               # 纯函数层：pipeline（几何/脊线）、actions、metrics、notificationPolicy、
+│   │                      #   enterToSend（决策 184）、localPage（决策 190）、behavior-map.test.ts（§12.3）
+│   ├── theme/             # 主题契约模块 + 对比度门（决策 195 的 contrast.ts）
 │   └── components/
+│       ├── ui/            # 公共非业务件：EmptyState（票 13）、Modal（三个对话框共用的键盘/语义底座）
 │       ├── pipeline/      # PipelineRail（轨道，3 种变奏：脊线 / 卡片迷你轨 / hero）、CursorDot、BranchPill
 │       ├── board/         # BoardColumn、TaskCard、PendingActions、StalledBadge、NewTaskDialog
 │       ├── task/          # TimelineView、ConversationViewer、CommandLog、FileViewer、DiffReviewPanel、ReviewForm
 │       ├── render/        # ★ 公共渲染件（§12.11 复用表）：MarkdownView、MessageBubble、
 │       │                  #   ToolCallCard、MetadataCard、CodeHighlight、DiffView、TokenMeter
-│       └── settings/      # ProjectForm（含 analyze 清单）、ProviderForm
+│       └── settings/      # ProjectForm（含 analyze 清单）、ProviderForm、StageConfigForm（阶段配置页用）
 ```
 
 - `render/` 即 §12.11"外壳独立、渲染件复用"的落点：v1 会话查看器与 v2 对话窗口共用。
@@ -321,5 +480,169 @@ GET /tasks/{id}               → 详情页装载 + 断线重连后的全量校�
 2. **看板**：`GET /tasks` 装载 + 卡片 + 列语义 + 过滤 + 新建任务对话框；无 SSE 也能用（refetch）。
 3. **任务详情**：hero 轨道 + 时间线 + 会话查看器（`render/` 组件就位）+ 命令表 + 文件。
 4. **实时**：SSE 连接层 + 归约表 + 异步按钮 + 通知策略；pending dossier 与待办计数。
-5. **Diff 审批与人工评审** → 6. **设置页与全局指标** → 7. 打磨：空态、reduced-motion、键盘可达、
-   断线重连横幅。
+5. **Diff 审批与人工评审** → 6. **设置页与全局指标**（含决策 198 的落地页与阶段配置页）→
+   7. 打磨：空态、reduced-motion、键盘可达、断线重连横幅、文案规范（§12）。
+
+---
+
+## 12. 文案规范与可追溯性（决策 199 / 200）
+
+> 本节是**新增的**（原文没有文案规范）。三条规则指向同一件事：界面上的字说的是
+> 「会发生什么、你该做什么」，而维护者要的那条「这条规矩从哪来」不占使用者的注意力。
+
+### 12.1 内部决策编号退场（决策 199）
+
+- **面向用户的正文里不再出现「决策 NN」。** 正文只留**动作与后果**：会发生什么、你该做什么。
+- 编号的去向**只有两处**：元素的 `title` 悬停提示，或（一条说明确实需要给出理由时）就地折叠的
+  `<details>` 说明。**同一处只选一种**，不叠加、不并排。
+- **例外照旧**：代码注释、开发文档、测试文件里的编号**不动**——机器门只扫**面向用户的文案**。
+  落到 `.svelte` 上有一条容易踩的判据：**`<!-- … -->` 是注释，不是文案**（`frontend/src/routes/Talk.svelte`
+  里现有五处「决策 NN」全在 HTML 注释里，门若按纯文本搜就会把它们误判成文案）；**算文案的是**：
+  标签之间的文本、`title` / `aria-label` 这类属性值、以及喂给它们的 JS 字符串常量。
+
+**定稿例子（现文案 → 新文案，可直接抄）**
+
+| 位置 | 现文案 | 正文（定稿） | 编号去向 |
+|---|---|---|---|
+| 设置·项目，删除被拒 | `该项目有 3 个活跃任务，不能删除（决策 101）。` | `先去处理那 3 个任务，然后再删除这个项目。` | `title="有活跃任务的项目不能删除"` |
+| 设置·模型与密钥，不受支持的行 | `! 不受支持 · 决策 103` | `! 不支持这个厂商，该行已停用` | `title="适配器不支持的 provider 行降级停用；被阶段引用时启动会拒绝"` |
+| 设置·模型与密钥，密钥提示 | `密钥明文存于本机 ~/.agentpipeline，目录权限 0700` | **逐字保留**（本来就没有编号，不属于本项） | — |
+| 指标页第一段 | `统计口径见 core metrics（决策 130 / 137）：成功率 = done ÷（done+failed+cancelled）…` | **整段重写归票 27**；本项只保证重写后的那段不带编号、不说字段名 | `title` 或折叠说明给「这几个数出自哪几条决定」 |
+| 任何说明行里的括注 | 形如 `（决策 N）` 的括注 | 换成一句**理由**，或直接删掉括注 | 编号移进该元素的 `title` |
+
+**界面上的编号出现点（初版清单，票 23 直接用；归属按 `parallel-brief.md` §二的所有权表）**
+
+清单是**初版**：行号会随并行改动漂移，**按「决策 N」搜一遍再核**；`title` 里的编号与正文里的
+同样算（它们都是使用者看得到的字）。真正的兜底是机器门 `frontend/src/lib/copy-discipline.test.ts`，
+这张表只是把「要改哪些处」一次说清。
+
+| 出现点 | 现文案（片段） | 正文（定稿） | 归属 |
+|---|---|---|---|
+| `frontend/src/routes/SettingsProjects.svelte:177` | `本地路径是项目唯一事实来源（决策 29）。创建时立即校验 git 仓库（决策 61）；删除有活跃任务的项目会被拒绝并给出原因（决策 101）。` | `本地路径是项目唯一事实来源。创建时立即校验是不是 git 仓库；删除有活跃任务的项目会被拒绝，并告诉你先去处理哪几个任务。` | S |
+| `frontend/src/routes/SettingsProjects.svelte:221` | `该项目有 {active} 个活跃任务，不能删除（决策 101）。` | `先去处理那 {active} 个任务，然后再删除这个项目。`（这行**只在动手时出现**，不再常驻——票 04） | S |
+| `frontend/src/routes/SettingsProjects.svelte:253` | `title` 里的 `该项目有 {active} 个活跃任务，不能删除（决策 101）` | `title="有活跃任务的项目不能删除"` | S |
+| `frontend/src/routes/SettingsProviders.svelte:256` | `provider 行 =（vendor, model, context_window）（决策 111）。api_key 明文存储，读接口只回显 ***；` | `每行一个 provider，写明厂商、模型与上下文窗口。密钥明文存储，读接口只回显 ***；` | S |
+| `frontend/src/routes/SettingsProviders.svelte:257` | `密钥明文存于本机 ~/.agentpipeline，目录权限 0700（决策 112 / §12.14）。` | `密钥明文存于本机 ~/.agentpipeline，目录权限 0700。` | S |
+| `frontend/src/routes/SettingsProviders.svelte:297` | `! 不受支持 · 决策 103` | `! 不支持这个厂商，该行已停用` + `title`（见上「冲突与处置」） | S |
+| `frontend/src/routes/SettingsProviders.svelte:360` | `阶段 provider 优先于全局默认（决策 129）。…被拒并回显原因（决策 47 / 103）。` | `阶段配置优先于全局默认。…被拒并回显原因。`；**这一段随决策 198 搬去 `#/settings/stages`**（N 建页，S 从本页摘掉） | S + N |
+| `frontend/src/routes/SettingsMarket.svelte:532` | `要启用请到「设置 · 模型与密钥」的阶段配置里声明` | `要启用请到「设置 · 阶段配置」里声明`，链接改指 `#/settings/stages`（决策 198 之后的正确落点） | S |
+| `frontend/src/routes/SettingsMarket.svelte:534` | `工具按需拉取，决策 181⑤）。` | `工具按需拉取）。` | S |
+| `frontend/src/routes/Share.svelte:206` | `（跨源防护只拦异源写请求，同源写请求自带客户端头，决策 128 / 153③）。` | `（手机加载的页与接口同源，不需要额外放行来源。）` | S |
+| `frontend/src/routes/Share.svelte:222` | `启动时指定的绑定优先于这里的按钮（决策 186）：…` | `启动时指定的绑定优先于这里的按钮：…` | S |
+| `frontend/src/components/settings/ProjectForm.svelte:85` | `…且 HEAD 已有提交（决策 29 / 61）。校验失败会原样回显后端拒绝原因。` | `…且 HEAD 已有提交。校验失败会原样回显后端拒绝原因。` | S |
+| `frontend/src/components/settings/ProviderForm.svelte:109` | `…被 stage_configs 引用时配置加载会拒绝启动（决策 103）。` | `…被阶段配置引用时配置加载会拒绝启动。` | S |
+| `frontend/src/components/settings/StageConfigForm.svelte:181` | `默认关闭——每次尝试干净对话（决策 33 / 180）。` | `默认关闭——每次尝试干净对话。`（该表单随决策 198 进 `#/settings/stages`） | S |
+| `frontend/src/components/settings/AnalysisChecklist.svelte:34` | `以下为 project_analysis 探测到的事实，确认无误后即可创建任务（决策 78）。` | `以下是探测到的事实，确认无误后即可创建任务。` | S |
+| `frontend/src/routes/Metrics.svelte:81` | `统计口径见 core metrics（决策 130 / 137）：成功率 = done ÷（done+failed+cancelled）…` | **整段重写归票 27**；重写后不带编号、不说字段名 | Me |
+| `frontend/src/routes/Metrics.svelte:141` | `已从轨道图排除非站点阶段（决策 107）：{…}。` | `已从轨道图排除非站点阶段：{…}。` | Me |
+| `frontend/src/routes/Metrics.svelte:179` | `stored_* 是任务表持久化值，与按 run 求和存在差异（决策 100 的父/子行口径或未落库更新）。` | `这个数与按执行记录逐个加起来的结果有出入（父子行的口径不同，或者还没落库）。` | Me |
+| `frontend/src/components/task/SplitDialog.svelte:41` | `原任务将被置为 cancelled（决策 105）。` | `原任务会被置为已取消。` | M |
+| `frontend/src/components/task/ModelOverrideDialog.svelte:38` | `仅影响本任务后续节点（决策 105 / 129），不改全局 stage config。` | `只影响本任务后面的节点，不改全局阶段配置。` | M |
+| `frontend/src/components/board/PendingActions.svelte:137` | `title` 里的 `无配对端点（决策 101）` | `title="这个动作没有配对的端点"` | **未指派**（`components/board/` 只把 BoardColumn / TaskCard 给了 B） |
+| `frontend/src/components/board/StalledBadge.svelte:10` | `title` 里的 `pending 超过 pending_timeout_hours（决策 34）` | `title="等你拍板已经超过超时上限"` | **未指派**（同上；请编排者指派或走 handoff） |
+
+**冲突与处置（写死）**
+
+- 现行视觉规格 `design/theme-6-pixel.md` 的组件映射表里有一条**明文要求把编号渲染进界面**：
+  `| 行内降级 | 决策 103 的"不受支持 vendor"整行 --t4 灰显 + ! 不受支持 · 决策 103 琥珀标；… |`
+  （审计报告记的位置是 `:251`；T 的 §2.6 / §2.7 增补已把它位移，**以文本匹配为准**）。
+- 它与本节规则**直接冲突**，属于**要改写的那一处**：那处文案改成 `! 不支持这个厂商，该行已停用`，
+  编号退到 `title`；改写 + 在原处标注修订来由**由 T 在视觉规格里执行**（本文不碰视觉规格——
+  它是 T / DEC-VIS 的文件）。交接见 `.scratch/ux-audit/handoff/DEC-IA-22.md`。
+- 之所以不是「修 bug」：那条要求是**决策 169 把主题六升格为现行视觉规格**时带进来的，
+  故按本项目惯例**追加修订决策（199）并在被改写的原文处标注**，不静默改。
+
+### 12.2 车间隐喻首现翻译（决策 200）
+
+**口径：隐喻保留（它是整个主题的投资）；每个词在「每个页面」内首次出现处给一次平实说法；
+同一页面内不重复。**
+
+- 为什么按页面而不是按全站：本项目是 hash 路由的本地应用，**任何页面都能被直接打开**
+  （手机扫码直接落看板、地址栏贴任务详情）——「全站只译一次」会让从别处进来的人永远看不到翻译；
+  而「同一页面内不重复」保证翻译不变成噪声。
+- 形态定稿：**行内、全宽括号、紧跟在词后**——`急停（等你拍板的阻塞）`。词与翻译**同字号、同色档**；
+  翻译用 `--text-3`（决策 195 的「次级必读」档，门槛 4.5:1，读得到）。
+  **不新增图元、不新增颜色、不加独立徽章、不加背景、不加动画位**；2px 描边、零圆角、
+  12 的倍数字阶一字不动。
+- **`title` 不承载翻译**（那是编号的位子）：译文必须是**屏上读得到**的字，悬停不算。
+- **按钮与标题里不翻译**：可执行物（按钮）与标题保持原词，翻译只出现在**说明性文字**里。
+- **第一屏与隐喻词的分界**：顶栏三项名、「新建任务」、状态过滤槽的词（§4.4）、空态的下一步
+  （§5.3）**一律用平实词、不翻译**（票 21）；翻译只服务**其余正文**。
+- 词表与译法的同步落点：`docs/glossary.md` 的「视觉语汇」一节（按同样的说法填一列），
+  两处必须一致。
+
+| 隐喻词 | 首现处的定稿平实说法（可抄进界面） |
+|---|---|
+| **急停** | `急停（等你拍板的阻塞）` |
+| **值班长** | `值班长（跟我对话的 AI）` |
+| **工位** | `工位（流水线的阶段）` |
+| **货箱** | `货箱（一张任务卡）` |
+| **工头** | `工头（就是值班长，跟我对话的 AI）` |
+| **值班经理** | `值班经理（你）` |
+| **对讲台** | `对讲台（跟值班长说话的地方）` |
+| **传送带 / 链节** | `传送带（这条流水线的顺序）` |
+| **信号灯** | `信号灯（任务的状态色）` |
+| **回流带** | `回流带（打回重做的那条线）` |
+| **台账** | `台账（设置这一类页面）` |
+| **道具栏** | `道具栏（顶栏那排状态过滤）` |
+
+### 12.3 行为 / 规则 → 实现位置（决策 199）
+
+**这张表是「决定 → 实现」的唯一权威索引。** 界面正文不再出现编号，编号住在**本表的「备注」列**
+（以及代码注释与开发文档里）；维护者改代码前从这里查「哪几条决定约束着它」。表与视觉规格既有那张
+「视图 → 组件」表**同形**（三列），**不新建文件**。
+
+**「实现位置」列的机器可解析格式（定稿；加行必须照此写，否则 `behavior-map.test.ts` 变红）**
+
+1. 每条位置**用反引号包裹**：`` `frontend/src/routes/Board.svelte` ``。
+2. 多条之间用**顿号 `、`** 分隔。
+3. 路径一律**相对仓库根**、用 `/`；**行号可选**，写成 `:行号`（如 `frontend/src/lib/pipeline.ts:120`）。
+   **行号只作定位辅助、不参与断言**——断言的是**文件存在**，行号漂移不会变红。
+4. **不写 glob**（`*`）、不写目录、不写锚点、不写仓库外的路径、不引用 `.scratch/` 下被 gitignore 的产物。
+5. 表里可以引用**本 effort 正在新建的文件**：`SettingsLanding.svelte` / `SettingsStages.svelte` /
+   `Modal.svelte` / `contrast.ts` / `copy-discipline.test.ts` 五个，由检查脚本登记为「允许尚未落地」，
+   **落地后逐条删掉**；除这五个之外，每一行引的路径**必须现在就在磁盘上**。
+
+**悬空引用检查**：`frontend/src/lib/behavior-map.test.ts`（vitest，纯静态扫描）逐行解析下表，
+断言每条位置在磁盘上存在；**指不到实现位置的条目变红**，失败信息说清「哪一行（行为列的文本）
+指向哪个不存在的路径」。索引最大的失败形态不是没建，是建完之后悄悄烂掉——这次的对比度规则
+就是这么没的。
+
+| 行为 / 规则 | 实现位置 | 备注 |
+|---|---|---|
+| 动作集纯渲染：前端不做白名单，每个 side_effect 有配对端点 | `frontend/src/lib/actions.ts`、`frontend/src/components/board/PendingActions.svelte` | 决策 69 / 101 / 105 |
+| 长耗时按钮异步：点击即 loading 禁用，SSE 回执后复位 | `frontend/src/lib/actionSubmit.ts` | 决策 69；§9.2 |
+| 多游标 resume 必须带 `cursor_id`（省略仅在恰有一条游标时允许） | `frontend/src/lib/actionSubmit.ts` | 决策 91 |
+| 列 = 阶段：含并行双轨合并列，sync-check 全站不展示 | `frontend/src/lib/pipeline.ts`、`frontend/src/components/board/BoardColumn.svelte` | 决策 92 / 107 |
+| 并行分支按 branch 分拣与着色，动作集按游标独立下发 | `frontend/src/realtime/reduce.ts`、`frontend/src/components/pipeline/BranchPill.svelte` | 决策 84 |
+| 脊线站点数字 = 累计到过这一站，框内带 `累计` 词（与列头存量区分） | `frontend/src/components/pipeline/PipelineRail.svelte`、`frontend/src/lib/pipeline.ts` | 决策 197 |
+| 看板溢出：宽屏 `merge` / `done` 钉右；窄档初始滚动落在 `merge` + 右缘「还有 N 列」 | `frontend/src/routes/Board.svelte` | 决策 196 |
+| 卡片禁拖；任务卡整卡可点进详情 | `frontend/src/components/board/TaskCard.svelte` | 决策 169 沿用的交互骨架；§5.2 |
+| 顶栏页面导航行三项（对讲台 / 指标 / 设置），其余入口从落地页进 | `frontend/src/components/layout/TopBar.svelte`、`frontend/src/router.svelte.ts` | 决策 198（修订 169） |
+| 设置落地页按用途两分（谁能进来 / 怎么跑），各项仍是独立路由 | `frontend/src/routes/SettingsLanding.svelte` | 决策 198 |
+| 「手机访问」入口只在本机（来源回环）渲染，非本机不给入口 | `frontend/src/lib/localPage.ts`、`frontend/src/routes/SettingsLanding.svelte` | 决策 190（位子由 198 挪到落地页，行为不变） |
+| 阶段配置独立成页，从「模型与密钥」页搬出 | `frontend/src/routes/SettingsStages.svelte`、`frontend/src/components/settings/StageConfigForm.svelte` | 决策 198 / 111 / 170 |
+| 不支持的 provider 行降级灰显 + 琥珀标（**标里不带内部编号**） | `frontend/src/routes/SettingsProviders.svelte:297` | 决策 103；决策 199（编号退到 `title`） |
+| 状态过滤槽 = 图标 + 词（词取 `FILTER_LABELS`），窄屏只给当前项带词 | `frontend/src/components/layout/TopBar.svelte`、`frontend/src/stores/board.svelte.ts` | 决策 201 |
+| pending 数的唯一显示位是「待处理 N」芯片（槽位不再重复这个数） | `frontend/src/components/layout/TopBar.svelte`、`frontend/src/components/layout/StatusLine.svelte` | 决策 92 / 201 |
+| 正文不出现内部决策编号（机器门扫面向用户的文案） | `frontend/src/lib/copy-discipline.test.ts` | 决策 199 |
+| 对比度门：`--text-3` ≥ 4.5:1（次级必读）；`--text-4` 豁免且不得承载必读信息 | `frontend/src/theme/contrast.ts`、`frontend/src/theme/contract.ts` | 决策 195 |
+| token 值与全局样式表互为镜像，逐值双向比对，禁裸十六进制颜色 | `frontend/src/theme/css-parity.test.ts`、`frontend/src/app.css` | 决策 169 |
+| 三个模态框：Escape 一律可关、焦点进第一个输入框并关在框内、对话框可被播报 | `frontend/src/components/ui/Modal.svelte`、`frontend/src/components/board/NewTaskDialog.svelte`、`frontend/src/components/task/SplitDialog.svelte`、`frontend/src/components/task/ModelOverrideDialog.svelte` | 决策 169 的交互骨架；票 02 |
+| 404 页给一条回看板的路（不留无路可走的死地址） | `frontend/src/App.svelte` | 决策 79 的 v1 范围；票 03 |
+| 删除被拒时才说下一步，不再常驻红字 | `frontend/src/routes/SettingsProjects.svelte` | 决策 105；票 04 |
+| 依赖任务 ID 用原生 `datalist`（不做完整选择器） | `frontend/src/components/board/NewTaskDialog.svelte` | 决策 79；票 05 |
+| 任务级指标入口：`#/metrics?task=<id>` 从任务详情进入，不要求手打 ULID | `frontend/src/routes/Metrics.svelte`、`frontend/src/routes/TaskDetail.svelte`、`frontend/src/lib/metrics.ts` | 决策 130 / 137；票 06 |
+| 项目分析入口 `#/settings/projects?project=<id>&analyze=1` | `frontend/src/routes/SettingsProjects.svelte`、`frontend/src/lib/analysis.ts` | 决策 78；票 07 |
+| 空态 = 状态 → 下一步 → 可选入口；提到另一个页面必须可点 | `frontend/src/components/ui/EmptyState.svelte` | 票 13 |
+| pending dossier 不重复渲染 diff；动作行保留（多处 e2e 依赖它） | `frontend/src/routes/TaskDetail.svelte`、`frontend/src/components/task/DiffReviewPanel.svelte` | 决策 23（无「拒绝」）；票 08 |
+| 输入法护栏：回车提交要挡「用回车确认候选词」的那一次 | `frontend/src/lib/enterToSend.ts` | 决策 184 |
+| 工头（值班长）只说话不动手，回复里永远没有按钮 | `frontend/src/routes/Talk.svelte`、`frontend/src/components/task/PendingDossier.svelte` | 决策 176 / 182 |
+| 对讲台急停轮折叠：两张以上一张都不展开；窄屏改「摘要条 + 输入坞」 | `frontend/src/lib/talkStops.ts`、`frontend/src/routes/Talk.svelte` | 决策 183 / 192 |
+| 技能市场：仓名单保存即生效；装前预览三项（去向 / 模式与信任态 / 特征扫描） | `frontend/src/routes/SettingsMarket.svelte`、`frontend/src/components/settings/StageRecommendations.svelte` | 决策 187 / 194 / 181 |
+| 未受信任的技能不得以全文模式保存（界面上就地改写信任态） | `frontend/src/components/settings/SkillDeclList.svelte`、`frontend/src/lib/stageConfigs.ts` | 决策 172 / 181 |
+| 「手机访问」取不到配对令牌就不画二维码 | `frontend/src/routes/Share.svelte`、`frontend/src/lib/sharePairing.ts` | 决策 189 |
+| 绑定开关只由回环来源发起；界面说出「这次绑定是谁定的」 | `frontend/src/routes/Share.svelte`、`frontend/src/lib/lanToggle.ts` | 决策 186 |
+| 通知策略：toast 只对 pending / done / failed 弹，同类 5 分钟 cooldown，22–8 免打扰 | `frontend/src/lib/notificationPolicy.ts` | 决策 65 |
+| 实时：逐任务开 SSE 流 + 10s 对齐 tick 兜底 refetch | `frontend/src/realtime/connection.ts`、`frontend/src/stores/board.svelte.ts` | 决策 76 |
+| 主题切换（夜班靛 / 掌机背光）并入底部状态行 | `frontend/src/components/layout/StatusLine.svelte` | 决策 169 |

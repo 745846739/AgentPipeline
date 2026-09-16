@@ -1,0 +1,240 @@
+import { fireEvent, render, screen, within } from '@testing-library/svelte';
+import { afterEach, beforeAll, describe, expect, it, vi } from 'vitest';
+import type { AllowedAction, BranchCursor, Task } from '../api/types';
+import { parseUnifiedDiff, type ParsedDiff } from '../lib/diff';
+import { emptyTaskDetailState } from '../realtime/reduce';
+import TaskDetail from './TaskDetail.svelte';
+
+/**
+ * 任务详情页接线层（票 08 / 06 / 07 / 13）。
+ *
+ * 这一层测的是**组件之间的接线**，不是子组件自身的渲染：
+ * - 票 08：档案盒不再和 Diff 页签重复渲染同一份 diff，但动作行（合入 / 返回修改）始终在。
+ *   子组件各自的内部行为由其自己的测试与 e2e 兜住；这里钉的是「什么时候把 `diffInPane`
+ *   递下去」——这正是「用户不切页签就拍不了板」与「同屏两份 diff」两种坏法的分界。
+ * - 票 06 / 07：任务级入口的地址形状是跨流接口契约，参数名逐字（写错对面就不就位）。
+ * - 票 13：打不到任务的空态必须给一条**可点**的回去的路。
+ *
+ * 断言只落在可访问性契约上（heading / link / button 的可读名与其容器），不落 class 名。
+ * 文案不做精确匹配（票 25 是文案改动，按先例：证据不是门）。
+ */
+
+const mocks = vi.hoisted(() => ({
+  detail: {
+    state: undefined as unknown,
+    loading: false,
+    error: null,
+    actionError: null,
+    busyKey: null,
+    diff: null as ParsedDiff | null,
+    diffRaw: null as string | null,
+    diffError: null,
+    diffStale: false,
+    files: {},
+    conversationsFull: {},
+    conversationsLoading: false,
+    load: vi.fn(async () => undefined),
+    loadDiff: vi.fn(),
+    loadFile: vi.fn(),
+    loadConversation: vi.fn(),
+    loadCommandOutput: vi.fn(),
+    outputFor: vi.fn(() => null),
+    getFile: vi.fn(() => undefined),
+    runAllowedAction: vi.fn(async () => undefined),
+    submitReview: vi.fn(async () => undefined),
+    submitSplit: vi.fn(async () => undefined),
+    submitModelOverride: vi.fn(async () => undefined),
+  },
+}));
+
+vi.mock('../stores/taskDetail.svelte', () => ({ taskDetail: mocks.detail }));
+vi.mock('../api/client', () => ({
+  listProviders: vi.fn(async () => []),
+  retryTask: vi.fn(async () => undefined),
+  archiveTask: vi.fn(async () => undefined),
+}));
+
+const DIFF_RAW = [
+  'diff --git a/src/lib.js b/src/lib.js',
+  '--- a/src/lib.js',
+  '+++ b/src/lib.js',
+  '@@ -1,1 +1,1 @@',
+  '-function add(a, b) { return 0; }',
+  '+function add(a, b) { return a + b; }',
+  '',
+].join('\n');
+
+/** 停在合并提案上的任务（`merge_approval`：右栏档案盒 + Diff 页签并存的那一态）。 */
+function pendingTask(): Task {
+  return {
+    id: 'task-1',
+    project_id: 'proj-9',
+    title: '合入前等人的任务',
+    description: '',
+    status: 'pending',
+    current_stage: 'merge',
+    current_node: 'execute',
+    validate_attempts: 0,
+    pending_reason: {
+      type: 'merge_approval',
+      stage: 'merge',
+      node: 'execute',
+      message: '合并提案已生成，等你拍板。',
+    },
+    worktree_path: null,
+    branch_name: 'kanban/task-1',
+    total_tokens: 1234,
+    total_calls: 7,
+    review_mode: 'agent',
+    model_override: null,
+    archived_at: null,
+    stalled: false,
+    executor_owner: null,
+    created_at: '2026-09-16T00:00:00Z',
+    updated_at: '2026-09-16T00:10:00Z',
+  };
+}
+
+const CURSOR: BranchCursor = {
+  cursor_id: 'c-merge',
+  branch: 'main',
+  stage: 'merge',
+  node: 'execute',
+  status: 'pending',
+  validate_attempts: 0,
+  skipped_to_join: false,
+  pending_reason: pendingTask().pending_reason,
+};
+
+const MERGE_ACTIONS: AllowedAction[] = [
+  { action: 'approve', kind: 'side_effect', label: '合入', cursor_id: 'c-merge' },
+  { action: 'return', kind: 'side_effect', label: '返回修改', cursor_id: 'c-merge' },
+];
+
+/** 把 store 摆到「合入前等人」那一态。 */
+function armPendingMerge(): void {
+  mocks.detail.state = emptyTaskDetailState({
+    task: pendingTask(),
+    cursors: [CURSOR],
+    allowedActions: MERGE_ACTIONS,
+    pendingReason: pendingTask().pending_reason,
+  });
+  mocks.detail.diff = parseUnifiedDiff(DIFF_RAW);
+  mocks.detail.diffRaw = DIFF_RAW;
+  mocks.detail.loading = false;
+}
+
+const dossier = () => screen.getByRole('complementary', { name: '待办' });
+/** diff 正文里的文件块标题（DiffView 的每个文件一个 h4）——用户看见的「一份 diff」。 */
+const diffHeadings = (scope: HTMLElement | Document = document) =>
+  within(scope as HTMLElement).queryAllByRole('heading', { level: 4, name: /lib\.js/ });
+
+beforeAll(() => {
+  // jsdom 不实现 matchMedia；详情页用它判断移动款（<480px），这里一律桌面档。
+  if (typeof window.matchMedia !== 'function') {
+    window.matchMedia = ((query: string) => ({
+      matches: false,
+      media: query,
+      onchange: null,
+      addEventListener: () => undefined,
+      removeEventListener: () => undefined,
+      addListener: () => undefined,
+      removeListener: () => undefined,
+      dispatchEvent: () => false,
+    })) as unknown as typeof window.matchMedia;
+  }
+});
+
+afterEach(() => {
+  vi.clearAllMocks();
+  document.body.innerHTML = '';
+});
+
+describe('任务详情 · 档案盒与 Diff 页签不同时摆两份 diff（票 08）', () => {
+  it('停在 Diff 页签：屏上只有一份 diff，右栏动作行仍在（合入 / 返回修改）', async () => {
+    armPendingMerge();
+    render(TaskDetail, { props: { id: 'task-1' } });
+
+    await fireEvent.click(screen.getByRole('button', { name: 'Diff' }));
+
+    // 屏上只有一份 diff 正文：那一份在主区
+    expect(diffHeadings()).toHaveLength(1);
+    expect(diffHeadings(dossier())).toHaveLength(0);
+
+    // 动作行是红线：右栏始终能拍板，不必先切页签回去
+    expect(within(dossier()).getByRole('button', { name: '合入' })).toBeTruthy();
+    expect(within(dossier()).getByRole('button', { name: '返回修改' })).toBeTruthy();
+  });
+
+  it('不在 Diff 页签：档案盒内嵌的 diff 按原样回来（既定设计，不动）', async () => {
+    armPendingMerge();
+    render(TaskDetail, { props: { id: 'task-1' } });
+
+    // 默认落在时间线页签：主区是时间线，diff 只在右栏
+    expect(diffHeadings(dossier())).toHaveLength(1);
+    expect(within(dossier()).getByRole('button', { name: '合入' })).toBeTruthy();
+
+    await fireEvent.click(screen.getByRole('button', { name: 'Diff' }));
+    expect(diffHeadings(dossier())).toHaveLength(0);
+
+    await fireEvent.click(screen.getByRole('button', { name: '时间线' }));
+    expect(diffHeadings(dossier())).toHaveLength(1);
+  });
+
+  it('人工评审同理：diff 只在 Diff 页签里一份，报告与评审动作仍在右栏', async () => {
+    armPendingMerge();
+    const review = pendingTask();
+    review.pending_reason = {
+      type: 'human_review',
+      stage: 'review',
+      node: 'execute',
+      message: '这一轮等人工评审。',
+    };
+    review.current_stage = 'review';
+    mocks.detail.state = emptyTaskDetailState({
+      task: review,
+      cursors: [CURSOR],
+      allowedActions: MERGE_ACTIONS,
+      pendingReason: review.pending_reason,
+    });
+
+    render(TaskDetail, { props: { id: 'task-1' } });
+    // 时间线页签：评审面板里的 diff 在右栏（主区是时间线）
+    expect(diffHeadings(dossier())).toHaveLength(1);
+
+    await fireEvent.click(screen.getByRole('button', { name: 'Diff' }));
+    expect(diffHeadings(dossier())).toHaveLength(0);
+    expect(within(dossier()).getByRole('button', { name: '通过' })).toBeTruthy();
+  });
+});
+
+describe('任务详情 · 任务级入口（票 06 / 07）', () => {
+  it('指标入口指向该任务，参数名逐字 `task`', () => {
+    armPendingMerge();
+    render(TaskDetail, { props: { id: 'task-1' } });
+
+    const link = screen.getByRole('link', { name: /这个任务的指标/ });
+    expect(link.getAttribute('href')).toBe('#/metrics?task=task-1');
+  });
+
+  it('项目分析入口指向所属项目且带 `analyze=1`，参数名逐字', () => {
+    armPendingMerge();
+    render(TaskDetail, { props: { id: 'task-1' } });
+
+    const link = screen.getByRole('link', { name: /分析所属项目/ });
+    expect(link.getAttribute('href')).toBe('#/settings/projects?project=proj-9&analyze=1');
+  });
+});
+
+describe('任务详情 · 空态（票 13）', () => {
+  it('任务不存在时给一条可点的回看板的路', async () => {
+    mocks.detail.state = emptyTaskDetailState();
+    mocks.detail.diff = null;
+    mocks.detail.diffRaw = null;
+    mocks.detail.loading = false;
+    render(TaskDetail, { props: { id: 'nope' } });
+
+    const back = screen.getByRole('link', { name: /回看板/ });
+    expect(back.getAttribute('href')).toBe('#/');
+  });
+});

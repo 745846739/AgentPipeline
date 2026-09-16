@@ -12,6 +12,7 @@
   import SplitDialog from '../components/task/SplitDialog.svelte';
   import TimelineView from '../components/task/TimelineView.svelte';
   import DiffView from '../components/render/DiffView.svelte';
+  import EmptyState from '../components/ui/EmptyState.svelte';
   import { buildHeroStations, formatDuration, formatTokens, pendingLabel, statusCode } from '../lib/pipeline';
   import { taskDetail } from '../stores/taskDetail.svelte';
 
@@ -66,6 +67,17 @@
       pendingType === 'human_review' ||
       task?.current_stage === 'merge' ||
       task?.current_stage === 'done',
+  );
+
+  /**
+   * 任务级入口的地址形状是 brief §二 末尾那张跨流接口表的**契约**（票 06 / 07），逐字照抄：
+   * 指标页据 `query.task` 自动载入并高亮（消费方 Me）、项目页据 `query.project` + `analyze=1`
+   * 自动就位并触发分析（消费方 S）。参数名不是自由发挥——写错一个字母，对面那页就不就位。
+   * 放在 `$derived` 里而不是模板里拼：`&` 在模板属性里要走实体，容易写成一个字面 `&amp;`。
+   */
+  const metricsHref = $derived(task ? `#/metrics?task=${task.id}` : '');
+  const analyzeHref = $derived(
+    task ? `#/settings/projects?project=${task.project_id}&analyze=1` : '',
   );
 
   let mobileMq: MediaQueryList | null = null;
@@ -244,17 +256,28 @@
         </div>
       {/if}
 
+      <!-- 任务级入口（票 06 / 07）：从任务就能到「这个任务的指标」与「所属项目的分析」，
+           不必手打 ULID、也不必先去设置里找项目。提到别的页面就给 **可点的入口**（票 13 §三.3）。
+           两处都是 `?k=v` 深链，目标页据 query 自动就位——入口只是把地址递过去，不做预判。 -->
+      <div class="entries">
+        <a class="entry" href={metricsHref}>这个任务的指标 ▸</a>
+        {#if task.project_id}
+          <a class="entry" href={analyzeHref}>分析所属项目 ▸</a>
+        {/if}
+      </div>
       <div class="hero-rail">
         <PipelineRail variant={isMobile ? 'vrail' : 'hero'} stations={heroStations} />
       </div>
       {#if !isMobile}
-        <!-- 图例：灯即状态（不使用 ✓ ● ○ 字符；与 hero 同一套信号灯图元） -->
+        <!-- 图例：灯即状态（不使用 ✓ ● ○ 字符；与 hero 同一套信号灯图元）。
+             `急停` 是车间隐喻词在**本页**的首次出现处 → 给一次平实说法（决策 200 的定稿说法，
+             逐字照抄；行内全宽括号、同字号同色档，本页不再重复解释）。 -->
         <div class="legend">
           <span class="lbl">灯</span>
           <i class="sw d"></i><span class="lg">已完成</span>
           <i class="sw c"></i><span class="lg">执行中</span>
           <i class="sw idle"></i><span class="lg">未开始</span>
-          <i class="sw w"></i><span class="lg">急停</span>
+          <i class="sw w"></i><span class="lg">急停（等你拍板的阻塞）</span>
           <i class="sw x"></i><span class="lg">失败</span>
           <span class="lg dash">↩ 已打回</span>
         </div>
@@ -330,11 +353,19 @@
     {:else if taskDetail.loading}
       <div class="hint">正在加载任务…</div>
     {:else}
-      <div class="hint">任务不存在：{id}</div>
+      <!-- 打不到任务也是一种空态（票 13）：状态 → 下一步 → 可选入口，入口必须可点。 -->
+      <EmptyState
+        state={`任务不存在：${id}`}
+        next="这个 id 没有对应的任务。它可能已经被删掉，或者地址抄漏了一位。"
+        href="#/"
+        linkLabel="回看板"
+      />
     {/if}
   </div>
 
   {#if task && isPending && pendingReason}
+    <!-- 票 08：把「用户此刻在哪个页签」告诉档案盒——停在 Diff 页签时右栏不再摆第二份 diff
+         （动作行照旧在，那是红线）。不在 Diff 页签时它照旧内嵌 diff，行为一字未动。 -->
     <PendingDossier
       dock={isMobile}
       ondockheight={handleDockHeight}
@@ -350,6 +381,7 @@
       diffStale={taskDetail.diffStale}
       diffError={taskDetail.diffError}
       diffLoading={taskDetail.diffError === null && taskDetail.diff === null && pendingType === 'merge_approval'}
+      diffInPane={tab === 'diff'}
       onreloaddiff={() => void taskDetail.loadDiff(pendingType === 'human_review' ? 'review-diff.diff' : 'merge-proposal.diff')}
       reviewReport={taskDetail.getFile('review-report.md')?.content ?? null}
       unitTestReport={taskDetail.getFile('test-report.md')?.content ?? null}
@@ -452,17 +484,36 @@
     display: flex;
     gap: 8px;
   }
+  .entries {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 8px 16px;
+    margin-top: 8px;
+  }
+  /* 任务级入口 = 空态那套「可选入口」的同一副面孔（--text-hi + 2px 底缘，票 13 §三.3）：
+     同一个语义在全站长一个样，用户不必学第二遍「哪里能点」。 */
+  .entry {
+    font-size: 12px;
+    color: var(--text-hi);
+    border-bottom: 2px solid var(--pane);
+    padding-bottom: 2px;
+  }
+  .entry:hover {
+    border-bottom-color: var(--text-hi);
+    text-decoration: none;
+  }
   .hero-rail {
     margin: 18px 0 6px;
   }
-  /* 图例：灯即状态（与 hero 信号灯同尺寸/同色，不用字符记号） */
+  /* 图例：灯即状态（与 hero 信号灯同尺寸/同色，不用字符记号）。
+     档位：读不到就分不清哪盏灯是什么 → 「次级必读」（决策 195 / 票 15）。 */
   .legend {
     display: flex;
     align-items: center;
     flex-wrap: wrap;
     gap: 4px 6px;
     font-size: 12px;
-    color: var(--text-4);
+    color: var(--text-3);
     margin: 4px 0 14px;
   }
   .legend .lbl {

@@ -1,6 +1,9 @@
 import { describe, expect, it } from 'vitest';
 import type { StageMetric } from '../api/types';
 import {
+  NO_SETTLED_TASKS_REASON,
+  NO_VALIDATE_RUNS_REASON,
+  NO_VALIDATE_RUNS_TASK_REASON,
   durationBars,
   escapeBars,
   escapeTotal,
@@ -61,6 +64,22 @@ describe('指标字段映射（crates/core/src/metrics.rs 口径）', () => {
     expect(bars[1].pct).toBe(0);
   });
 
+  it('重试率的灯色随值取（票 12 / 票 01 判定：0 值中性档，有值才取告警琥珀）', () => {
+    const bars = retryBars([
+      stageMetric({ stage: 'develop', retry_rate: 0.25 }),
+      stageMetric({ stage: 'test', retry_rate: 0 }),
+    ]);
+    expect(bars).toHaveLength(2);
+    expect(bars[0].tone).toBe('caution');
+    expect(bars[1].tone).toBe('dev');
+    // 纯 0 的一整张图里一个 caution 都没有——那正是「整图恒为琥珀」这个毛病的判据
+    const zero = retryBars([
+      stageMetric({ retry_rate: 0 }),
+      stageMetric({ stage: 'test', retry_rate: 0 }),
+    ]);
+    expect(zero.map((b) => b.tone)).not.toContain('caution');
+  });
+
   it('逃逸事件按 from_stage 归一，null 阶段丢弃', () => {
     const events: Array<[string | null, number]> = [
       ['develop', 3],
@@ -75,8 +94,9 @@ describe('指标字段映射（crates/core/src/metrics.rs 口径）', () => {
     expect(escapeTotal(events)).toBe(4);
   });
 
-  it('成功率 null → — 且条长为 0；正常值按比率', () => {
-    expect(successBar(null)[0]).toMatchObject({ display: '—', pct: 0 });
+  it('成功率分母为 0（null）时不画条，交页面用一句解释说明为什么没有意义（票 27）', () => {
+    expect(successBar(null)).toEqual([]);
+    expect(successBar(undefined)).toEqual([]);
     expect(successBar(0.75)[0]).toMatchObject({ display: '75.0%', pct: 0.75 });
     expect(formatPercent(undefined)).toBe('—');
   });
@@ -103,12 +123,38 @@ describe('mapGlobalMetrics', () => {
     expect(view.duration.map((b) => b.label)).toEqual(['develop']);
     expect(view.retry).toHaveLength(1);
     expect(view.escape).toHaveLength(1);
-    expect(view.firstPassAvailable).toBe(false);
+    // 「首过率现在有没有意义」读 `firstPassReason`（空串 = 有意义），不另设布尔
+    expect(view.firstPassReason).not.toBe('');
     expect(view.firstPass).toEqual([]);
     expect(view.excludedStages).toEqual(['sync-check']);
     expect(view.escapeEvents).toBe(2);
     expect(view.tokenDisplay).toBe('0');
     expect(view.callsDisplay).toBe('0');
+  });
+
+  it('分母为 0 的比值带上一句解释（票 27）：有值时没有解释，没值时解释非空', () => {
+    const unavailable = mapGlobalMetrics({
+      tasks: 3,
+      success_rate: null,
+      stage_aggregation: [],
+      escape_events: [],
+      validate_first_pass_rate: null,
+    });
+    expect(unavailable.success).toEqual([]);
+    expect(unavailable.successReason).toBe(NO_SETTLED_TASKS_REASON);
+    expect(unavailable.firstPass).toEqual([]);
+    expect(unavailable.firstPassReason).toBe(NO_VALIDATE_RUNS_REASON);
+
+    const available = mapGlobalMetrics({
+      tasks: 3,
+      success_rate: 0.5,
+      stage_aggregation: [stageMetric()],
+      escape_events: [],
+      validate_first_pass_rate: 1,
+    });
+    expect(available.success).toHaveLength(1);
+    expect(available.successReason).toBe('');
+    expect(available.firstPassReason).toBe('');
   });
 
   it('后端下发首过率与全局 token / 调用数时直接展示（ticket 22 全局面板）', () => {
@@ -121,7 +167,7 @@ describe('mapGlobalMetrics', () => {
       total_tokens: 12345,
       total_calls: 42,
     });
-    expect(view.firstPassAvailable).toBe(true);
+    expect(view.firstPassReason).toBe('');
     expect(view.firstPass[0].display).toBe('50.0%');
     expect(view.tokenDisplay).toBe('12,345');
     expect(view.callsDisplay).toBe('42');
@@ -145,5 +191,18 @@ describe('mapTaskMetrics', () => {
     expect(view.storedTokenDisplay).toBe('175');
     expect(view.tokenDrift).toBe(true);
     expect(view.callsDrift).toBe(false);
+  });
+
+  it('任务没做过质量检查时首过率不画条（票 27：页面用一句解释顶上）', () => {
+    const view = mapTaskMetrics({
+      total_tokens: 0,
+      total_calls: 0,
+      stored_total_tokens: 0,
+      stored_total_calls: 0,
+      stages: [],
+      validate_first_pass_rate: null,
+    });
+    expect(view.firstPass).toEqual([]);
+    expect(NO_VALIDATE_RUNS_TASK_REASON.length).toBeGreaterThan(0);
   });
 });

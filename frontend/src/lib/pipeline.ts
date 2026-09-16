@@ -1,5 +1,5 @@
 import type { BranchCursor, Stage, TaskStatus } from '../api/types';
-import { STATE_STYLES, type CrateState, type SpriteName } from '../theme/contract';
+import { GEOMETRY, STATE_STYLES, type CrateState, type SpriteName } from '../theme/contract';
 
 /**
  * 流水线静态拓扑（决策 107：sync-check 全站不展示）。
@@ -304,18 +304,22 @@ interface Geometry {
 
 /**
  * 脊线站点坐标：列宽 264px、列间共享 1px 框线，站点落在列中心
- * （列 i 中心 = 132 + 264i；并行区间是一个列两个侧站，共用 x = 660）。
+ * （列 i 中心 = columnWidth/2 + columnWidth × i；并行区间是一个列两个侧站，共用同一列 x）。
+ *
+ * x 一律由契约列宽推导（决策 196 裁决 ⑥ 的推荐做法）——**不重抄 264 / 132**，
+ * 于是「改列宽忘了改坐标」这种静默错位在源码层面就不可能发生；y 与列宽无关，照旧写字面值。
+ * 这条关系与链节带的列宽整数关系由 `pipeline.geometry.test.ts` 逐值守护。
  */
 const SPINE_GEOM: Record<string, Geometry> = {
-  init: { x: 132, y: 62 },
-  'architect-design': { x: 396, y: 62 },
-  'develop-design': { x: 660, y: 22 },
-  'test-design': { x: 660, y: 50 },
-  develop: { x: 924, y: 62 },
-  review: { x: 1188, y: 62 },
-  test: { x: 1452, y: 62 },
-  merge: { x: 1716, y: 62 },
-  done: { x: 1980, y: 62 },
+  init: { x: spineColumnX(0), y: 62 },
+  'architect-design': { x: spineColumnX(1), y: 62 },
+  'develop-design': { x: spineColumnX(2), y: 22 },
+  'test-design': { x: spineColumnX(2), y: 50 },
+  develop: { x: spineColumnX(3), y: 62 },
+  review: { x: spineColumnX(4), y: 62 },
+  test: { x: spineColumnX(5), y: 62 },
+  merge: { x: spineColumnX(6), y: 62 },
+  done: { x: spineColumnX(7), y: 62 },
 };
 
 /**
@@ -351,6 +355,111 @@ export const RAIL_LABELS: Record<string, string> = {
 
 export function railGeometry(variant: 'spine' | 'hero'): Record<string, Geometry> {
   return variant === 'hero' ? HERO_GEOM : SPINE_GEOM;
+}
+
+/* ───────────────── 看板溢出：两段与脊线几何（决策 196） ───────────────── */
+
+/**
+ * 钉在右侧的列数（`merge` / `done`，决策 196）。
+ *
+ * 钉住区宽 = `columnWidth × 本值`（列是 264px 边框盒，两列正好 528px），
+ * 钉缝是钉住区左缘的 2px `--pane` 竖线——即下面 `pinned` 段的 `base` 处。
+ */
+export const PINNED_COLUMN_COUNT = 2;
+
+/** 看板横滚内容里的一段：`base` 是起始列（整条看板口径），`span` 是列数。 */
+export interface SpineSegment {
+  base: number;
+  span: number;
+}
+
+/** 看板的两段：可横滚的六列 + 钉在右侧的两列。列数从 `BOARD_COLUMNS` 推导，不重抄。 */
+export function boardSegments(): { scroll: SpineSegment; pinned: SpineSegment } {
+  const base = BOARD_COLUMNS.length - PINNED_COLUMN_COUNT;
+  return { scroll: { base: 0, span: base }, pinned: { base, span: PINNED_COLUMN_COUNT } };
+}
+
+/**
+ * 列 i 的站心 x（**段内** i 从 0 计）：`columnWidth/2 + columnWidth × i`。
+ *
+ * 这是决策 196 定的口径：两段各自从 0 计，故脊线与列在同一把刀下断开而不错位。
+ */
+export function spineColumnX(i: number): number {
+  return GEOMETRY.columnWidth / 2 + GEOMETRY.columnWidth * i;
+}
+
+/**
+ * 由站心 x 反查它落在第几列。
+ *
+ * 成立的前提是脊线坐标与列宽同源（`SPINE_GEOM` 逐列满足 `132 + 264i`），
+ * 这条关系由 `pipeline.geometry.test.ts` 守护——不是本函数自己保证的。
+ */
+export function spineColumnIndex(x: number): number {
+  return Math.round((x - GEOMETRY.columnWidth / 2) / GEOMETRY.columnWidth);
+}
+
+/** 链节带 / 回流带的静态布局，**以「列」为单位**（px 一律由契约列宽推导，不重抄 264）。 */
+interface SpineBeltSpec {
+  /** 起点列（0 = 第 1 列站心）。 */
+  col: number;
+  /** 跨列数（1 = 相邻两列站心之间）。 */
+  cols: number;
+  /** 带顶 px（纵向，与列宽无关）。 */
+  top: number;
+  kind: 'main' | 'br' | 'vt' | 'ret';
+}
+
+const SPINE_BELTS: readonly SpineBeltSpec[] = [
+  { col: 0, cols: 7, top: 36, kind: 'main' }, // 主链节带：init 站心 → done 站心（按段切开）
+  { col: 1, cols: 2, top: 22, kind: 'br' }, // 并行上带
+  { col: 1, cols: 2, top: 50, kind: 'br' }, // 并行下带
+  { col: 1, cols: 0, top: 22, kind: 'vt' }, // 并行双带与主带的纵向接头
+  { col: 3, cols: 0, top: 22, kind: 'vt' },
+  { col: 1, cols: 1, top: 76, kind: 'ret' }, // 回流带（打回路径，虚线）
+  { col: 3, cols: 1, top: 88, kind: 'ret' },
+  { col: 5, cols: 1, top: 76, kind: 'ret' },
+  { col: 3, cols: 3, top: 100, kind: 'ret' },
+];
+
+/** 段内一条带的 px 几何。 */
+export interface SpineBelt {
+  key: string;
+  kind: 'main' | 'br' | 'vt' | 'ret';
+  /** 段内坐标，可为负（段起点之后的带被宿主裁掉，见 {@link spineBelts}）。 */
+  left: number;
+  /** `vt`（纵向接头）的宽度由 CSS 定 6px，此处恒为 0。 */
+  width: number;
+  top: number;
+}
+
+/**
+ * 段内的链节带几何（决策 196「同一把刀切列与脊线」）。
+ *
+ * 带只有**一套**（整条看板的列坐标，即冻结原型的静态几何），两段各自把它**平移**到本段起点：
+ * 段内 `left` = 静态 `left` − `columnWidth × base`（可为负）。段外那截由宿主的
+ * `overflow: hidden` 裁掉——于是两段拼起来在钉缝处严丝合缝，脊线与列断在同一条 x 上。
+ */
+export function spineBelts(seg: SpineSegment): SpineBelt[] {
+  const c = GEOMETRY.columnWidth;
+  return SPINE_BELTS.map((b) => ({
+    // 键要能区分**同列同类的多条带**（并行的上下两条 `br` 同 col=1，只按 kind+col 会撞键，
+    // Svelte 的 `{#each ... (key)}` 会当场抛 `each_key_duplicate`）——top 在同一 col 内唯一。
+    key: `${b.kind}${b.col}@${b.top}`,
+    kind: b.kind,
+    left: spineColumnX(b.col) - c * seg.base,
+    width: b.kind === 'vt' ? 0 : c * b.cols,
+    top: b.top,
+  }));
+}
+
+/** 段内站心 x：整条看板的列 x 减去段起点（两段各自从 0 计）。 */
+export function segmentStationX(x: number, base: number): number {
+  return x - GEOMETRY.columnWidth * base;
+}
+
+/** 整条看板的脊线带几何（八列一段，用于几何守护的端点与「同一把刀」断言）。 */
+export function spineBeltsAll(): SpineBelt[] {
+  return spineBelts({ base: 0, span: BOARD_COLUMNS.length });
 }
 
 export function stationStateFromDots(dots: MiniDotState[], i: number): StationState {
@@ -494,6 +603,9 @@ export const TRIGGER_LABELS: Record<string, string> = {
   start: 'start',
 };
 
+/** 脊线数字的口径词（决策 197）：带这个词的是流量（累计到过这一站），不带词的是存量。 */
+export const SPINE_COUNT_LABEL = '累计';
+
 /** 由各任务的迷你轨状态聚合出看板脊线站点（与卡片迷你轨同源）。 */
 export function buildSpineStations(tasks: MiniRailInput[]): StationView[] {
   const allDots = tasks.map((t) => miniRailState(t));
@@ -502,6 +614,8 @@ export function buildSpineStations(tasks: MiniRailInput[]): StationView[] {
     const states = allDots
       .map((dots) => stationStateFromDots(dots, i))
       .filter((s) => s !== 'idle');
+    // 口径：**累计到过这一站**的任务数（漏斗），与列头的「此刻停在这一列」（存量）是两个量
+    // ——故脊线那个数字在框里带 `累计` 词（决策 197），列头数字不带词。
     const count = allDots.filter((dots) => dots[i] !== 'idle').length;
     const parallel = stage === 'develop-design' || stage === 'test-design';
     return {
@@ -511,6 +625,7 @@ export function buildSpineStations(tasks: MiniRailInput[]): StationView[] {
       x: geom[stage].x,
       y: geom[stage].y,
       state: combineStationStates(states),
+      // 并行两个侧站没有数字（它是两条轨道，不是一个存量）→ 整块不渲染，不把「没有」画成 0
       count: parallel ? undefined : count,
       parallel: parallel ? (stage === 'develop-design' ? 'dev' : 'test') : undefined,
     };
@@ -543,13 +658,18 @@ export function buildHeroStations(task: MiniRailInput): StationView[] {
   });
 }
 
-/** 空态文案（§5.3：不放插画，一句话）。 */export const EMPTY_HINTS: Record<ColumnKey, string> = {
-  init: '新建第一个任务，流水线会从 init 开始走。',
-  'architect-design': '任务开始后第一步会落到架构设计。',
-  design: '架构通过后，开发方案与测试场景在这里并行产出。',
-  develop: '设计汇合后进入开发实现。',
-  review: '开发完成的任务会先过评审。',
-  test: '评审通过的任务会在这里跑集成测试。',
-  merge: '测试通过的任务在这里等待合入 main。',
+/**
+ * 空列引导（§5.3：不放插画，一句话；票 13 的语汇：**状态 → 下一步**）。
+ *
+ * 与 `EmptyState` 同一口径，只是它落在 264px 宽的列体里，故不用组件、只用同一套说法。
+ */
+export const EMPTY_HINTS: Record<ColumnKey, string> = {
+  init: '这一列还没有任务。新建一个，流水线从 init 开始走。',
+  'architect-design': '还没有任务走到这里。任务过了 init 就落架构设计。',
+  design: '还没有任务进入设计。架构通过后，开发方案与测试场景在这里并行产出。',
+  develop: '还没有任务开始开发。设计汇合后进入这里实现。',
+  review: '还没有任务等评审。开发完成的任务会先过评审。',
+  test: '还没有任务在跑测试。评审通过的任务会落在这里。',
+  merge: '还没有任务等合入。测试通过的任务在这里等待合入 main。',
   done: '还没有任务走到终点。跑完一个任务它会出现。',
 };

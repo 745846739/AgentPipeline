@@ -178,7 +178,7 @@
       <input type="checkbox" bind:checked={draft.resume_continuation} />
       <span>
         续接上一轮对话（resume_continuation）：pending → resume 重入时读回上一 attempt 的
-        messages。默认关闭——每次尝试干净对话（决策 33 / 180）。
+        messages。默认关闭——每次尝试干净对话。
       </span>
     </label>
 
@@ -215,6 +215,8 @@
     color: var(--text-hi);
     margin-bottom: 10px;
   }
+  /* 票 12 逐处判定：**保留琥珀**——这一块是「保存会清空留空字段」的后果警告，
+     读不到就会按错的方式保存（有东西要你处理），正是琥珀该在的地方。 */
   .replace-note {
     font-size: 12px;
     color: var(--pending);
@@ -270,6 +272,7 @@
     line-height: 1.6;
     margin-bottom: 6px;
   }
+  /* 票 12 逐处判定：**保留琥珀**——节点级 JSON 解析失败，用户得回去改那段文本。 */
   .nodes-warn {
     color: var(--pending);
   }

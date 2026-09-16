@@ -1,6 +1,15 @@
 <script lang="ts">
-  import type { MiniDotState, StationView } from '../../lib/pipeline';
-  import { RAIL_LABELS, railTokens, tokenLitsSegment } from '../../lib/pipeline';
+  import type { MiniDotState, SpineSegment, StationView } from '../../lib/pipeline';
+  import {
+    RAIL_LABELS,
+    SPINE_COUNT_LABEL,
+    railTokens,
+    segmentStationX,
+    spineBelts,
+    spineColumnIndex,
+    tokenLitsSegment,
+  } from '../../lib/pipeline';
+  import { GEOMETRY } from '../../theme/contract';
   import Worker from './Worker.svelte';
 
   /**
@@ -15,11 +24,42 @@
     /** mini：9 刻度状态。 */
     dots?: MiniDotState[];
     ariaLabel?: string;
+    /**
+     * spine 段（决策 196）：本段在看板列坐标里的起点与列数，缺省 = 整条看板。
+     *
+     * 看板把脊线切成两段（可横滚段 + 钉右段），两段各自从 0 计站心 x——
+     * 与列的切法同源，脊线才不会和列错位。
+     */
+    segment?: SpineSegment;
+    /** 左侧留白 px：与所在容器的内缩对齐（可横滚段 16px、钉右段 0）。 */
+    lead?: number;
   }
 
-  let { variant, stations = [], dots = [], ariaLabel = '流水线轨道' }: Props = $props();
+  let {
+    variant,
+    stations = [],
+    dots = [],
+    ariaLabel = '流水线轨道',
+    segment = { base: 0, span: GEOMETRY.columnCount },
+    lead = 16,
+  }: Props = $props();
 
   const tokens = $derived(railTokens(dots));
+
+  /** spine 段内的链节带几何（px 由契约列宽推导）；hero 不用（它逐字对齐冻结原型）。 */
+  const belts = $derived(spineBelts(segment));
+
+  /** 本段的站点：按列归段，站心 x 减去段起点（段内从 0 计）。 */
+  const shown = $derived(
+    variant === 'spine'
+      ? stations
+          .filter((s) => {
+            const col = spineColumnIndex(s.x);
+            return col >= segment.base && col < segment.base + segment.span;
+          })
+          .map((s) => ({ ...s, x: segmentStationX(s.x, segment.base) }))
+      : stations,
+  );
 
   /** 有工位在跑（hero）：链节离散步进 + 当前灯心跳微光（票 06）。 */
   const running = $derived(stations.some((s) => s.state === 'go' || s.state === 'dev' || s.state === 'test'));
@@ -147,20 +187,29 @@
     {/each}
   </ul>
 {:else}
-  <div class="rail {variant}" role="img" aria-label={ariaLabel}>
+  <div
+    class="rail {variant}"
+    role="img"
+    aria-label={ariaLabel}
+    style={variant === 'spine' ? `padding-left:${lead}px` : undefined}
+  >
     <div class="railline" class:run={variant === 'hero' && running}>
       {#if variant === 'spine'}
-        <!-- 主链节带 + 并行双带（在 develop 前合流） -->
-        <div class="belt" style="left:132px;width:1848px;top:36px"></div>
-        <div class="belt br" style="left:396px;width:528px;top:22px"></div>
-        <div class="belt br" style="left:396px;width:528px;top:50px"></div>
-        <div class="belt vt" style="left:396px;top:22px"></div>
-        <div class="belt vt" style="left:924px;top:22px"></div>
-        <!-- 回流带（打回路径，虚线） -->
-        <div class="ret" style="left:396px;width:264px;top:76px"><i>↩</i></div>
-        <div class="ret" style="left:924px;width:264px;top:88px"><i>↩</i></div>
-        <div class="ret" style="left:1452px;width:264px;top:76px"><i>↩</i></div>
-        <div class="ret" style="left:924px;width:792px;top:100px"><i>↩</i></div>
+        <!-- 主链节带 + 并行双带 + 回流带：一套静态几何（冻结原型那套），按**段**平移
+             （决策 196「同一把刀切列与脊线」）；段外那截由 .rail.spine 的 overflow 裁掉，
+             段内站心 x 也从 0 计——脊线与列因此断在同一条 x 上 -->
+        {#each belts as b (b.key)}
+          {#if b.kind === 'ret'}
+            <div class="ret" style="left:{b.left}px;width:{b.width}px;top:{b.top}px"><i>↩</i></div>
+          {:else if b.kind === 'vt'}
+            <div class="belt vt" style="left:{b.left}px;top:{b.top}px"></div>
+          {:else}
+            <div
+              class="belt {b.kind === 'br' ? 'br' : ''}"
+              style="left:{b.left}px;width:{b.width}px;top:{b.top}px"
+            ></div>
+          {/if}
+        {/each}
       {:else}
         <!-- hero：与冻结原型 #v-run .hrail 逐行对齐——主站灯在顶行，主带 y=76，
              并行双带 y=62/90（twin belts），回流带 116/132/148 -->
@@ -176,7 +225,7 @@
         <div class="ret" style="left:374px;width:318px;top:148px"><i>↩</i></div>
       {/if}
 
-      {#each stations as s (s.key)}
+      {#each shown as s (s.key)}
         {#if s.parallel}
           <div class="stn side {s.parallel === 'dev' ? 'up' : 'dn'}" style="left:{s.x}px;top:{s.y}px">
             <i class="lamp {lampClass(s.state)}"></i>
@@ -186,7 +235,12 @@
           <div class="stn" class:cur={s.state === 'go'} style="left:{s.x}px">
             <i class="lamp {lampClass(s.state)}"></i>
             <span class={lbClass(s.state)}>{s.label}</span>
-            {#if s.count !== undefined}<span class="ct">{s.count}</span>{/if}
+            {#if s.count !== undefined}
+              <!-- 口径标注（决策 197）：框里带 `累计` 词的必是流量，不带词的必是存量 -->
+              <span class="ct" class:pen={s.state === 'warn'} title="累计到过这一站"
+                ><span class="cum">{SPINE_COUNT_LABEL}&nbsp;</span><span class="n">{s.count}</span></span
+              >
+            {/if}
           </div>
         {/if}
       {/each}
@@ -273,10 +327,15 @@
     }
   }
   .rail.spine {
-    width: 2144px;
+    /* 宽度随所在段（看板把它切成「可横滚段 + 钉右段」两块），站心 x 由段内列号推导 */
+    width: 100%;
     height: 116px;
-    /* 与 .boardpad 的 16px 内缩对齐：站点 x=132+264i 即列中心 */
+    /* 与看板阵列的左内缩对齐（16px，两者的 16 由宿主给）：
+       站点 x = columnWidth/2 + columnWidth × j（j 在段内从 0 计）即列中心 */
     padding: 14px 0 0 16px;
+    /* 段外那截链节带 / 回流带在这里被裁掉：两段拼起来就在钉缝处严丝合缝
+       （决策 196「同一把刀切列与脊线」——脊线与列断在同一条 x 上） */
+    overflow: hidden;
   }
   .rail.hero {
     width: 100%;
@@ -407,6 +466,10 @@
     color: var(--text-3);
     border: 2px solid var(--pane);
     padding: 0 4px;
+  }
+  /* 口径词（决策 197）：与数字同色同框、同字号；完整读法 `[累计 3]`
+     （词后那个不换行空格就是读法里的空格），tabular-nums 只作用于数字本身 */
+  .stn .ct .n {
     font-variant-numeric: tabular-nums;
   }
   .stn .ct.pen {
@@ -423,6 +486,9 @@
     left: 18px;
     white-space: nowrap;
     background: var(--bg);
+    /* 遮罩要真的遮住链节（票 10）：原型 `.stn.side .lb{padding:0 4px}` 实现漏抄了，
+       少了这两条边距，标签就比原型窄 8px、链节从字的两端透出 */
+    padding: 0 4px;
     font-size: 12px;
     letter-spacing: 0.04em;
     color: var(--text-3);

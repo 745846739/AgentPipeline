@@ -32,5 +32,5 @@
   在日志中按编号顺序相邻排列。
 - **未配 `provider_id`**：写入的 `architect-design` 行只有 `node_overrides_json`，provider 走全局
   默认（`resolve_provider_id` 的第四级）。这是有意的——用户可为该阶段单独换模型时再补。
-- 用户目录 `/Users/lazyking/.agentpipeline/skills/` 尚不存在，属正常：内嵌技能开箱可用，
+- 用户目录 `~/.agentpipeline/skills/` 尚不存在，属正常：内嵌技能开箱可用，
   该目录只在用户要覆盖正文时才需要（`Home::ensure_dirs` 已负责创建）。

@@ -42,6 +42,34 @@ function hexToRgb(hex: string): string {
   return `rgb(${(n >> 16) & 255}, ${(n >> 8) & 255}, ${n & 255})`;
 }
 
+/** 把页面上的计算色（`#RRGGBB` 或 `rgb(...)`）拆成三通道。 */
+function channels(color: string): [number, number, number] {
+  if (color.startsWith('#')) {
+    const h = color.slice(1);
+    const full = h.length === 3 ? h.split('').map((c) => c + c).join('') : h;
+    const n = Number.parseInt(full, 16);
+    return [(n >> 16) & 255, (n >> 8) & 255, n & 255];
+  }
+  const m = color.match(/\d+/g) ?? ['0', '0', '0'];
+  return [Number(m[0]), Number(m[1]), Number(m[2])];
+}
+
+/** WCAG 相对亮度（0–1）。 */
+function luminance(color: string): number {
+  const lin = (v: number): number => {
+    const c = v / 255;
+    return c <= 0.03928 ? c / 12.92 : ((c + 0.055) / 1.055) ** 2.4;
+  };
+  const [r, g, b] = channels(color);
+  return 0.2126 * lin(r) + 0.7152 * lin(g) + 0.0722 * lin(b);
+}
+
+/** WCAG 对比度比（1–21）。 */
+function contrastRatio(a: string, b: string): number {
+  const [hi, lo] = [luminance(a), luminance(b)].sort((x, y) => y - x);
+  return (hi + 0.05) / (lo + 0.05);
+}
+
 const PIXEL_DARK = {
   bg: '#1B1D2C',
   pending: '#FFB545',
@@ -126,6 +154,32 @@ test.describe('前端 E2E ⑨：像素主题（决策 169）', () => {
     expectBundleHealthy(bundle);
   });
 
+  test('次级必读档达标：--text-3 在真应用上对 --bg 与 --panel 都 ≥ 4.5:1（深浅两套）', async ({ page }) => {
+    const bundle = watchBundle(page);
+    await page.goto(`${app.webBase}/#/`);
+    await settleBundle(page, bundle);
+    await expect(page.locator('article.card', { hasText: title })).toBeVisible({ timeout: 60_000 });
+
+    // 票 15 / 决策 195：--text-3 重新定位为「次级必读」，门槛对**两个承载表面**都要成立
+    // （深色款的约束面是 --panel、浅色款的约束面是 --bg）。断言的是浏览器里真正生效的
+    // 计算值——把它改回旧值（深 2.93 / 浅 3.32）这条立刻红。
+    for (const theme of ['dark', 'light'] as const) {
+      await setTheme(page, theme);
+      const text3 = await rootToken(page, '--text-3');
+      for (const surface of ['--bg', '--panel'] as const) {
+        const ratio = contrastRatio(text3, await rootToken(page, surface));
+        expect(ratio, `${theme} 款 ${text3} 对 ${surface} 实测 ${ratio.toFixed(2)}:1`).toBeGreaterThanOrEqual(4.5);
+      }
+      // 提的是 --text-3 这一档：--done（归档灰，刻意退后）原地不动，两者不再共用字面值。
+      expect(text3).not.toBe(await rootToken(page, '--done'));
+      // 次级必读档与纯装饰档是两档，值必须分得开。
+      expect(text3).not.toBe(await rootToken(page, '--text-4'));
+    }
+
+    await setTheme(page, 'dark');
+    expectBundleHealthy(bundle);
+  });
+
   test('缝合像素字体自托管生效：本地加载、非回退到系统 monospace', async ({ page }) => {
     const bundle = watchBundle(page);
     await page.goto(`${app.webBase}/#/`);
@@ -192,14 +246,21 @@ test.describe('前端 E2E ⑨：像素主题（决策 169）', () => {
     // 小人是双帧（两张 svg），帧切换为离散 opacity 翻转
     expect(await worker.locator('svg').count()).toBe(2);
 
-    // ── 顶栏过滤是 34px 道具栏槽位（图标 + 计数徽章） ──
+    // ── 顶栏过滤是 34px 道具栏槽位（图标 + 词 + 计数徽章；待处理槽不画徽章） ──
+    // 决策 201：槽位**高度**仍恒 34px、2px 描边、零圆角、共享边框；变的只是宽度不再定死——
+    // 七个槽都带 12px 词，宽随词走（`.slot` 现在是 `min-width: 34px` 的图标 + 词）。
     const slot = page.locator('.slot').first();
     await expect(slot).toBeVisible();
     const slotBox = await slot.boundingBox();
-    expect(slotBox?.width).toBe(34);
     expect(slotBox?.height).toBe(34);
+    expect(slotBox?.width).toBeGreaterThanOrEqual(34);
     expect(await slot.locator('svg.sprite').count()).toBe(1);
     expect(await slot.locator('.cb').count()).toBe(1);
+
+    // 决策 201 的计数去重：第 3 槽（待处理）**不画计数徽章**——同一个数不得在相邻的两个
+    // 控件上同时出现，而紧邻的「待处理 N」芯片是 pending 数的唯一显示位（保留原位）。
+    expect(await page.locator('.slot').nth(2).locator('.cb').count()).toBe(0);
+    await expect(page.locator('.chip.pending-count')).toBeVisible();
 
     // ── 底部车间看板条：2px 顶描边 + token 量表 + `▪` 分隔符 ──
     const statusline = page.locator('.statusline');
@@ -319,10 +380,15 @@ test.describe('前端 E2E ⑨：像素主题（决策 169）', () => {
     const after = await page.evaluate(() => window.scrollY);
     expect(after).toBeGreaterThan(before);
 
-    // 道具栏槽位不缩、横滚
+    // 道具栏槽位：高度仍恒 34px、不缩、整行横滚；窄屏（决策 201）只给**当前选中**的槽带词，
+    // 故第一个槽（缺省选中的「全部」）宽于未选中的图标槽——宽度不再定死。
     const slot = page.locator('.slot').first();
     const slotBox = await slot.boundingBox();
-    expect(slotBox?.width).toBe(34);
+    expect(slotBox?.height).toBe(34);
+    expect(slotBox?.width).toBeGreaterThanOrEqual(34);
+    const offBox = await page.locator('.slot:not(.on)').first().boundingBox();
+    expect(offBox?.width).toBeGreaterThanOrEqual(34);
+    expect(slotBox!.width).toBeGreaterThan(offBox!.width);
 
     // 触控目标 ≥44px
     const back = page.locator('section.col .col-head').first();

@@ -110,8 +110,17 @@ export const GEOMETRY = {
   worker: 16,
   /** 工头头像显示尺寸（viewBox 16×16）。 */
   foreman: 48,
-  /** 唯一媒体断点（桌面 ≥480px 行为不变）。 */
+  /** 移动款媒体断点（桌面 ≥480px 行为不变）。 */
   mobileBreakpoint: 480,
+  /**
+   * 桌面款看板**钉右档**的媒体断点（决策 196）。
+   *
+   * ≥1400px：`merge` / `done` 钉在右侧、中间六列横滚；<1400px：不钉右，
+   * 但初始滚动位置落在 `merge`。CSS 的 `@media` 不认自定义属性，所以
+   * `Board.svelte` 里是字面量 `1400px`——两者相等由
+   * `frontend/src/lib/pipeline.geometry.test.ts` 静态扫描断言（改单边即红）。
+   */
+  boardPinBreakpoint: 1400,
 } as const;
 
 /** 单枚像素图元：viewBox 为 N×N 像素网格，rect 用网格坐标。 */
@@ -320,7 +329,9 @@ export const DARK_COLORS: Readonly<Record<ColorToken, string>> = {
   '--text-hi': '#F1ECDC',
   '--text': '#C7C3B4',
   '--text-2': '#918E9F',
-  '--text-3': '#6E6C82',
+  // 次级必读档：决策 195 / §2.6 起要求对 --bg 与 --panel 都 ≥ 4.5:1（原 #6E6C82 只有
+  // 3.28 / 2.93），由票 15 提亮；门在 theme/contrast.ts。--done 刻意留在原值（§2.6 裁决四）。
+  '--text-3': '#8E8CA5',
   '--text-4': '#55536B',
   '--go': '#55D97C',
   '--go-hi': '#6FE693',
@@ -348,7 +359,8 @@ export const LIGHT_COLORS: Readonly<Record<ColorToken, string>> = {
   '--text-hi': '#14151F',
   '--text': '#2F3040',
   '--text-2': '#55566A',
-  '--text-3': '#7A7B8E',
+  // 次级必读档：浅色款的约束面是 --bg（原 #7A7B8E 只有 3.32:1），由票 15 加深。
+  '--text-3': '#636477',
   '--text-4': '#9A9BAC',
   '--go': '#1F7A3C',
   '--go-hi': '#175F2F',

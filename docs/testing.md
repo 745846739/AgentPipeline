@@ -225,8 +225,20 @@ Enter 发送、回话真的来自脚本、**回话里没有按钮**、两块名�
 （把「静默滚出」换成「主动展开」），②③ 正面钉住「内容来自后端真实读数、动作来自 `allowed_actions`（决策 101 纯渲染）」。
 
 另：`e2e/screenshots.spec.ts` 在真应用上产出 **7 路由 × 深浅 + 移动 3 视图 × 深浅** 的可重生成截图
-（`.scratch/shots/app/*.png`），**默认 skip**，需 `AGENTPIPELINE_SHOTS=1` 才跑——截图是证据不是门
+（落在 `.scratch/shots/app/*.png`；该目录**不入库**，跑一次即重新生成），**默认 skip**，需
+`AGENTPIPELINE_SHOTS=1` 才跑——截图是证据不是门
 （像素字体跨机渲染差异会引入 flaky 门，故不做字节级 golden 回放）。
+
+**UX 审计后的界面整备（2026-09-16，`.scratch/ux-audit/`，决策 195–203）：** 27 张票分 A 叠
+（纯实现修正）与 B 叠（先决策、后实现），实现见各页文件。本 effort **不新增任何可测试性接缝**，
+测试全部落在既有两条上（主题契约模块 + 前端 e2e harness），新增的机器门与既有检查同族：
+`theme/contrast.test.ts`（对比度分档门，从契约读值，决策 195）、`theme/css-parity.test.ts`（既有
+像素纪律）、`lib/copy-discipline.test.ts`（面向用户的文案里不出现内部编号，决策 199）、
+`lib/behavior-map.test.ts`（`frontend-design.md` §12.3 行为映射表的悬空引用检查，决策 199）、
+`lib/pipeline.geometry.test.ts`（脊线坐标与列宽同源，决策 196）。新增 e2e：
+`board-overflow` / `modal-keyboard` / `settings-landing` / `settings-empty-and-copy` /
+`metrics-entry` / `pending-dossier`（都进 `make check-e2e`）；审计取证用的
+`e2e/ux-audit.spec.ts` 仍**默认 skip**（`UX_AUDIT=1` 才跑，截图落 `.scratch/ux-audit/*.png`，不入库）。
 
 **主流程端到端补齐（2026-09-13，`.scratch/agentpipeline-mainflow-e2e/`）：** 详见该目录 spec 与票面。**全部 13 票 done**：01 / 02 / 03 / 04 / 05 / 06 / 07 / 08 / 09 / 10 / 11 / 12 / 13（其中 04 为 `#[ignore]` 真模型冒烟、10 为闸门扩展；08 / 11 / 12 / 13 为过程中暴露并修复的真实缺陷，09 一次暴露 3 个）。
 

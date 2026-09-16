@@ -40,10 +40,15 @@ test.describe('手机访问 · 绑定全网卡（决策 186）', () => {
     // ① 缺省（只绑回环）：不再只是一段「请去设环境变量」的文字，而是一颗钮
     const gate = page.locator('.gate');
     await expect(gate).toContainText('手机现在连不上这台机器');
-    // 决策 190：这一页是在跑服务的这台机器本机上打开的，故顶栏的「手机访问」入口**在**——
-    // 那一半（非本机来源不给这个入口）在 playwright 里造不出来，由单元层钉
-    //（`lib/localPage.test.ts` 与 `components/layout/TopBar.test.ts`）。
-    await expect(page.locator('.navbar')).toContainText('手机访问');
+    // 决策 190 / 198：这一页是在跑服务的这台机器本机上打开的，故「手机访问」**有一个入口**——
+    // 本轮（决策 198）它从顶栏的页面导航行挪进了设置落地页，顶栏只留三项。那一半（非本机来源
+    // 不给这个入口）在 playwright 里造不出来，由单元层钉（`lib/localPage.test.ts` 与
+    // `routes/SettingsLanding.test.ts`）；正反两面的真应用断言在 `settings-landing.spec.ts`。
+    await page.goto(`${app.webBase}/#/settings`);
+    await expect(page.getByRole('link', { name: /手机访问/ })).toBeVisible();
+    // 回这一页继续
+    await page.goto(`${app.webBase}/#/share`);
+    await expect(page.locator('.gate')).toContainText('手机现在连不上这台机器');
     const open = page.getByRole('button', { name: /绑定全网卡/ });
     await expect(open).toBeVisible();
     await expect(open).toBeEnabled();

@@ -42,6 +42,7 @@
   import Gauge from '../components/render/Gauge.svelte';
   import PendingActions from '../components/board/PendingActions.svelte';
   import DiffReviewPanel from '../components/task/DiffReviewPanel.svelte';
+  import EmptyState from '../components/ui/EmptyState.svelte';
   import { router } from '../router.svelte';
 
   /**
@@ -213,6 +214,9 @@
   function needsPairing(message: string): boolean {
     return message.includes('还没配对');
   }
+
+  /** 对话时间线是空的（且不是「还没读到」）：空态要居中，见 CSS 的 `.timeline.empty`。 */
+  const timelineEmpty = $derived(!(loading && !session) && turns.length === 0);
 
   async function reload(): Promise<boolean> {
     try {
@@ -458,9 +462,21 @@
   <div class="talk-head">
     <h1 class="tt">对讲台</h1>
     <div class="ts">
+      <!-- 车间隐喻的**首现平实说法**（决策 200 / design §12.2）：行内、全宽括号、紧跟词后，
+           词与译文同字号同色档。口径**按页面**、同一页面内不重复——故本页每个词只译一次。
+           `值班长` 的译文**不在这里**：这一行是页头（标题栏），而决策 200 裁决 ④ 明说
+           「按钮与标题里不翻译」；更要紧的是**版面**——430px 上这一行本来就只够一行，
+           加上「（跟我对话的 AI）」会把它挤成两行，页头因此从 38px 涨到 72px，
+           直接吃掉对话区 34px（决策 192 把对话区从 26px 救回来的那件事，不允许这样退回去，
+           `talk.spec.ts` 的窄屏几何用例会红）。译文落在本页正文里 `值班长` 首现的地方
+           ——时间线空态那句「说一句，值班长（跟我对话的 AI）就在对面」，那是第一次进这一页
+           的人真正读到这个词的地方。**名牌上的 `值班长` / `值班经理` 同样不翻译**
+           ——那是发言者称谓，保持原词。 -->
       <span>{session?.foreman.wired === false ? '值班长未接线' : '值班中'}</span>
       <span class="sep">▪</span>
-      <span class="stat-wide">夜班态势：8 工位</span>
+      <!-- `工位` 的译文只在这一行（`.stat-wide` 窄屏收起）：窄屏上这个词不再出现
+           （值班板的「8 工位」与那两行说明都收进了桌面款），故窄屏没有漏译。 -->
+      <span class="stat-wide">夜班态势：8 工位（流水线的阶段）</span>
       <span class="sep stat-wide">▪</span>
       <span>本次会话 {session ? formatTokens(session.total_tokens) : '—'} tok</span>
       <span class="sep">▪</span>
@@ -596,26 +612,41 @@
     {/each}
 
     {#if pending.length === 0}
+      <!-- 空态与其余六处同一套语汇（票 13 / parallel-brief §三.3）：状态 → 下一步 → 可选入口，
+           凡是提到另一个页面都可点。入口是页面固定的**导航入口**（纯前端路由，不进后端动作契约，
+           票 04）——`EmptyState` 的 href 就是它，不再是裸的 `<button>`。
+           `货箱` 的译文就在这一句里（本页首现处，同一页面内不重复）。 -->
       <div class="no-stop">
-        <p>
-          当前没有急停。
-          {board.projects.length === 0 ? '这台机器还没接入项目——先接一个，流水线才有货箱。' : ''}
-        </p>
-        <!-- 导航钮：页面固定，不进后端动作契约（票 04） -->
-        {#if emptyBoard}
-          <button type="button" class="btn" onclick={() => router.navigate('/')}>去看板新建任务</button>
-        {/if}
+        <EmptyState
+          state="当前没有急停（等你拍板的阻塞）。"
+          next={board.projects.length === 0
+            ? '这台机器还没接入项目——先接一个，流水线才有货箱（一张任务卡）。'
+            : '有任务需要你拍板时，它会挂在这里，动作就在那一轮里。'}
+          href={emptyBoard ? '#/' : undefined}
+          linkLabel="去看板新建任务"
+        />
       </div>
     {/if}
   </section>
 
   <!-- ── 对话时间线：值班长的话、值班经理的话、工位回执。宽屏它是那个会滚、会长的地方；
        窄屏整页去滚，它就是页面本身（§5 移动款，决策 192） ── -->
-  <section class="timeline" bind:this={timelineEl} aria-label="对话时间线">
+  <section
+    class="timeline"
+    class:empty={timelineEmpty}
+    bind:this={timelineEl}
+    aria-label="对话时间线"
+  >
     {#if loading && !session}
       <div class="quiet">正在读会话台账…</div>
     {:else if turns.length === 0}
-      <div class="quiet">还没有对话。说一句，值班长就在对面——它与任务无关，空班也答得上。</div>
+      <!-- 空态：状态 → 下一步（票 13 / parallel-brief §三.3）。`值班长` 的**首现平实说法**
+           落在这里（决策 200）：页头那一行是标题栏、不承载翻译，而这一句正是第一次进这一页的
+           人读到这个词的地方——本页其余地方（名牌、状态区）保持原词，同一页面内不重复。 -->
+      <EmptyState
+        state="还没有对话。"
+        next="说一句，值班长（跟我对话的 AI）就在对面——它与任务无关，空班也答得上。"
+      />
     {/if}
 
     {#each turns as turn (turn.key)}
@@ -718,6 +749,10 @@
           </li>
         {/each}
       </ul>
+      <!-- `急停` 的译文在这一页只给一次（决策 200：同一页面内不重复），落点是上面状态区
+           那条空态——「当前没有急停（等你拍板的阻塞）」正是这个词最需要被解释的时候。
+           有急停挂在屏上时，那一轮自己的标签就是完整的平实读法（「⏸ 等你拍板 · …」），
+           本块因此不再重复解释，只留原词。 -->
       <div class="boks">
         在跑的工位会自己往下走，不用追问。<br />
         急停的只能你来按键。
@@ -800,6 +835,14 @@
     min-height: 0;
     overflow-y: auto;
     padding: 20px 2px 6px; /* 上留白同上（名牌 tab） */
+  }
+  /* 空态**居中**（票 13）：空的时候这一格照样占满余下的高度（grid 的 1fr / 窄屏的
+     `flex: 1 0 auto`），内容若顶着上沿，就成了「内容浮在顶上、输入坞隔着大片空白」。
+     空态是这一格里唯一的内容，居中即「不浮在顶上」。 */
+  .timeline.empty {
+    display: flex;
+    flex-direction: column;
+    justify-content: center;
   }
   .quiet {
     color: var(--text-3);
@@ -952,8 +995,11 @@
   .ctx.err {
     color: var(--stop);
   }
+  /* 次级必读档（--text-3，决策 195 的门槛 4.5:1）：本页这一类字（断流后的补给说明、
+     输入坞的提示行、收据里的工具名与参数）都属「读不到会挡住下一步」，不是纯装饰刻度，
+     故不留 --text-4。纯装饰那几处（`.sep` 的 ▪、`.blamp` 的灯框）另按各自 token 走。 */
   .dim {
-    color: var(--text-4);
+    color: var(--text-3);
   }
   .note {
     font-size: 12px;
@@ -997,7 +1043,9 @@
   .rcpt-head .rs {
     margin-left: auto;
     flex: none;
-    color: var(--text-4);
+    /* 「已读 / 未读到」是回执的结论（未读到意味着这条工具被拒），属次级必读：--text-4
+       是纯装饰档，不得承载它（决策 195）。失败那一路仍走 --stop。 */
+    color: var(--text-3);
   }
   .rcpt-head .rs.bad {
     color: var(--stop);

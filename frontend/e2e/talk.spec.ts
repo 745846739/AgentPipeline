@@ -646,11 +646,13 @@ test.describe('对讲台 · 空看板也能对话（票 04 的验收锚点）', 
     await expect(input).toBeVisible();
     await expect(input).toBeEditable();
 
-    // 空态的「去看板新建任务」是**页面固定的导航钮**：它不在任何对话框（`.turn`）里，
-    // 也不来自 allowed_actions——此刻全页没有任何后端下发的动作。
+    // 空态的「去看板新建任务」是**页面固定的导航入口**（`EmptyState` 的可选入口，纯前端路由，
+    // 不进后端动作契约）：它不在任何对话框（`.turn`）里，也不来自 allowed_actions——此刻全页
+    // 没有任何后端下发的动作。
     // 它的出现同时证明看板已经装载完（空态等的是装载完成，不是"还没读"）。
-    const navBtn = page.getByRole('button', { name: '去看板新建任务' });
-    await expect(navBtn).toBeVisible();
+    const navLink = page.getByRole('link', { name: '去看板新建任务' });
+    await expect(navLink).toBeVisible();
+    await expect(navLink).toHaveAttribute('href', '#/');
     await expect(page.locator('.zone-status .turn button')).toHaveCount(0);
 
     // 验收锚点：空看板照样能对话

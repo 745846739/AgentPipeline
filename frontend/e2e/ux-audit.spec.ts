@@ -3,7 +3,13 @@
  *
  * 与 `screenshots.spec.ts` 的分工：那条只出「每个路由一张」的基线；这一条出**交互态**
  * ——空库、过滤、下拉、对话框、pending 档案盒、对讲台多急停、市场列表、手机访问两种
- * 绑定态。产物落 `.scratch/ux-audit/`，供人工审 UI/UX。
+ * 绑定态，以及票 01 补拍的两组逐处证据（琥珀五处用途 / 七处空态 + 404，均深浅两套）。
+ * 产物落 `.scratch/ux-audit/`，供人工审 UI/UX。
+ *
+ * **取证拿的是「改动前」的现状**：这里的页面来自被测二进制**编译期内嵌**的 `frontend/dist`
+ * （决策 155 的 `crates/app/build.rs`：dist 逐文件 `include_bytes!` 进二进制；harness 的
+ * `assertEmbeddedBundle` 就是这条的守卫）。所以磁盘上的 `frontend/dist` 被同轮并行改动
+ * 重新构建得更晚，也不会改变本 spec 拿到的画面——这也是本文件不重建产物的原因。
  *
  * 默认 skip：审计不是闸门，不该拖慢 `make check-e2e`。用法（仓库根）：
  *   cd frontend && UX_AUDIT=1 AGENTPIPELINE_E2E_BIN=target/release/agent-pipeline \
@@ -13,7 +19,7 @@
 import { mkdirSync } from 'node:fs';
 import { dirname, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { test, type Page } from '@playwright/test';
+import { test, type Locator, type Page } from '@playwright/test';
 import { startApp, waitForTaskById, watchBundle, type App } from './harness';
 import { startGitRepo, type GitRepoFixture } from './gitRepo';
 import {
@@ -68,6 +74,64 @@ async function open(page: Page, app: App, hash: string): Promise<void> {
   await page.waitForTimeout(700);
 }
 
+/** 逐处取证的「放大镜」：只截那一个元素，深浅两套并排比对才看得出一处是不是琥珀。 */
+async function clip(page: Page, name: string, target: Locator): Promise<void> {
+  const el = target.first();
+  await el.scrollIntoViewIfNeeded();
+  await page.waitForTimeout(200);
+  await el.screenshot({ path: resolve(outDir, `${name}.png`) });
+}
+
+/**
+ * 逐处取证的「量尺」：读**计算样式**（用户可见真值）并打到 stdout。
+ *
+ * 为什么必须有：审计的结论不能靠 class 名或印象——`--pending` 与 `--text-hi` 在深色款下
+ * 都是暖色，肉眼在小字号上会看错（本轮就纠正了一处）。这里把「这一处到底取哪枚 token」
+ * 变成可引用的输出，顺带把根上的 token 取值一起打出来。
+ */
+async function probeColor(page: Page, label: string, target: Locator): Promise<void> {
+  const info = await target.first().evaluate((node) => {
+    const cs = getComputedStyle(node);
+    const root = getComputedStyle(document.documentElement);
+    const tok = (name: string) => root.getPropertyValue(name).trim();
+    return {
+      text: (node.textContent ?? '').trim().replace(/\s+/g, ' ').slice(0, 32),
+      color: cs.color,
+      borderTop: cs.borderTopColor,
+      borderLeft: cs.borderLeftColor,
+      background: cs.backgroundColor,
+      tokens: {
+        '--pending': tok('--pending'),
+        '--text-hi': tok('--text-hi'),
+        '--text-3': tok('--text-3'),
+        '--text-4': tok('--text-4'),
+      },
+    };
+  });
+  console.log(`[audit] ${label} ${JSON.stringify(info)}`);
+}
+
+/**
+ * 阶段配置的取证入口（决策 198：设置的信息架构本轮改过——阶段配置从「模型与密钥」页
+ * 搬出、独立成 `#/settings/stages`）。
+ *
+ * **新路由优先、旧产物回落**：本轮证据取自已构建的 release 二进制（编译期内嵌 dist，
+ * 早于该 IA 改动），新路由在它上面还不存在；两条路都留着，下一轮取证自动走新路由。
+ */
+async function openStageConfig(
+  page: Page,
+  app: App,
+): Promise<'settings-stages' | 'settings-providers'> {
+  await open(page, app, '#/settings/stages');
+  if (await page.getByRole('button', { name: /新增阶段配置/ }).count()) {
+    console.log('[audit] 阶段配置取证走新路由 #/settings/stages（决策 198）');
+    return 'settings-stages';
+  }
+  console.log('[audit] 阶段配置取证走旧路由 #/settings/providers（内嵌产物早于决策 198）');
+  await open(page, app, '#/settings/providers');
+  return 'settings-providers';
+}
+
 test.describe('① 有数据的库：看板 / 详情 / 对讲台 / 台账', () => {
   let app: App;
 
@@ -81,6 +145,23 @@ test.describe('① 有数据的库：看板 / 详情 / 对讲台 / 台账', () =
         { title: '给导出命令加一个 --since 参数', script: stalledScript },
       ],
     });
+    // 琥珀用途取证（票 01 第 4 处）：`.warnnote`（§3.2「行内降级」的琥珀标）只在
+    // **不受支持厂商**那一行渲染，而 harness 只播 `openai`（受支持）。
+    // `SUPPORTED_ADAPTERS = openai / deepseek / anthropic`（`lib/providers.ts:16`），
+    // 故补一个 `gemini`；`enabled: false` 让它不参与任何阶段解析，主任务不受影响。
+    const res = await fetch(`${app.apiBase}/providers`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', 'x-agentpipeline': '1' },
+      body: JSON.stringify({
+        vendor: 'gemini',
+        model: 'gemini-2.5-pro',
+        context_window: 1000000,
+        base_url: 'https://example.invalid',
+        api_key: 'sk-test',
+        enabled: false,
+      }),
+    });
+    if (!res.ok) throw new Error(`播种「不受支持厂商」provider 失败：${res.status}`);
     // 让看板先有「跑到一半」的样子：三件事分散在不同列
     await new Promise((r) => setTimeout(r, 7000));
   });
@@ -227,7 +308,100 @@ test.describe('① 有数据的库：看板 / 详情 / 对讲台 / 台账', () =
     await shot(page, 'mobile-metrics');
   });
 
-  test('项目 / 模型与密钥：列表与表单', async ({ page }) => {
+  /**
+   * 票 01 的第 1–3 项：琥珀五处用途的**特写 + 计算样式**，深浅两套。
+   *
+   * 结论落 `.scratch/ux-audit/README.md`「核查后的更正」第 6 条。这一条只取证、不判定，
+   * 判定要引规格原文，故不在 spec 里写断言（文案与色值都在动，硬断言会与并行改动打架）。
+   */
+  test('琥珀用途：五处逐处特写与计算样式（深浅两套）', async ({ page }) => {
+    await page.setViewportSize({ width: 1440, height: 1100 });
+
+    // ① 指标页「各阶段重试率」：每根轨道上的 12px 描边方块标记（值全是 0.0% 也照样琥珀）
+    await open(page, app, '#/metrics');
+    for (const theme of ['dark', 'light'] as const) {
+      await setTheme(page, theme);
+      const retry = page.locator('.chart').filter({ hasText: '各阶段重试率' });
+      await clip(page, `amber-metrics-retry-${theme}`, retry);
+      await probeColor(page, `${theme} ①指标·重试率轨道标记 .mdot`, retry.locator('.mdot'));
+      await probeColor(page, `${theme} ①指标·重试率横条 .fill`, retry.locator('.fill'));
+      await probeColor(page, `${theme} ①指标·重试率数值 .val`, retry.locator('.val'));
+      // 同一屏上的对照组：平均耗时那张固定用 dev 档。两相对照才看得出「灯色是按图固定的」
+      const dur = page.locator('.chart').filter({ hasText: '各阶段平均耗时' });
+      await probeColor(page, `${theme} ①对照·耗时轨道标记 .mdot`, dur.locator('.mdot'));
+    }
+
+    // ② 模型与密钥页推荐技能的「未安装」标签
+    await open(page, app, '#/settings/providers');
+    for (const theme of ['dark', 'light'] as const) {
+      await setTheme(page, theme);
+      const rec = page.locator('.rec');
+      await clip(page, `amber-providers-uninstalled-${theme}`, rec);
+      await probeColor(page, `${theme} ②推荐技能·未安装 .state`, rec.locator('.state'));
+    }
+
+    // ③ 阶段配置区标题（以及展开表单后那块「整条替换」题注——两者不是同一处）
+    for (const theme of ['dark', 'light'] as const) {
+      await setTheme(page, theme);
+      const head = page.locator('.sub-head');
+      await clip(page, `amber-stageconfig-title-${theme}`, head);
+      await probeColor(page, `${theme} ③阶段配置区标题 .sub-head h2`, head.locator('h2'));
+      await page.getByRole('button', { name: /新增阶段配置/ }).click();
+      await page.waitForTimeout(400);
+      const note = page.locator('.replace-note');
+      if (await note.count()) {
+        await clip(page, `amber-stageconfig-replace-note-${theme}`, note);
+        await probeColor(page, `${theme} ③b阶段配置表单·整条替换题注 .replace-note`, note);
+      }
+      await page.getByRole('button', { name: /取消/ }).first().click();
+      await page.waitForTimeout(300);
+    }
+
+    // ④ 告警注记 `.warnnote`：只在「不受支持厂商」那一行（beforeAll 播的 gemini）
+    for (const theme of ['dark', 'light'] as const) {
+      await setTheme(page, theme);
+      const row = page.locator('.reg-row.dead').first();
+      if (await row.count()) {
+        await clip(page, `amber-warnnote-${theme}`, row);
+        await probeColor(page, `${theme} ④告警注记 .warnnote`, row.locator('.warnnote').first());
+      } else {
+        console.log(`[audit] ${theme} ④告警注记 .warnnote 未渲染（该行不是不受支持厂商？）`);
+      }
+    }
+
+    // ⑤ 手机访问页的入口闸标题（回环态默认就是闸；外加同页的风险提示作对照）
+    await open(page, app, '#/share');
+    for (const theme of ['dark', 'light'] as const) {
+      await setTheme(page, theme);
+      const gate = page.locator('.gate');
+      await clip(page, `amber-share-gate-${theme}`, gate);
+      await probeColor(page, `${theme} ⑤手机访问·入口闸标题 .gate-head`, page.locator('.gate-head'));
+      await probeColor(page, `${theme} ⑤b手机访问·风险提示 .warn`, page.locator('.gate .warn'));
+    }
+  });
+
+  /**
+   * 看板空**列**：`design/frontend-design.md` §5.3（HEAD:181-183）是**唯一**写了空态形状的
+   * 地方（「空列不放插画，一句话」），所以它的实现偏离要单独留一张特写——
+   * 实现是 `.col-empty`（`BoardColumn.svelte:169`，`--text-4` 装饰档）。
+   */
+  test('空列：规格 §5.3 写过的那一处（深浅两套）', async ({ page }) => {
+    await page.setViewportSize({ width: 1440, height: 1100 });
+    await open(page, app, '#/');
+    for (const theme of ['dark', 'light'] as const) {
+      await setTheme(page, theme);
+      const col = page.locator('.col').filter({ has: page.locator('.col-empty') }).first();
+      if (await col.count()) {
+        await clip(page, `empty-board-column-${theme}`, col);
+        await clip(page, `empty-board-column-text-${theme}`, col.locator('.col-empty'));
+        await probeColor(page, `${theme} 空列·引导句 .col-empty`, col.locator('.col-empty'));
+      } else {
+        console.log(`[audit] ${theme} 空列未出现（每列都占了？）`);
+      }
+    }
+  });
+
+  test('项目 / 模型与密钥 / 阶段配置：列表与表单', async ({ page }) => {
     await page.setViewportSize({ width: 1440, height: 1100 });
 
     await open(page, app, '#/settings/providers');
@@ -238,11 +412,18 @@ test.describe('① 有数据的库：看板 / 详情 / 对讲台 / 台账', () =
     await shot(page, 'providers-form');
     await page.getByRole('button', { name: /取消/ }).first().click();
     await page.waitForTimeout(300);
+
+    // 阶段配置：决策 198 起它有自己的路由（`#/settings/stages`）。这一步走 openStageConfig
+    // ——新路由优先、旧产物回落，下一轮取证不必再改这一条。
+    const stagesRoute = await openStageConfig(page, app);
+    await setTheme(page, 'dark');
+    await shot(page, `stageconfig-page-${stagesRoute}`);
     await page.getByRole('button', { name: /新增阶段配置/ }).click();
     await page.waitForTimeout(400);
-    await shot(page, 'providers-stage-form');
+    await shot(page, `stageconfig-form-${stagesRoute}`);
     await page.getByRole('button', { name: /取消/ }).first().click();
     await page.waitForTimeout(300);
+
     // 项目页放最后：三个任务都在飞，删除钮是**禁用**的（决策 101），
     // 这一张截的就是「按钮禁掉 + 旁边写出原因」的样子。
     await open(page, app, '#/settings/projects');
@@ -281,10 +462,19 @@ test.describe('① 有数据的库：看板 / 详情 / 对讲台 / 台账', () =
     }
   });
 
-  test('404', async ({ page }) => {
+  test('404：不存在路由（深浅两套）', async ({ page }) => {
     await page.setViewportSize({ width: 1440, height: 1100 });
     await open(page, app, '#/nope');
-    await shot(page, 'notfound');
+    for (const theme of ['dark', 'light'] as const) {
+      await setTheme(page, theme);
+      await shot(page, theme === 'dark' ? 'notfound' : 'notfound-light');
+    }
+    // 取证用：404 页面上「有没有一条能走的路」是字面意义上的可测项
+    const links = await page.locator('main a, .page a, body a').count();
+    const text = await page.locator('body').innerText();
+    console.log(
+      `[audit] 404 链接数=${links} 正文=${JSON.stringify(text.replace(/\s+/g, ' ').trim().slice(0, 120))}`,
+    );
   });
 });
 
@@ -324,7 +514,7 @@ test.describe('② 空库：首启空态', () => {
     await shot(page, 'dialog-escape-check');
   });
 
-  test('空看板 / 空对讲台 / 空指标 / 空台账', async ({ page }) => {
+  test('空看板 / 空对讲台 / 空指标 / 空台账：七处空态深浅两套', async ({ page }) => {
     await page.setViewportSize({ width: 1440, height: 1100 });
     for (const [slug, hash] of [
       ['empty-board', '#/'],
@@ -336,8 +526,26 @@ test.describe('② 空库：首启空态', () => {
       ['empty-share', '#/share'],
     ] as const) {
       await open(page, app, hash);
-      await setTheme(page, 'dark');
-      await shot(page, slug);
+      for (const theme of ['dark', 'light'] as const) {
+        await setTheme(page, theme);
+        // 深色款沿用审计原稿的文件名（README 里逐条引的是它），浅色款补 `-light`
+        await shot(page, theme === 'dark' ? slug : `${slug}-light`);
+      }
+      // 取证用：这一页此刻的正文——空态「说不说清下一步」「提到别处是不是可点」都在这行字里
+      const text = await page.locator('body').innerText();
+      const links = await page.locator('body a[href]').evaluateAll((els) =>
+        els.map((e) => `${(e.textContent ?? '').trim()}=${e.getAttribute('href')}`),
+      );
+      const emptyBlocks = await page
+        .locator('.board-empty, .empty, .col-empty, .gate-head')
+        .evaluateAll((els) =>
+          els.map((e) => (e.textContent ?? '').trim().replace(/\s+/g, ' ').slice(0, 150)),
+        );
+      console.log(
+        `[audit] ${slug} 正文=${JSON.stringify(text.replace(/\s+/g, ' ').trim().slice(0, 420))}`,
+      );
+      console.log(`[audit] ${slug} 正文内的链接=${JSON.stringify(links)}`);
+      console.log(`[audit] ${slug} 空态块=${JSON.stringify(emptyBlocks)}`);
     }
   });
 });

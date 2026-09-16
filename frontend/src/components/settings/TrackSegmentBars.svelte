@@ -148,6 +148,10 @@
   .mdot.go {
     border-color: var(--go);
   }
+  /* 琥珀档保留在组件里（§3.1 的灯色表列了 go / caution / stop / done / dev / test），
+     但**当前没有一张图用它**：UX 审计票 12 把「各阶段重试率」从琥珀收回中性档——值全是
+     0.0% 也照样是琥珀，说明那里不是「有东西要你处理」（brief §三.5）。要用它之前先回答
+     「这里要用户处理什么」。 */
   .mdot.caution {
     border-color: var(--pending);
   }
@@ -177,6 +181,7 @@
     min-width: 2px;
     background: var(--go);
   }
+  /* 见上 `.mdot.caution`：本档当前无人使用（票 12 的琥珀收敛） */
   .fill.caution {
     background: var(--pending);
   }

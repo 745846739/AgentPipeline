@@ -9,9 +9,11 @@
   /** 分析结果核对清单（design §7 / theme-6 §3.1）：伪阶段探测事实 → 清单供确认，不做 KPI 展示。 */
   interface Props {
     analysis: ProjectAnalysis;
+    /** 这份分析针对哪个项目（票 07：从任务侧跳过来时，这一栏要说清在看哪个项目）。 */
+    project?: string;
     onclose: () => void;
   }
-  let { analysis, onclose }: Props = $props();
+  let { analysis, project, onclose }: Props = $props();
 
   const ready = $derived(analysisReady(analysis));
   const items = $derived(analysis.result ? analysisChecklist(analysis.result) : []);
@@ -20,6 +22,7 @@
 <section class="checklist">
   <div class="sub-head">
     <h2>项目分析 · 核对清单</h2>
+    {#if project}<span class="target">{project}</span>{/if}
     {#if analysis.status === 'done'}
       <span class="st run">{analysisStatusLabel(analysis.status)}</span>
     {:else if analysis.status === 'failed'}
@@ -31,7 +34,7 @@
   </div>
 
   {#if ready}
-    <p class="hintline lead">以下为 project_analysis 探测到的事实，确认无误后即可创建任务（决策 78）。</p>
+    <p class="hintline lead">以下为 project_analysis 探测到的事实，确认无误后即可创建任务。</p>
     <ul>
       {#each items as item (item.key)}
         <li class:miss={!item.ok}>
@@ -73,6 +76,10 @@
   .checklist .sub-head .btn {
     margin-left: auto;
   }
+  /* 这份分析针对哪个项目（票 07）：次级必读档，跟在本节标题后面 */
+  .target {
+    color: var(--text-3);
+  }
   .lead {
     padding: 8px 12px 0;
   }
@@ -90,15 +97,17 @@
     border-bottom: 2px solid var(--wash);
     border-right: 2px solid var(--wash);
   }
-  /* 缺项：弱色「—」+ 「未探测到」，绝不假装通过 */
+  /* 缺项：弱色「—」+ 「未探测到」，绝不假装通过。
+     票 15 归位（决策 195）：缺什么正是「还差哪几步才能建档」，读不到就会挡住下一步
+     ——整条（含那个「—」标记，它是同一条信息的第二编码）走次级必读档，不是装饰档。 */
   li.miss {
-    color: var(--text-4);
+    color: var(--text-3);
   }
   .mk {
     color: var(--go);
   }
   li.miss .mk {
-    color: var(--text-4);
+    color: var(--text-3);
   }
   .lb {
     color: var(--text-2);

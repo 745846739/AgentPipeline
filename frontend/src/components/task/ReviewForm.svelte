@@ -15,6 +15,11 @@
     error?: string | null;
     /** 窄屏底部动作坞复用：只渲染意见输入 + 动作（§5 转写 3）。 */
     actionsOnly?: boolean;
+    /**
+     * 用户已经停在主区 Diff 页签（票 08，与 `DiffReviewPanel` 同一口径）→ 不渲染第二份 diff，
+     * 报告与动作照旧在：同一屏两份同样的 diff 会让「哪个是真的」变成问题。
+     */
+    diffInPane?: boolean;
     onsubmit?: (approved: boolean, comments?: string) => void;
     onreload?: () => void;
   }
@@ -28,6 +33,7 @@
     busy = false,
     error = null,
     actionsOnly = false,
+    diffInPane = false,
     onsubmit,
     onreload,
   }: Props = $props();
@@ -49,7 +55,9 @@
       {#if onreload}
         <button type="button" class="btn quiet small" onclick={onreload}>刷新</button>
       {/if}
-      {#if diff}
+      {#if diffInPane}
+        <div class="hint">diff 正文在 Diff 页签里展开，这里只留报告与动作。</div>
+      {:else if diff}
         <div class="diff-scroll">
           <DiffView parsed={diff} {raw} />
         </div>

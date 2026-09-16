@@ -53,7 +53,8 @@
   .msg {
     margin-bottom: 14px;
   }
-  /* 发言者行：弱灰小字 + 前缀 `▸`（装饰由 CSS 生成，是亮度编码不是状态字形） */
+  /* 发言者行：弱灰小字 + 前缀 `▸`（装饰由 CSS 生成，是亮度编码不是状态字形）。
+     档位：「谁在说话」读不到就分不清是谁的段落 → 两处都用「次级必读」（决策 195 / 票 15）。 */
   .who {
     font-family: var(--font-cond);
     font-size: 12px;
@@ -63,10 +64,10 @@
   }
   .who::after {
     content: ' ▸';
-    color: var(--text-4);
+    color: var(--text-3);
   }
   .who.sys {
-    color: var(--text-4);
+    color: var(--text-3);
   }
   .who.as {
     color: var(--text-hi);

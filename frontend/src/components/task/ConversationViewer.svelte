@@ -5,6 +5,7 @@
   import MessageBubble from '../render/MessageBubble.svelte';
   import MetadataCard from '../render/MetadataCard.svelte';
   import ToolCallCard from '../render/ToolCallCard.svelte';
+  import EmptyState from '../ui/EmptyState.svelte';
 
   interface Props {
     conversations: ConversationSummary[];
@@ -58,58 +59,69 @@
   const selectedTools = $derived(liveTools.filter((t) => t.run_id === selectedRunId));
 </script>
 
-<div class="runrow no-scrollbar">
-  {#each sorted as c (c.run_id)}
-    <button
-      type="button"
-      class="runchip"
-      class:now={selectedRunId === c.run_id}
-      onclick={() => onselect(c.run_id)}
-    >
-      {c.stage} · {c.node}{c.attempt > 1 ? ` · 尝试 ${c.attempt}` : ''}
-      {#if c.agent_type !== 'main'}
-        <span class="sub">∟ {c.agent_type}</span>
-      {/if}
-    </button>
-  {/each}
-</div>
-
-{#if selectedRunId === null}
-  <div class="empty">选择一个 run 查看会话。</div>
+{#if sorted.length === 0}
+  <!-- 空态的唯一形状（票 13）：状态 → 下一步。 -->
+  <EmptyState
+    state="这个任务还没有会话记录。"
+    next="流水线跑起来后，每个节点的会话都会出现在这里：模型说了什么、调了哪些工具。"
+  />
 {:else}
-  <div class="convhead">
-    <h3 class="cond">
-      {selected ? `${selected.stage} · ${selected.node} · 尝试 ${selected.attempt}` : `run ${selectedRunId}`}
-    </h3>
-    <span class="m">
-      {selected ? formatTokens(selected.prompt_tokens + selected.completion_tokens) : '0'} tok
-      {#if streamTokens}<span class="live">· 流式 +{formatTokens(streamTokens.prompt + streamTokens.completion)}</span>{/if}
-    </span>
+  <div class="runrow no-scrollbar">
+    {#each sorted as c (c.run_id)}
+      <button
+        type="button"
+        class="runchip"
+        class:now={selectedRunId === c.run_id}
+        onclick={() => onselect(c.run_id)}
+      >
+        {c.stage} · {c.node}{c.attempt > 1 ? ` · 尝试 ${c.attempt}` : ''}
+        {#if c.agent_type !== 'main'}
+          <span class="sub">∟ {c.agent_type}</span>
+        {/if}
+      </button>
+    {/each}
   </div>
 
-  {#if loading && !conversation}
-    <div class="empty">正在加载会话…</div>
+  {#if selectedRunId === null}
+    <EmptyState state="还没选中哪一轮。" next="点上面任一个节点，看它那一轮跟模型说了什么。" />
   {:else}
-    {#if conversation}
-      {#each conversation.messages_json as message, i (i)}
-        {#if message.role !== 'tool' || message.content}
-          <MessageBubble {message} />
+    <div class="convhead">
+      <h3 class="cond">
+        {selected ? `${selected.stage} · ${selected.node} · 尝试 ${selected.attempt}` : `run ${selectedRunId}`}
+      </h3>
+      <span class="m">
+        {selected ? formatTokens(selected.prompt_tokens + selected.completion_tokens) : '0'} tok
+        {#if streamTokens}<span class="live">· 流式 +{formatTokens(streamTokens.prompt + streamTokens.completion)}</span>{/if}
+      </span>
+    </div>
+
+    {#if loading && !conversation}
+      <div class="empty">正在加载会话…</div>
+    {:else}
+      {#if conversation}
+        {#each conversation.messages_json as message, i (i)}
+          {#if message.role !== 'tool' || message.content}
+            <MessageBubble {message} />
+          {/if}
+        {/each}
+        {#if conversation.metadata_json}
+          <MetadataCard metadata={conversation.metadata_json} />
         {/if}
-      {/each}
-      {#if conversation.metadata_json}
-        <MetadataCard metadata={conversation.metadata_json} />
       {/if}
-    {/if}
 
-    {#each mergedDeltas as message, i (i)}
-      <MessageBubble {message} streaming={i === mergedDeltas.length - 1} />
-    {/each}
-    {#each selectedTools as t, i (i)}
-      <ToolCallCard tool={t.tool} argsSummary={t.args_summary} resultSummary={t.phase} phase={t.phase} />
-    {/each}
+      {#each mergedDeltas as message, i (i)}
+        <MessageBubble {message} streaming={i === mergedDeltas.length - 1} />
+      {/each}
+      {#each selectedTools as t, i (i)}
+        <ToolCallCard tool={t.tool} argsSummary={t.args_summary} resultSummary={t.phase} phase={t.phase} />
+      {/each}
 
-    {#if !conversation && mergedDeltas.length === 0 && selectedTools.length === 0}
-      <div class="empty">该 run 的会话尚未落库（进行中或已被截断）。</div>
+      {#if !conversation && mergedDeltas.length === 0 && selectedTools.length === 0}
+        <EmptyState
+          state="这一轮的会话还没落库。"
+          next="它可能还在进行中、或者已经被截断——等这一轮跑完再回来看。"
+        />
+      {/if}
     {/if}
   {/if}
 {/if}
@@ -137,7 +149,7 @@
     border-color: var(--text-2);
   }
   .sub {
-    color: var(--text-4);
+    color: var(--text-3);
   }
   .convhead {
     display: flex;

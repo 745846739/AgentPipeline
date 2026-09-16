@@ -132,8 +132,10 @@
   .used {
     grid-column: 1 / -1;
   }
+  /* 票 12：琥珀只出现在「有东西要你处理」的地方。「未安装」是一条只有文字编码、要人读的
+     状态（要装它就点旁边的钮，但它本身不是告警），按决策 195 归到「次级必读」档。 */
   .state {
-    color: var(--pending);
+    color: var(--text-3);
   }
   .state.on {
     color: var(--done);
@@ -143,9 +145,10 @@
     border-top: 2px solid var(--pane);
     padding-top: 8px;
   }
+  /* 正文特征「只用于告知」（组件注释原话），不是待办——回中性档。 */
   .feat-head {
     font-size: 12px;
-    color: var(--pending);
+    color: var(--text-2);
     margin-bottom: 4px;
   }
   .features ul {
@@ -160,7 +163,7 @@
     line-height: 1.6;
   }
   .kind {
-    color: var(--pending);
+    color: var(--text-3);
   }
   .line,
   .text {

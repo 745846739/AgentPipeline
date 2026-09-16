@@ -2,6 +2,7 @@
   import type { Transition } from '../../api/types';
   import { TRIGGER_LABELS, branchKind } from '../../lib/pipeline';
   import { formatClock } from '../../lib/format';
+  import EmptyState from '../ui/EmptyState.svelte';
 
   interface Props {
     transitions: Transition[];
@@ -25,7 +26,11 @@
 </script>
 
 {#if transitions.length === 0}
-  <div class="empty">还没有流转记录。</div>
+  <!-- 空态的唯一形状（票 13）：状态 → 下一步；这里没提到别的页面，故没有可选入口。 -->
+  <EmptyState
+    state="还没有流转记录。"
+    next="任务每推进一次都会落一条：从哪一站到哪一站、谁触发的、为什么。"
+  />
 {:else}
   <div class="tline">
     {#each transitions as t (t.id)}
@@ -61,7 +66,7 @@
     background: var(--hover-bg);
   }
   .t {
-    color: var(--text-4);
+    color: var(--text-3);
     flex: none;
     width: 66px;
   }
@@ -82,7 +87,7 @@
     word-break: break-word;
   }
   .why {
-    color: var(--text-4);
+    color: var(--text-3);
   }
   .cur {
     color: var(--go);
@@ -99,10 +104,6 @@
   }
   .bbadge.test {
     color: var(--branch-tst);
-  }
-  .empty {
-    color: var(--text-3);
-    font-size: 12px;
   }
 
   /* ── 移动版（<480px）：时间线折行为块（§5 移动款） ── */

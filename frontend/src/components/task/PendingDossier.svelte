@@ -25,6 +25,11 @@
     diffStale?: boolean;
     diffError?: string | null;
     diffLoading?: boolean;
+    /**
+     * 票 08：用户已经停在主区 Diff 页签（`merge_approval`）→ 档案盒收成不重复内容的状态摘要。
+     * 动作行照旧渲染（那是被测合约的一部分，也是「不必先切页签就能拍板」的落点）。
+     */
+    diffInPane?: boolean;
     onreloaddiff?: () => void;
     /** human_review 三件套。 */
     reviewReport?: string | null;
@@ -47,6 +52,7 @@
     diffStale = false,
     diffError = null,
     diffLoading = false,
+    diffInPane = false,
     onreloaddiff,
     reviewReport = null,
     unitTestReport = null,
@@ -156,6 +162,7 @@
       {#if pendingType === 'merge_approval'}
         <div class="grp">恢复动作</div>
         <DiffReviewPanel
+          {diffInPane}
           {diff}
           raw={rawDiff}
           stale={diffStale}
@@ -170,6 +177,7 @@
       {:else if pendingType === 'human_review'}
         <div class="grp">人工评审</div>
         <ReviewForm
+          {diffInPane}
           {diff}
           raw={rawDiff}
           {reviewReport}
@@ -282,14 +290,14 @@
     color: var(--go);
   }
   .dim {
-    color: var(--text-4);
+    color: var(--text-3);
   }
   .trigger {
     margin-top: 10px;
   }
   .grp {
     font-size: 12px;
-    color: var(--text-4);
+    color: var(--text-3);
     letter-spacing: 0.08em;
     margin: 12px 0 7px;
   }
@@ -347,7 +355,7 @@
     color: var(--go);
   }
   .dock .dim {
-    color: var(--text-4);
+    color: var(--text-3);
   }
   .dock .linklike {
     color: var(--text-hi);

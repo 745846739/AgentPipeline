@@ -3,25 +3,15 @@
   import {
     createProvider,
     deleteProvider,
-    deleteStageConfig,
     installSkillForStage,
     listProviders,
     listRecommendedSkills,
-    listSkills,
-    listStageConfigs,
-    putStageConfig,
     updateProvider,
   } from '../api/client';
-  import type {
-    Provider,
-    RecommendedStage,
-    SkillPreview,
-    SkillSummary,
-    StageConfig,
-  } from '../api/types';
+  import type { Provider, RecommendedStage, SkillPreview } from '../api/types';
   import ProviderForm from '../components/settings/ProviderForm.svelte';
-  import StageConfigForm from '../components/settings/StageConfigForm.svelte';
   import StageRecommendations from '../components/settings/StageRecommendations.svelte';
+  import EmptyState from '../components/ui/EmptyState.svelte';
   import {
     API_KEY_MASK,
     buildProviderCreate,
@@ -30,13 +20,6 @@
     validateProviderDraft,
     type ProviderDraft,
   } from '../lib/providers';
-  import {
-    buildStageConfigPut,
-    isPseudoStage,
-    stageKeyLabel,
-    type StageConfigDraft,
-  } from '../lib/stageConfigs';
-  import { formatDateTime } from '../lib/format';
 
   let providers = $state<Provider[]>([]);
   let loading = $state(true);
@@ -51,35 +34,14 @@
   let deleteBusy = $state<string | null>(null);
   let rowError = $state<{ id: string; message: string } | null>(null);
 
-  /* ── stage_configs（决策 22 / 46 / 66 / 111 / 129）── */
-  let stageConfigs = $state<StageConfig[]>([]);
-  let scLoading = $state(true);
-  let scError = $state<string | null>(null);
-  type ScEditing = { mode: 'new' } | { mode: 'edit'; config: StageConfig };
-  let scEditing = $state<ScEditing | null>(null);
-  let scSaving = $state(false);
-  let scFormError = $state<string | null>(null);
-  let scConfirmingDelete = $state<string | null>(null);
-  let scDeleteBusy = $state<string | null>(null);
-  let scRowError = $state<{ stage: string; message: string } | null>(null);
-
-  /* ── 技能目录与推荐（决策 172①④，票 15 / 16）── */
-  let skills = $state<SkillSummary[]>([]);
+  /* ── 技能推荐与一键安装（决策 172①④，票 15 / 16）──
+     技能目录（`GET /skills`）只为阶段配置表单的候选读，已随那一段搬去 `#/settings/stages`。 */
   let recommendations = $state<RecommendedStage[]>([]);
   /** 正在安装的 `阶段:技能名`（按钮上的转圈与禁用）。 */
   let installing = $state<string | null>(null);
   let skillError = $state<string | null>(null);
   /** 最近一次一键安装带回来的三项预览（票 11）。 */
   let installPreview = $state<SkillPreview | null>(null);
-
-  async function loadSkills() {
-    try {
-      skills = await listSkills();
-    } catch (err) {
-      // 目录取不到不该挡住整页：技能控件退化为「手动输入技能名」
-      skillError = (err as Error).message;
-    }
-  }
 
   async function loadRecommendations() {
     try {
@@ -103,7 +65,7 @@
     try {
       const result = await installSkillForStage(stage, name);
       installPreview = result.preview;
-      await Promise.all([loadSkills(), loadRecommendations(), loadStageConfigs()]);
+      await loadRecommendations();
     } catch (err) {
       skillError = (err as Error).message;
     } finally {
@@ -128,22 +90,8 @@
     }
   }
 
-  async function loadStageConfigs() {
-    scLoading = true;
-    scError = null;
-    try {
-      stageConfigs = await listStageConfigs();
-    } catch (err) {
-      scError = (err as Error).message;
-    } finally {
-      scLoading = false;
-    }
-  }
-
   onMount(() => {
     void load();
-    void loadStageConfigs();
-    void loadSkills();
     void loadRecommendations();
   });
 
@@ -195,54 +143,8 @@
     }
   }
 
-  /* ── stage_configs handlers ── */
-
-  function openNewStageConfig() {
-    scFormError = null;
-    scEditing = { mode: 'new' };
-  }
-
-  function openEditStageConfig(config: StageConfig) {
-    scFormError = null;
-    scEditing = { mode: 'edit', config };
-  }
-
-  async function submitStageConfig(draft: StageConfigDraft) {
-    if (!scEditing) return;
-    const built = buildStageConfigPut(draft);
-    if (!built.ok) {
-      scFormError = built.error;
-      return;
-    }
-    scSaving = true;
-    scFormError = null;
-    try {
-      await putStageConfig(draft.stage, built.payload);
-      scEditing = null;
-      await loadStageConfigs();
-    } catch (err) {
-      // 400 { error }（provider 缺失/禁用/vendor 不支持、persona 不可读、会破坏启动的改动）原样回显
-      scFormError = (err as Error).message;
-    } finally {
-      scSaving = false;
-    }
-  }
-
-  async function removeStageConfig(config: StageConfig) {
-    scDeleteBusy = config.stage;
-    scRowError = null;
-    try {
-      await deleteStageConfig(config.stage);
-      scConfirmingDelete = null;
-      await loadStageConfigs();
-    } catch (err) {
-      // 404（无配置）/ 400（删除会破坏启动校验）都回显后端原因
-      scRowError = { stage: config.stage, message: (err as Error).message };
-      scConfirmingDelete = null;
-    } finally {
-      scDeleteBusy = null;
-    }
-  }
+  /* 阶段配置那一段（决策 198 裁决③ / 票 21）整体搬去 `#/settings/stages`
+     ——两边各留一套编辑器会让同一个 `PUT /stage-configs/{stage}` 互相覆盖。 */
 </script>
 
 <div class="page">
@@ -253,8 +155,8 @@
   </div>
 
   <p class="hintline">
-    provider 行 =（vendor, model, context_window）（决策 111）。api_key 明文存储，读接口只回显 <b>{API_KEY_MASK}</b>；
-    密钥明文存于本机 <b>~/.agentpipeline</b>，目录权限 <b>0700</b>（决策 112 / §12.14）。
+    provider 行 =（vendor, model, context_window）。api_key 明文存储，读接口只回显 <b>{API_KEY_MASK}</b>；
+    密钥明文存于本机 <b>~/.agentpipeline</b>，目录权限 <b>0700</b>。
   </p>
 
   {#if editing}
@@ -274,7 +176,17 @@
   {:else if loading}
     <div class="banner">正在加载 provider…</div>
   {:else if providers.length === 0}
-    <div class="banner">还没有 provider。新增一行后，任务的阶段模型才会被解析。</div>
+    <!-- 空态（票 13）：状态 → 下一步 → 可选入口。入口指向「设置 · 项目」：
+         配好模型之后下一件事就是接入一个本地仓库，那个动作在项目页上。容器沿用本页
+         既有的 `.banner`（与加载 / 错误提示同一只盒子），形状来自 `<EmptyState>`。 -->
+    <div class="banner">
+      <EmptyState
+        state="还没有 provider。"
+        next="新增一行并填好 model 与 api_key，任务的阶段模型才会被解析。"
+        href="#/settings/projects"
+        linkLabel="下一步：设置 · 项目"
+      />
+    </div>
   {:else}
     <div class="reg">
       <div class="reg-head">
@@ -294,7 +206,14 @@
                 {:else}
                   <span class="st dim">[OFF]</span>
                 {/if}
-                {#if !supported}<span class="warnnote inline">! 不受支持 · 决策 103</span>{/if}
+                {#if !supported}
+                  <!-- 决策 199 的定稿文案：正文只说动作与后果，编号不进正文（追溯见
+                       design/frontend-design.md §12.3 的行为映射表）。title 放理由、不夹编号
+                       ——`lib/copy-discipline.test.ts` 对 title 与模板文本一视同仁。 -->
+                  <span class="warnnote inline" title="厂商不在支持列表（supported_adapters）内">
+                    ! 不支持这个厂商，该行已停用
+                  </span>
+                {/if}
               </div>
               <div class="reg-l2 mono">
                 <span>ctx {p.context_window.toLocaleString('en-US')}</span>
@@ -350,96 +269,6 @@
     oninstall={installRecommended}
   />
   {#if skillError}<div class="error skills-error">{skillError}</div>{/if}
-
-  <!-- stage_configs 编辑器（决策 22 / 46 / 66 / 111 / 129）：GET 列表 / PUT 整条替换 / DELETE 撤销覆盖。 -->
-  <div class="sub-head">
-    <h2>阶段配置</h2>
-    <button type="button" class="btn" onclick={openNewStageConfig}>＋ 新增阶段配置</button>
-  </div>
-  <p class="hintline">
-    阶段 provider 优先于全局默认（决策 129）。保存为<b>整条替换</b>：留空字段清空为默认。写入会跑启动校验，非法配置（provider 缺失/禁用/厂商不支持、persona 不可读、会破坏启动的改动）被拒并回显原因（决策 47 / 103）。
-  </p>
-
-  {#if scEditing}
-    {#key scEditing.mode === 'new' ? 'sc-new' : scEditing.config.stage}
-      <StageConfigForm
-        config={scEditing.mode === 'edit' ? scEditing.config : null}
-        {providers}
-        {skills}
-        submitting={scSaving}
-        error={scFormError}
-        onsubmit={submitStageConfig}
-        oncancel={() => (scEditing = null)}
-      />
-    {/key}
-  {/if}
-
-  {#if scError}
-    <div class="banner error">{scError}</div>
-  {:else if scLoading}
-    <div class="banner">正在加载阶段配置…</div>
-  {:else if stageConfigs.length === 0}
-    <div class="banner">还没有阶段覆盖。所有阶段都在用系统默认配置。</div>
-  {:else}
-    <div class="reg">
-      <div class="reg-head">
-        <span>阶段配置</span>
-        <span class="n">▪ {stageConfigs.length}</span>
-      </div>
-      <ul class="reg-rows">
-        {#each stageConfigs as sc (sc.stage)}
-          <li class="reg-row row" class:pseudo={isPseudoStage(sc.stage)}>
-            <div class="reg-main">
-              <div class="reg-l1">
-                <span class="reg-name mono">{stageKeyLabel(sc.stage)}</span>
-                <span class="reg-sub mono">provider {sc.provider_id ?? '默认'}</span>
-                <span class="reg-sub mono">
-                  temp {sc.temperature ?? '默认'} · max_tokens {sc.max_tokens ?? '默认'}
-                </span>
-              </div>
-              <div class="reg-l2 mono">
-                <span>persona {sc.persona_path ?? '—'}</span>
-                <span>tools {sc.tools_json ? '已配置' : '—'}</span>
-                <span>skills {sc.skills_json ? '已配置' : '—'}</span>
-                <span>updated {formatDateTime(sc.updated_at)}</span>
-              </div>
-              {#if scRowError?.stage === sc.stage}
-                <div class="reg-err">{scRowError.message}</div>
-              {/if}
-            </div>
-            <div class="reg-acts">
-              {#if scConfirmingDelete === sc.stage}
-                <span class="reg-sub">确认撤销覆盖？</span>
-                <button
-                  type="button"
-                  class="btn danger"
-                  disabled={scDeleteBusy === sc.stage}
-                  onclick={() => removeStageConfig(sc)}
-                >
-                  {#if scDeleteBusy === sc.stage}<span class="spin"></span>{/if}删除
-                </button>
-                <button type="button" class="btn quiet" onclick={() => (scConfirmingDelete = null)}>
-                  取消
-                </button>
-              {:else}
-                <button type="button" class="btn" onclick={() => openEditStageConfig(sc)}>编辑</button>
-                <button
-                  type="button"
-                  class="btn danger"
-                  onclick={() => {
-                    scRowError = null;
-                    scConfirmingDelete = sc.stage;
-                  }}
-                >
-                  删除
-                </button>
-              {/if}
-            </div>
-          </li>
-        {/each}
-      </ul>
-    </div>
-  {/if}
 </div>
 
 <style>
@@ -461,6 +290,12 @@
   .warnnote.inline {
     margin-top: 0;
   }
+  /* 票 12 / 决策 203 裁决③：不受支持的厂商是**规格明文允许**的琥珀用法（「该行已停用」——
+     用户得动手处理：换厂商或删掉这一行），故**保留** app.css 里 `.warnnote` 的 `--pending`，
+     本页不再覆盖它。收敛掉的是那些回答不了「这里要用户处理什么」的地方（推荐技能的
+     「未安装」标签、手机访问入口闸标题），不是这一处。 */
+  /* 票 04：破坏性动作不比中性动作轻——定档在 app.css 的 `.btn.danger` 上（全站一处），
+     本页不再复制一份局部覆盖（票 04 的诉求是「删除」这一类动作的整体量级，不是某一页）。 */
   /* 技能目录 / 推荐清单的失败提示：不挡整页，只提示那一块降级了 */
   .skills-error {
     margin-bottom: 14px;
@@ -469,9 +304,5 @@
     color: var(--stop);
     font-size: 12px;
     line-height: 1.6;
-  }
-  /* 决策 84：伪阶段用左缘 4px --text-3 亮度阶 + 名称后缀「（伪阶段）」，不用分支色相 */
-  .row.pseudo {
-    border-left: 4px solid var(--text-3);
   }
 </style>

@@ -18,6 +18,7 @@
   } from '../api/types';
   import { CompositionGuard, shouldSubmitOnEnter } from '../lib/enterToSend';
   import { addRepo, removeRepo, validateRepo } from '../lib/marketRepos';
+  import EmptyState from '../components/ui/EmptyState.svelte';
 
   /**
    * 设置 · 技能市场（决策 194 换了整层的来源，页骨架照决策 187 不动）。
@@ -314,7 +315,14 @@
       </p>
 
       {#if draft.length === 0}
-        <div class="blank">仓名单是空的。填一个 owner/repo 才能看到它里面的技能。</div>
+        <!-- 空态（票 13）：状态 → 下一步 → 可选入口，形状来自 `<EmptyState>`；
+             容器沿用本页的虚线空盒 `.blank`（与「仓名单 / 技能列表」两块的分界一致）。 -->
+        <div class="blank">
+          <EmptyState
+            state="仓名单是空的。"
+            next="填一个 owner/repo 加进来并保存，就能看到它里面的技能。"
+          />
+        </div>
       {:else}
         <ul class="src-list">
           {#each draft as r (r)}
@@ -414,10 +422,18 @@
 
       {#if config.repos.length === 0}
         <div class="blank">
-          一个仓都没放行。先在上面填一个 owner/repo 并保存，再回来看它里面有什么。
+          <EmptyState
+            state="一个仓都没放行。"
+            next="先在上面填一个 owner/repo 并保存，再回来看它里面有什么。"
+          />
         </div>
       {:else if selectedRepo === null}
-        <div class="blank">选一个仓查看它里面的技能：点上面仓名单里的「查看技能」。</div>
+        <div class="blank">
+          <EmptyState
+            state="还没有选仓。"
+            next="点上面仓名单里的「查看技能」，看它里面有什么。"
+          />
+        </div>
       {:else if listing}
         <div class="banner">正在读 {selectedRepo}…</div>
       {:else if listError}
@@ -529,9 +545,9 @@
         </div>
         <p class="sub">
           技能已落到技能根，<b>还没有任何阶段在用它</b>。要启用请到
-          <a href="#/settings/providers">设置 · 模型与密钥</a>的阶段配置里声明——新声明默认只能是
+          <a href="#/settings/stages">设置 · 阶段配置</a>里声明——新声明默认只能是
           <span class="mono">name</span> 模式 + 未受信任（正文由 <span class="mono">Skill</span>
-          工具按需拉取，决策 181⑤）。
+          工具按需拉取）。
         </p>
         <div class="prev">
           <div class="prev-col">

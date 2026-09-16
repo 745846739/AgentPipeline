@@ -16,6 +16,13 @@
     busy?: boolean;
     /** 仅渲染动作行（窄屏底部动作坞复用，§5 转写 3）。 */
     actionsOnly?: boolean;
+    /**
+     * 用户已经停在主区 Diff 页签（票 08）→ 本面板不渲染 diff 正文，只留**状态摘要**
+     * （统计行 / 陈旧与错误提示）+ 动作行：同一屏两份同样的 diff 会让「哪个是真的」
+     * 变成问题，而档案盒存在的理由是「不切页签也能拍板」——动作行是红线，始终在。
+     * `actionsOnly` 优先于本开关（移动款底部动作坞本来就没有 diff 正文）。
+     */
+    diffInPane?: boolean;
     onaction?: (action: AllowedAction, opts: { cursorId?: string; input?: string }) => void;
     onreload?: () => void;
   }
@@ -30,6 +37,7 @@
     loading = false,
     busy = false,
     actionsOnly = false,
+    diffInPane = false,
     onaction,
     onreload,
   }: Props = $props();
@@ -69,24 +77,30 @@
       <div class="error">{error}</div>
     {/if}
 
-    {#if stats && stats.file_details.length > 0}
-      <div class="breakdown mono">
-        {#each stats.file_details as f (f.path)}
-          <span class="fdetail">
-            <span class="path">{f.path}</span>
-            <span class="a">+{f.additions}</span>
-            <span class="d">−{f.deletions}</span>
-          </span>
-        {/each}
-      </div>
-    {/if}
-
-    {#if loading}
-      <div class="hint">正在加载 diff…</div>
+    {#if diffInPane}
+      <!-- 票 08：用户已经停在主区 Diff 页签 → 右栏只留结论与动作，不再摆第二份 diff。
+           这句话是必要的：不说，用户会以为 diff 没了（同一屏两份的另一种坏法）。 -->
+      <div class="hint">diff 正文在 Diff 页签里展开，这里只留结论与动作。</div>
     {:else}
-      <div class="diff-scroll">
-        <DiffView parsed={diff} {raw} />
-      </div>
+      {#if stats && stats.file_details.length > 0}
+        <div class="breakdown mono">
+          {#each stats.file_details as f (f.path)}
+            <span class="fdetail">
+              <span class="path">{f.path}</span>
+              <span class="a">+{f.additions}</span>
+              <span class="d">−{f.deletions}</span>
+            </span>
+          {/each}
+        </div>
+      {/if}
+
+      {#if loading}
+        <div class="hint">正在加载 diff…</div>
+      {:else}
+        <div class="diff-scroll">
+          <DiffView parsed={diff} {raw} />
+        </div>
+      {/if}
     {/if}
   {/if}
 

@@ -2,6 +2,7 @@
   import type { NodeCommand } from '../../api/types';
   import { formatClock } from '../../lib/format';
   import { formatDuration } from '../../lib/pipeline';
+  import EmptyState from '../ui/EmptyState.svelte';
 
   interface Props {
     commands: NodeCommand[];
@@ -46,7 +47,11 @@
 </script>
 
 {#if commands.length === 0}
-  <div class="empty">还没有命令记录。</div>
+  <!-- 空态的唯一形状（票 13）：状态 → 下一步。 -->
+  <EmptyState
+    state="还没有命令记录。"
+    next="节点每跑一条命令都会记在这里：命令、耗时、退出码，点开看完整输出。"
+  />
 {:else}
   <div class="cmds">
     {#each commands as command (command.id)}
@@ -109,7 +114,7 @@
     background: var(--stop);
   }
   .tm {
-    color: var(--text-4);
+    color: var(--text-3);
     width: 62px;
     flex: none;
   }
@@ -162,10 +167,6 @@
   }
   .cmdout .fin {
     color: var(--go);
-  }
-  .empty {
-    color: var(--text-3);
-    font-size: 12px;
   }
 
   /* 桌面：两行容器不生成盒子，用 order 还原原列序（ok · tm · src · 命令 · ms · ex · 输出） */

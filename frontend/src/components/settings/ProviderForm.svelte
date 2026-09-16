@@ -106,7 +106,7 @@
   {#if !supported && draft.vendor.trim()}
     <div class="warn">
       厂商 <span class="mono">{draft.vendor.trim()}</span> 不在 supported_adapters
-      （{SUPPORTED_ADAPTERS.join(' / ')}）内：该行会降级灰显，被 stage_configs 引用时配置加载会拒绝启动（决策 103）。
+      （{SUPPORTED_ADAPTERS.join(' / ')}）内：该行会降级灰显，被 stage_configs 引用时配置加载会拒绝启动。
     </div>
   {/if}
 
@@ -178,11 +178,13 @@
     color: var(--text-3);
     margin-bottom: 4px;
   }
+  /* 票 12：同一条「厂商不受支持」的事实，在台账行里已回中性档，表单里也照同一口径
+     （琥珀只留给有东西要你处理的地方；这里是提示，不是待办）。 */
   .warn {
     margin-top: 10px;
     padding: 7px 10px;
-    border: 2px solid var(--pending);
-    color: var(--pending);
+    border: 2px solid var(--pane);
+    color: var(--text-3);
     font-size: 12px;
     line-height: 1.6;
   }
@@ -205,7 +207,9 @@
     font-size: 12px;
     margin-top: 8px;
   }
-  /* 「测试连接」结果行（决策 160）：绿 = 通，红 = 不通，琥珀 = 未定 */
+  /* 「测试连接」结果行（决策 160）：绿 = 通，红 = 不通，琥珀 = 未定。
+     票 12 逐处判定：**保留**——这一档是「还没定论、要你再看一眼」的告警位；实修中
+     `class:ok` / `class:fail` 恒有一真，故当前渲染不出琥珀，留着是给「未定」那一档的位子。 */
   .test-result {
     margin-top: 8px;
     padding: 7px 10px;
@@ -220,7 +224,8 @@
     border-color: var(--stop);
   }
   .test-result .dim {
-    color: var(--text-4);
+    /* 票 15 归位（决策 195）：延迟与诊断是要人读的结论行，不是装饰刻度。 */
+    color: var(--text-3);
     font-size: 12px;
     word-break: break-all;
   }

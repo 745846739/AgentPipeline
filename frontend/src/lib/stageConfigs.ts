@@ -282,9 +282,10 @@ export function setSkillMode(decls: SkillDeclDraft[], index: number, mode: Skill
   const target = decls[index];
   if (!target) return { ok: false, error: '技能不存在。' };
   if (mode === 'full' && !canSwitchToFull(target)) {
+    // 决策 172④：未受信任的技能不得注入全文。文案不带编号（决策 199）。
     return {
       ok: false,
-      error: `技能 ${target.name} 未受信任，不能注入全文（决策 172④）。请先确认信任此技能，或改用「仅注入名字」。`,
+      error: `技能 ${target.name} 未受信任，不能注入全文。请先确认信任此技能，或改用「仅注入名字」。`,
     };
   }
   const next = decls.map((d, i) => (i === index ? { ...d, mode, bare: false } : d));

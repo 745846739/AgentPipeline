@@ -1,8 +1,12 @@
 // 给四款终端原型逐个视图截图：桌面 3 视图 / 移动 4 视图。
 // 视口高度先按内容撑满再截，避免 position:fixed 的底栏被钉在视口中部。
+import { fileURLToPath } from 'node:url';
+
 const port = process.argv[2] || '9222';
-const root = '/Users/lazyking/Documents/AgentPipeline/design';
-const out = '/Users/lazyking/Documents/AgentPipeline/.scratch/shots';
+// 路径从脚本自身位置推导（脚本在 `<repo>/.scratch/shots/`），不再写死本机绝对路径。
+const here = new URL('.', import.meta.url);
+const root = fileURLToPath(new URL('../../design/', here));
+const out = fileURLToPath(here);
 
 const list = await (await fetch(`http://127.0.0.1:${port}/json/list`)).json();
 const page = list.find((t) => t.type === 'page');

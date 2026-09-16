@@ -1,5 +1,6 @@
 <script lang="ts">
   import type { ParsedDiff } from '../../lib/diff';
+  import EmptyState from '../ui/EmptyState.svelte';
 
   interface Props {
     parsed: ParsedDiff | null;
@@ -32,7 +33,11 @@
 {:else if raw}
   <pre class="raw mono">{raw}</pre>
 {:else}
-  <div class="empty">没有可渲染的 diff。</div>
+  <!-- 空态的唯一形状（票 13）：状态 → 下一步。 -->
+  <EmptyState
+    state="没有可渲染的 diff。"
+    next="变更生成后，这里会列出改动的文件与逐行增删。"
+  />
 {/if}
 
 <style>
@@ -119,10 +124,5 @@
     font-size: 12px;
     white-space: pre-wrap;
     color: var(--text-2);
-  }
-  .empty {
-    color: var(--text-3);
-    font-size: 12px;
-    padding: 12px 0;
   }
 </style>

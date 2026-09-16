@@ -232,6 +232,8 @@
   .lamp.go {
     background: var(--go);
   }
+  /* 票 12 逐处判定：**保留琥珀**——未信任是「要不要信这个技能」的待办，且带空心灯的第二编码
+     （决策 195：信号色作标记、且已有第二编码的那些不动）。 */
   .lamp.pend {
     background: var(--pending);
   }
@@ -277,10 +279,11 @@
   .pick:hover {
     color: var(--go);
   }
+  /* 票 12：「手动触发」是技能的一项属性说明，不是待办——回中性档，琥珀留给要人处理的地方。 */
   .tag {
-    border: 2px solid var(--pending);
+    border: 2px solid var(--pane);
     padding: 0 4px;
-    color: var(--pending);
+    color: var(--text-3);
     font-size: 12px;
   }
   .add {

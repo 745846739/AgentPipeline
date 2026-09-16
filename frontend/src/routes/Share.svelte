@@ -10,6 +10,7 @@
     setServerLan,
   } from '../api/client';
   import type { ServerAddress, ServerInfo } from '../api/types';
+  import EmptyState from '../components/ui/EmptyState.svelte';
   import { changeLanMode } from '../lib/lanToggle';
   import { sharePanel } from '../lib/sharePairing';
 
@@ -182,11 +183,12 @@
   {:else if info}
     {#if info.loopback_only}
       <section class="gate">
-        <div class="gate-head">手机现在连不上这台机器</div>
-        <p>
-          手机和电脑不在同一个地址空间：<b>127.0.0.1</b>（当前绑定 <span class="mono">{info.host}</span
-          >）在手机上指向手机自己，扫码必然打不开。要让手机访问，得让服务监听局域网网卡。
-        </p>
+        <!-- 空态（票 13）+ 琥珀收敛（票 12）：这一块是「现在什么也拿不到 + 下一步按哪颗钮」，
+             不是告警，故标题回到中性亮档；片段形状来自 `<EmptyState>`。 -->
+        <EmptyState
+          state="手机现在连不上这台机器"
+          next="手机和电脑不在同一个地址空间：127.0.0.1（当前绑定 {info.host}）在手机上指向手机自己，扫码必然打不开。要让手机访问，得让服务监听局域网网卡——按下面那颗钮。"
+        />
         <!-- 决策 186：这一颗就是「改绑」的入口，不必再去改环境变量重启。 -->
         <div class="switch">
           <button
@@ -203,7 +205,7 @@
         {#if switchError}<p class="note bad">{switchError}</p>{/if}
         <p class="note">
           手机加载的页面与 API <span class="hi">同源</span>，因此无需额外放行 origin
-          （跨源防护只拦异源写请求，同源写请求自带客户端头，决策 128 / 153③）。
+          （跨源防护只拦异源写请求，同源写请求自带客户端头）。
         </p>
         <p class="note">
           改绑<b>只允许从本机</b>发起（局域网来源 403）——否则同网段的任何设备都能把它打开。
@@ -219,7 +221,7 @@ host = "0.0.0.0"</code></pre>
           <p class="how">桌面应用启动时带上环境变量：</p>
           <pre><code>AGENTPIPELINE_LAN=1</code></pre>
           <p class="note">
-            启动时指定的绑定<b>优先于这里的按钮</b>（决策 186）：那样启动时，按钮只改得动
+            启动时指定的绑定<b>优先于这里的按钮</b>：那样启动时，按钮只改得动
             这一次，重启后仍按启动参数来。当前这次绑定来自
             <span class="mono">{info.bind_source === 'startup' ? '启动参数' : info.bind_source === 'settings' ? '界面设置' : '配置文件'}</span>。
           </p>
@@ -231,11 +233,11 @@ host = "0.0.0.0"</code></pre>
       </section>
     {:else if addresses.length === 0}
       <section class="gate">
-        <div class="gate-head">没有找到可用的局域网地址</div>
-        <p>
-          服务已绑定 <span class="mono">{info.host}:{info.port}</span>，但网卡枚举没有返回
-          可访问的 IPv4 地址。可能是终端缺少网络信息权限，或本机当前没有连上局域网。
-        </p>
+        <!-- 空态（票 13）：网卡枚举没给出可用地址——说清状态与下一步，再给手动办法。 -->
+        <EmptyState
+          state="没有找到可用的局域网地址"
+          next="服务已绑定 {info.host}:{info.port}，但网卡枚举没有返回可访问的 IPv4 地址——可能是终端缺少网络信息权限，或这台机器当前没有连上局域网。"
+        />
         <p class="note">
           可手动用本机局域网 IP 访问：<span class="mono">http://&lt;本机 IP&gt;:{info.port}</span>
         </p>
@@ -274,7 +276,10 @@ host = "0.0.0.0"</code></pre>
             <!-- 走到这里必定带着令牌（决策 189）：没有令牌的码根本不会画出来 -->
             <div class="pair">
               <span class="pair-note">
-                二维码已带上配对令牌：扫这一次，这台手机就能改任务、也能跟值班长说话。
+                <!-- 隐喻首现翻译（决策 200，票 25）：本页第一次出现「值班长」，给一次平实说法。
+                     行内全宽括号紧跟词后、与词同字号同色档（都在这一句里），页内不重复；
+                     后面那处不再解释。 -->
+                二维码已带上配对令牌：扫这一次，这台手机就能改任务、也能跟值班长（跟我对话的 AI）说话。
               </span>
               <button type="button" class="btn" disabled={reset} onclick={() => void doReset()}>
                 {reset ? '正在重置…' : '重置配对'}
@@ -315,12 +320,11 @@ host = "0.0.0.0"</code></pre>
             </p>
             <p class="note">先刷新这一页重试一次；还是失败的话，去跑服务的那台电脑上看日志。</p>
           {:else}
-            <div class="gate-head">二维码要在这台电脑本机上打开本页才拿得到</div>
-            <p>
-              配对令牌只允许本机读取（这是它作为凭据的前提），而这一页现在是从
-              <span class="mono">{origin}</span> 打开的，读不到它。<b>没有令牌的二维码扫了也配不上</b
-              >，所以这里不再画一张扫不出结果的码。
-            </p>
+            <!-- 空态（票 13）：状态 → 下一步；「没有令牌的码扫了也配不上」必须说在明处。 -->
+            <EmptyState
+              state="二维码要在这台电脑本机上打开本页才拿得到"
+              next="配对令牌只允许本机读取（这是它作为凭据的前提），而这一页现在是从 {origin} 打开的，读不到它。没有令牌的二维码扫了也配不上，所以这里不再画一张扫不出结果的码。"
+            />
             <p class="note">
               在这台跑服务的电脑上打开
               <span class="mono">http://127.0.0.1:{info.port}/#/share</span>
@@ -486,7 +490,8 @@ host = "0.0.0.0"</code></pre>
     border: 2px solid var(--go);
     padding: 0 5px;
   }
-  /* 仅回环绑定 / 无地址：琥珀标题的指引块（决策 167） */
+  /* 仅回环绑定 / 无地址：**中性档**的指引块（票 12：琥珀只出现在有东西要你处理的地方，
+     入口闸的标题是「现在拿不到什么 + 下一步按哪颗钮」，回到亮档；无待办时不用告警色）。 */
   .gate {
     border: 2px solid var(--pane);
     background: var(--panel);
@@ -495,7 +500,7 @@ host = "0.0.0.0"</code></pre>
     color: var(--text-2);
   }
   .gate-head {
-    color: var(--pending);
+    color: var(--text-hi);
     font-size: 24px;
     margin-bottom: 10px;
   }
@@ -550,6 +555,8 @@ host = "0.0.0.0"</code></pre>
   .hi {
     color: var(--text-hi);
   }
+  /* 票 12 逐处判定：**保留琥珀**——开放局域网前要确认网段可信，这是要用户拍板的风险提示
+     （不是「渲染出一个事实」），与入口闸标题那处不同。 */
   .warn {
     margin-top: 16px;
     border-top: 2px solid var(--wash);

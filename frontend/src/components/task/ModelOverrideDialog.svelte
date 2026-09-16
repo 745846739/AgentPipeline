@@ -1,5 +1,6 @@
 <script lang="ts">
   import type { Provider } from '../../api/types';
+  import Modal from '../ui/Modal.svelte';
 
   interface Props {
     open: boolean;
@@ -16,69 +17,40 @@
   $effect(() => {
     if (open && !providerId) providerId = providers.find((p) => p.enabled)?.id ?? providers[0]?.id ?? '';
   });
+
+  function submit(e: SubmitEvent) {
+    e.preventDefault();
+    if (providerId) onsubmit(providerId);
+  }
 </script>
 
-{#if open}
-  <div
-    class="overlay"
-    role="presentation"
-    onclick={(e) => {
-      if (e.target === e.currentTarget) onclose();
-    }}
-    onkeydown={(e) => e.key === 'Escape' && onclose()}
-  >
-    <form
-      class="dialog panel"
-      onsubmit={(e) => {
-        e.preventDefault();
-        if (providerId) onsubmit(providerId);
-      }}
-    >
-      <div class="head cond">更换长上下文模型</div>
-      <div class="hint">仅影响本任务后续节点（决策 105 / 129），不改全局 stage config。</div>
-      {#if providers.length === 0}
-        <div class="error">还没有配置 provider，请先到「设置 · 模型与密钥」添加。</div>
-      {:else}
-        <select class="input" bind:value={providerId}>
-          {#each providers as p (p.id)}
-            <option value={p.id} disabled={!p.enabled}>
-              {p.vendor} · {p.model} · {p.context_window} ctx
-            </option>
-          {/each}
-        </select>
-      {/if}
-      {#if error}<div class="error">{error}</div>{/if}
-      <div class="actions">
-        <button type="button" class="btn quiet" onclick={onclose}>取消</button>
-        <button type="submit" class="btn solid" disabled={submitting || !providerId}>
-          {#if submitting}<span class="spin"></span>{/if}
-          应用
-        </button>
-      </div>
-    </form>
-  </div>
-{/if}
+<Modal
+  {open}
+  width={460}
+  title="更换长上下文模型"
+  submitLabel="应用"
+  {submitting}
+  submitDisabled={!providerId}
+  {onclose}
+  onsubmit={submit}
+>
+  <!-- 正文只说影响范围（决策 199：编号退场，只留动作与后果）。 -->
+  <div class="hint">只影响本任务后续节点，不改全局阶段配置。</div>
+  {#if providers.length === 0}
+    <div class="error">还没有配置 provider，请先到「设置 · 模型与密钥」添加。</div>
+  {:else}
+    <select class="input" bind:value={providerId}>
+      {#each providers as p (p.id)}
+        <option value={p.id} disabled={!p.enabled}>
+          {p.vendor} · {p.model} · {p.context_window} ctx
+        </option>
+      {/each}
+    </select>
+  {/if}
+  {#if error}<div class="error">{error}</div>{/if}
+</Modal>
 
 <style>
-  .overlay {
-    position: fixed;
-    inset: 0;
-    z-index: 60;
-    background: var(--overlay);
-    display: flex;
-    align-items: center;
-    justify-content: center;
-  }
-  .dialog {
-    width: 460px;
-    max-width: calc(100vw - 32px);
-    padding: 18px 20px;
-  }
-  .head {
-    font-size: 12px;
-    color: var(--text-hi);
-    margin-bottom: 8px;
-  }
   .hint {
     font-size: 12px;
     color: var(--text-3);
@@ -88,11 +60,5 @@
     color: var(--stop);
     font-size: 12px;
     margin-top: 6px;
-  }
-  .actions {
-    display: flex;
-    justify-content: flex-end;
-    gap: 8px;
-    margin-top: 12px;
   }
 </style>

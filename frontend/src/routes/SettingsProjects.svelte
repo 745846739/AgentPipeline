@@ -1,5 +1,5 @@
 <script lang="ts">
-  import { onMount } from 'svelte';
+  import { onMount, tick } from 'svelte';
   import {
     createProject,
     deleteProject,
@@ -12,6 +12,8 @@
   import type { Project, ProjectAnalysis } from '../api/types';
   import AnalysisChecklist from '../components/settings/AnalysisChecklist.svelte';
   import ProjectForm from '../components/settings/ProjectForm.svelte';
+  import EmptyState from '../components/ui/EmptyState.svelte';
+  import { router } from '../router.svelte';
   import {
     ANALYSIS_POLL_TIMEOUT_MS,
     analysisPollDelayMs,
@@ -51,6 +53,35 @@
   let analysis = $state<ProjectAnalysis | null>(null);
   let analysisError = $state<string | null>(null);
 
+  /**
+   * 项目分析入口的 query（brief §二 末尾那张跨流接口表，票 07）。
+   *
+   * 形状是冻结契约：`#/settings/projects?project=<id>&analyze=1`。参数名逐字照抄，
+   * 由 N 的 `router.svelte.ts` 解析成已解码的 `query`（没有查询串时是空对象）。
+   * 读不到 query 时本页行为不变（不标行、也不触发分析）。
+   */
+  function readQuery(): { project: string | null; analyze: boolean } {
+    const query = router.route.query;
+    return { project: query.project ?? null, analyze: query.analyze === '1' };
+  }
+
+  /** 从任务侧指过来的那一行（票 07）：据 query 标出来，就是「已按该项目就位」。 */
+  const spotlightId = $derived(readQuery().project);
+
+  /**
+   * 据 query 自动就位并触发分析（票 07）。只认列表里真有的项目 id——不认识的 id 不猜，
+   * 页面保持原样。触发放在列表到手之后（`analyze()` 要一个真正的项目对象）。
+   */
+  async function applyQuery() {
+    const { project: pid, analyze: autoAnalyze } = readQuery();
+    if (!pid) return;
+    const target = projects.find((p) => p.id === pid);
+    if (!target) return;
+    if (autoAnalyze) await analyze(target);
+    await tick();
+    document.querySelector('.reg-row.current')?.scrollIntoView({ block: 'nearest' });
+  }
+
   async function loadActiveCounts() {
     try {
       const tasks = await listTasks({ include_archived: false });
@@ -78,7 +109,7 @@
     }
   }
 
-  onMount(() => void load());
+  onMount(() => void load().then(() => applyQuery()));
 
   function sleep(ms: number): Promise<void> {
     return new Promise((resolve) => setTimeout(resolve, ms));
@@ -174,7 +205,7 @@
   </div>
 
   <p class="hintline">
-    本地路径是项目唯一事实来源（决策 29）。创建时立即校验 git 仓库（决策 61）；<b>删除有活跃任务的项目会被拒绝并给出原因</b>（决策 101）。
+    本地路径是项目唯一事实来源。创建时立即校验 git 仓库；<b>有活跃任务的项目不能删除</b>——点「删除」时会先告诉你去处理哪几个任务。
   </p>
 
   {#if editing}
@@ -194,7 +225,13 @@
   {:else if loading}
     <div class="banner">正在加载项目…</div>
   {:else if projects.length === 0}
-    <div class="banner">还没有项目。新建一个本地 git 仓库后才能创建任务。</div>
+    <!-- 空态（票 13）：状态 → 下一步；形状来自 `<EmptyState>`，各页同一套语汇。 -->
+    <div class="banner">
+      <EmptyState
+        state="还没有项目。"
+        next="用右上角的「＋ 新建项目」加一个本地 git 仓库（要已初始化且有提交），加进来之后才能创建任务。"
+      />
+    </div>
   {:else}
     <div class="reg">
       <div class="reg-head">
@@ -204,7 +241,7 @@
       <ul class="reg-rows">
         {#each projects as p (p.id)}
           {@const active = activeCounts[p.id] ?? 0}
-          <li class="reg-row row">
+          <li class="reg-row row" class:current={spotlightId === p.id}>
             <div class="reg-main">
               <div class="reg-l1">
                 <span class="reg-name">{p.name}</span>
@@ -217,9 +254,6 @@
                 <span>lint {p.lint_command ?? '—'}</span>
                 <span>AGENTS.md {p.agents_md_path ?? '—'}</span>
               </div>
-              {#if active > 0}
-                <div class="reg-err">该项目有 {active} 个活跃任务，不能删除（决策 101）。</div>
-              {/if}
               {#if rowError?.id === p.id}<div class="reg-err">{rowError.message}</div>{/if}
             </div>
             <div class="reg-acts">
@@ -228,7 +262,7 @@
                 <button
                   type="button"
                   class="btn danger"
-                  disabled={deleteBusy === p.id || active > 0}
+                  disabled={deleteBusy === p.id}
                   onclick={() => remove(p)}
                 >
                   {#if deleteBusy === p.id}<span class="spin"></span>{/if}删除
@@ -249,10 +283,18 @@
                 <button
                   type="button"
                   class="btn danger"
-                  disabled={active > 0}
-                  title={active > 0 ? `该项目有 ${active} 个活跃任务，不能删除（决策 101）` : undefined}
+                  title={active > 0 ? '有活跃任务的项目不能删除' : undefined}
                   onclick={() => {
                     rowError = null;
+                    // 票 04 / 决策 199：理由只在**动手时**出现，给的是下一步而不是「不能删」的原因；
+                    // 编号退到上面的 title。计数是刚取到的读数，后端 409 仍是最后一道闸。
+                    if (active > 0) {
+                      rowError = {
+                        id: p.id,
+                        message: `先去处理那 ${active} 个任务，然后再删除这个项目。`,
+                      };
+                      return;
+                    }
                     confirmingDelete = p.id;
                   }}
                 >
@@ -270,7 +312,11 @@
     {#if analysisError}
       <div class="banner error">{analysisError}</div>
     {:else if analysis}
-      <AnalysisChecklist {analysis} onclose={() => (analysisFor = null)} />
+      <AnalysisChecklist
+        {analysis}
+        project={projects.find((p) => p.id === analysisFor)?.name ?? analysisFor}
+        onclose={() => (analysisFor = null)}
+      />
     {:else}
       <section class="analysis">
         <div class="running">
@@ -311,4 +357,16 @@
     font-size: 12px;
     color: var(--text-2);
   }
+  /* 票 07：据 query 就位的那一行。这一页没有「当前项目」这种状态，故不是选中态——
+     只是「你从任务那边指过来的就是这一行」的位置标记（左缘亮描边 + wash 底）。
+     描边用像素纪律里那条唯一的例外写法 `border-left: 4px`（其余描边一律 2px），
+     并用 `padding-left` 抵掉多出来的 4px（本行本来没有左边框），内容不错位。 */
+  .reg-row.current {
+    background: var(--wash);
+    border-left: 4px solid var(--text-hi);
+    padding-left: 8px;
+  }
+  /* 票 04：破坏性动作不比中性动作轻——定档在 app.css 的 `.btn.danger` 上（全站一处：
+     项目页的「删除」、市场页的「覆盖安装」、技能声明的「移除」都吃这一档），
+     本页不再复制一份局部覆盖。 */
 </style>

@@ -1,5 +1,6 @@
 <script lang="ts">
   import type { SplitTaskSpec } from '../../api/client';
+  import Modal from '../ui/Modal.svelte';
 
   interface Props {
     open: boolean;
@@ -26,53 +27,24 @@
   }
 </script>
 
-{#if open}
-  <div
-    class="overlay"
-    role="presentation"
-    onclick={(e) => {
-      if (e.target === e.currentTarget) onclose();
-    }}
-    onkeydown={(e) => e.key === 'Escape' && onclose()}
-  >
-    <form class="dialog panel" onsubmit={submit}>
-      <div class="head cond">拆分任务</div>
-      <div class="hint">
-        每行一个子任务，格式 <span class="mono">标题 | 描述</span>。原任务将被置为 cancelled（决策 105）。
-      </div>
-      <textarea class="input mono" rows="6" bind:value={text} placeholder="实现 A 部分 | 说明…&#10;实现 B 部分"></textarea>
-      {#if error}<div class="error">{error}</div>{/if}
-      <div class="actions">
-        <button type="button" class="btn quiet" onclick={onclose}>取消</button>
-        <button type="submit" class="btn solid" disabled={submitting}>
-          {#if submitting}<span class="spin"></span>{/if}
-          确认拆分
-        </button>
-      </div>
-    </form>
+<Modal
+  {open}
+  width={520}
+  title="拆分任务"
+  submitLabel="确认拆分"
+  {submitting}
+  {onclose}
+  onsubmit={submit}
+>
+  <!-- 正文只说动作与后果：拆分后原任务会怎样，而不是内部编号（决策 199）。 -->
+  <div class="hint">
+    每行一个子任务，格式 <span class="mono">标题 | 描述</span>。拆分后原任务会被取消。
   </div>
-{/if}
+  <textarea class="input mono" rows="6" bind:value={text} placeholder="实现 A 部分 | 说明…&#10;实现 B 部分"></textarea>
+  {#if error}<div class="error">{error}</div>{/if}
+</Modal>
 
 <style>
-  .overlay {
-    position: fixed;
-    inset: 0;
-    z-index: 60;
-    background: var(--overlay);
-    display: flex;
-    align-items: center;
-    justify-content: center;
-  }
-  .dialog {
-    width: 520px;
-    max-width: calc(100vw - 32px);
-    padding: 18px 20px;
-  }
-  .head {
-    font-size: 12px;
-    color: var(--text-hi);
-    margin-bottom: 8px;
-  }
   .hint {
     font-size: 12px;
     color: var(--text-3);
@@ -82,11 +54,5 @@
     color: var(--stop);
     font-size: 12px;
     margin-top: 6px;
-  }
-  .actions {
-    display: flex;
-    justify-content: flex-end;
-    gap: 8px;
-    margin-top: 12px;
   }
 </style>

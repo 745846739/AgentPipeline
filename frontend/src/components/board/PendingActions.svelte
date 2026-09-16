@@ -134,7 +134,7 @@
             type="button"
             class="btn quiet block add"
             disabled={disabled || !sideEffectEnabled(action, pendingType) || busy(action, group.cursorId)}
-            title={!sideEffectEnabled(action, pendingType) ? '无配对端点（决策 101）' : action.label}
+            title={!sideEffectEnabled(action, pendingType) ? '这个动作没有配对的端点' : action.label}
             onclick={() => submit(action, group.cursorId)}
           >
             {action.label}
@@ -173,6 +173,7 @@
     color: var(--branch-tst);
   }
   .grp-label {
+    /* 分组名：冻结原型 `.grp` 就是装饰档，决策 195 的归位清单里也没有它——保持不动 */
     font-size: 12px;
     color: var(--text-4);
     letter-spacing: 0.08em;

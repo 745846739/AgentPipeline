@@ -1,6 +1,7 @@
 <script lang="ts">
   import { board } from '../../stores/board.svelte';
   import { router } from '../../router.svelte';
+  import Modal from '../ui/Modal.svelte';
 
   interface Props {
     open: boolean;
@@ -15,6 +16,15 @@
   let reviewMode = $state<'agent' | 'human'>('agent');
   let submitting = $state(false);
   let error = $state<string | null>(null);
+
+  /**
+   * 依赖候选（票 05）：当前项目**已有的任务**，用标题区分。
+   *
+   * 列表来源就是看板已经在用的那一份（`board.tasks`，由 `loadTasks` 按项目拉取）——
+   * 本 effort 零新端点，也不做完整选择器：只在同一个输入框上挂一个原生候选项列表，
+   * 手打与粘贴的路径原样保留。
+   */
+  const candidates = $derived(board.tasks.filter((t) => t.project_id === projectId));
 
   // 打开时同步默认项目
   $effect(() => {
@@ -56,93 +66,70 @@
   }
 </script>
 
-{#if open}
-  <div
-    class="overlay"
-    role="presentation"
-    onclick={(e) => {
-      if (e.target === e.currentTarget) onclose();
-    }}
-    onkeydown={(e) => e.key === 'Escape' && onclose()}
-  >
-    <form class="dialog panel" onsubmit={submit}>
-      <div class="head cond">新建任务</div>
+<Modal
+  {open}
+  width={480}
+  title="新建任务"
+  submitLabel="创建并启动"
+  {submitting}
+  {onclose}
+  onsubmit={submit}
+>
+  <label class="field">
+    <span>项目</span>
+    <select class="input" bind:value={projectId}>
+      {#each board.projects as p (p.id)}
+        <option value={p.id}>{p.name}</option>
+      {/each}
+    </select>
+  </label>
 
-      <label class="field">
-        <span>项目</span>
-        <select class="input" bind:value={projectId}>
-          {#each board.projects as p (p.id)}
-            <option value={p.id}>{p.name}</option>
-          {/each}
-        </select>
-      </label>
+  <label class="field">
+    <span>标题</span>
+    <input class="input" bind:value={title} placeholder="一句话说明要做什么" />
+  </label>
 
-      <label class="field">
-        <span>标题</span>
-        <input class="input" bind:value={title} placeholder="一句话说明要做什么" />
-      </label>
+  <label class="field">
+    <span>描述</span>
+    <textarea class="input" rows="3" bind:value={description} placeholder="补充上下文…"></textarea>
+  </label>
 
-      <label class="field">
-        <span>描述</span>
-        <textarea class="input" rows="3" bind:value={description} placeholder="补充上下文…"></textarea>
-      </label>
+  <label class="field">
+    <span>依赖任务 ID（逗号分隔，可选）</span>
+    <input
+      class="input mono"
+      bind:value={dependsOn}
+      list="depends-on-candidates"
+      placeholder="01H…, 01H…"
+    />
+    <datalist id="depends-on-candidates">
+      {#each candidates as t (t.id)}
+        <option value={t.id}>{t.title}</option>
+      {/each}
+    </datalist>
+  </label>
 
-      <label class="field">
-        <span>依赖任务 ID（逗号分隔，可选）</span>
-        <input class="input mono" bind:value={dependsOn} placeholder="01H…, 01H…" />
-      </label>
+  <label class="field">
+    <span>评审模式</span>
+    <select class="input" bind:value={reviewMode}>
+      <option value="agent">agent 自动评审</option>
+      <option value="human">human 人工评审</option>
+    </select>
+  </label>
 
-      <label class="field">
-        <span>评审模式</span>
-        <select class="input" bind:value={reviewMode}>
-          <option value="agent">agent 自动评审</option>
-          <option value="human">human 人工评审</option>
-        </select>
-      </label>
-
-      {#if error}<div class="error">{error}</div>{/if}
-
-      <div class="actions">
-        <button type="button" class="btn quiet" onclick={onclose}>取消</button>
-        <button type="submit" class="btn solid" disabled={submitting}>
-          {#if submitting}<span class="spin"></span>{/if}
-          创建并启动
-        </button>
-      </div>
-    </form>
-  </div>
-{/if}
+  {#if error}<div class="error">{error}</div>{/if}
+</Modal>
 
 <style>
-  .overlay {
-    position: fixed;
-    inset: 0;
-    z-index: 60;
-    background: var(--overlay);
-    display: flex;
-    align-items: center;
-    justify-content: center;
-  }
-  .dialog {
-    width: 480px;
-    max-width: calc(100vw - 32px);
-    padding: 16px 18px;
-    border-radius: 0;
-    box-shadow: none;
-  }
-  .head {
-    font-size: 12px;
-    color: var(--text-hi);
-    margin-bottom: 14px;
-  }
   .field {
     display: block;
     margin-bottom: 10px;
   }
+  /* 字段标签：告诉你这一格填什么，读不到就填不下去——次级必读档（票 15 归位）。 */
   .field > span {
     display: block;
     font-size: 12px;
-    color: var(--text-4);
+    color: var(--text-3);
     letter-spacing: 0.04em;
     margin-bottom: 4px;
   }
@@ -150,11 +137,5 @@
     color: var(--stop);
     font-size: 12px;
     margin: 4px 0 8px;
-  }
-  .actions {
-    display: flex;
-    justify-content: flex-end;
-    gap: 8px;
-    margin-top: 12px;
   }
 </style>
