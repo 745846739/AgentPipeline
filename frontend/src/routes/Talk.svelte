@@ -28,6 +28,7 @@
     stopActionCount,
     toggleOpenStop,
   } from '../lib/talkStops';
+  import { CompositionGuard, shouldSubmitOnEnter } from '../lib/enterToSend';
   import { TaskStream, type StreamStatus } from '../realtime/connection';
   import {
     appendForemanDelta,
@@ -267,10 +268,17 @@
     }
   }
 
+  /**
+   * 输入法组合态（决策 184）。**只查 `event.isComposing` 挡不住**：桌面壳是 WKWebView，
+   * 它先发 `compositionend` 再发那次 `keydown`（`isComposing` 已是 false）——于是
+   * 「在中文输入法里敲英文、按回车确认」会把半截话直接发出去。判据在
+   * `lib/enterToSend.ts`（延迟一拍清标志），这里只接线。
+   */
+  const composing = new CompositionGuard();
+
   function onKeydown(event: KeyboardEvent) {
-    // Enter 发送 / Shift+Enter 换行。`isComposing` 必须挡：中文输入法用 Enter 选字，
-    // 不挡的话选字即发送。
-    if (event.key !== 'Enter' || event.shiftKey || event.isComposing) return;
+    // Enter 发送 / Shift+Enter 换行（判据见 `lib/enterToSend.ts`）
+    if (!shouldSubmitOnEnter(event, composing.active())) return;
     event.preventDefault();
     void send();
   }
@@ -580,6 +588,8 @@
       bind:value={input}
       disabled={sending}
       onkeydown={onKeydown}
+      oncompositionstart={() => composing.start()}
+      oncompositionend={() => composing.end()}
     ></textarea>
     <div class="typer-foot">
       <span class="dim hint">

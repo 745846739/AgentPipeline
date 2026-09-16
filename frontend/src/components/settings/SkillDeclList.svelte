@@ -8,6 +8,7 @@
     setSkillTrust,
     type SkillDeclDraft,
   } from '../../lib/stageConfigs';
+  import { CompositionGuard, shouldSubmitOnEnter } from '../../lib/enterToSend';
 
   /**
    * 技能声明列表控件（决策 172④，票 15）。
@@ -32,6 +33,8 @@
 
   let picked = $state('');
   let localError = $state<string | null>(null);
+  /** 输入法组合态（决策 184）：中文输入法里敲英文再回车，那个回车是选字不是「添加」。 */
+  const composing = new CompositionGuard();
 
   function describe(name: string): string | null {
     return available.find((s) => s.name === name)?.description ?? null;
@@ -154,11 +157,12 @@
         bind:value={picked}
         placeholder="技能名"
         onkeydown={(e) => {
-          if (e.key === 'Enter') {
-            e.preventDefault();
-            add();
-          }
+          if (!shouldSubmitOnEnter(e, composing.active())) return;
+          e.preventDefault();
+          add();
         }}
+        oncompositionstart={() => composing.start()}
+        oncompositionend={() => composing.end()}
       />
       <datalist id={catalogId}>
         {#each candidates as s (s.name)}

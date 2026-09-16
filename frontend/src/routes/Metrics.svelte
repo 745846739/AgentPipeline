@@ -4,6 +4,7 @@
   import type { GlobalMetrics, TaskMetrics } from '../api/types';
   import TrackSegmentBars from '../components/settings/TrackSegmentBars.svelte';
   import { mapGlobalMetrics, mapTaskMetrics } from '../lib/metrics';
+  import { CompositionGuard, shouldSubmitOnEnter } from '../lib/enterToSend';
 
   /**
    * 全局指标（design/frontend-design.md §7 / theme-6-pixel.md §3.1「车间台账」）：
@@ -23,6 +24,8 @@
   let taskMetrics = $state<TaskMetrics | null>(null);
   let taskLoading = $state(false);
   let taskError = $state<string | null>(null);
+  /** 输入法组合态（决策 184）：输入法里敲字再回车是选字，不该直接去查台账。 */
+  const composing = new CompositionGuard();
 
   const view = $derived(global ? mapGlobalMetrics(global) : null);
   const taskView = $derived(taskMetrics ? mapTaskMetrics(taskMetrics) : null);
@@ -149,7 +152,13 @@
         class="input mono"
         bind:value={taskIdInput}
         placeholder="任务 ID（ULID）"
-        onkeydown={(e) => e.key === 'Enter' && loadTask()}
+        onkeydown={(e) => {
+          if (!shouldSubmitOnEnter(e, composing.active())) return;
+          e.preventDefault();
+          void loadTask();
+        }}
+        oncompositionstart={() => composing.start()}
+        oncompositionend={() => composing.end()}
       />
       <button type="button" class="btn" disabled={taskLoading} onclick={loadTask}>
         {#if taskLoading}<span class="spin"></span>{/if}载入

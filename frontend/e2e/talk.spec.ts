@@ -561,3 +561,60 @@ test.describe('对讲台 · 发不出去时不清空输入框（票 01 的硬约
     expectBundleHealthy(bundle);
   });
 });
+
+/**
+ * E2E-⑩ 补：**输入法里敲英文再回车，不能把半截话发出去**（决策 184）。
+ *
+ * 这是桌面壳上必现的一条（WKWebView 先发 `compositionend` 再发那次 `keydown`，
+ * `event.isComposing` 已经是 `false`），故只查 `isComposing` 的护栏挡不住它。
+ * Chromium 的次序与 WebKit 不同，所以这里**按 WebKit 的次序合成事件**：
+ * `compositionstart` → `compositionend` → 同一个任务里的 `keydown(Enter)`。
+ * 护栏若只认 `isComposing`，这一条会打红（消息被提前发出）。
+ *
+ * 断言口径：只看**外部行为**——时间线里有没有多出「我」那一轮。
+ */
+test.describe('对讲台 · 输入法回车不发送（决策 184）', () => {
+  let app: App;
+
+  test.beforeAll(async () => {
+    app = await startApp({ script: foremanScript([[]]), providerOnly: true });
+  });
+
+  test.afterAll(async () => {
+    await app?.stop();
+  });
+
+  test('选字那一次回车不发送；人手下一次回车照常发送', async ({ page }) => {
+    const bundle = watchBundle(page);
+    await page.goto(`${app.webBase}/#/talk`);
+    await settleBundle(page, bundle);
+
+    const input = page.locator('.typer textarea');
+    // 组合态：中文输入法里敲英文（`isComposing` 那一刻已是 false —— WebKit 的次序）。
+    // **同一个任务里**发 `compositionend` + 那次 `keydown`，这就是 WKWebView 的次序；
+    // 事件都带 `bubbles: true`，因为 Svelte 5 把会冒泡的事件代理到根节点上。
+    await input.evaluate((el) => {
+      const fire = (type: string, init: EventInit = {}) =>
+        el.dispatchEvent(new Event(type, { bubbles: true, cancelable: true, ...init }));
+      fire('compositionstart');
+      (el as HTMLTextAreaElement).value = 'hello';
+      fire('input');
+      fire('compositionend');
+      fire('keydown', { key: 'Enter' } as unknown as EventInit);
+    });
+
+    // 选字那一次不得产生任何一轮对话
+    await expect(page.locator('.timeline .turn.mine')).toHaveCount(0);
+    // 文本仍在输入框里（没被当成「已发送」清掉）
+    await expect(input).toHaveValue('hello');
+
+    // 人手下一次回车是独立的输入事件（远在 50ms 窗口之外），必须照常发送
+    await page.waitForTimeout(120);
+    await input.press('Enter');
+    await expect(page.locator('.timeline .turn.mine', { hasText: 'hello' })).toHaveCount(1, {
+      timeout: 30_000,
+    });
+
+    expectBundleHealthy(bundle);
+  });
+});
