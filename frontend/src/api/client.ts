@@ -1,6 +1,9 @@
 import { CLIENT_HEADER, PAIRING_HEADER, PAIRING_QUERY, apiUrl, getPairingToken } from './config';
 import type {
   AnalyzeResponse,
+  MarketConfig,
+  MarketEntry,
+  MarketInstallResult,
   CreateTaskPayload,
   FlowResponse,
   ForemanSendResult,
@@ -400,6 +403,49 @@ export function installSkillForStage(
   return request<OneClickInstallResult>('/skills/install', {
     method: 'POST',
     body: { stage, name, overwrite },
+  });
+}
+
+/* 技能市场（决策 172⑤ / 177 / 187）：来源白名单的读写 + 搜索 + 安装。 */
+
+/** 当前生效的来源白名单与它的来源级别（界面 / 配置文件）。 */
+export function getMarketConfig(): Promise<MarketConfig> {
+  return request<MarketConfig>('/market/config');
+}
+
+/**
+ * 保存界面上的来源白名单（决策 187）：**保存完当场生效**，不必重启。
+ *
+ * 空数组是合法且显式的输入（= 不允许远程安装），与「没保存过」不是一回事——后者读配置文件。
+ * 非法来源由后端 400 并说明是哪一项、为什么（校验与 `config.toml` 共用同一个函数）。
+ */
+export function saveMarketConfig(sources: string[]): Promise<MarketConfig> {
+  return request<MarketConfig>('/market/config', { method: 'PUT', body: { sources } });
+}
+
+/** 清掉界面那份来源，回到 `config.toml` 的 `[market] allowed_sources`。 */
+export function clearMarketConfig(): Promise<MarketConfig> {
+  return request<MarketConfig>('/market/config', { method: 'DELETE' });
+}
+
+/** 查 registry（省略 `q` = 列出全部已放行来源的技能）。 */
+export function searchMarket(q = ''): Promise<{ skills: MarketEntry[]; sources: string[] }> {
+  return request<{ skills: MarketEntry[]; sources: string[] }>(
+    `/market/search?q=${encodeURIComponent(q)}`,
+  );
+}
+
+/**
+ * 从市场装一个技能到技能根（**不**写任何阶段配置——启用是另一件事）。
+ *
+ * 四类失败分得开：技能不存在 → 404、来源未放行 / 摘要不符 → 400（带 `detail`）、
+ * 网络失败 → 502、同名已存在 → 409（`overwrite` 为显式确认）。
+ * 落盘之后用 {@link previewSkill} 取三项预览给用户看（正文特征命中要摆在眼前）。
+ */
+export function installFromMarket(name: string, overwrite = false): Promise<MarketInstallResult> {
+  return request<MarketInstallResult>('/market/install', {
+    method: 'POST',
+    body: { name, overwrite },
   });
 }
 

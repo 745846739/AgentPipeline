@@ -8,6 +8,7 @@
   import Metrics from './routes/Metrics.svelte';
   import SettingsProjects from './routes/SettingsProjects.svelte';
   import SettingsProviders from './routes/SettingsProviders.svelte';
+  import SettingsMarket from './routes/SettingsMarket.svelte';
   import Share from './routes/Share.svelte';
   import Talk from './routes/Talk.svelte';
   import TaskDetail from './routes/TaskDetail.svelte';
@@ -41,6 +42,8 @@
   <SettingsProjects />
 {:else if route.name === 'settings-providers'}
   <SettingsProviders />
+{:else if route.name === 'settings-market'}
+  <SettingsMarket />
 {:else if route.name === 'metrics'}
   <Metrics />
 {:else if route.name === 'share'}

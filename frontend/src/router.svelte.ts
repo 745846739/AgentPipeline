@@ -4,7 +4,8 @@
  * `/`          看板
  * `/talk`      对讲台（决策 174；主题六 §3.3 的稿件落地）
  * `/task/:id`  任务详情
- * `/settings/projects` · `/settings/providers` · `/metrics` · `/share`（票 22 / 决策 167）
+ * `/settings/projects` · `/settings/providers` · `/settings/market` · `/metrics` · `/share`
+ * （票 22 / 决策 167 / 决策 187）
  */
 
 export type Route =
@@ -13,6 +14,7 @@ export type Route =
   | { name: 'task'; id: string }
   | { name: 'settings-projects' }
   | { name: 'settings-providers' }
+  | { name: 'settings-market' }
   | { name: 'metrics' }
   | { name: 'share' }
   | { name: 'not-found'; path: string };
@@ -27,6 +29,8 @@ export function parseRoute(hash: string): Route {
   if (task) return { name: 'task', id: decodeURIComponent(task[1]) };
   if (path === '/settings/projects') return { name: 'settings-projects' };
   if (path === '/settings/providers') return { name: 'settings-providers' };
+  // 技能市场（决策 187）：白名单 / 搜索 / 安装。此前只有 config.toml 一条路，界面上无处可改。
+  if (path === '/settings/market') return { name: 'settings-market' };
   if (path === '/metrics') return { name: 'metrics' };
   if (path === '/share') return { name: 'share' };
   return { name: 'not-found', path };

@@ -63,6 +63,20 @@ pub struct RebindRequest {
 /// 改绑通道的发送端（`serve` 之外不存在，故 `AppState` 里是 `Option`）。
 pub type RebindTx = tokio::sync::mpsc::Sender<RebindRequest>;
 
+/// 界面那一份市场来源的读数（来源白名单 + 它的客户端，决策 187）。
+pub type MarketSnapshot = (Vec<String>, Option<Arc<dyn MarketClient>>);
+
+/// 界面上的技能市场来源（决策 187）：来源白名单 + 由它现搭的客户端。
+///
+/// 与启动时那份（`[market] allowed_sources`）是**两级**关系：界面保存过就用界面这份，
+/// 清掉就回到配置文件。`sources` 为空表是**合法且有意义**的状态（= 不允许远程安装），
+/// 与「没保存过」（`None`）必须分得开——见 `Store::market_sources_override`。
+pub struct MarketRuntime {
+    pub sources: Vec<String>,
+    /// 空表时是 `None`（没有来源就没有客户端，端点给可操作报文而不是 panic）。
+    pub client: Option<Arc<dyn MarketClient>>,
+}
+
 #[derive(Clone)]
 pub struct AppState {
     pub store: Store,
@@ -97,7 +111,12 @@ pub struct AppState {
     /// testkit 的 `FakeMarket`，因此端点契约能在**完全离线**的前提下被钉住。
     pub market: Option<Arc<dyn MarketClient>>,
     /// `[market] allowed_sources` 归一后的白名单（空白名单 = 不允许远程安装）。
+    ///
+    /// 启动时那一级；界面保存过之后由 [`AppState::market_override`] 盖过，读经
+    /// [`AppState::market_sources`] / [`AppState::market_client`]（决策 187）。
     pub market_sources: Vec<String>,
+    /// 界面上的市场来源（决策 187）。`None` = 没保存过 → 用启动时那一级。
+    pub market_override: Arc<std::sync::RwLock<Option<MarketRuntime>>>,
     /// 值班长运行器（决策 182，票 01）。
     ///
     /// **缺省 `None`**：没有它时三个对讲台端点返回 503「未接线」，而不是 panic 或
@@ -123,7 +142,47 @@ impl AppState {
             extra_allowed_origins: Vec::new(),
             market: None,
             market_sources: Vec::new(),
+            market_override: Arc::new(std::sync::RwLock::new(None)),
             foreman: None,
+        }
+    }
+
+    /// 界面保存过的那一份市场来源（决策 187）；没保存过时 `None`。
+    pub fn market_override(&self) -> Option<MarketSnapshot> {
+        self.market_override.read().ok().and_then(|guard| {
+            guard
+                .as_ref()
+                .map(|rt| (rt.sources.clone(), rt.client.clone()))
+        })
+    }
+
+    /// 生效的市场来源（界面 > 配置文件，决策 187）。
+    pub fn market_sources(&self) -> Vec<String> {
+        match self.market_override() {
+            Some((sources, _)) => sources,
+            None => self.market_sources.clone(),
+        }
+    }
+
+    /// 生效的市场客户端。界面保存过空表 → `None`（不允许远程安装）。
+    pub fn market_client(&self) -> Option<Arc<dyn MarketClient>> {
+        match self.market_override() {
+            Some((_, client)) => client,
+            None => self.market.clone(),
+        }
+    }
+
+    /// 装上界面保存的那一份（保存端点调用；决策 187）。
+    pub fn set_market_override(&self, sources: Vec<String>, client: Option<Arc<dyn MarketClient>>) {
+        if let Ok(mut guard) = self.market_override.write() {
+            *guard = Some(MarketRuntime { sources, client });
+        }
+    }
+
+    /// 清掉界面那一份（回到配置文件，决策 187）。
+    pub fn clear_market_override(&self) {
+        if let Ok(mut guard) = self.market_override.write() {
+            *guard = None;
         }
     }
 

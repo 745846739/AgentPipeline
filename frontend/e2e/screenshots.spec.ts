@@ -33,7 +33,8 @@ test.skip(process.env.AGENTPIPELINE_SHOTS !== '1', '截图是证据不是门；�
 const here = dirname(fileURLToPath(import.meta.url));
 const outDir = resolve(here, '..', '..', '.scratch', 'shots', 'app');
 
-/** 七个路由（`frontend-design.md` §4 + 决策 167 的 `#/share` + 决策 174 的 `#/talk`）。 */
+/** 八个路由（`frontend-design.md` §4 + 决策 167 的 `#/share` + 决策 174 的 `#/talk`
+ *  + 决策 187 的 `#/settings/market`）。 */
 const ROUTES: Array<{ slug: string; hash: string }> = [
   { slug: 'board', hash: '#/' },
   { slug: 'talk', hash: '#/talk' },
@@ -41,6 +42,8 @@ const ROUTES: Array<{ slug: string; hash: string }> = [
   { slug: 'metrics', hash: '#/metrics' },
   { slug: 'projects', hash: '#/settings/projects' },
   { slug: 'providers', hash: '#/settings/providers' },
+  // 技能市场（决策 187）：与「模型与密钥」并列的设置页，同样出证据截图
+  { slug: 'market', hash: '#/settings/market' },
   { slug: 'share', hash: '#/share' },
 ];
 

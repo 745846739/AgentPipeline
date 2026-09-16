@@ -391,6 +391,28 @@ impl MarketConfig {
     }
 }
 
+/// 校验并归一**一组**市场来源（配置与界面共用同一条口径，决策 187）。
+///
+/// 界面上的来源编辑器与 `config.toml` 的 `[market] allowed_sources` 会写进同一个语义位，
+/// 两处各写一份校验必然漂移——而那正是安全相关的一处（放行一个来源 = 允许从它下载并执行
+/// 引导 agent 的正文）。故归一（大小写 / 尾斜杠）、去重、顺序保留、传输安全四件事收在这
+/// 一个函数里，两处都调它。
+///
+/// 返回归一后的列表；非法项报出**是哪一项、为什么**（用户要照着改）。
+pub fn validate_market_sources(raw: &[String]) -> Result<Vec<String>> {
+    let mut out: Vec<String> = Vec::new();
+    for item in raw {
+        let origin = normalize_origin(item)
+            .map_err(|e| Error::Config(format!("市场来源不合法（{item}）：{e}")))?;
+        check_market_source_scheme(&origin)
+            .map_err(|e| Error::Config(format!("市场来源不合法（{item}）：{e}")))?;
+        if !out.contains(&origin) {
+            out.push(origin);
+        }
+    }
+    Ok(out)
+}
+
 /// 校验一个市场来源 origin 的传输安全性（见 [`MarketConfig`] 的模块说明）。
 ///
 /// 返回中文原因（不合法时）。判定用 origin 里的 host，不看路径——来源本来就只能是 origin。

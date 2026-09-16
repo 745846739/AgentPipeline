@@ -30,6 +30,8 @@
     { path: '/metrics', route: 'metrics', label: '指标', sprite: 'chart' },
     { path: '/settings/projects', route: 'settings-projects', label: '项目', sprite: 'chest' },
     { path: '/settings/providers', route: 'settings-providers', label: '模型与密钥', sprite: 'key' },
+    // 技能市场（决策 187）：与「模型与密钥」并列的设置页；sprite 复用既有的 merge（来源接入）。
+    { path: '/settings/market', route: 'settings-market', label: '技能市场', sprite: 'merge' },
     { path: '/share', route: 'share', label: '手机访问', sprite: 'phone' },
   ];
 

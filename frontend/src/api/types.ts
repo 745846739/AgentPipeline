@@ -653,6 +653,38 @@ export interface SkillSummary {
   declared_in: string[];
 }
 
+/* ─────────────── 技能市场（crates/app/src/routes/market.rs，决策 172⑤ / 177 / 187）─────────────── */
+
+/** 来源白名单是谁定的（决策 187）：界面保存的那一份，还是 `config.toml` 的 `[market]`。 */
+export type MarketOrigin = 'settings' | 'config';
+
+/** `GET / PUT / DELETE /market/config`。 */
+export interface MarketConfig {
+  /** 生效的来源 origin 列表（界面 > 配置文件）；空表 = 不允许远程安装。 */
+  sources: string[];
+  origin: MarketOrigin;
+  /** 索引地址 = 列表第一项的 `{source}/index.json`；空表时为 null。 */
+  index_source: string | null;
+  /** 有没有可用的客户端（空表时为 false——端点会给出可操作报文，不是 panic）。 */
+  client_ready: boolean;
+}
+
+/** `GET /market/search` 的一项候选（未放行来源的条目不进候选）。 */
+export interface MarketEntry {
+  name: string;
+  version: string;
+  sha256: string;
+  /** 条目自己声明的来源（与放行白名单是两件事，两者都须放行才装得上）。 */
+  source: string;
+  description: string | null;
+  url: string;
+}
+
+/** `POST /market/install` 的响应。 */
+export interface MarketInstallResult {
+  skill: { name: string; description: string | null; sibling_count: number };
+}
+
 /** 正文特征命中（票 11 第 ③ 项）：**具体到行**，不是布尔「有风险」。 */
 export interface SkillFeatureHit {
   kind: 'run_command' | 'network' | 'credentials';

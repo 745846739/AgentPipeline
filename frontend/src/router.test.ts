@@ -30,6 +30,13 @@ describe('parseRoute', () => {
     expect(parseRoute('#v-talk')).toEqual({ name: 'talk' });
   });
 
+  it('技能市场（决策 187）可被解析', () => {
+    expect(parseRoute('#/settings/market')).toEqual({ name: 'settings-market' });
+    // 与既有两个设置页并列，且不能被它们的前缀吃掉
+    expect(parseRoute('#/settings/providers')).toEqual({ name: 'settings-providers' });
+    expect(parseRoute('#/settings/projects')).toEqual({ name: 'settings-projects' });
+  });
+
   it('query 与尾斜杠不影响匹配', () => {
     // hash 路由下分享页可能被带上查询串；parseRoute 只取 ? 之前的部分
     expect(parseRoute('#/share?from=board')).toEqual({ name: 'share' });

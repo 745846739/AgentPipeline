@@ -3348,6 +3348,131 @@ async fn api_with_one_skill(name: &str, body: &str) -> (Api, Vec<u8>) {
     )
 }
 
+// ─────────── 界面上的市场来源（决策 187）：GET / PUT / DELETE /market/config ───────────
+
+/// `GET /market/config` 报出「现在用的是哪一级」与索引地址。
+///
+/// 这一页存在的全部理由是「界面上终于能改」，故「现在以谁为准」必须可读——用户改了
+/// `config.toml` 却发现「改了没用」时，答案得在这一页上。
+#[tokio::test]
+async fn market_config_reports_the_effective_sources() {
+    let api = api_with_market(Arc::new(FakeMarket::with_entries(vec![])), market_sources()).await;
+
+    let (status, body) = get(&api, "/market/config").await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(
+        body["origin"], "config",
+        "没保存过界面那份 → 配置文件说了算"
+    );
+    assert_eq!(body["sources"][0], MARKET_SRC);
+    assert_eq!(body["index_source"], MARKET_SRC, "索引地址 = 第一项");
+    assert_eq!(body["client_ready"], true);
+}
+
+/// `PUT /market/config` 归一、去重、落库，并**当场**换掉生效来源（不必重启）。
+#[tokio::test]
+async fn market_config_put_normalizes_dedupes_and_takes_effect_immediately() {
+    let api = api_with_market(Arc::new(FakeMarket::with_entries(vec![])), market_sources()).await;
+
+    let (status, body) = put(
+        &api,
+        "/market/config",
+        serde_json::json!({"sources": ["HTTPS://Second.Example/", "https://second.example", "https://Third.Example/"]}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["origin"], "settings");
+    assert_eq!(
+        body["sources"],
+        serde_json::json!(["https://second.example", "https://third.example"]),
+        "归一（小写 + 去尾斜杠，与 normalize_origin 同口径）+ 去重 + 保留顺序"
+    );
+    assert_eq!(body["index_source"], "https://second.example");
+
+    // 生效了才算「保存即生效」：读端点与**处理器真正取用的那份**都换了。
+    // 注意这里断言的是 `AppState` 的读数而不是再搜一次：保存之后客户端是**真** HTTP 客户端
+    // （来源换了就该换客户端），离线契约测试里发不出请求——「搜索用哪份来源」这件事由
+    // 下面这条读数等价覆盖（`search` 处理器取的就是 `market_sources()`）。
+    let (_, after) = get(&api, "/market/config").await;
+    assert_eq!(after["sources"][0], "https://second.example");
+    assert_eq!(after["client_ready"], true);
+    assert_eq!(
+        api.state.market_sources(),
+        vec![
+            "https://second.example".to_string(),
+            "https://third.example".to_string()
+        ],
+        "处理器取用的那份必须是新来源（不是启动时那一份）"
+    );
+    assert!(api.state.market_override().is_some(), "界面那一级已生效");
+}
+
+/// 非法来源 → 400，且报文指出是哪一项、为什么（校验与 `config.toml` 同一个函数）。
+#[tokio::test]
+async fn market_config_put_rejects_illegal_sources_with_a_reason() {
+    let api = api_with_market(Arc::new(FakeMarket::with_entries(vec![])), market_sources()).await;
+
+    for bad in [
+        "http://skills.example.com",       // 非回环明文 http（决策 177③）
+        "https://skills.example.com/path", // 不是 origin
+        "not-an-origin",
+    ] {
+        let (status, body) = put(
+            &api,
+            "/market/config",
+            serde_json::json!({ "sources": [bad] }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{bad} → {body}");
+        let msg = body["error"].as_str().unwrap_or("");
+        assert!(msg.contains(bad), "报文要点出是哪一项：{msg}");
+    }
+    // 被拒之后来源没变（不半途改一半）
+    let (_, body) = get(&api, "/market/config").await;
+    assert_eq!(body["origin"], "config");
+    assert_eq!(body["sources"][0], MARKET_SRC);
+}
+
+/// 空数组是**显式**的「不允许远程安装」，与「没保存过」是两回事：
+/// 前者 `origin = settings` 且客户端为空（端点给可操作报文），后者回落配置文件。
+#[tokio::test]
+async fn market_config_empty_list_disables_the_market_but_stays_explicit() {
+    let api = api_with_market(Arc::new(FakeMarket::with_entries(vec![])), market_sources()).await;
+
+    let (status, body) = put(&api, "/market/config", serde_json::json!({"sources": []})).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["origin"], "settings");
+    assert_eq!(body["sources"], serde_json::json!([]));
+    assert_eq!(body["index_source"], serde_json::Value::Null);
+    assert_eq!(body["client_ready"], false);
+
+    // 搜索给出可操作报文（不是 500，也不是空成功）
+    let (status, search) = get(&api, "/market/search").await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{search}");
+    assert!(
+        search["error"].as_str().unwrap_or("").contains("技能市场"),
+        "{search}"
+    );
+}
+
+/// `DELETE /market/config` 把生效来源交还给 `config.toml` 那一份。
+#[tokio::test]
+async fn market_config_delete_falls_back_to_config() {
+    let api = api_with_market(Arc::new(FakeMarket::with_entries(vec![])), market_sources()).await;
+
+    let _ = put(
+        &api,
+        "/market/config",
+        serde_json::json!({ "sources": ["https://second.example"] }),
+    )
+    .await;
+    let (status, body) = delete(&api, "/market/config").await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["origin"], "config");
+    assert_eq!(body["sources"][0], MARKET_SRC, "回到配置文件那一份");
+    assert_eq!(body["client_ready"], true);
+}
+
 /// ① 正常安装：搜索能看到候选，安装后落盘且出现在 `GET /skills`。
 #[tokio::test]
 async fn market_search_lists_then_install_lands_the_skill() {
