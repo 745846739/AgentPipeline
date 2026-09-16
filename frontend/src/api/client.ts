@@ -411,6 +411,26 @@ export function getServerInfo(): Promise<ServerInfo> {
 }
 
 /**
+ * 打开 / 关闭局域网访问（决策 186）：把绑定切成全网卡或只回环，**当场改绑**并记住选择。
+ *
+ * **应答可能读不到**：改绑会切断当前所有连接，包括发出这次请求的那条。调用方必须把
+ * 「传输失败」与「真的失败」分开——正确读法是重读 [`getServerInfo`]，读到目标状态
+ * 就算成功（`changeLanMode` 就是这么做的）。
+ *
+ * 只有本机可以调（局域网来源 403）：这是全站唯一能把服务暴露到局域网的入口。
+ */
+export function setServerLan(enabled: boolean): Promise<ServerInfo> {
+  // `body` 传**对象**：`request()` 负责 JSON.stringify 与 Content-Type（传字符串会被
+  // 再序列化一次，服务端解不出来——422）
+  return request<ServerInfo>('/server/lan', { method: 'POST', body: { enabled } });
+}
+
+/** 清掉界面上的绑定选择，回到启动参数 / 配置文件那一级（决策 186）。 */
+export function clearServerLan(): Promise<ServerInfo> {
+  return request<ServerInfo>('/server/lan', { method: 'DELETE' });
+}
+
+/**
  * 二维码 SVG 的 `<img src>` 地址。
  *
  * 用 `apiUrl` 而非裸相对路径：桌面壳 / 跨源注入形态下 base 非空，裸路径会指错。

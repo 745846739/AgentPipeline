@@ -114,9 +114,16 @@ pub fn build_router(state: AppState) -> Router {
         // ── 技能市场：远程 registry（票 10）。来源白名单默认空 = 不允许远程安装；
         // 客户端由 AppState 注入（生产 HttpMarketClient / 测试 FakeMarket），故契约测试离线 ──
         .merge(routes::market::routes(state.clone()))
-        // ── 服务自述与局域网分享（决策 167）：纯 GET，无状态变更 ──
+        // ── 服务自述与局域网分享（决策 167）：读端点纯 GET，无状态变更 ──
         .route("/server-info", get(routes::server_info::info))
         .route("/server-info/qr.svg", get(routes::server_info::qr_svg))
+        // 绑定开关（决策 186）：**只允许回环来源**（处理器自己判，见 `PeerLoopback`），
+        // 运行时改绑 + 记住选择。它是全站唯一能把服务暴露到局域网的入口，故护栏在两处：
+        // 这里的对端判定，以及局域网形态下必然生效的配对令牌层。
+        .route(
+            "/server/lan",
+            post(routes::server_info::set_lan).delete(routes::server_info::clear_lan),
+        )
         // ── 配对（决策 182㉖㉗㉘，票 07）──
         // 读取口自己判来源是否回环（局域网来源 403）；重置是写请求，局域网形态下由
         // pairing_guard 护住、回环豁免（丢了令牌必须还能从本机复位）。

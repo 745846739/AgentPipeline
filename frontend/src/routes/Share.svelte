@@ -1,16 +1,27 @@
 <script lang="ts">
   import { onMount } from 'svelte';
-  import { fetchPairingToken, getServerInfo, pairedUrl, qrSvgUrl, resetPairing } from '../api/client';
+  import {
+    clearServerLan,
+    fetchPairingToken,
+    getServerInfo,
+    pairedUrl,
+    qrSvgUrl,
+    resetPairing,
+    setServerLan,
+  } from '../api/client';
   import type { ServerAddress, ServerInfo } from '../api/types';
+  import { changeLanMode } from '../lib/lanToggle';
 
   /**
-   * 局域网分享页（决策 167）：手机扫码接入。
+   * 局域网分享页（决策 167 / 186）：手机扫码接入。
    *
    * 页面只做一件事——把「手机能连上的地址」变成一个可扫的二维码。地址由后端
    * 枚举网卡得出（crates/app/src/lan.rs），前端不做任何猜测：多网卡 / VPN 环境下
    * 选错地址的表现是「扫了打不开」，故这里把后端排好序的推荐项放大，其余列为备选。
    *
-   * 仅回环绑定时不显示二维码（拷给手机也连不上），改为给出开启局域网访问的指引。
+   * 仅回环绑定时不显示二维码（拷给手机也连不上），改为给出**一颗真的能按的钮**
+   * （决策 186）：绑定可以在运行时改，不必再去改环境变量重启。**这一页跑在
+   * localhost，所以那颗钮按得动**——后端只允许回环来源改绑（局域网来源 403）。
    * 二维码由**后端渲染** SVG（决策 167），前端不引 QR 库。
    */
 
@@ -27,6 +38,11 @@
    */
   let token = $state<string | null>(null);
   let reset = $state(false);
+  /** 正在改绑（按钮转圈）；改绑的判定以重读为准（`lib/lanToggle.ts`）。 */
+  let switching = $state(false);
+  /** 改绑之后要说的话：成功也可能是「但启动参数说了算」，失败要带原因。 */
+  let switchNote = $state<string | null>(null);
+  let switchError = $state<string | null>(null);
 
   const addresses = $derived(info?.addresses ?? []);
   /** 二维码/复制栏里那个地址：有令牌就带上，多一个参数不增加任何操作步骤。 */
@@ -53,6 +69,47 @@
       token = null;
     }
   });
+
+  /**
+   * 按下「绑定全网卡」/「只绑本机」。
+   *
+   * 判定以**重读到的绑定地址**为准（`lib/lanToggle.ts`）：改绑会切断当前连接，
+   * 包括这次请求自己那条——把传输失败当失败会误报，当成功会掩盖真错误。
+   */
+  async function switchLan(enabled: boolean) {
+    switching = true;
+    switchError = null;
+    switchNote = null;
+    try {
+      const result = await changeLanMode(enabled, {
+        setLan: setServerLan,
+        clearLan: clearServerLan,
+        info: getServerInfo,
+        sleep: (ms) => new Promise((resolve) => setTimeout(resolve, ms)),
+      });
+      if (result.ok) {
+        info = result.info;
+        switchNote = result.note;
+        // 改绑会切断 SSE 与在飞请求，令牌与地址都重取一次：这一页的其余部分依赖它们
+        selected = result.info.addresses[0]?.url ?? null;
+        try {
+          token = (await fetchPairingToken()).token;
+        } catch {
+          token = null;
+        }
+      } else {
+        switchError = result.message;
+        // 失败也要把真实状态摆回来（它可能已经变了，或本来就是别的）
+        try {
+          info = await getServerInfo();
+        } catch {
+          /* 读不到就保留原读数 */
+        }
+      }
+    } finally {
+      switching = false;
+    }
+  }
 
   async function doReset() {
     reset = true;
@@ -99,24 +156,48 @@
   {:else if info}
     {#if info.loopback_only}
       <section class="gate">
-        <div class="gate-head">仅回环绑定时</div>
+        <div class="gate-head">手机现在连不上这台机器</div>
         <p>
-          手机和电脑不在同一个地址空间：<b>127.0.0.1</b> 在手机上指向手机自己，
-          扫码必然打不开。要让手机访问，需要让服务监听局域网网卡。
+          手机和电脑不在同一个地址空间：<b>127.0.0.1</b>（当前绑定 <span class="mono">{info.host}</span
+          >）在手机上指向手机自己，扫码必然打不开。要让手机访问，得让服务监听局域网网卡。
         </p>
-        <p class="how">命令行启动时绑定全网卡：</p>
-        <pre><code>agent-pipeline serve --host 0.0.0.0</code></pre>
-        <p class="how">或在配置文件里改：</p>
-        <pre><code>[server]
-host = "0.0.0.0"</code></pre>
+        <!-- 决策 186：这一颗就是「改绑」的入口，不必再去改环境变量重启。 -->
+        <div class="switch">
+          <button
+            type="button"
+            class="btn solid"
+            disabled={switching}
+            onclick={() => void switchLan(true)}
+          >
+            {switching ? '正在改绑…' : '绑定全网卡（开启手机访问）'}
+          </button>
+          <span class="switch-note">按下即生效，不必重启；选择会被记住。</span>
+        </div>
+        {#if switchNote}<p class="note ok">{switchNote}</p>{/if}
+        {#if switchError}<p class="note bad">{switchError}</p>{/if}
         <p class="note">
           手机加载的页面与 API <span class="hi">同源</span>，因此无需额外放行 origin
           （跨源防护只拦异源写请求，同源写请求自带客户端头，决策 128 / 153③）。
         </p>
         <p class="note">
-          桌面应用默认也只绑回环；设环境变量 <b>AGENTPIPELINE_LAN=1</b>
-          启动桌面壳即可开启局域网访问（决策 167）。
+          改绑<b>只允许从本机</b>发起（局域网来源 403）——否则同网段的任何设备都能把它打开。
+          扫了码的手机若改不了，回到这台电脑上按。
         </p>
+        <details class="manual">
+          <summary>也可以在启动时指定（改完要重启）</summary>
+          <p class="how">命令行启动时绑定全网卡：</p>
+          <pre><code>agent-pipeline serve --host 0.0.0.0</code></pre>
+          <p class="how">或在配置文件里改：</p>
+          <pre><code>[server]
+host = "0.0.0.0"</code></pre>
+          <p class="how">桌面应用启动时带上环境变量：</p>
+          <pre><code>AGENTPIPELINE_LAN=1</code></pre>
+          <p class="note">
+            启动时指定的绑定<b>优先于这里的按钮</b>（决策 186）：那样启动时，按钮只改得动
+            这一次，重启后仍按启动参数来。当前这次绑定来自
+            <span class="mono">{info.bind_source === 'startup' ? '启动参数' : info.bind_source === 'settings' ? '界面设置' : '配置文件'}</span>。
+          </p>
+        </details>
         <p class="warn">
           ⚠ 服务能触发真实 LLM 调用并读取全部会话，开放局域网前请确认所在网段可信
           （更稳妥可用 SSH 隧道 / Tailscale）。
@@ -205,6 +286,24 @@ host = "0.0.0.0"</code></pre>
         改任务与跟值班长对话需要配对——二维码里那个令牌就是凭据。
         怀疑泄露时点「重置配对」，旧令牌立即失效，各设备重扫一次即可。
       </p>
+
+      <!-- 决策 186：开了之后要能关回来，且说清这次绑定是谁定的 -->
+      <div class="switch">
+        <button type="button" class="btn" disabled={switching} onclick={() => void switchLan(false)}>
+          {switching ? '正在改绑…' : '改回只绑本机（关掉手机访问）'}
+        </button>
+        <span class="switch-note">
+          当前绑定 <span class="mono">{info.host}:{info.port}</span>，来自 <span class="mono"
+            >{info.bind_source === 'startup'
+              ? '启动参数'
+              : info.bind_source === 'settings'
+                ? '界面上的选择'
+                : '配置文件'}</span
+          >。
+        </span>
+      </div>
+      {#if switchNote}<p class="note ok">{switchNote}</p>{/if}
+      {#if switchError}<p class="note bad">{switchError}</p>{/if}
     {/if}
   {/if}
 </div>
@@ -373,6 +472,34 @@ host = "0.0.0.0"</code></pre>
   .note {
     margin-top: 14px;
     color: var(--text-3);
+  }
+  /* 改绑按钮行（决策 186）：一颗真的能按的钮 + 一句它意味着什么 */
+  .switch {
+    margin-top: 14px;
+    display: flex;
+    align-items: center;
+    gap: 12px;
+    flex-wrap: wrap;
+  }
+  .switch-note {
+    color: var(--text-3);
+    line-height: 1.8;
+  }
+  /* 改绑结果：成功与失败各自一档，不共用颜色（「响了」只在急停处，故这里用文字档） */
+  .note.ok {
+    color: var(--go);
+  }
+  .note.bad {
+    color: var(--stop);
+  }
+  /* 启动期指定绑定的老办法：收进 details，不与那颗钮抢注意力 */
+  .manual {
+    margin-top: 14px;
+    color: var(--text-3);
+  }
+  .manual summary {
+    cursor: pointer;
+    color: var(--text-2);
   }
   .hi {
     color: var(--text-hi);

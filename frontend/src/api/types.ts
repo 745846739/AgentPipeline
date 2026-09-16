@@ -596,6 +596,9 @@ export interface ServerAddress {
   preferred: boolean;
 }
 
+/** 绑定地址是谁定的（决策 186）：启动参数 / 界面上的开关 / 配置文件。 */
+export type BindSource = 'startup' | 'settings' | 'config';
+
 /** `GET /server-info`：局域网分享所需的服务自述。 */
 export interface ServerInfo {
   /** 实际绑定地址（`0.0.0.0` 表示全网卡）。 */
@@ -603,6 +606,12 @@ export interface ServerInfo {
   port: number;
   /** 仅绑定回环时为 true——手机连不上，分享页需给出开启指引。 */
   loopback_only: boolean;
+  /**
+   * `host` 的来源（决策 186）。界面必须能说出「这颗钮按了重启还算不算数」：
+   * `startup` = `--host` / `AGENTPIPELINE_LAN` 说了算，界面只改得动这一次；
+   * `settings` = 界面上的开关（住 DB，重启仍生效）；`config` = `config.toml`。
+   */
+  bind_source: BindSource;
   addresses: ServerAddress[];
 }
 

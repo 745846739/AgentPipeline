@@ -5,6 +5,7 @@
 //! 的绕开（决策 153⑤；决策 128 的同源 origin 判定也依赖这个真实端口）。
 
 use std::sync::Arc;
+use std::time::Duration;
 
 use agentpipeline_core::agent::market::{HttpMarketClient, MarketClient};
 use agentpipeline_core::clock::SystemClock;
@@ -18,8 +19,9 @@ use agentpipeline_core::storage::Store;
 use anyhow::Context;
 use tracing_subscriber::fmt::writer::{BoxMakeWriter, MakeWriterExt};
 
+use crate::build_router;
 use crate::runtime::Runtime;
-use crate::{build_router, AppState};
+use crate::state::{AppState, RebindRequest};
 
 /// 已就绪的服务句柄：真实绑定地址可读，`shutdown` 置位触发优雅退出。
 pub struct ServerHandle {
@@ -64,6 +66,197 @@ pub fn into_serving_service(
 ) -> axum::extract::connect_info::IntoMakeServiceWithConnectInfo<axum::Router, std::net::SocketAddr>
 {
     router.into_make_service_with_connect_info::<std::net::SocketAddr>()
+}
+
+/// 改绑时给在飞请求的优雅窗口（决策 186）。
+///
+/// 超过它就 `abort` 掉监听任务。**这个超时不是保守起见，而是必需的**：SSE 流
+/// （`/tasks/{id}/stream`、`/foreman/stream`）在客户端断开前永不结束，而浏览器的流是
+/// 常态——只看「优雅停机」的话，改绑会一直等下去，界面上的按钮永远转圈。前端有带退避的
+/// 重连循环（`realtime/connection.ts`），所以切断流的代价是一次自动重连，不是数据丢失。
+const REBIND_GRACEFUL_WINDOW: Duration = Duration::from_millis(500);
+
+/// 监听地址的解析：**启动期覆盖 > 界面设置 > 配置文件**（决策 186）。
+///
+/// 抽成纯函数是为了让优先级本身可断言——三种来源各有一条腿，而「谁盖谁」写错的表现是
+/// 「改了没生效」，那是最难从现象反推的一类错误。
+pub fn resolve_bind_host(
+    startup_override: Option<String>,
+    settings_override: Option<String>,
+    config_host: &str,
+) -> (String, crate::state::BindSource) {
+    use crate::state::BindSource;
+    if let Some(host) = startup_override {
+        return (host, BindSource::Startup);
+    }
+    if let Some(host) = settings_override {
+        return (host, BindSource::Settings);
+    }
+    (config_host.to_string(), BindSource::Config)
+}
+
+/// 一个已起好的监听器（决策 186：可被主管停掉并换一个新的）。
+struct Listener {
+    stop: tokio::sync::watch::Sender<bool>,
+    task: tokio::task::JoinHandle<()>,
+}
+
+/// 绑定并开始接受连接。返回错误时**没有**任何副作用（调用方据此回滚）。
+async fn spawn_listener(
+    router: axum::Router,
+    host: &str,
+    port: u16,
+) -> anyhow::Result<(Listener, u16)> {
+    let (listener, bound) = bind_listener(host, port).await?;
+    let (stop_tx, mut stop_rx) = tokio::sync::watch::channel(false);
+    let task = tokio::spawn(async move {
+        axum::serve(listener, into_serving_service(router))
+            .with_graceful_shutdown(async move {
+                let _ = stop_rx.changed().await;
+            })
+            .await
+            .context("axum 服务异常退出")
+            .map_err(|e| tracing::error!(error = %e, "监听任务退出"))
+            .ok();
+    });
+    Ok((
+        Listener {
+            stop: stop_tx,
+            task,
+        },
+        bound.port(),
+    ))
+}
+
+/// 停掉一个监听器：先给优雅窗口，超时则强制中断（理由见 [`REBIND_GRACEFUL_WINDOW`]）。
+async fn stop_listener(listener: Listener) {
+    let _ = listener.stop.send(true);
+    let mut task = listener.task;
+    if tokio::time::timeout(REBIND_GRACEFUL_WINDOW, &mut task)
+        .await
+        .is_err()
+    {
+        tracing::info!("优雅窗口内仍有连接（多半是 SSE 流）：强制断开并改绑");
+        task.abort();
+    }
+}
+
+/// 监听器主管的全部私有状态（决策 186）。
+struct ListenerSupervisor {
+    state: crate::state::AppState,
+    /// 当前生效的监听器；`None` = 换绑过程中正处在「旧已停、新未起」的那一瞬。
+    current: Option<Listener>,
+    /// 当前端口。**改绑不改端口**：分享页的二维码、手机的书签、桌面窗口的地址都指着它，
+    /// 换一个端口等于让刚扫过的码失效。
+    port: u16,
+    /// `[server] host` 的声明值——「恢复配置文件的值」回到的就是它。
+    config_host: String,
+    /// 启动期覆盖（`--host` / `AGENTPIPELINE_LAN`）。有它时界面设置改得动**这一次**，
+    /// 但重启后仍由它说了算，故界面要能说出这件事（`/server-info` 的 `bind_source`）。
+    startup_override: Option<String>,
+}
+
+impl ListenerSupervisor {
+    /// 换绑：停旧 → 绑新 → 起新；**绑新失败则回滚到旧地址**（决策 186）。
+    ///
+    /// 顺序是「先停后绑」而不是「先绑后停」：回环与全网卡绑在**同一个端口**上，
+    /// 多数平台上两个 socket 不能并存（`0.0.0.0:P` 与 `127.0.0.1:P` 互斥），
+    /// 先绑必然 EADDRINUSE。代价是那几毫秒里没有监听者——期间到达的连接被拒，
+    /// 浏览器的 SSE 重连循环会补上（决策 186 的残留风险，如实记在文档里）。
+    ///
+    /// 回滚不是可选项：一次失败的开关不该让整个服务消失。回滚也失败时（端口被别的进程
+    /// 抢走）只能报出两段原因——那是「这台机器上端口真的没了」，不是本函数能修的。
+    async fn swap(
+        &mut self,
+        host: &str,
+        source: crate::state::BindSource,
+    ) -> std::result::Result<u16, String> {
+        let previous_host = self.state.bind_host();
+        let previous_source = self.state.bind_source();
+        if let Some(listener) = self.current.take() {
+            stop_listener(listener).await;
+        }
+
+        let router = crate::build_router(self.state.clone());
+        match spawn_listener(router, host, self.port).await {
+            Ok((listener, port)) => {
+                self.current = Some(listener);
+                self.state.set_bind_host(host, source);
+                tracing::info!(host, port, "已改绑监听地址");
+                Ok(port)
+            }
+            Err(bind_error) => {
+                tracing::error!(error = %bind_error, host, "改绑失败，回滚到原地址");
+                let router = crate::build_router(self.state.clone());
+                match spawn_listener(router, &previous_host, self.port).await {
+                    Ok((listener, _)) => {
+                        self.current = Some(listener);
+                        self.state.set_bind_host(&previous_host, previous_source);
+                        Err(format!(
+                            "无法绑定 {host}:{}（{bind_error}）；已恢复为 {previous_host}",
+                            self.port
+                        ))
+                    }
+                    Err(rollback_error) => Err(format!(
+                        "无法绑定 {host}（{bind_error}），且回滚到 {previous_host} 也失败\
+                         （{rollback_error}）——请重启服务"
+                    )),
+                }
+            }
+        }
+    }
+}
+
+/// 主管循环：串行处理改绑请求，直到全局停机。
+async fn run_listener_supervisor(
+    mut sup: ListenerSupervisor,
+    mut rx: tokio::sync::mpsc::Receiver<RebindRequest>,
+    mut shutdown: tokio::sync::watch::Receiver<bool>,
+) -> anyhow::Result<()> {
+    loop {
+        tokio::select! {
+            _ = shutdown.changed() => {
+                // 全局停机：停当前监听器即可（graceful → abort 的窗口与改绑同一条路）。
+                if let Some(listener) = sup.current.take() {
+                    stop_listener(listener).await;
+                }
+                return Ok(());
+            }
+            request = rx.recv() => {
+                // 通道两端都在本进程内（端点侧持发送端），关闭只可能发生在停机路径上。
+                let Some(request) = request else { return Ok(()) };
+                let already_there = request.host.as_deref() == Some(sup.state.bind_host().as_str());
+                let (host, source) = match request.host.clone() {
+                    Some(host) => (host, crate::state::BindSource::Settings),
+                    // 清除界面设置 → 回到「启动期覆盖 > 配置文件」那一级的解析结果
+                    None => resolve_bind_host(sup.startup_override.clone(), None, &sup.config_host),
+                };
+                // 目标与当前一致时不换绑：换一次就切一次连接（浏览器要重连、二维码要重扫），
+                // 为了一个没有变化的结果付这个代价没有道理。落库照做（用户可能只想让它记住）。
+                let result = if already_there {
+                    Ok(sup.port)
+                } else {
+                    sup.swap(&host, source).await
+                };
+                // 持久化只在**成功路径**上做：先落库再改绑的话，一次失败的开关会在下一次
+                // 启动时生效——「点了没生效，重启却生效了」是这里最坏的一种状态。
+                if result.is_ok() {
+                    let persisted = match request.host.as_deref() {
+                        Some(host) => sup.state.store.set_server_bind_override(host).await,
+                        None => sup.state.store.clear_server_bind_override().await.map(|_| ()),
+                    };
+                    if let Err(e) = persisted {
+                        // 本次已经生效，只是重启后不记得——出声，但不改本次的结果（决策 186）
+                        tracing::error!(error = %e, "绑定选择落库失败：本次已生效，重启后会回到上一级");
+                    }
+                }
+                // 应答走在**换绑之后**：触发这次改绑的请求本身就在刚被切断的那条连接上，
+                // 所以这一应答常常到不了客户端——前端据此把「传输失败」与「真的失败」
+                // 分开：失败后重读 `/server-info`，读到目标状态就算成功（决策 186）。
+                let _ = request.reply.send(result);
+            }
+        }
+    }
 }
 
 /// serve 的启动参数（决策 157）：CLI 覆盖项与扩权 origin；`None` / 空表回落配置文件。
@@ -141,11 +334,15 @@ pub async fn serve(options: ServeOptions) -> anyhow::Result<ServerHandle> {
         tracing::warn!(?report.demoted_providers, "不受支持的 vendor 已降级 enabled=0");
     }
 
-    // CLI --port / --host > [server] port / host（§10.6.5 的配置此前被硬编码架空，
-    // 决策 128 修订同批对齐；决策 157 补 allowed_origins 并集）
+    // CLI --port / --host / 界面设置 > [server] port / host（§10.6.5 的配置此前被硬编码架空，
+    // 决策 128 修订同批对齐；决策 157 补 allowed_origins 并集；决策 186 插入界面设置这一级）
     let server = config.server.clone();
     let port = options.port_override.unwrap_or(server.port);
-    let host = options.host_override.clone().unwrap_or(server.host.clone());
+    let (host, bind_source) = resolve_bind_host(
+        options.host_override.clone(),
+        store.server_bind_override().await?,
+        &server.host,
+    );
     let mut extra_origins =
         Vec::with_capacity(server.allowed_origins.len() + options.extra_allowed_origins.len());
     for raw in server
@@ -157,8 +354,10 @@ pub async fn serve(options: ServeOptions) -> anyhow::Result<ServerHandle> {
             .push(normalize_origin(raw).map_err(|e| anyhow::anyhow!("allowed_origin 无效：{e}"))?);
     }
 
-    // 停机信号（决策 54）：一处广播，三处消费——axum、tick 循环、维护循环。
-    let (shutdown_tx, mut shutdown_rx) = tokio::sync::watch::channel(false);
+    // 停机信号（决策 54）：一处广播，三处消费——监听器主管、tick 循环、维护循环。
+    // 不再有第 4 个接收者直接挂在 axum 上：监听器的停机由主管转达（决策 186），
+    // 否则改绑与停机两条路径会各停一次、且停机要等一个已经换掉的句柄。
+    let (shutdown_tx, _) = tokio::sync::watch::channel(false);
 
     // 生产运行时（票 17）：真实 LLM + executor + scheduler（决策 55）。
     let sse = Arc::new(SseBus::default());
@@ -168,7 +367,13 @@ pub async fn serve(options: ServeOptions) -> anyhow::Result<ServerHandle> {
 
     // 先绑定再建 state：端口 0 时把内核分配的真实端口交给 AppState，
     // 决策 128 的本机 origin 白名单必须用真实端口（用 0 会拒掉桌面壳的同源请求）。
+    //
+    // 决策 186 起监听器由**主管任务**持有：界面上的「绑定全网卡」开关要能在运行时换掉
+    // 它，而换监听器是 `serve` 的私有知识（端口、graceful→abort 的窗口、失败回滚），
+    // 不该泄漏给端点。端点只往通道里投一个请求。
     let (listener, bound) = bind_listener(&host, port).await?;
+    let actual_port = bound.port();
+    let (rebind_tx, rebind_rx) = tokio::sync::mpsc::channel::<RebindRequest>(4);
 
     // 技能市场（票 10）：白名单非空才装客户端，`{source}/index.json` 取第一个来源。
     // 空 = 不允许远程安装（保守默认）——此时 AppState.market 仍是 None，端点会给出
@@ -191,29 +396,52 @@ pub async fn serve(options: ServeOptions) -> anyhow::Result<ServerHandle> {
         .with_executor(runtime.executor())
         .with_resume_hook(runtime.resume_hook.clone())
         .with_bind_host(host.clone())
+        .with_bind_source(bind_source)
+        .with_rebind(rebind_tx)
         .with_allowed_origins(extra_origins)
         .with_market(market_client, market_sources)
         .with_foreman(foreman);
-    let router = build_router(state);
+    let router = build_router(state.clone());
 
-    tracing::info!(%bound, port = bound.port(), "AgentPipeline 已启动");
+    tracing::info!(%bound, port = bound.port(), host_source = bind_source.as_str(), "AgentPipeline 已启动");
     // 就绪标记（决策 153⑤）：tracing 输出受 `RUST_LOG` 过滤，子进程（冒烟测试 / 桌面壳）
     // 需要一条不受日志级别影响的确定性信号来读取内核分配的真实端口。
     println!("AGENTPIPELINE_READY port={}", bound.port());
 
-    let server_task = tokio::spawn(async move {
-        axum::serve(listener, into_serving_service(router))
-            .with_graceful_shutdown(async move {
-                let _ = shutdown_rx.changed().await;
-            })
-            .await
-            .context("axum 服务异常退出")
-    });
+    // 首个监听器直接把已经绑好的 listener 交出去（不再二次 bind：那会在
+    // 「先 bind 再交给 serve」之间留一个端口被别的进程抢走的窗口）。
+    let (stop_tx, mut stop_rx) = tokio::sync::watch::channel(false);
+    let current = Listener {
+        stop: stop_tx,
+        task: tokio::spawn(async move {
+            axum::serve(listener, into_serving_service(router))
+                .with_graceful_shutdown(async move {
+                    let _ = stop_rx.changed().await;
+                })
+                .await
+                .context("axum 服务异常退出")
+                .map_err(|e| tracing::error!(error = %e, "监听任务退出"))
+                .ok();
+        }),
+    };
+
+    // 监听器主管（决策 186）：串行处理改绑请求，停机时随全局 shutdown 一起收摊。
+    let supervisor = tokio::spawn(run_listener_supervisor(
+        ListenerSupervisor {
+            state: state.clone(),
+            current: Some(current),
+            port: actual_port,
+            config_host: server.host.clone(),
+            startup_override: options.host_override.clone(),
+        },
+        rebind_rx,
+        shutdown_tx.subscribe(),
+    ));
 
     Ok(ServerHandle {
         port: bound.port(),
         shutdown: shutdown_tx,
-        server: server_task,
+        server: supervisor,
     })
 }
 
@@ -413,6 +641,45 @@ mod tests {
         use axum::extract::connect_info::IntoMakeServiceWithConnectInfo;
         let _serving: IntoMakeServiceWithConnectInfo<axum::Router, std::net::SocketAddr> =
             into_serving_service(axum::Router::new());
+    }
+
+    // ── 决策 186：绑定地址的三级来源 ──
+
+    #[test]
+    fn startup_override_beats_settings_and_config() {
+        let (host, source) = resolve_bind_host(
+            Some("10.0.0.5".to_string()),
+            Some("0.0.0.0".to_string()),
+            "127.0.0.1",
+        );
+        assert_eq!(host, "10.0.0.5");
+        assert_eq!(source, crate::state::BindSource::Startup);
+    }
+
+    #[test]
+    fn settings_beat_config_but_not_startup() {
+        let (host, source) = resolve_bind_host(None, Some("0.0.0.0".to_string()), "127.0.0.1");
+        assert_eq!(host, "0.0.0.0");
+        assert_eq!(source, crate::state::BindSource::Settings);
+    }
+
+    #[test]
+    fn config_is_the_fallback_and_is_reported_as_such() {
+        let (host, source) = resolve_bind_host(None, None, "192.168.1.10");
+        assert_eq!(host, "192.168.1.10");
+        assert_eq!(source, crate::state::BindSource::Config);
+        // 缺省配置也是这一级（分享页据此显示「这是配置文件里的值」）
+        let (host, source) = resolve_bind_host(None, None, "127.0.0.1");
+        assert_eq!(host, "127.0.0.1");
+        assert_eq!(source, crate::state::BindSource::Config);
+    }
+
+    #[test]
+    fn bind_source_strings_are_the_api_contract() {
+        // 这三个串是 `/server-info.bind_source` 的取值（前端据此选文案），改名即改契约。
+        assert_eq!(crate::state::BindSource::Startup.as_str(), "startup");
+        assert_eq!(crate::state::BindSource::Settings.as_str(), "settings");
+        assert_eq!(crate::state::BindSource::Config.as_str(), "config");
     }
 
     #[tokio::test]

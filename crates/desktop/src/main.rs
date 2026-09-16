@@ -10,9 +10,15 @@
 //!
 //! 单实例锁（决策 153 非传输件）：tauri-plugin-single-instance，二次启动聚焦既有窗口。
 //!
-//! **局域网访问（决策 167）**：默认仍只绑回环（缺省姿态不变，决策 128/157）。
-//! 设 `AGENTPIPELINE_LAN=1` 时改绑 `0.0.0.0`，窗口仍走回环访问（`0.0.0.0` 包含
-//! 回环，故本机体验不变），手机经「手机访问」页扫码接入。
+//! **局域网访问（决策 167 / 186）**：默认仍只绑回环（缺省姿态不变，决策 128/157）。
+//! 两条路打开它，优先级是「环境变量 > 界面上的开关 > `[server] host`」：
+//! - 设 `AGENTPIPELINE_LAN=1` 启动（启动期覆盖，界面改不动这一次）；
+//! - 或者什么都不设，在「手机访问」页按下「绑定全网卡」——`serve` 会读界面上存下的
+//!   选择（决策 186），下次启动仍然生效。**故这里只在设了环境变量时才传 `host_override`**：
+//!   恒传 `Some(...)` 会让界面上那颗钮永远赢不了。
+//!
+//! 两种路子里窗口都走回环访问（`0.0.0.0` 包含回环，故本机体验不变），手机经
+//! 「手机访问」页扫码接入。
 
 use app::serve::ServeOptions;
 use tauri::Manager;
@@ -26,14 +32,16 @@ fn main() {
         std::env::var(LAN_ENV).ok().as_deref(),
         Some("1") | Some("true")
     );
-    let host = if lan { "0.0.0.0".to_string() } else { "127.0.0.1".to_string() };
+    // 只在显式设置时才覆盖：没设就让 `serve` 按「界面设置 > [server] host」解析
+    // （决策 186）——恒传 Some 会把界面上的那颗钮彻底架空。
+    let host = lan.then(|| "0.0.0.0".to_string());
 
     // 起服在 Tauri run loop 之前：端口就绪后窗口才有地址可去。
     // serve 失败直接退出——桌面壳没有比后端更早成功的道理。
     // 窗口地址恒为本机回环：绑 0.0.0.0 时回环仍是同一服务的入口。
     let handle = tauri::async_runtime::block_on(app::serve::serve(ServeOptions {
         port_override: Some(0),
-        host_override: Some(host),
+        host_override: host,
         ..ServeOptions::default()
     }))
     .expect("AgentPipeline 服务启动失败");

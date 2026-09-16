@@ -15,6 +15,7 @@ use agentpipeline_core::config::Settings;
 use agentpipeline_core::pipeline::ForemanRunner;
 use agentpipeline_core::sse::{SseEvent, SseEventType};
 use agentpipeline_core::types::{Provider, ReviewMode, Stage, TaskStatus};
+use app::peer::PeerAddr;
 use app::{build_router, AppState};
 use axum::body::Body;
 use axum::extract::ConnectInfo;
@@ -2778,6 +2779,83 @@ async fn server_info_reports_lan_bind_as_not_loopback_only() {
     assert_eq!(status, 200);
     assert_eq!(body["host"], "0.0.0.0");
     assert_eq!(body["loopback_only"], false);
+    // 绑定来源（决策 186）：缺省构造是回环，`with_bind_host` 只改了地址，故来源仍是 config
+    assert_eq!(body["bind_source"], "config");
+}
+
+/// 绑定来源随 `with_bind_source` 上报——界面据此说清「这颗钮按了重启还算不算数」。
+#[tokio::test]
+async fn server_info_reports_bind_source() {
+    let home = TestHome::new().unwrap();
+    let (store, _clock) = home.setup().await.unwrap();
+    let state = AppState::new(store, home.home().clone(), Settings::default(), PORT)
+        .with_bind_host("0.0.0.0")
+        .with_bind_source(app::state::BindSource::Startup);
+    let router = build_router(state);
+
+    let response = router
+        .oneshot(request("GET", "/server-info").body(Body::empty()).unwrap())
+        .await
+        .unwrap();
+    let (status, body) = json_body(response).await;
+    assert_eq!(status, 200);
+    assert_eq!(body["bind_source"], "startup");
+}
+
+/* ─────────── 绑定开关（决策 186）：POST / DELETE /server/lan ─────────── */
+
+/// 局域网来源调用改绑端点 → 403。
+///
+/// 这是全站唯一能把服务暴露到局域网的入口，护栏必须钉在**执行点**上（不是靠界面藏按钮）：
+/// 局域网里任何一台设备若能调它，配对令牌（票 07）就白设了——先把它打开，再从自己的
+/// 机器上来。判定沿用票 07 那一套对端地址扩展。
+#[tokio::test]
+async fn server_lan_from_lan_peer_is_forbidden() {
+    let api = api().await;
+    for (method, path, body) in [
+        ("POST", "/server/lan", r#"{"enabled":true}"#),
+        ("DELETE", "/server/lan", ""),
+    ] {
+        let mut req = request(method, path)
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from(body))
+            .unwrap();
+        req.extensions_mut()
+            .insert(PeerAddr(SocketAddr::from(([192, 168, 1, 50], 40000))));
+        let response = api.router.clone().oneshot(req).await.unwrap();
+        let (status, payload) = json_body(response).await;
+        assert_eq!(status, 403, "{method} {path} 应拒绝局域网来源：{payload}");
+        assert!(
+            payload["error"].as_str().unwrap_or("").contains("本机"),
+            "报文要说清只有本机可以改：{payload}"
+        );
+    }
+}
+
+/// 回环来源、但这个实例没起监听器（契约测试的 in-process router）→ 503「未接线」。
+///
+/// 与对讲台三个端点的姿态一致：能力不在这台机器上时，报的是「这次没接上」而不是 500。
+#[tokio::test]
+async fn server_lan_without_a_listener_is_unbound() {
+    let api = api().await;
+    for (method, path, body) in [
+        ("POST", "/server/lan", r#"{"enabled":true}"#),
+        ("DELETE", "/server/lan", ""),
+    ] {
+        let mut req = request(method, path)
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from(body))
+            .unwrap();
+        req.extensions_mut()
+            .insert(PeerAddr(SocketAddr::from(([127, 0, 0, 1], 51234))));
+        let response = api.router.clone().oneshot(req).await.unwrap();
+        let (status, payload) = json_body(response).await;
+        assert_eq!(status, 503, "{method} {path}：{payload}");
+        assert!(
+            payload["error"].as_str().unwrap_or("").contains("未接线"),
+            "{payload}"
+        );
+    }
 }
 
 #[tokio::test]

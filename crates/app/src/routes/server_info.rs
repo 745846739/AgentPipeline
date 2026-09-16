@@ -1,10 +1,15 @@
-//! 局域网分享端点（决策 167）：给出手机可访问的地址与对应二维码。
+//! 局域网分享端点（决策 167 / 186）：给出手机可访问的地址与对应二维码，并让「绑什么地址」
+//! 这件事在界面上可改。
 //!
-//! 两个端点都不带状态变更，纯 GET：
+//! 四个端点：
 //! - `GET /server-info`：JSON，含绑定 host / 端口 / 候选局域网地址 / 当前是否
-//!   仅回环绑定（决定分享页是否该提示「需要重启并绑定 0.0.0.0」）；
+//!   仅回环绑定（决定分享页是否该提示「需要绑定 0.0.0.0」）/ **这个 host 是谁定的**
+//!   （启动参数 / 界面设置 / 配置文件，决策 186）；
 //! - `GET /server-info/qr.svg`：把指定 URL 渲染成 SVG 二维码，供分享页 `<img>`
-//!   直接引用——前端不必引入 QR 库，也不用把二维码画进 canvas。
+//!   直接引用——前端不必引入 QR 库，也不用把二维码画进 canvas；
+//! - `POST /server/lan`（决策 186）：**界面上的那颗钮**——把绑定切成全网卡或只回环，
+//!   当场改绑（不必重启）并记住选择；
+//! - `DELETE /server/lan`：清掉界面上的选择，回到启动参数 / 配置文件那一级。
 
 use axum::extract::{Query, State};
 use axum::http::{header, StatusCode};
@@ -13,18 +18,27 @@ use axum::Json;
 use serde::{Deserialize, Serialize};
 
 use crate::lan;
-use crate::peer::is_loopback_bind;
-use crate::state::AppState;
+use crate::peer::{is_loopback_bind, peer_is_loopback};
+use crate::state::{ApiError, AppState, RebindRequest};
+
+/// `POST /server/lan` 改绑的等待上限。
+///
+/// 换绑要停掉监听器（最长一个优雅窗口）再绑新的，这个等待**允许超时**：触发改绑的请求
+/// 就在被切断的那条连接上，很多情况下应答根本到不了客户端（前端据此重读
+/// `/server-info` 拿真值，见 [`switch_bind`]）。
+const REBIND_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 
 /// `GET /server-info` 的响应体。
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ServerInfo {
-    /// 实际绑定地址（`[server] host` 或 CLI `--host`）。
+    /// 实际绑定地址（启动参数 / 界面设置 / `[server] host` 三级，决策 186）。
     pub host: String,
     /// 实际绑定端口（端口 0 时是内核分配的真实端口）。
     pub port: u16,
-    /// 仅绑定回环时为 true——此时手机连不上，分享页需给出如何开启的指引。
+    /// 仅绑定回环时为 true——此时手机连不上，分享页需给出「怎么开」的动作。
     pub loopback_only: bool,
+    /// `host` 是谁定的（`startup` / `settings` / `config`，决策 186）。
+    pub bind_source: String,
     /// 候选局域网地址，已按推荐度排序（`lan::rank_ipv4`）。
     pub addresses: Vec<AddressEntry>,
 }
@@ -46,17 +60,155 @@ pub struct AddressEntry {
 /// 地址即真实入口；绑回环时枚举结果对手机没有意义，但仍返回（`loopback_only = true`），
 /// 让分享页能显示「为什么打不开」而不是空列表。
 pub async fn info(State(state): State<AppState>) -> Response {
-    let host = state.bind_host.clone();
-    let port = state.port;
-    let addresses = build_addresses(&lan::lan_addresses(), port);
+    Json(server_info(&state)).into_response()
+}
 
-    Json(ServerInfo {
+/// 组装 `/server-info`。读端点与两个改绑端点的响应共用它——三处各写一份口径必然漂移。
+fn server_info(state: &AppState) -> ServerInfo {
+    let host = state.bind_host();
+    ServerInfo {
         loopback_only: is_loopback_bind(&host),
+        bind_source: state.bind_source().as_str().to_string(),
         host,
-        port,
-        addresses,
-    })
-    .into_response()
+        port: state.port,
+        addresses: build_addresses(&lan::lan_addresses(), state.port),
+    }
+}
+
+/// `POST /server/lan` 的请求体。
+#[derive(Debug, Deserialize)]
+pub struct LanBody {
+    /// `true` = 绑全网卡（`0.0.0.0`，手机可访问）；`false` = 只绑回环（仅本机）。
+    pub enabled: bool,
+}
+
+/// 本次请求是否来自回环（票 07 / 决策 186 的同一套判定）。
+///
+/// 做成提取器而不是在处理器里读 `Request`：`Request` 会把整个请求（含 body）吃掉，
+/// 与 `Json<LanBody>` 不能共存（axum 只允许最后一个提取器消费 body）。这个提取器只看
+/// `parts.extensions`，**永不拒绝**，且沿用 [`peer_is_loopback`] 的缺省语义
+/// （无来源信息 = 隐含本机，那是 L3 契约测试的形态）。
+pub struct PeerLoopback(bool);
+
+impl<S: Send + Sync> axum::extract::FromRequestParts<S> for PeerLoopback {
+    type Rejection = std::convert::Infallible;
+
+    async fn from_request_parts(
+        parts: &mut axum::http::request::Parts,
+        _state: &S,
+    ) -> Result<Self, Self::Rejection> {
+        Ok(PeerLoopback(peer_is_loopback(&parts.extensions)))
+    }
+}
+
+/// `POST /server/lan`（决策 186）：界面上的「绑定全网卡 / 只绑本机」两颗钮。
+///
+/// **只允许回环来源调用**。这是全站唯一一个能把服务暴露到局域网的入口：局域网里任何一台
+/// 设备若能调它，配对令牌（票 07）就白设了——先把它打开，再从自己的机器上来。判定沿用
+/// 票 07 的同一套对端地址，不新开一条通路。
+///
+/// **应答可能到不了**：改绑会切断当前所有连接，包括发出这次请求的那条。故调用方（前端）
+/// 看到传输错误时**不得**当作失败——正确的读法是重读 `GET /server-info`：改绑确实完成时，
+/// 那个读会给出新状态。
+pub async fn set_lan(
+    State(state): State<AppState>,
+    PeerLoopback(loopback): PeerLoopback,
+    Json(body): Json<LanBody>,
+) -> Response {
+    if !loopback {
+        return (
+            StatusCode::FORBIDDEN,
+            Json(serde_json::json!({
+                "error": "只有本机可以打开或关闭局域网访问：从局域网里放行它，\
+                          等于让同网段的任何设备绕过配对令牌",
+            })),
+        )
+            .into_response();
+    }
+    // 没有监听器主管 = 这个实例没起监听器（契约测试的 in-process router）。
+    // 报 503 而不是假装改了：能力不在这台机器上，责任方要说清。
+    let Some(tx) = state.rebind.clone() else {
+        return unbound_response();
+    };
+
+    let target = if body.enabled { "0.0.0.0" } else { "127.0.0.1" };
+    switch_bind(&state, &tx, Some(target.to_string())).await
+}
+
+/// `DELETE /server/lan`（决策 186）：清掉界面上的选择，回到启动参数 / 配置文件那一级。
+///
+/// 没有这个口，只按过一次钮的用户就再也回不到配置文件那条路上——他改 `[server] host`
+/// 会发现「改了没用」，而原因不在他改的那个地方。
+pub async fn clear_lan(
+    State(state): State<AppState>,
+    PeerLoopback(loopback): PeerLoopback,
+) -> Response {
+    if !loopback {
+        return (
+            StatusCode::FORBIDDEN,
+            Json(serde_json::json!({ "error": "只有本机可以修改绑定地址" })),
+        )
+            .into_response();
+    }
+    let Some(tx) = state.rebind.clone() else {
+        return unbound_response();
+    };
+    switch_bind(&state, &tx, None).await
+}
+
+/// 这个实例没有监听器可改绑时的统一应答（决策 186）。
+fn unbound_response() -> Response {
+    (
+        StatusCode::SERVICE_UNAVAILABLE,
+        Json(serde_json::json!({
+            "error": "改绑监听地址未接线：该实例没有起监听器，\
+                      请用 agent-pipeline serve 或桌面应用",
+        })),
+    )
+        .into_response()
+}
+
+/// 把一次改绑请求投给监听器主管并等结果，成功时返回**改完之后**的 `/server-info`。
+///
+/// `target = None` 表示「清除界面设置」。持久化由主管在**成功路径**上做（见 `serve`）：
+/// 点了没生效却在下一次启动生效，是这里最不该出现的一种状态。
+async fn switch_bind(
+    state: &AppState,
+    tx: &crate::state::RebindTx,
+    target: Option<String>,
+) -> Response {
+    let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
+    if tx
+        .send(RebindRequest {
+            host: target,
+            reply: reply_tx,
+        })
+        .await
+        .is_err()
+    {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(serde_json::json!({ "error": "监听器主管已停止，改绑未生效" })),
+        )
+            .into_response();
+    }
+    match tokio::time::timeout(REBIND_TIMEOUT, reply_rx).await {
+        Ok(Ok(Ok(_port))) => Json(server_info(state)).into_response(),
+        // 绑不上、且已回滚：这是一条**确定的**失败，400 + 原因（用户该做的是换一个钮，
+        // 或者去查端口是不是被别的进程占了）。
+        Ok(Ok(Err(message))) => ApiError::bad_request(message).into_response(),
+        // 超时或应答通道断了：本次结果对调用方是未知的，但**状态是可读的**——前端重读
+        // `/server-info` 即可。故报文只说「去读一眼」，不编造成功也不编造失败。
+        _ => (
+            StatusCode::ACCEPTED,
+            Json(serde_json::json!({
+                "error": "改绑已提交，但应答没能回来（多半是连接被改绑切断）。\
+                          请重新读取服务状态确认。",
+                "pending": true,
+            })),
+        )
+            .into_response(),
+    }
 }
 
 /// `GET /server-info/qr.svg?url=...` 的查询参数。
@@ -318,6 +470,7 @@ mod tests {
             host: "0.0.0.0".into(),
             port: 8787,
             loopback_only: false,
+            bind_source: "settings".into(),
             addresses: vec![AddressEntry {
                 interface: "en0".into(),
                 url: "http://192.168.1.10:8787".into(),

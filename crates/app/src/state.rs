@@ -19,6 +19,50 @@ use serde_json::json;
 /// （决策 91 / §3 resume 防连点）。
 pub type ResumeHook = Arc<dyn Fn(&str) + Send + Sync>;
 
+/// 当前绑定地址的**来源**（决策 186）。
+///
+/// 优先级：命令行 / 环境变量 > 界面上的开关（DB）> `config.toml` 的 `[server] host`。
+/// 界面要能说清「你按下这颗钮之后，重启还算不算数」，所以来源必须是可读的——
+/// 只说「现在绑在 0.0.0.0」而不说「这是谁定的」，用户改配置文件时会撞上「改了没用」
+/// 而完全不知道原因。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum BindSource {
+    /// `--host` / `AGENTPIPELINE_LAN` 等启动期显式覆盖（最高）。
+    Startup,
+    /// 「手机访问」页上的开关（住 DB，重启仍生效）。
+    Settings,
+    /// `config.toml` 的 `[server] host`（声明式默认）。
+    Config,
+}
+
+impl BindSource {
+    /// 面向用户的说话方式（`/server-info` 的 JSON 字段值，前端据此选文案）。
+    pub fn as_str(self) -> &'static str {
+        match self {
+            BindSource::Startup => "startup",
+            BindSource::Settings => "settings",
+            BindSource::Config => "config",
+        }
+    }
+}
+
+/// 改绑监听地址的请求（决策 186）：端点把请求投给 [`crate::serve`] 里的监听器主管。
+///
+/// **为什么走消息而不是直接持有监听器**：监听器任务的所有权在 `serve` 手里，端点在
+/// `AppState` 里。让状态反过来持有一个「能重建 router」的回调会形成 `AppState` →
+/// 回调 → `AppState` 的环；一条通道把方向掰直，且这个方向可测（主管的判定与回滚
+/// 不必经过 HTTP 就能钉住）。
+pub struct RebindRequest {
+    /// 目标绑定地址。`None` = 回到配置文件声明的值（界面上的「恢复配置文件的值」）。
+    pub host: Option<String>,
+    /// 结果：成功给出真实端口，失败给出面向用户的报文（调用方原样回显）。
+    pub reply: tokio::sync::oneshot::Sender<std::result::Result<u16, String>>,
+}
+
+/// 改绑通道的发送端（`serve` 之外不存在，故 `AppState` 里是 `Option`）。
+pub type RebindTx = tokio::sync::mpsc::Sender<RebindRequest>;
+
 #[derive(Clone)]
 pub struct AppState {
     pub store: Store,
@@ -29,11 +73,21 @@ pub struct AppState {
     /// 生产执行器：`POST /projects/analyze` 的 `project_analysis` 伪阶段（决策 48 / 130⑦）
     /// 需要它。L3 契约测试不注入（`None`）时退化为纯代码探测。
     pub executor: Option<Arc<Executor>>,
-    /// 绑定端口，用于跨源防护的本机 origin 判定（决策 128）。
+    /// 绑定端口，用于跨源防护的本机 origin 判定（决策 128）。**改绑不改端口**（决策 186），
+    /// 故它是常量。
     pub port: u16,
     /// 实际绑定地址（决策 167）：`/server-info` 据它判断手机能否直连
     /// （仅回环绑定时分享页要给出「如何开启局域网访问」的指引）。
-    pub bind_host: String,
+    ///
+    /// **可写**（决策 186）：界面上的开关改绑之后，判定「是不是局域网形态」这件事
+    /// （[`AppState::lan_mode`]，也就是配对令牌生不生效）必须跟着变——两处读同一个值，
+    /// 故它不再是 `String` 而是一个共享单元。
+    pub bind_host: Arc<std::sync::RwLock<String>>,
+    /// 上面那个值的来源（决策 186），只影响界面文案与「重启还算不算数」。
+    pub bind_source: Arc<std::sync::RwLock<BindSource>>,
+    /// 改绑通道（决策 186）：`None` = 这个实例没起监听器（L3 契约测试），
+    /// 此时 `POST /server/lan` 返回明确的 503 而不是假装改了。
+    pub rebind: Option<RebindTx>,
     /// 配置 / CLI 注入的额外放行 origin（决策 157），与缺省本机集合合并。
     pub extra_allowed_origins: Vec<String>,
     /// 技能市场客户端（决策 172⑤，票 10——本 effort 唯一新增接缝）。
@@ -63,11 +117,49 @@ impl AppState {
             resume_hook: Arc::new(|_| {}),
             executor: None,
             port,
-            bind_host: "127.0.0.1".to_string(),
+            bind_host: Arc::new(std::sync::RwLock::new("127.0.0.1".to_string())),
+            bind_source: Arc::new(std::sync::RwLock::new(BindSource::Config)),
+            rebind: None,
             extra_allowed_origins: Vec::new(),
             market: None,
             market_sources: Vec::new(),
             foreman: None,
+        }
+    }
+
+    /// 注入改绑通道（决策 186，仅 `serve` 调用）。
+    pub fn with_rebind(mut self, tx: RebindTx) -> Self {
+        self.rebind = Some(tx);
+        self
+    }
+
+    /// 当前绑定地址（读锁的**唯一**读法：`/server-info` 与 [`AppState::lan_mode`] 都必须
+    /// 经它，否则「绑在 0.0.0.0」与「令牌是否生效」两套判断会各自漂移，决策 182㉖）。
+    ///
+    /// 读锁中毒（持锁线程 panic）时回落到回环：那是**更保守**的一侧（不放开令牌门），
+    /// 比 panic 掉一个只读端点或静默当成「非回环」要好。
+    pub fn bind_host(&self) -> String {
+        self.bind_host
+            .read()
+            .map(|h| h.clone())
+            .unwrap_or_else(|_| "127.0.0.1".to_string())
+    }
+
+    /// 绑定地址的来源（决策 186）。
+    pub fn bind_source(&self) -> BindSource {
+        self.bind_source
+            .read()
+            .map(|s| *s)
+            .unwrap_or(BindSource::Config)
+    }
+
+    /// 改绑生效后由监听器主管回写（决策 186）。
+    pub fn set_bind_host(&self, host: impl Into<String>, source: BindSource) {
+        if let Ok(mut h) = self.bind_host.write() {
+            *h = host.into();
+        }
+        if let Ok(mut s) = self.bind_source.write() {
+            *s = source;
         }
     }
 
@@ -92,8 +184,18 @@ impl AppState {
 
     /// 注入实际绑定地址（决策 167）。serve 路径必须调用，否则 `/server-info`
     /// 会把局域网绑定误报为仅回环。
+    ///
+    /// 形态是 `Arc<RwLock<String>>`（决策 186）：界面上的开关能在运行时改绑，这个值必须
+    /// 跟着变。注入时同时给出**来源**，否则界面无法解释「这颗钮按了算不算数」。
     pub fn with_bind_host(mut self, host: impl Into<String>) -> Self {
-        self.bind_host = host.into();
+        let host = host.into();
+        self.bind_host = Arc::new(std::sync::RwLock::new(host));
+        self
+    }
+
+    /// 注入绑定地址的来源（决策 186）。缺省 [`BindSource::Config`]。
+    pub fn with_bind_source(mut self, source: BindSource) -> Self {
+        self.bind_source = Arc::new(std::sync::RwLock::new(source));
         self
     }
 
@@ -137,8 +239,9 @@ impl AppState {
     /// 配对令牌**只在这个形态下生效**——默认回环形态是本机自己使用，零摩擦是它必须
     /// 保持的性质。把判定收在这一个具名谓词里，是因为「绑在哪里」这件事同时决定
     /// `/server-info` 的提示（决策 167）与令牌是否生效（票 07），两处必须同源。
+    /// 界面上的开关改绑（决策 186）也会经这里生效——令牌门跟着绑定走。
     pub fn lan_mode(&self) -> bool {
-        !crate::peer::is_loopback_bind(&self.bind_host)
+        !crate::peer::is_loopback_bind(&self.bind_host())
     }
 }
 
