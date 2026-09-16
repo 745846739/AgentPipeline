@@ -780,7 +780,7 @@ executor checkpoint 机制天然支持：
 | `POST /skills/import` | POST | 上传 **zip 原始字节**（`?name=&overwrite=`）装技能；校验含 `SKILL.md`、frontmatter 可解析、正文非空，落到技能根 `{name}/SKILL.md` + 兄弟文件；同名默认 409 并报出现有来源，`overwrite=true` 才覆盖；`name` 可省略（包为 `{name}/SKILL.md` 布局时自动推断，平铺包须显式给）（票 09） |
 | `POST /skills/import-dir` | POST | 从一个或多个本地技能目录导入（`{paths: [], overwrite}`），**逐项返回结果**，一项失败不中断整批（票 09） |
 | `GET /skills/scan` | GET | 扫描一个本地技能根（`?root=~/.zcode/skills`）列出可导入技能：名字 + `description` + `exists`（票 09） |
-| `DELETE /skills/{name}` | DELETE | 卸载技能（删技能根下 `{name}/`）。**不检查引用**——仍被引用的卸载后由启动校验与 `PUT /stage-configs` fail fast 兜住；工具型技能（PATH 可执行文件）拒绝卸载（票 09） |
+| `DELETE /skills/{name}` | DELETE | 卸载技能（删技能根下 `{name}/`）。**不检查引用**——仍被引用的卸载后由启动校验与 `PUT /stage-configs` fail fast 兜住（票 09；技能只剩技能根下的 markdown 一个来源，决策 185） |
 | `GET /market/search` | GET | 查远程 registry 的候选（`?q=` 关键词命中名字或描述）。**未放行来源的条目不进候选**；返回 `{skills, sources, query}`，每条含 `name`/`version`/`sha256`/`source`/`description`/`url`（决策 172⑤，票 10） |
 | `POST /market/install` | POST | 从远程 registry 安装技能（`{name, overwrite}`）：索引查条目 → 来源放行 → **下载地址 origin 也放行** → 下载 → `sha256` 校验 → 落盘（复用票 09）。状态码按类别分：`market_network` → 502、`market_not_found` → 404、摘要不符 / 来源未放行 / 索引畸形 → 400、同名未确认 → 409（票 10） |
 
@@ -792,7 +792,7 @@ executor checkpoint 机制天然支持：
 > `crates/core/src/agent/skill_import.rs` 模块头）。票 10 的远程 registry 复用同一落盘入口。
 
 > **市场客户端的注入姿态（票 10）：** `AppState.market: Option<Arc<dyn MarketClient>>` ——
-> 生产在 `serve` 里按 `[market] allowed_sources` 注入 `HttpMarketClient`（reqwest，复用既有
+> 生产在 `serve` 里按生效来源（界面那份优先于 `[market] allowed_sources`，决策 187）注入 `HttpMarketClient`（reqwest，复用既有
 > HTTP 栈）；L3 契约测试注入 testkit 的 `FakeMarket`，因此「摘要不符」「来源未放行」这些
 > 真网络没法稳定复现的路径都成了**确定性、离线**的用例。白名单为空时 `market` 为 `None`
 > 是**合法状态**（= 不装远程技能），端点返回一条说明怎么开的 400，而不是 500。
