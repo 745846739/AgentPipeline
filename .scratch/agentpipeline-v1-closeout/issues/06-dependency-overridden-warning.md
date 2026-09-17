@@ -6,7 +6,7 @@
 
 **Status:** done
 
-- [ ] `dependency_failed` 的 continue 在流转记录（或等价观测面）留下 `dependency_overridden` 警告，含被忽略的依赖任务 id
-- [ ] 任务置回 queued 交还准入、不直接 spawn 的既有语义不变（决策 130 ⑤）
-- [ ] 按依赖终态裁剪的动作集不变（cancelled 无「等待依赖重试」）
-- [ ] 用例覆盖：continue 后警告可查且内容正确；cancelled 分支同样落警告
+- [x] `dependency_failed` 的 continue 在流转记录（或等价观测面）留下 `dependency_overridden` 警告，含被忽略的依赖任务 id
+- [x] 任务置回 queued 交还准入、不直接 spawn 的既有语义不变（决策 130 ⑤）
+- [x] 按依赖终态裁剪的动作集不变（cancelled 无「等待依赖重试」）
+- [x] 用例覆盖：continue 后警告可查且内容正确；cancelled 分支同样落警告

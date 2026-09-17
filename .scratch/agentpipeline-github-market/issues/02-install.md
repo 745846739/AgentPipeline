@@ -6,7 +6,7 @@
 
 **Blocked by:** 01
 
-**Status:** ready-for-agent
+**Status:** done（2026-09-17 回填：实现早已落地，随决策 194 于 d41051f 交付）
 
 ## 链路
 

@@ -6,8 +6,8 @@
 
 **Status:** done
 
-- [ ] review 打回 pending 带 `context.kind = review`，动作集为「打回开发修复（goto develop.execute）/ 强制通过评审（skip）」
-- [ ] test 闸门 code_issue pending 带 `context.kind = test_code_issue` / `gate_recheck`，动作集为「修改测试用例 / 修改业务代码」
-- [ ] 两条路径不再落通用兜底行；权威表既有行不改语义
-- [ ] E2E-03 / E2E-06b 断言 `context.kind` 与动作集（复用票 01 的助手）
-- [ ] 前端纯渲染，无需改动；若发现渲染依赖通用行则一并核对
+- [x] review 打回 pending 带 `context.kind = review`，动作集为「打回开发修复（goto develop.execute）/ 强制通过评审（skip）」
+- [x] test 闸门 code_issue pending 带 `context.kind = test_code_issue` / `gate_recheck`，动作集为「修改测试用例 / 修改业务代码」
+- [x] 两条路径不再落通用兜底行；权威表既有行不改语义
+- [x] E2E-03 / E2E-06b 断言 `context.kind` 与动作集（复用票 01 的助手）
+- [x] 前端纯渲染，无需改动；若发现渲染依赖通用行则一并核对

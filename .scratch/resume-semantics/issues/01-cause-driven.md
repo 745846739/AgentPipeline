@@ -32,15 +32,24 @@ true，通过 = false）。
 
 **Status:** done
 
-- [ ] 迁移把 bool 列换成 kind 列；`clear_cursor_pending` 落原因；一次性读清
-- [ ] `ResumeCause` 穷尽 `PendingKind` + `context.kind` 的合法组合；`resume_continues` 是纯函数，
+- [x] 迁移把 bool 列换成 kind 列；`clear_cursor_pending` 落原因；一次性读清
+- [x] `ResumeCause` 穷尽 `PendingKind` + `context.kind` 的合法组合；`resume_continues` 是纯函数，
       且有穷尽性测试（新加一个 pending 原因却不写进表里时，测试报错而不是悄悄兜底）
-- [ ] 两条内联 SQL 改走 `clear_cursor_pending`；有测试钉住「评审驳回之后续接生效」
-- [ ] 重启恢复路径有测试钉住「不置位、不续接」
+- [x] 两条内联 SQL 改走 `clear_cursor_pending`；有测试钉住「评审驳回之后续接生效」
+- [x] 重启恢复路径有测试钉住「不置位、不续接」
 - [ ] 超时的两处行为各有一条测试：未耗尽 = 干净重试不续接；耗尽后人按「重试执行」= 续接
-- [ ] 自动重试（validate / agent）仍不续接（决策 33 不变）
+      ——**未满足（测试缺口）**：`crates/core/tests/scheduler_tick.rs:239` 只钉了「未耗尽 → 拉起
+      executor、耗尽 → pending(Timeout)」，没有断言续接与 messages；交付说明引的
+      `clean_retry_after_a_tool_failure_stays_empty_whatever_the_cause_says` 现场原因是
+      `info_insufficient` 且属工具失败重试，**不是 Timeout**。全仓测试无一处引用
+      `ResumeCause::Timeout`——「耗尽后人工按键 = 续接」目前只在判定表纯函数里有值
+- [x] 自动重试（validate / agent）仍不续接（决策 33 不变）
 - [ ] 冲突等待与依赖失败的**自动放行**各有测试钉住「续接」（无人按键但原因属 true 那一栏）
-- [ ] 决策 172⑥ / 180 的修订在 `docs/agents.md` §10.6.3 / §10.6.4 同步（由票 02 做亦可，二选一写清）
+      ——**未满足（测试缺口）**：`scheduler_tick.rs:407` 与 `:595` 只断言 pending 被清、状态变化，
+      **没有断言带回了上一轮 messages**；测试里完全没有 `ResumeCause::ConflictWait` /
+      `DependencyFailed` / `DependencyCancelled` 的出现。交付说明本身也只说「本来就走
+      `clear_cursor_pending`，无需改代码」，未提供续接取证
+- [x] 决策 172⑥ / 180 的修订在 `docs/agents.md` §10.6.3 / §10.6.4 同步（由票 02 做亦可，二选一写清）
 
 ## 交付
 

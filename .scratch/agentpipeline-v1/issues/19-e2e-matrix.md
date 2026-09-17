@@ -25,7 +25,7 @@
       pending/动作集/不合入 + **挂起后游标仍停 merge.execute** + **continue → 工作区恢复干净后完成合入到 done**
 - [x] E2E-11 skip 落点矩阵 —— 已有（`join_and_skip.rs`，不改）
 - [x] E2E-12 并行互不阻塞 —— 已有（`join_and_skip.rs` + core `one_branch_pending_does_not_stop_the_other`）
-- [ ] E2E-13 中断恢复 —— **归票 18**（`tests/e2e/tests/crash_recovery.rs`），本票不碰
+- [x] E2E-13 中断恢复 —— **归票 18**（`tests/e2e/tests/crash_recovery.rs`），本票不碰
 - [x] E2E-14 超时链 —— `timeouts.rs::e2e_14_timeout_chain_kills_retries_then_pends_and_merge_has_no_skip` / `..._long_system_command_heartbeat_survives_idle_timeout`
 - [x] E2E-15 judge_disagreement —— `pending.rs::e2e_15_judge_disagreement_pends_then_continue_advances_without_rerun` / `..._goto_execute_increments_attempts`
 - [x] E2E-16 design_refs 完整性 —— `pending.rs::e2e_16_high_dangling_design_ref_is_blocker_and_backtracks` / `..._medium_..._only_a_warning`

@@ -21,11 +21,11 @@
 
 **Status:** done
 
-- [ ] delta 带 `session_id`；流水线的 delta 该字段为空串（`serde(default)`，老客户端不炸）
-- [ ] 前端在会话不符时丢弃 delta；切会话后旧回话不落进新会话的活动轮
+- [x] delta 带 `session_id`；流水线的 delta 该字段为空串（`serde(default)`，老客户端不炸）
+- [x] 前端在会话不符时丢弃 delta；切会话后旧回话不落进新会话的活动轮
       （单测钉 `appendForemanDelta` 的守卫，照 `realtime/foreman.test.ts` 的既有写法）
-- [ ] `send()` 的 await 窗口里切会话时，回包与 `reload()` 的结果都不落到新会话
-- [ ] 两个会话同时发话的取证：一条测试或 e2e，证明两边的增量各归各
+- [x] `send()` 的 await 窗口里切会话时，回包与 `reload()` 的结果都不落到新会话
+- [x] 两个会话同时发话的取证：一条测试或 e2e，证明两边的增量各归各
 
 ## 交付
 

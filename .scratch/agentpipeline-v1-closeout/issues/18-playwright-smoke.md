@@ -6,8 +6,8 @@
 
 **Status:** done
 
-- [ ] harness 就位：临时 home + FakeAgent + 真实后端，端口经回读获取，用例结束干净回收
-- [ ] 用例 ① 跑通：看板 → 任务详情 → 页签切换 → diff 审批合入
-- [ ] 用例 ② 跑通：pending 触发 dossier 面板 → resume，断言琥珀面板与顶栏待办计数
-- [ ] 纳入可重复执行的门（justfile 目标），只跑 Chromium
-- [ ] `docs/testing.md` §9「playwright 两条 E2E 尚未执行」更新为已执行，并记用例路径
+- [x] harness 就位：临时 home + FakeAgent + 真实后端，端口经回读获取，用例结束干净回收
+- [x] 用例 ① 跑通：看板 → 任务详情 → 页签切换 → diff 审批合入
+- [x] 用例 ② 跑通：pending 触发 dossier 面板 → resume，断言琥珀面板与顶栏待办计数
+- [x] 纳入可重复执行的门（justfile 目标），只跑 Chromium
+- [x] `docs/testing.md` §9「playwright 两条 E2E 尚未执行」更新为已执行，并记用例路径

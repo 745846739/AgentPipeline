@@ -23,14 +23,14 @@
 
 **Status:** done
 
-- [ ] DROP COLUMN 迁移；`PUT /stage-configs` 不再吃这个字段（旧客户端带上它时的行为要选定一种：
+- [x] DROP COLUMN 迁移；`PUT /stage-configs` 不再吃这个字段（旧客户端带上它时的行为要选定一种：
       报 400，或按 `deny_unknown_fields` 的口径静默忽略——落地时选一种并写进交付说明）
-- [ ] `StageConfigForm` 的勾选框消失；`lib/stageConfigs.ts` 的四处字段逻辑删除，其单测
+- [x] `StageConfigForm` 的勾选框消失；`lib/stageConfigs.ts` 的四处字段逻辑删除，其单测
       （`stageConfigs.test.ts`）同步
-- [ ] `docs/agents.md` 两处描述改写为「由原因表决定」
-- [ ] 无回归：续接在「信息不足补充后继续」与「评审驳回回开发」两条路上仍生效（测试钉住）
-- [ ] 无回归：干净重试与首跑仍是空 messages
-- [ ] `node_overrides_json` 的**其他**键（skills、超时）不受影响——它是个通用覆盖表，只摘一个键
+- [x] `docs/agents.md` 两处描述改写为「由原因表决定」
+- [x] 无回归：续接在「信息不足补充后继续」与「评审驳回回开发」两条路上仍生效（测试钉住）
+- [x] 无回归：干净重试与首跑仍是空 messages
+- [x] `node_overrides_json` 的**其他**键（skills、超时）不受影响——它是个通用覆盖表，只摘一个键
 
 ## 交付
 

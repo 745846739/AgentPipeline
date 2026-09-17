@@ -11,10 +11,10 @@
 
 | 票 | 内容 | 阻塞于 | 状态 |
 |---|---|---|---|
-| [01](issues/01-repo-reader.md) | 仓访问层与测试接缝（libgit2 + 离线 fixture，不含界面与安装） | — | ready-for-agent |
-| [02](issues/02-install.md) | 从一个钉住的 commit 安装（八类失败、来源记录、一键安装连带） | 01 | ready-for-agent |
-| [03](issues/03-browse-ui.md) | 浏览与安装页（仓名单两级、冷启动名单、分组列表、SHA 刷新） | 01、02 | ready-for-agent |
-| [04](issues/04-remove-old-layer.md) | 拆除旧层（代码 / 界面 / 测试 / 文档 + 决策 194 的生效确认） | 02、03 | ready-for-agent |
+| [01](issues/01-repo-reader.md) | 仓访问层与测试接缝（libgit2 + 离线 fixture，不含界面与安装） | — | done |
+| [02](issues/02-install.md) | 从一个钉住的 commit 安装（八类失败、来源记录、一键安装连带） | 01 | done |
+| [03](issues/03-browse-ui.md) | 浏览与安装页（仓名单两级、冷启动名单、分组列表、SHA 刷新） | 01、02 | done |
+| [04](issues/04-remove-old-layer.md) | 拆除旧层（代码 / 界面 / 测试 / 文档 + 决策 194 的生效确认） | 02、03 | done |
 
 **01 起步，02 与 03 可并行，04 收尾。** 04 排在最后不是礼节：它删掉的是**当前唯一能用的那条路**，
 必须等新层建好并有用例守着再动手。

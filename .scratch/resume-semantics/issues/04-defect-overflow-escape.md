@@ -22,10 +22,15 @@
 **Status:** done
 
 - [ ] 按下去之后 pending 真的解除：`GET /tasks/{id}` 的 `allowed_actions` 随之变化（测试钉住）
-- [ ] 若选首选：走 `clear_cursor_pending`，原因与判定表的取值一起定
-- [ ] 补测试：`context_overflow` 下按 `model_override` 之后游标不再 pending、任务回到可被调度器
+      ——**未满足（测试缺口）**：行为已实现（`crates/core/src/storage/tasks.rs:237-276` 的
+      `apply_model_override` 清 pending、任务回 `queued`），但取证停在 Store 层
+      （`crates/core/tests/executor.rs:3094` 断言 `cleared == 1`、游标不再 pending、任务 `Queued`）；
+      契约侧的 `api_contract.rs:927` 只查 `model_override` 字段，**全仓无任何用例断言
+      `GET /tasks/{id}` 的 `allowed_actions` 在覆盖后变化**
+- [x] 若选首选：走 `clear_cursor_pending`，原因与判定表的取值一起定
+- [x] 补测试：`context_overflow` 下按 `model_override` 之后游标不再 pending、任务回到可被调度器
       准入的状态（`try_admit` 只认 `queued`）
-- [ ] 交付说明里写清选了哪条、以及为什么
+- [x] 交付说明里写清选了哪条、以及为什么
 
 ## 交付
 

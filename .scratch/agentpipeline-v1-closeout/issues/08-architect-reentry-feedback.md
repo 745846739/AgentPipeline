@@ -6,9 +6,9 @@
 
 **Status:** done
 
-- [ ] retry_exhausted 回架构设计时写入 `retry-feedback.md`，且与游标置位同事务（不落半截状态）
-- [ ] architect 重入的 user prompt 追加 `backtrack-feedback.md` + `retry-feedback.md` 内容，注明来源与诉求（决策 126 / 138）
-- [ ] 两文件在首轮执行时为空且不渲染该段
-- [ ] info_insufficient 的补充输入注入 validate_input 重入 prompt，而非只落流转原因
-- [ ] E2E-21 断言补充输入进入重入 prompt；retry 回架构设计的场景断言 `retry-feedback.md` 落盘与注入
-- [ ] `docs/pipeline-spec.md` 打回反馈文件表与实现一致
+- [x] retry_exhausted 回架构设计时写入 `retry-feedback.md`，且与游标置位同事务（不落半截状态）
+- [x] architect 重入的 user prompt 追加 `backtrack-feedback.md` + `retry-feedback.md` 内容，注明来源与诉求（决策 126 / 138）
+- [x] 两文件在首轮执行时为空且不渲染该段
+- [x] info_insufficient 的补充输入注入 validate_input 重入 prompt，而非只落流转原因
+- [x] E2E-21 断言补充输入进入重入 prompt；retry 回架构设计的场景断言 `retry-feedback.md` 落盘与注入
+- [x] `docs/pipeline-spec.md` 打回反馈文件表与实现一致

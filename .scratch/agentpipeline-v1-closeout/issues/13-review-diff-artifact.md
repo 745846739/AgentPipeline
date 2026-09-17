@@ -6,8 +6,8 @@
 
 **Status:** done
 
-- [ ] 人工评审 pending 前生成 diff 文件并落 stage output，记为系统来源命令
-- [ ] 文件经既有文件下发端点可取（路径确定，覆盖写入可重入）
-- [ ] 任务详情评审面板展示该 diff；无 diff 时降级不报错
-- [ ] 用例覆盖：人工评审 pending 时 `review-diff.diff` 存在且内容为基准到任务分支的差异
-- [ ] `docs/data-model.md` 任务目录清单与 `docs/operations.md` §（决策 124）与实现一致
+- [x] 人工评审 pending 前生成 diff 文件并落 stage output，记为系统来源命令
+- [x] 文件经既有文件下发端点可取（路径确定，覆盖写入可重入）
+- [x] 任务详情评审面板展示该 diff；无 diff 时降级不报错
+- [x] 用例覆盖：人工评审 pending 时 `review-diff.diff` 存在且内容为基准到任务分支的差异
+- [x] `docs/data-model.md` 任务目录清单与 `docs/operations.md` §（决策 124）与实现一致

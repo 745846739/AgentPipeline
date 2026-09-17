@@ -18,10 +18,10 @@
 
 **Status:** done
 
-- [ ] 链接只在 round 0 落（测试：一个续接 run + 一次干净重试，历史那条 run 只被排除一次）
-- [ ] 修完后 `refresh_task_totals` 的读数符合「排除的是历史那一侧」这条注释
-- [ ] `continued_from_run_id` 的语义与消费方（`metrics::total_tokens`，唯一）不变
-- [ ] 交付说明里写清这个 bug 的**方向**（少算而非双算）与它影响到的读数（任务 `total_tokens`）
+- [x] 链接只在 round 0 落（测试：一个续接 run + 一次干净重试，历史那条 run 只被排除一次）
+- [x] 修完后 `refresh_task_totals` 的读数符合「排除的是历史那一侧」这条注释
+- [x] `continued_from_run_id` 的语义与消费方（`metrics::total_tokens`，唯一）不变
+- [x] 交付说明里写清这个 bug 的**方向**（少算而非双算）与它影响到的读数（任务 `total_tokens`）
 
 ## 交付
 

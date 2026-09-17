@@ -7,7 +7,7 @@
 
 **Blocked by:** None (可立即开始)
 
-**Status:** ready-for-agent
+**Status:** done（2026-09-17 回填：实现早已落地，随决策 194 于 d41051f 交付）
 
 **背景与判据：** 三处口径的裁定与实测底稿见 [`../background.md`](../background.md)（差异表在第 0 节）。
 本票实现的是决策 194 的「只走 git 通道 + 钉 commit SHA」两条，`owner/repo` 白名单与失败分类**不在本票**。

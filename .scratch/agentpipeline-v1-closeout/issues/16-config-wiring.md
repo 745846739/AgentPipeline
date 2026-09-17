@@ -6,8 +6,8 @@
 
 **Status:** done
 
-- [ ] `prompts.dir` 生效，覆盖时从该目录读模板 / persona，缺省仍回落 `{home}/prompts`
-- [ ] `[logging]` 的键名与 `docs/agents.md` 文档一致，且 `format` / `file` 真正生效（含文件日志目录创建与权限）
-- [ ] 未知或冲突键的处理姿态明确（沿用既有配置校验姿态，不静默忽略）
-- [ ] `docs/agents.md` 配置示例与实现一致；若决定废弃某键，文档显式标注
-- [ ] 用例覆盖：prompts 目录覆盖生效；日志 format / file 生效（文件被创建且内容为该格式）
+- [x] `prompts.dir` 生效，覆盖时从该目录读模板 / persona，缺省仍回落 `{home}/prompts`
+- [x] `[logging]` 的键名与 `docs/agents.md` 文档一致，且 `format` / `file` 真正生效（含文件日志目录创建与权限）
+- [x] 未知或冲突键的处理姿态明确（沿用既有配置校验姿态，不静默忽略）
+- [x] `docs/agents.md` 配置示例与实现一致；若决定废弃某键，文档显式标注
+- [x] 用例覆盖：prompts 目录覆盖生效；日志 format / file 生效（文件被创建且内容为该格式）

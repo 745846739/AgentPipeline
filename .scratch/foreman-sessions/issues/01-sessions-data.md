@@ -32,17 +32,17 @@
 
 **Status:** done
 
-- [ ] 迁移 0012 三件事一张作业：新表 / messages 加列并回填 / commands 加列且 task_id 改可空
-- [ ] 回填成第一个会话，标题取自首条用户消息（截断规则写成纯函数并单测；无消息时给中性标题）
-- [ ] `list_foreman_messages` 与 `foreman_session_totals` 都按会话过滤，**页头读数从累计值变成真会话值**
+- [x] 迁移 0012 三件事一张作业：新表 / messages 加列并回填 / commands 加列且 task_id 改可空
+- [x] 回填成第一个会话，标题取自首条用户消息（截断规则写成纯函数并单测；无消息时给中性标题）
+- [x] `list_foreman_messages` 与 `foreman_session_totals` 都按会话过滤，**页头读数从累计值变成真会话值**
       （测试：两个会话各说两句，合计互不污染）
-- [ ] 会话列表按最近活动倒序、上限一条常量、不分页
-- [ ] 归档 = 置 `archived_at`，**不物理删除**；归档不保护消息，照旧吃 `conversation_retention_days`
+- [x] 会话列表按最近活动倒序、上限一条常量、不分页
+- [x] 归档 = 置 `archived_at`，**不物理删除**；归档不保护消息，照旧吃 `conversation_retention_days`
       （30 天）的年龄清理——归档是「从列表里收起来」，不是永久保存
-- [ ] 四个端点 + `GET /foreman/session?session=`；未接线时仍 503（`foreman_unwired`）
-- [ ] 值班长的一条命令能落库（`task_id` NULL + `session_id`）并从会话维度读出来；
+- [x] 四个端点 + `GET /foreman/session?session=`；未接线时仍 503（`foreman_unwired`）
+- [x] 值班长的一条命令能落库（`task_id` NULL + `session_id`）并从会话维度读出来；
       `list_commands` 的任务口径不变
-- [ ] 测试：在既有数据上打开不炸；跨会话取数与合计隔离；归档后列表不含它而消息仍在
+- [x] 测试：在既有数据上打开不炸；跨会话取数与合计隔离；归档后列表不含它而消息仍在
 
 ## 交付
 
