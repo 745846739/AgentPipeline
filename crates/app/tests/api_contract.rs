@@ -3859,6 +3859,98 @@ async fn recommendations_list_stages_with_install_state() {
     assert_eq!(architect["skills"][1]["installed"], false, "{body}");
 }
 
+/// 推荐清单的每行还要给出**机器可读**的「本阶段是否已声明」（票 01）。
+///
+/// 界面据此决定那一行给的是「安装」还是「启用」——票 16 那句「已安装的可直接启用」落地前的
+/// 缺口正在这里：只有 `installed` 时，一个已装但本阶段没启用的技能在行上既没有按钮、也不是
+/// 「已启用」（本机十个推荐行全部已装，于是一枚按钮都不出现）。
+///
+/// **为什么不复用 `declared_in`**：它是给人看的位置说明（`阶段 <key>` / `阶段 <key> 节点 <node>`），
+/// 界面拿它判断「是不是本阶段」就等于 parse 文案。故三态逐格断言，且**同名技能的相邻两行
+/// 必须给出不同答案**——推荐清单里 `tdd` 同时挂在 test-design 与 develop 两行上。
+#[tokio::test]
+async fn recommendations_report_whether_each_skill_is_declared_in_that_stage() {
+    let api = api().await;
+    seed_installed_skill(&api, "grilling", "拷问协议正文。").await;
+    seed_installed_skill(&api, "tdd", "测试先行。").await;
+    // code-review 走**节点级**声明，用来钉住「节点级也算本阶段」那一格
+    seed_installed_skill(&api, "code-review", "两轴评审。").await;
+
+    // grilling 在 **architect-design 阶段级**声明；tdd 只声明在 **test-design**。
+    let (status, body) = put(
+        &api,
+        "/stage-configs/architect-design",
+        serde_json::json!({"skills_json": ["grilling"]}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let (status, body) = put(
+        &api,
+        "/stage-configs/test-design",
+        serde_json::json!({"skills_json": ["tdd"]}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let (status, body) = put(
+        &api,
+        "/stage-configs/review",
+        serde_json::json!({
+            "node_overrides_json": {"execute": {"skills": ["code-review"]}},
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+
+    let (status, body) = get(&api, "/skills/recommendations").await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let stages = body["stages"].as_array().unwrap();
+    let row = |stage: &str, name: &str| -> serde_json::Value {
+        stages
+            .iter()
+            .find(|s| s["stage"] == stage)
+            .expect("该阶段应有推荐")
+            .clone()["skills"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|k| k["name"] == name)
+            .expect("该技能应有推荐行")
+            .clone()
+    };
+
+    // ① 已装 + 本阶段已声明 → 两个判定都是真（界面保持只读标签）
+    let grill = row("architect-design", "grilling");
+    assert_eq!(grill["installed"], true, "{grill}");
+    assert_eq!(grill["declared_here"], true, "本阶段声明过它：{grill}");
+    assert_eq!(
+        grill["declared_in"].as_array().unwrap().len(),
+        1,
+        "位置说明（展示串）照旧下发：{grill}"
+    );
+
+    // ② 已装 + 本阶段**没**声明 → installed true 而 declared_here false（界面给「启用」）
+    let tdd_develop = row("develop", "tdd");
+    assert_eq!(tdd_develop["installed"], true, "{tdd_develop}");
+    assert_eq!(
+        tdd_develop["declared_here"], false,
+        "tdd 声明在 test-design，develop 这一行不该算已启用：{tdd_develop}"
+    );
+
+    // ③ 同一个技能在它真正被声明的那个阶段上 → declared_here true
+    //    （这一对是本判定的牙齿：按名字全局回答会让 ② 也变成真）
+    let tdd_test_design = row("test-design", "tdd");
+    assert_eq!(tdd_test_design["declared_here"], true, "{tdd_test_design}");
+
+    // ④ 未装 + 未声明 → 两个都是假（界面给「安装」）
+    let domain = row("architect-design", "domain-modeling");
+    assert_eq!(domain["installed"], false, "{domain}");
+    assert_eq!(domain["declared_here"], false, "{domain}");
+
+    // ⑤ 节点级声明也算本阶段声明（不然那一行会白给一颗「启用」）
+    let review = row("review", "code-review");
+    assert_eq!(review["declared_here"], true, "节点级声明也算：{review}");
+}
+
 /// 一键安装：技能落到技能根 **且** 写进该阶段配置，一次请求完成。
 #[tokio::test]
 async fn one_click_install_lands_the_skill_and_writes_the_stage_config() {

@@ -764,7 +764,15 @@ export interface RecommendedSkill {
   name: string;
   reason: string;
   installed: boolean;
+  /** 被谁引用（展示串，如「阶段 develop」/「阶段 develop 节点 execute」）。 */
   declared_in: string[];
+  /**
+   * 本阶段是否已声明它（票 16「已安装的可直接启用」，票 01）。
+   *
+   * 界面按它决定那一行给的是「启用」还是只读标签。**不要拿 `declared_in` 推算这一格**：
+   * 那是给人看的展示串，按它判断阶段等于 parse 文案（后端另给这个布尔值就是为了这个）。
+   */
+  declared_here: boolean;
 }
 
 /** 某阶段的推荐清单（票 16）。 */

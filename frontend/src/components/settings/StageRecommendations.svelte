@@ -1,5 +1,5 @@
 <script lang="ts">
-  import type { RecommendedStage, SkillPreview } from '../../api/types';
+  import type { RecommendedSkill, RecommendedStage, SkillPreview } from '../../api/types';
   import { stageKeyLabel } from '../../lib/stageConfigs';
 
   /**
@@ -8,6 +8,13 @@
    * 推荐清单的投递载体是**界面**：清单本身是二进制里的常量（经 `GET /skills/recommendations`
    * 下发），技能正文一律由用户自己安装。一键安装把「落到技能根 + 写进该阶段配置」合成一步，
    * 并把票 11 的三项预览原样摆在按钮下面——**不绕过信任确认**：新装技能一律是名字态 + 未信任。
+   *
+   * 行按三态渲染（票 16「未安装的项带安装按钮，**已安装的可直接启用**」，票 01）：
+   * 未装 →「安装」；已装但**本阶段**没启用它 →「启用」；已装且本阶段已启用 → 只读标签。
+   * 判据取后端的 `declared_here`（机器可读），不拿 `declared_in` 那串展示文案去推。
+   * 两个词打的是**同一个**回调（`POST /skills/install`）：后端在「技能根里那份就是清单这一份」
+   * （含**没有来源记录**那种）时跳过下载、只写配置（决策 181⑦）；若来源记录指着别的仓，它会
+   * 照常去装一份，由同名冲突门交用户裁决——所以按「启用」**不保证零网络**，界面也不这么承诺。
    */
   interface Props {
     stages: RecommendedStage[];
@@ -17,12 +24,22 @@
      * 装完立刻把正文特征摆给用户看，是「预览不被绕过」在界面上的落点。
      */
     preview: SkillPreview | null;
-    /** 一键安装；失败原因（技能不存在 / 摘要不符 / 来源未放行…）由父组件回填到 error。 */
+    /** 安装 / 启用；失败原因（技能不存在 / 摘要不符 / 来源未放行…）由父组件回填到 error。 */
     oninstall: (stage: string, name: string) => void;
   }
   let { stages, busy, preview, oninstall }: Props = $props();
 
   const risky = $derived(preview?.features.hits ?? []);
+
+  /** 这一行要不要给钮：只有「已装且本阶段已启用」是只读的，另外两种各给一个词。 */
+  function needsAction(skill: RecommendedSkill): boolean {
+    return !skill.installed || !skill.declared_here;
+  }
+
+  /** 钮上的词：没装是「安装」，装好了而本阶段没启用是「启用」。 */
+  function actionLabel(skill: RecommendedSkill): '安装' | '启用' {
+    return skill.installed ? '启用' : '安装';
+  }
 </script>
 
 <div class="rec panel">
@@ -46,10 +63,16 @@
               <span class="state" class:on={skill.installed}>
                 {skill.installed ? '已安装' : '未安装'}
               </span>
-              {#if skill.declared_in.length > 0}
+              {#if skill.declared_here}
                 <span class="used">已启用：{skill.declared_in.join('、')}</span>
+              {:else if skill.declared_in.length > 0}
+                <!-- 本阶段没启用它，别的阶段启用了：**不能写成「已启用」**——那一行旁边正给着
+                     一颗「启用」钮，两个词摆在一起自相矛盾（票 01 的那一行 tdd 就是这样）。 -->
+                <span class="used">已被引用：{skill.declared_in.join('、')}</span>
               {/if}
-              {#if !skill.installed}
+              {#if needsAction(skill)}
+                <!-- 三态只有这一颗钮：未装是「安装」，已装而本阶段没启用是「启用」（票 16
+                     「已安装的可直接启用」——装与启用是两件事）；已装且本阶段已启用则不给钮。 -->
                 <button
                   type="button"
                   class="btn"
@@ -57,7 +80,7 @@
                   onclick={() => oninstall(group.stage, skill.name)}
                 >
                   {#if busy === `${group.stage}:${skill.name}`}<span class="spin"></span>{/if}
-                  安装
+                  {actionLabel(skill)}
                 </button>
               {/if}
             </li>

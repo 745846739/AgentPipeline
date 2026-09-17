@@ -907,6 +907,27 @@ pub fn declared_skill_where(stage_configs: &[StageConfig], name: &str) -> Vec<St
     out
 }
 
+/// 某个技能是否被**指定的这一个阶段**声明（阶段级或该阶段的任一节点级）。
+///
+/// 与 [`declared_skill_where`] 是同一个判定的两种形态：那一支回答「被谁用着」，回的是给人看的
+/// 位置说明；这一支回答「这个阶段用没用它」，回一个布尔值——推荐面板据此决定那一行给的是
+/// 「安装」还是「启用」（票 16「已安装的可直接启用」，票 01）。
+///
+/// **为什么不拿 [`declared_skill_where`] 的结果去比对字符串**：那等于让调用方 parse 展示文案
+/// （`阶段 <key>` / `阶段 <key> 节点 <node>`），文案一改判定就悄悄失效。两支同源，都走
+/// [`declared_skill_decls`]，故一条坏的节点声明一样只作废那一处来源。
+pub fn skill_declared_in_stage(
+    stage_configs: &[StageConfig],
+    stage: crate::types::Stage,
+    name: &str,
+) -> bool {
+    stage_configs
+        .iter()
+        .filter(|cfg| cfg.stage == stage.as_str())
+        .flat_map(declared_skill_decls)
+        .any(|(_, decl)| decl.name == name)
+}
+
 /// 一个阶段配置声明的全部技能，带**声明位置**（阶段级 / 哪个节点级）。
 pub fn declared_skill_decls(cfg: &StageConfig) -> Vec<(String, crate::agent::skills::SkillDecl)> {
     declared_skill_sources(cfg)
@@ -1680,6 +1701,68 @@ mod tests {
 
         // 而写入 / 启动路径仍 fail fast（同一份配置经严格版即报错）
         assert!(declared_skills(&cfg).is_err());
+    }
+
+    /// 推荐面板的「启用」判据：按**阶段**问「这个技能在这个阶段启用没有」。
+    ///
+    /// 关键的一格是「同名技能在别的阶段被声明 ≠ 本阶段被声明」——推荐清单里 `tdd` 同时挂在
+    /// test-design 与 develop 两行上，而它只被 test-design 声明过（票 01 要分辨的正是这一格）。
+    #[test]
+    fn skill_declared_in_stage_is_per_stage_and_counts_node_level() {
+        let cfgs = vec![
+            StageConfig {
+                stage: "architect-design".into(),
+                skills_json: Some(serde_json::json!(["grilling"])),
+                node_overrides_json: Some(serde_json::json!({
+                    "execute": {"skills": ["to-spec"]},
+                })),
+                ..Default::default()
+            },
+            StageConfig {
+                stage: "develop".into(),
+                skills_json: Some(serde_json::json!(["tdd"])),
+                ..Default::default()
+            },
+        ];
+
+        // 阶段级声明
+        assert!(skill_declared_in_stage(
+            &cfgs,
+            Stage::ArchitectDesign,
+            "grilling"
+        ));
+        // 节点级声明**也算**这个阶段声明了它（推荐面板那一行同样不该再给「启用」）
+        assert!(skill_declared_in_stage(
+            &cfgs,
+            Stage::ArchitectDesign,
+            "to-spec"
+        ));
+        // 本阶段没有它，别的阶段有 —— 两行推荐各自独立回答
+        assert!(skill_declared_in_stage(&cfgs, Stage::Develop, "tdd"));
+        assert!(!skill_declared_in_stage(
+            &cfgs,
+            Stage::ArchitectDesign,
+            "tdd"
+        ));
+        assert!(!skill_declared_in_stage(&cfgs, Stage::Develop, "grilling"));
+        // 一个字都没声明过的技能、以及没有配置行的阶段：false 而不是报错
+        assert!(!skill_declared_in_stage(&cfgs, Stage::Review, "tdd"));
+        assert!(!skill_declared_in_stage(&cfgs, Stage::Merge, "tdd"));
+
+        // 坏的那一处来源只作废它自己：同配置里的好声明照常算已声明
+        let broken = StageConfig {
+            stage: "review".into(),
+            skills_json: Some(serde_json::json!(["code-review"])),
+            node_overrides_json: Some(serde_json::json!({
+                "execute": {"skills": [{"name": "bad", "mode": "full", "trusted": false}]},
+            })),
+            ..Default::default()
+        };
+        assert!(skill_declared_in_stage(
+            &[broken],
+            Stage::Review,
+            "code-review"
+        ));
     }
 
     #[test]

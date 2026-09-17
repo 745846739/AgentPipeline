@@ -538,8 +538,10 @@ pub async fn set_trust(
 ///
 /// 推荐清单的**投递载体是界面而不是二进制**（决策 172①）：清单本身是代码内常量
 /// （[`agentpipeline_core::agent::skill_preview::STAGE_RECOMMENDATIONS`]），技能正文一律
-/// 由用户自己安装。这里把常量翻成界面能直接用的形态，并附上两件界面必须知道的事实：
-/// **装没装**（未装显示「未安装」而不是崩掉）与**被谁引用**。
+/// 由用户自己安装。这里把常量翻成界面能直接用的形态，并附上三件界面必须知道的事实：
+/// **装没装**（未装显示「未安装」而不是崩掉）、**被谁引用**（`declared_in`，展示串）与
+/// **本阶段用没用它**（`declared_here`，布尔值）——最后一条决定那一行给的是「安装」还是
+/// 「启用」，装与启用是两件事（票 16「已安装的可直接启用」）。
 pub async fn recommendations(State(state): State<AppState>) -> ApiResult<impl IntoResponse> {
     let root = state.home.skills_dir();
     let installed: Vec<String> = discover(&root).into_iter().map(|s| s.name).collect();
@@ -575,6 +577,13 @@ pub async fn recommendations(State(state): State<AppState>) -> ApiResult<impl In
                         "installed": installed.iter().any(|n| n == name),
                         "declared_in": agentpipeline_core::config::declared_skill_where(
                             &configs, name,
+                        ),
+                        // 本阶段用没用它——推荐面板据此决定那一行给的是「安装」还是「启用」
+                        // （票 16「已安装的可直接启用」）。**必须是机器可读的判定，不能让界面
+                        // 去读上一行的 `declared_in`**：那是给人看的展示串（`阶段 <key>` /
+                        // `阶段 <key> 节点 <node>`），拿它判断阶段等于 parse 文案。
+                        "declared_here": agentpipeline_core::config::skill_declared_in_stage(
+                            &configs, stage, name,
                         ),
                         "repo": located.map(|rec| rec.repo),
                         "dir": located.map(|rec| rec.dir),
