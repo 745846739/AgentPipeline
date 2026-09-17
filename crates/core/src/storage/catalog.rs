@@ -84,7 +84,6 @@ struct StageConfigRow {
     idle_timeout_sec: Option<i64>,
     max_duration_sec: Option<i64>,
     node_overrides_json: Option<String>,
-    resume_continuation: Option<i64>,
     updated_at: String,
 }
 
@@ -111,7 +110,6 @@ impl StageConfigRow {
             node_overrides_json: self
                 .node_overrides_json
                 .and_then(|s| serde_json::from_str(&s).ok()),
-            resume_continuation: self.resume_continuation.map(|v| v != 0),
             updated_at: parse_ts(&self.updated_at)?,
         })
     }
@@ -380,8 +378,8 @@ impl Store {
             "INSERT INTO stage_configs
              (stage, provider_id, temperature, max_tokens, persona_path, persona_append,
               tools_json, skills_json, idle_timeout_sec, max_duration_sec, node_overrides_json,
-              resume_continuation, updated_at)
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+              updated_at)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
              ON CONFLICT(stage) DO UPDATE SET
                  provider_id = excluded.provider_id, temperature = excluded.temperature,
                  max_tokens = excluded.max_tokens, persona_path = excluded.persona_path,
@@ -389,7 +387,6 @@ impl Store {
                  skills_json = excluded.skills_json, idle_timeout_sec = excluded.idle_timeout_sec,
                  max_duration_sec = excluded.max_duration_sec,
                  node_overrides_json = excluded.node_overrides_json,
-                 resume_continuation = excluded.resume_continuation,
                  updated_at = excluded.updated_at",
         )
         .bind(&cfg.stage)
@@ -403,7 +400,6 @@ impl Store {
         .bind(cfg.idle_timeout_sec.map(|v| v as i64))
         .bind(cfg.max_duration_sec.map(|v| v as i64))
         .bind(cfg.node_overrides_json.as_ref().map(|v| v.to_string()))
-        .bind(cfg.resume_continuation.map(|v| v as i64))
         .bind(ts(self.now()))
         .execute(self.pool())
         .await?;
@@ -414,7 +410,7 @@ impl Store {
         let rows: Vec<StageConfigRow> = sqlx::query_as(
             "SELECT stage, provider_id, temperature, max_tokens, persona_path, persona_append,
                     tools_json, skills_json, idle_timeout_sec, max_duration_sec,
-                    node_overrides_json, resume_continuation, updated_at
+                    node_overrides_json, updated_at
              FROM stage_configs ORDER BY stage",
         )
         .fetch_all(self.pool())

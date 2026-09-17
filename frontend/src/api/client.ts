@@ -7,6 +7,8 @@ import type {
   FlowResponse,
   ForemanSendResult,
   ForemanSession,
+  ForemanSessionList,
+  ForemanSessionMeta,
   GlobalMetrics,
   NodeCommand,
   NodeConversation,
@@ -552,8 +554,43 @@ export function pairedUrl(base: string, token: string): string {
  * 「值班经理说了什么 / 值班长回了什么 / 合计烧了多少 token」，不自己攒一份账。
  * 工头未接线时后端回 503，由 `request` 抛出 `ApiError`。
  */
-export function getForemanSession(signal?: AbortSignal): Promise<ForemanSession> {
-  return request<ForemanSession>('/foreman/session', { signal });
+export function getForemanSession(
+  sessionId?: string | null,
+  signal?: AbortSignal,
+): Promise<ForemanSession> {
+  const q = sessionId ? `?session=${encodeURIComponent(sessionId)}` : '';
+  return request<ForemanSession>(`/foreman/session${q}`, { signal });
+}
+
+/** 未归档的班次，按最近活动倒序（决策 204⑦）。 */
+export function getForemanSessions(signal?: AbortSignal): Promise<ForemanSessionList> {
+  return request<ForemanSessionList>('/foreman/sessions', { signal });
+}
+
+/** 新开一个班次。标题留空 = 中性标题，第一句话说出来时按它命名（决策 204②）。 */
+export function createForemanSession(title?: string): Promise<{ session: ForemanSessionMeta }> {
+  return request<{ session: ForemanSessionMeta }>('/foreman/sessions', {
+    method: 'POST',
+    body: { title: title ?? null },
+  });
+}
+
+export function renameForemanSession(
+  sessionId: string,
+  title: string,
+): Promise<{ session: ForemanSessionMeta }> {
+  return request<{ session: ForemanSessionMeta }>(`/foreman/sessions/${sessionId}`, {
+    method: 'PATCH',
+    body: { title },
+  });
+}
+
+/** 归档 = 从列表里收起来（不删行、不删消息）。 */
+export function archiveForemanSession(sessionId: string): Promise<{ session: ForemanSessionMeta }> {
+  return request<{ session: ForemanSessionMeta }>(`/foreman/sessions/${sessionId}/archive`, {
+    method: 'POST',
+    body: {},
+  });
 }
 
 /**
@@ -562,9 +599,12 @@ export function getForemanSession(signal?: AbortSignal): Promise<ForemanSession>
  * **失败时不要清空输入框**：后端在叫模型之前就把 user 行落了库，所以失败是「这句话
  * 没被答上」而不是「这句话没说」——人应当能改几个字重发（决策 182㉓）。
  */
-export function sendForemanMessage(text: string): Promise<ForemanSendResult> {
+export function sendForemanMessage(
+  text: string,
+  sessionId?: string | null,
+): Promise<ForemanSendResult> {
   return request<ForemanSendResult>('/foreman/messages', {
     method: 'POST',
-    body: { text },
+    body: { text, session_id: sessionId ?? null },
   });
 }

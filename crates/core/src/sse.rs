@@ -114,6 +114,10 @@ pub enum SseEvent {
         branch: String,
         run_id: i64,
         agent_type: String,
+        /// 归属会话（决策 204⑥）。流水线的增量为空串；`serde(default)` 让老客户端
+        /// （不认识这个字段的一方）读到的事件照旧能解析——加字段是**加性**改动。
+        #[serde(default)]
+        session_id: String,
         role: String,
         text: String,
         prompt_tokens: u32,
@@ -370,6 +374,7 @@ mod tests {
                 branch: "develop-design".into(),
                 run_id: 7,
                 agent_type: "pseudo:conflict_check".into(),
+                session_id: String::new(),
                 role: "assistant".into(),
                 text: "正在比对".into(),
                 prompt_tokens: 3,
@@ -423,6 +428,7 @@ mod tests {
             branch: "test-design".into(),
             run_id: 42,
             agent_type: "main".into(),
+            session_id: "s1".into(),
             role: "assistant".into(),
             text: "hi".into(),
             prompt_tokens: 5,
@@ -435,6 +441,9 @@ mod tests {
             "branch",
             "run_id",
             "agent_type",
+            // 决策 204⑥：会话身份。工头增量靠它归到正确的班次，
+            // 流水线的增量这里是空串。
+            "session_id",
             "role",
             "text",
             "prompt_tokens",
@@ -443,6 +452,20 @@ mod tests {
             assert!(json.get(key).is_some(), "conversation_delta 缺少 {key}");
         }
         assert_eq!(json["type"], "conversation_delta");
+        assert_eq!(json["session_id"], "s1");
+    }
+
+    /// 加字段是**加性**改动：老客户端（不认识 `session_id` 的一方）读到的事件照旧能解析。
+    #[test]
+    fn conversation_delta_without_session_id_still_parses() {
+        let raw = r#"{"type":"conversation_delta","task_id":"t","branch":"main","run_id":1,
+                       "agent_type":"main","role":"assistant","text":"hi",
+                       "prompt_tokens":0,"completion_tokens":0}"#;
+        let ev: SseEvent = serde_json::from_str(raw).unwrap();
+        match ev {
+            SseEvent::ConversationDelta { session_id, .. } => assert_eq!(session_id, ""),
+            other => panic!("解成了别的变体：{other:?}"),
+        }
     }
 
     #[test]

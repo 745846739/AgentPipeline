@@ -329,6 +329,207 @@ impl FromStr for PendingKind {
     }
 }
 
+/// resume 的原因（决策 205）：游标离开 pending 的那一刻，被清掉的是哪个原因。
+///
+/// **为什么需要它**：续不续接上一段对话，由**原因**决定，不由阶段 / 节点参数决定。
+/// 换掉一个 bool（`resumed_from_pending`）是因为那个 bool 把原因抹掉了——而
+/// 「信息不足被打回」与「合入提案通过」都要续接的话，两者对模型的意义完全不同。
+///
+/// **扁平枚举**，一个变体对应一个 `(PendingKind, context.kind)` 的合法组合（外加两个
+/// 由「人按了哪颗键」决定的分支：merge 与 review 的通过与驳回在 pending 原因上同名）。
+/// 扁平而不是嵌套，是为了让判定表能一眼读完——嵌套会让「这一条到底 true 还是 false」
+/// 需要两次跳转才能回答。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ResumeCause {
+    // ── 由 pending 原因分类（`classify`）──
+    InfoInsufficient,
+    ConflictWait,
+    RetryExhausted,
+    ContextOverflow,
+    Timeout,
+    DependencyFailed,
+    DependencyCancelled,
+    /// `user_decision` 且没有 `context.kind`（通用那一行：跳过 / 取消）。
+    UserDecision,
+    DuplicateRisk,
+    DevelopDesignInputInsufficient,
+    TestDesignInputInsufficient,
+    JudgeDisagreement,
+    /// 评审驳回（`review`）：人按下「打回开发修复」。
+    Review,
+    TestCodeIssue,
+    GateRecheck,
+    DirtyWorktree,
+    // ── 由人按的那颗键决定（merge / review 两条专用端点，同一原因有两个去向）──
+    MergeApproved,
+    MergeReturned,
+    HumanReviewApproved,
+    HumanReviewRejected,
+    /// 迁移前的历史行、或认不出的取值。**兜底 false**：退回「续接出现之前的行为」。
+    Unknown,
+}
+
+/// 全部原因（`as_str` / `from_str` 的往返用例按它逐条走）。
+///
+/// 新增一个变体时**先改这里**，再回答 `resume_continues` 那个穷尽 `match`——
+/// 编译器会在后者报「未覆盖的模式」，这是本表的牙齿（决策 205：兜底 false 是安全网，
+/// 不是让人忘记回答的借口）。
+pub const ALL_RESUME_CAUSES: [ResumeCause; 21] = [
+    ResumeCause::InfoInsufficient,
+    ResumeCause::ConflictWait,
+    ResumeCause::RetryExhausted,
+    ResumeCause::ContextOverflow,
+    ResumeCause::Timeout,
+    ResumeCause::DependencyFailed,
+    ResumeCause::DependencyCancelled,
+    ResumeCause::UserDecision,
+    ResumeCause::DuplicateRisk,
+    ResumeCause::DevelopDesignInputInsufficient,
+    ResumeCause::TestDesignInputInsufficient,
+    ResumeCause::JudgeDisagreement,
+    ResumeCause::Review,
+    ResumeCause::TestCodeIssue,
+    ResumeCause::GateRecheck,
+    ResumeCause::DirtyWorktree,
+    ResumeCause::MergeApproved,
+    ResumeCause::MergeReturned,
+    ResumeCause::HumanReviewApproved,
+    ResumeCause::HumanReviewRejected,
+    ResumeCause::Unknown,
+];
+
+impl ResumeCause {
+    /// DB 列（`kanban_node_cursors.resumed_from_pending_kind`）的取值。
+    pub fn as_str(self) -> &'static str {
+        match self {
+            ResumeCause::InfoInsufficient => "info_insufficient",
+            ResumeCause::ConflictWait => "conflict_wait",
+            ResumeCause::RetryExhausted => "retry_exhausted",
+            ResumeCause::ContextOverflow => "context_overflow",
+            ResumeCause::Timeout => "timeout",
+            ResumeCause::DependencyFailed => "dependency_failed",
+            ResumeCause::DependencyCancelled => "dependency_cancelled",
+            ResumeCause::UserDecision => "user_decision",
+            ResumeCause::DuplicateRisk => "duplicate_risk",
+            ResumeCause::DevelopDesignInputInsufficient => "develop_design_input_insufficient",
+            ResumeCause::TestDesignInputInsufficient => "test_design_input_insufficient",
+            ResumeCause::JudgeDisagreement => "judge_disagreement",
+            ResumeCause::Review => "review",
+            ResumeCause::TestCodeIssue => "test_code_issue",
+            ResumeCause::GateRecheck => "gate_recheck",
+            ResumeCause::DirtyWorktree => "dirty_worktree",
+            ResumeCause::MergeApproved => "merge_approved",
+            ResumeCause::MergeReturned => "merge_returned",
+            ResumeCause::HumanReviewApproved => "human_review_approved",
+            ResumeCause::HumanReviewRejected => "human_review_rejected",
+            ResumeCause::Unknown => "unknown",
+        }
+    }
+
+    /// 认不出的取值 → `None`（调用方按 [`ResumeCause::Unknown`] 处置：兜底 false）。
+    ///
+    /// 刻意不实现 `std::str::FromStr`：那个 trait 要求有一个 `Err` 类型，而这里的
+    /// 「认不出」是**正常情况**（库里的历史值、更新版本写下的值），不是错误。
+    #[allow(clippy::should_implement_trait)]
+    pub fn parse(raw: &str) -> Option<Self> {
+        ALL_RESUME_CAUSES
+            .iter()
+            .copied()
+            .find(|c| c.as_str() == raw)
+    }
+
+    /// 由被清掉的那个 pending 原因分类（决策 205 的「原因表」入口）。
+    ///
+    /// **穷尽 `match`**：`PendingKind` 新增一个变体时这里编译不过——那是刻意的，因为
+    /// 新加一个 pending 原因时最该被问的就是「它续不续接」。`context_kind` 是自由串
+    /// （可能来自库里的历史行），认不出的值退回该 `PendingKind` 的通用那一行。
+    pub fn classify(kind: PendingKind, context_kind: Option<&str>) -> ResumeCause {
+        let ctx = context_kind.unwrap_or_default();
+        match kind {
+            PendingKind::InfoInsufficient => ResumeCause::InfoInsufficient,
+            PendingKind::ConflictWait => ResumeCause::ConflictWait,
+            PendingKind::RetryExhausted => ResumeCause::RetryExhausted,
+            PendingKind::ContextOverflow => ResumeCause::ContextOverflow,
+            PendingKind::Timeout => ResumeCause::Timeout,
+            PendingKind::DependencyFailed if ctx == "dependency_cancelled" => {
+                ResumeCause::DependencyCancelled
+            }
+            PendingKind::DependencyFailed => ResumeCause::DependencyFailed,
+            // merge 与 review 的通过与驳回在 pending 原因上同名，去向由端点决定
+            // （`clear_pending_in_tx` 的显式分支）——走到分类说明那条路没走端点，
+            // 于是退回「还没决定」这一档。
+            PendingKind::MergeApproval => ResumeCause::MergeApproved,
+            PendingKind::HumanReview => ResumeCause::HumanReviewApproved,
+            PendingKind::UserDecision => match ctx {
+                "duplicate_risk" => ResumeCause::DuplicateRisk,
+                "develop_design_input_insufficient" => ResumeCause::DevelopDesignInputInsufficient,
+                "test_design_input_insufficient" => ResumeCause::TestDesignInputInsufficient,
+                "judge_disagreement" => ResumeCause::JudgeDisagreement,
+                "review" => ResumeCause::Review,
+                "test_code_issue" => ResumeCause::TestCodeIssue,
+                "gate_recheck" => ResumeCause::GateRecheck,
+                "dirty_worktree" => ResumeCause::DirtyWorktree,
+                // 认不出的 context.kind：按**通用那一行**（skip / cancel）处置。
+                _ => ResumeCause::UserDecision,
+            },
+        }
+    }
+}
+
+/// 续接判定表（决策 205）：这个原因要不要把上一段对话带进下一轮。
+///
+/// **硬编码、改它要发版**（与 [`crate::config::SUPPORTED_ADAPTERS`] 同姿态，决策 103 的先例）：
+/// 这张表是产品判断，不是配置项——「不展示在设置里、在代码中定义好」正是本决策的原话。
+///
+/// 分界一句话：**模型的自动失败重试不给续接，人的介入才给**（决策 33 不变）。
+/// 故 `validate_attempts` 的原地重试、`agent_retry_max` 的干净重试、未耗尽的超时
+/// 都不出现在这张表里——它们根本走不到 resume 边界（`clear_cursor_pending` 才是落点）。
+///
+/// **穷尽 `match`**：新增一个原因时不写进这个 match 就编译不过。这比「兜底 false 然后忘掉」
+/// 强——兜底仍保留（`Unknown` 那一档），但它只服务于「库里的历史值」，不服务于新代码。
+pub fn resume_continues(cause: ResumeCause) -> bool {
+    match cause {
+        // ── true：人按了键之后，让模型带着上一段对话接着干 ──
+        //
+        // 信息不足被打回（补充输入后重入同一节点）、校验耗尽（格式不是 json）、
+        // 代码有问题被打回（评审驳回 / 闸门 / test code_issue）、超时耗尽后人工「重试执行」、
+        // 判分歧、脏工作区、重复风险、冲突等待**自动**放行、依赖失败**自动**恢复。
+        ResumeCause::InfoInsufficient
+        | ResumeCause::RetryExhausted
+        | ResumeCause::Timeout
+        | ResumeCause::ConflictWait
+        | ResumeCause::DependencyFailed
+        | ResumeCause::DuplicateRisk
+        | ResumeCause::DevelopDesignInputInsufficient
+        | ResumeCause::TestDesignInputInsufficient
+        | ResumeCause::JudgeDisagreement
+        | ResumeCause::Review
+        | ResumeCause::TestCodeIssue
+        | ResumeCause::GateRecheck
+        | ResumeCause::DirtyWorktree
+        | ResumeCause::MergeReturned
+        | ResumeCause::HumanReviewRejected => true,
+
+        // ── false：去向是新的一段（或不是人按的键）──
+        //
+        // `merge_approved`：merge 的 phase A 是**提案**、phase B 是**执行**，
+        //   提案那段对话不该续进执行（决策 205 点名）。
+        // `human_review_approved`：去向 test.execute 是新节点，本来就没有自己的旧会话。
+        // `context_overflow`：上下文溢出的人为处置之后，重开一段更干净
+        //   （决策 205 未列 → 兜底 false；票 04 复用这一档）。
+        // `dependency_cancelled`：依赖被取消，人按「忽略失败依赖继续」——那是换一条路走。
+        // `user_decision`（通用那一行）：既非打回也非补充，没有可续的上下文。
+        // `unknown`：库里的历史值或认不出的取值，退回「续接出现之前的行为」。
+        ResumeCause::MergeApproved
+        | ResumeCause::HumanReviewApproved
+        | ResumeCause::ContextOverflow
+        | ResumeCause::DependencyCancelled
+        | ResumeCause::UserDecision
+        | ResumeCause::Unknown => false,
+    }
+}
+
 /// pending 的结构化上下文。`kind` 是 `(type, context.kind)` 动作表的第二个 key（决策 130）。
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize, JsonSchema)]
 pub struct PendingContext {
@@ -1007,7 +1208,11 @@ pub struct NodeConversation {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct NodeCommand {
     pub id: i64,
-    pub task_id: String,
+    /// 归属任务。**可空**（迁移 0012 / 决策 204④）：值班长的命令没有任务，它挂会话。
+    /// 与 `session_id` 恰好一个非空（迁移里的 CHECK），空串不是合法归属。
+    pub task_id: Option<String>,
+    /// 归属会话（值班长的命令挂它）。流水线命令为 `None`。
+    pub session_id: Option<String>,
     pub run_id: Option<i64>,
     pub stage: Stage,
     pub node: Node,
@@ -1108,8 +1313,6 @@ pub struct StageConfig {
     /// pending → resume 重入时是否续接上一 attempt 的对话（决策 180，票 13）。
     ///
     /// 缺省 / `None` = **关**：每次 attempt 干净对话，与续接出现之前逐字相同。节点级覆盖走
-    /// `node_overrides_json[node].resume_continuation`，分层照 `idle_timeout_sec`。
-    pub resume_continuation: Option<bool>,
     pub updated_at: DateTime<Utc>,
 }
 
@@ -1162,6 +1365,142 @@ mod tests {
         assert!(!TaskStatus::Queued.occupies_slot());
         assert!(!TaskStatus::Waiting.occupies_slot());
         assert!(TaskStatus::Queued.is_active());
+    }
+
+    /// 判定表逐行（决策 205）。表就是规格，故这里逐条抄一遍**期望值**：
+    /// 改动表却忘了改测试，或者改了测试没改表，两种都会在这里现形。
+    #[test]
+    fn resume_cause_table_is_the_spec() {
+        use ResumeCause::*;
+        let cases: [(ResumeCause, bool); 21] = [
+            // ── true ──
+            (InfoInsufficient, true),
+            (RetryExhausted, true),
+            (Timeout, true),
+            (ConflictWait, true),
+            (DependencyFailed, true),
+            (DuplicateRisk, true),
+            (DevelopDesignInputInsufficient, true),
+            (TestDesignInputInsufficient, true),
+            (JudgeDisagreement, true),
+            (Review, true),
+            (TestCodeIssue, true),
+            (GateRecheck, true),
+            (DirtyWorktree, true),
+            (MergeReturned, true),
+            (HumanReviewRejected, true),
+            // ── false ──
+            (MergeApproved, false),
+            (HumanReviewApproved, false),
+            (ContextOverflow, false),
+            (DependencyCancelled, false),
+            (UserDecision, false),
+            (Unknown, false),
+        ];
+        for (cause, expected) in cases {
+            assert_eq!(
+                resume_continues(cause),
+                expected,
+                "判定表里 {} 的值与决策 205 不一致",
+                cause.as_str()
+            );
+        }
+    }
+
+    /// 原因串与 `PendingKind` + `context.kind` 的组合互相对得上（分类表逐行）。
+    #[test]
+    fn resume_cause_classification_covers_every_pending_kind() {
+        use ResumeCause::*;
+        // 每一个 PendingKind 都要有归宿——新增变体时 `classify` 的穷尽 match 会先报错，
+        // 这条测试钉的是「归宿不是一个意外的地方」。
+        assert_eq!(
+            ResumeCause::classify(PendingKind::InfoInsufficient, None),
+            InfoInsufficient
+        );
+        assert_eq!(
+            ResumeCause::classify(PendingKind::ConflictWait, None),
+            ConflictWait
+        );
+        assert_eq!(
+            ResumeCause::classify(PendingKind::RetryExhausted, None),
+            RetryExhausted
+        );
+        assert_eq!(
+            ResumeCause::classify(PendingKind::ContextOverflow, None),
+            ContextOverflow
+        );
+        assert_eq!(ResumeCause::classify(PendingKind::Timeout, None), Timeout);
+        assert_eq!(
+            ResumeCause::classify(PendingKind::DependencyFailed, None),
+            DependencyFailed
+        );
+        assert_eq!(
+            ResumeCause::classify(PendingKind::DependencyFailed, Some("dependency_cancelled")),
+            DependencyCancelled
+        );
+        assert_eq!(
+            ResumeCause::classify(PendingKind::UserDecision, Some("review")),
+            Review
+        );
+        assert_eq!(
+            ResumeCause::classify(PendingKind::UserDecision, Some("test_code_issue")),
+            TestCodeIssue
+        );
+        assert_eq!(
+            ResumeCause::classify(PendingKind::UserDecision, Some("gate_recheck")),
+            GateRecheck
+        );
+        assert_eq!(
+            ResumeCause::classify(PendingKind::UserDecision, Some("dirty_worktree")),
+            DirtyWorktree
+        );
+        assert_eq!(
+            ResumeCause::classify(PendingKind::UserDecision, Some("judge_disagreement")),
+            JudgeDisagreement
+        );
+        assert_eq!(
+            ResumeCause::classify(PendingKind::UserDecision, Some("duplicate_risk")),
+            DuplicateRisk
+        );
+        assert_eq!(
+            ResumeCause::classify(
+                PendingKind::UserDecision,
+                Some("develop_design_input_insufficient")
+            ),
+            DevelopDesignInputInsufficient
+        );
+        assert_eq!(
+            ResumeCause::classify(
+                PendingKind::UserDecision,
+                Some("test_design_input_insufficient")
+            ),
+            TestDesignInputInsufficient
+        );
+        // 没有 context.kind、以及认不出的 context.kind 都落到通用那一行
+        assert_eq!(
+            ResumeCause::classify(PendingKind::UserDecision, None),
+            UserDecision
+        );
+        assert_eq!(
+            ResumeCause::classify(PendingKind::UserDecision, Some("未来才有的类别")),
+            UserDecision
+        );
+    }
+
+    /// DB 列的取值往返：每条都写得进去、读得回来。
+    #[test]
+    fn resume_cause_strings_round_trip() {
+        for cause in ALL_RESUME_CAUSES {
+            assert_eq!(
+                ResumeCause::parse(cause.as_str()),
+                Some(cause),
+                "{} 往返失败",
+                cause.as_str()
+            );
+        }
+        // 认不出的取值 → None（调用方按 Unknown 兜底，不 panic）
+        assert_eq!(ResumeCause::parse("未来才有的原因"), None);
+        assert_eq!(ResumeCause::parse(""), None);
     }
 
     #[test]

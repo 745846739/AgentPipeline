@@ -522,27 +522,6 @@ pub fn effective_max_duration(global: u64, stage_override: Option<u64>, node: No
     node.max_duration_sec.or(stage_override).unwrap_or(global)
 }
 
-/// 从阶段配置读节点级「续接上一轮对话」覆盖（`node_overrides_json[node].resume_continuation`，
-/// 决策 180 / 票 13）。
-pub fn node_resume_continuation(stage_cfg: Option<&StageConfig>, node: &str) -> Option<bool> {
-    stage_cfg
-        .and_then(|c| c.node_overrides_json.as_ref())
-        .and_then(|v| v.get(node))
-        .and_then(|n| n.get("resume_continuation"))
-        .and_then(|v| v.as_bool())
-}
-
-/// 有效续接开关 = 节点级 > 阶段级 > 关（决策 180，分层照 `idle_timeout_sec`）。
-///
-/// 兜底是 `false` 而不是某个可选值：票面要求默认 **false**，默认路径必须与续接出现之前
-/// 逐字相同。「没人配置过」就是关。
-pub fn effective_resume_continuation(
-    stage_override: Option<bool>,
-    node_override: Option<bool>,
-) -> bool {
-    node_override.or(stage_override).unwrap_or(false)
-}
-
 /// 从阶段配置读节点级覆盖（`node_overrides_json`）。
 pub fn node_timeouts(stage_cfg: Option<&StageConfig>, node: &str) -> NodeTimeouts {
     let Some(cfg) = stage_cfg else {
@@ -869,6 +848,24 @@ fn declared_skill_sources(
 /// 卸载前看到后果）。这类查询**不该因为一条坏配置整体失败**——坏配置该由启动校验与
 /// `PUT /stage-configs` 报错（写入路径 fail fast 才是对的）；若这里一并报错，用户反而失去
 /// 了查看「哪条配置坏了」的手段。失败范围也**只限那一处**：好的来源照常返回。
+/// 某个技能被**哪些地方**声明（阶段级 / 节点级），去重且保序。
+///
+/// 收在 core 里是因为有两个消费方：`GET /skills` 的 `declared_in` 字段与值班长的
+/// `read_skills` 工具（票 01）。两处各写一遍这个循环，迟早一处改了另一处不改——
+/// 而「这个技能被谁用着」正是回答「能不能删掉它 / 为什么它没生效」的关键读数。
+pub fn declared_skill_where(stage_configs: &[StageConfig], name: &str) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    for cfg in stage_configs {
+        for (where_, decl) in declared_skill_decls(cfg) {
+            if decl.name == name && !out.contains(&where_) {
+                out.push(where_);
+            }
+        }
+    }
+    out
+}
+
+/// 一个阶段配置声明的全部技能，带**声明位置**（阶段级 / 哪个节点级）。
 pub fn declared_skill_decls(cfg: &StageConfig) -> Vec<(String, crate::agent::skills::SkillDecl)> {
     declared_skill_sources(cfg)
         .into_iter()

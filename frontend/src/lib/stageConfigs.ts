@@ -66,8 +66,6 @@ export interface StageConfigDraft {
   skills: SkillDeclDraft[];
   idle_timeout_sec: string;
   max_duration_sec: string;
-  /** pending → resume 时续接上一轮对话（决策 180）；默认 false。 */
-  resume_continuation: boolean;
   node_overrides_json: string;
 }
 
@@ -81,7 +79,6 @@ export function emptyStageConfigDraft(stage: string = STAGE_KEYS[0]): StageConfi
     persona_append: '',
     tools_json: '',
     skills: [],
-    resume_continuation: false,
     idle_timeout_sec: '',
     max_duration_sec: '',
     node_overrides_json: '',
@@ -101,7 +98,6 @@ export function draftFromStageConfig(config: StageConfig): StageConfigDraft {
     skills: parseSkillDecls(config.skills_json).decls,
     idle_timeout_sec: config.idle_timeout_sec === null ? '' : String(config.idle_timeout_sec),
     max_duration_sec: config.max_duration_sec === null ? '' : String(config.max_duration_sec),
-    resume_continuation: config.resume_continuation === true,
     node_overrides_json: stringifyJson(config.node_overrides_json),
   };
 }
@@ -190,8 +186,6 @@ export function buildStageConfigPut(draft: StageConfigDraft): StageConfigPutResu
   // 多发一个 `[]` 只会让「用户到底有没有动过技能」更难从请求里读出来。
   const decls = serializeSkillDecls(draft.skills);
   if (decls.length > 0) payload.skills_json = decls;
-  // 续接开关的默认就是关（后端 `resume_continuation` 缺省读出 `None`），故只在打开时下发
-  if (draft.resume_continuation) payload.resume_continuation = true;
 
   const overrides = parseOptionalJson(draft.node_overrides_json, 'node_overrides_json');
   if ('error' in overrides) return { ok: false, error: overrides.error };

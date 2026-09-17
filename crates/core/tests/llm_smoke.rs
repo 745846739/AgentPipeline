@@ -88,6 +88,7 @@ async fn real_llm_completes_architect_execute_with_structured_metadata() {
             branch: "main".into(),
             run_id: 1,
             agent_type: "main".into(),
+            session_id: String::new(),
         }),
     };
     let response = client.complete(request).await.unwrap();

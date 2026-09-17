@@ -115,7 +115,9 @@ pub async fn list(State(state): State<AppState>) -> ApiResult<impl IntoResponse>
                 "description": s.frontmatter.description,
                 "disable_model_invocation": s.frontmatter.disable_model_invocation,
                 "path": s.path.display().to_string(),
-                "declared_in": declared_in(&configs, &s.name),
+                // 算法在 core 里（`config::declared_skill_where`）：值班长的 `read_skills`
+                // 工具读的是同一份，两处各写一遍会漂移。
+                "declared_in": agentpipeline_core::config::declared_skill_where(&configs, &s.name),
             })
         })
         .collect();
@@ -127,18 +129,6 @@ pub async fn list(State(state): State<AppState>) -> ApiResult<impl IntoResponse>
 }
 
 /// 该技能名被哪些阶段级 / 节点级配置引用（`["阶段 architect-design", "阶段 test 节点 execute"]`）。
-fn declared_in(configs: &[agentpipeline_core::types::StageConfig], name: &str) -> Vec<String> {
-    let mut out = Vec::new();
-    for cfg in configs {
-        for (where_, decl) in agentpipeline_core::config::declared_skill_decls(cfg) {
-            if decl.name == name && !out.contains(&where_) {
-                out.push(where_);
-            }
-        }
-    }
-    out
-}
-
 // ─────────────────────────── POST /skills/import ───────────────────────────
 
 #[derive(Debug, Deserialize)]
@@ -583,7 +573,9 @@ pub async fn recommendations(State(state): State<AppState>) -> ApiResult<impl In
                         "name": name,
                         "reason": reason,
                         "installed": installed.iter().any(|n| n == name),
-                        "declared_in": declared_in(&configs, name),
+                        "declared_in": agentpipeline_core::config::declared_skill_where(
+                            &configs, name,
+                        ),
                         "repo": located.map(|rec| rec.repo),
                         "dir": located.map(|rec| rec.dir),
                     })

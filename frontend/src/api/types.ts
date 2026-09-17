@@ -375,6 +375,11 @@ export interface ConversationDeltaEvent extends SseBase {
   type: 'conversation_delta';
   run_id: number;
   agent_type: string;
+  /**
+   * 归属班次（决策 204⑥）。流水线的增量为空串；**可选**是因为后端加了
+   * `#[serde(default)]`——加字段是加性改动，老客户端读到的事件照旧能解析。
+   */
+  session_id?: string;
   role: string;
   text: string;
   prompt_tokens: number;
@@ -561,8 +566,6 @@ export interface StageConfig {
   idle_timeout_sec: number | null;
   max_duration_sec: number | null;
   node_overrides_json: unknown | null;
-  /** pending → resume 重入时是否续接上一 attempt 的对话（决策 180）；`null` = 关。 */
-  resume_continuation: boolean | null;
   updated_at: string;
 }
 
@@ -581,7 +584,6 @@ export interface StageConfigPutPayload {
   idle_timeout_sec?: number;
   max_duration_sec?: number;
   node_overrides_json?: unknown;
-  resume_continuation?: boolean;
 }
 
 /* ─────────────── server-info（crates/app/src/routes/server_info.rs，决策 167）─────────────── */
@@ -803,9 +805,24 @@ export interface ForemanBriefing {
   done_count: number;
 }
 
+/**
+ * 一个班次（会话）。**决策 204**：一条长台账拆成一排可新建 / 切换 / 重命名 / 归档的班次。
+ *
+ * 归档 = 置 `archived_at`：从列表里收起来，**不物理删除**（消息也照旧吃保留期）。
+ */
+export interface ForemanSessionMeta {
+  id: string;
+  title: string;
+  created_at: string;
+  last_active_at: string;
+  archived_at: string | null;
+}
+
 /** 会话台账的一行。`role` 线上是 `"user" | "assistant"`（后端按串存）。 */
 export interface ForemanMessage {
   id: number;
+  /** 所属班次。会话隔离上下文，故它是每行的必填归属（决策 204②）。 */
+  session_id: string;
   role: string;
   content: string;
   prompt_tokens: number;
@@ -815,18 +832,36 @@ export interface ForemanMessage {
   created_at: string;
 }
 
-/** `GET /foreman/session`：按 id 升序的会话 + 合计；`foreman.wired` 为假时是未接线（503 之外的另一读法）。 */
+/**
+ * `GET /foreman/session`：某个班次按 id 升序的轮次 + **该班次**的合计
+ * （决策 204⑤：按班次过滤之前，这个数其实是「自建库以来的累计值」）。
+ *
+ * `session` 为 `null` = 这台机器上一个班次都还没有（不是错误）：前端据此走
+ * 「开一个班次」的空态。`foreman.wired` 为假时是未接线（503 之外的另一读法）。
+ */
 export interface ForemanSession {
+  session: ForemanSessionMeta | null;
   messages: ForemanMessage[];
   total_tokens: number;
   total_calls: number;
   foreman: { agent_type: string; stage_key: string; wired: boolean };
 }
 
-/** `POST /foreman/messages`：`message` 是刚落库的回话行（LLM 失败时整个请求失败，但 user 行已落库）。 */
+/** `GET /foreman/sessions`：未归档的班次，按最近活动倒序。 */
+export interface ForemanSessionList {
+  sessions: ForemanSessionMeta[];
+}
+
+/**
+ * `POST /foreman/messages`：`message` 是刚落库的回话行（LLM 失败时整个请求失败，但 user 行已落库）。
+ *
+ * `session` 是**这句话落进了哪个班次**：请求没带 `session_id` 时服务端会选或建一个，
+ * 客户端据此更新自己的「当前班次」——否则第一次说话会落进一个它不知道的会话。
+ */
 export interface ForemanSendResult {
   message: ForemanMessage | null;
   reply: string;
+  session: ForemanSessionMeta;
   total_tokens: number;
   total_calls: number;
 }

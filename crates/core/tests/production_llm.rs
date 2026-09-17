@@ -75,6 +75,7 @@ fn request(run_id: i64, messages: Vec<Message>) -> LlmRequest {
             branch: "main".into(),
             run_id,
             agent_type: "main".into(),
+            session_id: String::new(),
         }),
     }
 }

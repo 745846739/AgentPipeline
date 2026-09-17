@@ -7,7 +7,7 @@
 //! ## 三条硬边界
 //!
 //! 1. **不动手。** 写动作（resume / retry / 拍板 / merge / 建任务）一律由后端下发、由人按下。
-//!    值班长的工具集**只有两个只读台账工具**（[`FOREMAN_TOOLS`]），白名单在
+//!    值班长的工具集是**清单驱动**的（[`FOREMAN_TOOL_SPECS`]，票 01 起 8 个只读工具），白名单在
 //!    [`ToolExecutor::with_allowed_tools`] 的执行点强制。它的回复里也永远不出现按钮——
 //!    这个约束落在前端（票 04），这里保证的是它**没有能力**改状态。
 //! 2. **读不到文件系统。** 它的输入是人可以随便打的任意文本，而流水线自身调用的只读子代理
@@ -36,7 +36,9 @@ use crate::agent::tools::{ToolCallContext, ToolExecutor};
 use crate::config::Settings;
 use crate::home::Home;
 use crate::process::RealProcessKiller;
-use crate::storage::foreman::{ForemanMessage, NewForemanMessage, FOREMAN_ROLE_ASSISTANT};
+use crate::storage::foreman::{
+    ForemanMessage, ForemanSession, NewForemanMessage, FOREMAN_ROLE_ASSISTANT,
+};
 use crate::storage::tasks::TaskFilter;
 use crate::storage::Store;
 use crate::types::{CommandSource, Node, Stage, TaskStatus};
@@ -53,11 +55,107 @@ pub const FOREMAN_STAGE_KEY: &str = "foreman";
 /// 现在不落 run 行（值班长没有运行行，见 `say` 的注释），但 SSE 增量事件按它过滤。
 pub const FOREMAN_AGENT_TYPE: &str = "foreman";
 
-/// 值班长**固定**的只读台账工具集（决策 182⑭）。
+/// 工具的一层（决策 188 / 206 的两段白名单在权限模式那一批细化）。
 ///
-/// 与 [`crate::pipeline::subagent::SUB_AGENT_TOOLS`] 同一姿态：这是安全边界本身，不是配置项。
-/// 任何「给值班长加个工具」的改动都必须先改这里，从而在 diff 里显式可见。
-pub const FOREMAN_TOOLS: [&str; 2] = ["read_task", "read_conversation"];
+/// 本票（票 01）只有 `Read` 一层有内容；写工具由票 04 / 05 / 06 逐个加进来，而**每一层
+/// 能不能自动放行**由决策 206 的档位管——档位表不在本模块，这里只标身份。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ForemanToolLayer {
+    /// A 层：只读（台账 + 环境读数）。**永不改动任何东西**，故不需要确认钮。
+    Read,
+    /// C / D / E 层：会改动东西（文件 / 本服务状态 / 环境）。`ask` 档下转成提议。
+    Write,
+}
+
+/// 一个工具的完整规格：名字 + 层级 + 广告语 + 参数 schema。
+///
+/// **唯一事实源**：广告给模型的那一份（[`FOREMAN_TOOL_SPECS`] → `tool_defs()`）与执行点的
+/// 白名单（`ToolExecutor::with_allowed_tools` 收的那一份）都从这里来。两处各写一份名字的后果是
+/// 「模型看得见一个调用就被拒的工具」（或反过来，一个能调但没人告诉它的工具），
+/// 两种都很难从现象定位——这正是票 01 要求「同源」的理由。
+pub struct ForemanToolSpec {
+    pub name: &'static str,
+    pub layer: ForemanToolLayer,
+    pub description: &'static str,
+    /// 参数 JSON-Schema 的**文本**：常量表里放不了 `serde_json::Value`，
+    /// 用文本 + 一处解析（`tool_defs()`），并由单测钉住它是合法 JSON。
+    pub parameters: &'static str,
+}
+
+/// 值班长的工具清单（决策 182⑭ → 决策 188 / 207）。
+///
+/// 与 [`crate::pipeline::subagent::SUB_AGENT_TOOLS`] 同一姿态：这是**安全边界本身**，
+/// 不是配置项。任何「给值班长加个工具」的改动都必须先改这里，从而在 diff 里显式可见。
+///
+/// A 层的六个新读数（票 01）**一律复用后端既有口径**，不新造一套：看板读任务表、
+/// 指标走 `metrics::*` 纯函数、项目 / 阶段配置 / 技能 / provider 各读自己那张表的既有读法。
+/// 唯一需要加工的是 provider：库里存的是**明文密钥**（决策 112），故只回显掩码。
+pub const FOREMAN_TOOL_SPECS: [ForemanToolSpec; 8] = [
+    ForemanToolSpec {
+        name: "read_task",
+        layer: ForemanToolLayer::Read,
+        description: "读某个任务的台账详情：标题、状态、当前工位、待办原因原文、\
+                      后端下发的可用动作、各分支游标。卡住的细节问它。",
+        parameters: r#"{"type":"object","properties":{"task_id":{"type":"string","description":"任务 id（快照里方括号内那串）"}},"required":["task_id"]}"#,
+    },
+    ForemanToolSpec {
+        name: "read_conversation",
+        layer: ForemanToolLayer::Read,
+        description: "读某个任务某次节点运行的会话回执（工位当时说了什么）。\
+                      run_id 省略时取该任务最近一次会话。引用工位结论时要标出来源。",
+        parameters: r#"{"type":"object","properties":{"task_id":{"type":"string","description":"任务 id"},"run_id":{"type":"integer","description":"运行 id，省略取最近一次"}},"required":["task_id"]}"#,
+    },
+    ForemanToolSpec {
+        name: "read_board",
+        layer: ForemanToolLayer::Read,
+        description: "读整块看板：每个任务的状态与当前工位，以及按状态的分组计数。\
+                      想知道「一共有多少活、都在哪一档」时问它。",
+        parameters: r#"{"type":"object","properties":{}}"#,
+    },
+    ForemanToolSpec {
+        name: "read_metrics",
+        layer: ForemanToolLayer::Read,
+        description: "读全局指标：任务数、成功率、validate 首过率、token 与调用总量、\
+                      按阶段的聚合。这些数与指标页同源。",
+        parameters: r#"{"type":"object","properties":{}}"#,
+    },
+    ForemanToolSpec {
+        name: "read_projects",
+        layer: ForemanToolLayer::Read,
+        description: "读已接入的项目清单：名字、仓库路径、默认分支、语言与测试命令。",
+        parameters: r#"{"type":"object","properties":{}}"#,
+    },
+    ForemanToolSpec {
+        name: "read_stage_configs",
+        layer: ForemanToolLayer::Read,
+        description: "读各阶段的配置：provider、采样参数、人格文件、技能声明、超时。\
+                      想解释「为什么这个工位表现是这样」时问它。",
+        parameters: r#"{"type":"object","properties":{}}"#,
+    },
+    ForemanToolSpec {
+        name: "read_skills",
+        layer: ForemanToolLayer::Read,
+        description: "读当前可用的技能清单（技能根下的 markdown）：名字、描述、\
+                      被哪些阶段引用。",
+        parameters: r#"{"type":"object","properties":{}}"#,
+    },
+    ForemanToolSpec {
+        name: "read_providers",
+        layer: ForemanToolLayer::Read,
+        description: "读已配置的 provider 清单：id、厂商、模型、是否启用、上下文窗口。\
+                      **密钥只回显掩码**——你看到的是「有没有配」，不是密钥本身。",
+        parameters: r#"{"type":"object","properties":{}}"#,
+    },
+];
+
+/// 清单里某一层的工具名（票 01 起有 `Read`，票 04 / 05 / 06 往上加 `Write`）。
+pub fn foreman_tool_names(layer: ForemanToolLayer) -> Vec<&'static str> {
+    FOREMAN_TOOL_SPECS
+        .iter()
+        .filter(|s| s.layer == layer)
+        .map(|s| s.name)
+        .collect()
+}
 
 /// 单次回话的最大工具往返轮数（决策 182④）。
 ///
@@ -330,6 +428,9 @@ pub struct ForemanTrace {
 /// 一次回话的结果。
 #[derive(Debug, Clone)]
 pub struct ForemanTurn {
+    /// 这句话落进了哪个会话（决策 204）。请求没指定时是服务端选/建的那个，
+    /// 客户端据此更新自己的「当前班次」——否则第一次说话会落进一个它不知道的会话。
+    pub session: ForemanSession,
     pub reply: String,
     pub prompt_tokens: u32,
     pub completion_tokens: u32,
@@ -362,23 +463,35 @@ impl ForemanRunner {
         &self.store
     }
 
-    /// 回一句话。
+    /// 回一句话，落进指定的会话。
     ///
     /// 顺序是刻意的：**值班经理说的话先落库**，再叫模型，最后落值班长的回话。
     /// 中间任何一步失败，人说过的那句话仍在台账里（审计要的是「他说了什么」，
-    /// 不是「他说的哪句话被成功答复了」）。
+    /// 不是「他说的哪句成功被答复」）。
+    ///
+    /// `session_id` 为 `None` 时落到最近活动的未归档会话；一个都没有就新开一个
+    /// （首启空 home 的第一次说话走这条）。**历史窗口只取该会话**（决策 204②：
+    /// 会话隔离的是上下文）——换会话就是换一段上下文，台账本身照旧全局可查。
     ///
     /// **不落 run 行**：`kanban_node_runs` 的归属约束与指标口径都不接受一个无阶段、
     /// 无任务的运行行（决策 182⑨）。没有 run 行也就没有心跳可打——值班长的活性信号
     /// 是 HTTP 请求本身（决策 182⑦）。
-    pub async fn say(&self, user_text: &str) -> Result<ForemanTurn> {
+    pub async fn say(&self, session_id: Option<&str>, user_text: &str) -> Result<ForemanTurn> {
         let text = user_text.trim();
         if text.is_empty() {
             return Err(Error::Validation("空消息不入账".into()));
         }
+        let session = self.resolve_session(session_id).await?;
         self.store
-            .append_foreman_message(NewForemanMessage::user(text))
+            .append_foreman_user_message(&session.id, text)
             .await?;
+        // 标题可能是刚由这句话派生的（首次说话命名，决策 204②），故重读一次会话行，
+        // 让返回值里的标题与库里的标题是同一个——客户端拿它直接更新 chip。
+        let session = self
+            .store
+            .get_foreman_session(&session.id)
+            .await?
+            .unwrap_or(session);
 
         let briefing = build_briefing(&self.store).await?;
         // 阶段配置读一次、用两个地方（人格 + provider / 采样参数）。中途再读一次不会
@@ -390,7 +503,7 @@ impl ForemanRunner {
 
         let history = self
             .store
-            .list_foreman_messages(FOREMAN_HISTORY_FETCH_LIMIT)
+            .list_foreman_messages(&session.id, FOREMAN_HISTORY_FETCH_LIMIT)
             .await?;
         let window = trim_history(&history, FOREMAN_HISTORY_BUDGET_CHARS);
         // `user_prompt` **只放快照**，问题由 transcript 的最后一条承担。
@@ -412,11 +525,13 @@ impl ForemanRunner {
             Arc::new(RealProcessKiller),
         )
         .with_ledger(self.store.clone())
-        .with_allowed_tools(&FOREMAN_TOOLS);
+        .with_allowed_tools(FOREMAN_TOOL_SPECS.iter().map(|s| s.name).collect());
         let ctx = ToolCallContext {
             // 值班长不挂任务：这两个字段在它的两个工具里都不参与判定
             // （任务 id 来自工具参数，不是上下文）。
             task_id: String::new(),
+            // 命令 / 文件动作的归属走会话（迁移 0012 的 CHECK：恰好一个归属）。
+            session_id: Some(session.id.clone()),
             stage: Stage::Init,
             node: Node::Execute,
             worktree_path: PathBuf::from(self.home.root()),
@@ -471,6 +586,9 @@ impl ForemanRunner {
                     branch: String::new(),
                     run_id: 0,
                     agent_type: FOREMAN_AGENT_TYPE.to_string(),
+                    // 会话身份（决策 204⑥）：手机与电脑同时连着时，前端靠它把增量
+                    // 归到正确的会话，而不是把两台设备的回话混成一段。
+                    session_id: session.id.clone(),
                 }),
             };
             let response = self.llm.complete(request).await?;
@@ -526,6 +644,7 @@ impl ForemanRunner {
         let briefing_json = serde_json::to_value(&briefing)?;
         self.store
             .append_foreman_message(NewForemanMessage {
+                session_id: session.id.clone(),
                 role: FOREMAN_ROLE_ASSISTANT.to_string(),
                 content: reply.clone(),
                 prompt_tokens: tokens.0,
@@ -536,6 +655,7 @@ impl ForemanRunner {
             .await?;
 
         Ok(ForemanTurn {
+            session,
             reply,
             prompt_tokens: tokens.0,
             completion_tokens: tokens.1,
@@ -544,39 +664,53 @@ impl ForemanRunner {
         })
     }
 
-    /// 工具定义。与 [`crate::pipeline::subagent::StoreSubAgentRunner::tool_defs`] 同样的
-    /// 立场：**不经 `effective_tools`**——那条路会并入基线强制工具（含 `run_command` /
+    /// 把「哪个会话」解析成一个确实存在的会话行（决策 204）。
+    ///
+    /// 指定的会话必须存在且**未归档**：归档是把会话从列表里收起来，往一个已经不
+    /// 露面的会话里继续说话，只会生成一段谁也看不见的记录。没指定时落到最近活动的
+    /// 未归档会话，一个都没有就新开——首启空 home 的第一句话走的就是这条。
+    async fn resolve_session(&self, session_id: Option<&str>) -> Result<ForemanSession> {
+        match session_id {
+            Some(id) => {
+                let id = id.trim();
+                let session = self
+                    .store
+                    .get_foreman_session(id)
+                    .await?
+                    .ok_or_else(|| Error::Task(format!("会话不存在：{id}")))?;
+                if session.archived_at.is_some() {
+                    return Err(Error::Validation(
+                        "这个班次已归档——先新建或切到别的班次再说话".into(),
+                    ));
+                }
+                Ok(session)
+            }
+            None => match self.store.latest_foreman_session().await? {
+                Some(session) => Ok(session),
+                None => self.store.create_foreman_session("").await,
+            },
+        }
+    }
+
+    /// 工具定义：**从清单生成**（票 01）。
+    ///
+    /// 与 [`crate::pipeline::subagent::StoreSubAgentRunner::tool_defs`] 同样的立场：
+    /// **不经 `effective_tools`**——那条路会并入基线强制工具（含 `run_command` /
     /// `write_file`），正是本模块要挡掉的东西。
+    ///
+    /// 手写这两个 `ToolDef` 的时候，广告集与执行点白名单是两份独立的名单，而
+    /// 「同源」是票 01 的硬要求：两处各写一份名字，迟早出现「模型看得见一个调用就被拒
+    /// 的工具」这种不好定位的错。
     fn tool_defs() -> Vec<ToolDef> {
-        vec![
-            ToolDef {
-                name: "read_task".to_string(),
-                description: "读某个任务的台账详情：标题、状态、当前工位、待办原因原文、\
-                              后端下发的可用动作、各分支游标。卡住的细节问它。"
-                    .to_string(),
-                parameters: serde_json::json!({
-                    "type": "object",
-                    "properties": {
-                        "task_id": { "type": "string", "description": "任务 id（快照里方括号内那串）" }
-                    },
-                    "required": ["task_id"]
-                }),
-            },
-            ToolDef {
-                name: "read_conversation".to_string(),
-                description: "读某个任务某次节点运行的会话回执（工位当时说了什么）。\
-                              run_id 省略时取该任务最近一次会话。引用工位结论时要标出来源。"
-                    .to_string(),
-                parameters: serde_json::json!({
-                    "type": "object",
-                    "properties": {
-                        "task_id": { "type": "string", "description": "任务 id" },
-                        "run_id": { "type": "integer", "description": "运行 id，省略取最近一次" }
-                    },
-                    "required": ["task_id"]
-                }),
-            },
-        ]
+        FOREMAN_TOOL_SPECS
+            .iter()
+            .map(|spec| ToolDef {
+                name: spec.name.to_string(),
+                description: spec.description.to_string(),
+                parameters: serde_json::from_str(spec.parameters)
+                    .expect("清单里的参数 schema 必须是合法 JSON（单测钉住）"),
+            })
+            .collect()
     }
 
     async fn run_tool(
@@ -621,11 +755,24 @@ impl ForemanRunner {
                 out.push_str(&format!("\n{}\n", append.trim()));
             }
         }
-        out.push_str(
+        // 工具纪律：**按清单生成**（票 01）。手写一份工具名清单的下场是它与
+        // `FOREMAN_TOOL_SPECS` 各自漂移——模型于是要么看不见某个能调的工具，
+        // 要么被告知去调一个不存在的工具（后者正是它开始编造读数的起点）。
+        let read_tools = foreman_tool_names(ForemanToolLayer::Read);
+        let write_tools = foreman_tool_names(ForemanToolLayer::Write);
+        out.push_str(&format!(
             "\n## 工具纪律\n\
-             - 只有两个只读工具：read_task / read_conversation。你没有写权限、没有命令执行权限，\
-             也读不到文件系统。\n\
-             - 快照里已经有的（待拍板原因、在跑、失败、项目清单）不要再查一遍。\n\
+             - 你的工具分两段，现在可用的只读工具是：{}。\n",
+            read_tools.join(" / ")
+        ));
+        if write_tools.is_empty() {
+            out.push_str(
+                "- **你没有写权限**：没有改状态的键、没有命令执行权限，也读不到文件系统。\
+                 要动手的键一律由值班经理按——你只建议。\n",
+            );
+        }
+        out.push_str(
+            "- 快照里已经有的（待拍板原因、在跑、失败、项目清单）不要再查一遍。\n\
              - 引用工位结论时必须标出它来自哪个工位、哪次运行。\n\
              - 你不知道的事就说不知道。",
         );

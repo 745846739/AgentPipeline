@@ -5,13 +5,22 @@
     BranchCursor,
     ForemanBriefing,
     ForemanSession,
+    ForemanSessionMeta,
     ForemanTrace,
     SseEvent,
     Stage,
     TaskListItem,
   } from '../api/types';
   import type { SpriteName } from '../theme/contract';
-  import { getForemanSession, getTask, sendForemanMessage } from '../api/client';
+  import {
+    archiveForemanSession,
+    createForemanSession,
+    getForemanSession,
+    getForemanSessions,
+    getTask,
+    renameForemanSession,
+    sendForemanMessage,
+  } from '../api/client';
   import { board } from '../stores/board.svelte';
   import {
     BOARD_COLUMNS,
@@ -43,6 +52,7 @@
   import PendingActions from '../components/board/PendingActions.svelte';
   import DiffReviewPanel from '../components/task/DiffReviewPanel.svelte';
   import EmptyState from '../components/ui/EmptyState.svelte';
+  import Modal from '../components/ui/Modal.svelte';
   import { router } from '../router.svelte';
 
   /**
@@ -70,6 +80,12 @@
    * **对面是真的会说话的值班长**（`/foreman/session` + `/foreman/messages` + `/foreman/stream`）：
    * 对话不依赖任务——空看板（无项目无任务）也照样能问它话。
    *
+   * **一条长会话改成一排班次**（决策 204）：时间线顶部一条 chip 行——新建 / 切换 /
+   * 重命名 / 归档。三条硬约束都在版面里兑现：chip 行**非 sticky**（窄屏只有两个钉住物，
+   * 决策 192）、**不在页头**（`.talk-head` 在 `row auto` 上，涨的 px 直接吃对话区）、
+   * 不动顶栏（决策 198 的三项与 138px）。会话隔离的是**对话上下文**（这一屏读什么、合计多少），
+   * **不是权限、也不是态势快照**——「换会话 ≠ 换看板」。
+   *
    * **值班长的回复里永远没有按钮**：写动作只在状态区的急停轮里渲染（后端下发的
    * `allowed_actions`，决策 101）。同一个动作在两处各渲染一颗钮，会让「哪个是真的」
    * 变成使用者必须思考的问题。空态的「去看板新建任务」是页面固定的**导航钮**，不进动作契约。
@@ -85,6 +101,25 @@
   let loadError = $state<string | null>(null);
   /** 会话台账（时间线的权威内容；每次回话后重取，不自攒一份账）。 */
   let session = $state<ForemanSession | null>(null);
+
+  /** 未归档的班次（chip 行的数据源），按最近活动倒序。 */
+  let sessionList = $state<ForemanSessionMeta[]>([]);
+  /** 当前班次 id。**同步更新**，不从 `session` 派生——发送期间要靠它比对在途回包。 */
+  let currentId = $state<string | null>(null);
+  /**
+   * 世代记号：**每次「屏幕上换了班次」就 +1**（切换 / 新建 / 重读时发现服务端换了班）。
+   * 在途的 send 结果比对这个记号，不符即丢弃（决策 204⑥）——手机与电脑同时连着时，
+   * 别班的回话不得落进这一班的活动轮。
+   */
+  let generation = $state(0);
+  /** 班次操作（改名 / 归档）对话框；`null` = 关着。 */
+  let dialog = $state<'rename' | 'archive' | null>(null);
+  /** 改名输入框的草稿。 */
+  let titleDraft = $state('');
+  /** 班次操作的进行中标记（按钮转圈 + 禁用）。 */
+  let busy = $state(false);
+  /** 班次操作的失败说明（对话框里就地显示，不弹窗）。 */
+  let dialogError = $state<string | null>(null);
 
   let input = $state('');
   let sending = $state(false);
@@ -218,9 +253,28 @@
   /** 对话时间线是空的（且不是「还没读到」）：空态要居中，见 CSS 的 `.timeline.empty`。 */
   const timelineEmpty = $derived(!(loading && !session) && turns.length === 0);
 
-  async function reload(): Promise<boolean> {
+  /**
+   * 重读班次列表与某个班次的台账。
+   *
+   * `want` 三态：不给 = 接着看当前这一班；给 id = 切过去；给 `null` = 回到服务端默认
+   * （最近活动的未归档班次）。指定的班次不在了（别的设备归档了它、或这个 id 本来就不存在）
+   * 时**回落到默认**而不是报错——切班次的地方没有出错这一说，只有「去最近有人说话的那一班」。
+   *
+   * 落点与原先不同时 `generation + 1`：在途的 send 结果就此作废（决策 204⑥）。
+   * 这一条同时覆盖了「另一台设备把当前班次归档了」那条被动路径——它不在「发送中禁止切换」
+   * 那把 UI 锁的覆盖范围内。
+   */
+  async function reload(want?: string | null): Promise<boolean> {
     try {
-      session = await getForemanSession();
+      const list = await getForemanSessions();
+      const target = want === undefined ? currentId : want;
+      const known = !!target && list.sessions.some((s) => s.id === target);
+      const payload = await getForemanSession(known ? target : null);
+      sessionList = list.sessions;
+      session = payload;
+      const landed = payload.session?.id ?? null;
+      if (landed !== currentId) generation += 1;
+      currentId = landed;
       loadError = null;
       return true;
     } catch (err) {
@@ -231,10 +285,125 @@
     }
   }
 
+  /**
+   * 切换时要**重置**的会话级状态（决策 204③的那份清单，逐条）。
+   *
+   * 只有这些是「属于某一班」的：这一屏读到的台账、读的加载态与错误、正在发的那句乐观轮、
+   * 流式增量、以及还没发出去的输入。**不重置**的是 `details` / `chosenStop` / `crew` /
+   * `pending`——它们派生自全局看板，换会话不等于换看板（同一条决策的第②条裁决）。
+   */
+  function resetSessionState() {
+    session = null;
+    loading = true;
+    loadError = null;
+    pendingText = null;
+    stream = emptyForemanStream();
+    input = '';
+  }
+
+  /**
+   * 切到另一班。
+   *
+   * **发送中禁止切换**：这是最基本的自保——回包落地时得有一个确定的「这一轮属于谁」。
+   * 但它不是彻底隔离：两台设备各说各话不受任何 UI 锁保护，那一层靠上面的 `generation`
+   * 与 `appendForemanDelta` 的班次守卫（决策 204⑥）。
+   */
+  async function switchTo(id: string) {
+    if (sending || busy || id === currentId) return;
+    generation += 1;
+    resetSessionState();
+    await reload(id);
+  }
+
+  /**
+   * 开一个新班次并切过去（空班是合法状态：第一句话说出来时它才得名）。
+   *
+   * **不带 busy 守卫**：调用方已经持有它。归档最后一个班次那条路就是这样调的
+   * ——那时的 busy 必然是 true，若这里再守一次，归档完最后一个班次会静默什么都不做，
+   * 页面停在一片空白上（「一个班次都没有」且没有当前班次）。
+   */
+  async function openFreshSession() {
+    const created = await createForemanSession();
+    sessionList = [created.session, ...sessionList];
+    generation += 1;
+    resetSessionState();
+    await reload(created.session.id);
+  }
+
+  /** 从界面按下「+ 新班次」。 */
+  async function newSession() {
+    if (sending || busy) return;
+    busy = true;
+    try {
+      await openFreshSession();
+    } catch (err) {
+      loadError = (err as Error).message;
+    } finally {
+      busy = false;
+    }
+  }
+
+  function openRename() {
+    if (!session?.session) return;
+    titleDraft = session.session.title;
+    dialogError = null;
+    dialog = 'rename';
+  }
+
+  async function submitRename(event: SubmitEvent) {
+    event.preventDefault();
+    const id = currentId;
+    const title = titleDraft.trim();
+    if (!id || !title || busy) return;
+    busy = true;
+    try {
+      const updated = await renameForemanSession(id, title);
+      sessionList = sessionList.map((s) => (s.id === id ? updated.session : s));
+      if (session?.session) session = { ...session, session: updated.session };
+      dialog = null;
+    } catch (err) {
+      dialogError = (err as Error).message;
+    } finally {
+      busy = false;
+    }
+  }
+
+  /**
+   * 归档当前班并**自动切到最近活动的未归档班次**；一个都不剩时新开一个（决策 204）。
+   *
+   * 不切的话屏幕上会留着一个已经不在列表里的班次，人接着说话才发现「这一班已经归档了」
+   * ——把一件必然要做的善后交给使用者做，是界面偷懒。
+   */
+  async function submitArchive(event: SubmitEvent) {
+    event.preventDefault();
+    const id = currentId;
+    if (!id || busy) return;
+    busy = true;
+    try {
+      await archiveForemanSession(id);
+      dialog = null;
+      generation += 1;
+      resetSessionState();
+      const list = await getForemanSessions();
+      sessionList = list.sessions;
+      if (list.sessions.length > 0) {
+        await reload(list.sessions[0].id);
+      } else {
+        // 一个不剩：新开一班（走不带守卫的那条，见 `openFreshSession`）
+        await openFreshSession();
+      }
+    } catch (err) {
+      dialogError = (err as Error).message;
+    } finally {
+      busy = false;
+    }
+  }
+
   function onStreamEvent(_taskId: string, event: SseEvent) {
     // 只在等回话期间累积：收尾后到达的尾巴不得再造一轮（回话以台账为准）
     if (!sending) return;
-    stream = appendForemanDelta(stream, event);
+    // 班次守卫：不是当前这一班的增量一律丢弃（决策 204⑥，判据在 realtime/foreman.ts）
+    stream = appendForemanDelta(stream, event, currentId);
   }
 
   let conn: TaskStream | null = null;
@@ -313,27 +482,61 @@
     zoneEl?.scrollIntoView({ block: 'start' });
   }
 
+  /**
+   * 说一句话。
+   *
+   * **先确定班次，再发话**：这台机器上一个班次都没有时（首启空 home 的第一次说话），
+   * 客户端自己先开一个——若让它落到服务端的缺省逻辑上，回话的流式增量带的班次 id
+   * 是回来之后才知道的，而此刻增量已经在路上了，会被班次守卫挡掉（字还在，只是白流一场）。
+   *
+   * 每个 await 之后都比对 `generation`：这一班的回包不落到另一班的屏幕上（决策 204⑥）。
+   * 比对不通过时**连乐观轮一起撤**——它属于已经不显示的那一班。
+   */
   async function send() {
     const text = input.trim();
     if (!text || sending) return;
     sending = true;
     pendingText = text;
     stream = beginForemanStream();
+    let gen = generation;
+    let sid = currentId;
     try {
-      const res = await sendForemanMessage(text);
+      if (!sid) {
+        const created = await createForemanSession();
+        if (gen !== generation) return;
+        sid = created.session.id;
+        currentId = sid;
+        sessionList = [created.session, ...sessionList];
+        // 这是**我们自己**开的班，不算「换班」：重取记号，免得下面每一步都判成过期。
+        gen = generation;
+      }
+      const res = await sendForemanMessage(text, sid);
+      if (gen !== generation) {
+        pendingText = null;
+        stream = emptyForemanStream();
+        return;
+      }
       // 回话是权威值：先收敛流式文本（重取台账期间不闪空），再以台账覆盖
       stream = settleForemanStream(stream, res.reply);
       input = '';
-      if (await reload()) {
+      // 重取之后**无条件收掉这两样本地状态**：它们是「这一轮」的东西，而重取可能发现
+      // 服务端已经把我们换到了另一班（另一台设备归档了它）。那种情况下留着乐观轮，
+      // 它就会挂在**另一班的**时间线上——正是决策 204⑥ 要挡的串台。
+      if (await reload(sid)) {
         pendingText = null;
         stream = emptyForemanStream();
       }
     } catch (err) {
       // 失败不改输入框内容：后端在叫模型之前已把 user 行落库，人改几个字就能重发
       // （决策 182㉓）。失败以时间线里的一轮呈现——不弹窗、不 toast。
+      if (gen !== generation) {
+        pendingText = null;
+        stream = emptyForemanStream();
+        return;
+      }
       stream = failForemanStream(stream, (err as Error).message);
       // 重取成功才撤乐观轮：撤了之后这话由台账那一行承担，不靠重取失败时凭空消失
-      if (await reload()) pendingText = null;
+      if (await reload(sid)) pendingText = null;
     } finally {
       sending = false;
     }
@@ -637,6 +840,58 @@
     bind:this={timelineEl}
     aria-label="对话时间线"
   >
+    <!-- ── 班次 chip 行（决策 204③）：时间线顶部、**非 sticky**（随手指滚）。
+         词汇复用任务详情页的 `.runchip`——「选一条会话」在那里已经有现成语汇；
+         窄屏 `nowrap + 横滚` 也是现成的。**不得渲染成 `.turn`**：时间线里那些是发言，
+         而这是一排控件（`talk.spec.ts` 断言时间线里没有 `.turn.warn`）。
+         不动页头、不动顶栏：它长在这条**会滚的**时间线里，故 `.talk-head` 的高度
+         与对话区的高度都不因它变。 -->
+    <div class="runrow no-scrollbar" role="group" aria-label="班次">
+      {#each sessionList as s (s.id)}
+        <button
+          type="button"
+          class="runchip"
+          class:now={s.id === currentId}
+          disabled={sending || busy}
+          title={s.title}
+          onclick={() => void switchTo(s.id)}
+        >
+          {s.title}
+        </button>
+      {/each}
+      <button
+        type="button"
+        class="runchip plus"
+        disabled={sending || busy}
+        title="开一个新班次"
+        onclick={() => void newSession()}
+      >
+        + 新班次
+      </button>
+      {#if currentId}
+        <button
+          type="button"
+          class="runchip act"
+          disabled={sending || busy}
+          onclick={openRename}>改名</button
+        >
+        <button
+          type="button"
+          class="runchip act"
+          disabled={sending || busy}
+          onclick={() => {
+            dialogError = null;
+            dialog = 'archive';
+          }}>归档</button
+        >
+      {/if}
+      <!-- 发送中为什么点不动（决策 204③的「最基本的自保」）：光把按钮变灰，
+           人会以为界面卡了。回话落地得有一个确定的「这一轮属于谁」。 -->
+      {#if sending}
+        <span class="dim note rwhy">回话中，先别换班次</span>
+      {/if}
+    </div>
+
     {#if loading && !session}
       <div class="quiet">正在读会话台账…</div>
     {:else if turns.length === 0}
@@ -735,6 +990,53 @@
       <button type="submit" class="btn solid" disabled={sending || !input.trim()}>发送</button>
     </div>
   </form>
+
+  <!-- ── 班次的重命名与归档（决策 204③：走 Modal，不另造第二套对话框） ── -->
+  <Modal
+    open={dialog === 'rename'}
+    title="给这一班起个名字"
+    submitLabel="改名"
+    submitting={busy}
+    submitDisabled={!titleDraft.trim()}
+    onclose={() => (dialog = null)}
+    onsubmit={submitRename}
+    width={420}
+  >
+    <label class="field">
+      <span>班次名</span>
+      <input
+        type="text"
+        bind:value={titleDraft}
+        maxlength={24}
+        placeholder="例如：周三夜班"
+      />
+    </label>
+    <p class="dim note">名字只是给这一班贴的标签，改它不动台账里的任何一句话。</p>
+    {#if dialogError}
+      <p class="ferr note">{dialogError}</p>
+    {/if}
+  </Modal>
+
+  <Modal
+    open={dialog === 'archive'}
+    title="归档这一班"
+    submitLabel="归档"
+    submitting={busy}
+    onclose={() => (dialog = null)}
+    onsubmit={submitArchive}
+    width={420}
+  >
+    <p>
+      归档只是把「{session?.session?.title ?? ''}」从班次列表里收起来。
+    </p>
+    <p class="dim note">
+      说的话不会被删，但照旧按保留期（默认 30 天，可配）到期清理——归档是收起来，不是永久保存。
+      归档后自动切到最近有说话的班次；如果这是最后一个，就新开一班。
+    </p>
+    {#if dialogError}
+      <p class="ferr note">{dialogError}</p>
+    {/if}
+  </Modal>
 
   <!-- ── 值班板：桌面右栏；窄屏收成对话之上的横向灯条（`crew`） ── -->
   <aside class="talk-side crew">
@@ -843,6 +1145,58 @@
     display: flex;
     flex-direction: column;
     justify-content: center;
+  }
+  /* 空态里那两样东西**不是一类**：班次 chip 行是控件，空态文案是内容。
+     让 flex 把整组居中会让控件浮在大片空白的中间（决策 202 治的就是「内容浮着」），
+     故 chip 行照旧贴顶、只把空态文案推到中间。 */
+  .timeline.empty > .runrow {
+    flex: 0 0 auto;
+  }
+  .timeline.empty > :global(.empty) {
+    margin-top: auto;
+    margin-bottom: auto;
+  }
+
+  /* ── 班次 chip 行（决策 204③）：词汇照抄任务详情页的 `.runchip` ──
+     「选一条会话」在那里已经有现成形状，本页不另造一套药丸。 */
+  .runrow {
+    display: flex;
+    gap: 6px;
+    flex-wrap: wrap;
+    margin-bottom: 16px;
+  }
+  .runchip {
+    font-size: 12px;
+    padding: 2px 8px;
+    border: 2px solid var(--pane);
+    color: var(--text-3);
+    background: none;
+    max-width: 26ch;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+  .runchip:hover:not(:disabled) {
+    color: var(--text);
+  }
+  .runchip.now {
+    background: var(--wash);
+    color: var(--text-hi);
+    border-color: var(--text-2);
+  }
+  /* 「+ 新班次」是这里的主动作：亮一档，但仍不占信号色（全站唯一的响在急停一处） */
+  .runchip.plus {
+    color: var(--text-hi);
+  }
+  /* 改名 / 归档：同一排但不是「选一条班次」，故压暗一档（次级必读，决策 195） */
+  .runchip.act {
+    color: var(--text-3);
+  }
+  .runchip:disabled {
+    opacity: 0.5;
+  }
+  .rwhy {
+    align-self: center;
   }
   .quiet {
     color: var(--text-3);
@@ -995,6 +1349,25 @@
   .ctx.err {
     color: var(--stop);
   }
+  /* 班次对话框里的字段（与 NewTaskDialog 同一形状：标签在上、输入在下） */
+  .field {
+    display: block;
+    margin-bottom: 10px;
+  }
+  .field > span {
+    display: block;
+    font-size: 12px;
+    color: var(--text-3);
+    letter-spacing: 0.04em;
+    margin-bottom: 4px;
+  }
+  .field input {
+    width: 100%;
+  }
+  .ferr {
+    color: var(--stop);
+  }
+
   /* 次级必读档（--text-3，决策 195 的门槛 4.5:1）：本页这一类字（断流后的补给说明、
      输入坞的提示行、收据里的工具名与参数）都属「读不到会挡住下一步」，不是纯装饰刻度，
      故不留 --text-4。纯装饰那几处（`.sep` 的 ▪、`.blamp` 的灯框）另按各自 token 走。 */
@@ -1186,6 +1559,16 @@
     }
     .talk-head {
       order: 1;
+      flex: none;
+    }
+    /* 班次 chip 行在窄屏**不折行、横向滚**（与任务详情页的 `.runrow` 同一形状）：
+       430px 上折行会把三四个班次铺成两三行，而这一档的纵向空间是拿「两只钉住物之间的
+       残渣」换来的，不能喂给一排控件。 */
+    .runrow {
+      flex-wrap: nowrap;
+      overflow-x: auto;
+    }
+    .runchip {
       flex: none;
     }
     /* 标题与元信息同一行：手机上「对讲台」顶栏的页签已经在说，页内不必再铺两行。

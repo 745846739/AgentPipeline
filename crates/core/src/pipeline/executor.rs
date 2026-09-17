@@ -883,12 +883,17 @@ impl Executor {
                     process_group_id: None,
                 })
                 .await?;
-            // 本 run 续接了哪条历史（决策 180，票 13）：循环只为它续接来源记账，
-            // 干净重试与首跑都不留链接（否则 token 汇总会把无关的历史排掉）。
-            if let Some(c) = &continuation {
-                self.store
-                    .link_run_continuation(run_id, c.from_run_id)
-                    .await?;
+            // 本 run 续接了哪条历史（决策 180，票 13）：**只有 round 0 可能续接**
+            // （`carried` 从第 2 轮起按构造是 `&[]`，决策 33 的干净重试），故链接也只落在这里。
+            // 此前写成「只要 `continuation.is_some()` 就落链」，于是干净重试轮也指向那条历史；
+            // 而 `metrics::total_tokens` 把被指到的历史排进排除集——同一段历史被排除两次，
+            // 任务是 token **少算**不是双算，且读数随重试次数漂移。
+            if round == 0 {
+                if let Some(c) = &continuation {
+                    self.store
+                        .link_run_continuation(run_id, c.from_run_id)
+                        .await?;
+                }
             }
             self.sse.emit(SseEvent::NodeStarted {
                 task_id: task.id.clone(),
@@ -1014,29 +1019,28 @@ impl Executor {
         })
     }
 
-    /// 取本节点的续接素材（决策 180，票 13）。
+    /// 取本节点的续接素材（决策 180 / 205，票 13 / 01）。
     ///
-    /// 三步都要成立才续接：① 游标**刚从 pending 被 resume**（一次性标记，任何 resume 动作
-    /// 都会置位——continue / skip / goto 都是「在上次停下的地方重入」）；② 该阶段或该节点
-    /// 的开关为真；③ 真有一条上一 attempt 的主 agent 会话行可读。
+    /// **两道条件**（决策 205 把原来的三道砍掉一道：那个「谁来决定开不开」的配置层整层退场）：
     ///
-    /// 第 ③ 条在「开了开关却读不到」时**静默干净起跑**而不报错：这是票 13 必要条件一
+    /// ① 游标**刚从 pending 被 resume**，且**原因表说该续接**（[`crate::types::resume_continues`]）。
+    ///    取数是一次性的（取走即清零），且只有人能按出这个边界——`validate_attempts` 的原地重试、
+    ///    `agent_retry_max` 的干净重试、未耗尽的超时都不会置位（决策 33 不变：
+    ///    **模型的自动失败重试不给续接，人的介入才给**）。
+    /// ② 真有一条上一 attempt 的主 agent 会话行可读。
+    ///
+    /// 第 ② 条在「该续接却读不到」时**静默干净起跑**而不报错：这是票 13 必要条件一
     /// （`context_overflow` 退出路径补写会话行）修掉的那条路——修复之后它不该再发生，
     /// 但真发生时让节点继续跑仍优于让整条流水线停在一个诊断性错误上。
     async fn take_continuation(&self, cursor: &NodeCursor) -> Result<Option<Continuation>> {
-        if !self
+        let Some(cause) = self
             .store
-            .take_cursor_resumed_from_pending(&cursor.cursor_id)
+            .take_cursor_resume_cause(&cursor.cursor_id)
             .await?
-        {
+        else {
             return Ok(None);
-        }
-        let stage_cfg = self.store.get_stage_config(cursor.stage.as_str()).await?;
-        let enabled = crate::config::effective_resume_continuation(
-            stage_cfg.as_ref().and_then(|c| c.resume_continuation),
-            crate::config::node_resume_continuation(stage_cfg.as_ref(), cursor.node.as_str()),
-        );
-        if !enabled {
+        };
+        if !crate::types::resume_continues(cause) {
             return Ok(None);
         }
         let Some(conv) = self
@@ -1297,6 +1301,7 @@ impl Executor {
                 provider_id: task.model_override.clone(),
                 run: Some(crate::agent::client::RunContext {
                     task_id: task.id.clone(),
+                    session_id: String::new(),
                     branch: cursor.branch.clone(),
                     run_id,
                     agent_type: "main".into(),
@@ -1318,6 +1323,7 @@ impl Executor {
                 self.emit_tool_event(task, cursor, run_id, &call.name, ToolPhase::Start, &summary);
                 let ctx = ToolCallContext {
                     task_id: task.id.clone(),
+                    session_id: None,
                     stage: cursor.stage,
                     node: cursor.node,
                     worktree_path: worktree.clone().into(),
@@ -1551,6 +1557,7 @@ impl Executor {
                 branch: cursor.branch.clone(),
                 run_id,
                 agent_type: pseudo.agent_type().to_string(),
+                session_id: String::new(),
             }),
         };
 
@@ -1673,6 +1680,7 @@ impl Executor {
                 branch: String::new(),
                 run_id: 0,
                 agent_type: PseudoStage::ProjectAnalysis.agent_type().to_string(),
+                session_id: String::new(),
             }),
         };
         let response = self.llm.complete(request).await?;
@@ -2356,7 +2364,8 @@ impl Executor {
         let command_id = self
             .store
             .record_start(CommandStart {
-                task_id: task.id.clone(),
+                task_id: Some(task.id.clone()),
+                session_id: None,
                 run_id: Some(run_id),
                 stage: cursor.stage,
                 node: cursor.node,
@@ -2705,7 +2714,8 @@ impl Executor {
         let command_id = self
             .store
             .record_start(CommandStart {
-                task_id: task.id.clone(),
+                task_id: Some(task.id.clone()),
+                session_id: None,
                 run_id: Some(run_id),
                 stage,
                 node,

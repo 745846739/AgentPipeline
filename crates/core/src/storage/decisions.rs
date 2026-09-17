@@ -10,8 +10,8 @@ use crate::pipeline::landing::{
     entry_node, next_stages, skip_landing, stage_has_node, SkipLanding,
 };
 use crate::types::{
-    Approval, CursorStatus, MergeResult, Node, NodeCursor, PendingKind, PendingReason, Stage,
-    TransitionTrigger,
+    Approval, CursorStatus, MergeResult, Node, NodeCursor, PendingKind, PendingReason, ResumeCause,
+    Stage, TransitionTrigger,
 };
 use crate::{Error, Result};
 
@@ -117,10 +117,12 @@ impl Store {
         .execute(&mut *tx)
         .await?;
 
+        // 落点**无条件**改写（不只是 pending 时）：人工决策总是要换地方，
+        // 而「清 pending」只在它确实卡着时才有意义——两件事合并成一条 SQL 会让
+        // 「对一条 active 的游标提交决策」静默失效。
         sqlx::query(
             "UPDATE kanban_node_cursors
-             SET stage = ?, node = ?, status = 'active', pending_reason_json = NULL,
-                 validate_attempts = 0, updated_at = ?
+             SET stage = ?, node = ?, validate_attempts = 0, updated_at = ?
              WHERE cursor_id = ?",
         )
         .bind(target_stage.as_str())
@@ -129,6 +131,15 @@ impl Store {
         .bind(&cursor.cursor_id)
         .execute(&mut *tx)
         .await?;
+        // 离开 pending 走**共同实现**（决策 205）：「通过与驳回」在 pending 原因上同名
+        // （都是 merge_approval），只有这里知道人按的是哪一颗，故原因显式给。
+        // 同事务——分两个事务会留下「已 active、落点还是旧的」的窗口。
+        let cause = match decision {
+            MergeDecision::Approve => ResumeCause::MergeApproved,
+            MergeDecision::Return => ResumeCause::MergeReturned,
+        };
+        self.clear_pending_in_tx(&mut tx, &cursor.cursor_id, Some(cause))
+            .await?;
 
         sqlx::query(
             "INSERT INTO kanban_transitions
@@ -190,10 +201,10 @@ impl Store {
         }
 
         let mut tx = self.begin_write().await?;
+        // 落点无条件改写（同 `apply_merge_decision`）
         sqlx::query(
             "UPDATE kanban_node_cursors
-             SET stage = ?, node = ?, status = 'active', pending_reason_json = NULL,
-                 validate_attempts = 0, updated_at = ?
+             SET stage = ?, node = ?, validate_attempts = 0, updated_at = ?
              WHERE cursor_id = ?",
         )
         .bind(target_stage.as_str())
@@ -202,6 +213,15 @@ impl Store {
         .bind(&cursor.cursor_id)
         .execute(&mut *tx)
         .await?;
+        // 同上：通过与驳回同名，原因由这里给。**驳回这一条正是决策 205 点名要 true 的路**
+        // ——此前它绕过 flag，于是「评审驳回 → 打回开发」根本不续接（一处静默的行为缺口）。
+        let cause = if approved {
+            ResumeCause::HumanReviewApproved
+        } else {
+            ResumeCause::HumanReviewRejected
+        };
+        self.clear_pending_in_tx(&mut tx, &cursor.cursor_id, Some(cause))
+            .await?;
 
         sqlx::query(
             "INSERT INTO kanban_transitions

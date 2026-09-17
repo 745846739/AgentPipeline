@@ -337,7 +337,8 @@ pub async fn retry(
             let cmd_id = state
                 .store
                 .record_start(CommandStart {
-                    task_id: id.clone(),
+                    task_id: Some(id.clone()),
+                    session_id: None,
                     run_id: None,
                     stage: Stage::Init,
                     node: Node::Execute,
@@ -571,14 +572,18 @@ pub async fn model_override(
             provider.vendor
         )));
     }
-    state
+    // 写字段 + 若卡在 `context_overflow` 上则解除 pending（票 04：此前按了没反应）。
+    let cleared = state
         .store
-        .set_task_model_override(&id, Some(&body.provider_id))
+        .apply_model_override(&id, &body.provider_id)
         .await
         .map_err(map_core_error)?;
-    Ok(Json(
-        json!({ "ok": true, "model_override": body.provider_id }),
-    ))
+    Ok(Json(json!({
+        "ok": true,
+        "model_override": body.provider_id,
+        // 解除掉的 pending 数（0 = 只是改了模型）。如实回报，界面不必猜。
+        "resumed": cleared,
+    })))
 }
 
 #[derive(Debug, Deserialize)]
@@ -863,7 +868,9 @@ pub async fn command(
         .await
         .map_err(map_core_error)?
         .ok_or_else(|| ApiError::not_found(format!("命令不存在：{cmd_id}")))?;
-    if command.task_id != id {
+    // 归属校验按 `Some(id)` 比：值长在表里是 `Option`（迁移 0012 起命令也可以挂会话），
+    // 但这条路由只认任务归属——值班长那些 `task_id` 为 NULL 的命令在 `/foreman/` 下读。
+    if command.task_id.as_deref() != Some(id.as_str()) {
         return Err(ApiError::not_found(format!(
             "命令 {cmd_id} 不属于任务 {id}"
         )));
@@ -882,7 +889,9 @@ pub async fn command_output(
         .await
         .map_err(map_core_error)?
         .ok_or_else(|| ApiError::not_found(format!("命令不存在：{cmd_id}")))?;
-    if command.task_id != id {
+    // 归属校验按 `Some(id)` 比：值长在表里是 `Option`（迁移 0012 起命令也可以挂会话），
+    // 但这条路由只认任务归属——值班长那些 `task_id` 为 NULL 的命令在 `/foreman/` 下读。
+    if command.task_id.as_deref() != Some(id.as_str()) {
         return Err(ApiError::not_found(format!(
             "命令 {cmd_id} 不属于任务 {id}"
         )));

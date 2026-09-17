@@ -60,9 +60,6 @@ pub struct PutStageConfig {
     pub max_duration_sec: Option<u64>,
     #[serde(default)]
     pub node_overrides_json: Option<serde_json::Value>,
-    /// pending → resume 时续接上一 attempt 的对话（决策 180，票 13）。缺省 = 关。
-    #[serde(default)]
-    pub resume_continuation: Option<bool>,
 }
 
 /// 用「现有配置 + 待改动」跑一遍启动校验；`removed` 是本次要从集合里去掉的阶段键。
@@ -120,7 +117,6 @@ pub async fn put(
         idle_timeout_sec: body.idle_timeout_sec,
         max_duration_sec: body.max_duration_sec,
         node_overrides_json: body.node_overrides_json,
-        resume_continuation: body.resume_continuation,
         updated_at: state.store.now(),
     };
 

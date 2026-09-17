@@ -63,6 +63,7 @@ async fn run_command_records_real_process_group_id() {
     };
     let ctx = ToolCallContext {
         task_id: "t1".into(),
+        session_id: None,
         stage: Stage::Develop,
         node: Node::Execute,
         worktree_path: worktree.clone(),

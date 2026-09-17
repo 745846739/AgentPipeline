@@ -28,6 +28,9 @@ zip.workspace = true
 
 [dev-dependencies]
 insta.workspace = true
+# 迁移用例要用**原始 SQL** 造一份「还没升到 0012 的旧库」（决策 204：在既有数据上打开
+# 不炸是这次迁移的硬要求），而那条路必须绕过 Store::open（它会跑全量迁移）。
+sqlx.workspace = true
 tempfile.workspace = true
 testkit.workspace = true
 tokio = { workspace = true, features = ["full", "test-util"] }

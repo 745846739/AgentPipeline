@@ -33,7 +33,6 @@ function config(overrides: Partial<StageConfig> = {}): StageConfig {
     idle_timeout_sec: null,
     max_duration_sec: null,
     node_overrides_json: null,
-    resume_continuation: null,
     updated_at: '2026-09-12T00:00:00Z',
     ...overrides,
   };
@@ -278,13 +277,12 @@ describe('节点级技能：写回 node_overrides_json', () => {
   });
 });
 
-describe('草稿 → payload：技能与续接开关', () => {
-  it('技能以混合数组下发；空列表与续接关都走「留空 = 省略」', () => {
+describe('草稿 → payload：技能声明', () => {
+  it('技能以混合数组下发；空列表走「留空 = 省略」', () => {
     const empty = buildStageConfigPut(emptyStageConfigDraft());
     expect(empty.ok).toBe(true);
     if (!empty.ok) return;
     expect(empty.payload.skills_json).toBeUndefined();
-    expect(empty.payload.resume_continuation).toBeUndefined();
 
     const draft = { ...emptyStageConfigDraft(), skills: addSkillDecl([], 'grilling') };
     const result = buildStageConfigPut(draft);
@@ -303,11 +301,6 @@ describe('草稿 → payload：技能与续接开关', () => {
     expect(result.payload.skills_json).toEqual(['a', 'b']);
   });
 
-  it('勾上续接开关后如实下发', () => {
-    const draft = { ...emptyStageConfigDraft(), resume_continuation: true };
-    const result = buildStageConfigPut(draft);
-    expect(result.ok).toBe(true);
-    if (!result.ok) return;
-    expect(result.payload.resume_continuation).toBe(true);
-  });
+  // 「续不续接上一轮对话」那条开关由决策 205 整层退场（改由后端的原因表决定），
+  // 故它没有对应的用例了——不是漏了，是那个字段不存在了。
 });

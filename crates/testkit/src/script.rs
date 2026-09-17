@@ -755,6 +755,7 @@ mod tests {
             branch: "main".into(),
             run_id: 1,
             agent_type: "pseudo:conflict_check".into(),
+            session_id: String::new(),
         });
         let resp = agent.complete(pseudo).await.unwrap();
         assert_eq!(resp.tool_calls[0].name, "submit_metadata");

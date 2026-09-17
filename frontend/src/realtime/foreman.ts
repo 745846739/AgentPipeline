@@ -32,14 +32,23 @@ export function beginForemanStream(): ForemanStreamState {
 /**
  * 增量累积。
  *
- * 只认工头自己的对话增量：这条流上理论上只有它，但判定不能省——`/foreman/stream`
- * 与任务流共用一条总线，漏判就会把别的任务的增量拼进值班长的话里。
+ * 两道判定都不能省：
+ *
+ * 1. **身份**——只认工头自己的对话增量。`/foreman/stream` 与任务流共用一条总线
+ *    （决策 182⑥），漏判就会把别的任务的增量拼进值班长的话里；
+ * 2. **班次**（决策 204⑥）——`/foreman/stream` 把所有工头增量广播给所有订阅者，
+ *    而**同一台机器上可以多处同时说话**（手机 + 电脑，配对令牌正是为此存在）。
+ *    增量与当前班次不符时丢弃：否则手机上那一班的回话会插进电脑这一班的话里。
+ *    `sessionId` 为空（还没有当前班次）时同样丢弃——那种状态下屏幕上是空态，
+ *    没有「属于哪一班」这一说，接进来只会凭空长出一段不属于任何班次的话。
  */
 export function appendForemanDelta(
   state: ForemanStreamState,
   event: SseEvent,
+  sessionId: string | null,
 ): ForemanStreamState {
   if (event.type !== 'conversation_delta' || event.agent_type !== FOREMAN_AGENT_TYPE) return state;
+  if (!sessionId || event.session_id !== sessionId) return state;
   return { ...state, text: state.text + event.text };
 }
 

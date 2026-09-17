@@ -199,6 +199,17 @@ async fn put(api: &Api, uri: &str, body: Value) -> (StatusCode, Value) {
     .await
 }
 
+async fn patch(api: &Api, uri: &str, body: Value) -> (StatusCode, Value) {
+    call(
+        api,
+        request("PATCH", uri)
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from(body.to_string()))
+            .unwrap(),
+    )
+    .await
+}
+
 async fn delete(api: &Api, uri: &str) -> (StatusCode, Value) {
     call(api, request("DELETE", uri).body(Body::empty()).unwrap()).await
 }
@@ -1798,7 +1809,8 @@ async fn command_log_endpoints_expose_卸载_output() {
     use agentpipeline_core::agent::tools::{CommandFinish, CommandRecorder, CommandStart};
     let command_id = store
         .record_start(CommandStart {
-            task_id: "t1".into(),
+            task_id: Some("t1".into()),
+            session_id: None,
             run_id: None,
             stage: Stage::Test,
             node: agentpipeline_core::types::Node::Execute,
@@ -2046,7 +2058,8 @@ async fn commands_are_scoped_to_their_task() {
         .state
         .store
         .record_start(agentpipeline_core::agent::tools::CommandStart {
-            task_id: "t1".into(),
+            task_id: Some("t1".into()),
+            session_id: None,
             run_id: None,
             stage: Stage::Develop,
             node: agentpipeline_core::types::Node::Execute,
@@ -4036,6 +4049,9 @@ async fn foreman_session_is_available_on_an_empty_home() {
     assert_eq!(body["messages"].as_array().unwrap().len(), 0);
     assert_eq!(body["total_tokens"], 0);
     assert_eq!(body["total_calls"], 0);
+    // 一个班次都没有时是 `null`，不是一个凭空造出来的空班次：读端点不建行
+    // （建行是写端点的事），前端据此走空态并提议新开一个。
+    assert!(body["session"].is_null());
     // 身份回执：前端据此确认「对面是谁」，也让人一眼看出这一版有没有接线。
     assert_eq!(body["foreman"]["agent_type"], "foreman");
     assert_eq!(body["foreman"]["stage_key"], "foreman");
@@ -4084,6 +4100,188 @@ async fn empty_home_can_converse_through_the_api() {
         .contains("先建一个项目"));
 }
 
+/// 班次四件事（决策 204①）：新建 / 切换 / 重命名 / 归档，全走端点。
+///
+/// 一起测是刻意的——它们是同一条链（新建出来 → 列表里看到 → 改名 → 归档后从列表消失），
+/// 拆成四条会漏掉「新建的那条 id 在后三个操作里还认不认」。
+#[tokio::test]
+async fn foreman_sessions_can_be_created_renamed_and_archived() {
+    let api = api_with_foreman(FakeAgent::new(Script::new())).await;
+
+    // 空 home：列表是空的，不是 404、不是 500。
+    let (status, body) = get(&api, "/foreman/sessions").await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["sessions"].as_array().unwrap().len(), 0);
+
+    // 新建 → 201 + 中性标题（第一句话说出来时才按它命名，决策 204②）。
+    let (status, body) = post(&api, "/foreman/sessions", json!({})).await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+    let first = body["session"]["id"].as_str().unwrap().to_string();
+    assert_eq!(body["session"]["title"], "新班次");
+    assert!(body["session"]["archived_at"].is_null());
+
+    // 再开一个，列表按最近活动倒序（新的在前）。
+    let (_, body) = post(&api, "/foreman/sessions", json!({"title": "第二班"})).await;
+    let second = body["session"]["id"].as_str().unwrap().to_string();
+    assert_eq!(body["session"]["title"], "第二班");
+    let (_, body) = get(&api, "/foreman/sessions").await;
+    let ids: Vec<&str> = body["sessions"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|s| s["id"].as_str().unwrap())
+        .collect();
+    assert_eq!(ids, vec![second.as_str(), first.as_str()]);
+
+    // 改名。
+    let (status, body) = patch(
+        &api,
+        &format!("/foreman/sessions/{first}"),
+        json!({"title": "昨晚那一班"}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["session"]["title"], "昨晚那一班");
+
+    // 切到某个班次去读：`?session=` 认它，且返回的正是它的读数。
+    let (status, body) = get(&api, &format!("/foreman/session?session={first}")).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["session"]["id"], first.as_str());
+    assert_eq!(body["session"]["title"], "昨晚那一班");
+
+    // 归档 → 从列表里收起来（不物理删除）。
+    let (status, body) = post(
+        &api,
+        &format!("/foreman/sessions/{first}/archive"),
+        json!({}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert!(!body["session"]["archived_at"].is_null());
+    let (_, body) = get(&api, "/foreman/sessions").await;
+    let ids: Vec<&str> = body["sessions"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|s| s["id"].as_str().unwrap())
+        .collect();
+    assert_eq!(ids, vec![second.as_str()], "归档的不在列表里");
+    // 按 id 仍取得到它——归档是收起来，不是删掉。
+    let (status, _) = get(&api, &format!("/foreman/session?session={first}")).await;
+    assert_eq!(status, StatusCode::OK);
+
+    // 不存在的班次：404 且报文说得清是哪个。
+    let (status, body) = patch(
+        &api,
+        "/foreman/sessions/no-such-session",
+        json!({"title": "x"}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND, "{body}");
+    assert!(body["error"].as_str().unwrap().contains("no-such-session"));
+
+    // 空标题与超长标题都是 400（标题是 chip 上看得见的东西，不能是空串）。
+    let (status, _) = patch(
+        &api,
+        &format!("/foreman/sessions/{second}"),
+        json!({"title": "   "}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    let too_long = "字".repeat(64);
+    let (status, _) = patch(
+        &api,
+        &format!("/foreman/sessions/{second}"),
+        json!({"title": too_long}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+}
+
+/// 两个班次各说各的：消息与页头合计都按班次读，互不污染（决策 204②⑤）。
+#[tokio::test]
+async fn foreman_sessions_isolate_their_own_messages_and_totals() {
+    let mut script = Script::new();
+    script.for_foreman().text("甲班收到。");
+    script.for_foreman().text("乙班收到。");
+    let api = api_with_foreman(FakeAgent::new(script)).await;
+
+    let (_, body) = post(&api, "/foreman/sessions", json!({"title": "甲班"})).await;
+    let a = body["session"]["id"].as_str().unwrap().to_string();
+    let (_, body) = post(&api, "/foreman/sessions", json!({"title": "乙班"})).await;
+    let b = body["session"]["id"].as_str().unwrap().to_string();
+
+    let (_, body) = post(
+        &api,
+        "/foreman/messages",
+        json!({"text": "甲班的话", "session_id": a}),
+    )
+    .await;
+    assert_eq!(body["session"]["id"], a.as_str());
+    assert!(body["total_tokens"].as_u64().unwrap() > 0);
+
+    let (_, body) = post(
+        &api,
+        "/foreman/messages",
+        json!({"text": "乙班的话", "session_id": b}),
+    )
+    .await;
+    assert_eq!(body["total_calls"], 1, "乙班只说过一轮");
+
+    let (_, in_a) = get(&api, &format!("/foreman/session?session={a}")).await;
+    assert_eq!(in_a["messages"].as_array().unwrap().len(), 2);
+    assert_eq!(in_a["messages"][0]["content"], "甲班的话");
+    let (_, in_b) = get(&api, &format!("/foreman/session?session={b}")).await;
+    assert_eq!(in_b["messages"].as_array().unwrap().len(), 2);
+    assert_eq!(in_b["messages"][0]["content"], "乙班的话");
+
+    // 合计也各有各的：**一个没说过话的第三个班次读出来是 0**——按会话过滤之前，
+    // 这里读到的是「自建库以来的累计值」，这条断言当时必然失败。
+    let (_, body) = post(&api, "/foreman/sessions", json!({})).await;
+    let c = body["session"]["id"].as_str().unwrap().to_string();
+    let (_, in_c) = get(&api, &format!("/foreman/session?session={c}")).await;
+    assert_eq!(in_c["total_tokens"], 0);
+    assert_eq!(in_c["total_calls"], 0);
+    assert!(in_a["total_calls"].as_u64().unwrap() >= 1);
+
+    // 增量事件带会话身份（决策 204⑥）：前端据此把回话归到正确的班次。
+    let mut rx = api.state.sse.subscribe();
+    api.state.sse.publish(SseEvent::ConversationDelta {
+        task_id: String::new(),
+        branch: String::new(),
+        run_id: 0,
+        agent_type: "foreman".into(),
+        session_id: a.clone(),
+        role: "assistant".into(),
+        text: "甲班流式".into(),
+        prompt_tokens: 1,
+        completion_tokens: 1,
+    });
+    match rx.recv().await.unwrap() {
+        SseEvent::ConversationDelta { session_id, .. } => assert_eq!(session_id, a),
+        other => panic!("应是会话增量：{other:?}"),
+    }
+}
+
+/// 往已归档的班次说话被拒（400）——那种记录谁也看不见。
+#[tokio::test]
+async fn foreman_refuses_to_speak_into_an_archived_session() {
+    let api = api_with_foreman(FakeAgent::new(Script::new())).await;
+    let (_, body) = post(&api, "/foreman/sessions", json!({})).await;
+    let sid = body["session"]["id"].as_str().unwrap().to_string();
+    let (status, _) = post(&api, &format!("/foreman/sessions/{sid}/archive"), json!({})).await;
+    assert_eq!(status, StatusCode::OK);
+
+    let (status, body) = post(
+        &api,
+        "/foreman/messages",
+        json!({"text": "喂", "session_id": sid}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    assert!(body["error"].as_str().unwrap().contains("归档"));
+}
+
 /// 未接线时三个端点**一律** 503 而不是 500：服务是好的，是这个能力这次没被接上。
 ///
 /// 三个入口是同一件事的三面——留下一个「能读历史、发不出话」的页面比一句「未接线」
@@ -4104,7 +4302,9 @@ async fn foreman_endpoints_report_503_when_unwired() {
     assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
     // 未接线时不落任何一行会话——拒绝发生在写之前。
     let store = api.state.store.clone();
-    assert!(store.list_foreman_messages(10).await.unwrap().is_empty());
+    assert!(store.list_foreman_sessions().await.unwrap().is_empty());
+    let (status, _) = get(&api, "/foreman/sessions").await;
+    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
 }
 
 /// 空消息被拒且不入账（400，不是 500）。
@@ -4115,6 +4315,7 @@ async fn foreman_rejects_an_empty_message() {
     assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
     let (_, body) = get(&api, "/foreman/session").await;
     assert_eq!(body["messages"].as_array().unwrap().len(), 0);
+    assert!(body["session"].is_null(), "空消息连班次都不该开");
 }
 
 /// 流式端点真的把值班长的增量送到订阅者手上（票 03）。
@@ -4133,6 +4334,7 @@ async fn foreman_stream_carries_conversation_deltas_to_subscribers() {
         branch: String::new(),
         run_id: 0,
         agent_type: "foreman".into(),
+        session_id: "s-1".into(),
         role: "assistant".into(),
         text: "半句话".into(),
         prompt_tokens: 7,
@@ -4144,6 +4346,7 @@ async fn foreman_stream_carries_conversation_deltas_to_subscribers() {
         branch: "main".into(),
         run_id: 42,
         agent_type: "main".into(),
+        session_id: String::new(),
         role: "assistant".into(),
         text: "流水线的话".into(),
         prompt_tokens: 1,
@@ -4186,6 +4389,7 @@ async fn task_stream_never_receives_foreman_events() {
         branch: String::new(),
         run_id: 0,
         agent_type: "foreman".into(),
+        session_id: "s-1".into(),
         role: "assistant".into(),
         text: "值班长说的话".into(),
         prompt_tokens: 1,
@@ -4196,6 +4400,7 @@ async fn task_stream_never_receives_foreman_events() {
         branch: "main".into(),
         run_id: 9,
         agent_type: "main".into(),
+        session_id: String::new(),
         role: "assistant".into(),
         text: "这条任务自己的话".into(),
         prompt_tokens: 1,

@@ -73,6 +73,7 @@ async fn fixture(policy: NetworkPolicy) -> Fixture {
 
     let ctx = ToolCallContext {
         task_id: "t1".into(),
+        session_id: None,
         stage: Stage::Develop,
         node: Node::Execute,
         worktree_path: worktree.clone(),

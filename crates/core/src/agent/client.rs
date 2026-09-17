@@ -232,6 +232,12 @@ pub struct RunContext {
     pub branch: String,
     pub run_id: i64,
     pub agent_type: String,
+    /// 归属会话（决策 204⑥）：只有值班长的增量属于某个班次，流水线运行留空。
+    ///
+    /// 它不是「另一个 task_id」——`task_id` 定位流水线节点，这个定位对讲台里的班次。
+    /// 对讲台需要它是因为**同一台机器上多处可以同时说话**（手机 + 电脑），
+    /// 而回话的增量走的是同一条广播。
+    pub session_id: String,
 }
 
 /// 一次节点调用的请求（节点级独立对话，决策 33）。

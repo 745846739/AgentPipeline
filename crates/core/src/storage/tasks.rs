@@ -5,7 +5,7 @@ use sqlx::FromRow;
 
 use super::{decode_node, decode_pending, decode_stage, encode_pending, parse_ts, ts, Store};
 use crate::pipeline::cursor::{focus_cursor, project_pending_reason, project_task_status};
-use crate::types::{NodeCursor, ReviewMode, Stage, Task, TaskStatus};
+use crate::types::{NodeCursor, PendingKind, ReviewMode, Stage, Task, TaskStatus};
 use crate::{Error, Result};
 
 /// 创建任务的输入。
@@ -217,6 +217,65 @@ impl Store {
             .execute(self.pool())
             .await?;
         Ok(())
+    }
+
+    /// 换模型 + **解除 `context_overflow` 的 pending**（决策 105 / 205，票 04）。
+    ///
+    /// 为什么换模型要顺手解除 pending：`context_overflow` 的动作集里本来就有「更换长上下文模型」
+    /// 这一颗钮（决策 105），而人按下它表达的正是「换一次再试」。此前这个端点只写字段、
+    /// 不清 pending——界面上按下去什么都不变，**给了出口但门没开**。
+    ///
+    /// 两处刻意的取舍：
+    ///
+    /// - **只对 `context_overflow` 解除**。这个端点在任何时候都可被调用，而别的 pending
+    ///   （合入审批 / 人工评审）等的是另一种决定——顺手替人清掉，会让他永远等不到那个决定。
+    /// - **三件事一个事务**：写字段 / 清 pending / 任务回 `queued`（`try_admit` 只认 queued，
+    ///   这是任务重新被调度器接走的前提）。分开做会留下「游标已 active、任务还是 pending」的
+    ///   中间态，而那种状态下没有任何东西会再推它一把。
+    ///
+    /// 返回值是**解除掉的 pending 游标数**（0 = 只是换了模型）。
+    pub async fn apply_model_override(&self, task_id: &str, provider_id: &str) -> Result<usize> {
+        let mut tx = self.begin_write().await?;
+        let now = ts(self.now());
+        sqlx::query("UPDATE kanban_tasks SET model_override = ?, updated_at = ? WHERE id = ?")
+            .bind(provider_id)
+            .bind(&now)
+            .bind(task_id)
+            .execute(&mut *tx)
+            .await?;
+
+        let rows: Vec<(String, Option<String>)> = sqlx::query_as(
+            "SELECT cursor_id, pending_reason_json FROM kanban_node_cursors
+             WHERE task_id = ? AND status = 'pending'",
+        )
+        .bind(task_id)
+        .fetch_all(&mut *tx)
+        .await?;
+        let mut cleared = 0usize;
+        for (cursor_id, reason_json) in rows {
+            let is_overflow = decode_pending(reason_json)?
+                .map(|r| r.kind == PendingKind::ContextOverflow)
+                .unwrap_or(false);
+            if !is_overflow {
+                continue;
+            }
+            self.clear_pending_in_tx(&mut tx, &cursor_id, None).await?;
+            cleared += 1;
+        }
+        if cleared > 0 {
+            // 任务的 pending 是焦点游标的投影，清完要一并刷掉那一列：
+            // 留着它，界面会继续显示一条已经不存在的待办。
+            sqlx::query(
+                "UPDATE kanban_tasks SET status = 'queued', pending_reason_json = NULL,
+                     updated_at = ? WHERE id = ?",
+            )
+            .bind(&now)
+            .bind(task_id)
+            .execute(&mut *tx)
+            .await?;
+        }
+        tx.commit().await?;
+        Ok(cleared)
     }
 
     pub async fn set_task_status(&self, task_id: &str, status: TaskStatus) -> Result<()> {

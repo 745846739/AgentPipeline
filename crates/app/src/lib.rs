@@ -102,10 +102,24 @@ pub fn build_router(state: AppState) -> Router {
         )
         // ── 全局指标 ──
         .route("/metrics", get(routes::tasks::global_metrics))
-        // ── 对讲台（决策 182，票 01 / 03）──
-        // 三个端点全部任务无关、项目无关：值班长在首启空 home 上也要答得上话。
+        // ── 对讲台（决策 182 / 204，票 01 / 03）──
+        // 全部任务无关、项目无关：值班长在首启空 home 上也要答得上话。
         // 这里**没有任何写动作**——它只说话，动手的键仍在任务详情里由后端下发（决策 101）。
+        // 「一条长会话」= 一排班次（决策 204）：会话隔离对话上下文与页头读数，
+        // 不隔离权限、也不隔离态势快照。
         .route("/foreman/session", get(routes::foreman::session))
+        .route(
+            "/foreman/sessions",
+            get(routes::foreman::sessions).post(routes::foreman::create_session),
+        )
+        .route(
+            "/foreman/sessions/{id}",
+            patch(routes::foreman::rename_session),
+        )
+        .route(
+            "/foreman/sessions/{id}/archive",
+            post(routes::foreman::archive_session),
+        )
         .route("/foreman/messages", post(routes::foreman::send))
         .route("/foreman/stream", get(routes::foreman::stream))
         // ── 技能市场（决策 172⑤，票 09）：本地导入 / 目录扫描 / 卸载。全程离线 ──

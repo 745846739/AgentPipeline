@@ -6,8 +6,8 @@ use std::sync::Arc;
 
 use agentpipeline_core::storage::Store;
 use agentpipeline_core::types::{
-    CursorStatus, Node, NodeCursor, PendingContext, PendingKind, PendingReason, ReviewMode, Stage,
-    TaskStatus,
+    CursorStatus, Node, NodeCursor, PendingContext, PendingKind, PendingReason, ResumeCause,
+    ReviewMode, Stage, TaskStatus,
 };
 use testkit::{seed_project, seed_task, seed_task_full, TestHome};
 
@@ -927,25 +927,30 @@ async fn concurrent_writers_do_not_fail_with_busy_snapshot() {
 
 // ─────────────── resume 的一次性标记（决策 180，票 13）───────────────
 
-/// 「刚被 resume」标记：只有真翻过一次 pending 的游标才有，且**取走即清零**。
+/// 「刚被 resume」的原因：只有真翻过一次 pending 的游标才有，且**取走即清零**。
 ///
-/// 回归的是一处 SQL 语义陷阱：SQLite 的 `RETURNING` 报的是**更新之后**的值，
-/// 因此 `UPDATE ... SET resumed_from_pending = 0 ... RETURNING resumed_from_pending`
-/// 永远读到 0——续接会静默失效（探针表现为开了开关却读不到上一轮对话，且无任何报错）。
-/// 把「原本为 1」写进 `WHERE` 后按行是否存在判断，才对得上「取走即清零」的语义。
+/// 两件事一起钉：
+///
+/// - **取走即清零**（决策 180 的一次性语义）。这里回归的是一处 SQL 语义陷阱：SQLite 的
+///   `RETURNING` 报的是**更新之后**的值，因此 `UPDATE ... SET kind = NULL ... RETURNING kind`
+///   永远读到 NULL——续接会静默失效。故改成先读后清，同事务完成（决策 163①）。
+/// - **记的是被清掉的那个原因**（决策 205）。原因表靠它分叉，记错了就是「续不续接」判错。
 #[tokio::test]
-async fn resumed_from_pending_flag_is_one_shot() {
+async fn resume_cause_is_recorded_once_and_only_for_real_pending_exits() {
     let (_home, store, _task) = with_task().await;
     let cursor = store.load_live_cursors("t1").await.unwrap()[0].clone();
 
-    // 没 pending 过：没有标记（对非 pending 游标 clear 是 no-op，不该留下标记）
+    // 没 pending 过：没有原因（对非 pending 游标 clear 是 no-op，不该留下东西）
     store.clear_cursor_pending(&cursor.cursor_id).await.unwrap();
-    assert!(!store
-        .take_cursor_resumed_from_pending(&cursor.cursor_id)
-        .await
-        .unwrap());
+    assert_eq!(
+        store
+            .take_cursor_resume_cause(&cursor.cursor_id)
+            .await
+            .unwrap(),
+        None
+    );
 
-    // 真挂过 pending 再清：第一次取到，第二次清零
+    // 真挂过 pending 再清：第一次取到原因，第二次清零
     let reason = PendingReason::new(
         PendingKind::InfoInsufficient,
         Stage::Init,
@@ -957,12 +962,113 @@ async fn resumed_from_pending_flag_is_one_shot() {
         .await
         .unwrap();
     store.clear_cursor_pending(&cursor.cursor_id).await.unwrap();
-    assert!(store
-        .take_cursor_resumed_from_pending(&cursor.cursor_id)
+    assert_eq!(
+        store
+            .take_cursor_resume_cause(&cursor.cursor_id)
+            .await
+            .unwrap(),
+        Some(ResumeCause::InfoInsufficient),
+        "记的必须是被清掉的那个原因"
+    );
+    assert_eq!(
+        store
+            .take_cursor_resume_cause(&cursor.cursor_id)
+            .await
+            .unwrap(),
+        None
+    );
+
+    // 带 `context.kind` 的原因按组合分类（决策 205 的扁平枚举）
+    let reason = PendingReason::new(
+        PendingKind::UserDecision,
+        Stage::Review,
+        Node::ValidateOutput,
+        "评审不通过",
+    )
+    .with_context(PendingContext::with_kind(
+        agentpipeline_core::actions::kinds::REVIEW,
+    ));
+    store
+        .set_cursor_pending(&cursor.cursor_id, &reason)
         .await
-        .unwrap());
-    assert!(!store
-        .take_cursor_resumed_from_pending(&cursor.cursor_id)
+        .unwrap();
+    store.clear_cursor_pending(&cursor.cursor_id).await.unwrap();
+    assert_eq!(
+        store
+            .take_cursor_resume_cause(&cursor.cursor_id)
+            .await
+            .unwrap(),
+        Some(ResumeCause::Review)
+    );
+}
+
+/// 服务重启**根本不成其为 resume**：`requeue_running_tasks` 只翻任务状态，游标一行不动，
+/// 于是原因列也不会被置上（决策 205 裁决⑤）。
+///
+/// 这条以前靠「flag 没被置」隐式成立——而隐式成立的东西会在某次重构里悄悄变成「没有被置」
+/// 的反面（例如把清 pending 顺手加进重启路径）。写实它，是为了让那次重构在这里现形。
+#[tokio::test]
+async fn restarting_does_not_record_a_resume_cause() {
+    let (_home, store, task) = with_task().await;
+    let cursor = store.load_live_cursors(&task.id).await.unwrap()[0].clone();
+    // 跑到一半被打断：任务 running，游标 active（没有 pending）
+    store
+        .set_task_status(&task.id, TaskStatus::Running)
         .await
-        .unwrap());
+        .unwrap();
+
+    let requeued = store.requeue_running_tasks().await.unwrap();
+    assert_eq!(
+        requeued,
+        vec![task.id.clone()],
+        "重启恢复应把 running 翻回 queued"
+    );
+    assert_eq!(
+        store
+            .take_cursor_resume_cause(&cursor.cursor_id)
+            .await
+            .unwrap(),
+        None,
+        "重启不是人的介入，不该留下续接原因"
+    );
+}
+
+/// 两条绕过 `/resume` 的人为决策也记原因（决策 205 裁决④）。
+///
+/// 「评审驳回 → 打回开发」这条**当初根本没生效**：那两个端点自己写内联 SQL、不置位，
+/// 于是判定表再对也没人问过它。这条用例钉的是「凡是由人按键离开 pending 的都记原因」。
+#[tokio::test]
+async fn human_decisions_record_their_cause_too() {
+    let (_home, store, task) = with_task().await;
+    // 造一个停在人工评审上的任务
+    let cursor = store.load_live_cursors(&task.id).await.unwrap()[0].clone();
+    store
+        .set_cursor_stage(&cursor.cursor_id, Stage::Review, Node::ValidateOutput)
+        .await
+        .unwrap();
+    let reason = PendingReason::new(
+        PendingKind::HumanReview,
+        Stage::Review,
+        Node::ValidateOutput,
+        "等人评审",
+    );
+    store
+        .set_cursor_pending(&cursor.cursor_id, &reason)
+        .await
+        .unwrap();
+
+    // 驳回 → 打回开发：**这一条判定表说 true**
+    let after = store
+        .apply_human_review(&task.id, false, Some("断言太弱"))
+        .await
+        .unwrap();
+    assert_eq!(after.stage, Stage::Develop);
+    assert_eq!(
+        store
+            .take_cursor_resume_cause(&after.cursor_id)
+            .await
+            .unwrap(),
+        Some(ResumeCause::HumanReviewRejected),
+        "驳回必须记成 true 那一档，否则「打回开发」不续接"
+    );
 }

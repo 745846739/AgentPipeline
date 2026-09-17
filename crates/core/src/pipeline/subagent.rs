@@ -208,9 +208,10 @@ impl SubAgentRunner for StoreSubAgentRunner {
                 cfg.settings.clone(),
                 cfg.killer.clone(),
             )
-            .with_allowed_tools(&SUB_AGENT_TOOLS);
+            .with_allowed_tools(SUB_AGENT_TOOLS.to_vec());
             let ctx = ToolCallContext {
                 task_id: cfg.task_id.clone(),
+                session_id: None,
                 stage: cfg.stage,
                 node: cfg.node,
                 worktree_path: cfg.worktree_path.clone(),
@@ -327,6 +328,8 @@ impl StoreSubAgentRunner {
                     branch: self.cfg.branch.clone(),
                     run_id: session.run_id,
                     agent_type: SUB_AGENT_TYPE.to_string(),
+                    // 子代理不是对讲台的一部分：增量归父节点，与班次无关。
+                    session_id: String::new(),
                 }),
             };
             let response = self.cfg.llm.complete(req).await?;

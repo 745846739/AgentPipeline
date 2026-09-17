@@ -639,6 +639,9 @@ GET /tasks/{id}               → 详情页装载 + 断线重连后的全量校�
 | 输入法护栏：回车提交要挡「用回车确认候选词」的那一次 | `frontend/src/lib/enterToSend.ts` | 决策 184 |
 | 工头（值班长）只说话不动手，回复里永远没有按钮 | `frontend/src/routes/Talk.svelte`、`frontend/src/components/task/PendingDossier.svelte` | 决策 176 / 182 |
 | 对讲台急停轮折叠：两张以上一张都不展开；窄屏改「摘要条 + 输入坞」 | `frontend/src/lib/talkStops.ts`、`frontend/src/routes/Talk.svelte` | 决策 183 / 192 |
+| 对讲台的班次 chip 行：非 sticky、不动页头与顶栏，窄屏横滚不折行 | `frontend/src/routes/Talk.svelte` | 决策 204（三条几何约束见 `frontend/e2e/talk.spec.ts` 的 ⑭⑮） |
+| 换班次重置的是对话上下文，看板派生的东西（急停 / 值班板）一样不动 | `frontend/src/routes/Talk.svelte` | 决策 204；`resetSessionState()` 与它旁边那份「不重置」清单 |
+| 值班长的增量按会话身份归位；发送窗口里换了班次则不落地 | `frontend/src/realtime/foreman.ts`、`frontend/src/routes/Talk.svelte` | 决策 204 |
 | 技能市场：仓名单保存即生效；装前预览三项（去向 / 模式与信任态 / 特征扫描） | `frontend/src/routes/SettingsMarket.svelte`、`frontend/src/components/settings/StageRecommendations.svelte` | 决策 187 / 194 / 181 |
 | 未受信任的技能不得以全文模式保存（界面上就地改写信任态） | `frontend/src/components/settings/SkillDeclList.svelte`、`frontend/src/lib/stageConfigs.ts` | 决策 172 / 181 |
 | 「手机访问」取不到配对令牌就不画二维码 | `frontend/src/routes/Share.svelte`、`frontend/src/lib/sharePairing.ts` | 决策 189 |

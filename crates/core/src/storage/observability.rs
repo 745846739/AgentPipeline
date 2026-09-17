@@ -821,8 +821,8 @@ impl Store {
         node: Option<Node>,
     ) -> Result<Vec<NodeCommand>> {
         let mut sql = String::from(
-            "SELECT id, task_id, run_id, stage, node, source, command, cwd, exit_code, stdout_path,
-                    stdout_preview, stderr_preview, duration_ms, started_at, finished_at
+            "SELECT id, task_id, session_id, run_id, stage, node, source, command, cwd, exit_code,
+                    stdout_path, stdout_preview, stderr_preview, duration_ms, started_at, finished_at
              FROM kanban_node_commands WHERE task_id = ?",
         );
         if stage.is_some() {
@@ -843,10 +843,26 @@ impl Store {
         rows.into_iter().map(CommandRow::into_command).collect()
     }
 
+    /// 某个值班会话的命令（决策 204④：值班长的命令没有 task_id，它挂会话）。
+    ///
+    /// 与 [`Store::list_commands`] 是**两条平行的读法**，不是同一个查询的两个过滤项
+    /// ——归属列恰好一个非空，故两者永不重叠。
+    pub async fn list_foreman_commands(&self, session_id: &str) -> Result<Vec<NodeCommand>> {
+        let rows: Vec<CommandRow> = sqlx::query_as(
+            "SELECT id, task_id, session_id, run_id, stage, node, source, command, cwd, exit_code,
+                    stdout_path, stdout_preview, stderr_preview, duration_ms, started_at, finished_at
+             FROM kanban_node_commands WHERE session_id = ? ORDER BY id",
+        )
+        .bind(session_id)
+        .fetch_all(self.pool())
+        .await?;
+        rows.into_iter().map(CommandRow::into_command).collect()
+    }
+
     pub async fn get_command(&self, command_id: i64) -> Result<Option<NodeCommand>> {
         let row: Option<CommandRow> = sqlx::query_as(
-            "SELECT id, task_id, run_id, stage, node, source, command, cwd, exit_code, stdout_path,
-                    stdout_preview, stderr_preview, duration_ms, started_at, finished_at
+            "SELECT id, task_id, session_id, run_id, stage, node, source, command, cwd, exit_code,
+                    stdout_path, stdout_preview, stderr_preview, duration_ms, started_at, finished_at
              FROM kanban_node_commands WHERE id = ?",
         )
         .bind(command_id)
@@ -903,7 +919,8 @@ impl ConversationRow {
 #[derive(Debug, FromRow)]
 struct CommandRow {
     id: i64,
-    task_id: String,
+    task_id: Option<String>,
+    session_id: Option<String>,
     run_id: Option<i64>,
     stage: String,
     node: String,
@@ -924,6 +941,7 @@ impl CommandRow {
         Ok(NodeCommand {
             id: self.id,
             task_id: self.task_id,
+            session_id: self.session_id,
             run_id: self.run_id,
             stage: decode_stage(&self.stage)?,
             node: decode_node(&self.node)?,
@@ -947,14 +965,25 @@ impl CommandRecorder for Store {
     fn record_start(&self, start: CommandStart) -> BoxFuture<'static, Result<i64>> {
         let store = self.clone();
         Box::pin(async move {
+            // 归属归一：空串不是归属，它是「没有」的伪装（迁移 0004:11 的原话
+            // 「不采用哨兵值」）。归一之后由本函数给出人话错误，而不是让 SQLite
+            // 抛一句 `CHECK constraint failed: commands_new`。
+            let task_id = start.task_id.filter(|s| !s.is_empty());
+            let session_id = start.session_id.filter(|s| !s.is_empty());
+            if task_id.is_none() == session_id.is_none() {
+                return Err(crate::Error::Validation(
+                    "命令必须恰好属于一个归属（流水线任务或值班会话）".into(),
+                ));
+            }
             let id: i64 = sqlx::query_scalar(
                 "INSERT INTO kanban_node_commands
-                 (task_id, run_id, stage, node, source, command, cwd, exit_code, stdout_path,
-                  stdout_preview, stderr_preview, duration_ms, started_at, finished_at)
-                 VALUES (?, ?, ?, ?, ?, ?, ?, NULL, NULL, NULL, NULL, NULL, ?, NULL)
+                 (task_id, session_id, run_id, stage, node, source, command, cwd, exit_code,
+                  stdout_path, stdout_preview, stderr_preview, duration_ms, started_at, finished_at)
+                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, NULL, NULL, NULL, NULL, NULL, ?, NULL)
                  RETURNING id",
             )
-            .bind(&start.task_id)
+            .bind(&task_id)
+            .bind(&session_id)
             .bind(start.run_id)
             .bind(start.stage.as_str())
             .bind(start.node.as_str())

@@ -20,6 +20,7 @@ use super::sanitize::sanitize_text;
 use crate::config::{effective_run_command_timeout, Settings};
 use crate::home::Home;
 use crate::process::ProcessKiller;
+use crate::storage::tasks::TaskFilter;
 use crate::storage::Store;
 use crate::types::{CommandSource, Node, Stage};
 use crate::{Error, Result};
@@ -62,7 +63,11 @@ fn trim_conversation_messages(messages: &serde_json::Value) -> Vec<serde_json::V
 /// 命令日志记录的启动信息（§12.4.4）。
 #[derive(Debug, Clone)]
 pub struct CommandStart {
-    pub task_id: String,
+    /// 归属任务。值班长的命令给 `None`，改为挂 [`Self::session_id`]（决策 204④）。
+    /// 空串由存储层归一成 `None`——空串不是归属，它是「没有」的伪装。
+    pub task_id: Option<String>,
+    /// 归属会话（值班长的命令）。流水线命令为 `None`。
+    pub session_id: Option<String>,
     pub run_id: Option<i64>,
     pub stage: Stage,
     pub node: Node,
@@ -125,6 +130,9 @@ pub trait SubAgentRunner: Send + Sync + 'static {
 #[derive(Debug, Clone)]
 pub struct ToolCallContext {
     pub task_id: String,
+    /// 归属会话（值班长的命令挂会话，决策 204④）。流水线节点为 `None`——
+    /// 它不是「另一个称呼的 task_id」，是另一条归属。
+    pub session_id: Option<String>,
     pub stage: Stage,
     pub node: Node,
     pub worktree_path: PathBuf,
@@ -204,7 +212,11 @@ pub struct ToolExecutor {
     /// 这是子代理只读边界的真正落点。只限制「广告出去的 tool 定义」是不够的：
     /// [`Self::execute`] 按 `call.name` 路由，模型完全可以无视 tool 定义直接发一个
     /// `run_command`，那样它就真被跑掉了。故边界必须落在**执行点**。
-    allow: Option<&'static [&'static str]>,
+    ///
+    /// 类型是 `Vec<&'static str>` 而不是 `&'static [&'static str]`：值班长的白名单要能
+    /// **由工具清单生成**（票 01 的「广告集与白名单同源」），而 const 数组做不到按层过滤。
+    /// 名字本身仍是 `'static`，故「白名单是硬编码的，不是运行时可配的」这条性质不变。
+    allow: Option<Vec<&'static str>>,
     /// `run_command` 的出口策略（决策 179，票 12）。
     ///
     /// 构造时从 [`Settings`] 取一次（见 [`Self::new`]），执行点不再读配置——策略与「这次执行
@@ -281,7 +293,7 @@ impl ToolExecutor {
     ///
     /// 与「只少给几个 tool 定义」不同：越界的调用在 [`Self::execute`] 处被拒，模型
     /// 就算硬发也执行不了。子代理的只读边界靠它成立。
-    pub fn with_allowed_tools(mut self, allow: &'static [&'static str]) -> Self {
+    pub fn with_allowed_tools(mut self, allow: Vec<&'static str>) -> Self {
         self.allow = Some(allow);
         self
     }
@@ -335,7 +347,7 @@ impl ToolExecutor {
     /// 白名单（[`Self::with_allowed_tools`]）在**这里**生效——先于任何分发。只靠
     /// tool 定义约束是纸糊的：模型可以无视定义直接发 `run_command`。
     pub async fn execute(&self, call: &ToolCall, ctx: &ToolCallContext) -> Result<ToolOutcome> {
-        if let Some(allow) = self.allow {
+        if let Some(allow) = &self.allow {
             if !allow.contains(&call.name.as_str()) {
                 return Err(Error::Validation(format!(
                     "工具 {} 不在本次调用的允许集内（只读子代理仅允许：{}）",
@@ -358,6 +370,13 @@ impl ToolExecutor {
             // 越权调用在函数开头的白名单检查处就被拒，这里不再重复判定「谁可以调」。
             "read_task" => self.read_task(call).await?,
             "read_conversation" => self.read_conversation(call).await?,
+            // A 层环境读数（决策 188 / 207，票 01）：全部只读，全部走后端既有口径。
+            "read_board" => self.read_board().await?,
+            "read_metrics" => self.read_metrics().await?,
+            "read_projects" => self.read_projects().await?,
+            "read_stage_configs" => self.read_stage_configs().await?,
+            "read_skills" => self.read_skills().await?,
+            "read_providers" => self.read_providers().await?,
             other => return Err(Error::Validation(format!("未知工具：{other}"))),
         };
         self.apply_l2_offload(call, ctx, outcome)
@@ -596,11 +615,7 @@ impl ToolExecutor {
     /// 最常见的失败，`Err` 会被算作工具失败并累计 `tool_retry_max`（决策 33），
     /// 一次笔误就能把整次回话打挂。返回一段说明文本既进上下文又不触发失败计数。
     async fn read_task(&self, call: &ToolCall) -> Result<ToolOutcome> {
-        let Some(store) = &self.ledger else {
-            return Err(Error::Validation(
-                "read_task 不可用：本次调用没有注入台账读句柄".into(),
-            ));
-        };
+        let store = self.ledger_or_err()?;
         let args = Self::args(call)?;
         let task_id = args
             .get("task_id")
@@ -661,16 +676,187 @@ impl ToolExecutor {
         ))
     }
 
+    /// 台账读句柄。六个 A 层读数与两个台账工具共用它（票 01）。
+    ///
+    /// 不注入即不可用——值班长的能力必须来自一个显式注入的只读句柄，
+    /// 而不是继承流水线节点那套（含文件与命令）的上下文。
+    fn ledger_or_err(&self) -> Result<&Store> {
+        self.ledger
+            .as_ref()
+            .ok_or_else(|| Error::Validation("这个工具不可用：本次调用没有注入台账读句柄".into()))
+    }
+
+    /// 一个读数 → 交出去的文本。
+    ///
+    /// 统一收口三件事：不美化（`to_string_pretty` 便于模型读）、**按字符上限截断**
+    /// （这些结果不走 L2 卸载——卸载要写 `home.context_dir(&ctx.task_id)`，而值班长没有
+    /// task_id）、失败不 panic。
+    fn readout(value: serde_json::Value) -> ToolOutcome {
+        let text = match serde_json::to_string_pretty(&value) {
+            Ok(t) => t,
+            Err(e) => format!("读数序列化失败：{e}"),
+        };
+        ToolOutcome::ok(crate::pipeline::foreman::truncate_tool_result(&text))
+    }
+
+    /// `read_board`（票 01）：整块看板——每个任务的状态与当前工位 + 按状态的分组计数。
+    ///
+    /// 口径**与看板端点同源**（同一张任务表、同一组状态字符串），不新造一套读数。
+    /// 与态势快照的分工：快照只装「需要有人管的」（待拍板 / 在跑 / 失败），
+    /// 这里是全量——问「一共多少活」时要看得到已完成与排队。
+    async fn read_board(&self) -> Result<ToolOutcome> {
+        let store = self.ledger_or_err()?;
+        let tasks = store
+            .list_tasks(&TaskFilter {
+                include_archived: false,
+                ..Default::default()
+            })
+            .await?;
+        let mut counts: std::collections::BTreeMap<&str, usize> = std::collections::BTreeMap::new();
+        for t in &tasks {
+            *counts.entry(t.status.as_str()).or_default() += 1;
+        }
+        // 按状态分组列出（组内按 id，保证同一份数据两次调用给出同一个顺序）
+        let mut by_status: std::collections::BTreeMap<&str, Vec<serde_json::Value>> =
+            std::collections::BTreeMap::new();
+        for t in &tasks {
+            by_status
+                .entry(t.status.as_str())
+                .or_default()
+                .push(serde_json::json!({
+                    "task_id": t.id,
+                    "title": t.title,
+                    "stage": t.current_stage.as_str(),
+                    "node": t.current_node.as_str(),
+                    "updated_at": t.updated_at.to_rfc3339(),
+                }));
+        }
+        Ok(Self::readout(serde_json::json!({
+            "counts": counts,
+            "tasks_by_status": by_status,
+        })))
+    }
+
+    /// `read_metrics`（票 01）：全局指标，**复用 `metrics::*` 纯函数口径**（决策 130② / 137）。
+    ///
+    /// 不在这里另写一套 SQL 聚合：那是指标页与端点的契约，两处各写一份必然漂移。
+    async fn read_metrics(&self) -> Result<ToolOutcome> {
+        let store = self.ledger_or_err()?;
+        let tasks = store
+            .list_tasks(&TaskFilter {
+                include_archived: true,
+                ..Default::default()
+            })
+            .await?;
+        let statuses: Vec<crate::types::TaskStatus> = tasks.iter().map(|t| t.status).collect();
+        let runs = store.all_runs().await?;
+        let aggregation = store.stage_aggregation().await?;
+        Ok(Self::readout(serde_json::json!({
+            "tasks": tasks.len(),
+            "success_rate": crate::metrics::success_rate(&statuses),
+            "validate_first_pass_rate": crate::metrics::validate_first_pass_rate(&runs),
+            "total_tokens": crate::metrics::total_tokens(&runs),
+            "total_calls": crate::metrics::total_calls(&runs),
+            // 阶段聚合的既有形状是 `(stage, 平均时长, 重试率, 总次数)`——`GET /metrics`
+            // 与指标页都用这一份口径，故字段名逐字对齐（`avg_duration_ms` / `retry_rate` /
+            // `total_runs`）。**不在这里给它改名换姓**：改过名的读数会让值班长把「平均时长」
+            // 当成 token 数报给值班经理（第一次实现里就是错的）。
+            "stage_aggregation": aggregation.iter().map(|(stage, avg_duration, retry_rate, total)| {
+                serde_json::json!({
+                    "stage": stage,
+                    "avg_duration_ms": avg_duration,
+                    "retry_rate": retry_rate,
+                    "total_runs": total,
+                })
+            }).collect::<Vec<_>>(),
+        })))
+    }
+
+    /// `read_projects`（票 01）：已接入的项目清单。
+    async fn read_projects(&self) -> Result<ToolOutcome> {
+        let store = self.ledger_or_err()?;
+        let projects = store.list_projects().await?;
+        Ok(Self::readout(serde_json::json!({
+            "projects": projects.iter().map(|p| serde_json::json!({
+                "project_id": p.id,
+                "name": p.name,
+                "local_path": p.local_path,
+                "default_branch": p.default_branch,
+                "language": p.language,
+                "test_framework": p.test_framework,
+                "lint_command": p.lint_command,
+            })).collect::<Vec<_>>(),
+        })))
+    }
+
+    /// `read_stage_configs`（票 01）：各阶段的配置。
+    ///
+    /// 原样交出去（含 `persona_path` / 技能声明）：这些是配置读数，不是秘密；
+    /// 而选一个字段藏起来，模型就会开始猜「为什么这个工位是这样」。
+    async fn read_stage_configs(&self) -> Result<ToolOutcome> {
+        let store = self.ledger_or_err()?;
+        let configs = store.list_stage_configs().await?;
+        Ok(Self::readout(serde_json::json!({
+            "stage_configs": configs.iter().map(|c| serde_json::json!({
+                "stage": c.stage,
+                "provider_id": c.provider_id,
+                "temperature": c.temperature,
+                "max_tokens": c.max_tokens,
+                "persona_path": c.persona_path,
+                "skills_json": c.skills_json,
+                "idle_timeout_sec": c.idle_timeout_sec,
+                "max_duration_sec": c.max_duration_sec,
+            })).collect::<Vec<_>>(),
+        })))
+    }
+
+    /// `read_skills`（票 01）：技能根下可用的技能 + 被谁引用。
+    ///
+    /// 与 `GET /skills` 同源（同一个 `discover`），不另走一条发现逻辑。
+    async fn read_skills(&self) -> Result<ToolOutcome> {
+        let store = self.ledger_or_err()?;
+        let configs = store.list_stage_configs().await?;
+        let skills = crate::agent::skills::discover(&self.home.skills_dir());
+        Ok(Self::readout(serde_json::json!({
+            "skills": skills.iter().map(|s| serde_json::json!({
+                "name": s.name,
+                "description": s.frontmatter.description,
+                "path": s.path.display().to_string(),
+                "declared_in": crate::config::declared_skill_where(&configs, &s.name),
+            })).collect::<Vec<_>>(),
+        })))
+    }
+
+    /// `read_providers`（票 01）：provider 清单，**密钥只回显掩码**（决策 112）。
+    ///
+    /// 库里存的是明文，故这里走**既有的**掩码读法 `list_providers_masked()`
+    /// （provider 端点读的也是它），不是在这里另写一个正则。
+    async fn read_providers(&self) -> Result<ToolOutcome> {
+        let store = self.ledger_or_err()?;
+        // `list_providers_masked` 是**既有的**那一份掩码读法（provider 端点也走它）：
+        // 库里存的是明文密钥（决策 112），而「这个 provider 配没配密钥」值班长该知道，
+        // 密钥本身对它没有用处。
+        let providers = store.list_providers_masked().await?;
+        Ok(Self::readout(serde_json::json!({
+            "providers": providers.iter().map(|p| serde_json::json!({
+                "provider_id": p.id,
+                "vendor": p.vendor,
+                "model": p.model,
+                "enabled": p.enabled,
+                "context_window": p.context_window,
+                "base_url": p.base_url,
+                // 已是掩码（上面的 `list_providers_masked`），不是原文。
+                "api_key": p.api_key,
+            })).collect::<Vec<_>>(),
+        })))
+    }
+
     /// `read_conversation`（决策 182⑭，票 02）：读某次节点运行的会话回执。
     ///
     /// `run_id` 缺省取该任务**最近一次**会话——人是按「那个货箱卡哪儿了」提问的，
     /// 不是按运行 id；让模型非要先查 run 列表才能问，等于把台账的内部编号变成使用门槛。
     async fn read_conversation(&self, call: &ToolCall) -> Result<ToolOutcome> {
-        let Some(store) = &self.ledger else {
-            return Err(Error::Validation(
-                "read_conversation 不可用：本次调用没有注入台账读句柄".into(),
-            ));
-        };
+        let store = self.ledger_or_err()?;
         let args = Self::args(call)?;
         let task_id = args
             .get("task_id")
@@ -869,7 +1055,8 @@ impl ToolExecutor {
         };
         Ok(Some(
             rec.record_start(CommandStart {
-                task_id: ctx.task_id.clone(),
+                task_id: Some(ctx.task_id.clone()),
+                session_id: ctx.session_id.clone(),
                 run_id: ctx.run_id,
                 stage: ctx.stage,
                 node: ctx.node,
@@ -1114,6 +1301,7 @@ mod tests {
         );
         let ctx = ToolCallContext {
             task_id: "t1".into(),
+            session_id: None,
             stage,
             node: Node::Execute,
             worktree_path: worktree.clone(),

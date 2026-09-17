@@ -174,14 +174,6 @@
       <input class="input mono" type="number" min="0" bind:value={draft.max_duration_sec} />
     </label>
 
-    <label class="field wide check">
-      <input type="checkbox" bind:checked={draft.resume_continuation} />
-      <span>
-        续接上一轮对话（resume_continuation）：pending → resume 重入时读回上一 attempt 的
-        messages。默认关闭——每次尝试干净对话。
-      </span>
-    </label>
-
     <label class="field wide">
       <span>node_overrides_json</span>
       <textarea
@@ -278,15 +270,6 @@
   }
   .node {
     margin-bottom: 8px;
-  }
-  .check {
-    display: flex;
-    align-items: flex-start;
-    gap: 8px;
-  }
-  .check > span {
-    margin-bottom: 0;
-    line-height: 1.6;
   }
 
   @media (max-width: 479px) {

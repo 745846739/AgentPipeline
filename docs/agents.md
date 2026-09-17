@@ -826,12 +826,8 @@ interface StageAgentConfig {
       idle_timeout_sec?: number;   // 覆盖全局 node_idle_timeout_sec（决策 66）
       max_duration_sec?: number;   // 覆盖全局 node_max_duration_sec
       skills?: SkillDecl[];        // 该节点专属技能（与阶段级取并集，决策 170；形态同上）
-      resume_continuation?: boolean; // 覆盖阶段级续接开关（决策 180）
     };
   };
-
-  // ── 会话续接（决策 180，票 13）──
-  resume_continuation?: boolean;   // pending → resume 时续接上一 attempt 的对话；默认 false
 }
 
 // 技能声明：裸字符串 = { name, mode: "full", trusted: false }（旧配置行零迁移）
@@ -849,7 +845,7 @@ type SkillDecl = string | { name: string; mode: "full" | "name"; trusted?: boole
 | persona | 阶段 prompt + 基线强制前言 | 必须存在且非空 |
 | tools | `基线 mandatory_tools ∪ 阶段 tools − forbidden_tools`；节点存在名字态 / 目录态技能时自动并入 `Skill`（决策 172③，否则那批技能是断腿的指针）。扩展工具 `spawn_sub_agent` 只由阶段声明启用，**且其子代理的工具集固定只读、不继承此处并集**（票 08 的安全边界） | 不能移除 mandatory_tools |
 | skills | `基线 mandatory_skills ∪ 阶段 skills ∪ 节点级 skills`（决策 170，只增不减）；同名技能的 `mode` / `trusted` 由更具体的一层决定（节点级覆盖阶段级） | 不能移除 mandatory_skills；引用的 skill 名字必须存在，否则 fail fast；知识型技能的**正文必须存在且非空**，否则 fail fast（与 `persona_path` 同口径）；**未受信任的技能不得以 `full` 保存**（决策 172④）——写入与启动两侧都拒绝，须显式确认信任或改用 `name`。这道门**只对显式对象生效**：裸字符串是信任概念出现之前手写的配置行，一视同仁会使既有配置全部失效（零迁移） |
-| resume_continuation | 节点级 > 阶段级 > **关**（决策 180；照 `idle_timeout_sec` 的分层） | 无——它是一个开关，不改任何既有校验 |
+| 会话续接 | **不由配置决定**（决策 205）：pending → resume 时续不续接上一 attempt 的对话，由**被清掉的那个 pending 原因**查代码里的判定表（`types.rs::resume_continues`）。阶段级 / 节点级开关已整层退场 | 无——它不是配置项。自动重试（`validate_attempts` 原地重试 / `agent_retry_max` 干净重试 / 未耗尽的超时）**一律不续接**（决策 33 不变） |
 
 **工具层出口策略（决策 179，票 12）**——`run_command` 的网络出口按 allowlist 放行，**默认只放行回环**（`[pipeline] egress_allow_hosts` / `egress_allow_all`，见 §10.6.5）。它受 `Settings` 控制并经 `ToolExecutor` 的执行点强制，与 §10.6.2 的 `file_tool_policy` 是同构的两件事：**都只约束工具层，都不是系统级沙箱**。被拒的调用落 `kanban_node_commands`（与放行的命令同表）并返回可归因的 `PolicyDenied` 报文。残余风险与 OS 级沙箱候选见 `docs/operations.md` §12.15。
 

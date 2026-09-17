@@ -771,3 +771,143 @@ test.describe('对讲台 · 输入法回车不发送（决策 184）', () => {
     expectBundleHealthy(bundle);
   });
 });
+
+/**
+ * 对讲台 · 班次（决策 204）。
+ *
+ * 一条长会话改成一排可以新建 / 切换 / 重命名 / 归档的班次。这一组要钉的是**边界**：
+ *
+ * - 班次 chip 行**不是第三件钉住物**（决策 192 的窄屏只有两件）也不在页头里（`.talk-head`
+ *   在 `row auto` 上，涨的 px 直接吃对话区）——故两条断言：不 sticky、对话区几何不变；
+ * - **换会话 ≠ 换看板**：切班次重置的是这一屏读到的台账，状态区的急停（派生自全局看板）
+ *   一个字都不该动；
+ * - 归档后**自动**切到最近有说话的班次，不是把善后留给使用者。
+ */
+test.describe('对讲台 · 班次（决策 204）', () => {
+  let app: App;
+  const title = 'E2E 班次';
+
+  test.beforeAll(async () => {
+    app = await startApp({
+      script: {
+        ...fullPassScript('E2E'),
+        ...foremanScript(Array.from({ length: 8 }, () => [text('夜班安静，没有待办。')])),
+      },
+      title,
+    });
+    // 状态区得有一张真的急停，才能证明「切班次不动看板」
+    await waitForTask(app, (t) => pendingTypeOf(t) === 'merge_approval', 'merge_approval', 180_000);
+  });
+
+  test.afterAll(async () => {
+    await app?.stop();
+  });
+
+  test('新建 / 切换 / 重命名 / 归档，且换会话不动看板', async ({ page }) => {
+    const bundle = watchBundle(page);
+    await page.goto(`${app.webBase}/#/talk`);
+    await settleBundle(page, bundle);
+
+    const row = page.locator('.timeline .runrow');
+    await expect(row).toBeVisible();
+
+    // ① 首启一个班次都没有：chip 行只有「+ 新班次」那一颗，没有改名 / 归档（还没有当前班）
+    const chips = row.locator('.runchip:not(.plus):not(.act)');
+    await expect(chips).toHaveCount(0);
+    await expect(row.locator('.runchip.plus')).toHaveText('+ 新班次');
+    await expect(row.locator('.runchip.act')).toHaveCount(0);
+
+    // ② **非 sticky**：它随手指滚，不是第三件钉住物（决策 192 的窄屏只有两件）
+    await expect(row).toHaveCSS('position', 'static');
+    // 也**不在页头里**：页头高度不因它变（那只会在 `row auto` 上吃掉对话区）
+    await expect(page.locator('.talk-head .runrow')).toHaveCount(0);
+
+    // ③ 空态：没有班次时也照样能说话——第一次说话会开一个班次（服务端兜底）
+    const input = page.locator('.typer textarea');
+    await input.fill('第一班的问题');
+    await page.getByRole('button', { name: /发送/ }).click();
+    await expect(page.locator('.timeline .turn.fm').first()).toContainText('夜班安静', {
+      timeout: 30_000,
+    });
+
+    // ④ 新班次出现了，标题取自第一句话（决策 204②）；改名 / 归档随之出现在有当前班次时
+    await expect(chips).toHaveCount(1);
+    await expect(row.locator('.runchip.act')).toHaveCount(2);
+    const firstChip = chips.first();
+    await expect(firstChip).toHaveText('第一班的问题');
+    await expect(firstChip).toHaveClass(/now/);
+
+    // ⑤ 换会话 ≠ 换看板：状态区的急停（派生自全局看板）一个字都不动
+    const stopText = await page.locator('.zone-status .turn.warn').first().innerText();
+
+    // ⑥ 新建一个班次：切过去、时间线回到空态、急停仍在
+    await row.locator('.runchip.plus').click();
+    await expect(chips).toHaveCount(2);
+    await expect(page.locator('.timeline .turn')).toHaveCount(0);
+    await expect(row.locator('.runchip.now')).toContainText('新班次');
+    await expect(page.locator('.zone-status .turn.warn').first()).toHaveText(stopText);
+
+    // ⑦ 切回第一班：它的对话回来了（上下文按班次隔离）
+    await row.locator('.runchip', { hasText: '第一班的问题' }).click();
+    await expect(
+      page.locator('.timeline .turn.mine', { hasText: '第一班的问题' }),
+    ).toHaveCount(1);
+    await expect(page.locator('.timeline .turn.fm').first()).toContainText('夜班安静');
+
+    // ⑧ 重命名走 Modal（决策 204③）
+    await row.locator('.runchip.act', { hasText: '改名' }).click();
+    const dialog = page.getByRole('dialog');
+    await expect(dialog).toBeVisible();
+    await dialog.locator('input[type="text"]').fill('周三夜班');
+    await dialog.getByRole('button', { name: '改名' }).click();
+    await expect(dialog).toBeHidden();
+    await expect(row.locator('.runchip.now')).toHaveText('周三夜班');
+
+    // ⑨ 归档：从列表里收起来，并**自动切到最近有说话的班次**（不是留一个不在列表里的当前班）
+    await row.locator('.runchip.act', { hasText: '归档' }).click();
+    const archiveDialog = page.getByRole('dialog');
+    await expect(archiveDialog).toBeVisible();
+    await archiveDialog.getByRole('button', { name: '归档' }).click();
+    await expect(archiveDialog).toBeHidden();
+    await expect(row.locator('.runchip', { hasText: '周三夜班' })).toHaveCount(0);
+    // 剩下的那一班里应该就看得到它自己的空态（它是空班次），且当前班次是它
+    await expect(row.locator('.runchip.now')).toHaveText('新班次');
+    await expect(page.locator('.zone-status .turn.warn').first()).toHaveText(stopText);
+
+    expectBundleHealthy(bundle);
+  });
+
+  test('窄屏：chip 行横滚而不折行，对话区几何不被它吃掉', async ({ page }) => {
+    const bundle = watchBundle(page);
+    await page.setViewportSize({ width: 430, height: 900 });
+
+    // 造够班次让 chip 行真的溢出（窄屏上三四个就够）
+    for (const t of ['夜班甲', '夜班乙', '夜班丙']) {
+      const res = await fetch(`${app.apiBase}/foreman/sessions`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json', 'x-agentpipeline': '1' },
+        body: JSON.stringify({ title: t }),
+      });
+      expect(res.ok).toBeTruthy();
+    }
+
+    await page.goto(`${app.webBase}/#/talk`);
+    await settleBundle(page, bundle);
+
+    const row = page.locator('.timeline .runrow');
+    await expect(row.locator('.runchip').first()).toBeVisible();
+    // 不折行 + 横向滚（与任务详情页的 `.runrow` 同一形状）：430px 上折行会占掉两三行，
+    // 而这一档的纵向空间是「两条钉住物之间的残渣」，不能喂给一排控件
+    await expect(row).toHaveCSS('flex-wrap', 'nowrap');
+    await expect(row).toHaveCSS('overflow-x', 'auto');
+    const overflow = await row.evaluate((el) => el.scrollWidth - el.clientWidth);
+    expect(overflow, 'chip 行在窄屏没有横滚余地（班次不够多？）').toBeGreaterThan(0);
+
+    // **对话区仍是「整块屏幕减去两条钉住物」**（决策 192 的那条几何断言没有被 chip 行吃掉）：
+    // chip 行长在会滚的时间线**里面**，故时间线自己的盒子一点没变。
+    const timelineBox = await page.locator('.timeline').boundingBox();
+    expect(timelineBox?.height ?? 0).toBeGreaterThanOrEqual(320);
+
+    expectBundleHealthy(bundle);
+  });
+});

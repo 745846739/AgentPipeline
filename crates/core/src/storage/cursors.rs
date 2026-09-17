@@ -7,7 +7,9 @@ use chrono::{DateTime, Utc};
 use sqlx::FromRow;
 
 use super::{decode_node, decode_pending, decode_stage, encode_pending, parse_ts, ts, Store};
-use crate::types::{CursorStatus, Node, NodeCursor, PendingKind, PendingReason, Stage};
+use crate::types::{
+    CursorStatus, Node, NodeCursor, PendingKind, PendingReason, ResumeCause, Stage,
+};
 use crate::{Error, Result};
 
 #[derive(Debug, FromRow)]
@@ -350,44 +352,117 @@ impl Store {
 
     /// 清 pending 并恢复为 active（不改变 stage / node）。
     ///
-    /// 同时置 `resumed_from_pending = 1`（决策 180，票 13）：这是**唯一**的 resume 落点，
-    /// 而「续接上一轮对话」只在该边界成立（不作用于 `agent_retry_max` 的干净重试）。
-    /// `WHERE ... status = 'pending'` 让这个标记只在**确实**翻过一次 pending 时落下——
-    /// 对非 pending 游标调用本方法是 no-op，不该留下标记。
+    /// **全仓唯一的 resume 落点**（决策 180，票 13；决策 205 起还负责记**原因**）：
+    /// 「续接上一轮对话」只在该边界成立，不作用于 `agent_retry_max` 的干净重试。
+    /// 凡是由人按键（或由调度器自动放行）离开 pending 的都走这里，于是
+    /// 「离开 pending 时手里握着哪个原因」这件事只有一处被记录。
+    ///
+    /// 非 pending 游标是 no-op（不该留下标记、更不该记一个不存在的原因）。
     pub async fn clear_cursor_pending(&self, cursor_id: &str) -> Result<()> {
+        let mut tx = self.begin_write().await?;
+        self.clear_pending_in_tx(&mut tx, cursor_id, None).await?;
+        tx.commit().await?;
+        Ok(())
+    }
+
+    /// 清 pending 的**共同实现**（决策 205：唯一规则落在这里）。
+    ///
+    /// 三处调用：本文件的 [`Store::clear_cursor_pending`]、`decisions.rs` 的
+    /// `apply_merge_decision` / `apply_human_review`。后两处为什么不直接调
+    /// `clear_cursor_pending`：它们还要**同事务**改写 stage / node（人工决策会换落点），
+    /// 分成两个事务会留下一个「已 active、落点还是旧的」的窗口——执行器正好可能在那个
+    /// 窗口里捡起这条游标，去跑一个错的节点。
+    ///
+    /// **只清 pending，不改落点**：落点在调用方那一条 UPDATE 里改。两者的判据不同——
+    /// 改落点是无条件的（人工决策总是要换地方），清 pending 只在它确实卡着时才有意义；
+    /// 合并成一条 SQL 会让「对一条 active 的游标提交决策」这种既有用法静默失效
+    /// （`human_review_routes_to_test_or_develop` 打红即此）。
+    ///
+    /// `explicit`：由「人按了哪颗键」决定的原因。merge 与 review 的通过与驳回在
+    /// pending 原因上同名（都是 `merge_approval` / `human_review`），只有端点知道按的是
+    /// 哪一颗，故这两条路显式给值；其余情况给 `None`，按被清掉的那个原因分类。
+    ///
+    /// 读-写两步，故必须跑在 `BEGIN IMMEDIATE` 的事务里（决策 163①）。
+    pub(crate) async fn clear_pending_in_tx(
+        &self,
+        tx: &mut sqlx::SqliteConnection,
+        cursor_id: &str,
+        explicit: Option<ResumeCause>,
+    ) -> Result<()> {
+        let row: Option<(String, Option<String>)> = sqlx::query_as(
+            "SELECT status, pending_reason_json FROM kanban_node_cursors WHERE cursor_id = ?",
+        )
+        .bind(cursor_id)
+        .fetch_optional(&mut *tx)
+        .await?;
+        let Some((status, reason_json)) = row else {
+            return Ok(()); // 游标不存在：与「不是 pending」同样处置（no-op）
+        };
+        if status != "pending" {
+            return Ok(());
+        }
+        // 原因：显式给的优先（merge / review 那两条），否则由被清掉的原因分类。
+        // 读不出原因时记 `unknown`——判定表把它放在 false 那一档，退回干净起跑。
+        let cause = explicit.unwrap_or_else(|| {
+            decode_pending(reason_json)
+                .ok()
+                .flatten()
+                .map(|r| {
+                    ResumeCause::classify(
+                        r.kind,
+                        r.context.as_ref().and_then(|c| c.kind.as_deref()),
+                    )
+                })
+                .unwrap_or(ResumeCause::Unknown)
+        });
         sqlx::query(
             "UPDATE kanban_node_cursors
-             SET status = 'active', pending_reason_json = NULL, resumed_from_pending = 1,
+             SET status = 'active', pending_reason_json = NULL, resumed_from_pending_kind = ?,
                  updated_at = ?
              WHERE cursor_id = ? AND status = 'pending'",
         )
+        .bind(cause.as_str())
         .bind(ts(self.now()))
         .bind(cursor_id)
-        .execute(self.pool())
+        .execute(&mut *tx)
         .await?;
         Ok(())
     }
 
-    /// 取走并清零游标的「刚被 resume」标记（决策 180，票 13）。
+    /// 取走并清零游标的「刚被 resume」原因（决策 180 的一次性标记 + 决策 205 的原因列）。
     ///
-    /// 一次性：读与清在同一条 UPDATE 里完成，避免「读了没清」导致下一次 attempt 又续接一遍。
+    /// 一次性：读与清在同一条事务里完成，避免「读了没清」导致下一次 attempt 又续接一遍。
     /// 清零是必要的——标记留着会让**后续每一次**进入该节点都试图续接，包括正常的向前推进
     /// 与回溯重入。
     ///
-    /// 返回值取自**行是否存在**而不是列值：SQLite 的 `RETURNING` 报的是**更新之后**的值
-    /// （`UPDATE t SET x = 0 ... RETURNING x` 恒为 0，与 PostgreSQL 一致），所以
-    /// `RETURNING resumed_from_pending` 永远读不到 1——续接会静默失效。改成把「标记原本为 1」
-    /// 写进 `WHERE`，命中一行即命中过标记。
-    pub async fn take_cursor_resumed_from_pending(&self, cursor_id: &str) -> Result<bool> {
-        let hit: Option<String> = sqlx::query_scalar(
-            "UPDATE kanban_node_cursors SET resumed_from_pending = 0
-             WHERE cursor_id = ? AND resumed_from_pending = 1
-             RETURNING cursor_id",
+    /// **不用 `UPDATE ... RETURNING`**：SQLite 的 `RETURNING` 报的是**更新之后**的值
+    /// （`UPDATE t SET x = NULL ... RETURNING x` 恒为 NULL，与 PostgreSQL 一致），
+    /// 读不到被清掉的那个值。故先读后清，两步放在一个写事务里（决策 163①）。
+    pub async fn take_cursor_resume_cause(&self, cursor_id: &str) -> Result<Option<ResumeCause>> {
+        let mut tx = self.begin_write().await?;
+        let raw: Option<Option<String>> = sqlx::query_scalar(
+            "SELECT resumed_from_pending_kind FROM kanban_node_cursors WHERE cursor_id = ?",
         )
         .bind(cursor_id)
-        .fetch_optional(self.pool())
+        .fetch_optional(&mut *tx)
         .await?;
-        Ok(hit.is_some())
+        let Some(Some(raw)) = raw else {
+            tx.commit().await?;
+            return Ok(None);
+        };
+        // 只清「我们读到的那一个值」：万一有人在这中间又置了一次，那条不该被我们抹掉。
+        sqlx::query(
+            "UPDATE kanban_node_cursors SET resumed_from_pending_kind = NULL
+             WHERE cursor_id = ? AND resumed_from_pending_kind = ?",
+        )
+        .bind(cursor_id)
+        .bind(&raw)
+        .execute(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        Ok(Some(
+            ResumeCause::parse(&raw).unwrap_or(ResumeCause::Unknown),
+        ))
     }
 
     /// 并行分支 skip：置 `waiting_join` + `skipped_to_join = 1`（决策 93），

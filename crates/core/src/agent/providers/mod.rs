@@ -397,6 +397,7 @@ impl ProductionLlm {
             branch: run.branch.clone(),
             run_id: run.run_id,
             agent_type: run.agent_type.clone(),
+            session_id: run.session_id.clone(),
             role: "assistant".into(),
             text: text.to_string(),
             prompt_tokens: prompt,
