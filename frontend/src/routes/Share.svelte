@@ -12,7 +12,7 @@
   import type { ServerAddress, ServerInfo } from '../api/types';
   import EmptyState from '../components/ui/EmptyState.svelte';
   import { changeLanMode } from '../lib/lanToggle';
-  import { sharePanel } from '../lib/sharePairing';
+  import { portFallbackNote, sharePanel } from '../lib/sharePairing';
 
   /**
    * 局域网分享页（决策 167 / 186 / 189）：手机扫码接入。
@@ -72,6 +72,11 @@
   );
   /** 有了它才画码（决策 189）：`null` = 这一页拿不到令牌，改画「去哪台机器上打开」的指引。 */
   const qrTarget = $derived(panel.kind === 'paired-qr' ? panel.target : null);
+  /**
+   * 端口退让要说的话（决策 213）：后端没绑上固定端口（被别的程序占着）时才非空。
+   * 不说出来，使用者就只看到一张打不开的手机书签——判定住在 `lib/sharePairing.ts`。
+   */
+  const portNote = $derived(portFallbackNote(info));
 
   /**
    * 取一次配对令牌，并**把失败分档**：403 是「这一页不是从本机打开的」（这条护栏本身，
@@ -181,6 +186,12 @@
   {:else if error}
     <div class="banner error">{error}</div>
   {:else if info}
+    <!-- 端口退让的说明（决策 213）：不说出来，手机上那张打不开的书签就查不到原因。
+         只绑回环时不说（`portFallbackNote` 里判掉）——那时手机本来就连不上，端口是多少
+         与使用者的下一步（先按那颗钮）无关。 -->
+    {#if portNote}
+      <p class="note">{portNote}</p>
+    {/if}
     {#if info.loopback_only}
       <section class="gate">
         <!-- 空态（票 13）+ 琥珀收敛（票 12）：这一块是「现在什么也拿不到 + 下一步按哪颗钮」，

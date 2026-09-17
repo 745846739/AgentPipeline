@@ -49,3 +49,20 @@ export function sharePanel(input: {
   const base = input.selected ?? input.addresses[0]?.url ?? '';
   return { kind: 'paired-qr', target: pairedUrl(base, input.token) };
 }
+
+/**
+ * 退让端口要说的话（决策 213），不说则 `null`。
+ *
+ * 后端只在**首选端口被别的进程占着**时退让到内核随机端口（`/server-info.port_source`
+ * = `fallback`）——那正是「手机上存过的地址这次打不开」的原因，而它在界面上原本没有任何
+ * 痕迹（日志在桌面应用里看不到）。故这里给一句能对上号的话：**说清发生了什么 + 下一步做什么**。
+ *
+ * 只绑回环时不说话：那时手机本来就连不上，端口是多少与使用者的下一步动作（先按那颗钮）
+ * 无关，多说一句只是噪音。
+ */
+export function portFallbackNote(
+  info: Pick<ServerInfo, 'port_source' | 'port' | 'loopback_only'> | null,
+): string | null {
+  if (!info || info.loopback_only || info.port_source !== 'fallback') return null;
+  return `这次没能绑上固定的端口（被别的程序占着），当前用的是临时端口 ${info.port}——手机上存过的网址这次要重新扫一次。`;
+}

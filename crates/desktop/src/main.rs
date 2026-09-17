@@ -1,8 +1,13 @@
 //! 桌面壳入口（决策 153 / 156 / 167）：Tauri 只当外壳与窗口管理，传输层零改动。
 //!
 //! 壳只做三件事：
-//! 1. 起服——复用 `app::serve(ServeOptions::default())`（决策 153⑤ / 157），
-//!    `port_override = Some(0)` 内核分配随机端口；
+//! 1. 起服——复用 `app::serve(ServeOptions)`（决策 153⑤ / 157），
+//!    **端口不指定**（决策 213）：回落 `[server] port`（缺省 8788）。此前这里是
+//!    `port_override = Some(0)`，于是每次重启换一个临时端口，手机扫码存下的网址
+//!    下次启动就失效——而令牌（决策 182㉖㉗㉘）、界面上的绑定选择（决策 186）都是
+//!    跨重启有效的，端口是唯一每开一次就变的东西。真被别的进程占着时**退让**到内核
+//!    随机端口（`port_fallback_to_ephemeral`）而不是拒绝开窗，退让这件事会上报到
+//!    `/server-info` 的 `port_source`，由分享页讲给使用者听；
 //! 2. 开窗——导航到 `http://127.0.0.1:{port}` 同源 origin（零 CORS，决策 153⑤
 //!    首选路线），不启用 Tauri IPC / asset 协议，前端感知不到部署形态；
 //! 3. 停机——窗口关闭 → `RunEvent::Exit` → shutdown watch channel 广播（决策 54），
@@ -40,7 +45,10 @@ fn main() {
     // serve 失败直接退出——桌面壳没有比后端更早成功的道理。
     // 窗口地址恒为本机回环：绑 0.0.0.0 时回环仍是同一服务的入口。
     let handle = tauri::async_runtime::block_on(app::serve::serve(ServeOptions {
-        port_override: Some(0),
+        // 不指定端口（决策 213）：用 `[server] port`（缺省 8788），重启后手机上的书签仍有效。
+        port_override: None,
+        // 真被占用时退让到随机端口而不是打不开窗；退让会上报，分享页据此说明。
+        port_fallback_to_ephemeral: true,
         host_override: host,
         ..ServeOptions::default()
     }))

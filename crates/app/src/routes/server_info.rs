@@ -4,7 +4,8 @@
 //! 四个端点：
 //! - `GET /server-info`：JSON，含绑定 host / 端口 / 候选局域网地址 / 当前是否
 //!   仅回环绑定（决定分享页是否该提示「需要绑定 0.0.0.0」）/ **这个 host 是谁定的**
-//!   （启动参数 / 界面设置 / 配置文件，决策 186）；
+//!   （启动参数 / 界面设置 / 配置文件，决策 186）/ **这个端口是谁给的**（决策 213：
+//!   `fallback` = 首选端口被占、退让到了内核随机端口，手机上的旧书签会因此失效）；
 //! - `GET /server-info/qr.svg`：把指定 URL 渲染成 SVG 二维码，供分享页 `<img>`
 //!   直接引用——前端不必引入 QR 库，也不用把二维码画进 canvas；
 //! - `POST /server/lan`（决策 186）：**界面上的那颗钮**——把绑定切成全网卡或只回环，
@@ -39,6 +40,11 @@ pub struct ServerInfo {
     pub loopback_only: bool,
     /// `host` 是谁定的（`startup` / `settings` / `config`，决策 186）。
     pub bind_source: String,
+    /// 端口是谁给的（`startup` / `config` / `fallback`，决策 213）。
+    ///
+    /// `fallback` 是唯一需要界面出声的一档：首选端口被别的进程占着，这个端口是内核
+    /// 临时给的，**重启后会变**——手机上存过的地址这次就是打不开的原因。
+    pub port_source: String,
     /// 候选局域网地址，已按推荐度排序（`lan::rank_ipv4`）。
     pub addresses: Vec<AddressEntry>,
 }
@@ -69,6 +75,7 @@ fn server_info(state: &AppState) -> ServerInfo {
     ServerInfo {
         loopback_only: is_loopback_bind(&host),
         bind_source: state.bind_source().as_str().to_string(),
+        port_source: state.port_source().as_str().to_string(),
         host,
         port: state.port,
         addresses: build_addresses(&lan::lan_addresses(), state.port),
@@ -471,6 +478,7 @@ mod tests {
             port: 8787,
             loopback_only: false,
             bind_source: "settings".into(),
+            port_source: "fallback".into(),
             addresses: vec![AddressEntry {
                 interface: "en0".into(),
                 url: "http://192.168.1.10:8787".into(),
@@ -481,5 +489,6 @@ mod tests {
         assert_eq!(json["addresses"][0]["preferred"], true);
         assert_eq!(json["loopback_only"], false);
         assert_eq!(json["port"], 8787);
+        assert_eq!(json["port_source"], "fallback");
     }
 }

@@ -650,6 +650,7 @@ GET /tasks/{id}               → 详情页装载 + 断线重连后的全量校�
 | 未受信任的技能不得以全文模式保存（界面上就地改写信任态） | `frontend/src/components/settings/SkillDeclList.svelte`、`frontend/src/lib/stageConfigs.ts` | 决策 172 / 181 |
 | 「手机访问」取不到配对令牌就不画二维码 | `frontend/src/routes/Share.svelte`、`frontend/src/lib/sharePairing.ts` | 决策 189 |
 | 绑定开关只由回环来源发起；界面说出「这次绑定是谁定的」 | `frontend/src/routes/Share.svelte`、`frontend/src/lib/lanToggle.ts` | 决策 186 |
+| 端口不是配置里那个（被别的程序占着，退让到临时端口）时，分享页说出「这次为什么变了」 | `frontend/src/routes/Share.svelte`、`frontend/src/lib/sharePairing.ts` | 决策 213；判定在 `portFallbackNote`，只绑回环时不说 |
 | 通知策略：toast 只对 pending / done / failed 弹，同类 5 分钟 cooldown，22–8 免打扰 | `frontend/src/lib/notificationPolicy.ts` | 决策 65 |
 | 实时：逐任务开 SSE 流 + 10s 对齐 tick 兜底 refetch | `frontend/src/realtime/connection.ts`、`frontend/src/stores/board.svelte.ts` | 决策 76 |
 | 主题切换（夜班靛 / 掌机背光）并入底部状态行 | `frontend/src/components/layout/StatusLine.svelte` | 决策 169 |

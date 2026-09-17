@@ -613,6 +613,14 @@ export interface ServerAddress {
 /** 绑定地址是谁定的（决策 186）：启动参数 / 界面上的开关 / 配置文件。 */
 export type BindSource = 'startup' | 'settings' | 'config';
 
+/**
+ * 端口是谁给的（决策 213）：启动参数 / 配置文件 / **退让**。
+ *
+ * `fallback` = 首选端口被别的进程占着，当前这个端口是内核临时给的——它**重启后会变**，
+ * 手机上存过的地址这次就是打不开的原因，故这一档必须由界面说出去。
+ */
+export type PortSource = 'startup' | 'config' | 'fallback';
+
 /** `GET /server-info`：局域网分享所需的服务自述。 */
 export interface ServerInfo {
   /** 实际绑定地址（`0.0.0.0` 表示全网卡）。 */
@@ -626,6 +634,11 @@ export interface ServerInfo {
    * `settings` = 界面上的开关（住 DB，重启仍生效）；`config` = `config.toml`。
    */
   bind_source: BindSource;
+  /**
+   * 端口的来源（决策 213）：`fallback` 表示首选端口被占用、当前端口是临时给的——
+   * 手机上的旧书签会因此失效，见 `lib/sharePairing.ts::portFallbackNote`。
+   */
+  port_source: PortSource;
   addresses: ServerAddress[];
 }
 

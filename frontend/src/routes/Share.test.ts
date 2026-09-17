@@ -35,6 +35,7 @@ const lanInfo: ServerInfo = {
   port: 8788,
   loopback_only: false,
   bind_source: 'settings',
+  port_source: 'config',
   addresses: [{ interface: 'en0', url: 'http://192.168.1.10:8788', preferred: true }],
 };
 
@@ -102,5 +103,31 @@ describe('手机访问页 · 没有配对令牌时不画码（决策 189）', ()
     await screen.findByText('手机现在连不上这台机器');
     expect(screen.queryByAltText(/扫码访问/)).toBeNull();
     expect(screen.getByRole('button', { name: /绑定全网卡/ })).toBeTruthy();
+  });
+
+  it('端口是退让来的：页面上说清「这次为什么变了」（决策 213）', async () => {
+    // 固定端口被别的程序占着时后端会退让到临时端口——手机上的旧书签正是这样失效的，
+    // 而日志在桌面应用里看不到，故这句话必须出现在这一页上。
+    mocks.getServerInfo.mockResolvedValue({
+      ...lanInfo,
+      port: 53311,
+      port_source: 'fallback',
+      addresses: [{ interface: 'en0', url: 'http://192.168.1.10:53311', preferred: true }],
+    });
+    mocks.fetchPairingToken.mockResolvedValue({ token: 'tok' });
+    render(Share);
+
+    await screen.findByAltText('扫码访问 http://192.168.1.10:53311/?pair=tok');
+    expect(screen.getByText(/临时端口 53311/)).toBeTruthy();
+    expect(screen.getByText(/重新扫一次/)).toBeTruthy();
+  });
+
+  it('端口来自配置（常态）：不出现退让说明', async () => {
+    mocks.getServerInfo.mockResolvedValue(lanInfo);
+    mocks.fetchPairingToken.mockResolvedValue({ token: 'tok' });
+    render(Share);
+
+    await screen.findByAltText('扫码访问 http://192.168.1.10:8788/?pair=tok');
+    expect(screen.queryByText(/临时端口/)).toBeNull();
   });
 });

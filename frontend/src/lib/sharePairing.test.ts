@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { sharePanel } from './sharePairing';
+import { portFallbackNote, sharePanel } from './sharePairing';
 
 /**
  * 「手机访问」页的形态判定（决策 189）。
@@ -89,5 +89,36 @@ describe('sharePanel（决策 189）', () => {
   it('服务读数还没到（info 为 null）不当作回环形态', () => {
     const panel = sharePanel({ info: null, addresses: addr, selected: null, token: 'tok' });
     expect(panel.kind).toBe('paired-qr');
+  });
+});
+
+describe('portFallbackNote（决策 213：端口退让要说出来）', () => {
+  it('退让过 → 说清原因、当前端口、下一步', () => {
+    const note = portFallbackNote({ port_source: 'fallback', port: 53311, loopback_only: false });
+    expect(note).toContain('被别的程序占着');
+    expect(note).toContain('53311');
+    expect(note).toContain('重新扫');
+  });
+
+  it('端口来自配置（常态）→ 不说话', () => {
+    expect(
+      portFallbackNote({ port_source: 'config', port: 8788, loopback_only: false }),
+    ).toBeNull();
+  });
+
+  it('启动参数指定的端口 → 不说话（它不是「这次才变」的那一档）', () => {
+    expect(
+      portFallbackNote({ port_source: 'startup', port: 9000, loopback_only: false }),
+    ).toBeNull();
+  });
+
+  it('只绑回环 → 不说话：手机本来就连不上，端口是多少与下一步动作无关', () => {
+    expect(
+      portFallbackNote({ port_source: 'fallback', port: 53311, loopback_only: true }),
+    ).toBeNull();
+  });
+
+  it('读数还没到（info 为 null）→ 不说话', () => {
+    expect(portFallbackNote(null)).toBeNull();
   });
 });

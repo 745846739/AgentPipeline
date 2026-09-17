@@ -2914,6 +2914,30 @@ async fn server_info_reports_bind_host_port_and_loopback_flag() {
         body["addresses"].is_array(),
         "addresses 恒为数组（枚举不到时为空表，不是 null）：{body}"
     );
+    // 端口来源（决策 213）：缺省构造走 `[server] port` 那一级——桌面壳与不传 `--port`
+    // 的命令行都在这一级，也是「重启后手机书签仍有效」的前提。
+    assert_eq!(body["port_source"], "config");
+}
+
+/// 端口来源随 `with_port_source` 上报——`fallback` 是唯一要界面出声的一档
+/// （首选端口被占、退让到内核随机端口，手机上的旧地址下次启动就作废）。
+#[tokio::test]
+async fn server_info_reports_port_source() {
+    let home = TestHome::new().unwrap();
+    let (store, _clock) = home.setup().await.unwrap();
+    let state = AppState::new(store, home.home().clone(), Settings::default(), PORT)
+        .with_port_source(app::state::PortSource::Fallback);
+    let router = build_router(state);
+
+    let response = router
+        .oneshot(request("GET", "/server-info").body(Body::empty()).unwrap())
+        .await
+        .unwrap();
+    let (status, body) = json_body(response).await;
+    assert_eq!(status, 200);
+    assert_eq!(body["port_source"], "fallback");
+    // 端口本身照旧是真实端口（退让改的是号码，不是「读不到就别信」的语义）
+    assert_eq!(body["port"], PORT);
 }
 
 #[tokio::test]

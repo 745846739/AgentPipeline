@@ -86,6 +86,7 @@ describe('server-info 客户端（决策 167）', () => {
         host: '0.0.0.0',
         port: 8787,
         loopback_only: false,
+        port_source: 'config',
         addresses: [{ interface: 'en0', url: 'http://192.168.1.10:8787', preferred: true }],
       }),
     );

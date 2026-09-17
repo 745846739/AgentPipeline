@@ -116,6 +116,7 @@ workspace 成员 `crates/testkit`，供 L2 / L4 复用：
 | 指标 | 逃逸率口径、阶段聚合 SQL、`total_tokens`=Σruns、`total_calls`=LLM run 数（不含 system） | 137 / 100 / 130 |
 | SSE | 事件体 `branch` 字段；`conversation_delta` / `tool_event` 字段完整 | 84 / 123 |
 | 对端地址与配对 | `peer.rs`：ConnectInfo 归一为 `PeerAddr`、**缺省视为回环**（无 ConnectInfo 的 tower oneshot 契约测试不因此变红）、局域网来源读到非回环、`is_loopback_bind` 覆盖各绑定写法；`stream.rs`：令牌比较 `fixed_length_eq`（长度不同即不等、内容不同即不等）；`server_info.rs`：`pairing_url` 形状固定为 `{base}/?pair={token}`、二维码白名单**允许追加 query** 而前缀伪装与异 origin 仍拒、`resolve_qr_target` 原样保留 query | 182⑦ / 167 |
+| 端口绑定策略（决策 213） | `serve.rs` 六条：首选端口空闲时**就用它且不改来源** / 被占用时按开关退让到随机端口并标成 `PortSource::Fallback` / 未开退让时明确报错且错误链里是 `AddrInUse` / **只有 `AddrInUse` 才算「被占用」**（按错误链判而不按报文判——`bind_listener` 那条上下文同时罩着权限与地址不可用，按报文判会让它们静默退让）/ 退让**缺省是关的**（`ServeOptions::default()`）/ `port_source` 的三个串即契约 | 213 |
 
 ## 6. 集成测试目录（L2）
 
@@ -149,6 +150,15 @@ workspace 成员 `crates/testkit`，供 L2 / L4 复用：
 | **确认钮够得到**（决策 208） | `frontend/e2e/talk.spec.ts::expectProposalReachable`（两条按下用例共用） | 「内联在时间线里」这件事的**可达性**。四条一起断：时间线 ≥160px、钮**整颗**落在时间线里、钮的中心点用 `elementFromPoint` 命中的是它自己（2026-09-17 截走点击的是输入坞那颗悬出框沿 16px 的名牌）、输入坞与整页都没被顶坏。**牙齿**：把状态区上限退回 `46vh` → 第一条即以 `Received: 26` 变红。两条按下用例因此回到 playwright 默认的 **1280×720**，不再显式设 1280×1000 |
 
 **「状态区为空时零按钮」那条断言保留**（`talk.spec.ts` 的空看板用例）：它钉的是「后端下发的动作集是唯一动作来源」，与上面那条不是一件事。
+
+**端口跨重启稳定（决策 213，2026-09-17）**：`crates/app/tests/port_stability.rs` 2 条——① 写一份
+`[server] port = P` 的配置，**不传 `--port`** 起真二进制两次，两次就绪行必须是同一个 P，且
+`/server-info.port_source = config`（这是「手机里那本书签下次还打得开」的形态，也是桌面壳的形态）；
+② 占住配置里那个端口，用**桌面壳那套 `ServeOptions`**（`port_override = None` +
+`port_fallback_to_ephemeral = true`）起服务：必须**换一个端口起来**，且 `/server-info` 的
+`port` 是真实端口、`port_source = fallback`。两条的形态差异是**被测行为的差异**：前者要的正是
+「跨进程重启」，后者只存在于一条非 CLI 选项上（命令行不暴露退让，`--port` 绑不上就报错）。
+故本文件**只允许一处 in-process `serve`**——`TestHome::install_env` 改的是进程级环境变量。
 
 ## 7. API 契约测试（L3）
 
@@ -342,6 +352,7 @@ Enter 发送、回话真的来自脚本、**回话里没有按钮**、两块名�
 | 191（令牌留在地址栏） | §9 `api/pairing.test.ts` 改写三条并新增一条（**地址栏那份不再被抹掉**且令牌仍进本地 / 地址栏还有别的参数不影响读取 / **每次装载都从 URL 重存一次**（主屏图标与书签靠这条）/ 没有配对参数时不动已存的那份）+ §9 e2e `lan-bind.spec.ts` 新增一条（真应用里打开 `/?pair=e2e-token`：**地址栏里仍是 `pair=e2e-token`**、localStorage 也存下了；**再装载一次仍在**——等价于从主屏图标再进来）+ §5 `assets.rs::static_responses_forbid_referer`（所有静态响应带 `Referrer-Policy: no-referrer`，它是当初「抹地址栏」三条理由里 `Referer` 那条的替代品） | 191 |
 | 192（对讲台窄屏版面） | §9 `lib/talkStops.test.ts` 由 10 条增至 **15 条**（新增五条：**窄屏一张也折**、窄屏恒不展开、窄屏下摊开判据只认人点过的那个 id、窄屏显式收起仍不弹回、**同一份集合宽窄两解**）+ §9 e2e `talk.spec.ts` 由 11 条增至 **13 条**，新增一组**自带装置**的窄屏用例（不复用上面那组：那组最后一条会把唯一的急停按掉，之后量到的是空状态区）：① 静置版面——单张急停已折成摘要条、状态区不再区内滚、**对话区 ≥320px**（改版前同一装置实测 26px）、输入坞底边与底栏（`.statusline`）顶边严丝合缝、无对话时**整页不空滚**；② 长对话滚到底——整页滚（时间线不再是滚动容器）、**摘要条仍钉在顶栏下沿**（`top:138px`）、输入坞仍贴在底栏上沿；③ 断言口径是**几何**而不是「CSS 里有没有 sticky」（后者在版面塌掉时照样为真）。**牙齿检查**：把 `forceFold` 退回常假 → ①在「单张已折」这条就变红，且此时同一装置上对话区实测只剩 48px（②的前提同时失效）| 192 |
 | 193（名分：值班员 → 值班经理） | §6 `tests/foreman.rs` 由 21 条增至 **22 条**，新增 `the_persona_calls_the_human_what_the_ui_does`（人格里出现「值班经理」、旧词「值班员」**不回潮**——同一个名分只有一个答案，而这个名分漂过一次：决策 174 / 176）；§9 e2e `talk.spec.ts` ⑦「给值班长发话」补两条**名牌**断言（人这一侧 `turn.mine .dname` 与输入坞 `.typer .dname` 都读作「值班经理」，对面那块原本已断言「值班长」）——**用例数不变**，补在既有用例里 | 193 |
+| 213（桌面壳端口跨重启稳定） | §5 `serve.rs` 六条（绑定策略：首选空闲用它 / 占用退让并标 `fallback` / 未开退让明确报错 / **只认 `AddrInUse`** / 退让缺省关 / 三个串即契约）+ §6 `crates/app/tests/port_stability.rs` 2 条（**不传 `--port` 起两次真二进制，端口不变且 `port_source=config`**；占住配置端口时用桌面壳那套参数起服务 → **退让且 `port_source=fallback`**）+ §7 `api_contract.rs` 两条（缺省 `port_source=config`；`with_port_source(Fallback)` 上报 `fallback`）+ §9 `lib/sharePairing.test.ts` 5 条（退让时的话含当前端口与「重新扫」/ `config`、`startup` 不说 / **只绑回环不说** / 读数未到不说）+ §9 `routes/Share.test.ts` 2 条（退让 → 页面上出现「临时端口 53311」与「重新扫一次」；常态 → 不出现）。**旧行为被替换的那一条**：桌面壳此前的 `port_override = Some(0)`（决策 153⑤ / 156）不再有消费者，命令行与测试的 fail fast 姿态**原样保留**（`smoke.rs` 的「端口占用应启动失败」继续绿） | 213 |
 | …… | 其余决策随实现逐条填入 | — |
 
 ## 11. 实现状态（2026-09-12，票 15–22 后）

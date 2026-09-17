@@ -47,6 +47,34 @@ impl BindSource {
     }
 }
 
+/// 当前端口的**来源**（决策 213）。
+///
+/// 端口与绑定地址不同：它**运行期不可改**（决策 186 的「改绑不改端口」），故这里是常量而非
+/// 共享单元。它存在的理由也不同于 `bind_source` 的「重启还算不算数」——而是**分享地址会不会
+/// 随重启变**：`fallback` 意味着手机上存过的 URL 下次启动就作废，界面必须说出来，
+/// 否则使用者只会看到一张打不开的书签。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PortSource {
+    /// `--port` 显式指定（最高）。
+    Startup,
+    /// `config.toml` 的 `[server] port`（声明式默认；桌面壳走这一级）。
+    Config,
+    /// 首选端口被别的进程占着，退让到内核随机端口（决策 213）。
+    Fallback,
+}
+
+impl PortSource {
+    /// 面向用户的说话方式（`/server-info` 的 JSON 字段值，前端据此选文案）。
+    pub fn as_str(self) -> &'static str {
+        match self {
+            PortSource::Startup => "startup",
+            PortSource::Config => "config",
+            PortSource::Fallback => "fallback",
+        }
+    }
+}
+
 /// 改绑监听地址的请求（决策 186）：端点把请求投给 [`crate::serve`] 里的监听器主管。
 ///
 /// **为什么走消息而不是直接持有监听器**：监听器任务的所有权在 `serve` 手里，端点在
@@ -79,6 +107,9 @@ pub struct AppState {
     /// 绑定端口，用于跨源防护的本机 origin 判定（决策 128）。**改绑不改端口**（决策 186），
     /// 故它是常量。
     pub port: u16,
+    /// 上面那个端口的来源（决策 213）：`fallback` = 首选端口被占用、退让到了内核随机端口，
+    /// 此时手机上的旧书签会失效，分享页必须说出来。
+    pub port_source: PortSource,
     /// 实际绑定地址（决策 167）：`/server-info` 据它判断手机能否直连
     /// （仅回环绑定时分享页要给出「如何开启局域网访问」的指引）。
     ///
@@ -137,6 +168,7 @@ impl AppState {
             resume_hook: Arc::new(|_| {}),
             executor: None,
             port,
+            port_source: PortSource::Config,
             bind_host: Arc::new(std::sync::RwLock::new("127.0.0.1".to_string())),
             bind_source: Arc::new(std::sync::RwLock::new(BindSource::Config)),
             rebind: None,
@@ -216,6 +248,11 @@ impl AppState {
             .unwrap_or(BindSource::Config)
     }
 
+    /// 端口的来源（决策 213）。它是常量，故直接返回。
+    pub fn port_source(&self) -> PortSource {
+        self.port_source
+    }
+
     /// 改绑生效后由监听器主管回写（决策 186）。
     pub fn set_bind_host(&self, host: impl Into<String>, source: BindSource) {
         if let Ok(mut h) = self.bind_host.write() {
@@ -255,6 +292,13 @@ impl AppState {
     /// 注入绑定地址的来源（决策 186）。缺省 [`BindSource::Config`]。
     pub fn with_bind_source(mut self, source: BindSource) -> Self {
         self.bind_source = Arc::new(std::sync::RwLock::new(source));
+        self
+    }
+
+    /// 注入端口的来源（决策 213）。缺省 [`PortSource::Config`]；serve 在**退让**那条路上
+    /// 传 [`PortSource::Fallback`]，分享页据此说明「手机上的旧地址这次失效了」。
+    pub fn with_port_source(mut self, source: PortSource) -> Self {
+        self.port_source = source;
         self
     }
 

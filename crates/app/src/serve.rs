@@ -55,6 +55,56 @@ pub async fn bind_listener(
     Ok((listener, bound))
 }
 
+/// 首选端口 + 「占用则退让」的绑定（决策 213），返回实际监听器、真实端口，以及**这个端口是谁给的**。
+///
+/// 为什么退让要单独成为一个选项，而不是让所有调用方都退让：`--port` 是用户明确指定的，
+/// 绑不上就该按 [`bind_listener`] 的报文报错（「端口被占用或无法绑定」是唯一不需要猜的错误），
+/// 悄悄换一个端口等于把这条信息吃掉。桌面壳那条路不同——它没有命令行，界面上的端口也不是
+/// 用户当下选的，**应用打不开比端口变一次更糟**，故它显式打开这个开关。
+///
+/// 退让**只在 `EADDRINUSE` 时发生**：权限不足、地址不存在之类的错误照旧报出来——那不是
+/// 「换个端口就能好」的事，退让只会把真正的原因藏起来。
+///
+/// 退让的代价是**分享地址会变**（手机上的旧书签下次启动就打不开），故这里 warn 出声，
+/// 并经 [`PortSource::Fallback`] 一路报到 `/server-info`，由分享页对使用者说清楚。
+async fn bind_preferred(
+    host: &str,
+    port: u16,
+    source: crate::state::PortSource,
+    fallback_to_ephemeral: bool,
+) -> anyhow::Result<(
+    tokio::net::TcpListener,
+    std::net::SocketAddr,
+    crate::state::PortSource,
+)> {
+    use crate::state::PortSource;
+    match bind_listener(host, port).await {
+        Ok((listener, bound)) => Ok((listener, bound, source)),
+        Err(e) if fallback_to_ephemeral && is_addr_in_use(&e) => {
+            tracing::warn!(
+                port,
+                error = %e,
+                "首选端口被占用，退让到内核随机端口——分享地址会变，手机上的旧网址需重新扫一次"
+            );
+            let (listener, bound) = bind_listener(host, 0).await?;
+            Ok((listener, bound, PortSource::Fallback))
+        }
+        Err(e) => Err(e),
+    }
+}
+
+/// 错误链里有没有 `EADDRINUSE`（端口被占用）。
+///
+/// 看错误链而不是报文：`bind_listener` 给它套了一层「端口被占用或无法绑定」的上下文，
+/// 但那条上下文同时也罩着权限、地址不可用等**不该退让**的失败，按报文判断必然误判。
+fn is_addr_in_use(error: &anyhow::Error) -> bool {
+    error.chain().any(|cause| {
+        cause
+            .downcast_ref::<std::io::Error>()
+            .is_some_and(|io| io.kind() == std::io::ErrorKind::AddrInUse)
+    })
+}
+
 /// 把 router 变成能向处理器提供对端地址的 service（决策 182）。
 ///
 /// 返回类型本身就是行为事实：裸 `Router` 交给 `axum::serve`（`into_make_service`）时
@@ -264,6 +314,12 @@ async fn run_listener_supervisor(
 pub struct ServeOptions {
     /// CLI `--port`；`0` = 内核随机分配。
     pub port_override: Option<u16>,
+    /// 首选端口被别的进程占着时，退让到内核随机端口（决策 213）。
+    ///
+    /// 缺省 `false`（命令行与测试的 fail fast 姿态）：显式指定的端口绑不上就该报错。
+    /// **只有桌面壳打开它**——桌面应用没有命令行，开不了窗比端口变一次更糟。
+    /// 退让的代价是分享地址会随重启变，故它同时被上报成 [`crate::state::PortSource::Fallback`]。
+    pub port_fallback_to_ephemeral: bool,
     /// CLI `--host`（局域网访问用 `0.0.0.0`）；缺省回落 `[server] host`。
     pub host_override: Option<String>,
     /// CLI `--allowed-origin` 注入的额外放行 origin（已归一）；
@@ -275,6 +331,10 @@ pub struct ServeOptions {
 ///
 /// [`ServeOptions::port_override`] 为 `None` 时回落 `[server] port`（§10.6.5）；
 /// `0` 表示由内核分配，真实端口经 [`ServerHandle::port`] 与启动日志给出（决策 153⑤）。
+///
+/// 端口**默认可预期**：不给 `port_override` 就用配置里的那个，重启不变（决策 213）。
+/// 只有 [`ServeOptions::port_fallback_to_ephemeral`] 打开（桌面壳）时，首选端口被占用才
+/// 退让到内核随机端口，并把这件事经 [`crate::state::PortSource::Fallback`] 报到 `/server-info`。
 pub async fn serve(options: ServeOptions) -> anyhow::Result<ServerHandle> {
     let home = Home::from_env();
     home.ensure_dirs()?;
@@ -338,6 +398,13 @@ pub async fn serve(options: ServeOptions) -> anyhow::Result<ServerHandle> {
     // 决策 128 修订同批对齐；决策 157 补 allowed_origins 并集；决策 186 插入界面设置这一级）
     let server = config.server.clone();
     let port = options.port_override.unwrap_or(server.port);
+    // 端口是谁给的（决策 213）：显式 `--port` 是 startup，否则是 `[server] port`。
+    // 第三档 `fallback` 只有真的退让过才出现，在 bind_preferred 里定。
+    let port_source = if options.port_override.is_some() {
+        crate::state::PortSource::Startup
+    } else {
+        crate::state::PortSource::Config
+    };
     let (host, bind_source) = resolve_bind_host(
         options.host_override.clone(),
         store.server_bind_override().await?,
@@ -371,7 +438,8 @@ pub async fn serve(options: ServeOptions) -> anyhow::Result<ServerHandle> {
     // 决策 186 起监听器由**主管任务**持有：界面上的「绑定全网卡」开关要能在运行时换掉
     // 它，而换监听器是 `serve` 的私有知识（端口、graceful→abort 的窗口、失败回滚），
     // 不该泄漏给端点。端点只往通道里投一个请求。
-    let (listener, bound) = bind_listener(&host, port).await?;
+    let (listener, bound, port_source) =
+        bind_preferred(&host, port, port_source, options.port_fallback_to_ephemeral).await?;
     let actual_port = bound.port();
     let (rebind_tx, rebind_rx) = tokio::sync::mpsc::channel::<RebindRequest>(4);
 
@@ -398,6 +466,7 @@ pub async fn serve(options: ServeOptions) -> anyhow::Result<ServerHandle> {
         .with_resume_hook(runtime.resume_hook.clone())
         .with_bind_host(host.clone())
         .with_bind_source(bind_source)
+        .with_port_source(port_source)
         .with_rebind(rebind_tx)
         .with_allowed_origins(extra_origins)
         .with_repo(repo, market_repos)
@@ -696,6 +765,101 @@ mod tests {
             "错误信息应明确：{msg}"
         );
         drop(listener);
+    }
+
+    // ── 决策 213：首选端口 + 「占用则退让」 ──
+
+    /// 拿一个空闲端口当「首选」：先绑 `:0` 读出号码再释放。
+    ///
+    /// 这是**测试夹具**的手法；生产侧不做这种探测（决策 153⑤ 明写不再需要
+    /// 「先探测空闲端口再释放」，那中间有一个别人抢走的窗口）。
+    async fn free_port() -> u16 {
+        let (probe, bound) = bind_listener("127.0.0.1", 0).await.unwrap();
+        let port = bound.port();
+        drop(probe);
+        port
+    }
+
+    #[tokio::test]
+    async fn preferred_port_is_used_when_free() {
+        use crate::state::PortSource;
+        let port = free_port().await;
+        let (listener, bound, source) =
+            bind_preferred("127.0.0.1", port, PortSource::Config, false)
+                .await
+                .unwrap();
+        assert_eq!(
+            bound.port(),
+            port,
+            "首选端口空闲时必须用它（这正是不换端口的保证）"
+        );
+        assert_eq!(source, PortSource::Config, "没退让就不该改来源");
+        drop(listener);
+    }
+
+    #[tokio::test]
+    async fn occupied_preferred_port_falls_back_when_allowed() {
+        use crate::state::PortSource;
+        // 占住一个端口，再让它当首选：桌面壳那条路（打不开窗比端口变一次更糟）必须能起。
+        let (held, bound) = bind_listener("127.0.0.1", 0).await.unwrap();
+        let (listener, fallback, source) =
+            bind_preferred("127.0.0.1", bound.port(), PortSource::Config, true)
+                .await
+                .unwrap();
+        assert_ne!(fallback.port(), bound.port(), "首选被占时应换一个端口");
+        assert_ne!(fallback.port(), 0, "回读的必须是真实端口");
+        assert_eq!(
+            source,
+            PortSource::Fallback,
+            "退让必须被标记出来：分享页据此说明「手机上的旧网址这次失效了」"
+        );
+        drop(listener);
+        drop(held);
+    }
+
+    #[tokio::test]
+    async fn occupied_preferred_port_is_fatal_without_fallback() {
+        use crate::state::PortSource;
+        // 缺省姿态（命令行 / 测试）：显式指定的端口绑不上就报错，不悄悄换一个。
+        let (held, bound) = bind_listener("127.0.0.1", 0).await.unwrap();
+        let err = bind_preferred("127.0.0.1", bound.port(), PortSource::Startup, false)
+            .await
+            .expect_err("未打开退让时端口占用应报错");
+        let msg = format!("{err:#}");
+        assert!(msg.contains("端口被占用或无法绑定"), "{msg}");
+        assert!(is_addr_in_use(&err), "占用必须被识别成 AddrInUse");
+        drop(held);
+    }
+
+    #[test]
+    fn fallback_is_opt_in() {
+        // 缺省不开：`--port` 是用户明确指定的，绑不上就该看见错误（决策 213）。
+        assert!(
+            !ServeOptions::default().port_fallback_to_ephemeral,
+            "退让只能是显式开的（桌面壳）——缺省打开会把「端口被占」这条唯一不需要猜的错误吃掉"
+        );
+    }
+
+    #[test]
+    fn only_addr_in_use_is_recognized_as_occupied() {
+        // 按**错误链**判而不是按报文判：`bind_listener` 的上下文同时罩着权限 / 地址不可用
+        // 等不该退让的失败，按报文判会让它们静默退让到随机端口。
+        let other =
+            anyhow::anyhow!("permission denied").context("端口被占用或无法绑定：127.0.0.1:80");
+        assert!(!is_addr_in_use(&other), "别的绑定失败不得被当成端口占用");
+        let io = std::io::Error::from(std::io::ErrorKind::AddrInUse);
+        assert!(is_addr_in_use(
+            &anyhow::Error::from(io).context("任何上下文")
+        ));
+    }
+
+    #[test]
+    fn port_source_strings_are_the_api_contract() {
+        // 这三个串是 `/server-info.port_source` 的取值（前端据此选文案），改名即改契约。
+        use crate::state::PortSource;
+        assert_eq!(PortSource::Startup.as_str(), "startup");
+        assert_eq!(PortSource::Config.as_str(), "config");
+        assert_eq!(PortSource::Fallback.as_str(), "fallback");
     }
 
     // ── 票 16：`[logging] format / file` 真正生效 ──

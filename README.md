@@ -33,8 +33,12 @@ make desktop       # 出 dmg（crates/desktop/target/release/bundle/dmg/）
 make desktop-run   # debug 壳直接跑，窗口导航到内嵌同源服务
 ```
 
-桌面壳只是外壳：壳内调用 `app::serve(ServeOptions)`（`port_override = Some(0)`）随机端口起服，窗口加载
-`http://127.0.0.1:{port}`（同源零 CORS），传输层与 web 形态完全一致（决策 153）。
+桌面壳只是外壳：壳内调用 `app::serve(ServeOptions)` 起服，**端口不指定**——用 `[server] port`
+（缺省 8788），于是二维码地址、手机书签、桌面窗口地址跨重启都指着同一个号码（决策 213；此前是
+`port_override = Some(0)`，每次重启换一个临时端口，手机存过的网址就失效了）。真被别的程序占着时
+退让到临时端口而不是拒绝开窗（`port_fallback_to_ephemeral`），退让会经 `/server-info` 的
+`port_source` 报到「手机访问」页上。窗口加载 `http://127.0.0.1:{port}`（同源零 CORS），传输层与
+web 形态完全一致（决策 153）。
 壳是独立 workspace（自带 Cargo.lock），tauri 依赖树不进 `make check-lint` / `make check-test` 闸门。
 
 打包边界（决策 168）：`bundle.targets` 只列 `dmg`——dmg 里已含 `.app`（拖入「应用程序」即得，
