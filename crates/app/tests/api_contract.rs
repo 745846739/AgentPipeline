@@ -3949,6 +3949,37 @@ async fn recommendations_report_whether_each_skill_is_declared_in_that_stage() {
     // ⑤ 节点级声明也算本阶段声明（不然那一行会白给一颗「启用」）
     let review = row("review", "code-review");
     assert_eq!(review["declared_here"], true, "节点级声明也算：{review}");
+
+    // ⑥ 来源定位（决策 194）：清单是**指针**——仓 + 仓内目录，**不含 commit**（钉死 commit 会
+    //    随上游漂移变成一份陈旧名录；commit 由技能市场在浏览那一刻补上）。界面把这些摆给用户
+    //    看，才有「照着这个仓的哪一份装」可言。
+    //
+    //    **null 这一格打不出来**：行的名字取自 `recommended_skill_names`（同一个清单），
+    //    定位又按同一个 `(阶段, 名字)` 回来，`find` 必然命中——所以「不在清单里 → null」这条
+    //    分支在本端点上**不可达**，类型与界面容得下它只是防御（见字段注释）。硬造一个用例
+    //    只会变成「喂一个端点不会产生的形态」，故这里只钉真实契约：两个键都在、都是真值。
+    assert_eq!(grill["repo"], "mattpocock/skills", "{grill}");
+    assert_eq!(grill["dir"], "skills/productivity/grilling", "{grill}");
+    for stage in stages {
+        for skill in stage["skills"].as_array().unwrap() {
+            let repo = skill["repo"]
+                .as_str()
+                .expect("repo 必须是字符串（不是 null、不是别的类型）");
+            let dir = skill["dir"]
+                .as_str()
+                .expect("dir 必须是字符串（不是 null、不是别的类型）");
+            assert!(
+                repo.split_once('/')
+                    .is_some_and(|(o, r)| !o.is_empty() && !r.is_empty()),
+                "来源仓是 owner/repo 形态：{skill}"
+            );
+            assert!(!dir.is_empty(), "目录不能是空的：{skill}");
+            assert!(
+                skill.get("commit").is_none(),
+                "清单是指针不是名录，不下发 commit：{skill}"
+            );
+        }
+    }
 }
 
 /// 一键安装：技能落到技能根 **且** 写进该阶段配置，一次请求完成。

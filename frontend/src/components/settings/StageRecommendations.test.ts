@@ -22,6 +22,8 @@ function skill(over: Partial<RecommendedSkill> = {}): RecommendedSkill {
     installed: true,
     declared_in: [],
     declared_here: false,
+    repo: 'mattpocock/skills',
+    dir: 'skills/engineering/tdd',
     ...over,
   };
 }
@@ -114,5 +116,31 @@ describe('推荐面板：三态与启用钮', () => {
 
     expect(screen.getByRole('button', { name: '安装' }).hasAttribute('disabled')).toBe(true);
     expect(screen.getByRole('button', { name: '启用' }).hasAttribute('disabled')).toBe(true);
+  });
+});
+
+/**
+ * 来源定位（票 02，决策 194 加进清单的那两个字段）。
+ *
+ * 清单的全部意义是「给还没装的人照着装」，而 GitHub 模式下照着装要知道**哪个仓的哪个目录**：
+ * 后端一直在下发 `repo` / `dir`，是前端类型没声明、界面也没人用——于是装的是哪一份在点钮之前
+ * 根本看不出来，这也是「本地已装的那份是不是清单这份」在界面上的唯一可见面。
+ */
+describe('推荐行：来源定位', () => {
+  it('把 owner/repo 与仓内目录一并摆出来', () => {
+    renderPanel(stage(skill()));
+
+    expect(screen.getByText('mattpocock/skills · skills/engineering/tdd')).toBeTruthy();
+  });
+
+  it('两个字段都取不到时整行不画——不摆空壳', () => {
+    // 后端从同一次清单查找里取这两个字段，同来同去；`null` 那一支当前从端点不可达，但类型
+    // 容得下它，界面就不该在这种输入上画出一个空的来源行。
+    renderPanel(stage(skill({ repo: null, dir: null })));
+
+    expect(screen.queryByText(/mattpocock/)).toBeNull();
+    // 行本身还在（理由与钮照旧），只是没有来源那一行
+    expect(screen.getByText('先写测试再写实现')).toBeTruthy();
+    expect(screen.getByRole('button', { name: '启用' })).toBeTruthy();
   });
 });

@@ -40,6 +40,19 @@
   function actionLabel(skill: RecommendedSkill): '安装' | '启用' {
     return skill.installed ? '启用' : '安装';
   }
+
+  /**
+   * 来源那一行（决策 194）：`owner/repo · 技能目录`。
+   *
+   * 清单的全部意义是「给还没装的人照着装」，而 GitHub 模式下照着装要知道哪个仓、仓里哪个目录
+   * ——没有这一行，面板上就看不出装的是哪一份（它同时是「本地已装的那份是不是清单这份」的
+   * 用户可见面）。两段都是指针，**不含 commit**：清单钉死 commit 会随上游漂移变成陈旧名录。
+   *
+   * 两个字段同来同去（后端从同一次清单查找里取），取不到就整行不画——不摆空壳。
+   */
+  function sourceOf(skill: RecommendedSkill): string {
+    return skill.repo && skill.dir ? `${skill.repo} · ${skill.dir}` : '';
+  }
 </script>
 
 <div class="rec panel">
@@ -69,6 +82,11 @@
                 <!-- 本阶段没启用它，别的阶段启用了：**不能写成「已启用」**——那一行旁边正给着
                      一颗「启用」钮，两个词摆在一起自相矛盾（票 01 的那一行 tdd 就是这样）。 -->
                 <span class="used">已被引用：{skill.declared_in.join('、')}</span>
+              {/if}
+              {#if sourceOf(skill)}
+                <!-- 来源定位（决策 194）：写法沿用技能市场的来源呈现——等宽 + 次级灰，
+                     仓是 `owner/repo`、目录是仓内相对路径。取不到就整行不画，不摆空壳。 -->
+                <span class="src mono">{sourceOf(skill)}</span>
               {/if}
               {#if needsAction(skill)}
                 <!-- 三态只有这一颗钮：未装是「安装」，已装而本阶段没启用是「启用」（票 16
@@ -154,6 +172,13 @@
   }
   .used {
     grid-column: 1 / -1;
+  }
+  /* 来源定位（决策 194）：与技能市场的来源同档（等宽 + 次级灰），跨整行——目录比理由长，
+     落在 1fr 那一格里会被挤坏；`anywhere` 是给窄屏的（最长的一条目录在 320px 下超宽）。 */
+  .src {
+    grid-column: 1 / -1;
+    color: var(--text-3);
+    overflow-wrap: anywhere;
   }
   /* 票 12：琥珀只出现在「有东西要你处理」的地方。「未安装」是一条只有文字编码、要人读的
      状态（要装它就点旁边的钮，但它本身不是告警），按决策 195 归到「次级必读」档。 */
