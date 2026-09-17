@@ -32,7 +32,7 @@ use crate::agent::tools::{
 };
 use crate::agent::{
     effective_skills, effective_tools, file_policy::FileToolPolicy, submit_metadata_tool,
-    BUILTIN_TOOLS, SKILL_TOOL,
+    SKILL_TOOL,
 };
 use crate::config::Settings;
 use crate::git::Git;
@@ -1274,7 +1274,6 @@ impl Executor {
                         capacity,
                         &system_prompt,
                         &user_prompt,
-                        &declared_tools,
                         carried_len,
                         &mut messages,
                     )
@@ -1312,7 +1311,14 @@ impl Executor {
                 system_prompt: system_prompt.clone(),
                 user_prompt: user_prompt.clone(),
                 messages: messages.clone(),
-                tools: tool_defs(kind, &declared_tools, &skills, env_mode),
+                tools: tool_defs(
+                    kind,
+                    &declared_tools,
+                    &skills,
+                    env_mode,
+                    cursor.stage,
+                    cursor.node,
+                )?,
                 temperature: stage_cfg.as_ref().and_then(|c| c.temperature),
                 max_tokens: stage_cfg.as_ref().and_then(|c| c.max_tokens),
                 // 任务级 provider 覆盖（决策 105）；阶段配置 / 系统默认由生产适配器解析
@@ -1996,7 +2002,8 @@ impl Executor {
     }
 
     /// 每轮 loop 前的上下文预算检查（决策 105 / 票 04）：超软限 → L3 按轮压缩；
-    /// 压缩后仍超硬限 → L4 兜底（子代理关闭时返回待挂的 pending 理由）。
+    /// 压缩后仍超硬限 → L4 兜底（返回待挂的 `pending(context_overflow)` 理由，
+    /// v1 的 L4 只有这两级——决策 154）。
     ///
     /// 返回 `Some(reason)` 表示调用方应立即把该节点的输出收口为这个 pending；
     /// `None` 表示预算内或压缩后已回到预算内，可继续本轮 LLM 调用。
@@ -2008,7 +2015,6 @@ impl Executor {
         capacity: crate::agent::context::ContextCapacity,
         system_prompt: &str,
         user_prompt: &str,
-        declared_tools: &[String],
         carried_len: usize,
         messages: &mut Vec<Message>,
     ) -> Result<Option<PendingReason>> {
@@ -2061,20 +2067,12 @@ impl Executor {
         if !crate::agent::context::over_hard_limit(estimate(messages), capacity) {
             return Ok(None);
         }
-        // L4 兜底（决策 105 / 148⑦）：首选是分批 / 拆子代理，但那需要真正实现分批执行；
-        // v1 **未实现**分批与子代理拆分，因此**一律**挂 pending(context_overflow) 交用户处置。
+        // L4 兜底（决策 105 / 148⑦ / 154）：v1 的 L4 只有两级——压缩（上面那次）→ pending。
+        // 设计阶梯里的第二级（按节点分批 / 拆子代理）**整体不做**，故这里没有「首选动作」可选，
+        // 直接构造 pending。`spawn_sub_agent`（决策 172③）是模型可主动调用的只读能力，
+        // 不在自动降级路径上——阶段声明了它也走这条。
+        //
         // 关键：绝不能因为「首选动作未实现」就放行继续跑——那会让超硬限的节点无限循环。
-        let spawn_sub_agent = declared_tools.iter().any(|t| t == "spawn_sub_agent");
-        let plan = crate::agent::context::plan_l4(cursor.stage, cursor.node, spawn_sub_agent);
-        if plan.action != crate::agent::context::L4Action::PendingContextOverflow {
-            tracing::warn!(
-                task = %task.id,
-                stage = %cursor.stage,
-                node = %cursor.node,
-                action = ?plan.action,
-                "L4 首选动作（分批 / 子代理拆分）v1 未实现，按未开启收口为 pending(context_overflow)"
-            );
-        }
         tracing::warn!(
             task = %task.id,
             stage = %cursor.stage,
@@ -3273,18 +3271,23 @@ impl AgentNodeKind {
 }
 
 /// 有效工具定义：基线并集（G6）内且 v1 已实现的内置工具 + `submit_metadata`
-/// schema 工具（决策 38：与校验同源，不可移除）。声明了未实现的工具只告警不阻塞。
+/// schema 工具（决策 38：与校验同源，不可移除）。声明了未知工具名**报错**（不静默丢弃）。
 ///
 /// `Skill`（决策 172③，票 06）**不进 [`MANDATORY_TOOLS`]**：它由阶段声明启用。但名字态与
 /// 目录态技能的存在意义就是「正文由 `Skill` 工具按需拉取」——若阶段声明了任一非全文态
 /// 技能却没声明 `Skill`，那批技能就是断腿的指针。因此这里给一条**自动放行**：只要有技能
 /// 不处于全文态，就补上 `Skill` 工具定义，不要求用户在两处各配一遍。
+///
+/// `stage` / `node` 只进报错信息（阶段 + 节点）——故意传枚举而不是拼好的字符串：
+/// 这条分支在正常路径上不可达（同上），不该为它每轮多分配一个 `String`。
 fn tool_defs(
     kind: AgentNodeKind,
     declared: &[String],
     skills: &[crate::agent::skills::ResolvedSkill],
     env_mode: crate::types::EnvMode,
-) -> Vec<ToolDef> {
+    stage: crate::types::Stage,
+    node: crate::types::Node,
+) -> crate::Result<Vec<ToolDef>> {
     use crate::agent::skills::SkillRender;
 
     let needs_skill_tool = skills
@@ -3319,9 +3322,20 @@ fn tool_defs(
             defs.push(spawn_sub_agent_tool_def());
             continue;
         }
-        if !BUILTIN_TOOLS.contains(&name.as_str()) {
-            tracing::warn!(tool = %name, "阶段声明的工具在 v1 未实现，已忽略");
-            continue;
+        // v1 不认识的名字 = 配置错误，**拒绝**（决策 154 的后续票）。
+        //
+        // 这条分支在启动路径上不可达：`PUT /stage-configs` 与启动校验（`validate_startup`）
+        // 用的是同一个判据 [`crate::agent::client::is_known_tool_name`]，那个名字根本写不进库。
+        // 留着它是为了**不给同一个错误第二种处置**——手工改库绕过校验时，这里报错（报文也与
+        // 校验同源，见 `client::unknown_tools_message`）而不是「静默丢弃 + 一条 warn」：
+        // 后者会让「配置写了却没生效」只能靠翻日志发现。
+        if !crate::agent::client::is_known_tool_name(&name) {
+            return Err(crate::Error::Config(
+                crate::agent::client::unknown_tools_message(
+                    &format!("阶段 {stage} 节点 {node}"),
+                    std::slice::from_ref(&name),
+                ),
+            ));
         }
         defs.push(ToolDef {
             name,
@@ -3360,7 +3374,7 @@ fn tool_defs(
         }
     };
     defs.push(schema_tool);
-    defs
+    Ok(defs)
 }
 
 /// `Skill` 工具的 tool 定义（决策 172③，票 06）。
@@ -3788,5 +3802,44 @@ mod tests {
         assert!(out.is_char_boundary(out.len()));
         assert!(out.chars().all(|c| c == '中'
             || ".\n[闸门日志超长：已省略中间 400 字符；完整日志见上方 stdout_path]".contains(c)));
+    }
+
+    /// 决策 154 的后续票：`tool_defs` 对未知工具名**报错**，不再「静默丢弃 + 一条 warn」。
+    ///
+    /// 这条分支在启动路径上不可达（配置根本写不进来），留着是为了**不给同一个错误第二种
+    /// 处置**——手工改库绕过校验时行为与写入时一致：拒绝。故这条用例同时钉住报文形状。
+    #[test]
+    fn tool_defs_rejects_unknown_names_and_accepts_the_known_set() {
+        let (stage, node) = (crate::types::Stage::Develop, crate::types::Node::Execute);
+        let err = tool_defs(
+            AgentNodeKind::DevelopExecute,
+            &["read_file".to_string(), "web_search".to_string()],
+            &[],
+            crate::types::EnvMode::Auto,
+            stage,
+            node,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("web_search"), "{err}");
+        assert!(
+            err.contains("阶段 develop 节点 execute"),
+            "报文须定位到阶段 + 节点：{err}"
+        );
+        assert!(err.contains("v1 已知工具集"), "{err}");
+
+        // 已知集（含扩展工具）照旧出表：`spawn_sub_agent` 走它自己的定义分支
+        let defs = tool_defs(
+            AgentNodeKind::DevelopExecute,
+            &["read_file".to_string(), "spawn_sub_agent".to_string()],
+            &[],
+            crate::types::EnvMode::Auto,
+            stage,
+            node,
+        )
+        .unwrap();
+        assert!(defs.iter().any(|d| d.name == "read_file"));
+        assert!(defs.iter().any(|d| d.name == "spawn_sub_agent"));
+        assert!(defs.iter().any(|d| d.name == "submit_metadata"));
     }
 }

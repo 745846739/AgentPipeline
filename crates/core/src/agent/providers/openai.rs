@@ -314,6 +314,152 @@ mod tests {
         ));
     }
 
+    /// 跨语言 golden fixture（票 e2e-mock/01，`tests/fixtures/e2e_mock_sse.json`）。
+    ///
+    /// 这份 fixture 是**两侧 mock 与 Rust 适配器之间的唯一契约**：Rust testkit 的
+    /// `sse_tool` / `sse_text` 与 Node harness 的 `sseTool` / `sseText`（vitest 侧）各自
+    /// 断言自己产出的字节与它一致；这里负责另一半——**消费**。把 fixture 的每个载荷逐条
+    /// 喂 [`OpenAiCompatible::parse_chunk`]，断言解析出的块序列正是驱动层聚合所依赖的形状
+    /// （tool 名 / arguments / 文本 / usage / `[DONE]`）。任一侧漂移，总有一侧变红。
+    ///
+    /// 键序**不是**契约（`serde_json` 按键序输出、JS 按插入序），故两侧都比对解析后的结构；
+    /// 字节层只钉 SSE 帧与字段位置（票据第 4 条）。
+    #[test]
+    fn shared_golden_fixture_parses_into_the_expected_chunk_sequence() {
+        #[derive(serde::Deserialize)]
+        struct Fixture {
+            usage: FixtureUsage,
+            cases: Vec<FixtureCase>,
+        }
+        #[derive(serde::Deserialize)]
+        struct FixtureUsage {
+            prompt_tokens: u32,
+            completion_tokens: u32,
+        }
+        #[derive(serde::Deserialize)]
+        struct FixtureCase {
+            name: String,
+            producer: String,
+            call: serde_json::Value,
+            sse: String,
+        }
+
+        let raw = include_str!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../tests/fixtures/e2e_mock_sse.json"
+        ));
+        let fixture: Fixture = serde_json::from_str(raw).expect("fixture 必须是合法 JSON");
+        assert_eq!(
+            fixture.cases.len(),
+            3,
+            "三种步骤形态：tool call / submit / text"
+        );
+
+        for case in &fixture.cases {
+            // ① 字节契约：`data: ` 前缀、空行分帧、`[DONE]` 终止
+            assert!(
+                case.sse.starts_with("data: "),
+                "{}：缺 data: 前缀",
+                case.name
+            );
+            assert!(
+                case.sse.ends_with("data: [DONE]\n\n"),
+                "{}：缺 [DONE] 终止",
+                case.name
+            );
+            let events: Vec<&str> = case.sse.split("\n\n").filter(|e| !e.is_empty()).collect();
+            assert_eq!(
+                events.len(),
+                3,
+                "{}：三个事件（chunk / usage / [DONE]）",
+                case.name
+            );
+            for event in &events {
+                assert!(event.starts_with("data: "), "{}：{event}", case.name);
+            }
+
+            // ② 逐条喂适配器——与驱动层 `run_stream` 同一入口与同一取载荷方式
+            let mut chunks = Vec::new();
+            for event in &events {
+                let payload = event.strip_prefix("data:").expect("已断言前缀").trim();
+                chunks.extend(
+                    OpenAiCompatible
+                        .parse_chunk(payload)
+                        .unwrap_or_else(|e| panic!("{}：{e}", case.name)),
+                );
+            }
+            assert!(
+                matches!(chunks.last(), Some(StreamChunk::Done)),
+                "{}：流必须以 [DONE] 收尾：{chunks:?}",
+                case.name
+            );
+
+            // ③ 结构：工具调用（tool call / submit）或文本（text）
+            match case.producer.as_str() {
+                "sseTool" => {
+                    let (name, args) = chunks
+                        .iter()
+                        .find_map(|c| match c {
+                            StreamChunk::ToolDelta {
+                                name: Some(n),
+                                arguments_delta: Some(a),
+                                ..
+                            } => Some((n.clone(), a.clone())),
+                            _ => None,
+                        })
+                        .unwrap_or_else(|| panic!("{}：没有工具调用块：{chunks:?}", case.name));
+                    assert_eq!(name, case.call["name"], "{}：工具名", case.name);
+                    let got: serde_json::Value = serde_json::from_str(&args).unwrap_or_else(|e| {
+                        panic!(
+                            "{}：arguments 片段拼起来不是合法 JSON（{e}）：{args}",
+                            case.name
+                        )
+                    });
+                    assert_eq!(got, case.call["arguments"], "{}：工具参数", case.name);
+                    // id 由现场生成，两侧比对前归一为 fixture 里这个固定值（fixture 头注）
+                    assert!(
+                        chunks.iter().any(|c| matches!(
+                            c,
+                            StreamChunk::ToolDelta { id: Some(id), .. } if id == "call_fixture_1"
+                        )),
+                        "{}：工具调用 id 须归一为 call_fixture_1：{chunks:?}",
+                        case.name
+                    );
+                }
+                "sseText" => {
+                    let text = chunks
+                        .iter()
+                        .find_map(|c| match c {
+                            StreamChunk::Text(t) => Some(t.clone()),
+                            _ => None,
+                        })
+                        .unwrap_or_else(|| panic!("{}：没有文本块：{chunks:?}", case.name));
+                    assert_eq!(text, case.call["text"], "{}：文本", case.name);
+                }
+                other => panic!("{}：fixture 里的 producer 不认识：{other}", case.name),
+            }
+
+            // ④ usage：两个字段都要解析出来（漂移时这里就是「完全静默」的那一处）
+            let usage = chunks.iter().find_map(|c| match c {
+                StreamChunk::Usage {
+                    prompt_tokens,
+                    completion_tokens,
+                    ..
+                } => Some((*prompt_tokens, *completion_tokens)),
+                _ => None,
+            });
+            assert_eq!(
+                usage,
+                Some((
+                    Some(fixture.usage.prompt_tokens),
+                    Some(fixture.usage.completion_tokens)
+                )),
+                "{}：usage 字段",
+                case.name
+            );
+        }
+    }
+
     #[test]
     fn usage_and_delta_coexisting_in_one_payload_are_both_kept() {
         // vLLM 式网关：最后一个 chunk 同时带收尾 delta 与 usage

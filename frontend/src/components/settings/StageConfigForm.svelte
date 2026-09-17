@@ -192,7 +192,7 @@
         class="input mono json"
         rows="4"
         bind:value={draft.tools_json}
-        placeholder='&#123;"execute": ["read_file"]&#125; 或 ["read_file"]'
+        placeholder='["read_file", "run_command"]'
       ></textarea>
     </label>
 

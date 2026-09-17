@@ -944,6 +944,13 @@ dir = "~/.agentpipeline/skills"      # 覆盖技能根；缺省回落 {home}/ski
 >
 > **升级注意（行为变化）：** 此前拼错或多余的键会被静默忽略、按默认值运行；现在**启动即报错**。
 > 这是有意的收紧——静默忽略会让「配置写了却没生效」无从察觉。
+>
+> **升级注意（行为变化，决策 154 的后续票）：** 阶段配置的 `tools_json` 里写了 v1 不存在的工具名
+> （拼错、或写了某个 v2 才有的工具）此前是**静默丢弃 + 一行日志**，现在**拒绝**：
+> `PUT /stage-configs/{stage}` 返回 400，报文列出未知名字与 v1 已知工具集（8 个内置 +
+> `spawn_sub_agent`）；库里已有的旧配置则在**启动校验**失败并指明是哪个阶段的哪个名字
+> （不静默放行、也不自动清理——自动清理会把错字悄悄抹掉，让人再也看不到自己写错了什么）。
+> 判据与「引用不存在的 skill → 拒绝启动」同层同源，见 §10.6.4 与 `crates/core/src/config.rs::validate_startup`。
 
 **阶段级 Agent 配置**存储在 SQLite 数据库中，通过前端界面配置。每个阶段可独立设置 provider（引用 `providers` 表的 `provider_id`）、tools、skills、超时覆盖。系统最小基线（mandatory_tools、mandatory_skills、`file_tool_policy`）在代码中硬编码，不可覆盖。模型上下文窗口随 `providers` 表的一行存在一起（决策 46 / 111）——**阶段不单独存 model**，换模型即换 `provider_id`，这样 L0 容量预估（§12.13.3）查找窗口大小的路径唯一。伪阶段（`project_analysis` / `conflict_check` / `validator_cross_check`）复用同一配置机制（决策 67 / 87 / 134）；`cross_family_judge = true` 时 `validator_cross_check` 必须已配置 provider，否则配置加载 fail fast。
 

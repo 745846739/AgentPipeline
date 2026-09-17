@@ -1,0 +1,41 @@
+{
+  "$comment": "跨语言 golden fixture（决策 151 的 2026-09-13 修订；票 e2e-mock/01）。\n内容 = 两侧 mock 实际产出的 SSE 字节（由 frontend/e2e/harness.ts 的 sseTool / sseText 生成，\n仅把随机工具调用 id 固定为 call_fixture_1）。\n三处断言都指向它：Rust 适配器（openai.rs 的 parse_chunk 逐条消费）、Rust testkit mock（sse_tool / sse_text）、\nNode 侧 harness 构造函数（vitest）。任一侧形状漂移 → 那一侧断言变红，强制显式同步。\n比较口径：JSON 键序不是契约（serde_json 按键序输出、JS 按插入序），故两侧都比对**解析后的结构**；\n字节契约只覆盖 SSE 帧（`data: ` 前缀 / 空行分隔 / `[DONE]` 终止）与字段位置。\n工具调用 id 由各自现场生成（Ulid / 时间戳随机数），两侧比对前先归一为 call_fixture_1。",
+  "usage": {
+    "prompt_tokens": 10,
+    "completion_tokens": 5
+  },
+  "cases": [
+    {
+      "name": "tool_call",
+      "producer": "sseTool",
+      "call": {
+        "name": "write_file",
+        "arguments": {
+          "path": "src/lib.rs",
+          "content": "pub fn answer() -> u32 { 42 }\n"
+        }
+      },
+      "sse": "data: {\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\",\"tool_calls\":[{\"index\":0,\"id\":\"call_fixture_1\",\"type\":\"function\",\"function\":{\"name\":\"write_file\",\"arguments\":\"{\\\"path\\\":\\\"src/lib.rs\\\",\\\"content\\\":\\\"pub fn answer() -> u32 { 42 }\\\\n\\\"}\"}}]},\"finish_reason\":\"tool_calls\"}]}\n\ndata: {\"usage\":{\"prompt_tokens\":10,\"completion_tokens\":5}}\n\ndata: [DONE]\n\n"
+    },
+    {
+      "name": "submit",
+      "producer": "sseTool",
+      "call": {
+        "name": "submit_metadata",
+        "arguments": {
+          "readiness": true,
+          "blockers": []
+        }
+      },
+      "sse": "data: {\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\",\"tool_calls\":[{\"index\":0,\"id\":\"call_fixture_1\",\"type\":\"function\",\"function\":{\"name\":\"submit_metadata\",\"arguments\":\"{\\\"readiness\\\":true,\\\"blockers\\\":[]}\"}}]},\"finish_reason\":\"tool_calls\"}]}\n\ndata: {\"usage\":{\"prompt_tokens\":10,\"completion_tokens\":5}}\n\ndata: [DONE]\n\n"
+    },
+    {
+      "name": "text",
+      "producer": "sseText",
+      "call": {
+        "text": "脚本已结束：没有更多步骤了（含中文与 → 符号）"
+      },
+      "sse": "data: {\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\",\"content\":\"脚本已结束：没有更多步骤了（含中文与 → 符号）\"},\"finish_reason\":\"stop\"}]}\n\ndata: {\"usage\":{\"prompt_tokens\":10,\"completion_tokens\":5}}\n\ndata: [DONE]\n\n"
+    }
+  ]
+}

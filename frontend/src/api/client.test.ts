@@ -44,6 +44,20 @@ describe('stage_configs 客户端（票 22）', () => {
     expect(err.message).toContain('validator_cross_check');
   });
 
+  // 决策 154 的后续票：拼错的工具名从「静默丢弃」改为后端**拒绝写入**。
+  // 那句报文要一路走到表单上（`SettingsStages` 把捕获到的 message 交给
+  // `StageConfigForm` 的 error 槽）——不吞错、也不因为保存按钮按过就当成功。
+  it('未知工具名的 400 报文原样回显（含未知名字与已知集合）', async () => {
+    const backend =
+      '阶段 develop 的 tools_json 声明了 v1 不存在的工具：web_search（v1 已知工具集：write_file / ... / spawn_sub_agent）';
+    vi.stubGlobal('fetch', vi.fn(async () => jsonResponse({ error: backend }, 400)));
+    const err = await putStageConfig('develop', { tools_json: ['web_search'] }).catch((e) => e);
+    expect(err).toBeInstanceOf(ApiError);
+    expect(err.status).toBe(400);
+    expect(err.message).toContain('web_search');
+    expect(err.message).toContain('v1 已知工具集');
+  });
+
   it('写请求恒带 X-AgentPipeline 头（决策 128 / 153③），GET 不带', async () => {
     const fetchMock = vi.fn(async () => jsonResponse({ ok: true, stage_configs: [] }));
     vi.stubGlobal('fetch', fetchMock);

@@ -910,7 +910,10 @@ async fn prompt_assembly_consumes_templates_stage_configs_and_agents_md() {
             max_tokens: Some(1234),
             persona_path: None,
             persona_append: Some("附加要求：所有注释用中文。".into()),
-            tools_json: Some(serde_json::json!(["read_file", "not_implemented_tool"])),
+            // 声明的必须是 v1 已知工具（决策 154 的后续票：未知名字现在会被拒绝，
+            // 含未知名字的配置根本走不到执行器）。这里用一个**非基线**的已知工具
+            // （`Skill` 不在 `MANDATORY_TOOLS` 里）来钉「并集」那半段。
+            tools_json: Some(serde_json::json!(["read_file", "Skill"])),
             skills_json: None,
             idle_timeout_sec: None,
             max_duration_sec: None,
@@ -972,10 +975,18 @@ async fn prompt_assembly_consumes_templates_stage_configs_and_agents_md() {
     // 阶段配置采样参数透传给 LLM 适配层
     assert_eq!(vi.temperature, Some(0.25));
     assert_eq!(vi.max_tokens, Some(1234));
-    // 工具并集语义：mandatory 一个不少，声明未实现的被忽略
+    // 工具并集语义（§10.6.2：mandatory ∪ 阶段声明）：基线一个不少，声明的已知工具加进来
     assert!(vi.tools.iter().any(|t| t.name == "submit_metadata"));
     assert!(vi.tools.iter().any(|t| t.name == "read_file"));
-    assert!(!vi.tools.iter().any(|t| t.name == "not_implemented_tool"));
+    assert!(
+        vi.tools.iter().any(|t| t.name == "Skill"),
+        "声明的非基线已知工具须进广告集：{:?}",
+        vi.tools.iter().map(|t| &t.name).collect::<Vec<_>>()
+    );
+    // 「声明了 v1 不存在的工具」这条路已关闭（决策 154 的后续票）：写入与启动都拒绝，
+    // 故执行器里不再有「静默忽略」这条分支可测——那条契约在
+    // `config.rs::unknown_tool_names_fail_startup_validation` 与
+    // 本文件同目录的 `tool_defs_rejects_unknown_names_and_accepts_the_known_set` 上。
 
     // §10.3 user 模板变量：validate_output 拿到设计文档绝对路径
     let vo = requests

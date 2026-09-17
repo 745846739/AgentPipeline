@@ -214,6 +214,42 @@ pub const SKILL_TOOL: &str = "Skill";
 /// 而子代理是**要显式授予**的能力。
 pub const SPAWN_SUB_AGENT_TOOL: &str = "spawn_sub_agent";
 
+/// v1 已知工具名全集：阶段配置**可以**声明的那些。
+///
+/// = [`BUILTIN_TOOLS`]（8）+ 扩展工具 [`SPAWN_SUB_AGENT_TOOL`]。判据只有这一处
+/// （与 [`crate::agent::tools::denied_by_tier`] 同姿态）：工具定义的生成
+/// （`executor::tool_defs`）与阶段配置的准入校验（`config::validate_startup`，
+/// 由 `PUT /stage-configs` 复用）问的是同一个问题——两处各写一份的后果是
+/// 「写入时说不知道这个名字、运行时却把它丢掉」这种只能靠现象定位的漂移。
+///
+/// **不在这里的名字 = v1 不存在的能力**：声明它是配置错误，不是「暂时没实现」。
+/// 故它一律 **fail fast**（决策 154 之后立的这条姿态，与 `deny_unknown_fields` /
+/// 「引用不存在的 skill → 拒绝启动」同源），不再有「静默丢弃 + 一条 warn」这条路。
+pub fn is_known_tool_name(name: &str) -> bool {
+    BUILTIN_TOOLS.contains(&name) || name == SPAWN_SUB_AGENT_TOOL
+}
+
+/// [`is_known_tool_name`] 承认的全部名字（报错时列出，让用户照着改）。
+pub fn known_tool_names() -> Vec<&'static str> {
+    let mut out: Vec<&'static str> = BUILTIN_TOOLS.to_vec();
+    out.push(SPAWN_SUB_AGENT_TOOL);
+    out
+}
+
+/// 「声明了 v1 不存在的工具」的**唯一**报文（决策 154 的后续票）。
+///
+/// 两处会报它：写入 / 启动校验（`config::validate_startup`，含 `PUT /stage-configs`）与执行期
+/// 兜底（`executor::tool_defs`，校验被绕过时才可能走到）。同一个错误只能有一种说法——两处各写
+/// 一句的后果是同一个配置问题看起来像两个不同的问题，而对这句话有支配权的（未来加白名单、
+/// 改措辞）只有这里。`where_` 是定位串（如「阶段 develop」/「阶段 develop 的 tools_json」）。
+pub fn unknown_tools_message(where_: &str, unknown: &[String]) -> String {
+    format!(
+        "{where_} 声明了 v1 不存在的工具：{}（v1 已知工具集：{}）",
+        unknown.join(" / "),
+        known_tool_names().join(" / ")
+    )
+}
+
 /// 从阶段的 serde 结构体派生 `submit_metadata` 的 tool 定义（决策 38：schema 与校验同源）。
 pub fn submit_metadata_tool<T: JsonSchema>(description: impl Into<String>) -> ToolDef {
     ToolDef {
@@ -320,6 +356,21 @@ mod tests {
         assert!(BUILTIN_TOOLS.contains(&"submit_metadata"));
         assert!(BUILTIN_TOOLS.contains(&SKILL_TOOL));
         assert!(!BUILTIN_TOOLS.contains(&"spawn_sub_agent"));
+    }
+
+    /// 判据只有一处（决策 154 的后续票）：`is_known_tool_name` 承认的正好是
+    /// 「全部内置 + 扩展工具」——多认一个名字会让配置写出运行时根本不存在的工具。
+    #[test]
+    fn known_tool_names_is_builtins_plus_extended() {
+        let known = known_tool_names();
+        assert_eq!(known.len(), BUILTIN_TOOLS.len() + 1);
+        for b in BUILTIN_TOOLS {
+            assert!(known.contains(&b), "{b} 应在已知集合里");
+            assert!(is_known_tool_name(b));
+        }
+        assert!(is_known_tool_name(SPAWN_SUB_AGENT_TOOL));
+        assert!(!is_known_tool_name("web_search"));
+        assert!(!is_known_tool_name("read_fil"), "拼错的名字不是已知工具");
     }
 
     /// 决策 172③：`Skill` **不进** `MANDATORY_TOOLS`——它由阶段声明启用，

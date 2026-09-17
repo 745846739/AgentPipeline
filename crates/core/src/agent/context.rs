@@ -8,7 +8,6 @@
 
 use super::client::{Message, Role};
 use crate::config::Settings;
-use crate::types::{Node, Stage};
 
 /// 模型输出预留（L0 容量预估用）。
 pub const OUTPUT_RESERVE: usize = 4096;
@@ -425,60 +424,16 @@ fn first_error_or_exit(content: &str) -> String {
 }
 
 // ─────────────────────────────── L4 兜底 ───────────────────────────────
-
-/// L4 动作（§12.13.3）。
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum L4Action {
-    /// 按节点类型分批（test 分批执行 / review 分批评审）。
-    BatchByNode,
-    /// 拆子代理（仅 spawn_sub_agent 开启时）。
-    SpawnSubAgents,
-    /// 进入 pending(context_overflow)。
-    PendingContextOverflow,
-}
-
-/// L4 计划。
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct L4Plan {
-    /// 强制压缩时保留的轮数。
-    pub force_keep_recent_rounds: usize,
-    pub action: L4Action,
-}
-
-/// L4：L3 后仍超限时的降级路径。
-///
-/// 这里是 **L4 的自动降级**：`spawn_sub_agent_enabled` 表示「阶段声明了
-/// `spawn_sub_agent`」这一事实，用来判断理论上可否自动拆分。注意它与
-/// [`crate::pipeline::subagent`] 的**只读子代理工具**是两件事——后者（票 08）是模型
-/// 在对话中主动调用的能力，不参与 L4 判定，也没有改变本节的现状。
-///
-/// `BatchByNode` / `SpawnSubAgents` 从未实现，executor 一律按
-/// `pending(context_overflow)` 收口（决策 148 ⑦ / 154：L4 兜底只有两级）。
-///
-/// **既存偏差（非票 08 引入，且票 08 未改动它）**：决策 154① 裁定删除
-/// `L4Plan` / `L4Action` / `plan_l4` / `l4_pending_kind` 这一组，但它们在
-/// `84d2c8f`（2026-09-12）随执行器落地后**始终未被删除**；executor 只读 `plan.action`
-/// 来打一条 warn，`force_keep_recent_rounds` 与 `l4_pending_kind` 仍只有测试引用。
-/// 该清理不属于票 08（本票只改注释、不动语义），登记为既存瑕疵。
-pub fn plan_l4(stage: Stage, node: Node, spawn_sub_agent_enabled: bool) -> L4Plan {
-    let action = match (stage, node) {
-        (Stage::Test, Node::Execute) | (Stage::Review, Node::Execute) => L4Action::BatchByNode,
-        (Stage::Develop, Node::Execute) if spawn_sub_agent_enabled => L4Action::SpawnSubAgents,
-        _ => L4Action::PendingContextOverflow,
-    };
-    L4Plan {
-        force_keep_recent_rounds: 2,
-        action,
-    }
-}
-
-/// L4 兜底产生的 pending 类型（决策 148 ⑦：未开启子代理 → context_overflow）。
-pub fn l4_pending_kind(plan: L4Plan) -> Option<crate::types::PendingKind> {
-    match plan.action {
-        L4Action::PendingContextOverflow => Some(crate::types::PendingKind::ContextOverflow),
-        _ => None,
-    }
-}
+//
+// **L4 在 v1 只有两级**（决策 154）：压缩（`compact_messages_from`，L3 的那一次）→
+// `pending(context_overflow)`。§12.13.3 设计阶梯里的第二级（按节点分批 / 拆子代理）
+// 整体不做，因此本模块**没有**任何 L4 计划结构——原先的 `L4Plan` / `L4Action` /
+// `plan_l4` / `l4_pending_kind` 整组（`84d2c8f` 落地）已按决策 154① 删除：那两个
+// 非 pending 变体永不可达（executor 返回后立刻否决），`force_keep_recent_rounds`
+// 无消费者。pending 由 `pipeline::executor` 在压缩后仍超硬限时**直接构造**。
+//
+// 与 `spawn_sub_agent` 的边界（决策 172③）：那个只读子代理是**模型在对话中主动调用的
+// 工具**，与这里的自动降级路径互不相干——它不参与 L4 判定（决策 154 的原裁决不变）。
 
 #[cfg(test)]
 mod tests {
@@ -756,47 +711,16 @@ mod tests {
     }
 
     // ── L4 兜底 ──
-
-    #[test]
-    fn l4_without_sub_agents_goes_to_context_overflow_pending() {
-        // 决策 148 ⑦：子代理默认关闭，L4 直接 pending(context_overflow)
-        let plan = plan_l4(Stage::Develop, Node::Execute, false);
-        assert_eq!(plan.action, L4Action::PendingContextOverflow);
-        assert_eq!(plan.force_keep_recent_rounds, 2);
-        assert_eq!(
-            l4_pending_kind(plan),
-            Some(crate::types::PendingKind::ContextOverflow)
-        );
-    }
-
-    #[test]
-    fn l4_batches_by_node_type_for_test_and_review() {
-        assert_eq!(
-            plan_l4(Stage::Test, Node::Execute, false).action,
-            L4Action::BatchByNode
-        );
-        assert_eq!(
-            plan_l4(Stage::Review, Node::Execute, false).action,
-            L4Action::BatchByNode
-        );
-    }
-
-    #[test]
-    fn l4_uses_sub_agents_when_enabled_for_develop_only() {
-        assert_eq!(
-            plan_l4(Stage::Develop, Node::Execute, true).action,
-            L4Action::SpawnSubAgents
-        );
-        assert_eq!(
-            l4_pending_kind(plan_l4(Stage::Develop, Node::Execute, true)),
-            None
-        );
-        // 其他节点即便开启也用分批 / pending
-        assert_eq!(
-            plan_l4(Stage::Test, Node::Execute, true).action,
-            L4Action::BatchByNode
-        );
-    }
+    //
+    // 「压缩后仍超硬限 → `pending(context_overflow)`」这条行为的等价断言在 L2：
+    // `crates/core/tests/executor.rs::context_overflow_ctx` 造成真超限现场（窗口 1000 /
+    // 硬限 900 + 一次大块元数据），两条用例分别钉住 pending 的 kind 与「退出路径补写会话行」。
+    // 它落在执行器而非本模块——构造 pending 的是 `executor::enforce_context_budget`，
+    // 本模块只提供 `should_compact` / `over_hard_limit` 两个谓词（`compact_and_hard_limit_predicates`）。
+    //
+    // 原先此处还有三条针对已删除的 `plan_l4` / `L4Action` 的断言；它们钉的是
+    // 「哪个变体被选中」，而那两个非 pending 变体从未实现也从不可达（决策 154①），
+    // 故随该组一并删除。
 
     #[test]
     fn compact_and_hard_limit_predicates() {

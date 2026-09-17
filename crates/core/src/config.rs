@@ -932,6 +932,33 @@ fn parse_skill_decls_opt(
     }
 }
 
+/// 阶段配置声明的工具名（`tools_json`，决策 154 的后续票）。
+///
+/// **与 [`parse_skill_decls`] 的宽松口径刻意不同**：技能那一侧的「非字符串元素按不是声明
+/// 忽略」是历史兼容（旧版单字符串形态），而工具名没有这层包袱——`tools_json` 一直是字符串数组。
+/// 写了不是字符串的东西（`42` / `null` / `{"name": "read_file"}`）在这里就是**配置错误**：
+/// 容忍它等于给「配置写了却没生效」留一条静默路径，而那正是本票要关掉的东西。
+///
+/// `where_` 把报错定位到阶段（照 [`parse_skill_decls`] 的报错风格）。
+pub fn parse_tool_names(value: Option<&serde_json::Value>, where_: &str) -> Result<Vec<String>> {
+    let Some(value) = value else {
+        return Ok(Vec::new());
+    };
+    let items = value
+        .as_array()
+        .ok_or_else(|| Error::Config(format!("{where_} 的 tools_json 不是数组：{value}")))?;
+    let mut out = Vec::with_capacity(items.len());
+    for item in items {
+        let name = item.as_str().ok_or_else(|| {
+            Error::Config(format!(
+                "{where_} 的 tools_json 里有非字符串项：{item}（工具名必须是字符串）"
+            ))
+        })?;
+        out.push(name.to_string());
+    }
+    Ok(out)
+}
+
 /// 启动校验的输入（provider / 阶段配置来自 DB）。
 #[derive(Debug, Clone, Default)]
 pub struct StartupInputs {
@@ -960,6 +987,8 @@ pub struct StartupReport {
 /// - `cross_family_judge = true` 但 `validator_cross_check` 伪阶段没有可用 provider → 拒绝启动；
 /// - 阶段引用的 provider 不存在 / 被禁用 / vendor 不受支持 → 拒绝启动；
 /// - 引用的 skill 不存在 → 拒绝启动（阶段级与节点级都校验，节点级报错指明节点，决策 170）；
+/// - `tools_json` 声明了 v1 不存在的工具名 → 拒绝启动（决策 154 的后续票；
+///   形态非法——非数组 / 非字符串项——同样拒绝，见 [`parse_tool_names`]）；
 /// - 提供 `home_root` 时：阶段 `persona_path` 不可读或内容为空 → 拒绝启动（§10.6.4）；
 /// - 提供 `skills_root` 时：知识型技能的正文不可读或为空 → 拒绝启动（决策 170），
 ///   且 frontmatter `name` 与目录名不一致 → 拒绝启动（决策 172）；
@@ -1044,6 +1073,27 @@ pub fn validate_startup(inputs: &StartupInputs) -> Result<StartupReport> {
                     )?;
                 }
             }
+        }
+        // 工具名校验（决策 154 的后续票，姿态与「引用不存在的 skill」同层同源）：
+        // `tools_json` 里出现 v1 不存在的名字 → **拒绝**，不再「静默丢弃 + 一条 warn」。
+        // 触发场景是前端那格自由文本：拼错的名字在旧行为下只留一行日志，「配了却没生效」
+        // 因此无从察觉（与 `deny_unknown_fields` / 决策 134 的 fail fast 姿态对齐）。
+        //
+        // 存量配置（库里已有的行）走同一条路：启动即报错并指明是哪个阶段的哪个名字，
+        // **不静默放行、也不自动清理**——自动清理会把用户的错字悄悄抹掉，让人再也看不到
+        // 自己写错了什么。要放行就改那一行配置（`PUT /stage-configs` 会给出同样的报文）。
+        let where_ = format!("阶段 {} 的 tools_json", cfg.stage);
+        let mut unknown: Vec<String> = Vec::new();
+        for name in parse_tool_names(cfg.tools_json.as_ref(), &where_)? {
+            if !crate::agent::client::is_known_tool_name(&name) && !unknown.contains(&name) {
+                unknown.push(name);
+            }
+        }
+        if !unknown.is_empty() {
+            // 报文与执行期兜底同源（`client::unknown_tools_message`）：同一个错误一种说法
+            return Err(Error::Config(crate::agent::client::unknown_tools_message(
+                &where_, &unknown,
+            )));
         }
         // §10.6.4：persona「必须存在且非空」在启动时校验（运行时 resolve_stage_persona
         // 仍有同样检查兜底——手工改库可绕过启动校验）
@@ -1941,5 +1991,49 @@ mod tests {
         std::fs::remove_file(&good).unwrap();
         let err = validate_startup(&inputs).unwrap_err();
         assert!(err.to_string().contains("不可读"), "{err}");
+    }
+
+    /// 决策 154 的后续票：`tools_json` 里的**未知工具名拒绝**（静默丢弃 → fail fast）。
+    ///
+    /// 与「引用不存在的 skill」同层同源：判据是 `client::is_known_tool_name` 一处，
+    /// 报文给出未知名字 + v1 已知工具集，让用户照着改。
+    #[test]
+    fn unknown_tool_names_fail_startup_validation() {
+        let cfg = |tools: serde_json::Value| StartupInputs {
+            stage_configs: vec![StageConfig {
+                stage: "develop".into(),
+                tools_json: Some(tools),
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+
+        // 正面：v1 已知集（8 内置 + 扩展工具）逐个都能通过——拒绝不许拒得比该拒的多
+        for name in crate::agent::client::known_tool_names() {
+            let inputs = cfg(serde_json::json!([name]));
+            validate_startup(&inputs).unwrap_or_else(|e| panic!("已知工具 {name} 不该被拒：{e}"));
+        }
+        // 未声明（None）与空数组也通过
+        assert!(validate_startup(&StartupInputs::default()).is_ok());
+        validate_startup(&cfg(serde_json::json!([]))).unwrap();
+
+        // 未知名字 → 拒绝，报文含名字与已知集合
+        let err = validate_startup(&cfg(serde_json::json!(["read_file", "web_search"])))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("web_search"), "{err}");
+        assert!(err.contains("develop"), "{err}");
+        assert!(err.contains("v1 已知工具集"), "{err}");
+        assert!(err.contains("spawn_sub_agent"), "已知集合含扩展工具：{err}");
+
+        // 形态非法同样拒绝（非数组 / 非字符串项）——旧行为会把它们静默忽略
+        let err = validate_startup(&cfg(serde_json::json!({"read_file": true})))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("不是数组"), "{err}");
+        let err = validate_startup(&cfg(serde_json::json!(["read_file", 42])))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("非字符串"), "{err}");
     }
 }

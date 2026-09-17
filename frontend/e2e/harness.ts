@@ -176,7 +176,19 @@ function routeKey(system: string): string | null {
   return null;
 }
 
-function sseTool(name: string, args: unknown): string {
+/**
+ * 一个工具调用步的 SSE 字节（tool call / submit 两种步都走它）。
+ *
+ * **导出供 vitest 侧断言**（票 e2e-mock/01）：`frontend/src/lib/e2e-mock-fixture.test.ts`
+ * 用它产出字节，再与提交进仓库的 `tests/fixtures/e2e_mock_sse.json` 逐字段比对；
+ * Rust 侧（testkit 的 `sse_tool` / 适配器的 `parse_chunk`）指向同一份 fixture。
+ * 工具调用 `id` 现场生成，比对前按 fixture 的归一约定替换。
+ *
+ * 该用例跑在 **node 环境**（`@vitest-environment node`，照 `lib/behavior-map.test.ts` 的先例）：
+ * jsdom 环境下本文件顶部的 `fileURLToPath(new URL('.', import.meta.url))` 会抛
+ * （`import.meta.url` 是 http 形态），node 环境下 `import.meta.url` 才是 file: 协议。
+ */
+export function sseTool(name: string, args: unknown): string {
   const chunk = {
     choices: [
       {
@@ -203,7 +215,8 @@ function sseTool(name: string, args: unknown): string {
   );
 }
 
-function sseText(text: string): string {
+/** 一个文本步的 SSE 字节。导出理由同 {@link sseTool}（票 e2e-mock/01）。 */
+export function sseText(text: string): string {
   const chunk = {
     choices: [{ index: 0, delta: { role: 'assistant', content: text }, finish_reason: 'stop' }],
   };
@@ -269,7 +282,10 @@ async function startMockLlm(
       const owner = byId ?? extraScripts.find((e) => user.includes(e.title))?.title ?? '';
       const effRounds =
         extraScripts.find((e) => e.title === owner)?.rounds ?? state.rounds;
-      const nodeKey = owner ? `${owner}\u0000${key}` : key;
+      // `key === null`（认不出的请求）时取空串：下面每一处使用都由 `key` 把关，
+      // 这个值不会被读到；写成 string 是为了让类型检查看得懂这件事（svelte-check 会
+      // 顺着 vitest 的 import 检查本文件——票 e2e-mock/01）。
+      const nodeKey = key === null ? '' : owner ? `${owner}\u0000${key}` : key;
       // 新节点运行：请求只有 system + user（openai.rs 的 build_body 在上述两条之后再追加
       // 历史 messages）。每见到一次新一轮，轮指针 +1（首次 → 0），步骤指针归零。
       //

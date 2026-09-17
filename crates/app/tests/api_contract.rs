@@ -2473,6 +2473,96 @@ async fn stage_config_rejects_unusable_provider_and_persona() {
 }
 
 #[tokio::test]
+async fn stage_config_write_rejects_unknown_tool_names() {
+    // 决策 154 的后续票：拼错的工具名从「静默丢弃 + 一条 warn」改为**拒绝写入**。
+    // 报文要把未知名字与 v1 已知工具集一起给出——照它改配置才知道该写什么。
+    let api = api().await;
+
+    let (status, body) = put(
+        &api,
+        "/stage-configs/develop",
+        serde_json::json!({"tools_json": ["read_file", "web_search", "read_fil"]}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    let msg = body["error"].as_str().unwrap();
+    assert!(msg.contains("web_search"), "须点名未知工具：{msg}");
+    assert!(msg.contains("read_fil"), "每个未知名字都要列出：{msg}");
+    assert!(msg.contains("develop"), "须定位到阶段：{msg}");
+    // 已知工具集一并给出（照着改，不用去翻文档）
+    assert!(msg.contains("read_file"), "已知集合须列出：{msg}");
+    assert!(msg.contains("spawn_sub_agent"), "已知集合含扩展工具：{msg}");
+
+    // 形态非法同样拒绝：非字符串项在旧行为下会被静默忽略，那正是本票要关掉的路
+    let (status, body) = put(
+        &api,
+        "/stage-configs/develop",
+        serde_json::json!({"tools_json": ["read_file", 42]}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    assert!(
+        body["error"].as_str().unwrap().contains("非字符串"),
+        "{body}"
+    );
+
+    // 校验失败不得落库
+    assert!(api
+        .state
+        .store
+        .get_stage_config("develop")
+        .await
+        .unwrap()
+        .is_none());
+
+    // 正面：v1 已知工具集（8 内置 + spawn_sub_agent）**全都能写进去**——否则「拒绝」
+    // 可能只是拒得太多。逐个穷尽而不是抽查：漏掉一个名字的表现是「这个工具配不上」。
+    let (status, body) = put(
+        &api,
+        "/stage-configs/develop",
+        serde_json::json!({"tools_json": [
+            "write_file", "edit_file", "read_file", "delete_file",
+            "list_dir", "run_command", "submit_metadata", "Skill",
+            "spawn_sub_agent"
+        ]}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+}
+
+/// 存量配置的升级路径（决策 154 的后续票）：库里已有的行带未知工具名时，**启动校验**
+/// 确定地拒绝并指明是哪个阶段的哪个名字——不静默放行、也不自动清理（自动清理会把
+/// 用户的错字悄悄抹掉，让人再也看不到自己写错了什么）。
+///
+/// 直接落库（绕开 `PUT`，它现在会拒）模拟「升级前写下的配置」。
+#[tokio::test]
+async fn startup_rejects_an_existing_stage_config_with_an_unknown_tool() {
+    use agentpipeline_core::types::StageConfig;
+
+    let api = api().await;
+    api.state
+        .store
+        .upsert_stage_config(&StageConfig {
+            stage: "develop".into(),
+            tools_json: Some(serde_json::json!(["read_file", "web_search"])),
+            updated_at: api.state.store.now(),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+
+    let err = api
+        .state
+        .store
+        .validate_startup(&api.state.settings)
+        .await
+        .expect_err("存量配置含未知工具名 → 启动必须失败")
+        .to_string();
+    assert!(err.contains("develop"), "须指明阶段：{err}");
+    assert!(err.contains("web_search"), "须指明名字：{err}");
+}
+
+#[tokio::test]
 async fn stage_config_delete_refused_when_cross_family_judge_requires_it() {
     // 与启动同源的校验（决策 134⑤）：删掉被开关依赖的伪阶段配置 → 拒绝
     let api = api_with(Settings {

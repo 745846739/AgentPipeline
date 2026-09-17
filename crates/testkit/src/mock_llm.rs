@@ -233,9 +233,21 @@ const AGENT_NODES: [(Stage, Node); 12] = [
 ];
 
 /// 伪阶段 persona 首句 → `agent_type`（票 16 的伪阶段请求据此路由 `Script` 的伪阶段队列）。
-const PSEUDO_MARKERS: [(&str, &str); 2] = [
+///
+/// **与 Node 侧 `frontend/e2e/harness.ts::PERSONA_ROUTES` 的伪阶段三条一一对应**
+/// （票 e2e-mock/01）：两侧都靠子串匹配 system prompt，一处改了模板而另一处没同步的表现是
+/// Node mock 静默回「脚本已结束」文本、任务卡到超时。
+///
+/// **已知限制（票面要求写明，不得静默假设）**：匹配的是**内嵌 persona**
+/// （`PseudoStage::embedded_persona`）。伪阶段配置若写了 `persona_path`，system prompt 里就是
+/// 用户那份文件的内容，这个 marker 便不在其中——该伪阶段在脚本化 mock 下**因此无法路由**
+/// （`executor.rs` 的 pseudo 分支：`persona_path` 覆盖内嵌 persona，决策 7 / 87）。
+/// `persona_append` 不受影响（追加，首句仍在）。真要用 `persona_path` 覆盖
+/// `project_analysis`，该用例得走 [`MockLlm::start`] 的静态路由。
+const PSEUDO_MARKERS: [(&str, &str); 3] = [
     ("你是设计语义冲突比对 agent", "pseudo:conflict_check"),
     ("你是独立复核 agent", "pseudo:validator_cross_check"),
+    ("你是项目分析 agent", "pseudo:project_analysis"),
 ];
 
 /// 取出 OpenAI 兼容请求体里第一条 system message 的内容。
@@ -392,6 +404,121 @@ async fn write_response(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 把一段 SSE 文本拆成**可解析的字节契约**：逐事件的 JSON 载荷（`[DONE]` 留作字符串）。
+    ///
+    /// 帧层断言（`data: ` 前缀 / 空行分帧）在拆的过程中一并钉住——这就是 fixture 头注说的
+    /// 「键序不是契约，帧与字段位置才是」。两处归一：
+    ///
+    /// - **工具调用 id** 由两侧现场生成（Ulid / 时间戳随机数），归一为 fixture 里的固定值；
+    /// - **`function.arguments`** 是「由谁产出就按谁的键序」的不透明串（本侧与 Node 侧各自
+    ///   `JSON.stringify` 调用方给的参数），下游按 JSON 解析它，故比较**解析后的对象**——
+    ///   原始字符串的键序不是契约。
+    fn frames(sse: &str) -> Vec<serde_json::Value> {
+        assert!(sse.starts_with("data: "), "缺 `data: ` 前缀：{sse}");
+        assert!(sse.ends_with("\n\n"), "结尾须是空行：{sse}");
+        let mut out = Vec::new();
+        for event in sse.split("\n\n").filter(|e| !e.is_empty()) {
+            let payload = event
+                .strip_prefix("data: ")
+                .unwrap_or_else(|| panic!("事件缺 `data: ` 前缀：{event}"));
+            let mut value: serde_json::Value = if payload == "[DONE]" {
+                serde_json::Value::String(payload.to_string())
+            } else {
+                serde_json::from_str(payload).unwrap_or_else(|e| panic!("{event}：{e}"))
+            };
+            if let Some(calls) = value
+                .pointer_mut("/choices/0/delta/tool_calls")
+                .and_then(|c| c.as_array_mut())
+            {
+                for call in calls {
+                    if call.get("id").is_some() {
+                        call["id"] = serde_json::json!("call_fixture_1");
+                    }
+                    if let Some(args) = call
+                        .pointer("/function/arguments")
+                        .and_then(|a| a.as_str())
+                        .and_then(|a| serde_json::from_str::<serde_json::Value>(a).ok())
+                    {
+                        call["function"]["arguments"] = args;
+                    }
+                }
+            }
+            out.push(value);
+        }
+        out
+    }
+
+    fn golden_fixture() -> serde_json::Value {
+        serde_json::from_str(include_str!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../tests/fixtures/e2e_mock_sse.json"
+        )))
+        .expect("fixture 必须是合法 JSON")
+    }
+
+    /// 跨语言 golden fixture 的**生产侧**那一半（票 e2e-mock/01）：
+    /// `sse_tool` / `sse_text` 的产出必须与 `tests/fixtures/e2e_mock_sse.json` 一致。
+    ///
+    /// 另一半在消费侧（`crates/core/src/agent/providers/openai.rs` 的同名用例）与 Node 侧
+    /// （`frontend/src/lib/e2e-mock-fixture.test.ts`）。三处任一漂移 → 该处变红。
+    #[test]
+    fn sse_helpers_match_the_shared_golden_fixture() {
+        let fixture = golden_fixture();
+        let cases = fixture["cases"].as_array().expect("cases 是数组");
+        assert_eq!(cases.len(), 3, "三种步骤形态：tool call / submit / text");
+
+        for case in cases {
+            let name = case["name"].as_str().unwrap();
+            let actual = match case["producer"].as_str().unwrap() {
+                "sseTool" => sse_tool(
+                    case["call"]["name"].as_str().unwrap(),
+                    &case["call"]["arguments"].to_string(),
+                ),
+                "sseText" => sse_text(case["call"]["text"].as_str().unwrap()),
+                other => panic!("{name}：不认识的 producer {other}"),
+            };
+            // 逐字段一致 + 帧一致（id 已归一）
+            assert_eq!(
+                frames(&actual),
+                frames(case["sse"].as_str().unwrap()),
+                "{name}：testkit mock 的产出与 fixture 不一致"
+            );
+        }
+
+        // usage 常量同源：fixture 是唯一事实源——helper 里的字面量改了这里就红
+        let usage = frames(&sse_text("x"))
+            .into_iter()
+            .find_map(|v| v.get("usage").cloned())
+            .expect("usage 事件");
+        assert_eq!(usage, fixture["usage"], "usage 字段须与 fixture 同源");
+    }
+
+    /// 三条伪阶段 marker 都能在**组装后的 system prompt** 里命中（票 e2e-mock/01 的
+    /// 「实现时验证」项）。第三条（`pseudo:project_analysis`）是本次补的，此前 Rust mock
+    /// 覆盖不到该伪阶段。
+    ///
+    /// 这里走的是内嵌 persona 那条路——`persona_path` 覆盖时路由失效的**已知限制**见
+    /// [`PSEUDO_MARKERS`] 的文档。
+    #[test]
+    fn pseudo_markers_survive_prompt_assembly() {
+        use agentpipeline_core::agent::prompts::build_system_prompt;
+        use agentpipeline_core::pipeline::pseudo::PseudoStage;
+
+        for stage in [
+            PseudoStage::ConflictCheck,
+            PseudoStage::ValidatorCrossCheck,
+            PseudoStage::ProjectAnalysis,
+        ] {
+            let system = build_system_prompt("ctx", stage.embedded_persona(), "worktree：/wt", &[]);
+            assert_eq!(
+                pseudo_agent_type(&system),
+                Some(stage.agent_type()),
+                "{} 的内嵌 persona 过完组装须仍含 marker",
+                stage.stage_key()
+            );
+        }
+    }
 
     #[tokio::test]
     async fn serves_scripted_routes_and_records_requests() {

@@ -1,5 +1,7 @@
 # e2e mock 契约：共享 golden fixture 双向断言 + 补 project_analysis 路由
 
+**Status:** done（2026-09-17）
+
 来源：2026-09-13 针对决策 151 mock 偏差的专访（裁决已写入 `decisions.md` 决策 151 行的
 **2026-09-13 修订**）。本目录承接该裁决的执行面。
 
@@ -30,5 +32,13 @@ Node mock 会静默回「脚本已结束」文本、任务卡在断言前的超�
 ## 关键约束
 
 - 验收须落在既有质量闸门内：`cargo fmt --check`、`clippy --workspace --all-targets -- -D warnings`、
-  `cargo test --workspace`；前端加跑 vitest / svelte-check / build，以及 `just frontend-e2e`。
+  `cargo test --workspace`；前端加跑 vitest / svelte-check / build，以及 `make check-e2e`（仓库用 Makefile，无 justfile）。
 - 与决策冲突时必须显式标注决策编号（AGENTS.md）。权威裁决是决策 151 的 2026-09-13 修订。
+
+## 交付（2026-09-17）
+
+`tests/fixtures/e2e_mock_sse.json` 落地，三处断言指向它（Node 产出 / Rust mock 产出 / 适配器消费）；
+`PSEUDO_MARKERS` 补到三条，`pseudo_markers_survive_prompt_assembly` 钉住组装后仍命中，
+`persona_path` 覆盖导致的**路由失效**记为已知限制。一处对票面的偏离：SSE 构造函数住进了新模块
+`frontend/e2e/sse.ts`（harness 改为 import 它，仍是同一份实现）——`harness.ts` 顶部的
+`import.meta.url` 在 vitest 转换管线里不是 file: 协议，import 它会当场抛错。详见票据「交付」段。
