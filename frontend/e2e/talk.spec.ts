@@ -12,7 +12,7 @@
  * 操作台的确认钮，票 03）、两张急停同挂时两张都留在第一屏（决策 183）。
  */
 
-import { expect, test, type Locator } from '@playwright/test';
+import { expect, test, type Locator, type Page } from '@playwright/test';
 import { existsSync, readFileSync } from 'node:fs';
 import { join } from 'node:path';
 import {
@@ -262,11 +262,64 @@ async function expectZoneNeedsNoScroll(zone: Locator): Promise<void> {
 }
 
 /**
+ * 确认钮**够得到**（决策 208 的回归门）。
+ *
+ * 四条一起看才成立——只测「钮可见」在一条缝里也是绿的（元素可见，只是点不到）：
+ *   ① 时间线拿到了它的下限（`--timeline-floor`，§3.3 定值 160px）；
+ *   ② 钮**中心点**命中的是钮自己，不是输入坞悬出框沿的名牌（2026-09-17 的实测里，
+ *      把点击截走的正是它）；
+ *   ③ 输入坞与整页都没被顶坏——零和的分法不许拆东墙补西墙。
+ */
+async function expectProposalReachable(page: Page): Promise<void> {
+  const timeline = page.locator('.timeline');
+  const btn = timeline.locator('.turn.prop .pacts button').first();
+  await expect(btn).toBeVisible();
+
+  // ① 这一格拿到了它的下限（26px 那次它只够放下自己的上下内边距）
+  const tl = await timeline.boundingBox();
+  expect(tl).not.toBeNull();
+  expect(
+    tl?.height ?? 0,
+    '时间线短于下限：确认钮所在的这一格又被挤成一条缝',
+  ).toBeGreaterThanOrEqual(160);
+
+  // ② 滚进这一格之后它**整颗**在里面（这也就是点击前 playwright 会做的滚屏）
+  await btn.scrollIntoViewIfNeeded();
+  const b = await btn.boundingBox();
+  expect(b).not.toBeNull();
+  expect(b?.y ?? 0, '钮没被完全滚进时间线').toBeGreaterThanOrEqual((tl?.y ?? 0) - 1);
+  expect(
+    (b?.y ?? 0) + (b?.height ?? 0),
+    '钮没被完全滚进时间线',
+  ).toBeLessThanOrEqual((tl?.y ?? 0) + (tl?.height ?? 0) + 1);
+
+  // ③ 它的中心点命中的是它自己——不是悬出输入坞框沿的名牌（实测里正是它截走的点击）
+  const cx = Math.round((b?.x ?? 0) + (b?.width ?? 0) / 2);
+  const cy = Math.round((b?.y ?? 0) + (b?.height ?? 0) / 2);
+  const hit = await page.evaluate(
+    ([x, y]) => {
+      const el = document.elementFromPoint(x, y);
+      return el ? `${el.tagName}.${String(el.className)}` : 'null';
+    },
+    [cx, cy] as [number, number],
+  );
+  expect(hit, '钮的中心点被别的东西截走了').toContain('BUTTON');
+
+  // ④ 代价不许落在输入坞与整页上（零和的分法不能拆东墙补西墙）
+  await expect(page.locator('.typer button[type=submit]')).toBeInViewport();
+  const pageOverflow = await page.evaluate(
+    () => document.documentElement.scrollHeight - window.innerHeight,
+  );
+  expect(pageOverflow, '整页长出了滚动条（急停钉在第一屏就只剩口头保证）').toBeLessThanOrEqual(0);
+}
+
+/**
  * 对讲台 · 两张急停同时挂在状态区（决策 183）。
  *
  * **这条用例钉的是折叠的存在理由**：一张急停轮内联着后端下发的动作集，最高的一种形状
- * （`info_insufficient`：带补充输入的 resume + 旁路动作）约 330px，而状态区上限桌面 46vh
- * 在 13″ 笔记本上可用只有约 344px——**展开一张就已经占满整个区**。不折叠的话，两张同挂时
+ * （`info_insufficient`：带补充输入的 resume + 旁路动作）约 330px，而状态区上限桌面是
+ * 「46vh 与『先留给时间线的那一份』两项取小」（决策 208），13″ 上可用约 202px——
+ * **展开一张就已经占满整个区**。不折叠的话，两张同挂时
  * 最老的那张必然被挤到区内滚动之外，正是 §3.3 说的「本页最不能出的错」。
  *
  * 断言口径是**几何**，不是文案：两张都完整落在状态区里、且状态区自己不需要区内滚动。
@@ -296,7 +349,7 @@ test.describe('对讲台 · 两张急停同时在状态区（决策 183）', () 
 
   test('默认一张都不展开：两张都在第一屏，点开后后端下发的动作仍可下发', async ({ page }) => {
     const bundle = watchBundle(page);
-    // 桌面最紧的一档（也是 playwright 默认视口）：46vh ≈ 331px
+    // 桌面最紧的一档（也是 playwright 默认视口）：上限 min(46vh≈331px, 720-386-160=174px)
     await page.setViewportSize({ width: 1280, height: 720 });
     await page.goto(`${app.webBase}/#/talk`);
     await settleBundle(page, bundle);
@@ -474,10 +527,10 @@ test.describe('对讲台 · 对话（票 03）', () => {
    */
   test('按下确认钮：文件真的写了，结果回灌成一轮', async ({ page }) => {
     const bundle = watchBundle(page);
-    // **这一档要给对话区留出高度**：状态区占 46vh，720px 的窗口下时间线只剩一条缝——
-    // 确认钮内联在时间线里（决策 207③），缝里那颗钮点不到。真人的窗口比这高，
-    // 这里按真人的高度给一档（与窄屏用例显式设 430×900 是同一个手法）。
-    await page.setViewportSize({ width: 1280, height: 1000 });
+    // **1280×720 就是这一档的口径**（playwright 默认视口，也是三分区最紧的一档）：
+    // 这条用例原先被逼着显式设 1280×1000 绕开「时间线被挤成一条缝、确认钮点不到」
+    // （决策 207③ 的落地缺口），决策 208 修掉之后回到默认视口——缝回来了这条就红。
+    await page.setViewportSize({ width: 1280, height: 720 });
 
     // 先自己说一句，拿到一条**未决**提议（script 每轮都会提一条，取最后一条）
     await sayDirect(app, '提一条看看');
@@ -492,6 +545,9 @@ test.describe('对讲台 · 对话（票 03）', () => {
     // 提议**没有**执行：家目录里那个文件还不存在（直接看磁盘，不经界面）
     const target = join(app.homeDir, PROPOSED_FILE);
     expect(existsSync(target)).toBe(false);
+
+    // **够得到吗**（决策 208 的回归门）：三分区是零和的，720px 是它最紧的一档
+    await expectProposalReachable(page);
 
     await prop.getByRole('button', { name: '执行' }).click();
 
@@ -522,8 +578,8 @@ test.describe('对讲台 · 对话（票 03）', () => {
    */
   test('按下拒绝：提议作废、明确说没有执行动作', async ({ page }) => {
     const bundle = watchBundle(page);
-    // 同上：确认钮在时间线里，这一档要给它留出高度
-    await page.setViewportSize({ width: 1280, height: 1000 });
+    // 与上一条同一档：默认视口，不给它留高度（决策 208 修的就是「不给也点得到」）
+    await page.setViewportSize({ width: 1280, height: 720 });
 
     await sayDirect(app, '再提一条看看');
     await page.goto(`${app.webBase}/#/talk`);
@@ -531,6 +587,7 @@ test.describe('对讲台 · 对话（票 03）', () => {
 
     const prop = page.locator('.timeline .turn.prop').last();
     await expect(prop).toBeVisible({ timeout: 30_000 });
+    await expectProposalReachable(page);
     await prop.getByRole('button', { name: '拒绝' }).click();
 
     const log = page.locator('.timeline .turn.console', { hasText: '提议已拒绝' });
