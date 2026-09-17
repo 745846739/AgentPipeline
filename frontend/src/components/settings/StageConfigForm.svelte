@@ -8,11 +8,34 @@
     emptyStageConfigDraft,
     nodeSkillsFromJson,
     stageKeyLabel,
+    stageMayUseAsk,
     withNodeSkills,
     type SkillDeclDraft,
     type StageConfigDraft,
   } from '../../lib/stageConfigs';
   import SkillDeclList from './SkillDeclList.svelte';
+
+  /**
+   * 三档的界面说法（决策 206）。**文案不出现档位名以外的术语**：这一栏要回答的是
+   * 「这个阶段的 agent 能不能自己动手」，故每一档的 hint 说的都是**会发生什么**。
+   */
+  const ENV_MODE_OPTIONS = [
+    {
+      value: 'auto' as const,
+      label: 'auto · 直接执行',
+      hint: '文件与命令立即执行（与今天的流水线一致）',
+    },
+    {
+      value: 'ask' as const,
+      label: 'ask · 等人按键',
+      hint: '生成一条提议，等值班经理在界面上按下确认钮',
+    },
+    {
+      value: 'deny' as const,
+      label: 'deny · 拒绝且不告知',
+      hint: '连工具都不给它——模型看不到这个选项，硬发也会被拒',
+    },
+  ];
 
   /**
    * stage_configs 编辑表单（决策 22 / 46 / 66 / 111 / 129）。
@@ -98,6 +121,46 @@
         {/each}
       </datalist>
     </label>
+
+    <!-- 环境层档位（决策 206）：一组三档的单选，不是自由文本——它是这套配置里唯一
+         直接决定「模型能不能碰这台机器」的字段，一个拼错的值不该有地方写进去。
+         留空 = 不配置（真实阶段回落全局默认 auto、值班长回落 ask）。 -->
+    <div class="field wide">
+      <span>环境层权限档位（文件、命令、技能拉取、子代理）</span>
+      <div class="modes" role="radiogroup" aria-label="环境层权限档位">
+        <!-- `ask` 只对值班长有意义（规格 §4）：别的阶段无人按那颗钮，配上去等于静默收掉
+             这个阶段的环境写动作。这里不摆出来，后端那道门也拒（同一个判据，两处各写一份
+             必然漂移——两边的名字与理由都写在 `lib/stageConfigs.ts` 的 `stageMayUseAsk` 上）。 -->
+        {#each ENV_MODE_OPTIONS.filter((o) => o.value !== 'ask' || stageMayUseAsk(draft.stage)) as opt (opt.value)}
+          <label class="mode">
+            <input
+              type="radio"
+              name="env-mode-{draft.stage}"
+              value={opt.value}
+              checked={draft.env_mode === opt.value}
+              onchange={() => (draft.env_mode = opt.value)}
+            />
+            <span class="mode-label">{opt.label}</span>
+            <span class="mode-hint">{opt.hint}</span>
+          </label>
+        {/each}
+        <label class="mode">
+          <input
+            type="radio"
+            name="env-mode-{draft.stage}"
+            value=""
+            checked={draft.env_mode === ''}
+            onchange={() => (draft.env_mode = '')}
+          />
+          <span class="mode-label">不配置</span>
+          <span class="mode-hint">用这个阶段的缺省（值班长 ask，其余 auto）</span>
+        </label>
+      </div>
+      <p class="mode-note">
+        只管环境层。本服务的写接口（建任务、拍板、合入、改配置……）<strong>恒为提议 + 确认钮</strong>，
+        不受这一档影响——那类动作会改变流水线的事实。
+      </p>
+    </div>
 
     <label class="field">
       <span>temperature</span>
@@ -270,6 +333,34 @@
   }
   .node {
     margin-bottom: 8px;
+  }
+  /* 三档单选：竖排（每档之间是「会发生什么」的差别，横排会读成一组并列的开关）。
+     不用信号色——这一栏是配置，不是告警（全站唯一的响仍在急停一处，决策 203）。 */
+  .modes {
+    display: flex;
+    flex-direction: column;
+    gap: 2px;
+  }
+  .mode {
+    display: grid;
+    grid-template-columns: auto auto 1fr;
+    align-items: baseline;
+    gap: 8px;
+    padding: 4px 0;
+  }
+  .mode-label {
+    color: var(--text-hi);
+    white-space: nowrap;
+  }
+  .mode-hint {
+    font-size: 12px;
+    color: var(--text-3);
+  }
+  .mode-note {
+    font-size: 12px;
+    color: var(--text-3);
+    line-height: 1.6;
+    margin-top: 4px;
   }
 
   @media (max-width: 479px) {

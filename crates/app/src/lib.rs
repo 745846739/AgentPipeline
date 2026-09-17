@@ -122,6 +122,19 @@ pub fn build_router(state: AppState) -> Router {
         )
         .route("/foreman/messages", post(routes::foreman::send))
         .route("/foreman/stream", get(routes::foreman::stream))
+        // 提议（决策 188 / 207）：写动作的落库形态。**执行不是一条新路**——它按提议里的
+        // (工具, 参数) 走既有的那条端点，同一套校验、同一套闸门。这里能做的三件事是
+        // 一次一按、过期、态势变化的拒执（决策 207 的三条硬约束）。
+        .route("/foreman/commands", get(routes::foreman::commands))
+        .route("/foreman/proposals", get(routes::foreman::proposals))
+        .route(
+            "/foreman/proposals/{id}/execute",
+            post(routes::foreman::execute_proposal),
+        )
+        .route(
+            "/foreman/proposals/{id}/reject",
+            post(routes::foreman::reject_proposal),
+        )
         // ── 技能市场（决策 172⑤，票 09）：本地导入 / 目录扫描 / 卸载。全程离线 ──
         // 子 router 自带 state（import 路由要单独放宽请求体上限），故先 merge 再进防护层。
         .merge(routes::skills::routes(state.clone()))

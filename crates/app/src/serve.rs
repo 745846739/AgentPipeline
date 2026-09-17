@@ -390,6 +390,7 @@ pub async fn serve(options: ServeOptions) -> anyhow::Result<ServerHandle> {
         settings.clone(),
         home.clone(),
         runtime.llm(),
+        sse.clone(),
     ));
     let state = AppState::new(store, home, settings, bound.port())
         .with_sse(sse)

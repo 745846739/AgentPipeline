@@ -15,13 +15,14 @@ use agentpipeline_core::clock::Clock;
 use agentpipeline_core::config::Settings;
 use agentpipeline_core::metrics;
 use agentpipeline_core::pipeline::foreman::{
-    build_briefing, foreman_tool_names, trim_history, ForemanRunner, ForemanToolLayer,
-    FOREMAN_AGENT_TYPE, FOREMAN_PERSONA, FOREMAN_STAGE_KEY, FOREMAN_TOOL_SPECS,
+    build_briefing, foreman_tool_names, situation_fingerprint, trim_history, ForemanRunner,
+    ForemanToolLayer, FOREMAN_AGENT_TYPE, FOREMAN_PERSONA, FOREMAN_STAGE_KEY, FOREMAN_TOOL_SPECS,
+    OPERATION_LOG_MARK,
 };
 use agentpipeline_core::storage::foreman::NewForemanMessage;
 use agentpipeline_core::storage::tasks::TaskFilter;
 use agentpipeline_core::storage::Store;
-use agentpipeline_core::types::{Node, PendingKind, PendingReason, Stage, TaskStatus};
+use agentpipeline_core::types::{Node, PendingKind, PendingReason, Stage, StageConfig, TaskStatus};
 use agentpipeline_core::Error;
 use testkit::{FakeAgent, ManualClock, Script, TestHome};
 
@@ -72,6 +73,7 @@ impl Harness {
             Settings::default(),
             self._home.home().clone(),
             Arc::new(agent) as Arc<dyn LlmClient>,
+            Arc::new(testkit::SseRecorder::new()),
         )
     }
 }
@@ -341,28 +343,41 @@ async fn the_llm_request_carries_the_foreman_identity_and_a_placeholder_stage() 
         .map(|s| s.name)
         .collect::<Vec<_>>();
     assert_eq!(names, listed, "广告的工具集必须与清单逐字一致（且同序）");
-    // 反向断言（本票最该保留的一条）：**任何**越权工具名都不得进广告集。
+    // 反向断言（本票最该保留的一条）：**够不到手的工具名一个都不得进广告集**。
     // 逐个名字列出来而不是只断言数量：数量对得上、名字换了一个的情况，只断言数量看不出来。
-    for forbidden in [
-        "read_file",
-        "list_dir",
-        "run_command",
-        "write_file",
-        "edit_file",
-        "delete_file",
-        "spawn_sub_agent",
-        "submit_metadata",
-        "Skill",
-    ] {
+    //
+    // 这一列随票 04 / 05 / 06 收窄过一次：`write_file` / `edit_file` / `run_command` /
+    // `task` / `config` / `skills` **都不在这一列了**——它们进了清单，走的是确认钮（决策
+    // 188 / 207），而不是「不给」。留下的是**真的不该给**的那些：
+    // - `delete_file`：删除不可逆，决策 207 的一份清单里没有它，本票也不给它开；
+    // - `spawn_sub_agent`：要注入一个子代理运行器才有意义，值班长手上没有；
+    // - `submit_metadata`：它是流水线节点向状态机提交结构化元数据的口子，
+    //   值班长没有状态机可提交（它是面向人的对话者）。
+    for forbidden in ["delete_file", "spawn_sub_agent", "submit_metadata"] {
         assert!(
             !names.contains(&forbidden),
             "值班长的工具集不得含 {forbidden}：{names:?}"
         );
     }
     assert!(
-        names.len() >= 8,
-        "A 层只读工具（票 01）应当已全部在清单里：{names:?}"
+        names.contains(&"read_file"),
+        "B 层环境只读应当在广告集里（决策 206）：{names:?}"
     );
+    // 写面按档位广告：缺省 `ask` 下三个 C / D / E 层的名字**都在**（它们靠确认钮兜住，
+    // 不是靠不给）——这与「D 层排除清单」是两件事，排除的那三项压根没有工具名。
+    for present in [
+        "write_file",
+        "edit_file",
+        "run_command",
+        "task",
+        "config",
+        "skills",
+    ] {
+        assert!(
+            names.contains(&present),
+            "{present} 缺省档位下应当在广告集里（走确认钮）：{names:?}"
+        );
+    }
 }
 
 #[tokio::test]
@@ -387,6 +402,7 @@ async fn say_persists_the_user_message_even_when_the_model_fails() {
         Settings::default(),
         h._home.home().clone(),
         Arc::new(Boom) as Arc<dyn LlmClient>,
+        Arc::new(testkit::SseRecorder::new()),
     );
     let sid = h.session().await;
     let err = runner.say(Some(&sid), "喂").await.unwrap_err();
@@ -535,23 +551,29 @@ async fn read_conversation_tool_returns_the_workshop_receipt() {
 #[tokio::test]
 async fn out_of_whitelist_tools_are_rejected_at_the_execution_point() {
     // 白名单必须在**执行点**生效，不是在工具定义层过滤：模型可以无视 tool 定义
-    // 直接发一个 run_command。票 02 的硬约束，与只读子代理同一处检查。
+    // 直接发一个越权工具。票 02 的硬约束，与只读子代理同一处检查。
+    //
+    // 用例在票 06 之后换了个工具名：原来的 `run_command` 现在**在清单里**了（它走确认钮，
+    // 不靠不给），故边界改由 `spawn_sub_agent` 取证——它永远不在值班长的清单里。
     let h = Harness::seeded().await;
     let mut script = Script::new();
     script
         .for_foreman()
-        .tool("run_command", serde_json::json!({"command": "echo pwned"}));
+        .tool("spawn_sub_agent", serde_json::json!({"task": "去干点别的"}));
     script.for_foreman().text("我读不到那个。");
     let runner = h.runner(FakeAgent::new(script));
 
-    let turn = runner.say(None, "帮我跑个命令").await.unwrap();
+    let turn = runner.say(None, "帮我开个子代理").await.unwrap();
     assert_eq!(turn.traces.len(), 1);
-    assert_eq!(turn.traces[0].tool, "run_command");
-    // 工具被拒 → 痕迹记 ok = false；且命令**没有真的被执行**。
+    assert_eq!(turn.traces[0].tool, "spawn_sub_agent");
+    // 工具被拒 → 痕迹记 ok = false；且没有任何东西被落下来。
     assert!(!turn.traces[0].ok, "越权工具必须在执行点被拒");
-
-    let commands = h.store.list_commands("t1", None, None).await.unwrap();
-    assert!(commands.is_empty(), "越权命令不得真的跑起来");
+    assert!(h
+        .store
+        .list_pending_foreman_proposals(&turn.session.id)
+        .await
+        .unwrap()
+        .is_empty());
 }
 
 #[tokio::test]
@@ -584,11 +606,29 @@ async fn the_foreman_tool_set_matches_the_frozen_contract() {
             "read_stage_configs",
             "read_skills",
             "read_providers",
+            // B 层环境只读（决策 206）：域 = 家目录根，`data/` 与 `logs/` 按前缀拒。
+            // `spawn_sub_agent` **不在列**——它要注入子代理运行器才有意义，而值班长
+            // 手上没有（也不该有）：加一个只会回「未启用」的工具是噪声。
+            "read_file",
+            "list_dir",
+            "Skill",
         ]
     );
-    assert!(
-        foreman_tool_names(ForemanToolLayer::Write).is_empty(),
-        "本轮不引入任何写工具（写工具由票 04 / 05 / 06 加）"
+    assert_eq!(
+        foreman_tool_names(ForemanToolLayer::Write),
+        [
+            // C 层：环境写（决策 206 / 207）。`ask` 档下生成提议、`auto` 直通、`deny` 摘掉。
+            "write_file",
+            "edit_file",
+            "run_command",
+            // D 层：本服务写接口（决策 207④ 的「一族一个工具 + 动作参数」）。
+            // **不读档位**——写接口恒为提议，配成 `auto` 只放开环境层。
+            // 三个排除项（重置配对令牌 / 局域网开关 / 仓名单增删）**没有对应名字**，
+            // 由本文件末尾的用例单独断言。
+            "task",
+            "config",
+            "skills",
+        ]
     );
     assert_eq!(FOREMAN_STAGE_KEY, "foreman");
     assert_eq!(FOREMAN_AGENT_TYPE, "foreman");
@@ -693,23 +733,145 @@ async fn read_providers_never_echoes_the_plaintext_key() {
     assert!(fed.contains("***"), "密钥的存在性该看得到（掩码）：{fed}");
 }
 
-/// 越权工具名不在清单里 → 仍在执行点被拒（白名单是执行点的闸，不是广告集的筛选）。
+/// 三处措辞（`FOREMAN_PERSONA` / `FOREMAN_BASELINE` / 工具纪律段）按档位说真话，
+/// **取证取的是模型真正收到的那一份 system prompt**（不是常量本身）。
+///
+/// 这一条盯的是一个会让模型开始说谎的失效：上一版纪律段写的是「读不到文件系统，也不能执行
+/// 命令」——那在 B / C / E 层落地之后是**假的**，而一段假的能力说明会直接变成一句假话
+/// （「我读过那个文件」）。三档各取一轮请求，逐句核。
 #[tokio::test]
-async fn tools_outside_the_manifest_are_still_rejected_at_the_execution_point() {
-    let h = Harness::seeded().await;
-    for name in ["read_file", "write_file", "run_command"] {
+async fn the_system_prompt_tells_the_truth_about_what_it_can_do_in_each_tier() {
+    /// 跑一轮回话，返回模型收到的 system prompt。
+    async fn prompt_for(mode: Option<agentpipeline_core::types::EnvMode>) -> String {
+        let h = Harness::seeded().await;
+        if let Some(mode) = mode {
+            h.store
+                .upsert_stage_config(&StageConfig {
+                    stage: FOREMAN_STAGE_KEY.to_string(),
+                    env_mode: Some(mode),
+                    ..Default::default()
+                })
+                .await
+                .unwrap();
+        }
         let mut script = Script::new();
-        script
-            .for_foreman()
-            .tool(name, serde_json::json!({"path": "src/lib.rs"}));
-        script.for_foreman().text("我读不到那个。");
-        let runner = h.runner(FakeAgent::new(script));
-        let turn = runner.say(None, "帮我看看").await.unwrap();
-        assert_eq!(turn.traces.len(), 1);
-        assert!(!turn.traces[0].ok, "{name} 必须在执行点被拒");
+        script.for_foreman().text("收到。");
+        let agent = FakeAgent::new(script);
+        let requests = agent.clone();
+        let runner = h.runner(agent);
+        runner.say(None, "在吗").await.unwrap();
+        requests.request_log()[0].system_prompt.clone()
     }
+
+    // 三档共同的下限：不许再出现那两句**已经不成立**的能力说明，且称呼恒定。
+    let ask = prompt_for(None).await;
+    for forbidden in ["读不到文件系统", "没有动手的权力", "不能执行命令", "值班员"]
+    {
+        assert!(
+            !ask.contains(forbidden),
+            "人格／纪律里不得再出现「{forbidden}」（决策 188 / 193 / 206）：{ask}"
+        );
+    }
+    assert!(ask.contains("值班经理"), "{ask}");
+
+    // `ask` 档（缺省）：说清「提了但没执行」，且把 C / E 层的工具名摆在纪律段里。
+    assert!(ask.contains("待确认的提议"), "{ask}");
+    assert!(ask.contains("不会立即发生"), "{ask}");
+    assert!(ask.contains("run_command"), "{}", ask);
+    assert!(ask.contains("write_file"), "{ask}");
+    // D 层那三族也在广告集里（写接口恒为提议）
+    for tool in ["task", "config", "skills"] {
+        assert!(ask.contains(tool), "缺 {tool}：{ask}");
+    }
+
+    // `auto` 档：说清「会立即执行」，但**本服务写接口仍要按键**（决策 206 的硬规矩）。
+    let auto = prompt_for(Some(agentpipeline_core::types::EnvMode::Auto)).await;
+    assert!(auto.contains("会立即执行"), "{auto}");
+    assert!(
+        auto.contains("仍然"),
+        "auto 档下写接口仍要人按键这句不能少：{auto}"
+    );
+
+    // `deny` 档：说清环境层关掉了，并**明确叫它别再提**（提议无处可去）。
+    let deny = prompt_for(Some(agentpipeline_core::types::EnvMode::Deny)).await;
+    assert!(deny.contains("关掉"), "{deny}");
+    assert!(deny.contains("不要提议"), "{deny}");
 }
 
+/// `deny` 档：环境层**连广告都不给**，执行点也拒（决策 206，票 03 的按档断言）。
+///
+/// 两侧都要取证。「只不广告」是不够的：模型可以无视 tool 定义硬发一个工具名，那正是执行点
+/// 白名单存在的理由。而 D 层（本服务写接口）**不受档位影响**——它恒为提议，把值班长配成
+/// `deny` 收的是「能碰机器」的手，不是「能提建议」的嘴。
+#[tokio::test]
+async fn the_deny_tier_removes_the_environment_layer_from_both_sides() {
+    let h = Harness::seeded().await;
+    h.store
+        .upsert_stage_config(&StageConfig {
+            stage: FOREMAN_STAGE_KEY.to_string(),
+            env_mode: Some(agentpipeline_core::types::EnvMode::Deny),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+
+    let mut script = Script::new();
+    script.for_foreman().text("环境层关着。");
+    let agent = FakeAgent::new(script);
+    let requests = agent.clone();
+    let runner = h.runner(agent);
+    runner.say(None, "看看家目录").await.unwrap();
+
+    let log = requests.request_log();
+    let advertised: Vec<String> = log[0].tools.iter().map(|t| t.name.clone()).collect();
+    for gone in [
+        "read_file",
+        "list_dir",
+        "Skill",
+        "write_file",
+        "edit_file",
+        "run_command",
+    ] {
+        assert!(
+            !advertised.iter().any(|n| n == gone),
+            "deny 档不该广告 {gone}：{advertised:?}"
+        );
+    }
+    // 台账读数与 D 层照旧在（后者恒为提议，不读档位）。
+    for kept in ["read_task", "read_conversation", "task", "config", "skills"] {
+        assert!(
+            advertised.iter().any(|n| n == kept),
+            "deny 档下 {kept} 仍应在广告集里：{advertised:?}"
+        );
+    }
+
+    // 执行点：硬发一个被摘掉的工具名 → 拒，且**没有任何东西真的跑起来**。
+    let mut script = Script::new();
+    script
+        .for_foreman()
+        .tool("run_command", serde_json::json!({"command": "echo pwned"}));
+    script.for_foreman().text("跑不了。");
+    let runner = h.runner(FakeAgent::new(script));
+    let turn = runner.say(None, "帮我跑个命令").await.unwrap();
+    assert_eq!(turn.traces.len(), 1);
+    assert!(!turn.traces[0].ok, "deny 档下命令必须在执行点被拒");
+    assert!(
+        h.store
+            .list_commands("t1", None, None)
+            .await
+            .unwrap()
+            .is_empty(),
+        "被拒的命令不得真的跑起来"
+    );
+    assert!(
+        h.store
+            .list_pending_foreman_proposals(&turn.session.id)
+            .await
+            .unwrap()
+            .is_empty(),
+        "deny 档不生成提议——它无处可去"
+    );
+}
 // ─────────────────────────── 口径与保留期（票 05）───────────────────────────
 
 #[tokio::test]
@@ -835,6 +997,74 @@ async fn scheduler_maintenance_reports_foreman_purges_separately() {
     // 两类分开计数——混成一个数就看不出是哪一类在增长。
     assert_eq!(report.purged_foreman_messages, 1);
     assert_eq!(report.purged_conversations, 0);
+}
+
+/// 维护作业管提议的两件事（决策 207）：**过期清扫改状态、年龄清理删行**。
+///
+/// 合成一步就会让「过期只让按钮变灰、那一轮留在时间线里」这条规则在维护作业这一侧失效
+/// ——而那是这条规则唯一会被自动执行的地方。
+#[tokio::test]
+async fn scheduler_maintenance_expires_proposals_and_purges_them_by_age() {
+    let h = Harness::seeded().await;
+    let sid = h.session().await;
+    let pid = h
+        .store
+        .create_foreman_proposal(agentpipeline_core::storage::proposals::NewForemanProposal {
+            session_id: sid.clone(),
+            tool: "write_file".into(),
+            args: serde_json::json!({"path": "notes.md"}),
+            summary: "写入 notes.md".into(),
+            situation: None,
+        })
+        .await
+        .unwrap()
+        .id;
+
+    // 没过 TTL：什么都不该动。
+    let report = maintenance(&h).await;
+    assert_eq!(report.expired_foreman_proposals, 0);
+    assert_eq!(report.purged_foreman_proposals, 0);
+
+    // 过了 TTL（10 分钟）但还在保留期内：**只改状态、不删行**。
+    h.clock.advance_secs(11 * 60);
+    let report = maintenance(&h).await;
+    assert_eq!(report.expired_foreman_proposals, 1);
+    assert_eq!(report.purged_foreman_proposals, 0);
+    assert!(h
+        .store
+        .list_foreman_proposals(&sid, 10)
+        .await
+        .unwrap()
+        .iter()
+        .any(|p| p.id == pid && p.status.as_str() == "expired"));
+
+    // 过了保留期：这才删行（那时时间线里也没有这一轮了）。
+    h.clock.advance_secs(31 * 24 * 3600);
+    let report = maintenance(&h).await;
+    assert_eq!(
+        report.expired_foreman_proposals, 0,
+        "已经过期的不再重复计数"
+    );
+    assert_eq!(report.purged_foreman_proposals, 1);
+    assert!(h
+        .store
+        .list_foreman_proposals(&sid, 10)
+        .await
+        .unwrap()
+        .is_empty());
+}
+
+async fn maintenance(h: &Harness) -> agentpipeline_core::scheduler::MaintenanceReport {
+    use agentpipeline_core::scheduler::KanbanScheduler;
+    let scheduler = KanbanScheduler::new(
+        h.store.clone(),
+        Settings::default(),
+        Arc::new(h.clock.clone()),
+        Arc::new(testkit::RecordingKiller::new()),
+        Arc::new(testkit::SseRecorder::new()),
+        Arc::new(|_: &str| {}),
+    );
+    scheduler.maintenance().await.unwrap()
 }
 
 // ─────────────────────────── 任务清单不受影响（回归）───────────────────────────
@@ -1143,4 +1373,317 @@ async fn a_command_without_an_owner_is_refused() {
 
 fn message_of(err: &Error) -> String {
     err.to_string()
+}
+
+// ───────────── 文件域与卸载（决策 206 / 207，票 03）─────────────
+
+/// 值班长读得到家目录里的普通文件，**读不到 `data/` 与 `logs/`**。
+///
+/// 这一条是**补偿**不是边界：`run_command` 不受文件策略管（命令自己 `cd` 就出去了），
+/// 故它只挡住「用文件工具顺手读走密钥」这一条路。`data/agentpipeline.db` 里
+/// 明文存着 provider 密钥（决策 112），而默认那份**模式**名单（`.env*` / `*.pem` / …）
+/// 盖不住一个 `.db` 文件——这正是 `foreman_file_policy` 按路径前缀补上的那一条。
+#[tokio::test]
+async fn the_foreman_reads_the_home_but_not_the_key_store() {
+    let h = Harness::seeded().await;
+    let session = h.session().await;
+    // 家目录里放一个普通文件，与一个「看起来像配置」的产物
+    std::fs::write(h._home.home().root().join("NOTES.md"), "夜班交接：一切正常").unwrap();
+    // 密钥库路径上放一个可读文件（真库是 SQLite 二进制，读它本来也没什么可读的）
+    std::fs::write(h._home.home().db_path(), "sk-super-secret-value").unwrap();
+    std::fs::create_dir_all(h._home.home().logs_dir()).unwrap();
+    std::fs::write(h._home.home().logs_dir().join("app.log"), "日志一行").unwrap();
+
+    let mut script = Script::new();
+    script
+        .for_foreman()
+        .tool("read_file", serde_json::json!({"path": "NOTES.md"}));
+    script.for_foreman().tool(
+        "read_file",
+        serde_json::json!({"path": "data/agentpipeline.db"}),
+    );
+    script
+        .for_foreman()
+        .tool("read_file", serde_json::json!({"path": "logs/app.log"}));
+    script
+        .for_foreman()
+        .text("能读的读了，密钥库和日志读不到。");
+    let agent = FakeAgent::new(script);
+    let requests = agent.clone();
+    let runner = h.runner(agent);
+    let turn = runner.say(Some(&session), "交接笔记在吗？").await.unwrap();
+
+    assert_eq!(turn.traces.len(), 3);
+    assert!(turn.traces[0].ok, "家目录里的普通文件应当读得到");
+    assert!(!turn.traces[1].ok, "密钥库必须被拒");
+    assert!(!turn.traces[2].ok, "日志目录必须被拒");
+    // 拒绝的事实在对话里可见：回灌给模型的是错误原文，模型能转述给人。
+    // （判据取**模型收到的消息**，不是库里的 foreman_messages——后者只存人机两边的话，
+    //  工具结果不进那一层，这样历史裁的时候也不会被一条工具报错顶掉一句人话。）
+    let log = requests.request_log();
+    let tail = serde_json::to_string(&log.last().unwrap().messages).unwrap();
+    assert!(tail.contains("拒绝名单"), "{tail}");
+    assert!(tail.contains("NOTES.md"), "成功的那次读取应当真有内容");
+    assert!(
+        !tail.contains("sk-super-secret-value"),
+        "被拒的读取不得把内容带进对话：{tail}"
+    );
+    assert!(
+        !tail.contains("日志一行"),
+        "被拒的日志不得把内容带进对话：{tail}"
+    );
+}
+
+/// D 层（本服务写接口）**不读档位**：配成 `auto` 也只放开环境层，写接口照旧只是提议。
+///
+/// 这是决策 206 的硬规矩「本服务的写接口需要人按确认钮」在代码里的落点。三条名字各自
+/// 提一条，且**什么都还没发生**（库里没有新任务）。
+#[tokio::test]
+async fn the_service_write_tools_propose_even_under_the_auto_tier() {
+    let h = Harness::seeded().await;
+    h.store
+        .upsert_stage_config(&StageConfig {
+            stage: FOREMAN_STAGE_KEY.to_string(),
+            env_mode: Some(agentpipeline_core::types::EnvMode::Auto),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+    // 一条既有的阶段覆盖：后面要断言它**还在**（否则「还在」是一句空话）。
+    h.store
+        .upsert_stage_config(&StageConfig {
+            stage: "develop".into(),
+            max_tokens: Some(4096),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+
+    let mut script = Script::new();
+    script.for_foreman().tool(
+        "task",
+        serde_json::json!({"action": "cancel", "task_id": "t1"}),
+    );
+    script.for_foreman().tool(
+        "config",
+        serde_json::json!({"action": "delete", "stage": "develop"}),
+    );
+    script.for_foreman().tool(
+        "skills",
+        serde_json::json!({"action": "delete", "name": "whatever"}),
+    );
+    script.for_foreman().text("三条都提了，等你按键。");
+    let runner = h.runner(FakeAgent::new(script));
+    let turn = runner.say(None, "把 t1 停了").await.unwrap();
+
+    assert_eq!(turn.traces.len(), 3);
+    for trace in &turn.traces {
+        assert!(
+            trace.ok,
+            "{} 被提成提议应当记为「成功调用」（它不是工具失败）：{:?}",
+            trace.tool, trace
+        );
+    }
+    let pending = h
+        .store
+        .list_pending_foreman_proposals(&turn.session.id)
+        .await
+        .unwrap();
+    let tools: Vec<&str> = pending.iter().map(|p| p.tool.as_str()).collect();
+    assert_eq!(tools, ["task", "config", "skills"], "{pending:?}");
+    // 取证：什么状态都没变——任务还在跑、阶段配置还在、技能目录里那个文件也还在。
+    let task = h.store.get_task("t1").await.unwrap();
+    assert_ne!(task.status, TaskStatus::Cancelled, "提议不是执行");
+    assert!(
+        h.store.get_stage_config("develop").await.unwrap().is_some(),
+        "config delete 只是提议，覆盖行不该消失"
+    );
+}
+
+/// 任务族的提议**带着态势指纹**（决策 207 的拒执判据），且指纹取自**参数**里的 task_id。
+///
+/// 这一条盯的是一个会让整条拒执规则静默失效的错法：照**调用上下文**取 task_id 的话，值班长
+/// 那侧恒为空串 → 指纹永远是 `None` → 「执行时情况变了就拒执」再也拦不住任何东西，而所有
+/// 用例照旧全绿（端点那条路是手工塞 `situation` 进去测的）。
+#[tokio::test]
+async fn a_task_proposal_carries_a_situation_fingerprint() {
+    let h = Harness::seeded().await;
+    let session = h.session().await;
+    let mut script = Script::new();
+    script.for_foreman().tool(
+        "task",
+        serde_json::json!({"action": "cancel", "task_id": "t1"}),
+    );
+    script.for_foreman().text("提了，等你按键。");
+    let runner = h.runner(FakeAgent::new(script));
+    runner.say(Some(&session), "把 t1 停了").await.unwrap();
+
+    let pending = h
+        .store
+        .list_pending_foreman_proposals(&session)
+        .await
+        .unwrap();
+    assert_eq!(pending.len(), 1);
+    let situation = pending[0]
+        .situation
+        .as_ref()
+        .expect("任务族的提议必须存下当时那份态势（决策 207 的拒执判据）");
+    assert_eq!(situation["status"], "queued", "{situation}");
+    // 与当场取的那一份**逐字相同**（同一处实现，不是各算一份）
+    assert_eq!(
+        situation,
+        &situation_fingerprint(&h.store, "t1").await.unwrap()
+    );
+
+    // 文件 / 命令族的提议**没有**态势可判——它们的成立与否由端点自己的校验回答
+    let mut script = Script::new();
+    script.for_foreman().tool(
+        "write_file",
+        serde_json::json!({"path": "a.md", "content": "x"}),
+    );
+    script.for_foreman().text("提了。");
+    let runner = h.runner(FakeAgent::new(script));
+    runner.say(Some(&session), "写个文件").await.unwrap();
+    let all = h
+        .store
+        .list_pending_foreman_proposals(&session)
+        .await
+        .unwrap();
+    let file_proposal = all
+        .iter()
+        .find(|p| p.tool == "write_file")
+        .expect("写文件那条也该在");
+    assert!(file_proposal.situation.is_none());
+}
+
+/// 操作台记的那几轮（`role = system`）**不得被读回成值班长自己的话**（决策 207）。
+///
+/// 写成助理轮，模型下一轮读历史时会把「提议已执行：写文件 notes.md」当成自己说过的话——那正是
+/// 人格第一条纪律（不得声称自己动了手）要挡的东西。**也不能整段丢掉**：丢掉它，模型不知道人
+/// 按了什么键，会以为提议还挂着、于是重提一遍。
+#[tokio::test]
+async fn the_operation_log_is_not_read_back_as_the_foremans_own_words() {
+    let h = Harness::seeded().await;
+    let session = h.session().await;
+    h.store
+        .append_foreman_user_message(&session, "第一句")
+        .await
+        .unwrap();
+    h.store
+        .append_foreman_message(NewForemanMessage::assistant(&session, "收到了。"))
+        .await
+        .unwrap();
+    h.store
+        .append_foreman_message(NewForemanMessage::system(
+            &session,
+            "提议已执行：写入文件 notes.md",
+        ))
+        .await
+        .unwrap();
+
+    let mut script = Script::new();
+    script.for_foreman().text("知道了。");
+    let agent = FakeAgent::new(script);
+    let requests = agent.clone();
+    let runner = h.runner(agent);
+    runner.say(Some(&session), "第二句").await.unwrap();
+
+    let messages = requests.request_log()[0].messages.clone();
+    let as_assistant: Vec<&str> = messages
+        .iter()
+        .filter(|m| m.role == agentpipeline_core::agent::client::Role::Assistant)
+        .filter_map(|m| m.content.as_deref())
+        .collect();
+    assert!(
+        !as_assistant.iter().any(|c| c.contains("提议已执行")),
+        "操作台记的账不得以值班长的口吻回灌：{as_assistant:?}"
+    );
+    // 但它**在场**，且带着说明发言者的标记
+    let fed = messages
+        .iter()
+        .filter_map(|m| m.content.as_deref())
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(fed.contains("提议已执行"), "{fed}");
+    assert!(fed.contains(OPERATION_LOG_MARK), "{fed}");
+}
+
+/// 大结果卸载落**会话维度**，且**不写** `{root}/tasks/.context`（票 03 的硬规矩）。
+///
+/// 空 task_id 若被当成「根目录下的 `.context`」，落点就是所有任务共用的那一层——
+/// 下一次运行任意一个真实任务时会把它读成自己的工作区残留。
+#[tokio::test]
+async fn big_results_offload_into_the_session_dimension() {
+    let h = Harness::seeded().await;
+    let session = h.session().await;
+    // 一个超阈值（4000 token ≈ 16000 字符）的技能正文
+    let big = "第 x 行：这是一段很长的技能正文。\n".repeat(1_200);
+    testkit::write_skill_dir(&h._home.home().skills_dir(), "big", &big, &[]);
+
+    let mut script = Script::new();
+    script
+        .for_foreman()
+        .tool("Skill", serde_json::json!({"name": "big"}));
+    script
+        .for_foreman()
+        .text("那个技能正文很长，已经在台账里了。");
+    let runner = h.runner(FakeAgent::new(script));
+    let turn = runner
+        .say(Some(&session), "big 技能讲什么？")
+        .await
+        .unwrap();
+    assert_eq!(turn.traces.len(), 1);
+    assert!(turn.traces[0].ok);
+
+    // 卸载落在会话维度：`{root}/foreman/context/{session}/`
+    let dir = h._home.home().foreman_context_dir(&turn.session.id);
+    let offloaded: Vec<_> = std::fs::read_dir(&dir)
+        .unwrap_or_else(|e| panic!("会话卸载目录不存在（{}）：{e}", dir.display()))
+        .collect();
+    assert_eq!(offloaded.len(), 1, "大结果应当落一份到会话卸载目录");
+
+    // 硬规矩：**不写** `{root}/tasks/.context`
+    let shared = h._home.home().tasks_dir().join(".context");
+    assert!(
+        !shared.exists(),
+        "空 task_id 不得落到共享的 tasks/.context：{}",
+        shared.display()
+    );
+}
+
+/// 回灌给模型的那份是**预览 + 路径**，不是全文——卸载的意义就在于把正文移出上下文。
+#[tokio::test]
+async fn the_offloaded_result_keeps_only_a_preview_in_context() {
+    let h = Harness::seeded().await;
+    let session = h.session().await;
+    let big = "第 x 行：这是一段很长的技能正文。\n".repeat(1_200);
+    testkit::write_skill_dir(&h._home.home().skills_dir(), "big", &big, &[]);
+
+    let mut script = Script::new();
+    script
+        .for_foreman()
+        .tool("Skill", serde_json::json!({"name": "big"}));
+    script.for_foreman().text("读到了。");
+    let agent = FakeAgent::new(script);
+    let requests = agent.clone();
+    let runner = h.runner(agent);
+    runner
+        .say(Some(&session), "big 技能讲什么？")
+        .await
+        .unwrap();
+
+    let log = requests.request_log();
+    let last = log.last().unwrap();
+    let tail = serde_json::to_string(&last.messages).unwrap();
+    assert!(
+        tail.contains("foreman/context/"),
+        "回灌的应当是卸载路径：{}",
+        &tail[tail.len().saturating_sub(600)..]
+    );
+    assert!(
+        tail.len() < big.len(),
+        "全文不得进上下文（{} vs {}）",
+        tail.len(),
+        big.len()
+    );
 }

@@ -12,8 +12,10 @@ use agentpipeline_core::agent::client::LlmClient;
 use agentpipeline_core::agent::repo::{Libgit2Repo, SkillRepo};
 use agentpipeline_core::agent::tools::CommandRecorder;
 use agentpipeline_core::config::Settings;
+use agentpipeline_core::pipeline::foreman::situation_fingerprint;
 use agentpipeline_core::pipeline::ForemanRunner;
 use agentpipeline_core::sse::{SseEvent, SseEventType};
+use agentpipeline_core::storage::proposals::NewForemanProposal;
 use agentpipeline_core::types::{Provider, ReviewMode, Stage, TaskStatus};
 use app::peer::PeerAddr;
 use app::{build_router, AppState};
@@ -24,7 +26,7 @@ use axum::Router;
 use serde_json::{json, Value};
 use testkit::{
     seed_project, seed_task, seed_task_full, skill_zip, write_skill_dir, zip_bytes, FakeAgent,
-    Repo, Script, TestHome,
+    ManualClock, Repo, Script, TestHome,
 };
 use tower::ServiceExt;
 
@@ -36,6 +38,9 @@ struct Api {
     state: AppState,
     router: Router,
     resumes: Arc<AtomicUsize>,
+    /// 假时钟（决策 143 接缝①）。提议的 TTL（决策 207）靠它推进——「10 分钟到期」
+    /// 不能靠 `sleep`，那是把一条规则测成一次等待。
+    clock: ManualClock,
 }
 
 async fn api() -> Api {
@@ -96,7 +101,7 @@ async fn api_full_bind(
     bind_host: &str,
 ) -> Api {
     let home = TestHome::new().unwrap();
-    let (store, _clock) = home.setup().await.unwrap();
+    let (store, clock) = home.setup().await.unwrap();
     let repo = Repo::clean().unwrap();
 
     // 默认配一个可用 provider，否则 POST /tasks 会被决策 56 拦下
@@ -132,6 +137,7 @@ async fn api_full_bind(
         state,
         router,
         resumes,
+        clock,
     }
 }
 
@@ -1426,6 +1432,38 @@ async fn pairing_lan_peer_without_token_is_rejected() {
         StatusCode::FORBIDDEN,
         "局域网读工头会话也需令牌：{body}"
     );
+
+    // 提议的三个端点落在 `/foreman/` 前缀下，**自动继承配对护**（决策 182⑦）——
+    // 执行提议是写动作里最重的一种（它会碰文件或改流水线状态），更要凭据。
+    for uri in ["/foreman/proposals", "/foreman/commands"] {
+        let response = api
+            .router
+            .clone()
+            .oneshot(lan_get(uri, None))
+            .await
+            .unwrap();
+        assert_eq!(
+            response.status(),
+            StatusCode::FORBIDDEN,
+            "局域网读提议/命令也需令牌：{uri}"
+        );
+    }
+    for uri in [
+        "/foreman/proposals/whatever/execute",
+        "/foreman/proposals/whatever/reject",
+    ] {
+        let response = api
+            .router
+            .clone()
+            .oneshot(lan_write(uri, None))
+            .await
+            .unwrap();
+        assert_eq!(
+            response.status(),
+            StatusCode::FORBIDDEN,
+            "局域网执行提议也需令牌：{uri}"
+        );
+    }
 }
 
 #[tokio::test]
@@ -3990,7 +4028,7 @@ async fn api_with_foreman(agent: FakeAgent) -> Api {
 
 async fn api_full_with_foreman(settings: Settings, agent: Option<FakeAgent>) -> Api {
     let home = TestHome::new().unwrap();
-    let (store, _clock) = home.setup().await.unwrap();
+    let (store, clock) = home.setup().await.unwrap();
     let repo = Repo::clean().unwrap();
     // 配一个 provider：值班长的 provider 解析要落到一个真实存在的行上
     // （「不配置也能用」指的是**阶段配置**缺行，不是连 provider 都没有）。
@@ -4025,6 +4063,7 @@ async fn api_full_with_foreman(settings: Settings, agent: Option<FakeAgent>) -> 
                 state.settings.clone(),
                 state.home.clone(),
                 Arc::new(agent) as Arc<dyn LlmClient>,
+                state.sse.clone(),
             ));
             state.with_foreman(runner)
         }
@@ -4037,6 +4076,7 @@ async fn api_full_with_foreman(settings: Settings, agent: Option<FakeAgent>) -> 
         state,
         router,
         resumes,
+        clock,
     }
 }
 
@@ -4419,4 +4459,729 @@ async fn task_stream_never_receives_foreman_events() {
         }
     }
     assert_eq!(delivered, vec!["这条任务自己的话".to_string()]);
+}
+
+// ───────────────────── 提议：写动作的落库形态（决策 188 / 207，票 02）─────────────────────
+
+/// 落一条提议。
+///
+/// **票 02 一个写工具都不加**，故这里没有「让值班长提一条」的路径——本组用例要验的是提议层
+/// 自己的三条规则（一次一按 / 过期 / 态势变化），直接落库是唯一诚实的做法。生成路径
+/// （写工具 → 执行点拦截 → 提议）由票 04 / 05 / 06 各自带用例。
+async fn seed_proposal(api: &Api, session_id: &str, tool: &str, args: Value) -> String {
+    api.state
+        .store
+        .create_foreman_proposal(NewForemanProposal {
+            session_id: session_id.to_string(),
+            tool: tool.to_string(),
+            args,
+            summary: format!("（用例）{tool}"),
+            situation: None,
+        })
+        .await
+        .unwrap()
+        .id
+}
+
+async fn fresh_session(api: &Api) -> String {
+    api.state
+        .store
+        .create_foreman_session("用例班次")
+        .await
+        .unwrap()
+        .id
+}
+
+/// 提议的读端点：只给未决的那些，且挂在会话上。
+#[tokio::test]
+async fn proposals_endpoint_lists_only_the_pending_ones_of_that_session() {
+    let api = api_with_foreman(FakeAgent::new(Script::new())).await;
+    let a = fresh_session(&api).await;
+    let b = fresh_session(&api).await;
+    let p1 = seed_proposal(&api, &a, "write_file", json!({"path": "notes.md"})).await;
+    let p2 = seed_proposal(&api, &a, "run_command", json!({"command": "ls"})).await;
+    seed_proposal(&api, &b, "write_file", json!({"path": "other.md"})).await;
+
+    let (status, body) = get(&api, &format!("/foreman/proposals?session={a}")).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let ids: Vec<&str> = body["proposals"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|p| p["id"].as_str().unwrap())
+        .collect();
+    assert_eq!(ids, vec![p1.as_str(), p2.as_str()], "只给这一班的未决提议");
+    assert_eq!(body["proposals"][0]["status"], "pending");
+    assert_eq!(body["proposals"][0]["tool"], "write_file");
+    assert_eq!(body["proposals"][0]["args"]["path"], "notes.md");
+
+    // 拒绝一条之后它就不再是「未决」（读端点只列未决，时间线那份由 GET /foreman/session 给）。
+    let (status, _) = post(&api, &format!("/foreman/proposals/{p1}/reject"), json!({})).await;
+    assert_eq!(status, StatusCode::OK);
+    let (_, body) = get(&api, &format!("/foreman/proposals?session={a}")).await;
+    assert_eq!(body["proposals"].as_array().unwrap().len(), 1);
+}
+
+/// 提议**留在时间线里**（决策 207）：过期的那一轮不删行，`GET /foreman/session` 照样给出来。
+#[tokio::test]
+async fn expired_proposals_stay_in_the_timeline() {
+    let api = api_with_foreman(FakeAgent::new(Script::new())).await;
+    let sid = fresh_session(&api).await;
+    let pid = seed_proposal(&api, &sid, "write_file", json!({"path": "notes.md"})).await;
+
+    // 推过 TTL（10 分钟）再按一次「执行」。
+    api.clock.advance_secs(
+        agentpipeline_core::storage::proposals::FOREMAN_PROPOSAL_TTL_MINUTES * 60 + 1,
+    );
+    let (status, body) = post(
+        &api,
+        &format!("/foreman/proposals/{pid}/execute"),
+        json!({}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CONFLICT, "{body}");
+    assert!(
+        body["error"].as_str().unwrap().contains("过期"),
+        "报文要说清是过期：{body}"
+    );
+
+    // 状态落成 expired（不是删掉），且仍在时间线里。
+    let (_, body) = get(&api, &format!("/foreman/session?session={sid}")).await;
+    let proposals = body["proposals"].as_array().unwrap();
+    assert_eq!(proposals.len(), 1, "过期只让按钮变灰，那一轮留在时间线里");
+    assert_eq!(proposals[0]["id"], pid.as_str());
+    assert_eq!(proposals[0]["status"], "expired");
+    assert!(proposals[0]["resolved_at"].is_string());
+    // 未决清单里没有了
+    let (_, body) = get(&api, &format!("/foreman/proposals?session={sid}")).await;
+    assert!(body["proposals"].as_array().unwrap().is_empty());
+}
+
+/// 一次一按：第二次执行拿不到那条提议（不可重放）。
+///
+/// 这条也是「提议执行成功后作废」的落点——不是靠界面的禁用态，而是靠一次原子的占用。
+#[tokio::test]
+async fn a_proposal_can_only_be_pressed_once() {
+    let api = api_with_foreman(FakeAgent::new(Script::new())).await;
+    let sid = fresh_session(&api).await;
+    let pid = seed_proposal(&api, &sid, "write_file", json!({"path": "notes.md"})).await;
+
+    // 票 02 里没有任何工具接线，故第一次按下必然失败——而**失败不消耗提议**（参数过不了
+    // 校验是模型的事，不是提议本身作废），状态仍是 pending。
+    let (status, body) = post(
+        &api,
+        &format!("/foreman/proposals/{pid}/execute"),
+        json!({}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    let (_, body) = get(&api, &format!("/foreman/session?session={sid}")).await;
+    assert_eq!(body["proposals"][0]["status"], "pending");
+
+    // 拒绝是真的一次一按：第二次拒绝被挡下，且状态是 rejected。
+    let (status, _) = post(&api, &format!("/foreman/proposals/{pid}/reject"), json!({})).await;
+    assert_eq!(status, StatusCode::OK);
+    let (status, body) = post(&api, &format!("/foreman/proposals/{pid}/reject"), json!({})).await;
+    assert_eq!(status, StatusCode::CONFLICT, "{body}");
+    let (status, body) = post(
+        &api,
+        &format!("/foreman/proposals/{pid}/execute"),
+        json!({}),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::CONFLICT,
+        "已拒绝的提议不可再执行：{body}"
+    );
+    let (_, body) = get(&api, &format!("/foreman/session?session={sid}")).await;
+    assert_eq!(body["proposals"][0]["status"], "rejected");
+}
+
+/// 执行与拒绝**都回灌成一轮**（决策 207）：成功失败都进时间线，不弹窗。
+///
+/// 落的是「操作台」那一轮（`role = system`），不是助理轮——写成助理轮会让值班长下一轮
+/// 读到自己说过「我已经写入了」。
+#[tokio::test]
+async fn proposal_outcomes_land_in_the_timeline_as_system_turns() {
+    let api = api_with_foreman(FakeAgent::new(Script::new())).await;
+    let sid = fresh_session(&api).await;
+    let p1 = seed_proposal(&api, &sid, "write_file", json!({"path": "notes.md"})).await;
+    let p2 = seed_proposal(&api, &sid, "write_file", json!({"path": "other.md"})).await;
+
+    let _ = post(&api, &format!("/foreman/proposals/{p1}/execute"), json!({})).await;
+    let _ = post(&api, &format!("/foreman/proposals/{p2}/reject"), json!({})).await;
+
+    let (_, body) = get(&api, &format!("/foreman/session?session={sid}")).await;
+    let messages = body["messages"].as_array().unwrap();
+    assert_eq!(messages.len(), 2, "两次按键各留一轮：{body}");
+    assert!(messages.iter().all(|m| m["role"] == "system"));
+    assert!(messages[0]["content"]
+        .as_str()
+        .unwrap()
+        .contains("提议执行失败"));
+    assert!(messages[1]["content"]
+        .as_str()
+        .unwrap()
+        .contains("提议已拒绝"));
+}
+
+/// 态势变化的拒执（决策 207）：提议当时说的那件事已经不成立了 → 拒绝执行并报出来。
+#[tokio::test]
+async fn a_proposal_whose_situation_changed_is_refused() {
+    let api = api_with_foreman(FakeAgent::new(Script::new())).await;
+    // `seed` 返回的是项目 id，任务 id 就是给它的那个串。
+    seed(&api, "t-drift").await;
+    let task_id = "t-drift".to_string();
+    let sid = fresh_session(&api).await;
+    // 提议成立时任务停在 pending（seed_task 的状态），指纹就这么存下来。
+    let before = situation_fingerprint(&api.state.store, &task_id)
+        .await
+        .unwrap();
+    let pid = api
+        .state
+        .store
+        .create_foreman_proposal(NewForemanProposal {
+            session_id: sid.clone(),
+            tool: "task".into(),
+            args: json!({"task_id": task_id, "action": "resume"}),
+            summary: "（用例）恢复这个任务".into(),
+            situation: Some(before),
+        })
+        .await
+        .unwrap()
+        .id;
+
+    // 情况变了：任务被取消。
+    api.state
+        .store
+        .set_task_status(&task_id, TaskStatus::Cancelled)
+        .await
+        .unwrap();
+
+    let (status, body) = post(
+        &api,
+        &format!("/foreman/proposals/{pid}/execute"),
+        json!({}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CONFLICT, "{body}");
+    let message = body["error"].as_str().unwrap();
+    assert!(
+        message.contains("现在的情况已经不是它当时说的那样"),
+        "报文要报出「情况变了」而不是一句「执行失败」：{message}"
+    );
+    assert!(
+        message.contains("任务状态"),
+        "要说清变的是哪一样：{message}"
+    );
+
+    // 拒绝执行**不消耗**提议也不改写状态：人还可以自己按「拒绝」把它收掉。
+    let (_, body) = get(&api, &format!("/foreman/session?session={sid}")).await;
+    assert_eq!(body["proposals"][0]["status"], "pending");
+    // 而这次拒执**进了时间线**（失败也是这一轮的下场，决策 207）。
+    let messages = body["messages"].as_array().unwrap();
+    assert_eq!(messages.len(), 1);
+    assert!(messages[0]["content"]
+        .as_str()
+        .unwrap()
+        .contains("提议未执行"));
+}
+
+/// 三个端点未接线时一律 503（与既有七个端点同一条口径）。
+#[tokio::test]
+async fn proposal_endpoints_report_503_when_unwired() {
+    let api = api_full(Settings::default(), Vec::new(), offline_repo(), Vec::new()).await;
+    // 提议面与命令台账**四个**都在 `/foreman/*` 下：未接线时一律 503（不是 500，也不是
+    // 404——「没接线」与「这条提议不存在」是两件要分别排查的事）
+    for uri in ["/foreman/proposals", "/foreman/commands"] {
+        let (status, body) = get(&api, uri).await;
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{uri}: {body}");
+    }
+    for uri in [
+        "/foreman/proposals/x/execute",
+        "/foreman/proposals/x/reject",
+    ] {
+        let (status, body) = post(&api, uri, json!({})).await;
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{uri}: {body}");
+    }
+    // 未接线时一行都不落（拒绝发生在写之前）
+    assert!(api
+        .state
+        .store
+        .list_foreman_sessions()
+        .await
+        .unwrap()
+        .is_empty());
+}
+
+/// 不存在的提议 → 404（不是 500，也不是「无声成功」）。
+#[tokio::test]
+async fn unknown_proposal_is_a_404() {
+    let api = api_with_foreman(FakeAgent::new(Script::new())).await;
+    let (status, body) = post(&api, "/foreman/proposals/nope/execute", json!({})).await;
+    assert_eq!(status, StatusCode::NOT_FOUND, "{body}");
+    let (status, _) = post(&api, "/foreman/proposals/nope/reject", json!({})).await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+}
+
+/// 提议的生命周期事件推给 `/foreman/stream`，而任务流不吃它（决策 207 的单开事件）。
+#[tokio::test]
+async fn proposal_events_reach_the_foreman_stream() {
+    let api = api_with_foreman(FakeAgent::new(Script::new())).await;
+    let sid = fresh_session(&api).await;
+    let pid = seed_proposal(&api, &sid, "write_file", json!({"path": "notes.md"})).await;
+    let mut rx = api.state.sse.subscribe();
+
+    let _ = post(&api, &format!("/foreman/proposals/{pid}/reject"), json!({})).await;
+    let event = rx.recv().await.unwrap();
+    assert!(event.is_foreman_event(), "提议事件属于对讲台");
+    assert_eq!(event.task_id(), "", "值班长的事件不带任务");
+    match &event {
+        SseEvent::ForemanProposal {
+            proposal_id,
+            status,
+            session_id,
+            ..
+        } => {
+            assert_eq!(proposal_id, &pid);
+            assert_eq!(status, "rejected");
+            assert_eq!(session_id, &sid);
+        }
+        other => panic!("应是提议事件：{other:?}"),
+    }
+}
+
+/// 环境层档位走通全链路（决策 206）：写入、读回、非法值被拒、留空即清空。
+#[tokio::test]
+async fn stage_config_env_mode_round_trips_and_rejects_junk() {
+    let api = api().await;
+
+    let (status, body) = put(
+        &api,
+        "/stage-configs/develop",
+        json!({"env_mode": "deny", "max_tokens": 4096}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["stage_config"]["env_mode"], "deny");
+
+    // 读回来也是同一个值（不是只在响应里闪过）
+    let (_, body) = get(&api, "/stage-configs").await;
+    assert_eq!(body["stage_configs"][0]["env_mode"], "deny");
+
+    // 真实阶段收 `auto` / `deny` 两档（`ask` 只留给值班长那一行，见
+    // `only_the_foreman_row_may_be_configured_as_ask`——流水线节点无人按那颗钮）
+    for mode in ["auto", "deny"] {
+        let (status, body) = put(&api, "/stage-configs/develop", json!({"env_mode": mode})).await;
+        assert_eq!(status, StatusCode::OK, "{mode}: {body}");
+        assert_eq!(body["stage_config"]["env_mode"], mode);
+    }
+
+    // 非法值在**写入时**就被拒，且报文说清取值域（照 `SkillMode::parse` 的姿态）。
+    // 大小写不同也算非法：写错一个档位名而它悄悄变成 auto，等于把一次收紧的意图变成放松。
+    for junk in ["Auto", "allow", "yes", "1"] {
+        let (status, body) = put(&api, "/stage-configs/develop", json!({"env_mode": junk})).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{junk}: {body}");
+        assert!(
+            body["error"]
+                .as_str()
+                .unwrap()
+                .contains("auto / ask / deny"),
+            "{junk}: 报文要说清能填什么：{body}"
+        );
+    }
+    // 被拒之后库里仍是上一步那一条（坏值没有半写进去）
+    let cfg = api
+        .state
+        .store
+        .get_stage_config("develop")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(cfg.env_mode, Some(agentpipeline_core::types::EnvMode::Deny));
+
+    // 整条替换：不给 = 清空（回到「没配过」→ 用全局默认 / 该阶段的缺省）
+    let (status, body) = put(&api, "/stage-configs/develop", json!({"max_tokens": 2048})).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert!(body["stage_config"]["env_mode"].is_null());
+}
+
+/// `ask` **只留给值班长**（`run-command-permissions` 规格 §4）：别的阶段配上去会被拒。
+///
+/// 那不是洁癖：流水线节点无人按那颗钮，而它又没有提议通道——配成 `ask` 的结果是**静默收掉
+/// 这个阶段全部的环境写动作**（一条 develop 会卡在「写不了文件」上，而配置看上去只是一行
+/// `ask`）。要收紧就写 `deny`：那时意图与行为一致（拒绝，且连工具都不给）。
+#[tokio::test]
+async fn only_the_foreman_row_may_be_configured_as_ask() {
+    let api = api().await;
+
+    for stage in [
+        "develop",
+        "review",
+        "test",
+        "project_analysis",
+        "validator_cross_check",
+    ] {
+        let (status, body) = put(
+            &api,
+            &format!("/stage-configs/{stage}"),
+            json!({"env_mode": "ask"}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{stage}: {body}");
+        let message = body["error"].as_str().unwrap();
+        assert!(message.contains("ask"), "{stage}: {message}");
+        assert!(
+            message.contains("deny"),
+            "要说清该配什么：{stage}: {message}"
+        );
+        // 一个字都没写进库
+        assert!(api
+            .state
+            .store
+            .get_stage_config(stage)
+            .await
+            .unwrap()
+            .is_none());
+    }
+
+    // 值班长那一行照收（它的载体就是确认钮）
+    let (status, body) = put(&api, "/stage-configs/foreman", json!({"env_mode": "ask"})).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["stage_config"]["env_mode"], "ask");
+    // 另外两档对所有阶段都开放（收紧的方向不受限）
+    let (status, body) = put(&api, "/stage-configs/develop", json!({"env_mode": "deny"})).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+}
+
+/// 值班长的行同样可配（档位是**配置项**，不是代码里的常量）。
+#[tokio::test]
+async fn the_foreman_stage_accepts_an_env_mode_too() {
+    let api = api().await;
+    let (status, body) = put(&api, "/stage-configs/foreman", json!({"env_mode": "auto"})).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["stage_config"]["env_mode"], "auto");
+
+    // 不配这一行时，值班长解析到的是缺省 `ask`（两层解析的第二个缺省）
+    let settings = agentpipeline_core::config::Settings::default();
+    assert_eq!(
+        agentpipeline_core::types::effective_env_mode(settings.env_mode, "foreman", None),
+        agentpipeline_core::types::EnvMode::Ask
+    );
+}
+
+/// 值班长的命令走**会话维度**的只读面（决策 204④ / 206，票 03）。
+///
+/// 为什么不复用 `GET /tasks/{id}/commands`：那条路的归属列是任务，还带一句
+/// `command.task_id != id` 的归属校验——值班长的命令 `task_id` 是 NULL，永远查不到。
+/// 归属两列恰好一个非空（迁移 0012 的 CHECK），故两条读法平行且永不重叠。
+#[tokio::test]
+async fn foreman_commands_are_readable_from_the_session_dimension_only() {
+    use agentpipeline_core::agent::tools::{CommandFinish, CommandStart};
+    use agentpipeline_core::types::CommandSource;
+
+    let api = api_with_foreman(FakeAgent::new(Script::new())).await;
+    let (_, body) = post(&api, "/foreman/sessions", json!({"title": "夜班"})).await;
+    let sid = body["session"]["id"].as_str().unwrap().to_string();
+
+    // 落一行**真经过** `record_start`（生产里由 `run_command` 调它，不是手写 SQL）。
+    // task_id 传空串是值班长的真实形态：它没有任务，存储层把空串归一成 NULL。
+    let id = api
+        .state
+        .store
+        .record_start(CommandStart {
+            task_id: Some(String::new()),
+            session_id: Some(sid.clone()),
+            run_id: None,
+            stage: Stage::Init,
+            node: agentpipeline_core::types::Node::Execute,
+            source: CommandSource::Agent,
+            command: "ls tasks".into(),
+            cwd: api.state.home.root().display().to_string(),
+        })
+        .await
+        .unwrap();
+    api.state
+        .store
+        .record_finish(
+            id,
+            CommandFinish {
+                exit_code: Some(0),
+                stdout_preview: Some("tasks".into()),
+                duration_ms: 3,
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+
+    let (status, body) = get(&api, &format!("/foreman/commands?session={sid}")).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["session"]["id"], sid.as_str());
+    let commands = body["commands"].as_array().unwrap();
+    assert_eq!(commands.len(), 1, "{body}");
+    assert_eq!(commands[0]["command"], "ls tasks");
+    assert_eq!(commands[0]["exit_code"], 0);
+    // 归属落在会话上，任务列是 null——前端的渲染据此判断「这行不该挂到任务时间线」。
+    assert!(commands[0]["task_id"].is_null(), "{body}");
+    assert_eq!(commands[0]["session_id"], sid.as_str());
+
+    // 另一个班次读不到它（隔离在归属列上，不是靠前端过滤）。
+    let (_, body) = post(&api, "/foreman/sessions", json!({"title": "白班"})).await;
+    let other = body["session"]["id"].as_str().unwrap().to_string();
+    let (_, body) = get(&api, &format!("/foreman/commands?session={other}")).await;
+    assert!(body["commands"].as_array().unwrap().is_empty(), "{body}");
+
+    // 不存在的班次：空列表 + `session: null`，不是 404——「这一班没开过命令」与
+    // 「这一班不存在」对翻日志的人是同一个答案（库里什么都没有）。
+    let (status, body) = get(&api, "/foreman/commands?session=no-such-session").await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert!(body["session"].is_null(), "{body}");
+    assert!(body["commands"].as_array().unwrap().is_empty(), "{body}");
+}
+
+// ───────────── 确认钮接线：C / D / E 三层各一条（票 04 / 05 / 06）─────────────
+
+/// C 层：按下确认钮 → **文件真的变了**，且提议 id → 执行 → 落盘能在库里对上。
+///
+/// 这一条是整条链路的承重点：提议「只是记了一笔、按下才动」必须是真的。
+#[tokio::test]
+async fn pressing_the_button_actually_writes_the_file() {
+    let api = api_with_foreman(FakeAgent::new(Script::new())).await;
+    let sid = fresh_session(&api).await;
+    let target = api.state.home.root().join("notes.md");
+    let pid = seed_proposal(
+        &api,
+        &sid,
+        "write_file",
+        json!({"path": "notes.md", "content": "夜班交接：一切正常"}),
+    )
+    .await;
+    assert!(!target.exists(), "提议本身不该写任何东西");
+
+    let (status, body) = post(
+        &api,
+        &format!("/foreman/proposals/{pid}/execute"),
+        json!({}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(
+        std::fs::read_to_string(&target).unwrap(),
+        "夜班交接：一切正常"
+    );
+    assert_eq!(body["proposal"]["status"], "executed");
+
+    // 审计可追：结果落成**系统轮**（不是助理轮——写成助理轮会让它下一轮读成「我已经做了」）。
+    let text = body["message"]["content"].as_str().unwrap();
+    assert!(text.contains("提议已执行"), "{text}");
+    assert!(text.contains("notes.md"), "要能看见动了哪个文件：{text}");
+    assert!(text.contains("\"bytes\""), "要能看见写了多少：{text}");
+    assert_eq!(body["message"]["role"], "system");
+
+    // 库里那条提议的终态与原参数都还在（可追溯，不因执行而抹掉）。
+    let stored = api
+        .state
+        .store
+        .get_foreman_proposal(&pid)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(stored.args["path"], "notes.md");
+    assert!(!stored.status.is_open(), "执行过的提议不再是未决态");
+}
+
+/// C 层：域**补偿**在执行那一刻同样生效——`data/` 下的目标按不下去。
+///
+/// 两条路都要拒：域是执行时按当前策略判的，不是提议生成时记下来的。
+#[tokio::test]
+async fn a_confirmed_write_into_the_key_store_is_still_refused() {
+    let api = api_with_foreman(FakeAgent::new(Script::new())).await;
+    let sid = fresh_session(&api).await;
+    let pid = seed_proposal(
+        &api,
+        &sid,
+        "write_file",
+        json!({"path": "data/x.txt", "content": "偷偷放点东西"}),
+    )
+    .await;
+
+    let (status, body) = post(
+        &api,
+        &format!("/foreman/proposals/{pid}/execute"),
+        json!({}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    assert!(
+        body["error"].as_str().unwrap().contains("拒绝名单"),
+        "报文要说清命中了拒绝名单：{body}"
+    );
+    assert!(!api.state.home.root().join("data/x.txt").exists());
+
+    // 执行失败**不消耗**提议：参数过不了校验是提议自己的问题，人还可以按「拒绝」收掉它。
+    let stored = api
+        .state
+        .store
+        .get_foreman_proposal(&pid)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(stored.status.is_open(), "失败的提议仍应是未决态");
+}
+
+/// E 层：按下确认钮 → 命令真的跑了，并落进**会话维度**的命令台账。
+#[tokio::test]
+async fn pressing_the_button_actually_runs_the_command() {
+    let api = api_with_foreman(FakeAgent::new(Script::new())).await;
+    let sid = fresh_session(&api).await;
+    let pid = seed_proposal(
+        &api,
+        &sid,
+        "run_command",
+        json!({"command": "echo 夜班在岗"}),
+    )
+    .await;
+
+    let (status, body) = post(
+        &api,
+        &format!("/foreman/proposals/{pid}/execute"),
+        json!({}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert!(
+        body["message"]["content"]
+            .as_str()
+            .unwrap()
+            .contains("夜班在岗"),
+        "命令输出要回到时间线上：{body}"
+    );
+
+    let commands = api.state.store.list_foreman_commands(&sid).await.unwrap();
+    assert_eq!(commands.len(), 1);
+    assert_eq!(commands[0].task_id, None, "值班长的命令不挂任务");
+    assert_eq!(commands[0].exit_code, Some(0));
+    // 会话维度的只读面读得到它。
+    let (status, body) = get(&api, &format!("/foreman/commands?session={sid}")).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["commands"].as_array().unwrap().len(), 1, "{body}");
+}
+
+/// D 层：`task` 族的 `create` 按下之后**任务真的建了**（走的就是 `POST /tasks` 那段代码）。
+#[tokio::test]
+async fn the_task_family_creates_a_real_task() {
+    let api = api_with_foreman(FakeAgent::new(Script::new())).await;
+    let project_id = "proj-confirm".to_string();
+    seed_project(
+        &api.state.store,
+        &project_id,
+        "示例",
+        api._repo.path(),
+        "main",
+    )
+    .await
+    .unwrap();
+    let sid = fresh_session(&api).await;
+    let pid = seed_proposal(
+        &api,
+        &sid,
+        "task",
+        json!({"action": "create", "project_id": project_id, "title": "确认钮建的任务"}),
+    )
+    .await;
+
+    let (status, body) = post(
+        &api,
+        &format!("/foreman/proposals/{pid}/execute"),
+        json!({}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let tasks = api
+        .state
+        .store
+        .list_tasks(&agentpipeline_core::storage::tasks::TaskFilter::default())
+        .await
+        .unwrap();
+    assert_eq!(tasks.len(), 1, "按下的那一刻才建任务");
+    assert_eq!(tasks[0].title, "确认钮建的任务");
+}
+
+/// D 层：参数过不了**既有端点的校验** → 执行失败，且提议**不消耗**。
+///
+/// 这是「执行 = 走既有端点、同一套校验」的取证：提议不是一条绕过校验的捷径。
+#[tokio::test]
+async fn a_proposal_that_fails_the_endpoint_validation_stays_pending() {
+    let api = api_with_foreman(FakeAgent::new(Script::new())).await;
+    let sid = fresh_session(&api).await;
+    // 项目不存在 → `POST /tasks` 的既有校验会拒它。
+    let pid = seed_proposal(
+        &api,
+        &sid,
+        "task",
+        json!({"action": "create", "project_id": "没有这个项目", "title": "x"}),
+    )
+    .await;
+
+    let (status, body) = post(
+        &api,
+        &format!("/foreman/proposals/{pid}/execute"),
+        json!({}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    assert!(
+        body["error"].as_str().unwrap().contains("项目不存在"),
+        "报文应当是**端点自己那一句**：{body}"
+    );
+    let (_, body) = get(&api, &format!("/foreman/session?session={sid}")).await;
+    assert_eq!(body["proposals"][0]["status"], "pending", "{body}");
+    assert!(
+        body["proposals"][0]["status"] != "executed",
+        "参数过不了校验不是「执行过」：{body}"
+    );
+}
+
+/// D 层排除清单（决策 207⑤）：三项**没有对应的工具**，硬提一条也执行不了。
+///
+/// 判据是「改的是**谁能访问这台机器**」——让模型能提议它们，等于让它能给自己开门。
+#[tokio::test]
+async fn the_door_opening_actions_have_no_tool_at_all() {
+    let api = api_with_foreman(FakeAgent::new(Script::new())).await;
+    let sid = fresh_session(&api).await;
+
+    // ① 清单里没有这三个名字（白名单由此而来，故这就是「执行点也拒」的同一处）。
+    let manifest: Vec<&str> = agentpipeline_core::pipeline::foreman::FOREMAN_TOOL_SPECS
+        .iter()
+        .map(|s| s.name)
+        .collect();
+    for absent in ["pairing", "lan", "market_repos", "repo", "server"] {
+        assert!(
+            !manifest.contains(&absent),
+            "开门类动作不得有工具名：{absent} 出现在 {manifest:?}"
+        );
+    }
+
+    // ② 库里真有一条工具名对不上的提议（升级前落的 / 模型报了个不存在的名字）→ 执行被拒，
+    //    且**没有任何副作用**。
+    let token_before = api.state.store.pairing_token().await.unwrap_or_default();
+    let pid = seed_proposal(&api, &sid, "pairing", json!({"action": "reset"})).await;
+    let (status, body) = post(
+        &api,
+        &format!("/foreman/proposals/{pid}/execute"),
+        json!({}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    assert!(
+        body["error"].as_str().unwrap().contains("还没有接线"),
+        "报文要说清这个工具名没有落点：{body}"
+    );
+    assert_eq!(
+        api.state.store.pairing_token().await.unwrap_or_default(),
+        token_before,
+        "配对令牌一个字节都不该动"
+    );
 }

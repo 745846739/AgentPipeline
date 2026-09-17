@@ -21,9 +21,15 @@ use sqlx::FromRow;
 use super::{parse_ts, ts, Store};
 use crate::Result;
 
-/// `role` 的两个取值（与迁移 0005 的列注释同源）。
+/// `role` 的三个取值（与迁移 0005 的列注释同源）。
 pub const FOREMAN_ROLE_USER: &str = "user";
 pub const FOREMAN_ROLE_ASSISTANT: &str = "assistant";
+/// 操作台自己记的一轮（决策 207）：提议的执行结果。
+///
+/// **不能塞进 assistant**：那一侧是「值班长说的话」，而提议的结果恰恰是它**做不了**
+/// 的那件事的下场。写成 assistant，模型下一轮读到自己的历史时会把这段当成自己说过的话
+/// ——「你已经写入了 notes.md」这种声称正是人格里第一条纪律要挡的东西。
+pub const FOREMAN_ROLE_SYSTEM: &str = "system";
 
 /// 会话标题的字符上限（决策 204②：「前若干字」落到这个数）。
 ///
@@ -99,6 +105,19 @@ pub struct NewForemanMessage {
 }
 
 impl NewForemanMessage {
+    /// 操作台记的一轮（决策 207）：提议执行 / 拒绝的结果，或一次失败的理由。
+    pub fn system(session_id: impl Into<String>, content: impl Into<String>) -> Self {
+        NewForemanMessage {
+            session_id: session_id.into(),
+            role: FOREMAN_ROLE_SYSTEM.to_string(),
+            content: content.into(),
+            prompt_tokens: 0,
+            completion_tokens: 0,
+            briefing_json: None,
+            traces_json: None,
+        }
+    }
+
     /// 值班长回的话：带读数与（可能的）工具痕迹。
     pub fn assistant(session_id: impl Into<String>, content: impl Into<String>) -> Self {
         NewForemanMessage {

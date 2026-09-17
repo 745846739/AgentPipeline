@@ -9,6 +9,8 @@ import type {
   ForemanSession,
   ForemanSessionList,
   ForemanSessionMeta,
+  ForemanProposalResult,
+  ForemanCommand,
   GlobalMetrics,
   NodeCommand,
   NodeConversation,
@@ -607,4 +609,40 @@ export function sendForemanMessage(
     method: 'POST',
     body: { text, session_id: sessionId ?? null },
   });
+}
+
+/* ─────────── 确认钮（决策 188 / 207，票 02 / 03）：按下走既有端点 ─────────── */
+
+/**
+ * 按下「执行」。**执行不是一条新路**：后端按提议里的 `(工具, 参数)` 重走既有端点
+ * ——同一套校验、同一套闸门，故这里的失败报文与在别处点同一颗钮时看到的是同一句。
+ */
+export function executeForemanProposal(id: string): Promise<ForemanProposalResult> {
+  return request<ForemanProposalResult>(`/foreman/proposals/${encodeURIComponent(id)}/execute`, {
+    method: 'POST',
+    body: {},
+  });
+}
+
+/**
+ * 按下「拒绝」。它记的是「值班长提过、值班经理没让做」——**没有执行任何动作**，
+ * 与「执行失败」是两件事（后者只是没成功，提议仍是未决态）。
+ */
+export function rejectForemanProposal(id: string): Promise<ForemanProposalResult> {
+  return request<ForemanProposalResult>(`/foreman/proposals/${encodeURIComponent(id)}/reject`, {
+    method: 'POST',
+    body: {},
+  });
+}
+
+/** 该班次的命令台账（含被出口策略拒掉的——审计面要看得见那次尝试）。 */
+export function getForemanCommands(
+  sessionId?: string | null,
+  signal?: AbortSignal,
+): Promise<{ session: ForemanSessionMeta | null; commands: ForemanCommand[] }> {
+  const q = sessionId ? `?session=${encodeURIComponent(sessionId)}` : '';
+  return request<{ session: ForemanSessionMeta | null; commands: ForemanCommand[] }>(
+    `/foreman/commands${q}`,
+    { signal },
+  );
 }

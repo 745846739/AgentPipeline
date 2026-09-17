@@ -1,12 +1,6 @@
 import { describe, expect, it } from 'vitest';
 import type { StageConfig } from '../api/types';
-import {
-  STAGE_KEYS,
-  draftFromStageConfig,
-  emptyStageConfigDraft,
-  isPseudoStage,
-  stageKeyLabel,
-} from './stageConfigs';
+import { STAGE_KEYS, draftFromStageConfig, emptyStageConfigDraft, isPseudoStage, stageKeyLabel, stageMayUseAsk } from './stageConfigs';
 import { buildStageConfigPut } from './stageConfigs';
 import {
   addSkillDecl,
@@ -33,6 +27,9 @@ function config(overrides: Partial<StageConfig> = {}): StageConfig {
     idle_timeout_sec: null,
     max_duration_sec: null,
     node_overrides_json: null,
+    // 环境层档位（决策 206）：缺省行里它是 null（没配过）——真实阶段的缺省 `auto`
+    // 由后端的两层解析给出，不在这一行里。
+    env_mode: null,
     updated_at: '2026-09-12T00:00:00Z',
     ...overrides,
   };
@@ -303,4 +300,20 @@ describe('草稿 → payload：技能声明', () => {
 
   // 「续不续接上一轮对话」那条开关由决策 205 整层退场（改由后端的原因表决定），
   // 故它没有对应的用例了——不是漏了，是那个字段不存在了。
+});
+
+describe('ask 档只留给值班长（run-command-permissions 规格 §4）', () => {
+  it('只有 foreman 那一行允许 ask', () => {
+    expect(stageMayUseAsk('foreman')).toBe(true);
+    // 真实阶段与三个伪阶段都是无人值守的：它们没有提议通道，配 ask 等于静默收掉环境写动作
+    for (const stage of STAGE_KEYS.filter((k) => k !== 'foreman')) {
+      expect(stageMayUseAsk(stage)).toBe(false);
+    }
+  });
+
+  it('认不出的阶段键也不给 ask（默认拒绝，不是默认放行）', () => {
+    expect(stageMayUseAsk('')).toBe(false);
+    expect(stageMayUseAsk('develop ')).toBe(false);
+    expect(stageMayUseAsk('Foreman')).toBe(false);
+  });
 });

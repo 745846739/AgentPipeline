@@ -1086,6 +1086,15 @@ impl Executor {
         let task_dir = home.task_dir(&task.id).display().to_string();
 
         let policy = FileToolPolicy::new(vec![worktree.clone().into(), task_dir.clone().into()]);
+        // 阶段配置消费（§10.6.3 / 决策 22 / 46 / 111）：persona、采样参数、工具与技能增量。
+        // **在构造执行器之前读**：环境层档位要喂给执行点那道闸（决策 206），而它来自
+        // 这一份配置——构造完再读就得回头改执行器的状态。
+        let stage_cfg = self.store.get_stage_config(cursor.stage.as_str()).await?;
+        let env_mode = crate::types::effective_env_mode(
+            self.settings.env_mode,
+            cursor.stage.as_str(),
+            stage_cfg.as_ref(),
+        );
         let tools = ToolExecutor::new(
             home.clone(),
             policy,
@@ -1098,10 +1107,18 @@ impl Executor {
             sink: self.sse.clone(),
             task_id: task.id.clone(),
             branch: cursor.branch.clone(),
-        });
-
-        // 阶段配置消费（§10.6.3 / 决策 22 / 46 / 111）：persona、采样参数、工具与技能增量
-        let stage_cfg = self.store.get_stage_config(cursor.stage.as_str()).await?;
+        })
+        // 第三道闸（决策 206）：环境层按档位分三路。**不给它接提议通道**——流水线节点的
+        // `ask` 档下写工具会被拒，那是刻意的：提议是**人的**确认钮的载体，而流水线节点
+        // 背后没有人盯着，落一条没人会按的提议等于静默丢弃（决策 206 的档位是给
+        // 「有值班经理看着」的值班长用的，流水线阶段要么 auto 要么 deny）。
+        .with_env_mode(env_mode);
+        if env_mode == crate::types::EnvMode::Ask {
+            tracing::warn!(
+                stage = cursor.stage.as_str(),
+                "阶段被配成 ask 档：环境层工具会因没有提议通道而被拒（值班长的确认钮不服务流水线节点）"
+            );
+        }
         let persona = resolve_stage_persona(&home, stage_cfg.as_ref(), cursor.stage, cursor.node)?;
         let declared_tools =
             json_string_list(stage_cfg.as_ref().and_then(|c| c.tools_json.as_ref()));
@@ -1141,6 +1158,7 @@ impl Executor {
                         test_framework: project.test_framework.clone(),
                         temperature: stage_cfg.as_ref().and_then(|c| c.temperature),
                         max_tokens: stage_cfg.as_ref().and_then(|c| c.max_tokens),
+                        env_mode,
                         max_duration: std::time::Duration::from_secs(max_duration),
                     },
                 )) as Arc<dyn crate::agent::SubAgentRunner>
@@ -1294,7 +1312,7 @@ impl Executor {
                 system_prompt: system_prompt.clone(),
                 user_prompt: user_prompt.clone(),
                 messages: messages.clone(),
-                tools: tool_defs(kind, &declared_tools, &skills),
+                tools: tool_defs(kind, &declared_tools, &skills, env_mode),
                 temperature: stage_cfg.as_ref().and_then(|c| c.temperature),
                 max_tokens: stage_cfg.as_ref().and_then(|c| c.max_tokens),
                 // 任务级 provider 覆盖（决策 105）；阶段配置 / 系统默认由生产适配器解析
@@ -3265,6 +3283,7 @@ fn tool_defs(
     kind: AgentNodeKind,
     declared: &[String],
     skills: &[crate::agent::skills::ResolvedSkill],
+    env_mode: crate::types::EnvMode,
 ) -> Vec<ToolDef> {
     use crate::agent::skills::SkillRender;
 
@@ -3272,13 +3291,30 @@ fn tool_defs(
         .iter()
         .any(|s| matches!(s.render, SkillRender::Name | SkillRender::Catalogue { .. }));
     let mut defs: Vec<ToolDef> = Vec::new();
+    // `deny` 档**连广告都不给**（决策 206）：环境层工具直接从 tool 定义里摘掉，
+    // 而不是等模型发出来再拒一次。执行点那一道仍在（[`crate::agent::tools::ToolExecutor`]），
+    // 两道都留是因为它们挡的不是同一种东西：这里挡「模型看见了一个不该给的选项」，
+    // 那里挡「模型无视定义硬发」。
+    //
+    // 这是全仓**唯一**一处系统级设置压过强制基线的地方（[`MANDATORY_TOOLS`] 里含
+    // `write_file` / `run_command`）——压的方向只有收紧一种，故它是安全的：阶段配置动不了它，
+    // 只有全机档位可以。
+    // 判据只有一处（`agent::tools::denied_by_tier`）：值班长那一侧的广告集与这里问的是同一个
+    // 问题，两处各写一份谓词的后果是「一侧摘掉了、另一侧还广告着」这种只能靠现象定位的漂移。
+    let denied = |name: &str| crate::agent::tools::denied_by_tier(name, env_mode);
     for name in effective_tools(declared) {
         if name == "submit_metadata" {
             continue; // 最后以 schema 形式追加
         }
+        if denied(&name) {
+            continue;
+        }
         // 扩展工具（决策 172③，票 08）：不是内置工具，但**已实现**且由阶段声明启用。
         // 不认这一条的话，声明了 `spawn_sub_agent` 会在下面被当作「未实现」丢弃 + warn，
         // 于是声明与生效之间静默断开。
+        //
+        // `deny` 档的摘除**不在这里重复判**：上面那次 `denied` 已经把它挡下了
+        // （它与环境层其余工具同归一层）——同一支里判两遍，第二遍永远走不到。
         if name == crate::agent::SPAWN_SUB_AGENT_TOOL {
             defs.push(spawn_sub_agent_tool_def());
             continue;
@@ -3294,7 +3330,7 @@ fn tool_defs(
         });
     }
     // 有名字态 / 目录态技能 → 自动带上 `Skill`（渐进披露的按需拉取入口）
-    if needs_skill_tool && !defs.iter().any(|d| d.name == SKILL_TOOL) {
+    if needs_skill_tool && !denied(SKILL_TOOL) && !defs.iter().any(|d| d.name == SKILL_TOOL) {
         defs.push(skill_tool_def());
     }
     let schema_tool: ToolDef = match kind {

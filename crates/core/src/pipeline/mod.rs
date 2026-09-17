@@ -5,6 +5,7 @@ pub mod executor;
 pub mod foreman;
 pub mod graph;
 pub mod landing;
+pub mod proposals;
 pub mod pseudo;
 pub mod routes;
 pub mod subagent;

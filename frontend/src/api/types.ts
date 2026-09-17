@@ -566,8 +566,19 @@ export interface StageConfig {
   idle_timeout_sec: number | null;
   max_duration_sec: number | null;
   node_overrides_json: unknown | null;
+  /** 环境层权限档位（决策 206）。`null` = 没配过 → 用全局默认 / 该阶段的缺省。 */
+  env_mode: EnvMode | null;
   updated_at: string;
 }
+
+/**
+ * 环境层权限档位（决策 206，`crates/core/src/types.rs::EnvMode`）。
+ *
+ * `auto` 直接执行（缺省，等于现状）/ `ask` 转成提议等值班经理按键 / `deny` 拒绝且不广告。
+ * **只管环境层**（文件、命令、技能拉取、子代理）；本服务的写接口（建任务、拍板、合入……）
+ * 恒为提议 + 确认钮，不受这个值影响。
+ */
+export type EnvMode = 'auto' | 'ask' | 'deny';
 
 /**
  * `PUT /stage-configs/{stage}` 请求体（PutStageConfig）。
@@ -584,6 +595,7 @@ export interface StageConfigPutPayload {
   idle_timeout_sec?: number;
   max_duration_sec?: number;
   node_overrides_json?: unknown;
+  env_mode?: EnvMode;
 }
 
 /* ─────────────── server-info（crates/app/src/routes/server_info.rs，决策 167）─────────────── */
@@ -838,13 +850,54 @@ export interface ForemanMessage {
  *
  * `session` 为 `null` = 这台机器上一个班次都还没有（不是错误）：前端据此走
  * 「开一个班次」的空态。`foreman.wired` 为假时是未接线（503 之外的另一读法）。
+ *
+ * `proposals` 是**这个班次的全部**提议（含已执行 / 被拒绝 / 已过期）：时间线要的是
+ * 「它当时提议过什么」，只有未决的会在 `GET /foreman/proposals` 里（那是待办，不是台账）。
  */
 export interface ForemanSession {
   session: ForemanSessionMeta | null;
   messages: ForemanMessage[];
+  proposals: ForemanProposal[];
   total_tokens: number;
   total_calls: number;
   foreman: { agent_type: string; stage_key: string; wired: boolean };
+}
+
+/**
+ * 一条**提议**（决策 188 / 207）：值班长想做一件会改动东西的事，落库等人按键。
+ *
+ * `summary` 是**后端按参数生成**的一句话（不是模型写的自由文本）——它是人按键之前读到的
+ * 唯一一行字，故不能由模型自己措辞。`args` 原样下发（按键之前要看得出它到底要什么）。
+ */
+export interface ForemanProposal {
+  id: string;
+  session_id: string;
+  /** 工具名（`write_file` / `run_command` / `task` …）。认不出的原样显示。 */
+  tool: string;
+  args: unknown;
+  summary: string;
+  status: string;
+  created_at: string;
+  /** 有效期到点（决策 207：TTL 10 分钟）。**前端按它自己算过期**，不等后端标。 */
+  expires_at: string;
+  resolved_at: string | null;
+}
+
+/** `POST /foreman/proposals/{id}/execute` 与 `…/reject` 的响应。 */
+export interface ForemanProposalResult {
+  proposal: ForemanProposal | null;
+  message: ForemanMessage | null;
+}
+
+/** 会话命令台账的一行（`GET /foreman/commands`）。`task_id` 恒为 null——它挂会话。 */
+export interface ForemanCommand {
+  id: number;
+  session_id: string | null;
+  command: string;
+  cwd: string;
+  exit_code: number | null;
+  started_at: string;
+  finished_at: string | null;
 }
 
 /** `GET /foreman/sessions`：未归档的班次，按最近活动倒序。 */

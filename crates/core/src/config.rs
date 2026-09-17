@@ -48,6 +48,16 @@ pub struct Settings {
     pub egress_allow_hosts: Vec<String>,
     /// 显式放行全部出口。默认 `false`：未配置时**不得**静默变成「全部放行」。
     pub egress_allow_all: bool,
+    /// 环境层权限档位的**全局默认**（决策 206）。
+    ///
+    /// 缺省 `auto` = **等于现状**：环境层工具（文件 / 命令 / 技能拉取 / 子代理）直接执行，
+    /// 与档位出现之前逐字相同。阶段级覆盖在 `stage_configs.env_mode`，值班长的缺省是
+    /// `ask`（它的输入是人可以随便打的任意文本）——两层解析的唯一实现在
+    /// [`crate::types::effective_env_mode`]。
+    ///
+    /// 写在这里而不是 UI 里：改它等于改全机所有阶段的行为，那是一次深思熟虑的编辑，
+    /// 不是一次点击（照 `allow_dirty_worktree_merge` 那一批的做法）。
+    pub env_mode: crate::types::EnvMode,
 }
 
 impl Default for Settings {
@@ -78,6 +88,7 @@ impl Default for Settings {
             allow_dirty_worktree_merge: false,
             egress_allow_hosts: Vec::new(),
             egress_allow_all: false,
+            env_mode: crate::types::EnvMode::Auto,
         }
     }
 }
@@ -111,6 +122,10 @@ pub struct PipelineOverrides {
     pub allow_dirty_worktree_merge: Option<bool>,
     pub egress_allow_hosts: Option<Vec<String>>,
     pub egress_allow_all: Option<bool>,
+    /// 环境层档位（决策 206）。**用字符串接**：`deny_unknown_fields` +
+    /// 枚举反序列化会把 `env_mode = "Auto"` 报成一句难读的 serde 错误，而这里要的是一句
+    /// 「只能是 auto / ask / deny」——解析与校验在 [`PipelineOverrides::apply`] 里做。
+    pub env_mode: Option<String>,
 }
 
 impl PipelineOverrides {
@@ -149,6 +164,15 @@ impl PipelineOverrides {
             egress_allow_hosts,
             egress_allow_all,
         );
+        // 非法值由 [`Config::validate`] 在解析期拦下（fail fast），故这里只做「认得出就采用」
+        // ——两处都报错会让同一个错误有两个出口，而这里没有 `Result` 可返回。
+        if let Some(mode) = self
+            .env_mode
+            .as_deref()
+            .and_then(crate::types::EnvMode::parse)
+        {
+            s.env_mode = mode;
+        }
         s
     }
 }
@@ -483,6 +507,24 @@ impl Config {
                 crate::agent::egress::check_allow_host(host).map_err(|e| {
                     Error::Config(format!("[pipeline] egress_allow_hosts 校验失败：{e}"))
                 })?;
+            }
+        }
+        // 环境层档位（决策 206）同样在解析期 fail fast：写错一个档位名而它悄悄退回
+        // `auto`，等于把一次收紧的意图变成一次放松——这个方向不能靠猜。
+        //
+        // 这一层是**全局默认**，而真实阶段的档位取自它，故 `ask` 在这里就是「所有阶段都
+        // 变成 ask」——那不是收紧而是静默收掉所有环境写动作（流水线无人按提议）。
+        // 故这一层只收 `auto` / `deny`；`ask` 是值班长行的档位（规格 §4）。
+        if let Some(raw) = self.pipeline.env_mode.as_ref() {
+            let mode = crate::types::EnvMode::parse_or_message(raw)
+                .map_err(|e| Error::Config(format!("[pipeline] {e}")))?;
+            if mode == crate::types::EnvMode::Ask {
+                return Err(Error::Config(
+                    "[pipeline] env_mode 不能是 ask：这一层是所有阶段的全局默认，而流水线节点\
+                     无人值守（ask 在那里没有提议通道，等于静默收掉全部环境写动作）——\
+                     要收紧请写 deny；ask 请配在 stage_configs 的 foreman 行上"
+                        .into(),
+                ));
             }
         }
         Ok(())
@@ -1030,7 +1072,7 @@ pub fn validate_startup(inputs: &StartupInputs) -> Result<StartupReport> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::types::Stage;
+    use crate::types::{Stage, ENV_MODE_EXPECTED};
 
     #[test]
     fn defaults_match_design_table() {
@@ -1067,6 +1109,29 @@ mod tests {
         let server = ServerConfig::default();
         assert_eq!(server.port, 8788);
         assert_eq!(server.host, "127.0.0.1");
+    }
+
+    /// `[pipeline] env_mode` 走通两层解析，且**只收 `auto` / `deny`**（决策 206）。
+    ///
+    /// `ask` 在这一层是「所有阶段的全局默认」，而流水线节点无人按那颗确认钮、也没有提议通道
+    /// ——配成 `ask` 的结果是**静默收掉全机所有环境写动作**（一条 develop 会卡在「写不了文件」
+    /// 上，而配置看上去只是一行 `ask`）。故它在解析期就被拒，报错指向真正该配它的那一行
+    /// （`stage_configs` 的 `foreman`）。写错档位名同样 fail fast（方向只能是收紧，不能靠猜）。
+    #[test]
+    fn the_global_tier_accepts_auto_and_deny_but_not_ask() {
+        for mode in ["auto", "deny"] {
+            let cfg = Config::from_toml(&format!("[pipeline]\nenv_mode = \"{mode}\"\n")).unwrap();
+            assert_eq!(cfg.settings().env_mode.as_str(), mode);
+        }
+        // `ask` 被拒，且报文说清「配在哪一行」
+        let err = Config::from_toml("[pipeline]\nenv_mode = \"ask\"\n").unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("不能是 ask"), "{msg}");
+        assert!(msg.contains("deny"), "要说清该配什么：{msg}");
+        assert!(msg.contains("foreman"), "要指出该配在哪一行：{msg}");
+        // 认不出的值照旧 fail fast，且用共享那句话（与 `PUT /stage-configs` 同一份说法）
+        let err = Config::from_toml("[pipeline]\nenv_mode = \"Auto\"\n").unwrap_err();
+        assert!(err.to_string().contains(ENV_MODE_EXPECTED), "{err}");
     }
 
     #[test]

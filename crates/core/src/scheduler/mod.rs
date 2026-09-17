@@ -126,10 +126,19 @@ impl KanbanScheduler {
         let cutoff =
             self.clock.now() - Duration::days(self.settings.conversation_retention_days as i64);
         let purged_foreman = self.store.purge_foreman_messages(cutoff).await?;
+        // 提议两件事分开做（决策 207）：**过期清扫**改状态、留行；**年龄清理**删行。
+        // 合成一步就会让「过期只让按钮变灰、那一轮留在时间线」这条规则在维护作业里失效。
+        let expired_proposals = self
+            .store
+            .expire_foreman_proposals(self.clock.now())
+            .await?;
+        let purged_proposals = self.store.purge_foreman_proposals(cutoff).await?;
         let aggregated = self.aggregate_node_metrics().await?;
         Ok(MaintenanceReport {
             purged_conversations: purged,
             purged_foreman_messages: purged_foreman,
+            expired_foreman_proposals: expired_proposals,
+            purged_foreman_proposals: purged_proposals,
             aggregated_tasks: aggregated,
         })
     }
@@ -540,6 +549,11 @@ pub struct MaintenanceReport {
     /// 被保留期清掉的值班长会话行（票 05）。与上一项分开计数——它们挂在不同表上，
     /// 混成一个数就看不出是哪一类在增长。
     pub purged_foreman_messages: usize,
+    /// 被过期清扫标成 `expired` 的提议（决策 207）。**清的是状态不是行**——那一轮留在
+    /// 时间线里，故它与上面两项的「清掉了多少行」不是同一个量。
+    pub expired_foreman_proposals: usize,
+    /// 被保留期清掉的提议行（决策 207：与对讲台对话同一个保留期）。
+    pub purged_foreman_proposals: usize,
     pub aggregated_tasks: usize,
 }
 

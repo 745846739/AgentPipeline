@@ -800,6 +800,95 @@ fn diff_stat_summary_is_parsed() {
     assert_eq!(stats.deletions, 0);
 }
 
+/// `deny` 档下环境层工具**连广告都不给**（决策 206）：tool 定义里就被摘掉，
+/// 而不是只在执行点拒一次。
+///
+/// 反向那半段是同一条用例的一部分，而且是它真正的力量所在：同一条配置在 `auto` 档下
+/// 这些工具**在**——否则「上面那条不广告」可能只是因为配置里压根没声明它们。
+#[tokio::test]
+async fn deny_tier_removes_env_tools_from_the_advertised_set() {
+    use agentpipeline_core::types::{EnvMode, StageConfig};
+
+    let ctx = setup("true", Settings::default()).await;
+    let declared = serde_json::json!(["read_file", "run_command", "spawn_sub_agent"]);
+    ctx.store
+        .upsert_stage_config(&StageConfig {
+            stage: "architect-design".into(),
+            tools_json: Some(declared.clone()),
+            env_mode: Some(EnvMode::Deny),
+            updated_at: ctx.store.now(),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+
+    let mut ban = vec![
+        "read_file".to_string(),
+        "write_file".to_string(),
+        "edit_file".to_string(),
+        "delete_file".to_string(),
+        "list_dir".to_string(),
+        "run_command".to_string(),
+        "spawn_sub_agent".to_string(),
+    ];
+    ban.sort();
+
+    // deny：环境层全军覆没，而**与档位无关的东西照旧**（校验工具、只读台账工具）
+    let denied = advertised_tool_names(&ctx, "t-denied").await;
+    for name in &ban {
+        assert!(!denied.contains(name), "deny 档不得广告 {name}：{denied:?}");
+    }
+    assert!(
+        denied.iter().any(|n| n == "submit_metadata"),
+        "校验工具不受档位影响：{denied:?}"
+    );
+
+    // auto：同一条声明**在**（否则上面那条证明不了任何事）
+    let row = ctx
+        .store
+        .get_stage_config("architect-design")
+        .await
+        .unwrap()
+        .unwrap();
+    ctx.store
+        .upsert_stage_config(&StageConfig {
+            env_mode: Some(EnvMode::Auto),
+            ..row
+        })
+        .await
+        .unwrap();
+    let allowed = advertised_tool_names(&ctx, "t-allowed").await;
+    for name in ["read_file", "run_command"] {
+        assert!(
+            allowed.contains(&name.to_string()),
+            "auto 档应当广告 {name}：{allowed:?}"
+        );
+    }
+}
+
+/// 跑一个任务到 architect-design.validate_input，取那一次请求**广告出去的工具名**。
+///
+/// 广告集是这一档行为的一半（另一半在执行点）：`deny` 要「连广告都不给」，
+/// 而那件事只能从真发出去的请求上看。
+async fn advertised_tool_names(ctx: &Ctx, task: &str) -> Vec<String> {
+    let mut script = Script::new();
+    design_scripts(&mut script);
+    ctx.agent.set_script(script);
+    testkit::seed_task(&ctx.store, task, "p1").await.unwrap();
+    admit(ctx, task).await;
+    ctx.executor.run(task).await.unwrap();
+    let requests = ctx.agent.request_log();
+    requests
+        .iter()
+        .rev()
+        .find(|r| r.stage == Stage::ArchitectDesign && r.node == Node::ValidateInput)
+        .expect("architect validate_input 请求")
+        .tools
+        .iter()
+        .map(|t| t.name.clone())
+        .collect()
+}
+
 // ──────────────────── prompt 组装消费模板 / 配置（票 12）────────────────────
 
 #[tokio::test]
@@ -826,6 +915,7 @@ async fn prompt_assembly_consumes_templates_stage_configs_and_agents_md() {
             idle_timeout_sec: None,
             max_duration_sec: None,
             node_overrides_json: None,
+            env_mode: None,
             updated_at: ctx.store.now(),
         })
         .await
@@ -846,6 +936,7 @@ async fn prompt_assembly_consumes_templates_stage_configs_and_agents_md() {
             idle_timeout_sec: None,
             max_duration_sec: None,
             node_overrides_json: None,
+            env_mode: None,
             updated_at: ctx.store.now(),
         })
         .await

@@ -60,6 +60,11 @@ pub struct PutStageConfig {
     pub max_duration_sec: Option<u64>,
     #[serde(default)]
     pub node_overrides_json: Option<serde_json::Value>,
+    /// 环境层档位（决策 206）。**用字符串接**：枚举反序列化对 `"Auto"` 报的是 serde 的
+    /// 通用错误，而这里要给一句「只能是 auto / ask / deny」——与 config.toml 那一侧
+    /// 同一条口径（同一个值的两种来源，报错也该是同一种说法）。
+    #[serde(default)]
+    pub env_mode: Option<String>,
 }
 
 /// 用「现有配置 + 待改动」跑一遍启动校验；`removed` 是本次要从集合里去掉的阶段键。
@@ -105,6 +110,26 @@ pub async fn put(
     Json(body): Json<PutStageConfig>,
 ) -> ApiResult<impl IntoResponse> {
     validate_stage_key(&stage)?;
+    let env_mode = match body.env_mode.as_deref().map(str::trim) {
+        None | Some("") => None,
+        Some(raw) => {
+            let mode = agentpipeline_core::types::EnvMode::parse_or_message(raw)
+                .map_err(ApiError::bad_request)?;
+            // `ask` 只留给值班长（`run-command-permissions` 规格 §4）：流水线节点无人按那颗钮，
+            // 而它又没有提议通道——配成 `ask` 的结果是**静默收掉这个阶段全部的环境写动作**。
+            // 要收紧就写 `deny`（拒绝，且连工具都不给），那时意图与行为一致。
+            if mode == agentpipeline_core::types::EnvMode::Ask
+                && !agentpipeline_core::types::stage_may_use_ask(&stage)
+            {
+                return Err(ApiError::bad_request(format!(
+                    "阶段 {stage} 不能配成 ask：ask 是「等人按键」，而流水线节点无人值守\
+                     （它没有提议通道，配成 ask 等于静默收掉这个阶段全部的文件与命令动作）。\
+                     要收紧请配 deny"
+                )));
+            }
+            Some(mode)
+        }
+    };
     let candidate = StageConfig {
         stage: stage.clone(),
         provider_id: body.provider_id,
@@ -117,6 +142,7 @@ pub async fn put(
         idle_timeout_sec: body.idle_timeout_sec,
         max_duration_sec: body.max_duration_sec,
         node_overrides_json: body.node_overrides_json,
+        env_mode,
         updated_at: state.store.now(),
     };
 

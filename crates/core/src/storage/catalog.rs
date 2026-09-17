@@ -84,6 +84,10 @@ struct StageConfigRow {
     idle_timeout_sec: Option<i64>,
     max_duration_sec: Option<i64>,
     node_overrides_json: Option<String>,
+    /// 环境层档位（决策 206）。认不出的值**退回缺省**而不是报错：这一列可以被人手工改坏
+    /// （写入路径已经按枚举拒过），而让整张阶段配置表因此读不出来，代价远大于退一步
+    /// ——退回的方向是安全的：值班长退回 `ask`（收紧），真实阶段退回全局默认。
+    env_mode: Option<String>,
     updated_at: String,
 }
 
@@ -110,6 +114,10 @@ impl StageConfigRow {
             node_overrides_json: self
                 .node_overrides_json
                 .and_then(|s| serde_json::from_str(&s).ok()),
+            env_mode: self
+                .env_mode
+                .as_deref()
+                .and_then(crate::types::EnvMode::parse),
             updated_at: parse_ts(&self.updated_at)?,
         })
     }
@@ -378,8 +386,8 @@ impl Store {
             "INSERT INTO stage_configs
              (stage, provider_id, temperature, max_tokens, persona_path, persona_append,
               tools_json, skills_json, idle_timeout_sec, max_duration_sec, node_overrides_json,
-              updated_at)
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+              env_mode, updated_at)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
              ON CONFLICT(stage) DO UPDATE SET
                  provider_id = excluded.provider_id, temperature = excluded.temperature,
                  max_tokens = excluded.max_tokens, persona_path = excluded.persona_path,
@@ -387,6 +395,7 @@ impl Store {
                  skills_json = excluded.skills_json, idle_timeout_sec = excluded.idle_timeout_sec,
                  max_duration_sec = excluded.max_duration_sec,
                  node_overrides_json = excluded.node_overrides_json,
+                 env_mode = excluded.env_mode,
                  updated_at = excluded.updated_at",
         )
         .bind(&cfg.stage)
@@ -400,6 +409,7 @@ impl Store {
         .bind(cfg.idle_timeout_sec.map(|v| v as i64))
         .bind(cfg.max_duration_sec.map(|v| v as i64))
         .bind(cfg.node_overrides_json.as_ref().map(|v| v.to_string()))
+        .bind(cfg.env_mode.map(|m| m.as_str()))
         .bind(ts(self.now()))
         .execute(self.pool())
         .await?;
@@ -410,7 +420,7 @@ impl Store {
         let rows: Vec<StageConfigRow> = sqlx::query_as(
             "SELECT stage, provider_id, temperature, max_tokens, persona_path, persona_append,
                     tools_json, skills_json, idle_timeout_sec, max_duration_sec,
-                    node_overrides_json, updated_at
+                    node_overrides_json, env_mode, updated_at
              FROM stage_configs ORDER BY stage",
         )
         .fetch_all(self.pool())

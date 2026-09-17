@@ -10,20 +10,31 @@
 //! | POST | `/foreman/sessions` | 新开一个班次 |
 //! | PATCH | `/foreman/sessions/{id}` | 改名 |
 //! | POST | `/foreman/sessions/{id}/archive` | 归档（从列表里收起来，不删行） |
-//! | GET | `/foreman/session?session=<id>` | 某个班次的全部轮次 + 该班次的合计 token |
+//! | GET | `/foreman/session?session=<id>` | 某个班次的全部轮次 + 提议 + 合计 token |
 //! | POST | `/foreman/messages` | 说一句话，得到一次回话 |
-//! | GET | `/foreman/stream` | 订阅回话的逐字增量 |
+//! | GET | `/foreman/stream` | 订阅回话的逐字增量与提议事件 |
+//! | GET | `/foreman/commands?session=<id>` | 该班次跑过的命令（含被拒的） |
+//! | GET | `/foreman/proposals?session=<id>` | 该班次未决的提议 |
+//! | POST | `/foreman/proposals/{id}/execute` | 按下确认钮：**走既有端点**执行这条提议 |
+//! | POST | `/foreman/proposals/{id}/reject` | 拒绝这条提议（作废，不再可执行） |
 //!
-//! **写动作仍然只有任务端点有。** 这里没有任何改变流水线状态的入口——值班长只说话，
-//! 动手的键由 `POST /tasks/{id}/resume` 那批端点在详情里下发（决策 101 / 182⑯⑰）。
+//! **写动作仍然只有任务端点有。** 值班长只说话，动手的键由 `POST /tasks/{id}/resume` 那批
+//! 端点在详情里下发（决策 101 / 182⑯⑰）。决策 188 把它的能力扩到能碰文件与系统接口，靠的是
+//! **提议**（决策 207）：模型提议 → 落库 → 人按下「执行」→ [`run_proposal_tool`] 走**既有的
+//! 那条**端点（同一套校验、同一套闸门）。**这里没有第二条改状态的路**——绕过校验的捷径
+//! 一旦存在，「LLM 的判断不直接接进状态机」那条接缝就换个形式又回来了。
 //!
 //! **一条长会话改成一排班次**（决策 204）：会话隔离的是对话上下文与页头读数，
 //! 不是权限，也不是态势快照——「换会话 ≠ 换看板」。台账从此跨会话，会话只是容器。
 
-use agentpipeline_core::pipeline::foreman::{FOREMAN_AGENT_TYPE, FOREMAN_STAGE_KEY};
-use agentpipeline_core::storage::foreman::{
-    ForemanMessage, ForemanSession, SESSION_TITLE_MAX_CHARS,
+use agentpipeline_core::pipeline::foreman::{
+    situation_drift, situation_fingerprint, FOREMAN_AGENT_TYPE, FOREMAN_STAGE_KEY,
 };
+use agentpipeline_core::sse::SseEvent;
+use agentpipeline_core::storage::foreman::{
+    ForemanMessage, ForemanSession, NewForemanMessage, SESSION_TITLE_MAX_CHARS,
+};
+use agentpipeline_core::storage::proposals::{ForemanProposal, ForemanProposalStatus};
 use agentpipeline_core::storage::Store;
 use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
@@ -181,6 +192,634 @@ pub async fn archive_session(
     Ok(Json(json!({ "session": session_wire(&session) })))
 }
 
+// ───────────────────────── 命令（决策 204④ / 206，票 03）─────────────────────────
+
+/// `GET /foreman/commands?session=<id>`：该班次跑过的命令。
+///
+/// 为什么另开一条而不是复用 `GET /tasks/{id}/commands`：那个读法的归属列是**任务**
+/// （它还带一句 `command.task_id != id` 的归属校验），而值班长的命令 `task_id` 是 NULL
+/// ——它在那条路上永远查不到。两条读法是平行的，归属列恰好一个非空，故永不重叠。
+///
+/// **被拒的命令也在这张表里**（决策 179 的既有口径）：审计面要看得见「有过一次被拒的
+/// 尝试」，否则策略在日志里完全不可见，只剩模型侧的一次报错。
+pub async fn commands(
+    State(state): State<AppState>,
+    Query(params): Query<SessionQuery>,
+) -> ApiResult<impl IntoResponse> {
+    if state.foreman.is_none() {
+        return Err(foreman_unwired());
+    }
+    let store = state.store.clone();
+    let session = read_session(&store, params.session.as_deref()).await?;
+    let Some(session) = session else {
+        return Ok(Json(json!({
+            "session": serde_json::Value::Null,
+            "commands": [],
+        })));
+    };
+    let commands = store
+        .list_foreman_commands(&session.id)
+        .await
+        .map_err(map_core_error)?;
+    Ok(Json(json!({
+        "session": session_wire(&session),
+        "commands": commands,
+    })))
+}
+
+// ───────────────────────── 提议（决策 188 / 207，票 02）─────────────────────────
+
+/// `GET /foreman/proposals?session=<id>`：该班次**未决**的提议。
+///
+/// 与 `GET /foreman/session` 的分工：那里给的是**时间线**（全部提议，含已决与已过期——
+/// 过期的那一轮必须还在，决策 207），这里给的是**待办**（只有还要人按键的那些）。
+/// 不分页、不排序参数：一个班次里的未决提议是人一只手数得过来的东西。
+pub async fn proposals(
+    State(state): State<AppState>,
+    Query(params): Query<SessionQuery>,
+) -> ApiResult<impl IntoResponse> {
+    if state.foreman.is_none() {
+        return Err(foreman_unwired());
+    }
+    let store = state.store.clone();
+    let session = read_session(&store, params.session.as_deref()).await?;
+    let Some(session) = session else {
+        return Ok(Json(json!({
+            "session": serde_json::Value::Null,
+            "proposals": [],
+        })));
+    };
+    let proposals = store
+        .list_pending_foreman_proposals(&session.id)
+        .await
+        .map_err(map_core_error)?;
+    Ok(Json(json!({
+        "session": session_wire(&session),
+        "proposals": proposals.iter().map(proposal_wire).collect::<Vec<_>>(),
+    })))
+}
+
+/// `POST /foreman/proposals/{id}/execute`：按下确认钮。
+///
+/// **执行 = 走后端既有的那条路**（同一套校验、同一套闸门：依赖循环、worktree 准入、
+/// 写入门、fail fast）。本函数只负责提议层的三件事：一次一按、过期、态势变化的拒执。
+pub async fn execute_proposal(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+) -> ApiResult<impl IntoResponse> {
+    if state.foreman.is_none() {
+        return Err(foreman_unwired());
+    }
+    let store = state.store.clone();
+    let proposal = store
+        .get_foreman_proposal(&id)
+        .await
+        .map_err(map_core_error)?
+        .ok_or_else(|| proposal_not_found(&id))?;
+
+    // ① 过期：标成 expired 再拒（决策 207）。**不删行**——那一轮留在时间线里，
+    //    按钮变灰并说明原因就是从这里来的。
+    if proposal.is_expired(store.now()) {
+        let expired = store
+            .expire_foreman_proposal(&id)
+            .await
+            .map_err(map_core_error)?;
+        if let Some(expired) = &expired {
+            announce_proposal(&state, expired);
+        }
+        return Err(ApiError::conflict(format!(
+            "这条提议已经过期（有效期 {} 分钟）——当时的情况未必还成立，要做得重新提一次",
+            agentpipeline_core::storage::proposals::FOREMAN_PROPOSAL_TTL_MINUTES
+        )));
+    }
+
+    // ② 一次一按：原子占用。拿不到就说明有人先按了 / 正在执行 / 已经被处理过——
+    //    这一条是「不可重放」的落点，不靠界面的禁用态（两台设备同时按也算数）。
+    let Some(claimed) = store
+        .claim_foreman_proposal(&id)
+        .await
+        .map_err(map_core_error)?
+    else {
+        return Err(ApiError::conflict("这条提议已经在执行，或已经被处理过了"));
+    };
+
+    // ③ 态势变化的拒执（决策 207）：提议成立时存了一份指纹，执行时再取一份。
+    //    参数里没有 task_id 的提议没有「态势」可判（文件与命令是这一类）——那种情况下
+    //    提议的成立与否由端点自己的校验回答。
+    if let Some(before) = &claimed.situation {
+        if let Some(task_id) = claimed.args.get("task_id").and_then(|v| v.as_str()) {
+            let after = situation_fingerprint(&store, task_id)
+                .await
+                .map_err(map_core_error)?;
+            if let Some(drift) = situation_drift(before, &after) {
+                // 释放占用、**保持 pending**：人还可以按「拒绝」把它收掉（那是人的判断），
+                // 而把它自动标成 expired 会把「它过期了」与「情况变了」两件事说成一件。
+                store
+                    .release_foreman_proposal(&id)
+                    .await
+                    .map_err(map_core_error)?;
+                let reason = format!("现在的情况已经不是它当时说的那样：{drift}。要做得重新提一次");
+                record_proposal_outcome(&store, &claimed, &format!("提议未执行：{reason}")).await?;
+                return Err(ApiError::conflict(reason));
+            }
+        }
+    }
+
+    match run_proposal_tool(&state, &claimed).await {
+        Ok(detail) => {
+            let resolved = store
+                .resolve_foreman_proposal(&id, ForemanProposalStatus::Executed)
+                .await
+                .map_err(map_core_error)?;
+            let text = match &detail {
+                Some(d) => format!("提议已执行：{}\n{d}", claimed.summary),
+                None => format!("提议已执行：{}", claimed.summary),
+            };
+            let message = record_proposal_outcome(&store, &claimed, &text).await?;
+            if let Some(resolved) = &resolved {
+                announce_proposal(&state, resolved);
+            }
+            Ok(Json(json!({
+                "proposal": resolved.as_ref().map(proposal_wire),
+                "message": message.as_ref().map(message_wire),
+            })))
+        }
+        Err(err) => {
+            // 执行失败**不消耗提议**：参数过不了校验是模型的事，不是提议本身作废
+            // （票 02 的验收：那种情况下 status **不**变成 executed）。失败也进时间线。
+            store
+                .release_foreman_proposal(&id)
+                .await
+                .map_err(map_core_error)?;
+            record_proposal_outcome(&store, &claimed, &format!("提议执行失败：{}", err.message))
+                .await?;
+            Err(err)
+        }
+    }
+}
+
+/// `POST /foreman/proposals/{id}/reject`：拒绝这条提议。
+///
+/// 拒绝是**人的动作**，与执行一样要走占用（一次一按），也进时间线。拒绝之后
+/// 这条提议不可再执行——它记录的是「值班长提过、值班经理没让做」。
+pub async fn reject_proposal(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+) -> ApiResult<impl IntoResponse> {
+    if state.foreman.is_none() {
+        return Err(foreman_unwired());
+    }
+    let store = state.store.clone();
+    let proposal = store
+        .get_foreman_proposal(&id)
+        .await
+        .map_err(map_core_error)?
+        .ok_or_else(|| proposal_not_found(&id))?;
+    if !proposal.status.is_open() {
+        return Err(ApiError::conflict(format!(
+            "这条提议已经{}了",
+            proposal_status_label(proposal.status)
+        )));
+    }
+    let Some(claimed) = store
+        .claim_foreman_proposal(&id)
+        .await
+        .map_err(map_core_error)?
+    else {
+        return Err(ApiError::conflict("这条提议已经在执行，或已经被处理过了"));
+    };
+    let resolved = store
+        .resolve_foreman_proposal(&id, ForemanProposalStatus::Rejected)
+        .await
+        .map_err(map_core_error)?;
+    let message = record_proposal_outcome(
+        &store,
+        &claimed,
+        &format!("提议已拒绝：{}（没有执行任何动作）", claimed.summary),
+    )
+    .await?;
+    if let Some(resolved) = &resolved {
+        announce_proposal(&state, resolved);
+    }
+    Ok(Json(json!({
+        "proposal": resolved.as_ref().map(proposal_wire),
+        "message": message.as_ref().map(message_wire),
+    })))
+}
+
+/// 提议的**执行接缝**（决策 207）：按提议里的 `(工具, 参数)` 走既有那条路。
+///
+/// 分派是**按工具名**做的，而每个名字对应的是「走到哪条既有的路」：
+/// - **环境层**（`write_file` / `edit_file` / `run_command`）：走值班长自己的
+///   [`ToolExecutor`]——与对话里那一轮**同一个执行器**（同一份文件策略、同一个出口策略、
+///   同一份命令记录），只有确认闸关掉（人已经按过键了）。见 `foreman_tooling` 的说明。
+/// - **本服务写接口**（`task` / `config` / `skills`）：**直接调那个端点的处理器函数**。
+///   不是发一次 in-process HTTP——那会重新过一遍跨源与配对层，而这两层判的是「谁在门外」，
+///   这次调用已经在门内（值班经理在本机界面上按下了确认钮）。
+///
+/// 两条路都**不新增第二条改状态的实现**：绕过校验的捷径一旦存在，「LLM 的判断不直接接进
+/// 状态机」那条接缝就换个形式又回来了。
+///
+/// `Ok(Some(细节))` 是成功（细节进时间线），`Err` 是失败——失败一律走既有端点的错误，不在这里
+/// 翻译成别的东西（`Err` 的报文与界面上直接点那个按钮时看到的是**同一句**）。
+async fn run_proposal_tool(
+    state: &AppState,
+    proposal: &ForemanProposal,
+) -> Result<Option<String>, ApiError> {
+    match proposal.tool.as_str() {
+        "write_file" | "edit_file" | "run_command" => run_env_tool(state, proposal).await,
+        "task" => run_task_tool(state, proposal).await,
+        "config" => run_config_tool(state, proposal).await,
+        "skills" => run_skills_tool(state, proposal).await,
+        // 工具名对不上的提议是**真实可能**的（升级前落的、或模型报了一个不存在的名字）：
+        // 这句话正是要说的事，不是占位。
+        other => Err(ApiError::bad_request(format!(
+            "这条提议的工具还没有接线：{other}"
+        ))),
+    }
+}
+
+/// 环境层工具的执行：与对话轮**同一个执行器**，只把确认闸关掉。
+///
+/// 档位**在执行时重读一次**（而不是沿用提议生成时那一份）：白名单按当前档位算，于是档位在
+/// 提议之后被收紧到 `deny` 时，这条提议按不下去（报的是「不在允许集内」）。放松到 `auto`
+/// 则照旧能按——收紧是安全方向，放松不是。
+async fn run_env_tool(
+    state: &AppState,
+    proposal: &ForemanProposal,
+) -> Result<Option<String>, ApiError> {
+    use agentpipeline_core::pipeline::foreman::{foreman_tooling, ForemanMoment};
+
+    let cfg = state
+        .store
+        .get_stage_config(FOREMAN_STAGE_KEY)
+        .await
+        .map_err(map_core_error)?;
+    let env_mode = agentpipeline_core::types::effective_env_mode(
+        state.settings.env_mode,
+        FOREMAN_STAGE_KEY,
+        cfg.as_ref(),
+    );
+    let (tools, ctx) = foreman_tooling(
+        &state.store,
+        &state.settings,
+        &state.home,
+        state.sse.clone(),
+        &proposal.session_id,
+        env_mode,
+        ForemanMoment::ConfirmedPress,
+    );
+    let call = agentpipeline_core::agent::client::ToolCall {
+        id: proposal.id.clone(),
+        name: proposal.tool.clone(),
+        // 参数**逐字取自提议行**：这是「按下的是它当时提的那件事」的唯一凭据。
+        arguments: proposal.args.to_string(),
+    };
+    let outcome = tools.execute(&call, &ctx).await.map_err(map_core_error)?;
+    Ok(Some(outcome.content))
+}
+
+// ──────────────────── 本服务写接口：三个领域各一族（票 05）────────────────────
+
+/// `task` 族：建任务 / resume / retry / cancel / 拍板 / 合入。
+///
+/// 参数与界面上那颗按钮点下去时发的**同形**（票 05 的硬要求：不发明第二套参数语言），
+/// 故这里只做一件翻译——把 args 搬进端点的 body 结构体。
+async fn run_task_tool(
+    state: &AppState,
+    proposal: &ForemanProposal,
+) -> Result<Option<String>, ApiError> {
+    use crate::routes::tasks;
+    use axum::extract::Path;
+
+    let args = &proposal.args;
+    let action = str_arg(args, "action")?;
+    let state = state.clone();
+    match action.as_str() {
+        "create" => {
+            let response = tasks::create(
+                State(state),
+                Json(tasks::CreateTaskBody {
+                    project_id: str_arg(args, "project_id")?,
+                    title: str_arg(args, "title")?,
+                    description: opt_str(args, "description").unwrap_or_default(),
+                    depends_on: args
+                        .get("depends_on")
+                        .and_then(|v| v.as_array())
+                        .map(|a| {
+                            a.iter()
+                                .filter_map(|v| v.as_str().map(str::to_string))
+                                .collect()
+                        })
+                        .unwrap_or_default(),
+                    review_mode: opt_str(args, "review_mode"),
+                    model_override: opt_str(args, "model_override"),
+                }),
+            )
+            .await;
+            endpoint_outcome(response).await
+        }
+        "resume" => {
+            let task_id = str_arg(args, "task_id")?;
+            let response = tasks::resume(
+                State(state),
+                Path(task_id),
+                Json(tasks::ResumeBody {
+                    action: str_arg(args, "resume_action")?,
+                    cursor_id: opt_str(args, "cursor_id"),
+                    target_stage: opt_str(args, "target_stage"),
+                    target_node: opt_str(args, "target_node"),
+                    input: opt_str(args, "input"),
+                }),
+            )
+            .await;
+            endpoint_outcome(response).await
+        }
+        "review" => {
+            let task_id = str_arg(args, "task_id")?;
+            let Some(approved) = args.get("approved").and_then(|v| v.as_bool()) else {
+                return Err(ApiError::bad_request(
+                    "task review 缺少 approved（true 通过 / false 打回）",
+                ));
+            };
+            let response = tasks::review(
+                State(state),
+                Path(task_id),
+                Json(tasks::ReviewBody {
+                    approved,
+                    comments: opt_str(args, "comments"),
+                }),
+            )
+            .await;
+            endpoint_outcome(response).await
+        }
+        "merge" => {
+            let task_id = str_arg(args, "task_id")?;
+            let response = tasks::merge_decision(
+                State(state),
+                Path(task_id),
+                Json(tasks::MergeDecisionBody {
+                    decision: str_arg(args, "decision")?,
+                }),
+            )
+            .await;
+            endpoint_outcome(response).await
+        }
+        "retry" => {
+            let task_id = str_arg(args, "task_id")?;
+            let response = tasks::retry(State(state), Path(task_id)).await;
+            endpoint_outcome(response).await
+        }
+        "cancel" => {
+            let task_id = str_arg(args, "task_id")?;
+            let response = tasks::cancel(State(state), Path(task_id)).await;
+            endpoint_outcome(response).await
+        }
+        other => Err(ApiError::bad_request(format!(
+            "task 工具没有这个动作：{other}（可用：create / resume / retry / cancel / review / merge）"
+        ))),
+    }
+}
+
+/// `config` 族：改阶段配置（整条替换）/ 撤销覆盖。
+async fn run_config_tool(
+    state: &AppState,
+    proposal: &ForemanProposal,
+) -> Result<Option<String>, ApiError> {
+    use crate::routes::stage_configs;
+    use axum::extract::Path;
+
+    let args = &proposal.args;
+    let action = str_arg(args, "action")?;
+    let stage = str_arg(args, "stage")?;
+    let state = state.clone();
+    match action.as_str() {
+        "set" => {
+            let response = stage_configs::put(
+                State(state),
+                Path(stage),
+                Json(stage_configs::PutStageConfig {
+                    provider_id: opt_str(args, "provider_id"),
+                    temperature: args.get("temperature").and_then(|v| v.as_f64()),
+                    max_tokens: args
+                        .get("max_tokens")
+                        .and_then(|v| v.as_u64())
+                        .map(|v| v as u32),
+                    persona_path: opt_str(args, "persona_path"),
+                    persona_append: opt_str(args, "persona_append"),
+                    tools_json: args.get("tools_json").cloned(),
+                    skills_json: args.get("skills_json").cloned(),
+                    idle_timeout_sec: args.get("idle_timeout_sec").and_then(|v| v.as_u64()),
+                    max_duration_sec: args.get("max_duration_sec").and_then(|v| v.as_u64()),
+                    node_overrides_json: args.get("node_overrides_json").cloned(),
+                    env_mode: opt_str(args, "env_mode"),
+                }),
+            )
+            .await;
+            endpoint_outcome(response).await
+        }
+        "delete" => {
+            let response = stage_configs::delete(State(state), Path(stage)).await;
+            endpoint_outcome(response).await
+        }
+        other => Err(ApiError::bad_request(format!(
+            "config 工具没有这个动作：{other}（可用：set / delete）"
+        ))),
+    }
+}
+
+/// `skills` 族：装（从本地目录）/ 卸。
+///
+/// **只能从本地目录装**：zip 那条路要的是原始字节，塞不进 args 的 JSON（base64 既涨体积又
+/// 要一个新依赖）。值班长本来就能读文件系统，让它指一个目录是更自然的形态。
+async fn run_skills_tool(
+    state: &AppState,
+    proposal: &ForemanProposal,
+) -> Result<Option<String>, ApiError> {
+    use crate::routes::skills;
+    use axum::extract::Path;
+
+    let args = &proposal.args;
+    let action = str_arg(args, "action")?;
+    let state = state.clone();
+    match action.as_str() {
+        "install" => {
+            let response = skills::import_dir(
+                State(state),
+                Json(skills::ImportDirBody {
+                    paths: vec![std::path::PathBuf::from(str_arg(args, "path")?)],
+                    overwrite: args
+                        .get("overwrite")
+                        .and_then(|v| v.as_bool())
+                        .unwrap_or(false),
+                }),
+            )
+            .await;
+            // 批量端点的形态是「逐项结果」：一项失败时 HTTP 仍是 200，失败在 `results` 里。
+            // 提议执行必须把这个区分出来，否则界面会说「已执行」而技能其实没装上——
+            // 故这里读 `failed` 这个**字段**，不去匹配报文里的字样（报文一变就静默失效）。
+            let value = endpoint_json(response).await?;
+            if value.get("failed").and_then(|v| v.as_u64()).unwrap_or(0) > 0 {
+                return Err(ApiError::bad_request(format!(
+                    "技能没有装上：{}",
+                    compact(&value)
+                )));
+            }
+            Ok(Some(compact(&value)))
+        }
+        "delete" => {
+            let name = str_arg(args, "name")?;
+            let response = skills::uninstall(State(state), Path(name)).await;
+            endpoint_outcome(response).await
+        }
+        other => Err(ApiError::bad_request(format!(
+            "skills 工具没有这个动作：{other}（可用：install / delete）"
+        ))),
+    }
+}
+
+/// 把端点处理器的响应归一成「成功 / 失败 + 一句细节」。
+///
+/// 端点的错误**逐字带回**（状态码与报文都是端点自己的）：提议执行失败的原因，与在界面上
+/// 直接点那颗按钮时看到的是同一个东西。这一条是「执行 = 走既有端点」的可观测形态。
+async fn endpoint_outcome<R: IntoResponse>(
+    response: ApiResult<R>,
+) -> Result<Option<String>, ApiError> {
+    Ok(Some(compact(&endpoint_json(response).await?)))
+}
+
+/// 同上，但把响应体原样交出来（`skills` 族要读 `failed` 这个字段，不能只看一句话）。
+async fn endpoint_json<R: IntoResponse>(
+    response: ApiResult<R>,
+) -> Result<serde_json::Value, ApiError> {
+    let response = match response {
+        Ok(r) => r.into_response(),
+        Err(e) => return Err(e),
+    };
+    let status = response.status();
+    let bytes = axum::body::to_bytes(response.into_body(), 1 << 20)
+        .await
+        .map_err(|e| ApiError::internal(format!("读取端点响应失败：{e}")))?;
+    let value: serde_json::Value =
+        serde_json::from_slice(&bytes).unwrap_or(serde_json::Value::Null);
+    if !status.is_success() {
+        let message = value
+            .get("error")
+            .and_then(|v| v.as_str())
+            .unwrap_or("端点拒绝了这次调用")
+            .to_string();
+        return Err(ApiError {
+            status,
+            message,
+            detail: None,
+            kind: None,
+        });
+    }
+    Ok(value)
+}
+
+/// 端点回来的 JSON 压成一行（时间线里那一行要短：它是给人扫一眼的，不是给人读的）。
+fn compact(value: &serde_json::Value) -> String {
+    let text = value.to_string();
+    if text.chars().count() <= 400 {
+        return text;
+    }
+    format!("{}…", text.chars().take(400).collect::<String>())
+}
+
+fn str_arg(args: &serde_json::Value, key: &str) -> Result<String, ApiError> {
+    args.get(key)
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.trim().is_empty())
+        .map(str::to_string)
+        .ok_or_else(|| ApiError::bad_request(format!("这条提议缺少参数 {key}")))
+}
+
+fn opt_str(args: &serde_json::Value, key: &str) -> Option<String> {
+    args.get(key).and_then(|v| v.as_str()).map(str::to_string)
+}
+
+/// 提议的结果落进时间线（决策 207：**成功失败都进**，不弹窗）。
+///
+/// 落成 [`agentpipeline_core::storage::foreman::FOREMAN_ROLE_SYSTEM`] 而不是助理轮：
+/// 这是操作台记的账，不是值班长说的话——写成助理轮会让它下一轮读到「我已经做了」。
+async fn record_proposal_outcome(
+    store: &Store,
+    proposal: &ForemanProposal,
+    text: &str,
+) -> ApiResult<Option<ForemanMessage>> {
+    store
+        .append_foreman_message(NewForemanMessage::system(&proposal.session_id, text))
+        .await
+        .map_err(map_core_error)?;
+    // 回话行的 id / created_at 由落库产生，重取尾部一行（与 `send` 同一手法）。
+    Ok(store
+        .list_foreman_messages(&proposal.session_id, 1)
+        .await
+        .map_err(map_core_error)?
+        .pop())
+}
+
+/// 提议事件推给 `/foreman/stream`（决策 207：单开一个只读事件，不混进对话增量）。
+fn announce_proposal(state: &AppState, proposal: &ForemanProposal) {
+    state.sse.publish(SseEvent::ForemanProposal {
+        // 值班长的事件不带任务、也没有并行分支（与它的对话增量同一条口径）
+        task_id: String::new(),
+        branch: String::new(),
+        session_id: proposal.session_id.clone(),
+        proposal_id: proposal.id.clone(),
+        tool: proposal.tool.clone(),
+        status: proposal.status.as_str().to_string(),
+        summary: proposal.summary.clone(),
+        expires_at: proposal.expires_at.to_rfc3339(),
+    });
+}
+
+/// 读端点用的班次解析：指定 id 就取它（含已归档，读得出来），否则取最近活动的。
+///
+/// 与 [`ForemanRunner`] 的 `resolve_session` **不同**：那条路要拒绝归档会话（往里说话会
+/// 生成一段谁也看不见的记录），而读一条已归档班次的提议列表是完全正当的。
+async fn read_session(
+    store: &Store,
+    session_id: Option<&str>,
+) -> ApiResult<Option<ForemanSession>> {
+    match session_id {
+        Some(id) => store.get_foreman_session(id).await.map_err(map_core_error),
+        None => store.latest_foreman_session().await.map_err(map_core_error),
+    }
+}
+
+pub fn proposal_status_label(status: ForemanProposalStatus) -> &'static str {
+    match status {
+        ForemanProposalStatus::Pending => "待你按键",
+        ForemanProposalStatus::Executed => "执行过",
+        ForemanProposalStatus::Rejected => "被拒绝",
+        ForemanProposalStatus::Expired => "过期",
+    }
+}
+
+/// 一条提议 → 线上形态。
+///
+/// `status` / `expires_at` 原样出去：界面的按钮灰不灰**由前端按 `expires_at` 自己算**
+/// （到点即灰，不必等后端把它标成 expired），而后端那份 status 是权威的最终态。
+fn proposal_wire(p: &ForemanProposal) -> serde_json::Value {
+    json!({
+        "id": p.id,
+        "session_id": p.session_id,
+        "tool": p.tool,
+        "args": p.args,
+        "summary": p.summary,
+        "status": p.status.as_str(),
+        "created_at": p.created_at.to_rfc3339(),
+        "expires_at": p.expires_at.to_rfc3339(),
+        "resolved_at": p.resolved_at.map(|t| t.to_rfc3339()),
+    })
+}
+
+fn proposal_not_found(id: &str) -> ApiError {
+    ApiError::not_found(format!("提议不存在：{id}"))
+}
+
 #[derive(Debug, Deserialize)]
 pub struct SendBody {
     pub text: String,
@@ -258,7 +897,7 @@ pub async fn stream(
 /// 503 而不是 500 是把责任方说清楚：服务是好的，是这个能力这次没被接上
 /// （契约测试里不注入 LLM 替身时就会走到这里）。
 ///
-/// 七个端点**一样**回 503：它们是同一个能力的几面——一个「能读会话列表、发不出话」
+/// 十一个端点**一样**回 503：它们是同一个能力的几面——一个「能读会话列表、发不出话」
 /// 的页面比一句「未接线」更难排查。
 fn foreman_unwired() -> ApiError {
     ApiError {
@@ -279,10 +918,15 @@ fn session_not_found(id: &str) -> ApiError {
     }
 }
 
-/// 一个班次的读数：会话本身 + 该会话的轮次 + 该会话的合计。
+/// 一个班次的读数：会话本身 + 该会话的轮次 + 该会话的提议 + 该会话的合计。
 ///
-/// 三个东西一起给，是因为它们在界面上是同一屏的三个位置（chip 的标题、时间线、页头读数），
-/// 分成三个请求只会让「切了班次但页头还显示上一班的花费」这种不一致有时间窗。
+/// 四个东西一起给，是因为它们在界面上是同一屏的四个位置（chip 的标题、时间线、时间线里的
+/// 确认钮、页头读数），分成几个请求只会让「切了班次但页头还显示上一班的花费」这种不一致
+/// 有时间窗。
+///
+/// **提议是全量的**（含已执行 / 已拒绝 / 已过期）：决策 207 要求过期只让按钮变灰、
+/// 那一轮留在时间线里（审计——值班长当时提议过什么必须可追溯）。前端把两条列表按时间
+/// 并进同一条时间线。
 async fn session_payload(
     state: &AppState,
     store: &Store,
@@ -292,6 +936,7 @@ async fn session_payload(
         return Ok(json!({
             "session": serde_json::Value::Null,
             "messages": [],
+            "proposals": [],
             "total_tokens": 0,
             "total_calls": 0,
             "foreman": foreman_identity(state),
@@ -301,6 +946,13 @@ async fn session_payload(
         .list_foreman_messages(&session.id, SESSION_PAGE_LIMIT)
         .await
         .map_err(map_core_error)?;
+    let proposals = store
+        .list_foreman_proposals(
+            &session.id,
+            agentpipeline_core::storage::proposals::FOREMAN_PROPOSAL_LIST_LIMIT,
+        )
+        .await
+        .map_err(map_core_error)?;
     let (total_tokens, total_calls) = store
         .foreman_session_totals(&session.id)
         .await
@@ -308,6 +960,7 @@ async fn session_payload(
     Ok(json!({
         "session": session_wire(&session),
         "messages": messages.iter().map(message_wire).collect::<Vec<_>>(),
+        "proposals": proposals.iter().map(proposal_wire).collect::<Vec<_>>(),
         "total_tokens": total_tokens,
         "total_calls": total_calls,
         "foreman": foreman_identity(state),

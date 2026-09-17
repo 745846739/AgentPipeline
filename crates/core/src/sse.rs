@@ -24,6 +24,8 @@ pub enum SseEventType {
     CommandOutput,
     CommandFinished,
     ConversationDelta,
+    /// 决策 207：值班长提议的到达 / 作废（只读事件）。
+    ForemanProposal,
     ToolEvent,
     Stalled,
     TaskCancelled,
@@ -123,6 +125,28 @@ pub enum SseEvent {
         prompt_tokens: u32,
         completion_tokens: u32,
     },
+    /// 决策 207：值班长提议的生命周期事件（到达 / 执行 / 作废）。
+    ///
+    /// **单开一个只读事件，不混进 `conversation_delta`**：提议不是对话增量——它有自己的
+    /// 生命周期（未决 → 执行 / 拒绝 / 过期）、自己的读取面（`GET /foreman/proposals`）、
+    /// 以及自己的渲染形态（一颗确认钮）。混进增量里会让前端的时间线归约同时处理两种
+    /// 时态（「已经说过的话」与「还没发生的事」），那正是决策 207 要避开的那种复杂。
+    ///
+    /// 载荷里的 `status` 是**结果**的词汇表那一套（`pending` / `executed` / `rejected` /
+    /// `expired`），与落库的 `kanban_foreman_proposals.status` 同一个值。
+    ForemanProposal {
+        /// 两个恒空串：值班长的事件不带任务、也没有并行分支（照 `conversation_delta`
+        /// 为它立的同一条口径）。留着它们是因为决策 84 的「所有事件体带 task_id / branch」
+        /// 是一条整体不变式——为一个新事件开例外，读那条决策的人就得重新判断一次它还剩多少效力。
+        task_id: String,
+        branch: String,
+        session_id: String,
+        proposal_id: String,
+        tool: String,
+        status: String,
+        summary: String,
+        expires_at: String,
+    },
     /// 决策 123：工具调用事件（参数只给摘要）。
     ToolEvent {
         task_id: String,
@@ -165,6 +189,7 @@ impl SseEvent {
             SseEvent::CommandOutput { .. } => SseEventType::CommandOutput,
             SseEvent::CommandFinished { .. } => SseEventType::CommandFinished,
             SseEvent::ConversationDelta { .. } => SseEventType::ConversationDelta,
+            SseEvent::ForemanProposal { .. } => SseEventType::ForemanProposal,
             SseEvent::ToolEvent { .. } => SseEventType::ToolEvent,
             SseEvent::Stalled { .. } => SseEventType::Stalled,
             SseEvent::TaskCancelled { .. } => SseEventType::TaskCancelled,
@@ -186,6 +211,7 @@ impl SseEvent {
             | SseEvent::CommandOutput { branch, .. }
             | SseEvent::CommandFinished { branch, .. }
             | SseEvent::ConversationDelta { branch, .. }
+            | SseEvent::ForemanProposal { branch, .. }
             | SseEvent::ToolEvent { branch, .. }
             | SseEvent::Stalled { branch, .. }
             | SseEvent::TaskCancelled { branch, .. }
@@ -201,14 +227,20 @@ impl SseEvent {
     /// 故它对工头事件天然零干扰——这条过滤**不是**用来隔离的（隔离已经成立），
     /// 而是让新增的 `/foreman/stream` 说得清自己要哪一类事件。
     ///
-    /// 只认会话增量：工具事件（`tool_event`）的载荷里没有 `agent_type`，
+    /// 只认会话增量与提议事件：工具事件（`tool_event`）的载荷里没有 `agent_type`，
     /// 无法与流水线节点的工具调用区分。值班长的工具痕迹走**落库的 `traces_json`**
     /// 而不是实时事件（票 05），这也正是它不需要一个新事件变体的原因。
+    ///
+    /// 提议事件（决策 207）**天然只属于对讲台**——它是值班长的提议，流水线里没有对应的
+    /// 概念，故它的判定不看身份串，看的是变体本身。
     pub fn is_foreman_event(&self) -> bool {
-        matches!(
-            self,
-            SseEvent::ConversationDelta { agent_type, .. } if agent_type == crate::pipeline::foreman::FOREMAN_AGENT_TYPE
-        )
+        match self {
+            SseEvent::ConversationDelta { agent_type, .. } => {
+                agent_type == crate::pipeline::foreman::FOREMAN_AGENT_TYPE
+            }
+            SseEvent::ForemanProposal { .. } => true,
+            _ => false,
+        }
     }
 
     pub fn task_id(&self) -> &str {
@@ -223,6 +255,7 @@ impl SseEvent {
             | SseEvent::CommandOutput { task_id, .. }
             | SseEvent::CommandFinished { task_id, .. }
             | SseEvent::ConversationDelta { task_id, .. }
+            | SseEvent::ForemanProposal { task_id, .. }
             | SseEvent::ToolEvent { task_id, .. }
             | SseEvent::Stalled { task_id, .. }
             | SseEvent::TaskCancelled { task_id, .. }
@@ -380,6 +413,16 @@ mod tests {
                 prompt_tokens: 3,
                 completion_tokens: 4,
             },
+            SseEvent::ForemanProposal {
+                task_id: String::new(),
+                branch: String::new(),
+                session_id: "s1".into(),
+                proposal_id: "p1".into(),
+                tool: "write_file".into(),
+                status: "pending".into(),
+                summary: "写入 notes.md".into(),
+                expires_at: "2026-09-17T00:10:00+00:00".into(),
+            },
             SseEvent::ToolEvent {
                 task_id: "t".into(),
                 branch: "main".into(),
@@ -466,6 +509,45 @@ mod tests {
             SseEvent::ConversationDelta { session_id, .. } => assert_eq!(session_id, ""),
             other => panic!("解成了别的变体：{other:?}"),
         }
+    }
+
+    /// 决策 207：提议事件走 `/foreman/stream`，而流水线的工具事件不走——两条都要钉住，
+    /// 否则「对讲台看得到提议」与「任务页不混进值班长的事」里必有一条是碰巧成立的。
+    #[test]
+    fn proposal_events_reach_the_foreman_stream_only() {
+        let proposal = SseEvent::ForemanProposal {
+            task_id: String::new(),
+            branch: String::new(),
+            session_id: "s1".into(),
+            proposal_id: "p1".into(),
+            tool: "write_file".into(),
+            status: "pending".into(),
+            summary: "写入 notes.md".into(),
+            expires_at: "2026-09-17T00:10:00+00:00".into(),
+        };
+        assert!(proposal.is_foreman_event());
+        assert_eq!(proposal.event_type(), SseEventType::ForemanProposal);
+        assert!(!SseEvent::ToolEvent {
+            task_id: "t".into(),
+            branch: "main".into(),
+            run_id: 1,
+            tool: "write_file".into(),
+            phase: ToolPhase::Start,
+            args_summary: "x".into(),
+        }
+        .is_foreman_event());
+        let pipeline_delta = SseEvent::ConversationDelta {
+            task_id: "t".into(),
+            branch: "main".into(),
+            run_id: 1,
+            agent_type: "main".into(),
+            session_id: String::new(),
+            role: "assistant".into(),
+            text: "x".into(),
+            prompt_tokens: 0,
+            completion_tokens: 0,
+        };
+        assert!(!pipeline_delta.is_foreman_event());
     }
 
     #[test]

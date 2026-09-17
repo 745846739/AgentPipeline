@@ -8,11 +8,13 @@
  * （桌面右栏、窄屏收成时间线之上的横向灯条），**不在状态区里**。
  *
  * 断言口径与其它像素主题用例一致：只测**外部行为**——路由可达、真数据渲染、
- * 急停那轮的后端下发动作可下发、给值班长发话后它的回复里没有按钮、两张急停同挂时
- * 两张都留在第一屏（决策 183）。
+ * 急停那轮的后端下发动作可下发、给值班长发话后**回话里没有按钮**（时间线里唯一的钮是
+ * 操作台的确认钮，票 03）、两张急停同挂时两张都留在第一屏（决策 183）。
  */
 
 import { expect, test, type Locator } from '@playwright/test';
+import { existsSync, readFileSync } from 'node:fs';
+import { join } from 'node:path';
 import {
   startApp,
   waitForTask,
@@ -40,25 +42,32 @@ const FOREMAN_REPLY = [
 ].join('\n');
 
 /**
- * 回执那一轮要验的是「回执怎么渲染」，两步各钉一个标签：
+ * 回执那一轮要验的是「回执怎么渲染」，三步各钉一件事：
  *
  * ① 查一个**不存在**的任务 → 工具执行成功、台账里没这个号，标签是**已读**。
  *    「查无此任务」不是工具故障（决策 33 的分层：它不该累计 `tool_retry_max`），
  *    值班长收到的是可转述的文本，不是错误。
- * ② 发一个**不在白名单里**的工具 → 在执行点被拒，标签是**未读到**。
- *    这一步顺带把票 02 的安全边界钉在界面上：值班长调不动越权工具。
+ * ② 发一个**不在清单里**的工具 → 在执行点被拒，标签是**未读到**。
+ *    这一步顺带把安全边界钉在界面上：值班长调不动越权工具。
+ *    （票 06 之后这里用 `spawn_sub_agent`：`run_command` 已经进清单，它走确认钮
+ *    而不是被拒——边界由「压根不在清单里」的那些名字取证。）
+ * ③ 提一条 `write_file` → `ask` 档下**不执行**，落成一条**提议轮**（票 03）：
+ *    时间线上多一颗等人按的钮，而**回话轮里一颗钮都没有**。
  *
  * 工位来源（`stage`）不在这条用例里断言：它要把**真实**任务 id 写进脚本，而 id 由后端
  * 在 `startApp` 之后生成，mock 没有事后注入脚本的口子。来源渲染由 Talk.svelte 的
  * 回执分支按 `trace.stage` 读出，属理由可证、e2e 不可达。
  */
 const UNKNOWN_TASK_ID = '01K0000000000000000000000X';
+/** 提议要写的那个文件（相对家目录根；app 的家目录是每次 `startApp` 新建的临时目录）。 */
+const PROPOSED_FILE = 'foreman-note.md';
 
-/** 十二轮回话（每轮先查台账、再试一个越权工具）；留足余量给 CI 的一次重试。 */
+/** 十二轮回话（每轮：查台账 + 试一个越权工具 + 提一条写文件）；留足余量给 CI 的一次重试。 */
 const foremanRounds = foremanScript(
   Array.from({ length: 12 }, () => [
     readTask(UNKNOWN_TASK_ID),
-    tool('run_command', { command: 'echo pwned' }),
+    tool('spawn_sub_agent', { task: '去干点别的' }),
+    tool('write_file', { path: PROPOSED_FILE, content: '夜班交接：一切正常' }),
     text(FOREMAN_REPLY),
   ]),
 );
@@ -400,30 +409,136 @@ test.describe('对讲台 · 对话（票 03）', () => {
     // **值班长的回复里永远没有按钮**（票 04 的硬要求）：写动作只在状态区的急停轮里
     await expect(reply.locator('button')).toHaveCount(0);
 
-    // 工位回执留在对话里：这一轮查过台账、也试过一个越权工具 → 两条回执挂在回话那一轮内，
-    // 形状与发言**不同**——左缘 4px 亮度阶、无框（转述不是发言）
+    // 工位回执留在对话里：这一轮查过台账、也试过一个越权工具、还提了一件事 → 三条回执挂在
+    // 回话那一轮内，形状与发言**不同**——左缘 4px 亮度阶、无框（转述不是发言）
     const rcpt = reply.locator('.rcpt');
-    await expect(rcpt).toHaveCount(2);
+    await expect(rcpt).toHaveCount(3);
     const ledger = rcpt.filter({ hasText: UNKNOWN_TASK_ID });
     await expect(ledger).toContainText('读任务台账');
     // 查无此任务是「已读」而不是「未读到」：工具执行成功了，只是台账里没这个号
     await expect(ledger).toContainText('已读');
-    // 越权工具在执行点被拒 → 「未读到」，且那条命令**没有真的跑起来**
-    const denied = rcpt.filter({ hasText: 'run_command' });
+    // 越权工具在执行点被拒 → 「未读到」，且它**真的没跑起来**（清单之外，白名单挡下）
+    const denied = rcpt.filter({ hasText: 'spawn_sub_agent' });
     await expect(denied).toContainText('未读到');
+    // `ask` 档下的写工具是**提议**而不是失败：回执记「已读」（调用成功，只是没执行），
+    // 人按不按是另一件事——把它记成「未读到」会让人以为模型调错了工具
+    // 用**标签**找它：`TOOL_LABELS` 把 `write_file` 译成「写文件」，回执上不出现原始工具名
+    const proposed = rcpt.filter({ hasText: '写文件' });
+    await expect(proposed).toContainText(PROPOSED_FILE);
+    await expect(proposed).toContainText('已读');
     await expect(rcpt.locator('svg.sprite').first()).toBeVisible();
     await expect(rcpt.first()).toHaveCSS('border-left-width', '4px');
     await expect(rcpt.first()).toHaveCSS('border-top-width', '0px');
 
-    // 值班长不占琥珀档：它的轮次与急停那一轮不是同一个描边色（全站唯一的响仍在急停一处）
+    // ── 提议轮（票 03）──
+    // 时间线里**唯一**的按钮是操作台的确认钮：它在提议轮里，不在回话轮里。
+    // 「写动作要人按键」与「哪颗钮是真的」由此同时成立（决策 176④ / 207③）。
+    const prop = page.locator('.timeline .turn.prop');
+    await expect(prop).toHaveCount(1);
+    await expect(prop.locator('.dname')).toHaveText('操作台');
+    await expect(prop.locator('.dtag')).toContainText('等你按键');
+    await expect(prop).toContainText(PROPOSED_FILE);
+    // **不叫 `.warn`**（决策 203：全站唯一的响仍是急停）——时间线里不该出现急停轮
+    await expect(page.locator('.timeline .turn.warn')).toHaveCount(0);
+    await expect(prop).toHaveClass(/turn prop/);
+    // 两颗钮：执行 + 拒绝。**回话轮里一颗都没有**（上面已断），故「时间线里的按钮」
+    // 与「确认钮」是同一件事。
+    await expect(prop.getByRole('button', { name: '执行' })).toBeVisible();
+    await expect(prop.getByRole('button', { name: '拒绝' })).toBeVisible();
+    await expect(page.locator('.timeline .turn.fm button')).toHaveCount(0);
+    // 参数原文可展开（按键之前要看得出它到底要什么）
+    await expect(prop.locator('.pargs')).toContainText('夜班交接：一切正常');
+
+    // 值班长不占琥珀档：它的轮次与急停那一轮不是同一个描边色（全站唯一的响仍在急停一处），
+    // 提议轮同样不占（决策 203）。
     const stopColor = await page
       .locator('.zone-status .turn.warn')
       .evaluate((el) => getComputedStyle(el).borderTopColor);
     const replyColor = await reply.evaluate((el) => getComputedStyle(el).borderTopColor);
     expect(replyColor).not.toBe(stopColor);
+    const propColor = await prop.evaluate((el) => getComputedStyle(el).borderTopColor);
+    expect(propColor).not.toBe(stopColor);
 
     // 会话合计来自台账（不是编的 0）
     await expect(page.locator('.talk-head .ts')).toContainText(/本次会话 [1-9]\d* tok/);
+
+    expectBundleHealthy(bundle);
+  });
+
+  /**
+   * 按下确认钮：**它不直接改状态**——发一次 `/foreman/proposals/{id}/execute`，让后端按
+   * 提议里的参数走既有那条路，结果再以一轮对话回来（决策 207：成功失败都进时间线，不弹窗）。
+   *
+   * 三条一起看才成立：文件**按下之后**才出现（提议时没执行）、时间线多出一轮系统说明、
+   * 那一轮的两颗钮收掉（终态）。
+   */
+  test('按下确认钮：文件真的写了，结果回灌成一轮', async ({ page }) => {
+    const bundle = watchBundle(page);
+    // **这一档要给对话区留出高度**：状态区占 46vh，720px 的窗口下时间线只剩一条缝——
+    // 确认钮内联在时间线里（决策 207③），缝里那颗钮点不到。真人的窗口比这高，
+    // 这里按真人的高度给一档（与窄屏用例显式设 430×900 是同一个手法）。
+    await page.setViewportSize({ width: 1280, height: 1000 });
+
+    // 先自己说一句，拿到一条**未决**提议（script 每轮都会提一条，取最后一条）
+    await sayDirect(app, '提一条看看');
+    await page.goto(`${app.webBase}/#/talk`);
+    await settleBundle(page, bundle);
+
+    const prop = page.locator('.timeline .turn.prop').last();
+    await expect(prop).toBeVisible({ timeout: 30_000 });
+    const proposalId = await prop.getAttribute('data-proposal');
+    expect(proposalId).toBeTruthy();
+
+    // 提议**没有**执行：家目录里那个文件还不存在（直接看磁盘，不经界面）
+    const target = join(app.homeDir, PROPOSED_FILE);
+    expect(existsSync(target)).toBe(false);
+
+    await prop.getByRole('button', { name: '执行' }).click();
+
+    // 按下之后文件**真的**落在那里——「确认钮不是只改了一行状态」靠这一条成立
+    await expect
+      .poll(() => existsSync(target), { timeout: 15_000 })
+      .toBe(true);
+    expect(readFileSync(target, 'utf8')).toBe('夜班交接：一切正常');
+
+    // 结果以一轮**操作台记录**回到时间线（不是 toast、不是弹窗，也**不是值班长说的话**
+    // ——动手的是按下那颗钮的人，挂在值班长的名牌下等于替它认领了它没做的事）
+    const log = page.locator('.timeline .turn.console', { hasText: '提议已执行' });
+    await expect(log).toBeVisible({ timeout: 30_000 });
+    await expect(log.locator('.dname')).toHaveText('操作台');
+    await expect(log.locator('button')).toHaveCount(0);
+    // 终态：两颗钮收掉，那一轮**仍在**（审计）
+    await expect(prop.getByRole('button', { name: '执行' })).toHaveCount(0);
+    await expect(prop.locator('.dtag')).toContainText('执行过');
+    await expect(prop).toBeVisible();
+
+    expectBundleHealthy(bundle);
+  });
+
+  /**
+   * 拒绝：同样是**按下之后才有的终态**，且要说清「没有执行任何动作」。
+   *
+   * 与「执行失败」分开是必要的：后者只是没成功，提议仍可再按一次。
+   */
+  test('按下拒绝：提议作废、明确说没有执行动作', async ({ page }) => {
+    const bundle = watchBundle(page);
+    // 同上：确认钮在时间线里，这一档要给它留出高度
+    await page.setViewportSize({ width: 1280, height: 1000 });
+
+    await sayDirect(app, '再提一条看看');
+    await page.goto(`${app.webBase}/#/talk`);
+    await settleBundle(page, bundle);
+
+    const prop = page.locator('.timeline .turn.prop').last();
+    await expect(prop).toBeVisible({ timeout: 30_000 });
+    await prop.getByRole('button', { name: '拒绝' }).click();
+
+    const log = page.locator('.timeline .turn.console', { hasText: '提议已拒绝' });
+    await expect(log).toBeVisible({ timeout: 30_000 });
+    await expect(log.locator('.dname')).toHaveText('操作台');
+    await expect(prop.locator('.dtag')).toContainText('被拒绝');
+    await expect(prop).toContainText('没有执行任何动作');
+    await expect(prop.getByRole('button', { name: '执行' })).toHaveCount(0);
 
     expectBundleHealthy(bundle);
   });
@@ -661,7 +776,13 @@ test.describe('对讲台 · 空看板也能对话（票 04 的验收锚点）', 
 
     const reply = page.locator('.timeline .turn.fm').first();
     await expect(reply).toContainText('夜班安静', { timeout: 30_000 });
+    // 回话里没有按钮；这一轮的脚本也没提任何提议，故**整条时间线**一颗钮都没有
+    //（时间线上唯一的钮是操作台的确认钮，票 03——没有提议就没有它）
     await expect(reply.locator('button')).toHaveCount(0);
+    await expect(page.locator('.timeline .turn.prop')).toHaveCount(0);
+    // 收在 `.turn` 上：时间线那一块里还有班次 chip 行（切换 / 新建 / 改名 / 归档四颗钮），
+    // 它们不是「后端下发的动作」，不在本条断言的射程里
+    await expect(page.locator('.timeline .turn button')).toHaveCount(0);
     await expect(
       page.locator('.timeline .turn.mine', { hasText: '现在能做什么' }),
     ).toHaveCount(1);

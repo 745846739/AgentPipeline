@@ -637,7 +637,10 @@ GET /tasks/{id}               → 详情页装载 + 断线重连后的全量校�
 | 空态 = 状态 → 下一步 → 可选入口；提到另一个页面必须可点 | `frontend/src/components/ui/EmptyState.svelte` | 票 13 |
 | pending dossier 不重复渲染 diff；动作行保留（多处 e2e 依赖它） | `frontend/src/routes/TaskDetail.svelte`、`frontend/src/components/task/DiffReviewPanel.svelte` | 决策 23（无「拒绝」）；票 08 |
 | 输入法护栏：回车提交要挡「用回车确认候选词」的那一次 | `frontend/src/lib/enterToSend.ts` | 决策 184 |
-| 工头（值班长）只说话不动手，回复里永远没有按钮 | `frontend/src/routes/Talk.svelte`、`frontend/src/components/task/PendingDossier.svelte` | 决策 176 / 182 |
+| 工头（值班长）的回复里永远没有按钮；时间线上唯一的钮是操作台在提议轮里的确认钮 | `frontend/src/routes/Talk.svelte`、`frontend/src/components/task/PendingDossier.svelte` | 决策 176 / 182 / 207③ |
+| 提议轮的渲染判据：过期按 `expires_at` 自己算、过期只变灰而轮仍在、同一个动作已在下发的动作集里就只指路 | `frontend/src/lib/proposals.ts` | 决策 188 / 207；`proposals.test.ts` 逐条钉住 |
+| 确认钮按下走既有端点（不新增改状态的路）；成功失败都回灌成一轮，不弹窗不 toast | `frontend/src/routes/Talk.svelte`、`crates/app/src/routes/foreman.rs` | 决策 188 / 207② |
+| 权限档位（环境层 auto / ask / deny）是配置项，不是代码常量：阶段配置表单里可改 | `frontend/src/components/settings/StageConfigForm.svelte`、`frontend/src/lib/stageConfigs.ts` | 决策 206；档位在值班长那一行的缺省是 `ask` |
 | 对讲台急停轮折叠：两张以上一张都不展开；窄屏改「摘要条 + 输入坞」 | `frontend/src/lib/talkStops.ts`、`frontend/src/routes/Talk.svelte` | 决策 183 / 192 |
 | 对讲台的班次 chip 行：非 sticky、不动页头与顶栏，窄屏横滚不折行 | `frontend/src/routes/Talk.svelte` | 决策 204（三条几何约束见 `frontend/e2e/talk.spec.ts` 的 ⑭⑮） |
 | 换班次重置的是对话上下文，看板派生的东西（急停 / 值班板）一样不动 | `frontend/src/routes/Talk.svelte` | 决策 204；`resetSessionState()` 与它旁边那份「不重置」清单 |

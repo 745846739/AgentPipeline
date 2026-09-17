@@ -96,6 +96,10 @@ pub struct SubAgentRunnerConfig {
     /// 父节点的阶段配置采样参数（子代理沿用，决策 46）。
     pub temperature: Option<f64>,
     pub max_tokens: Option<u32>,
+    /// 父节点所在阶段的环境层档位（决策 206）。子代理是父节点的工具调用，父节点被
+    /// `deny` 时不读文件的手也不该从子代理这里伸出去——档位是**阶段**的属性，不是
+    /// 某一条调用路径的属性。
+    pub env_mode: crate::types::EnvMode,
     /// 本次调用的上限（票 08：沿用节点级 `node_max_duration_sec`）。
     pub max_duration: Duration,
 }
@@ -208,6 +212,10 @@ impl SubAgentRunner for StoreSubAgentRunner {
                 cfg.settings.clone(),
                 cfg.killer.clone(),
             )
+            // 子代理的只读工具同样受父阶段的档位管：`deny` 档下连只读文件也不给
+            //（决策 206 的 deny 是「环境层收到底」）。**不接提议通道**：与父节点同理
+            // ——流水线背后没有人盯着，落一条没人会按的提议等于静默丢弃。
+            .with_env_mode(cfg.env_mode)
             .with_allowed_tools(SUB_AGENT_TOOLS.to_vec());
             let ctx = ToolCallContext {
                 task_id: cfg.task_id.clone(),

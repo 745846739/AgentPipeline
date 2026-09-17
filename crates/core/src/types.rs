@@ -1310,10 +1310,107 @@ pub struct StageConfig {
     pub max_duration_sec: Option<u64>,
     /// 节点级覆盖（决策 66）：`{"execute": {"idle_timeout_sec": 600}}`。
     pub node_overrides_json: Option<serde_json::Value>,
-    /// pending → resume 重入时是否续接上一 attempt 的对话（决策 180，票 13）。
+    /// 环境层权限档位（决策 206）。`None` = 没配过 → 用全局默认 / 该阶段的缺省。
     ///
-    /// 缺省 / `None` = **关**：每次 attempt 干净对话，与续接出现之前逐字相同。节点级覆盖走
+    /// **不做节点级覆盖**（决策 206）：它是「这台机器上的环境层放手到什么程度」，
+    /// 不是「这个节点放手到什么程度」——后者会让同一条命令在不同节点上有不同的自由，
+    /// 而人看不出为什么。
+    pub env_mode: Option<EnvMode>,
     pub updated_at: DateTime<Utc>,
+}
+
+/// 这三个取值的人话说法（配置写入路径的报错共用一份）。
+///
+/// 与 [`EnvMode::parse_or_message`] 同源：两处各写一份字符串的后果是同一件事报出两种说法，
+/// 而使用者据此判断「我填错了什么」。
+pub const ENV_MODE_EXPECTED: &str = "环境层档位只能是 auto / ask / deny";
+
+/// 环境层权限档位（决策 206）。
+///
+/// **只管环境层**（文件 / 命令 / 技能拉取 / 子代理）：`auto` 直接执行、`ask` 转成提议
+/// 等值班经理按键、`deny` 连广告都不给。**本服务写接口（D 层）不读它**——那半边恒为
+/// 提议 + 确认钮，因为它的错误会改变流水线的事实（决策 206 的判据）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum EnvMode {
+    /// 直接执行，与档位出现之前逐字相同（**缺省值**）。
+    Auto,
+    /// 不执行，生成一条提议（决策 188 / 207 的表与确认钮）。
+    Ask,
+    /// 拒绝执行，且**不广告**（连工具定义都不给）。
+    Deny,
+}
+
+impl EnvMode {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            EnvMode::Auto => "auto",
+            EnvMode::Ask => "ask",
+            EnvMode::Deny => "deny",
+        }
+    }
+
+    /// 认得出就给出，认不出给 `None`。
+    ///
+    /// **不 panic、也不兜底成 `auto`**：调用方必须自己决定「认不出的值该怎么办」——
+    /// 读配置时那是「配置写错了」该 fail fast，读库时那是「这一列被人手工改坏了」
+    /// 该退回缺省。两处的正确答案不同，故这里不替它们选。
+    pub fn parse(raw: &str) -> Option<Self> {
+        match raw.trim() {
+            "auto" => Some(EnvMode::Auto),
+            "ask" => Some(EnvMode::Ask),
+            "deny" => Some(EnvMode::Deny),
+            _ => None,
+        }
+    }
+
+    /// 认得出就给出，认不出给一句人话（配置写入路径共用，两处各写一份必然漂移）。
+    pub fn parse_or_message(raw: &str) -> std::result::Result<Self, String> {
+        EnvMode::parse(raw).ok_or_else(|| format!("{ENV_MODE_EXPECTED}，实际：{raw:?}"))
+    }
+
+    /// 某个阶段的**缺省**档位（决策 206：真实阶段 `auto`、值班长 `ask`）。
+    ///
+    /// 真实阶段的缺省是全局默认（[`crate::config::Settings::env_mode`]）而不是一个写死的
+    /// 常量：那正是 config.toml 那一层的意义。值班长的缺省是全局默认之外的**另一条**，
+    /// 因为它的输入与流水线节点不是一类东西（人可以随便打的任意文本）。
+    pub fn default_for(stage: &str) -> Option<Self> {
+        if stage == crate::pipeline::foreman::FOREMAN_STAGE_KEY {
+            Some(EnvMode::Ask)
+        } else {
+            None
+        }
+    }
+}
+
+/// 某阶段此刻生效的环境层档位（决策 206 的两层解析，唯一实现）。
+///
+/// 顺序：阶段配置行 → 该阶段的缺省（值班长 `ask`；其余没有）→ 全局默认（`config.toml`
+/// 的 `[pipeline] env_mode`，缺省 `auto`）。
+///
+/// **收在一处**：广告集（`executor::tool_defs` / `ForemanRunner::tool_defs`）与执行点
+/// （`ToolExecutor::execute` 的第三道闸）都调它，两处各判一次必然漂移——而漂移的后果是
+/// 「模型看得见一个调用就被拒的工具」或反过来（一个能调但没人告诉它的工具）。
+pub fn effective_env_mode(
+    global_default: EnvMode,
+    stage: &str,
+    stage_config: Option<&StageConfig>,
+) -> EnvMode {
+    stage_config
+        .and_then(|c| c.env_mode)
+        .or_else(|| EnvMode::default_for(stage))
+        .unwrap_or(global_default)
+}
+
+/// `ask` 档只留给值班长（`run-command-permissions` 规格 §4：流水线只有 `auto` / `deny` 两档）。
+/// 写入路径（`config.toml` 的全局默认与 `PUT /stage-configs`）用它把关。
+///
+/// 理由不是洁癖：流水线节点**无人值守**，而 `ask` 的载体是「等人按键」——节点没有提议通道，
+/// 配成 `ask` 的结果是**静默收掉这个阶段全部的环境写动作**（一条 develop 会卡在「写不了文件」
+/// 上，而配置看上去只是一行 `ask`）。要收紧就明说 `deny`：那时行为与意图一致（拒绝，且连工具
+/// 都不给）。
+pub fn stage_may_use_ask(stage: &str) -> bool {
+    stage == crate::pipeline::foreman::FOREMAN_STAGE_KEY
 }
 
 #[cfg(test)]

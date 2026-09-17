@@ -119,6 +119,17 @@ impl Home {
         self.task_dir(task_id).join(".context")
     }
 
+    /// 值班长会话的卸载目录（决策 204④ / 206）。
+    ///
+    /// **必须在 `tasks/` 之外**：值班长没有 task_id，若让它的卸载走 `context_dir("")`，
+    /// 落点就是 `{root}/tasks/.context`——那是**所有任务共用**的那一层，下一次运行任意
+    /// 一个真实任务时会把它读成自己的工作区残留（`agent/tools.rs` 的 `apply_l2_offload`
+    /// 注释点名过这个后果）。会话维度既落在 `tasks/` 之外，又与「命令日志挂会话」
+    /// 是同一条归属。
+    pub fn foreman_context_dir(&self, session_id: &str) -> PathBuf {
+        self.root.join("foreman").join("context").join(session_id)
+    }
+
     pub fn worktrees_dir(&self) -> PathBuf {
         self.root.join("worktrees")
     }

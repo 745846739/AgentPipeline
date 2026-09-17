@@ -42,6 +42,10 @@ impl Default for FileToolPolicy {
 }
 
 /// 默认拒绝名单（决策 104 / agents.md §10.6.2）。
+///
+/// **模式**名单（按文件名匹配）——它盖不住这一条：`{home}/data/agentpipeline.db`
+/// 里明文存着 provider 密钥（决策 112），而 `.db` 不是 `.env` 也不是 `.pem`。
+/// 那一条由 [`foreman_file_policy`] 按**路径前缀**补上。
 pub fn default_deny_paths() -> Vec<String> {
     vec![
         ".env*".to_string(),
@@ -50,6 +54,32 @@ pub fn default_deny_paths() -> Vec<String> {
         "id_rsa*".to_string(),
         "~/.ssh".to_string(),
     ]
+}
+
+/// 值班长的文件域与补偿（决策 206）：域 = `home.root()`，按**路径前缀**拒掉
+/// `{root}/data` 与 `{root}/logs`。
+///
+/// 两处的理由不同：
+/// * `data/`——`agentpipeline.db` 明文存 provider 密钥（决策 112）。**这是补偿，
+///   不是边界**：`run_command` 不受文件策略管（命令自己 `cd` 就出去了），故它只挡住
+///   「用文件工具顺手读走密钥」这一条路，`auto` 档下的命令那条路**无补偿**——决策 206
+///   已把这条残余风险登记在案（`docs/operations.md` 的残余风险表）。
+/// * `logs/`——它是这台机器的日志，价值不在秘密而在体量：一个 200MB 的日志文件进上下文
+///   的代价（一次工具调用换一次几乎必然的 L4 压缩）远大于任何它能回答的问题。
+///
+/// **前缀语义**是靠 `matches_pattern` 的既有规则给的：含 `/` 且不含 `*` 的模式按
+/// 「等于它或落在它之下」判定。值是**绝对路径**，故 `data` 这个目录名在别处出现
+/// （比如某个项目自己有个 `data/`）不受影响——收的是这一个，不是所有同名目录。
+pub fn foreman_file_policy(home_root: &Path) -> FileToolPolicy {
+    let mut deny = default_deny_paths();
+    for dir in ["data", "logs"] {
+        deny.push(home_root.join(dir).display().to_string());
+    }
+    FileToolPolicy {
+        workdir_bound: vec![home_root.to_path_buf()],
+        deny_paths: deny,
+        ..Default::default()
+    }
 }
 
 impl FileToolPolicy {

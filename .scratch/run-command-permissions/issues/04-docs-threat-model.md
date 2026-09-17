@@ -16,11 +16,25 @@
 
 **Blocked by:** 01、02、03（要按落地后的实际界面写）
 
-**Status:** ready-for-agent
+**Status:** done
 
-- [ ] operations 残余风险表那一行改写（含「无补偿」与指向沙箱的出口）
-- [ ] glossary 的值班长词条改写 + 新词条
-- [ ] testing.md 的提示改写（并把两条断言的归属写清）
-- [ ] theme-6-pixel §3.3 确认钮的档位一句
-- [ ] frontend-design §12.3 补行；`behavior-map.test.ts` 绿
-- [ ] 用户可见文案不含内部编号；`copy-discipline.test.ts` 绿
+- [x] operations 残余风险表那一行改写（含「无补偿」与指向沙箱的出口）
+- [x] glossary 的值班长词条改写 + 新词条
+- [x] testing.md 的提示改写（并把两条断言的归属写清）
+- [x] theme-6-pixel §3.3 确认钮的档位一句
+- [x] frontend-design §12.3 补行；`behavior-map.test.ts` 绿
+- [x] 用户可见文案不含内部编号；`copy-discipline.test.ts` 绿
+
+## 交付
+
+- **`docs/operations.md` §12.14** 的残余风险表新增一行（值班长的命令面），并写明**无补偿**、
+  指向 §12.15 末尾那句「OS 级沙箱是唯一根本解」；那一句也补了一句「这也是值班长那一条的出口」。
+- **`docs/glossary.md`**：`值班长` 词条改写（只说话 → 能读、能提议，动手的是值班经理），
+  新增 `环境层 / 本服务写接口` 与 `权限档位（env_mode）` 两条。
+- **`docs/testing.md`**：「值班长能力扩面」那一段改成「三层都已落地」，并列出一张小表写清
+  **两条断言的归属**（工具集断言 / `talk.spec.ts` ⑦ 各自钉什么），另附「状态区为空时零按钮」
+  那条为什么保留。§6 / §7 / §9 的计数与端点行按落地后的实际数字改过。
+- **`design/theme-6-pixel.md` §3.3**：表格新增「提议轮 `.turn.prop`」一行，纪律 2 补确认钮那段
+  （**不新开一档「响」**、类名不叫 `.warn`、重复时只指路），纪律 4 补「提议过什么 / 你按了什么也进审计」。
+- **`design/frontend-design.md` §12.3** 补四行，`behavior-map.test.ts` 46 条绿、
+  `copy-discipline.test.ts` 8 条绿（新增文案里没有内部编号）。

@@ -60,6 +60,115 @@ fn trim_conversation_messages(messages: &serde_json::Value) -> Vec<serde_json::V
     kept
 }
 
+/// **环境层**工具（决策 206）：权限档位管的就是这一层。
+///
+/// 为什么是一层而不是一个个打补丁：这一层的共同点是「效果落在文件与机器里」——错了可以
+/// 回滚、有日志可查，故它**可配**（`auto` 直接执行 / `ask` 转提议 / `deny` 连广告都不给）。
+/// 与之相对的是**本服务写接口**（[`SERVICE_WRITE_TOOLS`]）：那一边的错误会改变流水线的
+/// 事实（有依赖边、有 worktree 准入、有合入门），故它**恒为提议 + 确认钮**、不读档位。
+///
+/// 名分说明：决策 206 的原文用的是 `FOREMAN_ENV_TOOLS`。这里改用不带前缀的名字，因为
+/// 这道闸对**每一个**执行器都生效——流水线阶段也有档位（全局默认 `auto` = 与今天逐字
+/// 相同），若只在值班长那一侧判，就成了执行点上的一个 per-caller 特例，而「判断落在一处」
+/// 正是这一层存在的理由。
+///
+/// `delete_file` **在列**：决策 206 的清单里没写它（那是按「文件读写 + 命令」举例的），
+/// 但它与 `write_file` 是同一件事的两种形态——漏掉它，`deny` 就成了一堵带门的墙。
+pub const ENV_TOOLS: [&str; 8] = [
+    "read_file",
+    "write_file",
+    "edit_file",
+    "delete_file",
+    "list_dir",
+    "run_command",
+    "Skill",
+    "spawn_sub_agent",
+];
+
+/// **本服务写接口**工具（决策 206）：恒为提议 + 确认钮，**不读档位**。
+///
+/// 三个名字**一族一个工具 + 动作参数**（决策 207④）：粒度对着 `allowed_actions` 的类型走，
+/// 理由有三——白名单短、确认钮的前端渲染不用按端点分叉、persona 描述 token 成本低。
+/// 代价是模型可能选错动作，而确认钮正是为拦这个而存在（后端按 `(端点位, 参数)` 重走一遍
+/// 既有校验）。
+///
+/// **故意缺席的三项**（决策 207⑤）：重置配对令牌、局域网开关、仓名单增删。判据是
+/// 「改的是**谁能访问这台机器**」——让模型能提议它们等于让它能给自己开门。本清单里没有
+/// 它们对应的名字，而清单与实现**同源**（白名单从工具清单生成、执行点按名字分派），
+/// 故「能提议一个开门的动作」这件事在代码里没有落点。
+pub const SERVICE_WRITE_TOOLS: [&str; 3] = ["task", "config", "skills"];
+
+/// 环境层里**会改动东西**的那些（决策 206 的 C / E 两层）：`ask` 档下转成提议。
+///
+/// 与 [`ENV_TOOLS`] 分成两段是必要的：`deny` 收的是**整层**（读也不给），而 `ask` 收的
+/// 只是**动手**那一半。「读一个文件也要人按键」不是在收紧权限，是在把确认钮变成噪声
+/// ——而噪声会让人开始无脑按，那时它挡不住真正该挡的那一次。
+pub const ENV_WRITE_TOOLS: [&str; 4] = ["write_file", "edit_file", "delete_file", "run_command"];
+
+/// 这个工具属于环境层吗（档位管它）。
+pub fn is_env_tool(name: &str) -> bool {
+    ENV_TOOLS.contains(&name)
+}
+
+/// 这个环境层工具在 `ask` 档下要人按键吗（= 它会改动东西）。
+pub fn is_env_write_tool(name: &str) -> bool {
+    ENV_WRITE_TOOLS.contains(&name)
+}
+
+/// 这个工具是本服务的写接口吗（恒提议，不看档位）。
+pub fn is_service_write_tool(name: &str) -> bool {
+    SERVICE_WRITE_TOOLS.contains(&name)
+}
+
+/// `deny` 档把哪些工具挡在**广告**之外（决策 206）：整层环境工具。
+///
+/// 判据只有这一处：工具清单（值班长那一侧的 `foreman_available_tools`）与阶段节点的
+/// `tool_defs` 都问它，两处各写一份谓词的后果是「一侧摘掉了、另一侧还广告着」这种只能靠
+/// 现象定位的漂移。`deny` 收的是**整层**（读也不给），与 `ask` 只收动手那一半不是一回事。
+pub fn denied_by_tier(name: &str, env_mode: crate::types::EnvMode) -> bool {
+    env_mode == crate::types::EnvMode::Deny && is_env_tool(name)
+}
+
+/// 一次调用的第三道闸怎么判（决策 206 / 207）。**这是判据的唯一实现**——
+/// [`ToolExecutor::execute`] 按它分派，[`needs_confirmation`] 与测试按它读数。
+///
+/// 分成三态而不是一个布尔，是因为「要按键」回答不了「然后呢」：拦下来之后是**生成提议**
+/// 还是**拒绝**，取决于有没有提议通道（流水线节点没有），而那件事只有执行器自己知道。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GateDecision {
+    /// 照常执行（`auto` 档；或只读的东西——「只读的不需要人按键」是决策 188 的原话）。
+    Execute,
+    /// 拦下来生成提议（决策 188 / 207 的表）。
+    Propose,
+    /// 拒绝，且这一层整个不可用（`deny` 档）。
+    Refuse,
+}
+
+/// 这个工具此刻会走哪一条（判据见 [`GateDecision`]）。
+pub fn gate_decision(name: &str, env_mode: crate::types::EnvMode) -> GateDecision {
+    // D 层：**不读档位**（决策 206）。它的错误会改变流水线的事实，故这一半永远是提议。
+    if is_service_write_tool(name) {
+        return GateDecision::Propose;
+    }
+    if !is_env_tool(name) {
+        // 台账只读工具（`read_task` 那一批）**不在**这两层里，故它们永远直接执行。
+        return GateDecision::Execute;
+    }
+    match env_mode {
+        crate::types::EnvMode::Auto => GateDecision::Execute,
+        // `ask` 只收**动手**那一半：只读的环境层工具（`read_file` / `list_dir` / `Skill` /
+        // 子代理）照常直接执行——「读一个文件也要人按键」是把确认钮变成噪声。
+        crate::types::EnvMode::Ask if is_env_write_tool(name) => GateDecision::Propose,
+        crate::types::EnvMode::Ask => GateDecision::Execute,
+        crate::types::EnvMode::Deny => GateDecision::Refuse,
+    }
+}
+
+/// 这个工具受**确认钮**管吗（决策 206 / 207）：[`gate_decision`] 的那一态，取名给人读。
+pub fn needs_confirmation(name: &str, env_mode: crate::types::EnvMode) -> bool {
+    gate_decision(name, env_mode) == GateDecision::Propose
+}
+
 /// 命令日志记录的启动信息（§12.4.4）。
 #[derive(Debug, Clone)]
 pub struct CommandStart {
@@ -102,6 +211,33 @@ pub trait CommandRecorder: Send + Sync + 'static {
     fn set_process_group(&self, _run_id: i64, _pgid: i32) -> BoxFuture<'static, Result<()>> {
         Box::pin(async { Ok(()) })
     }
+}
+
+/// 一条提议的请求（决策 188 / 207，票 02 / 04 / 05 / 06）。
+///
+/// 工具层只说「这次调用要变成一条提议」；**说明与态势指纹由接缝的实现去算**
+/// （[`crate::pipeline::proposals::StoreProposalSink`]）——从参数到人读的那句话是呈现层的
+/// 知识，工具层不该有第二份。
+pub struct ProposalRequest {
+    /// 归属会话。值班长的提议挂在它的会话上；流水线节点没有会话，则落 `None`
+    /// （那种情况下 `ask` 档仍然可用，提议只是不挂在任何班次下）。
+    pub session_id: Option<String>,
+    /// 归属任务（流水线节点；值班长为空）。执行时按它取态势指纹。
+    pub task_id: Option<String>,
+    pub tool: String,
+    pub args: serde_json::Value,
+}
+
+/// 提议写入接缝（决策 188 / 207）。
+///
+/// 与 [`SubAgentRunner`] / [`CommandRecorder`] 同一种做法：工具层声明「我需要一个能落提议
+/// 的东西」，真正的落库与广播住在 pipeline 层（它才持有 store 与 SSE）。
+///
+/// **不注入即不可用**：`ask` 档下没有接缝时，写工具调用被**拒**（不是放行）——
+/// 「接不上确认钮就先别动」是这条接缝唯一安全的默认。
+pub trait ProposalSink: Send + Sync + 'static {
+    /// 落一条提议，返回**回灌进对话**的一句话（让模型知道「已经提议、等人按键」）。
+    fn propose(&self, request: ProposalRequest) -> BoxFuture<'static, Result<String>>;
 }
 
 /// 子代理调用的入参（决策 172③，票 08）。
@@ -228,6 +364,21 @@ pub struct ToolExecutor {
     /// 一个显式注入的只读句柄，而不是继承流水线节点那套（含文件与命令）的上下文
     /// ——「不注入即不可用」让「它到底能碰什么」在构造点就看得见。
     ledger: Option<Store>,
+    /// 环境层档位（决策 206）。缺省 [`EnvMode::Auto`] = 与档位出现之前逐字相同。
+    ///
+    /// 把它放在执行器上而不是每个工具里：判断落在**一处**（[`needs_confirmation`] 的两段
+    /// 清单 + 这个档位），加一个环境层工具不需要碰分叉逻辑。
+    env_mode: crate::types::EnvMode,
+    /// 提议写入接缝（决策 188 / 207）。`None` = 需要确认的动作**被拒**（不注入不放行）。
+    proposals: Option<Arc<dyn ProposalSink>>,
+    /// **人已经按过键了**（决策 207）：关掉第三道闸。
+    ///
+    /// 只给「执行提议」那一条路用。提议生成时已经走过一次闸（`ask` 档下那次调用正是被拦
+    /// 下来变成了提议），执行时再拦一次就会自己吃掉自己——按钮按下去又生成一条新提议。
+    /// 这不是绕过闸门：按下的那个动作就是被拦下来的那一次调用，参数逐字取自提议行，
+    /// 而白名单（[`Self::allow`]）照旧按**当前**档位判——档位在提议之后被收紧到 `deny`
+    /// 时，这条提议按不下去。
+    confirmed: bool,
 }
 
 /// 命令输出推流的上下文（票 14）：SSE 去向 + 事件里要带的任务/分支。
@@ -275,7 +426,32 @@ impl ToolExecutor {
             sub_agent: None,
             allow: None,
             ledger: None,
+            env_mode: crate::types::EnvMode::Auto,
+            proposals: None,
+            confirmed: false,
         }
+    }
+
+    /// 设定环境层档位（决策 206）。生产路径由调用方按阶段配置解析后传入
+    /// （[`crate::types::effective_env_mode`] 是唯一的解析实现）。
+    pub fn with_env_mode(mut self, mode: crate::types::EnvMode) -> Self {
+        self.env_mode = mode;
+        self
+    }
+
+    /// **人已经按过键了**：这次调用是提议被确认之后的执行，不再走第三道闸。
+    ///
+    /// 只给「按下确认钮」那一条路用（[`crate::pipeline::foreman`] 的说明里有理由）。
+    /// 白名单不受影响——档位在提议之后收紧到 `deny` 时，那条提议照样按不下去。
+    pub fn confirmed_once(mut self) -> Self {
+        self.confirmed = true;
+        self
+    }
+
+    /// 注入提议写入接缝（决策 188 / 207）。不注入时 `ask` 档与 D 层写工具**一律被拒**。
+    pub fn with_proposal_sink(mut self, sink: Arc<dyn ProposalSink>) -> Self {
+        self.proposals = Some(sink);
+        self
     }
 
     pub fn with_recorder(mut self, recorder: Arc<dyn CommandRecorder>) -> Self {
@@ -356,6 +532,12 @@ impl ToolExecutor {
                 )));
             }
         }
+        // 第三道闸（决策 206 / 207）：`(工具属于哪一层, 当前档位)` 决定直接执行 / 生成提议 /
+        // 拒绝。它排在白名单**之后**：一个连广告都没给的 deny 档工具，先被白名单挡下时
+        // 报的是「不在允许集内」，那是更准确的一句话。
+        if let Some(proposed) = self.confirm_gate(call, ctx).await? {
+            return Ok(proposed);
+        }
         let outcome = match call.name.as_str() {
             "write_file" => self.write_file(call, ctx).await?,
             "edit_file" => self.edit_file(call, ctx).await?,
@@ -382,6 +564,57 @@ impl ToolExecutor {
         self.apply_l2_offload(call, ctx, outcome)
     }
 
+    /// 需要确认钮的动作（决策 206 / 207）：`ask` 档下的环境层、以及**任何档位下**的
+    /// 本服务写接口。
+    ///
+    /// 三种结局各自说得清：
+    /// - **生成提议**（`Ok(Some(…))`）：回给模型一句话，说清「这件事已经提了、等人按键」。
+    ///   它**不是**工具失败——模型该继续把话说完，而不是改道去试别的写法。
+    /// - **拒绝**（`Err`）：`deny` 档，或 `ask` 档但没人接上提议通道（不注入不放行）。
+    /// - **不该管**：`Ok(None)`，照常往下走。
+    async fn confirm_gate(
+        &self,
+        call: &ToolCall,
+        ctx: &ToolCallContext,
+    ) -> Result<Option<ToolOutcome>> {
+        // 人已经按过键了（决策 207）：不再问第二遍。
+        if self.confirmed {
+            return Ok(None);
+        }
+        match gate_decision(call.name.as_str(), self.env_mode) {
+            // 与档位出现之前逐字相同：直接执行、落命令日志、走既有的一切。
+            GateDecision::Execute => Ok(None),
+            GateDecision::Propose => self.propose(call, ctx).await.map(Some),
+            GateDecision::Refuse => Err(Error::Validation(format!(
+                "工具 {} 被 deny 档挡下（决策 206）：这个阶段的环境层权限已收到底，\
+                 文件、命令与技能拉取都不执行",
+                call.name
+            ))),
+        }
+    }
+
+    /// 把一次调用落成提议（决策 188 / 207），返回回灌进对话的那句话。
+    async fn propose(&self, call: &ToolCall, ctx: &ToolCallContext) -> Result<ToolOutcome> {
+        let args = Self::args(call)?;
+        let Some(sink) = &self.proposals else {
+            // 不注入不放行：接上确认钮之前，需要人按键的动作只能被拒。
+            return Err(Error::Validation(format!(
+                "工具 {} 需要值班经理按键确认，但本次运行没有接上提议通道（决策 188）\
+                 ——动作没有执行，也没有留下提议",
+                call.name
+            )));
+        };
+        let note = sink
+            .propose(ProposalRequest {
+                session_id: ctx.session_id.clone(),
+                task_id: (!ctx.task_id.is_empty()).then(|| ctx.task_id.clone()),
+                tool: call.name.clone(),
+                args,
+            })
+            .await?;
+        Ok(ToolOutcome::ok(note))
+    }
+
     /// L2 大结果卸载**覆盖全部工具**（决策 110 / 票 04）：任何工具结果超过
     /// `offload_threshold_tokens` 一律落盘、context 只留预览 + 路径。
     ///
@@ -406,7 +639,7 @@ impl ToolExecutor {
         if !needs_offload(&outcome.content, &self.settings) {
             return Ok(outcome);
         }
-        let dir = self.home.context_dir(&ctx.task_id);
+        let dir = self.offload_dir(ctx)?;
         std::fs::create_dir_all(&dir)?;
         let path = dir.join(format!("{}.txt", ulid::Ulid::new()));
         std::fs::write(&path, &outcome.content)?;
@@ -416,6 +649,28 @@ impl ToolExecutor {
             content: offload_replacement(&call.name, &path.display().to_string(), tokens, &preview),
             metadata: outcome.metadata,
         })
+    }
+
+    /// L2 卸载落在哪个目录——**按归属选维度**（决策 204④ / 206）。
+    ///
+    /// 空 `task_id` 不是「根目录下的 `.context`」，是「没有任务」。写进去的后果是污染
+    /// 下一个真实任务的工作区（`{root}/tasks/.context` 是**所有任务共用**的那一层），
+    /// 所以这里宁可报错也不退化成那个路径。值班长的卸载落会话维度，在 `tasks/` 之外。
+    fn offload_dir(&self, ctx: &ToolCallContext) -> Result<std::path::PathBuf> {
+        if !ctx.task_id.is_empty() {
+            return Ok(self.home.context_dir(&ctx.task_id));
+        }
+        let session = ctx
+            .session_id
+            .as_deref()
+            .filter(|s| !s.is_empty())
+            .ok_or_else(|| {
+                Error::Validation(
+                    "这次调用既没有任务也没有会话归属，工具输出无处卸载（不写 tasks/.context）"
+                        .into(),
+                )
+            })?;
+        Ok(self.home.foreman_context_dir(session))
     }
 
     fn args(call: &ToolCall) -> Result<serde_json::Value> {
@@ -456,6 +711,14 @@ impl ToolExecutor {
 
         let target = ctx.write_root_for(rel).join(rel);
         let resolved = self.policy.check_write(&target)?;
+        // 空 `old_text` 是一个**看起来成功**的错误改动：`contains("")` 恒真，`replacen("", …)`
+        // 把 new_text 插在文件开头——回执说 success，文件却被改坏了。缺参数时必须拒，
+        // 不能靠 `unwrap_or("")` 把它变成一个合法的空串。
+        if old_text.is_empty() {
+            return Err(Error::Validation(format!(
+                "edit_file 缺少 old_text（{rel}）——空串会变成「往开头插一段」，不是一次替换"
+            )));
+        }
         let original = std::fs::read_to_string(&resolved)?;
         if !original.contains(old_text) {
             return Err(Error::Validation(format!(
@@ -1009,7 +1272,7 @@ impl ToolExecutor {
         let stderr = sanitize_text(&stderr);
 
         // L1 裁剪 + L2 卸载（唯一阈值，决策 110）
-        let (in_context, offload_path) = self.prepare_output(&ctx.task_id, &stdout, &stderr)?;
+        let (in_context, offload_path) = self.prepare_output(ctx, &stdout, &stderr)?;
 
         if let Some(rec) = &self.recorder {
             if let Some(id) = command_id {
@@ -1173,9 +1436,12 @@ impl ToolExecutor {
     }
 
     /// 输出裁剪 + 卸载，返回（进 context 的文本，卸载路径）。
+    ///
+    /// 收的是 **ctx 而不是 task_id**：卸载目录按归属选维度（任务 / 值班会话），
+    /// 而归属是上下文里的两列，不是单一的 task_id（票 03）。
     fn prepare_output(
         &self,
-        task_id: &str,
+        ctx: &ToolCallContext,
         stdout: &str,
         stderr: &str,
     ) -> Result<(String, Option<String>)> {
@@ -1189,7 +1455,7 @@ impl ToolExecutor {
             return Ok((trim_run_command(&combined), None));
         }
 
-        let dir = self.home.context_dir(task_id);
+        let dir = self.offload_dir(ctx)?;
         std::fs::create_dir_all(&dir)?;
         let name = format!("{}.txt", ulid::Ulid::new());
         let path = dir.join(name);

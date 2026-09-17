@@ -31,11 +31,12 @@ use std::sync::Arc;
 use serde::{Deserialize, Serialize};
 
 use crate::agent::client::{LlmClient, LlmRequest, Message, ToolDef};
-use crate::agent::file_policy::FileToolPolicy;
 use crate::agent::tools::{ToolCallContext, ToolExecutor};
 use crate::config::Settings;
 use crate::home::Home;
+use crate::pipeline::proposals::StoreProposalSink;
 use crate::process::RealProcessKiller;
+use crate::sse::SseSink;
 use crate::storage::foreman::{
     ForemanMessage, ForemanSession, NewForemanMessage, FOREMAN_ROLE_ASSISTANT,
 };
@@ -90,7 +91,7 @@ pub struct ForemanToolSpec {
 /// A 层的六个新读数（票 01）**一律复用后端既有口径**，不新造一套：看板读任务表、
 /// 指标走 `metrics::*` 纯函数、项目 / 阶段配置 / 技能 / provider 各读自己那张表的既有读法。
 /// 唯一需要加工的是 provider：库里存的是**明文密钥**（决策 112），故只回显掩码。
-pub const FOREMAN_TOOL_SPECS: [ForemanToolSpec; 8] = [
+pub const FOREMAN_TOOL_SPECS: [ForemanToolSpec; 17] = [
     ForemanToolSpec {
         name: "read_task",
         layer: ForemanToolLayer::Read,
@@ -146,6 +147,100 @@ pub const FOREMAN_TOOL_SPECS: [ForemanToolSpec; 8] = [
                       **密钥只回显掩码**——你看到的是「有没有配」，不是密钥本身。",
         parameters: r#"{"type":"object","properties":{}}"#,
     },
+    // ── B 层：环境只读（决策 206）。域是家目录根，`data/` 与 `logs/` 按前缀拒——库里
+    //    明文存着 provider 密钥（决策 112），而默认那份**模式**名单盖不住一个 `.db` 文件。
+    //    这三件事在 `deny` 档下连广告都不给（`foreman_available_tools` 筛的），
+    //    在 `ask` 档下照常直接执行（只读不需要人按键）。
+    //
+    //    `spawn_sub_agent` **不在列**：它要注入一个子代理运行器才有意义，而值班长手上
+    //    没有（也不该有——它是面向人的对话者，不是流水线节点）。加一个只会回「未启用」的
+    //    工具，等于让模型每轮都看得见一个它调了也没用的东西。
+    ForemanToolSpec {
+        name: "read_file",
+        layer: ForemanToolLayer::Read,
+        description: "读一个文件（路径相对家目录根）。看配置、看产物、看你提议要改的那个\
+                      文件现在长什么样——**改之前先看**。",
+        parameters: r#"{"type":"object","properties":{"path":{"type":"string","description":"相对家目录根的路径"},"offset":{"type":"integer","description":"起始行（从 0 数）"},"limit":{"type":"integer","description":"最多读几行"}},"required":["path"]}"#,
+    },
+    ForemanToolSpec {
+        name: "list_dir",
+        layer: ForemanToolLayer::Read,
+        description: "列一个目录（路径相对家目录根，省略取根）。不知道东西在哪儿时先列一层。",
+        parameters: r#"{"type":"object","properties":{"path":{"type":"string","description":"相对家目录根的路径"},"recursive":{"type":"boolean","description":"是否递归"}}}"#,
+    },
+    ForemanToolSpec {
+        name: "Skill",
+        layer: ForemanToolLayer::Read,
+        description: "按技能名取它的正文（技能目录下的 markdown）。有人问「某个技能到底干什么」\
+                      时用它，不要凭名字猜。",
+        parameters: r#"{"type":"object","properties":{"name":{"type":"string","description":"技能名（技能目录里列出的那个）"}},"required":["name"]}"#,
+    },
+    // ── C 层：环境写（决策 206 / 207）。在 `ask` 档下**不执行**，生成提议等人按键；
+    //    `auto` 直通；`deny` 连广告都不给。域与 B 层同一份（家目录根 + `data` / `logs` 前缀 deny）。
+    ForemanToolSpec {
+        name: "write_file",
+        layer: ForemanToolLayer::Write,
+        description: "写一个文件（整份覆盖，路径相对家目录根）。**改之前先 read_file 看一眼**\
+                      ——覆盖是不可逆的，你不知道原来有什么就会把有用的东西抹掉。\
+                      这条动作要值班经理按键确认。",
+        parameters: r#"{"type":"object","properties":{"path":{"type":"string","description":"相对家目录根的路径"},"content":{"type":"string","description":"文件的全部内容（整份覆盖）"}},"required":["path","content"]}"#,
+    },
+    ForemanToolSpec {
+        name: "edit_file",
+        layer: ForemanToolLayer::Write,
+        description: "改一个文件里的一处（把 old_text 换成 new_text，路径相对家目录根）。\
+                      只想动一小段时用它，不要整份重写——整份重写会把文件里其它地方没读到的内容\
+                      一起抹掉。改之前先 read_file。这条动作要值班经理按键确认。",
+        parameters: r#"{"type":"object","properties":{"path":{"type":"string","description":"相对家目录根的路径"},"old_text":{"type":"string","description":"要被替换的原文（须在文件中出现，且只替换第一处）"},"new_text":{"type":"string","description":"替换成什么"}},"required":["path","old_text","new_text"]}"#,
+    },
+    ForemanToolSpec {
+        name: "run_command",
+        layer: ForemanToolLayer::Write,
+        description: "在这台机器上跑一条 shell 命令（默认工作目录是家目录根）。\
+                      命令的输出会作为工具回执回来，也会落进这个班次的命令台账。\
+                      这条动作会不会立即执行由权限档位决定（`ask` 档要值班经理按键确认）。",
+        parameters: r#"{"type":"object","properties":{"command":{"type":"string","description":"要执行的命令原文"},"cwd":{"type":"string","description":"工作目录（默认家目录根）"},"timeout_sec":{"type":"integer","description":"超时秒数"}},"required":["command"]}"#,
+    },
+    // ── D 层：本服务的写接口（决策 206 / 207）。**一族一个工具 + 动作参数**：粒度对着
+    //    `allowed_actions` 的类型走。这一层**不读档位**——「本服务自己的写接口需要人按
+    //    确认钮」不随权限档位变（把值班长配成 `auto` 只放开环境层）。
+    //
+    //    三个**排除项**（决策 207⑤，故意没有对应工具）：重置配对令牌、局域网开关、
+    //    仓名单增删。判据是「改的是**谁能访问这台机器**」——让模型能提议它们，等于让它能
+    //    给自己开门。本仓对此有专门的用例断言清单里不含它们（`tests/foreman.rs`）。
+    ForemanToolSpec {
+        name: "task",
+        layer: ForemanToolLayer::Write,
+        description: "对一个流水线任务动作。action 取值：\
+                      `create`（建任务，要 project_id 与 title）、\
+                      `resume`（让人拍过板的 pending 继续走，要 task_id 与 resume_action）、\
+                      `retry`（重跑一个终态任务）、\
+                      `cancel`（取消）、\
+                      `review`（人工评审通过/打回，要 approved）、\
+                      `merge`（合入决定，要 decision=approve 或 reject）。\
+                      参数与界面上那个按钮点下去时发的一模一样——先 read_task 看清它现在卡在\
+                      哪个 pending、允许的动作是什么，再决定 action 与 resume_action。\
+                      每条都要值班经理按键确认。",
+        parameters: r#"{"type":"object","properties":{"action":{"type":"string","enum":["create","resume","retry","cancel","review","merge"],"description":"要做的动作"},"task_id":{"type":"string","description":"目标任务（create 之外的 action 都要）"},"project_id":{"type":"string","description":"create：建在哪个项目下"},"title":{"type":"string","description":"create：任务标题"},"description":{"type":"string","description":"create：任务描述"},"depends_on":{"type":"array","items":{"type":"string"},"description":"create：依赖的任务 id"},"review_mode":{"type":"string","enum":["agent","human"],"description":"create：评审模式"},"cursor_id":{"type":"string","description":"resume：指定游标（多条活跃游标时必填）"},"resume_action":{"type":"string","description":"resume：拍板的动作名（read_task 的 allowed_actions 里那几个）"},"target_stage":{"type":"string","description":"resume：跳到哪个阶段"},"target_node":{"type":"string","description":"resume：跳到哪个节点"},"input":{"type":"string","description":"resume：给这次拍板的说明 / 打回意见"},"approved":{"type":"boolean","description":"review：通过还是打回"},"comments":{"type":"string","description":"review：打回时带给下游的意见"},"decision":{"type":"string","enum":["approve","reject"],"description":"merge：合入还是打回"}},"required":["action"]}"#,
+    },
+    ForemanToolSpec {
+        name: "config",
+        layer: ForemanToolLayer::Write,
+        description: "改流水线的阶段配置。action 取值：`set`（整条替换某个阶段的配置，要 stage；\
+                      留空的字段会被清成默认——这是整条替换不是局部修改）、\
+                      `delete`（删掉这个阶段的覆盖行，回到系统默认，要 stage）。\
+                      要值班经理按键确认。",
+        parameters: r#"{"type":"object","properties":{"action":{"type":"string","enum":["set","delete"],"description":"set 或 delete"},"stage":{"type":"string","description":"阶段键（如 develop / review / foreman）"},"provider_id":{"type":"string","description":"set：用哪个 provider"},"temperature":{"type":"number","description":"set：采样温度"},"max_tokens":{"type":"integer","description":"set：输出上限"},"persona_path":{"type":"string","description":"set：人格文件路径"},"persona_append":{"type":"string","description":"set：追加指令"},"env_mode":{"type":"string","enum":["auto","ask","deny"],"description":"set：环境层权限档位"},"tools_json":{"description":"set：工具声明（与界面那个框同形）"},"skills_json":{"description":"set：技能声明（与界面那个框同形）"},"node_overrides_json":{"description":"set：节点级覆盖（与界面那个框同形）"},"idle_timeout_sec":{"type":"integer","description":"set：空闲超时"},"max_duration_sec":{"type":"integer","description":"set：最长时长"}},"required":["action","stage"]}"#,
+    },
+    ForemanToolSpec {
+        name: "skills",
+        layer: ForemanToolLayer::Write,
+        description: "装 / 卸技能。action 取值：`install`（从一个本地技能目录导入，要 path，\
+                      该目录自身含 SKILL.md）、`delete`（卸载一个已装技能，要 name）。\
+                      卸载不检查引用——仍被阶段配置引用的技能卸掉之后，那个阶段解析会报错。\
+                      要值班经理按键确认。",
+        parameters: r#"{"type":"object","properties":{"action":{"type":"string","enum":["install","delete"],"description":"install 或 delete"},"path":{"type":"string","description":"install：技能目录路径"},"name":{"type":"string","description":"delete：技能名"},"overwrite":{"type":"boolean","description":"install：同名时是否覆盖"}},"required":["action"]}"#,
+    },
 ];
 
 /// 清单里某一层的工具名（票 01 起有 `Read`，票 04 / 05 / 06 往上加 `Write`）。
@@ -156,6 +251,103 @@ pub fn foreman_tool_names(layer: ForemanToolLayer) -> Vec<&'static str> {
         .map(|s| s.name)
         .collect()
 }
+
+/// 值班长此刻**真正拿得到**的工具名（决策 206 的 `deny` 档：连广告都不给）。
+///
+/// 广告集（[`ForemanRunner::tool_defs`]）与执行点白名单
+/// （[`ToolExecutor::with_allowed_tools`]）都从这里来——**同源**是票 01 的硬要求，
+/// 而档位是筛在这个源头上的一道，不是两处各筛一次。
+///
+/// 只读台账工具**不受档位影响**（它们不在 [`crate::agent::tools::ENV_TOOLS`] 里）：
+/// `deny` 收的是「能碰机器」的手，不是「能读台账」的眼。
+pub fn foreman_available_tools(mode: crate::types::EnvMode) -> Vec<&'static str> {
+    FOREMAN_TOOL_SPECS
+        .iter()
+        .filter(|s| !crate::agent::tools::denied_by_tier(s.name, mode))
+        .map(|s| s.name)
+        .collect()
+}
+
+/// 值班长的**调用上下文**：不挂任务、只挂会话，域是家目录根。
+///
+/// 与执行器一起从 [`foreman_tooling`] 出来，不单独暴露——两处各拼一份的后果是
+/// 「提议时的域」与「执行时的域」可以不同（提议存的是参数，域是执行时才拼的，
+/// 漂移会静默发生）。
+fn foreman_ctx(home: &Home, session_id: &str) -> ToolCallContext {
+    ToolCallContext {
+        // 值班长不挂任务：任务 id 来自工具参数，不是上下文。
+        task_id: String::new(),
+        // 命令 / 文件动作的归属走会话（迁移 0012 的 CHECK：恰好一个归属）。
+        session_id: Some(session_id.to_string()),
+        stage: Stage::Init,
+        node: Node::Execute,
+        // 域 = 家目录根（决策 206 / 207）：流水线阶段仍限任务工作区，那一条不动。
+        worktree_path: PathBuf::from(home.root()),
+        task_dir: PathBuf::from(home.root()),
+        run_id: None,
+        command_source: CommandSource::Agent,
+        default_cwd: None,
+    }
+}
+
+/// 值班长执行器的**时刻**（决策 207）——同一个构造，两种走向。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ForemanMoment {
+    /// 对话里那一轮：模型说它想做什么，写动作在此**落成提议**。
+    Conversation,
+    /// 人按下确认钮那一刻：闸门已经走过一次，这一趟是执行。
+    ConfirmedPress,
+}
+
+/// 值班长的工具执行器**与调用上下文**——对话轮与按键执行共用这一处构造。
+///
+/// `env_mode` 决定两件事：白名单（`deny` 档把环境层整个摘掉）与第三道闸的走向。
+///
+/// **按键执行为什么能关掉第三道闸**（决策 207）：提议生成时已经走过一次闸——`ask` 档下
+/// 的那次调用正是被它拦下来变成了提议。执行时再拦一次就会自己吃掉自己（按钮按下去又生成
+/// 一条新提议）。关的是「要不要问人」，不是「准不准」：白名单照旧按**当前**档位判，
+/// 于是档位在提议之后被收紧到 `deny` 时，那条提议按不下去。
+pub fn foreman_tooling(
+    store: &Store,
+    settings: &Settings,
+    home: &Home,
+    sse: Arc<dyn SseSink>,
+    session_id: &str,
+    env_mode: crate::types::EnvMode,
+    moment: ForemanMoment,
+) -> (ToolExecutor, ToolCallContext) {
+    // 值班长的域就是家目录根（决策 207 的「分两组」：流水线阶段仍限任务工作区），
+    // 并按路径前缀拒掉 `data/` 与 `logs/`——库里明文存着 provider 密钥（决策 112），
+    // 而默认那份**模式**名单（`.env*` / `*.pem` / …）盖不住一个 `.db` 文件。
+    let tools = ToolExecutor::new(
+        home.clone(),
+        crate::agent::file_policy::foreman_file_policy(home.root()),
+        settings.clone(),
+        Arc::new(RealProcessKiller),
+    )
+    .with_ledger(store.clone())
+    // 命令记录（§12.4.4）：值班长的命令要落 `kanban_node_commands`，`task_id` 为 NULL、
+    // 归属走会话（迁移 0012）。它同时是**出口策略拒绝**的落点（决策 179）——被拒的命令
+    // 也要留一行，否则策略在审计面完全不可见，只剩模型侧的一次报错。
+    .with_recorder(Arc::new(store.clone()))
+    .with_env_mode(env_mode)
+    .with_allowed_tools(foreman_available_tools(env_mode));
+    let tools = match moment {
+        // 提议接缝只在对话轮注入。按键执行那一次若还带着它，`ask` 档会把执行改成再提一条。
+        ForemanMoment::ConfirmedPress => tools.confirmed_once(),
+        ForemanMoment::Conversation => {
+            tools.with_proposal_sink(Arc::new(StoreProposalSink::new(store.clone(), sse)))
+        }
+    };
+    (tools, foreman_ctx(home, session_id))
+}
+
+/// 操作台记的那几轮在**模型看到的对话**里的标记（决策 207）。
+///
+/// 两种立场、三个角色：`user` 与 `assistant` 是「谁在说话」，而**提议的执行结果是操作台记的账**
+/// ——它既不是值班经理说的，也不是值班长做的。转写成 `user` 必须带这个标记，否则模型会把这句
+/// 当成人对它下的指令；不带标记也不转写（整段丢掉）则会让它以为提议还挂着、于是重提一遍。
+pub const OPERATION_LOG_MARK: &str = "【操作台】";
 
 /// 单次回话的最大工具往返轮数（决策 182④）。
 ///
@@ -200,8 +392,10 @@ pub(crate) const FOREMAN_CONVERSATION_MAX_CHARS: usize = 12_000;
 pub const FOREMAN_PERSONA: &str = "你是夜班车间的值班长，向值班经理汇报流水线态势。\
      你只报事实与建议：说清哪台工位卡了、卡在什么原因上、可以怎么做，并标出结论的出处\
      （哪个工位、哪次回执）。不寒暄、不恭维、不铺垫，短句优先。\
-     你没有动手的权力——改状态的动作一律由值班经理按下，你只建议；\
-     因此也绝不要声称你已经改了任何东西。\
+     你手上有一只读的手和一只写的手。写的那只手**先提建议、不直接动**：\
+     改状态、改文件、跑命令都是如此，除非这个阶段的权限档位被配成了自动——两种情况\
+     下面「工具纪律」那一段都会说清，以它为准。\
+     因此绝不要声称你已经改了任何东西：你能说的是「我提了一条建议，等你按键」。\
      态势快照之外的细节用 read_task / read_conversation 自己查，不要凭印象猜。";
 
 /// 值班长的前言。**不复用** [`crate::agent::prompts::build_system_prompt`]。
@@ -210,8 +404,8 @@ pub const FOREMAN_PERSONA: &str = "你是夜班车间的值班长，向值班经
 /// read_file 读取」）与 `FORMAT_RULES`（「产出文件一律通过 write_file 写入」「结构化流转
 /// 信息一律通过 submit_metadata 提交」）——三段指令都在让模型使用它**没有**的工具。
 /// 指示一个模型去调不存在的工具，正是它开始编造文件内容的起点。
-const FOREMAN_BASELINE: &str = "你在一个本机工具内运行，面对的是这台机器上的流水线台账。\
-     你只能通过工具读取台账，读不到文件系统，也不能执行命令。";
+const FOREMAN_BASELINE: &str = "你在一个本机工具内运行，面对的是这台机器上的流水线台账\
+     与这个工具自己的家目录。你能读到什么、能不能动手，由下面「工具纪律」那一段说清。";
 
 /// 夜班态势快照（决策 182⑬）：**只装「需要有人管的」**。
 ///
@@ -394,6 +588,105 @@ pub async fn build_briefing(store: &Store) -> Result<ForemanBriefing> {
     })
 }
 
+/// 提议的**态势指纹**（决策 207 的拒执判据）：任务状态 + 后端此刻下发的动作集。
+///
+/// 「现在的情况已经不是它当时说的那样」这句话要有东西可比——提议成立时存一份，
+/// 执行时再取一份，两者不等即拒执。取的三样是**会让人改变主意**的东西：
+/// 任务状态（`queued` 与 `pending` 是两回事）、当前工位（阶段 / 节点变了），
+/// 以及 `allowed_actions`（那颗键还在不在，由后端权威下发，决策 101）。
+///
+/// **任务不存在也是一份合法的指纹**（`{"missing": true}`）：模型可能提了一个后来被删掉的
+/// 任务，那也是「情况变了」，而且是最该被拒的一种。
+pub async fn situation_fingerprint(store: &Store, task_id: &str) -> Result<serde_json::Value> {
+    let task = match store.get_task(task_id).await {
+        Ok(t) => t,
+        Err(Error::Task(_)) => {
+            return Ok(serde_json::json!({ "task_id": task_id, "missing": true }))
+        }
+        Err(e) => return Err(e),
+    };
+    let actions: Vec<String> = task
+        .pending_reason
+        .as_ref()
+        .map(|r| crate::actions::allowed_actions(r, None))
+        .unwrap_or_default()
+        .into_iter()
+        .map(|a| a.action)
+        .collect();
+    Ok(serde_json::json!({
+        "task_id": task.id,
+        "status": task.status.as_str(),
+        "stage": task.current_stage.as_str(),
+        "node": task.current_node.as_str(),
+        "allowed_actions": actions,
+    }))
+}
+
+/// 态势漂移的一句话说明；没漂移时 `None`（决策 207 的「拒执并报出」）。
+///
+/// **整份比较**而不是逐字段挑着比：指纹里的三样都是判据的一部分，挑着比就得为每一处
+/// 新增字段补一行，而漏掉的那一行会让一条本该被拒的提议通过。逐字段只用来**说清楚**
+/// 变的是哪一样——那是给人看的理由，不是判定本身。
+pub fn situation_drift(before: &serde_json::Value, after: &serde_json::Value) -> Option<String> {
+    if before == after {
+        return None;
+    }
+    if before.get("missing") == Some(&serde_json::Value::Bool(true))
+        || after.get("missing") == Some(&serde_json::Value::Bool(true))
+    {
+        return Some("那个任务在台账里已经找不到（或刚刚才出现）".to_string());
+    }
+    let mut changed: Vec<String> = Vec::new();
+    if before.get("status") != after.get("status") {
+        changed.push(format!(
+            "任务状态从 {} 变成了 {}",
+            cell(before, "status"),
+            cell(after, "status")
+        ));
+    }
+    if before.get("stage") != after.get("stage") || before.get("node") != after.get("node") {
+        changed.push(format!(
+            "当前工位从 {}.{} 换到了 {}.{}",
+            cell(before, "stage"),
+            cell(before, "node"),
+            cell(after, "stage"),
+            cell(after, "node")
+        ));
+    }
+    if before.get("allowed_actions") != after.get("allowed_actions") {
+        changed.push(format!(
+            "可按下的事从 [{}] 变成了 [{}]",
+            list(before, "allowed_actions"),
+            list(after, "allowed_actions")
+        ));
+    }
+    if changed.is_empty() {
+        changed.push("它当时依据的那份读数已经对不上了".to_string());
+    }
+    Some(changed.join("；"))
+}
+
+fn cell(value: &serde_json::Value, key: &str) -> String {
+    value
+        .get(key)
+        .and_then(|v| v.as_str())
+        .unwrap_or("?")
+        .to_string()
+}
+
+fn list(value: &serde_json::Value, key: &str) -> String {
+    value
+        .get(key)
+        .and_then(|v| v.as_array())
+        .map(|a| {
+            a.iter()
+                .filter_map(|v| v.as_str())
+                .collect::<Vec<_>>()
+                .join(" / ")
+        })
+        .unwrap_or_else(|| "?".to_string())
+}
+
 /// 历史窗口按字符预算裁剪（决策 182⑫）：从**最新往回**取，返回选中项（时间升序）。
 ///
 /// 两条不变式：
@@ -447,15 +740,30 @@ pub struct ForemanRunner {
     settings: Settings,
     home: Home,
     llm: Arc<dyn LlmClient>,
+    /// 提议事件的广播去向（决策 207）。它与对话增量走**同一条**总线（决策 182⑥），
+    /// 只是事件类型不同——前端按类型分流，后端按类型过滤。
+    sse: Arc<dyn SseSink>,
 }
 
 impl ForemanRunner {
-    pub fn new(store: Store, settings: Settings, home: Home, llm: Arc<dyn LlmClient>) -> Self {
+    /// 构造。
+    ///
+    /// `sse` **不是可选项**：值班长的写动作只能以提议的形式出现在时间线上，而提议到达
+    /// 那一刻要能推给打开着的界面。留一个「不传就没有事件」的缺省，等于给这条链路留一个
+    /// 静默失效的口子（界面还是能靠重读拿到它，于是没人会发现事件没发）。
+    pub fn new(
+        store: Store,
+        settings: Settings,
+        home: Home,
+        llm: Arc<dyn LlmClient>,
+        sse: Arc<dyn SseSink>,
+    ) -> Self {
         ForemanRunner {
             store,
             settings,
             home,
             llm,
+            sse,
         }
     }
 
@@ -497,7 +805,14 @@ impl ForemanRunner {
         // 阶段配置读一次、用两个地方（人格 + provider / 采样参数）。中途再读一次不会
         // 有新值可读，却会让「人格用这一份、provider 用那一份」成为可能。
         let cfg = self.stage_config().await?;
-        let system_prompt = self.system_prompt(cfg.as_ref())?;
+        // 环境层档位（决策 206）：广告集、执行点白名单与人格里的工具纪律段**同源**，
+        // 都由它筛一次。缺省 `ask`（值班长的输入是人可以随便打的任意文本）。
+        let env_mode = crate::types::effective_env_mode(
+            self.settings.env_mode,
+            FOREMAN_STAGE_KEY,
+            cfg.as_ref(),
+        );
+        let system_prompt = self.system_prompt(cfg.as_ref(), env_mode)?;
         let provider_id =
             crate::storage::catalog::resolve_provider_id(None, None, cfg.as_ref(), None);
 
@@ -515,37 +830,33 @@ impl ForemanRunner {
         // 每轮全失效（§12.13.5）。
         let user_prompt = briefing.render();
 
-        let tools = ToolExecutor::new(
-            self.home.clone(),
-            // 值班长的工具集里没有任何文件工具，这个策略集合因此不可达；
-            // 传家目录根而不是空表，是为了万一将来有人加了文件工具，
-            // 默认边界仍是最紧的那个（家目录内），而不是「什么都不许」导致的假绿。
-            FileToolPolicy::new(vec![self.home.root().to_path_buf()]),
-            self.settings.clone(),
-            Arc::new(RealProcessKiller),
-        )
-        .with_ledger(self.store.clone())
-        .with_allowed_tools(FOREMAN_TOOL_SPECS.iter().map(|s| s.name).collect());
-        let ctx = ToolCallContext {
-            // 值班长不挂任务：这两个字段在它的两个工具里都不参与判定
-            // （任务 id 来自工具参数，不是上下文）。
-            task_id: String::new(),
-            // 命令 / 文件动作的归属走会话（迁移 0012 的 CHECK：恰好一个归属）。
-            session_id: Some(session.id.clone()),
-            stage: Stage::Init,
-            node: Node::Execute,
-            worktree_path: PathBuf::from(self.home.root()),
-            task_dir: PathBuf::from(self.home.root()),
-            run_id: None,
-            command_source: CommandSource::Agent,
-            default_cwd: None,
-        };
+        let (tools, ctx) = foreman_tooling(
+            &self.store,
+            &self.settings,
+            &self.home,
+            self.sse.clone(),
+            &session.id,
+            env_mode,
+            ForemanMoment::Conversation,
+        );
 
+        // 三种角色 → 两种说话的立场（决策 204 / 207）。**操作台记的那几轮（`system`）必须与
+        // 值班长自己的话分开**：写成助理轮，它下一轮读历史时会把「提议已执行：写文件 notes.md」
+        // 当成自己说过的话——那正是人格第一条纪律（不得声称自己动了手）要挡的东西。
+        //
+        // 转写成 `user` 而不是丢掉：丢掉它，模型就不知道人按了什么键，会以为提议还挂着
+        // （于是重提一遍）。剩下的问题是「user 这一侧还有值班经理」——故加一句与前缀一起
+        // 说明发言者是谁，而不是靠角色去暗示。
         let mut transcript: Vec<Message> = window
             .iter()
             .map(|m| {
                 if m.role == crate::storage::foreman::FOREMAN_ROLE_USER {
                     Message::user(m.content.clone())
+                } else if m.role == crate::storage::foreman::FOREMAN_ROLE_SYSTEM {
+                    Message::user(format!(
+                        "{}（操作台记的一轮）\n{}",
+                        OPERATION_LOG_MARK, m.content
+                    ))
                 } else {
                     Message::assistant(Some(m.content.clone()), Vec::new())
                 }
@@ -558,6 +869,7 @@ impl ForemanRunner {
             _ => transcript.push(Message::user(text.to_string())),
         }
 
+        let tool_defs = Self::tool_defs(env_mode);
         let mut tokens = (0u32, 0u32);
         let mut traces: Vec<ForemanTrace> = Vec::new();
         let mut reply: Option<String> = None;
@@ -575,7 +887,7 @@ impl ForemanRunner {
                 system_prompt: system_prompt.clone(),
                 user_prompt: user_prompt.clone(),
                 messages: transcript.clone(),
-                tools: Self::tool_defs(),
+                tools: tool_defs.clone(),
                 temperature: cfg.as_ref().and_then(|c| c.temperature),
                 max_tokens: cfg.as_ref().and_then(|c| c.max_tokens),
                 provider_id: provider_id.clone(),
@@ -701,9 +1013,11 @@ impl ForemanRunner {
     /// 手写这两个 `ToolDef` 的时候，广告集与执行点白名单是两份独立的名单，而
     /// 「同源」是票 01 的硬要求：两处各写一份名字，迟早出现「模型看得见一个调用就被拒
     /// 的工具」这种不好定位的错。
-    fn tool_defs() -> Vec<ToolDef> {
+    fn tool_defs(env_mode: crate::types::EnvMode) -> Vec<ToolDef> {
+        let available = foreman_available_tools(env_mode);
         FOREMAN_TOOL_SPECS
             .iter()
+            .filter(|spec| available.contains(&spec.name))
             .map(|spec| ToolDef {
                 name: spec.name.to_string(),
                 description: spec.description.to_string(),
@@ -722,6 +1036,34 @@ impl ForemanRunner {
         tools.execute(call, ctx).await
     }
 
+    /// 「你能动手到什么程度」那一段（决策 206 / 188）。
+    ///
+    /// **按档位写，不写一句笼统的「你没有权限」**：模型是照着这段描述自己汇报的，
+    /// 描述与事实不符时它会说出与事实不符的话（「我已经写好了」/「我读不到文件」）。
+    /// 这一段与 `ToolExecutor` 那道闸是同一件事的两种说法——一处给模型看，一处真的执行。
+    fn power_discipline(&self, env_mode: crate::types::EnvMode) -> String {
+        match env_mode {
+            crate::types::EnvMode::Ask => "\
+                 - 文件与命令这类**会改动东西**的动作：你调用之后**不会立即发生**，\
+                 而是生成为一条待确认的提议，等值班经理在界面上按下确认钮才真正执行。\
+                 `read_file` / `list_dir` / `Skill` 是只读的，直接执行。\
+                 - 因此**绝不要说你已经做了那件事**：你可以说「我提了一条建议，等你按键」。\
+                 - 本服务自己的写接口（建任务、拍板、合入、改配置……）一律走提议，\
+                 这件事不随档位变。\n"
+                .to_string(),
+            crate::types::EnvMode::Auto => "\
+                 - 文件与命令这类动作**会立即执行**（这个阶段被配成 auto 档）。执行结果\
+                 会以工具回执的形式回来，写进时间线；你汇报时以回执为准，不要凭印象说。\
+                 - 本服务自己的写接口（建任务、拍板、合入、改配置……）**仍然**要人按键，\
+                 不随档位变——那类动作会改变流水线的事实。\n"
+                .to_string(),
+            crate::types::EnvMode::Deny => "\
+                 - 这个阶段的环境层被关掉了：文件读写、命令执行、技能拉取都不可用，\
+                 连工具都看不到。台账读数照常可用。**不要提议这类动作**——它无处可去。\n"
+                .to_string(),
+        }
+    }
+
     /// `stage_configs["foreman"]` 的覆盖行（可能不存在——「不配置也能用」）。
     ///
     /// provider 解析（决策 182②）沿用 `project_analysis` 的路子：按**自己的 key** 读阶段配置，
@@ -736,7 +1078,11 @@ impl ForemanRunner {
     ///
     /// 不注入技能（与只读子代理同一立场）：值班长是面向人的对话者，不是技能执行者；
     /// 把项目技能正文灌进来只会挤占历史窗口。
-    fn system_prompt(&self, cfg: Option<&crate::types::StageConfig>) -> Result<String> {
+    fn system_prompt(
+        &self,
+        cfg: Option<&crate::types::StageConfig>,
+        env_mode: crate::types::EnvMode,
+    ) -> Result<String> {
         let persona = match cfg.and_then(|c| c.persona_path.as_deref()) {
             Some(path) => {
                 let full = self.home.root().join(path);
@@ -758,18 +1104,23 @@ impl ForemanRunner {
         // 工具纪律：**按清单生成**（票 01）。手写一份工具名清单的下场是它与
         // `FOREMAN_TOOL_SPECS` 各自漂移——模型于是要么看不见某个能调的工具，
         // 要么被告知去调一个不存在的工具（后者正是它开始编造读数的起点）。
+        //
+        // 档位（决策 206）也要在这里说：模型对「它做了什么」的描述**必须与事实一致**。
+        // 上一版这段写的是「读不到文件系统，也不能执行命令」——那在 B 层落地之后是假的，
+        // 而一段假的能力说明会直接变成一句假话（「我读过那个文件」）。
         let read_tools = foreman_tool_names(ForemanToolLayer::Read);
         let write_tools = foreman_tool_names(ForemanToolLayer::Write);
         out.push_str(&format!(
             "\n## 工具纪律\n\
-             - 你的工具分两段，现在可用的只读工具是：{}。\n",
+             - 你能直接用的工具是：{}。\n",
             read_tools.join(" / ")
         ));
-        if write_tools.is_empty() {
-            out.push_str(
-                "- **你没有写权限**：没有改状态的键、没有命令执行权限，也读不到文件系统。\
-                 要动手的键一律由值班经理按——你只建议。\n",
-            );
+        out.push_str(&format!("{}\n", self.power_discipline(env_mode)));
+        if !write_tools.is_empty() {
+            out.push_str(&format!(
+                "- 会改动东西的工具是：{}。\n",
+                write_tools.join(" / ")
+            ));
         }
         out.push_str(
             "- 快照里已经有的（待拍板原因、在跑、失败、项目清单）不要再查一遍。\n\

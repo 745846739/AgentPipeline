@@ -101,6 +101,13 @@ export interface App {
   webBase: string;
   /** fixture 仓库路径（用例断言合入产物时用 `git -C <repoDir> ...`）。 */
   repoDir: string;
+  /**
+   * 临时 home（`AGENTPIPELINE_HOME`）。
+   *
+   * 用例直接读磁盘时用——值班长的域就是它，提议执行之后文件**真的**落在这里，
+   * 「按下确认钮不是只改了一行状态」由这一条取证（票 03 / 04）。
+   */
+  homeDir: string;
   /** 播种出的任务 id（`seedless` 模式下为空串）。 */
   taskId: string;
   /** 全部播种任务 id（主任务在前，`additionalTasks` 次之；主流程票 09）。 */
@@ -604,6 +611,7 @@ export async function startApp(opts: StartOptions): Promise<App> {
       apiBase,
       webBase: apiBase,
       repoDir,
+      homeDir,
       taskId,
       taskIds,
       mockUrl: mock.url,

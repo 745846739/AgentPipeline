@@ -4,6 +4,7 @@
     AllowedAction,
     BranchCursor,
     ForemanBriefing,
+    ForemanProposal,
     ForemanSession,
     ForemanSessionMeta,
     ForemanTrace,
@@ -15,9 +16,11 @@
   import {
     archiveForemanSession,
     createForemanSession,
+    executeForemanProposal,
     getForemanSession,
     getForemanSessions,
     getTask,
+    rejectForemanProposal,
     renameForemanSession,
     sendForemanMessage,
   } from '../api/client';
@@ -37,6 +40,16 @@
     stopActionCount,
     toggleOpenStop,
   } from '../lib/talkStops';
+  import {
+    proposalActionable,
+    proposalPointerOnly,
+    proposalRemainingLabel,
+    proposalShortLabel,
+    proposalState,
+    proposalStateLabel,
+    proposalTaskId,
+    proposalToolLabel,
+  } from '../lib/proposals';
   import { CompositionGuard, shouldSubmitOnEnter } from '../lib/enterToSend';
   import { TaskStream, type StreamStatus } from '../realtime/connection';
   import {
@@ -176,8 +189,17 @@
 
   interface TurnView {
     key: string;
-    kind: 'fm' | 'mine' | 'failed';
+    /**
+     * 发言者。`console` = **操作台记的一轮**（`role === 'system'`：提议的执行结果，决策 207）。
+     *
+     * 它必须与 `fm`（值班长的话）分开：那一行的内容是「提议已执行：…」，而**动手的是按下
+     * 那颗钮的人**——挂在值班长的名牌下等于替它认领了它没做的事。三种角色、两种说话的立场，
+     * 操作台是第三种。
+     */
+    kind: 'fm' | 'mine' | 'failed' | 'proposal' | 'console';
     content: string;
+    /** 排进时间线的时刻（RFC3339）。三种在途轮（乐观轮 / 流式轮 / 失败轮）没有它，恒在末尾。 */
+    at: string;
     /** 流式尾随方块光标（既有 `.streaming`，不新增动画位）。 */
     streaming: boolean;
     /** 断流/出错：这一轮只有已收到的部分。 */
@@ -187,29 +209,67 @@
     briefing: ForemanBriefing | null;
     /** 失败原因是「这台设备还没配对」（票 07）：只有它会挂出配对入口。 */
     needsPairing: boolean;
+    /** 提议轮带的那条提议（其余轮为 `null`）。 */
+    proposal: ForemanProposal | null;
   }
 
+  /**
+   * 时间线归约（票 03 加一种轮：**提议轮**）。
+   *
+   * 提议与消息**按时刻合并排序**，不是把提议另起一段：提议是那一轮里发生的事
+   * （模型调用 → 落成提议 → 它把话说完），先后次序本身是信息。三段的时刻天然分得开——
+   * 值班经理的话先落库，提议在工具调用时落库，值班长的回话最后落库。
+   *
+   * 同刻的兜底次序按 `kind`：人的话 → 提议 → 值班长的话。时钟是同一台机器的，
+   * 同刻基本只出现在 `ManualClock` 的用例里，但排序必须是确定的（否则每次渲染都可能换位）。
+   */
   const turns = $derived.by<TurnView[]>(() => {
-    const out: TurnView[] = (session?.messages ?? []).map((m) => ({
-      key: `m${m.id}`,
-      kind: m.role === 'user' ? 'mine' : 'fm',
-      content: m.content,
-      streaming: false,
-      partial: false,
-      traces: m.traces ?? [],
-      briefing: m.briefing,
-      needsPairing: false,
+    const stamped: { view: TurnView; rank: number }[] = (session?.messages ?? []).map((m) => ({
+      rank: m.role === 'user' ? 0 : m.role === 'system' ? 1 : 2,
+      view: {
+        key: `m${m.id}`,
+        kind: m.role === 'user' ? 'mine' : m.role === 'system' ? 'console' : 'fm',
+        content: m.content,
+        at: m.created_at,
+        streaming: false,
+        partial: false,
+        traces: m.traces ?? [],
+        briefing: m.briefing,
+        needsPairing: false,
+        proposal: null,
+      },
     }));
+    for (const p of session?.proposals ?? []) {
+      stamped.push({
+        rank: 1,
+        view: {
+          key: `p${p.id}`,
+          kind: 'proposal',
+          content: p.summary,
+          at: p.created_at,
+          streaming: false,
+          partial: false,
+          traces: [],
+          briefing: null,
+          needsPairing: false,
+          proposal: p,
+        },
+      });
+    }
+    stamped.sort((a, b) => (a.view.at === b.view.at ? a.rank - b.rank : a.view.at < b.view.at ? -1 : 1));
+    const out: TurnView[] = stamped.map((s) => s.view);
     if (pendingText) {
       out.push({
         key: 'pending',
         kind: 'mine',
         content: pendingText,
+        at: '',
         streaming: false,
         partial: false,
         traces: [],
         briefing: null,
         needsPairing: false,
+        proposal: null,
       });
     }
     if (sending || stream.text) {
@@ -218,11 +278,13 @@
         kind: 'fm',
         // 还没收到第一个增量时不摆空白：给一句"对面在动"的实情，光标说明还在流
         content: stream.text || '值班长正在查台账…',
+        at: '',
         streaming: stream.streaming,
         partial: !stream.streaming && stream.text.length > 0,
         traces: [],
         briefing: null,
         needsPairing: false,
+        proposal: null,
       });
     }
     if (stream.error) {
@@ -230,11 +292,13 @@
         key: 'send-error',
         kind: 'failed',
         content: `发送失败：${stream.error}`,
+        at: '',
         streaming: false,
         partial: false,
         traces: [],
         briefing: null,
         needsPairing: needsPairing(stream.error),
+        proposal: null,
       });
     }
     return out;
@@ -408,6 +472,63 @@
 
   let conn: TaskStream | null = null;
 
+  /**
+   * 现在几点（提议的过期按它算，决策 207）。
+   *
+   * **只有在有未决提议时才走**（`$effect` 里判）：这条 10s 的心跳是给「还剩 N 分钟」
+   * 与到点变灰用的——没提议时它一次状态更新都不该产生，否则整页每 10 秒重算一遍。
+   * 到期那一刻不等后端把它标成 `expired`：清理挂在每小时的维护作业上，等它会让按钮
+   * 在过期之后还亮着（判据见 `lib/proposals.ts`）。
+   */
+  let now = $state(Date.now());
+  $effect(() => {
+    if (!(session?.proposals ?? []).some((p) => p.status === 'pending')) return;
+    const t = setInterval(() => (now = Date.now()), 10_000);
+    return () => clearInterval(t);
+  });
+
+  /** 提议对应的那个任务的 `allowed_actions`（不指路时用不到，判据在 `lib/proposals.ts`）。 */
+  function actionsFor(p: ForemanProposal): AllowedAction[] | undefined {
+    const id = proposalTaskId(p);
+    return id ? details[id]?.actions : undefined;
+  }
+
+  /** 正在执行 / 拒绝的那条提议 id（两颗钮一起禁用，理由与 `board.actionBusy` 同一姿态）。 */
+  let proposalBusy = $state<string | null>(null);
+  /**
+   * 提议操作的失败说明（就地显示在**那一轮**里，不弹窗、不 toast）。
+   *
+   * 带 id 而不是一个裸字符串：同时挂着两条提议时，裸字符串会把同一条报错挂到两轮下面
+   * ——人按的是第二条，却在第一条下面读到失败原因。
+   */
+  let proposalError = $state<{ id: string; text: string } | null>(null);
+
+  /**
+   * 按下确认钮（执行 / 拒绝）。
+   *
+   * **结果一律回灌成一轮对话**：后端把「执行了 / 拒绝了 / 执行失败」都落成一条系统轮，
+   * 这里只需重读台账——不弹窗、不 toast，与 `send()` 的失败处理同一姿态。
+   * 失败（400 / 409）就地挂在那一轮下面并保留提议原状：失败**不消耗**提议，
+   * 人还能改主意去按「拒绝」。
+   */
+  async function actOnProposal(id: string, act: 'execute' | 'reject') {
+    if (proposalBusy) return;
+    proposalBusy = id;
+    proposalError = null;
+    try {
+      if (act === 'execute') await executeForemanProposal(id);
+      else await rejectForemanProposal(id);
+      await reload();
+    } catch (e) {
+      proposalError = { id, text: e instanceof Error ? e.message : String(e) };
+      // 失败也要重读：过期 / 态势变化这两种失败**改了库里的状态**（标 expired / 保持 pending
+      // 并落一条说明），不重读的话界面显示的仍是按键之前那一份。
+      await reload();
+    } finally {
+      proposalBusy = null;
+    }
+  }
+
   function onVisible() {
     if (document.visibilityState !== 'visible') return;
     void reload();
@@ -570,6 +691,26 @@
   const TOOL_LABELS: Record<string, string> = {
     read_task: '读任务台账',
     read_conversation: '读工位会话',
+    // A 层环境读数（决策 188）
+    read_board: '读看板',
+    read_metrics: '读指标',
+    read_projects: '读项目',
+    read_stage_configs: '读阶段配置',
+    read_skills: '读技能清单',
+    read_providers: '读 provider',
+    // B 层环境只读（决策 206）
+    read_file: '读文件',
+    list_dir: '列目录',
+    Skill: '取技能正文',
+    // C / E 层（走确认钮，回执只在「它查过什么」这一层出现）
+    write_file: '写文件',
+    edit_file: '改文件',
+    delete_file: '删文件',
+    run_command: '跑命令',
+    // D 层本服务写接口（决策 207④ 的三族）
+    task: '任务动作',
+    config: '改阶段配置',
+    skills: '技能动作',
   };
 
   /** 工位名 → sprite：快照里的 stage 是后端字符串，未登记的值不猜（退回台账箱）。 */
@@ -905,59 +1046,137 @@
     {/if}
 
     {#each turns as turn (turn.key)}
-      <article
-        class="turn"
-        class:fm={turn.kind === 'fm'}
-        class:mine={turn.kind === 'mine'}
-        class:failed={turn.kind === 'failed'}
-      >
-        <div class="dname">
-          {turn.kind === 'failed' ? '发送失败' : turn.kind === 'mine' ? '值班经理' : '值班长'}
-        </div>
-        <p class:streaming={turn.streaming}>{turn.content}</p>
-
-        {#if turn.partial}
-          <p class="dim note">流断了，上面是已经收到的部分；完整回话会在台账里补齐。</p>
-        {/if}
-
-        <!-- 配对入口（决策 182㉙，票 07）：非回环形态下缺令牌时后端回 403，报文里已经说清
-             「这台设备还没配对」。这里补的是**动作**——报文让人知道发生了什么，链接让人知道
-             下一步去哪。只在 403 且报文提到配对时出现，普通失败不挂这个出口。
-             措辞点名「哪台机器」（决策 189）：见上方读失败路径的同一条注释。 -->
-        {#if turn.needsPairing}
-          <p class="note">
-            配对码只在那台跑服务的电脑本机生成：在那台电脑上（桌面应用窗口，或浏览器里的
-            127.0.0.1）打开<a
-              class="crumb"
-              href="#/share"
-              onclick={() => router.navigate('/share')}>手机访问</a
-            >页扫码即可——手机上打开这一页是拿不到配对码的。若已添加到主屏幕，**换过令牌后要
-            重新添加一次**（图标里记的是当时那条带令牌的地址）。
-          </p>
-        {/if}
-
-        <!-- 工位回执：转述不是发言（左缘亮度阶 + 无框，形状上就与发言不同）。
-             默认展开：回执是这一轮结论的出处，「可追溯性不因对话而丢失」是四条纪律之一 -->
-        {#if turn.traces.length > 0}
-          <details class="rcpts" open>
-            <summary class="rcpts-sum">
-              工位回执 <span class="dim">{turn.traces.length} 次台账查读 ▸</span>
-            </summary>
-            {#each turn.traces as trace, i (`${turn.key}-t${i}`)}
-              {@const r = receipt(trace, turn.briefing)}
-              <div class="rcpt">
-                <div class="rcpt-head">
-                  <Sprite name={r.sprite} size={10} />
-                  <span class="nm">{r.workshop}</span>
-                  <span class="dim">{r.label}</span>
-                  <span class="dim args">{trace.args_summary}</span>
-                  <span class="rs" class:bad={!trace.ok}>{trace.ok ? '已读' : '未读到'}</span>
-                </div>
-              </div>
-            {/each}
+      {#if turn.proposal}
+        {@const p = turn.proposal}
+        {@const st = proposalState(p, now)}
+        {@const actionable = proposalActionable(p, now)}
+        {@const pointer = proposalPointerOnly(p, actionsFor(p))}
+        <!-- 提议轮（决策 188 / 207，票 03）：**内联在时间线的那一轮里**，不新开第三个按钮面。
+             类名刻意**不叫** `.warn`（决策 203：全站唯一的「响」仍是急停轮）——它是操作台
+             记的一笔账 + 一颗等人按的钮，不是一次告警。 -->
+        <article class="turn prop" class:grey={st !== 'pending'} data-proposal={p.id}>
+          <!-- 名牌是发言者：这一轮是操作台在报「有一件事等你按键」，不是值班长在说话
+               （与急停轮同一条口径：值班长的话一律没有按钮）。 -->
+          <div class="dname">操作台</div>
+          <div class="dtag">
+            {#if st === 'pending'}⏳{/if}
+            {proposalShortLabel(p, now)} · {proposalToolLabel(p)}
+            {#if st === 'pending'}· <span class="pleft">{proposalRemainingLabel(p, now)}</span>{/if}
+          </div>
+          <p>{p.summary}</p>
+          <!-- 参数原样可见：按键之前要看得出它到底要什么（后端生成的那句话是摘要，不是全部） -->
+          <details class="pargs">
+            <summary class="dim">参数 ▸</summary>
+            <pre class="mono">{JSON.stringify(p.args, null, 2)}</pre>
           </details>
-        {/if}
-      </article>
+
+          {#if st === 'executed' || st === 'rejected'}
+            <!-- 终态：两颗钮都收掉，这一轮仍在（审计）。**先判终态再判指路**——反过来的话，
+                 一条已经执行过的提议只要那个动作还在动作集里，就会继续显示「去那里按」。 -->
+            <p class="dim note">这条提议{proposalStateLabel(p, now)}，不再可按键。</p>
+          {:else if pointer}
+            <!-- 同一个动作已经在状态区那张急停轮里有一颗钮 → **只指路，不画第二颗**
+                 （决策 207③，保留决策 176④ 的原顾虑：两处各一颗钮会让「哪颗是真的」
+                 变成使用者必须思考的问题，而它们是同一个端点）。 -->
+            <p class="dim note">
+              这件事的钮在状态区那张急停轮里——同一个动作不摆第二颗，去那里按。
+            </p>
+          {:else}
+            <div class="pacts">
+              <button
+                type="button"
+                class="btn solid"
+                disabled={!actionable || proposalBusy !== null}
+                onclick={() => void actOnProposal(p.id, 'execute')}
+              >
+                {proposalBusy === p.id ? '执行中…' : '执行'}
+              </button>
+              <button
+                type="button"
+                class="btn quiet"
+                disabled={!actionable || proposalBusy !== null}
+                onclick={() => void actOnProposal(p.id, 'reject')}
+              >
+                拒绝
+              </button>
+            </div>
+          {/if}
+
+          {#if st === 'expired'}
+            <!-- 过期只让按钮变灰，**那一轮留在时间线**（审计：它当时提议过什么必须可追溯）。
+                 这一句只说「为什么按不动、下一步怎么办」——完整说法在 `dtag` 上，两处都写全
+                 会让同一句话在同一轮里读两遍。 -->
+            <p class="dim note">
+              按钮已灰：有效期过了——当时的情况未必还成立，要做得请值班长重新提一次。
+            </p>
+          {/if}
+
+          {#if proposalError?.id === p.id}
+            <p class="note ferr">按下没成：{proposalError.text}</p>
+          {/if}
+        </article>
+      {:else}
+        <article
+          class="turn"
+          class:fm={turn.kind === 'fm'}
+          class:mine={turn.kind === 'mine'}
+          class:failed={turn.kind === 'failed'}
+          class:console={turn.kind === 'console'}
+        >
+          <div class="dname">
+            {turn.kind === 'failed'
+              ? '发送失败'
+              : turn.kind === 'mine'
+                ? '值班经理'
+                : turn.kind === 'console'
+                  ? '操作台'
+                  : '值班长'}
+          </div>
+          <p class:streaming={turn.streaming}>{turn.content}</p>
+
+          {#if turn.partial}
+            <p class="dim note">流断了，上面是已经收到的部分；完整回话会在台账里补齐。</p>
+          {/if}
+
+          <!-- 配对入口（决策 182㉙，票 07）：非回环形态下缺令牌时后端回 403，报文里已经说清
+               「这台设备还没配对」。这里补的是**动作**——报文让人知道发生了什么，链接让人知道
+               下一步去哪。只在 403 且报文提到配对时出现，普通失败不挂这个出口。
+               措辞点名「哪台机器」（决策 189）：见上方读失败路径的同一条注释。 -->
+          {#if turn.needsPairing}
+            <p class="note">
+              配对码只在那台跑服务的电脑本机生成：在那台电脑上（桌面应用窗口，或浏览器里的
+              127.0.0.1）打开<a
+                class="crumb"
+                href="#/share"
+                onclick={() => router.navigate('/share')}>手机访问</a
+              >页扫码即可——手机上打开这一页是拿不到配对码的。若已添加到主屏幕，**换过令牌后要
+              重新添加一次**（图标里记的是当时那条带令牌的地址）。
+            </p>
+          {/if}
+
+          <!-- 工位回执：转述不是发言（左缘亮度阶 + 无框，形状上就与发言不同）。
+               默认展开：回执是这一轮结论的出处，「可追溯性不因对话而丢失」是四条纪律之一 -->
+          {#if turn.traces.length > 0}
+            <details class="rcpts" open>
+              <summary class="rcpts-sum">
+                工位回执 <span class="dim">{turn.traces.length} 次台账查读 ▸</span>
+              </summary>
+              {#each turn.traces as trace, i (`${turn.key}-t${i}`)}
+                {@const r = receipt(trace, turn.briefing)}
+                <div class="rcpt">
+                  <div class="rcpt-head">
+                    <Sprite name={r.sprite} size={10} />
+                    <span class="nm">{r.workshop}</span>
+                    <span class="dim">{r.label}</span>
+                    <span class="dim args">{trace.args_summary}</span>
+                    <span class="rs" class:bad={!trace.ok}>{trace.ok ? '已读' : '未读到'}</span>
+                  </div>
+                </div>
+              {/each}
+            </details>
+          {/if}
+        </article>
+      {/if}
     {/each}
   </section>
 
@@ -1253,6 +1472,14 @@
   .turn.mine p {
     color: var(--text-2);
   }
+  /* 操作台记的一轮（提议的执行结果，决策 207）：名牌与正文都收一档，形状与值班长的话相同
+     ——它是同一张操作台在记账，不是第四种对话框。**不占琥珀、不加 ▼**（全站唯一的响在急停） */
+  .turn.console .dname {
+    color: var(--text-3);
+  }
+  .turn.console p {
+    color: var(--text-2);
+  }
   /* 发送失败：走失败红一档，仍不占琥珀（全站唯一的响只在急停） */
   .turn.failed {
     border-color: var(--stop);
@@ -1262,6 +1489,53 @@
     color: var(--stop);
   }
   .turn.failed p {
+    color: var(--stop);
+  }
+  /* ── 提议轮（决策 188 / 207，票 03）：操作台记的一笔账 + 一颗等人按的钮。
+     **不占琥珀、不加 ▼、不加硬投影**——决策 203 把「全站唯一的响」留给急停轮，
+     一次「可以这么做吗」的询问不是告警；这里只把边框换成正文色，与普通发言轮分开。
+     类名刻意不叫 `.warn`：那是急停轮的既有断言（`talk.spec.ts` 的 `.turn.warn` 计数）。 ── */
+  .turn.prop {
+    border-color: var(--text-3);
+  }
+  .turn.prop .dname {
+    border-color: var(--text-3);
+  }
+  .turn.prop .dtag {
+    color: var(--text-2);
+  }
+  /* 终态（执行过 / 被拒绝 / 已过期）整轮压暗一档：它仍在时间线上（审计），但不再是待办 */
+  .turn.prop.grey p {
+    color: var(--text-3);
+  }
+  .turn.prop.grey .dname {
+    color: var(--text-3);
+  }
+  .pleft {
+    color: var(--text-2);
+  }
+  .pacts {
+    display: flex;
+    gap: 8px;
+    margin-top: 4px;
+  }
+  /* 参数原文（`<details>` 收起）：按键之前要看得出它到底要什么 */
+  .pargs {
+    margin-bottom: 7px;
+  }
+  .pargs summary {
+    cursor: pointer;
+  }
+  .pargs pre {
+    margin: 6px 0 0;
+    padding: 6px 8px;
+    background: var(--pane);
+    color: var(--text-2);
+    overflow-x: auto;
+    white-space: pre;
+  }
+  /* 提议操作失败的说明：走失败红，与 `send()` 的失败轮同一档 */
+  .turn.prop .ferr {
     color: var(--stop);
   }
   /* ▼ 光标默认不画：只有待拍板那一轮点亮（§3.3 纪律 2） */

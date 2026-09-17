@@ -1,4 +1,5 @@
 import type {
+  EnvMode,
   SkillDeclaration,
   SkillMode,
   StageConfig,
@@ -48,6 +49,20 @@ export function isPseudoStage(stage: string): boolean {
   return PSEUDO_KEYS.has(stage);
 }
 
+/**
+ * 这个阶段能用 `ask` 档吗（决策 206；`run-command-permissions` 规格 §4）。
+ *
+ * **只有值班长能用**：`ask` 的载体是「等人按那颗确认钮」，而流水线节点无人值守、也没有提议
+ * 通道——在那里配 `ask` 的结果是静默收掉这个阶段全部的环境写动作（一条 develop 会卡在
+ * 「写不了文件」上，而配置看上去只是一行 `ask`）。要收紧就配 `deny`。
+ *
+ * 判据与后端 `types::stage_may_use_ask` **同源**（后端在 `PUT /stage-configs` 上把关），
+ * 这里只是不把那个选项摆出来——摆出来再报错等于让人白填一次。
+ */
+export function stageMayUseAsk(stage: string): boolean {
+  return stage === 'foreman';
+}
+
 /** 阶段键的界面标签（伪阶段加备注）。 */
 export function stageKeyLabel(stage: string): string {
   return isPseudoStage(stage) ? `${stage}（伪阶段）` : stage;
@@ -67,6 +82,8 @@ export interface StageConfigDraft {
   idle_timeout_sec: string;
   max_duration_sec: string;
   node_overrides_json: string;
+  /** 环境层档位（决策 206）。空串 = 没配过（用全局默认 / 该阶段的缺省）。 */
+  env_mode: EnvMode | '';
 }
 
 export function emptyStageConfigDraft(stage: string = STAGE_KEYS[0]): StageConfigDraft {
@@ -82,6 +99,7 @@ export function emptyStageConfigDraft(stage: string = STAGE_KEYS[0]): StageConfi
     idle_timeout_sec: '',
     max_duration_sec: '',
     node_overrides_json: '',
+    env_mode: '',
   };
 }
 
@@ -99,6 +117,7 @@ export function draftFromStageConfig(config: StageConfig): StageConfigDraft {
     idle_timeout_sec: config.idle_timeout_sec === null ? '' : String(config.idle_timeout_sec),
     max_duration_sec: config.max_duration_sec === null ? '' : String(config.max_duration_sec),
     node_overrides_json: stringifyJson(config.node_overrides_json),
+    env_mode: config.env_mode ?? '',
   };
 }
 
@@ -190,6 +209,10 @@ export function buildStageConfigPut(draft: StageConfigDraft): StageConfigPutResu
   const overrides = parseOptionalJson(draft.node_overrides_json, 'node_overrides_json');
   if ('error' in overrides) return { ok: false, error: overrides.error };
   if (overrides.value !== undefined) payload.node_overrides_json = overrides.value;
+
+  // 环境层档位（决策 206）：空串 = 不配置（留给全局默认 / 该阶段的缺省），
+  // 与「整条替换」的其余字段同一条规则——留空即省略。
+  if (draft.env_mode) payload.env_mode = draft.env_mode;
 
   return { ok: true, payload };
 }
