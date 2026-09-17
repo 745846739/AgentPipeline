@@ -58,15 +58,53 @@ fn gerr(e: git2::Error) -> Error {
     Error::Git(e.to_string())
 }
 
-/// 在阻塞线程池里执行一段同步 git2 逻辑（决策 12）。
+/// 单次 git 操作的兜底上限（秒）。
+///
+/// **为什么必须有**（决策 209）：libgit2 的调用是没有上限的，而节点超时**杀不掉**它们——
+/// 系统节点没有进程组（`kanban_node_runs.process_group_id` 为空），`handle_timeout` 按进程组
+/// 杀，于是「超时」只往台账上写了一个字，那份阻塞的工作还在跑、还占着锁，任务从此永久
+/// 卡在 `running` 且不会转 `pending`（零信号）。
+///
+/// 2026-09-17 的实例：`do_init` 的脏工作区检查里，`git2::Repository::open` 读 `.git/config`
+/// 时被 macOS 拦在 `open()` 里（未签名的 app 没有 `~/Documents` 的访问授权），进程 0% CPU、
+/// state=S、永不返回。任务卡了 4 小时，直到外部 `sample` 附进程才拿到栈。
+///
+/// 取值压在 `node_idle_timeout_sec`（默认 300）**之下**：让挂死以「一个普通的节点错误」
+/// 的形式浮出来——可归因、可重试、可播报——而不是变成一个杀不掉的超时。
+/// **超时不会终止那个阻塞线程**（`JoinHandle` 被丢弃、任务 detach 后继续跑）；这是拿
+/// 一个后台线程换关键路径能继续，不是真取消。**这一点在持锁的调用上更重**：
+/// `init_worktree` 的整个闭包在 `with_worktree_lock` 里跑，若它超时，那个线程仍持有该仓库的
+/// 分桶锁，此**同一仓库的每一次建 worktree 都会阻塞**。所以这条上限是「让关键路径能继续」
+/// 的权宜，不是「让 git 调用可取消」的答案；真取消需要另一套机制（见
+/// `.scratch/foreman-watch/issues/10-repair-worktree.md`）。
+const GIT_OP_TIMEOUT_SEC: u64 = 180;
+
+/// 脏工作区检查的上限（秒）。比 [`GIT_OP_TIMEOUT_SEC`] 短一个数量级。
+///
+/// 因为它换来的只是一条 `warn!`。同一个 2026-09-17 的实例里，正是这条只值一条警告的
+/// 检查把 `init.execute` 挂死了——**best-effort 的检查不允许有能力挂住关键路径**。
+const IS_DIRTY_TIMEOUT_SEC: u64 = 10;
+
+/// 在阻塞线程池里执行一段同步 git2 逻辑（决策 12），带 [`GIT_OP_TIMEOUT_SEC`] 兜底。
 async fn blocking<T, F>(f: F) -> Result<T>
 where
     T: Send + 'static,
     F: FnOnce() -> Result<T> + Send + 'static,
 {
-    match tokio::task::spawn_blocking(f).await {
-        Ok(inner) => inner,
-        Err(e) => Err(Error::Git(format!("spawn_blocking 任务失败：{e}"))),
+    blocking_within(GIT_OP_TIMEOUT_SEC, f).await
+}
+
+/// [`blocking`] 的实际实现，上限可指定（内联测试需要注入一个短上限）。
+async fn blocking_within<T, F>(timeout_sec: u64, f: F) -> Result<T>
+where
+    T: Send + 'static,
+    F: FnOnce() -> Result<T> + Send + 'static,
+{
+    let limit = std::time::Duration::from_secs(timeout_sec);
+    match tokio::time::timeout(limit, tokio::task::spawn_blocking(f)).await {
+        Ok(Ok(inner)) => inner,
+        Ok(Err(e)) => Err(Error::Git(format!("spawn_blocking 任务失败：{e}"))),
+        Err(_) => Err(Error::Git(format!("git 操作超时（{timeout_sec}s）"))),
     }
 }
 
@@ -273,9 +311,17 @@ impl Git {
     }
 
     /// 工作区是否有未提交改动（决策 61，含未跟踪文件）。
+    ///
+    /// 上限取 [`IS_DIRTY_TIMEOUT_SEC`]（比一般 git 操作短一个数量级）：这个读数的唯一用途
+    /// 是决定要不要打一条警告，而它在 `init.execute` 的**第一句**——超时了还让 init 干等，
+    /// 就是 2026-09-17 那次「任务一创建就永久卡住」。
+    ///
+    /// 失败会在调用点区分对待，这里**不**吞错：`do_init` 那条路按 best-effort 处理，
+    /// 而 merge 阶段那条（`executor.rs` 的合入前脏检查）必须失败即停——把它变成
+    /// `Ok(false)` 等于「查不出来就当干净」，那是往脏工作区里合入。
     pub async fn is_dirty(&self, path: &Path) -> Result<bool> {
         let p = path.to_path_buf();
-        blocking(move || {
+        blocking_within(IS_DIRTY_TIMEOUT_SEC, move || {
             let repo = open(&p)?;
             let mut opts = git2::StatusOptions::new();
             opts.include_untracked(true);
@@ -970,6 +1016,48 @@ pub fn branch_name(task_id: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 阻塞的 git 工作必须有上限（决策 209）。
+    ///
+    /// 牙齿：把 `blocking_within` 的 `tokio::time::timeout` 摘掉，这个用例会挂死到
+    /// 5 秒后返回 `Ok`，`matches!` 随即变红。
+    #[tokio::test]
+    async fn blocking_within_times_out_instead_of_hanging() {
+        let r = blocking_within(1, || {
+            std::thread::sleep(std::time::Duration::from_secs(2));
+            Ok(())
+        })
+        .await;
+        match r {
+            Err(Error::Git(m)) => assert!(m.contains("超时"), "超时文案不对：{m}"),
+            other => panic!("应当超时，实际：{other:?}"),
+        }
+    }
+
+    /// 没有超时的活儿照常走通，且错误仍然是错误（不吞错）。
+    #[tokio::test]
+    async fn blocking_within_passes_through_and_propagates_errors() {
+        assert_eq!(blocking_within(5, || Ok(7)).await.unwrap(), 7);
+        let r: Result<()> = blocking_within(5, || Err(Error::Git("底层报错".into()))).await;
+        match r {
+            Err(Error::Git(m)) => assert_eq!(m, "底层报错"),
+            other => panic!("应当原样透出底层错误，实际：{other:?}"),
+        }
+    }
+
+    /// `is_dirty` 的上限必须显著短于一般 git 操作——它只换来一条警告（决策 209）。
+    #[test]
+    fn is_dirty_timeout_is_shorter_than_the_general_bound() {
+        assert!(
+            IS_DIRTY_TIMEOUT_SEC < GIT_OP_TIMEOUT_SEC,
+            "脏检查上限（{IS_DIRTY_TIMEOUT_SEC}s）必须短于通用上限（{GIT_OP_TIMEOUT_SEC}s）"
+        );
+        assert!(
+            GIT_OP_TIMEOUT_SEC < 300,
+            "通用上限（{GIT_OP_TIMEOUT_SEC}s）必须压在 node_idle_timeout_sec 默认值 300s 之下，\
+             否则挂死会退化成杀不掉的节点超时"
+        );
+    }
 
     #[test]
     fn branch_name_convention() {

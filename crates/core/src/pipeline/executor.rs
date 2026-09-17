@@ -386,9 +386,23 @@ impl Executor {
 
     async fn do_init(&self, task: &Task, project: &Project) -> Result<()> {
         let worktree = self.store.home().worktree_path(&task.id);
-        // 目标仓库脏不阻塞，仅记录警告（决策 61）
-        if Git.is_dirty(Path::new(&project.local_path)).await? {
-            tracing::warn!(task = %task.id, "项目工作区有未提交改动（不阻塞，决策 61）");
+        // 目标仓库脏不阻塞，仅记录警告（决策 61）。**这个检查是 best-effort 的**
+        // （决策 209）：它换来的只是下面那条 warn，失败或超时都不能影响 init。
+        //
+        // 这里不写 `.await?` 是有来历的：2026-09-17 那次「任务一创建就永久卡住」，
+        // 挂死点正是这一句里的 `git2::Repository::open`（未签名的 app 没有 `~/Documents`
+        // 的访问授权，`open()` 被 macOS 拦住、永不返回）。一个只值一条警告的检查，
+        // 把整个任务挂死了四小时。
+        match Git.is_dirty(Path::new(&project.local_path)).await {
+            Ok(true) => {
+                tracing::warn!(task = %task.id, "项目工作区有未提交改动（不阻塞，决策 61）")
+            }
+            Ok(false) => {}
+            Err(e) => tracing::warn!(
+                task = %task.id,
+                error = %e,
+                "脏工作区检查失败或超时，按「不检查」继续（不阻塞，决策 61）"
+            ),
         }
         Git.init_worktree(
             Path::new(&project.local_path),
