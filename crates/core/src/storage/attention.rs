@@ -93,6 +93,28 @@ impl AttentionKind {
     }
 }
 
+/// 一次唤醒的结局（票 07 的唤醒账）。三态互斥：`capped` 的那次**没花钱**，
+/// 而 `silent` 那次花了钱但没播报——把两者混成一个数，全局上限就形同虚设。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WatchWakeOutcome {
+    /// 播报了一轮。
+    Broadcast,
+    /// 醒了、判定无需处理（不落会话行，但花了 token）。
+    Silent,
+    /// 触顶，没醒（`event_count` 是那批未播报的待办条数）。
+    Capped,
+}
+
+impl WatchWakeOutcome {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            WatchWakeOutcome::Broadcast => "broadcast",
+            WatchWakeOutcome::Silent => "silent",
+            WatchWakeOutcome::Capped => "capped",
+        }
+    }
+}
+
 /// 一行待办。
 #[derive(Debug, Clone, PartialEq)]
 pub struct AttentionItem {
@@ -213,6 +235,107 @@ impl Store {
         .fetch_one(self.pool())
         .await?;
         Ok(count as usize)
+    }
+
+    /// 窗口内**已被消费**的条数（按任务）。
+    ///
+    /// 票 07 的同任务冷却用它判：某任务刚被处理过（有已消费的待办），它新来的事件就
+    /// **不单独唤醒**——留在表里，等冷却到期后与那时的事件合并播报。
+    pub async fn count_consumed_attention_since(
+        &self,
+        task_id: &str,
+        since: DateTime<Utc>,
+    ) -> Result<usize> {
+        let count: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM kanban_foreman_attention
+             WHERE task_id = ? AND consumed_at IS NOT NULL AND consumed_at >= ?",
+        )
+        .bind(task_id)
+        .bind(ts(since))
+        .fetch_one(self.pool())
+        .await?;
+        Ok(count as usize)
+    }
+
+    // ─────────────────────── 唤醒账（决策 209⑤ / 票 07）───────────────────────
+
+    /// 记一次唤醒（或一次触顶）。返回值是这一行的 id。
+    pub async fn record_watch_wake(
+        &self,
+        session_id: Option<&str>,
+        outcome: WatchWakeOutcome,
+        event_count: usize,
+        prompt_tokens: u32,
+        completion_tokens: u32,
+    ) -> Result<i64> {
+        let id: i64 = sqlx::query_scalar(
+            "INSERT INTO kanban_foreman_watch_wakes
+             (session_id, outcome, event_count, prompt_tokens, completion_tokens, created_at)
+             VALUES (?, ?, ?, ?, ?, ?) RETURNING id",
+        )
+        .bind(session_id)
+        .bind(outcome.as_str())
+        .bind(event_count as i64)
+        .bind(prompt_tokens as i64)
+        .bind(completion_tokens as i64)
+        .bind(ts(self.now()))
+        .fetch_one(self.pool())
+        .await?;
+        Ok(id)
+    }
+
+    /// 窗口内**真的醒过**几次（触顶那一种不算——它没花钱）。
+    pub async fn count_watch_wakes_since(&self, since: DateTime<Utc>) -> Result<usize> {
+        let count: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM kanban_foreman_watch_wakes
+             WHERE outcome IN ('broadcast', 'silent') AND created_at >= ?",
+        )
+        .bind(ts(since))
+        .fetch_one(self.pool())
+        .await?;
+        Ok(count as usize)
+    }
+
+    /// 窗口内记过几次某种结果（触顶提示「同一小时只记一次」用它）。
+    pub async fn count_watch_wakes_with(
+        &self,
+        outcome: WatchWakeOutcome,
+        since: DateTime<Utc>,
+    ) -> Result<usize> {
+        let count: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM kanban_foreman_watch_wakes
+             WHERE outcome = ? AND created_at >= ?",
+        )
+        .bind(outcome.as_str())
+        .bind(ts(since))
+        .fetch_one(self.pool())
+        .await?;
+        Ok(count as usize)
+    }
+
+    /// 「这段时间值守花了多少」：`(醒过的次数, prompt token, completion token)`。
+    ///
+    /// 与人的回话分开统计——这是票 07 的最后一格：同一张账上答不出「这周谁花的钱」。
+    pub async fn watch_cost_since(&self, since: DateTime<Utc>) -> Result<(usize, u64, u64)> {
+        let row: (i64, i64, i64) = sqlx::query_as(
+            "SELECT COUNT(*), COALESCE(SUM(prompt_tokens), 0), COALESCE(SUM(completion_tokens), 0)
+             FROM kanban_foreman_watch_wakes
+             WHERE outcome IN ('broadcast', 'silent') AND created_at >= ?",
+        )
+        .bind(ts(since))
+        .fetch_one(self.pool())
+        .await?;
+        Ok((row.0 as usize, row.1 as u64, row.2 as u64))
+    }
+
+    /// 唤醒账的年龄清理（与其余各表同口径）。
+    pub async fn purge_watch_wakes(&self, cutoff: DateTime<Utc>) -> Result<u64> {
+        let affected = sqlx::query("DELETE FROM kanban_foreman_watch_wakes WHERE created_at < ?")
+            .bind(ts(cutoff))
+            .execute(self.pool())
+            .await?
+            .rows_affected();
+        Ok(affected)
     }
 
     /// 年龄清理：删掉早于 `cutoff` 的行（含已消费的）。返回删掉的行数。

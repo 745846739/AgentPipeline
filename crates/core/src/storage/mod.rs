@@ -22,7 +22,7 @@ pub mod server_bind;
 pub mod skill_sources;
 pub mod tasks;
 
-pub use attention::{AttentionItem, AttentionKind};
+pub use attention::{AttentionItem, AttentionKind, WatchWakeOutcome};
 pub use foreman::{ForemanMessage, NewForemanMessage};
 pub use skill_sources::SkillSource;
 

@@ -67,6 +67,16 @@ impl Harness {
         self.store.create_foreman_session("").await.unwrap().id
     }
 
+    /// 最近活动的未归档会话 id（值守轮自己挑的那个）。
+    async fn latest_session(&self) -> String {
+        self.store
+            .latest_foreman_session()
+            .await
+            .unwrap()
+            .expect("应当已有会话")
+            .id
+    }
+
     fn runner(&self, agent: FakeAgent) -> ForemanRunner {
         ForemanRunner::new(
             self.store.clone(),
@@ -737,6 +747,172 @@ async fn notice_only_events_do_not_wake_it() {
     let runner = h.runner(agent.clone());
     assert!(runner.watch().await.unwrap().is_none());
     assert_eq!(agent.total_calls(), 0, "慢跑只播报不唤醒");
+}
+
+// ───────────────── 节流与分级诊断（决策 209⑤⑥ / 票 07）─────────────────
+
+#[tokio::test]
+async fn the_same_task_is_not_woken_twice_within_the_cooldown() {
+    // 同任务冷却：刚处理过的任务，新事件不单独唤醒（事件仍在表里，等冷却到期合并播报）。
+    let h = Harness::seeded().await;
+    note(&h, "t1", agentpipeline_core::storage::AttentionKind::TaskPending).await;
+    h.clock.advance_secs(61);
+
+    let mut script = Script::new();
+    script.for_foreman().text("第一轮播报");
+    let agent = FakeAgent::new(script);
+    let runner = h.runner(agent.clone());
+    assert!(runner.watch().await.unwrap().is_some());
+    assert_eq!(agent.total_calls(), 1);
+
+    // 冷却期内又来一条同任务事件
+    note(&h, "t1", agentpipeline_core::storage::AttentionKind::TaskPending).await;
+    h.clock.advance_secs(61);
+    assert!(
+        runner.watch().await.unwrap().is_none(),
+        "冷却期内不再单独唤醒"
+    );
+    assert_eq!(agent.total_calls(), 1, "没有第二次模型调用");
+    assert_eq!(h.store.open_attention(100).await.unwrap().len(), 1, "事件留着");
+
+    // 冷却到期（默认 30 分钟）后合并播报
+    h.clock.advance_secs(30 * 60);
+    let mut second = Script::new();
+    second.for_foreman().text("第二轮播报");
+    agent.set_script(second);
+    assert!(runner.watch().await.unwrap().is_some());
+    assert_eq!(agent.total_calls(), 2);
+    assert!(h.store.open_attention(100).await.unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn hitting_the_hourly_cap_reports_instead_of_dropping_silently() {
+    // 触顶**不是**让值班长闭嘴：留一行「本小时已达上限，N 条待办未播报」，待办不消费。
+    let settings = Settings {
+        watch_max_wakes_per_hour: 1,
+        ..Default::default()
+    };
+    let h = Harness::seeded().await;
+    note(&h, "t1", agentpipeline_core::storage::AttentionKind::TaskPending).await;
+    h.clock.advance_secs(61);
+
+    let mut script = Script::new();
+    script.for_foreman().text("第一轮播报");
+    let agent = FakeAgent::new(script);
+    let runner = h.runner(agent.clone());
+    assert!(runner.watch().await.unwrap().is_some());
+    assert_eq!(agent.total_calls(), 1);
+
+    // 第二件（另一个任务，绕开同任务冷却）
+    note(&h, "t2", agentpipeline_core::storage::AttentionKind::TaskPending).await;
+    h.clock.advance_secs(61);
+    assert!(runner.watch().await.unwrap().is_none(), "触顶：这一次不醒");
+    assert_eq!(agent.total_calls(), 1, "触顶不花钱");
+
+    let messages = h.store.list_foreman_messages(&h.latest_session().await, 100).await.unwrap();
+    let note_row = messages
+        .iter()
+        .find(|m| m.role == "system" && m.content.contains("已达上限"))
+        .expect("触顶要留一行给值班经理，不能静默丢弃");
+    assert!(note_row.content.contains("1 条待办未播报"), "{}", note_row.content);
+    assert_eq!(
+        h.store.open_attention(100).await.unwrap().len(),
+        1,
+        "未播报的待办**不消费**：下一小时继续"
+    );
+
+    // 同一小时内不重复刷这条提示
+    h.clock.advance_secs(61);
+    assert!(runner.watch().await.unwrap().is_none());
+    let again = h
+        .store
+        .list_foreman_messages(&h.latest_session().await, 100)
+        .await
+        .unwrap()
+        .iter()
+        .filter(|m| m.content.contains("已达上限"))
+        .count();
+    assert_eq!(again, 1, "触顶提示一小时只留一条");
+}
+
+#[tokio::test]
+async fn the_automatic_turn_cannot_reach_the_expensive_tools() {
+    // 分级诊断（票 07）：自动那一轮的工具集里**没有** read_conversation 与 run_command；
+    // 被追问（人的那一轮）时同一份名单里**有**它们。
+    let h = Harness::seeded().await;
+    note(&h, "t1", agentpipeline_core::storage::AttentionKind::TaskPending).await;
+    h.clock.advance_secs(61);
+
+    let mut script = Script::new();
+    script.for_foreman().text("播报");
+    script.for_foreman().text("回话");
+    let agent = FakeAgent::new(script);
+    let runner = h.runner(agent.clone());
+    runner.watch().await.unwrap();
+
+    let watch_tools: Vec<String> = agent.request_log()[0]
+        .tools
+        .iter()
+        .map(|t| t.name.clone())
+        .collect();
+    for forbidden in ["read_conversation", "run_command"] {
+        assert!(
+            !watch_tools.contains(&forbidden.to_string()),
+            "自动轮不该拿到 {forbidden}：{watch_tools:?}"
+        );
+    }
+    assert!(
+        watch_tools.contains(&"read_diagnosis".to_string()),
+        "自动轮仍要看得到诊断包（它是台账类）：{watch_tools:?}"
+    );
+
+    runner.say(None, "t1 怎么了？").await.unwrap();
+    let human_tools: Vec<String> = agent
+        .request_log()
+        .last()
+        .expect("人的那一轮也调了模型")
+        .tools
+        .iter()
+        .map(|t| t.name.clone())
+        .collect();
+    for wanted in ["read_conversation", "run_command"] {
+        assert!(
+            human_tools.contains(&wanted.to_string()),
+            "被追问时该拿得到 {wanted}：{human_tools:?}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn the_watch_cost_is_accounted_separately_from_human_turns() {
+    // 「这周值守花了多少」：醒过的次数与 token 在一张**单独的**账上，且静默那一轮也在
+    // （它花了钱，只是没说话）。
+    let h = Harness::seeded().await;
+    note(&h, "t1", agentpipeline_core::storage::AttentionKind::TaskPending).await;
+    h.clock.advance_secs(61);
+    let mut script = Script::new();
+    script.for_foreman().text("播报");
+    let agent = FakeAgent::new(script);
+    let runner = h.runner(agent.clone());
+    assert!(runner.watch().await.unwrap().is_some());
+
+    // 人的一轮不该进这张账
+    runner.say(None, "在吗").await.unwrap();
+
+    let since = h.clock.now() - chrono::Duration::days(7);
+    let (wakes, prompt, completion) = h.store.watch_cost_since(since).await.unwrap();
+    assert_eq!(wakes, 1, "值守这边只记了自动那一轮");
+    assert!(prompt > 0 && completion > 0, "token 也要记：{prompt}/{completion}");
+
+    // 静默那一轮同样入账（花了钱没说话）
+    note(&h, "t2", agentpipeline_core::storage::AttentionKind::TaskPending).await;
+    h.clock.advance_secs(61);
+    let mut silent = Script::new();
+    silent.for_foreman().text("【无需处理】");
+    agent.set_script(silent);
+    assert!(runner.watch().await.unwrap().is_none());
+    let (wakes, _, _) = h.store.watch_cost_since(since).await.unwrap();
+    assert_eq!(wakes, 2, "静默轮也花了钱，必须入账");
 }
 
 // ─────────────────────── 诊断包（决策 211③ / 票 03）───────────────────────

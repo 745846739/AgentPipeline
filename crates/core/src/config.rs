@@ -74,6 +74,12 @@ pub struct Settings {
     ///
     /// 它换来的是「不为一件事吵两次」；代价是响得慢一点——夜里值守最不缺的就是时间。
     pub watch_debounce_sec: u64,
+    /// **同任务冷却**（分钟，决策 209⑤ / 票 07）：刚被处理过的任务，新事件不单独唤醒，
+    /// 留在待办表里等冷却到期后合并播报。判据是「这个任务最近有没有被消费过的待办」。
+    pub watch_task_cooldown_minutes: u64,
+    /// **全局唤醒上限**（次/小时，决策 209⑤ / 票 07）。触顶时不再唤醒，但**不静默丢弃**：
+    /// 留一行「本小时已达上限，N 条待办未播报」，待办不消费，下一小时继续。
+    pub watch_max_wakes_per_hour: u64,
 }
 
 impl Default for Settings {
@@ -108,6 +114,8 @@ impl Default for Settings {
             watch_event_window_minutes: 30,
             watch_owner_stuck_minutes: 10,
             watch_debounce_sec: 60,
+            watch_task_cooldown_minutes: 30,
+            watch_max_wakes_per_hour: 12,
         }
     }
 }
@@ -148,6 +156,8 @@ pub struct PipelineOverrides {
     pub watch_event_window_minutes: Option<u64>,
     pub watch_owner_stuck_minutes: Option<u64>,
     pub watch_debounce_sec: Option<u64>,
+    pub watch_task_cooldown_minutes: Option<u64>,
+    pub watch_max_wakes_per_hour: Option<u64>,
 }
 
 impl PipelineOverrides {
@@ -188,6 +198,8 @@ impl PipelineOverrides {
             watch_event_window_minutes,
             watch_owner_stuck_minutes,
             watch_debounce_sec,
+            watch_task_cooldown_minutes,
+            watch_max_wakes_per_hour,
         );
         // 非法值由 [`Config::validate`] 在解析期拦下（fail fast），故这里只做「认得出就采用」
         // ——两处都报错会让同一个错误有两个出口，而这里没有 `Result` 可返回。

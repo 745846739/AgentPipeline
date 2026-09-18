@@ -460,6 +460,7 @@ async fn run_env_tool(
         FOREMAN_STAGE_KEY,
         cfg.as_ref(),
     );
+    // 按键执行那一趟不分级（票 07 的分级只针对自动轮）：人已经按下了那颗钮。
     let (tools, ctx) = foreman_tooling(
         &state.store,
         &state.settings,
@@ -468,6 +469,8 @@ async fn run_env_tool(
         &proposal.session_id,
         env_mode,
         ForemanMoment::ConfirmedPress,
+        // 不分级：人已经按下了那颗钮，这一趟不是「自动轮」
+        &[],
     );
     let call = agentpipeline_core::agent::client::ToolCall {
         id: proposal.id.clone(),

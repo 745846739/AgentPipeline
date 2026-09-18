@@ -119,5 +119,7 @@ graph TD
 | `watch_event_window_minutes` | 30 | 值班长待办只收**这么新**的事件；同时是「同一任务在窗口内再次 pending」的计数窗口（决策 209②，票 05） |
 | `watch_owner_stuck_minutes` | 10 | 判「卡住」的宽限：`scheduler_no_effect`（run 已终态而游标仍 active）与 `owner_stuck`（有主但心跳停了）都用它（票 05） |
 | `watch_debounce_sec` | 60 | 值守轮的去抖窗口：窗口内攒批、到期唤醒一次；窗口内没有新事件则一次都不醒（票 06） |
+| `watch_task_cooldown_minutes` | 30 | 同任务冷却：刚处理过的任务，新事件不单独唤醒，等冷却到期后合并播报（票 07） |
+| `watch_max_wakes_per_hour` | 12 | 全局唤醒上限（次/小时）；触顶不再唤醒但留一行「N 条待办未播报」，待办不消费（票 07） |
 
 > 阶段级 Agent 配置（provider / model 覆盖、prompt 覆盖、工具集等）不在本表，见 [agents.md](agents.md) §10.6。

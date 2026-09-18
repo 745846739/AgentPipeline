@@ -271,9 +271,21 @@ pub fn foreman_tool_names(layer: ForemanToolLayer) -> Vec<&'static str> {
 /// 只读台账工具**不受档位影响**（它们不在 [`crate::agent::tools::ENV_TOOLS`] 里）：
 /// `deny` 收的是「能碰机器」的手，不是「能读台账」的眼。
 pub fn foreman_available_tools(mode: crate::types::EnvMode) -> Vec<&'static str> {
+    foreman_available_tools_except(mode, &[])
+}
+
+/// 同 [`foreman_available_tools`]，再摘掉一层（分级诊断，票 07）。
+///
+/// 广告集与执行点白名单**仍然同源**：两处都从这里来，故「模型看得见一个调用就被拒的工具」
+/// 这件事在自动轮里也不会发生——分级诊断最容易犯的错就是把工具只从执行点摘掉。
+pub fn foreman_available_tools_except(
+    mode: crate::types::EnvMode,
+    deny: &[&str],
+) -> Vec<&'static str> {
     FOREMAN_TOOL_SPECS
         .iter()
         .filter(|s| !crate::agent::tools::denied_by_tier(s.name, mode))
+        .filter(|s| !deny.contains(&s.name))
         .map(|s| s.name)
         .collect()
 }
@@ -325,6 +337,8 @@ pub fn foreman_tooling(
     session_id: &str,
     env_mode: crate::types::EnvMode,
     moment: ForemanMoment,
+    // 分级诊断（票 07）：这一轮再摘掉哪些工具。空 = 不摘（人的那一轮）。
+    deny: &[&str],
 ) -> (ToolExecutor, ToolCallContext) {
     // 值班长的域就是家目录根（决策 207 的「分两组」：流水线阶段仍限任务工作区），
     // 并按路径前缀拒掉 `data/` 与 `logs/`——库里明文存着 provider 密钥（决策 112），
@@ -341,7 +355,7 @@ pub fn foreman_tooling(
     // 也要留一行，否则策略在审计面完全不可见，只剩模型侧的一次报错。
     .with_recorder(Arc::new(store.clone()))
     .with_env_mode(env_mode)
-    .with_allowed_tools(foreman_available_tools(env_mode));
+    .with_allowed_tools(foreman_available_tools_except(env_mode, deny));
     let tools = match moment {
         // 提议接缝只在对话轮注入。按键执行那一次若还带着它，`ask` 档会把执行改成再提一条。
         ForemanMoment::ConfirmedPress => tools.confirmed_once(),
@@ -371,6 +385,17 @@ pub const FOREMAN_WATCH_MARK: &str = "【值守播报】";
 /// 漏报一条真问题比多播一条便宜（§2.4 的静默规则是为**历史窗口预算**设的，
 /// 不是为省 token 设的）。
 pub const FOREMAN_NO_ACTION_MARK: &str = "【无需处理】";
+
+/// 分级诊断（决策 209⑥ / 票 07）：**自动那一轮**不许用的工具。
+///
+/// 判据是「这一次你不在场」——主动播报是「固定成本 × 时间」，而你不在场时没有任何收益
+/// 能摊平它。贵的两件事各一：
+/// - `read_conversation`：一次最多 12k 字符的会话原文；
+/// - `run_command`：在本机上跑命令。
+///
+/// 两者在**被追问时**照常可用（那是人的那一轮，`say` 走的是完整工具集）——所以这不是
+/// 削减能力，是**分级**：自动轮只读台账与诊断包摘要（`read_diagnosis` 自带 12k 上限）。
+pub const FOREMAN_WATCH_TOOL_DENY: [&str; 2] = ["read_conversation", "run_command"];
 
 /// 一次值守轮最多把多少条待办喂进简报。
 ///
@@ -901,6 +926,14 @@ impl ForemanRunner {
         // 每轮全失效（§12.13.5）。
         let user_prompt = briefing.render();
 
+        // 分级诊断（票 07）：自动那一轮摘掉贵的两件（会话原文 / 跑命令）。摘在**源头上**
+        // ——广告集与执行点白名单都从这一份名单来，故「模型看得见一个调用就被拒的工具」
+        // 这件事在自动轮里同样不会发生。
+        let deny: &[&str] = if input.is_watch() {
+            &FOREMAN_WATCH_TOOL_DENY
+        } else {
+            &[]
+        };
         let (tools, ctx) = foreman_tooling(
             &self.store,
             &self.settings,
@@ -909,6 +942,7 @@ impl ForemanRunner {
             &session.id,
             env_mode,
             ForemanMoment::Conversation,
+            deny,
         );
 
         // 三种角色 → 两种说话的立场（决策 204 / 207）。**操作台记的那几轮（`system`）必须与
@@ -945,7 +979,7 @@ impl ForemanRunner {
             _ => transcript.push(Message::user(input.transcript_text())),
         }
 
-        let tool_defs = Self::tool_defs(env_mode);
+        let tool_defs = Self::tool_defs(env_mode, deny);
         let mut tokens = (0u32, 0u32);
         let mut traces: Vec<ForemanTrace> = Vec::new();
         let mut reply: Option<String> = None;
@@ -1104,21 +1138,80 @@ impl ForemanRunner {
             .store
             .open_attention(FOREMAN_ATTENTION_FETCH_LIMIT)
             .await?;
-        let waking: Vec<_> = open.iter().filter(|i| i.kind.wakes()).collect();
-        if waking.is_empty() {
+        let candidates: Vec<_> = open.iter().filter(|i| i.kind.wakes()).collect();
+        if candidates.is_empty() {
             // 空闲时**零次模型调用**（票 06 的牙齿之一）
             return Ok(None);
         }
         // 去抖：从**最早那件**算窗口。攒批的代价是响得慢一点，收益是不为一件事吵两次；
         // 窗口过后的第一趟就把窗口内所有件一起带上（不许丢事件）。
         let debounce = chrono::Duration::seconds(self.settings.watch_debounce_sec as i64);
-        if let Some(oldest) = waking.iter().map(|i| i.created_at).min() {
+        if let Some(oldest) = candidates.iter().map(|i| i.created_at).min() {
             if self.store.now() - oldest < debounce {
                 return Ok(None);
             }
         }
-        let brief = render_watch_brief(&waking);
+        // 同任务冷却（决策 209⑤ / 票 07）：刚被处理过的任务，新事件**不单独唤醒**——
+        // 留在表里不消费，冷却到期后与那时的事件合并播报。判据是「这个任务最近有没有
+        // 被消费过的待办」：那一行就是「刚有人看过它」的账。
+        let cooldown = chrono::Duration::minutes(self.settings.watch_task_cooldown_minutes as i64);
+        let mut waking = Vec::new();
+        for item in candidates {
+            let recently_handled = self
+                .store
+                .count_consumed_attention_since(&item.task_id, self.store.now() - cooldown)
+                .await?
+                > 0;
+            if !recently_handled {
+                waking.push(item);
+            }
+        }
+        if waking.is_empty() {
+            // 全在冷却里：这一趟不说话（事件仍在表里，等下一条路）
+            return Ok(None);
+        }
         let session = self.resolve_session(None).await?;
+
+        // 全局唤醒上限（决策 209⑤）：触顶时**不静默丢弃**——留一行「本小时已达上限，
+        // N 条待办未播报」给值班经理，且同一小时只留一行（否则触顶本身变成刷屏源）。
+        // 待办**不消费**：下一小时继续，一条不丢。
+        let hour_ago = self.store.now() - chrono::Duration::hours(1);
+        let wakes = self.store.count_watch_wakes_since(hour_ago).await?;
+        if wakes >= self.settings.watch_max_wakes_per_hour as usize {
+            let noted = self
+                .store
+                .count_watch_wakes_with(
+                    crate::storage::attention::WatchWakeOutcome::Capped,
+                    hour_ago,
+                )
+                .await?;
+            if noted == 0 {
+                let content = format!(
+                    "【值守】本小时唤醒已达上限（{} 次），{} 条待办未播报；下一小时继续，不会丢。",
+                    self.settings.watch_max_wakes_per_hour,
+                    waking.len()
+                );
+                if let Err(e) = self
+                    .store
+                    .append_foreman_message(NewForemanMessage::system(session.id.clone(), content))
+                    .await
+                {
+                    tracing::error!(session = %session.id, "触顶提示写不进去：{e}");
+                }
+                self.store
+                    .record_watch_wake(
+                        Some(&session.id),
+                        crate::storage::attention::WatchWakeOutcome::Capped,
+                        waking.len(),
+                        0,
+                        0,
+                    )
+                    .await?;
+            }
+            return Ok(None);
+        }
+
+        let brief = render_watch_brief(&waking);
         match self.respond(&session, TurnInput::WatchBrief(brief)).await {
             Ok(turn) => {
                 let ids: Vec<i64> = waking.iter().map(|i| i.id).collect();
@@ -1126,7 +1219,23 @@ impl ForemanRunner {
                     // 消费失败只记日志：下一趟会重复看到这批事件，多醒一次比丢事件便宜
                     tracing::error!(session = %session.id, "值守轮消费待办失败：{e}");
                 }
-                if turn.reply.trim_start().starts_with(FOREMAN_NO_ACTION_MARK) {
+                let silent = turn.reply.trim_start().starts_with(FOREMAN_NO_ACTION_MARK);
+                // 唤醒账（票 07）：静默那一轮**也花钱**，故它同样入账——数「花了多少」
+                // 与数「醒了几次」用的是同一张表（会话行那边漏掉静默轮）。
+                self.store
+                    .record_watch_wake(
+                        Some(&session.id),
+                        if silent {
+                            crate::storage::attention::WatchWakeOutcome::Silent
+                        } else {
+                            crate::storage::attention::WatchWakeOutcome::Broadcast
+                        },
+                        waking.len(),
+                        turn.prompt_tokens,
+                        turn.completion_tokens,
+                    )
+                    .await?;
+                if silent {
                     Ok(None)
                 } else {
                     Ok(Some(turn))
@@ -1195,8 +1304,8 @@ impl ForemanRunner {
     /// 手写这两个 `ToolDef` 的时候，广告集与执行点白名单是两份独立的名单，而
     /// 「同源」是票 01 的硬要求：两处各写一份名字，迟早出现「模型看得见一个调用就被拒
     /// 的工具」这种不好定位的错。
-    fn tool_defs(env_mode: crate::types::EnvMode) -> Vec<ToolDef> {
-        let available = foreman_available_tools(env_mode);
+    fn tool_defs(env_mode: crate::types::EnvMode, deny: &[&str]) -> Vec<ToolDef> {
+        let available = foreman_available_tools_except(env_mode, deny);
         FOREMAN_TOOL_SPECS
             .iter()
             .filter(|spec| available.contains(&spec.name))
