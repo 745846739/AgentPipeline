@@ -69,3 +69,15 @@ cargo / pytest / npm 映射好；本仓的 lint 是 `cargo clippy --all-targets 
 **「不试无用的 resume」**：诊断结论若是「流水线自身的 bug」，代码不变 → resume 必然同样卡住。
 出 diff + 播报 + 标「等修复合入」，**不吃票 08 的 N 次配额**。一个能撑过 `agent_retry_max = 3`
 才失败的东西，重跑一次几乎必然同样失败。
+
+## 闸门跑通后补记（2026-09-18）
+
+**闸门命令的归属此前写错了**：`run_gate_command` 按「修复既不是任务也不是值班会话」把
+`task_id` / `session_id` 一起留空，而迁移 0012 的 CHECK 是**严格 XOR**
+（`(task_id IS NOT NULL) <> (session_id IS NOT NULL)`，`0012_foreman_sessions.sql:91`），
+存储层的归属归一（`observability.rs:1098`）也要求恰好一个——于是这条路径**根本跑不到落账**
+（`Validation("命令必须恰好属于一个归属…")`），三条修复用例因此红在 `run_repair_gate` 上。
+归到**那一班**是对的：修复是值班长在一次对话里决定做的事，「它为了这次修复跑了什么」应当与
+它别的命令排在同一条时间线上，而不是另开一个界面去找。落地：`RepairSession` 多一个必填的
+`session_id`，`start_repair` 多收一个参数，用例侧新增断言把它钉住（命令台账里 cwd 就是修复
+worktree）。

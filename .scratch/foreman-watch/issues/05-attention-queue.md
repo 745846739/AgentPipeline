@@ -75,3 +75,19 @@
 
 **别把「发现」和「唤醒」混在一票里**：发现是确定性的、便宜的、每一 tick 都跑的；
 唤醒是要花 token 的。混在一起之后就没法单独测「不该唤醒时是否真的没唤醒」。
+
+## 闸门跑通后补记（2026-09-18）
+
+**`owner_stuck` 有一条成立前提，票面没写、用例原先也没摆对**：它要求「该节点的空闲超时
+**长于** `watch_owner_stuck_minutes`」。空闲超时若先到（缺省 300s < 停跳线 10 分钟），
+`check_timeouts` 会把 run 标终态，于是看到的是「处置未生效」那一类；`owner_stuck` 管的是
+另一种局面——清扫暂时不会来（长跑节点把空闲超时按小时配），而主已经不在了。用例改成按长跑
+节点配（`node_idle_timeout_sec = 7200`）并在注释里写清这条前提，否则它测的是一个到不了的态。
+
+用例侧还有一处**此前一直假绿**的写法：`Harness::running_run` / `finished_run` 把 run 的
+`(stage, node)` 写死成 `develop.execute`，而 `seed_task` 建的游标停在 `init.execute`。
+超时清扫按 run 自己那一行判，所以那些用例照过；而按 `(task, stage, node)` 找 run 的两个读法
+（本票的 `owner_stuck` / `scheduler_no_effect`）会一条都找不到——判据永远返回「没卡住」。
+两个 helper 改成从游标取 `(stage, node)`，需要 run 落在 develop.execute 的用例（超时分层、
+自适应分位数）先把游标推过去（`Harness::advance_to_develop`），因为那些读数**本来就是**
+按节点取配置与样本的。

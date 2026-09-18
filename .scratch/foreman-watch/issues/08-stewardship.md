@@ -79,3 +79,19 @@
 `scheduler/mod.rs:255-287`、冲突释放 `:293-343`、依赖放行 `:347-408`、准入重试 `:412-436`），
 都不需要人按键。所以这条墙真正拦的不是「自动」，而是「**判断来自 LLM**」。托管放开的正是这一点，
 放开的范围因此必须窄到可审计。
+
+## 闸门跑通后补记（2026-09-18）
+
+**托管能免按键动的那一格，比票面读起来更窄**：`continue` 是不是合法动作，由**当前 pending 的
+种类**决定（`actions::allowed_actions` 逐行实现 §5 那张表）。例如 `retry_exhausted` 那一档只有
+goto / skip / cancel——**没有 `continue`**；于是对这类卡住的任务，托管一格都放不开，值班长只能
+提议。真正含 `continue` 的是 `info_insufficient`、`dependency_failed`、
+`judge_disagreement`（「裁决合格，继续」）、`dirty_worktree`（「我已手动处理，继续合入」）。
+
+这是对的设计（状态机的允许集合是权威，托管只是免掉按键，不改写「哪些动作合法」），但票面
+只写了「放开 `resume(continue)`」，没写「那一格里到底有几个待办种类用得上」。落点在
+`apply_resume` 的 `is_action_allowed` 这道既有校验上——它同时是这条窄门的执行者。
+
+端到端用例原先拿 `retry_exhausted` 做样本，于是 `continue` 被状态机正当地拒掉、游标仍是
+pending——它测的是一个**到不了的态**。改成 `judge_disagreement` 那一档，并在用例注释里写明
+为什么必须挑这一档。
