@@ -52,6 +52,10 @@ vi.mock('../api/client', () => ({
   listProviders: vi.fn(async () => []),
   retryTask: vi.fn(async () => undefined),
   archiveTask: vi.fn(async () => undefined),
+  // 托管开关（票 14）：接线状态那一读在**这个文件里不摆那颗钮**（默认未接线），
+  // `set` 也只是让组件能 import——它的行为由 `lib/stewardship.test.ts` 钉。
+  getForemanSessions: vi.fn(async () => ({ sessions: [] })),
+  setStewardship: vi.fn(async () => ({ ok: true })),
 }));
 
 const DIFF_RAW = [
@@ -83,6 +87,7 @@ function pendingTask(): Task {
     },
     worktree_path: null,
     branch_name: 'kanban/task-1',
+    stewardship: null,
     total_tokens: 1234,
     total_calls: 7,
     review_mode: 'agent',

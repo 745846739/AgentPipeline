@@ -32,6 +32,25 @@ async fn fixture() -> (TestHome, Store, ManualClock, Repo) {
     (home, store, clock, repo)
 }
 
+/// 一个**真 git 仓**接成的项目行（修复的判据要求路径下真有 `.git`，见 `repair_supported`）。
+///
+/// `test_framework` 直接写命令原文而不是语言名：`test_command_for` 认不出的名字**原样返回**，
+/// 于是 `"true"` / `"false"` 就是一对恒真恒假的闸门。本文件测的是「闸门过了 / 没过之后各发生
+/// 什么」，不该顺带跑一次真的 `cargo test`——那是分钟级的，且把被测的东西埋进噪声里。
+fn project_for(repo: &Repo, test_framework: &str) -> Project {
+    Project {
+        id: "p1".into(),
+        name: "示例".into(),
+        local_path: repo.path().display().to_string(),
+        default_branch: "main".into(),
+        language: None,
+        test_framework: Some(test_framework.into()),
+        lint_command: None,
+        agents_md_path: None,
+        created_at: chrono::Utc::now(),
+    }
+}
+
 /// 票 10：从零拉起一个修复 worktree——分支从正确 base 分出、目录在家下、**值班长写得进**。
 #[tokio::test]
 async fn a_repair_worktree_lives_under_home_and_is_writable_by_the_foreman() {
@@ -272,6 +291,168 @@ async fn a_passing_gate_leads_to_a_marked_commit_and_a_scoped_diff() {
     assert!(path.exists());
 }
 
+/// 收口序列的前半：**闸门不过就停在原地**——没有 commit、没有 diff 文件、没有提议。
+///
+/// 三样都要断言，因为票 11 那条边界是「不出 diff」，而它最容易被实现成「出了但没给人看」：
+/// 那样人早上审的就是一份没验过的补丁，而它带着一条提议的完整外壳。
+#[tokio::test]
+async fn a_failed_gate_round_stops_before_commit_diff_and_proposal() {
+    use agentpipeline_core::pipeline::repair::{finish_repair_round, RepairRound};
+
+    let (home, store, clock, repo) = fixture().await;
+    let project = project_for(&repo, "false");
+    let session = start_repair(
+        home.home(),
+        repo.path(),
+        "main",
+        &new_repair_id(),
+        &foreman_session(&store).await,
+    )
+    .await
+    .unwrap();
+    std::fs::write(session.worktree.join("half_done.rs"), "pub fn half() {}\n").unwrap();
+
+    let round = finish_repair_round(
+        &store,
+        home.home(),
+        &project,
+        &session,
+        "改了一半",
+        None,
+        agentpipeline_core::clock::Clock::now(&clock),
+    )
+    .await
+    .unwrap();
+
+    match round {
+        RepairRound::GateFailed { gate, note } => {
+            assert_ne!(gate[0].exit_code, 0, "闸门读数要如实记失败");
+            assert!(note.contains("test"), "失败说明要点名是哪一步：{note}");
+        }
+        other => panic!("闸门不过时不该走到 commit / diff / 提议：{other:?}"),
+    }
+    assert_eq!(
+        repo.head("main"),
+        repo.head(&session.branch),
+        "闸门不过就不该有 commit"
+    );
+    assert!(
+        !home
+            .home()
+            .worktrees_dir()
+            .join(format!("repair-{}.diff", session.repair_id))
+            .exists(),
+        "闸门不过时**不该落 diff 文件**——它就是人早上要审的那份东西"
+    );
+    assert!(
+        store
+            .list_pending_foreman_proposals(&session.session_id)
+            .await
+            .unwrap()
+            .is_empty(),
+        "闸门不过时不该有提议：那会让人以为有东西可合"
+    );
+}
+
+/// 收口序列的后半：闸门过了 → 带标记的 commit + diff 落盘 + **一条不设 TTL 的修复提议**。
+///
+/// 这三样是「值班长说它改完了」这句话的全部凭证。断言提议是**待办列表里**那一条
+/// （而不是只看返回值）：人按的是列表里的行，返回值只是给模型看的。
+#[tokio::test]
+async fn a_passing_gate_round_lands_the_commit_the_diff_and_the_repair_proposal() {
+    use agentpipeline_core::pipeline::repair::{finish_repair_round, RepairRound};
+    use agentpipeline_core::storage::proposals::ForemanProposalKind;
+
+    let (home, store, clock, repo) = fixture().await;
+    let project = project_for(&repo, "true");
+    let session = start_repair(
+        home.home(),
+        repo.path(),
+        "main",
+        &new_repair_id(),
+        &foreman_session(&store).await,
+    )
+    .await
+    .unwrap();
+    std::fs::write(
+        session.worktree.join("fixed.rs"),
+        "pub fn fixed() -> i32 { 42 }\n",
+    )
+    .unwrap();
+
+    let now = agentpipeline_core::clock::Clock::now(&clock);
+    let round = finish_repair_round(
+        &store,
+        home.home(),
+        &project,
+        &session,
+        "补上缺的约束",
+        None,
+        now,
+    )
+    .await
+    .unwrap();
+
+    let RepairRound::Proposed {
+        outcome,
+        proposal_id,
+        summary,
+    } = round
+    else {
+        panic!("闸门过了就该收口成一条提议");
+    };
+    assert!(outcome.gate_passed);
+    assert!(
+        outcome
+            .diff
+            .as_deref()
+            .unwrap_or_default()
+            .contains("fixed.rs"),
+        "载荷里的 diff 要带上改动"
+    );
+    let commit = outcome.commit.clone().expect("闸门过了就该有 commit");
+    assert_eq!(repair_head(repo.path(), &session).await.unwrap(), commit);
+    let message = repo.git(&["log", "--format=%s", "-1", &session.branch]);
+    assert!(
+        message.contains(REPAIR_COMMIT_MARK),
+        "commit 要带可检索的标记：{message}"
+    );
+    assert!(
+        home.home()
+            .worktrees_dir()
+            .join(format!("repair-{}.diff", session.repair_id))
+            .exists(),
+        "diff 要落成可读文件——提议面板要能展开全文"
+    );
+
+    let proposals = store
+        .list_pending_foreman_proposals(&session.session_id)
+        .await
+        .unwrap();
+    let proposal = proposals
+        .iter()
+        .find(|p| p.id == proposal_id)
+        .expect("提议要出现在待办列表里（人按的是那一行）");
+    assert_eq!(proposal.kind, ForemanProposalKind::Repair);
+    assert!(proposal.payload.is_some(), "载荷里要有 diff 与闸门读数");
+    assert!(
+        !proposal.is_expired(now + chrono::Duration::hours(8)),
+        "修复提议不设 TTL：早上看到的要是可按键的那一行"
+    );
+    assert_eq!(summary, proposal.summary);
+    assert!(
+        summary.contains(&session.branch) && summary.contains(&project.name),
+        "摘要要说清合哪个分支、修哪个项目：{summary}"
+    );
+    // 闸门读数归属那一班：只配了测试命令，于是只该有一条
+    let commands = store
+        .list_foreman_commands(&session.session_id)
+        .await
+        .unwrap();
+    assert_eq!(commands.len(), 1);
+    assert_eq!(commands[0].source.as_str(), "system");
+}
+
 /// 票 11：本仓那一路**不许热修、不许自己重启**——修复产物一律落在 worktree 里。
 #[tokio::test]
 async fn the_repair_never_touches_the_project_working_tree() {
@@ -330,17 +511,7 @@ async fn a_repair_proposal_survives_the_night() {
     use agentpipeline_core::storage::proposals::ForemanProposalKind;
 
     let (home, store, clock, repo) = fixture().await;
-    let project = Project {
-        id: "p1".into(),
-        name: "示例".into(),
-        local_path: repo.path().display().to_string(),
-        default_branch: "main".into(),
-        language: None,
-        test_framework: Some("true".into()),
-        lint_command: None,
-        agents_md_path: None,
-        created_at: agentpipeline_core::clock::Clock::now(&clock),
-    };
+    let project = project_for(&repo, "true");
     let session_id = store.create_foreman_session("夜班").await.unwrap().id;
     let session = start_repair(
         home.home(),

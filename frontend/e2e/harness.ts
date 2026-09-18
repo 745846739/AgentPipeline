@@ -127,6 +127,11 @@ export interface App {
   /** 后端进程 stderr/stdout 的环形缓冲（诊断与日志断言用，主流程票 06/07）。 */
   backendLogs(): string[];
   /**
+   * **事后换值班长的脚本轮**（testkit `set_script` 的等价物）——供「下一轮要用前一轮产出的
+   * id」这类用例（修复那条链：`repair_id` 由后端生成）。
+   */
+  setForemanRounds(rounds: Step[][]): void;
+  /**
    * 修复 provider（主流程票 03）：把 base_url 从坏 mock 切回脚本 mock，
    * 模拟「用户到设置页改好了 base_url / api_key」。仅在 `badProvider` 下有意义。
    */
@@ -247,6 +252,7 @@ async function startMockLlm(
   close: () => Promise<void>;
   prompts: () => Array<{ system: string; user: string }>;
   bindTask: (taskId: string, title: string) => void;
+  setRounds: (key: string, rounds: Step[][]) => void;
 }> {
   const state: MockState = {
     rounds: new Map(Object.entries(script).map(([k, v]) => [k, v.map((r) => [...r])])),
@@ -336,6 +342,23 @@ async function startMockLlm(
     prompts: () => promptLog.map((p) => ({ ...p })),
     bindTask: (taskId, taskTitle) => {
       boundIds.set(taskId, taskTitle);
+    },
+    /**
+     * **事后换脚本**（testkit `set_script` 的等价物）。
+     *
+     * 为什么需要它：有些值只有**跑起来之后**才知道（后端生成的 `project_id`、修复 id），
+     * 而脚本在 `startApp` 之前就写死了——本文件那一列路由注释记的正是这个口子缺着的代价
+     * （「mock 没有事后注入脚本的口子」）。补上它之后，多轮之间就能按前一轮的产出改下一轮。
+     *
+     * 轮指针归零：下一次「新轮」从新脚本的第 0 轮开始（与 testkit 逐轮重设同一语义）。
+     */
+    setRounds: (key: string, rounds: Step[][]) => {
+      state.rounds.set(
+        key,
+        rounds.map((r) => [...r]),
+      );
+      state.round.set(key, -1); // 下一次新轮 → 索引 0（服务那一刻会 +1）
+      state.step.set(key, 0);
     },
   };
 }
@@ -634,6 +657,7 @@ export async function startApp(opts: StartOptions): Promise<App> {
       getTask: () => getJson<Record<string, unknown>>(apiBase, `/tasks/${taskId}`),
       prompts: () => mock.prompts(),
       backendLogs: () => [...backendLog],
+      setForemanRounds: (rounds) => mock.setRounds(FOREMAN, rounds),
       fixProvider: async () => {
         if (!bad || !providerId)
           throw new Error('fixProvider() 仅在 badProvider 模式下有意义');

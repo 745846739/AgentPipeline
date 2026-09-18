@@ -109,6 +109,135 @@ pub async fn start_repair(
     })
 }
 
+/// 按 `repair_id` 重建一次修复的现场（票 10 的路径与分支命名是**确定**的，故重建只差一个
+/// base 的解析）。
+///
+/// 为什么要能重建：值班长的工具调用是**一轮一次**的，`repair(action=start)` 与
+/// `repair(action=finish)` 之间隔着整个「改代码」的过程——现场不可能留在内存里，
+/// 只能靠 id 从命名规则复原（这也正是票 10 要求「命名自洽」的用处）。
+pub async fn repair_session_for(
+    home: &Home,
+    project_path: &Path,
+    default_branch: &str,
+    repair_id: &str,
+    session_id: &str,
+) -> Result<RepairSession> {
+    Ok(RepairSession {
+        repair_id: repair_id.to_string(),
+        session_id: session_id.to_string(),
+        worktree: home.repair_worktree_path(repair_id),
+        branch: Git::repair_branch_for(repair_id),
+        // 与 `start_repair` 走同一个解析（有 `origin` 用 `origin/{default}`）：diff 的范围是
+        // `{base}..{branch}`，两处解析出不同的名字就等于量错了范围。
+        base_ref: Git.base_ref(project_path, default_branch).await?,
+    })
+}
+
+/// 一次修复轮的收口结果（决策 210④⑤ / 票 11、12）。
+#[derive(Debug, Clone, PartialEq)]
+pub enum RepairRound {
+    /// 闸门没过：**没有 commit、没有 diff、没有提议**——「改完」这句话还不成立。
+    GateFailed {
+        gate: Vec<GateReading>,
+        note: String,
+    },
+    /// 闸门过了：已 commit（带标记）、已出 diff、已落一条不设 TTL 的提议。
+    ///
+    /// `outcome` 是**装箱**的：它是这一族里唯一的大载荷（272 字节，其余变体只有几十），
+    /// 而 clippy 的 `large_enum_variant` 拦正是拦这个——按值传一个被立刻拆开的结果不值当。
+    Proposed {
+        outcome: Box<RepairOutcome>,
+        proposal_id: String,
+        summary: String,
+    },
+}
+
+/// 把一次修复**收口**：闸门 → （过了才）commit → diff → 落提议 → 两处留痕。
+///
+/// 整条序列写在**一个**函数里，而不是散在工具分派那几行：每一步都有「不做会怎样」的后果
+/// （不过闸门就不许出 diff、commit 必须带标记、提议必须带载荷与不设 TTL），散开写迟早漂成
+/// 「某条路少了一步」。工具层因此只剩「按动作分派」。
+///
+/// `task_id` 是这条修复为之而做的任务（可选）：给了就留两处痕——班次里一条
+/// 「等修复合入」（人读对话时知道它在等什么），**任务上**也一句（人在看板上看那条任务时
+/// 知道它在等什么）。两处都要，因为它们回答的是两个场景的问题（票 11 / 决策 210⑨）。
+pub async fn finish_repair_round(
+    store: &Store,
+    home: &Home,
+    project: &crate::types::Project,
+    session: &RepairSession,
+    conclusion: &str,
+    task_id: Option<&str>,
+    now: DateTime<Utc>,
+) -> Result<RepairRound> {
+    let gate = run_repair_gate(
+        store,
+        home,
+        session,
+        project.lint_command.as_deref(),
+        project.test_framework.as_deref(),
+    )
+    .await?;
+    let failed = gate.iter().any(|r| r.exit_code != 0);
+    if failed {
+        return Ok(RepairRound::GateFailed {
+            note: gate_failure_note(&gate),
+            gate,
+        });
+    }
+
+    let commit = commit_repair(session, conclusion, now).await?;
+    let (diff, diff_stat) = repair_diff(Path::new(&project.local_path), session).await?;
+    write_repair_diff(home, &session.repair_id, &diff)?;
+    let outcome = RepairOutcome {
+        repair_id: session.repair_id.clone(),
+        worktree_path: session.worktree.display().to_string(),
+        branch: session.branch.clone(),
+        base_ref: session.base_ref.clone(),
+        base_commit: Git
+            .rev_parse(Path::new(&project.local_path), &session.base_ref)
+            .await?,
+        gate_passed: true,
+        gate,
+        commit: Some(commit),
+        diff: Some(diff),
+        diff_stat: Some(diff_stat),
+    };
+    let proposal = propose_repair(store, &session.session_id, project, &outcome).await?;
+    if let Some(task_id) = task_id {
+        // 两处留痕都是**善后**：写不进去不该让「这次修复已经就绪」这件事变成一次失败——
+        // 提议已经落库了，那才是人按键的地方。故各留一条 warn。
+        let note = format!("等修复合入（修复 {} 已过闸门）", session.repair_id);
+        if let Err(e) = store
+            .append_foreman_message(crate::storage::NewForemanMessage::system(
+                &session.session_id,
+                format!(
+                    "【等修复合入】任务 {task_id} 的修复已就绪（{}）：{}——合入之前那条任务不会\
+                     自己往前走。",
+                    session.repair_id, proposal.summary
+                ),
+            ))
+            .await
+        {
+            tracing::warn!(%task_id, "「等修复合入」的班次留痕写不进去：{e}");
+        }
+        match store.note_task_awaiting_repair_merge(task_id, &note).await {
+            // 任务不在 pending 上：它没有在等任何东西，这句话无处可写——不是故障，故只是 debug
+            // （修复一条没停下来的任务是正常用法，不是要人处理的事）。
+            Ok(false) => {
+                tracing::debug!(%task_id, "任务不在 pending 上，「等修复合入」只落在班次里")
+            }
+            Ok(true) => {}
+            Err(e) => tracing::warn!(%task_id, "「等修复合入」的任务留痕写不进去：{e}"),
+        }
+    }
+    Ok(RepairRound::Proposed {
+        summary: proposal.summary.clone(),
+        proposal_id: proposal.id,
+        outcome: Box::new(outcome),
+    })
+}
+
 /// 跑闸门（决策 210④ / 票 11）：lint（如配置）+ 测试，**全过才算改完**。
 ///
 /// 命令与 executor 的系统闸门**同一处映射**（`test_command_for`）：两处各写一份的下场是
@@ -297,6 +426,69 @@ pub async fn finish_repair(
 /// 修复分支当前的 commit（不存在时报错——「合入」前要确认它还在）。
 pub async fn repair_head(project_path: &Path, session: &RepairSession) -> Result<String> {
     Git.rev_parse(project_path, &session.branch).await
+}
+
+/// 回收**没人按过、已经过了保留期**的修复 worktree（决策 212③ / 票 12 的最后一格）。
+///
+/// 这是 [`finish_repair`] 的第三个调用者，补的是「一直没人按」那一条：合入与拒绝都由人按下，
+/// 而一条没人理的修复提议最终会被年龄清理删掉——在删行之前把它建的 worktree 收掉，
+/// **保留分支**（与拒绝同一理由：分支是唯一的证据）。
+///
+/// 为什么在删行之前：`args.project_id` 与载荷里的 worktree 路径是唯一知道那个目录属于谁、
+/// 在哪个仓里的东西。行一删，那个目录就成了无主残留——这正是这个函数存在的理由。
+///
+/// 四处**不致命**的跳过（维护作业不该被一行坏数据打断）：载荷解析不出来、项目已不在台账里、
+/// 目录已经不在了（人按过拒绝但行还留着的情况）、以及**回收本身失败**（项目路径已经不在磁盘上、
+/// worktree 的登记已被别的东西清掉）。每一处都留一条 `warn`：静默跳过会让残留悄悄地留下来。
+///
+/// 最后那一处为什么要收住：这个函数跑在**小时级维护作业**里，而它后面就是保留期清理
+/// （对话 / 提议 / 待办）。让一个 git 失败把整趟维护带走，就等于「一个 bad row 让所有清理停摆」
+/// ——那比留下一个目录坏得多。
+pub async fn recycle_unpressed_repair_worktrees(
+    store: &Store,
+    cutoff: DateTime<Utc>,
+) -> Result<usize> {
+    let stale = store.list_pending_repair_proposals_before(cutoff).await?;
+    let mut recycled = 0;
+    for proposal in stale {
+        let Some(payload) = &proposal.payload else {
+            tracing::warn!(proposal = %proposal.id, "修复提议没有载荷，回收不了它的 worktree");
+            continue;
+        };
+        let Ok(outcome) = serde_json::from_value::<RepairOutcome>(payload.clone()) else {
+            tracing::warn!(proposal = %proposal.id, "修复提议的载荷解析不出修复现场，跳过回收");
+            continue;
+        };
+        let Some(project_id) = proposal.args.get("project_id").and_then(|v| v.as_str()) else {
+            tracing::warn!(proposal = %proposal.id, "修复提议没写 project_id，回收不了它的 worktree");
+            continue;
+        };
+        let Some(project) = store.get_project(project_id).await? else {
+            tracing::warn!(project = %project_id, "修复提议指向的项目已不在台账里，跳过回收");
+            continue;
+        };
+        let session = RepairSession {
+            repair_id: outcome.repair_id.clone(),
+            session_id: proposal.session_id.clone(),
+            worktree: PathBuf::from(&outcome.worktree_path),
+            branch: outcome.branch.clone(),
+            base_ref: outcome.base_ref.clone(),
+        };
+        if !session.worktree.exists() {
+            // 「拒绝」已经收过一遍而行还留着（或人自己删的）：不是故障，无事可做。
+            continue;
+        }
+        if let Err(e) = finish_repair(Path::new(&project.local_path), &session, false).await {
+            tracing::warn!(
+                proposal = %proposal.id,
+                worktree = %session.worktree.display(),
+                "回收过期修复 worktree 失败（行照旧会被年龄清理删掉）：{e}"
+            );
+            continue;
+        }
+        recycled += 1;
+    }
+    Ok(recycled)
 }
 
 /// 把修复的 diff 落成可读文件（提议面板要能展开看全文）。

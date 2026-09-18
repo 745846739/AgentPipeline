@@ -31,6 +31,7 @@ import type {
   SkillSummary,
   StageConfig,
   StageConfigPutPayload,
+  Task,
   TaskDetail,
   TaskListItem,
   TaskMetrics,
@@ -227,6 +228,20 @@ export function resumeTask(id: string, payload: ResumePayload): Promise<ResumeRe
 
 export function cancelTask(id: string): Promise<unknown> {
   return request(`/tasks/${encodeURIComponent(id)}/cancel`, { method: 'POST' });
+}
+
+/**
+ * 打开 / 关掉**这一个任务**的托管（决策 210①，票 08 的端点 / 票 14 的界面）。
+ *
+ * 关掉走的是同一个端点 + `enabled: false`（后端语义是**清空那一列**，不是写一个 false）。
+ * 终态任务（400）与值班长未接线（503）都会被后端拒掉，故界面先不摆那颗钮
+ * （见 `lib/stewardship.ts::stewardshipFace`）。
+ */
+export function setStewardship(id: string, enabled: boolean): Promise<{ ok: boolean; task: Task }> {
+  return request<{ ok: boolean; task: Task }>(`/tasks/${encodeURIComponent(id)}/stewardship`, {
+    method: 'POST',
+    body: { enabled },
+  });
 }
 
 export function retryTask(id: string): Promise<unknown> {

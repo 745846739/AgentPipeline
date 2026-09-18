@@ -148,6 +148,11 @@ impl KanbanScheduler {
             .store
             .expire_foreman_proposals(self.clock.now())
             .await?;
+        // 修复 worktree 的回收（决策 212③ / 票 12）：**必须排在删行之前**——`args.project_id`
+        // 与载荷是唯一知道那个目录属于谁、在哪个仓里的东西，行一删就成了无主残留。
+        let recycled_repairs =
+            crate::pipeline::repair::recycle_unpressed_repair_worktrees(&self.store, cutoff)
+                .await?;
         let purged_proposals = self.store.purge_foreman_proposals(cutoff).await?;
         // 待办表与其余各表**同一口径**的年龄清理（票 05）：不做全仓唯一一张不设保留期的表。
         let purged_attention = self.store.purge_attention(cutoff).await?;
@@ -157,6 +162,7 @@ impl KanbanScheduler {
             purged_foreman_messages: purged_foreman,
             expired_foreman_proposals: expired_proposals,
             purged_foreman_proposals: purged_proposals,
+            recycled_repair_worktrees: recycled_repairs,
             purged_attention: purged_attention as usize,
             aggregated_tasks: aggregated,
         })
@@ -817,6 +823,12 @@ pub struct MaintenanceReport {
     pub expired_foreman_proposals: usize,
     /// 被保留期清掉的提议行（决策 207：与对讲台对话同一个保留期）。
     pub purged_foreman_proposals: usize,
+    /// 被回收的**没人按过**的修复 worktree 数（决策 212③ / 票 12）。
+    ///
+    /// 与上面两项不同类：它清的是**磁盘上的目录**，不是库里的行。**分支不删**——与拒绝
+    /// 那条路同一理由（分支是唯一的证据）。故这个数不为零时，`git branch` 里那些
+    /// `repair/*` 仍然在，知道这一点才读得懂这个数。
+    pub recycled_repair_worktrees: usize,
     /// 被保留期清掉的值班长待办行（票 05：同一个 `conversation_retention_days` 口径）。
     pub purged_attention: usize,
     pub aggregated_tasks: usize,

@@ -27,7 +27,7 @@ use agentpipeline_core::types::{
     STEWARDSHIP_MAX_AUTO_RESUMES,
 };
 use agentpipeline_core::Error;
-use testkit::{FakeAgent, ManualClock, Script, TestHome};
+use testkit::{FakeAgent, ManualClock, Repo, Script, TestHome};
 
 struct Harness {
     _home: TestHome,
@@ -68,6 +68,40 @@ impl Harness {
     /// 所以凡是要造多任务事件的用例都得**先把任务建出来**，不能只写个 id 串。
     async fn task(&self, task_id: &str) {
         testkit::seed_task(&self.store, task_id, "p1")
+            .await
+            .unwrap();
+    }
+
+    /// 把一个**真 git 仓**接成 `p1`（修复那条路的前提：`repair_supported` 要路径下真有 `.git`）。
+    ///
+    /// 与 [`Harness::seeded`] 是两件事：后者给的是 `scratch_dir` 下的**裸目录**，够用来看快照；
+    /// 而修复必须真起 worktree。也**不走** `testkit::seed_project` 的语言探测——它会把这个仓判成
+    /// `cargo`，于是闸门变成真的 `cargo test --quiet`（分钟级），而用例要测的是「闸门过了 /
+    /// 没过之后各发生什么」。`test_command_for` 对认不出的名字**原样返回**，故这里给一条恒真的命令。
+    async fn git_project(&self, repo: &testkit::Repo, test_framework: &str) {
+        let project = agentpipeline_core::types::Project {
+            id: "p1".into(),
+            name: "示例项目".into(),
+            local_path: repo.path().display().to_string(),
+            default_branch: "main".into(),
+            language: None,
+            test_framework: Some(test_framework.into()),
+            lint_command: None,
+            agents_md_path: None,
+            created_at: self.store.now(),
+        };
+        self.store.create_project(&project).await.unwrap();
+    }
+
+    /// 值班长的环境档位（`repair` 归环境层：默认的 `ask` 会把它转成一条提议，
+    /// 而修复那条用例要断言的是「worktree 真的拉起来了」——故显式配 `auto`）。
+    async fn foreman_env(&self, mode: agentpipeline_core::types::EnvMode) {
+        self.store
+            .upsert_stage_config(&StageConfig {
+                stage: FOREMAN_STAGE_KEY.to_string(),
+                env_mode: Some(mode),
+                ..Default::default()
+            })
             .await
             .unwrap();
     }
@@ -1634,6 +1668,9 @@ async fn the_foreman_tool_set_matches_the_frozen_contract() {
             "write_file",
             "edit_file",
             "run_command",
+            // 修复轮（决策 210③④ / 票 10–12）：归环境层由档位管（`ask` 每步要按键、
+            // `auto` 整轮自己跑），**合入永远人按**。没有进托管自动集。
+            "repair",
             // D 层：本服务写接口（决策 207④ 的「一族一个工具 + 动作参数」）。
             // **不读档位**——写接口恒为提议，配成 `auto` 只放开环境层。
             // 全局动作 `service`（票 09）：`action=restart`——**永远只提议**（会打断所有
@@ -2070,6 +2107,107 @@ async fn scheduler_maintenance_expires_proposals_and_purges_them_by_age() {
         .await
         .unwrap()
         .is_empty());
+}
+
+/// 修复 worktree 的**第三位回收者**（票 12 的最后一格）：没人按过的修复提议过了保留期，
+/// 维护作业要把它建的 worktree 收掉，且**保留分支**。
+///
+/// 与「拒绝」那条不重复：拒绝是人按的，而这一条走的是「人一直没理它，行被年龄清理删掉」。
+/// 顺序要紧——回收排在删行之前，否则没有任何东西知道那个目录属于谁、在哪个仓里。
+#[tokio::test]
+async fn maintenance_recycles_a_repair_worktree_nobody_pressed() {
+    use agentpipeline_core::git::Git;
+    use agentpipeline_core::pipeline::repair::{finish_repair_round, new_repair_id, start_repair};
+
+    let h = Harness::empty().await;
+    let repo = Repo::clean().unwrap();
+    h.git_project(&repo, "true").await;
+    let sid = h.session().await;
+
+    // 走**真**那条链把 worktree 与提议造出来（不起 worktree 就没有可回收的东西）。
+    let session = start_repair(h._home.home(), repo.path(), "main", &new_repair_id(), &sid)
+        .await
+        .unwrap();
+    std::fs::write(session.worktree.join("fixed.rs"), "pub fn fixed() {}\n").unwrap();
+    let project = h.store.get_project("p1").await.unwrap().unwrap();
+    finish_repair_round(
+        &h.store,
+        h._home.home(),
+        &project,
+        &session,
+        "结论一句话",
+        None,
+        h.clock.now(),
+    )
+    .await
+    .unwrap();
+
+    // 还在保留期内：目录照旧在（免得这条用例退化成「总是删」）。
+    let report = maintenance(&h).await;
+    assert_eq!(report.recycled_repair_worktrees, 0);
+    assert!(session.worktree.exists());
+
+    // 过了保留期（`conversation_retention_days` = 30 天）：worktree 被收，行也被删。
+    h.clock.advance_secs(31 * 24 * 3600);
+    let report = maintenance(&h).await;
+    assert_eq!(report.recycled_repair_worktrees, 1);
+    assert_eq!(report.purged_foreman_proposals, 1);
+    assert!(
+        !session.worktree.exists(),
+        "没人按过的修复 worktree 要在这时候被收掉"
+    );
+    assert!(
+        Git.rev_parse(repo.path(), &session.branch).await.is_ok(),
+        "分支必须留着——它是这次修复唯一的证据"
+    );
+    assert!(
+        repo.git(&["worktree", "list"]).trim().lines().count() == 1,
+        "台账里也不该再挂着那个 worktree：{}",
+        repo.git(&["worktree", "list"])
+    );
+}
+
+/// 回收失败**不许把整趟维护带走**（票 12 的收口）：项目已经不在磁盘上时那一步必然失败，
+/// 而它后面就是保留期清理——让一个 bad row 让所有清理停摆，比留下一个目录坏得多。
+#[tokio::test]
+async fn a_failed_repair_recycle_does_not_stop_the_maintenance() {
+    use agentpipeline_core::pipeline::repair::{finish_repair_round, new_repair_id, start_repair};
+
+    let h = Harness::empty().await;
+    let repo = Repo::clean().unwrap();
+    h.git_project(&repo, "true").await;
+    let sid = h.session().await;
+
+    let session = start_repair(h._home.home(), repo.path(), "main", &new_repair_id(), &sid)
+        .await
+        .unwrap();
+    std::fs::write(session.worktree.join("fixed.rs"), "pub fn fixed() {}\n").unwrap();
+    let project = h.store.get_project("p1").await.unwrap().unwrap();
+    finish_repair_round(
+        &h.store,
+        h._home.home(),
+        &project,
+        &session,
+        "结论一句话",
+        None,
+        h.clock.now(),
+    )
+    .await
+    .unwrap();
+    // 项目**连目录一起**没了（比「行没了」更狠的一种坏数据：判据过得去，动手时才炸）
+    std::fs::remove_dir_all(repo.path()).unwrap();
+
+    h.clock.advance_secs(31 * 24 * 3600);
+    let report = maintenance(&h).await;
+    assert_eq!(report.recycled_repair_worktrees, 0, "回收没成，如实记 0");
+    assert_eq!(
+        report.purged_foreman_proposals, 1,
+        "行**照旧**被年龄清理删掉——维护作业没被那一步带走"
+    );
+    assert!(
+        session.worktree.exists(),
+        "那次回收确实失败了（目录还在）——这条用例断的正是「失败了也不许拦着后面的清理」"
+    );
 }
 
 async fn maintenance(h: &Harness) -> agentpipeline_core::scheduler::MaintenanceReport {
@@ -2773,4 +2911,237 @@ async fn unstick_is_in_the_steward_auto_set_but_restart_never_is() {
             pending[0].summary
         );
     }
+}
+
+// ───────────────────── 修复轮的线上入口（决策 210③④ / 票 10–12）─────────────────────
+
+/// 修复这条链**在线上跑得通**：`repair(action=start)` 真拉起一个 worktree 并把它交回，
+/// `finish` 真把它收口成一条待按的提议。
+///
+/// 为什么这条非要走工具（而不是像 `tests/repair.rs` 那样直接调 `pipeline::repair`）：票 10–12
+/// 的实现全都写好了，却**没有任何生产调用者**——「通过闸门的测试」与「线上跑得通」之间的
+/// 差额恰好就是这个入口。故这里断言的是那条链路本身：工具 → 分派 → worktree 落在值班长的
+/// 写域里 → 改动能单独成 commit → 提议出现在待办列表里。
+#[tokio::test]
+async fn the_repair_tool_opens_a_worktree_and_lands_a_proposal() {
+    use agentpipeline_core::storage::proposals::ForemanProposalKind;
+    use agentpipeline_core::types::EnvMode;
+
+    let h = Harness::empty().await;
+    let repo = Repo::clean().unwrap();
+    h.git_project(&repo, "true").await;
+    h.task("t1").await;
+    // 这条任务得**真的停在 pending 上**——「等修复合入」是加在它的 pending 说明里的，
+    // 而一条没停下来的任务不该因为顺手提了个修复就显示成「在等」（下面正面断言那句原文还在）。
+    park_task(&h.store, "t1", PendingKind::UserDecision, "需要人定夺").await;
+    // `repair` 归**环境层**（决策 206 的 C 层、210③）：默认档位 `ask` 下它会变成一条提议，
+    // 而这一条要断言的是「worktree 真的被拉起来了」。档位就是这件事的开关。
+    h.foreman_env(EnvMode::Auto).await;
+
+    // —— 第一轮：start ——
+    let mut script = Script::new();
+    script.for_foreman().tool(
+        "repair",
+        serde_json::json!({"action": "start", "project_id": "p1"}),
+    );
+    script.for_foreman().text("去修。");
+    let turn = h
+        .runner(FakeAgent::new(script))
+        .say(None, "p1 有个毛病")
+        .await
+        .unwrap();
+    assert_eq!(turn.traces.len(), 1);
+    assert_eq!(turn.traces[0].tool, "repair");
+    assert!(turn.traces[0].ok, "start 应当真的拉起 worktree");
+    let session_id = turn.session.id.clone();
+
+    // worktree 真的在（而不是只回了一句「已就绪」）：`repair-{id}` 目录下有自己的 `.git`
+    let worktree = only_repair_worktree(&h);
+    assert!(
+        worktree.join(".git").exists(),
+        "start 必须真建出 worktree：{}",
+        worktree.display()
+    );
+    assert!(!repo.is_dirty(), "start 不许碰项目工作区");
+    let repair_id = worktree
+        .file_name()
+        .and_then(|n| n.to_str())
+        .and_then(|n| n.strip_prefix("repair-"))
+        .expect("worktree 目录名是 `repair-{id}`（命名自洽是重建现场的前提）")
+        .to_string();
+
+    // 值班长在这一轮里「改代码」：它写的是 worktree 里那个路径（家目录的写域之内）
+    std::fs::write(worktree.join("fixed.rs"), "pub fn fixed() -> i32 { 42 }\n").unwrap();
+
+    // —— 第二轮：finish ——
+    let mut script = Script::new();
+    script.for_foreman().tool(
+        "repair",
+        serde_json::json!({
+            "action": "finish",
+            "project_id": "p1",
+            "repair_id": repair_id,
+            "conclusion": "补上缺的约束",
+            "task_id": "t1",
+        }),
+    );
+    script.for_foreman().text("改完了，等你按。");
+    let turn = h
+        .runner(FakeAgent::new(script))
+        .say(Some(&session_id), "改完了吗")
+        .await
+        .unwrap();
+    assert_eq!(turn.traces.len(), 1);
+    assert_eq!(turn.traces[0].tool, "repair");
+    assert!(turn.traces[0].ok, "finish 应当收口成功");
+
+    // 收口的三样凭证：待办里一条提议、分支上一个带标记的 commit、改动**没进主干**
+    let pending = h
+        .store
+        .list_pending_foreman_proposals(&session_id)
+        .await
+        .unwrap();
+    assert_eq!(
+        pending.len(),
+        1,
+        "闸门过了就该落一条待按的提议：{pending:?}"
+    );
+    assert_eq!(pending[0].kind, ForemanProposalKind::Repair);
+    assert_eq!(pending[0].tool, "repair");
+    assert!(pending[0].payload.is_some(), "载荷里要有 diff 与闸门读数");
+    let branch = format!("repair/{repair_id}");
+    let message = repo.git(&["log", "--format=%s", "-1", &branch]);
+    assert!(
+        message.contains("[repair]"),
+        "修复 commit 要带可检索的标记：{message}"
+    );
+    assert!(
+        !repo.exists("fixed.rs"),
+        "合入由人按：在那之前主干上不该有这个改动"
+    );
+    // 两处留痕（票 11 的最后一格）：班次里一条，**任务行上也一条**。光有时间线里的提议，
+    // 人在看板上盯着那条任务，看不出它卡在哪儿。
+    let messages = h
+        .store
+        .list_foreman_messages(&session_id, 50)
+        .await
+        .unwrap();
+    assert!(
+        messages
+            .iter()
+            .any(|m| m.content.contains("【等修复合入】") && m.content.contains("t1")),
+        "传了 task_id 就要在班次里留「等修复合入」的字样：{:?}",
+        messages.iter().map(|m| &m.content).collect::<Vec<_>>()
+    );
+    let task = h.store.get_task("t1").await.unwrap();
+    let reason = task.pending_reason.expect("任务应当仍停在 pending 上");
+    assert!(
+        reason.message.contains("等修复合入"),
+        "任务本身上要看得出它在等什么：{}",
+        reason.message
+    );
+    assert!(
+        reason.message.contains("需要人定夺"),
+        "**原来那句不能丢**——修复改变的是「现在等什么」，不是「为什么停」：{}",
+        reason.message
+    );
+    assert_eq!(
+        reason.kind,
+        PendingKind::UserDecision,
+        "pending 的种类照旧：它是投影的来源，还参与 resume 的原因归类"
+    );
+}
+
+/// `discard`：不修了就回收——**保留分支**（它是唯一的证据），并覆盖「又调了一次」那一支。
+///
+/// 与「没人按」那条回收路是两回事：那一条是维护作业在行被删之前收的（票 12），这一条是
+/// 值班长**自己**放弃这次尝试。两条都收 worktree、都留分支，故收尾规则只有一个答案。
+#[tokio::test]
+async fn the_repair_tool_discards_an_abandoned_attempt() {
+    use agentpipeline_core::git::Git;
+    use agentpipeline_core::types::EnvMode;
+
+    let h = Harness::empty().await;
+    let repo = Repo::clean().unwrap();
+    h.git_project(&repo, "true").await;
+    h.foreman_env(EnvMode::Auto).await;
+
+    let mut script = Script::new();
+    script.for_foreman().tool(
+        "repair",
+        serde_json::json!({"action": "start", "project_id": "p1"}),
+    );
+    script.for_foreman().text("拿到 worktree 了。");
+    let turn = h
+        .runner(FakeAgent::new(script))
+        .say(None, "试试修一下")
+        .await
+        .unwrap();
+    assert!(turn.traces[0].ok);
+    let session_id = turn.session.id.clone();
+    let worktree = only_repair_worktree(&h);
+    let repair_id = worktree
+        .file_name()
+        .and_then(|n| n.to_str())
+        .and_then(|n| n.strip_prefix("repair-"))
+        .unwrap()
+        .to_string();
+
+    // ① 放弃：worktree 没了，分支还在
+    let mut script = Script::new();
+    script.for_foreman().tool(
+        "repair",
+        serde_json::json!({
+            "action": "discard", "project_id": "p1", "repair_id": repair_id,
+        }),
+    );
+    script.for_foreman().text("收掉了。");
+    let turn = h
+        .runner(FakeAgent::new(script))
+        .say(Some(&session_id), "不修了")
+        .await
+        .unwrap();
+    assert!(turn.traces[0].ok, "discard 应当回收成功");
+    assert!(!worktree.exists(), "worktree 应当被删掉");
+    assert!(
+        Git.rev_parse(repo.path(), &format!("repair/{repair_id}"))
+            .await
+            .is_ok(),
+        "分支必须留着——它是这次尝试唯一的证据"
+    );
+
+    // ② 又调一次：回一句话而不是让 git 报错（「重复调一次」不该看起来像工具坏了）
+    let mut script = Script::new();
+    script.for_foreman().tool(
+        "repair",
+        serde_json::json!({
+            "action": "discard", "project_id": "p1", "repair_id": repair_id,
+        }),
+    );
+    script.for_foreman().text("收过了。");
+    let turn = h
+        .runner(FakeAgent::new(script))
+        .say(Some(&session_id), "再收一次")
+        .await
+        .unwrap();
+    assert!(
+        turn.traces[0].ok,
+        "已经不在的 worktree 上再 discard 一次不是工具故障"
+    );
+}
+
+/// 家目录下那个唯一的修复 worktree（`gate-output-*.log` 与 `*.diff` 都不算）。
+fn only_repair_worktree(h: &Harness) -> std::path::PathBuf {
+    let mut found: Vec<std::path::PathBuf> = std::fs::read_dir(h._home.home().worktrees_dir())
+        .expect("worktrees 目录应当已被 start 建出来")
+        .filter_map(|e| e.ok().map(|e| e.path()))
+        .filter(|p| {
+            p.is_dir()
+                && p.file_name()
+                    .and_then(|n| n.to_str())
+                    .is_some_and(|n| n.starts_with("repair-"))
+        })
+        .collect();
+    assert_eq!(found.len(), 1, "应当恰好一个修复 worktree：{found:?}");
+    found.pop().unwrap()
 }

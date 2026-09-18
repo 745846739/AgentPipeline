@@ -1,6 +1,6 @@
 <script lang="ts">
   import { onDestroy, onMount } from 'svelte';
-  import { archiveTask, listProviders, retryTask } from '../api/client';
+  import { archiveTask, getForemanSessions, listProviders, retryTask, setStewardship } from '../api/client';
   import type { AllowedAction, Provider } from '../api/types';
   import PipelineRail from '../components/pipeline/PipelineRail.svelte';
   import CommandLog from '../components/task/CommandLog.svelte';
@@ -14,6 +14,7 @@
   import DiffView from '../components/render/DiffView.svelte';
   import EmptyState from '../components/ui/EmptyState.svelte';
   import { buildHeroStations, formatDuration, formatTokens, pendingLabel, statusCode } from '../lib/pipeline';
+  import { stewardshipFace, toggleStewardship } from '../lib/stewardship';
   import { taskDetail } from '../stores/taskDetail.svelte';
 
   interface Props {
@@ -29,6 +30,16 @@
   let providers = $state<Provider[]>([]);
   let dialogError = $state<string | null>(null);
   let bypassBusy = $state<string | null>(null);
+  /**
+   * 值班长接线没有（决策 210① / 票 14）：未接线时托管开关无处可去，不摆。
+   *
+   * 读法用 `/foreman/sessions`（小载荷）而不是 `/foreman/session`（连消息一起回）——
+   * 这里只要那个「接没接」的答案，而 503 就是答案。
+   */
+  let foremanWired = $state(false);
+  let stewardBusy = $state(false);
+  let stewardNote = $state<string | null>(null);
+  let stewardError = $state<string | null>(null);
   /** 窄屏（<480px）：hero 轨道转纵向脊线（§5 移动款）。 */
   let isMobile = $state(
     typeof window !== 'undefined' && window.matchMedia('(max-width: 479px)').matches,
@@ -68,6 +79,8 @@
       task?.current_stage === 'merge' ||
       task?.current_stage === 'done',
   );
+  /** 托管开关这一面（`null` = 不摆，见 `lib/stewardship.ts`）。 */
+  const steward = $derived(task ? stewardshipFace(task, foremanWired) : null);
 
   /**
    * 任务级入口的地址形状是 brief §二 末尾那张跨流接口表的**契约**（票 06 / 07），逐字照抄：
@@ -92,6 +105,10 @@
     void listProviders()
       .then((list) => (providers = list))
       .catch(() => (providers = []));
+    // 「值班长接线没有」的读法（见 `foremanWired` 的说明）：读得到就是接线的。
+    void getForemanSessions()
+      .then(() => (foremanWired = true))
+      .catch(() => (foremanWired = false));
   });
 
   onDestroy(() => {
@@ -170,6 +187,27 @@
     } finally {
       bypassBusy = null;
     }
+  }
+
+  /**
+   * 拨托管开关（决策 210①，票 14）。
+   *
+   * 成功之后**重读任务**：托管那一列是端点的回读值，界面不自己拼一个「应该是这样」的
+   * 本地态——开了没开以库里那一列为准（`lib/stewardship.ts` 的说明）。
+   */
+  async function toggleSteward() {
+    if (!steward) return;
+    stewardBusy = true;
+    stewardError = null;
+    stewardNote = null;
+    const result = await toggleStewardship(id, !steward.enabled, { set: setStewardship });
+    if (result.ok) {
+      stewardNote = result.note;
+      await taskDetail.load(id, true);
+    } else {
+      stewardError = result.message;
+    }
+    stewardBusy = false;
   }
 </script>
 
@@ -265,6 +303,27 @@
           <a class="entry" href={analyzeHref}>分析所属项目 ▸</a>
         {/if}
       </div>
+      {#if steward}
+        <!-- 托管开关（决策 210① / 票 08 的端点、票 14 的界面）：**任务级**授权，不是全局档位
+             ——它随任务自限。说明那一行不能省：同一个钮开着时「它现在能免按键做什么」与关着时
+             完全不同，而钮上只有两个字的差别。 -->
+        <div class="steward">
+          <span class="s-lbl">值班长</span>
+          <button
+            type="button"
+            class="btn"
+            class:on={steward.enabled}
+            disabled={stewardBusy}
+            aria-pressed={steward.enabled}
+            onclick={toggleSteward}
+          >
+            {steward.label}
+          </button>
+          <span class="s-note" class:bad={stewardError !== null}>
+            {stewardError ?? stewardNote ?? steward.note}
+          </span>
+        </div>
+      {/if}
       <div class="hero-rail">
         <PipelineRail variant={isMobile ? 'vrail' : 'hero'} stations={heroStations} />
       </div>
@@ -501,6 +560,31 @@
   .entry:hover {
     border-bottom-color: var(--text-hi);
     text-decoration: none;
+  }
+  /* 托管开关（决策 210① / 票 14）：与「任务级入口」同属任务级的那些事，故挨着它摆。
+     开着的形态吃全站「选中」的那套语言（`.chip.on`：wash 底 + text-hi 描边 + ▶）。 */
+  .steward {
+    display: flex;
+    align-items: center;
+    flex-wrap: wrap;
+    gap: 8px;
+    margin-top: 12px;
+    font-size: 12px;
+    color: var(--text-3);
+  }
+  .steward .btn.on {
+    background: var(--wash);
+    border-color: var(--text-hi);
+    color: var(--text-hi);
+  }
+  .steward .btn.on::before {
+    content: '▶ ';
+    color: var(--go);
+  }
+  /* 按下失败的原因就地说（不弹窗）：终态任务与未接线那两句是端点给的、原样透传，
+     故它用的是失败红档而不是琥珀——琥珀全站只留给急停（决策 203）。 */
+  .steward .s-note.bad {
+    color: var(--stop);
   }
   .hero-rail {
     margin: 18px 0 6px;

@@ -103,6 +103,7 @@
 | **待办（attention）** | 一条待记录的事件（`kanban_foreman_attention`）。去重键是 `(task_id, kind, occurred_at)`——`occurred_at` 是事件**发生**的时刻，不是写入时刻；`consumed_at IS NULL` 即未处理。九类：`task_pending` / `retry_exhausted` / `context_overflow` / `gate_failure` / `repeated_pending` / `scheduler_no_effect` / `owner_stuck` / `task_stale` / `slow_run`。**`slow_run` 是唯一只播报不唤醒的**（决策 66 的自适应告警没有可操作的动作） |
 | **托管（stewardship）** | **任务级**的一次授权（决策 210① / 票 08）：对一个指定任务，值班长可以**免按键** `task resume(continue)`——恰好一个动作。默认关；`kanban_tasks.stewardship_json` 一列装三件事（开着没有 / 自动动过几次 / 上次的指纹）。止损两条一起卡：**满 2 次**或**同一指纹**即停手、交回人按 |
 | **unstick** | 「解除僵死占用」（决策 210⑧ / 票 09）：摘进程内去重 + 清 `executor_owner` + 僵死 run 标终态 + 游标转 `pending`。与 `resume` 是两回事——**去重摘不掉时 `resume` 是空操作，还白吃托管的次数配额**。只对「调度器处置未生效」与「owner 持有超时」两类生效，正常在跑的任务踢不动 |
+| **等修复合入（awaiting repair merge）** | 修复那条路的收尾标记（决策 210⑨ / 票 11）：补丁出了、闸门过了、提议落成一条**等人按**的，而任务那一侧**不自己往前走**。落地形式是往**焦点游标 pending 原因的 `message` 里追加一句**（`Store::note_task_awaiting_repair_merge`），**不新增 `PendingKind`**——种类还参与 `ResumeCause::classify`，「为什么停」与「现在等什么」是两件事，原句一律保留。没有 pending 游标时什么都不写：一条没停下来的任务不因为顺手提了个修复就显示成「在等」 |
 | **修复提案（repair）** | 一条形态为 `repair` 的提议（决策 212① / 票 12）：载荷里带**没设 TTL**的修复现场（worktree / 分支 / 闸门读数 / diff）。执行它不是「一次工具调用」，而是「**合入一个分支**」——按下之前先 rebase 检查，冲突就拒执并列出文件 |
 | **Tick** | 调度器的一次轻量检查周期。检查超时、冲突恢复、依赖启动、并发准入、pending 提醒、stalled 标记 |
 | **Merge Approval** | merge 阶段等待用户在 GUI 审核 diff 并决定是否合入的状态。用户点击"合入"（`POST /tasks/{id}/merge/decision`，决策 119）后由 `merge.execute` 阶段 B 执行实际合并 |

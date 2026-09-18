@@ -436,6 +436,40 @@ impl Store {
         Ok(affected as usize)
     }
 
+    /// 超过保留期、**没人按过**的修复提议（决策 212③ / 票 12 的最后一格）。
+    ///
+    /// 为什么需要它：修复提议的 worktree 只被两条路回收——人按「合入」、人按「拒绝」。
+    /// 而「一直没人按」这一条没有落点：行会被年龄清理删掉，那个 worktree 于是变成没有任何
+    /// 东西指向的目录残留。回收必须在**删行之前**做，因为行里的 `args.project_id` 与载荷是
+    /// 唯一知道那个目录属于谁的东西——故本方法与 [`Self::purge_foreman_proposals`] 在同一趟
+    /// 维护作业里，且必须排在它前面。
+    ///
+    /// 判据用**行**而不是目录年龄：行是「人还按得着吗」的唯一权威，而目录上的时间戳会被
+    /// checkout 与编译改得与这件事无关。`status = pending` 把已决的排除在外（执行与拒绝
+    /// 那两条路各自回收过了，见 `reject_proposal`）。
+    ///
+    /// 不按 `expires_at` 筛：过期清扫碰不到修复类（`FOREMAN_PROPOSAL_NO_TTL_DAYS` = 100 年），
+    /// 对修复提议而言「没人按过」只有年龄清理这一个出口。
+    pub async fn list_pending_repair_proposals_before(
+        &self,
+        cutoff: DateTime<Utc>,
+    ) -> Result<Vec<ForemanProposal>> {
+        let sql = format!(
+            "SELECT {PROPOSAL_COLUMNS} FROM kanban_foreman_proposals
+             WHERE kind = ? AND status = ? AND created_at < ?
+             ORDER BY id ASC"
+        );
+        let rows: Vec<ForemanProposalRow> = sqlx::query_as(&sql)
+            .bind(ForemanProposalKind::Repair.as_str())
+            .bind(FOREMAN_PROPOSAL_PENDING)
+            .bind(ts(cutoff))
+            .fetch_all(self.pool())
+            .await?;
+        rows.into_iter()
+            .map(ForemanProposalRow::into_proposal)
+            .collect()
+    }
+
     /// 按年龄清理（与 `conversation_retention_days` 同口径）。
     pub async fn purge_foreman_proposals(&self, cutoff: DateTime<Utc>) -> Result<usize> {
         let purged = sqlx::query("DELETE FROM kanban_foreman_proposals WHERE created_at < ?")

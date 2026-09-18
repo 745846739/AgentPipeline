@@ -27,6 +27,7 @@ function task(overrides: Partial<TaskListItem> = {}): TaskListItem {
     current_node: 'execute',
     validate_attempts: 0,
     pending_reason: null,
+    stewardship: null,
     worktree_path: null,
     branch_name: null,
     total_tokens: 1000,

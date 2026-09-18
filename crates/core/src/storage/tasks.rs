@@ -360,6 +360,49 @@ impl Store {
         self.get_task(task_id).await
     }
 
+    /// 在任务的 pending 说明里加上一句「等修复合入」（决策 210⑨ / 票 11 的最后一格）。
+    ///
+    /// 为什么**不新增一个 `PendingKind`**（票面给了这个选项）：任务的状态是焦点游标 pending
+    /// 原因的**投影**（[`Self::sync_task_projection`]），而 `PendingKind` 还参与
+    /// `ResumeCause::classify`——换一个 kind 会把它**为什么停**（`retry_exhausted` /
+    /// `timeout`…）连同 resume 的语义一起改掉，而修复并没有改变它停下来的原因。故只往那句
+    /// 话里加一句：「为什么停」照旧在，人读到的是「为什么停 + 现在在等什么」。
+    ///
+    /// 没有 pending 游标时**什么都不做**并返回 `false`：一条没停下来的任务不该因为值班长顺手
+    /// 提了个修复就显示成「在等」。返回值就是让调用方说得清「标记落没落上」。
+    ///
+    /// 幂等：note 已经在那句话里就不再追加（它会随 pending 一起留在库里，重复追加只会变噪声）。
+    pub async fn note_task_awaiting_repair_merge(&self, task_id: &str, note: &str) -> Result<bool> {
+        let live = self.load_live_cursors(task_id).await?;
+        let Some(cursor) = live
+            .iter()
+            .filter(|c| c.pending_reason.is_some())
+            .max_by_key(|c| c.updated_at)
+        else {
+            return Ok(false);
+        };
+        let Some(mut reason) = cursor.pending_reason.clone() else {
+            return Ok(false);
+        };
+        if reason.message.contains(note) {
+            return Ok(true);
+        }
+        reason.message = format!("{}；{note}", reason.message);
+        sqlx::query(
+            "UPDATE kanban_node_cursors SET pending_reason_json = ?, updated_at = ?
+             WHERE cursor_id = ?",
+        )
+        .bind(encode_pending(&Some(reason)))
+        .bind(ts(self.now()))
+        .bind(&cursor.cursor_id)
+        .execute(self.pool())
+        .await?;
+        // 投影要跟着刷：任务的 `pending_reason_json` 是这一列的副本，不刷的话界面上读到的
+        // 还是上一句——那条任务仍然看不出它在等修复合入。
+        self.sync_task_projection(task_id).await?;
+        Ok(true)
+    }
+
     /// 从 runs 重算 `total_tokens` / `total_calls`（口径见 metrics，决策 130 ②）。
     pub async fn refresh_task_totals(&self, task_id: &str) -> Result<()> {
         let runs = self.list_runs(task_id).await?;

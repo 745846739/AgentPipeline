@@ -82,6 +82,19 @@ export interface PendingReason {
   context?: PendingContext;
 }
 
+/**
+ * 任务级托管（决策 210① / 票 08）。**关掉 = 这一列被清空**，不是 `enabled: false`——
+ * 「从来没开过」与「开过又关了」在库里不该长得一样。
+ */
+export interface Stewardship {
+  enabled: boolean;
+  /** 已被值班长**自动** resume 过的次数（决策 210⑨ 的止损：满 `STEWARDSHIP_MAX_AUTO_RESUMES` 即停手）。 */
+  auto_resumes: number;
+  /** 上一次自动动手时的态势指纹（同一指纹不重复动手）。 */
+  last_fingerprint: string | null;
+  updated_at: string | null;
+}
+
 export interface Task {
   id: string;
   project_id: string;
@@ -93,6 +106,8 @@ export interface Task {
   current_node: Node;
   validate_attempts: number;
   pending_reason: PendingReason | null;
+  /** 托管没开时为 `null`（决策 210①，端点回读同一列）。 */
+  stewardship: Stewardship | null;
   worktree_path: string | null;
   branch_name: string | null;
   total_tokens: number;

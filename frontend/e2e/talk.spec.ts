@@ -13,7 +13,7 @@
  */
 
 import { expect, test, type Locator, type Page } from '@playwright/test';
-import { existsSync, readFileSync } from 'node:fs';
+import { existsSync, readdirSync, readFileSync } from 'node:fs';
 import { join } from 'node:path';
 import {
   startApp,
@@ -1085,6 +1085,130 @@ test.describe('对讲台 · 班次（决策 204）', () => {
     // chip 行长在会滚的时间线**里面**，故时间线自己的盒子一点没变。
     const timelineBox = await page.locator('.timeline').boundingBox();
     expect(timelineBox?.height ?? 0).toBeGreaterThanOrEqual(320);
+
+    expectBundleHealthy(bundle);
+  });
+});
+
+/**
+ * 对讲台 · **修复提议**（票 12 的最后一格 / 决策 208 的几何门）。
+ *
+ * 这条用例走的是**真**那条链：值班长的 `repair` 工具在 `auto` 档下真的拉起一个 worktree、
+ * 把补丁写进去、过闸门（`npm test --silent` 真跑）、落一条 `kind=repair` 的提议。
+ * 界面要做的只是把它渲染成「看得全的补丁 + 一颗够得到的合入钮」。
+ *
+ * 为什么要 e2e 而不是只留单测：修复那一块是**追加在**参数位置下面的（闸门读数一行 +
+ * 折叠的 diff），它比普通提议高，而 720px 是三分区最紧的一档（决策 208）。
+ * 「按 208 的视口量一遍修复提议」这件事此前**没有量过**——那正是票 12 记的缺口。
+ *
+ * `repair_id` 只有跑起来才知道（后端生成），故这条用例用 `setForemanRounds` 中途换脚本。
+ */
+test.describe('对讲台 · 修复提议（票 12 / 决策 208）', () => {
+  let app: App;
+
+  test.beforeAll(async () => {
+    // 空脚本起步：每一轮的脚本都按前一轮的产出现给（见 `setForemanRounds`）。
+    app = await startApp({ script: foremanScript([]), title: 'E2E 修复' });
+    // 档位配成 `auto`——`repair` 归**环境层**（决策 206 的 C 层 / 210③）：`ask` 下它只会
+    // 变成一条提议，而这条用例要的是「worktree 真的拉起来了」。
+    const res = await fetch(`${app.apiBase}/stage-configs/foreman`, {
+      method: 'PUT',
+      headers: { 'content-type': 'application/json', 'x-agentpipeline': '1' },
+      body: JSON.stringify({ env_mode: 'auto' }),
+    });
+    expect(res.ok, `PUT /stage-configs/foreman -> ${res.status}`).toBeTruthy();
+  });
+
+  test.afterAll(async () => {
+    await app?.stop();
+  });
+
+  test('start → 改 → finish 真的走完，合入钮在默认视口下点得到', async ({ page }) => {
+    const bundle = watchBundle(page);
+    // **1280×720 就是这一档的口径**（playwright 默认视口，也是三分区最紧的一档）
+    await page.setViewportSize({ width: 1280, height: 720 });
+
+    // 项目 id 由后端生成 → 脚本只能事后注入（`setForemanRounds`）。
+    const projectsRes = await fetch(`${app.apiBase}/projects`);
+    expect(projectsRes.ok).toBeTruthy();
+    const projects = (await projectsRes.json()) as { projects: Array<{ id: string }> };
+    const projectId = projects.projects[0].id;
+
+    // ① start：值班长拿到一个**它写得进去**的 worktree
+    app.setForemanRounds([
+      [
+        tool('repair', { action: 'start', project_id: projectId }),
+        text('拿到 worktree 了，去改。'),
+      ],
+    ]);
+    await sayDirect(app, '把 fixture 里那个占位的 add 修一下');
+
+    // worktree 落在**家目录下**（值班长的写域之内）——这是可达性的硬约束，不是审美
+    const worktreesDir = join(app.homeDir, 'worktrees');
+    let repairDir = '';
+    await expect
+      .poll(
+        () => {
+          repairDir = existsSync(worktreesDir)
+            ? (readdirSync(worktreesDir).find((n) => n.startsWith('repair-')) ?? '')
+            : '';
+          return repairDir;
+        },
+        { timeout: 30_000, message: 'start 没有拉起修复 worktree' },
+      )
+      .not.toBe('');
+    const repairId = repairDir.slice('repair-'.length);
+    const worktree = join(worktreesDir, repairDir);
+
+    // ② 改（写进 worktree）+ ③ finish（闸门 → commit → 提议）
+    app.setForemanRounds([
+      [
+        tool('write_file', {
+          path: join(worktree, 'src/lib.js'),
+          content: 'function add(a, b) { return a + b; }\nmodule.exports = { add };\n',
+        }),
+        text('改好了。'),
+      ],
+      [
+        tool('repair', {
+          action: 'finish',
+          project_id: projectId,
+          repair_id: repairId,
+          conclusion: '把 throw 的占位换成真的加法',
+        }),
+        text('闸门过了，等你按合入。'),
+      ],
+    ]);
+    await sayDirect(app, '改吧');
+    // finish 那一轮里闸门（`npm test --silent`）真的跑，且**这次它绿**——绿不了就出不了提议
+    await sayDirect(app, '收口');
+
+    // 主干**没被动过**：fixture 里那份仍是占位（合入永远人按，决策 210⑦）
+    expect(
+      readFileSync(join(app.repoDir, 'src/lib.js'), 'utf8'),
+      '改动不许进主干——它只该在修复分支上',
+    ).toContain('throw new Error');
+
+    await page.goto(`${app.webBase}/#/talk`);
+    await settleBundle(page, bundle);
+
+    // 修复提议那一轮：闸门读数 + 可展开的补丁 + 「合入」而不是「执行」
+    const prop = page.locator('.timeline .turn.prop').last();
+    await expect(prop).toBeVisible({ timeout: 30_000 });
+    await expect(prop.locator('.dname')).toHaveText('操作台');
+    await expect(prop).toContainText('闸门');
+    await expect(prop.getByRole('button', { name: '合入' })).toBeVisible();
+    // 参数摘要那一段**不该出现**——修复提议给的是补丁，不是工具参数
+    await expect(prop.locator('.pargs')).toHaveCount(0);
+    // 补丁看得全、能复制（票 12）：展开之后 `src/lib.js` 的两个版本都在
+    await prop.locator('summary', { hasText: '补丁' }).click();
+    const diff = prop.locator(`[data-repair-diff]`);
+    await expect(diff).toBeVisible();
+    await expect(diff).toContainText('src/lib.js');
+    await expect(diff).toContainText('+function add(a, b) { return a + b; }');
+
+    // **够得到吗**（决策 208 的回归门）：修复那一块比普通提议高，而这一档不给它留高度
+    await expectProposalReachable(page);
 
     expectBundleHealthy(bundle);
   });

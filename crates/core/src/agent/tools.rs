@@ -74,13 +74,19 @@ fn trim_conversation_messages(messages: &serde_json::Value) -> Vec<serde_json::V
 ///
 /// `delete_file` **在列**：决策 206 的清单里没写它（那是按「文件读写 + 命令」举例的），
 /// 但它与 `write_file` 是同一件事的两种形态——漏掉它，`deny` 就成了一堵带门的墙。
-pub const ENV_TOOLS: [&str; 8] = [
+pub const ENV_TOOLS: [&str; 9] = [
     "read_file",
     "write_file",
     "edit_file",
     "delete_file",
     "list_dir",
     "run_command",
+    // 修复轮（决策 210③④，票 10–12）：它动的是**环境**——在项目仓上拉一个 worktree、
+    // 跑闸门、落一个带标记的 commit。放在这一层而不是 D 层，是**授权形状**决定的：
+    // 档位就是这个特性的开关（`ask` 下每一步要人按键，`auto` 下整轮自己跑完，而
+    // 「合入」永远人按）。放进 D 层它会恒为提议，而 `finish` 的产物**本身就是**一条提议
+    // ——那会变成两层按不完的钮。
+    "repair",
     "Skill",
     "spawn_sub_agent",
 ];
@@ -103,7 +109,16 @@ pub const SERVICE_WRITE_TOOLS: [&str; 4] = ["task", "config", "skills", "service
 /// 与 [`ENV_TOOLS`] 分成两段是必要的：`deny` 收的是**整层**（读也不给），而 `ask` 收的
 /// 只是**动手**那一半。「读一个文件也要人按键」不是在收紧权限，是在把确认钮变成噪声
 /// ——而噪声会让人开始无脑按，那时它挡不住真正该挡的那一次。
-pub const ENV_WRITE_TOOLS: [&str; 4] = ["write_file", "edit_file", "delete_file", "run_command"];
+pub const ENV_WRITE_TOOLS: [&str; 5] = [
+    "write_file",
+    "edit_file",
+    "delete_file",
+    "run_command",
+    // `repair` 三件（`start` / `finish` / `discard`）都会改动东西：建分支与 worktree、
+    // 落一个 commit、删掉 worktree。**整个族都算动手**，不看具体动作——「只读的
+    // `discard`」这种细分只会让人以为其中某个动作是安全的。
+    "repair",
+];
 
 /// 这个工具属于环境层吗（档位管它）。
 pub fn is_env_tool(name: &str) -> bool {
@@ -605,6 +620,9 @@ impl ToolExecutor {
             "delete_file" => self.delete_file(call, ctx).await?,
             "list_dir" => self.list_dir(call, ctx).await?,
             "run_command" => self.run_command(call, ctx).await?,
+            // 修复轮（决策 210③④ / 票 10–12）：start 给一个可写的 worktree，finish 跑闸门
+            // → commit → 落提议，discard 回收。三件事的**序列**都在 `pipeline::repair` 里。
+            "repair" => self.repair(call, ctx).await?,
             "submit_metadata" => self.submit_metadata(call)?,
             "Skill" => self.skill(call)?,
             "spawn_sub_agent" => self.spawn_sub_agent(call, ctx).await?,
@@ -1314,6 +1332,179 @@ impl ToolExecutor {
             "counts": counts,
             "tasks_by_status": by_status,
         })))
+    }
+
+    /// `repair`（决策 210③④ / 票 10–12）：**修复轮的三步**。
+    ///
+    /// 它补的是这条链此前缺的那一格：`start_repair` / `run_repair_gate` / `commit_repair` /
+    /// `propose_repair` 全都实现好了，却没有任何生产调用者——值班长拿不到 worktree，也就没有
+    /// 合法的落点去写补丁（项目工作区在它的文件域之外，那是票 10 的硬约束）。
+    ///
+    /// 三步的**顺序是用法的一部分**，故这条动作的回复把下一步说清：
+    /// 1. `start`：建 worktree/branch，回一个**它写得进去**的绝对路径；
+    /// 2. （写代码：`write_file` / `edit_file` / `run_command`，域就是既有的家目录那一条）；
+    /// 3. `finish`：闸门 → 过了才 commit → diff → 落一条提议（**不设 TTL**，等人按合入）；
+    ///    设置 `task_id` 时顺带在那条任务上留下「等修复合入」的字样。
+    ///
+    /// `discard` 是**另一条路**（不是第三步）：不打算继续了就回收——**保留分支**，
+    /// 它是唯一的证据。
+    async fn repair(&self, call: &ToolCall, ctx: &ToolCallContext) -> Result<ToolOutcome> {
+        use crate::pipeline::repair;
+
+        let store = self.ledger_or_err()?.clone();
+        let args = Self::args(call)?;
+        let action = args.get("action").and_then(|v| v.as_str()).unwrap_or("");
+        let project_id = args
+            .get("project_id")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .trim()
+            .to_string();
+        if project_id.is_empty() {
+            return Ok(ToolOutcome::ok(
+                "repair 需要一个 project_id（用 read_projects 看有哪些项目）。",
+            ));
+        }
+        // 「查无此项目」「这个项目不是 git 仓」都是**正常回答**而不是工具故障：与
+        // `read_task` 的「查无此任务」同一姿态（决策 33 的 tool_retry_max 不该被笔误吃掉）。
+        let Some(project) = store.get_project(&project_id).await? else {
+            return Ok(ToolOutcome::ok(format!(
+                "台账里没有项目 {project_id}。用 read_projects 看已接入的清单。"
+            )));
+        };
+        // 归属只可能是**那一班**：`repair` 不在 `BUILTIN_TOOLS` 里，故阶段配置声明不出它
+        // （`PUT /stage-configs` 与启动校验会当场拒），节点也就永远看不到这个名字——
+        // 这条动作只有值班长够得到，而它每次调用都带班次（迁移 0012 的严格 XOR 由此成立）。
+        let session_id = ctx.session_id.clone().unwrap_or_default();
+
+        match action {
+            "start" => {
+                if let Err(e) = repair::repair_supported(&project) {
+                    return Ok(ToolOutcome::ok(format!("这个项目没法修：{e}")));
+                }
+                let repair_id = repair::new_repair_id();
+                let session = repair::start_repair(
+                    &self.home,
+                    std::path::Path::new(&project.local_path),
+                    &project.default_branch,
+                    &repair_id,
+                    &session_id,
+                )
+                .await?;
+                Ok(ToolOutcome::ok(format!(
+                    "修复 worktree 已就绪。\n\
+                     repair_id：{repair_id}\n\
+                     可写目录：{}\n\
+                     分支：{}（从 {} 分出，未进主干）\n\
+                     下一步：在**那个目录里**改代码（write_file / edit_file / run_command 的路径\
+                     都写在它下面），改完调用 repair(action=finish, project_id={project_id}, \
+                     repair_id={repair_id}, conclusion=…一句话诊断结论)。\
+                     改动在你按下「合入」之前不会进主干，所以**不要说「我已经修好了」**。",
+                    session.worktree.display(),
+                    session.branch,
+                    session.base_ref
+                )))
+            }
+            "finish" => {
+                let Some(repair_id) = args.get("repair_id").and_then(|v| v.as_str()) else {
+                    return Ok(ToolOutcome::ok(
+                        "repair(action=finish) 需要一个 repair_id——start 的回执里有它。",
+                    ));
+                };
+                let conclusion = args
+                    .get("conclusion")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .trim()
+                    .to_string();
+                if conclusion.is_empty() {
+                    return Ok(ToolOutcome::ok(
+                        "repair(action=finish) 需要一句 conclusion：这次改了什么、为什么\
+                         （它会进 commit message，三个月后靠它认账）。",
+                    ));
+                }
+                let session = repair::repair_session_for(
+                    &self.home,
+                    std::path::Path::new(&project.local_path),
+                    &project.default_branch,
+                    repair_id,
+                    &session_id,
+                )
+                .await?;
+                if !session.worktree.exists() {
+                    return Ok(ToolOutcome::ok(format!(
+                        "修复 worktree 不在（{}）。它可能已经被回收——重新 start 一次，\
+                         或者用 read_projects 确认这个项目还是那个项目。",
+                        session.worktree.display()
+                    )));
+                }
+                match repair::finish_repair_round(
+                    &store,
+                    &self.home,
+                    &project,
+                    &session,
+                    &conclusion,
+                    args.get("task_id").and_then(|v| v.as_str()),
+                    store.now(),
+                )
+                .await?
+                {
+                    repair::RepairRound::GateFailed { gate, note } => Ok(ToolOutcome::ok(format!(
+                        "闸门没过，**没有出 diff、也没有提提议**：{note}\n\
+                         读数：{}。改完再调一次 finish。",
+                        gate.iter()
+                            .map(|r| format!("{} 退出码 {}", r.kind, r.exit_code))
+                            .collect::<Vec<_>>()
+                            .join("、")
+                    ))),
+                    repair::RepairRound::Proposed { summary, .. } => {
+                        // 「等修复合入」的两处留痕在 `finish_repair_round` 里（那里才有完整的
+                        // 序列），这里只负责把话说明白。
+                        Ok(ToolOutcome::ok(format!(
+                            "闸门已过，改动已单独成 commit（带 `{}` 标记）并落成一条**待你按合入**\
+                             的提议：{summary}\n\
+                             diff 全文：{}/worktrees/repair-{repair_id}.diff。\
+                             合入永远由值班经理按——在那之前主干上没有你的改动。",
+                            repair::REPAIR_COMMIT_MARK,
+                            self.home.root().display()
+                        )))
+                    }
+                }
+            }
+            "discard" => {
+                let Some(repair_id) = args.get("repair_id").and_then(|v| v.as_str()) else {
+                    return Ok(ToolOutcome::ok(
+                        "repair(action=discard) 需要一个 repair_id——start 的回执里有它。",
+                    ));
+                };
+                let session = repair::repair_session_for(
+                    &self.home,
+                    std::path::Path::new(&project.local_path),
+                    &project.default_branch,
+                    repair_id,
+                    &session_id,
+                )
+                .await?;
+                // 与 `finish` 同一姿态：目录不在就是「已经收过了」，回一句话而不是让 git 报错
+                // ——「重复调一次 discard」不该看起来像工具坏了。
+                if !session.worktree.exists() {
+                    return Ok(ToolOutcome::ok(format!(
+                        "{} 这个 worktree 已经不在（早先回收过，或人自己删的）——分支 {} 仍在。",
+                        session.worktree.display(),
+                        session.branch
+                    )));
+                }
+                repair::finish_repair(std::path::Path::new(&project.local_path), &session, false)
+                    .await?;
+                Ok(ToolOutcome::ok(format!(
+                    "worktree 已回收（分支 {} 留着——它是这次修复唯一的证据）。",
+                    session.branch
+                )))
+            }
+            other => Ok(ToolOutcome::ok(format!(
+                "repair 的动作只有 start / finish / discard，收到的是「{other}」。"
+            ))),
+        }
     }
 
     /// `read_metrics`（票 01）：全局指标，**复用 `metrics::*` 纯函数口径**（决策 130② / 137）。

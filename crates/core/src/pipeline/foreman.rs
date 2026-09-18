@@ -91,7 +91,7 @@ pub struct ForemanToolSpec {
 /// A 层的六个新读数（票 01）**一律复用后端既有口径**，不新造一套：看板读任务表、
 /// 指标走 `metrics::*` 纯函数、项目 / 阶段配置 / 技能 / provider 各读自己那张表的既有读法。
 /// 唯一需要加工的是 provider：库里存的是**明文密钥**（决策 112），故只回显掩码。
-pub const FOREMAN_TOOL_SPECS: [ForemanToolSpec; 19] = [
+pub const FOREMAN_TOOL_SPECS: [ForemanToolSpec; 20] = [
     ForemanToolSpec {
         name: "read_task",
         layer: ForemanToolLayer::Read,
@@ -215,6 +215,24 @@ pub const FOREMAN_TOOL_SPECS: [ForemanToolSpec; 19] = [
                       命令的输出会作为工具回执回来，也会落进这个班次的命令台账。\
                       这条动作会不会立即执行由权限档位决定（`ask` 档要值班经理按键确认）。",
         parameters: r#"{"type":"object","properties":{"command":{"type":"string","description":"要执行的命令原文"},"cwd":{"type":"string","description":"工作目录（默认家目录根）"},"timeout_sec":{"type":"integer","description":"超时秒数"}},"required":["command"]}"#,
+    },
+    // ── 修复轮（决策 210③④ / 票 10–12）：**它的载体是环境**——在项目仓上拉一个 worktree、
+    //    跑闸门、落一个带标记的 commit，故它归 C 层由档位管（`ask` 下每步要按键、`auto`
+    //    下整轮自己跑完），而**合入永远人按**。它没有进托管自动集，也没有进 D 层：
+    //    `finish` 的产物本身就是一条提议，放 D 层会变成两层按不完的钮。
+    ForemanToolSpec {
+        name: "repair",
+        layer: ForemanToolLayer::Write,
+        description:
+            "起草一份补丁（三步走，**改动在你按下合入之前不进主干**）。\
+                      `start`：给某个项目拉一个独立的修复 worktree，回执里有可写目录与 \
+                      repair_id——**补丁只能写在那个目录里**（项目工作区在文件域之外）；\
+                      `finish`：跑闸门（lint + 测试）→ 过了才单独成一个带标记的 commit → \
+                      出 diff → 落一条等你按合入的提议（没过就什么都不出，回执里说得清是哪一步）；\
+                      `discard`：不修了，回收 worktree（分支留着当证据）。\
+                      顺序是用法的一部分：先 start、写完再 finish，finish 时给一句 conclusion\
+                      （它进 commit message）。绝不说「我已经修好了」——你只是提了一条等人按的提议。",
+        parameters: r#"{"type":"object","properties":{"action":{"type":"string","enum":["start","finish","discard"],"description":"要做的动作"},"project_id":{"type":"string","description":"修哪个项目（read_projects 里有 id）"},"repair_id":{"type":"string","description":"finish / discard：start 回执里那个 id"},"conclusion":{"type":"string","description":"finish：一句话诊断结论（进 commit message）"},"task_id":{"type":"string","description":"finish：若这次修复是为某个任务做的，填它的 id——那条任务上会留下「等修复合入」"}},"required":["action","project_id"]}"#,
     },
     // ── D 层：本服务的写接口（决策 206 / 207）。**一族一个工具 + 动作参数**：粒度对着
     //    `allowed_actions` 的类型走。这一层**不读档位**——「本服务自己的写接口需要人按
@@ -478,9 +496,11 @@ pub const FOREMAN_PERSONA: &str = "你是夜班车间的值班长，向值班经
      态势快照之外的细节用 read_task / read_conversation 自己查，不要凭印象猜。\
      你有时会**自己醒过来说话**（值守轮）：那一段不是回话，是你按事件主动播报——\
      语气照旧（只报事实与建议、不寒暄、短句优先），并说清是哪件事把你叫醒的。\
-     你也能**起草补丁**（改修复分支、过闸门、留下一个带标记的 commit）：那些改动在你\
-     按下之前**没有进主干**——所以只说「我改了什么、为什么、闸门过没过」，\
-     绝不说「我已经修好了」；它也**不会**被自动合入，等人按键。";
+     你也能**起草补丁**（`repair` 工具，三步）：先 `start` 拿一个独立的修复 worktree，\
+     在**那个目录里**改代码（项目工作区你写不进去），改完 `finish`——它跑闸门（lint + 测试），\
+     过了才单独成一个带标记的 commit、出一份 diff、落一条等人按合入的提议；没过就什么都不出，\
+     回执会说清是哪一步没过。你的改动在值班经理按下之前**没有进主干**——所以只说\
+     「我改了什么、为什么、闸门过没过」，绝不说「我已经修好了」；它也**不会**被自动合入。";
 
 /// 值班长的前言。**不复用** [`crate::agent::prompts::build_system_prompt`]。
 ///
