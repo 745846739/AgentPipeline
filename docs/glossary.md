@@ -47,7 +47,9 @@
 | **Pending** | 任务因阻塞进入的中断状态。不是一个 stage，而是任何 node 都可进入的状态。挂在**游标**上（`kanban_node_cursors.pending_reason_json`），任务级 `pending_reason` 是它的投影（决策 82） |
 | **PendingReason** | 阻塞原因结构体，包含 type（info_insufficient/conflict_wait/retry_exhausted/merge_approval 等）、stage、node、message、suggested_actions |
 | **Resume** | 从 pending 恢复执行。用户操作后按**恢复动作**（continue / skip / goto）清除 pending_reason，流水线从 checkpoint 继续；取消 / 拆分等**旁路动作**走各自专用 API（决策 69） |
-| **Stalled** | pending 超过 `pending_timeout_hours` 的标志位，看板高亮。不是独立 TaskStatus |
+| **Stalled** | pending 超过 `pending_timeout_hours` 的标志位，看板高亮。不是独立 TaskStatus。**与「调度器处置未生效」不是一回事**：它要求**所有**活游标都 pending（`has_pending_cursor && !has_runnable_cursor`），而后者恰恰是「游标仍 active」——那个判据**永远不满足**，这正是它此前零信号的原因（决策 209② / 票 05 / 票 13） |
+| **调度器处置未生效** | 一类卡死（决策 209② / 票 05 发现、票 13 收口）：run 已是终态（`timeout` / `failed`）而它对应的游标仍 `active`、任务仍 `running`。`check_timeouts` 只看 `active_runs()`（终态 run 不再被扫），`remind_pending_tasks` 的 stalled 判据又不成立——**既有调度器与既有台账之间的这条缝**。判据落在 `pipeline::unstick::stuck_evidence`（报出来与解开的用同一份） |
+| **best-effort 检查** | 一个只值一条警告的检查（如 `do_init` 的脏工作区判断）：失败或超时都**不阻塞**关键路径（决策 209 附注 61）。来历是 2026-09-17 的实测——它把 `支持rtk` 的 init 挂死了四小时（栈停在 `git2` 的 `open()`，被 macOS 拦住） |
 | **Archived** | 终态任务的软删除，通过 `archived_at` 时间戳表示。不是独立 TaskStatus |
 | **judge_disagreement** | validate_output 首判"不合格"而异族复判"合格"时的 pending context.kind（决策 135）。用户终审：continue 特判直接放行（不重跑校验），或 goto execute 打回（attempts +1） |
 
@@ -95,7 +97,13 @@
 
 | 术语 | 定义 |
 |------|------|
-| **KanbanScheduler** | 独立调度器，处理图外的定时/轮询逻辑。每 `tick_interval_sec`（默认 10s）tick 一次，另有时钟级 maintenance 任务 |
+| **KanbanScheduler** | 独立调度器，处理图外的定时/轮询逻辑。每 `tick_interval_sec`（默认 10s）tick 一次，另有时钟级 maintenance 任务。**票 05 起它还把发现写进值班长待办表**——日志不是通道，表才是 |
+| **值守（watch）** | 值班长从「答话的」变成「值守的」（决策 209）：调度器把发现写进**待办表**（`kanban_foreman_attention`，一事件一行）→ 去抖窗口攒批 → 窗口到期唤醒一次诊断轮 → 播报落进当前班次。**只在「需要有人管」的事件上唤醒**：节点成功、每轮心跳、每次工具调用都不唤醒（唤醒是花钱的，且是在没人在场的时候花） |
+| **播报（broadcast）** | 值守轮**自己醒过来**说的那一轮：落进会话（`assistant` 行，开头带后端加的 `【值守播报】`），前端据此把名牌渲染成「值班长 · 值守」——与有人问才说的话分开。诊断结论是「无需处理」时**静默**：不落播报行（`【无需处理】` 哨兵，§2.4） |
+| **待办（attention）** | 一条待记录的事件（`kanban_foreman_attention`）。去重键是 `(task_id, kind, occurred_at)`——`occurred_at` 是事件**发生**的时刻，不是写入时刻；`consumed_at IS NULL` 即未处理。九类：`task_pending` / `retry_exhausted` / `context_overflow` / `gate_failure` / `repeated_pending` / `scheduler_no_effect` / `owner_stuck` / `task_stale` / `slow_run`。**`slow_run` 是唯一只播报不唤醒的**（决策 66 的自适应告警没有可操作的动作） |
+| **托管（stewardship）** | **任务级**的一次授权（决策 210① / 票 08）：对一个指定任务，值班长可以**免按键** `task resume(continue)`——恰好一个动作。默认关；`kanban_tasks.stewardship_json` 一列装三件事（开着没有 / 自动动过几次 / 上次的指纹）。止损两条一起卡：**满 2 次**或**同一指纹**即停手、交回人按 |
+| **unstick** | 「解除僵死占用」（决策 210⑧ / 票 09）：摘进程内去重 + 清 `executor_owner` + 僵死 run 标终态 + 游标转 `pending`。与 `resume` 是两回事——**去重摘不掉时 `resume` 是空操作，还白吃托管的次数配额**。只对「调度器处置未生效」与「owner 持有超时」两类生效，正常在跑的任务踢不动 |
+| **修复提案（repair）** | 一条形态为 `repair` 的提议（决策 212① / 票 12）：载荷里带**没设 TTL**的修复现场（worktree / 分支 / 闸门读数 / diff）。执行它不是「一次工具调用」，而是「**合入一个分支**」——按下之前先 rebase 检查，冲突就拒执并列出文件 |
 | **Tick** | 调度器的一次轻量检查周期。检查超时、冲突恢复、依赖启动、并发准入、pending 提醒、stalled 标记 |
 | **Merge Approval** | merge 阶段等待用户在 GUI 审核 diff 并决定是否合入的状态。用户点击"合入"（`POST /tasks/{id}/merge/decision`，决策 119）后由 `merge.execute` 阶段 B 执行实际合并 |
 | **Conflict Wait** | architect 阶段检出文件/符号与活跃任务重叠后进入的 pending，冲突任务终态后自动恢复，属自动串行化 |

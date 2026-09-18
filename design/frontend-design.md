@@ -644,6 +644,8 @@ GET /tasks/{id}               → 详情页装载 + 断线重连后的全量校�
 | 对讲台急停轮折叠：两张以上一张都不展开；窄屏改「摘要条 + 输入坞」 | `frontend/src/lib/talkStops.ts`、`frontend/src/routes/Talk.svelte` | 决策 183 / 192 |
 | 值班长没回话的那一轮渲染成失败轮**并显示原因**（后端落的 `system` 账以 `【没跑起来】` 开头），不再是一条只有红轮、无处看原因的静默失败 | `frontend/src/routes/Talk.svelte` | 决策 211④；票 04 |
 | 主动播报与回话是两种轮：值守轮自己醒来说的那条名牌写「值班长 · 值守」（后端加的 `【值守播报】` 标记），有人问才说的话仍是「值班长」 | `frontend/src/routes/Talk.svelte` | 决策 209④；票 06 |
+| 修复提议的渲染与工具调用不同：显示闸门读数（过了哪几步 / 没过则明说「没有补丁」）与可展开、可复制的 diff；按钮文案是「合入」而不是「执行」 | `frontend/src/routes/Talk.svelte`、`frontend/src/lib/proposals.ts` | 决策 212①；票 12（同一个钮面，不新开第三个） |
+| 任务级托管的开关状态在任务上看得见（读回来是 `task.stewardship`；`enabled` 为真即「托管中」） | `frontend/src/api/types.ts` | 决策 210①；票 08（开关本身暂只有端点，界面开关未做） |
 | 宽屏矮窗口：状态区上限取「46vh」与「先留给时间线的那一份」的较小者——时间线恒有 160px 下限，确认钮不被挤成一条缝 | `frontend/src/routes/Talk.svelte` | 决策 208；四条几何断言在 `frontend/e2e/talk.spec.ts` 的 `expectProposalReachable` |
 | 对讲台的班次 chip 行：非 sticky、不动页头与顶栏，窄屏横滚不折行 | `frontend/src/routes/Talk.svelte` | 决策 204（三条几何约束见 `frontend/e2e/talk.spec.ts` 的 ⑭⑮） |
 | 换班次重置的是对话上下文，看板派生的东西（急停 / 值班板）一样不动 | `frontend/src/routes/Talk.svelte` | 决策 204；`resetSessionState()` 与它旁边那份「不重置」清单 |

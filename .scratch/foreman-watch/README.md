@@ -43,6 +43,23 @@
 | [13](issues/13-project-run-lifecycle.md) | 项目级 run 的生命周期终止者 | — |
 | [14](issues/14-closeout.md) | 收口：人格 / glossary / operations / 决策行 | 01–13 |
 
+## 落地状态（2026-09-18 收尾）
+
+**十四张票全部动过，其中 12 张 `done`、2 张 `partial`（差额都写在各自的票面末尾）：**
+
+| 票 | 状态 | 一句话 |
+|---|---|---|
+| 01–04 | done | 证据面：失败 run 落会话 / prompt 原文落库 / `read_diagnosis` / 系统节点留痕 + 对讲台失败回合 |
+| 05–07 | done | 值守：待办表 + 调度器接入 / 值守轮 + 播报 / 三重节流 + 分级诊断（+ 唤醒账） |
+| 08–09 | done | 托管：任务级开关 + D 层唯一例外 / `unstick` + 重启只提议 |
+| 10–11 | done | 修复载体：独立 worktree + 闸门 + 单独成 commit + diff |
+| 12 | **partial** | 修复提议（后端 + 前端已落地）；差：e2e 的几何量测、过期侧的 worktree 回收、目标项目「当场生效」那一路 |
+| 13 | done | 项目级 run 的终止者 |
+| 14 | partial | 收口：persona / glossary / operations / 决策行 / §12.3 / testing 目录；差：托管开关的**界面**（只有端点） |
+
+**一处全局的差额**：`/Applications/AgentPipeline.app` 里那份仍是本批之前的构建——要用上这些
+得重打桌面壳（会中断正在跑的实例），故没有擅自做。
+
 ## 四条不可换的顺序
 
 1. **证据面在前**（01–03）：没它，值守只能盲诊。诊断包是「能分析出代码 / prompt / 环境问题」的
