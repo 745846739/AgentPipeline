@@ -17,13 +17,14 @@
 **Status:** done
 
 - [x] 定下走哪条路（补齐菜单语义 / 降级），并说明理由
-- [ ] Escape 一定关得掉；点击面板外部一定关得掉
-- [ ] 关闭后焦点回到触发钮
-- [ ] 若保留 `role="menu"`：方向键可在项间移动、Home/End、Enter 激活
-- [ ] 触发钮有 `aria-haspopup` 与 `aria-controls`
-- [ ] e2e：打开 → Escape → 断言关闭；再打开 → 点空白 → 断言关闭；
+- [x] Escape 一定关得掉；点击面板外部一定关得掉
+- [x] 关闭后焦点回到触发钮（Escape 时若焦点在触发钮或面板里就还给它）
+- [ ] 若保留 `role="menu"`：方向键可在项间移动、Home/End、Enter 激活——
+      **不走这条**：降级掉了 `role=menu`，故方向键按 disclosure 模式收在 `window` 上（能走、能 Home/End、回车交给链接自身）
+- [x] 触发钮有 `aria-controls`；**`aria-haspopup` 有意不加**（理由见实施记录）
+- [x] e2e：打开 → Escape → 断言关闭；再打开 → 点空白 → 断言关闭；
       再打开 → ArrowDown → 断言焦点进入第一项
-- [ ] e2e：断言触发钮的 `aria-haspopup` / `aria-controls` 指向真实元素
+- [x] e2e：断言触发钮的 `aria-controls` 指向**真实存在**的元素（`aria-haspopup` 本条不适用，见实施记录）
 
 **边界.** 下拉里每一项仍是能跳任务详情的可点项——别为了菜单语义把导航改成非链接语义。
 

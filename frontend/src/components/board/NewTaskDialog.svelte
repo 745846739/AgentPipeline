@@ -64,11 +64,17 @@
           .filter(Boolean),
         review_mode: reviewMode,
       });
+      if (!task?.id) {
+        // 取不到 id 就说出来（票 10）：不然「创建成功却没跳」看起来像没建成，
+        // 而任务其实已经在库里了。对话框**不关**——用户还能看到这句话。
+        error = '任务已创建，但服务端没有回传任务 id，无法跳到它。请回看板刷新后手动打开。';
+        return;
+      }
       onclose();
       title = '';
       description = '';
       dependsOn = '';
-      if (task) router.navigate(`/task/${task.id}`);
+      router.navigate(`/task/${task.id}`);
     } catch (err) {
       error = (err as Error).message;
     } finally {

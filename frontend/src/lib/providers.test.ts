@@ -100,6 +100,27 @@ describe('provider 表单校验', () => {
     expect(validateProviderDraft({ ...base, context_window: 0 })?.field).toBe('context_window');
     expect(validateProviderDraft({ ...base, context_window: 1.5 })?.field).toBe('context_window');
   });
+
+  it('base_url：空值合法，形状不对当场拦下（票 11 / R2-13）', () => {
+    const base = { ...emptyProviderDraft(), model: 'gpt-4o' };
+
+    // 空 = 用官方默认，合法
+    expect(validateProviderDraft({ ...base, base_url: '' })).toBeNull();
+    expect(validateProviderDraft({ ...base, base_url: '   ' })).toBeNull();
+    // 正常地址两种协议都收
+    expect(validateProviderDraft({ ...base, base_url: 'https://api.openai.com/v1' })).toBeNull();
+    expect(validateProviderDraft({ ...base, base_url: 'http://127.0.0.1:8788/v1' })).toBeNull();
+
+    // 实测里那个值：`not a url` 此前直接落库
+    const bad = validateProviderDraft({ ...base, base_url: 'not a url' });
+    expect(bad?.field).toBe('base_url');
+    expect(bad?.message).toMatch(/http/);
+    // 只收 http/https：ftp / file / 无协议的裸主机都不算
+    expect(validateProviderDraft({ ...base, base_url: 'ftp://x' })?.field).toBe('base_url');
+    expect(validateProviderDraft({ ...base, base_url: 'file:///tmp/x' })?.field).toBe('base_url');
+    expect(validateProviderDraft({ ...base, base_url: 'api.openai.com' })?.field).toBe('base_url');
+    expect(validateProviderDraft({ ...base, base_url: 'https://' })?.field).toBe('base_url');
+  });
 });
 
 describe('buildProviderTest（决策 160：测试连接）', () => {

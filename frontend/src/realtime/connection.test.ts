@@ -73,6 +73,51 @@ describe('TaskStream 主动重连', () => {
 
     conn.stop();
   });
+
+  it('掉线之后接回来的那一次要对齐一次（断流期间的事件已经永久丢了）', async () => {
+    // 第一次请求直接 500（模拟断流），第二次起成功
+    let attempt = 0;
+    const opened: ReturnType<typeof openStream>[] = [];
+    const fetchMock = vi.fn(async (_url: string, init?: RequestInit) => {
+      attempt += 1;
+      if (attempt === 1) return new Response('nope', { status: 500 });
+      const stream = openStream(init!.signal!);
+      opened.push(stream);
+      return new Response(stream.stream, {
+        status: 200,
+        headers: { 'content-type': 'text/event-stream' },
+      });
+    });
+    vi.stubGlobal('fetch', fetchMock);
+
+    const recalibrated: string[] = [];
+    const statuses: string[] = [];
+    const conn = new TaskStream(
+      't1',
+      {
+        onEvent: () => {},
+        onStatus: (_id, status) => statuses.push(status),
+        onRecalibrate: (id) => recalibrated.push(id),
+      },
+      // 退避压到最小：这条用例只验「接回来之后对齐一次」，不验退避的时长
+      { baseDelayMs: 1, maxDelayMs: 1 },
+    );
+    conn.start();
+
+    await vi.waitFor(() => expect(recalibrated).toEqual(['t1']), { timeout: 3000 });
+    expect(statuses, '顺序：先报断线，再报接回来，然后才对齐').toEqual([
+      'connecting',
+      'error',
+      'connecting',
+      'open',
+    ]);
+    // 只对齐一次：正常收事件的那段时间不该反复 refetch
+    opened[0].push('data: {"type":"stalled","task_id":"t1","branch":"main"}\n\n');
+    await vi.waitFor(() => expect(opened.length).toBe(1));
+    expect(recalibrated).toEqual(['t1']);
+
+    conn.stop();
+  });
 });
 
 describe('TaskStream 路径覆盖（票 03：值班长流复用同一解析层）', () => {

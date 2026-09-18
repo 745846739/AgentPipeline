@@ -65,12 +65,38 @@ export interface ProviderFieldError {
   message: string;
 }
 
+/**
+ * `base_url` 的形状（票 11 / R2-13）：**空值合法**（用官方默认），非空时必须是
+ * `http://` / `https://` 开头、且带主机的地址。
+ *
+ * 为什么不只是「非空就算」：填错了（`not a url`）此前照单落库，字段零报错、列表里逐字显示，
+ * 而后果要等到某个任务真跑模型时才炸——那离填写现场隔着好几屏。当场拦下是唯一划算的位置。
+ * 只认 http/https：适配器走的就是这两条，`ftp://x` 与 `file://x` 都不该被放行。
+ */
+export function isUsableBaseUrl(raw: string): boolean {
+  const value = raw.trim();
+  if (value === '') return true;
+  let parsed: URL;
+  try {
+    parsed = new URL(value);
+  } catch {
+    return false;
+  }
+  return (parsed.protocol === 'http:' || parsed.protocol === 'https:') && parsed.hostname !== '';
+}
+
 /** 表单校验；返回 null 表示通过。 */
 export function validateProviderDraft(draft: ProviderDraft): ProviderFieldError | null {
   if (!draft.vendor.trim()) return { field: 'vendor', message: '请填写厂商（vendor）。' };
   if (!draft.model.trim()) return { field: 'model', message: '请填写模型名（model）。' };
   if (!Number.isInteger(draft.context_window) || draft.context_window <= 0) {
     return { field: 'context_window', message: 'context_window 必须是正整数。' };
+  }
+  if (!isUsableBaseUrl(draft.base_url)) {
+    return {
+      field: 'base_url',
+      message: 'base_url 要留空（用官方默认）或写成 http:// 或 https:// 开头的完整地址。',
+    };
   }
   return null;
 }

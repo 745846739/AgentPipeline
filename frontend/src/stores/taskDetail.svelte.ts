@@ -13,6 +13,7 @@ import {
   type SplitTaskSpec,
 } from '../api/client';
 import { submitAllowedAction } from '../lib/actionSubmit';
+import { actionKey } from '../lib/actions';
 import type {
   AllowedAction,
   BranchCursor,
@@ -64,6 +65,14 @@ class TaskDetailStore {
 
   busyKey = $state<string | null>(null);
   actionError = $state<string | null>(null);
+  /**
+   * 实时流的状态（票 13 / R2-15）。看板早就有这一档，详情页此前**没有接** `onStatus`，
+   * 于是服务器重启或网络断掉之后，命令、会话增量、状态轨道**静静停止更新**，
+   * 页面看起来一切健康。
+   */
+  connectionState = $state<'idle' | 'open' | 'error'>('idle');
+  /** 断线时提交动作的提示（不是错误）：说清「发出去了，回执可能要等」（票 13）。 */
+  actionNote = $state<string | null>(null);
 
   private streamManager: StreamManager;
   private refetchTimer: ReturnType<typeof setTimeout> | null = null;
@@ -74,6 +83,13 @@ class TaskDetailStore {
   constructor() {
     this.streamManager = new StreamManager({
       onEvent: (_taskId, event) => this.handleEvent(event),
+      // 与看板同一个口径（票 13）：`open` 是健康态、`error` 是断了，而
+      // `idle` / `connecting` / `closed` **保持上一个已知状态**——流在重连途中的一瞬间
+      // 不是「断了」（一进页面就闪一条红横幅是误报），只有真出错才翻成 `error`。
+      onStatus: (_taskId, status) => {
+        this.connectionState =
+          status === 'open' ? 'open' : status === 'error' ? 'error' : this.connectionState;
+      },
       onRecalibrate: () => void this.load(this.id ?? undefined, true),
     });
   }
@@ -299,6 +315,7 @@ class TaskDetailStore {
     const key = actionKey(action, cursorId);
     this.busyKey = key;
     this.actionError = null;
+    this.actionNote = null;
 
     try {
       const cursor = this.cursorFor(action, cursorId);
@@ -308,7 +325,12 @@ class TaskDetailStore {
         input: options.input,
         pendingType,
       });
-      // 成功不立即复位：等 SSE 回执（safety timeout 兜底）
+      // 成功不立即复位：等 SSE 回执（safety timeout 兜底）。
+      // 流没连着时「等回执」会等于**静默等 30 秒**（票 13 / R2-15）——那就直说。
+      if (this.connectionState !== 'open') {
+        this.actionNote =
+          '实时流未连通：这次动作已经发出，界面要等重连之后才会更新（最长等 30 秒）。';
+      }
       this.busyTimer = setTimeout(() => {
         if (this.busyKey === key) this.clearBusy();
       }, 30_000);
@@ -387,10 +409,6 @@ class TaskDetailStore {
       throw err;
     }
   }
-}
-
-function actionKey(action: AllowedAction, cursorId?: string): string {
-  return `${action.action}:${action.cursor_id ?? cursorId ?? ''}`;
 }
 
 export const taskDetail = new TaskDetailStore();

@@ -19,12 +19,31 @@ topbarH=78   dossierTop=56   tagTop=42   headerBottom=78   stickyTopRule="56px"
 
 **Blocked by:** None（can start immediately）
 
-**Status:** open
+**Status:** done
 
-- [ ] 档案盒的 sticky `top` 取顶栏真实高度（CSS 变量或与 `--sbar-h` 同类的做法），不再写死
-- [ ] 铭牌（`.dtag`）滚到顶时完整可见，不被顶栏覆盖
-- [ ] e2e：1280 宽、滚动到档案盒吸顶 → 断言 `.dtag` 的矩形与顶栏矩形**交集为 0**，
+- [x] 档案盒的 sticky `top` 取顶栏真实高度（CSS 变量或与 `--sbar-h` 同类的做法），不再写死
+- [x] 铭牌（`.dtag`）滚到顶时完整可见，不被顶栏覆盖
+- [x] e2e：1280 宽、滚动到档案盒吸顶 → 断言 `.dtag` 的矩形与顶栏矩形**交集为 0**，
       且 `.dtag` 顶部在视口内
-- [ ] 回归：档案盒的动作行定位不变（六个 e2e 文件依赖）
+- [x] 回归：档案盒的动作行定位不变（六个 e2e 文件依赖）
 
 **边界.** 顶栏在窄档可能折成两行而更高——用测量值或变量，别换成另一个魔数。
+
+## 实施记录（2026-09-18）
+
+**落点**
+
+| 处 | 改动 |
+|---|---|
+| `src/components/layout/TopBar.svelte` | `bind:offsetHeight={topbarH}` + 一个 `$effect` 把实测值写到 `document.documentElement` 的 `--topbar-h`。用 `offsetHeight`（**含** 2px 下框）而不是 `clientHeight` |
+| `src/app.css` | `:root { --topbar-h: 78px }` 作兜底（首帧、或 JS 未跑到时） |
+| `src/components/task/PendingDossier.svelte` | `.dossier { top: 56px }` → `top: calc(var(--topbar-h) + 16px)` |
+
+**为什么 +16px**：铭牌 `.dtag` 自己 `top: -16px` 向上压在框沿上——只让位顶栏高度，
+那 16px 的铭牌照样钻到顶栏底下。这一条写进了 CSS 注释。
+
+**一句话说明为什么不换成另一个魔数**：顶栏在窄档会折成两行而更高（移动款约 138px），
+写死任何值都只是「在某一档对」；量出来的值在每一档都对。
+
+**证据**：`frontend/e2e/ux2-geometry.spec.ts` ③「档案盒吸顶时『等你拍板』铭牌不被顶栏盖住」
+——1280 宽滚动到吸顶，断言 `.dtag` 矩形与顶栏矩形交集为 0 且铭牌在视口内。

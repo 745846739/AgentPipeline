@@ -1,6 +1,7 @@
 import { describe, expect, it } from 'vitest';
 import type { AllowedAction, BranchCursor } from '../api/types';
 import {
+  actionKey,
   allowsFreeInput,
   endpointFor,
   groupActionsByBranch,
@@ -97,5 +98,58 @@ describe('allowsFreeInput — 只有 info_insufficient 有自由输入（决策 
     expect(
       allowsFreeInput({ action: 'cancel', kind: 'side_effect', label: '取消', requires_input: true }),
     ).toBe(false);
+  });
+});
+
+describe('actionKey — 同名不同落点不是一个动作', () => {
+  /** `retry_exhausted@develop` 的两条 goto（crates/core/src/actions.rs 的动作集）。 */
+  const retryDevelop: AllowedAction[] = [
+    {
+      action: 'goto',
+      kind: 'resume',
+      label: '重试执行',
+      cursor_id: 'c-dev',
+      target: { stage: 'develop', node: 'execute' },
+    },
+    { action: 'skip', kind: 'resume', label: '强制进入下一阶段', cursor_id: 'c-dev' },
+    {
+      action: 'goto',
+      kind: 'resume',
+      label: '带失败摘要回架构设计修订',
+      cursor_id: 'c-dev',
+      target: { stage: 'architect-design', node: 'validate_input' },
+    },
+  ];
+
+  it('同一游标下的两条 goto 各是各的（否则渲染层撞 key、提交中态同时点亮两颗）', () => {
+    const keys = retryDevelop.map((a) => actionKey(a, 'c-dev'));
+    expect(new Set(keys).size).toBe(keys.length);
+    expect(keys[0]).not.toBe(keys[2]);
+  });
+
+  it('落点相同才算同一个动作：对象重造不影响身份', () => {
+    const a: AllowedAction = {
+      action: 'goto',
+      kind: 'resume',
+      label: '重试执行',
+      cursor_id: 'c-dev',
+      target: { stage: 'develop', node: 'execute' },
+    };
+    expect(actionKey({ ...a }, 'c-dev')).toBe(actionKey(a, 'c-dev'));
+    // 动作自带游标优先（决策 91）——显式传入的所属分支游标只在它缺省时兜底
+    expect(actionKey(a, 'c-test')).toBe(actionKey(a, 'c-dev'));
+    const bare: AllowedAction = { action: 'goto', kind: 'resume', label: '重试执行' };
+    expect(actionKey(bare, 'c-test')).not.toBe(actionKey(bare, 'c-dev'));
+  });
+
+  it('没有落点的动作仍是「动作名 + 游标」（游标缺省回退到所属分支）', () => {
+    const cont: AllowedAction = {
+      action: 'continue',
+      kind: 'resume',
+      label: '补充信息并继续',
+      requires_input: true,
+    };
+    expect(actionKey(cont)).toBe('continue:::');
+    expect(actionKey(cont, 'c-main')).toBe('continue:c-main::');
   });
 });

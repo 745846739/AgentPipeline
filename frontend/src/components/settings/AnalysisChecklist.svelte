@@ -40,7 +40,9 @@
         <li class:miss={!item.ok}>
           <span class="mk">{item.ok ? '✓' : '—'}</span>
           <span class="lb">{item.label}</span>
-          <span class="vl mono">{item.value ?? '未探测到'}</span>
+          <!-- 探测到的是**路径 / 版本串**，被截断时尾巴才是区别（票 17 / R2-22）：
+               悬停看全，与 `TrackSegmentBars` 的既有写法同一条。 -->
+          <span class="vl mono" title={item.value ?? '未探测到'}>{item.value ?? '未探测到'}</span>
         </li>
       {/each}
     </ul>

@@ -51,6 +51,19 @@ export function sharePanel(input: {
 }
 
 /**
+ * 「这次绑定是谁定的」那句话（决策 186 / 票 15）。
+ *
+ * **同一个值只许有一个说法**：此前 `Share.svelte` 里两处各写了一份三元表达式，而
+ * `bind_source === 'settings'` 一处叫「界面设置」、另一处叫「界面上的选择」——同一个东西
+ * 在同一个页面上有两个名字。定义收在这里，模板只调它。
+ */
+export function bindSourceLabel(source: string | null | undefined): string {
+  if (source === 'startup') return '启动参数';
+  if (source === 'settings') return '界面上的选择';
+  return '配置文件';
+}
+
+/**
  * 退让端口要说的话（决策 213），不说则 `null`。
  *
  * 后端只在**首选端口被别的进程占着**时退让到内核随机端口（`/server-info.port_source`

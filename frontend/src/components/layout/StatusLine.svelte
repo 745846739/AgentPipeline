@@ -1,6 +1,7 @@
 <script lang="ts">
   import { onDestroy, onMount } from 'svelte';
   import { board } from '../../stores/board.svelte';
+  import { formatClockAt } from '../../lib/format';
   import { formatTokens } from '../../lib/pipeline';
   import { GEOMETRY, gaugeFilled } from '../../theme/contract';
   import Gauge from '../render/Gauge.svelte';
@@ -48,8 +49,9 @@
     } catch {
       // 忽略
     }
+    // 时钟也走全站口径（票 15）：时间格式只有 `lib/format.ts` 一处出处
     const tick = () => {
-      clock = new Date().toLocaleTimeString('zh-CN', { hour12: false });
+      clock = formatClockAt(new Date());
     };
     tick();
     timer = setInterval(tick, 1000);
@@ -160,6 +162,32 @@
     margin-left: auto;
     color: var(--text-2);
     font-variant-numeric: tabular-nums;
+  }
+
+  /* ── 中间档（决策 215 / 票 08 / R2-10）：480–748 不再静默裁切 ──
+     实测这一行在 749px 之下**恒定**需要 748px 宽（`clockRight=748`），此前既没有折行也没有
+     横滚，于是时钟整块、主题钮的一部分安静地消失。取舍按决策 215：**先舍在看板列头与过滤槽
+     上都有同一个数的三格汇总**（约 220px），再舍纯视觉量表（约 110px，数字逐字保留）。
+     容器同时加一条横滚兜底——**舍格优先、可滚兜底，绝不静默裁切**；滚动条不占高
+     （`--sbar-h` 参与对讲台的高度公式，这里不能长出 15px 去动那笔账），与 `.slots` /
+     `.navbar` / `.tabs` 的既有手法一致。 */
+  @media (max-width: 748px) {
+    .statusline {
+      gap: 10px;
+      overflow-x: auto;
+      scrollbar-width: none;
+    }
+    .statusline::-webkit-scrollbar {
+      display: none;
+    }
+    .statusline .dep {
+      display: none;
+    }
+  }
+  @media (max-width: 560px) {
+    .statusline .tok :global(.gauge) {
+      display: none;
+    }
   }
 
   @media (max-width: 479px) {

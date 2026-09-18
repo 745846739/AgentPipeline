@@ -59,6 +59,22 @@
 
   let newTaskOpen = $state(false);
 
+  /**
+   * 顶栏**实测**高度（含 2px 下框），写进 `document.documentElement` 的 `--topbar-h`（票 09）。
+   *
+   * 为什么不能写死：顶栏在窄档会折成两行而更高（桌面 78–81px，移动款约 138px），
+   * 而钉在它下面的东西（详情页的档案盒）要按**这一档的真实值**让位——写死一个数，
+   * 换一档就错（56px 那个旧值就是这么把「等你拍板」铭牌送到顶栏底下的）。
+   * 用 `offsetHeight` 而不是 `clientHeight`：后者不含边框，而压在顶栏下沿的那 2px 框
+   * 也是「被盖住」的一部分。
+   */
+  let topbarH = $state(0);
+  $effect(() => {
+    if (typeof document === 'undefined') return;
+    const h = topbarH;
+    if (h > 0) document.documentElement.style.setProperty('--topbar-h', `${h}px`);
+  });
+
   const sessionName = $derived(
     board.projects.find((p) => p.id === board.projectId)?.name ?? 'AgentPipeline',
   );
@@ -179,7 +195,7 @@
 
 <svelte:window onclick={onWindowClick} onkeydown={onWindowKey} />
 
-<header class="top">
+<header class="top" bind:offsetHeight={topbarH}>
   <div class="topbar">
     <div class="bar-top">
       <span class="logo" aria-hidden="true"></span>

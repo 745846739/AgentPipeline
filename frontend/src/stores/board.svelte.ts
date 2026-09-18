@@ -1,5 +1,12 @@
 import { createTask, getTask, listProjects, listTasks } from '../api/client';
-import type { AllowedAction, BranchCursor, CreateTaskPayload, Project, TaskListItem } from '../api/types';
+import type {
+  AllowedAction,
+  BranchCursor,
+  CreateTaskPayload,
+  Project,
+  Task,
+  TaskListItem,
+} from '../api/types';
 import { submitAllowedAction } from '../lib/actionSubmit';
 import { notificationClassForEvent } from '../lib/notificationPolicy';
 import { StreamManager } from '../realtime/connection';
@@ -156,12 +163,20 @@ class BoardStore {
     this.filter = filter;
   }
 
-  async createTask(payload: CreateTaskPayload): Promise<TaskListItem | null> {
+  /**
+   * 新建任务，返回**服务端建的那一个**（票 10 / R2-12）。
+   *
+   * 此前这里丢掉 `POST /tasks` 的返回值、改从 `loadTasks()` 的结果里取 `tasks[0]`——
+   * 而 `loadTasks` 是按 `board.projectId` 过滤的，对话框的项目却是它自己的局部状态：
+   * 两个 id 可以不同，于是「在 B 里建任务」跳到「A 的某个任务」，A 一个任务都没有时
+   * 干脆哪儿也不去。现在以响应里的那个 id 为准，与看板当前在看哪个项目无关。
+   */
+  async createTask(payload: CreateTaskPayload): Promise<Task | null> {
     this.error = null;
     try {
-      await createTask(payload);
+      const { task } = await createTask(payload);
       await this.loadTasks();
-      return this.tasks[0] ?? null;
+      return task ?? null;
     } catch (err) {
       this.error = (err as Error).message;
       throw err;

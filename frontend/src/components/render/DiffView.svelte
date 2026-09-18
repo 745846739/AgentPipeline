@@ -19,7 +19,7 @@
   {#each parsed.files as file (file.path)}
     <div class="dfile">
       <h3>
-        <span class="path mono">{file.path}</span>
+        <span class="path mono" title={file.path}>{file.path}</span>
         <span class="st {file.status}">{statusLabel[file.status]}</span>
         <span class="fstat mono">+{file.additions} −{file.deletions}</span>
       </h3>
@@ -54,6 +54,10 @@
     margin-bottom: 6px;
   }
   .path {
+    /* 值列在 flex 行里默认 `min-width: auto`，于是它**缩不到内容宽度以下**——长路径会把
+       这一行连同面板顶宽，`text-overflow: ellipsis` 永远不触发。`min-width: 0` 是先决条件；
+       `title` 让被截断的那条尾巴仍可回看（票 17 / R2-22）。 */
+    min-width: 0;
     overflow: hidden;
     text-overflow: ellipsis;
     white-space: nowrap;

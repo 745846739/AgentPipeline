@@ -182,7 +182,7 @@
         <div class="banner error" role="alert">动作提交失败：{board.actionError}</div>
       {/if}
       {#if board.connectionState === 'error'}
-        <div class="banner">实时流已断开，正在重连…（看板仍每 10s 对齐一次）</div>
+        <div class="banner" role="status">实时流已断开，正在重连…（看板仍每 10s 对齐一次）</div>
       {/if}
 
       {#if board.projects.length === 0 && !board.loading}

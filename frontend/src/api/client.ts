@@ -59,12 +59,45 @@ export class ApiError extends Error {
   }
 }
 
+/**
+ * 请求的默认超时（票 12 / R2-14）。**全站唯一出处**，各页不再各写一个。
+ *
+ * 为什么必须有：`fetch` 在「TCP 连上但不回包」时**不会自己失败**——此前全仓没有一处
+ * 传 `signal`、也没有 `AbortSignal.timeout`，于是技能安装的 `installing` 永不复位、
+ * 市场列表卡在「正在读 X…」、指标页的按钮一直禁着，唯一的出路是刷新整页。
+ *
+ * 取 30s：比一切正常端点的实测慢得多（本地 axum 是毫秒级），又比「用户以为死了」短。
+ * 已知慢的那条链（项目分析）自带 60s 的**轮询**上限（`lib/analysis.ts` 的
+ * `ANALYSIS_POLL_TIMEOUT_MS`），单次请求仍走这个兜底；值班长那一轮要等模型把话说完，
+ * 显式放宽到 3 分钟——**慢是那几个调用的属性，不该把全站的兜底一起拉长**。
+ */
+export const REQUEST_TIMEOUT_MS = 30_000;
+
 interface RequestOptions {
   method?: string;
   body?: unknown;
   /** 期望纯文本（命令输出 / 产出文件）。 */
   text?: boolean;
   signal?: AbortSignal;
+  /** 本次调用的超时（毫秒）；缺省 `REQUEST_TIMEOUT_MS`。 */
+  timeoutMs?: number;
+}
+
+/**
+ * `fetch` 的异常 → 界面口径的错误（票 12 / R2-14）。
+ *
+ * **导出是为了可测**：超时与「网络本身不通」要说得出来区别——前者是「等太久了，再试一次
+ * 可能就好」，后者是「连不上，先看服务在不在」。押成同一句话，用户就失去下一步。
+ *
+ * `TimeoutError` 是 `AbortSignal.timeout` 的产物；`AbortError` 只有在**没有调用方 signal**
+ * 时才归到超时（有调用方 signal 的那种 AbortError 是调用方主动取消，不是超时）。
+ */
+export function mapRequestError(err: unknown, timeoutMs: number, hasCallerSignal: boolean): ApiError {
+  const e = err as Error;
+  if (e?.name === 'TimeoutError' || (e?.name === 'AbortError' && !hasCallerSignal)) {
+    return new ApiError(0, `请求超时（${Math.round(timeoutMs / 1000)} 秒没有回应）。`);
+  }
+  return new ApiError(0, `网络请求失败：${e?.message ?? String(err)}`);
 }
 
 async function request<T>(path: string, opts: RequestOptions = {}): Promise<T> {
@@ -84,16 +117,32 @@ async function request<T>(path: string, opts: RequestOptions = {}): Promise<T> {
     headers['Content-Type'] = 'application/json';
   }
 
+  // 超时与调用方自己的 signal 合成一个。老内核没有 `AbortSignal.any` 时只能二选一，
+  // 这里**保调用方给的取消**（那是显式意图：调用方说撤就撤），超时那一条不生效；
+  // 今天全仓没有一处传 `signal`，两条路都走不到这一格。宁可少一层兜底，也不悄悄
+  // 吞掉调用方的取消。
+  const timeoutMs = opts.timeoutMs ?? REQUEST_TIMEOUT_MS;
+  let signal = opts.signal;
+  try {
+    const timeout = AbortSignal.timeout(timeoutMs);
+    signal =
+      opts.signal && typeof AbortSignal.any === 'function'
+        ? AbortSignal.any([opts.signal, timeout])
+        : (opts.signal ?? timeout);
+  } catch {
+    // 没有 `AbortSignal.timeout`（旧内核）：保持调用方给的那个，至少不更坏
+  }
+
   let res: Response;
   try {
     res = await fetch(apiUrl(path), {
       method,
       headers,
       body: opts.body !== undefined ? JSON.stringify(opts.body) : undefined,
-      signal: opts.signal,
+      signal,
     });
   } catch (err) {
-    throw new ApiError(0, `网络请求失败：${(err as Error).message}`);
+    throw mapRequestError(err, timeoutMs, opts.signal !== undefined);
   }
 
   if (!res.ok) {
@@ -144,8 +193,8 @@ export function getTask(id: string, signal?: AbortSignal): Promise<TaskDetail> {
   return request<TaskDetail>(`/tasks/${encodeURIComponent(id)}`, { signal });
 }
 
-export function createTask(payload: CreateTaskPayload): Promise<{ task: unknown }> {
-  return request('/tasks', { method: 'POST', body: payload });
+export function createTask(payload: CreateTaskPayload): Promise<{ task: Task }> {
+  return request<{ task: Task }>('/tasks', { method: 'POST', body: payload });
 }
 
 export function getFlow(id: string, signal?: AbortSignal): Promise<FlowResponse> {
@@ -623,6 +672,8 @@ export function sendForemanMessage(
   return request<ForemanSendResult>('/foreman/messages', {
     method: 'POST',
     body: { text, session_id: sessionId ?? null },
+    // 这一轮要等模型回话：默认 30s 兜底对它偏紧，显式放宽到 3 分钟（票 12 的口径）
+    timeoutMs: 180_000,
   });
 }
 

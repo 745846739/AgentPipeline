@@ -24,14 +24,36 @@
 
 **Blocked by:** None（can start immediately）
 
-**Status:** open
+**Status:** done
 
-- [ ] `request()` 有默认超时（统一口径），超时给出可识别的错误
-- [ ] 长操作（安装 / 市场读取 / 指标加载）暴露「取消」或至少在超时后复位按钮
-- [ ] `installing` / `listing` 改成按目标键控的集合，互不覆盖（或加并发护栏）
-- [ ] 命令输出失败：把 `commandOutputError` 渲染出来，不再永远说「正在加载」
-- [ ] 单测：超时映射成的错误消息；`commandOutputError` 的渲染分支可达
-- [ ] e2e：`page.route` 挂起不响应 → 断言超时后按钮复位且有可读的错误
-- [ ] e2e：命令输出接口返回 500 → 断言面板显示失败而不是「正在加载」
+- [x] `request()` 有默认超时（统一口径），超时给出可识别的错误
+- [x] 长操作（安装 / 市场读取 / 指标加载）暴露「取消」或至少在超时后复位按钮
+- [x] `installing` / `listing` 改成按目标键控的集合，互不覆盖（或加并发护栏）
+- [x] 命令输出失败：把 `commandOutputError` 渲染出来，不再永远说「正在加载」
+- [x] 单测：超时映射成的错误消息；`commandOutputError` 的渲染分支可达
+- [x] e2e：`page.route` 挂起不响应 → 断言超时后按钮复位且有可读的错误
+- [x] e2e：命令输出接口返回 500 → 断言面板显示失败而不是「正在加载」
 
 **边界.** 超时值要有单一出处（别每页各写一个），但不新建抽象层——放在 `api/client.ts` 即可。
+
+## 实施记录（2026-09-18）
+
+**落点**
+
+| 处 | 改动 |
+|---|---|
+| `src/api/client.ts` | `REQUEST_TIMEOUT_MS = 30_000`（**单一出处**）；`RequestOptions.timeoutMs` 可覆盖；用 `AbortSignal.timeout` + `AbortSignal.any` 与调用方 signal 合成；`mapRequestError(err, timeoutMs, hasCallerSignal)` 导出（可单测）——超时映射成「请求超时（Ns）」而**不是** `AbortError` 那种内部字眼 |
+| `src/api/client.ts` | 值班长发话单独放宽到 180s（`timeoutMs: 180_000`）：它会等模型把一整轮说完，30s 会把正常的长回话判成超时 |
+| `src/routes/SettingsMarket.svelte` | `installing` / `listing` / `refreshing` 三个单槽 → **按目标键控的集合**（`Record<string, true>` + `isInstalling / markInstalling / clearInstalling` 等），`finally` 只清自己那一格；超时后按钮自然复位 |
+| `src/components/task/CommandLog.svelte` | 新增 `errorFor` 属性：失败分支渲染 `.cmdout.failed[role=alert]`（「完整输出没读回来」），不再落到「正在加载完整输出…」；`outputText` 的兜底文案改成「（完整输出未取回，以上是 preview）」 |
+| `src/routes/TaskDetail.svelte` | 把 `taskDetail.commandOutputError` 接进 `CommandLog`（**此前全仓没人读它**） |
+
+**取舍**：没有加「取消」按钮，也没有把超时值做成每页可配——票面的要求是「超时后按钮
+复位 + 有可读错误」，而统一 30s 已经让每个长寿操作有出口。值班长那一处是唯一例外，
+理由写在代码里（长回话不是故障）。
+
+**证据**：
+- 单测 `src/api/client.test.ts`（超时映射出的消息、调用方 signal 与超时合成）；
+  `src/components/task/CommandLog.test.ts`（失败分支可达、不再出现「正在加载」）。
+- e2e `frontend/e2e/ux2-resilience.spec.ts` ①（命令输出 500 → 面板说失败）与
+  ③（`page.route` 挂住不回 → 超时后给出可读错误、重试钮仍可用）。

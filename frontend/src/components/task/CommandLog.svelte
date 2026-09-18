@@ -12,9 +12,15 @@
     onload?: (commandId: number) => Promise<void> | void;
     /** SSE 追加的输出（进行中的命令）。 */
     streamedFor?: (command: NodeCommand) => string | null;
+    /**
+     * 完整输出的读取错误（票 12 / R2-16）。此前这个错误**存了没人读**：
+     * `stores/taskDetail` 把它记在 `commandOutputError` 里，而这里在取不到时永远显示
+     * 「（正在加载完整输出…）」——一句能永久停住的谎。
+     */
+    errorFor?: (command: NodeCommand) => string | null;
   }
 
-  let { commands, outputFor, onload, streamedFor }: Props = $props();
+  let { commands, outputFor, onload, streamedFor, errorFor }: Props = $props();
 
   let expanded = $state<number | null>(null);
   let loading = $state<number | null>(null);
@@ -41,7 +47,7 @@
       outputFor?.(command) ??
       streamedFor?.(command) ??
       command.stdout_preview ??
-      (command.stdout_path ? '（正在加载完整输出…）' : '（该命令未卸载完整输出，只有 preview）')
+      (command.stdout_path ? '（完整输出未取回，以上是 preview）' : '（该命令未卸载完整输出，只有 preview）')
     );
   }
 </script>
@@ -70,6 +76,11 @@
       {#if expanded === command.id}
         {#if loading === command.id}
           <div class="cmdout">正在加载完整输出…</div>
+        {:else if errorFor?.(command)}
+          <!-- 读失败就说失败（票 12 / R2-16）：`role=alert` 让读屏也听得到 -->
+          <div class="cmdout failed" role="alert">
+            完整输出没读回来：{errorFor?.(command)}
+          </div>
         {:else}
           <pre class="cmdout"><span class="ln">$ {command.command}</span>
 {outputText(command)}{#if command.exit_code !== null}
@@ -167,6 +178,10 @@
   }
   .cmdout .fin {
     color: var(--go);
+  }
+  .cmdout.failed {
+    border-left-color: var(--stop);
+    color: var(--stop);
   }
 
   /* 桌面：两行容器不生成盒子，用 order 还原原列序（ok · tm · src · 命令 · ms · ex · 输出） */

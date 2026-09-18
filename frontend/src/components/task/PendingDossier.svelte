@@ -225,7 +225,11 @@
     grid-row: 1;
     align-self: start;
     position: sticky;
-    top: 56px;
+    /* 让位给**实测的**顶栏高度（票 09 / R2-11）：56px 那个旧值与真实顶栏（78–81px）
+       对不上，于是顶栏把压在框沿上的琥珀铭牌整块盖住——而那句「等你拍板」正是
+       「为什么这里有东西等你」的答案。再 +16px 是铭牌自己向上压出的那一截
+       （`.dtag` 的 `top: -16px`）：不让它，铭牌照样会钻到顶栏底下。 */
+    top: calc(var(--topbar-h) + 16px);
     margin-top: 20px; /* 给压在框沿上的名牌 tab 留出空间 */
     background: var(--panel);
     border: 2px solid var(--pending);

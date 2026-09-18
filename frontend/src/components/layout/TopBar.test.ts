@@ -1,5 +1,5 @@
 import { fireEvent, render, screen, waitFor, within } from '@testing-library/svelte';
-import { afterEach, beforeEach, describe, expect, it } from 'vitest';
+import { afterEach, beforeAll, beforeEach, describe, expect, it } from 'vitest';
 import type { TaskListItem } from '../../api/types';
 import { router } from '../../router.svelte';
 import { board } from '../../stores/board.svelte';
@@ -44,6 +44,18 @@ function pendingTask(id: string, title: string): TaskListItem {
 }
 
 // 芯片的可读名是「待处理 2」；过滤槽那一格是「待处理（2）」（全角括号），故按形状分开
+beforeAll(() => {
+  // jsdom 不实现 ResizeObserver，而顶栏用 `bind:offsetHeight` 量自己（票 09 的
+  // `--topbar-h`）。照 `TaskDetail.test.ts` 里 matchMedia 那条先例就地补一个空壳。
+  if (typeof globalThis.ResizeObserver !== 'function') {
+    globalThis.ResizeObserver = class {
+      observe(): void {}
+      unobserve(): void {}
+      disconnect(): void {}
+    } as unknown as typeof ResizeObserver;
+  }
+});
+
 const trigger = () => screen.getByRole('button', { name: /^待处理 \d+$/ });
 const panel = () => document.getElementById('pending-dropdown') as HTMLElement;
 const items = () => [...panel().querySelectorAll('a.dd-item')] as HTMLAnchorElement[];

@@ -7,6 +7,13 @@ import type { SseEvent } from '../api/types';
  * - toast 只对 pending / done / failed 弹；cancelled 永不弹。
  * - 同类通知 5 分钟 cooldown。
  * - 22–8 免打扰，pending 豁免（"等人优先"，§2 原则 3）。
+ *
+ * **由票 17（R2-23）补的一条口径：节流只作用于「另有通道」的那几类。**
+ * 原策略是「一律 5 分钟 + 一律免打扰」，于是夜间（22–8）或同类 5 分钟内，一条
+ * `task_failed` **根本不弹**——而那时它没有任何别的常驻位（待办计数只数 pending、
+ * 完成横幅只报 done）。所以：`failed` 既免免打扰也免 cooldown（**唯一**这样的类），
+ * `pending` 免免打扰（照旧，§2 原则 3）、cooldown 保留（计数芯片与档案盒是它的常驻通道），
+ * `done` 两者都保留（完成横幅不受任何节流，它另有通道，丢掉的不算丢）。
  */
 
 export type NotificationClass = 'pending' | 'done' | 'failed' | 'cancelled';
@@ -24,6 +31,9 @@ export const DEFAULT_NOTIFICATION_POLICY: NotificationPolicyConfig = {
   cooldownSec: 300,
   quietHours: [22, 8],
 };
+
+/** 既免免打扰、也免 cooldown 的类（见文件头的口径说明）。 */
+export const ALWAYS_ANNOUNCED: ReadonlySet<NotificationClass> = new Set(['failed']);
 
 export interface NotifyState {
   lastNotifiedAt: Partial<Record<NotificationClass, number>>;
@@ -45,6 +55,8 @@ export function shouldNotify(
   policy: NotificationPolicyConfig = DEFAULT_NOTIFICATION_POLICY,
 ): boolean {
   if (!policy.notifyOn[cls]) return false;
+  // 只有 toast 一条通道的那一类：免打扰与节流都不拦它
+  if (ALWAYS_ANNOUNCED.has(cls)) return true;
   // quiet hours：pending 豁免
   if (isQuietHours(now, policy.quietHours) && cls !== 'pending') return false;
   const last = state.lastNotifiedAt[cls];

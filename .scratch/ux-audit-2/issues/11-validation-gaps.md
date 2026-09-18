@@ -21,14 +21,40 @@
 
 **Blocked by:** None（can start immediately）
 
-**Status:** open
+**Status:** done
 
-- [ ] `base_url` 非空时校验形状（协议 + 主机），不合法给**字段级**错误并拦住提交
-- [ ] 拆分：标题为空的行拦下并指出**第几行**；不产生空标题子任务
-- [ ] 拆分：文本域全空时给提示（或在按钮上体现不可提交），不做静默 no-op
-- [ ] 单测：`validateProviderDraft` 对 `not a url` / `ftp://x` / 空值 各自的行为
-- [ ] 单测：`SplitDialog` 空标题行、全空文本域的行为（**随之改写 `SplitDialog.test.ts:41-51` 那条**）
-- [ ] e2e：provider 表单填非法 base_url → 断言被拦下且未创建
-- [ ] e2e：拆分表单放一行 `| 说明` → 断言被拦下并指出行号
+- [x] `base_url` 非空时校验形状（协议 + 主机），不合法给**字段级**错误并拦住提交
+- [x] 拆分：标题为空的行拦下并指出**第几行**；不产生空标题子任务
+- [x] 拆分：文本域全空时给提示（或在按钮上体现不可提交），不做静默 no-op
+- [x] 单测：`validateProviderDraft` 对 `not a url` / `ftp://x` / 空值 各自的行为
+- [x] 单测：`SplitDialog` 空标题行、全空文本域的行为（**随之改写 `SplitDialog.test.ts:41-51` 那条**）
+- [x] e2e：provider 表单填非法 base_url → 断言被拦下且未创建
+- [x] e2e：拆分表单放一行 `| 说明` → 断言被拦下并指出行号
 
 **边界.** 后端要不要一并补校验另议（本轮只要求前端当场拦下，不让脏值落库）。
+
+## 实施记录（2026-09-18）
+
+**落点**
+
+| 处 | 改动 |
+|---|---|
+| `src/lib/providers.ts` | `validateProviderDraft` 补 `base_url` 形状校验：非空时必须是 `http(s)://主机`；非法给**字段级** `{ field, message }` |
+| `src/components/task/SplitDialog.svelte` | `parse()` 重写为「解析 → 校验」两步：返回 `{ tasks } \| { message }`；**标题为空的行被拦下并指出第几行**；文本域全空时给一句 `localError` 而不是静默 no-op；错误节点 `role=alert` |
+| `src/components/board/NewTaskDialog.svelte` | 项目选择 + 校验结果接上字段级错误（票 02 的同一条通道） |
+
+**校验口径**（写死，单测钉住）：空值放行（`base_url` 可以不填，走 provider 默认）、
+`not a url` 与 `ftp://x` 拦下、`http://` 后必须有主机名。**不做全 URL 语法校验收敛**
+（后端才是最后一道），这里只堵「明显不是地址」这一类。
+
+**订正票面一处**：票面说「现有单测 `SplitDialog.test.ts:41-51` 正好把这个静默 no-op 钉住了」
+——那条用例已被本票改写（现在钉的是「全空时给提示且不提交」）；同时新增了「空标题行指出行号」
+一条。`SplitDialog.test.ts` 现在 3 条 → 5 条。
+
+**证据**：
+- 单测 `src/lib/providers.test.ts`（`not a url` / `ftp://x` / 空值 三态）、
+  `src/components/task/SplitDialog.test.ts`（空标题行 → 提示含行号；全空 → 提示且不提交）。
+- e2e `frontend/e2e/ux2-flows-and-copy.spec.ts` ③：走 UI 填 `not a url` → 断言当场拦下且
+  **列表里没有新行**。
+
+**边界**：后端校验未动（票面写明另议）。

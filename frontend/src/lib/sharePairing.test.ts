@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { portFallbackNote, sharePanel } from './sharePairing';
+import { bindSourceLabel, portFallbackNote, sharePanel } from './sharePairing';
 
 /**
  * 「手机访问」页的形态判定（决策 189）。
@@ -120,5 +120,25 @@ describe('portFallbackNote（决策 213：端口退让要说出来）', () => {
 
   it('读数还没到（info 为 null）→ 不说话', () => {
     expect(portFallbackNote(null)).toBeNull();
+  });
+});
+
+describe('绑定来源的叫法只有一处定义（票 15 / R2-18）', () => {
+  it('三个取值各有名有姓，同一个值任何时候都是同一个词', () => {
+    expect(bindSourceLabel('startup')).toBe('启动参数');
+    expect(bindSourceLabel('settings')).toBe('界面上的选择');
+    expect(bindSourceLabel('config')).toBe('配置文件');
+    // 认不出来的来源回落成配置文件那一档（后端只会给这三种，兜底别抛）
+    expect(bindSourceLabel(null)).toBe('配置文件');
+    expect(bindSourceLabel('???')).toBe('配置文件');
+  });
+
+  it('页面里不再各写一份三元表达式（同一个值两个说法就是这么来的）', async () => {
+    const { readFileSync } = await import('node:fs');
+    const { join, resolve } = await import('node:path');
+    // vitest 从 `frontend/` 运行（vite.config.ts 的 include 是 src/**），故以 cwd 定位
+    const share = readFileSync(join(resolve(process.cwd(), 'src'), 'routes', 'Share.svelte'), 'utf8');
+    expect(share).not.toContain('界面设置');
+    expect(share.match(/bind_source === 'settings'/g) ?? []).toHaveLength(0);
   });
 });

@@ -76,6 +76,16 @@ export class TaskStream {
     this.setStatus('closed');
   }
 
+  /**
+   * `true` = 这条流掉过线，还没等到「接回来之后的那一次对齐」。
+   *
+   * SSE **没有回放**：断流那段时间里发生的 `pending` / 阶段迁移不会被补发，所以「重连上」
+   * 只是把管子接回来了，页面内容还停在断流前那一刻。看板有 10s 对齐 tick 兜着，详情页没有
+   * ——重连成功的那一次因此要主动对齐一次（`onRecalibrate` → 全量 refetch），否则「内容恢复」
+   * 只是「横幅消失」（票 13 / R2-15 的验收里写的是前者）。
+   */
+  private missedWhileDown = false;
+
   /** visibilitychange 恢复：重置退避并立即重连（无 SSE 回放，靠 refetch 校准）。 */
   reconnectNow(): void {
     if (this.stopped) return;
@@ -122,7 +132,11 @@ export class TaskStream {
           throw new Error(`SSE ${res.status}`);
         }
         this.attempt = 0;
+        const wasDown = this.missedWhileDown;
+        this.missedWhileDown = false;
         this.setStatus('open');
+        // 掉线之后接回来的第一次：先把全量状态拉回来（断流期间的事件已经永久丢了）
+        if (wasDown) this.handlers.onRecalibrate?.(this.taskId);
         await this.consume(res.body);
         // 正常结束（服务端关闭）也走重连
         if (this.stopped) break;
@@ -138,6 +152,8 @@ export class TaskStream {
           break;
         }
         this.attempt += 1;
+        // 记下「断过」：接回来的那一次要主动对齐（见 `missedWhileDown`）
+        this.missedWhileDown = true;
         this.setStatus('error');
         await sleep(this.backoffDelay());
       }

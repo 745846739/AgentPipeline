@@ -8,13 +8,25 @@
   }
 </script>
 
-<div class="toasts" aria-live="polite">
+<!-- 每条 toast 自己是一个 polite live region（`role=status` + `aria-atomic`）：
+     新节点入 DOM 即播报，且**整条一起念**（标题 + 消息分成两个 span，不 atomic 就只念
+     变化的那一小段）。容器不再是 live region——否则每条新增都会让读屏重念整列。
+     悬停 / 聚焦暂停计时（票 17）：正在读的那一条不该在手指底下消失。 -->
+<div class="toasts">
   {#each notifications.toasts as toast (toast.id)}
-    <div class="toast {toast.cls}">
+    <div
+      class="toast {toast.cls}"
+      role="status"
+      aria-atomic="true"
+      onmouseenter={() => notifications.pause(toast.id)}
+      onmouseleave={() => notifications.resume(toast.id)}
+      onfocusin={() => notifications.pause(toast.id)}
+      onfocusout={() => notifications.resume(toast.id)}
+    >
       <span class="dot {toast.cls === 'pending' ? 'warn-dot' : ''}"></span>
       <button type="button" class="body" onclick={() => openTask(toast.taskId, toast.id)}>
-        <span class="title">{toast.title}</span>
-        {#if toast.message}<span class="msg">{toast.message}</span>{/if}
+        <span class="title" title={toast.title}>{toast.title}</span>
+        {#if toast.message}<span class="msg" title={toast.message}>{toast.message}</span>{/if}
       </button>
       <button
         type="button"
@@ -37,6 +49,19 @@
     gap: 8px;
     width: 340px;
     max-width: calc(100vw - 32px);
+  }
+  /* 窄屏：挪到顶栏下方（票 17 / R2-23）。底部那 16px 与详情页的动作坞（`bottom` = 底栏
+     上沿、z-index 31）**正面重叠**，而 toast 整块是可点导航按钮——点动作的位置可能跳去
+     另一个任务。挪到上面之后，钉住的两样（底栏、动作坞）都不再被压。
+     高度取实测的 `--topbar-h`（票 09 引入），不再写死。 */
+  @media (max-width: 479px) {
+    .toasts {
+      top: calc(var(--topbar-h) + 8px);
+      bottom: auto;
+      left: 16px;
+      right: 16px;
+      width: auto;
+    }
   }
   .toast {
     display: flex;

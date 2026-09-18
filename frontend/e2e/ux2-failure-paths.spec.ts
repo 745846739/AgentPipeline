@@ -69,8 +69,14 @@ test.describe('UX2 ① 详情失败态与终态动作（票 01 / 02）', () => {
     await page.goto(`${app.webBase}/#/task/01JZZZZZZZZZZZZZZZZZZZZZZZ`);
     await page.waitForTimeout(1200);
 
-    // 上一个任务的一切都不在屏上：标题、页签、六颗拍板按钮（它们会提交到那个坏 id）
-    await expect(page.locator('body')).not.toContainText(title);
+    // 上一个任务的一切都不在**详情页正文**里：标题、页签、六颗拍板按钮（它们会提交到那个坏 id）。
+    //
+    // 判据不用 `body`：顶栏的「待处理」下拉**常驻 DOM**（票 04：靠 `hidden` 开合，`aria-controls`
+    // 指过去的目标必须真的在），它会列出 pending 任务的**标题**——那是顶栏的合法内容，不是残留。
+    // Playwright 的 `toContainText` 走 DOM 文本（不看 CSS 可见性），拿 `body` 当判据就会把
+    // 这份合法内容误判成残留（本用例 2026-09-18 就是这么红过一次）。
+    const detail = page.locator('main.detail');
+    await expect(detail).not.toContainText(title);
     await expect(page.locator('.d-title')).toHaveCount(0);
     await expect(page.getByRole('tab', { name: '时间线' })).toHaveCount(0);
     await expect(page.getByRole('button', { name: '合入' })).toHaveCount(0);

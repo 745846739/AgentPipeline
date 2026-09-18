@@ -14,6 +14,16 @@
    ───────────────────────────────────────────────────────────── */
 
 :root {
+  /* 顶栏的视觉高度（含 2px 下框、含窄档折成两行时的高度）：桌面实测 78–81px。
+     这是**兜底值**——真值由 `TopBar.svelte` 在挂载与窗口变化时量出来后写到
+     `document.documentElement` 上；钉在顶栏下面的东西（档案盒）按它让位，
+     不再各写一个魔数（决策 215 / 票 09）。 */
+  --topbar-h: 78px;
+  /* 底栏（`.statusline`）的盒高：桌面 36px + 2px 上框 = 38px；窄屏由 479px 那一段的
+     媒体查询覆写成 `calc(42px + var(--safeb))`（40px min-height + 2px 上框 + 安全区）。
+     钉底的东西（对讲台输入坞、详情页动作坞）按它让位——同一个值只有这一处定义，
+     各路由不再各写一个（决策 215 / 票 05）。 */
+  --sbar-h: 38px;
   /* 色彩 — 深色「夜班靛」（contract.ts DARK_COLORS） */
   --bg: #1b1d2c; /* 夜班靛：页面底色（带蓝紫的厂房夜灯色温，不是纯黑） */
   --panel: #232639; /* 货箱面 / 对话框底 / hover 行底 */
@@ -703,12 +713,15 @@ textarea.input {
     font-variant-numeric: tabular-nums;
   }
 
-  /* pending 常驻底部动作坞 */
+  /* pending 常驻底部动作坞：**钉在底栏上沿**，不与状态行抢同一个 `bottom: 0`
+     （票 05 / R2-02）。此前两者都钉在 0、动作坞不透明且 z-index 更高，于是待处理计数、
+     token 总量与**深浅色切换**被整条压掉（实测重叠 42px = 状态行高度的 100%）。
+     对讲台的输入坞早就是这么让位的，这里照抄同一条口径。 */
   .dock {
     position: fixed;
     left: 0;
     right: 0;
-    bottom: 0;
+    bottom: var(--sbar-h);
     z-index: 31;
     background: var(--bg);
     border-top: 2px solid var(--pending);

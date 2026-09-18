@@ -1,5 +1,6 @@
 <script lang="ts">
   import type { AllowedAction, BranchCursor, PendingKind } from '../../api/types';
+  import { actionKey } from '../../lib/actions';
   import type { ParsedDiff } from '../../lib/diff';
   import DiffView from '../render/DiffView.svelte';
 
@@ -105,7 +106,7 @@
   {/if}
 
   <div class="actions" class:dock-acts={actionsOnly}>
-    {#each returnChanges as action (action.action + (action.cursor_id ?? ''))}
+    {#each returnChanges as action (actionKey(action, cursorIdFor(action)))}
       <button
         type="button"
         class="btn"
@@ -116,7 +117,7 @@
         {action.label}
       </button>
     {/each}
-    {#each approve as action (action.action + (action.cursor_id ?? ''))}
+    {#each approve as action (actionKey(action, cursorIdFor(action)))}
       <button
         type="button"
         class="btn solid"

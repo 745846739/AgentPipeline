@@ -18,7 +18,7 @@
 
 <script lang="ts">
   import type { AllowedAction, BranchCursor, PendingKind } from '../../api/types';
-  import { allowsFreeInput, groupActionsByBranch, sideEffectEnabled } from '../../lib/actions';
+  import { actionKey, allowsFreeInput, groupActionsByBranch, sideEffectEnabled } from '../../lib/actions';
   import { branchKind } from '../../lib/pipeline';
 
   interface Props {
@@ -50,10 +50,6 @@
     const cursorId = fallbackCursorId(groupCursorId);
     const input = inputs[actionKey(action, cursorId)];
     onaction?.(action, { cursorId, input: input?.trim() ? input : undefined });
-  }
-
-  function actionKey(action: AllowedAction, cursorId?: string): string {
-    return `${action.action}:${action.cursor_id ?? cursorId ?? ''}`;
   }
 
   function busy(action: AllowedAction, groupCursorId: string): boolean {
@@ -102,7 +98,7 @@
 
       {#if group.resume.length > 0}
         <div class="grp-label">恢复动作</div>
-        {#each group.resume as action (action.action + (action.cursor_id ?? ''))}
+        {#each group.resume as action (actionKey(action, group.cursorId))}
           <div class="item">
             {#if allowsFreeInput(action)}
               <textarea
@@ -129,7 +125,7 @@
 
       {#if group.sideEffect.length > 0}
         <div class="grp-label">旁路动作</div>
-        {#each group.sideEffect as action (action.action + (action.cursor_id ?? ''))}
+        {#each group.sideEffect as action (actionKey(action, group.cursorId))}
           <button
             type="button"
             class="btn quiet block add"
@@ -143,7 +139,7 @@
       {/if}
 
       {#if group.wait.length > 0}
-        {#each group.wait as action (action.action)}
+        {#each group.wait as action (actionKey(action, group.cursorId))}
           <button type="button" class="btn quiet block" disabled title="纯等待，无系统变更">
             {action.label}
           </button>

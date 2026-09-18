@@ -17,6 +17,8 @@
     SkillPreview,
   } from '../api/types';
   import { CompositionGuard, shouldSubmitOnEnter } from '../lib/enterToSend';
+  import { formatDateTime } from '../lib/format';
+  import { isFlagged, setFlag } from '../lib/keyedFlag';
   import { addRepo, removeRepo, validateRepo } from '../lib/marketRepos';
   import EmptyState from '../components/ui/EmptyState.svelte';
 
@@ -63,13 +65,21 @@
   /** 当前查看的仓（从**已保存**的名单里选；草稿里没保存的仓不进列表）。 */
   let selectedRepo = $state<string | null>(null);
   let list = $state<MarketSkillList | null>(null);
-  let listing = $state(false);
-  let refreshing = $state(false);
+  /** 正在读的仓（按 owner/repo 键控，理由同 `installing`）。 */
+  let listing = $state<Record<string, true>>({});
+  let refreshing = $state<Record<string, true>>({});
   let listError = $state<string | null>(null);
   let query = $state('');
 
-  /** 正在安装的技能目录（`dir` 在仓内唯一，比名字可靠）。 */
-  let installing = $state<string | null>(null);
+  /**
+   * 正在安装的技能目录（`dir` 在仓内唯一，比名字可靠）。
+   *
+   * **按目录键控的集合，不是单槽**（票 12 / R2-17）：慢网络下先后装两个技能时，
+   * 先完成的那一次会把后一个的 pending 态一起清掉（`finally { installing = null }`），
+   * 于是后面那一行的转圈消失、按钮复活、还能再点一次。
+   */
+  let installing = $state<Record<string, true>>({});
+  const isInstalling = (dir: string): boolean => isFlagged(installing, dir);
   /** 需要二次确认覆盖的技能目录（报文含「已存在」之后）。 */
   let confirmingOverwrite = $state<string | null>(null);
   let installError = $state<{ message: string; kind?: string; hint?: string } | null>(null);
@@ -218,8 +228,9 @@
       list = null;
       query = '';
     }
-    listing = !refresh;
-    refreshing = refresh;
+    // 读与刷新是两种在飞态，各记各的 key（同一形状的竞态见下面 finally）
+    if (!refresh) listing = setFlag(listing, repo, true);
+    if (refresh) refreshing = setFlag(refreshing, repo, true);
     listError = null;
     installError = null;
     confirmingOverwrite = null;
@@ -230,15 +241,22 @@
       if (!refresh) list = null;
       listError = (err as Error).message;
     } finally {
-      listing = false;
-      refreshing = false;
+      // 只清自己那一格（同一形状的竞态：读 A 的途中去读 B，A 的 finally 不该清掉 B 的转圈）
+      listing = setFlag(listing, repo, false);
+      refreshing = setFlag(refreshing, repo, false);
     }
   }
+  const listingNow = $derived(isFlagged(listing, selectedRepo));
+  const refreshingNow = $derived(isFlagged(refreshing, selectedRepo));
 
-  function localTime(iso: string): string {
-    const t = new Date(iso);
-    return Number.isNaN(t.getTime()) ? iso : t.toLocaleString();
-  }
+  /**
+   * 时间戳走全站口径（票 15 / R2-18）。
+   *
+   * 此前这里用的是裸 `toLocaleString()`——非 zh-CN 的浏览器上，同一页会同时出现
+   * `2026/9/18 15:04:05`（阶段页那一档）与 `9/18/2026, 3:04:05 PM`（这一档）。
+   * 全站唯一出处是 `lib/format.ts::formatDateTime`，页面里不再各写一个。
+   */
+  const localTime = formatDateTime;
 
   /**
    * 装一个技能。**`list.commit` 一路透传给后端**——用户看到的是某一份，装到的就必须是
@@ -248,7 +266,7 @@
     if (!list || selectedRepo === null) return;
     const [owner, repo] = selectedRepo.split('/');
     if (!owner || !repo) return;
-    installing = ref.dir;
+    installing = setFlag(installing, ref.dir, true);
     installError = null;
     confirmingOverwrite = null;
     try {
@@ -271,7 +289,7 @@
       if (err instanceof ApiError && err.status === 409) confirmingOverwrite = ref.dir;
       installError = { message, kind, hint: kind ? FAILURE_ACTIONS[kind] : undefined };
     } finally {
-      installing = null;
+      installing = setFlag(installing, ref.dir, false);
     }
   }
 
@@ -441,7 +459,7 @@
           />
         </div>
       {:else}
-        {#if listing}
+        {#if listingNow}
           <div class="banner">正在读 {selectedRepo}…</div>
         {/if}
         {#if list}
@@ -450,10 +468,10 @@
             <button
               type="button"
               class="btn quiet"
-              disabled={refreshing}
+              disabled={refreshingNow}
               onclick={() => selectedRepo && void viewRepo(selectedRepo, true)}
             >
-              {#if refreshing}<span class="spin"></span>{/if}刷新
+              {#if refreshingNow}<span class="spin"></span>{/if}刷新
             </button>
           </div>
 
@@ -502,7 +520,7 @@
                           <button
                             type="button"
                             class="btn danger"
-                            disabled={installing === s.dir}
+                            disabled={isInstalling(s.dir)}
                             onclick={() => void install(s, true)}
                           >
                             覆盖安装
@@ -518,10 +536,10 @@
                           <button
                             type="button"
                             class="btn"
-                            disabled={installing === s.dir}
+                            disabled={isInstalling(s.dir)}
                             onclick={() => void install(s)}
                           >
-                            {#if installing === s.dir}<span class="spin"></span>{/if}安装
+                            {#if isInstalling(s.dir)}<span class="spin"></span>{/if}安装
                           </button>
                         {/if}
                       </div>
@@ -543,7 +561,7 @@
             <button
               type="button"
               class="btn"
-              disabled={listing || refreshing}
+              disabled={listingNow || refreshingNow}
               onclick={() => selectedRepo && void viewRepo(selectedRepo, list !== null)}
             >
               重试

@@ -5,6 +5,7 @@ import {
   getForemanSession,
   getServerInfo,
   listStageConfigs,
+  mapRequestError,
   putStageConfig,
   qrSvgUrl,
 } from './client';
@@ -151,5 +152,60 @@ describe('配对令牌压在请求头上（决策 182㉙，票 07）', () => {
     await getForemanSession();
     const headers = calls[0].init?.headers as Record<string, string>;
     expect(PAIRING_HEADER in headers).toBe(false);
+  });
+});
+
+describe('请求失败的口径（票 12 / R2-14）', () => {
+  it('超时：说清等了多久（`AbortSignal.timeout` 抛的是 TimeoutError）', () => {
+    const err = new Error('signal timed out');
+    err.name = 'TimeoutError';
+
+    const mapped = mapRequestError(err, 30_000, false);
+
+    expect(mapped).toBeInstanceOf(ApiError);
+    expect(mapped.status).toBe(0);
+    expect(mapped.message).toContain('超时');
+    expect(mapped.message).toContain('30 秒');
+  });
+
+  it('没有调用方 signal 的 AbortError 也算超时', () => {
+    const err = new Error('aborted');
+    err.name = 'AbortError';
+    expect(mapRequestError(err, 5_000, false).message).toContain('超时');
+  });
+
+  it('有调用方 signal 的 AbortError 是**主动取消**，不冒充超时', () => {
+    const err = new Error('aborted');
+    err.name = 'AbortError';
+
+    const mapped = mapRequestError(err, 5_000, true);
+
+    expect(mapped.message).not.toContain('超时');
+    expect(mapped.message).toContain('网络请求失败');
+  });
+
+  it('网络本身不通：保留内核给的原因', () => {
+    expect(mapRequestError(new TypeError('Failed to fetch'), 30_000, false).message).toBe(
+      '网络请求失败：Failed to fetch',
+    );
+  });
+
+  it('拿不到 message 也不许抛：退化成一条可读的话', () => {
+    expect(mapRequestError('boom', 1_000, false).message).toBe('网络请求失败：boom');
+  });
+
+  it('每个请求都带上了超时 signal（不是只有调用方显式传的那些）', async () => {
+    const calls: Array<RequestInit | undefined> = [];
+    vi.stubGlobal(
+      'fetch',
+      vi.fn(async (_url: string, init?: RequestInit) => {
+        calls.push(init);
+        return jsonResponse({ ok: true, stage_configs: [] });
+      }),
+    );
+
+    await listStageConfigs();
+
+    expect(calls[0]?.signal).toBeInstanceOf(AbortSignal);
   });
 });

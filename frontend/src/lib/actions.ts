@@ -95,3 +95,29 @@ export function sideEffectEnabled(action: AllowedAction, pendingType: PendingKin
 export function allowsFreeInput(action: AllowedAction): boolean {
   return action.kind === 'resume' && action.requires_input === true;
 }
+
+/**
+ * 动作的身份（**同名动作不是同一个动作**）。
+ *
+ * 为什么必须有这把尺子：`allowed_actions` 里同名动作可以合法地出现两次，两条的**落点不同**——
+ * `retry_exhausted@develop|test` 是「重试执行」+「带失败摘要回架构设计修订」（两个 `goto`），
+ * `user_decision@test_code_issue|gate_recheck` 是「修改测试用例」+「修改业务代码」（同样是两个
+ * `goto`）。只看 `action` + `cursor_id` 会把它们认成同一个：
+ *   ① 渲染层 `{#each ... (key)}` 撞 key → Svelte 抛 `each_key_duplicate`，**整块动作区不再更新**，
+ *      坞里留着上一个 pending 的按钮（点下去发的是别的动作）；
+ *   ② 「提交中」态同时点亮两颗钮（`busyKey` 相同）。
+ * 落点（stage / node）进身份，两条 `goto` 就各是各的。没有落点的动作（`continue` / `skip` /
+ * side_effect）行为不变，仍是「动作名 + 游标」。
+ *
+ * 游标取 `action.cursor_id`，缺省时回退到调用方给的所属分支游标（决策 91）；两者都没有时
+ * 用空串——`groupActionsByBranch` 的分组也把这批动作归在同一个不具名组里。
+ */
+export function actionKey(action: AllowedAction, cursorId?: string): string {
+  const target = action.target;
+  return [
+    action.action,
+    action.cursor_id ?? cursorId ?? '',
+    target?.stage ?? '',
+    target?.node ?? '',
+  ].join(':');
+}

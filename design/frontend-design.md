@@ -24,6 +24,34 @@
 > **不变的部分写死**：过滤语义与端点一律不动；像素纪律（2px 描边 / 零圆角 / 12 的倍数字阶 /
 > 不新增图元 / 动画预算四处）一字不动；`allowed_actions` 纯渲染与卡片禁拖不动。
 
+> **修订（2026-09-18「ux-audit-2」第二轮审计 / 决策 215）：补上「中间档」这一整段。**
+> 第一轮的采样点只有 1440（桌面）与 430（移动）两个端点，**480–1240 之间没有任何断点**，
+> 于是详情页主栏在 480px 只剩 102px、对讲台对话列只剩 82px、`hero` 轨道把整页撑出横向滚动、
+> 状态行在 480–748 之间静默裁掉时钟。决策 215 定的就是这一段：
+>
+> | 定什么 | 结论 | 本文落点 |
+> |---|---|---|
+> | 详情页断点 | `≥1100` 两栏（右 320）／`820–1099` 两栏（右 280）／`<820` 折成一列，左栏下限 480px | §6.1（就地标注，见那一节的裁决框） |
+> | 对讲台断点 | `≥1100` 两栏（右 340）／`900–1099` 两栏（右 280）／`<900` 折成一列，对话列下限 420px | **主文档 §12.4 的交互设计**（本文只给路由，不给对讲台版面） |
+> | 右栏收缩下限 | 280px（两处同值） | §6.1 |
+> | `hero` 轨道 | **容器内横向滚**，不裁切、不把滚动传给文档 | §6.1（同上的裁决框） |
+> | 状态行档位 | `480–748` 隐三格 `.dep`；`480–560` 再隐量表；容器 `overflow-x: auto` 兜底 | 已落地，见 §12.3 索引表那一行 |
+>
+> **移动款（`≤479px`）既有版面一字不动**——决策 192 / 208 的口径只在那里适用；
+> 折行那一档复用的是它的三条规则，不是把它抬上来。
+
+> **修订（2026-09-18「ux-audit-2」第二轮审计 / 决策 216–217）：动作的确认与量级，以及中流状态去哪儿。**
+> 这一轮还翻出两件「规格没写、实现各按各的来」的事，两件都**不动版面**：
+>
+> | 改了什么 | 结论一句话 | 本文落点 | 决策 |
+> |---|---|---|---|
+> | 不可逆动作的确认步、后果句、三档量级、打回标签随输入变 | 四类动作走**内联两步确认**（沿用删项目那套）；跳过质量闸的动作降为琥珀描边，破坏性动作红描边 | §6.1、§9.3（新） | 216 |
+> | 中流状态：页签 / 过滤 / 班次 / 草稿的去向，以及谁写地址 | 「我在哪」进 URL、「我平常怎么用」与草稿进 localStorage、程序改地址用 `replaceState` | §4.1、§9.4（新） | 217 |
+>
+> **不变的部分写死**：像素纪律与全部视觉规格（2px 描边 / 12px 字阶 / 零圆角 / 四处动画预算）一字不动；
+> `allowed_actions` 纯渲染不变——确认步只加在**在册动作**的提交路径上，不改动作集；
+> 决策 132 已移出的无端点动作（「放弃合入」「合并任务」）不复活。
+
 ---
 
 ## 1. 定位
@@ -150,6 +178,9 @@ pending 琥珀呼吸（2.4s 周期）、流式输出尾随光标。`prefers-redu
 | 其它 | `not-found` | 404（给一条回看板的路） | — |
 
 - 无 SvelteKit，Vite + Svelte 5（runes）+ 轻量 hash 路由（本地应用，无 SEO 诉求）。
+- **query 是这条路由表的一部分**（决策 217）：`#/task/:id?tab=`、`#/?filter=`、`#/talk?session=`、
+  `#/metrics?task=`、`#/settings/projects?project=&analyze=1`。参数是短枚举、缺省值不写进地址；
+  谁写地址（用户 `pushState` / 程序 `replaceState`）与刷新恢复语义见 §9.4。
 - **传输层 Tauri 防御（决策 153）：** ① 本前端是**纯 API 客户端**，一切数据经 HTTP + SSE，不假设部署形态（桌面化 = Tauri 只当外壳，不走 IPC 重写）；② SSE 消费用 **fetch 流式读取**（可携带自定义头），不用 `EventSource`——它带不了自定义头，跨源过不了决策 128 防护；③ 所有写请求**恒携带** `X-AgentPipeline` 头（决策 128 旁路，桌面 webview origin 靠它放行）；④ API base 收敛**单一配置点**：默认同源相对路径，留注入覆盖口（桌面壳注入 `http://127.0.0.1:{port}`）。
 
 ### 4.2 顶栏：页面导航行三项（定稿，决策 198）
@@ -352,13 +383,29 @@ pending 琥珀呼吸（2.4s 周期）、流式输出尾随光标。`prefers-redu
 
 - **轨道 hero**：§12.4.2 流水线视图的实现体（9 站，不含 sync-check——决策 107，它不是
   任务位置），节点状态图例沿用 ✓/●/○/⏸/✗/↩；并行区间双轨分岔；当前游标有滑动圆点与心跳微光。
+> **裁决已落、实现未到（决策 215 / 票 07；实现票 18 / 19 状态 open）**
+>
+> 这一节画的是一栏宽屏的形态。**中间档（480–1240px）的折法已经定了，但代码还没改**——
+> 实现时按这张表，不要另定一套：
+>
+> | 宽度 | 形态 |
+> |---|---|
+> | `≥1100px` | 现状两栏：`minmax(0, 1fr) 320px` |
+> | `820–1099px` | 两栏、右栏收到 **280px**：`minmax(480px, 1fr) 280px`（依据 `820−40−18−280 = 482 ≥ 480`） |
+> | `<820px` | **折成一列**（档案盒落到主栏下方，DOM 顺序不变），复用窄屏那三条规则 |
+>
+> `hero` 轨道在折行档**容器内横向滚**（`.rail.hero { overflow-x: auto }`）——站点坐标写死在
+> `lib/pipeline.ts`，裁掉等于「后面的工位不存在」；**滚动只发生在容器里，不传给文档**。
+> `.rail.spine` 的裁切语义不变。移动款（`≤479px`）既有版面一字不动。
+
 - **待办 dossier（右栏 360px，仅 pending 时出现）**：G4 的展开实现。2026-09-11 确认以
   **持久面板**替代 §12.7 原定的弹窗形态——面板随任务常驻、不遮挡内容区，看板侧以
   toast + 顶栏待办计数提醒。内容：
   阻塞原因（`pending_reason.message`）、按分支分组的动作按钮（含行内输入框）、
   「agent 为什么这么判断」= 触发节点的会话直达链接（§12.4.3 联动）、
   `merge_approval` 时内嵌 Diff 面板、产出文件入口。任务不再 pending 时该栏收起，
-  内容区回到全宽。
+  内容区回到全宽。动作按钮的**确认步与三档量级**见 §9.3（决策 216）——不可逆动作
+  就地走内联两步确认，跳过质量闸的动作是琥珀描边而不是实心主按钮。
 
 ### 6.2 五个页签
 
@@ -459,6 +506,57 @@ GET /tasks/{id}               → 详情页装载 + 断线重连后的全量校�
 - pending 面板动作 = `continue / skip / goto`（resume 类）＋ 旁路动作（取消 / 拆分 / 换模型——决策 132 已把无端点的「放弃合入」「合并任务」移出动作集），
   两类按钮视觉分组，旁路动作弱化（决策 69/70）。完整映射见主文档 §5 的 **allowed_actions 权威总表**（决策 130）。
 - 长耗时按钮异步 + loading 禁用（§12.11）；看板卡片禁拖（§12.11）。
+
+### 9.3 动作的确认步与量级（决策 216）
+
+**判据一句话：这一下之后，有没有东西在物理上回不去。** 有 → 走确认步；只是「走错要花时间」
+→ 直接发。
+
+| 类 | 在册动作 | 量级 | 确认步 |
+|---|---|---|---|
+| 推进 | `通过评审`（`approve`） / `continue`（带自由输入那个） / `goto` / `重试执行` / `重试合并` | 实心 `.btn.solid` | 无 |
+| 写进项目仓库 | `合入`（`approve`@`merge_approval`） | 实心 | **有**：`确认合入到 {default_branch}？` |
+| 跳过质量闸 | `skip`（`跳过本设计阶段` / `跳过当前阶段` / `强制进入下一阶段` / `强制通过评审`）+ 不带自由输入的 `continue`（`忽略失败依赖，继续执行`） | 琥珀描边（`--pending`） | **有**：`确认跳过评审闸门？` |
+| 终结任务 | `cancel`（`终止任务` / `取消任务` / `取消本任务（其一）`） | 红描边 `.btn.danger` | **有**：`确认终止？任务会停在当前节点不再推进` |
+| 让设备失效 | `重置配对` | 红描边 `.btn.danger` | **有**：`确认重置？{n} 台已配对的设备要重新扫码`（取不到 `n` 就不写数） |
+| 弱化旁路 | `split_task` / `model_override` / `return`（`返回修改`） / `归档` / 上述之外的旁路 | `.btn.quiet` | 无（`拆分` / `换模型` 本来就要填表） |
+
+- **怎么就认出「跳过质量闸」**（不靠标签文字匹配）：`kind === 'resume'` 且
+  （`action === 'skip'` 或（`action === 'continue'` 且 `requires_input !== true`））。
+  理由：`skip` 的语义就是「不看本阶段产出直接放行」（决策 69 / 130），而 `continue`
+  只有**带自由输入**那一支是「把缺的信息补上再继续」——那是推进，不是跳闸。
+  `goto` 一律属推进：它把任务送回某个阶段重做，不跳过任何东西。
+- **形态 = 内联两步，不是模态**：动作行就地换成 `确认…？` + **同一颗钮**（保留原词与原量级，
+  进 `busy` 才禁用）+ 紧邻一颗 `取消`（`.btn.quiet`）。沿用删项目 / 删 provider 的既有写法
+  （`SettingsProjects.svelte` 的 `confirmingDelete`），理由见决策 216②。
+- **后果句只在动手那一步出现**，常驻处不摆（每个动作都挂一句会把坞顶满）；与决策 105
+  「理由只在动手时出现」同源。
+- **键盘**：确认态不移动焦点（焦点仍在刚点的那颗钮上，再按一次回车即确认）；`Escape`
+  从确认态退回普通态；`取消` 不进默认焦点。
+- **打回**不强制非空意见，但标签随输入变：空 → `打回开发`，非空 → `打回并附意见`。
+  它**不进确认步**（不跳过闸门，可再走一遍）。
+
+### 9.4 中流状态的地址与本地留存（决策 217）
+
+| 状态 | URL | localStorage | 谁写地址 |
+|---|---|---|---|
+| 详情页签 | `#/task/{id}?tab=timeline\|conversation\|commands\|files\|diff`（缺省 `timeline` **不写**） | — | 用户点页签 = `pushState` |
+| 看板过滤 | `#/?filter=all\|running\|pending\|…`（缺省 `all` 不写） | `agentpipeline.board_filter`（URL 里没有时兜底） | 用户切过滤 = `pushState` |
+| 对讲台班次 | `#/talk?session=42` | `agentpipeline.talk_session`（URL 里没有时兜底） | 用户换班次 = `pushState` |
+| 对讲台输入草稿 | **不进** | `agentpipeline.talk_draft`（`{sessionId, text, at}`） | — |
+| 会话页签里选中的 run | **不进** | **不进** | — |
+
+- **「我在哪」进 URL，「我平常怎么用」与没写完的草稿进 localStorage。** 草稿不是位置：
+  把半句话塞进地址，分享出去的是一个别人看不懂的 URL，而地址栏还会在打字时被反复改写。
+- **程序改地址一律 `replaceState`**（触发节点直达、打开产出文件、`?task=` 自动就位、
+  `?project=&analyze=1` 自动触发）——否则自动联动会把历史灌满，后退不再是「回到上一页」。
+- **刷新恢复**：地址里有就照地址；没有就用缺省，**不拿 localStorage 去覆盖**——过滤与班次
+  是两个例外（跨页面的工作语境：从看板点进任务再点「← 看板」回来时地址会丢参数，
+  而「我一直在看 pending」不该因此被重置）。取值非法（枚举外 / 库里已不存在）回落缺省**并删键**。
+- **清理**：草稿发送成功后立刻清零，装载时若 `at` 早于 7 天也清零；不新增「清空本地状态」界面
+  （theme / project / pairing 各有各的复位处，多一个总闸只多一个误触面）。
+- **上界**：只允许这几类短枚举参数（连同既有 `task=` / `project=` / `analyze=`）；
+  参数总数 ≥5 或出现自由文本时回来重新裁决。地址是给人看、给人抄的，不是状态垃圾桶。
 
 ---
 
@@ -661,3 +759,29 @@ GET /tasks/{id}               → 详情页装载 + 断线重连后的全量校�
 | 通知策略：toast 只对 pending / done / failed 弹，同类 5 分钟 cooldown，22–8 免打扰 | `frontend/src/lib/notificationPolicy.ts` | 决策 65 |
 | 实时：逐任务开 SSE 流 + 10s 对齐 tick 兜底 refetch | `frontend/src/realtime/connection.ts`、`frontend/src/stores/board.svelte.ts` | 决策 76 |
 | 主题切换（夜班靛 / 掌机背光）并入底部状态行 | `frontend/src/components/layout/StatusLine.svelte` | 决策 169 |
+| 详情页加载失败 / 换 id：把上一个任务连同它的动作按钮一起收走，并给一颗能按的「重新加载」（「这个 id 没有」与「没读到」分开说） | `frontend/src/stores/taskDetail.svelte.ts`、`frontend/src/routes/TaskDetail.svelte` | 票 01（R2-01）；清空是 `resetTaskContent()`，两条出路是「重试」与「重新加载」 |
+| 错误可见、可说、可恢复：错误横幅进 live region（`role=alert`）、表单给字段级 `aria-invalid` + `aria-describedby`、市场刷新失败**保留已列出的列表**并自带重试 | `frontend/src/routes/SettingsMarket.svelte`、`frontend/src/routes/Board.svelte`、`frontend/src/components/settings/ProjectForm.svelte`、`frontend/src/components/settings/ProviderForm.svelte` | 票 02（R2-06 / 07a / 07c） |
+| 终端旁路动作（重试 / 归档）失败不静默：写进页面既有的动作错误位并播报 | `frontend/src/routes/TaskDetail.svelte`、`frontend/src/stores/taskDetail.svelte.ts` | 票 02（R2-08）；审计 ②.1 的取证是假阳性（注入的路径对不上），代码结论成立并已修 |
+| 对话框动作进「提交中」态并有重入护栏（拆分 / 换模型）：连点两次只发一个请求 | `frontend/src/stores/taskDetail.svelte.ts`、`frontend/src/components/task/SplitDialog.svelte`、`frontend/src/components/task/ModelOverrideDialog.svelte` | 票 03（R2-03）；`dialogInFlight` 与 `busyKey` 两道 |
+| 「待处理」下拉是真链接列表而不是假菜单：Escape / 点外关得掉、方向键进得去、面板常驻 DOM 用 `hidden` 收 | `frontend/src/components/layout/TopBar.svelte`、`frontend/src/stores/board.svelte.ts` | 票 04（R2-04）；**降级**掉 `role=menu`（ARIA 1.2 里它是「菜单」，补不起契约就别用它） |
+| 全站地标与标题：每页一个 `<main>`、每页有 `<h1>`（看板与 404 也补）、页签是真 `tablist`（方向键 + roving tabindex）、当前项 `aria-current`、每页 `document.title` 各不相同 | `frontend/src/routes/Board.svelte`、`frontend/src/routes/TaskDetail.svelte`、`frontend/src/App.svelte`、`frontend/src/router.svelte.ts` | 票 06（R2-19 / 20） |
+| 装饰不进可访问名：按钮上的 `▶` 用 `::before` 画（`clip-path` 三角），DOM 里没有那个字符 | `frontend/src/app.css`、`frontend/src/components/layout/TopBar.svelte` | 票 06（R2-19）；像素纪律「只有 2px 一档描边」由 `frontend/src/theme/css-parity.test.ts` 守 |
+| 钉边元素按**变量**让位：动作坞钉在底栏上沿（`--sbar-h`）、档案盒吸顶避开**实测**顶栏高度（`--topbar-h`，由顶栏量出来写回） | `frontend/src/app.css`、`frontend/src/components/layout/TopBar.svelte`、`frontend/src/components/task/PendingDossier.svelte` | 票 05 / 09（R2-02 / R2-11）；两个高度的单一出处都在 `app.css` 的 `:root` |
+| 状态行档位：`≤748` 舍三格汇总、`≤560` 再舍 token 量表（数字逐字保留），容器加横滚兜底——**舍格优先、可滚兜底，绝不静默裁切** | `frontend/src/components/layout/StatusLine.svelte` | 决策 215 的档位表；票 08（R2-10） |
+| 同名动作不是一个动作：身份 = 动作名 + 游标 + **落点**，渲染层的 each key 与「提交中」态共用同一把尺子 | `frontend/src/lib/actions.ts`、`frontend/src/components/board/PendingActions.svelte`、`frontend/src/components/task/DiffReviewPanel.svelte` | 票 20；`retry_exhausted` 的两条 `goto` 撞 key 会让整块动作区停更 |
+| 新建任务按服务端返回的 id 跳转（不靠列表里的第一个去猜） | `frontend/src/stores/board.svelte.ts`、`frontend/src/components/board/NewTaskDialog.svelte` | 票 10（R2-12） |
+| 提交前拦下明显非法的值：`base_url` 形状、拆分里空标题的行**指出第几行**、文本域全空给提示而不是静默 no-op | `frontend/src/lib/providers.ts`、`frontend/src/components/task/SplitDialog.svelte` | 票 11（R2-13） |
+| 请求有统一超时（值只有一处出处），超时给可读错误而不是内部字眼；值班长发话单独放宽 | `frontend/src/api/client.ts` | 票 12（R2-14）；`REQUEST_TIMEOUT_MS` 与 `mapRequestError` |
+| 命令输出读不回来就说失败（不再永远「正在加载完整输出…」） | `frontend/src/components/task/CommandLog.svelte`、`frontend/src/stores/taskDetail.svelte.ts` | 票 12（R2-16）；`commandOutputError` 此前无人读 |
+| 详情页也有实时断线指示（与看板同一句话）；流未连通时动手要说「回执要等重连」而不是静默等 30 秒 | `frontend/src/stores/taskDetail.svelte.ts`、`frontend/src/routes/TaskDetail.svelte` | 票 13（R2-15） |
+| 时间与日期的格式只有一处出处（`lib/format.ts` 之外不许再出现 locale 调用） | `frontend/src/lib/format.ts`、`frontend/src/lib/format.test.ts` | 票 15（R2-18）；静态扫描是这道门的一部分 |
+| 同一个 `bind_source` 值只有一个说法（定义收在纯函数里，模板只调它） | `frontend/src/lib/sharePairing.ts`、`frontend/src/routes/Share.svelte` | 票 15（R2-18） |
+| 长值不撑破容器（`min-width: 0` + `overflow-wrap: anywhere`）；截断的值能悬停看全（`title`） | `frontend/src/components/render/MetadataCard.svelte`、`frontend/src/components/render/DiffView.svelte`、`frontend/src/components/settings/AnalysisChecklist.svelte` | 票 17（R2-22）；长值的尾巴才是区别所在 |
+| toast：hover/focus 时暂停计时（剩余时长**接着算**）、每条 `role="status" aria-atomic`、手机上挪到顶栏下方让开动作坞 | `frontend/src/stores/notifications.svelte.ts`、`frontend/src/components/layout/ToastStack.svelte` | 票 17（R2-23） |
+| 没有第二个通道的通知不节流：`failed` 的 toast 是它唯一的通道，夜间免打扰与同类 cooldown 都不吞它 | `frontend/src/lib/notificationPolicy.ts` | 票 17（R2-23 的调整支） |
+
+**决策 216（不可逆动作的确认步与三档量级）与 217（中流状态的地址与本地留存）的实现行，等实现票
+[21](../.scratch/ux-audit-2/issues/21-destructive-confirm-impl.md) / [22](../.scratch/ux-audit-2/issues/22-midflow-persistence-impl.md)
+落地后补**——按本表第 5 条的规矩，位置必须现在就在磁盘上，而这两条的行为现在**还没有落点**。
+同一条规矩下，决策 215 的「详情页 / 对讲台中间档折行 + hero 轨道容器内横滚」也还没有行
+（那两格是票 18 / 19），**已经落地的状态行档位在上面**。

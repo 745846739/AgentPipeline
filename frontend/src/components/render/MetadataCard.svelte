@@ -70,6 +70,13 @@
   .val {
     color: var(--text-hi);
     white-space: pre-wrap;
+    /* `word-break: break-word`（= `overflow-wrap: break-word`）**不给 min-content 尺寸
+       提供软换行点**：一个长路径 / ULID / token 会把这一行的 min-content 撑到它那么宽，
+       顶着整张卡片（以及右栏）横向溢出（票 17 / R2-22）。两件事一起做：
+       ① `min-width: 0` 让 flex 子项真的能收缩（flex 子项的 min-width 默认是 auto）；
+       ② `overflow-wrap: anywhere` 才在 min-content 的计算里也提供换行点。 */
+    min-width: 0;
+    overflow-wrap: anywhere;
     word-break: break-word;
   }
   .raw {

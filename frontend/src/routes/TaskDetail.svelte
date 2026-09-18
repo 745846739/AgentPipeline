@@ -285,6 +285,16 @@
       </div>
     {/if}
 
+    {#if taskDetail.connectionState === 'error'}
+      <!-- 与看板同一句话（票 13 / R2-15）：同一件事别两套说法；括号里说清**本页**的差别
+           ——详情页没有看板那种 10s 对齐，流断了就是真的不更新了。 -->
+      <div class="banner" role="status">实时流已断开，正在重连…（这期间本页不会自动更新）</div>
+    {/if}
+
+    {#if taskDetail.actionNote}
+      <div class="banner" role="status">{taskDetail.actionNote}</div>
+    {/if}
+
     {#if taskDetail.actionError}
       <!-- 动作提交失败必须可见（主流程票 03）：吞掉它 = 用户点「重试」毫无反应的死面板。
            `role=alert` 让它在读屏里也说一声（票 02 / R2-06）——红颜色只说给看得见的人。 -->
@@ -457,6 +467,7 @@
             commands={detail.commands}
             outputFor={(c) => taskDetail.outputFor(c)}
             streamedFor={(c) => detail.commandOutput[c.id] ?? null}
+            errorFor={(c) => taskDetail.commandOutputError[c.id] ?? null}
             onload={(cmdId) => taskDetail.loadCommandOutput(cmdId)}
           />
         {:else if tab === 'files'}
@@ -765,8 +776,10 @@
       padding: 0 12px calc(30px + var(--safeb));
     }
     /* pending 时底部动作坞常驻，内容留出坞高（原型 #v-approve .detail padding-bottom） */
+    /* 坞钉在底栏上沿（票 05），故内容要同时让出坞与底栏两份高度；
+       `--dock-h` 与 `--sbar-h` 都已含各自的安全区那一份。 */
     .detail.docked {
-      padding-bottom: calc(var(--dock-h) + 14px + var(--safeb));
+      padding-bottom: calc(var(--dock-h) + var(--sbar-h) + 14px);
     }
     .detail.split {
       display: block;

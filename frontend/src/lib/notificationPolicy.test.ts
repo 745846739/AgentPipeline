@@ -31,15 +31,20 @@ describe('NotificationPolicy（决策 65 / 130③）', () => {
     expect(shouldNotify('done', at(12, 1), state)).toBe(true);
   });
 
-  it('22–8 免打扰：done / failed 静音，pending 豁免', () => {
+  it('22–8 免打扰：done 静音、pending 与 failed 豁免（票 17 修订了 failed 这一档）', () => {
     expect(isQuietHours(at(23), [22, 8])).toBe(true);
     expect(isQuietHours(at(3), [22, 8])).toBe(true);
     expect(isQuietHours(at(12), [22, 8])).toBe(false);
     expect(isQuietHours(at(8), [22, 8])).toBe(false);
     expect(shouldNotify('done', at(23), fresh)).toBe(false);
-    expect(shouldNotify('failed', at(3), fresh)).toBe(false);
     // 等人优先（§2 原则 3）：pending 在免打扰时段照弹
     expect(shouldNotify('pending', at(23), fresh)).toBe(true);
+    // 票 17：failed 既免免打扰也免 cooldown——它只有 toast 一条通道，
+    // 而 done 另有完成横幅（那个不受任何节流），pending 另有计数芯片与档案盒
+    expect(shouldNotify('failed', at(3), fresh)).toBe(true);
+    expect(shouldNotify('failed', at(3), { lastNotifiedAt: { failed: at(3, 0).getTime() } })).toBe(
+      true,
+    );
   });
 
   it('notifyOn 关闭即静音', () => {

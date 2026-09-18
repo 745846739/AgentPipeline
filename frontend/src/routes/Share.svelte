@@ -12,7 +12,7 @@
   import type { ServerAddress, ServerInfo } from '../api/types';
   import EmptyState from '../components/ui/EmptyState.svelte';
   import { changeLanMode } from '../lib/lanToggle';
-  import { portFallbackNote, sharePanel } from '../lib/sharePairing';
+  import { bindSourceLabel, portFallbackNote, sharePanel } from '../lib/sharePairing';
 
   /**
    * 局域网分享页（决策 167 / 186 / 189）：手机扫码接入。
@@ -247,7 +247,7 @@ host = "0.0.0.0"</code></pre>
           <p class="note">
             启动时指定的绑定<b>优先于这里的按钮</b>：那样启动时，按钮只改得动
             这一次，重启后仍按启动参数来。当前这次绑定来自
-            <span class="mono">{info.bind_source === 'startup' ? '启动参数' : info.bind_source === 'settings' ? '界面设置' : '配置文件'}</span>。
+            <span class="mono">{bindSourceLabel(info.bind_source)}</span>。
           </p>
         </details>
         <p class="warn">
@@ -372,11 +372,7 @@ host = "0.0.0.0"</code></pre>
         </button>
         <span class="switch-note">
           当前绑定 <span class="mono">{info.host}:{info.port}</span>，来自 <span class="mono"
-            >{info.bind_source === 'startup'
-              ? '启动参数'
-              : info.bind_source === 'settings'
-                ? '界面上的选择'
-                : '配置文件'}</span
+            >{bindSourceLabel(info.bind_source)}</span
           >。
         </span>
       </div>

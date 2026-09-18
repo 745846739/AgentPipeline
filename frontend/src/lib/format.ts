@@ -29,11 +29,16 @@ export function lineCount(s: string | null | undefined): number {
   return s.split('\n').length;
 }
 
+/** 时刻（`Date`）→ 全站口径的钟点。**只有这一处**碰 `toLocaleTimeString`。 */
+export function formatClockAt(d: Date): string {
+  return d.toLocaleTimeString('zh-CN', { hour12: false });
+}
+
 export function formatClock(iso: string | null | undefined): string {
   if (!iso) return '—';
   const d = new Date(iso);
   if (Number.isNaN(d.getTime())) return '—';
-  return d.toLocaleTimeString('zh-CN', { hour12: false });
+  return formatClockAt(d);
 }
 
 export function formatDateTime(iso: string | null | undefined): string {
