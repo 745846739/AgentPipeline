@@ -78,7 +78,6 @@ impl Drop for ExecutorGuard {
     }
 }
 
-/// 非阻塞抢占：已有 executor 在跑同一任务时返回 `None`（调用方直接退出）。
 /// 把 `task_id` 从**进程内去重**里摘掉（决策 210⑧ / 票 09）。
 ///
 /// 这是 `unstick` 的第一个动作，也是它存在的理由：去重集合是「同一任务只跑一个执行体」的
@@ -93,6 +92,7 @@ pub fn force_release(task_id: &str) -> bool {
     EXECUTOR_REGISTRY.lock().unwrap().remove(task_id)
 }
 
+/// 非阻塞抢占：已有 executor 在跑同一任务时返回 `None`（调用方直接退出）。
 fn try_acquire(task_id: &str) -> Option<ExecutorGuard> {
     let mut set = EXECUTOR_REGISTRY.lock().unwrap();
     if set.contains(task_id) {
@@ -1101,18 +1101,17 @@ impl Executor {
         }))
     }
 
-    /// 单次 agent attempt：prompt 组装 → 工具循环 → 元数据抽取 → 节点后处理。
-    /// 返回（结论，token 计量）。
-    ///
-    /// 参数多于 clippy 的默认阈值：`run_id` / `attempt` / `carried` 三者都是**本次尝试**的
-    /// 入参，绑成结构体只是把同一份信息换个地方写，不改变调用点的可读性。
-    #[allow(clippy::too_many_arguments)]
     /// 一次 agent 尝试的**外框**（票 01 / 决策 211①）：失败也要落会话，所以现场
     /// （`messages` / `tokens`）必须活到函数出口——`?` 会把它们一起带走，那正是
     /// 2026-09-17 实测里「失败的那一轮什么都不留」的机制。
     ///
     /// `persisted` 保证**一条 run 至多一条会话行**（决策 99）：成功路径已经写过时，
     /// 失败收尾只把错误上下文并进那一行，不再插新行。
+    ///
+    /// 内层 [`Self::agent_attempt_inner`] 的参数多于 clippy 的默认阈值：`run_id` /
+    /// `attempt` / `carried` 三者都是**本次尝试**的入参，绑成结构体只是把同一份信息换个
+    /// 地方写，不改变调用点的可读性。返回（结论，token 计量）。
+    #[allow(clippy::too_many_arguments)]
     async fn agent_attempt(
         &self,
         task: &Task,
@@ -3071,7 +3070,6 @@ impl Executor {
         Ok((run_id, attempt))
     }
 
-    #[allow(clippy::too_many_arguments)]
     /// 系统节点的**步边界留痕**（决策 211④ / 票 04）。
     ///
     /// **best-effort**：写不进去只 warn，不 `?`。上一个同族的教训是 `Git::is_dirty`

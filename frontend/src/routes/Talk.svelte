@@ -64,6 +64,7 @@
     ledgerOwnsTheFailure,
     settleForemanStream,
     FOREMAN_FAILED_TURN_MARK,
+    FOREMAN_WATCH_MARK,
     type ForemanStreamState,
   } from '../realtime/foreman';
   import Sprite from '../components/render/Sprite.svelte';
@@ -205,14 +206,15 @@
   const FAILED_TURN_MARK = FOREMAN_FAILED_TURN_MARK;
 
   /**
-   * 主动播报的标记（决策 209④ / 票 06）。同样由后端加上（语义源在 foreman.rs 的
-   * `FOREMAN_WATCH_MARK`）：**值守轮不是回话**——它没人问就自己说话，名牌上要看得出来，
-   * 否则值班经理会以为自己在跟它对话（而它其实是在报事件）。
+   * 主动播报的标记（决策 209④ / 票 06）。语义源在 foreman.rs 的 `FOREMAN_WATCH_MARK`，
+   * 与失败轮那个标记同一姿态：前端拿的是**镜像常量**，不在界面里再抄一份字面量
+   * ——两份字面量迟早漂移成「后端加了标记、界面认不出来」。
    */
-  const WATCH_MARK = '【值守播报】';
+  const WATCH_MARK = FOREMAN_WATCH_MARK;
 
   interface TurnView {
-    key: string;    /**
+    key: string;
+    /**
      * 发言者。`console` = **操作台记的一轮**（`role === 'system'`：提议的执行结果，决策 207）。
      *
      * 它必须与 `fm`（值班长的话）分开：那一行的内容是「提议已执行：…」，而**动手的是按下

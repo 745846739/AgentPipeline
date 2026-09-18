@@ -258,6 +258,51 @@ async fn adaptive_timeout_cold_start_does_not_alert() {
     );
 }
 
+/// 慢跑告警要**落一条待办**（决策 209② 的事件清单：只播报不唤醒）。
+///
+/// 这一条此前只有日志——`SlowRun` 这个类别与它的 `wakes() == false` 都写好了，却没有任何
+/// 生产者，「值班长该知道这件事」在实际运行里没有出口。落表的口径是**一条 run 一行**
+/// （`occurred_at` 取 run 的开始时刻）：tick 每 10s 一次，用 `now` 的话同一条慢跑会每
+/// 10 秒落一行。
+#[tokio::test]
+async fn a_slow_run_is_noted_exactly_once_per_run() {
+    let h = Harness::new().await;
+    h.seed_task("t1").await;
+    h.mark_running("t1").await;
+    let cursor = h.store.load_live_cursors("t1").await.unwrap()[0].clone();
+    h.advance_to_develop(&cursor.cursor_id).await;
+    for _ in 0..5 {
+        h.finished_run("t1", &cursor.cursor_id, 1_000).await;
+    }
+    // 已跑 10s（> 3×P90），心跳新鲜（不触发空闲超时）
+    h.running_run("t1", &cursor.cursor_id, 1, 10, 0, None).await;
+    let settings = Settings {
+        adaptive_timeout_enabled: true,
+        ..Default::default()
+    };
+
+    let report = h.scheduler(settings.clone()).tick().await.unwrap();
+    assert_eq!(report.slow_run_alerts.len(), 1, "先有告警");
+    assert_eq!(report.attention_noted, 1, "告警同时落一条待办");
+    let open = h.store.open_attention(100).await.unwrap();
+    assert_eq!(open.len(), 1, "{open:?}");
+    assert_eq!(
+        open[0].kind,
+        agentpipeline_core::storage::AttentionKind::SlowRun
+    );
+    assert_eq!(open[0].task_id, "t1");
+    assert!(!open[0].kind.wakes(), "它不是把人叫醒的那一类");
+
+    // 再 tick 两趟：同一条 run 不重复落行（每 tick 一次会变成刷屏）
+    h.scheduler(settings.clone()).tick().await.unwrap();
+    h.scheduler(settings).tick().await.unwrap();
+    assert_eq!(
+        h.store.open_attention(100).await.unwrap().len(),
+        1,
+        "一条慢跑只落一行"
+    );
+}
+
 // ─────────────────────── ① 超时（决策 33 / 64 / 66 / 100 / 122）───────────────────────
 
 #[tokio::test]

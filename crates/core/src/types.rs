@@ -1075,7 +1075,10 @@ impl Stewardship {
             && self.last_fingerprint.as_deref() != Some(fingerprint)
     }
 
-    /// 记一次自动动手。
+    /// 记一次自动动手（`resume(continue)` 与 `unstick` **共用**这一条止损线，决策 210⑨）。
+    ///
+    /// 名字沿用列名（`auto_resumes` 就是落库的那一列），语义是「自动动作动过几次」——
+    /// 两种动作各记一条线，只会让「它今晚自己动了几次手」这个数变成两个数。
     pub fn note_auto_resume(&mut self, fingerprint: &str, now: DateTime<Utc>) {
         self.auto_resumes += 1;
         self.last_fingerprint = Some(fingerprint.to_string());

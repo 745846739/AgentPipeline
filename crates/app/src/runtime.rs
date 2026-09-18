@@ -27,19 +27,26 @@ use agentpipeline_core::storage::Store;
 
 use crate::state::ResumeHook;
 
-/// 托管放行的自动动作在 app 层的执行者（决策 210② / 票 08）。
+/// 托管放行的自动动作在 app 层的执行者（决策 210② / 票 08、票 09）。
 ///
-/// 走 `pipeline::resume::apply_resume` —— 与 `POST /tasks/{id}/resume` **同一份实现**。
-/// 抄一份到这里等于两套「resume 做了什么」，它们迟早漂移成「界面按得动、它按不动」。
-pub struct StewardResume {
+/// **按动作分派**，两件各走各自那份唯一实现：
+/// - `resume(continue)` → `pipeline::resume::apply_resume`（与 `POST /tasks/{id}/resume`
+///   同一份——抄一份到这里等于两套「resume 做了什么」，迟早漂移成「界面按得动、它按不动」）；
+/// - `unstick` → `pipeline::unstick::unstick`（与 `task` 工具的手动那一支同一份）。
+///
+/// 为什么分派必须收在这里：core 不认识 HTTP，也不持有 `force_release`（进程内去重住在
+/// `pipeline::executor`，摘它的入口在 app 层）。曾经这里只建 `ResumeRequest`，于是被放行的
+/// `unstick` 会走到 `ResumeAction::parse("")` 上——**托管放行了、执行不通**，而 core 那侧
+/// 注入替身的用例看不见（替身只会数「有没有被放行」）。
+pub struct StewardActions {
     store: Store,
     settings: Settings,
     resume: ResumeHook,
 }
 
-impl StewardResume {
+impl StewardActions {
     pub fn new(store: Store, settings: Settings, resume: ResumeHook) -> Self {
-        StewardResume {
+        StewardActions {
             store,
             settings,
             resume,
@@ -47,7 +54,7 @@ impl StewardResume {
     }
 }
 
-impl agentpipeline_core::agent::tools::StewardActionRunner for StewardResume {
+impl agentpipeline_core::agent::tools::StewardActionRunner for StewardActions {
     fn run(
         &self,
         call: agentpipeline_core::agent::client::ToolCall,
@@ -70,6 +77,23 @@ impl agentpipeline_core::agent::tools::StewardActionRunner for StewardResume {
                 .and_then(|v| v.as_str())
                 .unwrap_or_default()
                 .to_string();
+            // `unstick` 与 `resume` 是两回事（决策 210⑧），故先把这一支分出去——
+            // 两者的判据在 core 里各有一份实现，这里只做**分派**。
+            if args.get("action").and_then(|v| v.as_str()) == Some("unstick") {
+                let unstuck = agentpipeline_core::pipeline::unstick::unstick(
+                    &store,
+                    &force_release,
+                    &task_id,
+                    store.now(),
+                    chrono::Duration::minutes(settings.watch_owner_stuck_minutes as i64),
+                )
+                .await?;
+                return Ok(agentpipeline_core::agent::tools::ToolOutcome::ok(format!(
+                    "已自动解除僵死占用（托管）：任务 {task_id}，游标 {} 转 pending\
+                     （标终态的 run {:?}），现在可以 resume",
+                    unstuck.cursor_id, unstuck.finished_runs
+                )));
+            }
             let request = ResumeRequest {
                 action: args
                     .get("resume_action")

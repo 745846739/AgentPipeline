@@ -4313,7 +4313,7 @@ async fn api_full_with_foreman(settings: Settings, agent: Option<FakeAgent>) -> 
                     Arc::new(agent) as Arc<dyn LlmClient>,
                     state.sse.clone(),
                 )
-                .with_steward_actions(Arc::new(app::runtime::StewardResume::new(
+                .with_steward_actions(Arc::new(app::runtime::StewardActions::new(
                     state.store.clone(),
                     state.settings.clone(),
                     state.resume_hook.clone(),
@@ -4449,6 +4449,98 @@ async fn a_stewarded_task_is_resumed_by_the_foreman_without_a_press() {
         "{messages:?}"
     );
     assert_eq!(api.resumes.load(Ordering::SeqCst), 1, "执行器被拉起一次");
+}
+
+/// 托管放行的 `unstick` **真的执行得通**（决策 210⑧ / 票 09）。
+///
+/// 这一条必须打在 app 层。core 那侧的托管用例注入的是替身执行者——它能数出「有没有被放行」，
+/// 但不会真的去解开一个卡死的任务，于是「放行了、却执行不通」这件事在那一边永远看不见。
+/// 实际发生过：执行者只建 `ResumeRequest`，被放行的 `unstick` 落到 `ResumeAction::parse("")`
+/// 上（`未知 resume 动作：`）——门开了，路不通。
+#[tokio::test]
+async fn a_stewarded_task_can_be_unstuck_by_the_foreman_without_a_press() {
+    let agent = FakeAgent::new(Script::new());
+    let api = api_with_foreman(agent.clone()).await;
+    seed(&api, "t1").await;
+    let store = &api.state.store;
+    let cursor = store.load_live_cursors("t1").await.unwrap()[0].clone();
+    store
+        .set_task_status("t1", TaskStatus::Running)
+        .await
+        .unwrap();
+    assert!(store.try_claim_executor("t1", "owner-1").await.unwrap());
+    store
+        .insert_run(&agentpipeline_core::storage::observability::NewRun {
+            task_id: "t1".into(),
+            cursor_id: cursor.cursor_id.clone(),
+            stage: cursor.stage,
+            node: cursor.node,
+            attempt: 1,
+            agent_type: "main".into(),
+            parent_run_id: None,
+            prompt_template_hash: None,
+            process_group_id: None,
+        })
+        .await
+        .unwrap();
+    // 心跳停在 900s 前（> watch_owner_stuck_minutes = 10）：有主、但主已经不在了
+    api.clock.advance_secs(900);
+
+    let (status, _) = post(&api, "/tasks/t1/stewardship", json!({"enabled": true})).await;
+    assert_eq!(status, StatusCode::OK);
+
+    let mut script = Script::new();
+    script
+        .for_foreman()
+        .tool("task", json!({"action": "unstick", "task_id": "t1"}));
+    script.for_foreman().text("解开了，现在可以 resume。");
+    agent.set_script(script);
+
+    let (status, body) = post(&api, "/foreman/messages", json!({"text": "t1 卡住了"})).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+
+    // 没有提议（人没按键），而占用**真的**被摘掉了：owner 清空、游标转 pending、
+    // 僵死的 run 标了终态——三件事都是 `unstick` 的实现，不是「放行了一下」。
+    let sid = body["session"]["id"].as_str().unwrap().to_string();
+    assert!(store
+        .list_pending_foreman_proposals(&sid)
+        .await
+        .unwrap()
+        .is_empty());
+    let task = store.get_task("t1").await.unwrap();
+    assert!(
+        task.executor_owner.as_deref().unwrap_or("").is_empty(),
+        "执行者占用要清空：{:?}",
+        task.executor_owner
+    );
+    let after = store.load_live_cursors("t1").await.unwrap()[0].clone();
+    assert!(
+        after.is_pending(),
+        "解开之后停在 pending 等人拍板：{after:?}"
+    );
+    assert_eq!(
+        after
+            .pending_reason
+            .as_ref()
+            .and_then(|r| r.context.as_ref())
+            .and_then(|c| c.kind.as_deref()),
+        Some("unstick"),
+        "pending 的原因要指名它是怎么解开的"
+    );
+    let runs = store.list_runs("t1").await.unwrap();
+    assert_eq!(
+        runs[0].status,
+        agentpipeline_core::types::NodeStatus::Timeout,
+        "僵死的 run 要标终态——「它还在跑」这句话得从台账里消失"
+    );
+    // 留账（硬要求）：那一行说的是**实际做的动作**
+    let messages = store.list_foreman_messages(&sid, 100).await.unwrap();
+    assert!(
+        messages
+            .iter()
+            .any(|m| m.content.starts_with("【托管】") && m.content.contains("unstick")),
+        "{messages:?}"
+    );
 }
 
 /// 空 home 下读会话：形状完整、合计为 0、不报错。

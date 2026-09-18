@@ -50,6 +50,9 @@ pub struct TickReport {
     ///
     /// 与 `reminded` 的分工：后者是本 tick 的日志口径（内存、重启即失），前者才是
     /// 「有人看得见」的那一份。两者都留，是为了让「发现」与「推送」在测试里分得开。
+    ///
+    /// 两个生产者：待办那一段（②–⑥，本 tick 的常规发现）与自适应慢跑告警（它落在
+    /// 超时那一段里，见 `maybe_alert_slow_run`），故计数是累加而不是赋值。
     pub attention_noted: usize,
     /// 自适应超时的「运行显著偏慢」告警（决策 66 / 票 17）：`(task_id, 描述)`。
     ///
@@ -127,7 +130,7 @@ impl KanbanScheduler {
         self.admit_pending_tasks(&mut report).await?;
         self.remind_pending_tasks(&mut report).await?;
         self.abandon_stale_project_runs(&mut report).await?;
-        self.note_attention(&mut report).await?;
+        self.note_discoveries(&mut report).await?;
         Ok(report)
     }
 
@@ -217,6 +220,11 @@ impl KanbanScheduler {
     ///
     /// 采样走 [`crate::metrics::duration_percentiles`]（仅成功运行、窗口 20、最少 5 样本；
     /// 冷启动无数据不告警）。**绝不参与超时判定**——强制阈值始终取配置值。
+    ///
+    /// 告警同时**落一条待办**（`slow_run`，决策 209② 的事件清单）：它此前只写日志，
+    /// 于是「值班长该知道这件事」在实际运行里没有出口。这一类是**只播报不唤醒**的
+    /// （`AttentionKind::wakes` 唯一返回 `false` 的那个）——它没有可操作的动作，够不上
+    /// 半夜把人叫醒；下次为别的事醒来时，它在那份简报里。
     async fn maybe_alert_slow_run(
         &self,
         run: &NodeRun,
@@ -239,6 +247,29 @@ impl KanbanScheduler {
             run.stage, run.node, elapsed_ms, p.p90_ms, p.p50_ms, p.samples
         );
         tracing::warn!(task = %task_id, run = run.id, "{detail}");
+        // `occurred_at` 取**这条 run 的开始时刻**，不是 `now`：tick 每 10s 一次，用 `now`
+        // 会让同一条慢跑每 tick 都落一行新待办（唯一键是 (task, kind, occurred_at)）。
+        // 一条 run 一行，语义也正是「这一轮慢得不正常」，重跑一轮就是新的一行。
+        if self
+            .store
+            .note_attention(
+                &task_id,
+                AttentionKind::SlowRun,
+                run.started_at,
+                Some(&serde_json::json!({
+                    "run_id": run.id,
+                    "stage": run.stage.as_str(),
+                    "node": run.node.as_str(),
+                    "elapsed_ms": elapsed_ms,
+                    "p50_ms": p.p50_ms,
+                    "p90_ms": p.p90_ms,
+                    "samples": p.samples,
+                })),
+            )
+            .await?
+        {
+            report.attention_noted += 1;
+        }
         report.slow_run_alerts.push((task_id, detail));
         Ok(())
     }
@@ -583,7 +614,7 @@ impl KanbanScheduler {
     ///    每次重启后再喊一遍。
     ///
     /// 它**不唤醒任何东西**——唤醒归值守轮（票 06），那一步要花钱。
-    async fn note_attention(&self, report: &mut TickReport) -> Result<()> {
+    async fn note_discoveries(&self, report: &mut TickReport) -> Result<()> {
         let now = self.clock.now();
         let window = Duration::minutes(self.settings.watch_event_window_minutes as i64);
         let stuck = Duration::minutes(self.settings.watch_owner_stuck_minutes as i64);
@@ -696,12 +727,19 @@ impl KanbanScheduler {
             //    active_runs()（run 已是终态就不再被扫），remind_pending_tasks 的 stalled
             //    判据也不成立。这条缝此前零信号。
             if task.status == TaskStatus::Running {
-                if let Some((kind, occurred, detail)) =
-                    self.stuck_evidence(&task, now, stuck).await?
+                // 判据只有一处（`pipeline::unstick::stuck_evidence`）：报出来的卡住与解得开的
+                // 卡住必须是同一个集合，否则「它说卡了、我却解不开」迟早发生（票 09）。
+                if let Some(evidence) =
+                    crate::pipeline::unstick::stuck_evidence(&self.store, &task, now, stuck).await?
                 {
                     if self
                         .store
-                        .note_attention(&task.id, kind, occurred, Some(&detail))
+                        .note_attention(
+                            &task.id,
+                            evidence.kind,
+                            evidence.occurred_at,
+                            Some(&evidence.detail),
+                        )
                         .await?
                     {
                         noted += 1;
@@ -710,32 +748,10 @@ impl KanbanScheduler {
             }
         }
 
-        report.attention_noted = noted;
+        // **累加**而不是赋值：慢跑告警（`check_timeouts` 那一段）已经先加过一次了，
+        // 赋值会把那一份抹掉——两个生产者共用一个计数，就只能加。
+        report.attention_noted += noted;
         Ok(())
-    }
-
-    /// 任务卡在 running 上的两类证据（票 05 的 ⑤⑥）。
-    ///
-    /// 判据在 [`crate::pipeline::unstick::stuck_evidence`]——票 09 的 `unstick` 用的是同一份。
-    /// 两处各写一份的后果是「报出来的卡住」与「解得开的卡住」成为两个集合，
-    /// 而「它说卡了、我却解不开」正是最让人不信任这套东西的一类现象。
-    async fn stuck_evidence(
-        &self,
-        task: &crate::types::Task,
-        now: chrono::DateTime<chrono::Utc>,
-        stuck: Duration,
-    ) -> Result<
-        Option<(
-            AttentionKind,
-            chrono::DateTime<chrono::Utc>,
-            serde_json::Value,
-        )>,
-    > {
-        Ok(
-            crate::pipeline::unstick::stuck_evidence(&self.store, task, now, stuck)
-                .await?
-                .map(|e| (e.kind, e.occurred_at, e.detail)),
-        )
     }
 
     // ─────────────────────── 心跳刷新（决策 100）───────────────────────

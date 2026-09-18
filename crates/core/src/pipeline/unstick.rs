@@ -15,7 +15,7 @@ use chrono::{DateTime, Utc};
 
 use crate::storage::attention::AttentionKind;
 use crate::storage::Store;
-use crate::types::{NodeCursor, NodeStatus, PendingContext, PendingKind, PendingReason, Task};
+use crate::types::{NodeStatus, PendingContext, PendingKind, PendingReason, Task};
 use crate::{Error, Result};
 
 /// 一次「卡住」的证据（[`stuck_evidence`] 的产出）。
@@ -206,17 +206,4 @@ pub const UNSTICK_CONTEXT_KIND: &str = "unstick";
 /// 值班长那一侧的形状判据：`task` + `unstick`（决策 210⑧：进托管可自动集）。
 pub fn is_unstick_action(name: &str, args: &serde_json::Value) -> bool {
     name == "task" && args.get("action").and_then(|v| v.as_str()) == Some("unstick")
-}
-
-/// 这个游标此刻能不能被 unstick 解（供界面 / 值班长解释「为什么解不开」）。
-pub async fn is_stuck(store: &Store, task_id: &str, now: DateTime<Utc>) -> Result<bool> {
-    let task = store.get_task(task_id).await?;
-    Ok(stuck_evidence(store, &task, now, chrono::Duration::zero())
-        .await?
-        .is_some())
-}
-
-/// 便捷：游标是否停在 pending 上（`unstick` 之后应当为真）。
-pub fn cursor_is_pending(cursor: &NodeCursor) -> bool {
-    cursor.is_pending()
 }

@@ -80,6 +80,13 @@ export function failForemanStream(state: ForemanStreamState, message: string): F
  */
 export const FOREMAN_FAILED_TURN_MARK = '【没跑起来】';
 
+/**
+ * 主动播报的标记（`crates/core/src/pipeline/foreman.rs::FOREMAN_WATCH_MARK` 的前端镜像，
+ * 决策 209④ / 票 06）。**值守轮不是回话**——它没人问就自己说话，名牌上要看得出来，
+ * 否则值班经理会以为自己在跟它对话（而它其实是在报事件）。
+ */
+export const FOREMAN_WATCH_MARK = '【值守播报】';
+
 /** 台账里一行带 id 的轮次（只取判据要用的三列）。 */
 export interface LedgerRow {
   id: number;

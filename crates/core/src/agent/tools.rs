@@ -501,13 +501,14 @@ impl ToolExecutor {
         self
     }
 
-    /// 注入提议写入接缝（决策 188 / 207）。不注入时 `ask` 档与 D 层写工具**一律被拒**。
-    /// 注入托管动作的执行者（决策 210② / 票 08）。见 [`StewardActionRunner`]。
+    /// 注入托管动作的执行者（决策 210② / 票 08、票 09）。见 [`StewardActionRunner`]。
+    /// 不注入 = 不放行：没有执行者时 D 层照旧恒提议。
     pub fn with_steward_actions(mut self, runner: Arc<dyn StewardActionRunner>) -> Self {
         self.steward_actions = Some(runner);
         self
     }
 
+    /// 注入提议写入接缝（决策 188 / 207）。不注入时 `ask` 档与 D 层写工具**一律被拒**。
     pub fn with_proposal_sink(mut self, sink: Arc<dyn ProposalSink>) -> Self {
         self.proposals = Some(sink);
         self
@@ -721,13 +722,27 @@ impl ToolExecutor {
         let outcome = runner.run(call.clone(), ctx.clone()).await?;
         if let (Some(store), Some(fingerprint)) = (&self.ledger, grant) {
             if let Ok(task) = store.get_task(&task_id).await {
+                // 记账用的是**实际做的那个动作**（`resume(continue)` / `unstick`）：
+                // 这一行是值班经理第二天早上唯一能读到的「它自己动过几次手」，写错动作名
+                // 等于把一次 `unstick` 说成一次 resume。次数止损线两种动作**共用**一条
+                // （决策 210⑨ 的 N=2）——这是更保守的那一侧：同一条线不必记两遍，
+                // 而托管放开的范围本来就该窄到可审计。
+                let action = match args.get("action").and_then(|v| v.as_str()) {
+                    Some("unstick") => "unstick".to_string(),
+                    _ => format!(
+                        "resume({})",
+                        args.get("resume_action")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("continue")
+                    ),
+                };
                 let mut stewardship = task.stewardship.clone().unwrap_or_default();
                 stewardship.note_auto_resume(&fingerprint, store.now());
                 let nth = stewardship.auto_resumes;
                 store.set_stewardship(&task_id, Some(&stewardship)).await?;
                 if let Some(session_id) = ctx.session_id.as_deref() {
                     let content = format!(
-                        "【托管】自动 resume：任务 {task_id}（第 {nth}/{} 次，动作 continue）。\
+                        "【托管】自动 {action}：任务 {task_id}（第 {nth}/{} 次自动动作）。\
                          依据指纹 {fingerprint}。超出次数或指纹相同即停手，等你按键。",
                         crate::types::STEWARDSHIP_MAX_AUTO_RESUMES
                     );
@@ -1016,7 +1031,7 @@ impl ToolExecutor {
         let name = args.get("name").and_then(|v| v.as_str()).unwrap_or("");
         if name.trim().is_empty() {
             return Ok(ToolOutcome::ok(
-                "Skill 工具需要 {name} 参数（技能名）。请用技能目录里列出的名字重试。",
+                "Skill 工具需要一个 name 参数（技能名）。请用技能目录里列出的名字重试。",
             ));
         }
         match crate::agent::skills::load_body(&self.home.skills_dir(), name) {
@@ -1044,7 +1059,7 @@ impl ToolExecutor {
             .to_string();
         if task_id.is_empty() {
             return Ok(ToolOutcome::ok(
-                "read_task 需要 {task_id} 参数。任务 id 是态势快照里方括号内那串。",
+                "read_task 需要一个 task_id 参数。任务 id 是态势快照里方括号内那串。",
             ));
         }
         // 「任务不存在」在这里是**正常回答**而不是故障：模型可能记错一个 id。
@@ -1130,7 +1145,7 @@ impl ToolExecutor {
             .to_string();
         if task_id.is_empty() {
             return Ok(ToolOutcome::ok(
-                "read_diagnosis 需要 {task_id} 参数。任务 id 是态势快照里方括号内那串。",
+                "read_diagnosis 需要一个 task_id 参数。任务 id 是态势快照里方括号内那串。",
             ));
         }
         // 「查无此任务」是正常回答，不是故障——理由与 [`Self::read_task`] 逐字相同。
@@ -1430,7 +1445,7 @@ impl ToolExecutor {
             .to_string();
         if task_id.is_empty() {
             return Ok(ToolOutcome::ok(
-                "read_conversation 需要 {task_id} 参数（可再加 {run_id}）。",
+                "read_conversation 需要一个 task_id 参数（可再加 run_id）。",
             ));
         }
         let requested_run = args.get("run_id").and_then(|v| v.as_i64());

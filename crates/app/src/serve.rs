@@ -469,8 +469,8 @@ pub async fn serve(options: ServeOptions) -> anyhow::Result<ServerHandle> {
             runtime.llm(),
             sse.clone(),
         )
-        // 托管放行的自动动作（决策 210② / 票 08）：走与 resume 端点**同一份实现**。
-        .with_steward_actions(Arc::new(crate::runtime::StewardResume::new(
+        // 托管放行的自动动作（决策 210② / 票 08、票 09）：resume 与 unstick 各走各自那份实现。
+        .with_steward_actions(Arc::new(crate::runtime::StewardActions::new(
             store.clone(),
             settings.clone(),
             runtime.resume_hook.clone(),
