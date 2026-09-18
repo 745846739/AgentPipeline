@@ -186,10 +186,24 @@
   /**
    * 点信号灯缩略条跳段（移动原型 `.rn` + `scrollIntoView`）。
    * 站点带带 `scroll-margin-top: 148px`，故跳到顶时不会被 138px 的顶栏压住。
+   *
+   * **没有靶子时先去有靶子的那一页**（决策 218 ⑥）：`#s-<key>` 只存在于看板
+   * （`BoardColumn.svelte`），故在对讲台这类页面上点灯以前是**一动不动**的——而它自报
+   * `aria-label="跳到 <列名>"`，接通是兑现承诺、不是加功能。改址走**路由跳转**
+   * （`router.navigate`，hash 变化不整页刷新），等一次 DOM 刷新再定位——用 `tick()`
+   * 而不是定时器（后者是「等得够久就成了」的赌博，而且会与路由的渲染节奏错位）。
    */
   function jumpToStation(key: string) {
     if (typeof document === 'undefined') return;
-    document.getElementById(`s-${key}`)?.scrollIntoView({ block: 'start' });
+    const here = document.getElementById(`s-${key}`);
+    if (here) {
+      here.scrollIntoView({ block: 'start' });
+      return;
+    }
+    router.navigate('/');
+    void tick().then(() =>
+      document.getElementById(`s-${key}`)?.scrollIntoView({ block: 'start' }),
+    );
   }
 </script>
 

@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { parseRoute } from './router.svelte';
+import { parseRoute, readQuery, router, writeQuery } from './router.svelte';
 
 /**
  * 路由解析单测（决策 167 新增 `/share` 后补齐；决策 198 新增设置落地页与阶段配置页后重写）。
@@ -104,5 +104,58 @@ describe('parseRoute', () => {
 
   it('未知路径回落到 not-found 并带回原路径', () => {
     expect(parseRoute('#/nope')).toEqual({ name: 'not-found', path: '/nope', query: {} });
+  });
+});
+
+/**
+ * 查询串的读写口子（决策 217③，票 22 的实现面；对讲台的 `?session=` 是本叠第一个消费者）。
+ *
+ * `pushState` / `replaceState` **不发 `hashchange`**，故这里同时钉住「路由状态自己接上」
+ * 这一条——不写就是「地址变了、页面没变」。
+ */
+describe('readQuery / writeQuery（决策 217）', () => {
+  it('读的是当前地址那份查询串', async () => {
+    router.navigate('/talk?session=abc');
+    // 地址栏是权威：即使路由状态还没跟上（`hashchange` 是一次异步的任务），
+    // 这里读到的也是**此刻地址里那一份**
+    expect(readQuery()).toEqual({ session: 'abc' });
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    expect(router.route).toEqual({ name: 'talk', query: { session: 'abc' } });
+  });
+
+  it('写：默认 push（进历史），`replace` 不进；值没变时不动地址', () => {
+    router.navigate('/talk');
+    const base = window.history.length;
+
+    writeQuery({ session: 'a' });
+    expect(window.location.hash).toBe('#/talk?session=a');
+    // 路由状态自己接上了（pushState 不发 hashchange）
+    expect(router.route.query.session).toBe('a');
+    expect(window.history.length).toBe(base + 1);
+
+    // 同一个值再写一遍：地址没变，也就不该多一条历史
+    writeQuery({ session: 'a' });
+    expect(window.history.length).toBe(base + 1);
+
+    writeQuery({ session: 'b' }, { replace: true });
+    expect(window.location.hash).toBe('#/talk?session=b');
+    expect(window.history.length).toBe(base + 1);
+    expect(router.route.query.session).toBe('b');
+  });
+
+  it('`null` 删键；键删完之后回到没有查询串的干净地址', () => {
+    router.navigate('/talk?session=a&x=1');
+    writeQuery({ session: null });
+    expect(window.location.hash).toBe('#/talk?x=1');
+    writeQuery({ x: null });
+    expect(window.location.hash).toBe('#/talk');
+    expect(readQuery()).toEqual({});
+  });
+
+  it('只改查询串，路径一字不动（`#/task/01HZX?tab=diff` 这类）', () => {
+    router.navigate('/task/01HZX');
+    writeQuery({ tab: 'diff' });
+    expect(window.location.hash).toBe('#/task/01HZX?tab=diff');
+    expect(router.route).toMatchObject({ name: 'task', id: '01HZX', query: { tab: 'diff' } });
   });
 });

@@ -78,14 +78,54 @@ const foremanRounds = foremanScript(
  * 铺长时间线时用：每次 UI 发送都要等一次异步收尾，连铺几轮会让用例又慢又脆。
  * 「用户能不能从界面把话说出去」由 `空看板也能对话` 那条用例覆盖（点发送钮），
  * 以及本组第一条用例的 Enter 发送。
+ *
+ * `sessionId`（决策 220③ 的「跨设备那一组」）：以**别的班次**的名义说一句话——
+ * 它的流式增量会广播到本机那条 `/foreman/stream` 上、带着另一个 `session_id`，
+ * 正是「正在回话」那枚标记要接住的东西。
+ *
+ * 返回落地那个班次的 id。**不给 `sessionId` 不是「新开一个班次」**：服务端在缺省时落到
+ * 「最近活动的未归档班次」（`resolve_session`），故它会接着上一个用例留下的班次说话——
+ * 要一个干净的班次，先 `POST /foreman/sessions`（`makeSession`）拿到 id 再往它里面说。
+ * 另有一条命名规则要记着：班次的名字取自**它第一句话**（决策 204②），空班次上先起好名
+ * 再说话的话，名字会被那句话冲掉。
  */
-async function sayDirect(app: App, body: string): Promise<void> {
+async function sayDirect(app: App, body: string, sessionId?: string): Promise<string> {
   const res = await fetch(`${app.apiBase}/foreman/messages`, {
     method: 'POST',
     headers: { 'content-type': 'application/json', 'x-agentpipeline': '1' },
-    body: JSON.stringify({ text: body }),
+    body: JSON.stringify(sessionId ? { text: body, session_id: sessionId } : { text: body }),
   });
   if (!res.ok) throw new Error(`POST /foreman/messages -> ${res.status}: ${await res.text()}`);
+  const payload = (await res.json()) as { session: { id: string } };
+  return payload.session.id;
+}
+
+/** 开一个班次（绕过界面；跨设备那一组要的是「列表里有它，但本机没在它里面说话」）。 */
+async function makeSession(app: App, title: string): Promise<string> {
+  const res = await fetch(`${app.apiBase}/foreman/sessions`, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json', 'x-agentpipeline': '1' },
+    body: JSON.stringify({ title }),
+  });
+  if (!res.ok) throw new Error(`POST /foreman/sessions -> ${res.status}: ${await res.text()}`);
+  const payload = (await res.json()) as { session: { id: string } };
+  return payload.session.id;
+}
+
+/** 整页横向溢出的像素数。 */
+async function horizontalOverflow(page: Page): Promise<number> {
+  return page.evaluate(
+    () => document.documentElement.scrollWidth - document.documentElement.clientWidth,
+  );
+}
+
+/** 整页纵向溢出的像素数（静置态应当 ≤1：多出来的每一像素都是从对话区借的）。 */
+async function verticalOverflow(page: Page): Promise<number> {
+  return page.evaluate(
+    () =>
+      Math.max(document.documentElement.scrollHeight, document.body.scrollHeight) -
+      window.innerHeight,
+  );
 }
 
 test.describe('对讲台 · 版面（票 04）', () => {
@@ -173,6 +213,7 @@ test.describe('对讲台 · 版面（票 04）', () => {
     // 内容来自真实读数：任务标题 + pending 理由（界面用中文短标签，
     // 不把 merge_approval 这类内部枚举暴露给用户，见 pipeline.ts 的 pendingLabel）
     await expect(turn).toContainText(title);
+    await expect(turn.locator('.dtag')).toContainText('急停');
     await expect(turn.locator('.dtag')).toContainText('等你拍板');
     await expect(turn.locator('.dtag')).toContainText('合并提案');
     await expect(turn).not.toContainText('merge_approval');
@@ -199,35 +240,41 @@ test.describe('对讲台 · 版面（票 04）', () => {
     expectBundleHealthy(bundle);
   });
 
-  test('移动款：顶栏仍为 138px，值班板收成对话之上的横向灯条', async ({ page }) => {
+  test('折行档（430×900）：页头收成一行、值班板整块不渲染、班次行进 ⋯', async ({ page }) => {
     const bundle = watchBundle(page);
     await page.setViewportSize({ width: 430, height: 900 });
     await page.goto(`${app.webBase}/#/talk`);
     await settleBundle(page, bundle);
     await expect(page.locator('.talk')).toBeVisible({ timeout: 60_000 });
 
-    // 顶栏高度是 §5 两处定值（scroll-margin-top / 横幅 top = 148px）的依据：
+    // 顶栏高度是 §5 的两处定值（`--topbar-h` 的来源，也是各钉位的依据）：
     // 新增的 foreman 头像在 34px 页签盒里必须按 16px 显示，否则会撑到 156px。
     const headerBox = await page.locator('header.top').boundingBox();
     expect(headerBox?.height).toBe(138);
 
-    // 单列：值班板不再是右侧 sticky 栏
-    const side = page.locator('.talk-side');
-    await expect(side).toBeVisible();
-    await expect(side).toHaveCSS('position', 'static');
+    // ① 页头 = **46px 的钉住带子**（44px 行 + 2px 下框，决策 218 修订 ④）：
+    // ⋯ 的 44px 触控目标因此直接落在行内，不需要任何溢出技巧。
+    const headBox = await page.locator('.talk-head').boundingBox();
+    expect(headBox?.height, '页头带子应当是 46px').toBe(46);
+    // `<h1>` 视觉让位（visually-hidden：宽度 ≤1px），语义仍在（审计 R2-20 要求每路由有 h1）
+    const ttBox = await page.locator('.talk-head .tt').boundingBox();
+    expect(ttBox?.width ?? 99, '<h1> 应当 visually-hidden').toBeLessThanOrEqual(1);
+    // 那一行是 19.2px 的次级读法（不折行）
+    const lineBox = await page.locator('.talk-head .ts').boundingBox();
+    expect(lineBox?.height ?? 99, '页头那一行应当是一行 19.2px').toBeLessThanOrEqual(20);
+    // 右端的 ⋯：命中区 ≥44px（触控底线）
+    const moreBox = await page.locator('.talk-head .more').boundingBox();
+    expect(moreBox?.height ?? 0, '⋯ 的命中区应当 ≥44px').toBeGreaterThanOrEqual(44);
+    expect(moreBox?.width ?? 0).toBeGreaterThanOrEqual(44);
 
-    // 收成横向灯条（`crew`）：工位横排、不缩不折，且排在状态区（急停）之上
-    const brows = side.locator('.brow');
-    await expect(brows).toHaveCount(8);
-    const first = await brows.first().boundingBox();
-    const last = await brows.last().boundingBox();
-    expect(first).not.toBeNull();
-    expect(last).not.toBeNull();
-    expect(last?.y).toBe(first?.y);
-    expect(last?.x ?? 0).toBeGreaterThan(first?.x ?? 0);
-    const crewBox = await side.boundingBox();
-    const statusBox = await page.locator('.zone-status').boundingBox();
-    expect(crewBox?.y ?? 0).toBeLessThan(statusBox?.y ?? 0);
+    // ② 值班板整块不渲染（决策 218 ②：同一份读数在看板 8 列与顶栏灯带上各有一份，这是第三份）
+    await expect(page.locator('.talk-side')).toBeHidden();
+    expect(
+      await page.locator('.talk .brow:visible').count(),
+      '值班板灯条不该还在页上',
+    ).toBe(0);
+    // 班次行也收进了 ⋯：页面上没有 chip 行
+    await expect(page.locator('.runrow')).toHaveCount(0);
 
     expectBundleHealthy(bundle);
   });
@@ -634,21 +681,82 @@ test.describe('对讲台 · 对话（票 03）', () => {
     await expect(stopTurn).toBeInViewport();
     await expect(stopTurn).toContainText(title);
 
+    // 班次行挂在**页头右端**（决策 218 Q15），故时间线滚到底它仍在视口里——
+    // 原先它长在这个滚动容器**里面**，实测滚到底时已经在屏幕上方 320.2px，
+    // 那正是「新建对话要往上翻很久」的病根。
+    const row = page.locator('.talk-head .runrow');
+    await expect(row).toBeVisible();
+    await expect(page.locator('.timeline .runrow'), '班次行不该还在时间线里').toHaveCount(0);
+    await expect(row.locator('.runchip.plus')).toBeInViewport();
+    await expect(page.locator('.talk-head .runchip[aria-pressed="true"]')).toHaveCount(1);
+    // 页头高度没因它变：**页头 = 标题那一行**。拿 `<h1>` 的行盒当基准而不是写死数字——
+    // 改字号/行距时它会自己跟上，而「班次行把页头撑高」照样红（班次行一旦换行或高于标题行，
+    // 页头就会高过标题行）。`--talk-chrome: 386px` 里预留的「页头 38px」（决策 209 逐块量的）
+    // 比实测的 28.8px 多 9px，那几像素只让状态区少拿、时间线多拿，方向是安全的（决策 218 ⑧
+    // 明写这个常量不动）。
+    const headBox = await page.locator('.talk-head').boundingBox();
+    const ttlBox = await page.locator('.talk-head .tt').boundingBox();
+    expect(headBox?.height ?? 0, '班次行把页头撑高了').toBeLessThanOrEqual((ttlBox?.height ?? 0) + 1);
+
+    expectBundleHealthy(bundle);
+  });
+
+  /**
+   * 工位回执的默认态**分档**（决策 218 ②/Q11）：桌面照旧展开、折行档默认收起。
+   *
+   * 这条要用**界面真的发一句话**（`page.route` 把那一次 POST 拖住 2.5s），因为要验的第二件事
+   * 是「手动展开的那一轮不被流式增量打回」——增量只在 `sending` 期间进时间线，
+   * 直连铺长（`sayDirect`）产生的是别的浏览器上下文的流，进不了这一屏。
+   */
+  test('折行档：工位回执默认收起，手动展开后不被流式增量打回（票 06）', async ({ page }) => {
+    const bundle = watchBundle(page);
+    await page.setViewportSize({ width: 430, height: 900 });
+    // 先直连说一句：拿到一轮**带回执**的回话（脚本每轮都查一次台账）
+    await sayDirect(app, '窄屏回执看一眼');
+    await page.goto(`${app.webBase}/#/talk`);
+    await settleBundle(page, bundle);
+
+    const reply = page.locator('.timeline .turn.fm', { hasText: REPLY_MARK }).last();
+    await expect(reply).toBeVisible({ timeout: 30_000 });
+    const details = reply.locator('details.rcpts');
+    await expect(details).toHaveCount(1);
+
+    // 默认收起：内容不可见，而 summary 仍把**出处与条数**说全（可追溯性只是换了个开销方式）
+    await expect(details.locator('.rcpt').first()).toBeHidden();
+    await expect(details.locator('summary')).toContainText('次台账查读');
+
+    // 人点一下 → 展开
+    await details.locator('summary').click();
+    await expect(details.locator('.rcpt').first()).toBeVisible();
+
+    // 让这一趟慢下来：流式增量因此真的落在这个窗口里（决定性的「再来一次增量」）
+    await page.route('**/foreman/messages', async (route) => {
+      await new Promise((resolve) => setTimeout(resolve, 2500));
+      await route.continue();
+    });
+    await page.locator('.typer textarea').fill('再来一句');
+    await page.locator('.typer button[type=submit]').click();
+    await expect(page.locator('.timeline .turn p.streaming')).toBeVisible({ timeout: 30_000 });
+
+    // **受控展开态**：流式增量反复重渲染同一轮，也把人手动展开的那一轮打不回去
+    await expect(details.locator('.rcpt').first()).toBeVisible();
+
     expectBundleHealthy(bundle);
   });
 });
 
 /**
- * 对讲台 · 窄屏（决策 192）：版面口径是**整页随手指滚，只有两条钉住物**。
+ * 对讲台 · 折行档（决策 192 / 218）：版面口径是**整页随手指滚，钉住的是三样**
+ * （页头 46px 带子 / 急停摘要条 / 输入坞）。
  *
- * 宽屏靠「整页钉住 + 时间线是唯一滚动容器」；窄屏反过来——急停摘要条钉在顶栏下沿
- * （`.zone-status.stops`，`top: 138px`），输入坞钉在底栏上沿（`.typer`，`bottom: var(--sbar-h)`），
- * 对话从两者之间滚过去。
+ * 桌面靠「整页钉住 + 时间线是唯一滚动容器」；这一档反过来——页头那一行钉在顶栏下沿
+ * （`top: var(--topbar-h)`，带子 46px），急停摘要条钉在**它的**下沿，输入坞钉在底栏上沿
+ * （`bottom: var(--sbar-h)`），对话从三者之间滚过去。
  *
  * **这一组自带装置**（不复用上面那组的）：那组最后一条用例会把唯一的急停按掉（点合入），
  * 之后再进来就没有 pending 了——几何断言会退化成「空状态区当然不挤」，绿灯但无意义。
  */
-test.describe('对讲台 · 窄屏（决策 192）', () => {
+test.describe('对讲台 · 折行档（决策 192 / 218）', () => {
   let app: App;
   const title = 'E2E 窄屏长对话';
 
@@ -658,7 +766,7 @@ test.describe('对讲台 · 窄屏（决策 192）', () => {
         ...archBlockerRounds(),
         // 每轮 10 行（同 `FOREMAN_REPLY` 的量级）：三轮就足以让整页在 900px 上滚起来
         ...foremanScript(
-          Array.from({ length: 6 }, () => [
+          Array.from({ length: 12 }, () => [
             text(
               [
                 '窄屏标记',
@@ -681,31 +789,48 @@ test.describe('对讲台 · 窄屏（决策 192）', () => {
   /**
    * 这条钉的是那次改版的**结果**，不是机制：改版前同一装置（430×900、单张急停挂着）
    * 实测对话区只有 **26px**——钉死的状态区拿走 342px，页头 72px、值班板 67px、输入坞 145px
-   * 再把剩下的分完。所以断言写成**几何**（对话区的高度、两条钉住物的贴合），而不是
+   * 再把剩下的分完。所以断言写成**几何**（对话区的高度、三条钉住物的贴合），而不是
    * 「CSS 里有没有 sticky」——后者在版面塌掉时照样为真。
    *
    * 必须排在本组第一条：后面的用例会把对话铺长（那时「不空滚」不再成立，是应该的）。
    */
-  test('静置版面：对话区拿到整块屏幕、两条钉住物各就各位', async ({ page }) => {
+  test('静置版面（430×900）：对话区拿到余下的整块、三条钉住物各就各位', async ({ page }) => {
     const bundle = watchBundle(page);
     await page.setViewportSize({ width: 430, height: 900 });
     await page.goto(`${app.webBase}/#/talk`);
     await settleBundle(page, bundle);
     await expect(page.locator('.zone-status .turn.warn')).toHaveCount(1, { timeout: 60_000 });
 
-    // ① 单张急停也折成摘要条（宽屏那一档它应当是展开的——同一装置两种版面）
+    // ① 单张急停也折成摘要条（桌面那一档它应当是展开的——同一装置两种版面）
     await expect(page.locator('.zone-status .turn.warn.folded')).toHaveCount(1);
-    // ② 状态区退出区内滚动：窄屏没有「状态区自己滚」这回事，去滚的是整页
+    // ② 状态区退出区内滚动：这一档没有「状态区自己滚」这回事，去滚的是整页
     const zoneOverflow = await page
       .locator('.zone-status')
       .evaluate((el) => el.scrollHeight - el.clientHeight);
-    expect(zoneOverflow, '状态区在窄屏仍然区内滚').toBeLessThanOrEqual(4);
+    expect(zoneOverflow, '状态区在折行档仍然区内滚').toBeLessThanOrEqual(4);
 
-    // ③ **对话区是「整块屏幕减去两条钉住物」**，不是它们之间的残渣
+    // ③ **三条钉住物**（决策 218 修订 ④：从两只变三只）各钉在自己的下沿上。
+    // 静置态整页还滚不动，sticky 因此还没生效（带子仍在容器那 10px 上内边距之下）——
+    // 「钉在顶栏下沿」由下面那条「滚到底」的用例量，这里量的是**两者的相对关系**：
+    // 摘要条紧贴带子的下沿（钉位 138 → 184 那一处修订的可见后果）。
+    const headerBox = await page.locator('header.top').boundingBox();
+    const headBox = await page.locator('.talk-head').boundingBox();
+    expect(
+      (headBox?.y ?? 0) - ((headerBox?.y ?? 0) + (headerBox?.height ?? 0)),
+      '页头带子没紧接着顶栏',
+    ).toBeLessThanOrEqual(10);
+    const zoneBox = await page.locator('.zone-status').boundingBox();
+    expect(
+      Math.abs((zoneBox?.y ?? 0) - ((headBox?.y ?? 0) + (headBox?.height ?? 0))),
+      '急停摘要条没钉在页头带子下沿（钉位 138 → 184 那一处修订）',
+    ).toBeLessThanOrEqual(2);
+
+    // ④ **对话区是「整块屏幕减去三条钉住物」**，不是它们之间的残渣。
+    // 实测 430×900：盒子 448px（内容区 422px；决策 218 修订 ④ 的账是 427.7px）
     const timelineBox = await page.locator('.timeline').boundingBox();
-    expect(timelineBox?.height ?? 0).toBeGreaterThanOrEqual(320);
+    expect(timelineBox?.height ?? 0, '对话区又被挤小了').toBeGreaterThanOrEqual(440);
 
-    // ④ 输入坞钉在底栏（`.statusline`）上沿：底边与底栏顶边不许有缝
+    // ⑤ 输入坞钉在底栏（`.statusline`）上沿：底边与底栏顶边不许有缝
     const typerBox = await page.locator('.typer').boundingBox();
     const sbarBox = await page.locator('.statusline').boundingBox();
     expect(typerBox).not.toBeNull();
@@ -715,18 +840,38 @@ test.describe('对讲台 · 窄屏（决策 192）', () => {
       '输入坞没有贴在底栏上沿',
     ).toBeLessThanOrEqual(1);
 
-    // ⑤ 整页不空滚：没有对话时文档高度就是视口高度（多出来的每一像素都是从对话区借的）
-    const stray = await page.evaluate(
-      () =>
-        Math.max(document.documentElement.scrollHeight, document.body.scrollHeight) -
-        window.innerHeight,
-    );
-    expect(stray, '窄屏整页在没有对话时也能滚，说明版面高出了视口').toBeLessThanOrEqual(1);
+    // ⑥ 整页不空滚：没有对话时文档高度就是视口高度（多出来的每一像素都是从对话区借的）
+    expect(await verticalOverflow(page), '折行档整页在没有对话时也能滚').toBeLessThanOrEqual(1);
+    expect(await horizontalOverflow(page)).toBeLessThanOrEqual(0);
 
     expectBundleHealthy(bundle);
   });
 
-  test('整页滚到底之后，急停摘要条仍钉在顶栏下沿、输入坞仍贴在底栏上沿', async ({ page }) => {
+  /**
+   * 375×667（iPhone SE）那一档**从来没有被量过**（决策 192 的「能放下」只在 430 宽上成立过），
+   * 而它当时静置态就溢出 37px、对话区只剩 156.8px。这一条把那两个数钉住（决策 218 修订 ③/⑥）。
+   */
+  test('静置版面（375×667）：不再有静置态溢出', async ({ page }) => {
+    const bundle = watchBundle(page);
+    await page.setViewportSize({ width: 375, height: 667 });
+    await page.goto(`${app.webBase}/#/talk`);
+    await settleBundle(page, bundle);
+    await expect(page.locator('.zone-status .turn.warn')).toHaveCount(1, { timeout: 60_000 });
+
+    expect(await verticalOverflow(page), '375×667 上静置态整页溢出').toBeLessThanOrEqual(1);
+    expect(await horizontalOverflow(page)).toBeLessThanOrEqual(0);
+    // 对话区：实测盒子 215px（决策 218 修订 ④ 的账是约 195px 内容区）
+    const timelineBox = await page.locator('.timeline').boundingBox();
+    expect(timelineBox?.height ?? 0).toBeGreaterThanOrEqual(205);
+    // 一行页头 + ⋯：这一档也一样（同一条 899 的规则）
+    expect((await page.locator('.talk-head').boundingBox())?.height).toBe(46);
+    expect((await page.locator('.talk-head .more').boundingBox())?.height ?? 0).toBeGreaterThanOrEqual(
+      44,
+    );
+    expectBundleHealthy(bundle);
+  });
+
+  test('整页滚到底之后，三条钉住物都还在（⋯ 恒在手边是这次钉页头的全部意义）', async ({ page }) => {
     const bundle = watchBundle(page);
     await page.setViewportSize({ width: 430, height: 900 });
 
@@ -740,15 +885,12 @@ test.describe('对讲台 · 窄屏（决策 192）', () => {
       .poll(() => page.locator('.timeline .turn.fm').count(), { timeout: 30_000 })
       .toBeGreaterThanOrEqual(3);
 
-    // 窄屏滚的是**整页**（时间线不再是滚动容器）
+    // 这一档滚的是**整页**（时间线不再是滚动容器）
     const timelineOverflow = await page
       .locator('.timeline')
       .evaluate((el) => el.scrollHeight - el.clientHeight);
-    expect(timelineOverflow, '窄屏的时间线仍是滚动容器').toBeLessThanOrEqual(1);
-    const pageOverflow = await page.evaluate(
-      () => document.documentElement.scrollHeight - window.innerHeight,
-    );
-    expect(pageOverflow, '窄屏的长对话没有把整页撑出滚动').toBeGreaterThan(0);
+    expect(timelineOverflow, '折行档的时间线仍是滚动容器').toBeLessThanOrEqual(1);
+    expect(await verticalOverflow(page), '长对话没有把整页撑出滚动').toBeGreaterThan(0);
 
     // 滚到底
     const scrolled = await page.evaluate(() => {
@@ -758,18 +900,25 @@ test.describe('对讲台 · 窄屏（决策 192）', () => {
     });
     expect(scrolled).toBeGreaterThan(0);
 
-    // **硬要求**：滚到底时急停摘要条仍钉在顶栏下沿（顶栏 138px 是 §5 定值）
+    // **硬要求**①：滚到底时页头那一条带子仍钉在顶栏下沿
     const headerBox = await page.locator('header.top').boundingBox();
-    const zoneBox = await page.locator('.zone-status').boundingBox();
-    expect(zoneBox).not.toBeNull();
+    const headBox = await page.locator('.talk-head').boundingBox();
     expect(
-      Math.abs((zoneBox?.y ?? 0) - ((headerBox?.y ?? 0) + (headerBox?.height ?? 0))),
-      '滚到底后急停摘要条没钉在顶栏下沿',
+      Math.abs((headBox?.y ?? 0) - ((headerBox?.y ?? 0) + (headerBox?.height ?? 0))),
+      '滚到底后页头带子没钉在顶栏下沿',
+    ).toBeLessThanOrEqual(2);
+    // **硬要求**②：急停摘要条钉在带子下沿，且那一张摘要条还在视口里
+    const zoneBox = await page.locator('.zone-status').boundingBox();
+    expect(
+      Math.abs((zoneBox?.y ?? 0) - ((headBox?.y ?? 0) + (headBox?.height ?? 0))),
+      '滚到底后急停摘要条没钉在页头带子下沿',
     ).toBeLessThanOrEqual(2);
     await expect(page.locator('.zone-status .turn.warn').first()).toBeInViewport();
     await expect(page.locator('.zone-status .turn.warn').first()).toContainText(title);
+    // **硬要求**③：⋯ 恒在手边（班次动作含开新对话不必滚回顶部——用户诉求指向的正是这件事）
+    await expect(page.locator('.talk-head .more')).toBeInViewport();
 
-    // 输入坞也还在（同一时刻两样都在 = 这一档版面的全部合同）
+    // 输入坞也还在（同一时刻三样都在 = 这一档版面的全部合同）
     const typerBox = await page.locator('.typer').boundingBox();
     const sbarBox = await page.locator('.statusline').boundingBox();
     expect(
@@ -778,9 +927,202 @@ test.describe('对讲台 · 窄屏（决策 192）', () => {
     ).toBeLessThanOrEqual(1);
     await expect(page.locator('.typer textarea')).toBeInViewport();
 
-    // 滚回顶部：页头回来了（那些是随手指滚的部分）
-    await page.evaluate(() => (document.scrollingElement as HTMLElement).scrollTo({ top: 0 }));
-    await expect(page.locator('.talk-head .tt')).toBeInViewport();
+    expectBundleHealthy(bundle);
+  });
+
+  test('⋯ 班次菜单：三条出口、命中区 ≥44px、当前项有选中语义、切换真的换班', async ({ page }) => {
+    const bundle = watchBundle(page);
+    await makeSession(app, '夜班甲');
+    await makeSession(app, '夜班乙');
+    await page.setViewportSize({ width: 430, height: 900 });
+    await page.goto(`${app.webBase}/#/talk`);
+    await settleBundle(page, bundle);
+
+    const more = page.locator('.talk-head .more');
+    const menu = page.locator('#talk-session-menu');
+    await expect(more).toBeVisible({ timeout: 30_000 });
+    expect((await more.boundingBox())?.height ?? 0, '⋯ 命中区应当 ≥44px').toBeGreaterThanOrEqual(44);
+
+    // 开：`aria-expanded` 与面板同时到位（`aria-controls` 指向的目标常驻 DOM）
+    await more.click();
+    await expect(more).toHaveAttribute('aria-expanded', 'true');
+    await expect(menu).toBeVisible();
+    // 第一项是「+ 新班次」（这一页最常按的一颗，也是班次动作的唯一入口）
+    await expect(menu.locator('button').first()).toHaveText('+ 新班次');
+    // 行高按触控来（≥44px），不复用 20px 的芯片尺寸
+    const plus = await menu.locator('button').first().boundingBox();
+    expect(plus?.height ?? 0).toBeGreaterThanOrEqual(44);
+
+    // 出口①：Escape 关得掉——**焦点从没进过面板时也算**（顶栏那条实测里的场景）
+    await page.keyboard.press('Escape');
+    await expect(menu).toBeHidden();
+    await expect(more).toHaveAttribute('aria-expanded', 'false');
+
+    // 出口②：ArrowDown 从触发钮进第一项
+    await more.focus();
+    await page.keyboard.press('ArrowDown');
+    await expect(menu).toBeVisible();
+    await expect(menu.locator('button').first()).toBeFocused();
+
+    // 出口③：点面板外面关掉
+    await page.mouse.click(200, 640);
+    await expect(menu).toBeHidden();
+
+    // 当前班次是身份行，既可见又播报
+    await more.click();
+    await expect(menu.locator('.mi.now')).toHaveAttribute('aria-current', 'true');
+    const current = (await menu.locator('.mi.now .mi-nm').innerText()).trim();
+    const other = current === '夜班甲' ? '夜班乙' : '夜班甲';
+
+    // 切换：时间线换成那一条、页头的班次名跟着变、地址写 `?session=`（决策 217①：
+    // ⋯ 必须是它的消费者，不是替代品）
+    await menu.locator('button.mi', { hasText: other }).click();
+    await expect(page.locator('.talk-head .sess-name')).toHaveText(other);
+    await expect.poll(() => new URL(page.url()).hash, { timeout: 10_000 }).toContain('session=');
+    await more.click();
+    await expect(menu.locator('.mi.now .mi-nm')).toHaveText(other);
+
+    expectBundleHealthy(bundle);
+  });
+
+  /**
+   * 顶栏那 8 格信号灯在对讲台上也接得通（决策 218 ⑥）。
+   *
+   * 病根不在灯本身：它自报 `aria-label="跳到 <列名>"`，但 `#s-<key>` 只存在于看板
+   * （`BoardColumn.svelte`），于是本页上 8/8 无靶子、点了**一动不动**。接通的判据有两条，
+   * 缺一不可：**去到了 `#/`**，而且**目标列真的进了视野**——只断前者的话，一个「跳过去但
+   * 停在页面顶部、目标在视口下方一千像素」的实现照样绿。
+   *
+   * 第三条判据是「改址是**路由跳转**而不是整页刷新」：整页重载会清掉我们预先种下的那格
+   * 标记。这条不是形式主义——`router.navigate` 早先只写地址栏、镜像要等 `hashchange`
+   * （**另一个任务**）才跟上，于是紧随其后那次 `scrollIntoView` 找不到靶子（实测：整页
+   * `scrollTop` 停在 0，目标在视口下方 1027px），这正是本用例当初红掉的原因。
+   */
+  test('顶栏信号灯：在对讲台上点灯 → 去 #/ 并定位到那一列（决策 218 ⑥）', async ({ page }) => {
+    const bundle = watchBundle(page);
+    await page.setViewportSize({ width: 430, height: 900 });
+    await page.goto(`${app.webBase}/#/talk`);
+    await settleBundle(page, bundle);
+    await expect(page.locator('.talk')).toBeVisible({ timeout: 30_000 });
+
+    const lamp = page.locator('nav.railnav button.rn').first();
+    await expect(lamp).toBeVisible();
+    await expect(lamp).toHaveAttribute('aria-label', /跳到/);
+    await page.evaluate(() => {
+      (window as unknown as Record<string, unknown>).__enRoute = 1;
+    });
+    await lamp.click();
+
+    await expect(page).toHaveURL(/#\/$/);
+    // 靶子（看板第一列）真的在视口里：`≤479` 这一档 `scroll-margin-top: 148px` 由
+    // `app.css` 定，故它落在顶栏下沿稍下处，而不是屏幕上方或屏幕下方
+    await expect(page.locator('#s-init')).toBeVisible({ timeout: 15_000 });
+    const box = await page.locator('#s-init').boundingBox();
+    expect(box, '#s-init 应当有几何').not.toBeNull();
+    expect(box?.y ?? 1e9).toBeGreaterThanOrEqual(0);
+    expect(box?.y ?? 1e9).toBeLessThan(900);
+    // 没有整页重载（重载会把这格标记清掉）
+    expect(
+      await page.evaluate(() => (window as unknown as Record<string, unknown>).__enRoute),
+    ).toBe(1);
+
+    expectBundleHealthy(bundle);
+  });
+
+  test('输入坞：没有提示语行，常态 88px、贴底栏上沿', async ({ page }) => {
+    const bundle = watchBundle(page);
+    await page.setViewportSize({ width: 430, height: 900 });
+    await page.goto(`${app.webBase}/#/talk`);
+    await settleBundle(page, bundle);
+
+    const typerBox = await page.locator('.typer').boundingBox();
+    const sbarBox = await page.locator('.statusline').boundingBox();
+    expect(
+      Math.abs((typerBox?.height ?? 0) - 88),
+      '坞常态应当是 88px（撤掉那行提示语之后，决策 218 当日修订 ②）',
+    ).toBeLessThanOrEqual(1);
+    expect(
+      Math.abs((typerBox?.y ?? 0) + (typerBox?.height ?? 0) - (sbarBox?.y ?? 0)),
+      '输入坞没有贴在底栏上沿',
+    ).toBeLessThanOrEqual(1);
+
+    // 那一行整行撤掉了：坞里既没有「说的每句话都会记进审计」，也没有「值班长正在回话…」
+    // （撤的是**告知**，不是纪律：审计照旧全量落库，决策 218 当日修订 ⑤ / 220④）
+    await expect(page.locator('.typer')).not.toContainText('记进审计');
+    await expect(page.locator('.typer')).not.toContainText('正在回话');
+    await expect(page.locator('.typer .hint')).toHaveCount(0);
+
+    expectBundleHealthy(bundle);
+  });
+
+  test('掐断 SSE：坞里出现**唯一**那句断线告知，空闲时不占高', async ({ page }) => {
+    const bundle = watchBundle(page);
+    let blocked = true;
+    await page.route('**/foreman/stream', async (route) => (blocked ? route.abort() : route.continue()));
+    await page.setViewportSize({ width: 430, height: 900 });
+    await page.goto(`${app.webBase}/#/talk`);
+    await settleBundle(page, bundle);
+
+    // 「实时流断了不能静静不更新」是审计 R2-18 的既有能力，而这一句是全页**唯一**的告知
+    const hint = page.locator('.typer .hint');
+    await expect(hint).toBeVisible({ timeout: 30_000 });
+    await expect(hint).toContainText('流断了');
+    expect(
+      await page.getByText('流断了：回话仍会以台账为准补上。').count(),
+      '断线告知应当只此一处',
+    ).toBe(1);
+
+    // 放行 → 主动重连（与看板同一个口子）→ 告知消失、坞回到 88px
+    blocked = false;
+    await page.evaluate(() => document.dispatchEvent(new Event('visibilitychange')));
+    await expect(hint).toHaveCount(0, { timeout: 30_000 });
+    await expect
+      .poll(async () => Math.abs((await page.locator('.typer').boundingBox())?.height ?? 0), {
+        timeout: 30_000,
+      })
+      .toBeLessThanOrEqual(90);
+
+    expectBundleHealthy(bundle);
+  });
+
+  test('展开一张急停：名牌整块在状态区里、不压到钉住带子底下（那 20px 是名牌的位子）', async ({
+    page,
+  }) => {
+    const bundle = watchBundle(page);
+    await page.setViewportSize({ width: 430, height: 900 });
+    await page.goto(`${app.webBase}/#/talk`);
+    await settleBundle(page, bundle);
+    await expect(page.locator('.zone-status .turn.warn')).toHaveCount(1, { timeout: 60_000 });
+
+    // 折叠态**不画名牌**（决策 218 修订 ⑦a：那张 20px 的净空是给悬出框沿 14px 的名牌留的，
+    // 而摘要条上本就没有名牌——183 裁决③给它的三块里没有它）
+    await expect(page.locator('.zone-status .turn.warn .dname')).toHaveCount(0);
+
+    // 展开那一张：名牌回来、那 20px 也回来
+    await page.locator('.zone-status .expander').click();
+    const openCard = page.locator('.zone-status .turn.warn:not(.folded)');
+    await expect(openCard).toHaveCount(1);
+    const dname = openCard.locator('.dname');
+    await expect(dname).toBeVisible();
+
+    // **几何三条**（这条断言的存在理由：下一位做「空间清理」的人会把状态区的 padding-top
+    // 当成浪费删掉，而名牌被盖住是几何问题、不会报错）：
+    const zoneBox = await page.locator('.zone-status').boundingBox();
+    const bandBox = await page.locator('.talk-head').boundingBox();
+    const dnameBox = await dname.boundingBox();
+    const top = dnameBox?.y ?? 0;
+    const bottom = (dnameBox?.y ?? 0) + (dnameBox?.height ?? 0);
+    expect(top, '名牌悬出了状态区上沿').toBeGreaterThanOrEqual((zoneBox?.y ?? 0) - 1);
+    expect(bottom, '名牌悬出了状态区下沿').toBeLessThanOrEqual(
+      (zoneBox?.y ?? 0) + (zoneBox?.height ?? 0) + 1,
+    );
+    const bandBottom = (bandBox?.y ?? 0) + (bandBox?.height ?? 0);
+    const why =
+      `名牌上沿 ${Math.round(top)} / 带子下沿 ${Math.round(bandBottom)}` +
+      `（状态区 ${Math.round(zoneBox?.y ?? 0)}..${Math.round((zoneBox?.y ?? 0) + (zoneBox?.height ?? 0))}，` +
+      `scrollTop=${await page.evaluate(() => document.scrollingElement?.scrollTop ?? 0)}）`;
+    expect(top, `名牌被钉住的页头带子盖住了：${why}`).toBeGreaterThanOrEqual(bandBottom);
+    expect(top - bandBottom, `名牌与钉住带子的下沿之间不足 4px：${why}`).toBeGreaterThanOrEqual(4);
 
     expectBundleHealthy(bundle);
   });
@@ -986,7 +1328,7 @@ test.describe('对讲台 · 班次（决策 204）', () => {
     await page.goto(`${app.webBase}/#/talk`);
     await settleBundle(page, bundle);
 
-    const row = page.locator('.timeline .runrow');
+    const row = page.locator('.talk-head .runrow');
     await expect(row).toBeVisible();
 
     // ① 首启一个班次都没有：chip 行只有「+ 新班次」那一颗，没有改名 / 归档（还没有当前班）
@@ -995,10 +1337,11 @@ test.describe('对讲台 · 班次（决策 204）', () => {
     await expect(row.locator('.runchip.plus')).toHaveText('+ 新班次');
     await expect(row.locator('.runchip.act')).toHaveCount(0);
 
-    // ② **非 sticky**：它随手指滚，不是第三件钉住物（决策 192 的窄屏只有两件）
-    await expect(row).toHaveCSS('position', 'static');
-    // 也**不在页头里**：页头高度不因它变（那只会在 `row auto` 上吃掉对话区）
-    await expect(page.locator('.talk-head .runrow')).toHaveCount(0);
+    // ② 它**不在滚动容器里**（决策 218 Q15：原先长在 `.timeline` 里面，于是随对话上移）；
+    // 挂页头右端、容器内横滚、不折行，页头高度不因它变（`--talk-chrome` 因此不必动）
+    await expect(page.locator('.timeline .runrow'), '班次行不该还在时间线里').toHaveCount(0);
+    await expect(row).toHaveCSS('flex-wrap', 'nowrap');
+    await expect(row).toHaveCSS('overflow-x', 'auto');
 
     // ③ 空态：没有班次时也照样能说话——第一次说话会开一个班次（服务端兜底）
     const input = page.locator('.typer textarea');
@@ -1055,54 +1398,269 @@ test.describe('对讲台 · 班次（决策 204）', () => {
     expectBundleHealthy(bundle);
   });
 
-  test('窄屏：chip 行横滚而不折行，对话区几何不被它吃掉', async ({ page }) => {
+  /**
+   * 桌面那三条 `nowrap` / `overflow-x: auto` / `scrollWidth - clientWidth > 0` 断言**搬到了桌面档**
+   * （上面那条的 ②），这一档换成三条等价事实：⋯ 可点、菜单开得出来、当前那一条被标出
+   * （决策 218 Q10/Q12/Q14）。**它们说的是同一件事**：班次多到放不下时，它们仍然一条不少地
+   * 够得着——只是从「一排芯片横滚」换成了「一份菜单」。
+   */
+  test('折行档：页头里没有 chip 行，班次都在 ⋯ 里（决策 218 Q10 / Q14）', async ({ page }) => {
     const bundle = watchBundle(page);
     await page.setViewportSize({ width: 430, height: 900 });
 
-    // 造够班次让 chip 行真的溢出（窄屏上三四个就够）
-    for (const t of ['夜班甲', '夜班乙', '夜班丙']) {
-      const res = await fetch(`${app.apiBase}/foreman/sessions`, {
-        method: 'POST',
-        headers: { 'content-type': 'application/json', 'x-agentpipeline': '1' },
-        body: JSON.stringify({ title: t }),
-      });
-      expect(res.ok).toBeTruthy();
+    // 造够班次：窄档那三四个就够（决策 218 实测里的那句「三四个班次铺成两三行」）
+    for (const t of ['夜班甲', '夜班乙', '夜班丙', '夜班丁']) {
+      await makeSession(app, t);
     }
 
     await page.goto(`${app.webBase}/#/talk`);
     await settleBundle(page, bundle);
 
-    const row = page.locator('.timeline .runrow');
-    await expect(row.locator('.runchip').first()).toBeVisible();
-    // 不折行 + 横向滚（与任务详情页的 `.runrow` 同一形状）：430px 上折行会占掉两三行，
-    // 而这一档的纵向空间是「两条钉住物之间的残渣」，不能喂给一排控件
-    await expect(row).toHaveCSS('flex-wrap', 'nowrap');
-    await expect(row).toHaveCSS('overflow-x', 'auto');
-    const overflow = await row.evaluate((el) => el.scrollWidth - el.clientWidth);
-    expect(overflow, 'chip 行在窄屏没有横滚余地（班次不够多？）').toBeGreaterThan(0);
+    // ① 页面上没有 chip 行（它收进了 ⋯）
+    await expect(page.locator('.runrow')).toHaveCount(0);
+    // ② ⋯ 可点
+    const more = page.locator('.talk-head .more');
+    await expect(more).toBeVisible();
+    await expect(more).toBeEnabled();
+    // ③ 菜单开得出来，且**每一条班次都在**（条数与接口下发的一致——一条都没丢）、
+    // 当前那条被标出。当前那一班在菜单里是身份行（不是按钮），故按钮数 = 总数 − 1。
+    const list = (await (await fetch(`${app.apiBase}/foreman/sessions`)).json()) as {
+      sessions: Array<{ id: string }>;
+    };
+    await more.click();
+    const menu = page.locator('#talk-session-menu');
+    await expect(menu).toBeVisible();
+    await expect(menu.locator('.mi.now')).toHaveCount(1);
+    await expect(menu.locator('button.mi:not(.plus):not(.act)')).toHaveCount(
+      list.sessions.length - 1,
+    );
 
-    // **对话区仍是「整块屏幕减去两条钉住物」**（决策 192 的那条几何断言没有被 chip 行吃掉）：
-    // chip 行长在会滚的时间线**里面**，故时间线自己的盒子一点没变。
+    // **对话区仍是「整块屏幕减去三条钉住物」**（决策 192 的那条几何断言没有被班次列表吃掉）
+    await page.keyboard.press('Escape');
     const timelineBox = await page.locator('.timeline').boundingBox();
-    expect(timelineBox?.height ?? 0).toBeGreaterThanOrEqual(320);
+    expect(timelineBox?.height ?? 0).toBeGreaterThanOrEqual(440);
+
+    expectBundleHealthy(bundle);
+  });
+
+  /**
+   * 回话中允许换班次（决策 220②）+ 两枚标记（决策 220③）。
+   *
+   * 那把 `sending || busy` 的锁撤掉之后，「那一轮回话去哪了」由标记接手：切走时原班次
+   * 落下「有新动静」，点回去能看到**完整**那一轮（不是半截）。
+   *
+   * `page.route` 把这一次 POST 拖住 2.5s：切走的窗口因此是决定性的，而不是抢在几毫秒里。
+   */
+  test('回话中换班次：切走 → 回话落地 → 原班次带「有新动静」', async ({ page }) => {
+    const bundle = watchBundle(page);
+    await makeSession(app, '别处那一班');
+    await page.route('**/foreman/messages', async (route) => {
+      await new Promise((resolve) => setTimeout(resolve, 2500));
+      await route.continue();
+    });
+    await page.setViewportSize({ width: 430, height: 900 });
+    await page.goto(`${app.webBase}/#/talk`);
+    await settleBundle(page, bundle);
+
+    const more = page.locator('.talk-head .more');
+    const menu = page.locator('#talk-session-menu');
+
+    // 本机开一班新的（⋯ 的第一项），拿到一条干净的当前班次。
+    // 按**名字**找它而不是 `/新班次/`：本组共用一个 app，上一群用例开出来的班次
+    // 默认标题就叫「新班次 <时间>」，正则于是同时命中两枚按钮（实测 strict mode 报错）。
+    await more.click();
+    await menu.getByRole('button', { name: '+ 新班次' }).click();
+    await expect(page.locator('.timeline .turn')).toHaveCount(0);
+
+    // 说一句话（POST 被拖住）
+    await page.locator('.typer textarea').fill('这一句会在别处落地');
+    await page.locator('.typer button[type=submit]').click();
+
+    // 发送中：⋯ **仍开得出来**（否则人读不到任何解释），当前那一条带「正在回话」
+    await more.click();
+    await expect(menu.locator('.mi.now .mi-mark.rep')).toHaveText('正在回话');
+
+    // 切换**没有被禁用**（决策 220②）：切到「别处那一班」
+    await menu.getByRole('button', { name: /别处那一班/ }).click();
+    await expect(page.locator('.talk-head .sess-name')).toHaveText('别处那一班');
+    // 切走之后这一屏是空对话——那一轮从视野里撤下，但回话照旧落台账（决策 220⑤）
+    await expect(page.locator('.timeline .turn')).toHaveCount(0);
+
+    // 回话落地 → 原班次出现「有新动静」（它更新的 last_active_at 晚于本机记的看过时刻）
+    await more.click();
+    const marked = menu.locator('button.mi').filter({ has: page.locator('.mi-mark') });
+    await expect(marked).toHaveCount(1, { timeout: 30_000 });
+    await expect(marked.locator('.mi-mark')).toHaveText('有新动静');
+
+    // 点回去：那一轮是**完整**的（人那句 + 值班长的回话都从台账读回来），标记随之清零
+    await marked.click();
+    await expect(
+      page.locator('.timeline .turn.mine', { hasText: '这一句会在别处落地' }),
+    ).toHaveCount(1, { timeout: 30_000 });
+    await expect(page.locator('.timeline .turn.fm')).not.toHaveCount(0);
+    await more.click();
+    await expect(menu.locator('button.mi').filter({ has: page.locator('.mi-mark') })).toHaveCount(0);
+
+    expectBundleHealthy(bundle);
+  });
+
+  /**
+   * 「正在回话」的第二支：SSE 里带**别的** `session_id` 的增量（决策 220③）。
+   *
+   * 这是本票的关键用例——它证明那个字段终于被用上了：`/foreman/stream` 把全部工头增量广播给
+   * 所有订阅者，此前这个字段只被用来「丢掉不匹配的」，等于把「别的班次正在回话」白扔了。
+   * 「另一台设备」在这里就是另一个上下文（直连接口说话），不必真开第二个浏览器。
+   */
+  test('远端开腔：别的班次带「正在回话」（跨设备那一组）', async ({ page }) => {
+    const bundle = watchBundle(page);
+    // 那台「别的设备」开的班。两条命名规则叠在一起，一步都不能省：
+    //   ① `POST /foreman/sessions` 才**真的新开**一个班次——不带 `session_id` 说话是
+    //      「落到最近活动的那个班次」（`resolve_session`），于是它会落在上一个用例留下的
+    //      班次里（实测：菜单里根本没有「远端那一班」这一行）；
+    //   ② 班次的名字取自**它第一句话**（决策 204②），空班次起好名再说话，名字会被那句话冲掉。
+    // 故：先新开、再用**同一个名字**说第一句——名字立住，之后往里说话不会再改它。
+    const remote = await makeSession(app, '远端那一班');
+    await sayDirect(app, '远端那一班', remote);
+    await page.setViewportSize({ width: 430, height: 900 });
+    await page.goto(`${app.webBase}/#/talk`);
+    await settleBundle(page, bundle);
+    await expect(page.locator('.talk')).toBeVisible({ timeout: 30_000 });
+    // 先**离开**它：它刚建出来时是最活跃的那一条，故装载后当前班次正是它——
+    // 那样一来它的增量带的就是 `session_id == currentId`，压根不是「别的班次」
+    await page.locator('.talk-head .more').click();
+    await page.locator('#talk-session-menu').getByRole('button', { name: '+ 新班次' }).click();
+    await expect(page.locator('.talk-head .sess-name')).not.toHaveText('远端那一班');
+    // 等那条 SSE 真的连上（增量会广播到所有订阅者，接不上就什么都收不到）
+    await page.waitForTimeout(1500);
+
+    // 以**那个班次**的名义说一句话：它的增量带着别的 `session_id` 到达本机的流
+    await sayDirect(app, '远端的一句话', remote);
+
+    await page.locator('.talk-head .more').click();
+    const row = page.locator('#talk-session-menu button.mi', { hasText: '远端那一班' });
+    await expect(row.locator('.mi-mark.rep')).toHaveText('正在回话', { timeout: 30_000 });
+    // 标记只影响**读**、不影响点击：点它就是切过去（决策 220⑤，不拦）
+    await row.click();
+    await expect(page.locator('.talk-head .sess-name')).toHaveText('远端那一班');
+    await expect(page.locator('.timeline .turn.mine', { hasText: '远端的一句话' })).toHaveCount(1);
 
     expectBundleHealthy(bundle);
   });
 });
 
 /**
- * 对讲台 · **修复提议**（票 12 的最后一格 / 决策 208 的几何门）。
+ * 对讲台 · 折行档宽度扫描（决策 215 / 218）。
  *
- * 这条用例走的是**真**那条链：值班长的 `repair` 工具在 `auto` 档下真的拉起一个 worktree、
- * 把补丁写进去、过闸门（`npm test --silent` 真跑）、落一条 `kind=repair` 的提议。
- * 界面要做的只是把它渲染成「看得全的补丁 + 一颗够得到的合入钮」。
+ * 480–899 这一档此前**不存在**：`.talk` 只在 479 以下折，实测 480px 上对话列只剩 **82px**
+ * （`minmax(0, 1fr)` 的 1fr 能缩到 0）。本叠按决策 215 折成一列，并按决策 218 把**控件形态**
+ * 也一起换掉（否则这一档会先做出一个旧形态、再被改一次）。
  *
- * 为什么要 e2e 而不是只留单测：修复那一块是**追加在**参数位置下面的（闸门读数一行 +
- * 折叠的 diff），它比普通提议高，而 720px 是三分区最紧的一档（决策 208）。
- * 「按 208 的视口量一遍修复提议」这件事此前**没有量过**——那正是票 12 记的缺口。
- *
- * `repair_id` 只有跑起来才知道（后端生成），故这条用例用 `setForemanRounds` 中途换脚本。
+ * 三条一起看才成立：**不横向滚**、**控件形态与窄档同源**、**钉住关系按本档的顶栏算**
+ * （这一档顶栏仍是桌面款 78–81px，不是移动款的 138px——写死 138 会让摘要条钉在屏幕中间）。
  */
+test.describe('对讲台 · 折行档宽度扫描（决策 215 / 218）', () => {
+  let app: App;
+
+  test.beforeAll(async () => {
+    app = await startApp({ script: archBlockerRounds(), title: 'E2E 折行档扫描' });
+    await waitForTask(app, (t) => t.status === 'pending', 'pending', 60_000);
+  });
+
+  test.afterAll(async () => {
+    await app?.stop();
+  });
+
+  test('480 / 600 / 768 / 899：单列、不横向滚、⋯ 在位、单张急停也折', async ({ page }) => {
+    const bundle = watchBundle(page);
+    for (const w of [480, 600, 768, 899]) {
+      const why = `w=${w}`;
+      await page.setViewportSize({ width: w, height: 800 });
+      await page.goto(`${app.webBase}/#/talk`);
+      await settleBundle(page, bundle);
+      await expect(page.locator('.zone-status .turn.warn')).toHaveCount(1, { timeout: 60_000 });
+
+      // 折成一列：右栏整块不渲染
+      await expect(page.locator('.talk-side'), why).toBeHidden();
+      // 控件形态与窄档同源：没有 chip 行、有 ⋯
+      await expect(page.locator('.runrow'), why).toHaveCount(0);
+      await expect(page.locator('.talk-head .more'), why).toBeVisible();
+      // **单张急停也折**（决策 218 修订 ⑥：`forceFold` 的断点从 479 扩到 899）
+      await expect(page.locator('.zone-status .turn.warn.folded'), why).toHaveCount(1);
+
+      // 钉住关系：页头带子紧接着**本档**顶栏的下沿（这一档顶栏是桌面款 78px，
+      // 不是移动款的 138px——写死 138 会让摘要条钉在屏幕中间）
+      const hb = await page.locator('header.top').boundingBox();
+      const head = await page.locator('.talk-head').boundingBox();
+      expect(
+        (head?.y ?? 0) - ((hb?.y ?? 0) + (hb?.height ?? 0)),
+        `${why} 页头带子没紧接着顶栏`,
+      ).toBeLessThanOrEqual(10);
+      const zone = await page.locator('.zone-status').boundingBox();
+      expect(
+        Math.abs((zone?.y ?? 0) - ((head?.y ?? 0) + (head?.height ?? 0))),
+        `${why} 摘要条没贴着带子的下沿`,
+      ).toBeLessThanOrEqual(2);
+      // 对话列 ≥420（决策 215 的 `minmax(420px, 1fr)` 下限；480px 上曾只剩 82px）
+      const tl = await page.locator('.timeline').boundingBox();
+      expect(tl?.width ?? 0, `${why} 对话列被挤窄了`).toBeGreaterThanOrEqual(420);
+      // 坞贴底栏上沿（±2px：桌面那条底栏的盒高是 36px，而 `--sbar-h` 记的是 38px——既有偏差）
+      const typerBox = await page.locator('.typer').boundingBox();
+      const sbar = await page.locator('.statusline').boundingBox();
+      expect(
+        Math.abs((typerBox?.y ?? 0) + (typerBox?.height ?? 0) - (sbar?.y ?? 0)),
+        `${why} 坞没贴在底栏上沿`,
+      ).toBeLessThanOrEqual(2);
+      // 静置态不空滚（与 ≤479 同一条算式：底盘底边距在这一档也按 `--sbar-h` 让位）
+      expect(await verticalOverflow(page), `${why} 静置态空滚`).toBeLessThanOrEqual(1);
+      // 整页不横向滚。480 上那 1px 是**顶栏过滤槽的既有溢出**（`#/` 与 `#/metrics` 上同样如此，
+      // 与本叠无关）；600 以上要求严格 ≤0。
+      expect(await horizontalOverflow(page), `${why} 整页横向溢出`).toBeLessThanOrEqual(
+        w === 480 ? 1 : 0,
+      );
+      expectBundleHealthy(bundle);
+    }
+  });
+
+  test('899 与 900 两侧：单张急停「折」与「不折」（两侧差异是刻意的）', async ({ page }) => {
+    const bundle = watchBundle(page);
+    await page.setViewportSize({ width: 899, height: 800 });
+    await page.goto(`${app.webBase}/#/talk`);
+    await settleBundle(page, bundle);
+    await expect(page.locator('.zone-status .turn.warn.folded')).toHaveCount(1, {
+      timeout: 60_000,
+    });
+    await expect(page.locator('.talk-side')).toBeHidden();
+
+    await page.setViewportSize({ width: 900, height: 800 });
+    await page.goto(`${app.webBase}/#/talk`);
+    await settleBundle(page, bundle);
+    // 桌面口径逐像素不变：**单张展开**，右栏回来、⋯ 退场、班次行回到页头
+    await expect(page.locator('.zone-status .turn.warn:not(.folded)')).toHaveCount(1, {
+      timeout: 60_000,
+    });
+    await expect(page.locator('.zone-status .turn.warn')).toHaveCount(1);
+    await expect(page.locator('.talk-side')).toBeVisible();
+    await expect(page.locator('.talk-head .more')).toHaveCount(0);
+    await expect(page.locator('.talk-head .runrow')).toHaveCount(1);
+  });
+
+  test('900 / 1099 / 1100：右栏 280 → 340（决策 215 的两档）', async ({ page }) => {
+    const bundle = watchBundle(page);
+    const cases: Array<[number, number]> = [
+      [900, 280],
+      [1099, 280],
+      [1100, 340],
+    ];
+    for (const [w, right] of cases) {
+      await page.setViewportSize({ width: w, height: 800 });
+      await page.goto(`${app.webBase}/#/talk`);
+      await settleBundle(page, bundle);
+      const side = await page.locator('.talk-side').boundingBox();
+      expect(Math.round(side?.width ?? 0), `w=${w} 右栏宽度`).toBe(right);
+    }
+  });
+});
+
 test.describe('对讲台 · 修复提议（票 12 / 决策 208）', () => {
   let app: App;
 

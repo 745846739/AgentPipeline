@@ -1,4 +1,4 @@
-import type { SseEvent } from '../api/types';
+import type { ForemanSessionMeta, SseEvent } from '../api/types';
 
 /**
  * 值班长流式归约（票 03）：与 `reduce.ts` 同一姿态的纯函数——不触网、不读时钟、不改入参。
@@ -50,6 +50,112 @@ export function appendForemanDelta(
   if (event.type !== 'conversation_delta' || event.agent_type !== FOREMAN_AGENT_TYPE) return state;
   if (!sessionId || event.session_id !== sessionId) return state;
   return { ...state, text: state.text + event.text };
+}
+
+/**
+ * 「别的班次正在回话」的映射（决策 220③）。
+ *
+ * 这一份与 `appendForemanDelta` 是**同一件事的两半**：那个字段（`session_id`）此前只被用来
+ * 「丢掉不匹配的增量」——等于把「别的班次正在回话」这条事实白扔了。现在丢掉还是丢掉
+ * （串台必须挡），但**先把它记下来**：⋯ 的班次列表靠它点亮「正在回话」那枚标记。
+ *
+ * 与 `ForemanStreamState` 分开持有一份的原因很实际：切班次会 `emptyForemanStream()`，
+ * 而「甲班还在说话」这件事**不该跟着这一屏的重置一起消失**。它是纯前端状态、不进
+ * localStorage（描述的是「此刻」，刷新即空是对的）。
+ */
+export interface ForeignActive {
+  /** `sessionId → 最近一次增量到达时的本机毫秒时刻`。 */
+  bySession: Record<string, number>;
+}
+
+/**
+ * 增量**静默**多久算「不在回话了」。
+ *
+ * 没有它，一次注入后就断掉的增量会让那枚标记永远亮着——而标记的全部价值在于它**说的是真的**。
+ * 取值是**两种假之间的取舍**，两边都不致命，故取小的那一头：
+ *   - 取太长（初版 90s）：远端那句话**早已落地**，本机列表还没刷新过，标记于是继续说着
+ *     「此刻在说话」——它是假的，而且**撤不掉**（要等超时或切进那一班）；
+ *   - 取太短：一轮回话里模型卡一下就被判「不在回话了」——但下一批增量一到**它自己又会亮**
+ *     （`noteForeignDelta` 每次都刷新时刻），代价只是中间那几秒没亮。
+ * 20s 是「实时回话里两次增量之间的正常间隔」的宽裕量级（人眼可读的流是每几百毫秒一批）。
+ * 另外两条收尾是免费的：**落地**（本机读到那份新列表时比对 `last_active_at`，见
+ * {@link pruneForeignActive}）与**断开**（组件里 `streamStatus !== 'open'` 那一支）。
+ */
+export const FOREIGN_TTL_MS = 20_000;
+
+export function emptyForeignActive(): ForeignActive {
+  return { bySession: {} };
+}
+
+/**
+ * 收到一条增量：是**别的**班次的工头增量就点亮它。
+ *
+ * 三条过滤与 {@link appendForemanDelta} 同源（类型 / `agent_type` / 空 `session_id`），
+ * 只把「与当前班次不符」从「丢弃」改成「记下来」。当前班次的那一份**不进这张表**：它由
+ * 「本机发出且未落地」（`sending`）那一支说——两条路说的是同一件事，别记两遍。
+ */
+export function noteForeignDelta(
+  state: ForeignActive,
+  event: SseEvent,
+  currentId: string | null,
+  at: number,
+): ForeignActive {
+  if (event.type !== 'conversation_delta' || event.agent_type !== FOREMAN_AGENT_TYPE) return state;
+  const sid = event.session_id;
+  if (!sid || sid === currentId) return state;
+  return { bySession: { ...state.bySession, [sid]: at } };
+}
+
+/** 落地 / 处理完（那一班重新读了台账）即熄灭。 */
+export function forgetForeignActive(state: ForeignActive, sessionId: string): ForeignActive {
+  if (!(sessionId in state.bySession)) return state;
+  const next = { ...state.bySession };
+  delete next[sessionId];
+  return { bySession: next };
+}
+
+/** 这一班此刻「正在回话」吗（含静默超时）。 */
+export function foreignIsReplying(
+  state: ForeignActive,
+  sessionId: string,
+  now: number,
+  ttl: number = FOREIGN_TTL_MS,
+): boolean {
+  const at = state.bySession[sessionId];
+  return at !== undefined && now - at <= ttl;
+}
+
+/**
+ * 清掉**说过头**的那些，两条判据：
+ *
+ * 1. **静默超时**：`now - at > ttl`（见 {@link FOREIGN_TTL_MS} 的取舍）；
+ * 2. **已经落地**：那一班的 `last_active_at` **不早于**我们记下的时刻——回话落库会同时更新
+ *    `last_active_at`（与消息插入同事务，`storage/foreman.rs`），而它比增量时刻新的意思就是
+ *    「这一轮的收尾已经写进台账了」，此刻它不再「正在回话」。两边取的是同一座钟：本机记的
+ *    `at` 是本机毫秒，`last_active_at` 由同一台机器上的服务端写入（决策 220③ 的同一口径）。
+ *    这一条只在**手上有新鲜列表**时才判得动（调用方传 `list`），故它负责的是「本机刚读过列表」
+ *    那一刻的收口；列表没刷新时兜底的是第 1 条。
+ *
+ * **没有该清的项时返回同一个对象**——组件里那个 5s 的清理 `$effect` 因此不会自激
+ * （返回值不变 = 状态没变 = 不触发重跑）。
+ */
+export function pruneForeignActive(
+  state: ForeignActive,
+  list: readonly ForemanSessionMeta[],
+  now: number,
+  ttl: number = FOREIGN_TTL_MS,
+): ForeignActive {
+  const landed = new Map<string, string>();
+  for (const s of list) landed.set(s.id, s.last_active_at);
+  let dropped = false;
+  const next: Record<string, number> = {};
+  for (const [sid, at] of Object.entries(state.bySession)) {
+    const active = landed.get(sid);
+    const landedSince = active !== undefined && Date.parse(active) >= at;
+    if (now - at <= ttl && !landedSince) next[sid] = at;
+    else dropped = true;
+  }
+  return dropped ? { bySession: next } : state;
 }
 
 /**

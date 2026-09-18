@@ -93,6 +93,15 @@ class RouterStore {
     return parseRoute(this.hash);
   }
 
+  /**
+   * 程序改址（用户点链接仍走 `hashchange`）。地址栏是权威，`this.hash` 只是它的镜像
+   * ——但这一镜像**当场就跟上**，不等 `hashchange`：那是**另一个任务**，而页面渲染读的是
+   * 镜像，等它就等于「程序导航总会晚一帧渲染」。需要「改完址、渲染完、再定位到某个元素」
+   * 的地方（顶栏信号灯在外页上点灯 → 去 `#/` 再 `scrollIntoView`，决策 218 ⑥）因此拿不到
+   * 靶子——实测那一跳不动，目标停在视口下方 1027px 处、整页 `scrollTop` 还是 0。
+   * 赋值与 `location.hash` 同步做，两者不会说两套；随后到的 `hashchange` 写同一个值，
+   * 对 `$state` 是空操作，不会多渲染一次。
+   */
   navigate(path: string): void {
     if (typeof window === 'undefined') return;
     const next = path.startsWith('#') ? path : `#${path}`;
@@ -100,8 +109,60 @@ class RouterStore {
       this.hash = next;
       return;
     }
+    this.hash = next;
     window.location.hash = next;
   }
 }
 
 export const router = new RouterStore();
+
+/**
+ * 当前地址的**原始** hash。地址栏是权威，`router.hash` 只是它的镜像（由 `hashchange` 跟上
+ * ——那一次跟进是异步的，故读写查询串时用地址栏本身，免得读到镜像的滞后值）。
+ */
+function currentHash(): string {
+  if (typeof window !== 'undefined' && window.location.hash) return window.location.hash;
+  return router.hash;
+}
+
+/**
+ * 当前地址里的查询串（**只读**）。与 `router.route` 解析的是同一份，故不存在「路由看到的」
+ * 与「这里读到的」两个版本。
+ */
+export function readQuery(): RouteQuery {
+  return splitHash(currentHash()).query;
+}
+
+/**
+ * 把 patch 写回地址（决策 217③）。`null` = 删掉这个 key（缺省值不写进地址，老地址照旧）。
+ *
+ * **默认 `pushState`、程序自己改的用 `replaceState`**：用户点页签 / 切过滤 / 换班次 push
+ * （后退回到上一个页签是想要的），而程序化联动（触发节点直达、指标页 `?task=` 自动就位、
+ * 装载后把兜底值落进地址）replace——否则自动联动会把历史灌满，后退不再是「回到上一页」。
+ *
+ * 两个实现细节都不是可选的：
+ *   ① 值没变时**不动地址**——同一次切换被两条路径写两遍会产生两条历史；
+ *   ② `pushState` / `replaceState` **不发 `hashchange`**，故写完要自己把路由状态接上，
+ *      否则 `router.route` 还停在旧地址上（这一条不写就是「地址变了、页面没变」）。
+ */
+export function writeQuery(
+  patch: Record<string, string | null>,
+  opts: { replace?: boolean } = {},
+): void {
+  if (typeof window === 'undefined') return;
+  const before = currentHash();
+  const { path, query } = splitHash(before);
+  const next: RouteQuery = { ...query };
+  for (const [key, value] of Object.entries(patch)) {
+    if (value === null) delete next[key];
+    else next[key] = value;
+  }
+  const search = new URLSearchParams(Object.entries(next)).toString();
+  const hash = `#${path}${search ? `?${search}` : ''}`;
+  if (hash === before) return;
+  const url = `${window.location.pathname}${window.location.search}${hash}`;
+  if (opts.replace) window.history.replaceState(null, '', url);
+  else window.history.pushState(null, '', url);
+  router.hash = hash;
+}
+

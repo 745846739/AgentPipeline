@@ -54,18 +54,41 @@
     proposalToolLabel,
   } from '../lib/proposals';
   import { CompositionGuard, shouldSubmitOnEnter } from '../lib/enterToSend';
+  import { formatDateTime } from '../lib/format';
+  import {
+    TALK_FOLD_QUERY,
+    TALK_MOBILE_QUERY,
+  } from '../lib/talkLayout';
+  import {
+    loadSeen,
+    loadSessionId,
+    markSeen,
+    pruneSeen,
+    saveSeen,
+    saveSessionId,
+    seedBaselineIfFirstRun,
+    sessionMark,
+    type SeenAt,
+    type SessionMark,
+  } from '../lib/talkSessions';
   import { TaskStream, type StreamStatus } from '../realtime/connection';
   import {
     appendForemanDelta,
     beginForemanStream,
+    emptyForeignActive,
     emptyForemanStream,
     failForemanStream,
     failedLedgerRowIds,
+    foreignIsReplying,
+    forgetForeignActive,
     ledgerOwnsTheFailure,
+    noteForeignDelta,
+    pruneForeignActive,
     settleForemanStream,
     FOREMAN_FAILED_TURN_MARK,
     FOREMAN_WATCH_MARK,
     type ForemanStreamState,
+    type ForeignActive,
   } from '../realtime/foreman';
   import Sprite from '../components/render/Sprite.svelte';
   import Gauge from '../components/render/Gauge.svelte';
@@ -73,7 +96,7 @@
   import DiffReviewPanel from '../components/task/DiffReviewPanel.svelte';
   import EmptyState from '../components/ui/EmptyState.svelte';
   import Modal from '../components/ui/Modal.svelte';
-  import { router } from '../router.svelte';
+  import { router, writeQuery } from '../router.svelte';
 
   /**
    * 对讲台（theme-6-pixel.md §3.3；决策 174 / 182 / 183 / 192）。版面**三分区**（票 04）：
@@ -84,11 +107,19 @@
    * 是本页最不能出的错，故不靠 sticky 逐段救，而是把「会长的部分」与「不能动的部分」
    * 放在两个不同的滚动容器里。
    *
-   * **窄屏（≤479px）反过来：整页随手指滚，只有两样东西钉住**——急停摘要条钉在顶栏下沿、
-   * 输入坞钉在底栏上沿（决策 192，§5 转写 4）。同一个不变式（急停不滚出视野）在手机上由
-   * 「钉住」完成：钉住的东西必须便宜，故**窄屏连单张急停也折成一行摘要条**（`forceFold`），
+   * **窄档（≤899px）反过来：整页随手指滚，钉住的是三样**（决策 192，由决策 218 修订 ④
+   * 把两只改成三只）——页头那一行（46px 带子，`top: var(--topbar-h)`）、急停摘要条（钉在它
+   * 下沿）、输入坞（钉在底栏上沿）。同一个不变式（急停不滚出视野）在手机上由「钉住」完成：
+   * 钉住的东西必须便宜，故**折行档连单张急停也折成一行摘要条**（`forceFold`），
    * 一张 376px 的展开轮钉在 900px 的屏幕上等于把整块屏幕钉死。对话区因此拿到的是
-   * 「整块屏幕减去两条钉住物」，而不是钉住物之间的残渣——这是本次改版的全部要点。
+   * 「整块屏幕减去三条钉住物」，而不是钉住物之间的残渣。
+   *
+   * **为什么页头也要钉**（决策 218 当日修订 ④）：班次动作（含开新对话）收进页头右端的 ⋯
+   * 之后，**页头是它们唯一的家**——不钉的话，长会话里要滚回顶部才够得着，那正是用户最初
+   * 诉求指的毛病。代价是对话区 46px，换来全菜单恒在手边。
+   *
+   * **档位的分界是 899**（`lib/talkLayout.ts` 一处定义、三处用：折行版面 / ⋯ 与 `forceFold` /
+   * 页头形态）。桌面（≥900）仍是三分区 + 单张展开，两侧的行为差异是刻意的（两种滚动模型）。
    *
    * **但状态区自己也有上限**（桌面 46vh 与「先留给时间线的那一份」两项取小，
    * 超高时区内滚——后者是决策 208：矮窗口里不让它把时间线压成一条缝），而一张急停轮内联着
@@ -101,11 +132,20 @@
    * **对面是真的会说话的值班长**（`/foreman/session` + `/foreman/messages` + `/foreman/stream`）：
    * 对话不依赖任务——空看板（无项目无任务）也照样能问它话。
    *
-   * **一条长会话改成一排班次**（决策 204）：时间线顶部一条 chip 行——新建 / 切换 /
-   * 重命名 / 归档。三条硬约束都在版面里兑现：chip 行**非 sticky**（窄屏只有两个钉住物，
-   * 决策 192）、**不在页头**（`.talk-head` 在 `row auto` 上，涨的 px 直接吃对话区）、
-   * 不动顶栏（决策 198 的三项与 138px）。会话隔离的是**对话上下文**（这一屏读什么、合计多少），
-   * **不是权限、也不是态势快照**——「换会话 ≠ 换看板」。
+   * **一条长会话改成一排班次**（决策 204）。落点由决策 218 ② 改了两处：**桌面**把那一排
+   * 挂在**页头右端**（`nowrap` + 容器内横滚）——它原先长在 `.timeline` 这个滚动容器**里面**，
+   * 于是随对话上移（实测滚到底时它在屏幕上方 320.2px，这正是「新建对话往上翻很久」的病根）；
+   * **折行档**整排收进页头右端的 **⋯ 菜单**（含「+ 新班次」/ 切换 / 改名 / 归档），
+   * 桌面上可见的那一排因此有了第三处约束：页头高度与 `--talk-chrome` 都不许因它变
+   * （挂在既有那一行的右端、不新增行，桌面因此白得 36px）。
+   * 会话隔离的是**对话上下文**（这一屏读什么、合计多少），**不是权限、也不是态势快照**
+   * ——「换会话 ≠ 换看板」。班次进地址（`?session=` + `agentpipeline.talk_session` 兜底，
+   * 决策 217①）。
+   *
+   * **回话中允许换班次**（决策 220②）：那把 `sending || busy` 的 UI 锁撤掉了——它只是第三层
+   * 自保（前两层是 `appendForemanDelta` 的班次守卫与 `send()` 里的 `generation` 比对）。
+   * 「那一轮回话去哪了」改由班次列表里的两枚标记说：**正在回话**与**有新动静**
+   * （判据在 `lib/talkSessions.ts` 与 `realtime/foreman.ts`）。
    *
    * **值班长的回复里永远没有按钮**：写动作只在状态区的急停轮里渲染（后端下发的
    * `allowed_actions`，决策 101）。同一个动作在两处各渲染一颗钮，会让「哪个是真的」
@@ -148,13 +188,61 @@
   let pendingText = $state<string | null>(null);
   let stream = $state<ForemanStreamState>(emptyForemanStream());
   let streamStatus = $state<StreamStatus>('idle');
+  /**
+   * 本机刚发出去、还没落地的那一班（决策 220③ 的「正在回话」前半支）。
+   *
+   * 记 id 而不是一个布尔：切走之后那一轮照旧在路上，标记要落在**它**那一行上，
+   * 而不是「你现在看的这一班」。
+   */
+  let sendingSid = $state<string | null>(null);
+
+  /** 「哪一条我看过」的时刻表（决策 220③ 的「有新动静」判据）。 */
+  let seen = $state<SeenAt>({});
+  /** 这份表建过基线没有：本机第一次读到列表时把当下当基线（否则第一屏每条都带「有新动静」）。 */
+  let seenSeeded = $state(false);
+  /** 「别的班次正在回话」：SSE 广播里的 `session_id` 归位（纯前端、刷新即空）。 */
+  let foreignActive = $state<ForeignActive>(emptyForeignActive());
+  /** 标记的时钟：只在真有「别的班次在回话」时走（静默超时熄灭用）。 */
+  let markerNow = $state(Date.now());
+
+  /** ⋯ 班次菜单（折行档；桌面保留可见的班次行，决策 218 Q14）。 */
+  let menuOpen = $state(false);
+  let menuWrap = $state<HTMLDivElement | null>(null);
+  let menuTrigger = $state<HTMLButtonElement | null>(null);
+  let menuPanel = $state<HTMLDivElement | null>(null);
+
+  /**
+   * 工位回执的展开态，按 `turn.key` 记（票 06）。
+   *
+   * **必须受控**：`<details open>` 让浏览器自己管的话，流式增量反复重渲染同一轮时，
+   * 使用者手动展开的那一轮会被打回收起——这正是决策 218② 这条最容易写坏的地方。
+   * 没记过的 key 走默认：折行档收起、桌面照旧展开（决策 182 的纪律只在折行档反转）。
+   * 跨刷新不记忆（与决策 217 的折叠态口径一致：折叠态不进 URL / localStorage）。
+   */
+  let receiptOpen = $state<Record<string, boolean>>({});
+  const receiptIsOpen = (key: string) => receiptOpen[key] ?? !folded;
 
   /** 每个 pending 任务的详情（allowed_actions 只在详情里下发，决策 101）。 */
   let details = $state<Record<string, { actions: AllowedAction[]; cursors: BranchCursor[] }>>({});
 
-  /** 窄屏（≤479px，§5 移动款）：整页滚 + 两条钉住物，见文件头。断点与 app.css 同一档。 */
+  /**
+   * 折行档（≤899，决策 218 修订 ⑥）：`.talk` 折成一列、页头收成一行 + ⋯、班次行与值班板
+   * 灯条不渲染、工位回执默认收起、`forceFold` 传真。**这是版面判据的唯一一处**
+   * （`lib/talkLayout.ts` 里那个常量，与 CSS 那条 `@media` 由 `talkLayout.test.ts` 逐字对齐）。
+   */
+  let folded = $state(
+    typeof window !== 'undefined' && window.matchMedia(TALK_FOLD_QUERY).matches,
+  );
+  let foldedMq: MediaQueryList | null = null;
+  let onFoldChange: ((e: MediaQueryListEvent) => void) | null = null;
+
+  /**
+   * 移动款（≤479px，与 `app.css` 的窄屏基线同档）。**只剩输入框的占位语用它**：
+   * 「Enter 发送，Shift+Enter 换行」这句在手机上是一句空话（没有 Shift 键），而版面判据
+   * 一律走上面的 899——两件事的理由不同，故不是同一个断点。
+   */
   let narrow = $state(
-    typeof window !== 'undefined' && window.matchMedia('(max-width: 479px)').matches,
+    typeof window !== 'undefined' && window.matchMedia(TALK_MOBILE_QUERY).matches,
   );
   let narrowMq: MediaQueryList | null = null;
   let onNarrowChange: ((e: MediaQueryListEvent) => void) | null = null;
@@ -169,14 +257,26 @@
   const emptyBoard = $derived(!board.loading && board.tasks.length === 0);
 
   /**
+   * 地址里那一班（`?session=`，决策 217①：「我在哪」进 URL）。**它才是权威**——
+   * 前进 / 后退因此能回到上一班，刷新也照地址恢复；没有它才轮到 localStorage 兜底
+   * （跨页面回来时地址会丢参数，而「我一直在看这一班」不该因此被重置）。
+   */
+  const urlSession = $derived(
+    router.route.name === 'talk' ? (router.route.query.session ?? null) : null,
+  );
+
+  /** 折行档里班次列表的那些行（当前那一班在下一条里单独渲染成身份行）。 */
+  const otherSessions = $derived(sessionList.filter((s) => s.id !== currentId));
+
+  /**
    * 展开的那张急停（决策 183）。`undefined` = 还没选过（跟随默认：**宽屏只有一张时展开它，
    * 两张以上一张都不展开；窄屏恒不展开**）、`null` = 人显式收起、否则是那张的 id。
    * 三态的判据在 `lib/talkStops.ts`，此处只持状态。
    */
   let chosenStop = $state<string | null | undefined>(undefined);
   const stopIds = $derived(pending.map((t) => t.id));
-  const foldable = $derived(isFoldable(stopIds, narrow));
-  const openStop = $derived(resolveOpenStop(stopIds, chosenStop, narrow));
+  const foldable = $derived(isFoldable(stopIds, folded));
+  const openStop = $derived(resolveOpenStop(stopIds, chosenStop, folded));
 
   /** 8 工位的值班灯：按列聚合，与看板列头同一套词表与 sprite（`BOARD_COLUMNS`）。 */
   const crew = $derived(
@@ -383,6 +483,7 @@
       const landed = payload.session?.id ?? null;
       if (landed !== currentId) generation += 1;
       currentId = landed;
+      rememberLanding(landed, payload.session);
       loadError = null;
       return true;
     } catch (err) {
@@ -391,6 +492,43 @@
     } finally {
       loading = false;
     }
+  }
+
+  /**
+   * 落点收口（决策 217①④ / 220③）：**看过表、兜底文件、地址**三处一起跟上这一班。
+   *
+   * 三件事各有各的理由，且都必须在这里做：
+   *   - 「我看过它了」记的是**它此刻的 `last_active_at`**（不是本机的当下）——两边同一座钟，
+   *     机器一慢一快才不会读出假标记；
+   *   - 兜底文件写**落点**而不是「请求的那一班」：指定的班次不在了（别的设备归档了它）时
+   *     落回默认，此时该记住的是默认那一班；
+   *   - 地址用 `replaceState`（决策 217③：程序改地址一律 replace），否则装载时的规范化
+   *     会在历史里多塞一条，后退就不再是「回到上一页」。
+   */
+  function rememberLanding(landed: string | null, meta: ForemanSessionMeta | null) {
+    let next = seen;
+    if (!seenSeeded) {
+      // 立基线只在**本机一条记录都没有**时做（判据在 `seedBaselineIfFirstRun`）：
+      // 少了它，第一屏每一条都带「有新动静」——而它们只是刚被列出来；写成「每次装载都
+      // 拿当下的列表立基线」则相反：**关机期间别处发生的动静会被记成「看过了」**，
+      // 而那正是这枚标记最该说话的场合（实测：手机在别处开了新班次、说了话，回到这台
+      // 电脑打开对讲台，菜单里那条不该是安静的）。
+      next = seedBaselineIfFirstRun(next, sessionList);
+      seenSeeded = true;
+    }
+    if (meta) next = markSeen(next, meta.id, meta.last_active_at);
+    next = pruneSeen(
+      next,
+      sessionList.map((s) => s.id),
+    );
+    if (next !== seen) {
+      seen = next;
+      saveSeen(next);
+    }
+    // 落地即熄灭（决策 220③）：这一班的回话已经在台账里了，它不再是「此刻在说话」
+    if (landed) foreignActive = forgetForeignActive(foreignActive, landed);
+    saveSessionId(landed);
+    writeQuery({ session: landed }, { replace: true });
   }
 
   /**
@@ -412,16 +550,40 @@
   /**
    * 切到另一班。
    *
-   * **发送中禁止切换**：这是最基本的自保——回包落地时得有一个确定的「这一轮属于谁」。
-   * 但它不是彻底隔离：两台设备各说各话不受任何 UI 锁保护，那一层靠上面的 `generation`
-   * 与 `appendForemanDelta` 的班次守卫（决策 204⑥）。
+   * **回话中也可以切**（决策 220②）：那把 `sending || busy` 的锁撤掉了。它只是「别让你把
+   * 正在等的那句回话弄丢」的**第三层**自保——前两层是 `appendForemanDelta` 的班次守卫
+   * （增量串台）与 `send()` 里每个 await 之后的 `generation` 比对（回包串台），那两层一步没动。
+   * 切走之后「那一轮回话去哪了」改由班次列表里的两枚标记说清楚（决策 220③）。
+   *
+   * 切走时那一轮从视野里撤下（`resetSessionState` + `send()` 的 `gen !== generation` 分支），
+   * 但**回话照旧落台账**，回来就能看到完整的（决策 220⑤；切进一条正在回话的班次会先看到
+   * 回话的后半截，落地后 `reload()` 补齐——这一条也别当 bug 修）。
+   *
+   * `write`：用户点的切换把班次写进地址（`pushState`——后退回到上一班是想要的，决策 217③）；
+   * 从地址来的切换（后退 / 前进）不写，否则自己触发的装载会再写一次地址。
    */
-  async function switchTo(id: string) {
-    if (sending || busy || id === currentId) return;
+  async function switchTo(id: string, opts: { write?: boolean } = {}) {
+    if (id === currentId) return;
     generation += 1;
+    // 先认下这件事再写地址：地址一变，下面那个 `$effect` 会拿新值来比——认下了才不重复装载
+    currentId = id;
+    if (opts.write) writeQuery({ session: id });
     resetSessionState();
     await reload(id);
   }
+
+  /**
+   * 地址里的班次变了就跟着走（后退 / 前进，决策 217④ 的恢复语义）。
+   *
+   * 只在**装载完成之后**跟：首次装载由 `onMount` 负责（它还要兼顾 localStorage 兜底），
+   * 两边都动手会装载两遍。`switchTo` 先把 `currentId` 认下来，故由它自己写地址那一趟
+   * 不会被这里再拦一次。
+   */
+  $effect(() => {
+    const want = urlSession;
+    if (loading || !want || want === currentId) return;
+    void switchTo(want, { write: false });
+  });
 
   /**
    * 开一个新班次并切过去（空班是合法状态：第一句话说出来时它才得名）。
@@ -430,20 +592,24 @@
    * ——那时的 busy 必然是 true，若这里再守一次，归档完最后一个班次会静默什么都不做，
    * 页面停在一片空白上（「一个班次都没有」且没有当前班次）。
    */
-  async function openFreshSession() {
+  async function openFreshSession(opts: { push?: boolean } = {}) {
     const created = await createForemanSession();
     sessionList = [created.session, ...sessionList];
     generation += 1;
     resetSessionState();
+    // 同 `switchTo`：先把落点认下来，再写地址（用户按的那一颗 push，归档后的自动开新班不写——
+    // 地址的落点由随后的 `reload` 用 replaceState 规范化）
+    currentId = created.session.id;
+    if (opts.push) writeQuery({ session: created.session.id });
     await reload(created.session.id);
   }
 
-  /** 从界面按下「+ 新班次」。 */
+  /** 从界面按下「+ 新班次」（⋯ 菜单的第一项）。用户按的 = 一次换班，故 push 进地址。 */
   async function newSession() {
     if (sending || busy) return;
     busy = true;
     try {
-      await openFreshSession();
+      await openFreshSession({ push: true });
     } catch (err) {
       loadError = (err as Error).message;
     } finally {
@@ -508,6 +674,10 @@
   }
 
   function onStreamEvent(_taskId: string, event: SseEvent) {
+    // 「别的班次正在回话」（决策 220③）：`/foreman/stream` 把**全部**工头增量广播给所有
+    // 订阅者，而这个字段此前只被用来「丢掉不匹配的」——等于把「另一班在说话」白扔了。
+    // **不判 `sending`**：别的班次说话时本机可能什么都没发，而那正是需要告知的时候。
+    foreignActive = noteForeignDelta(foreignActive, event, currentId, Date.now());
     // 只在等回话期间累积：收尾后到达的尾巴不得再造一轮（回话以台账为准）
     if (!sending) return;
     // 班次守卫：不是当前这一班的增量一律丢弃（决策 204⑥，判据在 realtime/foreman.ts）
@@ -528,6 +698,25 @@
   $effect(() => {
     if (!(session?.proposals ?? []).some((p) => p.status === 'pending')) return;
     const t = setInterval(() => (now = Date.now()), 10_000);
+    return () => clearInterval(t);
+  });
+
+  /**
+   * 标记的时钟（决策 220③：**超时**与**落地**两条收口）。
+   *
+   * **只在真有别的班次在回话时才走**（与上面那条 10s 心跳同一姿态：没有东西要看的时候，
+   * 一次状态更新都不该产生）。查得比心跳密一点——这是一枚说「此刻」的标记，
+   * 慢半拍地撤掉比不显示更坏。传 `sessionList` 进去是为了第二条判据：那一班的
+   * `last_active_at` 一旦比我们记下的时刻新，就说明这一轮的收尾已经落台账了（判据在
+   * `pruneForeignActive`），此刻它不再「正在回话」。列表没刷新时兜底的是静默超时。
+   */
+  $effect(() => {
+    if (Object.keys(foreignActive.bySession).length === 0) return;
+    const t = setInterval(() => {
+      markerNow = Date.now();
+      const pruned = pruneForeignActive(foreignActive, sessionList, markerNow);
+      if (pruned !== foreignActive) foreignActive = pruned;
+    }, 5_000);
     return () => clearInterval(t);
   });
 
@@ -580,25 +769,37 @@
   }
 
   onMount(() => {
-    void reload();
+    // 地址权威、localStorage 兜底（决策 217④）：「我一直在看这一班」不该因为从看板点回来而重置
+    seen = loadSeen();
+    void reload(urlSession ?? loadSessionId() ?? undefined);
     // 复用任务流的分帧 / 退避 / 主动重连（票 03）：工头流只是换了一条路径
     conn = new TaskStream(
       '',
       {
         onEvent: onStreamEvent,
-        onStatus: (_id, status) => (streamStatus = status),
+        onStatus: (_id, status) => {
+          streamStatus = status;
+          // 断开即熄灭（决策 220③）：「别的班次在回话」是一份**描述此刻**的映射，
+          // 连接不在的时候它说的就不再是此刻——留着只会变成一个撤不掉的假标记。
+          if (status !== 'open') foreignActive = emptyForeignActive();
+        },
       },
       { path: '/foreman/stream' },
     );
     conn.start();
-    // 窄屏断点与 app.css 同一档（479px）：装置顺序与 TaskDetail 的 mobileMq 一致
-    narrowMq = window.matchMedia('(max-width: 479px)');
+    // 两档断点都是 `lib/talkLayout.ts` 的常量（票 07：899 一处定义；479 只剩占位语用它）
+    foldedMq = window.matchMedia(TALK_FOLD_QUERY);
+    folded = foldedMq.matches;
+    onFoldChange = (e: MediaQueryListEvent) => (folded = e.matches);
+    foldedMq.addEventListener('change', onFoldChange);
+    narrowMq = window.matchMedia(TALK_MOBILE_QUERY);
     narrow = narrowMq.matches;
     onNarrowChange = (e: MediaQueryListEvent) => (narrow = e.matches);
     narrowMq.addEventListener('change', onNarrowChange);
     document.addEventListener('visibilitychange', onVisible);
     return () => {
       document.removeEventListener('visibilitychange', onVisible);
+      if (foldedMq && onFoldChange) foldedMq.removeEventListener('change', onFoldChange);
       if (narrowMq && onNarrowChange) narrowMq.removeEventListener('change', onNarrowChange);
       conn?.stop();
       conn = null;
@@ -608,13 +809,13 @@
   /**
    * 新的一轮落地后把视口带到它那里。
    *
-   * **为什么必须有**：窄屏的输入坞钉在底栏上沿，回话落在文档末尾（在屏幕之外）——
-   * 不跟过去的话，人发完话只看得到一个空白的对话区，得自己往下拨。宽屏同理，只是滚的是
+   * **为什么必须有**：折行档的输入坞钉在底栏上沿，回话落在文档末尾（在屏幕之外）——
+   * 不跟过去的话，人发完话只看得到一个空白的对话区，得自己往下拨。桌面同理，只是滚的是
    * 时间线自己（它才是那个滚动容器）。滚动一律瞬时（§1 原则 4：无缓动），故直接写 scrollTop
    * ——`app.css` 没有 `scroll-behavior: smooth`，赋值即到位。
    */
   function scrollToNewest() {
-    if (narrow) {
+    if (folded) {
       const doc = document.scrollingElement;
       doc?.scrollTo({ top: doc.scrollHeight });
       return;
@@ -645,6 +846,114 @@
     if (next === null) return;
     await tick();
     zoneEl?.scrollIntoView({ block: 'start' });
+  }
+
+  /* ───────────── ⋯ 班次菜单（折行档）：键盘与关闭（票 04，照顶栏「待处理」那一套） ─────────────
+   *
+   * 交互语汇**照抄**顶栏那个下拉（票 04 / R2-04 补的三条出口），不新造第三套：`aria-expanded`
+   * + `aria-controls`、Escape 关得掉（**焦点没进过面板时也算**）、点面板外面关、上下方向键走项、
+   * `Home` / `End`、面板**常驻 DOM** 用 `hidden` 开合。键盘一律在 `window` 上收——给静态元素
+   * 挂交互处理器是 a11y 检查里的红灯。
+   */
+
+  /** 菜单里可聚焦的项（禁用的不行——它们在这一档读得到理由，但按不动）。 */
+  function menuItems(): HTMLElement[] {
+    return menuPanel
+      ? [...menuPanel.querySelectorAll<HTMLElement>('button[data-menu-item]:not([disabled])')]
+      : [];
+  }
+
+  function focusMenuItem(index: number): void {
+    const list = menuItems();
+    if (list.length === 0) return;
+    const n = list.length;
+    list[((index % n) + n) % n].focus();
+  }
+
+  function closeMenu(returnFocus: boolean): void {
+    menuOpen = false;
+    if (returnFocus) menuTrigger?.focus();
+  }
+
+  function toggleMenu(): void {
+    if (menuOpen) {
+      closeMenu(false);
+      return;
+    }
+    menuOpen = true;
+    void tick().then(() => focusMenuItem(0));
+  }
+
+  function onWindowKey(e: KeyboardEvent): void {
+    const active = document.activeElement as HTMLElement | null;
+    const onTrigger = !!menuTrigger && active === menuTrigger;
+    const inPanel = !!active && !!menuPanel && menuPanel.contains(active);
+
+    if (e.key === 'ArrowDown' && onTrigger && !menuOpen) {
+      e.preventDefault();
+      menuOpen = true;
+      void tick().then(() => focusMenuItem(0));
+      return;
+    }
+    if (!menuOpen) return;
+
+    if (e.key === 'Escape') {
+      closeMenu(onTrigger || inPanel);
+      return;
+    }
+    if (!onTrigger && !inPanel) return;
+
+    const list = menuItems();
+    if (list.length === 0) return;
+    const current = list.indexOf(active as HTMLElement);
+    if (e.key === 'ArrowDown') {
+      e.preventDefault();
+      focusMenuItem(current + 1);
+    } else if (e.key === 'ArrowUp') {
+      e.preventDefault();
+      if (current <= 0) menuTrigger?.focus();
+      else focusMenuItem(current - 1);
+    } else if (e.key === 'Home') {
+      e.preventDefault();
+      focusMenuItem(0);
+    } else if (e.key === 'End') {
+      e.preventDefault();
+      focusMenuItem(list.length - 1);
+    }
+  }
+
+  /** 点面板外面关掉（含「本来就开着、用户去点别处」那一档）。 */
+  function onWindowClick(e: MouseEvent): void {
+    if (!menuOpen) return;
+    const target = e.target as Node | null;
+    if (target && menuWrap?.contains(target)) return;
+    menuOpen = false;
+  }
+
+  /**
+   * 工位回执的展开／收起（受控，见 `receiptOpen`）。
+   *
+   * `preventDefault` 掉 `summary` 的默认行为：让浏览器自己翻 `open`，状态就在 Svelte 之外，
+   * 流式增量重渲染那一轮时会与模板里的 `open` 打架。人点一下 = 改一次我们自己的状态。
+   */
+  function toggleReceipt(event: MouseEvent, key: string) {
+    event.preventDefault();
+    receiptOpen = { ...receiptOpen, [key]: !receiptIsOpen(key) };
+  }
+
+  /**
+   * 一条班次该挂哪一枚标记（判据与优先关系全在 `lib/talkSessions.ts`，这里只把输入接上）。
+   *
+   * `markerNow` 是 `foreignIsReplying` 的时钟：读它才会在超时那一刻重算——那正是
+   * 「标记说的是此刻」这条要求的时间那一半。
+   */
+  function markersFor(s: ForemanSessionMeta): SessionMark {
+    return sessionMark(s, {
+      currentId,
+      sendingSid,
+      foreignReplying: foreignIsReplying(foreignActive, s.id, markerNow),
+      seen,
+    });
   }
 
   /**
@@ -678,10 +987,19 @@
         // 这是**我们自己**开的班，不算「换班」：重取记号，免得下面每一步都判成过期。
         gen = generation;
       }
+      // 「本机发出且未落地」（决策 220③）：切走之后这枚标记要落在**它**那一行上
+      sendingSid = sid;
       const res = await sendForemanMessage(text, sid);
       if (gen !== generation) {
+        // 切走了：这一轮从这一屏撤下（决策 220⑤），但回话已经落地——列表要跟上，
+        // 否则「原班次有新动静」永远等不到（这一支在放开切换之后是**常态路径**）。
+        // 「落地即熄灭」在这里同样要办：这一班的增量此前被记进了「别的班次在回话」那张映射
+        // （切走之后它的 `session_id` 就不再是「当前这一班」了），不清掉那枚
+        // 「正在回话」会一直亮到静默超时——而它说的已经不是实话。
         pendingText = null;
         stream = emptyForemanStream();
+        foreignActive = forgetForeignActive(foreignActive, sid);
+        void refreshSessionList();
         return;
       }
       // 回话是权威值：先收敛流式文本（重取台账期间不闪空），再以台账覆盖
@@ -700,6 +1018,7 @@
       if (gen !== generation) {
         pendingText = null;
         stream = emptyForemanStream();
+        void refreshSessionList();
         return;
       }
       stream = failForemanStream(stream, (err as Error).message);
@@ -716,6 +1035,30 @@
       }
     } finally {
       sending = false;
+      sendingSid = null;
+    }
+  }
+
+  /**
+   * 只重读班次列表（不碰这一屏的台账）。
+   *
+   * 已经落地的回话（含切走之后落地的那些）更新的是 `last_active_at`——「有新动静」那枚
+   * 标记的判据。这一屏读的是哪一班由 `reload` 管，本函数只管那一列元信息。
+   */
+  async function refreshSessionList() {
+    try {
+      const list = await getForemanSessions();
+      sessionList = list.sessions;
+      const next = pruneSeen(
+        seen,
+        list.sessions.map((s) => s.id),
+      );
+      if (next !== seen) {
+        seen = next;
+        saveSeen(next);
+      }
+    } catch {
+      // 列表读不到不影响这一屏：标记晚一步出现而已，台账是权威
     }
   }
 
@@ -872,6 +1215,13 @@
            ——时间线空态那句「说一句，值班长（跟我对话的 AI）就在对面」，那是第一次进这一页
            的人真正读到这个词的地方。**名牌上的 `值班长` / `值班经理` 同样不翻译**
            ——那是发言者称谓，保持原词。 -->
+      <!-- 当前班次名（票 03）：折行档把 chip 行收进页头右端的 ⋯ 之后，这是这一班在屏上
+           唯一的署名，故补在这里。桌面款不显示（`.sess-name` 只在折行档可见）——那里班次行
+           自己挂着每一班的名字，再说一遍是重复。截断宽度按 375px 算，不折行。 -->
+      {#if session?.session}
+        <span class="sess-name" title={session.session.title}>{session.session.title}</span>
+        <span class="sep sess-sep">▪</span>
+      {/if}
       <span>{session?.foreman.wired === false ? '值班长未接线' : '值班中'}</span>
       <span class="sep">▪</span>
       <!-- `工位` 的译文只在这一行（`.stat-wide` 窄屏收起）：窄屏上这个词不再出现
@@ -882,11 +1232,154 @@
       <span class="sep">▪</span>
       <a class="crumb" href="#/" onclick={() => router.navigate('/')}>看板</a>
     </div>
+
+    <!-- ── 班次行（决策 204③；落点由决策 218 ②/Q15 改到**页头右端**）：桌面挂在这里，
+         `nowrap` + 容器内横滚 + `min-width: 0`，故页头高度不因它变（`--talk-chrome` 因此
+         也不必动）。它原先长在 `.timeline` 这个滚动容器**里面**，于是随对话上移——实测长
+         会话滚到底时它在屏幕上方 320.2px，那正是「新建对话要往上翻很久」的病根。
+         **不得渲染成 `.turn`**：时间线里那些是发言，而这是一排控件。 -->
+    {#if !folded}
+      <div class="runrow no-scrollbar" role="group" aria-label="班次">
+        {#each sessionList as s (s.id)}
+          <!-- 切换**不因 `sending || busy` 禁用**（决策 220②）：回话中也可以换班次，
+               「那一轮回话去哪了」由 ⋯ 列表里的两枚标记说。 -->
+          <button
+            type="button"
+            class="runchip"
+            class:now={s.id === currentId}
+            aria-pressed={s.id === currentId}
+            title={s.title}
+            onclick={() => void switchTo(s.id, { write: true })}
+          >
+            {s.title}
+          </button>
+        {/each}
+        <button
+          type="button"
+          class="runchip plus"
+          disabled={sending || busy}
+          title="开一个新班次"
+          onclick={() => void newSession()}
+        >
+          + 新班次
+        </button>
+        {#if currentId}
+          <button type="button" class="runchip act" disabled={sending || busy} onclick={openRename}
+            >改名</button
+          >
+          <button
+            type="button"
+            class="runchip act"
+            disabled={sending || busy}
+            onclick={() => {
+              dialogError = null;
+              dialog = 'archive';
+            }}>归档</button
+          >
+        {/if}
+      </div>
+    {:else}
+      <!-- ── ⋯ 班次菜单（折行档，决策 218 ②/Q10/Q12/Q13）。桌面**不渲染**它
+           （Q14：桌面横向宽裕，把每一班的名字收进菜单是净丢信息）。
+           面板常驻 DOM 用 `hidden` 开合——`aria-controls` 指过去的目标必须真的存在。 -->
+      <div class="more-wrap" bind:this={menuWrap}>
+        <button
+          type="button"
+          class="more"
+          aria-label="班次菜单"
+          aria-expanded={menuOpen}
+          aria-controls="talk-session-menu"
+          bind:this={menuTrigger}
+          onclick={toggleMenu}
+        ></button>
+        <div class="smenu panel" id="talk-session-menu" hidden={!menuOpen} bind:this={menuPanel}>
+          {#if sessionList.length === 0 && !session?.session}
+            <div class="mi-empty">还没有班次。说一句话就会开一个。</div>
+          {/if}
+          <!-- 「+ 新班次」是第一项（这一页最常按的一颗），且**本页班次动作的唯一入口**
+               （决策 218 当日修订 ①：坞里那一颗已撤）。回话中禁用（`sending || busy`）。 -->
+          <button
+            type="button"
+            class="mi plus"
+            data-menu-item
+            disabled={sending || busy}
+            onclick={() => {
+              closeMenu(false);
+              void newSession();
+            }}>+ 新班次</button
+          >
+          {#if session?.session || otherSessions.length > 0}
+            <div class="mi-sep"></div>
+          {/if}
+          {#if session?.session}
+            {@const cur = session.session}
+            {@const curMark = markersFor(cur)}
+            <!-- 当前班次是**身份行**不是按钮：点了它没有去处（你已经在这一班）。
+                 `aria-current` 让它既可见又播报（票 04）。 -->
+            <div class="mi now" aria-current="true">
+              <span class="mi-nm">{cur.title}</span>
+              <span class="mi-meta dim">{formatDateTime(cur.last_active_at)}</span>
+              {#if curMark === 'replying'}<span class="mi-mark rep">正在回话</span>{/if}
+            </div>
+          {/if}
+          {#each otherSessions as s (s.id)}
+            {@const m = markersFor(s)}
+            <!-- 切换**不因回话中禁用**（决策 220②/⑤）：点「正在回话」那一条就是切过去，
+                 先看到回话的后半截、落地后 `reload()` 补齐——这不拦。 -->
+            <button
+              type="button"
+              class="mi"
+              data-menu-item
+              onclick={() => {
+                closeMenu(false);
+                void switchTo(s.id, { write: true });
+              }}
+            >
+              <span class="mi-nm">{s.title}</span>
+              <span class="mi-meta dim">{formatDateTime(s.last_active_at)}</span>
+              <!-- 标记只影响**读**：用词而不是纯色块（决策 195 的次级必读档门槛），
+                   且进可访问名（这是按钮自己的子节点，不做 `aria-hidden` 装饰）。
+                   「两条同时成立时哪条优先」不在这里判——`sessionMark()` 已经只回来一枚。 -->
+              {#if m === 'replying'}<span class="mi-mark rep">正在回话</span>
+              {:else if m === 'fresh'}<span class="mi-mark fresh">有新动静</span>{/if}
+            </button>
+          {/each}
+          <div class="mi-sep"></div>
+          <button
+            type="button"
+            class="mi act"
+            data-menu-item
+            disabled={sending || busy || !currentId}
+            onclick={() => {
+              closeMenu(false);
+              openRename();
+            }}>改名</button
+          >
+          <button
+            type="button"
+            class="mi act"
+            data-menu-item
+            disabled={sending || busy || !currentId}
+            onclick={() => {
+              closeMenu(false);
+              dialogError = null;
+              dialog = 'archive';
+            }}>归档</button
+          >
+        </div>
+      </div>
+    {/if}
   </div>
 
-  <!-- ── 状态区：当前急停。宽屏钉在第一屏，不随时间线滚动；窄屏默认收成摘要条并钉在
-       顶栏下沿（`.stops` / `.stop-open` 两个类只在 §5 的移动块里有规则，决策 192）。
-       值班板不在本区 ——桌面是右栏、窄屏是时间线之上的横向灯条 ── -->
+  <!-- ── 状态区：当前急停。桌面钉在第一屏，不随时间线滚动；折行档默认收成摘要条并钉在
+       页头那条带子的下沿（`.stops` / `.stop-open` 两个类只在折行档块里有规则）。
+       值班板不在本区 ——桌面是右栏、折行档**整块不渲染**（同一份读数在看板 8 列与顶栏
+       灯带上各有一份，这是第三份；决策 218 ②）。
+
+       **一张急停都没有时整块退场**（折行档；决策 218 修订 ⑦b）——430px 上它今天约 65px。
+       但 `loadError` 是另一回事：读不到台账时这里必须还说得出话，故它单独把关。
+       桌面款照旧保留那个引导块。 ── -->
+  {#if !folded || pending.length > 0 || loadError}
   <section
     class="zone-status"
     class:stops={pending.length > 0}
@@ -918,19 +1411,30 @@
       </div>
     {/if}
 
-    {#each pending as task (task.id)}
+    {#each pending as task, i (task.id)}
       {@const detail = details[task.id]}
       {@const count = stopActionCount(detail)}
       {@const open = isStopOpen(foldable, openStop, task.id)}
+      {@const first = i === 0}
       <!-- 急停轮：全站唯一"响"的一处（琥珀框 + ▼ + 恢复动作）。折叠只收动作区，不收身份：
-           折叠行的框色 / 硬投影 / ▼ 与展开行完全相同（决策 183） -->
+           折叠行的框色 / 硬投影 / ▼ 与展开行完全相同（决策 183）。**折行档的折叠态例外**：
+           摘要条不画名牌（决策 218 修订 ⑦a——那张 20px 的净空是给悬出框沿 14px 的名牌留的，
+           而决策 183 裁决③给摘要条定的三块里本就没有名牌；身份由框色 / 硬投影 / ▼ 承担）。 -->
       <article class="turn warn" class:folded={!open}>
         <!-- 名牌是发言者：这一轮是操作台在报"卡住了、要你按键"，不是值班长在说话
              （值班长的话一律没有按钮，见 §3.3 的四条纪律） -->
-        <div class="dname">操作台</div>
+        {#if open || !folded}
+          <div class="dname">操作台</div>
+        {/if}
 
         {#if open}
-          <div class="dtag">⏸ 等你拍板 · {pendingLabel(task.pending_reason)}</div>
+          <!-- 「急停」的首现平实说法落在**本页第一张**的琥珀标签上（决策 218 修订 ⑦b：
+               原先在窄屏那条空态里，而那条空态在折行档整块退场了）。主判据是 `i === 0`，
+               **不拘形态**——桌面只有一张时它是展开的，若按「只有摘要条才给括号」办，
+               那一档整页就没有一句解释（口径按页面、同一页面内不重复是决策 200 的要求）。 -->
+          <div class="dtag">
+            ⏸ 急停{first ? '（等你拍板的阻塞）' : ''} · {pendingLabel(task.pending_reason)}
+          </div>
           <p>
             「{task.title}」走到 {task.current_stage}，{task.pending_reason?.message ?? '需要你决定'}。
           </p>
@@ -991,7 +1495,12 @@
                展开钮。动作个数是「动作集仍在后端下发、仍在这一轮里」的可见证据；详情没到
                时不报数（不把「还没读到」说成「没有」——决策 182①） -->
           <div class="srow">
-            <span class="dtag">⏸ 等你拍板 · {pendingLabel(task.pending_reason)}</span>
+            <!-- 「急停」这个词的**首现平实说法**落在这里（决策 218 修订 ⑦b：原先在窄屏那条
+                 空态里，而那条空态在折行档整块退场了）。**只在本页第一张上给括号**，
+                 同一页面内不重复——译文跟着词走：没有急停则词不在，也就没有没被翻译的词。 -->
+            <span class="dtag"
+              >⏸ 急停{first ? '（等你拍板的阻塞）' : ''} · {pendingLabel(task.pending_reason)}</span
+            >
             <!-- 类名刻意不叫 `st`：那是 app.css 里的全局状态标记（`状态文字标记`，
                  `::before` 自带一枚 8px 方灯 + `white-space: nowrap`）。撞名的代价是
                  摘要条上凭空多一枚无意义的灯、且标题不换行——长标题会压到展开钮上
@@ -1012,14 +1521,16 @@
       </article>
     {/each}
 
-    {#if pending.length === 0}
+    {#if pending.length === 0 && !folded}
       <!-- 空态与其余六处同一套语汇（票 13 / parallel-brief §三.3）：状态 → 下一步 → 可选入口，
            凡是提到另一个页面都可点。入口是页面固定的**导航入口**（纯前端路由，不进后端动作契约，
            票 04）——`EmptyState` 的 href 就是它，不再是裸的 `<button>`。
-           `货箱` 的译文就在这一句里（本页首现处，同一页面内不重复）。 -->
+           `货箱` 的译文就在这一句里（本页首现处，同一页面内不重复）。
+           **折行档不渲染它**（决策 218 修订 ⑦b：整块退场，约 65px）；「急停」的首现平实说法
+           随之搬到摘要条的琥珀标签上（见上），故这里只留原词。 -->
       <div class="no-stop">
         <EmptyState
-          state="当前没有急停（等你拍板的阻塞）。"
+          state="当前没有急停。"
           next={board.projects.length === 0
             ? '这台机器还没接入项目——先接一个，流水线才有货箱（一张任务卡）。'
             : '有任务需要你拍板时，它会挂在这里，动作就在那一轮里。'}
@@ -1029,68 +1540,18 @@
       </div>
     {/if}
   </section>
+  {/if}
 
-  <!-- ── 对话时间线：值班长的话、值班经理的话、工位回执。宽屏它是那个会滚、会长的地方；
-       窄屏整页去滚，它就是页面本身（§5 移动款，决策 192） ── -->
+  <!-- ── 对话时间线：值班长的话、值班经理的话、工位回执。桌面它是那个会滚、会长的地方；
+       折行档整页去滚，它就是页面本身（§5 移动款 / 决策 192；档位由决策 218 修订 ⑥ 扩到 ≤899）。
+       班次行**不在这里**（决策 218 ②）：桌面在页头右端、折行档在页头的 ⋯ 里——它原先长在
+       这个滚动容器里面，于是随对话上移。 ── -->
   <section
     class="timeline"
     class:empty={timelineEmpty}
     bind:this={timelineEl}
     aria-label="对话时间线"
   >
-    <!-- ── 班次 chip 行（决策 204③）：时间线顶部、**非 sticky**（随手指滚）。
-         词汇复用任务详情页的 `.runchip`——「选一条会话」在那里已经有现成语汇；
-         窄屏 `nowrap + 横滚` 也是现成的。**不得渲染成 `.turn`**：时间线里那些是发言，
-         而这是一排控件（`talk.spec.ts` 断言时间线里没有 `.turn.warn`）。
-         不动页头、不动顶栏：它长在这条**会滚的**时间线里，故 `.talk-head` 的高度
-         与对话区的高度都不因它变。 -->
-    <div class="runrow no-scrollbar" role="group" aria-label="班次">
-      {#each sessionList as s (s.id)}
-        <button
-          type="button"
-          class="runchip"
-          class:now={s.id === currentId}
-          aria-pressed={s.id === currentId}
-          disabled={sending || busy}
-          title={s.title}
-          onclick={() => void switchTo(s.id)}
-        >
-          {s.title}
-        </button>
-      {/each}
-      <button
-        type="button"
-        class="runchip plus"
-        disabled={sending || busy}
-        title="开一个新班次"
-        onclick={() => void newSession()}
-      >
-        + 新班次
-      </button>
-      {#if currentId}
-        <button
-          type="button"
-          class="runchip act"
-          disabled={sending || busy}
-          onclick={openRename}>改名</button
-        >
-        <button
-          type="button"
-          class="runchip act"
-          disabled={sending || busy}
-          onclick={() => {
-            dialogError = null;
-            dialog = 'archive';
-          }}>归档</button
-        >
-      {/if}
-      <!-- 发送中为什么点不动（决策 204③的「最基本的自保」）：光把按钮变灰，
-           人会以为界面卡了。回话落地得有一个确定的「这一轮属于谁」。 -->
-      {#if sending}
-        <span class="dim note rwhy">回话中，先别换班次</span>
-      {/if}
-    </div>
-
     {#if loading && !session}
       <div class="quiet">正在读会话台账…</div>
     {:else if turns.length === 0}
@@ -1234,10 +1695,15 @@
           {/if}
 
           <!-- 工位回执：转述不是发言（左缘亮度阶 + 无框，形状上就与发言不同）。
-               默认展开：回执是这一轮结论的出处，「可追溯性不因对话而丢失」是四条纪律之一 -->
+               **默认态分档**（决策 218 ②/Q11）：桌面照旧展开（回执是这一轮结论的出处，
+               「可追溯性不因对话而丢失」是四条纪律之一）；折行档默认收起——每轮 30–60px
+               是长会话里最大的隐性纵向开销，而这一档的纵向空间是拿钉住物之间的残渣换的。
+               **内容一个字不删**：出处按一下就在，只是不再默认占屏（摘要行永远带条数）。
+               展开态**受控**（`receiptOpen`，见那边的注释）：让浏览器自己翻 `open` 的话，
+               流式增量反复重渲染同一轮时会把人手动展开的那一轮打回收起。 -->
           {#if turn.traces.length > 0}
-            <details class="rcpts" open>
-              <summary class="rcpts-sum">
+            <details class="rcpts" open={receiptIsOpen(turn.key)}>
+              <summary class="rcpts-sum" onclick={(e) => toggleReceipt(e, turn.key)}>
                 工位回执 <span class="dim">{turn.traces.length} 次台账查读 ▸</span>
               </summary>
               {#each turn.traces as trace, i (`${turn.key}-t${i}`)}
@@ -1260,7 +1726,14 @@
   </section>
 
   <!-- ── 输入坞：钉底。Enter 发送 / Shift+Enter 换行；发送中禁用 ── -->
-  <form class="typer" onsubmit={(e) => { e.preventDefault(); void send(); }}>
+  <form
+    class="typer"
+    class:warn={streamStatus === 'error'}
+    onsubmit={(e) => {
+      e.preventDefault();
+      void send();
+    }}
+  >
     <div class="dname">值班经理</div>
     <textarea
       class="input"
@@ -1273,18 +1746,19 @@
       oncompositionend={() => composing.end()}
     ></textarea>
     <div class="typer-foot">
-      <span class="dim hint">
-        {#if sending}
-          值班长正在回话…
-        {:else if streamStatus === 'error'}
-          流断了：回话仍会以台账为准补上。
-        {:else if narrow}
-          <!-- 窄屏这一行是**常驻**的（留了高度，见 CSS）：空着就是一条 19px 的死白，
-               拿它说 §3.3 纪律 4 的那件事（说的每句话都进审计）比留白有用。
-               宽屏不写：那里这一行本来就与发送钮同行，不占地方也不缺话说。 -->
-          说的每句话都会记进审计
-        {/if}
-      </span>
+      <!-- 这一行**只剩传输层断线**这一件事（决策 218 修订 ⑤ / 220④）：
+           - 「值班长正在回话…」**删掉**——流式尾随光标本就在说这件事（`.turn p.streaming`），
+             用户裁决「光标跳动已经代表了正在回复，不需要这条提示了」；不新增动画位。
+           - 「流断了」**删不得**：`streamStatus === 'error'` 是全页**唯一**的断线告知
+             （这个状态在仓里只有这一个消费者），而「实时流断了不能静静不更新」是审计 R2-18
+             的既有能力。时间线里那句「流断了，上面是已经收到的部分」是**另一件事**
+             （那一轮只收到半截，`turn.partial`）。
+           - 于是这一行**空闲时高度 0**：决策 192 当初是用 19.2px 的常驻死白换「坞不上下跳」
+             （那句「说的每句话都会记进审计」），撤掉告知之后这笔买卖不划算——而且它只在
+             异常态发生。**撤的是告知，不是纪律**：决策 182 §3.3 纪律 4 照旧，审计照旧全量落库。 -->
+      {#if streamStatus === 'error'}
+        <span class="dim hint">流断了：回话仍会以台账为准补上。</span>
+      {/if}
       <button type="submit" class="btn solid" disabled={sending || !input.trim()}>发送</button>
     </div>
   </form>
@@ -1336,7 +1810,8 @@
     {/if}
   </Modal>
 
-  <!-- ── 值班板：桌面右栏；窄屏收成对话之上的横向灯条（`crew`） ── -->
+  <!-- ── 值班板：**桌面右栏**（折行档整块不渲染，CSS 那条 `display: none` 管着；
+       同一份读数在看板 8 列与顶栏灯带上各有一份，这一条是第三份——决策 218 ②） ── -->
   <aside class="talk-side crew">
     <div class="reg">
       <div class="reg-head"><span>值班板</span><span class="n">8 工位</span></div>
@@ -1361,6 +1836,10 @@
   </aside>
 </main>
 
+<!-- ⋯ 班次菜单的三条出口（票 04）：Escape 关得掉（焦点没进过面板时也算）、点面板外面关、
+     上下方向键走项。与顶栏那个下拉同一姿态——键盘一律在 `window` 上收。 -->
+<svelte:window onclick={onWindowClick} onkeydown={onWindowKey} />
+
 <style>
   /* 三分区（票 04）：状态区 / 时间线 / 输入坞自上而下。整页钉在视口内，故时间线是
      唯一会滚的区域——两小时前挂起的急停不会被它顶出视野。 */
@@ -1369,7 +1848,10 @@
     margin: 0 auto;
     padding: 14px 20px 12px;
     display: grid;
-    grid-template-columns: minmax(0, 1fr) var(--dossier-w, 340px);
+    /* 左栏的下限**写在这里**（决策 215）：`minmax(0, 1fr)` 正是「480px 上只剩 82px」那个洞
+       的来源——1fr 能缩到 0，而对话列的下限是 420px（右栏 280 的下限配上一条算得出来的不等式：
+       `900 − 40(页内边距) − 18(gap) − 280 = 562 ≥ 420`）。 */
+    grid-template-columns: minmax(420px, 1fr) var(--dossier-w, 340px);
     grid-template-rows: auto auto minmax(0, 1fr) auto;
     gap: 20px 18px;
     /* 视口 = 顶栏 + 整页 + 底栏区 46px（body 下边距）。顶栏实测约 78–81px
@@ -1415,8 +1897,21 @@
   .sep {
     color: var(--text-4);
   }
+  /* 当前班次名与它后面那个分隔符只属于折行档的页头那一行（票 03）：桌面款不显示
+     ——那里班次行自己挂着每一班的名字，再说一遍是重复。折行档的规则在下面的 899 块里。 */
+  .sess-name,
+  .sess-sep {
+    display: none;
+  }
+  /* `crumb` 是 app.css 里的**共用基元**（台账三页的「← 看板」面包屑，`.crumb` 带
+     `display: inline-block; margin-bottom: 10px`）。本页只借它的颜色档：那一份 10px 下边距
+     是给「面包屑独占一行、下面还有标题」的版面留的，落在这里一头扎进页头**那一行**——
+     flex 行盒量的是**外边距盒**，于是 19.44px 的字撑出 29.44px 的行（决策 218 ④ 要一行
+     19.2px，`talk.spec.ts` 的折行档页头用例钉着它）；散在正文里的两条（配对说明）也会被
+     它顶高一个半行。故这里显式归零。 */
   .crumb {
     color: var(--text-3);
+    margin-bottom: 0;
   }
   .crumb:hover {
     color: var(--text-hi);
@@ -1461,26 +1956,33 @@
     flex-direction: column;
     justify-content: center;
   }
-  /* 空态里那两样东西**不是一类**：班次 chip 行是控件，空态文案是内容。
-     让 flex 把整组居中会让控件浮在大片空白的中间（决策 202 治的就是「内容浮着」），
-     故 chip 行照旧贴顶、只把空态文案推到中间。 */
-  .timeline.empty > .runrow {
-    flex: 0 0 auto;
-  }
+  /* 空态里那两样东西**不是一类**：班次行是控件，空态文案是内容——而班次行已随决策 218 Q15
+     搬进页头，这一格里只剩空态文案，故 `justify-content: center` 直接就是「不浮在顶上」。 */
   .timeline.empty > :global(.empty) {
     margin-top: auto;
     margin-bottom: auto;
   }
 
-  /* ── 班次 chip 行（决策 204③）：词汇照抄任务详情页的 `.runchip` ──
-     「选一条会话」在那里已经有现成形状，本页不另造一套药丸。 */
+  /* ── 班次行（决策 204③；决策 218 Q15 把它从时间线里搬到这里）──
+     词汇照抄任务详情页的 `.runchip`：「选一条会话」在那里已经有现成形状，本页不另造一套药丸。
+     **它现在挂在页头那一行的右端**，故：`flex: 1 1 auto` 吃掉标题与元信息之后的余量、
+     `min-width: 0` 是能被压窄的前提（否则内容宽就是它的下限，页头会被撑高）、
+     `nowrap` + `overflow-x: auto` 让多出来的班次在**容器内**横滚（与 `.slots` / `.navbar`
+     同一手法，`no-scrollbar` 已在标记上）、`align-self: center` 保证它不参与基线对齐
+     ——页头的高度仍由 `<h1>` 那一行决定（`--talk-chrome: 386px` 里那个「页头 38px」因此不动）。 */
   .runrow {
     display: flex;
     gap: 6px;
-    flex-wrap: wrap;
-    margin-bottom: 16px;
+    flex: 1 1 auto;
+    min-width: 0;
+    flex-wrap: nowrap;
+    overflow-x: auto;
+    justify-content: flex-end;
+    align-self: center;
+    margin-bottom: 0;
   }
   .runchip {
+    flex: none;
     font-size: 12px;
     padding: 2px 8px;
     border: 2px solid var(--pane);
@@ -1509,9 +2011,6 @@
   }
   .runchip:disabled {
     opacity: 0.5;
-  }
-  .rwhy {
-    align-self: center;
   }
   .quiet {
     color: var(--text-3);
@@ -1916,129 +2415,275 @@
     color: var(--stop);
   }
 
-  /* 移动款（§5 转写 4）：页头 → 值班灯条 → 状态区 → 竖排对话 → 钉底输入坞 */
-  /* ── 窄屏（§5 移动款，决策 192）：**对话是页面本身** ──
-     桌面款把整页钉在视口里、让时间线做唯一的滚动容器；窄屏反过来——整页随手指滚，
-     只有两样东西钉住：急停摘要条（钉在顶栏下沿）与输入坞（钉在底栏上沿）。
-     两个滚动容器在 430px 宽、740–930px 高的屏上是零和的：钉住的部分每多 100px，
-     对话区就少 100px，而对话区正是这一页在手机上唯一的用处。
-     钉住的两样各有代价：急停摘要条实测约 66px/张（宽屏是 376px 的展开轮，见 `forceFold`），
-     输入坞约 113px（宽屏那种「正文一行、提示与按钮又一行」在这里要吃掉 145px）。 */
-  @media (max-width: 479px) {
+  /* ── 两栏那一档的右栏宽度（决策 215）：`900–1099` 收到 **280px**，`≥1100` 回到 340px ──
+     「先缩右栏、缩到底再折」：右栏是「摘要 + 动作行」，280 仍放得下一行动作钮，而对话列
+     因此拿回 60px。`≤899` 那一条也落在这个上界里，但折行档是 `display: flex`，
+     `grid-template-columns` 在那里不生效（故不必写 `min-width: 900` ∧ `max-width: 1099`，
+     那样只会让断点表多出一个数）。 */
+  @media (max-width: 1099px) {
+    .talk {
+      grid-template-columns: minmax(420px, 1fr) 280px;
+    }
+  }
+
+  /* ── 折行档（≤899px）：**对话是页面本身**（决策 192 的版面，由决策 218 修订 ⑥ 从 ≤479
+     扩到 ≤899——折行档与窄档同源，「钉住的东西必须便宜」那条理由在那里同样成立，而一张
+     376px 的展开轮钉在 768px 高的窗口上就是半块屏）──
+     桌面款把整页钉在视口里、让时间线做唯一的滚动容器；这一档反过来——整页随手指滚，
+     钉住的是**三样**（决策 218 修订 ④：页头 46px 带子 / 急停摘要条 / 输入坞）。
+     钉住的部分每多 100px，对话区就少 100px，而对话区正是这一页在这一档唯一的用处。
+
+     **顶栏高度在两档里不同**（≤479 是移动款 138px，480–899 仍是桌面款 78–81px），
+     故一切钉位读 `--topbar-h`（顶栏自己量出来写回，票 09 / R2-11）而**不写死 138**
+     ——写死的话折行档那半截的摘要条会钉在屏幕中间。 */
+  @media (max-width: 899px) {
     .talk {
       display: flex;
       flex-direction: column;
-      gap: 14px;
+      /* **间距改成逐块外边距**（决策 218 修订 ④）：页头与状态区之间那道通用行距要省掉
+         ——钉住的带子自带 2px 下框，再叠一道 14px 是白给。其余几对仍是 14px，坞前那 40px
+         （= 14 行距 + 26 外边距）原样保留。用 `gap: 0` + 各自外边距，而不是给页头加负边距：
+         状态区在「一张急停都没有」时整块不渲染（决策 218 修订 ⑦b），负边距会把那一对的
+         14px 一起吃掉。 */
+      gap: 0;
       padding: 10px 12px 0;
-      /* 桌面那条 `height` 必须撤掉：两处一起定高，窄屏就没有「长出去」的余地 */
+      /* 桌面那条 `height` 必须撤掉：两处一起定高，这一档就没有「长出去」的余地 */
       height: auto;
-      /* 视口 = 顶栏 138 + 整页 + 底盘底边距（`app.css` 窄屏把底盘 padding-bottom
-         定成了底栏高度 `--sbar-h`，故这里减的是同一个值）。`min-height` 而非 `height`：
+      /* 视口 = 顶栏（实测）+ 整页 + **底盘底边距**。`min-height` 而非 `height`：
          内容长了就长出去（整页滚），短了就撑满余下的屏幕——输入坞于是总在底边。
          底内边距为 0 是**算过**的：让输入坞的底边正好落在底栏顶边（钉住时同一个位置，
          于是「对话短时悬空 16px、长了又贴上去」那种一跳没有了）。
          用 `dvh` 而不是 `vh`：手机上 `vh` 取的是地址栏收起时的高度，地址栏在场时
-         整块版面会高出一截，把钉底的输入坞推到屏幕外（`vh` 那行是给不认 `dvh` 的旧内核的）。 */
-      min-height: calc(100vh - 138px - var(--sbar-h));
-      min-height: calc(100dvh - 138px - var(--sbar-h));
+         整块版面会高出一截，把钉底的输入坞推到屏幕外（`vh` 那行是给不认 `dvh` 的旧内核的）。
+         **底盘那一份要按「这一档实际是多少」算**，而 480–899 上一共有两个数：`app.css` 给
+         `body` 的仍是桌面那份 **46px**（它到 ≤479 才换成 `--sbar-h`），而输入坞钉的是
+         `bottom: var(--sbar-h)`（= 38px）。两者差 8px，各管一头——`min-height` 减 **38**
+         才让坞的底边与底栏顶边齐平（实测差 10px 的正是这条），多出来的那 8px 底盘边距由下面
+         那条负外边距就地抵掉，文档高度因此仍是视口高（静置态不空滚）。**不去改 `body`
+         本身**：底盘边距是全站的（看板、详情页、台账页都在用），组件里一条 `:global(body)`
+         会把 480–899 这一档**所有页面**的底边距一起改掉，那不是本页的地盘
+         （决策 218 ⑧：其余页面不动；这一处是决策 222 的现场修正）。 */
+      min-height: calc(100vh - var(--topbar-h) - var(--sbar-h));
+      min-height: calc(100dvh - var(--topbar-h) - var(--sbar-h));
+      margin-bottom: calc(var(--sbar-h) - 46px);
     }
+    /* ── 页头那一行：**钉住的 46px 带子**（决策 218 修订 ④）──
+       `height: 46px` 含那 2px 下框（全站 `box-sizing: border-box`），于是内容高 44px
+       ——⋯ 的 44px 触控目标**直接落在行内**，不需要任何溢出技巧（旧 ④ 的「命中区故意溢出
+       到留白里」与随之而来的「`.talk` 不得加 `overflow: hidden`」都作废了）。
+       `top: var(--topbar-h)`：带子钉在顶栏下沿，急停摘要条再钉在它下沿（+46px）。 */
     .talk-head {
       order: 1;
       flex: none;
-    }
-    /* 班次 chip 行在窄屏**不折行、横向滚**（与任务详情页的 `.runrow` 同一形状）：
-       430px 上折行会把三四个班次铺成两三行，而这一档的纵向空间是拿「两只钉住物之间的
-       残渣」换来的，不能喂给一排控件。 */
-    .runrow {
+      position: sticky;
+      top: var(--topbar-h);
+      z-index: 15;
+      height: 46px;
+      align-items: center;
       flex-wrap: nowrap;
-      overflow-x: auto;
+      gap: 10px;
+      padding: 0 2px;
+      background: var(--bg);
+      border-bottom: 2px solid var(--hairline);
     }
-    .runchip {
+    /* `<h1>` 转 visually-hidden（决策 218 Q6，先例是看板页）：页签已经在说「对讲台」，
+       而这一行 19.2px 的高度要留给真正会变的东西。**语义要留**——每路由一个 h1（R2-20）。 */
+    .talk-head .tt {
+      position: absolute;
+      width: 1px;
+      height: 1px;
+      overflow: hidden;
+      clip: rect(0 0 0 0);
+      white-space: nowrap;
+    }
+    .ts {
+      flex: 1 1 auto;
+      min-width: 0;
+      flex-wrap: nowrap;
+      overflow: hidden;
+      gap: 8px;
+      /* 这一档是**一行**，垂直居中即可。不参与基线对齐是必须的：`.sess-name` 带
+         `overflow: hidden`，它的基线由盒子底边合成，`align-items: baseline` 会把整行撑到
+         29.4px（决策 218 ④ 要的是 19.2px 的行——量出来的是行盒，不是字）。 */
+      align-items: center;
+    }
+    .ts > span,
+    .ts > a {
       flex: none;
+      white-space: nowrap;
     }
-    /* 标题与元信息同一行：手机上「对讲台」顶栏的页签已经在说，页内不必再铺两行。
-       「夜班态势：8 工位」收进宽屏——它说的就是正下方那条 8 工位的灯条。 */
+    .ts .sess-sep {
+      display: inline;
+    }
+    /* 班次名是这一行里唯一可以被压窄的东西：其余几项都是短定值，压它们只会把字切掉 */
+    .ts .sess-name {
+      display: inline;
+      flex: 0 1 auto;
+      min-width: 0;
+      max-width: 26ch;
+      overflow: hidden;
+      text-overflow: ellipsis;
+    }
+    /* 标题与元信息同一行：这一档「对讲台」的顶栏页签已经在说，页内不必再铺两行。
+       「夜班态势：8 工位」也收进桌面款——它说的就是看板列头与顶栏灯带上已有的那份读数。 */
     .stat-wide {
       display: none;
     }
-    /* 值班板收成对话之上的横向灯条：横向滚动、不缩不折。
-       台账盒的框与头行在窄屏没有意义（它会随手指滚走），只留「值班板」当行首标签。 */
-    .talk-side {
-      order: 2;
+    /* ── ⋯ 与它的班次菜单（决策 218 ②/Q10/Q12/Q13）── */
+    .more-wrap {
+      position: relative;
       flex: none;
-      position: static;
-      /* 桌面那条 `align-self: start` 必须撤掉：灯条要靠父宽约束才会横向滚，
-         否则 aside 取 max-content 宽度、把整页撑出横向滚动条 */
       align-self: stretch;
-      max-height: none;
-      overflow: visible;
-    }
-    .talk-side .reg {
       display: flex;
       align-items: center;
-      gap: 10px;
+    }
+    .more {
+      width: 44px;
+      height: 44px;
+      display: grid;
+      place-items: center;
+      background: none;
       border: 0;
-      background: none;
+      color: var(--text-2);
     }
-    .talk-side .reg-head {
-      flex: none;
-      padding: 0;
-      border-bottom: 0;
-      background: none;
+    /* 三个点用 `::before` 画：装饰不进可访问名（票 06 / R2-19，与页签前缀三角同一手法），
+       名字由 `aria-label` 给。 */
+    .more::before {
+      content: '⋯';
+      font-size: 16px;
+      line-height: 1;
     }
-    /* 「8 工位」不写：下面 8 枚灯自己说得更清楚（与页头收掉的那句是同一件事） */
-    .talk-side .reg-head .n {
+    .more:hover,
+    .more[aria-expanded='true'] {
+      color: var(--text-hi);
+    }
+    /* 面板锚在**钉住带子的下沿**：带子自己钉着，故这是个常量（顶栏实测高 + 46px 带子），
+       不必现量。`fixed` + 左右各 12px 与顶栏「待处理」下拉在窄档同一手法（脱离横滚容器的
+       裁剪，也让长标题有地方展开）。 */
+    .smenu {
+      position: fixed;
+      left: 12px;
+      right: 12px;
+      top: calc(var(--topbar-h) + 46px);
+      max-height: 60vh;
+      overflow: auto;
+      padding: 6px 0;
+      z-index: 40;
+      background: var(--bg);
+      text-align: left;
+    }
+    .smenu[hidden] {
       display: none;
     }
-    .brows {
+    /* 行高按触控来（≥44px）：**不复用 20px 的 `.runchip` 尺寸**——那一档的芯片是在页头里
+       横滚的一排，这里是一份要按得准的菜单。 */
+    .mi {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      width: 100%;
+      min-height: 44px;
+      padding: 0 12px;
+      background: none;
+      border: 0;
+      color: var(--text-2);
+      text-align: left;
+    }
+    .mi:hover:not(:disabled) {
+      background: var(--wash);
+      color: var(--text-hi);
+    }
+    .mi:disabled {
+      opacity: 0.5;
+    }
+    /* 「+ 新班次」是这一页最常按的一颗：亮一档，但仍不占信号色（全站唯一的响仍在急停一处） */
+    .mi.plus {
+      color: var(--text-hi);
+    }
+    .mi-nm {
       flex: 1;
       min-width: 0;
-      display: flex;
-      overflow-x: auto;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
     }
-    .brow {
+    .mi-meta,
+    .mi-mark {
       flex: none;
-      border-bottom: 0;
-      border-right: 2px solid var(--wash);
+      font-size: 12px;
     }
-    .brow:last-child {
-      border-right: 0;
+    /* 当前班次是**身份行**：它不是按钮（点了没有去处），选中态与页头那一行的名字是同一个人 */
+    .mi.now {
+      background: var(--wash);
+      color: var(--text-hi);
     }
-    .boks {
+    /* 两枚标记（决策 220③）：**用词而不是纯色块**（决策 195 的次级必读档门槛），
+       且不加动画位。「有新动静」比行右端的时间戳亮一档——它是叫你回去看一眼的那一句。 */
+    .mi-mark.fresh {
+      color: var(--text-2);
+    }
+    /* 「正在回话」占琥珀档的文字色，但**不加动画**（全站唯一的「响」仍只给急停，决策 220③） */
+    .mi-mark.rep {
+      color: var(--pending);
+    }
+    .mi-sep {
+      height: 2px;
+      margin: 6px 0;
+      background: var(--hairline);
+    }
+    .mi-empty {
+      padding: 10px 12px;
+      color: var(--text-3);
+      font-size: 12px;
+    }
+    /* ── 值班板：**整块不渲染**（决策 218 ②）──
+       同一份读数在看板 8 列与顶栏灯带上各有一份，灯条是第三份；而这一档的纵向空间是零和的。
+       桌面右栏 `.talk-side` 一字不动（下面那些 `.brows` / `.brow` / `.blamp` 规则照旧是它的）。 */
+    .talk-side {
       display: none;
     }
-    /* ── 状态区：钉在顶栏下沿的一条（`.stops`） ──
-       桌面那条 38vh 上限（区内滚动）在窄屏撤掉：整页去滚，状态区不再有自己的滚动条。
+    /* ── 状态区：钉在**页头那条带子的下沿**（`.stops`） ──
+       桌面那条 46vh 上限（区内滚动）在这一档撤掉：整页去滚，状态区不再有自己的滚动条。
        钉住只在**收起时**成立——展开的那一张回到普通文档流（`.stop-open`），否则一张
        376px 的轮钉在 900px 的屏上就钉死了整块屏幕；展开那一张要看得见由 `toggleStop`
-       滚回它负责。不钉住的是「没急停」的形态：一句「当前没有急停」不值得占一行屏幕。 */
+       滚回它负责（`scroll-margin-top` 要按带子的下沿算，见下）。 */
     .zone-status {
-      order: 3;
+      order: 2;
       flex: none;
-      padding: 20px 6px 6px 2px;
+      /* 上内边距归 0（决策 218 修订 ⑦a）：那 20px 是给悬出框沿 14px 的名牌留的净空，
+         而摘要条不再画名牌——只有展开那一张（`.stop-open`）才把它拿回来。 */
+      padding: 0 6px 6px 2px;
       max-height: none;
       overflow: visible;
+      /* `toggleStop` 的 `scrollIntoView` 停的位置：钉住的带子下沿再让 10px 的呼吸
+         （430×900 上是 194 = 138 + 46 + 10，决策 218 修订 ④ 把 148 挪过来的那一处）。
+         **两种形态都要**——别放进下面 `.stops:not(.stop-open)` 那条规则里：展开那一张恰好
+         退出钉住，滚动是唯一能把它带回眼前的东西，而丢了 `scroll-margin-top` 就会**多滚一截**
+         （实测整页滚到底 36px、名牌因此钻到钉住带子底下：状态区 158、名牌上沿 164、
+         带子下沿 184——正是「点了展开恢复动作，动作却看不见」那种错）。 */
+      scroll-margin-top: calc(var(--topbar-h) + 56px);
     }
-    .zone-status:not(.stops) {
-      padding-top: 0;
+    /* 展开那一张：名牌回来、那 20px 也回来。展开态本来就退出钉住，是刻意的一刻。 */
+    .zone-status.stop-open {
+      padding-top: 20px;
     }
     .zone-status.stops:not(.stop-open) {
       position: sticky;
-      top: 138px; /* = 窄屏顶栏高度（e2e ⑩ 钉住 138）；下边框把灯条与对话分开 */
-      z-index: 15;
+      /* 下沿 = 顶栏实测高 + 46px 带子（决策 218 修订 ④：这个钉位从「顶栏下沿」挪到了
+         「带子下沿」，即 430×900 上的 138 → 184）。下边框把这条带子与下面的对话分开。 */
+      top: calc(var(--topbar-h) + 46px);
+      z-index: 14;
       background: var(--bg);
       border-bottom: 2px solid var(--hairline);
-      /* `scrollIntoView` 停的位置（§5 定值：顶栏 138 + 10） */
-      scroll-margin-top: 148px;
-      /* 兜底上限：一张摘要条实测约 **66px**（窄屏两行）+ 26px 间距，五张在 900px 屏上
-         就是 460px——钉住的东西不能没有上界，否则「对话区太小」会以另一种形状回来。
+      /* 兜底上限：一张摘要条实测约 **66px**（窄屏两行）+ 14px 间距，五张在 900px 屏上
+         就是 400px——钉住的东西不能没有上界，否则「对话区太小」会以另一种形状回来。
          到顶之后这条带子自己滚（与桌面那一档同一手法），代价如实写在 §3.3 的残留里：
          被滚出去的那张不再「一直看得见」。2px 右内边距已在基线上留过（见 `.zone-status`），
          故纵向一滚不会连带长出横向滚动条。 */
       max-height: 45vh;
       overflow-y: auto;
     }
-    /* 摘要条在窄屏**显式两行**：标签一行，标题与展开钮一行。
+    /* 摘要条在这一档**显式两行**：标签一行，标题与展开钮一行。
        不显式分行、让 flex 自己折的话，430px 上量到的是「标题被压到 122px 宽、
        `· 2 个动作` 断在词中间」（标签 138 + 标题 160 + 钮 90 + 两道间距 = 408px > 370px），
        而标题恰好是这一行唯一要看的东西。 */
@@ -2052,40 +2697,36 @@
     .srow .expander {
       margin-left: auto;
     }
-    /* ── 对话时间线：窄屏它就是页面（没有自己的滚动条，只剩名牌 tab 的上留白） ── */
+    /* ── 对话时间线：这一档它就是页面（没有自己的滚动条，只剩名牌 tab 的上留白） ──
+       `margin-top: 14px` 是**它自己带的那一道行距**（页头→状态区那一对被省掉了；
+       状态区整块不渲染时，页头与它之间也正好是这一道——见 `.talk` 的 `gap: 0`）。 */
     .timeline {
-      order: 4;
+      order: 3;
       /* 不缩：内容多高就多高——去滚的是整页，不是它；余量归它，输入坞于是贴底 */
       flex: 1 0 auto;
-      /* 桌面那条 `overflow-y: auto` 也要撤掉：窄屏它一旦成了滚动容器，会长出来的
+      /* 桌面那条 `overflow-y: auto` 也要撤掉：这一档它一旦成了滚动容器，会长出来的
          是它自己而不是整页（滚轮到底也翻不过去），与这一档的版面整个相反 */
       overflow-y: visible;
       padding: 20px 2px 6px;
-    }
-    .turn p {
-      max-width: none;
-    }
-    /* 手机上每行字数少（约 31 个汉字），行距跟上走：1.6 是按桌面约 76 字符一行配的 */
-    .timeline .turn p {
-      line-height: 1.8;
+      margin-top: 14px;
     }
     /* ── 输入坞：钉在底栏上沿 ──
-       一行制：[空心底的输入框][实心发送] 同一行，提示语挪到下一行并**常驻**（出现时才占位
-       会把这颗钉底的框顶得上下跳）。`display: contents` 把桌面的 `.typer-foot` 拆开，
-       两个子元素各归各格——桌面款那一套排版因此逐像素不变，不必改标记。 */
+       一行制：[空心底的输入框][实心发送] 同一行。那一行提示语**整行撤掉**（决策 218
+       当日修订 ②）：它原先常驻是为了不上下跳，而现在它只在**断线**时出现——异常态才
+       跳一次，比常驻 19.2px 的死白划算（`grid-template-areas` 因此只剩一行）。
+       `display: contents` 把桌面的 `.typer-foot` 拆开，两个子元素各归各格——
+       桌面款那一套排版因此逐像素不变，不必改标记。 */
     .typer {
-      order: 5;
+      order: 4;
       flex: none;
       position: sticky;
       bottom: var(--sbar-h);
       z-index: 25;
       /* 名牌 tab 悬出框沿 16px，给它留出上沿（也给对话留出与输入坞的分界） */
-      margin-top: 26px;
+      margin-top: 40px;
       display: grid;
       grid-template-columns: minmax(0, 1fr) auto;
-      grid-template-areas:
-        'field send'
-        'hint hint';
+      grid-template-areas: 'field send';
       gap: 6px 10px;
     }
     .typer textarea {
@@ -2094,14 +2735,41 @@
     .typer-foot {
       display: contents;
     }
+    /* 空闲时这一行**不占高**（决策 218 修订 ⑤ / 220④） */
     .typer-foot .hint {
+      display: none;
       grid-area: hint;
-      min-height: 1.6em;
+    }
+    .typer.warn {
+      grid-template-areas:
+        'field send'
+        'hint hint';
+    }
+    .typer.warn .typer-foot .hint {
+      display: block;
     }
     .typer-foot .btn {
       grid-area: send;
       /* 与输入框齐高（44px 是触控底线，2 行输入框在 16px 字号下约 63px） */
       align-self: stretch;
+    }
+  }
+
+  /* ── 移动款（≤479px，与 `app.css` 的窄屏基线同档）：**只剩排版细调** ──
+     版面判据（页头收窄、钉住物、⋯ 菜单、回执默认态）一律走上面那条 899——两档同源
+     （决策 218 修订 ⑥）。这里留下的两条都是「每行字数少」引起的，与页宽无关。 */
+  @media (max-width: 479px) {
+    .turn p {
+      max-width: none;
+    }
+    /* 手机上每行字数少（约 31 个汉字），行距跟上走：1.6 是按桌面约 76 字符一行配的 */
+    .timeline .turn p {
+      line-height: 1.8;
+    }
+    /* 这一档 `app.css` 把 `body` 的底边距也换成了 `--sbar-h`（底栏实测高 = 42px + 安全区），
+       两个数从此相等——899 块里那条抵差额的负外边距因此归零（不改的话会白吃 4px）。 */
+    .talk {
+      margin-bottom: 0;
     }
   }
 </style>

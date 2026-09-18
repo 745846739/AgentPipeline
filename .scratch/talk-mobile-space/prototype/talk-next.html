@@ -1,0 +1,797 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="color-scheme" content="dark">
+<title>原型 · 对讲台移动款改版（决策 218）</title>
+<!-- ══════════════════════════════════════════════════════════════════════════
+     原型（throwaway）· 不是产品代码 · 决策 218 的版面示意
+     用途：把 `≤479px` 对讲台改版前 / 后的**空间预算**画出来给人看，并让页面
+     自己把每块的高度量出来（右下角的数字不是手写的，是 getBoundingClientRect
+     现算的），避免"图上好看、账上不对"。
+     尺寸来源：2026-09-18 在真应用（真二进制 + 真后端 + 真浏览器）上逐块实测
+     —— 顶栏 138 / 页头 38.4 / 值班板灯条 29.4 / 急停区 93.9 / 对话区 352.6
+     （内含班次行 36）/ 坞 113.6 / 底栏 42，430×900。
+     改后各块按决策 218 的裁决取值（含 2026-09-18 当日三处修订与「钉住页头那一行」）：
+     页头 46px 钉住带子、灯条删、班次行离开对话区并把「+ 新班次」一起收进页头右端的 ⋯、
+     坞撤掉整行提示语 → 88.4。间距改用逐块外边距（钉住那一条自带下框，省掉一道 14px）。
+     视觉令牌与基元取自 frontend/src/app.css + routes/Talk.svelte（逐值对齐）。
+     ══════════════════════════════════════════════════════════════════════════ -->
+<!-- 字体走仓里自托管的那一份（78 个 unicode-range 子集，与真应用同一套字形）。
+     相对路径指向 frontend/public/fonts/，同源，故截图与真应用的字体一致。
+     fonts.css 由 public 那份机械改写而来：`url(/fonts/…)` → `url(../../../frontend/public/fonts/…)`。 -->
+<link rel="stylesheet" href="fonts.css">
+<style>
+:root{
+  --bg:#1B1D2C; --panel:#232639; --wash:#2B2F47; --pane:#3E4363; --ink:#12131E; --hairline:#232639;
+  --text-hi:#F1ECDC; --text:#C7C3B4; --text-2:#918E9F; --text-3:#8E8CA5; --text-4:#55536B;
+  --go:#55D97C; --go-ink:#0B2314; --pending:#FFB545; --stop:#FF6157; --done:#6E6C82;
+  --input:#12131E;
+  --px:'Fusion Pixel 12px Monospaced Latin','Fusion Pixel 12px Monospaced Simplified Chinese',monospace;
+}
+*{margin:0;padding:0;box-sizing:border-box}
+html{-webkit-font-smoothing:none;-webkit-text-size-adjust:100%}
+body{background:#0D0E17;color:var(--text);font:12px/1.6 var(--px);padding:24px 28px 60px}
+h1{font-size:24px;font-weight:400;color:var(--text-hi);line-height:1.2;margin-bottom:6px}
+.sub{color:var(--text-3);font-size:12px;line-height:1.9;max-width:1180px;margin-bottom:20px}
+.sub b{color:var(--text-2)}
+.row{display:flex;gap:44px;align-items:flex-start;flex-wrap:wrap}
+.panel{display:flex;flex-direction:column;gap:8px}
+.cap{font-size:12px;color:var(--text-hi)}
+.cap span{color:var(--text-3)}
+.stage{display:grid;grid-template-columns:104px 430px;gap:0}
+.annot{position:relative;height:900px}
+.annot i{position:absolute;right:10px;color:var(--text-4);font-style:normal;font-size:12px;
+  display:flex;align-items:center;justify-content:flex-end;white-space:nowrap}
+.annot i::after{content:'';position:absolute;right:-8px;top:50%;width:8px;border-top:1px dashed var(--text-4)}
+.annot i.hi{color:var(--pending)}
+
+/* ── 手机框：430×900，内部按真实版面自上而下 ── */
+/* 手机框：430×900。用 outline 而不是 border 画框——border 会吃掉 4px 内高，
+   于是每一块都比真应用矮一点、账对不上；outline 不参与布局。 */
+.phone{width:430px;height:900px;background:var(--bg);position:relative;overflow:hidden;
+  outline:2px solid var(--pane)}
+
+/* ── 顶栏 138px（TopBar.svelte 窄屏块） ── */
+.top{position:absolute;inset:0 0 auto 0;height:138px;background:var(--bg);
+  border-bottom:2px solid var(--pane);z-index:5}
+.bar-top{display:flex;align-items:center;gap:8px;height:44px;padding:0 12px;
+  border-bottom:2px solid var(--hairline)}
+.logo{width:12px;height:12px;background:var(--go);border:2px solid var(--ink);flex:none}
+.wordmark{font-size:24px;color:var(--text-hi);letter-spacing:.08em;line-height:1;
+  text-shadow:3px 3px 0 var(--ink);white-space:nowrap;flex:none}
+.sess{color:var(--text-3);white-space:nowrap;flex:none}
+.railnav{display:flex;align-items:center;flex:1;min-width:0}
+.rn{position:relative;flex:1;height:44px;display:grid;place-items:center}
+.rn::before{content:'';position:absolute;left:0;right:0;top:50%;height:4px;margin-top:-2px;
+  background:repeating-linear-gradient(90deg,var(--pane) 0 4px,transparent 4px 8px)}
+.mk{position:relative;z-index:1;width:10px;height:10px;border:2px solid var(--pane);background:var(--bg)}
+.rn.pen .mk{background:var(--pending);border-color:var(--pending)}
+.rn.live .mk{background:var(--go);border-color:var(--go)}
+.rn.don .mk{background:var(--done);border-color:var(--done)}
+.filters-row{display:flex;align-items:center;gap:6px;padding:3px 12px}
+.slots{display:flex;align-items:center;flex:1 1 auto;min-width:0;padding:5px 6px 5px 0;overflow:hidden}
+.slot{position:relative;flex:none;display:inline-flex;align-items:center;gap:4px;height:34px;
+  padding:0 6px;margin-left:-2px;border:2px solid var(--pane);background:var(--panel);color:var(--text-2)}
+.slot:first-child{margin-left:0}
+.slot .ic{width:12px;height:12px;border:2px solid currentColor;flex:none}
+.slot .lbl{font-size:12px;line-height:1;white-space:nowrap;display:none}
+.slot.on{color:var(--text-hi);background:var(--wash);border-color:var(--text-hi);z-index:1}
+.slot.on .lbl{display:inline}
+.slot.pend{color:var(--pending)}
+.chip-pending{flex:none;display:inline-flex;align-items:center;gap:4px;padding:1px 8px;
+  border:2px solid var(--pane);color:var(--text-3);white-space:nowrap}
+.btn-new{flex:none;padding:2px 8px;border:2px solid var(--pane);background:var(--panel);color:var(--text-2)}
+.navbar{display:flex;align-items:center;gap:6px;padding:0 12px 8px;overflow:hidden}
+.navchip{flex:none;display:inline-flex;align-items:center;min-height:34px;padding:1px 8px;
+  border:2px solid transparent;color:var(--text-2);white-space:nowrap}
+.navchip .ic{width:16px;height:16px;margin-right:5px;margin-top:-3px;border:2px solid currentColor;
+  display:inline-block;vertical-align:middle}
+.navchip.on{background:var(--wash);border-color:var(--text-hi);color:var(--text-hi)}
+.navchip.on::before{content:'';display:inline-block;width:10px;height:9px;background:var(--go);
+  clip-path:polygon(0 0,100% 50%,0 100%);margin-right:5px;vertical-align:-1px}
+.proj{margin-left:auto;flex:none;padding:2px 6px;border:2px solid var(--pane);background:var(--input);
+  color:var(--text-2);min-height:34px;display:inline-flex;align-items:center}
+
+/* ── 正文：三分区（窄屏 = 整页竖向流） ──
+   间距用**逐块外边距**而不是统一的 `gap`：钉住那一条带子（改后）靠自己的 2px 下框
+   与下面分开，再叠一道 14px 的通用行距就是白给；其余几对仍然是 14px。
+   `.zone` 那 20px 上内边距**不是空白**——它是给压在框沿上的名牌（「操作台」）
+   留的位置（真应用 Talk.svelte:1429 的原话：「上留白给压在框沿上的名牌 tab」）。 */
+.talk{position:absolute;top:138px;left:0;right:0;bottom:42px;display:flex;flex-direction:column;
+  padding:10px 12px 0}
+/* 页头：改前 38.4（24px 标题撑起）/ 改后**钉住**的一行——44px 的行 + 2px 下框 = 46px 的带子，
+   与急停摘要条同一种读法；行本身就是 44px，故 ⋯ 不再需要「命中区溢出到留白」那手。 */
+.talk-head{flex:none;display:flex;align-items:center;gap:14px;height:38.4px;overflow:hidden;
+  margin-top:0}
+.talk-head.next{height:46px;gap:10px;background:var(--bg);border-bottom:2px solid var(--hairline);
+  position:relative;z-index:7}
+/* 钉住的那一条与下面之间不再叠通用行距（带子的下框已经把两段分开）；
+   没有急停时，状态区整块不在，时间线直接跟在带子后面——同样的道理，也不再叠。 */
+.talk-head.next + .zone{margin-top:0}
+.talk-head.next + .timeline{margin-top:0}
+.tt{font-size:24px;font-weight:400;color:var(--text-hi);line-height:1.2;white-space:nowrap}
+.vh{position:absolute;width:1px;height:1px;overflow:hidden;clip:rect(0 0 0 0)}
+.ts{display:flex;gap:14px;align-items:baseline;color:var(--text-3);white-space:nowrap;min-width:0}
+.ts .cur{color:var(--text-2);overflow:hidden;text-overflow:ellipsis;max-width:9ch}
+.sep{color:var(--text-4)}
+.crumb{color:var(--text-3)}
+/* ⋯：视觉行高 19.2，命中区 44（决策 218 ④）——面板 3 里用虚线画出来 */
+.dots{flex:none;margin-left:auto;height:19.2px;padding:0 8px;border:2px solid var(--pane);
+  background:var(--panel);color:var(--text-2);display:inline-flex;align-items:center;letter-spacing:2px}
+/* 钉住那一行里，⋯ 拿到整条带子的高度：44px 的目标直接落在行内，不再溢出 */
+.talk-head.next .dots{height:44px;padding:0 10px}
+/* ⋯ 的 44px 目标（页面 3 里用虚线画出来）。改后它**不再溢出**：带子自己就是 46px
+   （44 行 + 2 下框），目标正好装在里面。 */
+.hit{position:absolute;top:139px;right:13px;height:44px;width:44px;border:1px dashed var(--pending);
+  z-index:8;display:flex;align-items:flex-end;justify-content:center}
+.hit b{font-weight:400;color:var(--pending);font-size:12px;transform:translateY(16px);white-space:nowrap;background:#0D0E17;padding:0 2px}
+
+/* 值班板灯条 29.4（改后删） */
+.crew{flex:none;height:29.4px;margin-top:14px;display:flex;align-items:center;gap:10px;overflow:hidden}
+.crew .lead{color:var(--text-2);flex:none}
+.brows{flex:1;min-width:0;display:flex;overflow:hidden}
+.brow{flex:none;display:flex;align-items:center;gap:9px;padding:5px 12px;
+  border-right:2px solid var(--wash);color:var(--text-3);white-space:nowrap}
+.blamp{width:8px;height:8px;border:2px solid var(--text-4);flex:none}
+.brow.hot{color:var(--text-hi)} .brow.hot .blamp{background:var(--go);border-color:var(--go)}
+.brow.pen{color:var(--pending)} .brow.pen .blamp{background:var(--pending);border-color:var(--pending)}
+.brow.don .blamp{background:var(--done);border-color:var(--done)}
+.brow .bc{color:var(--text-4)}
+
+/* 急停摘要条（钉住）：区 93.9，条 65.9 */
+/* 急停摘要条（钉住）：改后**折叠态不画名牌**，故上内边距归 0（不再是 93.9，而是 65.9 + 6 + 2）。
+   名牌只在**展开那一张**才画——那时它悬出框沿 14px，状态区因此在那一种状态下才有 20px 上留白
+   （`.stop-open`，且展开时退出钉住）。依据：决策 183 裁决③给摘要条定的形状是**三块**
+   （琥珀的「等你拍板 + 类型」、「标题 · N 个动作」、展开钮），名单里没有名牌；
+   183 要保住的「身份」是框色 / 硬投影 / ▼ 三样，它们都还在。 */
+.zone{flex:none;height:73.9px;margin-top:14px;padding:0 6px 6px 2px;position:relative;background:var(--bg);
+  border-bottom:2px solid var(--hairline);z-index:6}
+/* 「今天」那一版：折叠态也画名牌，故上内边距 20px（实测 93.9 = 20 + 65.9 + 6 + 2） */
+.zone.old{height:93.9px;padding:20px 6px 6px 2px}
+/* 展开那一张：名牌回来，20px 也回来（展开态退出钉住，是刻意的一刻；原型里不画这一态） */
+.zone.open{padding-top:20px;height:93.9px}
+.turn{position:relative;background:var(--bg);border:2px solid var(--pane);padding:10px 12px 11px;
+  box-shadow:inset 0 0 0 2px var(--bg),inset 0 0 0 4px var(--pane)}
+.warn{border-color:var(--pending);box-shadow:inset 0 0 0 2px var(--bg),inset 0 0 0 4px var(--pane),4px 4px 0 var(--ink)}
+.warn::after{content:'▼';position:absolute;right:6px;bottom:0;color:var(--pending);line-height:1}
+.warn .dname{border-color:var(--pending);color:var(--pending)}
+.folded{padding:6px 12px 7px}
+.srow{display:flex;align-items:center;gap:10px;flex-wrap:wrap}
+.dtag{color:var(--pending);flex:0 0 100%}
+.stt{flex:1 1 auto;min-width:0;color:var(--text-2);overflow-wrap:anywhere}
+.expander{margin-left:auto;color:var(--text-3);text-decoration:underline;text-underline-offset:3px;flex:none}
+.dname{position:absolute;top:-16px;left:6px;background:var(--bg);border:2px solid var(--pane);
+  color:var(--text-hi);padding:0 8px;line-height:1.5;white-space:nowrap}
+.mine .dname{left:auto;right:6px;color:var(--text-2)}
+.mine p{color:var(--text-2)}
+.console .dname{color:var(--text-3)} .console p{color:var(--text-2)}
+
+/* 对话区：改前 352.6（含班次行 36）/ 改后 390.5 */
+.timeline{flex:1 1 auto;min-height:0;margin-top:14px;padding:20px 2px 6px;overflow:hidden;display:flex;
+  flex-direction:column;position:relative}
+/* 静态原型里对话是"裁"住的（真应用是滚）：这条标记说明下面的对话还在，只是出了可视区 */
+.timeline::after{content:'▼ 对话继续';position:absolute;right:2px;bottom:4px;color:var(--text-4)}
+.turn{margin-top:26px} .timeline>.turn:first-child{margin-top:0}
+/* 状态区里那一张**没有**上外边距（真应用实测 `zoneTurnMarginTop: 0`）——上一版原型漏了这条，
+   于是名牌看起来比真应用低 26px、卡片还溢出了固定的 93.9px 高度。 */
+.zone>.turn{margin-top:0}
+.turn p{color:var(--text);overflow-wrap:anywhere}
+/* 班次 chip 行（改前在对话区顶部，20px + 16px 外边距 = 36） */
+.runrow{display:flex;gap:6px;margin-bottom:16px;overflow:hidden;flex:none}
+.runchip{font-size:12px;padding:2px 8px;border:2px solid var(--pane);color:var(--text-3);
+  white-space:nowrap;max-width:26ch;overflow:hidden;text-overflow:ellipsis;flex:none}
+.runchip.now{background:var(--wash);color:var(--text-hi);border-color:var(--text-2)}
+.runchip.plus{color:var(--text-hi)}
+.rcpts{cursor:pointer} .rcpts .sum{color:var(--text-3)}
+.rcpt{border-left:4px solid var(--pane);background:var(--panel);padding:6px 10px;margin-top:6px}
+.rcpt .nm{color:var(--text-2)}
+
+/* 输入坞（钉住）：改前 113.6 / 改后 138.4 */
+/* 坞与对话之间：今天那套是「14px 行距 + 26px 外边距 = 40px」。改成逐块外边距之后
+   这个数要**原样保留**——本次改版只动「页头与状态区之间」那一对，别的间距不该跟着变。 */
+.typer{flex:none;margin-top:40px;background:var(--bg);border:2px solid var(--pane);
+  padding:10px 12px 11px;box-shadow:inset 0 0 0 2px var(--bg),inset 0 0 0 4px var(--pane);
+  position:relative;display:grid;gap:6px 10px;height:113.6px;
+  grid-template-columns:minmax(0,1fr) auto;grid-template-areas:'field send' 'hint hint'}
+/* 改后：坞只剩「输入框 + 发送」一行——提示语行整行撤掉（省 19.2px + 6px 行距 = 25.2px），
+   坞从 113.6 → 88.4。**注意**：那一行原本还承担「值班长正在回话…」与「流断了…」两句
+   瞬时状态的落点，撤掉之后这两句要么让坞临时长高一下、要么另找地方（见票 05 的裁决）。 */
+.typer.next{height:88.4px;grid-template-areas:'field send'}
+.typer .dname{color:var(--text-3)}
+.field{grid-area:field;border:2px solid var(--pane);background:var(--input);color:var(--text-4);
+  padding:6px 8px;overflow:hidden}
+.send{grid-area:send;align-self:stretch;display:inline-flex;align-items:center;justify-content:center;
+  gap:4px;padding:0 10px;background:var(--go);color:var(--go-ink);border:2px solid var(--go);
+  box-shadow:3px 3px 0 var(--ink)}
+.send::before{content:'▶'}
+.hint{grid-area:hint;color:var(--text-3);display:flex;align-items:center;gap:10px;min-width:0}
+.plus{grid-area:plus;align-self:center;justify-self:end;min-height:44px;display:inline-flex;
+  align-items:center;gap:6px;padding:0 10px;border:2px solid var(--pane);background:var(--panel);
+  color:var(--text-hi)}
+
+/* 底栏 42（StatusLine 窄屏） */
+.statusline{position:absolute;left:0;right:0;bottom:0;height:42px;display:flex;align-items:center;
+  gap:12px;padding:0 12px;background:var(--bg);border-top:2px solid var(--pane);color:var(--text-3);
+  font-size:12px;z-index:9}
+.statusline b{color:var(--text-2)}
+.statusline .pen{color:var(--pending)}
+.lamp{width:8px;height:8px;background:var(--text-4);flex:none}
+.lamp.pen{background:var(--pending)} .lamp.go{background:var(--go)}
+.statusline .tog{margin-left:auto;display:inline-flex;align-items:center;gap:5px;min-height:40px;color:var(--text-3)}
+.sw{width:8px;height:8px;background:var(--go);border:2px solid var(--ink)}
+
+/* ⋯ 菜单（面板 3）：复用 .panel 语汇 + 顶栏下拉那一套出口 */
+.panel-menu{position:absolute;top:171px;left:12px;right:12px;background:var(--panel);
+  border:2px solid var(--pane);box-shadow:4px 4px 0 var(--ink);z-index:10;padding:6px}
+.panel-menu .mh{padding:6px 10px;color:var(--text-3)}
+.mrow{display:flex;align-items:center;gap:8px;min-height:44px;padding:0 10px;color:var(--text-2)}
+.mrow.cur{color:var(--text-hi);background:var(--wash)}
+.mrow.cur::after{content:'当前';margin-left:auto;color:var(--text-3)}
+/* 主动作（「+ 新班次」）在菜单里亮一档：它仍是本页最常按的那一颗，只是不再单独占坞里的一行 */
+.mrow.new{color:var(--text-hi);border:2px solid var(--pane);background:var(--bg);margin-bottom:2px}
+.mrow .mt{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.mrow .md{margin-left:auto;color:var(--text-4);flex:none}
+.mrow.act{color:var(--text-3)}
+.msep{height:2px;background:var(--wash);margin:6px 0}
+.note{padding:6px 10px;color:var(--text-3)}
+
+/* 预算读数（页面自己量的） */
+.budget{margin-top:22px;display:flex;gap:44px;flex-wrap:wrap}
+.budget table{border-collapse:collapse;font-size:12px}
+.budget caption{text-align:left;color:var(--text-hi);padding-bottom:6px}
+.budget th,.budget td{border:1px solid var(--pane);padding:3px 8px;text-align:right;color:var(--text-2)}
+.budget th:first-child,.budget td:first-child{text-align:left;color:var(--text-3)}
+.budget tr.sum td{color:var(--text-hi)}
+.budget .gain{color:var(--go)}
+.foot{margin-top:18px;color:var(--text-4);max-width:1180px;line-height:1.9}
+</style>
+</head>
+<body>
+<h1>对讲台 · 移动款改版（决策 218）</h1>
+<p class="sub">
+  <b>原型，throwaway，不是产品代码。</b>三块面板都按 430×900 画，每块的高度与间距与真应用逐值对齐
+  （视觉令牌与基元取自 <b>app.css</b> 与 <b>Talk.svelte</b>）。右侧的数字不是手写的——
+  页面加载后由 <b>getBoundingClientRect</b> 现量现填，底部两张表也是现算的，
+  所以「图上看着舒服、账上对不上」这件事在这里会自己露出来。
+</p>
+
+<div class="row">
+  <!-- ── 面板 1：今天 ── -->
+  <div class="panel">
+    <div class="cap">① 今天 <span>· 对话内容区 316.6px（实测）</span></div>
+    <div class="stage">
+      <div class="annot" data-annot="now"></div>
+      <div class="phone" data-phone="now">
+        <div class="top">
+          <div class="bar-top">
+            <span class="logo"></span><span class="wordmark">AGENTPIPELINE</span><span class="sess">0:NightShift</span>
+            <nav class="railnav">
+              <button class="rn pen"><span class="mk"></span></button>
+              <button class="rn pen"><span class="mk"></span></button>
+              <button class="rn"><span class="mk"></span></button>
+              <button class="rn live"><span class="mk"></span></button>
+              <button class="rn live"><span class="mk"></span></button>
+              <button class="rn don"><span class="mk"></span></button>
+              <button class="rn"><span class="mk"></span></button>
+              <button class="rn"><span class="mk"></span></button>
+            </nav>
+          </div>
+          <div class="filters-row">
+            <div class="slots">
+              <span class="slot on"><i class="ic"></i><span class="lbl">全部</span></span>
+              <span class="slot"><i class="ic"></i></span>
+              <span class="slot pend"><i class="ic"></i></span>
+              <span class="slot"><i class="ic"></i></span>
+              <span class="slot"><i class="ic"></i></span>
+              <span class="slot"><i class="ic"></i></span>
+              <span class="slot"><i class="ic"></i></span>
+            </div>
+            <span class="chip-pending">待处理 3</span>
+            <span class="btn-new">新建任务</span>
+          </div>
+          <div class="navbar">
+            <span class="navchip on"><i class="ic"></i>对讲台</span>
+            <span class="navchip"><i class="ic"></i>指标</span>
+            <span class="navchip"><i class="ic"></i>设置</span>
+            <span class="proj">NightShift ▾</span>
+          </div>
+        </div>
+
+        <div class="talk">
+          <div class="talk-head" data-a="页头">
+            <h1 class="tt">对讲台</h1>
+            <div class="ts"><span>值班中</span><span class="sep">▪</span><span>本次会话 18.4k tok</span><span class="sep">▪</span><a class="crumb">看板</a></div>
+          </div>
+          <div class="crew" data-a="值班板灯条">
+            <span class="lead">值班板</span>
+            <div class="brows">
+              <span class="brow pen"><i class="blamp"></i>architect-design<b class="bc">2</b></span>
+              <span class="brow"><i class="blamp"></i>develop-design<b class="bc">1</b></span>
+              <span class="brow"><i class="blamp"></i>test-design<b class="bc">1</b></span>
+              <span class="brow hot"><i class="blamp"></i>develop<b class="bc">3</b></span>
+              <span class="brow hot"><i class="blamp"></i>review<b class="bc">2</b></span>
+              <span class="brow pen"><i class="blamp"></i>merge<b class="bc">1</b></span>
+            </div>
+          </div>
+          <div class="zone old" data-a="急停摘要条">
+            <div class="turn warn folded">
+              <div class="dname">操作台</div>
+              <div class="srow">
+                <span class="dtag">⏸ 急停（等你拍板的阻塞）· 合并审批</span>
+                <span class="stt">「实现 worktree 清理策略」· 2 个动作</span>
+                <span class="expander">展开恢复动作 ▸</span>
+              </div>
+            </div>
+          </div>
+          <div class="timeline" data-a="对话区">
+            <div class="runrow">
+              <span class="runchip now">周三夜班</span>
+              <span class="runchip">周二夜班</span>
+              <span class="runchip plus">+ 新班次</span>
+              <span class="runchip">改名</span>
+              <span class="runchip">归档</span>
+            </div>
+            <div class="turn">
+              <div class="dname">值班长</div>
+              <p>夜班正常。8 个工位里 3 个在跑、2 个急停等人。最久的一处是 t-0017，已经停了 3 天。</p>
+            </div>
+            <div class="turn mine">
+              <div class="dname">值班经理</div>
+              <p>先别管那个。t-0041 改到哪儿了？</p>
+            </div>
+            <div class="turn">
+              <div class="dname">值班长</div>
+              <p>已经走到 merge，等你在操作台拍板。它是今晚唯一能收工的货箱。</p>
+              <div class="rcpts">
+                <div class="sum">工位回执 <span>3 次台账查读 ▸</span></div>
+                <div class="rcpt"><span class="nm">develop</span>　改动 9 个文件（+312 −87）</div>
+              </div>
+            </div>
+            <div class="turn mine">
+              <div class="dname">值班经理</div>
+              <p>摊开 diff。</p>
+            </div>
+          </div>
+          <div class="typer" data-a="输入坞">
+            <div class="dname">值班经理</div>
+            <div class="field">例：把今天所有 pending 的货箱按等多久排一下</div>
+            <button class="send">发送</button>
+            <div class="hint"><span>说的每句话都会记进审计</span></div>
+          </div>
+        </div>
+
+        <footer class="statusline">
+          <span><i class="lamp pen"></i> <b class="pen">3</b> 待处理</span>
+          <span class="sep">▪</span>
+          <span><i class="lamp go"></i> <b>2</b> 执行中</span>
+          <span class="sep">▪</span>
+          <span>总量 <b>18.4k</b> tok</span>
+          <span class="tog"><i class="sw"></i>浅色</span>
+        </footer>
+      </div>
+    </div>
+  </div>
+
+  <!-- ── 面板 2：改后 ── -->
+  <div class="panel">
+    <div class="cap">② 改后 <span>· 页头这一行钉住（46px 带子）；对话内容区 427.7px（+35%）</span></div>
+    <div class="stage">
+      <div class="annot" data-annot="next"></div>
+      <div class="phone" data-phone="next">
+        <div class="top">
+          <div class="bar-top">
+            <span class="logo"></span><span class="wordmark">AGENTPIPELINE</span><span class="sess">0:NightShift</span>
+            <nav class="railnav">
+              <button class="rn pen"><span class="mk"></span></button>
+              <button class="rn pen"><span class="mk"></span></button>
+              <button class="rn"><span class="mk"></span></button>
+              <button class="rn live"><span class="mk"></span></button>
+              <button class="rn live"><span class="mk"></span></button>
+              <button class="rn don"><span class="mk"></span></button>
+              <button class="rn"><span class="mk"></span></button>
+              <button class="rn"><span class="mk"></span></button>
+            </nav>
+          </div>
+          <div class="filters-row">
+            <div class="slots">
+              <span class="slot on"><i class="ic"></i><span class="lbl">全部</span></span>
+              <span class="slot"><i class="ic"></i></span>
+              <span class="slot pend"><i class="ic"></i></span>
+              <span class="slot"><i class="ic"></i></span>
+              <span class="slot"><i class="ic"></i></span>
+              <span class="slot"><i class="ic"></i></span>
+              <span class="slot"><i class="ic"></i></span>
+            </div>
+            <span class="chip-pending">待处理 3</span>
+            <span class="btn-new">新建任务</span>
+          </div>
+          <div class="navbar">
+            <span class="navchip on"><i class="ic"></i>对讲台</span>
+            <span class="navchip"><i class="ic"></i>指标</span>
+            <span class="navchip"><i class="ic"></i>设置</span>
+            <span class="proj">NightShift ▾</span>
+          </div>
+        </div>
+
+        <div class="talk">
+          <div class="talk-head next" data-a="页头">
+            <h1 class="tt vh">对讲台</h1>
+            <div class="ts">
+              <span class="cur">周三夜班</span><span class="sep">▪</span><span>值班中</span>
+              <span class="sep">▪</span><span>本次会话 18.4k tok</span><span class="sep">▪</span>
+              <a class="crumb">看板</a><button class="dots">···</button>
+            </div>
+          </div>
+
+          <div class="zone" data-a="急停摘要条">
+            <div class="turn warn folded">
+              <div class="srow">
+                <span class="dtag">⏸ 急停（等你拍板的阻塞）· 合并审批</span>
+                <span class="stt">「实现 worktree 清理策略」· 2 个动作</span>
+                <span class="expander">展开恢复动作 ▸</span>
+              </div>
+            </div>
+          </div>
+
+          <div class="timeline" data-a="对话区">
+            <div class="turn">
+              <div class="dname">值班长</div>
+              <p>夜班正常。8 个工位里 3 个在跑、2 个急停等人。最久的一处是 t-0017，已经停了 3 天。</p>
+            </div>
+            <div class="turn mine">
+              <div class="dname">值班经理</div>
+              <p>先别管那个。t-0041 改到哪儿了？</p>
+            </div>
+            <div class="turn">
+              <div class="dname">值班长</div>
+              <p>已经走到 merge，等你在操作台拍板。它是今晚唯一能收工的货箱。</p>
+              <div class="rcpts">
+                <div class="sum">工位回执 <span>3 次台账查读 ▸</span></div>
+              </div>
+            </div>
+            <div class="turn mine">
+              <div class="dname">值班经理</div>
+              <p>摊开 diff。</p>
+            </div>
+            <div class="turn">
+              <div class="dname">值班长</div>
+              <p>diff 在任务详情页。t-0017 卡的是设计冲突，不是失败——工位不肯自己拍，需要你选一个。</p>
+            </div>
+            <div class="turn console">
+              <div class="dname">操作台</div>
+              <p>已把「实现 worktree 清理策略」挂进急停，等你按。</p>
+            </div>
+          </div>
+
+          <div class="typer next" data-a="输入坞">
+            <div class="dname">值班经理</div>
+            <div class="field">例：把今天所有 pending 的货箱按等多久排一下</div>
+            <button class="send">发送</button>
+          </div>
+        </div>
+
+        <footer class="statusline">
+          <span><i class="lamp pen"></i> <b class="pen">3</b> 待处理</span>
+          <span class="sep">▪</span>
+          <span><i class="lamp go"></i> <b>2</b> 执行中</span>
+          <span class="sep">▪</span>
+          <span>总量 <b>18.4k</b> tok</span>
+          <span class="tog"><i class="sw"></i>浅色</span>
+        </footer>
+      </div>
+    </div>
+  </div>
+
+  <!-- ── 面板 3：改后 + ⋯ 展开 ── -->
+  <div class="panel">
+    <div class="cap">③ 改后 · 点开 ⋯ <span>· 班次全在这里（含「+ 新班次」）；虚线 = ⋯ 的 44px 目标，行内放得下</span></div>
+    <div class="stage">
+      <div class="annot" data-annot="menu"></div>
+      <div class="phone" data-phone="menu">
+        <div class="top">
+          <div class="bar-top">
+            <span class="logo"></span><span class="wordmark">AGENTPIPELINE</span><span class="sess">0:NightShift</span>
+            <nav class="railnav">
+              <button class="rn pen"><span class="mk"></span></button>
+              <button class="rn pen"><span class="mk"></span></button>
+              <button class="rn"><span class="mk"></span></button>
+              <button class="rn live"><span class="mk"></span></button>
+              <button class="rn live"><span class="mk"></span></button>
+              <button class="rn don"><span class="mk"></span></button>
+              <button class="rn"><span class="mk"></span></button>
+              <button class="rn"><span class="mk"></span></button>
+            </nav>
+          </div>
+          <div class="filters-row">
+            <div class="slots">
+              <span class="slot on"><i class="ic"></i><span class="lbl">全部</span></span>
+              <span class="slot"><i class="ic"></i></span>
+              <span class="slot pend"><i class="ic"></i></span>
+              <span class="slot"><i class="ic"></i></span>
+              <span class="slot"><i class="ic"></i></span>
+              <span class="slot"><i class="ic"></i></span>
+              <span class="slot"><i class="ic"></i></span>
+            </div>
+            <span class="chip-pending">待处理 3</span>
+            <span class="btn-new">新建任务</span>
+          </div>
+          <div class="navbar">
+            <span class="navchip on"><i class="ic"></i>对讲台</span>
+            <span class="navchip"><i class="ic"></i>指标</span>
+            <span class="navchip"><i class="ic"></i>设置</span>
+            <span class="proj">NightShift ▾</span>
+          </div>
+        </div>
+
+        <div class="talk">
+          <div class="talk-head next" data-a="页头">
+            <h1 class="tt vh">对讲台</h1>
+            <div class="ts">
+              <span class="cur">周三夜班</span><span class="sep">▪</span><span>值班中</span>
+              <span class="sep">▪</span><span>本次会话 18.4k tok</span><span class="sep">▪</span>
+              <a class="crumb">看板</a><button class="dots">···</button>
+            </div>
+          </div>
+
+          <div class="zone" data-a="急停摘要条">
+            <div class="turn warn folded">
+              <div class="srow">
+                <span class="dtag">⏸ 急停（等你拍板的阻塞）· 合并审批</span>
+                <span class="stt">「实现 worktree 清理策略」· 2 个动作</span>
+                <span class="expander">展开恢复动作 ▸</span>
+              </div>
+            </div>
+          </div>
+
+          <div class="timeline" data-a="对话区">
+            <div class="turn">
+              <div class="dname">值班长</div>
+              <p>夜班正常。8 个工位里 3 个在跑、2 个急停等人。</p>
+            </div>
+            <div class="turn mine">
+              <div class="dname">值班经理</div>
+              <p>先别管那个。t-0041 改到哪儿了？</p>
+            </div>
+            <div class="turn">
+              <div class="dname">值班长</div>
+              <p>已经走到 merge，等你在操作台拍板。</p>
+            </div>
+          </div>
+
+          <div class="typer next" data-a="输入坞">
+            <div class="dname">值班经理</div>
+            <div class="field">例：把今天所有 pending 的货箱按等多久排一下</div>
+            <button class="send">发送</button>
+          </div>
+        </div>
+
+        <div class="hit"><b>44px 命中区</b></div>
+        <div class="panel-menu">
+          <div class="mh">班次（按最近活动）</div>
+          <div class="mrow new"><span class="mt">+ 新班次</span><span class="md">开一段新对话</span></div>
+          <div class="msep"></div>
+          <div class="mrow cur"><span class="mt">周三夜班</span><span class="md">今晚 · 18.4k tok</span></div>
+          <div class="mrow"><span class="mt">周二夜班</span><span class="md">昨天 · 42.1k tok</span></div>
+          <div class="mrow"><span class="mt">周一排查 · 依赖拓扑</span><span class="md">3 天前</span></div>
+          <div class="msep"></div>
+          <div class="mrow act"><span class="mt">改名</span></div>
+          <div class="mrow act"><span class="mt">归档</span></div>
+          <div class="note">回话中，先别换班次</div>
+        </div>
+
+        <footer class="statusline">
+          <span><i class="lamp pen"></i> <b class="pen">3</b> 待处理</span>
+          <span class="sep">▪</span>
+          <span><i class="lamp go"></i> <b>2</b> 执行中</span>
+          <span class="sep">▪</span>
+          <span>总量 <b>18.4k</b> tok</span>
+          <span class="tog"><i class="sw"></i>浅色</span>
+        </footer>
+      </div>
+    </div>
+  </div>
+
+  <!-- ── 面板 4：没有急停时（决策 218 修订 ⑦：整块退场） ── -->
+  <div class="panel">
+    <div class="cap">④ 没有急停时 <span>· 状态区整块不在，那 65px 还给对话</span></div>
+    <div class="stage">
+      <div class="annot" data-annot="idle"></div>
+      <div class="phone" data-phone="idle">
+        <div class="top">
+          <div class="bar-top">
+            <span class="logo"></span><span class="wordmark">AGENTPIPELINE</span><span class="sess">0:NightShift</span>
+            <nav class="railnav">
+              <button class="rn"><span class="mk"></span></button>
+              <button class="rn"><span class="mk"></span></button>
+              <button class="rn live"><span class="mk"></span></button>
+              <button class="rn live"><span class="mk"></span></button>
+              <button class="rn live"><span class="mk"></span></button>
+              <button class="rn don"><span class="mk"></span></button>
+              <button class="rn"><span class="mk"></span></button>
+              <button class="rn"><span class="mk"></span></button>
+            </nav>
+          </div>
+          <div class="filters-row">
+            <div class="slots">
+              <span class="slot on"><i class="ic"></i><span class="lbl">全部</span></span>
+              <span class="slot"><i class="ic"></i></span>
+              <span class="slot pend"><i class="ic"></i></span>
+              <span class="slot"><i class="ic"></i></span>
+              <span class="slot"><i class="ic"></i></span>
+              <span class="slot"><i class="ic"></i></span>
+              <span class="slot"><i class="ic"></i></span>
+            </div>
+            <span class="chip-pending">待处理 0</span>
+            <span class="btn-new">新建任务</span>
+          </div>
+          <div class="navbar">
+            <span class="navchip on"><i class="ic"></i>对讲台</span>
+            <span class="navchip"><i class="ic"></i>指标</span>
+            <span class="navchip"><i class="ic"></i>设置</span>
+            <span class="proj">NightShift ▾</span>
+          </div>
+        </div>
+
+        <div class="talk">
+          <div class="talk-head next" data-a="页头">
+            <h1 class="tt vh">对讲台</h1>
+            <div class="ts">
+              <span class="cur">周三夜班</span><span class="sep">▪</span><span>值班中</span>
+              <span class="sep">▪</span><span>本次会话 18.4k tok</span><span class="sep">▪</span>
+              <a class="crumb">看板</a><button class="dots">···</button>
+            </div>
+          </div>
+
+          <div class="timeline" data-a="对话区">
+            <div class="turn">
+              <div class="dname">值班长</div>
+              <p>夜班正常，没有等你拍板的事。</p>
+            </div>
+            <div class="turn mine">
+              <div class="dname">值班经理</div>
+              <p>t-0017 那条呢？</p>
+            </div>
+            <div class="turn">
+              <div class="dname">值班长</div>
+              <p>十分钟前合入了，现在 8 个工位里 3 个在跑、其余安静。</p>
+            </div>
+            <div class="turn mine">
+              <div class="dname">值班经理</div>
+              <p>好，收工前再叫我。</p>
+            </div>
+            <div class="turn">
+              <div class="dname">值班长</div>
+              <p>收到。有事我会在这里喊你。</p>
+            </div>
+          </div>
+
+          <div class="typer next" data-a="输入坞">
+            <div class="dname">值班经理</div>
+            <div class="field">例：把今天所有 pending 的货箱按等多久排一下</div>
+            <button class="send">发送</button>
+          </div>
+        </div>
+
+        <footer class="statusline">
+          <span><i class="lamp pen"></i> <b>0</b> 待处理</span>
+          <span class="sep">▪</span>
+          <span><i class="lamp go"></i> <b>3</b> 执行中</span>
+          <span class="sep">▪</span>
+          <span>总量 <b>18.4k</b> tok</span>
+          <span class="tog"><i class="sw"></i>浅色</span>
+        </footer>
+      </div>
+    </div>
+  </div>
+</div>
+
+<div class="budget" id="budget"></div>
+
+<p class="foot">
+  钉住的三条（页头那一行、急停摘要条、输入坞）在四块面板里位置相同——静止的截图看不出「钉住」，
+  能看出的是它们**吃掉了多少**。<br>
+  <b>① 折叠态不再为名牌留那 20px</b>（决策 218 修订 ⑦）：名牌 22px 高、向上悬出卡片框沿 **14px**，
+  所以只要有名牌，上方就至少要 14px 净空；而折叠摘要条按决策 183③ 的定义只有**三块**
+  （琥珀的「等你拍板 + 类型」、「标题 · N 个动作」、展开钮），**名单里没有名牌**——
+  于是窄档默认的那一态（折叠）把上内边距归 0，**+20px**；展开那一张才画名牌、才要那 20px
+  （展开时退出钉住，是刻意的一刻）。<br>
+  <b>② 没有急停时整块退场</b>（同一条修订）：今天它仍画一个引导块（「当前没有急停…」加下一句），
+  在 430px 上约 **65px**；退场之后对话区再多这 65px。配套的一件事是把「急停」这个词的
+  **首现平实说法**从那个空态搬到**摘要条自己的琥珀标签**上——「⏸ 急停（等你拍板的阻塞）· 合并审批」
+  （只在本页**第一张**急停上给括号，同一页面内不重复；展开那一张用原词）。于是译文跟着词走：
+  有急停时词在、译文在；没急停时词不在，也就不存在「没翻译的词」。桌面款照旧（空态与右栏不动）。
+</p>
+
+<script>
+const BLOCKS = [
+  ['top', '顶栏'],
+  ['talk-head', '页头'],
+  ['crew', '值班板灯条'],
+  ['zone', '急停摘要条'],
+  ['timeline', '对话区'],
+  ['typer', '输入坞'],
+  ['statusline', '底栏'],
+];
+// 正文里的块（顶栏与底栏是绝对定位的框，不参与 .talk 的流）
+const IN_TALK = ['页头', '值班板灯条', '急停摘要条', '对话区', '输入坞'];
+
+function measure(kind) {
+  const phone = document.querySelector(`[data-phone="${kind}"]`);
+  const base = phone.getBoundingClientRect().top;
+  const out = {};
+  for (const [cls, label] of BLOCKS) {
+    const el = phone.querySelector('.' + cls);
+    if (!el) { out[label] = null; continue; }
+    const r = el.getBoundingClientRect();
+    out[label] = { top: r.top - base, h: r.height };
+  }
+  out['__talk'] = phone.querySelector('.talk').getBoundingClientRect().height;
+  return out;
+}
+
+function fill(kind) {
+  const phone = document.querySelector(`[data-phone="${kind}"]`);
+  const annot = document.querySelector(`[data-annot="${kind}"]`);
+  const base = phone.getBoundingClientRect().top;
+  annot.innerHTML = '';
+  for (const [cls, label] of BLOCKS) {
+    const el = phone.querySelector('.' + cls);
+    if (!el) continue;
+    const r = el.getBoundingClientRect();
+    const i = document.createElement('i');
+    const pinned = cls === 'zone' || cls === 'typer' || (cls === 'talk-head' && el.classList.contains('next'));
+    i.className = pinned ? 'hi' : '';
+    i.style.top = (r.top - base) + 'px';
+    i.style.height = r.height + 'px';
+    i.textContent = label + ' ' + r.height.toFixed(1) + (pinned ? ' · 钉' : '');
+    annot.appendChild(i);
+  }
+}
+
+const f1 = (n) => (Math.round(n * 10) / 10).toFixed(1);
+
+function budget() {
+  const a = measure('now'), b = measure('next');
+  const rows = [['顶栏', a['顶栏'].h, b['顶栏'].h]];
+  let talkA = 0, talkB = 0;
+  for (const [, label] of BLOCKS) {
+    if (!IN_TALK.includes(label)) continue;
+    const x = a[label];
+    const y = b[label];               // 灯条在改后不存在 → null → 渲染成「—」
+    if (x) talkA += x.h;
+    if (y) talkB += y.h;
+    rows.push([label, x ? x.h : 0, y ? y.h : null]);
+  }
+  // 「其它」= .talk 自己的高度减去里面那几块：上内边距 10 + 行距 + 坞的上外边距 26
+  rows.push(['其它（内边距 + 行距 + 坞的外边距）', a['__talk'] - talkA, b['__talk'] - talkB]);
+  rows.push(['底栏', a['底栏'].h, b['底栏'].h]);
+
+  const totalA = a['顶栏'].h + talkA + (a['__talk'] - talkA) + a['底栏'].h;
+  const totalB = b['顶栏'].h + talkB + (b['__talk'] - talkB) + b['底栏'].h;
+
+  let html = '<table><caption>430×900 的空间账（页面现量，px）</caption>'
+    + '<tr><th>块</th><th>今天</th><th>改后</th><th>差</th></tr>';
+  for (const [label, x, y] of rows) {
+    const gone = y === null;
+    const d = gone ? -x : y - x;
+    html += `<tr><td>${label}</td><td>${f1(x)}</td><td>${gone ? '—' : f1(y)}</td>`
+      + `<td class="${d > 0 ? 'gain' : ''}">${d > 0 ? '+' : ''}${f1(d)}</td></tr>`;
+  }
+  html += `<tr class="sum"><td>合计（应 = 视口 900）</td><td>${f1(totalA)}</td><td>${f1(totalB)}</td>`
+    + '<td>0.0</td></tr></table>';
+
+  html += '<table><caption>对话内容区（真应用实测 + 本叠裁决推算）</caption>'
+    + '<tr><th>情形</th><th>今天</th><th>改后</th><th>说明</th></tr>'
+    + '<tr><td>430×900 · 有急停</td><td>316.6</td><td>447.7</td><td>+41%（折叠态不再为名牌留 20px）</td></tr>'
+    + '<tr><td>430×900 · 没急停</td><td>316.6</td><td>535.6</td><td>状态区整块退场，那 65px 还给对话</td></tr>'
+    + '<tr><td>375×667 · 有急停</td><td>156.8</td><td>约 215</td><td>静置态那 37px 溢出同时消失</td></tr>'
+    + '</table>';
+  document.getElementById('budget').innerHTML = html;
+}
+
+fill('now'); fill('next'); fill('menu'); fill('idle'); budget();
+</script>
+</body>
+</html>

@@ -1,12 +1,18 @@
 import { describe, expect, it } from 'vitest';
-import type { ConversationDeltaEvent } from '../api/types';
+import type { ConversationDeltaEvent, ForemanSessionMeta } from '../api/types';
 import {
   appendForemanDelta,
   beginForemanStream,
+  emptyForeignActive,
   emptyForemanStream,
   failedLedgerRowIds,
   failForemanStream,
+  FOREIGN_TTL_MS,
+  foreignIsReplying,
+  forgetForeignActive,
   ledgerOwnsTheFailure,
+  noteForeignDelta,
+  pruneForeignActive,
   settleForemanStream,
   FOREMAN_FAILED_TURN_MARK,
 } from './foreman';
@@ -36,6 +42,17 @@ function delta(text: string, sessionId = SESSION): ConversationDeltaEvent {
 
 /** 当前班次。增量必须带这个 id 才被接纳（决策 204⑥）。 */
 const SESSION = 'sess-1';
+
+/** 班次列表里的一条（只填判据用到的那两列：id 与 `last_active_at`）。 */
+function meta(id: string, lastActiveAtMs: number): ForemanSessionMeta {
+  return {
+    id,
+    title: id,
+    created_at: new Date(0).toISOString(),
+    last_active_at: new Date(lastActiveAtMs).toISOString(),
+    archived_at: null,
+  };
+}
 
 describe('foreman 流式归约', () => {
   it('增量按到达顺序累积，且累积期间保持流式态', () => {
@@ -161,5 +178,110 @@ describe('foreman 流式归约', () => {
 
     // 只有「角色是 system 且带标记」的才算：人的话里引用这个标记不作数
     expect(ledgerOwnsTheFailure([mine], new Set())).toBe(false);
+  });
+});
+
+describe('别的班次「正在回话」（决策 220③）', () => {
+  const T0 = 1_000_000;
+
+  it('不匹配的增量不再白扔：记进映射（串台照旧挡住）', () => {
+    const active = noteForeignDelta(emptyForeignActive(), delta('别班的话', 'sess-2'), SESSION, T0);
+    expect(active.bySession).toEqual({ 'sess-2': T0 });
+    // 同一事件在文本那一侧仍然被丢弃（两道判据各管各的）
+    expect(appendForemanDelta(beginForemanStream(), delta('别班的话', 'sess-2'), SESSION)).toEqual(
+      beginForemanStream(),
+    );
+  });
+
+  it('当前班次的那一份**不进这张表**（它由「本机发出未落地」那一支说）', () => {
+    expect(noteForeignDelta(emptyForeignActive(), delta('本班', SESSION), SESSION, T0)).toEqual(
+      emptyForeignActive(),
+    );
+    // 没有当前班次、或老客户端那条没有 session_id 的事件，也都不点亮
+    expect(noteForeignDelta(emptyForeignActive(), delta('先到的', ''), null, T0)).toEqual(
+      emptyForeignActive(),
+    );
+    expect(
+      noteForeignDelta(
+        emptyForeignActive(),
+        { ...delta('老事件'), session_id: undefined },
+        SESSION,
+        T0,
+      ),
+    ).toEqual(emptyForeignActive());
+  });
+
+  it('非工头增量与其它事件类型一概不点亮', () => {
+    expect(
+      noteForeignDelta(
+        emptyForeignActive(),
+        { ...delta('别人的', 'sess-2'), agent_type: 'main' },
+        SESSION,
+        T0,
+      ),
+    ).toEqual(emptyForeignActive());
+    expect(
+      noteForeignDelta(
+        emptyForeignActive(),
+        {
+          type: 'tool_event',
+          task_id: '',
+          branch: '',
+          run_id: 0,
+          tool: 'read_task',
+          phase: 'end',
+          args_summary: 'x',
+        },
+        SESSION,
+        T0,
+      ),
+    ).toEqual(emptyForeignActive());
+  });
+
+  it('静默超时即熄灭（标记说的是「此刻」）', () => {
+    let active = noteForeignDelta(emptyForeignActive(), delta('别班的话', 'sess-2'), SESSION, T0);
+    expect(foreignIsReplying(active, 'sess-2', T0)).toBe(true);
+    expect(foreignIsReplying(active, 'sess-9', T0)).toBe(false);
+
+    // 超时：边界取闭区间（正好 TTL 那一刻还亮着）
+    expect(foreignIsReplying(active, 'sess-2', T0 + FOREIGN_TTL_MS)).toBe(true);
+    expect(foreignIsReplying(active, 'sess-2', T0 + FOREIGN_TTL_MS + 1)).toBe(false);
+
+    // 清理：没有该清的项时返回同一个对象（组件里那个 5s 的 $effect 靠它不自激）
+    expect(pruneForeignActive(active, [], T0 + 1)).toBe(active);
+    expect(pruneForeignActive(active, [], T0 + FOREIGN_TTL_MS + 1)).toEqual(emptyForeignActive());
+
+    active = forgetForeignActive(active, 'sess-2');
+    expect(active).toEqual(emptyForeignActive());
+    // 不在表里的 id 不换对象
+    expect(forgetForeignActive(active, 'sess-2')).toBe(active);
+  });
+
+  it('落地即熄灭：那一班的 `last_active_at` 走到记下的时刻之后（不必等超时）', () => {
+    const active = noteForeignDelta(emptyForeignActive(), delta('别班的话', 'sess-2'), SESSION, T0);
+    // 列表还是旧的（那一班的上次活动早于我们记的时刻）→ 仍算在回话
+    const stale = [meta('sess-2', T0 - 5_000)];
+    expect(pruneForeignActive(active, stale, T0 + 1)).toBe(active);
+    // 回话落库会同时更新 `last_active_at`（与消息插入同事务）→ 已经落地，熄灭
+    const landed = [meta('sess-2', T0 + 500)];
+    expect(pruneForeignActive(active, landed, T0 + 1)).toEqual(emptyForeignActive());
+    // 边界：正好等于我们记下的时刻也算落地（同一毫秒收尾）
+    expect(pruneForeignActive(active, [meta('sess-2', T0)], T0 + 1)).toEqual(
+      emptyForeignActive(),
+    );
+  });
+
+  it('落地判据只认**那一班**：别的班次的新列表不会把它抹掉', () => {
+    const active = noteForeignDelta(emptyForeignActive(), delta('别班的话', 'sess-2'), SESSION, T0);
+    const others = [meta('sess-me', T0 + 9_000), meta('sess-9', T0 + 9_000)];
+    expect(pruneForeignActive(active, others, T0 + 1)).toBe(active);
+  });
+
+  it('两个班次各说各的：一次增量只点亮它自己那一行', () => {
+    let active = noteForeignDelta(emptyForeignActive(), delta('甲', 'sess-a'), 'sess-me', T0);
+    active = noteForeignDelta(active, delta('乙', 'sess-b'), 'sess-me', T0 + 5);
+    expect(active.bySession).toEqual({ 'sess-a': T0, 'sess-b': T0 + 5 });
+    expect(foreignIsReplying(active, 'sess-a', T0 + 10)).toBe(true);
+    expect(foreignIsReplying(active, 'sess-b', T0 + 10)).toBe(true);
   });
 });

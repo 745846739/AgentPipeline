@@ -37,8 +37,20 @@
 > | `hero` 轨道 | **容器内横向滚**，不裁切、不把滚动传给文档 | §6.1（同上的裁决框） |
 > | 状态行档位 | `480–748` 隐三格 `.dep`；`480–560` 再隐量表；容器 `overflow-x: auto` 兜底 | 已落地，见 §12.3 索引表那一行 |
 >
+> **折行档（`480–899px`）的控件形态（决策 218 补，2026-09-18）：**上面那张表说的是**栏数**，
+> 而这一档的**控件形态**同一时刻整体换过一遍——页头收成一行（`<h1>` 转 visually-hidden）+ 右端
+> ⋯ 班次菜单、**不画**值班板灯条、工位回执默认收起、输入坞撤掉提示语那一行、单张急停也折、
+> 页头做成 **46px 的钉住带子**（这一档共三只钉住物）。**三个断点自此各司其职**：`899` 同时管
+> 「时间线折成一列」「页头 ⋯ 与折行档版面」「`forceFold`」（一个断点三处用），`1099` 管右栏
+> 280 → 340，`479` 只剩输入框占位语一处用它。断点常量住在 `frontend/src/lib/talkLayout.ts`
+> 一处，`talkLayout.test.ts` 把它与 `Talk.svelte` 里的 CSS 字面量对着钉。生效口径见
+> `design/theme-6-pixel.md` §3.3 的「修订决策 218 / 220」那一段（含逐块处置表与实测数）。
+>
 > **移动款（`≤479px`）既有版面一字不动**——决策 192 / 208 的口径只在那里适用；
 > 折行那一档复用的是它的三条规则，不是把它抬上来。
+> **（2026-09-18 / 决策 218 修订：这一句已不成立。）**这一档的版面本就是按重排后的形状重写的
+> （折行档与窄档同源），且窄档自己动了四处：值班板灯条不再画、坞的提示语那一行撤掉、页头收成
+> 一行**并钉住**（钉住物由两只变三只）、单张急停也折（`forceFold` 的断点从 `479` 扩到 `899`）。
 
 > **修订（2026-09-18「ux-audit-2」第二轮审计 / 决策 216–217）：动作的确认与量级，以及中流状态去哪儿。**
 > 这一轮还翻出两件「规格没写、实现各按各的来」的事，两件都**不动版面**：
@@ -668,6 +680,11 @@ GET /tasks/{id}               → 详情页装载 + 断线重连后的全量校�
   （§5.3）**一律用平实词、不翻译**（票 21）；翻译只服务**其余正文**。
 - 词表与译法的同步落点：`docs/glossary.md` 的「视觉语汇」一节（按同样的说法填一列），
   两处必须一致。
+- **「急停」的首现落点在 `≤899px` 一档搬过位置（决策 218 ⑦b）：**那一档「一张急停都没有时
+  状态区整块退场」，原先承载这个译文的空态因此不在了；译文随之**搬到摘要条自己的琥珀标签**
+  （`⏸ 急停（等你拍板的阻塞）· 合并审批`，只在本页**第一张**急停上给括号，页面内仍不重复）。
+  译文跟着词走：有急停则词在译文在，没有急停则词不在、也就没有「没被翻译的词」——与本页既有的
+  「`工位` 的译文只落在桌面那一行、窄屏该词不出现故没有漏译」是同一条手法（口径不变，换的只是落点）。
 
 | 隐喻词 | 首现处的定稿平实说法（可抄进界面） |
 |---|---|
@@ -739,14 +756,23 @@ GET /tasks/{id}               → 详情页装载 + 断线重连后的全量校�
 | 提议轮的渲染判据：过期按 `expires_at` 自己算、过期只变灰而轮仍在、同一个动作已在下发的动作集里就只指路 | `frontend/src/lib/proposals.ts` | 决策 188 / 207；`proposals.test.ts` 逐条钉住 |
 | 确认钮按下走既有端点（不新增改状态的路）；成功失败都回灌成一轮，不弹窗不 toast | `frontend/src/routes/Talk.svelte`、`crates/app/src/routes/foreman.rs` | 决策 188 / 207② |
 | 权限档位（环境层 auto / ask / deny）是配置项，不是代码常量：阶段配置表单里可改 | `frontend/src/components/settings/StageConfigForm.svelte`、`frontend/src/lib/stageConfigs.ts` | 决策 206；档位在值班长那一行的缺省是 `ask` |
-| 对讲台急停轮折叠：两张以上一张都不展开；窄屏改「摘要条 + 输入坞」 | `frontend/src/lib/talkStops.ts`、`frontend/src/routes/Talk.svelte` | 决策 183 / 192 |
+| 对讲台急停轮折叠：两张以上一张都不展开；窄屏改「摘要条 + 输入坞」 | `frontend/src/lib/talkStops.ts`、`frontend/src/routes/Talk.svelte` | 决策 183 / 192；**折叠判据的档位由决策 218 ⑥ 修订**——`≤899px` 起**单张也折**，且那一档摘要条不画名牌、没有急停时整块退场（`forceFold` 的断点在 `frontend/src/lib/talkLayout.ts` 一处） |
+| 对讲台折行档（`≤899px`）的页头带子与 ⋯ 班次菜单：`<h1>` 转 visually-hidden、行内 ≥44px 命中区、`aria-expanded`/`aria-controls`、Escape 与方向键能进出、点外关得掉、当前班次是身份行（`aria-current`）不是按钮 | `frontend/src/routes/Talk.svelte` | 决策 218（Q10 / Q12 / Q14）；三条等价断言（⋯ 可点、菜单开得出来、当前条被标出）在 `frontend/e2e/talk.spec.ts` |
+| 折行档的断点只有一处定义：JS 的 `forceFold` / `matchMedia` 与 CSS 字面量由静态扫描对着钉 | `frontend/src/lib/talkLayout.ts` | 决策 192 / 215 / 218；`talkLayout.test.ts`（node 环境静态扫 `Talk.svelte`）钉住只有 479 / 899 / 1099 三个断点 |
+| 班次落点进 URL（`#/talk?session=<id>`）+ localStorage 兜底、程序改地址一律 `replaceState`、非法值回落并删键 | `frontend/src/router.svelte.ts`、`frontend/src/lib/talkSessions.ts`、`frontend/src/routes/Talk.svelte` | 决策 217③④、218；`router.test.ts` 的 `readQuery` / `writeQuery` 用例 |
+| 回话中允许换班次（那把「发送中禁止切换」的 UI 锁已撤），「这一轮回话去哪了」由两枚标记接手 | `frontend/src/routes/Talk.svelte`、`frontend/src/lib/talkSessions.ts` | 决策 220②⑤（修订决策 204③ 的既有自保「回话中先别换班次」） |
+| 班次列表两枚标记（每条最多一枚）：**正在回话**（本机发出未落地 ∪ SSE 增量带别的 `session_id`；静默 20s / **落地** / 断流三条收口）/ **有新动静**（`last_active_at` 晚于本机记的看过时刻；当前班次永不算；基线**只在本机一条记录都没有时**立）；回话中优先于有新动静 | `frontend/src/lib/talkSessions.ts`、`frontend/src/realtime/foreman.ts`、`frontend/src/routes/Talk.svelte` | 决策 220①③④ / 222；派生口径由 `talkSessions.test.ts` / `foreman.test.ts` 钉住，跨设备那一组在 `frontend/e2e/talk.spec.ts` |
+| 工位回执在折行档默认收起（`<details>` 不写 `open`，内容一个字不删），人手动展开后不被流式增量打回 | `frontend/src/routes/Talk.svelte` | 决策 218 ②（修订决策 182 的「默认展开」在那一档的纪律）；`frontend/e2e/talk.spec.ts` 把 POST 拖住 2.5s 验「不打回」 |
+| 输入坞不常驻提示语；传输层断线（`streamStatus === 'error'`）时才有那一行，且是全页**唯一**的断线告知（空闲 88px） | `frontend/src/routes/Talk.svelte` | 决策 218 当日修订②、220④；「值班长正在回话…」那半句已删（流式尾随光标已在说） |
+| 顶栏 8 格工位灯在 `#/talk` 上接通：点灯去 `#/` 并定位到那一列（此前 8/8 无靶子，点了不动） | `frontend/src/components/layout/TopBar.svelte` | 决策 218 ⑥；兑现已有的 `aria-label="跳到 init"`，不是新功能 |
+| 「急停」的首现平实说法落在急停摘要条的琥珀标签上（折行档没有急停时那整块退场、词与译文一起不在） | `frontend/src/routes/Talk.svelte` | 决策 200（口径不变）＋ 218 ⑦b（换落点） |
 | 值班长没回话的那一轮渲染成失败轮**并显示原因**（后端落的 `system` 账以 `【没跑起来】` 开头），不再是一条只有红轮、无处看原因的静默失败 | `frontend/src/routes/Talk.svelte` | 决策 211④；票 04 |
 | 主动播报与回话是两种轮：值守轮自己醒来说的那条名牌写「值班长 · 值守」（后端加的 `【值守播报】` 标记），有人问才说的话仍是「值班长」 | `frontend/src/routes/Talk.svelte` | 决策 209④；票 06 |
 | 修复提议的渲染与工具调用不同：显示闸门读数（过了哪几步 / 没过则明说「没有补丁」）与可展开、可复制的 diff；按钮文案是「合入」而不是「执行」 | `frontend/src/routes/Talk.svelte`、`frontend/src/lib/proposals.ts` | 决策 212①；票 12（同一个钮面，不新开第三个） |
 | 任务级托管：状态在任务上看得见，且拨得动；终态任务与值班长未接线时不摆那颗钮（两条理由与端点的两种拒绝同一份） | `frontend/src/lib/stewardship.ts`、`frontend/src/routes/TaskDetail.svelte`、`frontend/src/api/types.ts` | 决策 210①；票 08 的端点 / 票 14 的界面；判据由 `stewardship.test.ts` 逐条钉住 |
 | 任务停在 pending 时，说明那一句里看得出它在**等修复合入**（原句「为什么停」不丢、`PendingKind` 也不换——它还参与 resume 的原因归类） | `crates/core/src/pipeline/repair.rs`、`crates/core/src/storage/tasks.rs` | 决策 210⑨；票 11 的最后一格 |
 | 宽屏矮窗口：状态区上限取「46vh」与「先留给时间线的那一份」的较小者——时间线恒有 160px 下限，确认钮不被挤成一条缝 | `frontend/src/routes/Talk.svelte` | 决策 208；四条几何断言在 `frontend/e2e/talk.spec.ts` 的 `expectProposalReachable` |
-| 对讲台的班次 chip 行：非 sticky、不动页头与顶栏，窄屏横滚不折行 | `frontend/src/routes/Talk.svelte` | 决策 204（三条几何约束见 `frontend/e2e/talk.spec.ts` 的 ⑭⑮） |
+| 对讲台的班次 chip 行：桌面挂在**页头那一行右端**（非 sticky、不动页头与顶栏，`nowrap` + 容器内横滚），`≤899px` 收进页头右端的 ⋯ 菜单（页面上没有 chip 行） | `frontend/src/routes/Talk.svelte` | 决策 204③（落点由决策 218 Q15 从「时间线里」改到页头右端）；**三条几何约束已作废**——决策 218 Q15 的原始动机正是「它长在滚动容器里，滚到底时实测在屏幕上方 320.2px」，搬出来之后桌面白得 36px |
 | 换班次重置的是对话上下文，看板派生的东西（急停 / 值班板）一样不动 | `frontend/src/routes/Talk.svelte` | 决策 204；`resetSessionState()` 与它旁边那份「不重置」清单 |
 | 值班长的增量按会话身份归位；发送窗口里换了班次则不落地 | `frontend/src/realtime/foreman.ts`、`frontend/src/routes/Talk.svelte` | 决策 204 |
 | 技能市场：仓名单保存即生效；装前预览三项（去向 / 模式与信任态 / 特征扫描） | `frontend/src/routes/SettingsMarket.svelte`、`frontend/src/components/settings/StageRecommendations.svelte` | 决策 187 / 194 / 181 |
