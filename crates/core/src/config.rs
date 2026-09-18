@@ -80,6 +80,15 @@ pub struct Settings {
     /// **全局唤醒上限**（次/小时，决策 209⑤ / 票 07）。触顶时不再唤醒，但**不静默丢弃**：
     /// 留一行「本小时已达上限，N 条待办未播报」，待办不消费，下一小时继续。
     pub watch_max_wakes_per_hour: u64,
+    /// **项目级 run 的空闲超时**（秒，决策 212 / 票 13）。
+    ///
+    /// 与节点超时**语义分开**（不是一个数）：项目级伪阶段没有任务、没有游标，它的生命周期
+    /// 归 `POST /projects/analyze` 收尾——而那条路在**进程被杀 / 重启**时跑不到收尾，
+    /// 于是留下一条跨重启永生的 `running` 行（2026-09-17 实证：三条 run 的活动时间冻结、
+    /// 仍是 running）。这个超时就是那种行的终止者。
+    ///
+    /// 默认 900 秒：一次项目分析是「探测（纯代码）+ 一次 LLM 摘要」，15 分钟远够。
+    pub project_run_idle_timeout_sec: u64,
 }
 
 impl Default for Settings {
@@ -116,6 +125,7 @@ impl Default for Settings {
             watch_debounce_sec: 60,
             watch_task_cooldown_minutes: 30,
             watch_max_wakes_per_hour: 12,
+            project_run_idle_timeout_sec: 900,
         }
     }
 }
@@ -158,6 +168,7 @@ pub struct PipelineOverrides {
     pub watch_debounce_sec: Option<u64>,
     pub watch_task_cooldown_minutes: Option<u64>,
     pub watch_max_wakes_per_hour: Option<u64>,
+    pub project_run_idle_timeout_sec: Option<u64>,
 }
 
 impl PipelineOverrides {
@@ -200,6 +211,7 @@ impl PipelineOverrides {
             watch_debounce_sec,
             watch_task_cooldown_minutes,
             watch_max_wakes_per_hour,
+            project_run_idle_timeout_sec,
         );
         // 非法值由 [`Config::validate`] 在解析期拦下（fail fast），故这里只做「认得出就采用」
         // ——两处都报错会让同一个错误有两个出口，而这里没有 `Result` 可返回。

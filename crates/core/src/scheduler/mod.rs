@@ -44,6 +44,8 @@ pub struct TickReport {
     pub stalled: Vec<String>,
     /// 发出重复提醒的任务 id。
     pub reminded: Vec<String>,
+    /// 本 tick 被判定「心跳已停」并标终态的项目级 run id（决策 212 / 票 13）。
+    pub abandoned_project_runs: Vec<i64>,
     /// 本 tick **新写进待办表**的事件条数（决策 209③ / 票 05）。
     ///
     /// 与 `reminded` 的分工：后者是本 tick 的日志口径（内存、重启即失），前者才是
@@ -124,6 +126,7 @@ impl KanbanScheduler {
         self.recover_dependency_failed(&mut report).await?;
         self.admit_pending_tasks(&mut report).await?;
         self.remind_pending_tasks(&mut report).await?;
+        self.abandon_stale_project_runs(&mut report).await?;
         self.note_attention(&mut report).await?;
         Ok(report)
     }
@@ -521,6 +524,47 @@ impl KanbanScheduler {
 
     pub fn reminded_count(&self) -> usize {
         self.reminded.len()
+    }
+
+    // ────────────── ⑦ 项目级 run 的终止者（决策 212 / 票 13）──────────────
+
+    /// 给项目级 run 一个明确的终止者。
+    ///
+    /// **这不是「加观测」，是修调度器的洞**：`check_timeouts` 有意跳过它们
+    /// （没有任务 / 游标，不属节点超时语义），而 `requeue_running_tasks` 也不认它们
+    /// （那条路按 `task_id` 归队）——两条路都不管的后果是它们**跨重启永生**。
+    /// 2026-09-17 的实证：三条 `pseudo:project_analysis` run 的 `last_activity_at` 冻结在
+    /// 某个时刻、仍是 `running`，更早的一对还一起活了 4 小时 24 分。
+    ///
+    /// 判据只有一条：仍是 `running` 且**心跳停了**超过 `project_run_idle_timeout_sec`。
+    /// 标 `Timeout` 并写一句可读原因——活的那些（正在跑 LLM）心跳会刷新，不会误伤。
+    async fn abandon_stale_project_runs(&self, report: &mut TickReport) -> Result<()> {
+        let cutoff = self.clock.now()
+            - Duration::seconds(self.settings.project_run_idle_timeout_sec as i64);
+        for run in self.store.stale_project_runs(cutoff).await? {
+            let idle = self
+                .clock
+                .now()
+                .signed_duration_since(run.last_activity_at.unwrap_or(run.started_at))
+                .num_seconds()
+                .max(0);
+            self.store
+                .finish_run(
+                    run.id,
+                    &crate::storage::observability::RunOutcome {
+                        status: Some(NodeStatus::Timeout),
+                        error: Some(format!(
+                            "项目级 run（{}）心跳停止 {idle}s，判定中断并标终态（决策 212）：\
+                             analyze 端点那条收尾路径在进程被杀 / 重启时跑不到",
+                            run.agent_type
+                        )),
+                        ..Default::default()
+                    },
+                )
+                .await?;
+            report.abandoned_project_runs.push(run.id);
+        }
+        Ok(())
     }
 
     // ─────────────────── ⑦ 发现落表（决策 209③，票 05）───────────────────

@@ -121,5 +121,6 @@ graph TD
 | `watch_debounce_sec` | 60 | 值守轮的去抖窗口：窗口内攒批、到期唤醒一次；窗口内没有新事件则一次都不醒（票 06） |
 | `watch_task_cooldown_minutes` | 30 | 同任务冷却：刚处理过的任务，新事件不单独唤醒，等冷却到期后合并播报（票 07） |
 | `watch_max_wakes_per_hour` | 12 | 全局唤醒上限（次/小时）；触顶不再唤醒但留一行「N 条待办未播报」，待办不消费（票 07） |
+| `project_run_idle_timeout_sec` | 900 | 项目级 run 的空闲超时（与节点超时**语义分开**）：心跳停了就标终态，免得它跨重启永生（决策 212，票 13） |
 
 > 阶段级 Agent 配置（provider / model 覆盖、prompt 覆盖、工具集等）不在本表，见 [agents.md](agents.md) §10.6。

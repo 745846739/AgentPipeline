@@ -1315,3 +1315,100 @@ async fn subagent_runs_are_not_swept_as_node_timeouts() {
     let sub_row = runs.iter().find(|r| r.id == sub).unwrap();
     assert_eq!(sub_row.status, NodeStatus::Running);
 }
+
+// ─────────── 项目级 run 的终止者（决策 212 / 票 13）───────────
+
+/// 僵尸行：项目级 run 心跳停了就标终态——它们跨重启永生的那条路（两条既有路径都不认它们）。
+#[tokio::test]
+async fn a_stale_project_run_is_abandoned() {
+    use agentpipeline_core::storage::observability::NewProjectRun;
+
+    let h = Harness::new().await;
+    // 项目在 Harness::new 里已经 seed 过（p1）
+    let run_id = h
+        .store
+        .insert_project_run(&NewProjectRun {
+            project_id: "p1".into(),
+            stage: Stage::Init,
+            node: Node::Execute,
+            attempt: 1,
+            agent_type: "pseudo:project_analysis".into(),
+        })
+        .await
+        .unwrap();
+    // 心跳冻结在 1 小时前（`project_run_idle_timeout_sec` 默认 900s）
+    let frozen = h.clock.now() - chrono::Duration::hours(1);
+    sqlx::query("UPDATE kanban_node_runs SET started_at = ?, last_activity_at = ? WHERE id = ?")
+        .bind(agentpipeline_core::storage::ts(frozen))
+        .bind(agentpipeline_core::storage::ts(frozen))
+        .bind(run_id)
+        .execute(h.store.pool())
+        .await
+        .unwrap();
+
+    let report = h.scheduler(Settings::default()).tick().await.unwrap();
+    assert_eq!(report.abandoned_project_runs, vec![run_id]);
+
+    let runs = h.store.list_project_runs("p1").await.unwrap();
+    let run = runs.iter().find(|r| r.id == run_id).unwrap();
+    assert_eq!(run.status, NodeStatus::Timeout);
+    assert!(
+        run.error.as_deref().unwrap_or_default().contains("心跳停止"),
+        "原因要可读：{:?}",
+        run.error
+    );
+}
+
+/// 活着的项目级 run 不误伤（心跳新鲜 → 一次都不标）。
+#[tokio::test]
+async fn a_live_project_run_is_left_alone() {
+    use agentpipeline_core::storage::observability::NewProjectRun;
+
+    let h = Harness::new().await;
+    let run_id = h
+        .store
+        .insert_project_run(&NewProjectRun {
+            project_id: "p1".into(),
+            stage: Stage::Init,
+            node: Node::Execute,
+            attempt: 1,
+            agent_type: "pseudo:project_analysis".into(),
+        })
+        .await
+        .unwrap();
+    h.store.touch_run_heartbeat(run_id).await.unwrap();
+
+    let report = h.scheduler(Settings::default()).tick().await.unwrap();
+    assert!(report.abandoned_project_runs.is_empty());
+    let runs = h.store.list_project_runs("p1").await.unwrap();
+    assert_eq!(runs[0].status, NodeStatus::Running);
+}
+
+/// 重启后不存在 running 的项目级 run（决策 212 的硬要求）。
+#[tokio::test]
+async fn a_restart_leaves_no_running_project_run() {
+    use agentpipeline_core::storage::observability::NewProjectRun;
+
+    let h = Harness::new().await;
+    for _ in 0..3 {
+        h.store
+            .insert_project_run(&NewProjectRun {
+                project_id: "p1".into(),
+                stage: Stage::Init,
+                node: Node::Execute,
+                attempt: 1,
+                agent_type: "pseudo:project_analysis".into(),
+            })
+            .await
+            .unwrap();
+    }
+    let abandoned = h.store.abandon_stale_project_runs().await.unwrap();
+    assert_eq!(abandoned.len(), 3, "重启那一刻它们都是孤儿");
+    assert!(h
+        .store
+        .list_project_runs("p1")
+        .await
+        .unwrap()
+        .iter()
+        .all(|r| r.status == NodeStatus::Timeout));
+}

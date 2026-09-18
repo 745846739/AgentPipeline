@@ -274,6 +274,57 @@ impl Store {
         rows.into_iter().map(RunRow::into_run).collect()
     }
 
+    /// 项目级 run 里**心跳已停**的那些（决策 212 / 票 13）。
+    ///
+    /// 筛选条件就是「僵尸行」的定义：仍是 `running`、但最后活动早于 `cutoff`。
+    /// 没有任务、没有游标，故 [`crate::storage::Store::requeue_running_tasks`] 与
+    /// `check_timeouts` 都不认它们——这就是它们会跨重启永生的原因。
+    pub async fn stale_project_runs(
+        &self,
+        cutoff: DateTime<Utc>,
+    ) -> Result<Vec<NodeRun>> {
+        let sql = format!(
+            "SELECT {RUN_COLUMNS} FROM kanban_node_runs
+             WHERE project_id IS NOT NULL AND task_id IS NULL AND status = 'running'
+               AND COALESCE(last_activity_at, started_at) < ?
+             ORDER BY id"
+        );
+        let rows: Vec<RunRow> = sqlx::query_as(&sql)
+            .bind(ts(cutoff))
+            .fetch_all(self.pool())
+            .await?;
+        rows.into_iter().map(RunRow::into_run).collect()
+    }
+
+    /// 启动时一次性收掉**中断的项目级 run**（决策 212 / 票 13）：心跳停了的直接标终态。
+    ///
+    /// 与调度器 tick 里的那条用同一个阈值思想，但起点不同——重启那一刻**所有**在跑的
+    /// 项目级 run 都已经是孤儿（发起它们的那个进程没了），故这里不设宽限：
+    /// 「还有心跳」在重启后是一个不可能成立的条件。
+    pub async fn abandon_stale_project_runs(&self) -> Result<Vec<i64>> {
+        let ids: Vec<i64> = sqlx::query_scalar(
+            "SELECT id FROM kanban_node_runs
+             WHERE project_id IS NOT NULL AND task_id IS NULL AND status = 'running'
+             ORDER BY id",
+        )
+        .fetch_all(self.pool())
+        .await?;
+        for id in &ids {
+            self.finish_run(
+                *id,
+                &RunOutcome {
+                    status: Some(crate::types::NodeStatus::Timeout),
+                    error: Some(
+                        "进程重启：项目级 run 成了孤儿，标终态（决策 212 / 票 13）".into(),
+                    ),
+                    ..Default::default()
+                },
+            )
+            .await?;
+        }
+        Ok(ids)
+    }
+
     pub async fn list_runs_at(
         &self,
         task_id: &str,

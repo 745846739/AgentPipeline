@@ -388,6 +388,14 @@ pub async fn serve(options: ServeOptions) -> anyhow::Result<ServerHandle> {
         tracing::info!(count = requeued.len(), tasks = ?requeued, "已将中断的 running 任务归队待调度");
     }
 
+    // 恢复流程第三步（决策 212 / 票 13）：项目级 run 既不在 `requeue_running_tasks`
+    // 的归队范围内（那条路按 task_id），也不在 `check_timeouts` 的扫描范围内——两条路都
+    // 不管的后果是它们跨重启永生。启动时立刻收一次：心跳停了的直接标终态（带原因）。
+    let abandoned = store.abandon_stale_project_runs().await?;
+    if !abandoned.is_empty() {
+        tracing::info!(count = abandoned.len(), runs = ?abandoned, "已把中断的项目级 run 标成终态");
+    }
+
     // 配置 fail fast（决策 47 / 103 / 134）
     let report = store.validate_startup(&settings).await?;
     if !report.demoted_providers.is_empty() {
