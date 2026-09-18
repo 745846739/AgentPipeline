@@ -5,8 +5,10 @@
 //! `foreman`（值班长会话——唯一不挂任务的表，决策 182）、`proposals`（值班长提议——
 //! 写动作的落库形态，决策 188 / 207）、`pairing`（配对令牌，票 07）、
 //! `server_bind`（界面上的绑定开关，决策 186）、`market_repos`（界面上的技能来源仓名单，
-//! 决策 194 继承决策 187 的两级结构）、`skill_sources`（已装技能的来源记录，决策 194）。
+//! 决策 194 继承决策 187 的两级结构）、`skill_sources`（已装技能的来源记录，决策 194）、
+//! `attention`（值班长待办——调度器发现的落点，决策 209③）。
 
+pub mod attention;
 pub mod catalog;
 pub mod conflict;
 pub mod cursors;
@@ -20,6 +22,7 @@ pub mod server_bind;
 pub mod skill_sources;
 pub mod tasks;
 
+pub use attention::{AttentionItem, AttentionKind};
 pub use foreman::{ForemanMessage, NewForemanMessage};
 pub use skill_sources::SkillSource;
 

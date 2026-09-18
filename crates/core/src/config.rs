@@ -58,6 +58,18 @@ pub struct Settings {
     /// 写在这里而不是 UI 里：改它等于改全机所有阶段的行为，那是一次深思熟虑的编辑，
     /// 不是一次点击（照 `allow_dirty_worktree_merge` 那一批的做法）。
     pub env_mode: crate::types::EnvMode,
+    /// **事件的新鲜窗口**（分钟，决策 209②/③，票 05）：多久之内发生的事才值得写进
+    /// 值班长待办。它同时是「同一任务在窗口内再次 pending」的计数窗口——两件事本来就是
+    /// 同一个数（「多久之内算同一件事」）。
+    ///
+    /// 为什么要窗口：待办表的去重键含事件发生时刻，而「写待办」是每一 tick 都跑的。
+    /// 没有窗口，一个三天前就 pending 的任务会被反复写、反复唤醒。
+    pub watch_event_window_minutes: u64,
+    /// **卡住的宽限**（分钟，票 05）：两条「调度器与台账之间的缝」用它判——
+    /// `scheduler_no_effect`（run 已终态而游标仍 active）与 `owner_stuck`
+    /// （任务 running 但长时间没有 run 心跳）。默认 10 分钟：低于它时还在正常重试的
+    /// 时间范围内，报出来只会是噪声。
+    pub watch_owner_stuck_minutes: u64,
 }
 
 impl Default for Settings {
@@ -89,6 +101,8 @@ impl Default for Settings {
             egress_allow_hosts: Vec::new(),
             egress_allow_all: false,
             env_mode: crate::types::EnvMode::Auto,
+            watch_event_window_minutes: 30,
+            watch_owner_stuck_minutes: 10,
         }
     }
 }
@@ -126,6 +140,8 @@ pub struct PipelineOverrides {
     /// 枚举反序列化会把 `env_mode = "Auto"` 报成一句难读的 serde 错误，而这里要的是一句
     /// 「只能是 auto / ask / deny」——解析与校验在 [`PipelineOverrides::apply`] 里做。
     pub env_mode: Option<String>,
+    pub watch_event_window_minutes: Option<u64>,
+    pub watch_owner_stuck_minutes: Option<u64>,
 }
 
 impl PipelineOverrides {
@@ -163,6 +179,8 @@ impl PipelineOverrides {
             allow_dirty_worktree_merge,
             egress_allow_hosts,
             egress_allow_all,
+            watch_event_window_minutes,
+            watch_owner_stuck_minutes,
         );
         // 非法值由 [`Config::validate`] 在解析期拦下（fail fast），故这里只做「认得出就采用」
         // ——两处都报错会让同一个错误有两个出口，而这里没有 `Result` 可返回。

@@ -116,5 +116,7 @@ graph TD
 | `conflict_overlap_threshold` | 0 | `affected_files` 交集判定冲突的最小重叠文件数，0 表示任一交集即冲突 |
 | `max_concurrent_tasks` | 5 | 同时执行的任务数上限（决策 21 / 36），在 scheduler `start_task` 处准入；名额占用 = `status ∈ {running, pending}`（决策 117） |
 | `allow_dirty_worktree_merge` | false | 允许在目标分支工作区不干净时合入；false 时进入 pending 由用户决定 |
+| `watch_event_window_minutes` | 30 | 值班长待办只收**这么新**的事件；同时是「同一任务在窗口内再次 pending」的计数窗口（决策 209②，票 05） |
+| `watch_owner_stuck_minutes` | 10 | 判「卡住」的宽限：`scheduler_no_effect`（run 已终态而游标仍 active）与 `owner_stuck`（有主但心跳停了）都用它（票 05） |
 
 > 阶段级 Agent 配置（provider / model 覆盖、prompt 覆盖、工具集等）不在本表，见 [agents.md](agents.md) §10.6。

@@ -709,7 +709,7 @@ impl Default for NotificationPolicy {
 }
 ```
 
-**pending 超时提醒：** 任务进入 pending 超过 `pending_reminder_hours`（默认 24h）未处理，重复提醒一次；超过 `pending_timeout_hours`（默认 72h）自动标记 `stalled = 1`，看板高亮显示。提醒与高亮均通过 SSE 推送，不依赖外部渠道。
+**pending 超时提醒：** 任务进入 pending 超过 `pending_reminder_hours`（默认 24h）未处理，重复提醒一次；超过 `pending_timeout_hours`（默认 72h）自动标记 `stalled = 1`，看板高亮显示。提醒与高亮均通过 SSE 推送，不依赖外部渠道。**票 05 补上了那个「均通过 SSE 推送」的洞**：提醒此前只活在调度器内存的 `HashSet` 里、重启即失、从不外发——现在是 `stalled` 事件真的发出去，同时落一行 `task_stale` 待办（决策 209③）。
 
 **pending 待办展示（2026-09-11 前端评审定稿：持久面板，非弹窗）：** 进入 pending 时（无论人工触发还是调度器自动检测），前端在**任务详情右侧的待办 dossier 面板**常驻呈现下列内容（任务不再 pending 时收起）；看板侧以 toast + 顶栏待办计数提醒。内容包含：
 

@@ -13,6 +13,7 @@ use crate::clock::Clock;
 use crate::config::{effective_idle_timeout, effective_max_duration, node_timeouts, Settings};
 use crate::process::ProcessKiller;
 use crate::sse::{SseEvent, SseSink};
+use crate::storage::attention::AttentionKind;
 use crate::storage::observability::is_timed_out;
 use crate::storage::tasks::DependencyState;
 use crate::storage::Store;
@@ -43,6 +44,11 @@ pub struct TickReport {
     pub stalled: Vec<String>,
     /// 发出重复提醒的任务 id。
     pub reminded: Vec<String>,
+    /// 本 tick **新写进待办表**的事件条数（决策 209③ / 票 05）。
+    ///
+    /// 与 `reminded` 的分工：后者是本 tick 的日志口径（内存、重启即失），前者才是
+    /// 「有人看得见」的那一份。两者都留，是为了让「发现」与「推送」在测试里分得开。
+    pub attention_noted: usize,
     /// 自适应超时的「运行显著偏慢」告警（决策 66 / 票 17）：`(task_id, 描述)`。
     ///
     /// **纯告警**：不影响任何超时判定（自适应值不作强制阈值，决策 66 边界）。
@@ -106,7 +112,10 @@ impl KanbanScheduler {
         }
     }
 
-    /// 一次 tick：六项职责（决策 55）。
+    /// 一次 tick：六项职责（决策 55）+ 发现落表（决策 209③，票 05）。
+    ///
+    /// 落表排在最后：它读的是**这一 tick 处置完之后**的态势（超时已处置、pending 已挂上），
+    /// 而不是处置之前的。它本身不改任何状态——发现与唤醒是两件事，唤醒归值守轮。
     pub async fn tick(&self) -> Result<TickReport> {
         let mut report = TickReport::default();
         self.check_timeouts(&mut report).await?;
@@ -115,6 +124,7 @@ impl KanbanScheduler {
         self.recover_dependency_failed(&mut report).await?;
         self.admit_pending_tasks(&mut report).await?;
         self.remind_pending_tasks(&mut report).await?;
+        self.note_attention(&mut report).await?;
         Ok(report)
     }
 
@@ -133,12 +143,15 @@ impl KanbanScheduler {
             .expire_foreman_proposals(self.clock.now())
             .await?;
         let purged_proposals = self.store.purge_foreman_proposals(cutoff).await?;
+        // 待办表与其余各表**同一口径**的年龄清理（票 05）：不做全仓唯一一张不设保留期的表。
+        let purged_attention = self.store.purge_attention(cutoff).await?;
         let aggregated = self.aggregate_node_metrics().await?;
         Ok(MaintenanceReport {
             purged_conversations: purged,
             purged_foreman_messages: purged_foreman,
             expired_foreman_proposals: expired_proposals,
             purged_foreman_proposals: purged_proposals,
+            purged_attention: purged_attention as usize,
             aggregated_tasks: aggregated,
         })
     }
@@ -468,6 +481,31 @@ impl KanbanScheduler {
             // pending 超时提醒：只重复一次
             if age > reminder_after && !self.reminded.contains(&task.id) {
                 report.reminded.push(task.id.clone());
+                // 票 05 顺手修掉的既有缺陷：提醒此前**从不推 SSE**，只在内存集合里记一笔
+                // ——「任务停滞超过 24h」这件事前端永远不知道。走既有 `stalled` 事件
+                // （前端按它置看板高亮，不弹 toast：决策 65 的弹窗只给 pending/done/failed）。
+                self.sse.emit(SseEvent::Stalled {
+                    task_id: task.id.clone(),
+                    branch: crate::types::NodeCursor::BRANCH_MAIN.to_string(),
+                    pending_hours: age.num_hours().max(0) as u64,
+                });
+                // 表才是通道（票 05）：一个停了 24h 还没人管的 pending，**必须**能唤醒
+                // 值守轮——上面那条「只报新鲜事」的窗口恰恰会漏掉它（事件发生在 24h 前）。
+                if self
+                    .store
+                    .note_attention(
+                        &task.id,
+                        AttentionKind::TaskStale,
+                        now,
+                        Some(&serde_json::json!({
+                            "pending_hours": age.num_hours().max(0),
+                            "since": since.to_rfc3339(),
+                        })),
+                    )
+                    .await?
+                {
+                    report.attention_noted += 1;
+                }
             }
         }
 
@@ -483,6 +521,209 @@ impl KanbanScheduler {
 
     pub fn reminded_count(&self) -> usize {
         self.reminded.len()
+    }
+
+    // ─────────────────── ⑦ 发现落表（决策 209③，票 05）───────────────────
+
+    /// 把本 tick 的发现写进**值班长待办**表（一事件一行）。
+    ///
+    /// 三条纪律：
+    /// 1. **只写「需要有人管」的**（§2.1）——节点成功、每轮心跳、每次工具调用都不写。
+    /// 2. **`occurred_at` 取事件发生的时刻**，不是「现在」：去重键含它，而这一句每 10 秒
+    ///    跑一次；取「现在」等于给同一次 pending 每 tick 写一行，唤醒会被自己的重试刷屏。
+    /// 3. **只报新鲜事**（`watch_event_window_minutes`）：三天前就 pending 的任务不该在
+    ///    每次重启后再喊一遍。
+    ///
+    /// 它**不唤醒任何东西**——唤醒归值守轮（票 06），那一步要花钱。
+    async fn note_attention(&self, report: &mut TickReport) -> Result<()> {
+        let now = self.clock.now();
+        let window = Duration::minutes(self.settings.watch_event_window_minutes as i64);
+        let stuck = Duration::minutes(self.settings.watch_owner_stuck_minutes as i64);
+        let mut noted = 0usize;
+
+        for task in self
+            .store
+            .list_tasks(&crate::storage::tasks::TaskFilter {
+                include_archived: false,
+                ..Default::default()
+            })
+            .await?
+        {
+            // ① 任务转 pending（含重试耗尽 / 上下文溢出两个子类）
+            if let Some(reason) = &task.pending_reason {
+                let live = self.store.load_live_cursors(&task.id).await?;
+                let occurred = live
+                    .iter()
+                    .filter(|c| c.is_pending())
+                    .map(|c| c.updated_at)
+                    .min()
+                    .filter(|t| now - *t <= window);
+                if let Some(occurred) = occurred {
+                    let kind = pending_attention_kind(reason.kind);
+                    if self
+                        .store
+                        .note_attention(
+                            &task.id,
+                            kind,
+                            occurred,
+                            Some(&serde_json::json!({
+                                "pending_kind": reason.kind.as_str(),
+                                "stage": reason.stage.as_str(),
+                                "node": reason.node.as_str(),
+                                "message": reason.message,
+                                "diagnostic": reason
+                                    .context
+                                    .as_ref()
+                                    .and_then(|c| c.diagnostic.clone()),
+                            })),
+                        )
+                        .await?
+                    {
+                        noted += 1;
+                    }
+                    // ② 同一任务在窗口内再次 pending：**自动修复没治好**（§4.9 的判据之一）。
+                    //    按条数判而不是按「有没有未消费的行」判——去重键含 occurred_at，
+                    //    两次真事件就是两行，这正是要数出来的东西。
+                    let repeats = self.store.count_attention_since(&task.id, kind, now - window).await?;
+                    if repeats > 1
+                        && self
+                            .store
+                            .note_attention(
+                                &task.id,
+                                AttentionKind::RepeatedPending,
+                                occurred,
+                                Some(&serde_json::json!({"count": repeats})),
+                            )
+                            .await?
+                    {
+                        noted += 1;
+                    }
+                }
+            }
+
+            // ③ 闸门失败（票面点名 develop 闸门与 merge 的 gate_failure_kind，读的是同一处
+            //    merge_result：develop 闸门失败也会落到那条记录上）
+            if now - task.updated_at <= window {
+                if let Some(merge) = self.store.merge_metadata(&task.id).await? {
+                    if merge.gate == Some(crate::types::Gate::Fail)
+                        && self
+                            .store
+                            .note_attention(
+                                &task.id,
+                                AttentionKind::GateFailure,
+                                task.updated_at,
+                                Some(&serde_json::json!({
+                                    "gate_failure_kind": merge.gate_failure_kind.map(|k| match k {
+                                        crate::types::GateFailureKind::Lint => "lint",
+                                        crate::types::GateFailureKind::Test => "test",
+                                    }),
+                                    "gate_failures": merge.gate_failures,
+                                    "output": merge.gate_failure_output,
+                                })),
+                            )
+                            .await?
+                    {
+                        noted += 1;
+                    }
+                }
+            }
+
+            // ④ 任务转 done（收尾播报；同样是「新鲜事」才写）
+            if task.status == TaskStatus::Done
+                && now - task.updated_at <= window
+                && self
+                    .store
+                    .note_attention(&task.id, AttentionKind::TaskDone, task.updated_at, None)
+                    .await?
+            {
+                noted += 1;
+            }
+
+            // ⑤ 调度器处置未生效 + ⑥ owner 持有超时：两条缝，都要求「任务还在 running」。
+            //    实测（2026-09-17）：run 已被标 timeout、transition 也写了「干净对话重试」，
+            //    但**没有 attempt-2 的 run 行**，任务从此停在 running——check_timeouts 只看
+            //    active_runs()（run 已是终态就不再被扫），remind_pending_tasks 的 stalled
+            //    判据也不成立。这条缝此前零信号。
+            if task.status == TaskStatus::Running {
+                if let Some((kind, occurred, detail)) = self.stuck_evidence(&task, now, stuck).await?
+                {
+                    if self
+                        .store
+                        .note_attention(&task.id, kind, occurred, Some(&detail))
+                        .await?
+                    {
+                        noted += 1;
+                    }
+                }
+            }
+        }
+
+        report.attention_noted = noted;
+        Ok(())
+    }
+
+    /// 任务卡在 running 上的两类证据（票 05 的 ⑤⑥）。
+    async fn stuck_evidence(
+        &self,
+        task: &crate::types::Task,
+        now: chrono::DateTime<chrono::Utc>,
+        stuck: Duration,
+    ) -> Result<Option<(AttentionKind, chrono::DateTime<chrono::Utc>, serde_json::Value)>> {
+        for cursor in self.store.load_live_cursors(&task.id).await? {
+            if !cursor.is_runnable() {
+                continue;
+            }
+            let Some(run) = self
+                .store
+                .list_runs_at(&task.id, cursor.stage, cursor.node)
+                .await?
+                .pop()
+            else {
+                continue;
+            };
+            if run.status == NodeStatus::Running {
+                // owner 持有超时：**有主**，但心跳停了（没有主的不该报这一类）
+                let last = run.last_activity_at.unwrap_or(run.started_at);
+                let owned = task
+                    .executor_owner
+                    .as_deref()
+                    .is_some_and(|o| !o.is_empty());
+                if owned && now - last > stuck {
+                    return Ok(Some((
+                        AttentionKind::OwnerStuck,
+                        last,
+                        serde_json::json!({
+                            "run_id": run.id,
+                            "stage": run.stage.as_str(),
+                            "node": run.node.as_str(),
+                            "owner": task.executor_owner,
+                            "heartbeat_seconds_ago": (now - last).num_seconds(),
+                        }),
+                    )));
+                }
+                continue;
+            }
+            // 游标 active 而 run 已终态（且过了宽限期）：处置没生效
+            let Some(finished) = run.finished_at else {
+                continue;
+            };
+            if now - finished > stuck {
+                return Ok(Some((
+                    AttentionKind::SchedulerNoEffect,
+                    finished,
+                    serde_json::json!({
+                        "run_id": run.id,
+                        "run_status": run.status.as_str(),
+                        "stage": run.stage.as_str(),
+                        "node": run.node.as_str(),
+                        "attempt": run.attempt,
+                        "cursor_id": cursor.cursor_id,
+                        "error": run.error,
+                    }),
+                )));
+            }
+        }
+        Ok(None)
     }
 
     // ─────────────────────── 心跳刷新（决策 100）───────────────────────
@@ -548,6 +789,8 @@ pub struct MaintenanceReport {
     pub expired_foreman_proposals: usize,
     /// 被保留期清掉的提议行（决策 207：与对讲台对话同一个保留期）。
     pub purged_foreman_proposals: usize,
+    /// 被保留期清掉的值班长待办行（票 05：同一个 `conversation_retention_days` 口径）。
+    pub purged_attention: usize,
     pub aggregated_tasks: usize,
 }
 
@@ -557,6 +800,18 @@ async fn branch_of(cursor_id: &str, store: &Store) -> Result<String> {
         .await
         .map(|c| c.branch)
         .unwrap_or_else(|_| crate::types::NodeCursor::BRANCH_MAIN.to_string()))
+}
+
+/// pending 原因 → 待办类别（票 05）：两个子类单列，其余一律 `task_pending`。
+///
+/// 单列它们不是为了分类好看：`retry_exhausted` 与 `context_overflow` 是**自动修复盯得最紧**
+/// 的两类（前者是「跑不动了」，后者是「塞不下了」），播报分级与 §4.9 的止损都按它们判。
+fn pending_attention_kind(kind: PendingKind) -> AttentionKind {
+    match kind {
+        PendingKind::RetryExhausted => AttentionKind::RetryExhausted,
+        PendingKind::ContextOverflow => AttentionKind::ContextOverflow,
+        _ => AttentionKind::TaskPending,
+    }
 }
 
 /// 超时那句话（决策 211④ / 票 04）：**把「当时在哪一步」带上**。

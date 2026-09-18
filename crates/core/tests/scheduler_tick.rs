@@ -282,6 +282,193 @@ async fn timeout_kills_process_group_and_retries_until_exhausted() {
     let _ = task;
 }
 
+// ─────────────────── 票 05：发现落表（决策 209③）───────────────────
+
+/// 造一条**已终态**的 run，并把 `finished_at` 回拨（游标仍 active = 处置没生效）。
+async fn terminal_run_at_init(
+    h: &Harness,
+    task_id: &str,
+    status: NodeStatus,
+    finished_minutes_ago: i64,
+) -> i64 {
+    let cursor = h.store.load_live_cursors(task_id).await.unwrap()[0].clone();
+    let run_id = h
+        .store
+        .insert_run(&NewRun {
+            task_id: task_id.into(),
+            cursor_id: cursor.cursor_id.clone(),
+            stage: Stage::Init,
+            node: Node::Execute,
+            attempt: 1,
+            agent_type: "system".into(),
+            parent_run_id: None,
+            prompt_template_hash: None,
+            process_group_id: None,
+        })
+        .await
+        .unwrap();
+    h.store
+        .finish_run(
+            run_id,
+            &RunOutcome {
+                status: Some(status),
+                error: Some("init.execute 超时，当时在「检查项目工作区是否脏」".into()),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+    let finished = h.clock.now() - chrono::Duration::minutes(finished_minutes_ago);
+    sqlx::query("UPDATE kanban_node_runs SET finished_at = ? WHERE id = ?")
+        .bind(agentpipeline_core::storage::ts(finished))
+        .bind(run_id)
+        .execute(h.store.pool())
+        .await
+        .unwrap();
+    run_id
+}
+
+/// 「调度器处置未生效」——这一票的重点，且此前**零信号**。
+///
+/// 实测（2026-09-17）：run 已被标 timeout、transition 也写了「干净对话重试」，但没有
+/// attempt-2 的 run 行，任务从此停在 running——`check_timeouts` 只看 active_runs()，
+/// `remind_pending_tasks` 的 stalled 判据也不成立。既有调度器与既有台账之间的这条缝。
+#[tokio::test]
+async fn a_terminal_run_behind_an_active_cursor_is_noted() {
+    let h = Harness::new().await;
+    h.seed_task("t1").await;
+    h.mark_running("t1").await;
+    let run_id = terminal_run_at_init(&h, "t1", NodeStatus::Timeout, 30).await;
+
+    let report = h.scheduler(Settings::default()).tick().await.unwrap();
+    assert_eq!(report.attention_noted, 1, "本 tick 新记一件事");
+
+    let open = h.store.open_attention(100).await.unwrap();
+    assert_eq!(open.len(), 1);
+    assert_eq!(
+        open[0].kind,
+        agentpipeline_core::storage::AttentionKind::SchedulerNoEffect
+    );
+    assert_eq!(open[0].task_id, "t1");
+    assert_eq!(open[0].detail_json.as_ref().unwrap()["run_id"], run_id);
+    assert!(open[0].consumed_at.is_none(), "没有人处理过它");
+}
+
+/// 宽限期内不报：run 刚失败、重试还没起来的那个瞬间是**正常**的中间态。
+#[tokio::test]
+async fn a_fresh_terminal_run_is_not_noted_yet() {
+    let h = Harness::new().await;
+    h.seed_task("t1").await;
+    h.mark_running("t1").await;
+    terminal_run_at_init(&h, "t1", NodeStatus::Failed, 1).await;
+
+    let report = h.scheduler(Settings::default()).tick().await.unwrap();
+    assert_eq!(report.attention_noted, 0, "1 分钟前刚失败，还在正常重试窗口里");
+    assert!(h.store.open_attention(100).await.unwrap().is_empty());
+}
+
+/// 心跳停跳的 owner：任务 running、有主、run 还挂着但长时间没有活动。
+#[tokio::test]
+async fn an_owner_held_run_without_heartbeat_is_noted() {
+    let h = Harness::new().await;
+    h.seed_task("t1").await;
+    h.mark_running("t1").await;
+    assert!(h.store.try_claim_executor("t1", "owner-1").await.unwrap());
+    let cursor = h.store.load_live_cursors("t1").await.unwrap()[0].clone();
+    // 已跑 900s、心跳停在 900s 前（远过 watch_owner_stuck_minutes = 10）
+    h.running_run("t1", &cursor.cursor_id, 1, 900, 900, None)
+        .await;
+
+    let report = h.scheduler(Settings::default()).tick().await.unwrap();
+    assert!(report.attention_noted >= 1);
+    let open = h.store.open_attention(100).await.unwrap();
+    assert!(
+        open.iter()
+            .any(|a| a.kind == agentpipeline_core::storage::AttentionKind::OwnerStuck),
+        "{open:?}"
+    );
+}
+
+/// §2.1 那条纪律的牙齿：**正常在跑的东西不产生待办**（成功、心跳、工具调用都不写）。
+#[tokio::test]
+async fn healthy_activity_produces_no_attention() {
+    let h = Harness::new().await;
+    h.seed_task("t1").await;
+    h.mark_running("t1").await;
+    let cursor = h.store.load_live_cursors("t1").await.unwrap()[0].clone();
+    // 正在跑、心跳新鲜、没有 owner（也照样不该报 owner_stuck）
+    h.running_run("t1", &cursor.cursor_id, 1, 5, 5, None).await;
+
+    let report = h.scheduler(Settings::default()).tick().await.unwrap();
+    assert_eq!(report.attention_noted, 0, "在跑的任务不该被写进待办");
+    assert!(h.store.open_attention(100).await.unwrap().is_empty());
+}
+
+/// 一 tick 内多个事件 → **只写多行**（唤醒在票 06，一次）；且同一件事不会每 tick 重写。
+#[tokio::test]
+async fn many_discoveries_note_rows_once_each() {
+    let h = Harness::new().await;
+    h.seed_task("t1").await;
+    h.mark_running("t1").await;
+    terminal_run_at_init(&h, "t1", NodeStatus::Timeout, 30).await;
+    h.seed_task("t2").await;
+    h.mark_running("t2").await;
+    terminal_run_at_init(&h, "t2", NodeStatus::Timeout, 40).await;
+
+    let report = h.scheduler(Settings::default()).tick().await.unwrap();
+    assert_eq!(report.attention_noted, 2, "两个任务各一件");
+    assert_eq!(h.store.open_attention(100).await.unwrap().len(), 2);
+
+    // 第二次 tick：同一件事（同一 occurred_at）不再写第二行——否则唤醒会被自己的重试刷屏
+    let report = h.scheduler(Settings::default()).tick().await.unwrap();
+    assert_eq!(report.attention_noted, 0);
+    assert_eq!(h.store.open_attention(100).await.unwrap().len(), 2);
+}
+
+/// 停滞提醒此前**从不推 SSE**（只在内存集合里记一笔）——这是本票顺手修掉的既有缺陷。
+#[tokio::test]
+async fn a_repeated_reminder_reaches_the_frontend() {
+    let h = Harness::new().await;
+    h.seed_task("t1").await;
+    park_pending_aged(&h, "t1", 30).await;
+
+    let report = h.scheduler(Settings::default()).tick().await.unwrap();
+    assert_eq!(report.reminded, vec!["t1".to_string()]);
+    assert!(
+        h.sse.count_of(SseEventType::Stalled) >= 1,
+        "停滞提醒要走 SSE（前端按它置看板高亮）"
+    );
+    let open = h.store.open_attention(100).await.unwrap();
+    assert!(
+        open.iter()
+            .any(|a| a.kind == agentpipeline_core::storage::AttentionKind::TaskStale),
+        "停了 24h 还没人管的 pending 必须落表（恰恰是「只报新鲜事」会漏掉的那一类）：{open:?}"
+    );
+}
+
+/// 把任务推成 pending 并把游标 `updated_at` 回拨（提醒判据按它算年龄）。
+async fn park_pending_aged(h: &Harness, task_id: &str, hours_ago: i64) {
+    let cursor = h.store.load_live_cursors(task_id).await.unwrap()[0].clone();
+    let reason = PendingReason::new(
+        PendingKind::UserDecision,
+        cursor.stage,
+        cursor.node,
+        "等你拍板",
+    );
+    h.store
+        .set_cursor_pending(&cursor.cursor_id, &reason)
+        .await
+        .unwrap();
+    h.store.sync_task_projection(task_id).await.unwrap();
+    let updated = h.clock.now() - chrono::Duration::hours(hours_ago);
+    sqlx::query("UPDATE kanban_node_cursors SET updated_at = ? WHERE cursor_id = ?")
+        .bind(agentpipeline_core::storage::ts(updated))
+        .bind(&cursor.cursor_id)
+        .execute(h.store.pool())
+        .await
+        .unwrap();
+}
+
 // ─────────────────────── 票 04：超时要说清「当时在哪一步」───────────────────────
 
 /// 卡住的**系统节点**：台账里不能只有一句「超时」。
