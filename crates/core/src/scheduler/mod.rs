@@ -280,17 +280,21 @@ impl KanbanScheduler {
             (self.resume)(task_id);
         } else {
             // 耗尽：pending 挂在该 run 所属的**游标**上（决策 82）
-                self.store
-                    .set_cursor_pending(
-                        cursor_id,
-                        &PendingReason::new(
-                            PendingKind::Timeout,
-                            run.stage,
-                            run.node,
-                            format!("{}（attempt {}）", timeout_detail(run, "执行超时"), run.attempt),
+            self.store
+                .set_cursor_pending(
+                    cursor_id,
+                    &PendingReason::new(
+                        PendingKind::Timeout,
+                        run.stage,
+                        run.node,
+                        format!(
+                            "{}（attempt {}）",
+                            timeout_detail(run, "执行超时"),
+                            run.attempt
                         ),
-                    )
-                    .await?;
+                    ),
+                )
+                .await?;
             self.store.sync_task_projection(task_id).await?;
             report.timeout_pending_cursors.push(cursor_id.to_string());
             self.emit_pending(task_id, cursor_id).await?;
@@ -539,8 +543,8 @@ impl KanbanScheduler {
     /// 判据只有一条：仍是 `running` 且**心跳停了**超过 `project_run_idle_timeout_sec`。
     /// 标 `Timeout` 并写一句可读原因——活的那些（正在跑 LLM）心跳会刷新，不会误伤。
     async fn abandon_stale_project_runs(&self, report: &mut TickReport) -> Result<()> {
-        let cutoff = self.clock.now()
-            - Duration::seconds(self.settings.project_run_idle_timeout_sec as i64);
+        let cutoff =
+            self.clock.now() - Duration::seconds(self.settings.project_run_idle_timeout_sec as i64);
         for run in self.store.stale_project_runs(cutoff).await? {
             let idle = self
                 .clock
@@ -628,7 +632,10 @@ impl KanbanScheduler {
                     // ② 同一任务在窗口内再次 pending：**自动修复没治好**（§4.9 的判据之一）。
                     //    按条数判而不是按「有没有未消费的行」判——去重键含 occurred_at，
                     //    两次真事件就是两行，这正是要数出来的东西。
-                    let repeats = self.store.count_attention_since(&task.id, kind, now - window).await?;
+                    let repeats = self
+                        .store
+                        .count_attention_since(&task.id, kind, now - window)
+                        .await?;
                     if repeats > 1
                         && self
                             .store
@@ -689,7 +696,8 @@ impl KanbanScheduler {
             //    active_runs()（run 已是终态就不再被扫），remind_pending_tasks 的 stalled
             //    判据也不成立。这条缝此前零信号。
             if task.status == TaskStatus::Running {
-                if let Some((kind, occurred, detail)) = self.stuck_evidence(&task, now, stuck).await?
+                if let Some((kind, occurred, detail)) =
+                    self.stuck_evidence(&task, now, stuck).await?
                 {
                     if self
                         .store
@@ -716,7 +724,13 @@ impl KanbanScheduler {
         task: &crate::types::Task,
         now: chrono::DateTime<chrono::Utc>,
         stuck: Duration,
-    ) -> Result<Option<(AttentionKind, chrono::DateTime<chrono::Utc>, serde_json::Value)>> {
+    ) -> Result<
+        Option<(
+            AttentionKind,
+            chrono::DateTime<chrono::Utc>,
+            serde_json::Value,
+        )>,
+    > {
         Ok(
             crate::pipeline::unstick::stuck_evidence(&self.store, task, now, stuck)
                 .await?

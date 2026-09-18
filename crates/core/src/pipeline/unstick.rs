@@ -187,7 +187,9 @@ pub async fn unstick(
         },
     )
     .with_context(PendingContext::with_kind(UNSTICK_CONTEXT_KIND));
-    store.set_cursor_pending(&evidence.cursor_id, &reason).await?;
+    store
+        .set_cursor_pending(&evidence.cursor_id, &reason)
+        .await?;
     store.sync_task_projection(task_id).await?;
 
     Ok(Unstuck {

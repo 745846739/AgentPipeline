@@ -538,25 +538,24 @@ async fn run_repair_proposal(
     let repo = std::path::Path::new(&project.local_path);
     let session = RepairSession {
         repair_id: outcome.repair_id.clone(),
+        session_id: proposal.session_id.clone(),
         worktree: std::path::PathBuf::from(&outcome.worktree_path),
         branch: outcome.branch.clone(),
         base_ref: outcome.base_ref.clone(),
     };
 
     // ① 基准前进 / 冲突：以「能不能干净 rebase」为准（指纹换义）
-    match agentpipeline_core::git::Git
-        .rebase_onto_with_auto_resolve(&session.worktree, &session.base_ref)
-        .await
-        .map_err(map_core_error)?
+    if let agentpipeline_core::git::AutoRebaseOutcome::Conflict { files } =
+        agentpipeline_core::git::Git
+            .rebase_onto_with_auto_resolve(&session.worktree, &session.base_ref)
+            .await
+            .map_err(map_core_error)?
     {
-        agentpipeline_core::git::AutoRebaseOutcome::Conflict { files } => {
-            return Err(ApiError::conflict(format!(
-                "修复分支与基准冲突（{}），没有合入——先解决这几处再按：{}",
-                files.len(),
-                files.join("、")
-            )));
-        }
-        _ => {}
+        return Err(ApiError::conflict(format!(
+            "修复分支与基准冲突（{}），没有合入——先解决这几处再按：{}",
+            files.len(),
+            files.join("、")
+        )));
     }
 
     // ② 合入（与 merge 阶段同一个 git 出口）+ 回收（合入成功 → 删分支、删 worktree）
@@ -1007,6 +1006,7 @@ async fn discard_repair_worktree(
     };
     let session = RepairSession {
         repair_id: outcome.repair_id,
+        session_id: proposal.session_id.clone(),
         worktree: std::path::PathBuf::from(&outcome.worktree_path),
         branch: outcome.branch,
         base_ref: outcome.base_ref,

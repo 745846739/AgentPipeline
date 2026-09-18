@@ -238,7 +238,9 @@ pub async fn set_stewardship(
             task.status.as_str()
         )));
     }
-    let value = body.enabled.then(|| Stewardship::enabled_now(state.store.now()));
+    let value = body
+        .enabled
+        .then(|| Stewardship::enabled_now(state.store.now()));
     state
         .store
         .set_stewardship(&id, value.as_ref())

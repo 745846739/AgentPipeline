@@ -60,7 +60,10 @@
     beginForemanStream,
     emptyForemanStream,
     failForemanStream,
+    failedLedgerRowIds,
+    ledgerOwnsTheFailure,
     settleForemanStream,
+    FOREMAN_FAILED_TURN_MARK,
     type ForemanStreamState,
   } from '../realtime/foreman';
   import Sprite from '../components/render/Sprite.svelte';
@@ -199,7 +202,7 @@
    * 前端按它把那一轮渲染成**失败轮**（红、名牌写「发送失败」）而不是中性的操作台轮——
    * 2026-09-17 实测里值班长两次静默失败，页面上只有红轮、原因无处可看。
    */
-  const FAILED_TURN_MARK = '【没跑起来】';
+  const FAILED_TURN_MARK = FOREMAN_FAILED_TURN_MARK;
 
   /**
    * 主动播报的标记（决策 209④ / 票 06）。同样由后端加上（语义源在 foreman.rs 的
@@ -658,6 +661,9 @@
     sending = true;
     pendingText = text;
     stream = beginForemanStream();
+    // 这一趟之前台账里已有的失败轮 id：失败回来后靠它分辨「这次新出现的那一条」
+    // （判据在 realtime/foreman.ts；不记的话，早先的失败会让真正的断网静默下来）
+    const failuresBefore = failedLedgerRowIds(session?.messages ?? []);
     let gen = generation;
     let sid = currentId;
     try {
@@ -696,7 +702,16 @@
       }
       stream = failForemanStream(stream, (err as Error).message);
       // 重取成功才撤乐观轮：撤了之后这话由台账那一行承担，不靠重取失败时凭空消失
-      if (await reload(sid)) pendingText = null;
+      if (await reload(sid)) {
+        pendingText = null;
+        // 后端**已经**把这一轮为什么没跑起来落了账（决策 211④ / 票 04）：那一行就是这次的
+        // 失败轮，而且比本地这条传输报文更全（带归因、刷新后还在）。此时撤掉本地的 error，
+        // 免得同一个失败在时间线里摆成两轮。台账里没有新失败行时才用它兜底——请求根本没
+        // 到后端（网络断了、代理 502、配对 403 发生在进 handler 之前）时，本地是唯一信号。
+        if (ledgerOwnsTheFailure(session?.messages ?? [], failuresBefore)) {
+          stream = { ...stream, error: null };
+        }
+      }
     } finally {
       sending = false;
     }
@@ -1611,13 +1626,15 @@
     white-space: pre;
   }
   /* 修复提议的补丁正文（票 12）：**看得全、能复制**——不要求语法高亮，
-     但要求横向可滚、用户能选中全文。等宽是唯一的形式要求。 */
+     但要求横向可滚、用户能选中全文。等宽是唯一的形式要求。
+     字号随全站的像素纪律（12 的整数倍，`css-parity.test.ts` 钉着）——11px 那条
+     是凭手感写的，被闸门挡下是它该做的事。 */
   .diff-body {
     margin: 0;
     max-height: 320px;
     overflow: auto;
     font-family: var(--font-mono, ui-monospace, SFMono-Regular, Menlo, monospace);
-    font-size: 11px;
+    font-size: 12px;
     line-height: 1.5;
     white-space: pre;
     user-select: text;

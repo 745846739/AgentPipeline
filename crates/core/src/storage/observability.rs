@@ -279,10 +279,7 @@ impl Store {
     /// 筛选条件就是「僵尸行」的定义：仍是 `running`、但最后活动早于 `cutoff`。
     /// 没有任务、没有游标，故 [`crate::storage::Store::requeue_running_tasks`] 与
     /// `check_timeouts` 都不认它们——这就是它们会跨重启永生的原因。
-    pub async fn stale_project_runs(
-        &self,
-        cutoff: DateTime<Utc>,
-    ) -> Result<Vec<NodeRun>> {
+    pub async fn stale_project_runs(&self, cutoff: DateTime<Utc>) -> Result<Vec<NodeRun>> {
         let sql = format!(
             "SELECT {RUN_COLUMNS} FROM kanban_node_runs
              WHERE project_id IS NOT NULL AND task_id IS NULL AND status = 'running'
@@ -314,9 +311,7 @@ impl Store {
                 *id,
                 &RunOutcome {
                     status: Some(crate::types::NodeStatus::Timeout),
-                    error: Some(
-                        "进程重启：项目级 run 成了孤儿，标终态（决策 212 / 票 13）".into(),
-                    ),
+                    error: Some("进程重启：项目级 run 成了孤儿，标终态（决策 212 / 票 13）".into()),
                     ..Default::default()
                 },
             )
@@ -1199,23 +1194,32 @@ pub fn truncate_conversation(
     prompts: Option<PromptSnapshot<'_>>,
     max_chars: usize,
 ) -> TruncatedConversation {
-    let mut remaining = max_chars;
+    // 两段原文先占，但**留出标记的余量**：`truncate_messages_json` 在预算耗尽时会写一条
+    // 截断标记，而那条标记本身也是字符——不留余量，账就不闭合（实测：400 的预算下
+    // 三段加起来 449）。标记有界（一条 JSON 消息），故这个预留够用。
+    let mut remaining = max_chars.saturating_sub(TRUNCATION_MARKER_RESERVE);
     let (system_prompt, user_prompt) = match prompts {
         Some(p) => {
             let system = truncate_text(p.system, remaining);
             remaining = remaining.saturating_sub(system.chars().count());
             let user = truncate_text(p.user, remaining);
-            remaining = remaining.saturating_sub(user.chars().count());
             (Some(system), Some(user))
         }
         None => (None, None),
     };
+    // 给 messages 的余量是「原预算 - 两段原文」，**不是**减去预留之后那个数：
+    // 预留只用来保证标记放得下，不该把 messages 的可用空间也吃掉。
+    let prompt_chars = system_prompt.as_deref().map_or(0, |s| s.chars().count())
+        + user_prompt.as_deref().map_or(0, |s| s.chars().count());
     TruncatedConversation {
-        messages: truncate_messages_json(messages, remaining),
+        messages: truncate_messages_json(messages, max_chars.saturating_sub(prompt_chars)),
         system_prompt,
         user_prompt,
     }
 }
+
+/// 截断标记的预留（见 [`truncate_conversation`]）：一条 JSON 标记消息的字符上界。
+const TRUNCATION_MARKER_RESERVE: usize = 200;
 
 /// 单段 prompt 原文的截断。**留标记**，且标记本身也算在预算里——否则「截断后的长度」
 /// 会随标记长度偷偷超出阈值，账就不闭合了。

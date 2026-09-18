@@ -50,11 +50,7 @@ impl ForemanProposalKind {
         Ok(match raw {
             "api_call" => ForemanProposalKind::ApiCall,
             "repair" => ForemanProposalKind::Repair,
-            other => {
-                return Err(crate::Error::Validation(format!(
-                    "未知的提议形态：{other}"
-                )))
-            }
+            other => return Err(crate::Error::Validation(format!("未知的提议形态：{other}"))),
         })
     }
 }

@@ -4,8 +4,11 @@ import {
   appendForemanDelta,
   beginForemanStream,
   emptyForemanStream,
+  failedLedgerRowIds,
   failForemanStream,
+  ledgerOwnsTheFailure,
   settleForemanStream,
+  FOREMAN_FAILED_TURN_MARK,
 } from './foreman';
 
 /**
@@ -129,5 +132,34 @@ describe('foreman 流式归约', () => {
     const previous = appendForemanDelta(beginForemanStream(), delta('上一轮的话'), SESSION);
     expect(previous.text).toBe('上一轮的话');
     expect(beginForemanStream().text).toBe('');
+  });
+
+  it('失败轮的归属：台账里新出现的那一条才算这一次（决策 211④）', () => {
+    const failedRow = (id: number) => ({
+      id,
+      role: 'system',
+      content: `${FOREMAN_FAILED_TURN_MARK}这一轮没跑起来（llm_auth）：…`,
+    });
+    const mine = { id: 3, role: 'user', content: `${FOREMAN_FAILED_TURN_MARK}我引用了一下这个标记` };
+    const consoleRow = { id: 4, role: 'system', content: '【操作台】…' };
+
+    // 空台账 / 只有无关行 → 本地那一行要留着（请求根本没到后端时它是唯一信号）
+    expect(ledgerOwnsTheFailure([], failedLedgerRowIds([]))).toBe(false);
+    expect(ledgerOwnsTheFailure([mine, consoleRow], failedLedgerRowIds([mine, consoleRow]))).toBe(
+      false,
+    );
+
+    // 失败之后重取到的台账里多出一条带标记的 system 行 → 它就是这次的失败轮
+    const before = failedLedgerRowIds([mine, consoleRow]);
+    expect(ledgerOwnsTheFailure([mine, consoleRow, failedRow(7)], before)).toBe(true);
+
+    // 早先那次失败**不算**：不然一次历史失败会让此后每次真实断网都静默
+    const stale = failedRow(5);
+    const beforeWithStale = failedLedgerRowIds([stale]);
+    expect(ledgerOwnsTheFailure([stale], beforeWithStale)).toBe(false);
+    expect(ledgerOwnsTheFailure([stale, failedRow(9)], beforeWithStale)).toBe(true);
+
+    // 只有「角色是 system 且带标记」的才算：人的话里引用这个标记不作数
+    expect(ledgerOwnsTheFailure([mine], new Set())).toBe(false);
   });
 });

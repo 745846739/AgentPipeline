@@ -73,3 +73,42 @@ export function settleForemanStream(
 export function failForemanStream(state: ForemanStreamState, message: string): ForemanStreamState {
   return { text: state.text, streaming: false, error: message };
 }
+
+/**
+ * 失败回合在台账里的标记（`crates/core/src/pipeline/foreman.rs::FOREMAN_FAILED_TURN_MARK`
+ * 的前端镜像，决策 211④ / 票 04）。
+ */
+export const FOREMAN_FAILED_TURN_MARK = '【没跑起来】';
+
+/** 台账里一行带 id 的轮次（只取判据要用的三列）。 */
+export interface LedgerRow {
+  id: number;
+  role: string;
+  content: string;
+}
+
+/** 这批轮次里**带失败标记**的那些行的 id。 */
+export function failedLedgerRowIds(rows: LedgerRow[]): Set<number> {
+  return new Set(
+    rows
+      .filter((m) => m.role === 'system' && m.content.startsWith(FOREMAN_FAILED_TURN_MARK))
+      .map((m) => m.id),
+  );
+}
+
+/**
+ * 这一次失败**已经**在台账里记下了吗（决策 211④ / 票 04）。
+ *
+ * 后端在失败当场就把「为什么没跑起来」落成一条带标记的 `system` 行（含归因），而前端手里
+ * 还有一条本地造的「发送失败」轮（承载传输层报文与配对入口）。重取台账成功之后，两行会在
+ * 时间线上说同一件事——人得自己分辨哪条是真的。台账那一行更全、刷新之后还在，故本地那行退场。
+ *
+ * `before` 是**发送之前**已有的失败行 id：不带上它，一次早先的失败会让此后每一次真实断网
+ * （请求根本没到后端，台账不会多出任何行）都静默——而那种情况正是本地那行存在的理由。
+ */
+export function ledgerOwnsTheFailure(rows: LedgerRow[], before: ReadonlySet<number>): boolean {
+  return rows.some(
+    (m) =>
+      m.role === 'system' && m.content.startsWith(FOREMAN_FAILED_TURN_MARK) && !before.has(m.id),
+  );
+}

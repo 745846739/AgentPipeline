@@ -156,7 +156,8 @@ impl AttentionRow {
     }
 }
 
-const ATTENTION_COLUMNS: &str = "id, task_id, kind, occurred_at, detail_json, created_at, consumed_at";
+const ATTENTION_COLUMNS: &str =
+    "id, task_id, kind, occurred_at, detail_json, created_at, consumed_at";
 
 impl Store {
     /// 记一条待办。同一 `(task_id, kind, occurred_at)` 已存在时**什么都不做**。

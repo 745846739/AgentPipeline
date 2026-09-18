@@ -9,8 +9,8 @@
 //! 端点仍然负责 HTTP 那一层（参数解析、错误映射、响应 JSON）；这里负责**状态机**。
 
 use crate::actions::is_action_allowed;
-use crate::storage::decisions::ResumeAction;
 use crate::config::Settings;
+use crate::storage::decisions::ResumeAction;
 use crate::storage::Store;
 use crate::types::{Node, PendingKind, Stage};
 use crate::{Error, Result};
@@ -74,7 +74,10 @@ pub async fn apply_resume(
         }
     }
 
-    let target = match (request.target_stage.as_deref(), request.target_node.as_deref()) {
+    let target = match (
+        request.target_stage.as_deref(),
+        request.target_node.as_deref(),
+    ) {
         (Some(stage), Some(node)) => Some((stage.parse::<Stage>()?, node.parse::<Node>()?)),
         _ => None,
     };

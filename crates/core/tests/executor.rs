@@ -911,7 +911,9 @@ async fn the_assembled_prompt_is_kept_verbatim_beside_the_conversation() {
         });
     ctx.agent.set_script(script);
 
-    testkit::seed_task(&ctx.store, "t-prompt", "p1").await.unwrap();
+    testkit::seed_task(&ctx.store, "t-prompt", "p1")
+        .await
+        .unwrap();
     admit(&ctx, "t-prompt").await;
     ctx.executor.run("t-prompt").await.unwrap();
 
@@ -3835,7 +3837,9 @@ async fn unsticking_releases_the_in_process_dedup_and_allows_a_rerun() {
         Arc::new(ctx.killer.clone()),
     ));
 
-    testkit::seed_task(&ctx.store, "t-hang", "p1").await.unwrap();
+    testkit::seed_task(&ctx.store, "t-hang", "p1")
+        .await
+        .unwrap();
     admit(&ctx, "t-hang").await;
 
     // 第一个执行体卡在 LLM 调用上（进程内去重持有 t-hang）
@@ -3850,12 +3854,10 @@ async fn unsticking_releases_the_in_process_dedup_and_allows_a_rerun() {
     })
     .await
     .expect("执行体应进行到第一次 LLM 调用");
-    let before = ctx
-        .store
-        .list_runs_at("t-hang", Stage::Init, Node::Execute)
-        .await
-        .unwrap()
-        .len();
+    // 时钟推一分钟：心跳在这段时间里停了（ManualClock 冻结时 `now - last` 恒为 0，
+    // 而「有主但心跳停了」这条判据需要它真的停过）
+    ctx.clock.advance_secs(61);
+    let before = ctx.store.list_runs("t-hang").await.unwrap().len();
 
     // 不看门：第二个执行体被**进程内去重**拒掉（这正是「清了 DB 也没用」的机制）
     assert!(
@@ -3874,9 +3876,14 @@ async fn unsticking_releases_the_in_process_dedup_and_allows_a_rerun() {
     )
     .await
     .unwrap();
-    assert_eq!(unstuck.run_id > 0, true);
+    assert!(unstuck.run_id > 0);
     assert!(
-        ctx.store.get_task("t-hang").await.unwrap().executor_owner.is_none(),
+        ctx.store
+            .get_task("t-hang")
+            .await
+            .unwrap()
+            .executor_owner
+            .is_none(),
         "占用已清"
     );
 
@@ -3888,12 +3895,7 @@ async fn unsticking_releases_the_in_process_dedup_and_allows_a_rerun() {
         executor.try_run("t-hang").await.unwrap(),
         "unstick 之后 try_run 应当取得执行权"
     );
-    let after = ctx
-        .store
-        .list_runs_at("t-hang", Stage::Init, Node::Execute)
-        .await
-        .unwrap()
-        .len();
+    let after = ctx.store.list_runs("t-hang").await.unwrap().len();
     assert!(after > before, "重跑发生了：run 行由 {before} 增到 {after}");
 }
 
@@ -3942,7 +3944,12 @@ async fn a_healthy_running_task_cannot_be_unstuck() {
         "健康任务不该被踢：{err}"
     );
     assert_eq!(
-        ctx.store.get_task("t-ok").await.unwrap().executor_owner.as_deref(),
+        ctx.store
+            .get_task("t-ok")
+            .await
+            .unwrap()
+            .executor_owner
+            .as_deref(),
         Some("executor:live"),
         "占用没被动过"
     );

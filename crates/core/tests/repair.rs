@@ -16,6 +16,12 @@ use agentpipeline_core::storage::Store;
 use agentpipeline_core::types::Project;
 use testkit::{ManualClock, Repo, TestHome};
 
+/// 开一个班次：修复的命令台账按**严格 XOR** 归属（迁移 0012），而修复属于
+/// 「值班长在一次对话里决定做的事」——归它，不归任务。
+async fn foreman_session(store: &Store) -> String {
+    store.create_foreman_session("").await.unwrap().id
+}
+
 async fn fixture() -> (TestHome, Store, ManualClock, Repo) {
     let home = TestHome::new().unwrap();
     let clock = ManualClock::fixed();
@@ -29,14 +35,23 @@ async fn fixture() -> (TestHome, Store, ManualClock, Repo) {
 /// 票 10：从零拉起一个修复 worktree——分支从正确 base 分出、目录在家下、**值班长写得进**。
 #[tokio::test]
 async fn a_repair_worktree_lives_under_home_and_is_writable_by_the_foreman() {
-    let (home, _store, _clock, repo) = fixture().await;
+    let (home, store, _clock, repo) = fixture().await;
     let base_before = repo.head("main");
     let repair_id = new_repair_id();
-    let session = start_repair(home.home(), repo.path(), "main", &repair_id)
-        .await
-        .unwrap();
+    let session = start_repair(
+        home.home(),
+        repo.path(),
+        "main",
+        &repair_id,
+        &foreman_session(&store).await,
+    )
+    .await
+    .unwrap();
 
-    assert!(session.branch.starts_with("repair/"), "修复分支要有自己的前缀");
+    assert!(
+        session.branch.starts_with("repair/"),
+        "修复分支要有自己的前缀"
+    );
     assert_eq!(session.base_ref, "main", "无 remote 时基准是本地分支");
     assert_eq!(session.base_ref, "main");
     assert_eq!(
@@ -71,20 +86,25 @@ async fn a_repair_worktree_lives_under_home_and_is_writable_by_the_foreman() {
 /// 票 10：两个修复并发拉同一仓库的 worktree，**都成功**（`with_worktree_lock` 的牙齿）。
 #[tokio::test]
 async fn concurrent_repair_worktrees_for_the_same_repo_all_succeed() {
-    let (home, _store, _clock, repo) = fixture().await;
+    let (home, store, _clock, repo) = fixture().await;
     let path = repo.path().to_path_buf();
     let root = home.home().clone();
+    let sid = foreman_session(&store).await;
     let mut handles = Vec::new();
     for _ in 0..2 {
         let path = path.clone();
         let root = root.clone();
+        let sid = sid.clone();
         handles.push(tokio::spawn(async move {
             let id = new_repair_id();
-            start_repair(&root, &path, "main", &id).await
+            start_repair(&root, &path, "main", &id, &sid).await
         }));
     }
     for handle in handles {
-        let session = handle.await.unwrap().expect("并发建 worktree 不该撞 EEXIST");
+        let session = handle
+            .await
+            .unwrap()
+            .expect("并发建 worktree 不该撞 EEXIST");
         assert!(session.worktree.exists());
     }
 }
@@ -92,15 +112,27 @@ async fn concurrent_repair_worktrees_for_the_same_repo_all_succeed() {
 /// 票 10 的回收规则：**合入成功**删分支 + 删 worktree；**被拒**保留分支、删 worktree。
 #[tokio::test]
 async fn cleanup_keeps_the_branch_unless_it_was_merged() {
-    let (home, _store, _clock, repo) = fixture().await;
+    let (home, store, _clock, repo) = fixture().await;
     // 被拒 / 年龄清理那一路
-    let rejected = start_repair(home.home(), repo.path(), "main", &new_repair_id())
-        .await
-        .unwrap();
+    let rejected = start_repair(
+        home.home(),
+        repo.path(),
+        "main",
+        &new_repair_id(),
+        &foreman_session(&store).await,
+    )
+    .await
+    .unwrap();
     rejected_repair(&rejected, repo.path()).await;
-    let merged = start_repair(home.home(), repo.path(), "main", &new_repair_id())
-        .await
-        .unwrap();
+    let merged = start_repair(
+        home.home(),
+        repo.path(),
+        "main",
+        &new_repair_id(),
+        &foreman_session(&store).await,
+    )
+    .await
+    .unwrap();
     finish_repair(repo.path(), &merged, true).await.unwrap();
 
     // 一起断言（两次都在同一个仓上）
@@ -126,9 +158,15 @@ async fn cleanup_keeps_the_branch_unless_it_was_merged() {
 #[tokio::test]
 async fn a_failed_gate_produces_no_diff() {
     let (home, store, _clock, repo) = fixture().await;
-    let session = start_repair(home.home(), repo.path(), "main", &new_repair_id())
-        .await
-        .unwrap();
+    let session = start_repair(
+        home.home(),
+        repo.path(),
+        "main",
+        &new_repair_id(),
+        &foreman_session(&store).await,
+    )
+    .await
+    .unwrap();
     // 在修复 worktree 里改点东西，再让闸门必然失败
     std::fs::write(session.worktree.join("add.rs"), "pub fn x() {}\n").unwrap();
     let readings = run_repair_gate(
@@ -142,6 +180,20 @@ async fn a_failed_gate_produces_no_diff() {
     .unwrap();
     assert_eq!(readings.len(), 1, "lint 未配置时只跑测试");
     assert_ne!(readings[0].exit_code, 0);
+    // 读数**落在那一班的命令台账里**：归属是严格 XOR（任务 xor 班次，迁移 0012:91），
+    // 而修复属于「值班长在一次对话里决定做的事」——于是「它为了这次修复跑了什么」
+    // 与它别的命令排在同一条时间线上，不必另开一个界面去找。
+    let commands = store
+        .list_foreman_commands(&session.session_id)
+        .await
+        .unwrap();
+    assert_eq!(commands.len(), 1, "闸门命令要记在这次修复所属的那一班下");
+    assert_eq!(commands[0].source.as_str(), "system");
+    assert_eq!(
+        commands[0].cwd,
+        session.worktree.display().to_string(),
+        "命令的工作目录就是修复 worktree——「它到底在哪跑的这一条」不该靠猜"
+    );
     let note = gate_failure_note(&readings);
     assert!(note.contains("test"), "{note}");
     assert!(
@@ -155,7 +207,10 @@ async fn a_failed_gate_produces_no_diff() {
     );
     let branch_head = repo.head(&session.branch);
     let base_head = repo.head("main");
-    assert_eq!(branch_head, base_head, "没有 commit：两者还在同一个 commit 上");
+    assert_eq!(
+        branch_head, base_head,
+        "没有 commit：两者还在同一个 commit 上"
+    );
 }
 
 /// 票 11：闸门过了 → commit 存在且 message 带标记；diff 的范围是 `{base}..{branch}`。
@@ -163,9 +218,15 @@ async fn a_failed_gate_produces_no_diff() {
 async fn a_passing_gate_leads_to_a_marked_commit_and_a_scoped_diff() {
     let (home, store, clock, repo) = fixture().await;
     let before = repo.head("main");
-    let session = start_repair(home.home(), repo.path(), "main", &new_repair_id())
-        .await
-        .unwrap();
+    let session = start_repair(
+        home.home(),
+        repo.path(),
+        "main",
+        &new_repair_id(),
+        &foreman_session(&store).await,
+    )
+    .await
+    .unwrap();
     std::fs::write(
         session.worktree.join("fixed.rs"),
         "pub fn fixed() -> i32 { 42 }\n",
@@ -181,8 +242,8 @@ async fn a_passing_gate_leads_to_a_marked_commit_and_a_scoped_diff() {
         "develop 阶段缺了一条约束",
         agentpipeline_core::clock::Clock::now(&clock),
     )
-        .await
-        .unwrap();
+    .await
+    .unwrap();
     let (diff, stat) = repair_diff(repo.path(), &session).await.unwrap();
 
     assert_eq!(repair_head(repo.path(), &session).await.unwrap(), commit);
@@ -215,9 +276,15 @@ async fn a_passing_gate_leads_to_a_marked_commit_and_a_scoped_diff() {
 #[tokio::test]
 async fn the_repair_never_touches_the_project_working_tree() {
     let (home, store, clock, repo) = fixture().await;
-    let session = start_repair(home.home(), repo.path(), "main", &new_repair_id())
-        .await
-        .unwrap();
+    let session = start_repair(
+        home.home(),
+        repo.path(),
+        "main",
+        &new_repair_id(),
+        &foreman_session(&store).await,
+    )
+    .await
+    .unwrap();
     std::fs::write(session.worktree.join("x.rs"), "pub fn x() {}\n").unwrap();
     let _ = run_repair_gate(&store, home.home(), &session, None, Some("true")).await;
     let _ = commit_repair(
@@ -231,10 +298,7 @@ async fn the_repair_never_touches_the_project_working_tree() {
         !repo.is_dirty(),
         "项目工作区必须干净：修复只碰 worktree（本仓不许热修）"
     );
-    assert!(
-        !repo.exists("x.rs"),
-        "改动不该出现在项目工作区里"
-    );
+    assert!(!repo.exists("x.rs"), "改动不该出现在项目工作区里");
 }
 
 /// 修复的判据：不是 git 仓就说清「为什么不能修」。
@@ -278,9 +342,15 @@ async fn a_repair_proposal_survives_the_night() {
         created_at: agentpipeline_core::clock::Clock::now(&clock),
     };
     let session_id = store.create_foreman_session("夜班").await.unwrap().id;
-    let session = start_repair(home.home(), repo.path(), "main", &new_repair_id())
-        .await
-        .unwrap();
+    let session = start_repair(
+        home.home(),
+        repo.path(),
+        "main",
+        &new_repair_id(),
+        &foreman_session(&store).await,
+    )
+    .await
+    .unwrap();
     std::fs::write(session.worktree.join("x.rs"), "pub fn x() {}\n").unwrap();
     let gate = run_repair_gate(&store, home.home(), &session, None, Some("true"))
         .await
@@ -335,11 +405,21 @@ async fn a_repair_proposal_survives_the_night() {
 #[tokio::test]
 async fn the_repair_rebase_check_speaks_up_on_conflicts() {
     let (home, store, clock, repo) = fixture().await;
-    let session = start_repair(home.home(), repo.path(), "main", &new_repair_id())
-        .await
-        .unwrap();
+    let session = start_repair(
+        home.home(),
+        repo.path(),
+        "main",
+        &new_repair_id(),
+        &foreman_session(&store).await,
+    )
+    .await
+    .unwrap();
     // 修复分支改一行
-    std::fs::write(session.worktree.join("src/lib.rs"), "pub fn add(a: i32, b: i32) -> i32 { a - b }\n").unwrap();
+    std::fs::write(
+        session.worktree.join("src/lib.rs"),
+        "pub fn add(a: i32, b: i32) -> i32 { a - b }\n",
+    )
+    .unwrap();
     let _ = run_repair_gate(&store, home.home(), &session, None, Some("true")).await;
     let _ = commit_repair(
         &session,
@@ -363,9 +443,15 @@ async fn the_repair_rebase_check_speaks_up_on_conflicts() {
     );
 
     // 基准又前进，且改的是**同一段**：冲突，且文件清单说得出来
-    let session2 = start_repair(home.home(), repo.path(), "main", &new_repair_id())
-        .await
-        .unwrap();
+    let session2 = start_repair(
+        home.home(),
+        repo.path(),
+        "main",
+        &new_repair_id(),
+        &foreman_session(&store).await,
+    )
+    .await
+    .unwrap();
     std::fs::write(
         session2.worktree.join("src/lib.rs"),
         "pub fn add(a: i32, b: i32) -> i32 { a * b }\n",
@@ -377,7 +463,10 @@ async fn the_repair_rebase_check_speaks_up_on_conflicts() {
         agentpipeline_core::clock::Clock::now(&clock),
     )
     .await;
-    repo.advance_main("src/lib.rs", "pub fn add(a: i32, b: i32) -> i32 { b + a }\n");
+    repo.advance_main(
+        "src/lib.rs",
+        "pub fn add(a: i32, b: i32) -> i32 { b + a }\n",
+    );
     let outcome = Git
         .rebase_onto_with_auto_resolve(&session2.worktree, "main")
         .await
@@ -396,10 +485,16 @@ async fn the_repair_rebase_check_speaks_up_on_conflicts() {
 /// 合入成功那一路：分支合进默认分支 + 回收（删分支、删 worktree）。
 #[tokio::test]
 async fn merging_a_repair_lands_the_branch_and_cleans_up() {
-    let (home, _store, clock, repo) = fixture().await;
-    let session = start_repair(home.home(), repo.path(), "main", &new_repair_id())
-        .await
-        .unwrap();
+    let (home, store, clock, repo) = fixture().await;
+    let session = start_repair(
+        home.home(),
+        repo.path(),
+        "main",
+        &new_repair_id(),
+        &foreman_session(&store).await,
+    )
+    .await
+    .unwrap();
     std::fs::write(session.worktree.join("added.rs"), "pub fn y() {}\n").unwrap();
     let _ = commit_repair(
         &session,

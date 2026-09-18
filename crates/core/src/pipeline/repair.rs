@@ -23,10 +23,10 @@ use std::path::{Path, PathBuf};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
+use crate::agent::tools::{CommandFinish, CommandRecorder, CommandStart};
 use crate::git::Git;
 use crate::home::Home;
 use crate::pipeline::executor::test_command_for;
-use crate::agent::tools::{CommandFinish, CommandRecorder, CommandStart};
 use crate::storage::Store;
 use crate::types::{CommandSource, Node, Stage};
 use crate::{Error, Result};
@@ -75,6 +75,10 @@ pub struct GateReading {
 #[derive(Debug, Clone, PartialEq)]
 pub struct RepairSession {
     pub repair_id: String,
+    /// 这次修复归属的班次。**必填**：修复是值班长在一次对话里决定做的事，命令台账里
+    /// 就该记在那一班名下——迁移 0012 的归属是**严格 XOR**（任务 xor 班次），
+    /// 「两边都不属于」那一行会被存储层直接拒掉（`observability.rs` 的归属归一）。
+    pub session_id: String,
     pub worktree: PathBuf,
     pub branch: String,
     pub base_ref: String,
@@ -89,6 +93,7 @@ pub async fn start_repair(
     project_path: &Path,
     default_branch: &str,
     repair_id: &str,
+    session_id: &str,
 ) -> Result<RepairSession> {
     let worktree = home.repair_worktree_path(repair_id);
     let branch = Git::repair_branch_for(repair_id);
@@ -97,6 +102,7 @@ pub async fn start_repair(
         .await?;
     Ok(RepairSession {
         repair_id: repair_id.to_string(),
+        session_id: session_id.to_string(),
         worktree,
         branch,
         base_ref,
@@ -136,8 +142,9 @@ pub async fn run_repair_gate(
 
 /// 跑一条闸门命令并落库（`kanban_node_commands` 的 system 源 + 全文日志）。
 ///
-/// 修复没有任务、没有游标，故 `task_id` / `run_id` 都是 `None`：它挂的是
-/// **修复自己**（归属由命令内容与日志文件名说清）。这是票 11 要求的「命名要自洽」。
+/// 修复没有任务、没有游标，故 `task_id` / `run_id` 都是 `None`；归属是**那一班**——
+/// 迁移 0012 的 CHECK 要求「任务 xor 班次」恰好一个，命令台账里于是能读到
+/// 「值班长为了这次修复跑了什么」，与它别的命令排在同一条时间线上。
 async fn run_gate_command(
     store: &Store,
     home: &Home,
@@ -148,9 +155,7 @@ async fn run_gate_command(
     let command_id = store
         .record_start(CommandStart {
             task_id: None,
-            // 修复既不是任务也不是值班会话：两处归属都为空。迁移 0012 的 CHECK 只约束
-            // 「不能都是非空」，这里都是 NULL —— 于是这条命令在界面上按「修复」看。
-            session_id: None,
+            session_id: Some(session.session_id.clone()),
             run_id: None,
             stage: REPAIR_STAGE,
             node: Node::Execute,
@@ -177,9 +182,10 @@ async fn run_gate_command(
         Err(e) => (-1, String::new(), format!("命令无法执行：{e}")),
     };
     // 全文落可读路径（与 executor 的闸门日志同一约定，文件名自洽：带修复 id 与 kind）
-    let full_path = home
-        .worktrees_dir()
-        .join(format!("gate-output-repair-{}-{kind}.log", session.repair_id));
+    let full_path = home.worktrees_dir().join(format!(
+        "gate-output-repair-{}-{kind}.log",
+        session.repair_id
+    ));
     let full_log = format!("[stdout]\n{stdout}\n[stderr]\n{stderr}");
     let _ = std::fs::write(&full_path, &full_log);
     let preview = crate::agent::tools::head_tail(&full_log, 10, 20);
@@ -280,7 +286,8 @@ pub async fn finish_repair(
     session: &RepairSession,
     merged: bool,
 ) -> Result<()> {
-    Git.remove_worktree(project_path, &session.worktree, true).await?;
+    Git.remove_worktree(project_path, &session.worktree, true)
+        .await?;
     if merged {
         Git.delete_branch(project_path, &session.branch).await?;
     }
@@ -322,9 +329,7 @@ pub async fn propose_repair(
     };
     let summary = format!(
         "合入修复分支 {} → {}（{}）：{gate_note}",
-        outcome.branch,
-        project.default_branch,
-        project.name
+        outcome.branch, project.default_branch, project.name
     );
     // 指纹换义（决策 212①）：不是「任务状态变没变」，而是「这个分支还能不能干净地 rebase
     // 到基准上」——分支不会因为别的事变迁而失效，而 base 会前进。

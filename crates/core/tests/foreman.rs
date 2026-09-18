@@ -62,6 +62,16 @@ impl Harness {
         h
     }
 
+    /// 再建一个任务（都在 `p1` 下）。
+    ///
+    /// 待办表的 `task_id` 有真外键（一条「关于不存在任务的待办」不是事件，是坏数据），
+    /// 所以凡是要造多任务事件的用例都得**先把任务建出来**，不能只写个 id 串。
+    async fn task(&self, task_id: &str) {
+        testkit::seed_task(&self.store, task_id, "p1")
+            .await
+            .unwrap();
+    }
+
     /// 新开一个班次（会话）。
     ///
     /// 本文件里凡是要「往库里塞几句话」的用例都先开一个——会话是这些行的**必填**
@@ -575,12 +585,19 @@ async fn note(h: &Harness, task_id: &str, kind: agentpipeline_core::storage::Att
 #[tokio::test]
 async fn a_due_attention_wakes_the_foreman_exactly_once() {
     let h = Harness::seeded().await;
-    note(&h, "t1", agentpipeline_core::storage::AttentionKind::RetryExhausted).await;
+    note(
+        &h,
+        "t1",
+        agentpipeline_core::storage::AttentionKind::RetryExhausted,
+    )
+    .await;
     // 去抖窗口过了（默认 60s）
     h.clock.advance_secs(61);
 
     let mut script = Script::new();
-    script.for_foreman().text("t1 重试耗尽了，需要值班经理看一眼。");
+    script
+        .for_foreman()
+        .text("t1 重试耗尽了，需要值班经理看一眼。");
     let agent = FakeAgent::new(script);
     let runner = h.runner(agent.clone());
 
@@ -613,11 +630,28 @@ async fn a_due_attention_wakes_the_foreman_exactly_once() {
 async fn several_events_are_batched_into_one_brief() {
     // 攒批**不许丢事件**：窗口内连来三件，一次唤醒里三条都在。
     let h = Harness::seeded().await;
-    note(&h, "t1", agentpipeline_core::storage::AttentionKind::TaskPending).await;
+    h.task("t2").await;
+    h.task("t3").await;
+    note(
+        &h,
+        "t1",
+        agentpipeline_core::storage::AttentionKind::TaskPending,
+    )
+    .await;
     h.clock.advance_secs(5);
-    note(&h, "t2", agentpipeline_core::storage::AttentionKind::GateFailure).await;
+    note(
+        &h,
+        "t2",
+        agentpipeline_core::storage::AttentionKind::GateFailure,
+    )
+    .await;
     h.clock.advance_secs(5);
-    note(&h, "t3", agentpipeline_core::storage::AttentionKind::SchedulerNoEffect).await;
+    note(
+        &h,
+        "t3",
+        agentpipeline_core::storage::AttentionKind::SchedulerNoEffect,
+    )
+    .await;
     h.clock.advance_secs(61);
 
     let mut script = Script::new();
@@ -657,15 +691,27 @@ async fn several_events_are_batched_into_one_brief() {
 async fn a_fresh_event_is_not_woken_yet() {
     // 去抖窗口内不唤醒（攒批），窗口一到才醒
     let h = Harness::seeded().await;
-    note(&h, "t1", agentpipeline_core::storage::AttentionKind::TaskDone).await;
+    note(
+        &h,
+        "t1",
+        agentpipeline_core::storage::AttentionKind::TaskDone,
+    )
+    .await;
     let mut script = Script::new();
     script.for_foreman().text("播报");
     let agent = FakeAgent::new(script);
     let runner = h.runner(agent.clone());
 
-    assert!(runner.watch().await.unwrap().is_none(), "窗口没过，不吵醒它");
+    assert!(
+        runner.watch().await.unwrap().is_none(),
+        "窗口没过，不吵醒它"
+    );
     assert_eq!(agent.total_calls(), 0, "这一趟一次模型调用都没有");
-    assert_eq!(h.store.open_attention(100).await.unwrap().len(), 1, "事件还在");
+    assert_eq!(
+        h.store.open_attention(100).await.unwrap().len(),
+        1,
+        "事件还在"
+    );
 
     h.clock.advance_secs(60);
     assert!(runner.watch().await.unwrap().is_some());
@@ -696,11 +742,18 @@ async fn a_no_action_verdict_is_recorded_silently() {
     // §2.4：诊断结论是「无需处理」→ 静默入库、**不播报**——一次自愈的风吹草动不该变成
     // 一条消息，而消息本身会挤占 24k 的历史窗口预算。
     let h = Harness::seeded().await;
-    note(&h, "t1", agentpipeline_core::storage::AttentionKind::TaskDone).await;
+    note(
+        &h,
+        "t1",
+        agentpipeline_core::storage::AttentionKind::TaskDone,
+    )
+    .await;
     h.clock.advance_secs(61);
 
     let mut script = Script::new();
-    script.for_foreman().text("【无需处理】这一件按设计走完了。");
+    script
+        .for_foreman()
+        .text("【无需处理】这一件按设计走完了。");
     let agent = FakeAgent::new(script);
     let runner = h.runner(agent.clone());
 
@@ -735,7 +788,12 @@ async fn a_failed_watch_turn_keeps_the_events_unconsumed() {
         }
     }
     let h = Harness::seeded().await;
-    note(&h, "t1", agentpipeline_core::storage::AttentionKind::TaskPending).await;
+    note(
+        &h,
+        "t1",
+        agentpipeline_core::storage::AttentionKind::TaskPending,
+    )
+    .await;
     h.clock.advance_secs(61);
     let runner = ForemanRunner::new(
         h.store.clone(),
@@ -757,7 +815,12 @@ async fn a_failed_watch_turn_keeps_the_events_unconsumed() {
 #[tokio::test]
 async fn notice_only_events_do_not_wake_it() {
     let h = Harness::seeded().await;
-    note(&h, "t1", agentpipeline_core::storage::AttentionKind::SlowRun).await;
+    note(
+        &h,
+        "t1",
+        agentpipeline_core::storage::AttentionKind::SlowRun,
+    )
+    .await;
     h.clock.advance_secs(600);
     let mut script = Script::new();
     script.for_foreman().text("不该发生");
@@ -823,7 +886,11 @@ async fn a_stewarded_resume_runs_without_a_button() {
     let runner = h.runner_with_steward(script, calls.clone());
     let turn = runner.say(None, "t1 卡住了").await.unwrap();
 
-    assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 1, "托管放行：直接执行");
+    assert_eq!(
+        calls.load(std::sync::atomic::Ordering::SeqCst),
+        1,
+        "托管放行：直接执行"
+    );
     // 没有提议（人不用按键）
     assert!(h
         .store
@@ -832,7 +899,11 @@ async fn a_stewarded_resume_runs_without_a_button() {
         .unwrap()
         .is_empty());
     // 留账：会话里一条【托管】行 + 任务行上的计数
-    let messages = h.store.list_foreman_messages(&turn.session.id, 100).await.unwrap();
+    let messages = h
+        .store
+        .list_foreman_messages(&turn.session.id, 100)
+        .await
+        .unwrap();
     let ledger = messages
         .iter()
         .find(|m| m.content.starts_with("【托管】"))
@@ -858,7 +929,11 @@ async fn without_stewardship_the_same_call_is_still_a_proposal() {
     let runner = h.runner_with_steward(script, calls.clone());
     let turn = runner.say(None, "t1 卡住了").await.unwrap();
 
-    assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 0, "未托管：不动手");
+    assert_eq!(
+        calls.load(std::sync::atomic::Ordering::SeqCst),
+        0,
+        "未托管：不动手"
+    );
     let pending = h
         .store
         .list_pending_foreman_proposals(&turn.session.id)
@@ -888,7 +963,10 @@ async fn a_stewarded_task_still_cannot_auto_retry_or_merge() {
         script.for_foreman().tool("task", action.clone());
         script.for_foreman().text("提了。");
         let runner = h.runner_with_steward(script, calls.clone());
-        let turn = runner.say(None, "动手吧").await.unwrap();
+        // 每一轮**各开一班**：`say(None, …)` 会续用最近的那个会话，提议于是会跨轮累加，
+        // 「这一轮提了几条」就再也数不准了。
+        let sid = h.session().await;
+        let turn = runner.say(Some(&sid), "动手吧").await.unwrap();
         assert_eq!(
             calls.load(std::sync::atomic::Ordering::SeqCst),
             0,
@@ -928,8 +1006,13 @@ async fn the_auto_resume_stops_at_the_cap_and_at_the_same_fingerprint() {
     );
     script.for_foreman().text("到上限了，等你按键。");
     let runner = h.runner_with_steward(script, calls.clone());
-    let turn = runner.say(None, "接着修").await.unwrap();
-    assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 0, "触顶即停手");
+    let sid = h.session().await;
+    let turn = runner.say(Some(&sid), "接着修").await.unwrap();
+    assert_eq!(
+        calls.load(std::sync::atomic::Ordering::SeqCst),
+        0,
+        "触顶即停手"
+    );
     assert_eq!(
         h.store
             .list_pending_foreman_proposals(&turn.session.id)
@@ -967,7 +1050,8 @@ async fn the_auto_resume_stops_at_the_cap_and_at_the_same_fingerprint() {
     );
     script.for_foreman().text("同一个指纹，不动。");
     let runner = h.runner_with_steward(script, calls.clone());
-    let turn = runner.say(None, "接着修").await.unwrap();
+    let sid = h.session().await;
+    let turn = runner.say(Some(&sid), "接着修").await.unwrap();
     assert_eq!(
         calls.load(std::sync::atomic::Ordering::SeqCst),
         0,
@@ -989,7 +1073,12 @@ async fn the_auto_resume_stops_at_the_cap_and_at_the_same_fingerprint() {
 async fn the_same_task_is_not_woken_twice_within_the_cooldown() {
     // 同任务冷却：刚处理过的任务，新事件不单独唤醒（事件仍在表里，等冷却到期合并播报）。
     let h = Harness::seeded().await;
-    note(&h, "t1", agentpipeline_core::storage::AttentionKind::TaskPending).await;
+    note(
+        &h,
+        "t1",
+        agentpipeline_core::storage::AttentionKind::TaskPending,
+    )
+    .await;
     h.clock.advance_secs(61);
 
     let mut script = Script::new();
@@ -1000,14 +1089,23 @@ async fn the_same_task_is_not_woken_twice_within_the_cooldown() {
     assert_eq!(agent.total_calls(), 1);
 
     // 冷却期内又来一条同任务事件
-    note(&h, "t1", agentpipeline_core::storage::AttentionKind::TaskPending).await;
+    note(
+        &h,
+        "t1",
+        agentpipeline_core::storage::AttentionKind::TaskPending,
+    )
+    .await;
     h.clock.advance_secs(61);
     assert!(
         runner.watch().await.unwrap().is_none(),
         "冷却期内不再单独唤醒"
     );
     assert_eq!(agent.total_calls(), 1, "没有第二次模型调用");
-    assert_eq!(h.store.open_attention(100).await.unwrap().len(), 1, "事件留着");
+    assert_eq!(
+        h.store.open_attention(100).await.unwrap().len(),
+        1,
+        "事件留着"
+    );
 
     // 冷却到期（默认 30 分钟）后合并播报
     h.clock.advance_secs(30 * 60);
@@ -1027,7 +1125,13 @@ async fn hitting_the_hourly_cap_reports_instead_of_dropping_silently() {
         ..Default::default()
     };
     let h = Harness::seeded().await;
-    note(&h, "t1", agentpipeline_core::storage::AttentionKind::TaskPending).await;
+    h.task("t2").await;
+    note(
+        &h,
+        "t1",
+        agentpipeline_core::storage::AttentionKind::TaskPending,
+    )
+    .await;
     h.clock.advance_secs(61);
 
     let mut script = Script::new();
@@ -1038,17 +1142,30 @@ async fn hitting_the_hourly_cap_reports_instead_of_dropping_silently() {
     assert_eq!(agent.total_calls(), 1);
 
     // 第二件（另一个任务，绕开同任务冷却）
-    note(&h, "t2", agentpipeline_core::storage::AttentionKind::TaskPending).await;
+    note(
+        &h,
+        "t2",
+        agentpipeline_core::storage::AttentionKind::TaskPending,
+    )
+    .await;
     h.clock.advance_secs(61);
     assert!(runner.watch().await.unwrap().is_none(), "触顶：这一次不醒");
     assert_eq!(agent.total_calls(), 1, "触顶不花钱");
 
-    let messages = h.store.list_foreman_messages(&h.latest_session().await, 100).await.unwrap();
+    let messages = h
+        .store
+        .list_foreman_messages(&h.latest_session().await, 100)
+        .await
+        .unwrap();
     let note_row = messages
         .iter()
         .find(|m| m.role == "system" && m.content.contains("已达上限"))
         .expect("触顶要留一行给值班经理，不能静默丢弃");
-    assert!(note_row.content.contains("1 条待办未播报"), "{}", note_row.content);
+    assert!(
+        note_row.content.contains("1 条待办未播报"),
+        "{}",
+        note_row.content
+    );
     assert_eq!(
         h.store.open_attention(100).await.unwrap().len(),
         1,
@@ -1074,7 +1191,12 @@ async fn the_automatic_turn_cannot_reach_the_expensive_tools() {
     // 分级诊断（票 07）：自动那一轮的工具集里**没有** read_conversation 与 run_command；
     // 被追问（人的那一轮）时同一份名单里**有**它们。
     let h = Harness::seeded().await;
-    note(&h, "t1", agentpipeline_core::storage::AttentionKind::TaskPending).await;
+    note(
+        &h,
+        "t1",
+        agentpipeline_core::storage::AttentionKind::TaskPending,
+    )
+    .await;
     h.clock.advance_secs(61);
 
     let mut script = Script::new();
@@ -1122,7 +1244,12 @@ async fn the_watch_cost_is_accounted_separately_from_human_turns() {
     // 「这周值守花了多少」：醒过的次数与 token 在一张**单独的**账上，且静默那一轮也在
     // （它花了钱，只是没说话）。
     let h = Harness::seeded().await;
-    note(&h, "t1", agentpipeline_core::storage::AttentionKind::TaskPending).await;
+    note(
+        &h,
+        "t1",
+        agentpipeline_core::storage::AttentionKind::TaskPending,
+    )
+    .await;
     h.clock.advance_secs(61);
     let mut script = Script::new();
     script.for_foreman().text("播报");
@@ -1136,10 +1263,19 @@ async fn the_watch_cost_is_accounted_separately_from_human_turns() {
     let since = h.clock.now() - chrono::Duration::days(7);
     let (wakes, prompt, completion) = h.store.watch_cost_since(since).await.unwrap();
     assert_eq!(wakes, 1, "值守这边只记了自动那一轮");
-    assert!(prompt > 0 && completion > 0, "token 也要记：{prompt}/{completion}");
+    assert!(
+        prompt > 0 && completion > 0,
+        "token 也要记：{prompt}/{completion}"
+    );
 
     // 静默那一轮同样入账（花了钱没说话）
-    note(&h, "t2", agentpipeline_core::storage::AttentionKind::TaskPending).await;
+    h.task("t2").await;
+    note(
+        &h,
+        "t2",
+        agentpipeline_core::storage::AttentionKind::TaskPending,
+    )
+    .await;
     h.clock.advance_secs(61);
     let mut silent = Script::new();
     silent.for_foreman().text("【无需处理】");
@@ -1213,10 +1349,10 @@ async fn seed_failed_task(h: &Harness, task_id: &str) -> i64 {
         .await
         .unwrap();
     // 命令台账 + 闸门输出的**真文件**（路径与 executor 落的那一份同源）
-    let gate_log = h
-        ._home
-        .home()
-        .task_file(task_id, &format!("gate-output-{}.log", Stage::Test.as_str()));
+    let gate_log = h._home.home().task_file(
+        task_id,
+        &format!("gate-output-{}.log", Stage::Test.as_str()),
+    );
     h._home.home().ensure_task_dirs(task_id).unwrap();
     std::fs::write(&gate_log, "[stdout]\nassertion failed at src/lib.rs:12\n").unwrap();
     record_command(h, task_id, Some(run_id), "cargo test --quiet").await;
@@ -1271,7 +1407,15 @@ async fn one_diagnosis_call_answers_why_it_stalled() {
     // 一次调用的回执里，四类证据同时在场（打在同一份文本上）
     let requests = agent.request_log();
     assert_eq!(requests.len(), 2, "一次工具往返 = 两次 LLM 请求");
-    let fed_back = serde_json::to_string(&requests[1].messages).unwrap();
+    // 断言打在**模型读到的正文**上，不是 `serde_json::to_string` 之后那一份：
+    // 序列化会把正文里的引号转义成 `\"`，于是 `"run_id":7` 这种带引号的证据永远搜不到
+    // （曾经就是这么红的一条：正文里有，转义后匹配不上）。
+    let fed_back = requests[1]
+        .messages
+        .iter()
+        .filter_map(|m| m.content.as_deref())
+        .collect::<Vec<_>>()
+        .join("\n");
     assert!(
         fed_back.contains("闸门失败：测试命令退出码 1"),
         "失败 run 的 error 要在同一次调用里：{fed_back}"
@@ -1282,8 +1426,8 @@ async fn one_diagnosis_call_answers_why_it_stalled() {
         "证据要指名是哪一条 run"
     );
     assert!(
-        fed_back.contains("process_group_id"),
-        "「超时杀不杀得掉」的唯一线索要给出：{fed_back}"
+        fed_back.contains("has_process_group"),
+        "「超时杀不杀得掉」的唯一线索要给出（run 行上有 process_group_id 时为 true）：{fed_back}"
     );
     assert!(
         fed_back.contains("gate-output-test.log"),
@@ -2607,7 +2751,9 @@ async fn unstick_is_in_the_steward_auto_set_but_restart_never_is() {
             .tool("service", serde_json::json!({"action": "restart"}));
         script.for_foreman().text("提了，等你按键。");
         let runner = h.runner_with_steward(script, calls.clone());
-        let turn = runner.say(None, "重启一下").await.unwrap();
+        // 两种托管状态各起一班（同上的理由：提议不能跨轮累加）
+        let sid = h.session().await;
+        let turn = runner.say(Some(&sid), "重启一下").await.unwrap();
         assert_eq!(
             calls.load(std::sync::atomic::Ordering::SeqCst),
             0,

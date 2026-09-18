@@ -1199,7 +1199,8 @@ impl ToolExecutor {
         }
 
         // ③ 全部 run（最近的在前，限条数）：耗时 / token / error / 进程组。
-        let run_rows: Vec<serde_json::Value> = runs.iter().rev().take(runs_limit).map(run_digest).collect();
+        let run_rows: Vec<serde_json::Value> =
+            runs.iter().rev().take(runs_limit).map(run_digest).collect();
         sections.push(serde_json::json!({
             "runs": run_rows,
             "runs_total": runs.len(),
@@ -1241,8 +1242,12 @@ impl ToolExecutor {
             })).collect::<Vec<_>>(),
         }));
 
-        let text = serde_json::to_string_pretty(&serde_json::json!({ "task_id": task.id, "evidence": sections }))?;
-        Ok(ToolOutcome::ok(crate::pipeline::foreman::truncate_tool_result(&text)))
+        let text = serde_json::to_string_pretty(
+            &serde_json::json!({ "task_id": task.id, "evidence": sections }),
+        )?;
+        Ok(ToolOutcome::ok(
+            crate::pipeline::foreman::truncate_tool_result(&text),
+        ))
     }
 
     /// 一个读数 → 交出去的文本。

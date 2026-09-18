@@ -663,7 +663,8 @@ impl Executor {
         std::fs::write(self.store.home().task_file(&task.id, diff_path), &diff)?;
 
         // (4) 合入前强制闸门：lint（如已配置）+ 测试（决策 139）
-        self.mark_step(run_id, "跑合入前的闸门（lint + 测试）").await;
+        self.mark_step(run_id, "跑合入前的闸门（lint + 测试）")
+            .await;
         let gate = self
             .run_code_gate(task, project, run_id, Stage::Merge, Node::Execute, wt, true)
             .await?;
@@ -1148,10 +1149,10 @@ impl Executor {
         error: &Error,
     ) {
         let metadata = failure_metadata(error);
-        let prompts = trace.prompts.as_ref().map(|(system, user)| PromptSnapshot {
-            system,
-            user,
-        });
+        let prompts = trace
+            .prompts
+            .as_ref()
+            .map(|(system, user)| PromptSnapshot { system, user });
         let result = if trace.persisted {
             self.store
                 .annotate_conversation_failure(&task.id, run_id, &metadata)
@@ -1418,10 +1419,10 @@ impl Executor {
                             "main",
                             None,
                             &msgs,
-                            trace.prompts.as_ref().map(|(system, user)| PromptSnapshot {
-                                system,
-                                user,
-                            }),
+                            trace
+                                .prompts
+                                .as_ref()
+                                .map(|(system, user)| PromptSnapshot { system, user }),
                             None,
                             trace.tokens.prompt,
                             trace.tokens.completion,
@@ -1605,10 +1606,10 @@ impl Executor {
                 "main",
                 None,
                 &msgs,
-                trace.prompts.as_ref().map(|(system, user)| PromptSnapshot {
-                    system,
-                    user,
-                }),
+                trace
+                    .prompts
+                    .as_ref()
+                    .map(|(system, user)| PromptSnapshot { system, user }),
                 Some(&value),
                 trace.tokens.prompt,
                 trace.tokens.completion,

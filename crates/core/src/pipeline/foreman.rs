@@ -100,16 +100,6 @@ pub const FOREMAN_TOOL_SPECS: [ForemanToolSpec; 19] = [
         parameters: r#"{"type":"object","properties":{"task_id":{"type":"string","description":"任务 id（快照里方括号内那串）"}},"required":["task_id"]}"#,
     },
     ForemanToolSpec {
-        name: "read_diagnosis",
-        layer: ForemanToolLayer::Read,
-        description: "读某个任务的**诊断包**：一次拿到定因所需的全部证据——每条 run 的状态 / 耗时 / \
-                      token / error / 是否挂过进程组、命令台账与闸门输出路径、阶段产出与验收标准、\
-                      待办原因原文、组装后的 prompt 原文、失败 run 的最后几条工具往来。\
-                      「它为什么卡住 / 为什么失败 / 是不是 prompt 问题」这类问题问它；\
-                      只看「现在什么状态」用 read_task（便宜得多）。",
-        parameters: r#"{"type":"object","properties":{"task_id":{"type":"string","description":"任务 id（快照里方括号内那串）"},"runs":{"type":"integer","description":"最多带回多少条 run（默认 30，最近的在前）"}},"required":["task_id"]}"#,
-    },
-    ForemanToolSpec {
         name: "read_conversation",
         layer: ForemanToolLayer::Read,
         description: "读某个任务某次节点运行的会话回执（工位当时说了什么）。\
@@ -185,6 +175,21 @@ pub const FOREMAN_TOOL_SPECS: [ForemanToolSpec; 19] = [
                       时用它，不要凭名字猜。",
         parameters: r#"{"type":"object","properties":{"name":{"type":"string","description":"技能名（技能目录里列出的那个）"}},"required":["name"]}"#,
     },
+    // 诊断包（决策 211③ / 票 03）：一族一个工具，一次调用给出定因所需的全部证据。
+    // 它**不扩 `read_task`**——后者是每轮值守都会调的高频、便宜读数，混进来会让
+    // 「看一眼任务状态」开始烧 12k 字符。排在只读层末尾：往这份清单里加东西，
+    // diff 里永远是末尾多一段（`foreman_tool_names` 的顺序被冻结断言逐条钉住）。
+    ForemanToolSpec {
+        name: "read_diagnosis",
+        layer: ForemanToolLayer::Read,
+        description:
+            "读某个任务的**诊断包**：一次拿到定因所需的全部证据——每条 run 的状态 / 耗时 / \
+                      token / error / 是否挂过进程组、命令台账与闸门输出路径、阶段产出与验收标准、\
+                      待办原因原文、组装后的 prompt 原文、失败 run 的最后几条工具往来。\
+                      「它为什么卡住 / 为什么失败 / 是不是 prompt 问题」这类问题问它；\
+                      只看「现在什么状态」用 read_task（便宜得多）。",
+        parameters: r#"{"type":"object","properties":{"task_id":{"type":"string","description":"任务 id（快照里方括号内那串）"},"runs":{"type":"integer","description":"最多带回多少条 run（默认 30，最近的在前）"}},"required":["task_id"]}"#,
+    },
     // ── C 层：环境写（决策 206 / 207）。在 `ask` 档下**不执行**，生成提议等人按键；
     //    `auto` 直通；`deny` 连广告都不给。域与 B 层同一份（家目录根 + `data` / `logs` 前缀 deny）。
     ForemanToolSpec {
@@ -218,6 +223,17 @@ pub const FOREMAN_TOOL_SPECS: [ForemanToolSpec; 19] = [
     //    三个**排除项**（决策 207⑤，故意没有对应工具）：重置配对令牌、局域网开关、
     //    仓名单增删。判据是「改的是**谁能访问这台机器**」——让模型能提议它们，等于让它能
     //    给自己开门。本仓对此有专门的用例断言清单里不含它们（`tests/foreman.rs`）。
+    // 全局动作（票 09）：`action=restart`——**永远只提议**（会打断所有在跑的任务），
+    // 既不受档位影响，也不在托管自动集里。
+    ForemanToolSpec {
+        name: "service",
+        layer: ForemanToolLayer::Write,
+        description: "本服务自己的运维动作。action 取值：`restart`（重启服务）。\
+                      它是**全局**动作：会打断所有在跑的任务（本服务没有自重启能力，\
+                      按下后先做恢复序列——清占用 + 把中断的 running 任务归队——\
+                      再告诉你需要在你启动它的地方重启一次）。永远要值班经理按键确认。",
+        parameters: r#"{"type":"object","properties":{"action":{"type":"string","enum":["restart"],"description":"要做的动作"}},"required":["action"]}"#,
+    },
     ForemanToolSpec {
         name: "task",
         layer: ForemanToolLayer::Write,
@@ -243,15 +259,6 @@ pub const FOREMAN_TOOL_SPECS: [ForemanToolSpec; 19] = [
                       `delete`（删掉这个阶段的覆盖行，回到系统默认，要 stage）。\
                       要值班经理按键确认。",
         parameters: r#"{"type":"object","properties":{"action":{"type":"string","enum":["set","delete"],"description":"set 或 delete"},"stage":{"type":"string","description":"阶段键（如 develop / review / foreman）"},"provider_id":{"type":"string","description":"set：用哪个 provider"},"temperature":{"type":"number","description":"set：采样温度"},"max_tokens":{"type":"integer","description":"set：输出上限"},"persona_path":{"type":"string","description":"set：人格文件路径"},"persona_append":{"type":"string","description":"set：追加指令"},"env_mode":{"type":"string","enum":["auto","ask","deny"],"description":"set：环境层权限档位"},"tools_json":{"description":"set：工具声明（与界面那个框同形）"},"skills_json":{"description":"set：技能声明（与界面那个框同形）"},"node_overrides_json":{"description":"set：节点级覆盖（与界面那个框同形）"},"idle_timeout_sec":{"type":"integer","description":"set：空闲超时"},"max_duration_sec":{"type":"integer","description":"set：最长时长"}},"required":["action","stage"]}"#,
-    },
-    ForemanToolSpec {
-        name: "service",
-        layer: ForemanToolLayer::Write,
-        description: "本服务自己的运维动作。action 取值：`restart`（重启服务）。\
-                      它是**全局**动作：会打断所有在跑的任务（本服务没有自重启能力，\
-                      按下后先做恢复序列——清占用 + 把中断的 running 任务归队——\
-                      再告诉你需要在你启动它的地方重启一次）。永远要值班经理按键确认。",
-        parameters: r#"{"type":"object","properties":{"action":{"type":"string","enum":["restart"],"description":"要做的动作"}},"required":["action"]}"#,
     },
     ForemanToolSpec {
         name: "skills",
@@ -340,6 +347,7 @@ pub enum ForemanMoment {
 /// 的那次调用正是被它拦下来变成了提议。执行时再拦一次就会自己吃掉自己（按钮按下去又生成
 /// 一条新提议）。关的是「要不要问人」，不是「准不准」：白名单照旧按**当前**档位判，
 /// 于是档位在提议之后被收紧到 `deny` 时，那条提议按不下去。
+#[allow(clippy::too_many_arguments)]
 pub fn foreman_tooling(
     store: &Store,
     settings: &Settings,
@@ -927,7 +935,9 @@ impl ForemanRunner {
         // 失败也要留痕（决策 211④ / 票 04）：`?` 会把这一轮的现场一起带走，库里只剩
         // 一条孤立的 user 行——2026-09-17 实测里值班长两次没回话，「为什么没回话」
         // 一个字都查不到。故外框兜住所有出口，失败时落一条 `system` 账。
-        let result = self.respond(&session, TurnInput::Human(text.to_string())).await;
+        let result = self
+            .respond(&session, TurnInput::Human(text.to_string()))
+            .await;
         if let Err(error) = &result {
             self.record_failed_turn(&session, error).await;
         }
@@ -1498,7 +1508,19 @@ pub const FOREMAN_FAILED_TURN_MARK: &str = "【没跑起来】";
 /// 四个面：网络 / 配置 / 模型 / 内部。
 fn turn_failure_reason(error: &Error) -> (String, String) {
     match error {
-        Error::LlmClassified { kind, raw, .. } => (kind.clone(), raw.clone()),
+        // `message` 是**人话那一段**（「这一轮没有回话」「密钥不对」这种），`raw` 是
+        // 排查时能拿去搜的原始串。台账那一行两段都要有：只留原文，值班经理读不懂
+        // 「无 tool_calls、无文本」是什么意思；只留人话，现场那串就丢了。
+        Error::LlmClassified {
+            kind, message, raw, ..
+        } => {
+            let reason = if raw.is_empty() || raw == message {
+                message.clone()
+            } else {
+                format!("{message}（原文：{raw}）")
+            };
+            (kind.clone(), reason)
+        }
         // 适配器层的失败（HTTP 错误 / 响应解析 / 连接被拒）：它就是网络那一类
         Error::Llm(msg) => ("llm_network".into(), msg.clone()),
         Error::Config(msg) => ("config".into(), msg.clone()),

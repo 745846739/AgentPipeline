@@ -69,6 +69,11 @@ impl Harness {
     }
 
     /// 造一个"正在跑"的 run，并把 started_at / last_activity_at 回拨。
+    ///
+    /// run 的 `(stage, node)` **取自那个游标自己**，不是写死的：`init` 任务的首个游标在
+    /// `init.execute`，而按 `(task, stage, node)` 找 run 的读法（`stuck_evidence` 的
+    /// 「owner 持有超时 / 处置未生效」两条）会因此一条都找不到——写死 develop.execute
+    /// 时那两条判据永远返回「没卡住」，用例于是要么假绿、要么在断言处莫名地红。
     async fn running_run(
         &self,
         task_id: &str,
@@ -78,13 +83,14 @@ impl Harness {
         idle_secs_ago: i64,
         pgid: Option<i32>,
     ) -> i64 {
+        let cursor = self.store.get_cursor(cursor_id).await.unwrap();
         let run_id = self
             .store
             .insert_run(&NewRun {
                 task_id: task_id.into(),
                 cursor_id: cursor_id.into(),
-                stage: Stage::Develop,
-                node: Node::Execute,
+                stage: cursor.stage,
+                node: cursor.node,
                 attempt,
                 agent_type: "main".into(),
                 parent_run_id: None,
@@ -115,14 +121,18 @@ impl Harness {
     }
 
     /// 造一条**已完成**的成功 run（给定耗时），供自适应分位数采样（票 17）。
+    ///
+    /// 与 [`Self::running_run`] 同理：`(stage, node)` 取自游标——分位数是**按节点**分组的，
+    /// 历史样本与那条正在跑的 run 落不到同一组，告警线就永远算不出来。
     async fn finished_run(&self, task_id: &str, cursor_id: &str, duration_ms: u64) -> i64 {
+        let cursor = self.store.get_cursor(cursor_id).await.unwrap();
         let run_id = self
             .store
             .insert_run(&NewRun {
                 task_id: task_id.into(),
                 cursor_id: cursor_id.into(),
-                stage: Stage::Develop,
-                node: Node::Execute,
+                stage: cursor.stage,
+                node: cursor.node,
                 attempt: 1,
                 agent_type: "main".into(),
                 parent_run_id: None,
@@ -144,6 +154,18 @@ impl Harness {
             .unwrap();
         run_id
     }
+
+    /// 把游标推到 `develop.execute`。
+    ///
+    /// 超时分层（决策 66）与自适应分位数（票 17）都是**按 `(stage, node)`** 取配置与样本的，
+    /// 而 `seed_task` 建的游标停在 `init.execute`。要测那几条读数，就得先让游标真的走到那个
+    /// 节点上——「run 在 develop、游标在 init」是生产里不会出现的形状。
+    async fn advance_to_develop(&self, cursor_id: &str) {
+        self.store
+            .set_cursor_stage(cursor_id, Stage::Develop, Node::Execute)
+            .await
+            .unwrap();
+    }
 }
 
 // ─────────────────────── 票 17：自适应超时告警（决策 66）───────────────────────
@@ -155,6 +177,7 @@ async fn adaptive_timeout_off_by_default_yields_no_alerts() {
     h.seed_task("t-adaptive-off").await;
     h.mark_running("t-adaptive-off").await;
     let cursor = h.store.load_live_cursors("t-adaptive-off").await.unwrap()[0].clone();
+    h.advance_to_develop(&cursor.cursor_id).await;
     // 5 条成功历史（1s 级）
     for _ in 0..5 {
         h.finished_run("t-adaptive-off", &cursor.cursor_id, 1_000)
@@ -179,6 +202,7 @@ async fn adaptive_timeout_enabled_alerts_only_when_past_three_times_p90() {
     h.seed_task("t-adaptive-on").await;
     h.mark_running("t-adaptive-on").await;
     let cursor = h.store.load_live_cursors("t-adaptive-on").await.unwrap()[0].clone();
+    h.advance_to_develop(&cursor.cursor_id).await;
     // 历史：5 条成功、每次 1s → P90 = 1000ms，告警线 3000ms
     for _ in 0..5 {
         h.finished_run("t-adaptive-on", &cursor.cursor_id, 1_000)
@@ -214,6 +238,7 @@ async fn adaptive_timeout_cold_start_does_not_alert() {
     h.seed_task("t-adaptive-cold").await;
     h.mark_running("t-adaptive-cold").await;
     let cursor = h.store.load_live_cursors("t-adaptive-cold").await.unwrap()[0].clone();
+    h.advance_to_develop(&cursor.cursor_id).await;
     // 只有 2 条历史（不足 5）
     for _ in 0..2 {
         h.finished_run("t-adaptive-cold", &cursor.cursor_id, 1_000)
@@ -363,11 +388,19 @@ async fn a_fresh_terminal_run_is_not_noted_yet() {
     terminal_run_at_init(&h, "t1", NodeStatus::Failed, 1).await;
 
     let report = h.scheduler(Settings::default()).tick().await.unwrap();
-    assert_eq!(report.attention_noted, 0, "1 分钟前刚失败，还在正常重试窗口里");
+    assert_eq!(
+        report.attention_noted, 0,
+        "1 分钟前刚失败，还在正常重试窗口里"
+    );
     assert!(h.store.open_attention(100).await.unwrap().is_empty());
 }
 
 /// 心跳停跳的 owner：任务 running、有主、run 还挂着但长时间没有活动。
+///
+/// **这条只在「该节点的空闲超时比 owner 停跳线更长」时才可能成立**：空闲超时若先到
+/// （缺省 300s < 停跳线 10 分钟），超时清扫会先把 run 标终态——那时该报的是
+/// 「调度器处置未生效」，不是这一条。OwnerStuck 管的是另一种局面：清扫暂时不会来
+/// （长跑节点把空闲超时按小时配），而主已经不在了。用例因此按长跑节点配。
 #[tokio::test]
 async fn an_owner_held_run_without_heartbeat_is_noted() {
     let h = Harness::new().await;
@@ -379,7 +412,11 @@ async fn an_owner_held_run_without_heartbeat_is_noted() {
     h.running_run("t1", &cursor.cursor_id, 1, 900, 900, None)
         .await;
 
-    let report = h.scheduler(Settings::default()).tick().await.unwrap();
+    let settings = Settings {
+        node_idle_timeout_sec: 7200, // 长跑节点：空闲超时不会先来收走这一条
+        ..Default::default()
+    };
+    let report = h.scheduler(settings).tick().await.unwrap();
     assert!(report.attention_noted >= 1);
     let open = h.store.open_attention(100).await.unwrap();
     assert!(
@@ -497,7 +534,10 @@ async fn a_timed_out_system_run_names_the_step_it_was_on() {
     let run = runs.iter().find(|r| r.id == run_id).unwrap();
     assert_eq!(run.status, NodeStatus::Timeout);
     assert!(
-        run.error.as_deref().unwrap_or_default().contains("检查项目工作区是否脏"),
+        run.error
+            .as_deref()
+            .unwrap_or_default()
+            .contains("检查项目工作区是否脏"),
         "超时的 run 行要写清当时在哪一步：{:?}",
         run.error
     );
@@ -564,6 +604,8 @@ async fn effective_timeout_layering_node_beats_stage_beats_global() {
     h.seed_task("t1").await;
     h.mark_running("t1").await;
     let cursor = h.store.load_live_cursors("t1").await.unwrap()[0].clone();
+    // 分层读的是 run 所在那个节点的配置，所以它得真的在 develop.execute 上
+    h.advance_to_develop(&cursor.cursor_id).await;
 
     // 阶段级 idle 覆盖为 60s；节点级再覆盖为 120s（决策 66：node > stage > global）
     h.store
@@ -1353,7 +1395,10 @@ async fn a_stale_project_run_is_abandoned() {
     let run = runs.iter().find(|r| r.id == run_id).unwrap();
     assert_eq!(run.status, NodeStatus::Timeout);
     assert!(
-        run.error.as_deref().unwrap_or_default().contains("心跳停止"),
+        run.error
+            .as_deref()
+            .unwrap_or_default()
+            .contains("心跳停止"),
         "原因要可读：{:?}",
         run.error
     );

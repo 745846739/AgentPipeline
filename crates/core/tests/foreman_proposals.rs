@@ -37,8 +37,8 @@ impl Fixture {
     async fn propose(&self, tool: &str, args: serde_json::Value) -> String {
         self.store
             .create_foreman_proposal(NewForemanProposal {
-            kind: agentpipeline_core::storage::proposals::ForemanProposalKind::ApiCall,
-            payload: None,
+                kind: agentpipeline_core::storage::proposals::ForemanProposalKind::ApiCall,
+                payload: None,
                 session_id: self.session_id.clone(),
                 tool: tool.to_string(),
                 args,

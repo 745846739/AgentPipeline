@@ -49,8 +49,8 @@ impl ProposalSink for RecordingSink {
             };
             store
                 .create_foreman_proposal(NewForemanProposal {
-            kind: agentpipeline_core::storage::proposals::ForemanProposalKind::ApiCall,
-            payload: None,
+                    kind: agentpipeline_core::storage::proposals::ForemanProposalKind::ApiCall,
+                    payload: None,
                     session_id,
                     tool,
                     args,

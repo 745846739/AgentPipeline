@@ -88,7 +88,10 @@ impl agentpipeline_core::agent::tools::StewardActionRunner for StewardResume {
                     .get("target_node")
                     .and_then(|v| v.as_str())
                     .map(str::to_string),
-                input: args.get("input").and_then(|v| v.as_str()).map(str::to_string),
+                input: args
+                    .get("input")
+                    .and_then(|v| v.as_str())
+                    .map(str::to_string),
             };
             let applied = apply_resume(&store, &settings, &resume, &task_id, &request).await?;
             Ok(agentpipeline_core::agent::tools::ToolOutcome::ok(format!(

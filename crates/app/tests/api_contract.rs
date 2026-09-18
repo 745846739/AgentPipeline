@@ -4334,7 +4334,6 @@ async fn api_full_with_foreman(settings: Settings, agent: Option<FakeAgent>) -> 
     }
 }
 
-
 // ─────────────── 任务级托管：端点与自动放行（决策 210② / 票 08）───────────────
 
 #[tokio::test]
@@ -4346,12 +4345,7 @@ async fn stewardship_is_a_task_level_switch_read_back_on_the_task() {
     let (_, body) = get(&api, "/tasks/t1").await;
     assert!(body["task"]["stewardship"].is_null(), "{body}");
 
-    let (status, body) = post(
-        &api,
-        "/tasks/t1/stewardship",
-        json!({"enabled": true}),
-    )
-    .await;
+    let (status, body) = post(&api, "/tasks/t1/stewardship", json!({"enabled": true})).await;
     assert_eq!(status, StatusCode::OK, "{body}");
     assert_eq!(body["task"]["stewardship"]["enabled"], true);
 
@@ -4389,21 +4383,28 @@ async fn stewardship_is_refused_on_a_terminal_task_and_when_unwired() {
 #[tokio::test]
 async fn a_stewarded_task_is_resumed_by_the_foreman_without_a_press() {
     // 端到端：开托管 → 值班长说 resume(continue) → **真的走了 resume 那条路**（无提议、有账）。
+    //
+    // 待办形态得挑对：托管放开的**只有** `continue`（决策 210②），而「允许集合里有哪些动作」
+    // 是按 pending 的种类下发的——`retry_exhausted` 那一档只有 goto / skip / cancel，
+    // 拿它做样本的话 `continue` 会被状态机正当地拒掉，用例永远看不到「放行」那一步。
+    // 「裁决分歧」这一档的 continue（裁决合格，继续）是真实存在的合法落点。
     let agent = FakeAgent::new(Script::new());
     let api = api_with_foreman(agent.clone()).await;
     seed(&api, "t1").await;
+    let cursor = api.state.store.load_live_cursors("t1").await.unwrap()[0].clone();
     api.state
         .store
         .set_cursor_pending(
-            &api.state.store.load_live_cursors("t1").await.unwrap()[0]
-                .cursor_id
-                .clone(),
+            &cursor.cursor_id,
             &agentpipeline_core::types::PendingReason::new(
-                agentpipeline_core::types::PendingKind::RetryExhausted,
-                Stage::ArchitectDesign,
-                agentpipeline_core::types::Node::Execute,
-                "重试耗尽",
-            ),
+                agentpipeline_core::types::PendingKind::UserDecision,
+                cursor.stage,
+                cursor.node,
+                "评审员与架构师对这条裁决有分歧",
+            )
+            .with_context(agentpipeline_core::types::PendingContext::with_kind(
+                agentpipeline_core::actions::kinds::JUDGE_DISAGREEMENT,
+            )),
         )
         .await
         .unwrap();
