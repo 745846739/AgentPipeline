@@ -16,8 +16,8 @@ use agentpipeline_core::config::Settings;
 use agentpipeline_core::metrics;
 use agentpipeline_core::pipeline::foreman::{
     build_briefing, foreman_tool_names, situation_fingerprint, trim_history, ForemanRunner,
-    ForemanToolLayer, FOREMAN_AGENT_TYPE, FOREMAN_FAILED_TURN_MARK, FOREMAN_PERSONA,
-    FOREMAN_STAGE_KEY, FOREMAN_TOOL_SPECS, FOREMAN_WATCH_MARK, OPERATION_LOG_MARK,
+    ForemanToolLayer, FOREMAN_AGENT_TYPE, FOREMAN_FAILED_TURN_MARK, FOREMAN_MAX_ROUNDS,
+    FOREMAN_PERSONA, FOREMAN_STAGE_KEY, FOREMAN_TOOL_SPECS, FOREMAN_WATCH_MARK, OPERATION_LOG_MARK,
 };
 use agentpipeline_core::storage::foreman::NewForemanMessage;
 use agentpipeline_core::storage::tasks::TaskFilter;
@@ -594,6 +594,51 @@ async fn a_silent_model_is_recorded_with_its_own_kind() {
         failed.content
     );
     assert!(failed.content.contains("没有回话"), "{}", failed.content);
+}
+
+/// 轮数耗尽与空回话是**两种不同的失败**（票 04 的 kind 机制）：脚本每一轮都发起工具调用，
+/// 模型一直在查台账、从不收口——到上限必须有人喊停，否则它会烧 token 直到 HTTP 超时
+/// （决策 182④）。这正是 2026-09-18 那两轮的形状（决策 224）。
+///
+/// 脚本按常量声明而不是写死轮数：本用例钉的是「耗尽就报这一类别、并且落一条可归因的账、
+/// 模型确实被叫了整整数轮」，不是「上限恰好是几」——那个数没有用例值得钉。
+#[tokio::test]
+async fn a_foreman_that_never_wraps_up_is_capped_and_named() {
+    let h = Harness::empty().await;
+    let mut script = Script::new();
+    for _ in 0..FOREMAN_MAX_ROUNDS {
+        script
+            .for_foreman()
+            .tool("read_task", serde_json::json!({"task_id": "t1"}));
+    }
+    let agent = FakeAgent::new(script);
+    let runner = h.runner(agent.clone());
+    let sid = h.session().await;
+
+    let err = runner.say(Some(&sid), "盯着这个任务").await.unwrap_err();
+    let kind = err.llm_classified().map(|(k, _)| k.to_string());
+    assert_eq!(
+        kind.as_deref(),
+        Some("model_no_reply"),
+        "轮数耗尽要带自己的类别：{err}"
+    );
+    // 整整数轮模型调用：上限就是「模型被叫了几次」，不是「工具被调了几次」。
+    assert_eq!(
+        agent.calls_for(Stage::Init, Node::Execute),
+        FOREMAN_MAX_ROUNDS as u32,
+        "该停在上限上"
+    );
+
+    let messages = h.store.list_foreman_messages(&sid, 100).await.unwrap();
+    let failed = messages
+        .iter()
+        .find(|m| m.role == "system")
+        .expect("失败回合要落一条 system 账");
+    assert!(
+        failed.content.contains("model_no_reply") && failed.content.contains("轮内没有给出回话"),
+        "{}",
+        failed.content
+    );
 }
 
 #[tokio::test]
