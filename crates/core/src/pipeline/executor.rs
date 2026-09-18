@@ -1081,6 +1081,12 @@ impl Executor {
     /// 参数多于 clippy 的默认阈值：`run_id` / `attempt` / `carried` 三者都是**本次尝试**的
     /// 入参，绑成结构体只是把同一份信息换个地方写，不改变调用点的可读性。
     #[allow(clippy::too_many_arguments)]
+    /// 一次 agent 尝试的**外框**（票 01 / 决策 211①）：失败也要落会话，所以现场
+    /// （`messages` / `tokens`）必须活到函数出口——`?` 会把它们一起带走，那正是
+    /// 2026-09-17 实测里「失败的那一轮什么都不留」的机制。
+    ///
+    /// `persisted` 保证**一条 run 至多一条会话行**（决策 99）：成功路径已经写过时，
+    /// 失败收尾只把错误上下文并进那一行，不再插新行。
     async fn agent_attempt(
         &self,
         task: &Task,
@@ -1090,6 +1096,79 @@ impl Executor {
         run_id: i64,
         attempt: u32,
         carried: &[Message],
+    ) -> Result<(NodeOutput, RunTokens)> {
+        let mut trace = AttemptTrace {
+            messages: carried.to_vec(),
+            ..Default::default()
+        };
+        let result = self
+            .agent_attempt_inner(task, project, cursor, kind, run_id, attempt, &mut trace)
+            .await;
+        if let Err(error) = &result {
+            self.record_failed_attempt(task, cursor, run_id, attempt, &trace, error)
+                .await;
+        }
+        result
+    }
+
+    /// 失败现场的落库。**落库失败不覆盖原错误**：调用方要带回去的是节点为什么失败，
+    /// 不是记账为什么失败——后者只值一条 error 日志。
+    async fn record_failed_attempt(
+        &self,
+        task: &Task,
+        cursor: &NodeCursor,
+        run_id: i64,
+        attempt: u32,
+        trace: &AttemptTrace,
+        error: &Error,
+    ) {
+        let metadata = failure_metadata(error);
+        let result = if trace.persisted {
+            self.store
+                .annotate_conversation_failure(&task.id, run_id, &metadata)
+                .await
+        } else {
+            let msgs = match serde_json::to_value(&trace.messages) {
+                Ok(v) => v,
+                Err(e) => {
+                    tracing::error!(run_id, "失败会话不可序列化：{e}");
+                    return;
+                }
+            };
+            self.store
+                .insert_conversation(
+                    &task.id,
+                    run_id,
+                    cursor.stage,
+                    cursor.node,
+                    attempt,
+                    "main",
+                    None,
+                    &msgs,
+                    Some(&metadata),
+                    trace.tokens.prompt,
+                    trace.tokens.completion,
+                )
+                .await
+                .map(|_| ())
+        };
+        if let Err(e) = result {
+            tracing::error!(run_id, "失败会话落库失败（原错误仍照原样上报）：{e}");
+        }
+    }
+
+    /// 一次尝试的**内里**：与外框同签名，外加现场。它专管「跑」，
+    /// 出口的记账（成功写一行、失败补上下文）归 [`Self::agent_attempt`]。
+    #[allow(clippy::too_many_arguments)]
+    async fn agent_attempt_inner(
+        &self,
+        task: &Task,
+        project: &Project,
+        cursor: &NodeCursor,
+        kind: AgentNodeKind,
+        run_id: i64,
+        attempt: u32,
+        trace: &mut AttemptTrace,
     ) -> Result<(NodeOutput, RunTokens)> {
         let home = self.store.home().clone();
         home.ensure_task_dirs(&task.id)?;
@@ -1253,14 +1332,12 @@ impl Executor {
             .set_run_template_hash(run_id, &template_hash)
             .await?;
 
-        let mut messages: Vec<Message> = carried.to_vec();
         // 压缩锚点的边界（决策 180，票 13 必要条件三）：`carried` 是**上一轮**的对话，
         // 它里面的 user 消息不得充当「本轮第一条 user 消息」这个锚点——否则载入历史后，
         // keep 预算会被上一轮的提问占掉。
-        let carried_len = messages.len();
+        let carried_len = trace.messages.len();
         let mut tool_failures = 0u32;
         let mut submitted: Option<serde_json::Value> = None;
-        let mut tokens = RunTokens::default();
 
         // L0 容量预估（决策 110 / 票 04）：窗口来自解析后的 provider 行
         // （`providers.context_window`，决策 46 / 111）。无可用 provider（FakeAgent /
@@ -1289,7 +1366,7 @@ impl Executor {
                         &system_prompt,
                         &user_prompt,
                         carried_len,
-                        &mut messages,
+                        &mut trace.messages,
                     )
                     .await?
                 {
@@ -1298,7 +1375,7 @@ impl Executor {
                     // 票 13 的必要条件一（决策 180）：这条退出路径在会话落库**之前**返回，
                     // 于是「开了续接却读不到上一轮」会是一条静默无效的路。先补写会话行，
                     // 再返回 pending——它正是续接最需要的那个失败现场。
-                    let msgs = serde_json::to_value(&messages)?;
+                    let msgs = serde_json::to_value(&trace.messages)?;
                     self.store
                         .insert_conversation(
                             &task.id,
@@ -1310,11 +1387,13 @@ impl Executor {
                             None,
                             &msgs,
                             None,
-                            tokens.prompt,
-                            tokens.completion,
+                            trace.tokens.prompt,
+                            trace.tokens.completion,
                         )
                         .await?;
-                    return Ok((NodeOutput::Pending(reason), tokens));
+                    // 这一条 run 的会话行已经写过（外框的失败收尾只补上下文，不再插行）
+                    trace.persisted = true;
+                    return Ok((NodeOutput::Pending(reason), trace.tokens));
                 }
             }
 
@@ -1324,7 +1403,7 @@ impl Executor {
                 attempt,
                 system_prompt: system_prompt.clone(),
                 user_prompt: user_prompt.clone(),
-                messages: messages.clone(),
+                messages: trace.messages.clone(),
                 tools: tool_defs(
                     kind,
                     &declared_tools,
@@ -1346,8 +1425,8 @@ impl Executor {
                 }),
             };
             let response = self.llm.complete(req).await?;
-            tokens.add(&response);
-            messages.push(Message::assistant(
+            trace.tokens.add(&response);
+            trace.messages.push(Message::assistant(
                 response.content.clone(),
                 response.tool_calls.clone(),
             ));
@@ -1375,7 +1454,9 @@ impl Executor {
                         if let Some(m) = outcome.metadata {
                             submitted = Some(m);
                         }
-                        messages.push(Message::tool_result(call, outcome.content));
+                        trace
+                            .messages
+                            .push(Message::tool_result(call, outcome.content));
                         self.emit_tool_event(
                             task,
                             cursor,
@@ -1398,7 +1479,9 @@ impl Executor {
                         );
                         // G13：工具失败在 agent loop 内重试，只计 tool_retry_max 次
                         tool_failures += 1;
-                        messages.push(Message::tool_result(call, format!("工具执行失败：{e}")));
+                        trace
+                            .messages
+                            .push(Message::tool_result(call, format!("工具执行失败：{e}")));
                         if tool_failures > self.settings.tool_retry_max {
                             return Err(Error::Validation(format!(
                                 "工具失败超过 tool_retry_max：{e}"
@@ -1414,7 +1497,7 @@ impl Executor {
             Some(v) => v,
             None => {
                 let final_resp = crate::agent::client::AgentResponse {
-                    content: messages.iter().rev().find_map(|m| m.content.clone()),
+                    content: trace.messages.iter().rev().find_map(|m| m.content.clone()),
                     ..Default::default()
                 };
                 let extracted = crate::agent::metadata::extract_metadata(&final_resp);
@@ -1475,7 +1558,7 @@ impl Executor {
         }
 
         // 会话落库（§12.4.3；1:1 对调 LLM 的 run，决策 99）
-        let msgs = serde_json::to_value(&messages)?;
+        let msgs = serde_json::to_value(&trace.messages)?;
         self.store
             .insert_conversation(
                 &task.id,
@@ -1487,21 +1570,24 @@ impl Executor {
                 None,
                 &msgs,
                 Some(&value),
-                tokens.prompt,
-                tokens.completion,
+                trace.tokens.prompt,
+                trace.tokens.completion,
             )
             .await?;
+        // 这一条 run 的会话行已经写过：后面若在 `post_process` 上失败，外框只把错误
+        // 上下文并进这一行（票 01），不会再插一行——1:1 的口径不因失败路径而破。
+        trace.persisted = true;
         self.store.refresh_task_totals(&task.id).await?;
 
         // 分歧路径在节点内直接置 pending，不经 post_process / 路由（决策 135）
         if let Some(reason) = judge_disagreement {
-            return Ok((NodeOutput::Pending(reason), tokens));
+            return Ok((NodeOutput::Pending(reason), trace.tokens));
         }
 
         let output = kind
             .post_process(self, task, cursor, run_id, attempt, value)
             .await?;
-        Ok((output, tokens))
+        Ok((output, trace.tokens))
     }
 
     // ─────────────────────── 伪阶段（决策 48 / 60 / 67 / 88 / 100 / 113 / 134）───────────────────────
@@ -3026,6 +3112,32 @@ fn args_summary(text: &str) -> String {
         let cut: String = compact.chars().take(LIMIT).collect();
         format!("{cut}…")
     }
+}
+
+/// 一次 agent 尝试的现场（票 01 / 决策 211①）。
+///
+/// 失败也要落会话，所以现场必须活到函数出口——`?` 会把内存里的 `messages` 一起带走，
+/// 那正是那次实测「失败的那一轮什么都不留」的机制。`persisted` 保证一条 run 至多一条
+/// 会话行（决策 99）：成功路径已经写过时，失败收尾只往那一行补错误上下文。
+#[derive(Default)]
+struct AttemptTrace {
+    messages: Vec<Message>,
+    tokens: RunTokens,
+    persisted: bool,
+}
+
+/// 失败会话写在 `metadata_json` 里的上下文（票 01）：读会话的人先看到它，才知道这条
+/// 对话为什么停在这里。可归因的 LLM 失败额外带上类别与原始诊断——它们回答的是
+/// 「该去改什么」，与 `error` 那句「发生了什么」不是一回事。
+fn failure_metadata(error: &Error) -> serde_json::Value {
+    let mut meta = serde_json::json!({
+        "failed": true,
+        "error": error.to_string(),
+    });
+    if let Some((kind, raw)) = error.llm_classified() {
+        meta["classified"] = serde_json::json!({ "kind": kind, "raw": raw });
+    }
+    meta
 }
 
 /// 节点执行结论：大多数走路由；少数（merge 冲突打回 / 决策 135 分歧）直接给边或 pending。

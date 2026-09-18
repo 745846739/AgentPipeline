@@ -124,11 +124,11 @@ impl MockLlm {
         }));
         let responder: Responder = Arc::new(move |request: &RecordedRequest| {
             let system = request_system_prompt(&request.body).unwrap_or_default();
-            let body = {
+            let step_route = {
                 let mut state = state.lock().unwrap();
                 if let Some(agent_type) = pseudo_agent_type(&system) {
                     if state.just_submitted_pseudo.remove(agent_type) {
-                        sse_text("（已提交元数据）")
+                        MockRoute::sse("/", sse_text("（已提交元数据）"))
                     } else {
                         let step = state.script.take_next_pseudo(agent_type);
                         if matches!(step, Some(Step::Submit(_))) {
@@ -138,7 +138,7 @@ impl MockLlm {
                     }
                 } else if let Some((stage, node)) = node_for_system(&system) {
                     if state.just_submitted_nodes.remove(&(stage, node)) {
-                        sse_text("（已提交元数据）")
+                        MockRoute::sse("/", sse_text("（已提交元数据）"))
                     } else {
                         let step = state.script.take_next(stage, node);
                         if matches!(step, Some(Step::Submit(_))) {
@@ -148,10 +148,10 @@ impl MockLlm {
                     }
                 } else {
                     // 认不出的请求（如未脚本化节点）：当作脚本耗尽，干净收尾。
-                    sse_text("（脚本已结束）")
+                    MockRoute::sse("/", sse_text("（脚本已结束）"))
                 }
             };
-            MockRoute::sse("/", body)
+            step_route
         });
         Self::start_responder(responder).await
     }
@@ -280,15 +280,25 @@ fn pseudo_agent_type(system: &str) -> Option<&'static str> {
         .map(|(_, agent_type)| *agent_type)
 }
 
-/// 一步脚本 → 一段 OpenAI 兼容 SSE。
-fn render_step(step: Option<Step>) -> String {
+/// 一步脚本 → 一条 mock 响应。
+fn render_step(step: Option<Step>) -> MockRoute {
     match step {
-        Some(Step::Tool { name, arguments }) => sse_tool(&name, &arguments.to_string()),
-        Some(Step::Submit(value)) => sse_tool("submit_metadata", &value.to_string()),
-        Some(Step::Text(text)) => sse_text(&text),
+        Some(Step::Tool { name, arguments }) => {
+            MockRoute::sse("/", sse_tool(&name, &arguments.to_string()))
+        }
+        Some(Step::Submit(value)) => {
+            MockRoute::sse("/", sse_tool("submit_metadata", &value.to_string()))
+        }
+        Some(Step::Text(text)) => MockRoute::sse("/", sse_text(&text)),
         // Stall：不写 [DONE]，连接关闭即流结束（与 FakeAgent 的「永不返回」近似）
-        Some(Step::Stall) => String::new(),
-        None => sse_text("（脚本已结束）"),
+        Some(Step::Stall) => MockRoute::sse("/", String::new()),
+        // 当场报错：真 HTTP 层的失败（与生产适配器的 401 / 429 / 5xx 同形）
+        Some(Step::Fail { kind, message, .. }) => MockRoute::json(
+            "/",
+            503,
+            serde_json::json!({"error": {"type": kind, "message": message}}).to_string(),
+        ),
+        None => MockRoute::sse("/", sse_text("（脚本已结束）")),
     }
 }
 

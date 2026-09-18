@@ -26,6 +26,14 @@ pub enum Step {
     Text(String),
     /// 不返回（心跳停跳 / 卡死），配合假时钟验证空闲 / 绝对超时。
     Stall,
+    /// LLM 调用当场失败（决策 211① / 票 01）：适配器层的可归因失败——401 / 429 /
+    /// 网络不可达 / 窗口超限。与 [`Step::Stall`] 并列成一对照：一个「永不返回」，
+    /// 一个「立刻报错」；两者都是**失败现场**，都得留下证据。
+    Fail {
+        kind: String,
+        message: String,
+        raw: String,
+    },
 }
 
 /// 按 `(stage, node)` 组织的脚本；伪阶段按 `agent_type`（`pseudo:*`）单独排队（testing.md §3.2 ⑥）。
@@ -277,6 +285,16 @@ impl NodeScript<'_> {
         self.push(Step::Stall)
     }
 
+    /// LLM 调用当场失败（票 01）：`kind` 用生产的稳定类别标识
+    /// （`llm_auth` / `llm_network` / `llm_context_window` …）。
+    pub fn fail_llm(self, kind: &str, message: &str, raw: &str) -> Self {
+        self.push(Step::Fail {
+            kind: kind.to_string(),
+            message: message.to_string(),
+            raw: raw.to_string(),
+        })
+    }
+
     pub fn push(self, step: Step) -> Self {
         self.script.push(self.stage, self.node, step);
         self
@@ -514,6 +532,10 @@ impl LlmClient for FakeAgent {
                 // 不返回：由节点级超时包装终止（决策 64 / 148 ④）
                 Some(Step::Stall) => {
                     std::future::pending::<agentpipeline_core::Result<AgentResponse>>().await
+                }
+                // 当场报错：适配器层的可归因失败（票 01 的失败落库路径）
+                Some(Step::Fail { kind, message, raw }) => {
+                    Err(agentpipeline_core::Error::LlmClassified { kind, message, raw })
                 }
                 // 脚本耗尽：返回无 tool_call 的收尾响应，agent loop 自然结束
                 None => Ok(AgentResponse {

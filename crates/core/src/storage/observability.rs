@@ -628,6 +628,53 @@ impl Store {
         Ok(id)
     }
 
+    /// 把失败原因并进**已落库**会话行的 `metadata_json`（票 01 / 决策 211①）。
+    ///
+    /// 用得上它的路径：会话行已经写过、而 run 仍在后面失败（`post_process` 那一段）。
+    /// 此时再插一行会破坏「一条 run 至多一条会话行」（决策 99）；而失败原因又不能丢——
+    /// 读会话的人得知道它为什么停在这里。故只合并，不插行。
+    pub async fn annotate_conversation_failure(
+        &self,
+        task_id: &str,
+        run_id: i64,
+        failure: &serde_json::Value,
+    ) -> Result<()> {
+        let raw: Option<Option<String>> = sqlx::query_scalar(
+            "SELECT metadata_json FROM kanban_node_conversations WHERE task_id = ? AND run_id = ?",
+        )
+        .bind(task_id)
+        .bind(run_id)
+        .fetch_optional(self.pool())
+        .await?;
+        let Some(Some(raw)) = raw else {
+            return Ok(());
+        };
+        let Ok(mut existing) = serde_json::from_str::<serde_json::Value>(&raw) else {
+            // 坏 JSON 不静默覆盖：它是观测类字段，让它留着比让错误原因吞掉它更好
+            tracing::warn!(
+                task_id,
+                run_id,
+                "会话 metadata_json 不是合法 JSON，跳过失败上下文写入"
+            );
+            return Ok(());
+        };
+        if let (Some(dst), Some(src)) = (existing.as_object_mut(), failure.as_object()) {
+            for (k, v) in src {
+                dst.insert(k.clone(), v.clone());
+            }
+        }
+        sqlx::query(
+            "UPDATE kanban_node_conversations SET metadata_json = ?
+             WHERE task_id = ? AND run_id = ?",
+        )
+        .bind(existing.to_string())
+        .bind(task_id)
+        .bind(run_id)
+        .execute(self.pool())
+        .await?;
+        Ok(())
+    }
+
     /// 落一行**项目级**伪阶段会话（票 10 / 决策 100）：`project_id` 归属项目，
     /// `task_id` 为 NULL，`run_id` 指向项目级 run。
     #[allow(clippy::too_many_arguments)]

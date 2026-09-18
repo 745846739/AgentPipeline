@@ -722,6 +722,148 @@ async fn agent_metadata_failure_retries_then_pends() {
         "每个 attempt 都落 run 行"
     );
     assert!(runs.iter().all(|r| r.status == NodeStatus::Failed));
+
+    // 票 01（决策 211①）：失败的每一轮同样落会话行——1:1 对 run，attempt 区分。
+    // 这条链路今天断在「`?` 把内存里的 messages 一起带走」，所以查不到失败现场。
+    let convs: Vec<_> = ctx
+        .store
+        .list_conversations("t4", true)
+        .await
+        .unwrap()
+        .into_iter()
+        .filter(|c| c.stage == Stage::ArchitectDesign && c.node == Node::Execute)
+        .collect();
+    assert_eq!(
+        convs.len(),
+        runs.len(),
+        "每个失败的 run 都该有且仅有一条会话行"
+    );
+    for conv in &convs {
+        let meta = conv
+            .metadata_json
+            .as_ref()
+            .expect("失败会话要带错误上下文（否则读会话的人不知道它为什么停在这里）");
+        assert_eq!(meta["failed"], true);
+        assert!(
+            !meta["error"].as_str().unwrap_or_default().is_empty(),
+            "失败原因不能是空串：{meta}"
+        );
+        assert!(
+            !conv.messages_json.as_array().unwrap().is_empty(),
+            "失败前的消息要留下（这里正是「模型回了文本却没给元数据」）"
+        );
+    }
+}
+
+// ─────────────────── 失败路径的会话落库（决策 211① / 票 01）───────────────────
+
+#[tokio::test]
+async fn llm_failure_writes_a_conversation_row_with_the_reason() {
+    // 可归因的适配器失败：这一轮以前什么都不留，连「为什么没跑起来」都查不到
+    let settings = Settings {
+        agent_retry_max: 1,
+        ..Default::default()
+    };
+    let ctx = setup("true", settings).await;
+    let mut script = Script::new();
+    script
+        .for_node(Stage::ArchitectDesign, Node::ValidateInput)
+        .submit(&ValidateInputMetadata {
+            readiness: true,
+            blockers: vec![],
+        });
+    script
+        .for_node(Stage::ArchitectDesign, Node::Execute)
+        .fail_llm(
+            "llm_network",
+            "LLM 服务不可达，请检查网络或 base_url",
+            "connect: connection refused",
+        );
+    ctx.agent.set_script(script);
+
+    testkit::seed_task(&ctx.store, "t-llmfail", "p1")
+        .await
+        .unwrap();
+    admit(&ctx, "t-llmfail").await;
+    ctx.executor.run("t-llmfail").await.unwrap();
+
+    let run = ctx
+        .store
+        .list_runs_at("t-llmfail", Stage::ArchitectDesign, Node::Execute)
+        .await
+        .unwrap()
+        .remove(0);
+    assert_eq!(run.status, NodeStatus::Failed);
+    let conv = ctx
+        .store
+        .get_conversation("t-llmfail", run.id)
+        .await
+        .unwrap()
+        .expect("LLM 报错的那一轮也要有会话行");
+    let meta = conv.metadata_json.expect("失败会话带错误上下文");
+    assert_eq!(meta["failed"], true);
+    assert_eq!(
+        meta["classified"]["kind"], "llm_network",
+        "类别要留下来——它是「该去改什么」的线索：{meta}"
+    );
+    assert!(
+        meta["error"].as_str().unwrap().contains("不可达"),
+        "可操作提示要进 error：{meta}"
+    );
+}
+
+#[tokio::test]
+async fn tool_retry_exhaustion_writes_the_failed_conversation() {
+    // 工具重试耗尽：失败前的最后一次工具调用必须能在会话里看见
+    let settings = Settings {
+        tool_retry_max: 1,
+        agent_retry_max: 1,
+        ..Default::default()
+    };
+    let ctx = setup("true", settings).await;
+    let mut script = Script::new();
+    script
+        .for_node(Stage::ArchitectDesign, Node::ValidateInput)
+        .submit(&ValidateInputMetadata {
+            readiness: true,
+            blockers: vec![],
+        });
+    // 两次必然失败的工具调用（参数不是对象 → 解析失败）：第 2 次超过 tool_retry_max
+    script
+        .for_node(Stage::ArchitectDesign, Node::Execute)
+        .failing_tool("run_command", serde_json::json!("__fail__"))
+        .failing_tool("run_command", serde_json::json!("__fail__"));
+    ctx.agent.set_script(script);
+
+    testkit::seed_task(&ctx.store, "t-toolbox", "p1")
+        .await
+        .unwrap();
+    admit(&ctx, "t-toolbox").await;
+    ctx.executor.run("t-toolbox").await.unwrap();
+
+    let run = ctx
+        .store
+        .list_runs_at("t-toolbox", Stage::ArchitectDesign, Node::Execute)
+        .await
+        .unwrap()
+        .remove(0);
+    assert_eq!(run.status, NodeStatus::Failed);
+    let conv = ctx
+        .store
+        .get_conversation("t-toolbox", run.id)
+        .await
+        .unwrap()
+        .expect("工具重试耗尽的那一轮也要有会话行");
+    let raw = conv.messages_json.to_string();
+    assert!(
+        raw.contains("工具执行失败"),
+        "失败前的最后一次工具调用要留下：{raw}"
+    );
+    let meta = conv.metadata_json.expect("失败会话带错误上下文");
+    assert!(
+        meta["error"].as_str().unwrap().contains("tool_retry_max"),
+        "失败原因要点名工具重试预算：{meta}"
+    );
 }
 
 // ─────────────────────────── 会话截断（§12.4.3 conversation_max_chars）───────────────────────────
