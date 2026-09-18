@@ -3,15 +3,13 @@
 //! 覆盖决策 85 / 86 / 108 / 109 / 125 / 139：merge 测试闸门失败跳 test.execute 复检、
 //! code_issue 交用户、lint 失败直接打回 develop、gate_failures 耗尽收口与 retry 复位。
 
-mod common;
-
+use super::common::{design_ok, full_pass_script, Flow};
 use agentpipeline_core::git::Git;
 use agentpipeline_core::storage::decisions::ResumeAction;
 use agentpipeline_core::types::{
     Approval, FailureCause, Gate, GateFailureKind, Node, PendingKind, Stage, TaskStatus,
     TestFailure, TestResult, TransitionTrigger,
 };
-use common::{design_ok, full_pass_script, Flow};
 use testkit::Script;
 
 /// 有状态闸门脚本：第 `fail_on` 次调用退出 1（含匹配输出），其余退出 0。

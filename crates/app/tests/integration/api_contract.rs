@@ -63,7 +63,7 @@ async fn api_with_origins(settings: Settings, extra_origins: Vec<String>) -> Api
 ///
 /// 契约测试的其余端点与技能来源无关，而给它们注入真 libgit2 会让「谁不小心出网了」
 /// 变成一次真实的超时等待。指向关闭的端口既保住了「不发真请求」，又让这类意外**立刻失败**
-/// （连接被拒，不是挂住）。技能来源自己的契约用例在 `crates/app/tests/market.rs`，
+/// （连接被拒，不是挂住）。技能来源自己的契约用例在 `crates/app/tests/integration/market.rs`，
 /// 那里注入的是指向离线 smart HTTP fixture 的真实现。
 fn offline_repo() -> Arc<dyn SkillRepo> {
     Arc::new(
@@ -3517,7 +3517,7 @@ async fn import_flat_zip_without_name_is_rejected() {
 // 旧的那组（自定 `/index.json` registry、注入 testkit `FakeMarket`）随决策 194 整层退场。
 // 新的契约用例不走替身：testkit 起一个**离线 smart HTTP 的 git 仓**，后端注入真的
 // `Libgit2Repo`——于是传输、shallow、钉 commit 这几条只有真 libgit2 才打得到的路径都在
-// 契约层被钉住。用例在 `crates/app/tests/market.rs`。
+// 契约层被钉住。用例在 `crates/app/tests/integration/market.rs`。
 // ═══════════════ 装前预览与信任标记（决策 172④⑤，票 11）═══════════════
 //
 // 四条契约用例对应票面验收清单：预览返回三项 / 特征命中列出具体行 / 未信任 + 全文被拒 /
@@ -3828,7 +3828,7 @@ async fn preview_of_an_uninstalled_skill_is_not_found() {
 ///
 /// 一键安装在**已装**时走决策 181⑦ 的「已在技能根里 → 不重新下载」那条路，于是本文件的
 /// 阶段推荐/一键安装用例可以继续用「仓访问层指向关闭端口」的 harness（零网络）。
-/// **下载那条链路由 `crates/app/tests/market.rs` 用真 fixture 覆盖**（那里注入的是指向
+/// **下载那条链路由 `crates/app/tests/integration/market.rs` 用真 fixture 覆盖**（那里注入的是指向
 /// 离线 smart HTTP 的真 `Libgit2Repo`）；本文件测的是**落点**：写进阶段配置 + 三项预览
 /// ——那件事与二进制从哪儿来无关，而把真网络搬进来只会让这两层重复。
 async fn seed_installed_skill(api: &Api, name: &str, body: &str) {
@@ -4127,7 +4127,7 @@ async fn one_click_install_keeps_existing_declarations_and_never_duplicates_them
     );
     // **`overwrite: true` 不在这一层测**：它走的是"回来源仓重新取一份"那条路（覆盖换的是
     // 技能根里的字节，不是配置里的条目），这里没有可用的来源仓。那一条由
-    // `crates/app/tests/market.rs` 的 `conflict_names_the_recorded_origin_and_overwrite_replaces`
+    // `crates/app/tests/integration/market.rs` 的 `conflict_names_the_recorded_origin_and_overwrite_replaces`
     // 用真 fixture 覆盖（含"覆盖之后 `note` 为空、配置条目仍是一条"）。
 }
 

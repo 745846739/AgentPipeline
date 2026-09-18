@@ -3,14 +3,12 @@
 //!
 //! 决策 57 / 98 / 116 / 117 / §12.3。
 
-mod common;
-
+use super::common::Flow;
 use agentpipeline_core::config::Settings;
 use agentpipeline_core::storage::decisions::ResumeAction;
 use agentpipeline_core::types::{
     Node, PendingKind, ReviewMode, Stage, TaskStatus, TransitionTrigger,
 };
-use common::Flow;
 
 // ─────────────────────────── E2E-19 ───────────────────────────
 

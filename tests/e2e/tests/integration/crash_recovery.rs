@@ -11,15 +11,13 @@
 //! - `executor_owner` 残留阻断再 claim，`clear_executor_owners` 后可重新准入；
 //! - 节点级幂等重跑：已完成的上游节点不重跑，产出不重复（G8/G9）。
 
-mod common;
-
+use super::common::Flow;
 use agentpipeline_core::storage::decisions::MergeDecision;
 use agentpipeline_core::types::{
     AcceptanceCriterion, ArchitectExecuteMetadata, CodeChanges, CursorStatus,
     DevelopDesignMetadata, Node, ReviewResult, Stage, TaskStatus, TestDesignMetadata, TestResult,
     TestScenario, ValidateInputMetadata, ValidateOutputMetadata,
 };
-use common::Flow;
 use testkit::script::NodeScript;
 use testkit::Script;
 

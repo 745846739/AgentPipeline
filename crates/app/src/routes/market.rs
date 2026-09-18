@@ -398,7 +398,7 @@ pub(crate) fn map_market_error(err: agentpipeline_core::Error) -> ApiError {
 /// 引擎（`skill_import::install`）只知道技能根下的路径，而 GitHub 模式下仓名 / commit /
 /// 子路径**一样都不在路径里**。票 01 / 02 的验收明写「引擎零改动可核对」，所以替换在这里做。
 ///
-/// 代价是这个函数依赖引擎的报文模板，故 `crates/app/tests/market.rs` 有一条用例**真的调一次
+/// 代价是这个函数依赖引擎的报文模板，故 `crates/app/tests/integration/market.rs` 有一条用例**真的调一次
 /// `install`**、按模板断言那句报文——引擎哪天改了措辞，那条会红，而不是让这句替换静默失效。
 ///
 /// **没有记录时原样返回**（手工拷进来、本地导入、扫描进来的技能都没有记录）：
@@ -427,7 +427,7 @@ pub(crate) async fn conflict_with_origin(
 
 /// 引擎报文里的「当前来源」那一栏的起点。
 ///
-/// 与 `crates/app/tests/market.rs` 里那条"真的调一次 install"的用例配对：模板变了，
+/// 与 `crates/app/tests/integration/market.rs` 里那条"真的调一次 install"的用例配对：模板变了，
 /// 那条红，这里也就一起被看见。
 const SOURCE_CLAUSE_OPEN: &str = "（当前来源：";
 const SOURCE_CLAUSE_CLOSE: &str = "）；覆盖需显式确认";

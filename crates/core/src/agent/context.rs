@@ -713,7 +713,7 @@ mod tests {
     // ── L4 兜底 ──
     //
     // 「压缩后仍超硬限 → `pending(context_overflow)`」这条行为的等价断言在 L2：
-    // `crates/core/tests/executor.rs::context_overflow_ctx` 造成真超限现场（窗口 1000 /
+    // `crates/core/tests/integration/executor.rs::context_overflow_ctx` 造成真超限现场（窗口 1000 /
     // 硬限 900 + 一次大块元数据），两条用例分别钉住 pending 的 kind 与「退出路径补写会话行」。
     // 它落在执行器而非本模块——构造 pending 的是 `executor::enforce_context_budget`，
     // 本模块只提供 `should_compact` / `over_hard_limit` 两个谓词（`compact_and_hard_limit_predicates`）。

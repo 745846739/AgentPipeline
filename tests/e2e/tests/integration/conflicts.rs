@@ -3,8 +3,7 @@
 //!
 //! 决策 60 / 67 / 71 / 74 / 102 / 120 / 132。
 
-mod common;
-
+use super::common::{design_ok, Flow};
 use agentpipeline_core::git::Git;
 use agentpipeline_core::pipeline::pseudo::ConflictCheckResult;
 use agentpipeline_core::storage::decisions::{MergeDecision, ResumeAction};
@@ -12,7 +11,6 @@ use agentpipeline_core::types::{
     Approval, ArchitectExecuteMetadata, DuplicateRisk, NewSymbol, Node, PendingKind, Stage,
     SymbolKind, TaskStatus, TestResult, TransitionTrigger, ValidateInputMetadata,
 };
-use common::{design_ok, Flow};
 use testkit::{Repo, Script};
 
 // ─────────────────────────── E2E-05 ───────────────────────────
@@ -112,7 +110,7 @@ async fn e2e_05_merge_rebase_conflict_kicks_back_develop_with_conflict_files() {
 async fn e2e_10_dirty_worktree_pends_for_user_and_blocks_merge() {
     let f = Flow::new().await;
     let mut script = Script::new();
-    common::full_pass_script(&mut script, "t10");
+    super::common::full_pass_script(&mut script, "t10");
     f.agent.set_script(script);
     testkit::seed_task(&f.store, "t10", "p1").await.unwrap();
     f.admit("t10").await;

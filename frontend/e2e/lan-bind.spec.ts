@@ -7,7 +7,7 @@
  *
  * 断言口径（只测外部行为）：按钮存在且可点；点完页面从「手机现在连不上」变成二维码区，
  * 且那区里的码**带着配对令牌**；关回来之后回到指引区。**绑定地址本身**的变化由 Rust 侧
- * `crates/app/tests/lan_bind.rs` 用真二进制钉（那里能读 `/server-info` 的原文），这里只钉
+ * `crates/app/tests/integration/lan_bind.rs` 用真二进制钉（那里能读 `/server-info` 的原文），这里只钉
  * 界面这一层。决策 189 的另一半（非回环来源下不画码）钉在单元层：playwright 跑不出一个
  * 非回环来源，而 `routes/Share.test.ts` 能直接让 `GET /pairing/token` 回 403。
  *

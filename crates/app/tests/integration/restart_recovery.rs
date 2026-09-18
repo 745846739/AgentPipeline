@@ -1,7 +1,7 @@
 //! 真进程重启恢复（主流程票 08）：spawn **真二进制** → 任务运行中 `kill -9` →
 //! **同一个 home** 重启 → 启动恢复（决策 127）接管 → 任务续跑到 done。
 //!
-//! 与 in-process 的 E2E-13（`tests/e2e/tests/crash_recovery.rs`）的分工：
+//! 与 in-process 的 E2E-13（`tests/e2e/tests/integration/crash_recovery.rs`）的分工：
 //! E2E-13 验**游标检查点语义**（快、决定性，决策 152 允许它不 spawn 真二进制）；
 //! 本用例验**进程边界**——真实启动路径上的 `executor_owner` 清理、kill -9 留下的
 //! 中间态（WAL / worktree / 分支）、服务能再次起来。两者互补，不互相替代；

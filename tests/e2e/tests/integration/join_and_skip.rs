@@ -14,15 +14,13 @@
 //! 各用例让流程停在紧随 join 的自然暂停点（脚本耗尽 → pending(retry_exhausted)
 //! 或 info_insufficient），并经由 sync_decision 产出、run 行与请求快照断言。
 
-mod common;
-
+use super::common::{architect_ok, dev_design_ok, Flow};
 use agentpipeline_core::storage::decisions::ResumeAction;
 use agentpipeline_core::types::{
     CursorStatus, DevelopDesignMetadata, Node, NodeCursor, PendingKind, ScenarioPriority, Stage,
     TaskStatus, TestDesignMetadata, TestScenario, TransitionTrigger, ValidateInputMetadata,
     ValidateOutputMetadata,
 };
-use common::{architect_ok, dev_design_ok, Flow};
 use testkit::Script;
 
 // ─────────────────────────── 脚本片段 ───────────────────────────

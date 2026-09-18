@@ -2,15 +2,13 @@
 //!
 //! 决策 33 / 36 / 64 / 66 / 100 / 122 / §3：假时钟驱动，手动 tick。
 
-mod common;
-
 use std::time::Duration;
 
+use super::common::Flow;
 use agentpipeline_core::config::Settings;
 use agentpipeline_core::storage::decisions::ResumeAction;
 use agentpipeline_core::storage::observability::NewRun;
 use agentpipeline_core::types::{Node, NodeStatus, PendingKind, PendingReason, Stage};
-use common::Flow;
 use testkit::{backdate_run, Script};
 
 /// 轮询等待该任务的某个 running run 出现（executor 已进入第一个 LLM 调用）。

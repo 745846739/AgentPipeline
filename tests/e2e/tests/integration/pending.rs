@@ -3,8 +3,7 @@
 //!
 //! 决策 79 / 94 / 105 / 110 / 134 / 135 / 136。
 
-mod common;
-
+use super::common::{architect_ok, Flow};
 use agentpipeline_core::config::Settings;
 use agentpipeline_core::pipeline::pseudo::CrossCheckResult;
 use agentpipeline_core::storage::decisions::ResumeAction;
@@ -12,7 +11,6 @@ use agentpipeline_core::types::{
     ArchitectExecuteMetadata, Node, PendingKind, ScenarioPriority, Stage, TestDesignMetadata,
     TestScenario, ValidateInputMetadata, ValidateOutputMetadata,
 };
-use common::{architect_ok, Flow};
 use testkit::Script;
 
 // ─────────────────────────── E2E-21 ───────────────────────────
@@ -147,7 +145,7 @@ async fn e2e_16_high_dangling_design_ref_is_blocker_and_backtracks() {
     let f = Flow::new().await;
     let mut script = Script::new();
     architect_ok(&mut script);
-    common::dev_design_ok(&mut script);
+    super::common::dev_design_ok(&mut script);
     test_design_with(&mut script, ScenarioPriority::High, vec!["AC-999".into()]);
     f.agent.set_script(script);
     testkit::seed_task(&f.store, "t16h", "p1").await.unwrap();
@@ -182,7 +180,7 @@ async fn e2e_16_medium_dangling_design_ref_is_only_a_warning() {
     let f = Flow::new().await;
     let mut script = Script::new();
     architect_ok(&mut script);
-    common::dev_design_ok(&mut script);
+    super::common::dev_design_ok(&mut script);
     test_design_with(&mut script, ScenarioPriority::Medium, vec!["AC-999".into()]);
     f.agent.set_script(script);
     testkit::seed_task(&f.store, "t16m", "p1").await.unwrap();

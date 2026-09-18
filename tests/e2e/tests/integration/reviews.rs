@@ -3,14 +3,12 @@
 //! 决策 2 / 43 / 124 / 133：review 不通过交用户裁决（不是节点重试）；人工评审
 //! pending(human_review)、approve → test / reject → develop。
 
-mod common;
-
+use super::common::{design_ok, Flow};
 use agentpipeline_core::storage::decisions::ResumeAction;
 use agentpipeline_core::types::{
     Approval, Node, PendingKind, ReviewMode, ReviewResult, Stage, TaskStatus, TestResult,
     TransitionTrigger,
 };
-use common::{design_ok, Flow};
 use testkit::Script;
 
 /// 到 review 为止的脚本（develop 真写代码 + review.execute 给出指定结论）。

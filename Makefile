@@ -51,9 +51,18 @@ check-lint:
 	cargo fmt --all -- --check
 	cargo clippy --workspace --all-targets -- -D warnings
 
-# 全量测试是**冷启动最贵的一步**（本机约 10 分钟）：它会为 22 个集成测试文件各
-# 链接一个独立二进制，而每个二进制的链接输入含全部依赖 rlib（本机约 3.3 GB）。
-# 日常改动用分层子目标（unit / integration / api / e2e / smoke）只编一层；
+# 全量测试是**冷启动最贵的一步**：它为每个集成测试文件各链接一个独立二进制。
+# 决策 218 把 33 个集成文件按 crate 合成 3 个二进制（测试二进制 37 → 7），实测
+# core 的 L2 编译 CPU 从 445 CPU-s 降到 317 CPU-s（−29%）；合并的收益来自
+# 「每个 crate root 都要付一次的固定成本」——实测往合并二进制里多塞一个文件只要
+# 约 0.15 CPU-s，而单独建一个文件要 1.7–2.6 CPU-s。
+#
+# 两处**旧注释已被实测推翻**，别再照抄：① 冷构建不是「约 10 分钟」——本机实测
+# 约 20 分钟（2026-09-18）；② 「链接是大头、链接输入约 3.3 GB」不成立——链接只占
+# 单个测试二进制的 2–3%（0.43–0.72s，且不随二进制体积增长），`deps/*.rlib`
+# 合计 1.03 GB（642 个），链接器只抽取用到的成员。改链接器曾是候选方向，已否决。
+#
+# 日常改动用分层子目标（unit / integration / api / e2e / smoke）；
 # 本目标留给提交前的那一次完整验证。
 check-test:
 	cargo test --workspace
@@ -102,16 +111,20 @@ desktop-run: frontend
 	cd crates/desktop && cargo build
 	./crates/desktop/target/debug/agent-pipeline-desktop
 
-# 分层子集的三个可选参数（都可省略）：
+# 分层子集的三个可选参数（都可省略）。**决策 218 起集成测试按 crate 合成单一二进制**，
+# 所以「按文件收敛**编译**」不再可能——每个测试文件现在是一个**模块**：
 #
 #   PKG=<crate>    作用域收敛到单个 crate，只编/跑它（unit 层专用，其余层已自带 -p）
-#   TESTS=<文件名> 只编/跑某一个测试文件（`--test <name>`）；默认 `--tests` 编全部。
-#                  这一项省的是**编译与链接**，是大头（本机实测 core 的 L2 全部
-#                  二进制 3m41s vs 单个 market 58s）；FILTER 省的是**执行**，很小
-#   FILTER=<名称>  cargo 的用例名过滤，只跑名字匹配的用例
+#   TESTS=<模块名> 收窄到某一个测试文件的用例，走**用例名前缀**过滤（`-- <模块>::`）。
+#                  即：**编译不再收敛，执行仍然收敛**——改一个文件要重编整个二进制，
+#                  但编好之后只跑一个文件几乎不花时间。这一收支见 check-test 处的实测。
+#   FILTER=<用例名> 再收窄到单个用例。与 TESTS 同用时二者串成 `<模块>::<用例>` 作为
+#                  **一个子串**交给 harness，所以此时 FILTER 要写**完整用例名**——写半截
+#                  （如 `rebase`）会因中间隔着模块前缀而匹配不到（实测 0 条，不是报错，
+#                  静默通过是这里唯一的坑）。只给 FILTER 时仍是全二进制的子串匹配，行为同旧。
 #
 # 牙齿检查（停用某个防护 → 确认对应用例变红 → 恢复）用
-# `make integration TESTS=market FILTER=<用例名>`，比 `make integration` 快一个量级。
+# `make integration TESTS=market FILTER=<用例名>`。
 #
 # **作用域收敛一律走 PKG，不要写 `make unit -p <crate>`**：make 会把 `-p` 当成
 # 自己的 `--print-data-base` 吞掉——① cargo 收不到作用域参数，实际跑的是整
@@ -119,28 +132,33 @@ desktop-run: frontend
 # ③ `<crate>` 被当成另一个 target，报 `No rule to make target` 并**以退出码 2
 # 结束**。该调用若串在 `&&` 之后，后面的闸门步骤会被静默截断（实测 2026-09-15：
 # 一个会话用它跑了 14 次，每次都误以为是「只跑 core」）。
-test_filter = $(if $(FILTER),-- $(FILTER),)
-test_scope  = $(if $(TESTS),--test $(TESTS),--tests)
+# 用例级过滤（unit 层用；名字形如 `模块::用例`）
+case_filter  = $(if $(FILTER),-- $(FILTER),)
+# 文件模块 + 用例。决策 218：集成测试按 crate 合并成单一二进制后，每个测试文件是
+# 一个**模块**，用例全名形如 `<文件模块>::<用例>`，故「按文件收敛」靠用例名前缀，
+# 而不是 `--test <文件>`（那个不再存在）。
+suite_filter = $(if $(TESTS),$(TESTS)::,)$(FILTER)
+test_filter  = $(if $(strip $(suite_filter)),-- $(suite_filter),)
 
 # 只跑单元层（L1）
 unit:
-	cargo test $(if $(PKG),-p $(PKG),--workspace) --lib $(test_filter)
+	cargo test $(if $(PKG),-p $(PKG),--workspace) --lib $(case_filter)
 
-# L2 集成（core tests/）
+# L2 集成（core tests/integration/，单一二进制）
 integration:
-	cargo test -p agentpipeline-core $(test_scope) $(test_filter)
+	cargo test -p agentpipeline-core --test integration $(test_filter)
 
-# L3 API 契约（in-process axum router）
+# L3 API 契约（in-process axum router）；合并后靠用例名前缀收敛到 api_contract 模块
 api:
-	cargo test -p app --test api_contract $(test_filter)
+	cargo test -p app --test integration -- api_contract::$(FILTER)
 
-# L4 端到端场景
+# L4 端到端场景（e2e tests/integration/，单一二进制）
 e2e:
-	cargo test -p e2e $(test_filter)
+	cargo test -p e2e --test integration $(test_filter)
 
-# 启动冒烟（spawn 真二进制，E2E-00）
+# 启动冒烟（spawn 真二进制，E2E-00）；同上，靠前缀收敛到 smoke 模块
 smoke:
-	cargo test -p app --test smoke $(test_filter)
+	cargo test -p app --test integration -- smoke::$(FILTER)
 
 # 格式化（写回）
 fmt:

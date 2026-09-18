@@ -9,15 +9,13 @@
 //!
 //! FakeAgent 只替换 LLM 响应流；工具层、git、命令记录全部真实执行（决策 148）。
 
-mod common;
-
+use super::common::{full_pass_script, merge_row, Flow};
 use agentpipeline_core::git::Git;
 use agentpipeline_core::storage::decisions::MergeDecision;
 use agentpipeline_core::types::{
     Approval, CursorStatus, Gate, MergeResult, Node, NodeStatus, PendingKind, Stage, TaskStatus,
     TransitionTrigger,
 };
-use common::{full_pass_script, merge_row, Flow};
 use testkit::Script;
 
 #[tokio::test]

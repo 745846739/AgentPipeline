@@ -344,7 +344,7 @@ interface PendingReason {
 （main + 子代理 + 伪阶段，不含 `agent_type = "system"`）」。`project_analysis` 确实调了
 LLM（`agent_type = pseudo:project_analysis` ≠ `system`），因此**计入**；未注入 executor
 的纯代码探测不落 run，**不计入**。`total_tokens` 同理按行求和（决策 100）。
-该口径由 `metrics::total_calls` 单测与 `crates/core/tests/project_analysis_observation.rs`
+该口径由 `metrics::total_calls` 单测与 `crates/core/tests/integration/project_analysis_observation.rs`
 钉住。
 
 **LLM 不可用降级不回退**：摘要属观测面——LLM 失败时保留纯代码探测事实并记
