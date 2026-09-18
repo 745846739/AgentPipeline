@@ -96,7 +96,7 @@ pub const ENV_TOOLS: [&str; 8] = [
 /// 「改的是**谁能访问这台机器**」——让模型能提议它们等于让它能给自己开门。本清单里没有
 /// 它们对应的名字，而清单与实现**同源**（白名单从工具清单生成、执行点按名字分派），
 /// 故「能提议一个开门的动作」这件事在代码里没有落点。
-pub const SERVICE_WRITE_TOOLS: [&str; 3] = ["task", "config", "skills"];
+pub const SERVICE_WRITE_TOOLS: [&str; 4] = ["task", "config", "skills", "service"];
 
 /// 环境层里**会改动东西**的那些（决策 206 的 C / E 两层）：`ask` 档下转成提议。
 ///
@@ -180,6 +180,21 @@ pub fn is_stewardable_resume(name: &str, args: &serde_json::Value) -> bool {
     name == "task"
         && args.get("action").and_then(|v| v.as_str()) == Some("resume")
         && args.get("resume_action").and_then(|v| v.as_str()) == Some("continue")
+}
+
+/// 托管可自动集里**还有** `unstick`（决策 210⑧ / 票 09）。
+///
+/// 它与 `resume` 是两回事，但进同一个集合的理由相同：只影响一个任务、可逆、且它是
+/// `resume` 能生效的**前提**（去重摘不掉时 resume 是空操作）。
+///
+/// 「重启服务」**不在**这里——它是全局动作，永远只提议（决策 210⑧ 的硬规矩）。
+pub fn is_stewardable_unstick(name: &str, args: &serde_json::Value) -> bool {
+    crate::pipeline::unstick::is_unstick_action(name, args)
+}
+
+/// 这一次调用在整个托管自动集里吗（形状判据的**唯一入口**）。
+pub fn is_stewardable_action(name: &str, args: &serde_json::Value) -> bool {
+    is_stewardable_resume(name, args) || is_stewardable_unstick(name, args)
 }
 
 /// 托管放行的自动动作怎么**执行**（决策 210② / 票 08）。
@@ -634,7 +649,7 @@ impl ToolExecutor {
             // 三道闸缺一不可——形状对（恰一个动作）、托管中且未触顶、执行者已注入。
             GateDecision::Propose
                 if self.steward_actions.is_some()
-                    && is_stewardable_resume(&call.name, &Self::args(call)?)
+                    && is_stewardable_action(&call.name, &Self::args(call)?)
                     && self.steward_grant(call).await?.is_some() =>
             {
                 self.run_steward_action(call, ctx).await.map(Some)

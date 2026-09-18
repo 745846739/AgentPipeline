@@ -79,6 +79,20 @@ impl Drop for ExecutorGuard {
 }
 
 /// 非阻塞抢占：已有 executor 在跑同一任务时返回 `None`（调用方直接退出）。
+/// 把 `task_id` 从**进程内去重**里摘掉（决策 210⑧ / 票 09）。
+///
+/// 这是 `unstick` 的第一个动作，也是它存在的理由：去重集合是「同一任务只跑一个执行体」的
+/// 进程内那一半（DB 那一半是 `executor_owner`），而它**只在执行体返回时**才释放。执行体
+/// 卡在一个不返回的系统调用里（2026-09-17 实证：`git2` 的 `open()` 被 macOS 拦住）时，
+/// 去重永远摘不掉——清了 DB 也没用，重试会被逐次拒掉。
+///
+/// **代价如实记**：摘掉之后，那个仍然卡着的旧执行体若哪天活过来，可能与新执行体同时写库。
+/// 这不是新增的风险面，而是原本那个僵死状态本来就有的（旧执行体已经不再写库，否则它不会
+/// 被判定为「心跳停了」）。
+pub fn force_release(task_id: &str) -> bool {
+    EXECUTOR_REGISTRY.lock().unwrap().remove(task_id)
+}
+
 fn try_acquire(task_id: &str) -> Option<ExecutorGuard> {
     let mut set = EXECUTOR_REGISTRY.lock().unwrap();
     if set.contains(task_id) {

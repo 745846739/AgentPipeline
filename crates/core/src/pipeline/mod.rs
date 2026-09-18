@@ -10,6 +10,7 @@ pub mod pseudo;
 pub mod resume;
 pub mod routes;
 pub mod subagent;
+pub mod unstick;
 
 pub use cursor::{
     focus_cursor, has_pending_cursor, has_runnable_cursor, is_join_ready, live_cursors,

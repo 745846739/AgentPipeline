@@ -107,6 +107,14 @@ impl agentpipeline_core::agent::tools::StewardActionRunner for StewardResume {
     }
 }
 
+/// 把 task_id 从**进程内去重**里摘掉（决策 210⑧ / 票 09）。
+///
+/// 去重集合住在 core（`pipeline::executor` 的 `EXECUTOR_REGISTRY`，与 `try_run` 同一处），
+/// 这里是给 app 层一个**有名字的入口**：`unstick` 必须先调它，否则清了 DB 也没用。
+pub fn force_release(task_id: &str) -> bool {
+    agentpipeline_core::pipeline::executor::force_release(task_id)
+}
+
 /// 小时级维护周期（决策 55：会话清理 + 指标聚合与 10s tick 分开）。
 pub const MAINTENANCE_INTERVAL: Duration = Duration::from_secs(3600);
 

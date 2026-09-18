@@ -91,7 +91,7 @@ pub struct ForemanToolSpec {
 /// A 层的六个新读数（票 01）**一律复用后端既有口径**，不新造一套：看板读任务表、
 /// 指标走 `metrics::*` 纯函数、项目 / 阶段配置 / 技能 / provider 各读自己那张表的既有读法。
 /// 唯一需要加工的是 provider：库里存的是**明文密钥**（决策 112），故只回显掩码。
-pub const FOREMAN_TOOL_SPECS: [ForemanToolSpec; 18] = [
+pub const FOREMAN_TOOL_SPECS: [ForemanToolSpec; 19] = [
     ForemanToolSpec {
         name: "read_task",
         layer: ForemanToolLayer::Read,
@@ -227,11 +227,13 @@ pub const FOREMAN_TOOL_SPECS: [ForemanToolSpec; 18] = [
                       `retry`（重跑一个终态任务）、\
                       `cancel`（取消）、\
                       `review`（人工评审通过/打回，要 approved）、\
-                      `merge`（合入决定，要 decision=approve 或 reject）。\
+                      `merge`（合入决定，要 decision=approve 或 reject）、\
+                      `unstick`（解除僵死占用：run 已终态而游标仍 active / 有主但心跳停了——\
+                      清执行者、标终态、游标转 pending；**只对真卡住的任务生效**）。\
                       参数与界面上那个按钮点下去时发的一模一样——先 read_task 看清它现在卡在\
                       哪个 pending、允许的动作是什么，再决定 action 与 resume_action。\
                       每条都要值班经理按键确认。",
-        parameters: r#"{"type":"object","properties":{"action":{"type":"string","enum":["create","resume","retry","cancel","review","merge"],"description":"要做的动作"},"task_id":{"type":"string","description":"目标任务（create 之外的 action 都要）"},"project_id":{"type":"string","description":"create：建在哪个项目下"},"title":{"type":"string","description":"create：任务标题"},"description":{"type":"string","description":"create：任务描述"},"depends_on":{"type":"array","items":{"type":"string"},"description":"create：依赖的任务 id"},"review_mode":{"type":"string","enum":["agent","human"],"description":"create：评审模式"},"cursor_id":{"type":"string","description":"resume：指定游标（多条活跃游标时必填）"},"resume_action":{"type":"string","description":"resume：拍板的动作名（read_task 的 allowed_actions 里那几个）"},"target_stage":{"type":"string","description":"resume：跳到哪个阶段"},"target_node":{"type":"string","description":"resume：跳到哪个节点"},"input":{"type":"string","description":"resume：给这次拍板的说明 / 打回意见"},"approved":{"type":"boolean","description":"review：通过还是打回"},"comments":{"type":"string","description":"review：打回时带给下游的意见"},"decision":{"type":"string","enum":["approve","reject"],"description":"merge：合入还是打回"}},"required":["action"]}"#,
+        parameters: r#"{"type":"object","properties":{"action":{"type":"string","enum":["create","resume","retry","cancel","review","merge","unstick"],"description":"要做的动作"},"task_id":{"type":"string","description":"目标任务（create 之外的 action 都要）"},"project_id":{"type":"string","description":"create：建在哪个项目下"},"title":{"type":"string","description":"create：任务标题"},"description":{"type":"string","description":"create：任务描述"},"depends_on":{"type":"array","items":{"type":"string"},"description":"create：依赖的任务 id"},"review_mode":{"type":"string","enum":["agent","human"],"description":"create：评审模式"},"cursor_id":{"type":"string","description":"resume：指定游标（多条活跃游标时必填）"},"resume_action":{"type":"string","description":"resume：拍板的动作名（read_task 的 allowed_actions 里那几个）"},"target_stage":{"type":"string","description":"resume：跳到哪个阶段"},"target_node":{"type":"string","description":"resume：跳到哪个节点"},"input":{"type":"string","description":"resume：给这次拍板的说明 / 打回意见"},"approved":{"type":"boolean","description":"review：通过还是打回"},"comments":{"type":"string","description":"review：打回时带给下游的意见"},"decision":{"type":"string","enum":["approve","reject"],"description":"merge：合入还是打回"}},"required":["action"]}"#,
     },
     ForemanToolSpec {
         name: "config",
@@ -241,6 +243,15 @@ pub const FOREMAN_TOOL_SPECS: [ForemanToolSpec; 18] = [
                       `delete`（删掉这个阶段的覆盖行，回到系统默认，要 stage）。\
                       要值班经理按键确认。",
         parameters: r#"{"type":"object","properties":{"action":{"type":"string","enum":["set","delete"],"description":"set 或 delete"},"stage":{"type":"string","description":"阶段键（如 develop / review / foreman）"},"provider_id":{"type":"string","description":"set：用哪个 provider"},"temperature":{"type":"number","description":"set：采样温度"},"max_tokens":{"type":"integer","description":"set：输出上限"},"persona_path":{"type":"string","description":"set：人格文件路径"},"persona_append":{"type":"string","description":"set：追加指令"},"env_mode":{"type":"string","enum":["auto","ask","deny"],"description":"set：环境层权限档位"},"tools_json":{"description":"set：工具声明（与界面那个框同形）"},"skills_json":{"description":"set：技能声明（与界面那个框同形）"},"node_overrides_json":{"description":"set：节点级覆盖（与界面那个框同形）"},"idle_timeout_sec":{"type":"integer","description":"set：空闲超时"},"max_duration_sec":{"type":"integer","description":"set：最长时长"}},"required":["action","stage"]}"#,
+    },
+    ForemanToolSpec {
+        name: "service",
+        layer: ForemanToolLayer::Write,
+        description: "本服务自己的运维动作。action 取值：`restart`（重启服务）。\
+                      它是**全局**动作：会打断所有在跑的任务（本服务没有自重启能力，\
+                      按下后先做恢复序列——清占用 + 把中断的 running 任务归队——\
+                      再告诉你需要在你启动它的地方重启一次）。永远要值班经理按键确认。",
+        parameters: r#"{"type":"object","properties":{"action":{"type":"string","enum":["restart"],"description":"要做的动作"}},"required":["action"]}"#,
     },
     ForemanToolSpec {
         name: "skills",

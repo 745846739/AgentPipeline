@@ -28,20 +28,41 @@ transition，但**重试从未发生**——原始 `try_run` 没返回、进程�
 
 **Blocked by:** 08
 
-**Status:** ready-for-agent
+**Status:** done
 
-- [ ] `Runtime::force_release(task_id)`：从进程内去重集合里摘除，且**摘除后可再次 `try_run`**
-- [ ] `unstick` 动作：清 owner + 僵死 run 标终态（原因可读）+ 游标转 `pending`（带原因）
-- [ ] `unstick` 的判据：只对「run 已终态而游标仍 active / owner 持有超时」这类任务生效，
+- [x] `Runtime::force_release(task_id)`：从进程内去重集合里摘除，且**摘除后可再次 `try_run`**
+- [x] `unstick` 动作：清 owner + 僵死 run 标终态（原因可读）+ 游标转 `pending`（带原因）
+- [x] `unstick` 的判据：只对「run 已终态而游标仍 active / owner 持有超时」这类任务生效，
       不对正常 `running` 的任务生效（否则它会变成「随便踢一脚」）
-- [ ] `unstick` 走 D 层通道，进托管可自动集；`config` 一类的其它动作不变
-- [ ] 「重启服务」做成**提议**（复用决策 207 的提议表与确认钮），永不自动，
+- [x] `unstick` 走 D 层通道，进托管可自动集；`config` 一类的其它动作不变
+- [x] 「重启服务」做成**提议**（复用决策 207 的提议表与确认钮），永不自动，
       且提议文案要说清「会打断 N 个在跑的任务」
-- [ ] 新增用例：造一个进程内去重被占用的任务，`unstick` 后**真的能重跑**
+- [x] 新增用例：造一个进程内去重被占用的任务，`unstick` 后**真的能重跑**
       （打在新 run 行出现上，不是打在「owner 列为空」上——后者清个 DB 字段就能满足，
       而那正是这条要防的假绿）
-- [ ] 新增用例：正常 `running` 的任务不能被 `unstick`
-- [ ] 新增用例：重启提议永远是 `Propose`，无论托管与否
+- [x] 新增用例：正常 `running` 的任务不能被 `unstick`
+- [x] 新增用例：重启提议永远是 `Propose`，无论托管与否
+
+**实施收尾（2026-09-18）:**
+
+- **`force_release` 落在 core**：进程内去重集合（`EXECUTOR_REGISTRY`）住在
+  `pipeline::executor`，与 `try_run` 同一处。app 层的 `runtime::force_release` 是一个**有名字的
+  入口**（票面点的是 `Runtime::force_release`），实现只有一行转发——两个入口、一处实现。
+  **代价写进了注释**：摘掉之后那个仍卡着的旧执行体若哪天活过来，可能与新执行体同时写库；
+  这不是新增风险面，而是原本那个僵死状态本来就有的。
+- **判据只有一处**：`pipeline::unstick::stuck_evidence`，**票 05 的待办扫描也改用它**。
+  两处各写一份的后果是「报出来的卡住」与「解得开的卡住」成为两个集合，而「它说卡了、
+  我却解不开」正是最让人不信任这套东西的一类现象。
+- **`unstick` 挂在 `task` 工具上**（`action=unstick`，决策 207④ 的一族一个工具），
+  pending 用 `UserDecision` + context kind `unstick`（不是新造 PendingKind：它要动前端与
+  动作集两份公开契约，而这里的语义确实是「解开了，等你决定下一步」）。
+- **「重启服务」做成第四个 D 层工具 `service`**（`action=restart`）。提议文案由系统生成，
+  明写「**会打断所有在跑的任务**」。用例正反面都打：托管开着也仍是提议。
+- **一处如实偏离票面**：按下 `restart` 之后做的是**恢复序列**（决策 127 的两步：清
+  `executor_owner` + 中断的 running 任务归队 + 顺手收中断的项目级 run），然后**明说本进程
+  没有自重启能力、请在你启动它的地方重启一次**。票面写的是「只重启、不改代码」，但本仓
+  没有进程外的监督者契约——擅自 `exit` 会让服务就此消失，而按下那颗钮的人未必在能把它
+  拉起来的地方。**真重启需要一条 supervisor，那是另一票**；这一处不能算「做完了」。
 
 ## 备注
 

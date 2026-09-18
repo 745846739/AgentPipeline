@@ -1492,6 +1492,9 @@ async fn the_foreman_tool_set_matches_the_frozen_contract() {
             "run_command",
             // D 层：本服务写接口（决策 207④ 的「一族一个工具 + 动作参数」）。
             // **不读档位**——写接口恒为提议，配成 `auto` 只放开环境层。
+            // 全局动作 `service`（票 09）：`action=restart`——**永远只提议**（会打断所有
+            // 在跑的任务），既不受档位影响，也不在托管自动集里。
+            "service",
             // 三个排除项（重置配对令牌 / 局域网开关 / 仓名单增删）**没有对应名字**，
             // 由本文件末尾的用例单独断言。
             "task",
@@ -2559,4 +2562,67 @@ async fn the_offloaded_result_keeps_only_a_preview_in_context() {
         tail.len(),
         big.len()
     );
+}
+
+// ─────────────── unstick 进托管自动集、重启只提议（决策 210⑧ / 票 09）───────────────
+
+#[tokio::test]
+async fn unstick_is_in_the_steward_auto_set_but_restart_never_is() {
+    let h = Harness::seeded().await;
+    stewarded_task(&h, Some(Stewardship::enabled_now(h.clock.now()))).await;
+
+    // ① unstick 进托管自动集（它与 resume 是两回事，但同一理由：只动一个任务、可逆）
+    let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let mut script = Script::new();
+    script.for_foreman().tool(
+        "task",
+        serde_json::json!({"action": "unstick", "task_id": "t1"}),
+    );
+    script.for_foreman().text("解开了。");
+    let runner = h.runner_with_steward(script, calls.clone());
+    let turn = runner.say(None, "它卡住了").await.unwrap();
+    assert_eq!(
+        calls.load(std::sync::atomic::Ordering::SeqCst),
+        1,
+        "unstick 在托管自动集里"
+    );
+    assert!(h
+        .store
+        .list_pending_foreman_proposals(&turn.session.id)
+        .await
+        .unwrap()
+        .is_empty());
+
+    // ② 「重启服务」**永不**自动——它是全局动作（会打断所有在跑的任务）
+    for steward in [true, false] {
+        if steward {
+            stewarded_task(&h, Some(Stewardship::enabled_now(h.clock.now()))).await;
+        }
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let mut script = Script::new();
+        script
+            .for_foreman()
+            .tool("service", serde_json::json!({"action": "restart"}));
+        script.for_foreman().text("提了，等你按键。");
+        let runner = h.runner_with_steward(script, calls.clone());
+        let turn = runner.say(None, "重启一下").await.unwrap();
+        assert_eq!(
+            calls.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "重启永远只提议（托管={steward}）"
+        );
+        let pending = h
+            .store
+            .list_pending_foreman_proposals(&turn.session.id)
+            .await
+            .unwrap();
+        assert_eq!(pending.len(), 1, "重启是一条提议：{pending:?}");
+        assert_eq!(pending[0].tool, "service");
+        // 文案要说清影响面：值班经理按下之前唯一能读到的就是这一行
+        assert!(
+            pending[0].summary.contains("打断"),
+            "重启提议的说明必须说清会打断在跑的任务：{}",
+            pending[0].summary
+        );
+    }
 }

@@ -429,6 +429,8 @@ async fn run_proposal_tool(
     match proposal.tool.as_str() {
         "write_file" | "edit_file" | "run_command" => run_env_tool(state, proposal).await,
         "task" => run_task_tool(state, proposal).await,
+        // 全局动作（决策 210⑧ / 票 09）：**永远只提议**，按下走恢复序列。
+        "service" => run_service_tool(state, proposal).await,
         "config" => run_config_tool(state, proposal).await,
         "skills" => run_skills_tool(state, proposal).await,
         // 工具名对不上的提议是**真实可能**的（升级前落的、或模型报了一个不存在的名字）：
@@ -482,6 +484,50 @@ async fn run_env_tool(
     };
     let outcome = tools.execute(&call, &ctx).await.map_err(map_core_error)?;
     Ok(Some(outcome.content))
+}
+
+// ──────────────────── 本服务写接口：四个领域各一族（票 05 / 09）────────────────────
+
+/// `service` 族（决策 210⑧ / 票 09）：**全局动作，永远只提议**。
+///
+/// 按下之后做的是**恢复序列**（决策 127 的两步：清 `executor_owner` + 把中断的 `running`
+/// 任务归队），然后**如实说清本进程没有自重启能力**——没有 supervisor 契约，擅自 `exit`
+/// 会让服务就此消失，而按下那颗钮的人未必在能把它拉起来的地方。
+///
+/// 这一条偏离了票面「重启服务」的字面（只重启、不改代码那件事），如实记在票 09 的收尾里：
+/// 真正重启需要一条进程外的监督者，那是另一票。
+async fn run_service_tool(
+    state: &AppState,
+    proposal: &ForemanProposal,
+) -> Result<Option<String>, ApiError> {
+    let action = str_arg(&proposal.args, "action")?;
+    if action != "restart" {
+        return Err(ApiError::bad_request(format!(
+            "service 工具没有这个动作：{action}（可用：restart）"
+        )));
+    }
+    let cleared = state
+        .store
+        .clear_executor_owners()
+        .await
+        .map_err(map_core_error)?;
+    let requeued = state
+        .store
+        .requeue_running_tasks()
+        .await
+        .map_err(map_core_error)?;
+    let abandoned = state
+        .store
+        .abandon_stale_project_runs()
+        .await
+        .map_err(map_core_error)?;
+    Ok(Some(format!(
+        "已执行重启前的恢复序列：清理残留执行者 {cleared} 个、中断的 running 任务归队 {} 个、\
+         中断的项目级 run 标终态 {} 条。**本进程没有自重启能力**——请在你启动它的地方\
+         （桌面壳或那个终端）重启一次，中断的任务会从归队处继续。",
+        requeued.len(),
+        abandoned.len()
+    )))
 }
 
 // ──────────────────── 本服务写接口：三个领域各一族（票 05）────────────────────
@@ -569,6 +615,30 @@ async fn run_task_tool(
             )
             .await;
             endpoint_outcome(response).await
+        }
+        "unstick" => {
+            let task_id = str_arg(args, "task_id")?;
+            // `unstick` 不在端点里（它是修补动作面，不是界面上的按钮面）：直接调 core。
+            // **必须先摘进程内去重**，否则清了 DB 也没用（决策 210⑧ 的原话）。
+            let release = crate::runtime::force_release;
+            let unstuck = agentpipeline_core::pipeline::unstick::unstick(
+                &state.store,
+                &release,
+                &task_id,
+                state.store.now(),
+                chrono::Duration::seconds(state.settings.watch_owner_stuck_minutes as i64),
+            )
+            .await
+            .map_err(map_core_error)?;
+            Ok(Some(format!(
+                "已解除僵死占用（{}）：游标 {} 转 pending（标终态的 run {:?}），现在可以 resume",
+                match unstuck.kind {
+                    agentpipeline_core::storage::AttentionKind::OwnerStuck => "owner 持有超时",
+                    _ => "调度器处置未生效",
+                },
+                unstuck.cursor_id,
+                unstuck.finished_runs
+            )))
         }
         "retry" => {
             let task_id = str_arg(args, "task_id")?;

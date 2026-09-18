@@ -132,6 +132,11 @@ pub fn proposal_summary(request: &ProposalRequest) -> String {
                 format!("安装技能（来自 {}）", s("path"))
             }
         }
+        // 全局动作（决策 210⑧ / 票 09）：文案必须说清它的影响面——「会打断在跑的任务」
+        // 是值班经理按下之前唯一能读到的一句话。
+        "service" => "重启服务（**会打断所有在跑的任务**；按下后先清理占用并把中断的任务归队，\
+                      本进程没有自重启能力，需要你在启动它的地方重启一次）"
+            .to_string(),
         other => format!("调用 {other}"),
     }
 }
@@ -146,6 +151,7 @@ fn task_summary(request: &ProposalRequest) -> String {
         // 恢复动作由模型填（`continue` / `skip` / …），与动作集同一套词表
         "resume" => format!("让任务 {task_id} 的 {} 继续", s("resume_action")),
         "retry" => format!("重跑任务 {task_id}"),
+        "unstick" => format!("解除任务 {task_id} 的僵死占用（清执行者 + 标终态 + 转 pending）"),
         "cancel" => format!("取消任务 {task_id}"),
         "review" => format!(
             "{}任务 {task_id} 的人工评审",

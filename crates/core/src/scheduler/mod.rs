@@ -707,67 +707,21 @@ impl KanbanScheduler {
     }
 
     /// 任务卡在 running 上的两类证据（票 05 的 ⑤⑥）。
+    ///
+    /// 判据在 [`crate::pipeline::unstick::stuck_evidence`]——票 09 的 `unstick` 用的是同一份。
+    /// 两处各写一份的后果是「报出来的卡住」与「解得开的卡住」成为两个集合，
+    /// 而「它说卡了、我却解不开」正是最让人不信任这套东西的一类现象。
     async fn stuck_evidence(
         &self,
         task: &crate::types::Task,
         now: chrono::DateTime<chrono::Utc>,
         stuck: Duration,
     ) -> Result<Option<(AttentionKind, chrono::DateTime<chrono::Utc>, serde_json::Value)>> {
-        for cursor in self.store.load_live_cursors(&task.id).await? {
-            if !cursor.is_runnable() {
-                continue;
-            }
-            let Some(run) = self
-                .store
-                .list_runs_at(&task.id, cursor.stage, cursor.node)
+        Ok(
+            crate::pipeline::unstick::stuck_evidence(&self.store, task, now, stuck)
                 .await?
-                .pop()
-            else {
-                continue;
-            };
-            if run.status == NodeStatus::Running {
-                // owner 持有超时：**有主**，但心跳停了（没有主的不该报这一类）
-                let last = run.last_activity_at.unwrap_or(run.started_at);
-                let owned = task
-                    .executor_owner
-                    .as_deref()
-                    .is_some_and(|o| !o.is_empty());
-                if owned && now - last > stuck {
-                    return Ok(Some((
-                        AttentionKind::OwnerStuck,
-                        last,
-                        serde_json::json!({
-                            "run_id": run.id,
-                            "stage": run.stage.as_str(),
-                            "node": run.node.as_str(),
-                            "owner": task.executor_owner,
-                            "heartbeat_seconds_ago": (now - last).num_seconds(),
-                        }),
-                    )));
-                }
-                continue;
-            }
-            // 游标 active 而 run 已终态（且过了宽限期）：处置没生效
-            let Some(finished) = run.finished_at else {
-                continue;
-            };
-            if now - finished > stuck {
-                return Ok(Some((
-                    AttentionKind::SchedulerNoEffect,
-                    finished,
-                    serde_json::json!({
-                        "run_id": run.id,
-                        "run_status": run.status.as_str(),
-                        "stage": run.stage.as_str(),
-                        "node": run.node.as_str(),
-                        "attempt": run.attempt,
-                        "cursor_id": cursor.cursor_id,
-                        "error": run.error,
-                    }),
-                )));
-            }
-        }
-        Ok(None)
+                .map(|e| (e.kind, e.occurred_at, e.detail)),
+        )
     }
 
     // ─────────────────────── 心跳刷新（决策 100）───────────────────────

@@ -3811,3 +3811,139 @@ async fn context_overflow_path_writes_a_conversation_row() {
         "context_overflow 退出路径须补写会话行（票 13 必要条件一）：{convs:?}"
     );
 }
+
+// ─────────────── unstick：摘掉进程内去重，重跑才真的发生（决策 210⑧ / 票 09）───────────────
+
+/// 票 09 的核心断言：**「重跑真的发生了」要打在新 run 行出现上**，不是打在「owner 列为空」上
+/// ——后者清个 DB 字段就能满足，而那正是这条要防的假绿。
+#[tokio::test]
+async fn unsticking_releases_the_in_process_dedup_and_allows_a_rerun() {
+    use agentpipeline_core::pipeline::unstick::unstick;
+
+    let ctx = setup("true", Settings::default()).await;
+    let (tx, rx) = tokio::sync::oneshot::channel::<()>();
+    let calls = Arc::new(AtomicUsize::new(0));
+    let llm: Arc<dyn LlmClient> = Arc::new(BlockingAgentSimple {
+        gate: Arc::new(tokio::sync::Mutex::new(Some(rx))),
+        calls: calls.clone(),
+    });
+    let executor = Arc::new(Executor::new(
+        ctx.store.clone(),
+        Settings::default(),
+        Arc::new(ctx.sse.clone()),
+        llm,
+        Arc::new(ctx.killer.clone()),
+    ));
+
+    testkit::seed_task(&ctx.store, "t-hang", "p1").await.unwrap();
+    admit(&ctx, "t-hang").await;
+
+    // 第一个执行体卡在 LLM 调用上（进程内去重持有 t-hang）
+    let hanging = {
+        let e = executor.clone();
+        tokio::spawn(async move { e.run("t-hang").await })
+    };
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while calls.load(Ordering::SeqCst) < 1 {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("执行体应进行到第一次 LLM 调用");
+    let before = ctx
+        .store
+        .list_runs_at("t-hang", Stage::Init, Node::Execute)
+        .await
+        .unwrap()
+        .len();
+
+    // 不看门：第二个执行体被**进程内去重**拒掉（这正是「清了 DB 也没用」的机制）
+    assert!(
+        !executor.try_run("t-hang").await.unwrap(),
+        "去重仍持有它，第二次 try_run 被拒"
+    );
+
+    // unstick：摘去重 + 清 owner + 转 pending。任务此刻仍在 running（执行体卡着），
+    // 这正是实证里的形状——僵死 run 判定的宽限设为 0，免得测试要等 10 分钟。
+    let unstuck = unstick(
+        &ctx.store,
+        &agentpipeline_core::pipeline::executor::force_release,
+        "t-hang",
+        agentpipeline_core::clock::Clock::now(&ctx.clock),
+        chrono::Duration::zero(),
+    )
+    .await
+    .unwrap();
+    assert_eq!(unstuck.run_id > 0, true);
+    assert!(
+        ctx.store.get_task("t-hang").await.unwrap().executor_owner.is_none(),
+        "占用已清"
+    );
+
+    // 关键断言：现在同一个 executor **真的能再跑一轮**（新 run 行出现）
+    drop(tx);
+    let _ = hanging.await;
+    calls.store(0, Ordering::SeqCst);
+    assert!(
+        executor.try_run("t-hang").await.unwrap(),
+        "unstick 之后 try_run 应当取得执行权"
+    );
+    let after = ctx
+        .store
+        .list_runs_at("t-hang", Stage::Init, Node::Execute)
+        .await
+        .unwrap()
+        .len();
+    assert!(after > before, "重跑发生了：run 行由 {before} 增到 {after}");
+}
+
+/// 正常在跑的任务不能被 unstick（否则它会变成「随便踢一脚」）。
+#[tokio::test]
+async fn a_healthy_running_task_cannot_be_unstuck() {
+    use agentpipeline_core::pipeline::unstick::unstick;
+
+    let ctx = setup("true", Settings::default()).await;
+    testkit::seed_task(&ctx.store, "t-ok", "p1").await.unwrap();
+    admit(&ctx, "t-ok").await;
+    ctx.store
+        .try_claim_executor("t-ok", "executor:live")
+        .await
+        .unwrap();
+    let cursor = ctx.store.load_live_cursors("t-ok").await.unwrap()[0].clone();
+    // 一条**心跳新鲜**的 running run
+    let run_id = ctx
+        .store
+        .insert_run(&agentpipeline_core::storage::observability::NewRun {
+            task_id: "t-ok".into(),
+            cursor_id: cursor.cursor_id.clone(),
+            stage: cursor.stage,
+            node: cursor.node,
+            attempt: 1,
+            agent_type: "main".into(),
+            parent_run_id: None,
+            prompt_template_hash: None,
+            process_group_id: None,
+        })
+        .await
+        .unwrap();
+    ctx.store.touch_run_heartbeat(run_id).await.unwrap();
+
+    let err = unstick(
+        &ctx.store,
+        &agentpipeline_core::pipeline::executor::force_release,
+        "t-ok",
+        agentpipeline_core::clock::Clock::now(&ctx.clock),
+        chrono::Duration::minutes(10),
+    )
+    .await
+    .unwrap_err();
+    assert!(
+        err.to_string().contains("没有卡住"),
+        "健康任务不该被踢：{err}"
+    );
+    assert_eq!(
+        ctx.store.get_task("t-ok").await.unwrap().executor_owner.as_deref(),
+        Some("executor:live"),
+        "占用没被动过"
+    );
+}
