@@ -24,6 +24,8 @@ crates/desktop/gen/schemas/
 .scratch/shots/**/*.png
 # UI/UX 审计截图（可由 UX_AUDIT=1 跑 e2e/ux-audit.spec.ts 重新生成，不入库）
 .scratch/ux-audit/*.png
+# 第二轮审计截图（可由 UX_AUDIT2=1 跑 e2e/ux-audit-2.spec.ts 重新生成，不入库）
+.scratch/ux-audit-2/*.png
 
 # 本机工具产物，与本项目无关：cargo-sweep 的时间戳文件、ZCode 客户端的会话目录
 sweep.timestamp
