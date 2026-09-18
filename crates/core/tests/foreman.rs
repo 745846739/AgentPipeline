@@ -17,7 +17,7 @@ use agentpipeline_core::metrics;
 use agentpipeline_core::pipeline::foreman::{
     build_briefing, foreman_tool_names, situation_fingerprint, trim_history, ForemanRunner,
     ForemanToolLayer, FOREMAN_AGENT_TYPE, FOREMAN_FAILED_TURN_MARK, FOREMAN_PERSONA,
-    FOREMAN_STAGE_KEY, FOREMAN_TOOL_SPECS, OPERATION_LOG_MARK,
+    FOREMAN_STAGE_KEY, FOREMAN_TOOL_SPECS, FOREMAN_WATCH_MARK, OPERATION_LOG_MARK,
 };
 use agentpipeline_core::storage::foreman::NewForemanMessage;
 use agentpipeline_core::storage::tasks::TaskFilter;
@@ -527,6 +527,216 @@ async fn read_task_tool_actually_reads_the_ledger_and_feeds_the_reply() {
     let traces = assistant.traces_json.as_ref().expect("痕迹应落库");
     assert_eq!(traces[0]["tool"], "read_task");
     assert_eq!(traces[0]["ok"], true);
+}
+
+// ─────────────────────── 值守轮（决策 209④ / 票 06）───────────────────────
+
+/// 造一条待办（真库，不伪造）。
+async fn note(h: &Harness, task_id: &str, kind: agentpipeline_core::storage::AttentionKind) {
+    h.store
+        .note_attention(
+            task_id,
+            kind,
+            h.clock.now(),
+            Some(&serde_json::json!({"message": "测试事件"})),
+        )
+        .await
+        .unwrap();
+}
+
+#[tokio::test]
+async fn a_due_attention_wakes_the_foreman_exactly_once() {
+    let h = Harness::seeded().await;
+    note(&h, "t1", agentpipeline_core::storage::AttentionKind::RetryExhausted).await;
+    // 去抖窗口过了（默认 60s）
+    h.clock.advance_secs(61);
+
+    let mut script = Script::new();
+    script.for_foreman().text("t1 重试耗尽了，需要值班经理看一眼。");
+    let agent = FakeAgent::new(script);
+    let runner = h.runner(agent.clone());
+
+    let turn = runner.watch().await.unwrap().expect("应当醒一次");
+    assert_eq!(agent.total_calls(), 1, "恰好一次模型调用");
+    assert!(turn.reply.contains("重试耗尽"));
+
+    // 播报落进班次，且**带主动播报的标记**（前端靠它把两种轮分开）
+    let messages = h
+        .store
+        .list_foreman_messages(&turn.session.id, 100)
+        .await
+        .unwrap();
+    assert_eq!(messages.len(), 1, "只有播报那一行：{messages:?}");
+    assert_eq!(messages[0].role, "assistant");
+    assert!(
+        messages[0].content.starts_with(FOREMAN_WATCH_MARK),
+        "播报的开头要让人一眼看出这是主动播报：{}",
+        messages[0].content
+    );
+    // 待办被消费（「这条我处理过没有」有了答案）
+    assert!(h.store.open_attention(100).await.unwrap().is_empty());
+
+    // 第二趟：没有待办了 → 零次模型调用
+    assert!(runner.watch().await.unwrap().is_none());
+    assert_eq!(agent.total_calls(), 1, "空闲时零成本");
+}
+
+#[tokio::test]
+async fn several_events_are_batched_into_one_brief() {
+    // 攒批**不许丢事件**：窗口内连来三件，一次唤醒里三条都在。
+    let h = Harness::seeded().await;
+    note(&h, "t1", agentpipeline_core::storage::AttentionKind::TaskPending).await;
+    h.clock.advance_secs(5);
+    note(&h, "t2", agentpipeline_core::storage::AttentionKind::GateFailure).await;
+    h.clock.advance_secs(5);
+    note(&h, "t3", agentpipeline_core::storage::AttentionKind::SchedulerNoEffect).await;
+    h.clock.advance_secs(61);
+
+    let mut script = Script::new();
+    script.for_foreman().text("三件事：t1 / t2 / t3 都要看。");
+    let agent = FakeAgent::new(script);
+    let runner = h.runner(agent.clone());
+
+    let turn = runner.watch().await.unwrap().expect("应当醒一次");
+    assert_eq!(agent.total_calls(), 1, "三件事只唤醒一次");
+    assert_eq!(
+        h.store
+            .list_foreman_messages(&turn.session.id, 100)
+            .await
+            .unwrap()
+            .len(),
+        1
+    );
+
+    // 简报里三条都在（打在这一轮真正发给模型的 messages 上）
+    let fed = serde_json::to_string(&agent.request_log()[0].messages).unwrap();
+    for (task, kind) in [
+        ("t1", "task_pending"),
+        ("t2", "gate_failure"),
+        ("t3", "scheduler_no_effect"),
+    ] {
+        assert!(fed.contains(task), "简报缺 {task}：{fed}");
+        assert!(fed.contains(kind), "简报缺 {kind}：{fed}");
+    }
+    assert!(
+        fed.contains("系统生成的"),
+        "简报要标明来路——否则值班长会把它当成有人在对它下指令：{fed}"
+    );
+    assert!(h.store.open_attention(100).await.unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn a_fresh_event_is_not_woken_yet() {
+    // 去抖窗口内不唤醒（攒批），窗口一到才醒
+    let h = Harness::seeded().await;
+    note(&h, "t1", agentpipeline_core::storage::AttentionKind::TaskDone).await;
+    let mut script = Script::new();
+    script.for_foreman().text("播报");
+    let agent = FakeAgent::new(script);
+    let runner = h.runner(agent.clone());
+
+    assert!(runner.watch().await.unwrap().is_none(), "窗口没过，不吵醒它");
+    assert_eq!(agent.total_calls(), 0, "这一趟一次模型调用都没有");
+    assert_eq!(h.store.open_attention(100).await.unwrap().len(), 1, "事件还在");
+
+    h.clock.advance_secs(60);
+    assert!(runner.watch().await.unwrap().is_some());
+    assert_eq!(agent.total_calls(), 1);
+}
+
+#[tokio::test]
+async fn no_attention_means_no_model_call() {
+    // 「空闲时零成本」的牙齿：连一次 LLM 调用都不发生
+    let h = Harness::seeded().await;
+    let mut script = Script::new();
+    script.for_foreman().text("不该发生");
+    let agent = FakeAgent::new(script);
+    let runner = h.runner(agent.clone());
+    assert!(runner.watch().await.unwrap().is_none());
+    assert_eq!(agent.total_calls(), 0);
+    let sid = h.session().await;
+    assert!(h
+        .store
+        .list_foreman_messages(&sid, 100)
+        .await
+        .unwrap()
+        .is_empty());
+}
+
+#[tokio::test]
+async fn a_no_action_verdict_is_recorded_silently() {
+    // §2.4：诊断结论是「无需处理」→ 静默入库、**不播报**——一次自愈的风吹草动不该变成
+    // 一条消息，而消息本身会挤占 24k 的历史窗口预算。
+    let h = Harness::seeded().await;
+    note(&h, "t1", agentpipeline_core::storage::AttentionKind::TaskDone).await;
+    h.clock.advance_secs(61);
+
+    let mut script = Script::new();
+    script.for_foreman().text("【无需处理】这一件按设计走完了。");
+    let agent = FakeAgent::new(script);
+    let runner = h.runner(agent.clone());
+
+    assert!(runner.watch().await.unwrap().is_none(), "静默：不返回播报");
+    assert_eq!(agent.total_calls(), 1, "它仍然醒了一次并做了判断");
+    let sid = h.store.latest_foreman_session().await.unwrap().unwrap().id;
+    assert!(
+        h.store
+            .list_foreman_messages(&sid, 100)
+            .await
+            .unwrap()
+            .is_empty(),
+        "静默 = 不落播报行"
+    );
+    // 但这件事**被处理过了**：不消费的话它会一夜被反复唤醒
+    assert!(h.store.open_attention(100).await.unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn a_failed_watch_turn_keeps_the_events_unconsumed() {
+    // 一次网络抖动不该等于把这批事件丢了
+    struct Boom;
+    impl LlmClient for Boom {
+        fn complete(
+            &self,
+            _request: LlmRequest,
+        ) -> futures::future::BoxFuture<
+            'static,
+            agentpipeline_core::Result<agentpipeline_core::agent::client::AgentResponse>,
+        > {
+            Box::pin(async { Err(Error::Llm("模型没配".into())) })
+        }
+    }
+    let h = Harness::seeded().await;
+    note(&h, "t1", agentpipeline_core::storage::AttentionKind::TaskPending).await;
+    h.clock.advance_secs(61);
+    let runner = ForemanRunner::new(
+        h.store.clone(),
+        Settings::default(),
+        h._home.home().clone(),
+        Arc::new(Boom) as Arc<dyn LlmClient>,
+        Arc::new(testkit::SseRecorder::new()),
+    );
+
+    assert!(runner.watch().await.is_err());
+    assert_eq!(
+        h.store.open_attention(100).await.unwrap().len(),
+        1,
+        "失败不消费：下一趟还看得见同一批"
+    );
+}
+
+/// `slow_run` 这类「只播报不唤醒」的事件不该把我们叫醒（§2.1 的牙齿长在类别上）。
+#[tokio::test]
+async fn notice_only_events_do_not_wake_it() {
+    let h = Harness::seeded().await;
+    note(&h, "t1", agentpipeline_core::storage::AttentionKind::SlowRun).await;
+    h.clock.advance_secs(600);
+    let mut script = Script::new();
+    script.for_foreman().text("不该发生");
+    let agent = FakeAgent::new(script);
+    let runner = h.runner(agent.clone());
+    assert!(runner.watch().await.unwrap().is_none());
+    assert_eq!(agent.total_calls(), 0, "慢跑只播报不唤醒");
 }
 
 // ─────────────────────── 诊断包（决策 211③ / 票 03）───────────────────────

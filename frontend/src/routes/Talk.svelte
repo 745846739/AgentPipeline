@@ -198,6 +198,13 @@
    */
   const FAILED_TURN_MARK = '【没跑起来】';
 
+  /**
+   * 主动播报的标记（决策 209④ / 票 06）。同样由后端加上（语义源在 foreman.rs 的
+   * `FOREMAN_WATCH_MARK`）：**值守轮不是回话**——它没人问就自己说话，名牌上要看得出来，
+   * 否则值班经理会以为自己在跟它对话（而它其实是在报事件）。
+   */
+  const WATCH_MARK = '【值守播报】';
+
   interface TurnView {
     key: string;    /**
      * 发言者。`console` = **操作台记的一轮**（`role === 'system'`：提议的执行结果，决策 207）。
@@ -221,6 +228,13 @@
     needsPairing: boolean;
     /** 提议轮带的那条提议（其余轮为 `null`）。 */
     proposal: ForemanProposal | null;
+    /**
+     * 这一轮是**主动播报**（值守轮自己醒来说的话，票 06）。
+     *
+     * 与「回话」分开渲染的理由不是好看：回话是有人问的，播报是它自己说的——
+     * 混成一种轮会让「它是不是在跟我说话」变成读不出来的一件事。
+     */
+    proactive: boolean;
   }
 
   /**
@@ -254,6 +268,7 @@
         briefing: m.briefing,
         needsPairing: false,
         proposal: null,
+        proactive: m.role === 'assistant' && m.content.startsWith(WATCH_MARK),
       },
     }));
     for (const p of session?.proposals ?? []) {
@@ -270,6 +285,7 @@
           briefing: null,
           needsPairing: false,
           proposal: p,
+          proactive: false,
         },
       });
     }
@@ -287,6 +303,7 @@
         briefing: null,
         needsPairing: false,
         proposal: null,
+        proactive: false,
       });
     }
     if (sending || stream.text) {
@@ -302,6 +319,7 @@
         briefing: null,
         needsPairing: false,
         proposal: null,
+        proactive: false,
       });
     }
     if (stream.error) {
@@ -316,6 +334,7 @@
         briefing: null,
         needsPairing: needsPairing(stream.error),
         proposal: null,
+        proactive: false,
       });
     }
     return out;
@@ -1147,7 +1166,9 @@
                 ? '值班经理'
                 : turn.kind === 'console'
                   ? '操作台'
-                  : '值班长'}
+                  : turn.proactive
+                    ? '值班长 · 值守'
+                    : '值班长'}
           </div>
           <p class:streaming={turn.streaming}>{turn.content}</p>
 

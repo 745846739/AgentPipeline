@@ -460,6 +460,9 @@ pub async fn serve(options: ServeOptions) -> anyhow::Result<ServerHandle> {
         runtime.llm(),
         sse.clone(),
     ));
+    // 值守轮（决策 209④ / 票 06）：与调度器的 10s tick 分开驱动——它要花模型的钱，
+    // 且「醒不醒」的判据在 `ForemanRunner::watch` 里（有待办 + 去抖窗口到期）。
+    runtime.spawn_watch_loop(foreman.clone(), shutdown_tx.subscribe());
     let state = AppState::new(store, home, settings, bound.port())
         .with_sse(sse)
         .with_executor(runtime.executor())

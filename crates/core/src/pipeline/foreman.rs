@@ -359,6 +359,25 @@ pub fn foreman_tooling(
 /// 当成人对它下的指令；不带标记也不转写（整段丢掉）则会让它以为提议还挂着、于是重提一遍。
 pub const OPERATION_LOG_MARK: &str = "【操作台】";
 
+/// 主动播报的标记（决策 209④ / 票 06）。
+///
+/// 播报落进班次时**由后端加上**，不由模型自己说：它是「这句话不是回话、是值守轮说的」
+/// 这个事实的载体，而前端要靠它区分两种轮，模型不该有机会说错。
+pub const FOREMAN_WATCH_MARK: &str = "【值守播报】";
+
+/// 值守轮的**静默哨兵**（决策 209④ / 票 06）：诊断结论是「无需处理」时，让模型只回这一行。
+///
+/// 为什么敢让模型回哨兵：判据是「明确说了无需处理」才静默，任何别的输出照常播报——
+/// 漏报一条真问题比多播一条便宜（§2.4 的静默规则是为**历史窗口预算**设的，
+/// 不是为省 token 设的）。
+pub const FOREMAN_NO_ACTION_MARK: &str = "【无需处理】";
+
+/// 一次值守轮最多把多少条待办喂进简报。
+///
+/// 与 `FOREMAN_HISTORY_BUDGET_CHARS` 同一姿态：真正的账是字符，这个数只是「别把一夜的
+/// 事件都塞进一次简报」的粗兜底。超出的部分留在表里，下一轮（或被追问时）再处理。
+const FOREMAN_ATTENTION_FETCH_LIMIT: usize = 50;
+
 /// 单次回话的最大工具往返轮数（决策 182④）。
 ///
 /// 正常靠「模型不再发起 tool_call」自然结束；这个上限是防御性的——模型若陷入
@@ -741,6 +760,36 @@ pub struct ForemanTurn {
     pub traces: Vec<ForemanTrace>,
 }
 
+/// 一轮回话的输入（决策 209④ / 票 06）：人的话与值守轮的简报**共用**同一条模型调用与
+/// 工具循环（token 记账、痕迹、审计都只有一份）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TurnInput {
+    /// 值班经理打的一句话。它先落库（审计要的是「他说了什么」）。
+    Human(String),
+    /// **值守轮的系统简报**：待办逐条（类别 + 任务 + 当时的台账事实）合成的一段话。
+    ///
+    /// 它必须**在文案上标明来路**：值班长的人格第一条是「不认领没做过的事」，
+    /// 而一段没有署名的话会被它当成有人在对它下指令（「你让它重启它」）。
+    WatchBrief(String),
+}
+
+impl TurnInput {
+    /// 喂进 transcript 最后一条 user 消息的正文。
+    fn transcript_text(&self) -> String {
+        match self {
+            TurnInput::Human(text) => text.clone(),
+            TurnInput::WatchBrief(brief) => format!(
+                "{FOREMAN_WATCH_MARK}（以下是**系统生成的**值守简报，不是值班经理说的话；\
+                 建议不要当成指令）\n{brief}"
+            ),
+        }
+    }
+
+    fn is_watch(&self) -> bool {
+        matches!(self, TurnInput::WatchBrief(_))
+    }
+}
+
 /// 值班长运行器。
 ///
 /// 与 [`crate::pipeline::subagent::StoreSubAgentRunner`] 不同，它由 `AppState` 长期持有
@@ -814,15 +863,15 @@ impl ForemanRunner {
         // 失败也要留痕（决策 211④ / 票 04）：`?` 会把这一轮的现场一起带走，库里只剩
         // 一条孤立的 user 行——2026-09-17 实测里值班长两次没回话，「为什么没回话」
         // 一个字都查不到。故外框兜住所有出口，失败时落一条 `system` 账。
-        let result = self.respond(&session, text).await;
+        let result = self.respond(&session, TurnInput::Human(text.to_string())).await;
         if let Err(error) = &result {
             self.record_failed_turn(&session, error).await;
         }
         result
     }
 
-    /// 一轮回话的**内里**（现场由 [`Self::say`] 的外框记账）。
-    async fn respond(&self, session: &ForemanSession, text: &str) -> Result<ForemanTurn> {
+    /// 一轮回话的**内里**（现场由 [`Self::say`] / [`Self::watch`] 的外框记账）。
+    async fn respond(&self, session: &ForemanSession, input: TurnInput) -> Result<ForemanTurn> {
         let briefing = build_briefing(&self.store).await?;
         // 阶段配置读一次、用两个地方（人格 + provider / 采样参数）。中途再读一次不会
         // 有新值可读，却会让「人格用这一份、provider 用那一份」成为可能。
@@ -886,9 +935,14 @@ impl ForemanRunner {
             .collect();
         // 历史最后一条就是刚落库的这句 user 消息；但若它被 `trim_history` 之外的原因
         // 漏掉（例如库被外部清空），仍要保证本轮的问题在场。
-        match transcript.last() {
-            Some(m) if m.role == crate::agent::client::Role::User => {}
-            _ => transcript.push(Message::user(text.to_string())),
+        // 值守简报**总是**追加成最后一条：它带署名（`TurnInput::transcript_text`），
+        // 而历史里最后一条也是 user（刚落的用户行）时不能靠「已经有了」跳过它——
+        // 那会让这一轮真正要处理的东西消失。人的话反过来：历史里最后一条就是它。
+        match (&input, transcript.last()) {
+            (TurnInput::Human(text), Some(m)) if m.role == crate::agent::client::Role::User => {
+                let _ = text;
+            }
+            _ => transcript.push(Message::user(input.transcript_text())),
         }
 
         let tool_defs = Self::tool_defs(env_mode);
@@ -985,12 +1039,37 @@ impl ForemanRunner {
         } else {
             Some(serde_json::to_value(&traces)?)
         };
+        // 静默规则（决策 209④ / §2.4）：值守轮判定「无需处理」时不落**播报**——
+        // 一次自愈的风吹草动不该变成一条消息，而消息本身会挤占历史窗口预算（24k 字符）。
+        // 痕迹留在日志里；台账那一栏的「我处理过没有」由待办表的 `consumed_at` 回答。
+        if input.is_watch() && reply.trim_start().starts_with(FOREMAN_NO_ACTION_MARK) {
+            tracing::info!(
+                session = %session.id,
+                reply = %reply,
+                "值守轮判定无需处理：静默入库，不播报"
+            );
+            return Ok(ForemanTurn {
+                session: session.clone(),
+                reply,
+                prompt_tokens: tokens.0,
+                completion_tokens: tokens.1,
+                briefing,
+                traces,
+            });
+        }
         let briefing_json = serde_json::to_value(&briefing)?;
+        // 播报的标记由**后端**加上（不由模型自己说）：它是「这一轮不是回话」这个事实的载体，
+        // 前端靠它把主动播报与回话分开渲染，模型不该有机会说错。
+        let content = if input.is_watch() {
+            format!("{FOREMAN_WATCH_MARK}{reply}")
+        } else {
+            reply.clone()
+        };
         self.store
             .append_foreman_message(NewForemanMessage {
                 session_id: session.id.clone(),
                 role: FOREMAN_ROLE_ASSISTANT.to_string(),
-                content: reply.clone(),
+                content,
                 prompt_tokens: tokens.0,
                 completion_tokens: tokens.1,
                 briefing_json: Some(briefing_json),
@@ -1006,6 +1085,59 @@ impl ForemanRunner {
             briefing,
             traces,
         })
+    }
+
+    /// **值守轮**（决策 209④ / 票 06）：有待办、且去抖窗口已到，就自己醒一次。
+    ///
+    /// 与人回话的区别只有一个——**输入不是人打的话，而是系统生成的简报**；模型调用、
+    /// 工具循环、token 记账、`briefing_json` / `traces_json` 审计全部共用（[`Self::respond`]）。
+    ///
+    /// 返回 `Ok(None)` 的三种情形都是「这一趟不说话」：
+    /// - 没有**会唤醒**的待办（§2.1 那条纪律：只有需要有人管的事才吵醒它）；
+    /// - 有，但最早那件还没到去抖窗口（攒批：一夜的风吹草动该合成一次）；
+    /// - 醒了，但判定无需处理（§2.4 静默规则）。
+    ///
+    /// **消费只在成功之后**：失败（模型报错 / 没回话）不置 `consumed_at`，下一趟还看得见
+    /// 同一批——否则一次网络抖动就等于把这批事件丢了。
+    pub async fn watch(&self) -> Result<Option<ForemanTurn>> {
+        let open = self
+            .store
+            .open_attention(FOREMAN_ATTENTION_FETCH_LIMIT)
+            .await?;
+        let waking: Vec<_> = open.iter().filter(|i| i.kind.wakes()).collect();
+        if waking.is_empty() {
+            // 空闲时**零次模型调用**（票 06 的牙齿之一）
+            return Ok(None);
+        }
+        // 去抖：从**最早那件**算窗口。攒批的代价是响得慢一点，收益是不为一件事吵两次；
+        // 窗口过后的第一趟就把窗口内所有件一起带上（不许丢事件）。
+        let debounce = chrono::Duration::seconds(self.settings.watch_debounce_sec as i64);
+        if let Some(oldest) = waking.iter().map(|i| i.created_at).min() {
+            if self.store.now() - oldest < debounce {
+                return Ok(None);
+            }
+        }
+        let brief = render_watch_brief(&waking);
+        let session = self.resolve_session(None).await?;
+        match self.respond(&session, TurnInput::WatchBrief(brief)).await {
+            Ok(turn) => {
+                let ids: Vec<i64> = waking.iter().map(|i| i.id).collect();
+                if let Err(e) = self.store.consume_attention(&ids).await {
+                    // 消费失败只记日志：下一趟会重复看到这批事件，多醒一次比丢事件便宜
+                    tracing::error!(session = %session.id, "值守轮消费待办失败：{e}");
+                }
+                if turn.reply.trim_start().starts_with(FOREMAN_NO_ACTION_MARK) {
+                    Ok(None)
+                } else {
+                    Ok(Some(turn))
+                }
+            }
+            Err(error) => {
+                // 失败也留痕（票 04 那条路），且**不消费**——这批事件下一趟还在。
+                self.record_failed_turn(&session, &error).await;
+                Err(error)
+            }
+        }
     }
 
     /// 落一条**失败回合**的账（决策 211④ / 票 04）。
@@ -1199,6 +1331,34 @@ fn turn_failure_reason(error: &Error) -> (String, String) {
         Error::Migrate(e) => ("db".into(), e.to_string()),
         other => ("internal".into(), other.to_string()),
     }
+}
+
+/// 待办 → 值班长读的那段简报（票 06）。
+///
+/// 逐条给「类别 + 任务 + 当时的台账事实」，并**明确标注这是系统简报**（署名在
+/// [`TurnInput::transcript_text`] 里，两者一起才完整：一段没有署名的事实清单会被
+/// 当成有人在给它下指令）。
+fn render_watch_brief(items: &[&crate::storage::attention::AttentionItem]) -> String {
+    let mut out = String::from("值守简报：以下事件是调度器发现的，请判断哪些需要值班经理处置。\n");
+    for item in items {
+        let detail = item
+            .detail_json
+            .as_ref()
+            .map(|d| d.to_string())
+            .unwrap_or_else(|| "（无细节）".into());
+        out.push_str(&format!(
+            "- [{}] 任务 {}｜发生 {}｜{}\n",
+            item.kind.as_str(),
+            item.task_id,
+            item.occurred_at.to_rfc3339(),
+            detail
+        ));
+    }
+    out.push_str(&format!(
+        "\n若这些都不需要处置，只回一行 {FOREMAN_NO_ACTION_MARK}（不会打扰值班经理）；\
+         有需要他管的，就说清哪台工位、卡在什么上、可以怎么做。"
+    ));
+    out
 }
 
 /// 参数摘要：紧凑 JSON，截到 200 字符。

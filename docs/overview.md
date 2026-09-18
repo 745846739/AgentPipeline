@@ -118,5 +118,6 @@ graph TD
 | `allow_dirty_worktree_merge` | false | 允许在目标分支工作区不干净时合入；false 时进入 pending 由用户决定 |
 | `watch_event_window_minutes` | 30 | 值班长待办只收**这么新**的事件；同时是「同一任务在窗口内再次 pending」的计数窗口（决策 209②，票 05） |
 | `watch_owner_stuck_minutes` | 10 | 判「卡住」的宽限：`scheduler_no_effect`（run 已终态而游标仍 active）与 `owner_stuck`（有主但心跳停了）都用它（票 05） |
+| `watch_debounce_sec` | 60 | 值守轮的去抖窗口：窗口内攒批、到期唤醒一次；窗口内没有新事件则一次都不醒（票 06） |
 
 > 阶段级 Agent 配置（provider / model 覆盖、prompt 覆盖、工具集等）不在本表，见 [agents.md](agents.md) §10.6。

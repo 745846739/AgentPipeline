@@ -70,6 +70,10 @@ pub struct Settings {
     /// （任务 running 但长时间没有 run 心跳）。默认 10 分钟：低于它时还在正常重试的
     /// 时间范围内，报出来只会是噪声。
     pub watch_owner_stuck_minutes: u64,
+    /// **值守轮的去抖窗口**（秒，决策 209④ / 票 06）：窗口内攒批，到期才唤醒一次。
+    ///
+    /// 它换来的是「不为一件事吵两次」；代价是响得慢一点——夜里值守最不缺的就是时间。
+    pub watch_debounce_sec: u64,
 }
 
 impl Default for Settings {
@@ -103,6 +107,7 @@ impl Default for Settings {
             env_mode: crate::types::EnvMode::Auto,
             watch_event_window_minutes: 30,
             watch_owner_stuck_minutes: 10,
+            watch_debounce_sec: 60,
         }
     }
 }
@@ -142,6 +147,7 @@ pub struct PipelineOverrides {
     pub env_mode: Option<String>,
     pub watch_event_window_minutes: Option<u64>,
     pub watch_owner_stuck_minutes: Option<u64>,
+    pub watch_debounce_sec: Option<u64>,
 }
 
 impl PipelineOverrides {
@@ -181,6 +187,7 @@ impl PipelineOverrides {
             egress_allow_all,
             watch_event_window_minutes,
             watch_owner_stuck_minutes,
+            watch_debounce_sec,
         );
         // 非法值由 [`Config::validate`] 在解析期拦下（fail fast），故这里只做「认得出就采用」
         // ——两处都报错会让同一个错误有两个出口，而这里没有 `Result` 可返回。

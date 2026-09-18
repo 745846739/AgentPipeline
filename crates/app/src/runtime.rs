@@ -30,6 +30,10 @@ use crate::state::ResumeHook;
 /// 小时级维护周期（决策 55：会话清理 + 指标聚合与 10s tick 分开）。
 pub const MAINTENANCE_INTERVAL: Duration = Duration::from_secs(3600);
 
+/// 值守轮的驱动周期（票 06）：比去抖窗口短一档即可——真正的判据是窗口到了没有
+/// （`ForemanRunner::watch` 自己按 `watch_debounce_sec` 判），这个周期只决定「多久看一次」。
+pub const WATCH_INTERVAL: Duration = Duration::from_secs(10);
+
 /// 组装生产执行器 + resume 钩子 + 调度器所需的共享件。
 pub struct Runtime {
     pub resume_hook: ResumeHook,
@@ -124,6 +128,43 @@ impl Runtime {
         tokio::spawn(async move {
             if let Err(e) = scheduler.run_loop(shutdown).await {
                 tracing::error!(error = %e, "scheduler run_loop 退出");
+            }
+        });
+    }
+
+    /// 启动**值守轮**循环（决策 209④ / 票 06）：有待办且去抖窗口到了，值班长自己醒一次。
+    ///
+    /// 为什么由 app 层驱动而不是塞进 scheduler 的 tick：调度器不认识值班长（它只用
+    /// store + resume），而「醒一次」要花模型的钱——把它挂在 tick 里会让每个调度器用例
+    /// 都变成一次潜在的 LLM 调用。这里是一个独立的、可关掉的循环。
+    pub fn spawn_watch_loop(
+        &self,
+        foreman: Arc<agentpipeline_core::pipeline::foreman::ForemanRunner>,
+        mut shutdown: tokio::sync::watch::Receiver<bool>,
+    ) {
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(WATCH_INTERVAL);
+            interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            // 首次 tick 立即完成：跳过，避免启动瞬间就值一次班（那时态势还没稳）
+            interval.tick().await;
+            loop {
+                tokio::select! {
+                    _ = interval.tick() => {
+                        match foreman.watch().await {
+                            Ok(Some(turn)) => tracing::info!(
+                                session = %turn.session.id,
+                                "值守轮播报了一轮"
+                            ),
+                            // 没有待办 / 未到窗口 / 判定无需处理：都是「这一趟不说话」
+                            Ok(None) => {}
+                            Err(e) => tracing::warn!(error = %e, "值守轮失败（待办未消费，下一趟重试）"),
+                        }
+                    }
+                    _ = shutdown.changed() => {
+                        tracing::info!("值守轮收到停机信号");
+                        return;
+                    }
+                }
             }
         });
     }
