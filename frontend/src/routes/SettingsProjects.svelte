@@ -221,7 +221,11 @@
   {/if}
 
   {#if error}
-    <div class="banner error">{error}</div>
+    <!-- 读不到要有出路（票 02 / R2-07c）：`load()` 只在 onMount 调，没有这颗钮就只能整页刷新。 -->
+    <div class="banner error" role="alert">{error}</div>
+    <div class="retry">
+      <button type="button" class="btn" disabled={loading} onclick={() => void load()}>重试</button>
+    </div>
   {:else if loading}
     <div class="banner">正在加载项目…</div>
   {:else if projects.length === 0}
@@ -343,6 +347,10 @@
   .banner.error {
     border-color: var(--stop);
     color: var(--stop);
+  }
+  /* 错误横幅下的出路（票 02）：横幅与它的重试钮是同一件事。 */
+  .retry {
+    margin: 8px 0 12px;
   }
   .analysis {
     padding: 12px 14px;

@@ -45,6 +45,8 @@ class TaskDetailStore {
   state = $state<TaskDetailState>(emptyTaskDetailState());
   loading = $state(false);
   error = $state<string | null>(null);
+  /** 失败的状态码（非 `ApiError` 记 0）：界面据此分开「这个 id 没有」与「没读到」（票 01）。 */
+  errorStatus = $state<number | null>(null);
 
   conversationsFull = $state<Record<number, NodeConversation>>({});
   conversationsLoading = $state(false);
@@ -78,8 +80,17 @@ class TaskDetailStore {
     const taskId = id ?? this.id;
     if (!taskId) return;
     this.id = taskId;
-    if (!silent) this.loading = true;
+    if (!silent) {
+      this.loading = true;
+      // 用户可见的那一次加载（进页面 / 换 id / 点「重新加载」）从第一帧起就把上一份收走：
+      // 否则新 id 的地址下会先闪出旧任务的正文，失败时旧任务的拍板按钮还会留在屏上
+      // 并指向新那个坏 id（票 01 / R2-01）。
+      this.resetTaskContent();
+      // 旧任务的流一并收：事件回调不按 id 过滤，留着就会把 A 的事件记到 B 的头上。
+      this.streamManager.sync([]);
+    }
     this.error = null;
+    this.errorStatus = null;
     try {
       const detail = await getTask(taskId);
       // 保留流式增量（重载会话前不丢当前 run 的实时文本）
@@ -108,9 +119,34 @@ class TaskDetailStore {
       this.streamManager.sync([taskId]);
     } catch (err) {
       this.error = (err as Error).message;
+      this.errorStatus = err instanceof ApiError ? err.status : 0;
+      // 失败当下再清一次：`getTask` 成功、随后三个并行请求里有一个失败时，
+      // 半截的新任务会与上一份的 transitions / conversations / commands 混在一起。
+      // 静默 refetch 失败不清——那是后台对齐，把正在看的页面清空比留着更坏；
+      // 它只把错误挂出来（横幅），内容照旧。
+      if (!silent) this.resetTaskContent();
     } finally {
       if (!silent) this.loading = false;
     }
+  }
+
+  /**
+   * 把「上一个任务的一切」收走（票 01 / R2-01）。
+   *
+   * 必须整份收：`{#if task}` 靠 `task` 短路掉加载与空分支，只清 title 之类的局部字段
+   * 仍会让旧任务的正文（含 6 颗指向新 id 的拍板按钮）留在屏上。
+   */
+  private resetTaskContent(): void {
+    this.state = emptyTaskDetailState();
+    this.conversationsFull = {};
+    this.commandOutputFull = {};
+    this.commandOutputError = {};
+    this.files = {};
+    this.diff = null;
+    this.diffRaw = null;
+    this.diffError = null;
+    this.diffStale = false;
+    this.actionError = null;
   }
 
   dispose(): void {

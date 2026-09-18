@@ -29,10 +29,23 @@ export function draftFromProject(p: Project): ProjectDraft {
   };
 }
 
-/** 返回 null 表示通过；否则为界面提示文案。 */
-export function validateProjectDraft(draft: ProjectDraft, isNew: boolean): string | null {
-  if (!draft.name.trim()) return '请填写项目名。';
-  if (isNew && !draft.local_path.trim()) return '请填写本地路径。';
+/**
+ * 字段级校验结果（票 02 / R2-06）。
+ *
+ * 校验失败要能指到**哪一格**：只有文案的版本没法给那一格 `aria-invalid` +
+ * `aria-describedby`，读屏用户听到的是一句没有落点的告警。
+ */
+export interface ProjectFieldError {
+  field: 'name' | 'local_path';
+  message: string;
+}
+
+/** 返回 null 表示通过；否则是出错的那一格与界面提示文案。 */
+export function validateProjectDraft(draft: ProjectDraft, isNew: boolean): ProjectFieldError | null {
+  if (!draft.name.trim()) return { field: 'name', message: '请填写项目名。' };
+  if (isNew && !draft.local_path.trim()) {
+    return { field: 'local_path', message: '请填写本地路径。' };
+  }
   return null;
 }
 

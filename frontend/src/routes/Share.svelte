@@ -93,7 +93,17 @@
     }
   }
 
-  onMount(async () => {
+  onMount(() => void load());
+
+  /**
+   * 读服务地址 + 配对令牌。
+   *
+   * 从 `onMount` 里提出来是为了给错误横幅一颗「重试」（票 02 / R2-07c）——原来这套只在
+   * 挂载时跑一次，读不到就只剩整页刷新一条路。
+   */
+  async function load() {
+    loading = true;
+    error = null;
     try {
       info = await getServerInfo();
       selected = addresses[0]?.url ?? null;
@@ -104,7 +114,7 @@
     }
     // 令牌单取：它失败不影响这一页对「手机怎么连上」的回答，故不并进上面那个 try。
     await loadToken();
-  });
+  }
 
   /**
    * 按下「绑定全网卡」/「只绑本机」。
@@ -184,7 +194,10 @@
   {#if loading}
     <div class="banner">正在读取服务地址…</div>
   {:else if error}
-    <div class="banner error">{error}</div>
+    <div class="banner error" role="alert">{error}</div>
+    <div class="retry">
+      <button type="button" class="btn" onclick={() => void load()}>重试</button>
+    </div>
   {:else if info}
     <!-- 端口退让的说明（决策 213）：不说出来，手机上那张打不开的书签就查不到原因。
          只绑回环时不说（`portFallbackNote` 里判掉）——那时手机本来就连不上，端口是多少
@@ -388,6 +401,10 @@ host = "0.0.0.0"</code></pre>
   .banner.error {
     border-color: var(--stop);
     color: var(--stop);
+  }
+  /* 错误横幅下的出路（票 02）：横幅与它的重试钮是同一件事。 */
+  .retry {
+    margin: 8px 0 12px;
   }
   /* 二维码牌：2px 描边盒 + 右侧地址栏（移动款纵向堆叠，见下方媒体查询） */
   .qrbox {

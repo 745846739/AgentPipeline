@@ -162,11 +162,21 @@
 
     <div class="notices">
       {#if board.error}
-        <div class="banner error">加载失败：{board.error}</div>
+        <!-- 错误要说得出口、也要有出路（票 02 / R2-06 / R2-07c）：读屏靠 role=alert 听到，
+             手上有这颗「重试」——不在别处，就在这条横幅底下。 -->
+        <div class="banner error" role="alert">加载失败：{board.error}</div>
+        <button
+          type="button"
+          class="btn retry"
+          disabled={board.loading}
+          onclick={() => void board.loadTasks()}
+        >
+          重试
+        </button>
       {/if}
       {#if board.actionError}
         <!-- 动作提交失败必须可见（主流程票 03）：吞掉它 = 用户点「重试」毫无反应的死面板 -->
-        <div class="banner error">动作提交失败：{board.actionError}</div>
+        <div class="banner error" role="alert">动作提交失败：{board.actionError}</div>
       {/if}
       {#if board.connectionState === 'error'}
         <div class="banner">实时流已断开，正在重连…（看板仍每 10s 对齐一次）</div>
@@ -278,6 +288,10 @@
     font-size: 12px;
     color: var(--text-2);
     margin-bottom: 8px;
+  }
+  /* 错误横幅下的出路（票 02）：横幅与它的重试钮是同一件事。 */
+  .btn.retry {
+    margin: 0 0 10px;
   }
   .banner.error {
     border-color: var(--stop);

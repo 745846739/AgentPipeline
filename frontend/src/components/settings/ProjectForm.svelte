@@ -6,6 +6,7 @@
     emptyProjectDraft,
     validateProjectDraft,
     type ProjectDraft,
+    type ProjectFieldError,
   } from '../../lib/projects';
 
   /**
@@ -29,8 +30,13 @@
   let draft = $state<ProjectDraft>(
     untrack(() => (project ? draftFromProject(project) : emptyProjectDraft())),
   );
-  let localError = $state<string | null>(null);
-  const shownError = $derived(error ?? localError);
+  let localError = $state<ProjectFieldError | null>(null);
+  const shownError = $derived(error ?? localError?.message ?? null);
+  /**
+   * 只有**本地**校验知道错在哪一格（后端拒绝原因是一句话，没有落点）。
+   * 出错的那一格拿 `aria-invalid` + 指向错误节点的 `aria-describedby`（票 02 / R2-06）。
+   */
+  const badField = $derived(localError?.field ?? null);
 
   function submit(e: SubmitEvent) {
     e.preventDefault();
@@ -50,7 +56,13 @@
   <div class="grid">
     <label class="field">
       <span>名称</span>
-      <input class="input" bind:value={draft.name} placeholder="项目显示名" />
+      <input
+        class="input"
+        bind:value={draft.name}
+        placeholder="项目显示名"
+        aria-invalid={badField === 'name' ? 'true' : undefined}
+        aria-describedby={badField === 'name' ? 'proj-form-error' : undefined}
+      />
     </label>
 
     <label class="field">
@@ -65,6 +77,8 @@
         bind:value={draft.local_path}
         readonly={!isNew}
         placeholder="/Users/you/code/project"
+        aria-invalid={badField === 'local_path' ? 'true' : undefined}
+        aria-describedby={badField === 'local_path' ? 'proj-form-error' : undefined}
       />
     </label>
 
@@ -86,7 +100,9 @@
     </p>
   {/if}
 
-  {#if shownError}<div class="error">{shownError}</div>{/if}
+  {#if shownError}
+    <div class="error" id="proj-form-error" role="alert">{shownError}</div>
+  {/if}
 
   <div class="actions">
     <button type="button" class="btn quiet" disabled={submitting} onclick={oncancel}>取消</button>

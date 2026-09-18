@@ -1,5 +1,5 @@
 import { fireEvent, render, screen, within } from '@testing-library/svelte';
-import { afterEach, beforeAll, describe, expect, it, vi } from 'vitest';
+import { afterEach, beforeAll, beforeEach, describe, expect, it, vi } from 'vitest';
 import type { AllowedAction, BranchCursor, Task } from '../api/types';
 import { parseUnifiedDiff, type ParsedDiff } from '../lib/diff';
 import { emptyTaskDetailState } from '../realtime/reduce';
@@ -23,7 +23,8 @@ const mocks = vi.hoisted(() => ({
   detail: {
     state: undefined as unknown,
     loading: false,
-    error: null,
+    error: null as string | null,
+    errorStatus: null as number | null,
     actionError: null,
     busyKey: null,
     diff: null as ParsedDiff | null,
@@ -237,9 +238,61 @@ describe('任务详情 · 空态（票 13）', () => {
     mocks.detail.diff = null;
     mocks.detail.diffRaw = null;
     mocks.detail.loading = false;
+    mocks.detail.error = null;
+    mocks.detail.errorStatus = null;
     render(TaskDetail, { props: { id: 'nope' } });
 
     const back = screen.getByRole('link', { name: /回看板/ });
     expect(back.getAttribute('href')).toBe('#/');
+  });
+});
+
+describe('任务详情 · 加载失败有出口（票 01 / R2-01）', () => {
+  beforeEach(() => {
+    mocks.detail.state = emptyTaskDetailState();
+    mocks.detail.diff = null;
+    mocks.detail.diffRaw = null;
+    mocks.detail.loading = false;
+  });
+
+  it('失败态给一颗「重新加载」，点了真的重跑 load（首次加载失败不再是永久死页）', async () => {
+    mocks.detail.error = 'Internal Server Error';
+    mocks.detail.errorStatus = 500;
+    render(TaskDetail, { props: { id: 'task-1' } });
+
+    const again = screen.getByRole('button', { name: '重新加载' });
+    await fireEvent.click(again);
+    expect(mocks.detail.load).toHaveBeenCalledWith('task-1');
+  });
+
+  it('「404」说这个 id 没有，「其它失败」说没能打开——两种话不混用', () => {
+    mocks.detail.error = '任务不存在：nope';
+    mocks.detail.errorStatus = 404;
+    render(TaskDetail, { props: { id: 'nope' } });
+    // 空态与失败横幅各说一遍同一句（横幅那一份同时是 live region）
+    expect(screen.getAllByText(/任务不存在：nope/).length).toBeGreaterThan(0);
+
+    document.body.innerHTML = '';
+    mocks.detail.error = 'Failed to fetch';
+    mocks.detail.errorStatus = 0;
+    render(TaskDetail, { props: { id: 'task-1' } });
+    expect(screen.getByText(/任务没能打开：task-1/)).toBeTruthy();
+    expect(screen.getByText(/Failed to fetch/)).toBeTruthy();
+  });
+
+  it('失败原因进 live region（票 02）：读屏听到的是那句话，不只是红颜色', () => {
+    mocks.detail.error = 'Failed to fetch';
+    mocks.detail.errorStatus = 0;
+    render(TaskDetail, { props: { id: 'task-1' } });
+    const alert = screen.getByRole('alert');
+    expect(alert.textContent).toContain('Failed to fetch');
+  });
+
+  it('加载中不摆失败态：先给「正在加载任务…」', () => {
+    mocks.detail.loading = true;
+    mocks.detail.error = null;
+    render(TaskDetail, { props: { id: 'task-1' } });
+    expect(screen.getByText(/正在加载任务/)).toBeTruthy();
+    expect(screen.queryByRole('button', { name: '重新加载' })).toBeNull();
   });
 });

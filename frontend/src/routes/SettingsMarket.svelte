@@ -299,7 +299,11 @@
   </p>
 
   {#if error}
-    <div class="banner error">{error}</div>
+    <!-- 读不到要有出路（票 02 / R2-07c）：`load()` 只在 onMount 调，没有这颗钮就只能整页刷新。 -->
+    <div class="banner error" role="alert">{error}</div>
+    <div class="retry">
+      <button type="button" class="btn" disabled={loading} onclick={() => void load()}>重试</button>
+    </div>
   {:else if loading}
     <div class="banner">正在读取市场配置…</div>
   {:else if config}
@@ -350,6 +354,8 @@
           class="input mono"
           bind:value={newRepo}
           placeholder="owner/repo"
+          aria-invalid={addError !== null ? 'true' : undefined}
+          aria-describedby={addError !== null ? 'market-add-error' : undefined}
           onkeydown={(e) => {
             if (!shouldSubmitOnEnter(e, composingRepo.active())) return;
             e.preventDefault();
@@ -367,7 +373,7 @@
           ＋ 添加
         </button>
       </div>
-      {#if addError}<div class="err">{addError}</div>{/if}
+      {#if addError}<div class="err" id="market-add-error" role="alert">{addError}</div>{/if}
 
       <div class="acts">
         <button type="button" class="btn solid" disabled={saving || !dirty} onclick={() => void save()}>
@@ -381,7 +387,7 @@
         {#if dirty}<span class="sub">有未保存的改动。</span>{/if}
         {#if saved}<span class="ok">已保存。</span>{/if}
       </div>
-      {#if saveError}<div class="err">{saveError}</div>{/if}
+      {#if saveError}<div class="err" role="alert">{saveError}</div>{/if}
       {#if config.origin === 'settings'}
         <p class="sub">
           现在以界面上的这一份为准；<span class="mono">config.toml</span> 里
@@ -434,102 +440,125 @@
             next="点上面仓名单里的「查看技能」，看它里面有什么。"
           />
         </div>
-      {:else if listing}
-        <div class="banner">正在读 {selectedRepo}…</div>
-      {:else if listError}
-        <div class="err">{listError}</div>
-        <div class="sub">读不到这个仓时不显示任何技能——未取到的东西不能进列表。</div>
-      {:else if list}
-        <div class="sub listmeta">
-          基于 <span class="mono">{list.commit_short}</span>（{localTime(list.listed_at)}）
-          <button
-            type="button"
-            class="btn quiet"
-            disabled={refreshing}
-            onclick={() => selectedRepo && void viewRepo(selectedRepo, true)}
-          >
-            {#if refreshing}<span class="spin"></span>{/if}刷新
-          </button>
-        </div>
-
-        <div class="subform">
-          <input
-            class="input"
-            bind:value={query}
-            placeholder="技能名或描述关键词（留空 = 列出全部）"
-            onkeydown={(e) => {
-              // 过滤是即时的，回车没有动作可提交；护栏照旧接上，免得输入法选字那一次回车
-              // 被别的处理者当成一次动作（决策 184）。
-              if (!shouldSubmitOnEnter(e, composingQuery.active())) return;
-              e.preventDefault();
-            }}
-            oncompositionstart={() => composingQuery.start()}
-            oncompositionend={() => composingQuery.end()}
-          />
-        </div>
-        <p class="sub">
-          搜索只过滤<b>这一个仓里已经取下来的技能</b>（不打 GitHub 的搜索接口，那个接口配额
-          10 次/小时）——要看别的仓就在上面切换。
-        </p>
-
-        {#if groups.length === 0}
-          <div class="blank">
-            没有命中的技能：这个仓里没有带 <span class="mono">SKILL.md</span> 的目录，或关键词没命中。
-            换个词，或点「刷新」取这个仓现在的 tip。
+      {:else}
+        {#if listing}
+          <div class="banner">正在读 {selectedRepo}…</div>
+        {/if}
+        {#if list}
+          <div class="sub listmeta">
+            基于 <span class="mono">{list.commit_short}</span>（{localTime(list.listed_at)}）
+            <button
+              type="button"
+              class="btn quiet"
+              disabled={refreshing}
+              onclick={() => selectedRepo && void viewRepo(selectedRepo, true)}
+            >
+              {#if refreshing}<span class="spin"></span>{/if}刷新
+            </button>
           </div>
-        {:else}
-          {#each groups as g (g.path)}
-            <div class="grp">
-              <div class="grp-head mono">{g.path === '' ? '（根）' : g.path}</div>
-              <ul class="hit-list">
-                {#each g.skills as s (s.dir)}
-                  <li class="hit">
-                    <div class="hit-main">
-                      <div class="hit-l1">
-                        <span class="hit-name mono">{s.name}</span>
-                      </div>
-                      {#if s.description}<div class="sub">{s.description}</div>{/if}
-                      <div class="sub mono hit-dir">{s.dir}</div>
-                    </div>
-                    <div class="hit-acts">
-                      {#if confirmingOverwrite === s.dir}
-                        <span class="sub">同名已存在，覆盖？</span>
-                        <button
-                          type="button"
-                          class="btn danger"
-                          disabled={installing === s.dir}
-                          onclick={() => void install(s, true)}
-                        >
-                          覆盖安装
-                        </button>
-                        <button
-                          type="button"
-                          class="btn quiet"
-                          onclick={() => (confirmingOverwrite = null)}
-                        >
-                          取消
-                        </button>
-                      {:else}
-                        <button
-                          type="button"
-                          class="btn"
-                          disabled={installing === s.dir}
-                          onclick={() => void install(s)}
-                        >
-                          {#if installing === s.dir}<span class="spin"></span>{/if}安装
-                        </button>
-                      {/if}
-                    </div>
-                  </li>
-                {/each}
-              </ul>
+
+          <div class="subform">
+            <input
+              class="input"
+              bind:value={query}
+              placeholder="技能名或描述关键词（留空 = 列出全部）"
+              onkeydown={(e) => {
+                // 过滤是即时的，回车没有动作可提交；护栏照旧接上，免得输入法选字那一次回车
+                // 被别的处理者当成一次动作（决策 184）。
+                if (!shouldSubmitOnEnter(e, composingQuery.active())) return;
+                e.preventDefault();
+              }}
+              oncompositionstart={() => composingQuery.start()}
+              oncompositionend={() => composingQuery.end()}
+            />
+          </div>
+          <p class="sub">
+            搜索只过滤<b>这一个仓里已经取下来的技能</b>（不打 GitHub 的搜索接口，那个接口配额
+            10 次/小时）——要看别的仓就在上面切换。
+          </p>
+
+          {#if groups.length === 0}
+            <div class="blank">
+              没有命中的技能：这个仓里没有带 <span class="mono">SKILL.md</span> 的目录，或关键词没命中。
+              换个词，或点「刷新」取这个仓现在的 tip。
             </div>
-          {/each}
+          {:else}
+            {#each groups as g (g.path)}
+              <div class="grp">
+                <div class="grp-head mono">{g.path === '' ? '（根）' : g.path}</div>
+                <ul class="hit-list">
+                  {#each g.skills as s (s.dir)}
+                    <li class="hit">
+                      <div class="hit-main">
+                        <div class="hit-l1">
+                          <span class="hit-name mono">{s.name}</span>
+                        </div>
+                        {#if s.description}<div class="sub">{s.description}</div>{/if}
+                        <div class="sub mono hit-dir">{s.dir}</div>
+                      </div>
+                      <div class="hit-acts">
+                        {#if confirmingOverwrite === s.dir}
+                          <span class="sub">同名已存在，覆盖？</span>
+                          <button
+                            type="button"
+                            class="btn danger"
+                            disabled={installing === s.dir}
+                            onclick={() => void install(s, true)}
+                          >
+                            覆盖安装
+                          </button>
+                          <button
+                            type="button"
+                            class="btn quiet"
+                            onclick={() => (confirmingOverwrite = null)}
+                          >
+                            取消
+                          </button>
+                        {:else}
+                          <button
+                            type="button"
+                            class="btn"
+                            disabled={installing === s.dir}
+                            onclick={() => void install(s)}
+                          >
+                            {#if installing === s.dir}<span class="spin"></span>{/if}安装
+                          </button>
+                        {/if}
+                      </div>
+                    </li>
+                  {/each}
+                </ul>
+              </div>
+            {/each}
+          {/if}
+        {/if}
+
+        {#if listError}
+          <!-- 刷新失败**不再把已列出的技能连控制一起弄没**（票 02 / R2-07a）：
+               原来 `listError` 分支排在 `list` 之前，于是 refresh 特意保留的 list 根本渲染不到，
+               「刷新」与「查看技能」两颗钮一起消失——唯一出路是换个仓再切回来或整页刷新。
+               现在错误与列表并存，且错误自带重试。 -->
+          <div class="err" role="alert">{listError}</div>
+          <div class="acts">
+            <button
+              type="button"
+              class="btn"
+              disabled={listing || refreshing}
+              onclick={() => selectedRepo && void viewRepo(selectedRepo, list !== null)}
+            >
+              重试
+            </button>
+            {#if list}
+              <span class="sub">
+                上面这份还是上一次读到的 <span class="mono">{list.commit_short}</span>。
+              </span>
+            {/if}
+          </div>
         {/if}
       {/if}
 
       {#if installError}
-        <div class="err">
+        <div class="err" role="alert">
           {installError.message}
           {#if installError.kind}<span class="tag mono">{installError.kind}</span>{/if}
         </div>
@@ -621,6 +650,10 @@
   .banner.error {
     border-color: var(--stop);
     color: var(--stop);
+  }
+  /* 错误横幅下的出路（票 02）：横幅与它的重试钮是同一件事。 */
+  .retry {
+    margin: 8px 0 12px;
   }
   .hintline {
     color: var(--text-3);

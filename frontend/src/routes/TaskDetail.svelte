@@ -81,6 +81,8 @@
   );
   /** 托管开关这一面（`null` = 不摆，见 `lib/stewardship.ts`）。 */
   const steward = $derived(task ? stewardshipFace(task, foremanWired) : null);
+  /** 「这个 id 没有」与「没读到」是两回事（票 01）：404 说前者，其余说后者。 */
+  const notFound = $derived(taskDetail.error !== null && taskDetail.errorStatus === 404);
 
   /**
    * 任务级入口的地址形状是 brief §二 末尾那张跨流接口表的**契约**（票 06 / 07），逐字照抄：
@@ -180,10 +182,15 @@
 
   async function bypass(kind: 'retry' | 'archive') {
     bypassBusy = kind;
+    taskDetail.actionError = null;
     try {
       if (kind === 'retry') await retryTask(id);
       else await archiveTask(id);
       await taskDetail.load(id, true);
+    } catch (err) {
+      // 静默失败 = 用户点了「重试」而屏上什么都没发生（票 02 / R2-08）：按钮静静复活，
+      // 人不知道出了事。走页面既有的动作错误位（`actionError`），不再让 rejection 落地。
+      taskDetail.actionError = (err as Error).message;
     } finally {
       bypassBusy = null;
     }
@@ -235,13 +242,21 @@
   <div class="main">
     {#if !isMobile}<a class="crumb" href="#/">← 看板</a>{/if}
 
-    {#if taskDetail.error}
-      <div class="banner error">{taskDetail.error}</div>
+    {#if task && taskDetail.error}
+      <!-- 后台对齐（refetch）失败：内容还在，只把「这次没刷新上」挂出来。
+           没有 task 的那一态（进页面 / 换 id 失败）由下面的空分支自己说，
+           否则同一件事会在屏上出现两遍（票 01）。这颗「重试」是用户看得见的那条出路
+           ——不指望他等到下一次 10s 对齐或切一次标签页（票 02 / R2-07）。 -->
+      <div class="banner error" role="alert">{taskDetail.error}</div>
+      <div class="reload">
+        <button type="button" class="btn" onclick={() => void taskDetail.load(id, true)}>重试</button>
+      </div>
     {/if}
 
     {#if taskDetail.actionError}
-      <!-- 动作提交失败必须可见（主流程票 03）：吞掉它 = 用户点「重试」毫无反应的死面板 -->
-      <div class="banner error">动作提交失败：{taskDetail.actionError}</div>
+      <!-- 动作提交失败必须可见（主流程票 03）：吞掉它 = 用户点「重试」毫无反应的死面板。
+           `role=alert` 让它在读屏里也说一声（票 02 / R2-06）——红颜色只说给看得见的人。 -->
+      <div class="banner error" role="alert">动作提交失败：{taskDetail.actionError}</div>
     {/if}
 
     {#if task}
@@ -412,13 +427,25 @@
     {:else if taskDetail.loading}
       <div class="hint">正在加载任务…</div>
     {:else}
-      <!-- 打不到任务也是一种空态（票 13）：状态 → 下一步 → 可选入口，入口必须可点。 -->
+      <!-- 打不到任务也是一种空态（票 13）：状态 → 下一步 → 可选入口，入口必须可点。
+           失败态再给一条「重新加载」（票 01 / R2-01）——首次加载失败在服务器恢复后
+           不会自愈（流没接上，visibility 恢复遍历的是空连接表），没有这颗钮就是永久死页。
+           「这个 id 没有」与「没读到」分开说：前者重试无意义，后者重试是唯一的出路。
+           失败原因单独一行并进 live region（票 02 / R2-06）——读屏也要听得到。 -->
       <EmptyState
-        state={`任务不存在：${id}`}
-        next="这个 id 没有对应的任务。它可能已经被删掉，或者地址抄漏了一位。"
+        state={notFound ? `任务不存在：${id}` : `任务没能打开：${id}`}
+        next={notFound
+          ? '这个 id 没有对应的任务。它可能已经被删掉，或者地址抄漏了一位。'
+          : '没能读到这个任务。'}
         href="#/"
         linkLabel="回看板"
       />
+      {#if taskDetail.error}
+        <div class="banner error" role="alert">{taskDetail.error}</div>
+        <div class="reload">
+          <button type="button" class="btn" onclick={() => void taskDetail.load(id)}>重新加载</button>
+        </div>
+      {/if}
     {/if}
   </div>
 
@@ -655,6 +682,10 @@
   .hint {
     color: var(--text-3);
     font-size: 12px;
+  }
+  /* 「重新加载」挨着空态摆（票 01）：失败态的唯一出路，不能藏在别处。 */
+  .reload {
+    margin-top: 10px;
   }
   /* 横幅（断线 / 加载失败 / 动作提交失败，决策 159）：像素框，必须可见 */
   .banner {

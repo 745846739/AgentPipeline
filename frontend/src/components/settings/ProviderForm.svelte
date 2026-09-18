@@ -9,7 +9,9 @@
     draftFromProvider,
     emptyProviderDraft,
     isSupportedAdapter,
+    validateProviderDraft,
     type ProviderDraft,
+    type ProviderFieldError,
   } from '../../lib/providers';
 
   /**
@@ -36,8 +38,13 @@
     isNew ? 'sk-…（可留空，本机代理可匿名）' : `已保存；保持 ${API_KEY_MASK} 即不修改`,
   );
 
-  let localError = $state<string | null>(null);
-  const shownError = $derived(error ?? localError);
+  let localError = $state<ProviderFieldError | null>(null);
+  const shownError = $derived(error ?? localError?.message ?? null);
+  /** 出错的那一格（只有本地校验知道；后端拒绝原因是一句话，没有落点）。票 02 / R2-06。 */
+  const badField = $derived(localError?.field ?? null);
+  const invalidAttr = (field: keyof ProviderDraft) => (badField === field ? 'true' : undefined);
+  const describedBy = (field: keyof ProviderDraft) =>
+    badField === field ? 'prov-form-error' : undefined;
 
   // 「测试连接」（决策 160）：建任务前验证密钥 / 模型 / 地址，不必保存草稿
   let testing = $state(false);
@@ -60,6 +67,13 @@
 
   function submit(e: SubmitEvent) {
     e.preventDefault();
+    // 当场拦下（票 11 / R2-13）：形状不对的 base_url 落库之后，要等到任务真跑模型才炸，
+    // 离填写现场很远。字段级结果同时供 aria-invalid / aria-describedby 用（票 02）。
+    const invalid = validateProviderDraft(draft);
+    if (invalid) {
+      localError = invalid;
+      return;
+    }
     localError = null;
     onsubmit(draft);
   }
@@ -71,7 +85,13 @@
   <div class="grid">
     <label class="field">
       <span>厂商 vendor</span>
-      <input class="input mono" list="supported-adapters" bind:value={draft.vendor} />
+      <input
+        class="input mono"
+        list="supported-adapters"
+        bind:value={draft.vendor}
+        aria-invalid={invalidAttr('vendor')}
+        aria-describedby={describedBy('vendor')}
+      />
       <datalist id="supported-adapters">
         {#each SUPPORTED_ADAPTERS as a (a)}<option value={a}></option>{/each}
       </datalist>
@@ -79,7 +99,13 @@
 
     <label class="field">
       <span>模型 model</span>
-      <input class="input mono" bind:value={draft.model} placeholder="gpt-4o / claude-… / deepseek-chat" />
+      <input
+        class="input mono"
+        bind:value={draft.model}
+        placeholder="gpt-4o / claude-… / deepseek-chat"
+        aria-invalid={invalidAttr('model')}
+        aria-describedby={describedBy('model')}
+      />
     </label>
 
     <label class="field">
@@ -89,12 +115,20 @@
         type="number"
         min="1"
         bind:value={draft.context_window}
+        aria-invalid={invalidAttr('context_window')}
+        aria-describedby={describedBy('context_window')}
       />
     </label>
 
     <label class="field">
       <span>base_url（可选）</span>
-      <input class="input mono" bind:value={draft.base_url} placeholder="留空使用官方默认" />
+      <input
+        class="input mono"
+        bind:value={draft.base_url}
+        placeholder="留空使用官方默认"
+        aria-invalid={invalidAttr('base_url')}
+        aria-describedby={describedBy('base_url')}
+      />
     </label>
 
     <label class="field wide">
@@ -120,9 +154,11 @@
     <span class="mono">0700</span>。保存时未改动则不会回传掩码。
   </p>
 
-  {#if shownError}<div class="error">{shownError}</div>{/if}
+  {#if shownError}
+    <div class="error" id="prov-form-error" role="alert">{shownError}</div>
+  {/if}
 
-  {#if testError}<div class="error">测试连接失败：{testError}</div>{/if}
+  {#if testError}<div class="error" role="alert">测试连接失败：{testError}</div>{/if}
   {#if testResult}
     <div class="test-result" class:ok={testResult.ok} class:fail={!testResult.ok}>
       <b>{testResult.ok ? '✓' : '✗'} {testResult.message}</b>

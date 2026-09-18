@@ -108,7 +108,8 @@
   async function submit(draft: ProviderDraft) {
     const invalid = validateProviderDraft(draft);
     if (invalid) {
-      formError = invalid;
+      // 兜底：表单自己也校验（它才拿得到「哪一格」），这里只防绕过。
+      formError = invalid.message;
       return;
     }
     if (!editing) return;
@@ -172,7 +173,11 @@
   {/if}
 
   {#if error}
-    <div class="banner error">{error}</div>
+    <!-- 读不到要有出路（票 02 / R2-07c）：`load()` 只在 onMount 调，没有这颗钮就只能整页刷新。 -->
+    <div class="banner error" role="alert">{error}</div>
+    <div class="retry">
+      <button type="button" class="btn" disabled={loading} onclick={() => void load()}>重试</button>
+    </div>
   {:else if loading}
     <div class="banner">正在加载 provider…</div>
   {:else if providers.length === 0}
@@ -286,6 +291,10 @@
   .banner.error {
     border-color: var(--stop);
     color: var(--stop);
+  }
+  /* 错误横幅下的出路（票 02）：横幅与它的重试钮是同一件事，间距把它们绑在一起。 */
+  .retry {
+    margin: 8px 0 12px;
   }
   .warnnote.inline {
     margin-top: 0;

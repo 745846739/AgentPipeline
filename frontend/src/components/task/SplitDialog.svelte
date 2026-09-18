@@ -41,7 +41,7 @@
     每行一个子任务，格式 <span class="mono">标题 | 描述</span>。拆分后原任务会被取消。
   </div>
   <textarea class="input mono" rows="6" bind:value={text} placeholder="实现 A 部分 | 说明…&#10;实现 B 部分"></textarea>
-  {#if error}<div class="error">{error}</div>{/if}
+  {#if error}<div class="error" role="alert">{error}</div>{/if}
 </Modal>
 
 <style>

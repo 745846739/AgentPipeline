@@ -37,7 +37,7 @@
   <!-- 正文只说影响范围（决策 199：编号退场，只留动作与后果）。 -->
   <div class="hint">只影响本任务后续节点，不改全局阶段配置。</div>
   {#if providers.length === 0}
-    <div class="error">还没有配置 provider，请先到「设置 · 模型与密钥」添加。</div>
+    <div class="error" role="alert">还没有配置 provider，请先到「设置 · 模型与密钥」添加。</div>
   {:else}
     <select class="input" bind:value={providerId}>
       {#each providers as p (p.id)}
@@ -47,7 +47,7 @@
       {/each}
     </select>
   {/if}
-  {#if error}<div class="error">{error}</div>{/if}
+  {#if error}<div class="error" role="alert">{error}</div>{/if}
 </Modal>
 
 <style>

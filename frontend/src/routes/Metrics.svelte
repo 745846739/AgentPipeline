@@ -222,7 +222,7 @@
     </div>
 
     {#if taskError}
-      <div class="blank error">{taskError}</div>
+      <div class="blank error" role="alert">{taskError}</div>
     {:else if taskView && taskMetrics}
       <div class="msum mono">
         <span>

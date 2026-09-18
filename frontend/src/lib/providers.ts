@@ -59,12 +59,18 @@ export function draftFromProvider(p: Provider): ProviderDraft {
   };
 }
 
+/** 字段级校验结果（票 02 / R2-06）：出错的那一格 + 文案，供 `aria-invalid` / `aria-describedby` 用。 */
+export interface ProviderFieldError {
+  field: keyof ProviderDraft;
+  message: string;
+}
+
 /** 表单校验；返回 null 表示通过。 */
-export function validateProviderDraft(draft: ProviderDraft): string | null {
-  if (!draft.vendor.trim()) return '请填写厂商（vendor）。';
-  if (!draft.model.trim()) return '请填写模型名（model）。';
+export function validateProviderDraft(draft: ProviderDraft): ProviderFieldError | null {
+  if (!draft.vendor.trim()) return { field: 'vendor', message: '请填写厂商（vendor）。' };
+  if (!draft.model.trim()) return { field: 'model', message: '请填写模型名（model）。' };
   if (!Number.isInteger(draft.context_window) || draft.context_window <= 0) {
-    return 'context_window 必须是正整数。';
+    return { field: 'context_window', message: 'context_window 必须是正整数。' };
   }
   return null;
 }

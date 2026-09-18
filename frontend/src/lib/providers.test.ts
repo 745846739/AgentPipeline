@@ -91,10 +91,14 @@ describe('provider 表单校验', () => {
   it('vendor / model / context_window 必填且为正整数', () => {
     const base = { ...emptyProviderDraft(), model: 'gpt-4o' };
     expect(validateProviderDraft(base)).toBeNull();
-    expect(validateProviderDraft({ ...base, vendor: ' ' })).toMatch(/厂商/);
-    expect(validateProviderDraft({ ...base, model: '' })).toMatch(/模型/);
-    expect(validateProviderDraft({ ...base, context_window: 0 })).toMatch(/正整数/);
-    expect(validateProviderDraft({ ...base, context_window: 1.5 })).toMatch(/正整数/);
+    // 结果带**哪一格**（票 02）：界面据此给该格 aria-invalid + aria-describedby。
+    const vendor = validateProviderDraft({ ...base, vendor: ' ' });
+    expect(vendor?.field).toBe('vendor');
+    expect(vendor?.message).toMatch(/厂商/);
+
+    expect(validateProviderDraft({ ...base, model: '' })?.field).toBe('model');
+    expect(validateProviderDraft({ ...base, context_window: 0 })?.field).toBe('context_window');
+    expect(validateProviderDraft({ ...base, context_window: 1.5 })?.field).toBe('context_window');
   });
 });
 

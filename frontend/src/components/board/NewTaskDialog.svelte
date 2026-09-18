@@ -16,6 +16,11 @@
   let reviewMode = $state<'agent' | 'human'>('agent');
   let submitting = $state(false);
   let error = $state<string | null>(null);
+  /**
+   * 字段级校验（票 02 / R2-06）：空项目与空标题是两件事，说清是哪一格才有落点
+   * （`aria-invalid` + `aria-describedby` 指得到它）。
+   */
+  let fieldError = $state<{ field: 'project' | 'title'; message: string } | null>(null);
 
   /**
    * 依赖候选（票 05）：当前项目**已有的任务**，用标题区分。
@@ -31,17 +36,23 @@
     if (open) {
       projectId = board.projectId ?? board.projects[0]?.id ?? '';
       error = null;
+      fieldError = null;
     }
   });
 
   async function submit(e: SubmitEvent) {
     e.preventDefault();
-    if (!projectId || !title.trim()) {
-      error = '请填写项目与标题。';
+    error = null;
+    fieldError = null;
+    if (!projectId) {
+      fieldError = { field: 'project', message: '请选择项目。' };
+      return;
+    }
+    if (!title.trim()) {
+      fieldError = { field: 'title', message: '请填写标题。' };
       return;
     }
     submitting = true;
-    error = null;
     try {
       const task = await board.createTask({
         project_id: projectId,
@@ -77,7 +88,12 @@
 >
   <label class="field">
     <span>项目</span>
-    <select class="input" bind:value={projectId}>
+    <select
+      class="input"
+      bind:value={projectId}
+      aria-invalid={fieldError?.field === 'project' ? 'true' : undefined}
+      aria-describedby={fieldError?.field === 'project' ? 'new-task-error' : undefined}
+    >
       {#each board.projects as p (p.id)}
         <option value={p.id}>{p.name}</option>
       {/each}
@@ -86,7 +102,13 @@
 
   <label class="field">
     <span>标题</span>
-    <input class="input" bind:value={title} placeholder="一句话说明要做什么" />
+    <input
+      class="input"
+      bind:value={title}
+      placeholder="一句话说明要做什么"
+      aria-invalid={fieldError?.field === 'title' ? 'true' : undefined}
+      aria-describedby={fieldError?.field === 'title' ? 'new-task-error' : undefined}
+    />
   </label>
 
   <label class="field">
@@ -117,7 +139,9 @@
     </select>
   </label>
 
-  {#if error}<div class="error">{error}</div>{/if}
+  {#if fieldError ?? error}
+    <div class="error" id="new-task-error" role="alert">{fieldError?.message ?? error}</div>
+  {/if}
 </Modal>
 
 <style>
