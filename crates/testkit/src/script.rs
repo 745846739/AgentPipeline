@@ -363,6 +363,14 @@ impl ForemanScript<'_> {
         self.tool("read_task", serde_json::json!({ "task_id": task_id }))
     }
 
+    /// 查某个任务诊断包的便捷写法（决策 211③，票 03）。
+    pub fn read_diagnosis(self, task_id: &str) -> Self {
+        self.tool(
+            "read_diagnosis",
+            serde_json::json!({ "task_id": task_id }),
+        )
+    }
+
     /// 查某次运行回执的便捷写法（`run_id` 省略即「最近一次」）。
     pub fn read_conversation(self, task_id: &str, run_id: Option<i64>) -> Self {
         let mut args = serde_json::json!({ "task_id": task_id });

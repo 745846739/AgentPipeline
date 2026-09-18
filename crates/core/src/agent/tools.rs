@@ -22,7 +22,7 @@ use crate::home::Home;
 use crate::process::ProcessKiller;
 use crate::storage::tasks::TaskFilter;
 use crate::storage::Store;
-use crate::types::{CommandSource, Node, Stage};
+use crate::types::{CommandSource, Node, NodeRun, NodeStatus, Stage};
 use crate::{Error, Result};
 
 use super::egress::NetworkPolicy;
@@ -552,6 +552,8 @@ impl ToolExecutor {
             // 越权调用在函数开头的白名单检查处就被拒，这里不再重复判定「谁可以调」。
             "read_task" => self.read_task(call).await?,
             "read_conversation" => self.read_conversation(call).await?,
+            // 诊断包（决策 211③，票 03）：一次调用给出定因所需的全部证据。
+            "read_diagnosis" => self.read_diagnosis(call).await?,
             // A 层环境读数（决策 188 / 207，票 01）：全部只读，全部走后端既有口径。
             "read_board" => self.read_board().await?,
             "read_metrics" => self.read_metrics().await?,
@@ -632,7 +634,11 @@ impl ToolExecutor {
     ) -> Result<ToolOutcome> {
         if matches!(
             call.name.as_str(),
-            "run_command" | "submit_metadata" | "read_task" | "read_conversation"
+            "run_command"
+                | "submit_metadata"
+                | "read_task"
+                | "read_conversation"
+                | "read_diagnosis"
         ) {
             return Ok(outcome);
         }
@@ -947,6 +953,146 @@ impl ToolExecutor {
         self.ledger
             .as_ref()
             .ok_or_else(|| Error::Validation("这个工具不可用：本次调用没有注入台账读句柄".into()))
+    }
+
+    /// 台账文本的截断（票 03）：**与 `truncate_messages_json` 同一套纪律**——留标记，
+    /// 不许静默截短。借用存储层那份实现，免得这里再长出一套「截到多少算多少」。
+    fn clip(text: &str, max_chars: usize) -> String {
+        crate::storage::observability::truncate_text(text, max_chars)
+    }
+
+    /// `read_diagnosis`（决策 211③，票 03）：一次调用拿到**定因**所需的全部证据。
+    ///
+    /// **为什么不扩 `read_task`**：那是高频、便宜的看状态（每一轮值守都会调），诊断包低频，
+    /// 一击就撞 12k 上限。混在一起会让「看一眼任务状态」开始烧 12k 字符。
+    ///
+    /// 输出是**分节数组**而不是一个大对象，因为顺序在这里是有语义的：`serde_json` 默认按
+    /// key 排序（没有 `preserve_order`），而 12k 截断是从尾部切的——被切掉的必须是长尾
+    /// （命令台账、阶段产出），不是「为什么卡住」那一屏。数组保序，是这个语义的载体。
+    async fn read_diagnosis(&self, call: &ToolCall) -> Result<ToolOutcome> {
+        let store = self.ledger_or_err()?;
+        let args = Self::args(call)?;
+        let task_id = args
+            .get("task_id")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .trim()
+            .to_string();
+        if task_id.is_empty() {
+            return Ok(ToolOutcome::ok(
+                "read_diagnosis 需要 {task_id} 参数。任务 id 是态势快照里方括号内那串。",
+            ));
+        }
+        // 「查无此任务」是正常回答，不是故障——理由与 [`Self::read_task`] 逐字相同。
+        let task = match store.get_task(&task_id).await {
+            Ok(t) => t,
+            Err(Error::Task(_)) => {
+                return Ok(ToolOutcome::ok(format!(
+                    "台账里没有任务 {task_id}。请用态势快照里列出的 id 重试。"
+                )))
+            }
+            Err(e) => return Err(e),
+        };
+        let runs_limit = args
+            .get("runs")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(30)
+            .clamp(1, 200) as usize;
+
+        let runs = store.list_runs(&task_id).await?;
+        let commands = store.list_commands(&task_id, None, None).await?;
+        let outputs = store.list_stage_outputs(&task_id).await?;
+
+        // 最近一次**非成功**的 run：诊断的重点。全成功时退到最近一次 run——
+        // 「它到底跑到哪了」在那种情况下才是问题。
+        let latest_failure = runs
+            .iter()
+            .rev()
+            .find(|r| matches!(r.status, NodeStatus::Failed | NodeStatus::Timeout))
+            .or_else(|| runs.last());
+        let pending = task.pending_reason.as_ref();
+
+        // ① 为什么卡住：待办原因原文 + 最近那次失败。**必须排在最前**。
+        let why = serde_json::json!({
+            "why_stalled": {
+                "task_id": task.id,
+                "title": task.title,
+                "status": task.status.as_str(),
+                "current": format!("{}.{}", task.current_stage.as_str(), task.current_node.as_str()),
+                "stalled": task.stalled,
+                "pending": pending.map(|p| serde_json::json!({
+                    "kind": p.kind.as_str(),
+                    "at": format!("{}.{}", p.stage.as_str(), p.node.as_str()),
+                    "message": p.message,
+                    "diagnostic": p.context.as_ref().and_then(|c| c.diagnostic.clone()),
+                    "suggested_actions": p.suggested_actions,
+                })),
+                "latest_failure": latest_failure.map(run_digest),
+            }
+        });
+
+        // ② 失败那一轮的现场：组装后的两段 prompt 原文（票 02）+ 最后几次工具往来。
+        //    这两件加 `runs` 里的 error，才够回答「是代码问题 / prompt 问题 / 环境问题」。
+        let mut sections = vec![why];
+        if let Some(run) = latest_failure {
+            if let Some(conv) = store.get_conversation(&task_id, run.id).await? {
+                sections.push(serde_json::json!({
+                    "failed_run_context": {
+                        "run_id": run.id,
+                        "prompt_template_hash": run.prompt_template_hash,
+                        "system_prompt": conv.system_prompt.as_deref().map(|s| Self::clip(s, PROMPT_SNAPSHOT_MAX_CHARS)),
+                        "user_prompt": conv.user_prompt.as_deref().map(|s| Self::clip(s, PROMPT_SNAPSHOT_MAX_CHARS)),
+                        "last_messages": tail_messages(&conv.messages_json, 4),
+                    }
+                }));
+            }
+        }
+
+        // ③ 全部 run（最近的在前，限条数）：耗时 / token / error / 进程组。
+        let run_rows: Vec<serde_json::Value> = runs.iter().rev().take(runs_limit).map(run_digest).collect();
+        sections.push(serde_json::json!({
+            "runs": run_rows,
+            "runs_total": runs.len(),
+        }));
+
+        // ④ 命令台账：闸门命令与 agent 自己跑的都在这里（`stdout_path` 是全文的落点）。
+        sections.push(serde_json::json!({
+            "commands": commands.iter().map(|c| serde_json::json!({
+                "id": c.id,
+                "run_id": c.run_id,
+                "stage": c.stage.as_str(),
+                "node": c.node.as_str(),
+                "source": c.source.as_str(),
+                "command": c.command,
+                "cwd": c.cwd,
+                "exit_code": c.exit_code,
+                "duration_ms": c.duration_ms,
+                "stdout_path": c.stdout_path,
+                "stdout_preview": c.stdout_preview.as_deref().map(|s| Self::clip(s, 1500)),
+                "stderr_preview": c.stderr_preview.as_deref().map(|s| Self::clip(s, 1500)),
+            })).collect::<Vec<_>>(),
+            "commands_total": commands.len(),
+        }));
+
+        // ⑤ 闸门输出：路径 + 尾部。路径是**确定**的（按 stage 命名，重跑覆盖同一文件），
+        //    所以即便尾部被截，路径也足以让人 / 后续轮次取全文。
+        sections.push(serde_json::json!({
+            "gate_outputs": gate_outputs(&self.home, &task.id),
+        }));
+
+        // ⑥ 阶段产出与验收标准：architect 的 acceptance_criteria 在这里。
+        sections.push(serde_json::json!({
+            "stage_outputs": outputs.iter().map(|o| serde_json::json!({
+                "stage": o.stage.as_str(),
+                "output_type": o.output_type,
+                "file_path": o.file_path,
+                "stale": o.stale,
+                "metadata": o.metadata_json,
+            })).collect::<Vec<_>>(),
+        }));
+
+        let text = serde_json::to_string_pretty(&serde_json::json!({ "task_id": task.id, "evidence": sections }))?;
+        Ok(ToolOutcome::ok(crate::pipeline::foreman::truncate_tool_result(&text)))
     }
 
     /// 一个读数 → 交出去的文本。
@@ -1494,6 +1640,74 @@ pub fn head_tail(text: &str, head: usize, tail: usize) -> String {
     out.push(format!("... 省略 {} 行 ...", lines.len() - head - tail));
     out.extend(lines[lines.len() - tail..].iter().map(|l| l.to_string()));
     out.join("\n")
+}
+
+// ─────────────────────────── 诊断包的装配（票 03）───────────────────────────
+
+/// 诊断包里单段 prompt 原文的上限（票 02 的两列可能很长，而 12k 是**整个包**的账）。
+const PROMPT_SNAPSHOT_MAX_CHARS: usize = 4_000;
+
+/// 闸门日志的尾部上限：先把头部丢掉的那句说明保住，剩下的给尾部。
+const GATE_LOG_TAIL_CHARS: usize = 1_200;
+
+/// 一条 run 的摘要（诊断包的第 ③ 节与「最近那次失败」共用同一形状）。
+///
+/// `process_group_id` 不给原值、只给「空不空」：它是判「超时杀不杀得掉」的**唯一线索**
+/// （决策 209 的实证：系统节点没有进程组，于是那一轮超时也杀不掉），而原值对模型没有意义。
+fn run_digest(run: &NodeRun) -> serde_json::Value {
+    serde_json::json!({
+        "run_id": run.id,
+        "stage": run.stage.as_str(),
+        "node": run.node.as_str(),
+        "attempt": run.attempt,
+        "agent_type": run.agent_type,
+        "status": run.status.as_str(),
+        "duration_ms": run.duration_ms,
+        "prompt_tokens": run.prompt_tokens,
+        "completion_tokens": run.completion_tokens,
+        "error": run.error,
+        "prompt_template_hash": run.prompt_template_hash,
+        "has_process_group": run.process_group_id.is_some(),
+        "continued_from_run_id": run.continued_from_run_id,
+        "started_at": run.started_at.to_rfc3339(),
+        "finished_at": run.finished_at.map(|t| t.to_rfc3339()),
+    })
+}
+
+/// 会话的**尾巴**（最后几条往来）：失败前的最后几次工具调用正是诊断要看的现场。
+/// 每条按字符截断并留标记——单条超长（一次 `write_file` 的参数）不该吃掉整屏。
+fn tail_messages(messages: &serde_json::Value, take: usize) -> Vec<serde_json::Value> {
+    let empty = Vec::new();
+    let arr = messages.as_array().unwrap_or(&empty);
+    arr[arr.len().saturating_sub(take)..]
+        .iter()
+        .map(|m| {
+            let text = m.to_string();
+            serde_json::json!({
+                "role": m.get("role").and_then(|r| r.as_str()),
+                "content": crate::storage::observability::truncate_text(&text, 1_500),
+            })
+        })
+        .collect()
+}
+
+/// 闸门输出：按 stage 的**确定路径**找（与 executor 的命名同源：同一阶段重跑覆盖同一文件）。
+///
+/// 只报存在的那些：没有这条路的时候，硬造一条空路径反而会让模型以为「闸门跑了但输出丢了」。
+fn gate_outputs(home: &Home, task_id: &str) -> Vec<serde_json::Value> {
+    let mut out = Vec::new();
+    for stage in crate::types::ALL_STAGES {
+        let path = home.task_file(task_id, &format!("gate-output-{}.log", stage.as_str()));
+        let Ok(text) = std::fs::read_to_string(&path) else {
+            continue;
+        };
+        out.push(serde_json::json!({
+            "stage": stage.as_str(),
+            "path": path.display().to_string(),
+            "tail": crate::storage::observability::truncate_text(&text, GATE_LOG_TAIL_CHARS),
+        }));
+    }
+    out
 }
 
 #[cfg(test)]

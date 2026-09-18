@@ -484,6 +484,205 @@ async fn read_task_tool_actually_reads_the_ledger_and_feeds_the_reply() {
     assert_eq!(traces[0]["ok"], true);
 }
 
+// ─────────────────────── 诊断包（决策 211③ / 票 03）───────────────────────
+
+/// 造一个「失败得能定因」的任务：一条失败 run（带 error）、一条命令台账、一份闸门输出。
+///
+/// 四项证据**必须来自真库 / 真文件**——本仓的替换边界是「只替换 LLM 响应流」，
+/// 诊断包这条链的验证要打在「一次调用够不够定因」上。
+async fn seed_failed_task(h: &Harness, task_id: &str) -> i64 {
+    let cursor_id = h.store.load_live_cursors(task_id).await.unwrap()[0]
+        .cursor_id
+        .clone();
+    // 失败的那一轮：error 是定因的入口，process_group_id 为空是「超时杀不掉」的唯一线索
+    let run_id = h
+        .store
+        .insert_run(&agentpipeline_core::storage::observability::NewRun {
+            task_id: task_id.into(),
+            cursor_id: cursor_id.clone(),
+            stage: Stage::Test,
+            node: Node::Execute,
+            attempt: 1,
+            agent_type: "main".into(),
+            parent_run_id: None,
+            prompt_template_hash: Some("deadbeefdeadbeef".into()),
+            process_group_id: None,
+        })
+        .await
+        .unwrap();
+    h.store
+        .finish_run(
+            run_id,
+            &agentpipeline_core::storage::observability::RunOutcome {
+                status: Some(agentpipeline_core::types::NodeStatus::Failed),
+                error: Some("闸门失败：测试命令退出码 1".into()),
+                duration_ms: 4321,
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+    // 会话行带两段 prompt 原文（票 02）——「这是 prompt 问题」的证据
+    h.store
+        .insert_conversation(
+            task_id,
+            run_id,
+            Stage::Test,
+            Node::Execute,
+            1,
+            "main",
+            None,
+            &serde_json::json!([
+                {"role": "assistant", "tool_calls": [{"id": "c1", "name": "run_command",
+                  "arguments": "{\"command\":\"cargo test --quiet\"}"}]},
+                {"role": "tool", "completion": "exit code 1: assertion failed at src/lib.rs:12"}
+            ]),
+            Some(agentpipeline_core::storage::observability::PromptSnapshot {
+                system: "你是测试工位。",
+                user: "跑一遍闸门，把失败原文带回来。",
+            }),
+            Some(&serde_json::json!({"failed": true, "error": "闸门失败：测试命令退出码 1"})),
+            900,
+            120,
+        )
+        .await
+        .unwrap();
+    // 命令台账 + 闸门输出的**真文件**（路径与 executor 落的那一份同源）
+    let gate_log = h
+        ._home
+        .home()
+        .task_file(task_id, &format!("gate-output-{}.log", Stage::Test.as_str()));
+    h._home.home().ensure_task_dirs(task_id).unwrap();
+    std::fs::write(&gate_log, "[stdout]\nassertion failed at src/lib.rs:12\n").unwrap();
+    record_command(h, task_id, Some(run_id), "cargo test --quiet").await;
+    run_id
+}
+
+/// 落一条命令台账（走既有 `record_start`，不手写 SQL）。
+async fn record_command(h: &Harness, task_id: &str, run_id: Option<i64>, command: &str) {
+    use agentpipeline_core::agent::tools::{CommandRecorder, CommandStart};
+
+    h.store
+        .record_start(CommandStart {
+            task_id: Some(task_id.to_string()),
+            session_id: None,
+            run_id,
+            stage: Stage::Test,
+            node: Node::Execute,
+            source: agentpipeline_core::types::CommandSource::System,
+            command: command.to_string(),
+            cwd: h._home.path().display().to_string(),
+        })
+        .await
+        .unwrap();
+}
+
+#[tokio::test]
+async fn one_diagnosis_call_answers_why_it_stalled() {
+    // 票 03 的口径：验证打的是「一次调用够不够定因」，不是「字段齐不齐」。
+    let h = Harness::seeded().await;
+    let run_id = seed_failed_task(&h, "t1").await;
+    park_task(
+        &h.store,
+        "t1",
+        PendingKind::RetryExhausted,
+        "测试工位重试耗尽",
+    )
+    .await;
+
+    let mut script = Script::new();
+    script.for_foreman().read_diagnosis("t1");
+    script
+        .for_foreman()
+        .text("它在 test.execute 上闸门没过：测试命令退出码 1，看 gate-output-test.log。");
+    let agent = FakeAgent::new(script);
+    let runner = h.runner(agent.clone());
+
+    let turn = runner.say(None, "t1 为什么卡住了？").await.unwrap();
+    assert_eq!(turn.traces.len(), 1);
+    assert_eq!(turn.traces[0].tool, "read_diagnosis");
+    assert!(turn.traces[0].ok, "诊断包应执行成功");
+
+    // 一次调用的回执里，四类证据同时在场（打在同一份文本上）
+    let requests = agent.request_log();
+    assert_eq!(requests.len(), 2, "一次工具往返 = 两次 LLM 请求");
+    let fed_back = serde_json::to_string(&requests[1].messages).unwrap();
+    assert!(
+        fed_back.contains("闸门失败：测试命令退出码 1"),
+        "失败 run 的 error 要在同一次调用里：{fed_back}"
+    );
+    assert!(
+        fed_back.contains(&format!("\"run_id\":{run_id}"))
+            || fed_back.contains(&format!("\"run_id\": {run_id}")),
+        "证据要指名是哪一条 run"
+    );
+    assert!(
+        fed_back.contains("process_group_id"),
+        "「超时杀不杀得掉」的唯一线索要给出：{fed_back}"
+    );
+    assert!(
+        fed_back.contains("gate-output-test.log"),
+        "闸门输出的路径要给出：{fed_back}"
+    );
+    assert!(
+        fed_back.contains("cargo test --quiet"),
+        "命令台账要在同一次调用里：{fed_back}"
+    );
+    assert!(
+        fed_back.contains("测试工位重试耗尽"),
+        "pending 原因的原文要在同一次调用里：{fed_back}"
+    );
+    // 两段 prompt 原文（票 02）——「是 prompt 问题」这句话的根据
+    assert!(
+        fed_back.contains("跑一遍闸门，把失败原文带回来。"),
+        "组装后的用户段原文要带出来：{fed_back}"
+    );
+}
+
+#[tokio::test]
+async fn the_diagnosis_pack_keeps_the_reason_when_truncated() {
+    // 一次调用给的证据可能超过 12k：截断**必须**发生在「为什么卡住」之后——
+    // 否则最要紧的那一屏会被长 tail 挤掉。
+    let h = Harness::seeded().await;
+    let run_id = seed_failed_task(&h, "t1").await;
+    // 用一堆超长命令台账把总量顶过 12k（每条的 command 都是长串）
+    for i in 0..40 {
+        record_command(
+            &h,
+            "t1",
+            Some(run_id),
+            &format!("echo {}{}", "x".repeat(600), i),
+        )
+        .await;
+    }
+    park_task(&h.store, "t1", PendingKind::RetryExhausted, "重试耗尽").await;
+
+    let mut script = Script::new();
+    script.for_foreman().read_diagnosis("t1");
+    script.for_foreman().text("看诊断包。");
+    let agent = FakeAgent::new(script);
+    let runner = h.runner(agent.clone());
+    runner.say(None, "t1 怎么了？").await.unwrap();
+
+    let requests = agent.request_log();
+    let fed_back = serde_json::to_string(&requests[1].messages).unwrap();
+    assert!(
+        fed_back.contains("已截断"),
+        "超过 12k 要留截断标记，不许静默截短"
+    );
+    assert!(
+        fed_back.contains("闸门失败：测试命令退出码 1"),
+        "失败原因是重点证据，必须在截断后的前 12k 里：{}",
+        &fed_back[..fed_back.len().min(400)]
+    );
+    assert!(
+        fed_back.contains("重试耗尽"),
+        "pending 原因必须在截断后的前 12k 里"
+    );
+}
+
+// ─────────────────────── 会话回执（票 02）───────────────────────
+
 #[tokio::test]
 async fn read_conversation_tool_returns_the_workshop_receipt() {
     let h = Harness::seeded().await;
@@ -613,6 +812,10 @@ async fn the_foreman_tool_set_matches_the_frozen_contract() {
             "read_file",
             "list_dir",
             "Skill",
+            // 诊断包（决策 211③ / 票 03）：一族一个工具，一次调用给出定因所需的全部证据。
+            // 它**不扩 `read_task`**——后者是每轮值守都会调的高频、便宜读数，混进来会让
+            // 「看一眼任务状态」开始烧 12k 字符。
+            "read_diagnosis",
         ]
     );
     assert_eq!(

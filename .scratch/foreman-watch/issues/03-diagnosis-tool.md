@@ -23,18 +23,37 @@
 
 **Blocked by:** 01, 02
 
-**Status:** ready-for-agent
+**Status:** done
 
-- [ ] **先改断言**：`crates/core/tests/foreman.rs:598-632` 的「工具集恰为这 17 个」按顺序钉着，
+- [x] **先改断言**：`crates/core/tests/foreman.rs:598-632` 的「工具集恰为这 17 个」按顺序钉着，
       加工具前先改它；`foreman.rs:56-59` 的原话「这是安全边界本身，不是配置项」
-- [ ] 新工具加进 `FOREMAN_TOOL_SPECS`（`crates/core/src/pipeline/foreman.rs:94`），
+- [x] 新工具加进 `FOREMAN_TOOL_SPECS`（`crates/core/src/pipeline/foreman.rs:94`），
       **广告集与执行点白名单同源**（不许两处各写一份名字）
-- [ ] 粒度守决策 207④：**一族一个工具**，不拆成五个
-- [ ] 结果截断沿用 `FOREMAN_TOOL_RESULT_MAX_CHARS`（12k），**但截断要留标记**；
+- [x] 粒度守决策 207④：**一族一个工具**，不拆成五个
+- [x] 结果截断沿用 `FOREMAN_TOOL_RESULT_MAX_CHARS`（12k），**但截断要留标记**；
       重点证据（失败那一轮的 error + 最后一次工具调用）**优先保证在截断后的前 12k 里**
-- [ ] 新增用例：造一个失败的任务，断言诊断包能一次给出失败 run 的 `error`、
+- [x] 新增用例：造一个失败的任务，断言诊断包能一次给出失败 run 的 `error`、
       `process_group_id` 为空、命令台账条数、闸门输出路径——**四项都在同一次调用的返回里**
-- [ ] persona 里的工具纪律段按清单自动更新（它已是从清单生成，不需手写工具名）
+- [x] persona 里的工具纪律段按清单自动更新（它已是从清单生成，不需手写工具名）
+
+**实施收尾（2026-09-18）:**
+
+- **工具名 `read_diagnosis`**，`FOREMAN_TOOL_SPECS` 由 17 → 18（A 层 +1）。广告集与执行点
+  白名单都从 `foreman_available_tools` 出，两处都没有第二份名字。
+- **输出是分节**数组**，不是一个大对象**——这不是审美：`serde_json` 默认按 key 排序
+  （本仓没开 `preserve_order`，Cargo.lock 里 serde_json 的依赖表也没有 indexmap），而 12k
+  截断是从尾部切的。数组保序，于是「为什么卡住」能稳稳待在被保留的那一段里。
+  六节的顺序就是取证顺序：为什么卡住 → 失败那一轮的现场（两段 prompt 原文 + 最后 4 条往来）
+  → 全部 run → 命令台账 → 闸门输出 → 阶段产出与验收标准。
+- **`process_group_id` 只给 `has_process_group` 布尔**：它是判「超时杀不杀得掉」的唯一线索
+  （决策 209 的实证），而那个整数本身对模型没有意义。
+- **闸门输出按 stage 的确定路径找**（与 executor 的命名同源），只报**存在**的那些：
+  硬造一条空路径会让模型以为「闸门跑了但输出丢了」。
+- **两条用例**：①一次调用同时给出 error / 进程组为空 / 命令台账 / 闸门路径 / pending 原文 /
+  用户段 prompt 原文（六项打在同一份回灌文本上）；②用 40 条超长命令把总量顶过 12k，
+  断言截断标记在场而失败原因与 pending 原文仍在。
+- **`read_diagnosis` 进 `apply_l2_offload` 的豁免名单**：它自己按 12k 截断，卸载要写
+  `home.context_dir(&ctx.task_id)`，而值班长没有 task_id（与 `read_task` 逐字同一理由）。
 
 ## 备注
 

@@ -91,13 +91,23 @@ pub struct ForemanToolSpec {
 /// A 层的六个新读数（票 01）**一律复用后端既有口径**，不新造一套：看板读任务表、
 /// 指标走 `metrics::*` 纯函数、项目 / 阶段配置 / 技能 / provider 各读自己那张表的既有读法。
 /// 唯一需要加工的是 provider：库里存的是**明文密钥**（决策 112），故只回显掩码。
-pub const FOREMAN_TOOL_SPECS: [ForemanToolSpec; 17] = [
+pub const FOREMAN_TOOL_SPECS: [ForemanToolSpec; 18] = [
     ForemanToolSpec {
         name: "read_task",
         layer: ForemanToolLayer::Read,
         description: "读某个任务的台账详情：标题、状态、当前工位、待办原因原文、\
                       后端下发的可用动作、各分支游标。卡住的细节问它。",
         parameters: r#"{"type":"object","properties":{"task_id":{"type":"string","description":"任务 id（快照里方括号内那串）"}},"required":["task_id"]}"#,
+    },
+    ForemanToolSpec {
+        name: "read_diagnosis",
+        layer: ForemanToolLayer::Read,
+        description: "读某个任务的**诊断包**：一次拿到定因所需的全部证据——每条 run 的状态 / 耗时 / \
+                      token / error / 是否挂过进程组、命令台账与闸门输出路径、阶段产出与验收标准、\
+                      待办原因原文、组装后的 prompt 原文、失败 run 的最后几条工具往来。\
+                      「它为什么卡住 / 为什么失败 / 是不是 prompt 问题」这类问题问它；\
+                      只看「现在什么状态」用 read_task（便宜得多）。",
+        parameters: r#"{"type":"object","properties":{"task_id":{"type":"string","description":"任务 id（快照里方括号内那串）"},"runs":{"type":"integer","description":"最多带回多少条 run（默认 30，最近的在前）"}},"required":["task_id"]}"#,
     },
     ForemanToolSpec {
         name: "read_conversation",
