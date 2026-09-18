@@ -1056,6 +1056,12 @@ pub struct NodeRun {
     pub cache_write_tokens: u32,
     pub duration_ms: u64,
     pub error: Option<String>,
+    /// 系统节点「进行到哪一步」（决策 211④ / 票 04）。
+    ///
+    /// 只由纯代码节点在**步边界**写（`init.execute` 的「检查项目工作区是否脏」这类），
+    /// 于是卡住时台账里不再只有一句「超时」——那一句正是 2026-09-17 那次四小时挂死的
+    /// 全部信息量。LLM 节点的现场在会话行里，这里恒为 `None`。
+    pub step: Option<String>,
     pub process_group_id: Option<i32>,
     pub last_activity_at: Option<DateTime<Utc>>,
     pub prompt_template_hash: Option<String>,

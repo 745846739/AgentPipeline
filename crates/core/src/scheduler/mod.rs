@@ -243,10 +243,7 @@ impl KanbanScheduler {
                 run.id,
                 &crate::storage::observability::RunOutcome {
                     status: Some(NodeStatus::Timeout),
-                    error: Some(format!(
-                        "{}.{} 超时（attempt {}）",
-                        run.stage, run.node, run.attempt
-                    )),
+                    error: Some(timeout_detail(run, "超时")),
                     ..Default::default()
                 },
             )
@@ -267,20 +264,17 @@ impl KanbanScheduler {
             (self.resume)(task_id);
         } else {
             // 耗尽：pending 挂在该 run 所属的**游标**上（决策 82）
-            self.store
-                .set_cursor_pending(
-                    cursor_id,
-                    &PendingReason::new(
-                        PendingKind::Timeout,
-                        run.stage,
-                        run.node,
-                        format!(
-                            "{}.{} 执行超时（attempt {}）",
-                            run.stage, run.node, run.attempt
+                self.store
+                    .set_cursor_pending(
+                        cursor_id,
+                        &PendingReason::new(
+                            PendingKind::Timeout,
+                            run.stage,
+                            run.node,
+                            format!("{}（attempt {}）", timeout_detail(run, "执行超时"), run.attempt),
                         ),
-                    ),
-                )
-                .await?;
+                    )
+                    .await?;
             self.store.sync_task_projection(task_id).await?;
             report.timeout_pending_cursors.push(cursor_id.to_string());
             self.emit_pending(task_id, cursor_id).await?;
@@ -563,4 +557,16 @@ async fn branch_of(cursor_id: &str, store: &Store) -> Result<String> {
         .await
         .map(|c| c.branch)
         .unwrap_or_else(|_| crate::types::NodeCursor::BRANCH_MAIN.to_string()))
+}
+
+/// 超时那句话（决策 211④ / 票 04）：**把「当时在哪一步」带上**。
+///
+/// 不带的话，台账里就只剩「超时」两个字——2026-09-17 那次四小时挂死的信息量正是如此，
+/// 要知道卡在哪个系统调用只能拿外部 `sample` 附进程。步骤由系统节点自己写
+/// （[`crate::storage::Store::set_run_step`]），LLM 节点没有它，故可空。
+fn timeout_detail(run: &NodeRun, what: &str) -> String {
+    match run.step.as_deref() {
+        Some(step) => format!("{}.{} {what}，当时在「{step}」", run.stage, run.node),
+        None => format!("{}.{} {what}", run.stage, run.node),
+    }
 }

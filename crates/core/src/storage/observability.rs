@@ -73,6 +73,7 @@ struct RunRow {
     cache_write_tokens: i64,
     duration_ms: i64,
     error: Option<String>,
+    step: Option<String>,
     process_group_id: Option<i64>,
     last_activity_at: Option<String>,
     prompt_template_hash: Option<String>,
@@ -101,6 +102,7 @@ impl RunRow {
             cache_write_tokens: self.cache_write_tokens as u32,
             duration_ms: self.duration_ms as u64,
             error: self.error,
+            step: self.step,
             process_group_id: self.process_group_id.map(|v| v as i32),
             last_activity_at: self.last_activity_at.map(|s| parse_ts(&s)).transpose()?,
             prompt_template_hash: self.prompt_template_hash,
@@ -114,8 +116,8 @@ impl RunRow {
 const RUN_COLUMNS: &str =
     "id, task_id, cursor_id, project_id, stage, node, attempt, agent_type, parent_run_id, \
      status, prompt_tokens, completion_tokens, cache_read_tokens, cache_write_tokens, duration_ms, \
-     error, process_group_id, last_activity_at, prompt_template_hash, continued_from_run_id, \
-     started_at, finished_at";
+     error, step, process_group_id, last_activity_at, prompt_template_hash, \
+     continued_from_run_id, started_at, finished_at";
 
 impl Store {
     /// 落一行 run（所有节点都落，含 `agent_type = "system"`，决策 99 / 114）。
@@ -171,6 +173,19 @@ impl Store {
         .fetch_one(self.pool())
         .await?;
         Ok(id)
+    }
+
+    /// 记下**系统节点当前在哪一步**（决策 211④ / 票 04）。
+    ///
+    /// 调用方 best-effort 调用（不要把 `?` 挂上去）：留痕本身不得挂住关键路径，
+    /// 一条写不进去的步骤名也不该让节点失败。与 [`Self::touch_run_heartbeat`] 同一姿态。
+    pub async fn set_run_step(&self, run_id: i64, step: &str) -> Result<()> {
+        sqlx::query("UPDATE kanban_node_runs SET step = ? WHERE id = ?")
+            .bind(step)
+            .bind(run_id)
+            .execute(self.pool())
+            .await?;
+        Ok(())
     }
 
     pub async fn finish_run(&self, run_id: i64, outcome: &RunOutcome) -> Result<()> {

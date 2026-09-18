@@ -298,6 +298,28 @@ async fn executor_drives_full_happy_path_to_done() {
     assert!(system_runs.iter().any(|r| r.stage == Stage::Done));
     assert!(runs.iter().all(|r| r.status == NodeStatus::Success));
 
+    // 票 04：系统节点在步边界留痕——「它做到了哪一步」在成功路径上同样是证据
+    // （失败 / 超时那条路走的是同一列，见 scheduler_tick 的 timeout 用例）。
+    let init_run = system_runs
+        .iter()
+        .find(|r| r.stage == Stage::Init)
+        .expect("init 应有 system run");
+    assert_eq!(
+        init_run.step.as_deref(),
+        Some("把工作区与分支写回任务行"),
+        "init 的最后一步要留下（步骤名是执行语义，不是观测细节）"
+    );
+    assert!(
+        system_runs
+            .iter()
+            .any(|r| r.step.as_deref() == Some("跑测试：true")),
+        "闸门命令也是步边界：{:?}",
+        system_runs
+            .iter()
+            .map(|r| (r.stage, r.node, r.step.clone()))
+            .collect::<Vec<_>>()
+    );
+
     // total_tokens / total_calls 汇总（决策 100 / 130 ②）
     let task = ctx.store.get_task("t1").await.unwrap();
     assert!(task.total_tokens > 0);

@@ -188,9 +188,18 @@
     }),
   );
 
+  /**
+   * 失败回合在台账里的标记（前端侧的镜像，语义源在 `crates/core/src/pipeline/foreman.rs`
+   * 的 `FOREMAN_FAILED_TURN_MARK`，决策 211④ / 票 04）。
+   *
+   * 后端把「这一轮没跑起来」落成一条 `role = system` 的账（含归因后的原因），
+   * 前端按它把那一轮渲染成**失败轮**（红、名牌写「发送失败」）而不是中性的操作台轮——
+   * 2026-09-17 实测里值班长两次静默失败，页面上只有红轮、原因无处可看。
+   */
+  const FAILED_TURN_MARK = '【没跑起来】';
+
   interface TurnView {
-    key: string;
-    /**
+    key: string;    /**
      * 发言者。`console` = **操作台记的一轮**（`role === 'system'`：提议的执行结果，决策 207）。
      *
      * 它必须与 `fm`（值班长的话）分开：那一行的内容是「提议已执行：…」，而**动手的是按下
@@ -229,7 +238,14 @@
       rank: m.role === 'user' ? 0 : m.role === 'system' ? 1 : 2,
       view: {
         key: `m${m.id}`,
-        kind: m.role === 'user' ? 'mine' : m.role === 'system' ? 'console' : 'fm',
+        kind:
+          m.role === 'user'
+            ? 'mine'
+            : m.role === 'system'
+              ? m.content.startsWith(FAILED_TURN_MARK)
+                ? 'failed'
+                : 'console'
+              : 'fm',
         content: m.content,
         at: m.created_at,
         streaming: false,

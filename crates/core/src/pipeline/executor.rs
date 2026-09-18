@@ -368,7 +368,7 @@ impl Executor {
         let project = self.project(&task.project_id).await?;
         let (run_id, attempt) = self.begin_run(task, cursor, "system").await?;
         let started = Instant::now();
-        let result = self.do_init(task, &project).await;
+        let result = self.do_init(task, &project, run_id).await;
         self.finish_run(
             run_id,
             task,
@@ -384,7 +384,7 @@ impl Executor {
         Ok(NodeOutput::Route(crate::pipeline::MetadataView::default()))
     }
 
-    async fn do_init(&self, task: &Task, project: &Project) -> Result<()> {
+    async fn do_init(&self, task: &Task, project: &Project, run_id: i64) -> Result<()> {
         let worktree = self.store.home().worktree_path(&task.id);
         // 目标仓库脏不阻塞，仅记录警告（决策 61）。**这个检查是 best-effort 的**
         // （决策 209）：它换来的只是下面那条 warn，失败或超时都不能影响 init。
@@ -393,6 +393,7 @@ impl Executor {
         // 挂死点正是这一句里的 `git2::Repository::open`（未签名的 app 没有 `~/Documents`
         // 的访问授权，`open()` 被 macOS 拦住、永不返回）。一个只值一条警告的检查，
         // 把整个任务挂死了四小时。
+        self.mark_step(run_id, "检查项目工作区是否脏").await;
         match Git.is_dirty(Path::new(&project.local_path)).await {
             Ok(true) => {
                 tracing::warn!(task = %task.id, "项目工作区有未提交改动（不阻塞，决策 61）")
@@ -404,6 +405,7 @@ impl Executor {
                 "脏工作区检查失败或超时，按「不检查」继续（不阻塞，决策 61）"
             ),
         }
+        self.mark_step(run_id, "创建隔离工作区（worktree）").await;
         Git.init_worktree(
             Path::new(&project.local_path),
             &task.id,
@@ -411,6 +413,7 @@ impl Executor {
             &project.default_branch,
         )
         .await?;
+        self.mark_step(run_id, "把工作区与分支写回任务行").await;
         self.store
             .set_task_worktree(
                 &task.id,
@@ -424,7 +427,7 @@ impl Executor {
     async fn done_execute(&self, task: &Task, cursor: &NodeCursor) -> Result<NodeOutput> {
         let (run_id, attempt) = self.begin_run(task, cursor, "system").await?;
         let started = Instant::now();
-        let result = self.do_done(task).await;
+        let result = self.do_done(task, run_id).await;
         self.finish_run(
             run_id,
             task,
@@ -444,7 +447,7 @@ impl Executor {
         Ok(NodeOutput::Route(crate::pipeline::MetadataView::default()))
     }
 
-    async fn do_done(&self, task: &Task) -> Result<()> {
+    async fn do_done(&self, task: &Task, run_id: i64) -> Result<()> {
         let merged = self
             .store
             .merge_metadata(&task.id)
@@ -457,6 +460,7 @@ impl Executor {
             ));
         }
         if let Some(worktree) = &task.worktree_path {
+            self.mark_step(run_id, "回收 worktree 与任务分支").await;
             let project = self.project(&task.project_id).await?;
             Git.remove_worktree(Path::new(&project.local_path), Path::new(worktree), true)
                 .await?;
@@ -465,6 +469,7 @@ impl Executor {
                     .await?;
             }
         }
+        self.mark_step(run_id, "置任务终态").await;
         self.store
             .mark_terminal(&task.id, crate::types::TaskStatus::Done)
             .await?;
@@ -584,9 +589,11 @@ impl Executor {
     ) -> Result<PhaseA> {
         let repo = Path::new(&project.local_path);
         let wt = Path::new(worktree);
+        self.mark_step(run_id, "解析合入基准（base_ref）").await;
         let base_ref = Git.base_ref(repo, &project.default_branch).await?;
 
         // (2) rebase 到基准（决策 74 / 96 / pipeline-spec §6）
+        self.mark_step(run_id, "把任务分支 rebase 到基准").await;
         let mut auto_resolved: Vec<String> = Vec::new();
         match Git.rebase_onto_with_auto_resolve(wt, &base_ref).await? {
             crate::git::AutoRebaseOutcome::Clean { .. } => {}
@@ -642,6 +649,7 @@ impl Executor {
         std::fs::write(self.store.home().task_file(&task.id, diff_path), &diff)?;
 
         // (4) 合入前强制闸门：lint（如已配置）+ 测试（决策 139）
+        self.mark_step(run_id, "跑合入前的闸门（lint + 测试）").await;
         let gate = self
             .run_code_gate(task, project, run_id, Stage::Merge, Node::Execute, wt, true)
             .await?;
@@ -699,7 +707,7 @@ impl Executor {
         let (run_id, attempt) = self.begin_run(task, cursor, "system").await?;
         let started = Instant::now();
         let result = self
-            .merge_phase_b_inner(task, project, cursor, &mut stored)
+            .merge_phase_b_inner(task, project, cursor, &mut stored, run_id)
             .await;
         self.finish_run(
             run_id,
@@ -727,11 +735,13 @@ impl Executor {
         project: &Project,
         _cursor: &NodeCursor,
         stored: &mut MergeResult,
+        run_id: i64,
     ) -> Result<PhaseB> {
         let repo = Path::new(&project.local_path);
 
         // (1) 目标分支工作区干净检查（决策 61 / 132）：不自动 stash。
         // 只返回挂起意图，由调用方经 NodeOutput::Pending 落库（否则游标会被推进到 done）。
+        self.mark_step(run_id, "检查目标分支工作区是否干净").await;
         if !self.settings.allow_dirty_worktree_merge && Git.is_dirty(repo).await? {
             let reason = PendingReason::new(
                 PendingKind::UserDecision,
@@ -750,6 +760,7 @@ impl Executor {
             .branch_name
             .clone()
             .ok_or_else(|| Error::Validation("merge 阶段缺少 branch_name".into()))?;
+        self.mark_step(run_id, "把任务分支合入默认分支").await;
         let outcome = Git
             .merge_into_default_branch(repo, &project.default_branch, &branch)
             .await?;
@@ -2957,6 +2968,7 @@ impl Executor {
     ) -> Result<GateOutcome> {
         if include_lint {
             if let Some(lint) = &project.lint_command {
+                self.mark_step(run_id, &format!("跑 lint：{lint}")).await;
                 let (code, output) = self
                     .run_system_command(task, run_id, stage, node, lint, cwd)
                     .await?;
@@ -2970,6 +2982,7 @@ impl Executor {
             }
         }
         let test = test_command_for(project.test_framework.as_deref());
+        self.mark_step(run_id, &format!("跑测试：{test}")).await;
         let (code, output) = self
             .run_system_command(task, run_id, stage, node, &test, cwd)
             .await?;
@@ -3044,6 +3057,17 @@ impl Executor {
     }
 
     #[allow(clippy::too_many_arguments)]
+    /// 系统节点的**步边界留痕**（决策 211④ / 票 04）。
+    ///
+    /// **best-effort**：写不进去只 warn，不 `?`。上一个同族的教训是 `Git::is_dirty`
+    /// 那个只值一条警告的检查把任务挂死了四小时（决策 209）——留痕本身更不能挂住关键路径。
+    /// 它补偿的是那次挂死的全部信息量：卡在哪个系统调用，事后必须能从台账里读出来。
+    async fn mark_step(&self, run_id: i64, step: &str) {
+        if let Err(e) = self.store.set_run_step(run_id, step).await {
+            tracing::warn!(run_id, step, "步骤留痕写不进去（不阻塞节点）：{e}");
+        }
+    }
+
     #[allow(clippy::too_many_arguments)]
     async fn finish_run(
         &self,

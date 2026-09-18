@@ -282,6 +282,51 @@ async fn timeout_kills_process_group_and_retries_until_exhausted() {
     let _ = task;
 }
 
+// ─────────────────────── 票 04：超时要说清「当时在哪一步」───────────────────────
+
+/// 卡住的**系统节点**：台账里不能只有一句「超时」。
+///
+/// 实证（2026-09-17）：`支持rtk` 的 init run 卡了四小时，要知道卡在哪个系统调用只能拿
+/// 外部 `sample` 附进程——服务自己一个字都没说。
+#[tokio::test]
+async fn a_timed_out_system_run_names_the_step_it_was_on() {
+    let h = Harness::new().await;
+    h.seed_task("t1").await;
+    h.mark_running("t1").await;
+    let cursor = h.store.load_live_cursors("t1").await.unwrap()[0].clone();
+    // attempt 3 = agent_retry_max → 耗尽，直接落 pending（信息量最完整的那个出口）
+    let run_id = h
+        .running_run("t1", &cursor.cursor_id, 3, 400, 400, Some(4242))
+        .await;
+    h.store
+        .set_run_step(run_id, "检查项目工作区是否脏")
+        .await
+        .unwrap();
+
+    let report = h.scheduler(Settings::default()).tick().await.unwrap();
+    assert_eq!(report.timed_out_runs, vec![run_id]);
+
+    let runs = h.store.list_runs("t1").await.unwrap();
+    let run = runs.iter().find(|r| r.id == run_id).unwrap();
+    assert_eq!(run.status, NodeStatus::Timeout);
+    assert!(
+        run.error.as_deref().unwrap_or_default().contains("检查项目工作区是否脏"),
+        "超时的 run 行要写清当时在哪一步：{:?}",
+        run.error
+    );
+    let after = h.store.get_cursor(&cursor.cursor_id).await.unwrap();
+    assert!(
+        after
+            .pending_reason
+            .as_ref()
+            .unwrap()
+            .message
+            .contains("检查项目工作区是否脏"),
+        "pending 的那句话同样要带上：{:?}",
+        after.pending_reason
+    );
+}
+
 #[tokio::test]
 async fn long_system_command_survives_idle_timeout_when_heartbeat_refreshes() {
     // 决策 100：merge 闸门最长 600s，若按 started_at 判空闲会被 300s 误杀

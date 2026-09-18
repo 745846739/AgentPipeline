@@ -811,6 +811,18 @@ impl ForemanRunner {
             .await?
             .unwrap_or(session);
 
+        // 失败也要留痕（决策 211④ / 票 04）：`?` 会把这一轮的现场一起带走，库里只剩
+        // 一条孤立的 user 行——2026-09-17 实测里值班长两次没回话，「为什么没回话」
+        // 一个字都查不到。故外框兜住所有出口，失败时落一条 `system` 账。
+        let result = self.respond(&session, text).await;
+        if let Err(error) = &result {
+            self.record_failed_turn(&session, error).await;
+        }
+        result
+    }
+
+    /// 一轮回话的**内里**（现场由 [`Self::say`] 的外框记账）。
+    async fn respond(&self, session: &ForemanSession, text: &str) -> Result<ForemanTurn> {
         let briefing = build_briefing(&self.store).await?;
         // 阶段配置读一次、用两个地方（人格 + provider / 采样参数）。中途再读一次不会
         // 有新值可读，却会让「人格用这一份、provider 用那一份」成为可能。
@@ -947,14 +959,24 @@ impl ForemanRunner {
 
         let reply = reply.ok_or_else(|| {
             if empty_replies > 0 {
-                Error::Validation(
-                    "值班长这一轮没有回话（模型返回了空内容）。\n                     若这是本机第一次使用，先确认 provider 与模型名配对了；                     也可以换个模型再试——有些模型在被要求用工具时会返回空内容。"
-                        .to_string(),
-                )
+                // 归因**走 `LlmClassified` 的 kind 机制**而不是新造一种错误（票 04）：
+                // 这两条是模型行为，不是内部故障，而「哪一类」正是排查要的入口。
+                Error::LlmClassified {
+                    kind: "model_empty_reply".into(),
+                    message: "值班长这一轮没有回话（模型返回了空内容）。\
+                              若这是本机第一次使用，先确认 provider 与模型名配对了；\
+                              也可以换个模型再试——有些模型在被要求用工具时会返回空内容。"
+                        .into(),
+                    raw: "模型返回空内容（无 tool_calls、无文本）".into(),
+                }
             } else {
-                Error::Validation(format!(
-                    "值班长在 {FOREMAN_MAX_ROUNDS} 轮内没有给出回话——它可能一直在查台账"
-                ))
+                Error::LlmClassified {
+                    kind: "model_no_reply".into(),
+                    message: format!(
+                        "值班长在 {FOREMAN_MAX_ROUNDS} 轮内没有给出回话——它可能一直在查台账"
+                    ),
+                    raw: format!("达到 FOREMAN_MAX_ROUNDS = {FOREMAN_MAX_ROUNDS} 仍未收口"),
+                }
             }
         })?;
 
@@ -977,13 +999,31 @@ impl ForemanRunner {
             .await?;
 
         Ok(ForemanTurn {
-            session,
+            session: session.clone(),
             reply,
             prompt_tokens: tokens.0,
             completion_tokens: tokens.1,
             briefing,
             traces,
         })
+    }
+
+    /// 落一条**失败回合**的账（决策 211④ / 票 04）。
+    ///
+    /// `role = system` 复用「操作台记账」那条路（决策 207）：对讲台把它渲染成一轮，
+    /// 模型下一轮也会看到它——于是「上一轮我为什么没回话」对它自己也是已知的一件事。
+    ///
+    /// 留痕本身失败只记日志：要带回去的是这一轮为什么失败，不是记账为什么失败。
+    async fn record_failed_turn(&self, session: &ForemanSession, error: &Error) {
+        let (kind, reason) = turn_failure_reason(error);
+        let content = format!("{FOREMAN_FAILED_TURN_MARK}这一轮没跑起来（{kind}）：{reason}");
+        if let Err(e) = self
+            .store
+            .append_foreman_message(NewForemanMessage::system(session.id.clone(), content))
+            .await
+        {
+            tracing::error!(session = %session.id, "失败回合的留痕也写不进去：{e}");
+        }
     }
 
     /// 把「哪个会话」解析成一个确实存在的会话行（决策 204）。
@@ -1138,6 +1178,26 @@ impl ForemanRunner {
              - 你不知道的事就说不知道。",
         );
         Ok(out)
+    }
+}
+
+/// 失败回合在台账里的标记（票 04）。对讲台按它把这一轮渲染成失败轮，不是一个中性轮。
+pub const FOREMAN_FAILED_TURN_MARK: &str = "【没跑起来】";
+
+/// 一轮回话失败的归因（票 04）：`(稳定类别, 人话原因)`。
+///
+/// 与 [`Error::llm_classified`] 同一姿态：**能确证才标类别，其余退回原始串**——误标类别
+/// 比不标更坏，它会把排查引向一个错误的方向（这条纪律的来历见 `error.rs` 的 `LlmClassified`）。
+/// 四个面：网络 / 配置 / 模型 / 内部。
+fn turn_failure_reason(error: &Error) -> (String, String) {
+    match error {
+        Error::LlmClassified { kind, raw, .. } => (kind.clone(), raw.clone()),
+        // 适配器层的失败（HTTP 错误 / 响应解析 / 连接被拒）：它就是网络那一类
+        Error::Llm(msg) => ("llm_network".into(), msg.clone()),
+        Error::Config(msg) => ("config".into(), msg.clone()),
+        Error::Db(e) => ("db".into(), e.to_string()),
+        Error::Migrate(e) => ("db".into(), e.to_string()),
+        other => ("internal".into(), other.to_string()),
     }
 }
 

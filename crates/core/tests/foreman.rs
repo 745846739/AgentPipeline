@@ -16,8 +16,8 @@ use agentpipeline_core::config::Settings;
 use agentpipeline_core::metrics;
 use agentpipeline_core::pipeline::foreman::{
     build_briefing, foreman_tool_names, situation_fingerprint, trim_history, ForemanRunner,
-    ForemanToolLayer, FOREMAN_AGENT_TYPE, FOREMAN_PERSONA, FOREMAN_STAGE_KEY, FOREMAN_TOOL_SPECS,
-    OPERATION_LOG_MARK,
+    ForemanToolLayer, FOREMAN_AGENT_TYPE, FOREMAN_FAILED_TURN_MARK, FOREMAN_PERSONA,
+    FOREMAN_STAGE_KEY, FOREMAN_TOOL_SPECS, OPERATION_LOG_MARK,
 };
 use agentpipeline_core::storage::foreman::NewForemanMessage;
 use agentpipeline_core::storage::tasks::TaskFilter;
@@ -408,10 +408,55 @@ async fn say_persists_the_user_message_even_when_the_model_fails() {
     let err = runner.say(Some(&sid), "喂").await.unwrap_err();
     assert!(matches!(err, Error::Llm(_)));
 
+    // 票 04 改了这条口径：user 行**不再孤立**——失败当场落一条 `system` 账，
+    // 把「为什么没回话」写下来（2026-09-17 实测里那两次静默失败，库里一个字都没有）。
     let messages = h.store.list_foreman_messages(&sid, 100).await.unwrap();
-    assert_eq!(messages.len(), 1, "只有用户那一行");
+    assert_eq!(messages.len(), 2, "用户那一行 + 失败那一行：{messages:?}");
     assert_eq!(messages[0].role, "user");
     assert_eq!(messages[0].content, "喂");
+    assert_eq!(messages[1].role, "system");
+    assert!(
+        messages[1].content.starts_with(FOREMAN_FAILED_TURN_MARK),
+        "失败轮要有标记，前端靠它渲染成失败轮：{}",
+        messages[1].content
+    );
+    assert!(
+        messages[1].content.contains("llm_network") && messages[1].content.contains("模型没配"),
+        "失败原因要能归因，且带回原始串：{}",
+        messages[1].content
+    );
+}
+
+/// 失败回合的归因用 `LlmClassified` 的 kind 机制（票 04）：空回话是**模型行为**，
+/// 不是内部故障——类别正是排查的入口。
+#[tokio::test]
+async fn a_silent_model_is_recorded_with_its_own_kind() {
+    let h = Harness::empty().await;
+    let mut script = Script::new();
+    // 空文本步：内容过滤后为空 → 这一轮没有回话
+    script.for_foreman().text("");
+    let runner = h.runner(FakeAgent::new(script));
+    let sid = h.session().await;
+
+    let err = runner.say(Some(&sid), "在吗").await.unwrap_err();
+    let kind = err.llm_classified().map(|(k, _)| k.to_string());
+    assert_eq!(
+        kind.as_deref(),
+        Some("model_empty_reply"),
+        "空回话要带自己的类别：{err}"
+    );
+
+    let messages = h.store.list_foreman_messages(&sid, 100).await.unwrap();
+    let failed = messages
+        .iter()
+        .find(|m| m.role == "system")
+        .expect("失败回合要落一条 system 账");
+    assert!(
+        failed.content.contains("model_empty_reply"),
+        "{}",
+        failed.content
+    );
+    assert!(failed.content.contains("没有回话"), "{}", failed.content);
 }
 
 #[tokio::test]

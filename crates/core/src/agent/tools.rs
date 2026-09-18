@@ -1666,6 +1666,7 @@ fn run_digest(run: &NodeRun) -> serde_json::Value {
         "prompt_tokens": run.prompt_tokens,
         "completion_tokens": run.completion_tokens,
         "error": run.error,
+        "step": run.step,
         "prompt_template_hash": run.prompt_template_hash,
         "has_process_group": run.process_group_id.is_some(),
         "continued_from_run_id": run.continued_from_run_id,
