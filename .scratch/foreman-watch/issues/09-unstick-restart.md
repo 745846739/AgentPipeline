@@ -68,3 +68,22 @@ transition，但**重试从未发生**——原始 `try_run` 没返回、进程�
 
 票 05 把这类任务**报出来**，票 09 让它**能被解开**。两票缺一，症状就还是「卡住且只能重启」——
 区别只是现在有人会告诉你它卡住了。
+
+## 评审后补记（2026-09-18）：**门开了，路不通**
+
+`unstick` 进了托管自动集（`is_stewardable_action` 放行它），而 app 层唯一的执行者只建
+`ResumeRequest`——被放行的 `unstick` 会走到 `ResumeAction::parse("")` 上（`未知 resume 动作：`）。
+也就是：**D 层放行了，执行处却只会 resume**。core 那侧注入替身的用例看不见这件事（替身只会
+数「有没有被放行」），所以它是评审时才被指出来的。
+
+落地三件：
+
+1. **执行者按动作分派**（`crates/app/src/runtime.rs`，`StewardResume` 改名 `StewardActions`）：
+   `resume(continue)` → `apply_resume`，`unstick` → `pipeline::unstick::unstick`（与手动那一支
+   同一份实现，`force_release` 也从这里注入）。两件动作各自仍只有一份实现，分派是唯一新增的东西。
+2. **账上写实际做的那个动作**（`tools.rs::run_steward_action`）：此前那行固定写「自动 resume…
+   动作 continue」，一次 `unstick` 也会被记成 resume。次数止损线**两种动作共用一条**
+   （`Stewardship::note_auto_resume` 的文档写清了）——这是更保守的那一侧。
+3. **新增 app 层端到端用例**（`crates/app/tests/api_contract.rs::a_stewarded_task_can_be_unstuck_by_the_foreman_without_a_press`）：
+   托管 + 工具返回 `unstick` → 无提议、`executor_owner` 清空、游标转 pending（原因带 `unstick`）、
+   僵死 run 标终态、留账那一行写着 `unstick`。这条用例正是「放行 ≠ 执行得通」的取证。
