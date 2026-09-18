@@ -12,6 +12,7 @@ import { describe, expect, it } from 'vitest';
 import type { AllowedAction, ForemanProposal } from '../api/types';
 import {
   expiryReached,
+  isRepairProposal,
   proposalActionable,
   proposalPointerOnly,
   proposalRemainingLabel,
@@ -19,6 +20,8 @@ import {
   proposalStateLabel,
   proposalTaskId,
   proposalToolLabel,
+  repairActionLabel,
+  repairGateLabel,
   stateZoneActionName,
 } from './proposals';
 
@@ -208,5 +211,73 @@ describe('终态优先于指路（渲染顺序会决定人能读到什么）', (
     expect(proposalState(p, NOW)).toBe('expired');
     expect(proposalActionable(p, NOW)).toBe(false);
     expect(proposalPointerOnly(p, actions)).toBe(true);
+  });
+});
+
+// ─────────────── 修复提议的渲染判据（决策 212① / 票 12）───────────────
+
+describe('修复提议：合入而不是执行，闸门读数说清有没有补丁', () => {
+  const repair = (over: Partial<ForemanProposal> = {}): ForemanProposal =>
+    proposal({
+      id: 'p-repair',
+      tool: 'repair',
+      kind: 'repair',
+      summary: '合入修复分支 repair/abc → main（示例）：闸门已过',
+      args: { project_id: 'p1' },
+      payload: {
+        repair_id: 'abc',
+        worktree_path: '/tmp/home/worktrees/repair-abc',
+        branch: 'repair/abc',
+        base_ref: 'main',
+        base_commit: 'deadbeef',
+        gate_passed: true,
+        gate: [
+          {
+            kind: 'test',
+            command: 'cargo test --quiet',
+            exit_code: 0,
+            duration_ms: 1200,
+            output_path: null,
+            output_preview: '',
+          },
+        ],
+        commit: 'cafe',
+        diff: 'diff --git a/x.rs b/x.rs',
+        diff_stat: ' x.rs | 2 ++',
+      },
+      ...over,
+    });
+
+  it('名牌与按钮点名「合入」——它会动主干', () => {
+    expect(proposalToolLabel(repair())).toContain('修复');
+    expect(repairActionLabel(repair())).toBe('合入');
+    expect(repairActionLabel(proposal())).toBe('执行');
+  });
+
+  it('闸门读数在场；没过时明说「没有补丁」', () => {
+    expect(repairGateLabel(repair())).toContain('test 过');
+    const failed = repair({
+      payload: {
+        ...repair().payload!,
+        gate_passed: false,
+        gate: [{ ...repair().payload!.gate[0], exit_code: 1 }],
+        diff: null,
+      },
+    });
+    expect(repairGateLabel(failed)).toContain('没有补丁');
+    expect(isRepairProposal(failed)).toBe(true);
+  });
+
+  it('普通提议不走修复那一块', () => {
+    expect(isRepairProposal(proposal())).toBe(false);
+    expect(repairGateLabel(proposal())).toBeNull();
+  });
+
+  it('修复提议**不按时间过期**：远期有效期不会让按钮变灰', () => {
+    // 决策 212①：修复是唯一一条有意留到第二天早上看的东西——10 分钟的 TTL 会让早上
+    // 看到的是一排灰按钮。后端给它的是远期有效期（`FOREMAN_PROPOSAL_NO_TTL_DAYS`）。
+    const overnight = repair({ expires_at: '2126-01-01T00:00:00Z' });
+    expect(proposalState(overnight, NOW)).toBe('pending');
+    expect(proposalActionable(overnight, NOW)).toBe(true);
   });
 });

@@ -301,6 +301,56 @@ pub fn write_repair_diff(home: &Home, repair_id: &str, diff: &str) -> Result<Pat
     Ok(path)
 }
 
+/// 把一次修复落成**一条提议**（决策 212① / 票 12）。
+///
+/// 为什么复用提议表而不是新开一张：它的每个字段都对得上修复这件事（见迁移 0022 的注释）。
+/// 这里只做一件表里没有的事——**写载荷**（`kind = repair` + 现场 JSON）与**不设 TTL**
+/// （由存储层按 `kind` 判）。
+///
+/// `summary` 是人在按下之前唯一读的那一行，故它必须说清三件事：修哪个项目、依据什么结论、
+/// 闸门过了没有。含糊的一句「合入一个修复」等于让人对着一个分支名按键。
+pub async fn propose_repair(
+    store: &Store,
+    session_id: &str,
+    project: &crate::types::Project,
+    outcome: &RepairOutcome,
+) -> Result<crate::storage::proposals::ForemanProposal> {
+    let gate_note = if outcome.gate_passed {
+        "闸门已过".to_string()
+    } else {
+        format!("**闸门未过**：{}", gate_failure_note(&outcome.gate))
+    };
+    let summary = format!(
+        "合入修复分支 {} → {}（{}）：{gate_note}",
+        outcome.branch,
+        project.default_branch,
+        project.name
+    );
+    // 指纹换义（决策 212①）：不是「任务状态变没变」，而是「这个分支还能不能干净地 rebase
+    // 到基准上」——分支不会因为别的事变迁而失效，而 base 会前进。
+    let situation = serde_json::json!({
+        "repair": {
+            "branch": outcome.branch,
+            "base_ref": outcome.base_ref,
+            "base_commit": outcome.base_commit,
+            "project_id": project.id,
+        }
+    });
+    store
+        .create_foreman_proposal(crate::storage::proposals::NewForemanProposal {
+            session_id: session_id.to_string(),
+            // 修复没有对应的工具端点：`tool` 这个名字是**执行分派的键**
+            // （`run_proposal_tool` 按它走 `repair` 那一支），不是某个工具的名字。
+            tool: "repair".to_string(),
+            args: serde_json::json!({"project_id": project.id}),
+            summary,
+            situation: Some(situation),
+            kind: crate::storage::proposals::ForemanProposalKind::Repair,
+            payload: Some(serde_json::to_value(outcome)?),
+        })
+        .await
+}
+
 /// 修复 id 生成（ULID：时间有序，`git branch --list repair/*` 天然按时间排）。
 pub fn new_repair_id() -> String {
     ulid::Ulid::new().to_string()

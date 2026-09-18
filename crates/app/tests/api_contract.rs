@@ -4842,6 +4842,8 @@ async fn seed_proposal(api: &Api, session_id: &str, tool: &str, args: Value) -> 
     api.state
         .store
         .create_foreman_proposal(NewForemanProposal {
+            kind: agentpipeline_core::storage::proposals::ForemanProposalKind::ApiCall,
+            payload: None,
             session_id: session_id.to_string(),
             tool: tool.to_string(),
             args,
@@ -5012,6 +5014,8 @@ async fn a_proposal_whose_situation_changed_is_refused() {
         .state
         .store
         .create_foreman_proposal(NewForemanProposal {
+            kind: agentpipeline_core::storage::proposals::ForemanProposalKind::ApiCall,
+            payload: None,
             session_id: sid.clone(),
             tool: "task".into(),
             args: json!({"task_id": task_id, "action": "resume"}),

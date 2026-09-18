@@ -13,7 +13,7 @@ use futures::future::BoxFuture;
 
 use crate::agent::tools::{ProposalRequest, ProposalSink};
 use crate::sse::{SseEvent, SseSink};
-use crate::storage::proposals::NewForemanProposal;
+use crate::storage::proposals::{ForemanProposalKind, NewForemanProposal};
 use crate::storage::Store;
 use crate::Result;
 
@@ -59,6 +59,10 @@ impl ProposalSink for StoreProposalSink {
                     args: request.args.clone(),
                     summary: summary.clone(),
                     situation,
+                    // 对话轮提出来的都是工具调用（票 12 的修复提议由修复流程自己落，
+                    // 走的是另一条路：它的载荷不是「工具的调用参数」）。
+                    kind: ForemanProposalKind::ApiCall,
+                    payload: None,
                 })
                 .await?;
             if !proposal.session_id.is_empty() {

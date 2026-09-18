@@ -21,6 +21,44 @@ use crate::Result;
 /// 提议的有效期（决策 207：**10 分钟**，比照 resume cooldown 的姿态）。
 pub const FOREMAN_PROPOSAL_TTL_MINUTES: i64 = 10;
 
+/// **不设 TTL** 的提议用的远期有效期（决策 212① / 票 12）。
+///
+/// 为什么是「远期」而不是「把列改成可空」：`expires_at` 是 NOT NULL，而它的意义
+/// ——「这条提议按时间作废」——对修复类**不成立**：修复恰好是唯一一条你有意留给自己
+/// 第二天早上看的。100 年是一个明确的「不按时间过期」，而不是一个算得出来的时刻；
+/// 真正的生命周期归年龄清理（`conversation_retention_days` 同口径）。
+pub const FOREMAN_PROPOSAL_NO_TTL_DAYS: i64 = 36_500;
+
+/// 提议的两种载荷形态（决策 212① / 票 12）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ForemanProposalKind {
+    /// 一次工具调用（原先唯一的那种）。
+    ApiCall,
+    /// 一次**修复**：执行的不是工具，而是「合入一个分支」。
+    Repair,
+}
+
+impl ForemanProposalKind {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            ForemanProposalKind::ApiCall => "api_call",
+            ForemanProposalKind::Repair => "repair",
+        }
+    }
+
+    pub fn parse(raw: &str) -> Result<Self> {
+        Ok(match raw {
+            "api_call" => ForemanProposalKind::ApiCall,
+            "repair" => ForemanProposalKind::Repair,
+            other => {
+                return Err(crate::Error::Validation(format!(
+                    "未知的提议形态：{other}"
+                )))
+            }
+        })
+    }
+}
+
 /// `status` 的四个取值（与迁移 0015 的 CHECK 同源）。
 pub const FOREMAN_PROPOSAL_PENDING: &str = "pending";
 pub const FOREMAN_PROPOSAL_EXECUTED: &str = "executed";
@@ -80,6 +118,10 @@ pub struct ForemanProposal {
     pub summary: String,
     /// 提议成立时的态势指纹（参数里带 `task_id` 时才有）。
     pub situation: Option<Value>,
+    /// 载荷形态（决策 212① / 票 12）。
+    pub kind: ForemanProposalKind,
+    /// 修复类提议的现场（worktree / 分支 / 基准 / 闸门读数 / diff 路径）。
+    pub payload: Option<Value>,
     /// 执行占用时间戳（见模块头）。
     pub claimed_at: Option<DateTime<Utc>>,
     pub created_at: DateTime<Utc>,
@@ -103,10 +145,15 @@ pub struct NewForemanProposal {
     pub args: Value,
     pub summary: String,
     pub situation: Option<Value>,
+    /// 形态（票 12）。`Repair` 时 `expires_at` 走远期值——**修复不按时间过期**。
+    pub kind: ForemanProposalKind,
+    /// 修复类的现场。
+    pub payload: Option<Value>,
 }
 
-const PROPOSAL_COLUMNS: &str = "id, session_id, tool, args_json, summary, situation_json, \
-                                claimed_at, created_at, expires_at, status, resolved_at";
+const PROPOSAL_COLUMNS: &str = "id, session_id, tool, args_json, summary, situation_json, kind, \
+                                payload_json, claimed_at, created_at, expires_at, status, \
+                                resolved_at";
 
 #[derive(FromRow)]
 struct ForemanProposalRow {
@@ -116,6 +163,8 @@ struct ForemanProposalRow {
     args_json: String,
     summary: String,
     situation_json: Option<String>,
+    kind: String,
+    payload_json: Option<String>,
     claimed_at: Option<String>,
     created_at: String,
     expires_at: String,
@@ -139,6 +188,13 @@ impl ForemanProposalRow {
                 .as_deref()
                 .map(serde_json::from_str)
                 .transpose()?,
+            // 形态与现场是**执行语义**字段（决定按哪条路走）：损坏即报错。
+            kind: ForemanProposalKind::parse(&self.kind)?,
+            payload: self
+                .payload_json
+                .as_deref()
+                .map(serde_json::from_str)
+                .transpose()?,
             claimed_at: self.claimed_at.as_deref().map(parse_ts).transpose()?,
             created_at: parse_ts(&self.created_at)?,
             expires_at: parse_ts(&self.expires_at)?,
@@ -159,13 +215,19 @@ impl Store {
         new: NewForemanProposal,
     ) -> Result<ForemanProposal> {
         let now = self.now();
-        let expires_at = now + Duration::minutes(FOREMAN_PROPOSAL_TTL_MINUTES);
+        // 修复类**不按时间过期**（决策 212① / 票 12）：它是唯一一条你有意留到第二天早上
+        // 看的东西，10 分钟的 TTL 会让早上看到的是一排灰按钮。年龄清理照旧管它。
+        let expires_at = now
+            + match new.kind {
+                ForemanProposalKind::ApiCall => Duration::minutes(FOREMAN_PROPOSAL_TTL_MINUTES),
+                ForemanProposalKind::Repair => Duration::days(FOREMAN_PROPOSAL_NO_TTL_DAYS),
+            };
         let id = ulid::Ulid::new().to_string();
         sqlx::query(
             "INSERT INTO kanban_foreman_proposals
-             (id, session_id, tool, args_json, summary, situation_json, claimed_at, created_at,
-              expires_at, status, resolved_at)
-             VALUES (?, ?, ?, ?, ?, ?, NULL, ?, ?, ?, NULL)",
+             (id, session_id, tool, args_json, summary, situation_json, kind, payload_json,
+              claimed_at, created_at, expires_at, status, resolved_at)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, NULL, ?, ?, ?, NULL)",
         )
         .bind(&id)
         .bind(&new.session_id)
@@ -173,6 +235,8 @@ impl Store {
         .bind(new.args.to_string())
         .bind(&new.summary)
         .bind(new.situation.as_ref().map(Value::to_string))
+        .bind(new.kind.as_str())
+        .bind(new.payload.as_ref().map(Value::to_string))
         .bind(ts(now))
         .bind(ts(expires_at))
         .bind(FOREMAN_PROPOSAL_PENDING)
@@ -185,6 +249,8 @@ impl Store {
             args: new.args,
             summary: new.summary,
             situation: new.situation,
+            kind: new.kind,
+            payload: new.payload,
             claimed_at: None,
             created_at: now,
             expires_at,

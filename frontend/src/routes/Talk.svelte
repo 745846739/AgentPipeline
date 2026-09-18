@@ -41,8 +41,11 @@
     toggleOpenStop,
   } from '../lib/talkStops';
   import {
+    isRepairProposal,
     proposalActionable,
     proposalPointerOnly,
+    repairActionLabel,
+    repairGateLabel,
     proposalRemainingLabel,
     proposalShortLabel,
     proposalState,
@@ -1100,11 +1103,29 @@
             {#if st === 'pending'}· <span class="pleft">{proposalRemainingLabel(p, now)}</span>{/if}
           </div>
           <p>{p.summary}</p>
-          <!-- 参数原样可见：按键之前要看得出它到底要什么（后端生成的那句话是摘要，不是全部） -->
-          <details class="pargs">
-            <summary class="dim">参数 ▸</summary>
-            <pre class="mono">{JSON.stringify(p.args, null, 2)}</pre>
-          </details>
+          {#if isRepairProposal(p)}
+            <!-- 修复提议（票 12）：人要看的是那份补丁，不是参数摘要。
+                 闸门读数先说「有没有补丁」——没过闸门时**根本没有** diff（决策 210④），
+                 不说清会被当成加载失败。diff 可展开、可复制，不做语法高亮。 -->
+            {@const gateLabel = repairGateLabel(p)}
+            {#if gateLabel}
+              <p class="dim note" class:ferr={!p.payload?.gate_passed}>{gateLabel}</p>
+            {/if}
+            {#if p.payload?.diff}
+              <details class="rcpts">
+                <summary class="rcpts-sum">
+                  补丁 <span class="dim">{p.payload.diff_stat ?? ''}▸</span>
+                </summary>
+                <pre class="diff-body" data-repair-diff={p.id}>{p.payload.diff}</pre>
+              </details>
+            {/if}
+          {:else}
+            <!-- 参数原样可见：按键之前要看得出它到底要什么（后端生成的那句话是摘要，不是全部） -->
+            <details class="pargs">
+              <summary class="dim">参数 ▸</summary>
+              <pre class="mono">{JSON.stringify(p.args, null, 2)}</pre>
+            </details>
+          {/if}
 
           {#if st === 'executed' || st === 'rejected'}
             <!-- 终态：两颗钮都收掉，这一轮仍在（审计）。**先判终态再判指路**——反过来的话，
@@ -1125,7 +1146,7 @@
                 disabled={!actionable || proposalBusy !== null}
                 onclick={() => void actOnProposal(p.id, 'execute')}
               >
-                {proposalBusy === p.id ? '执行中…' : '执行'}
+                {proposalBusy === p.id ? '执行中…' : repairActionLabel(p)}
               </button>
               <button
                 type="button"
@@ -1589,6 +1610,19 @@
     overflow-x: auto;
     white-space: pre;
   }
+  /* 修复提议的补丁正文（票 12）：**看得全、能复制**——不要求语法高亮，
+     但要求横向可滚、用户能选中全文。等宽是唯一的形式要求。 */
+  .diff-body {
+    margin: 0;
+    max-height: 320px;
+    overflow: auto;
+    font-family: var(--font-mono, ui-monospace, SFMono-Regular, Menlo, monospace);
+    font-size: 11px;
+    line-height: 1.5;
+    white-space: pre;
+    user-select: text;
+  }
+
   /* 提议操作失败的说明：走失败红，与 `send()` 的失败轮同一档 */
   .turn.prop .ferr {
     color: var(--stop);

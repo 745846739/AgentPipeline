@@ -256,3 +256,167 @@ async fn a_non_git_project_says_why_it_cannot_be_repaired() {
     let err = agentpipeline_core::pipeline::repair::repair_supported(&project).unwrap_err();
     assert!(err.to_string().contains("不是 git 仓库"), "{err}");
 }
+
+// ─────────────── 修复提议：不设 TTL + 指纹换义（决策 212① / 票 12）───────────────
+
+/// 修复提议**不按时间过期**：睡过一夜后仍是 pending、按钮仍可点。
+#[tokio::test]
+async fn a_repair_proposal_survives_the_night() {
+    use agentpipeline_core::pipeline::repair::propose_repair;
+    use agentpipeline_core::storage::proposals::ForemanProposalKind;
+
+    let (home, store, clock, repo) = fixture().await;
+    let project = Project {
+        id: "p1".into(),
+        name: "示例".into(),
+        local_path: repo.path().display().to_string(),
+        default_branch: "main".into(),
+        language: None,
+        test_framework: Some("true".into()),
+        lint_command: None,
+        agents_md_path: None,
+        created_at: agentpipeline_core::clock::Clock::now(&clock),
+    };
+    let session_id = store.create_foreman_session("夜班").await.unwrap().id;
+    let session = start_repair(home.home(), repo.path(), "main", &new_repair_id())
+        .await
+        .unwrap();
+    std::fs::write(session.worktree.join("x.rs"), "pub fn x() {}\n").unwrap();
+    let gate = run_repair_gate(&store, home.home(), &session, None, Some("true"))
+        .await
+        .unwrap();
+    let commit = commit_repair(
+        &session,
+        "结论一句话",
+        agentpipeline_core::clock::Clock::now(&clock),
+    )
+    .await
+    .unwrap();
+    let (diff, stat) = repair_diff(repo.path(), &session).await.unwrap();
+    let outcome = agentpipeline_core::pipeline::repair::RepairOutcome {
+        repair_id: session.repair_id.clone(),
+        worktree_path: session.worktree.display().to_string(),
+        branch: session.branch.clone(),
+        base_ref: session.base_ref.clone(),
+        base_commit: repo.head("main"),
+        gate_passed: true,
+        gate: gate.clone(),
+        commit: Some(commit),
+        diff: Some(diff),
+        diff_stat: Some(stat),
+    };
+    let proposal = propose_repair(&store, &session_id, &project, &outcome)
+        .await
+        .unwrap();
+    assert_eq!(proposal.kind, ForemanProposalKind::Repair);
+    assert!(proposal.payload.is_some(), "载荷里要有 diff 与闸门读数");
+
+    // 八小时之后（一夜）仍在有效期内，且状态仍是 pending
+    let morning = agentpipeline_core::clock::Clock::now(&clock) + chrono::Duration::hours(8);
+    assert!(!proposal.is_expired(morning), "修复提议不该按 10 分钟过期");
+    assert!(proposal.status.is_open(), "早上看到的应当是可按键的");
+    // 对照：普通提议在同样的时刻早已过期（10 分钟 TTL）
+    let api_call = store
+        .create_foreman_proposal(agentpipeline_core::storage::proposals::NewForemanProposal {
+            session_id: session_id.clone(),
+            tool: "run_command".into(),
+            args: serde_json::json!({"command": "ls"}),
+            summary: "执行命令：ls".into(),
+            situation: None,
+            kind: ForemanProposalKind::ApiCall,
+            payload: None,
+        })
+        .await
+        .unwrap();
+    assert!(api_call.is_expired(morning), "普通提议照旧 10 分钟过期");
+}
+
+/// 指纹换义（票 12）：基准前进了 —— 执行时能干净 rebase 就合，冲突就报出文件清单。
+#[tokio::test]
+async fn the_repair_rebase_check_speaks_up_on_conflicts() {
+    let (home, store, clock, repo) = fixture().await;
+    let session = start_repair(home.home(), repo.path(), "main", &new_repair_id())
+        .await
+        .unwrap();
+    // 修复分支改一行
+    std::fs::write(session.worktree.join("src/lib.rs"), "pub fn add(a: i32, b: i32) -> i32 { a - b }\n").unwrap();
+    let _ = run_repair_gate(&store, home.home(), &session, None, Some("true")).await;
+    let _ = commit_repair(
+        &session,
+        "改掉一个符号",
+        agentpipeline_core::clock::Clock::now(&clock),
+    )
+    .await;
+
+    // 基准前进了**没有冲突**的一步：干净 rebase
+    repo.advance_main("README.md", "# 新的一行\n");
+    let outcome = Git
+        .rebase_onto_with_auto_resolve(&session.worktree, "main")
+        .await
+        .unwrap();
+    assert!(
+        !matches!(
+            outcome,
+            agentpipeline_core::git::AutoRebaseOutcome::Conflict { .. }
+        ),
+        "不冲突时应当能合：{outcome:?}"
+    );
+
+    // 基准又前进，且改的是**同一段**：冲突，且文件清单说得出来
+    let session2 = start_repair(home.home(), repo.path(), "main", &new_repair_id())
+        .await
+        .unwrap();
+    std::fs::write(
+        session2.worktree.join("src/lib.rs"),
+        "pub fn add(a: i32, b: i32) -> i32 { a * b }\n",
+    )
+    .unwrap();
+    let _ = commit_repair(
+        &session2,
+        "另一种改法",
+        agentpipeline_core::clock::Clock::now(&clock),
+    )
+    .await;
+    repo.advance_main("src/lib.rs", "pub fn add(a: i32, b: i32) -> i32 { b + a }\n");
+    let outcome = Git
+        .rebase_onto_with_auto_resolve(&session2.worktree, "main")
+        .await
+        .unwrap();
+    match outcome {
+        agentpipeline_core::git::AutoRebaseOutcome::Conflict { files } => {
+            assert!(
+                files.iter().any(|f| f.contains("lib.rs")),
+                "冲突文件要说得出：{files:?}"
+            );
+        }
+        other => panic!("同一段被两边改过应当冲突：{other:?}"),
+    }
+}
+
+/// 合入成功那一路：分支合进默认分支 + 回收（删分支、删 worktree）。
+#[tokio::test]
+async fn merging_a_repair_lands_the_branch_and_cleans_up() {
+    let (home, _store, clock, repo) = fixture().await;
+    let session = start_repair(home.home(), repo.path(), "main", &new_repair_id())
+        .await
+        .unwrap();
+    std::fs::write(session.worktree.join("added.rs"), "pub fn y() {}\n").unwrap();
+    let _ = commit_repair(
+        &session,
+        "补一个文件",
+        agentpipeline_core::clock::Clock::now(&clock),
+    )
+    .await;
+    // 无 remote 时基准是本地 main：先把 main 的引用对齐（fixture 的 main 就是 HEAD）
+    Git.merge_into_default_branch(repo.path(), "main", &session.branch)
+        .await
+        .unwrap();
+    finish_repair(repo.path(), &session, true).await.unwrap();
+
+    assert!(repo.exists("added.rs"), "改动应当出现在主干上");
+    assert!(!session.worktree.exists(), "worktree 被回收");
+    assert!(
+        Git.rev_parse(repo.path(), &session.branch).await.is_err(),
+        "合入成功后分支被删"
+    );
+}

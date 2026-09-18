@@ -1882,6 +1882,8 @@ async fn scheduler_maintenance_expires_proposals_and_purges_them_by_age() {
     let pid = h
         .store
         .create_foreman_proposal(agentpipeline_core::storage::proposals::NewForemanProposal {
+            kind: agentpipeline_core::storage::proposals::ForemanProposalKind::ApiCall,
+            payload: None,
             session_id: sid.clone(),
             tool: "write_file".into(),
             args: serde_json::json!({"path": "notes.md"}),

@@ -902,6 +902,28 @@ export interface ForemanSession {
  * `summary` 是**后端按参数生成**的一句话（不是模型写的自由文本）——它是人按键之前读到的
  * 唯一一行字，故不能由模型自己措辞。`args` 原样下发（按键之前要看得出它到底要什么）。
  */
+/** 修复提议的现场（决策 212① / 票 12）：闸门读数 + diff。 */
+export interface RepairPayload {
+  repair_id: string;
+  worktree_path: string;
+  branch: string;
+  base_ref: string;
+  base_commit: string;
+  /** 闸门过了没有。**没过不会出 diff**（决策 210④）。 */
+  gate_passed: boolean;
+  gate: {
+    kind: string;
+    command: string;
+    exit_code: number;
+    duration_ms: number;
+    output_path: string | null;
+    output_preview: string;
+  }[];
+  commit: string | null;
+  diff: string | null;
+  diff_stat: string | null;
+}
+
 export interface ForemanProposal {
   id: string;
   session_id: string;
@@ -910,8 +932,21 @@ export interface ForemanProposal {
   args: unknown;
   summary: string;
   status: string;
+  /**
+   * 载荷形态（票 12）：`api_call` = 一次工具调用；`repair` = **一次修复**。
+   *
+   * 后者执行的是「合入一个分支」，载荷里带 diff 与闸门读数——故它的渲染与工具调用不同
+   * （人要看的是那份补丁，不是参数摘要）。
+   */
+  kind?: 'api_call' | 'repair';
+  payload?: RepairPayload | null;
   created_at: string;
-  /** 有效期到点（决策 207：TTL 10 分钟）。**前端按它自己算过期**，不等后端标。 */
+  /**
+   * 有效期到点（决策 207：TTL 10 分钟）。**前端按它自己算过期**，不等后端标。
+   *
+   * 修复类例外（决策 212①）：它们的有效期是远期的「不按时间过期」——人有意留到第二天
+   * 早上看，做成 10 分钟会让人早上看到一排灰按钮。
+   */
   expires_at: string;
   resolved_at: string | null;
 }

@@ -388,6 +388,14 @@ pub async fn reject_proposal(
     else {
         return Err(ApiError::conflict("这条提议已经在执行，或已经被处理过了"));
     };
+    // 修复类的回收（决策 212③ / 票 12）：**保留分支、删 worktree**——分支是唯一的证据，
+    // 与决策 207「过期只让按钮变灰、那一轮留在时间线」同一理由。
+    if claimed.kind == agentpipeline_core::storage::proposals::ForemanProposalKind::Repair {
+        if let Err(e) = discard_repair_worktree(&state, &claimed).await {
+            // 回收失败不阻塞「拒绝」这件事本身：提议的状态是人的判断，回收是善后。
+            tracing::warn!(proposal = %id, "拒绝修复提议时回收 worktree 失败：{}", e.message);
+        }
+    }
     let resolved = store
         .resolve_foreman_proposal(&id, ForemanProposalStatus::Rejected)
         .await
@@ -431,6 +439,8 @@ async fn run_proposal_tool(
         "task" => run_task_tool(state, proposal).await,
         // 全局动作（决策 210⑧ / 票 09）：**永远只提议**，按下走恢复序列。
         "service" => run_service_tool(state, proposal).await,
+        // 修复提议（决策 212① / 票 12）：执行的不是工具，是「合入一个分支」。
+        "repair" => run_repair_proposal(state, proposal).await,
         "config" => run_config_tool(state, proposal).await,
         "skills" => run_skills_tool(state, proposal).await,
         // 工具名对不上的提议是**真实可能**的（升级前落的、或模型报了一个不存在的名字）：
@@ -484,6 +494,83 @@ async fn run_env_tool(
     };
     let outcome = tools.execute(&call, &ctx).await.map_err(map_core_error)?;
     Ok(Some(outcome.content))
+}
+
+// ──────────────────── 修复提议（决策 212① / 票 12）────────────────────
+
+/// 按下一条修复提议：**先 rebase 检查，再合入**。
+///
+/// 指纹换义（决策 212①）就落在这里：普通提议的拒执判据是「任务状态变了吗」，而修复执行的是
+/// 「合入一个分支」——分支不会因为别的事变迁而失效，会变的是**基准**。故执行时先走 merge
+/// 阶段已有的 `rebase_onto_with_auto_resolve`：
+/// - 能干净 rebase（或自动解决冲突）→ 合入；
+/// - 冲突 → **拒执**，并把冲突文件列给你（那是你要动手的地方）。
+async fn run_repair_proposal(
+    state: &AppState,
+    proposal: &ForemanProposal,
+) -> Result<Option<String>, ApiError> {
+    use agentpipeline_core::pipeline::repair::{finish_repair, RepairOutcome, RepairSession};
+
+    let payload = proposal
+        .payload
+        .as_ref()
+        .ok_or_else(|| ApiError::internal("修复提议缺载荷（不该发生：落库时必写）"))?;
+    let outcome: RepairOutcome = serde_json::from_value(payload.clone())
+        .map_err(|e| ApiError::internal(format!("修复提议的载荷读不出来：{e}")))?;
+    if !outcome.gate_passed {
+        return Err(ApiError::conflict(format!(
+            "这条修复的闸门没过，不能合入：{}",
+            agentpipeline_core::pipeline::repair::gate_failure_note(&outcome.gate)
+        )));
+    }
+    let project = state
+        .store
+        .get_project(
+            proposal
+                .args
+                .get("project_id")
+                .and_then(|v| v.as_str())
+                .unwrap_or_default(),
+        )
+        .await
+        .map_err(map_core_error)?
+        .ok_or_else(|| ApiError::not_found("修复所属的项目不存在"))?;
+    let repo = std::path::Path::new(&project.local_path);
+    let session = RepairSession {
+        repair_id: outcome.repair_id.clone(),
+        worktree: std::path::PathBuf::from(&outcome.worktree_path),
+        branch: outcome.branch.clone(),
+        base_ref: outcome.base_ref.clone(),
+    };
+
+    // ① 基准前进 / 冲突：以「能不能干净 rebase」为准（指纹换义）
+    match agentpipeline_core::git::Git
+        .rebase_onto_with_auto_resolve(&session.worktree, &session.base_ref)
+        .await
+        .map_err(map_core_error)?
+    {
+        agentpipeline_core::git::AutoRebaseOutcome::Conflict { files } => {
+            return Err(ApiError::conflict(format!(
+                "修复分支与基准冲突（{}），没有合入——先解决这几处再按：{}",
+                files.len(),
+                files.join("、")
+            )));
+        }
+        _ => {}
+    }
+
+    // ② 合入（与 merge 阶段同一个 git 出口）+ 回收（合入成功 → 删分支、删 worktree）
+    agentpipeline_core::git::Git
+        .merge_into_default_branch(repo, &project.default_branch, &session.branch)
+        .await
+        .map_err(map_core_error)?;
+    finish_repair(repo, &session, true)
+        .await
+        .map_err(map_core_error)?;
+    Ok(Some(format!(
+        "已合入 {} → {} 并回收修复 worktree（分支已删）",
+        session.branch, project.default_branch
+    )))
 }
 
 // ──────────────────── 本服务写接口：四个领域各一族（票 05 / 09）────────────────────
@@ -885,10 +972,48 @@ fn proposal_wire(p: &ForemanProposal) -> serde_json::Value {
         "args": p.args,
         "summary": p.summary,
         "status": p.status.as_str(),
+        // 形态与载荷（票 12）：前端按 `kind` 决定渲染哪一块（diff + 闸门读数 vs 参数摘要）
+        "kind": p.kind.as_str(),
+        "payload": p.payload,
         "created_at": p.created_at.to_rfc3339(),
         "expires_at": p.expires_at.to_rfc3339(),
         "resolved_at": p.resolved_at.map(|t| t.to_rfc3339()),
     })
+}
+
+/// 拒绝 / 过期时回收修复的 worktree（**保留分支**）。
+async fn discard_repair_worktree(
+    state: &AppState,
+    proposal: &ForemanProposal,
+) -> Result<(), ApiError> {
+    use agentpipeline_core::pipeline::repair::{finish_repair, RepairOutcome, RepairSession};
+
+    let Some(payload) = &proposal.payload else {
+        return Ok(());
+    };
+    let Ok(outcome) = serde_json::from_value::<RepairOutcome>(payload.clone()) else {
+        return Ok(());
+    };
+    let Some(project_id) = proposal.args.get("project_id").and_then(|v| v.as_str()) else {
+        return Ok(());
+    };
+    let Some(project) = state
+        .store
+        .get_project(project_id)
+        .await
+        .map_err(map_core_error)?
+    else {
+        return Ok(());
+    };
+    let session = RepairSession {
+        repair_id: outcome.repair_id,
+        worktree: std::path::PathBuf::from(&outcome.worktree_path),
+        branch: outcome.branch,
+        base_ref: outcome.base_ref,
+    };
+    finish_repair(std::path::Path::new(&project.local_path), &session, false)
+        .await
+        .map_err(map_core_error)
 }
 
 fn proposal_not_found(id: &str) -> ApiError {
