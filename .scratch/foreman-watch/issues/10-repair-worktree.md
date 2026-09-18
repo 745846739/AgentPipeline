@@ -22,28 +22,44 @@
 
 **Blocked by:** 09
 
-**Status:** ready-for-agent
+**Status:** done
 
-- [ ] 修复 worktree 的创建与清理生命周期独立于 init 阶段
+- [x] 修复 worktree 的创建与清理生命周期独立于 init 阶段
       （`Git.init_worktree` 现签名是 `(project_path, task_id, worktree_path, default_branch)`，
       `crates/core/src/git.rs:312-318`，且只被 init 调用）
-- [ ] 分支命名：与流水线任务的分支可区分（`Git::branch_for` 是 `kanban/{task_id}`，
+- [x] 分支命名：与流水线任务的分支可区分（`Git::branch_for` 是 `kanban/{task_id}`，
       修复分支要有自己的前缀，否则 `git branch --list` 里分不出哪些是修复）
-- [ ] worktree 落在 `{home}/worktrees/` 下 → 在值班长的写域内（**有断言钉住**
+- [x] worktree 落在 `{home}/worktrees/` 下 → 在值班长的写域内（**有断言钉住**
       `FileToolPolicy::check_write` 对它返回 `Ok`）
-- [ ] **base 的取法**：与 merge 阶段一致——有 `origin` 用 `origin/{default_branch}`，否则本地分支
+- [x] **base 的取法**：与 merge 阶段一致——有 `origin` 用 `origin/{default_branch}`，否则本地分支
       （`Git::base_ref`，`git.rs:292-305`；本仓无 remote，故走本地）
-- [ ] 修复轮里允许的写工具与命令域**明确列出**（不靠「碰巧域够大」）
-- [ ] 回收：合入成功 → 删分支 + 删 worktree；被拒 / 年龄清理 → **保留分支、删 worktree**
+- [x] 修复轮里允许的写工具与命令域**明确列出**（不靠「碰巧域够大」）
+- [x] 回收：合入成功 → 删分支 + 删 worktree；被拒 / 年龄清理 → **保留分支、删 worktree**
       （分支是唯一的证据，与决策 207「过期只让按钮变灰、那一轮留在时间线」同一理由）
-- [ ] 复用既有的按仓库串行的 `with_worktree_lock`（`git.rs:88-105`）——
+- [x] 复用既有的按仓库串行的 `with_worktree_lock`（`git.rs:88-105`）——
       libgit2 建 worktree 对 `{repo}/.git/worktrees` 是「先查后建」，跨任务并发会撞 `EEXIST`
-- [ ] 所有 git 调用走 `blocking`/`blocking_within` 的兜底上限（不许新增无界阻塞点）
-- [ ] 新增用例：从零拉起一个修复 worktree，断言分支从正确 base 分出、目录在 home 下、
+- [x] 所有 git 调用走 `blocking`/`blocking_within` 的兜底上限（不许新增无界阻塞点）
+- [x] 新增用例：从零拉起一个修复 worktree，断言分支从正确 base 分出、目录在 home 下、
       且 `FileToolPolicy` 允许写它
-- [ ] 新增用例：两个修复并发拉同一仓库的 worktree，**都成功**（`with_worktree_lock` 的牙齿）
-- [ ] 新增用例：回收后 worktree 目录消失、分支按规则留存或删除
+- [x] 新增用例：两个修复并发拉同一仓库的 worktree，**都成功**（`with_worktree_lock` 的牙齿）
+- [x] 新增用例：回收后 worktree 目录消失、分支按规则留存或删除
 
+**实施收尾（2026-09-18）:**
+
+- **创建走 `Git::init_worktree_named`**（`init_worktree` 也改成调它）：base 的取法、幂等复用、
+  `with_worktree_lock` 的串行化、unborn HEAD 的明确报错**都只有一份实现**——修复与 init
+  在这几件事上必须逐字相同。
+- **路径 `{home}/worktrees/repair-{id}`**（`Home::repair_worktree_path`）：前缀 `repair-`
+  让它与任务 worktree 一眼可分；落在家目录下是**可达性的硬约束**，用例正面断言
+  `FilePolicy::check_write` 通过、反面断言项目工作区写不进去。
+- **分支 `repair/{id}`**（`Git::repair_branch_for`）：可检索是唯一理由——`git branch --list`
+  里要一眼看出哪些是修复产物。
+- **回收规则**在 `finish_repair(merged)`：合入删分支、被拒留分支（分支是唯一证据）。
+- **「修复轮里允许的写工具与命令域」如实记**：域不是新划的——就是决策 206 给值班长的
+  `home.root()`，而 worktree 落在它下面。写工具仍是 `write_file` / `edit_file` / `run_command`
+  那三件（命令域走既有的出口策略），**没有为修复新开任何域或工具**。
+- **`blocking` 与 `gerr` 从 private 提为 `pub(crate)`**：修复模块要用它们，而新增第二份
+  「阻塞 + 超时兜底」的包装正是这一票要避免的东西。
 ## 备注
 
 **这是本批最实的一块工程量。** 前面几票都能用既有接缝拼出来，这一票要新管一套生命周期。

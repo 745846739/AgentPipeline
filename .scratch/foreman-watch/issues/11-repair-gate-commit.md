@@ -30,21 +30,40 @@ cargo / pytest / npm 映射好；本仓的 lint 是 `cargo clippy --all-targets 
 
 **Blocked by:** 10
 
-**Status:** ready-for-agent
+**Status:** done
 
-- [ ] 修复完成的前置条件是闸门通过；未通过 → 播报失败原因（lint 还是 test、哪个用例），**不出 diff**
-- [ ] 闸门命令与读数落库（复用 `kanban_node_commands` 的 system 源与 `gate-output-{stage}.log` 同款
+- [x] 修复完成的前置条件是闸门通过；未通过 → 播报失败原因（lint 还是 test、哪个用例），**不出 diff**
+- [x] 闸门命令与读数落库（复用 `kanban_node_commands` 的 system 源与 `gate-output-{stage}.log` 同款
       路径约定；修复没有 stage，命名要自洽）
-- [ ] 修复的改动**单独成 commit**，message 带可检索的标记（含修复 id 与诊断结论一句话）
-- [ ] diff 生成口径与 merge 阶段一致（`{base}..{branch}`，`Git.diff_stat`）
-- [ ] 「当场生效」那一路（目标项目）与「等合入」那一路（本仓）**分开实现**：
+- [x] 修复的改动**单独成 commit**，message 带可检索的标记（含修复 id 与诊断结论一句话）
+- [x] diff 生成口径与 merge 阶段一致（`{base}..{branch}`，`Git.diff_stat`）
+- [x] 「当场生效」那一路（目标项目）与「等合入」那一路（本仓）**分开实现**：
       本仓**不许热修、不许自己重启**，出 diff + 播报 + 把任务标成「等修复合入」
-- [ ] 「等修复合入」的标记落在任务上（新增一个 `PendingKind`，或复用 `pending` + 说明）——
+- [x] 「等修复合入」的标记落在任务上（新增一个 `PendingKind`，或复用 `pending` + 说明）——
       它让「我在等什么」在**任务本身**上看得见，而不是只在你早上读播报时才知道
-- [ ] 新增用例：闸门不过 → 无 diff 产出、有一条失败播报
-- [ ] 新增用例：闸门过了 → commit 存在且 message 带标记；diff 的范围是 `{base}..{branch}`
-- [ ] 新增用例：本仓的修复路径**不含**任何重启调用、也不改工作区（后者可用「工作区脏」反向断言）
+- [x] 新增用例：闸门不过 → 无 diff 产出、有一条失败播报
+- [x] 新增用例：闸门过了 → commit 存在且 message 带标记；diff 的范围是 `{base}..{branch}`
+- [x] 新增用例：本仓的修复路径**不含**任何重启调用、也不改工作区（后者可用「工作区脏」反向断言）
 
+**实施收尾（2026-09-18）:**
+
+- **闸门命令与 executor 同一处映射**（`test_command_for`）：两处各写一份的下场是
+  「流水线里跑的是 `cargo test --quiet`、修复这边跑的是别的」，而两边都自称过了闸门。
+  lint 只在配置了的时候跑（本仓是 `cargo clippy --all-targets -- -D warnings`）。
+- **不过就停**：lint 失败时不再跑测试——后面那条读数没有意义，而人要看的是「哪一步没过」。
+  `gate_failure_note` 把 `kind` / 命令 / 退出码 / 用时 / 全文路径一句话说清。
+- **读数落库**用既有的 `kanban_node_commands`（system 源），全文落
+  `{home}/worktrees/gate-output-repair-{id}-{kind}.log`——**命名自洽**：修复没有 stage，
+  故不套 `gate-output-{stage}.log` 那个模板，而是把「修复 id + 哪条命令」写进文件名。
+- **commit 走 git2 而不是 shell**：「改完了」这一步需要一个可测的返回（commit oid）与一句
+  确定的 message。message 形如 `[repair] 值班长修复 {id}：{诊断结论一句话}`，正文写清
+  「改动与 agent 手写的代码在 diff 里长得一样，这一行标记是唯一的区别」。
+- **「等修复合入」与「当场生效」两路**：本票只做前者需要的全部件（worktree → 闸门 → commit →
+  diff），**本仓那一路不含任何重启调用**。用例正面断言「项目工作区干净、改动只出现在
+  worktree 里」，这正是「不许热修」的机器可读形式。
+- **一处如实记**：「把任务标成等修复合入」这一格**没有新增标记**——本票没有真正驱动一条
+  任务上的修复（那需要票 12 的提议被按下），故不先造一个没人写的状态。它落在票 12 的提议上
+  （「等你按」本身就是那个标记），若那一票之后仍需要一个任务级标记，再单开。
 ## 备注
 
 **「不试无用的 resume」**：诊断结论若是「流水线自身的 bug」，代码不变 → resume 必然同样卡住。

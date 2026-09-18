@@ -139,6 +139,16 @@ impl Home {
         self.worktrees_dir().join(task_id)
     }
 
+    /// **修复 worktree** 的路径（决策 210③ / 票 10）：`{home}/worktrees/repair-{id}`。
+    ///
+    /// 落在家目录下是这一票的**硬约束**，不是审美：值班长的写域是 `home.root()`，
+    /// 而 `FileToolPolicy` 对读写都强制「路径必须落在允许根内」——本仓（以及任何在
+    /// `~/Documents` 下的项目）它一个字都写不了。落在 `{home}/worktrees/` 下才可达。
+    /// 前缀 `repair-` 让它与任务 worktree（`worktrees/{task_id}`）在目录列表里一眼可分。
+    pub fn repair_worktree_path(&self, repair_id: &str) -> PathBuf {
+        self.worktrees_dir().join(format!("repair-{repair_id}"))
+    }
+
     /// 任务产出的既有文件路径集合（§4.2 文件目录约定）。
     pub fn task_file(&self, task_id: &str, name: &str) -> PathBuf {
         self.task_dir(task_id).join(name)

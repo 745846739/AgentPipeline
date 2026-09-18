@@ -54,7 +54,7 @@ pub struct MergeOutcome {
     pub commit: String,
 }
 
-fn gerr(e: git2::Error) -> Error {
+pub(crate) fn gerr(e: git2::Error) -> Error {
     Error::Git(e.to_string())
 }
 
@@ -86,7 +86,7 @@ const GIT_OP_TIMEOUT_SEC: u64 = 180;
 const IS_DIRTY_TIMEOUT_SEC: u64 = 10;
 
 /// 在阻塞线程池里执行一段同步 git2 逻辑（决策 12），带 [`GIT_OP_TIMEOUT_SEC`] 兜底。
-async fn blocking<T, F>(f: F) -> Result<T>
+pub(crate) async fn blocking<T, F>(f: F) -> Result<T>
 where
     T: Send + 'static,
     F: FnOnce() -> Result<T> + Send + 'static,
@@ -362,10 +362,30 @@ impl Git {
         worktree_path: &Path,
         default_branch: &str,
     ) -> Result<String> {
+        self.init_worktree_named(
+            project_path,
+            &branch_name(task_id),
+            worktree_path,
+            default_branch,
+        )
+        .await
+    }
+
+    /// 同 [`Git::init_worktree`]，但**分支名由调用方给**（票 10 的修复 worktree 用）。
+    ///
+    /// 两者共用这一份实现：base 的取法（有 `origin` 用 `origin/{default}`）、幂等复用、
+    /// `with_worktree_lock` 的串行化、unborn HEAD 的明确报错——这些都不该有第二份。
+    pub async fn init_worktree_named(
+        &self,
+        project_path: &Path,
+        branch: &str,
+        worktree_path: &Path,
+        default_branch: &str,
+    ) -> Result<String> {
         let project = project_path.to_path_buf();
         let worktree = worktree_path.to_path_buf();
         let default_branch = default_branch.to_string();
-        let task_id = task_id.to_string();
+        let branch = branch.to_string();
         blocking(move || {
             let repo = open(&project)?;
             match repo.head() {
@@ -402,7 +422,6 @@ impl Git {
             // 建 worktree 的窗口必须按仓库串行（见 worktree_creation_lock）：
             // libgit2 对共享的 `.git/worktrees` 先查后建，跨任务并发会撞 EEXIST。
             with_worktree_lock(&project, || {
-                let branch = branch_name(&task_id);
                 let base_commit = repo
                     .revparse_single(&base)
                     .and_then(|o| o.peel_to_commit())
@@ -435,6 +454,14 @@ impl Git {
     /// worktree 分支名（§6）。
     pub fn branch_for(task_id: &str) -> String {
         branch_name(task_id)
+    }
+
+    /// **修复分支**名（决策 210③ / 票 10）：`repair/{id}`。
+    ///
+    /// 与 `kanban/{task_id}` 分开的理由是**可检索**：`git branch --list` 里要一眼看得出
+    /// 哪些分支是修复产物。混用同一个前缀，三个月后没人分得出哪条是谁留的。
+    pub fn repair_branch_for(repair_id: &str) -> String {
+        format!("repair/{repair_id}")
     }
 
     /// merge 阶段 A：在 worktree 内 rebase 到基准（决策 74 / 96）。
