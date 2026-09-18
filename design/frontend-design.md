@@ -767,6 +767,7 @@ GET /tasks/{id}               → 详情页装载 + 断线重连后的全量校�
 | 顶栏 8 格工位灯在 `#/talk` 上接通：点灯去 `#/` 并定位到那一列（此前 8/8 无靶子，点了不动） | `frontend/src/components/layout/TopBar.svelte` | 决策 218 ⑥；兑现已有的 `aria-label="跳到 init"`，不是新功能 |
 | 「急停」的首现平实说法落在急停摘要条的琥珀标签上（折行档没有急停时那整块退场、词与译文一起不在） | `frontend/src/routes/Talk.svelte` | 决策 200（口径不变）＋ 218 ⑦b（换落点） |
 | 值班长没回话的那一轮渲染成失败轮**并显示原因**（后端落的 `system` 账以 `【没跑起来】` 开头），不再是一条只有红轮、无处看原因的静默失败 | `frontend/src/routes/Talk.svelte` | 决策 211④；票 04 |
+| 本地等不到回包**不等于**这一轮失败：超时那一类补一句「它在服务端仍在继续」（回话会随流式增量到达，切走再切回本班次也能看到），其余失败照原样说 | `frontend/src/realtime/foreman.ts`、`frontend/src/routes/Talk.svelte` | 决策 223；判据由 `frontend/src/realtime/foreman.test.ts` 钉住（`failureNotice` / `isTimeoutMessage`） |
 | 主动播报与回话是两种轮：值守轮自己醒来说的那条名牌写「值班长 · 值守」（后端加的 `【值守播报】` 标记），有人问才说的话仍是「值班长」 | `frontend/src/routes/Talk.svelte` | 决策 209④；票 06 |
 | 修复提议的渲染与工具调用不同：显示闸门读数（过了哪几步 / 没过则明说「没有补丁」）与可展开、可复制的 diff；按钮文案是「合入」而不是「执行」 | `frontend/src/routes/Talk.svelte`、`frontend/src/lib/proposals.ts` | 决策 212①；票 12（同一个钮面，不新开第三个） |
 | 任务级托管：状态在任务上看得见，且拨得动；终态任务与值班长未接线时不摆那颗钮（两条理由与端点的两种拒绝同一份） | `frontend/src/lib/stewardship.ts`、`frontend/src/routes/TaskDetail.svelte`、`frontend/src/api/types.ts` | 决策 210①；票 08 的端点 / 票 14 的界面；判据由 `stewardship.test.ts` 逐条钉住 |
@@ -797,7 +798,7 @@ GET /tasks/{id}               → 详情页装载 + 断线重连后的全量校�
 | 同名动作不是一个动作：身份 = 动作名 + 游标 + **落点**，渲染层的 each key 与「提交中」态共用同一把尺子 | `frontend/src/lib/actions.ts`、`frontend/src/components/board/PendingActions.svelte`、`frontend/src/components/task/DiffReviewPanel.svelte` | 票 20；`retry_exhausted` 的两条 `goto` 撞 key 会让整块动作区停更 |
 | 新建任务按服务端返回的 id 跳转（不靠列表里的第一个去猜） | `frontend/src/stores/board.svelte.ts`、`frontend/src/components/board/NewTaskDialog.svelte` | 票 10（R2-12） |
 | 提交前拦下明显非法的值：`base_url` 形状、拆分里空标题的行**指出第几行**、文本域全空给提示而不是静默 no-op | `frontend/src/lib/providers.ts`、`frontend/src/components/task/SplitDialog.svelte` | 票 11（R2-13） |
-| 请求有统一超时（值只有一处出处），超时给可读错误而不是内部字眼；值班长发话单独放宽 | `frontend/src/api/client.ts` | 票 12（R2-14）；`REQUEST_TIMEOUT_MS` 与 `mapRequestError` |
+| 请求有统一超时（值只有一处出处），超时给可读错误而不是内部字眼；值班长发话单独放宽（5 分钟——那一轮不随本地放弃而死，故这只是本地等多久） | `frontend/src/api/client.ts` | 票 12（R2-14）＋ 决策 223；`REQUEST_TIMEOUT_MS` 与 `mapRequestError` |
 | 命令输出读不回来就说失败（不再永远「正在加载完整输出…」） | `frontend/src/components/task/CommandLog.svelte`、`frontend/src/stores/taskDetail.svelte.ts` | 票 12（R2-16）；`commandOutputError` 此前无人读 |
 | 详情页也有实时断线指示（与看板同一句话）；流未连通时动手要说「回执要等重连」而不是静默等 30 秒 | `frontend/src/stores/taskDetail.svelte.ts`、`frontend/src/routes/TaskDetail.svelte` | 票 13（R2-15） |
 | 时间与日期的格式只有一处出处（`lib/format.ts` 之外不许再出现 locale 调用） | `frontend/src/lib/format.ts`、`frontend/src/lib/format.test.ts` | 票 15（R2-18）；静态扫描是这道门的一部分 |

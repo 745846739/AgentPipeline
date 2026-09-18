@@ -78,6 +78,7 @@
     emptyForeignActive,
     emptyForemanStream,
     failForemanStream,
+    failureNotice,
     failedLedgerRowIds,
     foreignIsReplying,
     forgetForeignActive,
@@ -1021,7 +1022,10 @@
         void refreshSessionList();
         return;
       }
-      stream = failForemanStream(stream, (err as Error).message);
+      // 本地超时**不等于**这一轮失败：服务端那一轮不随这次请求一起死（决策 223），
+      // 故超时那一类由 `failureNotice` 补上「它仍在继续」的实情——否则人会重发一句，
+      // 而那一轮很可能正在把话答完。
+      stream = failForemanStream(stream, failureNotice((err as Error).message));
       // 重取成功才撤乐观轮：撤了之后这话由台账那一行承担，不靠重取失败时凭空消失
       if (await reload(sid)) {
         pendingText = null;

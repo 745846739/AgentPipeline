@@ -12,7 +12,7 @@ use agentpipeline_core::agent::client::LlmClient;
 use agentpipeline_core::agent::repo::{Libgit2Repo, SkillRepo};
 use agentpipeline_core::agent::tools::CommandRecorder;
 use agentpipeline_core::config::Settings;
-use agentpipeline_core::pipeline::foreman::situation_fingerprint;
+use agentpipeline_core::pipeline::foreman::{situation_fingerprint, FOREMAN_FAILED_TURN_MARK};
 use agentpipeline_core::pipeline::ForemanRunner;
 use agentpipeline_core::sse::{SseEvent, SseEventType};
 use agentpipeline_core::storage::proposals::NewForemanProposal;
@@ -4271,7 +4271,26 @@ async fn api_with_foreman(agent: FakeAgent) -> Api {
     .await
 }
 
+/// 同 `api_with_foreman`，但注入的是**任意** `LlmClient`。
+///
+/// 并发的取消类用例要在模型那一侧自己掌握节奏（「我说放行才回话」），而 `Script` 的形状
+/// 是「按序取一步」——不给它加一个只为测试存在的步骤类型，用在这里的客户端自带。
+async fn api_with_llm(llm: Arc<dyn LlmClient>) -> Api {
+    api_full_with_foreman_llm(
+        Settings {
+            pending_resume_cooldown_sec: 5,
+            ..Default::default()
+        },
+        Some(llm),
+    )
+    .await
+}
+
 async fn api_full_with_foreman(settings: Settings, agent: Option<FakeAgent>) -> Api {
+    api_full_with_foreman_llm(settings, agent.map(|a| Arc::new(a) as Arc<dyn LlmClient>)).await
+}
+
+async fn api_full_with_foreman_llm(settings: Settings, llm: Option<Arc<dyn LlmClient>>) -> Api {
     let home = TestHome::new().unwrap();
     let (store, clock) = home.setup().await.unwrap();
     let repo = Repo::clean().unwrap();
@@ -4301,8 +4320,8 @@ async fn api_full_with_foreman(settings: Settings, agent: Option<FakeAgent>) -> 
     );
     // 先取好 runner 需要的三个句柄，再消费 `state`——`with_foreman` 会拿走 state，
     // 在它的实参位置里读 `state.home` 是「移动后借用」。
-    let state = match agent {
-        Some(agent) => {
+    let state = match llm {
+        Some(llm) => {
             // 与生产接线同形（serve.rs）：托管放行的自动动作走 resume 的唯一实现。
             // 测试里少这一句，那条路（票 08 的 `task resume continue`）就只会在生产里跑。
             let runner = Arc::new(
@@ -4310,7 +4329,7 @@ async fn api_full_with_foreman(settings: Settings, agent: Option<FakeAgent>) -> 
                     state.store.clone(),
                     state.settings.clone(),
                     state.home.clone(),
-                    Arc::new(agent) as Arc<dyn LlmClient>,
+                    llm,
                     state.sse.clone(),
                 )
                 .with_steward_actions(Arc::new(app::runtime::StewardActions::new(
@@ -4601,6 +4620,104 @@ async fn empty_home_can_converse_through_the_api() {
         .as_str()
         .unwrap()
         .contains("先建一个项目"));
+}
+
+/// 客户端在回话途中放弃，**掐不死这一轮**（决策 223）。
+///
+/// 现场（2026-09-18）：本地等不到回包就放弃，hyper 把 handler 的 future 丢掉，`say()`
+/// 连同它的失败外框一起消失——库里只剩一条孤立的 `user` 行，回话与原因都是零。这一轮
+/// 现在跑在自己的任务里，故「本地放弃」只等于「这一次没等到回包」。
+///
+/// 牙齿：把路由里的 `tokio::spawn` 拿掉（回到 handler 与请求同生共死），这个用例会停在
+/// 「放行模型之后台账里还是只有 user 行」那一格上。
+#[tokio::test]
+async fn a_dropped_request_does_not_kill_the_turn() {
+    /// 收到信号才回话的模型：把「客户端在回话途中放弃」变成一个可复现的次序——
+    /// 断言的是**放弃之后**这一轮的下场，故模型必须停在那一刻等我们动手。
+    struct Gated(Arc<tokio::sync::Notify>);
+    impl LlmClient for Gated {
+        fn complete(
+            &self,
+            _request: agentpipeline_core::agent::client::LlmRequest,
+        ) -> futures::future::BoxFuture<
+            'static,
+            agentpipeline_core::Result<agentpipeline_core::agent::client::AgentResponse>,
+        > {
+            let release = self.0.clone();
+            Box::pin(async move {
+                release.notified().await;
+                Ok(agentpipeline_core::agent::client::AgentResponse {
+                    content: Some("收到，我盯着 t1。".into()),
+                    prompt_tokens: 10,
+                    completion_tokens: 5,
+                    ..Default::default()
+                })
+            })
+        }
+    }
+
+    let release = Arc::new(tokio::sync::Notify::new());
+    let api = api_with_llm(Arc::new(Gated(release.clone()))).await;
+
+    // 请求要**真发出去**（`oneshot` 返回的是惰性 future），同时留着掐它的把手：
+    // 掐掉这一次请求 ≈ hyper 在客户端断开时把 handler 丢掉。
+    let sending = tokio::spawn(
+        api.router.clone().oneshot(
+            request("POST", "/foreman/messages")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(json!({"text": "盯着 t1"}).to_string()))
+                .unwrap(),
+        ),
+    );
+    // 这一轮真的开始了：`say()` 的第一步就是把用户那一句落库（会话也随之建出来）。
+    let mut sid = String::new();
+    for _ in 0..300 {
+        if let Some(session) = api.state.store.latest_foreman_session().await.unwrap() {
+            sid = session.id;
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    assert!(!sid.is_empty(), "这一轮应当先把用户那一句落库");
+
+    // 客户端放弃这一次请求（关页 / 本地超时 / 换网）：丢掉它的 future。
+    sending.abort();
+    let _ = sending.await;
+
+    // 放行模型：这一轮仍应当把回话写进台账。
+    release.notify_one();
+    let mut reply = None;
+    for _ in 0..300 {
+        let messages = api
+            .state
+            .store
+            .list_foreman_messages(&sid, 100)
+            .await
+            .unwrap();
+        if let Some(assistant) = messages.iter().find(|m| m.role == "assistant") {
+            reply = Some(assistant.content.clone());
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    assert_eq!(
+        reply.as_deref(),
+        Some("收到，我盯着 t1。"),
+        "客户端放弃之后，这一轮的回话仍要落库"
+    );
+    // 而且它是**成功**的一轮：不应当多出一条失败留痕（那会把「客户端走了」说成「这一轮没跑起来」）。
+    let messages = api
+        .state
+        .store
+        .list_foreman_messages(&sid, 100)
+        .await
+        .unwrap();
+    assert!(
+        !messages
+            .iter()
+            .any(|m| m.role == "system" && m.content.starts_with(FOREMAN_FAILED_TURN_MARK)),
+        "放弃这一次请求不等于这一轮失败：{messages:?}"
+    );
 }
 
 /// 班次四件事（决策 204①）：新建 / 切换 / 重命名 / 归档，全走端点。

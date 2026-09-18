@@ -181,6 +181,28 @@ export function failForemanStream(state: ForemanStreamState, message: string): F
 }
 
 /**
+ * 「这一轮还在服务端继续」这句话的正文（决策 223）。
+ *
+ * 服务端那一轮**不随这次请求一起死**：本地放弃（本地超时 / 关页 / 换网）只丢掉这一次的
+ * 同步回包，回话照旧落库、增量照旧走 `/foreman/stream`。所以「本地等不到回包」不等于
+ * 「这一轮失败」——说成失败会让人重发一句，而服务端那一轮很可能正在把它答完
+ * （2026-09-18 实测的两次「没回话」正是这个形状：话说了，回话没等到，界面与库都只剩
+ * 一条孤立的用户行）。
+ */
+export const FOREMAN_TIMEOUT_SUFFIX =
+  '本地已不再等这一轮，但它在服务端仍在继续：回话会随流式增量出现，切走再切回本班次也能看到。';
+
+/** 报文是不是「本地等不到回包」（判据与 `api/client.ts::mapRequestError` 的超时那句同源）。 */
+export function isTimeoutMessage(message: string): boolean {
+  return message.startsWith('请求超时');
+}
+
+/** 失败轮的说明：超时那一类补上「还在跑」的实情，其余原样返回。 */
+export function failureNotice(message: string): string {
+  return isTimeoutMessage(message) ? `${message} ${FOREMAN_TIMEOUT_SUFFIX}` : message;
+}
+
+/**
  * 失败回合在台账里的标记（`crates/core/src/pipeline/foreman.rs::FOREMAN_FAILED_TURN_MARK`
  * 的前端镜像，决策 211④ / 票 04）。
  */

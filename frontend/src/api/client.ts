@@ -672,8 +672,12 @@ export function sendForemanMessage(
   return request<ForemanSendResult>('/foreman/messages', {
     method: 'POST',
     body: { text, session_id: sessionId ?? null },
-    // 这一轮要等模型回话：默认 30s 兜底对它偏紧，显式放宽到 3 分钟（票 12 的口径）
-    timeoutMs: 180_000,
+    // 这一轮要等模型回话：默认 30s 兜底对它偏紧，显式放宽到 3 分钟（票 12 的口径）。
+    // 2026-09-18 抬到 5 分钟：实测一次**成功**的回话约 150s，而它带着 9 万 token 的
+    // prompt——3 分钟对它是常态而不是异常，于是本地一放弃就报一句「失败」，让人以为
+    // 话没发出去。本地放弃**不再掐死这一轮**（决策 223：服务端那一轮跑在自己的任务里，
+    // 回话照旧落库），故这个数只决定本地等多久，不影响这一轮的成败。
+    timeoutMs: 300_000,
   });
 }
 

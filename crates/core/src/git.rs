@@ -134,8 +134,47 @@ fn worktree_creation_lock(repo: &Path) -> &'static Mutex<()> {
 
 /// 在[`worktree_creation_lock`]保护下执行 `f`（同步上下文；调用方在 spawn_blocking 里）。
 fn with_worktree_lock<T>(repo: &Path, f: impl FnOnce() -> Result<T>) -> Result<T> {
+    with_worktree_lock_within(WORKTREE_LOCK_WAIT_SEC, repo, f)
+}
+
+/// 等这把锁的上限（秒）。
+///
+/// **为什么连等锁也要有上限**（2026-09-18 实测）：`GIT_OP_TIMEOUT_SEC` 的超时**不会终止**
+/// 那个仍在 `open()` 里阻塞的线程，而它手里正握着这把锁。当天给桌面进程采的栈里就有三条
+/// 这样的线程（两条 `Git::is_dirty`、一条 `Git::init_worktree_named`），于是同一仓库之后
+/// 每一次建 worktree 都只能等满 180s 的通用上限，报出来的却是「git 操作超时」——
+/// 一句话指向 libgit2，而真凶是「这把锁被一个挂死的线程占着」。
+///
+/// 取值对**正常**竞争是极宽裕的量级：这把锁只罩着 `branch` + `worktree add` 那几毫秒，
+/// fetch 在锁外（见 `init_worktree_named`）。真等满这一档，只可能是上一次调用挂住了。
+const WORKTREE_LOCK_WAIT_SEC: u64 = 60;
+
+/// 同上，等待上限可指定（内联测试注入一个短上限，照 `blocking_within` 的形状）。
+fn with_worktree_lock_within<T>(
+    wait_sec: u64,
+    repo: &Path,
+    f: impl FnOnce() -> Result<T>,
+) -> Result<T> {
     let lock = worktree_creation_lock(repo);
-    let _guard = lock.lock().unwrap_or_else(|e| e.into_inner());
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(wait_sec);
+    let _guard = loop {
+        match lock.try_lock() {
+            Ok(guard) => break guard,
+            // 毒化不当作错误：这把锁护的是一段没有共享状态的窗口，前一个持有者 panic
+            // 不该让之后每一次建 worktree 都失败（与 `lock()` 的既有姿态一致）。
+            Err(std::sync::TryLockError::Poisoned(poisoned)) => break poisoned.into_inner(),
+            Err(std::sync::TryLockError::WouldBlock) => {
+                if std::time::Instant::now() >= deadline {
+                    return Err(Error::Git(format!(
+                        "建 worktree 的互斥锁被占用超过 {wait_sec}s 没放（同一仓库上一次建 \
+                         worktree 的调用可能还挂在 libgit2 里）：这个仓库的建 worktree 会继续\
+                         被挡住，别的仓库不受影响"
+                    )));
+                }
+                std::thread::sleep(std::time::Duration::from_millis(50));
+            }
+        }
+    };
     f()
 }
 
@@ -1058,6 +1097,23 @@ mod tests {
         match r {
             Err(Error::Git(m)) => assert!(m.contains("超时"), "超时文案不对：{m}"),
             other => panic!("应当超时，实际：{other:?}"),
+        }
+    }
+
+    /// 等锁也有上限，且报文说清是「锁被占着」而不是「git 慢」（2026-09-18 实测）。
+    ///
+    /// 牙齿：把 `with_worktree_lock_within` 的 `try_lock` 换回 `lock()`，这个用例会挂死在
+    /// 等锁上——而「挂死在等锁上、报出来的却是 git 超时」正是当时那条误导性报文的来源。
+    #[test]
+    fn worktree_lock_wait_is_bounded_and_says_so() {
+        let repo = Path::new("/tmp/agentpipeline-lock-probe");
+        // 同一条线程自己占住它：`std::sync::Mutex` 不可重入，第二次拿就是 WouldBlock。
+        let held = worktree_creation_lock(repo);
+        let _guard = held.lock().unwrap_or_else(|e| e.into_inner());
+        let r: Result<()> = with_worktree_lock_within(0, repo, || Ok(()));
+        match r {
+            Err(Error::Git(m)) => assert!(m.contains("互斥锁被占用"), "报文不对：{m}"),
+            other => panic!("应当报「锁被占用」，实际：{other:?}"),
         }
     }
 

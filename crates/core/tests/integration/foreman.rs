@@ -499,6 +499,71 @@ async fn say_persists_the_user_message_even_when_the_model_fails() {
     );
 }
 
+/// 挂住的模型流不再把这一轮无限拖住（2026-09-18 实测的形状）。
+///
+/// 现场那一轮没有 run 行、也就没有任何时限约束：模型流一挂住，`say()` 就一直挂在
+/// `stream.next()` 上，`Err` 到不了、失败外框也不执行——库里只剩一条孤立的用户行。
+///
+/// 牙齿：把 `ForemanRunner::respond` 的 `tokio::time::timeout` 摘掉，这个用例会挂死在
+/// 这里（`Step::Stall` 的 future 永不返回）。
+#[tokio::test]
+async fn a_hung_model_is_bounded_and_recorded() {
+    let h = Harness::empty().await;
+    let mut script = Script::new();
+    script.for_foreman().stall();
+    let runner = h
+        .runner(FakeAgent::new(script))
+        .with_turn_timeout(std::time::Duration::from_millis(1200));
+    let sid = h.session().await;
+
+    let err = runner.say(Some(&sid), "盯着 t1").await.unwrap_err();
+    match &err {
+        // 时限按人话写出来（不足一分钟说秒）：账里那一句是人判断「挂了多久」的凭据。
+        Error::Llm(m) => {
+            assert!(m.contains("没有结束"), "时限说明要读得懂：{m}");
+            assert!(m.contains("1 秒"), "要带出实际的时限：{m}");
+        }
+        other => panic!("应当是「这一轮没结束」这一类失败，实际：{other:?}"),
+    }
+
+    // 用户那一句 + 失败那一句：这一轮**不再**只剩孤立的用户行。
+    let messages = h.store.list_foreman_messages(&sid, 100).await.unwrap();
+    assert_eq!(messages.len(), 2, "{messages:?}");
+    assert_eq!(messages[0].role, "user");
+    assert!(
+        messages[1].content.starts_with(FOREMAN_FAILED_TURN_MARK)
+            && messages[1].content.contains("没有结束"),
+        "失败那一行要说清是时限：{}",
+        messages[1].content
+    );
+}
+
+/// 被 panic 带走的那一轮也要留痕（决策 223）：`say()` 的失败外框本身就在 panic 里没了，
+/// 能补这一条的只有调用方——HTTP 端点拿到 `JoinError` 时调的就是这个方法。
+#[tokio::test]
+async fn an_interrupted_turn_is_recorded_in_the_latest_session() {
+    let h = Harness::empty().await;
+    let runner = h.runner(FakeAgent::new(Script::new()));
+    let sid = h.session().await;
+    // 用户那一句先落库（panic 发生在它之后、回话之前）；落库会更新会话的
+    // `last_active_at`，故「最近活动的班次」就是它。
+    h.store
+        .append_foreman_user_message(&sid, "盯着 t1")
+        .await
+        .unwrap();
+
+    runner.record_interrupted_turn("内部错误").await;
+
+    let messages = h.store.list_foreman_messages(&sid, 100).await.unwrap();
+    let last = messages.last().expect("至少两行");
+    assert_eq!(last.role, "system");
+    assert!(
+        last.content.starts_with(FOREMAN_FAILED_TURN_MARK) && last.content.contains("内部错误"),
+        "中断那一行要可归因：{}",
+        last.content
+    );
+}
+
 /// 失败回合的归因用 `LlmClassified` 的 kind 机制（票 04）：空回话是**模型行为**，
 /// 不是内部故障——类别正是排查的入口。
 #[tokio::test]

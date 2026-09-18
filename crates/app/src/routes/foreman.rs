@@ -1030,6 +1030,17 @@ pub struct SendBody {
 
 /// `POST /foreman/messages`。
 ///
+/// **一轮跑在独立任务里**（决策 223）：它与这次 HTTP 请求**不同生共死**。客户端断开
+/// （本地超时 / 关页 / 换网 / 手机切走）只丢掉这一次的同步回包，掐不死这一轮——回话
+/// 照旧落库，下一次重读台账就能看到它。
+///
+/// 此前 handler 与请求绑在一起：客户端一放弃，hyper 就把 handler 的 future 丢掉，
+/// `say()` 的失败外框（`if let Err(error) = &result`）连执行的机会都没有——库里于是
+/// 只剩一条孤立的用户行。2026-09-18 实测的两条消息正是这个形状：`user` 行两条、
+/// 回话与失败留痕都是零，连「为什么没回话」都查不到。任务被 detach 之后，这一轮的
+/// 成败都归它自己记账（`Err` 走 `record_failed_turn`，panic 走
+/// `record_interrupted_turn`）。
+///
 /// **LLM 失败时值班经理说的那句话已经落库**（`ForemanRunner::say` 的第一步）。
 /// 失败返回错误状态，前端据此渲染一条错误轮并**保留输入框内容**，让人改几个字重发
 /// 而不是重打一遍（决策 182㉓）。
@@ -1038,10 +1049,22 @@ pub async fn send(
     Json(body): Json<SendBody>,
 ) -> ApiResult<impl IntoResponse> {
     let runner = state.foreman.clone().ok_or_else(foreman_unwired)?;
-    let turn = runner
-        .say(body.session_id.as_deref(), &body.text)
-        .await
-        .map_err(map_core_error)?;
+    let who = runner.clone();
+    let text = body.text.clone();
+    let session_id = body.session_id.clone();
+    let turn = match tokio::spawn(async move { who.say(session_id.as_deref(), &text).await }).await
+    {
+        Ok(inner) => inner.map_err(map_core_error)?,
+        // panic 把 `say()` 的失败外框一起带走了，故这一条账只能在这里补——它正是
+        // 「库里为什么什么都没有」的那一格（决策 223）。
+        Err(join) => {
+            tracing::error!(panic = join.is_panic(), "对讲台这一轮没跑完，回话没有落库");
+            runner.record_interrupted_turn("内部错误").await;
+            return Err(ApiError::internal(
+                "这一轮没跑完（内部错误）：台账里已经记下这一次中断，重发一次通常能过去",
+            ));
+        }
+    };
     let store = state.store.clone();
     let (total_tokens, total_calls) = store
         .foreman_session_totals(&turn.session.id)

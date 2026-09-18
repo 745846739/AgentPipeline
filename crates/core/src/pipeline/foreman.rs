@@ -879,6 +879,8 @@ pub struct ForemanRunner {
     sse: Arc<dyn SseSink>,
     /// 托管放行的自动动作的执行者（决策 210② / 票 08）。`None` = 不放行。
     steward_actions: Option<Arc<dyn crate::agent::tools::StewardActionRunner>>,
+    /// 一轮回话的绝对上限（测试注入；生产走 `node_max_duration_sec` / 阶段覆盖）。
+    turn_timeout: Option<std::time::Duration>,
 }
 
 impl ForemanRunner {
@@ -901,7 +903,18 @@ impl ForemanRunner {
             llm,
             sse,
             steward_actions: None,
+            turn_timeout: None,
         }
+    }
+
+    /// 测试用：把一轮回话的上限压到可观测的量级（生产走 [`Self::turn_limit`]）。
+    ///
+    /// 与 [`crate::agent::providers::ProductionLlm::with_heartbeat_interval`] 同一姿态：
+    /// 上限在生产里是一个配置值（默认半小时），而「挂住的模型流会被掐断并留账」这件事
+    /// 不可能靠真等半小时来验。
+    pub fn with_turn_timeout(mut self, limit: std::time::Duration) -> Self {
+        self.turn_timeout = Some(limit);
+        self
     }
 
     /// 注入托管动作的执行者（决策 210② / 票 08）。
@@ -964,12 +977,56 @@ impl ForemanRunner {
         result
     }
 
-    /// 一轮回话的**内里**（现场由 [`Self::say`] / [`Self::watch`] 的外框记账）。
+    /// 一轮回话的**外框**：给这一轮加上时限，让它有界。
+    ///
+    /// **为什么必须有界**（2026-09-18 实测）：对讲台这一轮没有 run 行，也就没有心跳可打
+    /// （决策 182⑨），于是它此前**完全不受任何时限约束**——模型流一挂住，`say()` 就一直
+    /// 挂在 `stream.next()` 上。那一晚两条消息都是这个形状：`Err` 到不了，失败外框也
+    /// 就不执行，库里只剩孤立的用户行。有界之后，「挂住」变成一条**可归因的失败**——
+    /// 与流水线节点同一个口径（见 [`Self::turn_limit`]）。
     async fn respond(&self, session: &ForemanSession, input: TurnInput) -> Result<ForemanTurn> {
-        let briefing = build_briefing(&self.store).await?;
-        // 阶段配置读一次、用两个地方（人格 + provider / 采样参数）。中途再读一次不会
-        // 有新值可读，却会让「人格用这一份、provider 用那一份」成为可能。
         let cfg = self.stage_config().await?;
+        let limit = self.turn_limit(cfg.as_ref());
+        match tokio::time::timeout(limit, self.respond_inner(session, input, cfg)).await {
+            Ok(inner) => inner,
+            Err(_) => Err(Error::Llm(format!(
+                "这一轮超过 {} 没有结束（模型或网络挂住）：已中止，重发一次通常能过去",
+                human_duration(limit)
+            ))),
+        }
+    }
+
+    /// 一轮回话的时限：**与流水线节点取同一个数**（决策 66 的四级解析）。
+    ///
+    /// 节点级覆盖 > 阶段配置（`[foreman]` 那行的 `max_duration_sec`）> 全局
+    /// `node_max_duration_sec`（默认 1800s = 半小时）。取同一个数的理由是：对讲台这一轮
+    /// 与一个节点在「一次有界的执行」这件事上是同一种东西，各写一个数字只会让两个地方
+    /// 各自漂移。
+    ///
+    /// 取值**宁可宽**：它的职责是让挂死有界，不是让长轮次失败——一轮里可以有多次模型
+    /// 调用（`FOREMAN_MAX_ROUNDS` 次上限），每次实测在分钟量级。
+    fn turn_limit(&self, cfg: Option<&crate::types::StageConfig>) -> std::time::Duration {
+        if let Some(injected) = self.turn_timeout {
+            return injected;
+        }
+        let secs = crate::config::effective_max_duration(
+            self.settings.node_max_duration_sec,
+            cfg.and_then(|c| c.max_duration_sec),
+            crate::config::NodeTimeouts::default(),
+        );
+        std::time::Duration::from_secs(secs)
+    }
+
+    /// 一轮回话的**内里**（现场由 [`Self::say`] / [`Self::watch`] 的外框记账，
+    /// 时限由 [`Self::respond`] 给）。
+    async fn respond_inner(
+        &self,
+        session: &ForemanSession,
+        input: TurnInput,
+        cfg: Option<crate::types::StageConfig>,
+    ) -> Result<ForemanTurn> {
+        let briefing = build_briefing(&self.store).await?;
+        // 阶段配置由外框读了一次传进来（人格 + provider / 采样参数共用那一份）。
         // 环境层档位（决策 206）：广告集、执行点白名单与人格里的工具纪律段**同源**，
         // 都由它筛一次。缺省 `ask`（值班长的输入是人可以随便打的任意文本）。
         let env_mode = crate::types::effective_env_mode(
@@ -1334,17 +1391,47 @@ impl ForemanRunner {
     ///
     /// `role = system` 复用「操作台记账」那条路（决策 207）：对讲台把它渲染成一轮，
     /// 模型下一轮也会看到它——于是「上一轮我为什么没回话」对它自己也是已知的一件事。
-    ///
-    /// 留痕本身失败只记日志：要带回去的是这一轮为什么失败，不是记账为什么失败。
     async fn record_failed_turn(&self, session: &ForemanSession, error: &Error) {
         let (kind, reason) = turn_failure_reason(error);
-        let content = format!("{FOREMAN_FAILED_TURN_MARK}这一轮没跑起来（{kind}）：{reason}");
+        self.note_turn(
+            &session.id,
+            format!("{FOREMAN_FAILED_TURN_MARK}这一轮没跑起来（{kind}）：{reason}"),
+        )
+        .await;
+    }
+
+    /// 落一条**没跑完**的账（决策 223）：这一轮的 future 被 panic 带走时用。
+    ///
+    /// 与 [`Self::record_failed_turn`] 分开的理由是它拿不到 `Error`——`say()` 的失败外框
+    /// 本身就在 panic 里没了，能看见这件事的只有调用方（HTTP 端点拿到 `JoinError`）。
+    /// 会话取**此刻最近活动的未归档班次**：`say()` 已经先把用户那一句落了库，而落库会
+    /// 更新该会话的 `last_active_at`，故那一行就在它里面。
+    pub async fn record_interrupted_turn(&self, why: &str) {
+        let session = match self.store.latest_foreman_session().await {
+            Ok(Some(session)) => session,
+            Ok(None) => return,
+            Err(e) => {
+                tracing::error!("记「没跑完」这一刻读不到班次：{e}");
+                return;
+            }
+        };
+        self.note_turn(
+            &session.id,
+            format!("{FOREMAN_FAILED_TURN_MARK}这一轮没跑完（{why}）：回话没有落库"),
+        )
+        .await;
+    }
+
+    /// 往台账里写一条**操作台自己**的账（`role = system`，决策 207 那条路）。
+    ///
+    /// 写不进去只记日志：要带回去的是「这一轮为什么没成」，不是「记账为什么没成」。
+    async fn note_turn(&self, session_id: &str, content: String) {
         if let Err(e) = self
             .store
-            .append_foreman_message(NewForemanMessage::system(session.id.clone(), content))
+            .append_foreman_message(NewForemanMessage::system(session_id.to_string(), content))
             .await
         {
-            tracing::error!(session = %session.id, "失败回合的留痕也写不进去：{e}");
+            tracing::error!(session = %session_id, "回合留痕写不进去：{e}");
         }
     }
 
@@ -1520,6 +1607,19 @@ impl ForemanRunner {
 
 /// 失败回合在台账里的标记（票 04）。对讲台按它把这一轮渲染成失败轮，不是一个中性轮。
 pub const FOREMAN_FAILED_TURN_MARK: &str = "【没跑起来】";
+
+/// 时限的人话说法（写进失败账里给人看的那一句）。
+///
+/// **整分钟才说分钟**：`max_duration_sec` 是个秒数，90 秒按整除写成「1 分钟」是在少报现场——
+/// 而这一句正是人拿去判断「它到底挂了多久」的东西。
+fn human_duration(limit: std::time::Duration) -> String {
+    let secs = limit.as_secs();
+    if secs >= 60 && secs % 60 == 0 {
+        format!("{} 分钟", secs / 60)
+    } else {
+        format!("{secs} 秒")
+    }
+}
 
 /// 一轮回话失败的归因（票 04）：`(稳定类别, 人话原因)`。
 ///

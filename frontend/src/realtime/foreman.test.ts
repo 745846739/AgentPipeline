@@ -7,9 +7,12 @@ import {
   emptyForemanStream,
   failedLedgerRowIds,
   failForemanStream,
+  failureNotice,
   FOREIGN_TTL_MS,
   foreignIsReplying,
   forgetForeignActive,
+  FOREMAN_TIMEOUT_SUFFIX,
+  isTimeoutMessage,
   ledgerOwnsTheFailure,
   noteForeignDelta,
   pruneForeignActive,
@@ -178,6 +181,20 @@ describe('foreman 流式归约', () => {
 
     // 只有「角色是 system 且带标记」的才算：人的话里引用这个标记不作数
     expect(ledgerOwnsTheFailure([mine], new Set())).toBe(false);
+  });
+
+  it('本地超时不等于这一轮失败：补上「它仍在服务端继续」的实情（决策 223）', () => {
+    // 判据与 `api/client.ts::mapRequestError` 的超时那句同源
+    expect(isTimeoutMessage('请求超时（300 秒没有回应）。')).toBe(true);
+    expect(isTimeoutMessage('配对令牌无效')).toBe(false);
+
+    const timedOut = failureNotice('请求超时（300 秒没有回应）。');
+    expect(timedOut).toContain('请求超时');
+    expect(timedOut).toContain(FOREMAN_TIMEOUT_SUFFIX);
+    // 其余失败**不**加这句话：真失败了还说「仍在继续」是在骗人
+    expect(failureNotice('这一轮没跑起来（llm_auth）：密钥不对')).toBe(
+      '这一轮没跑起来（llm_auth）：密钥不对',
+    );
   });
 });
 
