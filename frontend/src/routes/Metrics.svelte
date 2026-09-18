@@ -107,7 +107,7 @@
   });
 </script>
 
-<div class="page">
+<main class="page">
   <a class="crumb" href="#/">看板</a>
   <div class="p-head">
     <h1 class="p-title">全局指标</h1>
@@ -262,7 +262,7 @@
       </div>
     {/if}
   </section>
-</div>
+</main>
 
 <style>
   .page {

@@ -242,15 +242,26 @@ select {
   opacity: 0.55;
   cursor: not-allowed;
 }
-/* 主动作：go 实心 + ▶ 前缀（前缀由 CSS 生成，故仍会进入可访问名——
-   e2e 的 getByRole 用非精确匹配，前缀不影响命中；见票 03 说明）。 */
+/* 主动作：go 实心 + ▶ 前缀（像素三角用 `clip-path` 画）。
+   此前它是 `content: '▶ '` 的 CSS 文字——CSS 生成的文字同样进可访问名，读屏念「▶ 合入」，
+   `getByRole('button', {name: '合入'})` 也就命中不了（票 06 / R2-19）。
+   换成 `content: ''` + 剪影三角：形状照画，一个字都不进名字。
+   **不用边框三角**：边框宽度在这个仓是受管的像素纪律（只允许 2px 一档，
+   `css-parity.test.ts` 会当场撞红）。 */
 .btn.solid {
   background: var(--go);
   border-color: var(--go);
   color: var(--go-ink);
 }
 .btn.solid::before {
-  content: '▶ ';
+  content: '';
+  display: inline-block;
+  width: 11px;
+  height: 10px;
+  background: currentColor;
+  clip-path: polygon(0 0, 100% 50%, 0 100%);
+  margin-right: 6px;
+  vertical-align: -1px;
 }
 .btn.solid:hover:not(:disabled) {
   background: var(--go-hi);

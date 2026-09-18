@@ -289,7 +289,7 @@ test.describe('前端 E2E ⑨：像素主题（决策 169）', () => {
     expect(heroText).toContain('init');
 
     // 页签 = 工位标签盒：active = wash 实底 + 描边上浮；圆角 0、2px 描边
-    const activeTab = page.locator('nav.tabs .tab.on').first();
+    const activeTab = page.locator('.tabs .tab.on').first();
     await expect(activeTab).toHaveCSS('border-radius', '0px');
     await expect(activeTab).toHaveCSS('border-top-width', '2px');
     const activeBg = await activeTab.evaluate((el) => getComputedStyle(el).backgroundColor);

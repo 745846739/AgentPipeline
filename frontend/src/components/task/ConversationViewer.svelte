@@ -72,6 +72,7 @@
         type="button"
         class="runchip"
         class:now={selectedRunId === c.run_id}
+        aria-pressed={selectedRunId === c.run_id}
         onclick={() => onselect(c.run_id)}
       >
         {c.stage} · {c.node}{c.attempt > 1 ? ` · 尝试 ${c.attempt}` : ''}

@@ -127,7 +127,7 @@
   }
 </script>
 
-<div class="page">
+<main class="page">
   <div class="crumbs">
     <!-- 设置子页给一条回落地页的路（design §4.3），与既有的「← 看板」并列 -->
     <a class="crumb" href="#/settings" onclick={() => router.navigate('/settings')}>← 设置</a>
@@ -234,7 +234,7 @@
       </ul>
     </div>
   {/if}
-</div>
+</main>
 
 <style>
   .page {

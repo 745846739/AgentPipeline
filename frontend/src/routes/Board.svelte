@@ -142,6 +142,9 @@
 </script>
 
 <div class="board" bind:this={scroller} onscroll={measure}>
+  <!-- 看板此前没有标题：读屏进来只听到一片列头，不知道这是哪一页（票 06 / R2-20）。
+       视觉上不摆（列头与脊线已经说清了画面），语义上必须有。 -->
+  <h1 class="visually-hidden">看板</h1>
   <div class="hinner">
     <div class="row rails">
       <!-- A 段：可横滚的六列（站心 x 从 0 计） -->

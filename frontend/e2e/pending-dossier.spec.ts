@@ -56,26 +56,26 @@ test.describe('前端 E2E：档案盒不重复渲染 diff（票 08）', () => {
     await expect(dossier.locator('.dtag')).toContainText('合并提案');
 
     // ── ① 默认停在时间线页签：档案盒内嵌 diff 按原样出现（既定设计，不动） ──
-    const dossierFiles = dossier.getByRole('heading', { level: 4 });
+    const dossierFiles = dossier.getByRole('heading', { level: 3 });
     await expect(dossierFiles.first()).toBeVisible({ timeout: 30_000 });
     const fileCount = await dossierFiles.count();
     expect(fileCount, '合并提案的 diff 里应有可数的文件块').toBeGreaterThan(0);
 
     // ── ② 切到 Diff 页签：主区一份、右栏零份；动作行照旧在右栏 ──
-    await page.locator('nav.tabs button.tab', { hasText: 'Diff' }).click();
+    await page.locator('.tabs button.tab', { hasText: 'Diff' }).click();
     const pane = page.locator('.pane');
-    await expect(pane.getByRole('heading', { level: 4 }).first()).toBeVisible({ timeout: 30_000 });
+    await expect(pane.getByRole('heading', { level: 3 }).first()).toBeVisible({ timeout: 30_000 });
     // 屏上只有这一份：主区同一份 diff 的文件块数与刚才档案盒里的一样多，右栏一个不剩
-    await expect(pane.getByRole('heading', { level: 4 })).toHaveCount(fileCount);
-    await expect(dossier.getByRole('heading', { level: 4 })).toHaveCount(0);
+    await expect(pane.getByRole('heading', { level: 3 })).toHaveCount(fileCount);
+    await expect(dossier.getByRole('heading', { level: 3 })).toHaveCount(0);
 
     // 动作行是红线：右栏始终能拍板，不必先切回别的页签（用户故事 17）
     await expect(dossier.getByRole('button', { name: '合入' })).toBeVisible();
     await expect(dossier.getByRole('button', { name: '返回修改' })).toBeVisible();
 
     // ── ③ 切回时间线：档案盒内嵌 diff 回来，动作行还在 ──
-    await page.locator('nav.tabs button.tab', { hasText: '时间线' }).click();
-    await expect(dossier.getByRole('heading', { level: 4 })).toHaveCount(fileCount);
+    await page.locator('.tabs button.tab', { hasText: '时间线' }).click();
+    await expect(dossier.getByRole('heading', { level: 3 })).toHaveCount(fileCount);
     await expect(dossier.getByRole('button', { name: '合入' })).toBeVisible();
 
     // ── ④ 移动款（<480px）：底部动作坞不受影响 ──
@@ -86,6 +86,6 @@ test.describe('前端 E2E：档案盒不重复渲染 diff（票 08）', () => {
     const dock = page.locator('aside.dock');
     await expect(dock).toBeVisible({ timeout: 30_000 });
     await expect(dock.getByRole('button', { name: '合入' })).toBeVisible();
-    await expect(dock.getByRole('heading', { level: 4 })).toHaveCount(0);
+    await expect(dock.getByRole('heading', { level: 3 })).toHaveCount(0);
   });
 });

@@ -858,7 +858,7 @@
   }
 </script>
 
-<div class="talk">
+<main class="talk">
   <div class="talk-head">
     <h1 class="tt">对讲台</h1>
     <div class="ts">
@@ -1049,6 +1049,7 @@
           type="button"
           class="runchip"
           class:now={s.id === currentId}
+          aria-pressed={s.id === currentId}
           disabled={sending || busy}
           title={s.title}
           onclick={() => void switchTo(s.id)}
@@ -1356,7 +1357,7 @@
       </div>
     </div>
   </aside>
-</div>
+</main>
 
 <style>
   /* 三分区（票 04）：状态区 / 时间线 / 输入坞自上而下。整页钉在视口内，故时间线是

@@ -51,6 +51,7 @@
         type="button"
         class="cmd"
         class:active={selected === file}
+        aria-pressed={selected === file}
         onclick={() => select(file)}
       >
         <span class="c mono">{file}</span>

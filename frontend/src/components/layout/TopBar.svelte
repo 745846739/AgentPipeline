@@ -5,6 +5,7 @@
   import Sprite from '../render/Sprite.svelte';
   import { BOARD_COLUMNS, columnForTask } from '../../lib/pipeline';
   import type { SpriteName } from '../../theme/contract';
+  import { tick } from 'svelte';
 
   const FILTERS: StatusFilter[] = ['all', 'running', 'pending', 'waiting', 'queued', 'done', 'ended'];
 
@@ -82,6 +83,90 @@
     router.navigate(`/task/${id}`);
   }
 
+  /* ─────────────── 待处理下拉：键盘与关闭（票 04 / R2-04） ───────────────
+   *
+   * 它原来播报自己是 `role="menu"`，却没有菜单的**任何**行为：Escape 关不掉、方向键不动、
+   * 点面板外面也不关，触发钮还缺 `aria-controls`。实测 `afterEsc:1 / afterOutside:1`。
+   *
+   * **选的路：降级成普通弹层**（去掉 `role=menu` / `role=menuitem`）。理由：这一栏里每一行
+   * 都是「跳到某个任务详情」的**链接**，链接不是菜单项。补齐 `role=menu` 的契约要求把行播报
+   * 成「菜单项」——那正好丢掉链接语义，而票面边界明令不能为了菜单语义改掉导航语义。
+   * 降级之后行为上补齐三条出口，并把方向键也接上（可选的自在性，不是菜单契约）。
+   */
+  let pendingWrap = $state<HTMLDivElement | null>(null);
+  let pendingTrigger = $state<HTMLButtonElement | null>(null);
+  let pendingPanel = $state<HTMLDivElement | null>(null);
+
+  function pendingItems(): HTMLAnchorElement[] {
+    return pendingPanel ? [...pendingPanel.querySelectorAll<HTMLAnchorElement>('a.dd-item')] : [];
+  }
+
+  function focusPendingItem(index: number): void {
+    const list = pendingItems();
+    if (list.length === 0) return;
+    const n = list.length;
+    list[((index % n) + n) % n].focus();
+  }
+
+  function closePending(returnFocus: boolean): void {
+    board.pendingOpen = false;
+    if (returnFocus) pendingTrigger?.focus();
+  }
+
+  /**
+   * 键盘一律在 `window` 上收（触发钮与面板都不挂 `onkeydown`：那两个落点要么给静态元素挂
+   * 交互处理器、要么把按钮的默认语义扯歪，两条都是 a11y 检查里的红灯）。判据收紧到
+   * ——面板开着，且焦点在触发钮或面板里。
+   */
+  function onWindowKey(e: KeyboardEvent): void {
+    const active = document.activeElement as HTMLElement | null;
+    const onTrigger = !!pendingTrigger && active === pendingTrigger;
+    const inPanel = !!active && !!pendingPanel && pendingPanel.contains(active);
+
+    // 触发钮上按 ArrowDown：打开并把焦点送进第一项（面板刚变可见，要等一次 DOM 刷新）
+    if (e.key === 'ArrowDown' && onTrigger && !board.pendingOpen) {
+      e.preventDefault();
+      board.togglePendingDropdown();
+      void tick().then(() => focusPendingItem(0));
+      return;
+    }
+    if (!board.pendingOpen) return;
+
+    // Escape 一律关得掉——**焦点从没进过面板时也算**（实测里就是这个场景：点开芯片、
+    // 焦点还在芯片上按 Escape）。焦点若在触发钮或面板里，顺带还回去。
+    if (e.key === 'Escape') {
+      closePending(onTrigger || inPanel);
+      return;
+    }
+    if (!onTrigger && !inPanel) return;
+
+    const list = pendingItems();
+    if (list.length === 0) return;
+    const current = list.indexOf(active as HTMLAnchorElement);
+    if (e.key === 'ArrowDown') {
+      e.preventDefault();
+      focusPendingItem(current + 1);
+    } else if (e.key === 'ArrowUp') {
+      e.preventDefault();
+      if (current <= 0) pendingTrigger?.focus();
+      else focusPendingItem(current - 1);
+    } else if (e.key === 'Home') {
+      e.preventDefault();
+      focusPendingItem(0);
+    } else if (e.key === 'End') {
+      e.preventDefault();
+      focusPendingItem(list.length - 1);
+    }
+  }
+
+  /** 点面板外面关掉（含「本来就开着、用户去点别处」那一档）。 */
+  function onWindowClick(e: MouseEvent): void {
+    if (!board.pendingOpen) return;
+    const target = e.target as Node | null;
+    if (target && pendingWrap?.contains(target)) return;
+    board.pendingOpen = false;
+  }
+
   /**
    * 点信号灯缩略条跳段（移动原型 `.rn` + `scrollIntoView`）。
    * 站点带带 `scroll-margin-top: 148px`，故跳到顶时不会被 138px 的顶栏压住。
@@ -91,6 +176,8 @@
     document.getElementById(`s-${key}`)?.scrollIntoView({ block: 'start' });
   }
 </script>
+
+<svelte:window onclick={onWindowClick} onkeydown={onWindowKey} />
 
 <header class="top">
   <div class="topbar">
@@ -139,35 +226,39 @@
         {/each}
       </nav>
 
-      <div class="pending-wrap">
+      <div class="pending-wrap" bind:this={pendingWrap}>
         <button
           type="button"
           class="chip pending-count {board.pendingCount > 0 ? 'pend' : ''}"
           aria-expanded={board.pendingOpen}
+          aria-controls="pending-dropdown"
+          bind:this={pendingTrigger}
           onclick={() => board.togglePendingDropdown()}
         >
           待处理 <span class="c">{board.pendingCount}</span>
         </button>
-        {#if board.pendingOpen}
-          <div class="dropdown panel" role="menu">
-            {#if board.pendingTasks.length === 0}
-              <div class="dd-empty">当前没有待办任务。</div>
-            {:else}
-              {#each board.pendingTasks as task (task.id)}
-                <button
-                  type="button"
-                  class="dd-item"
-                  role="menuitem"
-                  onclick={() => openTask(task.id)}
-                >
-                  <span class="dd-dot"></span>
-                  <span class="dd-title">{task.title}</span>
-                  <span class="dd-msg">{task.pending_reason?.message ?? ''}</span>
-                </button>
-              {/each}
-            {/if}
-          </div>
-        {/if}
+        <!-- 面板**常驻 DOM**、靠 `hidden` 开合（票 04）：`aria-controls` 指过去的目标必须真的
+             存在，IDREF 悬空是另一条会烂掉的账。 -->
+        <div
+          class="dropdown panel"
+          id="pending-dropdown"
+          hidden={!board.pendingOpen}
+          bind:this={pendingPanel}
+        >
+          {#if board.pendingTasks.length === 0}
+            <div class="dd-empty">当前没有待办任务。</div>
+          {:else}
+            {#each board.pendingTasks as task (task.id)}
+              <!-- 每一行是一个**链接**（跳任务详情），不是菜单项——这正是选降级而不是补齐
+                   `role=menu` 的理由：菜单项会盖掉链接语义。 -->
+              <a class="dd-item" href="#/task/{task.id}" onclick={() => openTask(task.id)}>
+                <span class="dd-dot"></span>
+                <span class="dd-title">{task.title}</span>
+                <span class="dd-msg">{task.pending_reason?.message ?? ''}</span>
+              </a>
+            {/each}
+          {/if}
+        </div>
       </div>
 
       <button type="button" class="btn btn-new" onclick={() => (newTaskOpen = true)}>新建任务</button>
@@ -180,6 +271,7 @@
         href="#{item.path}"
         class="chip navchip"
         class:on={item.routes.includes(router.route.name)}
+        aria-current={item.routes.includes(router.route.name) ? 'page' : undefined}
         onclick={() => router.navigate(item.path)}
       >
         <span class="ic"><Sprite name={item.sprite} /></span>{item.label}
@@ -352,9 +444,16 @@
     border-color: var(--text-hi);
     color: var(--text-hi);
   }
+  /* 选中芯片的前缀三角：剪影画（`clip-path`），一个字都不进可访问名（票 06 / R2-19） */
   .chip.on::before {
-    content: '▶ ';
-    color: var(--go);
+    content: '';
+    display: inline-block;
+    width: 10px;
+    height: 9px;
+    background: var(--go);
+    clip-path: polygon(0 0, 100% 50%, 0 100%);
+    margin-right: 5px;
+    vertical-align: -1px;
   }
   .chip .ic {
     display: inline-flex;
@@ -422,6 +521,10 @@
     padding: 6px;
     z-index: 30;
   }
+  /* 常驻 DOM + `hidden` 开合（票 04）：显式写出来，免得将来哪条 `display` 规则把它顶掉 */
+  .dropdown[hidden] {
+    display: none;
+  }
   .dd-empty {
     padding: 10px 12px;
     color: var(--text-3);
@@ -438,6 +541,7 @@
   }
   .dd-item:hover {
     background: var(--wash);
+    text-decoration: none;
   }
   .dd-dot::before {
     content: '!';

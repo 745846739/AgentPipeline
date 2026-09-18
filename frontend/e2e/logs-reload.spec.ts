@@ -37,7 +37,7 @@ test.describe('前端 E2E ⑦：日志对话可信 + 刷新恢复', () => {
       await settleBundle(page, bundle);
 
       // ── 实时流：页面不刷新，命令与输出计数从 0（或少量）涨到出现 git commit ──
-      const tabButton = page.getByRole('button', { name: /命令与输出/ });
+      const tabButton = page.getByRole('tab', { name: /命令与输出/ });
       await expect(tabButton).toBeVisible();
       await waitForTask(
         app,
@@ -58,7 +58,7 @@ test.describe('前端 E2E ⑦：日志对话可信 + 刷新恢复', () => {
       await expect(page.locator('.cmd, li, .row', { hasText: "commit -m 'feat: task" })).toBeVisible();
 
       // ── 会话内容：review.execute 的对话含脚本 text 步骤的原文 ──
-      await page.getByRole('button', { name: /会话/ }).click();
+      await page.getByRole('tab', { name: /会话/ }).click();
       const reviewChip = page.locator('.runchip', { hasText: 'review' }).first();
       await reviewChip.click();
       await expect(

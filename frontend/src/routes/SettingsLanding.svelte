@@ -77,7 +77,7 @@
   }));
 </script>
 
-<div class="page">
+<main class="page">
   <div class="p-head">
     <h1 class="p-title">设置</h1>
   </div>
@@ -104,7 +104,7 @@
       </ul>
     </section>
   {/each}
-</div>
+</main>
 
 <style>
   .page {

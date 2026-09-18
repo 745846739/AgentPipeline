@@ -68,6 +68,8 @@ class TaskDetailStore {
   private streamManager: StreamManager;
   private refetchTimer: ReturnType<typeof setTimeout> | null = null;
   private busyTimer: ReturnType<typeof setTimeout> | null = null;
+  /** 正在飞的对话框动作（重入时把同一个 promise 交回，见 `submitDialogAction`）。 */
+  private dialogInFlight: Promise<void> | null = null;
 
   constructor() {
     this.streamManager = new StreamManager({
@@ -325,27 +327,50 @@ class TaskDetailStore {
   /** 拆分任务（旁路动作 split_task 的表单提交）。 */
   async submitSplit(tasks: SplitTaskSpec[]): Promise<void> {
     if (!this.id) return;
-    this.actionError = null;
-    try {
-      await splitTask(this.id, tasks);
-      void this.load(this.id, true);
-    } catch (err) {
-      this.actionError = (err as Error).message;
-      throw err;
-    }
+    await this.submitDialogAction('split_task:', () => splitTask(this.id!, tasks));
   }
 
   /** 更换任务级模型（旁路动作 model_override 的表单提交）。 */
   async submitModelOverride(providerId: string): Promise<void> {
     if (!this.id) return;
+    await this.submitDialogAction('model_override:', () => modelOverrideTask(this.id!, providerId));
+  }
+
+  /**
+   * 两个对话框动作的共同口径（票 03 / R2-03）。
+   *
+   * 此前这一对**从不设 `busyKey`**，而两个对话框拿的正是 `busyKey !== null` → `submitting`
+   * 恒为 false：按钮不禁用、没有转圈，慢网络下再点一次就发出第二个 `POST /tasks/{id}/split`
+   * ——原任务被取消两次、子任务建两套。这里补齐三件事：
+   *
+   * 1. **进「提交中」态**（`busyKey`），对话框的 `submitting` 才真的生效；
+   * 2. **重入护栏**：in-flight 期间同一个动作再来一次，交回**同一个 promise**——
+   *    不产生第二个请求，调用方也不会把「什么都没发生」当成功（禁用的按钮是第一道，
+   *    这是第二道：两次点击可能落在同一次重渲染之前）；
+   * 3. 成功**不立即复位**：与 `runAllowedAction` 同一条口径，等 SSE 回执，30s safety timeout 兜底。
+   */
+  private submitDialogAction(key: string, send: () => Promise<unknown>): Promise<void> {
+    if (this.busyKey === key && this.dialogInFlight) return this.dialogInFlight;
+    this.busyKey = key;
     this.actionError = null;
-    try {
-      await modelOverrideTask(this.id, providerId);
-      void this.load(this.id, true);
-    } catch (err) {
-      this.actionError = (err as Error).message;
-      throw err;
-    }
+    const done = (async () => {
+      try {
+        await send();
+        // 成功之后照旧重读一次（端点回读是权威，SSE 之外的第二条路）
+        void this.load(this.id ?? undefined, true);
+        this.busyTimer = setTimeout(() => {
+          if (this.busyKey === key) this.clearBusy();
+        }, 30_000);
+      } catch (err) {
+        this.actionError = (err as Error).message;
+        this.clearBusy();
+        throw err;
+      } finally {
+        this.dialogInFlight = null;
+      }
+    })();
+    this.dialogInFlight = done;
+    return done;
   }
 
   /** 人工评审表单（review_mode = human）：通过 / 打回并附意见。 */

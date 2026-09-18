@@ -197,7 +197,7 @@
   }
 </script>
 
-<div class="page">
+<main class="page">
   <a class="crumb" href="#/">← 看板</a>
   <div class="p-head">
     <h1 class="p-title">设置 · 项目</h1>
@@ -329,7 +329,7 @@
       </section>
     {/if}
   {/if}
-</div>
+</main>
 
 <style>
   .page {

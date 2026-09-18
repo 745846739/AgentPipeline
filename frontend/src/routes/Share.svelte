@@ -185,7 +185,7 @@
   }
 </script>
 
-<div class="page">
+<main class="page">
   <a class="crumb" href="#/">← 看板</a>
   <div class="p-head">
     <h1 class="p-title">手机访问</h1>
@@ -321,6 +321,7 @@ host = "0.0.0.0"</code></pre>
                   <button
                     type="button"
                     class="alt-item {a.url === selected ? 'on' : ''}"
+                    aria-pressed={a.url === selected}
                     onclick={() => (selected = a.url)}
                   >
                     <span class="iface">{a.interface}</span>
@@ -383,7 +384,7 @@ host = "0.0.0.0"</code></pre>
       {#if switchError}<p class="note bad">{switchError}</p>{/if}
     {/if}
   {/if}
-</div>
+</main>
 
 <style>
   .page {

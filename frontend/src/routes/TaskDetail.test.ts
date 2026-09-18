@@ -133,7 +133,7 @@ function armPendingMerge(): void {
 const dossier = () => screen.getByRole('complementary', { name: '待办' });
 /** diff 正文里的文件块标题（DiffView 的每个文件一个 h4）——用户看见的「一份 diff」。 */
 const diffHeadings = (scope: HTMLElement | Document = document) =>
-  within(scope as HTMLElement).queryAllByRole('heading', { level: 4, name: /lib\.js/ });
+  within(scope as HTMLElement).queryAllByRole('heading', { level: 3, name: /lib\.js/ });
 
 beforeAll(() => {
   // jsdom 不实现 matchMedia；详情页用它判断移动款（<480px），这里一律桌面档。
@@ -161,7 +161,7 @@ describe('任务详情 · 档案盒与 Diff 页签不同时摆两份 diff（票 
     armPendingMerge();
     render(TaskDetail, { props: { id: 'task-1' } });
 
-    await fireEvent.click(screen.getByRole('button', { name: 'Diff' }));
+    await fireEvent.click(screen.getByRole('tab', { name: 'Diff' }));
 
     // 屏上只有一份 diff 正文：那一份在主区
     expect(diffHeadings()).toHaveLength(1);
@@ -180,10 +180,10 @@ describe('任务详情 · 档案盒与 Diff 页签不同时摆两份 diff（票 
     expect(diffHeadings(dossier())).toHaveLength(1);
     expect(within(dossier()).getByRole('button', { name: '合入' })).toBeTruthy();
 
-    await fireEvent.click(screen.getByRole('button', { name: 'Diff' }));
+    await fireEvent.click(screen.getByRole('tab', { name: 'Diff' }));
     expect(diffHeadings(dossier())).toHaveLength(0);
 
-    await fireEvent.click(screen.getByRole('button', { name: '时间线' }));
+    await fireEvent.click(screen.getByRole('tab', { name: '时间线' }));
     expect(diffHeadings(dossier())).toHaveLength(1);
   });
 
@@ -208,7 +208,7 @@ describe('任务详情 · 档案盒与 Diff 页签不同时摆两份 diff（票 
     // 时间线页签：评审面板里的 diff 在右栏（主区是时间线）
     expect(diffHeadings(dossier())).toHaveLength(1);
 
-    await fireEvent.click(screen.getByRole('button', { name: 'Diff' }));
+    await fireEvent.click(screen.getByRole('tab', { name: 'Diff' }));
     expect(diffHeadings(dossier())).toHaveLength(0);
     expect(within(dossier()).getByRole('button', { name: '通过' })).toBeTruthy();
   });
@@ -229,6 +229,62 @@ describe('任务详情 · 任务级入口（票 06 / 07）', () => {
 
     const link = screen.getByRole('link', { name: /分析所属项目/ });
     expect(link.getAttribute('href')).toBe('#/settings/projects?project=proj-9&analyze=1');
+  });
+});
+
+describe('任务详情 · 页签语义与标题层级（票 06 / R2-19 / R2-20）', () => {
+  it('页签是 tablist/tab + aria-selected + aria-controls，面板是 tabpanel', () => {
+    armPendingMerge();
+    render(TaskDetail, { props: { id: 'task-1' } });
+
+    const tablist = screen.getByRole('tablist', { name: '任务详情页签' });
+    const tabs = within(tablist).getAllByRole('tab');
+    expect(tabs.map((t) => t.textContent?.trim())).toEqual([
+      '时间线',
+      '会话',
+      '命令与输出0',
+      '产出文件',
+      'Diff',
+    ]);
+    // 选中态是给读屏的那一个属性，不只是 class
+    expect(within(tablist).getByRole('tab', { name: '时间线' }).getAttribute('aria-selected')).toBe(
+      'true',
+    );
+    expect(within(tablist).getByRole('tab', { name: 'Diff' }).getAttribute('aria-selected')).toBe(
+      'false',
+    );
+    // aria-controls 指向真面板
+    expect(screen.getByRole('tabpanel').id).toBe('detail-pane');
+    expect(
+      within(tablist).getByRole('tab', { name: '时间线' }).getAttribute('aria-controls'),
+    ).toBe('detail-pane');
+  });
+
+  it('方向键在页签间走，焦点跟着选中项（Home/End 到两端）', async () => {
+    armPendingMerge();
+    render(TaskDetail, { props: { id: 'task-1' } });
+    const tablist = screen.getByRole('tablist', { name: '任务详情页签' });
+
+    await fireEvent.keyDown(tablist, { key: 'ArrowRight' });
+    expect(screen.getByRole('tab', { name: '会话' }).getAttribute('aria-selected')).toBe('true');
+
+    await fireEvent.keyDown(tablist, { key: 'End' });
+    expect(screen.getByRole('tab', { name: 'Diff' }).getAttribute('aria-selected')).toBe('true');
+
+    await fireEvent.keyDown(tablist, { key: 'Home' });
+    expect(screen.getByRole('tab', { name: '时间线' }).getAttribute('aria-selected')).toBe('true');
+  });
+
+  it('标题层级不断级：h1 之下有 h2，Diff 的文件块是 h3（不再是 h1 → h4）', async () => {
+    armPendingMerge();
+    render(TaskDetail, { props: { id: 'task-1' } });
+
+    expect(screen.getAllByRole('heading', { level: 1 })).toHaveLength(1);
+    expect(screen.getAllByRole('heading', { level: 2 }).length).toBeGreaterThan(0);
+
+    await fireEvent.click(screen.getByRole('tab', { name: 'Diff' }));
+    expect(screen.getAllByRole('heading', { level: 3, name: /lib\.js/ }).length).toBeGreaterThan(0);
+    expect(screen.queryAllByRole('heading', { level: 4 })).toHaveLength(0);
   });
 });
 

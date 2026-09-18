@@ -1,5 +1,5 @@
 <script lang="ts">
-  import { onDestroy, onMount } from 'svelte';
+  import { onDestroy, onMount, tick } from 'svelte';
   import { archiveTask, getForemanSessions, listProviders, retryTask, setStewardship } from '../api/client';
   import type { AllowedAction, Provider } from '../api/types';
   import PipelineRail from '../components/pipeline/PipelineRail.svelte';
@@ -23,6 +23,15 @@
   let { id }: Props = $props();
 
   type Tab = 'timeline' | 'conversation' | 'commands' | 'files' | 'diff';
+  /** 页签顺序（方向键与 Home/End 按它走）与各自的词（面板标题用它）。 */
+  const TAB_ORDER: Tab[] = ['timeline', 'conversation', 'commands', 'files', 'diff'];
+  const TAB_LABELS: Record<Tab, string> = {
+    timeline: '时间线',
+    conversation: '会话',
+    commands: '命令与输出',
+    files: '产出文件',
+    diff: 'Diff',
+  };
   let tab = $state<Tab>('timeline');
   let selectedRunId = $state<number | null>(null);
   let splitOpen = $state(false);
@@ -142,6 +151,29 @@
     void taskDetail.runAllowedAction(action, opts).catch(() => undefined);
   }
 
+  /**
+   * 页签的方向键（票 06 / R2-19）：`role="tablist"` 的契约要求方向键能在页签间走
+   * （左右循环、Home/End 到两端），并且**焦点跟着选中的页签走**（roving tabindex）——
+   * 只在选中项上按左右键也能一路切过去。
+   */
+  function onTabKey(e: KeyboardEvent) {
+    if (!['ArrowLeft', 'ArrowRight', 'Home', 'End'].includes(e.key)) return;
+    const list = TAB_ORDER.filter((t) => t !== 'diff' || showDiffTab);
+    if (list.length === 0) return;
+    e.preventDefault();
+    const i = list.indexOf(tab);
+    const next =
+      e.key === 'Home'
+        ? list[0]
+        : e.key === 'End'
+          ? list[list.length - 1]
+          : e.key === 'ArrowLeft'
+            ? list[(i - 1 + list.length) % list.length]
+            : list[(i + 1) % list.length];
+    tab = next;
+    void tick().then(() => document.getElementById(`tab-${next}`)?.focus());
+  }
+
   function gotoconversation(stage: string, node: string) {
     const match = detail.conversations.find((c) => c.stage === stage && c.node === node);
     tab = 'conversation';
@@ -233,7 +265,7 @@
   {/if}
 {/snippet}
 
-<div
+<main
   class="detail"
   class:split={isPending}
   class:docked={isMobile && isPending}
@@ -361,23 +393,47 @@
         <div class="terminal {detail.terminal}">任务已{detail.terminal === 'done' ? '完成' : detail.terminal === 'failed' ? '失败' : '取消'}。</div>
       {/if}
 
-      <nav class="tabs" class:no-scrollbar={isMobile} aria-label="任务详情页签">
-        <button type="button" class="tab" class:on={tab === 'timeline'} onclick={() => (tab = 'timeline')}>时间线</button>
-        <button type="button" class="tab" class:on={tab === 'conversation'} onclick={() => (tab = 'conversation')}>
-          会话
-        </button>
-        <button type="button" class="tab" class:on={tab === 'commands'} onclick={() => (tab = 'commands')}>
-          命令与输出<span class="c">{detail.commands.length}</span>
-        </button>
-        <button type="button" class="tab" class:on={tab === 'files'} onclick={() => (tab = 'files')}>产出文件</button>
-        {#if showDiffTab}
-          <button type="button" class="tab" class:on={tab === 'diff'} onclick={() => (tab = 'diff')}>Diff</button>
-        {:else}
-          <button type="button" class="tab dis" disabled>Diff ─ merge 后生成</button>
-        {/if}
-      </nav>
+      <!-- 真页签（票 06 / R2-19）：`role=tablist` + 每格 `role=tab` + `aria-selected`
+           + `aria-controls` 指向面板；方向键在页签间走、焦点跟着选中项走（roving tabindex）。
+           元素从 `<nav>` 换成 `<div>`：页签不是导航地标，`nav` + `tablist` 这个组合本身
+           就是错的（Svelte 的 a11y 检查直接点名）。
+           容器**不必可聚焦**：焦点住在那几格上（选中的那一格 `tabindex=0`）——这是 APG 的
+           tablist 模式，Svelte 那条检查不认，故就地忽略并在此说明。 -->
+      <!-- svelte-ignore a11y_interactive_supports_focus -->
+      <div
+        class="tabs"
+        class:no-scrollbar={isMobile}
+        role="tablist"
+        aria-label="任务详情页签"
+        onkeydown={onTabKey}
+      >
+        {#each TAB_ORDER as t (t)}
+          {#if t === 'diff' && !showDiffTab}
+            <button type="button" class="tab dis" role="tab" aria-selected="false" disabled>
+              Diff ─ merge 后生成
+            </button>
+          {:else}
+            <button
+              type="button"
+              class="tab"
+              class:on={tab === t}
+              id={`tab-${t}`}
+              role="tab"
+              aria-selected={tab === t}
+              aria-controls="detail-pane"
+              tabindex={tab === t ? 0 : -1}
+              onclick={() => (tab = t)}
+            >
+              {TAB_LABELS[t]}{#if t === 'commands'}<span class="c">{detail.commands.length}</span>{/if}
+            </button>
+          {/if}
+        {/each}
+      </div>
 
-      <div class="pane">
+      <div class="pane" id="detail-pane" role="tabpanel" aria-labelledby={`tab-${tab}`}>
+        <!-- 面板的标题（票 06 / R2-20）：详情页此前从 h1 直接跳到 Diff 里的 h4，
+             中间整两级没人管——读屏按标题跳转时等于没有落点。视觉上不摆（页签已经写着）。 -->
+        <h2 class="visually-hidden">{TAB_LABELS[tab]}</h2>
         {#if tab === 'timeline'}
           <TimelineView
             transitions={detail.transitions}
@@ -474,7 +530,7 @@
       onsubmitreview={(approved, comments) => void taskDetail.submitReview(approved, comments).catch(() => undefined)}
     />
   {/if}
-</div>
+</main>
 
 <SplitDialog
   open={splitOpen}
@@ -605,8 +661,14 @@
     color: var(--text-hi);
   }
   .steward .btn.on::before {
-    content: '▶ ';
-    color: var(--go);
+    content: '';
+    display: inline-block;
+    width: 10px;
+    height: 9px;
+    background: var(--go);
+    clip-path: polygon(0 0, 100% 50%, 0 100%);
+    margin-right: 5px;
+    vertical-align: -1px;
   }
   /* 按下失败的原因就地说（不弹窗）：终态任务与未接线那两句是端点给的、原样透传，
      故它用的是失败红档而不是琥珀——琥珀全站只留给急停（决策 203）。 */

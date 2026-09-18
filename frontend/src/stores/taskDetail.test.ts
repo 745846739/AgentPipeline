@@ -26,6 +26,8 @@ const mocks = vi.hoisted(() => {
     getFlow: vi.fn(),
     getConversations: vi.fn(),
     getCommands: vi.fn(),
+    splitTask: vi.fn(),
+    modelOverrideTask: vi.fn(),
     sync: vi.fn(),
   };
 });
@@ -36,13 +38,13 @@ vi.mock('../api/client', () => ({
   getFlow: mocks.getFlow,
   getConversations: mocks.getConversations,
   getCommands: mocks.getCommands,
+  splitTask: mocks.splitTask,
+  modelOverrideTask: mocks.modelOverrideTask,
   // 本用例走不到，但被测模块要能 import
   getCommandOutput: vi.fn(),
   getConversation: vi.fn(),
   getTaskFile: vi.fn(),
-  modelOverrideTask: vi.fn(),
   reviewTask: vi.fn(),
-  splitTask: vi.fn(),
 }));
 
 vi.mock('../realtime/connection', () => ({
@@ -114,6 +116,8 @@ beforeEach(() => {
   mocks.getFlow.mockReset().mockResolvedValue({ transitions: [] });
   mocks.getConversations.mockReset().mockResolvedValue([]);
   mocks.getCommands.mockReset().mockResolvedValue([]);
+  mocks.splitTask.mockReset();
+  mocks.modelOverrideTask.mockReset();
   mocks.sync.mockReset();
   armLoadedA();
 });
@@ -184,5 +188,56 @@ describe('详情页装载失败不留上一个任务（票 01 / R2-01）', () =>
     expect(taskDetail.state.task?.id).toBe('B');
     expect(taskDetail.error).toBeNull();
     expect(mocks.sync).toHaveBeenCalledWith(['B']);
+  });
+});
+
+describe('对话框动作的提交中态与重入护栏（票 03 / R2-03）', () => {
+  /** 一个悬挂的 split 请求：resolve 由用例自己放行。 */
+  function hangingSplit(): { release: () => void } {
+    let release = (): void => undefined;
+    mocks.splitTask.mockImplementation(
+      () => new Promise<void>((resolve) => (release = resolve)),
+    );
+    return { release: () => release() };
+  }
+
+  it('in-flight 期间 busyKey 非空（对话框的 submitting 才真的生效）', async () => {
+    const { release } = hangingSplit();
+    const pending = taskDetail.submitSplit([{ title: '子任务' }]);
+
+    expect(taskDetail.busyKey).toBe('split_task:');
+    // 对话框拿的正是这一个判据
+    expect(taskDetail.busyKey !== null).toBe(true);
+
+    release();
+    await pending;
+  });
+
+  it('in-flight 期间第二次调用不产生第二个请求（双击不会建两套子任务）', async () => {
+    const { release } = hangingSplit();
+    const first = taskDetail.submitSplit([{ title: '子任务' }]);
+    const second = taskDetail.submitSplit([{ title: '子任务' }]);
+
+    expect(mocks.splitTask).toHaveBeenCalledTimes(1);
+
+    release();
+    await Promise.all([first, second]);
+  });
+
+  it('失败：错误可读、busy 复位（按钮不卡在转圈上）', async () => {
+    mocks.splitTask.mockRejectedValue(new mocks.ApiError(500, '拆不开'));
+
+    await expect(taskDetail.submitSplit([{ title: '子任务' }])).rejects.toThrow('拆不开');
+
+    expect(taskDetail.actionError).toBe('拆不开');
+    expect(taskDetail.busyKey).toBeNull();
+  });
+
+  it('换模型与拆分互不干扰：各自进自己的提交中态', async () => {
+    mocks.modelOverrideTask.mockImplementation(() => new Promise<void>(() => undefined));
+    void taskDetail.submitModelOverride('p-1');
+
+    expect(taskDetail.busyKey).toBe('model_override:');
+    expect(mocks.modelOverrideTask).toHaveBeenCalledTimes(1);
   });
 });

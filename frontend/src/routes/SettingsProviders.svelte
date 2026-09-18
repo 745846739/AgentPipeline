@@ -148,7 +148,7 @@
      ——两边各留一套编辑器会让同一个 `PUT /stage-configs/{stage}` 互相覆盖。 */
 </script>
 
-<div class="page">
+<main class="page">
   <a class="crumb" href="#/">← 看板</a>
   <div class="p-head">
     <h1 class="p-title">设置 · 模型与密钥</h1>
@@ -274,7 +274,7 @@
     oninstall={installRecommended}
   />
   {#if skillError}<div class="error skills-error">{skillError}</div>{/if}
-</div>
+</main>
 
 <style>
   .page {

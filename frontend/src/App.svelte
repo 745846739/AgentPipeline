@@ -15,12 +15,40 @@
   import Share from './routes/Share.svelte';
   import Talk from './routes/Talk.svelte';
   import TaskDetail from './routes/TaskDetail.svelte';
-  import { router } from './router.svelte';
+  import { router, type Route } from './router.svelte';
   import { board } from './stores/board.svelte';
+  import { taskDetail } from './stores/taskDetail.svelte';
 
   const route = $derived(router.route);
   const taskId = $derived(route.name === 'task' ? route.id : null);
   const notFoundPath = $derived(route.name === 'not-found' ? route.path : '');
+
+  /**
+   * 每个路由一个 `document.title`（票 06 / R2-20）。
+   *
+   * 此前 11 条路由共用 `index.html` 里那一个 `AgentPipeline · 像素机房`——标签页、前进后退的
+   * 历史、书签全都分不清哪是哪。任务详情再带上**任务标题**：那一页的「这一页是什么」就是它。
+   */
+  const ROUTE_TITLES: Record<Route['name'], string> = {
+    board: '看板',
+    talk: '对讲台',
+    task: '任务详情',
+    metrics: '指标',
+    'settings-landing': '设置',
+    'settings-projects': '设置 · 项目',
+    'settings-providers': '设置 · 模型与密钥',
+    'settings-stages': '设置 · 阶段配置',
+    'settings-market': '设置 · 技能市场',
+    share: '手机访问',
+    'not-found': '页面不存在',
+  };
+  const BASE_TITLE = 'AgentPipeline · 像素机房';
+
+  $effect(() => {
+    const name = route.name;
+    const taskTitle = name === 'task' ? taskDetail.state.task?.title : null;
+    document.title = `${taskTitle ?? ROUTE_TITLES[name]} · ${BASE_TITLE}`;
+  });
 
   onMount(() => {
     void board.init();
@@ -57,15 +85,17 @@
   <Share />
 {:else}
   <!-- 404 给一条回看板的路（票 03）：与其余空态同一套语汇（状态 → 下一步 → 入口）。
-       `route.path` 已经是干净的路由名（不带 hash 路由里恒有的 `#`），照原样显示即可。 -->
-  <div class="notfound">
+       `route.path` 已经是干净的路由名（不带 hash 路由里恒有的 `#`），照原样显示即可。
+       标题与地标照其余路由补齐（票 06 / R2-20）：404 此前既没有 `<h1>` 也没有 `<main>`。 -->
+  <main class="notfound">
+    <h1 class="visually-hidden">页面不存在</h1>
     <EmptyState
       state={`页面不存在：${notFoundPath}`}
       next="这个地址没有对应的页面。回看板看看任务现在跑到哪了。"
       href="#/"
       linkLabel="回看板"
     />
-  </div>
+  </main>
 {/if}
 
 <ToastStack />

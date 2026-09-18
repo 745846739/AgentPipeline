@@ -18,11 +18,11 @@
 {#if parsed && parsed.files.length > 0}
   {#each parsed.files as file (file.path)}
     <div class="dfile">
-      <h4>
+      <h3>
         <span class="path mono">{file.path}</span>
         <span class="st {file.status}">{statusLabel[file.status]}</span>
         <span class="fstat mono">+{file.additions} −{file.deletions}</span>
-      </h4>
+      </h3>
       <div class="dbody">
         {#each file.lines as line, i (i)}
           <div class="dl {line.kind}">{line.text}</div>
@@ -44,7 +44,7 @@
   .dfile {
     margin-bottom: 14px;
   }
-  .dfile h4 {
+  .dfile h3 {
     display: flex;
     align-items: center;
     gap: 8px;

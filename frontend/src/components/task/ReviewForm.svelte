@@ -51,7 +51,7 @@
     {#if error}<div class="error">{error}</div>{/if}
 
     <section class="block">
-      <h4 class="cond">变更 diff</h4>
+      <h3 class="cond">变更 diff</h3>
       {#if onreload}
         <button type="button" class="btn quiet small" onclick={onreload}>刷新</button>
       {/if}
@@ -67,7 +67,7 @@
     </section>
 
     <section class="block">
-      <h4 class="cond">agent 预审报告</h4>
+      <h3 class="cond">agent 预审报告</h3>
       {#if reviewReport}
         <MarkdownView source={reviewReport} />
       {:else}
@@ -76,7 +76,7 @@
     </section>
 
     <section class="block">
-      <h4 class="cond">单元测试结果</h4>
+      <h3 class="cond">单元测试结果</h3>
       {#if unitTestReport}
         <MarkdownView source={unitTestReport} />
       {:else}
@@ -120,7 +120,7 @@
   .block {
     margin-bottom: 18px;
   }
-  .block h4 {
+  .block h3 {
     font-size: 12px;
     color: var(--text-3);
     margin-bottom: 8px;

@@ -72,7 +72,7 @@ test.describe('UX2 ① 详情失败态与终态动作（票 01 / 02）', () => {
     // 上一个任务的一切都不在屏上：标题、页签、六颗拍板按钮（它们会提交到那个坏 id）
     await expect(page.locator('body')).not.toContainText(title);
     await expect(page.locator('.d-title')).toHaveCount(0);
-    await expect(page.getByRole('button', { name: '时间线' })).toHaveCount(0);
+    await expect(page.getByRole('tab', { name: '时间线' })).toHaveCount(0);
     await expect(page.getByRole('button', { name: '合入' })).toHaveCount(0);
     // 空态可达，且带一条出路（横幅与空态各说一遍同一句，取第一处即可）
     await expect(page.getByRole('alert')).toContainText('任务不存在');
