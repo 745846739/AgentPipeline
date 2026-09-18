@@ -648,6 +648,8 @@ GET /tasks/{id}               → 详情页装载 + 断线重连后的全量校�
 | 值班长的增量按会话身份归位；发送窗口里换了班次则不落地 | `frontend/src/realtime/foreman.ts`、`frontend/src/routes/Talk.svelte` | 决策 204 |
 | 技能市场：仓名单保存即生效；装前预览三项（去向 / 模式与信任态 / 特征扫描） | `frontend/src/routes/SettingsMarket.svelte`、`frontend/src/components/settings/StageRecommendations.svelte` | 决策 187 / 194 / 181 |
 | 未受信任的技能不得以全文模式保存（界面上就地改写信任态） | `frontend/src/components/settings/SkillDeclList.svelte`、`frontend/src/lib/stageConfigs.ts` | 决策 172 / 181 |
+| 推荐行三态：未装给「安装」、已装而本阶段未声明给「启用」、已装且本阶段已声明只读——**判据是「本阶段是否声明」，不是「是否安装」** | `frontend/src/components/settings/StageRecommendations.svelte` | 决策 214①；票 16 第 14 行那条验收的界面落点（票 01）；判据 `config::skill_declared_in_stage` |
+| 推荐行标出来源：`owner/repo · 技能目录`，是**指针**不带 commit，两段取不到就只省掉这一段（推荐行照旧在） | `frontend/src/components/settings/StageRecommendations.svelte` | 决策 194 / 214④；票 02 |
 | 「手机访问」取不到配对令牌就不画二维码 | `frontend/src/routes/Share.svelte`、`frontend/src/lib/sharePairing.ts` | 决策 189 |
 | 绑定开关只由回环来源发起；界面说出「这次绑定是谁定的」 | `frontend/src/routes/Share.svelte`、`frontend/src/lib/lanToggle.ts` | 决策 186 |
 | 端口不是配置里那个（被别的程序占着，退让到临时端口）时，分享页说出「这次为什么变了」 | `frontend/src/routes/Share.svelte`、`frontend/src/lib/sharePairing.ts` | 决策 213；判定在 `portFallbackNote`，只绑回环时不说 |
