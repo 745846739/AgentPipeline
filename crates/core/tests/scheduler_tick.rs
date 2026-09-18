@@ -807,6 +807,7 @@ async fn maintenance_refreshes_totals_and_purges_expired_conversations() {
             None,
             &serde_json::json!([{"role": "user", "content": "x"}]),
             None,
+            None,
             200,
             100,
         )

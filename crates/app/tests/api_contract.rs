@@ -758,6 +758,7 @@ async fn retry_archives_old_conversations_and_default_list_excludes_them() {
             None,
             &serde_json::json!([{"role": "user", "content": "旧 attempt"}]),
             None,
+            None,
             10,
             5,
         )
@@ -826,6 +827,7 @@ async fn conversation_messages_endpoint_returns_messages_and_is_task_scoped() {
                 {"role": "user", "content": "实现登录"},
                 {"role": "assistant", "content": "好的"}
             ]),
+            None,
             None,
             10,
             5,
@@ -1767,6 +1769,7 @@ async fn flow_metrics_and_conversations_endpoints() {
             "main",
             None,
             &serde_json::json!([{"role": "system", "content": "x"}]),
+            None,
             Some(&serde_json::json!({"readiness": true})),
             100,
             50,

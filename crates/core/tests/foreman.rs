@@ -519,6 +519,7 @@ async fn read_conversation_tool_returns_the_workshop_receipt() {
                 {"role": "assistant", "content": "改完了，在 src/auth.rs:42"}
             ]),
             None,
+            None,
             120,
             45,
         )

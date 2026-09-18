@@ -226,6 +226,7 @@ pub async fn analyze(
                                     1,
                                     PseudoStage::ProjectAnalysis.agent_type(),
                                     &messages,
+                                    None,
                                     Some(&merged),
                                     0,
                                     0,

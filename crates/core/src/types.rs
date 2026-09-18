@@ -1195,6 +1195,13 @@ pub struct NodeConversation {
     pub agent_type: String,
     pub parent_run_id: Option<i64>,
     pub messages_json: serde_json::Value,
+    /// 组装后**系统段**的原文（决策 211② / 票 02）。原文是权威，
+    /// `kanban_node_runs.prompt_template_hash` 降级为「两次跑的是不是同一份」的快速索引。
+    /// 空 = 这一列落地之前落的历史行，或本就不调 LLM 的 run。
+    pub system_prompt: Option<String>,
+    /// 组装后**用户段**的原文（同上）。落库的 `messages` 里没有这两段——它们只在适配器
+    /// 组装 HTTP body 时才被前置，从不回写，所以「这是 prompt 问题」此前无从核对。
+    pub user_prompt: Option<String>,
     pub metadata_json: Option<serde_json::Value>,
     pub prompt_tokens: u32,
     pub completion_tokens: u32,

@@ -235,6 +235,7 @@ impl SubAgentRunner for StoreSubAgentRunner {
             let mut session = SubAgentSession {
                 run_id,
                 system_prompt,
+                user_prompt: request.task.clone(),
                 tools,
                 ctx,
                 tokens: std::sync::Mutex::new(RunTokens::default()),
@@ -274,14 +275,14 @@ impl SubAgentRunner for StoreSubAgentRunner {
                         tokens_now,
                     )
                     .await?;
-                    write_conversation(cfg, run_id, &session.transcript, tokens_now).await?;
+                    write_conversation(cfg, &session, tokens_now).await?;
                     return Ok(text);
                 }
                 Ok(Ok(summary)) => (summary, NodeStatus::Success, None),
             };
 
             finish_run(&cfg.store, run_id, started, status, error, tokens_now).await?;
-            write_conversation(cfg, run_id, &session.transcript, tokens_now).await?;
+            write_conversation(cfg, &session, tokens_now).await?;
             Ok(summary)
         })
     }
@@ -291,6 +292,9 @@ impl SubAgentRunner for StoreSubAgentRunner {
 struct SubAgentSession {
     run_id: i64,
     system_prompt: String,
+    /// 这次子任务的正文（同时是 `user_prompt` 与首条 user message）。
+    /// 存下来是为了会话行（票 02）：失败子代理的 prompt 原文同样要可核对。
+    user_prompt: String,
     tools: ToolExecutor,
     ctx: ToolCallContext,
     tokens: std::sync::Mutex<RunTokens>,
@@ -312,12 +316,12 @@ impl StoreSubAgentRunner {
             self.cfg.store.clone(),
             self.cfg.parent_run_id,
         ));
-        let result = self.run_rounds(session, task).await;
+        let result = self.run_rounds(session).await;
         heartbeat.abort();
         result
     }
 
-    async fn run_rounds(&self, session: &mut SubAgentSession, task: &str) -> Result<String> {
+    async fn run_rounds(&self, session: &mut SubAgentSession) -> Result<String> {
         for _ in 0..SUB_AGENT_MAX_ROUNDS {
             let req = LlmRequest {
                 stage: self.cfg.stage,
@@ -326,7 +330,7 @@ impl StoreSubAgentRunner {
                 system_prompt: session.system_prompt.clone(),
                 // 子任务既在 user_prompt，也在首条 user message 里：前者给只看 user_prompt
                 // 的适配器，后者给按 messages 组装的适配器，两条路都不落空。
-                user_prompt: task.to_string(),
+                user_prompt: session.user_prompt.clone(),
                 messages: session.transcript.clone(),
                 tools: Self::tool_defs(),
                 temperature: self.cfg.temperature,
@@ -426,13 +430,14 @@ async fn finish_run(
 
 /// 子代理独立会话行（决策 77 / 100）：不与父会话混进同一个 `messages_json`，
 /// 但同样带 `agent_type` / `parent_run_id`，使「这次子代理读了什么」可复盘。
+/// 两段 prompt 原文一并落地（票 02）——失败子代理的检索为什么没找到，证据在这里。
 async fn write_conversation(
     cfg: &SubAgentRunnerConfig,
-    run_id: i64,
-    messages: &[Message],
+    session: &SubAgentSession,
     tokens: RunTokens,
 ) -> Result<()> {
-    let msgs = serde_json::to_value(messages)?;
+    let run_id = session.run_id;
+    let msgs = serde_json::to_value(&session.transcript)?;
     cfg.store
         .insert_conversation(
             &cfg.task_id,
@@ -443,6 +448,10 @@ async fn write_conversation(
             SUB_AGENT_TYPE,
             Some(cfg.parent_run_id),
             &msgs,
+            Some(crate::storage::observability::PromptSnapshot {
+                system: &session.system_prompt,
+                user: &session.user_prompt,
+            }),
             None,
             tokens.prompt,
             tokens.completion,

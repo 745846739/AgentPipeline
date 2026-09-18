@@ -40,7 +40,7 @@ use crate::home::Home;
 use crate::pipeline::pseudo::{ConflictCheckResult, CrossCheckResult, PseudoStage};
 use crate::process::ProcessKiller;
 use crate::sse::{SseEvent, SseSink, ToolPhase};
-use crate::storage::observability::{NewRun, RunOutcome};
+use crate::storage::observability::{NewRun, PromptSnapshot, RunOutcome};
 use crate::types::{
     Approval, CommandSource, DiffStats, DuplicateRisk, EdgeKind, Gate, GateFailureKind,
     MergeResult, MergeStatus, Node, NodeCursor, NodeStatus, PendingContext, PendingKind,
@@ -1123,6 +1123,10 @@ impl Executor {
         error: &Error,
     ) {
         let metadata = failure_metadata(error);
+        let prompts = trace.prompts.as_ref().map(|(system, user)| PromptSnapshot {
+            system,
+            user,
+        });
         let result = if trace.persisted {
             self.store
                 .annotate_conversation_failure(&task.id, run_id, &metadata)
@@ -1145,6 +1149,7 @@ impl Executor {
                     "main",
                     None,
                     &msgs,
+                    prompts,
                     Some(&metadata),
                     trace.tokens.prompt,
                     trace.tokens.completion,
@@ -1331,6 +1336,8 @@ impl Executor {
         self.store
             .set_run_template_hash(run_id, &template_hash)
             .await?;
+        // 原文落现场（票 02）：hash 与原文同时写——hash 是索引，原文是权威。
+        trace.prompts = Some((system_prompt.clone(), user_prompt.clone()));
 
         // 压缩锚点的边界（决策 180，票 13 必要条件三）：`carried` 是**上一轮**的对话，
         // 它里面的 user 消息不得充当「本轮第一条 user 消息」这个锚点——否则载入历史后，
@@ -1386,6 +1393,10 @@ impl Executor {
                             "main",
                             None,
                             &msgs,
+                            trace.prompts.as_ref().map(|(system, user)| PromptSnapshot {
+                                system,
+                                user,
+                            }),
                             None,
                             trace.tokens.prompt,
                             trace.tokens.completion,
@@ -1569,6 +1580,10 @@ impl Executor {
                 "main",
                 None,
                 &msgs,
+                trace.prompts.as_ref().map(|(system, user)| PromptSnapshot {
+                    system,
+                    user,
+                }),
                 Some(&value),
                 trace.tokens.prompt,
                 trace.tokens.completion,
@@ -1669,8 +1684,8 @@ impl Executor {
             stage: cursor.stage,
             node: cursor.node,
             attempt,
-            system_prompt,
-            user_prompt,
+            system_prompt: system_prompt.clone(),
+            user_prompt: user_prompt.clone(),
             messages: Vec::new(),
             tools: vec![pseudo.submit_tool()],
             temperature: stage_cfg.as_ref().and_then(|c| c.temperature),
@@ -1745,6 +1760,10 @@ impl Executor {
                 pseudo.agent_type(),
                 Some(parent_run_id),
                 &msgs,
+                Some(PromptSnapshot {
+                    system: &system_prompt,
+                    user: &user_prompt,
+                }),
                 Some(&value),
                 tokens.prompt,
                 tokens.completion,
@@ -3123,6 +3142,9 @@ fn args_summary(text: &str) -> String {
 struct AttemptTrace {
     messages: Vec<Message>,
     tokens: RunTokens,
+    /// 组装后的两段原文（票 02）：**成功与失败都要写**——「这是 prompt 问题」这句判断
+    /// 在失败的那一轮才最需要证据。
+    prompts: Option<(String, String)>,
     persisted: bool,
 }
 

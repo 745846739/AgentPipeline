@@ -71,6 +71,7 @@ async fn project_run_and_conversation_are_queryable_after_analysis() {
             1,
             PSEUDO_PROJECT_ANALYSIS,
             &messages,
+            None,
             Some(&serde_json::json!({"summary": "摘要"})),
             10,
             5,

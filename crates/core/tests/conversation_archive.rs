@@ -63,6 +63,7 @@ async fn insert_conv(
             None,
             &messages,
             None,
+            None,
             10,
             5,
         )
@@ -177,6 +178,7 @@ async fn archive_is_scoped_to_task() {
             "main",
             None,
             &serde_json::json!([{"role": "user", "content": "t2"}]),
+            None,
             None,
             1,
             1,

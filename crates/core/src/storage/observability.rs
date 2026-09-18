@@ -598,18 +598,20 @@ impl Store {
         agent_type: &str,
         parent_run_id: Option<i64>,
         messages: &serde_json::Value,
+        prompts: Option<PromptSnapshot<'_>>,
         metadata: Option<&serde_json::Value>,
         prompt_tokens: u32,
         completion_tokens: u32,
     ) -> Result<i64> {
-        // conversation_max_chars：超出截断（§12.4.3）。在 Value 层做——丢最旧轮次、
-        // 单条仍超限时截其 content——保证落库的 messages_json 永远是合法 JSON。
-        let truncated = truncate_messages_json(messages, self.conversation_max_chars);
+        // conversation_max_chars：超出截断（§12.4.3 / 票 02）。三段（系统段 / 用户段 /
+        // messages）共吃**同一本账**：原文先占（它是诊断的根据），余量给 messages。
+        let truncated = truncate_conversation(messages, prompts, self.conversation_max_chars);
         let id: i64 = sqlx::query_scalar(
             "INSERT INTO kanban_node_conversations
              (task_id, project_id, run_id, stage, node, attempt, agent_type, parent_run_id,
-              messages_json, metadata_json, prompt_tokens, completion_tokens, created_at)
-             VALUES (?, NULL, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) RETURNING id",
+              messages_json, system_prompt, user_prompt, metadata_json, prompt_tokens,
+              completion_tokens, created_at)
+             VALUES (?, NULL, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) RETURNING id",
         )
         .bind(task_id)
         .bind(run_id)
@@ -618,7 +620,9 @@ impl Store {
         .bind(attempt as i64)
         .bind(agent_type)
         .bind(parent_run_id)
-        .bind(truncated.to_string())
+        .bind(truncated.messages.to_string())
+        .bind(truncated.system_prompt)
+        .bind(truncated.user_prompt)
         .bind(metadata.map(|m| m.to_string()))
         .bind(prompt_tokens as i64)
         .bind(completion_tokens as i64)
@@ -687,16 +691,18 @@ impl Store {
         attempt: u32,
         agent_type: &str,
         messages: &serde_json::Value,
+        prompts: Option<PromptSnapshot<'_>>,
         metadata: Option<&serde_json::Value>,
         prompt_tokens: u32,
         completion_tokens: u32,
     ) -> Result<i64> {
-        let truncated = truncate_messages_json(messages, self.conversation_max_chars);
+        let truncated = truncate_conversation(messages, prompts, self.conversation_max_chars);
         let id: i64 = sqlx::query_scalar(
             "INSERT INTO kanban_node_conversations
              (task_id, project_id, run_id, stage, node, attempt, agent_type, parent_run_id,
-              messages_json, metadata_json, prompt_tokens, completion_tokens, created_at)
-             VALUES (NULL, ?, ?, ?, ?, ?, ?, NULL, ?, ?, ?, ?, ?) RETURNING id",
+              messages_json, system_prompt, user_prompt, metadata_json, prompt_tokens,
+              completion_tokens, created_at)
+             VALUES (NULL, ?, ?, ?, ?, ?, ?, NULL, ?, ?, ?, ?, ?, ?, ?) RETURNING id",
         )
         .bind(project_id)
         .bind(run_id)
@@ -704,7 +710,9 @@ impl Store {
         .bind(node.as_str())
         .bind(attempt as i64)
         .bind(agent_type)
-        .bind(truncated.to_string())
+        .bind(truncated.messages.to_string())
+        .bind(truncated.system_prompt)
+        .bind(truncated.user_prompt)
         .bind(metadata.map(|m| m.to_string()))
         .bind(prompt_tokens as i64)
         .bind(completion_tokens as i64)
@@ -721,7 +729,8 @@ impl Store {
     ) -> Result<Option<NodeConversation>> {
         let row: Option<ConversationRow> = sqlx::query_as(
             "SELECT id, task_id, project_id, run_id, stage, node, attempt, agent_type, parent_run_id,
-                    messages_json, metadata_json, prompt_tokens, completion_tokens, created_at,
+                    messages_json, system_prompt, user_prompt, metadata_json, prompt_tokens,
+                    completion_tokens, created_at,
                     archived_at
              FROM kanban_node_conversations WHERE task_id = ? AND run_id = ?",
         )
@@ -740,7 +749,8 @@ impl Store {
     ) -> Result<Option<NodeConversation>> {
         let row: Option<ConversationRow> = sqlx::query_as(
             "SELECT id, task_id, project_id, run_id, stage, node, attempt, agent_type, parent_run_id,
-                    messages_json, metadata_json, prompt_tokens, completion_tokens, created_at,
+                    messages_json, system_prompt, user_prompt, metadata_json, prompt_tokens,
+                    completion_tokens, created_at,
                     archived_at
              FROM kanban_node_conversations WHERE project_id = ? AND run_id = ?",
         )
@@ -780,7 +790,8 @@ impl Store {
     ) -> Result<Vec<NodeConversation>> {
         let mut sql = String::from(
             "SELECT id, task_id, project_id, run_id, stage, node, attempt, agent_type, parent_run_id,
-                    messages_json, metadata_json, prompt_tokens, completion_tokens, created_at,
+                    messages_json, system_prompt, user_prompt, metadata_json, prompt_tokens,
+                    completion_tokens, created_at,
                     archived_at
              FROM kanban_node_conversations WHERE task_id = ?",
         );
@@ -812,7 +823,8 @@ impl Store {
     ) -> Result<Option<NodeConversation>> {
         let row: Option<ConversationRow> = sqlx::query_as(
             "SELECT id, task_id, project_id, run_id, stage, node, attempt, agent_type, parent_run_id,
-                    messages_json, metadata_json, prompt_tokens, completion_tokens, created_at,
+                    messages_json, system_prompt, user_prompt, metadata_json, prompt_tokens,
+                    completion_tokens, created_at,
                     archived_at
              FROM kanban_node_conversations
              WHERE task_id = ? AND stage = ? AND node = ? AND agent_type = 'main'
@@ -847,7 +859,8 @@ impl Store {
     ) -> Result<Vec<NodeConversation>> {
         let rows: Vec<ConversationRow> = sqlx::query_as(
             "SELECT id, task_id, project_id, run_id, stage, node, attempt, agent_type, parent_run_id,
-                    messages_json, metadata_json, prompt_tokens, completion_tokens, created_at,
+                    messages_json, system_prompt, user_prompt, metadata_json, prompt_tokens,
+                    completion_tokens, created_at,
                     archived_at
              FROM kanban_node_conversations WHERE project_id = ? ORDER BY id",
         )
@@ -931,6 +944,8 @@ struct ConversationRow {
     agent_type: String,
     parent_run_id: Option<i64>,
     messages_json: String,
+    system_prompt: Option<String>,
+    user_prompt: Option<String>,
     metadata_json: Option<String>,
     prompt_tokens: i64,
     completion_tokens: i64,
@@ -951,6 +966,8 @@ impl ConversationRow {
             agent_type: self.agent_type,
             parent_run_id: self.parent_run_id,
             messages_json: serde_json::from_str(&self.messages_json)?,
+            system_prompt: self.system_prompt,
+            user_prompt: self.user_prompt,
             metadata_json: self
                 .metadata_json
                 .map(|s| serde_json::from_str(&s))
@@ -1084,6 +1101,72 @@ impl CommandRecorder for Store {
         let store = self.clone();
         Box::pin(async move { store.set_run_process_group(run_id, pgid).await })
     }
+}
+
+/// 组装后 prompt 的原文（决策 211② / 票 02）。
+///
+/// **原文是权威**：`prompt_template_hash` 只对系统段、只有 16 位十六进制，它回答的是
+/// 「两次跑的是不是同一份」；而「当时到底注入了什么」只有原文答得了——用户段连 hash
+/// 都没有，五个 PromptSegments 片段又是运行时拼的，磁盘上的模板反推不出当时那一份。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PromptSnapshot<'a> {
+    pub system: &'a str,
+    pub user: &'a str,
+}
+
+/// 一条会话落库前的截断结果（票 02）：三段共吃 `conversation_max_chars` 一本账。
+#[derive(Debug, Clone, PartialEq)]
+pub struct TruncatedConversation {
+    pub messages: serde_json::Value,
+    pub system_prompt: Option<String>,
+    pub user_prompt: Option<String>,
+}
+
+/// 会话整行的字符账（§12.4.3 / 票 02）。
+///
+/// 顺序是**固定**的：系统段 → 用户段 → messages。理由不是偏好，是证据的不可替代性——
+/// 两段原文是「这是不是 prompt 问题」的唯一根据，而 messages 在下一轮就重建了。
+/// 两侧超限都**留标记**（`truncate_text` / `truncate_messages_json`），
+/// 静默截短会让读者把残缺的文本当成当时的原文。
+pub fn truncate_conversation(
+    messages: &serde_json::Value,
+    prompts: Option<PromptSnapshot<'_>>,
+    max_chars: usize,
+) -> TruncatedConversation {
+    let mut remaining = max_chars;
+    let (system_prompt, user_prompt) = match prompts {
+        Some(p) => {
+            let system = truncate_text(p.system, remaining);
+            remaining = remaining.saturating_sub(system.chars().count());
+            let user = truncate_text(p.user, remaining);
+            remaining = remaining.saturating_sub(user.chars().count());
+            (Some(system), Some(user))
+        }
+        None => (None, None),
+    };
+    TruncatedConversation {
+        messages: truncate_messages_json(messages, remaining),
+        system_prompt,
+        user_prompt,
+    }
+}
+
+/// 单段 prompt 原文的截断。**留标记**，且标记本身也算在预算里——否则「截断后的长度」
+/// 会随标记长度偷偷超出阈值，账就不闭合了。
+pub fn truncate_text(text: &str, budget: usize) -> String {
+    let count = text.chars().count();
+    if count <= budget {
+        return text.to_string();
+    }
+    let marker = format!("…[原文在此截断：原文 {count} 字符，本段预算 {budget} 字符]");
+    let marker_len = marker.chars().count();
+    if budget <= marker_len {
+        // 预算连标记都装不下：只留标记的前缀（仍然是「这里被截过」这件事的可见证据）
+        return marker.chars().take(budget).collect();
+    }
+    let mut out: String = text.chars().take(budget - marker_len).collect();
+    out.push_str(&marker);
+    out
 }
 
 /// 未完成的 run 视为崩溃残留（进程恢复时判定用）。

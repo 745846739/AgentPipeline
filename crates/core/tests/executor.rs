@@ -866,12 +866,76 @@ async fn tool_retry_exhaustion_writes_the_failed_conversation() {
     );
 }
 
-// ─────────────────────────── 会话截断（§12.4.3 conversation_max_chars）───────────────────────────
+// ─────────────────── prompt 原文落库（决策 211② / 票 02）───────────────────
 
 #[tokio::test]
-async fn conversations_are_truncated_to_max_chars() {
+async fn the_assembled_prompt_is_kept_verbatim_beside_the_conversation() {
+    // 「这是 prompt 问题」此前无从核对：落库的 messages 里没有 system / user 两段
+    // （它们只在适配器组装 HTTP body 时才前置），用户段连 hash 都没有。
+    let ctx = setup("true", Settings::default()).await;
+    let mut script = Script::new();
+    script
+        .for_node(Stage::ArchitectDesign, Node::ValidateInput)
+        .submit(&ValidateInputMetadata {
+            readiness: true,
+            blockers: vec![],
+        });
+    script
+        .for_node(Stage::ArchitectDesign, Node::Execute)
+        .write_file("design.md", "# 设计\n## 验收标准\n- AC-1 能登录\n")
+        .submit(&ArchitectExecuteMetadata {
+            readiness: true,
+            ..Default::default()
+        });
+    ctx.agent.set_script(script);
+
+    testkit::seed_task(&ctx.store, "t-prompt", "p1").await.unwrap();
+    admit(&ctx, "t-prompt").await;
+    ctx.executor.run("t-prompt").await.unwrap();
+
+    let run = ctx
+        .store
+        .list_runs_at("t-prompt", Stage::ArchitectDesign, Node::Execute)
+        .await
+        .unwrap()
+        .remove(0);
+    // hash 没被取代：它降级为「两次跑的是不是同一份」的索引，两者同时写
+    assert!(
+        run.prompt_template_hash.is_some(),
+        "hash 仍是索引，不是被原文取代"
+    );
+    let conv = ctx
+        .store
+        .get_conversation("t-prompt", run.id)
+        .await
+        .unwrap()
+        .expect("execute 节点应有会话行");
+    // 与当次真实请求逐字相等——打在两段字符串上，不是打在长度上
+    // （长度相等而内容不同，正是哈希看不见的那种漂移）
+    let request = ctx
+        .agent
+        .request_log()
+        .into_iter()
+        .find(|r| r.stage == Stage::ArchitectDesign && r.node == Node::Execute)
+        .expect("execute 节点调过 LLM");
+    assert_eq!(
+        conv.system_prompt.as_deref(),
+        Some(request.system_prompt.as_str()),
+        "系统段原文逐字相等"
+    );
+    assert_eq!(
+        conv.user_prompt.as_deref(),
+        Some(request.user_prompt.as_str()),
+        "用户段原文逐字相等"
+    );
+}
+
+#[tokio::test]
+async fn prompt_snapshot_shares_the_conversation_char_account() {
+    // 票 02：三段共吃 conversation_max_chars 一本账——原文先占，余量给 messages；
+    // 两侧超限都留标记，不许静默截短。
     let settings = Settings {
-        conversation_max_chars: 120,
+        conversation_max_chars: 400,
         ..Default::default()
     };
     let ctx = setup("true", settings).await;
@@ -884,7 +948,70 @@ async fn conversations_are_truncated_to_max_chars() {
         });
     script
         .for_node(Stage::ArchitectDesign, Node::Execute)
-        .write_file("design.md", &"x".repeat(2000))
+        .write_file("design.md", &"x".repeat(3000))
+        .submit(&ArchitectExecuteMetadata {
+            readiness: true,
+            ..Default::default()
+        });
+    ctx.agent.set_script(script);
+
+    testkit::seed_task(&ctx.store, "t-account", "p1")
+        .await
+        .unwrap();
+    admit(&ctx, "t-account").await;
+    ctx.executor.run("t-account").await.unwrap();
+
+    let run = ctx
+        .store
+        .list_runs_at("t-account", Stage::ArchitectDesign, Node::Execute)
+        .await
+        .unwrap()
+        .remove(0);
+    let conv = ctx
+        .store
+        .get_conversation("t-account", run.id)
+        .await
+        .unwrap()
+        .expect("execute 节点应有会话行");
+    let system = conv.system_prompt.expect("系统段原文要落库");
+    let user = conv.user_prompt.expect("用户段原文要落库");
+    let total = system.chars().count()
+        + user.chars().count()
+        + conv.messages_json.to_string().chars().count();
+    assert!(
+        total <= 400,
+        "三段共吃一本账：实际 {total} 字符（system {} + user {}）",
+        system.chars().count(),
+        user.chars().count()
+    );
+    assert!(
+        system.contains("截断"),
+        "截断要留标记，不许静默截短：{}",
+        &system[system.len().saturating_sub(80)..]
+    );
+}
+
+// ─────────────────────────── 会话截断（§12.4.3 conversation_max_chars）───────────────────────────
+
+#[tokio::test]
+async fn conversations_are_truncated_to_max_chars() {
+    // 阈值要**明显大于两段 prompt**（否则测的就成了「原文吃光预算」，那是上一条用例）；
+    // 60k 的 write_file 参数则一定撑破余量。账的口径见 `truncate_conversation`。
+    let settings = Settings {
+        conversation_max_chars: 40_000,
+        ..Default::default()
+    };
+    let ctx = setup("true", settings).await;
+    let mut script = Script::new();
+    script
+        .for_node(Stage::ArchitectDesign, Node::ValidateInput)
+        .submit(&ValidateInputMetadata {
+            readiness: true,
+            blockers: vec![],
+        });
+    script
+        .for_node(Stage::ArchitectDesign, Node::Execute)
+        .write_file("design.md", &"x".repeat(60_000))
         .submit(&ArchitectExecuteMetadata {
             readiness: true,
             ..Default::default()
@@ -895,7 +1022,7 @@ async fn conversations_are_truncated_to_max_chars() {
     admit(&ctx, "t5").await;
     ctx.executor.run("t5").await.unwrap();
 
-    // write_file 的 2000 字符参数应让会话触顶截断
+    // write_file 的 60k 字符参数应让 messages 触顶截断
     let runs = ctx.store.list_runs("t5").await.unwrap();
     let execute_run = runs
         .iter()
@@ -909,14 +1036,15 @@ async fn conversations_are_truncated_to_max_chars() {
         .expect("execute 节点应有会话行");
     let raw = conv.messages_json.to_string();
     assert!(
-        raw.chars().count() < 400,
-        "会话应被截断：{}",
+        !raw.contains("xxxxxxxxxx"),
+        "超长内容不得进入落库会话（应被丢弃轮次或截断）：{} 字符",
         raw.chars().count()
     );
-    assert!(
-        !raw.contains("xxxxxxxxxx"),
-        "超长内容不得进入落库会话（应被丢弃轮次或截断）"
-    );
+    // 整行的账（票 02 起含两段原文）不超过阈值
+    let total = conv.system_prompt.unwrap_or_default().chars().count()
+        + conv.user_prompt.unwrap_or_default().chars().count()
+        + raw.chars().count();
+    assert!(total <= 40_000, "整行共吃一本账，实际 {total} 字符");
 }
 
 // ─────────────────────────── 小工具单测 ───────────────────────────
