@@ -339,6 +339,8 @@ pub fn foreman_tooling(
     moment: ForemanMoment,
     // 分级诊断（票 07）：这一轮再摘掉哪些工具。空 = 不摘（人的那一轮）。
     deny: &[&str],
+    // 托管动作的执行者（票 08）。`None` = 不放行：D 层照旧恒提议。
+    steward: Option<Arc<dyn crate::agent::tools::StewardActionRunner>>,
 ) -> (ToolExecutor, ToolCallContext) {
     // 值班长的域就是家目录根（决策 207 的「分两组」：流水线阶段仍限任务工作区），
     // 并按路径前缀拒掉 `data/` 与 `logs/`——库里明文存着 provider 密钥（决策 112），
@@ -356,6 +358,10 @@ pub fn foreman_tooling(
     .with_recorder(Arc::new(store.clone()))
     .with_env_mode(env_mode)
     .with_allowed_tools(foreman_available_tools_except(env_mode, deny));
+    let tools = match steward {
+        Some(runner) => tools.with_steward_actions(runner),
+        None => tools,
+    };
     let tools = match moment {
         // 提议接缝只在对话轮注入。按键执行那一次若还带着它，`ask` 档会把执行改成再提一条。
         ForemanMoment::ConfirmedPress => tools.confirmed_once(),
@@ -827,6 +833,8 @@ pub struct ForemanRunner {
     /// 提议事件的广播去向（决策 207）。它与对话增量走**同一条**总线（决策 182⑥），
     /// 只是事件类型不同——前端按类型分流，后端按类型过滤。
     sse: Arc<dyn SseSink>,
+    /// 托管放行的自动动作的执行者（决策 210② / 票 08）。`None` = 不放行。
+    steward_actions: Option<Arc<dyn crate::agent::tools::StewardActionRunner>>,
 }
 
 impl ForemanRunner {
@@ -848,7 +856,22 @@ impl ForemanRunner {
             home,
             llm,
             sse,
+            steward_actions: None,
         }
+    }
+
+    /// 注入托管动作的执行者（决策 210② / 票 08）。
+    ///
+    /// 由 **app 层**注入，不在 core 里实现：resume 的唯一实现在
+    /// [`crate::pipeline::resume::apply_resume`]，而它的另一个调用者是 HTTP 端点
+    /// （`POST /tasks/{id}/resume`）——两处必须逐字同源，故执行者由知道端点的那一层提供。
+    /// 不注入 = 不放行（D 层照旧恒提议）。
+    pub fn with_steward_actions(
+        mut self,
+        runner: Arc<dyn crate::agent::tools::StewardActionRunner>,
+    ) -> Self {
+        self.steward_actions = Some(runner);
+        self
     }
 
     pub fn store(&self) -> &Store {
@@ -908,7 +931,18 @@ impl ForemanRunner {
             FOREMAN_STAGE_KEY,
             cfg.as_ref(),
         );
-        let system_prompt = self.system_prompt(cfg.as_ref(), env_mode)?;
+        // 有没有任务在被托管（决策 210① / 票 08）：只在真有时才在人格里说那一段——
+        // 一段笼统的「你可以直接动手」会立刻变成一句假话（别的任务上它照样只能提）。
+        let stewarded = self
+            .store
+            .list_tasks(&crate::storage::tasks::TaskFilter {
+                include_archived: false,
+                ..Default::default()
+            })
+            .await?
+            .iter()
+            .any(|t| t.stewardship.as_ref().is_some_and(|s| s.enabled));
+        let system_prompt = self.system_prompt(cfg.as_ref(), env_mode, stewarded)?;
         let provider_id =
             crate::storage::catalog::resolve_provider_id(None, None, cfg.as_ref(), None);
 
@@ -943,6 +977,7 @@ impl ForemanRunner {
             env_mode,
             ForemanMoment::Conversation,
             deny,
+            self.steward_actions.clone(),
         );
 
         // 三种角色 → 两种说话的立场（决策 204 / 207）。**操作台记的那几轮（`system`）必须与
@@ -1332,8 +1367,11 @@ impl ForemanRunner {
     /// **按档位写，不写一句笼统的「你没有权限」**：模型是照着这段描述自己汇报的，
     /// 描述与事实不符时它会说出与事实不符的话（「我已经写好了」/「我读不到文件」）。
     /// 这一段与 `ToolExecutor` 那道闸是同一件事的两种说法——一处给模型看，一处真的执行。
-    fn power_discipline(&self, env_mode: crate::types::EnvMode) -> String {
-        match env_mode {
+    ///
+    /// **托管那一段是条件说的**（决策 210① / 票 08）：只有真开着托管的方案才说明它的存在，
+    /// 否则模型会以为自己对任何任务都能免按键动手——而它实际只对**被托管的那几个**能。
+    fn power_discipline(&self, env_mode: crate::types::EnvMode, stewarded: bool) -> String {
+        let mut discipline = match env_mode {
             crate::types::EnvMode::Ask => "\
                  - 文件与命令这类**会改动东西**的动作：你调用之后**不会立即发生**，\
                  而是生成为一条待确认的提议，等值班经理在界面上按下确认钮才真正执行。\
@@ -1352,7 +1390,18 @@ impl ForemanRunner {
                  - 这个阶段的环境层被关掉了：文件读写、命令执行、技能拉取都不可用，\
                  连工具都看不到。台账读数照常可用。**不要提议这类动作**——它无处可去。\n"
                 .to_string(),
+        };
+        if stewarded {
+            // 只对**开着托管的任务**这么说（票 08）：一段笼统的「你可以直接动手」会立刻
+            // 变成一句假话——别的任务上它照样只能提。
+            discipline.push_str(
+                "- 有任务被值班经理**托管**（态势快照里标出「托管中」的那几个）：对它们你可以\
+                 直接 `task` + `resume` + `resume_action=continue`，**不用等他按键**——\
+                 这一条是例外，只对它、只对这个动作。其余动作（retry / merge / review /\
+                 cancel / create）与其余任务照旧要按键。动手之后说明你做了什么、依据是什么。\n",
+            );
         }
+        discipline
     }
 
     /// `stage_configs["foreman"]` 的覆盖行（可能不存在——「不配置也能用」）。
@@ -1373,6 +1422,7 @@ impl ForemanRunner {
         &self,
         cfg: Option<&crate::types::StageConfig>,
         env_mode: crate::types::EnvMode,
+        stewarded: bool,
     ) -> Result<String> {
         let persona = match cfg.and_then(|c| c.persona_path.as_deref()) {
             Some(path) => {
@@ -1406,7 +1456,7 @@ impl ForemanRunner {
              - 你能直接用的工具是：{}。\n",
             read_tools.join(" / ")
         ));
-        out.push_str(&format!("{}\n", self.power_discipline(env_mode)));
+        out.push_str(&format!("{}\n", self.power_discipline(env_mode, stewarded)));
         if !write_tools.is_empty() {
             out.push_str(&format!(
                 "- 会改动东西的工具是：{}。\n",

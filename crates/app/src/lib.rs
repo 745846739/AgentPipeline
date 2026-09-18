@@ -52,6 +52,11 @@ pub fn build_router(state: AppState) -> Router {
         .route("/tasks/{id}/metrics", get(routes::tasks::metrics))
         .route("/tasks/{id}/resume", post(routes::tasks::resume))
         .route("/tasks/{id}/retry", post(routes::tasks::retry))
+        // 任务级托管（决策 210① / 票 08）：开关由人拨，授权范围只有一个动作。
+        .route(
+            "/tasks/{id}/stewardship",
+            post(routes::tasks::set_stewardship),
+        )
         .route("/tasks/{id}/cancel", post(routes::tasks::cancel))
         .route("/tasks/{id}/archive", post(routes::tasks::archive))
         .route("/tasks/{id}/split", post(routes::tasks::split))

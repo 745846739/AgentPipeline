@@ -22,7 +22,10 @@ use agentpipeline_core::pipeline::foreman::{
 use agentpipeline_core::storage::foreman::NewForemanMessage;
 use agentpipeline_core::storage::tasks::TaskFilter;
 use agentpipeline_core::storage::Store;
-use agentpipeline_core::types::{Node, PendingKind, PendingReason, Stage, StageConfig, TaskStatus};
+use agentpipeline_core::types::{
+    Node, PendingKind, PendingReason, Stage, StageConfig, Stewardship, TaskStatus,
+    STEWARDSHIP_MAX_AUTO_RESUMES,
+};
 use agentpipeline_core::Error;
 use testkit::{FakeAgent, ManualClock, Script, TestHome};
 
@@ -78,9 +81,24 @@ impl Harness {
     }
 
     fn runner(&self, agent: FakeAgent) -> ForemanRunner {
+        self.runner_with(Settings::default(), agent)
+    }
+
+    /// 注入托管动作执行替身的那一种构造（票 08）。
+    fn runner_with_steward(
+        &self,
+        script: Script,
+        calls: Arc<std::sync::atomic::AtomicUsize>,
+    ) -> ForemanRunner {
+        self.runner_with(Settings::default(), FakeAgent::new(script))
+            .with_steward_actions(Arc::new(TestSteward { calls }))
+    }
+
+    /// 非缺省设置的那一种构造（节流阈值要按用例配）。
+    fn runner_with(&self, settings: Settings, agent: FakeAgent) -> ForemanRunner {
         ForemanRunner::new(
             self.store.clone(),
-            Settings::default(),
+            settings,
             self._home.home().clone(),
             Arc::new(agent) as Arc<dyn LlmClient>,
             Arc::new(testkit::SseRecorder::new()),
@@ -749,6 +767,222 @@ async fn notice_only_events_do_not_wake_it() {
     assert_eq!(agent.total_calls(), 0, "慢跑只播报不唤醒");
 }
 
+// ─────────────── 任务级托管与 D 层例外（决策 210② / 票 08）───────────────
+
+/// 托管动作的执行替身：只记「被叫了几次」——**执行**本身由 app 层实现（走 resume 的
+/// 唯一实现），core 这边要证的是「闸放行了、执行者被叫到了、账留下了」。
+struct TestSteward {
+    calls: Arc<std::sync::atomic::AtomicUsize>,
+}
+
+impl agentpipeline_core::agent::tools::StewardActionRunner for TestSteward {
+    fn run(
+        &self,
+        _call: agentpipeline_core::agent::client::ToolCall,
+        _ctx: agentpipeline_core::agent::tools::ToolCallContext,
+    ) -> futures::future::BoxFuture<
+        'static,
+        agentpipeline_core::Result<agentpipeline_core::agent::tools::ToolOutcome>,
+    > {
+        let calls = self.calls.clone();
+        Box::pin(async move {
+            calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok(agentpipeline_core::agent::tools::ToolOutcome::ok(
+                "已自动放行（托管，测试替身）",
+            ))
+        })
+    }
+}
+
+/// 把任务推成 pending（有下一次拍板可谈）。
+async fn stewarded_task(h: &Harness, stewardship: Option<Stewardship>) {
+    park_task(
+        &h.store,
+        "t1",
+        PendingKind::RetryExhausted,
+        "重试耗尽，等你拍板",
+    )
+    .await;
+    if let Some(s) = stewardship {
+        h.store.set_stewardship("t1", Some(&s)).await.unwrap();
+    }
+}
+
+#[tokio::test]
+async fn a_stewarded_resume_runs_without_a_button() {
+    let h = Harness::seeded().await;
+    stewarded_task(&h, Some(Stewardship::enabled_now(h.clock.now()))).await;
+
+    let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let mut script = Script::new();
+    script.for_foreman().tool(
+        "task",
+        serde_json::json!({"action": "resume", "task_id": "t1", "resume_action": "continue"}),
+    );
+    script.for_foreman().text("已放行。");
+    let runner = h.runner_with_steward(script, calls.clone());
+    let turn = runner.say(None, "t1 卡住了").await.unwrap();
+
+    assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 1, "托管放行：直接执行");
+    // 没有提议（人不用按键）
+    assert!(h
+        .store
+        .list_pending_foreman_proposals(&turn.session.id)
+        .await
+        .unwrap()
+        .is_empty());
+    // 留账：会话里一条【托管】行 + 任务行上的计数
+    let messages = h.store.list_foreman_messages(&turn.session.id, 100).await.unwrap();
+    let ledger = messages
+        .iter()
+        .find(|m| m.content.starts_with("【托管】"))
+        .expect("每次自动动手都必须在班次里留一条账");
+    assert!(ledger.content.contains("第 1/2 次"), "{}", ledger.content);
+    let task = h.store.get_task("t1").await.unwrap();
+    let s = task.stewardship.expect("托管状态要落库");
+    assert_eq!(s.auto_resumes, 1);
+    assert!(s.last_fingerprint.is_some());
+}
+
+#[tokio::test]
+async fn without_stewardship_the_same_call_is_still_a_proposal() {
+    let h = Harness::seeded().await;
+    stewarded_task(&h, None).await;
+    let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let mut script = Script::new();
+    script.for_foreman().tool(
+        "task",
+        serde_json::json!({"action": "resume", "task_id": "t1", "resume_action": "continue"}),
+    );
+    script.for_foreman().text("提了，等你按键。");
+    let runner = h.runner_with_steward(script, calls.clone());
+    let turn = runner.say(None, "t1 卡住了").await.unwrap();
+
+    assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 0, "未托管：不动手");
+    let pending = h
+        .store
+        .list_pending_foreman_proposals(&turn.session.id)
+        .await
+        .unwrap();
+    assert_eq!(pending.len(), 1, "D 层照旧恒提议：{pending:?}");
+    assert_eq!(pending[0].tool, "task");
+    let task = h.store.get_task("t1").await.unwrap();
+    assert_eq!(task.status, TaskStatus::Pending, "提议不是执行");
+}
+
+#[tokio::test]
+async fn a_stewarded_task_still_cannot_auto_retry_or_merge() {
+    // 托管放开的**恰好一个动作**（决策 210②）：retry / merge / review / cancel 永不自动。
+    let h = Harness::seeded().await;
+    for action in [
+        serde_json::json!({"action": "retry", "task_id": "t1"}),
+        serde_json::json!({"action": "merge", "task_id": "t1", "decision": "approve"}),
+        serde_json::json!({"action": "review", "task_id": "t1", "approved": true}),
+        serde_json::json!({"action": "cancel", "task_id": "t1"}),
+        // resume 但不是 continue（skip / goto 会替人重排流水线）
+        serde_json::json!({"action": "resume", "task_id": "t1", "resume_action": "skip"}),
+    ] {
+        stewarded_task(&h, Some(Stewardship::enabled_now(h.clock.now()))).await;
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let mut script = Script::new();
+        script.for_foreman().tool("task", action.clone());
+        script.for_foreman().text("提了。");
+        let runner = h.runner_with_steward(script, calls.clone());
+        let turn = runner.say(None, "动手吧").await.unwrap();
+        assert_eq!(
+            calls.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "托管不该放行这个动作：{action}"
+        );
+        assert_eq!(
+            h.store
+                .list_pending_foreman_proposals(&turn.session.id)
+                .await
+                .unwrap()
+                .len(),
+            1,
+            "{action} 仍应是提议"
+        );
+    }
+}
+
+#[tokio::test]
+async fn the_auto_resume_stops_at_the_cap_and_at_the_same_fingerprint() {
+    let h = Harness::seeded().await;
+    // ① 次数触顶：已经自动动过 2 次 → 停手，转回提议（任务仍停在 pending 等人）
+    stewarded_task(
+        &h,
+        Some(Stewardship {
+            enabled: true,
+            auto_resumes: STEWARDSHIP_MAX_AUTO_RESUMES,
+            last_fingerprint: Some("旧的指纹".into()),
+            updated_at: Some(h.clock.now()),
+        }),
+    )
+    .await;
+    let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let mut script = Script::new();
+    script.for_foreman().tool(
+        "task",
+        serde_json::json!({"action": "resume", "task_id": "t1", "resume_action": "continue"}),
+    );
+    script.for_foreman().text("到上限了，等你按键。");
+    let runner = h.runner_with_steward(script, calls.clone());
+    let turn = runner.say(None, "接着修").await.unwrap();
+    assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 0, "触顶即停手");
+    assert_eq!(
+        h.store
+            .list_pending_foreman_proposals(&turn.session.id)
+            .await
+            .unwrap()
+            .len(),
+        1
+    );
+    assert_eq!(
+        h.store.get_task("t1").await.unwrap().status,
+        TaskStatus::Pending,
+        "停手 = 任务留在 pending 等值班经理"
+    );
+
+    // ② 同一指纹：态势没变就不重复动手（单靠次数挡不住「同一件事被反复触发」）
+    let fingerprint = situation_fingerprint(&h.store, "t1")
+        .await
+        .unwrap()
+        .to_string();
+    stewarded_task(
+        &h,
+        Some(Stewardship {
+            enabled: true,
+            auto_resumes: 1,
+            last_fingerprint: Some(fingerprint),
+            updated_at: Some(h.clock.now()),
+        }),
+    )
+    .await;
+    let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let mut script = Script::new();
+    script.for_foreman().tool(
+        "task",
+        serde_json::json!({"action": "resume", "task_id": "t1", "resume_action": "continue"}),
+    );
+    script.for_foreman().text("同一个指纹，不动。");
+    let runner = h.runner_with_steward(script, calls.clone());
+    let turn = runner.say(None, "接着修").await.unwrap();
+    assert_eq!(
+        calls.load(std::sync::atomic::Ordering::SeqCst),
+        0,
+        "同一指纹不重复动手"
+    );
+    assert_eq!(
+        h.store
+            .list_pending_foreman_proposals(&turn.session.id)
+            .await
+            .unwrap()
+            .len(),
+        1
+    );
+}
+
 // ───────────────── 节流与分级诊断（决策 209⑤⑥ / 票 07）─────────────────
 
 #[tokio::test]
@@ -799,7 +1033,7 @@ async fn hitting_the_hourly_cap_reports_instead_of_dropping_silently() {
     let mut script = Script::new();
     script.for_foreman().text("第一轮播报");
     let agent = FakeAgent::new(script);
-    let runner = h.runner(agent.clone());
+    let runner = h.runner_with(settings, agent.clone());
     assert!(runner.watch().await.unwrap().is_some());
     assert_eq!(agent.total_calls(), 1);
 
@@ -2126,6 +2360,10 @@ async fn the_service_write_tools_propose_even_under_the_auto_tier() {
         .unwrap();
     let tools: Vec<&str> = pending.iter().map(|p| p.tool.as_str()).collect();
     assert_eq!(tools, ["task", "config", "skills"], "{pending:?}");
+    // D 层恒提议的**唯一例外**是「托管中的任务 + resume(continue)」（决策 210② / 票 08）；
+    // 这里的三个动作一个都不在例外里，且本例既没开托管、也没注入执行者——**不注入不放行**。
+    // 例外的正面与反面断言见本文件「任务级托管与 D 层例外」那一节。
+    //
     // 取证：什么状态都没变——任务还在跑、阶段配置还在、技能目录里那个文件也还在。
     let task = h.store.get_task("t1").await.unwrap();
     assert_ne!(task.status, TaskStatus::Cancelled, "提议不是执行");

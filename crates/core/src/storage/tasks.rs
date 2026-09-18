@@ -67,6 +67,7 @@ struct TaskRow {
     archived_at: Option<String>,
     stalled: i64,
     executor_owner: Option<String>,
+    stewardship_json: Option<String>,
     created_at: String,
     updated_at: String,
 }
@@ -97,6 +98,10 @@ impl TaskRow {
             archived_at: self.archived_at.map(|s| parse_ts(&s)).transpose()?,
             stalled: self.stalled != 0,
             executor_owner: self.executor_owner,
+            stewardship: self
+                .stewardship_json
+                .map(|s| serde_json::from_str(&s))
+                .transpose()?,
             created_at: parse_ts(&self.created_at)?,
             updated_at: parse_ts(&self.updated_at)?,
         })
@@ -105,7 +110,8 @@ impl TaskRow {
 
 const TASK_COLUMNS: &str = "id, project_id, title, description, status, current_stage, current_node, \
      validate_attempts, pending_reason_json, worktree_path, branch_name, total_tokens, total_calls, \
-     review_mode, model_override, archived_at, stalled, executor_owner, created_at, updated_at";
+     review_mode, model_override, archived_at, stalled, executor_owner, stewardship_json,
+     created_at, updated_at";
 
 impl Store {
     /// 创建任务 + 同事务插入单条 main 游标（决策 90）。
@@ -125,8 +131,9 @@ impl Store {
              (id, title, description, project_id, status, current_stage, current_node,
               validate_attempts, pending_reason_json, worktree_path, branch_name,
               total_tokens, total_calls, review_mode, model_override, archived_at, stalled,
-              executor_owner, created_at, updated_at)
-             VALUES (?, ?, ?, ?, ?, 'init', 'execute', 0, NULL, NULL, NULL, 0, 0, ?, ?, NULL, 0, NULL, ?, ?)",
+              executor_owner, stewardship_json, created_at, updated_at)
+             VALUES (?, ?, ?, ?, ?, 'init', 'execute', 0, NULL, NULL, NULL, 0, 0, ?, ?, NULL, 0,
+                     NULL, NULL, ?, ?)",
         )
         .bind(&new_task.id)
         .bind(&new_task.title)
@@ -498,6 +505,23 @@ impl Store {
         .await?
         .rows_affected();
         Ok(affected == 1)
+    }
+
+    /// 写任务级托管（决策 210① / 票 08）。`None` = 关掉（清空那一列）。
+    ///
+    /// 只在**任务级**动这一列：托管不是「模式的开关」，是「对这个任务的一次授权」。
+    pub async fn set_stewardship(
+        &self,
+        task_id: &str,
+        stewardship: Option<&crate::types::Stewardship>,
+    ) -> Result<()> {
+        sqlx::query("UPDATE kanban_tasks SET stewardship_json = ?, updated_at = ? WHERE id = ?")
+            .bind(stewardship.map(serde_json::to_string).transpose()?)
+            .bind(ts(self.now()))
+            .bind(task_id)
+            .execute(self.pool())
+            .await?;
+        Ok(())
     }
 
     pub async fn release_executor(&self, task_id: &str) -> Result<()> {

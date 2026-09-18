@@ -3,10 +3,10 @@
 use agentpipeline_core::actions::allowed_actions;
 use agentpipeline_core::agent::tools::{CommandFinish, CommandRecorder, CommandStart};
 use agentpipeline_core::git::Git;
-use agentpipeline_core::storage::decisions::{MergeDecision, ResumeAction};
+use agentpipeline_core::storage::decisions::MergeDecision;
 use agentpipeline_core::storage::tasks::{NewTask, TaskFilter};
 use agentpipeline_core::types::{
-    CommandSource, Node, NodeCursor, PendingKind, ReviewMode, Stage, TaskStatus,
+    CommandSource, Node, NodeCursor, ReviewMode, Stage, Stewardship, TaskStatus,
 };
 use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
@@ -201,6 +201,53 @@ pub async fn detail(
     })))
 }
 
+// ─────────────────────── 任务级托管（决策 210① / 票 08）───────────────────────
+
+#[derive(Debug, Deserialize)]
+pub struct StewardshipBody {
+    /// 打开 = `true`；关掉 = `false`。
+    pub enabled: bool,
+}
+
+/// `POST /tasks/{id}/stewardship`：打开 / 关掉**这个任务**的托管。
+///
+/// 打开之后值班长可以对它免按键 `resume(continue)`——**恰好一个动作**（决策 210②）。
+/// 关掉是**清空那一列**，不是写一个 `enabled: false`：留一个「关着的托管」会让
+/// 「从来没开过」与「开过又关了」在库里长得一样，而这两件事在复盘时不是一回事。
+///
+/// 终态任务拒绝：托管天然自限（任务一 done 就再也用不上），给一个终态任务开托管只会
+/// 让界面上多一个永远不会生效的开关。
+pub async fn set_stewardship(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    Json(body): Json<StewardshipBody>,
+) -> ApiResult<impl IntoResponse> {
+    // 值班长没接线时这个开关没有意义（没人会用那份授权）——与对讲台其余端点同一姿态。
+    if state.foreman.is_none() {
+        return Err(ApiError {
+            status: StatusCode::SERVICE_UNAVAILABLE,
+            message: "对讲台未接线：本次运行没有注入值班长，托管无人使用".into(),
+            detail: None,
+            kind: None,
+        });
+    }
+    let task = state.store.get_task(&id).await.map_err(map_core_error)?;
+    if task.status.is_terminal() {
+        return Err(ApiError::bad_request(format!(
+            "任务 {id} 已是终态（{}）：托管随任务自限，终态任务没有可托管的下一步",
+            task.status.as_str()
+        )));
+    }
+    let value = body.enabled.then(|| Stewardship::enabled_now(state.store.now()));
+    state
+        .store
+        .set_stewardship(&id, value.as_ref())
+        .await
+        .map_err(map_core_error)?;
+    let task = state.store.get_task(&id).await.map_err(map_core_error)?;
+    Ok(Json(json!({ "ok": true, "task": task })))
+}
+
 // ─────────────────────────────── resume（决策 91 / 49 / §3）───────────────────────────────
 
 #[derive(Debug, Deserialize)]
@@ -222,83 +269,30 @@ pub async fn resume(
     Path(id): Path<String>,
     Json(body): Json<ResumeBody>,
 ) -> ApiResult<impl IntoResponse> {
-    let _task = state.store.get_task(&id).await.map_err(map_core_error)?;
-
-    // 游标解析（决策 91）：恰好一条可省略；多条缺失 → 409
-    let cursor = match body.cursor_id.as_deref() {
-        Some(cursor_id) => state
-            .store
-            .get_cursor(cursor_id)
-            .await
-            .map_err(map_core_error)?,
-        None => state
-            .store
-            .resolve_sole_cursor(&id)
-            .await
-            .map_err(map_core_error)?
-            .ok_or_else(|| {
-                ApiError::conflict("该任务有多条活跃游标，必须显式提供 cursor_id（决策 91）")
-            })?,
-    };
-    if cursor.task_id != id {
-        return Err(ApiError::bad_request("cursor_id 不属于该任务"));
-    }
-
-    let action = ResumeAction::parse(&body.action).map_err(map_core_error)?;
-
-    // 动作必须在当前 pending 的允许集合内（决策 49）
-    if let Some(reason) = &cursor.pending_reason {
-        if !agentpipeline_core::actions::is_action_allowed(reason, &body.action) {
-            return Err(ApiError::bad_request(format!(
-                "动作 {} 不在当前 pending 的允许集合内",
-                body.action
-            )));
-        }
-    }
-
-    let target = match (body.target_stage.as_deref(), body.target_node.as_deref()) {
-        (Some(stage), Some(node)) => Some((
-            stage.parse::<Stage>().map_err(map_core_error)?,
-            node.parse().map_err(map_core_error)?,
-        )),
-        _ => None,
-    };
-
-    // `pending_resume_cooldown_sec` 防连点（§3）：必须**在写入本次 user_resume 流水之前**
-    // 判定，否则刚写入的这条会让间隔恒为 0，第一次 resume 就被误判为连点。
-    let cooldown = state.settings.pending_resume_cooldown_sec as i64;
-    let since_last = state
-        .store
-        .seconds_since_last_user_resume(&id)
-        .await
-        .map_err(map_core_error)?;
-    let within_cooldown = matches!(since_last, Some(secs) if secs < cooldown);
-
-    state
-        .store
-        .apply_resume(&cursor, action, target, body.input.as_deref())
-        .await
-        .map_err(map_core_error)?;
-
-    // 决策 130⑤：dependency_failed 的 continue = 清 pending + 置回 queued 交还**准入**，
-    // 不直接 spawn executor（避免绕过 max_concurrent_tasks）。
-    let dependency_continue = action == ResumeAction::Continue
-        && cursor
-            .pending_reason
-            .as_ref()
-            .is_some_and(|r| r.kind == PendingKind::DependencyFailed);
-
-    let mut spawned = false;
-    if !within_cooldown && !dependency_continue {
-        (state.resume_hook)(&id);
-        spawned = true;
-    }
+    // 状态机在 core 的 `pipeline::resume::apply_resume`（票 08 抽出来的**唯一实现**）：
+    // 值班长的托管自动动作走的是同一份，两处逐字同源才不会漂移成
+    // 「界面按得动、它按不动」。
+    let applied = agentpipeline_core::pipeline::resume::apply_resume(
+        &state.store,
+        &state.settings,
+        &state.resume_hook,
+        &id,
+        &agentpipeline_core::pipeline::resume::ResumeRequest {
+            action: body.action.clone(),
+            cursor_id: body.cursor_id.clone(),
+            target_stage: body.target_stage.clone(),
+            target_node: body.target_node.clone(),
+            input: body.input.clone(),
+        },
+    )
+    .await
+    .map_err(map_core_error)?;
 
     Ok(Json(json!({
         "ok": true,
-        "action": action.as_str(),
-        "cursor_id": cursor.cursor_id,
-        "spawned": spawned,
+        "action": applied.action,
+        "cursor_id": applied.cursor_id,
+        "spawned": applied.spawned,
     })))
 }
 

@@ -164,6 +164,39 @@ pub fn gate_decision(name: &str, env_mode: crate::types::EnvMode) -> GateDecisio
     }
 }
 
+/// D 层恒提议的**唯一例外**的形状判据（决策 210② / 票 08）：
+/// `task` + `resume` + `resume_action = continue`。
+///
+/// **只有形状，不含托管状态**：形状是纯函数（可以单独测、可以在两处复用），
+/// 状态由调用方从库里读（`Store::get_task` → `task.stewardship`）。形状与状态分开的
+/// 后果是「界面说托管中、执行点却仍在提议」这种不一致变得不可能——两边问的是同一个函数。
+///
+/// 为什么恰好这一个动作（决策 210② 的清单，逐条有理由）：
+/// - `retry` 会 `git reset --hard` + `git clean -fdx`，会洗掉工作区；
+/// - `merge` / `review` 写回主干或替人拍板；
+/// - `cancel` / `create` 一个丢掉工作、一个花钱；
+/// - `skip` / `goto` 在 pending 上直接改流转目标，等于替人重排流水线。
+pub fn is_stewardable_resume(name: &str, args: &serde_json::Value) -> bool {
+    name == "task"
+        && args.get("action").and_then(|v| v.as_str()) == Some("resume")
+        && args.get("resume_action").and_then(|v| v.as_str()) == Some("continue")
+}
+
+/// 托管放行的自动动作怎么**执行**（决策 210② / 票 08）。
+///
+/// 为什么执行者由注入决定、而不是在 core 里实现：resume 的唯一实现在
+/// [`crate::pipeline::resume::apply_resume`]，它的调用方（`POST /tasks/{id}/resume` 与
+/// 托管动作）都必须走那一份。core 不知道 HTTP 那一层，注入进来的正是「谁来跑那一段」。
+///
+/// 不注入 = 不放行：D 层照旧恒提议（与「不注入不放行」的既有姿态一致）。
+pub trait StewardActionRunner: Send + Sync + 'static {
+    fn run(
+        &self,
+        call: crate::agent::client::ToolCall,
+        ctx: ToolCallContext,
+    ) -> BoxFuture<'static, Result<ToolOutcome>>;
+}
+
 /// 这个工具受**确认钮**管吗（决策 206 / 207）：[`gate_decision`] 的那一态，取名给人读。
 pub fn needs_confirmation(name: &str, env_mode: crate::types::EnvMode) -> bool {
     gate_decision(name, env_mode) == GateDecision::Propose
@@ -320,7 +353,9 @@ pub struct ToolOutcome {
 }
 
 impl ToolOutcome {
-    fn ok(content: impl Into<String>) -> Self {
+    /// 成功回执。`pub` 是给**托管动作的执行者**用的（决策 210② / 票 08）：它在 app 层
+    /// 实现，需要构造与工具回执同形的返回值。
+    pub fn ok(content: impl Into<String>) -> Self {
         ToolOutcome {
             content: content.into(),
             metadata: None,
@@ -379,6 +414,8 @@ pub struct ToolExecutor {
     /// 而白名单（[`Self::allow`]）照旧按**当前**档位判——档位在提议之后被收紧到 `deny`
     /// 时，这条提议按不下去。
     confirmed: bool,
+    /// 托管放行的自动动作的执行者（决策 210② / 票 08）。`None` = 不放行（D 层恒提议）。
+    steward_actions: Option<Arc<dyn StewardActionRunner>>,
 }
 
 /// 命令输出推流的上下文（票 14）：SSE 去向 + 事件里要带的任务/分支。
@@ -429,6 +466,7 @@ impl ToolExecutor {
             env_mode: crate::types::EnvMode::Auto,
             proposals: None,
             confirmed: false,
+            steward_actions: None,
         }
     }
 
@@ -449,6 +487,12 @@ impl ToolExecutor {
     }
 
     /// 注入提议写入接缝（决策 188 / 207）。不注入时 `ask` 档与 D 层写工具**一律被拒**。
+    /// 注入托管动作的执行者（决策 210② / 票 08）。见 [`StewardActionRunner`]。
+    pub fn with_steward_actions(mut self, runner: Arc<dyn StewardActionRunner>) -> Self {
+        self.steward_actions = Some(runner);
+        self
+    }
+
     pub fn with_proposal_sink(mut self, sink: Arc<dyn ProposalSink>) -> Self {
         self.proposals = Some(sink);
         self
@@ -586,6 +630,15 @@ impl ToolExecutor {
         match gate_decision(call.name.as_str(), self.env_mode) {
             // 与档位出现之前逐字相同：直接执行、落命令日志、走既有的一切。
             GateDecision::Execute => Ok(None),
+            // D 层恒提议的**唯一例外**（决策 210② / 票 08）：托管任务上的 `resume(continue)`。
+            // 三道闸缺一不可——形状对（恰一个动作）、托管中且未触顶、执行者已注入。
+            GateDecision::Propose
+                if self.steward_actions.is_some()
+                    && is_stewardable_resume(&call.name, &Self::args(call)?)
+                    && self.steward_grant(call).await?.is_some() =>
+            {
+                self.run_steward_action(call, ctx).await.map(Some)
+            }
             GateDecision::Propose => self.propose(call, ctx).await.map(Some),
             GateDecision::Refuse => Err(Error::Validation(format!(
                 "工具 {} 被 deny 档挡下（决策 206）：这个阶段的环境层权限已收到底，\
@@ -593,6 +646,88 @@ impl ToolExecutor {
                 call.name
             ))),
         }
+    }
+
+    /// 这一次调用拿得到托管授权吗（决策 210② / 票 08）。
+    ///
+    /// 三条闸**一起**判，且判据只有这一处：
+    /// 1. 形状：`task` + `resume` + `continue`（[`is_stewardable_resume`]）；
+    /// 2. 任务托管中（`Stewardship::enabled`）；
+    /// 3. 未触顶且指纹不同（[`crate::types::Stewardship::permits`]，决策 210⑨ 的两条止损）。
+    ///
+    /// 返回 `Some(指纹)` 时调用方直接执行；`None` 时照常生成提议——**触顶与同指纹不是
+    /// 报错**，是「这一次交给人」（任务仍停在 pending，按钮照旧给得出来）。
+    async fn steward_grant(&self, call: &ToolCall) -> Result<Option<String>> {
+        let Some(store) = &self.ledger else {
+            return Ok(None);
+        };
+        let args = Self::args(call)?;
+        let Some(task_id) = args.get("task_id").and_then(|v| v.as_str()) else {
+            return Ok(None);
+        };
+        let task = match store.get_task(task_id).await {
+            Ok(t) => t,
+            // 查无此任务：照常走提议（模型可能记错一个 id，那不是托管该管的事）
+            Err(_) => return Ok(None),
+        };
+        let Some(stewardship) = task.stewardship.as_ref() else {
+            return Ok(None);
+        };
+        let fingerprint = crate::pipeline::foreman::situation_fingerprint(store, task_id)
+            .await?
+            .to_string();
+        Ok(stewardship.permits(&fingerprint).then_some(fingerprint))
+    }
+
+    /// 执行一次托管放行的自动动作，并**当场留账**（决策 210② 的硬要求）。
+    ///
+    /// 账分两处，各自回答不同的问题：
+    /// - 会话里一条 `system` 行（操作台记的）——「它什么时候、对哪个任务、第几次动的手」，
+    ///   人第二天早上在时间线上读得到；
+    /// - 任务行上的 `auto_resumes` / `last_fingerprint`——止损线要落库，重启后仍算数。
+    async fn run_steward_action(
+        &self,
+        call: &ToolCall,
+        ctx: &ToolCallContext,
+    ) -> Result<ToolOutcome> {
+        let runner = self
+            .steward_actions
+            .as_ref()
+            .ok_or_else(|| Error::Validation("托管动作没有执行者（不注入不放行）".into()))?;
+        let args = Self::args(call)?;
+        let task_id = args
+            .get("task_id")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
+        // 授权在**执行前**再取一次：上一步的检查与这一步之间没有任何 await 之外的东西，
+        // 但账要记在动手之后（记「动了几次」而不是「打算动几次」）。
+        let grant = self.steward_grant(call).await?;
+        let outcome = runner.run(call.clone(), ctx.clone()).await?;
+        if let (Some(store), Some(fingerprint)) = (&self.ledger, grant) {
+            if let Ok(task) = store.get_task(&task_id).await {
+                let mut stewardship = task.stewardship.clone().unwrap_or_default();
+                stewardship.note_auto_resume(&fingerprint, store.now());
+                let nth = stewardship.auto_resumes;
+                store.set_stewardship(&task_id, Some(&stewardship)).await?;
+                if let Some(session_id) = ctx.session_id.as_deref() {
+                    let content = format!(
+                        "【托管】自动 resume：任务 {task_id}（第 {nth}/{} 次，动作 continue）。\
+                         依据指纹 {fingerprint}。超出次数或指纹相同即停手，等你按键。",
+                        crate::types::STEWARDSHIP_MAX_AUTO_RESUMES
+                    );
+                    if let Err(e) = store
+                        .append_foreman_message(crate::storage::NewForemanMessage::system(
+                            session_id, content,
+                        ))
+                        .await
+                    {
+                        tracing::error!(task = %task_id, "托管动作的留痕写不进去：{e}");
+                    }
+                }
+            }
+        }
+        Ok(outcome)
     }
 
     /// 把一次调用落成提议（决策 188 / 207），返回回灌进对话的那句话。

@@ -471,6 +471,8 @@ async fn run_env_tool(
         ForemanMoment::ConfirmedPress,
         // 不分级：人已经按下了那颗钮，这一趟不是「自动轮」
         &[],
+        // 也不注入托管执行者：按键那一趟根本走不到托管分支（`confirmed_once` 已短路）
+        None,
     );
     let call = agentpipeline_core::agent::client::ToolCall {
         id: proposal.id.clone(),

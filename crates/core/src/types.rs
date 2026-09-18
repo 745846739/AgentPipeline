@@ -986,6 +986,8 @@ pub struct Task {
     pub archived_at: Option<DateTime<Utc>>,
     pub stalled: bool,
     pub executor_owner: Option<String>,
+    /// 任务级托管（决策 210① / 票 08）。`None` = 从来没开过。
+    pub stewardship: Option<Stewardship>,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
 }
@@ -1028,6 +1030,56 @@ impl NodeCursor {
 
     pub fn is_pending(&self) -> bool {
         self.status == CursorStatus::Pending
+    }
+}
+
+/// 任务级托管（决策 210① / 票 08）。
+///
+/// **默认关**。打开之后，值班长可以在**这一个任务**上免按键 `resume(continue)`——
+/// 恰好一个动作，别的（`retry` / `merge` / `review` / `cancel` / `create`）永远仍要人按。
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
+pub struct Stewardship {
+    /// 托管开着没有。
+    pub enabled: bool,
+    /// 已被值班长**自动** resume 过的次数（决策 210⑨ 的止损：满 [`STEWARDSHIP_MAX_AUTO_RESUMES`] 次）。
+    ///
+    /// 落库而不是放内存：票 05 已经吃过「内存状态重启即失」的亏（`TickReport.reminded`），
+    /// 而这里失掉的是**止损线**——重启后重新数一遍等于上限不存在。
+    pub auto_resumes: u32,
+    /// 上一次自动动手时的态势指纹（决策 210⑨：同一指纹不重复动手）。
+    ///
+    /// 与次数是**两条独立的闸**：单靠次数挡不住「同一件事被反复触发」，单靠指纹挡不住
+    /// 「每次指纹都不同但都没用」。两个一起才封住。
+    pub last_fingerprint: Option<String>,
+    pub updated_at: Option<DateTime<Utc>>,
+}
+
+/// 同一个任务的自动 `resume` 次数上限（决策 210⑨：N = 2）。
+pub const STEWARDSHIP_MAX_AUTO_RESUMES: u32 = 2;
+
+impl Stewardship {
+    /// 打开托管。**计数与指纹一起清零**：新开的一次托管是新的授权，不是上一次的续期。
+    pub fn enabled_now(now: DateTime<Utc>) -> Self {
+        Stewardship {
+            enabled: true,
+            auto_resumes: 0,
+            last_fingerprint: None,
+            updated_at: Some(now),
+        }
+    }
+
+    /// 这一次动手许可吗（决策 210⑨ 的两条闸）。
+    pub fn permits(&self, fingerprint: &str) -> bool {
+        self.enabled
+            && self.auto_resumes < STEWARDSHIP_MAX_AUTO_RESUMES
+            && self.last_fingerprint.as_deref() != Some(fingerprint)
+    }
+
+    /// 记一次自动动手。
+    pub fn note_auto_resume(&mut self, fingerprint: &str, now: DateTime<Utc>) {
+        self.auto_resumes += 1;
+        self.last_fingerprint = Some(fingerprint.to_string());
+        self.updated_at = Some(now);
     }
 }
 

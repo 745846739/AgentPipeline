@@ -27,6 +27,86 @@ use agentpipeline_core::storage::Store;
 
 use crate::state::ResumeHook;
 
+/// 托管放行的自动动作在 app 层的执行者（决策 210② / 票 08）。
+///
+/// 走 `pipeline::resume::apply_resume` —— 与 `POST /tasks/{id}/resume` **同一份实现**。
+/// 抄一份到这里等于两套「resume 做了什么」，它们迟早漂移成「界面按得动、它按不动」。
+pub struct StewardResume {
+    store: Store,
+    settings: Settings,
+    resume: ResumeHook,
+}
+
+impl StewardResume {
+    pub fn new(store: Store, settings: Settings, resume: ResumeHook) -> Self {
+        StewardResume {
+            store,
+            settings,
+            resume,
+        }
+    }
+}
+
+impl agentpipeline_core::agent::tools::StewardActionRunner for StewardResume {
+    fn run(
+        &self,
+        call: agentpipeline_core::agent::client::ToolCall,
+        _ctx: agentpipeline_core::agent::tools::ToolCallContext,
+    ) -> futures::future::BoxFuture<
+        'static,
+        agentpipeline_core::Result<agentpipeline_core::agent::tools::ToolOutcome>,
+    > {
+        use agentpipeline_core::pipeline::resume::{apply_resume, ResumeRequest};
+
+        let store = self.store.clone();
+        let settings = self.settings.clone();
+        let resume = self.resume.clone();
+        Box::pin(async move {
+            let args: serde_json::Value = serde_json::from_str(&call.arguments).map_err(|e| {
+                agentpipeline_core::Error::Validation(format!("托管动作的参数不是合法 JSON：{e}"))
+            })?;
+            let task_id = args
+                .get("task_id")
+                .and_then(|v| v.as_str())
+                .unwrap_or_default()
+                .to_string();
+            let request = ResumeRequest {
+                action: args
+                    .get("resume_action")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or_default()
+                    .to_string(),
+                cursor_id: args
+                    .get("cursor_id")
+                    .and_then(|v| v.as_str())
+                    .map(str::to_string),
+                target_stage: args
+                    .get("target_stage")
+                    .and_then(|v| v.as_str())
+                    .map(str::to_string),
+                target_node: args
+                    .get("target_node")
+                    .and_then(|v| v.as_str())
+                    .map(str::to_string),
+                input: args.get("input").and_then(|v| v.as_str()).map(str::to_string),
+            };
+            let applied = apply_resume(&store, &settings, &resume, &task_id, &request).await?;
+            Ok(agentpipeline_core::agent::tools::ToolOutcome::ok(format!(
+                "已自动放行（托管）：任务 {task_id}，动作 {}，游标 {}，{}",
+                applied.action,
+                applied.cursor_id,
+                if applied.requeued {
+                    "已交还准入，等下一个 tick 放行"
+                } else if applied.spawned {
+                    "执行器已拉起"
+                } else {
+                    "在冷却窗口内，未重复拉起"
+                }
+            )))
+        })
+    }
+}
+
 /// 小时级维护周期（决策 55：会话清理 + 指标聚合与 10s tick 分开）。
 pub const MAINTENANCE_INTERVAL: Duration = Duration::from_secs(3600);
 

@@ -453,13 +453,21 @@ pub async fn serve(options: ServeOptions) -> anyhow::Result<ServerHandle> {
     let repo: Arc<dyn SkillRepo> = Arc::new(Libgit2Repo::new(home.root().join("market-repos")));
     // 值班长（决策 182）：与执行器共用同一个 LLM 出口。构造在 `AppState::new` 之前
     // ——那一步会消费掉 store / home / settings。
-    let foreman = Arc::new(ForemanRunner::new(
-        store.clone(),
-        settings.clone(),
-        home.clone(),
-        runtime.llm(),
-        sse.clone(),
-    ));
+    let foreman = Arc::new(
+        ForemanRunner::new(
+            store.clone(),
+            settings.clone(),
+            home.clone(),
+            runtime.llm(),
+            sse.clone(),
+        )
+        // 托管放行的自动动作（决策 210② / 票 08）：走与 resume 端点**同一份实现**。
+        .with_steward_actions(Arc::new(crate::runtime::StewardResume::new(
+            store.clone(),
+            settings.clone(),
+            runtime.resume_hook.clone(),
+        ))),
+    );
     // 值守轮（决策 209④ / 票 06）：与调度器的 10s tick 分开驱动——它要花模型的钱，
     // 且「醒不醒」的判据在 `ForemanRunner::watch` 里（有待办 + 去抖窗口到期）。
     runtime.spawn_watch_loop(foreman.clone(), shutdown_tx.subscribe());

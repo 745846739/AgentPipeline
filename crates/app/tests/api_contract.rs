@@ -220,6 +220,11 @@ async fn delete(api: &Api, uri: &str) -> (StatusCode, Value) {
     call(api, request("DELETE", uri).body(Body::empty()).unwrap()).await
 }
 
+/// 专门给「没接线」那条路用的构造（`api()` 是另一个 harness，名字在用例里会被局部变量遮住）。
+async fn api_for_unwired_probe() -> Api {
+    api().await
+}
+
 async fn seed(api: &Api, task_id: &str) -> String {
     let project_id = format!("proj-{task_id}");
     seed_project(
@@ -4298,13 +4303,22 @@ async fn api_full_with_foreman(settings: Settings, agent: Option<FakeAgent>) -> 
     // 在它的实参位置里读 `state.home` 是「移动后借用」。
     let state = match agent {
         Some(agent) => {
-            let runner = Arc::new(ForemanRunner::new(
-                state.store.clone(),
-                state.settings.clone(),
-                state.home.clone(),
-                Arc::new(agent) as Arc<dyn LlmClient>,
-                state.sse.clone(),
-            ));
+            // 与生产接线同形（serve.rs）：托管放行的自动动作走 resume 的唯一实现。
+            // 测试里少这一句，那条路（票 08 的 `task resume continue`）就只会在生产里跑。
+            let runner = Arc::new(
+                ForemanRunner::new(
+                    state.store.clone(),
+                    state.settings.clone(),
+                    state.home.clone(),
+                    Arc::new(agent) as Arc<dyn LlmClient>,
+                    state.sse.clone(),
+                )
+                .with_steward_actions(Arc::new(app::runtime::StewardResume::new(
+                    state.store.clone(),
+                    state.settings.clone(),
+                    state.resume_hook.clone(),
+                ))),
+            );
             state.with_foreman(runner)
         }
         None => state,
@@ -4318,6 +4332,122 @@ async fn api_full_with_foreman(settings: Settings, agent: Option<FakeAgent>) -> 
         resumes,
         clock,
     }
+}
+
+
+// ─────────────── 任务级托管：端点与自动放行（决策 210② / 票 08）───────────────
+
+#[tokio::test]
+async fn stewardship_is_a_task_level_switch_read_back_on_the_task() {
+    let api = api_with_foreman(FakeAgent::new(Script::new())).await;
+    seed(&api, "t1").await;
+
+    // 默认没开：读回来是 null（不是 `enabled: false` —— 那会让「从没开过」与「开过又关了」混起来）
+    let (_, body) = get(&api, "/tasks/t1").await;
+    assert!(body["task"]["stewardship"].is_null(), "{body}");
+
+    let (status, body) = post(
+        &api,
+        "/tasks/t1/stewardship",
+        json!({"enabled": true}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["task"]["stewardship"]["enabled"], true);
+
+    // 看板回读：列表里也带得出来
+    let (_, list) = get(&api, "/tasks").await;
+    assert_eq!(list["tasks"][0]["stewardship"]["enabled"], true, "{list}");
+
+    // 关掉 = 清空那一列
+    let (status, _) = post(&api, "/tasks/t1/stewardship", json!({"enabled": false})).await;
+    assert_eq!(status, StatusCode::OK);
+    let (_, body) = get(&api, "/tasks/t1").await;
+    assert!(body["task"]["stewardship"].is_null(), "{body}");
+}
+
+#[tokio::test]
+async fn stewardship_is_refused_on_a_terminal_task_and_when_unwired() {
+    let api = api_with_foreman(FakeAgent::new(Script::new())).await;
+    seed(&api, "t1").await;
+    api.state
+        .store
+        .mark_terminal("t1", TaskStatus::Done)
+        .await
+        .unwrap();
+    let (status, body) = post(&api, "/tasks/t1/stewardship", json!({"enabled": true})).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    assert!(body["error"].as_str().unwrap().contains("终态"), "{body}");
+
+    // 没接线时这个开关没人用得上：503（与对讲台其余端点同一姿态）
+    let unwired = api_for_unwired_probe().await;
+    seed(&unwired, "t1").await;
+    let (status, body) = post(&unwired, "/tasks/t1/stewardship", json!({"enabled": true})).await;
+    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{body}");
+}
+
+#[tokio::test]
+async fn a_stewarded_task_is_resumed_by_the_foreman_without_a_press() {
+    // 端到端：开托管 → 值班长说 resume(continue) → **真的走了 resume 那条路**（无提议、有账）。
+    let agent = FakeAgent::new(Script::new());
+    let api = api_with_foreman(agent.clone()).await;
+    seed(&api, "t1").await;
+    api.state
+        .store
+        .set_cursor_pending(
+            &api.state.store.load_live_cursors("t1").await.unwrap()[0]
+                .cursor_id
+                .clone(),
+            &agentpipeline_core::types::PendingReason::new(
+                agentpipeline_core::types::PendingKind::RetryExhausted,
+                Stage::ArchitectDesign,
+                agentpipeline_core::types::Node::Execute,
+                "重试耗尽",
+            ),
+        )
+        .await
+        .unwrap();
+    api.state.store.sync_task_projection("t1").await.unwrap();
+    let (status, _) = post(&api, "/tasks/t1/stewardship", json!({"enabled": true})).await;
+    assert_eq!(status, StatusCode::OK);
+
+    let mut script = Script::new();
+    script.for_foreman().tool(
+        "task",
+        json!({"action": "resume", "task_id": "t1", "resume_action": "continue"}),
+    );
+    script.for_foreman().text("已放行。");
+    agent.set_script(script);
+
+    let (status, body) = post(&api, "/foreman/messages", json!({"text": "t1 卡住了"})).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+
+    // 提议一条都没有（人没按键），任务真的被放出去了（游标不再 pending）
+    let sid = body["session"]["id"].as_str().unwrap().to_string();
+    let pending = api
+        .state
+        .store
+        .list_pending_foreman_proposals(&sid)
+        .await
+        .unwrap();
+    assert!(pending.is_empty(), "{pending:?}");
+    let cursor = api.state.store.load_live_cursors("t1").await.unwrap()[0].clone();
+    assert!(
+        !cursor.is_pending(),
+        "托管放行后游标应当被拍过板：{cursor:?}"
+    );
+    // 留账（硬要求）
+    let messages = api
+        .state
+        .store
+        .list_foreman_messages(&sid, 100)
+        .await
+        .unwrap();
+    assert!(
+        messages.iter().any(|m| m.content.starts_with("【托管】")),
+        "{messages:?}"
+    );
+    assert_eq!(api.resumes.load(Ordering::SeqCst), 1, "执行器被拉起一次");
 }
 
 /// 空 home 下读会话：形状完整、合计为 0、不报错。
