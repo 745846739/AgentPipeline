@@ -1046,17 +1046,24 @@ mod tests {
     }
 
     /// `is_dirty` 的上限必须显著短于一般 git 操作——它只换来一条警告（决策 209）。
+    ///
+    /// 两条断言搬进 `const` 块：两边都是常量，本就不该在运行期比——这正是 clippy 1.98 的
+    /// `assertions_on_constants` 指出的。进 const 块之后，违反这条大小关系会**编译失败**，
+    /// 比跑测试更早拦下。代价是消息里不能插值（const 上下文只收字面量，E0015），
+    /// 故消息点常量名而不点数值——数值就在上面那两行常量定义里。
     #[test]
     fn is_dirty_timeout_is_shorter_than_the_general_bound() {
-        assert!(
-            IS_DIRTY_TIMEOUT_SEC < GIT_OP_TIMEOUT_SEC,
-            "脏检查上限（{IS_DIRTY_TIMEOUT_SEC}s）必须短于通用上限（{GIT_OP_TIMEOUT_SEC}s）"
-        );
-        assert!(
-            GIT_OP_TIMEOUT_SEC < 300,
-            "通用上限（{GIT_OP_TIMEOUT_SEC}s）必须压在 node_idle_timeout_sec 默认值 300s 之下，\
-             否则挂死会退化成杀不掉的节点超时"
-        );
+        const {
+            assert!(
+                IS_DIRTY_TIMEOUT_SEC < GIT_OP_TIMEOUT_SEC,
+                "脏检查上限（IS_DIRTY_TIMEOUT_SEC）必须短于通用上限（GIT_OP_TIMEOUT_SEC）"
+            );
+            assert!(
+                GIT_OP_TIMEOUT_SEC < 300,
+                "通用上限（GIT_OP_TIMEOUT_SEC）必须压在 node_idle_timeout_sec 默认值 300 之下，\
+                 否则挂死会退化成杀不掉的节点超时"
+            );
+        }
     }
 
     #[test]
