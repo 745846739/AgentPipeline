@@ -6,6 +6,8 @@
 #   make desktop-run   桌面调试：debug 壳直接跑（窗口导航到内嵌服务）
 #   make icon          重新生成桌面应用图标（规格 theme-6-pixel.md §2.5）
 #   make clean         清理构建产物（target / frontend/dist / node_modules / desktop target）
+#   make sweep         只清**可再生**的缓存（增量缓存 / deps/*.rcgu.o / cargo doc），
+#                      保留第三方 rlib 与 rmeta；`DRY=1 make sweep` 只报将删什么
 #
 # 质量闸门也在这里（决策 147 / 166，**决策 168 起本文件是闸门的唯一权威定义**：
 # justfile 已删除，`just` 未装在开发机上、维护两份定义只会漂移）：
@@ -25,7 +27,7 @@
 #   make smoke          启动冒烟（spawn 真二进制，E2E-00）
 #   make fmt            格式化（写回，非 check）
 
-.PHONY: build frontend backend run desktop desktop-run clean icon \
+.PHONY: build frontend backend run desktop desktop-run clean sweep icon \
         check check-lint check-test check-frontend check-e2e \
         unit integration api e2e smoke fmt
 
@@ -167,3 +169,24 @@ fmt:
 clean:
 	cargo clean
 	rm -rf frontend/dist frontend/node_modules crates/desktop/target
+
+# 缓存清理（`scripts/sweep-artifacts.sh`）：只删**可再生**的中间产物——增量缓存、
+# `deps/*.rcgu.o` 这类只增不减的一次性目标文件、`cargo doc` 产物。第三方 rlib / rmeta
+# 一律保留：它们是「改一处不必重编整棵依赖树」的前提（决策 178 的收益靠它兑现）。
+#
+# 为什么不并进 `clean`：`cargo clean` 连第三方产物一起删，下次是冷编——本机实测约
+# 20 分钟（见 check-test 处的更正）。本目标把「清缓存」与「清产物」分开，`clean` 仍是
+# 核选项、本目标是日常可重跑的那一档。
+#
+# 为什么不用 `cargo-sweep`（本机已装、仓库里也留着它的 sweep.timestamp）：它按**访问
+# 时间**判「过时」，而这里的堆积按时间算全是**新**的——2026-09-18 实测它只报 61 MiB
+# （`--stamp` 更是 0），而当时项目实占 29 GB、其中 18 GB 正是本脚本删掉的那类。
+#
+# 实测支撑（2026-09-18，决策 218 之后）：删净 root 的 9.2 GB 增量缓存与 131,924 个
+# `.rcgu.o` 后，`cargo build --workspace` 与 `cargo test --workspace --no-run` 都仍是
+# **0 个 crate 编译的空转**，`cargo test -p agentpipeline-core --lib` 469 passed。
+# 桌面壳是独立 workspace（决策 156），两个 target 树都在扫描范围内。
+# 完整理由、坑（131k 文件必须走 find 而非通配符）与逆向验证见该脚本文件头。
+# `DRY=1 make sweep` 只报将删什么，不动盘。
+sweep:
+	bash scripts/sweep-artifacts.sh

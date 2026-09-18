@@ -105,12 +105,21 @@ make api             # L3 API 契约（in-process axum router）
 make e2e             # L4 场景
 make smoke           # 启动冒烟（spawn 真二进制）
 make fmt             # 格式化（写回）
+# 构建缓存清理（非闸门，随时可跑）
+make sweep           # 只清可再生的缓存（增量缓存 / deps/*.rcgu.o / cargo doc），保留第三方 rlib
 ```
 
 **Makefile 是闸门的唯一权威定义**（决策 168）：原先并存的 `justfile` 已删除——
 开发机上未装 `just`，两份定义只会在改动时漂移，而 Makefile 是实际被执行的入口。
 `justfile` 独有的分层目标（`unit` / `integration` / `api` / `e2e` / `smoke` / `fmt`）
 已按原语义搬进 Makefile，名字不变。
+
+**构建缓存会只增不减**，而这件事 `cargo-sweep` 看不见——它按**访问时间**判「过时」，
+可这里的堆积按时间算全是**新**的（实测 `--stamp` 报 0、`--time 4` 只有 61 MiB，而项目
+实占 29 GB）。`make sweep` 只删**可再生**的中间产物：增量缓存、`deps/*.rcgu.o` 这类
+增量编译每次会话产生、cargo 从不回收的一次性目标文件、`cargo doc` 产物；第三方
+rlib / rmeta 一律保留，故清完不必重编整棵依赖树。`DRY=1 make sweep` 只报将删什么。
+核选项仍是 `make clean`（连第三方产物一起删，下次是冷编，本机实测约 20 分钟）。
 
 **产物新鲜度守卫（决策 166）：** `check-e2e` 跑用例前先确保被测对象是当前源码——
 前端源码比 `frontend/dist` 新则重建 dist，随后 `cargo build -p app`（dist 变化经
