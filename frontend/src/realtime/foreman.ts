@@ -215,6 +215,37 @@ export const FOREMAN_FAILED_TURN_MARK = '【没跑起来】';
  */
 export const FOREMAN_WATCH_MARK = '【值守播报】';
 
+/**
+ * 归因结构块的哨兵（`crates/core/src/pipeline/foreman.rs::FOREMAN_ATTRIBUTION_MARK` 的
+ * 前端镜像，决策 227 / 235 / 238）。
+ *
+ * 界面**不自己从正文里抠**这个块：解析点在后端一处（`parse_attribution`），界面拿的是
+ * 那一行的 `attribution` 字段。这个常量留在这里只是为了让「正文里那一行长什么样」在
+ * 前端也有一份可读的参照（e2e 的 mock 回话要照它写）。
+ */
+export const FOREMAN_ATTRIBUTION_MARK = '【归因】';
+
+/**
+ * 归因类别 → 界面上那个词（决策 235①：播报那一轮显示类别标记，四类各一个词）。
+ *
+ * `unlocated` 与缺值都返回 `null`：**不编一个假的类别**——「没给出类别」本身就是判据
+ * （决策 230 的第四项），界面把它画成一个类别会把这个事实抹掉。
+ */
+export function attributionLabel(kind: string | null | undefined): string | null {
+  switch (kind) {
+    case 'host':
+      return '宿主环境';
+    case 'pipeline':
+      return '流水线运行';
+    case 'project_code':
+      return '目标项目代码';
+    case 'prompt_config':
+      return 'prompt 与配置';
+    default:
+      return null;
+  }
+}
+
 /** 台账里一行带 id 的轮次（只取判据要用的三列）。 */
 export interface LedgerRow {
   id: number;

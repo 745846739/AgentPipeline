@@ -75,6 +75,12 @@ fn trim_conversation_messages(messages: &serde_json::Value) -> Vec<serde_json::V
 ///
 /// `delete_file` **在列**：决策 206 的清单里没写它（那是按「文件读写 + 命令」举例的），
 /// 但它与 `write_file` 是同一件事的两种形态——漏掉它，`deny` 就成了一堵带门的墙。
+///
+/// **`run_readonly` 不在列**（决策 237）：档位管的是「**能不能改动东西**」（决策 206），
+/// 而它改不了任何东西——白名单里没有一条能写（`sample` / `lsof` / `ps` 只读，
+/// `wc` / `tail` / `date` / `pgrep` 同理）。故它进只读层：三档语义一个都不动，
+/// 值守轮的 deny 清单也不拦它。这是**刻意的**，不是漏了——把它塞进这一层，
+/// `deny` 档下「自主轮能用白名单取证」就又不成立了（决策 232 要的正是那个）。
 pub const ENV_TOOLS: [&str; 9] = [
     "read_file",
     "write_file",
@@ -632,7 +638,10 @@ impl ToolExecutor {
             "read_task" => self.read_task(call).await?,
             "read_conversation" => self.read_conversation(call).await?,
             // 诊断包（决策 211③，票 03）：一次调用给出定因所需的全部证据。
-            "read_diagnosis" => self.read_diagnosis(call).await?,
+            "read_diagnosis" => self.read_diagnosis(call, ctx).await?,
+            // 只读取证（决策 232 / 237）：白名单命令、argv 直出。它**不在**环境层里，
+            // 故档位与值守轮的 deny 清单都管不到它——这正是「自主轮能取证」的落点。
+            "run_readonly" => self.run_readonly(call, ctx).await?,
             // A 层环境读数（决策 188 / 207，票 01）：全部只读，全部走后端既有口径。
             "read_board" => self.read_board().await?,
             "read_metrics" => self.read_metrics().await?,
@@ -1154,7 +1163,9 @@ impl ToolExecutor {
     /// 输出是**分节数组**而不是一个大对象，因为顺序在这里是有语义的：`serde_json` 默认按
     /// key 排序（没有 `preserve_order`），而 12k 截断是从尾部切的——被切掉的必须是长尾
     /// （命令台账、阶段产出），不是「为什么卡住」那一屏。数组保序，是这个语义的载体。
-    async fn read_diagnosis(&self, call: &ToolCall) -> Result<ToolOutcome> {
+    ///
+    /// `ctx` 进来只为一件东西：`latest_attribution` 按**班次**取（决策 235③）。
+    async fn read_diagnosis(&self, call: &ToolCall, ctx: &ToolCallContext) -> Result<ToolOutcome> {
         let store = self.ledger_or_err()?;
         let args = Self::args(call)?;
         let task_id = args
@@ -1271,7 +1282,14 @@ impl ToolExecutor {
             },
         }));
 
-        // ④ 命令台账：闸门命令与 agent 自己跑的都在这里（`stdout_path` 是全文的落点）。
+        // ⑤ 上一轮的归因类别（决策 235③）：不然下一轮又要重新问一遍自己「上次我怎么定的性」。
+        //    取**最近一条助理轮**的那个结构块（值守播报与人的回话都算），未定位时把原因一并给出
+        //    ——「上一轮我没给类别」本身是要看见的事实，不是要抹掉的痕迹。
+        sections.push(serde_json::json!({
+            "latest_attribution": latest_attribution(store, ctx).await?,
+        }));
+
+        // ⑥ 命令台账：闸门命令与 agent 自己跑的都在这里（`stdout_path` 是全文的落点）。
         sections.push(serde_json::json!({
             "commands": commands.iter().map(|c| serde_json::json!({
                 "id": c.id,
@@ -1290,13 +1308,13 @@ impl ToolExecutor {
             "commands_total": commands.len(),
         }));
 
-        // ⑤ 闸门输出：路径 + 尾部。路径是**确定**的（按 stage 命名，重跑覆盖同一文件），
+        // ⑦ 闸门输出：路径 + 尾部。路径是**确定**的（按 stage 命名，重跑覆盖同一文件），
         //    所以即便尾部被截，路径也足以让人 / 后续轮次取全文。
         sections.push(serde_json::json!({
             "gate_outputs": gate_outputs(&self.home, &task.id),
         }));
 
-        // ⑥ 阶段产出与验收标准：architect 的 acceptance_criteria 在这里。
+        // ⑧ 阶段产出与验收标准：architect 的 acceptance_criteria 在这里。
         sections.push(serde_json::json!({
             "stage_outputs": outputs.iter().map(|o| serde_json::json!({
                 "stage": o.stage.as_str(),
@@ -1605,6 +1623,14 @@ impl ToolExecutor {
                 "temperature": c.temperature,
                 "max_tokens": c.max_tokens,
                 "persona_path": c.persona_path,
+                // `persona_append` / `env_mode` / `node_overrides_json` 是**改动之前必须先看见**
+                // 的那三样（决策 236）：`config set` 是整条替换（留空即清成默认），
+                // 而看不见的东西没法「照着带回来」——2026-09-18 值班长正是因此**拒提**配置改动
+                // （它明说「read_stage_configs 不回显 node_overrides，所以这一改我看不全现状」）。
+                // 那时它不是保守，是没有可看的东西。
+                "persona_append": c.persona_append,
+                "env_mode": c.env_mode.map(|m| m.as_str()),
+                "node_overrides_json": c.node_overrides_json,
                 "skills_json": c.skills_json,
                 "idle_timeout_sec": c.idle_timeout_sec,
                 "max_duration_sec": c.max_duration_sec,
@@ -1842,6 +1868,216 @@ impl ToolExecutor {
         Ok(ToolOutcome::ok(in_context))
     }
 
+    /// `run_readonly`（决策 232 / 237）：**只读取证**——白名单命令、argv 直出、不经 shell。
+    ///
+    /// 三处判定全部在**启动进程之前**，任一条不过就拒绝、什么都不跑：
+    /// ① 命令名在白名单里；② 每个非选项参数按路径过既有的**文件域**（家目录根，`data/` 按
+    /// 前缀拒——库里明文存着 provider 密钥，决策 206 / 226）；③ `sample` 的 pid 落
+    /// 「本服务的 pid + 其子进程」集合内。
+    ///
+    /// **为什么值守轮放它而 `run_command` 不放**：它**改不了任何东西**，故进只读层——
+    /// 不受 `env_mode` 档位管、也不吃 `FOREMAN_WATCH_TOOL_DENY`。这正是决策 232 要的形状
+    /// （「夜里自己发现并定死」），而那一条当时**没有落点**：值守轮把 `run_command` 整个
+    /// 挡掉了，于是 7 次自主唤醒全部止步于「我定不死 / 等你按键」（决策 237 的起因）。
+    async fn run_readonly(&self, call: &ToolCall, ctx: &ToolCallContext) -> Result<ToolOutcome> {
+        let args = Self::args(call)?;
+        let program = args
+            .get("command")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| Error::Validation("run_readonly 缺少 command".into()))?
+            .trim()
+            .to_string();
+        // 参数形态只收数组：字符串形态看着方便，但「带空格的参数」在它上面解析不对，
+        // 而一份**含糊**的参数解析正是这条链最不该有的东西（决策 232 的「别用原样匹配
+        // 这种含糊话混过去」）。
+        let argv = match args.get("args") {
+            None | Some(serde_json::Value::Null) => Vec::new(),
+            Some(serde_json::Value::Array(items)) => items
+                .iter()
+                .map(|v| {
+                    v.as_str().map(str::to_string).ok_or_else(|| {
+                        Error::Validation("run_readonly 的 args 必须是字符串数组".into())
+                    })
+                })
+                .collect::<Result<Vec<String>>>()?,
+            Some(_) => {
+                return Err(Error::Validation(
+                    "run_readonly 的 args 必须是**字符串数组**，例如 [\"-n\",\"50\",\
+                     \"logs/agentpipeline.log\"]——字符串形态解析不了带空格的参数。"
+                        .into(),
+                ))
+            }
+        };
+        let cwd = ctx
+            .default_cwd
+            .clone()
+            .unwrap_or_else(|| ctx.worktree_path.clone());
+        // 台账里那一行的形状：argv 拼回一行（与 `run_command` 的 command 同一列）。
+        let rendered = if argv.is_empty() {
+            program.clone()
+        } else {
+            format!("{program} {}", argv.join(" "))
+        };
+
+        // ① 白名单：按**命令名**判定（argv 直出是它的前提——`sh -c "date; rm x"` 的名字是 `sh`）。
+        if !READONLY_COMMANDS.contains(&program.as_str()) {
+            return self
+                .refuse_readonly(
+                    ctx,
+                    &rendered,
+                    &cwd,
+                    format!(
+                        "run_readonly 只能跑这份白名单里的命令：{}（收到 {program:?}）。\
+                         要跑白名单外的命令，用 run_command 并让值班经理按键确认。",
+                        READONLY_COMMANDS.join(" / ")
+                    ),
+                )
+                .await;
+        }
+        // ② 文件域：非选项参数一律按路径判（相对路径按这次调用的 cwd 解析）。
+        //    选项（`-eo pid,ppid`）跳过——它们不含路径语义；不含 `/` 的裸词（`pgrep -fl git`
+        //    里的搜索词）解析到家目录根之下，照常放行，而 `.env` 这类仍会被既有的
+        //    **模式**名单拦下（`foreman_file_policy` 的 deny_paths）。
+        for arg in &argv {
+            if let Some(path) = readonly_path_arg(arg, &cwd) {
+                if let Err(denied) = self.policy.check_read(&path) {
+                    return self
+                        .refuse_readonly(ctx, &rendered, &cwd, denied.to_string())
+                        .await;
+                }
+            }
+        }
+
+        // ③ `sample` 的 pid：这份白名单里唯一能读走**别的进程内存镜像**的一个
+        //    （栈里可能落到密钥、prompt、对话原文），故只许对本服务自己的树取证。
+        if program == "sample" {
+            let Some(pid) = readonly_sample_pid(&argv) else {
+                return self
+                    .refuse_readonly(
+                        ctx,
+                        &rendered,
+                        &cwd,
+                        "sample 需要一个数字 pid 参数（按进程名取样不受支持：那会绕过 pid 校验）。"
+                            .to_string(),
+                    )
+                    .await;
+            };
+            let ours = std::process::id();
+            if !pid_reaches_us(pid, ours, real_parent_pid) {
+                return self
+                    .refuse_readonly(
+                        ctx,
+                        &rendered,
+                        &cwd,
+                        format!(
+                            "sample 只允许对本服务的进程取证：pid {pid} 既不是本进程（{ours}）\
+                             也不是它的子孙进程。"
+                        ),
+                    )
+                    .await;
+            }
+        }
+
+        // 命令台账（§12.4.4）：值与 `run_command` 同一条口径——argv 拼回一行、过脱敏、
+        // 归属走会话（值班长）或任务（决策 204④）。审计面要看得见每一次取证。
+        let sanitized = super::sanitize::sanitize_command_line(&rendered);
+        let command_id = self.record_command_start(ctx, &sanitized, &cwd).await?;
+        if let Some(rec) = &self.recorder {
+            rec.touch_heartbeat(ctx.run_id).await?;
+        }
+
+        let explicit_timeout = args.get("timeout_sec").and_then(|v| v.as_u64());
+        let timeout_sec =
+            effective_run_command_timeout(&self.settings, ctx.stage, explicit_timeout);
+        let heartbeat = self.spawn_command_heartbeat(ctx.run_id);
+        let started = Instant::now();
+        let mut child_pgid: Option<i32> = None;
+        let collected = std::sync::Arc::new(std::sync::Mutex::new(CollectedOutput::default()));
+        let output = match crate::process::spawn_argv_in_own_process_group(&program, &argv, &cwd) {
+            Ok(child) => {
+                child_pgid = child.id().map(|id| id as i32);
+                if let (Some(rec), Some(run_id), Some(pgid)) =
+                    (self.recorder.as_ref(), ctx.run_id, child_pgid)
+                {
+                    rec.set_process_group(run_id, pgid).await?;
+                }
+                let collect = self.spawn_streaming_collector(child, command_id, collected.clone());
+                tokio::time::timeout(std::time::Duration::from_secs(timeout_sec), collect).await
+            }
+            Err(e) => Ok(Err(e)),
+        };
+        if let Some(task) = &heartbeat {
+            task.abort();
+        }
+        let duration_ms = started.elapsed().as_millis() as u64;
+        let (exit_code, stdout, stderr) = match output {
+            Ok(Ok(status)) => {
+                let out = collected.lock().unwrap().clone();
+                (status.code(), out.stdout, out.stderr)
+            }
+            Ok(Err(e)) => (None, String::new(), format!("命令启动失败：{e}")),
+            Err(_) => {
+                let out = collected.lock().unwrap().clone();
+                if let Some(pgid) = child_pgid {
+                    let _ = self.killer.kill_process_group(pgid);
+                }
+                (None, out.stdout, format!("命令超时（{timeout_sec}s）"))
+            }
+        };
+
+        // 输出脱敏在**回填 messages 之前**（决策 118），再走与 `run_command` 同一套裁剪 / 卸载。
+        let stdout = sanitize_text(&stdout);
+        let stderr = sanitize_text(&stderr);
+        let (in_context, offload_path) = self.prepare_output(ctx, &stdout, &stderr)?;
+        if let Some(rec) = &self.recorder {
+            if let Some(id) = command_id {
+                rec.record_finish(
+                    id,
+                    CommandFinish {
+                        exit_code,
+                        stdout_path: offload_path,
+                        stdout_preview: Some(head_tail(&stdout, 50, 100)),
+                        stderr_preview: Some(head_tail(&stderr, 50, 100)),
+                        duration_ms,
+                    },
+                )
+                .await?;
+            }
+            rec.touch_heartbeat(ctx.run_id).await?;
+        }
+        // 命令自己以非零退出（`tail` 的文件不存在之类）**不是**策略拒绝：回执原样交回去，
+        // 让模型看着真输出改道——它正在取证，一条读不到的文件本来就是要报出来的事实。
+        Ok(ToolOutcome::ok(in_context))
+    }
+
+    /// 拒掉一次只读取证，**并把这次尝试记下来**（决策 179 的口径：审计面必须看得见被拒的
+    /// 每一次尝试，否则策略在日志里完全不可见，只剩模型侧的一次报错）。
+    ///
+    /// `exit_code` 留空而不是编一个数：**没有进程跑起来**，就没有退出码可填——这里与
+    /// `run_command` 的出口拒绝（那一侧真编了一个约定的码）不同，因为那条路数的是「出口
+    /// 策略拦下的一次调用」，而这一条是「参数没过校验」。
+    async fn refuse_readonly(
+        &self,
+        ctx: &ToolCallContext,
+        rendered: &str,
+        cwd: &Path,
+        reason: String,
+    ) -> Result<ToolOutcome> {
+        let sanitized = super::sanitize::sanitize_command_line(rendered);
+        let id = self.record_command_start(ctx, &sanitized, cwd).await?;
+        if let (Some(rec), Some(id)) = (self.recorder.as_ref(), id) {
+            rec.record_finish(
+                id,
+                CommandFinish {
+                    stderr_preview: Some(reason.clone()),
+                    ..Default::default()
+                },
+            )
+            .await?;
+        }
+        Err(Error::PolicyDenied(reason))
+    }
+
     /// 落一条命令日志的「开始」并返回 id（未接记录器时 `None`）。
     ///
     /// 被拒的出口与正常执行**走同一个入口**（决策 179，票 12）：审计面必须看得见每一次
@@ -2006,6 +2242,43 @@ impl ToolExecutor {
             Some(path.display().to_string()),
         ))
     }
+}
+
+/// 诊断包里回看多少条会话消息来找「上一轮的归因」（决策 235③）。
+const FOREMAN_ATTRIBUTION_LOOKBACK: usize = 20;
+
+/// 最近一条**助理轮**的归因类别（决策 235③）。
+///
+/// 取值域是**这个班次**：归因声明落在值班长自己的回话里，而「最近一次」就是「上一轮我怎么
+/// 定的性」。没有班次（流水线侧那条路）时给 `null`——不编一个类别，也不假装没这条读数。
+async fn latest_attribution(store: &Store, ctx: &ToolCallContext) -> Result<serde_json::Value> {
+    let Some(session_id) = ctx.session_id.as_deref() else {
+        return Ok(serde_json::Value::Null);
+    };
+    let messages = store
+        .list_foreman_messages(session_id, FOREMAN_ATTRIBUTION_LOOKBACK)
+        .await?;
+    let Some(last) = messages
+        .iter()
+        .rev()
+        .find(|m| m.role == crate::storage::foreman::FOREMAN_ROLE_ASSISTANT)
+    else {
+        return Ok(serde_json::Value::Null);
+    };
+    let parsed = crate::pipeline::foreman::parse_attribution(&last.content);
+    Ok(serde_json::json!({
+        "message_id": last.id,
+        "at": last.created_at.to_rfc3339(),
+        "attribution": parsed.wire(),
+        "label": parsed.kind().map(|k| k.label()),
+        // 未定位时给原因（missing / 四类之外 / …）：**「上一轮我没给出类别」本身是要看见的
+        // 事实**，不是要抹掉的痕迹（决策 230 把「没有证据」与「证据归错 run」同判失败）。
+        "reason": parsed.reason(),
+        "payload": match &parsed {
+            crate::pipeline::foreman::Attribution::Invalid { payload, .. } => Some(payload.clone()),
+            _ => None,
+        },
+    }))
 }
 
 fn collect_entries(root: &Path, recursive: bool, out: &mut Vec<String>) -> Result<()> {
@@ -2197,8 +2470,84 @@ fn model_request_digest(
     })
 }
 
-/// 一条 run 的摘要（诊断包的第 ③ 节与「最近那次失败」共用同一形状）。
+// ─────────────────── 只读取证的白名单命令（决策 232 / 237）───────────────────
+
+/// `run_readonly` 能跑的命令，**这就是它的全部能力**（决策 232 的最小集 + `sample`）。
 ///
+/// 收在这一个常量里而不是散在提示词与校验两处：白名单是这份工具的安全边界本身，
+/// 两处各写一份就会漂移——而漂移的方向是「提示词里说能跑、执行点拒了」（模型反复试）
+/// 或更坏的「提示词里没说、执行点放行」。
+pub const READONLY_COMMANDS: [&str; 7] = ["date", "ps", "pgrep", "lsof", "wc", "tail", "sample"];
+
+/// 一个参数要不要按**路径**过文件域，是则返回解析后的候选路径。
+///
+/// 判据是「不是选项」——以 `-` 开头的跳过（它们不含路径语义，`-eo pid,ppid` 这种参数串
+/// 里那个逗号没有别的读法），其余一律按路径处理：相对路径按这次调用的 cwd 解析，
+/// 交给既有的 [`FileToolPolicy::check_read`] 判。这个方向是**保守**的——不含 `/` 的裸词
+/// （`pgrep -fl git` 里的搜索词）解析到家目录根之下，照常放行；而 `.env` 这类仍会被
+/// 那份额外的**模式**名单（`foreman_file_policy` 的 `deny_paths`）拦下。
+fn readonly_path_arg(arg: &str, cwd: &Path) -> Option<PathBuf> {
+    let arg = arg.trim();
+    if arg.is_empty() || arg.starts_with('-') {
+        return None;
+    }
+    let path = Path::new(arg);
+    Some(if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        cwd.join(path)
+    })
+}
+
+/// `sample` 要取的 pid：**第一个非选项参数**，且必须是纯数字
+/// （`sample <pid> <duration> [interval]`）。
+///
+/// 只认数字、**不认进程名**：`sample Safari 10` 这种写法会让「按名字取一个进程」绕过
+/// pid 校验，而 pid 校验正是这一条的全部安全面（它读的是别人的内存镜像）。判据取
+/// **第一个**非选项参数而不是「第一个数字」：后者会把 `sample Safari 5` 里的时长当成 pid，
+/// 于是名字形态在「时长恰好落在本服务进程树里」时溜过去。
+fn readonly_sample_pid(argv: &[String]) -> Option<u32> {
+    let first = argv.iter().find(|a| !a.trim().starts_with('-'))?;
+    first.trim().parse::<u32>().ok()
+}
+
+/// `pid` 是否落在「本服务的 pid + 其子进程」集合内：从 `pid` **沿父链往上走**，看能不能走到
+/// 本进程。往下枚举子孙要把整张进程表读出来，往上走只需树的深度那么多步，故它有界。
+///
+/// `parent_of` 是可注入的读父 pid（生产实现见 [`real_parent_pid`]）——进程树在测试里造不出来，
+/// 而这个谓词是这条工具最要紧的一处判定，不能只靠「生产里跑过一次」来保证。
+fn pid_reaches_us(start: u32, ours: u32, parent_of: impl Fn(u32) -> Option<u32>) -> bool {
+    let mut current = start;
+    // 上限 64：进程树深不到那里，而有了它就不怕父链成环（坏数据不该让判定永远转下去）。
+    for _ in 0..64 {
+        if current == ours {
+            return true;
+        }
+        match parent_of(current) {
+            Some(parent) if parent != current && parent > 0 => current = parent,
+            _ => return false,
+        }
+    }
+    false
+}
+
+/// 真实读父 pid：`ps -o ppid= -p <pid>`。
+///
+/// 用 `ps` 而不是 libc：本仓对 libc 只留了进程组那一条（决策 66 的 `kill` 做法），
+/// 读父 pid 不值得再引一套绑定。读不到（进程已退出 / 参数非法）返回 `None`，
+/// 判定方向是**不在集合内**。
+fn real_parent_pid(pid: u32) -> Option<u32> {
+    let out = std::process::Command::new("ps")
+        .arg("-o")
+        .arg("ppid=")
+        .arg("-p")
+        .arg(pid.to_string())
+        .output()
+        .ok()?;
+    String::from_utf8_lossy(&out.stdout).trim().parse().ok()
+}
+
+/// 一条 run 的摘要（诊断包的第 ③ 节与「最近那次失败」共用同一形状）。
 /// `process_group_id` 不给原值、只给「空不空」：它是判「超时杀不杀得掉」的**唯一线索**
 /// （决策 209 的实证：系统节点没有进程组，于是那一轮超时也杀不掉），而原值对模型没有意义。
 fn run_digest(run: &NodeRun) -> serde_json::Value {
@@ -2262,6 +2611,83 @@ fn gate_outputs(home: &Home, task_id: &str) -> Vec<serde_json::Value> {
 mod tests {
     use super::*;
     use std::sync::Mutex;
+
+    // ── 只读取证的三条判定（决策 232 / 237）：纯函数部分 ──
+
+    #[test]
+    fn readonly_path_args_skip_options_and_resolve_relative_to_the_call_cwd() {
+        let cwd = Path::new("/home/u");
+        // 选项不是路径（`-eo pid,ppid` 里那个逗号没有别的读法）。
+        assert_eq!(readonly_path_arg("-eo", cwd), None);
+        assert_eq!(readonly_path_arg("-n", cwd), None);
+        assert_eq!(readonly_path_arg("", cwd), None);
+        // 相对路径按这次调用的 cwd 解析（不是进程 cwd——那会让域判定跟着服务的工作目录走）。
+        assert_eq!(
+            readonly_path_arg("logs/a.log", cwd),
+            Some(PathBuf::from("/home/u/logs/a.log"))
+        );
+        assert_eq!(
+            readonly_path_arg("../x", cwd),
+            Some(PathBuf::from("/home/u/../x"))
+        );
+        assert_eq!(
+            readonly_path_arg("/etc/hosts", cwd),
+            Some(PathBuf::from("/etc/hosts"))
+        );
+    }
+
+    #[test]
+    fn sample_takes_a_numeric_pid_and_not_a_process_name() {
+        let argv = |items: &[&str]| items.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        assert_eq!(readonly_sample_pid(&argv(&["1234", "5", "1"])), Some(1234));
+        // 选项在前也认（`sample -mayDie 1234 5`）。
+        assert_eq!(
+            readonly_sample_pid(&argv(&["-mayDie", "1234", "5"])),
+            Some(1234)
+        );
+        // 按**进程名**取样不给过：那会绕过 pid 校验（它读的是别人的内存镜像）。
+        assert_eq!(readonly_sample_pid(&argv(&["Safari", "10"])), None);
+        assert_eq!(readonly_sample_pid(&argv(&[])), None);
+    }
+
+    #[test]
+    fn the_pid_gate_walks_up_the_parent_chain_to_us() {
+        // 10 = 本服务；30 → 20 → 10 是它的子孙；77 → 1 → 0 不是。
+        let tree = |pid: u32| match pid {
+            30 => Some(20),
+            20 => Some(10),
+            77 => Some(1),
+            1 => Some(0),
+            _ => None,
+        };
+        assert!(pid_reaches_us(10, 10, tree));
+        assert!(pid_reaches_us(30, 10, tree));
+        assert!(pid_reaches_us(20, 10, tree));
+        assert!(!pid_reaches_us(77, 10, tree));
+        assert!(!pid_reaches_us(1, 10, tree));
+        // 坏数据（父链成环 / 自指）不该让判定永远转下去，也不该误判为「是我们的孩子」。
+        let cycle = |pid: u32| match pid {
+            5 => Some(6),
+            6 => Some(5),
+            _ => None,
+        };
+        assert!(!pid_reaches_us(5, 10, cycle));
+        assert!(!pid_reaches_us(9, 10, Some));
+    }
+
+    #[test]
+    fn the_whitelist_is_the_one_decision_232_froze() {
+        // 这份清单**就是**这个工具的全部能力，故它被逐字钉在这里：改它 = 改安全边界，
+        // 必须在 diff 里显式可见（与工具清单的冻结断言同一个姿态）。
+        assert_eq!(
+            READONLY_COMMANDS,
+            ["date", "ps", "pgrep", "lsof", "wc", "tail", "sample"]
+        );
+        // 一个能改东西的命令都不在里面。
+        for write_capable in ["sh", "rm", "mv", "cp", "tee", "dd", "curl"] {
+            assert!(!READONLY_COMMANDS.contains(&write_capable));
+        }
+    }
 
     /// 记录器替身：记录调用，不落库。
     #[derive(Default)]

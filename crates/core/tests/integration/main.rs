@@ -27,6 +27,7 @@ mod pairing;
 mod process_group;
 mod production_llm;
 mod project_analysis_observation;
+mod readonly;
 mod repair;
 mod repo_live;
 mod scheduler_tick;

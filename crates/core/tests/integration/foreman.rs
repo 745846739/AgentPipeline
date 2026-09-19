@@ -15,9 +15,10 @@ use agentpipeline_core::clock::Clock;
 use agentpipeline_core::config::Settings;
 use agentpipeline_core::metrics;
 use agentpipeline_core::pipeline::foreman::{
-    build_briefing, foreman_tool_names, situation_fingerprint, trim_history, ForemanRunner,
-    ForemanToolLayer, FOREMAN_AGENT_TYPE, FOREMAN_FAILED_TURN_MARK, FOREMAN_MAX_ROUNDS,
-    FOREMAN_PERSONA, FOREMAN_STAGE_KEY, FOREMAN_TOOL_SPECS, FOREMAN_WATCH_MARK, OPERATION_LOG_MARK,
+    build_briefing, foreman_tool_names, situation_fingerprint, trim_history, AttributionKind,
+    ForemanRunner, ForemanToolLayer, FOREMAN_AGENT_TYPE, FOREMAN_ATTRIBUTION_MARK,
+    FOREMAN_FAILED_TURN_MARK, FOREMAN_MAX_ROUNDS, FOREMAN_PERSONA, FOREMAN_STAGE_KEY,
+    FOREMAN_TOOL_SPECS, FOREMAN_WATCH_MARK, OPERATION_LOG_MARK,
 };
 use agentpipeline_core::storage::foreman::NewForemanMessage;
 use agentpipeline_core::storage::model_requests::{
@@ -1368,6 +1369,13 @@ async fn the_automatic_turn_cannot_reach_the_expensive_tools() {
         watch_tools.contains(&"read_diagnosis".to_string()),
         "自动轮仍要看得到诊断包（它是台账类）：{watch_tools:?}"
     );
+    // 决策 232 / 237：自主轮拿得到**只读取证**的手——正是这一份白名单命令
+    // （`sample` / `pgrep` / `lsof`）让「夜里自己发现并定死」在工具面上成立；
+    // 而写的那只手（`run_command`）照旧被挡着。
+    assert!(
+        watch_tools.contains(&"run_readonly".to_string()),
+        "自动轮要拿得到只读取证：{watch_tools:?}"
+    );
 
     runner.say(None, "t1 怎么了？").await.unwrap();
     let human_tools: Vec<String> = agent
@@ -1868,6 +1876,10 @@ async fn the_foreman_tool_set_matches_the_frozen_contract() {
             // 它**不扩 `read_task`**——后者是每轮值守都会调的高频、便宜读数，混进来会让
             // 「看一眼任务状态」开始烧 12k 字符。
             "read_diagnosis",
+            // 只读取证的命令（决策 237 / 票 02）：白名单就是它的全部能力（不经 shell、
+            // 按命令名判定，`sample` 只许对本服务的 pid 与其子进程）。它属**只读层**，
+            // 故不受档位管、也不在值守轮的 deny 清单里——「自主轮能取证」正是它为的。
+            "run_readonly",
         ]
     );
     assert_eq!(
@@ -2035,6 +2047,23 @@ async fn the_system_prompt_tells_the_truth_about_what_it_can_do_in_each_tier() {
         );
     }
     assert!(ask.contains("值班经理"), "{ask}");
+
+    // 归因那段「必填」的规格在**三档里都要在**（决策 227 的必填 + 235 的载体 + 238 的形态）：
+    // 它是判据④的载体，而档位只该改「能不能动手」，不该改「怎么收口」。
+    for prompt in [&ask] {
+        assert!(
+            prompt.contains(FOREMAN_ATTRIBUTION_MARK),
+            "system prompt 要给出结构块的形状：{prompt}"
+        );
+        assert!(prompt.contains("四类之外不许收口"), "{prompt}");
+        for kind in AttributionKind::ALL {
+            assert!(
+                prompt.contains(kind.as_str()) && prompt.contains(kind.label()),
+                "四类里的 {} 要写进规格（稳定标识与词都要）：{prompt}",
+                kind.as_str()
+            );
+        }
+    }
 
     // `ask` 档（缺省）：说清「提了但没执行」，且把 C / E 层的工具名摆在纪律段里。
     assert!(ask.contains("待确认的提议"), "{ask}");
@@ -3355,4 +3384,311 @@ fn only_repair_worktree(h: &Harness) -> std::path::PathBuf {
         .collect();
     assert_eq!(found.len(), 1, "应当恰好一个修复 worktree：{found:?}");
     found.pop().unwrap()
+}
+
+// ─────────────── 归因结构块（决策 227 / 235 / 238，票 03）───────────────
+
+/// 结构块的解析判据（判决 235 的「四类之外不许收口」+ 238 的「同一个解析点」）。
+///
+/// 这些是纯函数用例：解析点是这一批裁定的**唯一校验面**，它上面每一条分支都得有名字——
+/// 否则「必填」与「不许越界」都只是人格里的一句话（决策 235 的起因正是一次
+/// 「格式漂亮但不可校验」的回话）。
+mod attribution {
+    use agentpipeline_core::pipeline::foreman::{parse_attribution, Attribution, AttributionKind};
+
+    #[test]
+    fn a_valid_block_locates_the_category() {
+        // 稳定标识与中文词都认（模型写出中文词是正常事，不认只会多一条假未定位）。
+        for (written, expected) in [
+            ("host", AttributionKind::Host),
+            ("pipeline", AttributionKind::Pipeline),
+            ("project_code", AttributionKind::ProjectCode),
+            ("prompt_config", AttributionKind::PromptConfig),
+            ("宿主环境", AttributionKind::Host),
+            ("流水线运行", AttributionKind::Pipeline),
+            ("目标项目代码", AttributionKind::ProjectCode),
+            ("prompt 与配置", AttributionKind::PromptConfig),
+        ] {
+            let text =
+                format!("它卡在 test.execute 上。\n【归因】{{\"attribution\":\"{written}\"}}\n");
+            assert_eq!(
+                parse_attribution(&text),
+                Attribution::Located(expected),
+                "写的是 {written}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_reply_without_the_block_is_missing_not_a_guess() {
+        let text = "我查了台账，看不出问题在哪。";
+        assert_eq!(parse_attribution(text), Attribution::Missing);
+        // 光有哨兵没有载荷也算没给（「根本没给」与「四类之外」都由这一个点判出）。
+        assert_eq!(
+            parse_attribution("【归因】\n"),
+            Attribution::Invalid {
+                payload: String::new(),
+                why: "JSON 解析失败",
+            }
+        );
+    }
+
+    #[test]
+    fn anything_outside_the_four_does_not_close() {
+        // 四类之外：不许收口（决策 235 的核心判据）。
+        let outside = "【归因】{\"attribution\":\"unknown_thing\"}\n";
+        assert_eq!(
+            parse_attribution(outside),
+            Attribution::Invalid {
+                payload: "{\"attribution\":\"unknown_thing\"}".into(),
+                why: "四类之外",
+            }
+        );
+        assert!(!parse_attribution(outside).is_located());
+        // 坏 JSON / 缺字段：同样是未定位，但原因分得开（排查要看得出是哪一种）。
+        assert!(matches!(
+            parse_attribution("【归因】宿主环境\n"),
+            Attribution::Invalid {
+                why: "JSON 解析失败",
+                ..
+            }
+        ));
+        assert!(matches!(
+            parse_attribution("【归因】{\"kind\":\"host\"}\n"),
+            Attribution::Invalid {
+                why: "缺 attribution 字段",
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn repeated_or_contradictory_blocks_do_not_close() {
+        // 合规的一次 + 夹带的一次不合规：按**最严的一处**判——不让人靠夹带一个合规字样收口。
+        let smuggled =
+            "【归因】{\"attribution\":\"pipeline\"}\n【归因】{\"attribution\":\"whatever\"}\n";
+        assert!(matches!(
+            parse_attribution(smuggled),
+            Attribution::Invalid {
+                why: "四类之外",
+                ..
+            }
+        ));
+        // 结构块**以整行出现**（行首哨兵）才是块；行文里提一句哨兵不算给（那是散文，
+        // 不参与判定）。这条规则让「夹带」只有一种形态——再写一行块，而那一行照样按最严判。
+        let inline = "上一轮我给的【归因】是 {\"attribution\":\"whatever\"}，但这次是 pipeline。\n\
+                      【归因】{\"attribution\":\"pipeline\"}\n";
+        assert_eq!(
+            parse_attribution(inline),
+            Attribution::Located(AttributionKind::Pipeline)
+        );
+        // 两处互相矛盾：自相矛盾不是结论。
+        let contradictory =
+            "【归因】{\"attribution\":\"host\"}\n【归因】{\"attribution\":\"pipeline\"}\n";
+        assert!(matches!(
+            parse_attribution(contradictory),
+            Attribution::Invalid {
+                why: "多处自相矛盾",
+                ..
+            }
+        ));
+        // 同一类写两遍不算矛盾（复述是正常行文；一次写稳定标识、一次写中文词也对得上）。
+        let repeated =
+            "【归因】{\"attribution\":\"host\"}\n【归因】{\"attribution\":\"宿主环境\"}\n";
+        assert_eq!(
+            parse_attribution(repeated),
+            Attribution::Located(AttributionKind::Host)
+        );
+    }
+
+    #[test]
+    fn the_wire_string_never_invents_a_category() {
+        assert_eq!(
+            parse_attribution("【归因】{\"attribution\":\"project_code\"}").wire(),
+            "project_code"
+        );
+        assert_eq!(parse_attribution("没有块").wire(), "unlocated");
+        assert_eq!(parse_attribution("没有块").reason(), Some("missing"));
+        assert_eq!(
+            parse_attribution("【归因】{\"attribution\":\"x\"}").reason(),
+            Some("四类之外")
+        );
+    }
+}
+
+#[tokio::test]
+async fn the_diagnosis_pack_carries_the_last_attribution() {
+    // 决策 235③：`read_diagnosis` 顺手带出**最近一次**的归因类别——不然下一轮又要重新问一遍
+    // 自己「上次我怎么定的性」，而那一问往往又值一次模型往返。
+    let h = Harness::seeded().await;
+    park_task(&h.store, "t1", PendingKind::RetryExhausted, "重试耗尽").await;
+
+    let mut script = Script::new();
+    script
+        .for_foreman()
+        .text("它卡在 open() 上，是宿主环境拦的。\n【归因】{\"attribution\":\"host\"}\n");
+    script.for_foreman().read_diagnosis("t1");
+    script
+        .for_foreman()
+        .text("结论同上。\n【归因】{\"attribution\":\"host\"}\n");
+    let agent = FakeAgent::new(script);
+    let runner = h.runner(agent.clone());
+
+    runner.say(None, "t1 怎么了？").await.unwrap();
+    // 第一轮的回话（带结构块）已经落库，于是第二轮调诊断包时它是「最近一次」。
+    runner.say(None, "再说一遍").await.unwrap();
+
+    let fed_back = agent.request_log()[2]
+        .messages
+        .iter()
+        .filter_map(|m| m.content.as_deref())
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(
+        fed_back.contains("latest_attribution"),
+        "诊断包要有上一轮的归因那一节：{fed_back}"
+    );
+    assert!(
+        fed_back.contains("\"attribution\": \"host\""),
+        "上一轮的类别要带出来：{fed_back}"
+    );
+    assert!(
+        fed_back.contains("宿主环境"),
+        "给人看的那个词也要在（模型读得懂中文词）：{fed_back}"
+    );
+}
+
+#[tokio::test]
+async fn a_missing_attribution_reads_as_unlocated_in_the_pack() {
+    // 「上一轮我没给出类别」本身是要看见的事实（决策 230 把「没有证据」与「证据归错 run」
+    // 同判失败）。故未定位不是**没有这一节**，而是这一节里写着 unlocated + 原因。
+    let h = Harness::seeded().await;
+    park_task(&h.store, "t1", PendingKind::RetryExhausted, "重试耗尽").await;
+
+    let mut script = Script::new();
+    script.for_foreman().text("我还在看。");
+    script.for_foreman().read_diagnosis("t1");
+    script.for_foreman().text("还是没定下来。");
+    let agent = FakeAgent::new(script);
+    let runner = h.runner(agent.clone());
+    runner.say(None, "t1 怎么了？").await.unwrap();
+    runner.say(None, "再说一遍").await.unwrap();
+
+    let fed_back = agent.request_log()[2]
+        .messages
+        .iter()
+        .filter_map(|m| m.content.as_deref())
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(
+        fed_back.contains("\"attribution\": \"unlocated\""),
+        "没有类别就说未定位，不编一个：{fed_back}"
+    );
+    assert!(
+        fed_back.contains("\"reason\": \"missing\""),
+        "原因要分得开（missing 与四类之外不是一回事）：{fed_back}"
+    );
+}
+
+#[tokio::test]
+async fn read_stage_configs_echoes_the_node_overrides() {
+    // 决策 236：`config set` 是整条替换，而 `read_stage_configs` 此前不回显 `node_overrides`
+    // ——「改之前先看」这条既有纪律于是**执行不了**（2026-09-18 值班长因此拒提配置改动，
+    // 它明说「这一改我看不全现状」：那不是保守，是没有可看的东西）。
+    let h = Harness::seeded().await;
+    let overrides = serde_json::json!({
+        "validate_input": {"skills": ["grilling"]},
+        "execute": {"skills": ["to-spec"]},
+    });
+    h.store
+        .upsert_stage_config(&StageConfig {
+            stage: Stage::ArchitectDesign.as_str().to_string(),
+            skills_json: Some(serde_json::json!(["domain-modeling"])),
+            node_overrides_json: Some(overrides.clone()),
+            persona_append: Some("简短。".into()),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+
+    let mut script = Script::new();
+    script
+        .for_foreman()
+        .tool("read_stage_configs", serde_json::json!({}));
+    script.for_foreman().text("看清了。");
+    let agent = FakeAgent::new(script);
+    let turn = h
+        .runner(agent.clone())
+        .say(None, "现在是什么情况？")
+        .await
+        .unwrap();
+    assert!(turn.traces[0].ok);
+
+    let fed_back = agent.request_log()[1]
+        .messages
+        .iter()
+        .filter_map(|m| m.content.as_deref())
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(
+        fed_back.contains("node_overrides_json"),
+        "回显里要有 node_overrides：{fed_back}"
+    );
+    for node in ["validate_input", "execute", "to-spec", "grilling"] {
+        assert!(
+            fed_back.contains(node),
+            "节点级覆盖的 {node} 要看得见（照着带回来才带得全）：{fed_back}"
+        );
+    }
+    // `persona_append` 与 `env_mode` 同批补：它们也是「留空即清成默认」会动的东西。
+    assert!(fed_back.contains("persona_append"), "{fed_back}");
+    assert!(fed_back.contains("env_mode"), "{fed_back}");
+}
+
+/// 同任务 30 分钟冷却**必须对 `run_failed` 真的生效**（决策 234 点名的风险）。
+///
+/// 为什么单列一条：`run_failed` 是逐 run 的事件，而**重试型故障**会连着出好几条
+/// （实测那次三次同形状失败）。冷却不生效的话，一次重试型故障就能把每小时 12 次的唤醒
+/// 配额烧光——而那个配额保护的正是「唤醒是花钱的、且是在没人在场的时候花」。
+#[tokio::test]
+async fn run_failures_of_the_same_task_are_collapsed_by_the_cooldown() {
+    let h = Harness::seeded().await;
+    note(
+        &h,
+        "t1",
+        agentpipeline_core::storage::AttentionKind::RunFailed,
+    )
+    .await;
+    h.clock.advance_secs(61);
+
+    let mut script = Script::new();
+    script.for_foreman().text("第一次播报：t1 的 run 挂了");
+    let agent = FakeAgent::new(script);
+    let runner = h.runner(agent.clone());
+    assert!(runner.watch().await.unwrap().is_some(), "第一次要醒");
+    assert_eq!(agent.total_calls(), 1);
+
+    // 同一任务又来一条失败的 run（occurred_at 不同，故去重键不会把它折叠掉）
+    h.clock.advance_secs(60);
+    note(
+        &h,
+        "t1",
+        agentpipeline_core::storage::AttentionKind::RunFailed,
+    )
+    .await;
+    h.clock.advance_secs(61);
+    assert!(
+        runner.watch().await.unwrap().is_none(),
+        "冷却期内不再单独唤醒（事件仍在表里，等冷却到期合并播报）"
+    );
+    assert_eq!(agent.total_calls(), 1, "没有第二次模型调用");
+
+    // 冷却到期后合并播报：两条事件一起进去
+    h.clock.advance_secs(30 * 60);
+    let mut second = Script::new();
+    second.for_foreman().text("第二次播报：补上后面那条");
+    agent.set_script(second);
+    assert!(runner.watch().await.unwrap().is_some());
+    assert_eq!(agent.total_calls(), 2);
+    assert!(h.store.open_attention(100).await.unwrap().is_empty());
 }

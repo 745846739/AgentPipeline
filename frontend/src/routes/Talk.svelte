@@ -86,6 +86,7 @@
     noteForeignDelta,
     pruneForeignActive,
     settleForemanStream,
+    attributionLabel,
     FOREMAN_FAILED_TURN_MARK,
     FOREMAN_WATCH_MARK,
     type ForemanStreamState,
@@ -344,6 +345,13 @@
      * 混成一种轮会让「它是不是在跟我说话」变成读不出来的一件事。
      */
     proactive: boolean;
+    /**
+     * 这一轮的归因类别词（决策 235①）：四类之一，由**后端解析**后随消息下来。
+     *
+     * `null` = 未定位或非助理轮——**不编一个假的类别**（决策 230 把「没有类别」也
+     * 当成一项判据）。界面只渲染这一个词，不显示稳定标识、也不显示原因（那是排查面）。
+     */
+    attribution: string | null;
   }
 
   /**
@@ -378,6 +386,8 @@
         needsPairing: false,
         proposal: null,
         proactive: m.role === 'assistant' && m.content.startsWith(WATCH_MARK),
+        // 归因类别（决策 235①）：后端解析好的那一份；未定位时为 null。
+        attribution: attributionLabel(m.attribution),
       },
     }));
     for (const p of session?.proposals ?? []) {
@@ -395,6 +405,7 @@
           needsPairing: false,
           proposal: p,
           proactive: false,
+          attribution: null,
         },
       });
     }
@@ -413,6 +424,7 @@
         needsPairing: false,
         proposal: null,
         proactive: false,
+        attribution: null,
       });
     }
     if (sending || stream.text) {
@@ -429,6 +441,7 @@
         needsPairing: false,
         proposal: null,
         proactive: false,
+        attribution: null,
       });
     }
     if (stream.error) {
@@ -444,6 +457,7 @@
         needsPairing: needsPairing(stream.error),
         proposal: null,
         proactive: false,
+        attribution: null,
       });
     }
     return out;
@@ -1677,6 +1691,15 @@
           </div>
           <p class:streaming={turn.streaming}>{turn.content}</p>
 
+          <!-- 归因类别标记（决策 235① / 238）：四类各一个词，显示在那一轮的名牌行上。
+               未定位时**什么都不显示**——不编一个假的类别（决策 230 把「没有类别」也算一项
+               判据，而画一个「未定位」的标签会让人以为那也是一类）。 -->
+          {#if turn.attribution}
+            <p class="attr" data-attribution={turn.attribution}>
+              <span class="dim">归因</span> · {turn.attribution}
+            </p>
+          {/if}
+
           {#if turn.partial}
             <p class="dim note">流断了，上面是已经收到的部分；完整回话会在台账里补齐。</p>
           {/if}
@@ -2050,6 +2073,14 @@
   }
   .turn p:last-child {
     margin-bottom: 0;
+  }
+  /* 归因类别（决策 235①）：一行小字，跟在正文之后。像素纪律照旧——只用既有 token，
+     不加圆角、不加投影（决策 169 的基元表里没有「徽章」这一档，故它就是一行字）。 */
+  .turn .attr {
+    margin-top: 6px;
+    font-size: 12px;
+    letter-spacing: 0.04em;
+    color: var(--text);
   }
   .dname {
     position: absolute;

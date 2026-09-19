@@ -442,33 +442,50 @@ async fn a_terminal_run_behind_an_active_cursor_is_noted() {
     let run_id = terminal_run_at_init(&h, "t1", NodeStatus::Timeout, 30).await;
 
     let report = h.scheduler(Settings::default()).tick().await.unwrap();
-    assert_eq!(report.attention_noted, 1, "本 tick 新记一件事");
+    // 本 tick 记两件事：`scheduler_no_effect`（这一条的主人）与 `run_failed`
+    // （决策 234——同一次终态失败在两个判据下各是一个事实：调度器的处置没生效、
+    // 而这条调用确实挂了。两条待办在**一次唤醒**里合并播报，故不重复花钱）。
+    assert_eq!(report.attention_noted, 2, "本 tick 新记两件事");
 
     let open = h.store.open_attention(100).await.unwrap();
-    assert_eq!(open.len(), 1);
-    assert_eq!(
-        open[0].kind,
-        agentpipeline_core::storage::AttentionKind::SchedulerNoEffect
-    );
-    assert_eq!(open[0].task_id, "t1");
-    assert_eq!(open[0].detail_json.as_ref().unwrap()["run_id"], run_id);
-    assert!(open[0].consumed_at.is_none(), "没有人处理过它");
+    let effect = open
+        .iter()
+        .find(|i| i.kind == agentpipeline_core::storage::AttentionKind::SchedulerNoEffect)
+        .expect("调度器处置未生效那一条要在");
+    assert_eq!(effect.task_id, "t1");
+    assert_eq!(effect.detail_json.as_ref().unwrap()["run_id"], run_id);
+    assert!(effect.consumed_at.is_none(), "没有人处理过它");
 }
 
-/// 宽限期内不报：run 刚失败、重试还没起来的那个瞬间是**正常**的中间态。
+/// 宽限期内不报 `scheduler_no_effect`：run 刚失败、重试还没起来的那个瞬间是**正常**的中间态。
+///
+/// 但**失败本身要报**（决策 234）：`run_failed` 的判据是「落终态失败且任务没转 pending」，
+/// 它没有宽限期——2026-09-19 实测里正是因为重试立刻起了新 run（游标始终 active、任务始终
+/// running），`scheduler_no_effect` 那条缝**永远不成立**，于是三次失败烧掉一千万 token
+/// 而值守一次没醒。故这一条同时钉住两件事：宽限期内不报 `scheduler_no_effect`，
+/// 而 `run_failed` 当场就在。
 #[tokio::test]
-async fn a_fresh_terminal_run_is_not_noted_yet() {
+async fn a_fresh_terminal_run_is_not_yet_a_scheduler_no_effect() {
     let h = Harness::new().await;
     h.seed_task("t1").await;
     h.mark_running("t1").await;
     terminal_run_at_init(&h, "t1", NodeStatus::Failed, 1).await;
 
     let report = h.scheduler(Settings::default()).tick().await.unwrap();
+    assert_eq!(report.attention_noted, 1, "只有 run_failed 那一条");
+    let kinds: Vec<_> = h
+        .store
+        .open_attention(100)
+        .await
+        .unwrap()
+        .iter()
+        .map(|i| i.kind)
+        .collect();
     assert_eq!(
-        report.attention_noted, 0,
-        "1 分钟前刚失败，还在正常重试窗口里"
+        kinds,
+        vec![agentpipeline_core::storage::AttentionKind::RunFailed],
+        "1 分钟前刚失败：还在正常重试窗口里（不报处置未生效），但失败本身要看得见"
     );
-    assert!(h.store.open_attention(100).await.unwrap().is_empty());
 }
 
 /// 心跳停跳的 owner：任务 running、有主、run 还挂着但长时间没有活动。
@@ -529,13 +546,16 @@ async fn many_discoveries_note_rows_once_each() {
     terminal_run_at_init(&h, "t2", NodeStatus::Timeout, 40).await;
 
     let report = h.scheduler(Settings::default()).tick().await.unwrap();
-    assert_eq!(report.attention_noted, 2, "两个任务各一件");
-    assert_eq!(h.store.open_attention(100).await.unwrap().len(), 2);
+    // 三件：t1（30 分钟前超时，在发现窗口的边界上）两条都对得上——处置未生效 + run_failed；
+    // t2（40 分钟前）已经出了 30 分钟的**发现窗口**，只剩处置未生效那一条。
+    // 与其余发现项共用同一个窗口：窗口是「还值得叫醒的时距」，逐类各配一个是另一件事。
+    assert_eq!(report.attention_noted, 3, "t1 两件 + t2 一件");
+    assert_eq!(h.store.open_attention(100).await.unwrap().len(), 3);
 
     // 第二次 tick：同一件事（同一 occurred_at）不再写第二行——否则唤醒会被自己的重试刷屏
     let report = h.scheduler(Settings::default()).tick().await.unwrap();
     assert_eq!(report.attention_noted, 0);
-    assert_eq!(h.store.open_attention(100).await.unwrap().len(), 2);
+    assert_eq!(h.store.open_attention(100).await.unwrap().len(), 3);
 }
 
 /// 停滞提醒此前**从不推 SSE**（只在内存集合里记一笔）——这是本票顺手修掉的既有缺陷。
@@ -1532,4 +1552,129 @@ async fn a_restart_leaves_no_running_project_run() {
         .unwrap()
         .iter()
         .all(|r| r.status == NodeStatus::Timeout));
+}
+
+// ───────────────── 待办补两类（决策 234，票 05）─────────────────
+
+/// `run_failed`：一次 run 落 `failed` / `timeout`、而任务**没有因此转 pending**。
+///
+/// 这条缝此前零信号，而它最贵：实测里一条任务的三次 `architect-design.execute` 全失败、
+/// 合计烧掉 1,050 万 prompt token，而值守轮**一次都没醒**——`scheduler_no_effect` 要求
+/// run 终态而游标仍 active、`task_pending` 要求任务转 pending，两条都不成立。
+#[tokio::test]
+async fn a_failed_run_that_did_not_pend_the_task_is_noted() {
+    let h = Harness::new().await;
+    h.seed_task("t1").await;
+    h.mark_running("t1").await;
+    let run_id = terminal_run_at_init(&h, "t1", NodeStatus::Failed, 1).await;
+
+    let report = h.scheduler(Settings::default()).tick().await.unwrap();
+    assert_eq!(report.attention_noted, 1);
+    let open = h.store.open_attention(100).await.unwrap();
+    assert_eq!(open.len(), 1);
+    assert_eq!(
+        open[0].kind,
+        agentpipeline_core::storage::AttentionKind::RunFailed
+    );
+    assert!(open[0].kind.wakes(), "两类都唤醒（决策 234）");
+    // 归位的入口：detail 要点名是哪一条 run（决策 230 的判据①）。
+    let detail = open[0].detail_json.as_ref().expect("要带上 run 的身份");
+    assert_eq!(detail["run_id"], run_id);
+    assert_eq!(detail["stage"], "init");
+    assert_eq!(detail["status"], "failed");
+
+    // 同一件事不会每 tick 重写（occurred_at = 那一轮的 finished_at，去重键命中）。
+    let report = h.scheduler(Settings::default()).tick().await.unwrap();
+    assert_eq!(report.attention_noted, 0);
+    assert_eq!(h.store.open_attention(100).await.unwrap().len(), 1);
+}
+
+/// 重试型故障：**每一条失败的 run 各一行**（事件是逐 run 的），而唤醒由节流收
+/// ——30 分钟冷却那一条由 `foreman.rs` 的用例钉住（决策 234 点名）。
+#[tokio::test]
+async fn each_failed_attempt_of_a_retrying_task_is_a_row() {
+    let h = Harness::new().await;
+    h.seed_task("t1").await;
+    h.mark_running("t1").await;
+    for minutes in [3, 2, 1] {
+        terminal_run_at_init(&h, "t1", NodeStatus::Failed, minutes).await;
+    }
+
+    let report = h.scheduler(Settings::default()).tick().await.unwrap();
+    assert_eq!(
+        report.attention_noted, 3,
+        "三次同形状失败 = 三件逐 run 的事件"
+    );
+    let open = h.store.open_attention(100).await.unwrap();
+    assert_eq!(open.len(), 3);
+    let run_ids: Vec<i64> = open
+        .iter()
+        .map(|i| i.detail_json.as_ref().unwrap()["run_id"].as_i64().unwrap())
+        .collect();
+    assert_eq!(
+        run_ids.len(),
+        run_ids
+            .iter()
+            .collect::<std::collections::HashSet<_>>()
+            .len(),
+        "每一次失败各自归位到它自己那条 run：{run_ids:?}"
+    );
+
+    // 同一刻的两次失败折叠成一行（去重键是 `(task, kind, occurred_at)`）：同一件事只写一行，
+    // 而「两次失败的时长相同」在生产里罕见——真撞上了也只该播一次。
+    let h2 = Harness::new().await;
+    h2.seed_task("t2").await;
+    h2.mark_running("t2").await;
+    for _ in 0..2 {
+        terminal_run_at_init(&h2, "t2", NodeStatus::Failed, 1).await;
+    }
+    h2.scheduler(Settings::default()).tick().await.unwrap();
+    assert_eq!(h2.store.open_attention(100).await.unwrap().len(), 1);
+}
+
+/// 口径收窄的那一半：任务**自己转 pending** 时不记 `run_failed`
+/// ——`task_pending` 那一条本来就会响，重复记只会让同一个故障占两条待办。
+#[tokio::test]
+async fn a_failed_run_that_pended_the_task_is_not_double_noted() {
+    let h = Harness::new().await;
+    h.seed_task("t1").await;
+    h.mark_running("t1").await;
+    park_pending_aged(&h, "t1", 0).await;
+    terminal_run_at_init(&h, "t1", NodeStatus::Timeout, 1).await;
+
+    let report = h.scheduler(Settings::default()).tick().await.unwrap();
+    assert_eq!(report.attention_noted, 1, "只该有一条");
+    let kinds: Vec<_> = h
+        .store
+        .open_attention(100)
+        .await
+        .unwrap()
+        .iter()
+        .map(|i| i.kind)
+        .collect();
+    assert!(
+        !kinds.contains(&agentpipeline_core::storage::AttentionKind::RunFailed),
+        "已经转 pending 的任务不再补一条 run_failed：{kinds:?}"
+    );
+}
+
+/// `task_cancelled`：取消是**有人做了个决定**，而 09-18 那三条任务被一并标 cancelled 之后
+/// 值守班次从 `01:25` 起再没被叫醒过（值班长只能报「是谁下的手，我没有证据」）。
+///
+/// 生产者不是 tick 而是取消本身（`cancel_task`），故这条用例不走 `scheduler.tick()`。
+#[tokio::test]
+async fn cancelling_a_task_leaves_a_waking_attention_row() {
+    let h = Harness::new().await;
+    h.seed_task("t1").await;
+
+    h.store.cancel_task("t1").await.unwrap();
+
+    let open = h.store.open_attention(100).await.unwrap();
+    assert_eq!(open.len(), 1);
+    assert_eq!(
+        open[0].kind,
+        agentpipeline_core::storage::AttentionKind::TaskCancelled
+    );
+    assert!(open[0].kind.wakes(), "两类都唤醒（决策 234）");
+    assert_eq!(open[0].task_id, "t1");
 }

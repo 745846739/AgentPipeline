@@ -19,8 +19,9 @@ pub use cursor::{
 };
 pub use executor::Executor;
 pub use foreman::{
-    build_briefing, trim_history, ForemanBriefing, ForemanRunner, ForemanTrace, ForemanTurn,
-    FOREMAN_AGENT_TYPE, FOREMAN_MAX_ROUNDS, FOREMAN_PERSONA, FOREMAN_STAGE_KEY, FOREMAN_TOOL_SPECS,
+    build_briefing, parse_attribution, trim_history, Attribution, AttributionKind, ForemanBriefing,
+    ForemanRunner, ForemanTrace, ForemanTurn, FOREMAN_AGENT_TYPE, FOREMAN_ATTRIBUTION_MARK,
+    FOREMAN_MAX_ROUNDS, FOREMAN_PERSONA, FOREMAN_STAGE_KEY, FOREMAN_TOOL_SPECS,
 };
 pub use graph::{build_pipeline_graph, PipelineGraph};
 pub use landing::{

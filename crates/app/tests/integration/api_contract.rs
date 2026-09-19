@@ -5769,3 +5769,185 @@ async fn the_door_opening_actions_have_no_tool_at_all() {
         "配对令牌一个字节都不该动"
     );
 }
+
+/// 回话里的归因类别**由后端解析后随消息下发**（决策 235 / 238）。
+///
+/// 为什么断言打在线上形态而不是正文：结构块住在回话文本里，但**解析点只有一处**
+/// （`parse_attribution`）——界面拿的是那一行 `attribution` 字段，不自己从正文里抠。
+/// 这条契约把「界面看到的那一份」与「后端判定的那一份」钉成同一件事；未定位时给
+/// `unlocated` 而不是编一个类别（决策 230 把「没有类别」也算一项判据）。
+#[tokio::test]
+async fn the_session_wire_carries_the_parsed_attribution() {
+    let mut script = Script::new();
+    script
+        .for_foreman()
+        .text("它卡在 open() 上，是宿主环境拦的。\n【归因】{\"attribution\":\"host\"}\n");
+    script
+        .for_foreman()
+        .text("我还是说不上来。\n【归因】{\"attribution\":\"四类之外的词\"}\n");
+    let api = api_with_foreman(FakeAgent::new(script)).await;
+
+    for question in ["第一问", "第二问"] {
+        let (status, body) = post(&api, "/foreman/messages", json!({ "text": question })).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+    }
+
+    let (status, body) = get(&api, "/foreman/session").await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let messages = body["messages"].as_array().unwrap();
+    let assistant: Vec<&serde_json::Value> = messages
+        .iter()
+        .filter(|m| m["role"] == "assistant")
+        .collect();
+    assert_eq!(assistant.len(), 2);
+
+    // 定位成功：类别 + 给人看的词（界面不自己映射一遍）。
+    assert_eq!(assistant[0]["attribution"], "host");
+    assert_eq!(assistant[0]["attribution_label"], "宿主环境");
+    assert!(assistant[0]["attribution_reason"].is_null());
+
+    // 四类之外不许收口：给 `unlocated` + 原因，**没有** label。
+    assert_eq!(assistant[1]["attribution"], "unlocated");
+    assert!(assistant[1]["attribution_label"].is_null());
+    assert_eq!(assistant[1]["attribution_reason"], "四类之外");
+
+    // 非助理轮不解析（那两类里不会有结构块）。
+    let user = messages.iter().find(|m| m["role"] == "user").unwrap();
+    assert!(user["attribution"].is_null());
+}
+
+/// `config set` 会抹掉 `node_overrides` 就拒，不静默抹掉（决策 236）。
+///
+/// 校验点在**工具这一侧**而不是 `PUT /stage-configs`：整条替换（「留空即清成默认」）是那个
+/// 端点的既有语义（界面那份表单总是带全整行），而这个工具是唯一会「看不见就改」的入口。
+/// 前后两侧都要取证：**没带、旧配置有 → 拒且提议不消耗、旧配置一字未动**；带上或本来就
+/// 没有覆盖 → 照常写；显式传 `{}` → 那是**明路的清空**（决策 236 明确不做局部合并，
+/// 所以给的是一条明路，不是一条自动合并）。
+#[tokio::test]
+async fn a_config_set_that_would_drop_node_overrides_is_refused() {
+    let api = api_with_foreman(FakeAgent::new(Script::new())).await;
+    let sid = fresh_session(&api).await;
+    // 覆盖内容本身要过既有的启动校验（这个 fixture 里没有技能生态），故用两个无害的键
+    // ——这条用例考的是「字段会不会被静默抹掉」，不是覆盖内容本身。
+    let overrides = serde_json::json!({
+        "validate_input": {"temperature": 0.2},
+        "execute": {"temperature": 0.3},
+    });
+    api.state
+        .store
+        .upsert_stage_config(&agentpipeline_core::types::StageConfig {
+            stage: "architect-design".into(),
+            node_overrides_json: Some(overrides.clone()),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+
+    // ① 不带它就 set：拒，报文说清有几个覆盖与怎么处置，**提议不消耗**。
+    let pid = seed_proposal(
+        &api,
+        &sid,
+        "config",
+        json!({"action": "set", "stage": "architect-design", "temperature": 0.9}),
+    )
+    .await;
+    let (status, body) = post(
+        &api,
+        &format!("/foreman/proposals/{pid}/execute"),
+        json!({}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    let message = body["error"].as_str().unwrap_or_default().to_string();
+    assert!(message.contains("node_overrides_json"), "{message}");
+    assert!(message.contains('2'), "要说清有几个节点覆盖：{message}");
+    assert!(
+        message.contains("read_stage_configs"),
+        "要给出处置：{message}"
+    );
+    let proposal = api
+        .state
+        .store
+        .get_foreman_proposal(&pid)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        proposal.status.as_str(),
+        "pending",
+        "参数过不了校验时提议**不消耗**（人还可以自己按掉它）"
+    );
+    let stored = api
+        .state
+        .store
+        .get_stage_config("architect-design")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        stored.node_overrides_json,
+        Some(overrides.clone()),
+        "被拒的 set 不得改动旧配置"
+    );
+
+    // ② 原样带回来：照常写（这才是决策 228 要的那条路——先看清、照着带回来）。
+    let pid = seed_proposal(
+        &api,
+        &sid,
+        "config",
+        json!({
+            "action": "set",
+            "stage": "architect-design",
+            "temperature": 0.9,
+            "node_overrides_json": overrides,
+        }),
+    )
+    .await;
+    let (status, body) = post(
+        &api,
+        &format!("/foreman/proposals/{pid}/execute"),
+        json!({}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+
+    // ③ 显式清空：`{}` 与「没带」分得开，故它写得进去。
+    let pid = seed_proposal(
+        &api,
+        &sid,
+        "config",
+        json!({"action": "set", "stage": "architect-design", "node_overrides_json": {}}),
+    )
+    .await;
+    let (status, body) = post(
+        &api,
+        &format!("/foreman/proposals/{pid}/execute"),
+        json!({}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let cleared = api
+        .state
+        .store
+        .get_stage_config("architect-design")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(cleared.node_overrides_json, Some(serde_json::json!({})));
+
+    // ④ 本来就没有覆盖的阶段不受这条守卫影响（不是「一律要带」）。
+    let pid = seed_proposal(
+        &api,
+        &sid,
+        "config",
+        json!({"action": "set", "stage": "develop", "temperature": 0.2}),
+    )
+    .await;
+    let (status, body) = post(
+        &api,
+        &format!("/foreman/proposals/{pid}/execute"),
+        json!({}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+}

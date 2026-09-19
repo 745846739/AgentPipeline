@@ -305,6 +305,29 @@ impl Store {
         rows.into_iter().map(RunRow::into_run).collect()
     }
 
+    /// 某任务在 `since` 之后**落终态失败**的 run（决策 234 的 `run_failed` 待办用它）。
+    ///
+    /// 判据落在 `finished_at` 上而不是 `started_at`：事件是「它这次**挂了**」，而挂的时刻是
+    /// 收场那一刻。时间戳同由 `ts()` 写成 RFC3339（同一时区、同一格式），故文本比较即时间比较。
+    pub async fn failed_runs_since(
+        &self,
+        task_id: &str,
+        since: DateTime<Utc>,
+    ) -> Result<Vec<NodeRun>> {
+        let sql = format!(
+            "SELECT {RUN_COLUMNS} FROM kanban_node_runs
+             WHERE task_id = ? AND status IN ('failed', 'timeout')
+               AND finished_at IS NOT NULL AND finished_at >= ?
+             ORDER BY id"
+        );
+        let rows: Vec<RunRow> = sqlx::query_as(&sql)
+            .bind(task_id)
+            .bind(ts(since))
+            .fetch_all(self.pool())
+            .await?;
+        rows.into_iter().map(RunRow::into_run).collect()
+    }
+
     pub async fn list_runs(&self, task_id: &str) -> Result<Vec<NodeRun>> {
         let sql =
             format!("SELECT {RUN_COLUMNS} FROM kanban_node_runs WHERE task_id = ? ORDER BY id");

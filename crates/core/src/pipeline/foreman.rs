@@ -91,7 +91,7 @@ pub struct ForemanToolSpec {
 /// A 层的六个新读数（票 01）**一律复用后端既有口径**，不新造一套：看板读任务表、
 /// 指标走 `metrics::*` 纯函数、项目 / 阶段配置 / 技能 / provider 各读自己那张表的既有读法。
 /// 唯一需要加工的是 provider：库里存的是**明文密钥**（决策 112），故只回显掩码。
-pub const FOREMAN_TOOL_SPECS: [ForemanToolSpec; 20] = [
+pub const FOREMAN_TOOL_SPECS: [ForemanToolSpec; 21] = [
     ForemanToolSpec {
         name: "read_task",
         layer: ForemanToolLayer::Read,
@@ -192,6 +192,19 @@ pub const FOREMAN_TOOL_SPECS: [ForemanToolSpec; 20] = [
                       「它为什么卡住 / 为什么失败 / 是不是 prompt 问题」这类问题问它；\
                       只看「现在什么状态」用 read_task（便宜得多）。",
         parameters: r#"{"type":"object","properties":{"task_id":{"type":"string","description":"任务 id（快照里方括号内那串）"},"runs":{"type":"integer","description":"最多带回多少条 run（默认 30，最近的在前）"}},"required":["task_id"]}"#,
+    },
+    // 只读取证（决策 232 / 237 / 票 02）：白名单就是它的全部能力——`date` / `ps` / `pgrep` /
+    // `lsof` / `wc` / `tail` / `sample`，argv 直出不经 shell，`sample` 只许对本服务的进程。
+    // 它属**只读层**：改不了任何东西，故不受档位管、也不吃值守轮的 deny 清单。
+    ForemanToolSpec {
+        name: "run_readonly",
+        layer: ForemanToolLayer::Read,
+        description:
+            "跑一条**只读**的诊断命令（白名单：date / ps / pgrep / lsof / wc / tail / sample）。\
+                     不经 shell——command 与 args 是两个独立的参数，分号、管道、$(...) 都没有落点。\
+                     路径参数必须落在你的域内（家目录根，data/ 读不到）；sample 只能对本服务自己的\
+                     进程树取证。取证优先用它，不要等人按键：它是「夜里自己把事定死」的那只手。",
+        parameters: r#"{"type":"object","properties":{"command":{"type":"string","enum":["date","ps","pgrep","lsof","wc","tail","sample"],"description":"白名单里的命令名（不经 shell，直接 exec）"},"args":{"type":"array","items":{"type":"string"},"description":"命令参数（必须是字符串数组，例如 [\"-n\",\"50\",\"logs/agentpipeline.log\"]；字符串形态会被拒）"},"timeout_sec":{"type":"integer","description":"超时秒数（可选，缺省按阶段配置）"}},"required":["command"]}"#,
     },
     // ── C 层：环境写（决策 206 / 207）。在 `ask` 档下**不执行**，生成提议等人按键；
     //    `auto` 直通；`deny` 连广告都不给。域与 B 层同一份（家目录根 + `data` / `logs` 前缀 deny）。
@@ -1618,6 +1631,7 @@ impl ForemanRunner {
                 write_tools.join(" / ")
             ));
         }
+        out.push_str(&attribution_discipline());
         out.push_str(
             "- 快照里已经有的（待拍板原因、在跑、失败、项目清单）不要再查一遍。\n\
              - 引用工位结论时必须标出它来自哪个工位、哪次运行。\n\
@@ -1643,8 +1657,204 @@ fn human_duration(limit: std::time::Duration) -> String {
     }
 }
 
-/// 一轮回话失败的归因（票 04）：`(稳定类别, 人话原因)`。
+// ───────────────── 播报的归因类别（决策 227 / 235 / 238）─────────────────
+
+/// 归因结构块的哨兵（决策 238）：**回话文本里约定的一段**，后端解析。
 ///
+/// 为什么走回话文本而不是新工具：仓里已经靠回话里的哨兵 / 前缀传机器可读信号
+/// （`【无需处理】` 模型发后端认、[`FOREMAN_WATCH_MARK`] 后端加前端认），而归因类别
+/// **每一轮播报都要带**——做成工具调用等于每轮多一次模型往返，而实测里一轮的往返成本
+/// 已经在十万 token 量级（决策 238 的两条理由）。
+///
+/// 为什么不是 `traces_json`（决策 235 明确否决）：那是**后端自己写的**观测数据，装不了
+/// 「模型的归因声明」——而那正是要被校验的东西，让产者与证者同一人等于没校验。
+pub const FOREMAN_ATTRIBUTION_MARK: &str = "【归因】";
+
+/// 归因类别（决策 227 的四类）。**「我不知道是什么问题」不是结论**，故四类之外不许收口。
+///
+/// 四类的证据面、修法、授权都不一样，用一个词盖住就会在播报里丢掉「该找谁」这个信息——
+/// 而值班长的全部价值就在这个信息上（决策 227 的起因：一次实测里三条故障各自属于不同类别）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AttributionKind {
+    /// 宿主环境：未签名的壳、系统调用被拦、磁盘 / 权限一类。
+    Host,
+    /// 流水线运行：节点自身跑挂、重试耗尽、循环 / 调度。
+    Pipeline,
+    /// 目标项目代码：只有这一类才吃 `repair` 那条 worktree 链。
+    ProjectCode,
+    /// prompt 与配置：provider / persona / 阶段配置 / 工具声明。
+    PromptConfig,
+}
+
+impl AttributionKind {
+    pub const ALL: [AttributionKind; 4] = [
+        AttributionKind::Host,
+        AttributionKind::Pipeline,
+        AttributionKind::ProjectCode,
+        AttributionKind::PromptConfig,
+    ];
+
+    /// 稳定标识（落库 / 线上 / 界面都按它判，不按文案）。
+    pub fn as_str(self) -> &'static str {
+        match self {
+            AttributionKind::Host => "host",
+            AttributionKind::Pipeline => "pipeline",
+            AttributionKind::ProjectCode => "project_code",
+            AttributionKind::PromptConfig => "prompt_config",
+        }
+    }
+
+    /// 给人看的词（界面标记与播报里的那一类）。
+    pub fn label(self) -> &'static str {
+        match self {
+            AttributionKind::Host => "宿主环境",
+            AttributionKind::Pipeline => "流水线运行",
+            AttributionKind::ProjectCode => "目标项目代码",
+            AttributionKind::PromptConfig => "prompt 与配置",
+        }
+    }
+
+    /// 稳定标识或中文词 → 类别。两者都认是**刻意的**：模型写出中文词是一件正常事，
+    /// 不认它只会多出一条「格式不合规」的假未定位。产物一律是稳定标识（[`Self::as_str`]）。
+    pub fn parse(raw: &str) -> Option<Self> {
+        let value = raw.trim();
+        Self::ALL
+            .into_iter()
+            .find(|k| k.as_str() == value || k.label() == value)
+    }
+}
+
+/// 一次回话里那个结构块的解析结果。
+///
+/// **「根本没给」与「四类之外」由这一个解析点判出**（决策 238）：两条都算**未定位**，
+/// 因为对判据（决策 230 的第四项）而言它们是同一件事——这一次收口没有可校验的归因类别。
+/// 分开记的是原因，不是结论。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Attribution {
+    /// 定位成功：给出了四类之一。
+    Located(AttributionKind),
+    /// 没给结构块（回话里一行哨兵都没有）。
+    Missing,
+    /// 给了但不可用：四类之外 / 缺 `attribution` / JSON 坏了 / 多处自相矛盾。
+    Invalid { payload: String, why: &'static str },
+}
+
+impl Attribution {
+    pub fn kind(&self) -> Option<AttributionKind> {
+        match self {
+            Attribution::Located(kind) => Some(*kind),
+            _ => None,
+        }
+    }
+
+    /// 这一次收口算不算「定位成功」的那一项（决策 230 判据④）。
+    pub fn is_located(&self) -> bool {
+        matches!(self, Attribution::Located(_))
+    }
+
+    /// 线上 / 界面用的串：四类之一，或 `unlocated`（**不编一个假的类别**）。
+    pub fn wire(&self) -> &'static str {
+        self.kind().map(|k| k.as_str()).unwrap_or("unlocated")
+    }
+
+    /// 未定位时的原因串（定位成功时为 `None`）——给排查看，不给界面当类别使。
+    pub fn reason(&self) -> Option<&'static str> {
+        match self {
+            Attribution::Located(_) => None,
+            Attribution::Missing => Some("missing"),
+            Attribution::Invalid { why, .. } => Some(why),
+        }
+    }
+}
+
+/// 结构块的载荷上限：超出的部分不留在结果里（它是模型写歪的一段文本，不是证据）。
+const ATTRIBUTION_PAYLOAD_MAX_CHARS: usize = 200;
+
+/// 从回话文本里解析归因类别（决策 235 的载体 + 决策 238 的发射方式）。
+///
+/// 三条判据：
+/// * **结构块以整行出现**（行首哨兵，载荷在同一行）才算块——行文里提一句哨兵是散文，
+///   不参与判定。于是「夹带」只剩一种形态：再写一行块，而那一行照样要过下面的判据。
+/// * **按最严的一处判**：一条回话里有多个块时，任何一处不合规都不收口（决策 235 的
+///   「四类之外不许收口」）；多处互相矛盾同样不收口——自相矛盾不是结论。
+/// * 找不到块 = `Missing`；**它与「四类之外」在判据上是同一件事**（都没给出可校验的
+///   类别），分开记的只是原因（决策 238）。
+///
+/// 这个方向是刻意的：宁可判未定位，也不让一段夹带的一个合规字样把整轮说成已定位。
+pub fn parse_attribution(text: &str) -> Attribution {
+    let payloads: Vec<&str> = text
+        .lines()
+        .filter_map(|line| {
+            line.trim()
+                .strip_prefix(FOREMAN_ATTRIBUTION_MARK)
+                .map(|rest| rest.trim())
+        })
+        .collect();
+    if payloads.is_empty() {
+        return Attribution::Missing;
+    }
+    let mut located: Option<AttributionKind> = None;
+    for payload in payloads {
+        let truncated =
+            || crate::storage::observability::truncate_text(payload, ATTRIBUTION_PAYLOAD_MAX_CHARS);
+        let Ok(value) = serde_json::from_str::<serde_json::Value>(payload) else {
+            return Attribution::Invalid {
+                payload: truncated(),
+                why: "JSON 解析失败",
+            };
+        };
+        let Some(raw) = value.get("attribution").and_then(|v| v.as_str()) else {
+            return Attribution::Invalid {
+                payload: truncated(),
+                why: "缺 attribution 字段",
+            };
+        };
+        let Some(kind) = AttributionKind::parse(raw) else {
+            return Attribution::Invalid {
+                payload: truncated(),
+                why: "四类之外",
+            };
+        };
+        match located {
+            None => located = Some(kind),
+            Some(previous) if previous == kind => {}
+            Some(_) => {
+                return Attribution::Invalid {
+                    payload: truncated(),
+                    why: "多处自相矛盾",
+                }
+            }
+        }
+    }
+    match located {
+        Some(kind) => Attribution::Located(kind),
+        None => Attribution::Missing,
+    }
+}
+
+/// 播报里那段「必填」的规格（决策 227 的必填 + 235 的载体 + 238 的形态）。
+///
+/// 写进 system prompt 而不是人格文本：人格是可被 `persona_path` 覆盖的（决策 7），
+/// 而这条要求**没有校验点就不能少**——它是决策 230 判据④的载体，覆盖人格的人不该
+/// 顺手把校验面一起覆盖掉。四类的词与稳定标识都由 [`AttributionKind`] 生成（同源）。
+fn attribution_discipline() -> String {
+    let choices = AttributionKind::ALL
+        .iter()
+        .map(|k| format!("{}（{}）", k.as_str(), k.label()))
+        .collect::<Vec<_>>()
+        .join(" / ");
+    format!(
+        "\n## 播报的归因（必填）\n\
+         每一次**播报**（值守轮，以及你回答「哪里出了什么问题」时）末尾都要单独一行给出归因类别，\n\
+         机器可读，照这个形状写：\n\
+         {FOREMAN_ATTRIBUTION_MARK}{{\"attribution\":\"host\"}}\n\
+         取值只能是这四类之一：{choices}。\n\
+         四类之外不许收口：写别的词等于没给。四类的证据面、修法、授权各不相同——\n\
+         「我不知道是什么问题」不是结论，宁可用一条证据把范围收到最像的那一类并说清还缺什么。\n"
+    )
+}
+
+/// 一轮回话失败的归因（票 04）：`(稳定类别, 人话原因)`。
 /// 与 [`Error::llm_classified`] 同一姿态：**能确证才标类别，其余退回原始串**——误标类别
 /// 比不标更坏，它会把排查引向一个错误的方向（这条纪律的来历见 `error.rs` 的 `LlmClassified`）。
 /// 四个面：网络 / 配置 / 模型 / 内部。

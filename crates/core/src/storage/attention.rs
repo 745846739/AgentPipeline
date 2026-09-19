@@ -43,6 +43,18 @@ pub enum AttentionKind {
     TaskDone,
     /// 慢跑（3×P90，决策 66 的自适应告警）。
     SlowRun,
+    /// **run 落了终态失败 / 超时，而任务没有因此转 pending**（决策 234）。
+    ///
+    /// 这条缝此前零信号，而它最贵：2026-09-19 实测里一条任务的 `architect-design.execute`
+    /// 连试三次全失败、合计烧掉 **1,050 万** prompt token，而值守轮**一次都没醒**——
+    /// 失败后游标自动重试、任务始终 `running`，于是 `scheduler_no_effect`（要求 run 终态
+    /// 而游标仍 active）与 `task_pending`（要求任务转 pending）两条既有判据都不成立。
+    RunFailed,
+    /// **任务被取消**（决策 234）。
+    ///
+    /// 实证：09-18 那三条任务被一并标 cancelled 之后，值守班次从 `01:25` 起**再没被叫醒过**，
+    /// 值班长只能报「是谁下的手，我没有证据」。
+    TaskCancelled,
 }
 
 impl AttentionKind {
@@ -58,6 +70,8 @@ impl AttentionKind {
             AttentionKind::TaskStale => "task_stale",
             AttentionKind::TaskDone => "task_done",
             AttentionKind::SlowRun => "slow_run",
+            AttentionKind::RunFailed => "run_failed",
+            AttentionKind::TaskCancelled => "task_cancelled",
         }
     }
 
@@ -84,6 +98,8 @@ impl AttentionKind {
             "task_stale" => AttentionKind::TaskStale,
             "task_done" => AttentionKind::TaskDone,
             "slow_run" => AttentionKind::SlowRun,
+            "run_failed" => AttentionKind::RunFailed,
+            "task_cancelled" => AttentionKind::TaskCancelled,
             other => {
                 return Err(crate::Error::Validation(format!(
                     "未知的值班长待办类别：{other}"

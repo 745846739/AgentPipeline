@@ -752,6 +752,45 @@ impl KanbanScheduler {
                 noted += 1;
             }
 
+            // ⑦ run 落终态失败 / 超时，而任务**没有因此转 pending**（决策 234）。
+            //
+            //    判据必须带「任务没转 pending」这一半：任务自己转 pending 时 ①（task_pending）
+            //    本来就会响，重复记等于给同一个故障写两条待办。而**重试型故障**（连着几次
+            //    同形状失败、任务始终 running）只有这一条看得见——实测里它烧掉一千万
+            //    prompt token 而值守一次没醒（`scheduler_no_effect` 要求 run 终态而游标仍
+            //    active、`task_pending` 要求任务转 pending，两条都不成立）。
+            //
+            //    每条失败的 run 各记一行（`occurred_at` = 它收场那一刻，去重键天然按 run
+            //    分得开）；「连着几条会不会连着唤醒」交给**既有的三重节流**收——同任务
+            //    30 分钟冷却正是为它准备的（决策 234 点名要用例钉住这一条）。
+            //    已收口（done / cancelled）的任务不再为历史失败报警：那是复盘，不是待办。
+            if task.status == TaskStatus::Running && task.pending_reason.is_none() {
+                for run in self.store.failed_runs_since(&task.id, now - window).await? {
+                    let occurred = run.finished_at.unwrap_or(now);
+                    if self
+                        .store
+                        .note_attention(
+                            &task.id,
+                            AttentionKind::RunFailed,
+                            occurred,
+                            Some(&serde_json::json!({
+                                "run_id": run.id,
+                                "stage": run.stage.as_str(),
+                                "node": run.node.as_str(),
+                                "attempt": run.attempt,
+                                "status": run.status.as_str(),
+                                "error": run.error,
+                                "prompt_tokens": run.prompt_tokens,
+                                "completion_tokens": run.completion_tokens,
+                            })),
+                        )
+                        .await?
+                    {
+                        noted += 1;
+                    }
+                }
+            }
+
             // ⑤ 调度器处置未生效 + ⑥ owner 持有超时：两条缝，都要求「任务还在 running」。
             //    实测（2026-09-17）：run 已被标 timeout、transition 也写了「干净对话重试」，
             //    但**没有 attempt-2 的 run 行**，任务从此停在 running——check_timeouts 只看

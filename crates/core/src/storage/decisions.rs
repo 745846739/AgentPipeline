@@ -529,6 +529,20 @@ impl Store {
     pub async fn cancel_task(&self, task_id: &str) -> Result<Vec<String>> {
         self.mark_terminal(task_id, crate::types::TaskStatus::Cancelled)
             .await?;
+        // 待办：**任务被取消**（决策 234）。此前这条路上一个关注项都不写，于是 09-18 那三条
+        // 任务被一并标 cancelled 之后，值守班次从 `01:25` 起再没被叫醒过——值班长只能报
+        // 「是谁下的手，我没有证据」。取消是**有人做了个决定**，而那正是值守该知道的事。
+        //
+        // 记在 `mark_terminal` 之后（那一刻就是事件时刻），与其余待办同一张表、同一套节流。
+        // 「拆分」那条路（`POST /tasks/{id}/split`）不走这里：它是一次**有产出的**处置，
+        // 不是把一个任务丢下不管（决策 234 点的是 `cancel_task`）。
+        self.note_attention(
+            task_id,
+            crate::storage::AttentionKind::TaskCancelled,
+            self.now(),
+            None,
+        )
+        .await?;
         let mut notified = Vec::new();
         for dependent in self.dependents_of(task_id).await? {
             let status = self.get_task(&dependent).await?.status;

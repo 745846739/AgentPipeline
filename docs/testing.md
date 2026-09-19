@@ -169,6 +169,41 @@ workspace 成员 `crates/testkit`，供 L2 / L4 复用：
 「跨进程重启」，后者只存在于一条非 CLI 选项上（命令行不暴露退让，`--port` 绑不上就报错）。
 故本文件**只允许一处 in-process `serve`**——`TestHome::install_env` 改的是进程级环境变量。
 
+**值班长的定位面（决策 227–239，`/.scratch/foreman-run-failure/`，票 01–06）**：这一批把
+「定位成功」的四项判据（决策 230）落成可测的读数与校验点，用例分五处落：
+
+- **模型请求台账（决策 231，票 01）**：`tests/model_requests.rs` **9 条**——收场请求带 run 归属与
+  用量 / 在飞的请求**先于收场可读** / 被丢掉的请求由 Drop 兜底收成 `timeout`（**不留假「在飞」**）/
+  失败与中止分得开且**不记假的 0** / 重启把上一进程遗留的在飞请求收成终态 / 值班长的请求落它自己的
+  阶段键与班次（哨兵 `run_id = 0` 归一成 NULL）/ 一次 run 内序号自增 / 无归属的调用照样落账。
+  另两条在既有文件里：`foreman::the_diagnosis_pack_carries_the_model_requests_of_each_run`
+  （读数**必须进诊断包**）与 `app::serve::tests::the_three_model_log_lines_form_a_timeline_in_the_file`
+  （三行日志按时间顺序落在文件里——「日志读得到」与「日志里有东西」是两件事）。
+- **只读取证（决策 232 / 237，票 02）**：`tests/readonly.rs` **5 条** + `agent::tools::tests` 内联 4 条。
+  牙齿都在**副作用**上：`; touch <文件>` 作为参数递进去后文件**不存在**（不经 shell 的证明）/
+  白名单外的名字（`sh` / `rm` / `curl`）拒且**留一行台账** / 路径参数越出文件域即拒（`data/`、
+  `..`、绝对路径各一）/ `sample` 的 pid 只认本进程及其子进程（外人拒、按进程名取样拒）/
+  `deny` 档照旧广告照旧执行（它改不了任何东西，故不归档位管）。冻结断言按决策 209 的次序**先改后加**。
+- **归因结构块（决策 235 / 238，票 03）**：`foreman::attribution` **5 条**（稳定标识与中文词都认 /
+  没给与不可用分开记 / 四类之外不收口 / 重复与自相矛盾都不收口 / 行内提及不算块）+
+  `app::api_contract::the_session_wire_carries_the_parsed_attribution`（解析点在后端，
+  界面拿 `attribution` + `attribution_label`，未定位给 `unlocated` 而不是编一个类别）+
+  `frontend/src/realtime/foreman.test.ts` 3 条（四类各一个词、未定位 **不给词**）+ 诊断包带出
+  「最近一次的归因类别」两条（定位成功与未定位各一）。
+- **`node_overrides` 的读法（决策 236，票 04）**：`foreman::read_stage_configs_echoes_the_node_overrides`
+  （回显带 `node_overrides_json` / `persona_append` / `env_mode`）+
+  `api_contract::a_config_set_that_would_drop_node_overrides_is_refused`（**工具那一侧**的校验：
+  没带而旧有 → 拒、报文说清几个覆盖、**提议不消耗**、旧配置一字未动；带上 / 本来没有 / 显式 `{}` 各一）。
+  校验点不在 `PUT /stage-configs` 上：整条替换是那个端点的**既有语义**（界面表单总带全整行）。
+- **待办补两类（决策 234，票 05）**：`scheduler_tick.rs` 4 条（`run_failed` 当场记且点名 run /
+  逐 attempt 各一行 / 任务已转 pending 时不重复记 / 取消留一条唤醒待办）+
+  `foreman::run_failures_of_the_same_task_are_collapsed_by_the_cooldown`（决策 234 点名的风险：
+  同任务 30 分钟冷却必须对 `run_failed` 真的生效，否则一次重试型故障能烧光每小时配额）。
+  **同批改写 3 条既有用例**：`a_terminal_run_behind_an_active_cursor_is_noted` /
+  `a_fresh_terminal_run_is_not_yet_a_scheduler_no_effect`（原名 `…is_not_noted_yet`）/
+  `many_discoveries_note_rows_once_each`——同一个终态失败现在同时是 `scheduler_no_effect` 与
+  `run_failed` 两个事实，断言随之改成**按类别**取证（宽限期内不报处置未生效，**而失败本身当场可见**）。
+
 ## 7. API 契约测试（L3）
 
 in-process axum router（tower oneshot），不 spawn 二进制：

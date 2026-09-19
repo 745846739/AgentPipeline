@@ -890,6 +890,18 @@ export interface ForemanMessage {
   briefing: ForemanBriefing | null;
   traces: ForemanTrace[] | null;
   created_at: string;
+  /**
+   * 这一轮的**归因类别**（决策 235 / 238）：`host` / `pipeline` / `project_code` /
+   * `prompt_config`，或 `unlocated`（没给结构块、或四类之外）。
+   *
+   * 由**后端解析**——结构块住在回话文本里，而解析点只有一处（`parse_attribution`）；
+   * 界面照它显示类别标记，不自己从正文里抠。非助理轮（`user` / `system`）是 `null`。
+   */
+  attribution?: string | null;
+  /** 归因类别的中文词（后端给的那一份）。未定位时为 `null`。 */
+  attribution_label?: string | null;
+  /** 未定位的原因（`missing` / `四类之外` / …）；定位成功时为 `null`。 */
+  attribution_reason?: string | null;
 }
 
 /**

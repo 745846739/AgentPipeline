@@ -756,6 +756,34 @@ async fn run_config_tool(
     let state = state.clone();
     match action.as_str() {
         "set" => {
+            // 决策 236：这次 `config set` 会**抹掉旧的 `node_overrides`** 就拒，不静默抹掉。
+            //
+            // 校验点为什么在工具这一侧而不是 `PUT /stage-configs`：整条替换（「留空即清成
+            // 默认」）是那个端点的**既有语义**，界面那份表单也总是把整行（含 node_overrides）
+            // 带回来；而这个工具是**唯一会「看不见就改」**的入口——09-18 值班长明确拒提配置
+            // 改动，理由就是「整条替换若漏带 node_overrides 会把节点级的 to-spec / grilling
+            // 抹掉，而 read_stage_configs 不回显它」。故两处一起补：回显（`read_stage_configs`）
+            // + 这条校验。翻掉那个端点的替换语义要另立一条（决策 236 的「明确不做」）。
+            //
+            // 空对象 `{}` 是**显式清空**（它与「没带」分得开），故不想带旧值的人仍有一条明路。
+            if args.get("node_overrides_json").is_none() {
+                let overridden_nodes = state
+                    .store
+                    .get_stage_config(&stage)
+                    .await
+                    .map_err(map_core_error)?
+                    .and_then(|c| c.node_overrides_json)
+                    .and_then(|v| v.as_object().map(|o| o.len()))
+                    .unwrap_or(0);
+                if overridden_nodes > 0 {
+                    return Err(ApiError::bad_request(format!(
+                        "这次 config set 没带 node_overrides_json，而阶段 {stage} 现有配置里有 \
+                         {overridden_nodes} 个节点级覆盖——照「留空即清成默认」的语义，改下去会把\
+                         它们抹掉。用 read_stage_configs 看清现状，把 node_overrides_json 原样带回来；\
+                         确实要清空就显式传 {{}}。"
+                    )));
+                }
+            }
             let response = stage_configs::put(
                 State(state),
                 Path(stage),
@@ -1216,7 +1244,13 @@ fn session_wire(s: &ForemanSession) -> serde_json::Value {
 ///
 /// `briefing` / `traces` 原样带出去：审计要的是「它当时看到的是这份读数」「它翻了什么」，
 /// 在后端重新摘要一遍只会让界面显示的与落库的不一致。
+///
+/// `attribution` 是**解析出来**的（决策 235 / 238）：结构块住在回话文本里，而解析只有一处
+/// ——界面拿的是后端判定的结果，不自己从正文里抠（那会造出第二个判定点，两边迟早不一致）。
+/// 未定位时给 `unlocated` 而不是编一个类别，`attribution_reason` 说清是哪一种未定位。
 fn message_wire(m: &ForemanMessage) -> serde_json::Value {
+    let attribution = (m.role == agentpipeline_core::storage::foreman::FOREMAN_ROLE_ASSISTANT)
+        .then(|| agentpipeline_core::pipeline::foreman::parse_attribution(&m.content));
     json!({
         "id": m.id,
         "session_id": m.session_id,
@@ -1227,5 +1261,9 @@ fn message_wire(m: &ForemanMessage) -> serde_json::Value {
         "briefing": m.briefing_json,
         "traces": m.traces_json,
         "created_at": m.created_at.to_rfc3339(),
+        // 只对助理轮解析：`system` 行是后端自己写的中断 / 失败账，里面不会有归因块。
+        "attribution": attribution.as_ref().map(|a| a.wire()),
+        "attribution_label": attribution.as_ref().and_then(|a| a.kind()).map(|k| k.label()),
+        "attribution_reason": attribution.as_ref().and_then(|a| a.reason()),
     })
 }

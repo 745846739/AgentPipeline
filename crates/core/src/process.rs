@@ -24,9 +24,35 @@ pub fn spawn_in_own_process_group(
     cwd: &Path,
 ) -> std::io::Result<tokio::process::Child> {
     let mut cmd = tokio::process::Command::new("sh");
-    cmd.arg("-c").arg(command).current_dir(cwd);
-    // spawn() 不自动接管 stdio（不同于 output()）：必须显式管道化，
-    // 否则 wait_with_output 读回空内容。
+    cmd.arg("-c").arg(command);
+    spawn_with_stdio_and_group(cmd, cwd)
+}
+
+/// 在**独立进程组**里按 **argv 直出**启动一个命令（决策 232 / 237）：不经 `sh`。
+///
+/// 与 [`spawn_in_own_process_group`] 的差别只有一处，而那一处就是安全面的全部：
+/// 命令名与参数是两个独立的数组元素，没有一层 shell 去解释分号、管道、`$(...)`。
+/// 分层诊断的白名单命令（`date` / `ps` / `pgrep` / `lsof` / `wc` / `tail` / `sample`）
+/// 走这条，故「按命令名判定」这句话才有落点——`sh -c "date; rm -rf x"` 的命令名是 `sh`。
+#[cfg(unix)]
+pub fn spawn_argv_in_own_process_group(
+    program: &str,
+    args: &[String],
+    cwd: &Path,
+) -> std::io::Result<tokio::process::Child> {
+    let mut cmd = tokio::process::Command::new(program);
+    cmd.args(args);
+    spawn_with_stdio_and_group(cmd, cwd)
+}
+
+/// stdio + 独立进程组的共同配置（`spawn()` 不自动接管 stdio，必须显式管道化，
+/// 否则读回的是空内容；`process_group(0)` = 以自身 pid 新建进程组）。
+#[cfg(unix)]
+fn spawn_with_stdio_and_group(
+    mut cmd: tokio::process::Command,
+    cwd: &Path,
+) -> std::io::Result<tokio::process::Child> {
+    cmd.current_dir(cwd);
     cmd.stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped());

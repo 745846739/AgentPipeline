@@ -17,6 +17,8 @@ import {
   noteForeignDelta,
   pruneForeignActive,
   settleForemanStream,
+  attributionLabel,
+  FOREMAN_ATTRIBUTION_MARK,
   FOREMAN_FAILED_TURN_MARK,
 } from './foreman';
 
@@ -300,5 +302,31 @@ describe('别的班次「正在回话」（决策 220③）', () => {
     expect(active.bySession).toEqual({ 'sess-a': T0, 'sess-b': T0 + 5 });
     expect(foreignIsReplying(active, 'sess-a', T0 + 10)).toBe(true);
     expect(foreignIsReplying(active, 'sess-b', T0 + 10)).toBe(true);
+  });
+});
+
+/**
+ * 归因类别标记（决策 235① / 238）：界面只做一件事——把后端给的类别翻成一个词。
+ *
+ * 判据的重点在**未定位那一条**：绝不能编一个假的类别（决策 230 把「没有类别」也算一项
+ * 判据，画一个「未定位」的标签会让人以为那也是一类）。
+ */
+describe('归因类别标记（票 03）', () => {
+  it('四类各一个词', () => {
+    expect(attributionLabel('host')).toBe('宿主环境');
+    expect(attributionLabel('pipeline')).toBe('流水线运行');
+    expect(attributionLabel('project_code')).toBe('目标项目代码');
+    expect(attributionLabel('prompt_config')).toBe('prompt 与配置');
+  });
+
+  it('未定位与缺值都不给词：不编一个假的类别', () => {
+    for (const value of ['unlocated', '', null, undefined, 'unknown_thing']) {
+      expect(attributionLabel(value)).toBeNull();
+    }
+  });
+
+  it('哨兵与后端同源（原样镜像）', () => {
+    // 后端那一份在 `crates/core/src/pipeline/foreman.rs::FOREMAN_ATTRIBUTION_MARK`。
+    expect(FOREMAN_ATTRIBUTION_MARK).toBe('【归因】');
   });
 });
