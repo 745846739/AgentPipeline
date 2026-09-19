@@ -30,6 +30,8 @@ function config(overrides: Partial<StageConfig> = {}): StageConfig {
     // 环境层档位（决策 206）：缺省行里它是 null（没配过）——真实阶段的缺省 `auto`
     // 由后端的两层解析给出，不在这一行里。
     env_mode: null,
+    // 轮数上限（决策 233① / 239）：没配过是 null（缺省 300）。
+    max_rounds: null,
     updated_at: '2026-09-12T00:00:00Z',
     ...overrides,
   };
@@ -315,5 +317,42 @@ describe('ask 档只留给值班长（run-command-permissions 规格 §4）', ()
     expect(stageMayUseAsk('')).toBe(false);
     expect(stageMayUseAsk('develop ')).toBe(false);
     expect(stageMayUseAsk('Foreman')).toBe(false);
+  });
+});
+
+/**
+ * 轮数上限（决策 233① / 239）：只收正整数，缺省留空即省略。
+ *
+ * 界面这一层挡的是**人**：填 0 或负数在按下之前就该看见原因（后端也会拒 400，
+ * 两处都要——前端拦是为了不白跑一趟，后端拦是因为它才是权威）。
+ */
+describe('max_rounds（票 06）', () => {
+  it('正整数写进 payload', () => {
+    const draft = { ...emptyStageConfigDraft('foreman'), max_rounds: '120' };
+    const built = buildStageConfigPut(draft);
+    expect(built.ok).toBe(true);
+    if (built.ok) expect(built.payload.max_rounds).toBe(120);
+  });
+
+  it('留空 = 省略（整条替换的既有语义：缺省 300）', () => {
+    const built = buildStageConfigPut(emptyStageConfigDraft('foreman'));
+    expect(built.ok).toBe(true);
+    if (built.ok) expect('max_rounds' in built.payload).toBe(false);
+  });
+
+  it('0 与负数被拒：没有「无上限」这一档', () => {
+    for (const bad of ['0', '-5']) {
+      const built = buildStageConfigPut({
+        ...emptyStageConfigDraft('foreman'),
+        max_rounds: bad,
+      });
+      expect(built.ok).toBe(false);
+      if (!built.ok) expect(built.error).toContain('正整数');
+    }
+  });
+
+  it('预填把库里的值读回来', () => {
+    const draft = draftFromStageConfig(config({ stage: 'foreman', max_rounds: 300 }));
+    expect(draft.max_rounds).toBe('300');
   });
 });

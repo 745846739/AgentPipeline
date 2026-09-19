@@ -11,7 +11,13 @@ use agentpipeline_core::storage::observability::NewRun;
 use agentpipeline_core::types::{Node, NodeStatus, PendingKind, PendingReason, Stage};
 use testkit::{backdate_run, Script};
 
-/// 轮询等待该任务的某个 running run 出现（executor 已进入第一个 LLM 调用）。
+/// 轮询等待**那一条**卡死的 run 出现（executor 已进入第一个 LLM 调用）。
+///
+/// 按 `(stage, node)` 收窄到脚本挂了 `stall` 的那一个，而不是「该任务的第一条 running run」：
+/// `init` 是**系统节点**（不调模型）而在它跑 git 活的这段时间里同样是 `running`，
+/// 整套 gate 满负荷并行时轮询会先抓到它——随后它被判超时，又被它自己完成时按值写回
+/// `success`（`finish_run` 的 status 是按值写的），于是「判超时」这条用例约 1/3 的概率
+/// 红在一个与它无关的节点上。收窄之后这条等待才真的在等它要测的那一次调用。
 async fn wait_for_active_run(flow: &Flow, task_id: &str) -> agentpipeline_core::types::NodeRun {
     tokio::time::timeout(Duration::from_secs(5), async {
         loop {
@@ -21,7 +27,11 @@ async fn wait_for_active_run(flow: &Flow, task_id: &str) -> agentpipeline_core::
                 .await
                 .unwrap()
                 .into_iter()
-                .find(|r| r.task_id.as_deref() == Some(task_id))
+                .find(|r| {
+                    r.task_id.as_deref() == Some(task_id)
+                        && r.stage == Stage::ArchitectDesign
+                        && r.node == Node::ValidateInput
+                })
             {
                 return run;
             }

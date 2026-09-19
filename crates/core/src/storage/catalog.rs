@@ -88,6 +88,8 @@ struct StageConfigRow {
     /// （写入路径已经按枚举拒过），而让整张阶段配置表因此读不出来，代价远大于退一步
     /// ——退回的方向是安全的：值班长退回 `ask`（收紧），真实阶段退回全局默认。
     env_mode: Option<String>,
+    /// 值班长一轮的轮数上限（决策 233① / 239）。可空 = 没配过。
+    max_rounds: Option<i64>,
     updated_at: String,
 }
 
@@ -118,6 +120,12 @@ impl StageConfigRow {
                 .env_mode
                 .as_deref()
                 .and_then(crate::types::EnvMode::parse),
+            // 手工改坏的负数 / 0 一律当「没配过」：这一列是观测性配置，读不出来时退到缺省
+            // 比让整张表报错更划算（写入路径已经只收正整数）。
+            max_rounds: self
+                .max_rounds
+                .and_then(|v| u32::try_from(v).ok())
+                .filter(|v| *v > 0),
             updated_at: parse_ts(&self.updated_at)?,
         })
     }
@@ -386,8 +394,8 @@ impl Store {
             "INSERT INTO stage_configs
              (stage, provider_id, temperature, max_tokens, persona_path, persona_append,
               tools_json, skills_json, idle_timeout_sec, max_duration_sec, node_overrides_json,
-              env_mode, updated_at)
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+              env_mode, max_rounds, updated_at)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
              ON CONFLICT(stage) DO UPDATE SET
                  provider_id = excluded.provider_id, temperature = excluded.temperature,
                  max_tokens = excluded.max_tokens, persona_path = excluded.persona_path,
@@ -396,6 +404,7 @@ impl Store {
                  max_duration_sec = excluded.max_duration_sec,
                  node_overrides_json = excluded.node_overrides_json,
                  env_mode = excluded.env_mode,
+                 max_rounds = excluded.max_rounds,
                  updated_at = excluded.updated_at",
         )
         .bind(&cfg.stage)
@@ -410,6 +419,7 @@ impl Store {
         .bind(cfg.max_duration_sec.map(|v| v as i64))
         .bind(cfg.node_overrides_json.as_ref().map(|v| v.to_string()))
         .bind(cfg.env_mode.map(|m| m.as_str()))
+        .bind(cfg.max_rounds.map(|v| v as i64))
         .bind(ts(self.now()))
         .execute(self.pool())
         .await?;
@@ -420,7 +430,7 @@ impl Store {
         let rows: Vec<StageConfigRow> = sqlx::query_as(
             "SELECT stage, provider_id, temperature, max_tokens, persona_path, persona_append,
                     tools_json, skills_json, idle_timeout_sec, max_duration_sec,
-                    node_overrides_json, env_mode, updated_at
+                    node_overrides_json, env_mode, max_rounds, updated_at
              FROM stage_configs ORDER BY stage",
         )
         .fetch_all(self.pool())

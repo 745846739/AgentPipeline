@@ -2,6 +2,7 @@
   import { untrack } from 'svelte';
   import type { Provider, SkillSummary, StageConfig } from '../../api/types';
   import {
+    FOREMAN_STAGE_KEY,
     SKILL_NODES,
     STAGE_KEYS,
     draftFromStageConfig,
@@ -236,6 +237,16 @@
       <span>max_duration_sec</span>
       <input class="input mono" type="number" min="0" bind:value={draft.max_duration_sec} />
     </label>
+
+    <!-- 轮数上限（决策 233① / 239）：只对值班长那一行有意义，故只在 foreman 上摆出来
+         ——14 行里 13 行都看不见这个格子，比「一个对多数行都无意义的旋钮」安静。
+         `min=1`：没有「无上限」这一档（填 0 会被后端拒，这里先挡一道）。 -->
+    {#if draft.stage === FOREMAN_STAGE_KEY}
+      <label class="field">
+        <span>max_rounds</span>
+        <input class="input mono" type="number" min="1" bind:value={draft.max_rounds} />
+      </label>
+    {/if}
 
     <label class="field wide">
       <span>node_overrides_json</span>

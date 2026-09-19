@@ -195,6 +195,15 @@ workspace 成员 `crates/testkit`，供 L2 / L4 复用：
   `api_contract::a_config_set_that_would_drop_node_overrides_is_refused`（**工具那一侧**的校验：
   没带而旧有 → 拒、报文说清几个覆盖、**提议不消耗**、旧配置一字未动；带上 / 本来没有 / 显式 `{}` 各一）。
   校验点不在 `PUT /stage-configs` 上：整条替换是那个端点的**既有语义**（界面表单总带全整行）。
+- **一轮的收尾语义（决策 233 / 239，票 06）**：`foreman.rs` 3 条——触顶**不再整轮作废**
+  （部分结论落库 + `【未收口】` 标注 + 标注里给出实际生效的上限；上限由 `stage_configs` 的
+  `max_rounds` 给，用例配 3 轮同时钉住「设置项真的生效」）/ 一句话都没说过的触顶**仍旧按失败
+  处置**（类别仍是 `model_no_reply`，没有东西可留时报错才是诚实的）/ 一轮死了之后它提的提议
+  **随之失效**（`invalidate_pending_foreman_proposals`：状态 `expired`、行留着可追溯）+
+  `api_contract::max_rounds_accepts_only_positive_integers`（正整数 / `0` / 负数 / 留空四种）
+  + `config::a_stored_zero_max_rounds_fails_startup_validation`（存量里的 `0` 拒绝启动，
+  与 `tools_json` 的未知名字同一姿态）+ 前端 `stageConfigs.test.ts` 4 条（正整数入 payload /
+  留空省略 / `0` 与负数在按下之前就被拦 / 预填读回来）。
 - **待办补两类（决策 234，票 05）**：`scheduler_tick.rs` 4 条（`run_failed` 当场记且点名 run /
   逐 attempt 各一行 / 任务已转 pending 时不重复记 / 取消留一条唤醒待办）+
   `foreman::run_failures_of_the_same_task_are_collapsed_by_the_cooldown`（决策 234 点名的风险：

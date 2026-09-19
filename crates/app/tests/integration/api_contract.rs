@@ -5951,3 +5951,62 @@ async fn a_config_set_that_would_drop_node_overrides_is_refused() {
     .await;
     assert_eq!(status, StatusCode::OK, "{body}");
 }
+
+/// 轮数上限只收正整数（决策 233① / 239）：`0` / 负数当场拒，缺省（不传）与显式清空都合法。
+#[tokio::test]
+async fn max_rounds_accepts_only_positive_integers() {
+    let api = api().await;
+
+    // 正面：正整数写得进去、读得回来。
+    let (status, body) = put(
+        &api,
+        "/stage-configs/foreman",
+        serde_json::json!({"max_rounds": 42}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["stage_config"]["max_rounds"], 42);
+    let stored = api
+        .state
+        .store
+        .get_stage_config("foreman")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(stored.max_rounds, Some(42));
+
+    // `0` 与负数：拒，且报文说清「没有无上限这一档」。
+    for bad in [serde_json::json!(0), serde_json::json!(-1)] {
+        let (status, body) = put(
+            &api,
+            "/stage-configs/foreman",
+            serde_json::json!({"max_rounds": bad}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+        let message = body["error"].as_str().unwrap_or_default();
+        assert!(message.contains("正整数"), "{message}");
+        assert!(message.contains("无上限"), "要说清没有那一档：{message}");
+    }
+    // 被拒的两次都没改动旧值。
+    let stored = api
+        .state
+        .store
+        .get_stage_config("foreman")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(stored.max_rounds, Some(42));
+
+    // 不传 = 回到缺省（整条替换的既有语义）。
+    let (status, _) = put(&api, "/stage-configs/foreman", serde_json::json!({})).await;
+    assert_eq!(status, StatusCode::OK);
+    let cleared = api
+        .state
+        .store
+        .get_stage_config("foreman")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(cleared.max_rounds, None, "留空即清成默认（缺省 300）");
+}

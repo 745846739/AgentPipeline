@@ -10,13 +10,13 @@
 
 **Blocked by:** None
 
-**Status:** pending
+**Status:** done
 
-- [ ] `read_stage_configs` 的读数带回 `node_overrides_json`（顺带 `persona_append` / `env_mode`）
-- [ ] `config set` 的校验点：会丢掉旧 `node_overrides` 就拒，报文给出处置办法
-- [ ] 用例：回显真的回来（含「本来就有 / 本来就没有」两侧）；拒绝那一条**什么都不落库**
+- [x] `read_stage_configs` 的读数带回 `node_overrides_json`（顺带 `persona_append` / `env_mode`）
+- [x] `config set` 的校验点：会丢掉旧 `node_overrides` 就拒，报文给出处置办法
+- [x] 用例：回显真的回来（含「本来就有 / 本来就没有」两侧）；拒绝那一条**什么都不落库**
       （旧配置一字未动）；带上 `node_overrides` 时照常写成功
-- [ ] 既有语义不动：其余字段仍然「留空即清成默认」
+- [x] 既有语义不动：其余字段仍然「留空即清成默认」
 
 **Notes（实现提示）:**
 - 只回显防不住手滑（看见了仍可能静默抹掉），只校验则让它继续看不见现状——两条都要。

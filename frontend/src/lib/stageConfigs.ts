@@ -34,6 +34,15 @@ export const STAGE_KEYS = [
 export type StageKey = (typeof STAGE_KEYS)[number];
 
 /**
+ * 值班长的阶段键（`crates/core/src/pipeline/foreman.rs::FOREMAN_STAGE_KEY` 的前端镜像）。
+ *
+ * 界面有两处需要**只对那一行**成立的东西（`env_mode` 的 `ask` 档、`max_rounds` 那一格），
+ * 而在这之前它是散落的字面量 `'foreman'`——两处各写一遍就会与后端那个键漂移，
+ * 而漂移的形状是「格子不见了」，不是报错。
+ */
+export const FOREMAN_STAGE_KEY: StageKey = 'foreman';
+
+/**
  * 不是真实阶段的配置键。`foreman`（值班长，决策 182①）与三个伪阶段并列，
  * 但它**不是伪阶段**——它不在流水线里，是任务无关的对话角色；
  * 归在这一组只是为了复用同一个「加备注」的渲染。
@@ -60,7 +69,7 @@ export function isPseudoStage(stage: string): boolean {
  * 这里只是不把那个选项摆出来——摆出来再报错等于让人白填一次。
  */
 export function stageMayUseAsk(stage: string): boolean {
-  return stage === 'foreman';
+  return stage === FOREMAN_STAGE_KEY;
 }
 
 /** 阶段键的界面标签（伪阶段加备注）。 */
@@ -82,6 +91,12 @@ export interface StageConfigDraft {
   idle_timeout_sec: string;
   max_duration_sec: string;
   node_overrides_json: string;
+  /**
+   * 值班长一轮的轮数上限（决策 233① / 239）。空串 = 没配过（缺省 300）。
+   *
+   * 只对 `foreman` 那一行有意义，而表单是逐阶段通用的，故它在其它阶段上只是「没填」。
+   */
+  max_rounds: string;
   /** 环境层档位（决策 206）。空串 = 没配过（用全局默认 / 该阶段的缺省）。 */
   env_mode: EnvMode | '';
 }
@@ -99,6 +114,7 @@ export function emptyStageConfigDraft(stage: string = STAGE_KEYS[0]): StageConfi
     idle_timeout_sec: '',
     max_duration_sec: '',
     node_overrides_json: '',
+    max_rounds: '',
     env_mode: '',
   };
 }
@@ -117,6 +133,7 @@ export function draftFromStageConfig(config: StageConfig): StageConfigDraft {
     idle_timeout_sec: config.idle_timeout_sec === null ? '' : String(config.idle_timeout_sec),
     max_duration_sec: config.max_duration_sec === null ? '' : String(config.max_duration_sec),
     node_overrides_json: stringifyJson(config.node_overrides_json),
+    max_rounds: config.max_rounds === null || config.max_rounds === undefined ? '' : String(config.max_rounds),
     env_mode: config.env_mode ?? '',
   };
 }
@@ -209,6 +226,18 @@ export function buildStageConfigPut(draft: StageConfigDraft): StageConfigPutResu
   const overrides = parseOptionalJson(draft.node_overrides_json, 'node_overrides_json');
   if ('error' in overrides) return { ok: false, error: overrides.error };
   if (overrides.value !== undefined) payload.node_overrides_json = overrides.value;
+
+  // 轮数上限（决策 233① / 239）：只收正整数，缺省（留空）不上送。
+  // 「0 = 无上限」这一档不存在，故这里把它挡在界面这一层（后端也会拒，两处都要）——
+  // 让填错的人在按下之前就看见原因，而不是拿到一句 400。
+  const rounds = parseOptionalNumber(draft.max_rounds, 'max_rounds', true);
+  if ('error' in rounds) return { ok: false, error: rounds.error };
+  if (rounds.value !== undefined) {
+    if (rounds.value <= 0) {
+      return { ok: false, error: 'max_rounds 必须为正整数（没有「无上限」这一档）。' };
+    }
+    payload.max_rounds = rounds.value;
+  }
 
   // 环境层档位（决策 206）：空串 = 不配置（留给全局默认 / 该阶段的缺省），
   // 与「整条替换」的其余字段同一条规则——留空即省略。

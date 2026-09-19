@@ -65,6 +65,10 @@ pub struct PutStageConfig {
     /// 同一条口径（同一个值的两种来源，报错也该是同一种说法）。
     #[serde(default)]
     pub env_mode: Option<String>,
+    /// 值班长一轮的轮数上限（决策 233① / 239）。**用 `i64` 接**：只收正整数，而用 `u32`
+    /// 接的话 `-1` 会退化成 serde 的通用 422 报文，说不出「必须是正整数」这句话。
+    #[serde(default)]
+    pub max_rounds: Option<i64>,
 }
 
 /// 用「现有配置 + 待改动」跑一遍启动校验；`removed` 是本次要从集合里去掉的阶段键。
@@ -130,6 +134,21 @@ pub async fn put(
             Some(mode)
         }
     };
+    // 轮数上限只收正整数（决策 239）：`0` / 负数都不许，也**不提供无上限**——判据写在
+    // 决策 239 里（`0` = 无上限会在配置面上造出第二个「留空即特殊」的语义）。
+    let max_rounds = match body.max_rounds {
+        None => None,
+        Some(v) if v > 0 => Some(u32::try_from(v).map_err(|_| {
+            ApiError::bad_request(format!(
+                "max_rounds 超出口径（收到 {v}）：它管「一轮里能跑几次模型调用」，请给一个正整数"
+            ))
+        })?),
+        Some(v) => {
+            return Err(ApiError::bad_request(format!(
+                "max_rounds 必须是正整数（收到 {v}）：`0` / 负数都不许，也没有「无上限」这一档。                 要恢复缺省就删掉这一格。"
+            )))
+        }
+    };
     let candidate = StageConfig {
         stage: stage.clone(),
         provider_id: body.provider_id,
@@ -143,6 +162,7 @@ pub async fn put(
         max_duration_sec: body.max_duration_sec,
         node_overrides_json: body.node_overrides_json,
         env_mode,
+        max_rounds,
         updated_at: state.store.now(),
     };
 

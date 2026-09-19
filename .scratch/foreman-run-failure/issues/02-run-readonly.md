@@ -11,15 +11,15 @@
 
 **Blocked by:** None（与票 01 都在读面，并批省一次构建）
 
-**Status:** pending
+**Status:** done
 
-- [ ] **先改断言再加能力**（决策 209 的次序）：`foreman.rs` 的冻结工具清单用例与
+- [x] **先改断言再加能力**（决策 209 的次序）：`foreman.rs` 的冻结工具清单用例与
       `FOREMAN_WATCH_TOOL_DENY` 相关断言先写进 `run_readonly`
-- [ ] `FOREMAN_TOOL_SPECS` 追加 `run_readonly`（`Read` 层，第 21 个）
-- [ ] `ToolExecutor::run_readonly`：白名单判定 → argv 直出 → 路径参数过文件域 → `sample` 过 pid 集
-- [ ] pid 集判定可注入替身（纯函数 + 一条用真子进程的用例），`sample` 的拒绝发生在**启动之前**
-- [ ] 命令仍落 `kanban_node_commands`（归属走会话，决策 204④）——审计面看得见每一次取证
-- [ ] 用例：白名单外拒（`sh` / `rm`）、分号与管道**没有落点**（不经 shell 的牙齿）、
+- [x] `FOREMAN_TOOL_SPECS` 追加 `run_readonly`（`Read` 层，第 21 个）
+- [x] `ToolExecutor::run_readonly`：白名单判定 → argv 直出 → 路径参数过文件域 → `sample` 过 pid 集
+- [x] pid 集判定可注入替身（纯函数 + 一条用真子进程的用例），`sample` 的拒绝发生在**启动之前**
+- [x] 命令仍落 `kanban_node_commands`（归属走会话，决策 204④）——审计面看得见每一次取证
+- [x] 用例：白名单外拒（`sh` / `rm`）、分号与管道**没有落点**（不经 shell 的牙齿）、
       `data/` 与域外路径拒、`sample` 对外来 pid 拒而对本进程子进程放行、
       值守轮的工具集里有它、`deny` 档仍广告（它改不了任何东西）
 

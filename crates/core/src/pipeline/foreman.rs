@@ -292,7 +292,7 @@ pub const FOREMAN_TOOL_SPECS: [ForemanToolSpec; 21] = [
                       留空的字段会被清成默认——这是整条替换不是局部修改）、\
                       `delete`（删掉这个阶段的覆盖行，回到系统默认，要 stage）。\
                       要值班经理按键确认。",
-        parameters: r#"{"type":"object","properties":{"action":{"type":"string","enum":["set","delete"],"description":"set 或 delete"},"stage":{"type":"string","description":"阶段键（如 develop / review / foreman）"},"provider_id":{"type":"string","description":"set：用哪个 provider"},"temperature":{"type":"number","description":"set：采样温度"},"max_tokens":{"type":"integer","description":"set：输出上限"},"persona_path":{"type":"string","description":"set：人格文件路径"},"persona_append":{"type":"string","description":"set：追加指令"},"env_mode":{"type":"string","enum":["auto","ask","deny"],"description":"set：环境层权限档位"},"tools_json":{"description":"set：工具声明（与界面那个框同形）"},"skills_json":{"description":"set：技能声明（与界面那个框同形）"},"node_overrides_json":{"description":"set：节点级覆盖（与界面那个框同形）"},"idle_timeout_sec":{"type":"integer","description":"set：空闲超时"},"max_duration_sec":{"type":"integer","description":"set：最长时长"}},"required":["action","stage"]}"#,
+        parameters: r#"{"type":"object","properties":{"action":{"type":"string","enum":["set","delete"],"description":"set 或 delete"},"stage":{"type":"string","description":"阶段键（如 develop / review / foreman）"},"provider_id":{"type":"string","description":"set：用哪个 provider"},"temperature":{"type":"number","description":"set：采样温度"},"max_tokens":{"type":"integer","description":"set：输出上限"},"persona_path":{"type":"string","description":"set：人格文件路径"},"persona_append":{"type":"string","description":"set：追加指令"},"env_mode":{"type":"string","enum":["auto","ask","deny"],"description":"set：环境层权限档位"},"tools_json":{"description":"set：工具声明（与界面那个框同形）"},"skills_json":{"description":"set：技能声明（与界面那个框同形）"},"node_overrides_json":{"description":"set：节点级覆盖（与界面那个框同形）"},"idle_timeout_sec":{"type":"integer","description":"set：空闲超时"},"max_duration_sec":{"type":"integer","description":"set：最长时长"},"max_rounds":{"type":"integer","description":"set：只对 foreman 行有意义——一轮里最多几次模型调用，**正整数**（缺省 300；0 / 负数会被拒，没有「无上限」）"}},"required":["action","stage"]}"#,
     },
     ForemanToolSpec {
         name: "skills",
@@ -462,23 +462,29 @@ pub const FOREMAN_WATCH_TOOL_DENY: [&str; 2] = ["read_conversation", "run_comman
 /// 事件都塞进一次简报」的粗兜底。超出的部分留在表里，下一轮（或被追问时）再处理。
 const FOREMAN_ATTENTION_FETCH_LIMIT: usize = 50;
 
-/// 单次回话的最大工具往返轮数（决策 182④，**2026-09-18 由决策 224 从 8 改为 30**）。
+/// 单次回话的工具往返轮数**缺省值**（决策 182④，8 → 30 由决策 224，30 → 300 由决策 233①/239）。
 ///
 /// 正常靠「模型不再发起 tool_call」自然结束；这个上限是防御性的——模型若陷入
 /// 「查一个任务 → 再查一个」的循环，必须有人喊停，否则会持续烧 token 直到 HTTP 超时。
 ///
-/// **8 太小**：一轮正常的定位本来就要十几次工具调用——两轮**跑成功**的回话在痕迹里
-/// 分别留下 16 / 17 条（09-18 14:59 那条与 09-17 15:20 那条），而**同一班次**
-/// `01M2QZCNN4CC65SSBQS1FJG402` 里 14:54 与 15:47 那两轮就是撞在这个数上报
-/// `model_no_reply` 的：不是模型失控，是这个上限比一次正常轮还短。
-/// 取值参照同类 agent 运行时的口径：zcode 的子代理默认 4 轮，但它**面向人的主会话没有
-/// 轮数上限**，专家工作流的 react 循环默认 30——值班长属于前者的反面（面向人、被任意
-/// 提问），故取 30 而不是照抄「查得动就行」的小数。
+/// **现在它是「缺省」而不是「唯一取值」**（决策 233① / 239）：真正生效的数住在
+/// `stage_configs` 的 `foreman` 行（`max_rounds`，只收正整数，见 `Store::upsert_stage_config`
+/// 的写入校验与 `validate_startup`），这一份是没配过时的缺省。
+///
+/// 取值 300 的来历（决策 233①）：本轮实测里同一类问题用满 30 轮仍未收口 → `model_no_reply`、
+/// HTTP 500、**回话一条没落库**，而那 30 轮其实查到了东西。300 是「有人喊停」的兜底而**不是
+/// 预算目标**；它兜的那笔账由「触顶时部分结论落库 + 标注」（决策 233②）接着。
 ///
 /// **它不管墙钟**：一轮跑多久由 [`Self::respond`] 的 timeout 兜底（决策 223②，默认
-/// 1800s）。这个数只管「很快地空转」那一种病——**一轮里能跑几次模型调用**，与
-/// 「一轮能跑多久」是两个正交的界，各自守各自的。
-pub const FOREMAN_MAX_ROUNDS: usize = 30;
+/// 1800s）。两个数是**两条正交的界**，实际最坏值是 `min(max_rounds, 1800s)`——在墙钟先到的
+/// 情况下轮数不生效（决策 233 的如实记 (i)：抬墙钟另立一条）。
+pub const FOREMAN_MAX_ROUNDS: usize = 300;
+
+/// 触到轮数上限时那一段的标记（决策 233②）：**部分结论落库并标注**。
+///
+/// 它必须看得见：一则让值班经理知道「这不是结论而是没说完」，二则让下一轮（或下一班）
+/// 读历史时知道那一段是半成品——把半成品当结论用，正是这一批要修的那类失真。
+pub const FOREMAN_PARTIAL_TURN_MARK: &str = "【未收口】";
 
 /// 历史窗口的字符预算（决策 182⑫）。
 ///
@@ -1052,6 +1058,19 @@ impl ForemanRunner {
         std::time::Duration::from_secs(secs)
     }
 
+    /// 这一轮的**轮数上限**（决策 233① / 239）：`stage_configs` 的 `foreman` 行配了就用它，
+    /// 没配过用缺省 [`FOREMAN_MAX_ROUNDS`]。
+    ///
+    /// 与 [`Self::turn_limit`]（墙钟）并列：两个数管两件事，实际最坏值是它们的较小者。
+    /// 解析**只有这一处**——写入路径只收正整数，读回来是 `None` = 没配过（`0` / 负数在
+    /// `StageConfigRow::into_config` 里已经被挡在门外，而 `validate_startup` 对存量里的
+    /// `0` 直接拒绝启动）。
+    fn round_limit(&self, cfg: Option<&crate::types::StageConfig>) -> usize {
+        cfg.and_then(|c| c.max_rounds)
+            .map(|v| v as usize)
+            .unwrap_or(FOREMAN_MAX_ROUNDS)
+    }
+
     /// 一轮回话的**内里**（现场由 [`Self::say`] / [`Self::watch`] 的外框记账，
     /// 时限由 [`Self::respond`] 给）。
     async fn respond_inner(
@@ -1159,8 +1178,13 @@ impl ForemanRunner {
         // 空内容与「轮数耗尽」是两回事，报错必须分得开——否则一次「模型返回空」会被
         // 说成「它可能一直在查台账」，把人引到完全错误的方向上去查。
         let mut empty_replies = 0usize;
+        // 到目前为此它说过的**最后一句有内容的话**（决策 233②）：触到上限时不再整轮作废，
+        // 把这一段带上标注落库。它会随工具调用一起出现（模型一边查一边说），故与 `reply`
+        // 分开记——`reply` 只在「这一轮收口了」时赋值。
+        let mut last_text: Option<String> = None;
+        let round_limit = self.round_limit(cfg.as_ref());
 
-        for _ in 0..FOREMAN_MAX_ROUNDS {
+        for _ in 0..round_limit {
             let request = LlmRequest {
                 // 占位阶段：让既有的 provider 解析链跑通。真正生效的 provider 从
                 // `provider_id` 进来（决策 182②，与 project_analysis 同一路子）。
@@ -1193,6 +1217,14 @@ impl ForemanRunner {
                 response.content.clone(),
                 response.tool_calls.clone(),
             ));
+            if let Some(text) = response
+                .content
+                .as_deref()
+                .map(str::trim)
+                .filter(|t| !t.is_empty())
+            {
+                last_text = Some(text.to_string());
+            }
 
             if response.tool_calls.is_empty() {
                 reply = response.content.filter(|s| !s.trim().is_empty());
@@ -1218,28 +1250,45 @@ impl ForemanRunner {
             }
         }
 
-        let reply = reply.ok_or_else(|| {
-            if empty_replies > 0 {
+        // 触到上限**不再整轮作废**（决策 233②）：那 30 轮其实查到了东西（实测里两条提议
+        // 就是证明），把已经付过钱的结论整段扔掉是那次实测里最贵的一件事。故只要有话说，
+        // 就带上标注落库；**一句话都没说过的**仍旧按失败处置（没有东西可留，报错才是诚实的）。
+        let reply = match reply {
+            Some(reply) => reply,
+            None if last_text.is_some() && empty_replies == 0 => {
+                let partial = last_text.unwrap_or_default();
+                tracing::warn!(
+                    limit = round_limit,
+                    "值班长触到轮数上限：部分结论落库并标注（决策 233②）"
+                );
+                format!(
+                    "{partial}\n\n{FOREMAN_PARTIAL_TURN_MARK}这一轮到了 {round_limit} 轮的收口上限，\
+                     话没说完——以上是已经确定的部分。要接着查可以让我再来一轮（带上线索）。"
+                )
+            }
+            None => {
                 // 归因**走 `LlmClassified` 的 kind 机制**而不是新造一种错误（票 04）：
                 // 这两条是模型行为，不是内部故障，而「哪一类」正是排查要的入口。
-                Error::LlmClassified {
-                    kind: "model_empty_reply".into(),
-                    message: "值班长这一轮没有回话（模型返回了空内容）。\
-                              若这是本机第一次使用，先确认 provider 与模型名配对了；\
-                              也可以换个模型再试——有些模型在被要求用工具时会返回空内容。"
-                        .into(),
-                    raw: "模型返回空内容（无 tool_calls、无文本）".into(),
-                }
-            } else {
-                Error::LlmClassified {
-                    kind: "model_no_reply".into(),
-                    message: format!(
-                        "值班长在 {FOREMAN_MAX_ROUNDS} 轮内没有给出回话——它可能一直在查台账"
-                    ),
-                    raw: format!("达到 FOREMAN_MAX_ROUNDS = {FOREMAN_MAX_ROUNDS} 仍未收口"),
-                }
+                return Err(if empty_replies > 0 {
+                    Error::LlmClassified {
+                        kind: "model_empty_reply".into(),
+                        message: "值班长这一轮没有回话（模型返回了空内容）。\
+                                  若这是本机第一次使用，先确认 provider 与模型名配对了；\
+                                  也可以换个模型再试——有些模型在被要求用工具时会返回空内容。"
+                            .into(),
+                        raw: "模型返回空内容（无 tool_calls、无文本）".into(),
+                    }
+                } else {
+                    Error::LlmClassified {
+                        kind: "model_no_reply".into(),
+                        message: format!(
+                            "值班长在 {round_limit} 轮内没有给出回话——它可能一直在查台账"
+                        ),
+                        raw: format!("达到轮数上限 = {round_limit} 仍未收口"),
+                    }
+                });
             }
-        })?;
+        };
 
         let traces_json = if traces.is_empty() {
             None
@@ -1433,6 +1482,33 @@ impl ForemanRunner {
             format!("{FOREMAN_FAILED_TURN_MARK}这一轮没跑起来（{kind}）：{reason}"),
         )
         .await;
+        self.invalidate_round_proposals(&session.id).await;
+    }
+
+    /// 一轮死掉之后，**它那一轮提的提议随之失效**（决策 233③）。
+    ///
+    /// 提议是「等这一次问答收口」的产物：那一轮已经死了，钮就该随之作废——否则有人还能按
+    /// 一条**已经没人等它**的提议。实测里那两条悬空提议（`01M2VSYN…`）从 09-18 一直挂在
+    /// `pending`，正是这个缺口的形状。
+    ///
+    /// 只在**失败的轮**上作废：正常收口那一轮的提议照旧等人按键（那是它的正常归宿）。
+    /// 不额外广播事件（与每小时的过期扫描同一姿态）：界面重读会话时看到 `expired`，
+    /// 两颗钮随之变灰——为此新造一个 SSE 事件只是多一条要维护的契约。
+    async fn invalidate_round_proposals(&self, session_id: &str) {
+        match self
+            .store
+            .invalidate_pending_foreman_proposals(session_id)
+            .await
+        {
+            Ok(0) => {}
+            Ok(count) => tracing::info!(
+                session = session_id,
+                count,
+                "这一轮没跑起来：把它提的悬空提议一并作废（决策 233③）"
+            ),
+            // 作废失败不改变「这一轮失败了」这个事实，故只记一行。
+            Err(e) => tracing::warn!(session = session_id, error = %e, "作废悬空提议失败"),
+        }
     }
 
     /// 落一条**没跑完**的账（决策 223）：这一轮的 future 被 panic 带走时用。
@@ -1455,6 +1531,7 @@ impl ForemanRunner {
             format!("{FOREMAN_FAILED_TURN_MARK}这一轮没跑完（{why}）：回话没有落库"),
         )
         .await;
+        self.invalidate_round_proposals(&session.id).await;
     }
 
     /// 往台账里写一条**操作台自己**的账（`role = system`，决策 207 那条路）。

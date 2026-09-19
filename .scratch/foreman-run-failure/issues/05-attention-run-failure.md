@@ -10,13 +10,13 @@
 
 **Blocked by:** None（最便宜的一条，且立刻止住「烧掉一千万 token 而值守不知情」）
 
-**Status:** pending
+**Status:** done
 
-- [ ] 两个枚举值 + `as_str` / `parse` 两条臂（`wakes()` 缺省为真，两条都自动唤醒）
-- [ ] `run_failed` 的生产点：`note_discoveries` 里扫「终态失败 / 超时的 run」并带
+- [x] 两个枚举值 + `as_str` / `parse` 两条臂（`wakes()` 缺省为真，两条都自动唤醒）
+- [x] `run_failed` 的生产点：`note_discoveries` 里扫「终态失败 / 超时的 run」并带
       **「任务没转 pending」**那一半判据（否则重试型故障会连着出几条）
-- [ ] `task_cancelled` 的生产点：取消路径（`cancel_task`）补写
-- [ ] 用例：两类各自被记下并被唤醒；**同任务 30 分钟冷却对 `run_failed` 真的生效**
+- [x] `task_cancelled` 的生产点：取消路径（`cancel_task`）补写
+- [x] 用例：两类各自被记下并被唤醒；**同任务 30 分钟冷却对 `run_failed` 真的生效**
       （风险明文在决策 234：不然一次重试型故障能烧光每小时配额）；任务自己转 pending 时不重复记
 
 **Notes（实现提示）:**

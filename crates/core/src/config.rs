@@ -1178,6 +1178,19 @@ pub fn validate_startup(inputs: &StartupInputs) -> Result<StartupReport> {
                 &where_, &unknown,
             )));
         }
+        // `max_rounds` 只收正整数（决策 233① / 239）：`0` / 负数都不许，也**不提供无上限**。
+        // 写入路径（`PUT /stage-configs` / 值班长的 `config set`）已经按这条拒过，这里管的是
+        // **存量**（手工改库、老版本写下的值）：与 `tools_json` 的未知名字同一姿态——
+        // 启动即报错并说清怎么改，**不静默放行、也不自动清理**（静默把 0 当成缺省，等于让
+        // 「配了个无效值」这件事永远不被发现）。`None` = 没配过 = 用缺省 300，那是合法的。
+        if cfg.max_rounds == Some(0) {
+            return Err(Error::Config(format!(
+                "阶段 {} 的 max_rounds 必须是正整数（当前是 0）：它管「一轮里能跑几次模型调用」，\
+                 缺省 {}。要恢复缺省就删掉这一格（或整条阶段配置），**没有「无上限」这一档**。",
+                cfg.stage,
+                crate::pipeline::foreman::FOREMAN_MAX_ROUNDS,
+            )));
+        }
         // §10.6.4：persona「必须存在且非空」在启动时校验（运行时 resolve_stage_persona
         // 仍有同样检查兜底——手工改库可绕过启动校验）
         if let (Some(root), Some(path)) = (&inputs.home_root, cfg.persona_path.as_deref()) {
@@ -2150,6 +2163,33 @@ mod tests {
         std::fs::remove_file(&good).unwrap();
         let err = validate_startup(&inputs).unwrap_err();
         assert!(err.to_string().contains("不可读"), "{err}");
+    }
+
+    /// 决策 233① / 239：存量的 `max_rounds = 0` **拒绝启动**（写入路径已经按正整数拒过）。
+    ///
+    /// 与 `tools_json` 的未知名字同一姿态：`None`（没配过）= 缺省 300 是合法的，而 `0` 是一个
+    /// **无效值**——静默把它当缺省，等于让「配了个 0」这件事永远不被发现。
+    #[test]
+    fn a_stored_zero_max_rounds_fails_startup_validation() {
+        let cfg = |max_rounds: Option<u32>| StartupInputs {
+            stage_configs: vec![StageConfig {
+                stage: crate::pipeline::foreman::FOREMAN_STAGE_KEY.into(),
+                max_rounds,
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        // 没配过 / 正整数都能启动
+        validate_startup(&cfg(None)).unwrap();
+        validate_startup(&cfg(Some(1))).unwrap();
+        // 0 拒，且报文说清取值面与缺省值
+        let err = validate_startup(&cfg(Some(0))).unwrap_err().to_string();
+        assert!(err.contains("max_rounds"), "{err}");
+        assert!(err.contains("正整数"), "{err}");
+        assert!(
+            err.contains(&crate::pipeline::foreman::FOREMAN_MAX_ROUNDS.to_string()),
+            "{err}"
+        );
     }
 
     /// 决策 154 的后续票：`tools_json` 里的**未知工具名拒绝**（静默丢弃 → fail fast）。

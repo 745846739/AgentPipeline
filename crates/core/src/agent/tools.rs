@@ -1631,6 +1631,9 @@ impl ToolExecutor {
                 "persona_append": c.persona_append,
                 "env_mode": c.env_mode.map(|m| m.as_str()),
                 "node_overrides_json": c.node_overrides_json,
+                // 值班长那一行的轮数上限（决策 233① / 239）：它同样是「留空即清成默认」
+                // 会动的字段，而值班长要能看见自己现在被放了多少轮。
+                "max_rounds": c.max_rounds,
                 "skills_json": c.skills_json,
                 "idle_timeout_sec": c.idle_timeout_sec,
                 "max_duration_sec": c.max_duration_sec,

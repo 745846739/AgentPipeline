@@ -583,6 +583,11 @@ export interface StageConfig {
   node_overrides_json: unknown | null;
   /** 环境层权限档位（决策 206）。`null` = 没配过 → 用全局默认 / 该阶段的缺省。 */
   env_mode: EnvMode | null;
+  /**
+   * 值班长一轮的轮数上限（决策 233① / 239）：`null` = 没配过（缺省 300）。
+   * 只收正整数——`0` 与「无上限」都不存在（后端会拒 400）。只对 `foreman` 那一行有意义。
+   */
+  max_rounds: number | null;
   updated_at: string;
 }
 
@@ -611,6 +616,7 @@ export interface StageConfigPutPayload {
   max_duration_sec?: number;
   node_overrides_json?: unknown;
   env_mode?: EnvMode;
+  max_rounds?: number;
 }
 
 /* ─────────────── server-info（crates/app/src/routes/server_info.rs，决策 167）─────────────── */

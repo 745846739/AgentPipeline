@@ -436,6 +436,29 @@ impl Store {
         Ok(affected as usize)
     }
 
+    /// 作废**一个班次**里此刻仍悬空的提议（决策 233③：一轮死了，它那一轮提的提议随之失效）。
+    ///
+    /// 与 [`Self::expire_foreman_proposals`] 的差别只有判据：那条按**时间**（`expires_at` 到点），
+    /// 这条按**事件**（提出它的那一轮死了）。两条都要求 `claimed_at IS NULL`——正在被按下的
+    /// 那一条不在此列（它的终态归那次执行）。
+    ///
+    /// 状态用 `expired` 而不是新造一个：对界面而言「过期」与「那一轮死了」是同一件事
+    /// （钮按不动、行留在时间线里）。**不删行**，与其余路径同一姿态。
+    pub async fn invalidate_pending_foreman_proposals(&self, session_id: &str) -> Result<usize> {
+        let affected = sqlx::query(
+            "UPDATE kanban_foreman_proposals SET status = ?, resolved_at = ?
+             WHERE session_id = ? AND status = ? AND claimed_at IS NULL",
+        )
+        .bind(FOREMAN_PROPOSAL_EXPIRED)
+        .bind(ts(self.now()))
+        .bind(session_id)
+        .bind(FOREMAN_PROPOSAL_PENDING)
+        .execute(self.pool())
+        .await?
+        .rows_affected();
+        Ok(affected as usize)
+    }
+
     /// 超过保留期、**没人按过**的修复提议（决策 212③ / 票 12 的最后一格）。
     ///
     /// 为什么需要它：修复提议的 worktree 只被两条路回收——人按「合入」、人按「拒绝」。

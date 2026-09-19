@@ -802,6 +802,9 @@ async fn run_config_tool(
                     max_duration_sec: args.get("max_duration_sec").and_then(|v| v.as_u64()),
                     node_overrides_json: args.get("node_overrides_json").cloned(),
                     env_mode: opt_str(args, "env_mode"),
+                    // 轮数上限（决策 233① / 239）：只收正整数，越界由 `put` 那条路拒
+                    // （报文与界面上写错时同一句）。
+                    max_rounds: args.get("max_rounds").and_then(|v| v.as_i64()),
                 }),
             )
             .await;

@@ -10,15 +10,15 @@
 
 use std::sync::Arc;
 
-use agentpipeline_core::agent::client::{LlmClient, LlmRequest};
+use agentpipeline_core::agent::client::{AgentResponse, LlmClient, LlmRequest};
 use agentpipeline_core::clock::Clock;
 use agentpipeline_core::config::Settings;
 use agentpipeline_core::metrics;
 use agentpipeline_core::pipeline::foreman::{
     build_briefing, foreman_tool_names, situation_fingerprint, trim_history, AttributionKind,
     ForemanRunner, ForemanToolLayer, FOREMAN_AGENT_TYPE, FOREMAN_ATTRIBUTION_MARK,
-    FOREMAN_FAILED_TURN_MARK, FOREMAN_MAX_ROUNDS, FOREMAN_PERSONA, FOREMAN_STAGE_KEY,
-    FOREMAN_TOOL_SPECS, FOREMAN_WATCH_MARK, OPERATION_LOG_MARK,
+    FOREMAN_FAILED_TURN_MARK, FOREMAN_MAX_ROUNDS, FOREMAN_PARTIAL_TURN_MARK, FOREMAN_PERSONA,
+    FOREMAN_STAGE_KEY, FOREMAN_TOOL_SPECS, FOREMAN_WATCH_MARK, OPERATION_LOG_MARK,
 };
 use agentpipeline_core::storage::foreman::NewForemanMessage;
 use agentpipeline_core::storage::model_requests::{
@@ -3691,4 +3691,188 @@ async fn run_failures_of_the_same_task_are_collapsed_by_the_cooldown() {
     assert!(runner.watch().await.unwrap().is_some());
     assert_eq!(agent.total_calls(), 2);
     assert!(h.store.open_attention(100).await.unwrap().is_empty());
+}
+
+// ─────── 一轮的收尾语义（决策 233②③ / 239，票 06）───────
+
+/// 当场报错的替身：这一轮跑不起来。
+struct FailingLlm;
+
+impl LlmClient for FailingLlm {
+    fn complete(
+        &self,
+        _request: LlmRequest,
+    ) -> futures::future::BoxFuture<'static, agentpipeline_core::Result<AgentResponse>> {
+        Box::pin(async { Err(Error::Llm("连接被对端关掉".into())) })
+    }
+}
+
+/// 一边查一边说、从不收口的替身：每次响应都带同一句话与一个 tool_call。
+///
+/// 为什么要自己写一个：FakeAgent 的脚本步**要么文本、要么工具**（`Step::Text` /
+/// `Step::Tool`），而「触顶时还有话说」这件事只出现在**两者同时返回**的那一支上
+/// ——那正是决策 233② 要留下东西的那一支。
+struct ChattyForever {
+    calls: Arc<std::sync::atomic::AtomicUsize>,
+}
+
+impl LlmClient for ChattyForever {
+    fn complete(
+        &self,
+        _request: LlmRequest,
+    ) -> futures::future::BoxFuture<'static, agentpipeline_core::Result<AgentResponse>> {
+        self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        Box::pin(async move {
+            Ok(AgentResponse {
+                content: Some("到目前为止：它挂在 test.execute 上，栈落在 parse_chunk。".into()),
+                tool_calls: vec![agentpipeline_core::agent::client::ToolCall {
+                    id: "c1".into(),
+                    name: "read_task".into(),
+                    arguments: r#"{"task_id":"t1"}"#.into(),
+                }],
+                prompt_tokens: 10,
+                completion_tokens: 5,
+                ..Default::default()
+            })
+        })
+    }
+}
+
+/// 触到上限**不再整轮作废**：把已确定的部分落库并标注（决策 233②）。
+#[tokio::test]
+async fn a_capped_turn_keeps_what_it_already_established() {
+    let h = Harness::seeded().await;
+    // 上限配成 3：既验「那个设置项真的生效」（决策 233① / 239），也让用例不必跑 300 轮。
+    h.store
+        .upsert_stage_config(&StageConfig {
+            stage: FOREMAN_STAGE_KEY.to_string(),
+            max_rounds: Some(3),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+    let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let runner = ForemanRunner::new(
+        h.store.clone(),
+        Settings::default(),
+        h._home.home().clone(),
+        Arc::new(ChattyForever {
+            calls: calls.clone(),
+        }) as Arc<dyn LlmClient>,
+        Arc::new(testkit::SseRecorder::new()),
+    );
+    let sid = h.session().await;
+
+    let turn = runner.say(Some(&sid), "盯着 t1").await.unwrap();
+    assert_eq!(
+        calls.load(std::sync::atomic::Ordering::SeqCst),
+        3,
+        "轮数上限是设置项说的那个数（不是缺省的 300）"
+    );
+    assert!(
+        turn.reply.contains("它挂在 test.execute 上"),
+        "已经查到的东西要留下：{}",
+        turn.reply
+    );
+    assert!(
+        turn.reply.contains(FOREMAN_PARTIAL_TURN_MARK),
+        "要标出「这不是结论」：{}",
+        turn.reply
+    );
+    assert!(
+        turn.reply.contains("3 轮"),
+        "标注里要给出实际生效的上限：{}",
+        turn.reply
+    );
+
+    // 落库的是同一段（「那 30 轮其实查到了东西、却整段扔掉」是实测里最贵的一次浪费）。
+    let stored = h.store.list_foreman_messages(&sid, 10).await.unwrap();
+    assert!(
+        stored
+            .iter()
+            .any(|m| m.role == "assistant" && m.content.contains(FOREMAN_PARTIAL_TURN_MARK)),
+        "部分结论要落库：{stored:?}"
+    );
+    // 而且**不是**一轮失败：不落「没跑起来」的账。
+    assert!(
+        !stored
+            .iter()
+            .any(|m| m.role == "system" && m.content.contains(FOREMAN_FAILED_TURN_MARK)),
+        "触顶不再是失败：{stored:?}"
+    );
+}
+
+/// 一句话都没说过的触顶**仍旧按失败处置**（没有东西可留，报错才是诚实的）。
+#[tokio::test]
+async fn a_capped_turn_with_nothing_to_keep_is_still_a_failure() {
+    let h = Harness::empty().await;
+    let mut script = Script::new();
+    for _ in 0..FOREMAN_MAX_ROUNDS {
+        script.for_foreman().read_task("t1");
+    }
+    let runner = h.runner(FakeAgent::new(script));
+    let sid = h.session().await;
+
+    let err = runner.say(Some(&sid), "盯着 t1").await.unwrap_err();
+    assert_eq!(
+        err.llm_classified().map(|(k, _)| k.to_string()).as_deref(),
+        Some("model_no_reply"),
+        "没有可留的东西时，类别与原来一致：{err}"
+    );
+}
+
+/// 一轮死了之后，**它那一轮提的提议随之失效**（决策 233③）。
+#[tokio::test]
+async fn a_failed_turn_invalidates_the_proposals_it_left_behind() {
+    let h = Harness::seeded().await;
+    let sid = h.session().await;
+    // 这一轮提过两条（实测里那两条悬空提议就是这个形状）
+    for i in 0..2 {
+        h.store
+            .create_foreman_proposal(agentpipeline_core::storage::proposals::NewForemanProposal {
+                kind: agentpipeline_core::storage::proposals::ForemanProposalKind::ApiCall,
+                payload: None,
+                session_id: sid.clone(),
+                tool: "write_file".into(),
+                args: serde_json::json!({"path": format!("notes-{i}.md"), "content": "x"}),
+                summary: "（用例）".into(),
+                situation: None,
+            })
+            .await
+            .unwrap();
+    }
+    assert_eq!(
+        h.store
+            .list_pending_foreman_proposals(&sid)
+            .await
+            .unwrap()
+            .len(),
+        2
+    );
+
+    // 这一轮跑不起来（模型当场报错）
+    let runner = ForemanRunner::new(
+        h.store.clone(),
+        Settings::default(),
+        h._home.home().clone(),
+        Arc::new(FailingLlm) as Arc<dyn LlmClient>,
+        Arc::new(testkit::SseRecorder::new()),
+    );
+    assert!(runner.say(Some(&sid), "动手吧").await.is_err());
+
+    assert!(
+        h.store
+            .list_pending_foreman_proposals(&sid)
+            .await
+            .unwrap()
+            .is_empty(),
+        "那一轮已经死了，钮就该随之作废"
+    );
+    // 行还在（审计：它当时提议过什么必须可追溯），状态是 expired。
+    let all = h.store.list_foreman_proposals(&sid, 100).await.unwrap();
+    assert_eq!(all.len(), 2);
+    assert!(
+        all.iter().all(|p| p.status.as_str() == "expired"),
+        "留痕但不 pending：{all:?}"
+    );
 }
