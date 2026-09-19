@@ -82,9 +82,25 @@ pub enum Error {
 
     #[error("未实现：{0}")]
     NotImplemented(String),
+
+    /// 执行体被**主动中止**（决策 226）：调度器判节点超时后，通知执行体自己收口。
+    ///
+    /// 与其余错误的区别在**归属**，不在严重程度：它表示「这一轮已经不算数了」，而不是
+    /// 「这个节点失败了」。故上层不按节点失败处置——不挂 `pending`、不再重试本节点
+    /// （那会把判超时那边刚放出去的那次重试立刻打回去）；run 行的终态与重试记账归
+    /// `scheduler::handle_timeout`，执行体只把自己手里那份**用量**补记上去。
+    #[error("已中止：{0}")]
+    Cancelled(String),
 }
 
 impl Error {
+    /// 是否为「执行体按中止请求收口」（决策 226）。
+    ///
+    /// 调用方要按它分流：中止**不是**节点失败，别当失败处置。
+    pub fn is_cancelled(&self) -> bool {
+        matches!(self, Error::Cancelled(_))
+    }
+
     /// API 层是否需要把这个错误映射为 409。
     pub fn is_conflict(&self) -> bool {
         matches!(self, Error::Conflict(_))

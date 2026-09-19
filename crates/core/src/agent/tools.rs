@@ -968,6 +968,9 @@ impl ToolExecutor {
             .get("limit")
             .and_then(|v| v.as_u64())
             .map(|v| v as usize);
+        // 决策 226：要**尾部**而不是头部。追加写的文件（日志、运行记录）要看的都是尾巴，
+        // 而默认的头部读法在这种文件上给的恰好是最没用的那一段。
+        let tail = args.get("tail").and_then(|v| v.as_bool()).unwrap_or(false);
 
         let mut found: Option<PathBuf> = None;
         for candidate in ctx.read_candidates(rel) {
@@ -978,18 +981,16 @@ impl ToolExecutor {
             }
         }
         let path = found.ok_or_else(|| Error::Validation(format!("文件不存在：{rel}")))?;
-        let content = std::fs::read_to_string(&path)?;
-        let sliced = if offset > 0 || limit.is_some() {
-            let lines: Vec<&str> = content.lines().collect();
-            let end = limit
-                .map(|l| (offset + l).min(lines.len()))
-                .unwrap_or(lines.len());
-            lines[offset.min(lines.len())..end].join("\n")
-        } else {
-            content
-        };
+        // 决策 226：读取**不再整份进内存**（此前是 `read_to_string`，一个 200MB 的日志会
+        // 整份读进来再交给 L1 裁剪）。小文件仍走原路（`trim_read_file` 的结构大纲要往后扫
+        // 全文），大文件只读需要的那一段——`tail` 直接读尾部，日志与运行记录都该这么读。
+        let (sliced, note) = read_text_bounded(&path, offset, limit, tail)?;
         // L1 裁剪：默认头部 200 行 + 结构大纲
-        Ok(ToolOutcome::ok(trim_read_file(&sliced, limit)))
+        let mut out = trim_read_file(&sliced, limit);
+        if let Some(note) = note {
+            out.push_str(&format!("\n[{note}]"));
+        }
+        Ok(ToolOutcome::ok(out))
     }
 
     async fn delete_file(&self, call: &ToolCall, ctx: &ToolCallContext) -> Result<ToolOutcome> {
@@ -1991,6 +1992,118 @@ fn collect_entries(root: &Path, recursive: bool, out: &mut Vec<String>) -> Resul
     Ok(())
 }
 
+/// 有界读取（决策 226）：小文件整份读，大文件只读**需要的那一段**。返回（内容，省略说明）。
+///
+/// 省略说明非空时，内容是文件的一段而不是全部——**读的人必须知道这件事**，否则
+/// 「日志里没有那一行」与「我没读到那一行」长得一样。
+///
+/// 三条读法的分工：
+/// - **小文件（≤ [`READ_FILE_MAX_BYTES`]）走原路**：整份读。`trim_read_file` 的结构大纲
+///   要往后扫全文，流式读给不了它，而小文件占绝大多数，这条路的行为必须一字不变。
+/// - **大文件 + `tail`**：从尾部往回读最多一个上限，丢掉可能被切断的首行，再取最后
+///   `limit`（默认 200）行。**`tail` 与 `offset` 不同时用**：给了 `tail` 就是「要尾巴」，
+///   `offset` 被忽略（对着文件末尾数第 N 行不是任何人想要的读法）。
+/// - **大文件 + 头部 / 区间**：按行流式读，读满所需行数即停；字节预算用尽也停。
+///
+/// 按字节而不是按行读，是因为「有多少行」这件事本身要先读完整个文件才知道——正是要避免的
+/// 那一步。
+fn read_text_bounded(
+    path: &Path,
+    offset: usize,
+    limit: Option<usize>,
+    tail: bool,
+) -> Result<(String, Option<String>)> {
+    use std::io::{BufRead, BufReader, Read, Seek, SeekFrom};
+
+    let size = std::fs::metadata(path)?.len() as usize;
+    let take = limit.unwrap_or(crate::agent::context::READ_FILE_HEAD_LINES);
+    let cap = crate::agent::context::READ_FILE_MAX_BYTES;
+    if size <= cap {
+        let content = std::fs::read_to_string(path)?;
+        let lines: Vec<&str> = content.lines().collect();
+        let sliced = if tail {
+            last_lines(&lines, take)
+        } else if offset > 0 || limit.is_some() {
+            let end = limit
+                .map(|l| (offset + l).min(lines.len()))
+                .unwrap_or(lines.len());
+            lines[offset.min(lines.len())..end].join("\n")
+        } else {
+            content
+        };
+        return Ok((sliced, None));
+    }
+
+    let mut file = std::fs::File::open(path)?;
+    if tail {
+        file.seek(SeekFrom::Start((size - cap) as u64))?;
+        // 按字节读、再宽松解码：起点可能正好落在一个多字节字符中间（日志里中文常见），
+        // 严格解码会当场报「不是一个 UTF-8 文件」，而这里只是读了半行。
+        let mut raw = Vec::new();
+        file.read_to_end(&mut raw)?;
+        let text = String::from_utf8_lossy(&raw);
+        let mut lines: Vec<&str> = text.lines().collect();
+        // 首行是被 seek 切出来的半行：丢它，不丢就会把半行当成一条真日志读。
+        if !lines.is_empty() {
+            lines.remove(0);
+        }
+        let note = format!(
+            "{path} 共 {size} 字节，超过单次上限 {cap} 字节：这里读到的是**尾部**（最后 \
+             {cap} 字节里的最后 {} 行）。",
+            lines.len().min(take),
+            path = path.display()
+        );
+        let body = last_lines(&lines, take);
+        return Ok((body, Some(note)));
+    }
+
+    let mut reader = BufReader::new(file);
+    let mut out: Vec<String> = Vec::new();
+    let mut seen = 0usize;
+    let mut budget = cap;
+    let mut hit_budget = false;
+    let mut buf: Vec<u8> = Vec::new();
+    loop {
+        buf.clear();
+        let read = reader.read_until(b'\n', &mut buf)?;
+        if read == 0 {
+            break;
+        }
+        if read > budget {
+            hit_budget = true;
+            break;
+        }
+        budget -= read;
+        if seen >= offset && out.len() < take {
+            out.push(
+                String::from_utf8_lossy(&buf)
+                    .trim_end_matches(['\n', '\r'])
+                    .to_string(),
+            );
+        }
+        seen += 1;
+        if out.len() >= take {
+            break;
+        }
+    }
+    let why = if hit_budget {
+        format!("读到 {cap} 字节上限就停了")
+    } else {
+        format!("只读了从第 {offset} 行起的 {} 行", out.len())
+    };
+    let note = format!(
+        "{path} 共 {size} 字节，超过单次上限 {cap} 字节：{why}。\
+         要看尾部请用 tail=true，要看别处请调 offset / limit。",
+        path = path.display()
+    );
+    Ok((out.join("\n"), Some(note)))
+}
+
+/// 取最后 `take` 行（`read_text_bounded` 的两条尾部读法共用一处）。
+fn last_lines(lines: &[&str], take: usize) -> String {
+    lines[lines.len().saturating_sub(take)..].join("\n")
+}
+
 /// 首尾摘录（L2 预览 / 命令 preview 用）。
 pub fn head_tail(text: &str, head: usize, tail: usize) -> String {
     let lines: Vec<&str> = text.lines().collect();
@@ -2292,6 +2405,60 @@ mod tests {
             )
             .await
             .is_err());
+    }
+
+    #[tokio::test]
+    async fn a_big_file_is_read_without_being_loaded_whole() {
+        // 决策 226：超过 READ_FILE_MAX_BYTES 的文件不再整份读。造一个刚好越线的日志，
+        // 两种读法各断言一次——**头部**读法要如实说「只读了这一段」，**尾部**读法要给到
+        // 最后一行（追加写的文件要的就是它）。
+        let s = setup(Stage::Develop);
+        let cap = crate::agent::context::READ_FILE_MAX_BYTES;
+        let mut body = String::new();
+        let mut n = 0usize;
+        while body.len() <= cap + 1024 {
+            body.push_str(&format!("line-{n} 填充一下\n"));
+            n += 1;
+        }
+        let last = n - 1;
+        std::fs::write(s.worktree.join("big.log"), &body).unwrap();
+
+        let head = s
+            .executor
+            .execute(
+                &call(
+                    "read_file",
+                    serde_json::json!({"path": "big.log", "limit": 5}),
+                ),
+                &s.ctx,
+            )
+            .await
+            .unwrap();
+        assert!(head.content.contains("line-0"), "头部读法要给开头");
+        assert!(head.content.contains("超过单次上限"), "{}", head.content);
+
+        let tail = s
+            .executor
+            .execute(
+                &call(
+                    "read_file",
+                    serde_json::json!({"path": "big.log", "tail": true, "limit": 5}),
+                ),
+                &s.ctx,
+            )
+            .await
+            .unwrap();
+        assert!(
+            tail.content.contains(&format!("line-{last}")),
+            "尾部读法要给到最后一行：{}",
+            tail.content
+        );
+        assert!(
+            !tail.content.contains("line-0\n"),
+            "尾部读法不该从开头给起：{}",
+            tail.content
+        );
+        assert!(tail.content.contains("尾部"), "{}", tail.content);
     }
 
     #[tokio::test]

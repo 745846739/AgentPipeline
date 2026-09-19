@@ -149,6 +149,23 @@ pub const MAINTENANCE_INTERVAL: Duration = Duration::from_secs(3600);
 /// （`ForemanRunner::watch` 自己按 `watch_debounce_sec` 判），这个周期只决定「多久看一次」。
 pub const WATCH_INTERVAL: Duration = Duration::from_secs(10);
 
+/// resume 触发的重试预算（决策 226）。
+///
+/// 此前是 25 次 × ≤100ms ≈ **2.3 秒**，依据是下面那句「旧 executor 退出是毫秒级」。
+/// 2026-09-19 实测那句依据不成立：被判超时的执行体可能停在**不返回的模型调用**上，退出
+/// 时间以小时计（run 23 被判超时之后又活了 8 小时以上）。2.3 秒的窗口意味着一次静默失败
+/// 就够让任务僵死——「一次性触发被静默吞掉会让任务永久停在 pending」这句注释写的正是这个
+/// 后果，只是预算给得太小。
+///
+/// 现在按指数退避试满这个预算。判超时那条路会先请执行体收口（`request_cancel`，决策 226），
+/// 正常情况下第一次就拿到执行权；这个预算兜的是「旧执行体收口得慢一点」，而不是「它永远
+/// 不退出」——后者归 `unstick`（去重与 owner 强摘 + 游标转 pending）。
+const RESUME_RETRY_BUDGET: Duration = Duration::from_secs(30);
+/// 起始退避（决策 226）：先紧后松——多数情形就是毫秒级的窗口，别一上来先等一秒。
+const RESUME_RETRY_BACKOFF_START: Duration = Duration::from_millis(20);
+/// 退避上限（决策 226）：封顶一秒，免得长尾把整个预算耗在几次长睡上。
+const RESUME_RETRY_BACKOFF_MAX: Duration = Duration::from_secs(1);
+
 /// 组装生产执行器 + resume 钩子 + 调度器所需的共享件。
 pub struct Runtime {
     pub resume_hook: ResumeHook,
@@ -185,15 +202,18 @@ impl Runtime {
                 // 到达的 resume」——一次性触发被静默吞掉会让任务永久停在 pending。
                 // 端点（resume / review / merge-decision）与 scheduler 都依赖这次触发，
                 // 故做有界重试；旧 executor 退出后重试即可取得执行权。
-                const MAX_ATTEMPTS: u32 = 25;
-                for attempt in 0..MAX_ATTEMPTS {
+                // 预算见 `RESUME_RETRY_BUDGET`（决策 226：从约 2.3 秒提到 30 秒）。
+                let deadline = tokio::time::Instant::now() + RESUME_RETRY_BUDGET;
+                let mut backoff = RESUME_RETRY_BACKOFF_START;
+                loop {
                     match executor.try_run(&task_id).await {
                         Ok(true) => return, // 真正跑了一轮
                         Ok(false) => {
-                            let backoff = std::time::Duration::from_millis(
-                                20 * u64::from(attempt + 1).min(5),
-                            );
+                            if tokio::time::Instant::now() >= deadline {
+                                break;
+                            }
                             tokio::time::sleep(backoff).await;
+                            backoff = (backoff * 2).min(RESUME_RETRY_BACKOFF_MAX);
                         }
                         Err(e) => {
                             tracing::error!(task = %task_id, error = %e, "executor 执行失败");

@@ -14,6 +14,16 @@ pub const OUTPUT_RESERVE: usize = 4096;
 
 /// L1：`read_file` 默认返回头部行数。
 pub const READ_FILE_HEAD_LINES: usize = 200;
+/// L1：`read_file` 单次**最多读入**的字节数（决策 226）。
+///
+/// 它管的是「体量」这件事本身：超过它就不再整份读（小文件仍走原路，好保住
+/// [`trim_read_file`] 的结构大纲），改读需要的那一段。
+///
+/// 这个上限同时**替代**了此前「按路径前缀拒绝 `{root}/logs`」那条规则——那条的理由写着
+/// 「价值不在秘密而在体量：一个 200MB 的日志文件进上下文的代价」，而体量是**可结构地**
+/// 管的，不必用一堵把 877 字节的日志也一起挡住的墙（2026-09-19 实测：定死那次僵死根因的
+/// 就是那条日志，而值班长读不到它）。
+pub const READ_FILE_MAX_BYTES: usize = 4 * 1024 * 1024;
 /// L1：`run_command` 保留前 N 行。
 pub const RUN_COMMAND_HEAD_LINES: usize = 50;
 /// L1：`run_command` 保留后 N 行。

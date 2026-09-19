@@ -56,25 +56,29 @@ pub fn default_deny_paths() -> Vec<String> {
     ]
 }
 
-/// 值班长的文件域与补偿（决策 206）：域 = `home.root()`，按**路径前缀**拒掉
-/// `{root}/data` 与 `{root}/logs`。
+/// 值班长的文件域与补偿（决策 206；其中 `logs/` 一条由决策 226 撤销）：
+/// 域 = `home.root()`，按**路径前缀**拒掉 `{root}/data`。
 ///
-/// 两处的理由不同：
 /// * `data/`——`agentpipeline.db` 明文存 provider 密钥（决策 112）。**这是补偿，
 ///   不是边界**：`run_command` 不受文件策略管（命令自己 `cd` 就出去了），故它只挡住
 ///   「用文件工具顺手读走密钥」这一条路，`auto` 档下的命令那条路**无补偿**——决策 206
-///   已把这条残余风险登记在案（`docs/operations.md` 的残余风险表）。
-/// * `logs/`——它是这台机器的日志，价值不在秘密而在体量：一个 200MB 的日志文件进上下文
-///   的代价（一次工具调用换一次几乎必然的 L4 压缩）远大于任何它能回答的问题。
+///   已把这条残余风险登记在案（`docs/operations.md` 的残余风险表）。**密钥是秘密，
+///   这一条留着**。
+/// * `logs/`——**决策 226 撤掉了这一条**。它原来的理由没错：这台机器的日志价值不在秘密
+///   而在体量，一个 200MB 的文件进上下文的代价远大于它能回答的问题。错的是**手段**——
+///   体量是**可以结构地**管的（`read_file` 现在按
+///   [`crate::agent::context::READ_FILE_MAX_BYTES`] 有界读、并支持 `tail`），而一堵按前缀
+///   拦的墙会把 877 字节的日志一起挡在外面。实测代价就在那里：定死 2026-09-19 那次僵死
+///   根因的那一行（`resume 触发被在跑的 executor 持续挡下，放弃本次触发`）住在一个 877
+///   字节的日志里，值班长读不到它，于是连报四轮、从台账反推症状。日志里没有密钥
+///   （决策 112 的密钥只在库里与配置里），故撤掉它不新增秘密面。
 ///
 /// **前缀语义**是靠 `matches_pattern` 的既有规则给的：含 `/` 且不含 `*` 的模式按
 /// 「等于它或落在它之下」判定。值是**绝对路径**，故 `data` 这个目录名在别处出现
 /// （比如某个项目自己有个 `data/`）不受影响——收的是这一个，不是所有同名目录。
 pub fn foreman_file_policy(home_root: &Path) -> FileToolPolicy {
     let mut deny = default_deny_paths();
-    for dir in ["data", "logs"] {
-        deny.push(home_root.join(dir).display().to_string());
-    }
+    deny.push(home_root.join("data").display().to_string());
     FileToolPolicy {
         workdir_bound: vec![home_root.to_path_buf()],
         deny_paths: deny,
@@ -332,6 +336,38 @@ mod tests {
                 "{name} 应被拒绝，实际：{err:?}"
             );
         }
+    }
+
+    #[test]
+    fn the_foreman_root_denies_the_key_store_but_not_logs() {
+        // 决策 226：`data/` 按前缀拒（密钥在那里），`logs/` **不再拒**——体量由
+        // `read_file` 的字节上限管，按前缀拦会把 877 字节的日志一起挡在外面。
+        // 前缀语义 = 「等于它或落在它之下」，故两个目录里的文件与目录本身都要断言到。
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().canonicalize().unwrap();
+        let policy = foreman_file_policy(&root);
+        let data = root.join("data");
+        let logs = root.join("logs");
+        for path in [data.clone(), data.join("agentpipeline.db")] {
+            assert!(
+                policy.check_read(&path).is_err(),
+                "{} 必须在拒绝名单里",
+                path.display()
+            );
+            assert!(policy.check_write(&path).is_err());
+        }
+        for path in [logs.clone(), logs.join("agentpipeline.log")] {
+            assert!(
+                policy.check_read(&path).is_ok(),
+                "{} 应读得到（决策 226 撤销了那条拒绝）",
+                path.display()
+            );
+            assert!(policy.check_write(&path).is_ok());
+        }
+        // 同名目录在别处不受影响：收的是这一个前缀，不是所有叫 data 的目录
+        assert!(policy
+            .check_read(&root.join("project/data/keep.json"))
+            .is_ok());
     }
 
     #[test]

@@ -147,8 +147,10 @@ pub const FOREMAN_TOOL_SPECS: [ForemanToolSpec; 20] = [
                       **密钥只回显掩码**——你看到的是「有没有配」，不是密钥本身。",
         parameters: r#"{"type":"object","properties":{}}"#,
     },
-    // ── B 层：环境只读（决策 206）。域是家目录根，`data/` 与 `logs/` 按前缀拒——库里
-    //    明文存着 provider 密钥（决策 112），而默认那份**模式**名单盖不住一个 `.db` 文件。
+    // ── B 层：环境只读（决策 206）。域是家目录根，`data/` 按前缀拒——库里明文存着
+    //    provider 密钥（决策 112），而默认那份**模式**名单盖不住一个 `.db` 文件。
+    //    **`logs/` 曾同样按前缀拒，决策 226 撤销了那一条**：体量该由 `read_file` 的字节上限
+    //    管，不该用一堵把 877 字节的日志也一并挡在外面的墙（实测代价见 2026-09-19 那次僵死）。
     //    这三件事在 `deny` 档下连广告都不给（`foreman_available_tools` 筛的），
     //    在 `ask` 档下照常直接执行（只读不需要人按键）。
     //
@@ -159,8 +161,9 @@ pub const FOREMAN_TOOL_SPECS: [ForemanToolSpec; 20] = [
         name: "read_file",
         layer: ForemanToolLayer::Read,
         description: "读一个文件（路径相对家目录根）。看配置、看产物、看你提议要改的那个\
-                      文件现在长什么样——**改之前先看**。",
-        parameters: r#"{"type":"object","properties":{"path":{"type":"string","description":"相对家目录根的路径"},"offset":{"type":"integer","description":"起始行（从 0 数）"},"limit":{"type":"integer","description":"最多读几行"}},"required":["path"]}"#,
+                      文件现在长什么样——**改之前先看**。日志、运行记录这类追加写的文件\
+                      要尾巴就用 tail=true。",
+        parameters: r#"{"type":"object","properties":{"path":{"type":"string","description":"相对家目录根的路径"},"offset":{"type":"integer","description":"起始行（从 0 数）；tail 为真时忽略"},"limit":{"type":"integer","description":"最多读几行"},"tail":{"type":"boolean","description":"读尾部而不是头部（日志用它）"}},"required":["path"]}"#,
     },
     ForemanToolSpec {
         name: "list_dir",

@@ -2643,12 +2643,16 @@ fn message_of(err: &Error) -> String {
 
 // ───────────── 文件域与卸载（决策 206 / 207，票 03）─────────────
 
-/// 值班长读得到家目录里的普通文件，**读不到 `data/` 与 `logs/`**。
+/// 值班长读得到家目录里的普通文件与 `logs/` 下的日志，**读不到 `data/`**。
 ///
 /// 这一条是**补偿**不是边界：`run_command` 不受文件策略管（命令自己 `cd` 就出去了），
 /// 故它只挡住「用文件工具顺手读走密钥」这一条路。`data/agentpipeline.db` 里
 /// 明文存着 provider 密钥（决策 112），而默认那份**模式**名单（`.env*` / `*.pem` / …）
 /// 盖不住一个 `.db` 文件——这正是 `foreman_file_policy` 按路径前缀补上的那一条。
+///
+/// **`logs/` 在读得着的那一侧**（决策 226 撤销了原来那条前缀拒绝）：日志的价值不在秘密
+/// 而在体量，而体量由 `read_file` 的字节上限管；把它们一并拒掉，代价是 2026-09-19 那次
+/// 僵死的根因（一行 `resume 触发被在跑的 executor 持续挡下`）恰好只写在日志里。
 #[tokio::test]
 async fn the_foreman_reads_the_home_but_not_the_key_store() {
     let h = Harness::seeded().await;
@@ -2671,9 +2675,7 @@ async fn the_foreman_reads_the_home_but_not_the_key_store() {
     script
         .for_foreman()
         .tool("read_file", serde_json::json!({"path": "logs/app.log"}));
-    script
-        .for_foreman()
-        .text("能读的读了，密钥库和日志读不到。");
+    script.for_foreman().text("能读的读了，密钥库读不到。");
     let agent = FakeAgent::new(script);
     let requests = agent.clone();
     let runner = h.runner(agent);
@@ -2682,7 +2684,7 @@ async fn the_foreman_reads_the_home_but_not_the_key_store() {
     assert_eq!(turn.traces.len(), 3);
     assert!(turn.traces[0].ok, "家目录里的普通文件应当读得到");
     assert!(!turn.traces[1].ok, "密钥库必须被拒");
-    assert!(!turn.traces[2].ok, "日志目录必须被拒");
+    assert!(turn.traces[2].ok, "日志应当读得到（决策 226）");
     // 拒绝的事实在对话里可见：回灌给模型的是错误原文，模型能转述给人。
     // （判据取**模型收到的消息**，不是库里的 foreman_messages——后者只存人机两边的话，
     //  工具结果不进那一层，这样历史裁的时候也不会被一条工具报错顶掉一句人话。）
@@ -2691,12 +2693,12 @@ async fn the_foreman_reads_the_home_but_not_the_key_store() {
     assert!(tail.contains("拒绝名单"), "{tail}");
     assert!(tail.contains("NOTES.md"), "成功的那次读取应当真有内容");
     assert!(
-        !tail.contains("sk-super-secret-value"),
-        "被拒的读取不得把内容带进对话：{tail}"
+        tail.contains("日志一行"),
+        "日志读得到，内容就该真的进对话（否则那条拒绝撤了也没用）：{tail}"
     );
     assert!(
-        !tail.contains("日志一行"),
-        "被拒的日志不得把内容带进对话：{tail}"
+        !tail.contains("sk-super-secret-value"),
+        "被拒的读取不得把内容带进对话：{tail}"
     );
 }
 

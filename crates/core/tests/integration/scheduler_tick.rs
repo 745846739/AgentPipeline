@@ -352,6 +352,37 @@ async fn timeout_kills_process_group_and_retries_until_exhausted() {
     let _ = task;
 }
 
+/// 判超时要照实记**跑了多久**（决策 226）。
+///
+/// 此前这条路径不带 `duration_ms`，于是「跑了 8 小时 51 分」「5 分 10 秒」这种判读只能由
+/// 读的人拿 `started_at` 与自己心算相减——2026-09-19 值班长就是这么算的，而台账里摆着的
+/// `duration_ms` 是 0。一个既是读数又是哨兵的字段，读的人只能猜。
+#[tokio::test]
+async fn a_timed_out_run_records_how_long_it_ran() {
+    let h = Harness::new().await;
+    h.seed_task("t1").await;
+    h.mark_running("t1").await;
+    let cursor = h.store.load_live_cursors("t1").await.unwrap()[0].clone();
+    // 起跑在 311 秒前、心跳停在 400 秒前 → 空闲超时（默认 300s）
+    let run_id = h
+        .running_run("t1", &cursor.cursor_id, 1, 311, 400, None)
+        .await;
+
+    let report = h.scheduler(Settings::default()).tick().await.unwrap();
+    assert_eq!(report.timed_out_runs, vec![run_id]);
+
+    let run = h
+        .store
+        .list_runs("t1")
+        .await
+        .unwrap()
+        .into_iter()
+        .find(|r| r.id == run_id)
+        .expect("那条 run 应当在台账里");
+    assert_eq!(run.status, NodeStatus::Timeout);
+    assert_eq!(run.duration_ms, 311_000, "时长要照实记，不能留 0");
+}
+
 // ─────────────────── 票 05：发现落表（决策 209③）───────────────────
 
 /// 造一条**已终态**的 run，并把 `finished_at` 回拨（游标仍 active = 处置没生效）。

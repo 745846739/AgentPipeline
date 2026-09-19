@@ -7,6 +7,7 @@ use sqlx::FromRow;
 use super::{decode_lossy, decode_node, decode_stage, parse_ts, ts, Store};
 use crate::agent::tools::{CommandFinish, CommandRecorder, CommandStart};
 use crate::metrics;
+use crate::pipeline::subagent::RunTokens;
 use crate::types::{
     CommandSource, MergeResult, Node, NodeCommand, NodeConversation, NodeRun, NodeStatus, Stage,
     StageOutput, Transition, TransitionTrigger,
@@ -208,6 +209,34 @@ impl Store {
         .bind(outcome.process_group_id)
         .bind(ts(now))
         .bind(ts(now))
+        .bind(run_id)
+        .execute(self.pool())
+        .await?;
+        Ok(())
+    }
+
+    /// 补记**判超时之后**才拿到的用量（决策 226）。
+    ///
+    /// 超时是调度器从台账**外面**判的：那一刻执行体还停在模型调用上，它已经烧掉的 token
+    /// 谁也看不见；等它收到中止请求收口时，run 行早已是终态。这里只补**读数**，不碰
+    /// `status` / `error` / `duration_ms`——终态与时长归判超时那一次写入（`finish_run`
+    /// 的 `status` 走 `COALESCE` 是同一条精神：谁判的终态，谁说了算）。
+    ///
+    /// **只给中止路径用**：它不是「第二遍 finish_run」。
+    ///
+    /// 取 [`RunTokens`] 而不是四个 `u32`：这四个数在 run 行上是**同进同出的一列**，散成位置
+    /// 参数就有把 cache 与 completion 传反的可能，而那种错不会报错、只会让读数错。
+    pub async fn record_run_usage(&self, run_id: i64, tokens: &RunTokens) -> Result<()> {
+        sqlx::query(
+            "UPDATE kanban_node_runs
+             SET prompt_tokens = ?, completion_tokens = ?,
+                 cache_read_tokens = ?, cache_write_tokens = ?
+             WHERE id = ?",
+        )
+        .bind(tokens.prompt as i64)
+        .bind(tokens.completion as i64)
+        .bind(tokens.cache_read as i64)
+        .bind(tokens.cache_write as i64)
         .bind(run_id)
         .execute(self.pool())
         .await?;

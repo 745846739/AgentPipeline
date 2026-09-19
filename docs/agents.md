@@ -52,13 +52,14 @@ tools = [
         "type": "function",
         "function": {
             "name": "read_file",
-            "description": "读取指定文件的内容。支持 offset 和 limit 参数分段读取。",
+            "description": "读取指定文件的内容。支持 offset 和 limit 分段读取；大文件按字节上限有界读取（超出时只给读到的那一段并标注），追加写的文件要尾巴就给 tail=true。",
             "parameters": {
                 "type": "object",
                 "properties": {
                     "path": {"type": "string", "description": "文件路径"},
-                    "offset": {"type": "integer", "description": "起始行号（从 0 开始）"},
-                    "limit": {"type": "integer", "description": "读取行数"}
+                    "offset": {"type": "integer", "description": "起始行号（从 0 开始；tail 为真时忽略）"},
+                    "limit": {"type": "integer", "description": "读取行数"},
+                    "tail": {"type": "boolean", "description": "读尾部而不是头部（日志用它）"}
                 },
                 "required": ["path"]
             }

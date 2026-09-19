@@ -4,8 +4,13 @@
 //! 把节点结果交给路由函数推进游标；定时职责（超时 / 冲突恢复 / 准入）归 scheduler。
 //!
 //! 关键语义（出处见行内标注）：
-//! - **单执行者保证**（决策 36）：进程内 `Mutex<HashSet<task_id>>` 非阻塞去重 +
-//!   DB `executor_owner` 乐观锁兜底跨进程；
+//! - **单执行者保证**（决策 36）：进程内注册表（`task_id` → 代次 + 取消观察点）
+//!   非阻塞去重 + DB `executor_owner` 乐观锁兜底跨进程；
+//! - **判超时先通知执行体收口**（决策 226）：超时是从台账**外面**判的，而执行体可能正
+//!   停在一个不返回的模型调用上——那种 run 的 `process_group_id` 是 NULL（只有
+//!   `run_command` 起过子进程才回填），`kill_process_group` 没有东西可杀。
+//!   [`request_cancel`] 是让 run **真的停下来**的那条线；缺了它，去重与
+//!   `executor_owner` 会被一个已判死的执行体占住，紧随其后的重试会被逐次拒掉；
 //! - **单游标失败不传播**（决策 89）：一条游标的节点失败只把该游标置 pending，
 //!   另一分支继续跑完本阶段后停在 join 边界；
 //! - **`waiting_join` 只由 `advance_cursor` 写入**（决策 107）；join 由
@@ -13,12 +18,14 @@
 //! - 纯代码节点同样落 run 行（`agent_type = "system"`，决策 99 / 114）；
 //! - agent 节点按 `agent_retry_max` 干净对话重试，耗尽才 pending（决策 33 / G13）。
 
-use std::collections::HashSet;
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, LazyLock, Mutex};
 use std::time::Instant;
 
 use futures::StreamExt;
+use tokio::sync::Notify;
 
 use crate::agent::client::{LlmClient, LlmRequest, Message, ToolDef};
 use crate::agent::metadata::parse_metadata;
@@ -65,16 +72,76 @@ struct Continuation {
     from_run_id: i64,
 }
 
-// ─────────────────────────────── 单执行者注册表（决策 36）───────────────────────────────
+/// 一次尝试的失败现场：错误 + **这一轮已经烧掉的 token**（决策 226）。
+///
+/// 两者必须一起回来。此前失败路径给 `finish_run` 传的是 `RunTokens::default()`，于是台账
+/// 里的「0」同时意味着两件事：「一次模型调用都没发生」与「发生了但记账丢了」。2026-09-19
+/// 值班长正是据那个 0 推出「两次尝试连第一次 LLM 调用都没落账」，把它当成关键证据报了
+/// 四轮——而同一个 0 也长在死因完全已知的 run 上（init 的 `git 操作超时（180s）`）。
+/// 一个既是读数又是哨兵的字段，读的人只能猜；把真读数带上，它才只是读数。
+struct AttemptFailure {
+    error: Error,
+    tokens: RunTokens,
+}
 
-static EXECUTOR_REGISTRY: LazyLock<Mutex<HashSet<String>>> =
-    LazyLock::new(|| Mutex::new(HashSet::new()));
+// ─────────────────────────────── 单执行者注册表（决策 36 / 226）───────────────────────────────
 
-struct ExecutorGuard(String);
+/// 一次执行体登记：代次 + 它的取消观察点。
+///
+/// **代次**让收尾只摘掉**自己那一格**：`force_release`（`unstick`）会把同名登记强行摘走，
+/// 随后的重试取到的是同名的新一格；若旧执行体的 `Drop` 按名字无差别地删，它顺手摘掉的
+/// 是新执行体的取消通道。
+struct RegistryEntry {
+    generation: u64,
+    cancel: CancelSignal,
+}
+
+/// 一次「请求中止」的观察点（决策 226）。
+///
+/// 用 `AtomicBool` + `Notify` 而不是单一个 `Notify`：**两条路都要走通**——执行体停在
+/// 模型调用上时靠 `notified()` 把它唤醒；它正走在两轮之间（或信号先于观察者到达）时
+/// 靠那个布尔值在下一轮开头拦住它。只用 `notify_waiters()` 会**丢信号**（它只唤醒当时
+/// 已登记的等待者），只用布尔值则要等到下一轮开头才行——而停住的恰恰就是那一轮。
+#[derive(Clone, Default)]
+struct CancelSignal {
+    requested: Arc<AtomicBool>,
+    notify: Arc<Notify>,
+}
+
+impl CancelSignal {
+    fn request(&self) {
+        self.requested.store(true, Ordering::SeqCst);
+        // `notify_one` 而非 `notify_waiters`：无人等待时它**存一个许可**，
+        // 于是「信号先到、观察者后建」这个窗口也不会丢。
+        self.notify.notify_one();
+    }
+
+    fn is_requested(&self) -> bool {
+        self.requested.load(Ordering::SeqCst)
+    }
+
+    async fn wait(&self) {
+        self.notify.notified().await;
+    }
+}
+
+static EXECUTOR_REGISTRY: LazyLock<Mutex<HashMap<String, RegistryEntry>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
+
+/// 代次发号器（只服务「这一格是不是我的」这一处判断）。
+static REGISTRY_GENERATION: AtomicU64 = AtomicU64::new(0);
+
+struct ExecutorGuard {
+    task_id: String,
+    generation: u64,
+}
 
 impl Drop for ExecutorGuard {
     fn drop(&mut self) {
-        EXECUTOR_REGISTRY.lock().unwrap().remove(&self.0);
+        let mut registry = EXECUTOR_REGISTRY.lock().unwrap();
+        if registry.get(&self.task_id).map(|e| e.generation) == Some(self.generation) {
+            registry.remove(&self.task_id);
+        }
     }
 }
 
@@ -86,20 +153,75 @@ impl Drop for ExecutorGuard {
 /// 去重永远摘不掉——清了 DB 也没用，重试会被逐次拒掉。
 ///
 /// **代价如实记**：摘掉之后，那个仍然卡着的旧执行体若哪天活过来，可能与新执行体同时写库。
-/// 这不是新增的风险面，而是原本那个僵死状态本来就有的（旧执行体已经不再写库，否则它不会
-/// 被判定为「心跳停了」）。
+/// **决策 226 把这条代价收窄了**：摘之前先 [`request_cancel`]——旧执行体停在可被打断的
+/// await 点（模型调用就是这样）时会自己收口退出、不再写库；只有停在不返回的**阻塞**调用里
+/// 的那一类才剩下这条代价。
 pub fn force_release(task_id: &str) -> bool {
-    EXECUTOR_REGISTRY.lock().unwrap().remove(task_id)
+    request_cancel(task_id);
+    EXECUTOR_REGISTRY.lock().unwrap().remove(task_id).is_some()
+}
+
+/// 请求中止 `task_id` 正在跑的执行体（决策 226），返回「当时确实有一个在跑」。
+///
+/// 存在的理由是一条实测：2026-09-19 任务 `01M2QH0DHKGSGNVHC0WT2Q4CG0` 的
+/// architect-design.execute 被判超时（run 23）后，它的执行体**又活了 8 小时以上**——
+/// 停在一个不返回的模型调用上，没有进程组可杀。于是「超时」只改了台账：run 行是终态，
+/// 去重与 `executor_owner` 仍被它占着，调度器接着调 resume 被逐次拒掉，2.3 秒后钩子
+/// 放弃，任务就此僵死到有人按 `unstick`。
+///
+/// **这不是硬中止**，两处边界要说清：
+/// - 执行体在**下一个 await 点**收口（[`Error::Cancelled`]），已烧掉的 token 照常落库；
+///   停在不返回的**阻塞**系统调用里的执行体收不到——那一类只能靠 `kill_process_group`
+///   或重启进程；
+/// - 收口是**协作**的：它收口之前，去重与 `executor_owner` 仍被占着。调用方因此不能
+///   假定「通知完就立刻能起来」——紧跟其后的 resume 仍要按自己的重试预算等它。
+pub fn request_cancel(task_id: &str) -> bool {
+    let registry = EXECUTOR_REGISTRY.lock().unwrap();
+    match registry.get(task_id) {
+        Some(entry) => {
+            entry.cancel.request();
+            true
+        }
+        None => false,
+    }
+}
+
+/// 执行体侧取自己的观察点。取不到 = 进程内没有这一号登记（跨进程，或已被 `unstick` 摘走）
+/// ——此时没有中止通道可观察，照旧跑完。
+///
+/// **这一处是「按名字取」而不是「按代次取」**（代次只用在寄存那一格，见
+/// [`RegistryEntry`]），代价如实记：`force_release` 摘走登记之后，那个旧执行体若**正走在
+/// 两轮之间**，再取就取不到自己的观察点了——它那一次中止请求只对「当时已经停在 await 上」
+/// 的那一半有效（`notify_one` 已经把等待者唤醒）。两轮之间的那一半回到决策 210⑧ 记的老
+/// 样子（旧执行体可能继续跑到自己结束）。
+/// **判超时那条路不在此列**：它只发请求、不摘登记，故那个执行体在本轮的任何位置都看得见
+/// 自己那一格——而这正是 2026-09-19 那次僵死的形状。
+fn cancel_signal(task_id: &str) -> Option<CancelSignal> {
+    EXECUTOR_REGISTRY
+        .lock()
+        .unwrap()
+        .get(task_id)
+        .map(|entry| entry.cancel.clone())
 }
 
 /// 非阻塞抢占：已有 executor 在跑同一任务时返回 `None`（调用方直接退出）。
 fn try_acquire(task_id: &str) -> Option<ExecutorGuard> {
-    let mut set = EXECUTOR_REGISTRY.lock().unwrap();
-    if set.contains(task_id) {
+    let mut registry = EXECUTOR_REGISTRY.lock().unwrap();
+    if registry.contains_key(task_id) {
         return None;
     }
-    set.insert(task_id.to_string());
-    Some(ExecutorGuard(task_id.to_string()))
+    let generation = REGISTRY_GENERATION.fetch_add(1, Ordering::Relaxed);
+    registry.insert(
+        task_id.to_string(),
+        RegistryEntry {
+            generation,
+            cancel: CancelSignal::default(),
+        },
+    );
+    Some(ExecutorGuard {
+        task_id: task_id.to_string(),
+        generation,
+    })
 }
 
 // ─────────────────────────────── 阶段产出类型定名（§4.2）───────────────────────────────
@@ -222,6 +344,8 @@ impl Executor {
                 .await;
 
             let before = self.cursor_snapshot(task_id).await?;
+            // 本轮的某个游标是否被「中止请求」收了口（决策 226）。
+            let mut cancelled = false;
             for (cursor, outcome) in results {
                 match outcome {
                     Ok(output) => {
@@ -232,6 +356,21 @@ impl Executor {
                         }
                     }
                     Err(node_error) => {
+                        // **被中止 ≠ 这个节点失败了**（决策 226）：判超时那一方
+                        // （`handle_timeout`）已经把 run 判终态、写好转重试的 transition、
+                        // 并另外叫了一次 resume。这里若照常挂 pending，会把刚放出去的
+                        // 那次重试立刻打回去——重试起来只会看到游标 pending 然后原地退出。
+                        // 故只记账、不挂 pending，随后让出执行权。
+                        if node_error.is_cancelled() {
+                            tracing::info!(
+                                task = %task.id,
+                                stage = %cursor.stage,
+                                node = %cursor.node,
+                                "执行体按中止请求收口，让出执行权"
+                            );
+                            cancelled = true;
+                            continue;
+                        }
                         // 单游标失败不传播（决策 89）。
                         // 可归因的 LLM 配置类失败（主流程票 03）：message 用中文可操作提示，
                         // 原始诊断进 pending.context.diagnostic（不拼进 message）。
@@ -247,6 +386,13 @@ impl Executor {
                         .await?;
                     }
                 }
+            }
+
+            // 被中止：本轮的账已经落完，这里退出，把执行权（去重 + `executor_owner`）
+            // 让给判超时那一方叫来的重试。**不能靠下面那条「先后快照相等」的防御退出**：
+            // 中止发生时台账刚被调度器改过，两次快照往往不相等。
+            if cancelled {
+                return Ok(());
             }
 
             // 终态判定（done.execute 已 mark_terminal）
@@ -973,11 +1119,22 @@ impl Executor {
                     self.store.refresh_task_totals(&task.id).await?;
                     return Ok(output);
                 }
-                Err(e) => {
-                    last_classified = e
+                Err(AttemptFailure { error, tokens }) => {
+                    // 被中止（决策 226）：run 行的终态、以及「这一轮已经算过一次超时」
+                    // 这件事，归判超时的 `scheduler::handle_timeout` 写。这里只补它当时
+                    // 还看不见的**用量**——那是执行体手里的读数，它不收口就没人知道。
+                    // **不碰 status / error**：覆盖会把台账里的「超时」读成「失败」，而
+                    // 顺手放出去的那次重试正按「超时」记着账。
+                    if error.is_cancelled() {
+                        self.store.record_run_usage(run_id, &tokens).await?;
+                        // 用量变了，任务投影就得跟着走（`total_tokens` 是从 run 行**重算**的）
+                        self.store.refresh_task_totals(&task.id).await?;
+                        return Err(error);
+                    }
+                    last_classified = error
                         .llm_classified()
                         .map(|(k, r)| (k.to_string(), r.to_string()));
-                    last_error = e.to_string();
+                    last_error = error.to_string();
                     self.finish_run(
                         run_id,
                         task,
@@ -986,9 +1143,15 @@ impl Executor {
                         true,
                         started.elapsed().as_millis() as u64,
                         Some(last_error.clone()),
-                        &RunTokens::default(),
+                        // 失败也照实记这一轮烧掉的 token（决策 226）：
+                        // 记 0 会让「从未调用过模型」与「调用过但失败」在台账里长得一样。
+                        &tokens,
                     )
                     .await?;
+                    // run 行的 token 变了，任务投影就得跟着走：`total_tokens` 是**从 run 行重算**
+                    // 出来的，不刷新它，库里那份读数会比 run 行汇总出来的小——决策 226 把失败轮的
+                    // token 记真之后这个差第一次看得见（此前失败一律记 0，两者恰好相等）。
+                    self.store.refresh_task_totals(&task.id).await?;
                     // 干净对话重试：messages 不跨 attempt 保留（决策 33）
                 }
             }
@@ -1110,7 +1273,8 @@ impl Executor {
     ///
     /// 内层 [`Self::agent_attempt_inner`] 的参数多于 clippy 的默认阈值：`run_id` /
     /// `attempt` / `carried` 三者都是**本次尝试**的入参，绑成结构体只是把同一份信息换个
-    /// 地方写，不改变调用点的可读性。返回（结论，token 计量）。
+    /// 地方写，不改变调用点的可读性。返回（结论，token 计量）；失败时计量跟着错误一起回来
+    /// （见 [`AttemptFailure`]）。
     #[allow(clippy::too_many_arguments)]
     async fn agent_attempt(
         &self,
@@ -1121,19 +1285,25 @@ impl Executor {
         run_id: i64,
         attempt: u32,
         carried: &[Message],
-    ) -> Result<(NodeOutput, RunTokens)> {
+    ) -> std::result::Result<(NodeOutput, RunTokens), AttemptFailure> {
         let mut trace = AttemptTrace {
             messages: carried.to_vec(),
             ..Default::default()
         };
-        let result = self
+        match self
             .agent_attempt_inner(task, project, cursor, kind, run_id, attempt, &mut trace)
-            .await;
-        if let Err(error) = &result {
-            self.record_failed_attempt(task, cursor, run_id, attempt, &trace, error)
-                .await;
+            .await
+        {
+            Ok((output, tokens)) => Ok((output, tokens)),
+            Err(error) => {
+                self.record_failed_attempt(task, cursor, run_id, attempt, &trace, &error)
+                    .await;
+                Err(AttemptFailure {
+                    error,
+                    tokens: trace.tokens,
+                })
+            }
         }
-        result
     }
 
     /// 失败现场的落库。**落库失败不覆盖原错误**：调用方要带回去的是节点为什么失败，
@@ -1387,6 +1557,18 @@ impl Executor {
             });
 
         loop {
+            // 中止请求（决策 226）：每一轮开头先看一眼。被叫醒的那一轮由下面模型调用处的
+            // `select!` 打断；这里拦的是另外两种情形——信号在两轮之间到达、以及已经请求过
+            // 中止却又进了一轮（重试循环会走到这里）。
+            let cancel = cancel_signal(&task.id);
+            if let Some(signal) = &cancel {
+                if signal.is_requested() {
+                    return Err(Error::Cancelled(format!(
+                        "{}.{} 的本次执行已按节点超时中止",
+                        cursor.stage, cursor.node
+                    )));
+                }
+            }
             // L3 按轮压缩（决策 105）：估算当前 messages 是否超过软限，超了就规则化压缩。
             // 压缩本身不调 LLM（§12.13.3 规则表），压缩发生时有可观测记录。
             if let Some(capacity) = capacity {
@@ -1460,7 +1642,22 @@ impl Executor {
                     agent_type: "main".into(),
                 }),
             };
-            let response = self.llm.complete(req).await?;
+            // 模型调用是**最容易无限期停住**的地方：一个不返回的请求两侧都没有心跳，
+            // 于是它既正是调度器判超时的对象，也是执行体身上唯一能观察中止请求的 await 点
+            // （决策 226）——判超时那边不需要「有进程组可杀」，从这里就能把执行体叫停。
+            // 取不到观察点（进程内没有这一号登记）时照旧直连，行为与加这条通道之前一致。
+            let response = match &cancel {
+                Some(signal) => tokio::select! {
+                    r = self.llm.complete(req) => r?,
+                    _ = signal.wait() => {
+                        return Err(Error::Cancelled(format!(
+                            "{}.{} 的模型调用已按节点超时中止",
+                            cursor.stage, cursor.node
+                        )));
+                    }
+                },
+                None => self.llm.complete(req).await?,
+            };
             trace.tokens.add(&response);
             trace.messages.push(Message::assistant(
                 response.content.clone(),

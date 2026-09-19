@@ -702,6 +702,227 @@ async fn try_run_reports_skip_so_the_resume_hook_can_retry() {
     );
 }
 
+// ─────────────────────────── 判超时之后真的停下来（决策 226）───────────────────────────
+
+/// 第一次调用正常返回（带用量），**之后停住不返回**——2026-09-19 那次僵死的形状：
+/// 卡死的 run 停在模型调用上，没有进程组可杀。
+struct StallingAgent {
+    calls: Arc<AtomicUsize>,
+    gate: Arc<tokio::sync::Mutex<Option<tokio::sync::oneshot::Receiver<()>>>>,
+}
+
+impl LlmClient for StallingAgent {
+    fn complete(
+        &self,
+        _request: LlmRequest,
+    ) -> BoxFuture<'static, agentpipeline_core::Result<AgentResponse>> {
+        let calls = self.calls.clone();
+        let gate = self.gate.clone();
+        Box::pin(async move {
+            if calls.fetch_add(1, Ordering::SeqCst) == 0 {
+                return Ok(AgentResponse {
+                    content: None,
+                    tool_calls: vec![agentpipeline_core::agent::client::ToolCall {
+                        id: "c1".into(),
+                        name: "read_file".into(),
+                        arguments: r#"{"path":"."}"#.into(),
+                    }],
+                    prompt_tokens: 7,
+                    completion_tokens: 3,
+                    ..Default::default()
+                });
+            }
+            // 永不放行 = 永不返回。判超时那边**没有进程组可杀**，只有中止请求这条路。
+            if let Some(rx) = gate.lock().await.take() {
+                let _ = rx.await;
+            }
+            Ok(AgentResponse::default())
+        })
+    }
+}
+
+/// 被判超时的 run 必须**真的停下来**（决策 226）。
+///
+/// 停在模型调用上的 run，其 `process_group_id` 是 NULL（只有 `run_command` 回填过），
+/// 于是「杀进程组」那一刀没有东西可砍：超时只改了台账，执行体照旧活着、照旧占着进程内
+/// 去重与 `executor_owner`，紧接着的 resume 被逐次拒掉——2026-09-19 实测它又活了 8 小时
+/// 以上，任务僵死到有人按 `unstick`。
+///
+/// 这一条断言收口的**三件事**：执行体在有界时间内退出、它把手里那份用量补记上去且
+/// **不碰**终态与时长、执行权真的让了出来。
+#[tokio::test]
+async fn a_timed_out_run_is_stopped_and_reports_its_usage() {
+    let ctx = setup("true", Settings::default()).await;
+    // 闸门**不放行**：`_tx` 一直活着，于是第二次调用永远停在那里——这正是要的形状。
+    let (_tx, rx) = tokio::sync::oneshot::channel::<()>();
+    let calls = Arc::new(AtomicUsize::new(0));
+    let llm: Arc<dyn LlmClient> = Arc::new(StallingAgent {
+        calls: calls.clone(),
+        gate: Arc::new(tokio::sync::Mutex::new(Some(rx))),
+    });
+    let ex = Arc::new(Executor::new(
+        ctx.store.clone(),
+        Settings::default(),
+        Arc::new(ctx.sse.clone()),
+        llm,
+        Arc::new(ctx.killer.clone()),
+    ));
+
+    testkit::seed_task(&ctx.store, "t9", "p1").await.unwrap();
+    admit(&ctx, "t9").await;
+    let jh = {
+        let e = ex.clone();
+        tokio::spawn(async move { e.run("t9").await })
+    };
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while calls.load(Ordering::SeqCst) < 2 {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .expect("应进行到第二次模型调用（就是停住那次）");
+
+    let run = ctx
+        .store
+        .list_runs_at("t9", Stage::ArchitectDesign, Node::ValidateInput)
+        .await
+        .unwrap()
+        .pop()
+        .expect("validate_input 应当已经落了 run 行");
+    assert_eq!(run.status, NodeStatus::Running);
+
+    // 判超时那一步：标终态 + 记时长（时长本身由 scheduler 写，见 scheduler_tick 用例）
+    ctx.store
+        .finish_run(
+            run.id,
+            &agentpipeline_core::storage::observability::RunOutcome {
+                status: Some(NodeStatus::Timeout),
+                duration_ms: 31_886_000,
+                error: Some("测试：判超时".into()),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+
+    assert!(
+        agentpipeline_core::pipeline::executor::request_cancel("t9"),
+        "在跑的执行体应当找得到，才谈得上通知它收口"
+    );
+    tokio::time::timeout(Duration::from_secs(5), jh)
+        .await
+        .expect("收到中止请求的执行体应当在有界时间内收口")
+        .unwrap()
+        .unwrap();
+
+    let after = ctx
+        .store
+        .list_runs_at("t9", Stage::ArchitectDesign, Node::ValidateInput)
+        .await
+        .unwrap()
+        .pop()
+        .unwrap();
+    // 终态与时长归判超时那一方——补记用量是**只补读数**，不抢终态的归属
+    assert_eq!(
+        after.status,
+        NodeStatus::Timeout,
+        "中止不得把「超时」改写成「失败」"
+    );
+    assert_eq!(
+        after.duration_ms, 31_886_000,
+        "中止不得改写判超时记下的时长"
+    );
+    // 用量是执行体手里的读数：它不收口就没人知道（此前失败/超时路径一律记 0）
+    assert_eq!(
+        (after.prompt_tokens, after.completion_tokens),
+        (7, 3),
+        "这一轮已经烧掉的 token 要照实补记"
+    );
+    // 补记的用量也要进任务投影：`total_tokens` 是从 run 行**重算**的，不刷新就两面不一致
+    let task = ctx.store.get_task("t9").await.unwrap();
+    let from_runs: u64 = ctx
+        .store
+        .list_runs("t9")
+        .await
+        .unwrap()
+        .iter()
+        .map(agentpipeline_core::metrics::run_tokens)
+        .sum();
+    assert_eq!(
+        task.total_tokens as u64, from_runs,
+        "任务投影须与 run 行汇总同源"
+    );
+    assert!(task.total_tokens > 0, "补记的用量不得被漏掉");
+
+    // 不挂 pending：判超时那边已经放了一次重试，这里挂 pending 会把它立刻打回去
+    let cursors = ctx.store.load_live_cursors("t9").await.unwrap();
+    assert!(
+        cursors.iter().all(|c| !c.is_pending()),
+        "中止不得把游标置 pending（那会把调度器刚放出去的重试打回去）"
+    );
+
+    // 执行权真的让出来了——这正是僵死的解法（此前会被逐次拒到钩子放弃）
+    assert!(
+        ex.try_run("t9").await.unwrap(),
+        "旧执行体收口后，重试应当拿得到执行权"
+    );
+}
+
+/// 失败的一轮也要照实记它烧掉的 token（决策 226）。
+///
+/// 此前失败路径给 `finish_run` 传的是 `RunTokens::default()`，于是台账里的「0」既是读数
+/// 又是哨兵：2026-09-19 值班长据那个 0 推出「两次尝试连第一次 LLM 调用都没落账」，而同一个
+/// 0 也长在死因完全已知的 run 上（init 的 `git 操作超时（180s）`）。
+#[tokio::test]
+async fn a_failed_round_records_the_tokens_it_burned() {
+    // 一轮就耗尽：断言那一条 run 行不用挑
+    let settings = Settings {
+        agent_retry_max: 1,
+        ..Default::default()
+    };
+    let ctx = setup("true", settings).await;
+    let mut script = Script::new();
+    script
+        .for_node(Stage::ArchitectDesign, Node::ValidateInput)
+        // 先一次成功的调用（FakeAgent 每步报 10 prompt / 5 completion），再让调用当场失败
+        .list_dir(".")
+        .fail_llm("llm_network", "模型服务不可达", "connect timed out");
+    ctx.agent.set_script(script);
+
+    testkit::seed_task(&ctx.store, "t9", "p1").await.unwrap();
+    admit(&ctx, "t9").await;
+    ctx.executor.run("t9").await.unwrap();
+
+    let run = ctx
+        .store
+        .list_runs_at("t9", Stage::ArchitectDesign, Node::ValidateInput)
+        .await
+        .unwrap()
+        .pop()
+        .expect("validate_input 应当落了 run 行");
+    assert_eq!(run.status, NodeStatus::Failed);
+    assert_eq!(
+        (run.prompt_tokens, run.completion_tokens),
+        (10, 5),
+        "失败的那一轮烧掉的 token 要照实落账，不能记成 0"
+    );
+    // 投影与 run 行必须同源：失败轮的 token 记真之后，只在成功路径刷新的那份投影会落后
+    // （这一批正是被 `continued_run_links_back_so_tokens_are_not_double_counted` 顶出来的）
+    let task = ctx.store.get_task("t9").await.unwrap();
+    let from_runs: u64 = ctx
+        .store
+        .list_runs("t9")
+        .await
+        .unwrap()
+        .iter()
+        .map(agentpipeline_core::metrics::run_tokens)
+        .sum();
+    assert_eq!(
+        task.total_tokens as u64, from_runs,
+        "任务投影须与 run 行汇总同源"
+    );
+}
+
 // ─────────────────────────── 节点重试耗尽（决策 33 / G13）───────────────────────────
 
 #[tokio::test]
@@ -3818,12 +4039,17 @@ async fn context_overflow_path_writes_a_conversation_row() {
 
 /// 票 09 的核心断言：**「重跑真的发生了」要打在新 run 行出现上**，不是打在「owner 列为空」上
 /// ——后者清个 DB 字段就能满足，而那正是这条要防的假绿。
+///
+/// **决策 226 之后这一条的写法变了**：`unstick` 会先请求中止，卡住的执行体自己收口，
+/// 于是「重跑」不再由那个被判死的旧执行体顺手跑出来（此前它靠放闸放行、跑完自己的三轮回试
+/// 凑出新 run 行——那是巧合，不是这次要钉的东西）。现在新 run 行只能来自一次真正的恢复。
 #[tokio::test]
 async fn unsticking_releases_the_in_process_dedup_and_allows_a_rerun() {
     use agentpipeline_core::pipeline::unstick::unstick;
 
     let ctx = setup("true", Settings::default()).await;
-    let (tx, rx) = tokio::sync::oneshot::channel::<()>();
+    // 闸门不放行：执行体停在第一次模型调用上（`_tx` 一直活着）
+    let (_tx, rx) = tokio::sync::oneshot::channel::<()>();
     let calls = Arc::new(AtomicUsize::new(0));
     let llm: Arc<dyn LlmClient> = Arc::new(BlockingAgentSimple {
         gate: Arc::new(tokio::sync::Mutex::new(Some(rx))),
@@ -3887,16 +4113,46 @@ async fn unsticking_releases_the_in_process_dedup_and_allows_a_rerun() {
         "占用已清"
     );
 
-    // 关键断言：现在同一个 executor **真的能再跑一轮**（新 run 行出现）
-    drop(tx);
-    let _ = hanging.await;
-    calls.store(0, Ordering::SeqCst);
+    // 决策 226：`unstick` 先**请求中止**再摘去重，所以那个卡住的执行体自己就收口了——
+    // 不必再放闸。此前它只能靠人放闸或重启进程才动，这正是「清了 DB 也没用」的由来。
+    tokio::time::timeout(Duration::from_secs(5), hanging)
+        .await
+        .expect("unstick 之后，卡住的执行体应当在有界时间内收口")
+        .unwrap()
+        .unwrap();
+
+    // 关键断言：现在同一个 executor **真的能再取得执行权**
     assert!(
         executor.try_run("t-hang").await.unwrap(),
         "unstick 之后 try_run 应当取得执行权"
     );
+
+    // 而「真的再跑一轮」得等一次 resume：`unstick` 把游标转成了 pending，那一轮本来
+    // 就不该执行节点——这正是 pending 的语义（此处钉住它，免得「取得执行权」被读成
+    // 「已经重跑了」）。
+    assert_eq!(
+        ctx.store.list_runs("t-hang").await.unwrap().len(),
+        before,
+        "游标还在 pending 时，取得执行权不得执行节点"
+    );
+    let cursor = ctx
+        .store
+        .load_live_cursors("t-hang")
+        .await
+        .unwrap()
+        .into_iter()
+        .next()
+        .unwrap();
+    ctx.store
+        .apply_resume(&cursor, ResumeAction::Continue, None, None)
+        .await
+        .unwrap();
+    executor.try_run("t-hang").await.unwrap();
     let after = ctx.store.list_runs("t-hang").await.unwrap().len();
-    assert!(after > before, "重跑发生了：run 行由 {before} 增到 {after}");
+    assert!(
+        after > before,
+        "恢复之后重跑发生了：run 行由 {before} 增到 {after}"
+    );
 }
 
 /// 正常在跑的任务不能被 unstick（否则它会变成「随便踢一脚」）。

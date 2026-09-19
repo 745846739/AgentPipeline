@@ -412,13 +412,18 @@ fn call(name: &str, args: serde_json::Value) -> ToolCall {
     }
 }
 
-/// 家目录里的普通文件读写得到；`data/` 与 `logs/` 读写**都**被拒。
+/// 家目录里的普通文件读写得到；`data/` 读写**都**被拒；`logs/` **读得到**
+/// （决策 226 撤掉了那一条按前缀的拒绝）。
 ///
 /// 这一条是**补偿**不是边界（决策 206 的原话）：命令自己 `cd` 就出去了，文件策略只管
 /// 文件工具。它挡住的是一件具体的事——`data/agentpipeline.db` 里明文存着 provider 密钥
 /// （决策 112），而默认那份**模式**名单（`.env*` / `*.pem` / …）盖不住一个 `.db` 文件。
+///
+/// **`logs/` 为什么不在这张名单里**：它原按前缀被拒的理由是「体量」，而体量该由
+/// `read_file` 的字节上限（`READ_FILE_MAX_BYTES`）管——一堵按前缀拦的墙会把 877 字节的
+/// 日志一起挡在外面，而 2026-09-19 那次僵死的根因恰好只写在那样一个日志里。
 #[tokio::test]
-async fn the_foreman_domain_covers_the_home_but_not_data_or_logs() {
+async fn the_foreman_domain_covers_the_home_but_not_the_key_store() {
     let f = fixture().await;
     // 密钥库与日志目录按真实形态造出来
     std::fs::create_dir_all(f._home.home().db_path().parent().unwrap()).unwrap();
@@ -453,24 +458,26 @@ async fn the_foreman_domain_covers_the_home_but_not_data_or_logs() {
             "write_file",
             serde_json::json!({"path": "data/x.txt", "content": "x"}),
         ),
-        (
-            "edit_file",
-            serde_json::json!({"path": "logs/app.log", "old_text": "日志", "new_text": "改了"}),
-        ),
-        ("read_file", serde_json::json!({"path": "logs/app.log"})),
     ] {
         let err = executor.execute(&call(tool, args), &ctx).await.unwrap_err();
         // 命中名单的报文要说清是哪一条命中的（不然「为什么被拒」只能靠猜）
         assert!(
-            err.to_string().contains("data") || err.to_string().contains("logs"),
+            err.to_string().contains("data"),
             "{tool} 应当被 deny 前缀拒：{err}"
         );
+        // 被拒的那一次不得把内容带出来
+        assert!(!err.to_string().contains("sk-live-secret"), "{err}");
     }
-    // 密钥内容没有被带出来，日志也一个字没变
-    assert_eq!(
-        std::fs::read_to_string(f._home.home().logs_dir().join("app.log")).unwrap(),
-        "日志"
-    );
+
+    // 日志读得到，**内容真的回来了**——这正是撤掉那条拒绝要买的东西
+    let log = executor
+        .execute(
+            &call("read_file", serde_json::json!({"path": "logs/app.log"})),
+            &ctx,
+        )
+        .await
+        .unwrap();
+    assert!(log.content.contains("日志"), "{}", log.content);
 }
 
 /// `ask` 档下 C 层的**两个**写工具都走确认钮（不是只接了一个）。

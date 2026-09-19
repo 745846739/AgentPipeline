@@ -244,13 +244,13 @@ impl KanbanScheduler {
         let Some(p) = crate::metrics::duration_percentiles(history, run.stage, run.node) else {
             return Ok(()); // 冷启动 / 样本不足：不展示、不告警
         };
-        let elapsed_ms = (now - run.started_at).num_milliseconds().max(0) as u64;
-        if !crate::metrics::should_alert_slow(elapsed_ms, p) {
+        let elapsed = elapsed_ms(run, now);
+        if !crate::metrics::should_alert_slow(elapsed, p) {
             return Ok(());
         }
         let detail = format!(
             "{}.{} 已运行 {}ms，超过该节点 P90（{}ms）的 3 倍（P50 {}ms，样本 {}）",
-            run.stage, run.node, elapsed_ms, p.p90_ms, p.p50_ms, p.samples
+            run.stage, run.node, elapsed, p.p90_ms, p.p50_ms, p.samples
         );
         tracing::warn!(task = %task_id, run = run.id, "{detail}");
         // `occurred_at` 取**这条 run 的开始时刻**，不是 `now`：tick 每 10s 一次，用 `now`
@@ -266,7 +266,7 @@ impl KanbanScheduler {
                     "run_id": run.id,
                     "stage": run.stage.as_str(),
                     "node": run.node.as_str(),
-                    "elapsed_ms": elapsed_ms,
+                    "elapsed_ms": elapsed,
                     "p50_ms": p.p50_ms,
                     "p90_ms": p.p90_ms,
                     "samples": p.samples,
@@ -280,7 +280,7 @@ impl KanbanScheduler {
         Ok(())
     }
 
-    /// 超时处理：杀进程组 → 未耗尽则干净对话重试 → 耗尽才 pending(timeout)。
+    /// 超时处理：杀进程组 / 通知执行体收口 → 未耗尽则干净对话重试 → 耗尽才 pending(timeout)。
     async fn handle_timeout(&self, run: &NodeRun, report: &mut TickReport) -> Result<()> {
         // 调用方已跳过项目级 run；这里再兜一层，避免无任务 / 游标时误用空值。
         let (Some(task_id), Some(cursor_id)) = (run.task_id.as_deref(), run.cursor_id.as_deref())
@@ -296,11 +296,36 @@ impl KanbanScheduler {
                 run.id,
                 &crate::storage::observability::RunOutcome {
                     status: Some(NodeStatus::Timeout),
+                    // 决策 226：**时长照实记**。此前这里留 0，而「跑了 8 小时 51 分」这种
+                    // 判读只能由读的人拿 started_at 自己算——值班长 2026-09-19 就是这么
+                    // 算的，同时台账里摆着的 duration_ms 是 0。
+                    duration_ms: elapsed_ms(run, self.clock.now()),
                     error: Some(timeout_detail(run, "超时")),
                     ..Default::default()
                 },
             )
             .await?;
+        // 决策 226：**判超时要真的把 run 停下来**。上面那一刀只对「起过子进程」的 run 有效
+        // （`process_group_id` 只有 `run_command` 回填过），而实测卡死的恰好是另一种：停在
+        // 不返回的模型调用上的 run 根本没有进程组可杀。它在下一个 await 点按这一句收口，
+        // 去重与 `executor_owner` 随之释放；缺了这一句，紧随其后的 resume 会被那个已判死的
+        // 执行体逐次拒掉直到钩子放弃——2026-09-19 实测 run 23 被判超时后又活了 8 小时以上，
+        // 任务就此僵死到有人按 `unstick`。
+        //
+        // **顺序是承重的：这一句必须在 `finish_run` 之后。** 收口是异步的，而执行体收口时
+        // 会调 `record_run_usage` 把「已经烧掉的 token」补进这一行；而 `finish_run` 是按值
+        // 整段写入（`RunOutcome::default()` 的 token 是 0）。先通知就先被覆盖——那正是这条
+        // 要修的那类「读数看起来像真值，其实是占位符」。先用例 `a_timed_out_run_is_stopped_
+        // and_reports_its_usage` 也是这个顺序（判超时写入在前、通知在后）。
+        if !crate::pipeline::executor::request_cancel(task_id) {
+            // 取不到登记：进程内没有这一号执行体（例如本进程刚重启，台账里留着上一进程的
+            // running run）。此时既没有通道可通知，也没有人要等——照旧往下走。
+            tracing::debug!(
+                task = %task_id,
+                run = run.id,
+                "超时处置：进程内没有在跑的执行体可通知"
+            );
+        }
 
         if run.attempt < self.settings.agent_retry_max {
             // 未耗尽：干净对话重试当前节点（决策 33），不计 validate_attempts
@@ -852,6 +877,15 @@ fn pending_attention_kind(kind: PendingKind) -> AttentionKind {
         PendingKind::ContextOverflow => AttentionKind::ContextOverflow,
         _ => AttentionKind::TaskPending,
     }
+}
+
+/// run 从起跑到 `now` 的毫秒数（决策 226）。时钟回拨时按 0 记，不写负数。
+///
+/// 存在的理由是一条实测：2026-09-19 的两次执行一次记作「8 小时 51 分」、一次「5 分 10 秒」，
+/// 而台账里两条的 `duration_ms` **都是 0**——判超时那条路此前不带时长，于是最该被一眼读到的
+/// 那个数字，只能靠读的人拿 `started_at` / `finished_at` 自己相减。
+fn elapsed_ms(run: &NodeRun, now: chrono::DateTime<chrono::Utc>) -> u64 {
+    (now - run.started_at).num_milliseconds().max(0) as u64
 }
 
 /// 超时那句话（决策 211④ / 票 04）：**把「当时在哪一步」带上**。
