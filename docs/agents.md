@@ -909,9 +909,13 @@ allow_dirty_worktree_merge = false
 [logging]
 level = "info"                       # EnvFilter 表达式；非法值回退 info，不阻断启动
 format = "pretty"                    # pretty（缺省）| compact | json
-file = "~/.agentpipeline/logs/agentpipeline.log"
-# 不写 file 只输出到标准输出。file 的 ~ 会展开、相对路径按 home 根解析；
-# 目录自动创建为 0700、文件 0600（§12.14）。文件打不开时降级为仅标准输出，不阻断启动。
+file = "~/.agentpipeline/logs/agentpipeline.log"   # 不写也是这一份（决策 225）
+# 缺省落 {home}/logs/agentpipeline.log（家目录骨架里的 logs/ 就是它的落点）——桌面壳从
+# Finder 启动时没有终端，标准输出哪儿都不去，不落文件等于没有日志。**显式写空白
+# （file = ""）才是「只写标准输出」**，与「没配」分得开。file 的 ~ 会展开、相对路径按
+# home 根解析；目录自动创建为 0700、文件 0600（§12.14）。文件打不开时降级为仅标准输出，
+# 不阻断启动。终端与文件是**两层输出**：终端在 pretty 下照常着色，文件那层恒不着色
+# （转义码不污染日志文件）。
 # 已废弃：旧键 json_file（bool）。json_file = true 等价 format = "json"。
 # 两者同时配置属冲突 → 配置加载 fail fast（决策 47 / 103 / 134 姿态）。
 

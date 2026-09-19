@@ -304,7 +304,8 @@ pub struct LoggingConfig {
     /// 日志格式；未设置时由 `json_file` 推导，最终缺省 `pretty`。
     #[serde(skip_serializing_if = "Option::is_none")]
     pub format: Option<LogFormat>,
-    /// 日志文件路径（`~` 可展开，相对路径按 home 根解析）；空 = 不落文件。
+    /// 日志文件路径（`~` 可展开，相对路径按 home 根解析）。**缺省**
+    /// `{home}/logs/agentpipeline.log`（[`DEFAULT_LOG_FILE`]）；显式空白 = 只写标准输出。
     #[serde(skip_serializing_if = "Option::is_none")]
     pub file: Option<String>,
     /// **已废弃**（决策 56 时代的旧键）：`json_file = true` 等价 `format = "json"`。
@@ -335,15 +336,27 @@ impl LoggingConfig {
         }
     }
 
-    /// 解析后的日志文件路径；未配置或空白 → `None`（只写标准输出）。
+    /// 解析后的日志文件路径。
+    ///
+    /// - **未配置**（`file` 缺省）→ `{home_root}/logs/agentpipeline.log`：日志默认落文件，
+    ///   否则桌面壳（从 Finder 启动，没有终端）里的日志等于不存在，而家目录骨架里的
+    ///   `logs/` 永远是空的；
+    /// - **显式空白**（`file = ""`）→ `None`：这是「只写标准输出」的逃生口，与「没配」必须分得开；
+    /// - 其余按 [`resolve_config_path`] 展开（`~` 展开、相对路径按 `home_root` 解析）。
     pub fn resolved_file(&self, home_root: &Path) -> Option<PathBuf> {
-        let raw = self.file.as_deref()?.trim();
-        if raw.is_empty() {
-            return None;
+        match self.file.as_deref() {
+            None => Some(home_root.join(DEFAULT_LOG_FILE)),
+            Some(raw) if raw.trim().is_empty() => None,
+            Some(raw) => Some(resolve_config_path(raw, home_root)),
         }
-        Some(resolve_config_path(raw, home_root))
     }
 }
+
+/// `[logging] file` 未配置时的落点（相对家目录根，§10.6.5）。
+///
+/// 与 `Home::logs_dir()` 同一条口径：`{home}/logs/` 是家目录骨架里就建好、§12.14 要求
+/// 0700 的那个目录，它的用途就是放日志——缺省不落文件等于让它永远是空的。
+pub const DEFAULT_LOG_FILE: &str = "logs/agentpipeline.log";
 
 /// 展开配置里的路径（§10.6.4 同口径）：
 /// - `~` / `~/x` → 用户家目录；
@@ -1296,15 +1309,31 @@ mod tests {
     }
 
     #[test]
-    fn logging_defaults_to_pretty_without_file() {
+    fn logging_defaults_to_pretty_with_default_file() {
         let cfg = Config::from_toml("[logging]\nlevel = \"warn\"\n").unwrap();
         assert_eq!(cfg.logging.effective_format(), LogFormat::Pretty);
-        assert!(cfg
-            .logging
-            .resolved_file(Path::new("/home/u/.agentpipeline"))
-            .is_none());
+        // 缺省落 {home}/logs/agentpipeline.log：家目录骨架里的 logs/ 就是它的落点，
+        // 缺省不写文件的话那个目录永远是空的（桌面壳还没有终端可看）。
+        let home = Path::new("/home/u/.agentpipeline");
+        assert_eq!(
+            cfg.logging.resolved_file(home).unwrap(),
+            home.join("logs/agentpipeline.log")
+        );
         // 缺省不再默认 json（旧结构体 json_file = true 的语义不再无条件继承）
         assert_eq!(LoggingConfig::default().level, "info");
+        // 缺省文件名与 §12.14 的 logs/ 目录口径一致
+        assert_eq!(DEFAULT_LOG_FILE, "logs/agentpipeline.log");
+    }
+
+    #[test]
+    fn logging_blank_file_is_the_stdout_only_escape_hatch() {
+        // 显式空白 = 只写标准输出。这与「没配」必须分得开：没配是缺省落文件，
+        // 配了空白才是关掉文件——否则「想关掉」的人只能靠猜一个不存在的写法。
+        let home = Path::new("/home/u/.agentpipeline");
+        let cfg = Config::from_toml("[logging]\nfile = \"   \"\n").unwrap();
+        assert!(cfg.logging.resolved_file(home).is_none());
+        let cfg = Config::from_toml("[logging]\nfile = \"\"\n").unwrap();
+        assert!(cfg.logging.resolved_file(home).is_none());
     }
 
     #[test]
@@ -1351,9 +1380,7 @@ mod tests {
             home.join("logs/ap.log")
         );
 
-        // 空白 = 不落文件
-        let cfg = Config::from_toml("[logging]\nfile = \"   \"\n").unwrap();
-        assert!(cfg.logging.resolved_file(home).is_none());
+        // 空白的语义见 `logging_blank_file_is_the_stdout_only_escape_hatch`
     }
 
     #[test]

@@ -17,7 +17,6 @@ use agentpipeline_core::pipeline::ForemanRunner;
 use agentpipeline_core::sse::SseBus;
 use agentpipeline_core::storage::Store;
 use anyhow::Context;
-use tracing_subscriber::fmt::writer::{BoxMakeWriter, MakeWriterExt};
 
 use crate::build_router;
 use crate::runtime::Runtime;
@@ -538,9 +537,13 @@ pub async fn serve(options: ServeOptions) -> anyhow::Result<ServerHandle> {
 ///
 /// - `level`：`EnvFilter` 表达式，非法时回退 `info`（不阻断启动）；
 /// - `format`：`pretty`（缺省）/ `compact` / `json`；旧键 `json_file = true` 等价 `json`；
-/// - `file`：同时写入该文件（`~` 可展开、相对路径按 home 根解析）；目录自动创建并
-///   收紧到 0700、文件 0600（§12.14）。文件无法创建时**不**阻断启动，改为把原因
-///   打到标准错误——日志初始化失败不该让服务起不来。
+/// - `file`：日志文件的落点（`~` 可展开、相对路径按 home 根解析）；目录自动创建并
+///   收紧到 0700、文件 0600（§12.14）。**未配置时缺省落
+///   `{home}/logs/agentpipeline.log`**（`LoggingConfig::resolved_file`）——`logs/` 是家目录
+///   骨架里就建好的那个目录（`Home::ensure_dirs`），缺省不落文件等于让它永远空着；
+///   而桌面壳从 Finder 启动时没有终端，标准输出哪儿都不去，日志便等于不存在。
+///   文件无法创建时**不**阻断启动，改为把原因打到标准错误——日志初始化失败不该让
+///   服务起不来。
 pub fn init_tracing(config: &Config, home: &Home) {
     let subscriber = build_subscriber(config, home);
     // 已注册（测试进程里的第二次调用）不视为错误。
@@ -555,42 +558,82 @@ pub fn init_tracing(config: &Config, home: &Home) {
 }
 
 /// 按 `[logging]` 构造 subscriber（与全局注册分离，便于测试用 `with_default` 捕获）。
+///
+/// **标准输出与日志文件各成一层**：着色是**每层**自己的属性，两条输出共用一个 writer 时
+/// 只能整体二选一——配了 `file` 就连终端一起失去颜色（此前正是如此）。分层之后，终端那层
+/// 照旧着色，文件那层恒不着色，转义码不会污染日志文件。
 fn build_subscriber(config: &Config, home: &Home) -> Box<dyn tracing::Subscriber + Send + Sync> {
-    use tracing_subscriber::EnvFilter;
+    use tracing_subscriber::{fmt, layer::SubscriberExt as _, EnvFilter, Layer as _};
 
+    // filter 每层各带一份：「哪些事件能出去」与「层怎么排」无关，也就不必记全局过滤器的顺序约定。
     let filter =
-        EnvFilter::try_new(&config.logging.level).unwrap_or_else(|_| EnvFilter::new("info"));
+        || EnvFilter::try_new(&config.logging.level).unwrap_or_else(|_| EnvFilter::new("info"));
     let format = config.logging.effective_format();
+    // 只有 pretty 着色：json / compact 本就不该带颜色
+    let ansi = matches!(format, LogFormat::Pretty);
 
     // 文件日志：目录 + 文件（打不开则降级为仅标准输出，不阻断启动）
-    let (writer, has_file): (BoxMakeWriter, bool) = match config.logging.resolved_file(home.root())
-    {
+    let file = match config.logging.resolved_file(home.root()) {
         Some(path) => match open_log_file(&path) {
-            Ok(file) => (BoxMakeWriter::new(std::io::stdout.and(file)), true),
+            Ok(file) => Some(file),
             Err(e) => {
                 eprintln!("警告：日志文件不可用，本次仅写标准输出：{e:#}");
-                (BoxMakeWriter::new(std::io::stdout), false)
+                None
             }
         },
-        None => (BoxMakeWriter::new(std::io::stdout), false),
+        None => None,
     };
-
-    // 写文件时禁 ANSI，避免转义码污染 JSON / 日志文件；json / compact 也不需要颜色
-    let ansi = matches!(format, LogFormat::Pretty) && !has_file;
-    let builder = tracing_subscriber::fmt()
-        .with_env_filter(filter)
-        .with_writer(writer)
-        .with_ansi(ansi);
 
     match format {
         LogFormat::Json => Box::new(
-            builder
-                .event_format(JsonEvent)
-                .fmt_fields(tracing_subscriber::fmt::format::DefaultFields::new())
-                .finish(),
+            tracing_subscriber::registry()
+                .with(
+                    fmt::layer()
+                        .with_writer(std::io::stdout)
+                        .with_ansi(ansi)
+                        .event_format(JsonEvent)
+                        .with_filter(filter()),
+                )
+                .with(file.map(|f| {
+                    fmt::layer()
+                        .with_writer(f)
+                        .with_ansi(false)
+                        .event_format(JsonEvent)
+                        .with_filter(filter())
+                })),
         ),
-        LogFormat::Compact => Box::new(builder.compact().finish()),
-        LogFormat::Pretty => Box::new(builder.finish()),
+        LogFormat::Compact => Box::new(
+            tracing_subscriber::registry()
+                .with(
+                    fmt::layer()
+                        .with_writer(std::io::stdout)
+                        .with_ansi(ansi)
+                        .compact()
+                        .with_filter(filter()),
+                )
+                .with(file.map(|f| {
+                    fmt::layer()
+                        .with_writer(f)
+                        .with_ansi(false)
+                        .compact()
+                        .with_filter(filter())
+                })),
+        ),
+        LogFormat::Pretty => Box::new(
+            tracing_subscriber::registry()
+                .with(
+                    fmt::layer()
+                        .with_writer(std::io::stdout)
+                        .with_ansi(ansi)
+                        .with_filter(filter()),
+                )
+                .with(file.map(|f| {
+                    fmt::layer()
+                        .with_writer(f)
+                        .with_ansi(false)
+                        .with_filter(filter())
+                })),
+        ),
     }
 }
 
@@ -885,6 +928,66 @@ mod tests {
 
     fn logging_config(toml: &str) -> Config {
         Config::from_toml(toml).unwrap()
+    }
+
+    /// 缺省（没写 `[logging] file`）就要落文件——这是那个「日志没输出到日志文件」的
+    /// 真问题：`config.toml` 是可选的，没人写它就一直没有日志文件，而桌面壳从 Finder
+    /// 启动时连标准输出都没有。
+    #[test]
+    fn log_file_is_written_even_without_explicit_file_config() {
+        let home = tempfile::tempdir().unwrap();
+        let home = Home::new(home.path());
+        // 一个字都不配：全缺省
+        let cfg = logging_config("");
+
+        let sub = build_subscriber(&cfg, &home);
+        tracing::subscriber::with_default(sub, || {
+            tracing::info!("缺省也要落文件");
+        });
+
+        let path = home.root().join("logs/agentpipeline.log");
+        let content = std::fs::read_to_string(&path)
+            .unwrap_or_else(|e| panic!("缺省应创建日志文件 {}：{e}", path.display()));
+        assert!(content.contains("缺省也要落文件"), "内容：{content}");
+    }
+
+    /// `file = ""` 是「只写标准输出」的逃生口（与「没配」分得开）。
+    #[test]
+    fn blank_file_config_keeps_logs_on_stdout_only() {
+        let home = tempfile::tempdir().unwrap();
+        let home = Home::new(home.path());
+        let cfg = logging_config("[logging]\nfile = \"\"\n");
+
+        let sub = build_subscriber(&cfg, &home);
+        tracing::subscriber::with_default(sub, || {
+            tracing::info!("只写标准输出");
+        });
+
+        assert!(
+            !home.root().join("logs/agentpipeline.log").exists(),
+            "显式空白不该建日志文件"
+        );
+    }
+
+    /// 终端那层着色、文件那层不着色：转义码不得污染日志文件（同一个 writer 做不到这件事，
+    /// 故两层分开）。
+    #[test]
+    fn log_file_never_contains_ansi_escapes() {
+        let home = tempfile::tempdir().unwrap();
+        let home = Home::new(home.path());
+        let cfg = logging_config("[logging]\nlevel = \"info\"\n"); // pretty（缺省）= 终端着色那一档
+
+        let sub = build_subscriber(&cfg, &home);
+        tracing::subscriber::with_default(sub, || {
+            tracing::info!("转义码不该进文件");
+        });
+
+        let content = std::fs::read_to_string(home.root().join("logs/agentpipeline.log")).unwrap();
+        assert!(content.contains("转义码不该进文件"), "内容：{content}");
+        assert!(
+            !content.contains('\u{1b}'),
+            "文件里出现了 ANSI 转义码：{content:?}"
+        );
     }
 
     #[test]
