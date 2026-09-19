@@ -257,6 +257,14 @@ impl Executor {
     ) -> Self {
         let mut store = store;
         store.set_conversation_max_chars(settings.conversation_max_chars);
+        // 模型请求留痕（决策 231）包在**构造处**而不是各调用点：本执行体的所有 LLM 出口
+        // （节点工具循环 / 伪阶段 / 项目分析 / 子代理）都由这一层拿到同一个 `llm`，
+        // 包一次就全都在账上，调用点一个字不动。测试注入的 FakeAgent 同样过它——
+        // 于是「请求可归位」这件事在 L2/L4 的用例里也是真的。
+        let llm = Arc::new(crate::agent::recording::RecordingLlm::new(
+            llm,
+            store.clone(),
+        ));
         Executor {
             store,
             settings,

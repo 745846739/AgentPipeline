@@ -146,6 +146,19 @@ impl Store {
         .bind(ts(now))
         .fetch_one(self.pool())
         .await?;
+        // 三行日志的第一行（决策 231：节点开始 / 请求派发 / 请求收场）。落在这里而不是
+        // 某个调用点：这才是「一个节点开始跑」的**唯一漏斗**——主 agent、子代理、伪阶段、
+        // 系统节点全都过它，于是「逐 run / 逐节点的日志时间线」不会有漏掉的一类
+        // （2026-09-19 实测里值班长读到的那份日志正是一条逐 run 的行都没有）。
+        tracing::info!(
+            run = id,
+            task = %new_run.task_id,
+            stage = new_run.stage.as_str(),
+            node = new_run.node.as_str(),
+            attempt = new_run.attempt,
+            agent_type = %new_run.agent_type,
+            "节点开始"
+        );
         Ok(id)
     }
 
@@ -173,6 +186,16 @@ impl Store {
         .bind(ts(now))
         .fetch_one(self.pool())
         .await?;
+        // 第一行日志的项目版（决策 231）：项目级 run 没有 task_id，定位靠 project_id。
+        tracing::info!(
+            run = id,
+            project = %new_run.project_id,
+            stage = new_run.stage.as_str(),
+            node = new_run.node.as_str(),
+            attempt = new_run.attempt,
+            agent_type = %new_run.agent_type,
+            "节点开始"
+        );
         Ok(id)
     }
 

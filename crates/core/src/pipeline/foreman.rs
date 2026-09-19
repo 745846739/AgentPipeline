@@ -911,6 +911,13 @@ impl ForemanRunner {
         llm: Arc<dyn LlmClient>,
         sse: Arc<dyn SseSink>,
     ) -> Self {
+        // 模型请求留痕（决策 231）：值班长的请求没有 run 行，归属靠 `session_id`——
+        // 而「这一轮第几次调用、烧了多少字节、最后一次收字节是何时」正是它 2026-09-19
+        // 那次实测里把它带偏（把活栈记在错的 run 名下）的那个缺口。
+        let llm = Arc::new(crate::agent::recording::RecordingLlm::new(
+            llm,
+            store.clone(),
+        ));
         ForemanRunner {
             store,
             settings,

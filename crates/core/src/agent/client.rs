@@ -160,6 +160,19 @@ pub struct AgentResponse {
     /// OpenAI 无对应字段恒为 0）。是 `prompt_tokens` 的子集。
     #[serde(default)]
     pub cache_write_tokens: u32,
+    /// 这次流式调用**收到过多少字节**（决策 231 的「量速」）。
+    ///
+    /// `None` = 没量到（FakeAgent 之类的脚本实现不产流量），不是「量到 0」——收字节总量
+    /// 与最后一次收字节的时刻合起来才分得开「流快但 prompt 本身大」与「流被压到极慢」，
+    /// 而 0 会把两者都说成「什么都没收到」。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bytes_received: Option<u64>,
+    /// 最后一次从流里收到字节的时刻（决策 231）。
+    ///
+    /// 与 `finished_at` 一起读才有意义：一个请求在飞、而最后一次收字节是一分钟前，说明它
+    /// 卡在流上；两者都往前走，说明它只是慢。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_byte_at: Option<chrono::DateTime<chrono::Utc>>,
 }
 
 /// 工具定义（`submit_metadata` 的 parameters 由各阶段 serde 结构体派生，决策 38）。

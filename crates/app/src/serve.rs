@@ -395,6 +395,18 @@ pub async fn serve(options: ServeOptions) -> anyhow::Result<ServerHandle> {
         tracing::info!(count = abandoned.len(), runs = ?abandoned, "已把中断的项目级 run 标成终态");
     }
 
+    // 恢复流程第四步（决策 231）：把上一进程遗留的「在飞」模型请求收成终态。
+    // 为什么必须有：`finished_at IS NULL` 是那张表唯一的「还在跑」读数，而进程被强杀时
+    // 收场那一次写入永远不会发生——不收口的话，一个**死掉的**请求会永远以「在飞」的样子
+    // 出现在诊断包里。那是决策 226③ 要根除的同一类失真，只是方向相反（不是假装 0，
+    // 是假装还活着）。标终态而不是删行：它在时间线上真的发生过。
+    let orphaned = store
+        .orphan_inflight_model_requests("上一个进程退出（或被强杀）时这次请求还没有收场")
+        .await?;
+    if orphaned > 0 {
+        tracing::info!(count = orphaned, "已把上一进程遗留的在飞模型请求标成终态");
+    }
+
     // 配置 fail fast（决策 47 / 103 / 134）
     let report = store.validate_startup(&settings).await?;
     if !report.demoted_providers.is_empty() {
@@ -949,6 +961,101 @@ mod tests {
         let content = std::fs::read_to_string(&path)
             .unwrap_or_else(|e| panic!("缺省应创建日志文件 {}：{e}", path.display()));
         assert!(content.contains("缺省也要落文件"), "内容：{content}");
+    }
+
+    /// 决策 231 的三行日志：**节点开始 / 请求派发 / 请求收场**，按时间顺序落在同一个文件里。
+    ///
+    /// 为什么要有这一条：「日志读得到」（决策 226）与「日志里有东西」是两件事——09-19 的
+    /// 实测里值班长自己报出「这份日志只有 16 行、没有任何一条逐 run / 逐节点的行」，于是
+    /// 「零 token」在那份证据面上无解。这三行就是给那份证据面补的**时间线**（表回答「现在
+    /// 在飞什么」，日志回答「那一刻按顺序发生了什么」，决策 231 两条都要）。
+    #[test]
+    fn the_three_model_log_lines_form_a_timeline_in_the_file() {
+        use agentpipeline_core::agent::client::{AgentResponse, LlmClient, LlmRequest};
+        use agentpipeline_core::storage::observability::NewProjectRun;
+        use agentpipeline_core::types::{Node, Stage};
+
+        /// 当场返回的替身；本用例只关心日志，不关心读数。
+        struct Stub;
+        impl LlmClient for Stub {
+            fn complete(
+                &self,
+                _request: LlmRequest,
+            ) -> futures::future::BoxFuture<'static, agentpipeline_core::Result<AgentResponse>>
+            {
+                Box::pin(async { Ok(AgentResponse::default()) })
+            }
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let home = Home::new(dir.path());
+        let cfg = logging_config("[logging]\nlevel = \"info\"\n");
+        let sub = build_subscriber(&cfg, &home);
+
+        // `with_default` 是**线程局部**的，而 `current_thread` 运行时就在本线程上跑，
+        // 故这三行确实过的是上面那个 subscriber（换成多线程运行时这条用例会变成 flaky）。
+        tracing::subscriber::with_default(sub, || {
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            rt.block_on(async {
+                let store = Store::open(Home::new(dir.path()), Arc::new(SystemClock))
+                    .await
+                    .unwrap();
+                testkit::seed_project(&store, "p1", "示例", dir.path(), "main")
+                    .await
+                    .unwrap();
+                // 第一行：节点开始（项目级 run 是「没有任务归属」的那一支）。
+                store
+                    .insert_project_run(&NewProjectRun {
+                        project_id: "p1".into(),
+                        stage: Stage::Init,
+                        node: Node::Execute,
+                        attempt: 1,
+                        agent_type: "pseudo:project_analysis".into(),
+                    })
+                    .await
+                    .unwrap();
+                // 第二、三行：请求派发 / 请求收场。
+                let llm =
+                    agentpipeline_core::agent::RecordingLlm::new(Arc::new(Stub), store.clone());
+                llm.complete(LlmRequest {
+                    stage: Stage::Init,
+                    node: Node::Execute,
+                    attempt: 1,
+                    system_prompt: "s".into(),
+                    user_prompt: "u".into(),
+                    messages: Vec::new(),
+                    tools: Vec::new(),
+                    temperature: None,
+                    max_tokens: None,
+                    provider_id: None,
+                    run: None,
+                })
+                .await
+                .unwrap();
+            });
+        });
+
+        let content = std::fs::read_to_string(home.root().join("logs/agentpipeline.log")).unwrap();
+        let start = content
+            .find("节点开始")
+            .unwrap_or_else(|| panic!("第一行缺失（节点开始）—— 日志里没有逐节点的行：{content}"));
+        let dispatch = content
+            .find("模型请求派发")
+            .unwrap_or_else(|| panic!("第二行缺失（请求派发）：{content}"));
+        let settle = content
+            .find("模型请求收场")
+            .unwrap_or_else(|| panic!("第三行缺失（请求收场）：{content}"));
+        assert!(
+            start < dispatch && dispatch < settle,
+            "三行的顺序就是时间线（节点开始 → 请求派发 → 请求收场）：{content}"
+        );
+        assert!(
+            content.contains("pseudo:project_analysis"),
+            "节点开始那一行要说清是哪个节点 / 哪种调用：{content}"
+        );
     }
 
     /// `file = ""` 是「只写标准输出」的逃生口（与「没配」分得开）。

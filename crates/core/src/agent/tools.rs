@@ -8,6 +8,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use chrono::{DateTime, Utc};
 use futures::future::BoxFuture;
 
 use super::client::ToolCall;
@@ -1240,6 +1241,36 @@ impl ToolExecutor {
             "runs_total": runs.len(),
         }));
 
+        // ④ 模型请求台账（决策 231）：**归位**与**量速**的共同地基，排在命令台账之前
+        //    ——「卡在哪一次调用上」比「跑过哪些命令」更靠近病因。
+        //
+        //    两半各答一件事：`inflight` 是**此刻**在飞的请求（`finished_at IS NULL`），
+        //    它回答 run 行回答不了的问题（一次 run 里有多次请求，工具循环每轮一次）；
+        //    `recent` 逐条给出 run_id + 序号 + 起止 + 用量 + 收字节总量 + 最后一次收字节的
+        //    时刻，于是「这条栈属于哪一个 run」与「流是被压慢了还是 prompt 本来就大」
+        //    都有可复核的落点。**不派生 bytes/s**：目录里没有对那个比值的判据，
+        //    给一个没人判得了的数只会多一个误导的读数（决策 235 拒「置信度」同一条道理）。
+        let inflight = store
+            .inflight_model_requests(MODEL_REQUEST_INFLIGHT_LIMIT)
+            .await?;
+        let recent = store
+            .model_requests_for_task(&task.id, MODEL_REQUEST_LIMIT)
+            .await?;
+        let now = store.now();
+        sections.push(serde_json::json!({
+            "model_requests": {
+                "inflight": inflight
+                    .iter()
+                    .map(|r| model_request_digest(r, now))
+                    .collect::<Vec<_>>(),
+                "recent": recent
+                    .iter()
+                    .map(|r| model_request_digest(r, now))
+                    .collect::<Vec<_>>(),
+                "recent_limit": MODEL_REQUEST_LIMIT,
+            },
+        }));
+
         // ④ 命令台账：闸门命令与 agent 自己跑的都在这里（`stdout_path` 是全文的落点）。
         sections.push(serde_json::json!({
             "commands": commands.iter().map(|c| serde_json::json!({
@@ -2123,6 +2154,48 @@ const PROMPT_SNAPSHOT_MAX_CHARS: usize = 4_000;
 
 /// 闸门日志的尾部上限：先把头部丢掉的那句说明保住，剩下的给尾部。
 const GATE_LOG_TAIL_CHARS: usize = 1_200;
+
+/// 诊断包里**逐条**列出的模型请求条数上限（决策 231）。整个包有 12k 的账，而请求多的 run
+/// 可以有几打；`inflight` 单列一份，故这一份只承担「最近的调用长什么样」。
+const MODEL_REQUEST_LIMIT: usize = 40;
+
+/// 诊断包里**此刻在飞**的请求条数上限。在飞的本就该是个位数——超过这个数说明机器在并发
+/// 跑好几个任务，那时逐条列全反而吃掉真正要看的那几行（留出 `truncated` 的余地给模型追问）。
+const MODEL_REQUEST_INFLIGHT_LIMIT: usize = 20;
+
+/// 一条模型请求的摘要（决策 231）。
+///
+/// `run_id` / `session_id` 是**归位**那一半：它把这一条与 `runs` 那一节里的某一行钉在一起，
+/// 而 2026-09-19 那次实测里死的正是这一条（值班长把 run 27 的活栈记在 run 26 名下，
+/// 而当时「栈里没有任何东西写着它是哪个 run 的」）。token 与 `bytes_received` 在**没量到**时
+/// 是 `null` 而不是 0——「没有读数」与「量到零」是两件事，写 0 就是把 226③ 那个坑再挖一遍。
+fn model_request_digest(
+    request: &crate::storage::ModelRequest,
+    now: DateTime<Utc>,
+) -> serde_json::Value {
+    serde_json::json!({
+        "request_id": request.id,
+        "run_id": request.run_id,
+        "session_id": request.session_id,
+        "agent_type": request.agent_type,
+        "stage": request.stage,
+        "node": request.node,
+        "attempt": request.attempt,
+        "seq": request.seq,
+        "status": request.status.as_str(),
+        "in_flight": request.in_flight(),
+        "duration_ms": request.elapsed_ms(now),
+        "prompt_tokens": request.usage.prompt_tokens,
+        "completion_tokens": request.usage.completion_tokens,
+        "cache_read_tokens": request.usage.cache_read_tokens,
+        "cache_write_tokens": request.usage.cache_write_tokens,
+        "bytes_received": request.usage.bytes_received,
+        "last_byte_at": request.usage.last_byte_at.map(|t| t.to_rfc3339()),
+        "error": request.error,
+        "started_at": request.started_at.to_rfc3339(),
+        "finished_at": request.finished_at.map(|t| t.to_rfc3339()),
+    })
+}
 
 /// 一条 run 的摘要（诊断包的第 ③ 节与「最近那次失败」共用同一形状）。
 ///

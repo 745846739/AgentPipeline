@@ -291,12 +291,18 @@ impl ProductionLlm {
         let mut usage = UsageAccum::default();
         let mut done = false;
         let mut last_heartbeat = Instant::now();
+        // 量速读数（决策 231）：字节总量 + 最后一次收字节的时刻。它们在**这一层**才量得到
+        // ——再往外一层只看得到最终响应，分不清「流快但 prompt 大」与「流被压到极慢」。
+        let mut bytes_received: u64 = 0;
+        let mut last_byte_at: Option<chrono::DateTime<chrono::Utc>> = None;
 
         while !done {
             let Some(chunk) = stream.next().await else {
                 break;
             };
             let bytes = chunk.map_err(|e| Error::Llm(format!("读取流失败：{e}")))?;
+            bytes_received += bytes.len() as u64;
+            last_byte_at = Some(self.store.now());
             buffer.push_str(&String::from_utf8_lossy(&bytes));
             while let Some(pos) = buffer.find('\n') {
                 let line: String = buffer.drain(..=pos).collect();
@@ -387,6 +393,8 @@ impl ProductionLlm {
             completion_tokens: usage.completion_tokens.unwrap_or(0),
             cache_read_tokens: usage.cache_read.unwrap_or(0),
             cache_write_tokens: usage.cache_write.unwrap_or(0),
+            bytes_received: Some(bytes_received),
+            last_byte_at,
         })
     }
 

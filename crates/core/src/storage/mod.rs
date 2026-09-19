@@ -6,7 +6,8 @@
 //! 写动作的落库形态，决策 188 / 207）、`pairing`（配对令牌，票 07）、
 //! `server_bind`（界面上的绑定开关，决策 186）、`market_repos`（界面上的技能来源仓名单，
 //! 决策 194 继承决策 187 的两级结构）、`skill_sources`（已装技能的来源记录，决策 194）、
-//! `attention`（值班长待办——调度器发现的落点，决策 209③）。
+//! `attention`（值班长待办——调度器发现的落点，决策 209③）、
+//! `model_requests`（模型请求台账——「现在在飞什么」与「这一次烧了多少字节」，决策 231）。
 
 pub mod attention;
 pub mod catalog;
@@ -15,6 +16,7 @@ pub mod cursors;
 pub mod decisions;
 pub mod foreman;
 pub mod market_repos;
+pub mod model_requests;
 pub mod observability;
 pub mod pairing;
 pub mod proposals;
@@ -24,6 +26,7 @@ pub mod tasks;
 
 pub use attention::{AttentionItem, AttentionKind, WatchWakeOutcome};
 pub use foreman::{ForemanMessage, NewForemanMessage};
+pub use model_requests::{ModelRequest, ModelRequestStatus, ModelRequestUsage, NewModelRequest};
 pub use skill_sources::SkillSource;
 
 use std::str::FromStr;

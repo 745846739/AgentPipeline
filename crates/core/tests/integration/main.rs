@@ -22,6 +22,7 @@ mod foreman_proposals;
 mod foreman_sessions_migration;
 mod git_chain;
 mod llm_smoke;
+mod model_requests;
 mod pairing;
 mod process_group;
 mod production_llm;

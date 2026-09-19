@@ -8,6 +8,7 @@ pub mod file_policy;
 pub mod metadata;
 pub mod prompts;
 pub mod providers;
+pub mod recording;
 pub mod repo;
 pub mod sanitize;
 pub mod skill_import;
@@ -32,6 +33,7 @@ pub use prompts::{
     prompt_template_hash, render_template, resolve_persona, PromptSegments, TemplateVars,
     BASELINE_PREAMBLE, FORMAT_RULES,
 };
+pub use recording::RecordingLlm;
 pub use skills::{ResolvedSkill, Skill};
 pub use templates::{system_template, user_template};
 pub use tools::{

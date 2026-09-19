@@ -20,6 +20,9 @@ use agentpipeline_core::pipeline::foreman::{
     FOREMAN_PERSONA, FOREMAN_STAGE_KEY, FOREMAN_TOOL_SPECS, FOREMAN_WATCH_MARK, OPERATION_LOG_MARK,
 };
 use agentpipeline_core::storage::foreman::NewForemanMessage;
+use agentpipeline_core::storage::model_requests::{
+    ModelRequestStatus, ModelRequestUsage, NewModelRequest,
+};
 use agentpipeline_core::storage::tasks::TaskFilter;
 use agentpipeline_core::storage::Store;
 use agentpipeline_core::types::{
@@ -1589,6 +1592,102 @@ async fn one_diagnosis_call_answers_why_it_stalled() {
     assert!(
         fed_back.contains("跑一遍闸门，把失败原文带回来。"),
         "组装后的用户段原文要带出来：{fed_back}"
+    );
+}
+
+#[tokio::test]
+async fn the_diagnosis_pack_carries_the_model_requests_of_each_run() {
+    // 决策 231 的硬要求：这张表的读数**必须进 `read_diagnosis`**——不进就是白做
+    // （值班长看不见的表等于不存在）。判据是决策 230 的前两项在**一次调用**里答得上：
+    // ① 哪一个 run（`run_id` + 序号落在同一行）② 卡在哪一环（这一次调用 / 还在飞）。
+    let h = Harness::seeded().await;
+    let run_id = seed_failed_task(&h, "t1").await;
+    let now = h.store.now();
+
+    // 一条收场的请求（带量速读数） + 一条仍在飞的请求（此刻的现状）。
+    let settled = h
+        .store
+        .begin_model_request(&NewModelRequest {
+            run_id: Some(run_id),
+            session_id: None,
+            task_id: Some("t1".into()),
+            agent_type: "main".into(),
+            stage: "test".into(),
+            node: "execute".into(),
+            attempt: 1,
+        })
+        .await
+        .unwrap();
+    h.store
+        .finish_model_request(
+            settled,
+            ModelRequestStatus::Ok,
+            &ModelRequestUsage {
+                prompt_tokens: Some(3_772_456),
+                completion_tokens: Some(812),
+                bytes_received: Some(4_096),
+                last_byte_at: Some(now),
+                ..Default::default()
+            },
+            None,
+        )
+        .await
+        .unwrap();
+    h.store
+        .begin_model_request(&NewModelRequest {
+            run_id: Some(run_id),
+            session_id: None,
+            task_id: Some("t1".into()),
+            agent_type: "main".into(),
+            stage: "test".into(),
+            node: "execute".into(),
+            attempt: 2,
+        })
+        .await
+        .unwrap();
+    park_task(&h.store, "t1", PendingKind::RetryExhausted, "重试耗尽").await;
+
+    let mut script = Script::new();
+    script.for_foreman().read_diagnosis("t1");
+    script.for_foreman().text("第 2 次调用还挂在流上。");
+    let agent = FakeAgent::new(script);
+    let turn = h
+        .runner(agent.clone())
+        .say(None, "t1 卡在哪一次调用？")
+        .await
+        .unwrap();
+    assert!(turn.traces[0].ok);
+
+    let fed_back = agent.request_log()[1]
+        .messages
+        .iter()
+        .filter_map(|m| m.content.as_deref())
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(
+        fed_back.contains("model_requests"),
+        "诊断包要有模型请求那一节：{fed_back}"
+    );
+    // ① 归位：这一行指名它属于哪一条 run（2026-09-19 实测里正是这一条缺了，才把 run 27
+    //    的活栈记到 run 26 名下）。
+    assert!(
+        fed_back.contains(&format!("\"run_id\": {run_id}")),
+        "请求要归位到它真正所属的 run：{fed_back}"
+    );
+    assert!(fed_back.contains("\"seq\": 1"), "序号要说清是第几次调用");
+    // ② 量速：收字节总量与最后一次收字节的时刻。
+    assert!(
+        fed_back.contains("\"bytes_received\": 4096"),
+        "收字节总量要在场：{fed_back}"
+    );
+    assert!(
+        fed_back.contains("\"prompt_tokens\": 3772456"),
+        "这一次调用烧掉的用量要在场：{fed_back}"
+    );
+    // ③ 现状：`finished_at IS NULL` 的那一条就是「现在在飞什么」。
+    assert!(
+        fed_back.contains("\"in_flight\": true"),
+        "在飞的请求要能被认出来：{fed_back}"
     );
 }
 
