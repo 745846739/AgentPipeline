@@ -86,7 +86,6 @@
     noteForeignDelta,
     pruneForeignActive,
     settleForemanStream,
-    attributionLabel,
     FOREMAN_FAILED_TURN_MARK,
     FOREMAN_WATCH_MARK,
     type ForemanStreamState,
@@ -386,8 +385,10 @@
         needsPairing: false,
         proposal: null,
         proactive: m.role === 'assistant' && m.content.startsWith(WATCH_MARK),
-        // 归因类别（决策 235①）：后端解析好的那一份；未定位时为 null。
-        attribution: attributionLabel(m.attribution),
+        // 归因类别（决策 235① / 238）：**用后端解析并翻好的那一份**（`attribution_label`），
+        // 界面不自己从稳定标识再映射一遍——两份映射迟早给出两个词，而「四类各一个词」
+        // 是同一件事。未定位时后端给 null，界面就不显示（不编一个假的类别）。
+        attribution: m.attribution_label ?? null,
       },
     }));
     for (const p of session?.proposals ?? []) {

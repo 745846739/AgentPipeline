@@ -170,7 +170,12 @@ workspace 成员 `crates/testkit`，供 L2 / L4 复用：
 故本文件**只允许一处 in-process `serve`**——`TestHome::install_env` 改的是进程级环境变量。
 
 **值班长的定位面（决策 227–239，`/.scratch/foreman-run-failure/`，票 01–06）**：这一批把
-「定位成功」的四项判据（决策 230）落成可测的读数与校验点，用例分五处落：
+「定位成功」的四项判据（决策 230）落成可测的读数与校验点，用例分五处落。**四项判据本身有一条
+总闸**：`foreman::one_watch_round_closes_all_four_criteria_on_the_same_run`——一次播报轮里
+①（run_id）②（哪一环，失败原文挂在那条 run 上）③（可复核的原始证据：闸门输出真文件 + 命令回执）
+④（`【归因】` 结构块，四类之内）齐备，且**四项指向同一条 run**（模型请求台账那一节也归到同一个
+`run_id`）。为什么单列：四个读数分开各绿而合起来给不出四项，正是 2026-09-19 的现场（采到正确方法、
+却把 run 27 的活栈归到已 failed 的 run 26 名下）。
 
 - **模型请求台账（决策 231，票 01）**：`tests/model_requests.rs` **9 条**——收场请求带 run 归属与
   用量 / 在飞的请求**先于收场可读** / 被丢掉的请求由 Drop 兜底收成 `timeout`（**不留假「在飞」**）/
@@ -179,10 +184,14 @@ workspace 成员 `crates/testkit`，供 L2 / L4 复用：
   另两条在既有文件里：`foreman::the_diagnosis_pack_carries_the_model_requests_of_each_run`
   （读数**必须进诊断包**）与 `app::serve::tests::the_three_model_log_lines_form_a_timeline_in_the_file`
   （三行日志按时间顺序落在文件里——「日志读得到」与「日志里有东西」是两件事）。
-- **只读取证（决策 232 / 237，票 02）**：`tests/readonly.rs` **5 条** + `agent::tools::tests` 内联 4 条。
+- **只读取证（决策 232 / 237，票 02）**：`tests/readonly.rs` **6 条** + `agent::tools::tests` 内联 5 条。
   牙齿都在**副作用**上：`; touch <文件>` 作为参数递进去后文件**不存在**（不经 shell 的证明）/
   白名单外的名字（`sh` / `rm` / `curl`）拒且**留一行台账** / 路径参数越出文件域即拒（`data/`、
-  `..`、绝对路径各一）/ `sample` 的 pid 只认本进程及其子进程（外人拒、按进程名取样拒）/
+  `..`、绝对路径各一，**连着选项写进去的那一种也拒**：`--files0-from=/etc/passwd` 的值半边同样
+  要过文件域）/ `sample` 的 pid 只认本进程及其子进程（外人拒、按进程名取样拒）/
+  **超时杀掉整个进程组**（`a_timed_out_readonly_command_kills_its_process_group`：`tail -f` 挂住
+  → 报「命令超时」+ 终止器被叫到 + pgid 非 0；这条是抽公共管道时补的回归——原先只读那一支抄
+  `run_command` 时漏了这句，超时的取证进程会留到天荒地老，而白名单里有 `sample`）/
   `deny` 档照旧广告照旧执行（它改不了任何东西，故不归档位管）。冻结断言按决策 209 的次序**先改后加**。
 - **归因结构块（决策 235 / 238，票 03）**：`foreman::attribution` **5 条**（稳定标识与中文词都认 /
   没给与不可用分开记 / 四类之外不收口 / 重复与自相矛盾都不收口 / 行内提及不算块）+
@@ -199,10 +208,15 @@ workspace 成员 `crates/testkit`，供 L2 / L4 复用：
   （部分结论落库 + `【未收口】` 标注 + 标注里给出实际生效的上限；上限由 `stage_configs` 的
   `max_rounds` 给，用例配 3 轮同时钉住「设置项真的生效」）/ 一句话都没说过的触顶**仍旧按失败
   处置**（类别仍是 `model_no_reply`，没有东西可留时报错才是诚实的）/ 一轮死了之后它提的提议
-  **随之失效**（`invalidate_pending_foreman_proposals`：状态 `expired`、行留着可追溯）+
+  **随之失效**（`invalidate_pending_foreman_proposals`：状态 `expired`、行留着可追溯）/
+  **只作废那一轮自己提的**（`a_failed_turn_only_invalidates_the_proposals_of_its_own_round`：
+  上一轮留下的合规待办不受牵连——判据是 `created_at >= 这一轮开始`，同刻按「这一轮的」收）+
   `api_contract::max_rounds_accepts_only_positive_integers`（正整数 / `0` / 负数 / 留空四种）
-  + `config::a_stored_zero_max_rounds_fails_startup_validation`（存量里的 `0` 拒绝启动，
-  与 `tools_json` 的未知名字同一姿态）+ 前端 `stageConfigs.test.ts` 4 条（正整数入 payload /
+  + `config::a_stored_zero_max_rounds_fails_startup_validation` 与
+  `foreman::a_stored_zero_max_rounds_fails_startup_on_the_real_read_path`（存量里的 `0` 拒绝启动，
+  与 `tools_json` 的未知名字同一姿态；后者打在**真读路径**上——绕过写入校验直接改库，走
+  `Store::validate_startup`，钉住 `list_stage_configs` → `into_config` 不许把 `0` 吞成「没配过」，
+  否则那条守卫永远不可达）+ 前端 `stageConfigs.test.ts` 4 条（正整数入 payload /
   留空省略 / `0` 与负数在按下之前就被拦 / 预填读回来）。
 - **待办补两类（决策 234，票 05）**：`scheduler_tick.rs` 4 条（`run_failed` 当场记且点名 run /
   逐 attempt 各一行 / 任务已转 pending 时不重复记 / 取消留一条唤醒待办）+

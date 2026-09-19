@@ -436,7 +436,11 @@ impl Store {
         Ok(affected as usize)
     }
 
-    /// 作废**一个班次**里此刻仍悬空的提议（决策 233③：一轮死了，它那一轮提的提议随之失效）。
+    /// 作废**这一轮提的**、此刻仍悬空的提议（决策 233③：一轮死了，它那一轮提的提议随之失效）。
+    ///
+    /// 判据是 `created_at >= since`（`since` = 这一轮开始的时刻）——不能只按班次收：
+    /// 那会把**上一轮**留下的、正等着人按键的提议一起作废，而它们是合规的待办
+    /// （实测里那两条悬空提议要的是「**它们那一轮**死了才失效」，不是「之后任何一轮死了都失效」）。
     ///
     /// 与 [`Self::expire_foreman_proposals`] 的差别只有判据：那条按**时间**（`expires_at` 到点），
     /// 这条按**事件**（提出它的那一轮死了）。两条都要求 `claimed_at IS NULL`——正在被按下的
@@ -444,15 +448,20 @@ impl Store {
     ///
     /// 状态用 `expired` 而不是新造一个：对界面而言「过期」与「那一轮死了」是同一件事
     /// （钮按不动、行留在时间线里）。**不删行**，与其余路径同一姿态。
-    pub async fn invalidate_pending_foreman_proposals(&self, session_id: &str) -> Result<usize> {
+    pub async fn invalidate_pending_foreman_proposals(
+        &self,
+        session_id: &str,
+        since: DateTime<Utc>,
+    ) -> Result<usize> {
         let affected = sqlx::query(
             "UPDATE kanban_foreman_proposals SET status = ?, resolved_at = ?
-             WHERE session_id = ? AND status = ? AND claimed_at IS NULL",
+             WHERE session_id = ? AND status = ? AND claimed_at IS NULL AND created_at >= ?",
         )
         .bind(FOREMAN_PROPOSAL_EXPIRED)
         .bind(ts(self.now()))
         .bind(session_id)
         .bind(FOREMAN_PROPOSAL_PENDING)
+        .bind(ts(since))
         .execute(self.pool())
         .await?
         .rows_affected();

@@ -998,6 +998,9 @@ impl ForemanRunner {
         self.store
             .append_foreman_user_message(&session.id, text)
             .await?;
+        // 这一轮从这一刻算起（决策 233③：一轮死了要作废**它那一轮**提的提议）——
+        // 用「刚落库的这句人话的时刻」而不是墙上现在，因为提议是在这之后才可能落库的。
+        let round_started_at = self.store.now();
         // 标题可能是刚由这句话派生的（首次说话命名，决策 204②），故重读一次会话行，
         // 让返回值里的标题与库里的标题是同一个——客户端拿它直接更新 chip。
         let session = self
@@ -1013,7 +1016,8 @@ impl ForemanRunner {
             .respond(&session, TurnInput::Human(text.to_string()))
             .await;
         if let Err(error) = &result {
-            self.record_failed_turn(&session, error).await;
+            self.record_failed_turn(&session, error, round_started_at)
+                .await;
         }
         result
     }
@@ -1356,6 +1360,8 @@ impl ForemanRunner {
     /// **消费只在成功之后**：失败（模型报错 / 没回话）不置 `consumed_at`，下一趟还看得见
     /// 同一批——否则一次网络抖动就等于把这批事件丢了。
     pub async fn watch(&self) -> Result<Option<ForemanTurn>> {
+        // 这一轮的起点（决策 233③）：与 `say()` 同一个用途——死轮只作废**它自己**提的提议。
+        let started_at = self.store.now();
         let open = self
             .store
             .open_attention(FOREMAN_ATTENTION_FETCH_LIMIT)
@@ -1465,7 +1471,8 @@ impl ForemanRunner {
             }
             Err(error) => {
                 // 失败也留痕（票 04 那条路），且**不消费**——这批事件下一趟还在。
-                self.record_failed_turn(&session, &error).await;
+                // 值守轮的起点就是这一趟本身（它没有「人说的那句话」那条界线）。
+                self.record_failed_turn(&session, &error, started_at).await;
                 Err(error)
             }
         }
@@ -1475,14 +1482,20 @@ impl ForemanRunner {
     ///
     /// `role = system` 复用「操作台记账」那条路（决策 207）：对讲台把它渲染成一轮，
     /// 模型下一轮也会看到它——于是「上一轮我为什么没回话」对它自己也是已知的一件事。
-    async fn record_failed_turn(&self, session: &ForemanSession, error: &Error) {
+    async fn record_failed_turn(
+        &self,
+        session: &ForemanSession,
+        error: &Error,
+        started_at: chrono::DateTime<chrono::Utc>,
+    ) {
         let (kind, reason) = turn_failure_reason(error);
         self.note_turn(
             &session.id,
             format!("{FOREMAN_FAILED_TURN_MARK}这一轮没跑起来（{kind}）：{reason}"),
         )
         .await;
-        self.invalidate_round_proposals(&session.id).await;
+        self.invalidate_round_proposals(&session.id, started_at)
+            .await;
     }
 
     /// 一轮死掉之后，**它那一轮提的提议随之失效**（决策 233③）。
@@ -1494,10 +1507,14 @@ impl ForemanRunner {
     /// 只在**失败的轮**上作废：正常收口那一轮的提议照旧等人按键（那是它的正常归宿）。
     /// 不额外广播事件（与每小时的过期扫描同一姿态）：界面重读会话时看到 `expired`，
     /// 两颗钮随之变灰——为此新造一个 SSE 事件只是多一条要维护的契约。
-    async fn invalidate_round_proposals(&self, session_id: &str) {
+    async fn invalidate_round_proposals(
+        &self,
+        session_id: &str,
+        started_at: chrono::DateTime<chrono::Utc>,
+    ) {
         match self
             .store
-            .invalidate_pending_foreman_proposals(session_id)
+            .invalidate_pending_foreman_proposals(session_id, started_at)
             .await
         {
             Ok(0) => {}
@@ -1526,12 +1543,22 @@ impl ForemanRunner {
                 return;
             }
         };
+        // 这一轮从哪一刻算起：**最后一条消息的时刻**（`say()` 已经把用户那一句落了库，
+        // 而它就是这一轮的起点）。读不到就退到「现在」——那只会收得更少，不会误收上一轮的。
+        let started_at = self
+            .store
+            .list_foreman_messages(&session.id, 1)
+            .await
+            .ok()
+            .and_then(|m| m.last().map(|m| m.created_at))
+            .unwrap_or_else(|| self.store.now());
         self.note_turn(
             &session.id,
             format!("{FOREMAN_FAILED_TURN_MARK}这一轮没跑完（{why}）：回话没有落库"),
         )
         .await;
-        self.invalidate_round_proposals(&session.id).await;
+        self.invalidate_round_proposals(&session.id, started_at)
+            .await;
     }
 
     /// 往台账里写一条**操作台自己**的账（`role = system`，决策 207 那条路）。

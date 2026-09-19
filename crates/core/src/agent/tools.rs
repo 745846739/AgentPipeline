@@ -1783,9 +1783,33 @@ impl ToolExecutor {
         if let Some(rec) = &self.recorder {
             rec.touch_heartbeat(ctx.run_id).await?;
         }
+        self.run_child_to_outcome(
+            ctx,
+            command_id,
+            || crate::process::spawn_in_own_process_group(&command, &cwd),
+            explicit_timeout,
+        )
+        .await
+    }
 
-        let timeout_sec =
-            effective_run_command_timeout(&self.settings, ctx.stage, explicit_timeout);
+    /// 启动 → 流式收集 → 超时收口 → 台账回填的**共同管道**（`run_command` 与 `run_readonly`
+    /// 只有「怎么启动」不一样）。
+    ///
+    /// 为什么抽出来：两处各写一遍时**已经漂移过一次**——只有 `run_command` 那一支在超时后补了
+    /// 一次 `kill_process_group`，`run_readonly` 那一支漏了（进程组没杀干净，超时的取证进程会
+    /// 留到天荒地老）。这个管道里每一步的理由都是同一条（心跳 / 进程组 / 脱敏 / 裁剪 / 卸载），
+    /// copy 一份就是给下一次漂移留位置。
+    ///
+    /// `spawn` 是一个闭包而不是一个 `Command`：两条路启动方式不同（`sh -c` 一行 vs argv 直出，
+    /// 决策 232 的「不经 shell」是 `run_readonly` 的安全面本身），而这个差别**只在启动**。
+    /// 调用方负责在调它之前落台账与刷心跳（被拒的那一类也要落账，故那一步不在管道里）。
+    async fn run_child_to_outcome(
+        &self,
+        ctx: &ToolCallContext,
+        command_id: Option<i64>,
+        spawn: impl FnOnce() -> std::io::Result<tokio::process::Child>,
+        explicit_timeout: Option<u64>,
+    ) -> Result<ToolOutcome> {
         // 决策 100：运行期间周期心跳——600s 级命令不被 300s 空闲超时误杀
         let heartbeat = self.spawn_command_heartbeat(ctx.run_id);
         let started = Instant::now();
@@ -1795,7 +1819,9 @@ impl ToolExecutor {
         // 逐行读 + 按行推流（票 14 / 决策 100 / §12.4.4）：输出经管道进入后台收集任务，
         // 完整内容全量缓冲用于落库与回填（推流是观测面，不改变 kanban_node_commands 口径）。
         let collected = std::sync::Arc::new(std::sync::Mutex::new(CollectedOutput::default()));
-        let output = match crate::process::spawn_in_own_process_group(&command, &cwd) {
+        let timeout_sec =
+            effective_run_command_timeout(&self.settings, ctx.stage, explicit_timeout);
+        let output = match spawn() {
             Ok(child) => {
                 child_pgid = child.id().map(|id| id as i32);
                 if let (Some(rec), Some(run_id), Some(pgid)) =
@@ -1803,7 +1829,6 @@ impl ToolExecutor {
                 {
                     rec.set_process_group(run_id, pgid).await?;
                 }
-                // 流式收集：stdout / stderr 各起一条读行任务，边读边推 event
                 let collect = self.spawn_streaming_collector(child, command_id, collected.clone());
                 tokio::time::timeout(std::time::Duration::from_secs(timeout_sec), collect).await
             }
@@ -1868,6 +1893,8 @@ impl ToolExecutor {
             }
         }
 
+        // 命令自己以非零退出（`tail` 的文件不存在之类）**不是**策略拒绝：回执原样交回去，
+        // 让模型看着真输出改道——它正在取证，一条读不到的文件本来就是要报出来的事实。
         Ok(ToolOutcome::ok(in_context))
     }
 
@@ -1990,67 +2017,15 @@ impl ToolExecutor {
         }
 
         let explicit_timeout = args.get("timeout_sec").and_then(|v| v.as_u64());
-        let timeout_sec =
-            effective_run_command_timeout(&self.settings, ctx.stage, explicit_timeout);
-        let heartbeat = self.spawn_command_heartbeat(ctx.run_id);
-        let started = Instant::now();
-        let mut child_pgid: Option<i32> = None;
-        let collected = std::sync::Arc::new(std::sync::Mutex::new(CollectedOutput::default()));
-        let output = match crate::process::spawn_argv_in_own_process_group(&program, &argv, &cwd) {
-            Ok(child) => {
-                child_pgid = child.id().map(|id| id as i32);
-                if let (Some(rec), Some(run_id), Some(pgid)) =
-                    (self.recorder.as_ref(), ctx.run_id, child_pgid)
-                {
-                    rec.set_process_group(run_id, pgid).await?;
-                }
-                let collect = self.spawn_streaming_collector(child, command_id, collected.clone());
-                tokio::time::timeout(std::time::Duration::from_secs(timeout_sec), collect).await
-            }
-            Err(e) => Ok(Err(e)),
-        };
-        if let Some(task) = &heartbeat {
-            task.abort();
-        }
-        let duration_ms = started.elapsed().as_millis() as u64;
-        let (exit_code, stdout, stderr) = match output {
-            Ok(Ok(status)) => {
-                let out = collected.lock().unwrap().clone();
-                (status.code(), out.stdout, out.stderr)
-            }
-            Ok(Err(e)) => (None, String::new(), format!("命令启动失败：{e}")),
-            Err(_) => {
-                let out = collected.lock().unwrap().clone();
-                if let Some(pgid) = child_pgid {
-                    let _ = self.killer.kill_process_group(pgid);
-                }
-                (None, out.stdout, format!("命令超时（{timeout_sec}s）"))
-            }
-        };
-
-        // 输出脱敏在**回填 messages 之前**（决策 118），再走与 `run_command` 同一套裁剪 / 卸载。
-        let stdout = sanitize_text(&stdout);
-        let stderr = sanitize_text(&stderr);
-        let (in_context, offload_path) = self.prepare_output(ctx, &stdout, &stderr)?;
-        if let Some(rec) = &self.recorder {
-            if let Some(id) = command_id {
-                rec.record_finish(
-                    id,
-                    CommandFinish {
-                        exit_code,
-                        stdout_path: offload_path,
-                        stdout_preview: Some(head_tail(&stdout, 50, 100)),
-                        stderr_preview: Some(head_tail(&stderr, 50, 100)),
-                        duration_ms,
-                    },
-                )
-                .await?;
-            }
-            rec.touch_heartbeat(ctx.run_id).await?;
-        }
-        // 命令自己以非零退出（`tail` 的文件不存在之类）**不是**策略拒绝：回执原样交回去，
-        // 让模型看着真输出改道——它正在取证，一条读不到的文件本来就是要报出来的事实。
-        Ok(ToolOutcome::ok(in_context))
+        // 启动之后的一切与 `run_command` **同一条管道**（心跳 / 进程组 / 超时收口 / 脱敏 /
+        // 裁剪卸载 / 台账回填）：唯一不同的只有启动那一句——argv 直出、不经 shell。
+        self.run_child_to_outcome(
+            ctx,
+            command_id,
+            || crate::process::spawn_argv_in_own_process_group(&program, &argv, &cwd),
+            explicit_timeout,
+        )
+        .await
     }
 
     /// 拒掉一次只读取证，**并把这次尝试记下来**（决策 179 的口径：审计面必须看得见被拒的
@@ -2491,10 +2466,24 @@ pub const READONLY_COMMANDS: [&str; 7] = ["date", "ps", "pgrep", "lsof", "wc", "
 /// 那份额外的**模式**名单（`foreman_file_policy` 的 `deny_paths`）拦下。
 fn readonly_path_arg(arg: &str, cwd: &Path) -> Option<PathBuf> {
     let arg = arg.trim();
-    if arg.is_empty() || arg.starts_with('-') {
+    if arg.is_empty() {
         return None;
     }
-    let path = Path::new(arg);
+    // 带 `=` 的选项：**值那一半**照样可能是路径（`wc --files0-from=/etc/passwd`、
+    // `lsof --pidfile=/tmp/x`）。决策 232 的原文把「路径**与选项**」并列在不得越界的范围内，
+    // 而「选项一律跳过」正是那句话下面的一个洞（这个洞是 code review 打出来的）。
+    let candidate = if arg.starts_with('-') {
+        match arg.split_once('=') {
+            Some((_, value)) if !value.trim().is_empty() => value.trim(),
+            // 纯选项（`-n` / `-eo pid,ppid` / `--mayDie`）：不含路径语义。
+            _ => return None,
+        }
+    } else {
+        // 非选项一律按路径过一遍：不含 `/` 的裸词（`pgrep -fl git` 里的搜索词）解析到
+        // 家目录根之下、照常放行，而 `.env` 这类仍会被那份额外的**模式**名单拦下。
+        arg
+    };
+    let path = Path::new(candidate);
     Some(if path.is_absolute() {
         path.to_path_buf()
     } else {
@@ -2637,6 +2626,21 @@ mod tests {
             readonly_path_arg("/etc/hosts", cwd),
             Some(PathBuf::from("/etc/hosts"))
         );
+        // 带 `=` 的选项：判的是**值**那一半（决策 232 的「路径与选项」两半都不得越界）。
+        assert_eq!(
+            readonly_path_arg("--files0-from=/etc/passwd", cwd),
+            Some(PathBuf::from("/etc/passwd"))
+        );
+        assert_eq!(
+            readonly_path_arg("--files0-from=logs/a.log", cwd),
+            Some(PathBuf::from("/home/u/logs/a.log"))
+        );
+        // 值的形态不像路径也照过一遍（拿不准就往保守的方向判：解析下来在域内就放行）。
+        assert_eq!(
+            readonly_path_arg("--format=wide", cwd),
+            Some(PathBuf::from("/home/u/wide"))
+        );
+        assert_eq!(readonly_path_arg("--files0-from=", cwd), None);
     }
 
     #[test]

@@ -15,10 +15,11 @@ use agentpipeline_core::clock::Clock;
 use agentpipeline_core::config::Settings;
 use agentpipeline_core::metrics;
 use agentpipeline_core::pipeline::foreman::{
-    build_briefing, foreman_tool_names, situation_fingerprint, trim_history, AttributionKind,
-    ForemanRunner, ForemanToolLayer, FOREMAN_AGENT_TYPE, FOREMAN_ATTRIBUTION_MARK,
-    FOREMAN_FAILED_TURN_MARK, FOREMAN_MAX_ROUNDS, FOREMAN_PARTIAL_TURN_MARK, FOREMAN_PERSONA,
-    FOREMAN_STAGE_KEY, FOREMAN_TOOL_SPECS, FOREMAN_WATCH_MARK, OPERATION_LOG_MARK,
+    build_briefing, foreman_tool_names, parse_attribution, situation_fingerprint, trim_history,
+    Attribution, AttributionKind, ForemanRunner, ForemanToolLayer, FOREMAN_AGENT_TYPE,
+    FOREMAN_ATTRIBUTION_MARK, FOREMAN_FAILED_TURN_MARK, FOREMAN_MAX_ROUNDS,
+    FOREMAN_PARTIAL_TURN_MARK, FOREMAN_PERSONA, FOREMAN_STAGE_KEY, FOREMAN_TOOL_SPECS,
+    FOREMAN_WATCH_MARK, OPERATION_LOG_MARK,
 };
 use agentpipeline_core::storage::foreman::NewForemanMessage;
 use agentpipeline_core::storage::model_requests::{
@@ -3874,5 +3875,302 @@ async fn a_failed_turn_invalidates_the_proposals_it_left_behind() {
     assert!(
         all.iter().all(|p| p.status.as_str() == "expired"),
         "留痕但不 pending：{all:?}"
+    );
+}
+
+/// 一轮死了只作废**它那一轮**提的提议（决策 233③）——上一轮留下的待办不受牵连。
+///
+/// 为什么这条必须钉：`invalidate` 若只按班次收，一次失败轮会把**上一轮**留下、正等着人按键的
+/// 提议一起作废——而它们是合规的待办（实测里那两条悬空提议要的是「**它们那一轮**死了才失效」，
+/// 不是「之后任何一轮死了都失效」）。这条用例的牙齿就是把两者放在同一班次里对照。
+#[tokio::test]
+async fn a_failed_turn_only_invalidates_the_proposals_of_its_own_round() {
+    let h = Harness::seeded().await;
+    let sid = h.session().await;
+    let new_proposal = |tool: &str| agentpipeline_core::storage::proposals::NewForemanProposal {
+        kind: agentpipeline_core::storage::proposals::ForemanProposalKind::ApiCall,
+        payload: None,
+        session_id: sid.clone(),
+        tool: tool.into(),
+        args: serde_json::json!({"path": "notes.md", "content": "x"}),
+        summary: "（用例）".into(),
+        situation: None,
+    };
+    // 上一轮留下的那一条（合规待办，等人按键）
+    let old = h
+        .store
+        .create_foreman_proposal(new_proposal("write_file"))
+        .await
+        .unwrap()
+        .id;
+
+    // 时钟往前推一秒：判据是 `created_at >= 这一轮开始的时刻`，而这一台是**固定时钟**
+    // ——不推的话两条提议同刻，那条合规待办会被一起收掉（真实时钟下没有这个问题，
+    // 而 `>=` 是故意的：同刻的提议按「这一轮的」收，宁可多收也不漏收）。
+    h.clock.advance_secs(1);
+
+    // 这一轮：先说一句 → 提一条 → 然后就跑不起来了。
+    let runner = ForemanRunner::new(
+        h.store.clone(),
+        Settings::default(),
+        h._home.home().clone(),
+        Arc::new(ProposeThenFail {
+            proposed: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            store: h.store.clone(),
+            session_id: sid.clone(),
+        }) as Arc<dyn LlmClient>,
+        Arc::new(testkit::SseRecorder::new()),
+    );
+    assert!(runner.say(Some(&sid), "动手吧").await.is_err());
+
+    let pending: Vec<String> = h
+        .store
+        .list_pending_foreman_proposals(&sid)
+        .await
+        .unwrap()
+        .iter()
+        .map(|p| p.id.clone())
+        .collect();
+    assert_eq!(
+        pending,
+        vec![old],
+        "上一轮那条要留着（它是合规待办），这一轮提的那条要作废"
+    );
+    let all = h.store.list_foreman_proposals(&sid, 100).await.unwrap();
+    assert_eq!(all.len(), 2, "两条都还在台账里（作废不删行）");
+}
+
+/// 先提一条、然后报错的替身（模拟「那一轮提了东西，然后死了」）。
+struct ProposeThenFail {
+    proposed: Arc<std::sync::atomic::AtomicBool>,
+    store: agentpipeline_core::storage::Store,
+    session_id: String,
+}
+
+impl LlmClient for ProposeThenFail {
+    fn complete(
+        &self,
+        _request: LlmRequest,
+    ) -> futures::future::BoxFuture<'static, agentpipeline_core::Result<AgentResponse>> {
+        use std::sync::atomic::Ordering;
+        if self.proposed.swap(true, Ordering::SeqCst) {
+            return Box::pin(async { Err(Error::Llm("连接被对端关掉".into())) });
+        }
+        let store = self.store.clone();
+        let session_id = self.session_id.clone();
+        Box::pin(async move {
+            // 走真实的提议入口（`ask` 档下的写工具会被拦成提议）——这里直接落一条，
+            // 因为这条用例考的**不是**闸门，而是「这一轮提的」这个归属判据。
+            store
+                .create_foreman_proposal(
+                    agentpipeline_core::storage::proposals::NewForemanProposal {
+                        kind: agentpipeline_core::storage::proposals::ForemanProposalKind::ApiCall,
+                        payload: None,
+                        session_id,
+                        tool: "write_file".into(),
+                        args: serde_json::json!({"path": "during-round.md", "content": "x"}),
+                        summary: "（用例）这一轮提的".into(),
+                        situation: None,
+                    },
+                )
+                .await?;
+            Ok(AgentResponse {
+                content: Some("我先提一条。".into()),
+                tool_calls: vec![agentpipeline_core::agent::client::ToolCall {
+                    id: "c1".into(),
+                    name: "read_task".into(),
+                    arguments: r#"{"task_id":"t1"}"#.into(),
+                }],
+                prompt_tokens: 10,
+                completion_tokens: 5,
+                ..Default::default()
+            })
+        })
+    }
+}
+
+/// 存量里的 `max_rounds = 0` **拒绝启动**（决策 233① / 239）——打在**真读路径**上。
+///
+/// 为什么单列：写入路径（`PUT /stage-configs`、`config set`）已经按正整数拒过，这条守卫管的是
+/// **存量**（手工改库、老版本写下的值）。只构造一个 `StageConfig` 去调 `validate_startup` 是
+/// 不够的——真正的入口是 `list_stage_configs` → `StageConfigRow::into_config`；那一层若把 `0`
+/// 吞成 `None`（当成「没配过」），守卫就永远不可达，而 `0` 被静默当成缺省 300。故这里绕过写入
+/// 校验直接改库，再走 `Store::validate_startup`（与 `serve.rs` 启动时同一条路）。
+#[tokio::test]
+async fn a_stored_zero_max_rounds_fails_startup_on_the_real_read_path() {
+    let h = Harness::seeded().await;
+    // 先按正常写入放一个合法值，再绕过写入校验把它改成 0（模拟手工改库 / 老版本写下的值）。
+    h.store
+        .upsert_stage_config(&StageConfig {
+            stage: FOREMAN_STAGE_KEY.to_string(),
+            max_rounds: Some(3),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+    sqlx::query("UPDATE stage_configs SET max_rounds = 0 WHERE stage = 'foreman'")
+        .execute(h.store.pool())
+        .await
+        .unwrap();
+
+    // 读路径必须把 0 原样带出来（不是当成「没配过」）……
+    let cfg = h
+        .store
+        .get_stage_config(FOREMAN_STAGE_KEY)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(cfg.max_rounds, Some(0), "0 不许被静默吞成「没配过」");
+
+    // ……启动校验必须当场拒绝，并说清改哪儿、以及「没有无上限这一档」。
+    let err = h
+        .store
+        .validate_startup(&Settings::default())
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(err.contains("max_rounds"), "{err}");
+    assert!(err.contains("正整数"), "{err}");
+    assert!(
+        err.contains(&FOREMAN_MAX_ROUNDS.to_string()),
+        "报文要给出缺省值，好让人知道删掉这一格会回到多少：{err}"
+    );
+}
+
+/// 决策 230 的四项判据**在同一次播报轮里齐备**——这是那一票的验收形状，不是四个分开的读数齐不齐。
+///
+/// 判据原文：「收到一次失败/停摆后，**一次值守轮内**必须给出 ①哪一个 run（id）②卡在哪一环
+/// （阶段 / 节点 / 一次具体调用）③一条**可复核的原始证据**（日志行 / 栈帧 / 命令回执）
+/// ④**归因类别**；四项缺一即算未定位，且『证据归错 run』与『没有证据』同判为失败」。
+///
+/// 为什么必须**打在一轮里**：分开的用例各自绿着、而合起来一轮给不出四项，正是 2026-09-19 的现场
+/// ——它采到了正确的方法（`sample` / `lsof` / 栈帧齐全），却把 run 27 的活栈归到**已经 failed 的
+/// run 26** 名下。四项里任何一项单独看都不缺，缺的是「四项说的是**同一条 run**」。
+/// 故这里断言四个读数落在**同一份回话**上，且 run 的归属是**同一条**。
+#[tokio::test]
+async fn one_watch_round_closes_all_four_criteria_on_the_same_run() {
+    let h = Harness::seeded().await;
+    // 现场：一条失败的 run（带 error），命令台账与闸门输出的真文件（可复核的原始证据）。
+    let run_id = seed_failed_task(&h, "t1").await;
+    // 那条 run 上挂了一次模型请求（票 01 的落点）：它是「这一轮卡在哪一次调用」的读数，
+    // 而**它必须归到同一条 run 上**——这正是 2026-09-19 缺的那一环。
+    let request_id = h
+        .store
+        .begin_model_request(&NewModelRequest {
+            run_id: Some(run_id),
+            session_id: None,
+            task_id: Some("t1".into()),
+            agent_type: "main".into(),
+            stage: "test".into(),
+            node: "execute".into(),
+            attempt: 1,
+        })
+        .await
+        .unwrap();
+    h.store
+        .finish_model_request(
+            request_id,
+            ModelRequestStatus::Error,
+            &ModelRequestUsage {
+                prompt_tokens: Some(1_234_567),
+                ..Default::default()
+            },
+            Some("对端在流中途关掉了连接"),
+        )
+        .await
+        .unwrap();
+    // 任务**没有**因此转 pending（失败后游标自动重试、任务仍在 running）——这正是
+    // `run_failed` 那类事件的形状：既有的 `task_pending` / `scheduler_no_effect` 两条都不成立。
+    let mut script = Script::new();
+    script.for_foreman().read_diagnosis("t1");
+    // 回话：① run 身份 ② 卡在哪一环 ③ 原始证据 ④ 归因类别（机器可读的一段）。
+    script.for_foreman().text(
+        "run tid-1 卡在 test.execute 这一次调用上：闸门退出码 1，\
+         见 gate-output-test.log（命令台账里的 `cargo test --quiet`）。\n\
+         【归因】{\"attribution\":\"project_code\"}\n",
+    );
+    let agent = FakeAgent::new(script);
+    let runner = h.runner(agent.clone());
+
+    let attention = agentpipeline_core::storage::AttentionKind::RunFailed;
+    note(&h, "t1", attention).await;
+    h.clock.advance_secs(61);
+    let turn = runner.watch().await.unwrap().expect("这条失败应当唤醒值守");
+
+    // 播报轮的身份没被弄错：落库那一行仍是播报轮（前端靠前缀把两种轮分开——前缀由**后端**
+    // 加在入库的那一份上，`turn.reply` 是模型原话，故这里读库），且归因类别已经解析出来。
+    let stored = h
+        .store
+        .list_foreman_messages(&turn.session.id, 10)
+        .await
+        .unwrap();
+    let broadcast = stored
+        .iter()
+        .find(|m| m.role == "assistant")
+        .expect("播报要落库");
+    assert!(
+        broadcast.content.starts_with(FOREMAN_WATCH_MARK),
+        "播报那一轮的前缀不能丢：{}",
+        broadcast.content
+    );
+    assert_eq!(
+        parse_attribution(&broadcast.content),
+        Attribution::Located(AttributionKind::ProjectCode),
+        "④ 归因类别要在播报那一轮里给出，且四类之内：{}",
+        broadcast.content
+    );
+
+    // ① ② ③ 三项落在**同一次工具回执**上：这是模型据以收口的证据面，也是唯一能被复核的那一份。
+    let pack = agent.request_log()[1]
+        .messages
+        .iter()
+        .find(|m| m.name.as_deref() == Some("read_diagnosis"))
+        .and_then(|m| m.content.clone())
+        .expect("诊断包的回执要在转写里");
+    // 按结构断言，不按字符串顺序：回执本身就是一份 JSON 文档（`to_string_pretty`）。
+    let doc: serde_json::Value = serde_json::from_str(&pack).expect("诊断包要是一份完整 JSON");
+    let evidence = &doc["evidence"];
+    assert_eq!(
+        evidence[0]["why_stalled"]["latest_failure"]["run_id"].as_i64(),
+        Some(run_id),
+        "① 哪一个 run：诊断包要指名它（不是「最近失败的那条」这种描述）：{evidence}"
+    );
+    assert!(
+        evidence[0]["why_stalled"]["latest_failure"]["error"]
+            .as_str()
+            .is_some_and(|e| e.contains("闸门失败：测试命令退出码 1")),
+        "② 卡在哪一环（这一次调用的错误原文）：{evidence}"
+    );
+    assert_eq!(
+        evidence[1]["failed_run_context"]["run_id"].as_i64(),
+        Some(run_id),
+        "② 的现场必须是**那条 run 的**现场——「证据归错 run」与「没有证据」同判失败：{}",
+        evidence[1]
+    );
+    let pack_text = pack.as_str();
+    assert!(
+        pack_text.contains("gate-output-test.log"),
+        "③ 可复核的原始证据（落盘的那份闸门输出）：{pack_text}"
+    );
+    assert!(
+        pack_text.contains("cargo test --quiet"),
+        "③ 命令回执（谁跑的、跑的是什么）：{pack_text}"
+    );
+    // 归位判据也咬在结构上：模型请求台账那一节与失败现场**指向同一条 run**——两张不同的
+    // 脸都归到同一个 `run_id` 上，才算「四项说的是同一条 run」（实测里正是这一步错了）。
+    let requests = evidence[3]["model_requests"]["recent"]
+        .as_array()
+        .expect("模型请求那一节要在场（票 01 的归位面）");
+    assert!(
+        requests
+            .iter()
+            .any(|r| r["run_id"].as_i64() == Some(run_id)),
+        "这一次调用要归到那条 run 上（不是「最近有一次调用」）：{evidence}"
+    );
+    assert!(
+        requests
+            .iter()
+            .any(|r| r["prompt_tokens"].as_i64() == Some(1_234_567)),
+        "量速那一半（这一次调用烧掉多少）也要在场：{evidence}"
     );
 }

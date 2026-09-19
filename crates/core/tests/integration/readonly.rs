@@ -50,11 +50,16 @@ async fn fixture() -> Fixture {
 impl Fixture {
     /// 值班长那一侧的构造（域 = 家目录根 + `data/` 前缀拒）——与 `foreman_tooling` 同源。
     fn executor(&self, mode: EnvMode) -> ToolExecutor {
+        self.executor_with_killer(mode, Arc::new(RecordingKiller::new()))
+    }
+
+    /// 同 [`Fixture::executor`]，但交回终止器的把手——超时那条用例要看它有没有被叫到。
+    fn executor_with_killer(&self, mode: EnvMode, killer: Arc<RecordingKiller>) -> ToolExecutor {
         ToolExecutor::new(
             self._home.home().clone(),
             agentpipeline_core::agent::file_policy::foreman_file_policy(self._home.home().root()),
             Settings::default(),
-            Arc::new(RecordingKiller::new()),
+            killer,
         )
         .with_recorder(Arc::new(self.store.clone()))
         .with_env_mode(mode)
@@ -212,6 +217,31 @@ async fn arguments_cannot_leave_the_readonly_file_domain() {
         "密钥库要读不到：{denied:?}"
     );
 
+    // 带 `=` 的选项里那个值同样要过域（决策 232 的原文把「路径**与选项**」并列）：
+    // `--files0-from=/etc/passwd` 这种写法不判就漏了。
+    let option_path = executor
+        .execute(
+            &call("wc", serde_json::json!(["--files0-from=/etc/passwd"])),
+            &ctx,
+        )
+        .await
+        .wrap_err();
+    assert!(
+        matches!(option_path, Error::PolicyDenied(_)),
+        "选项里带的路径也要过域：{option_path:?}"
+    );
+    // 域内的那一半照常放行（判定收的是路径，不是「有没有 `=`」）。
+    let inside = executor
+        .execute(
+            &call(
+                "wc",
+                serde_json::json!(["--files0-from=logs/agentpipeline.log"]),
+            ),
+            &ctx,
+        )
+        .await;
+    assert!(inside.is_ok(), "域内的选项值不该被拒：{inside:?}");
+
     // 域**之外**的路径同样拒（含 `..` 穿越与绝对路径两种写法）。
     for path in ["../outside.txt", "/etc/hosts"] {
         let denied = executor
@@ -332,4 +362,61 @@ impl<T> WrapErr<T> for Result<T> {
             Err(e) => e,
         }
     }
+}
+
+/// 超时**要把进程组杀掉**（决策 66 / 票 17 的同一姿态）——这条从 `run_command` 那条路上
+/// 抽出来时曾经**漏在只读这一支**。
+///
+/// 为什么单列：`run_readonly` 原本是把 `run_command` 的那一段抄一遍，抄的时候少了一句
+/// 「超时后补一次 `kill_process_group`」。后果是取证命令超时之后进程组留到天荒地老——
+/// 而这份白名单里正好有 `sample`（能读走内存镜像的那一个）。现在两条路共用同一条管道
+/// （`run_child_to_outcome`），这条用例钉住「共用之后它真的在管道里」。
+#[tokio::test]
+async fn a_timed_out_readonly_command_kills_its_process_group() {
+    let f = fixture().await;
+    let killer = Arc::new(RecordingKiller::new());
+    let executor = f.executor_with_killer(EnvMode::Auto, killer.clone());
+    let mut ctx = f.ctx();
+    // 一条会一直挂着的白名单命令（`tail -f` 一个没人写的文件），超时给 1 秒。
+    let spin = f._home.home().root().join("quiet.log");
+    std::fs::write(&spin, "").unwrap();
+    ctx.stage = Stage::Test; // 无关紧要，只为让 timeout 走 test 那一档之外
+
+    let out = executor
+        .execute(
+            &ToolCall {
+                id: "c".into(),
+                name: "run_readonly".into(),
+                arguments: serde_json::json!({
+                    "command": "tail",
+                    "args": ["-f", spin.display().to_string()],
+                    "timeout_sec": 1
+                })
+                .to_string(),
+            },
+            &ctx,
+        )
+        .await
+        .unwrap();
+
+    assert!(
+        out.content.contains("命令超时"),
+        "超时要如实报出来，不是静默截断：{}",
+        out.content
+    );
+    // 两次：超时当时一次 + 收口时又确认一次（`run_command` 那一支原本就有两次，
+    // 抽管道时把它一并带过来了）。关键是**至少一次**，且 pgid 不是 0。
+    let killed = killer.killed_groups();
+    assert!(
+        !killed.is_empty(),
+        "超时必须杀进程组（这份白名单里有 sample，能读内存镜像的那个）"
+    );
+    assert!(
+        killed.iter().all(|pgid| *pgid > 0),
+        "杀的是真 pgid，不是 0（kill(0) 是 no-op）：{killed:?}"
+    );
+    // 台账要留下那一行（超时的命令也跑过）
+    let last = last_command(&f).await;
+    assert!(last.command.contains("tail"), "{}", last.command);
+    assert!(last.exit_code.is_none(), "超时的命令没有退出码可填");
 }

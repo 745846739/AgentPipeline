@@ -766,7 +766,13 @@ async fn run_config_tool(
             // + 这条校验。翻掉那个端点的替换语义要另立一条（决策 236 的「明确不做」）。
             //
             // 空对象 `{}` 是**显式清空**（它与「没带」分得开），故不想带旧值的人仍有一条明路。
-            if args.get("node_overrides_json").is_none() {
+            // 显式 `null` 与「没带」按同一件事处理：两者在 `PutStageConfig` 里都反序列化成
+            // `None`（整条替换下都是「清成默认」），故守卫必须一起罩住——只判 `is_none()`
+            // 的话，写一个 `null` 就绕过去了。
+            let carries_overrides = args
+                .get("node_overrides_json")
+                .is_some_and(|v| !v.is_null());
+            if !carries_overrides {
                 let overridden_nodes = state
                     .store
                     .get_stage_config(&stage)

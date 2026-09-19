@@ -17,7 +17,6 @@ import {
   noteForeignDelta,
   pruneForeignActive,
   settleForemanStream,
-  attributionLabel,
   FOREMAN_ATTRIBUTION_MARK,
   FOREMAN_FAILED_TURN_MARK,
 } from './foreman';
@@ -312,19 +311,8 @@ describe('别的班次「正在回话」（决策 220③）', () => {
  * 判据，画一个「未定位」的标签会让人以为那也是一类）。
  */
 describe('归因类别标记（票 03）', () => {
-  it('四类各一个词', () => {
-    expect(attributionLabel('host')).toBe('宿主环境');
-    expect(attributionLabel('pipeline')).toBe('流水线运行');
-    expect(attributionLabel('project_code')).toBe('目标项目代码');
-    expect(attributionLabel('prompt_config')).toBe('prompt 与配置');
-  });
-
-  it('未定位与缺值都不给词：不编一个假的类别', () => {
-    for (const value of ['unlocated', '', null, undefined, 'unknown_thing']) {
-      expect(attributionLabel(value)).toBeNull();
-    }
-  });
-
+  // 词表**只有一份**（后端的 `AttributionKind::label`）：界面拿 `attribution_label` 直接渲染，
+  // 故这里只钉哨兵这个镜像常量（e2e 的 mock 回话要照它写）。
   it('哨兵与后端同源（原样镜像）', () => {
     // 后端那一份在 `crates/core/src/pipeline/foreman.rs::FOREMAN_ATTRIBUTION_MARK`。
     expect(FOREMAN_ATTRIBUTION_MARK).toBe('【归因】');

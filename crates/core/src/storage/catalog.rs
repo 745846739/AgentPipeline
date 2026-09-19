@@ -120,12 +120,10 @@ impl StageConfigRow {
                 .env_mode
                 .as_deref()
                 .and_then(crate::types::EnvMode::parse),
-            // 手工改坏的负数 / 0 一律当「没配过」：这一列是观测性配置，读不出来时退到缺省
-            // 比让整张表报错更划算（写入路径已经只收正整数）。
-            max_rounds: self
-                .max_rounds
-                .and_then(|v| u32::try_from(v).ok())
-                .filter(|v| *v > 0),
+            // 手工改坏的**负数**当「没配过」（`u32` 装不下它，而写入路径已经拒过）；
+            // **`0` 照原样带出去**——它不许被静默当成缺省：`validate_startup` 要拿它拒绝启动
+            // （决策 239：`0` 既不是「无上限」，也不是「没配过」）。
+            max_rounds: self.max_rounds.and_then(|v| u32::try_from(v).ok()),
             updated_at: parse_ts(&self.updated_at)?,
         })
     }

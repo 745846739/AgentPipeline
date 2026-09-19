@@ -225,26 +225,9 @@ export const FOREMAN_WATCH_MARK = '【值守播报】';
  */
 export const FOREMAN_ATTRIBUTION_MARK = '【归因】';
 
-/**
- * 归因类别 → 界面上那个词（决策 235①：播报那一轮显示类别标记，四类各一个词）。
- *
- * `unlocated` 与缺值都返回 `null`：**不编一个假的类别**——「没给出类别」本身就是判据
- * （决策 230 的第四项），界面把它画成一个类别会把这个事实抹掉。
- */
-export function attributionLabel(kind: string | null | undefined): string | null {
-  switch (kind) {
-    case 'host':
-      return '宿主环境';
-    case 'pipeline':
-      return '流水线运行';
-    case 'project_code':
-      return '目标项目代码';
-    case 'prompt_config':
-      return 'prompt 与配置';
-    default:
-      return null;
-  }
-}
+// 归因类别 → 界面上那个词**不在前端映射**：后端解析结构块之后把它翻好的
+// `attribution_label` 一并下发（词表只有一份：`AttributionKind::label`）。前端再写一份的
+// 下场是两个词表迟早不一致，而「四类各一个词」是同一件事。
 
 /** 台账里一行带 id 的轮次（只取判据要用的三列）。 */
 export interface LedgerRow {
