@@ -1,7 +1,16 @@
 # `run_command` 的权限模式（run-command-permissions）
 
-**状态（2026-09-17）：四张票均未开工。** 权限模式的档位字段、环境层的那道闸、值班长的命令接线、
-文档与残余风险登记都还没有落地；`run_command` 对值班长仍然不可用。
+**状态（2026-09-20）：四张票全部落地。** 权限模式的档位字段、环境层的那道闸、值班长的命令接线、
+文档与残余风险登记都已落地（决策 206 / 207），`run_command` 对值班长可用——**每次先变成提议、
+等人按下确认钮**。落点：`crates/core/src/types.rs` 的 `EnvMode`（auto / ask / deny）、
+`crates/core/src/agent/tools.rs::gate_decision`（执行 / 提议 / 拒绝三分支）、
+迁移 `crates/core/src/storage/migrations/0016_env_mode.sql`、
+前端 `frontend/src/components/settings/StageConfigForm.svelte` 的档位下拉。
+
+> **（2026-09-20 订正）** 本行原文写的是「四张票均未开工」，与票面矛盾——票 01–04 的
+> `**Status:**` 都是 `done`，且实现随提交 `2aec356`（2026-09-17「三层写工具面 + 提议确认钮 +
+> 环境层三档」，决策 188 / 206 / 207）一并交付。原文那句已作废。教训：**README 的状态行由人写、
+> 会漂；票级 `**Status:**` 与代码在不在才是判据。**
 
 
 裁决（决策 206）：`run_command` 与文件工具这类**环境层**能力按档位走（`auto` / `ask` / `deny`），

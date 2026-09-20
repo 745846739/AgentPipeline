@@ -1,6 +1,12 @@
 # 前端像素主题替换（agentpipeline-pixel-theme）
 
-**Status:** ready-for-agent
+**Status:** done（2026-09-20 订正）——13 张票全部落地，票级 `**Status:**` 均为 `done（2026-09-14）`。
+落点：提交 `612cc07`（参照物冻结点）→ `b251817`（升格为现行视觉规格）→ `12addd6`（主题契约 + token + 字体自托管）
+→ `fc5f663`（全站像素控件）→ `fb9a47e`（移动版转写）→ `8e1ae04`（全量 e2e + 真应用截图）。
+自托管字体在 `frontend/public/fonts/fusion-pixel-12px/`，主题三已归档到 `design/deprecated/theme-3-terminal.md`。
+
+> **（2026-09-20 订正）** 本行原文是 `ready-for-agent`，属**过期状态**（该 effort 早已落地，
+> 见 `docs/decisions.md` 决策 169 与上列提交）。判据：票级 `**Status:**` 全 done + 代码/资产在位。
 
 来源：2026-09-13 用户诉求「把本项目前端替换成像素主题」。规格见 [spec.md](spec.md)。
 
