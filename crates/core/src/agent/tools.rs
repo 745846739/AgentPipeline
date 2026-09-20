@@ -2249,6 +2249,10 @@ async fn latest_attribution(store: &Store, ctx: &ToolCallContext) -> Result<serd
         "at": last.created_at.to_rfc3339(),
         "attribution": parsed.wire(),
         "label": parsed.kind().map(|k| k.label()),
+        // 上一轮**自己指名的那条 run**（决策 230 判据①的校验面）：读它的这一方据此对账
+        // 「回话说的是哪条 run」与「证据挂在哪条 run」——两者不一致就是「证据归错 run」，
+        // 而那种形状在 2026-09-19 出现过一次，当时没有任何读数看得出来。
+        "run_id": parsed.run_id(),
         // 未定位时给原因（missing / 四类之外 / …）：**「上一轮我没给出类别」本身是要看见的
         // 事实**，不是要抹掉的痕迹（决策 230 把「没有证据」与「证据归错 run」同判失败）。
         "reason": parsed.reason(),

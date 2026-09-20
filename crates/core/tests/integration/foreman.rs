@@ -2057,6 +2057,12 @@ async fn the_system_prompt_tells_the_truth_about_what_it_can_do_in_each_tier() {
             "system prompt 要给出结构块的形状：{prompt}"
         );
         assert!(prompt.contains("四类之外不许收口"), "{prompt}");
+        // 判据①的要求与判据④同批写进规格：只给类别不给 run，「这条证据是哪条 run 的」
+        // 就只能靠行文猜——2026-09-19 正是这么归错的（决策 230）。
+        assert!(
+            prompt.contains("run_id") && prompt.contains("报错 run 与没有 run 同判未定位"),
+            "规格要一并说清 run_id（判据①的校验面）：{prompt}"
+        );
         for kind in AttributionKind::ALL {
             assert!(
                 prompt.contains(kind.as_str()) && prompt.contains(kind.label()),
@@ -3414,7 +3420,10 @@ mod attribution {
                 format!("它卡在 test.execute 上。\n【归因】{{\"attribution\":\"{written}\"}}\n");
             assert_eq!(
                 parse_attribution(&text),
-                Attribution::Located(expected),
+                Attribution::Located {
+                    kind: expected,
+                    run_id: None,
+                },
                 "写的是 {written}"
             );
         }
@@ -3481,7 +3490,10 @@ mod attribution {
                       【归因】{\"attribution\":\"pipeline\"}\n";
         assert_eq!(
             parse_attribution(inline),
-            Attribution::Located(AttributionKind::Pipeline)
+            Attribution::Located {
+                kind: AttributionKind::Pipeline,
+                run_id: None,
+            }
         );
         // 两处互相矛盾：自相矛盾不是结论。
         let contradictory =
@@ -3498,8 +3510,70 @@ mod attribution {
             "【归因】{\"attribution\":\"host\"}\n【归因】{\"attribution\":\"宿主环境\"}\n";
         assert_eq!(
             parse_attribution(repeated),
-            Attribution::Located(AttributionKind::Host)
+            Attribution::Located {
+                kind: AttributionKind::Host,
+                run_id: None,
+            }
         );
+    }
+
+    /// 判据①的校验面：回话**自己指名的 run**（决策 230 的「证据归错 run 与没有证据同判失败」）。
+    ///
+    /// 2026-09-19 那次翻车的形状是「行文与类别都合规、只是把 run 27 的活栈记在 run 26 名下」，
+    /// 而当时没有任何断言拦得住它——因为结构块里只有一个类别字段，装不下「这次说的是哪条 run」。
+    #[test]
+    fn a_named_run_travels_with_the_category() {
+        assert_eq!(
+            parse_attribution("【归因】{\"attribution\":\"pipeline\",\"run_id\":27}\n"),
+            Attribution::Located {
+                kind: AttributionKind::Pipeline,
+                run_id: Some(27),
+            }
+        );
+        // 指不出单条 run 的播报（任务级态势）**不写**就是诚实的：不逼它编一个数。
+        assert_eq!(
+            parse_attribution("【归因】{\"attribution\":\"pipeline\"}\n").run_id(),
+            None
+        );
+        assert_eq!(
+            parse_attribution("【归因】{\"attribution\":\"pipeline\",\"run_id\":null}\n").run_id(),
+            None
+        );
+        // 两处类别一致而 run 不同：**那不是复述，是两处互相矛盾**——正是要拦的形状。
+        assert!(matches!(
+            parse_attribution(
+                "【归因】{\"attribution\":\"host\",\"run_id\":26}\n\
+                 【归因】{\"attribution\":\"host\",\"run_id\":27}\n"
+            ),
+            Attribution::Invalid {
+                why: "多处自相矛盾",
+                ..
+            }
+        ));
+        // 一字不差地重复同一处（含同一个 run）仍是复述。
+        assert_eq!(
+            parse_attribution(
+                "【归因】{\"attribution\":\"host\",\"run_id\":26}\n\
+                 【归因】{\"attribution\":\"host\",\"run_id\":26}\n"
+            )
+            .run_id(),
+            Some(26)
+        );
+        // `0` / 负数 / 字符串都判非法：`0` 在库里同样是「没有锚点」的值，照单全收会把
+        // 「按 run 对账」变成一个假读数（与决策 231 的哨兵归一同一姿态）。
+        for bad in ["0", "-3", "\"27\"", "1.5", "true"] {
+            let text = format!("【归因】{{\"attribution\":\"pipeline\",\"run_id\":{bad}}}\n");
+            assert!(
+                matches!(
+                    parse_attribution(&text),
+                    Attribution::Invalid {
+                        why: "run_id 不是正整数",
+                        ..
+                    }
+                ),
+                "写的是 {bad}"
+            );
+        }
     }
 
     #[test]
@@ -3525,13 +3599,13 @@ async fn the_diagnosis_pack_carries_the_last_attribution() {
     park_task(&h.store, "t1", PendingKind::RetryExhausted, "重试耗尽").await;
 
     let mut script = Script::new();
-    script
-        .for_foreman()
-        .text("它卡在 open() 上，是宿主环境拦的。\n【归因】{\"attribution\":\"host\"}\n");
+    script.for_foreman().text(
+        "它卡在 open() 上，是宿主环境拦的。\n【归因】{\"attribution\":\"host\",\"run_id\":41}\n",
+    );
     script.for_foreman().read_diagnosis("t1");
     script
         .for_foreman()
-        .text("结论同上。\n【归因】{\"attribution\":\"host\"}\n");
+        .text("结论同上。\n【归因】{\"attribution\":\"host\",\"run_id\":41}\n");
     let agent = FakeAgent::new(script);
     let runner = h.runner(agent.clone());
 
@@ -3556,6 +3630,11 @@ async fn the_diagnosis_pack_carries_the_last_attribution() {
     assert!(
         fed_back.contains("宿主环境"),
         "给人看的那个词也要在（模型读得懂中文词）：{fed_back}"
+    );
+    // 判据① 的复查面：上一轮指名的 run 也带出来，下一轮才能拿它与台账对账（决策 230）。
+    assert!(
+        fed_back.contains("\"run_id\": 41"),
+        "上一轮指名的 run 要带出来：{fed_back}"
     );
 }
 
@@ -3588,6 +3667,10 @@ async fn a_missing_attribution_reads_as_unlocated_in_the_pack() {
     assert!(
         fed_back.contains("\"reason\": \"missing\""),
         "原因要分得开（missing 与四类之外不是一回事）：{fed_back}"
+    );
+    assert!(
+        fed_back.contains("\"run_id\": null"),
+        "没定下来时也没有 run 可指，读数是 null 而不是编一个：{fed_back}"
     );
 }
 
@@ -4084,11 +4167,14 @@ async fn one_watch_round_closes_all_four_criteria_on_the_same_run() {
     let mut script = Script::new();
     script.for_foreman().read_diagnosis("t1");
     // 回话：① run 身份 ② 卡在哪一环 ③ 原始证据 ④ 归因类别（机器可读的一段）。
-    script.for_foreman().text(
-        "run tid-1 卡在 test.execute 这一次调用上：闸门退出码 1，\
+    // ① 与 ④ 落在**同一行**上：类别说的是哪一类问题，`run_id` 说这条证据是哪一条 run 的——
+    // 判据①的校验面就在这里（决策 230 把「证据归错 run」与「没有证据」同判失败）。
+    let reply = format!(
+        "run {run_id} 卡在 test.execute 这一次调用上：闸门退出码 1，\
          见 gate-output-test.log（命令台账里的 `cargo test --quiet`）。\n\
-         【归因】{\"attribution\":\"project_code\"}\n",
+         【归因】{{\"attribution\":\"project_code\",\"run_id\":{run_id}}}\n"
     );
+    script.for_foreman().text(&reply);
     let agent = FakeAgent::new(script);
     let runner = h.runner(agent.clone());
 
@@ -4113,10 +4199,15 @@ async fn one_watch_round_closes_all_four_criteria_on_the_same_run() {
         "播报那一轮的前缀不能丢：{}",
         broadcast.content
     );
+    // 判据①：回话指名的 run 必须与**证据实际挂在的那条 run** 是同一条。这条断言在
+    // 2026-09-19 那次是缺的——当时回话把 run 27 的活栈记在 run 26 名下，行文与类别都合规。
     assert_eq!(
         parse_attribution(&broadcast.content),
-        Attribution::Located(AttributionKind::ProjectCode),
-        "④ 归因类别要在播报那一轮里给出，且四类之内：{}",
+        Attribution::Located {
+            kind: AttributionKind::ProjectCode,
+            run_id: Some(run_id),
+        },
+        "④ 归因类别要在播报那一轮里给出（四类之内），且 ① 它指名的 run 就是证据那条 run：{}",
         broadcast.content
     );
 

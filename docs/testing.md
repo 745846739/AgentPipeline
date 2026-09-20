@@ -193,12 +193,23 @@ workspace 成员 `crates/testkit`，供 L2 / L4 复用：
   → 报「命令超时」+ 终止器被叫到 + pgid 非 0；这条是抽公共管道时补的回归——原先只读那一支抄
   `run_command` 时漏了这句，超时的取证进程会留到天荒地老，而白名单里有 `sample`）/
   `deny` 档照旧广告照旧执行（它改不了任何东西，故不归档位管）。冻结断言按决策 209 的次序**先改后加**。
-- **归因结构块（决策 235 / 238，票 03）**：`foreman::attribution` **5 条**（稳定标识与中文词都认 /
-  没给与不可用分开记 / 四类之外不收口 / 重复与自相矛盾都不收口 / 行内提及不算块）+
+- **归因结构块（决策 235 / 238，票 03；判据①的校验面见下）**：`foreman::attribution` **6 条**（稳定标识与中文词都认 /
+  没给与不可用分开记 / 四类之外不收口 / 重复与自相矛盾都不收口 / 行内提及不算块 /
+  **指名的 run 与类别同批走**——`a_named_run_travels_with_the_category`：正整数带上、
+  缺省与 `null` 都是「没指名」、`0` / 负数 / 字符串 / 小数 / 布尔都判 `run_id 不是正整数`、
+  **两处类别一致而 run 不同判「多处自相矛盾」**）+
   `app::api_contract::the_session_wire_carries_the_parsed_attribution`（解析点在后端，
   界面拿 `attribution` + `attribution_label`，未定位给 `unlocated` 而不是编一个类别）+
   `frontend/src/realtime/foreman.test.ts` 3 条（四类各一个词、未定位 **不给词**）+ 诊断包带出
-  「最近一次的归因类别」两条（定位成功与未定位各一）。
+  「最近一次的归因类别」两条（定位成功与未定位各一；定位成功那条另钉 `run_id` 与类别
+  一并带出，未定位那条钉它是 `null`——**判据①在下一轮可对账**）。
+
+**判据①「哪一个 run」的落点（2026-09-19 实测补，决策 230）**：`parse_attribution` 把
+`run_id` 与类别**绑在同一行结构块**上校验，`latest_attribution` 把它带进诊断包，
+`foreman::one_watch_round_closes_all_four_criteria_on_the_same_run` 在**播报轮端到端**钉住
+「回话指名的 run 就是证据实际挂的那条 run」（回话按真实的 `run_id` 拼，断言拿它与结构块比对）
+——这一条此前是空的：2026-09-19 那次回话把 run 27 的活栈记在 run 26 名下，
+行文、引用格式与类别**全都合规**，没有任何断言拦得住它。
 - **`node_overrides` 的读法（决策 236，票 04）**：`foreman::read_stage_configs_echoes_the_node_overrides`
   （回显带 `node_overrides_json` / `persona_append` / `env_mode`）+
   `api_contract::a_config_set_that_would_drop_node_overrides_is_refused`（**工具那一侧**的校验：

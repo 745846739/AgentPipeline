@@ -1833,10 +1833,22 @@ impl AttributionKind {
 /// **「根本没给」与「四类之外」由这一个解析点判出**（决策 238）：两条都算**未定位**，
 /// 因为对判据（决策 230 的第四项）而言它们是同一件事——这一次收口没有可校验的归因类别。
 /// 分开记的是原因，不是结论。
+///
+/// **`run_id` 是判据①的校验面**（决策 230 的「证据归错 run 与没有证据同判失败」）：
+/// 类别单独一个字段装不下「这次说的是哪条 run」，而 09-19 翻车的正是这一件——回话读起来
+/// 毫无破绽、类别也合规，只是把 run 27 的活栈记在了 run 26 名下，而**没有任何断言拦得住**。
+/// 故结构块同时带 `run_id`：它让「回话说的是哪条 run」与「证据说的是哪条 run」可比。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Attribution {
     /// 定位成功：给出了四类之一。
-    Located(AttributionKind),
+    Located {
+        kind: AttributionKind,
+        /// 回话自己指名的 run（判据①）。**可以为空**：不是每条播报都针对某一条 run
+        /// （「无需处理」、或一次说的是任务级态势），而那种情况下「没指名」是诚实的，
+        /// 不该被逼着编一个数。校验交给读它的那一方（诊断包的 `latest_attribution`
+        /// 与总闸用例），这里只如实带出。
+        run_id: Option<i64>,
+    },
     /// 没给结构块（回话里一行哨兵都没有）。
     Missing,
     /// 给了但不可用：四类之外 / 缺 `attribution` / JSON 坏了 / 多处自相矛盾。
@@ -1846,14 +1858,22 @@ pub enum Attribution {
 impl Attribution {
     pub fn kind(&self) -> Option<AttributionKind> {
         match self {
-            Attribution::Located(kind) => Some(*kind),
+            Attribution::Located { kind, .. } => Some(*kind),
+            _ => None,
+        }
+    }
+
+    /// 回话明确指名的 run（判据①）。未定位或没指名时是 `None`。
+    pub fn run_id(&self) -> Option<i64> {
+        match self {
+            Attribution::Located { run_id, .. } => *run_id,
             _ => None,
         }
     }
 
     /// 这一次收口算不算「定位成功」的那一项（决策 230 判据④）。
     pub fn is_located(&self) -> bool {
-        matches!(self, Attribution::Located(_))
+        matches!(self, Attribution::Located { .. })
     }
 
     /// 线上 / 界面用的串：四类之一，或 `unlocated`（**不编一个假的类别**）。
@@ -1864,7 +1884,7 @@ impl Attribution {
     /// 未定位时的原因串（定位成功时为 `None`）——给排查看，不给界面当类别使。
     pub fn reason(&self) -> Option<&'static str> {
         match self {
-            Attribution::Located(_) => None,
+            Attribution::Located { .. } => None,
             Attribution::Missing => Some("missing"),
             Attribution::Invalid { why, .. } => Some(why),
         }
@@ -1897,7 +1917,10 @@ pub fn parse_attribution(text: &str) -> Attribution {
     if payloads.is_empty() {
         return Attribution::Missing;
     }
-    let mut located: Option<AttributionKind> = None;
+    // 类别与它自己指名的 run 同批记：**两处「类别一致但 run 不同」是矛盾**（一处说
+    // run 26、一处说 run 27），而只比类别会把这种形状当成「复述同一件事」放过去——
+    // 那正是 09-19 那次回话的形状（决策 230 判据①）。
+    let mut located: Option<(AttributionKind, Option<i64>)> = None;
     for payload in payloads {
         let truncated =
             || crate::storage::observability::truncate_text(payload, ATTRIBUTION_PAYLOAD_MAX_CHARS);
@@ -1919,9 +1942,26 @@ pub fn parse_attribution(text: &str) -> Attribution {
                 why: "四类之外",
             };
         };
+        // 判据① 的校验面：`run_id` 与类别同批给。**它不是必填**（有的播报说的是任务级态势，
+        // 指不出单条 run），但一旦给了就必须是正整数——给个字符串或 0 会把「按 run 对账」
+        // 这件事悄悄变成一个假读数（0 在库里同样是锚点值，与决策 231 的哨兵归一同一姿态）。
+        let run_id = match value.get("run_id") {
+            None | Some(serde_json::Value::Null) => None,
+            Some(v) => match v.as_i64() {
+                Some(id) if id > 0 => Some(id),
+                _ => {
+                    return Attribution::Invalid {
+                        payload: truncated(),
+                        why: "run_id 不是正整数",
+                    }
+                }
+            },
+        };
         match located {
-            None => located = Some(kind),
-            Some(previous) if previous == kind => {}
+            None => located = Some((kind, run_id)),
+            Some((previous, previous_run)) if previous == kind && previous_run == run_id => {}
+            // 类别一致但 run 不同：**那不是复述，是两处互相矛盾**——正是要拦的形状
+            // （一处说 run 26、一处说 run 27，两处都「合规」，合起来是错的）。
             Some(_) => {
                 return Attribution::Invalid {
                     payload: truncated(),
@@ -1931,7 +1971,7 @@ pub fn parse_attribution(text: &str) -> Attribution {
         }
     }
     match located {
-        Some(kind) => Attribution::Located(kind),
+        Some((kind, run_id)) => Attribution::Located { kind, run_id },
         None => Attribution::Missing,
     }
 }
@@ -1951,10 +1991,13 @@ fn attribution_discipline() -> String {
         "\n## 播报的归因（必填）\n\
          每一次**播报**（值守轮，以及你回答「哪里出了什么问题」时）末尾都要单独一行给出归因类别，\n\
          机器可读，照这个形状写：\n\
-         {FOREMAN_ATTRIBUTION_MARK}{{\"attribution\":\"host\"}}\n\
+         {FOREMAN_ATTRIBUTION_MARK}{{\"attribution\":\"host\",\"run_id\":123}}\n\
          取值只能是这四类之一：{choices}。\n\
          四类之外不许收口：写别的词等于没给。四类的证据面、修法、授权各不相同——\n\
-         「我不知道是什么问题」不是结论，宁可用一条证据把范围收到最像的那一类并说清还缺什么。\n"
+         「我不知道是什么问题」不是结论，宁可用一条证据把范围收到最像的那一类并说清还缺什么。\n\
+         说某一条 run 时**同时带上它的 id**（`run_id`，正整数，取台账里的那一行）：\n\
+         你采到的证据是**哪一条 run 的**，写在别处没人对得了账——报错 run 与没有 run 同判未定位。\n\
+         说的若是任务级态势、指不出单条 run，就**不写** `run_id`（不写是诚实的，编一个数不是）。\n"
     )
 }
 
