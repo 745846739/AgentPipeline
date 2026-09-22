@@ -198,7 +198,9 @@
 </script>
 
 <main class="page">
-  <a class="crumb" href="#/">← 看板</a>
+  <!-- 返回**父级**（design §4.3 / 决策 240）：原先这里挂的是「← 看板」，而看板已是顶栏
+       的一枚页签——设置子页该给的是回落地页的那条路，与阶段配置页同一口径。 -->
+  <a class="crumb" href="#/settings">← 设置</a>
   <div class="p-head">
     <h1 class="p-title">设置 · 项目</h1>
     <button type="button" class="btn solid" onclick={openNew}>＋ 新建项目</button>

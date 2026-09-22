@@ -2,13 +2,16 @@
   import { onMount } from 'svelte';
   import {
     deleteStageConfig,
+    installSkillForStage,
     listProviders,
+    listRecommendedSkills,
     listSkills,
     listStageConfigs,
     putStageConfig,
   } from '../api/client';
-  import type { Provider, SkillSummary, StageConfig } from '../api/types';
+  import type { Provider, RecommendedStage, SkillPreview, SkillSummary, StageConfig } from '../api/types';
   import StageConfigForm from '../components/settings/StageConfigForm.svelte';
+  import StageRecommendations from '../components/settings/StageRecommendations.svelte';
   import EmptyState from '../components/ui/EmptyState.svelte';
   import {
     buildStageConfigPut,
@@ -49,6 +52,47 @@
   let providers = $state<Provider[]>([]);
   let skills = $state<SkillSummary[]>([]);
 
+  /* ── 推荐技能与一键安装（决策 172①④，票 15 / 16）──
+     这块原挂在「模型与密钥」页，但按落地页的分类判据（design §4.3）它属「每个阶段带哪些
+     技能」——面板按阶段分组、一键安装就是把「落技能根 + 写进该阶段配置」合成一步，
+     与本页管的事是同一件，故随阶段配置落在这一页（决策 198 裁决③的收尾）。 */
+  let recommendations = $state<RecommendedStage[]>([]);
+  /** 正在安装的 `阶段:技能名`（按钮上的转圈与禁用）。 */
+  let installing = $state<string | null>(null);
+  let skillError = $state<string | null>(null);
+  /** 最近一次一键安装带回来的三项预览（票 11）。 */
+  let installPreview = $state<SkillPreview | null>(null);
+
+  async function loadRecommendations() {
+    try {
+      recommendations = await listRecommendedSkills();
+    } catch (err) {
+      // 推荐清单是锦上添花，取不到就整块不显示（票 16：技能不存在时界面降级）
+      skillError = (err as Error).message;
+      recommendations = [];
+    }
+  }
+
+  /**
+   * 一键安装：装技能 + 写该阶段配置一步完成（票 16）。
+   *
+   * 失败原因由后端分类给出（技能不存在 / 摘要不符 / 来源未放行 / 网络失败），原样回显。
+   * 成功时把 `preview` 交给推荐面板——特征命中当场可见，这是「不绕过票 11 预览」的落点。
+   */
+  async function installRecommended(stage: string, name: string) {
+    installing = `${stage}:${name}`;
+    skillError = null;
+    try {
+      const result = await installSkillForStage(stage, name);
+      installPreview = result.preview;
+      await loadRecommendations();
+    } catch (err) {
+      skillError = (err as Error).message;
+    } finally {
+      installing = null;
+    }
+  }
+
   async function load() {
     loading = true;
     error = null;
@@ -77,6 +121,7 @@
   onMount(() => {
     void load();
     void loadCandidates();
+    void loadRecommendations();
   });
 
   function openNew() {
@@ -129,9 +174,9 @@
 
 <main class="page">
   <div class="crumbs">
-    <!-- 设置子页给一条回落地页的路（design §4.3），与既有的「← 看板」并列 -->
+    <!-- 设置子页给一条回落地页的路（design §4.3）。原先与它并列的「← 看板」由决策 240 摘除：
+         看板是顶栏的一枚页签，不必每页再代递一次。 -->
     <a class="crumb" href="#/settings" onclick={() => router.navigate('/settings')}>← 设置</a>
-    <a class="crumb" href="#/" onclick={() => router.navigate('/')}>← 看板</a>
   </div>
   <div class="p-head">
     <h1 class="p-title">设置 · 阶段配置</h1>
@@ -234,6 +279,15 @@
       </ul>
     </div>
   {/if}
+
+  <!-- 推荐技能与一键安装（决策 172①，票 16）：清单来自内置常量，装进来的技能默认未受信任。 -->
+  <StageRecommendations
+    stages={recommendations}
+    busy={installing}
+    preview={installPreview}
+    oninstall={installRecommended}
+  />
+  {#if skillError}<div class="error skills-error">{skillError}</div>{/if}
 </main>
 
 <style>
@@ -275,5 +329,14 @@
   /* 伪阶段用左缘 4px --text-3 亮度阶 + 名称后缀「（伪阶段）」，不用分支色相 */
   .row.pseudo {
     border-left: 4px solid var(--text-3);
+  }
+  /* 推荐清单的失败提示：不挡整页，只提示那一块降级了 */
+  .skills-error {
+    margin-bottom: 14px;
+    padding: 8px 10px;
+    border: 2px solid var(--stop);
+    color: var(--stop);
+    font-size: 12px;
+    line-height: 1.6;
   }
 </style>

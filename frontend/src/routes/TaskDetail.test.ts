@@ -289,7 +289,7 @@ describe('任务详情 · 页签语义与标题层级（票 06 / R2-19 / R2-20�
 });
 
 describe('任务详情 · 空态（票 13）', () => {
-  it('任务不存在时给一条可点的回看板的路', async () => {
+  it('任务不存在时说清状态与下一步，且不再自带一条回看板的链（决策 240）', async () => {
     mocks.detail.state = emptyTaskDetailState();
     mocks.detail.diff = null;
     mocks.detail.diffRaw = null;
@@ -298,8 +298,10 @@ describe('任务详情 · 空态（票 13）', () => {
     mocks.detail.errorStatus = null;
     render(TaskDetail, { props: { id: 'nope' } });
 
-    const back = screen.getByRole('link', { name: /回看板/ });
-    expect(back.getAttribute('href')).toBe('#/');
+    // 状态一行说清是什么（这一步是「没读到」，故说的是「没能打开」；下一步照旧给）
+    expect(screen.getByText(/任务(不存在|没能打开)：nope/)).toBeTruthy();
+    // 看板入口**只在顶栏那一枚页签上**（决策 240），本页不再代它递一次
+    expect(screen.queryByRole('link', { name: /看板/ })).toBeNull();
   });
 });
 

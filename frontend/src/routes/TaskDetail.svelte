@@ -272,8 +272,8 @@
   style="--dock-h: {dockH > 0 ? `${dockH}px` : '122px'}"
 >
   <div class="main">
-    {#if !isMobile}<a class="crumb" href="#/">← 看板</a>{/if}
-
+    <!-- 桌面档原先在这里挂一条「← 看板」面包屑（决策 240 摘除）：看板已是顶栏的一枚页签，
+         详情不必再代它递一次入口。这一行因此直接进正文，`<h1>` 仍是本页唯一的标题。 -->
     {#if task && taskDetail.error}
       <!-- 后台对齐（refetch）失败：内容还在，只把「这次没刷新上」挂出来。
            没有 task 的那一态（进页面 / 换 id 失败）由下面的空分支自己说，
@@ -304,7 +304,6 @@
     {#if task}
       {#if isMobile}
         <div class="bar-row">
-          <a class="back" href="#/">← 看板</a>
           <h1 class="d-title bt">{task.title}</h1>
           <!-- 标题行只放短码（原型 `.bar-row` 写 WAIT / RUN）：完整状态句在下一行
                `.dmeta` 里，两处都写全句会让同一件事在屏上出现两遍并挤掉标题 -->
@@ -494,18 +493,16 @@
     {:else if taskDetail.loading}
       <div class="hint">正在加载任务…</div>
     {:else}
-      <!-- 打不到任务也是一种空态（票 13）：状态 → 下一步 → 可选入口，入口必须可点。
-           失败态再给一条「重新加载」（票 01 / R2-01）——首次加载失败在服务器恢复后
-           不会自愈（流没接上，visibility 恢复遍历的是空连接表），没有这颗钮就是永久死页。
-           「这个 id 没有」与「没读到」分开说：前者重试无意义，后者重试是唯一的出路。
-           失败原因单独一行并进 live region（票 02 / R2-06）——读屏也要听得到。 -->
+      <!-- 打不到任务也是一种空态（票 13）：状态 → 下一步（入口由决策 240 摘除——回看板走顶栏
+           那枚页签，这里不再自带一条）。失败态再给一条「重新加载」（票 01 / R2-01）——首次加载
+           失败在服务器恢复后不会自愈（流没接上，visibility 恢复遍历的是空连接表），没有这颗钮
+           就是永久死页。「这个 id 没有」与「没读到」分开说：前者重试无意义，后者重试是唯一的
+           出路。失败原因单独一行并进 live region（票 02 / R2-06）——读屏也要听得到。 -->
       <EmptyState
         state={notFound ? `任务不存在：${id}` : `任务没能打开：${id}`}
         next={notFound
           ? '这个 id 没有对应的任务。它可能已经被删掉，或者地址抄漏了一位。'
           : '没能读到这个任务。'}
-        href="#/"
-        linkLabel="回看板"
       />
       {#if taskDetail.error}
         <div class="banner error" role="alert">{taskDetail.error}</div>
@@ -786,7 +783,7 @@
       max-width: var(--detail-max);
     }
 
-    /* 标题行：返回 + 标题 + 状态标记 */
+    /* 标题行：标题 + 状态标记（原先还有一颗「← 看板」返回链，决策 240 摘除，`.back` 随之删） */
     .bar-row {
       display: flex;
       align-items: center;
@@ -795,18 +792,6 @@
       padding: 0 12px;
       margin: 0 -12px;
       border-bottom: 2px solid var(--hairline);
-    }
-    .back {
-      flex: none;
-      display: inline-flex;
-      align-items: center;
-      min-height: 42px;
-      color: var(--text-3);
-      font-size: 12px;
-    }
-    .back:hover {
-      color: var(--text-hi);
-      text-decoration: none;
     }
     .d-title.bt {
       flex: 1;

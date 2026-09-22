@@ -8,6 +8,10 @@
  * `/settings/projects` · `/settings/providers` · `/settings/stages` · `/settings/market` · `/metrics` · `/share`
  * （票 22 / 决策 167 / 决策 187 / 决策 198）
  *
+ * **开屏默认是对讲台（决策 241）**：地址栏**没写 hash**（`''` / `#`）时，进 store 之前先归一成
+ * `#/talk`（见 `normalizeBareHash`）。「默认落点」问的是**什么都不指定时去哪儿**，所以它只接管
+ * **空地址**：显式 `#/` 照旧解析成看板——决策 240 的「看板是根路由」与 §4.2 的四枚页签一个字不动。
+ *
  * **查询串（`?k=v`）解析出 `query`，两个跨流入口的 key 名是契约的一部分**
  * （`parallel-brief.md` §二 的跨流接口表与 `design/frontend-design.md` §4.5，别改名）：
  *
@@ -113,6 +117,33 @@ class RouterStore {
     window.location.hash = next;
   }
 }
+
+/**
+ * 开屏默认落点（决策 241）：地址栏还没写 hash 时，把它归一成 `#/talk`（对讲台）。
+ *
+ * **住模块这一层、不在 `main.ts`**：`router` store 由 `App.svelte` 的 import 链先初始化
+ * （ES 导入先于 `main.ts` 的语句体执行）。等 `main.ts` 再改就晚一拍——store 已经按空 hash
+ * 读出「看板」，而 `replaceState` **不发 `hashchange`**，没有人会去把这面镜像追回来，
+ * 于是地址说对讲台、页面画看板。故归一必须跑在 `new RouterStore()` **之前**，让 `$state`
+ * 的首读就读到归一后的值。
+ *
+ * 用 `replaceState` 而不是 `navigate`：开屏这一跳**不进历史**（后退应当离开本应用，而不是
+ * 退回一个「还没归一」的空地址）；`?pair=` 那段 search **原样带过去**——扫码进来的令牌就挂在
+ * 它上面（决策 191，抹掉它等于让主屏图标再也配不上对）。
+ *
+ * 只认 `''` 与 `#` 两种空写法：地址栏一旦带了任何路径（含 `#/`），就不是「什么都不指定」。
+ */
+function normalizeBareHash(): void {
+  if (typeof window === 'undefined') return;
+  if (window.location.hash !== '' && window.location.hash !== '#') return;
+  window.history.replaceState(
+    null,
+    '',
+    `${window.location.pathname}${window.location.search}#/talk`,
+  );
+}
+
+normalizeBareHash();
 
 export const router = new RouterStore();
 

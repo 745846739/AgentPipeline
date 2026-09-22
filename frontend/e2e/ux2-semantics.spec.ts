@@ -23,7 +23,7 @@ import { fullPassScript } from './scripts';
 
 /** 逐路由的结构事实。`nav` = 这一条路由上顶栏该点亮哪一项（没有就是 null）。 */
 const ROUTES: Array<{ hash: string; name: string; nav: string | null }> = [
-  { hash: '#/', name: '看板', nav: null },
+  { hash: '#/', name: '看板', nav: '看板' },
   { hash: '#/talk', name: '对讲台', nav: '对讲台' },
   { hash: '#/metrics', name: '指标', nav: '指标' },
   { hash: '#/settings', name: '设置落地页', nav: '设置' },

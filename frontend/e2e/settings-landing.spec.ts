@@ -6,11 +6,11 @@
  * 与计算样式上，不落 class 名，也不做说明性段落的精确文案匹配。
  *
  * 覆盖五条：
- *   ① 顶栏**页面导航行恰三项**（对讲台 / 指标 / 设置）；
+ *   ① 顶栏**页面导航行恰四项**（对讲台 / 看板 / 指标 / 设置，决策 240 修订决策 198）；
  *   ② 设置落地页两组分类、每一项可点且落到各自的路由；
  *   ③ 非本机来源下「手机访问」项**不渲染**；
  *   ④ `#/settings/stages` 有自己的页面、阶段配置在那里（小节标题不与页面标题同级）；
- *   ⑤ 404 有一条回看板的路，点了落在看板。
+ *   ⑤ 404 说清状态与下一步，出口是顶栏那一行页签（决策 240：此处不再自带「回看板」）。
  *
  * ③ 的做法：`onHostMachine()`（决策 190）的判据是**来源是否回环**——`api base` 非空时看它，
  * 否则看当前地址（`lib/localPage.ts`）。playwright 造不出一个非回环的浏览器来源，但可以按
@@ -47,20 +47,26 @@ test.describe('前端 E2E：设置的信息架构（票 21 / 决策 198）', () 
     await app?.stop();
   });
 
-  test('顶栏页面导航行恰三项：对讲台 / 指标 / 设置', async ({ page }) => {
+  test('顶栏页面导航行恰四项：对讲台 / 看板 / 指标 / 设置（决策 240）', async ({ page }) => {
     const bundle = watchBundle(page);
     await page.goto(`${app.webBase}/#/`);
     await settleBundle(page, bundle);
 
     const nav = page.getByRole('navigation', { name: '页面导航' });
-    await expect(nav.getByRole('link')).toHaveCount(3);
+    await expect(nav.getByRole('link')).toHaveCount(4);
     await expect(nav.getByRole('link').nth(0)).toHaveText(/对讲台/);
-    await expect(nav.getByRole('link').nth(1)).toHaveText(/指标/);
-    await expect(nav.getByRole('link').nth(2)).toHaveText(/设置/);
+    await expect(nav.getByRole('link').nth(1)).toHaveText(/看板/);
+    await expect(nav.getByRole('link').nth(2)).toHaveText(/指标/);
+    await expect(nav.getByRole('link').nth(3)).toHaveText(/设置/);
 
-    // 收缩只针对这一行：wordmark 与「新建任务」仍在（它们不是导航项）
-    await expect(page.getByRole('link', { name: 'AGENTPIPELINE' })).toBeVisible();
+    // 看板落在根路由，且只在根路由上点亮
+    await expect(nav.getByRole('link', { name: '看板' })).toHaveAttribute('href', '#/');
+    await expect(nav.getByRole('link', { name: '看板' })).toHaveAttribute('aria-current', 'page');
+
+    // 收缩只针对这一行：「新建任务」仍在（它不是导航项）；wordmark 是铭牌，不再是看板入口
     await expect(page.getByRole('button', { name: '新建任务' })).toBeVisible();
+    await expect(page.getByText('AGENTPIPELINE').first()).toBeVisible();
+    await expect(page.getByRole('link', { name: 'AGENTPIPELINE' })).toHaveCount(0);
 
     expectBundleHealthy(bundle);
   });
@@ -160,7 +166,7 @@ test.describe('前端 E2E：设置的信息架构（票 21 / 决策 198）', () 
     expectBundleHealthy(bundle);
   });
 
-  test('404 给回看板的路：点了落在看板，文案里的地址不带 #', async ({ page }) => {
+  test('404 说清状态与下一步，出口是顶栏的看板页签（决策 240）', async ({ page }) => {
     const bundle = watchBundle(page);
     await page.goto(`${app.webBase}/#/nope`);
     await settleBundle(page, bundle);
@@ -171,14 +177,13 @@ test.describe('前端 E2E：设置的信息架构（票 21 / 决策 198）', () 
     await expect(state).toContainText('/nope');
     expect(await state.textContent()).not.toContain('#');
 
-    // 一条可点的回看板入口（与其余空态同一套语汇）
-    const back = page.getByRole('link', { name: '回看板' });
-    await expect(back).toBeVisible();
-    await back.click();
+    // 不再自带一条「回看板」：看板入口**只有**顶栏那一枚页签（同一个目的地两套进法）
+    await expect(page.getByRole('link', { name: '回看板' })).toHaveCount(0);
 
+    // 点那枚页签，落在看板（八列工位阵列在场）
+    await page.getByRole('navigation', { name: '页面导航' }).getByRole('link', { name: '看板' }).click();
     await expect(page).toHaveURL(/#\/$/);
     await expect(page.locator('p', { hasText: '页面不存在' })).toHaveCount(0);
-    // 看板真的渲染了（八列工位阵列在场）
     await expect(page.locator('section.col').first()).toBeVisible({ timeout: 60_000 });
 
     expectBundleHealthy(bundle);

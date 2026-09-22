@@ -3,14 +3,11 @@
   import {
     createProvider,
     deleteProvider,
-    installSkillForStage,
     listProviders,
-    listRecommendedSkills,
     updateProvider,
   } from '../api/client';
-  import type { Provider, RecommendedStage, SkillPreview } from '../api/types';
+  import type { Provider } from '../api/types';
   import ProviderForm from '../components/settings/ProviderForm.svelte';
-  import StageRecommendations from '../components/settings/StageRecommendations.svelte';
   import EmptyState from '../components/ui/EmptyState.svelte';
   import {
     API_KEY_MASK,
@@ -34,44 +31,10 @@
   let deleteBusy = $state<string | null>(null);
   let rowError = $state<{ id: string; message: string } | null>(null);
 
-  /* ── 技能推荐与一键安装（决策 172①④，票 15 / 16）──
-     技能目录（`GET /skills`）只为阶段配置表单的候选读，已随那一段搬去 `#/settings/stages`。 */
-  let recommendations = $state<RecommendedStage[]>([]);
-  /** 正在安装的 `阶段:技能名`（按钮上的转圈与禁用）。 */
-  let installing = $state<string | null>(null);
-  let skillError = $state<string | null>(null);
-  /** 最近一次一键安装带回来的三项预览（票 11）。 */
-  let installPreview = $state<SkillPreview | null>(null);
-
-  async function loadRecommendations() {
-    try {
-      recommendations = await listRecommendedSkills();
-    } catch (err) {
-      // 推荐清单是锦上添花，取不到就整块不显示（票 16：技能不存在时界面降级）
-      skillError = (err as Error).message;
-      recommendations = [];
-    }
-  }
-
-  /**
-   * 一键安装：装技能 + 写该阶段配置一步完成（票 16）。
-   *
-   * 失败原因由后端分类给出（技能不存在 / 摘要不符 / 来源未放行 / 网络失败），原样回显。
-   * 成功时把 `preview` 交给推荐面板——特征命中当场可见，这是「不绕过票 11 预览」的落点。
-   */
-  async function installRecommended(stage: string, name: string) {
-    installing = `${stage}:${name}`;
-    skillError = null;
-    try {
-      const result = await installSkillForStage(stage, name);
-      installPreview = result.preview;
-      await loadRecommendations();
-    } catch (err) {
-      skillError = (err as Error).message;
-    } finally {
-      installing = null;
-    }
-  }
+  /* ── 技能相关的内容不在这页（决策 198 裁决③的分类判据）──
+     技能目录（`GET /skills`）只为阶段配置表单的候选读、推荐技能面板（推荐 + 一键安装，
+     决策 172①④ / 票 15 / 16）都属「每个阶段带哪些技能」——已随阶段配置整体搬去
+     `#/settings/stages`。本页只装 provider 台账与密钥（落地页定稿的那句话）。 */
 
   /** 每行的掩码状态：密钥已配置显示 `***`，未配置显示「未设置」（决策 112）。 */
   function keyText(p: Provider): string {
@@ -92,7 +55,6 @@
 
   onMount(() => {
     void load();
-    void loadRecommendations();
   });
 
   function openNew() {
@@ -149,7 +111,9 @@
 </script>
 
 <main class="page">
-  <a class="crumb" href="#/">← 看板</a>
+  <!-- 返回**父级**（design §4.3 / 决策 240）：原先这里挂的是「← 看板」，而看板已是顶栏
+       的一枚页签——设置子页该给的是回落地页的那条路，与阶段配置页同一口径。 -->
+  <a class="crumb" href="#/settings">← 设置</a>
   <div class="p-head">
     <h1 class="p-title">设置 · 模型与密钥</h1>
     <button type="button" class="btn solid" onclick={openNew}>＋ 新增 provider</button>
@@ -265,15 +229,6 @@
       </ul>
     </div>
   {/if}
-
-  <!-- 推荐技能与一键安装（决策 172①，票 16）：清单来自内置常量，装进来的技能默认未受信任。 -->
-  <StageRecommendations
-    stages={recommendations}
-    busy={installing}
-    preview={installPreview}
-    oninstall={installRecommended}
-  />
-  {#if skillError}<div class="error skills-error">{skillError}</div>{/if}
 </main>
 
 <style>
@@ -305,13 +260,4 @@
      「未安装」标签、手机访问入口闸标题），不是这一处。 */
   /* 票 04：破坏性动作不比中性动作轻——定档在 app.css 的 `.btn.danger` 上（全站一处），
      本页不再复制一份局部覆盖（票 04 的诉求是「删除」这一类动作的整体量级，不是某一页）。 */
-  /* 技能目录 / 推荐清单的失败提示：不挡整页，只提示那一块降级了 */
-  .skills-error {
-    margin-bottom: 14px;
-    padding: 8px 10px;
-    border: 2px solid var(--stop);
-    color: var(--stop);
-    font-size: 12px;
-    line-height: 1.6;
-  }
 </style>

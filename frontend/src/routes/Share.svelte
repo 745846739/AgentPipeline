@@ -186,7 +186,9 @@
 </script>
 
 <main class="page">
-  <a class="crumb" href="#/">← 看板</a>
+  <!-- 返回**父级**（design §4.3 / 决策 240）：本页是设置类页面（顶栏「设置」在它上面点亮），
+       原先这里挂的是「← 看板」，而看板已是顶栏的一枚页签——给回落地页的那条路就行。 -->
+  <a class="crumb" href="#/settings">← 设置</a>
   <div class="p-head">
     <h1 class="p-title">手机访问</h1>
   </div>

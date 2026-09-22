@@ -84,7 +84,12 @@ test.describe('UX2 ① 详情失败态与终态动作（票 01 / 02）', () => {
     await expect(page.getByRole('alert')).toContainText('任务不存在');
     await expect(page.getByText(/任务不存在/).first()).toBeVisible();
     await expect(page.getByRole('button', { name: '重新加载', exact: true })).toBeVisible();
-    await expect(page.getByRole('link', { name: '回看板' })).toBeVisible();
+    // 出路是**那颗「重新加载」**（决策 240 摘掉了本页的「回看板」链）：回看板走顶栏那枚页签，
+    // 死路上不再摆第二个入口。顶栏那一行恒在，故这一页并不因此没了去处。
+    await expect(page.getByRole('link', { name: '回看板' })).toHaveCount(0);
+    await expect(
+      page.getByRole('navigation', { name: '页面导航' }).getByRole('link', { name: '看板' }),
+    ).toBeVisible();
     expectBundleHealthy(bundle);
   });
 

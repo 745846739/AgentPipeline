@@ -16,10 +16,12 @@
 >
 > | 改了什么 | 本文落点 | 决策 |
 > |---|---|---|
-> | 设置类入口按用途两分、新增设置落地页与阶段配置页、顶栏导航行收到三项、手机访问入口挪位 | §1、§4、§7、§8 | 198 |
+> | 设置类入口按用途两分、新增设置落地页与阶段配置页、顶栏导航行收到三项（决策 240 起四项）、手机访问入口挪位 | §1、§4、§7、§8 | 198 / 240 |
 > | 界面正文里的内部决策编号退场，可追溯性交给「行为 / 规则 → 实现位置」表 | §12.1、§12.3 | 199 |
 > | 车间隐喻在首次出现处给一次平实说法 | §12.2 | 200 |
 > | 状态过滤槽加词、同一个数不再在相邻控件上重复 | §4.4 | 201 |
+> | 窄档顶栏重排：铭牌行退场、导航行升为首行、道具栏行只在看板露出（高度按路由两档） | §4.2、§12.3 | 242 |
+| 窄档页面导航**移出顶栏、钉到屏幕底缘**成底部页签栏（四项等分 / 命中区 44 / 独占安全区），顶栏非看板路由清零，`--nav-h` + `--sbar-h` 两层让位账本 | §4.2、§12.3 | 243（修订 242 的导航行位置与高度两档） |
 >
 > **不变的部分写死**：过滤语义与端点一律不动；像素纪律（2px 描边 / 零圆角 / 12 的倍数字阶 /
 > 不新增图元 / 动画预算四处）一字不动；`allowed_actions` 纯渲染与卡片禁拖不动。
@@ -177,41 +179,59 @@ pending 琥珀呼吸（2.4s 周期）、流式输出尾随光标。`prefers-redu
 
 | 路由 | `route.name` | 页面 | 入口 |
 |---|---|---|---|
-| `#/` | `board` | 看板（按 project 过滤；决策 58） | wordmark / 404 的返回入口 |
+| `#/` | `board` | 看板（按 project 过滤；决策 58） | 顶栏第 2 项（决策 240；入口**只此一处**） |
 | `#/talk` | `talk` | 对讲台（与值班长对话，决策 176 / 182） | 顶栏第 1 项（兼容原型写法 `#v-talk`） |
 | `#/task/:id` | `task` | 任务详情（轨道 hero + 时间线/会话/命令/产出/Diff） | 看板卡片 / 待处理下拉 |
-| `#/metrics` | `metrics` | 全局指标（`GET /metrics`） | 顶栏第 2 项；任务侧入口见 §4.5 |
-| `#/settings` | `settings-landing` | **设置落地页（新）** | 顶栏第 3 项 |
+| `#/metrics` | `metrics` | 全局指标（`GET /metrics`） | 顶栏第 3 项；任务侧入口见 §4.5 |
+| `#/settings` | `settings-landing` | **设置落地页（新）** | 顶栏第 4 项 |
 | `#/settings/projects` | `settings-projects` | 项目（创建即 `POST /projects` + 可选 `/projects/analyze`） | 落地页「谁能进来」 |
 | `#/share` | `share` | 手机访问（局域网扫码接入，决策 167 / 186） | 落地页「谁能进来」的手机访问项（**仅本机渲染**） |
 | `#/settings/providers` | `settings-providers` | 模型与密钥（provider 台账；决策 112：明文存储、读接口回显 `***`） | 落地页「怎么跑」 |
 | `#/settings/stages` | `settings-stages` | **阶段配置（新页，内容从「模型与密钥」页搬出）** | 落地页「怎么跑」 |
 | `#/settings/market` | `settings-market` | 技能市场（决策 187 / 194） | 落地页「怎么跑」 |
-| 其它 | `not-found` | 404（给一条回看板的路） | — |
+| 其它 | `not-found` | 404（状态 + 下一步；出口是顶栏那一行页签，决策 240） | — |
 
 - 无 SvelteKit，Vite + Svelte 5（runes）+ 轻量 hash 路由（本地应用，无 SEO 诉求）。
+- **首屏默认是对讲台（决策 241）**：地址栏**没写 hash**（`''` / `#`）时，进 store 之前归一到
+  `#/talk`。默认落点只接管**空地址**——显式 `#/` 照旧是看板（本表第一行、§4.2 第 2 项，
+  决策 240 的「看板是根路由」不修订）；带 hash 的开屏一律不动。
 - **query 是这条路由表的一部分**（决策 217）：`#/task/:id?tab=`、`#/?filter=`、`#/talk?session=`、
   `#/metrics?task=`、`#/settings/projects?project=&analyze=1`。参数是短枚举、缺省值不写进地址；
   谁写地址（用户 `pushState` / 程序 `replaceState`）与刷新恢复语义见 §9.4。
 - **传输层 Tauri 防御（决策 153）：** ① 本前端是**纯 API 客户端**，一切数据经 HTTP + SSE，不假设部署形态（桌面化 = Tauri 只当外壳，不走 IPC 重写）；② SSE 消费用 **fetch 流式读取**（可携带自定义头），不用 `EventSource`——它带不了自定义头，跨源过不了决策 128 防护；③ 所有写请求**恒携带** `X-AgentPipeline` 头（决策 128 旁路，桌面 webview origin 靠它放行）；④ API base 收敛**单一配置点**：默认同源相对路径，留注入覆盖口（桌面壳注入 `http://127.0.0.1:{port}`）。
 
-### 4.2 顶栏：页面导航行三项（定稿，决策 198）
+### 4.2 顶栏：页面导航行四项（定稿，决策 240 修订决策 198）
 
 | 序 | 项名（定稿） | 落点 | 高亮判据（`route.name`） |
 |---|---|---|---|
 | 1 | **对讲台** | `#/talk` | `talk` |
-| 2 | **指标** | `#/metrics` | `metrics` |
-| 3 | **设置** | `#/settings` | `settings-landing` / `settings-projects` / `settings-providers` / `settings-stages` / `settings-market` / `share` |
+| 2 | **看板** | `#/` | `board` |
+| 3 | **指标** | `#/metrics` | `metrics` |
+| 4 | **设置** | `#/settings` | `settings-landing` / `settings-projects` / `settings-providers` / `settings-stages` / `settings-market` / `share` |
 
-- 这是**有意的收缩**：顶栏是「第一屏必须懂」的那一处，六项让人先学词表再开始用。
+- 决策 198 的收缩**照旧成立**（顶栏是「第一屏必须懂」的那一处，六项让人先学词表再开始用）：
+  原先移入落地页的四项不回这一行。**决策 240 只加了一项——看板**：它是根路由，入口原先散在
+  wordmark（`href="#/"`）、各页面包屑（`← 看板`）与空态（「回看板」/「去看板新建任务」）
+  三处，于是「看板在哪儿进」取决于人当时站在哪一页。收成**一枚页签**之后，那三处一并摘除：
+  **看板只从这一行进**。
+- **看板页签的高亮只有 `board` 一条判据**：任务详情不是这一行的项，与「对讲台不在详情页点亮」
+  同理。
 - **收缩只针对页面导航行**（`.navbar`）。顶栏其余部分一字不动：wordmark、项目切换器、
   道具栏（状态过滤槽，§4.4）、**「待处理 N」芯片**（`has_pending_cursor` 的任务数，决策 92 的
   唯一动态计数入口，点击下拉列出全部 pending 任务——琥珀点 + 阻塞原因摘要，点击进入对应任务）、
   「新建任务」。**它们不是导航项**，不受本项影响。
 - 原先挂在顶栏的四个设置类项（项目 / 模型与密钥 / 技能市场 / 手机访问）**改为落地页里的项**，
   各自路由不变。
-- 移动款的顶栏结构（铭牌行 + 信号灯缩略条 + 道具栏行 + 页面导航行，≈138px）**不变**，
-  只是导航行从六枚 chip 变成三枚；`scroll-margin-top` 与横幅 top 的几何因此**不用改**。
+- **窄档（≤479px）的结构由决策 242 重排、再由决策 243 修订位置**：**铭牌行整行退场**
+  （logo / wordmark / 会话名 / 信号灯缩略条都不再露出——决策 218 ⑥ 的「点灯跳段」随灯一起
+  没有了，故决策 240 记的那条例外作废）；**页面导航行不再属于顶栏——`position: fixed` 钉到
+  屏幕底缘**，成为底部页签栏：四项等分整宽、图标在上文字在下、命中区定死 44px、
+  `padding-bottom: var(--safeb)` 独占安全区、项目切换器 `.proj` 落行内右端；**状态条叠在
+  页签栏上方**（`bottom: var(--nav-h)`）。顶栏只剩**道具栏行且只在看板路由露出**，高度因此
+  **按路由分两档：看板 52px、其余 0px（清零）**，连带的 `scroll-margin-top` / 横幅 `top` /
+  待处理下拉 `top` 一律改读实测的 `--topbar-h`（**0 也是合法值**，写死一个数必错一档）；
+  底部让位读重定义后的 `--sbar-h`（= 状态条 42 + `--nav-h`）。桌面档（≥480px）的两行结构
+  一字不动。四项的 DOM、role、`aria-current` 契约一个字不动——变的只是位置。
 
 ### 4.3 设置落地页（`#/settings`）
 
@@ -229,10 +249,11 @@ pending 琥珀呼吸（2.4s 周期）、流式输出尾随光标。`prefers-redu
 - 页面标题 `设置`；导入语 `这台机器上的流水线怎么跑、谁能进来。`
 - **各项仍是独立路由，落地页只是入口**（决策 198）：它不复制任何设置内容，不内嵌表单，
   不替子页保存状态。
-- **指标不列在落地页**：它不是设置类入口，留在顶栏（第一屏三项之一）。
+- **指标不列在落地页**：它不是设置类入口，留在顶栏（第一屏四项之一，决策 240 起）。
 - **被拆出来的东西各有其位**：技能市场归技能（`#/settings/market`）、**阶段配置独立成页**
   （`#/settings/stages`）、provider 台账留在原处（`#/settings/providers`，**只摘掉阶段配置那一段**）。
-- 每个设置子页给一条**返回设置**的路（`← 设置` → `#/settings`），与既有的 `← 看板` 并列。
+- 每个设置子页给一条**返回设置**的路（`← 设置` → `#/settings`；决策 240 之前还与一条
+  `← 看板` 并列，看板收进顶栏页签后那条已摘除——设置子页的上一级是落地页，不是看板）。
 - **手机访问项只在跑服务的这台机器本机上渲染**——判据与行为**逐字沿用决策 190**：
   看**来源是否回环**（`onHostMachine()`），不看视口宽度；被判为非本机时这一项**不渲染**
   （不是禁用、不是留个空位）；非本机来源直接敲 `#/share` 仍得到那一页既有的指引
@@ -312,7 +333,7 @@ pending 琥珀呼吸（2.4s 周期）、流式输出尾随光标。`prefers-redu
 ```
 
 > 上图只画顶栏的**道具栏一行**（过滤槽 + 待处理计数 + 新建任务）；它下面的**页面导航行**按
-> §4.2 只有三项（对讲台 / 指标 / 设置），图上不重复画。
+> §4.2 只有四项（对讲台 / 看板 / 指标 / 设置，决策 240），图上不重复画。
 
 - **列 = 阶段**（决策 92 的"独立槽位"）：8 列 = init / architect-design /
   **develop-design ∥ test-design（双轨合并列）** / develop / review / test / merge / done。
@@ -676,7 +697,7 @@ GET /tasks/{id}               → 详情页装载 + 断线重连后的全量校�
   12 的倍数字阶一字不动。
 - **`title` 不承载翻译**（那是编号的位子）：译文必须是**屏上读得到**的字，悬停不算。
 - **按钮与标题里不翻译**：可执行物（按钮）与标题保持原词，翻译只出现在**说明性文字**里。
-- **第一屏与隐喻词的分界**：顶栏三项名、「新建任务」、状态过滤槽的词（§4.4）、空态的下一步
+- **第一屏与隐喻词的分界**：顶栏四项名、「新建任务」、状态过滤槽的词（§4.4）、空态的下一步
   （§5.3）**一律用平实词、不翻译**（票 21）；翻译只服务**其余正文**。
 - 词表与译法的同步落点：`docs/glossary.md` 的「视觉语汇」一节（按同样的说法填一列），
   两处必须一致。
@@ -733,7 +754,8 @@ GET /tasks/{id}               → 详情页装载 + 断线重连后的全量校�
 | 脊线站点数字 = 累计到过这一站，框内带 `累计` 词（与列头存量区分） | `frontend/src/components/pipeline/PipelineRail.svelte`、`frontend/src/lib/pipeline.ts` | 决策 197 |
 | 看板溢出：宽屏 `merge` / `done` 钉右；窄档初始滚动落在 `merge` + 右缘「还有 N 列」 | `frontend/src/routes/Board.svelte` | 决策 196 |
 | 卡片禁拖；任务卡整卡可点进详情 | `frontend/src/components/board/TaskCard.svelte` | 决策 169 沿用的交互骨架；§5.2 |
-| 顶栏页面导航行三项（对讲台 / 指标 / 设置），其余入口从落地页进 | `frontend/src/components/layout/TopBar.svelte`、`frontend/src/router.svelte.ts` | 决策 198（修订 169） |
+| 页面导航行四项（对讲台 / 看板 / 指标 / 设置），其余入口从落地页进；**看板只从这一行进**（窄档这一行钉在屏幕底缘，桌面档是顶栏第二行——同一个 `nav` 元素） | `frontend/src/components/layout/TopBar.svelte`、`frontend/src/router.svelte.ts` | 决策 240（修订 198 / 169）；位置由 243 定（窄档在底部） |
+| 首屏默认落对讲台：地址栏没写 hash 就 `replaceState` 归一到 `#/talk`（带 hash 的开屏与显式 `#/` 都不动） | `frontend/src/router.svelte.ts` | 决策 241（不修订 240）；`router.test.ts` 的「开屏默认落点」用例 |
 | 设置落地页按用途两分（谁能进来 / 怎么跑），各项仍是独立路由 | `frontend/src/routes/SettingsLanding.svelte` | 决策 198 |
 | 「手机访问」入口只在本机（来源回环）渲染，非本机不给入口 | `frontend/src/lib/localPage.ts`、`frontend/src/routes/SettingsLanding.svelte` | 决策 190（位子由 198 挪到落地页，行为不变） |
 | 阶段配置独立成页，从「模型与密钥」页搬出 | `frontend/src/routes/SettingsStages.svelte`、`frontend/src/components/settings/StageConfigForm.svelte` | 决策 198 / 111 / 170 |
@@ -764,7 +786,7 @@ GET /tasks/{id}               → 详情页装载 + 断线重连后的全量校�
 | 班次列表两枚标记（每条最多一枚）：**正在回话**（本机发出未落地 ∪ SSE 增量带别的 `session_id`；静默 20s / **落地** / 断流三条收口）/ **有新动静**（`last_active_at` 晚于本机记的看过时刻；当前班次永不算；基线**只在本机一条记录都没有时**立）；回话中优先于有新动静 | `frontend/src/lib/talkSessions.ts`、`frontend/src/realtime/foreman.ts`、`frontend/src/routes/Talk.svelte` | 决策 220①③④ / 222；派生口径由 `talkSessions.test.ts` / `foreman.test.ts` 钉住，跨设备那一组在 `frontend/e2e/talk.spec.ts` |
 | 工位回执在折行档默认收起（`<details>` 不写 `open`，内容一个字不删），人手动展开后不被流式增量打回 | `frontend/src/routes/Talk.svelte` | 决策 218 ②（修订决策 182 的「默认展开」在那一档的纪律）；`frontend/e2e/talk.spec.ts` 把 POST 拖住 2.5s 验「不打回」 |
 | 输入坞不常驻提示语；传输层断线（`streamStatus === 'error'`）时才有那一行，且是全页**唯一**的断线告知（空闲 88px） | `frontend/src/routes/Talk.svelte` | 决策 218 当日修订②、220④；「值班长正在回话…」那半句已删（流式尾随光标已在说） |
-| 顶栏 8 格工位灯在 `#/talk` 上接通：点灯去 `#/` 并定位到那一列（此前 8/8 无靶子，点了不动） | `frontend/src/components/layout/TopBar.svelte` | 决策 218 ⑥；兑现已有的 `aria-label="跳到 init"`，不是新功能 |
+| 窄档（≤479px）**页面导航行钉在屏幕底缘**（`position: fixed; bottom: 0`，四项等分、图标上文字下、页签 `height: 44px`、`padding-bottom: var(--safeb)` 独占安全区、`z-index: 32`）、**铭牌行整行 `display:none`**、**道具栏行只在看板路由露出**（`class:on-board` 判据，**不叫 `.board`**——那是看板页容器的类名）且自带下框；高度按路由两档（看板 52px / 其余 **0px 清零**），下游钉位一律读 `--topbar-h`（**0 也写入**）；状态条 `bottom: var(--nav-h)` 叠页签栏上方，底部让位读 `--sbar-h`（= 42 + `--nav-h`，两层账本） | `frontend/src/components/layout/TopBar.svelte`、`frontend/src/app.css`、`frontend/src/components/layout/StatusLine.svelte` | 决策 243（修订 242 的 ② 导航行位置与高度两档；242 的铭牌行退场、`class:on-board` 判据照旧）；e2e 钉在 `frontend/e2e/pixel-theme.spec.ts`（52 / 58 / 页签贴底缘 / 状态条贴页签上沿 / `scroll-margin` 62）与 `frontend/e2e/talk.spec.ts`（非看板顶栏 0） |
 | 「急停」的首现平实说法落在急停摘要条的琥珀标签上（折行档没有急停时那整块退场、词与译文一起不在） | `frontend/src/routes/Talk.svelte` | 决策 200（口径不变）＋ 218 ⑦b（换落点） |
 | 值班长没回话的那一轮渲染成失败轮**并显示原因**（后端落的 `system` 账以 `【没跑起来】` 开头），不再是一条只有红轮、无处看原因的静默失败 | `frontend/src/routes/Talk.svelte` | 决策 211④；票 04 |
 | 本地等不到回包**不等于**这一轮失败：超时那一类补一句「它在服务端仍在继续」（回话会随流式增量到达，切走再切回本班次也能看到），其余失败照原样说 | `frontend/src/realtime/foreman.ts`、`frontend/src/routes/Talk.svelte` | 决策 223；判据由 `frontend/src/realtime/foreman.test.ts` 钉住（`failureNotice` / `isTimeoutMessage`） |

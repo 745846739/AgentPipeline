@@ -267,7 +267,9 @@ test.describe('前端 E2E：指标页的空态（票 13）', () => {
     await app?.stop();
   });
 
-  test('空态说清「现在是空的 + 下一步做什么」，入口可点、点了能到（票 13）', async ({ page }) => {
+  test('空态说清「现在是空的 + 下一步做什么」，去哪页走顶栏那一行（票 13 / 决策 240）', async ({
+    page,
+  }) => {
     await openMetrics(page, app, '#/metrics');
 
     // 空态的形状来自共享组件 components/ui/EmptyState.svelte。这里**只按用户看得见的文字**
@@ -275,10 +277,14 @@ test.describe('前端 E2E：指标页的空态（票 13）', () => {
     await expect(page.getByText('现在还没有任务，所以没有可统计的东西。')).toBeVisible();
     await expect(page.getByText(/先去看板新建一个任务/)).toBeVisible();
 
-    // 下一步提到的另一个页面**必须可点**
-    const link = page.getByRole('link', { name: '去看板新建任务' }).first();
-    await expect(link).toBeVisible();
-    await link.click();
+    // 空态**不再自带**一条看板链（决策 240）：看板入口收进顶栏那一枚页签
+    await expect(page.getByRole('link', { name: '去看板新建任务' })).toHaveCount(0);
+
+    // 点那枚页签照样落在看板——「下一步」指的那一页仍是一点就到
+    await page
+      .getByRole('navigation', { name: '页面导航' })
+      .getByRole('link', { name: '看板' })
+      .click();
     await expect(page.locator('.board')).toBeVisible();
     await expect(page).toHaveURL(/#\/$/);
   });

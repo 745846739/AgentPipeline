@@ -194,8 +194,11 @@
       flex-direction: row;
       align-items: stretch;
       border-right: 0;
-      /* 点灯跳段时不被 138px 顶栏压住（§5 转写 5 的连带定值） */
-      scroll-margin-top: 148px;
+      /* 跳段定位时不被顶栏压住（§5 转写 5 的连带定值）。
+         顶栏高度**按路由两档**（看板 52px 含道具栏行 / 其余 0——导航行已钉屏幕底缘，
+         决策 243），故读实测的 `--topbar-h` 而不是写死一个数——写死换一档就错
+         （票 09 立这条的理由；0 也是合法值）。 */
+      scroll-margin-top: calc(var(--topbar-h) + 10px);
     }
     .col-spine {
       display: block;

@@ -3,7 +3,6 @@
   import { router } from '../../router.svelte';
   import NewTaskDialog from '../board/NewTaskDialog.svelte';
   import Sprite from '../render/Sprite.svelte';
-  import { BOARD_COLUMNS, columnForTask } from '../../lib/pipeline';
   import type { SpriteName } from '../../theme/contract';
   import { tick } from 'svelte';
 
@@ -25,20 +24,30 @@
   };
 
   /**
-   * 页面导航行**三项**（决策 198 / design §4.2）：对讲台 / 指标 / 设置。
+   * 页面导航行**四项**（决策 240，修订决策 198）：对讲台 / 看板 / 指标 / 设置。
    *
-   * 这是**有意的收缩**——顶栏是「第一屏必须懂」的那一处，原先六项等于让人先学词表再开始用。
-   * 原「项目 / 模型与密钥 / 技能市场 / 手机访问」四项**从顶栏移入设置落地页**（项名逐字不改），
-   * 各自路由不变；收缩**只针对这一行**，顶栏其余部分（wordmark / 项目切换器 / 道具栏过滤槽 /
-   * 「待处理 N」芯片 / 「新建任务」）一字不动——它们不是导航项。
+   * 「看板」原先**不在这行里**——它是根路由 `#/`，入口散在 wordmark、各页面包屑
+   * （`← 看板`）与空态（「回看板」）三处，于是「看板在哪儿进」取决于人当时站在哪一页。
+   * 决策 240 把入口收成**这一行里的一枚页签**，与对讲台同排、同样式、同高亮规则
+   * （用户选的顺序：紧贴对讲台之后）；其余三处入口随之摘除——**看板只从这里进**。
+   *
+   * 图元复用既有 sprite（不新增图元）：`chest`（货箱）= 看板上的任务卡。
+   *
+   * 决策 198 的收缩**照旧成立**（顶栏是「第一屏必须懂」的那一处，六项等于先学词表）：
+   * 原先移入设置落地页的四项（项目 / 模型与密钥 / 技能市场 / 手机访问）**不回这一行**，
+   * 各自路由不变。顶栏其余部分（wordmark / 项目切换器 / 道具栏过滤槽 / 「待处理 N」芯片 /
+   * 「新建任务」）一字不动——它们不是导航项。
    *
    * `routes` 是**高亮判据的集合**（design §4.2 的第三列）：「设置」在落地页与五个设置类页面
-   * （含 `/share`）六处都点亮。
+   * （含 `/share`）六处都点亮；「看板」只在根路由上点亮（任务详情不是这一行的项，
+   * 与对讲台不在详情页点亮同理）。
    */
   const NAV: Array<{ path: string; routes: string[]; label: string; sprite: SpriteName }> = [
     // 对讲台（决策 174 / theme-6-pixel.md §3.3）：与看板并列，故排在台账页之前。
-    // 图元复用既有 foreman 头像（不新增 sprite）；它在 34px 页签盒里按 16px 显示。
+    // 图元复用既有 foreman 头像（不新增 sprite）；它在页签盒里按 16px 显示（宽窄两档同）。
     { path: '/talk', routes: ['talk'], label: '对讲台', sprite: 'foreman' },
+    // 看板（决策 240）：根路由，与对讲台同排同款。
+    { path: '/', routes: ['board'], label: '看板', sprite: 'chest' },
     { path: '/metrics', routes: ['metrics'], label: '指标', sprite: 'chart' },
     {
       path: '/settings',
@@ -62,36 +71,28 @@
   /**
    * 顶栏**实测**高度（含 2px 下框），写进 `document.documentElement` 的 `--topbar-h`（票 09）。
    *
-   * 为什么不能写死：顶栏在窄档会折成两行而更高（桌面 78–81px，移动款约 138px），
-   * 而钉在它下面的东西（详情页的档案盒）要按**这一档的真实值**让位——写死一个数，
-   * 换一档就错（56px 那个旧值就是这么把「等你拍板」铭牌送到顶栏底下的）。
+   * 为什么不能写死：顶栏在窄档会折成多行而更高（桌面 78–81px；窄档**还按路由分两档**——
+   * 导航行已移到屏幕底部（决策 243），顶栏只剩道具栏行且只在看板露出，故看板 52px、
+   * **其余路由 0px**），而钉在它下面的东西（详情页的档案盒、完成横幅、看板跳段的
+   * scroll-margin）要按**这一档的真实值**让位——写死一个数，换一档就错
+   * （56px 那个旧值就是这么把「等你拍板」铭牌送到顶栏底下的）。
    * 用 `offsetHeight` 而不是 `clientHeight`：后者不含边框，而压在顶栏下沿的那 2px 框
    * 也是「被盖住」的一部分。
+   *
+   * **0 也是合法实测值**（决策 243：窄档非看板顶栏清零），不能用 `h > 0` 把它挡掉——
+   * 否则变量会停在上一档的值（78 / 52），下游钉位全错。`bind:offsetHeight` 的回调
+   * 尚未到达（或 ResizeObserver 不实现，如 jsdom）时，退回直接读一次实测高度。
    */
   let topbarH = $state(0);
+  let headerEl = $state<HTMLElement | null>(null);
   $effect(() => {
-    if (typeof document === 'undefined') return;
-    const h = topbarH;
-    if (h > 0) document.documentElement.style.setProperty('--topbar-h', `${h}px`);
+    if (typeof document === 'undefined' || !headerEl) return;
+    const h = topbarH || headerEl.offsetHeight;
+    document.documentElement.style.setProperty('--topbar-h', `${h}px`);
   });
 
   const sessionName = $derived(
     board.projects.find((p) => p.id === board.projectId)?.name ?? 'AgentPipeline',
-  );
-
-  /**
-   * 移动版信号灯缩略条（theme-6-pixel.md §5 / 移动原型 `.railnav`）：
-   * 8 列各压成一枚 10px 实心像素灯，链节底纹连通。字符字形（○ ● ◆）已退役。
-   */
-  const railCells = $derived.by(() =>
-    BOARD_COLUMNS.map((column) => {
-      const tasks = board.tasks.filter((t) => columnForTask(t) === column.key);
-      const pen = tasks.some((t) => t.status === 'pending');
-      const live = tasks.some((t) => t.status === 'running');
-      const don = tasks.length > 0 && tasks.every((t) => t.status === 'done');
-      const state = pen ? 'pen' : live ? 'live' : don ? 'don' : 'idle';
-      return { key: column.key, label: column.label, state };
-    }),
   );
 
   function openTask(id: string) {
@@ -182,56 +183,27 @@
     if (target && pendingWrap?.contains(target)) return;
     board.pendingOpen = false;
   }
-
-  /**
-   * 点信号灯缩略条跳段（移动原型 `.rn` + `scrollIntoView`）。
-   * 站点带带 `scroll-margin-top: 148px`，故跳到顶时不会被 138px 的顶栏压住。
-   *
-   * **没有靶子时先去有靶子的那一页**（决策 218 ⑥）：`#s-<key>` 只存在于看板
-   * （`BoardColumn.svelte`），故在对讲台这类页面上点灯以前是**一动不动**的——而它自报
-   * `aria-label="跳到 <列名>"`，接通是兑现承诺、不是加功能。改址走**路由跳转**
-   * （`router.navigate`，hash 变化不整页刷新），等一次 DOM 刷新再定位——用 `tick()`
-   * 而不是定时器（后者是「等得够久就成了」的赌博，而且会与路由的渲染节奏错位）。
-   */
-  function jumpToStation(key: string) {
-    if (typeof document === 'undefined') return;
-    const here = document.getElementById(`s-${key}`);
-    if (here) {
-      here.scrollIntoView({ block: 'start' });
-      return;
-    }
-    router.navigate('/');
-    void tick().then(() =>
-      document.getElementById(`s-${key}`)?.scrollIntoView({ block: 'start' }),
-    );
-  }
 </script>
 
 <svelte:window onclick={onWindowClick} onkeydown={onWindowKey} />
 
-<header class="top" bind:offsetHeight={topbarH}>
+<header class="top" bind:this={headerEl} bind:offsetHeight={topbarH}>
   <div class="topbar">
     <div class="bar-top">
       <span class="logo" aria-hidden="true"></span>
-      <a class="wordmark" href="#/" onclick={() => router.navigate('/')}>AGENTPIPELINE</a>
+      <!-- wordmark（决策 240）：**铭牌，不是入口**。它原先是 `href="#/"` 的看板入口，而看板
+           现在是这一行里的一枚页签（见 `NAV`）——同一个目的地两处入口，其中一处还是「看着像
+           站名、点了却换页」的那种。留字、去链：它说的仍是这台机器的名字。 -->
+      <span class="wordmark">AGENTPIPELINE</span>
       <span class="sess">0:{sessionName}</span>
-
-      <nav class="railnav" aria-label="站点状态缩略">
-        {#each railCells as cell (cell.key)}
-          <!-- 点灯跳段（移动原型 `.rn` → `scrollIntoView`）；桌面隐藏 -->
-          <button
-            type="button"
-            class="rn {cell.state}"
-            aria-label="跳到 {cell.label}"
-            onclick={() => jumpToStation(cell.key)}
-          >
-            <span class="mk"></span>
-          </button>
-        {/each}
-      </nav>
     </div>
 
-    <div class="filters-row">
+    <!-- 道具栏行**只跟看板相关**（状态过滤、待处理、新建任务都只在看板上有意义），
+         故窄档只在看板路由露出（页面导航行已移到屏幕底部，决策 243）；
+         桌面档照旧拍平进 `.topbar`。
+         类名用 `on-board` 不用 `board`：看板页容器自己占着 `.board`（`Board.svelte:144`），
+         撞名会让 `page.locator('.board')` 命中两个元素（实测 e2e strict mode violation）。 -->
+    <div class="filters-row" class:on-board={router.route.name === 'board'}>
       <nav class="slots" aria-label="状态过滤">
         {#each FILTERS as f (f)}
           <!-- 图标 + 词（决策 201）：屏幕上的字才是「一眼扫过去就懂」的那一层，title 与
@@ -327,7 +299,9 @@
 <NewTaskDialog open={newTaskOpen} onclose={() => (newTaskOpen = false)} />
 
 <style>
-  /* 顶栏 = 车间铭牌（sticky）：第一行铭牌 + 道具栏，第二行页面铭牌排（§3） */
+  /* 顶栏 = 车间铭牌（sticky）：桌面款第一行铭牌 + 道具栏，第二行页面铭牌排（§3）；
+     窄档（≤479）导航行**移到屏幕底部**成页签栏、顶栏只留道具栏行（只在看板露出），
+     见文件末的媒体查询（决策 243） */
   .top {
     position: sticky;
     top: 0;
@@ -375,9 +349,6 @@
     color: var(--text-3);
     font-size: 12px;
     white-space: nowrap;
-  }
-  .railnav {
-    display: none;
   }
 
   /* ── 道具栏槽位：34px 高、2px 描边、图标 + 词 + 右下角计数徽章、选中 = 亮描边 + wash 底 ──
@@ -490,9 +461,9 @@
     margin-right: 5px;
     vertical-align: -3px;
   }
-  /* 工头头像的契约显示尺寸是 48px（dossier 用），塞进 34px 高的导航页签盒会把它
-     撑到 52px，连带移动端顶栏从 138px 涨到 156px，压坏 §5 的 scroll-margin-top
-     与横幅 top = 148px。导航处一律按 chip 节奏缩到 16px（规格 §3.3）。 */
+  /* 工头头像的契约显示尺寸是 48px（dossier 用），塞进页签盒会把它撑高——窄档页签栏
+     高是 `--nav-h` 账本里写死的数（app.css：58 + safeb），撑高即账实不符；导航处一律
+     按 chip 节奏缩到 16px（规格 §3.3）。 */
   .chip .ic :global(svg.sprite) {
     width: 16px;
     height: 16px;
@@ -596,81 +567,42 @@
     white-space: nowrap;
   }
 
-  /* ── 移动款：铭牌行 + 信号灯缩略条 + 道具栏横滚行 + 页面导航行（顶栏 ≈ 138px） ── */
+  /* ── 移动款（决策 243）：**页面导航行搬出顶栏、钉到屏幕底缘**成底部页签栏
+     （四项等分、图标在上、命中区 ≥44px、独占安全区）；铭牌行（logo / wordmark /
+     会话名）整行去掉照旧；顶栏只剩道具栏行、且只在看板路由露出——
+     看板 52px、**非看板路由 0px**（顶栏清零，内容全屏展开）。
+     各处钉位一律读 `--topbar-h`（0 也是合法值）；底部让位读 `--sbar-h`
+     （窄档 = 状态条 42 + 页签栏 `--nav-h`，见 app.css 账本）。 */
   @media (max-width: 479px) {
+    .top {
+      display: flex;
+      flex-direction: column;
+      /* 下框改由道具栏行自带（它只在看板露出）：非看板路由顶栏清零后不留 2px 残线 */
+      border-bottom: none;
+    }
     .topbar {
       display: block;
       height: auto;
       padding: 0;
     }
     .bar-top {
-      display: flex;
-      align-items: center;
-      gap: 8px;
-      height: 44px;
-      padding: 0 12px;
-      border-bottom: 2px solid var(--hairline);
+      display: none;
     }
-    .railnav {
-      display: flex;
-      align-items: center;
-      flex: 1;
-      min-width: 0;
-      margin-left: 2px;
-    }
-    .rn {
-      position: relative;
-      flex: 1;
-      min-width: 0;
-      height: 44px;
-      display: grid;
-      place-items: center;
-    }
-    /* 链节底纹：4px 亮 / 4px 暗的硬边像素条（非平滑渐变） */
-    .rn::before {
-      content: '';
-      position: absolute;
-      left: 0;
-      right: 0;
-      top: 50%;
-      height: 4px;
-      margin-top: -2px;
-      background: repeating-linear-gradient(90deg, var(--pane) 0 4px, transparent 4px 8px);
-    }
-    .rn .mk {
-      position: relative;
-      z-index: 1;
-      width: 10px;
-      height: 10px;
-      border: 2px solid var(--pane);
-      background: var(--bg);
-    }
-    .rn.don .mk {
-      background: var(--done);
-      border-color: var(--done);
-    }
-    .rn.live .mk {
-      background: var(--go);
-      border-color: var(--go);
-    }
-    .rn.pen .mk {
-      background: var(--pending);
-      border-color: var(--pending);
-    }
-    .rn.on {
-      outline: 2px solid var(--text-hi);
-      outline-offset: -2px;
-    }
-
+    /* 道具栏行只跟看板相关：非看板路由整行不渲染（`.on-board` 由模板上的
+       `class:on-board` 挂——**不能叫 `.board`**，那个类名是看板页容器的） */
     .filters-row {
+      display: none;
+    }
+    .filters-row.on-board {
       display: flex;
       align-items: center;
       gap: 6px;
-      /* 3px 上下留白：行高由 44px 触控目标决定 → 50px；顶栏总高
-         = 44(铭牌行) + 50(道具栏行) + 42(页面导航行) + 2(边框) ≈ 138px（§5）。
-         **这一行自己不再横滚**（决策 201）：横滚收进槽位行（`.slots`），于是紧邻的
+      /* 3px 上下留白 + 行高由 44px 触控目标决定（44 + 6）+ 2px 下框（顶栏的框挪进来）
+         → 顶栏 = 52px；非看板路由这一行不露出 → 顶栏 0px。
+         **这一行自己不横滚**（决策 201）：横滚收进槽位行（`.slots`），于是紧邻的
          「待处理 N」与「新建任务」恒定完整可见——它们不再随槽位横滚出屏。 */
       padding: 3px 12px;
+      border-bottom: 2px solid var(--pane);
       overflow: visible;
     }
     .slots {
@@ -696,27 +628,69 @@
       flex: none;
       margin-left: 2px;
     }
-    /* 下拉脱离横滚容器的裁剪，改用视口定位；顶栏 138px → top 146px */
+    /* 下拉脱离横滚容器的裁剪，改用视口定位；钉在顶栏下沿（顶栏高度按路由变，故读 `--topbar-h`） */
     .dropdown {
       position: fixed;
       left: 12px;
       right: 12px;
-      top: 146px;
+      top: calc(var(--topbar-h) + 8px);
       width: auto;
       max-height: 55vh;
       background: var(--bg);
     }
+
+    /* ── 底部页签栏（决策 243）：脱出文档流、钉视口底缘。
+       盒高 = 2(上框) + 6(上留白) + 44(页签) + 6(下留白) + safeb = 58 + safeb，
+       与 app.css 里 `--nav-h` 的取值逐字对应——改这里必须同步改那笔账。 */
     .navbar {
-      padding: 0 12px 8px;
+      position: fixed;
+      left: 0;
+      right: 0;
+      bottom: 0;
+      z-index: 32;
+      gap: 0;
+      padding: 6px 6px calc(6px + var(--safeb));
+      border-top: 2px solid var(--pane);
+      background: var(--bg);
+      /* 四项恒定放得下：等分整宽，不再横滚 */
+      overflow: visible;
     }
     .navbar .chip {
-      min-height: 34px;
+      flex: 1 1 0;
+      min-width: 0;
+      /* 定高 44（border-box）：内容恰好 16(图) + 2(gap) + 18(行盒) = 36，
+         加 2×2 内边距 + 2×2 框 = 44——`min-height` 在这里拦不住（内容自然高
+         48 会把它顶掉），只有定死才能让页签栏盒高与 `--nav-h` 账本（58）对上。
+         图标在上、文字在下（移动页签范式）；命中区 ≥44px 补齐移动基线。
+         `overflow: hidden` 兜住行盒波动，绝不把整页撑出横向滚动 */
+      height: 44px;
+      flex-direction: column;
+      justify-content: center;
+      gap: 2px;
+      padding: 2px;
+      overflow: hidden;
+    }
+    /* 列排里前缀三角会悬在图标上方，且 wash 底 + 亮描边已足够表意——去掉 */
+    .navbar .chip.on::before {
+      display: none;
+    }
+    .navbar .chip .ic {
+      margin-right: 0;
+      vertical-align: baseline;
     }
     .proj {
-      margin-left: 6px;
+      flex: none;
+      margin-left: auto;
+      /* label 是 inline 容器时，select（inline-block）的基线 descender 会把行盒撑高
+         约 4px——页签栏盒高是 `--nav-h` 账本里写死的 58，一行都不许多。
+         改 flex 后行盒间隙消失，select 由自身 `height` 定高。 */
+      display: flex;
+      align-items: center;
     }
     .proj select {
-      min-height: 34px;
+      /* 定高（border-box 含 2px 框 = 44 触控底线）：intrinsic 高度不得上撑页签栏 */
+      height: 44px;
+      max-width: 34vw;
     }
   }
 </style>

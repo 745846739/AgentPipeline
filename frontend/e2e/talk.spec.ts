@@ -247,10 +247,11 @@ test.describe('对讲台 · 版面（票 04）', () => {
     await settleBundle(page, bundle);
     await expect(page.locator('.talk')).toBeVisible({ timeout: 60_000 });
 
-    // 顶栏高度是 §5 的两处定值（`--topbar-h` 的来源，也是各钉位的依据）：
-    // 新增的 foreman 头像在 34px 页签盒里必须按 16px 显示，否则会撑到 156px。
+    // 顶栏高度是 §5 的两处定值（`--topbar-h` 的来源，也是各钉位的依据）。
+    // 对讲台**不是看板路由**：窄档道具栏行不露出、导航行又已移到屏幕底部（决策 243），
+    // 顶栏**清零**——0 也是 `--topbar-h` 的合法值（`TopBar` 的 effect 不再挡 0）。
     const headerBox = await page.locator('header.top').boundingBox();
-    expect(headerBox?.height).toBe(138);
+    expect(headerBox?.height).toBe(0);
 
     // ① 页头 = **46px 的钉住带子**（44px 行 + 2px 下框，决策 218 修订 ④）：
     // ⋯ 的 44px 触控目标因此直接落在行内，不需要任何溢出技巧。
@@ -985,49 +986,8 @@ test.describe('对讲台 · 折行档（决策 192 / 218）', () => {
     expectBundleHealthy(bundle);
   });
 
-  /**
-   * 顶栏那 8 格信号灯在对讲台上也接得通（决策 218 ⑥）。
-   *
-   * 病根不在灯本身：它自报 `aria-label="跳到 <列名>"`，但 `#s-<key>` 只存在于看板
-   * （`BoardColumn.svelte`），于是本页上 8/8 无靶子、点了**一动不动**。接通的判据有两条，
-   * 缺一不可：**去到了 `#/`**，而且**目标列真的进了视野**——只断前者的话，一个「跳过去但
-   * 停在页面顶部、目标在视口下方一千像素」的实现照样绿。
-   *
-   * 第三条判据是「改址是**路由跳转**而不是整页刷新」：整页重载会清掉我们预先种下的那格
-   * 标记。这条不是形式主义——`router.navigate` 早先只写地址栏、镜像要等 `hashchange`
-   * （**另一个任务**）才跟上，于是紧随其后那次 `scrollIntoView` 找不到靶子（实测：整页
-   * `scrollTop` 停在 0，目标在视口下方 1027px），这正是本用例当初红掉的原因。
-   */
-  test('顶栏信号灯：在对讲台上点灯 → 去 #/ 并定位到那一列（决策 218 ⑥）', async ({ page }) => {
-    const bundle = watchBundle(page);
-    await page.setViewportSize({ width: 430, height: 900 });
-    await page.goto(`${app.webBase}/#/talk`);
-    await settleBundle(page, bundle);
-    await expect(page.locator('.talk')).toBeVisible({ timeout: 30_000 });
-
-    const lamp = page.locator('nav.railnav button.rn').first();
-    await expect(lamp).toBeVisible();
-    await expect(lamp).toHaveAttribute('aria-label', /跳到/);
-    await page.evaluate(() => {
-      (window as unknown as Record<string, unknown>).__enRoute = 1;
-    });
-    await lamp.click();
-
-    await expect(page).toHaveURL(/#\/$/);
-    // 靶子（看板第一列）真的在视口里：`≤479` 这一档 `scroll-margin-top: 148px` 由
-    // `app.css` 定，故它落在顶栏下沿稍下处，而不是屏幕上方或屏幕下方
-    await expect(page.locator('#s-init')).toBeVisible({ timeout: 15_000 });
-    const box = await page.locator('#s-init').boundingBox();
-    expect(box, '#s-init 应当有几何').not.toBeNull();
-    expect(box?.y ?? 1e9).toBeGreaterThanOrEqual(0);
-    expect(box?.y ?? 1e9).toBeLessThan(900);
-    // 没有整页重载（重载会把这格标记清掉）
-    expect(
-      await page.evaluate(() => (window as unknown as Record<string, unknown>).__enRoute),
-    ).toBe(1);
-
-    expectBundleHealthy(bundle);
-  });
+  /* 决策 218 ⑥ 的「顶栏信号灯跳段」用例已随**铭牌行整行退场**删除：窄档顶栏不再有
+     `.railnav`（导航行升为首行、道具栏行只在看板露出），那颗灯没有了，判据自然无处落。 */
 
   test('输入坞：没有提示语行，常态 88px、贴底栏上沿', async ({ page }) => {
     const bundle = watchBundle(page);
@@ -1160,14 +1120,15 @@ test.describe('对讲台 · 空看板也能对话（票 04 的验收锚点）', 
     await expect(input).toBeVisible();
     await expect(input).toBeEditable();
 
-    // 空态的「去看板新建任务」是**页面固定的导航入口**（`EmptyState` 的可选入口，纯前端路由，
-    // 不进后端动作契约）：它不在任何对话框（`.turn`）里，也不来自 allowed_actions——此刻全页
-    // 没有任何后端下发的动作。
-    // 它的出现同时证明看板已经装载完（空态等的是装载完成，不是"还没读"）。
-    const navLink = page.getByRole('link', { name: '去看板新建任务' });
-    await expect(navLink).toBeVisible();
-    await expect(navLink).toHaveAttribute('href', '#/');
+    // 空态**不再自带**导航入口（决策 240）：原先的「去看板新建任务」是页面固定的导航钮
+    // （纯前端路由、不进后端动作契约），看板收进顶栏那一枚页签之后它就没了；此刻全页
+    // 没有任何后端下发的动作，也不该有任何前端自造的页面跳转。
+    await expect(page.getByRole('link', { name: '去看板新建任务' })).toHaveCount(0);
     await expect(page.locator('.zone-status .turn button')).toHaveCount(0);
+    // 看板入口**只**在顶栏那一行页签上
+    await expect(
+      page.getByRole('navigation', { name: '页面导航' }).getByRole('link', { name: '看板' }),
+    ).toBeVisible();
 
     // 验收锚点：空看板照样能对话
     await input.fill('现在能做什么');
@@ -1556,7 +1517,7 @@ test.describe('对讲台 · 班次（决策 204）', () => {
  * 也一起换掉（否则这一档会先做出一个旧形态、再被改一次）。
  *
  * 三条一起看才成立：**不横向滚**、**控件形态与窄档同源**、**钉住关系按本档的顶栏算**
- * （这一档顶栏仍是桌面款 78–81px，不是移动款的 138px——写死 138 会让摘要条钉在屏幕中间）。
+ * （这一档顶栏仍是桌面款 78–81px，不是窄档那两档 52 / 0——写死窄档的数会让摘要条钉偏）。
  */
 test.describe('对讲台 · 折行档宽度扫描（决策 215 / 218）', () => {
   let app: App;
@@ -1588,7 +1549,7 @@ test.describe('对讲台 · 折行档宽度扫描（决策 215 / 218）', () => 
       await expect(page.locator('.zone-status .turn.warn.folded'), why).toHaveCount(1);
 
       // 钉住关系：页头带子紧接着**本档**顶栏的下沿（这一档顶栏是桌面款 78px，
-      // 不是移动款的 138px——写死 138 会让摘要条钉在屏幕中间）
+      // 不是窄档的 52 / 0——写死窄档的数会让摘要条钉偏）
       const hb = await page.locator('header.top').boundingBox();
       const head = await page.locator('.talk-head').boundingBox();
       expect(

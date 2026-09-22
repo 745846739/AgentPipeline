@@ -108,7 +108,7 @@
 </script>
 
 <main class="page">
-  <a class="crumb" href="#/">看板</a>
+  <!-- 原先这里挂一颗「看板」面包屑（决策 240 摘除）：看板是顶栏的一枚页签，不再由各页代递。 -->
   <div class="p-head">
     <h1 class="p-title">全局指标</h1>
     <button type="button" class="btn" disabled={loading} onclick={() => loadGlobal()}>
@@ -137,12 +137,11 @@
     </p>
 
     {#if global.tasks === 0}
-      <!-- 空态（票 13）：状态 → 下一步 → 可点的入口，七个页面同一套语汇。 -->
+      <!-- 空态（票 13）：状态 → 下一步（入口由决策 240 摘除——去哪页由顶栏那一行页签走，
+           本页不再自带一条看板链）。 -->
       <EmptyState
         state="现在还没有任务，所以没有可统计的东西。"
         next="先去看板新建一个任务：它跑起来之后，这里会出现成功率、各阶段耗时与重试率。"
-        href="#/"
-        linkLabel="去看板新建任务"
       />
     {:else}
       <!-- 站点分段条形图：横条挂在传送带站点下，无 KPI 卡片横排 -->
@@ -270,18 +269,8 @@
     margin: 0 auto;
     padding: 18px 20px 44px;
   }
-  /* 页头：面包屑 + 24px 标题 + 右侧动作钮（§3.1） */
-  .crumb {
-    display: inline-block;
-    color: var(--text-3);
-    margin-bottom: 10px;
-  }
-  .crumb::before {
-    content: '← ';
-  }
-  .crumb:hover {
-    color: var(--text-hi);
-  }
+  /* 页头：24px 标题 + 右侧动作钮（§3.1）。原先还有一颗「看板」面包屑及其三条样式，
+     决策 240 摘除后一并删（留下会变成 svelte-check 的死选择器告警）。 */
   .p-head {
     display: flex;
     align-items: baseline;

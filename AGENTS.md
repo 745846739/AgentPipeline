@@ -2,7 +2,7 @@
 
 AgentPipeline：kanban 式流水线驱动的本地多 agent 开发管线（init → architect-design → develop-design / test-design 并行 → sync-check → develop → review → test → merge → done）。
 
-设计文档入口见 [docs/README.md](docs/README.md)（含章节编号 §N ↔ 文件对照表）；术语表 [docs/glossary.md](docs/glossary.md)；决策日志 [docs/decisions.md](docs/decisions.md)（#1–239，只追加）。改代码前先读 [docs/testing.md](docs/testing.md) 的用例目录与五条可测试性接缝（决策 143，由决策 177 修订为五条，再由决策 194 修订**形状**——条数仍是五条，第五条从「网络出口加一条 `MarketClient`」改为「仓访问加一条 `SkillRepo`」）。界面层的可追溯性走 [design/frontend-design.md](design/frontend-design.md) §12.3 的「行为 / 规则 → 实现位置」表（决策 199，悬空引用由 `frontend/src/lib/behavior-map.test.ts` 拦下）。
+设计文档入口见 [docs/README.md](docs/README.md)（含章节编号 §N ↔ 文件对照表）；术语表 [docs/glossary.md](docs/glossary.md)；决策日志 [docs/decisions.md](docs/decisions.md)（#1–243，只追加）。改代码前先读 [docs/testing.md](docs/testing.md) 的用例目录与五条可测试性接缝（决策 143，由决策 177 修订为五条，再由决策 194 修订**形状**——条数仍是五条，第五条从「网络出口加一条 `MarketClient`」改为「仓访问加一条 `SkillRepo`」）。界面层的可追溯性走 [design/frontend-design.md](design/frontend-design.md) §12.3 的「行为 / 规则 → 实现位置」表（决策 199，悬空引用由 `frontend/src/lib/behavior-map.test.ts` 拦下）。
 
 ## Agent skills
 

@@ -180,7 +180,9 @@ test.describe('前端 E2E：设置各页的空态（票 13 / 12 / 09 / 23）', (
   test('设置页的小节标题明确小于页面标题，且不引入阶外字号（票 09）', async ({ page }) => {
     for (const [hash, heading] of [
       ['#/settings/market', '设置 · 技能市场'],
-      ['#/settings/providers', '设置 · 模型与密钥'],
+      // 推荐技能面板随阶段配置整块搬来了这一页（决策 198 裁决③），「模型与密钥」页自此
+      // 没有小节标题（只剩 h1 与台账盒的 div 头）——小节标题的第二处取证落点跟着搬。
+      ['#/settings/stages', '设置 · 阶段配置'],
     ] as const) {
       await open(page, app, hash, heading);
 
@@ -189,7 +191,7 @@ test.describe('前端 E2E：设置各页的空态（票 13 / 12 / 09 / 23）', (
         .evaluate((el) => getComputedStyle(el).fontSize);
       expect(titleSize).toBe('24px');
 
-      // 小节标题：市场的「仓名单 / 技能列表」是 h2，模型与密钥的「推荐技能」是区块头
+      // 小节标题：市场的「仓名单 / 技能列表」是 h2，阶段配置的「阶段配置」是 h2、「推荐技能」是区块头
       const sizes = await page
         .locator('h2, .rec-head')
         .evaluateAll((els) => els.map((el) => getComputedStyle(el).fontSize));
@@ -215,8 +217,9 @@ test.describe('前端 E2E：设置各页的空态（票 13 / 12 / 09 / 23）', (
     expect(gateColor).toBe(rgbString(await rootToken(page, '--text-hi')));
     expect(gateColor).not.toBe(pending);
 
-    // ② 推荐技能的「未安装」：只有文字编码、要人读 → 次级必读档（决策 195）
-    await open(page, app, '#/settings/providers', '设置 · 模型与密钥');
+    // ② 推荐技能的「未安装」：只有文字编码、要人读 → 次级必读档（决策 195）。
+    // 面板已随阶段配置搬到 `#/settings/stages`（决策 198 裁决③），取证跟着它走。
+    await open(page, app, '#/settings/stages', '设置 · 阶段配置');
     const state = page.locator('.item .state').first();
     await expect(state).toHaveText(/未安装/);
     const stateColor = await colorOf(state);

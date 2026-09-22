@@ -1,4 +1,4 @@
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it, vi } from 'vitest';
 import { parseRoute, readQuery, router, writeQuery } from './router.svelte';
 
 /**
@@ -12,7 +12,10 @@ import { parseRoute, readQuery, router, writeQuery } from './router.svelte';
  * 消费方（指标页 / 项目页）按它们取值，改名会静默断掉那两个入口。
  */
 describe('parseRoute', () => {
-  it('看板是根与空 hash 的共同落点', () => {
+  it('根 `#/` 是看板；空 hash 的**纯解析**也仍是看板（开屏那一层另有一手，见「开屏默认落点」）', () => {
+    // 决策 241 把默认落点改成了对讲台，但改的是**开屏归一**（store 进场前那手 replaceState），
+    // 不是 `parseRoute`：显式 `#/` 必须照旧是看板——决策 240 的「看板是根路由」不修订，
+    // §4.2 四枚页签的落点与十几处 `goto('#/')` 的 e2e 也都指着它。
     expect(parseRoute('')).toEqual({ name: 'board', query: {} });
     expect(parseRoute('#')).toEqual({ name: 'board', query: {} });
     expect(parseRoute('#/')).toEqual({ name: 'board', query: {} });
@@ -104,6 +107,46 @@ describe('parseRoute', () => {
 
   it('未知路径回落到 not-found 并带回原路径', () => {
     expect(parseRoute('#/nope')).toEqual({ name: 'not-found', path: '/nope', query: {} });
+  });
+});
+
+/**
+ * 开屏默认落点（决策 241）：地址栏没写 hash 时归一到 `#/talk`。
+ *
+ * 这一手住在**模块初始化**里（`router.svelte.ts` 顶部、`new RouterStore()` 之前），
+ * 所以只能靠清掉模块缓存重跑一遍来钉——直接调 `parseRoute('')` 钉不到它：纯解析照旧把空
+ * hash 算成看板（上一组用例），归一是 store 进场前那手 `replaceState` 干的。
+ */
+describe('开屏默认落点（决策 241）', () => {
+  it('空 hash 开屏归一成 #/talk，且 ?pair= 与后退历史都不动；显式 #/ 仍是看板', async () => {
+    // 扫码进来的地址长这样：有 search、没 hash（决策 191 的令牌就挂在 search 上）
+    window.history.replaceState(null, '', '/?pair=e2e-token');
+    expect(window.location.hash).toBe('');
+    const historyBefore = window.history.length;
+
+    vi.resetModules();
+    const fresh = await import('./router.svelte');
+
+    // 归一到对讲台：地址与渲染读的是同一份（replaceState 不发 hashchange，
+    // 所以归一必须跑在 store 首读之前）
+    expect(window.location.hash).toBe('#/talk');
+    expect(window.location.search).toBe('?pair=e2e-token');
+    expect(fresh.router.route.name).toBe('talk');
+    // 不进历史：开屏这一跳用 replaceState，后退不该退回「还没归一」的空地址
+    expect(window.history.length).toBe(historyBefore);
+
+    // 显式 #/ 照旧是看板（决策 240 不修订）：默认落点只接管空地址
+    fresh.router.navigate('/');
+    expect(window.location.hash).toBe('#/');
+    expect(fresh.router.route.name).toBe('board');
+  });
+
+  it('带 hash 的开屏不动（#/、#/metrics 各归各位）', async () => {
+    window.history.replaceState(null, '', '/#/metrics');
+    vi.resetModules();
+    const fresh = await import('./router.svelte');
+    expect(window.location.hash).toBe('#/metrics');
+    expect(fresh.router.route.name).toBe('metrics');
   });
 });
 

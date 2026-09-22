@@ -349,17 +349,53 @@ test.describe('前端 E2E ⑨：像素主题（决策 169）', () => {
     expectBundleHealthy(bundle);
   });
 
-  test('移动款：138px 顶栏、纵向链节脊线、灯可跳段、触控目标 ≥44px', async ({ page }) => {
+  test('移动款：导航钉底缘成页签栏 + 道具栏行只在看板、纵向链节脊线、触控目标 ≥44px', async ({
+    page,
+  }) => {
     const bundle = watchBundle(page);
     await page.setViewportSize({ width: 430, height: 900 });
     await page.goto(`${app.webBase}/#/`);
     await settleBundle(page, bundle);
     await expect(page.locator('section.col').first()).toBeVisible({ timeout: 60_000 });
 
-    // 顶栏三行 ≈138px（铭牌行 + 灯条 + 页导航 + 道具栏）
     const header = page.locator('header.top');
     const headerBox = await header.boundingBox();
-    expect(headerBox?.height).toBe(138);
+    // 看板路由 = 44(触控行) + 6(上下留白) + 2(下框) = 52px（决策 243：导航行已移出顶栏）
+    expect(headerBox?.height).toBe(52);
+
+    // 行位：**页面导航行钉在视口底缘**（决策 243），道具栏行留在顶栏里
+    const navBox = await page.locator('header.top .navbar').boundingBox();
+    const filBox = await page.locator('header.top .filters-row').boundingBox();
+    expect(navBox, '底部页签栏应当有几何').not.toBeNull();
+    expect(filBox, '看板上道具栏行应当有几何').not.toBeNull();
+    expect(navBox!.y, '页签栏必须在道具栏行下面').toBeGreaterThan(filBox!.y);
+    expect(
+      Math.round(navBox!.y + navBox!.height),
+      '页签栏下沿必须贴住视口底缘',
+    ).toBe(900);
+    // 页签栏自身几何：上框 2 + 上留白 6 + 页签 44 + 下留白 6 = 58（无安全区的桌面上下文）
+    expect(Math.round(navBox!.height)).toBe(58);
+    // 四枚页签命中区 ≥44px（移动基线），状态条叠在页签栏上方、交集为 0
+    const chips = page.locator('header.top .navbar .navchip');
+    await expect(chips).toHaveCount(4);
+    const chipBoxes = await chips.evaluateAll((els) =>
+      els.map((el) => el.getBoundingClientRect().height),
+    );
+    for (const h of chipBoxes) {
+      expect(h).toBeGreaterThanOrEqual(44);
+    }
+    const statusBox = await page.locator('footer.statusline').boundingBox();
+    expect(statusBox, '状态条应当有几何').not.toBeNull();
+    expect(
+      Math.round(statusBox!.y + statusBox!.height),
+      '状态条下沿必须贴住页签栏上沿',
+    ).toBe(Math.round(navBox!.y));
+
+    // 铭牌行（logo / wordmark / 会话名 / 信号灯缩略条）在窄档整行不渲染
+    // （元素仍在 DOM——桌面档要靠它，故断的是 `display:none` 而不是不存在）
+    await expect(page.locator('header.top .bar-top')).toBeHidden();
+    await expect(page.locator('nav.railnav')).toHaveCount(0);
+    await expect(page.locator('header.top .wordmark')).toBeHidden();
 
     // 站点脊线 = 6px 纵向链节（不是横向传送带）
     const spine = page.locator('.spine-rule').first();
@@ -368,17 +404,12 @@ test.describe('前端 E2E ⑨：像素主题（决策 169）', () => {
     const spineBg = await spine.evaluate((el) => getComputedStyle(el).backgroundImage);
     expect(spineBg).toContain('repeating-linear-gradient');
 
-    // 灯条可跳段：点击后页面滚动（站点带带 scroll-margin-top: 148px）
+    // 跳段定位的让位读实测 `--topbar-h`（看板 52 + 10 的呼吸）
     const scrollMargin = await page
       .locator('section.col')
       .first()
       .evaluate((el) => getComputedStyle(el).scrollMarginTop);
-    expect(scrollMargin).toBe('148px');
-    const before = await page.evaluate(() => window.scrollY);
-    await page.locator('.rn').nth(4).click();
-    await page.waitForTimeout(500);
-    const after = await page.evaluate(() => window.scrollY);
-    expect(after).toBeGreaterThan(before);
+    expect(scrollMargin).toBe('62px');
 
     // 道具栏槽位：高度仍恒 34px、不缩、整行横滚；窄屏（决策 201）只给**当前选中**的槽带词，
     // 故第一个槽（缺省选中的「全部」）宽于未选中的图标槽——宽度不再定死。
