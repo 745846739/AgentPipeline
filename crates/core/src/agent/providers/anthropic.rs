@@ -145,6 +145,18 @@ impl Adapter for Anthropic {
                             .unwrap_or("")
                             .to_string(),
                     )],
+                    // 扩展思考的增量（决策 244）：`thinking` 是它的正文。
+                    // 本适配器**不开启** `thinking` 请求参数（那是另一件事：开启后必须原样
+                    // 回灌思考块，而回灌会改变既有请求形状），故这条分支只为「对端自己发了」
+                    // 那种情形准备——收到就展示，而不是静默丢掉。
+                    Some("thinking_delta") => {
+                        let thought = delta.get("thinking").and_then(|v| v.as_str()).unwrap_or("");
+                        if thought.is_empty() {
+                            Vec::new()
+                        } else {
+                            vec![StreamChunk::Reasoning(thought.to_string())]
+                        }
+                    }
                     Some("input_json_delta") => vec![StreamChunk::ToolDelta {
                         index,
                         id: None,
@@ -422,6 +434,30 @@ mod tests {
         // 未知事件（如 ping）忽略
         assert!(Anthropic
             .parse_chunk(r#"{"type":"ping"}"#)
+            .unwrap()
+            .is_empty());
+    }
+
+    #[test]
+    fn thinking_delta_is_its_own_channel() {
+        // 决策 244：扩展思考的增量走 `thinking_delta` / `thinking`，与正文分开。
+        // 本适配器不开启 `thinking` 请求参数（那要原样回灌思考块，是另一件事），
+        // 但**对端发了就展示**——静默丢掉会让「它想了什么」永远看不见。
+        let thought = Anthropic
+            .parse_chunk(
+                r#"{"type":"content_block_delta","index":0,"delta":{"type":"thinking_delta","thinking":"先看台账"}}"#,
+            )
+            .unwrap();
+        assert!(
+            matches!(thought.as_slice(), [StreamChunk::Reasoning(t)] if t == "先看台账"),
+            "{thought:?}"
+        );
+
+        // 空串不产块（照 text_delta 的分寸：空增量只会在驱动层被丢掉）
+        assert!(Anthropic
+            .parse_chunk(
+                r#"{"type":"content_block_delta","index":0,"delta":{"type":"thinking_delta","thinking":""}}"#
+            )
             .unwrap()
             .is_empty());
     }

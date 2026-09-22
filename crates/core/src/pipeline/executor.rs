@@ -235,6 +235,13 @@ const OUTPUT_CODE_CHANGES: &str = "code_changes";
 const OUTPUT_SYNC_DECISION: &str = "sync_decision";
 const OUTPUT_REVIEW_DIFF: &str = "review_diff";
 
+/// 流水线节点的 agent 身份（`RunContext.agent_type` 与 `tool_event.agent_type` 的**同一处**
+/// 事实源，决策 244）。
+///
+/// 两处各写一个字面量的话，「工具事件带身份」这条改动会在其中一处悄悄漂移，而漂移的表现
+/// 恰好是**对讲台多出别人的工具调用**（或被判成别人）——一个不会报错的错误。
+const PIPELINE_AGENT_TYPE: &str = "main";
+
 // ─────────────────────────────── 执行器 ───────────────────────────────
 
 /// executor 的协作依赖。`llm` 是测试接缝（决策 142/143）：生产传真实适配层，
@@ -1647,7 +1654,7 @@ impl Executor {
                     session_id: String::new(),
                     branch: cursor.branch.clone(),
                     run_id,
-                    agent_type: "main".into(),
+                    agent_type: PIPELINE_AGENT_TYPE.into(),
                 }),
             };
             // 模型调用是**最容易无限期停住**的地方：一个不返回的请求两侧都没有心跳，
@@ -3343,6 +3350,11 @@ use crate::pipeline::subagent::RunTokens;
 
 impl Executor {
     /// 决策 123 的 `tool_event` 发射（start / end / error 三态共用一个出口）。
+    ///
+    /// 身份串与会话**在这一个出口里填死**（决策 244）：执行体发的事件永远是流水线节点的，
+    /// 由调用点各传一次只会多两处能写错的地方——而写错的后果（对讲台混进流水线的工具调用，
+    /// 或反之）不会报错，只会显示错。值班长那边有它自己的出口
+    /// （`ForemanRunner::emit_tool_event`），一样的形状、不同的身份。
     fn emit_tool_event(
         &self,
         task: &Task,
@@ -3356,6 +3368,9 @@ impl Executor {
             task_id: task.id.clone(),
             branch: cursor.branch.clone(),
             run_id,
+            agent_type: PIPELINE_AGENT_TYPE.to_string(),
+            // 流水线节点不挂会话（与 `RunContext.session_id` 同一口径）。
+            session_id: String::new(),
             tool: tool.to_string(),
             phase,
             args_summary: args_summary.to_string(),

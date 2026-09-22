@@ -146,6 +146,15 @@ impl Message {
 pub struct AgentResponse {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub content: Option<String>,
+    /// 这次调用的**推理 / 思考**原文（决策 244）。没有推理的模型给 `None`。
+    ///
+    /// **它不是 `content` 的一部分**，也**绝不回灌**进后续请求：部分厂商把推理段
+    /// 视为模型内部状态，发回去会被拒；进 `messages` 还会让下一轮的 prompt 平白翻倍
+    /// （它是这一轮里最长的东西）。它的去处只有两个：实时增量
+    /// （`conversation_delta` 的 `reasoning` 声道）与对讲台的展示留痕
+    /// （`kanban_foreman_messages.thinking`）——**它不进模型上下文**。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reasoning: Option<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub tool_calls: Vec<ToolCall>,
     #[serde(default)]

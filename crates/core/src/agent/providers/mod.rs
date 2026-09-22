@@ -25,7 +25,7 @@ use futures::StreamExt;
 use reqwest::Client;
 
 use crate::agent::client::{AgentResponse, LlmClient, LlmRequest, RunContext, ToolCall};
-use crate::sse::{SseEvent, SseSink};
+use crate::sse::{Channel, SseEvent, SseSink};
 use crate::storage::Store;
 use crate::types::Provider;
 use crate::{Error, Result};
@@ -149,6 +149,18 @@ pub fn base_url(provider: &Provider) -> String {
 pub(crate) enum StreamChunk {
     /// 助手文本增量。
     Text(String),
+    /// 推理（思考）增量（决策 244）。
+    ///
+    /// **与 `Text` 分开是必须的，不是好看**：它是模型的草稿而不是它要说的话——
+    /// 两件事混成一个声道之后，界面分不出哪一段是回话、哪一段是过程，而
+    /// 「把思考当回话念给人听」与「把回话当思考折叠起来」都是错的。
+    ///
+    /// 两条去处，都要与 `Text` 分开走：① 实时增量（`conversation_delta` 的
+    /// `channel = reasoning`）；② 攒进 [`AgentResponse::reasoning`] 供对讲台展示留痕。
+    /// **绝不用它拼 `content`、绝不回灌**——回灌会破坏部分厂商的协议（推理段不是 assistant
+    /// 消息的一部分，OpenAI 兼容族把 `reasoning_content` 发回去会被拒），而它通常是一轮里
+    /// 最长的一段，进历史窗口会每轮白烧一份 token。
+    Reasoning(String),
     /// 工具调用增量：按 `index` 聚合 id / name / arguments 片段。
     ToolDelta {
         index: usize,
@@ -287,6 +299,8 @@ impl ProductionLlm {
         let mut stream = response.bytes_stream();
         let mut buffer = String::new();
         let mut content = String::new();
+        // 推理原文（决策 244）：和 `content` 分开攒，只用于展示留痕，不回灌。
+        let mut reasoning = String::new();
         let mut tools: BTreeMap<usize, ToolAccum> = BTreeMap::new();
         let mut usage = UsageAccum::default();
         let mut done = false;
@@ -320,7 +334,15 @@ impl ProductionLlm {
                         StreamChunk::Text(t) => {
                             content.push_str(&t);
                             if !t.is_empty() {
-                                self.emit_delta(run, &t, 0, 0);
+                                self.emit_delta(run, Channel::Content, &t, 0, 0);
+                            }
+                        }
+                        // 推理增量只走实时通道：**不入 `content`**（它不是回话的一部分，
+                        // 回灌会破坏部分厂商协议），也不落进模型上下文（决策 244）。
+                        StreamChunk::Reasoning(t) => {
+                            reasoning.push_str(&t);
+                            if !t.is_empty() {
+                                self.emit_delta(run, Channel::Reasoning, &t, 0, 0);
                             }
                         }
                         StreamChunk::ToolDelta {
@@ -372,6 +394,7 @@ impl ProductionLlm {
         if usage.prompt_tokens.is_some() || usage.completion_tokens.is_some() {
             self.emit_delta(
                 run,
+                Channel::Content,
                 "",
                 usage.prompt_tokens.unwrap_or(0),
                 usage.completion_tokens.unwrap_or(0),
@@ -388,6 +411,11 @@ impl ProductionLlm {
             } else {
                 Some(content)
             },
+            reasoning: if reasoning.is_empty() {
+                None
+            } else {
+                Some(reasoning)
+            },
             tool_calls,
             prompt_tokens: usage.prompt_tokens.unwrap_or(0),
             completion_tokens: usage.completion_tokens.unwrap_or(0),
@@ -398,7 +426,14 @@ impl ProductionLlm {
         })
     }
 
-    fn emit_delta(&self, run: Option<&RunContext>, text: &str, prompt: u32, completion: u32) {
+    fn emit_delta(
+        &self,
+        run: Option<&RunContext>,
+        channel: Channel,
+        text: &str,
+        prompt: u32,
+        completion: u32,
+    ) {
         let Some(run) = run else { return };
         self.sse.emit(SseEvent::ConversationDelta {
             task_id: run.task_id.clone(),
@@ -406,6 +441,7 @@ impl ProductionLlm {
             run_id: run.run_id,
             agent_type: run.agent_type.clone(),
             session_id: run.session_id.clone(),
+            channel,
             role: "assistant".into(),
             text: text.to_string(),
             prompt_tokens: prompt,

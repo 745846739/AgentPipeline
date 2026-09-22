@@ -36,7 +36,7 @@ use crate::config::Settings;
 use crate::home::Home;
 use crate::pipeline::proposals::StoreProposalSink;
 use crate::process::RealProcessKiller;
-use crate::sse::SseSink;
+use crate::sse::{SseEvent, SseSink, ToolPhase};
 use crate::storage::foreman::{
     ForemanMessage, ForemanSession, NewForemanMessage, FOREMAN_ROLE_ASSISTANT,
 };
@@ -1179,6 +1179,10 @@ impl ForemanRunner {
         let mut tokens = (0u32, 0u32);
         let mut traces: Vec<ForemanTrace> = Vec::new();
         let mut reply: Option<String> = None;
+        // 这一轮里各次模型调用产出的推理原文，按顺序拼起来（决策 244）。
+        // **跨轮累积**：一轮可能调用模型好几次（先思考再查台账再收口），而界面上那条
+        // 折叠块说的是「这一轮它想了什么」，不是「最后一次调用想了什么」。
+        let mut thinking = String::new();
         // 空内容与「轮数耗尽」是两回事，报错必须分得开——否则一次「模型返回空」会被
         // 说成「它可能一直在查台账」，把人引到完全错误的方向上去查。
         let mut empty_replies = 0usize;
@@ -1217,6 +1221,14 @@ impl ForemanRunner {
             let response = self.llm.complete(request).await?;
             tokens.0 += response.prompt_tokens;
             tokens.1 += response.completion_tokens;
+            // 推理原文（决策 244）：**只攒起来展示，不回灌**——既不进 `transcript`，
+            // 也不进下一轮的 prompt（它不是 assistant 消息的一部分）。
+            if let Some(thought) = response.reasoning.as_deref().filter(|t| !t.is_empty()) {
+                if !thinking.is_empty() {
+                    thinking.push_str("\n\n");
+                }
+                thinking.push_str(thought);
+            }
             transcript.push(Message::assistant(
                 response.content.clone(),
                 response.tool_calls.clone(),
@@ -1239,12 +1251,22 @@ impl ForemanRunner {
             }
             for call in &response.tool_calls {
                 let args_summary = summarize_args(&call.arguments);
+                // 工具调用**当场**推给界面（决策 244）：落库的 `traces_json` 要等到这一轮
+                // 收口才写，而诉求正是「不要在对话完结后才展示」。两处记的是同一件事的两种
+                // 时态——实时事件说「此刻在查什么」，落库痕迹说「这一轮查过什么」（审计）。
+                self.emit_tool_event(&session.id, &call.name, ToolPhase::Start, &args_summary);
                 let (content, ok) = match self.run_tool(&tools, call, &ctx).await {
                     Ok(outcome) => (outcome.content, true),
                     // 工具失败**不**上升为整次回话失败（§12.8 的同一姿态）：
                     // 把错误文本回给模型让它改道，而不是让人看到一条报错。
                     Err(e) => (format!("工具执行失败：{e}"), false),
                 };
+                self.emit_tool_event(
+                    &session.id,
+                    &call.name,
+                    if ok { ToolPhase::End } else { ToolPhase::Error },
+                    &args_summary,
+                );
                 traces.push(ForemanTrace {
                     tool: call.name.clone(),
                     args_summary,
@@ -1334,6 +1356,9 @@ impl ForemanRunner {
                 completion_tokens: tokens.1,
                 briefing_json: Some(briefing_json),
                 traces_json,
+                // 空串存 `None`（不存空文本）：与 `briefing_json` / `traces_json` 同一条
+                // 口径——「没有」与「有但是空的」是两件事，前者该在下发时是 null。
+                thinking: (!thinking.trim().is_empty()).then_some(thinking),
             })
             .await?;
 
@@ -1632,6 +1657,25 @@ impl ForemanRunner {
         ctx: &ToolCallContext,
     ) -> Result<crate::agent::tools::ToolOutcome> {
         tools.execute(call, ctx).await
+    }
+
+    /// 工具调用事件的发射（决策 244）。
+    ///
+    /// 身份串填 [`FOREMAN_AGENT_TYPE`] + 本班次 `session_id`——路由那头按**同一个判据**
+    /// （`SseEvent::is_foreman_event`）过滤，与对话增量走同一条路。`task_id` / `branch`
+    /// 是恒空串、`run_id` 恒 0，与值班长的对话增量同一条口径（决策 182⑥/⑨：它不挂任务、
+    /// 不落 run 行）。
+    fn emit_tool_event(&self, session_id: &str, tool: &str, phase: ToolPhase, args_summary: &str) {
+        self.sse.emit(SseEvent::ToolEvent {
+            task_id: String::new(),
+            branch: String::new(),
+            run_id: 0,
+            agent_type: FOREMAN_AGENT_TYPE.to_string(),
+            session_id: session_id.to_string(),
+            tool: tool.to_string(),
+            phase,
+            args_summary: args_summary.to_string(),
+        });
     }
 
     /// 「你能动手到什么程度」那一段（决策 206 / 188）。

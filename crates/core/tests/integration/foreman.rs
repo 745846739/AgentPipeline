@@ -21,6 +21,7 @@ use agentpipeline_core::pipeline::foreman::{
     FOREMAN_PARTIAL_TURN_MARK, FOREMAN_PERSONA, FOREMAN_STAGE_KEY, FOREMAN_TOOL_SPECS,
     FOREMAN_WATCH_MARK, OPERATION_LOG_MARK,
 };
+use agentpipeline_core::sse::{SseEvent, SseEventType, ToolPhase};
 use agentpipeline_core::storage::foreman::NewForemanMessage;
 use agentpipeline_core::storage::model_requests::{
     ModelRequestStatus, ModelRequestUsage, NewModelRequest,
@@ -150,6 +151,34 @@ impl Harness {
             settings,
             self._home.home().clone(),
             Arc::new(agent) as Arc<dyn LlmClient>,
+            Arc::new(testkit::SseRecorder::new()),
+        )
+    }
+
+    /// 带**可读的事件录制器**的构造（决策 244：断言工具调用是**在轮次进行中**推出去的，
+    /// 而不是等它落库）。
+    ///
+    /// 与 [`Self::runner_with`] 的差别只有一处：那个扔掉录制器（大多数用例只关心收口结果），
+    /// 这个把它交出来。
+    fn runner_recording(&self, agent: FakeAgent) -> (ForemanRunner, Arc<testkit::SseRecorder>) {
+        let recorder = Arc::new(testkit::SseRecorder::new());
+        let runner = ForemanRunner::new(
+            self.store.clone(),
+            Settings::default(),
+            self._home.home().clone(),
+            Arc::new(agent) as Arc<dyn LlmClient>,
+            recorder.clone() as Arc<dyn agentpipeline_core::sse::SseSink>,
+        );
+        (runner, recorder)
+    }
+
+    /// 接任意替身的构造（决策 244：给 [`Thinking`] 那类「包一层 FakeAgent」的替身用）。
+    fn runner_with_llm(&self, llm: Arc<dyn LlmClient>) -> ForemanRunner {
+        ForemanRunner::new(
+            self.store.clone(),
+            Settings::default(),
+            self._home.home().clone(),
+            llm,
             Arc::new(testkit::SseRecorder::new()),
         )
     }
@@ -288,6 +317,7 @@ async fn history_is_trimmed_by_character_budget_but_stays_in_the_store() {
                 completion_tokens: 0,
                 briefing_json: None,
                 traces_json: None,
+                thinking: None,
             })
             .await
             .unwrap();
@@ -346,6 +376,104 @@ async fn session_listing_returns_the_newest_tail_in_chronological_order() {
         .await
         .unwrap()
         .is_empty());
+}
+
+// ──────────────────── 工具调用的实时声道（决策 244）────────────────────
+
+/// 工具调用**在轮次进行中**就推事件出去，而不是等它落库。
+///
+/// 诉求的原话是「把对讲台的 thinking 和工具调用都实时展示出来，不要像现在这样在对话
+/// 完结后展示」。改动之前，值班长的工具痕迹只有两条路到界面：落库的 `traces_json`
+/// （那一轮收口之后才有）——即「对话完结后」。本用例钉的就是这条改变：`start` / `end`
+/// 两个相位都在 `say()` 返回**之前**已经发出去了。
+#[tokio::test]
+async fn foreman_tool_calls_are_published_live_not_only_after_the_turn() {
+    let h = Harness::seeded().await;
+    let mut script = Script::new();
+    script
+        .for_foreman()
+        .read_task("t1")
+        .text("t1 还在排队，没别的事。");
+    let (runner, recorder) = h.runner_recording(FakeAgent::new(script));
+
+    let turn = runner.say(None, "t1 怎么样了？").await.unwrap();
+    assert_eq!(turn.traces.len(), 1, "痕迹照旧落库（审计那条路不动）");
+
+    let tool_events: Vec<_> = recorder
+        .events()
+        .into_iter()
+        .filter(|e| e.event_type() == SseEventType::ToolEvent)
+        .collect();
+    assert_eq!(tool_events.len(), 2, "一次调用两个相位：{tool_events:?}");
+    for (i, event) in tool_events.iter().enumerate() {
+        match event {
+            SseEvent::ToolEvent {
+                agent_type,
+                session_id,
+                tool,
+                phase,
+                args_summary,
+                task_id,
+                branch,
+                ..
+            } => {
+                // 身份串与会话是这条事件走得到 `/foreman/stream` 的唯一凭据
+                // （`is_foreman_event` 的判据）。
+                assert_eq!(agent_type, "foreman");
+                assert_eq!(session_id, &turn.session.id);
+                assert_eq!(tool, "read_task");
+                assert!(args_summary.contains("t1"));
+                // 空 task id / 空分支（决策 182⑥）：工头事件不挂流水线的坐标。
+                assert_eq!(task_id, "");
+                assert_eq!(branch, "");
+                let expected = if i == 0 {
+                    ToolPhase::Start
+                } else {
+                    ToolPhase::End
+                };
+                assert_eq!(*phase, expected, "相位顺序必须是 start → end");
+            }
+            other => panic!("应是工具事件：{other:?}"),
+        }
+    }
+    // 这条事件真的会被对讲台那条路由收下（判据本身，不只是字段长得对）。
+    assert!(tool_events.iter().all(|e| e.is_foreman_event()));
+    // 任务级流照旧收不到它：空 task id 永不等于真实任务 id（决策 182⑥ 的零干扰）。
+    assert!(tool_events.iter().all(|e| e.task_id() != "t1"));
+}
+
+/// 工具**失败**也走实时声道，且相位是 `error` 而不是静默。
+///
+/// 失败不该上升为整轮回话失败（§12.8），但它必须让人看得见「这一下没查到」——
+/// 否则界面上那次调用会停在「正在查…」不动。
+///
+/// 用 `read_file` 而不是 `read_task` 来造这个失败，是**故意的**：读一个不存在的任务
+/// **不算失败**（`read_task` 自己把「没这个任务」当正常回答交回去，见它的实现注释——
+/// 模型记错 id 不该让整轮报错），而读一个不存在的文件走的是真 `Err` 通道。
+#[tokio::test]
+async fn foreman_reports_a_failed_tool_call_live_with_the_error_phase() {
+    let h = Harness::seeded().await;
+    let mut script = Script::new();
+    script
+        .for_foreman()
+        .tool("read_file", serde_json::json!({"path": "没有这个文件.md"}))
+        .text("那个文件不在，我换个线索查。");
+    let (runner, recorder) = h.runner_recording(FakeAgent::new(script));
+
+    let turn = runner.say(None, "看看那个文件").await.unwrap();
+    assert!(turn.reply.contains("换个线索"));
+    assert_eq!(turn.traces.len(), 1);
+    assert!(!turn.traces[0].ok, "这一条痕迹该记成失败");
+
+    let phases: Vec<_> = recorder
+        .events()
+        .into_iter()
+        .filter_map(|e| match e {
+            SseEvent::ToolEvent { phase, .. } => Some(phase),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(phases, vec![ToolPhase::Start, ToolPhase::Error]);
 }
 
 // ─────────────────────────── 会话（票 01 / 02）───────────────────────────
@@ -2211,6 +2339,7 @@ async fn session_totals_sum_the_persisted_columns() {
             completion_tokens: 20,
             briefing_json: None,
             traces_json: None,
+            thinking: None,
         })
         .await
         .unwrap();
@@ -2223,6 +2352,7 @@ async fn session_totals_sum_the_persisted_columns() {
             completion_tokens: 5,
             briefing_json: None,
             traces_json: None,
+            thinking: None,
         })
         .await
         .unwrap();
@@ -2554,6 +2684,7 @@ async fn two_sessions_do_not_pollute_each_others_messages_or_totals() {
             completion_tokens: 10,
             briefing_json: None,
             traces_json: None,
+            thinking: None,
         })
         .await
         .unwrap();
@@ -4263,5 +4394,129 @@ async fn one_watch_round_closes_all_four_criteria_on_the_same_run() {
             .iter()
             .any(|r| r["prompt_tokens"].as_i64() == Some(1_234_567)),
         "量速那一半（这一次调用烧掉多少）也要在场：{evidence}"
+    );
+}
+
+// ──────────────────── 思考留痕（决策 244）────────────────────
+
+/// 把任意替身包一层：给它每一次响应补上推理原文。
+///
+/// 为什么包一层而不是改 `FakeAgent`：`Step` 是**共享**的接缝（流水线 / 子代理 / 伪阶段都用
+/// 它），而「产推理」只有本特性关心——往那个公共枚举上加一个变体会让每一处 `match step`
+/// 都要跟着改，代价与收益不成比例（照 `FailingLlm` / `ChattyForever` 那两个局部替身的先例）。
+struct Thinking {
+    inner: FakeAgent,
+    thought: String,
+}
+
+impl LlmClient for Thinking {
+    fn complete(
+        &self,
+        request: LlmRequest,
+    ) -> futures::future::BoxFuture<'static, agentpipeline_core::Result<AgentResponse>> {
+        let inner = self.inner.clone();
+        let thought = self.thought.clone();
+        Box::pin(async move {
+            let mut response = inner.complete(request).await?;
+            response.reasoning = Some(thought);
+            Ok(response)
+        })
+    }
+}
+
+/// 值班长想过什么**留在台账那一行**上（决策 244）。
+///
+/// 为什么落库这一条必须钉住：推理若只活在实时流里，它会在那一轮收口重取台账的那一刻
+/// 整段消失（前端以台账为权威，见 `settleForemanStream`）——即「能看到一秒，然后永远
+/// 看不到」，那比不展示更坏。
+#[tokio::test]
+async fn foreman_persists_what_it_thought() {
+    let h = Harness::empty().await;
+    let mut script = Script::new();
+    script.for_foreman().text("看过了，没有待办。");
+    let runner = h.runner_with_llm(Arc::new(Thinking {
+        inner: FakeAgent::new(script),
+        thought: "先看看板，再看有没有卡住的任务。".into(),
+    }));
+
+    let turn = runner.say(None, "有活吗").await.unwrap();
+    let rows = h
+        .store
+        .list_foreman_messages(&turn.session.id, 10)
+        .await
+        .unwrap();
+    let assistant = rows
+        .iter()
+        .find(|m| m.role == "assistant")
+        .expect("值班长那一行");
+    assert_eq!(
+        assistant.thinking.as_deref(),
+        Some("先看看板，再看有没有卡住的任务。"),
+        "推理原文要原样落库（展示留痕）"
+    );
+    // 用户那一行没有推理（与 `briefing_json` / `traces_json` 同一条口径）。
+    let user = rows.iter().find(|m| m.role == "user").unwrap();
+    assert!(user.thinking.is_none());
+}
+
+/// 不产推理的模型（多数）落 `NULL` 而不是空串——「没有」与「有但是空的」是两件事。
+#[tokio::test]
+async fn foreman_without_reasoning_leaves_the_column_null() {
+    let h = Harness::empty().await;
+    let mut script = Script::new();
+    script.for_foreman().text("没有待办。");
+    let turn = h
+        .runner(FakeAgent::new(script))
+        .say(None, "有活吗")
+        .await
+        .unwrap();
+    let rows = h
+        .store
+        .list_foreman_messages(&turn.session.id, 10)
+        .await
+        .unwrap();
+    let assistant = rows.iter().find(|m| m.role == "assistant").unwrap();
+    assert!(
+        assistant.thinking.is_none(),
+        "不产推理时该是 NULL，不是空串：{:?}",
+        assistant.thinking
+    );
+}
+
+/// 一轮里模型被叫好几次时，推理**按次累积**（决策 244）。
+///
+/// 界面上那条折叠块说的是「这一轮它想了什么」，不是「最后一次调用想了什么」——
+/// 而值班长的一轮常态就是「先想 → 查台账 → 再想 → 收口」。
+#[tokio::test]
+async fn foreman_thinking_accumulates_across_the_calls_of_one_turn() {
+    let h = Harness::seeded().await;
+    let mut script = Script::new();
+    script.for_foreman().read_task("t1").text("t1 还在排队。");
+    let runner = h.runner_with_llm(Arc::new(Thinking {
+        inner: FakeAgent::new(script),
+        // 每一次调用都给同一段文本，故累积 N 次就是 N 段拼起来。
+        thought: "再核一遍。".into(),
+    }));
+
+    let turn = runner.say(None, "t1 怎么样了？").await.unwrap();
+    assert_eq!(
+        turn.traces.len(),
+        1,
+        "这一轮确实调了一次工具（两次模型调用）"
+    );
+    let rows = h
+        .store
+        .list_foreman_messages(&turn.session.id, 10)
+        .await
+        .unwrap();
+    let thinking = rows
+        .iter()
+        .find(|m| m.role == "assistant")
+        .and_then(|m| m.thinking.clone())
+        .expect("有推理原文");
+    assert_eq!(
+        thinking.matches("再核一遍。").count(),
+        2,
+        "两次模型调用各想了一段，两段都该在：{thinking}"
     );
 }

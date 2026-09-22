@@ -395,6 +395,11 @@ export interface ConversationDeltaEvent extends SseBase {
    * `#[serde(default)]`——加字段是加性改动，老客户端读到的事件照旧能解析。
    */
   session_id?: string;
+  /**
+   * 这一段增量是**回话**还是**思考**（决策 244）。**可选**：老后端不发这个字段，
+   * 缺省按 `content` 处理——那正是它此前唯一见过的形状。
+   */
+  channel?: 'content' | 'reasoning';
   role: string;
   text: string;
   prompt_tokens: number;
@@ -403,6 +408,16 @@ export interface ConversationDeltaEvent extends SseBase {
 export interface ToolEventEvent extends SseBase {
   type: 'tool_event';
   run_id: number;
+  /**
+   * 发起这次调用的 agent 身份（决策 244）。**可选**：老后端不发这个字段，而缺省的空串
+   * 不会等于 `"foreman"`——即「认不出来就当作别人的」，不会误收。
+   */
+  agent_type?: string;
+  /**
+   * 归属班次（决策 244）。对讲台据此丢弃别的班次的工具事件（与增量的班次守卫同一个
+   * 判据，决策 204⑥）——手机与电脑同时连着时，两台设备不会看到对方的工具调用。
+   */
+  session_id?: string;
   tool: string;
   phase: ToolPhase;
   args_summary: string;
@@ -895,6 +910,13 @@ export interface ForemanMessage {
   completion_tokens: number;
   briefing: ForemanBriefing | null;
   traces: ForemanTrace[] | null;
+  /**
+   * 这一轮的**推理 / 思考**原文（决策 244）。不产推理的模型是 `null`。
+   *
+   * **展示留痕，永不回灌**：它不是回话的一部分，后端也不会把它发回模型。
+   * 界面把它收进一个折叠块——它常常很长（一段完整的推演），默认展开会把时间线冲垮。
+   */
+  thinking?: string | null;
   created_at: string;
   /**
    * 这一轮的**归因类别**（决策 235 / 238）：`host` / `pipeline` / `project_code` /

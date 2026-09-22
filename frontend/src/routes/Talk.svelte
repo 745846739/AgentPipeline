@@ -74,6 +74,7 @@
   import { TaskStream, type StreamStatus } from '../realtime/connection';
   import {
     appendForemanDelta,
+    appendForemanTool,
     beginForemanStream,
     emptyForeignActive,
     emptyForemanStream,
@@ -88,6 +89,7 @@
     settleForemanStream,
     FOREMAN_FAILED_TURN_MARK,
     FOREMAN_WATCH_MARK,
+    type ForemanLiveTool,
     type ForemanStreamState,
     type ForeignActive,
   } from '../realtime/foreman';
@@ -224,6 +226,25 @@
   let receiptOpen = $state<Record<string, boolean>>({});
   const receiptIsOpen = (key: string) => receiptOpen[key] ?? !folded;
 
+  /**
+   * 「它想了什么」折叠块的展开态，按 `turn.key` 记（决策 244）。
+   *
+   * **与工位回执分开一份、且两边默认值相反**：回执是这一轮结论的出处（桌面默认展开），
+   * 而思考是**过程的草稿**——长会话里它往往比回话本身长一个量级，默认展开会把时间线
+   * 冲垮。故它**两档都默认收起**，人想看再点开。
+   *
+   * 受控的理由与 `receiptOpen` 逐字相同：`<details open>` 交给浏览器管的话，
+   * 流式增量反复重渲染同一轮时会把使用者手动展开的那一块打回收起。
+   */
+  let thinkingOpen = $state<Record<string, boolean>>({});
+  const thinkingIsOpen = (key: string) => thinkingOpen[key] ?? false;
+
+  function toggleThinking(e: MouseEvent, key: string) {
+    // 阻止默认的 `open` 翻转，改由状态说了算（与 `toggleReceipt` 同一手法）。
+    e.preventDefault();
+    thinkingOpen = { ...thinkingOpen, [key]: !thinkingIsOpen(key) };
+  }
+
   /** 每个 pending 任务的详情（allowed_actions 只在详情里下发，决策 101）。 */
   let details = $state<Record<string, { actions: AllowedAction[]; cursors: BranchCursor[] }>>({});
 
@@ -331,6 +352,20 @@
     partial: boolean;
     /** 该轮工具痕迹（台账查读），空数组 = 这一轮没翻台账。 */
     traces: ForemanTrace[];
+    /**
+     * 这一轮的**推理 / 思考**原文（决策 244）。`null` = 这一轮没产推理（多数模型如此）。
+     *
+     * 两种来源：在途轮来自实时流（`stream.thinking`），落地轮来自台账那一行的
+     * `thinking` 列——**同一份内容的两个时态**，界面只渲染它，不关心哪来的。
+     */
+    thinking: string | null;
+    /**
+     * 这一轮**正在发生**的工具调用（决策 244，只在途轮非空）。
+     *
+     * 与 `traces`（落库那一份）分工：`traces` 说「这一轮查过什么」（轮次结束后才有），
+     * 这里说「此刻在查什么」。落地之后这一栏就空了——那时 `traces` 已经把同一件事说完。
+     */
+    liveTools: ForemanLiveTool[];
     briefing: ForemanBriefing | null;
     /** 失败原因是「这台设备还没配对」（票 07）：只有它会挂出配对入口。 */
     needsPairing: boolean;
@@ -380,6 +415,9 @@
         streaming: false,
         partial: false,
         traces: m.traces ?? [],
+        // 推理留痕（决策 244）：空串与 null 都当作「这一轮没产推理」，界面不渲染那一块。
+        thinking: m.thinking?.trim() ? m.thinking : null,
+        liveTools: [],
         briefing: m.briefing,
         needsPairing: false,
         proposal: null,
@@ -401,6 +439,8 @@
           streaming: false,
           partial: false,
           traces: [],
+          thinking: null,
+          liveTools: [],
           briefing: null,
           needsPairing: false,
           proposal: p,
@@ -420,6 +460,8 @@
         streaming: false,
         partial: false,
         traces: [],
+        thinking: null,
+        liveTools: [],
         briefing: null,
         needsPairing: false,
         proposal: null,
@@ -437,6 +479,8 @@
         streaming: stream.streaming,
         partial: !stream.streaming && stream.text.length > 0,
         traces: [],
+        thinking: stream.thinking.trim() ? stream.thinking : null,
+        liveTools: stream.tools,
         briefing: null,
         needsPairing: false,
         proposal: null,
@@ -453,6 +497,8 @@
         streaming: false,
         partial: false,
         traces: [],
+        thinking: null,
+        liveTools: [],
         briefing: null,
         needsPairing: needsPairing(stream.error),
         proposal: null,
@@ -695,8 +741,11 @@
     foreignActive = noteForeignDelta(foreignActive, event, currentId, Date.now());
     // 只在等回话期间累积：收尾后到达的尾巴不得再造一轮（回话以台账为准）
     if (!sending) return;
-    // 班次守卫：不是当前这一班的增量一律丢弃（决策 204⑥，判据在 realtime/foreman.ts）
+    // 班次守卫：不是当前这一班的增量一律丢弃（决策 204⑥，判据在 realtime/foreman.ts）。
+    // 两条声道各归各的：回话进 `text`、思考进 `thinking`、工具调用进 `tools`（决策 244），
+    // 判据（类型 / 身份 / 班次）三处同源，故都收在这一个出口。
     stream = appendForemanDelta(stream, event, currentId);
+    stream = appendForemanTool(stream, event, currentId);
   }
 
   let conn: TaskStream | null = null;
@@ -1134,6 +1183,16 @@
   function stageSprite(stage: string): SpriteName {
     const col = BOARD_COLUMNS.find((c) => c.stages.includes(stage as Stage));
     return col ? COLUMN_SPRITES[col.key] : 'chest';
+  }
+
+  /**
+   * 工具名 → 中文词（实时那一栏用；回执那一栏在 {@link receipt} 里并列拿同一张表）。
+   *
+   * 未登记的值**原样显示工具名**，不兜底成「台账查读」——那个兜底会把「值班长调了个
+   * 界面还不认识的新工具」说成一件它没做的事（决策 200 的平实口径）。
+   */
+  function toolLabel(tool: string): string {
+    return TOOL_LABELS[tool] ?? tool;
   }
 
   /**
@@ -1688,6 +1747,45 @@
                     : '值班长'}
           </div>
           <p class:streaming={turn.streaming}>{turn.content}</p>
+
+          <!-- 正在发生的工具调用（决策 244）：**实时**，不是等这一轮落库。
+               形态照工位回执（左缘亮度阶 + 无框 = 转述不是发言），但它是**此刻**的东西，
+               故左缘跟相位走：正在查是静的 --pane，查完点亮 --go，没查到用 --stop。
+               它与下面的「工位回执」是同一件事的两个时态：这里是进行中，落地后由回执接管
+               （所以落地轮的 `liveTools` 恒空，不会两处都画）。 -->
+          {#if turn.liveTools.length > 0}
+            <div class="livetools" data-live-tools={turn.liveTools.length}>
+              {#each turn.liveTools as t, i (`${turn.key}-lt${i}`)}
+                <div
+                  class="rcpt live"
+                  class:pending={t.phase === 'start'}
+                  class:done={t.phase === 'end'}
+                  class:bad={t.phase === 'error'}
+                >
+                  <div class="rcpt-head">
+                    <span class="dim">{toolLabel(t.tool)}</span>
+                    <span class="dim args">{t.args_summary}</span>
+                    <span class="rs" class:bad={t.phase === 'error'}>
+                      {t.phase === 'start' ? '正在查…' : t.phase === 'error' ? '没查到' : '已读'}
+                    </span>
+                  </div>
+                </div>
+              {/each}
+            </div>
+          {/if}
+
+          <!-- 推理 / 思考（决策 244）：**默认收起**，两档都是——它常常比回话本身长一个量级，
+               展开着摆在时间线上会把对话冲垮。零新增视觉语言：复用回执那套
+               （左缘亮度阶 + 无框 + 详情块），只在措辞上把「它想的过程」与「它查的台账」分开。
+               摘要在流式期间就说「正在想…」，收口后带字数——人不用点开就知道里面有没有东西。 -->
+          {#if turn.thinking}
+            <details class="rcpts think" open={thinkingIsOpen(turn.key)}>
+              <summary class="rcpts-sum" onclick={(e) => toggleThinking(e, turn.key)}>
+                {turn.streaming ? '正在想…' : `思考过程 ${turn.thinking.length} 字`} ▸
+              </summary>
+              <pre class="think-body">{turn.thinking}</pre>
+            </details>
+          {/if}
 
           <!-- 归因类别标记（决策 235① / 238）：四类各一个词，显示在那一轮的名牌行上。
                未定位时**什么都不显示**——不编一个假的类别（决策 230 把「没有类别」也算一项
@@ -2339,6 +2437,42 @@
   }
   .rcpt-head .rs.bad {
     color: var(--stop);
+  }
+
+  /* ── 正在发生的工具调用（决策 244）：与回执同一形状，靠左缘的档位说相位 ──
+     正在查是静的 --pane（还没结果可看），查完点亮 --go，没查到走 --stop。
+     不用动画位：全站零新增动画位这条纪律不因「实时」破例（转的那一刻就说明在查）。 */
+  .livetools {
+    margin-top: 8px;
+  }
+  .rcpt.live {
+    margin-top: 4px;
+  }
+  .rcpt.live.pending {
+    border-left-color: var(--pane);
+  }
+  .rcpt.live.done {
+    border-left-color: var(--go);
+  }
+  .rcpt.live.bad {
+    border-left-color: var(--stop);
+  }
+
+  /* ── 思考过程（决策 244）：默认收起，展开后是一段等宽正文 ──
+     用 .mono 那一套等宽 + 预换行（它是模型的草稿，markdown 结构未必成立，故不渲染 md）。 */
+  .think-body {
+    margin: 6px 0 0;
+    padding: 6px 10px;
+    border-left: 4px solid var(--pane);
+    background: var(--panel);
+    color: var(--text-2);
+    font-family: var(--font-mono);
+    font-size: 12px;
+    line-height: 1.5;
+    white-space: pre-wrap;
+    overflow-wrap: break-word;
+    max-height: 320px;
+    overflow-y: auto;
   }
 
   /* ── 输入坞：对话框形（双线框），描边 --pane、名牌收 --t3；主动作交给既有实心 ▶ 钮 ── */

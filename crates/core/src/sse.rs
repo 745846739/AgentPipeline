@@ -120,6 +120,13 @@ pub enum SseEvent {
         /// （不认识这个字段的一方）读到的事件照旧能解析——加字段是**加性**改动。
         #[serde(default)]
         session_id: String,
+        /// 这一段增量是**回话**还是**思考**（决策 244）。
+        ///
+        /// 默认 `content`（`serde(default)`）：老客户端读到推理增量会照旧把它拼进回话里
+        /// ——那是这条通道在今天之前的行为（它们根本没有推理增量），故默认值必须落在
+        /// 「照旧」那一侧，而不是凭空给老客户端造一段它不认识的东西。
+        #[serde(default)]
+        channel: Channel,
         role: String,
         text: String,
         prompt_tokens: u32,
@@ -148,10 +155,23 @@ pub enum SseEvent {
         expires_at: String,
     },
     /// 决策 123：工具调用事件（参数只给摘要）。
+    ///
+    /// **身份串进载荷**（决策 244）：这个事件原先没有 `agent_type`，于是
+    /// `is_foreman_event` 无法把它与流水线节点的工具调用区分，值班长的工具痕迹只能等
+    /// 那一轮落库后从 `traces_json` 读回来——即「对话完结后才展示」。加上
+    /// `agent_type` / `session_id` 之后，它走**既有的那条**过滤（与
+    /// `conversation_delta` 同一个判据），值班长的工具调用因此在发生的那一刻就到达界面。
+    /// 流水线节点照旧填 `"main"` / `"system"` / `"pseudo:*"` 与空会话，判据不变。
     ToolEvent {
         task_id: String,
         branch: String,
         run_id: i64,
+        /// 发起这次调用的 agent 身份（`"foreman"` / `"main"` / `"system"` / `"pseudo:*"`）。
+        #[serde(default)]
+        agent_type: String,
+        /// 归属会话（决策 204⑥）；流水线节点为空串，与 `conversation_delta` 同一条口径。
+        #[serde(default)]
+        session_id: String,
         tool: String,
         phase: ToolPhase,
         args_summary: String,
@@ -231,11 +251,17 @@ impl SseEvent {
     /// 无法与流水线节点的工具调用区分。值班长的工具痕迹走**落库的 `traces_json`**
     /// 而不是实时事件（票 05），这也正是它不需要一个新事件变体的原因。
     ///
-    /// 提议事件（决策 207）**天然只属于对讲台**——它是值班长的提议，流水线里没有对应的
-    /// 概念，故它的判定不看身份串，看的是变体本身。
+    /// **2026-09-22 修订（决策 244）**：上一段的前半句不再成立——`tool_event` 现在**带**
+    /// `agent_type` / `session_id`（见该变体的注释），于是值班长的工具调用与增量走同一个
+    /// 判据。修订的动因是诉求：「把对讲台的 thinking 和工具调用都实时展示出来，不要像现在
+    /// 这样在对话完结后展示」——痕迹落库那条路本身没问题（审计照旧靠它），有问题的是它
+    /// **只在轮次结束后**才到得了界面。
     pub fn is_foreman_event(&self) -> bool {
         match self {
             SseEvent::ConversationDelta { agent_type, .. } => {
+                agent_type == crate::pipeline::foreman::FOREMAN_AGENT_TYPE
+            }
+            SseEvent::ToolEvent { agent_type, .. } => {
                 agent_type == crate::pipeline::foreman::FOREMAN_AGENT_TYPE
             }
             SseEvent::ForemanProposal { .. } => true,
@@ -277,6 +303,24 @@ pub enum ToolPhase {
     Start,
     End,
     Error,
+}
+
+/// 会话增量走哪条声道（决策 244）。
+///
+/// **两条声道必须分开**：`content` 是模型要说的话，`reasoning` 是它的草稿。
+/// 合成一条之后，界面分不出哪一段该当回话念、哪一段该收进折叠块——而「把思考当回话
+/// 念给人听」与「把回话折起来看不见」都是错的。
+///
+/// 默认是 `Content`（`serde(default)`）：老客户端收到没有 `channel` 字段的事件会照旧
+/// 把它当回话文本拼上去，那正是它们此前唯一见过的形状。加字段是**加性**改动。
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Channel {
+    /// 回话正文（今天已有的那一类）。
+    #[default]
+    Content,
+    /// 推理 / 思考增量。只走实时通道，不落库、不回灌（决策 244）。
+    Reasoning,
 }
 
 /// 进程内 SSE 广播（单机工具，v1 不落库）。
@@ -408,6 +452,7 @@ mod tests {
                 run_id: 7,
                 agent_type: "pseudo:conflict_check".into(),
                 session_id: String::new(),
+                channel: Channel::Content,
                 role: "assistant".into(),
                 text: "正在比对".into(),
                 prompt_tokens: 3,
@@ -427,6 +472,8 @@ mod tests {
                 task_id: "t".into(),
                 branch: "main".into(),
                 run_id: 7,
+                agent_type: "main".into(),
+                session_id: String::new(),
                 tool: "write_file".into(),
                 phase: ToolPhase::End,
                 args_summary: "design.md".into(),
@@ -472,6 +519,7 @@ mod tests {
             run_id: 42,
             agent_type: "main".into(),
             session_id: "s1".into(),
+            channel: Channel::Content,
             role: "assistant".into(),
             text: "hi".into(),
             prompt_tokens: 5,
@@ -487,6 +535,8 @@ mod tests {
             // 决策 204⑥：会话身份。工头增量靠它归到正确的班次，
             // 流水线的增量这里是空串。
             "session_id",
+            // 决策 244：回话 / 思考两条声道的分道标记。
+            "channel",
             "role",
             "text",
             "prompt_tokens",
@@ -496,6 +546,7 @@ mod tests {
         }
         assert_eq!(json["type"], "conversation_delta");
         assert_eq!(json["session_id"], "s1");
+        assert_eq!(json["channel"], "content");
     }
 
     /// 加字段是**加性**改动：老客户端（不认识 `session_id` 的一方）读到的事件照旧能解析。
@@ -509,6 +560,100 @@ mod tests {
             SseEvent::ConversationDelta { session_id, .. } => assert_eq!(session_id, ""),
             other => panic!("解成了别的变体：{other:?}"),
         }
+    }
+
+    /// 决策 244：`channel` 是**加性**字段，缺省落在 `content` 那一侧。
+    ///
+    /// 默认值的方向不是随便定的：老客户端收到没有 `channel` 的增量时会把它当回话正文拼上去
+    /// ——那正是这条通道在加字段之前唯一见过的形状。默认成 `reasoning` 会让它们**静默丢掉
+    /// 每一段回话**。
+    #[test]
+    fn conversation_delta_channel_defaults_to_content() {
+        let raw = r#"{"type":"conversation_delta","task_id":"t","branch":"main","run_id":1,
+                       "agent_type":"main","session_id":"","role":"assistant","text":"hi",
+                       "prompt_tokens":0,"completion_tokens":0}"#;
+        let ev: SseEvent = serde_json::from_str(raw).unwrap();
+        match ev {
+            SseEvent::ConversationDelta { channel, .. } => assert_eq!(channel, Channel::Content),
+            other => panic!("解成了别的变体：{other:?}"),
+        }
+
+        // 显式给 reasoning 时要真的读出来（并且序列化成 snake_case）
+        let thought = SseEvent::ConversationDelta {
+            task_id: "t".into(),
+            branch: "main".into(),
+            run_id: 1,
+            agent_type: "main".into(),
+            session_id: String::new(),
+            channel: Channel::Reasoning,
+            role: "assistant".into(),
+            text: "想想".into(),
+            prompt_tokens: 0,
+            completion_tokens: 0,
+        };
+        let json: serde_json::Value = serde_json::from_str(&thought.to_json()).unwrap();
+        assert_eq!(json["channel"], "reasoning");
+    }
+
+    /// 决策 244：工具事件带身份串，于是它走**同一个** `is_foreman_event` 过滤。
+    ///
+    /// 这一条是诉求「工具调用不要等对话完结才展示」的落点：没有身份串，那个判定无法把
+    /// 值班长的工具调用与流水线节点的区分开，痕迹就只能等那一轮落库后从 `traces_json` 读。
+    #[test]
+    fn tool_events_are_routed_to_the_foreman_stream_by_identity() {
+        let foreman_tool = SseEvent::ToolEvent {
+            task_id: String::new(),
+            branch: String::new(),
+            run_id: 0,
+            agent_type: "foreman".into(),
+            session_id: "s1".into(),
+            tool: "read_task".into(),
+            phase: ToolPhase::Start,
+            args_summary: "t-1".into(),
+        };
+        assert!(
+            foreman_tool.is_foreman_event(),
+            "值班长的工具调用该走对讲台流"
+        );
+        let json: serde_json::Value = serde_json::from_str(&foreman_tool.to_json()).unwrap();
+        assert_eq!(json["agent_type"], "foreman");
+        assert_eq!(json["session_id"], "s1");
+        assert_eq!(json["phase"], "start");
+
+        // 流水线节点的工具调用照旧不进对讲台（身份串对不上）
+        for agent_type in ["main", "system", "pseudo:project_analysis"] {
+            let pipeline_tool = SseEvent::ToolEvent {
+                task_id: "t".into(),
+                branch: "main".into(),
+                run_id: 7,
+                agent_type: agent_type.into(),
+                session_id: String::new(),
+                tool: "write_file".into(),
+                phase: ToolPhase::End,
+                args_summary: "x".into(),
+            };
+            assert!(
+                !pipeline_tool.is_foreman_event(),
+                "{agent_type} 的工具事件不该进对讲台"
+            );
+        }
+
+        // 老后端不发 agent_type：缺省空串不等于 "foreman"，即「认不出来就当作别人的」
+        let legacy = r#"{"type":"tool_event","task_id":"t","branch":"main","run_id":7,
+                        "tool":"write_file","phase":"end","args_summary":"x"}"#;
+        let ev: SseEvent = serde_json::from_str(legacy).unwrap();
+        match &ev {
+            SseEvent::ToolEvent {
+                agent_type,
+                session_id,
+                ..
+            } => {
+                assert_eq!(agent_type, "");
+                assert_eq!(session_id, "");
+            }
+            other => panic!("解成了别的变体：{other:?}"),
+        }
+        assert!(!ev.is_foreman_event());
     }
 
     /// 决策 207：提议事件走 `/foreman/stream`，而流水线的工具事件不走——两条都要钉住，
@@ -531,6 +676,8 @@ mod tests {
             task_id: "t".into(),
             branch: "main".into(),
             run_id: 1,
+            agent_type: "main".into(),
+            session_id: String::new(),
             tool: "write_file".into(),
             phase: ToolPhase::Start,
             args_summary: "x".into(),
@@ -542,6 +689,7 @@ mod tests {
             run_id: 1,
             agent_type: "main".into(),
             session_id: String::new(),
+            channel: Channel::Content,
             role: "assistant".into(),
             text: "x".into(),
             prompt_tokens: 0,
@@ -556,6 +704,8 @@ mod tests {
             task_id: "t".into(),
             branch: "main".into(),
             run_id: 1,
+            agent_type: "main".into(),
+            session_id: String::new(),
             tool: "read_file".into(),
             phase: ToolPhase::Start,
             args_summary: "src/a.rs".into(),

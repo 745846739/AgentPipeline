@@ -24,7 +24,13 @@ function has(id: number): boolean {
 describe('toast 的暂停与恢复（票 17）', () => {
   beforeEach(() => {
     // 每条用例从零开始：cooldown 是跨用例的状态（同类 5 分钟内只弹一次）
-    vi.useFakeTimers();
+    //
+    // **假时钟必须钉在一个白天时刻**：通知策略有免打扰窗口（22–8），而 `notifyAt()`
+    // 用的是 `done` 类、`notify()` 默认取挂钟——夜里跑闸门时 `shouldNotify` 直接返回
+    // false，toast 根本不弹，这组用例在 22 点后集体变红（失败点是 `toasts[0].id` 读
+    // 不到，与暂停算术毫无关系）。免打扰本身由 `notificationPolicy.test.ts` 用显式
+    // 日期单独钉住，这里注入一个固定时刻不会漏掉那条口径。
+    vi.useFakeTimers({ now: new Date(2026, 0, 15, 12, 0, 0) });
     notifications.clear();
     notifications.resetCooldown();
   });

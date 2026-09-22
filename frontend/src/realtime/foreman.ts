@@ -14,29 +14,54 @@ export const FOREMAN_AGENT_TYPE = 'foreman';
 export interface ForemanStreamState {
   /** 本轮已到达的流式文本。 */
   text: string;
+  /**
+   * 本轮已到达的**推理 / 思考**文本（决策 244）。
+   *
+   * 与 `text` 分开攒：合成一段之后界面分不出哪一段该当回话念、哪一段该收进折叠块。
+   * 收尾（`settleForemanStream`）时它**不清空**——回话的权威值由台账给，而这一轮的
+   * 思考在台账那一行里同样有（`thinking` 列），两边说的是同一件事。
+   */
+  thinking: string;
+  /** 本轮已在发生的工具调用（决策 244），按到达顺序。 */
+  tools: ForemanLiveTool[];
   /** 是否仍在流：只有 `true` 才渲染既有方块光标（`.streaming`，不新增动画位）。 */
   streaming: boolean;
   /** 断流 / 出错说明；非空时 `text` 照常显示（降级为一次性显示已收到的部分）。 */
   error: string | null;
 }
 
+/**
+ * 一次工具调用在流里的现场（决策 244）。
+ *
+ * `phase` 是**那一刻**的状态：同一把工具先 `start`（正在查）后 `end`（查到了）/
+ * `error`（没查到），两次事件合成**一条**，而不是两条——它是一件正在发生的事，
+ * 不是一个又一个独立事件。判据见 {@link appendForemanTool}。
+ */
+export interface ForemanLiveTool {
+  tool: string;
+  args_summary: string;
+  phase: 'start' | 'end' | 'error';
+}
+
 export function emptyForemanStream(): ForemanStreamState {
-  return { text: '', streaming: false, error: null };
+  return { text: '', thinking: '', tools: [], streaming: false, error: null };
 }
 
 /** 开一轮新回话：丢掉上一轮的残留，点亮方块光标。 */
 export function beginForemanStream(): ForemanStreamState {
-  return { text: '', streaming: true, error: null };
+  return { text: '', thinking: '', tools: [], streaming: true, error: null };
 }
 
 /**
  * 增量累积。
  *
- * 两道判定都不能省：
+ * 三道判定都不能省：
  *
  * 1. **身份**——只认工头自己的对话增量。`/foreman/stream` 与任务流共用一条总线
  *    （决策 182⑥），漏判就会把别的任务的增量拼进值班长的话里；
- * 2. **班次**（决策 204⑥）——`/foreman/stream` 把所有工头增量广播给所有订阅者，
+ * 2. **声道**（决策 244）——`reasoning` 进 `thinking`，其余（含缺省）进 `text`。
+ *    缺省按 `content` 处理：老后端不发这个字段，那正是它此前唯一见过的形状；
+ * 3. **班次**（决策 204⑥）——`/foreman/stream` 把所有工头增量广播给所有订阅者，
  *    而**同一台机器上可以多处同时说话**（手机 + 电脑，配对令牌正是为此存在）。
  *    增量与当前班次不符时丢弃：否则手机上那一班的回话会插进电脑这一班的话里。
  *    `sessionId` 为空（还没有当前班次）时同样丢弃——那种状态下屏幕上是空态，
@@ -49,7 +74,40 @@ export function appendForemanDelta(
 ): ForemanStreamState {
   if (event.type !== 'conversation_delta' || event.agent_type !== FOREMAN_AGENT_TYPE) return state;
   if (!sessionId || event.session_id !== sessionId) return state;
-  return { ...state, text: state.text + event.text };
+  return event.channel === 'reasoning'
+    ? { ...state, thinking: state.thinking + event.text }
+    : { ...state, text: state.text + event.text };
+}
+
+/**
+ * 工具调用事件累积（决策 244）——诉求里「工具调用也实时展示」那一半。
+ *
+ * 三处判据与 {@link appendForemanDelta} 同源（类型 / 身份 / 班次），只多一条**相位合并**：
+ * 同一把工具的 `start` 与随后的 `end`（或 `error`）合成**一条**现场记录。不合并的话，
+ * 一次 `read_task` 会在时间线上留两个「正在查」——而它其实是一次调用。
+ *
+ * **合并的判据是「最后一条还没收尾」**：值班长的工具调用是一条一条顺序执行的
+ * （`run_tool` 在 for 循环里 await），故「最后一条仍处于 `start`」就是「这一次调用在等结果」。
+ * 用工具名配对是不够的：同一轮里连着查两次 `read_task` 是常态。
+ */
+export function appendForemanTool(
+  state: ForemanStreamState,
+  event: SseEvent,
+  sessionId: string | null,
+): ForemanStreamState {
+  if (event.type !== 'tool_event' || event.agent_type !== FOREMAN_AGENT_TYPE) return state;
+  if (!sessionId || event.session_id !== sessionId) return state;
+  const live: ForemanLiveTool = {
+    tool: event.tool,
+    args_summary: event.args_summary,
+    phase: event.phase,
+  };
+  const last = state.tools[state.tools.length - 1];
+  const tools =
+    last && last.phase === 'start'
+      ? [...state.tools.slice(0, -1), { ...last, phase: live.phase }]
+      : [...state.tools, live];
+  return { ...state, tools };
 }
 
 /**
@@ -100,7 +158,13 @@ export function noteForeignDelta(
   currentId: string | null,
   at: number,
 ): ForeignActive {
-  if (event.type !== 'conversation_delta' || event.agent_type !== FOREMAN_AGENT_TYPE) return state;
+  // 工具事件也算「在回话」（决策 244）：一轮里它可能连着查十几次台账而**一个字都不说**
+  // （决策 224 的实测：一次正常定位 16–17 次调用）。只认 `conversation_delta` 的话，
+  // 那几十秒里「别的班次正在回话」是暗的——而它恰恰正在忙。
+  const isForemanChatter =
+    (event.type === 'conversation_delta' || event.type === 'tool_event') &&
+    event.agent_type === FOREMAN_AGENT_TYPE;
+  if (!isForemanChatter) return state;
   const sid = event.session_id;
   if (!sid || sid === currentId) return state;
   return { bySession: { ...state.bySession, [sid]: at } };
@@ -163,6 +227,11 @@ export function pruneForeignActive(
  *
  * **空 / 全空白的回话不得覆盖已到达的文字**——那种回话只说明「这一轮没有新内容」，
  * 拿它收敛会把用户已经看到的字擦掉（票 03：不丢已经出现的文字）。
+ *
+ * **`thinking` 与 `tools` 原样留着**（决策 244）：回话的权威值由台账给，而这两样在
+ * 台账那一行里同样有（`thinking` 列与 `traces`）。收尾是「这一轮流完了」，不是
+ * 「把刚才发生的事撤掉」——清掉的话，人在重取台账前的那一段会看到思考与工具调用
+ * 突然消失。它们随后由台账那一行接管（同一份内容，多一个来源不算脏）。
  */
 export function settleForemanStream(
   state: ForemanStreamState,
@@ -170,14 +239,22 @@ export function settleForemanStream(
 ): ForemanStreamState {
   return {
     text: reply && reply.trim() ? reply : state.text,
+    thinking: state.thinking,
+    tools: state.tools,
     streaming: false,
     error: null,
   };
 }
 
-/** 断流 / 出错：保留已到达的文字，只落一个说明（不整轮消失）。 */
+/** 断流 / 出错：保留已到达的文字与现场，只落一个说明（不整轮消失）。 */
 export function failForemanStream(state: ForemanStreamState, message: string): ForemanStreamState {
-  return { text: state.text, streaming: false, error: message };
+  return {
+    text: state.text,
+    thinking: state.thinking,
+    tools: state.tools,
+    streaming: false,
+    error: message,
+  };
 }
 
 /**

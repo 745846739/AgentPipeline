@@ -95,6 +95,16 @@ impl Adapter for OpenAiCompatible {
         if let Some(text) = delta.get("content").and_then(|v| v.as_str()) {
             chunks.push(StreamChunk::Text(text.to_string()));
         }
+        // 推理增量（决策 244）：`reasoning_content` 是 DeepSeek / 部分 OpenAI 兼容网关
+        // 的字段名（vLLM、月之暗面等沿用），`reasoning` 是另一支。两者都收——
+        // 认不出就只是没有思考可看，而认错字段会把它当成回话正文念出来。
+        for key in ["reasoning_content", "reasoning"] {
+            if let Some(thought) = delta.get(key).and_then(|v| v.as_str()) {
+                if !thought.is_empty() {
+                    chunks.push(StreamChunk::Reasoning(thought.to_string()));
+                }
+            }
+        }
         if let Some(calls) = delta.get("tool_calls").and_then(|v| v.as_array()) {
             // 一个 chunk 可能携带多个 tool_call 分片，全部交给驱动层聚合
             chunks.extend(calls.iter().enumerate().map(|(position, call)| {
@@ -458,6 +468,51 @@ mod tests {
                 case.name
             );
         }
+    }
+
+    #[test]
+    fn reasoning_deltas_are_their_own_channel() {
+        // 决策 244：推理与回话是两条声道。DeepSeek / 部分兼容网关用 `reasoning_content`。
+        let deepseek = OpenAiCompatible
+            .parse_chunk(r#"{"choices":[{"index":0,"delta":{"reasoning_content":"让我想想"}}]}"#)
+            .unwrap();
+        assert!(
+            matches!(deepseek.as_slice(), [StreamChunk::Reasoning(t)] if t == "让我想想"),
+            "{deepseek:?}"
+        );
+
+        // 另一支网关用 `reasoning`——两个字段名都收
+        let alt = OpenAiCompatible
+            .parse_chunk(r#"{"choices":[{"index":0,"delta":{"reasoning":"再想想"}}]}"#)
+            .unwrap();
+        assert!(
+            matches!(alt.as_slice(), [StreamChunk::Reasoning(t)] if t == "再想想"),
+            "{alt:?}"
+        );
+
+        // 推理与正文同一 delta 并存时**两条都收、且不混**：合成一段的话界面就分不出
+        // 哪一句该当回话念、哪一句该收进折叠块了（那正是分开声道的全部理由）。
+        // 顺序是正文在前、推理在后（与解析顺序一致，测试照实钉住这个顺序）。
+        let both = OpenAiCompatible
+            .parse_chunk(
+                r#"{"choices":[{"index":0,"delta":{"reasoning_content":"想好了","content":"答案是 42"}}]}"#,
+            )
+            .unwrap();
+        assert_eq!(both.len(), 2, "{both:?}");
+        assert!(matches!(&both[0], StreamChunk::Text(t) if t == "答案是 42"));
+        assert!(matches!(&both[1], StreamChunk::Reasoning(t) if t == "想好了"));
+
+        // 空串不产块：否则每一轮都会多出一堆空增量事件
+        assert!(OpenAiCompatible
+            .parse_chunk(r#"{"choices":[{"index":0,"delta":{"reasoning_content":""}}]}"#)
+            .unwrap()
+            .is_empty());
+
+        // 不产推理的模型（没有这两个字段）照旧只有正文
+        let plain = OpenAiCompatible
+            .parse_chunk(r#"{"choices":[{"index":0,"delta":{"content":"普通回话"}}]}"#)
+            .unwrap();
+        assert!(matches!(plain.as_slice(), [StreamChunk::Text(t)] if t == "普通回话"));
     }
 
     #[test]

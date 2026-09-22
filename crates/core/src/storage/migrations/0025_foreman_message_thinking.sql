@@ -1,0 +1,16 @@
+-- 决策 244：把值班长的**推理 / 思考**留痕在对讲台上。
+--
+-- 为什么需要一列而不是「实时流看过就算了」：思考此前根本没有落点——流水线的
+-- `conversation_delta` 只通道回话正文，而值班长的这一列是它的第一个归宿。
+-- 若只留在实时流里，它会在那一轮**收口重取台账**的那一刻整段消失（前端以台账为权威，
+-- 见 `settleForemanStream`）——即「能看到一秒，然后永远看不到」，比不展示更坏。
+-- 与 `traces_json` 同一姿态：都是「它当时在想什么 / 翻过什么」的展示留痕。
+--
+-- **它绝不回灌进模型上下文**（这是本列与 `content` 最要紧的区别）：推理段不是
+-- assistant 消息的一部分，部分厂商把 `reasoning_content` 发回去会被拒；而它在一轮里
+-- 往往是最长的那一段，进历史窗口（`FOREMAN_HISTORY_BUDGET_CHARS` = 24k 字符）
+-- 会让每一轮都白烧一份 token。故它只被读出来展示，永远不进 `transcript`。
+--
+-- 可空：绝大多数模型不产推理，那些轮次这里是 NULL（与 `briefing_json` / `traces_json`
+-- 同一条口径，不存空对象）。
+ALTER TABLE kanban_foreman_messages ADD COLUMN thinking TEXT;

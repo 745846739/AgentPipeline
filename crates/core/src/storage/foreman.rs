@@ -89,6 +89,11 @@ pub struct ForemanMessage {
     pub briefing_json: Option<Value>,
     /// 该轮调用过的只读工具痕迹（票 05）。无工具调用时为 `None`。
     pub traces_json: Option<Value>,
+    /// 该轮的**推理 / 思考**原文（决策 244）。不产推理的模型为 `None`。
+    ///
+    /// **展示留痕，永不回灌**：它不是 assistant 消息的一部分，进 `transcript` 既会被
+    /// 部分厂商拒绝，也会让每一轮白烧一份最长的文本。
+    pub thinking: Option<String>,
     pub created_at: DateTime<Utc>,
 }
 
@@ -102,6 +107,9 @@ pub struct NewForemanMessage {
     pub completion_tokens: u32,
     pub briefing_json: Option<Value>,
     pub traces_json: Option<Value>,
+    /// 该轮的推理原文（决策 244）。构造它的两条便捷路径都给 `None`——
+    /// 只有值班长那一轮会填它，且由 [`crate::pipeline::foreman`] 直接赋值。
+    pub thinking: Option<String>,
 }
 
 impl NewForemanMessage {
@@ -115,6 +123,7 @@ impl NewForemanMessage {
             completion_tokens: 0,
             briefing_json: None,
             traces_json: None,
+            thinking: None,
         }
     }
 
@@ -128,6 +137,7 @@ impl NewForemanMessage {
             completion_tokens: 0,
             briefing_json: None,
             traces_json: None,
+            thinking: None,
         }
     }
 }
@@ -163,6 +173,7 @@ struct ForemanMessageRow {
     completion_tokens: i64,
     briefing_json: Option<String>,
     traces_json: Option<String>,
+    thinking: Option<String>,
     created_at: String,
 }
 
@@ -180,6 +191,7 @@ impl ForemanMessageRow {
             completion_tokens: self.completion_tokens.max(0) as u32,
             briefing_json: self.briefing_json.as_deref().map(parse_json).transpose()?,
             traces_json: self.traces_json.as_deref().map(parse_json).transpose()?,
+            thinking: self.thinking,
             created_at: parse_ts(&self.created_at)?,
         })
     }
@@ -192,7 +204,8 @@ fn parse_json(raw: &str) -> Result<Value> {
 }
 
 const FOREMAN_MESSAGE_COLUMNS: &str = "id, session_id, role, content, prompt_tokens, \
-                                       completion_tokens, briefing_json, traces_json, created_at";
+                                       completion_tokens, briefing_json, traces_json, thinking, \
+                                       created_at";
 
 const FOREMAN_SESSION_COLUMNS: &str = "id, title, created_at, last_active_at, archived_at";
 
@@ -319,8 +332,8 @@ impl Store {
         let id: i64 = sqlx::query_scalar(
             "INSERT INTO kanban_foreman_messages
              (session_id, role, content, prompt_tokens, completion_tokens, briefing_json,
-              traces_json, created_at)
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?) RETURNING id",
+              traces_json, thinking, created_at)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?) RETURNING id",
         )
         .bind(&msg.session_id)
         .bind(&msg.role)
@@ -329,6 +342,7 @@ impl Store {
         .bind(msg.completion_tokens as i64)
         .bind(msg.briefing_json.as_ref().map(Value::to_string))
         .bind(msg.traces_json.as_ref().map(Value::to_string))
+        .bind(msg.thinking.as_deref())
         .bind(ts(now))
         .fetch_one(&mut *tx)
         .await?;
@@ -363,8 +377,8 @@ impl Store {
         let id: i64 = sqlx::query_scalar(
             "INSERT INTO kanban_foreman_messages
              (session_id, role, content, prompt_tokens, completion_tokens, briefing_json,
-              traces_json, created_at)
-             VALUES (?, ?, ?, 0, 0, NULL, NULL, ?) RETURNING id",
+              traces_json, thinking, created_at)
+             VALUES (?, ?, ?, 0, 0, NULL, NULL, NULL, ?) RETURNING id",
         )
         .bind(session_id)
         .bind(FOREMAN_ROLE_USER)

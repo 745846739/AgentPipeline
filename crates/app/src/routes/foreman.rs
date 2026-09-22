@@ -1269,6 +1269,9 @@ fn message_wire(m: &ForemanMessage) -> serde_json::Value {
         "completion_tokens": m.completion_tokens,
         "briefing": m.briefing_json,
         "traces": m.traces_json,
+        // 该轮的推理原文（决策 244）：**展示留痕**，界面把它收进一个折叠块。
+        // 与 `traces` 一样原样带出去，不在后端截断——界面要显示的就是落库那一份。
+        "thinking": m.thinking,
         "created_at": m.created_at.to_rfc3339(),
         // 只对助理轮解析：`system` 行是后端自己写的中断 / 失败账，里面不会有归因块。
         "attribution": attribution.as_ref().map(|a| a.wire()),
