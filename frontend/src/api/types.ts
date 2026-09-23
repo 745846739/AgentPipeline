@@ -845,6 +845,20 @@ export interface ForemanTrace {
   ok: boolean;
 }
 
+/** 一个工具的回执标签（`GET /foreman/tools`，决策 247⑤）：界面上那个中文词。 */
+export interface ForemanToolLabel {
+  name: string;
+  label: string;
+}
+
+/**
+ * 全量工具清单的标签：21 条、与后端清单同序、**不按档位滤**——回执标的是历史上的工具
+ * 调用，昨天 `auto` 今天 `deny`，昨天的回执仍要能翻译。
+ */
+export interface ForemanToolLabelList {
+  tools: ForemanToolLabel[];
+}
+
 /** 态势快照里等人拍板的一条：`message` 是 pending 原因**原文**，不是枚举名。 */
 export interface ForemanBriefingPending {
   task_id: string;

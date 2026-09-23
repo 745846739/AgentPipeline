@@ -54,6 +54,7 @@
     proposalToolLabel,
   } from '../lib/proposals';
   import { CompositionGuard, shouldSubmitOnEnter } from '../lib/enterToSend';
+  import { labelFor, loadToolLabels } from '../lib/toolLabels';
   import { formatDateTime } from '../lib/format';
   import {
     TALK_FOLD_QUERY,
@@ -224,6 +225,8 @@
    * 跨刷新不记忆（与决策 217 的折叠态口径一致：折叠态不进 URL / localStorage）。
    */
   let receiptOpen = $state<Record<string, boolean>>({});
+  /** 工具回执标签（`GET /foreman/tools`，取数一次缓存，决策 247⑤）。空表 = 还没回来，原样显示工具名。 */
+  let toolLabels = $state<Record<string, string>>({});
   const receiptIsOpen = (key: string) => receiptOpen[key] ?? !folded;
 
   /**
@@ -835,6 +838,11 @@
   onMount(() => {
     // 地址权威、localStorage 兜底（决策 217④）：「我一直在看这一班」不该因为从看板点回来而重置
     seen = loadSeen();
+    // 回执标签取一次（模块级缓存，之后别的页签再挂载不再发第二跳）。失败**不打断对话**：
+    // 缓存不记失败（下一次挂载会重试），期间回执原样显示工具名——英文原名好过一个错词。
+    void loadToolLabels()
+      .then((l) => (toolLabels = l))
+      .catch(() => {});
     void reload(urlSession ?? loadSessionId() ?? undefined);
     // 复用任务流的分帧 / 退避 / 主动重连（票 03）：工头流只是换了一条路径
     conn = new TaskStream(
@@ -1153,32 +1161,6 @@
     narrow ? '对值班长说一句话…' : '对值班长说一句话（Enter 发送，Shift+Enter 换行）…',
   );
 
-  /** 值班长的两个只读工具（`FOREMAN_TOOLS`）；未登记的照原样显示。 */
-  const TOOL_LABELS: Record<string, string> = {
-    read_task: '读任务台账',
-    read_conversation: '读工位会话',
-    // A 层环境读数（决策 188）
-    read_board: '读看板',
-    read_metrics: '读指标',
-    read_projects: '读项目',
-    read_stage_configs: '读阶段配置',
-    read_skills: '读技能清单',
-    read_providers: '读 provider',
-    // B 层环境只读（决策 206）
-    read_file: '读文件',
-    list_dir: '列目录',
-    Skill: '取技能正文',
-    // C / E 层（走确认钮，回执只在「它查过什么」这一层出现）
-    write_file: '写文件',
-    edit_file: '改文件',
-    delete_file: '删文件',
-    run_command: '跑命令',
-    // D 层本服务写接口（决策 207④ 的三族）
-    task: '任务动作',
-    config: '改阶段配置',
-    skills: '技能动作',
-  };
-
   /** 工位名 → sprite：快照里的 stage 是后端字符串，未登记的值不猜（退回台账箱）。 */
   function stageSprite(stage: string): SpriteName {
     const col = BOARD_COLUMNS.find((c) => c.stages.includes(stage as Stage));
@@ -1188,11 +1170,14 @@
   /**
    * 工具名 → 中文词（实时那一栏用；回执那一栏在 {@link receipt} 里并列拿同一张表）。
    *
-   * 未登记的值**原样显示工具名**，不兜底成「台账查读」——那个兜底会把「值班长调了个
-   * 界面还不认识的新工具」说成一件它没做的事（决策 200 的平实口径）。
+   * 词来自后端清单（`GET /foreman/tools`，onMount 取一次缓存，决策 247⑤）——**前端不再
+   * 手抄一张表**（那张 18 键的 `TOOL_LABELS` 缺 4 个词、还带着死键，已删）。未登记的值
+   * **原样显示工具名**，不兜底成「台账查读」——那个兜底会把「值班长调了个界面还不认识的
+   * 新工具」说成一件它没做的事（决策 200 的平实口径）；取数还没回来时同理（英文原名好过
+   * 一个猜出来的中文词）。
    */
   function toolLabel(tool: string): string {
-    return TOOL_LABELS[tool] ?? tool;
+    return labelFor(toolLabels, tool);
   }
 
   /**
@@ -1214,7 +1199,7 @@
     return {
       sprite: known ? stageSprite(known.stage) : 'chest',
       workshop: known?.stage ?? '台账',
-      label: TOOL_LABELS[trace.tool] ?? trace.tool,
+      label: labelFor(toolLabels, trace.tool),
     };
   }
 
@@ -1654,7 +1639,7 @@
           <div class="dname">操作台</div>
           <div class="dtag">
             {#if st === 'pending'}⏳{/if}
-            {proposalShortLabel(p, now)} · {proposalToolLabel(p)}
+            {proposalShortLabel(p, now)} · {proposalToolLabel(p, toolLabels)}
             {#if st === 'pending'}· <span class="pleft">{proposalRemainingLabel(p, now)}</span>{/if}
           </div>
           <p>{p.summary}</p>

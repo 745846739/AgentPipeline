@@ -13,6 +13,7 @@
 //! | GET | `/foreman/session?session=<id>` | 某个班次的全部轮次 + 提议 + 合计 token |
 //! | POST | `/foreman/messages` | 说一句话，得到一次回话 |
 //! | GET | `/foreman/stream` | 订阅回话的逐字增量与提议事件 |
+//! | GET | `/foreman/tools` | 全量工具清单的回执标签（`{name, label}`，21 条，不按档位滤） |
 //! | GET | `/foreman/commands?session=<id>` | 该班次跑过的命令（含被拒的） |
 //! | GET | `/foreman/proposals?session=<id>` | 该班次未决的提议 |
 //! | POST | `/foreman/proposals/{id}/execute` | 按下确认钮：**走既有端点**执行这条提议 |
@@ -29,6 +30,7 @@
 
 use agentpipeline_core::pipeline::foreman::{
     situation_drift, situation_fingerprint, FOREMAN_AGENT_TYPE, FOREMAN_STAGE_KEY,
+    FOREMAN_TOOL_SPECS,
 };
 use agentpipeline_core::sse::SseEvent;
 use agentpipeline_core::storage::foreman::{
@@ -53,6 +55,27 @@ use crate::state::{map_core_error, ApiError, ApiResult, AppState};
 /// 本班次全部对话的上限，而不是分页——分页会把「滚上去看两小时前说的那句」变成一个
 /// 要写代码的交互。跨班次翻找是**列表**的职责（`GET /foreman/sessions`）。
 const SESSION_PAGE_LIMIT: usize = 500;
+
+/// `GET /foreman/tools`：清单的**回执标签**（决策 247⑤）。
+///
+/// **全量 21 条、按清单顺序、不按档位滤**：回执标的是**历史**上的工具调用——昨天 `auto`
+/// 今天改 `deny`，昨天的回执仍要能翻译（按当前档位滤会翻译不了它）。**只出 `{name, label}`**
+/// ——description / parameters 前端用不上，interface 能少则少。
+///
+/// 清单本身是静态的，但**未接线照旧 503**：`/foreman/*` 下没有例外（这条规则由既有
+/// 两组 503 用例与 testing.md §7 钉着）——给一条静态端点开「接线外可用」的特例，
+/// 等于给「什么算对讲台的能力」造出第二份口径。
+pub async fn tools(State(state): State<AppState>) -> ApiResult<Json<serde_json::Value>> {
+    if state.foreman.is_none() {
+        return Err(foreman_unwired());
+    }
+    Ok(Json(json!({
+        "tools": FOREMAN_TOOL_SPECS
+            .iter()
+            .map(|s| json!({ "name": s.name, "label": s.label }))
+            .collect::<Vec<_>>(),
+    })))
+}
 
 /// `GET /foreman/session?session=<id>`。
 ///
@@ -460,7 +483,9 @@ async fn run_env_tool(
     state: &AppState,
     proposal: &ForemanProposal,
 ) -> Result<Option<String>, ApiError> {
-    use agentpipeline_core::pipeline::foreman::{foreman_tooling, ForemanMoment};
+    use agentpipeline_core::pipeline::foreman::{
+        foreman_available_tools_except, foreman_tooling, ForemanMoment,
+    };
 
     let cfg = state
         .store
@@ -472,7 +497,9 @@ async fn run_env_tool(
         FOREMAN_STAGE_KEY,
         cfg.as_ref(),
     );
-    // 按键执行那一趟不分级（票 07 的分级只针对自动轮）：人已经按下了那颗钮。
+    // 按键执行那一趟不分级（票 07 的分级只针对自动轮）：人已经按下了那颗钮，故 `deny`
+    // 为空；白名单仍按**当前**档位算一次传进去（决策 247：执行点不吃自己另筛的一份）。
+    let available = foreman_available_tools_except(env_mode, &[]);
     let (tools, ctx) = foreman_tooling(
         &state.store,
         &state.settings,
@@ -481,8 +508,7 @@ async fn run_env_tool(
         &proposal.session_id,
         env_mode,
         ForemanMoment::ConfirmedPress,
-        // 不分级：人已经按下了那颗钮，这一趟不是「自动轮」
-        &[],
+        &available,
         // 也不注入托管执行者：按键那一趟根本走不到托管分支（`confirmed_once` 已短路）
         None,
     );

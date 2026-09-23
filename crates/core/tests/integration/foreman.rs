@@ -11,15 +11,15 @@
 use std::sync::Arc;
 
 use agentpipeline_core::agent::client::{AgentResponse, LlmClient, LlmRequest};
+use agentpipeline_core::agent::tools::{is_env_write_tool, is_service_write_tool, ENV_TOOLS};
 use agentpipeline_core::clock::Clock;
 use agentpipeline_core::config::Settings;
 use agentpipeline_core::metrics;
 use agentpipeline_core::pipeline::foreman::{
-    build_briefing, foreman_tool_names, parse_attribution, situation_fingerprint, trim_history,
-    Attribution, AttributionKind, ForemanRunner, ForemanToolLayer, FOREMAN_AGENT_TYPE,
-    FOREMAN_ATTRIBUTION_MARK, FOREMAN_FAILED_TURN_MARK, FOREMAN_MAX_ROUNDS,
-    FOREMAN_PARTIAL_TURN_MARK, FOREMAN_PERSONA, FOREMAN_STAGE_KEY, FOREMAN_TOOL_SPECS,
-    FOREMAN_WATCH_MARK, OPERATION_LOG_MARK,
+    build_briefing, parse_attribution, situation_fingerprint, trim_history, Attribution,
+    AttributionKind, ForemanRunner, FOREMAN_AGENT_TYPE, FOREMAN_ATTRIBUTION_MARK,
+    FOREMAN_FAILED_TURN_MARK, FOREMAN_MAX_ROUNDS, FOREMAN_PARTIAL_TURN_MARK, FOREMAN_PERSONA,
+    FOREMAN_STAGE_KEY, FOREMAN_TOOL_SPECS, FOREMAN_WATCH_MARK, OPERATION_LOG_MARK,
 };
 use agentpipeline_core::sse::{SseEvent, SseEventType, ToolPhase};
 use agentpipeline_core::storage::foreman::NewForemanMessage;
@@ -1980,12 +1980,16 @@ async fn unknown_task_id_answers_with_text_instead_of_failing_the_turn() {
     assert!(turn.reply.contains("没有这个号"));
 }
 
-#[tokio::test]
-async fn the_foreman_tool_set_matches_the_frozen_contract() {
-    // 清单的**名字与层级**逐条钉住：这是安全边界本身（`foreman.rs` 的注释原话），
+#[test]
+fn the_foreman_tool_set_matches_the_frozen_contract() {
+    // 清单的**名字与顺序**（21 个）逐条钉住：这是安全边界本身（`foreman.rs` 的注释原话），
     // 加一个工具必须先改这里，从而在任何 diff 里显式可见。
+    //
+    // 分组（你能直接用 / 会改动东西）**不再手标**——`ForemanToolLayer` 已删（决策 247），
+    // 两组由档位谓词从这份名单派生，派生对不对由下一条用例钉。
+    let names: Vec<&str> = FOREMAN_TOOL_SPECS.iter().map(|s| s.name).collect();
     assert_eq!(
-        foreman_tool_names(ForemanToolLayer::Read),
+        names,
         [
             "read_task",
             "read_conversation",
@@ -2009,11 +2013,6 @@ async fn the_foreman_tool_set_matches_the_frozen_contract() {
             // 按命令名判定，`sample` 只许对本服务的 pid 与其子进程）。它属**只读层**，
             // 故不受档位管、也不在值守轮的 deny 清单里——「自主轮能取证」正是它为的。
             "run_readonly",
-        ]
-    );
-    assert_eq!(
-        foreman_tool_names(ForemanToolLayer::Write),
-        [
             // C 层：环境写（决策 206 / 207）。`ask` 档下生成提议、`auto` 直通、`deny` 摘掉。
             "write_file",
             "edit_file",
@@ -2052,6 +2051,13 @@ fn every_listed_tool_has_a_parseable_parameter_schema() {
         assert!(
             !spec.description.trim().is_empty(),
             "{} 缺广告语——模型只能靠它决定要不要调",
+            spec.name
+        );
+        // 编译器管 `label` 有没有（必填字段，决策 247④），这里管它是不是空串：
+        // 空串会让回执上凭空少一个词，而「少一个词」与「没登记」在界面上分不开。
+        assert!(
+            !spec.label.trim().is_empty(),
+            "{} 的 label 是空的——回执上会只剩一个裸工具名",
             spec.name
         );
     }
@@ -2136,6 +2142,61 @@ async fn read_providers_never_echoes_the_plaintext_key() {
     assert!(fed.contains("***"), "密钥的存在性该看得到（掩码）：{fed}");
 }
 
+/// 跑一轮**人的**回话，返回模型真正收到的那一份 system prompt（不是常量本身——
+/// 取证要取模型看到的那份，否则纪律段算早了还是算晚了都看不出来）。
+async fn prompt_for(mode: Option<agentpipeline_core::types::EnvMode>) -> String {
+    let h = Harness::seeded().await;
+    if let Some(mode) = mode {
+        h.store
+            .upsert_stage_config(&StageConfig {
+                stage: FOREMAN_STAGE_KEY.to_string(),
+                env_mode: Some(mode),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+    }
+    let mut script = Script::new();
+    script.for_foreman().text("收到。");
+    let agent = FakeAgent::new(script);
+    let requests = agent.clone();
+    let runner = h.runner(agent);
+    runner.say(None, "在吗").await.unwrap();
+    requests.request_log()[0].system_prompt.clone()
+}
+
+/// 从 system prompt 里抠出工具纪律段列的**两组**名单（`你能直接用的工具是：…。` 与
+/// `会改动东西的工具是：…。`），断言打的是模型看到的行文，不是常量表。
+fn discipline_groups(prompt: &str) -> (Vec<String>, Vec<String>) {
+    fn grab(prompt: &str, marker: &str) -> Vec<String> {
+        let line = prompt
+            .lines()
+            .find(|l| l.contains(marker))
+            .unwrap_or_else(|| panic!("prompt 里没有「{marker}」那一行：{prompt}"));
+        let body = line
+            .split_once(marker)
+            .expect("上一行刚按同一个 marker 找到")
+            .1
+            .trim()
+            .trim_end_matches('。');
+        body.split(" / ")
+            .filter(|s| !s.is_empty())
+            .map(str::to_string)
+            .collect()
+    }
+    (
+        grab(prompt, "你能直接用的工具是："),
+        grab(prompt, "会改动东西的工具是："),
+    )
+}
+
+/// 人格是**静态文案**，三档、值守与否都逐字相同，且它点着工具名（`read_conversation` /
+/// `repair`）——本票明文不动它的文案（决策 247），故「prompt 不含 X」的取证先把人格摘掉：
+/// 余下的（须知 + 工具纪律 + 纪律之后的每一段）才是按 `available` 算出来的那部分。
+fn without_persona(prompt: &str) -> String {
+    prompt.replace(FOREMAN_PERSONA, "")
+}
+
 /// 三处措辞（`FOREMAN_PERSONA` / `FOREMAN_BASELINE` / 工具纪律段）按档位说真话，
 /// **取证取的是模型真正收到的那一份 system prompt**（不是常量本身）。
 ///
@@ -2144,28 +2205,6 @@ async fn read_providers_never_echoes_the_plaintext_key() {
 /// （「我读过那个文件」）。三档各取一轮请求，逐句核。
 #[tokio::test]
 async fn the_system_prompt_tells_the_truth_about_what_it_can_do_in_each_tier() {
-    /// 跑一轮回话，返回模型收到的 system prompt。
-    async fn prompt_for(mode: Option<agentpipeline_core::types::EnvMode>) -> String {
-        let h = Harness::seeded().await;
-        if let Some(mode) = mode {
-            h.store
-                .upsert_stage_config(&StageConfig {
-                    stage: FOREMAN_STAGE_KEY.to_string(),
-                    env_mode: Some(mode),
-                    ..Default::default()
-                })
-                .await
-                .unwrap();
-        }
-        let mut script = Script::new();
-        script.for_foreman().text("收到。");
-        let agent = FakeAgent::new(script);
-        let requests = agent.clone();
-        let runner = h.runner(agent);
-        runner.say(None, "在吗").await.unwrap();
-        requests.request_log()[0].system_prompt.clone()
-    }
-
     // 三档共同的下限：不许再出现那两句**已经不成立**的能力说明，且称呼恒定。
     let ask = prompt_for(None).await;
     for forbidden in ["读不到文件系统", "没有动手的权力", "不能执行命令", "值班员"]
@@ -2222,6 +2261,108 @@ async fn the_system_prompt_tells_the_truth_about_what_it_can_do_in_each_tier() {
     let deny = prompt_for(Some(agentpipeline_core::types::EnvMode::Deny)).await;
     assert!(deny.contains("关掉"), "{deny}");
     assert!(deny.contains("不要提议"), "{deny}");
+}
+
+/// 纪律段的两组名单**从档位谓词派生**（决策 247）：并 == 冻结清单、交为空，且每个名字
+/// 落在「会改动东西」那一组 ⟺ 它是环境层写工具或本服务写接口——`gate_decision` 与纪律段
+/// 从此读同一份档位表。手标的层枚举删掉之后，「分组说的」与「闸门判的」还能不能对上，
+/// 由这一条拦。
+#[tokio::test]
+async fn the_discipline_groups_are_derived_from_the_tier_predicates() {
+    let prompt = prompt_for(None).await;
+    let (direct, mutating) = discipline_groups(&prompt);
+
+    // 两组的并 == 冻结清单：少一个 = 这一轮拿得到却没人告诉它；多一个 = 念了个不存在的。
+    let mut union = direct.clone();
+    union.extend(mutating.iter().cloned());
+    let mut frozen: Vec<String> = FOREMAN_TOOL_SPECS
+        .iter()
+        .map(|s| s.name.to_string())
+        .collect();
+    union.sort();
+    frozen.sort();
+    assert_eq!(union, frozen, "两组的并必须逐字等于冻结清单：{prompt}");
+
+    // 交为空：同一个名字两组都列，模型收到的就是自相矛盾的纪律。
+    for name in &direct {
+        assert!(
+            !mutating.contains(name),
+            "{name} 同时出现在两组里：{prompt}"
+        );
+    }
+
+    // 分组与档位谓词一致（判据的唯一实现是 `ENV_WRITE_TOOLS` / `SERVICE_WRITE_TOOLS`）。
+    for name in &direct {
+        assert!(
+            !is_env_write_tool(name) && !is_service_write_tool(name),
+            "「你能直接用」组里的 {name} 其实会改动东西：{prompt}"
+        );
+    }
+    for name in &mutating {
+        assert!(
+            is_env_write_tool(name) || is_service_write_tool(name),
+            "「会改动东西」组里的 {name} 不在任何写清单里：{prompt}"
+        );
+    }
+}
+
+/// 值守轮：这一轮摘掉的两件贵东西**也不许出现在纪律段里**（决策 247 修的顺序 bug——
+/// `deny` 从前晚于 `system_prompt` 才算，纪律段于是广告着 `read_conversation` /
+/// `run_command`，而广告集与白名单里没有它们：模型被告知去调一个必被拒的名字）。
+#[tokio::test]
+async fn the_watch_round_prompt_does_not_advertise_what_it_stripped() {
+    let h = Harness::seeded().await;
+    note(
+        &h,
+        "t1",
+        agentpipeline_core::storage::AttentionKind::RetryExhausted,
+    )
+    .await;
+    // 去抖窗口过了（默认 60s）
+    h.clock.advance_secs(61);
+
+    let mut script = Script::new();
+    script.for_foreman().text("t1 重试耗尽了，需要看一眼。");
+    let agent = FakeAgent::new(script);
+    let requests = agent.clone();
+    let runner = h.runner(agent);
+    runner.watch().await.unwrap().expect("应当醒一次");
+
+    let prompt = requests.request_log()[0].system_prompt.clone();
+    let minus_persona = without_persona(&prompt);
+    for gone in ["read_conversation", "run_command"] {
+        assert!(
+            !minus_persona.contains(gone),
+            "值守轮摘掉了 {gone}，纪律段却还广告它：{minus_persona}"
+        );
+    }
+    // 摘的是两件贵的，不是整个清单：便宜的台账读数与诊断包照旧广告（否则这轮变哑巴）。
+    let (direct, _) = discipline_groups(&prompt);
+    assert!(direct.iter().any(|n| n == "read_task"), "{direct:?}");
+    assert!(direct.iter().any(|n| n == "read_diagnosis"), "{direct:?}");
+}
+
+/// `deny` 档：纪律段点不出**任何**环境层工具名（决策 247）。「连广告都不给」从前只兑现在
+/// 广告集与白名单上，纪律段照旧念着整份清单——这是同一个顺序 bug 的档位那一面。
+#[tokio::test]
+async fn the_deny_tier_prompt_does_not_advertise_the_environment_layer() {
+    let prompt = prompt_for(Some(agentpipeline_core::types::EnvMode::Deny)).await;
+    let minus_persona = without_persona(&prompt);
+    for gone in ENV_TOOLS {
+        assert!(
+            !minus_persona.contains(gone),
+            "deny 档连广告都不给 {gone}，纪律段却念着它：{minus_persona}"
+        );
+    }
+    // 「什么都不给」同样是假话：台账读数与 D 层照旧在（后者恒为提议，不读档位）。
+    let (direct, mutating) = discipline_groups(&prompt);
+    assert!(direct.iter().any(|n| n == "read_task"), "{direct:?}");
+    for kept in ["task", "config", "skills", "service"] {
+        assert!(
+            mutating.iter().any(|n| n == kept),
+            "D 层 {kept} 不随档位走：{mutating:?}"
+        );
+    }
 }
 
 /// `deny` 档：环境层**连广告都不给**，执行点也拒（决策 206，票 03 的按档断言）。

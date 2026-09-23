@@ -4904,13 +4904,18 @@ async fn foreman_refuses_to_speak_into_an_archived_session() {
     assert!(body["error"].as_str().unwrap().contains("归档"));
 }
 
-/// 未接线时三个端点**一律** 503 而不是 500：服务是好的，是这个能力这次没被接上。
+/// 未接线时对讲台端点**一律** 503 而不是 500：服务是好的，是这个能力这次没被接上。
 ///
-/// 三个入口是同一件事的三面——留下一个「能读历史、发不出话」的页面比一句「未接线」
-/// 更难排查（而且读会话虽然只需要库，页面拿到历史后第一件事就是发话）。
+/// 会话 / 发话 / 订阅这几个入口是同一件事的几面——留下一个「能读历史、发不出话」的页面
+/// 比一句「未接线」更难排查（而且读会话虽然只需要库，页面拿到历史后第一件事就是发话）。
+/// 清单端点（`/foreman/tools`，决策 247⑤）**也在列**：它虽是静态数据，
+/// `/foreman/*` 下没有「接线外可用」的特例——特例就是第二份口径。
 #[tokio::test]
 async fn foreman_endpoints_report_503_when_unwired() {
     let api = api_full(Settings::default(), Vec::new(), offline_repo(), Vec::new()).await;
+
+    let (status, body) = get(&api, "/foreman/tools").await;
+    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{body}");
 
     let (status, body) = get(&api, "/foreman/session").await;
     assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{body}");
@@ -5774,6 +5779,35 @@ async fn the_door_opening_actions_have_no_tool_at_all() {
         token_before,
         "配对令牌一个字节都不该动"
     );
+}
+
+/// `GET /foreman/tools`（决策 247⑤）：**全量 21 条、与清单同序、label 均非空、只出两个字段**。
+///
+/// 回执标的是**历史**上的工具调用，故条目数 == 清单长度本身就是「不按档位滤」的形状
+/// （滤过就会少——昨天的回执今天翻译不了）。description / parameters 不出：前端用不上。
+#[tokio::test]
+async fn the_tool_label_endpoint_lists_the_whole_manifest() {
+    let api = api_with_foreman(FakeAgent::new(Script::new())).await;
+    let (status, body) = get(&api, "/foreman/tools").await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+
+    let manifest = agentpipeline_core::pipeline::foreman::FOREMAN_TOOL_SPECS;
+    let listed = body["tools"].as_array().expect("报文要有 tools 数组");
+    assert_eq!(listed.len(), 21, "全量 21 条，按档位滤了？{body}");
+    assert_eq!(listed.len(), manifest.len(), "条目数要与清单一致：{body}");
+    for (i, (item, spec)) in listed.iter().zip(manifest.iter()).enumerate() {
+        assert_eq!(item["name"], spec.name, "第 {i} 条与清单不同序：{body}");
+        assert_eq!(item["label"], spec.label, "第 {i} 条的标签对不上：{body}");
+        assert!(
+            !item["label"].as_str().unwrap().trim().is_empty(),
+            "label 不许为空：{item}"
+        );
+        assert_eq!(
+            item.as_object().map(|o| o.len()),
+            Some(2),
+            "只出 name / label 两个字段：{item}"
+        );
+    }
 }
 
 /// 回话里的归因类别**由后端解析后随消息下发**（决策 235 / 238）。

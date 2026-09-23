@@ -127,6 +127,9 @@ pub fn build_router(state: AppState) -> Router {
         )
         .route("/foreman/messages", post(routes::foreman::send))
         .route("/foreman/stream", get(routes::foreman::stream))
+        // 回执标签（决策 247⑤）：全量清单的 `{name, label}`，**不按档位滤**——回执标的是
+        // 历史上的工具调用，昨天的回执今天仍要能翻译。
+        .route("/foreman/tools", get(routes::foreman::tools))
         // 提议（决策 188 / 207）：写动作的落库形态。**执行不是一条新路**——它按提议里的
         // (工具, 参数) 走既有的那条端点，同一套校验、同一套闸门。这里能做的三件事是
         // 一次一按、过期、态势变化的拒执（决策 207 的三条硬约束）。

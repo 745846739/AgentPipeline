@@ -10,6 +10,7 @@ import type {
   ForemanSessionList,
   ForemanSessionMeta,
   ForemanProposalResult,
+  ForemanToolLabelList,
   ForemanCommand,
   GlobalMetrics,
   NodeCommand,
@@ -631,6 +632,16 @@ export function getForemanSession(
 /** 未归档的班次，按最近活动倒序（决策 204⑦）。 */
 export function getForemanSessions(signal?: AbortSignal): Promise<ForemanSessionList> {
   return request<ForemanSessionList>('/foreman/sessions', { signal });
+}
+
+/**
+ * 全量工具清单的回执标签（决策 247⑤）。
+ *
+ * 静态清单，前端**取数一次缓存**（`lib/toolLabels.ts`）；不带档位参数——回执标的是历史，
+ * 端点自己不滤。
+ */
+export function getForemanToolLabels(signal?: AbortSignal): Promise<ForemanToolLabelList> {
+  return request<ForemanToolLabelList>('/foreman/tools', { signal });
 }
 
 /** 新开一个班次。标题留空 = 中性标题，第一句话说出来时按它命名（决策 204②）。 */

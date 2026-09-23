@@ -56,27 +56,24 @@ pub const FOREMAN_STAGE_KEY: &str = "foreman";
 /// 现在不落 run 行（值班长没有运行行，见 `say` 的注释），但 SSE 增量事件按它过滤。
 pub const FOREMAN_AGENT_TYPE: &str = "foreman";
 
-/// 工具的一层（决策 188 / 206 的两段白名单在权限模式那一批细化）。
+/// 一个工具的完整规格：名字 + 给人看的中文标签 + 广告语 + 参数 schema。
 ///
-/// 本票（票 01）只有 `Read` 一层有内容；写工具由票 04 / 05 / 06 逐个加进来，而**每一层
-/// 能不能自动放行**由决策 206 的档位管——档位表不在本模块，这里只标身份。
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ForemanToolLayer {
-    /// A 层：只读（台账 + 环境读数）。**永不改动任何东西**，故不需要确认钮。
-    Read,
-    /// C / D / E 层：会改动东西（文件 / 本服务状态 / 环境）。`ask` 档下转成提议。
-    Write,
-}
-
-/// 一个工具的完整规格：名字 + 层级 + 广告语 + 参数 schema。
-///
-/// **唯一事实源**：广告给模型的那一份（[`FOREMAN_TOOL_SPECS`] → `tool_defs()`）与执行点的
-/// 白名单（`ToolExecutor::with_allowed_tools` 收的那一份）都从这里来。两处各写一份名字的后果是
+/// **唯一事实源**：广告给模型的那一份（[`FOREMAN_TOOL_SPECS`] → `tool_defs()`）、执行点的
+/// 白名单（`ToolExecutor::with_allowed_tools` 收的那一份）与人格里工具纪律段的两组名单
+/// 都从这里来（三处吃同一个 `available`，决策 247）；界面读的回执标签（`label` →
+/// `GET /foreman/tools`）也从这里来。两处各写一份名字的后果是
 /// 「模型看得见一个调用就被拒的工具」（或反过来，一个能调但没人告诉它的工具），
 /// 两种都很难从现象定位——这正是票 01 要求「同源」的理由。
+///
+/// **没有「层」字段**（决策 247 删掉了 `ForemanToolLayer`）：「会改动东西」由档位谓词
+/// （`is_env_write_tool` ∨ `is_service_write_tool`）判，手标一份枚举等于第二份要与档位表
+/// 对账的镜像——而镜像漂了没人看得见（分组说的与闸门判的可以不同）。
 pub struct ForemanToolSpec {
     pub name: &'static str,
-    pub layer: ForemanToolLayer,
+    /// 给人看的中文词（回执与提议徽章上那个）。**必填**（决策 247④）：加工具不写标签
+    /// 直接编译不过——前端那张 18 键手抄表（`TOOL_LABELS`）由此能整个删掉，漂移进不了 diff。
+    /// 空串由单测拦（编译器只管「有没有」）。
+    pub label: &'static str,
     pub description: &'static str,
     /// 参数 JSON-Schema 的**文本**：常量表里放不了 `serde_json::Value`，
     /// 用文本 + 一处解析（`tool_defs()`），并由单测钉住它是合法 JSON。
@@ -94,55 +91,55 @@ pub struct ForemanToolSpec {
 pub const FOREMAN_TOOL_SPECS: [ForemanToolSpec; 21] = [
     ForemanToolSpec {
         name: "read_task",
-        layer: ForemanToolLayer::Read,
+        label: "读任务台账",
         description: "读某个任务的台账详情：标题、状态、当前工位、待办原因原文、\
                       后端下发的可用动作、各分支游标。卡住的细节问它。",
         parameters: r#"{"type":"object","properties":{"task_id":{"type":"string","description":"任务 id（快照里方括号内那串）"}},"required":["task_id"]}"#,
     },
     ForemanToolSpec {
         name: "read_conversation",
-        layer: ForemanToolLayer::Read,
+        label: "读工位会话",
         description: "读某个任务某次节点运行的会话回执（工位当时说了什么）。\
                       run_id 省略时取该任务最近一次会话。引用工位结论时要标出来源。",
         parameters: r#"{"type":"object","properties":{"task_id":{"type":"string","description":"任务 id"},"run_id":{"type":"integer","description":"运行 id，省略取最近一次"}},"required":["task_id"]}"#,
     },
     ForemanToolSpec {
         name: "read_board",
-        layer: ForemanToolLayer::Read,
+        label: "读看板",
         description: "读整块看板：每个任务的状态与当前工位，以及按状态的分组计数。\
                       想知道「一共有多少活、都在哪一档」时问它。",
         parameters: r#"{"type":"object","properties":{}}"#,
     },
     ForemanToolSpec {
         name: "read_metrics",
-        layer: ForemanToolLayer::Read,
+        label: "读指标",
         description: "读全局指标：任务数、成功率、validate 首过率、token 与调用总量、\
                       按阶段的聚合。这些数与指标页同源。",
         parameters: r#"{"type":"object","properties":{}}"#,
     },
     ForemanToolSpec {
         name: "read_projects",
-        layer: ForemanToolLayer::Read,
+        label: "读项目",
         description: "读已接入的项目清单：名字、仓库路径、默认分支、语言与测试命令。",
         parameters: r#"{"type":"object","properties":{}}"#,
     },
     ForemanToolSpec {
         name: "read_stage_configs",
-        layer: ForemanToolLayer::Read,
+        label: "读阶段配置",
         description: "读各阶段的配置：provider、采样参数、人格文件、技能声明、超时。\
                       想解释「为什么这个工位表现是这样」时问它。",
         parameters: r#"{"type":"object","properties":{}}"#,
     },
     ForemanToolSpec {
         name: "read_skills",
-        layer: ForemanToolLayer::Read,
+        label: "读技能清单",
         description: "读当前可用的技能清单（技能根下的 markdown）：名字、描述、\
                       被哪些阶段引用。",
         parameters: r#"{"type":"object","properties":{}}"#,
     },
     ForemanToolSpec {
         name: "read_providers",
-        layer: ForemanToolLayer::Read,
+        label: "读 provider",
         description: "读已配置的 provider 清单：id、厂商、模型、是否启用、上下文窗口。\
                       **密钥只回显掩码**——你看到的是「有没有配」，不是密钥本身。",
         parameters: r#"{"type":"object","properties":{}}"#,
@@ -159,7 +156,7 @@ pub const FOREMAN_TOOL_SPECS: [ForemanToolSpec; 21] = [
     //    工具，等于让模型每轮都看得见一个它调了也没用的东西。
     ForemanToolSpec {
         name: "read_file",
-        layer: ForemanToolLayer::Read,
+        label: "读文件",
         description: "读一个文件（路径相对家目录根）。看配置、看产物、看你提议要改的那个\
                       文件现在长什么样——**改之前先看**。日志、运行记录这类追加写的文件\
                       要尾巴就用 tail=true。",
@@ -167,13 +164,13 @@ pub const FOREMAN_TOOL_SPECS: [ForemanToolSpec; 21] = [
     },
     ForemanToolSpec {
         name: "list_dir",
-        layer: ForemanToolLayer::Read,
+        label: "列目录",
         description: "列一个目录（路径相对家目录根，省略取根）。不知道东西在哪儿时先列一层。",
         parameters: r#"{"type":"object","properties":{"path":{"type":"string","description":"相对家目录根的路径"},"recursive":{"type":"boolean","description":"是否递归"}}}"#,
     },
     ForemanToolSpec {
         name: "Skill",
-        layer: ForemanToolLayer::Read,
+        label: "取技能正文",
         description: "按技能名取它的正文（技能目录下的 markdown）。有人问「某个技能到底干什么」\
                       时用它，不要凭名字猜。",
         parameters: r#"{"type":"object","properties":{"name":{"type":"string","description":"技能名（技能目录里列出的那个）"}},"required":["name"]}"#,
@@ -181,10 +178,10 @@ pub const FOREMAN_TOOL_SPECS: [ForemanToolSpec; 21] = [
     // 诊断包（决策 211③ / 票 03）：一族一个工具，一次调用给出定因所需的全部证据。
     // 它**不扩 `read_task`**——后者是每轮值守都会调的高频、便宜读数，混进来会让
     // 「看一眼任务状态」开始烧 12k 字符。排在只读层末尾：往这份清单里加东西，
-    // diff 里永远是末尾多一段（`foreman_tool_names` 的顺序被冻结断言逐条钉住）。
+    // diff 里永远是末尾多一段（`FOREMAN_TOOL_SPECS` 的顺序被冻结断言逐条钉住）。
     ForemanToolSpec {
         name: "read_diagnosis",
-        layer: ForemanToolLayer::Read,
+        label: "读诊断包",
         description:
             "读某个任务的**诊断包**：一次拿到定因所需的全部证据——每条 run 的状态 / 耗时 / \
                       token / error / 是否挂过进程组、命令台账与闸门输出路径、阶段产出与验收标准、\
@@ -198,7 +195,7 @@ pub const FOREMAN_TOOL_SPECS: [ForemanToolSpec; 21] = [
     // 它属**只读层**：改不了任何东西，故不受档位管、也不吃值守轮的 deny 清单。
     ForemanToolSpec {
         name: "run_readonly",
-        layer: ForemanToolLayer::Read,
+        label: "只读取证",
         description:
             "跑一条**只读**的诊断命令（白名单：date / ps / pgrep / lsof / wc / tail / sample）。\
                      不经 shell——command 与 args 是两个独立的参数，分号、管道、$(...) 都没有落点。\
@@ -210,7 +207,7 @@ pub const FOREMAN_TOOL_SPECS: [ForemanToolSpec; 21] = [
     //    `auto` 直通；`deny` 连广告都不给。域与 B 层同一份（家目录根 + `data` / `logs` 前缀 deny）。
     ForemanToolSpec {
         name: "write_file",
-        layer: ForemanToolLayer::Write,
+        label: "写文件",
         description: "写一个文件（整份覆盖，路径相对家目录根）。**改之前先 read_file 看一眼**\
                       ——覆盖是不可逆的，你不知道原来有什么就会把有用的东西抹掉。\
                       这条动作要值班经理按键确认。",
@@ -218,7 +215,7 @@ pub const FOREMAN_TOOL_SPECS: [ForemanToolSpec; 21] = [
     },
     ForemanToolSpec {
         name: "edit_file",
-        layer: ForemanToolLayer::Write,
+        label: "改文件",
         description: "改一个文件里的一处（把 old_text 换成 new_text，路径相对家目录根）。\
                       只想动一小段时用它，不要整份重写——整份重写会把文件里其它地方没读到的内容\
                       一起抹掉。改之前先 read_file。这条动作要值班经理按键确认。",
@@ -226,7 +223,7 @@ pub const FOREMAN_TOOL_SPECS: [ForemanToolSpec; 21] = [
     },
     ForemanToolSpec {
         name: "run_command",
-        layer: ForemanToolLayer::Write,
+        label: "跑命令",
         description: "在这台机器上跑一条 shell 命令（默认工作目录是家目录根）。\
                       命令的输出会作为工具回执回来，也会落进这个班次的命令台账。\
                       这条动作会不会立即执行由权限档位决定（`ask` 档要值班经理按键确认）。",
@@ -238,7 +235,7 @@ pub const FOREMAN_TOOL_SPECS: [ForemanToolSpec; 21] = [
     //    `finish` 的产物本身就是一条提议，放 D 层会变成两层按不完的钮。
     ForemanToolSpec {
         name: "repair",
-        layer: ForemanToolLayer::Write,
+        label: "修复",
         description:
             "起草一份补丁（三步走，**改动在你按下合入之前不进主干**）。\
                       `start`：给某个项目拉一个独立的修复 worktree，回执里有可写目录与 \
@@ -261,7 +258,7 @@ pub const FOREMAN_TOOL_SPECS: [ForemanToolSpec; 21] = [
     // 既不受档位影响，也不在托管自动集里。
     ForemanToolSpec {
         name: "service",
-        layer: ForemanToolLayer::Write,
+        label: "服务动作",
         description: "本服务自己的运维动作。action 取值：`restart`（重启服务）。\
                       它是**全局**动作：会打断所有在跑的任务（本服务没有自重启能力，\
                       按下后先做恢复序列——清占用 + 把中断的 running 任务归队——\
@@ -270,7 +267,7 @@ pub const FOREMAN_TOOL_SPECS: [ForemanToolSpec; 21] = [
     },
     ForemanToolSpec {
         name: "task",
-        layer: ForemanToolLayer::Write,
+        label: "任务动作",
         description: "对一个流水线任务动作。action 取值：\
                       `create`（建任务，要 project_id 与 title）、\
                       `resume`（让人拍过板的 pending 继续走，要 task_id 与 resume_action）、\
@@ -287,7 +284,7 @@ pub const FOREMAN_TOOL_SPECS: [ForemanToolSpec; 21] = [
     },
     ForemanToolSpec {
         name: "config",
-        layer: ForemanToolLayer::Write,
+        label: "改阶段配置",
         description: "改流水线的阶段配置。action 取值：`set`（整条替换某个阶段的配置，要 stage；\
                       留空的字段会被清成默认——这是整条替换不是局部修改）、\
                       `delete`（删掉这个阶段的覆盖行，回到系统默认，要 stage）。\
@@ -296,7 +293,7 @@ pub const FOREMAN_TOOL_SPECS: [ForemanToolSpec; 21] = [
     },
     ForemanToolSpec {
         name: "skills",
-        layer: ForemanToolLayer::Write,
+        label: "技能动作",
         description: "装 / 卸技能。action 取值：`install`（从一个本地技能目录导入，要 path，\
                       该目录自身含 SKILL.md）、`delete`（卸载一个已装技能，要 name）。\
                       卸载不检查引用——仍被阶段配置引用的技能卸掉之后，那个阶段解析会报错。\
@@ -305,13 +302,11 @@ pub const FOREMAN_TOOL_SPECS: [ForemanToolSpec; 21] = [
     },
 ];
 
-/// 清单里某一层的工具名（票 01 起有 `Read`，票 04 / 05 / 06 往上加 `Write`）。
-pub fn foreman_tool_names(layer: ForemanToolLayer) -> Vec<&'static str> {
-    FOREMAN_TOOL_SPECS
-        .iter()
-        .filter(|s| s.layer == layer)
-        .map(|s| s.name)
-        .collect()
+/// 「会改动东西」的判据（决策 247）：工具纪律段的两组按它分家，[`crate::agent::tools::gate_decision`]
+/// 按同一组档位表分流——**分类只此一份事实源**（`ENV_WRITE_TOOLS` / `SERVICE_WRITE_TOOLS`），
+/// 不再另有手标的层枚举与它对账。
+fn mutates_something(name: &str) -> bool {
+    crate::agent::tools::is_env_write_tool(name) || crate::agent::tools::is_service_write_tool(name)
 }
 
 /// 值班长此刻**真正拿得到**的工具名（决策 206 的 `deny` 档：连广告都不给）。
@@ -390,8 +385,9 @@ pub fn foreman_tooling(
     session_id: &str,
     env_mode: crate::types::EnvMode,
     moment: ForemanMoment,
-    // 分级诊断（票 07）：这一轮再摘掉哪些工具。空 = 不摘（人的那一轮）。
-    deny: &[&str],
+    // 这一轮**真正拿得到**的工具名（决策 247）：由 `respond_inner` 算一次传进来，
+    // 与广告集、工具纪律段吃同一份——三处不再各筛一次。
+    available: &[&'static str],
     // 托管动作的执行者（票 08）。`None` = 不放行：D 层照旧恒提议。
     steward: Option<Arc<dyn crate::agent::tools::StewardActionRunner>>,
 ) -> (ToolExecutor, ToolCallContext) {
@@ -410,7 +406,7 @@ pub fn foreman_tooling(
     // 也要留一行，否则策略在审计面完全不可见，只剩模型侧的一次报错。
     .with_recorder(Arc::new(store.clone()))
     .with_env_mode(env_mode)
-    .with_allowed_tools(foreman_available_tools_except(env_mode, deny));
+    .with_allowed_tools(available.to_vec());
     let tools = match steward {
         Some(runner) => tools.with_steward_actions(runner),
         None => tools,
@@ -1085,13 +1081,25 @@ impl ForemanRunner {
     ) -> Result<ForemanTurn> {
         let briefing = build_briefing(&self.store).await?;
         // 阶段配置由外框读了一次传进来（人格 + provider / 采样参数共用那一份）。
-        // 环境层档位（决策 206）：广告集、执行点白名单与人格里的工具纪律段**同源**，
-        // 都由它筛一次。缺省 `ask`（值班长的输入是人可以随便打的任意文本）。
+        // 环境层档位（决策 206）：广告集、执行点白名单与人格里的工具纪律段**同源**——
+        // 由下面的 `available` 筛**一次**，三处消费者各取所需（决策 247 兑现了这句注释）。
+        // 缺省 `ask`（值班长的输入是人可以随便打的任意文本）。
         let env_mode = crate::types::effective_env_mode(
             self.settings.env_mode,
             FOREMAN_STAGE_KEY,
             cfg.as_ref(),
         );
+        // 分级诊断（票 07）：自动那一轮摘掉贵的两件（会话原文 / 跑命令）。**先算它**——
+        // 紧接着 `available` 算**一次**，三处消费者（广告集 / 执行点白名单 / 工具纪律段）
+        // 吃同一份（决策 247）。顺序是这条承诺的全部：从前 `deny` 晚于 `system_prompt`
+        // 才算，纪律段于是广告着一个这一轮已被摘掉的工具——模型被告知去调一个必被拒的
+        // 名字，而这种错从现象上与「闸门坏了」分不开（架构评审候选 7 抓到的顺序 bug）。
+        let deny: &[&str] = if input.is_watch() {
+            &FOREMAN_WATCH_TOOL_DENY
+        } else {
+            &[]
+        };
+        let available = foreman_available_tools_except(env_mode, deny);
         // 有没有任务在被托管（决策 210① / 票 08）：只在真有时才在人格里说那一段——
         // 一段笼统的「你可以直接动手」会立刻变成一句假话（别的任务上它照样只能提）。
         let stewarded = self
@@ -1103,7 +1111,7 @@ impl ForemanRunner {
             .await?
             .iter()
             .any(|t| t.stewardship.as_ref().is_some_and(|s| s.enabled));
-        let system_prompt = self.system_prompt(cfg.as_ref(), env_mode, stewarded)?;
+        let system_prompt = self.system_prompt(cfg.as_ref(), env_mode, stewarded, &available)?;
         let provider_id =
             crate::storage::catalog::resolve_provider_id(None, None, cfg.as_ref(), None);
 
@@ -1121,14 +1129,9 @@ impl ForemanRunner {
         // 每轮全失效（§12.13.5）。
         let user_prompt = briefing.render();
 
-        // 分级诊断（票 07）：自动那一轮摘掉贵的两件（会话原文 / 跑命令）。摘在**源头上**
-        // ——广告集与执行点白名单都从这一份名单来，故「模型看得见一个调用就被拒的工具」
+        // 分级诊断摘在**源头上**（决策 247）：`deny` 早于三处消费者算好，广告集、
+        // 执行点白名单与纪律段都吃 `available`，故「模型看得见一个调用就被拒的工具」
         // 这件事在自动轮里同样不会发生。
-        let deny: &[&str] = if input.is_watch() {
-            &FOREMAN_WATCH_TOOL_DENY
-        } else {
-            &[]
-        };
         let (tools, ctx) = foreman_tooling(
             &self.store,
             &self.settings,
@@ -1137,7 +1140,7 @@ impl ForemanRunner {
             &session.id,
             env_mode,
             ForemanMoment::Conversation,
-            deny,
+            &available,
             self.steward_actions.clone(),
         );
 
@@ -1175,7 +1178,7 @@ impl ForemanRunner {
             _ => transcript.push(Message::user(input.transcript_text())),
         }
 
-        let tool_defs = Self::tool_defs(env_mode, deny);
+        let tool_defs = Self::tool_defs(&available);
         let mut tokens = (0u32, 0u32);
         let mut traces: Vec<ForemanTrace> = Vec::new();
         let mut reply: Option<String> = None;
@@ -1636,8 +1639,7 @@ impl ForemanRunner {
     /// 手写这两个 `ToolDef` 的时候，广告集与执行点白名单是两份独立的名单，而
     /// 「同源」是票 01 的硬要求：两处各写一份名字，迟早出现「模型看得见一个调用就被拒
     /// 的工具」这种不好定位的错。
-    fn tool_defs(env_mode: crate::types::EnvMode, deny: &[&str]) -> Vec<ToolDef> {
-        let available = foreman_available_tools_except(env_mode, deny);
+    fn tool_defs(available: &[&'static str]) -> Vec<ToolDef> {
         FOREMAN_TOOL_SPECS
             .iter()
             .filter(|spec| available.contains(&spec.name))
@@ -1739,6 +1741,9 @@ impl ForemanRunner {
         cfg: Option<&crate::types::StageConfig>,
         env_mode: crate::types::EnvMode,
         stewarded: bool,
+        // 这一轮真正拿得到的工具名（决策 247）：纪律段的两组从**它**派生，不再读全量清单
+        // ——否则值守轮与 `deny` 档的纪律段会广告一个这一轮已被摘掉的工具。
+        available: &[&'static str],
     ) -> Result<String> {
         let persona = match cfg.and_then(|c| c.persona_path.as_deref()) {
             Some(path) => {
@@ -1765,18 +1770,28 @@ impl ForemanRunner {
         // 档位（决策 206）也要在这里说：模型对「它做了什么」的描述**必须与事实一致**。
         // 上一版这段写的是「读不到文件系统，也不能执行命令」——那在 B 层落地之后是假的，
         // 而一段假的能力说明会直接变成一句假话（「我读过那个文件」）。
-        let read_tools = foreman_tool_names(ForemanToolLayer::Read);
-        let write_tools = foreman_tool_names(ForemanToolLayer::Write);
+        // 两组从 `available` 按档位谓词分家（决策 247）：并 = 这一轮拿得到的、交为空，
+        // 「会改动东西」由 `ENV_WRITE_TOOLS` / `SERVICE_WRITE_TOOLS` 判——与 `gate_decision`
+        // 同一份事实源，不再另标一份层枚举与它对账。
+        let mut direct: Vec<&str> = Vec::new();
+        let mut mutating: Vec<&str> = Vec::new();
+        for name in available {
+            if mutates_something(name) {
+                mutating.push(name);
+            } else {
+                direct.push(name);
+            }
+        }
         out.push_str(&format!(
             "\n## 工具纪律\n\
              - 你能直接用的工具是：{}。\n",
-            read_tools.join(" / ")
+            direct.join(" / ")
         ));
         out.push_str(&format!("{}\n", self.power_discipline(env_mode, stewarded)));
-        if !write_tools.is_empty() {
+        if !mutating.is_empty() {
             out.push_str(&format!(
                 "- 会改动东西的工具是：{}。\n",
-                write_tools.join(" / ")
+                mutating.join(" / ")
             ));
         }
         out.push_str(&attribution_discipline());

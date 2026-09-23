@@ -42,16 +42,20 @@ const FOREMAN_REPLY = [
 ].join('\n');
 
 /**
- * 回执那一轮要验的是「回执怎么渲染」，三步各钉一件事：
+ * 回执那一轮要验的是「回执怎么渲染」，四步各钉一件事：
  *
  * ① 查一个**不存在**的任务 → 工具执行成功、台账里没这个号，标签是**已读**。
  *    「查无此任务」不是工具故障（决策 33 的分层：它不该累计 `tool_retry_max`），
  *    值班长收到的是可转述的文本，不是错误。
- * ② 发一个**不在清单里**的工具 → 在执行点被拒，标签是**未读到**。
+ * ② 读一个**诊断包**（同样查无此任务，照样已读）→ 标签是**「读诊断包」**：四个从前
+ *    裸奔的英文名之一上了中文词，证明标签来自后端清单 `GET /foreman/tools`，
+ *    前端不再手抄（决策 247⑤，`TOOL_LABELS` 那张 18 键的表已删）。
+ *    它用**另一个**任务 id：回执按参数摘要找任务，两个读数共用一个 id 会互相认错。
+ * ③ 发一个**不在清单里**的工具 → 在执行点被拒，标签是**未读到**。
  *    这一步顺带把安全边界钉在界面上：值班长调不动越权工具。
  *    （票 06 之后这里用 `spawn_sub_agent`：`run_command` 已经进清单，它走确认钮
  *    而不是被拒——边界由「压根不在清单里」的那些名字取证。）
- * ③ 提一条 `write_file` → `ask` 档下**不执行**，落成一条**提议轮**（票 03）：
+ * ④ 提一条 `write_file` → `ask` 档下**不执行**，落成一条**提议轮**（票 03）：
  *    时间线上多一颗等人按的钮，而**回话轮里一颗钮都没有**。
  *
  * 工位来源（`stage`）不在这条用例里断言：它要把**真实**任务 id 写进脚本，而 id 由后端
@@ -59,13 +63,19 @@ const FOREMAN_REPLY = [
  * 回执分支按 `trace.stage` 读出，属理由可证、e2e 不可达。
  */
 const UNKNOWN_TASK_ID = '01K0000000000000000000000X';
+/** 诊断包那一步专用的另一个查无此任务的 id（见 ②：不能与台账那一步共用一个 id）。 */
+const DIAG_TASK_ID = '01K0000000000000000000000Y';
 /** 提议要写的那个文件（相对家目录根；app 的家目录是每次 `startApp` 新建的临时目录）。 */
 const PROPOSED_FILE = 'foreman-note.md';
 
-/** 十二轮回话（每轮：查台账 + 试一个越权工具 + 提一条写文件）；留足余量给 CI 的一次重试。 */
+/**
+ * 十二轮回话（每轮：查台账 + 读诊断包 + 试一个越权工具 + 提一条写文件）；
+ * 留足余量给 CI 的一次重试。
+ */
 const foremanRounds = foremanScript(
   Array.from({ length: 12 }, () => [
     readTask(UNKNOWN_TASK_ID),
+    tool('read_diagnosis', { task_id: DIAG_TASK_ID }),
     tool('spawn_sub_agent', { task: '去干点别的' }),
     tool('write_file', { path: PROPOSED_FILE, content: '夜班交接：一切正常' }),
     text(FOREMAN_REPLY),
@@ -510,20 +520,23 @@ test.describe('对讲台 · 对话（票 03）', () => {
     // **值班长的回复里永远没有按钮**（票 04 的硬要求）：写动作只在状态区的急停轮里
     await expect(reply.locator('button')).toHaveCount(0);
 
-    // 工位回执留在对话里：这一轮查过台账、也试过一个越权工具、还提了一件事 → 三条回执挂在
-    // 回话那一轮内，形状与发言**不同**——左缘 4px 亮度阶、无框（转述不是发言）
+    // 工位回执留在对话里：这一轮查过台账、读过一个诊断包、试过一个越权工具、还提了一件事
+    // → 四条回执挂在回话那一轮内，形状与发言**不同**——左缘 4px 亮度阶、无框（转述不是发言）
     const rcpt = reply.locator('.rcpt');
-    await expect(rcpt).toHaveCount(3);
+    await expect(rcpt).toHaveCount(4);
     const ledger = rcpt.filter({ hasText: UNKNOWN_TASK_ID });
     await expect(ledger).toContainText('读任务台账');
     // 查无此任务是「已读」而不是「未读到」：工具执行成功了，只是台账里没这个号
     await expect(ledger).toContainText('已读');
+    // 标签来自后端清单（决策 247⑤）：四个从前裸奔的英文名之一上了中文词，前端不再手抄表
+    const diag = rcpt.filter({ hasText: DIAG_TASK_ID });
+    await expect(diag).toContainText('读诊断包');
     // 越权工具在执行点被拒 → 「未读到」，且它**真的没跑起来**（清单之外，白名单挡下）
     const denied = rcpt.filter({ hasText: 'spawn_sub_agent' });
     await expect(denied).toContainText('未读到');
     // `ask` 档下的写工具是**提议**而不是失败：回执记「已读」（调用成功，只是没执行），
     // 人按不按是另一件事——把它记成「未读到」会让人以为模型调错了工具
-    // 用**标签**找它：`TOOL_LABELS` 把 `write_file` 译成「写文件」，回执上不出现原始工具名
+    // 用**标签**找它：`labelFor` 按后端清单把 `write_file` 译成「写文件」，回执上不出现原始工具名
     const proposed = rcpt.filter({ hasText: '写文件' });
     await expect(proposed).toContainText(PROPOSED_FILE);
     await expect(proposed).toContainText('已读');

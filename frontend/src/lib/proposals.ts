@@ -167,33 +167,35 @@ export function proposalStateLabel(p: ForemanProposal, now: number): string {
 }
 
 /**
- * 工具名的人话（这一轮在做什么）。认不出的工具名**原样显示**——模型或旧版本可能报出一个
- * 这边不认识的工具，假装认识它才是真的误导。
+ * 工具名的人话（这一轮在做什么）。**基词查后端标签**（决策 247⑥，02 的取数缓存传进来）
+ * ——提议徽章与回执从此说同一个词，前端不再各持一份基词镜像。
+ *
+ * **后缀与特例留前端**：`task` / `config` / `skills` 拼 `· action`，`service` 无后缀，
+ * `repair` 是固定句——那是**说法**不是标签，后端只供标签。
+ *
+ * 认不出的工具名**原样显示**（`labels[tool]` 查不到时基词就是工具名本身）：模型或旧版本
+ * 可能报出一个这边不认识的工具，假装认识它才是真的误导。
  */
-export function proposalToolLabel(p: ForemanProposal): string {
+export function proposalToolLabel(
+  p: ForemanProposal,
+  labels: Record<string, string> = {},
+): string {
   const args = p.args as Record<string, unknown>;
   const action = typeof args?.action === 'string' ? ` · ${args.action}` : '';
+  const base = labels[p.tool] ?? p.tool;
   switch (p.tool) {
-    case 'write_file':
-      return '写文件';
-    case 'edit_file':
-      return '改文件';
-    case 'run_command':
-      return '跑命令';
     case 'task':
-      return `任务动作${action}`;
     case 'config':
-      return `改阶段配置${action}`;
     case 'skills':
-      return `技能${action}`;
-    case 'service':
-      return '服务动作';
+      return `${base}${action}`;
     // 修复提议（决策 212① / 票 12）：执行的是「合入一个分支」，名牌要说出来——
-    // 「合入」这两个字是人按下之前最该看见的。
+    // 「合入」这两个字是人按下之前最该看见的。**不查 label**：这句话是固定的。
     case 'repair':
       return '修复 · 合入分支';
+    // `write_file` / `edit_file` / `run_command` / `service` 与其余一切名字都落这里：
+    // 前四个给标签（`service` 恰好无后缀），认不出的给原名。
     default:
-      return p.tool;
+      return base;
   }
 }
 

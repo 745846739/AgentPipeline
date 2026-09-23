@@ -168,20 +168,45 @@ describe('只指路：同一个动作不摆第二颗钮', () => {
 });
 
 describe('工具名的人话', () => {
+  // 基词来自后端标签（决策 247⑥）——单测传**字面量**，不发请求；`· action` 后缀仍由这边拼。
+  const labels = {
+    write_file: '写文件',
+    run_command: '跑命令',
+    task: '任务动作',
+    config: '改阶段配置',
+    skills: '技能动作',
+    service: '服务动作',
+  };
+
   it('认得的工具按族翻译，动作并进去', () => {
-    expect(proposalToolLabel(proposal({ tool: 'write_file' }))).toBe('写文件');
-    expect(proposalToolLabel(proposal({ tool: 'run_command' }))).toBe('跑命令');
-    expect(proposalToolLabel(proposal({ tool: 'task', args: { action: 'cancel' } }))).toBe(
+    expect(proposalToolLabel(proposal({ tool: 'write_file' }), labels)).toBe('写文件');
+    expect(proposalToolLabel(proposal({ tool: 'run_command' }), labels)).toBe('跑命令');
+    expect(proposalToolLabel(proposal({ tool: 'task', args: { action: 'cancel' } }), labels)).toBe(
       '任务动作 · cancel',
     );
-    expect(proposalToolLabel(proposal({ tool: 'config', args: { action: 'set' } }))).toBe(
+    expect(proposalToolLabel(proposal({ tool: 'config', args: { action: 'set' } }), labels)).toBe(
       '改阶段配置 · set',
     );
   });
 
+  // 两份镜像从前是打架的（徽章 `技能 · install` vs 回执 `技能动作`）：统一到后端标签之后，
+  // skills 与其余 D 层族同形——这是本条改词的唯一可见变化（决策 247⑥）。
+  it('skills 徽章与回执同词，并带动作', () => {
+    expect(
+      proposalToolLabel(proposal({ tool: 'skills', args: { action: 'install' } }), labels),
+    ).toBe('技能动作 · install');
+  });
+
+  it('service 不拼动作——它是动作族的名字，不是某个具体动作', () => {
+    expect(
+      proposalToolLabel(proposal({ tool: 'service', args: { action: 'restart' } }), labels),
+    ).toBe('服务动作');
+  });
+
   it('认不出的工具名**原样显示**——假装认识它才是真的误导', () => {
     // 判据是「认不出就照抄」，不是「照抄工具名再加一半动作」——把 action 拼到一个
-    // 不认识的工具名后面，读起来像「我们支持这个工具，只是它叫 pairing」
+    // 不认识的工具名后面，读起来像「我们支持这个工具，只是它叫 pairing」。
+    // **不传 labels**：兜底语义与 `labelFor` 同一条（查不到 = 原样）。
     expect(proposalToolLabel(proposal({ tool: 'pairing', args: { action: 'reset' } }))).toBe(
       'pairing',
     );
@@ -249,7 +274,9 @@ describe('修复提议：合入而不是执行，闸门读数说清有没有补�
     });
 
   it('名牌与按钮点名「合入」——它会动主干', () => {
-    expect(proposalToolLabel(repair())).toContain('修复');
+    // 固定句**不查 label**：传一个冲突的标签也照旧（决策 212① 的措辞，「合入」是按下前
+    // 最该看见的字——它是说法不是标签）。
+    expect(proposalToolLabel(repair(), { repair: '别的词' })).toBe('修复 · 合入分支');
     expect(repairActionLabel(repair())).toBe('合入');
     expect(repairActionLabel(proposal())).toBe('执行');
   });
