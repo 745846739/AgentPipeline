@@ -1,7 +1,7 @@
 # AgentPipeline v1 执行计划
 
 来源：docs/ 设计文档（2026-09-12 定稿）对照 crates/ 实现现状逐条核对后拆分。
-**01–22 全部已实现（状态 done）**；**23 另立（ready-for-agent，2026-09-23）**：RepoId 前后端两份判定收口 + 两个未钉住的 failure kind（决策 250 Q2 的「另立一票」，与 v1 主体无关的后续修缮）。票 19 的 E2E 矩阵补全同时暴露并修复了三个生产缺陷（见 [docs/testing.md](../../docs/testing.md) §11）。
+**01–23 全部已实现（状态 done）**；**23（2026-09-23 落地）**：RepoId 前后端两份判定收口——共享表 `tests/fixtures/repo_id.json` 双侧同断言方向把「前端输出 ⊆ 后端接受集」从注释升成会变红的测试；两个未钉住的 failure kind 补到契约层 8/8（`RemoteBehaviour::AuthRequired` / `CorruptPack` 两种远端形态），实现顺带修了一处 `is_digest_shaped` 分类缺口（实测 libgit2 1.9.7 原话 `packfile trailer mismatch`）——决策 250 Q2 的「另立一票」。票 19 的 E2E 矩阵补全同时暴露并修复了三个生产缺陷（见 [docs/testing.md](../../docs/testing.md) §11）。
 
 ## 依赖图
 

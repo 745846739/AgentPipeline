@@ -26,7 +26,7 @@ use axum::body::Body;
 use axum::http::{header, Request, StatusCode};
 use axum::Router;
 use serde_json::{json, Value};
-use testkit::{RepoFixture, SmartHttp, TestHome};
+use testkit::{RemoteBehaviour, RepoFixture, SmartHttp, TestHome};
 use tower::ServiceExt;
 
 const PORT: u16 = 8787;
@@ -108,6 +108,32 @@ async fn api_offline(repos: Vec<String>) -> Api {
         _home: home,
         fixture: RepoFixture::named(STEM).unwrap(),
         http: None,
+        state,
+        router,
+    }
+}
+
+/// 带指定远端形态的一套装置（票 23 的两类失败形态）：单技能裸仓 +
+/// [`SmartHttp::serve_behaviour`]。两个形态用例与它共用同一份脚手架——内容都只是
+/// "一个本来能被正常取下的仓"，差别只在远端怎么应答。
+async fn api_with_behaviour(behaviour: RemoteBehaviour) -> Api {
+    let mut fixture = RepoFixture::named(STEM).unwrap();
+    fixture
+        .add_file(
+            "skills/grilling/SKILL.md",
+            &skill_md("grilling", "拷问设计树", "正文"),
+        )
+        .unwrap();
+    fixture.commit("chore: 票 23 的形态仓").unwrap();
+    let http = SmartHttp::serve_behaviour(fixture.dir(), behaviour)
+        .await
+        .unwrap();
+    let (home, state) = base_state(vec![SLUG.to_string()], &http.base(), None).await;
+    let router = build_router(state.clone());
+    Api {
+        _home: home,
+        fixture,
+        http: Some(http),
         state,
         router,
     }
@@ -773,9 +799,20 @@ async fn failure_classes_are_distinguishable_by_kind() {
     assert_eq!(status, StatusCode::NOT_FOUND, "{body}");
     assert_eq!(body["kind"], "skill_not_found");
 
-    // ⑥ 请求体是残缺/畸形的仓名 → 也是 400 / repo_not_allowed（判定只有一处实现）
+    // ⑥ 请求体是残缺/畸形的仓名 → 400。**这条不带 `kind`**（实测，票 23）：判定本身
+    //    仍是同一处 `RepoId::parse`（报文里点名了「仓名不合法」），但错误在 handler 被
+    //    包成「配置错误」重新映射，`kind` 在包的那一步丢了——kind 断言由①钉，此处只钉
+    //    「同一处判定、也是 400」。
     let (status, body) = put(&api, "/market/repos", json!({"repos": ["a/../../../b"]})).await;
     assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    assert!(
+        body["error"].as_str().unwrap().contains("仓名不合法"),
+        "{body}"
+    );
+    assert!(
+        body["kind"].is_null(),
+        "这条路径不该带 kind（与①分得开）：{body}"
+    );
 }
 
 /// 连不上 → 502 / `market_network`（请求没问题，对面没应答——用户该做的是重试）。
@@ -832,6 +869,44 @@ async fn download_over_the_cap_is_reported_with_our_own_count() {
     assert!(msg.contains("子目录"), "须给出可操作的去向：{msg}");
     // 中止有两种错误形态，其中一条（GIT_EUSER）的报文里**什么都没有**——
     // 故用户看到的数字只能来自我们自己记的那份，而诊断串单列在 detail 里
+    assert!(body["detail"].as_str().is_some(), "{body}");
+}
+
+/// ⑦ 远端答 401（私有仓、无凭据的形态）→ 404 / `repo_unreadable`——与②「仓不存在」同码，
+/// 但 `kind` 分得开：前者出路是「换一个公开仓」，后者是「改仓名」。
+///
+/// 形态由 fixture 的 [`RemoteBehaviour::AuthRequired`] 供给（票 23）。真 GitHub 对无凭据读私有仓
+/// 究竟回 401 还是 404 仍未实测（`repo.rs::unreadable` 的注记），这里钉的是**分类路径**：
+/// 401 形态进 `is_auth_shaped` → `unreadable` → API 按 kind 下发，而不是含糊的网络错。
+#[tokio::test]
+async fn auth_required_remote_is_reported_as_repo_unreadable() {
+    let api = api_with_behaviour(RemoteBehaviour::AuthRequired).await;
+
+    let (status, body) = get(&api, "/market/skills?repo=acme%2Frepo").await;
+    assert_eq!(status, StatusCode::NOT_FOUND, "{body}");
+    assert_eq!(body["kind"], "repo_unreadable");
+    // 文案要指到「私有仓」与出路（换一个公开仓），不是含糊的网络错误
+    let err = body["error"].as_str().unwrap();
+    assert!(err.contains("私有仓"), "{err}");
+    assert!(err.contains("公开仓"), "{err}");
+}
+
+/// ⑧ 对象哈希不符（坏包）→ 400 / `digest_mismatch`——语义是**别装、报警**（传输损坏 /
+/// 中途改过），与「换一个 commit」（`commit_not_found`）是两回事，而两者都会让
+/// `find_commit` 找不到对象——分岔点正是 `ensure_fetched` 里「先认哈希不符」那一步。
+///
+/// 坏包由 fixture 的 [`RemoteBehaviour::CorruptPack`] 供给（票 23）：pack 照流、只改尾哈希，
+/// 与真传输损坏同形——打到的正是生产里 `is_digest_shaped` 那条分支（此前记账的覆盖缺口）。
+#[tokio::test]
+async fn corrupted_pack_is_reported_as_digest_mismatch() {
+    let api = api_with_behaviour(RemoteBehaviour::CorruptPack).await;
+
+    let (status, body) = get(&api, "/market/skills?repo=acme%2Frepo").await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    assert_eq!(body["kind"], "digest_mismatch", "{body}");
+    let err = body["error"].as_str().unwrap();
+    assert!(err.contains("别装"), "要劝住「先别装」：{err}");
+    // 原始诊断（class / code / msg）单列在 detail，不混进 error
     assert!(body["detail"].as_str().is_some(), "{body}");
 }
 

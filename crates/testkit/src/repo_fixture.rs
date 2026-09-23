@@ -126,6 +126,22 @@ impl RepoFixture {
     }
 }
 
+/// 远端的行为形态（票 23）：八类失败里有两类在正常服务的 fixture 上**打不到**，
+/// 需要远端先摆出那个形态——都是真实存在过的服务端样子，不是任意错误注入。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RemoteBehaviour {
+    /// 照常服务（既有用例的默认形态）。
+    Normal,
+    /// 一切请求回 401：**私有仓、无凭据**的远端（`repo_unreadable` 的可测输入；
+    /// 真 GitHub 对无凭据读私有仓回 401 还是 404 属实测缺口，见 `unreadable` 的注——这里钉的是
+    /// 「401 形态分得出来」这条分类路径本身）。
+    AuthRequired,
+    /// 把 `git-upload-pack` 响应里的 pack **尾哈希**改坏（`digest_mismatch` 的可测输入）：
+    /// 内容照流，只有「git 自己算出来的那个哈希」对不上——正是生产里
+    /// `is_digest_shaped` 要接的那类失败（传输损坏 / 坏包）。
+    CorruptPack,
+}
+
 /// 离线 **smart HTTP**：把裸仓用 git 协议暴露出来。
 ///
 /// 只有两条路由，都由系统 git 的 `upload-pack` 子进程实现：
@@ -153,8 +169,13 @@ pub struct SmartHttp {
 }
 
 impl SmartHttp {
-    /// 在本机回环上起服务（端口 0 = 让内核分配，避免并行用例撞端口）。
+    /// 在本机回环上起服务（端口 0 = 让内核分配，避免并行用例撞端口）。默认 [`RemoteBehaviour::Normal`]。
     pub async fn serve(bare: &Path) -> Result<Self> {
+        Self::serve_behaviour(bare, RemoteBehaviour::Normal).await
+    }
+
+    /// 同 [`serve`](Self::serve)，但远端按指定 [`RemoteBehaviour`] 应答（票 23 的两类失败形态）。
+    pub async fn serve_behaviour(bare: &Path, behaviour: RemoteBehaviour) -> Result<Self> {
         let listener = TcpListener::bind(("127.0.0.1", 0)).context("绑定回环端口失败")?;
         let addr = listener.local_addr().context("读回环端口失败")?;
         // 非阻塞轮询：这样后台线程能定期检查 stop，不必靠"关掉 listener 让 accept 报错"
@@ -189,9 +210,9 @@ impl SmartHttp {
                         let trace = Arc::clone(&loop_trace);
                         let stem = loop_stem.clone();
                         std::thread::spawn(move || {
-                            if let Err(err) =
-                                handle_connection(stream, &bare, &stem, &requests, &trace)
-                            {
+                            if let Err(err) = handle_connection(
+                                stream, &bare, &stem, behaviour, &requests, &trace,
+                            ) {
                                 // fixture 的失败要看得见，而不是变成一个卡住的 fetch
                                 let detail = last_trace(&trace);
                                 eprintln!("[SmartHttp] 处理连接失败：{err:#}（上一趟：{detail}）");
@@ -279,6 +300,7 @@ fn handle_connection(
     stream: TcpStream,
     bare: &Path,
     stem: &str,
+    behaviour: RemoteBehaviour,
     requests: &Mutex<Vec<String>>,
     trace: &Mutex<Vec<String>>,
 ) -> Result<()> {
@@ -297,7 +319,15 @@ fn handle_connection(
         .context("设写超时失败")?;
     let mut reader = BufReader::new(stream.try_clone().context("克隆连接失败")?);
     let mut writer = stream;
-    serve_one(&mut reader, &mut writer, bare, stem, requests, trace)
+    serve_one(
+        &mut reader,
+        &mut writer,
+        bare,
+        stem,
+        behaviour,
+        requests,
+        trace,
+    )
 }
 
 /// 记一笔诊断（带锁，出错也不影响服务）。
@@ -339,6 +369,7 @@ fn serve_one(
     writer: &mut TcpStream,
     bare: &Path,
     stem: &str,
+    behaviour: RemoteBehaviour,
     requests: &Mutex<Vec<String>>,
     trace: &Mutex<Vec<String>>,
 ) -> Result<()> {
@@ -438,6 +469,23 @@ fn serve_one(
         None => (target.as_str(), ""),
     };
 
+    // —— 形态②：私有仓、无凭据（票 23）——
+    // 请求行 / header / body 都**读完**再答：没读完就收线，`close()` 时队列里压着的字节会
+    // 换来 RST，把已写出的响应一起丢掉（同 `handle_connection` 里那条 macOS 实测）。
+    if behaviour == RemoteBehaviour::AuthRequired {
+        respond(
+            writer,
+            "401 Unauthorized",
+            "text/plain",
+            b"Authentication required",
+        )?;
+        note_trace(
+            trace,
+            format!("{method} {target} → 401（AuthRequired 形态）"),
+        );
+        return Ok(());
+    }
+
     // —— 两条路由 ——
     let note = format!(
         "{} {} len={content_length:?} chunked={chunked} 对端要关={peer_wants_close} 原始 headers={raw_headers:?}",
@@ -471,12 +519,19 @@ fn serve_one(
         )?;
     } else if method == "POST" && strip_repo_prefix(path, stem) == Some("git-upload-pack") {
         match run_upload_pack(bare, false, &body) {
-            Ok(out) => respond(
-                writer,
-                "200 OK",
-                "application/x-git-upload-pack-result",
-                &out,
-            )?,
+            Ok(mut out) => {
+                // 形态③：坏包（票 23）——定位不到 pack 是 fixture 自己坏了，走 eprintln 报出来，
+                // 别静默送出一份好包让用例假绿。
+                if behaviour == RemoteBehaviour::CorruptPack {
+                    corrupt_pack_tail(&mut out)?;
+                }
+                respond(
+                    writer,
+                    "200 OK",
+                    "application/x-git-upload-pack-result",
+                    &out,
+                )?
+            }
             Err(err) => return respond_500(writer, err),
         }
     } else {
@@ -598,6 +653,66 @@ fn run_upload_pack(bare: &Path, advertise_refs: bool, input: &[u8]) -> Result<Ve
         bail!("git upload-pack 退出码 {:?}：{stderr}", status.code());
     }
     Ok(stdout)
+}
+
+/// 把 `git upload-pack` 响应里的 pack **尾哈希**改坏一个字节（[`RemoteBehaviour::CorruptPack`]）。
+///
+/// 只动内容、不动 framing：pkt-line 长度头一个都不改，libgit2 收包照常，坏的恰是「git 自己
+/// 算出来的那个 sha1」——这正是 `digest_mismatch` 的语义（传输损坏 / 坏包），而不是网络失败。
+///
+/// v0 `--stateless-rpc` 的形态：先是协商的 pkt-line（`NAK` / `ACK`），pack 要么**裸**跟在
+/// 后面（未开 side-band），要么裹在 `0x01` 信道的数据帧里（开了 side-band）。两种形态下
+/// 「尾部 20 字节」都是 pack 的 sha1；本 fixture 的仓都很小、pack 一帧装得下，故数据帧的
+/// 帧尾就是 pack 尾。定位不到 `PACK` 魔数或 pkt-line 对不上就**报错**——fixture 自己坏了
+/// 要看得见（走 eprintln），不许静默送出一份好包让用例假绿。
+fn corrupt_pack_tail(out: &mut [u8]) -> Result<()> {
+    let mut pos = 0usize;
+    while pos < out.len() {
+        // 形态①：裸 pack（未开 side-band）——协商 pkt-line 之后直接就是它
+        if out[pos..].starts_with(b"PACK") {
+            out[out.len() - 1] ^= 0xFF;
+            return Ok(());
+        }
+        // 形态②：pkt-line（flush / 协商行 / side-band 帧），四字节长度头必须是十六进制
+        let head = out
+            .get(pos..pos + 4)
+            .context("响应在 pkt-line 长度头之前就结束了")?;
+        if !head.iter().all(|b| b.is_ascii_hexdigit()) {
+            bail!("{pos} 处既不是 `PACK` 也不是 pkt-line 头：形态与预期不符");
+        }
+        let len = usize::from_str_radix(std::str::from_utf8(head)?, 16)
+            .context("pkt-line 长度头不是十六进制")?;
+        if len == 0 {
+            // flush（`0000`）：长度 0 是特殊值——占 4 字节、无 payload（实测协商段与 pack
+            // 之间真有一条，把它当畸形会让连接当场断掉、客户端只看到 unexpected EOF）
+            pos += 4;
+            continue;
+        }
+        if len < 4 {
+            bail!("pkt-line 长度 {len} < 4（畸形）");
+        }
+        let end = pos + len;
+        let payload = out.get(pos + 4..end).context("pkt-line 声明的长度越界")?;
+        if payload.first() == Some(&0x01) && payload.get(1..5) == Some(&b"PACK"[..]) {
+            // 数据帧 = `0x01` 信道字节 + pack；小仓一帧装下 ⇒ 帧尾即 pack 的尾哈希
+            out[end - 1] ^= 0xFF;
+            return Ok(());
+        }
+        pos = end; // flush（`0000` → 空 payload）与协商行都直接跳过
+    }
+    // 这一轮没有 pack 是**正常形态**：`depth(1)` 的浅取协商第一轮就是
+    // `shallow <sha>` + flush（实测 56 字节，pack 在下一轮 POST 里，那一段照样会走
+    // 本函数）。走完没找到、而 `PACK` 魔数确实在某处——那才是 pkt 走法的形态回归，
+    // 报出来（静默送出好包会让 digest 用例假绿，这条 bail 就是反假绿的哨兵）。
+    if out.windows(4).position(|w| w == b"PACK").is_none() {
+        return Ok(());
+    }
+    bail!(
+        "这一轮有 pack（偏移 {:?}）但 pkt 走法没走到它——形态回归（len={}，头 96 字节：{:02x?}）",
+        out.windows(4).position(|w| w == b"PACK"),
+        out.len(),
+        &out[..out.len().min(96)]
+    )
 }
 
 /// 解 `Transfer-Encoding: chunked`（够用的一层：hex 长度行 + CRLF + 尾 trailer）。

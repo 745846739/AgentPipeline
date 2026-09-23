@@ -1062,16 +1062,27 @@ fn commit_unavailable(repo: &RepoId, commit: &Oid, err: &git2::Error) -> Error {
 /// 用户该做的是**别装、报警**（中间人、传输损坏、或对面给了个坏包），与"换一个 commit"
 /// 是两回事，故必须与 [`commit_unavailable`] 分开判——两者都会让 `find_commit` 找不到对象。
 ///
-/// **本仓的离线 fixture 造不出这个失败**（要手搓一个哈希坏掉的 pack），故它**没有端到端用例**；
-/// 这条判定由下面的单测钉住措辞与 class。诚实记账见票 02 的实施记录。
+/// 离线 fixture 造得出这个失败（`testkit` 的 `RemoteBehaviour::CorruptPack` 改坏 pack 尾哈希，
+/// 票 23），端到端钉在 `app` 契约层 `corrupted_pack_is_reported_as_digest_mismatch`。
+/// **实测**（libgit2 1.9.7，2026-09-23，票 23 的 CorruptPack 形态）：尾哈希不符报的是
+/// `class=Indexer msg=packfile trailer mismatch`——既不是 `Sha1` class、字面也不含
+/// "hash mismatch"，不入清单就会掉进 [`commit_unavailable`]、被说成「换一个 commit」
+/// （方向正好反了）。下面的单测按 class 与措辞钉住两路。
 fn is_digest_shaped(err: &git2::Error) -> bool {
     if matches!(err.class(), git2::ErrorClass::Sha1) {
         return true;
     }
     let text = err.message().to_ascii_lowercase();
-    ["hash mismatch", "checksum", "corrupt", "invalid object"]
-        .iter()
-        .any(|phrase| text.contains(phrase))
+    [
+        "hash mismatch",
+        "checksum",
+        "corrupt",
+        "invalid object",
+        // 实测（票 23）：libgit2 对 pack 尾 sha1 不符的原话
+        "trailer mismatch",
+    ]
+    .iter()
+    .any(|phrase| text.contains(phrase))
 }
 
 /// 哈希不符的报文：说清"这不是网络问题、也不是你填错了"，并劝住"别装"。
@@ -1148,6 +1159,10 @@ const TRANSPORT_PHRASES: &[&str] = &[
 /// [`is_auth_shaped`] 就永远打不到，这一类会退化成 [`KIND_REPO_NOT_FOUND`]——而那一类的文案里
 /// **已经写了「也可能是私有仓且无权访问」**，所以两条路都不会把用户引到错误的方向上。
 /// 这个判定宁可漏报（落到 not_found），也不硬造一个判不出来的类。
+///
+/// 分类路径本身已有契约层用例钉住（票 23）：fixture 的 `RemoteBehaviour::AuthRequired` 演 401 形态
+/// → `app` 的 `auth_required_remote_is_reported_as_repo_unreadable` 断言 kind 分得开。
+/// **上面那段真 GitHub 的 401/404 缺口仍然开着**——那是对真网络的观察，离线 fixture 代替不了。
 fn unreadable(context: &str, repo: &RepoId, err: &git2::Error) -> Error {
     market_error(
         KIND_REPO_UNREADABLE,
@@ -1408,6 +1423,9 @@ mod tests {
             "loose object is corrupt",
             "invalid object header",
             "checksum mismatch",
+            // 实测原话（libgit2 1.9.7，票 23 的 CorruptPack 形态）：class 是 Indexer 不是 Sha1，
+            // 字面也没有 "hash mismatch"——不入清单就会被说成「换一个 commit」（方向反了）
+            "packfile trailer mismatch",
         ] {
             assert!(
                 is_digest_shaped(&GError::new(ErrorCode::GenericError, ErrorClass::Odb, msg)),
@@ -1524,6 +1542,88 @@ mod tests {
     fn bad_repo_names_report_the_repo_class() {
         let err = RepoId::parse("https://gitlab.com/a/b").unwrap_err();
         assert_eq!(kind_of(&err), Some(KIND_REPO_NOT_ALLOWED));
+    }
+
+    /// 跨语言共享表（票 23，决策 250 Q2）：**「前端输出 ⊆ 后端接受集」的机器钉法**。
+    ///
+    /// 前端 `marketRepos.ts` 有一份自己的归一/校验（调不了 Rust——页面判定可能发生在任何
+    /// API 调用之前，与决策 246 同一个理由），两份之间原本只有文件头注释里的承诺。这张表是
+    /// 共同规格：vitest 侧钉前端逐行产出表里的 `normalized`/`valid`，本侧钉**表里的
+    /// `normalized` 就是 [`RepoId`] 认识的输入**（成功 ⟺ `valid`，且 `slug()` 原样）——
+    /// 两侧串起来，任何一侧的规范漂了都会变红（照决策 246 `host_policy_loopback.json` 先例）。
+    #[test]
+    fn shared_repo_id_fixture_pins_frontend_output_inside_backend_accepts() {
+        #[derive(serde::Deserialize)]
+        struct Fixture {
+            cases: Vec<Case>,
+        }
+        #[derive(serde::Deserialize)]
+        struct Case {
+            input: String,
+            normalized: String,
+            valid: bool,
+        }
+
+        let raw = include_str!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../tests/fixtures/repo_id.json"
+        ));
+        let fixture: Fixture = serde_json::from_str(raw).expect("fixture 必须是合法 JSON");
+        assert!(
+            fixture.cases.len() >= 30,
+            "全输入表不该被悄悄裁短：{}",
+            fixture.cases.len()
+        );
+        // 形状守卫（与 vitest 侧同一把尺）：合法 / 非法两侧都非空，且归一真的干了活——
+        // 退化成单侧或逐行 input === normalized 时，逐行断言照样绿，那等于没测。
+        assert!(
+            fixture.cases.iter().any(|c| c.valid),
+            "合法侧一行都不剩 = 表退化了"
+        );
+        assert!(
+            fixture.cases.iter().any(|c| !c.valid),
+            "非法侧一行都不剩 = 表退化了"
+        );
+        assert!(
+            fixture.cases.iter().any(|c| c.input != c.normalized),
+            "归一行都不剩 = 粘贴残留那一半没测"
+        );
+        for required in [
+            "www.github.com/Obra/Superpowers",
+            "HTTPS://GITHUB.COM/obra/superpowers",
+            "obra/superpowers.git/",
+            "Obra/Superpowers",
+            "obra",
+            "obra//superpowers",
+            "https://gitlab.com/obra/superpowers",
+            "git@github.com:obra/superpowers",
+            "中文/技能",
+            "",
+        ] {
+            assert!(
+                fixture.cases.iter().any(|c| c.input == required),
+                "缺必需行 {required:?}"
+            );
+        }
+        for case in &fixture.cases {
+            let parsed = RepoId::parse(&case.normalized);
+            if case.valid {
+                let id = parsed.unwrap_or_else(|e| {
+                    panic!(
+                        "前端交出来的 {:?}（归一后 {:?}）后端却不收——子集不变量破了：{e}",
+                        case.input, case.normalized
+                    )
+                });
+                assert_eq!(id.slug(), case.normalized, "raw = {:?}", case.input);
+            } else {
+                assert!(
+                    parsed.is_err(),
+                    "前端拒 {:?}（归一后 {:?}），后端却收——两侧判定分叉了",
+                    case.input,
+                    case.normalized
+                );
+            }
+        }
     }
 
     // ── Oid ──
