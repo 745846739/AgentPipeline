@@ -240,7 +240,7 @@ pub const SPAWN_SUB_AGENT_TOOL: &str = "spawn_sub_agent";
 ///
 /// = [`BUILTIN_TOOLS`]（8）+ 扩展工具 [`SPAWN_SUB_AGENT_TOOL`]。判据只有这一处
 /// （与 [`crate::agent::tools::denied_by_tier`] 同姿态）：工具定义的生成
-/// （`executor::tool_defs`）与阶段配置的准入校验（`config::validate_startup`，
+/// （`model_request::tool_defs`）与阶段配置的准入校验（`config::validate_startup`，
 /// 由 `PUT /stage-configs` 复用）问的是同一个问题——两处各写一份的后果是
 /// 「写入时说不知道这个名字、运行时却把它丢掉」这种只能靠现象定位的漂移。
 ///
@@ -261,7 +261,7 @@ pub fn known_tool_names() -> Vec<&'static str> {
 /// 「声明了 v1 不存在的工具」的**唯一**报文（决策 154 的后续票）。
 ///
 /// 两处会报它：写入 / 启动校验（`config::validate_startup`，含 `PUT /stage-configs`）与执行期
-/// 兜底（`executor::tool_defs`，校验被绕过时才可能走到）。同一个错误只能有一种说法——两处各写
+/// 兜底（`model_request::tool_defs`，校验被绕过时才可能走到）。同一个错误只能有一种说法——两处各写
 /// 一句的后果是同一个配置问题看起来像两个不同的问题，而对这句话有支配权的（未来加白名单、
 /// 改措辞）只有这里。`where_` 是定位串（如「阶段 develop」/「阶段 develop 的 tools_json」）。
 pub fn unknown_tools_message(where_: &str, unknown: &[String]) -> String {

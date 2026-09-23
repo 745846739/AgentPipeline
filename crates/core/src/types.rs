@@ -1458,7 +1458,7 @@ impl EnvMode {
 /// 顺序：阶段配置行 → 该阶段的缺省（值班长 `ask`；其余没有）→ 全局默认（`config.toml`
 /// 的 `[pipeline] env_mode`，缺省 `auto`）。
 ///
-/// **收在一处**：广告集（`executor::tool_defs` / `ForemanRunner::tool_defs`）与执行点
+/// **收在一处**：广告集（`model_request::tool_defs` / `ForemanRunner::tool_defs`）与执行点
 /// （`ToolExecutor::execute` 的第三道闸）都调它，两处各判一次必然漂移——而漂移的后果是
 /// 「模型看得见一个调用就被拒的工具」或反过来（一个能调但没人告诉它的工具）。
 pub fn effective_env_mode(

@@ -59,3 +59,22 @@ impl RunLedger<'_> {
 
 **明确不做**：不动 `Store::finish_run` 等既有 SQL 的语义（搬调用不改储存层）；
 不把 SSE 发射搬进来（观测面留守，照 245 先例）；不顺手改 token 口径（决策 61 系只读引用）。
+
+## Comments
+
+- 2026-09-23 实现落地：`crates/core/src/pipeline/run_ledger.rs`（`RunLedger::{begin, finish,
+  mark_step, record_usage, link_continuation, take_continuation, next_attempt}` + `since_ms`；
+  四条红线进模块 doc，`finish` 不抢已有终态做成结构——先 `get_run` 看 status，非 Running
+  只走 `record_run_usage`，为此 storage 新增**只读** `get_run`（既有 SQL 语义一字未动））。
+  Clock 接缝：`Executor` 加 `clock` 字段（`store.clock().clone()`，`new` 五参冻结）；
+  9 处 `Instant::now()` 全改 `self.clock.now()`，duration 由台账算一次、SSE 复用同一读数；
+  `git.rs` 锁等待改经 `Clock`（`_within` 收 clock 照 `blocking_within` 形状，生产传
+  `SystemClock`——`start_repair` 工具链没有 clock 可传，不为此动 ToolExecutor）。
+  既有 F8 全绿（4 续接 + 超时全栈 + git 锁界），新增 5 条窄测试（假时钟驱动 duration、
+  终态不被抢、用量不改状态、只链 round 0、take 读清一次）；core 全量 496+328 绿；
+  clippy / fmt 干净。SSE 发射未搬（观测面留守，照 245 先例）。
+- 2026-09-23 Standards 评审注记（诚实口径）：`git.rs` 锁等待由 `Instant`（单调钟）改为
+  `Clock` 读数（墙钟）——取时点换了，**钟的语义也从单调变墙钟**：NTP 跳变可让 60s 等待
+  提前或延后触顶。与 scheduler 全线的墙钟超时（`started_at` / `elapsed_ms`）同族，守卫性
+  上限不在乎秒级抖动；单调读法若要保留得把 clock 参数一路带进锁助手，收益不成比例。
+  记录在案，不回改。

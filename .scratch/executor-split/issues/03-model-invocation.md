@@ -42,3 +42,17 @@ SSE 发射留守（本片经既有 emit 函数调用，不自建事件面）。
 **明确不做**：不动 LLM 适配器与 ToolExecutor；不动 `submit_metadata` schema 与降级表；
 不把 merge 的 PhaseA/B 带走（票 04）；不改伪阶段与真阶段的配置复用口径（决策 60/67/134/135 语义逐字）；
 `project_analysis` 公开入口的语义不改（app 路由在调）。
+
+## Comments
+
+- 2026-09-23 实现落地：`crates/core/src/pipeline/model_invoke.rs`（`ModelInvoke` 只拿
+  store / settings / llm / killer / sse / clock 六件，字段廉价克隆、不借 `&Executor`——
+  全仓 `&Executor` 参数归零，post_process 9 臂签名改 `inv: &ModelInvoke`）。搬入：agent
+  节点循环（重试/工具往返/元数据/异族复判/会话落库）+ 四个伪阶段（含
+  `project_analysis` 实现——公开触点冻结，executor 留转发壳）+ `semantic_conflict_check`
+  + `context_overflow_exit`（Overflow 翻译随编排走，01 检测 03 翻译）+ AgentNodeKind +
+  AttemptTrace/AttemptFailure/failure_metadata/args_summary/module_overlaps。
+  SSE 留守核：`emit_tool_event` / `emit_node_started` / `finish_run_with_sse` 三个出口
+  函数留 executor、形状单点，编排片经既有 emit 函数调用。executor 4223 → 2088 行。
+  既有 C10+I5+F8 全绿；新增 3 条窄测试（post_process 两臂直测 + 伪阶段 run 行形状
+  不跑全循环，桩 LlmClient）；core 全量 500+328 绿；clippy / fmt 干净。

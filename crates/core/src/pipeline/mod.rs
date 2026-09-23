@@ -5,11 +5,15 @@ pub mod cursor;
 pub mod executor;
 pub mod foreman;
 pub mod landing;
+pub mod merge;
+pub(crate) mod model_invoke;
+pub(crate) mod model_request;
 pub mod proposals;
 pub mod pseudo;
 pub mod repair;
 pub mod resume;
 pub mod routes;
+pub(crate) mod run_ledger;
 pub mod subagent;
 pub mod unstick;
 

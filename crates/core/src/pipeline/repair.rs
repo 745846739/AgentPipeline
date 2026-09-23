@@ -26,7 +26,7 @@ use serde::{Deserialize, Serialize};
 use crate::agent::tools::{CommandFinish, CommandRecorder, CommandStart};
 use crate::git::Git;
 use crate::home::Home;
-use crate::pipeline::executor::test_command_for;
+use crate::pipeline::merge::test_command_for;
 use crate::storage::Store;
 use crate::types::{CommandSource, Node, Stage};
 use crate::{Error, Result};

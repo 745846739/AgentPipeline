@@ -96,3 +96,13 @@ AGENTS.md 缺失、反馈文件缺失、无 provider、段不适用——都不�
 
 **明确不做**：不调 LLM；不构造 Pending；不开 `UserSegment` trait；不做跨 attempt 缓存；
 伪阶段 prompt 站点不动（票 03）；`EdgeKind` 与路由不动。
+
+## Comments
+
+- 2026-09-23 实现落地：`crates/core/src/pipeline/model_request.rs`（interface 按 Q13 杂交形状，
+  `assemble_with` 按可删条款**未落地**——窄测试全走写文件/建行取段，注释轴等第二调用方再开；
+  `Prepared`/`BudgetCheck`/`OverflowFacts` 与 plan 补了 LlmRequest 身份戳和 `keep_recent_rounds`
+  字段，微调条款内）。executor 侧：`agent_attempt_inner` 改走 `RequestPlan::assemble` +
+  每轮 `check_budget`，两条越界汇进新私有方法 `context_overflow_exit`（翻译留编排侧，照 245）。
+  既有 5 条随搬（名字不变），新增 13 条窄测试（D8+E5），core 全量 491 lib + 328 集成全绿；
+  clippy / fmt 干净。未动：伪阶段 prompt 站点（随票 03）、Clock（随票 02）。

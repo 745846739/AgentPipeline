@@ -16,6 +16,7 @@
 use std::path::{Path, PathBuf};
 use std::sync::{Mutex, OnceLock};
 
+use crate::clock::{Clock, SystemClock};
 use crate::{Error, Result};
 
 /// 供集成测试直接操作底层仓库（例如检查 rebase abort 后的 tracked 状态）。
@@ -134,7 +135,7 @@ fn worktree_creation_lock(repo: &Path) -> &'static Mutex<()> {
 
 /// 在[`worktree_creation_lock`]保护下执行 `f`（同步上下文；调用方在 spawn_blocking 里）。
 fn with_worktree_lock<T>(repo: &Path, f: impl FnOnce() -> Result<T>) -> Result<T> {
-    with_worktree_lock_within(WORKTREE_LOCK_WAIT_SEC, repo, f)
+    with_worktree_lock_within(&SystemClock, WORKTREE_LOCK_WAIT_SEC, repo, f)
 }
 
 /// 等这把锁的上限（秒）。
@@ -149,14 +150,17 @@ fn with_worktree_lock<T>(repo: &Path, f: impl FnOnce() -> Result<T>) -> Result<T
 /// fetch 在锁外（见 `init_worktree_named`）。真等满这一档，只可能是上一次调用挂住了。
 const WORKTREE_LOCK_WAIT_SEC: u64 = 60;
 
-/// 同上，等待上限可指定（内联测试注入一个短上限，照 `blocking_within` 的形状）。
+/// 同上，等待上限与**时钟**都可指定（照 `blocking_within` 的注入形状；生产传
+/// [`SystemClock`]——工具上下文（`start_repair` 链）手里没有 clock 可传，不为此动
+/// `ToolExecutor`，票 02 只改取时点：`Instant` 换成 [`Clock`] 接缝的读法）。
 fn with_worktree_lock_within<T>(
+    clock: &dyn Clock,
     wait_sec: u64,
     repo: &Path,
     f: impl FnOnce() -> Result<T>,
 ) -> Result<T> {
     let lock = worktree_creation_lock(repo);
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(wait_sec);
+    let deadline = clock.now() + chrono::Duration::seconds(wait_sec as i64);
     let _guard = loop {
         match lock.try_lock() {
             Ok(guard) => break guard,
@@ -164,7 +168,7 @@ fn with_worktree_lock_within<T>(
             // 不该让之后每一次建 worktree 都失败（与 `lock()` 的既有姿态一致）。
             Err(std::sync::TryLockError::Poisoned(poisoned)) => break poisoned.into_inner(),
             Err(std::sync::TryLockError::WouldBlock) => {
-                if std::time::Instant::now() >= deadline {
+                if clock.now() >= deadline {
                     return Err(Error::Git(format!(
                         "建 worktree 的互斥锁被占用超过 {wait_sec}s 没放（同一仓库上一次建 \
                          worktree 的调用可能还挂在 libgit2 里）：这个仓库的建 worktree 会继续\
@@ -1110,7 +1114,7 @@ mod tests {
         // 同一条线程自己占住它：`std::sync::Mutex` 不可重入，第二次拿就是 WouldBlock。
         let held = worktree_creation_lock(repo);
         let _guard = held.lock().unwrap_or_else(|e| e.into_inner());
-        let r: Result<()> = with_worktree_lock_within(0, repo, || Ok(()));
+        let r: Result<()> = with_worktree_lock_within(&SystemClock, 0, repo, || Ok(()));
         match r {
             Err(Error::Git(m)) => assert!(m.contains("互斥锁被占用"), "报文不对：{m}"),
             other => panic!("应当报「锁被占用」，实际：{other:?}"),

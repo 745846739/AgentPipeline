@@ -45,3 +45,16 @@ Phase B、proposal 生成与 `pending(merge_approval)`）从 executor.rs 搬进�
 **明确不做**：不动 rebase/合入的 git 操作语义（决策 73/97，风险优先级②「每操作必测」）；
 不设审批 TTL、不改 `approval` 落点；不把闸门执行搬进来（留守）；不动 `route()` 条件边
 （事实源 `routes.rs` + `landing.rs`，245/248 之后）。
+
+## Comments
+
+- 2026-09-23 实现落地：`crates/core/src/pipeline/merge.rs`（`MergeFlow` 借用四件套
+  store / settings / sse / clock；`execute` + `phase_a(_inner)` + `phase_b(_inner)` + 私有
+  `PhaseA`/`PhaseB` 枚举逐字搬入）。**闸门执行留守**：`run_code_gate` / `run_system_command`
+  从方法改成 executor 的自由函数（显式传 store/settings/clock），留守核的 develop 闸门与
+  本片都经它调——不借 `&Executor`；`pend_reason` 同样下沉为自由函数（挂起出口单点，
+  留守核两条路径 + 本片共用）；`begin_run_with_sse` 补齐与 `finish_run_with_sse` 对称的
+  开立+事件单点。`test_command_for` / `parse_diff_stats` 随迁本片（repair.rs /
+  model_request / 集成测试 import 改道，语义逐字）。新增窄测试 2 条：基准失配→审批失效
+  **不跑全节点循环**直测（`reset_stale_approval` 抽层）+ parse_diff_stats 随迁单测。
+  B3 三条 + e2e merge 组全绿；core 全量 502+328 绿；clippy / fmt 干净。executor → 1756 行。

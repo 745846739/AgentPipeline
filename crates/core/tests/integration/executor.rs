@@ -1296,7 +1296,7 @@ async fn conversations_are_truncated_to_max_chars() {
 
 #[test]
 fn test_command_mapping() {
-    use agentpipeline_core::pipeline::executor::test_command_for;
+    use agentpipeline_core::pipeline::merge::test_command_for;
     assert_eq!(test_command_for(None), "true");
     assert_eq!(test_command_for(Some("")), "true");
     assert_eq!(test_command_for(Some("cargo")), "cargo test --quiet");
@@ -1308,7 +1308,7 @@ fn test_command_mapping() {
 
 #[test]
 fn diff_stat_summary_is_parsed() {
-    use agentpipeline_core::pipeline::executor::parse_diff_stats;
+    use agentpipeline_core::pipeline::merge::parse_diff_stats;
     let stats = parse_diff_stats(" src/a.rs | 2 ++\n 1 file changed, 2 insertions(+)\n");
     assert_eq!(stats.files_changed, 1);
     assert_eq!(stats.insertions, 2);

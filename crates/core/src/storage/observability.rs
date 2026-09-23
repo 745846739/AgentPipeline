@@ -328,6 +328,19 @@ impl Store {
         rows.into_iter().map(RunRow::into_run).collect()
     }
 
+    /// 按 id 取一条 run（`None` = 行不存在）。
+    ///
+    /// 台账收口前先看终态用它（决策 249 票 02「finish 不抢已有终态」）——**只读**，
+    /// 不改任何既有 SQL 的语义。
+    pub async fn get_run(&self, run_id: i64) -> Result<Option<NodeRun>> {
+        let sql = format!("SELECT {RUN_COLUMNS} FROM kanban_node_runs WHERE id = ?");
+        let row: Option<RunRow> = sqlx::query_as(&sql)
+            .bind(run_id)
+            .fetch_optional(self.pool())
+            .await?;
+        row.map(RunRow::into_run).transpose()
+    }
+
     pub async fn list_runs(&self, task_id: &str) -> Result<Vec<NodeRun>> {
         let sql =
             format!("SELECT {RUN_COLUMNS} FROM kanban_node_runs WHERE task_id = ? ORDER BY id");
