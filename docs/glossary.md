@@ -96,6 +96,13 @@
 | **kanban_node_commands** | 命令执行记录（agent 和系统驱动的命令及其输出） |
 | **kanban_transitions** | 流转记录（节点切换时间线，见 §12.4.2） |
 
+### 推进（advance，决策 245）
+
+| 术语 | 定义 |
+|------|------|
+| **推进（advance）** | 把一条游标从当前落点搬到下一个落点的那一次写入，**唯一实现**住 `crates/core/src/pipeline/advance.rs`（决策 245）。接口吃**落点 + 修饰**（`Landing::{Entry, EntryWithAttempt, Retry, Stay, JoinBoundary{skipped}, Pause}`）而**不吃原因**——`EdgeKind` / `ResumeAction` / 超时耗尽 / 用户裁决这四种原因在门外各自翻译成落点（judge-continue 不接受 `Terminal`、goto 必须落在 `entry_node`、skip 在 merge 上非法，都是**校验**，留在门外），门只回答「给定落点和修饰，一次事务写完」。它**只返回 `Advanced{cursors}`**，不发 SSE、不做任务投影——那两件由调用方完成（草案里的 `replaced` 字段最终不设：`Split` / 「归档旧行 + 插新行」没进 `Landing`，恒为假的判据就是死代码）。**包事务的是四条路径**：`Retry` / `Entry` / `JoinBoundary` / `Pause`；`Split` 与「归档旧行 + 插新行」仍是既有的原子 `Store` 方法（`split_cursors` / `replace_cursors_with_main`），门只补那笔 transition。落地前它是四份实现（`executor.rs` 的 `apply_edge`、`storage/decisions.rs` 的 `apply_resume` 与 `advance_after_judge_continue`、`scheduler` 的 `handle_timeout`、`unstick`），共同症状是调用方必须自己记住 3–5 笔存储调用的顺序。**「唯一」的边界**：指的是**推进**（把游标搬到新落点）这一件事。另有两处仍直接写 pending 且**有意不进这扇门**——merge 审批 / 人工评审的旁路动作（决策 119 / 124，`storage/decisions.rs`，那是「先写字段再推进」的旁路事务而非推进）与调度器的 `conflict_wait` 复检改写（决策 102，游标本来就在 pending 上，只换 context、不挪落点）——因为 `Store::begin_write()` 是 `pub(crate)`，pipeline 侧本来没有组合事务的能力 |
+| **不进推进的东西** | 一条判据（决策 245）：**进程内存 / 重派不进事务模块**。两处适用——`handle_timeout` 的**重试支**（游标不动、attempts 不动、带进程级重派，那不是推进）与 `unstick` 的**编排**（第一步 `force_release` 是不可回滚的内存操作；它签名里那个 `+ Sync` 闭包参数正是硬塞进纯 DB module 的后果）。两处的 DB 那一步仍复用 `advance`。故 `advance` 的入参只有 `&Store` 与纯数据，没有闭包 |
+
 ### 调度相关
 
 | 术语 | 定义 |

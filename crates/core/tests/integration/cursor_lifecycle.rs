@@ -138,6 +138,54 @@ async fn split_after_split_attempts_are_independent() {
     assert_eq!(test_cursor.validate_attempts, 0);
 }
 
+/// 票 02 的**见证者**：`Retry` 的「attempts+1」与「回 execute」必须在同一笔事务里。
+///
+/// 让流转行写不进去（`kanban_transitions` 已不存在），看游标会不会被半截推进。
+/// 三笔 autocommit 的旧实现里前两笔早就提交了，这条会红——它是本次唯一行为变化的
+/// 唯一见证者（`Retry` 臂在此前零测试覆盖）。
+#[tokio::test]
+async fn a_failed_retry_leaves_the_cursor_untouched() {
+    use agentpipeline_core::pipeline::{advance, Landing};
+    use agentpipeline_core::types::TransitionTrigger;
+
+    let (_home, store, _task) = with_task().await;
+    let cursor = store.load_live_cursors("t1").await.unwrap().remove(0);
+    // 摆到 validate_output 上，好让 Retry 真有两笔游标写可做
+    store
+        .set_cursor_stage(&cursor.cursor_id, Stage::Develop, Node::ValidateOutput)
+        .await
+        .unwrap();
+    let before = store.get_cursor(&cursor.cursor_id).await.unwrap();
+    assert_eq!(before.validate_attempts, 0);
+
+    // 造一次「流转行写不进去」的失败
+    sqlx::query("DROP TABLE kanban_transitions")
+        .execute(store.pool())
+        .await
+        .unwrap();
+
+    let failed = advance(
+        &store,
+        &before.task_id,
+        &before,
+        Landing::Retry,
+        TransitionTrigger::NodeRetry,
+        None,
+    )
+    .await;
+    assert!(failed.is_err(), "流转行写不进去时，整笔推进必须失败");
+
+    let after = store.get_cursor(&before.cursor_id).await.unwrap();
+    assert_eq!(
+        after.validate_attempts, before.validate_attempts,
+        "attempts 不得在失败后已经 +1（说明两笔写不是一个事务）"
+    );
+    assert_eq!(
+        after.node, before.node,
+        "落点不得在失败后已被改写（说明两笔写不是一个事务）"
+    );
+}
+
 // ─────────────────────────── 合并 / 回退 / 重试（决策 113）───────────────────────────
 
 #[tokio::test]

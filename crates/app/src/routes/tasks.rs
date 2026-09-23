@@ -273,11 +273,14 @@ pub async fn resume(
 ) -> ApiResult<impl IntoResponse> {
     // 状态机在 core 的 `pipeline::resume::apply_resume`（票 08 抽出来的**唯一实现**）：
     // 值班长的托管自动动作走的是同一份，两处逐字同源才不会漂移成
-    // 「界面按得动、它按不动」。
+    // 「界面按得动、它按不动」。决策 245 给这条路径补了 SSE——`&Arc<SseBus>` 在实参位
+    // 不会自动收窄成 `&Arc<dyn SseSink>`，先在这里立一个绑定。
+    let sse: std::sync::Arc<dyn agentpipeline_core::sse::SseSink> = state.sse.clone();
     let applied = agentpipeline_core::pipeline::resume::apply_resume(
         &state.store,
         &state.settings,
         &state.resume_hook,
+        &sse,
         &id,
         &agentpipeline_core::pipeline::resume::ResumeRequest {
             action: body.action.clone(),

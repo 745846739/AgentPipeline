@@ -4336,6 +4336,7 @@ async fn api_full_with_foreman_llm(settings: Settings, llm: Option<Arc<dyn LlmCl
                     state.store.clone(),
                     state.settings.clone(),
                     state.resume_hook.clone(),
+                    state.sse.clone(),
                 ))),
             );
             state.with_foreman(runner)

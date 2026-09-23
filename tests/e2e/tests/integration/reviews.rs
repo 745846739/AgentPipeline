@@ -114,15 +114,15 @@ async fn e2e_03_review_rejection_pends_then_goto_develop_and_re_review_passes() 
     assert_eq!(review_meta["required_changes"][0]["path"], "src/lib.rs");
 
     // 用户 goto develop.execute 打回修复
-    f.store
-        .apply_resume(
-            &cursor,
-            ResumeAction::Goto,
-            Some((Stage::Develop, Node::Execute)),
-            None,
-        )
-        .await
-        .unwrap();
+    agentpipeline_core::pipeline::resume::apply_action(
+        &f.store,
+        &cursor,
+        ResumeAction::Goto,
+        Some((Stage::Develop, Node::Execute)),
+        None,
+    )
+    .await
+    .unwrap();
     let after = f.store.get_cursor(&cursor.cursor_id).await.unwrap();
     assert_eq!((after.stage, after.node), (Stage::Develop, Node::Execute));
     assert_eq!(

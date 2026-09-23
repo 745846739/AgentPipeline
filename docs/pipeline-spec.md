@@ -44,7 +44,7 @@
 | **validate_input** | develop agent 读取 `design.md`，分析是否支撑开发。充足 → execute；不充足 → pending(user_decision)，用户选择重回 architect-design 或跳过 |
 | **execute** | develop agent 读取 `design.md`，生成 `dev-plan.md` 写入任务目录 |
 | **validate_output** | develop agent 读取 `dev-plan.md` 验证是否符合要求。通过 → next_stage；不通过 → 重新进入 execute。validate_attempts +1，超过 → pending(retry_exhausted)。`cross_family_judge = true` 时首判不合格先经异族复判（决策 134 / 135） |
-| **next** | `[sync-check]`。因 sync-check 是 join，`advance_cursor` 把本游标置为 **`waiting_join`**（决策 107）——这是 `next` 路由在"下一阶段是 join 节点"时的变体，不是独立状态机 |
+| **next** | `[sync-check]`。因 sync-check 是 join，`advance_cursor` 把本游标置为 **`waiting_join`**（决策 107）——这是 `next` 路由在"下一阶段是 join 节点"时的变体，不是独立状态机（落地实现见 `crates/core/src/pipeline/advance.rs`，决策 245） |
 
 ### test-design（业务测试用例设计）
 
@@ -53,7 +53,7 @@
 | **validate_input** | test agent 读取 `design.md`，分析是否支撑测试场景设计。充足 → execute；不充足 → pending(user_decision)，用户选择重回 architect-design 或跳过 |
 | **execute** | test agent 读取 `design.md`，生成 `test-scenarios.md` 写入任务目录。文档描述业务测试场景（测什么、怎么测、预期结果），**不产出测试代码**；`test_scenarios[]` 元数据每项携带 `design_refs`（引用 design.md 验收标准编号，决策 136） |
 | **validate_output** | test agent 读取 `test-scenarios.md` 验证场景完整性。通过 → next_stage；不通过 → 重新进入 execute。validate_attempts +1，超过 → pending(retry_exhausted)。`cross_family_judge = true` 时首判不合格先经异族复判（决策 134 / 135） |
-| **next** | `[sync-check]`。同 develop-design，`advance_cursor` 把本游标置为 **`waiting_join`**（决策 107） |
+| **next** | `[sync-check]`。同 develop-design，`advance_cursor` 把本游标置为 **`waiting_join`**（决策 107）（落地实现见 `crates/core/src/pipeline/advance.rs`，决策 245） |
 
 ### sync-check（纯代码逻辑，**不占游标行**）
 
@@ -216,11 +216,11 @@ develop-design 和 test-design 并行执行，汇聚于 **sync-check** 节点统
 |---|---|
 | 游标独立 | 每个分支一条游标记录，`stage` / `node` / `validate_attempts` / `pending_reason` 全部独立（决策 82） |
 | 相互不阻塞 | 一个分支进 pending 时，另一分支继续跑完自己的阶段，然后停在 join 边界（`waiting_join`），**不进入 sync-check 之后的阶段**（决策 82）。executor 通过"把 pending 游标移出可运行集合"实现，不是整体暂停（决策 89） |
-| join 条件 | 两条游标都到达边界（`waiting_join`）且均无 pending，`sync-check.execute` 才执行，且**只执行一次**（决策 83，落实 G5）。`waiting_join` 由 `advance_cursor` 在 `next` 指向 join 时写入（决策 107） |
+| join 条件 | 两条游标都到达边界（`waiting_join`）且均无 pending，`sync-check.execute` 才执行，且**只执行一次**（决策 83，落实 G5）。`waiting_join` 由 `advance_cursor` 在 `next` 指向 join 时写入（决策 107）（落地实现见 `crates/core/src/pipeline/advance.rs`，决策 245） |
 | pending 归属 | pending 挂在游标上；任务整体 `status = pending` 是"任一游标被阻塞"的投影。看板同时展示两个分支各自的状态与可用动作（决策 82） |
 | backtrack 处置 | 两条游标**一起**重置回 `architect-design.validate_input`（一个事务内归档两条 + 插入单条 main，决策 90 / 113）；`dev-plan.md` / `test-scenarios.md` 标记为过期（文件保留供回溯，下次执行按 §8 覆盖写入）（决策 83） |
 | 重试计数 | `validate_retry_max` 按游标各自判定；backtrack 属跨阶段跳转，两条游标都重置为 0（决策 43 / 82） |
-| 本分支 skip | 用户对某分支执行 `skip` 时，该分支**不得越过 join**：`advance_cursor` 把它置为 `waiting_join` 并写 `skipped_to_join = true`；sync-check 读到该标志则视其 readiness=true（决策 93） |
+| 本分支 skip | 用户对某分支执行 `skip` 时，该分支**不得越过 join**：`advance_cursor` 把它置为 `waiting_join` 并写 `skipped_to_join = true`（落地实现见 `crates/core/src/pipeline/advance.rs`，决策 245）；sync-check 读到该标志则视其 readiness=true（决策 93） |
 
 > **模型一致性：** 本节规则取代了早先"单游标 + 待定稿"的表述。§4.1 的 `NodeCursor` 类型、§11.5 的 `kanban_node_cursors` 表、§11.2 的 executor 伪码是同一套模型的三个视图。
 

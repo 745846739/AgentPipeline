@@ -2172,10 +2172,15 @@ async fn merge_gate_failure_routes_to_test_recheck_then_reruns_gate() {
         .into_iter()
         .next()
         .unwrap();
-    ctx.store
-        .apply_resume(&cursor, ResumeAction::Continue, None, None)
-        .await
-        .unwrap();
+    agentpipeline_core::pipeline::resume::apply_action(
+        &ctx.store,
+        &cursor,
+        ResumeAction::Continue,
+        None,
+        None,
+    )
+    .await
+    .unwrap();
     ctx.executor.run("t7").await.unwrap();
 
     // 复检 prompt 注入闸门完整日志（决策 85 / 109）
@@ -2407,10 +2412,15 @@ async fn validator_cross_check_disagreement_pends_and_continue_advances_stage() 
     let calls_before = ctx
         .agent
         .calls_for(Stage::ArchitectDesign, Node::ValidateOutput);
-    ctx.store
-        .apply_resume(&cursor, ResumeAction::Continue, None, None)
-        .await
-        .unwrap();
+    agentpipeline_core::pipeline::resume::apply_action(
+        &ctx.store,
+        &cursor,
+        ResumeAction::Continue,
+        None,
+        None,
+    )
+    .await
+    .unwrap();
     let live = ctx.store.load_live_cursors("td-continue").await.unwrap();
     assert_eq!(live.len(), 2, "architect 放行应分裂到两条设计分支");
     let stages: Vec<Stage> = live.iter().map(|c| c.stage).collect();
@@ -2438,15 +2448,15 @@ async fn validator_cross_check_disagreement_goto_execute_increments_attempts() {
         .into_iter()
         .next()
         .unwrap();
-    ctx.store
-        .apply_resume(
-            &cursor,
-            ResumeAction::Goto,
-            Some((Stage::ArchitectDesign, Node::Execute)),
-            None,
-        )
-        .await
-        .unwrap();
+    agentpipeline_core::pipeline::resume::apply_action(
+        &ctx.store,
+        &cursor,
+        ResumeAction::Goto,
+        Some((Stage::ArchitectDesign, Node::Execute)),
+        None,
+    )
+    .await
+    .unwrap();
     let live = ctx.store.get_cursor(&cursor.cursor_id).await.unwrap();
     assert_eq!(live.stage, Stage::ArchitectDesign);
     assert_eq!(live.node, Node::Execute);
@@ -2454,6 +2464,57 @@ async fn validator_cross_check_disagreement_goto_execute_increments_attempts() {
     assert_eq!(
         live.validate_attempts, 1,
         "goto execute → attempts +1（决策 135）"
+    );
+}
+
+/// 决策 245：交互式 resume **不再是静默的**——人按完钮，实时流里要看得见。
+///
+/// 这条路径此前零 `emit`（`Store` 连 `sse` 字段都没有），界面只能靠重新拉取或轮询。
+/// 用例走的是端点与托管动作共用的那份 `apply_resume`，断言 `stage_changed` 真的发出来了。
+#[tokio::test]
+async fn pressing_continue_emits_stage_changed() {
+    use agentpipeline_core::pipeline::resume::{apply_resume, ResumeRequest};
+    use agentpipeline_core::scheduler::ResumeFn;
+    use agentpipeline_core::sse::SseEventType;
+
+    // judge 分歧的 continue 会真的把游标从 architect.validate_output 放行出去（决策 135）
+    let ctx = judge_disagreement_ctx("td-sse").await;
+    let recorder = testkit::SseRecorder::new();
+    // 实参位不自动把 `Arc<SseRecorder>` 收窄成 `Arc<dyn SseSink>`，两边都要留：
+    // 断言要用具体类型，签名要的是 trait 对象（`SseRecorder` 是 Clone，共享同一份事件）。
+    let sse: Arc<dyn agentpipeline_core::sse::SseSink> = Arc::new(recorder.clone());
+    let noop: ResumeFn = Arc::new(|_| {});
+
+    let applied = apply_resume(
+        &ctx.store,
+        &Settings::default(),
+        &noop,
+        &sse,
+        "td-sse",
+        &ResumeRequest {
+            action: "continue".into(),
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap();
+    assert_eq!(applied.action, "continue");
+
+    assert!(
+        recorder.count_of(SseEventType::StageChanged) >= 1,
+        "人按 continue 之后必须收到 stage_changed：{:?}",
+        recorder.type_sequence()
+    );
+    assert!(
+        recorder.count_of(SseEventType::CursorChanged) >= 1,
+        "每条受影响游标都要收到 cursor_changed：{:?}",
+        recorder.type_sequence()
+    );
+    // 决策 245：resume 的落点没有一种会把游标挂起，所以这条路径不发 pending
+    assert_eq!(
+        recorder.count_of(SseEventType::Pending),
+        0,
+        "resume 不该把游标挂起"
     );
 }
 
@@ -2488,15 +2549,15 @@ async fn pseudo_stage_run_does_not_inflate_next_attempt() {
         .into_iter()
         .next()
         .unwrap();
-    ctx.store
-        .apply_resume(
-            &cursor,
-            ResumeAction::Goto,
-            Some((Stage::ArchitectDesign, Node::Execute)),
-            None,
-        )
-        .await
-        .unwrap();
+    agentpipeline_core::pipeline::resume::apply_action(
+        &ctx.store,
+        &cursor,
+        ResumeAction::Goto,
+        Some((Stage::ArchitectDesign, Node::Execute)),
+        None,
+    )
+    .await
+    .unwrap();
 
     // 第二轮脚本：execute 再产出，validate_output 这次通过
     let mut script = Script::new();
@@ -2709,6 +2770,66 @@ async fn advance_join_runs_exactly_once_even_across_repeated_runs() {
         1,
         "join 只执行一次"
     );
+}
+
+/// 反向不变量（票 01）：**没有任何路径能把游标停在 sync-check**。
+///
+/// sync-check 不占游标行（决策 107）——它只以 run 行（`agent_type = "system"`）存在，
+/// 回溯由 `advance_join` 经 `SyncDecisionKind` 判定、`Store::backtrack_cursors` 落库，
+/// 从不经过 `route()`。本条今天为真、删掉 `EdgeKind::Backtrack` 死代码之后仍为真；
+/// 将来若有人「照文档」把 sync-check 做成占游标行的节点，它会变红。
+#[tokio::test]
+async fn no_cursor_row_ever_parks_at_sync_check() {
+    let ctx = setup("true", Settings::default()).await;
+    let mut script = Script::new();
+    script
+        .for_node(Stage::ArchitectDesign, Node::ValidateInput)
+        .submit(&ValidateInputMetadata {
+            readiness: false,
+            blockers: vec!["占位".into()],
+        });
+    ctx.agent.set_script(script);
+    testkit::seed_task(&ctx.store, "t-sync-inv", "p1")
+        .await
+        .unwrap();
+    admit(&ctx, "t-sync-inv").await;
+
+    // 造出「两分支都到界」的 join-ready 状态，让 join 真的跑一次
+    let split = ctx.store.split_cursors("t-sync-inv").await.unwrap();
+    for c in &split {
+        ctx.store
+            .set_cursor_waiting_join(&c.cursor_id)
+            .await
+            .unwrap();
+    }
+    ctx.agent.set_script(Script::new());
+    ctx.executor.run("t-sync-inv").await.unwrap();
+
+    // ① 全部游标行（含已归档）都不停在 sync-check
+    let cursors = ctx.store.load_all_cursors("t-sync-inv").await.unwrap();
+    assert!(!cursors.is_empty(), "join 之后必须还有游标行");
+    for c in &cursors {
+        assert!(
+            (c.stage, c.node) != (Stage::SyncCheck, Node::Execute),
+            "游标 {}（{}）停在了 sync-check：sync-check 不占游标行（决策 107）",
+            c.cursor_id,
+            c.branch
+        );
+    }
+
+    // ② sync-check 只以 system run 行存在，且 join 恰执行一次
+    let runs = ctx
+        .store
+        .list_runs_at("t-sync-inv", Stage::SyncCheck, Node::Execute)
+        .await
+        .unwrap();
+    assert_eq!(runs.len(), 1, "join 恰执行一次（决策 107 / G5）");
+    for r in &runs {
+        assert_eq!(
+            r.agent_type, "system",
+            "sync-check 只以 system run 存在（决策 114）"
+        );
+    }
 }
 
 // ──────────────────── G13：工具失败分层，单次工具失败不触发节点重试（决策 33）────────────────────
@@ -3761,10 +3882,15 @@ async fn a_cause_that_says_yes_carries_the_previous_attempt_messages() {
             blockers: vec![],
         });
     ctx.agent.set_script(rerun);
-    ctx.store
-        .apply_resume(&cursor, ResumeAction::Continue, None, Some("生产 k8s"))
-        .await
-        .unwrap();
+    agentpipeline_core::pipeline::resume::apply_action(
+        &ctx.store,
+        &cursor,
+        ResumeAction::Continue,
+        None,
+        Some("生产 k8s"),
+    )
+    .await
+    .unwrap();
     ctx.executor.run("cont-on").await.unwrap();
 
     let requests = ctx.agent.request_log();
@@ -3818,10 +3944,15 @@ async fn clean_retry_after_a_tool_failure_stays_empty_whatever_the_cause_says() 
         .for_node(Stage::ArchitectDesign, Node::ValidateInput)
         .text("这不是结构化元数据，抽取必然失败");
     ctx.agent.set_script(rerun);
-    ctx.store
-        .apply_resume(&cursor, ResumeAction::Continue, None, None)
-        .await
-        .unwrap();
+    agentpipeline_core::pipeline::resume::apply_action(
+        &ctx.store,
+        &cursor,
+        ResumeAction::Continue,
+        None,
+        None,
+    )
+    .await
+    .unwrap();
     ctx.executor.run("cont-retry").await.unwrap();
 
     let requests = ctx.agent.request_log();
@@ -3907,10 +4038,15 @@ async fn continued_run_links_back_so_tokens_are_not_double_counted() {
             blockers: vec![],
         });
     ctx.agent.set_script(rerun);
-    ctx.store
-        .apply_resume(&cursor, ResumeAction::Continue, None, None)
-        .await
-        .unwrap();
+    agentpipeline_core::pipeline::resume::apply_action(
+        &ctx.store,
+        &cursor,
+        ResumeAction::Continue,
+        None,
+        None,
+    )
+    .await
+    .unwrap();
     ctx.executor.run("cont-tokens").await.unwrap();
 
     let runs = ctx.store.list_runs("cont-tokens").await.unwrap();
@@ -4145,10 +4281,15 @@ async fn unsticking_releases_the_in_process_dedup_and_allows_a_rerun() {
         .into_iter()
         .next()
         .unwrap();
-    ctx.store
-        .apply_resume(&cursor, ResumeAction::Continue, None, None)
-        .await
-        .unwrap();
+    agentpipeline_core::pipeline::resume::apply_action(
+        &ctx.store,
+        &cursor,
+        ResumeAction::Continue,
+        None,
+        None,
+    )
+    .await
+    .unwrap();
     executor.try_run("t-hang").await.unwrap();
     let after = ctx.store.list_runs("t-hang").await.unwrap().len();
     assert!(

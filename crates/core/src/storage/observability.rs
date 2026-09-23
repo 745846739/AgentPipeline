@@ -661,6 +661,27 @@ impl Store {
         trigger: TransitionTrigger,
         reason: Option<&str>,
     ) -> Result<i64> {
+        let mut tx = self.begin_write().await?;
+        let id = self
+            .insert_transition_in_tx(&mut tx, task_id, branch, from, to, trigger, reason)
+            .await?;
+        tx.commit().await?;
+        Ok(id)
+    }
+
+    /// [`Store::insert_transition`] 的行级原语（决策 245）：让 `pipeline::advance`
+    /// 能把「落点 + 流转行」写进同一笔事务。
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) async fn insert_transition_in_tx(
+        &self,
+        tx: &mut sqlx::SqliteConnection,
+        task_id: &str,
+        branch: &str,
+        from: Option<(Stage, Node)>,
+        to: (Stage, Node),
+        trigger: TransitionTrigger,
+        reason: Option<&str>,
+    ) -> Result<i64> {
         let id: i64 = sqlx::query_scalar(
             "INSERT INTO kanban_transitions
              (task_id, branch, from_stage, from_node, to_stage, to_node, trigger, reason, created_at)
@@ -675,7 +696,7 @@ impl Store {
         .bind(trigger.as_str())
         .bind(reason)
         .bind(ts(self.now()))
-        .fetch_one(self.pool())
+        .fetch_one(&mut *tx)
         .await?;
         Ok(id)
     }

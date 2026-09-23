@@ -485,6 +485,7 @@ pub async fn serve(options: ServeOptions) -> anyhow::Result<ServerHandle> {
             store.clone(),
             settings.clone(),
             runtime.resume_hook.clone(),
+            sse.clone(),
         ))),
     );
     // 值守轮（决策 209④ / 票 06）：与调度器的 10s tick 分开驱动——它要花模型的钱，

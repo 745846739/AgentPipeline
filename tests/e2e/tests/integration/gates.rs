@@ -144,10 +144,15 @@ async fn e2e_06a_merge_test_gate_failure_rechecks_via_test_then_passes() {
         });
     f.agent.set_script(recheck);
     let cursor = f.sole_cursor("t6a").await;
-    f.store
-        .apply_resume(&cursor, ResumeAction::Continue, None, None)
-        .await
-        .unwrap();
+    agentpipeline_core::pipeline::resume::apply_action(
+        &f.store,
+        &cursor,
+        ResumeAction::Continue,
+        None,
+        None,
+    )
+    .await
+    .unwrap();
     f.executor.run("t6a").await.unwrap();
 
     let meta = f
@@ -248,10 +253,15 @@ async fn e2e_06b_gate_failure_code_issue_pends_for_user_then_goto_develop() {
         });
     f.agent.set_script(recheck);
     let cursor = f.sole_cursor("t6b").await;
-    f.store
-        .apply_resume(&cursor, ResumeAction::Continue, None, None)
-        .await
-        .unwrap();
+    agentpipeline_core::pipeline::resume::apply_action(
+        &f.store,
+        &cursor,
+        ResumeAction::Continue,
+        None,
+        None,
+    )
+    .await
+    .unwrap();
     f.executor.run("t6b").await.unwrap();
 
     let cursor = f.sole_cursor("t6b").await;
@@ -292,15 +302,15 @@ async fn e2e_06b_gate_failure_code_issue_pends_for_user_then_goto_develop() {
     );
 
     // 用户裁决「修改业务代码」→ goto develop.execute（决策 85 动作集）
-    f.store
-        .apply_resume(
-            &cursor,
-            ResumeAction::Goto,
-            Some((Stage::Develop, Node::Execute)),
-            None,
-        )
-        .await
-        .unwrap();
+    agentpipeline_core::pipeline::resume::apply_action(
+        &f.store,
+        &cursor,
+        ResumeAction::Goto,
+        Some((Stage::Develop, Node::Execute)),
+        None,
+    )
+    .await
+    .unwrap();
     let after = f.store.get_cursor(&cursor.cursor_id).await.unwrap();
     assert_eq!((after.stage, after.node), (Stage::Develop, Node::Execute));
     assert_eq!(
@@ -344,15 +354,15 @@ async fn retry_exhausted_to_architect_writes_retry_feedback_and_injects_on_reent
         .find(|a| a.label == "带失败摘要回架构设计修订")
         .unwrap();
     let target = goto.target.as_ref().expect("goto 应带落点");
-    f.store
-        .apply_resume(
-            &cursor,
-            ResumeAction::Goto,
-            Some((target.stage, target.node)),
-            None,
-        )
-        .await
-        .unwrap();
+    agentpipeline_core::pipeline::resume::apply_action(
+        &f.store,
+        &cursor,
+        ResumeAction::Goto,
+        Some((target.stage, target.node)),
+        None,
+    )
+    .await
+    .unwrap();
 
     // 决策 138：与游标置位同事务写入 retry-feedback.md（先写文件再动游标）
     let feedback_path = f.home.home().task_file("t8r", "retry-feedback.md");
@@ -483,10 +493,15 @@ async fn e2e_08_exhausts_gate_failures_then_retry_resets_worktree_and_readmits()
                 });
             f.agent.set_script(recheck);
             let cursor = f.sole_cursor("t8").await;
-            f.store
-                .apply_resume(&cursor, ResumeAction::Continue, None, None)
-                .await
-                .unwrap();
+            agentpipeline_core::pipeline::resume::apply_action(
+                &f.store,
+                &cursor,
+                ResumeAction::Continue,
+                None,
+                None,
+            )
+            .await
+            .unwrap();
         }
         f.executor.run("t8").await.unwrap();
         gate_failures_seen.push(

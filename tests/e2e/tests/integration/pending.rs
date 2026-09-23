@@ -44,10 +44,15 @@ async fn e2e_21_info_insufficient_requires_input_then_reruns_validate_input() {
 
     // continue 带输入 → 用户输入落库为流转原因（决策 79）
     let input = "部署环境是生产 k8s";
-    f.store
-        .apply_resume(&cursor, ResumeAction::Continue, None, Some(input))
-        .await
-        .unwrap();
+    agentpipeline_core::pipeline::resume::apply_action(
+        &f.store,
+        &cursor,
+        ResumeAction::Continue,
+        None,
+        Some(input),
+    )
+    .await
+    .unwrap();
     let transitions = f.store.list_transitions("t21").await.unwrap();
     assert!(
         transitions
@@ -263,10 +268,15 @@ async fn e2e_15_judge_disagreement_pends_then_continue_advances_without_rerun() 
     let before = f
         .agent
         .calls_for(Stage::ArchitectDesign, Node::ValidateOutput);
-    f.store
-        .apply_resume(&cursor, ResumeAction::Continue, None, None)
-        .await
-        .unwrap();
+    agentpipeline_core::pipeline::resume::apply_action(
+        &f.store,
+        &cursor,
+        ResumeAction::Continue,
+        None,
+        None,
+    )
+    .await
+    .unwrap();
     let live = f.live_cursors("t15c").await;
     assert_eq!(live.len(), 2, "architect 放行分裂为两条设计分支");
     let stages: Vec<Stage> = live.iter().map(|c| c.stage).collect();
@@ -284,15 +294,15 @@ async fn e2e_15_judge_disagreement_pends_then_continue_advances_without_rerun() 
 async fn e2e_15_judge_disagreement_goto_execute_increments_attempts() {
     let f = judge_disagreement_flow("t15g").await;
     let cursor = f.sole_cursor("t15g").await;
-    f.store
-        .apply_resume(
-            &cursor,
-            ResumeAction::Goto,
-            Some((Stage::ArchitectDesign, Node::Execute)),
-            None,
-        )
-        .await
-        .unwrap();
+    agentpipeline_core::pipeline::resume::apply_action(
+        &f.store,
+        &cursor,
+        ResumeAction::Goto,
+        Some((Stage::ArchitectDesign, Node::Execute)),
+        None,
+    )
+    .await
+    .unwrap();
     let after = f.store.get_cursor(&cursor.cursor_id).await.unwrap();
     assert_eq!(
         (after.stage, after.node),

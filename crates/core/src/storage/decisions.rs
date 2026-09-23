@@ -6,12 +6,10 @@
 use sqlx::Row;
 
 use super::{decode_pending, parse_ts, ts, Store};
-use crate::pipeline::landing::{
-    entry_node, next_stages, skip_landing, stage_has_node, SkipLanding,
-};
+use crate::pipeline::landing::{entry_node, next_stages};
 use crate::types::{
     Approval, CursorStatus, MergeResult, Node, NodeCursor, PendingKind, PendingReason, ResumeCause,
-    Stage, TransitionTrigger,
+    Stage,
 };
 use crate::{Error, Result};
 
@@ -243,170 +241,11 @@ impl Store {
         self.get_cursor(&cursor.cursor_id).await
     }
 
-    /// 应用 resume 动作（决策 35 / 43 / 69 / 93 / 116）。
-    ///
-    /// 落点查 [`crate::pipeline::landing`]，不在此处硬编码阶段特例。
-    pub async fn apply_resume(
-        &self,
-        cursor: &NodeCursor,
-        action: ResumeAction,
-        target: Option<(Stage, Node)>,
-        input: Option<&str>,
-    ) -> Result<()> {
-        // 本次 resume 的流转原因（决策 79 的用户补充输入 / 决策 116 的 dependency_overridden
-        // 警告都写进**同一条** user_resume 流转行，不重复插行）。
-        let mut reason: Option<String> = input.map(str::to_string);
-        match action {
-            ResumeAction::Continue => {
-                let ctx_kind = cursor
-                    .pending_reason
-                    .as_ref()
-                    .and_then(|r| r.context.as_ref())
-                    .and_then(|c| c.kind.as_deref())
-                    .map(str::to_string);
-                // decision 135：judge_disagreement 的 continue = 用户裁决「合格」，
-                // 特判**直接放行到下一阶段入口**，不重跑 validate_output（用户裁决即终审）。
-                let is_judge_disagreement =
-                    ctx_kind.as_deref() == Some(crate::actions::kinds::JUDGE_DISAGREEMENT);
-                // dependency_failed 的 continue 特殊：忽略失败依赖，置回 queued 重新准入（决策 116）
-                let is_dependency_failed = cursor
-                    .pending_reason
-                    .as_ref()
-                    .map(|r| r.kind == PendingKind::DependencyFailed)
-                    .unwrap_or(false);
-                self.clear_cursor_pending(&cursor.cursor_id).await?;
-                if is_judge_disagreement {
-                    self.advance_after_judge_continue(cursor).await?;
-                } else if is_dependency_failed {
-                    // 决策 130 ⑤：清 pending + 置回 queued 交还准入（不直接 spawn）。
-                    // 决策 116 / 票 06：这一步等于用户**主动忽略失败依赖**，必须在观测面
-                    // 留下 `dependency_overridden` 警告（含被忽略的依赖任务 id），
-                    // 否则事后无法从审计面看出这个任务是踩着失败依赖上路的。
-                    let ignored = match self.dependencies_satisfied(&cursor.task_id).await? {
-                        crate::storage::tasks::DependencyState::Failed(ids) => ids,
-                        _ => Vec::new(),
-                    };
-                    let detail = if ignored.is_empty() {
-                        "（未记录 id）".to_string()
-                    } else {
-                        ignored.join("、")
-                    };
-                    reason = Some(format!(
-                        "dependency_overridden：忽略失败依赖 {detail}（决策 116）"
-                    ));
-                    self.set_task_status(&cursor.task_id, crate::types::TaskStatus::Queued)
-                        .await?;
-                } else if cursor
-                    .pending_reason
-                    .as_ref()
-                    .map(|r| r.kind == PendingKind::InfoInsufficient)
-                    .unwrap_or(false)
-                {
-                    // 决策 79 / 票 08：info_insufficient 的补充输入不只是流转原因——
-                    // 落任务目录 `user-input.md`，architect-design 重入时注入 prompt。
-                    // 空输入不落文件（重入 prompt 该段不渲染）。
-                    if let Some(input) = input.map(str::trim).filter(|s| !s.is_empty()) {
-                        self.home().ensure_task_dirs(&cursor.task_id)?;
-                        std::fs::write(
-                            self.home().task_file(&cursor.task_id, "user-input.md"),
-                            format!("# 用户补充输入\n\n{input}\n"),
-                        )?;
-                    }
-                }
-            }
-            ResumeAction::Skip => {
-                self.clear_cursor_pending(&cursor.cursor_id).await?;
-                match skip_landing(cursor.stage) {
-                    SkipLanding::SplitCursors => {
-                        self.split_cursors(&cursor.task_id).await?;
-                    }
-                    SkipLanding::ToJoinBoundary => {
-                        self.mark_cursor_skipped_to_join(&cursor.cursor_id).await?;
-                    }
-                    SkipLanding::StageEntry(stage, node) => {
-                        self.set_cursor_stage(&cursor.cursor_id, stage, node)
-                            .await?;
-                    }
-                    SkipLanding::Forbidden => {
-                        return Err(Error::Validation(format!(
-                            "阶段 {} 无 skip（决策 86）",
-                            cursor.stage
-                        )));
-                    }
-                }
-                self.reset_cursor_attempts(&cursor.cursor_id).await?;
-            }
-            ResumeAction::Goto => {
-                let is_judge_disagreement = cursor
-                    .pending_reason
-                    .as_ref()
-                    .and_then(|r| r.context.as_ref())
-                    .and_then(|c| c.kind.as_deref())
-                    == Some(crate::actions::kinds::JUDGE_DISAGREEMENT);
-                let (stage, node) = target.ok_or_else(|| {
-                    Error::Validation("goto 必须提供 target_stage / target_node".into())
-                })?;
-                if is_judge_disagreement && stage == cursor.stage && node == Node::Execute {
-                    // decision 135：裁决不合格 → 打回本阶段 execute，`validate_attempts` +1
-                    // （不走 goto 入口校验，落点就是同阶段的 Execute）。
-                    self.clear_cursor_pending(&cursor.cursor_id).await?;
-                    self.set_cursor_stage(&cursor.cursor_id, stage, node)
-                        .await?;
-                    self.increment_cursor_attempts(&cursor.cursor_id).await?;
-                } else {
-                    if stage == Stage::SyncCheck {
-                        return Err(Error::Validation(
-                            "sync-check 不占游标行，不能作为 goto 目标（决策 107）".into(),
-                        ));
-                    }
-                    // 决策 69：goto 落点 = entry_node(stage)。任意节点（如 merge.validate_input、
-                    // 不存在的节点组合）都是对状态机完整性的破坏，必须拒绝。
-                    let expected = entry_node(stage);
-                    if node != expected || !stage_has_node(stage, node) {
-                        return Err(Error::Validation(format!(
-                            "goto 落点必须是 {stage} 的入口节点 {expected}（决策 69）"
-                        )));
-                    }
-                    // 决策 138：develop / test 的 retry_exhausted 走「带失败摘要回架构设计修订」时，
-                    // 先把重试历史摘要落任务目录 `retry-feedback.md`。**先写文件再动游标**：
-                    // 写失败即中止，不出现「游标已回架构但摘要缺失」的半截状态。
-                    if stage == Stage::ArchitectDesign
-                        && matches!(cursor.stage, Stage::Develop | Stage::Test)
-                        && cursor
-                            .pending_reason
-                            .as_ref()
-                            .map(|r| r.kind == PendingKind::RetryExhausted)
-                            .unwrap_or(false)
-                    {
-                        self.write_retry_feedback(cursor).await?;
-                    }
-                    self.clear_cursor_pending(&cursor.cursor_id).await?;
-                    self.set_cursor_stage(&cursor.cursor_id, stage, node)
-                        .await?;
-                    self.reset_cursor_attempts(&cursor.cursor_id).await?;
-                }
-            }
-        }
-
-        // 流转原因（决策 79 的用户补充输入 / 决策 116 的 dependency_overridden 警告）
-        self.insert_transition(
-            &cursor.task_id,
-            &cursor.branch,
-            Some((cursor.stage, cursor.node)),
-            (cursor.stage, cursor.node),
-            TransitionTrigger::UserResume,
-            reason.as_deref(),
-        )
-        .await?;
-        self.sync_task_projection(&cursor.task_id).await?;
-        Ok(())
-    }
-
     /// decision 138 / 票 08：把重试历史摘要写入任务目录 `retry-feedback.md`。
     ///
     /// 内容 = 该阶段各次 attempt 的 run 结果（失败原因）+ 最近一次 validate_output
     /// 的 blockers。与 `backtrack-feedback.md` 同构，由 architect-design 重入时注入 prompt。
-    async fn write_retry_feedback(&self, cursor: &NodeCursor) -> Result<()> {
+    pub(crate) async fn write_retry_feedback(&self, cursor: &NodeCursor) -> Result<()> {
         let stage = cursor.stage;
         let mut out = format!("# 重试历史摘要（{stage} 重试耗尽）\n\n");
         out.push_str("## 各次 attempt 的失败原因\n");
@@ -610,31 +449,6 @@ impl Store {
             .iter()
             .map(|s| (*s, entry_node(*s)))
             .collect()
-    }
-
-    /// decision 135：judge_disagreement 的 continue = 用户裁决「合格」，放行到下一阶段入口。
-    ///
-    /// 落点判定**复用** [`crate::pipeline::stage_landing`]（票 03：不再复刻游标落点逻辑），
-    /// 与 executor 的 `EdgeKind::Next` 跨阶段分支同源。不重跑 validate_output。
-    async fn advance_after_judge_continue(&self, cursor: &NodeCursor) -> Result<()> {
-        match crate::pipeline::stage_landing(cursor.stage) {
-            crate::pipeline::StageLanding::Split => {
-                self.split_cursors(&cursor.task_id).await?;
-                Ok(())
-            }
-            crate::pipeline::StageLanding::JoinBoundary => {
-                self.set_cursor_waiting_join(&cursor.cursor_id).await
-            }
-            crate::pipeline::StageLanding::StageEntry(stage, node) => {
-                self.set_cursor_stage(&cursor.cursor_id, stage, node)
-                    .await?;
-                self.reset_cursor_attempts(&cursor.cursor_id).await
-            }
-            crate::pipeline::StageLanding::Terminal => Err(Error::Cursor(format!(
-                "阶段 {} 没有下一阶段，judge_disagreement continue 无处放行（决策 135）",
-                cursor.stage
-            ))),
-        }
     }
 }
 

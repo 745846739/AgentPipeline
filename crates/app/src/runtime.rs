@@ -42,14 +42,23 @@ pub struct StewardActions {
     store: Store,
     settings: Settings,
     resume: ResumeHook,
+    /// 托管放行的 resume 与界面那颗钮共用同一份事件契约（决策 245）：
+    /// 少了它，「值班长替人按了」在实时流里是无声的。
+    sse: Arc<dyn SseSink>,
 }
 
 impl StewardActions {
-    pub fn new(store: Store, settings: Settings, resume: ResumeHook) -> Self {
+    pub fn new(
+        store: Store,
+        settings: Settings,
+        resume: ResumeHook,
+        sse: Arc<dyn SseSink>,
+    ) -> Self {
         StewardActions {
             store,
             settings,
             resume,
+            sse,
         }
     }
 }
@@ -68,6 +77,7 @@ impl agentpipeline_core::agent::tools::StewardActionRunner for StewardActions {
         let store = self.store.clone();
         let settings = self.settings.clone();
         let resume = self.resume.clone();
+        let sse = self.sse.clone();
         Box::pin(async move {
             let args: serde_json::Value = serde_json::from_str(&call.arguments).map_err(|e| {
                 agentpipeline_core::Error::Validation(format!("托管动作的参数不是合法 JSON：{e}"))
@@ -117,7 +127,8 @@ impl agentpipeline_core::agent::tools::StewardActionRunner for StewardActions {
                     .and_then(|v| v.as_str())
                     .map(str::to_string),
             };
-            let applied = apply_resume(&store, &settings, &resume, &task_id, &request).await?;
+            let applied =
+                apply_resume(&store, &settings, &resume, &sse, &task_id, &request).await?;
             Ok(agentpipeline_core::agent::tools::ToolOutcome::ok(format!(
                 "已自动放行（托管）：任务 {task_id}，动作 {}，游标 {}，{}",
                 applied.action,

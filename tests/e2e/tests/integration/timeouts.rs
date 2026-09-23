@@ -197,10 +197,15 @@ async fn e2e_24_resume_cooldown_detected_and_single_executor_guard() {
         )
         .await
         .unwrap();
-    f.store
-        .apply_resume(&cursor, ResumeAction::Continue, None, Some("补充"))
-        .await
-        .unwrap();
+    agentpipeline_core::pipeline::resume::apply_action(
+        &f.store,
+        &cursor,
+        ResumeAction::Continue,
+        None,
+        Some("补充"),
+    )
+    .await
+    .unwrap();
     let elapsed = f
         .store
         .seconds_since_last_user_resume("t24")

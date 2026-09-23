@@ -458,9 +458,27 @@ impl Executor {
     ) -> Result<()> {
         let mut reason = PendingReason::new(kind, cursor.stage, cursor.node, message);
         reason.context = context;
-        self.store
-            .set_cursor_pending(&cursor.cursor_id, &reason)
-            .await?;
+        self.pend_reason(cursor, reason).await
+    }
+
+    /// 把一条**现成的** `PendingReason` 挂上（决策 82 / 决策 245）。
+    ///
+    /// 落库走 [`crate::pipeline::advance`]（一笔事务），同步投影与 SSE 在门外——
+    /// 这里曾有一份手抄的 `set_cursor_pending` + `sync_task_projection` + `emit` 三连，
+    /// 与本文件的 `pend_cursor_with_context` 逐字重复。
+    async fn pend_reason(&self, cursor: &NodeCursor, reason: PendingReason) -> Result<()> {
+        crate::pipeline::advance(
+            &self.store,
+            &cursor.task_id,
+            cursor,
+            crate::pipeline::Landing::Pause {
+                reason: reason.clone(),
+            },
+            // 挂起不写流转行，这个 trigger 不会被读到（门的签名对五种落点是同一个）。
+            crate::types::TransitionTrigger::AutoResume,
+            None,
+        )
+        .await?;
         self.store.sync_task_projection(&cursor.task_id).await?;
         self.sse.emit(SseEvent::Pending {
             task_id: cursor.task_id.clone(),
@@ -2796,17 +2814,10 @@ impl Executor {
                 (crate::pipeline::route(cursor, &ctx), None)
             }
             NodeOutput::Edge(edge, reason) => (edge, reason),
+            // 节点自己已经把整条 `PendingReason` 造好了（含构造者指定的 stage / node，
+            // 例如 conflict_wait 写死 architect-design.execute），原样挂上。
             NodeOutput::Pending(reason) => {
-                self.store
-                    .set_cursor_pending(&cursor.cursor_id, &reason)
-                    .await?;
-                self.store.sync_task_projection(&task.id).await?;
-                self.sse.emit(SseEvent::Pending {
-                    task_id: task.id.clone(),
-                    branch: cursor.branch.clone(),
-                    cursor_id: cursor.cursor_id.clone(),
-                    reason,
-                });
+                self.pend_reason(cursor, reason).await?;
                 return Ok(());
             }
         };
@@ -2829,23 +2840,17 @@ impl Executor {
         match edge {
             EdgeKind::NoOp => {}
             EdgeKind::Retry => {
-                // 阶段内重试：attempts +1，回到 execute（重试回边 validate_output → execute）
-                self.store
-                    .increment_cursor_attempts(&cursor.cursor_id)
-                    .await?;
-                self.store
-                    .move_cursor(&cursor.cursor_id, cursor.stage, Node::Execute)
-                    .await?;
-                self.store
-                    .insert_transition(
-                        task_id,
-                        &cursor.branch,
-                        Some((cursor.stage, cursor.node)),
-                        (cursor.stage, Node::Execute),
-                        crate::types::TransitionTrigger::NodeRetry,
-                        None,
-                    )
-                    .await?;
+                // 阶段内重试：attempts +1，回到 execute（重试回边 validate_output → execute）。
+                // 三笔写收成一笔事务——这是决策 245 的直接动因。
+                crate::pipeline::advance(
+                    &self.store,
+                    task_id,
+                    cursor,
+                    crate::pipeline::Landing::Retry,
+                    crate::types::TransitionTrigger::NodeRetry,
+                    None,
+                )
+                .await?;
             }
             EdgeKind::Pending(kind) => {
                 let message = pending_message(kind);
@@ -2910,37 +2915,29 @@ impl Executor {
                         }
                         crate::pipeline::StageLanding::JoinBoundary => {
                             // 下一阶段是 join：本游标置 waiting_join（决策 107，唯一写入路径）
-                            self.store
-                                .set_cursor_waiting_join(&cursor.cursor_id)
-                                .await?;
-                            self.store
-                                .insert_transition(
-                                    task_id,
-                                    &cursor.branch,
-                                    Some((cursor.stage, cursor.node)),
-                                    (crate::pipeline::JOIN_STAGE, Node::Execute),
-                                    crate::types::TransitionTrigger::Normal,
-                                    Some("到达 join 边界"),
-                                )
-                                .await?;
+                            crate::pipeline::advance(
+                                &self.store,
+                                task_id,
+                                cursor,
+                                crate::pipeline::Landing::JoinBoundary { skipped: false },
+                                crate::types::TransitionTrigger::Normal,
+                                Some("到达 join 边界"),
+                            )
+                            .await?;
                             self.emit_cursor_changed(task_id, &cursor.branch).await?;
                         }
                         crate::pipeline::StageLanding::StageEntry(next, next_node) => {
                             let from = (cursor.stage, cursor.node);
                             let to = (next, next_node);
-                            self.store
-                                .set_cursor_stage(&cursor.cursor_id, to.0, to.1)
-                                .await?;
-                            self.store
-                                .insert_transition(
-                                    task_id,
-                                    &cursor.branch,
-                                    Some(from),
-                                    to,
-                                    crate::types::TransitionTrigger::Normal,
-                                    None,
-                                )
-                                .await?;
+                            crate::pipeline::advance(
+                                &self.store,
+                                task_id,
+                                cursor,
+                                crate::pipeline::Landing::Entry(next, next_node),
+                                crate::types::TransitionTrigger::Normal,
+                                None,
+                            )
+                            .await?;
                             self.sse.emit(SseEvent::StageChanged {
                                 task_id: task_id.clone(),
                                 branch: cursor.branch.clone(),
@@ -3016,30 +3013,6 @@ impl Executor {
                     from_node: Some(from.1),
                     to_stage: Stage::Test,
                     to_node: Node::Execute,
-                    trigger: "kickback".into(),
-                    reason: None,
-                });
-            }
-            EdgeKind::Backtrack => {
-                // 双方一起回 architect-design.validate_input（决策 83 / 90）
-                let main = self.store.backtrack_cursors(task_id).await?;
-                self.store
-                    .insert_transition(
-                        task_id,
-                        &main.branch,
-                        Some((cursor.stage, cursor.node)),
-                        (Stage::ArchitectDesign, Node::ValidateInput),
-                        crate::types::TransitionTrigger::Kickback,
-                        Some("sync-check backtrack（决策 83）"),
-                    )
-                    .await?;
-                self.sse.emit(SseEvent::StageChanged {
-                    task_id: task_id.clone(),
-                    branch: main.branch.clone(),
-                    from_stage: Some(cursor.stage),
-                    from_node: Some(cursor.node),
-                    to_stage: Stage::ArchitectDesign,
-                    to_node: Node::ValidateInput,
                     trigger: "kickback".into(),
                     reason: None,
                 });

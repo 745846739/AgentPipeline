@@ -42,8 +42,10 @@ impl MetadataView {
         }
     }
 
-    /// sync-check 是纯代码节点（G7）：`proceed` 即"放行"，`backtrack` 即"不放行"。
-    /// 路由据此在 [`EdgeKind::Next`] 与 [`EdgeKind::Backtrack`] 之间选择（决策 83）。
+    /// sync-check 判定投影到 [`MetadataView::passed`]（`proceed` 即"放行"，决策 83）。
+    ///
+    /// sync-check **不占游标行**（决策 107），回溯由 [`crate::pipeline`] 的 `advance_join`
+    /// 按 [`SyncDecisionKind`] 落库，不经 [`route`]；本方法只提供字段投影。
     pub fn from_sync_decision(d: &SyncDecision) -> Self {
         MetadataView {
             passed: d.decision == SyncDecisionKind::Proceed,
@@ -112,14 +114,8 @@ pub fn route(cursor: &NodeCursor, ctx: &RouteContext) -> EdgeKind {
             route_code_gate(cursor, ctx)
         }
         (Stage::Merge, Node::Execute) => route_merge(ctx),
-        // sync-check 是纯代码节点（G7）：backtrack 退回 architect-design.validate_input（决策 83）
-        (Stage::SyncCheck, Node::Execute) => {
-            if ctx.metadata.passed {
-                EdgeKind::Next
-            } else {
-                EdgeKind::Backtrack
-            }
-        }
+        // sync-check 不占游标行（决策 107）：execute_node 直接报错拦截，
+        // 汇聚与回溯由 advance_join 经 SyncDecisionKind 落库，永远到不了这里。
         // review 的 validate_output 是纯代码判定（approved）。不通过不是"重试"，
         // 而是上交用户裁决：pending(user_decision, context.kind = "review")（决策 2 / 131）。
         (Stage::Review, Node::ValidateOutput) => {
@@ -394,32 +390,7 @@ mod tests {
         assert_eq!(route_merge(&ctx_with(m)), EdgeKind::GotoTest);
     }
 
-    // ── sync-check backtrack / review 判定 ──
-
-    fn sync_decision(kind: SyncDecisionKind) -> SyncDecision {
-        SyncDecision {
-            decision: kind,
-            dev_readiness: true,
-            test_readiness: true,
-            dev_blockers: Vec::new(),
-            test_blockers: Vec::new(),
-            warnings: Vec::new(),
-        }
-    }
-
-    #[test]
-    fn sync_check_backtrack_is_routable() {
-        // 决策 83：backtrack 是独立边，不能落进 `_ => Next`。
-        let c = cursor(Stage::SyncCheck, Node::Execute, 0);
-        let mut ctx = RouteContext {
-            validate_retry_max: 3,
-            metadata: MetadataView::from_sync_decision(&sync_decision(SyncDecisionKind::Backtrack)),
-            merge: plain_merge(),
-        };
-        assert_eq!(route(&c, &ctx), EdgeKind::Backtrack);
-        ctx.metadata = MetadataView::from_sync_decision(&sync_decision(SyncDecisionKind::Proceed));
-        assert_eq!(route(&c, &ctx), EdgeKind::Next);
-    }
+    // ── review 判定 ──
 
     #[test]
     fn review_failure_pends_for_user_not_retry() {

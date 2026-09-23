@@ -68,10 +68,15 @@ async fn e2e_05_merge_rebase_conflict_kicks_back_develop_with_conflict_files() {
         });
     f.agent.set_script(test_script);
     let test_cursor = f.sole_cursor("t5").await;
-    f.store
-        .apply_resume(&test_cursor, ResumeAction::Continue, None, None)
-        .await
-        .unwrap();
+    agentpipeline_core::pipeline::resume::apply_action(
+        &f.store,
+        &test_cursor,
+        ResumeAction::Continue,
+        None,
+        None,
+    )
+    .await
+    .unwrap();
     f.executor.run("t5").await.unwrap();
 
     let transitions = f.store.list_transitions("t5").await.unwrap();
@@ -171,10 +176,15 @@ async fn e2e_10_dirty_worktree_pends_for_user_and_blocks_merge() {
     std::fs::remove_file(f.repo.path().join("uncommitted.txt")).unwrap();
     assert!(!Git.is_dirty(f.repo.path()).await.unwrap());
     let cursor = f.sole_cursor("t10").await;
-    f.store
-        .apply_resume(&cursor, ResumeAction::Continue, None, None)
-        .await
-        .unwrap();
+    agentpipeline_core::pipeline::resume::apply_action(
+        &f.store,
+        &cursor,
+        ResumeAction::Continue,
+        None,
+        None,
+    )
+    .await
+    .unwrap();
     f.executor.run("t10").await.unwrap();
 
     assert_eq!(

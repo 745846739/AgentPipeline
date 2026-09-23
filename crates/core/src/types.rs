@@ -269,10 +269,6 @@ pub enum EdgeKind {
     KickbackDevelop,
     /// 跳回 test.execute（merge 测试闸门失败，决策 85）。
     GotoTest,
-    /// 回溯：sync-check 判定两个设计分支冲突，退回 architect-design.validate_input（决策 83）。
-    ///
-    /// 与 [`EdgeKind::KickbackDevelop`] 区分：那条边只回开发，这条回架构重跑设计。
-    Backtrack,
 }
 
 /// pending 原因类型（§4.2 PendingReason.type）。

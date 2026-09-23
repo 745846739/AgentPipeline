@@ -18,6 +18,8 @@ use crate::storage::Store;
 use crate::types::{NodeStatus, PendingContext, PendingKind, PendingReason, Task};
 use crate::{Error, Result};
 
+use super::advance::{advance, Landing};
+
 /// 一次「卡住」的证据（[`stuck_evidence`] 的产出）。
 ///
 /// 待办表（票 05）与 `unstick`（票 09）共用它：**判据只有一处实现**，否则「报出来的卡住」
@@ -168,6 +170,11 @@ pub async fn unstick(
     store.release_executor(task_id).await?;
 
     // 游标转 pending：原因是**人话**，且带上证据里的关键事实（哪个 run、停了多久）。
+    // 落库走 `advance` 那扇门（决策 245），同步投影在门外。
+    //
+    // **这里不发 SSE，与 resume 那条的处置不同**：`unstick` 的调用方是值班长的动作面
+    // （决策 210⑧），事件面怎么设计是另一件事，本票不扩大范围——resume 补 SSE 是因为
+    // 「人按了按钮却毫无反应」，而这条路本来就只有值班长在走。
     let cursor = store.get_cursor(&evidence.cursor_id).await?;
     let reason = PendingReason::new(
         PendingKind::UserDecision,
@@ -187,9 +194,16 @@ pub async fn unstick(
         },
     )
     .with_context(PendingContext::with_kind(UNSTICK_CONTEXT_KIND));
-    store
-        .set_cursor_pending(&evidence.cursor_id, &reason)
-        .await?;
+    advance(
+        store,
+        task_id,
+        &cursor,
+        Landing::Pause { reason },
+        // 挂起不写流转行，这个 trigger 不会被读到（门的签名对各落点是同一个）。
+        crate::types::TransitionTrigger::AutoResume,
+        None,
+    )
+    .await?;
     store.sync_task_projection(task_id).await?;
 
     Ok(Unstuck {

@@ -341,11 +341,17 @@ impl KanbanScheduler {
                 .await?;
             (self.resume)(task_id);
         } else {
-            // 耗尽：pending 挂在该 run 所属的**游标**上（决策 82）
-            self.store
-                .set_cursor_pending(
-                    cursor_id,
-                    &PendingReason::new(
+            // 耗尽：pending 挂在该 run 所属的**游标**上（决策 82）。
+            // 落库走 `advance` 那扇门（决策 245）；同步投影与事件留在门外——门不发 SSE。
+            // 注意 reason 里的 stage/node 取自**run**而不是游标，所以 `Landing::Pause`
+            // 整条带走 `PendingReason`，不按游标重算。
+            let cursor = self.store.get_cursor(cursor_id).await?;
+            crate::pipeline::advance(
+                &self.store,
+                task_id,
+                &cursor,
+                crate::pipeline::Landing::Pause {
+                    reason: PendingReason::new(
                         PendingKind::Timeout,
                         run.stage,
                         run.node,
@@ -355,8 +361,12 @@ impl KanbanScheduler {
                             run.attempt
                         ),
                     ),
-                )
-                .await?;
+                },
+                // 挂起不写流转行，这个 trigger 不会被读到（门的签名对各落点是同一个）。
+                crate::types::TransitionTrigger::Timeout,
+                None,
+            )
+            .await?;
             self.store.sync_task_projection(task_id).await?;
             report.timeout_pending_cursors.push(cursor_id.to_string());
             self.emit_pending(task_id, cursor_id).await?;

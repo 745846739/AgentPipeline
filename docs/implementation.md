@@ -144,8 +144,12 @@ async fn run_executor_inner(task_id: &str, db: &SqlitePool) -> Result<()> {
         for (cursor, result) in results {
             match result {
                 Ok(node_result) => {
-                    // 路由到 next / retry / pending / waiting_join，不改动其他游标
-                    advance_cursor(db, cursor, node_result, &graph()).await?;
+                    // 路由算出落点，「落点 → 游标行 + 流转行」由 `pipeline::advance`
+                    // 收成**一笔事务**（决策 245）。签名是
+                    // `advance(store, task_id, &cursor, landing, trigger, reason)`：
+                    // 不带 `&graph()`——落点查的是 `pipeline::landing` 那张表，
+                    // `pipeline/graph.rs` 是生产零调用方的死镜像（评审候选 3）。
+                    advance(store, task_id, &cursor, landing, trigger, reason).await?;
                 }
                 Err(node_error) => {
                     // 节点级重试已耗尽（agent_retry_max）→ 只阻塞这一条游标
@@ -174,7 +178,7 @@ async fn run_executor_inner(task_id: &str, db: &SqlitePool) -> Result<()> {
 | attempts 计数 | `validate_attempts` **每游标独立**；`validate_retry_max` 按游标判定（决策 82） |
 | pending 归属 | pending 挂在**游标**上（`kanban_node_cursors.pending_reason_json`）；任务整体 `status = pending` 是"任一游标被阻塞"的投影（决策 82） |
 | 分支失败隔离 | 一个分支 `retry_exhausted` / 超时进 pending 时，另一分支**不被打断**，跑完当前阶段后停在 join 边界（决策 82） |
-| **`waiting_join` 的写入** | 由 `advance_cursor` 写入：`next` 路由发现下一阶段是 join 节点时，把该游标置为 `waiting_join` 而非继续（决策 107）。没有任何其他代码路径写这个状态 |
+| **`waiting_join` 的写入** | 由 `pipeline::advance` 的 `Landing::JoinBoundary` 写入（`crates/core/src/pipeline/advance.rs`，决策 245）：`next` 路由发现下一阶段是 join 节点时，把该游标置为 `waiting_join` 而非继续（决策 107）。除这扇门之外没有别的写入点——resume 的并行分支 `skip` 走的也是同一扇门（`Landing::JoinBoundary { skipped: true }`） |
 | join 条件 | 所有分支游标都到达 join 边界（`waiting_join`）且均无 pending，汇聚节点才执行一次（决策 83） |
 | join 的游标归属 | 汇聚节点 `sync-check` **不占游标行**（决策 107）；它落库为一次 run（`agent_type="system"`，`cursor_id` = 同事务内新建的 main 游标，决策 113），推进时在一个事务内归档分支游标并插入单条 main |
 | 焦点游标 | 取 `updated_at` 最新的 pending 游标，无 pending 时取 `updated_at` 最新的活跃游标；串行时即 main（决策 92 / 130） |

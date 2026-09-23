@@ -83,12 +83,6 @@ pub fn build_pipeline_graph() -> PipelineGraph {
         get((Stage::Develop, Node::Execute)),
         EdgeKind::KickbackDevelop,
     );
-    // sync-check backtrack 回 architect-design.validate_input（决策 83）
-    g.add_edge(
-        get((Stage::SyncCheck, Node::Execute)),
-        get((Stage::ArchitectDesign, Node::ValidateInput)),
-        EdgeKind::Backtrack,
-    );
 
     g
 }
@@ -168,20 +162,6 @@ mod tests {
         assert!(succ
             .iter()
             .any(|(s, _, k)| *s == Stage::Test && *k == EdgeKind::GotoTest));
-    }
-
-    #[test]
-    fn sync_check_backtrack_edge_returns_to_architect() {
-        // 决策 83：backtrack 的落点是 architect-design.validate_input，标签是 Backtrack
-        // （与 merge lint 失败的 KickbackDevelop 区分开）。
-        let g = build_pipeline_graph();
-        let succ = successors(&g, Stage::SyncCheck, Node::Execute);
-        assert!(
-            succ.iter().any(|(s, n, k)| *s == Stage::ArchitectDesign
-                && *n == Node::ValidateInput
-                && *k == EdgeKind::Backtrack),
-            "sync-check 缺少 backtrack 边：{succ:?}"
-        );
     }
 
     #[test]

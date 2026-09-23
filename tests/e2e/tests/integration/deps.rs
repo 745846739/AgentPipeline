@@ -70,10 +70,15 @@ async fn e2e_19_dep_failed_pends_main_cursor_continue_and_retry_recover() {
     assert!(names.contains(&"continue".to_string()));
 
     // continue = 忽略失败依赖 → 置回 queued 重新准入（决策 116）
-    f.store
-        .apply_resume(&cursor, ResumeAction::Continue, None, None)
-        .await
-        .unwrap();
+    agentpipeline_core::pipeline::resume::apply_action(
+        &f.store,
+        &cursor,
+        ResumeAction::Continue,
+        None,
+        None,
+    )
+    .await
+    .unwrap();
     assert_eq!(
         f.store.get_task("w19b").await.unwrap().status,
         TaskStatus::Queued,
@@ -151,10 +156,15 @@ async fn e2e_19_dep_cancelled_drops_wait_for_retry_action() {
     assert_eq!(names, vec!["continue", "cancel"]);
 
     // 决策 116 / 票 06：cancelled 分支的 continue 同样落 dependency_overridden 警告
-    f.store
-        .apply_resume(&cursor, ResumeAction::Continue, None, None)
-        .await
-        .unwrap();
+    agentpipeline_core::pipeline::resume::apply_action(
+        &f.store,
+        &cursor,
+        ResumeAction::Continue,
+        None,
+        None,
+    )
+    .await
+    .unwrap();
     let transitions = f.store.list_transitions("w19c").await.unwrap();
     assert!(
         transitions.iter().any(|t| {

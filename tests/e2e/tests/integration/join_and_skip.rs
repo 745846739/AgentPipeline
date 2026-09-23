@@ -86,10 +86,15 @@ async fn e2e_11_architect_skip_splits_into_parallel_branches() {
     );
 
     // skip 落点表（决策 93）：architect-design → 分裂，不越过 join
-    f.store
-        .apply_resume(&cursor, ResumeAction::Skip, None, None)
-        .await
-        .unwrap();
+    agentpipeline_core::pipeline::resume::apply_action(
+        &f.store,
+        &cursor,
+        ResumeAction::Skip,
+        None,
+        None,
+    )
+    .await
+    .unwrap();
 
     let live = f.store.load_live_cursors("js1").await.unwrap();
     assert_eq!(live.len(), 2, "分裂为两条并行分支");
@@ -148,10 +153,15 @@ async fn e2e_11_develop_design_skip_marks_skipped_to_join_and_proceeds() {
     assert_eq!(test.status, CursorStatus::WaitingJoin);
 
     // 用户对 develop-design 分支 skip：置 waiting_join + skipped_to_join（决策 93）
-    f.store
-        .apply_resume(&dev, ResumeAction::Skip, None, None)
-        .await
-        .unwrap();
+    agentpipeline_core::pipeline::resume::apply_action(
+        &f.store,
+        &dev,
+        ResumeAction::Skip,
+        None,
+        None,
+    )
+    .await
+    .unwrap();
     let dev = f
         .live_cursor("js2", NodeCursor::BRANCH_DEVELOP_DESIGN)
         .await;
@@ -241,10 +251,15 @@ async fn e2e_11_test_design_skip_is_readiness_true_without_refs_check() {
 
     let test = f.live_cursor("js3", NodeCursor::BRANCH_TEST_DESIGN).await;
     assert_eq!(test.status, CursorStatus::Pending);
-    f.store
-        .apply_resume(&test, ResumeAction::Skip, None, None)
-        .await
-        .unwrap();
+    agentpipeline_core::pipeline::resume::apply_action(
+        &f.store,
+        &test,
+        ResumeAction::Skip,
+        None,
+        None,
+    )
+    .await
+    .unwrap();
 
     // join 后脚本耗尽 → pending(retry_exhausted)，停在 develop.execute 便于断言
     f.agent.set_script(Script::new());
@@ -322,10 +337,15 @@ async fn e2e_12_pending_branch_resumes_then_join_proceeds() {
         });
     dev_design_ok(&mut script_b);
     f.agent.set_script(script_b);
-    f.store
-        .apply_resume(&dev, ResumeAction::Continue, None, None)
-        .await
-        .unwrap();
+    agentpipeline_core::pipeline::resume::apply_action(
+        &f.store,
+        &dev,
+        ResumeAction::Continue,
+        None,
+        None,
+    )
+    .await
+    .unwrap();
     f.executor.run("js4").await.unwrap();
 
     assert_eq!(
@@ -437,10 +457,15 @@ async fn e2e_02_sync_check_backtrack_resets_to_architect_and_marks_docs_stale() 
             blockers: vec!["补充：明确部署环境".into()],
         });
     f.agent.set_script(script_b);
-    f.store
-        .apply_resume(&main, ResumeAction::Continue, None, None)
-        .await
-        .unwrap();
+    agentpipeline_core::pipeline::resume::apply_action(
+        &f.store,
+        &main,
+        ResumeAction::Continue,
+        None,
+        None,
+    )
+    .await
+    .unwrap();
     f.executor.run("js5").await.unwrap();
 
     let main = f.sole_cursor("js5").await;

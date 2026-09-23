@@ -282,6 +282,22 @@ impl Store {
 
     /// 跨阶段跳转：置 stage / node 并把 `validate_attempts` 归零（决策 43）。
     pub async fn set_cursor_stage(&self, cursor_id: &str, stage: Stage, node: Node) -> Result<()> {
+        let mut tx = self.begin_write().await?;
+        self.set_cursor_stage_in_tx(&mut tx, cursor_id, stage, node)
+            .await?;
+        tx.commit().await?;
+        Ok(())
+    }
+
+    /// [`Store::set_cursor_stage`] 的行级原语（决策 245）：SQL 只此一处，
+    /// 由 `pipeline::advance` 在自己的事务里调用。
+    pub(crate) async fn set_cursor_stage_in_tx(
+        &self,
+        tx: &mut sqlx::SqliteConnection,
+        cursor_id: &str,
+        stage: Stage,
+        node: Node,
+    ) -> Result<()> {
         sqlx::query(
             "UPDATE kanban_node_cursors
              SET stage = ?, node = ?, validate_attempts = 0, updated_at = ?
@@ -291,13 +307,27 @@ impl Store {
         .bind(node.as_str())
         .bind(ts(self.now()))
         .bind(cursor_id)
-        .execute(self.pool())
+        .execute(&mut *tx)
         .await?;
         Ok(())
     }
 
     /// 阶段内重试：只加 attempts，不改 stage / node。
     pub async fn increment_cursor_attempts(&self, cursor_id: &str) -> Result<u32> {
+        let mut tx = self.begin_write().await?;
+        let attempts = self
+            .increment_cursor_attempts_in_tx(&mut tx, cursor_id)
+            .await?;
+        tx.commit().await?;
+        Ok(attempts)
+    }
+
+    /// [`Store::increment_cursor_attempts`] 的行级原语（决策 245）。
+    pub(crate) async fn increment_cursor_attempts_in_tx(
+        &self,
+        tx: &mut sqlx::SqliteConnection,
+        cursor_id: &str,
+    ) -> Result<u32> {
         let attempts: i64 = sqlx::query_scalar(
             "UPDATE kanban_node_cursors
              SET validate_attempts = validate_attempts + 1, updated_at = ?
@@ -306,7 +336,7 @@ impl Store {
         )
         .bind(ts(self.now()))
         .bind(cursor_id)
-        .fetch_one(self.pool())
+        .fetch_one(&mut *tx)
         .await?;
         Ok(attempts as u32)
     }
@@ -314,6 +344,21 @@ impl Store {
     /// 仅移动 stage / node，**不重置 attempts**（阶段内重试回边 validate_output → execute；
     /// 跨阶段跳转必须用 [`Store::set_cursor_stage`]，它按决策 43 归零）。
     pub async fn move_cursor(&self, cursor_id: &str, stage: Stage, node: Node) -> Result<()> {
+        let mut tx = self.begin_write().await?;
+        self.move_cursor_in_tx(&mut tx, cursor_id, stage, node)
+            .await?;
+        tx.commit().await?;
+        Ok(())
+    }
+
+    /// [`Store::move_cursor`] 的行级原语（决策 245）。
+    pub(crate) async fn move_cursor_in_tx(
+        &self,
+        tx: &mut sqlx::SqliteConnection,
+        cursor_id: &str,
+        stage: Stage,
+        node: Node,
+    ) -> Result<()> {
         sqlx::query(
             "UPDATE kanban_node_cursors SET stage = ?, node = ?, updated_at = ? WHERE cursor_id = ?",
         )
@@ -321,22 +366,48 @@ impl Store {
         .bind(node.as_str())
         .bind(ts(self.now()))
         .bind(cursor_id)
-        .execute(self.pool())
+        .execute(&mut *tx)
         .await?;
         Ok(())
     }
 
     pub async fn reset_cursor_attempts(&self, cursor_id: &str) -> Result<()> {
+        let mut tx = self.begin_write().await?;
+        self.reset_cursor_attempts_in_tx(&mut tx, cursor_id).await?;
+        tx.commit().await?;
+        Ok(())
+    }
+
+    /// [`Store::reset_cursor_attempts`] 的行级原语（决策 245）。
+    pub(crate) async fn reset_cursor_attempts_in_tx(
+        &self,
+        tx: &mut sqlx::SqliteConnection,
+        cursor_id: &str,
+    ) -> Result<()> {
         sqlx::query("UPDATE kanban_node_cursors SET validate_attempts = 0, updated_at = ? WHERE cursor_id = ?")
             .bind(ts(self.now()))
             .bind(cursor_id)
-            .execute(self.pool())
+            .execute(&mut *tx)
             .await?;
         Ok(())
     }
 
     /// 置 pending（挂在该游标上，决策 82）。
     pub async fn set_cursor_pending(&self, cursor_id: &str, reason: &PendingReason) -> Result<()> {
+        let mut tx = self.begin_write().await?;
+        self.set_cursor_pending_in_tx(&mut tx, cursor_id, reason)
+            .await?;
+        tx.commit().await?;
+        Ok(())
+    }
+
+    /// [`Store::set_cursor_pending`] 的行级原语（决策 245）。
+    pub(crate) async fn set_cursor_pending_in_tx(
+        &self,
+        tx: &mut sqlx::SqliteConnection,
+        cursor_id: &str,
+        reason: &PendingReason,
+    ) -> Result<()> {
         sqlx::query(
             "UPDATE kanban_node_cursors
              SET status = 'pending', pending_reason_json = ?, updated_at = ?
@@ -345,7 +416,7 @@ impl Store {
         .bind(encode_pending(&Some(reason.clone())))
         .bind(ts(self.now()))
         .bind(cursor_id)
-        .execute(self.pool())
+        .execute(&mut *tx)
         .await?;
         Ok(())
     }
@@ -468,6 +539,19 @@ impl Store {
     /// 并行分支 skip：置 `waiting_join` + `skipped_to_join = 1`（决策 93），
     /// **不改写产出元数据**（不伪造 readiness）。
     pub async fn mark_cursor_skipped_to_join(&self, cursor_id: &str) -> Result<()> {
+        let mut tx = self.begin_write().await?;
+        self.mark_cursor_skipped_to_join_in_tx(&mut tx, cursor_id)
+            .await?;
+        tx.commit().await?;
+        Ok(())
+    }
+
+    /// [`Store::mark_cursor_skipped_to_join`] 的行级原语（决策 245）。
+    pub(crate) async fn mark_cursor_skipped_to_join_in_tx(
+        &self,
+        tx: &mut sqlx::SqliteConnection,
+        cursor_id: &str,
+    ) -> Result<()> {
         sqlx::query(
             "UPDATE kanban_node_cursors
              SET status = 'waiting_join', skipped_to_join = 1,
@@ -476,13 +560,26 @@ impl Store {
         )
         .bind(ts(self.now()))
         .bind(cursor_id)
-        .execute(self.pool())
+        .execute(&mut *tx)
         .await?;
         Ok(())
     }
 
     /// `advance_cursor` 发现 next 是 join 时的唯一写入路径（决策 107）。
     pub async fn set_cursor_waiting_join(&self, cursor_id: &str) -> Result<()> {
+        let mut tx = self.begin_write().await?;
+        self.set_cursor_waiting_join_in_tx(&mut tx, cursor_id)
+            .await?;
+        tx.commit().await?;
+        Ok(())
+    }
+
+    /// [`Store::set_cursor_waiting_join`] 的行级原语（决策 245）。
+    pub(crate) async fn set_cursor_waiting_join_in_tx(
+        &self,
+        tx: &mut sqlx::SqliteConnection,
+        cursor_id: &str,
+    ) -> Result<()> {
         sqlx::query(
             "UPDATE kanban_node_cursors
              SET status = 'waiting_join', updated_at = ?
@@ -490,7 +587,7 @@ impl Store {
         )
         .bind(ts(self.now()))
         .bind(cursor_id)
-        .execute(self.pool())
+        .execute(&mut *tx)
         .await?;
         Ok(())
     }

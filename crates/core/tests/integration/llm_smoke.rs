@@ -547,8 +547,13 @@ async fn auto_answer_pending(
         "自动应答 #{:?}：{} 的 {}（{}）target={target:?}",
         pending.kind, pending.stage, choice.action, choice.label
     );
-    store
-        .apply_resume(&cursor, action, target, Some("（真模型冒烟自动应答）"))
-        .await
-        .unwrap();
+    agentpipeline_core::pipeline::resume::apply_action(
+        store,
+        &cursor,
+        action,
+        target,
+        Some("（真模型冒烟自动应答）"),
+    )
+    .await
+    .unwrap();
 }
