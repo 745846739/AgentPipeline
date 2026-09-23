@@ -85,7 +85,7 @@ graph TD
 | G12 | 工作目录显式告知 | agent 的 system prompt 和 user prompt 必须显式包含 worktree 和任务目录的**绝对路径**，不允许 agent 自行猜测路径 |
 | G13 | 重试分层 | 工具调用失败在 agent loop 内重试（最多 `tool_retry_max` 次），节点级重试只处理 agent loop 整体失败；单次工具失败不得直接触发节点重试 |
 | G14 | 减少 pending | pending 需要人工介入，成本高。设计时优先用自动重试/自动恢复解决，只有确实需要用户决策或补充信息时才进 pending |
-| G15 | 独立 Graph | kanban 使用独立的 petgraph DAG 图，各阶段无长期记忆，节点级独立对话 |
+| G15 | 独立 Graph | kanban 使用独立的 DAG 图（静态落点表与条件边，决策 248），各阶段无长期记忆，节点级独立对话 |
 
 ---
 

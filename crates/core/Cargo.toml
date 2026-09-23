@@ -11,7 +11,6 @@ anyhow.workspace = true
 chrono.workspace = true
 futures.workspace = true
 git2.workspace = true
-petgraph.workspace = true
 regex.workspace = true
 reqwest.workspace = true
 schemars.workspace = true

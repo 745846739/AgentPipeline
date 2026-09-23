@@ -4,7 +4,6 @@ pub mod advance;
 pub mod cursor;
 pub mod executor;
 pub mod foreman;
-pub mod graph;
 pub mod landing;
 pub mod proposals;
 pub mod pseudo;
@@ -26,7 +25,6 @@ pub use foreman::{
     ForemanRunner, ForemanTrace, ForemanTurn, FOREMAN_AGENT_TYPE, FOREMAN_ATTRIBUTION_MARK,
     FOREMAN_MAX_ROUNDS, FOREMAN_PERSONA, FOREMAN_STAGE_KEY, FOREMAN_TOOL_SPECS,
 };
-pub use graph::{build_pipeline_graph, PipelineGraph};
 pub use landing::{
     entry_node, next_is_join, next_stages, nodes_for_stage, skip_landing, stage_has_node,
     stage_landing, SkipLanding, StageLanding, JOIN_STAGE,

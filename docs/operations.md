@@ -725,7 +725,7 @@ impl Default for NotificationPolicy {
 
 **kanban agent 的核心特征：**
 
-- **独立图：** kanban 使用独立的 petgraph DAG，各阶段无长期记忆
+- **独立图：** kanban 使用独立的 DAG（静态落点表，决策 248），各阶段无长期记忆
 - **节点级独立对话：** 每次 agent 调用使用独立的对话上下文，不跨节点累积
 - **无记忆绑定：** 不绑定 memory_retrieve，各阶段无记忆写回
 - **pending 机制：** 通过 pending_reason 实现人工介入（§11.3）

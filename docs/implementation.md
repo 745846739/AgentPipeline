@@ -8,7 +8,7 @@
 
 ```
 ┌──────────────────────────────────────────────────────┐
-│                  petgraph DAG（状态流转）               │
+│                  静态拓扑 DAG（状态流转）               │
 │                                                      │
 │  validate_input → execute → validate_output          │
 │         ↑                     │                      │
@@ -47,32 +47,20 @@
 
 > **单执行者保证（决策 36）：** 用户 resume 与 scheduler tick 都可能触发 `run_executor`，因此每个任务同一时刻只允许一个 executor 运行——进程内用 `Mutex<HashSet<task_id>>` 去重，DB 层用乐观锁（`UPDATE ... WHERE executor_owner IS NULL`）兜底跨进程场景。
 
-### 11.2 状态流转 → petgraph DAG + 自定义 executor
+### 11.2 状态流转 → 静态拓扑表 + 自定义 executor
 
-使用 petgraph 构建 DAG，自定义 executor 遍历图并执行节点：
+拓扑与走向都由**静态表**给出，executor **不遍历图**——它按当前游标查表取落点，
+交 `pipeline::advance` 一笔事务写入（决策 245 / 248）：
 
 ```rust
-// crates/core/src/pipeline/graph.rs
+// crates/core/src/pipeline/landing.rs——落点表：跨阶段去哪、并行怎么分叉与汇合
+pub fn next_stages(stage: Stage) -> &'static [Stage] { /* 每阶段一行，全表由单测钉住 */ }
+pub fn stage_landing(stage: Stage) -> StageLanding { /* Split / JoinBoundary / StageEntry / Terminal */ }
 
-use petgraph::graph::DiGraph;
-
-pub fn build_pipeline_graph() -> DiGraph<String, &str> {
-    let mut graph = DiGraph::new();
-
-    // 添加节点：每个阶段的 3 个节点
-    let stages = ["init", "architect-design", "develop-design", "test-design",
-                   "sync-check", "develop", "review", "test", "merge", "done"];
-    let nodes = ["validate_input", "execute", "validate_output"];
-
-    // ... 添加节点和边 ...
-
-    // 条件边通过边权重标记：
-    // "next" → 进入下一阶段
-    // "retry" → 重试 execute
-    // "pending" → 进入 pending 状态
-    // "backtrack" → 回退到 architect-design
-
-    graph
+// crates/core/src/pipeline/routes.rs——条件边：此刻该走哪条（决策 39：显式 Rust 路由函数）
+pub fn route(cursor: &NodeCursor, ctx: &RouteContext) -> EdgeKind {
+    // None→NoOp、Approved→Next、gate 失败→KickbackDevelop / GotoTest、
+    // attempts 耗尽→Pending……全分支单测见 routes.rs（testing.md §5）
 }
 ```
 
@@ -147,8 +135,8 @@ async fn run_executor_inner(task_id: &str, db: &SqlitePool) -> Result<()> {
                     // 路由算出落点，「落点 → 游标行 + 流转行」由 `pipeline::advance`
                     // 收成**一笔事务**（决策 245）。签名是
                     // `advance(store, task_id, &cursor, landing, trigger, reason)`：
-                    // 不带 `&graph()`——落点查的是 `pipeline::landing` 那张表，
-                    // `pipeline/graph.rs` 是生产零调用方的死镜像（评审候选 3）。
+                    // 不带 `&graph()`——落点查的是 `pipeline::landing` 那张表；
+                    // `pipeline/graph.rs` 那面死镜像已退场（评审候选 3 → 决策 248）。
                     advance(store, task_id, &cursor, landing, trigger, reason).await?;
                 }
                 Err(node_error) => {

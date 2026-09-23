@@ -499,7 +499,8 @@ frontend/
 ```
 
 - `render/` 即 §12.11"外壳独立、渲染件复用"的落点：v1 会话查看器与 v2 对话窗口共用。
-- `PipelineRail` 是全站唯一"重"组件：一份 DAG 拓扑数据（来自 petgraph 的静态形状，构建期内联）
+- `PipelineRail` 是全站唯一"重"组件：一份 DAG 拓扑数据（静态形状、构建期内联；后端的拓扑由
+  `landing.rs` 落点表与 `routes.rs` 条件边给出，决策 248）
   + 游标数组 → 三种密度变奏（脊线 120px / 迷你轨 16px / hero 200px）。
 - token 计数组件 `TokenMeter` 唯一允许每秒多次重渲（流式累加），并做 `requestAnimationFrame` 合帧。
 

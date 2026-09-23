@@ -12,7 +12,7 @@
 | **Cursor（游标）** | 任务在某条分支上的执行位置与状态（`branch` / `stage` / `node` / `status` / `validate_attempts` / `pending_reason` / `skipped_to_join`）。执行状态的唯一事实来源，落库 `kanban_node_cursors`（决策 80）。串行阶段恒为一条（`main`），并行阶段两条（此时**没有** main）；生命周期见决策 90 |
 | **Stage** | 流水线的一个阶段。共 10 个：init, architect-design, develop-design, test-design, sync-check, develop, review, test, merge, done |
 | **Node** | 每个 stage 内部的执行节点。标准模式为 3 个：validate_input, execute, validate_output。init/done/sync-check 有特殊节点集 |
-| **Pipeline** | 整个看板流水线的 DAG 图定义 + 执行引擎。基于 petgraph 构建 |
+| **Pipeline** | 整个看板流水线的 DAG 图定义 + 执行引擎。拓扑的事实源是 `landing.rs` 落点表与 `routes.rs` 条件边（决策 248） |
 | **ExecutionState** | 流水线执行状态，即全部活跃游标的集合。持久化到 `kanban_node_cursors`，进程重启后据各游标行恢复；`kanban_tasks` 的 `current_stage` / `current_node` / `validate_attempts` 只是焦点游标的投影，供展示与筛选（决策 80） |
 
 ### Agent 相关
