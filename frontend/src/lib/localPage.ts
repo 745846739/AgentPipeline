@@ -18,17 +18,27 @@ import { getApiBase } from '../api/config';
  */
 
 /**
- * 回环主机名。
+ * 回环主机名——判定语义与 Rust 侧 `crates/core/src/host_policy.rs` 同源（决策 246）。
  *
- * **要求四段点分数字**，故 `127.evil.com` 这类前缀伪装不算回环——这条谓词的输入在本模块里
- * 是页面自己的主机名（可被 DNS 影响），比 `host.startsWith('127.')` 宽一档的写法不够用。
+ * **归一**（去空白 / 转小写 / 去一个尾点 / 脱方括号）→ `localhost` / `::1` → **要求四段点分
+ * 数字且八位组过范围检查**，故 `127.evil.com` 这类前缀伪装与 `127.999.999.999` 都不算回环——
+ * 这条谓词的输入在本模块里是页面自己的主机名（可被 DNS 影响），比 `host.startsWith('127.')`
+ * 宽一档的写法不够用。**本文件调不了 Rust**（页面 hostname 的判定可能发生在任何 API 调用
+ * 之前），同源靠共享表：`tests/fixtures/host_policy_loopback.json` 由 Rust 表测试与
+ * `localPage.test.ts` 两侧读同一份、同一断言方向——Rust 改了规范前端没跟，就会变红。
  * `lib/lanToggle.ts` 复用同一个口径，避免「什么算回环」出现两个答案。
  */
 export function isLoopbackHostname(hostname: string): boolean {
   // URL 里的 IPv6 主机名带方括号（`http://[::1]:8788` 的 hostname 是 `[::1]`）
-  const host = hostname.trim().toLowerCase().replace(/^\[|\]$/g, '');
+  const host = hostname
+    .trim()
+    .toLowerCase()
+    .replace(/^\[|\]$/g, '')
+    .replace(/\.$/, '');
   if (host === 'localhost' || host === '::1') return true;
-  return /^127(\.\d{1,3}){3}$/.test(host);
+  // 八位组范围：`127.999.999.999` 形状合法但解析不成 IP 字面量（决策 246）
+  if (!/^127(\.\d{1,3}){3}$/.test(host)) return false;
+  return host.split('.').every((part) => Number(part) <= 255);
 }
 
 /**

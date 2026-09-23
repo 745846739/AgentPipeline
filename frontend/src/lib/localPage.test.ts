@@ -21,6 +21,11 @@ describe('isLoopbackHostname（决策 190）', () => {
     expect(isLoopbackHostname('[::1]')).toBe(true);
   });
 
+  it('脱尾点与八位组范围（决策 246 的两处对齐，与 Rust 同源）', () => {
+    expect(isLoopbackHostname('localhost.')).toBe(true);
+    expect(isLoopbackHostname('127.999.999.999')).toBe(false);
+  });
+
   it('局域网地址与域名不算', () => {
     for (const host of ['192.168.3.12', '10.0.0.5', '172.16.1.1', '0.0.0.0', 'example.com']) {
       expect(isLoopbackHostname(host), host).toBe(false);
