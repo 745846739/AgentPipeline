@@ -1,0 +1,40 @@
+{
+  "$comment": "跨语言**规格表**（票 mirror-contract/03，决策 253 ②）。\n成员集（有哪些值）走 `enum_members.json`——那份由 Rust 枚举机械导出。**本表不同**：\n这里装的是枚举推不出来的**规格**——格子按什么次序排、哪些键不是真实阶段、终态是哪几个、\n`user_decision` 有哪些子类。故它**是手写的**，两侧各自断言（Rust 断言自己那半边的实现与它\n一致，前端断言自己那半边的实现与它一致）。\n\n为什么不合进成员表：漂移症状不同，红了要能一眼分出是哪一类——\n成员表漂了是「前端认不出一个值」（FromStr 失败 / 格子不显示），\n规格表漂了是「格子顺序不对 / 伪键掉出配置页」。\n\n**两份已经登记为险的注释**（说明这不是假想问题）：\n- `frontend/src/lib/stageConfigs.ts` 写「10 个真实阶段 + 4 个非阶段配置键（routes/stage_configs.rs::PSEUDO_STAGE_KEYS）」；\n- `crates/app/src/routes/stage_configs.rs` 写「**必须与 frontend/src/lib/stageConfigs.ts 的\n  PSEUDO_KEYS 同步**：那份决定设置页列不列得出这一行，这份决定后端收不收这一行。不同步的\n  表现是「界面上填好、保存被 400 拒掉」，而 400 的理由写着「未知阶段」——看的人只会当成界面\n  bug 去查前端」。\n两侧都靠注释承诺，没有任何机器检查。本表把它变成会红的。\n\n各节的钉法：\n- `stage_keys`：14 项**按格子顺序**。前 10 项 == `Stage` 成员（`enum_members.json::stage`，\n  同一顺序），后 4 项 == 后端 `PSEUDO_STAGE_KEYS`。注意它**不等于** `STAGE_MEMBERS`：\n  它多带 4 个配置键。\n- `pseudo_keys`：4 项——**不是真实阶段**的配置键。`'foreman'`（值班长，决策 182①）在这里，\n  它不在 `Stage` 枚举里；后端 `PSEUDO_STAGE_KEYS` 也是这 4 项、同一集合。\n- `terminal_statuses`：3 项——`TaskStatus::is_terminal` 为真的那些（done / failed / cancelled）。\n- `user_decision_context_kinds`：`PendingKind::UserDecision` 的 `context.kind` 子类\n  （`crates/core/src/actions.rs::kinds` 里那些在 `user_decision` 行上出现过的）。\n  `pendingLabel` 的 `user_decision` 分支要覆盖它们全部——漏一个的症状是那一格退回\n  「等待决定」，而原因在手边却没说。",
+  "stage_keys": [
+    "init",
+    "architect-design",
+    "develop-design",
+    "test-design",
+    "sync-check",
+    "develop",
+    "review",
+    "test",
+    "merge",
+    "done",
+    "conflict_check",
+    "validator_cross_check",
+    "project_analysis",
+    "foreman"
+  ],
+  "pseudo_keys": [
+    "conflict_check",
+    "validator_cross_check",
+    "project_analysis",
+    "foreman"
+  ],
+  "terminal_statuses": [
+    "done",
+    "failed",
+    "cancelled"
+  ],
+  "user_decision_context_kinds": [
+    "duplicate_risk",
+    "develop_design_input_insufficient",
+    "test_design_input_insufficient",
+    "judge_disagreement",
+    "review",
+    "test_code_issue",
+    "gate_recheck",
+    "dirty_worktree"
+  ]
+}

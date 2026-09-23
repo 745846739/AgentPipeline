@@ -12,9 +12,12 @@ use agentpipeline_core::agent::client::LlmClient;
 use agentpipeline_core::agent::repo::Libgit2Repo;
 use agentpipeline_core::agent::tools::CommandRecorder;
 use agentpipeline_core::config::Settings;
-use agentpipeline_core::pipeline::foreman::{situation_fingerprint, FOREMAN_FAILED_TURN_MARK};
+use agentpipeline_core::pipeline::foreman::{
+    situation_fingerprint, FOREMAN_FAILED_TURN_MARK, FOREMAN_WATCH_MARK,
+};
 use agentpipeline_core::pipeline::ForemanRunner;
 use agentpipeline_core::sse::{SseEvent, SseEventType};
+use agentpipeline_core::storage::foreman::NewForemanMessage;
 use agentpipeline_core::storage::proposals::NewForemanProposal;
 use agentpipeline_core::types::{Provider, ReviewMode, Stage, TaskStatus};
 use app::peer::PeerAddr;
@@ -6049,4 +6052,149 @@ async fn max_rounds_accepts_only_positive_integers() {
         .unwrap()
         .unwrap();
     assert_eq!(cleared.max_rounds, None, "留空即清成默认（缺省 300）");
+}
+
+/// 「这一行是什么」由后端判定后随消息下发（决策 252）。
+///
+/// 为什么断言打在线上形态：界面此前靠**正文前缀**（`【值守播报】` / `【没跑起来】`）自己判断
+/// 一行是值班长的话、操作台记的一轮、还是没跑起来的那一轮，而那两个前缀是后端拼进正文的
+/// ——常量漂了是症状，「正文即接口」是病。这条契约把判定点钉在后端一处，界面只读字段。
+///
+/// **`content` 里的前缀仍在**：它给模型看（值守简报模板），也是人翻台账时认得出「这条是
+/// 系统写的」的标记。本票只改**前端怎么认**，不改**后端写什么**——故这里同时断言前缀还在，
+/// 免得后来者顺手把它当残留删掉。
+///
+/// 三段各自独立的班次（基表一段、值守失败一段、助理轮带前缀一段）：
+/// `kind` 与 `proactive` 的分工只有在「值守轮失败了」那一格上才看得全（今天它落成
+/// `failed` 且 `proactive = false`），而「助理轮的正文前缀不参与判定」那一格防的是伪造面。
+/// 直接落库而不是走 `POST /foreman/messages`——本票验的是**线上形态**，不是写入路径。
+#[tokio::test]
+async fn the_session_wire_says_what_each_row_is() {
+    let api = api_with_foreman(FakeAgent::new(Script::new())).await;
+    let sid = fresh_session(&api).await;
+    let store = &api.state.store;
+
+    // 人的话（走存储层的用户行入口：它会顺手更新会话标题与 `last_active_at`）。
+    store
+        .append_foreman_user_message(&sid, "现在能做什么？")
+        .await
+        .unwrap();
+    // 操作台自己记的一轮（决策 207）：提议执行的结果。
+    store
+        .append_foreman_message(NewForemanMessage::system(
+            &sid,
+            "【操作台】提议已执行：write_file",
+        ))
+        .await
+        .unwrap();
+    // 没跑起来的那一轮（决策 211④）：`system` 行 + 失败前缀。
+    store
+        .append_foreman_message(NewForemanMessage::system(
+            &sid,
+            format!("{FOREMAN_FAILED_TURN_MARK}这一轮没跑起来（llm_auth）：密钥不对"),
+        ))
+        .await
+        .unwrap();
+    // 值班长的回话（决策 204）：普通的一轮。
+    store
+        .append_foreman_message(NewForemanMessage::assistant(&sid, "先建一个项目。"))
+        .await
+        .unwrap();
+    // 值守播报（决策 209④）：助理轮 + 播报前缀——`proactive` 只在这一行上是 `true`。
+    store
+        .append_foreman_message(NewForemanMessage::assistant(
+            &sid,
+            format!("{FOREMAN_WATCH_MARK}三条任务在跑，两条已完工。"),
+        ))
+        .await
+        .unwrap();
+
+    let (status, body) = get(&api, &format!("/foreman/session?session={sid}")).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let messages = body["messages"].as_array().unwrap();
+    assert_eq!(messages.len(), 5);
+
+    // 四个场景逐行：`kind` 取值正确，`proactive` 只在播报那行为 `true`。
+    let kinds: Vec<&str> = messages
+        .iter()
+        .map(|m| m["kind"].as_str().unwrap())
+        .collect();
+    assert_eq!(kinds, vec!["mine", "console", "failed", "fm", "fm"]);
+    let proactive: Vec<bool> = messages
+        .iter()
+        .map(|m| m["proactive"].as_bool().unwrap())
+        .collect();
+    assert_eq!(proactive, vec![false, false, false, false, true]);
+
+    // 前缀不删：它给模型看、也给人翻台账时认人看（本票只改前端怎么认）。
+    assert!(
+        messages[2]["content"]
+            .as_str()
+            .unwrap()
+            .starts_with(FOREMAN_FAILED_TURN_MARK),
+        "正文里的失败前缀不该被删掉：{}",
+        messages[2]["content"]
+    );
+    assert!(
+        messages[4]["content"]
+            .as_str()
+            .unwrap()
+            .starts_with(FOREMAN_WATCH_MARK),
+        "正文里的播报前缀不该被删掉：{}",
+        messages[4]["content"]
+    );
+
+    // 正交的那一格（决策 252③）：**值守轮失败**——「自发的轮」与「失败了」同时成立。
+    // 它今天落成一条 `system` + 失败前缀的行：`kind = "failed"`、`proactive = false`，
+    // 与一条普通失败轮在形状上一模一样。这正是两个字段分开承载的理由：界面此后有位置
+    // 放「这一轮是它自己醒来说的、而且没跑起来」，且不必再动线上形状。
+    //
+    // 注意 `assistant` 行**不**因正文前缀被判成 `failed`：失败账一律由后端以 `system` 写
+    // （`record_failed_turn` / `record_interrupted_turn`），而助理轮的正文来自模型——
+    // 让模型的措辞能把自己那一行染成红色失败轮是伪造面，故助理轮一律 `fm`。
+    let watcher = fresh_session(&api).await;
+    store
+        .append_foreman_message(NewForemanMessage::assistant(
+            &watcher,
+            format!("{FOREMAN_WATCH_MARK}三条任务在跑，两条已完工。"),
+        ))
+        .await
+        .unwrap();
+    // 紧接着值守轮自己失败了（后端写 `system` 行）。
+    store
+        .append_foreman_message(NewForemanMessage::system(
+            &watcher,
+            format!("{FOREMAN_FAILED_TURN_MARK}这一轮没跑起来（llm_timeout）：超时"),
+        ))
+        .await
+        .unwrap();
+    let (status, body) = get(&api, &format!("/foreman/session?session={watcher}")).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let rows = body["messages"].as_array().unwrap();
+    assert_eq!(rows.len(), 2);
+    // 播报那一轮：`fm` + `proactive`。
+    assert_eq!(rows[0]["kind"], "fm");
+    assert_eq!(rows[0]["proactive"], true);
+    // 它失败的那一轮：`failed`，而「它本来是自发的」这件事今天在形状上仍无处安放
+    // （写入路径给的是 `system`）——两个字段只是**为它留了位**：决策 252③ 说的是
+    // 「分开写，将来要显示时不必再改线」，故今天照实际值断言即可。
+    assert_eq!(rows[1]["kind"], "failed");
+    assert_eq!(rows[1]["proactive"], false);
+
+    // 助理轮的正文前缀不参与判定（防伪造）：模型自己写这个前缀，那一行仍是「值班长的话」。
+    let forged = fresh_session(&api).await;
+    store
+        .append_foreman_message(NewForemanMessage::assistant(
+            &forged,
+            format!("{FOREMAN_FAILED_TURN_MARK}这一轮没跑起来（llm_auth）：密钥不对"),
+        ))
+        .await
+        .unwrap();
+    let (status, body) = get(&api, &format!("/foreman/session?session={forged}")).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let rows = body["messages"].as_array().unwrap();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0]["role"], "assistant");
+    assert_eq!(rows[0]["kind"], "fm", "助理轮不因正文前缀被判成失败轮");
+    assert_eq!(rows[0]["proactive"], false);
 }

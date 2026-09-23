@@ -22,6 +22,10 @@ use crate::state::{map_core_error, ApiError, ApiResult, AppState};
 /// **必须与 `frontend/src/lib/stageConfigs.ts` 的 `PSEUDO_KEYS` 同步**：那份决定设置页
 /// 列不列得出这一行，这份决定后端收不收这一行。不同步的表现是「界面上填好、保存被 400
 /// 拒掉」，而 400 的理由写着「未知阶段」——看的人只会当成界面 bug 去查前端。
+///
+/// 那份承诺由 `tests/fixtures/frontend_spec_tables.json` 的 `pseudo_keys` 机器钉住
+/// （票 mirror-contract/03，决策 253②）：文件尾部那条测试断言本表与它一致，前端
+/// `lib/specTablesFixture.test.ts` 断言同一份表——两侧同一张表、同一断言方向。
 const PSEUDO_STAGE_KEYS: [&str; 4] = [
     "conflict_check",
     "validator_cross_check",
@@ -213,4 +217,54 @@ pub async fn delete(
         .await
         .map_err(map_core_error)?;
     Ok(Json(json!({ "ok": true })))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::PSEUDO_STAGE_KEYS;
+
+    /// `PSEUDO_STAGE_KEYS` 与共享规格表一致（票 mirror-contract/03，决策 253②）。
+    ///
+    /// 本表与前端 `stageConfigs.ts::PSEUDO_KEYS` 是**同一份规格的两个副本**，而它们的关系
+    /// 不是「一个从另一个生成」——枚举推不出「哪些键不是真实阶段」。故两侧各自断言同一张
+    /// 手写表（前端那份在 `lib/specTablesFixture.test.ts`）。
+    ///
+    /// 这条测试在这里、而不在 core 的 `types.rs`：`PSEUDO_STAGE_KEYS` 住在 app，
+    /// 而它是**后端收不收这一行**的唯一判据（`validate_stage_key`）——钉它自己的那份副本。
+    #[test]
+    fn pseudo_stage_keys_match_the_shared_spec_table() {
+        #[derive(serde::Deserialize)]
+        struct Fixture {
+            pseudo_keys: Vec<String>,
+            stage_keys: Vec<String>,
+        }
+
+        let raw = include_str!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../tests/fixtures/frontend_spec_tables.json"
+        ));
+        let fixture: Fixture = serde_json::from_str(raw).expect("fixture 必须是合法 JSON");
+
+        let ours: Vec<&str> = PSEUDO_STAGE_KEYS.to_vec();
+        let theirs: Vec<&str> = fixture.pseudo_keys.iter().map(String::as_str).collect();
+        assert_eq!(
+            ours, theirs,
+            "PSEUDO_STAGE_KEYS 与共享规格表不一致——两份副本漂了，\
+             症状是「界面上填好、保存被 400 拒掉」"
+        );
+
+        // 后 4 项 == 伪键（与 core 侧 `shared_spec_tables_match_the_backend_spec` 同一条
+        // 不变量，两处都断一次：core 断的是「表里那 14 项自洽」，这里断的是「app 真的只用
+        // 这 4 个当键」）。
+        let real: usize = fixture.stage_keys.len() - fixture.pseudo_keys.len();
+        assert_eq!(&fixture.stage_keys[real..], theirs.as_slice());
+
+        // 一个真阶段都不许混进来：它会让「真实阶段」与「配置键」两处分组打架。
+        for key in &fixture.pseudo_keys {
+            assert!(
+                !fixture.stage_keys[..real].contains(key),
+                "伪键 {key} 同时出现在真实阶段里"
+            );
+        }
+    }
 }

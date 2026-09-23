@@ -1,4 +1,4 @@
-import type { ForemanSessionMeta, SseEvent } from '../api/types';
+import type { ForemanMessage, ForemanSessionMeta, SseEvent } from '../api/types';
 
 /**
  * 值班长流式归约（票 03）：与 `reduce.ts` 同一姿态的纯函数——不触网、不读时钟、不改入参。
@@ -280,61 +280,33 @@ export function failureNotice(message: string): string {
 }
 
 /**
- * 失败回合在台账里的标记（`crates/core/src/pipeline/foreman.rs::FOREMAN_FAILED_TURN_MARK`
- * 的前端镜像，决策 211④ / 票 04）。
- */
-export const FOREMAN_FAILED_TURN_MARK = '【没跑起来】';
-
-/**
- * 主动播报的标记（`crates/core/src/pipeline/foreman.rs::FOREMAN_WATCH_MARK` 的前端镜像，
- * 决策 209④ / 票 06）。**值守轮不是回话**——它没人问就自己说话，名牌上要看得出来，
- * 否则值班经理会以为自己在跟它对话（而它其实是在报事件）。
- */
-export const FOREMAN_WATCH_MARK = '【值守播报】';
-
-/**
- * 归因结构块的哨兵（`crates/core/src/pipeline/foreman.rs::FOREMAN_ATTRIBUTION_MARK` 的
- * 前端镜像，决策 227 / 235 / 238）。
+ * 台账里一行带 id 的轮次——判据只需要这两列。
  *
- * 界面**不自己从正文里抠**这个块：解析点在后端一处（`parse_attribution`），界面拿的是
- * 那一行的 `attribution` 字段。这个常量留在这里只是为了让「正文里那一行长什么样」在
- * 前端也有一份可读的参照（e2e 的 mock 回话要照它写）。
+ * `kind` 是**后端给的**（决策 252）：界面不再拿正文前缀去猜这一行是人的话、操作台记的账、
+ * 还是没跑起来的那一轮。刻意*不*取 `content`——下面两条判据只该看字段，不看正文。
+ *
+ * 类型从 `ForemanMessage` **摘**（`Pick`）而不是重抄那四个字面量：抄一遍就是又一份枚举副本
+ * （决策 253② 要挡的形状），且后端将来加一种 `kind` 时这里不会跟着宽、只会静默落在
+ * 「不是 failed」那一支。`Pick` 让它们是**同一个**类型。
  */
-export const FOREMAN_ATTRIBUTION_MARK = '【归因】';
+export type LedgerRow = Pick<ForemanMessage, 'id' | 'kind'>;
 
-// 归因类别 → 界面上那个词**不在前端映射**：后端解析结构块之后把它翻好的
-// `attribution_label` 一并下发（词表只有一份：`AttributionKind::label`）。前端再写一份的
-// 下场是两个词表迟早不一致，而「四类各一个词」是同一件事。
-
-/** 台账里一行带 id 的轮次（只取判据要用的三列）。 */
-export interface LedgerRow {
-  id: number;
-  role: string;
-  content: string;
-}
-
-/** 这批轮次里**带失败标记**的那些行的 id。 */
+/** 这批轮次里**没跑起来**的那些行的 id。 */
 export function failedLedgerRowIds(rows: LedgerRow[]): Set<number> {
-  return new Set(
-    rows
-      .filter((m) => m.role === 'system' && m.content.startsWith(FOREMAN_FAILED_TURN_MARK))
-      .map((m) => m.id),
-  );
+  return new Set(rows.filter((m) => m.kind === 'failed').map((m) => m.id));
 }
 
 /**
  * 这一次失败**已经**在台账里记下了吗（决策 211④ / 票 04）。
  *
- * 后端在失败当场就把「为什么没跑起来」落成一条带标记的 `system` 行（含归因），而前端手里
- * 还有一条本地造的「发送失败」轮（承载传输层报文与配对入口）。重取台账成功之后，两行会在
- * 时间线上说同一件事——人得自己分辨哪条是真的。台账那一行更全、刷新之后还在，故本地那行退场。
+ * 后端在失败当场就把「为什么没跑起来」落成一条 `kind = "failed"` 的行（含归因），而前端
+ * 手里还有一条本地造的「发送失败」轮（承载传输层报文与配对入口）。重取台账成功之后，两行
+ * 会在时间线上说同一件事——人得自己分辨哪条是真的。台账那一行更全、刷新之后还在，故本地
+ * 那行退场。
  *
  * `before` 是**发送之前**已有的失败行 id：不带上它，一次早先的失败会让此后每一次真实断网
  * （请求根本没到后端，台账不会多出任何行）都静默——而那种情况正是本地那行存在的理由。
  */
 export function ledgerOwnsTheFailure(rows: LedgerRow[], before: ReadonlySet<number>): boolean {
-  return rows.some(
-    (m) =>
-      m.role === 'system' && m.content.startsWith(FOREMAN_FAILED_TURN_MARK) && !before.has(m.id),
-  );
+  return rows.some((m) => m.kind === 'failed' && !before.has(m.id));
 }

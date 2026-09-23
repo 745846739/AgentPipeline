@@ -18,8 +18,6 @@ import {
   noteForeignDelta,
   pruneForeignActive,
   settleForemanStream,
-  FOREMAN_ATTRIBUTION_MARK,
-  FOREMAN_FAILED_TURN_MARK,
 } from './foreman';
 
 /**
@@ -185,13 +183,10 @@ describe('foreman 流式归约（续）', () => {
   });
 
   it('失败轮的归属：台账里新出现的那一条才算这一次（决策 211④）', () => {
-    const failedRow = (id: number) => ({
-      id,
-      role: 'system',
-      content: `${FOREMAN_FAILED_TURN_MARK}这一轮没跑起来（llm_auth）：…`,
-    });
-    const mine = { id: 3, role: 'user', content: `${FOREMAN_FAILED_TURN_MARK}我引用了一下这个标记` };
-    const consoleRow = { id: 4, role: 'system', content: '【操作台】…' };
+    // 判据只看 `kind`（决策 252）：后端说这一行是没跑起来的那一轮，界面不再解析正文。
+    const failedRow = (id: number) => ({ id, kind: 'failed' as const });
+    const mine = { id: 3, kind: 'mine' as const };
+    const consoleRow = { id: 4, kind: 'console' as const };
 
     // 空台账 / 只有无关行 → 本地那一行要留着（请求根本没到后端时它是唯一信号）
     expect(ledgerOwnsTheFailure([], failedLedgerRowIds([]))).toBe(false);
@@ -199,7 +194,7 @@ describe('foreman 流式归约（续）', () => {
       false,
     );
 
-    // 失败之后重取到的台账里多出一条带标记的 system 行 → 它就是这次的失败轮
+    // 失败之后重取到的台账里多出一条 `kind = "failed"` 的行 → 它就是这次的失败轮
     const before = failedLedgerRowIds([mine, consoleRow]);
     expect(ledgerOwnsTheFailure([mine, consoleRow, failedRow(7)], before)).toBe(true);
 
@@ -209,8 +204,10 @@ describe('foreman 流式归约（续）', () => {
     expect(ledgerOwnsTheFailure([stale], beforeWithStale)).toBe(false);
     expect(ledgerOwnsTheFailure([stale, failedRow(9)], beforeWithStale)).toBe(true);
 
-    // 只有「角色是 system 且带标记」的才算：人的话里引用这个标记不作数
+    // 只有 `kind = "failed"` 的算：人的话（`mine`）与操作台记的账（`console`）都不作数
+    // ——**这正是这一批要的东西**：判据不再看正文里有没有那个字样，看的是后端给的字段。
     expect(ledgerOwnsTheFailure([mine], new Set())).toBe(false);
+    expect(ledgerOwnsTheFailure([consoleRow], new Set())).toBe(false);
   });
 
   it('本地超时不等于这一轮失败：补上「它仍在服务端继续」的实情（决策 223）', () => {
@@ -356,21 +353,6 @@ describe('别的班次「正在回话」（决策 220③）', () => {
     expect(active.bySession).toEqual({ 'sess-a': T0, 'sess-b': T0 + 5 });
     expect(foreignIsReplying(active, 'sess-a', T0 + 10)).toBe(true);
     expect(foreignIsReplying(active, 'sess-b', T0 + 10)).toBe(true);
-  });
-});
-
-/**
- * 归因类别标记（决策 235① / 238）：界面只做一件事——把后端给的类别翻成一个词。
- *
- * 判据的重点在**未定位那一条**：绝不能编一个假的类别（决策 230 把「没有类别」也算一项
- * 判据，画一个「未定位」的标签会让人以为那也是一类）。
- */
-describe('归因类别标记（票 03）', () => {
-  // 词表**只有一份**（后端的 `AttributionKind::label`）：界面拿 `attribution_label` 直接渲染，
-  // 故这里只钉哨兵这个镜像常量（e2e 的 mock 回话要照它写）。
-  it('哨兵与后端同源（原样镜像）', () => {
-    // 后端那一份在 `crates/core/src/pipeline/foreman.rs::FOREMAN_ATTRIBUTION_MARK`。
-    expect(FOREMAN_ATTRIBUTION_MARK).toBe('【归因】');
   });
 });
 

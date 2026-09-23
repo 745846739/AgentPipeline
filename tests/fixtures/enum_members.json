@@ -1,0 +1,26 @@
+{
+  "$comment": "跨语言**枚举成员表**（票 mirror-contract/02，决策 253 ②）。\n「枚举有哪些成员」这条不变量的唯一共享规格：Rust 侧是权威（crates/core/src/types.rs 的\nStage / PendingKind 枚举本身），前端 api/types.ts 的两个字符串联合是**手抄的副本**\n（前端调不了 Rust：这些值在编译期就要定下来，页面判定可能发生在任何 API 调用之前，\n与决策 246 / 250 同一个理由）。两侧读同一份表、同一断言方向。\n\n**本文件的内容是导出物，不是手写的**——`crates/core/src/types.rs` 的表测试用\n`schemars::schema_for!`（宏从枚举定义取变体表）算出**同一份内容**并逐项比对，比中就说明\n文件没漂。改了枚举却没改这里，那条测试就变红，且失败报文里印着**可直接贴回来的 JSON**。\n（没有独立的生成脚本：唯一的消费者是那条测试，多一个脚本就多一处要同步的东西。）\n\n成员表**只管有哪些值**；顺序、伪键归属、展示标签是**规格**，走\n`frontend_spec_tables.json`（票 03）。两份分开是因为漂移症状不同：\n成员表漂了是「前端认不出一个值」（FromStr 失败 / 格子不显示），\n规格表漂了是「格子顺序不对 / 伪键掉出配置页」——红了要能一眼分出是哪一类。\n\n- Rust 侧（crates/core/src/types.rs 表测试）：`schema_for!` 导出的变体表 ⟺ 本表逐项相等；\n- vitest 侧（frontend/src/lib/enumMembersFixture.test.ts）：`STAGE_MEMBERS` /\n  `PENDING_KIND_MEMBERS` 与本表**集合相等**（多一个值也要红——那正是「前端认得出、\n  后端认不出」这一类漂移）。",
+  "stage": [
+    "init",
+    "architect-design",
+    "develop-design",
+    "test-design",
+    "sync-check",
+    "develop",
+    "review",
+    "test",
+    "merge",
+    "done"
+  ],
+  "pending_kind": [
+    "info_insufficient",
+    "conflict_wait",
+    "retry_exhausted",
+    "user_decision",
+    "merge_approval",
+    "human_review",
+    "dependency_failed",
+    "context_overflow",
+    "timeout"
+  ]
+}

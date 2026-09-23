@@ -29,8 +29,8 @@
 //! 不是权限，也不是态势快照——「换会话 ≠ 换看板」。台账从此跨会话，会话只是容器。
 
 use agentpipeline_core::pipeline::foreman::{
-    situation_drift, situation_fingerprint, FOREMAN_AGENT_TYPE, FOREMAN_STAGE_KEY,
-    FOREMAN_TOOL_SPECS,
+    situation_drift, situation_fingerprint, FOREMAN_AGENT_TYPE, FOREMAN_FAILED_TURN_MARK,
+    FOREMAN_STAGE_KEY, FOREMAN_TOOL_SPECS, FOREMAN_WATCH_MARK,
 };
 use agentpipeline_core::sse::SseEvent;
 use agentpipeline_core::storage::foreman::{
@@ -1283,9 +1283,29 @@ fn session_wire(s: &ForemanSession) -> serde_json::Value {
 /// `attribution` 是**解析出来**的（决策 235 / 238）：结构块住在回话文本里，而解析只有一处
 /// ——界面拿的是后端判定的结果，不自己从正文里抠（那会造出第二个判定点，两边迟早不一致）。
 /// 未定位时给 `unlocated` 而不是编一个类别，`attribution_reason` 说清是哪一种未定位。
+///
+/// `kind` / `proactive` 同理（决策 252）：**「这一行是什么」由后端判定**，前端不拿正文前缀
+/// 去猜。两个字段而不是一个枚举，是因为它们**正交**——「值班长自己醒来说的那一轮失败了」
+/// 今天算成 `failed` 且 `proactive = false`，压成一个枚举会让这个组合从形状上不可能。
 fn message_wire(m: &ForemanMessage) -> serde_json::Value {
-    let attribution = (m.role == agentpipeline_core::storage::foreman::FOREMAN_ROLE_ASSISTANT)
+    use agentpipeline_core::storage::foreman::{
+        FOREMAN_ROLE_ASSISTANT, FOREMAN_ROLE_SYSTEM, FOREMAN_ROLE_USER,
+    };
+    let attribution = (m.role == FOREMAN_ROLE_ASSISTANT)
         .then(|| agentpipeline_core::pipeline::foreman::parse_attribution(&m.content));
+    // 「这一行是谁说的」——四个取值只有这里是判定点（`role` 列是三个值的观测字段）。
+    let kind = match m.role.as_str() {
+        FOREMAN_ROLE_USER => "mine",
+        FOREMAN_ROLE_SYSTEM if m.content.starts_with(FOREMAN_FAILED_TURN_MARK) => "failed",
+        FOREMAN_ROLE_SYSTEM => "console",
+        // `assistant` 与**认不出的角色值**：落到值班长一侧。这是原样搬过来的口径
+        // （`ForemanMessageRow::into_message` 明写「前端按 `=== "user"` 判定，不认识的值落到
+        // 「值班长」一侧」）——本票只把判定点从界面挪到后端，不顺手改这一档的归属。
+        _ => "fm",
+    };
+    // 「是不是它自己醒来说的」——值守播报由后端加前缀（决策 209④），故判定点也在这边。
+    // 只在助理轮上成立：同样带前缀的用户行不是播报（人可能恰好引用了那个标记）。
+    let proactive = m.role == FOREMAN_ROLE_ASSISTANT && m.content.starts_with(FOREMAN_WATCH_MARK);
     json!({
         "id": m.id,
         "session_id": m.session_id,
@@ -1303,5 +1323,7 @@ fn message_wire(m: &ForemanMessage) -> serde_json::Value {
         "attribution": attribution.as_ref().map(|a| a.wire()),
         "attribution_label": attribution.as_ref().and_then(|a| a.kind()).map(|k| k.label()),
         "attribution_reason": attribution.as_ref().and_then(|a| a.reason()),
+        "kind": kind,
+        "proactive": proactive,
     })
 }

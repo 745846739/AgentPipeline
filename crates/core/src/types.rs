@@ -1487,6 +1487,49 @@ pub fn stage_may_use_ask(stage: &str) -> bool {
 mod tests {
     use super::*;
 
+    /// 从 `schema_for!` 取一个枚举的**变体表**——宏路径，不经过任何手写清单。
+    ///
+    /// 这条是本模块两张共享表测试的共同底层：手写数组（`ALL_STAGES` 那种）自己也会漏一个
+    /// 变体，故「判据必须遍历枚举」在这里落成「让宏去遍历枚举定义」。
+    ///
+    /// `RootSchema` 先经 `serde_json::to_value` 归一：`schema_for!` 给的是
+    /// `schemars::schema::RootSchema` 而不是 `Value`（`client.rs::tool_defs` 同一做法）。
+    ///
+    /// 两种输出形状都要收：无文档注释的枚举给 `enum`；带文档注释的变体在 schemars 0.8 里走
+    /// `oneOf`（每个分支一个 `enum`，`description` 在旁边）。一个分支可以带**多个**值——
+    /// 相邻变体都没有文档注释时 schemars 会把它们并进一个 `enum`（`TaskStatus` 的
+    /// `done` / `failed` / `cancelled` 正是这样并成一组的），故要展开整个数组。
+    fn variants_of(name: &str, schema: &schemars::schema::RootSchema) -> Vec<String> {
+        let schema = serde_json::to_value(schema).expect("schema 可序列化");
+        let mut out: Vec<String> = Vec::new();
+        if let Some(list) = schema.get("enum").and_then(|e| e.as_array()) {
+            out.extend(list.iter().map(|v| {
+                v.as_str()
+                    .unwrap_or_else(|| panic!("{name} 的 enum 里有非字符串：{v}"))
+                    .to_string()
+            }));
+        }
+        if let Some(branches) = schema.get("oneOf").and_then(|v| v.as_array()) {
+            for branch in branches {
+                let list = branch["enum"]
+                    .as_array()
+                    .unwrap_or_else(|| panic!("{name} 的 oneOf 分支没有 enum：{branch}"));
+                for v in list {
+                    out.push(
+                        v.as_str()
+                            .unwrap_or_else(|| panic!("{name} 的 oneOf 里有非字符串：{v}"))
+                            .to_string(),
+                    );
+                }
+            }
+        }
+        assert!(
+            !out.is_empty(),
+            "{name} 的 schema 里一个变体都没取到：{schema}"
+        );
+        out
+    }
+
     #[test]
     fn stage_string_roundtrip() {
         for st in ALL_STAGES {
@@ -1700,5 +1743,251 @@ mod tests {
         };
         assert_eq!(p.masked_api_key().as_deref(), Some("***"));
         assert_ne!(p.masked_api_key(), p.api_key);
+    }
+
+    /// 枚举成员表：`Stage` / `PendingKind` 的成员导给前端（票 mirror-contract/02，决策 253②）。
+    ///
+    /// 前端 `api/types.ts` 的两个联合是**手抄的副本**，而它们抄的正是这两个枚举本身
+    /// ——抄第二遍的东西自己还会漂。这条测试把它变成会红的机器检查。
+    ///
+    /// **判据遍历枚举、不是手写数组**（票面要求）：`schema_for!` 由宏从枚举定义取变体表，
+    /// 故「导出漏了一个变体」在这条路上不可能发生。这里只需核对**文件里那份**与枚举一致。
+    ///
+    /// 失败报文带可直接贴回的 JSON：表是**导出物**，改了枚举就该重新导出——
+    /// 不手改生成物，重跑生成（`scripts/make-icon.mjs --check` 同一姿态）。
+    #[test]
+    fn shared_enum_members_fixture_matches_the_enums() {
+        #[derive(serde::Deserialize)]
+        struct Fixture {
+            stage: Vec<String>,
+            pending_kind: Vec<String>,
+        }
+
+        let raw = include_str!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../tests/fixtures/enum_members.json"
+        ));
+        let fixture: Fixture = serde_json::from_str(raw).expect("fixture 必须是合法 JSON");
+
+        let stage = variants_of("Stage", &schemars::schema_for!(Stage));
+        let pending = variants_of("PendingKind", &schemars::schema_for!(PendingKind));
+
+        // 顺序也 pin：两个枚举都是 `rename_all` 的纯变体表，声明序即展示序
+        // （`ALL_STAGES` 的注释写着「阶段全序（流程图顺序）」）。
+        assert_eq!(
+            fixture.stage, stage,
+            "Stage 的成员表与 fixture 不一致——改了枚举就重新导出 tests/fixtures/enum_members.json：\n{}",
+            serde_json::to_string_pretty(&serde_json::json!({
+                "stage": stage,
+                "pending_kind": pending,
+            }))
+            .unwrap()
+        );
+        assert_eq!(
+            fixture.pending_kind, pending,
+            "PendingKind 的成员表与 fixture 不一致——改了枚举就重新导出 tests/fixtures/enum_members.json：\n{}",
+            serde_json::to_string_pretty(&serde_json::json!({
+                "stage": stage,
+                "pending_kind": pending,
+            }))
+            .unwrap()
+        );
+
+        // 形状守卫：两侧都非空（退化成空表时逐项比较照样绿，那等于没测）。
+        assert!(!fixture.stage.is_empty() && !fixture.pending_kind.is_empty());
+    }
+
+    /// 规格表：**枚举推不出来的那几件事**由手写表钉住（票 mirror-contract/03，决策 253②）。
+    ///
+    /// 与 [`shared_enum_members_fixture_matches_the_enums`] 分工明确：那份管「有哪些值」
+    /// （Rust 导出、前端断言），这份管「按什么次序 / 归哪一组 / 哪几个是终态」
+    /// （手写、两侧各自断言）。红的症状也不同：成员表红了是「认不出一个值」，
+    /// 本表红了是「格子顺序不对 / 伪键被 400 拒掉」。
+    ///
+    /// **判据遍历枚举、不手写数组**（票面要求）：`terminal_statuses` 那条跑完全部
+    /// `TaskStatus` 变体问 `is_terminal()`，故「新增一个状态但忘了回答它算不算终态」
+    /// 会在这条路上现形；前 10 项与 `ALL_STAGES` 的比对同理。
+    ///
+    /// 本测试**只管 Rust 那一半**：前端 `STAGE_KEYS` / `PSEUDO_KEYS` / `TERMINAL_STATUSES` /
+    /// `pendingLabel` 由 `lib/specTablesFixture.test.ts` 断言同一张表。
+    #[test]
+    fn shared_spec_tables_match_the_backend_spec() {
+        #[derive(serde::Deserialize)]
+        struct Fixture {
+            stage_keys: Vec<String>,
+            pseudo_keys: Vec<String>,
+            terminal_statuses: Vec<String>,
+            user_decision_context_kinds: Vec<String>,
+        }
+
+        let raw = include_str!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../tests/fixtures/frontend_spec_tables.json"
+        ));
+        let fixture: Fixture = serde_json::from_str(raw).expect("fixture 必须是合法 JSON");
+
+        // ── stage_keys：前 N 项就是 `Stage` 的全部成员（含顺序），后 4 项是伪键 ──
+        //
+        // 真实阶段那一半**从枚举导出**（`variants_of`），不用 `ALL_STAGES`——那个数组是手写的，
+        // 新增一个阶段而忘了加进它就测不到（这正是本模块反复提防的形状：判据不许是手写清单）。
+        // `variants_of` 给出的次序是 `schema_for!` 的次序而不是声明序，故这里比**集合**；
+        // 次序那一半由 `stage_order_matches_flowchart`（对 `ALL_STAGES`）单独钉住。
+        let stages = variants_of("Stage", &schemars::schema_for!(Stage));
+        let mut want_stages =
+            fixture.stage_keys[..fixture.stage_keys.len() - fixture.pseudo_keys.len()].to_vec();
+        want_stages.sort();
+        let mut got_stages = stages.clone();
+        got_stages.sort();
+        assert_eq!(
+            want_stages, got_stages,
+            "stage_keys 的前半段应当恰好是 Stage 的全部成员"
+        );
+        assert_eq!(
+            fixture.stage_keys.len(),
+            stages.len() + fixture.pseudo_keys.len(),
+            "stage_keys 应当是「全部真实阶段 + 4 个伪键」：{:?}",
+            fixture.stage_keys
+        );
+        assert_eq!(
+            &fixture.stage_keys[stages.len()..],
+            fixture.pseudo_keys.as_slice(),
+            "stage_keys 的后 4 项应当就是 pseudo_keys"
+        );
+        // 顺序也 pin：前 10 项 == `ALL_STAGES`（阶段全序，`stage_order_matches_flowchart`
+        // 的同一份次序）。这一条是**规格**（流程图次序），枚举推不出来，故照 `ALL_STAGES` 比。
+        let ordered: Vec<&str> = ALL_STAGES.iter().map(|s| s.as_str()).collect();
+        assert_eq!(
+            &fixture.stage_keys[..ALL_STAGES.len()],
+            ordered.as_slice(),
+            "stage_keys 的前 {} 项应当按阶段全序排列",
+            ALL_STAGES.len()
+        );
+
+        // ── pseudo_keys：**不是** `Stage` 成员，且一个真阶段也不许混进来 ──
+        //
+        // 这一条正是 `stage_configs.rs` 那段注释许下的承诺：「这份决定后端收不收这一行，
+        // 那份决定设置页列不列得出这一行」。同源在 `app/src/routes/stage_configs.rs`
+        // 的 `PSEUDO_STAGE_KEYS`（那边由 api_contract 的 stage-configs 用例钉）。
+        for key in &fixture.pseudo_keys {
+            assert!(
+                !stages.contains(key),
+                "伪键 {key} 同时是真实阶段——两处分组打架了"
+            );
+        }
+        assert!(fixture.pseudo_keys.contains(&"foreman".to_string()));
+
+        // ── terminal_statuses：遍历全部 `TaskStatus` 变体，问 `is_terminal()` ──
+        //
+        // **变体表由 `schema_for!` 导出**（与成员表同一条路），不手写数组——手写的那份
+        // 自己会漏（新增一个状态而忘了加进来，这条断言就悄悄少测一格）。
+        let mut terminal: Vec<String> = Vec::new();
+        for name in variants_of("TaskStatus", &schemars::schema_for!(TaskStatus)) {
+            let status = TaskStatus::from_str(&name)
+                .unwrap_or_else(|e| panic!("schema 里的 {name} 不是合法 TaskStatus：{e}"));
+            if status.is_terminal() {
+                terminal.push(name);
+            }
+        }
+        // 顺序不 pin（`schema_for!` 把无文档注释的变体并进一个分支，次序与声明序不同）——
+        // 这条钉的是**集合**：终态有哪几个。
+        let mut want = fixture.terminal_statuses.clone();
+        want.sort();
+        terminal.sort();
+        assert_eq!(
+            want, terminal,
+            "terminal_statuses 与 TaskStatus::is_terminal 不一致"
+        );
+
+        // ── user_decision 的 context.kind 子类 ──
+        //
+        // 权威在 `actions.rs::kinds`（那些常量）+ 动作表里 `user_decision` 名下的行。
+        // 这里断言的是**表里那几个都能被 `ResumeCause::classify` 认出来并且不落回通用行**
+        // ——落回通用行说明前端表里写的是一个后端不认识的子类（界面会给它一个专有的词，
+        // 而后端的续接判定按「通用那一行」走，两边的说法就分叉了）。
+        for kind in &fixture.user_decision_context_kinds {
+            let cause = ResumeCause::classify(PendingKind::UserDecision, Some(kind));
+            assert_ne!(
+                cause,
+                ResumeCause::UserDecision,
+                "user_decision 的子类 {kind} 在后端落回了通用那一行——表里有后端不认的值"
+            );
+        }
+        // 反方向：`classify` 认识的子类都要在表里，否则界面会退回「等待决定」。
+        //
+        // 判据是**问 `classify` 自己**（它是这条映射的唯一权威），而不是遍历一张手写的
+        // `ResumeCause` 清单——那样新增一个子类时清单不会自己长出来，这条就静默少测一格。
+        // 做法：拿 `actions::kinds` 里**全部**上下文常量逐个问 `classify`，凡是它给出
+        // 「非通用行」的那些就是后端认的子类。
+        for ctx in BACKEND_CONTEXT_KINDS {
+            let cause = ResumeCause::classify(PendingKind::UserDecision, Some(ctx));
+            if cause == ResumeCause::UserDecision {
+                // 这个常量在 `user_decision` 下就是通用行（比如依赖类的两个，它们挂在
+                // `DependencyFailed` 名下）——不是「后端认的 user_decision 子类」，跳过。
+                continue;
+            }
+            assert!(
+                fixture
+                    .user_decision_context_kinds
+                    .contains(&ctx.to_string()),
+                "后端认识的 user_decision 子类 {ctx} 不在表里——界面那一格会退回「等待决定」"
+            );
+        }
+    }
+
+    /// 后端认识的全部 `context.kind` 常量（`actions::kinds` 那一族）。
+    ///
+    /// 这不是「又抄一份清单」：`actions::kinds` 只定义常量、不提供枚举它们的路径，而这里
+    /// 需要的正是「逐个问一遍」。清单**由下面那条测试自己钉住**——每个常量都被它用一遍，
+    /// 而 `actions::kinds` 里新增一个常量时，配对的守卫在 `types::tests::` 的
+    /// `every_actions_kind_is_covered_here`（同一模块末尾）会红：它比对 `actions.rs` 源文本里
+    /// 出现的 `pub const X: &str = "..."` 与这张清单，故「加了常量忘了加进来」不会静默。
+    const BACKEND_CONTEXT_KINDS: [&str; 10] = [
+        crate::actions::kinds::DUPLICATE_RISK,
+        crate::actions::kinds::DEVELOP_DESIGN_INPUT_INSUFFICIENT,
+        crate::actions::kinds::TEST_DESIGN_INPUT_INSUFFICIENT,
+        crate::actions::kinds::JUDGE_DISAGREEMENT,
+        crate::actions::kinds::REVIEW,
+        crate::actions::kinds::TEST_CODE_ISSUE,
+        crate::actions::kinds::GATE_RECHECK,
+        crate::actions::kinds::DIRTY_WORKTREE,
+        crate::actions::kinds::DEPENDENCY_FAILED,
+        crate::actions::kinds::DEPENDENCY_CANCELLED,
+    ];
+
+    /// `BACKEND_CONTEXT_KINDS` 覆盖了 `actions::kinds` 里的每一个常量。
+    ///
+    /// 判据是**读源码文本**（`include_str!` + 正则式扫描），不是再抄一份数组——同一种病
+    /// （手写清单自己会漏）不能用同一种药再治一遍。扫描的形态与 `actions.rs` 里那族的写法
+    /// 一致：`pub const NAME: &str = "value";`。
+    #[test]
+    fn every_actions_kind_is_covered_here() {
+        let source = include_str!("actions.rs");
+        let mut declared: Vec<String> = Vec::new();
+        for line in source.lines() {
+            let line = line.trim();
+            let Some(rest) = line.strip_prefix("pub const ") else {
+                continue;
+            };
+            // 只看 `&str` 常量且值里没有格式串——`kinds` 那一族的写法。
+            if !rest.contains(": &str = \"") {
+                continue;
+            }
+            if let Some(value) = rest.split("= \"").nth(1).and_then(|v| v.split('"').next()) {
+                declared.push(value.to_string());
+            }
+        }
+        assert!(
+            declared.len() >= 10,
+            "扫 actions.rs 只取到 {} 个常量——扫描式可能过期了：{declared:?}",
+            declared.len()
+        );
+        for value in &declared {
+            assert!(
+                BACKEND_CONTEXT_KINDS.contains(&value.as_str()),
+                "actions.rs 里的常量 {value} 不在 BACKEND_CONTEXT_KINDS 里——\
+                 新增/改动了 context.kind 就要同步那张清单（它驱动 user_decision 子类的\
+                 反方向断言）"
+            );
+        }
     }
 }

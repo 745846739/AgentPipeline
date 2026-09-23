@@ -88,8 +88,6 @@
     noteForeignDelta,
     pruneForeignActive,
     settleForemanStream,
-    FOREMAN_FAILED_TURN_MARK,
-    FOREMAN_WATCH_MARK,
     type ForemanLiveTool,
     type ForemanStreamState,
     type ForeignActive,
@@ -319,23 +317,6 @@
     }),
   );
 
-  /**
-   * 失败回合在台账里的标记（前端侧的镜像，语义源在 `crates/core/src/pipeline/foreman.rs`
-   * 的 `FOREMAN_FAILED_TURN_MARK`，决策 211④ / 票 04）。
-   *
-   * 后端把「这一轮没跑起来」落成一条 `role = system` 的账（含归因后的原因），
-   * 前端按它把那一轮渲染成**失败轮**（红、名牌写「发送失败」）而不是中性的操作台轮——
-   * 2026-09-17 实测里值班长两次静默失败，页面上只有红轮、原因无处可看。
-   */
-  const FAILED_TURN_MARK = FOREMAN_FAILED_TURN_MARK;
-
-  /**
-   * 主动播报的标记（决策 209④ / 票 06）。语义源在 foreman.rs 的 `FOREMAN_WATCH_MARK`，
-   * 与失败轮那个标记同一姿态：前端拿的是**镜像常量**，不在界面里再抄一份字面量
-   * ——两份字面量迟早漂移成「后端加了标记、界面认不出来」。
-   */
-  const WATCH_MARK = FOREMAN_WATCH_MARK;
-
   interface TurnView {
     key: string;
     /**
@@ -402,17 +383,12 @@
    */
   const turns = $derived.by<TurnView[]>(() => {
     const stamped: { view: TurnView; rank: number }[] = (session?.messages ?? []).map((m) => ({
-      rank: m.role === 'user' ? 0 : m.role === 'system' ? 1 : 2,
+      // 排序与分类**同一处判定**（决策 252）：`kind` 是后端给的，界面不再各判一遍
+      // （此前这里用 `role` 三元式、下面用 `startsWith`，两个判定点迟早不一致）。
+      rank: m.kind === 'mine' ? 0 : m.kind === 'fm' ? 2 : 1,
       view: {
         key: `m${m.id}`,
-        kind:
-          m.role === 'user'
-            ? 'mine'
-            : m.role === 'system'
-              ? m.content.startsWith(FAILED_TURN_MARK)
-                ? 'failed'
-                : 'console'
-              : 'fm',
+        kind: m.kind,
         content: m.content,
         at: m.created_at,
         streaming: false,
@@ -424,7 +400,8 @@
         briefing: m.briefing,
         needsPairing: false,
         proposal: null,
-        proactive: m.role === 'assistant' && m.content.startsWith(WATCH_MARK),
+        // 值守播报（决策 209④）：与 `kind` 正交的那个布尔（决策 252③），也由后端判。
+        proactive: m.proactive,
         // 归因类别（决策 235① / 238）：**用后端解析并翻好的那一份**（`attribution_label`），
         // 界面不自己从稳定标识再映射一遍——两份映射迟早给出两个词，而「四类各一个词」
         // 是同一件事。未定位时后端给 null，界面就不显示（不编一个假的类别）。

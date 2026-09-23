@@ -18,32 +18,54 @@ export type TaskStatus =
   | 'failed'
   | 'cancelled';
 
-export type Stage =
-  | 'init'
-  | 'architect-design'
-  | 'develop-design'
-  | 'test-design'
-  | 'sync-check'
-  | 'develop'
-  | 'review'
-  | 'test'
-  | 'merge'
-  | 'done';
+/**
+ * 流水线阶段的**成员表**（决策 252 / 253）。
+ *
+ * 成员集是**权威**而不是副本：`Stage` 联合由它推出来（`(typeof STAGE_MEMBERS)[number]`），
+ * 故二者不可能漂——手抄两份联合与数组才会漂。它与后端 `crates/core/src/types.rs` 的
+ * `Stage` 枚举由 `tests/fixtures/enum_members.json` 机器钉住
+ * （`lib/enumMembersFixture.test.ts`，两者**集合相等**：多一个值也红）。
+ *
+ * 顺序 = 后端的声明序 = 流程图全序（`ALL_STAGES` 的注释：「阶段全序（流程图顺序）」）。
+ * 展示用的格子顺序**不是**这一份——那是规格，走 `lib/stageConfigs.ts::STAGE_KEYS`。
+ */
+export const STAGE_MEMBERS = [
+  'init',
+  'architect-design',
+  'develop-design',
+  'test-design',
+  'sync-check',
+  'develop',
+  'review',
+  'test',
+  'merge',
+  'done',
+] as const;
+
+export type Stage = (typeof STAGE_MEMBERS)[number];
 
 export type Node = 'validate_input' | 'execute' | 'validate_output';
 
 export type CursorStatus = 'active' | 'waiting_join' | 'pending' | 'archived';
 
-export type PendingKind =
-  | 'info_insufficient'
-  | 'conflict_wait'
-  | 'retry_exhausted'
-  | 'user_decision'
-  | 'merge_approval'
-  | 'human_review'
-  | 'dependency_failed'
-  | 'context_overflow'
-  | 'timeout';
+/**
+ * pending 原因的**成员表**（决策 253 ②）——与 {@link STAGE_MEMBERS} 同一姿态：
+ * 成员集是权威，`PendingKind` 联合由它推出来，与后端 `types.rs::PendingKind` 由
+ * `tests/fixtures/enum_members.json` 机器钉住。
+ */
+export const PENDING_KIND_MEMBERS = [
+  'info_insufficient',
+  'conflict_wait',
+  'retry_exhausted',
+  'user_decision',
+  'merge_approval',
+  'human_review',
+  'dependency_failed',
+  'context_overflow',
+  'timeout',
+] as const;
+
+export type PendingKind = (typeof PENDING_KIND_MEMBERS)[number];
 
 export type ReviewMode = 'agent' | 'human';
 
@@ -944,6 +966,22 @@ export interface ForemanMessage {
   attribution_label?: string | null;
   /** 未定位的原因（`missing` / `四类之外` / …）；定位成功时为 `null`。 */
   attribution_reason?: string | null;
+  /**
+   * **这一行是什么**（决策 252）：`mine`（值班经理的话）/ `console`（操作台记的一轮）/
+   * `failed`（没跑起来的那一轮）/ `fm`（值班长的话）。
+   *
+   * 由**后端判定**：这三个前缀是后端拼进正文的，界面此前靠 `startsWith` 自己认——常量漂了
+   * 只是症状，「正文即接口」才是病。认不出的 `role` 值落到 `fm`（与 storage 层
+   * 「非法值不打垮查询、前端按 `=== "user"` 判定」的原口径一致）。
+   */
+  kind: 'mine' | 'console' | 'failed' | 'fm';
+  /**
+   * 这一轮是不是**值班长自己醒来说的**（值守播报，决策 209④）。
+   *
+   * 与 `kind` **正交**（决策 252③）：「自发的轮失败了」是可能的组合——那里 `kind = "failed"`
+   * 且 `proactive = false`（播报要求助理轮）。压成一个枚举会让这个组合从形状上不可能。
+   */
+  proactive: boolean;
 }
 
 /**
