@@ -17,7 +17,7 @@
 
 use std::sync::Arc;
 
-use agentpipeline_core::agent::repo::{Libgit2Repo, Oid, RepoId, SkillRepo};
+use agentpipeline_core::agent::repo::{Libgit2Repo, Oid, RepoId};
 use agentpipeline_core::config::Settings;
 use agentpipeline_core::storage::SkillSource;
 use agentpipeline_core::types::Provider;

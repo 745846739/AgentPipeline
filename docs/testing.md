@@ -36,10 +36,10 @@
 | `AGENTPIPELINE_HOME` 环境变量 | 默认 `~/.agentpipeline/` | 每测试独占临时目录 | 家目录硬编码 → 无法并行、无法隔离 |
 | 进程组终止器 trait | `kill_process_group` 真杀 | 记录调用 | 测试无可杀进程组，但超时路径仍要断言「杀了」 |
 | scheduler `tick()` 手动驱动 | 10s 周期 | 测试直接调用 | tick 六项职责（决策 55）逐项验证 |
-| **仓访问 trait `SkillRepo`**（决策 194 修订决策 172⑤ / 143，票 01） | `Libgit2Repo`（`crates/core/src/agent/repo.rs`：`head` 只 ls-remote、**不下载 pack**；`list_skills` / `read_skill` 走 libgit2 git 通道，`RemoteRedirect::None` **显式设**、`depth(1)`、字节上限在流式回调里守） | testkit 的**两层离线 fixture**：本地裸仓（快单测）与**离线 smart HTTP**（核心用例）；**不打真网络** | 这条来源下有多条真网络**无法稳定复现**的失败与策略路径（commit 取不到 / 技能目录不存在 / 对象哈希不符 / 传输超限与中断 / 不跟随跨站重定向），而票面要求它们互不混淆——只有把仓访问换成 trait 才能钉住（决策 194 裁决⑦） |
+| **仓访问的远端地址替换点**（决策 194 修订决策 172⑤ / 143，票 01；原 `SkillRepo` trait 已删，**决策 250**） | `Libgit2Repo`（`crates/core/src/agent/repo.rs`：`head` 只 ls-remote、**不下载 pack**；`list_skills` / `read_skill` 走 libgit2 git 通道，`RemoteRedirect::None` **显式设**、`depth(1)`、字节上限在流式回调里守），缺省对真 GitHub；替换原语是 `with_base(url)` / `AGENTPIPELINE_MARKET_GIT_BASE`（**非类型缝**） | testkit 的**两层离线 fixture**：本地裸仓（快单测）与**离线 smart HTTP**（核心用例），经上述替换点指向它们；**不打真网络** | 这条来源下有多条真网络**无法稳定复现**的失败与策略路径（commit 取不到 / 技能目录不存在 / 对象哈希不符 / 传输超限与中断 / 不跟随跨站重定向），而票面要求它们互不混淆——**替换远端地址**即可钉住（裁决⑦ 的要求不靠 trait：全仓只有一处 `impl`，类型从未变过，变的一直是 URL——决策 250 按删除测试删掉假 seam） |
 | **主题契约模块**（决策 169） | `frontend/src/theme/contract.ts`（token / 几何常量 / 15 枚 sprite / 状态映射的唯一事实源）+ 手工镜像的 `app.css` | `theme/contract.test.ts`（纯数据断言）+ `theme/css-parity.test.ts`（读 `app.css` 两个 token 块与契约**逐条比对**，并扫描全部组件禁止 token 块外裸十六进制颜色）+ playwright 在真应用上断言计算样式 | 30+ token 与 15 枚 sprite 的漂移**人工对照不现实**；`app.css` 是手工镜像（不引入代码生成——它还承载全站基元与移动版规则，整体生成化会让手改 CSS 变危险操作），镜像与事实源之间必须由机器发现不一致 |
 
-> 接缝只做可替换、不改语义：超时判定仍以 `Clock` 读数为唯一时钟源（决策 64）。**实现顺序要求：前四个接缝先于业务模块落地**（后补要翻全部模块签名）。第 5 条接缝（决策 194，`SkillRepo`——**条数仍是五条**，决策 194 修订决策 143 / 177 的措辞，形状从「网络出口加一条 `MarketClient`」换成「仓访问加一条 `SkillRepo`」）与第 6 条（决策 169，主题契约）同守此界——主题契约只承载**视觉数据**，不承载状态或业务语义，状态语义仍在 `stores` 与 `realtime/reduce.ts`。
+> 接缝只做可替换、不改语义：超时判定仍以 `Clock` 读数为唯一时钟源（决策 64）。**实现顺序要求：前四个接缝先于业务模块落地**（后补要翻全部模块签名）。第 5 条接缝（决策 194 立、**决策 250 校正形状**——**条数仍是五条**：从「网络出口加一条 `MarketClient`」换到「仓访问」时落地成了一条只有一处 `impl` 的 `SkillRepo` trait，是假 seam，已删；现指**远端地址替换点**（`with_base` / `AGENTPIPELINE_MARKET_GIT_BASE`——生产对 GitHub、测试对离线 fixture 服务，两条「adapter」在服务端））与第 6 条（决策 169，主题契约）同守此界——主题契约只承载**视觉数据**，不承载状态或业务语义，状态语义仍在 `stores` 与 `realtime/reduce.ts`。
 
 > **第二处扩展（决策 210，同样不是新接缝）：`StewardActionRunner`**（`crates/core/src/agent/tools.rs`）。
 > 托管放行的自动动作（`task resume continue` / `task unstick`）**怎么执行**由注入的那一位决定——

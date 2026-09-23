@@ -7,7 +7,7 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use agentpipeline_core::agent::repo::{Libgit2Repo, SkillRepo};
+use agentpipeline_core::agent::repo::Libgit2Repo;
 use agentpipeline_core::clock::SystemClock;
 use agentpipeline_core::config::{normalize_origin, Config, LogFormat};
 use agentpipeline_core::home::{
@@ -469,7 +469,7 @@ pub async fn serve(options: ServeOptions) -> anyhow::Result<ServerHandle> {
     // 缓存根放在家目录下而不是系统临时目录：取下来的裸仓要跨列表与安装两次请求复用，
     // 落在 /tmp 里会被系统清理器顺手删掉，表现为「刚列出来的 commit 忽然取不到」。
     let market_repos = config.market.resolved_repos();
-    let repo: Arc<dyn SkillRepo> = Arc::new(Libgit2Repo::new(home.root().join("market-repos")));
+    let repo = Arc::new(Libgit2Repo::new(home.root().join("market-repos")));
     // 值班长（决策 182）：与执行器共用同一个 LLM 出口。构造在 `AppState::new` 之前
     // ——那一步会消费掉 store / home / settings。
     let foreman = Arc::new(

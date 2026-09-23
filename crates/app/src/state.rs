@@ -2,7 +2,7 @@
 
 use std::sync::Arc;
 
-use agentpipeline_core::agent::repo::{Libgit2Repo, SkillRepo};
+use agentpipeline_core::agent::repo::Libgit2Repo;
 use agentpipeline_core::config::Settings;
 use agentpipeline_core::home::Home;
 use agentpipeline_core::pipeline::{Executor, ForemanRunner};
@@ -132,7 +132,7 @@ pub struct AppState {
     ///
     /// 生产在 `serve` 里注入 [`Libgit2Repo`]；L3 契约测试注入一个指向离线 smart HTTP
     /// fixture 的同一个实现，因此端点契约能在**完全离线**的前提下走**真 libgit2**。
-    pub repo: Arc<dyn SkillRepo>,
+    pub repo: Arc<Libgit2Repo>,
     /// `[market] github_repos` 归一后的仓名单（空名单 = 不从任何仓安装）。
     ///
     /// 启动时那一级；界面保存过之后由 [`AppState::market_override`] 盖过，读经
@@ -204,7 +204,7 @@ impl AppState {
 
     /// 生效的来源仓访问层（决策 194）。**不是 `Option`**：它没有"没配就用不了"的形态，
     /// 放行与否由仓名单判定，与这个实现无关。
-    pub fn repo(&self) -> Arc<dyn SkillRepo> {
+    pub fn repo(&self) -> Arc<Libgit2Repo> {
         Arc::clone(&self.repo)
     }
 
@@ -272,7 +272,7 @@ impl AppState {
     /// 注入来源仓访问层与 `config.toml` 那一级的仓名单（决策 194）。
     ///
     /// 空名单是**合法状态**（= 不从任何仓安装），端点会给出可操作报文。
-    pub fn with_repo(mut self, repo: Arc<dyn SkillRepo>, repos: Vec<String>) -> Self {
+    pub fn with_repo(mut self, repo: Arc<Libgit2Repo>, repos: Vec<String>) -> Self {
         self.repo = repo;
         self.configured_repos = repos;
         self

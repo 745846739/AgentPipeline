@@ -792,14 +792,15 @@ executor checkpoint 机制天然支持：
 > `crates/core/src/agent/skill_import.rs` 模块头）。从 GitHub 仓安装（决策 194）复用同一落盘入口——
 > 来源侧读出的技能目录重打成 `{name}/SKILL.md` 单根包后才交给它，故远程包不比本地上传的包享有更宽的路。
 
-> **仓访问接缝的注入姿态（决策 194，修订决策 143 第五条接缝）：** `crates/core/src/agent/repo.rs`
-> 的 `SkillRepo` trait（`head` / `list_skills` / `read_skill`）是本批**唯一新增的接缝**，生产实现是
-> 走 libgit2 git 通道的 `Libgit2Repo`；L3 契约测试注入 testkit 的**两层离线 fixture**（本地裸仓 /
-> 离线 smart HTTP），因此「commit 取不到」「技能目录不存在」「对象哈希不符」「传输超限与中断」
-> 这些**真网络没法稳定复现**的路径都成了确定性、离线的用例。仓名单为空是**合法状态**
-> （= 不装远程技能），端点返回一条说明怎么开的 400，而不是 500。上一代的自定 registry 客户端
-> （`AppState.market: Option<Arc<dyn MarketClient>>` / `HttpMarketClient` / testkit 的 `FakeMarket`）
-> 随那一层退场（决策 194）。
+> **仓访问接缝的注入姿态（决策 194 立，注入形态由决策 250 校正）：** 替换点是
+> `crates/core/src/agent/repo.rs` 的**远端地址**（`with_base(url)` / `AGENTPIPELINE_MARKET_GIT_BASE`）——
+> 生产走 libgit2 git 通道对真 GitHub（`Libgit2Repo`），测试把它指向 testkit 的**两层离线
+> fixture**（本地裸仓 / 离线 smart HTTP），因此「commit 取不到」「技能目录不存在」「对象哈希不符」
+> 「传输超限与中断」这些**真网络没法稳定复现**的路径都成了确定性、离线的用例。
+> （194 落地时写的 `SkillRepo` trait 因全仓只有一处 `impl`、测试从未注入第二种类型，按删除测试
+> 删掉——决策 250。）仓名单为空是**合法状态**（= 不装远程技能），端点返回一条说明怎么开的 400，
+> 而不是 500。上一代的自定 registry 客户端（`AppState.market: Option<Arc<dyn MarketClient>>` /
+> `HttpMarketClient` / testkit 的 `FakeMarket`）随那一层退场（决策 194）。
 
 > **`allowed_actions` 与端点的配对（决策 101 / 119）：** 前端对 `allowed_actions` 纯渲染，因此每个 `side_effect` 动作都必须有对应端点——`cancel` → `POST /tasks/{id}/cancel`、`split_task` → `POST /tasks/{id}/split`、`更换长上下文模型` → `POST /tasks/{id}/model-override`、`合入 / 返回修改` → `POST /tasks/{id}/merge/decision`（决策 119）。新增 side_effect 动作时必须同时新增端点，否则前端会出现点不动的按钮。
 
@@ -814,16 +815,17 @@ executor checkpoint 机制天然支持：
 | 进程组终止器 trait | 真杀进程组（决策 66） | 记录调用，不真杀 |
 | scheduler `tick()` | 10s 周期驱动 | 测试中手动调用 |
 
-**第五条接缝（决策 194 修订决策 143 / 177，票 01）：** 换形状——从「网络出口加一条 `MarketClient`」变成「**仓访问加一条 `SkillRepo`**」。**条数仍是五条**，自定 registry 退场后 `MarketClient` 那种「索引 → 下载字节」的形状**没有对应物**（没有索引、没有 `sha256`、字节来自 git 对象库），故新接缝按「仓访问」切。
+**第五条接缝（决策 194 修订决策 143 / 177，票 01；形状由决策 250 校正）：** 换形状——从「网络出口加一条 `MarketClient`」变成「**仓访问**」。**条数仍是五条**，自定 registry 退场后 `MarketClient` 那种「索引 → 下载字节」的形状**没有对应物**（没有索引、没有 `sha256`、字节来自 git 对象库），故新接缝按「仓访问」切。**决策 250**：194 当时把它落地成一条 `SkillRepo` trait，但全仓只有一处 `impl`、测试从未注入过第二种类型——真正的替换点一直是**远端地址**（`with_base` / `AGENTPIPELINE_MARKET_GIT_BASE`），trait 按删除测试删掉；第五条 = 仓访问的**远端地址替换点**（生产对 GitHub、测试对离线 fixture 服务）。
 （测试设计侧的同一条接缝见 [testing.md](testing.md) §3.1 的权威表；决策 169 的主题契约随之成为第六条。）
 
 | 接缝 | 生产实现 | 测试实现 |
 |---|---|---|
-| `SkillRepo` trait（`crates/core/src/agent/repo.rs`：`head` / `list_skills` / `read_skill`） | `Libgit2Repo`：`head` 只 ls-remote、**不下载 pack**；`list_skills` / `read_skill` 走 libgit2 的 git 通道（`RemoteRedirect::None` **显式设**、`depth(1)`、字节上限 64 MiB 在流式回调里守） | testkit 的**两层离线 fixture**：本地裸仓（快单测；**不能带 `depth`**——local transport 直接报 `shallow fetch is not supported by the local transport`）与**离线 smart HTTP**（核心用例：真 HTTP 传输 + `depth(1)` + 重定向策略 + 中断），**不打真网络** |
+| 仓访问的**远端地址替换点**（`with_base(url)` / `AGENTPIPELINE_MARKET_GIT_BASE`；原 `SkillRepo` trait 已删，决策 250） | `Libgit2Repo`（`crates/core/src/agent/repo.rs`：`head` 只 ls-remote、**不下载 pack**；`list_skills` / `read_skill` 走 libgit2 的 git 通道（`RemoteRedirect::None` **显式设**、`depth(1)`、字节上限 64 MiB 在流式回调里守）），缺省对真 GitHub | 上述替换点指向 testkit 的**两层离线 fixture**：本地裸仓（快单测；**不能带 `depth`**——local transport 直接报 `shallow fetch is not supported by the local transport`）与**离线 smart HTTP**（核心用例：真 HTTP 传输 + `depth(1)` + 重定向策略 + 中断），**不打真网络** |
 
 > 这是 v2 技能 effort **唯一新增**的接缝（决策 143 的「接缝数不随功能数线性增长」）。加它的
 > 理由与四条老接缝同构：这条来源下有多条**真网络无法稳定复现**的失败与策略路径（commit 取不到 /
 > 技能目录不存在 / 对象哈希不符 / 传输超限与中断 / 不跟随跨站重定向），而票面要求它们互不混淆——
-> 只有把仓访问换成 trait，这些路径才能被钉住（决策 194）。
+> 只有把仓访问指到离线 fixture（换远端地址），这些路径才能被钉住（决策 194 裁决⑦ 的要求；
+> 原以为要靠 trait，实测 URL 替换已覆盖——trait 由决策 250 删除）。
 
 > **实现顺序要求：四个接缝先于业务模块落地**——后补接缝要翻全部模块签名。逐项用例目录见 testing.md。

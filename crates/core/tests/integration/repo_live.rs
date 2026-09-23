@@ -25,7 +25,7 @@
 
 use std::path::PathBuf;
 
-use agentpipeline_core::agent::repo::{Libgit2Repo, Oid, RepoId, SkillRepo};
+use agentpipeline_core::agent::repo::{Libgit2Repo, Oid, RepoId};
 
 /// 冒烟用的真仓：一个**多技能、深度 2 段**的公开仓（实测 8 个技能）。
 const REPO: &str = "mattpocock/skills";

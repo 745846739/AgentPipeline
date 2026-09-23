@@ -9,7 +9,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 
 use agentpipeline_core::agent::client::LlmClient;
-use agentpipeline_core::agent::repo::{Libgit2Repo, SkillRepo};
+use agentpipeline_core::agent::repo::Libgit2Repo;
 use agentpipeline_core::agent::tools::CommandRecorder;
 use agentpipeline_core::config::Settings;
 use agentpipeline_core::pipeline::foreman::{situation_fingerprint, FOREMAN_FAILED_TURN_MARK};
@@ -65,7 +65,7 @@ async fn api_with_origins(settings: Settings, extra_origins: Vec<String>) -> Api
 /// 变成一次真实的超时等待。指向关闭的端口既保住了「不发真请求」，又让这类意外**立刻失败**
 /// （连接被拒，不是挂住）。技能来源自己的契约用例在 `crates/app/tests/integration/market.rs`，
 /// 那里注入的是指向离线 smart HTTP fixture 的真实现。
-fn offline_repo() -> Arc<dyn SkillRepo> {
+fn offline_repo() -> Arc<Libgit2Repo> {
     Arc::new(
         Libgit2Repo::new(std::env::temp_dir().join("agentpipeline-test-repos"))
             .with_base("http://127.0.0.1:1")
@@ -76,7 +76,7 @@ fn offline_repo() -> Arc<dyn SkillRepo> {
 async fn api_full(
     settings: Settings,
     extra_origins: Vec<String>,
-    skill_repo: Arc<dyn SkillRepo>,
+    skill_repo: Arc<Libgit2Repo>,
     market_repos: Vec<String>,
 ) -> Api {
     api_full_bind(
@@ -96,7 +96,7 @@ async fn api_full(
 async fn api_full_bind(
     settings: Settings,
     extra_origins: Vec<String>,
-    skill_repo: Arc<dyn SkillRepo>,
+    skill_repo: Arc<Libgit2Repo>,
     market_repos: Vec<String>,
     bind_host: &str,
 ) -> Api {

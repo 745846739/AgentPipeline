@@ -286,25 +286,10 @@ pub struct SkillRef {
     pub description: Option<String>,
 }
 
-/// 「从一个 GitHub 仓取技能」的访问层——本 effort 唯一新增的测试接缝
-/// （决策 194 修订决策 143/177 那条接缝的**形状**，条数仍是五条）。
-///
-/// 生产实现是 [`Libgit2Repo`]；离线测试用 testkit 的 `RepoFixture`（本地裸仓）与
-/// `SmartHttp`（离线 smart HTTP）喂**真 libgit2**，故默认门不打真网络。
-pub trait SkillRepo: Send + Sync + 'static {
-    /// 分支 tip（只 ls-remote，**不下载 pack**）。
-    fn head(&self, repo: &RepoId) -> BoxFuture<'static, Result<Oid>>;
-    /// 该 commit 下所有技能目录（含 `SKILL.md` 的目录即技能，与深度无关）。
-    fn list_skills(&self, repo: &RepoId, commit: &Oid)
-        -> BoxFuture<'static, Result<Vec<SkillRef>>>;
-    /// 读一个技能目录（含子树）成一个 [`SkillPackage`]。
-    fn read_skill(
-        &self,
-        repo: &RepoId,
-        commit: &Oid,
-        dir: &str,
-    ) -> BoxFuture<'static, Result<SkillPackage>>;
-}
+// 原 `pub trait SkillRepo` 已删（决策 250）：全仓只有一处 `impl`，测试真正的替换原语
+// 是 [`Libgit2Repo::with_base`] 与 `AGENTPIPELINE_MARKET_GIT_BASE`（远端地址——生产对
+// GitHub、测试对离线 fixture 服务），trait 从未提供过第二种 adapter，是假想 seam。
+// 三个读方法现为 [`Libgit2Repo`] 的固有方法，语义与签名逐字不变。
 
 // ─────────────────────────────── 纯函数 ───────────────────────────────
 
@@ -423,7 +408,7 @@ pub fn normalize_git_base(raw: &str) -> std::result::Result<String, String> {
 ///
 /// 顺序刻意如此：**先认 `default_branch()` 给的 symref 目标**（真服务器都会给），
 /// 认不出再回落到 `main` → `master` → 第一个 `refs/heads/*`。
-/// 做成纯函数是为了能脱开网络钉住这段挑选逻辑——它是 [`SkillRepo::head`] 唯一有分支的地方。
+/// 做成纯函数是为了能脱开网络钉住这段挑选逻辑——它是 [`Libgit2Repo::head`] 唯一有分支的地方。
 pub fn pick_default_tip<'a>(
     heads: &'a [(String, Oid)],
     default_branch: Option<&str>,
@@ -478,7 +463,7 @@ pub fn sanitize_dir(raw: &str) -> std::result::Result<String, String> {
 
 // ─────────────────────────── 生产实现 Libgit2Repo ───────────────────────────
 
-/// 用 libgit2 从 GitHub 取仓（[`SkillRepo`] 的生产实现）。
+/// 用 libgit2 从 GitHub 取仓。
 ///
 /// ## 取法固定 `depth(1)`
 ///
@@ -602,8 +587,9 @@ where
     }
 }
 
-impl SkillRepo for Libgit2Repo {
-    fn head(&self, repo: &RepoId) -> BoxFuture<'static, Result<Oid>> {
+impl Libgit2Repo {
+    /// 分支 tip（只 ls-remote，**不下载 pack**）。
+    pub fn head(&self, repo: &RepoId) -> BoxFuture<'static, Result<Oid>> {
         let repo = repo.clone();
         let url = repo.url(&self.inner.base);
         let probe = self.probe_dir();
@@ -663,7 +649,8 @@ impl SkillRepo for Libgit2Repo {
         })
     }
 
-    fn list_skills(
+    /// 该 commit 下所有技能目录（含 `SKILL.md` 的目录即技能，与深度无关）。
+    pub fn list_skills(
         &self,
         repo: &RepoId,
         commit: &Oid,
@@ -689,7 +676,8 @@ impl SkillRepo for Libgit2Repo {
         })
     }
 
-    fn read_skill(
+    /// 读一个技能目录（含子树）成一个 [`SkillPackage`]。
+    pub fn read_skill(
         &self,
         repo: &RepoId,
         commit: &Oid,
