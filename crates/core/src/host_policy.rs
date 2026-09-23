@@ -79,6 +79,31 @@ mod tests {
             "全输入表不该被悄悄裁短：{}",
             fixture.cases.len()
         );
+        // 形状守卫（与 vitest 侧同一把尺）：放行 / 拒绝两侧都非空——
+        // 退化成全 `true` 时逐行断言照样绿，那等于没测。
+        assert!(
+            fixture.cases.iter().any(|c| c.loopback),
+            "放行侧一行都不剩 = 表退化了"
+        );
+        assert!(
+            fixture.cases.iter().any(|c| !c.loopback),
+            "拒绝侧一行都不剩 = 表退化了"
+        );
+        // 必需行**按名**钉住：只数行数时，把 `::ffff:127.0.0.1` 换成任意多余行也能过 ≥20。
+        for required in [
+            "localhost.",
+            "LOCALHOST",
+            "127.0.0.1.evil.test",
+            "127.999.999.999",
+            "0.0.0.0",
+            "::ffff:127.0.0.1",
+            "[::1].",
+        ] {
+            assert!(
+                fixture.cases.iter().any(|c| c.input == required),
+                "缺必需行 {required:?}"
+            );
+        }
         for case in &fixture.cases {
             assert_eq!(
                 is_loopback(&case.input),

@@ -29,12 +29,14 @@ import { getApiBase } from '../api/config';
  * `lib/lanToggle.ts` 复用同一个口径，避免「什么算回环」出现两个答案。
  */
 export function isLoopbackHostname(hostname: string): boolean {
-  // URL 里的 IPv6 主机名带方括号（`http://[::1]:8788` 的 hostname 是 `[::1]`）
+  // URL 里的 IPv6 主机名带方括号（`http://[::1]:8788` 的 hostname 是 `[::1]`）。
+  // 归一顺序与 Rust 侧 host_policy::normalize 逐字一致（**先脱尾点、再脱方括号**）：
+  // `[::1].` 在两种顺序下答案不同——顺序漂了跨语言同一份表就会给两个答案（决策 246）。
   const host = hostname
     .trim()
     .toLowerCase()
-    .replace(/^\[|\]$/g, '')
-    .replace(/\.$/, '');
+    .replace(/\.$/, '')
+    .replace(/^\[|\]$/g, '');
   if (host === 'localhost' || host === '::1') return true;
   // 八位组范围：`127.999.999.999` 形状合法但解析不成 IP 字面量（决策 246）
   if (!/^127(\.\d{1,3}){3}$/.test(host)) return false;

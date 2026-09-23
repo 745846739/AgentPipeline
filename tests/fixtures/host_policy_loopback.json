@@ -7,6 +7,7 @@
     { "input": "  LocalHost  ", "loopback": true },
     { "input": "::1", "loopback": true },
     { "input": "[::1]", "loopback": true },
+    { "input": "[::1].", "loopback": true },
     { "input": "127.0.0.1", "loopback": true },
     { "input": "127.0.0.2", "loopback": true },
     { "input": "127.9.9.9", "loopback": true },

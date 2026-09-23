@@ -43,6 +43,22 @@ describe('回环判定共享表（决策 246，与 Rust host_policy 同源）', 
     // 放行 / 拒绝两侧都非空——谓词收窄是安全语义，只测一侧等于没测
     expect(fixture.cases.some((c) => c.loopback)).toBe(true);
     expect(fixture.cases.some((c) => !c.loopback)).toBe(true);
+    // 必需行按名钉住（与 Rust 表测试同一把尺）：只数行数时，
+    // 把 `::ffff:127.0.0.1` 换成任意多余行也能过 ≥20
+    for (const required of [
+      'localhost.',
+      'LOCALHOST',
+      '127.0.0.1.evil.test',
+      '127.999.999.999',
+      '0.0.0.0',
+      '::ffff:127.0.0.1',
+      '[::1].',
+    ]) {
+      expect(
+        fixture.cases.some((c) => c.input === required),
+        `缺必需行 ${required}`,
+      ).toBe(true);
+    }
   });
 
   it('逐行断言 isLoopbackHostname 与 fixture 一致（与 Rust 表测试同一方向）', () => {
