@@ -408,28 +408,15 @@ pub fn normalize_git_base(raw: &str) -> std::result::Result<String, String> {
     if host.is_empty() {
         return Err("基础地址没有主机名".into());
     }
-    if scheme == "http" && !is_loopback_host(&host) {
+    // 判据走 host_policy（决策 246 的唯一实现）——原先是本文件自带的一份 `IpAddr` 谓词，
+    // 其「前缀伪装不算回环」断言已迁入 `host_policy` 的共享表测试。
+    if scheme == "http" && !crate::host_policy::is_loopback(&host) {
         return Err(format!(
             "非回环的主机必须用 https：{value}。明文 http 挡不住中间人——\
              攻击者可以替换整份技能正文（决策 177③）"
         ));
     }
     Ok(format!("{scheme}://{rest}"))
-}
-
-/// 回环主机判定。
-///
-/// **必须按 IP 字面量解析，不能按前缀匹配**：`starts_with("127.")` 会把
-/// `127.0.0.1.evil.test` 也判成回环——那是一个外部域名，却因此拿到了明文 http 的放行。
-/// 这条是放行规则本身的一环，所以用 `IpAddr::is_loopback()`（IPv4 的 `127.0.0.0/8`
-/// 与 IPv6 的 `::1` 正是它的定义）而不是自己拼判断。
-pub fn is_loopback_host(host: &str) -> bool {
-    if host.eq_ignore_ascii_case("localhost") {
-        return true;
-    }
-    host.parse::<std::net::IpAddr>()
-        .map(|addr| addr.is_loopback())
-        .unwrap_or(false)
 }
 
 /// 从广告的 ref 列表里挑出「默认分支的 tip」。
@@ -1645,16 +1632,9 @@ mod tests {
         }
     }
 
-    #[test]
-    fn loopback_hosts_cover_the_whole_127_slash_8() {
-        assert!(is_loopback_host("127.0.0.1"));
-        assert!(is_loopback_host("127.9.9.9"));
-        assert!(is_loopback_host("localhost"));
-        assert!(is_loopback_host("::1"));
-        assert!(!is_loopback_host("127.0.0.1.evil.test"));
-        assert!(!is_loopback_host("github.com"));
-        assert!(!is_loopback_host("0.0.0.0"));
-    }
+    // 回环谓词的表测试已随谓词迁到 `crate::host_policy`（共享 fixture 逐行断言，
+    // 决策 246）——原先 `loopback_hosts_cover_the_whole_127_slash_8` 的七条断言
+    // 全部由 `tests/fixtures/host_policy_loopback.json` 承接。
 
     // ── 默认分支的挑选（`head()` 唯一有分支的地方） ──
 

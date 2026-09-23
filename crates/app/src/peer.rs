@@ -57,11 +57,11 @@ pub fn peer_is_loopback(extensions: &Extensions) -> bool {
 /// 「需重启并绑定 0.0.0.0」，决策 167）与票 07 的 `AppState::lan_mode()`（决定配对令牌
 /// 是否生效）。故它必须与对端地址判定住在同一处，否则「绑定在 0.0.0.0」与「请求来自
 /// 局域网」两套判断会各自漂移。
+///
+/// 判据走 `host_policy`（决策 246 的唯一实现）：原先是本文件的一份 `matches!`，
+/// 大小写敏感（`LOCALHOST` 与另外几处判得不一样），收敛后 `LOCALHOST` 四处一个答案。
 pub fn is_loopback_bind(host: &str) -> bool {
-    matches!(host, "127.0.0.1" | "localhost" | "::1")
-        || host
-            .parse::<std::net::IpAddr>()
-            .is_ok_and(|ip| ip.is_loopback())
+    agentpipeline_core::host_policy::is_loopback(host)
 }
 
 #[cfg(test)]
@@ -164,6 +164,9 @@ mod tests {
         assert!(is_loopback_bind("localhost"));
         assert!(is_loopback_bind("::1"));
         assert!(is_loopback_bind("127.0.0.2"));
+        // 大小写与尾点与另外两处（出口策略 / 技能来源仓）同一个答案（决策 246）
+        assert!(is_loopback_bind("LOCALHOST"));
+        assert!(is_loopback_bind("localhost."));
         assert!(!is_loopback_bind("0.0.0.0"), "0.0.0.0 是全网卡绑定，非回环");
         assert!(!is_loopback_bind("192.168.1.10"));
     }

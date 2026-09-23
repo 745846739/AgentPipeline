@@ -179,14 +179,15 @@ impl NetworkPolicy {
         )))
     }
 
-    /// 某个主机是否放行（回环恒放行）。
+    /// 某个主机是否放行（回环恒放行；判据走 [`crate::host_policy::is_loopback`]——
+    /// 「什么算回环」的唯一实现，决策 246）。
     pub fn allows(&self, host: &str) -> bool {
+        if crate::host_policy::is_loopback(host) {
+            return true;
+        }
         let host = normalize_host(host);
         if host.is_empty() {
             return false;
-        }
-        if is_loopback(&host) {
-            return true;
         }
         self.allow_hosts
             .iter()
@@ -454,23 +455,6 @@ fn normalize_host(raw: &str) -> String {
     without_dot.to_string()
 }
 
-/// 回环判定，规范形态（决策 246）：归一 → 能 `parse::<IpAddr>` 就走 `is_loopback()` → 否则判 `localhost`。
-///
-/// **不按 `127.` 前缀匹配**：`127.evil.test` 是外部域名（DNS 可解析到攻击者自己的机器），
-/// 前缀匹配会把这类伪装放行成回环豁免——那正是决策 246 收窄语义的直接起因。
-/// 能到回环的 IPv4-mapped 形态（`::ffff:127.0.0.1`）也拒：按模块「错的方向是多拦」的偏向，
-/// 不为它开特例。
-fn is_loopback(host: &str) -> bool {
-    let host = normalize_host(host);
-    if host
-        .parse::<std::net::IpAddr>()
-        .is_ok_and(|ip| ip.is_loopback())
-    {
-        return true;
-    }
-    host == "localhost"
-}
-
 fn rule_matches(rule: &str, host: &str) -> bool {
     if rule == "*" {
         return true;
@@ -615,29 +599,6 @@ mod tests {
             "wget http://127.0.0.1/npm-package.tgz",
         ] {
             assert!(p.check(cmd).is_ok(), "{cmd}");
-        }
-    }
-
-    /// 决策 246 的规范形态：放行侧与拒绝侧逐个钉住（两侧都要，谓词收窄是本票的安全语义）。
-    #[test]
-    fn loopback_predicate_follows_the_canonical_form() {
-        for host in [
-            "localhost",
-            "localhost.",
-            "LOCALHOST",
-            "127.0.0.1",
-            "127.0.0.2",
-            "::1",
-        ] {
-            assert!(is_loopback(host), "{host} 是回环，该放");
-        }
-        for host in [
-            "127.evil.test",
-            "127.0.0.1.evil.test",
-            "0.0.0.0",
-            "::ffff:127.0.0.1",
-        ] {
-            assert!(!is_loopback(host), "{host} 不是回环，该拒");
         }
     }
 

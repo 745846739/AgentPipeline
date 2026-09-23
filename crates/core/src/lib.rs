@@ -15,6 +15,7 @@ pub mod config;
 pub mod error;
 pub mod git;
 pub mod home;
+pub mod host_policy;
 pub mod metrics;
 pub mod pipeline;
 pub mod process;

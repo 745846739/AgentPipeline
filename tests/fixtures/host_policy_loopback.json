@@ -1,0 +1,25 @@
+{
+  "$comment": "跨语言回环判定表（决策 246；票 host-policy/02）。\n「什么算本机」的唯一共享规格：Rust 侧 crates/core/src/host_policy.rs 的表测试与\n前端 localPage.test.ts 读同一份、同一断言方向——一侧改了规范另一侧没跟时，\n落后的那一侧变红（「Rust 改了规范前端没跟」从此有落点）。\n归一规则两侧各自实现、语义一致：去空白 / 转小写 / 去一个尾点 / 脱方括号；\n能解析成 IP 字面量的走 is_loopback()，否则判 localhost。\n注意：IPv6 只收规范形态 ::1 / [::1]（非规范写法如 0:0:0:0:0:0:0:1 不进表——\nTS 侧不做 IPv6 解析，表内只放两侧都能独立判定的输入）。",
+  "cases": [
+    { "input": "localhost", "loopback": true },
+    { "input": "localhost.", "loopback": true },
+    { "input": "LOCALHOST", "loopback": true },
+    { "input": "  LocalHost  ", "loopback": true },
+    { "input": "::1", "loopback": true },
+    { "input": "[::1]", "loopback": true },
+    { "input": "127.0.0.1", "loopback": true },
+    { "input": "127.0.0.2", "loopback": true },
+    { "input": "127.9.9.9", "loopback": true },
+    { "input": "127.evil.test", "loopback": false },
+    { "input": "127.0.0.1.evil.test", "loopback": false },
+    { "input": "127.0.0.1.evil.com", "loopback": false },
+    { "input": "localhost.evil.com", "loopback": false },
+    { "input": "127.999.999.999", "loopback": false },
+    { "input": "0.0.0.0", "loopback": false },
+    { "input": "::ffff:127.0.0.1", "loopback": false },
+    { "input": "192.168.3.12", "loopback": false },
+    { "input": "10.0.0.5", "loopback": false },
+    { "input": "github.com", "loopback": false },
+    { "input": "", "loopback": false }
+  ]
+}
