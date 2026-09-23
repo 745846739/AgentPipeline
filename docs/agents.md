@@ -900,7 +900,8 @@ cross_family_judge = false
 allow_dirty_worktree_merge = false
 
 # run_command 的出口放行主机（决策 179，票 12）。**默认空 = 只放行回环**
-# （localhost / 127.* / ::1）。条目形态：精确主机、`*.example.com`（子域通配，落在点边界上）、
+# （localhost / 127.0.0.0/8 的 IP 字面量 / ::1——前缀伪装如 127.evil.test 不算，
+# 决策 246）。条目形态：精确主机、`*.example.com`（子域通配，落在点边界上）、
 # `*`。写错在解析期 fail fast。这是「市场下载的技能 + agent 有无限 shell」在工具层的兜底：
 # 只约束 agent 主动经 run_command 发起的调用，**不是安全边界**（残余风险见 §12.15）。
 # egress_allow_hosts = ["api.example.com", "*.internal.example.com"]
