@@ -258,7 +258,8 @@ pub fn allowed_actions(reason: &PendingReason, cursor_id: Option<&str>) -> Vec<A
             AllowedAction::side_effect("cancel", "终止任务"),
         ],
         (PendingKind::Timeout, _) => vec![
-            AllowedAction::goto("重试执行", reason.stage, Node::Execute),
+            // 落点 = 阶段入口（决策 69）：设计类阶段硬编码 Execute 会 400（同决策 159 的形状）
+            AllowedAction::goto("重试执行", reason.stage, entry_node(reason.stage)),
             AllowedAction::resume("skip", "强制进入下一阶段"),
             AllowedAction::side_effect("cancel", "终止任务"),
         ],
@@ -422,6 +423,35 @@ mod tests {
                 target.node,
                 entry_node(stage),
                 "{stage}: goto 落点必须是本阶段入口节点（决策 69）"
+            );
+        }
+    }
+
+    #[test]
+    fn timeout_goto_lands_on_stage_entry_for_every_stage() {
+        // 决策 69 同款漏网（票 12 的形状，由超时路径触发）：Timeout 行曾硬编码 Execute，
+        // 设计类阶段超时后的「重试执行」在端点上必然 400，而 retry_exhausted 的用例钉不到它。
+        for stage in [
+            Stage::Init,
+            Stage::ArchitectDesign,
+            Stage::DevelopDesign,
+            Stage::TestDesign,
+            Stage::Develop,
+            Stage::Review,
+            Stage::Test,
+            Stage::Merge,
+        ] {
+            let r = reason(PendingKind::Timeout, stage, None);
+            let goto = allowed_actions(&r, None)
+                .into_iter()
+                .find(|a| a.action == "goto")
+                .unwrap_or_else(|| panic!("{stage}: timeout 缺 goto"));
+            let target = goto.target.as_ref().unwrap();
+            assert_eq!(target.stage, stage, "{stage}: 重试应落回本阶段");
+            assert_eq!(
+                target.node,
+                entry_node(stage),
+                "{stage}: timeout 的 goto 落点必须是本阶段入口节点（决策 69）"
             );
         }
     }
