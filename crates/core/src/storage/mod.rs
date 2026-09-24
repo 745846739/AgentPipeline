@@ -50,6 +50,10 @@ pub struct Store {
     home: Home,
     /// 单次会话落库的最大字符数（§3 `conversation_max_chars`，超出截断）。
     conversation_max_chars: usize,
+    /// 离线通知出口（决策 268）：`None` = `[notify].webhook_url` 没配，整段关死。
+    /// `Arc<RwLock<..>>` 而不是裸 `RwLock`：`Store` 按值 Clone，裸锁会被一起复制、
+    /// 两份状态从此各记各的节流——`Arc` 让所有克隆看见同一个出口与同一份状态。
+    notifier: Arc<std::sync::RwLock<Option<Arc<crate::notify::WebhookNotifier>>>>,
 }
 
 /// `conversation_max_chars` 的默认值（§3 全局配置表）。
@@ -99,6 +103,7 @@ impl Store {
             clock,
             home,
             conversation_max_chars: DEFAULT_CONVERSATION_MAX_CHARS,
+            notifier: Arc::new(std::sync::RwLock::new(None)),
         })
     }
 
@@ -150,6 +155,21 @@ impl Store {
     /// 调整会话截断阈值（executor 按 Settings 注入；测试用小值验证截断）。
     pub fn set_conversation_max_chars(&mut self, max_chars: usize) {
         self.conversation_max_chars = max_chars;
+    }
+
+    /// 挂上离线通知出口（决策 268）：app 层在 `[notify].webhook_url` 在场时调一次；
+    /// 不调 = 没配 = 整段关死。`&self` 而非 `&mut self`——锁在 `Arc` 字段里，
+    /// 先创建的克隆同样看得见这次挂接。
+    pub fn set_notifier(&self, notifier: Arc<crate::notify::WebhookNotifier>) {
+        match self.notifier.write() {
+            Ok(mut slot) => *slot = Some(notifier),
+            Err(_) => tracing::error!("通知出口挂接失败（锁中毒），本轮没有离线通知"),
+        }
+    }
+
+    /// 当前通知出口（`note_attention` 的触发点取用）。
+    pub(crate) fn notifier(&self) -> Option<Arc<crate::notify::WebhookNotifier>> {
+        self.notifier.read().ok().and_then(|slot| slot.clone())
     }
 }
 

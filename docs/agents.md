@@ -940,11 +940,20 @@ dir = "~/.agentpipeline/skills"      # 覆盖技能根；缺省回落 {home}/ski
 # 放行一个仓 = 允许从它下载引导 agent 的正文。旧的 allowed_sources 键已由本键取代：
 # 配置里仍写着它会让启动失败（deny_unknown_fields，fail fast 姿态），报错文案点明被 github_repos 取代。
 # github_repos = ["obra/superpowers", "mattpocock/skills"]
+
+[notify]
+# 离线通知（决策 268）：webhook_url 缺席 = 整段关死（零配置零行为）。
+# URL 含 token 即秘密——只进本文件，不入台账、不入日志明文。
+# cooldown_sec 是**每类**节流、quiet_hours 是免打扰 [start, end) 跨零点按本地整点，
+# 两者的缺省与前端 toast 同一张表（tests/fixtures/notification_policy.json 双端钉住）。
+# webhook_url = "https://chat.example/hooks/xxxx"
+# cooldown_sec = 300
+# quiet_hours = [22, 8]
 ```
 
 > **配置校验姿态（票 16 / 决策 172）：** `config.toml` 中未知的 section / 键一律**拒绝启动**
 > （`deny_unknown_fields` 施加于 `Config` / `ServerConfig` / `PipelineOverrides` /
-> `LoggingConfig` / `PromptsConfig` / `SkillsConfig` / `MarketConfig`），不静默忽略——与决策
+> `LoggingConfig` / `PromptsConfig` / `SkillsConfig` / `MarketConfig` / `NotifyConfig`），不静默忽略——与决策
 > 47 / 103 / 134 的 fail fast 姿态一致。`[logging]` 的 `format` 与已废弃 `json_file` 同时出现
 > 同样报错。
 >

@@ -1,0 +1,30 @@
+{
+  "$comment": "跨语言通知礼貌表（决策 268③，照决策 246 回环表先例）：Rust 侧 crates/core/src/notify.rs 的表测试与前端 notificationPolicyFixture.test.ts 读同一份、同一断言方向——一侧改了规范另一侧没跟时，落后的那一侧变红。语义：failed 恒发（免打扰与每类节流都不拦）、免打扰 [22,8) 跨零点含头不含尾按整点、pending 免打扰豁免但节流照走、其余类两者都受；节流边界严格小于（age==300 放行、299 拦下）。时间只给「本地小时」——两侧各自不涉时区换算。不在表内（显式差异，记在决策 268 与 notify.rs 头注）：notifyOn 每类开关（前端用户偏好面，后端没有）、cancelled 类（前端缺省 false 永不弹，后端按通用类规则）——故本表只收 pending/done/failed 三类。",
+  "policy": { "cooldown_sec": 300, "quiet_hours": [22, 8] },
+  "cases": [
+    { "id": "failed-quiet-bypass", "cls": "failed", "hour": 23, "age_sec": null, "expected": true },
+    { "id": "failed-ignores-cooldown", "cls": "failed", "hour": 3, "age_sec": 100, "expected": true },
+    { "id": "failed-early-hour", "cls": "failed", "hour": 3, "age_sec": null, "expected": true },
+    { "id": "failed-noon-fresh", "cls": "failed", "hour": 12, "age_sec": 100, "expected": true },
+
+    { "id": "pending-quiet-none", "cls": "pending", "hour": 3, "age_sec": null, "expected": true },
+    { "id": "pending-cooldown-blocks", "cls": "pending", "hour": 3, "age_sec": 100, "expected": false },
+    { "id": "cooldown-strict-300", "cls": "pending", "hour": 3, "age_sec": 300, "expected": true },
+    { "id": "cooldown-299-blocks", "cls": "pending", "hour": 3, "age_sec": 299, "expected": false },
+    { "id": "pending-noon-none", "cls": "pending", "hour": 12, "age_sec": null, "expected": true },
+    { "id": "pending-noon-cooldown", "cls": "pending", "hour": 12, "age_sec": 100, "expected": false },
+    { "id": "pending-noon-passes-301", "cls": "pending", "hour": 12, "age_sec": 301, "expected": true },
+    { "id": "pending-quiet-exempt", "cls": "pending", "hour": 23, "age_sec": 300, "expected": true },
+    { "id": "pending-quiet-still-cooled", "cls": "pending", "hour": 23, "age_sec": 100, "expected": false },
+
+    { "id": "done-noon-none", "cls": "done", "hour": 12, "age_sec": null, "expected": true },
+    { "id": "done-noon-cooldown", "cls": "done", "hour": 12, "age_sec": 100, "expected": false },
+    { "id": "done-noon-strict-300", "cls": "done", "hour": 12, "age_sec": 300, "expected": true },
+    { "id": "done-noon-299-blocks", "cls": "done", "hour": 12, "age_sec": 299, "expected": false },
+    { "id": "done-hour8-not-quiet", "cls": "done", "hour": 8, "age_sec": null, "expected": true },
+    { "id": "done-quiet-silenced", "cls": "done", "hour": 23, "age_sec": null, "expected": false },
+    { "id": "done-early-hour-silenced", "cls": "done", "hour": 3, "age_sec": null, "expected": false },
+    { "id": "done-quiet-cooldown-irrelevant", "cls": "done", "hour": 23, "age_sec": 100, "expected": false },
+    { "id": "done-midnight-silenced", "cls": "done", "hour": 0, "age_sec": null, "expected": false }
+  ]
+}

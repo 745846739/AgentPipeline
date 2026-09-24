@@ -154,7 +154,7 @@ pub fn foreman_turn_in_flight(session_id: &str) -> bool {
 /// A 层的六个新读数（票 01）**一律复用后端既有口径**，不新造一套：看板读任务表、
 /// 指标走 `metrics::*` 纯函数、项目 / 阶段配置 / 技能 / provider 各读自己那张表的既有读法。
 /// 唯一需要加工的是 provider：库里存的是**明文密钥**（决策 112），故只回显掩码。
-pub const FOREMAN_TOOL_SPECS: [ForemanToolSpec; 23] = [
+pub const FOREMAN_TOOL_SPECS: [ForemanToolSpec; 24] = [
     ForemanToolSpec {
         name: "read_task",
         label: "读任务台账",
@@ -268,6 +268,20 @@ pub const FOREMAN_TOOL_SPECS: [ForemanToolSpec; 23] = [
                      路径参数必须落在你的域内（家目录根，data/ 读不到）；sample 只能对本服务自己的\
                      进程树取证。取证优先用它，不要等人按键：它是「夜里自己把事定死」的那只手。",
         parameters: r#"{"type":"object","properties":{"command":{"type":"string","enum":["date","ps","pgrep","lsof","wc","tail","sample"],"description":"白名单里的命令名（不经 shell，直接 exec）"},"args":{"type":"array","items":{"type":"string"},"description":"命令参数（必须是字符串数组，例如 [\"-n\",\"50\",\"logs/agentpipeline.log\"]；字符串形态会被拒）"},"timeout_sec":{"type":"integer","description":"超时秒数（可选，缺省按阶段配置）"}},"required":["command"]}"#,
+    },
+    // 内容搜索（决策 267 / 票 01）：只读层的找内容之手——纯 Rust 正则 + 域内行走，
+    // 不碰系统二进制（grep/rg 的旗标差异与二进制在场都不再是它的前提）。与
+    // `run_readonly` 同属只读层：不受档位管（改不了任何东西，237 判据）、值守轮
+    // deny 清单**不摘**它（夜里找证据不需要人在场）。
+    ForemanToolSpec {
+        name: "search_content",
+        label: "搜内容",
+        description: "在你的文件域里**按正则找内容**（报错串、配置键、函数名落在哪几处）。\
+                     pattern 是正则（如 `timeout_sec|TIMEOUT`，区分大小写）；path 缺省整个\
+                     域根，也可指定域内子目录（data/ 读不到——与 read_file 同一条域规则）。\
+                     不跟符号链接；二进制文件跳过；命中按「路径:行号:行文本」带回并有行数\
+                     上限。列文件名用 list_dir、跑诊断命令用 run_readonly——找**内容**用它。",
+        parameters: r#"{"type":"object","properties":{"pattern":{"type":"string","description":"正则表达式（区分大小写）"},"path":{"type":"string","description":"从哪个目录开始找（相对域根，缺省整个域；data/ 被拒）"}},"required":["pattern"]}"#,
     },
     // 受治理的网口（决策 266 / 票 02）：GET-only、https 出环、白名单走 `NetworkPolicy`
     // **同一张**（决策 179，零第二版本）、每次取数与每次被拒都落命令台账。同属只读层故
@@ -589,6 +603,92 @@ pub const FOREMAN_PARTIAL_TURN_MARK: &str = "【未收口】";
 /// 2000 字），按轮数裁会让长轮挤出上下文、短轮浪费预算。被裁掉的历史仍在库里（`list_foreman_messages`
 /// 只影响这一轮注入了什么，不影响台账）。
 pub const FOREMAN_HISTORY_BUDGET_CHARS: usize = 24_000;
+
+/// 上下文压缩（决策 269 / 票 foreman-within-boundary 03）的锚点前缀标记。
+/// 锚点以**一条 user 轮**的形态带头拼进历史头部（system 行重注入走 user 的先例，
+/// 204 同姿态）；测试按它认锚点（`over_budget_history_is_summarized_…`）。
+pub const COMPACTION_MARK: &str = "【更早的对话已压缩成下面这段摘要——原始轮次仍在班次台账里】";
+
+/// 摘要器的专用指令（269②：同一 `llm.complete`、同 provider 的**无工具**小补全）。
+const SUMMARIZER_SYSTEM_PROMPT: &str = "你是对话历史压缩器。把给定的历史压成**一段摘要**，\
+    作为值班长后续轮次的上下文锚点。保留：任务与结论、关键报错与证据原文（尽量短）、\
+    值班经理给过的方向与决定、未决问题与承诺。丢弃：寒暄、重复、过程细节。\
+    只输出摘要正文——不要标题、不要解释、不要列表符号。";
+/// 摘要调用的绝对上限：它是主轮之外的一次附加调用，挂住不能把整轮拖死
+/// （超时即回退现状，269④）。
+const SUMMARIZER_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
+/// 摘要输出上限（锚点自身要能进预算算术，269②）。
+const SUMMARIZER_MAX_TOKENS: u32 = 800;
+const SUMMARIZER_MAX_CHARS: usize = 4_000;
+/// 摘要输入上限：掉出预算的区间可能很长，超限**留尾巴**（离窗口最近的轮次最要紧）。
+const SUMMARIZER_INPUT_MAX_CHARS: usize = 60_000;
+/// 锚点缓存的会话槽数（FIFO 淘汰；重启重算可接受——锚点不落库，269③）。
+const COMPACTION_CACHE_SLOTS: usize = 16;
+
+/// 一条会话的压缩缓存（决策 269③）：`covered_until` = 摘要已覆盖到的消息 id
+/// （第一条**没**被覆盖的那条）。窗口边界在会话内单调前进，下一轮从这里接着增量压
+/// ——每条轮次一生只被压一次，最老原文不整段重发。
+#[derive(Clone)]
+struct CompactionEntry {
+    covered_until: i64,
+    summary: String,
+}
+
+/// 缓存本体：按会话分槽、FIFO 淘汰（上限 [`COMPACTION_CACHE_SLOTS`]）。
+#[derive(Default)]
+struct CompactionCache {
+    entries: HashMap<String, CompactionEntry>,
+    order: std::collections::VecDeque<String>,
+}
+
+impl CompactionCache {
+    fn get(&self, session: &str) -> Option<&CompactionEntry> {
+        self.entries.get(session)
+    }
+
+    fn put(&mut self, session: &str, entry: CompactionEntry) {
+        if !self.entries.contains_key(session) {
+            while self.order.len() >= COMPACTION_CACHE_SLOTS {
+                if let Some(old) = self.order.pop_front() {
+                    self.entries.remove(&old);
+                }
+            }
+            self.order.push_back(session.to_string());
+        }
+        self.entries.insert(session.to_string(), entry);
+    }
+}
+
+/// 摘要器的输入（269③）：已有摘要打头（增量）+ 新掉出预算的轮次逐条带发言者；
+/// 整段超限时留尾巴——首条掉队的原文从此只活在旧摘要里，不整段重发。
+fn summarize_input(newly: &[ForemanMessage], prefix: Option<&str>) -> String {
+    let mut out = String::new();
+    match prefix {
+        Some(p) => {
+            out.push_str("【已有摘要】\n");
+            out.push_str(p);
+            out.push_str("\n\n【新掉出预算的轮次】\n");
+        }
+        None => out.push_str("【掉出预算的对话历史】\n"),
+    }
+    for m in newly {
+        let who = if m.role == crate::storage::foreman::FOREMAN_ROLE_USER {
+            "值班经理"
+        } else if m.role == crate::storage::foreman::FOREMAN_ROLE_SYSTEM {
+            "操作台"
+        } else {
+            "值班长"
+        };
+        out.push_str(&format!("[{who}]\n{}\n\n", m.content));
+    }
+    let n = out.chars().count();
+    if n > SUMMARIZER_INPUT_MAX_CHARS {
+        let kept: String = out.chars().skip(n - SUMMARIZER_INPUT_MAX_CHARS).collect();
+        format!("（更早部分略）\n{kept}")
+    } else {
+        out
+    }
+}
 
 /// 一次性从库里取出的历史行数上限——真正的裁剪判据是字符预算，
 /// 这个数字只是「别把整晚的对话都读进内存」的粗兜底。
@@ -1012,6 +1112,9 @@ pub struct ForemanRunner {
     steward_actions: Option<Arc<dyn crate::agent::tools::StewardActionRunner>>,
     /// 一轮回话的绝对上限（测试注入；生产走 `node_max_duration_sec` / 阶段覆盖）。
     turn_timeout: Option<std::time::Duration>,
+    /// 上下文压缩的每会话锚点缓存（决策 269③）。锁只在读改写缓存时短暂持有——
+    /// 摘要调用本身在锁外跑，绝不持锁跨 await。
+    compaction: Mutex<CompactionCache>,
 }
 
 impl ForemanRunner {
@@ -1042,6 +1145,7 @@ impl ForemanRunner {
             sse,
             steward_actions: None,
             turn_timeout: None,
+            compaction: Mutex::new(CompactionCache::default()),
         }
     }
 
@@ -1075,6 +1179,131 @@ impl ForemanRunner {
 
     /// 回一句话，落进指定的会话。
     ///
+    /// 超预算才摘要（决策 269 / 票 foreman-within-boundary 03）：把**掉出预算**的最老
+    /// 区间压成一段锚点，锚点按上限**预留**进同一本预算（预留式算术，见方法内注释——
+    /// 事后重裁会掉出一截没人摘要的轮次）；预算内逐字照旧
+    /// （两条既有钉子走的就是未改动的 [`trim_history`]）、失败回退现状、DB 不动。
+    ///
+    /// 缓存按会话分槽（[`CompactionCache`]）：边界没动 → 直接复用、零 token；
+    /// 边界前进 → 旧摘要 + 新掉队轮增量再压（每条轮次一生只被压一次）。
+    /// 摘要失败/超时 → 不写缓存、不加锚点，窗口原样（269④——轮次绝不因摘要挂掉而挂掉）。
+    async fn compact_history(
+        &self,
+        session_id: &str,
+        history: &[ForemanMessage],
+        budget_chars: usize,
+        provider_id: Option<String>,
+    ) -> (Vec<ForemanMessage>, Option<String>) {
+        // 第一步照旧：按**原预算**裁一次——预算内逐字照旧（269①），连缓存都不碰；
+        // 它同时是摘要失败时的回退窗口（现状 = 从头丢，269④）。
+        let probe = trim_history(history, budget_chars);
+        if probe.len() == history.len() {
+            return (probe, None);
+        }
+        // 预算算术用**预留**而不是事后重裁：锚点长度要摘要完才知道，事后重裁会再掉
+        // 一截**没人摘要**的轮次（先有鸡还是先有蛋）。按锚点上限（标记 +
+        // SUMMARIZER_MAX_CHARS）预留头部，窗口裁完不再动——摘要覆盖的区间 = 最终掉出
+        // 预算的区间，一条不漏，也不需要二段压。代价是锚点实际更短时窗口也不回填
+        // （最多让出 4k 字的保守余量，24k 预算下可接受）。
+        let reserve = COMPACTION_MARK.chars().count() + 1 + SUMMARIZER_MAX_CHARS;
+        let window = trim_history(history, budget_chars.saturating_sub(reserve));
+        let dropped_count = history.len() - window.len();
+        let boundary = window[0].id;
+
+        let entry = self
+            .compaction
+            .lock()
+            .ok()
+            .and_then(|cache| cache.get(session_id).cloned());
+
+        let (summary, fresh) = match &entry {
+            // 边界没动：没有新掉队的轮次，直接复用——一个 token 都不烧。
+            Some(e) if e.covered_until == boundary => (e.summary.clone(), false),
+            other => {
+                let (prefix, newly) = match other {
+                    Some(e) => match history.iter().position(|m| m.id == e.covered_until) {
+                        Some(i) if i <= dropped_count => {
+                            (Some(e.summary.as_str()), &history[i..dropped_count])
+                        }
+                        // 覆盖点找不到 / 反常后退：防御性全量重算（单调会话走不到）。
+                        _ => (None, &history[..dropped_count]),
+                    },
+                    None => (None, &history[..dropped_count]),
+                };
+                let input = summarize_input(newly, prefix);
+                let Some(s) = self
+                    .summarize_interval(session_id, &input, provider_id)
+                    .await
+                else {
+                    return (probe, None); // 回退现状（269④）：不写缓存，下一轮再试
+                };
+                (s, true)
+            }
+        };
+        if fresh {
+            if let Ok(mut cache) = self.compaction.lock() {
+                cache.put(
+                    session_id,
+                    CompactionEntry {
+                        covered_until: boundary,
+                        summary: summary.clone(),
+                    },
+                );
+            }
+        }
+
+        // 锚点自身计入预算算术（269②）——预留已在上面扣过，这里兑现承诺：
+        debug_assert!(
+            COMPACTION_MARK.chars().count() + 1 + summary.chars().count() <= reserve,
+            "摘要器输出必须落在 SUMMARIZER_MAX_CHARS 的预留内"
+        );
+        (window, Some(summary))
+    }
+
+    /// 摘要调用本体：同一 `llm.complete`、同 provider、无工具的小补全（269②）。
+    /// 超时 / 失败 / 空回一律 `None`（调用方回退现状）；它会作为一条按会话归属的
+    /// 模型请求留在台账里（决策 231 的留痕口径——可见、无 run 行、不算作一轮）。
+    async fn summarize_interval(
+        &self,
+        session_id: &str,
+        input: &str,
+        provider_id: Option<String>,
+    ) -> Option<String> {
+        let request = LlmRequest {
+            stage: Stage::Init,
+            node: Node::Execute,
+            attempt: 1,
+            system_prompt: SUMMARIZER_SYSTEM_PROMPT.to_string(),
+            user_prompt: input.to_string(),
+            messages: Vec::new(),
+            tools: Vec::new(),
+            temperature: Some(0.2),
+            max_tokens: Some(SUMMARIZER_MAX_TOKENS),
+            provider_id,
+            run: Some(crate::agent::client::RunContext {
+                task_id: String::new(),
+                branch: String::new(),
+                run_id: 0,
+                agent_type: FOREMAN_AGENT_TYPE.to_string(),
+                session_id: session_id.to_string(),
+            }),
+        };
+        let response = tokio::time::timeout(SUMMARIZER_TIMEOUT, self.llm.complete(request))
+            .await
+            .ok()?
+            .ok()?;
+        let text = response.content?.trim().to_string();
+        if text.is_empty() {
+            return None;
+        }
+        if text.chars().count() > SUMMARIZER_MAX_CHARS {
+            let clipped: String = text.chars().take(SUMMARIZER_MAX_CHARS).collect();
+            Some(format!("{clipped}…"))
+        } else {
+            Some(text)
+        }
+    }
+
     /// 顺序是刻意的：**值班经理说的话先落库**，再叫模型，最后落值班长的回话。
     /// 中间任何一步失败，人说过的那句话仍在台账里（审计要的是「他说了什么」，
     /// 不是「他说的哪句成功被答复」）。
@@ -1224,7 +1453,17 @@ impl ForemanRunner {
             .store
             .list_foreman_messages(&session.id, FOREMAN_HISTORY_FETCH_LIMIT)
             .await?;
-        let window = trim_history(&history, FOREMAN_HISTORY_BUDGET_CHARS);
+        // 超预算才摘要（决策 269 / 票 03）：预算内逐字照旧；跨线时把掉出预算的最老
+        // 区间压成锚点（会话缓存增量、失败回退现状），锚点与窗口共用同一本预算。
+        // 值守轮同路径（共用 respond），零分支（269⑤）。
+        let (window, anchor) = self
+            .compact_history(
+                &session.id,
+                &history,
+                FOREMAN_HISTORY_BUDGET_CHARS,
+                provider_id.clone(),
+            )
+            .await;
         // `user_prompt` **只放快照**，问题由 transcript 的最后一条承担。
         //
         // 适配器组装的 body 是 `[system][user(user_prompt)] + messages`（见
@@ -1275,6 +1514,14 @@ impl ForemanRunner {
                 }
             })
             .collect();
+        if let Some(anchor) = anchor {
+            // 锚点以**标记 user 轮**带头插在历史头部（system 行重注入走 user 的先例）。
+            // 两种适配器都不会把它错位：OpenAI 把 `[system, user_prompt]` 拼在 messages
+            // 之前、Anthropic 抽走 system 段后 user_prompt 仍占 wire 头——锚点只是 messages
+            // 的第一条普通 user 轮（providers 的 `messages[0]` 只有 mock 在读，且读的是
+            // 组装后的 wire 头，不受影响）。
+            transcript.insert(0, Message::user(format!("{COMPACTION_MARK}\n{anchor}")));
+        }
         // 历史最后一条就是刚落库的这句 user 消息；但若它被 `trim_history` 之外的原因
         // 漏掉（例如库被外部清空），仍要保证本轮的问题在场。
         // 值守简报**总是**追加成最后一条：它带署名（`TurnInput::transcript_text`），

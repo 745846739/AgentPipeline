@@ -17,9 +17,10 @@ use agentpipeline_core::config::Settings;
 use agentpipeline_core::metrics;
 use agentpipeline_core::pipeline::foreman::{
     build_briefing, foreman_turn_in_flight, parse_attribution, situation_fingerprint, trim_history,
-    Attribution, AttributionKind, ForemanRunner, FOREMAN_AGENT_TYPE, FOREMAN_ATTRIBUTION_MARK,
-    FOREMAN_FAILED_TURN_MARK, FOREMAN_MAX_ROUNDS, FOREMAN_PARTIAL_TURN_MARK, FOREMAN_PERSONA,
-    FOREMAN_STAGE_KEY, FOREMAN_TOOL_SPECS, FOREMAN_WATCH_MARK, OPERATION_LOG_MARK,
+    Attribution, AttributionKind, ForemanRunner, COMPACTION_MARK, FOREMAN_AGENT_TYPE,
+    FOREMAN_ATTRIBUTION_MARK, FOREMAN_FAILED_TURN_MARK, FOREMAN_MAX_ROUNDS,
+    FOREMAN_PARTIAL_TURN_MARK, FOREMAN_PERSONA, FOREMAN_STAGE_KEY, FOREMAN_TOOL_SPECS,
+    FOREMAN_WATCH_MARK, OPERATION_LOG_MARK,
 };
 use agentpipeline_core::sse::{SseEvent, SseEventType, ToolPhase};
 use agentpipeline_core::storage::foreman::NewForemanMessage;
@@ -354,6 +355,199 @@ async fn history_trimming_always_keeps_the_newest_message_even_over_budget() {
     let kept = trim_history(&all, 10);
     assert_eq!(kept.len(), 1);
     assert_eq!(kept[0].id, all[1].id);
+}
+
+// ─────────────── 上下文压缩（决策 269 / 票 foreman-within-boundary 03）───────────────
+
+/// 把会话塞到**超预算**（24k）：首条带「最早标记」，其后 30 条各约千字。
+/// 掉出预算的必然包含首条——摘要器的输入里要看得见它。
+async fn seed_over_budget(h: &Harness, sid: &str) {
+    h.store
+        .append_foreman_user_message(sid, "最早标记：我们决定用方案甲")
+        .await
+        .unwrap();
+    let filler = "史".repeat(990);
+    for i in 0..30 {
+        let content = format!("第{i}轮 {filler}");
+        if i % 2 == 0 {
+            h.store
+                .append_foreman_user_message(sid, &content)
+                .await
+                .unwrap();
+        } else {
+            h.store
+                .append_foreman_message(NewForemanMessage::assistant(sid, content))
+                .await
+                .unwrap();
+        }
+    }
+}
+
+#[tokio::test]
+async fn over_budget_history_is_summarized_into_a_head_anchor_within_budget() {
+    let h = Harness::empty().await;
+    let sid = h.session().await;
+    seed_over_budget(&h, &sid).await;
+
+    let mut script = Script::new();
+    script
+        .for_foreman()
+        .text("压缩后的摘要") // 第一次调用 = 摘要器
+        .text("收口了。"); // 第二次 = 主轮
+    let agent = FakeAgent::new(script);
+    let runner = h.runner(agent.clone());
+    runner.say(Some(&sid), "现在怎么样？").await.unwrap();
+
+    let reqs = agent.request_log();
+    assert_eq!(reqs.len(), 2, "摘要一次 + 主轮一次：{}", reqs.len());
+    // 摘要器：无工具、专用指令、输入里有掉出预算的最老内容
+    assert!(reqs[0].tools.is_empty(), "摘要器不该带工具");
+    assert!(
+        reqs[0].system_prompt.contains("压缩"),
+        "摘要器要认得出自己的指令：{}",
+        reqs[0].system_prompt
+    );
+    assert!(
+        reqs[0].user_prompt.contains("最早标记"),
+        "掉出预算的最老轮次是摘要输入：{}",
+        reqs[0].user_prompt
+    );
+    // 主轮：头部一条锚点 user 轮 = 标记 + 摘要正文；且锚点与窗口**同一本预算**
+    let m0 = &reqs[1].messages[0];
+    assert_eq!(
+        m0.role,
+        agentpipeline_core::agent::client::Role::User,
+        "锚点按 system 行重注入的先例走 user 角色"
+    );
+    let head = m0.content.as_deref().unwrap_or_default();
+    assert!(
+        head.contains(COMPACTION_MARK) && head.contains("压缩后的摘要"),
+        "头部要同时有标记与摘要正文：{head}"
+    );
+    let total: usize = reqs[1]
+        .messages
+        .iter()
+        .map(|m| m.content.as_deref().unwrap_or_default().chars().count())
+        .sum();
+    assert!(
+        total <= agentpipeline_core::pipeline::foreman::FOREMAN_HISTORY_BUDGET_CHARS,
+        "锚点自身计入预算算术（269②），锚点 + 窗口不许超：{total}"
+    );
+}
+
+#[tokio::test]
+async fn budget_internal_history_needs_no_anchor_and_no_extra_call() {
+    let h = Harness::empty().await;
+    let sid = h.session().await;
+    h.store
+        .append_foreman_user_message(&sid, "很短的历史")
+        .await
+        .unwrap();
+    h.store
+        .append_foreman_message(NewForemanMessage::assistant(&sid, "也很短"))
+        .await
+        .unwrap();
+
+    let mut script = Script::new();
+    script.for_foreman().text("好。");
+    let agent = FakeAgent::new(script);
+    let runner = h.runner(agent.clone());
+    runner.say(Some(&sid), "在吗？").await.unwrap();
+
+    let reqs = agent.request_log();
+    assert_eq!(
+        reqs.len(),
+        1,
+        "预算内逐字照旧——一次调用都不许多（269①）：{}",
+        reqs.len()
+    );
+    assert!(
+        reqs[0].messages.iter().all(|m| !m
+            .content
+            .as_deref()
+            .unwrap_or_default()
+            .contains(COMPACTION_MARK)),
+        "预算内不许出现锚点"
+    );
+}
+
+#[tokio::test]
+async fn successive_over_budget_rounds_incrementally_recompress_only_new_drops() {
+    let h = Harness::empty().await;
+    let sid = h.session().await;
+    seed_over_budget(&h, &sid).await;
+
+    let mut script = Script::new();
+    // 回合一够长（+1500 字 > 窗口的最大余量 1006）：第二轮的裁剪边界**必然**前进，
+    // 才有「新掉队的轮次」可增量压——边界不动时缓存直接复用（那是另一条语义，见下）。
+    let long_reply = format!("回合一 {}", "重".repeat(1500));
+    script
+        .for_foreman()
+        .text("摘要一")
+        .text(&long_reply)
+        .text("摘要二")
+        .text("回合二");
+    let agent = FakeAgent::new(script);
+    let runner = h.runner(agent.clone());
+    runner.say(Some(&sid), "第一问？").await.unwrap();
+    runner.say(Some(&sid), "第二问？").await.unwrap();
+
+    let reqs = agent.request_log();
+    assert_eq!(reqs.len(), 4, "两轮 ×（摘要 + 主轮）：{}", reqs.len());
+    // 第二次摘要 = 旧摘要 + 新掉队的种子老轮（269③ 增量再压）——最老原文不整段重发
+    assert!(
+        reqs[2].user_prompt.contains("摘要一"),
+        "旧摘要要进增量输入：{}",
+        reqs[2].user_prompt
+    );
+    assert!(
+        reqs[2].user_prompt.contains("史"),
+        "新掉队的轮次（种子里的千字轮）要进增量输入：{}",
+        reqs[2].user_prompt
+    );
+    assert!(
+        !reqs[2].user_prompt.contains("最早标记"),
+        "最老原文已经压进旧摘要，不整段重发（每条轮次一生只被压一次）：{}",
+        reqs[2].user_prompt
+    );
+    // 第二轮主轮的锚点换成了新摘要
+    let head2 = reqs[3].messages[0].content.as_deref().unwrap_or_default();
+    assert!(head2.contains("摘要二"), "锚点要跟上最新摘要：{head2}");
+}
+
+#[tokio::test]
+async fn a_failed_summarizer_falls_back_to_plain_dropping() {
+    let h = Harness::empty().await;
+    let sid = h.session().await;
+    seed_over_budget(&h, &sid).await;
+
+    let mut script = Script::new();
+    script
+        .for_foreman()
+        .push(testkit::Step::Fail {
+            kind: "llm_network".into(),
+            message: "摘要器挂了".into(),
+            raw: "boom".into(),
+        })
+        .text("收口了。");
+    let agent = FakeAgent::new(script);
+    let runner = h.runner(agent.clone());
+    let turn = runner.say(Some(&sid), "在吗？").await;
+    assert!(
+        turn.is_ok(),
+        "轮次绝不因摘要挂掉而挂掉（269④ 回退现状）：{turn:?}"
+    );
+
+    let reqs = agent.request_log();
+    assert_eq!(reqs.len(), 2, "失败的摘要尝试 + 主轮：{}", reqs.len());
+    assert!(
+        reqs[1].messages.iter().all(|m| !m
+            .content
+            .as_deref()
+            .unwrap_or_default()
+            .contains(COMPACTION_MARK)),
+        "回退路径不许有锚点——与现状（从头丢）逐字相同"
+    );
 }
 
 #[tokio::test]
@@ -2109,7 +2303,7 @@ async fn unknown_task_id_answers_with_text_instead_of_failing_the_turn() {
 
 #[test]
 fn the_foreman_tool_set_matches_the_frozen_contract() {
-    // 清单的**名字与顺序**（23 个）逐条钉住：这是安全边界本身（`foreman.rs` 的注释原话），
+    // 清单的**名字与顺序**（24 个）逐条钉住：这是安全边界本身（`foreman.rs` 的注释原话），
     // 加一个工具必须先改这里，从而在任何 diff 里显式可见。
     //
     // 分组（你能直接用 / 会改动东西）**不再手标**——`ForemanToolLayer` 已删（决策 247），
@@ -2140,6 +2334,9 @@ fn the_foreman_tool_set_matches_the_frozen_contract() {
             // 按命令名判定，`sample` 只许对本服务的 pid 与其子进程）。它属**只读层**，
             // 故不受档位管、也不在值守轮的 deny 清单里——「自主轮能取证」正是它为的。
             "run_readonly",
+            // 内容搜索（决策 267 / 票 01）：纯 Rust 正则找内容，不碰系统二进制。同属
+            // 只读层：不受档位管、值守轮 deny 清单**不摘**它（run_readonly 先例）。
+            "search_content",
             // 受治理的网口（决策 266 / 票 02）：GET-only、https 出环、白名单走 `NetworkPolicy`
             // 同一张、每次都落命令台账。同属只读层故**不受档位管**，但值守轮的 deny 清单
             // 收它（夜间外发无人盯）——与 `run_readonly` 的区别正在这一条上。

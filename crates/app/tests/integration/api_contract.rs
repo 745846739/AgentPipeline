@@ -6543,7 +6543,7 @@ async fn a_repair_proposal_whose_base_moved_conflicts_and_is_refused() {
     assert_eq!(body["proposals"][0]["status"], "pending", "{body}");
 }
 
-/// `GET /foreman/tools`（决策 247⑤）：**全量 23 条、与清单同序、label 均非空、只出两个字段**。
+/// `GET /foreman/tools`（决策 247⑤）：**全量 24 条、与清单同序、label 均非空、只出两个字段**。
 ///
 /// 回执标的是**历史**上的工具调用，故条目数 == 清单长度本身就是「不按档位滤」的形状
 /// （滤过就会少——昨天的回执今天翻译不了）。description / parameters 不出：前端用不上。
@@ -6555,7 +6555,7 @@ async fn the_tool_label_endpoint_lists_the_whole_manifest() {
 
     let manifest = agentpipeline_core::pipeline::foreman::FOREMAN_TOOL_SPECS;
     let listed = body["tools"].as_array().expect("报文要有 tools 数组");
-    assert_eq!(listed.len(), 23, "全量 23 条，按档位滤了？{body}");
+    assert_eq!(listed.len(), 24, "全量 24 条，按档位滤了？{body}");
     assert_eq!(listed.len(), manifest.len(), "条目数要与清单一致：{body}");
     for (i, (item, spec)) in listed.iter().zip(manifest.iter()).enumerate() {
         assert_eq!(item["name"], spec.name, "第 {i} 条与清单不同序：{body}");

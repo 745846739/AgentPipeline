@@ -201,6 +201,15 @@ impl Store {
         .await?
         .rows_affected()
             > 0;
+        if inserted && kind.wakes() {
+            // 离线通知（决策 268②）：与值守轮同一信号面的**另一个出口**——LLM 连挂、
+            // 播报被每小时上限掐掉时，这条线照发。`wakes()` 在这里再判一次（调用方
+            // 多、通知的判据只该有一处）；投递本身 best-effort，绝不把 attention 记账
+            // 弄挂：没挂出口时这里一个字节都不出。
+            if let Some(notifier) = self.notifier() {
+                notifier.notify(kind, task_id, occurred_at, detail);
+            }
+        }
         Ok(inserted)
     }
 

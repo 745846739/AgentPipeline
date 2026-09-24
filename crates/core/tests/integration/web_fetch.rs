@@ -81,6 +81,23 @@ impl Fixture {
     }
 }
 
+/// 报文头结束（`\r\n\r\n`）之后的第一个下标；头没齐则 `None`。
+fn find_body_start(raw: &[u8]) -> Option<usize> {
+    raw.windows(4).position(|w| w == b"\r\n\r\n").map(|i| i + 4)
+}
+
+/// 从报文头里取 Content-Length（大小写不敏感；没有这个头按「到头即止」处理）。
+fn content_length(headers: &[u8]) -> Option<usize> {
+    let text = String::from_utf8_lossy(headers).to_lowercase();
+    let idx = text.find("content-length:")?;
+    // `split_whitespace` 自己会跳过首尾空白——再套一层 `trim` 是冗余（clippy 同判）。
+    text[idx + "content-length:".len()..]
+        .split_whitespace()
+        .next()?
+        .parse()
+        .ok()
+}
+
 fn fetch(url: &str) -> ToolCall {
     ToolCall {
         id: "c".into(),
@@ -108,15 +125,28 @@ async fn last_command(f: &Fixture) -> agentpipeline_core::types::NodeCommand {
 }
 
 /// 手写 HTTP/1.1 服务器：按同一份应答回每一个连接，记录命中数与首行（方法行）。
-struct TinyHttp {
+pub struct TinyHttp {
     addr: std::net::SocketAddr,
     hits: Arc<AtomicUsize>,
     first_line: Arc<Mutex<String>>,
+    body: Arc<Mutex<Vec<u8>>>,
     alive: Arc<AtomicBool>,
 }
 
 impl TinyHttp {
-    fn spawn(status: &str, content_type: &str, body: Vec<u8>, delay: Duration) -> Self {
+    /// 命中次数（跨模块轮询用——离线通知的投递是后台任务）。
+    pub fn hits(&self) -> usize {
+        self.hits.load(Ordering::SeqCst)
+    }
+
+    /// 最近一次请求的报文体（`TinyHttp` 只服务单连接序列的测试，取最后一次即可）。
+    pub fn body(&self) -> Vec<u8> {
+        self.body.lock().unwrap().clone()
+    }
+}
+
+impl TinyHttp {
+    pub fn spawn(status: &str, content_type: &str, body: Vec<u8>, delay: Duration) -> Self {
         use std::io::{Read, Write};
 
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
@@ -124,8 +154,16 @@ impl TinyHttp {
         let addr = listener.local_addr().unwrap();
         let hits = Arc::new(AtomicUsize::new(0));
         let first_line = Arc::new(Mutex::new(String::new()));
+        // 请求报文体捕获——**不叫 `body`**：`spawn` 的形参 `body` 是应答正文，撞名会把
+        // 下面 `write_all(&body)` 静默改成写这段 Arc（编译器会叫，但别给它机会）。
+        let captured = Arc::new(Mutex::new(Vec::new()));
         let alive = Arc::new(AtomicBool::new(true));
-        let (h2, f2, a2) = (hits.clone(), first_line.clone(), alive.clone());
+        let (h2, f2, b2, a2) = (
+            hits.clone(),
+            first_line.clone(),
+            captured.clone(),
+            alive.clone(),
+        );
         let status = status.to_string();
         let ct = content_type.to_string();
         std::thread::spawn(move || {
@@ -133,12 +171,35 @@ impl TinyHttp {
                 match listener.accept() {
                     Ok((mut sock, _)) => {
                         h2.fetch_add(1, Ordering::SeqCst);
+                        // 读到「头 + Content-Length 齐了」或对端停手（测试载荷都是小 JSON，
+                        // 几轮就读完；500ms 读超时只是兜底，齐了立刻收工不等下一拍）。
+                        let _ = sock.set_read_timeout(Some(Duration::from_millis(500)));
+                        let mut raw: Vec<u8> = Vec::new();
                         let mut buf = [0u8; 8192];
-                        let _ = sock.set_read_timeout(Some(Duration::from_secs(2)));
-                        let n = sock.read(&mut buf).unwrap_or(0);
-                        let head = String::from_utf8_lossy(&buf[..n]).to_string();
-                        if let Some(line) = head.lines().next() {
-                            *f2.lock().unwrap() = line.to_string();
+                        let body_start = loop {
+                            match sock.read(&mut buf) {
+                                Ok(0) => break None,
+                                Ok(n) => {
+                                    raw.extend_from_slice(&buf[..n]);
+                                    if let Some(h) = find_body_start(&raw) {
+                                        let complete = content_length(&raw[..h])
+                                            .map(|c| raw.len() >= h + c)
+                                            .unwrap_or(true);
+                                        if complete {
+                                            break Some(h);
+                                        }
+                                    }
+                                }
+                                Err(_) => break None,
+                            }
+                        };
+                        if let Some(line) = String::from_utf8_lossy(&raw).lines().next() {
+                            if !line.is_empty() {
+                                *f2.lock().unwrap() = line.to_string();
+                            }
+                        }
+                        if let Some(h) = body_start {
+                            *b2.lock().unwrap() = raw[h..].to_vec();
                         }
                         if !delay.is_zero() {
                             std::thread::sleep(delay);
@@ -162,15 +223,16 @@ impl TinyHttp {
             addr,
             hits,
             first_line,
+            body: captured,
             alive,
         }
     }
 
-    fn url(&self, path: &str) -> String {
+    pub fn url(&self, path: &str) -> String {
         format!("http://{}{}", self.addr, path)
     }
 
-    fn first_request_line(&self) -> String {
+    pub fn first_request_line(&self) -> String {
         self.first_line.lock().unwrap().clone()
     }
 }

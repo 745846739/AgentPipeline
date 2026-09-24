@@ -683,31 +683,19 @@ async fn recover_dependency_failed(&self) -> Result<()> {
 
 > **会话流式事件（决策 123，排掉前端差距①⑤）：** `conversation_delta` 事件体含 `run_id` / `agent_type` / `branch` / `role` / `text`，并带 `prompt_tokens` / `completion_tokens` 增量（流式 token 计数的唯一来源）；`tool_event` 事件体含 `run_id` / `branch` / `tool` / `phase(start|end|error)`（error 为实现侧扩展：工具被 FileToolPolicy 拒绝或执行失败）/ 参数摘要与结果行数。SSE 只是渲染通道，落库仍走 §12.4.3 的会话写入。
 
-**离线通知（v2 预留）：** Webhook / 邮件 / 飞书 / Slack 等外部渠道不在 v1 范围（决策 65），完整设计见附录 B。v1 只做 SSE 应用内通知，但保留 `NotificationPolicy` 结构。**职责划分（决策 130）：SSE 全量推送、不做 cooldown 合并**——它是状态同步通道，吞事件会丢状态；cooldown / quiet_hours 只作用于前端 toast 通知层（与 frontend-design §9.1 对齐）。
-
-**通知策略：**
-
-```rust
-// crates/core/src/notification.rs
-
-pub struct NotificationPolicy {
-    pub notify_on: HashMap<String, bool>,
-    pub cooldown_sec: u64,             // 同类通知 5 分钟内合并
-    pub quiet_hours: (u8, u8),         // 免打扰时段，pending 除外
-}
-
-impl Default for NotificationPolicy {
-    fn default() -> Self {
-        let mut notify_on = HashMap::new();
-        notify_on.insert("pending".to_string(), true);        // pending 立即通知
-        notify_on.insert("done".to_string(), true);           // 任务完成通知
-        notify_on.insert("failed".to_string(), true);         // 失败通知
-        notify_on.insert("cancelled".to_string(), false);     // 取消不通知
-        notify_on.insert("node_finished".to_string(), false); // 节点完成不通知
-        Self { notify_on, cooldown_sec: 300, quiet_hours: (22, 8) }
-    }
-}
-```
+**离线通知（决策 268 落地 2026-09-24——原决策 65 的「v2 预留」随本条进 v1）：**
+`[notify].webhook_url` 配置在场即出站：attention 落库且 `wakes()` 时 POST 一条通用 JSON
+（`{title, body, kind, task_id, occurred_at, source}`，`body` 只带归因白名单字段、
+不带正文/日志原文），URL 缺席 = 整段关死、URL 含 token 只进 config.toml 不进日志。
+礼貌语义（每类 cooldown、免打扰 `[22, 8)` 跨零点按本地整点、`failed` 恒发、`pending`
+免打扰豁免）在 Rust（`crates/core/src/notify.rs`）与前端
+（`frontend/src/lib/notificationPolicy.ts`，只管浏览器 toast）各有一份，由
+`tests/fixtures/notification_policy.json` 双端同表钉住（决策 246 先例）；前端还有一层
+`notifyOn` 用户偏好开关（`cancelled` 缺省关），后端没有偏好面——差异记在决策 268 与
+fixture `$comment`。邮件 / IM 机器人可由 webhook 转发，独立 SMTP / 专用卡片有证据再议。
+**职责划分（决策 130，不动）：SSE 全量推送、不做 cooldown 合并**——它是状态同步通道，
+吞事件会丢状态；前端 toast 的 cooldown / quiet_hours 只作用于 toast 层
+（frontend-design §9.1 对齐）。
 
 **pending 超时提醒：** 任务进入 pending 超过 `pending_reminder_hours`（默认 24h）未处理，重复提醒一次；超过 `pending_timeout_hours`（默认 72h）自动标记 `stalled = 1`，看板高亮显示。提醒与高亮均通过 SSE 推送，不依赖外部渠道。**票 05 补上了那个「均通过 SSE 推送」的洞**：提醒此前只活在调度器内存的 `HashSet` 里、重启即失、从不外发——现在是 `stalled` 事件真的发出去，同时落一行 `task_stale` 待办（决策 209③）。
 

@@ -505,6 +505,32 @@ pub fn validate_market_repos(raw: &[String]) -> Result<Vec<String>> {
     Ok(out)
 }
 
+/// `[notify]` 离线通知（决策 268）：**URL 缺席 = 整段关死**——没配 webhook 的部署
+/// 里这条路径一个字节都不出（零配置零行为）。cooldown / quiet_hours 的缺省与前端
+/// `notificationPolicy.ts` 同一张表（跨语言 fixture 钉住，268③）。
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct NotifyConfig {
+    /// webhook 端点（POST 通用 JSON）。含 token 即秘密：只进 config.toml，
+    /// 不入台账、不入日志明文（投递失败的日志走 `without_url()`）。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub webhook_url: Option<String>,
+    /// 每类节流秒数（镜像前端 per-class cooldown，严格小于语义）。
+    pub cooldown_sec: u64,
+    /// 免打扰时段 `[start, end)` 小时，跨零点写法（如 `[22, 8]`）；按服务器本地整点。
+    pub quiet_hours: [u8; 2],
+}
+
+impl Default for NotifyConfig {
+    fn default() -> Self {
+        Self {
+            webhook_url: None,
+            cooldown_sec: 300,
+            quiet_hours: [22, 8],
+        }
+    }
+}
+
 /// 完整配置。
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
@@ -515,6 +541,7 @@ pub struct Config {
     pub prompts: PromptsConfig,
     pub skills: SkillsConfig,
     pub market: MarketConfig,
+    pub notify: NotifyConfig,
 }
 
 impl Config {
@@ -1473,6 +1500,40 @@ mod tests {
     fn skills_unknown_key_is_rejected() {
         let err = Config::from_toml("[skills]\ndir = \"x\"\nnope = 1\n").unwrap_err();
         assert!(matches!(err, Error::Config(_)), "{err}");
+    }
+
+    // ── 决策 268：`[notify]` 离线通知段 ──
+
+    /// 缺席 = 整段关死（268①：URL 没配就没有行为）；缺省节流与免打扰与前端同一张表。
+    #[test]
+    fn notify_defaults_are_off_with_300s_and_22_8() {
+        let cfg = Config::from_toml("").unwrap();
+        assert!(cfg.notify.webhook_url.is_none());
+        assert_eq!(cfg.notify.cooldown_sec, 300);
+        assert_eq!(cfg.notify.quiet_hours, [22, 8]);
+    }
+
+    /// 未知键照 fail fast 拒（47 / 103 / 134 姿势，`deny_unknown_fields`）。
+    #[test]
+    fn notify_unknown_key_is_rejected() {
+        let err =
+            Config::from_toml("[notify]\nwebhook_url = \"https://x\"\nbogus = 1\n").unwrap_err();
+        assert!(matches!(err, Error::Config(_)), "{err:?}");
+    }
+
+    /// 显式值整段解析——cooldown / 免打扰可调（镜像面与前端被同一份事实调）。
+    #[test]
+    fn notify_explicit_values_parse() {
+        let cfg = Config::from_toml(
+            "[notify]\nwebhook_url = \"https://chat.example/hook\"\ncooldown_sec = 60\nquiet_hours = [9, 18]\n",
+        )
+        .unwrap();
+        assert_eq!(
+            cfg.notify.webhook_url.as_deref(),
+            Some("https://chat.example/hook")
+        );
+        assert_eq!(cfg.notify.cooldown_sec, 60);
+        assert_eq!(cfg.notify.quiet_hours, [9, 18]);
     }
 
     // ── 决策 194：`[market] github_repos` 来源仓名单（取代决策 172⑤ 的 origin 白名单）──

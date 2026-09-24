@@ -374,6 +374,16 @@ pub async fn serve(options: ServeOptions) -> anyhow::Result<ServerHandle> {
     };
 
     let store = Store::open(home.clone(), Arc::new(SystemClock)).await?;
+    // 离线通知（决策 268）：`[notify].webhook_url` 在场才挂出口——缺席 = 整段关死。
+    // 挂在 attention 的记账漏斗上（与值守轮同一信号面），投递 best-effort 在出口内部。
+    if let Some(url) = config.notify.webhook_url.as_deref() {
+        store.set_notifier(Arc::new(agentpipeline_core::notify::WebhookNotifier::new(
+            url.to_string(),
+            config.notify.cooldown_sec,
+            config.notify.quiet_hours,
+            Arc::new(SystemClock),
+        )));
+    }
 
     // 恢复序列（决策 127 / 212）：三步走**唯一那一份实现**（决策 255）——`service` 提议的
     // 「重启」动作按的是同一个函数，两处从此不会给出不同的答案。这里只负责把读数记成日志。

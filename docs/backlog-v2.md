@@ -35,7 +35,7 @@ async def build_stage_tools(cfg: StageAgentConfig, baseline: SystemBaseline) -> 
 
 ### B.3 离线通知渠道
 
-**已自决策 262① 提前出 v2 预留**（值班长能力面 triage 的边界内叠第三项：值守轮的终点是叫醒人，夜里没人盯 SSE 则值守轮白醒）——渠道实现立项时从这里接手，`NotificationPolicy`（cooldown、quiet_hours）结构已保留。原 v1 口径留档：Webhook / 邮件 / 飞书 / Slack；v1 只做 SSE 应用内通知。
+**已自决策 262① 提前出 v2 预留**（值班长能力面 triage 的边界内叠第三项：值守轮的终点是叫醒人，夜里没人盯 SSE 则值守轮白醒）——渠道实现立项时从这里接手，`NotificationPolicy`（cooldown、quiet_hours）结构已保留。原 v1 口径留档：Webhook / 邮件 / 飞书 / Slack；v1 只做 SSE 应用内通知。**已落地（决策 268，2026-09-24）**：`[notify].webhook_url` **通用 webhook**（attention 落库且 `wakes()` 直发、礼貌语义镜像前端同一张表、best-effort）——即本行渠道分支里的 webhook 形态；邮件与 IM 机器人可由其转发，独立 SMTP/专用卡片有证据再议（268「明确不做」）。
 
 ### B.4 自适应强制超时
 

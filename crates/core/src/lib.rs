@@ -17,6 +17,7 @@ pub mod git;
 pub mod home;
 pub mod host_policy;
 pub mod metrics;
+pub mod notify;
 pub mod pipeline;
 pub mod process;
 pub mod scheduler;

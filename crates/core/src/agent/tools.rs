@@ -662,6 +662,9 @@ impl ToolExecutor {
             // 只读取证（决策 232 / 237）：白名单命令、argv 直出。它**不在**环境层里，
             // 故档位与值守轮的 deny 清单都管不到它——这正是「自主轮能取证」的落点。
             "run_readonly" => self.run_readonly(call, ctx).await?,
+            // 内容搜索（决策 267）：纯 Rust 正则找内容。同属只读层——档位与值守轮的
+            // deny 清单都管不到它（run_readonly 同款判据）。
+            "search_content" => self.search_content(call, ctx).await?,
             // 受治理的网口（决策 266）：GET-only、同一张出口白名单、落命令台账。
             // 同属只读层故档位管不到它，但值守轮的 deny 清单收它（夜间外发无人盯）。
             "web_fetch" => self.web_fetch(call, ctx).await?,
@@ -2054,6 +2057,148 @@ impl ToolExecutor {
         .await
     }
 
+    /// 内容搜索（决策 267 / 票 01）：纯 Rust 正则检索文件域——`regex` crate + `std::fs`
+    /// 行走，零系统二进制（grep/rg 的旗标差异与在场性都不是它的前提）。
+    ///
+    /// 三条护栏写死在这里：**域**（起始点过 `check_read`，行走中逐条再判——`data/` 整棵
+    /// 剪掉，206 同一条规则）、**不跟符号链接**（`DirEntry::file_type` 不穿越链接：越域与
+    /// 环两个理由）、**三条上限**（命中行数 / 单文件字节 / 扫描文件数——超限带截断标注，
+    /// transcript 12k 是下游那道闸）。台账两态：域拒走 [`Self::refuse_readonly`]（留行、
+    /// 退出码空），坏正则是形状错不是尝试（`Validation` 不落行，`ask` 同款）。
+    async fn search_content(&self, call: &ToolCall, ctx: &ToolCallContext) -> Result<ToolOutcome> {
+        let args = Self::args(call)?;
+        let pattern = args
+            .get("pattern")
+            .and_then(|v| v.as_str())
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .ok_or_else(|| {
+                Error::Validation(
+                    "search_content 缺少 pattern——给一个正则，如 `timeout_sec|TIMEOUT`".into(),
+                )
+            })?
+            .to_string();
+        // 域根与 `run_readonly` 的 cwd 同源（foreman 侧恒为家目录根，`foreman_tooling` 保证）。
+        let root = ctx.worktree_path.clone();
+        let cwd = ctx
+            .default_cwd
+            .clone()
+            .unwrap_or_else(|| ctx.worktree_path.clone());
+        let rel = args
+            .get("path")
+            .and_then(|v| v.as_str())
+            .map(str::trim)
+            .filter(|s| !s.is_empty());
+        let rendered = match rel {
+            Some(p) => format!("search_content {pattern} {p}"),
+            None => format!("search_content {pattern}"),
+        };
+        let base = match rel {
+            Some(p) => {
+                let p = Path::new(p);
+                if p.is_absolute() {
+                    p.to_path_buf()
+                } else {
+                    root.join(p)
+                }
+            }
+            None => root.clone(),
+        };
+        // ① 域：起始点先判（`data/` 前缀、域外绝对路径都倒在这一步），行走中逐条再判。
+        if let Err(denied) = self.policy.check_read(&base) {
+            return self
+                .refuse_readonly(ctx, &rendered, &cwd, denied.to_string())
+                .await;
+        }
+        // ② 形状：坏正则是模型的口误，回给它改——没有发生过任何尝试，故不落行。
+        let re = match regex::Regex::new(&pattern) {
+            Ok(re) => re,
+            Err(e) => {
+                return Err(Error::Validation(format!(
+                    "search_content 的 pattern 不是合法正则：{e}（Rust regex 语法，区分大小写）"
+                )))
+            }
+        };
+
+        let sanitized = super::sanitize::sanitize_command_line(&rendered);
+        let command_id = self.record_command_start(ctx, &sanitized, &cwd).await?;
+        let started = std::time::Instant::now();
+
+        // ③ 行走：显式栈 DFS；每一条先过域再分方向——`data/` 与 deny 模式名单里的路径
+        //    整棵剪掉（不是「扫到了再过滤」，是根本不进栈）。
+        let mut scan = SearchScan::default();
+        let mut stack = vec![base];
+        'walk: while let Some(dir) = stack.pop() {
+            let Ok(rd) = std::fs::read_dir(&dir) else {
+                continue;
+            };
+            for entry in rd.flatten() {
+                if scan.files_scanned >= SEARCH_MAX_FILES {
+                    scan.files_capped = true;
+                    break 'walk;
+                }
+                let path = entry.path();
+                let Ok(ft) = entry.file_type() else { continue };
+                if ft.is_symlink() {
+                    continue; // 不跟链接：越域与环，两个理由都在 267②
+                }
+                if self.policy.check_read(&path).is_err() {
+                    continue;
+                }
+                if ft.is_dir() {
+                    stack.push(path);
+                } else if ft.is_file() {
+                    scan_file(&mut scan, &path, &root, &re);
+                }
+            }
+        }
+
+        // ④ 回执与台账：命中行 + 截断标注；无论命中与否都是一次成功的尝试（exit 0）。
+        let mut parts: Vec<String> = Vec::new();
+        if scan.capped {
+            parts.push(format!(
+                "（命中超过 {SEARCH_MAX_MATCH_LINES} 行，已截断——收窄 pattern 或用 path 指到子目录）"
+            ));
+        }
+        if scan.files_capped {
+            parts.push(format!(
+                "（扫描文件数达到上限 {SEARCH_MAX_FILES}，可能没扫完——收窄 path 范围）"
+            ));
+        }
+        if scan.file_capped {
+            parts.push(format!(
+                "（有文件超过 {} 字节，只读了每个文件的前 {} 字节——命中超界部分不会出现）",
+                SEARCH_MAX_FILE_BYTES, SEARCH_MAX_FILE_BYTES
+            ));
+        }
+        let body = if scan.lines.is_empty() {
+            format!("没有命中（扫了 {} 个文件）。", scan.files_scanned)
+        } else {
+            format!(
+                "命中 {} 行：\n\n{}",
+                scan.lines.len(),
+                scan.lines.join("\n")
+            )
+        };
+        let text = if parts.is_empty() {
+            body
+        } else {
+            format!("{body}\n{}", parts.join("\n"))
+        };
+        let preview: String = text.chars().take(2000).collect();
+        self.record_command_finish(
+            command_id,
+            CommandFinish {
+                exit_code: Some(0),
+                stdout_preview: Some(preview),
+                duration_ms: started.elapsed().as_millis() as u64,
+                ..Default::default()
+            },
+        )
+        .await?;
+        Ok(ToolOutcome::ok(text))
+    }
+
     /// 拒掉一次只读取证，**并把这次尝试记下来**（决策 179 的口径：审计面必须看得见被拒的
     /// 每一次尝试，否则策略在日志里完全不可见，只剩模型侧的一次报错）。
     ///
@@ -2698,6 +2843,74 @@ fn model_request_digest(
 }
 
 // ─────────────────── 只读取证的白名单命令（决策 232 / 237）───────────────────
+
+/// 内容搜索的三条上限（决策 267②）：超限不是错误，带截断标注照常回执——transcript
+/// 的 12k 是下游那道闸，这三条管的是「别把整棵树读进内存」。
+const SEARCH_MAX_MATCH_LINES: usize = 200;
+const SEARCH_MAX_FILE_BYTES: u64 = 1024 * 1024;
+const SEARCH_MAX_FILES: usize = 10_000;
+/// 单行回显上限：一行几 MB 的压缩 JSON 不该原样进回执。
+const SEARCH_MAX_LINE_CHARS: usize = 300;
+/// 判二进制的窗口：首块含 NUL 即跳过（grep 家族同款启发）——内容不以 lossy 乱码的
+/// 形态进对话上下文。
+const SEARCH_BINARY_SNIFF: usize = 8000;
+
+/// 一次搜索的累计状态：命中行、扫描计数与两个截断旗。
+#[derive(Default)]
+struct SearchScan {
+    lines: Vec<String>,
+    files_scanned: usize,
+    capped: bool,
+    files_capped: bool,
+    /// 有文件超过单文件字节上限、只读了前 1 MiB（267②：截断要带标注，不许静默）。
+    file_capped: bool,
+}
+
+/// 读一个文件并把命中行累进 `scan`（空文件、二进制、读不动的文件都静默跳过——
+/// 跳过是常态：一次全域扫描本来就会路过大量不该进回执的东西）。
+fn scan_file(scan: &mut SearchScan, path: &Path, root: &Path, re: &regex::Regex) {
+    use std::io::Read;
+    let Ok(meta) = std::fs::metadata(path) else {
+        return;
+    };
+    if meta.len() == 0 {
+        return;
+    }
+    let Ok(mut f) = std::fs::File::open(path) else {
+        return;
+    };
+    let mut buf: Vec<u8> = Vec::new();
+    let cap = meta.len().min(SEARCH_MAX_FILE_BYTES);
+    if meta.len() > SEARCH_MAX_FILE_BYTES {
+        scan.file_capped = true;
+    }
+    if f.by_ref().take(cap).read_to_end(&mut buf).is_err() {
+        return;
+    }
+    if buf[..buf.len().min(SEARCH_BINARY_SNIFF)].contains(&0) {
+        return;
+    }
+    scan.files_scanned += 1;
+    let text = String::from_utf8_lossy(&buf);
+    let display = path.strip_prefix(root).unwrap_or(path);
+    for (i, line) in text.lines().enumerate() {
+        if re.is_match(line) {
+            if scan.lines.len() >= SEARCH_MAX_MATCH_LINES {
+                scan.capped = true;
+                return;
+            }
+            let shown: String = if line.chars().count() > SEARCH_MAX_LINE_CHARS {
+                let mut s: String = line.chars().take(SEARCH_MAX_LINE_CHARS).collect();
+                s.push('…');
+                s
+            } else {
+                line.to_string()
+            };
+            scan.lines
+                .push(format!("{}:{}:{}", display.display(), i + 1, shown));
+        }
+    }
+}
 
 /// `run_readonly` 能跑的命令，**这就是它的全部能力**（决策 232 的最小集 + `sample`）。
 ///
