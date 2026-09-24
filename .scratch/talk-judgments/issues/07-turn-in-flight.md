@@ -35,8 +35,7 @@
 
 **Blocked by:** None
 
-**Status:** partial（2026-09-24：主体与记账已落成决策 260，两条余量与两处测试竞态已补；
-**code-review 又查出一条决策 260 内部矛盾，见文末新增余量**）
+**Status:** done（2026-09-24；主体与记账由并行会话落成决策 260，两条余量与两处测试竞态由本票收口时补上。code-review 另查出一条**决策 260 内部**的矛盾（裁决③「留白」vs 落地哨清字）——那是在途轮那批自己的问题、不属本票，已单立 `.scratch/in-flight-turn/issues/01`）
 
 - [x] core 登记 / 计数摘除集成用例
 - [x] 前端判据 + 单测（`maxLedgerId` / `turnLanded` / `following`）
@@ -46,13 +45,6 @@
 - [x] 两处测试竞态收口（见上「顺手修的两处」）
 - [x] `types.ts:999` 的悬空 `followForemanTurn` 引用改指真判据
 - [x] `AGENTS.md` / `docs/README.md` 计数 → #1–260
-- [ ] **裁决③的「留白」没落地**（2026-09-24 code-review 查出）：决策 260 裁决③与
-  `turnLanded` 的 doc 都写「不换行而服务端也不再报『在跑』（进程被杀）时**保留已经收到的
-  半截字比清空诚实**」，而 `Talk.svelte` 落地哨是 `landed = turnLanded(...) ||
-  !payload.turn_in_flight`——恰恰那一类靠后半句为真进分支，随后
-  `stream = emptyForemanStream()` **把半截字清掉了**，与裁决相反。修法要先裁决呈现方式
-  （半截字留在时间线上以何种身份出现——`failForemanStream` 的失败轮姿态是现成候选），
-  不只是把 `|| !turn_in_flight` 摘掉（摘掉会让死掉的那一轮永远跟下去）。
 
 **来源：** 票 06 收口跑 `npm run check` 时发现（fixture 缺 `turn_in_flight` 字段而红——
 vitest 不做类型检查，实现方当时的「全绿」没照到这一处）。按「交付时发现的缺口另立票」先例

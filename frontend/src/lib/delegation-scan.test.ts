@@ -224,8 +224,11 @@ describe('超时判据按 kind、不摸正文（票 06，决策 259 的延伸）
 
   it('Talk 趁 ApiError 还在手把判好的布尔交给 failureNotice（判上移、拼接留下游）', () => {
     expect(talk, 'Talk 该调 isRequestTimeout').toContain('isRequestTimeout(err)');
-    expect(talk, '该把布尔传给 failureNotice').toContain(
-      'failureNotice((err as Error).message, isRequestTimeout(err))',
+    // 判好的布尔**存进一个具名变量**再交给 `failureNotice`（决策 260）：`finally` 里还要
+    // 用它决定那条本地失败轮退不退场（超时那一类交棒给「跟」），故不能在实参位置上判一次完事。
+    expect(talk, '该把判好的布尔存下来').toContain('timedOut = isRequestTimeout(err)');
+    expect(talk, '该把那个布尔传给 failureNotice').toContain(
+      'failureNotice((err as Error).message, timedOut)',
     );
     expect(
       talk.match(/import \{[^}]*isRequestTimeout[^}]*\} from '\.\..*\/realtime\/foreman'/)?.[0],
