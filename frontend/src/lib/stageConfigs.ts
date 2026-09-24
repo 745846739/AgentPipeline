@@ -174,6 +174,8 @@ function parseOptionalJson(raw: string, label: string): Parsed<unknown> {
 
 /**
  * 草稿 → PUT payload。留空字段被省略（= 后端清空为默认）。
+ * **例外（决策 261⑤）**：foreman 行的 `persona_append` 清空时显式下发 `""`——
+ * 省略会被后端存成 NULL，下次启动把用户的「关」当成「没配过」重新播种点名。
  * 任意字段非法时返回 `{ ok: false, error }`，不产生半成品 payload。
  */
 export function buildStageConfigPut(draft: StageConfigDraft): StageConfigPutResult {
@@ -186,7 +188,7 @@ export function buildStageConfigPut(draft: StageConfigDraft): StageConfigPutResu
   if (personaPath) payload.persona_path = personaPath;
 
   const personaAppend = draft.persona_append.trim();
-  if (personaAppend) payload.persona_append = personaAppend;
+  if (personaAppend || draft.stage === 'foreman') payload.persona_append = personaAppend;
 
   const temperature = parseOptionalNumber(draft.temperature, 'temperature', false);
   if ('error' in temperature) return { ok: false, error: temperature.error };

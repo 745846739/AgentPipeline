@@ -81,6 +81,19 @@ describe('buildStageConfigPut（整条替换：留空 = 省略 = 清空）', () 
     expect('tools_json' in result.payload).toBe(false);
   });
 
+  it('foreman 行清空点名时显式下发 ""（决策 261⑤：省略会在下次启动被重新播种）', () => {
+    const draft = { ...emptyStageConfigDraft('foreman'), persona_append: '  ' };
+    const result = buildStageConfigPut(draft);
+    expect(result.ok).toBe(true);
+    if (result.ok) expect(result.payload.persona_append).toBe('');
+  });
+
+  it('其余阶段清空点名仍是省略（既有「留空 = 省略 = 清空」语义不动）', () => {
+    const result = buildStageConfigPut(emptyStageConfigDraft('develop'));
+    expect(result.ok).toBe(true);
+    if (result.ok) expect('persona_append' in result.payload).toBe(false);
+  });
+
   it('显式 JSON（含 null）原样下发', () => {
     const draft = {
       ...emptyStageConfigDraft('test'),

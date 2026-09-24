@@ -419,6 +419,22 @@ pub async fn serve(options: ServeOptions) -> anyhow::Result<ServerHandle> {
         tracing::info!(count = orphaned, "已把上一进程遗留的在飞模型请求标成终态");
     }
 
+    // 出厂技能与点名的幂等播种（决策 261）：只补缺失、不覆盖用户改过的。
+    //
+    // 必须在下面的 `validate_startup` **之前**：用户若在阶段配置里声明了出厂技能，
+    // 校验要看到技能根里文件已经就位。技能文件写不进去不阻断启动（不声明时 `Skill`
+    // 工具有友好回落，同决策 261④ 的代价账）；点名的库写失败随 `?` 上传。
+    let seeded = agentpipeline_core::agent::factory::seed_factory_defaults(&home, &store).await?;
+    for warning in &seeded.warnings {
+        tracing::warn!("出厂技能播种未完成：{warning}");
+    }
+    if !seeded.skills_written.is_empty() {
+        tracing::info!(skills = ?seeded.skills_written, "已种入出厂技能");
+    }
+    if seeded.pointer_written {
+        tracing::info!("已为值班长播种 operate-pipeline 点名（foreman persona_append）");
+    }
+
     // 配置 fail fast（决策 47 / 103 / 134）
     let report = store.validate_startup(&settings).await?;
     if !report.demoted_providers.is_empty() {
@@ -798,6 +814,23 @@ mod tests {
         let (listener, bound) = bind_listener("127.0.0.1", 0).await.unwrap();
         assert_ne!(bound.port(), 0, "应回读内核分配的真实端口");
         assert_eq!(listener.local_addr().unwrap().port(), bound.port());
+    }
+
+    #[test]
+    fn startup_seeds_factory_defaults() {
+        // 决策 261 的**接线守卫**：出厂播种必须真的发生在启动路径上。判据是读本文件的
+        // **生产段**源码——先把 `#[cfg(test)]` 之后的测试段切掉再找：测试段自身就含
+        // 这个字面量（本断言就在里面），不切的话删掉生产调用这把尺也照样绿（自证式
+        // 守卫，code-review 抓出来的）。serve() 本体没法不绑端口地单测，接线只能这样钉。
+        let source = include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/src/serve.rs"));
+        let production = source
+            .split("#[cfg(test)]")
+            .next()
+            .expect("serve.rs 含测试段");
+        assert!(
+            production.contains("factory::seed_factory_defaults("),
+            "serve() 的生产段必须调用出厂播种（决策 261）"
+        );
     }
 
     #[test]

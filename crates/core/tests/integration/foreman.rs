@@ -4772,3 +4772,171 @@ async fn a_running_turn_is_readable_and_drops_the_moment_it_ends() {
         "失败的一轮也要摘掉登记（提前 `?` 退出那条路）"
     );
 }
+
+// ─────────────── 出厂技能点名的主缝三断言（决策 261，票 foreman-operate-pipeline 03）───────────────
+//
+// 取证一律取**模型真正收到的那一份**（system prompt / 回灌的 messages），不是常量本身：
+// 点名在不在、拉没拉、参数同不对，都以请求日志为准（照既有纪律段测试的姿态）。
+
+/// 播一次出厂默认（技能文件 + 点名），与 `serve()` 启动时调的是同一个函数。
+async fn seed_defaults(h: &Harness) {
+    let seeded =
+        agentpipeline_core::agent::factory::seed_factory_defaults(h._home.home(), &h.store)
+            .await
+            .unwrap();
+    assert!(seeded.pointer_written, "无存量配置时应当播下点名");
+}
+
+/// 断言①（人的回话轮）：点名每轮在场，且位置在人格段之后、工具纪律段之前（决策 261⑤）。
+#[tokio::test]
+async fn the_human_turn_prompt_carries_the_skill_pointer() {
+    let h = Harness::seeded().await;
+    seed_defaults(&h).await;
+
+    let mut script = Script::new();
+    script.for_foreman().text("在。");
+    let agent = FakeAgent::new(script);
+    let requests = agent.clone();
+    let runner = h.runner(agent);
+    runner.say(None, "在吗").await.unwrap();
+
+    let prompt = requests.request_log()[0].system_prompt.clone();
+    let ptr = prompt
+        .find(agentpipeline_core::agent::factory::FOREMAN_SKILL_POINTER)
+        .unwrap_or_else(|| panic!("人对话轮的 system prompt 要带点名：{prompt}"));
+    let persona = prompt.find(FOREMAN_PERSONA).expect("人格段在场");
+    let discipline = prompt.find("## 工具纪律").expect("工具纪律段在场");
+    assert!(
+        persona < ptr && ptr < discipline,
+        "点名该在人格段之后、工具纪律段之前：{prompt}"
+    );
+}
+
+/// 断言①（值守轮）：点名同样在场——值守轮自动轮也要按手册来（决策 261⑤ / spec Q10）。
+#[tokio::test]
+async fn the_watch_round_prompt_carries_the_skill_pointer() {
+    let h = Harness::seeded().await;
+    seed_defaults(&h).await;
+    note(
+        &h,
+        "t1",
+        agentpipeline_core::storage::AttentionKind::RetryExhausted,
+    )
+    .await;
+    h.clock.advance_secs(61); // 去抖窗口（默认 60s）过了
+
+    let mut script = Script::new();
+    script.for_foreman().text("t1 重试耗尽，我按手册备好提议。");
+    let agent = FakeAgent::new(script);
+    let requests = agent.clone();
+    let runner = h.runner(agent);
+    runner.watch().await.unwrap().expect("应当醒一次");
+
+    let prompt = requests.request_log()[0].system_prompt.clone();
+    assert!(
+        prompt.contains(agentpipeline_core::agent::factory::FOREMAN_SKILL_POINTER),
+        "值守轮的 system prompt 也要带点名：{prompt}"
+    );
+}
+
+/// 断言②：脚本让模型发 `Skill(name=operate-pipeline)`，工具**真实执行**——回灌进下一轮
+/// messages 的是技能根里那份手册正文（脚本从没写过它一个字）。
+#[tokio::test]
+async fn pulling_the_factory_handbook_returns_the_real_body_from_disk() {
+    let h = Harness::seeded().await;
+    let seeded =
+        agentpipeline_core::agent::factory::seed_factory_defaults(h._home.home(), &h.store)
+            .await
+            .unwrap();
+    assert!(
+        seeded
+            .skills_written
+            .iter()
+            .any(|s| s == "operate-pipeline"),
+        "技能文件应当本次种入：{seeded:?}"
+    );
+
+    let mut script = Script::new();
+    script
+        .for_foreman()
+        .tool("Skill", serde_json::json!({"name": "operate-pipeline"}));
+    script.for_foreman().text("手册已读，按它执行。");
+    let agent = FakeAgent::new(script);
+    let requests = agent.clone();
+    let runner = h.runner(agent);
+    let turn = runner.say(None, "把 t1 推进一步").await.unwrap();
+
+    assert_eq!(turn.traces.len(), 1, "{:?}", turn.traces);
+    assert_eq!(turn.traces[0].tool, "Skill");
+    assert!(turn.traces[0].ok, "Skill 工具应执行成功");
+
+    let log = requests.request_log();
+    assert_eq!(log.len(), 2, "一次工具往返 = 两次 LLM 请求");
+    let fed = serde_json::to_string(&log[1].messages).unwrap();
+    // 手册正文里的标志句——只可能来自磁盘上那份 SKILL.md
+    assert!(
+        fed.contains("确认纪律：一切写操作只产提议，永不绕过按键"),
+        "回灌的应是手册正文：{fed}"
+    );
+    assert!(fed.contains("逐票一卡"), "回灌的应是手册正文：{fed}");
+    // frontmatter 已剥（`load_body` 的口径）：回灌正文，不是带头的原文件
+    assert!(
+        !fed.contains("name: operate-pipeline"),
+        "frontmatter 不该回灌进正文：{fed}"
+    );
+}
+
+/// 断言③：拉完手册后产出的 `task` 提议，args 与配对端点按钮直发的参数**逐字一致**。
+///
+/// 「逐字」的机制在 `routes/foreman.rs::run_task_tool`：它把 args **逐字段原样**搬进
+/// `tasks::ResumeBody`——按键 POST `/tasks/{id}/resume` 直发的就是这份形，没有第二套参数
+/// 语言。故 JSON 全等（含字节：两边都按 canonical 形比 `to_string`）。
+#[tokio::test]
+async fn the_proposal_args_are_the_parameters_the_button_would_send() {
+    let h = Harness::seeded().await;
+    seed_defaults(&h).await;
+    park_task(
+        &h.store,
+        "t1",
+        PendingKind::RetryExhausted,
+        "重试耗尽，等你拍板",
+    )
+    .await;
+
+    let mut script = Script::new();
+    script
+        .for_foreman()
+        .tool("Skill", serde_json::json!({"name": "operate-pipeline"}));
+    script.for_foreman().tool(
+        "task",
+        serde_json::json!({"action": "resume", "task_id": "t1", "resume_action": "continue"}),
+    );
+    script.for_foreman().text("提议已备好，等你按键。");
+    let runner = h.runner(FakeAgent::new(script));
+    let turn = runner.say(None, "把 t1 推进一步").await.unwrap();
+
+    assert_eq!(turn.traces.len(), 2, "{:?}", turn.traces);
+    assert_eq!(turn.traces[0].tool, "Skill");
+    assert_eq!(turn.traces[1].tool, "task");
+    assert!(turn.traces[1].ok);
+
+    let pending = h
+        .store
+        .list_pending_foreman_proposals(&turn.session.id)
+        .await
+        .unwrap();
+    assert_eq!(pending.len(), 1, "应当恰好一张提议：{pending:?}");
+    assert_eq!(pending[0].tool, "task");
+
+    let expected = serde_json::json!({
+        "action": "resume",
+        "task_id": "t1",
+        "resume_action": "continue"
+    });
+    assert_eq!(pending[0].args, expected, "提议参数要与按钮直发的参数同源");
+    assert_eq!(
+        pending[0].args.to_string(),
+        expected.to_string(),
+        "逐字一致：按 canonical 字节比，不只比结构"
+    );
+}

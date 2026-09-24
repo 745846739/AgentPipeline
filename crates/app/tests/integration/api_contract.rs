@@ -3438,6 +3438,188 @@ async fn uninstall_unknown_skill_is_404() {
     assert_eq!(status, StatusCode::NOT_FOUND, "{body}");
 }
 
+// ═══════════════════════ 出厂技能（决策 261，票 foreman-operate-pipeline 02）═══════════════════════
+
+/// 出厂技能：种入即列表可见、预览读得出正文、**卸载被拒且报文说清**；对照组（普通技能）
+/// 照旧删得掉。
+///
+/// 播种由用例直接调 `seed_factory_defaults`——与 `serve()` 启动时调的是同一个函数；那条
+/// 接线由 serve 自己的源码扫描守卫钉住（`serve.rs::startup_seeds_factory_defaults`），
+/// 契约层不再重复验启动。
+#[tokio::test]
+async fn factory_skill_seeds_lists_previews_and_refuses_uninstall() {
+    let api = api().await;
+    agentpipeline_core::agent::factory::seed_factory_defaults(&api.state.home, &api.state.store)
+        .await
+        .unwrap();
+
+    // ① 列表可见，且目录态靠的 description 非空
+    let (status, body) = get(&api, "/skills").await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let entry = body["skills"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|s| s["name"] == "operate-pipeline")
+        .cloned()
+        .unwrap_or_else(|| panic!("出厂技能应当在列表里：{body}"));
+    assert!(
+        !entry["description"]
+            .as_str()
+            .unwrap_or("")
+            .trim()
+            .is_empty(),
+        "技能列表与目录态靠 description：{entry}"
+    );
+
+    // ② 预览读得出正文（body_available = 磁盘上那份读得到）
+    let (status, body) = get(&api, "/skills/operate-pipeline/preview").await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["body_available"], json!(true), "{body}");
+
+    // 磁盘上那份与二进制携带的逐字一致
+    let file = skills_root(&api).join("operate-pipeline").join("SKILL.md");
+    let on_disk = std::fs::read_to_string(&file).unwrap();
+    let embedded = agentpipeline_core::agent::factory::FACTORY_SKILLS
+        .iter()
+        .find(|s| s.name == "operate-pipeline")
+        .expect("白名单里应当有 operate-pipeline")
+        .body;
+    assert_eq!(on_disk, embedded, "种入的正文必须与二进制携带的逐字一致");
+
+    // ③ 卸载被拒：400 + 报文说清出厂技能不可删除；文件与列表项都还在
+    let (status, body) = delete(&api, "/skills/operate-pipeline").await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    let err = body["error"].as_str().unwrap_or("");
+    assert!(err.contains("出厂技能"), "报文要说清是出厂技能：{err}");
+    assert!(err.contains("不可删除"), "报文要说清不可删除：{err}");
+    assert!(file.is_file(), "拒绝卸载后文件必须还在");
+    let (_, body) = get(&api, "/skills").await;
+    assert!(
+        body["skills"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|s| s["name"] == "operate-pipeline"),
+        "拒绝卸载后列表里必须还有它：{body}"
+    );
+
+    // ④ 对照组：普通技能照旧删得掉——拒的是白名单名字，不是删除这个动作
+    let zip = skill_zip("grill", "普通技能正文", &[]);
+    let (status, body) = post_zip(&api, "/skills/import", zip).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let (status, body) = delete(&api, "/skills/grill").await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert!(
+        !skills_root(&api).join("grill").exists(),
+        "普通技能应当删掉"
+    );
+}
+
+/// foreman 点名的默认值经**阶段配置端点**写入与读回（票 03）：播种 → GET 见默认；
+/// 用户清空 → 重播不覆盖；删行（存量数据「无该配置」的升级路径）→ 重播补回。
+#[tokio::test]
+async fn foreman_pointer_default_roundtrips_through_stage_configs() {
+    use agentpipeline_core::agent::factory;
+    let api = api().await;
+
+    // ① 播种后 GET 读回默认点名
+    factory::seed_factory_defaults(&api.state.home, &api.state.store)
+        .await
+        .unwrap();
+    assert_eq!(
+        foreman_persona_append(&api).await,
+        json!(factory::FOREMAN_SKILL_POINTER)
+    );
+
+    // ② 用户清空（设置页那格的权威）→ 重播不覆盖
+    let (status, body) = put(
+        &api,
+        "/stage-configs/foreman",
+        json!({"persona_append": ""}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    factory::seed_factory_defaults(&api.state.home, &api.state.store)
+        .await
+        .unwrap();
+    assert_eq!(
+        foreman_persona_append(&api).await,
+        json!(""),
+        "用户清空过的点名不得被播种覆盖"
+    );
+
+    // ③ 升级路径：删行（等价存量「无该配置」）→ 重播补回
+    let (status, body) = delete(&api, "/stage-configs/foreman").await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    factory::seed_factory_defaults(&api.state.home, &api.state.store)
+        .await
+        .unwrap();
+    assert_eq!(
+        foreman_persona_append(&api).await,
+        json!(factory::FOREMAN_SKILL_POINTER),
+        "删行（存量无配置）后重播应当补回"
+    );
+}
+
+/// 按下 `task/resume` 提议真的走**按钮端点**落库（决策 261 主缝断言③的执行侧）。
+///
+/// 断言③（core 主缝）钉的是「提议参数与按钮直发的参数逐字一致」；这条钉后半句——
+/// 同源的参数按下去真的落地。`run_task_tool` 的 `resume` 分支此前只有托管路径
+/// （不经按键）覆盖，按键快乐路径只测过环境两族与 `service`（code-review 抓出的缺口）。
+#[tokio::test]
+async fn pressing_a_task_resume_proposal_lands_the_cursor() {
+    let api = api_with_foreman(FakeAgent::new(Script::new())).await;
+    seed(&api, "t-press").await;
+    // 停在「裁决分歧」：continue 是这一档的合法动作（与托管用例同一取样理由）
+    let cursor = api.state.store.load_live_cursors("t-press").await.unwrap()[0].clone();
+    api.state
+        .store
+        .set_cursor_pending(
+            &cursor.cursor_id,
+            &agentpipeline_core::types::PendingReason::new(
+                agentpipeline_core::types::PendingKind::UserDecision,
+                cursor.stage,
+                cursor.node,
+                "评审员与架构师对这条裁决有分歧",
+            )
+            .with_context(agentpipeline_core::types::PendingContext::with_kind(
+                agentpipeline_core::actions::kinds::JUDGE_DISAGREEMENT,
+            )),
+        )
+        .await
+        .unwrap();
+    api.state
+        .store
+        .sync_task_projection("t-press")
+        .await
+        .unwrap();
+    let sid = fresh_session(&api).await;
+    let pid = seed_proposal(
+        &api,
+        &sid,
+        "task",
+        json!({"action": "resume", "task_id": "t-press", "resume_action": "continue"}),
+    )
+    .await;
+
+    let (status, body) = post(
+        &api,
+        &format!("/foreman/proposals/{pid}/execute"),
+        json!({}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+
+    let cursor = api.state.store.load_live_cursors("t-press").await.unwrap()[0].clone();
+    assert!(
+        !cursor.is_pending(),
+        "按键应当把这一步拍板落地（游标不再 pending）：{cursor:?}"
+    );
+    let (_, body) = get(&api, &format!("/foreman/session?session={sid}")).await;
+    assert_eq!(body["proposals"][0]["status"], "executed", "{body}");
+}
+
 /// 本机无网时票 09 的功能全部可用——本端点组不依赖任何网络（票 09 最后一条验收项）。
 ///
 /// 断言的是「导入 / 列表 / 扫描」三段全链路在纯本地路径下跑通，没有需要出网的环节。
@@ -5200,6 +5382,19 @@ async fn fresh_session(api: &Api) -> String {
         .await
         .unwrap()
         .id
+}
+
+/// foreman 行的 `persona_append` 读数（点名播种用例专用）：行不在就地失败，
+/// 免得三段各自手抄一遍「GET → 展开 → 找行」（code-review 的重复代码口径）。
+async fn foreman_persona_append(api: &Api) -> Value {
+    let (_, body) = get(api, "/stage-configs").await;
+    body["stage_configs"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|c| c["stage"] == "foreman")
+        .map(|c| c["persona_append"].clone())
+        .unwrap_or_else(|| panic!("foreman 行应当在场：{body}"))
 }
 
 /// 提议的读端点：只给未决的那些，且挂在会话上。

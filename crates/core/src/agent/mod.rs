@@ -4,6 +4,7 @@ pub mod baseline;
 pub mod client;
 pub mod context;
 pub mod egress;
+pub mod factory;
 pub mod file_policy;
 pub mod metadata;
 pub mod prompts;
