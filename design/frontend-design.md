@@ -812,7 +812,7 @@ GET /tasks/{id}               → 详情页装载 + 断线重连后的全量校�
 | 绑定开关只由回环来源发起；界面说出「这次绑定是谁定的」 | `frontend/src/routes/Share.svelte`、`frontend/src/lib/lanToggle.ts` | 决策 186 |
 | 端口不是配置里那个（被别的程序占着，退让到临时端口）时，分享页说出「这次为什么变了」 | `frontend/src/routes/Share.svelte`、`frontend/src/lib/sharePairing.ts` | 决策 213；判定在 `portFallbackNote`，只绑回环时不说 |
 | 通知策略：toast 只对 pending / done / failed 弹，同类 5 分钟 cooldown，22–8 免打扰 | `frontend/src/lib/notificationPolicy.ts` | 决策 65 |
-| 实时：逐任务开 SSE 流 + 10s 对齐 tick 兜底 refetch | `frontend/src/realtime/connection.ts`、`frontend/src/stores/board.svelte.ts` | 决策 76 |
+| 实时：逐任务开 SSE 流 + 10s 对齐 tick 兜底 refetch；断流自愈——服务端静默也每 15s 发心跳、客户端「已连接」超 3×心跳无字节判死重连（看门狗）、任何重连成功后必补一次全量校准（解锁竞态与对讲台 reload 同走这一个入口） | `frontend/src/realtime/connection.ts`、`frontend/src/stores/board.svelte.ts`、`frontend/src/stores/taskDetail.svelte.ts`、`frontend/src/routes/Talk.svelte`、`crates/app/src/stream.rs` | 决策 76；spec `stream-self-heal` 票 01–04（心跳常量 SSE_KEEPALIVE_INTERVAL，阈值在连接层 options 注入） |
 | 主题切换（夜班靛 / 掌机背光）并入底部状态行 | `frontend/src/components/layout/StatusLine.svelte` | 决策 169 |
 | 详情页加载失败 / 换 id：把上一个任务连同它的动作按钮一起收走，并给一颗能按的「重新加载」（「这个 id 没有」与「没读到」分开说） | `frontend/src/stores/taskDetail.svelte.ts`、`frontend/src/routes/TaskDetail.svelte` | 票 01（R2-01）；清空是 `resetTaskContent()`，两条出路是「重试」与「重新加载」 |
 | 错误可见、可说、可恢复：错误横幅进 live region（`role=alert`）、表单给字段级 `aria-invalid` + `aria-describedby`、市场刷新失败**保留已列出的列表**并自带重试 | `frontend/src/routes/SettingsMarket.svelte`、`frontend/src/routes/Board.svelte`、`frontend/src/components/settings/ProjectForm.svelte`、`frontend/src/components/settings/ProviderForm.svelte` | 票 02（R2-06 / 07a / 07c） |

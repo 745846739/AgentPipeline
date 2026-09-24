@@ -833,6 +833,10 @@
           // 连接不在的时候它说的就不再是此刻——留着只会变成一个撤不掉的假标记。
           if (status !== 'open') foreignActive = emptyForeignActive();
         },
+        // 重连成功后补一次全量（票 03，stream-self-heal）：SSE 无回放，非可见性原因
+        // 断线重连后不 reload 就得切走再切回来才对齐。走与可见性恢复同一个入口
+        // （reload），不另造第二条读路径。
+        onRecalibrate: () => void reload(),
       },
       { path: '/foreman/stream' },
     );

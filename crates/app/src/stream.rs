@@ -11,6 +11,14 @@ use crate::state::{ApiError, AppState};
 /// 配对令牌请求头（决策 182㉗，票 07）。
 pub const PAIRING_TOKEN_HEADER: &str = "x-agentpipeline-token";
 
+/// SSE 心跳间隔（票 01，stream-self-heal）：静默的流每 15 秒发一帧
+/// **不携带 data 的注释帧**——客户端分帧器只认 data 行，解析器因此零改动。
+///
+/// 「有事件才出字节」的流在半开连接下双方都察觉不到：这是客户端停滞看门狗
+/// 分清「安静且健康」与「安静且已死」的唯一凭据。与看门狗阈值成 **3 倍**关系
+/// （客户端阈值 45 秒 = 3 × 本间隔）：慢到丢两帧心跳才判死，改一个必须看另一个。
+pub const SSE_KEEPALIVE_INTERVAL: std::time::Duration = std::time::Duration::from_secs(15);
+
 /// 配对缺失的机器可读失败类别（票 04 / 决策 259，姿态照 `KIND_SKILL_NOT_FOUND` 先例）。
 ///
 /// 403 在本应用里被两处用着（配对缺失、跨源防护），界面此前只能按**报文字串**分支

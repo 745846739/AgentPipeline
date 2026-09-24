@@ -7,7 +7,8 @@ import type { SseEvent } from '../api/types';
  * **fetch 流式读取，不用 EventSource**：EventSource 无法携带自定义头，
  * 跨源过不了决策 128 防护，也违背 153② 的桌面壳约束。
  *
- * 特性：指数退避重连 + `document.visibilitychange` 恢复时立即校准一次。
+ * 特性：指数退避重连 + `document.visibilitychange` 恢复时立即校准一次
+ * + 停滞看门狗（`open` 下超时没字节判死，票 02）。
  */
 
 export type StreamStatus = 'idle' | 'connecting' | 'open' | 'closed' | 'error';
@@ -30,6 +31,13 @@ export interface TaskStreamOptions {
    * 的分帧错误只在生产的长 delta 上才现形。缺省是任务流地址。
    */
   path?: string;
+  /**
+   * 停滞看门狗阈值（票 02，stream-self-heal）：`open` 状态下超过该时长收不到
+   * **任何字节**就判死走主动重连。缺省 45 秒 = 3 × 服务端心跳间隔 15 秒
+   * （服务端 `SSE_KEEPALIVE_INTERVAL`）——慢到连丢两帧心跳才判死；
+   * 改一个必须看另一个。判据是字节而非事件：心跳帧解析出零事件，但它证明线还活着。
+   */
+  stallTimeoutMs?: number;
 }
 
 /** 解析 SSE 帧，返回本次 chunk 产生的 data 载荷。纯函数，便于测试。 */
@@ -71,6 +79,7 @@ export class TaskStream {
 
   stop(): void {
     this.stopped = true;
+    this.disarmStallWatch();
     this.controller?.abort();
     this.controller = null;
     this.setStatus('closed');
@@ -86,10 +95,40 @@ export class TaskStream {
    */
   private missedWhileDown = false;
 
-  /** visibilitychange 恢复：重置退避并立即重连（无 SSE 回放，靠 refetch 校准）。 */
+  /**
+   * 停滞看门狗（票 02）的计时器：`open` 期间从「最近一次收到任何字节」起算，
+   * 阈值内来字节就重置，超时走 `reconnectNow()`（它置「断过线」，重连成功后
+   * 自动补一次全量校准）。只在 `open` 挂——`connecting` 阶段由 fetch 自身失败
+   * 与退避兜底，`closed` / `stop` 之后不该再有任何动作。
+   */
+  private stallTimer: ReturnType<typeof setTimeout> | null = null;
+
+  private armStallWatch(): void {
+    this.disarmStallWatch();
+    const ms = this.options.stallTimeoutMs ?? 45_000;
+    this.stallTimer = setTimeout(() => {
+      this.stallTimer = null;
+      if (this.stopped || this.status !== 'open') return;
+      this.reconnectNow();
+    }, ms);
+  }
+
+  private disarmStallWatch(): void {
+    if (this.stallTimer !== null) {
+      clearTimeout(this.stallTimer);
+      this.stallTimer = null;
+    }
+  }
+
+  /** 可见性恢复 / 看门狗触发：重置退避并立即重连（无 SSE 回放，靠 refetch 校准）。 */
   reconnectNow(): void {
     if (this.stopped) return;
     this.attempt = 0;
+    // 主动重连也置「断过线」（票 03，stream-self-heal）：解锁时可见性回调里那次并发的
+    // 校准请求可能因网络未醒先失败，而重连随后成功——不置标记的话系统会认为「没错过」，
+    // 断流期间的变化就停在旧画面。置了标记，重连成功那一次必补一次全量校准；
+    // 可见性回调那次降级为「先到的预热」，重复校准无害。
+    this.missedWhileDown = true;
     // 主动中断必须与 stop() 区分：否则 AbortError 会让循环永久退出，
     // visibilitychange 之后再也收不到实时更新（§9.1「恢复时立即校准一次」）。
     this.restarting = true;
@@ -137,11 +176,13 @@ export class TaskStream {
         this.setStatus('open');
         // 掉线之后接回来的第一次：先把全量状态拉回来（断流期间的事件已经永久丢了）
         if (wasDown) this.handlers.onRecalibrate?.(this.taskId);
+        this.armStallWatch();
         await this.consume(res.body);
         // 正常结束（服务端关闭）也走重连
         if (this.stopped) break;
         throw new Error('stream ended');
       } catch (err) {
+        this.disarmStallWatch();
         if (this.stopped) break;
         if ((err as Error).name === 'AbortError') {
           // 主动重连（reconnectNow）：不退出循环、不退避，立刻重开一条流。
@@ -158,6 +199,7 @@ export class TaskStream {
         await sleep(this.backoffDelay());
       }
     }
+    this.disarmStallWatch();
     this.setStatus('closed');
   }
 
@@ -168,6 +210,8 @@ export class TaskStream {
     while (!this.stopped) {
       const { value, done } = await reader.read();
       if (done) return;
+      // 任何字节都是「线还活着」的证据（心跳注释帧也算）：重置看门狗
+      this.armStallWatch();
       buffer += decoder.decode(value, { stream: true });
       const { events, rest } = parseSseFrames(buffer);
       buffer = rest;

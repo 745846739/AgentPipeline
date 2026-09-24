@@ -247,3 +247,91 @@ test.describe('UX2 ⑨ 超时 / 断线 / 长值（票 12 / 13 / 17）', () => {
     expectBundleHealthy(bundle);
   });
 });
+
+/**
+ * 解锁恢复链（票 04，stream-self-heal spec）：锁屏解锁（= 可见性恢复）之后——
+ * 流必须重开；可见性回调里那次校准**失败**也必须有人兜（重连成功后补的第二次校准，
+ * 票 03 的牙齿）；对讲台重连成功后必须补一次 reload（onRecalibrate 接线的牙齿）。
+ *
+ * 看门狗不进 e2e（45 秒太慢），它归连接层单测（缝 A，connection.test.ts）。
+ * 断言落点是**请求数**而非横幅显隐：详情页没有周期 tick 兜底，内容恢复只可能来自校准。
+ */
+test.describe('解锁恢复链（票 04，stream-self-heal）', () => {
+  let app: App;
+
+  test.beforeAll(async () => {
+    app = await startApp({ script: fullPassScript('UNLOCK'), title: '解锁恢复' });
+  });
+
+  test.afterAll(async () => {
+    await app?.stop();
+  });
+
+  test('⑥ 详情页：首个校准失败也有人兜——流重开 + 第二次校准到达 + 内容仍正确', async ({
+    page,
+  }) => {
+    const bundle = watchBundle(page);
+    let refetches = 0;
+    let streamOpens = 0;
+    let failNextRefetch = false;
+    await page.route('**/tasks/*/stream', async (route) => {
+      streamOpens += 1;
+      return route.continue();
+    });
+    await page.route(`**/tasks/${app.taskIds[0]}`, async (route) => {
+      if (route.request().method() !== 'GET') return route.continue();
+      // 只让解锁后「可见性回调里的那一次」失败：它模拟解锁瞬间网络还没醒
+      if (failNextRefetch) {
+        failNextRefetch = false;
+        return route.abort();
+      }
+      refetches += 1;
+      return route.continue();
+    });
+
+    await page.goto(`${app.webBase}/#/task/${app.taskIds[0]}`);
+    await settleBundle(page, bundle);
+    await expect(page.locator('.d-title')).toBeVisible({ timeout: 30_000 });
+    await expect.poll(() => streamOpens, { timeout: 30_000 }).toBeGreaterThan(0);
+
+    const refetchBefore = refetches;
+    const streamBefore = streamOpens;
+    failNextRefetch = true;
+    // 模拟解锁：visibilityState 本来就是 visible，事件本身是唤醒信号
+    await page.evaluate(() => document.dispatchEvent(new Event('visibilitychange')));
+
+    // ① 流被重开（reconnectNow 中断旧连接、立刻新开一条）
+    await expect.poll(() => streamOpens, { timeout: 30_000 }).toBeGreaterThan(streamBefore);
+    // ② 首次校准按计划失败，但重连成功后的补校准必须到达——没有票 03，
+    //    这里会等到超时（主动重连不置「断过线」，系统以为没错过）
+    await expect.poll(() => refetches, { timeout: 30_000 }).toBeGreaterThan(refetchBefore);
+    // ③ 内容最终正确：失败的那次校准若清过现场，补校准把它拉了回来
+    await expect(page.locator('.d-title')).toBeVisible({ timeout: 30_000 });
+    expectBundleHealthy(bundle);
+  });
+
+  test('⑦ 对讲台：解锁后流重连成功，必须补一次 reload（onRecalibrate 接线的牙齿）', async ({
+    page,
+  }) => {
+    const bundle = watchBundle(page);
+    let sessionReads = 0;
+    await page.route('**/foreman/session', async (route) => {
+      if (route.request().method() === 'GET') sessionReads += 1;
+      return route.continue();
+    });
+
+    await page.goto(`${app.webBase}/#/talk`);
+    await settleBundle(page, bundle);
+    await expect.poll(() => sessionReads, { timeout: 30_000 }).toBeGreaterThan(0);
+
+    const before = sessionReads;
+    await page.evaluate(() => document.dispatchEvent(new Event('visibilitychange')));
+
+    // 可见性回调自己 reload 一次（+1）；接了 onRecalibrate 之后重连成功再补一次（+2）。
+    // 没接线只有 +1——这条用例的牙齿。安静班次没有轮询会来搅局（轮询只在真跟随时走）。
+    await expect
+      .poll(() => sessionReads, { timeout: 30_000 })
+      .toBeGreaterThanOrEqual(before + 2);
+    expectBundleHealthy(bundle);
+  });
+});

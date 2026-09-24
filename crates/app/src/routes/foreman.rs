@@ -42,7 +42,7 @@ use agentpipeline_core::storage::proposals::{ForemanProposal, ForemanProposalSta
 use agentpipeline_core::storage::Store;
 use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
-use axum::response::sse::{Event, Sse};
+use axum::response::sse::{Event, KeepAlive, Sse};
 use axum::response::IntoResponse;
 use axum::Json;
 use futures::StreamExt;
@@ -50,6 +50,7 @@ use serde::Deserialize;
 use serde_json::json;
 
 use crate::state::{map_core_error, ApiError, ApiResult, AppState};
+use crate::stream::SSE_KEEPALIVE_INTERVAL;
 
 /// 单次读取的会话上限。
 ///
@@ -1005,7 +1006,7 @@ pub async fn stream(
                 _ => None,
             }
         });
-    Ok(Sse::new(stream))
+    Ok(Sse::new(stream).keep_alive(KeepAlive::new().interval(SSE_KEEPALIVE_INTERVAL)))
 }
 
 /// 未接线时的统一拒绝（决策 182：缺省 `None` 返回 503，不是 500）。

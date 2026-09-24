@@ -10,7 +10,7 @@ use agentpipeline_core::types::{
 };
 use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
-use axum::response::sse::{Event, Sse};
+use axum::response::sse::{Event, KeepAlive, Sse};
 use axum::response::IntoResponse;
 use axum::Json;
 use futures::StreamExt;
@@ -18,6 +18,7 @@ use serde::Deserialize;
 use serde_json::json;
 
 use crate::state::{map_core_error, ApiError, ApiResult, AppState};
+use crate::stream::SSE_KEEPALIVE_INTERVAL;
 
 fn cursors_json(cursors: &[NodeCursor]) -> Vec<serde_json::Value> {
     cursors
@@ -668,7 +669,7 @@ pub async fn stream(
             }
         }
     });
-    Ok(Sse::new(stream))
+    Ok(Sse::new(stream).keep_alive(KeepAlive::new().interval(SSE_KEEPALIVE_INTERVAL)))
 }
 
 /// `GET /tasks/{id}/flow`：流转时间线（历史查询，决策 76）。

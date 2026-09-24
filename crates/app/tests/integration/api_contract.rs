@@ -1704,6 +1704,114 @@ async fn stream_is_the_only_event_channel_and_carries_branch() {
     assert_eq!(recorder.branches(), vec!["develop-design".to_string()]);
 }
 
+/// 读 SSE 响应体的第一帧，等不到就按「心跳没来」归因（票 01，stream-self-heal）。
+///
+/// 帧边界按 `\n\n` 判（SSE 规范），不假设一次 read 恰好等于一帧。
+async fn first_sse_frame_within(body: Body, limit: std::time::Duration) -> String {
+    use futures::StreamExt;
+    let mut stream = body.into_data_stream();
+    let got = tokio::time::timeout(limit, async {
+        let mut buf: Vec<u8> = Vec::new();
+        loop {
+            match stream.next().await {
+                Some(Ok(bytes)) => {
+                    buf.extend_from_slice(&bytes);
+                    if buf.windows(2).any(|w| w == b"\n\n") {
+                        return buf;
+                    }
+                }
+                Some(Err(e)) => panic!("SSE 响应体出错：{e}"),
+                None => panic!("SSE 响应体提前结束（keep-alive 不该让流收尾）"),
+            }
+        }
+    })
+    .await;
+    match got {
+        Ok(buf) => String::from_utf8_lossy(&buf).into_owned(),
+        Err(_) => panic!("{limit:?} 内没等到第一帧——静默流无心跳时，半开连接永远不会被双方发现"),
+    }
+}
+
+/// 心跳：**静默**的任务流也必须按时来一帧（票 01，stream-self-heal §验收）。
+///
+/// 「有事件才出字节」的流在半开状态下双方都察觉不到——心跳是客户端停滞看门狗
+/// 分清「安静且健康」与「安静且已死」的唯一凭据。故本用例**故意不发任何业务事件**：
+/// 拿到的第一帧只可能来自 keep-alive，且它必须是不携带 data 的注释帧
+/// （客户端分帧器只认 data 行 → 解析器零改动；另一侧的钉子在 connection.test.ts）。
+///
+/// 时钟在 **setup 之后、等帧之前**再暂停：`start_paused` 会把 sqlx 连接池的
+/// acquire 超时也快进掉（实测 `Db(PoolTimedOut)` 炸在 `api().await`），
+/// 而暂停后唯一在跑的定时器就是 keep-alive 的 15 秒 Sleep——auto-advance
+/// 直接把它推到点上，不睡真实时间、也不再碰 DB。
+#[tokio::test]
+async fn quiet_task_stream_receives_keepalive_comment_frame() {
+    let api = api().await;
+    seed(&api, "t1").await;
+
+    let response = api
+        .router
+        .clone()
+        .oneshot(
+            request("GET", "/tasks/t1/stream")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let content_type = response
+        .headers()
+        .get(header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or_default()
+        .to_string();
+    assert!(
+        content_type.starts_with("text/event-stream"),
+        "心跳不改通道形状：{content_type}"
+    );
+
+    tokio::time::pause();
+    let frame =
+        first_sse_frame_within(response.into_body(), std::time::Duration::from_secs(20)).await;
+    assert!(
+        !frame.contains("data:"),
+        "心跳必须是不携带 data 的注释帧，否则解析器不再是零改动：{frame:?}"
+    );
+}
+
+/// 值班长流同赌注（票 01）：两个端点必须同做，否则值班长流成为漏网的那条。
+#[tokio::test]
+async fn quiet_foreman_stream_receives_keepalive_comment_frame() {
+    let api = api_with_foreman(FakeAgent::new(Script::new())).await;
+
+    let response = api
+        .router
+        .clone()
+        .oneshot(
+            request("GET", "/foreman/stream")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let content_type = response
+        .headers()
+        .get(header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or_default()
+        .to_string();
+    assert!(
+        content_type.starts_with("text/event-stream"),
+        "心跳不改通道形状：{content_type}"
+    );
+
+    tokio::time::pause();
+    let frame =
+        first_sse_frame_within(response.into_body(), std::time::Duration::from_secs(20)).await;
+    assert!(!frame.contains("data:"), "心跳必须不携带 data：{frame:?}");
+}
+
 // ─────────────────────────── 只读视图（决策 63 / 99 / 114 / 76）───────────────────────────
 
 #[tokio::test]
