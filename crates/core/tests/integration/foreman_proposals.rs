@@ -189,10 +189,21 @@ async fn the_sweep_expires_rows_without_deleting_them() {
         .await
         .unwrap();
     assert_eq!(all.len(), 2);
-    assert_eq!(
-        all[0].status,
-        ForemanProposalStatus::Expired,
+    // 升序钉的是**排序本身**，不拿「位置 0」认行：id 是 ULID，同一毫秒内大小由随机段
+    // 决定、与插入先后无关——「先建的那条排第一」在全量套件里实测偶发不成立。
+    assert!(
+        all[0].id < all[1].id,
         "时间线按 id 升序给出全部（含已过期）"
+    );
+    let row = |id: &str| all.iter().find(|p| p.id == id).unwrap();
+    assert_eq!(
+        row(stale.as_str()).status,
+        ForemanProposalStatus::Expired,
+        "过期的那条仍在时间线里（不删行）"
+    );
+    assert_eq!(
+        row(in_flight.as_str()).status,
+        ForemanProposalStatus::Pending
     );
     // 未决清单里只剩那条在执行的
     let pending = fx
