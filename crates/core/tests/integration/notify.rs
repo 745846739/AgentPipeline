@@ -16,7 +16,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use agentpipeline_core::clock::Clock;
-use agentpipeline_core::notify::{notification_class, NotifyClass, WebhookNotifier};
+use agentpipeline_core::notify::{notification_class, NotifyClass, NotifyFormat, WebhookNotifier};
 use agentpipeline_core::storage::attention::AttentionKind;
 use agentpipeline_core::storage::Store;
 use chrono::{DateTime, Local, TimeZone, Utc};
@@ -80,10 +80,15 @@ async fn fixture(hour: u32) -> Fixture {
 
 impl Fixture {
     fn attach(&self, server: &TinyHttp) {
+        self.attach_format(server, NotifyFormat::Generic);
+    }
+
+    fn attach_format(&self, server: &TinyHttp, format: NotifyFormat) {
         self.store.set_notifier(Arc::new(WebhookNotifier::new(
             server.url("/hook"),
             300,
             [22, 8],
+            format,
             self.clock.clone(),
         )));
     }
@@ -141,6 +146,35 @@ async fn an_attention_that_wakes_posts_generic_json_to_the_webhook() {
         "detail 原文一个字都不该出网：{payload}"
     );
     // 方法行是 POST（TinyHttp 的首行记录）。
+    assert!(
+        server.first_request_line().starts_with("POST"),
+        "{}",
+        server.first_request_line()
+    );
+}
+
+#[tokio::test]
+async fn feishu_format_posts_a_text_message_instead_of_generic_json() {
+    let f = fixture(12).await;
+    let server = TinyHttp::spawn("200", "application/json", b"{}".to_vec(), Duration::ZERO);
+    f.attach_format(&server, NotifyFormat::Feishu);
+
+    note(&f, AttentionKind::RunFailed, f.clock.now()).await;
+    assert!(
+        wait_hits(&server, 1, 3_000).await,
+        "format = feishu 不改变触发面：wakes() 照样出站"
+    );
+
+    let raw = String::from_utf8_lossy(&server.body()).to_string();
+    let payload: serde_json::Value = serde_json::from_str(&raw).expect("payload 是合法 JSON");
+    assert_eq!(payload["msg_type"], "text", "{payload}");
+    let text = payload["content"]["text"].as_str().unwrap();
+    assert!(
+        text.starts_with("[AgentPipeline] t1 run_failed"),
+        "自定义关键词前缀 + kind + task_id：{text}"
+    );
+    // 归因纪律与格式无关：detail 原文一个字都不出网（270② 分流前共用）。
+    assert!(!text.contains("boom"), "detail 原文不出网：{text}");
     assert!(
         server.first_request_line().starts_with("POST"),
         "{}",

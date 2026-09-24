@@ -686,13 +686,13 @@ async fn recover_dependency_failed(&self) -> Result<()> {
 **离线通知（决策 268 落地 2026-09-24——原决策 65 的「v2 预留」随本条进 v1）：**
 `[notify].webhook_url` 配置在场即出站：attention 落库且 `wakes()` 时 POST 一条通用 JSON
 （`{title, body, kind, task_id, occurred_at, source}`，`body` 只带归因白名单字段、
-不带正文/日志原文），URL 缺席 = 整段关死、URL 含 token 只进 config.toml 不进日志。
+不带正文/日志原文），URL 缺席 = 整段关死、URL 含 token 只进 config.toml 不进日志。`[notify].format`（决策 270，缺省 `generic`）可切 `feishu`——同一份事件按目标选序列化、报文变成飞书文本消息（`msg_type=text`，text = `title\nbody`），政策语义与格式无关；飞书端安全设置用**自定义关键词 `AgentPipeline`**（`title` 固定前缀命中），不做签名校验。
 礼貌语义（每类 cooldown、免打扰 `[22, 8)` 跨零点按本地整点、`failed` 恒发、`pending`
 免打扰豁免）在 Rust（`crates/core/src/notify.rs`）与前端
 （`frontend/src/lib/notificationPolicy.ts`，只管浏览器 toast）各有一份，由
 `tests/fixtures/notification_policy.json` 双端同表钉住（决策 246 先例）；前端还有一层
 `notifyOn` 用户偏好开关（`cancelled` 缺省关），后端没有偏好面——差异记在决策 268 与
-fixture `$comment`。邮件 / IM 机器人可由 webhook 转发，独立 SMTP / 专用卡片有证据再议。
+fixture `$comment`。飞书机器人已可 `format = "feishu"` 直连（决策 270），其余 IM / 邮件仍可由通用 webhook 转发，独立 SMTP / 专用卡片有证据再议。
 **职责划分（决策 130，不动）：SSE 全量推送、不做 cooldown 合并**——它是状态同步通道，
 吞事件会丢状态；前端 toast 的 cooldown / quiet_hours 只作用于 toast 层
 （frontend-design §9.1 对齐）。

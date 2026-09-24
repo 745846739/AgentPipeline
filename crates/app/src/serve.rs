@@ -374,13 +374,15 @@ pub async fn serve(options: ServeOptions) -> anyhow::Result<ServerHandle> {
     };
 
     let store = Store::open(home.clone(), Arc::new(SystemClock)).await?;
-    // 离线通知（决策 268）：`[notify].webhook_url` 在场才挂出口——缺席 = 整段关死。
-    // 挂在 attention 的记账漏斗上（与值守轮同一信号面），投递 best-effort 在出口内部。
+    // 离线通知（决策 268 / 270）：`[notify].webhook_url` 在场才挂出口——缺席 = 整段关死。
+    // 挂在 attention 的记账漏斗上（与值守轮同一信号面），投递 best-effort 在出口内部；
+    // 报文格式（`[notify].format`，决策 270）在这里透传给出口，政策语义与格式无关。
     if let Some(url) = config.notify.webhook_url.as_deref() {
         store.set_notifier(Arc::new(agentpipeline_core::notify::WebhookNotifier::new(
             url.to_string(),
             config.notify.cooldown_sec,
             config.notify.quiet_hours,
+            config.notify.format,
             Arc::new(SystemClock),
         )));
     }

@@ -7,6 +7,7 @@ use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
+use crate::notify::NotifyFormat;
 use crate::types::{Provider, StageConfig};
 use crate::{Error, Result};
 
@@ -519,6 +520,10 @@ pub struct NotifyConfig {
     pub cooldown_sec: u64,
     /// 免打扰时段 `[start, end)` 小时，跨零点写法（如 `[22, 8]`）；按服务器本地整点。
     pub quiet_hours: [u8; 2],
+    /// 报文格式（决策 270）：`generic` = 268 的六字段通用 JSON（缺省）；
+    /// `feishu` = 飞书机器人文本消息。政策语义（cooldown / 免打扰 / 触发面）
+    /// 与格式无关，只有最后拼 payload 那一步分流。
+    pub format: NotifyFormat,
 }
 
 impl Default for NotifyConfig {
@@ -527,6 +532,7 @@ impl Default for NotifyConfig {
             webhook_url: None,
             cooldown_sec: 300,
             quiet_hours: [22, 8],
+            format: NotifyFormat::Generic,
         }
     }
 }
@@ -1534,6 +1540,30 @@ mod tests {
         );
         assert_eq!(cfg.notify.cooldown_sec, 60);
         assert_eq!(cfg.notify.quiet_hours, [9, 18]);
+    }
+
+    // ── 决策 270：`[notify].format` 报文格式分支 ──
+
+    /// 缺省 `generic` = 268 的六字段契约原样（不配格式 = 零行为差异）。
+    #[test]
+    fn notify_format_defaults_to_generic() {
+        let cfg = Config::from_toml("").unwrap();
+        assert_eq!(cfg.notify.format, NotifyFormat::Generic);
+    }
+
+    /// 显式 `feishu` 解析成分支枚举（同一份通用事件、按目标选序列化）。
+    #[test]
+    fn notify_format_feishu_parses() {
+        let cfg = Config::from_toml("[notify]\nwebhook_url = \"https://x\"\nformat = \"feishu\"\n")
+            .unwrap();
+        assert_eq!(cfg.notify.format, NotifyFormat::Feishu);
+    }
+
+    /// 非法格式值解析期拒（fail fast 姿势同 47 / 103 / 134——拼错不静默回落 generic）。
+    #[test]
+    fn notify_format_unknown_value_is_rejected() {
+        let err = Config::from_toml("[notify]\nformat = \"bogus\"\n").unwrap_err();
+        assert!(matches!(err, Error::Config(_)), "{err:?}");
     }
 
     // ── 决策 194：`[market] github_repos` 来源仓名单（取代决策 172⑤ 的 origin 白名单）──

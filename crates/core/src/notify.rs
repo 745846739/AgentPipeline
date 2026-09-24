@@ -19,9 +19,23 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use chrono::{DateTime, Local, Timelike, Utc};
+use serde::{Deserialize, Serialize};
 
 use crate::clock::Clock;
 use crate::storage::attention::AttentionKind;
+
+/// 报文格式（决策 270）：同一份通用事件、按目标选序列化——政策语义
+/// （cooldown / 免打扰 / `wakes()` 触发面）与格式无关，只有最后拼 payload 分流。
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum NotifyFormat {
+    /// 268④ 的六字段通用 JSON（缺省）。
+    #[default]
+    Generic,
+    /// 飞书机器人文本消息（`{"msg_type":"text","content":{"text":...}}`）；
+    /// 安全设置用自定义关键词 `AgentPipeline`——`title` 固定前缀命中，不做签名。
+    Feishu,
+}
 
 /// 通知分类——与前端 `notificationPolicy.ts::NotificationClass` 同名同义。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -112,6 +126,66 @@ pub fn should_notify(
 /// （它早已返回，投递在后台），但挂住的连接也该有个头。
 const WEBHOOK_TIMEOUT: Duration = Duration::from_secs(10);
 
+/// 归因文本（分流前**共用**，决策 270②）：只带白名单短标识键，`detail` 里的
+/// `output` / `diagnostic` / `error` / `message` 原文一个都不出网（268「不发正文/
+/// 日志原文」的纪律不因格式松动）；挑不到就退回 kind + task_id。
+fn attribution_body(
+    kind: AttentionKind,
+    task_id: &str,
+    detail: Option<&serde_json::Value>,
+) -> String {
+    const ATTRIBUTION_KEYS: [&str; 7] = [
+        "stage",
+        "node",
+        "attempt",
+        "pending_kind",
+        "gate_failure_kind",
+        "run_id",
+        "status",
+    ];
+    let mut attrs: Vec<String> = Vec::new();
+    if let Some(d) = detail {
+        for k in ATTRIBUTION_KEYS {
+            match d.get(k) {
+                Some(serde_json::Value::String(s)) => attrs.push(format!("{k}={s}")),
+                Some(serde_json::Value::Number(n)) => attrs.push(format!("{k}={n}")),
+                _ => {}
+            }
+        }
+    }
+    if attrs.is_empty() {
+        format!("{}（{task_id}）", kind.as_str())
+    } else {
+        format!("{}（{task_id}） {}", kind.as_str(), attrs.join(" "))
+    }
+}
+
+/// 按配置选报文形状（决策 270② 的唯一分流点）。
+pub fn payload_for(
+    format: NotifyFormat,
+    kind: AttentionKind,
+    task_id: &str,
+    occurred_at: DateTime<Utc>,
+    detail: Option<&serde_json::Value>,
+) -> serde_json::Value {
+    let body = attribution_body(kind, task_id, detail);
+    let title = format!("[AgentPipeline] {task_id} {}", kind.as_str());
+    match format {
+        NotifyFormat::Generic => serde_json::json!({
+            "source": "agentpipeline",
+            "kind": kind.as_str(),
+            "task_id": task_id,
+            "occurred_at": occurred_at.to_rfc3339(),
+            "title": title,
+            "body": body,
+        }),
+        NotifyFormat::Feishu => serde_json::json!({
+            "msg_type": "text",
+            "content": { "text": format!("{title}\n{body}") },
+        }),
+    }
+}
+
 /// 出站口（决策 268）：一个 URL + 一份礼貌策略 + 一份每类节流状态。
 ///
 /// 与 `Store` 的挂接是 **可选** 的（`set_notifier`）：URL 缺席 = 整段关死，没配
@@ -121,6 +195,7 @@ pub struct WebhookNotifier {
     client: reqwest::Client,
     cooldown_sec: u64,
     quiet: [u8; 2],
+    format: NotifyFormat,
     clock: Arc<dyn Clock>,
     /// 每类最近一次**尝试**时刻（镜像前端 `lastNotifiedAt` 的 per-class 语义）。
     /// 「尝试」而非「成功」：best-effort 不重试，重试循环会把通知变成新的噪音源。
@@ -132,6 +207,7 @@ impl WebhookNotifier {
         url: impl Into<String>,
         cooldown_sec: u64,
         quiet: [u8; 2],
+        format: NotifyFormat,
         clock: Arc<dyn Clock>,
     ) -> Self {
         let client = reqwest::Client::builder()
@@ -146,6 +222,7 @@ impl WebhookNotifier {
             client,
             cooldown_sec,
             quiet,
+            format,
             clock,
             last_sent: Mutex::new(HashMap::new()),
         }
@@ -181,42 +258,8 @@ impl WebhookNotifier {
         guard.insert(cls, now);
         drop(guard);
 
-        // `body` 只带**归因字段**（268 明确不做：不发正文/日志原文）——`detail` 里的
-        // `output` / `diagnostic` / `error` / `message` 原文一个都不出网（diagnosis 不出境
-        // 的外发面纪律同款），只白名单式地挑短标识键（stage/node/attempt 之类）；
-        // 挑不到就退回 kind + task_id，接收端要细节自己回系统查。
-        const ATTRIBUTION_KEYS: [&str; 7] = [
-            "stage",
-            "node",
-            "attempt",
-            "pending_kind",
-            "gate_failure_kind",
-            "run_id",
-            "status",
-        ];
-        let mut attrs: Vec<String> = Vec::new();
-        if let Some(d) = detail {
-            for k in ATTRIBUTION_KEYS {
-                match d.get(k) {
-                    Some(serde_json::Value::String(s)) => attrs.push(format!("{k}={s}")),
-                    Some(serde_json::Value::Number(n)) => attrs.push(format!("{k}={n}")),
-                    _ => {}
-                }
-            }
-        }
-        let body_text = if attrs.is_empty() {
-            format!("{}（{task_id}）", kind.as_str())
-        } else {
-            format!("{}（{task_id}） {}", kind.as_str(), attrs.join(" "))
-        };
-        let payload = serde_json::json!({
-            "source": "agentpipeline",
-            "kind": kind.as_str(),
-            "task_id": task_id,
-            "occurred_at": occurred_at.to_rfc3339(),
-            "title": format!("[AgentPipeline] {task_id} {}", kind.as_str()),
-            "body": body_text,
-        });
+        // 报文形状按配置分流（决策 270）；归因白名单与「原文不出网」在分流前共用。
+        let payload = payload_for(self.format, kind, task_id, occurred_at, detail);
         let url = self.url.clone();
         let client = self.client.clone();
         tokio::spawn(async move {
@@ -319,6 +362,51 @@ mod tests {
             );
             assert_eq!(got, case.expected, "{}", case.id);
         }
+    }
+
+    /// 268④ 六字段契约原样（generic 缺省分支）：归因白名单在、detail 原文不出网。
+    #[test]
+    fn generic_payload_is_the_six_field_contract() {
+        let p = payload_for(
+            NotifyFormat::Generic,
+            AttentionKind::RunFailed,
+            "t1",
+            Utc::now(),
+            Some(&serde_json::json!({ "stage": "test", "error": "boom" })),
+        );
+        assert_eq!(p["source"], "agentpipeline", "{p}");
+        assert_eq!(p["kind"], "run_failed", "{p}");
+        assert_eq!(p["task_id"], "t1", "{p}");
+        assert!(p["occurred_at"].is_string(), "{p}");
+        assert!(
+            p["title"].as_str().unwrap().contains("[AgentPipeline]"),
+            "{p}"
+        );
+        let body = p["body"].as_str().unwrap();
+        assert!(body.contains("stage=test"), "{p}");
+        assert!(!body.contains("boom"), "detail 原文不出网：{p}");
+    }
+
+    /// 飞书分支（决策 270④）：`msg_type=text`、text 以关键词前缀开头、原文不出网、
+    /// 不带通用字段（飞书机器人拒收未知顶层字段之外的形状——以官方文档形状为准）。
+    #[test]
+    fn feishu_payload_is_a_text_message_with_keyword_prefix() {
+        let p = payload_for(
+            NotifyFormat::Feishu,
+            AttentionKind::TaskPending,
+            "t9",
+            Utc::now(),
+            Some(&serde_json::json!({ "pending_kind": "gate", "error": "boom" })),
+        );
+        assert_eq!(p["msg_type"], "text", "{p}");
+        let text = p["content"]["text"].as_str().unwrap();
+        assert!(
+            text.starts_with("[AgentPipeline] t9 task_pending"),
+            "自定义关键词靠这个前缀命中：{text}"
+        );
+        assert!(text.contains("pending_kind=gate"), "{text}");
+        assert!(!text.contains("boom"), "detail 原文不出网：{text}");
+        assert!(p.get("source").is_none(), "飞书格式不该带通用字段：{p}");
     }
 
     /// 免打扰边界的纯函数钉子（fixture 没覆盖的角落：start==end、整点含头不含尾）。

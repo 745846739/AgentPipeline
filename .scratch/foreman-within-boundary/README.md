@@ -11,3 +11,4 @@
 | [01 内容搜索](issues/01-content-search.md) | done（2026-09-24，决策 267） | `FOREMAN_TOOL_SPECS`（23→24）或 `READONLY_COMMANDS`；域校验 + 台账 |
 | [02 离线通知渠道](issues/02-offline-notification.md) | done（2026-09-24，决策 268） | attention 生产点 / `NotificationPolicy` 移端；`[notify]` 配置段 |
 | [03 上下文管理](issues/03-context-compaction.md) | done（2026-09-24，决策 269） | `trim_history`（`pipeline/foreman.rs`）+ `llm.complete` 复用；两条既有钉子不能破 |
+| [04 飞书报文分支](issues/04-feishu-format.md) | done（2026-09-24，决策 270） | `notify.rs` payload 两纯函数；`[notify].format` 配置字段 |
