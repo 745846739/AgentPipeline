@@ -158,8 +158,10 @@
    * 「那一轮回话去哪了」改由班次列表里的两枚标记说：**正在回话**与**有新动静**
    * （判据在 `lib/talkSessions.ts` 与 `realtime/foreman.ts`）。
    *
-   * **值班长的回复里永远没有按钮**：写动作只在状态区的急停轮里渲染（后端下发的
-   * `allowed_actions`，决策 101）。同一个动作在两处各渲染一颗钮，会让「哪个是真的」
+   * **值班长的回复里永远没有按钮**：按钮有三个落点、都不在回复里——状态区的急停轮
+   * （后端下发的 `allowed_actions`，决策 101）、提议轮里操作台内联的确认钮（决策 207③）
+   * 与提问轮的选项钮（决策 265）。
+   * 同一个动作在两处各渲染一颗钮，会让「哪个是真的」
    * 变成使用者必须思考的问题。（空态原先还有一颗页面固定的导航钮「去看板新建任务」，
    * 决策 240 随看板页签一并摘除——它不进动作契约，去掉也不动这条边界。）
    *
@@ -963,6 +965,17 @@
    * 每个 await 之后都比对 `generation`：这一班的回包不落到另一班的屏幕上（决策 204⑥）。
    * 比对不通过时**连乐观轮一起撤**——它属于已经不显示的那一班。
    */
+  /**
+   * 选项点选 = 把选项文本当作下一条 user 消息发回（决策 265⑤：既有写口、零新端点）。
+   * 乐观轮、配对闸、落地哨全部走 `send()` 既有那套——这里只负责把 `input` 填上。
+   * 已答 / 发送在途时按钮本身是禁用的，这里再拦一道（防连点）。
+   */
+  function answerAsk(option: string) {
+    if (sending) return;
+    input = option;
+    void send();
+  }
+
   async function send() {
     const text = input.trim();
     if (!text || sending) return;
@@ -1680,6 +1693,33 @@
             <p class="note ferr">按下没成：{proposalError.text}</p>
           {/if}
         </article>
+      {:else if turn.ask}
+        <!-- 提问轮（决策 265，第三种轮型）：**选项钮住在自己这一轮里**——回话轮零按钮的
+             票 04 断言原样不动（`talk.spec.ts` 的 reply count 0）。时间线的钮位自此两处：
+             提议确认钮（207③）与这里的选项钮（265）；名牌沿提议轮口径挂「操作台」——
+             这一轮在等一个选择，选项钮不是值班长回话的一部分。 -->
+        <article class="turn ask" class:grey={turn.askAnswered} data-ask>
+          <div class="dname">操作台</div>
+          <div class="dtag">{turn.askAnswered ? '已答' : '等你选'}</div>
+          <!-- 模型的收口话照常显示（工具指示叫它别复述问题，但短收口是它的自由）；
+               问题本身以**结构化字段**为准——两处不互相解析。 -->
+          {#if turn.content.trim()}
+            <p>{turn.content}</p>
+          {/if}
+          <p class="ask-q">{turn.ask.question}</p>
+          <div class="aopts">
+            {#each turn.ask.options as option}
+              <button
+                type="button"
+                class="btn solid"
+                disabled={turn.askAnswered || sending}
+                onclick={() => answerAsk(option)}
+              >
+                {option}
+              </button>
+            {/each}
+          </div>
+        </article>
       {:else}
         <article
           class="turn"
@@ -2231,6 +2271,41 @@
   /* 提议操作失败的说明：走失败红，与 `send()` 的失败轮同一档 */
   .turn.prop .ferr {
     color: var(--stop);
+  }
+
+  /* ── 提问轮（决策 265）：操作台等一个选择，选项钮住在这一轮里。
+     框色比提议轮再深一档（--text-2 vs --text-3）——两种轮型并排时分得开；
+     同样**不占琥珀**（决策 203：全站唯一的「响」仍是急停轮），不加 ▼、不加硬投影。 ── */
+  .turn.ask {
+    border-color: var(--text-2);
+  }
+  .turn.ask .dname {
+    border-color: var(--text-2);
+  }
+  .turn.ask .dtag {
+    color: var(--text-2);
+  }
+  /* 已答 / 被取代：整轮压暗一档（与 `.turn.prop.grey` 同一条口径）——它仍在时间线上
+     （审计：它当时问过什么），但选项不再是待办。 */
+  .turn.ask.grey p {
+    color: var(--text-3);
+  }
+  .turn.ask.grey .dname {
+    color: var(--text-3);
+  }
+  .turn.ask.grey .aopts button {
+    opacity: 0.6;
+  }
+  /* 问题句是这一轮的主体，比收口话重一档 */
+  .ask-q {
+    font-weight: 600;
+  }
+  /* 选项钮一行排不下就折行（2–4 个短语，窄屏同理） */
+  .aopts {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 8px;
+    margin-top: 4px;
   }
   /* ▼ 光标默认不画：只有待拍板那一轮点亮（§3.3 纪律 2） */
   .turn::after {

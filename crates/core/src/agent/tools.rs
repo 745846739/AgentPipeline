@@ -433,7 +433,8 @@ pub struct ToolExecutor {
     /// 台账读句柄（决策 182⑭，票 02）。`None` = `read_task` / `read_conversation` 不可用。
     ///
     /// 这两个工具**只面向值班长**：它的输入是人可以随便打的任意文本，故它的能力必须来自
-    /// 一个显式注入的只读句柄，而不是继承流水线节点那套（含文件与命令）的上下文
+    /// 一个显式注入的只读句柄，而不是继承流水线节点那套上下文（节点那套是任务工作区 +
+    /// 阶段声明的工具；值班长的其余工具走自己的清单与档位，决策 206/207）
     /// ——「不注入即不可用」让「它到底能碰什么」在构造点就看得见。
     ledger: Option<Store>,
     /// 环境层档位（决策 206）。缺省 [`EnvMode::Auto`] = 与档位出现之前逐字相同。
@@ -453,6 +454,12 @@ pub struct ToolExecutor {
     confirmed: bool,
     /// 托管放行的自动动作的执行者（决策 210② / 票 08）。`None` = 不放行（D 层恒提议）。
     steward_actions: Option<Arc<dyn StewardActionRunner>>,
+    /// 结构化选项提问的载荷槽（决策 265）。`None` = 这一轮接不上提问通道（`ask` 被拒）。
+    ///
+    /// 与 ledger / recorder / proposal sink 同一构造姿态：每轮一个执行器，工具把**校验过的**
+    /// 载荷写进槽，`respond_inner` 收口时取走挂到那一轮的 assistant 行上——行还没写出来时
+    /// 载荷无处可挂，故走槽不走工具直写（那会造出「问题在、回话没落」的半截状态）。
+    ask_slot: Option<Arc<tokio::sync::Mutex<Option<serde_json::Value>>>>,
 }
 
 /// 命令输出推流的上下文（票 14）：SSE 去向 + 事件里要带的任务/分支。
@@ -504,6 +511,7 @@ impl ToolExecutor {
             proposals: None,
             confirmed: false,
             steward_actions: None,
+            ask_slot: None,
         }
     }
 
@@ -600,6 +608,18 @@ impl ToolExecutor {
         &self.settings
     }
 
+    /// 注入问话载荷槽（决策 265）：使 `ask` 可用——与 ledger 同姿态，不注入即不可用。
+    ///
+    /// 只有值班长的**对话轮**接它（`respond_inner` 每轮新建一个）；按键执行那条路
+    /// （`foreman_actions`）不接，`ask` 在那边被执行点拒掉——它本来就永不生成提议。
+    pub fn with_ask_slot(
+        mut self,
+        slot: Arc<tokio::sync::Mutex<Option<serde_json::Value>>>,
+    ) -> Self {
+        self.ask_slot = Some(slot);
+        self
+    }
+
     /// 执行一次工具调用。
     ///
     /// 白名单（[`Self::with_allowed_tools`]）在**这里**生效——先于任何分发。只靠
@@ -642,6 +662,12 @@ impl ToolExecutor {
             // 只读取证（决策 232 / 237）：白名单命令、argv 直出。它**不在**环境层里，
             // 故档位与值守轮的 deny 清单都管不到它——这正是「自主轮能取证」的落点。
             "run_readonly" => self.run_readonly(call, ctx).await?,
+            // 受治理的网口（决策 266）：GET-only、同一张出口白名单、落命令台账。
+            // 同属只读层故档位管不到它，但值守轮的 deny 清单收它（夜间外发无人盯）。
+            "web_fetch" => self.web_fetch(call, ctx).await?,
+            // 结构化选项提问（决策 265）：不在两段写清单里（恒 Execute——问话不是打算
+            // 执行的动作），载荷走每轮一个的槽。
+            "ask" => self.ask(call).await?,
             // A 层环境读数（决策 188 / 207，票 01）：全部只读，全部走后端既有口径。
             "read_board" => self.read_board().await?,
             "read_metrics" => self.read_metrics().await?,
@@ -2043,17 +2069,236 @@ impl ToolExecutor {
     ) -> Result<ToolOutcome> {
         let sanitized = super::sanitize::sanitize_command_line(rendered);
         let id = self.record_command_start(ctx, &sanitized, cwd).await?;
-        if let (Some(rec), Some(id)) = (self.recorder.as_ref(), id) {
-            rec.record_finish(
+        self.record_command_finish(
+            id,
+            CommandFinish {
+                stderr_preview: Some(reason.clone()),
+                ..Default::default()
+            },
+        )
+        .await?;
+        Err(Error::PolicyDenied(reason))
+    }
+
+    /// 结构化选项提问（决策 265 / 票 01）：校验在**执行点**（不信任 schema 的 2–4 约束，
+    /// 模型会违反），载荷写进每轮一个的槽；槽不在或已被占 → 拒（错误回给模型，不落半成品）。
+    ///
+    /// 它不在两段写清单里，故 `gate_decision` 恒 Execute——问话不是打算执行的动作，
+    /// 永不进提议通道、不吃确认钮；值守轮则在**广告之前**就被 deny 清单摘掉，
+    /// 连执行点都到不了（真到了，白名单那道也会拒）。
+    async fn ask(&self, call: &ToolCall) -> Result<ToolOutcome> {
+        let args = Self::args(call)?;
+        let question = args
+            .get("question")
+            .and_then(|v| v.as_str())
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .ok_or_else(|| Error::Validation("ask 缺少 question——一句话把问题问清楚".into()))?;
+        let options = match args.get("options") {
+            Some(serde_json::Value::Array(items)) if (2..=4).contains(&items.len()) => {
+                let mut out = Vec::with_capacity(items.len());
+                for item in items {
+                    let s = item
+                        .as_str()
+                        .map(str::trim)
+                        .filter(|s| !s.is_empty())
+                        .ok_or_else(|| Error::Validation("ask 的每个选项都得是非空短语".into()))?;
+                    out.push(s.to_string());
+                }
+                out
+            }
+            _ => {
+                return Err(Error::Validation(
+                    "ask 的 options 必须是 2–4 个非空短语的数组（选项少了人没得选，多了点不过来）"
+                        .into(),
+                ))
+            }
+        };
+        let Some(slot) = &self.ask_slot else {
+            return Err(Error::Validation(
+                "这一轮没有接上提问通道（ask 只在值班长的对话轮可用）".into(),
+            ));
+        };
+        let mut guard = slot.lock().await;
+        if guard.is_some() {
+            return Err(Error::Validation(
+                "一轮只许问一个问题：上一个还没答，先把这一轮收掉".into(),
+            ));
+        }
+        *guard = Some(serde_json::json!({ "question": question, "options": options }));
+        Ok(ToolOutcome::ok(
+            "问题已发给值班经理：时间线上会渲染成可点的选项，TA 点选（或另写一句）之后\
+             会作为下一条消息回来。现在结束这一轮——直接简短收口，**不要把问题再复述一遍**。",
+        ))
+    }
+
+    /// 受治理的只读网口（决策 266 / 票 02）。判据链：URL 形态 → scheme（https 才出环，
+    /// 回环例外）→ **同一张**出口白名单（决策 179，零第二版本）→ 取数 → 台账。
+    ///
+    /// 每一次尝试都留行：出口拒绝带 [`crate::agent::egress::EGRESS_DENIED_EXIT_CODE`]（179
+    /// 的约定），校验类拒绝退出码留空（[`Self::refuse_readonly`] 同口径——没跑起来就没有
+    /// 退出码），取数失败记 1。报错一律可归因 + 说清怎么放行。
+    async fn web_fetch(&self, call: &ToolCall, ctx: &ToolCallContext) -> Result<ToolOutcome> {
+        let args = Self::args(call)?;
+        let timeout_sec = args
+            .get("timeout_sec")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(WEB_FETCH_TIMEOUT_SECS)
+            .clamp(1, 120);
+        let raw = args
+            .get("url")
+            .and_then(|v| v.as_str())
+            .map(str::trim)
+            .filter(|s| !s.is_empty());
+        let cwd = ctx
+            .default_cwd
+            .clone()
+            .unwrap_or_else(|| ctx.worktree_path.clone());
+        let Some(raw) = raw else {
+            return self
+                .refuse_readonly(
+                    ctx,
+                    "web_fetch（缺 url）",
+                    &cwd,
+                    "web_fetch 缺少 url——要完整形态，如 https://example.com/docs".into(),
+                )
+                .await;
+        };
+        let rendered = format!("web_fetch {raw}");
+
+        let parsed = match reqwest::Url::parse(raw) {
+            Ok(u) if u.host_str().is_some() => u,
+            _ => {
+                return self
+                    .refuse_readonly(
+                        ctx,
+                        &rendered,
+                        &cwd,
+                        format!("URL 解析不了：{raw}（要完整形态，如 https://example.com/docs）"),
+                    )
+                    .await;
+            }
+        };
+        let host = parsed.host_str().unwrap_or_default().to_ascii_lowercase();
+        let scheme = parsed.scheme();
+        if scheme != "https" && !(scheme == "http" && crate::host_policy::is_loopback(&host)) {
+            return self
+                .refuse_readonly(
+                    ctx,
+                    &rendered,
+                    &cwd,
+                    format!(
+                        "网口只出 https（回环地址例外可 http），收到 {scheme}://{host}\
+                         ——明文不许出环（决策 266）"
+                    ),
+                )
+                .await;
+        }
+        if !self.egress.allows(&host) {
+            // 与 `run_command` 的出口拒绝同一条口径（决策 179）：留行、带约定退出码、
+            // 报错可归因。白名单是同一张——网口不开第二张（179① 的「不能有第二个版本」）。
+            let msg = format!(
+                "出口策略：主机 {host} 不在放行清单里。放行方式：config.toml 的 \
+                 `[pipeline] egress_allow_hosts` 加入该主机（可用 `*.example.com` 覆盖子域），\
+                 或 `egress_allow_all = true` 显式放行全部出口（决策 179 / 266）。"
+            );
+            let sanitized = super::sanitize::sanitize_command_line(&rendered);
+            let id = self.record_command_start(ctx, &sanitized, &cwd).await?;
+            self.record_command_finish(
                 id,
                 CommandFinish {
-                    stderr_preview: Some(reason.clone()),
+                    exit_code: Some(crate::agent::egress::EGRESS_DENIED_EXIT_CODE),
+                    stderr_preview: Some(msg.clone()),
                     ..Default::default()
                 },
             )
             .await?;
+            return Err(Error::PolicyDenied(msg));
         }
-        Err(Error::PolicyDenied(reason))
+
+        let sanitized = super::sanitize::sanitize_command_line(&rendered);
+        let command_id = self.record_command_start(ctx, &sanitized, &cwd).await?;
+        let started = std::time::Instant::now();
+        match web_fetch_text(raw, timeout_sec).await {
+            Ok(text) => {
+                let preview: String = text.chars().take(2000).collect();
+                self.record_command_finish(
+                    command_id,
+                    CommandFinish {
+                        exit_code: Some(0),
+                        stdout_preview: Some(preview),
+                        duration_ms: started.elapsed().as_millis() as u64,
+                        ..Default::default()
+                    },
+                )
+                .await?;
+                Ok(ToolOutcome::ok(format!(
+                    "GET {raw} → 正文 {} 字符：\n\n{text}",
+                    text.chars().count()
+                )))
+            }
+            Err(err) => {
+                let (msg, exit, refused) = match &err {
+                    WebFetchErr::Timeout => (
+                        format!("web_fetch 超时（{timeout_sec}s，可用 timeout_sec 调整）：{raw}"),
+                        Some(1),
+                        false,
+                    ),
+                    WebFetchErr::Status { code, location } => (
+                        format!(
+                            "目标返回 HTTP {code}{}，没取到正文：{raw}",
+                            location
+                                .as_deref()
+                                .map(|l| format!(
+                                    "（Location: {l}；网口不跟随重定向——白名单按 URL 判定，\
+                                     放行域之外的跳转要换 URL 再取一次）"
+                                ))
+                                .unwrap_or_default()
+                        ),
+                        Some(1),
+                        false,
+                    ),
+                    WebFetchErr::Binary(ct) => (
+                        format!(
+                            "web_fetch 只收文本类 content-type（text/*、json、xml），收到 {ct}：{raw}"
+                        ),
+                        None,
+                        true,
+                    ),
+                    WebFetchErr::Network(inner) => (
+                        format!("web_fetch 取不到正文：{inner}"),
+                        Some(1),
+                        false,
+                    ),
+                };
+                self.record_command_finish(
+                    command_id,
+                    CommandFinish {
+                        exit_code: exit,
+                        stderr_preview: Some(msg.clone()),
+                        duration_ms: started.elapsed().as_millis() as u64,
+                        ..Default::default()
+                    },
+                )
+                .await?;
+                Err(if refused {
+                    Error::PolicyDenied(msg)
+                } else {
+                    Error::Validation(msg)
+                })
+            }
+        }
+    }
+
+    /// 落一条命令日志的「结束」（未接记录器或没有起始 id 时静默跳过）。
+    ///
+    /// [`Self::record_command_start`] 的对偶：审计面要求起止成对，拒绝与成功都走这对
+    /// （决策 179——被拒的也要留一行，留的就得是完整一行）。
+    async fn record_command_finish(&self, id: Option<i64>, finish: CommandFinish) -> Result<()> {
+        if let (Some(rec), Some(id)) = (self.recorder.as_ref(), id) {
+            rec.record_finish(id, finish).await?;
+        }
+        Ok(())
     }
 
     /// 落一条命令日志的「开始」并返回 id（未接记录器时 `None`）。
@@ -2460,6 +2705,109 @@ fn model_request_digest(
 /// 两处各写一份就会漂移——而漂移的方向是「提示词里说能跑、执行点拒了」（模型反复试）
 /// 或更坏的「提示词里没说、执行点放行」。
 pub const READONLY_COMMANDS: [&str; 7] = ["date", "ps", "pgrep", "lsof", "wc", "tail", "sample"];
+
+// ─────────────────── 受治理的只读网口（决策 266）───────────────────
+
+/// `web_fetch` 的缺省超时（决策 266②）：网口等不起——深挖时一个挂住的站点不该把整轮拖死。
+/// 调用方可传 `timeout_sec`（1–120）覆盖，与 `run_readonly` 的显式超时同姿态。
+pub const WEB_FETCH_TIMEOUT_SECS: u64 = 15;
+
+/// `web_fetch` 的正文字节上限（决策 266②）：超限截断带标注；下游 transcript 另有 12k 截断
+/// （[`crate::pipeline::foreman`] 的 `truncate`）——两道上限各管各的场合。
+pub const WEB_FETCH_MAX_BYTES: usize = 512 * 1024;
+
+/// `web_fetch` 的失败分类：报错与台账的 `exit_code` 都按这四类收口。
+enum WebFetchErr {
+    /// 等超了（传输层 timeout）——记失败，不是拒绝。
+    Timeout,
+    /// 非 2xx：记失败；`location` 给模型一条出路（网口**不跟随重定向**）。
+    Status { code: u16, location: Option<String> },
+    /// 非文本 content-type：**拒绝**（二进制不进对话上下文），退出码留空。
+    Binary(String),
+    /// 传输 / 构造错误（DNS、连接、TLS……）——记失败。
+    Network(String),
+}
+
+/// 取一个 URL 的文本正文（决策 266 的治理五件套里取数那三件）。
+///
+/// - **不跟随重定向**：白名单按 URL 判定，跟随会把放行域 302 到未放行域——开口子。
+///   3xx 回 `Status` 带 `Location`，让模型换 URL 自己再取一次。
+/// - 只收文本族 content-type（`text/*`、json、xml；含参数如 `; charset=utf-8`）。
+/// - 超 [`WEB_FETCH_MAX_BYTES`] 截断并在开头标注——完整性让位给「不把上下文撑爆」。
+async fn web_fetch_text(raw: &str, timeout_sec: u64) -> std::result::Result<String, WebFetchErr> {
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(timeout_sec))
+        .redirect(reqwest::redirect::Policy::none())
+        .build()
+        .map_err(|e| WebFetchErr::Network(e.to_string()))?;
+    let resp = client.get(raw).send().await.map_err(|e| {
+        if e.is_timeout() {
+            WebFetchErr::Timeout
+        } else {
+            WebFetchErr::Network(e.to_string())
+        }
+    })?;
+    let status = resp.status();
+    if !status.is_success() {
+        let location = resp
+            .headers()
+            .get(reqwest::header::LOCATION)
+            .and_then(|v| v.to_str().ok())
+            .map(str::to_string);
+        return Err(WebFetchErr::Status {
+            code: status.as_u16(),
+            location,
+        });
+    }
+    let content_type = resp
+        .headers()
+        .get(reqwest::header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .map(str::to_string);
+    let Some(content_type) = content_type else {
+        return Err(WebFetchErr::Binary("（没有 content-type）".into()));
+    };
+    let essence = content_type
+        .split(';')
+        .next()
+        .unwrap_or("")
+        .trim()
+        .to_ascii_lowercase();
+    let textual = essence.starts_with("text/")
+        || essence == "application/json"
+        || essence.ends_with("+json")
+        || essence == "application/xml"
+        || essence.ends_with("+xml");
+    if !textual {
+        return Err(WebFetchErr::Binary(essence));
+    }
+    let mut resp = resp;
+    let mut buf: Vec<u8> = Vec::new();
+    let mut truncated = false;
+    while let Some(chunk) = resp.chunk().await.map_err(|e| {
+        if e.is_timeout() {
+            WebFetchErr::Timeout
+        } else {
+            WebFetchErr::Network(e.to_string())
+        }
+    })? {
+        if buf.len() + chunk.len() > WEB_FETCH_MAX_BYTES {
+            buf.extend_from_slice(&chunk[..WEB_FETCH_MAX_BYTES - buf.len()]);
+            truncated = true;
+            break;
+        }
+        buf.extend_from_slice(&chunk);
+    }
+    let text = String::from_utf8_lossy(&buf).into_owned();
+    Ok(if truncated {
+        format!(
+            "（正文超过 {}KiB，已截断）\n{text}",
+            WEB_FETCH_MAX_BYTES / 1024
+        )
+    } else {
+        text
+    })
+}
 
 /// 一个参数要不要按**路径**过文件域，是则返回解析后的候选路径。
 ///

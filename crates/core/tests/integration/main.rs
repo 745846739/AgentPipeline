@@ -34,3 +34,4 @@ mod repair;
 mod repo_live;
 mod scheduler_tick;
 mod server_bind;
+mod web_fetch;

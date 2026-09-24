@@ -1,4 +1,5 @@
 import type {
+  ForemanAsk,
   ForemanBriefing,
   ForemanProposal,
   ForemanSession,
@@ -42,7 +43,7 @@ export interface TurnView {
    * 那颗钮的人**——挂在值班长的名牌下等于替它认领了它没做的事。三种角色、两种说话的立场，
    * 操作台是第三种。
    */
-  kind: 'fm' | 'mine' | 'failed' | 'proposal' | 'console';
+  kind: 'fm' | 'mine' | 'failed' | 'proposal' | 'console' | 'ask';
   content: string;
   /** 排进时间线的时刻（RFC3339）。三种在途轮（乐观轮 / 流式轮 / 失败轮）没有它，恒在末尾。 */
   at: string;
@@ -71,6 +72,20 @@ export interface TurnView {
   needsPairing: boolean;
   /** 提议轮带的那条提议（其余轮为 `null`）。 */
   proposal: ForemanProposal | null;
+  /**
+   * 提问轮带的问题与选项（决策 265，第三种轮型 `.turn.ask`；其余轮为 `null`）。
+   *
+   * 载荷由后端给（`message_wire` 的 `ask` 字段）——与 `kind` 同一条边界（决策 252）：
+   * 读字段，不从正文里抠。
+   */
+  ask: ForemanAsk | null;
+  /**
+   * 这个问题**已被回答或被取代**（决策 265③）：它之后又出现过值班经理的话
+   * （最大 `mine` 行 id 大于本行 id）——**纯派生，不存状态、不设过期机制**。
+   * 每一轮都以一条 user 消息开场，故「下一轮开始了」⇔「这个问题已经不用再答」。
+   * 为真时选项钮禁用（灰一档，与提议终态同口径）。
+   */
+  askAnswered: boolean;
   /**
    * 这一轮是**主动播报**（值守轮自己醒来说的话，票 06）。
    *
@@ -123,9 +138,13 @@ export interface TalkTurnsInput {
  */
 export function buildTurns(input: TalkTurnsInput): TurnView[] {
   const { session, pendingText, sending, following, stream, pairingNeeded } = input;
-  const stamped: { view: TurnView; rank: number }[] = (session?.messages ?? []).map((m) => ({
+  const messages = session?.messages ?? [];
+  // 「提问之后人又开过口」的判据（决策 265③，纯派生）：最大 mine 行 id 大于该行 id。
+  const maxMineId = messages.reduce((mx, m) => (m.kind === 'mine' && m.id > mx ? m.id : mx), 0);
+  const stamped: { view: TurnView; rank: number }[] = messages.map((m) => ({
     // 排序与分类**同一处判定**（决策 252）：`kind` 是后端给的，界面不再各判一遍。
-    rank: m.kind === 'mine' ? 0 : m.kind === 'fm' ? 2 : 1,
+    // 提问轮与回话同为值班长那一轮的产物，同刻兜底与 `fm` 同档。
+    rank: m.kind === 'mine' ? 0 : m.kind === 'fm' || m.kind === 'ask' ? 2 : 1,
     view: {
       key: `m${m.id}`,
       kind: m.kind,
@@ -140,6 +159,9 @@ export function buildTurns(input: TalkTurnsInput): TurnView[] {
       briefing: m.briefing,
       needsPairing: false,
       proposal: null,
+      // 提问载荷与「已答」派生（决策 265③）：载荷后端给，已答按行序纯派生。
+      ask: m.ask ?? null,
+      askAnswered: m.ask != null && maxMineId > m.id,
       // 值守播报（决策 209④）：与 `kind` 正交的那个布尔（决策 252③），也由后端判。
       proactive: m.proactive,
       // 归因类别（决策 235① / 238）：**用后端解析并翻好的那一份**（`attribution_label`），
@@ -164,6 +186,8 @@ export function buildTurns(input: TalkTurnsInput): TurnView[] {
         briefing: null,
         needsPairing: false,
         proposal: p,
+        ask: null,
+        askAnswered: false,
         proactive: false,
         attribution: null,
       },
@@ -185,6 +209,8 @@ export function buildTurns(input: TalkTurnsInput): TurnView[] {
       briefing: null,
       needsPairing: false,
       proposal: null,
+      ask: null,
+      askAnswered: false,
       proactive: false,
       attribution: null,
     });
@@ -204,6 +230,8 @@ export function buildTurns(input: TalkTurnsInput): TurnView[] {
       briefing: null,
       needsPairing: false,
       proposal: null,
+      ask: null,
+      askAnswered: false,
       proactive: false,
       attribution: null,
     });
@@ -222,6 +250,8 @@ export function buildTurns(input: TalkTurnsInput): TurnView[] {
       briefing: null,
       needsPairing: pairingNeeded,
       proposal: null,
+      ask: null,
+      askAnswered: false,
       proactive: false,
       attribution: null,
     });

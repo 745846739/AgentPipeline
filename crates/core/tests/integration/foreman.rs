@@ -318,6 +318,7 @@ async fn history_is_trimmed_by_character_budget_but_stays_in_the_store() {
                 briefing_json: None,
                 traces_json: None,
                 thinking: None,
+                ask_json: None,
             })
             .await
             .unwrap();
@@ -1488,7 +1489,9 @@ async fn the_automatic_turn_cannot_reach_the_expensive_tools() {
         .iter()
         .map(|t| t.name.clone())
         .collect();
-    for forbidden in ["read_conversation", "run_command"] {
+    // 决策 265 / 266：值守轮既不问人（`ask`）也不外发（`web_fetch`）——
+    // 「这一次你不在场」对提问与网络同样成立。
+    for forbidden in ["read_conversation", "run_command", "ask", "web_fetch"] {
         assert!(
             !watch_tools.contains(&forbidden.to_string()),
             "自动轮不该拿到 {forbidden}：{watch_tools:?}"
@@ -1515,12 +1518,136 @@ async fn the_automatic_turn_cannot_reach_the_expensive_tools() {
         .iter()
         .map(|t| t.name.clone())
         .collect();
-    for wanted in ["read_conversation", "run_command"] {
+    for wanted in ["read_conversation", "run_command", "ask", "web_fetch"] {
         assert!(
             human_tools.contains(&wanted.to_string()),
             "被追问时该拿得到 {wanted}：{human_tools:?}"
         );
     }
+}
+
+// ───────────────── 结构化选项提问（决策 265，票 foreman-capability-gaps 01） ─────────────────
+
+#[tokio::test]
+async fn an_ask_lands_on_its_row_with_options_and_never_becomes_a_proposal() {
+    let h = Harness::seeded().await;
+    let mut script = Script::new();
+    script.for_foreman().tool(
+        "ask",
+        serde_json::json!({
+            "question": "这张票怎么处理？",
+            "options": ["修一下", "重开", "搁置"]
+        }),
+    );
+    script.for_foreman().text("等你选。");
+    let runner = h.runner(FakeAgent::new(script));
+    let turn = runner.say(None, "拿个主意").await.unwrap();
+
+    let messages = h
+        .store
+        .list_foreman_messages(&turn.session.id, 100)
+        .await
+        .unwrap();
+    let ask_row = messages
+        .iter()
+        .find(|m| m.ask_json.is_some())
+        .expect("问了就要落库——刷新后选项钮靠这一行重建");
+    assert_eq!(
+        ask_row.ask_json.as_ref().unwrap(),
+        &serde_json::json!({"question": "这张票怎么处理？", "options": ["修一下", "重开", "搁置"]}),
+        "载荷按 canonical 形状落（问句 + 选项数组）"
+    );
+    assert_eq!(
+        ask_row.content, "等你选。",
+        "回话照常落，问题只是多带了一份结构"
+    );
+    assert_eq!(
+        ask_row.role,
+        agentpipeline_core::storage::foreman::FOREMAN_ROLE_ASSISTANT
+    );
+    // 问话永不进提议通道：它不是打算执行的动作，人点选项走的是「下一条 user 消息」。
+    assert!(
+        h.store
+            .list_pending_foreman_proposals(&turn.session.id)
+            .await
+            .unwrap()
+            .is_empty(),
+        "ask 不该生成提议"
+    );
+}
+
+#[tokio::test]
+async fn only_the_first_ask_of_a_round_lands() {
+    let h = Harness::seeded().await;
+    let mut script = Script::new();
+    script.for_foreman().tool(
+        "ask",
+        serde_json::json!({"question": "第一个？", "options": ["甲", "乙"]}),
+    );
+    script.for_foreman().tool(
+        "ask",
+        serde_json::json!({"question": "第二个？", "options": ["丙", "丁"]}),
+    );
+    script.for_foreman().text("收口。");
+    let runner = h.runner(FakeAgent::new(script));
+    let turn = runner.say(None, "问吧").await.unwrap();
+
+    let messages = h
+        .store
+        .list_foreman_messages(&turn.session.id, 100)
+        .await
+        .unwrap();
+    let asks: Vec<_> = messages.iter().filter(|m| m.ask_json.is_some()).collect();
+    assert_eq!(asks.len(), 1, "一轮只许问一个问题：{asks:?}");
+    assert_eq!(asks[0].ask_json.as_ref().unwrap()["question"], "第一个？");
+
+    // 第二次调用在执行点被拒：错误回给模型（轮次照常收口），痕迹里记一笔 ok=false。
+    let fm_row = messages
+        .iter()
+        .rev()
+        .find(|m| m.role == agentpipeline_core::storage::foreman::FOREMAN_ROLE_ASSISTANT)
+        .expect("回话行在场");
+    let traces_raw = fm_row.traces_json.clone().expect("这一轮跑过工具");
+    let traces: Vec<agentpipeline_core::pipeline::foreman::ForemanTrace> =
+        serde_json::from_value(traces_raw).unwrap();
+    let ask_traces: Vec<_> = traces.iter().filter(|t| t.tool == "ask").collect();
+    assert_eq!(ask_traces.len(), 2, "两次调用都要留痕：{ask_traces:?}");
+    assert!(ask_traces[0].ok, "第一个落库成功");
+    assert!(!ask_traces[1].ok, "第二个被执行点拒掉");
+}
+
+#[tokio::test]
+async fn a_malformed_ask_is_refused_to_the_model_and_lands_nothing() {
+    let h = Harness::seeded().await;
+    let mut script = Script::new();
+    // 只有一个选项：schema 说 2–4，模型偶尔会违反——校验在执行点，不信任 schema。
+    script.for_foreman().tool(
+        "ask",
+        serde_json::json!({"question": "只有一个选项？", "options": ["甲"]}),
+    );
+    script.for_foreman().text("算了，先这样。");
+    let runner = h.runner(FakeAgent::new(script));
+    let turn = runner.say(None, "问个坏问题").await.unwrap();
+
+    let messages = h
+        .store
+        .list_foreman_messages(&turn.session.id, 100)
+        .await
+        .unwrap();
+    assert!(
+        messages.iter().all(|m| m.ask_json.is_none()),
+        "坏载荷不落库——落了就是给界面一个渲染不了的半成品"
+    );
+    let fm_row = messages
+        .iter()
+        .rev()
+        .find(|m| m.role == agentpipeline_core::storage::foreman::FOREMAN_ROLE_ASSISTANT)
+        .expect("回话行在场");
+    assert_eq!(fm_row.content, "算了，先这样。", "工具失败不毁掉这一轮");
+    let traces: Vec<agentpipeline_core::pipeline::foreman::ForemanTrace> =
+        serde_json::from_value(fm_row.traces_json.clone().unwrap()).unwrap();
+    let ask_trace = traces.iter().find(|t| t.tool == "ask").expect("调用要留痕");
+    assert!(!ask_trace.ok, "坏载荷对模型是失败");
 }
 
 #[tokio::test]
@@ -1982,7 +2109,7 @@ async fn unknown_task_id_answers_with_text_instead_of_failing_the_turn() {
 
 #[test]
 fn the_foreman_tool_set_matches_the_frozen_contract() {
-    // 清单的**名字与顺序**（21 个）逐条钉住：这是安全边界本身（`foreman.rs` 的注释原话），
+    // 清单的**名字与顺序**（23 个）逐条钉住：这是安全边界本身（`foreman.rs` 的注释原话），
     // 加一个工具必须先改这里，从而在任何 diff 里显式可见。
     //
     // 分组（你能直接用 / 会改动东西）**不再手标**——`ForemanToolLayer` 已删（决策 247），
@@ -2013,6 +2140,10 @@ fn the_foreman_tool_set_matches_the_frozen_contract() {
             // 按命令名判定，`sample` 只许对本服务的 pid 与其子进程）。它属**只读层**，
             // 故不受档位管、也不在值守轮的 deny 清单里——「自主轮能取证」正是它为的。
             "run_readonly",
+            // 受治理的网口（决策 266 / 票 02）：GET-only、https 出环、白名单走 `NetworkPolicy`
+            // 同一张、每次都落命令台账。同属只读层故**不受档位管**，但值守轮的 deny 清单
+            // 收它（夜间外发无人盯）——与 `run_readonly` 的区别正在这一条上。
+            "web_fetch",
             // C 层：环境写（决策 206 / 207）。`ask` 档下生成提议、`auto` 直通、`deny` 摘掉。
             "write_file",
             "edit_file",
@@ -2030,6 +2161,9 @@ fn the_foreman_tool_set_matches_the_frozen_contract() {
             "task",
             "config",
             "skills",
+            // 结构化选项提问（决策 265 / 票 01）：不在两段写清单里——问话不是打算执行的
+            // 动作，`gate_decision` 恒 Execute；值守轮的 deny 清单收它（在叫人、不在问人）。
+            "ask",
         ]
     );
     assert_eq!(FOREMAN_STAGE_KEY, "foreman");
@@ -2481,6 +2615,7 @@ async fn session_totals_sum_the_persisted_columns() {
             briefing_json: None,
             traces_json: None,
             thinking: None,
+            ask_json: None,
         })
         .await
         .unwrap();
@@ -2494,6 +2629,7 @@ async fn session_totals_sum_the_persisted_columns() {
             briefing_json: None,
             traces_json: None,
             thinking: None,
+            ask_json: None,
         })
         .await
         .unwrap();
@@ -2826,6 +2962,7 @@ async fn two_sessions_do_not_pollute_each_others_messages_or_totals() {
             briefing_json: None,
             traces_json: None,
             thinking: None,
+            ask_json: None,
         })
         .await
         .unwrap();

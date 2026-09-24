@@ -1,8 +1,9 @@
 //! 对讲台端点（决策 182⑤ / 204，票 01 / 03）。
 //!
 //! **全部任务无关、项目无关**——这正是本特性的立身之本：值班长在任何时候
-//! 都答得上话，包括首启的空 home（用户故事 11）。它们与任务端点的唯一交集是
-//! `read_task` / `read_conversation` 两个只读工具，那是值班长自己去查，不是路由依赖。
+//! 都答得上话，包括首启的空 home（用户故事 11）。与任务端点的交集是值班长**自己去查**
+//! 的台账读数（`read_task` / `read_conversation` 等，决策 207 的清单），不是路由依赖；
+//! 提议执行另走 [`run_proposal_tool`] 见下。
 //!
 //! | 方法 | 路径 | 说明 |
 //! |---|---|---|
@@ -13,17 +14,18 @@
 //! | GET | `/foreman/session?session=<id>` | 某个班次的全部轮次 + 提议 + 合计 token |
 //! | POST | `/foreman/messages` | 说一句话，得到一次回话 |
 //! | GET | `/foreman/stream` | 订阅回话的逐字增量与提议事件 |
-//! | GET | `/foreman/tools` | 全量工具清单的回执标签（`{name, label}`，21 条，不按档位滤） |
+//! | GET | `/foreman/tools` | 全量工具清单的回执标签（`{name, label}`，不按档位滤） |
 //! | GET | `/foreman/commands?session=<id>` | 该班次跑过的命令（含被拒的） |
 //! | GET | `/foreman/proposals?session=<id>` | 该班次未决的提议 |
 //! | POST | `/foreman/proposals/{id}/execute` | 按下确认钮：**走既有端点**执行这条提议 |
 //! | POST | `/foreman/proposals/{id}/reject` | 拒绝这条提议（作废，不再可执行） |
 //!
-//! **写动作仍然只有任务端点有。** 值班长只说话，动手的键由 `POST /tasks/{id}/resume` 那批
-//! 端点在详情里下发（决策 101 / 182⑯⑰）。决策 188 把它的能力扩到能碰文件与系统接口，靠的是
-//! **提议**（决策 207）：模型提议 → 落库 → 人按下「执行」→ [`run_proposal_tool`] 走**既有的
-//! 那条**端点（同一套校验、同一套闸门）。**这里没有第二条改状态的路**——绕过校验的捷径
-//! 一旦存在，「LLM 的判断不直接接进状态机」那条接缝就换个形式又回来了。
+//! **改状态的键分两族下发，但执行只有既有端点这一条。** 流水线自身的写动作（resume / retry /
+//! 拍板）仍由 `POST /tasks/{id}/resume` 那批端点在详情里下发（决策 101 / 182⑯⑰）；值班长侧
+//! （决策 188 起能碰文件与系统接口）靠**提议**（决策 207）：模型提议 → 落库 → 人按下「执行」
+//! → [`run_proposal_tool`] 走**既有的那条**端点（同一套校验、同一套闸门）。**这里没有第二条
+//! 改状态的路**——绕过校验的捷径一旦存在，「LLM 的判断不直接接进状态机」那条接缝就换个形式
+//! 又回来了。
 //!
 //! **一条长会话改成一排班次**（决策 204）：会话隔离的是对话上下文与页头读数，
 //! 不是权限，也不是态势快照——「换会话 ≠ 换看板」。台账从此跨会话，会话只是容器。
@@ -58,7 +60,7 @@ const SESSION_PAGE_LIMIT: usize = 500;
 
 /// `GET /foreman/tools`：清单的**回执标签**（决策 247⑤）。
 ///
-/// **全量 21 条、按清单顺序、不按档位滤**：回执标的是**历史**上的工具调用——昨天 `auto`
+/// **全量、按清单顺序、不按档位滤**：回执标的是**历史**上的工具调用——昨天 `auto`
 /// 今天改 `deny`，昨天的回执仍要能翻译（按当前档位滤会翻译不了它）。**只出 `{name, label}`**
 /// ——description / parameters 前端用不上，interface 能少则少。
 ///
@@ -1132,6 +1134,9 @@ fn message_wire(m: &ForemanMessage) -> serde_json::Value {
         FOREMAN_ROLE_USER => "mine",
         FOREMAN_ROLE_SYSTEM if m.content.starts_with(FOREMAN_FAILED_TURN_MARK) => "failed",
         FOREMAN_ROLE_SYSTEM => "console",
+        // 结构化选项提问（决策 265）：assistant 且带载荷 → `ask`。判定点与决策 252 的
+        // 其余分支同一处——前端拿字段，不从正文里抠选项。
+        FOREMAN_ROLE_ASSISTANT if m.ask_json.is_some() => "ask",
         // `assistant` 与**认不出的角色值**：落到值班长一侧。这是原样搬过来的口径
         // （`ForemanMessageRow::into_message` 明写「前端按 `=== "user"` 判定，不认识的值落到
         // 「值班长」一侧」）——本票只把判定点从界面挪到后端，不顺手改这一档的归属。
@@ -1159,6 +1164,9 @@ fn message_wire(m: &ForemanMessage) -> serde_json::Value {
         "attribution_reason": attribution.as_ref().and_then(|a| a.reason()),
         "kind": kind,
         "proactive": proactive,
+        // 结构化选项提问的载荷（决策 265）：恒在场、没有就是 null——加性字段，
+        // 老客户端解析不受影响；用户 / system 行恒 null（那一列只有 assistant 会填）。
+        "ask": m.ask_json,
     })
 }
 

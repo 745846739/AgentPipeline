@@ -874,11 +874,23 @@ export interface ForemanToolLabel {
 }
 
 /**
- * 全量工具清单的标签：21 条、与后端清单同序、**不按档位滤**——回执标的是历史上的工具
+ * 全量工具清单的标签：与后端清单同序、**不按档位滤**——回执标的是历史上的工具
  * 调用，昨天 `auto` 今天 `deny`，昨天的回执仍要能翻译。
  */
 export interface ForemanToolLabelList {
   tools: ForemanToolLabel[];
+}
+
+/**
+ * 结构化选项提问的载荷（决策 265，第三种轮型 `.turn.ask`）。
+ *
+ * 由**后端**随那一行 assistant 消息下发（`message_wire` 的 `ask` 字段，决策 252 同一支
+ * 判定点）：界面拿它直接渲染选项钮，不从正文里抠。校验在工具执行点（2–4 个非空短语），
+ * 故到达前端时这个形状一定完整可用。
+ */
+export interface ForemanAsk {
+  question: string;
+  options: string[];
 }
 
 /** 态势快照里等人拍板的一条：`message` 是 pending 原因**原文**，不是枚举名。 */
@@ -968,13 +980,13 @@ export interface ForemanMessage {
   attribution_reason?: string | null;
   /**
    * **这一行是什么**（决策 252）：`mine`（值班经理的话）/ `console`（操作台记的一轮）/
-   * `failed`（没跑起来的那一轮）/ `fm`（值班长的话）。
+   * `failed`（没跑起来的那一轮）/ `fm`（值班长的话）/ `ask`（提问轮，决策 265）。
    *
-   * 由**后端判定**：这三个前缀是后端拼进正文的，界面此前靠 `startsWith` 自己认——常量漂了
-   * 只是症状，「正文即接口」才是病。认不出的 `role` 值落到 `fm`（与 storage 层
-   * 「非法值不打垮查询、前端按 `=== "user"` 判定」的原口径一致）。
+   * 由**后端判定**：这几个前缀是后端拼进正文的 / 字段是后端给的，界面此前靠 `startsWith`
+   * 自己认——常量漂了只是症状，「正文即接口」才是病。认不出的 `role` 值落到 `fm`
+   * （与 storage 层「非法值不打垮查询、前端按 `=== "user"` 判定」的原口径一致）。
    */
-  kind: 'mine' | 'console' | 'failed' | 'fm';
+  kind: 'mine' | 'console' | 'failed' | 'fm' | 'ask';
   /**
    * 这一轮是不是**值班长自己醒来说的**（值守播报，决策 209④）。
    *
@@ -982,6 +994,13 @@ export interface ForemanMessage {
    * 且 `proactive = false`（播报要求助理轮）。压成一个枚举会让这个组合从形状上不可能。
    */
   proactive: boolean;
+  /**
+   * 提问轮的问题与选项（决策 265）：非提问行恒 `null`（加性字段，老客户端解析不受影响）。
+   *
+   * 只有 assistant 行可能携带——那一列（迁移 0026）的生产者只有工具执行点，
+   * 用户行的 INSERT 不写它。
+   */
+  ask?: ForemanAsk | null;
 }
 
 /**

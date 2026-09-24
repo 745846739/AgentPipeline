@@ -8,8 +8,8 @@
  * （桌面右栏、窄屏收成时间线之上的横向灯条），**不在状态区里**。
  *
  * 断言口径与其它像素主题用例一致：只测**外部行为**——路由可达、真数据渲染、
- * 急停那轮的后端下发动作可下发、给值班长发话后**回话里没有按钮**（时间线里唯一的钮是
- * 操作台的确认钮，票 03）、两张急停同挂时两张都留在第一屏（决策 183）。
+ * 急停那轮的后端下发动作可下发、给值班长发话后**回话里没有按钮**（时间线的钮只在
+ * 提议轮确认钮与提问轮选项钮上，票 03 / 决策 265）、两张急停同挂时两张都留在第一屏（决策 183）。
  */
 
 import { expect, test, type Locator, type Page } from '@playwright/test';
@@ -606,7 +606,8 @@ test.describe('对讲台 · 对话（票 03）', () => {
     await expect(mine.locator('.dname')).toHaveText('值班经理');
     await expect(page.locator('.typer .dname')).toHaveText('值班经理');
 
-    // **值班长的回复里永远没有按钮**（票 04 的硬要求）：写动作只在状态区的急停轮里
+    // **值班长的回复里永远没有按钮**（票 04 的硬要求）：按钮只在急停轮、提议轮与提问轮
+    // （决策 101 / 207③ / 265），从不出现在回话那一轮里
     await expect(reply.locator('button')).toHaveCount(0);
 
     // 工位回执留在对话里：这一轮查过台账、读过一个诊断包、试过一个越权工具、还提了一件事
@@ -1254,8 +1255,8 @@ test.describe('对讲台 · 空看板也能对话（票 04 的验收锚点）', 
 
     const reply = page.locator('.timeline .turn.fm').first();
     await expect(reply).toContainText('夜班安静', { timeout: 30_000 });
-    // 回话里没有按钮；这一轮的脚本也没提任何提议，故**整条时间线**一颗钮都没有
-    //（时间线上唯一的钮是操作台的确认钮，票 03——没有提议就没有它）
+    // 回话里没有按钮；这一轮的脚本既没提任何提议、也没发问，故**整条时间线**一颗钮都没有
+    //（时间线的钮只在提议轮确认钮与提问轮选项钮上，票 03 / 决策 265——没有它们就没有钮）
     await expect(reply.locator('button')).toHaveCount(0);
     await expect(page.locator('.timeline .turn.prop')).toHaveCount(0);
     // 收在 `.turn` 上：时间线那一块里还有班次 chip 行（切换 / 新建 / 改名 / 归档四颗钮），
@@ -1942,6 +1943,90 @@ test.describe('对讲台 · 修复提议（票 12 / 决策 208）', () => {
 
     // **够得到吗**（决策 208 的回归门）：修复那一块比普通提议高，而这一档不给它留高度
     await expectProposalReachable(page);
+
+    expectBundleHealthy(bundle);
+  });
+});
+
+/**
+ * 提问轮（决策 265，第三种轮型）：选项钮住在**自己那一轮里**，点选即作为下一条
+ * user 消息回发（既有 `POST /foreman/messages`，零新端点）。
+ *
+ * **独立 app、空脚本起步**（照修复提议那一组的装置）：轮次按阶段事后注入
+ * （`setForemanRounds`），而 app 里**没有任务**——没有待办就没有值守轮，
+ * 「值守轮把注入的脚本轮次吃掉」这条干扰面从根上不存在（共享 app 的那版整文件跑
+ * 偶发红过：注入的两轮被另一个消费者推进了指针，回话成了『脚本已结束』）。
+ *
+ * 四件事一起看才成立：
+ * ① `.turn.ask` 渲染问题与 N 颗选项钮（名牌挂操作台——它在等一个选择，不是回话）；
+ * ② **刷新之后还在**：载荷在 `GET /foreman/session` 的 `ask` 字段里（决策 265④），
+ *    不是本机内存状态；
+ * ③ 点选 → 选项文本成为一条 `.turn.mine` + 第二轮的回话落地，提问轮灰下、钮禁用
+ *    （「已答」按行序纯派生，265③——没有过期机制）；
+ * ④ **回话轮照旧零按钮**：`.turn.fm button` 全场计 0——票 04 那条老断言在
+ *    提问轮加进来之后原样成立（选项钮只在 `.turn.ask` 里）。
+ */
+test.describe('对讲台 · 提问轮（决策 265）', () => {
+  let app: App;
+
+  test.beforeAll(async () => {
+    // 空脚本起步：每一轮按阶段注入。**不铺 archBlocker**——本组不要急停，
+    // 而任务带来的待办会让值守轮进场偷吃脚本轮次（见上）。
+    app = await startApp({ script: foremanScript([]), title: 'E2E 提问轮' });
+  });
+
+  test.afterAll(async () => {
+    await app?.stop();
+  });
+
+  test('选项钮在自己那一轮、刷新存活、点选回发', async ({ page }) => {
+    const bundle = watchBundle(page);
+    await page.setViewportSize({ width: 1280, height: 720 });
+
+    // ① 第一轮：抛两个选项。注入即指针归零，下一次「最后一条是 user」吃第 0 轮。
+    app.setForemanRounds([
+      [
+        tool('ask', { question: '这张票怎么处理？', options: ['修一下', '搁置'] }),
+        text('你倾向哪个？'),
+      ],
+    ]);
+    await sayDirect(app, '拿个主意');
+
+    await page.goto(`${app.webBase}/#/talk`);
+    await settleBundle(page, bundle);
+
+    const askTurn = page.locator('.timeline .turn.ask').last();
+    await expect(askTurn).toBeVisible({ timeout: 30_000 });
+    await expect(askTurn.locator('.dname')).toHaveText('操作台');
+    await expect(askTurn.locator('.ask-q')).toHaveText('这张票怎么处理？');
+    await expect(askTurn.locator('.dtag')).toContainText('等你选');
+    const opts = askTurn.locator('.aopts button');
+    await expect(opts).toHaveCount(2);
+    await expect(opts.nth(0)).toHaveText('修一下');
+    await expect(opts.nth(1)).toHaveText('搁置');
+
+    // ④ 老边界原样：任何回话轮里都没有按钮（选项钮不许漏进 `.turn.fm`）
+    await expect(page.locator('.timeline .turn.fm button')).toHaveCount(0);
+
+    // ② 刷新之后选项还在——权威在会话载荷，不在本机状态
+    await page.reload();
+    await expect(page.locator('.timeline .turn.ask .aopts button')).toHaveCount(2, {
+      timeout: 30_000,
+    });
+
+    // ③ 点选前注入第二轮：点选即 POST，吃这一轮
+    app.setForemanRounds([[text('好，就按你选的办。')]]);
+    await page.locator('.timeline .turn.ask .aopts button').nth(0).click();
+    const mine = page.locator('.timeline .turn.mine', { hasText: '修一下' }).last();
+    await expect(mine).toBeVisible({ timeout: 30_000 });
+    const reply = page.locator('.timeline .turn.fm', { hasText: '按你选的办' }).last();
+    await expect(reply).toBeVisible({ timeout: 30_000 });
+
+    // 已答：提问轮灰一档、选项钮禁用（载荷仍在——审计：它当时问过什么）
+    const answered = page.locator('.timeline .turn.ask').last();
+    await expect(answered).toHaveClass(/grey/);
+    await expect(answered.locator('.aopts button').first()).toBeDisabled();
+    await expect(answered.locator('.dtag')).toContainText('已答');
 
     expectBundleHealthy(bundle);
   });

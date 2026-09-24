@@ -31,11 +31,11 @@ async def build_stage_tools(cfg: StageAgentConfig, baseline: SystemBaseline) -> 
 
 ### B.2 对话 agent（自然语言创建 kanban 任务）
 
-v1 不实现。规划形态：复用现有对话窗口（§12.11），新增 `create_task` 工具，把自然语言转成结构化任务（title / description / project_id / depends_on / review_mode），并复用 `POST /tasks` 的全部校验（循环依赖检测、worktree 准入）。v1 仅保留扩展点，不定义模型 / 工具集 / 存储 / UI 归属。
+**已实现（决策 262⑤ 认定，本行从「v1 不实现」改写）**：D 层 `task(create)` 提议路径即此形态——值班长把自然语言转成结构化任务（title / description / project_id / depends_on / review_mode 五字段全在参数表里），按下确认钮后**直调 `POST /tasks` 的同一个 handler `routes::tasks::create`**（`crates/app/src/routes/foreman.rs:508-529` → `routes/tasks.rs:57-114`），循环依赖检测、依赖存在性、review_mode 归一**同一套校验链**；worktree 准入与按钮路径同落下游 `try_admit`（两条路都经 `store.create_task` 以 queued/waiting 落库）。提议执行另加三道前置闸（过期 / 一次一按 / 态势指纹）——是加查不是漏查。保留的差异：B.2 原设想「复用现有对话窗口（§12.11）」即对讲台本身，此路已通；**没有**独立的 `create_task` 工具名（走 `task` 族的 `action=create`，决策 207 的一族一工具粒度）。
 
 ### B.3 离线通知渠道
 
-Webhook / 邮件 / 飞书 / Slack。v1 只做 SSE 应用内通知；`NotificationPolicy`（cooldown、quiet_hours）结构已保留，渠道实现留待 v2。
+**已自决策 262① 提前出 v2 预留**（值班长能力面 triage 的边界内叠第三项：值守轮的终点是叫醒人，夜里没人盯 SSE 则值守轮白醒）——渠道实现立项时从这里接手，`NotificationPolicy`（cooldown、quiet_hours）结构已保留。原 v1 口径留档：Webhook / 邮件 / 飞书 / Slack；v1 只做 SSE 应用内通知。
 
 ### B.4 自适应强制超时
 

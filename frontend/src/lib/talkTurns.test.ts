@@ -391,3 +391,69 @@ describe('排序：同刻的兜底次序确定、异刻按时间（原 :400-402�
     expect(out.map((t) => t.key)).toEqual(['m2', 'p1', 'm3', 'm1']);
   });
 });
+
+describe('提问轮（决策 265，第三种轮型）：载荷读字段、「已答」按行序纯派生', () => {
+  const ask = { question: '这张票怎么处理？', options: ['修一下', '搁置'] };
+
+  it('kind=ask 原样透过、ask 载荷带过来，后到的话还没来 → 未答', () => {
+    const out = buildTurns(
+      inputOf({
+        session: sessionOf([
+          message({ id: 1, kind: 'mine', content: '拿个主意' }),
+          message({ id: 2, kind: 'ask', content: '等你选。', ask }),
+        ]),
+      }),
+    );
+    const turn = out.find((t) => t.kind === 'ask');
+    expect(turn).toBeDefined();
+    expect(turn!.ask).toEqual(ask);
+    expect(turn!.askAnswered).toBe(false);
+    expect(turn!.key).toBe('m2');
+  });
+
+  it('开场那句 mine 在 ask **之前**，不算已答——判据是「之后还有人的话」', () => {
+    // 每一轮都以一条 user 消息开场（后端 `say` 先落人的话）：它 id 小于 ask 行，
+    // 不该把刚抛出的问题判成已答——265③「免机制」靠的就是这个不变量。
+    const out = buildTurns(
+      inputOf({
+        session: sessionOf([
+          message({ id: 1, kind: 'mine', content: '拿个主意' }),
+          message({ id: 2, kind: 'ask', ask }),
+        ]),
+      }),
+    );
+    expect(out.find((t) => t.kind === 'ask')!.askAnswered).toBe(false);
+  });
+
+  it('下一轮开场（后到的 mine）即已答 / 被取代：选项钮该灰', () => {
+    const out = buildTurns(
+      inputOf({
+        session: sessionOf([
+          message({ id: 1, kind: 'mine' }),
+          message({ id: 2, kind: 'ask', ask }),
+          message({ id: 3, kind: 'mine', content: '还是搁置吧' }),
+          message({ id: 4, kind: 'fm', content: '好' }),
+        ]),
+      }),
+    );
+    expect(out.find((t) => t.kind === 'ask')!.askAnswered).toBe(true);
+  });
+
+  it('别的轮没有 ask 载荷（null / false），透传与合并不受影响', () => {
+    const out = buildTurns(
+      inputOf({
+        session: sessionOf([
+          message({ id: 1, kind: 'mine' }),
+          message({ id: 2, kind: 'fm' }),
+          message({ id: 3, kind: 'ask', ask }),
+        ]),
+      }),
+    );
+    const [a, b, c] = out;
+    expect(a.ask).toBeNull();
+    expect(a.askAnswered).toBe(false);
+    expect(b.ask).toBeNull();
+    expect(c.kind).toBe('ask');
+    expect(c.ask!.options).toHaveLength(2);
+  });
+});

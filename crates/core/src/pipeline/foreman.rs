@@ -6,13 +6,18 @@
 //!
 //! ## 三条硬边界
 //!
-//! 1. **不动手。** 写动作（resume / retry / 拍板 / merge / 建任务）一律由后端下发、由人按下。
-//!    值班长的工具集是**清单驱动**的（[`FOREMAN_TOOL_SPECS`]，票 01 起 8 个只读工具），白名单在
-//!    [`ToolExecutor::with_allowed_tools`] 的执行点强制。它的回复里也永远不出现按钮——
-//!    这个约束落在前端（票 04），这里保证的是它**没有能力**改状态。
-//! 2. **读不到文件系统。** 它的输入是人可以随便打的任意文本，而流水线自身调用的只读子代理
-//!    不需要面对这个（[`crate::pipeline::subagent`]）。故工具集里没有 `read_file` / `list_dir`，
-//!    也没有 `run_command`。
+//! 1. **动手分层、不直连状态机。** 写动作按**档位与族**走（决策 206/207）：环境层
+//!    （`write_file` / `edit_file` / `run_command` / `repair`）在 `ask` 档落成**提议**等按键、
+//!    `auto` 档直通、`deny` 档连广告都不给；本服务写接口（`task` / `config` / `skills` /
+//!    `service`）**恒为提议、不看档位**，按下确认钮后由 `run_proposal_tool` 走**既有端点**
+//!    （同一套校验，没有第二条改状态的路）；决策 210 的托管另对单任务放免按键
+//!    `task resume(continue)`。工具集是**清单驱动**的（[`FOREMAN_TOOL_SPECS`]，顺序有冻结断言钉住），
+//!    白名单在 [`ToolExecutor::with_allowed_tools`] 的执行点强制。它的回复里也永远不出现
+//!    按钮——这个约束落在前端（票 04），时间线上唯一的钮是提议轮的确认钮（决策 207③）。
+//! 2. **域是家目录根，不是任务工作区。** 文件与命令工具（决策 206/207 起在列）的路径都
+//!    相对家目录根（`home.root()`），`data/` 按路径前缀拒（库里明文存着 provider 密钥）；
+//!    `logs/` 的体量由 `read_file` 的字节上限管（决策 226 撤掉了前缀墙）。流水线自身调用的
+//!    只读子代理是另一个边界（[`crate::pipeline::subagent`]），与这里无关。
 //! 3. **不新增阶段枚举变体。** 它占据 [`FOREMAN_STAGE_KEY`] 这一个配置 key。阶段枚举是
 //!    kebab-case 的公开契约（落库列 / SSE 载荷 / 前端联合类型），且流水线图遍历「全部阶段」
 //!    这个定长数组构建——加一个变体会让值班长要么被静默漏掉、要么被当成流水线的一个阶段
@@ -149,7 +154,7 @@ pub fn foreman_turn_in_flight(session_id: &str) -> bool {
 /// A 层的六个新读数（票 01）**一律复用后端既有口径**，不新造一套：看板读任务表、
 /// 指标走 `metrics::*` 纯函数、项目 / 阶段配置 / 技能 / provider 各读自己那张表的既有读法。
 /// 唯一需要加工的是 provider：库里存的是**明文密钥**（决策 112），故只回显掩码。
-pub const FOREMAN_TOOL_SPECS: [ForemanToolSpec; 21] = [
+pub const FOREMAN_TOOL_SPECS: [ForemanToolSpec; 23] = [
     ForemanToolSpec {
         name: "read_task",
         label: "读任务台账",
@@ -264,6 +269,23 @@ pub const FOREMAN_TOOL_SPECS: [ForemanToolSpec; 21] = [
                      进程树取证。取证优先用它，不要等人按键：它是「夜里自己把事定死」的那只手。",
         parameters: r#"{"type":"object","properties":{"command":{"type":"string","enum":["date","ps","pgrep","lsof","wc","tail","sample"],"description":"白名单里的命令名（不经 shell，直接 exec）"},"args":{"type":"array","items":{"type":"string"},"description":"命令参数（必须是字符串数组，例如 [\"-n\",\"50\",\"logs/agentpipeline.log\"]；字符串形态会被拒）"},"timeout_sec":{"type":"integer","description":"超时秒数（可选，缺省按阶段配置）"}},"required":["command"]}"#,
     },
+    // 受治理的网口（决策 266 / 票 02）：GET-only、https 出环、白名单走 `NetworkPolicy`
+    // **同一张**（决策 179，零第二版本）、每次取数与每次被拒都落命令台账。同属只读层故
+    // 不受档位管（237 的判据：改不了任何东西），但值守轮的 deny 清单收它——与
+    // `run_readonly` 的区别正在这一条上：夜里没人盯外发。
+    ForemanToolSpec {
+        name: "web_fetch",
+        label: "读网页",
+        description: "用 GET 取一个网页 / 接口的**文本**正文（受治理的只读网口）。\
+                     只出 https（回环地址例外可 http）；可达域由出口白名单决定——默认只有回环，\
+                     放行域在 config.toml 的 `[pipeline] egress_allow_hosts`（`*.example.com` \
+                     覆盖子域）。缺省 15 秒超时，可用 timeout_sec 覆盖（1–120）；只收文本类 \
+                     content-type（text/*、json、xml），超 512KiB 截断；不跟随重定向（302 会给 \
+                     Location，换 URL 再取一次）。每一次（含被拒的）都落命令台账。\
+                     **不要把密钥、令牌或敏感正文拼进 URL**——query 会同时进台账与对端。\
+                     值守轮没有这个工具。",
+        parameters: r#"{"type":"object","properties":{"url":{"type":"string","description":"要取的完整 URL（https）"},"timeout_sec":{"type":"integer","description":"可选：本次超时秒数（1–120，缺省 15）"}},"required":["url"]}"#,
+    },
     // ── C 层：环境写（决策 206 / 207）。在 `ask` 档下**不执行**，生成提议等人按键；
     //    `auto` 直通；`deny` 连广告都不给。域与 B 层同一份（家目录根 + `data` / `logs` 前缀 deny）。
     ForemanToolSpec {
@@ -360,6 +382,19 @@ pub const FOREMAN_TOOL_SPECS: [ForemanToolSpec; 21] = [
                       卸载不检查引用——仍被阶段配置引用的技能卸掉之后，那个阶段解析会报错。\
                       要值班经理按键确认。",
         parameters: r#"{"type":"object","properties":{"action":{"type":"string","enum":["install","delete"],"description":"install 或 delete"},"path":{"type":"string","description":"install：技能目录路径"},"name":{"type":"string","description":"delete：技能名"},"overwrite":{"type":"boolean","description":"install：同名时是否覆盖"}},"required":["action"]}"#,
+    },
+    // 结构化选项提问（决策 265 / 票 01）：**第三种轮型**的入口。不在两段写清单里
+    // （问话不是打算执行的动作，`gate_decision` 恒 Execute），值守轮的 deny 清单收它
+    // （在叫人、不在问人）；载荷落那一轮 assistant 行的 `ask_json`（迁移 0026）。
+    ForemanToolSpec {
+        name: "ask",
+        label: "提问",
+        description: "需要值班经理在 **2–4 个选项**里拍板、而你猜不出 TA 的偏好时用：\
+                     把问题与选项发出去，TA 在时间线上点选（或自己写一句）作为下一条消息回来。\
+                     选项是短语数组（2–4 个，各一句）；**一轮只许问一个**，问完就简短收口、\
+                     不要把问题再复述一遍。它不是提议（不需要按键执行），也不进任何执行链。\
+                     值守轮没有这个工具——那一轮在叫人，不在问人。",
+        parameters: r#"{"type":"object","properties":{"question":{"type":"string","description":"一句话问清楚"},"options":{"type":"array","minItems":2,"maxItems":4,"items":{"type":"string"},"description":"2–4 个可点选项，各一句短语"}},"required":["question","options"]}"#,
     },
 ];
 
@@ -502,16 +537,21 @@ pub const FOREMAN_WATCH_MARK: &str = "【值守播报】";
 /// 不是为省 token 设的）。
 pub const FOREMAN_NO_ACTION_MARK: &str = "【无需处理】";
 
-/// 分级诊断（决策 209⑥ / 票 07）：**自动那一轮**不许用的工具。
+/// 值守轮（**自动那一轮**）不许用的工具（决策 209⑥ / 票 07；265 / 266 各扩一项）。
 ///
-/// 判据是「这一次你不在场」——主动播报是「固定成本 × 时间」，而你不在场时没有任何收益
-/// 能摊平它。贵的两件事各一：
+/// 前两项的判据是「这一次你不在场」——主动播报是「固定成本 × 时间」，而你不在场时没有
+/// 任何收益能摊平它：
 /// - `read_conversation`：一次最多 12k 字符的会话原文；
 /// - `run_command`：在本机上跑命令。
 ///
-/// 两者在**被追问时**照常可用（那是人的那一轮，`say` 走的是完整工具集）——所以这不是
+/// 后两项的判据是「这一轮没有人在场」，形状不同但同一句话（用户四问裁决，265 / 266）：
+/// - `ask`：**在叫人、不在问人**——值守轮发起的提问没有人点选，只会悬在时间线上；
+/// - `web_fetch`：**夜间外发无人盯**——外发是治理面（179），无人值守时不开口。
+///
+/// 四项在**被追问时**照常可用（那是人的那一轮，`say` 走的是完整工具集）——所以这不是
 /// 削减能力，是**分级**：自动轮只读台账与诊断包摘要（`read_diagnosis` 自带 12k 上限）。
-pub const FOREMAN_WATCH_TOOL_DENY: [&str; 2] = ["read_conversation", "run_command"];
+pub const FOREMAN_WATCH_TOOL_DENY: [&str; 4] =
+    ["read_conversation", "run_command", "ask", "web_fetch"];
 
 /// 一次值守轮最多把多少条待办喂进简报。
 ///
@@ -1197,6 +1237,9 @@ impl ForemanRunner {
         // 分级诊断摘在**源头上**（决策 247）：`deny` 早于三处消费者算好，广告集、
         // 执行点白名单与纪律段都吃 `available`，故「模型看得见一个调用就被拒的工具」
         // 这件事在自动轮里同样不会发生。
+        // 问话载荷槽（决策 265）：每轮新建一个——工具写、本轮收口时取走挂到 assistant 行。
+        let ask_slot: Arc<tokio::sync::Mutex<Option<serde_json::Value>>> =
+            Arc::new(tokio::sync::Mutex::new(None));
         let (tools, ctx) = foreman_tooling(
             &self.store,
             &self.settings,
@@ -1208,6 +1251,7 @@ impl ForemanRunner {
             &available,
             self.steward_actions.clone(),
         );
+        let tools = tools.with_ask_slot(ask_slot.clone());
 
         // 三种角色 → 两种说话的立场（决策 204 / 207）。**操作台记的那几轮（`system`）必须与
         // 值班长自己的话分开**：写成助理轮，它下一轮读历史时会把「提议已执行：写文件 notes.md」
@@ -1415,6 +1459,9 @@ impl ForemanRunner {
         } else {
             reply.clone()
         };
+        // 问话载荷随行落地（决策 265②）：取走即清——一轮至多挂一行，坏轮 / 失败轮
+        // 走不到这里（没有 assistant 行可挂，半截的问题不该比它所属的那一轮活得久）。
+        let ask_json = ask_slot.lock().await.take();
         self.store
             .append_foreman_message(NewForemanMessage {
                 session_id: session.id.clone(),
@@ -1427,6 +1474,7 @@ impl ForemanRunner {
                 // 空串存 `None`（不存空文本）：与 `briefing_json` / `traces_json` 同一条
                 // 口径——「没有」与「有但是空的」是两件事，前者该在下发时是 null。
                 thinking: (!thinking.trim().is_empty()).then_some(thinking),
+                ask_json,
             })
             .await?;
 

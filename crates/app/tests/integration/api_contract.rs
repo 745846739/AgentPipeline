@@ -6435,7 +6435,7 @@ async fn a_repair_proposal_whose_base_moved_conflicts_and_is_refused() {
     assert_eq!(body["proposals"][0]["status"], "pending", "{body}");
 }
 
-/// `GET /foreman/tools`（决策 247⑤）：**全量 21 条、与清单同序、label 均非空、只出两个字段**。
+/// `GET /foreman/tools`（决策 247⑤）：**全量 23 条、与清单同序、label 均非空、只出两个字段**。
 ///
 /// 回执标的是**历史**上的工具调用，故条目数 == 清单长度本身就是「不按档位滤」的形状
 /// （滤过就会少——昨天的回执今天翻译不了）。description / parameters 不出：前端用不上。
@@ -6447,7 +6447,7 @@ async fn the_tool_label_endpoint_lists_the_whole_manifest() {
 
     let manifest = agentpipeline_core::pipeline::foreman::FOREMAN_TOOL_SPECS;
     let listed = body["tools"].as_array().expect("报文要有 tools 数组");
-    assert_eq!(listed.len(), 21, "全量 21 条，按档位滤了？{body}");
+    assert_eq!(listed.len(), 23, "全量 23 条，按档位滤了？{body}");
     assert_eq!(listed.len(), manifest.len(), "条目数要与清单一致：{body}");
     for (i, (item, spec)) in listed.iter().zip(manifest.iter()).enumerate() {
         assert_eq!(item["name"], spec.name, "第 {i} 条与清单不同序：{body}");
@@ -6462,6 +6462,53 @@ async fn the_tool_label_endpoint_lists_the_whole_manifest() {
             "只出 name / label 两个字段：{item}"
         );
     }
+}
+
+/// `.turn.ask` 的线上形态（决策 265）：`kind="ask"` 与 `ask` 载荷**由后端给**
+/// （决策 252 同一支判定点），其余助理行照旧落 `fm`——前端不从正文里抠选项。
+#[tokio::test]
+async fn an_ask_row_carries_its_options_on_the_wire() {
+    let api = api_with_foreman(FakeAgent::new(Script::new())).await;
+    let sid = fresh_session(&api).await;
+    let store = &api.state.store;
+
+    store
+        .append_foreman_user_message(&sid, "拿个主意")
+        .await
+        .unwrap();
+    store
+        .append_foreman_message(NewForemanMessage {
+            ask_json: Some(json!({"question": "这张票怎么处理？", "options": ["修一下", "搁置"]})),
+            ..NewForemanMessage::assistant(&sid, "等你选。")
+        })
+        .await
+        .unwrap();
+    store
+        .append_foreman_message(NewForemanMessage::assistant(&sid, "（普通回话）"))
+        .await
+        .unwrap();
+
+    let (status, body) = get(&api, &format!("/foreman/session?session={sid}")).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let messages = body["messages"].as_array().unwrap();
+    let kinds: Vec<&str> = messages
+        .iter()
+        .map(|m| m["kind"].as_str().unwrap())
+        .collect();
+    assert_eq!(kinds, vec!["mine", "ask", "fm"], "{body}");
+    assert_eq!(messages[1]["ask"]["question"], "这张票怎么处理？", "{body}");
+    assert_eq!(messages[1]["ask"]["options"].as_array().unwrap().len(), 2);
+    assert_eq!(messages[1]["proactive"], json!(false), "{body}");
+    assert!(
+        messages[0]["ask"].is_null(),
+        "用户行没有 ask（ask_json 只由 assistant 轮携带）：{}",
+        messages[0]
+    );
+    assert!(
+        messages[2]["ask"].is_null(),
+        "普通回话行没有 ask：{}",
+        messages[2]
+    );
 }
 
 /// 回话里的归因类别**由后端解析后随消息下发**（决策 235 / 238）。
