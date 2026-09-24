@@ -89,14 +89,15 @@
     failureNotice,
     failedLedgerRowIds,
     foreignIsReplying,
+    FOREMAN_LOST_TURN_SUFFIX,
     forgetForeignActive,
     isRequestTimeout,
     ledgerOwnsTheFailure,
     maxLedgerId,
     noteForeignDelta,
     pruneForeignActive,
+    resolveFollowOutcome,
     settleForemanStream,
-    turnLanded,
     type ForemanStreamState,
     type ForeignActive,
   } from '../realtime/foreman';
@@ -720,6 +721,10 @@
    *
    * 落地判据用**台账尾部有没有新行**而不是只看 `turn_in_flight`：后者在「回话落库、
    * 但下一轮紧接着又起」那一瞬间会连着为真，而尾部多一行是确定无疑的信号。
+   *
+   * 收场有一支**不是落地**（决策 260 裁决③）：没换行而服务端也不再跑它——那一轮永远
+   * 不会再落一行了。此时**不许清字**（那一段是这一轮留下的全部），收成一条失败轮说清
+   * 发生了什么；三支的判据在 `resolveFollowOutcome`，这里只接线。
    */
   $effect(() => {
     if (followingSince === null) return;
@@ -728,11 +733,22 @@
       if (anchor === null) return;
       try {
         const payload = await getForemanSession(currentId);
-        const landed = turnLanded(payload.messages ?? [], anchor) || !payload.turn_in_flight;
-        if (!landed) return;
+        const outcome = resolveFollowOutcome(
+          payload.messages ?? [],
+          anchor,
+          payload.turn_in_flight,
+        );
+        if (outcome.kind === 'keep') return;
         session = payload;
-        stream = emptyForemanStream();
         rememberLanding(payload.session?.id ?? null, payload.session);
+        if (outcome.kind === 'lost') {
+          // 死轮：已经收到的部分原样留着（`failForemanStream` 的姿态），只多一句说明。
+          stream = failForemanStream(stream, FOREMAN_LOST_TURN_SUFFIX);
+          followingSince = null;
+          return;
+        }
+        // 落地：台账那一行接管（它带着完整回话进来），本地那一段退场。
+        stream = emptyForemanStream();
         // **先放手再交棒**：`syncFollowing` 在收到 `turn_in_flight` 为真时重新立锚点。
         // 那一格是「回话落了库、而同一班紧接着又起了一轮」（值守轮插进来，或这一屏刚
         // 发出下一句）——此时该跟的是**新那一轮**，锚点必须按它落库后的台账重记；

@@ -34,15 +34,20 @@ stream = emptyForemanStream();   // ← 死掉的那一轮恰恰靠后半句进�
 仍在跑 → 继续跟。`delegation-scan` 或等价守卫钉 Talk 落地哨不再就地 `emptyForemanStream`
 一把梭。
 
-**Blocked by:** 一次裁决（用户；(a)/(b)/(c)）
+**裁决：取 (a)，且它不必再问用户**——本仓已经有一条更早、更强、且与本条同源的纪律把它定死了：
+`realtime/foreman.ts` 的文件头（票 03 立）写着「断流时 `text` 就是**已经出现的文字**，
+**任何一支都不许把它清掉**」，`failForemanStream` 的注释是同一条的落点。故 (b)「留着但看不见」
+与 (c)「清掉」都与那条纪律冲突——**这不是三选一，只有一支立得住**。照既有纪律办，不问。
 
-**Status:** open（需裁决）
+**Blocked by:** None
 
-- [ ] 裁决 (a)/(b)/(c)
-- [ ] 落地哨按裁决分两支（换行清 / 死轮按裁决留），判据收成纯函数 + 单测
-- [ ] 若取 (a)：定文案（决策 223 超时后缀的同款姿态）
-- [ ] 守卫：Talk 落地哨不再单支 `emptyForemanStream` 梭掉一切
-- [ ] 若产出决策修订/新号，`docs/decisions.md` 追加，`AGENTS.md` / `docs/README.md` 计数带上
+**Status:** done（2026-09-24；(a) 落地）
+
+- [x] 裁决 (a)：死轮收成失败轮，半截字原样留着
+- [x] 判据收成纯函数 `resolveFollowOutcome(rows, anchor, turnInFlight)`：keep / settled / lost 三支 + 单测 5 条
+- [x] 文案 `FOREMAN_LOST_TURN_SUFFIX`（决策 223 超时后缀的同款姿态：说清事实 + 说清下一步；**不假装还能等**——与「仍在继续」那句说的是相反的实情）
+- [x] 守卫：`lib/delegation-scan.test.ts` 2 条（落地哨按三支分派、死轮那一支取 `failForemanStream` 而非 `emptyForemanStream`；**牙齿检查**：改回清字即变红）
+- [x] 记账：决策 260 裁决③行内订正 + `testing.md` + `glossary.md`（无需新号——这是同一条决策内部的订正，不是新裁决）
 
 **来源：** 2026-09-24 talk-judgments 票 07 收口的两轴 code-review（Spec 轴）查出——
 决策 260 自己的裁决③与实现矛盾。用户裁定该问题**不属票 07**（那是缺口记账票），单立本票，

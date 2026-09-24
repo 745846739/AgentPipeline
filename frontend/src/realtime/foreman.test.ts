@@ -11,6 +11,7 @@ import {
   emptyForemanStream,
   failedLedgerRowIds,
   failForemanStream,
+  FOREMAN_LOST_TURN_SUFFIX,
   failureNotice,
   FOREIGN_TTL_MS,
   foreignIsReplying,
@@ -21,6 +22,7 @@ import {
   maxLedgerId,
   noteForeignDelta,
   pruneForeignActive,
+  resolveFollowOutcome,
   settleForemanStream,
   turnLanded,
 } from './foreman';
@@ -507,6 +509,56 @@ describe('重新接上一轮：锚点与落地判据（决策 260）', () => {
   it('空台账 / 锚点之后的更小 id：都不算落地（别把历史当成刚发生的事）', () => {
     expect(turnLanded([], 5)).toBe(false);
     expect(turnLanded([row(3), row(4)], 5)).toBe(false);
+  });
+});
+
+/**
+ * 收场三支（决策 260 裁决③的落实）。
+ *
+ * 决策 260 原文说死轮（没换行而服务端也不再跑它）**「留白」**——保留半截字。可落地哨当时
+ * 只写了「落地就 `emptyForemanStream()`」，于是死轮恰好也走那一支：**半截字被清掉、那一轮
+ * 从时间线上整段消失**。那正是用户报的那条毛病在死轮场景下的残留子集。这一组把三支的判据
+ * 钉死，并钉住「任何一支都不许清掉已经出现的文字」这条模块级纪律。
+ */
+describe('跟的那一轮怎么收场：keep / settled / lost（决策 260 裁决③）', () => {
+  const row = (id: number): LedgerRow => ({ id, kind: 'fm' });
+
+  it('仍在跑：继续跟（哪怕台账一动不动）', () => {
+    expect(resolveFollowOutcome([row(1), row(2)], 2, true)).toEqual({ kind: 'keep' });
+  });
+
+  it('台账尾部多了一行：落地（台账那一行接管回话）', () => {
+    expect(resolveFollowOutcome([row(1), row(2), row(3)], 2, true)).toEqual({ kind: 'settled' });
+    // 落了地而同一班紧接着又起一轮（下一轮已在跑）：**落地优先**——这一轮的回话确实落库了
+    expect(resolveFollowOutcome([row(1), row(2), row(3)], 2, true).kind).toBe('settled');
+  });
+
+  it('没换行而服务端也不再跑它：lost，不是 settled', () => {
+    // 进程被杀 / 重启（决策 223 明确不做那一轮的落账）：台账永远不会有它那一行
+    expect(resolveFollowOutcome([row(1), row(2)], 2, false)).toEqual({ kind: 'lost' });
+    expect(resolveFollowOutcome([], 0, false)).toEqual({ kind: 'lost' });
+  });
+
+  it('**半截字在 lost 那一支必须留着**——`failForemanStream` 不许清字', () => {
+    // 这是本组的承重断言：死轮那一支若走 `emptyForemanStream()`，半截字就没了，
+    // 而「已经出现的文字任何一支都不许清掉」是本模块文件头立的纪律（票 03）。
+    const half = appendForemanDelta(beginForemanStream(), delta('说了一半就断'), SESSION);
+    const outcome = resolveFollowOutcome([row(1)], 1, false);
+    expect(outcome).toEqual({ kind: 'lost' });
+
+    const shown = failForemanStream(half, FOREMAN_LOST_TURN_SUFFIX);
+    expect(shown.text, '半截字必须原样留着').toBe('说了一半就断');
+    expect(shown.error).toBe(FOREMAN_LOST_TURN_SUFFIX);
+    // 而且它仍然渲染成一轮（不是从时间线上消失）
+    const turns = buildTurns(inputOf({ stream: shown }));
+    expect(turns.map((t) => t.key)).toEqual(['live', 'send-error']);
+    expect(turns[0].content).toBe('说了一半就断');
+  });
+
+  it('lost 的说明说清「不会再来」——不假装还能等（与超时那句分得开）', () => {
+    expect(FOREMAN_LOST_TURN_SUFFIX).toContain('不会再');
+    // 超时那句说的是「仍在继续」：两句说的是相反的实情，不能混用
+    expect(FOREMAN_LOST_TURN_SUFFIX).not.toContain('仍在继续');
   });
 });
 

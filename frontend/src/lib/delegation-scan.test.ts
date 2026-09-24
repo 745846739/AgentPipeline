@@ -236,3 +236,38 @@ describe('超时判据按 kind、不摸正文（票 06，决策 259 的延伸）
     ).toBeTruthy();
   });
 });
+
+describe('跟的那一轮的收场分三支（决策 260 裁决③，票 in-flight-turn 01）', () => {
+  const talk = read('routes/Talk.svelte');
+  const foreman = read('realtime/foreman.ts');
+
+  it('落地哨把收场交给纯函数，不再就地「一把梭清字」', () => {
+    // 曾经的形状：`const landed = turnLanded(...) || !turn_in_flight; if (!landed) return;`
+    // 然后无条件 `emptyForemanStream()`——死轮（没换行、服务端也不在跑了）恰好也走那一支，
+    // 已经收到的半截字随之被清掉、那一轮从时间线上整段消失。判据收进 `resolveFollowOutcome`
+    // 之后，三支各自决定「清 / 留 + 以何姿态留」。
+    expect(talk, '落地哨该按纯函数的三支分支').toContain('resolveFollowOutcome(');
+    expect(talk, '死轮那一支要留着半截字').toContain('FOREMAN_LOST_TURN_SUFFIX');
+    // 两支要显式分出来（`settled` 是兜底那一支，故它没有字面量）：
+    // keep = 还在跑、什么都不动；lost = 死轮、留字 + 一句说明
+    expect(talk, '少了「继续跟」那一支').toContain("outcome.kind === 'keep'");
+    expect(talk, '少了「死轮」那一支').toContain("outcome.kind === 'lost'");
+    // 死轮那一支必须留字（走 failForemanStream）、且不许顺手清掉（emptyForemanStream）
+    const lostBranch = talk.slice(talk.indexOf("outcome.kind === 'lost'"));
+    const lostBody = lostBranch.slice(0, lostBranch.indexOf('return;'));
+    expect(lostBody, '死轮该按「保留半截字」的姿态收').toContain('failForemanStream');
+    expect(lostBody, '死轮不许清字').not.toContain('emptyForemanStream');
+    // 判据不许再就地写回（那两个读数各自答一半，合起来才是三支）
+    expect(talk, '落地判据不该在组件里就地进行').not.toContain(
+      'turnLanded(payload.messages ?? [], anchor) || !payload.turn_in_flight',
+    );
+  });
+
+  it('三支的判据与文案住在纯函数模块里（可单测、不触 DOM）', () => {
+    expect(foreman, '判据该在模块里').toContain('export function resolveFollowOutcome');
+    expect(foreman, '死轮的说明该在模块里').toContain('export const FOREMAN_LOST_TURN_SUFFIX');
+    // 「任何一支都不许清掉已出现的文字」这条纪律的落点：死轮走 failForemanStream（留字），
+    // 不是 emptyForemanStream（清字）
+    expect(foreman, '死轮该按「保留」的姿态收').toContain('failForemanStream');
+  });
+});

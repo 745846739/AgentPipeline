@@ -276,13 +276,63 @@ export function maxLedgerId(rows: LedgerRow[]): number {
  * 或一条失败账）就是它落了地。
  *
  * `before` 是**接手那一刻**看到的最大行 id：接手时这一轮的用户那一句已经在台账里了
- * （`say` 先落它再叫模型），故回话落地时 id 必然更大。不换行而服务端也不再报「在跑」
- * 的那一类（进程被杀——决策 223 明确不做那一轮的落账）留白：此时保留已经收到的半截字
- * 比清空诚实，而这正是本函数返回假的含义。
+ * （`say` 先落它再叫模型），故回话落地时 id 必然更大。
+ *
+ * **本函数只管「换行了没有」**；「没换行而服务端也不再报在跑」那一类（进程被杀——决策 223
+ * 明确不做那一轮的落账）该拿已经收到的半截字怎么办，是 {@link resolveFollowOutcome} 的事。
  */
 export function turnLanded(rows: LedgerRow[], before: number): boolean {
   return rows.some((m) => m.id > before);
 }
+
+/** 跟的那一轮收场了，接下来怎么办（见 {@link resolveFollowOutcome}）。 */
+export type FollowOutcome =
+  /** 继续跟：它还在跑。 */
+  | { kind: 'keep' }
+  /** 落了地：台账那一行接管（它会带着完整回话进来），本地那一段该收掉了。 */
+  | { kind: 'settled' }
+  /**
+   * **没落地而服务端也不再报在跑**（进程被杀 / 重启）：这一轮永远不会再落一行。
+   *
+   * 收成一条**失败轮**——不是把半截字清掉。这是本仓那条一以贯之的纪律的落点：
+   * 「已经出现的文字，任何一支都不许把它清掉」（本模块文件头，票 03 立的）。
+   * 判据与呈现分开：**留什么**由这一支说了算，**怎么说**在 {@link FOREMAN_LOST_TURN_SUFFIX}。
+   */
+  | { kind: 'lost' };
+
+/**
+ * 跟的那一轮这一趟问下来收场没有、以及收成什么样（决策 260 裁决③的落实）。
+ *
+ * 两个读数各答一半，且**不能互相替代**：
+ * - {@link turnLanded}（台账尾部有没有新行）——答「它答完了吗」；
+ * - `turn_in_flight`——答「服务端还认不认这一轮」。
+ *
+ * 两件都是假，就是**死轮**：回话永远不会来（决策 223 明确不做进程退出那一轮的落账）。
+ * 此时**不许清字**——那一段是这一轮留下的全部，清掉正是用户报的那条毛病
+ * （「刷新就看不到实时对话流」）在死轮场景下的残留子集。故这一支收成一条失败轮，
+ * 把已经收到的部分原样留着（{@link failForemanStream} 的既有姿态），并说清发生了什么。
+ *
+ * `|| !turn_in_flight` **不能摘**（只按 `turnLanded` 判的话，死轮会永远跟下去——每 3s
+ * 一趟，永远不落地）。
+ */
+export function resolveFollowOutcome(
+  rows: LedgerRow[],
+  anchor: number,
+  turnInFlight: boolean,
+): FollowOutcome {
+  if (turnLanded(rows, anchor)) return { kind: 'settled' };
+  return turnInFlight ? { kind: 'keep' } : { kind: 'lost' };
+}
+
+/**
+ * 死轮那一条失败轮的说明（决策 260 裁决③）。
+ *
+ * 姿态与 {@link FOREMAN_TIMEOUT_SUFFIX} 同一份：**说清事实 + 说清下一步**，不认领没发生的
+ * 事（「它没答完」而不是「它答错了」），也不假装还能等（那一轮永远不会再落一行）。
+ */
+export const FOREMAN_LOST_TURN_SUFFIX =
+  '这一轮没有答完就断了（服务端已不再跑它，回话不会再来）。上面是已经收到的部分：' +
+  '可以再问一次，或者切走再切回本班次看看台账里有没有留下别的痕迹。';
 
 /**
  * 「这一轮还在服务端继续」这句话的正文（决策 223）。
