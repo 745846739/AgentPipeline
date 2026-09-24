@@ -232,6 +232,18 @@ export function sseText(text: string): string {
   );
 }
 
+/**
+ * **一段流中间的增量**（`drip` 步的装置，决策 260）：只有一个 content delta，
+ * **没有 `usage`、没有 `[DONE]`**——那两样都在另一半里。
+ *
+ * 为什么不复用 {@link sseText}：它带 `[DONE]`，而适配器一读到那个标记就认为流结束了
+ * （`openai.rs::parse_chunk`）——两截都用它的话，后半截永远不会到。
+ */
+function sseDelta(text: string): string {
+  const chunk = { choices: [{ index: 0, delta: { role: 'assistant', content: text } }] };
+  return `data: ${JSON.stringify(chunk)}\n\n`;
+}
+
 /** 启动 mock LLM，返回 `{ url, close, prompts, bindTask }`。
  *
  * `extra`（主流程票 09）：按任务路由的附加脚本。**优先按任务 id 匹配**——只有
@@ -319,15 +331,53 @@ async function startMockLlm(
         out = sseTool(step.name, step.args);
       } else if (step.kind === 'submit') {
         out = sseTool('submit_metadata', step.value);
+      } else if (step.kind === 'drip') {
+        // 分两截滴：走下面的 `drip` 那一支（`out` 用不到，给个空串让类型收敛）
+        out = '';
       } else {
         out = sseText(step.text);
       }
-      res.writeHead(200, {
-        'content-type': 'text/event-stream',
-        'cache-control': 'no-cache',
-        connection: 'close',
-      });
-      res.end(out);
+      // **拖住再回**（决策 260 的用例装置）：一轮「还在跑」因此有一段可观测的窗口，
+      // 「跑着的时候刷新页面」才抢得到。字节仍是上面那一份产出的，只有**何时**发出去不同。
+      const delayMs = step && step.kind === 'text' ? (step.delayMs ?? 0) : 0;
+      const send = () => {
+        res.writeHead(200, {
+          'content-type': 'text/event-stream',
+          'cache-control': 'no-cache',
+          connection: 'close',
+        });
+        res.end(out);
+      };
+      // **分两截滴**（同上）：前半截先真写出去，隔 `gapMs` 再补后半截并收线。刷新之后的
+      // 那一段增量因此是**真的在刷新之后到达的**——旧闸门会把它丢掉，用例于是有牙齿。
+      if (step && step.kind === 'drip') {
+        res.writeHead(200, {
+          'content-type': 'text/event-stream',
+          'cache-control': 'no-cache',
+          connection: 'close',
+        });
+        res.write(sseDelta(step.parts[0] ?? ''));
+        step.parts.slice(1).forEach((part, i) => {
+          const last = i === step.parts.length - 2;
+          setTimeout(
+            () => {
+              if (last) {
+                res.end(
+                  sseDelta(part) +
+                    `data: ${JSON.stringify({ usage: { prompt_tokens: 10, completion_tokens: 5 } })}\n\n` +
+                    'data: [DONE]\n\n',
+                );
+              } else {
+                res.write(sseDelta(part));
+              }
+            },
+            step.gapMs * (i + 1),
+          );
+        });
+        return;
+      }
+      if (delayMs > 0) setTimeout(send, delayMs);
+      else send();
     });
   });
   await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve));

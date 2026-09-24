@@ -4,6 +4,7 @@ pub mod advance;
 pub mod cursor;
 pub mod executor;
 pub mod foreman;
+pub mod foreman_actions;
 pub mod landing;
 pub mod merge;
 pub(crate) mod model_invoke;
@@ -25,9 +26,10 @@ pub use cursor::{
 };
 pub use executor::Executor;
 pub use foreman::{
-    build_briefing, parse_attribution, trim_history, Attribution, AttributionKind, ForemanBriefing,
-    ForemanRunner, ForemanTrace, ForemanTurn, FOREMAN_AGENT_TYPE, FOREMAN_ATTRIBUTION_MARK,
-    FOREMAN_MAX_ROUNDS, FOREMAN_PERSONA, FOREMAN_STAGE_KEY, FOREMAN_TOOL_SPECS,
+    build_briefing, foreman_turn_in_flight, parse_attribution, trim_history, Attribution,
+    AttributionKind, ForemanBriefing, ForemanRunner, ForemanTrace, ForemanTurn, FOREMAN_AGENT_TYPE,
+    FOREMAN_ATTRIBUTION_MARK, FOREMAN_MAX_ROUNDS, FOREMAN_PERSONA, FOREMAN_STAGE_KEY,
+    FOREMAN_TOOL_SPECS,
 };
 pub use landing::{
     entry_node, next_is_join, next_stages, nodes_for_stage, skip_landing, stage_has_node,

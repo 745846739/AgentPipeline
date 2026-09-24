@@ -1,0 +1,64 @@
+.DS_Store
+/target
+**/*.rs.bk
+web/node_modules
+web/dist
+web/test-results
+web/playwright-report
+.insta-pending
+frontend/node_modules/
+# 前端子目录里可能被工具生成的依赖缓存（vitest/vite 会在就近目录建 .vite）
+**/node_modules/
+frontend/dist/
+frontend/test-results/
+frontend/playwright-report/
+
+# 桌面壳独立 workspace 的构建产物（决策 156；Cargo.lock / shell-assets / icons 入库）
+crates/desktop/target/
+crates/desktop/gen/schemas/
+
+# 并行子代理工作树（临时）
+.worktrees/
+
+# 原型截图与真应用截图（可由 .scratch/shots/capture*.mjs / e2e/screenshots.spec.ts 重新生成，不入库）
+.scratch/shots/**/*.png
+# UI/UX 审计截图（可由 UX_AUDIT=1 跑 e2e/ux-audit.spec.ts 重新生成，不入库）
+.scratch/ux-audit/*.png
+# 第二轮审计截图（可由 UX_AUDIT2=1 跑 e2e/ux-audit-2.spec.ts 重新生成，不入库）
+.scratch/ux-audit-2/*.png
+
+# 本机工具产物，与本项目无关：cargo-sweep 的时间戳文件、ZCode 客户端的会话目录
+sweep.timestamp
+.zcode/
+
+# ===== ↑ 以上同步自 .gitignore（「从 .gitignore 同步」只重写以上部分）=====
+.git/
+.hg/
+.svn/
+node_modules/
+bower_components/
+jspm_packages/
+__pycache__/
+site-packages/
+venv/
+coverage/
+htmlcov/
+lcov-report/
+cmakefiles/
+cmake-build-*/
+bazel-*/
+pods/
+deriveddata/
+storybook-static/
+playwright-report/
+test-results/
+allure-results/
+allure-report/
+cdk.out/
+*.egg-info/
+*.dist-info/
+eggs/
+pip-wheel-metadata/
+wheels/
+# ----- ↑ 以上为 ZCode 默认排除规则（自定义规则请写在本行下方，不会被同步/恢复改动）-----
+# 自定义规则写在下方（本行提示可删除）

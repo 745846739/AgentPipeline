@@ -13,7 +13,8 @@ use crate::{Error, Result};
 /// v1 代码支持的适配器集合（决策 103：硬编码常量，改它要发版）。
 pub const SUPPORTED_ADAPTERS: [&str; 3] = ["openai", "anthropic", "deepseek"];
 
-/// 全局参数（§3 全表）。
+/// 全局参数（见 [docs/overview.md] §3 全表；`env_mode` 的档位语义另见
+/// [docs/glossary.md] 的「权限档位」条，两处不重复写）。
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Settings {
@@ -38,7 +39,6 @@ pub struct Settings {
     pub context_hard_limit_ratio: f64,
     pub semantic_conflict_check: bool,
     pub cross_family_judge: bool,
-    pub conflict_overlap_threshold: usize,
     pub max_concurrent_tasks: usize,
     pub allow_dirty_worktree_merge: bool,
     /// `run_command` 的出口放行主机（决策 179，票 12）：精确主机 / `*.example.com` / `*`。
@@ -114,7 +114,6 @@ impl Default for Settings {
             context_hard_limit_ratio: 0.9,
             semantic_conflict_check: true,
             cross_family_judge: false,
-            conflict_overlap_threshold: 0,
             max_concurrent_tasks: 5,
             allow_dirty_worktree_merge: false,
             egress_allow_hosts: Vec::new(),
@@ -154,7 +153,6 @@ pub struct PipelineOverrides {
     pub context_hard_limit_ratio: Option<f64>,
     pub semantic_conflict_check: Option<bool>,
     pub cross_family_judge: Option<bool>,
-    pub conflict_overlap_threshold: Option<usize>,
     pub max_concurrent_tasks: Option<usize>,
     pub allow_dirty_worktree_merge: Option<bool>,
     pub egress_allow_hosts: Option<Vec<String>>,
@@ -201,7 +199,6 @@ impl PipelineOverrides {
             context_hard_limit_ratio,
             semantic_conflict_check,
             cross_family_judge,
-            conflict_overlap_threshold,
             max_concurrent_tasks,
             allow_dirty_worktree_merge,
             egress_allow_hosts,
@@ -1243,7 +1240,6 @@ mod tests {
         assert_eq!(s.context_hard_limit_ratio, 0.9);
         assert!(s.semantic_conflict_check);
         assert!(!s.cross_family_judge);
-        assert_eq!(s.conflict_overlap_threshold, 0);
         assert_eq!(s.max_concurrent_tasks, 5);
         assert!(!s.allow_dirty_worktree_merge);
     }
@@ -2234,5 +2230,117 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(err.contains("非字符串"), "{err}");
+    }
+    // ── 票 03：三份清单的同一性（决策 258）──
+
+    /// `Settings` 的字段集 == `PipelineOverrides` 的字段集，且**每一个字段都真的合得上**。
+    ///
+    /// **为什么需要它**：一个全局设置字段的存在被写在四份平行清单里——`Settings` 的字段、它的
+    /// `Default`、`PipelineOverrides` 的 `Option` 字段、`apply` 里的 `set!` 宏参数表。**四份里
+    /// 只有宏清单是静默的**：字段加进两个 struct 却忘了加进宏清单，该键在 `config.toml` 里写了
+    /// **读回来还是默认值**，而没有任何测试会红（`defaults_match_design_table` 只断言一个子集、
+    /// `toml_override_only_touches_named_fields` 只断言 3 个字段）。另外三份漏写是编译错误。
+    ///
+    /// **为什么是定值探针而不是键集比对**：键集比对只防「字段集漂」，防不住「字段在清单里但值
+    /// 没被合上」。探针每项喂一个非默认值、断言 `apply` 后**每一项都 ≠ 默认**，两种都抓，且对
+    /// 未来新增字段**自动生效**。
+    ///
+    /// **判据遍历默认值对象、不手写字段数组**——手写就又是抄一遍，而那正是本条要消灭的形状。
+    #[test]
+    fn every_setting_field_is_actually_overridable() {
+        use serde_json::{json, Value};
+
+        let base = Settings::default();
+        let base_value = serde_json::to_value(&base).expect("Settings 必须可序列化");
+
+        // ① 字段集相同：两个 struct 的键集必须逐一对应（这条抓「加进一边忘了另一边」）
+        let over_default = serde_json::to_value(PipelineOverrides::default())
+            .expect("PipelineOverrides 必须可序列化");
+        let mut base_keys: Vec<&String> = base_value.as_object().unwrap().keys().collect();
+        let mut over_keys: Vec<&String> = over_default.as_object().unwrap().keys().collect();
+        base_keys.sort();
+        over_keys.sort();
+        assert_eq!(
+            base_keys, over_keys,
+            "Settings 与 PipelineOverrides 的字段集必须逐一对应"
+        );
+
+        // ② 每一项都真的合得上：按**类型**给一个非默认值，机械化地填满整个覆盖层。
+        //
+        // 类型从默认值本身读出来（`Value` 的 variant 即类型），故新增字段自动被覆盖——不需要
+        // 在测试里再写一遍字段名。
+        let mut probe = serde_json::Map::new();
+        for (name, current) in base_value.as_object().expect("Settings 是对象") {
+            // 唯一走特殊路径的字段（`apply` 里单独一段，不是 `set!` 宏的一员）：它用
+            // `Option<String>` 接、为的是报错文案（`"Auto"` 走枚举会得到一句难读的 serde
+            // 错误），故**探针值必须是合法档位字面量**。这里写常量而不放进豁免表——豁免表
+            // 本身就是一份会漂的清单（决策 258 ③）。
+            if name == "env_mode" {
+                assert_eq!(
+                    current,
+                    &json!("auto"),
+                    "env_mode 的默认是 auto（`EnvMode` 的 snake_case 序列化）"
+                );
+                probe.insert(name.clone(), json!("deny"));
+                continue;
+            }
+            let bumped = match current {
+                Value::Bool(b) => json!(!b),
+                Value::Number(_) => json!(7),
+                Value::String(s) => json!(format!("{s}-probe")),
+                Value::Array(items) => {
+                    let mut next = items.clone();
+                    next.push(json!("probe.example.com"));
+                    Value::Array(next)
+                }
+                other => panic!("字段 {name} 的类型没有探针：{other:?}（新增类型请在此补一条）"),
+            };
+            probe.insert(name.clone(), bumped);
+        }
+        let over: PipelineOverrides =
+            serde_json::from_value(Value::Object(probe)).expect("探针必须能反序列化回覆盖层");
+        let applied = over.apply(&base);
+
+        // ③ 逐项断言：合上之后每一项都必须**不再是默认值**
+        let applied_value = serde_json::to_value(&applied).expect("结果必须可序列化");
+        let mut missed: Vec<String> = Vec::new();
+        for (name, before) in base_value.as_object().expect("Settings 是对象") {
+            let after = applied_value.get(name).expect("字段必须仍在");
+            if after == before {
+                missed.push(name.clone());
+            }
+        }
+        assert!(
+            missed.is_empty(),
+            "这些字段喂了非默认值却仍等于默认值——它们没被 `set!` 宏清单接住：{missed:?}"
+        );
+    }
+
+    /// `env_mode` 走的是 `apply` 里的特殊路径（不是宏清单），故它**也要**单独钉住：
+    /// 豁免的是**填值方式**，不是**覆盖关系**。
+    ///
+    /// 合法性由 `Config::validate` 在解析期管（`the_global_tier_accepts_auto_and_deny_but_not_ask`），
+    /// 这里只钉「认得出就采用」这一半。
+    #[test]
+    fn env_mode_override_takes_effect_through_its_special_path() {
+        let over = PipelineOverrides {
+            env_mode: Some("deny".into()),
+            ..Default::default()
+        };
+        assert_eq!(
+            over.apply(&Settings::default()).env_mode,
+            crate::types::EnvMode::Deny
+        );
+
+        // 认不出的值**不静默降级成别的档位**——保持 base（报错由解析期那条测试管）
+        let over = PipelineOverrides {
+            env_mode: Some("Auto".into()),
+            ..Default::default()
+        };
+        assert_eq!(
+            over.apply(&Settings::default()).env_mode,
+            Settings::default().env_mode,
+            "认不出的档位必须保持 base，不得猜"
+        );
     }
 }

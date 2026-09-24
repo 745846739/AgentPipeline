@@ -993,6 +993,11 @@ export interface ForemanMessage {
  *
  * `proposals` 是**这个班次的全部**提议（含已执行 / 被拒绝 / 已过期）：时间线要的是
  * 「它当时提议过什么」，只有未决的会在 `GET /foreman/proposals` 里（那是待办，不是台账）。
+ *
+ * `turn_in_flight` 是**此刻**这一班有没有一轮在跑（决策 260）。它不是台账里的一行
+ * （回话落库才算数），故刷新页面会把它重新问一遍——界面据它决定要不要接着把增量
+ * 接进时间线（判据：接手锚点 `realtime/foreman.ts::maxLedgerId`、落地 `turnLanded`、
+ * 接线在 `Talk.svelte` 的 `followingSince`）。
  */
 export interface ForemanSession {
   session: ForemanSessionMeta | null;
@@ -1000,6 +1005,7 @@ export interface ForemanSession {
   proposals: ForemanProposal[];
   total_tokens: number;
   total_calls: number;
+  turn_in_flight: boolean;
   foreman: { agent_type: string; stage_key: string; wired: boolean };
 }
 

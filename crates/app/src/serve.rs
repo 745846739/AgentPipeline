@@ -375,27 +375,39 @@ pub async fn serve(options: ServeOptions) -> anyhow::Result<ServerHandle> {
 
     let store = Store::open(home.clone(), Arc::new(SystemClock)).await?;
 
-    // 恢复流程第一步（决策 127）：清理 kill -9 残留的 executor_owner
-    let cleared = store.clear_executor_owners().await?;
-    if cleared > 0 {
-        tracing::info!(cleared, "已清理残留的 executor 持有者");
+    // 恢复序列（决策 127 / 212）：三步走**唯一那一份实现**（决策 255）——`service` 提议的
+    // 「重启」动作按的是同一个函数，两处从此不会给出不同的答案。这里只负责把读数记成日志。
+    let readings =
+        agentpipeline_core::pipeline::foreman_actions::run_recovery_sequence(&store).await?;
+    if readings.cleared > 0 {
+        tracing::info!(cleared = readings.cleared, "已清理残留的 executor 持有者");
     }
-    // 恢复流程第二步（决策 127 补全，主流程票 08）：孤儿 running 任务归队，
+    // 第二步（决策 127 补全，主流程票 08）：孤儿 running 任务归队，
     // 否则调度器（准入只认 queued）不会接管，任务在重启后永久挂起。
-    let requeued = store.requeue_running_tasks().await?;
-    if !requeued.is_empty() {
-        tracing::info!(count = requeued.len(), tasks = ?requeued, "已将中断的 running 任务归队待调度");
+    if !readings.requeued.is_empty() {
+        tracing::info!(
+            count = readings.requeued.len(),
+            tasks = ?readings.requeued,
+            "已将中断的 running 任务归队待调度"
+        );
     }
-
-    // 恢复流程第三步（决策 212 / 票 13）：项目级 run 既不在 `requeue_running_tasks`
-    // 的归队范围内（那条路按 task_id），也不在 `check_timeouts` 的扫描范围内——两条路都
-    // 不管的后果是它们跨重启永生。启动时立刻收一次：心跳停了的直接标终态（带原因）。
-    let abandoned = store.abandon_stale_project_runs().await?;
-    if !abandoned.is_empty() {
-        tracing::info!(count = abandoned.len(), runs = ?abandoned, "已把中断的项目级 run 标成终态");
+    // 第三步（决策 212 / 票 13）：项目级 run 既不在 `requeue_running_tasks` 的归队范围内
+    //（那条路按 task_id），也不在 `check_timeouts` 的扫描范围内——两条路都不管的后果是它们
+    // 跨重启永生。启动时立刻收一次：心跳停了的直接标终态（带原因）。
+    if !readings.abandoned.is_empty() {
+        tracing::info!(
+            count = readings.abandoned.len(),
+            runs = ?readings.abandoned,
+            "已把中断的项目级 run 标成终态"
+        );
     }
 
     // 恢复流程第四步（决策 231）：把上一进程遗留的「在飞」模型请求收成终态。
+    //
+    // **这一步是启动特有的，故留在调用点、不在上面那个共用函数里**（决策 255④）：它的判据
+    // `finished_at IS NULL` 没有进程限定，语义就是「上一个实例留下的」；而**运行中**被丢弃
+    // 的请求另有承担者——`agent::recording::Settle` 的 `Drop` 会把它收成 `Timeout`。
+    //
     // 为什么必须有：`finished_at IS NULL` 是那张表唯一的「还在跑」读数，而进程被强杀时
     // 收场那一次写入永远不会发生——不收口的话，一个**死掉的**请求会永远以「在飞」的样子
     // 出现在诊断包里。那是决策 226③ 要根除的同一类失真，只是方向相反（不是假装 0，
@@ -468,7 +480,15 @@ pub async fn serve(options: ServeOptions) -> anyhow::Result<ServerHandle> {
     //
     // 缓存根放在家目录下而不是系统临时目录：取下来的裸仓要跨列表与安装两次请求复用，
     // 落在 /tmp 里会被系统清理器顺手删掉，表现为「刚列出来的 commit 忽然取不到」。
+    //
+    // 两级结构**跨重启**（决策 257）：`config.toml` 那一级进 `configured_repos`，界面保存过的
+    // 那一级从 DB 读回并经 `set_market_override` 装上——与 `server_bind_override` 同构
+    // （那个也是启动时读、界面写的，因为绑地址必须在启动时解析）。**`.await` 不能省**：
+    // 少了这一步，界面保存的名单在重启后静默回落到 `config.toml`，而「显式清空」与
+    // 「没保存过」也就再也分不开——那正是存储层 doc（`storage/market_repos.rs`）与
+    // `glossary.md`「技能市场」条明写不许丢的那条区分。
     let market_repos = config.market.resolved_repos();
+    let market_override = store.market_repos_override().await?;
     let repo = Arc::new(Libgit2Repo::new(home.root().join("market-repos")));
     // 值班长（决策 182）：与执行器共用同一个 LLM 出口。构造在 `AppState::new` 之前
     // ——那一步会消费掉 store / home / settings。
@@ -501,6 +521,7 @@ pub async fn serve(options: ServeOptions) -> anyhow::Result<ServerHandle> {
         .with_rebind(rebind_tx)
         .with_allowed_origins(extra_origins)
         .with_repo(repo, market_repos)
+        .with_market_override(market_override)
         .with_foreman(foreman);
     let router = build_router(state.clone());
 

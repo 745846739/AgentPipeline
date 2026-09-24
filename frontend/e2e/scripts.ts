@@ -10,13 +10,37 @@
 export type Step =
   | { kind: 'tool'; name: string; args: unknown }
   | { kind: 'submit'; value: unknown }
-  | { kind: 'text'; text: string };
+  /**
+   * 纯文本回复。`delayMs` = **先拖住这么久再回**（缺省 0）。
+   *
+   * 它存在的理由是一条要测的形状：**一轮还在跑的时候刷新页面**（决策 260）。mock 此前
+   * 一收到请求就把整段 SSE 写完并收线，那一轮于是只在一瞬间是「在跑」的——用例抢不到
+   * 那个窗口。拖住之后「在跑」变成一段可观测的时间，「刷新那一刻它还在答」才可复现。
+   * 只改**何时**回，不改**回什么**（SSE 字节与 `delayMs` 无关，跨语言 fixture 不受影响）。
+   */
+  | { kind: 'text'; text: string; delayMs?: number }
+  /**
+   * **分几截滴出来的回话**：`parts[0]` 先写，此后每隔 `gapMs` 补一截，最后一截带 `[DONE]` 收线。
+   *
+   * 比 {@link Step}`['delayMs']` 强的地方是它给出**决定性的中间态**：两段空档里，前面的
+   * 已经到、后面的还没发生。`parts` 取三段时用例可以这么走——
+   *
+   *   等第 0 截可见 → **刷新** → 断言第 1 截可见（此刻这一轮**还在跑**）→ 第 2 截收线
+   *
+   * 中间那条断言是**唯一能证明增量真的接上了**的地方：那一轮还没落地，台账里只有用户那一句，
+   * 故第 1 截只可能来自 `/foreman/stream`。用两截（`head` / `tail`）时做不到——第二截同时也是
+   * 最后一截，它出现时这一轮已经落地，而落地会触发重读台账，于是「字是从流来的」与
+   * 「字是从台账来的」在屏幕上分不开（实测：那时摘掉闸门，用例照样绿）。
+   */
+  | { kind: 'drip'; parts: string[]; gapMs: number };
 
 export type NodeScript = Record<string, Step[][]>;
 
 export const tool = (name: string, args: unknown): Step => ({ kind: 'tool', name, args });
 export const submit = (value: unknown): Step => ({ kind: 'submit', value });
-export const text = (value: string): Step => ({ kind: 'text', text: value });
+export const text = (value: string, delayMs = 0): Step => ({ kind: 'text', text: value, delayMs });
+/** 分几截滴：`parts[0]` 先到，此后每 `gapMs` 补一截。见 {@link Step} 的那一条说明。 */
+export const drip = (parts: string[], gapMs = 4_000): Step => ({ kind: 'drip', parts, gapMs });
 
 export const writeFile = (path: string, content: string): Step =>
   tool('write_file', { path, content });

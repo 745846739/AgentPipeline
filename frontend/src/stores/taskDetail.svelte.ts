@@ -398,6 +398,10 @@ class TaskDetailStore {
   /** 人工评审表单（review_mode = human）：通过 / 打回并附意见。 */
   async submitReview(approved: boolean, comments?: string): Promise<void> {
     if (!this.id) return;
+    // 这两枚是**第三种拼法，但只写不读**（票 05 取证）：全仓没有一处拿它们的值做相等
+    // 比较——评审按钮只查 `busyKey !== null`——故它们不参与「哪个动作在忙」的身份判定，
+    // 不与 `actionKey` 的四段式竞争。评审表单不是流水线动作（没有游标与落点），硬塞进
+    // 四段式只会造出一段恒空的伪身份；裁定：保持原样，由这条注释记下取舍。
     this.busyKey = approved ? 'review:approve' : 'review:reject';
     this.actionError = null;
     try {

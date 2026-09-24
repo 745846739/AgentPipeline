@@ -92,10 +92,12 @@ impl agentpipeline_core::agent::tools::StewardActionRunner for StewardActions {
             if args.get("action").and_then(|v| v.as_str()) == Some("unstick") {
                 let unstuck = agentpipeline_core::pipeline::unstick::unstick(
                     &store,
-                    &force_release,
+                    &agentpipeline_core::pipeline::executor::force_release,
                     &task_id,
                     store.now(),
-                    chrono::Duration::minutes(settings.watch_owner_stuck_minutes as i64),
+                    // 宽限换算走唯一那一处（决策 255）：此前这里与提议那条各换算一次，
+                    // 而提议那条按**秒**读同一个分钟设置，两条路差 60 倍。
+                    agentpipeline_core::pipeline::foreman_actions::owner_stuck_window(&settings),
                 )
                 .await?;
                 return Ok(agentpipeline_core::agent::tools::ToolOutcome::ok(format!(
@@ -143,14 +145,6 @@ impl agentpipeline_core::agent::tools::StewardActionRunner for StewardActions {
             )))
         })
     }
-}
-
-/// 把 task_id 从**进程内去重**里摘掉（决策 210⑧ / 票 09）。
-///
-/// 去重集合住在 core（`pipeline::executor` 的 `EXECUTOR_REGISTRY`，与 `try_run` 同一处），
-/// 这里是给 app 层一个**有名字的入口**：`unstick` 必须先调它，否则清了 DB 也没用。
-pub fn force_release(task_id: &str) -> bool {
-    agentpipeline_core::pipeline::executor::force_release(task_id)
 }
 
 /// 小时级维护周期（决策 55：会话清理 + 指标聚合与 10s tick 分开）。

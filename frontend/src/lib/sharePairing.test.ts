@@ -1,5 +1,6 @@
 import { describe, expect, it } from 'vitest';
-import { bindSourceLabel, portFallbackNote, sharePanel } from './sharePairing';
+import { ApiError } from '../api/client';
+import { bindSourceLabel, isPairingRequired, portFallbackNote, sharePanel } from './sharePairing';
 
 /**
  * 「手机访问」页的形态判定（决策 189）。
@@ -140,5 +141,27 @@ describe('绑定来源的叫法只有一处定义（票 15 / R2-18）', () => {
     const share = readFileSync(join(resolve(process.cwd(), 'src'), 'routes', 'Share.svelte'), 'utf8');
     expect(share).not.toContain('界面设置');
     expect(share.match(/bind_source === 'settings'/g) ?? []).toHaveLength(0);
+  });
+});
+
+describe('isPairingRequired（票 04 / 决策 259：按 kind 判，不按报文字样）', () => {
+  it('配对缺失的 403（kind = pairing_required）→ true', () => {
+    expect(isPairingRequired(new ApiError(403, '这台设备还没配对：请在跑服务的电脑本机扫码', 'pairing_required'))).toBe(
+      true,
+    );
+  });
+
+  it('跨源 403（403 但没有 kind）→ false——这正是不能只看状态码的那条教训', () => {
+    expect(isPairingRequired(new ApiError(403, '跨源写请求被拒绝：Origin/Referer = x'))).toBe(false);
+  });
+
+  it('报文写着「还没配对」但 kind 不是 → false（字样说了不算）', () => {
+    expect(isPairingRequired(new ApiError(403, '这台设备还没配对', 'origin_rejected'))).toBe(false);
+  });
+
+  it('非 ApiError 与网络层错误（status 0）→ false', () => {
+    expect(isPairingRequired(new Error('网络请求失败：连接被拒'))).toBe(false);
+    expect(isPairingRequired(new ApiError(0, '请求超时（30 秒没有回应）。'))).toBe(false);
+    expect(isPairingRequired(null)).toBe(false);
   });
 });

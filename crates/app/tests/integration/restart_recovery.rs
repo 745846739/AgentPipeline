@@ -400,3 +400,84 @@ async fn kill_9_mid_run_then_restart_recovers_to_done() {
     assert_eq!(repo.head("main"), repo.head("main")); // 主干存在性冒烟
     let _ = json_i64(&last, "total_tokens").expect("任务计量字段存在");
 }
+
+// ─────────────────── 决策 257：界面保存的仓名单跨重启 ───────────────────
+
+/// 界面保存的仓名单**跨真进程重启仍在**，且 `origin` 如实说是「界面」定的。
+///
+/// **为什么必须在真进程重启上验**：`serve.rs` 的启动路径读 DB 这一步，与 `PUT /market/repos`
+/// 写 DB 那一步在**同一个进程里**是串起来的——`AppState` 的 `market_override` 当场就装上了，
+/// 故进程内的用例（`market.rs::repos_config_is_a_two_level_override`）看不见「重启后读不读回」
+/// 这件事。少了启动读回那一步，症状正是「保存完看着挺好，重启就回到配置文件那一级」。
+///
+/// **`origin` 也要一起验**：只要名单在、但 `origin` 说成 `config`，用户会以为「我保存的那份
+/// 被配置文件盖掉了」——那是与真相相反的困惑，而这一页的存在意义就是回答「现在生效的是哪一份」。
+///
+/// 与 `server_bind_override` 同构（决策 186 / 213）：那个也是界面写 DB、启动读回，故这条形状
+/// 不是为技能市场发明的。
+#[tokio::test]
+async fn settings_saved_market_repos_survive_a_real_restart() {
+    let home = TestHome::new().unwrap();
+    // `[market] github_repos` 是**另一级**，用来证明重启后生效的是界面那一份、不是它。
+    std::fs::write(
+        home.home().config_path(),
+        "[market]\ngithub_repos = [\"config/level\"]\n",
+    )
+    .unwrap();
+
+    // ── 第一次启动：保存一份界面名单 ──
+    let (mut first, port) = spawn_server(&home).await;
+    wait_until_ready(port).await;
+
+    let (status, body) = http(
+        "PUT",
+        port,
+        "/market/repos",
+        Some(r#"{"repos":["Obra/Superpowers"]}"#),
+    )
+    .unwrap();
+    assert_eq!(status, 200, "{body}");
+    assert!(body.contains("\"settings\""), "保存后是界面那一级：{body}");
+
+    // ── 真重启：kill 掉、同一个 home 再起 ──
+    first.kill().await.unwrap();
+    first.wait().await.unwrap();
+    let (mut second, port2) = spawn_server(&home).await;
+    wait_until_ready(port2).await;
+
+    let (status, body) = http("GET", port2, "/market/repos", None).unwrap();
+    assert_eq!(status, 200, "{body}");
+    assert!(
+        body.contains("Obra/Superpowers"),
+        "界面保存的名单必须跨重启存活（回归点：少了启动读回这一步，这里会变回配置文件那一级）：{body}"
+    );
+    assert!(
+        !body.contains("config/level"),
+        "生效的必须是界面那一份、不是 config.toml 那一份：{body}"
+    );
+    assert!(
+        body.contains("\"origin\":\"settings\""),
+        "origin 必须如实说是界面定的——说成 config 会让用户以为自己的保存被配置文件盖掉了：{body}"
+    );
+
+    // ── DELETE 之后重启：回落 `config.toml` 那一级 ──
+    let (status, _) = http("DELETE", port2, "/market/repos", None).unwrap();
+    assert_eq!(status, 200);
+    second.kill().await.unwrap();
+    second.wait().await.unwrap();
+    let (mut third, port3) = spawn_server(&home).await;
+    wait_until_ready(port3).await;
+
+    let (status, body) = http("GET", port3, "/market/repos", None).unwrap();
+    assert_eq!(status, 200, "{body}");
+    assert!(
+        body.contains("config/level"),
+        "清掉界面那一级之后应回落到 config.toml：{body}"
+    );
+    assert!(
+        body.contains("\"origin\":\"config\""),
+        "回落之后 origin 应说是 config 定的：{body}"
+    );
+    third.kill().await.unwrap();
+    third.wait().await.unwrap();
+}

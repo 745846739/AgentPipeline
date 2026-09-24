@@ -1,3 +1,4 @@
+import { ApiError, KIND_REQUEST_TIMEOUT } from '../api/client';
 import type { ForemanMessage, ForemanSessionMeta, SseEvent } from '../api/types';
 
 /**
@@ -258,6 +259,32 @@ export function failForemanStream(state: ForemanStreamState, message: string): F
 }
 
 /**
+ * 台账里最大的一行 id（0 = 一行都没有）。
+ *
+ * 与 {@link turnLanded} 配对使用：接手一轮时记下它，落地时拿它比对。**只看 id**，
+ * 与 `failedLedgerRowIds` 同一姿态（判据只该看字段，不看正文）。
+ */
+export function maxLedgerId(rows: LedgerRow[]): number {
+  return rows.reduce((max, m) => (m.id > max ? m.id : max), 0);
+}
+
+/**
+ * 这一轮落地了吗——判据是**台账尾部多了一行**（决策 260）。
+ *
+ * 刷新之后重新接上一轮时，本机手里**没有**那一趟 POST 的回包（它随旧页面一起走了），
+ * 故「它答完了」只能从台账读：尾部冒出比 `before` 新的行（值班长的回话、操作台记的一笔、
+ * 或一条失败账）就是它落了地。
+ *
+ * `before` 是**接手那一刻**看到的最大行 id：接手时这一轮的用户那一句已经在台账里了
+ * （`say` 先落它再叫模型），故回话落地时 id 必然更大。不换行而服务端也不再报「在跑」
+ * 的那一类（进程被杀——决策 223 明确不做那一轮的落账）留白：此时保留已经收到的半截字
+ * 比清空诚实，而这正是本函数返回假的含义。
+ */
+export function turnLanded(rows: LedgerRow[], before: number): boolean {
+  return rows.some((m) => m.id > before);
+}
+
+/**
  * 「这一轮还在服务端继续」这句话的正文（决策 223）。
  *
  * 服务端那一轮**不随这次请求一起死**：本地放弃（本地超时 / 关页 / 换网）只丢掉这一次的
@@ -269,14 +296,27 @@ export function failForemanStream(state: ForemanStreamState, message: string): F
 export const FOREMAN_TIMEOUT_SUFFIX =
   '本地已不再等这一轮，但它在服务端仍在继续：回话会随流式增量出现，切走再切回本班次也能看到。';
 
-/** 报文是不是「本地等不到回包」（判据与 `api/client.ts::mapRequestError` 的超时那句同源）。 */
-export function isTimeoutMessage(message: string): boolean {
-  return message.startsWith('请求超时');
+/**
+ * 这次失败是「本地等不到回包」吗——**按 `kind` 判，不按报文字样**（票 06，决策 259 的延伸）。
+ *
+ * 超时那句话由 `api/client.ts::mapRequestError` 构造，此前这里 `startsWith('请求超时')`
+ * 与它隔着模块逐字同步——报文即接口，改一句话就断（与配对判据是同一个反模式，票 04 先清了
+ * 那一半）。超时是前端本地 `AbortSignal.timeout` 的产物、没有 HTTP 应答体，故 `kind`
+ * 由 `mapRequestError` 在构造点带上（`KIND_REQUEST_TIMEOUT`），这里只认那枚字段。
+ */
+export function isRequestTimeout(err: unknown): boolean {
+  return err instanceof ApiError && err.kind === KIND_REQUEST_TIMEOUT;
 }
 
-/** 失败轮的说明：超时那一类补上「还在跑」的实情，其余原样返回。 */
-export function failureNotice(message: string): string {
-  return isTimeoutMessage(message) ? `${message} ${FOREMAN_TIMEOUT_SUFFIX}` : message;
+/**
+ * 失败轮的说明：超时那一类补上「还在跑」的实情，其余原样返回。
+ *
+ * `timedOut` 由调用方**趁 `ApiError` 还在手**判好传进来（{@link isRequestTimeout}）——
+ * 判据上移、字符串拼接留在这儿：错误降级成流里的字符串之后 `kind` 就丢了，
+ * 本函数不再（也不能）摸正文。
+ */
+export function failureNotice(message: string, timedOut: boolean): string {
+  return timedOut ? `${message} ${FOREMAN_TIMEOUT_SUFFIX}` : message;
 }
 
 /**

@@ -61,6 +61,15 @@ export class ApiError extends Error {
 }
 
 /**
+ * 「本地等不到回包」这一类失败的 `kind`（票 06，命名姿态照配对的 `pairing_required`）。
+ *
+ * **后端不参与**：超时是前端本地 `AbortSignal.timeout` 的产物、没有 HTTP 应答体，
+ * 故这枚 kind 由 {@link mapRequestError} 在构造点自己带上——消费者
+ * （`realtime/foreman.ts::isRequestTimeout`）据此分支，不摸报文字样。
+ */
+export const KIND_REQUEST_TIMEOUT = 'request_timeout';
+
+/**
  * 请求的默认超时（票 12 / R2-14）。**全站唯一出处**，各页不再各写一个。
  *
  * 为什么必须有：`fetch` 在「TCP 连上但不回包」时**不会自己失败**——此前全仓没有一处
@@ -96,7 +105,8 @@ interface RequestOptions {
 export function mapRequestError(err: unknown, timeoutMs: number, hasCallerSignal: boolean): ApiError {
   const e = err as Error;
   if (e?.name === 'TimeoutError' || (e?.name === 'AbortError' && !hasCallerSignal)) {
-    return new ApiError(0, `请求超时（${Math.round(timeoutMs / 1000)} 秒没有回应）。`);
+    // kind 在构造点带上（票 06）：报文是给用户看的，界面分支只认这枚字段
+    return new ApiError(0, `请求超时（${Math.round(timeoutMs / 1000)} 秒没有回应）。`, KIND_REQUEST_TIMEOUT);
   }
   return new ApiError(0, `网络请求失败：${e?.message ?? String(err)}`);
 }

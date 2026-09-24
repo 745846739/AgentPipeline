@@ -8,6 +8,7 @@ import type {
   TaskListItem,
 } from '../api/types';
 import { submitAllowedAction } from '../lib/actionSubmit';
+import { actionKey } from '../lib/actions';
 import { notificationClassForEvent } from '../lib/notificationPolicy';
 import { StreamManager } from '../realtime/connection';
 import { emptyBoardState, reduceBoard } from '../realtime/reduce';
@@ -111,7 +112,12 @@ class BoardStore {
     const cursor = action.cursor_id
       ? cursors.find((c) => c.cursor_id === action.cursor_id)
       : cursors[0];
-    const key = `${taskId}:${action.action}`;
+    // 「哪个动作在忙」与规范形**同一把尺子**（票 05）：此前这里是两段
+    // `taskId:action` 拼法，与 taskDetail / PendingActions 的四段 `actionKey`
+    // 并存——同一个概念两种拼法，且旧拼法长在 §12.3 映射表没盖到的地方。
+    // 游标是 ULID、全局唯一，四段式不带 taskId 也跨任务分得开；`opts.cursorId` 与消费
+    // 者比较时用的是同一个 `fallbackCursorId`（PendingActions 的 emit 与 busy() 同源）。
+    const key = actionKey(action, opts.cursorId);
     this.actionBusy = key;
     this.actionError = null;
     try {

@@ -25,7 +25,15 @@ import {
   expectBundleHealthy,
   type App,
 } from './harness';
-import { foremanScript, fullPassScript, archBlockerRounds, readTask, text, tool } from './scripts';
+import {
+  archBlockerRounds,
+  drip,
+  foremanScript,
+  fullPassScript,
+  readTask,
+  text,
+  tool,
+} from './scripts';
 
 /**
  * 值班长的回话：10 行，**每轮同文**（只有开头的标记用于断言）。
@@ -370,6 +378,87 @@ async function expectProposalReachable(page: Page): Promise<void> {
   );
   expect(pageOverflow, '整页长出了滚动条（急停钉在第一屏就只剩口头保证）').toBeLessThanOrEqual(0);
 }
+
+/**
+ * 对讲台 · 值班板的失败灯（决策 251①）。
+ *
+ * **这条补的是本批唯一的行为变化**：值班板此前把「该工位的任务全部失败」并进 `idle`，
+ * 画成一个空灯框，而看板同一列是红的——规格 `design/theme-6-pixel.md:628` 明写值班板是
+ * 「同一份读数在看板 8 列与顶栏灯带上各有一份，**这是第三份**」，`:620` 又把它归在**状态直陈**
+ * 层（后端确定性下发、不经 LLM 转手、最硬的信号）。两份读数不该各说各话。
+ *
+ * 断言口径是**接线**，不是优先序：优先序（急停 > 在跑 > 失败 > 归档 > 空）由
+ * `lib/pipeline.station.test.ts` 逐条钉住，这里只回答「那一盏灯点的是不是失败色」。
+ *
+ * 取势选 `POST /tasks/{id}/cancel` 而不是坏 provider：后者要把重试耗尽才落终态
+ * （`ux-audit-2.spec.ts:385` 那条只能 `.catch(() => undefined)` 容忍它没跑到），而取消是一次
+ * 同步写。**`archBlockerRounds` 先把任务钉在 architect 的 `info_insufficient` 上再取消**——
+ * 不等这一下的话，`startApp` 刚返回时任务还在 `init`，红灯会落到错误的工位上。
+ *
+ * 独立 describe 而不是并进「版面」那一组：取消是**终态**写，共享 app 的兄弟用例会跟着遭殃
+ * （那一组里有人还在等 `merge_approval`，而 `waitForTask` 撞见终态就抛）。
+ */
+test.describe('对讲台 · 值班板的失败灯（决策 251①）', () => {
+  let app: App;
+
+  test.beforeAll(async () => {
+    app = await startApp({ script: archBlockerRounds(), title: 'E2E 值班板失败灯' });
+    // 先钉在 architect 的 info_insufficient 上（脚本到此不再推进），再取消：
+    // `mark_terminal` 只改 status、清 pending，留 current_stage，故它仍归 architect 列。
+    await waitForTask(
+      app,
+      (t) => pendingTypeOf(t) === 'info_insufficient',
+      'architect 的 info_insufficient',
+      120_000,
+    );
+    const res = await fetch(`${app.apiBase}/tasks/${app.taskId}/cancel`, {
+      method: 'POST',
+      headers: { 'x-agentpipeline': '1' },
+    });
+    if (!res.ok) {
+      throw new Error(`POST /tasks/${app.taskId}/cancel -> ${res.status}: ${await res.text()}`);
+    }
+  });
+
+  test.afterAll(async () => {
+    await app?.stop();
+  });
+
+  test('全失败的工位点红灯：那一盏带 x 变体、取色逐字等于 --stop，且不是空灯框', async ({
+    page,
+  }) => {
+    await page.setViewportSize({ width: 1280, height: 720 });
+    const bundle = watchBundle(page);
+    await page.goto(`${app.webBase}/#/talk`);
+    await settleBundle(page, bundle);
+    await expect(page.locator('.talk')).toBeVisible();
+
+    // 值班板 8 工位照旧画满——失败只换那一盏的色，不增不减行
+    await expect(page.locator('.talk .brow')).toHaveCount(8);
+
+    // toHaveCount 自带重试，故它顺带等 board.tasks 装载完成（装配前 8 盏全是空灯框）
+    const lamp = page.locator('.talk .blamp.x');
+    await expect(lamp, '取消后那个工位该亮失败灯，而不是空灯框').toHaveCount(1);
+    await expect(page.locator('.talk .brow:has(.blamp.x) .bnm')).toHaveText('architect-design');
+
+    // 灯自己算出来的颜色要逐字等于 --stop。在页里用一探针读同一个 token，故换主题
+    // （深 / 浅）不用改这条断言——断的是「接没接上失败色」，不是某个字面量。
+    const { lampBg, stopBg } = await page.evaluate(() => {
+      const el = document.querySelector('.talk .blamp.x');
+      const probe = document.createElement('i');
+      probe.style.background = 'var(--stop)';
+      document.body.appendChild(probe);
+      const a = el ? getComputedStyle(el).backgroundColor : '<no lamp>';
+      const b = getComputedStyle(probe).backgroundColor;
+      probe.remove();
+      return { lampBg: a, stopBg: b };
+    });
+    expect(lampBg, '失败灯的取色要逐字等于 --stop').toBe(stopBg);
+    expect(lampBg, '空灯框是 transparent，这一盏不该是它').not.toBe('rgba(0, 0, 0, 0)');
+
+    expectBundleHealthy(bundle);
+  });
+});
 
 /**
  * 对讲台 · 两张急停同时挂在状态区（决策 183）。
@@ -978,6 +1067,22 @@ test.describe('对讲台 · 折行档（决策 192 / 218）', () => {
     await expect(menu).toBeVisible();
     await expect(menu.locator('button').first()).toBeFocused();
 
+    // 出口②b：**ArrowUp 从第一项回触发钮**（不绕到末项）——这条是两处弹层共用的
+    // 陷阱里最容易被抄漏的一条，而 Talk 这份此前一条单测都没有（决策 251⑤）
+    await page.keyboard.press('ArrowUp');
+    await expect(more).toBeFocused();
+    await expect(menu, '只是把焦点送出来，面板不关').toBeVisible();
+
+    // 出口②c：Home / End 落首末项，末项再 ArrowDown **绕回**第一项
+    await page.keyboard.press('ArrowDown'); // 焦点在触发钮上 → 回面板第一项
+    await expect(menu.locator('button').first()).toBeFocused();
+    await page.keyboard.press('End');
+    await expect(menu.locator('button').last()).toBeFocused();
+    await page.keyboard.press('ArrowDown'); // 末项往下 → 绕回第一项
+    await expect(menu.locator('button').first()).toBeFocused();
+    await page.keyboard.press('Home');
+    await expect(menu.locator('button').first()).toBeFocused();
+
     // 出口③：点面板外面关掉
     await page.mouse.click(200, 640);
     await expect(menu).toBeHidden();
@@ -1163,6 +1268,102 @@ test.describe('对讲台 · 空看板也能对话（票 04 的验收锚点）', 
     await expect(input).toHaveValue('');
     await expect(page.locator('.talk-head .ts')).toContainText(/本次会话 [1-9]\d* tok/);
 
+    expectBundleHealthy(bundle);
+  });
+});
+
+/**
+ * 对讲台 · 回话中刷新页面（决策 260）——**用户报的那条毛病**。
+ *
+ * 现场：值班长正在答话时按 F5，刷新之后看不到实时回话——那一轮在屏幕上整段消失，得等它
+ * 落地后重读台账才出现，而「正在逐字往外冒」这件事完全看不见。根因是在途轮的现场
+ * （乐观轮 / 流式文本）只住在 `sending` 那一侧，刷新即丢；增量到达时无从判断「这一段字
+ * 属于谁」，闸门于是**一律不接**。
+ *
+ * 修法：`GET /foreman/session` 带 `turn_in_flight`（服务端进程内登记，见 `foreman.rs`），
+ * 界面据此把「跟这一轮」这件事重新立起来——增量照旧接进时间线，落地后收口。
+ *
+ * **装置是 `drip` 步**（脚本那条 `drip(head, tail, gapMs)`）：回话分两截滴出来，中间留一段
+ * 空档。用例因此有一个**决定性的中间态**——前半截已经在流上、后半截还没发生：
+ *
+ *   等「前半截」可见 → **刷新** → 断言「后半截」照旧到达
+ *
+ * 那个后半截正是**刷新之后才到达的增量**：旧闸门（`if (!sending) return`）会把它丢掉，
+ * 于是时间线上永远只有一个光秃秃的前半截（实测：这条用例的第一版用的是「一个字都不写、
+ * 只拖时间」的 `delayMs`，摘掉闸门照样绿——那种写法只有 `following` 在承重，增量那半条
+ * 路径根本没被走到）。
+ */
+test.describe('对讲台 · 回话中刷新页面（决策 260）', () => {
+  let app: App;
+
+  /** 三截：A 在刷新之前到，B 在**刷新之后、还没落地时**到（决定性那一段），C 收线。 */
+  const A = '第一截：我开始想了';
+  const B = '；第二截：还在想，这一句是刷新之后到的';
+  const C = '；第三截：想完了。';
+
+  test.beforeAll(async () => {
+    app = await startApp({
+      // 两个空档各 6s：A→(6s)→B→(6s)→C。够「看见 A → 刷新 → 断言 B → 等 C 收口」走完。
+      script: foremanScript([[drip([A, B, C], 6_000)], [text('第二轮的收尾。')]]),
+      providerOnly: true,
+    });
+  });
+
+  test.afterAll(async () => {
+    await app?.stop();
+  });
+
+  test('刷新之后增量照旧到达：中段（还没落地时来的那一截）接得住，落地后收口', async ({
+    page,
+  }) => {
+    const bundle = watchBundle(page);
+    await page.goto(`${app.webBase}/#/talk`);
+    await settleBundle(page, bundle);
+
+    // 发一句：这一轮分三截滴出来，A 立刻到，B / C 各隔 6s。
+    await page.locator('.typer textarea').fill('这一句要分三截答');
+    await page.locator('.typer button[type=submit]').click();
+
+    // 等 A 落屏（证明这一轮真的开始了、流是通的）。
+    await expect(page.locator('.timeline .turn.fm').first()).toContainText(A, { timeout: 30_000 });
+
+    // **刷新**：正是在这一轮还在跑的时候（B 还没到、C 更没到）。
+    await page.reload();
+    await settleBundle(page, bundle);
+
+    // 用户那一句从台账读回来（它先落库，决策 182㉓）。
+    await expect(
+      page.locator('.timeline .turn.mine', { hasText: '这一句要分三截答' }),
+    ).toHaveCount(1, { timeout: 30_000 });
+
+    // **这一条是用例的牙齿**：B 必须在这一轮**还没落地**的时候就出现在屏上——那时台账里
+    // 只有用户那一句，故 B 只可能来自 `/foreman/stream`。界面此刻也没有本机那一趟 POST
+    // （随旧页面走了）：它靠 `turn_in_flight` 把「跟这一轮」立起来，B 才接得住。
+    // 旧行为（`if (!sending) return`）下 B 被丢掉，这里永远只有 A。
+    await expect(
+      page.locator('.timeline .turn.fm').first(),
+      '刷新之后、落地之前到达的那一截必须接得住——正是这条毛病要修的东西',
+    ).toContainText(B, { timeout: 30_000 });
+
+    // **落地之前**这一条要当场取证，否则上面那句会退化成「等台账把整段回话送回来」——
+    // 那种写法下 B 从哪来分不出（实测：第一版就是这样，摘掉闸门照样绿）。读一次服务端：
+    // 台账里仍只有用户那一句、且这一轮仍在跑，而屏幕上已经有 B 了。
+    const live = await page.evaluate(async (apiBase) => {
+      const res = await fetch(`${apiBase}/foreman/session`);
+      const body = (await res.json()) as { messages: unknown[]; turn_in_flight: boolean };
+      return { rows: body.messages.length, inFlight: body.turn_in_flight };
+    }, app.apiBase);
+    expect(live.rows, 'B 到达时台账里应当只有用户那一句（回话还没落）').toBe(1);
+    expect(live.inFlight, 'B 到达时这一轮应当仍在跑——这正是它只能来自流的前提').toBe(true);
+
+    // 收口：C 之后回话落地，台账那一行接管（时间线上仍是这一轮，且三截齐全）。
+    await expect(page.locator('.timeline .turn.fm').first()).toContainText(C, { timeout: 30_000 });
+    await expect(page.locator('.timeline .turn.fm')).toHaveCount(1);
+    const reply = page.locator('.timeline .turn.fm').first();
+    await expect(reply).toContainText(A);
+    await expect(reply).toContainText(B);
+
+    bundle.problems.length = 0;
     expectBundleHealthy(bundle);
   });
 });

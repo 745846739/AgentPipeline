@@ -4,7 +4,7 @@
   import NewTaskDialog from '../board/NewTaskDialog.svelte';
   import Sprite from '../render/Sprite.svelte';
   import type { SpriteName } from '../../theme/contract';
-  import { tick } from 'svelte';
+  import { createMenuTrap } from '../../lib/menuTrap';
 
   const FILTERS: StatusFilter[] = ['all', 'running', 'pending', 'waiting', 'queued', 'done', 'ended'];
 
@@ -114,78 +114,29 @@
   let pendingTrigger = $state<HTMLButtonElement | null>(null);
   let pendingPanel = $state<HTMLDivElement | null>(null);
 
-  function pendingItems(): HTMLAnchorElement[] {
-    return pendingPanel ? [...pendingPanel.querySelectorAll<HTMLAnchorElement>('a.dd-item')] : [];
-  }
-
-  function focusPendingItem(index: number): void {
-    const list = pendingItems();
-    if (list.length === 0) return;
-    const n = list.length;
-    list[((index % n) + n) % n].focus();
-  }
-
-  function closePending(returnFocus: boolean): void {
-    board.pendingOpen = false;
-    if (returnFocus) pendingTrigger?.focus();
-  }
-
   /**
+   * 键盘与点外关闭的**判据**在 `lib/menuTrap`（决策 251⑤）——⋯ 班次菜单与这一栏是同义的
+   * 两份（各 80 多行、只换了标识符），共用一份之后抄漏陷阱就不再可能。这里只出**接线**：
+   * 开关态住在 `board.pendingOpen`，而「打开」在这一栏顺带拉一次待办列表。
+   *
    * 键盘一律在 `window` 上收（触发钮与面板都不挂 `onkeydown`：那两个落点要么给静态元素挂
-   * 交互处理器、要么把按钮的默认语义扯歪，两条都是 a11y 检查里的红灯）。判据收紧到
-   * ——面板开着，且焦点在触发钮或面板里。
+   * 交互处理器、要么把按钮的默认语义扯歪，两条都是 a11y 检查里的红灯）——那两条监听仍在
+   * 模板的 `<svelte:window>` 上，立场没挪地方。
    */
-  function onWindowKey(e: KeyboardEvent): void {
-    const active = document.activeElement as HTMLElement | null;
-    const onTrigger = !!pendingTrigger && active === pendingTrigger;
-    const inPanel = !!active && !!pendingPanel && pendingPanel.contains(active);
-
-    // 触发钮上按 ArrowDown：打开并把焦点送进第一项（面板刚变可见，要等一次 DOM 刷新）
-    if (e.key === 'ArrowDown' && onTrigger && !board.pendingOpen) {
-      e.preventDefault();
-      board.togglePendingDropdown();
-      void tick().then(() => focusPendingItem(0));
-      return;
-    }
-    if (!board.pendingOpen) return;
-
-    // Escape 一律关得掉——**焦点从没进过面板时也算**（实测里就是这个场景：点开芯片、
-    // 焦点还在芯片上按 Escape）。焦点若在触发钮或面板里，顺带还回去。
-    if (e.key === 'Escape') {
-      closePending(onTrigger || inPanel);
-      return;
-    }
-    if (!onTrigger && !inPanel) return;
-
-    const list = pendingItems();
-    if (list.length === 0) return;
-    const current = list.indexOf(active as HTMLAnchorElement);
-    if (e.key === 'ArrowDown') {
-      e.preventDefault();
-      focusPendingItem(current + 1);
-    } else if (e.key === 'ArrowUp') {
-      e.preventDefault();
-      if (current <= 0) pendingTrigger?.focus();
-      else focusPendingItem(current - 1);
-    } else if (e.key === 'Home') {
-      e.preventDefault();
-      focusPendingItem(0);
-    } else if (e.key === 'End') {
-      e.preventDefault();
-      focusPendingItem(list.length - 1);
-    }
-  }
-
-  /** 点面板外面关掉（含「本来就开着、用户去点别处」那一档）。 */
-  function onWindowClick(e: MouseEvent): void {
-    if (!board.pendingOpen) return;
-    const target = e.target as Node | null;
-    if (target && pendingWrap?.contains(target)) return;
-    board.pendingOpen = false;
-  }
+  const menuTrap = createMenuTrap({
+    isOpen: () => board.pendingOpen,
+    onOpen: () => board.togglePendingDropdown(),
+    onClose: () => {
+      board.pendingOpen = false;
+    },
+    trigger: () => pendingTrigger,
+    panel: () => pendingPanel,
+    wrap: () => pendingWrap,
+    itemSelector: 'a.dd-item',
+  });
 </script>
 
-<svelte:window onclick={onWindowClick} onkeydown={onWindowKey} />
+<svelte:window onclick={menuTrap.onClick} onkeydown={menuTrap.onKeydown} />
 
 <header class="top" bind:this={headerEl} bind:offsetHeight={topbarH}>
   <div class="topbar">

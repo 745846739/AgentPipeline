@@ -483,11 +483,21 @@ export function stationStateFromDots(dots: MiniDotState[], i: number): StationSt
   }
 }
 
-/** 看板列头的聚合站点状态：有 pending → warn；在跑 → go；否则 idle。 */
+/**
+ * 工位灯的聚合状态：急停琥珀 > 在跑绿 > 失败红 > 归档灰 > 空（决策 251②）。
+ *
+ * **看板列头与对讲台值班板读的是同一个答案**（规格 `design/theme-6-pixel.md:628`：值班板是
+ * 「同一份读数在看板 8 列与顶栏灯带上各有一份，**这是第三份**」）。顶栏那条灯带是**逐任务**
+ * 的灯、输入形状不同（一颗灯 = 一个任务），不在此列。
+ *
+ * 优先序取**看板的可见次序**：`running` 压过 `failed`——「这个工位还在动」比「它有一次失败」
+ * 更该被说出口，反过来会把正在重试的工位报成红的。这一档此前正是反的，于是同一问题在
+ * helper、看板列头、值班板三处给出两个答案。
+ */
 export function aggregateStationState(statuses: TaskStatus[]): StationState {
   if (statuses.some((s) => s === 'pending')) return 'warn';
-  if (statuses.some((s) => s === 'failed' || s === 'cancelled')) return 'stop';
   if (statuses.some((s) => s === 'running')) return 'go';
+  if (statuses.some((s) => s === 'failed' || s === 'cancelled')) return 'stop';
   if (statuses.length > 0 && statuses.every((s) => s === 'done')) return 'done';
   return 'idle';
 }

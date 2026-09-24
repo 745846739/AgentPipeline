@@ -4,6 +4,7 @@ import {
   deleteStageConfig,
   getForemanSession,
   getServerInfo,
+  KIND_REQUEST_TIMEOUT,
   listStageConfigs,
   mapRequestError,
   putStageConfig,
@@ -166,6 +167,8 @@ describe('请求失败的口径（票 12 / R2-14）', () => {
     expect(mapped.status).toBe(0);
     expect(mapped.message).toContain('超时');
     expect(mapped.message).toContain('30 秒');
+    // 超时带机器可读 kind（票 06）：界面分支只认它，报文是给用户看的
+    expect(mapped.kind).toBe(KIND_REQUEST_TIMEOUT);
   });
 
   it('没有调用方 signal 的 AbortError 也算超时', () => {
@@ -185,9 +188,10 @@ describe('请求失败的口径（票 12 / R2-14）', () => {
   });
 
   it('网络本身不通：保留内核给的原因', () => {
-    expect(mapRequestError(new TypeError('Failed to fetch'), 30_000, false).message).toBe(
-      '网络请求失败：Failed to fetch',
-    );
+    const mapped = mapRequestError(new TypeError('Failed to fetch'), 30_000, false);
+    expect(mapped.message).toBe('网络请求失败：Failed to fetch');
+    // 不是超时就不带超时的 kind（票 06：附不附「仍在继续」那句全看它）
+    expect(mapped.kind).toBeUndefined();
   });
 
   it('拿不到 message 也不许抛：退化成一条可读的话', () => {

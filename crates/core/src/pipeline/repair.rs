@@ -84,6 +84,24 @@ pub struct RepairSession {
     pub base_ref: String,
 }
 
+impl RepairSession {
+    /// 从一条提议的载荷（[`RepairOutcome`]）**重建**现场（决策 255）。
+    ///
+    /// 载荷里带着 `repair_id` / `worktree_path` / `branch` / `base_ref` 四件，正是本结构
+    /// 除 `session_id` 之外的全部字段；`session_id` 来自提议归属的班次。此前这条重建在
+    /// 三处各写了一遍（提议执行、拒绝时的回收、以及 `finish_repair_round` 那条），
+    /// 收成一处之后「重建一次修复现场」只有一个答案。
+    pub fn from_outcome(outcome: &RepairOutcome, session_id: &str) -> RepairSession {
+        RepairSession {
+            repair_id: outcome.repair_id.clone(),
+            session_id: session_id.to_string(),
+            worktree: PathBuf::from(&outcome.worktree_path),
+            branch: outcome.branch.clone(),
+            base_ref: outcome.base_ref.clone(),
+        }
+    }
+}
+
 /// 拉起一次修复的载体（决策 210③ / 票 10）。
 ///
 /// base 的取法与 merge 阶段一致（有 `origin` 用 `origin/{default}`——[`Git::init_worktree_named`]
@@ -467,13 +485,7 @@ pub async fn recycle_unpressed_repair_worktrees(
             tracing::warn!(project = %project_id, "修复提议指向的项目已不在台账里，跳过回收");
             continue;
         };
-        let session = RepairSession {
-            repair_id: outcome.repair_id.clone(),
-            session_id: proposal.session_id.clone(),
-            worktree: PathBuf::from(&outcome.worktree_path),
-            branch: outcome.branch.clone(),
-            base_ref: outcome.base_ref.clone(),
-        };
+        let session = RepairSession::from_outcome(&outcome, &proposal.session_id);
         if !session.worktree.exists() {
             // 「拒绝」已经收过一遍而行还留着（或人自己删的）：不是故障，无事可做。
             continue;

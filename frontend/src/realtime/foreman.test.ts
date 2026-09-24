@@ -1,5 +1,8 @@
 import { describe, expect, it } from 'vitest';
+import { ApiError, mapRequestError } from '../api/client';
 import type { ConversationDeltaEvent, ForemanSessionMeta, ToolEventEvent } from '../api/types';
+import { buildTurns, type TalkTurnsInput } from '../lib/talkTurns';
+import type { LedgerRow } from './foreman';
 import {
   appendForemanDelta,
   appendForemanTool,
@@ -13,11 +16,13 @@ import {
   foreignIsReplying,
   forgetForeignActive,
   FOREMAN_TIMEOUT_SUFFIX,
-  isTimeoutMessage,
+  isRequestTimeout,
   ledgerOwnsTheFailure,
+  maxLedgerId,
   noteForeignDelta,
   pruneForeignActive,
   settleForemanStream,
+  turnLanded,
 } from './foreman';
 
 /**
@@ -210,16 +215,33 @@ describe('foreman 流式归约（续）', () => {
     expect(ledgerOwnsTheFailure([consoleRow], new Set())).toBe(false);
   });
 
-  it('本地超时不等于这一轮失败：补上「它仍在服务端继续」的实情（决策 223）', () => {
-    // 判据与 `api/client.ts::mapRequestError` 的超时那句同源
-    expect(isTimeoutMessage('请求超时（300 秒没有回应）。')).toBe(true);
-    expect(isTimeoutMessage('配对令牌无效')).toBe(false);
+  it('本地超时不等于这一轮失败：补上「它仍在服务端继续」的实情（决策 223 / 票 06）', () => {
+    // 判据按 `kind`（票 06）：生产者是 mapRequestError，它在构造点带上 KIND_REQUEST_TIMEOUT——
+    // 走真构造链而不是手写字面量，钉的是「两端共用同一枚 kind」这件事本身
+    const timeoutErr = mapRequestError(
+      Object.assign(new Error('signal timed out'), { name: 'TimeoutError' }),
+      300_000,
+      false,
+    );
+    expect(isRequestTimeout(timeoutErr)).toBe(true);
 
-    const timedOut = failureNotice('请求超时（300 秒没有回应）。');
+    const timedOut = failureNotice(timeoutErr.message, isRequestTimeout(timeoutErr));
     expect(timedOut).toContain('请求超时');
     expect(timedOut).toContain(FOREMAN_TIMEOUT_SUFFIX);
-    // 其余失败**不**加这句话：真失败了还说「仍在继续」是在骗人
-    expect(failureNotice('这一轮没跑起来（llm_auth）：密钥不对')).toBe(
+
+    // 网络本身不通（kind 不是超时）→ **不**加这句话：真失败了还说「仍在继续」是在骗人
+    const offline = mapRequestError(new TypeError('Failed to fetch'), 30_000, false);
+    expect(isRequestTimeout(offline)).toBe(false);
+    expect(failureNotice(offline.message, isRequestTimeout(offline))).toBe(offline.message);
+
+    // 字样 spoof：正文以「请求超时」开头、但 kind 不是超时 → 不附——这正是「不按 message
+    // 里的字样分支」（api/client.ts 的那条纪律）要挡的形状，也是本票替换掉的旧判据
+    const spoof = new ApiError(0, '请求超时（30 秒没有回应）。');
+    expect(isRequestTimeout(spoof)).toBe(false);
+    expect(failureNotice(spoof.message, isRequestTimeout(spoof))).toBe(spoof.message);
+
+    // 其余失败照原样
+    expect(failureNotice('这一轮没跑起来（llm_auth）：密钥不对', false)).toBe(
       '这一轮没跑起来（llm_auth）：密钥不对',
     );
   });
@@ -445,3 +467,88 @@ describe('思考与工具调用的实时声道（决策 244）', () => {
     expect(failed.thinking).toBe('想了半截');
   });
 });
+
+/**
+ * 刷新之后重新接上一轮（决策 260）。
+ *
+ * 起因是一条实测：对讲台上值班长正在答话时刷新页面，那一轮**整段看不见**——在途轮的现场
+ * （乐观轮 / 流式文本）全住在 `sending` 那一侧，刷新即丢，增量到达时无从判断「这一段字属于
+ * 谁」，闸门一律不接；于是只剩等它落地后重读台账才出现。
+ *
+ * 补的是两条纯判据：接手时记锚点（{@link maxLedgerId}），落地时看台账尾部有没有新行
+ * （{@link turnLanded}）。它们都是「只读字段、不看正文」的（与 `failedLedgerRowIds` 同一姿态）。
+ */
+describe('重新接上一轮：锚点与落地判据（决策 260）', () => {
+  const row = (id: number, kind: LedgerRow['kind'] = 'fm') => ({ id, kind });
+
+  it('锚点是台账里最大的行 id；一行都没有时是 0', () => {
+    expect(maxLedgerId([])).toBe(0);
+    expect(maxLedgerId([row(3), row(9), row(5)])).toBe(9);
+    // 顺序无关：接手那一刻读到的台账是升序的，但不靠这个顺序（少一处能漂的假设）
+    expect(maxLedgerId([row(9), row(3)])).toBe(9);
+  });
+
+  it('接手那一刻已有的行不算落地——回话落地时 id 必然更大', () => {
+    const before = maxLedgerId([row(1), row(2)]);
+    expect(before).toBe(2);
+    // 还在跑：台账一动不动
+    expect(turnLanded([row(1), row(2)], before)).toBe(false);
+    // 落地：值班长的回话进来（id 3）
+    expect(turnLanded([row(1), row(2), row(3)], before)).toBe(true);
+  });
+
+  it('落地的那一行是哪种 kind 都算：回话 / 操作台记的账 / 失败账都是「这一轮结束了」', () => {
+    const before = 2;
+    expect(turnLanded([row(1), row(2), row(3, 'fm')], before)).toBe(true);
+    expect(turnLanded([row(1), row(2), row(3, 'console')], before)).toBe(true);
+    expect(turnLanded([row(1), row(2), row(3, 'failed')], before)).toBe(true);
+  });
+
+  it('空台账 / 锚点之后的更小 id：都不算落地（别把历史当成刚发生的事）', () => {
+    expect(turnLanded([], 5)).toBe(false);
+    expect(turnLanded([row(3), row(4)], 5)).toBe(false);
+  });
+});
+
+/**
+ * 本地放弃之后的接力（决策 260）——决策 223 那条路在界面侧的收口。
+ *
+ * `say` 的超时**不等于**这一轮失败：它跑在自己的任务里（决策 223），回话照旧落库。
+ * 此前那条实情只写在文案里（`FOREMAN_TIMEOUT_SUFFIX` 那句「它仍在服务端继续」），
+ * 而屏幕上的那一轮会停在半截（`partial`），**增量也不再接**——说的与实际对不上。
+ *
+ * 现在接力：`turn_in_flight` 为真就继续跟，那一轮的 `partial` 也随之翻假（它仍在流）。
+ */
+describe('本地超时之后的接力：说的与做的对上（决策 260）', () => {
+  it('接力时那一轮不再是「断流」——它仍在流', () => {
+    const stalled = failForemanStream(appendForemanDelta(beginForemanStream(), delta('说了一半'), SESSION), '请求超时（300 秒没有回应）。');
+    // 本地放弃那一刻：屏幕上是「断流」
+    const before = buildTurns(inputOf({ stream: stalled }));
+    expect(before[0]).toMatchObject({ key: 'live', partial: true });
+
+    // 服务端说这一轮在跑 → 接着跟：同一段文字现在标注为「仍在流之中」
+    const after = buildTurns(inputOf({ following: true, stream: { ...stalled, streaming: true, error: null } }));
+    expect(after[0]).toMatchObject({ key: 'live', partial: false, streaming: true });
+    expect(after[0].content).toBe('说了一半');
+  });
+
+  it('接力之后到达的增量照旧接得上（那一轮没断）', () => {
+    let state = failForemanStream(beginForemanStream(), '请求超时（300 秒没有回应）。');
+    // 「跟」这一支的闸门在组件里；这里钉的是归约本身不因 error 在场而拒绝累积
+    state = appendForemanDelta(state, delta('后台接着说的'), SESSION);
+    expect(state.text).toBe('后台接着说的');
+  });
+});
+
+/** `buildTurns` 的最小输入（判据本身在 `lib/talkTurns.test.ts`；这里只用它读 partial）。 */
+function inputOf(over: Partial<TalkTurnsInput>): TalkTurnsInput {
+  return {
+    session: null,
+    pendingText: null,
+    sending: false,
+    following: false,
+    stream: beginForemanStream(),
+    pairingNeeded: false,
+    ...over,
+  };
+}

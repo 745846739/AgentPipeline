@@ -1,7 +1,7 @@
 <script lang="ts">
   import type { AllowedAction, BranchCursor, TaskListItem } from '../../api/types';
   import type { BoardColumnDef } from '../../lib/pipeline';
-  import { COLUMN_SPRITES, EMPTY_HINTS, workerRhythm } from '../../lib/pipeline';
+  import { COLUMN_SPRITES, EMPTY_HINTS, aggregateStationState, workerRhythm } from '../../lib/pipeline';
   import Sprite from '../render/Sprite.svelte';
   import Worker from '../pipeline/Worker.svelte';
   import TaskCard from './TaskCard.svelte';
@@ -55,10 +55,15 @@
             : 'idle',
   );
 
-  /** 列头信号灯状态（契约 `StationState` 词表）。 */
-  const stationState = $derived(
-    hasPending ? 'warn' : hasRunning ? 'go' : hasFailed ? 'stop' : allDone ? 'done' : 'idle',
-  );
+  /**
+   * 列头信号灯状态（契约 `StationState` 词表）。
+   *
+   * 判据取自 `aggregateStationState`（决策 251②）——**与对讲台值班板同一个答案**。
+   * 此前这里就地推一遍，而那一遍恰好是对的、共享 helper 反而错了一档（`failed` 排在
+   * `running` 之前），于是「同一个问题三个地方三个答案」。优先序改对之后就地推导与 helper
+   * 逐字等价（上面那四个谓词被 `colState` 共用，故它们留在原地）。
+   */
+  const stationState = $derived(aggregateStationState(spineTasks.map((t) => t.status)));
 
   /** 挥锤小人节奏：run 快挥 / wait 慢挥 / idle 站立（帧切换为离散 opacity 翻转）。 */
   const rhythm = $derived(workerRhythm(stationState));

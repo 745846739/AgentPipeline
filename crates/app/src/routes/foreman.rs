@@ -440,30 +440,44 @@ pub async fn reject_proposal(
 
 /// 提议的**执行接缝**（决策 207）：按提议里的 `(工具, 参数)` 走既有那条路。
 ///
-/// 分派是**按工具名**做的，而每个名字对应的是「走到哪条既有的路」：
-/// - **环境层**（`write_file` / `edit_file` / `run_command`）：走值班长自己的
-///   [`ToolExecutor`]——与对话里那一轮**同一个执行器**（同一份文件策略、同一个出口策略、
-///   同一份命令记录），只有确认闸关掉（人已经按过键了）。见 `foreman_tooling` 的说明。
-/// - **本服务写接口**（`task` / `config` / `skills`）：**直接调那个端点的处理器函数**。
+/// 分派是**按工具名**做的，而每个名字对应的是「走到哪条既有的路」。分法见决策 255——
+/// **判据是「这颗动作有没有一颗对应的界面按钮」**：
+/// - **有按钮的三族**（`task` / `config` / `skills`）：**直接调那个端点的处理器函数**。
 ///   不是发一次 in-process HTTP——那会重新过一遍跨源与配对层，而这两层判的是「谁在门外」，
-///   这次调用已经在门内（值班经理在本机界面上按下了确认钮）。
+///   这次调用已经在门内（值班经理在本机界面上按下了确认钮）。直接调 handler 也正是
+///   「参数与按钮同形」那条要求的执行机制（票 05）。
+/// - **没按钮的四件**（env 三件 / `unstick` / `repair` / `service`）：走
+///   [`agentpipeline_core::pipeline::foreman_actions`]——与界面无关，故住在 core。
 ///
 /// 两条路都**不新增第二条改状态的实现**：绕过校验的捷径一旦存在，「LLM 的判断不直接接进
 /// 状态机」那条接缝就换个形式又回来了。
 ///
 /// `Ok(Some(细节))` 是成功（细节进时间线），`Err` 是失败——失败一律走既有端点的错误，不在这里
 /// 翻译成别的东西（`Err` 的报文与界面上直接点那个按钮时看到的是**同一句**）。
+///
+/// **分派器只此一处**（决策 247 的语汇单点）：四族搬进 core 之后，六条臂仍在这张表里，
+/// 只是其中四条各变成一行 core 调用——不设「一个入口内部分派」，那会让工具名语汇出现第二份副本。
 async fn run_proposal_tool(
     state: &AppState,
     proposal: &ForemanProposal,
 ) -> Result<Option<String>, ApiError> {
+    use agentpipeline_core::pipeline::foreman_actions;
+    let sse: std::sync::Arc<dyn agentpipeline_core::sse::SseSink> = state.sse.clone();
     match proposal.tool.as_str() {
-        "write_file" | "edit_file" | "run_command" => run_env_tool(state, proposal).await,
+        "write_file" | "edit_file" | "run_command" => {
+            foreman_actions::run_env(&state.store, &state.settings, &state.home, sse, proposal)
+                .await
+                .map_err(map_core_error)
+        }
         "task" => run_task_tool(state, proposal).await,
         // 全局动作（决策 210⑧ / 票 09）：**永远只提议**，按下走恢复序列。
-        "service" => run_service_tool(state, proposal).await,
+        "service" => foreman_actions::run_service(&state.store, proposal)
+            .await
+            .map_err(map_core_error),
         // 修复提议（决策 212① / 票 12）：执行的不是工具，是「合入一个分支」。
-        "repair" => run_repair_proposal(state, proposal).await,
+        "repair" => foreman_actions::run_repair(&state.store, proposal)
+            .await
+            .map_err(map_core_error),
         "config" => run_config_tool(state, proposal).await,
         "skills" => run_skills_tool(state, proposal).await,
         // 工具名对不上的提议是**真实可能**的（升级前落的、或模型报了一个不存在的名字）：
@@ -474,175 +488,7 @@ async fn run_proposal_tool(
     }
 }
 
-/// 环境层工具的执行：与对话轮**同一个执行器**，只把确认闸关掉。
-///
-/// 档位**在执行时重读一次**（而不是沿用提议生成时那一份）：白名单按当前档位算，于是档位在
-/// 提议之后被收紧到 `deny` 时，这条提议按不下去（报的是「不在允许集内」）。放松到 `auto`
-/// 则照旧能按——收紧是安全方向，放松不是。
-async fn run_env_tool(
-    state: &AppState,
-    proposal: &ForemanProposal,
-) -> Result<Option<String>, ApiError> {
-    use agentpipeline_core::pipeline::foreman::{
-        foreman_available_tools_except, foreman_tooling, ForemanMoment,
-    };
-
-    let cfg = state
-        .store
-        .get_stage_config(FOREMAN_STAGE_KEY)
-        .await
-        .map_err(map_core_error)?;
-    let env_mode = agentpipeline_core::types::effective_env_mode(
-        state.settings.env_mode,
-        FOREMAN_STAGE_KEY,
-        cfg.as_ref(),
-    );
-    // 按键执行那一趟不分级（票 07 的分级只针对自动轮）：人已经按下了那颗钮，故 `deny`
-    // 为空；白名单仍按**当前**档位算一次传进去（决策 247：执行点不吃自己另筛的一份）。
-    let available = foreman_available_tools_except(env_mode, &[]);
-    let (tools, ctx) = foreman_tooling(
-        &state.store,
-        &state.settings,
-        &state.home,
-        state.sse.clone(),
-        &proposal.session_id,
-        env_mode,
-        ForemanMoment::ConfirmedPress,
-        &available,
-        // 也不注入托管执行者：按键那一趟根本走不到托管分支（`confirmed_once` 已短路）
-        None,
-    );
-    let call = agentpipeline_core::agent::client::ToolCall {
-        id: proposal.id.clone(),
-        name: proposal.tool.clone(),
-        // 参数**逐字取自提议行**：这是「按下的是它当时提的那件事」的唯一凭据。
-        arguments: proposal.args.to_string(),
-    };
-    let outcome = tools.execute(&call, &ctx).await.map_err(map_core_error)?;
-    Ok(Some(outcome.content))
-}
-
-// ──────────────────── 修复提议（决策 212① / 票 12）────────────────────
-
-/// 按下一条修复提议：**先 rebase 检查，再合入**。
-///
-/// 指纹换义（决策 212①）就落在这里：普通提议的拒执判据是「任务状态变了吗」，而修复执行的是
-/// 「合入一个分支」——分支不会因为别的事变迁而失效，会变的是**基准**。故执行时先走 merge
-/// 阶段已有的 `rebase_onto_with_auto_resolve`：
-/// - 能干净 rebase（或自动解决冲突）→ 合入；
-/// - 冲突 → **拒执**，并把冲突文件列给你（那是你要动手的地方）。
-async fn run_repair_proposal(
-    state: &AppState,
-    proposal: &ForemanProposal,
-) -> Result<Option<String>, ApiError> {
-    use agentpipeline_core::pipeline::repair::{finish_repair, RepairOutcome, RepairSession};
-
-    let payload = proposal
-        .payload
-        .as_ref()
-        .ok_or_else(|| ApiError::internal("修复提议缺载荷（不该发生：落库时必写）"))?;
-    let outcome: RepairOutcome = serde_json::from_value(payload.clone())
-        .map_err(|e| ApiError::internal(format!("修复提议的载荷读不出来：{e}")))?;
-    if !outcome.gate_passed {
-        return Err(ApiError::conflict(format!(
-            "这条修复的闸门没过，不能合入：{}",
-            agentpipeline_core::pipeline::repair::gate_failure_note(&outcome.gate)
-        )));
-    }
-    let project = state
-        .store
-        .get_project(
-            proposal
-                .args
-                .get("project_id")
-                .and_then(|v| v.as_str())
-                .unwrap_or_default(),
-        )
-        .await
-        .map_err(map_core_error)?
-        .ok_or_else(|| ApiError::not_found("修复所属的项目不存在"))?;
-    let repo = std::path::Path::new(&project.local_path);
-    let session = RepairSession {
-        repair_id: outcome.repair_id.clone(),
-        session_id: proposal.session_id.clone(),
-        worktree: std::path::PathBuf::from(&outcome.worktree_path),
-        branch: outcome.branch.clone(),
-        base_ref: outcome.base_ref.clone(),
-    };
-
-    // ① 基准前进 / 冲突：以「能不能干净 rebase」为准（指纹换义）
-    if let agentpipeline_core::git::AutoRebaseOutcome::Conflict { files } =
-        agentpipeline_core::git::Git
-            .rebase_onto_with_auto_resolve(&session.worktree, &session.base_ref)
-            .await
-            .map_err(map_core_error)?
-    {
-        return Err(ApiError::conflict(format!(
-            "修复分支与基准冲突（{}），没有合入——先解决这几处再按：{}",
-            files.len(),
-            files.join("、")
-        )));
-    }
-
-    // ② 合入（与 merge 阶段同一个 git 出口）+ 回收（合入成功 → 删分支、删 worktree）
-    agentpipeline_core::git::Git
-        .merge_into_default_branch(repo, &project.default_branch, &session.branch)
-        .await
-        .map_err(map_core_error)?;
-    finish_repair(repo, &session, true)
-        .await
-        .map_err(map_core_error)?;
-    Ok(Some(format!(
-        "已合入 {} → {} 并回收修复 worktree（分支已删）",
-        session.branch, project.default_branch
-    )))
-}
-
 // ──────────────────── 本服务写接口：四个领域各一族（票 05 / 09）────────────────────
-
-/// `service` 族（决策 210⑧ / 票 09）：**全局动作，永远只提议**。
-///
-/// 按下之后做的是**恢复序列**（决策 127 的两步：清 `executor_owner` + 把中断的 `running`
-/// 任务归队），然后**如实说清本进程没有自重启能力**——没有 supervisor 契约，擅自 `exit`
-/// 会让服务就此消失，而按下那颗钮的人未必在能把它拉起来的地方。
-///
-/// 这一条偏离了票面「重启服务」的字面（只重启、不改代码那件事），如实记在票 09 的收尾里：
-/// 真正重启需要一条进程外的监督者，那是另一票。
-async fn run_service_tool(
-    state: &AppState,
-    proposal: &ForemanProposal,
-) -> Result<Option<String>, ApiError> {
-    let action = str_arg(&proposal.args, "action")?;
-    if action != "restart" {
-        return Err(ApiError::bad_request(format!(
-            "service 工具没有这个动作：{action}（可用：restart）"
-        )));
-    }
-    let cleared = state
-        .store
-        .clear_executor_owners()
-        .await
-        .map_err(map_core_error)?;
-    let requeued = state
-        .store
-        .requeue_running_tasks()
-        .await
-        .map_err(map_core_error)?;
-    let abandoned = state
-        .store
-        .abandon_stale_project_runs()
-        .await
-        .map_err(map_core_error)?;
-    Ok(Some(format!(
-        "已执行重启前的恢复序列：清理残留执行者 {cleared} 个、中断的 running 任务归队 {} 个、\
-         中断的项目级 run 标终态 {} 条。**本进程没有自重启能力**——请在你启动它的地方\
-         （桌面壳或那个终端）重启一次，中断的任务会从归队处继续。",
-        requeued.len(),
-        abandoned.len()
-    )))
-}
-
-// ──────────────────── 本服务写接口：三个领域各一族（票 05）────────────────────
 
 /// `task` 族：建任务 / resume / retry / cancel / 拍板 / 合入。
 ///
@@ -729,28 +575,15 @@ async fn run_task_tool(
             endpoint_outcome(response).await
         }
         "unstick" => {
-            let task_id = str_arg(args, "task_id")?;
-            // `unstick` 不在端点里（它是修补动作面，不是界面上的按钮面）：直接调 core。
-            // **必须先摘进程内去重**，否则清了 DB 也没用（决策 210⑧ 的原话）。
-            let release = crate::runtime::force_release;
-            let unstuck = agentpipeline_core::pipeline::unstick::unstick(
+            // `unstick` 不在端点里（它是修补动作面，不是界面上的按钮面）：归 core 的直接
+            // 动作面（决策 255②）——判据落在**动作**粒度，不是族粒度。
+            agentpipeline_core::pipeline::foreman_actions::run_unstick(
                 &state.store,
-                &release,
-                &task_id,
-                state.store.now(),
-                chrono::Duration::seconds(state.settings.watch_owner_stuck_minutes as i64),
+                &state.settings,
+                proposal,
             )
             .await
-            .map_err(map_core_error)?;
-            Ok(Some(format!(
-                "已解除僵死占用（{}）：游标 {} 转 pending（标终态的 run {:?}），现在可以 resume",
-                match unstuck.kind {
-                    agentpipeline_core::storage::AttentionKind::OwnerStuck => "owner 持有超时",
-                    _ => "调度器处置未生效",
-                },
-                unstuck.cursor_id,
-                unstuck.finished_runs
-            )))
+            .map_err(map_core_error)
         }
         "retry" => {
             let task_id = str_arg(args, "task_id")?;
@@ -1067,13 +900,8 @@ async fn discard_repair_worktree(
     else {
         return Ok(());
     };
-    let session = RepairSession {
-        repair_id: outcome.repair_id,
-        session_id: proposal.session_id.clone(),
-        worktree: std::path::PathBuf::from(&outcome.worktree_path),
-        branch: outcome.branch,
-        base_ref: outcome.base_ref,
-    };
+    // 重建现场走 `RepairSession::from_outcome`（决策 255）：这条重建此前在三处各写了一遍。
+    let session = RepairSession::from_outcome(&outcome, &proposal.session_id);
     finish_repair(std::path::Path::new(&project.local_path), &session, false)
         .await
         .map_err(map_core_error)
@@ -1213,6 +1041,10 @@ fn session_not_found(id: &str) -> ApiError {
 /// **提议是全量的**（含已执行 / 已拒绝 / 已过期）：决策 207 要求过期只让按钮变灰、
 /// 那一轮留在时间线里（审计——值班长当时提议过什么必须可追溯）。前端把两条列表按时间
 /// 并进同一条时间线。
+///
+/// `turn_in_flight` 是**第五个位置**（决策 260）：这一班此刻有没有一轮在跑。它不是台账里
+/// 的一行（回话落库才算数），而是进程内登记的直接读数（`foreman_turn_in_flight`），
+/// 界面刷新之后靠它重新接上「正在说话」那一轮——详见该函数的说明。
 async fn session_payload(
     state: &AppState,
     store: &Store,
@@ -1225,6 +1057,7 @@ async fn session_payload(
             "proposals": [],
             "total_tokens": 0,
             "total_calls": 0,
+            "turn_in_flight": false,
             "foreman": foreman_identity(state),
         }));
     };
@@ -1249,6 +1082,7 @@ async fn session_payload(
         "proposals": proposals.iter().map(proposal_wire).collect::<Vec<_>>(),
         "total_tokens": total_tokens,
         "total_calls": total_calls,
+        "turn_in_flight": agentpipeline_core::pipeline::foreman_turn_in_flight(&session.id),
         "foreman": foreman_identity(state),
     }))
 }
@@ -1326,4 +1160,92 @@ fn message_wire(m: &ForemanMessage) -> serde_json::Value {
         "kind": kind,
         "proactive": proactive,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    //! 分派器的静态守卫（决策 255⑦，票 foreman-actions 04）。
+    //!
+    //! 照 `frontend/src/lib/talkLayout.test.ts` 的先例：**读源文本 + 断言**。
+    //! 单测只能证明新 module 对，证明不了**路由层没有又长回一份**——这两条守的就是后者。
+
+    use agentpipeline_core::agent::tools::{is_env_write_tool, is_service_write_tool};
+    use agentpipeline_core::pipeline::foreman::FOREMAN_TOOL_SPECS;
+
+    fn source() -> String {
+        let full = std::fs::read_to_string(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/src/routes/foreman.rs"
+        ))
+        .expect("本文件可读");
+        // **只扫生产部分**：本守卫自己带着那些「禁止出现」的字面量，全文扫会扫到自己。
+        let cut = full
+            .find("#[cfg(test)]")
+            .expect("本测试模块之前还有生产代码");
+        full[..cut].to_string()
+    }
+
+    fn dispatcher_body(src: &str) -> &str {
+        let start = src
+            .find("async fn run_proposal_tool")
+            .expect("分派器还在这个文件里");
+        let end = src
+            .find("async fn run_task_tool")
+            .expect("task 族接在分派器后面（提取锚点）");
+        &src[start..end]
+    }
+
+    /// **会生成提议的每个工具名在分派器里都有一条臂。**
+    ///
+    /// 判据与执行点同源：清单（`FOREMAN_TOOL_SPECS`）× 写工具集（`ask` 档转提议 / 恒提议）
+    /// 的交集就是「可能落成一条提议」的那些名字；少一条臂，那条提议按下就是
+    /// 「还没有接线」，而它本该能执行——这正是决策 247 修的那类漂移的执行面版本。
+    #[test]
+    fn every_proposal_capable_tool_has_a_dispatcher_arm() {
+        let src = source();
+        let body = dispatcher_body(&src);
+        let mut checked = 0usize;
+        for spec in FOREMAN_TOOL_SPECS.iter() {
+            if !(is_env_write_tool(spec.name) || is_service_write_tool(spec.name)) {
+                continue;
+            }
+            assert!(
+                body.contains(&format!("\"{}\"", spec.name)),
+                "工具 {} 会生成提议，但分派器里没有它的臂",
+                spec.name
+            );
+            checked += 1;
+        }
+        // 读数冻结（照决策 247「21 名顺序冻结」的姿势）：当前交集 = env 写 4
+        //（write_file / edit_file / run_command / repair；`delete_file` 不在值班长清单里）
+        // + service 写 4（task / config / skills / service）。数目变了先重算再改这里。
+        assert_eq!(checked, 8, "交集读数变了：先核对清单与写工具集");
+    }
+
+    /// **直接动作面的实现不在路由层**（防它长回来）：git 链、unstick、恢复序列三样
+    /// 都只经 `foreman_actions`，且四个函数真的被调到。
+    #[test]
+    fn the_moved_families_are_not_implemented_here_anymore() {
+        let src = source();
+        for gone in [
+            "rebase_onto_with_auto_resolve",
+            "merge_into_default_branch",
+            "pipeline::unstick::unstick",
+            "clear_executor_owners",
+            "agentpipeline_core::git",
+        ] {
+            assert!(
+                !src.contains(gone),
+                "{gone} 回到了路由层——它属于 core 的直接动作面（决策 255）"
+            );
+        }
+        for present in [
+            "foreman_actions::run_env",
+            "foreman_actions::run_service",
+            "foreman_actions::run_repair",
+            "foreman_actions::run_unstick",
+        ] {
+            assert!(src.contains(present), "四族要经 {present} 走");
+        }
+    }
 }

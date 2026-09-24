@@ -1,5 +1,6 @@
 <script lang="ts">
   import type { AllowedAction, BranchCursor, TaskListItem } from '../../api/types';
+  import { actionKey } from '../../lib/actions';
   import {
     branchShort,
     crateState,
@@ -58,10 +59,9 @@
   );
 
   function isBusy(action: AllowedAction, cursorId?: string): boolean {
-    return (
-      actionBusy === `${task.id}:${action.action}` ||
-      actionBusy === `${action.action}:${cursorId ?? ''}`
-    );
+    // 只认四段式（票 05）：此前这里手工桥着两种拼法（store 的两段式 + actionKey 的
+    // 截断版），那正是「同一个忙有两把尺子」的来源——现在生产者与消费者同一把。
+    return actionBusy === actionKey(action, cursorId);
   }
 </script>
 

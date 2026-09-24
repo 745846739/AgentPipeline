@@ -4724,6 +4724,117 @@ async fn a_dropped_request_does_not_kill_the_turn() {
     );
 }
 
+/// 刷新页面之后，**服务端说得出「这一班此刻有一轮在跑」**（决策 260）。
+///
+/// 这是用户报的那条毛病的服务端半边：正在答话时刷新对讲台，那一轮整段看不见——因为界面上
+/// 「在途」的现场（乐观轮 / 流式文本）刷新即丢，而它此前**没有任何权威读数**可依。
+/// `GET /foreman/session` 现在带 `turn_in_flight`，界面据此重新接上那一轮（把到达的增量
+/// 接进时间线）。这一条钉的是这个字段随一轮的寿命翻转。
+///
+/// 牙齿：把 `session_payload` 的 `turn_in_flight` 改成恒 `false`，本用例停在第一个断言上。
+#[tokio::test]
+async fn the_session_payload_says_whether_a_turn_is_running() {
+    /// 收到信号才回话的模型：把「正在跑」变成一个可观测的窗口（时序照
+    /// [`a_dropped_request_does_not_kill_the_turn`] 同一手法）。
+    struct Gated(Arc<tokio::sync::Notify>);
+    impl LlmClient for Gated {
+        fn complete(
+            &self,
+            _request: agentpipeline_core::agent::client::LlmRequest,
+        ) -> futures::future::BoxFuture<
+            'static,
+            agentpipeline_core::Result<agentpipeline_core::agent::client::AgentResponse>,
+        > {
+            let release = self.0.clone();
+            Box::pin(async move {
+                release.notified().await;
+                Ok(agentpipeline_core::agent::client::AgentResponse {
+                    content: Some("收到，我盯着 t1。".into()),
+                    prompt_tokens: 10,
+                    completion_tokens: 5,
+                    ..Default::default()
+                })
+            })
+        }
+    }
+
+    let release = Arc::new(tokio::sync::Notify::new());
+    let api = api_with_llm(Arc::new(Gated(release.clone()))).await;
+
+    // 空 home：一个班次都没有，故没有「在跑的一轮」这一说——字段在场且为假
+    // （老客户端读到它照旧能解析：加字段是加性改动）。
+    let (status, body) = get(&api, "/foreman/session").await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(
+        body["turn_in_flight"].as_bool(),
+        Some(false),
+        "一个班次都没有时不该有「在跑」：{body}"
+    );
+
+    // 发一句话并停在模型调用里：此刻它在跑。
+    let sending = tokio::spawn(
+        api.router.clone().oneshot(
+            request("POST", "/foreman/messages")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(json!({"text": "盯着 t1"}).to_string()))
+                .unwrap(),
+        ),
+    );
+    let mut sid = String::new();
+    for _ in 0..300 {
+        if let Some(session) = api.state.store.latest_foreman_session().await.unwrap() {
+            sid = session.id;
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    assert!(!sid.is_empty(), "这一轮应当先把用户那一句落库");
+
+    // **刷新那一屏**读到的就是这一趟：`turn_in_flight` 为真（这正是界面重新接上一轮的依据）。
+    // 轮询而不是单次断言（与下面落地那次对称）：用户行先落库、「在跑」的登记在随后起来的
+    // 那一轮里——两步之间有窗口，全量测试满载时单次断言会输掉这场竞态（单独跑 3/3 绿、
+    // `make check-test` 整跑里红过一次）。
+    let mut body = serde_json::Value::Null;
+    let mut running = false;
+    for _ in 0..300 {
+        let (status, b) = get(&api, &format!("/foreman/session?session={sid}")).await;
+        assert_eq!(status, StatusCode::OK, "{b}");
+        body = b;
+        if body["turn_in_flight"].as_bool() == Some(true) {
+            running = true;
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    assert!(
+        running,
+        "一轮正在跑时，刷新页面读到的必须是「在跑」：{body}"
+    );
+    // 这一轮还没答完，故台账里只有用户那一句——界面手里那段流式文字不在台账里，
+    // 「在跑」这个读数正是它唯一的依据。
+    assert_eq!(body["messages"].as_array().unwrap().len(), 1);
+
+    // 放行：这一轮答完。**回话落库之后的读数必须翻回 false**——否则界面会永远以为它在说话，
+    // 那比没有这个读数更坏（假读数）。
+    release.notify_one();
+    let _ = sending.await;
+    let mut landed = false;
+    for _ in 0..300 {
+        let (_, body) = get(&api, &format!("/foreman/session?session={sid}")).await;
+        if body["turn_in_flight"].as_bool() == Some(false) {
+            landed = true;
+            assert_eq!(
+                body["messages"].as_array().unwrap().len(),
+                2,
+                "答完之后台账里是两句（人一句、值班长一句）：{body}"
+            );
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    assert!(landed, "跑完即摘：这一格必须翻回 false");
+}
+
 /// 班次四件事（决策 204①）：新建 / 切换 / 重命名 / 归档，全走端点。
 ///
 /// 一起测是刻意的——它们是同一条链（新建出来 → 列表里看到 → 改名 → 归档后从列表消失），
@@ -4744,7 +4855,10 @@ async fn foreman_sessions_can_be_created_renamed_and_archived() {
     assert_eq!(body["session"]["title"], "新班次");
     assert!(body["session"]["archived_at"].is_null());
 
-    // 再开一个，列表按最近活动倒序（新的在前）。
+    // 再开一个，列表按最近活动倒序（新的在前）。**先把钟拨一下**：测试里的钟是冻住的，
+    // 不拨则两行 `last_active_at` 相等，排序落进 `id DESC` 的并列兜底——而 ULID 同毫秒的
+    // 随机尾缀决定先后，全量并跑（两次新建挤进同一毫秒）时这条断言会翻面（实测红过一次）。
+    api.clock.advance_secs(60);
     let (_, body) = post(&api, "/foreman/sessions", json!({"title": "第二班"})).await;
     let second = body["session"]["id"].as_str().unwrap().to_string();
     assert_eq!(body["session"]["title"], "第二班");
@@ -5784,6 +5898,348 @@ async fn the_door_opening_actions_have_no_tool_at_all() {
     );
 }
 
+// ───────── 直接动作面：service / repair 两族的执行补测（决策 255⑦）─────────
+//
+// 这两族此前在 app 与 core 两侧**都零测试**（全仓 grep 确认）：分派是个私有 `match`、
+// 拿 `&AppState`，只能经真端点打到真仓 / 真 store 上才够得着。搬迁进
+// `pipeline::foreman_actions` 之后，报文逐字没变，变的是「现在有人钉着它」。
+
+/// 在任意目录里跑一条 git（身份照 testkit `run_raw` 的同一口径）。
+///
+/// 修复 worktree 不在 `Repo` 的 path 下，故 testkit 的 `Repo::git` 够不着它。
+fn git_at(dir: &std::path::Path, args: &[&str]) -> String {
+    let out = std::process::Command::new("git")
+        .args(["-c", "user.name=fixture"])
+        .args(["-c", "user.email=fixture@localhost"])
+        .args(args)
+        .current_dir(dir)
+        .output()
+        .expect("git 可执行");
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "git {} 失败：{}",
+        args.join(" "),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    String::from_utf8_lossy(&out.stdout).to_string()
+}
+
+/// 落一条**修复**提议（`kind = Repair`、带现场载荷）。
+///
+/// `seed_proposal` 硬编码 `kind: ApiCall` / `payload: None`，而 repair 那条路第一关
+/// 就是「缺载荷 → 拒」——repair 用不了它，故要一个带载荷的兄弟助手。
+async fn seed_repair_proposal(
+    api: &Api,
+    session_id: &str,
+    project_id: &str,
+    outcome: &agentpipeline_core::pipeline::repair::RepairOutcome,
+) -> String {
+    api.state
+        .store
+        .create_foreman_proposal(NewForemanProposal {
+            kind: agentpipeline_core::storage::proposals::ForemanProposalKind::Repair,
+            payload: Some(serde_json::to_value(outcome).unwrap()),
+            session_id: session_id.to_string(),
+            tool: "repair".to_string(),
+            args: json!({"project_id": project_id}),
+            summary: "（用例）repair".to_string(),
+            situation: None,
+        })
+        .await
+        .unwrap()
+        .id
+}
+
+/// `service` 族按下 → **三步恢复序列真的跑了**（决策 255①⑦）。
+///
+/// 三步各断一件：owner 被清、`running` 任务归队 `queued`、项目级 run 标终态。
+/// 再钉两件事：动作名不对 → 400 且**提议不消耗**；成功报文要说清
+/// **本进程没有自重启能力**（那是这条链的立身之本，票 09 的偏离记账）。
+#[tokio::test]
+async fn the_service_family_runs_the_three_step_recovery_sequence() {
+    use agentpipeline_core::storage::observability::NewProjectRun;
+    use agentpipeline_core::types::Node;
+
+    let api = api_with_foreman(FakeAgent::new(Script::new())).await;
+    let project_id = seed(&api, "t1").await;
+    let store = &api.state.store;
+
+    // 制造「重启前的残留」：一个 running 且有主的任务 + 一条在跑的项目级 run。
+    store
+        .set_task_status("t1", TaskStatus::Running)
+        .await
+        .unwrap();
+    assert!(store.try_claim_executor("t1", "owner-1").await.unwrap());
+    let project_run = store
+        .insert_project_run(&NewProjectRun {
+            project_id: project_id.clone(),
+            stage: Stage::Init,
+            node: Node::Execute,
+            attempt: 1,
+            agent_type: agentpipeline_core::pipeline::pseudo::PseudoStage::ProjectAnalysis
+                .agent_type()
+                .to_string(),
+        })
+        .await
+        .unwrap();
+
+    let sid = fresh_session(&api).await;
+
+    // ① 动作名不对 → 400（`Validation` → 400 的映射），且提议**不消耗**。
+    let bad = seed_proposal(&api, &sid, "service", json!({"action": "nope"})).await;
+    let (status, body) = post(
+        &api,
+        &format!("/foreman/proposals/{bad}/execute"),
+        json!({}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    assert!(
+        body["error"].as_str().unwrap().contains("没有这个动作"),
+        "{body}"
+    );
+    let (_, body) = get(&api, &format!("/foreman/session?session={sid}")).await;
+    assert_eq!(
+        body["proposals"][0]["status"], "pending",
+        "参数不对不消耗提议：{body}"
+    );
+
+    // ② 三步全跑。
+    let pid = seed_proposal(&api, &sid, "service", json!({"action": "restart"})).await;
+    let (status, body) = post(
+        &api,
+        &format!("/foreman/proposals/{pid}/execute"),
+        json!({}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["proposal"]["status"], "executed", "{body}");
+    let message = body["message"]["content"].as_str().unwrap();
+    assert!(
+        message.contains("本进程没有自重启能力"),
+        "如实说清没有自重启能力（票 09 的偏离记账）：{message}"
+    );
+    assert!(message.contains("清理残留执行者 1 个"), "{message}");
+
+    // 第一步：owner 被清。第二步：running 归队 queued。
+    let task = store.get_task("t1").await.unwrap();
+    assert!(
+        task.executor_owner.as_deref().unwrap_or("").is_empty(),
+        "第一步清 owner：{:?}",
+        task.executor_owner
+    );
+    assert_eq!(task.status, TaskStatus::Queued, "第二步归队");
+
+    // 第三步：项目级 run 标终态。
+    let runs = store.list_project_runs(&project_id).await.unwrap();
+    assert_eq!(runs.len(), 1, "{project_run}");
+    assert!(
+        matches!(
+            runs[0].status,
+            agentpipeline_core::types::NodeStatus::Timeout
+        ),
+        "第三步标终态：{:?}",
+        runs[0].status
+    );
+}
+
+/// 修复提议的干净路径：rebase 干净 → **真的合入** + worktree / 分支回收（决策 255⑦）。
+///
+/// 这是提议执行里唯一**真的动 git 仓库**的一族，也是唯一「执行 = 合入一个分支」
+/// 而不是「一次工具调用」的那一族（决策 212①）——搬迁前它零测试。
+#[tokio::test]
+async fn a_repair_proposal_merges_the_branch_and_recycles_the_worktree() {
+    use agentpipeline_core::pipeline::repair::{new_repair_id, start_repair, RepairOutcome};
+
+    let api = api_with_foreman(FakeAgent::new(Script::new())).await;
+    let project_id = "proj-repair-clean".to_string();
+    seed_project(
+        &api.state.store,
+        &project_id,
+        "示例",
+        api._repo.path(),
+        "main",
+    )
+    .await
+    .unwrap();
+    let sid = fresh_session(&api).await;
+
+    // 拉起修复现场（分支从 main 分出、worktree 在家下），在 worktree 里改一行并提交。
+    let repair_id = new_repair_id();
+    let session = start_repair(&api.state.home, api._repo.path(), "main", &repair_id, &sid)
+        .await
+        .unwrap();
+    std::fs::write(
+        session.worktree.join("repaired.rs"),
+        "pub fn repaired() -> i32 { 42 }\n",
+    )
+    .unwrap();
+    git_at(&session.worktree, &["add", "-A"]);
+    git_at(&session.worktree, &["commit", "-m", "[repair] 修一条"]);
+
+    let outcome = RepairOutcome {
+        repair_id: repair_id.clone(),
+        worktree_path: session.worktree.display().to_string(),
+        branch: session.branch.clone(),
+        base_ref: session.base_ref.clone(),
+        base_commit: api._repo.head("main"),
+        gate_passed: true,
+        gate: vec![],
+        commit: None,
+        diff: None,
+        diff_stat: None,
+    };
+    let pid = seed_repair_proposal(&api, &sid, &project_id, &outcome).await;
+
+    let (status, body) = post(
+        &api,
+        &format!("/foreman/proposals/{pid}/execute"),
+        json!({}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["proposal"]["status"], "executed", "{body}");
+    let message = body["message"]["content"].as_str().unwrap();
+    assert!(message.contains("已合入"), "{message}");
+    assert!(
+        message.contains("回收修复 worktree（分支已删）"),
+        "{message}"
+    );
+
+    // 合入真的发生了：改动进 main、worktree 删掉、分支删掉（三样缺一不可——
+    // 「说了已合入」而仓库没动，正是没有测试时最可能悄悄发生的那种漂移）。
+    assert!(
+        api._repo.path().join("repaired.rs").exists(),
+        "改动要落进默认分支的工作区"
+    );
+    assert!(
+        !session.worktree.exists(),
+        "worktree 应当被回收：{}",
+        session.worktree.display()
+    );
+    let verify = std::process::Command::new("git")
+        .args([
+            "-C",
+            &api._repo.path().display().to_string(),
+            "rev-parse",
+            "--verify",
+            &format!("refs/heads/{}", session.branch),
+        ])
+        .output()
+        .expect("git 可执行");
+    assert_ne!(
+        verify.status.code(),
+        Some(0),
+        "分支应已删：{}",
+        String::from_utf8_lossy(&verify.stderr)
+    );
+}
+
+/// 修复提议的冲突路径：基准前进了 → **拒执**并列出冲突文件，且**没有合入**（决策 212①）。
+///
+/// 「指纹换义」就落在这里：普通提议的拒执判据是「任务状态变了吗」，而修复执行的是
+/// 「合入一个分支」——会变的是**基准**。搬迁前这条路径从未被执行过。
+#[tokio::test]
+async fn a_repair_proposal_whose_base_moved_conflicts_and_is_refused() {
+    use agentpipeline_core::pipeline::repair::{new_repair_id, start_repair, RepairOutcome};
+
+    let api = api_with_foreman(FakeAgent::new(Script::new())).await;
+    let project_id = "proj-repair-conflict".to_string();
+    seed_project(
+        &api.state.store,
+        &project_id,
+        "示例",
+        api._repo.path(),
+        "main",
+    )
+    .await
+    .unwrap();
+    let sid = fresh_session(&api).await;
+
+    // 修复现场：worktree 里改 `src/lib.rs` 第一行。
+    let repair_id = new_repair_id();
+    let session = start_repair(&api.state.home, api._repo.path(), "main", &repair_id, &sid)
+        .await
+        .unwrap();
+    std::fs::write(
+        session.worktree.join("src/lib.rs"),
+        "pub fn add(a: i32, b: i32) -> i32 { a - b }\n",
+    )
+    .unwrap();
+    git_at(&session.worktree, &["add", "-A"]);
+    git_at(&session.worktree, &["commit", "-m", "[repair] 侧改同一行"]);
+
+    // 基准前进：main 也改同一行（不同内容）→ rebase 必冲突。
+    api._repo.write(
+        "src/lib.rs",
+        "pub fn add(a: i32, b: i32) -> i32 { a * b }\n",
+    );
+    api._repo.commit_all("main 侧改同一行");
+
+    let outcome = RepairOutcome {
+        repair_id: repair_id.clone(),
+        worktree_path: session.worktree.display().to_string(),
+        branch: session.branch.clone(),
+        base_ref: session.base_ref.clone(),
+        base_commit: api._repo.head("main"),
+        gate_passed: true,
+        gate: vec![],
+        commit: None,
+        diff: None,
+        diff_stat: None,
+    };
+    let pid = seed_repair_proposal(&api, &sid, &project_id, &outcome).await;
+
+    let (status, body) = post(
+        &api,
+        &format!("/foreman/proposals/{pid}/execute"),
+        json!({}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CONFLICT, "{body}");
+    let error = body["error"].as_str().unwrap();
+    assert!(error.contains("没有合入"), "要说清没合入：{error}");
+    assert!(
+        error.contains("src/lib.rs"),
+        "要把冲突文件列给你（那是你要动手的地方）：{error}"
+    );
+
+    // 拒执不是合入的另一种说法：main 上是 main 自己那版，worktree 与分支都还在。
+    assert!(
+        api._repo.path().join("src/lib.rs").exists(),
+        "默认分支的工作区还在"
+    );
+    let main_content = std::fs::read_to_string(api._repo.path().join("src/lib.rs")).unwrap();
+    assert!(
+        main_content.contains("a * b"),
+        "合入没发生（main 侧是 `*` 不是 `-`）：{main_content}"
+    );
+    assert!(
+        session.worktree.exists(),
+        "拒执不动现场——worktree 是要给人看的"
+    );
+    let verify = std::process::Command::new("git")
+        .args([
+            "-C",
+            &api._repo.path().display().to_string(),
+            "rev-parse",
+            "--verify",
+            &format!("refs/heads/{}", session.branch),
+        ])
+        .output()
+        .expect("git 可执行");
+    assert_eq!(
+        verify.status.code(),
+        Some(0),
+        "分支保留——它是唯一的证据：{}",
+        String::from_utf8_lossy(&verify.stderr)
+    );
+    // 提议不消耗：人可以先解决冲突再按一次。
+    let (_, body) = get(&api, &format!("/foreman/session?session={sid}")).await;
+    assert_eq!(body["proposals"][0]["status"], "pending", "{body}");
+}
+
 /// `GET /foreman/tools`（决策 247⑤）：**全量 21 条、与清单同序、label 均非空、只出两个字段**。
 ///
 /// 回执标的是**历史**上的工具调用，故条目数 == 清单长度本身就是「不按档位滤」的形状
@@ -5857,6 +6313,151 @@ async fn the_session_wire_carries_the_parsed_attribution() {
     // 非助理轮不解析（那两类里不会有结构块）。
     let user = messages.iter().find(|m| m["role"] == "user").unwrap();
     assert!(user["attribution"].is_null());
+}
+
+/// 「这一行是什么」由后端判定后随消息下发（决策 252）。
+///
+/// 为什么断言打在线上形态：界面此前靠**正文前缀**（`【值守播报】` / `【没跑起来】`）自己判断
+/// 一行是值班长的话、操作台记的一轮、还是没跑起来的那一轮，而那两个前缀是后端拼进正文的
+/// ——常量漂了是症状，「正文即接口」是病。这条契约把判定点钉在后端一处，界面只读字段。
+///
+/// **`content` 里的前缀仍在**：它给模型看（值守简报模板），也是人翻台账时认得出「这条是
+/// 系统写的」的标记。本票只改**前端怎么认**，不改**后端写什么**——故这里同时断言前缀还在，
+/// 免得后来者顺手把它当残留删掉。
+///
+/// 三段各自独立的班次（基表一段、值守失败一段、助理轮带前缀一段）：
+/// `kind` 与 `proactive` 的分工只有在「值守轮失败了」那一格上才看得全（今天它落成
+/// `failed` 且 `proactive = false`），而「助理轮的正文前缀不参与判定」那一格防的是伪造面。
+/// 直接落库而不是走 `POST /foreman/messages`——本票验的是**线上形态**，不是写入路径。
+#[tokio::test]
+async fn the_session_wire_says_what_each_row_is() {
+    let api = api_with_foreman(FakeAgent::new(Script::new())).await;
+    let sid = fresh_session(&api).await;
+    let store = &api.state.store;
+
+    // 人的话（走存储层的用户行入口：它会顺手更新会话标题与 `last_active_at`）。
+    store
+        .append_foreman_user_message(&sid, "现在能做什么？")
+        .await
+        .unwrap();
+    // 操作台自己记的一轮（决策 207）：提议执行的结果。
+    store
+        .append_foreman_message(NewForemanMessage::system(
+            &sid,
+            "【操作台】提议已执行：write_file",
+        ))
+        .await
+        .unwrap();
+    // 没跑起来的那一轮（决策 211④）：`system` 行 + 失败前缀。
+    store
+        .append_foreman_message(NewForemanMessage::system(
+            &sid,
+            format!("{FOREMAN_FAILED_TURN_MARK}这一轮没跑起来（llm_auth）：密钥不对"),
+        ))
+        .await
+        .unwrap();
+    // 值班长的回话（决策 204）：普通的一轮。
+    store
+        .append_foreman_message(NewForemanMessage::assistant(&sid, "先建一个项目。"))
+        .await
+        .unwrap();
+    // 值守播报（决策 209④）：助理轮 + 播报前缀——`proactive` 只在这一行上是 `true`。
+    store
+        .append_foreman_message(NewForemanMessage::assistant(
+            &sid,
+            format!("{FOREMAN_WATCH_MARK}三条任务在跑，两条已完工。"),
+        ))
+        .await
+        .unwrap();
+
+    let (status, body) = get(&api, &format!("/foreman/session?session={sid}")).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let messages = body["messages"].as_array().unwrap();
+    assert_eq!(messages.len(), 5);
+
+    // 四个场景逐行：`kind` 取值正确，`proactive` 只在播报那行为 `true`。
+    let kinds: Vec<&str> = messages
+        .iter()
+        .map(|m| m["kind"].as_str().unwrap())
+        .collect();
+    assert_eq!(kinds, vec!["mine", "console", "failed", "fm", "fm"]);
+    let proactive: Vec<bool> = messages
+        .iter()
+        .map(|m| m["proactive"].as_bool().unwrap())
+        .collect();
+    assert_eq!(proactive, vec![false, false, false, false, true]);
+
+    // 前缀不删：它给模型看、也给人翻台账时认人看（本票只改前端怎么认）。
+    assert!(
+        messages[2]["content"]
+            .as_str()
+            .unwrap()
+            .starts_with(FOREMAN_FAILED_TURN_MARK),
+        "正文里的失败前缀不该被删掉：{}",
+        messages[2]["content"]
+    );
+    assert!(
+        messages[4]["content"]
+            .as_str()
+            .unwrap()
+            .starts_with(FOREMAN_WATCH_MARK),
+        "正文里的播报前缀不该被删掉：{}",
+        messages[4]["content"]
+    );
+
+    // 正交的那一格（决策 252③）：**值守轮失败**——「自发的轮」与「失败了」同时成立。
+    // 它今天落成一条 `system` + 失败前缀的行：`kind = "failed"`、`proactive = false`，
+    // 与一条普通失败轮在形状上一模一样。这正是两个字段分开承载的理由：界面此后有位置
+    // 放「这一轮是它自己醒来说的、而且没跑起来」，且不必再动线上形状。
+    //
+    // 注意 `assistant` 行**不**因正文前缀被判成 `failed`：失败账一律由后端以 `system` 写
+    // （`record_failed_turn` / `record_interrupted_turn`），而助理轮的正文来自模型——
+    // 让模型的措辞能把自己那一行染成红色失败轮是伪造面，故助理轮一律 `fm`。
+    let watcher = fresh_session(&api).await;
+    store
+        .append_foreman_message(NewForemanMessage::assistant(
+            &watcher,
+            format!("{FOREMAN_WATCH_MARK}三条任务在跑，两条已完工。"),
+        ))
+        .await
+        .unwrap();
+    // 紧接着值守轮自己失败了（后端写 `system` 行）。
+    store
+        .append_foreman_message(NewForemanMessage::system(
+            &watcher,
+            format!("{FOREMAN_FAILED_TURN_MARK}这一轮没跑起来（llm_timeout）：超时"),
+        ))
+        .await
+        .unwrap();
+    let (status, body) = get(&api, &format!("/foreman/session?session={watcher}")).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let rows = body["messages"].as_array().unwrap();
+    assert_eq!(rows.len(), 2);
+    // 播报那一轮：`fm` + `proactive`。
+    assert_eq!(rows[0]["kind"], "fm");
+    assert_eq!(rows[0]["proactive"], true);
+    // 它失败的那一轮：`failed`，而「它本来是自发的」这件事今天在形状上仍无处安放
+    // （写入路径给的是 `system`）——两个字段只是**为它留了位**：决策 252③ 说的是
+    // 「分开写，将来要显示时不必再改线」，故今天照实际值断言即可。
+    assert_eq!(rows[1]["kind"], "failed");
+    assert_eq!(rows[1]["proactive"], false);
+
+    // 助理轮的正文前缀不参与判定（防伪造）：模型自己写这个前缀，那一行仍是「值班长的话」。
+    let forged = fresh_session(&api).await;
+    store
+        .append_foreman_message(NewForemanMessage::assistant(
+            &forged,
+            format!("{FOREMAN_FAILED_TURN_MARK}这一轮没跑起来（llm_auth）：密钥不对"),
+        ))
+        .await
+        .unwrap();
+    let (status, body) = get(&api, &format!("/foreman/session?session={forged}")).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let rows = body["messages"].as_array().unwrap();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0]["role"], "assistant");
+    assert_eq!(rows[0]["kind"], "fm", "助理轮不因正文前缀被判成失败轮");
+    assert_eq!(rows[0]["proactive"], false);
 }
 
 /// `config set` 会抹掉 `node_overrides` 就拒，不静默抹掉（决策 236）。
@@ -6052,149 +6653,4 @@ async fn max_rounds_accepts_only_positive_integers() {
         .unwrap()
         .unwrap();
     assert_eq!(cleared.max_rounds, None, "留空即清成默认（缺省 300）");
-}
-
-/// 「这一行是什么」由后端判定后随消息下发（决策 252）。
-///
-/// 为什么断言打在线上形态：界面此前靠**正文前缀**（`【值守播报】` / `【没跑起来】`）自己判断
-/// 一行是值班长的话、操作台记的一轮、还是没跑起来的那一轮，而那两个前缀是后端拼进正文的
-/// ——常量漂了是症状，「正文即接口」是病。这条契约把判定点钉在后端一处，界面只读字段。
-///
-/// **`content` 里的前缀仍在**：它给模型看（值守简报模板），也是人翻台账时认得出「这条是
-/// 系统写的」的标记。本票只改**前端怎么认**，不改**后端写什么**——故这里同时断言前缀还在，
-/// 免得后来者顺手把它当残留删掉。
-///
-/// 三段各自独立的班次（基表一段、值守失败一段、助理轮带前缀一段）：
-/// `kind` 与 `proactive` 的分工只有在「值守轮失败了」那一格上才看得全（今天它落成
-/// `failed` 且 `proactive = false`），而「助理轮的正文前缀不参与判定」那一格防的是伪造面。
-/// 直接落库而不是走 `POST /foreman/messages`——本票验的是**线上形态**，不是写入路径。
-#[tokio::test]
-async fn the_session_wire_says_what_each_row_is() {
-    let api = api_with_foreman(FakeAgent::new(Script::new())).await;
-    let sid = fresh_session(&api).await;
-    let store = &api.state.store;
-
-    // 人的话（走存储层的用户行入口：它会顺手更新会话标题与 `last_active_at`）。
-    store
-        .append_foreman_user_message(&sid, "现在能做什么？")
-        .await
-        .unwrap();
-    // 操作台自己记的一轮（决策 207）：提议执行的结果。
-    store
-        .append_foreman_message(NewForemanMessage::system(
-            &sid,
-            "【操作台】提议已执行：write_file",
-        ))
-        .await
-        .unwrap();
-    // 没跑起来的那一轮（决策 211④）：`system` 行 + 失败前缀。
-    store
-        .append_foreman_message(NewForemanMessage::system(
-            &sid,
-            format!("{FOREMAN_FAILED_TURN_MARK}这一轮没跑起来（llm_auth）：密钥不对"),
-        ))
-        .await
-        .unwrap();
-    // 值班长的回话（决策 204）：普通的一轮。
-    store
-        .append_foreman_message(NewForemanMessage::assistant(&sid, "先建一个项目。"))
-        .await
-        .unwrap();
-    // 值守播报（决策 209④）：助理轮 + 播报前缀——`proactive` 只在这一行上是 `true`。
-    store
-        .append_foreman_message(NewForemanMessage::assistant(
-            &sid,
-            format!("{FOREMAN_WATCH_MARK}三条任务在跑，两条已完工。"),
-        ))
-        .await
-        .unwrap();
-
-    let (status, body) = get(&api, &format!("/foreman/session?session={sid}")).await;
-    assert_eq!(status, StatusCode::OK, "{body}");
-    let messages = body["messages"].as_array().unwrap();
-    assert_eq!(messages.len(), 5);
-
-    // 四个场景逐行：`kind` 取值正确，`proactive` 只在播报那行为 `true`。
-    let kinds: Vec<&str> = messages
-        .iter()
-        .map(|m| m["kind"].as_str().unwrap())
-        .collect();
-    assert_eq!(kinds, vec!["mine", "console", "failed", "fm", "fm"]);
-    let proactive: Vec<bool> = messages
-        .iter()
-        .map(|m| m["proactive"].as_bool().unwrap())
-        .collect();
-    assert_eq!(proactive, vec![false, false, false, false, true]);
-
-    // 前缀不删：它给模型看、也给人翻台账时认人看（本票只改前端怎么认）。
-    assert!(
-        messages[2]["content"]
-            .as_str()
-            .unwrap()
-            .starts_with(FOREMAN_FAILED_TURN_MARK),
-        "正文里的失败前缀不该被删掉：{}",
-        messages[2]["content"]
-    );
-    assert!(
-        messages[4]["content"]
-            .as_str()
-            .unwrap()
-            .starts_with(FOREMAN_WATCH_MARK),
-        "正文里的播报前缀不该被删掉：{}",
-        messages[4]["content"]
-    );
-
-    // 正交的那一格（决策 252③）：**值守轮失败**——「自发的轮」与「失败了」同时成立。
-    // 它今天落成一条 `system` + 失败前缀的行：`kind = "failed"`、`proactive = false`，
-    // 与一条普通失败轮在形状上一模一样。这正是两个字段分开承载的理由：界面此后有位置
-    // 放「这一轮是它自己醒来说的、而且没跑起来」，且不必再动线上形状。
-    //
-    // 注意 `assistant` 行**不**因正文前缀被判成 `failed`：失败账一律由后端以 `system` 写
-    // （`record_failed_turn` / `record_interrupted_turn`），而助理轮的正文来自模型——
-    // 让模型的措辞能把自己那一行染成红色失败轮是伪造面，故助理轮一律 `fm`。
-    let watcher = fresh_session(&api).await;
-    store
-        .append_foreman_message(NewForemanMessage::assistant(
-            &watcher,
-            format!("{FOREMAN_WATCH_MARK}三条任务在跑，两条已完工。"),
-        ))
-        .await
-        .unwrap();
-    // 紧接着值守轮自己失败了（后端写 `system` 行）。
-    store
-        .append_foreman_message(NewForemanMessage::system(
-            &watcher,
-            format!("{FOREMAN_FAILED_TURN_MARK}这一轮没跑起来（llm_timeout）：超时"),
-        ))
-        .await
-        .unwrap();
-    let (status, body) = get(&api, &format!("/foreman/session?session={watcher}")).await;
-    assert_eq!(status, StatusCode::OK, "{body}");
-    let rows = body["messages"].as_array().unwrap();
-    assert_eq!(rows.len(), 2);
-    // 播报那一轮：`fm` + `proactive`。
-    assert_eq!(rows[0]["kind"], "fm");
-    assert_eq!(rows[0]["proactive"], true);
-    // 它失败的那一轮：`failed`，而「它本来是自发的」这件事今天在形状上仍无处安放
-    // （写入路径给的是 `system`）——两个字段只是**为它留了位**：决策 252③ 说的是
-    // 「分开写，将来要显示时不必再改线」，故今天照实际值断言即可。
-    assert_eq!(rows[1]["kind"], "failed");
-    assert_eq!(rows[1]["proactive"], false);
-
-    // 助理轮的正文前缀不参与判定（防伪造）：模型自己写这个前缀，那一行仍是「值班长的话」。
-    let forged = fresh_session(&api).await;
-    store
-        .append_foreman_message(NewForemanMessage::assistant(
-            &forged,
-            format!("{FOREMAN_FAILED_TURN_MARK}这一轮没跑起来（llm_auth）：密钥不对"),
-        ))
-        .await
-        .unwrap();
-    let (status, body) = get(&api, &format!("/foreman/session?session={forged}")).await;
-    assert_eq!(status, StatusCode::OK, "{body}");
-    let rows = body["messages"].as_array().unwrap();
-    assert_eq!(rows.len(), 1);
-    assert_eq!(rows[0]["role"], "assistant");
-    assert_eq!(rows[0]["kind"], "fm", "助理轮不因正文前缀被判成失败轮");
-    assert_eq!(rows[0]["proactive"], false);
 }

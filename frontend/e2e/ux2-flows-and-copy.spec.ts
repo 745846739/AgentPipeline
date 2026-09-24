@@ -141,12 +141,15 @@ test.describe('UX2 ⑧ 新建任务 / 表单校验 / 文案（票 10 / 11 / 15�
 
   test('④ 对讲台的配对提示里没有字面 `**`（未配对态）', async ({ page }) => {
     const bundle = watchBundle(page);
-    // 造未配对态：读会话的那一读被拒（403 是「这台设备还没配对」的那一档）
+    // 造未配对态：读会话的那一读被拒（403 是「这台设备还没配对」的那一档）。
+    // **必须带 `kind`**：判据按字段走（票 04 / 决策 259，`isPairingRequired`），只有报文
+    // 没有 `kind` 的话界面认不出这是配对缺失，那条指引就不会出现——这一栏是生产
+    // `stream.rs::pairing_rejected()` 真下的形状，mock 照它写。
     await page.route('**/foreman/session*', (route) =>
       route.fulfill({
         status: 403,
         contentType: 'application/json',
-        body: JSON.stringify({ error: '这台设备还没配对' }),
+        body: JSON.stringify({ error: '这台设备还没配对', kind: 'pairing_required' }),
       }),
     );
 

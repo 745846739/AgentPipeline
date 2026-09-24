@@ -16,8 +16,8 @@ use agentpipeline_core::clock::Clock;
 use agentpipeline_core::config::Settings;
 use agentpipeline_core::metrics;
 use agentpipeline_core::pipeline::foreman::{
-    build_briefing, parse_attribution, situation_fingerprint, trim_history, Attribution,
-    AttributionKind, ForemanRunner, FOREMAN_AGENT_TYPE, FOREMAN_ATTRIBUTION_MARK,
+    build_briefing, foreman_turn_in_flight, parse_attribution, situation_fingerprint, trim_history,
+    Attribution, AttributionKind, ForemanRunner, FOREMAN_AGENT_TYPE, FOREMAN_ATTRIBUTION_MARK,
     FOREMAN_FAILED_TURN_MARK, FOREMAN_MAX_ROUNDS, FOREMAN_PARTIAL_TURN_MARK, FOREMAN_PERSONA,
     FOREMAN_STAGE_KEY, FOREMAN_TOOL_SPECS, FOREMAN_WATCH_MARK, OPERATION_LOG_MARK,
 };
@@ -4659,5 +4659,116 @@ async fn foreman_thinking_accumulates_across_the_calls_of_one_turn() {
         thinking.matches("再核一遍。").count(),
         2,
         "两次模型调用各想了一段，两段都该在：{thinking}"
+    );
+}
+
+/// 刷新之后还能接着看这一轮（决策 260）：**「这一班此刻有没有一轮在跑」是一个可读的读数**。
+///
+/// 起因是一条实测：值班长正在答话时刷新对讲台，那一轮整段看不见——在途轮的现场
+/// （乐观轮 / 流式文本）此前只住在界面那侧，刷新即丢，于是增量到达时无从判断「这一段字属于
+/// 谁」，闸门一律不接。补的读数只有一处：`say` 与 `watch` 共用的那个漏斗（`respond`）在
+/// 开工时登记、返回时摘掉，`foreman_turn_in_flight` 把它读出来。
+///
+/// 这一条钉三件事：**在跑时为真**、**跑完为假**、**失败也一样为假**（漏摘的话界面会永远
+/// 以为它在说话——比没有这个读数更坏：那是假读数）。
+#[tokio::test]
+async fn a_running_turn_is_readable_and_drops_the_moment_it_ends() {
+    /// 停在模型调用里、直到放行标志翻真才回话的模型。
+    ///
+    /// **用轮询而不是 `Notify`**：`notify_waiters()` 只唤醒**当时已登记**的等待者，
+    /// 「放行信号比等待者先到」那一瞬间会丢信号，用例随之挂死（不是变红，是挂住——
+    /// 那种失败最难查）。轮询没有这一格：放行标志是**状态**，晚到的观察者照样看得见。
+    struct Gated {
+        release: Arc<std::sync::atomic::AtomicBool>,
+        fail: bool,
+    }
+    impl LlmClient for Gated {
+        fn complete(
+            &self,
+            _request: LlmRequest,
+        ) -> futures::future::BoxFuture<
+            'static,
+            agentpipeline_core::Result<agentpipeline_core::agent::client::AgentResponse>,
+        > {
+            let release = self.release.clone();
+            let fail = self.fail;
+            Box::pin(async move {
+                while !release.load(std::sync::atomic::Ordering::SeqCst) {
+                    tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+                }
+                if fail {
+                    return Err(Error::Llm("模型没配".into()));
+                }
+                Ok(AgentResponse {
+                    content: Some("答完了。".into()),
+                    tool_calls: Vec::new(),
+                    prompt_tokens: 3,
+                    completion_tokens: 5,
+                    ..Default::default()
+                })
+            })
+        }
+    }
+
+    let h = Harness::empty().await;
+    let release = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let sid = h.session().await;
+    assert!(
+        !foreman_turn_in_flight(&sid),
+        "什么都没发时不该有「在跑」的读数"
+    );
+
+    // 开一轮并**停在模型调用里**：此刻它在跑。
+    let turn = tokio::spawn({
+        let runner = h.runner_with_llm(Arc::new(Gated {
+            release: release.clone(),
+            fail: false,
+        }));
+        let sid = sid.clone();
+        async move { runner.say(Some(&sid), "盯着 t1").await }
+    });
+    // 等登记出现：这一格既等到了「在跑」，也顺带确定这一轮已经开跑。
+    for _ in 0..400 {
+        if foreman_turn_in_flight(&sid) {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    assert!(
+        foreman_turn_in_flight(&sid),
+        "一轮正在跑时这个读数必须为真——界面刷新后正是靠它重新接上"
+    );
+    assert!(
+        !foreman_turn_in_flight("别的班次"),
+        "它说的是**那一班**：别的班次不该被连带说成在跑"
+    );
+
+    release.store(true, std::sync::atomic::Ordering::SeqCst);
+    turn.await.unwrap().unwrap();
+    assert!(
+        !foreman_turn_in_flight(&sid),
+        "跑完即摘：留着的话界面会永远以为它在说话（假读数比没有更坏）"
+    );
+
+    // 失败的那一轮同样摘掉——漏摘的代价与上面同一条（`say` 的失败外框那一趟）。
+    let sid2 = h.session().await;
+    let handle = tokio::spawn({
+        let failing = h.runner_with_llm(Arc::new(Gated {
+            release: release.clone(),
+            fail: true,
+        }));
+        let sid2 = sid2.clone();
+        async move { failing.say(Some(&sid2), "喂").await }
+    });
+    for _ in 0..400 {
+        if foreman_turn_in_flight(&sid2) {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    assert!(handle.await.unwrap().is_err(), "这个替身这一轮必然失败");
+    assert!(
+        !foreman_turn_in_flight(&sid2),
+        "失败的一轮也要摘掉登记（提前 `?` 退出那条路）"
     );
 }

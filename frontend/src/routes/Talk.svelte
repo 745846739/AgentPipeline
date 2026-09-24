@@ -13,6 +13,7 @@
     TaskListItem,
   } from '../api/types';
   import type { SpriteName } from '../theme/contract';
+  import { createMenuTrap } from '../lib/menuTrap';
   import {
     archiveForemanSession,
     createForemanSession,
@@ -28,10 +29,12 @@
   import {
     BOARD_COLUMNS,
     COLUMN_SPRITES,
+    aggregateStationState,
     formatDuration,
     formatTokens,
     pendingLabel,
     taskDuration,
+    type StationState,
   } from '../lib/pipeline';
   import {
     isFoldable,
@@ -72,6 +75,9 @@
     type SeenAt,
     type SessionMark,
   } from '../lib/talkSessions';
+  import { buildTurns, type TurnView } from '../lib/talkTurns';
+  import { isPairingRequired } from '../lib/sharePairing';
+  import { actionKey } from '../lib/actions';
   import { TaskStream, type StreamStatus } from '../realtime/connection';
   import {
     appendForemanDelta,
@@ -84,11 +90,13 @@
     failedLedgerRowIds,
     foreignIsReplying,
     forgetForeignActive,
+    isRequestTimeout,
     ledgerOwnsTheFailure,
+    maxLedgerId,
     noteForeignDelta,
     pruneForeignActive,
     settleForemanStream,
-    type ForemanLiveTool,
+    turnLanded,
     type ForemanStreamState,
     type ForeignActive,
   } from '../realtime/foreman';
@@ -163,6 +171,8 @@
 
   let loading = $state(true);
   let loadError = $state<string | null>(null);
+  /** `loadError` 是不是**配对缺失**（按后端给的 `kind` 判，决策 259）——挂不挂配对入口读它，不读报文字样。 */
+  let loadErrorPairing = $state(false);
   /** 会话台账（时间线的权威内容；每次回话后重取，不自攒一份账）。 */
   let session = $state<ForemanSession | null>(null);
 
@@ -190,7 +200,27 @@
   /** 正在发的那句话（台账里还没有它的回话，故先以乐观轮显示）。 */
   let pendingText = $state<string | null>(null);
   let stream = $state<ForemanStreamState>(emptyForemanStream());
+  /**
+   * 当前这条流错误是不是**配对缺失**（按 `kind` 判，决策 259）。
+   *
+   * 与 `stream.error` 在同一处 catch 里设置、恒同步：错误降级成字符串之后 `kind` 就丢了，
+   * 判据必须趁 `ApiError` 还在手时做掉。
+   */
+  let sendPairingNeeded = $state(false);
   let streamStatus = $state<StreamStatus>('idle');
+  /**
+   * **刷新之后重新接上的一轮**（决策 260）：服务端说这一班此刻有一轮在跑，而本机没有
+   * 它那一趟 POST（它随旧页面一起走了）。
+   *
+   * 那些在途轮的现场本来全住在 `sending` 那一侧——刷新即丢，于是增量到达时无从判断
+   * 「这一段字属于谁」，闸门只好一律不接（`if (!sending) return`），时间线于是**看不到
+   * 实时回话**，只剩等它落地后重读台账。这一格就是补上的那份「此刻在跑」的事实：
+   * 它在场时，增量照旧接进 `stream`，界面照旧渲染那一轮（`lib/talkTurns.ts` 的 live 轮）。
+   *
+   * `null` = 没在跟；否则是**接手那一刻台账里最大的行 id**——那之后多一行就是这个回合
+   * 落了地（判据在 `realtime/foreman.ts::turnLanded`）。
+   */
+  let followingSince = $state<number | null>(null);
   /**
    * 本机刚发出去、还没落地的那一班（决策 220③ 的「正在回话」前半支）。
    *
@@ -300,204 +330,74 @@
   const foldable = $derived(isFoldable(stopIds, folded));
   const openStop = $derived(resolveOpenStop(stopIds, chosenStop, folded));
 
-  /** 8 工位的值班灯：按列聚合，与看板列头同一套词表与 sprite（`BOARD_COLUMNS`）。 */
+  /**
+   * 8 工位的值班灯：按列聚合，与看板列头**读同一个答案**（决策 251②）。
+   *
+   * 判断落在 `aggregateStationState` 一处——规格 `theme-6-pixel.md:628` 说值班板是
+   * 「同一份读数在看板 8 列与顶栏灯带上各有一份，**这是第三份**」，三份不许各推一遍：
+   * 此前这里是就地推的，且**少了失败分支**（全失败的工位画成空灯框，与看板的红灯打架）。
+   */
   const crew = $derived(
     BOARD_COLUMNS.map((col) => {
       const tasks = board.tasks.filter((t) => col.stages.includes(t.current_stage));
-      const pen = tasks.some((t) => t.status === 'pending');
-      const live = tasks.some((t) => t.status === 'running');
-      const don = tasks.length > 0 && tasks.every((t) => t.status === 'done');
       return {
         key: col.key,
         label: col.label,
-        sprite: COLUMN_SPRITES[col.key],
         count: tasks.length,
-        state: pen ? 'warn' : live ? 'run' : don ? 'done' : 'idle',
+        state: aggregateStationState(tasks.map((t) => t.status)),
       };
     }),
   );
 
-  interface TurnView {
-    key: string;
-    /**
-     * 发言者。`console` = **操作台记的一轮**（`role === 'system'`：提议的执行结果，决策 207）。
-     *
-     * 它必须与 `fm`（值班长的话）分开：那一行的内容是「提议已执行：…」，而**动手的是按下
-     * 那颗钮的人**——挂在值班长的名牌下等于替它认领了它没做的事。三种角色、两种说话的立场，
-     * 操作台是第三种。
-     */
-    kind: 'fm' | 'mine' | 'failed' | 'proposal' | 'console';
-    content: string;
-    /** 排进时间线的时刻（RFC3339）。三种在途轮（乐观轮 / 流式轮 / 失败轮）没有它，恒在末尾。 */
-    at: string;
-    /** 流式尾随方块光标（既有 `.streaming`，不新增动画位）。 */
-    streaming: boolean;
-    /** 断流/出错：这一轮只有已收到的部分。 */
-    partial: boolean;
-    /** 该轮工具痕迹（台账查读），空数组 = 这一轮没翻台账。 */
-    traces: ForemanTrace[];
-    /**
-     * 这一轮的**推理 / 思考**原文（决策 244）。`null` = 这一轮没产推理（多数模型如此）。
-     *
-     * 两种来源：在途轮来自实时流（`stream.thinking`），落地轮来自台账那一行的
-     * `thinking` 列——**同一份内容的两个时态**，界面只渲染它，不关心哪来的。
-     */
-    thinking: string | null;
-    /**
-     * 这一轮**正在发生**的工具调用（决策 244，只在途轮非空）。
-     *
-     * 与 `traces`（落库那一份）分工：`traces` 说「这一轮查过什么」（轮次结束后才有），
-     * 这里说「此刻在查什么」。落地之后这一栏就空了——那时 `traces` 已经把同一件事说完。
-     */
-    liveTools: ForemanLiveTool[];
-    briefing: ForemanBriefing | null;
-    /** 失败原因是「这台设备还没配对」（票 07）：只有它会挂出配对入口。 */
-    needsPairing: boolean;
-    /** 提议轮带的那条提议（其余轮为 `null`）。 */
-    proposal: ForemanProposal | null;
-    /**
-     * 这一轮是**主动播报**（值守轮自己醒来说的话，票 06）。
-     *
-     * 与「回话」分开渲染的理由不是好看：回话是有人问的，播报是它自己说的——
-     * 混成一种轮会让「它是不是在跟我说话」变成读不出来的一件事。
-     */
-    proactive: boolean;
-    /**
-     * 这一轮的归因类别词（决策 235①）：四类之一，由**后端解析**后随消息下来。
-     *
-     * `null` = 未定位或非助理轮——**不编一个假的类别**（决策 230 把「没有类别」也
-     * 当成一项判据）。界面只渲染这一个词，不显示稳定标识、也不显示原因（那是排查面）。
-     */
-    attribution: string | null;
+  /**
+   * 值班板的状态 → **灯**的变体（决策 251①③）。词表是契约的 `StationState`：
+   * 灯取 `--go` / `--pending` / `--done` / `--stop`，`idle` 不亮灯（空灯框）。
+   * `stop` 这一档（`x`）是本批新增的——改之前全失败的工位掉进 `idle`、画的是空灯框。
+   */
+  function crewLampClass(state: StationState): string {
+    switch (state) {
+      case 'warn':
+        return 'w';
+      case 'go':
+        return 'c';
+      case 'done':
+        return 'd';
+      case 'stop':
+        return 'x';
+      default:
+        return '';
+    }
   }
 
   /**
-   * 时间线归约（票 03 加一种轮：**提议轮**）。
-   *
-   * 提议与消息**按时刻合并排序**，不是把提议另起一段：提议是那一轮里发生的事
-   * （模型调用 → 落成提议 → 它把话说完），先后次序本身是信息。三段的时刻天然分得开——
-   * 值班经理的话先落库，提议在工具调用时落库，值班长的回话最后落库。
-   *
-   * 同刻的兜底次序按 `kind`：人的话 → 提议 → 值班长的话。时钟是同一台机器的，
-   * 同刻基本只出现在 `ManualClock` 的用例里，但排序必须是确定的（否则每次渲染都可能换位）。
+   * 值班板的状态 → **行**class（决策 251①③）。三档 + 一档留白，与改之前逐字同一份：
+   * 急停琥珀（`pen`）> 在跑提亮（`hot`，只把工位名提到 `--text-hi`）> 失败红
+   * （`fail`，本批新增的一档）> 其余保持次级灰。`idle` / `done` 不上行 class——
+   * 它们的语义全在灯上。**不给它新造图元或颜色**（决策 169 / 200 的纪律）。
    */
-  const turns = $derived.by<TurnView[]>(() => {
-    const stamped: { view: TurnView; rank: number }[] = (session?.messages ?? []).map((m) => ({
-      // 排序与分类**同一处判定**（决策 252）：`kind` 是后端给的，界面不再各判一遍
-      // （此前这里用 `role` 三元式、下面用 `startsWith`，两个判定点迟早不一致）。
-      rank: m.kind === 'mine' ? 0 : m.kind === 'fm' ? 2 : 1,
-      view: {
-        key: `m${m.id}`,
-        kind: m.kind,
-        content: m.content,
-        at: m.created_at,
-        streaming: false,
-        partial: false,
-        traces: m.traces ?? [],
-        // 推理留痕（决策 244）：空串与 null 都当作「这一轮没产推理」，界面不渲染那一块。
-        thinking: m.thinking?.trim() ? m.thinking : null,
-        liveTools: [],
-        briefing: m.briefing,
-        needsPairing: false,
-        proposal: null,
-        // 值守播报（决策 209④）：与 `kind` 正交的那个布尔（决策 252③），也由后端判。
-        proactive: m.proactive,
-        // 归因类别（决策 235① / 238）：**用后端解析并翻好的那一份**（`attribution_label`），
-        // 界面不自己从稳定标识再映射一遍——两份映射迟早给出两个词，而「四类各一个词」
-        // 是同一件事。未定位时后端给 null，界面就不显示（不编一个假的类别）。
-        attribution: m.attribution_label ?? null,
-      },
-    }));
-    for (const p of session?.proposals ?? []) {
-      stamped.push({
-        rank: 1,
-        view: {
-          key: `p${p.id}`,
-          kind: 'proposal',
-          content: p.summary,
-          at: p.created_at,
-          streaming: false,
-          partial: false,
-          traces: [],
-          thinking: null,
-          liveTools: [],
-          briefing: null,
-          needsPairing: false,
-          proposal: p,
-          proactive: false,
-          attribution: null,
-        },
-      });
-    }
-    stamped.sort((a, b) => (a.view.at === b.view.at ? a.rank - b.rank : a.view.at < b.view.at ? -1 : 1));
-    const out: TurnView[] = stamped.map((s) => s.view);
-    if (pendingText) {
-      out.push({
-        key: 'pending',
-        kind: 'mine',
-        content: pendingText,
-        at: '',
-        streaming: false,
-        partial: false,
-        traces: [],
-        thinking: null,
-        liveTools: [],
-        briefing: null,
-        needsPairing: false,
-        proposal: null,
-        proactive: false,
-        attribution: null,
-      });
-    }
-    if (sending || stream.text) {
-      out.push({
-        key: 'live',
-        kind: 'fm',
-        // 还没收到第一个增量时不摆空白：给一句"对面在动"的实情，光标说明还在流
-        content: stream.text || '值班长正在查台账…',
-        at: '',
-        streaming: stream.streaming,
-        partial: !stream.streaming && stream.text.length > 0,
-        traces: [],
-        thinking: stream.thinking.trim() ? stream.thinking : null,
-        liveTools: stream.tools,
-        briefing: null,
-        needsPairing: false,
-        proposal: null,
-        proactive: false,
-        attribution: null,
-      });
-    }
-    if (stream.error) {
-      out.push({
-        key: 'send-error',
-        kind: 'failed',
-        content: `发送失败：${stream.error}`,
-        at: '',
-        streaming: false,
-        partial: false,
-        traces: [],
-        thinking: null,
-        liveTools: [],
-        briefing: null,
-        needsPairing: needsPairing(stream.error),
-        proposal: null,
-        proactive: false,
-        attribution: null,
-      });
-    }
-    return out;
-  });
+  function crewRowClass(state: StationState): string {
+    if (state === 'warn') return 'pen';
+    if (state === 'go') return 'hot';
+    if (state === 'stop') return 'fail';
+    return '';
+  }
 
   /**
-   * 失败原因是「这台设备还没配对」吗（票 07）。
-   *
-   * 判据是后端的 403 报文原文，而不是 HTTP 状态码：403 在本应用里还被跨源防护用着
-   * （决策 128），只看状态码会把「Origin 不对」也挂上配对入口——那是一条走不通的指引。
+   * 时间线：台账行、提议与三种在飞轮归约成一列 {@link TurnView}（票 02；判断在
+   * `lib/talkTurns.ts`——合并与排序的坑都长在行与行的关系上，组件只把四个响应式输入
+   * 加一枚判好的布尔传进去；行分类读决策 252 给的 `kind` / `proactive`，配对与否读
+   * 决策 259 的 `kind`——正文哨兵不再由界面解析）。
    */
-  function needsPairing(message: string): boolean {
-    return message.includes('还没配对');
-  }
+  const turns = $derived.by<TurnView[]>(() =>
+    buildTurns({
+      session,
+      pendingText,
+      sending,
+      following: followingSince !== null,
+      stream,
+      pairingNeeded: sendPairingNeeded,
+    }),
+  );
 
   /** 对话时间线是空的（且不是「还没读到」）：空态要居中，见 CSS 的 `.timeline.empty`。 */
   const timelineEmpty = $derived(!(loading && !session) && turns.length === 0);
@@ -525,13 +425,45 @@
       if (landed !== currentId) generation += 1;
       currentId = landed;
       rememberLanding(landed, payload.session);
+      // 重新接上一轮（决策 260）：服务端说这一班此刻有一轮在跑，而本机没在等它
+      // （`sending` 的现场只属于本机发出的那一趟）。此时把「跟」这件事立起来，增量
+      // 才会照旧接进时间线——否则刷新之后实时回话整段看不见，只剩落地后重读台账。
+      syncFollowing(payload);
       loadError = null;
+      loadErrorPairing = false;
       return true;
     } catch (err) {
       loadError = (err as Error).message;
+      loadErrorPairing = isPairingRequired(err);
       return false;
     } finally {
       loading = false;
+    }
+  }
+
+  /**
+   * 按这一趟读到的台账收口「跟不跟这一轮」（决策 260）。
+   *
+   * 三条判据，各自对应一种真实情形：
+   *
+   * 1. **本机在发**（`sending`）：跟着的是本机那一趟，`send()` 的收尾负责放手——
+   *    这里一个字都不动（此时 `turn_in_flight` 也在场，两条路说的是同一件事）。
+   * 2. **服务端说没在跑**：放手（`null`）。这一条同时收掉「刚落地」那一趟——回话进了
+   *    台账，`turn_in_flight` 随之变假，下一次重读（或落地后的那一趟轮询）就撤了。
+   * 3. **服务端说在跑、本机没在发**：接手。`followingSince` 记**接手那一刻的最大行 id**，
+   *    尾部此后多一行就是它落了地（这趟 POST 的回包本机没有，只能这么读）。
+   *
+   * 已经接手且仍在跑时**不改 `followingSince`**：它是「落地」那条判据的锚点，每趟轮询
+   * 重记一次的话锚点会跟着往前爬，落地的行反而永远比它小。
+   */
+  function syncFollowing(payload: ForemanSession) {
+    if (sending) return;
+    if (!payload.turn_in_flight) {
+      followingSince = null;
+      return;
+    }
+    if (followingSince === null) {
+      followingSince = maxLedgerId(payload.messages ?? []);
     }
   }
 
@@ -578,13 +510,18 @@
    * 只有这些是「属于某一班」的：这一屏读到的台账、读的加载态与错误、正在发的那句乐观轮、
    * 流式增量、以及还没发出去的输入。**不重置**的是 `details` / `chosenStop` / `crew` /
    * `pending`——它们派生自全局看板，换会话不等于换看板（同一条决策的第②条裁决）。
+   *
+   * `followingSince` 在这份清单里（决策 260）：它跟的是**某一班**那一轮，而那一段流式文字
+   * 随着 `stream` 一起被清掉了——留着锚点会让新那一班的增量继续往这一格里攒。
    */
   function resetSessionState() {
     session = null;
     loading = true;
     loadError = null;
+    loadErrorPairing = false;
     pendingText = null;
     stream = emptyForemanStream();
+    followingSince = null;
     input = '';
   }
 
@@ -653,6 +590,7 @@
       await openFreshSession({ push: true });
     } catch (err) {
       loadError = (err as Error).message;
+      loadErrorPairing = isPairingRequired(err);
     } finally {
       busy = false;
     }
@@ -719,8 +657,11 @@
     // 订阅者，而这个字段此前只被用来「丢掉不匹配的」——等于把「另一班在说话」白扔了。
     // **不判 `sending`**：别的班次说话时本机可能什么都没发，而那正是需要告知的时候。
     foreignActive = noteForeignDelta(foreignActive, event, currentId, Date.now());
-    // 只在等回话期间累积：收尾后到达的尾巴不得再造一轮（回话以台账为准）
-    if (!sending) return;
+    // 只在等回话期间累积：收尾后到达的尾巴不得再造一轮（回话以台账为准）。
+    // **「在等」有两条来源**（决策 260）：本机发出的那一趟（`sending`），或刷新之后
+    // 从服务端重新接上的那一轮（`followingSince`）。少了后一条，刷新页面的那一刻起
+    // 增量就全被挡在这里——时间线上看不到实时回话，只有等它落地后重读台账才出现。
+    if (!sending && followingSince === null) return;
     // 班次守卫：不是当前这一班的增量一律丢弃（决策 204⑥，判据在 realtime/foreman.ts）。
     // 两条声道各归各的：回话进 `text`、思考进 `thinking`、工具调用进 `tools`（决策 244），
     // 判据（类型 / 身份 / 班次）三处同源，故都收在这一个出口。
@@ -761,6 +702,48 @@
       const pruned = pruneForeignActive(foreignActive, sessionList, markerNow);
       if (pruned !== foreignActive) foreignActive = pruned;
     }, 5_000);
+    return () => clearInterval(t);
+  });
+
+  /**
+   * 跟一轮时的**落地哨**（决策 260）。
+   *
+   * 重新接上一轮之后，本机手里没有那一趟 POST 的回包（它随旧页面一起走了），故「它答完了」
+   * 只能从台账读：每几秒问一次服务端，`turn_in_flight` 转假、或台账尾部多出比接手时更新的
+   * 一行，就是这一轮落了地——那时重读台账（回话落地进时间线）、放下跟随（`stream` 清掉，
+   * 增量不再往这一格里攒）。
+   *
+   * **只在真的在跟时才走**（与上面两条 5s / 10s 心跳同一姿态：没有东西要看的时候，一次
+   * 状态更新都不该产生）。这是全页第三条周期请求，故间隔取得比标记那条更宽：跟随的那一轮
+   * 本来就有 SSE 增量在动，人看得见它在忙；这一条只负责把「已经答完」这件事及时收口，
+   * 快慢几秒不影响。
+   *
+   * 落地判据用**台账尾部有没有新行**而不是只看 `turn_in_flight`：后者在「回话落库、
+   * 但下一轮紧接着又起」那一瞬间会连着为真，而尾部多一行是确定无疑的信号。
+   */
+  $effect(() => {
+    if (followingSince === null) return;
+    const t = setInterval(async () => {
+      const anchor = followingSince;
+      if (anchor === null) return;
+      try {
+        const payload = await getForemanSession(currentId);
+        const landed = turnLanded(payload.messages ?? [], anchor) || !payload.turn_in_flight;
+        if (!landed) return;
+        session = payload;
+        stream = emptyForemanStream();
+        rememberLanding(payload.session?.id ?? null, payload.session);
+        // **先放手再交棒**：`syncFollowing` 在收到 `turn_in_flight` 为真时重新立锚点。
+        // 那一格是「回话落了库、而同一班紧接着又起了一轮」（值守轮插进来，或这一屏刚
+        // 发出下一句）——此时该跟的是**新那一轮**，锚点必须按它落库后的台账重记；
+        // 沿用旧锚点会让下一趟立刻又判成「落地」（新那一轮的回话 id 当然大于旧锚点，
+        // 但那不是它答完了）。
+        followingSince = null;
+        syncFollowing(payload);
+      } catch {
+        // 读不到不影响这一屏：SSE 增量照旧在动，下一趟再收口
+      }
+    }, 3_000);
     return () => clearInterval(t);
   });
 
@@ -897,86 +880,35 @@
     zoneEl?.scrollIntoView({ block: 'start' });
   }
 
-  /* ───────────── ⋯ 班次菜单（折行档）：键盘与关闭（票 04，照顶栏「待处理」那一套） ─────────────
+  /* ───────────── ⋯ 班次菜单（折行档）：键盘与关闭（票 04 / 决策 251⑤） ─────────────
    *
-   * 交互语汇**照抄**顶栏那个下拉（票 04 / R2-04 补的三条出口），不新造第三套：`aria-expanded`
-   * + `aria-controls`、Escape 关得掉（**焦点没进过面板时也算**）、点面板外面关、上下方向键走项、
-   * `Home` / `End`、面板**常驻 DOM** 用 `hidden` 开合。键盘一律在 `window` 上收——给静态元素
-   * 挂交互处理器是 a11y 检查里的红灯。
+   * 交互语汇与顶栏「待处理」下拉**同一份**（票 04 / R2-04 补的三条出口），不新造第三套：
+   * `aria-expanded` + `aria-controls`、Escape 关得掉（**焦点没进过面板时也算**）、点面板外面关、
+   * 上下方向键走项、`Home` / `End`、面板**常驻 DOM** 用 `hidden` 开合。键盘一律在 `window`
+   * 上收——给静态元素挂交互处理器是 a11y 检查里的红灯（那两条监听仍在模板的 `<svelte:window>`）。
+   *
+   * **判据不在这里**：它在 `lib/menuTrap`（决策 251⑤），两处弹层共用一份——此前这两段是
+   * 同义的两份（各 80 多行、只换了标识符），而**这一份一条单测都没有**，抄漏一条出口
+   * 没人会发现。这里只出**接线**：开关态是本地的 `menuOpen`（顶栏那份住在 `board.pendingOpen`）。
    */
-
-  /** 菜单里可聚焦的项（禁用的不行——它们在这一档读得到理由，但按不动）。 */
-  function menuItems(): HTMLElement[] {
-    return menuPanel
-      ? [...menuPanel.querySelectorAll<HTMLElement>('button[data-menu-item]:not([disabled])')]
-      : [];
-  }
-
-  function focusMenuItem(index: number): void {
-    const list = menuItems();
-    if (list.length === 0) return;
-    const n = list.length;
-    list[((index % n) + n) % n].focus();
-  }
-
-  function closeMenu(returnFocus: boolean): void {
-    menuOpen = false;
-    if (returnFocus) menuTrigger?.focus();
-  }
-
-  function toggleMenu(): void {
-    if (menuOpen) {
-      closeMenu(false);
-      return;
-    }
-    menuOpen = true;
-    void tick().then(() => focusMenuItem(0));
-  }
-
-  function onWindowKey(e: KeyboardEvent): void {
-    const active = document.activeElement as HTMLElement | null;
-    const onTrigger = !!menuTrigger && active === menuTrigger;
-    const inPanel = !!active && !!menuPanel && menuPanel.contains(active);
-
-    if (e.key === 'ArrowDown' && onTrigger && !menuOpen) {
-      e.preventDefault();
+  const menuTrap = createMenuTrap({
+    isOpen: () => menuOpen,
+    onOpen: () => {
       menuOpen = true;
-      void tick().then(() => focusMenuItem(0));
-      return;
-    }
-    if (!menuOpen) return;
+    },
+    onClose: () => {
+      menuOpen = false;
+    },
+    trigger: () => menuTrigger,
+    panel: () => menuPanel,
+    wrap: () => menuWrap,
+    itemSelector: 'button[data-menu-item]:not([disabled])',
+  });
 
-    if (e.key === 'Escape') {
-      closeMenu(onTrigger || inPanel);
-      return;
-    }
-    if (!onTrigger && !inPanel) return;
-
-    const list = menuItems();
-    if (list.length === 0) return;
-    const current = list.indexOf(active as HTMLElement);
-    if (e.key === 'ArrowDown') {
-      e.preventDefault();
-      focusMenuItem(current + 1);
-    } else if (e.key === 'ArrowUp') {
-      e.preventDefault();
-      if (current <= 0) menuTrigger?.focus();
-      else focusMenuItem(current - 1);
-    } else if (e.key === 'Home') {
-      e.preventDefault();
-      focusMenuItem(0);
-    } else if (e.key === 'End') {
-      e.preventDefault();
-      focusMenuItem(list.length - 1);
-    }
-  }
-
-  /** 点面板外面关掉（含「本来就开着、用户去点别处」那一档）。 */
-  function onWindowClick(e: MouseEvent): void {
-    if (!menuOpen) return;
-    const target = e.target as Node | null;
-    if (target && menuWrap?.contains(target)) return;
-    menuOpen = false;
+  /** 点触发钮开合。打开那一路与键盘打开**同一条路径**（都要等一次 DOM 刷新再送焦点），故走 `menuTrap.open`。 */
+  function toggleMenu(): void {
+    if (menuOpen) menuTrap.close(false);
+    else menuTrap.open();
   }
 
   /**
@@ -1021,9 +953,16 @@
     sending = true;
     pendingText = text;
     stream = beginForemanStream();
+    // 本机这一趟接手之后就不再「跟」别人（决策 260）：两条来源说的是同一件事的不同主人，
+    // 留着锚点会让落地哨（那个 3s 的 `$effect`）拿旧锚点判本机这一趟，而它的收尾归
+    // 下面这一趟 POST 管——两条路各收各的口，混起来会把这一轮提前判成「落地了」。
+    followingSince = null;
     // 这一趟之前台账里已有的失败轮 id：失败回来后靠它分辨「这次新出现的那一条」
     // （判据在 realtime/foreman.ts；不记的话，早先的失败会让真正的断网静默下来）
     const failuresBefore = failedLedgerRowIds(session?.messages ?? []);
+    // 「这一次是本地等不到回包」那一类（决策 223）——在 catch 里趁 `ApiError` 还在手判好，
+    // `finally` 里要用（它决定那条本地失败轮退不退场，见下）。缺省假：成功那一趟用不到它。
+    let timedOut = false;
     let gen = generation;
     let sid = currentId;
     try {
@@ -1073,7 +1012,14 @@
       // 本地超时**不等于**这一轮失败：服务端那一轮不随这次请求一起死（决策 223），
       // 故超时那一类由 `failureNotice` 补上「它仍在继续」的实情——否则人会重发一句，
       // 而那一轮很可能正在把话答完。
-      stream = failForemanStream(stream, failureNotice((err as Error).message));
+      // 配对与超时两枚判据（票 04 / 06，决策 259）：趁 `ApiError` 还在手按 `kind` 判掉——
+      // 错误降级成流里的字符串之后 `kind` 就丢了。与 `stream.error` 同一处设置，两者恒同步。
+      sendPairingNeeded = isPairingRequired(err);
+      timedOut = isRequestTimeout(err);
+      stream = failForemanStream(
+        stream,
+        failureNotice((err as Error).message, timedOut),
+      );
       // 重取成功才撤乐观轮：撤了之后这话由台账那一行承担，不靠重取失败时凭空消失
       if (await reload(sid)) {
         pendingText = null;
@@ -1088,6 +1034,24 @@
     } finally {
       sending = false;
       sendingSid = null;
+      // **本地放弃、服务端还在跑**那一类（决策 223 的超时）交棒给「跟」这一支（决策 260）：
+      // 这一趟的回包等不到了，但那一轮不随请求一起死——上面那一趟 `reload` 已经把
+      // `turn_in_flight` 读回来，这里据此接力，增量才继续往时间线上走。
+      // 成功那一趟是**空操作**：那一刻 `turn_in_flight` 已经翻假（回话落了库）。
+      // 必须放在 `sending = false` **之后**——`syncFollowing` 在本机还在发时不接手。
+      if (session) syncFollowing(session);
+      // 接上手之后，那条本地的「发送失败」要退场——**但只退超时那一类**（决策 260）：
+      // 它说的是「这一次请求没等到回包」，字是真话，可屏幕上同时摆着**一条失败轮与一轮
+      // 正在流式作答**，人只会读成「它说错了、又答上了」。那一轮此刻在跑这件实情，由
+      // 上面那一轮自己说（光标在动）。
+      //
+      // 其余失败**一个字都不动**：网络不通、配对 403 这些请求很可能根本没到后端，
+      // 而值班长的**值守轮**完全可能在那一瞬间正在跑——按「服务端说有在跑」就把本地那条
+      // 错误抹掉，等于拿一件无关的实情盖住另一件真事（配对那条尤其：它的指引是唯一出口）。
+      if (followingSince !== null && timedOut) {
+        stream = { ...stream, error: null };
+        sendPairingNeeded = false;
+      }
     }
   }
 
@@ -1138,7 +1102,18 @@
     narrow ? '对值班长说一句话…' : '对值班长说一句话（Enter 发送，Shift+Enter 换行）…',
   );
 
-  /** 工位名 → sprite：快照里的 stage 是后端字符串，未登记的值不猜（退回台账箱）。 */
+  /**
+   * 工位名 → sprite：快照里的 stage 是后端字符串，未登记的值不猜（退回台账箱）。
+   *
+   * **这里刻意不调 `columnForStage`**（实现期观察，**不是**决策 251 的裁决——251② 只裁灯的
+   * 优先序与唯一实现）：那张表把 `sync-check` 也映到 design 列，而 `BOARD_COLUMNS` 按决策 107
+   * **全站不展示** sync-check。两者答的是不同的问题——「这个 stage 属于哪一列」（含不展示的）
+   * 与「它是这 8 列里的哪一列」。改成查 `columnForStage` 会把未列的 sync-check 从台账箱变成
+   * 锤子 sprite，那是一处**新的可见行为**，而本批的口径是「行为变化只有一处」（决策 251 §五）。
+   * 票 01 原写「二选一，不两处都留」，两项都不成立：① 委派 = 上述行为变化；② 「改由 `crew`
+   * 直接给出」做不到——`receipt()` 要的是**任一** trace 的 stage（可能落在没有工位行的列上），
+   * 而 `crew` 只有 8 列。故留两处并**在此写明理由**，偏差记在票面。
+   */
   function stageSprite(stage: string): SpriteName {
     const col = BOARD_COLUMNS.find((c) => c.stages.includes(stage as Stage));
     return col ? COLUMN_SPRITES[col.key] : 'chest';
@@ -1343,7 +1318,7 @@
             data-menu-item
             disabled={sending || busy}
             onclick={() => {
-              closeMenu(false);
+              menuTrap.close(false);
               void newSession();
             }}>+ 新班次</button
           >
@@ -1370,7 +1345,7 @@
               class="mi"
               data-menu-item
               onclick={() => {
-                closeMenu(false);
+                menuTrap.close(false);
                 void switchTo(s.id, { write: true });
               }}
             >
@@ -1390,7 +1365,7 @@
             data-menu-item
             disabled={sending || busy || !currentId}
             onclick={() => {
-              closeMenu(false);
+              menuTrap.close(false);
               openRename();
             }}>改名</button
           >
@@ -1400,7 +1375,7 @@
             data-menu-item
             disabled={sending || busy || !currentId}
             onclick={() => {
-              closeMenu(false);
+              menuTrap.close(false);
               dialogError = null;
               dialog = 'archive';
             }}>归档</button
@@ -1435,7 +1410,7 @@
              一次」，而座机上的「手机访问」页在手机上打开是拿不到配对码的（配对令牌只允许回环
              来源读取），照着这句话做的人会一直停在这一页——指引把使用者的力气导向重复扫码，
              而不是去找那台电脑。 -->
-        {#if needsPairing(loadError)}
+        {#if loadErrorPairing}
           <p class="note">
             配对码只在那台跑服务的电脑本机生成：在那台电脑上（桌面应用窗口，或浏览器里的
             127.0.0.1）打开<a
@@ -1504,7 +1479,7 @@
               cursors={detail.cursors}
               pendingType={task.pending_reason?.type}
               disabled={board.actionBusy !== null}
-              isBusy={(a) => board.actionBusy === `${task.id}:${a.action}`}
+              isBusy={(a, cursorId) => board.actionBusy === actionKey(a, cursorId)}
               onaction={(a, opts) => handleAction(task.id, a, opts)}
             />
           {:else}
@@ -1902,8 +1877,8 @@
       <div class="reg-head"><span>值班板</span><span class="n">8 工位</span></div>
       <ul class="brows no-scrollbar">
         {#each crew as c (c.key)}
-          <li class="brow {c.state === 'warn' ? 'pen' : c.state === 'run' ? 'hot' : ''}">
-            <span class="blamp {c.state === 'warn' ? 'w' : c.state === 'run' ? 'c' : c.state === 'done' ? 'd' : ''}"></span>
+          <li class="brow {crewRowClass(c.state)}">
+            <span class="blamp {crewLampClass(c.state)}"></span>
             <span class="bnm">{c.label}</span>
             <span class="bc">{c.count}</span>
           </li>
@@ -1923,7 +1898,7 @@
 
 <!-- ⋯ 班次菜单的三条出口（票 04）：Escape 关得掉（焦点没进过面板时也算）、点面板外面关、
      上下方向键走项。与顶栏那个下拉同一姿态——键盘一律在 `window` 上收。 -->
-<svelte:window onclick={onWindowClick} onkeydown={onWindowKey} />
+<svelte:window onclick={menuTrap.onClick} onkeydown={menuTrap.onKeydown} />
 
 <style>
   /* 三分区（票 04）：状态区 / 时间线 / 输入坞自上而下。整页钉在视口内，故时间线是
@@ -2509,6 +2484,11 @@
     background: var(--done);
     border-color: var(--done);
   }
+  /* 失败工位（决策 251①）：与看板同一列的失败红同源，取契约的 `--stop`。 */
+  .blamp.x {
+    background: var(--stop);
+    border-color: var(--stop);
+  }
   .brow .bnm {
     flex: 1;
     min-width: 0;
@@ -2521,6 +2501,10 @@
   }
   .brow.pen .bnm {
     color: var(--pending);
+  }
+  /* 失败工位（决策 251①）：工位名与灯同色，与看板失败列的做法一致。 */
+  .brow.fail .bnm {
+    color: var(--stop);
   }
   .brow .bc {
     flex: none;

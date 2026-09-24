@@ -1,4 +1,4 @@
-import { pairedUrl } from '../api/client';
+import { ApiError, pairedUrl } from '../api/client';
 import type { ServerInfo } from '../api/types';
 
 /**
@@ -78,4 +78,20 @@ export function portFallbackNote(
 ): string | null {
   if (!info || info.loopback_only || info.port_source !== 'fallback') return null;
   return `这次没能绑上固定的端口（被别的程序占着），当前用的是临时端口 ${info.port}——手机上存过的网址这次要重新扫一次。`;
+}
+
+/**
+ * 这次失败是「设备还没配对」吗——**按后端给的 `kind` 判，不按报文字样**（票 04 / 决策 259）。
+ *
+ * 403 在本应用里被**两处**用着：配对缺失（`pairing_guard`，带
+ * `kind: "pairing_required"`）与跨源防护（决策 128，**不带 kind**）。此前界面只能
+ * `message.includes('还没配对')` 才分得开——报文即接口，改一句话就断。与技能市场八类
+ * （决策 194⑦）同姿态：`api/client.ts` 已把 `kind` 从错误体里解出来挂在 `ApiError` 上，
+ * 这里只是把它变成一个可以逐条测的判定。
+ *
+ * **判在 ApiError 还在手上的那一层**（两处 catch），不等错误被降级成流里的字符串——
+ * 那时 `kind` 已经丢了，任何补救都要重新摸报文。
+ */
+export function isPairingRequired(err: unknown): boolean {
+  return err instanceof ApiError && err.kind === 'pairing_required';
 }

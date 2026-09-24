@@ -11,6 +11,28 @@ use crate::state::{ApiError, AppState};
 /// 配对令牌请求头（决策 182㉗，票 07）。
 pub const PAIRING_TOKEN_HEADER: &str = "x-agentpipeline-token";
 
+/// 配对缺失的机器可读失败类别（票 04 / 决策 259，姿态照 `KIND_SKILL_NOT_FOUND` 先例）。
+///
+/// 403 在本应用里被两处用着（配对缺失、跨源防护），界面此前只能按**报文字串**分支
+/// 来区分——报文即接口。`kind` 让这两次 403 从形状上分得开；**报文一个字不动**，
+/// 它照旧是给人看的那句话（决策 189 的措辞）。
+pub const KIND_PAIRING_REQUIRED: &str = "pairing_required";
+
+/// 配对缺失的拒绝（`pairing_guard` 的落点）。抽成构造函数是为了让「带 kind、
+/// 报文原样」这件事能被单测钉住——中间件本体要真请求才跑得到（L3 契约的地盘）。
+fn pairing_rejected() -> ApiError {
+    // 报文点名「跑服务的电脑本机」而不是「已配对的设备」（决策 189）：配对码只能在
+    // 回环来源的那一页上生成，原措辞让手机上的使用者去重复扫一张它自己永远拿不到的码。
+    ApiError::forbidden("这台设备还没配对：请在跑服务的电脑本机打开手机访问页扫码")
+        .with_kind(KIND_PAIRING_REQUIRED)
+}
+
+/// 跨源防护的拒绝（`cross_origin_guard` 的落点）。**不带 kind**——它与配对缺失同为 403，
+/// 界面按 kind 分支的前提正是这一对里只有一个带（票 04 要钉的「跨源 403 不挂配对入口」）。
+fn origin_rejected(origin: &str) -> ApiError {
+    ApiError::forbidden(format!("跨源写请求被拒绝：Origin/Referer = {origin}"))
+}
+
 /// 跨源防护中间件（决策 128）。
 ///
 /// 127.0.0.1 绑定**不防**跨站 POST（form / no-cors fetch 可驱动 merge/decision、cancel、resume）。
@@ -53,8 +75,7 @@ pub async fn cross_origin_guard(
             if allowed {
                 next.run(request).await
             } else {
-                ApiError::forbidden(format!("跨源写请求被拒绝：Origin/Referer = {value}"))
-                    .into_response()
+                origin_rejected(value).into_response()
             }
         }
     }
@@ -102,10 +123,7 @@ pub async fn pairing_guard(
         .and_then(|value| value.to_str().ok());
     match provided {
         Some(token) if fixed_length_eq(token, &expected) => next.run(request).await,
-        // 报文点名「跑服务的电脑本机」而不是「已配对的设备」（决策 189）：配对码只能在
-        // 回环来源的那一页上生成，原措辞让手机上的使用者去重复扫一张它自己永远拿不到的码。
-        _ => ApiError::forbidden("这台设备还没配对：请在跑服务的电脑本机打开手机访问页扫码")
-            .into_response(),
+        _ => pairing_rejected().into_response(),
     }
 }
 
@@ -128,7 +146,38 @@ fn fixed_length_eq(a: &str, b: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::fixed_length_eq;
+    use super::{fixed_length_eq, origin_rejected, pairing_rejected, KIND_PAIRING_REQUIRED};
+    use crate::state::ApiError;
+
+    #[test]
+    fn pairing_rejection_carries_machine_readable_kind_and_verbatim_message() {
+        let err = pairing_rejected();
+        assert_eq!(err.status, axum::http::StatusCode::FORBIDDEN);
+        assert_eq!(err.kind.as_deref(), Some(KIND_PAIRING_REQUIRED));
+        // 报文一个字不动（决策 189）：kind 是加给机器的，不是换给人的那句话
+        assert_eq!(
+            err.message,
+            "这台设备还没配对：请在跑服务的电脑本机打开手机访问页扫码"
+        );
+    }
+
+    #[test]
+    fn origin_rejection_has_no_kind_so_the_two_403s_stay_distinguishable() {
+        let err = origin_rejected("http://evil.example");
+        assert_eq!(err.status, axum::http::StatusCode::FORBIDDEN);
+        assert!(
+            err.kind.is_none(),
+            "跨源 403 带上配对 kind 会让界面把 Origin 拒绝也挂上配对入口"
+        );
+    }
+
+    #[test]
+    fn forbidden_defaults_to_no_kind() {
+        // 没显式 with_kind 的 403（路径越界、令牌只能本机读…）保持 None——
+        // kind 是例外而非常态，界面按它分支才不会误报。
+        let err = ApiError::forbidden("随便");
+        assert!(err.kind.is_none());
+    }
 
     #[test]
     fn fixed_length_eq_matches_only_identical_tokens() {

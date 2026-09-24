@@ -98,7 +98,7 @@ graph TD
 | `tool_retry_max` | 3 | agent loop 内单次工具调用失败的最大重试次数 |
 | `node_idle_timeout_sec` | 300 | 节点空闲超时（秒）：以流式 token / LLM 返回 / 工具与命令活动为心跳，无活动超过此值判定超时 |
 | `node_max_duration_sec` | 1800 | 节点绝对时长上限（秒），即使持续有活动也不得超过，防不收敛循环 |
-| `tool_timeout_sec` | 60 | 单次工具调用超时（秒） |
+| `tool_timeout_sec` | 60 | **`run_command` 的缺省超时（秒）**——test / merge 两阶段取 `test_command_timeout_sec`，其余阶段取它（`config::effective_run_command_timeout`，决策 75）；调用方显式传 `timeout` 参数时取显式值。**它不是「所有工具的超时」**：文件类工具没有超时 |
 | `test_command_timeout_sec` | 600 | 系统执行的测试命令超时（秒），不受 `tool_timeout_sec` 限制 |
 | `adaptive_timeout_enabled` | false | 自适应超时仅用于进度估算与告警，不改变强制阈值 |
 | `pending_resume_cooldown_sec` | 5 | 用户 resume 后到开始执行下一节点之间的最小间隔，防止连续点击造成重复 resume |
@@ -113,9 +113,11 @@ graph TD
 | `context_hard_limit_ratio` | 0.9 | 硬上限，超过则强制压缩或降级模型 |
 | `semantic_conflict_check` | true | 开启 architect 阶段的第二层语义冲突比对（§6） |
 | `cross_family_judge` | false | 开启后 agent 型 validate_output 首判不合格时调用 `validator_cross_check` 伪阶段异族复判（决策 134 / 135）；开启但伪阶段未配置 provider → 配置加载 fail fast |
-| `conflict_overlap_threshold` | 0 | `affected_files` 交集判定冲突的最小重叠文件数，0 表示任一交集即冲突 |
 | `max_concurrent_tasks` | 5 | 同时执行的任务数上限（决策 21 / 36），在 scheduler `start_task` 处准入；名额占用 = `status ∈ {running, pending}`（决策 117） |
 | `allow_dirty_worktree_merge` | false | 允许在目标分支工作区不干净时合入；false 时进入 pending 由用户决定 |
+| `egress_allow_hosts` | `[]` | `run_command` 的出口放行主机（决策 179）：精确主机 / `*.example.com`（子域通配，落在点边界上）/ `*`。**默认空 = 只放行回环**；写错在解析期 fail fast。只约束 agent 主动经 `run_command` 发起的调用，**不是安全边界**（残余风险见 [operations.md](operations.md) §12.15） |
+| `egress_allow_all` | false | 显式放行全部出口（决策 179）。默认 `false`——未配置时**不得**静默变成「全部放行」；两个方向的代价不对称，故默认取保守侧 |
+| `env_mode` | `auto` | 环境层权限档位的**全局默认**（决策 206）。口径见 [glossary.md](glossary.md) 的「权限档位（环境层档位）」条——三层解析的唯一实现在 `types::effective_env_mode`，本层只收 `auto` / `deny`（`ask` 在这里是「所有阶段都变 ask」，流水线无人按确认钮，故解析期拒） |
 | `watch_event_window_minutes` | 30 | 值班长待办只收**这么新**的事件；同时是「同一任务在窗口内再次 pending」的计数窗口（决策 209②，票 05） |
 | `watch_owner_stuck_minutes` | 10 | 判「卡住」的宽限：`scheduler_no_effect`（run 已终态而游标仍 active）与 `owner_stuck`（有主但心跳停了）都用它（票 05） |
 | `watch_debounce_sec` | 60 | 值守轮的去抖窗口：窗口内攒批、到期唤醒一次；窗口内没有新事件则一次都不醒（票 06） |

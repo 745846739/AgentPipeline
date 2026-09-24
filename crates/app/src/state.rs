@@ -278,6 +278,23 @@ impl AppState {
         self
     }
 
+    /// 注入**启动时从 DB 读回**的界面那一级仓名单（决策 257，仅 `serve` 调用）。
+    ///
+    /// 为什么是「装成 override」而不是「塞进 `configured_repos`」：`GET /market/repos` 的
+    /// `origin` 判据是 [`AppState::market_override`] 存不存在（`routes/market.rs` 的
+    /// `repos_json`），而那个字段的用途是「用户改 `config.toml` 却发现『改了没用』时，
+    /// 答案必须在这一页上看得见」。把 DB 那份塞进 `configured_repos` 会让界面把
+    /// **用户自己保存的名单**标成来自配置文件——制造一个正好相反的困惑。
+    ///
+    /// `None` = 从未保存过：不装 override，读取回落 `config.toml`（与 `Some(vec![])`
+    /// 「显式清空」是两回事，见 `storage/market_repos.rs` 的 doc）。
+    pub fn with_market_override(self, repos: Option<Vec<String>>) -> Self {
+        if let Some(repos) = repos {
+            self.set_market_override(repos);
+        }
+        self
+    }
+
     /// 注入实际绑定地址（决策 167）。serve 路径必须调用，否则 `/server-info`
     /// 会把局域网绑定误报为仅回环。
     ///

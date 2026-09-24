@@ -7,13 +7,15 @@
  */
 
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
-import type { Task, TaskListItem } from '../api/types';
+import type { AllowedAction, Task, TaskListItem } from '../api/types';
+import { actionKey } from '../lib/actions';
 
 const mocks = vi.hoisted(() => ({
   createTask: vi.fn(),
   listTasks: vi.fn(),
   listProjects: vi.fn(),
   getTask: vi.fn(),
+  submitAllowedAction: vi.fn(),
 }));
 
 vi.mock('../api/client', () => ({
@@ -21,6 +23,12 @@ vi.mock('../api/client', () => ({
   listTasks: mocks.listTasks,
   listProjects: mocks.listProjects,
   getTask: mocks.getTask,
+}));
+
+// 动作提交走的是 lib/actionSubmit（不是 api/client）——board 的忙态测试要能把它拖住，
+// 才好在「提交还没回来」的窗口里断言 actionBusy 的形状。
+vi.mock('../lib/actionSubmit', () => ({
+  submitAllowedAction: mocks.submitAllowedAction,
 }));
 
 vi.mock('../realtime/connection', () => ({
@@ -116,5 +124,52 @@ describe('看板新建任务（票 10 / R2-12）', () => {
 
     await expect(board.createTask({ project_id: 'A', title: '新任务' })).rejects.toThrow('项目不存在');
     expect(board.error).toBe('项目不存在');
+  });
+});
+
+describe('看板动作的身份与忙态（票 05：与 actionKey 同一把尺子）', () => {
+  const cont: AllowedAction = {
+    action: 'continue',
+    kind: 'resume',
+    label: '补充信息并继续',
+    cursor_id: 'c-main',
+  };
+
+  beforeEach(() => {
+    board.actionBusy = null;
+    board.actionError = null;
+    mocks.submitAllowedAction.mockReset();
+  });
+
+  /** 把提交拖在半路，造出「还在忙」的观察窗口；调用方负责 release() 后 await。 */
+  function hangSubmit(): { release: () => void; pending: Promise<void> } {
+    let release!: () => void;
+    mocks.submitAllowedAction.mockImplementation(
+      () =>
+        new Promise<void>((resolve) => {
+          release = resolve;
+        }),
+    );
+    const pending = board.handleTaskAction('t1', cont, { cursorId: 'c-main' });
+    return { release, pending };
+  }
+
+  it('提交中 actionBusy 存的是四段式 actionKey（不再是两段 taskId:action）', async () => {
+    const { release, pending } = hangSubmit();
+    // busy 在第一个 await 之前同步置上——此刻提交还悬着
+    expect(board.actionBusy).toBe(actionKey(cont, 'c-main'));
+    expect(board.actionBusy).toBe('continue:c-main::');
+    release();
+    await pending;
+    expect(board.actionBusy).toBeNull();
+  });
+
+  it('同名动作、不同游标 → 不是同一个忙（§12.3 那一行要守的语义）', async () => {
+    const { release, pending } = hangSubmit();
+    const other: AllowedAction = { ...cont, cursor_id: 'c-other' };
+    expect(board.actionBusy === actionKey(other, 'c-other')).toBe(false);
+    expect(board.actionBusy === actionKey(cont, 'c-main')).toBe(true);
+    release();
+    await pending;
   });
 });

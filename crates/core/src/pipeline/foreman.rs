@@ -25,8 +25,9 @@
 //! 轮数有上限、工具失败只回灌错误文本不上升为失败），但**不用** `submit_metadata`：值班长
 //! 的产出是人读的一句话，不是给状态机消费的结构化元数据。
 
+use std::collections::HashMap;
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::sync::{Arc, LazyLock, Mutex};
 
 use serde::{Deserialize, Serialize};
 
@@ -78,6 +79,66 @@ pub struct ForemanToolSpec {
     /// 参数 JSON-Schema 的**文本**：常量表里放不了 `serde_json::Value`，
     /// 用文本 + 一处解析（`tool_defs()`），并由单测钉住它是合法 JSON。
     pub parameters: &'static str,
+}
+
+/// 此刻**有哪几班正在跑一轮**（决策 260）。
+///
+/// 为什么需要它：一轮回话跑在独立任务里（决策 223），**它不随请求一起死**——本地放弃只
+/// 丢掉这一次的同步回包，回话照旧落库。可这条实情此前只写在文案里（超时那一类的
+/// `failureNotice`），**没有任何读数**：刷新页面之后，界面上既没有「这一轮还在跑」的
+/// 那一轮（乐观轮与流式轮都住在 `sending` 这把局部状态里），也就**不再累积增量**——
+/// 于是「它在说话」这件事只有等回话落地、重读台账才看得见。本节补的正是这个读数。
+///
+/// 登记的是**会话 id**、不是「一轮」的标识：界面要知道的是「这一班此刻有一轮在跑」，
+/// 它据此才敢把到达的增量接进时间线（否则那一段字属于谁就无从判断）。
+///
+/// **进程内**（照 [`crate::pipeline::executor`] 的 `EXECUTOR_REGISTRY` 同一姿态）：跨进程
+/// 的情形是**上一个实例留下的**，那种「还在跑」是假的——而它恰好由启动时的
+/// `orphan_inflight_model_requests` 与 `requeue_running_tasks` 一起收口（决策 255④ / 226）。
+static FOREMAN_TURNS: LazyLock<Mutex<HashMap<String, usize>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
+
+/// 一轮在跑的登记凭据：**退出即摘**。
+///
+/// 记账用**计数**而不是一个布尔 / 一格代次：同一班**可以**同时跑着两轮——值守轮（决策 209）
+/// 与人打的一句话各起一轮，两者之间没有任何互斥。按格覆盖的话，先退出的那一轮会把另一轮
+/// 的登记一起摘掉，界面于是在真的还在跑的时候读到「不在跑了」；计数不会：它就是「此刻有几轮
+/// 在跑」这个读数本身。
+struct ForemanTurnGuard {
+    session_id: String,
+}
+
+impl Drop for ForemanTurnGuard {
+    fn drop(&mut self) {
+        let mut turns = FOREMAN_TURNS.lock().unwrap();
+        match turns.get_mut(&self.session_id) {
+            Some(count) if *count > 1 => *count -= 1,
+            _ => {
+                turns.remove(&self.session_id);
+            }
+        }
+    }
+}
+
+/// 登记「这一班开始跑一轮」，返回退出即自动摘的凭据（决策 260）。
+fn begin_foreman_turn(session_id: &str) -> ForemanTurnGuard {
+    *FOREMAN_TURNS
+        .lock()
+        .unwrap()
+        .entry(session_id.to_string())
+        .or_insert(0) += 1;
+    ForemanTurnGuard {
+        session_id: session_id.to_string(),
+    }
+}
+
+/// 此刻这一班**有一轮在跑**吗（决策 260）。
+///
+/// 界面刷新之后靠它决定「要不要把到达的增量接进时间线」——见 [`FOREMAN_TURNS`]。
+/// 读的是**登记**而不是台账：台账里没有「在跑」这一行（回话落库才算数），而这一轮的
+/// 现场（乐观轮 / 流式文本）本来就全在界面那侧，刷新即丢。
+pub fn foreman_turn_in_flight(session_id: &str) -> bool {
+    FOREMAN_TURNS.lock().unwrap().contains_key(session_id)
 }
 
 /// 值班长的工具清单（决策 182⑭ → 决策 188 / 207）。
@@ -1026,6 +1087,10 @@ impl ForemanRunner {
     /// 就不执行，库里只剩孤立的用户行。有界之后，「挂住」变成一条**可归因的失败**——
     /// 与流水线节点同一个口径（见 [`Self::turn_limit`]）。
     async fn respond(&self, session: &ForemanSession, input: TurnInput) -> Result<ForemanTurn> {
+        // 「这一班有一轮在跑」的登记（决策 260）就落在这个**唯一漏斗**上：`say` 与
+        // `watch` 都过它，故两条路各写一遍的漂移从形状上不可能。凭据在函数返回（含
+        // 提前 `?` 退出）时随 `Drop` 摘掉——登记与一轮的真实寿命因此是同一条。
+        let _turn = begin_foreman_turn(&session.id);
         let cfg = self.stage_config().await?;
         let limit = self.turn_limit(cfg.as_ref());
         match tokio::time::timeout(limit, self.respond_inner(session, input, cfg)).await {
