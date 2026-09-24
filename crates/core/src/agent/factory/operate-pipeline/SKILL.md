@@ -34,7 +34,9 @@ description: 操作 AgentPipeline 流水线的操作手册——读数取真、�
 2. 七个动作各自的适用：
    - `create`：新建任务，要 `project_id` 与 `title`（依赖、评审模式按需）。
    - `resume`：pending（等人拍板 / 拍过板要继续）的任务继续走，要 `task_id` +
-     `resume_action`；多条活跃游标时带 `cursor_id`。
+     `resume_action`；多条活跃游标时带 `cursor_id`。`resume_action` 为 `goto` 时
+     **必须带落点**：把 `allowed_actions` 该条 `target` 里的 `stage` / `node` 原样抄进
+     `target_stage` / `target_node`（与确认按钮同一套参数，缺了按键必 400）。
    - `retry`：只对**终态**任务重跑。
    - `cancel`：取消任务。
    - `review`：人工评审，要 `approved`（true 通过 / false 打回），意见走 `comments`。

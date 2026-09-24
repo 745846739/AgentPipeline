@@ -4,13 +4,13 @@
 
 **Blocked by:** 03 (点名注入 + 主缝三件断言)
 
-**Status:** ready-for-human（文档侧已收口；黄金剧本三类场景待本机 LLM 代理可用时人工执行——见 Comments）
+**Status:** done（2026-09-24 黄金剧本三类场景真 LLM 全过；一次断言红已按「先改手册再重跑」回改——见 Comments 执行记录）
 
-- [ ] 黄金剧本三类场景全部人工执行通过，记录贴回本票 Comments（**待执行**：本机 provider 指向 `127.0.0.1:8787`，执行时该端口无监听——见 Comments 的运行命令）
-- [ ] 单票推进：一句自然语言 → 参数正确的提议卡 → 按键执行落库（**待执行**：本机 provider 指向 `127.0.0.1:8787`，执行时该端口无监听——见 Comments 的运行命令）
-- [ ] 批量重试：一次下令 → 每任务至多一张在途卡、排队给人逐张按；同任务连锁被教成分步提（**待执行**：本机 provider 指向 `127.0.0.1:8787`，执行时该端口无监听——见 Comments 的运行命令）
-- [ ] 只读问答：回答引用 pending 原因原文、全程零提议（**待执行**：本机 provider 指向 `127.0.0.1:8787`，执行时该端口无监听——见 Comments 的运行命令）
-- [ ] 手册按剧本暴露的问题修订完毕（如剧本未过先改手册再重跑）（**待执行**：本机 provider 指向 `127.0.0.1:8787`，执行时该端口无监听——见 Comments 的运行命令）
+- [x] 黄金剧本三类场景全部人工执行通过，记录贴回本票 Comments（2026-09-24，真 LLM 跑通，三段记录见 Comments）
+- [x] 单票推进：一句自然语言 → 参数正确的提议卡 → 按键执行落库（A 类过：goto 提议带全落点；「按键落库」半步的机器证据 = L3 `pressing_a_task_resume_proposal_lands_the_cursor`，参数同源 = 主缝断言③）
+- [x] 批量重试：一次下令 → 每任务至多一张在途卡、排队给人逐张按；同任务连锁被教成分步提（B 类过：t2/t3/t4 各恰一张 retry，回话明说「一票一按」）
+- [x] 只读问答：回答引用 pending 原因原文、全程零提议（C 类过：停因「冲突了两条路，你挑一条」逐字引用，零提议）
+- [x] 手册按剧本暴露的问题修订完毕（剧本第一轮 goto 缺落点断言红 → 手册 `resume` 条目补「target 抄成 target_stage/target_node」→ 重跑全绿）
 - [x] 术语表含「出厂技能」词条且三要素齐
 - [x] testing.md 决策↔测试映射表补行，锚点指向票 02/03 的真实用例
 - [x] 决策日志、术语表、testing.md 之间无悬空引用（编号与词条名互相对得上）
@@ -76,3 +76,32 @@ vitest 补两侧各一条；L3 契约本来就钉了「`""` 不被重播覆盖�
 `park` 助手在 `foreman.rs` / `foreman_golden.rs` 各留一份（同 crate 私有 helper，已注释
 说明取样理由）；L3 URL 里的字面技能名（路径段必须字面，内嵌正文比对仍走 `FACTORY_SKILLS`）。
 黄金剧本 5 条执行项仍被 8787 代理挡着（见上节）。
+
+### 2026-09-24（黄金剧本执行）：三类场景真 LLM 全过；一轮断言红已回改手册
+
+**链路**：本机代理 `npx commandcode-api-proxy` 起在 `127.0.0.1:8787`（v0.4.1，auth 启用），
+上游 commandcode.ai；首跑撞余额不足（`insufficient credits`，换 key）后放行。运行命令即上节
+那条（`AGENTPIPELINE_SMOKE_*` 四件套 + `golden_script -- --ignored --nocapture`）。
+
+**第一轮断言红 → 改手册**：A 类模型提了 `resume_action=goto` 但**没带落点**——数据其实都在
+（`read_task` 的 `allowed_actions` 里 goto 条目带 `target:{stage,node}`，工具 schema 也声明了
+`target_stage`/`target_node`），漏在手册：`resume` 条目只教了 `task_id`+`resume_action`，
+没教「goto 必须把 target 抄成 target_stage/target_node（与确认按钮同源，缺了按键必 400）」。
+按本票协议先改手册 `crates/core/src/agent/factory/operate-pipeline/SKILL.md` 再重跑。
+
+**第二轮全绿**（77.8s，token A 24998/303 · B 25931/644 · C 11850/590）：
+
+- **A 单票推进**（指令「把 t1 推进一步」）：痕迹 `Skill → read_task → task`（真拉手册）；
+  恰一张提议 `{"action":"resume","resume_action":"goto","task_id":"t1","target_stage":"init","target_node":"execute",...}`——
+  落点齐、`resume_action` 来自此刻 `allowed_actions`、按键前任务仍 Pending。回话附停因原文
+  「重试耗尽，等你拍板」并明说「未执行，等你按键确认」。
+- **B 批量重试**（指令「这三张挨个重试」）：痕迹 `Skill → read_task×3 → task×3`；
+  t2/t3/t4 各恰一张 `retry`、零多余卡，回话摆出顺序表 +「一票一按，按顺序来」。
+- **C 只读问答**（指令「t5 为什么停了」）：痕迹 `Skill → read_task`；**零提议**；停因
+  「冲突了两条路，你挑一条」逐字引用，还注明 `user_decision` 枚举与「等你按键的决策点，
+  不是故障」。
+
+**改手册后的回归**：factory 10 条 + foreman 11 条（含主缝 4 条）+ app 契约 4 条
+（factory_skill / pointer / foreman_pointer / pressing）+ core lib 509 条全绿，clippy/fmt 过。
+
+**措辞质量**：三段回话贴在上面，措辞人工复核——记录在案待值班经理过目（结构断言已机器钉死）。

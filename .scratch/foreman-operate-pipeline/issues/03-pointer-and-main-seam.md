@@ -12,5 +12,5 @@
 - [x] persona_append 默认播种只写一次默认值：用户改过/清空过不被启动逻辑覆盖
 - [x] persona_append 的写入与回读经阶段配置端点契约测试钉住
 - [x] 无该配置存量数据（升级路径）补播种（L2 `pointer_seeds_a_missing_foreman_row` + L3「删行 → 重播补回」）
-- [ ] 端到端 demo：对讲台下令 → 提议卡出现 → 按键执行成功（**随票 04 黄金剧本 A 类执行**：同一句话的验收，不重复立条；按键落库的机器证据已由 L3 `pressing_a_task_resume_proposal_lands_the_cursor` 钉住）
+- [x] 端到端 demo：对讲台下令 → 提议卡出现 → 按键执行成功（随票 04 黄金剧本 A 类执行完毕 2026-09-24：真模型下令后提议卡参数带全落点；按键落库的机器证据 = L3 `pressing_a_task_resume_proposal_lands_the_cursor`；三段回话见票 04 Comments）
 - [x] 既有 e2e 断言（回话里没有按钮等）继续全绿——UI 形状未变
