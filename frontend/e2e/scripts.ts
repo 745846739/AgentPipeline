@@ -405,7 +405,7 @@ export function parallelBlockerRounds(): NodeScript {
  */
 export const FOREMAN = 'foreman';
 
-/** 值班长的两个只读工具（`FOREMAN_TOOLS`）：与真实人格同一张表，多一个都不给。 */
+/** 值班长最常用的两个只读工具（清单见 `FOREMAN_TOOL_SPECS`）：脚本铺这两下就够，多一个都不用。 */
 export const readTask = (taskId: string): Step => tool('read_task', { task_id: taskId });
 export const readConversation = (taskId: string, runId?: number): Step =>
   tool('read_conversation', { task_id: taskId, run_id: runId ?? null });
