@@ -2,8 +2,30 @@
 <html lang="zh-CN" data-theme="dark">
   <head>
     <meta charset="UTF-8" />
-    <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover" />
+    <!-- `interactive-widget=resizes-content`（决策 282 ④）：安卓 Chrome/WebView 聚焦输入框时
+         键盘压缩的是**版面**而不是叠在版面上的浮层——钉底的输入坞不再被键盘压住。
+         iPhone 不认这一键，由 WebKit 自理（键盘本就压缩版面）。 -->
+    <meta
+      name="viewport"
+      content="width=device-width, initial-scale=1.0, viewport-fit=cover, interactive-widget=resizes-content"
+    />
     <meta name="color-scheme" content="dark light" />
+    <!-- 主屏幕 standalone（决策 282 ④）：从主屏幕图标打开即为独立窗口——Safari 的地址栏与
+         底栏整体让位，看板 / 详情 / 对讲台全站受益。与桌面壳（WKWebView）无涉：壳内本就没有
+         浏览器 chrome，这些 meta 在壳里是惰性的。
+         · 图标与桌面壳同一份母版（scripts/make-icon.mjs 生成，改图改那里重跑）：apple-touch
+           与 maskable 用满幅底那份——iOS 不认透明，桌面版的透明四角会露黑角；
+         · status-bar-style 取 black（实心黑）而不是 black-translucent：仓里只有底部安全区
+           基建（--safeb），黑透明会把顶栏压进刘海，那是另一笔账；
+         · iOS 主屏 web app 与 Safari 存储隔离，配对令牌靠图标记下的 `?pair=` 地址（决策 191），
+           换过令牌要重新添加一次——这句提醒住在对讲台的配对指引里。 -->
+    <link rel="manifest" href="/manifest.webmanifest" />
+    <meta name="theme-color" content="#1b1d2c" />
+    <meta name="mobile-web-app-capable" content="yes" />
+    <meta name="apple-mobile-web-app-capable" content="yes" />
+    <meta name="apple-mobile-web-app-status-bar-style" content="black" />
+    <meta name="apple-mobile-web-app-title" content="AgentPipeline" />
+    <link rel="apple-touch-icon" href="/icons/icon-maskable-192.png" />
     <title>AgentPipeline · 像素机房</title>
     <script>
       // 深浅两套像素主题：本地记忆，避免首屏闪回深色（决策 169，键名沿用既有约定）

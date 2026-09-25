@@ -201,6 +201,11 @@ test.describe('UX2 ⑨ 超时 / 断线 / 长值（票 12 / 13 / 17）', () => {
 
     // 停在 info_insufficient：动作坞在（移动款的底部件），输入框要补一句话
     await expect(page.locator('.dock')).toBeVisible({ timeout: 60_000 });
+    // 决策 281 起 pending 坞默认收成一行手柄，动作面要点开才在——先按手柄展开
+    const dockHead = page.locator('.dock').getByRole('button', { name: /等你拍板/ });
+    await expect(dockHead).toBeVisible({ timeout: 30_000 });
+    await dockHead.click();
+    await expect(dockHead).toHaveAttribute('aria-expanded', 'true');
     const box = page.locator('.dock textarea');
     await expect(box).toBeVisible({ timeout: 30_000 });
     await box.fill('技术约束：仅 Chromium，单机本地运行。');
@@ -211,6 +216,16 @@ test.describe('UX2 ⑨ 超时 / 断线 / 长值（票 12 / 13 / 17）', () => {
     await expect(toast).toBeVisible({ timeout: 120_000 });
     // 坞回到屏上（新的 pending）
     await expect(page.locator('.dock')).toBeVisible({ timeout: 60_000 });
+
+    // 新一轮 pending 重新收起（决策 281），先按手柄展开——下面量的是**动作面**的几何，
+    // 展开层的按钮（`cancel` 恒在）才是「不压住动作坞的按钮」要保的东西。
+    // 重试链里 pending 会进出几轮、坞随之重挂载（展开态随之收起），故点到「真的展开」为止。
+    const head2 = page.locator('.dock').getByRole('button', { name: /等你拍板/ });
+    await expect(head2).toBeVisible({ timeout: 60_000 });
+    await expect(async () => {
+      await head2.click();
+      await expect(head2).toHaveAttribute('aria-expanded', 'true', { timeout: 2_000 });
+    }).toPass({ timeout: 60_000 });
 
     // 坞里至少有一颗能按的钮（任何 pending 都有：`cancel` 恒在），下面的命中测试才成立
     const dockEl = page.locator('.dock');

@@ -55,6 +55,7 @@
     proposalToolLabel,
   } from '../lib/proposals';
   import { CompositionGuard, shouldSubmitOnEnter } from '../lib/enterToSend';
+  import { growTextarea } from '../lib/talkDock';
   import { labelFor, loadToolLabels } from '../lib/toolLabels';
   import { formatDateTime } from '../lib/format';
   import {
@@ -286,6 +287,8 @@
   let timelineEl = $state<HTMLElement | undefined>();
   /** 状态区（展开一张时把它拉回视野，见 `toggleStop`）。 */
   let zoneEl = $state<HTMLElement | undefined>();
+  /** 输入坞的 textarea（折行档自长的接线点，见下面那个 `$effect`）。 */
+  let typerField = $state<HTMLTextAreaElement | undefined>();
 
   const pending = $derived(board.pendingTasks);
 
@@ -1017,6 +1020,21 @@
   );
 
   /**
+   * 坞的自长接线（决策 282 ③，修订 218④ 隐含的「rows=2 固定」）：折行档（≤899）
+   * **1 行起步、随内容自长、封顶 6 行**——判据在 `lib/talkDock.ts`，这里只把
+   * `rows` 拨到判据说的那一档。三条路都汇到这一处：`bind:value` 的每一次输入、
+   * 发送后的清空（`send` 里 `input = ''` 那一趟不经过 input 事件）、跨 899 的档位
+   * 切换（`folded` 翻转时按目标档重算——桌面档写回 2，逐像素不变，两侧差异是刻意的）。
+   */
+  $effect(() => {
+    void input;
+    const el = typerField;
+    if (!el) return;
+    if (folded) growTextarea(el);
+    else el.rows = 2;
+  });
+
+  /**
    * 工位名 → sprite：快照里的 stage 是后端字符串，未登记的值不猜（退回台账箱）。
    *
    * **这里刻意不调 `columnForStage`**（实现期观察，**不是**决策 251 的裁决——251② 只裁灯的
@@ -1344,8 +1362,9 @@
               class="crumb"
               href="#/share"
               onclick={() => router.navigate('/share')}>手机访问</a
-            >页扫码即可——手机上打开这一页是拿不到配对码的。若已添加到主屏幕，<b
-              >换过令牌后要重新添加一次</b
+            >页扫码即可——手机上打开这一页是拿不到配对码的。若已添加到主屏幕，从图标打开即是<b
+              >独立窗口</b
+            >（没有地址栏与底栏）；<b>换过令牌后要重新添加一次</b
             >（图标里记的是当时那条带令牌的地址）。
           </p>
         {/if}
@@ -1734,8 +1753,9 @@
                 class="crumb"
                 href="#/share"
                 onclick={() => router.navigate('/share')}>手机访问</a
-              >页扫码即可——手机上打开这一页是拿不到配对码的。若已添加到主屏幕，<b
-                >换过令牌后要重新添加一次</b
+              >页扫码即可——手机上打开这一页是拿不到配对码的。若已添加到主屏幕，从图标打开即是<b
+                >独立窗口</b
+              >（没有地址栏与底栏）；<b>换过令牌后要重新添加一次</b
               >（图标里记的是当时那条带令牌的地址）。
             </p>
           {/if}
@@ -1764,6 +1784,7 @@
       rows="2"
       {placeholder}
       bind:value={input}
+      bind:this={typerField}
       disabled={sending}
       onkeydown={onKeydown}
       oncompositionstart={() => composing.start()}
@@ -2852,8 +2873,12 @@
       position: sticky;
       bottom: var(--sbar-h);
       z-index: 25;
-      /* 名牌 tab 悬出框沿 16px，给它留出上沿（也给对话留出与输入坞的分界） */
-      margin-top: 40px;
+      /* 名牌悬出净空（决策 282 ②，修订 218④ 的「40 = 14 + 26」为「24 = 14 + 10」）：
+         悬出量按实测 14px 定（名牌 22px 高、`top: -16px` 相对 padding box，再让 2px
+         描边——上一轮 14/16 两个口径之差就是那道边框），呼吸 10px 与 `toggleStop` 的
+         `scroll-margin-top` 那道同量；时间线自带的 6px 下内边距计入后，最后一轮正文
+         与名牌之间仍有 16px 视觉余量 */
+      margin-top: 24px;
       display: grid;
       grid-template-columns: minmax(0, 1fr) auto;
       grid-template-areas: 'field send';
@@ -2861,6 +2886,10 @@
     }
     .typer textarea {
       grid-area: field;
+      /* 自长 1 行起步（决策 282 ③）：`app.css` 的 `textarea.input` 基线是
+         `min-height: 60px`——不归零，1 行仍占 60px，自长就白改。全局基线不动，
+         只在这一档归零；行高的下限由发送钮的 44px 触控底线抬住（见下）。 */
+      min-height: 0;
     }
     .typer-foot {
       display: contents;
@@ -2880,8 +2909,10 @@
     }
     .typer-foot .btn {
       grid-area: send;
-      /* 与输入框齐高（44px 是触控底线，2 行输入框在 16px 字号下约 63px） */
+      /* 与输入框齐高；自长 1 行起步之后（决策 282 ③）stretch 只有 37.6px——
+         触控底线 44px 由 min-height 抬住（网格行高随之抬到 44，坞与钮仍然齐平） */
       align-self: stretch;
+      min-height: 44px;
     }
   }
 

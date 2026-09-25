@@ -178,6 +178,17 @@ test.describe('对讲台 · 版面（票 04）', () => {
     await expect(page.locator('.typer textarea')).toBeVisible();
     await expect(page.getByRole('button', { name: /发送/ })).toBeVisible();
 
+    // 桌面款（≥900）自长不落这一档（决策 282 ③）：rows 仍是 2；框高仍是 60px——
+    // rows=2 的固有盒高（2×19.2 + 8 + 4 = 50.4）被 `app.css` 的 `min-height: 60px`
+    // （border-box）抬到 60，本批不动桌面一像素，把它钉住防漂移；坞前也没有折行档
+    // 那道 24px 外边距——899 / 900 两侧的差异是刻意的
+    expect(await page.locator('.typer textarea').evaluate((el) => el.rows)).toBe(2);
+    const taBox = await page.locator('.typer textarea').boundingBox();
+    expect(Math.abs((taBox?.height ?? 0) - 60), '桌面输入框高度变了').toBeLessThanOrEqual(1);
+    expect(await page.locator('.typer').evaluate((el) => getComputedStyle(el).marginTop)).toBe(
+      '0px',
+    );
+
     // 三分区的整页高度算式里含「桌面顶栏不超过 88px」这个假设（Talk.svelte 的 height）。
     // 顶栏长高超过它，整页就会开始能滚，「急停钉在第一屏」随之失效——故在这里钉住。
     const topBox = await page.locator('header.top').boundingBox();
@@ -1110,7 +1121,7 @@ test.describe('对讲台 · 折行档（决策 192 / 218）', () => {
   /* 决策 218 ⑥ 的「顶栏信号灯跳段」用例已随**铭牌行整行退场**删除：窄档顶栏不再有
      `.railnav`（导航行升为首行、道具栏行只在看板露出），那颗灯没有了，判据自然无处落。 */
 
-  test('输入坞：没有提示语行，常态 88px、贴底栏上沿', async ({ page }) => {
+  test('输入坞：没有提示语行，空态 69px（自长 1 行起步，决策 282 ③）、贴底栏上沿', async ({ page }) => {
     const bundle = watchBundle(page);
     await page.setViewportSize({ width: 430, height: 900 });
     await page.goto(`${app.webBase}/#/talk`);
@@ -1118,10 +1129,14 @@ test.describe('对讲台 · 折行档（决策 192 / 218）', () => {
 
     const typerBox = await page.locator('.typer').boundingBox();
     const sbarBox = await page.locator('.statusline').boundingBox();
+    // 决策 282 ③ 把「常态 88px」的定高断言改成空态坞高：rows=2 固定改为 1 行起步后，
+    // 坞 = 44px 的网格行（被发送钮的 44px 触控底线抬住，textarea 自身 1 行只有 37.6px）
+    // + 21px 坞内边距 + 4px 边框 ≈ 69px。修订 218④ 当日修订 ② 撤提示语后的那个数作废。
     expect(
-      Math.abs((typerBox?.height ?? 0) - 88),
-      '坞常态应当是 88px（撤掉那行提示语之后，决策 218 当日修订 ②）',
+      Math.abs((typerBox?.height ?? 0) - 69),
+      '坞空态应当是 69px（1 行起步，决策 282 ③）',
     ).toBeLessThanOrEqual(1);
+    // 贴合钉的是**贴合**不是定高：自长改变坞高，这条不该也不用跟着改
     expect(
       Math.abs((typerBox?.y ?? 0) + (typerBox?.height ?? 0) - (sbarBox?.y ?? 0)),
       '输入坞没有贴在底栏上沿',
@@ -1132,6 +1147,47 @@ test.describe('对讲台 · 折行档（决策 192 / 218）', () => {
     await expect(page.locator('.typer')).not.toContainText('记进审计');
     await expect(page.locator('.typer')).not.toContainText('正在回话');
     await expect(page.locator('.typer .hint')).toHaveCount(0);
+
+    expectBundleHealthy(bundle);
+  });
+
+  test('输入坞自长（决策 282 ③）：1 行起步、封顶 6 行框内滚、发完归零', async ({ page }) => {
+    const bundle = watchBundle(page);
+    await page.setViewportSize({ width: 430, height: 900 });
+    await page.goto(`${app.webBase}/#/talk`);
+    await settleBundle(page, bundle);
+
+    const ta = page.locator('.typer textarea');
+    const typer = page.locator('.typer');
+    const sbarBox = await page.locator('.statusline').boundingBox();
+    const dockH = async () => (await typer.boundingBox())?.height ?? 0;
+    const stillFlush = async () => {
+      const t = await typer.boundingBox();
+      return Math.abs((t?.y ?? 0) + (t?.height ?? 0) - (sbarBox?.y ?? 0));
+    };
+
+    // 粘贴 10 行硬换行 → 封顶 6 行：坞 = 6×25.6 + 21 + 4 ≈ 191px，到顶后框内滚
+    await ta.fill(Array.from({ length: 10 }, (_, i) => `第${i + 1}行`).join('\n'));
+    await expect.poll(dockH).toBeGreaterThanOrEqual(190);
+    expect(await dockH(), '封顶之后不应继续长高').toBeLessThanOrEqual(192);
+    expect(await stillFlush(), '自长之后没有贴在底栏上沿').toBeLessThanOrEqual(1);
+
+    // 软换行（无换行符的长句）也要自长到封顶——判据只认硬换行，接线层用 scrollHeight 校正
+    await ta.fill('长句'.repeat(120));
+    await expect.poll(dockH).toBeGreaterThanOrEqual(190);
+    expect(await dockH()).toBeLessThanOrEqual(192);
+
+    // 换行归零：删回到一句，坞回到 1 行起步的那一档
+    await ta.fill('就一句');
+    await expect.poll(dockH).toBeLessThanOrEqual(70);
+
+    // 发送照旧：回话真的从后端来，坞清空后回到空态 69px
+    await ta.press('Enter');
+    await expect(page.locator('.timeline .turn.mine', { hasText: '就一句' })).toHaveCount(1, {
+      timeout: 30_000,
+    });
+    await expect.poll(dockH).toBeLessThanOrEqual(70);
+    expect(await stillFlush(), '发完清空之后没有贴在底栏上沿').toBeLessThanOrEqual(1);
 
     expectBundleHealthy(bundle);
   });

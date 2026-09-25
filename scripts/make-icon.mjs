@@ -10,6 +10,7 @@
 //
 // 用法：
 //   node scripts/make-icon.mjs           生成 crates/desktop/icons/{icon.png,icon.icns}
+//                                        与 frontend/public/icons/ 的 Web/PWA 各档（决策 282 ④）
 //   node scripts/make-icon.mjs --check   校验取色表与规格 §2.1 逐字一致（不写文件）
 //   node scripts/make-icon.mjs --dump    把 16px 真实位图打成字符网格（核像素用）
 //   node scripts/make-icon.mjs --preview 写 .scratch/shots/icon-preview.png（放大对照图）
@@ -130,12 +131,17 @@ function plate(g, r, inset) {
     }
 }
 
-/** 母版：一次画完 32×32 的所有层（书写顺序即遮挡关系） */
-function master() {
+/** 母版：一次画完 32×32 的所有层（书写顺序即遮挡关系）。
+ *  `fullBleed`（决策 282 ④）：底板不再内缩圆角、夜班靛铺满整幅——maskable 与
+ *  apple-touch-icon 的目标会按自己的形状裁切（安卓圆形遮罩 / iOS 圆角），透明四角
+ *  会被裁成黑角或白角；满幅底 + 图形全部落在中央 80% 安全区内，两边就都吃得住。
+ *  桌面 Dock 仍用内缩圆角的那份（与邻近原生图标对齐是桌面格的事）。 */
+function master(fullBleed = false) {
   assertEven();
 
   const g = new Grid(N, N);
-  plate(g, PLATE.r, PLATE.inset);
+  if (fullBleed) g.rect(0, 0, N - 1, N - 1, C.bg);
+  else plate(g, PLATE.r, PLATE.inset);
 
   // ① 传送带：前 lit 节已通过（亮），其余未点亮
   for (let i = 0; i < BELT.n; i++) {
@@ -346,3 +352,18 @@ if (process.platform === 'darwin') {
 } else {
   console.log(`非 macOS：iconset 留在 ${set}，未生成 .icns`);
 }
+
+/* ── Web/PWA 出图（决策 282 ④）：主屏幕图标与桌面壳**同一份母版**，不另造第二套图形 ──
+   192 = 32×6、512 = 32×16，全整数倍（非整数的 180 不出档：apple-touch-icon 直接
+   用 192 那份，iOS 自己缩）。两个 purpose：
+   - any        → 桌面内缩圆角版（桌面 Chrome 铺图标时不裁切，圆角是图形自己的）；
+   - maskable   → 满幅底版（安卓圆形/圆角遮罩裁的是它；iOS 的 apple-touch-icon
+                  也用它——iOS 不认透明，桌面版的透明四角会露黑）。 */
+const WEB_ICONS_DIR = join(ROOT, 'frontend', 'public', 'icons');
+mkdirSync(WEB_ICONS_DIR, { recursive: true });
+const maskable = master(true);
+for (const n of [192, 512]) {
+  writeFileSync(join(WEB_ICONS_DIR, `icon-${n}.png`), encodePNG(scaleInt(m, n / 32)));
+  writeFileSync(join(WEB_ICONS_DIR, `icon-maskable-${n}.png`), encodePNG(scaleInt(maskable, n / 32)));
+}
+console.log('已写 frontend/public/icons/{icon-192,icon-512,icon-maskable-192,icon-maskable-512}.png');
