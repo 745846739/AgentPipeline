@@ -129,6 +129,14 @@ async fn run_executor_inner(task_id: &str, db: &SqlitePool) -> Result<()> {
         // 5. 逐游标更新：validate_attempts / pending 都记在各自游标上（决策 82）。
         //    单条游标的节点失败**不得向上传播**中止整个 executor（决策 89）——
         //    它只把该游标置为 pending，另一分支必须能继续跑完本阶段。
+        //
+        //    例外：**人按停的请求一旦发出，本轮结论一个字都不许写台账**（决策 276）——
+        //    落点与挂起都归发出请求的那一方（pause / rerun 端点）。不加这一句，一个
+        //    「刚好在这一瞬跑完」的节点会把游标推走，人按下的暂停会被静默覆盖。
+        //    判超时那条路（决策 226）不在此列：它自己已处置过台账。
+        if held_by_human(task_id) {
+            return Ok(()); // 让出执行权；台账归发出请求的那一方
+        }
         for (cursor, result) in results {
             match result {
                 Ok(node_result) => {
@@ -264,6 +272,12 @@ pending 不是一个"阶段"，而是**中断**。某条游标进入 pending 后
 - 该游标被移出可运行集合（决策 89）；
 - **另一分支不被中断**，继续跑完本阶段后停在 `waiting_join`（决策 82）；
 - 只有当没有可运行游标时，executor 才整体暂停等 resume。
+
+pending 的来路有两类，**处置面不同**：**流水线提出来的**（校验耗尽 / 等冲突 / 等人拍板…，
+原因类型见 `PendingKind`）与**人自己按下的暂停**（`user_paused`，决策 276）。后者由
+`POST /tasks/{id}/pause` 写、由 `POST /tasks/{id}/resume` 的 `continue`（续跑）或
+`goto`（重跑本阶段）松开；它是唯一一种**调度器不为它报「有人得管一管」**的 pending——
+人按住的东西不需要别人来提醒，托管的自动放行也不替人松开。
 
 ```
 pending 触发

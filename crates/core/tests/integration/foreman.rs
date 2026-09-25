@@ -1636,6 +1636,46 @@ async fn without_stewardship_the_same_call_is_still_a_proposal() {
     assert_eq!(task.status, TaskStatus::Pending, "提议不是执行");
 }
 
+/// 人按住的任务，托管**不许替他松开**（决策 276）。
+///
+/// 形状与自动集里的 `resume(continue)` 同名——但那是同一个 pending 两颗出口键之一，
+/// 人按住的意思正是「谁也别动它」：托管自动放行等于把一次明确的人工操作撤回去。
+#[tokio::test]
+async fn a_held_task_is_never_auto_released_by_stewardship() {
+    let h = Harness::seeded().await;
+    stewarded_task(&h, Some(Stewardship::enabled_now(h.clock.now()))).await;
+    // 把待办换成「人按下的暂停」：除原因外与上一条用例逐字相同，故红的只会是这条判据。
+    park_task(&h.store, "t1", PendingKind::UserPaused, "已按暂停（手动）").await;
+
+    let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let mut script = Script::new();
+    script.for_foreman().tool(
+        "task",
+        serde_json::json!({"action": "resume", "task_id": "t1", "resume_action": "continue"}),
+    );
+    script.for_foreman().text("提了，等你按键。");
+    let runner = h.runner_with_steward(script, calls.clone());
+    let turn = runner.say(None, "要不要放行").await.unwrap();
+
+    assert_eq!(
+        calls.load(std::sync::atomic::Ordering::SeqCst),
+        0,
+        "人按住的暂停：托管不自动放行"
+    );
+    let pending = h
+        .store
+        .list_pending_foreman_proposals(&turn.session.id)
+        .await
+        .unwrap();
+    assert_eq!(pending.len(), 1, "照常生成提议，按键仍是人的：{pending:?}");
+    let task = h.store.get_task("t1").await.unwrap();
+    assert_eq!(task.status, TaskStatus::Pending, "提议不是执行");
+    assert!(
+        task.stewardship.is_some_and(|s| s.auto_resumes == 0),
+        "一次自动动作都不该记"
+    );
+}
+
 #[tokio::test]
 async fn a_stewarded_task_still_cannot_auto_retry_or_merge() {
     // 托管放开的**恰好一个动作**（决策 210②）：retry / merge / review / cancel 永不自动。

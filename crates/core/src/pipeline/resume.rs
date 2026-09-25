@@ -300,7 +300,21 @@ pub async fn apply_action(
                 {
                     store.write_retry_feedback(cursor).await?;
                 }
-                advance_one(store, cursor, Landing::Entry(stage, node), &reason).await?
+                // 手动暂停那一行里的 `goto` 就是「重跑本阶段」（决策 276）：落点与别的 goto
+                // 相同，**要写的原因不同**——`user_rerun`（那一轮不算，重开一段对话），而不是
+                // 按被清掉的 pending 原因分类出来的 `user_paused`（那是「续跑」的去向）。
+                // 同一行两颗出口键，只有按键的这一方知道按的是哪一颗（与 merge / review 那两条
+                // 同一个理由）。
+                let rerun = cursor
+                    .pending_reason
+                    .as_ref()
+                    .is_some_and(|r| r.kind == PendingKind::UserPaused);
+                let landed = if rerun {
+                    advance_one(store, cursor, Landing::Rerun(stage, node), &reason).await?
+                } else {
+                    advance_one(store, cursor, Landing::Entry(stage, node), &reason).await?
+                };
+                landed
             }
         }
     };

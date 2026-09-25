@@ -21,6 +21,7 @@
     "human_review",
     "dependency_failed",
     "context_overflow",
-    "timeout"
+    "timeout",
+    "user_paused"
   ]
 }

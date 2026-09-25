@@ -32,6 +32,16 @@ pub enum Landing {
     /// 落到某 `(stage, node)`，并把 `validate_attempts` 归零（决策 43）。
     /// 跨阶段的 `Next`、kickback / goto、resume 的 goto 与串行 skip 走这一条。
     Entry(Stage, Node),
+    /// 同 [`Landing::Entry`]，但这是**人按下的「重跑本阶段」**（决策 276）。
+    ///
+    /// 落点与 `Entry` 逐字相同（含 `validate_attempts` 归零）；差别只在**离开 pending 时
+    /// 记下的原因**：重跑记 `user_rerun`，于是续接判定表给它 `false`（重跑 = 这一轮不算、
+    /// 重开一段对话），台账里也读得出「这一轮是人按了重跑」。
+    ///
+    /// 为什么不给 `advance` 再添一个 `resume_cause` 形参：那个参数只服务这一条落点，
+    /// 而落点**本来就是这个门吃的语言**（「门吃落点 + 修饰，不吃原因」）——把「这是重跑」
+    /// 说成一种落点，比让每个调用点多传一个恒为 `None` 的参数诚实。
+    Rerun(Stage, Node),
     /// 同 [`Landing::Entry`]，但落完再记一次尝试：`validate_attempts` 归零后 +1，**恒为 1**。
     ///
     /// 决策 135 的 judge goto（裁决不合格 → 打回本阶段 `execute`）走这一条。它今天的实现是
@@ -92,6 +102,22 @@ pub async fn advance(
         Landing::Entry(stage, node) => {
             store
                 .clear_pending_in_tx(&mut tx, &cursor.cursor_id, None)
+                .await?;
+            store
+                .set_cursor_stage_in_tx(&mut tx, &cursor.cursor_id, stage, node)
+                .await?;
+            Some((stage, node))
+        }
+        Landing::Rerun(stage, node) => {
+            // 「人按了重跑」由**按的是哪颗键**决定，与 merge / review 那两条同一个理由
+            // （`clear_pending_in_tx` 的 `explicit`）：同一条 `user_paused` 的两颗出口键
+            // （续跑 / 重跑）在 pending 原因上同名，只有端点知道按的是哪一颗。
+            store
+                .clear_pending_in_tx(
+                    &mut tx,
+                    &cursor.cursor_id,
+                    Some(crate::types::ResumeCause::UserRerun),
+                )
                 .await?;
             store
                 .set_cursor_stage_in_tx(&mut tx, &cursor.cursor_id, stage, node)

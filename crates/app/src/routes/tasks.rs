@@ -302,6 +302,66 @@ pub async fn resume(
     })))
 }
 
+// ─────────────────────── 手动按住 / 重跑本阶段（决策 276）───────────────────────
+
+/// `POST /tasks/{id}/pause`：把在跑的任务按住（位置保留，等人放行）。
+///
+/// 与 `resume` 的**分工**：这一颗管「停下来」，那颗管「放行」。暂停之后任务落在
+/// `pending`（原因 `user_paused`），续跑/重跑两颗钮由 `allowed_actions` 下发
+/// （`crate::actions` 的 `user_paused` 那一行）——与其余每一种 pending 同一套机制。
+pub async fn pause(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+) -> ApiResult<impl IntoResponse> {
+    // `&Arc<SseBus>` 在实参位不会自动收窄成 `&Arc<dyn SseSink>`，先立一个绑定（同 `resume`）。
+    let sse: std::sync::Arc<dyn agentpipeline_core::sse::SseSink> = state.sse.clone();
+    let paused = agentpipeline_core::pipeline::pause::pause(&state.store, &sse, &id)
+        .await
+        .map_err(map_core_error)?;
+    let note = if paused.notified {
+        "已按暂停：在跑的那一轮收到中止请求，位置保留——按「续跑」从原处接着走"
+    } else {
+        "已按暂停：位置保留。进程里没有在跑的执行体可通知（它早已退出，或卡在不返回的调用里）\
+         ——若它继续动，用 unstick 摘掉它"
+    };
+    Ok(Json(json!({
+        "ok": true,
+        "cursor_ids": paused.cursor_ids,
+        "notified": paused.notified,
+        "message": note,
+    })))
+}
+
+/// `POST /tasks/{id}/rerun`：**从本阶段入口**重跑一遍（那一轮不算）。
+///
+/// 与 `retry` 的分工写在这里，因为两颗钮的名字像、范围差一整条任务：
+/// 这一颗重跑**当前阶段**，`retry` 把整条任务打回 init。
+pub async fn rerun(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+) -> ApiResult<impl IntoResponse> {
+    let sse: std::sync::Arc<dyn agentpipeline_core::sse::SseSink> = state.sse.clone();
+    let rerun =
+        agentpipeline_core::pipeline::pause::rerun(&state.store, &state.resume_hook, &sse, &id)
+            .await
+            .map_err(map_core_error)?;
+    let note = if rerun.notified {
+        "已重跑本阶段：在跑的那一轮收到中止请求，游标回到本阶段入口，执行体已重派"
+    } else {
+        "已重跑本阶段：游标回到本阶段入口，执行体已重派（当时进程里没有在跑的执行体可通知）"
+    };
+    Ok(Json(json!({
+        "ok": true,
+        "cursors": rerun
+            .moved
+            .iter()
+            .map(|m| json!({ "cursor_id": m.cursor_id, "stage": m.stage }))
+            .collect::<Vec<_>>(),
+        "notified": rerun.notified,
+        "message": note,
+    })))
+}
+
 // ─────────────────────────────── 旁路动作 ───────────────────────────────
 
 /// `POST /tasks/{id}/retry`（决策 125 / 117）

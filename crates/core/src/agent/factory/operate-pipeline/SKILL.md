@@ -14,8 +14,8 @@ description: 操作 AgentPipeline 流水线的操作手册——读数取真、�
   `task` 都只对它生效）。
 - **`.scratch/` 下的 markdown 票据不在范围**：它没有通到看板的通道。指令要你操作 `.scratch`
   票时，直接说明做不到——两套状态体系不混。
-- 不发明动作：`task` 族只有七个——`create` / `resume` / `retry` / `cancel` / `review` /
-  `merge` / `unstick`。指令超出这七个，说明做不到，不要拼一个像的动作名。
+- 不发明动作：`task` 族只有九个——`create` / `resume` / `retry` / `pause` / `rerun` / `cancel` /
+  `review` / `merge` / `unstick`。指令超出这九个，说明做不到，不要拼一个像的动作名。
 
 ## 读流程（只读问题 → 只回答，零提议）
 
@@ -31,13 +31,19 @@ description: 操作 AgentPipeline 流水线的操作手册——读数取真、�
 1. **先读后提**：动作必须来自该任务此刻的 `allowed_actions`（`read_task` 的读数里）。不在
    清单里的动作不要提；`resume_action` / `cursor_id` / `decision` 这些参数同样只取自当下
    读数，不凭记忆、不猜。
-2. 七个动作各自的适用：
+2. 九个动作各自的适用：
    - `create`：新建任务，要 `project_id` 与 `title`（依赖、评审模式按需）。
-   - `resume`：pending（等人拍板 / 拍过板要继续）的任务继续走，要 `task_id` +
-     `resume_action`；多条活跃游标时带 `cursor_id`。`resume_action` 为 `goto` 时
-     **必须带落点**：把 `allowed_actions` 该条 `target` 里的 `stage` / `node` 原样抄进
-     `target_stage` / `target_node`（与确认按钮同一套参数，缺了按键必 400）。
-   - `retry`：只对**终态**任务重跑。
+   - `resume`：**pending** 的任务继续走，要 `task_id` + `resume_action`；多条活跃游标时带
+     `cursor_id`。`resume_action` 为 `goto` 时**必须带落点**：把 `allowed_actions` 该条
+     `target` 里的 `stage` / `node` 原样抄进 `target_stage` / `target_node`（与确认按钮同一套
+     参数，缺了按键必 400）。**被人按住过的任务（`pending_reason.type = user_paused`）也从这里
+     松开**——它那两颗出口键在 `allowed_actions` 里：续跑是 `continue`，重跑本阶段是 `goto`。
+   - `retry`：只对**终态**任务重跑（整条回到 init）。
+   - `pause`：把**在跑**的任务按住（`running`）——中止在飞的那一轮、位置保留，只要 `task_id`。
+     按住之后任务转 `pending`、原因 `user_paused`，续跑/重跑那两颗钮随 `allowed_actions` 出现。
+     队列里（`queued`）与等依赖（`waiting`）的任务会被拒：还没开跑，没什么可按住的。
+   - `rerun`：**当前阶段**从入口重跑一遍（那一轮不算）——同样只对**在跑**的任务；已经停住的
+     任务从 `resume` 的 `goto` 走（同一件事的另一条入口，别拿它去 rerun）。
    - `cancel`：取消任务。
    - `review`：人工评审，要 `approved`（true 通过 / false 打回），意见走 `comments`。
    - `merge`：合入决定，`decision` 以该任务此刻 `allowed_actions` 给出的动作为准。
@@ -59,6 +65,31 @@ description: 操作 AgentPipeline 流水线的操作手册——读数取真、�
 3. **TTL 10 分钟**：提议过期后重新提一张，不是报错完事。
 4. 接到批量指令的顺序：先读全体状态 → 逐任务各备一张提议 → 告诉值班经理「一票一按，按
    顺序来」。
+
+## 非 pending 任务的三颗钮（暂停 / 续跑 / 重跑）
+
+值班经理说「把它按住 / 先别跑了 / 让它重来这一阶段」时，翻这一节。要点只有一句：
+**暂停与重跑各是一颗键、各一条提议，不合成一步。**
+
+1. **暂停**（`task` + `pause` + `task_id`）：把在跑的任务按住——在飞的那一轮收到中止请求、
+   位置保留，任务转 `pending`、原因 `user_paused`。**只对已被准入、且还有在跑的游标的任务**
+   （`read_task` 里 `status` 是 `running`；两条游标里一条挂着、另一条在跑时 `status` 也可以是
+   `pending`——那时按住的正是还在跑的那条）；`queued` / `waiting` 会被拒（还没开跑），
+   「都在等拍板 / 都停在 join 边界」也会被拒（已经停着的东西不需要再暂停）。
+   回执里那句 `notified` 是事实：`false` = 进程里没有在跑的执行体可通知（它早已退出，或卡在
+   一个不会返回的调用里）——台账照旧按暂停落定，但**要如实转述这一句**，不要说成「已经停稳了」。
+2. **续跑**（`task` + `resume` + `resume_action=continue`）：从按住的那一处接着走，位置不动。
+   这是**唯一**的续跑入口，与别的 pending 完全是同一条路。
+3. **重跑本阶段**（`task` + `rerun` + `task_id`）：那一轮不算，从**本阶段入口**重来。
+   - 任务**已经停着**（`pending`）时**不要用 `rerun`**：那会被拒并让你改写 `resume`
+     （动作名 `goto` + 落点 = 本阶段入口，落点照抄 `allowed_actions`）；
+   - 本阶段**一次都没跑过**（台账里没有它的 run）时也被拒——那种「重跑」什么也不会发生；
+   - 想重跑**整条**任务（回到 init）用 `retry`，但那只对终态任务生效。
+4. **连锁动作分步提**（见下面「批量规则」②）：「暂停 → 重跑」「暂停 → 续跑」各是两张卡：
+   先提暂停、等按键落地看见回执，再提下一张。**不要**指望一次按键做完两件事。
+5. **人按住的任务，托管也不会替他松开**——这不是你要记的规则，是系统事实：值班长在托管里
+   自动放行的只有「人拍过板要继续」那一种 pending；你读到 `user_paused` 时的正确动作是
+   备好提议等人按键。
 
 ## 值守轮规则
 

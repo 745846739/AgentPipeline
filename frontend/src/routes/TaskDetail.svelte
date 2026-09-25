@@ -1,6 +1,6 @@
 <script lang="ts">
   import { onDestroy, onMount, tick } from 'svelte';
-  import { archiveTask, getForemanSessions, listProviders, retryTask, setStewardship } from '../api/client';
+  import { archiveTask, getForemanSessions, listProviders, pauseTask, rerunTask, retryTask, setStewardship } from '../api/client';
   import type { AllowedAction, Provider } from '../api/types';
   import PipelineRail from '../components/pipeline/PipelineRail.svelte';
   import CommandLog from '../components/task/CommandLog.svelte';
@@ -248,6 +248,34 @@
     }
     stewardBusy = false;
   }
+
+  /**
+   * 非 pending 任务的两颗手动钮（决策 276）：**暂停**与**重跑本阶段**。
+   *
+   * 只在 `running` 上摆：暂停的前提是「已被准入 + 有在跑的游标」，而那正是 `running`
+   * 这一档；`queued` / `waiting` 还没开跑（后端会拒，报文说清为什么），终态有自己的
+   * 两颗（`bypassActions`）。「续跑」不在这里——按住之后任务变 pending，那颗钮由后端的
+   * `allowed_actions` 下发，与其余每一种待办同一套机制（界面不写第二份）。
+   */
+  const canHold = $derived(task?.status === 'running');
+
+  /** 暂停：走 `bypassBusy` 那套忙态与错误位（与既有的旁路动作同一副面孔）。 */
+  async function hold(kind: 'pause' | 'rerun') {
+    bypassBusy = kind;
+    taskDetail.actionError = null;
+    taskDetail.actionNote = null;
+    try {
+      const result = kind === 'pause' ? await pauseTask(id) : await rerunTask(id);
+      // 后端那句报文带**事实**（有没有真的通知到在跑的执行体）——照原样显示，不自己拼。
+      taskDetail.actionNote = result.message;
+      await taskDetail.load(id, true);
+    } catch (err) {
+      // 与 bypass 同一条纪律：吞掉 rejection = 点了钮而屏上什么都没发生。
+      taskDetail.actionError = (err as Error).message;
+    } finally {
+      bypassBusy = null;
+    }
+  }
 </script>
 
 {#snippet bypassActions()}
@@ -260,6 +288,17 @@
       {/if}
       <button type="button" class="btn quiet" disabled={bypassBusy !== null} onclick={() => bypass('archive')}>
         归档
+      </button>
+    </div>
+  {:else if canHold}
+    <!-- 在跑的任务（决策 276）：按住 / 从本阶段入口重来。续跑那一步等按住之后再出现
+         （任务转 pending，动作坞换成 allowed_actions 下发的那一组）。 -->
+    <div class="bypass">
+      <button type="button" class="btn" disabled={bypassBusy !== null} onclick={() => hold('pause')}>
+        暂停
+      </button>
+      <button type="button" class="btn quiet" disabled={bypassBusy !== null} onclick={() => hold('rerun')}>
+        重跑本阶段
       </button>
     </div>
   {/if}

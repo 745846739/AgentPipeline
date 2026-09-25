@@ -6,9 +6,11 @@
 //!    执行）：它的结构半边是 [`RunLedger::finish`] **不抢已有终态**——行已是
 //!    Success / Failed / Timeout 时只补用量、不碰 status / error。`RunOutcome::default()`
 //!    的 0 不得覆盖执行体手里已记过的真读数（决策 226）。
-//! 2. **cancel 分支只补用量、不碰终态**（[`RunLedger::record_usage`]）：「超时」由判超时的
-//!    调度器写着，执行体收口覆盖会把台账里的「超时」读成「失败」——而顺手放出去的那次
-//!    重试正按「超时」记着账（决策 226）。
+//! 2. **cancel 分支只补用量、不碰终态**（[`RunLedger::finish_cancelled`] 中「已有终态」那
+//!    一支）：「超时」由判超时的调度器写着，执行体收口覆盖会把台账里的「超时」读成
+//!    「失败」——而顺手放出去的那次重试正按「超时」记着账（决策 226）。**判超时那条路
+//!    先写、执行体后写**，故同一道红线由「谁先写谁说了算」保证；反过来（没有人写过终态，
+//!    例如人按停）执行体自己收成 `Cancelled`——台账里不留一条永远在跑的假记录（决策 276）。
 //! 3. **续接链接只落 round 0**（[`RunLedger::link_continuation`]）：落进干净重试轮会让
 //!    `metrics::total_tokens` 把同一段历史排除两次——token 少算不是双算，且读数随重试
 //!    次数漂移（决策 180 / 票 13 必要条件二）。
@@ -109,8 +111,8 @@ impl<'a> RunLedger<'a> {
     /// 同一个读数——计时只算一次）。
     ///
     /// **不抢已有终态**（红线①的结构半边）：行已被判超时那侧收口成 Timeout / 已是
-    /// Success / Failed 时，只把执行体手里的用量补进去（[`Self::record_usage`] 同一条
-    /// SQL），status / error / duration 一个字不碰。行不存在时与原「UPDATE 空转」同义：
+    /// Success / Failed 时，只把执行体手里的用量补进去（同一条 SQL），
+    /// status / error / duration 一个字不碰。行不存在时与原「UPDATE 空转」同义：
     /// 什么都不写、照常返回读数（SSE 照发）。
     pub(crate) async fn finish(
         &self,
@@ -163,10 +165,46 @@ impl<'a> RunLedger<'a> {
         }
     }
 
-    /// cancel 路径专用（红线②）：只补用量，**status / error 不碰**——终态归判超时的
-    /// 调度器写（决策 226）。
-    pub(crate) async fn record_usage(&self, run_id: i64, tokens: &RunTokens) -> Result<()> {
-        self.store.record_run_usage(run_id, tokens).await
+    /// **中止路径的收口**（决策 276）：判超时 / 人按停之后执行体自己收口时，顺手把这一条
+    /// run 收成 `Cancelled`——**但只在还没有人判过它的时候**。
+    ///
+    /// 为什么需要它：红线②（决策 226）把终态判给了「判超时的那一方」，因为那边同时还要
+    /// 决定「重试还是挂起」。可**人按停**那条路不判终态（见 `pipeline::pause`：人按停只管
+    /// 按住，不重试也不挂起）——于是被判停的那条 run 会永远留在 `running` 上：台账里那句
+    /// 「还在跑」是假的，而 `check_timeouts` 日后还会把它判一次超时，把人的处置覆盖掉。
+    ///
+    /// 与 [`Self::finish`] 的同一道红线：**行已是终态就一个字都不碰**（只补用量）。故两方
+    /// 都可调用它——谁先写谁说了算（判超时那条路先写 Timeout，执行体这一笔退化成补用量）。
+    pub(crate) async fn finish_cancelled(
+        &self,
+        run_id: i64,
+        started: DateTime<Utc>,
+        error: String,
+        tokens: &RunTokens,
+    ) -> Result<()> {
+        let duration_ms = since_ms(self.clock.now(), started);
+        let Some(run) = self.store.get_run(run_id).await? else {
+            return Ok(());
+        };
+        if run.status != NodeStatus::Running {
+            self.store.record_run_usage(run_id, tokens).await?;
+            return Ok(());
+        }
+        self.store
+            .finish_run(
+                run_id,
+                &RunOutcome {
+                    status: Some(NodeStatus::Cancelled),
+                    duration_ms,
+                    error: Some(error),
+                    prompt_tokens: tokens.prompt,
+                    completion_tokens: tokens.completion,
+                    cache_read_tokens: tokens.cache_read,
+                    cache_write_tokens: tokens.cache_write,
+                    ..Default::default()
+                },
+            )
+            .await
     }
 
     /// 续接链接**只落 round 0**（红线③；决策 180 / 票 13 必要条件二）。`round` 由编排侧
@@ -363,35 +401,68 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn record_usage_adds_tokens_without_touching_status() {
-        // 红线②：cancel 路径只补用量——status / error 一个字不碰。
+    async fn cancelled_finish_writes_the_status_only_when_nobody_else_did() {
+        // 决策 276：中止路径的收口有**两个来路**，这一条把两者的边界一次钉住——
+        // ① 行仍是 running（人按停那条路不判终态）→ 自己收成 Cancelled（否则它永远
+        //    留在「还在跑」上，日后还会被 check_timeouts 判一次超时把人的处置覆盖掉）；
+        // ② 行已被判终态（判超时那侧先写了 Timeout）→ 一个字都不碰，只补用量（红线①）。
         let (_tmp, store, task, cursor, clock) = base().await;
         let ledger = RunLedger::new(&store, &clock);
         let (run_id, _) = ledger
             .begin(&task, &cursor.cursor_id, cursor.stage, cursor.node, "main")
             .await
             .unwrap();
+
+        // ① 没人判过：中止路径自己收成 Cancelled
+        let tokens = RunTokens {
+            prompt: 11,
+            completion: 22,
+            ..Default::default()
+        };
+        ledger
+            .finish_cancelled(
+                run_id,
+                clock.now(),
+                "已按人工暂停 / 重跑中止".into(),
+                &tokens,
+            )
+            .await
+            .unwrap();
+        let run = store.get_run(run_id).await.unwrap().unwrap();
+        assert_eq!(run.status, NodeStatus::Cancelled);
+        assert_eq!(
+            run.error.as_deref(),
+            Some("已按人工暂停 / 重跑中止"),
+            "台账里要读得出是谁把它按停的"
+        );
+        assert_eq!(run.prompt_tokens, 11, "中止那一轮烧掉的量照记");
+
+        // ② 已有终态（判超时那侧先写）：只补用量，status / error / duration 不动
+        let (run2, _) = ledger
+            .begin(&task, &cursor.cursor_id, cursor.stage, cursor.node, "main")
+            .await
+            .unwrap();
         store
             .finish_run(
-                run_id,
+                run2,
                 &RunOutcome {
                     status: Some(NodeStatus::Timeout),
+                    duration_ms: 999,
                     error: Some("节点超时".into()),
                     ..Default::default()
                 },
             )
             .await
             .unwrap();
-        let tokens = RunTokens {
-            prompt: 11,
-            completion: 22,
-            ..Default::default()
-        };
-        ledger.record_usage(run_id, &tokens).await.unwrap();
-        let run = store.get_run(run_id).await.unwrap().unwrap();
-        assert_eq!(run.status, NodeStatus::Timeout, "状态不动");
-        assert_eq!(run.error.as_deref(), Some("节点超时"), "error 不动");
-        assert_eq!(run.prompt_tokens, 11);
+        ledger
+            .finish_cancelled(run2, clock.now(), "不该写进去".into(), &tokens)
+            .await
+            .unwrap();
+        let run = store.get_run(run2).await.unwrap().unwrap();
+        assert_eq!(run.status, NodeStatus::Timeout, "终态不被抢");
+        assert_eq!(run.error.as_deref(), Some("节点超时"), "error 不被抢");
+        assert_eq!(run.duration_ms, 999, "duration 不被抢");
+        assert_eq!(run.prompt_tokens, 11, "但用量照补（决策 226 真读数）");
         assert_eq!(run.completion_tokens, 22);
     }
 

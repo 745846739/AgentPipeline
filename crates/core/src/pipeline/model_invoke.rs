@@ -10,7 +10,7 @@
 //!   [`RequestPlan::check_budget`] + [`RequestPlan::request`]；**Overflow 的翻译在本片**
 //!   ——先落快照与会话行、再 `NodeOutput::Pending(context_overflow)`：构造落点是编排的
 //!   职责（决策 245「门吃落点不吃原因」：01 检测、03 翻译）。
-//! - **02 run 台账**：`begin / mark_step / finish / record_usage / link / take` 全经
+//! - **02 run 台账**：`begin / mark_step / finish / finish_cancelled / link / take` 全经
 //!   [`RunLedger`]，承重顺序四条在本片的调用侧兑现（见 `run_ledger` 模块 doc）。
 //!
 //! **SSE 发射留守**：事件形状的唯一出口在 `executor`（`emit_tool_event` /
@@ -179,10 +179,15 @@ impl ModelInvoke {
                     return Ok(output);
                 }
                 Err(AttemptFailure { error, tokens }) => {
-                    // 被中止（红线② / 决策 226）：终态归判超时的 `scheduler::handle_timeout`，
-                    // 这里只补执行体手里的用量、不碰 status/error——理由见 `run_ledger` 模块 doc。
+                    // 被中止（红线② / 决策 226 / 276）：**谁判的终态谁说了算**——判超时那条路
+                    // 已经写过 Timeout，人按停那条路不判终态，于是这里自己收成 `Cancelled`
+                    // （行已是终态时这一笔退化成「只补用量」）。不收的话，一次被按停的 run 会
+                    // 永远留在 `running` 上：台账里那句「还在跑」是假的，而 `check_timeouts`
+                    // 日后还会把它判一次超时，把人的处置覆盖掉。
                     if error.is_cancelled() {
-                        self.ledger().record_usage(run_id, &tokens).await?;
+                        self.ledger()
+                            .finish_cancelled(run_id, started, error.to_string(), &tokens)
+                            .await?;
                         // 用量变了，任务投影就得跟着走（`total_tokens` 是从 run 行**重算**的）
                         self.store.refresh_task_totals(&task.id).await?;
                         return Err(error);
@@ -459,15 +464,17 @@ impl ModelInvoke {
         let mut submitted: Option<serde_json::Value> = None;
 
         loop {
-            // 中止请求（决策 226）：每一轮开头先看一眼。被叫醒的那一轮由下面模型调用处的
-            // `select!` 打断；这里拦的是另外两种情形——信号在两轮之间到达、以及已经请求过
+            // 中止请求（决策 226 / 276）：每一轮开头先看一眼。被叫醒的那一轮由下面模型调用处
+            // 的 `select!` 打断；这里拦的是另外两种情形——信号在两轮之间到达、以及已经请求过
             // 中止却又进了一轮（重试循环会走到这里）。
             let cancel = cancel_signal(&task.id);
             if let Some(signal) = &cancel {
                 if signal.is_requested() {
                     return Err(Error::Cancelled(format!(
-                        "{}.{} 的本次执行已按节点超时中止",
-                        cursor.stage, cursor.node
+                        "{}.{} 的本次执行已按{}中止",
+                        cursor.stage,
+                        cursor.node,
+                        signal.origin().as_str()
                     )));
                 }
             }
@@ -511,8 +518,10 @@ impl ModelInvoke {
                     r = self.llm.complete(req) => r?,
                     _ = signal.wait() => {
                         return Err(Error::Cancelled(format!(
-                            "{}.{} 的模型调用已按节点超时中止",
-                            cursor.stage, cursor.node
+                            "{}.{} 的模型调用已按{}中止",
+                            cursor.stage,
+                            cursor.node,
+                            signal.origin().as_str()
                         )));
                     }
                 },

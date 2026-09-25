@@ -311,6 +311,22 @@ export function retryTask(id: string): Promise<unknown> {
   return request(`/tasks/${encodeURIComponent(id)}/retry`, { method: 'POST' });
 }
 
+/**
+ * 把**在跑**的任务按住（决策 276）：中止在飞的那一轮、位置保留。
+ *
+ * `message` 是后端写好的那一句（含「有没有通知到在跑的执行体」这件事实）——界面直接显示，
+ * 不自己拼一句「应该成功了」的话。续跑 / 重跑本阶段那两颗钮不在这里：它们由暂停之后
+ * 后端下发的 `allowed_actions` 给（`continue` / 带落点的 `goto`），走 `resume` 那条路。
+ */
+export function pauseTask(id: string): Promise<{ ok: boolean; message: string }> {
+  return request(`/tasks/${encodeURIComponent(id)}/pause`, { method: 'POST' });
+}
+
+/** 从**本阶段入口**重跑一遍（决策 276）：那一轮不算。整条任务回 init 重跑是 `retryTask`。 */
+export function rerunTask(id: string): Promise<{ ok: boolean; message: string }> {
+  return request(`/tasks/${encodeURIComponent(id)}/rerun`, { method: 'POST' });
+}
+
 export function archiveTask(id: string): Promise<unknown> {
   return request(`/tasks/${encodeURIComponent(id)}/archive`, { method: 'POST' });
 }

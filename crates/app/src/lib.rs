@@ -51,6 +51,11 @@ pub fn build_router(state: AppState) -> Router {
         .route("/tasks/{id}/flow", get(routes::tasks::flow))
         .route("/tasks/{id}/metrics", get(routes::tasks::metrics))
         .route("/tasks/{id}/resume", post(routes::tasks::resume))
+        // 手动按住 / 重跑本阶段（决策 276）：**非 pending 任务**的那两颗钮。
+        // 「续跑」不在这里——它是 `user_paused` 那一行 pending 的 `resume(continue)`，
+        // 与其余每一种 pending 同一套机制（`crate::actions` 的动作表）。
+        .route("/tasks/{id}/pause", post(routes::tasks::pause))
+        .route("/tasks/{id}/rerun", post(routes::tasks::rerun))
         .route("/tasks/{id}/retry", post(routes::tasks::retry))
         // 任务级托管（决策 210① / 票 08）：开关由人拨，授权范围只有一个动作。
         .route(

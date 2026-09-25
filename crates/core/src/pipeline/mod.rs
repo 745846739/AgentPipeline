@@ -9,6 +9,7 @@ pub mod landing;
 pub mod merge;
 pub(crate) mod model_invoke;
 pub(crate) mod model_request;
+pub mod pause;
 pub mod proposals;
 pub mod pseudo;
 pub mod repair;

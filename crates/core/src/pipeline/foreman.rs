@@ -368,7 +368,9 @@ pub const FOREMAN_TOOL_SPECS: [ForemanToolSpec; 24] = [
         description: "对一个流水线任务动作。action 取值：\
                       `create`（建任务，要 project_id 与 title）、\
                       `resume`（让人拍过板的 pending 继续走，要 task_id 与 resume_action）、\
-                      `retry`（重跑一个终态任务）、\
+                      `retry`（重跑一个终态任务，回到 init）、\
+                      `pause`（把**在跑**的任务按住：中止在飞的那一轮、位置保留，要 task_id）、\
+                      `rerun`（把**当前阶段**从入口重跑一遍，那一轮不算，要 task_id）、\
                       `cancel`（取消）、\
                       `review`（人工评审通过/打回，要 approved）、\
                       `merge`（合入决定，要 decision=approve 或 reject）、\
@@ -376,8 +378,11 @@ pub const FOREMAN_TOOL_SPECS: [ForemanToolSpec; 24] = [
                       清执行者、标终态、游标转 pending；**只对真卡住的任务生效**）。\
                       参数与界面上那个按钮点下去时发的一模一样——先 read_task 看清它现在卡在\
                       哪个 pending、允许的动作是什么，再决定 action 与 resume_action。\
+                      被 `pause` 按住过的任务（pending 原因 `user_paused`）用 `resume` 松开：\
+                      动作名取 read_task 的 allowed_actions——续跑是 `continue`、\
+                      重跑本阶段是带落点的 `goto`。\
                       每条都要值班经理按键确认。",
-        parameters: r#"{"type":"object","properties":{"action":{"type":"string","enum":["create","resume","retry","cancel","review","merge","unstick"],"description":"要做的动作"},"task_id":{"type":"string","description":"目标任务（create 之外的 action 都要）"},"project_id":{"type":"string","description":"create：建在哪个项目下"},"title":{"type":"string","description":"create：任务标题"},"description":{"type":"string","description":"create：任务描述"},"depends_on":{"type":"array","items":{"type":"string"},"description":"create：依赖的任务 id"},"review_mode":{"type":"string","enum":["agent","human"],"description":"create：评审模式"},"cursor_id":{"type":"string","description":"resume：指定游标（多条活跃游标时必填）"},"resume_action":{"type":"string","description":"resume：拍板的动作名（read_task 的 allowed_actions 里那几个）"},"target_stage":{"type":"string","description":"resume：跳到哪个阶段"},"target_node":{"type":"string","description":"resume：跳到哪个节点"},"input":{"type":"string","description":"resume：给这次拍板的说明 / 打回意见"},"approved":{"type":"boolean","description":"review：通过还是打回"},"comments":{"type":"string","description":"review：打回时带给下游的意见"},"decision":{"type":"string","enum":["approve","reject"],"description":"merge：合入还是打回"}},"required":["action"]}"#,
+        parameters: r#"{"type":"object","properties":{"action":{"type":"string","enum":["create","resume","retry","pause","rerun","cancel","review","merge","unstick"],"description":"要做的动作"},"task_id":{"type":"string","description":"目标任务（create 之外的 action 都要）"},"project_id":{"type":"string","description":"create：建在哪个项目下"},"title":{"type":"string","description":"create：任务标题"},"description":{"type":"string","description":"create：任务描述"},"depends_on":{"type":"array","items":{"type":"string"},"description":"create：依赖的任务 id"},"review_mode":{"type":"string","enum":["agent","human"],"description":"create：评审模式"},"cursor_id":{"type":"string","description":"resume：指定游标（多条活跃游标时必填）"},"resume_action":{"type":"string","description":"resume：拍板的动作名（read_task 的 allowed_actions 里那几个）"},"target_stage":{"type":"string","description":"resume：跳到哪个阶段"},"target_node":{"type":"string","description":"resume：跳到哪个节点"},"input":{"type":"string","description":"resume：给这次拍板的说明 / 打回意见"},"approved":{"type":"boolean","description":"review：通过还是打回"},"comments":{"type":"string","description":"review：打回时带给下游的意见"},"decision":{"type":"string","enum":["approve","reject"],"description":"merge：合入还是打回"}},"required":["action"]}"#,
     },
     ForemanToolSpec {
         name: "config",

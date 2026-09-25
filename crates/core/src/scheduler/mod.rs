@@ -543,6 +543,12 @@ impl KanbanScheduler {
             if !stalled_candidate {
                 continue;
             }
+            // 决策 276：**人自己按下的暂停不在这里**。停滞提醒与 `stalled` 标记服务的是
+            // 「没人管的 pending」，而手动暂停恰恰是有人在管——给按住的任务挂一个「停滞 24h」
+            // 的红标、还把值班长叫起来，等于用噪声回报一次明确的人工操作。
+            if crate::pipeline::cursor::all_pending_are_human_holds(&live) {
+                continue;
+            }
             let Some(since) = live
                 .iter()
                 .filter(|c| c.is_pending())
@@ -670,8 +676,18 @@ impl KanbanScheduler {
             .await?
         {
             // ① 任务转 pending（含重试耗尽 / 上下文溢出两个子类）
+            //
+            // 决策 276：**人自己按下的暂停不算「新鲜事」**——待办表服务的是「值班长该看一眼
+            // 什么」，而按住任务的人已经在看着它了。跳过整块（含下面的重复计数 ②）：把一次
+            // 明确的人工操作记成一条待办，只会让第二天早上那份简报多一条假信号。
             if let Some(reason) = &task.pending_reason {
                 let live = self.store.load_live_cursors(&task.id).await?;
+                // 决策 276：**人自己按住的任务整条跳过本 tick 的发现**（① 与 ② 是它的家，
+                // 后面 ③–⑦ 对一条 pending 的任务本就都不成立：它们要么要求 `running`、要么
+                // 是「新鲜事」那几条——跳过它们是同一条判据的自然延伸，不是漏读）。
+                if crate::pipeline::cursor::all_pending_are_human_holds(&live) {
+                    continue;
+                }
                 let occurred = live
                     .iter()
                     .filter(|c| c.is_pending())

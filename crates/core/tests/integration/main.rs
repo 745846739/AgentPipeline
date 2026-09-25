@@ -27,6 +27,7 @@ mod llm_smoke;
 mod model_requests;
 mod notify;
 mod pairing;
+mod pause;
 mod process_group;
 mod production_llm;
 mod project_analysis_observation;

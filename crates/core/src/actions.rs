@@ -208,6 +208,20 @@ pub fn allowed_actions(reason: &PendingReason, cursor_id: Option<&str>) -> Vec<A
             AllowedAction::side_effect("cancel", "取消任务"),
         ],
 
+        // ── user_paused：人自己把任务按住之后的两条出口（决策 276）──
+        //
+        // 与其余每一行都不同：这一行的 pending **不是**流水线提出来的问题，而是人按下的
+        // 暂停。故它的动作只有两颗「松开」的钮 + 终止——没有 skip、没有补充输入：
+        // 位置没有被谁挪走，续跑就从按住的那一处接着走。
+        //
+        // `goto` 的落点同样走 `entry_node`（决策 69 的同一张表）：重跑的是**本阶段**，
+        // 不是「本阶段剩下的那几个节点」。
+        (PendingKind::UserPaused, _) => vec![
+            AllowedAction::resume("continue", "续跑（从按住的地方接着走）"),
+            AllowedAction::goto("重跑本阶段", reason.stage, entry_node(reason.stage)),
+            AllowedAction::side_effect("cancel", "取消任务"),
+        ],
+
         // ── retry_exhausted（merge / develop / test 三套动作集）──
         (PendingKind::RetryExhausted, _) if reason.stage == Stage::Merge => vec![
             // 决策 86 / 122：merge 无 skip
@@ -631,6 +645,9 @@ mod tests {
                 Stage::Merge,
             ),
             (PendingKind::UserDecision, None, Stage::Review),
+            (PendingKind::UserPaused, None, Stage::ArchitectDesign),
+            (PendingKind::UserPaused, None, Stage::Develop),
+            (PendingKind::UserPaused, None, Stage::Merge),
             (PendingKind::RetryExhausted, None, Stage::ArchitectDesign),
             (PendingKind::RetryExhausted, None, Stage::Merge),
             (PendingKind::RetryExhausted, None, Stage::Develop),
@@ -690,6 +707,39 @@ mod tests {
         assert!(acts
             .iter()
             .all(|a| a.cursor_id.as_deref() == Some("cursor-42")));
+    }
+
+    /// 人按下的暂停那两行（决策 276）：续跑 + 重跑本阶段 + 取消，**没有 skip**。
+    ///
+    /// 三条一起断言而不是只断言动作名：`goto` 的落点必须是**本阶段入口**（决策 69）——
+    /// 落点写错时的症状是端点 400、按钮点不动，而动作名那一半照样绿。
+    #[test]
+    fn user_paused_row_has_continue_rerun_and_cancel() {
+        for stage in [
+            Stage::Init,
+            Stage::ArchitectDesign,
+            Stage::Develop,
+            Stage::Test,
+            Stage::Merge,
+        ] {
+            let r = reason(PendingKind::UserPaused, stage, None);
+            let acts = allowed_actions(&r, None);
+            assert_eq!(
+                acts.iter().map(|a| a.action.as_str()).collect::<Vec<_>>(),
+                vec!["continue", "goto", "cancel"],
+                "{stage}: 手动暂停的动作集变了"
+            );
+            assert_eq!(acts[0].kind, ActionKind::Resume);
+            assert!(!acts[0].requires_input, "续跑不讨自由输入");
+            let target = acts[1].target.as_ref().expect("重跑要带落点");
+            assert_eq!(target.stage, stage, "{stage}: 重跑的是本阶段");
+            assert_eq!(
+                target.node,
+                entry_node(stage),
+                "{stage}: 重跑必须落在本阶段入口（决策 69）"
+            );
+            assert!(!acts.iter().any(|a| a.action == "skip"), "暂停没有 skip");
+        }
     }
 
     #[test]

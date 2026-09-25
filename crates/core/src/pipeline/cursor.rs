@@ -32,6 +32,32 @@ pub fn has_pending_cursor(cursors: &[NodeCursor]) -> bool {
     cursors.iter().any(|c| c.is_pending())
 }
 
+/// 这条 pending **是人自己按下的暂停**（决策 276）。
+///
+/// 调度器的两处自动行为按它豁免——**人按住的东西不需要别人来管**：
+/// - `remind_pending_tasks` 的停滞提醒 / `stalled` 标记（那是给「没人管的 pending」准备的）；
+/// - `note_discoveries` 的待办落表（那是给「值班长该看一眼」准备的）。
+///
+/// 判据落在**游标**而不是任务上（决策 82 的同一姿态）：任务状态只是投影，一个分支被人按住、
+/// 另一分支在跑的任务，不该因为这条投影被当成「等人管」。
+pub fn is_human_hold(cursor: &NodeCursor) -> bool {
+    cursor.is_pending()
+        && cursor
+            .pending_reason
+            .as_ref()
+            .is_some_and(|r| r.kind == crate::types::PendingKind::UserPaused)
+}
+
+/// 这个任务**所有**的 pending 都是人按下的暂停（决策 276）。
+///
+/// 提醒 / 停滞标记要的是这一档而不是 [`is_human_hold`] 的「有一条算一条」：两条游标里
+/// 一条被人按住、另一条挂着真待办时，任务确实还需要人管——只有「全部被人按住」才是
+/// 「别去打扰他」。无 pending 的任务返回 `false`（没有待办 ≠ 人按住了）。
+pub fn all_pending_are_human_holds(cursors: &[NodeCursor]) -> bool {
+    let pending: Vec<&NodeCursor> = pending_cursors(cursors);
+    !pending.is_empty() && pending.iter().all(|c| is_human_hold(c))
+}
+
 /// join 条件：所有活跃游标都到达边界（`waiting_join`）且均无 pending（决策 83）。
 ///
 /// 至少要有两条游标——单游标任务不构成 join（sync-check 是并行区间的屏障）。

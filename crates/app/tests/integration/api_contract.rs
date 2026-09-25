@@ -705,6 +705,88 @@ async fn human_review_routes_to_test_or_develop() {
     assert_eq!(body["stage"], "develop");
 }
 
+// ──────────────── 手动暂停 / 重跑本阶段（决策 276）────────────────
+
+/// 两颗钮的入口、拒绝与成功各自的报文（契约的那一半；状态机那一半在 core 的 L2）。
+#[tokio::test]
+async fn pause_and_rerun_hold_a_running_task() {
+    let api = api().await;
+    seed(&api, "t1").await;
+
+    // 队列里的任务按不住：报文要说清「为什么」，而不是一个笼统的 400
+    let (status, body) = post(&api, "/tasks/t1/pause", json!({})).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert!(
+        body["error"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("还没被准入"),
+        "{body}"
+    );
+
+    // 准入（decision 117 的同一道闸）之后按住
+    api.state
+        .store
+        .set_task_status("t1", TaskStatus::Running)
+        .await
+        .unwrap();
+    let (status, body) = post(&api, "/tasks/t1/pause", json!({})).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["ok"], true);
+    assert_eq!(body["cursor_ids"].as_array().unwrap().len(), 1);
+    assert_eq!(body["notified"], false, "契约测试里没有在跑的执行体");
+
+    // 按住之后：任务 pending（原因 user_paused），屏上那两颗钮由 allowed_actions 下发
+    let (status, body) = get(&api, "/tasks/t1").await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["task"]["status"], "pending");
+    assert_eq!(body["task"]["pending_reason"]["type"], "user_paused");
+    let actions: Vec<&str> = body["allowed_actions"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|a| a["action"].as_str())
+        .collect();
+    assert_eq!(actions, vec!["continue", "goto", "cancel"]);
+
+    // 续跑：既有 resume 端点的 continue
+    let (status, body) = post(&api, "/tasks/t1/resume", json!({"action": "continue"})).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let (_, body) = get(&api, "/tasks/t1").await;
+    assert_eq!(body["task"]["status"], "running", "续跑回到原处接着跑");
+
+    // 重跑本阶段：本阶段还没跑过（没有 run 行）→ 拒绝，且指路
+    let (status, body) = post(&api, "/tasks/t1/rerun", json!({})).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    let message = body["error"].as_str().unwrap_or_default();
+    assert!(message.contains("还没跑过"), "{body}");
+
+    // 造一条本阶段的 run 之后重跑成立
+    let cursor = api.state.store.load_live_cursors("t1").await.unwrap()[0].clone();
+    api.state
+        .store
+        .insert_run(&agentpipeline_core::storage::observability::NewRun {
+            task_id: "t1".into(),
+            cursor_id: cursor.cursor_id.clone(),
+            stage: cursor.stage,
+            node: agentpipeline_core::types::Node::Execute,
+            attempt: 1,
+            agent_type: "main".into(),
+            parent_run_id: None,
+            prompt_template_hash: None,
+            process_group_id: None,
+        })
+        .await
+        .unwrap();
+    let (status, body) = post(&api, "/tasks/t1/rerun", json!({})).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["cursors"].as_array().unwrap().len(), 1);
+    assert_eq!(
+        body["cursors"][0]["stage"], "init",
+        "重跑落在**本阶段**入口（任务此刻在 init）"
+    );
+}
+
 // ─────────────────────────── 旁路端点（决策 105 / 117 / 125 / 34）───────────────────────────
 
 #[tokio::test]
@@ -4854,6 +4936,60 @@ async fn a_stewarded_task_can_be_unstuck_by_the_foreman_without_a_press() {
             .iter()
             .any(|m| m.content.starts_with("【托管】") && m.content.contains("unstick")),
         "{messages:?}"
+    );
+}
+
+/// 值班长的 `task pause` **按键之后真的按得住**（决策 276）。
+///
+/// 与 `unstick` 那条同一个理由打在 app 层：core 那侧只证「提议生成得出来」，
+/// 而「按键执行这一支有没有接到实现上」只有 app 层看得见（端点分派漏一条臂的症状，
+/// 就是一颗按下去报 400 的钮）。
+#[tokio::test]
+async fn the_foreman_can_pause_a_task_once_its_proposal_is_pressed() {
+    let agent = FakeAgent::new(Script::new());
+    let api = api_with_foreman(agent.clone()).await;
+    seed(&api, "t1").await;
+    api.state
+        .store
+        .set_task_status("t1", TaskStatus::Running)
+        .await
+        .unwrap();
+
+    let mut script = Script::new();
+    script
+        .for_foreman()
+        .tool("task", json!({"action": "pause", "task_id": "t1"}));
+    script.for_foreman().text("提了，等你按键。");
+    agent.set_script(script);
+
+    let (status, body) = post(&api, "/foreman/messages", json!({"text": "把 t1 按住"})).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let sid = body["session"]["id"].as_str().unwrap().to_string();
+    let pending = api
+        .state
+        .store
+        .list_pending_foreman_proposals(&sid)
+        .await
+        .unwrap();
+    assert_eq!(pending.len(), 1, "写操作恒提议：{pending:?}");
+    assert_eq!(pending[0].tool, "task");
+    let task = api.state.store.get_task("t1").await.unwrap();
+    assert_eq!(task.status, TaskStatus::Running, "提议不是执行");
+
+    // 按键
+    let (status, body) = post(
+        &api,
+        &format!("/foreman/proposals/{}/execute", pending[0].id),
+        json!({}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let task = api.state.store.get_task("t1").await.unwrap();
+    assert_eq!(task.status, TaskStatus::Pending);
+    assert_eq!(
+        task.pending_reason.map(|r| r.kind),
+        Some(agentpipeline_core::types::PendingKind::UserPaused),
+        "按键之后真的按住了"
     );
 }
 

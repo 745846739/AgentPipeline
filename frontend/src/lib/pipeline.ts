@@ -577,6 +577,10 @@ export function pendingLabel(reason: { type: string; context?: { kind?: string }
       return '上下文超限';
     case 'timeout':
       return '执行超时';
+    // 人自己按下的暂停（决策 276）：与其它待办的区别就在这一格——
+    // 「等决定」是流水线在等人，「已暂停」是人在按住它。
+    case 'user_paused':
+      return '已暂停';
     case 'user_decision':
       switch (reason.context?.kind) {
         case 'duplicate_risk':

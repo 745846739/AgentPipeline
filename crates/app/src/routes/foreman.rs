@@ -593,13 +593,26 @@ async fn run_task_tool(
             let response = tasks::retry(State(state), Path(task_id)).await;
             endpoint_outcome(response).await
         }
+        // 手动按住 / 重跑本阶段（决策 276）：**非 pending 任务**的那两颗钮，与界面上
+        // 那两颗同形——直接调 handler，参数语言只有一套（票 05 的硬要求）。
+        "pause" => {
+            let task_id = str_arg(args, "task_id")?;
+            let response = tasks::pause(State(state), Path(task_id)).await;
+            endpoint_outcome(response).await
+        }
+        "rerun" => {
+            let task_id = str_arg(args, "task_id")?;
+            let response = tasks::rerun(State(state), Path(task_id)).await;
+            endpoint_outcome(response).await
+        }
         "cancel" => {
             let task_id = str_arg(args, "task_id")?;
             let response = tasks::cancel(State(state), Path(task_id)).await;
             endpoint_outcome(response).await
         }
         other => Err(ApiError::bad_request(format!(
-            "task 工具没有这个动作：{other}（可用：create / resume / retry / cancel / review / merge）"
+            "task 工具没有这个动作：{other}（可用：create / resume / retry / pause / rerun / \
+             cancel / review / merge / unstick）"
         ))),
     }
 }

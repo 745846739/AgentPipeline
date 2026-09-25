@@ -20,7 +20,7 @@
 
 use std::collections::HashMap;
 use std::path::Path;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, Ordering};
 use std::sync::{Arc, LazyLock, Mutex};
 
 use futures::StreamExt;
@@ -70,14 +70,56 @@ struct RegistryEntry {
 /// 模型调用上时靠 `notified()` 把它唤醒；它正走在两轮之间（或信号先于观察者到达）时
 /// 靠那个布尔值在下一轮开头拦住它。只用 `notify_waiters()` 会**丢信号**（它只唤醒当时
 /// 已登记的等待者），只用布尔值则要等到下一轮开头才行——而停住的恰恰就是那一轮。
+///
+/// **来路也记在这一格里**（决策 276）：同一个中止通道现在有两个发出方，而执行体对它们的
+/// 处置**不同**——人按停要求「这一轮的结果一个字都不许写」（见 [`Executor::run_inner`]），
+/// 判超时那条路则保持决策 226 的既有行为（结果照常推进，另一条分支的已完成工作不丢）。
+/// 不记来路的话，两者共用一个布尔值，执行体只能猜。
 #[derive(Clone, Default)]
 pub(crate) struct CancelSignal {
     requested: Arc<AtomicBool>,
+    origin: Arc<AtomicU8>,
     notify: Arc<Notify>,
 }
 
+/// 中止请求的来路（决策 276）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CancelOrigin {
+    /// 判超时（调度器 `handle_timeout`，决策 226）。
+    Timeout,
+    /// **人按停**：手动暂停 / 重跑本阶段（决策 276）。
+    Hold,
+}
+
+impl CancelOrigin {
+    fn as_u8(self) -> u8 {
+        match self {
+            CancelOrigin::Timeout => 0,
+            CancelOrigin::Hold => 1,
+        }
+    }
+
+    fn from_u8(raw: u8) -> Self {
+        if raw == 1 {
+            CancelOrigin::Hold
+        } else {
+            CancelOrigin::Timeout
+        }
+    }
+
+    /// 人话（进 run 行的 `error`）：台账里要读得出**是谁**把它按停的。
+    pub fn as_str(self) -> &'static str {
+        match self {
+            CancelOrigin::Timeout => "节点超时",
+            CancelOrigin::Hold => "人工暂停 / 重跑",
+        }
+    }
+}
+
 impl CancelSignal {
-    pub(crate) fn request(&self) {
+    fn request(&self, origin: CancelOrigin) {
+        // 先记来路再置位：读的那一方看到 `is_requested()` 为真时，来路一定已经写好了。
+        self.origin.store(origin.as_u8(), Ordering::SeqCst);
         self.requested.store(true, Ordering::SeqCst);
         // `notify_one` 而非 `notify_waiters`：无人等待时它**存一个许可**，
         // 于是「信号先到、观察者后建」这个窗口也不会丢。
@@ -86,6 +128,10 @@ impl CancelSignal {
 
     pub(crate) fn is_requested(&self) -> bool {
         self.requested.load(Ordering::SeqCst)
+    }
+
+    pub(crate) fn origin(&self) -> CancelOrigin {
+        CancelOrigin::from_u8(self.origin.load(Ordering::SeqCst))
     }
 
     pub(crate) async fn wait(&self) {
@@ -144,14 +190,39 @@ pub fn force_release(task_id: &str) -> bool {
 /// - 收口是**协作**的：它收口之前，去重与 `executor_owner` 仍被占着。调用方因此不能
 ///   假定「通知完就立刻能起来」——紧跟其后的 resume 仍要按自己的重试预算等它。
 pub fn request_cancel(task_id: &str) -> bool {
+    request_cancel_with(task_id, CancelOrigin::Timeout)
+}
+
+/// **人按停**（手动暂停 / 重跑本阶段）时请求中止在飞的执行体（决策 276）。
+///
+/// 与 [`request_cancel`] 走同一个通道、同一份协作语义，唯一差别是**来路**：执行体据此
+/// 决定「这一轮的结果一个字都不许写」（[`Executor::run_inner`]）——人按停的意图正是
+/// 「停在原处」，而判超时那一方已经自己处置过台账，多写一笔只会覆盖它。
+///
+/// 返回值同 [`request_cancel`]：`false` = 进程内没有这一号登记（执行体已退出，或本就
+/// 没有在跑）——调用方照常落自己那一笔。
+pub fn request_hold(task_id: &str) -> bool {
+    request_cancel_with(task_id, CancelOrigin::Hold)
+}
+
+fn request_cancel_with(task_id: &str, origin: CancelOrigin) -> bool {
     let registry = EXECUTOR_REGISTRY.lock().unwrap();
     match registry.get(task_id) {
         Some(entry) => {
-            entry.cancel.request();
+            entry.cancel.request(origin);
             true
         }
         None => false,
     }
+}
+
+/// 人按停的请求已经发出吗（决策 276）——是的话，本轮结论**一个字都不许写台账**。
+///
+/// 判据收在这一处（`run_inner` 只调它）：两个发出方共用一条通道，而**执行体只对
+/// `Hold` 让路**——判超时那一方（决策 226）自己已经处置过台账（重试流转 / 挂起），
+/// 让路反而会把另一条并行分支已完成的工作一起丢掉。
+pub(crate) fn held_by_human(task_id: &str) -> bool {
+    cancel_signal(task_id).is_some_and(|s| s.is_requested() && s.origin() == CancelOrigin::Hold)
 }
 
 /// 执行体侧取自己的观察点。取不到 = 进程内没有这一号登记（跨进程，或已被 `unstick` 摘走）
@@ -337,9 +408,28 @@ impl Executor {
                 .await;
 
             let before = self.cursor_snapshot(task_id).await?;
+            // **人按停的请求一旦发出，本轮的一切结论都不许写台账**（决策 276）：落点与
+            // 挂起都归发出请求的那一方（`pipeline::pause` / `rerun`）。不加这一句的话，
+            // 一个「刚好在这一瞬跑完」的节点会把游标推走——人按下的暂停/重跑会被这一笔
+            // 静默覆盖，而屏上看起来像是按了没反应。
+            //
+            // 只认 `Hold`：判超时那条路（决策 226）**行为不变**——它自己已经处置过台账
+            // （重试流转或挂起），而另一条并行分支若恰好在这一瞬跑完，那个结果照旧推进，
+            // 不该被这一轮的中止连坐。
+            let held = held_by_human(task_id);
             // 本轮的某个游标是否被「中止请求」收了口（决策 226）。
             let mut cancelled = false;
             for (cursor, outcome) in results {
+                if held {
+                    tracing::info!(
+                        task = %task.id,
+                        stage = %cursor.stage,
+                        node = %cursor.node,
+                        "本轮已有「人按停」的中止请求：不推进游标，让出执行权"
+                    );
+                    cancelled = true;
+                    continue;
+                }
                 match outcome {
                     Ok(output) => {
                         if let Err(e) = self.advance_cursor(&task, &cursor, output).await {
@@ -1768,5 +1858,32 @@ mod tests {
         let with_log = gate_output("测试", "cargo test", 1, "FAILED: test_login\n");
         assert!(with_log.contains("退出码 1"));
         assert!(with_log.contains("FAILED: test_login"));
+    }
+
+    /// 中止请求的**来路**随请求一起落进那一格（决策 276）。
+    ///
+    /// 这条钉的是分类本身：两个发出方（判超时 / 人按停）共用一条通道，而执行体只对后者
+    /// 让路——来路存错（或忘了存）时的症状是**按了暂停它照样往前跑**，一个不会报错的错。
+    /// 用两个各自独占的 task_id：注册表是进程全局的，本模块的用例并行跑。
+    #[test]
+    fn the_cancel_origin_travels_with_the_request() {
+        let hold_id = "t-cancel-origin-hold";
+        let _guard = try_acquire(hold_id).expect("注册表里应当没有这一号");
+        assert!(!held_by_human(hold_id), "还没发请求：不算按住");
+        assert!(request_hold(hold_id), "刚登记过，应当找得到");
+        assert!(held_by_human(hold_id), "人按停：执行体要让路");
+        assert_eq!(cancel_signal(hold_id).unwrap().origin(), CancelOrigin::Hold);
+
+        let timeout_id = "t-cancel-origin-timeout";
+        let _guard = try_acquire(timeout_id).expect("注册表里应当没有这一号");
+        assert!(request_cancel(timeout_id));
+        assert_eq!(
+            cancel_signal(timeout_id).unwrap().origin(),
+            CancelOrigin::Timeout
+        );
+        assert!(
+            !held_by_human(timeout_id),
+            "判超时那条路**不让路**：它自己处置过台账，另一条分支的工作不该连坐"
+        );
     }
 }

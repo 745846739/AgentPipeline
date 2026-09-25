@@ -269,6 +269,9 @@ impl Store {
                         .unwrap_or_else(|| "失败".into()),
                     crate::types::NodeStatus::Success => "成功".into(),
                     crate::types::NodeStatus::Timeout => "超时".into(),
+                    // 人按停（暂停 / 重跑）留下的那一轮（决策 276）：说清是**人**停的，
+                    // 别让它读起来像一次失败。
+                    crate::types::NodeStatus::Cancelled => "被人工中止".into(),
                     crate::types::NodeStatus::Running => "未完成".into(),
                 };
                 out.push_str(&format!(

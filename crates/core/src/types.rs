@@ -284,6 +284,16 @@ pub enum PendingKind {
     DependencyFailed,
     ContextOverflow,
     Timeout,
+    /// **人按下的暂停**（手动暂停，`POST /tasks/{id}/pause`）。
+    ///
+    /// 它不是「流水线遇到了要人拍板的事」，而是**人自己把任务按住**：位置保留、在飞的那一轮
+    /// 收口，等人放行。用 pending 承载而不是新造一个 `TaskStatus`，因为这套系统里 pending
+    /// 本来就是「停着等人」的那一格（`docs/implementation.md` 的伪码写的是「非空 → 暂停
+    /// （等 resume）」）——续跑、看板投影、调度器的准入与超时处置全都不必为它新开一条路。
+    ///
+    /// 与别的 pending 的**唯一区别**：它不需要任何人管（那正是人自己按下的），故调度器的
+    /// 提醒 / 待办发现会跳过它（[`crate::pipeline::cursor::is_human_hold`]）。
+    UserPaused,
 }
 
 impl PendingKind {
@@ -298,6 +308,7 @@ impl PendingKind {
             PendingKind::DependencyFailed => "dependency_failed",
             PendingKind::ContextOverflow => "context_overflow",
             PendingKind::Timeout => "timeout",
+            PendingKind::UserPaused => "user_paused",
         }
     }
 }
@@ -316,6 +327,7 @@ impl FromStr for PendingKind {
             "dependency_failed" => PendingKind::DependencyFailed,
             "context_overflow" => PendingKind::ContextOverflow,
             "timeout" => PendingKind::Timeout,
+            "user_paused" => PendingKind::UserPaused,
             other => {
                 return Err(crate::Error::Validation(format!(
                     "未知 pending 类型：{other}"
@@ -357,6 +369,14 @@ pub enum ResumeCause {
     TestCodeIssue,
     GateRecheck,
     DirtyWorktree,
+    /// 人松开一次手动暂停（`user_paused` 的 `continue`）：从按住的那一处接着跑。
+    UserPaused,
+    /// 人按下「重跑本阶段」：**不带**上一段对话，重开一段。
+    ///
+    /// 它不是由 pending 原因分类出来的（`classify` 不返回它）：它由**按的是哪颗键**决定
+    /// ——`user_paused` 那两条出口（续跑 / 重跑）在 pending 原因上同名，只有端点知道按的是
+    /// 哪一颗，故重跑那条显式把它写进列（[`crate::pipeline::advance`] 的 `resume_cause`）。
+    UserRerun,
     // ── 由人按的那颗键决定（merge / review 两条专用端点，同一原因有两个去向）──
     MergeApproved,
     MergeReturned,
@@ -371,7 +391,7 @@ pub enum ResumeCause {
 /// 新增一个变体时**先改这里**，再回答 `resume_continues` 那个穷尽 `match`——
 /// 编译器会在后者报「未覆盖的模式」，这是本表的牙齿（决策 205：兜底 false 是安全网，
 /// 不是让人忘记回答的借口）。
-pub const ALL_RESUME_CAUSES: [ResumeCause; 21] = [
+pub const ALL_RESUME_CAUSES: [ResumeCause; 23] = [
     ResumeCause::InfoInsufficient,
     ResumeCause::ConflictWait,
     ResumeCause::RetryExhausted,
@@ -388,6 +408,8 @@ pub const ALL_RESUME_CAUSES: [ResumeCause; 21] = [
     ResumeCause::TestCodeIssue,
     ResumeCause::GateRecheck,
     ResumeCause::DirtyWorktree,
+    ResumeCause::UserPaused,
+    ResumeCause::UserRerun,
     ResumeCause::MergeApproved,
     ResumeCause::MergeReturned,
     ResumeCause::HumanReviewApproved,
@@ -415,6 +437,8 @@ impl ResumeCause {
             ResumeCause::TestCodeIssue => "test_code_issue",
             ResumeCause::GateRecheck => "gate_recheck",
             ResumeCause::DirtyWorktree => "dirty_worktree",
+            ResumeCause::UserPaused => "user_paused",
+            ResumeCause::UserRerun => "user_rerun",
             ResumeCause::MergeApproved => "merge_approved",
             ResumeCause::MergeReturned => "merge_returned",
             ResumeCause::HumanReviewApproved => "human_review_approved",
@@ -469,6 +493,9 @@ impl ResumeCause {
                 // 认不出的 context.kind：按**通用那一行**（skip / cancel）处置。
                 _ => ResumeCause::UserDecision,
             },
+            // 手动暂停的**默认出口**（续跑）。重跑那条出口按的是另一颗键，由端点显式写
+            // `user_rerun`——同一原因两个去向，只有按键的那一方知道按的是哪一颗。
+            PendingKind::UserPaused => ResumeCause::UserPaused,
         }
     }
 }
@@ -505,6 +532,7 @@ pub fn resume_continues(cause: ResumeCause) -> bool {
         | ResumeCause::GateRecheck
         | ResumeCause::DirtyWorktree
         | ResumeCause::MergeReturned
+        | ResumeCause::UserPaused
         | ResumeCause::HumanReviewRejected => true,
 
         // ── false：去向是新的一段（或不是人按的键）──
@@ -516,11 +544,13 @@ pub fn resume_continues(cause: ResumeCause) -> bool {
         //   （决策 205 未列 → 兜底 false；票 04 复用这一档）。
         // `dependency_cancelled`：依赖被取消，人按「忽略失败依赖继续」——那是换一条路走。
         // `user_decision`（通用那一行）：既非打回也非补充，没有可续的上下文。
-        // `unknown`：库里的历史值或认不出的取值，退回「续接出现之前的行为」。
+        // `user_rerun`：**重跑 = 这一轮不算，重来**——带着上一轮的对话重来正是「重来」的
+        //   反面（模型会接着自己刚写的那半句往下写）。故它落在 false：重开一段。
         ResumeCause::MergeApproved
         | ResumeCause::HumanReviewApproved
         | ResumeCause::ContextOverflow
         | ResumeCause::DependencyCancelled
+        | ResumeCause::UserRerun
         | ResumeCause::UserDecision
         | ResumeCause::Unknown => false,
     }
@@ -1131,6 +1161,11 @@ pub enum NodeStatus {
     Success,
     Failed,
     Timeout,
+    /// **人在这一轮跑完之前把它按停了**（手动暂停 / 重跑本阶段）。
+    ///
+    /// 与 `Timeout` 分开记：一句「超时」会让人去查超时配置，而这一轮根本没有超时——
+    /// 是人按了暂停。两个来路的区别在复盘时是承重的（决策 276）。
+    Cancelled,
 }
 
 impl NodeStatus {
@@ -1140,6 +1175,7 @@ impl NodeStatus {
             NodeStatus::Success => "success",
             NodeStatus::Failed => "failed",
             NodeStatus::Timeout => "timeout",
+            NodeStatus::Cancelled => "cancelled",
         }
     }
 }
@@ -1153,6 +1189,7 @@ impl FromStr for NodeStatus {
             "success" => NodeStatus::Success,
             "failed" => NodeStatus::Failed,
             "timeout" => NodeStatus::Timeout,
+            "cancelled" => NodeStatus::Cancelled,
             other => return Err(crate::Error::Validation(format!("未知节点状态：{other}"))),
         })
     }
@@ -1582,7 +1619,7 @@ mod tests {
     #[test]
     fn resume_cause_table_is_the_spec() {
         use ResumeCause::*;
-        let cases: [(ResumeCause, bool); 21] = [
+        let cases: [(ResumeCause, bool); 23] = [
             // ── true ──
             (InfoInsufficient, true),
             (RetryExhausted, true),
@@ -1599,19 +1636,23 @@ mod tests {
             (DirtyWorktree, true),
             (MergeReturned, true),
             (HumanReviewRejected, true),
+            // 人松开自己按下的暂停：接着上一段干（决策 276）
+            (UserPaused, true),
             // ── false ──
             (MergeApproved, false),
             (HumanReviewApproved, false),
             (ContextOverflow, false),
             (DependencyCancelled, false),
             (UserDecision, false),
+            // 重跑 = 这一轮不算：重开一段（决策 276）
+            (UserRerun, false),
             (Unknown, false),
         ];
         for (cause, expected) in cases {
             assert_eq!(
                 resume_continues(cause),
                 expected,
-                "判定表里 {} 的值与决策 205 不一致",
+                "判定表里 {} 的值与决策 205 / 276 不一致",
                 cause.as_str()
             );
         }
@@ -1640,6 +1681,11 @@ mod tests {
             ContextOverflow
         );
         assert_eq!(ResumeCause::classify(PendingKind::Timeout, None), Timeout);
+        // 手动暂停的默认出口是「续跑」（重跑那条出口由端点显式写 user_rerun，决策 276）
+        assert_eq!(
+            ResumeCause::classify(PendingKind::UserPaused, None),
+            UserPaused
+        );
         assert_eq!(
             ResumeCause::classify(PendingKind::DependencyFailed, None),
             DependencyFailed

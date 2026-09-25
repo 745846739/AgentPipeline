@@ -63,6 +63,9 @@ export const PENDING_KIND_MEMBERS = [
   'dependency_failed',
   'context_overflow',
   'timeout',
+  // 人自己按下的暂停（决策 276）：暂停中的任务与其它待办同一格（都是 pending），
+  // 区别在原因那一栏与「不需要别人来管」这条豁免。
+  'user_paused',
 ] as const;
 
 export type PendingKind = (typeof PENDING_KIND_MEMBERS)[number];

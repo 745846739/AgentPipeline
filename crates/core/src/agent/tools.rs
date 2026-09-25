@@ -723,10 +723,14 @@ impl ToolExecutor {
 
     /// 这一次调用拿得到托管授权吗（决策 210② / 票 08）。
     ///
-    /// 三条闸**一起**判，且判据只有这一处：
+    /// 四条闸**一起**判，且判据只有这一处：
     /// 1. 形状：`task` + `resume` + `continue`（[`is_stewardable_resume`]）；
     /// 2. 任务托管中（`Stewardship::enabled`）；
-    /// 3. 未触顶且指纹不同（[`crate::types::Stewardship::permits`]，决策 210⑨ 的两条止损）。
+    /// 3. 未触顶且指纹不同（[`crate::types::Stewardship::permits`]，决策 210⑨ 的两条止损）；
+    /// 4. **不是人按下的暂停**（决策 276）：`user_paused` 那一行的两颗出口键（续跑 / 重跑）
+    ///    与托管的自动集**形状同名**（都是 `resume(continue)`），但人按下暂停的意思是
+    ///    「谁也别动它」——托管替人松开，等于把一次明确的人工操作静默撤销。故这一档
+    ///    照常生成提议（值班长可以说、可以提），**按键仍是人的**。
     ///
     /// 返回 `Some(指纹)` 时调用方直接执行；`None` 时照常生成提议——**触顶与同指纹不是
     /// 报错**，是「这一次交给人」（任务仍停在 pending，按钮照旧给得出来）。
@@ -743,6 +747,11 @@ impl ToolExecutor {
             // 查无此任务：照常走提议（模型可能记错一个 id，那不是托管该管的事）
             Err(_) => return Ok(None),
         };
+        // 人按住的任务：托管不自动放行（判据落在游标上，与调度器那两处豁免同一把尺子）
+        let live = store.load_live_cursors(task_id).await?;
+        if crate::pipeline::cursor::all_pending_are_human_holds(&live) {
+            return Ok(None);
+        }
         let Some(stewardship) = task.stewardship.as_ref() else {
             return Ok(None);
         };
