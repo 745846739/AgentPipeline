@@ -326,7 +326,7 @@ pub trait LlmClient: Send + Sync + 'static {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::types::ArchitectExecuteMetadata;
+    use crate::types::{ArchitectExecuteMetadata, ValidateInputMetadata};
 
     #[test]
     fn submit_metadata_schema_derives_from_serde_struct() {
@@ -338,6 +338,18 @@ mod tests {
         assert!(props.get("affected_files").is_some());
         assert!(props.get("acceptance_criteria").is_some());
         assert!(props.get("new_symbols").is_some());
+    }
+
+    #[test]
+    fn validate_input_blockers_schema_carries_the_contract() {
+        // 决策 277②：blockers 的「问题 + 推荐答案」语义同步进 tool schema——
+        // 模板与 schema 同源同话，模型在两处读到的都是同一条契约。
+        let tool = submit_metadata_tool::<ValidateInputMetadata>("提交输入充分性判定");
+        let desc = tool.parameters["properties"]["blockers"]["description"]
+            .as_str()
+            .unwrap_or_default();
+        assert!(desc.contains("问题 + 推荐答案"), "{desc}");
+        assert!(desc.contains("默认值"), "{desc}");
     }
 
     #[test]

@@ -92,11 +92,16 @@ pub fn parse_metadata<T: DeserializeOwned>(value: &serde_json::Value) -> Result<
         .map_err(|e| crate::Error::Validation(format!("元数据校验失败：{e}")))
 }
 
-/// 校验失败后的重试 prompt（决策 33：错误回填，要求重新调用 submit_metadata）。
+/// 校验失败后的重试反馈（决策 33「错误回填」；决策 278 定形为**错误 turn**）。
 ///
-/// 首轮为空不渲染的规则只适用于 feedback 段（决策 126 / 138）；重试段必然非空。
-pub fn retry_prompt(original: &str, error: &str) -> String {
-    format!("{original}\n\n上次调用失败：{error}\n请重新调用 submit_metadata。")
+/// 决策 278 起，agent 节点的整体失败重试不再空对话起步：上一轮转录**原样保留**，
+/// 本函数的返回值作为一条 user 消息追加在转录末尾——原 prompt 不再拼接（转录本身
+/// 就是上下文），「错误回填」从拼进 prompt 改成追加进对话。
+pub fn retry_prompt(error: &str) -> String {
+    format!(
+        "上一轮的输出未按输出契约提交、已判废（{error}）。\n\
+         本轮的最终动作必须是调用 submit_metadata 提交结构化元数据。"
+    )
 }
 
 /// 提取 ```json ... ``` 或 ``` ... ``` 围栏中的第一个 JSON 对象。
@@ -300,10 +305,12 @@ mod tests {
     }
 
     #[test]
-    fn retry_prompt_appends_error() {
-        let p = retry_prompt("原始 prompt", "缺少 readiness 字段");
-        assert!(p.starts_with("原始 prompt"));
-        assert!(p.contains("上次调用失败：缺少 readiness 字段"));
-        assert!(p.contains("请重新调用 submit_metadata。"));
+    fn retry_prompt_is_the_error_turn() {
+        // 决策 278：retry_prompt 是续接转录末尾那条错误 turn 的内容来源。
+        // 关键指令放在第一行——L3 压缩摘要只保留首行（context.rs::summarize_message）。
+        let p = retry_prompt("未找到结构化元数据");
+        assert!(p.starts_with("上一轮的输出未按输出契约提交、已判废"));
+        assert!(p.contains("未找到结构化元数据"), "原始诊断要给模型");
+        assert!(p.contains("本轮的最终动作必须是调用 submit_metadata"));
     }
 }

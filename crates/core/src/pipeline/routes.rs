@@ -13,6 +13,9 @@ use crate::types::{
 pub struct MetadataView {
     /// validate_input 的充分性（architect / develop-design / test-design）。
     pub readiness: bool,
+    /// validate_input 不充分时提交的问题清单（决策 277④）：`info_insufficient`
+    /// 的 pending 消息要把它带给用户，路由侧才不用回头翻会话行。
+    pub blockers: Vec<String>,
     /// agent 型 validate_output 的判定。
     pub passed: bool,
     /// test.validate_output 的根因分类（决策 62 / 85）。
@@ -23,6 +26,15 @@ impl MetadataView {
     pub fn readiness(readiness: bool) -> Self {
         MetadataView {
             readiness,
+            ..Default::default()
+        }
+    }
+
+    /// validate_input 的完整投影（决策 277④）：readiness 连同它提交的问题清单。
+    pub fn readiness_with_blockers(readiness: bool, blockers: Vec<String>) -> Self {
+        MetadataView {
+            readiness,
+            blockers,
             ..Default::default()
         }
     }

@@ -3736,6 +3736,46 @@ async fn info_insufficient_ctx(task_id: &str) -> Ctx {
     ctx
 }
 
+/// 决策 277④：info_insufficient 的 pending 消息携带 blockers 摘要——
+/// 「要问什么」直接出现在看板卡片的 pending 原因里，用户不必翻会话记录才知道要答什么。
+#[tokio::test]
+async fn info_insufficient_pending_message_carries_blockers_summary() {
+    let ctx = setup("true", Settings::default()).await;
+    let mut script = Script::new();
+    script
+        .for_node(Stage::ArchitectDesign, Node::ValidateInput)
+        .submit(&ValidateInputMetadata {
+            readiness: false,
+            blockers: vec!["部署目标是什么？推荐：本地 Docker".into()],
+        });
+    ctx.agent.set_script(script);
+    testkit::seed_task(&ctx.store, "vi-blockers", "p1")
+        .await
+        .unwrap();
+    admit(&ctx, "vi-blockers").await;
+    ctx.executor.run("vi-blockers").await.unwrap();
+
+    let cursor = ctx
+        .store
+        .load_live_cursors("vi-blockers")
+        .await
+        .unwrap()
+        .into_iter()
+        .next()
+        .unwrap();
+    let reason = cursor
+        .pending_reason
+        .expect("readiness=false 应挂 info_insufficient");
+    assert_eq!(reason.kind, PendingKind::InfoInsufficient);
+    assert!(
+        reason
+            .message
+            .contains("1. 部署目标是什么？推荐：本地 Docker"),
+        "pending 消息须带 blockers 摘要：{}",
+        reason.message
+    );
+}
+
 /// 判定表说 **false** 的原因：重入同一节点，起点仍是空的（决策 205）。
 ///
 /// 现场用 `context_overflow` 转「更换长上下文模型」：它是表里 false 的一档
@@ -3923,11 +3963,15 @@ async fn a_cause_that_says_yes_carries_the_previous_attempt_messages() {
     );
 }
 
-/// 干净重试不受续接影响：`agent_retry_max` 的第 2、3 次仍是空起点（决策 33 不变）。
+/// 重试轮续接转录＋错误 turn（决策 278，显式修订决策 205 裁决②）：
+/// `agent_retry_max` 的自动重试不再空起步——上一轮转录原样保留（不折叠、不省略），
+/// 末尾多一条明示「已判废、本轮必须交元数据」的错误 turn。
 ///
-/// 与原因无关——**模型的自动失败重试不给续接**，哪怕这一轮的原因表说 true。
+/// 现场：resume 重入后脚本只有一句纯文本，抽不出元数据——三次尝试全部失败。此前
+/// 「干净重试」的每次起点都是空；如今每次起点都比上一次多两条（assistant 回复 + 错误
+/// turn）。耗尽后的 pending 文案也换成人话（不再外露裸诊断串）。
 #[tokio::test]
-async fn clean_retry_after_a_tool_failure_stays_empty_whatever_the_cause_says() {
+async fn a_failed_retry_carries_the_previous_transcript_and_the_error_turn() {
     let ctx = info_insufficient_ctx("cont-retry").await;
     let cursor = ctx
         .store
@@ -3938,7 +3982,7 @@ async fn clean_retry_after_a_tool_failure_stays_empty_whatever_the_cause_says() 
         .next()
         .unwrap();
 
-    // 重入这一轮：第 1 次尝试以「元数据始终抽不出」失败，第 2 次成功 → 两次都在同一轮里
+    // 重入这一轮：唯一的脚本是纯文本（抽不出元数据），后续尝试走「脚本耗尽」收尾响应——同样失败
     let mut rerun = Script::new();
     rerun
         .for_node(Stage::ArchitectDesign, Node::ValidateInput)
@@ -3965,33 +4009,84 @@ async fn clean_retry_after_a_tool_failure_stays_empty_whatever_the_cause_says() 
                 .is_some_and(|c| c.agent_type.as_str() == "main")
         })
         .collect();
-    assert!(vi.len() >= 3, "首轮 + 本轮两次尝试：{}", vi.len());
-    // 按 run 分组看首条请求：三条 run = 首轮 / 本轮的续接尝试 / 本轮的干净重试。
-    // 续接**只**作用于第二条（resume 重入的那次 attempt），第三条必须回到空起点。
-    let mut first_per_run: Vec<(i64, usize)> = Vec::new();
+    // 按 run 分组取**首条请求**：首轮（info_insufficient_ctx）/ resume 那次 / 重试 1 / 重试 2
+    //（agent_retry_max = 3）。一次 attempt 内的后续请求（工具往来）不算起点。
+    let mut firsts: Vec<&LlmRequest> = Vec::new();
     for r in &vi {
         let run_id = r.run.as_ref().expect("主 agent 请求须带 run 上下文").run_id;
-        if first_per_run.last().map(|(id, _)| *id) != Some(run_id) {
-            first_per_run.push((run_id, r.messages.len()));
+        if firsts.last().map(|p| p.run.as_ref().unwrap().run_id) != Some(run_id) {
+            firsts.push(r);
         }
     }
     assert!(
-        first_per_run.len() >= 3,
-        "首轮 + 续接的那次 + 至少一次干净重试：{first_per_run:?}"
+        firsts.len() >= 4,
+        "首轮 + resume + 两次自动重试：{}",
+        firsts.len()
     );
-    assert_eq!(first_per_run[0].1, 0, "首轮起点为空：{first_per_run:?}");
+    assert_eq!(firsts[0].messages.len(), 0, "首轮起点为空");
+    assert_eq!(
+        firsts[1].messages.len(),
+        3,
+        "resume 起点带上一轮的完整转录（工具往来 2 条 + 收尾文本 1 条，决策 205 不变）"
+    );
+    // 决策 278：每次失败重试的起点都比上一次多两条——assistant 回复 + 错误 turn。
+    for w in 2..firsts.len() {
+        assert_eq!(
+            firsts[w].messages.len(),
+            firsts[w - 1].messages.len() + 2,
+            "重试轮 {w} 的起点应是上一轮转录 + 错误 turn（+2）"
+        );
+    }
+    // 重试请求的末条消息就是错误 turn：user 角色、明示判废与契约要求
+    let retried = firsts.last().unwrap();
+    let last = retried.messages.last().expect("重试请求不应为空");
+    assert_eq!(
+        last.role,
+        agentpipeline_core::agent::client::Role::User,
+        "错误 turn 是一条 user 消息：{last:?}"
+    );
+    let turn = last.content.as_deref().unwrap_or("");
+    assert!(turn.contains("已判废"), "明示上一轮已判废：{turn}");
     assert!(
-        first_per_run[1].1 > 0,
-        "续接的那次尝试须带回上一轮的对话（否则本用例是空转）：{first_per_run:?}"
+        turn.contains("submit_metadata"),
+        "明示本轮最终必须交元数据：{turn}"
     );
     assert!(
-        first_per_run[2..].iter().all(|(_, n)| *n == 0),
-        "干净重试的起点必须为空（决策 33）；`agent_retry_max` 有几次就几次：{first_per_run:?}"
+        turn.contains("未找到结构化元数据"),
+        "原始诊断照给模型（人话化只面向用户）：{turn}"
     );
-    // 票 03 的回归：**链接也只落在续接那一轮**。此前它写在循环里、只看
-    // `continuation.is_some()`，于是干净重试轮也指回同一条历史，而
-    // `metrics::total_tokens` 会把被指到的历史排进排除集——同一段历史被排除两次，
-    // 任务是 token **少算**（不是双算），且随重试次数漂移。
+    // 转录原样保留：上一轮的 assistant 文本一字不动地在请求里
+    assert!(
+        retried
+            .messages
+            .iter()
+            .any(|m| m.content.as_deref() == Some("这不是结构化元数据，抽取必然失败")),
+        "上一轮的输出原样保留，不折叠不省略（决策 278）"
+    );
+
+    // 耗尽后的 pending 文案人话化（决策 278）：裸诊断串不再直接外露
+    let cursor = ctx
+        .store
+        .load_live_cursors("cont-retry")
+        .await
+        .unwrap()
+        .into_iter()
+        .next()
+        .unwrap();
+    let reason = cursor.pending_reason.expect("重试耗尽应挂 pending");
+    assert_eq!(reason.kind, PendingKind::RetryExhausted);
+    assert!(
+        reason.message.contains("输出未按契约提交"),
+        "用户看到的是人话（措辞对 execute 节点也通用）：{}",
+        reason.message
+    );
+    assert!(
+        !reason.message.contains("未找到结构化元数据"),
+        "裸诊断串不再外露：{}",
+        reason.message
+    );
+
+    // 红线③不变：链接只落续接边界那一轮（resume 那次），重试轮不落链
     let linked: Vec<i64> = ctx
         .store
         .list_runs("cont-retry")
@@ -4003,8 +4098,283 @@ async fn clean_retry_after_a_tool_failure_stays_empty_whatever_the_cause_says() 
     assert_eq!(
         linked.len(),
         1,
-        "恰有一条 run 记下续接来源（干净重试轮不得再落链）：{linked:?}"
+        "恰有一条 run 记下续接来源（重试轮不落链，决策 278 不改链接语义）：{linked:?}"
     );
+}
+
+/// 决策 279：补充输入作为 user turn 追加到转录末尾——续接请求的首条消息（system +
+/// user_prompt）与上一轮**逐字一致**（segment 停用，prompt cache 的前缀承诺延伸到
+/// resume），转录里则真的有用户那句发言（run40 的教训：用户的话只活在重渲染的开场白里，
+/// 43 条归档消息与上一轮逐字相同，查无此人）。
+#[tokio::test]
+async fn supplement_input_rides_the_transcript_tail_and_leaves_the_first_message_verbatim() {
+    let ctx = info_insufficient_ctx("supp-turn").await;
+    let cursor = ctx
+        .store
+        .load_live_cursors("supp-turn")
+        .await
+        .unwrap()
+        .into_iter()
+        .next()
+        .unwrap();
+
+    let mut rerun = Script::new();
+    rerun
+        .for_node(Stage::ArchitectDesign, Node::ValidateInput)
+        .submit(&ValidateInputMetadata {
+            readiness: true,
+            blockers: vec![],
+        });
+    ctx.agent.set_script(rerun);
+    agentpipeline_core::pipeline::resume::apply_action(
+        &ctx.store,
+        &cursor,
+        ResumeAction::Continue,
+        None,
+        Some("部署在 k8s，单机即可"),
+    )
+    .await
+    .unwrap();
+    ctx.executor.run("supp-turn").await.unwrap();
+
+    // 两条 run 各自的首条请求（一轮内的后续请求不算）
+    let requests = ctx.agent.request_log();
+    let vi: Vec<&LlmRequest> = requests
+        .iter()
+        .filter(|r| r.stage == Stage::ArchitectDesign && r.node == Node::ValidateInput)
+        .filter(|r| {
+            r.run
+                .as_ref()
+                .is_some_and(|c| c.agent_type.as_str() == "main")
+        })
+        .collect();
+    let mut firsts: Vec<&LlmRequest> = Vec::new();
+    for r in &vi {
+        let run_id = r.run.as_ref().expect("主 agent 请求须带 run 上下文").run_id;
+        if firsts.last().map(|p| p.run.as_ref().unwrap().run_id) != Some(run_id) {
+            firsts.push(r);
+        }
+    }
+    assert!(firsts.len() >= 2, "首轮 + 续接那轮：{}", firsts.len());
+    let prev = firsts[0];
+    let resumed = firsts[1];
+
+    // ① 首条消息逐字一致：segment 停用后，补充输入不再重渲染进开场白
+    assert_eq!(prev.system_prompt, resumed.system_prompt, "system 不变");
+    assert_eq!(
+        prev.user_prompt, resumed.user_prompt,
+        "user_prompt 逐字一致——缓存前缀不打穿（run40 实测：25,800 prompt 只命中 126）"
+    );
+    // ② user turn 在转录末尾，内容就是用户说的那句话（verbatim，不带标题行）
+    let last = resumed.messages.last().expect("续接请求不应为空");
+    assert_eq!(
+        last.role,
+        agentpipeline_core::agent::client::Role::User,
+        "补充输入是一条真实的 user 消息：{last:?}"
+    );
+    assert_eq!(last.content.as_deref(), Some("部署在 k8s，单机即可"));
+    // ③ 末尾之前的消息 = 上一轮会话行逐字
+    let prev_run_id = prev.run.as_ref().unwrap().run_id;
+    let convs = ctx
+        .store
+        .list_conversations("supp-turn", true)
+        .await
+        .unwrap();
+    let prev_conv = convs
+        .iter()
+        .find(|c| c.run_id == prev_run_id)
+        .expect("上一轮的会话行");
+    let prev_msgs: Vec<agentpipeline_core::agent::client::Message> =
+        serde_json::from_value(prev_conv.messages_json.clone()).unwrap();
+    assert!(!prev_msgs.is_empty(), "上一轮须有工具往来可断言");
+    assert_eq!(
+        &resumed.messages[..prev_msgs.len()],
+        prev_msgs.as_slice(),
+        "续接装配逐字保留上一轮转录"
+    );
+    assert_eq!(resumed.messages.len(), prev_msgs.len() + 1);
+}
+
+/// 决策 79 落盘纪律的边缘（评审发现）：user-input.md 只写不清——同一
+/// info_insufficient 第二次「继续」且**不带新输入**时，文件里还是上一次的补充，
+/// 而它已经作为 user turn 在续接转录里了。重放会让同一段发言出现两遍。
+#[tokio::test]
+async fn a_second_resume_without_new_input_does_not_replay_the_old_supplement() {
+    let ctx = setup("true", Settings::default()).await;
+    // run 1：readiness=false → pending(info_insufficient)
+    let mut script = Script::new();
+    script
+        .for_node(Stage::ArchitectDesign, Node::ValidateInput)
+        .submit(&ValidateInputMetadata {
+            readiness: false,
+            blockers: vec!["还缺部署口径".into()],
+        });
+    ctx.agent.set_script(script);
+    testkit::seed_task(&ctx.store, "supp-replay", "p1")
+        .await
+        .unwrap();
+    admit(&ctx, "supp-replay").await;
+    ctx.executor.run("supp-replay").await.unwrap();
+
+    // run 2：带补充输入续接，但 readiness 仍 false → 再次 pending
+    let mut script = Script::new();
+    script
+        .for_node(Stage::ArchitectDesign, Node::ValidateInput)
+        .submit(&ValidateInputMetadata {
+            readiness: false,
+            blockers: vec!["还缺并发口径".into()],
+        });
+    ctx.agent.set_script(script);
+    let cursor = ctx
+        .store
+        .load_live_cursors("supp-replay")
+        .await
+        .unwrap()
+        .into_iter()
+        .next()
+        .unwrap();
+    agentpipeline_core::pipeline::resume::apply_action(
+        &ctx.store,
+        &cursor,
+        ResumeAction::Continue,
+        None,
+        Some("部署在 k8s"),
+    )
+    .await
+    .unwrap();
+    ctx.executor.run("supp-replay").await.unwrap();
+
+    // run 3：第二次续接**不带新输入**（文件里还是「部署在 k8s」）
+    let cursor = ctx
+        .store
+        .load_live_cursors("supp-replay")
+        .await
+        .unwrap()
+        .into_iter()
+        .next()
+        .unwrap();
+    let mut script = Script::new();
+    script
+        .for_node(Stage::ArchitectDesign, Node::ValidateInput)
+        .submit(&ValidateInputMetadata {
+            readiness: true,
+            blockers: vec![],
+        });
+    ctx.agent.set_script(script);
+    agentpipeline_core::pipeline::resume::apply_action(
+        &ctx.store,
+        &cursor,
+        ResumeAction::Continue,
+        None,
+        None,
+    )
+    .await
+    .unwrap();
+    ctx.executor.run("supp-replay").await.unwrap();
+
+    // 最后一条 run 的首条请求：「部署在 k8s」恰好一次（转录携带的那条），不重放
+    let requests = ctx.agent.request_log();
+    let vi: Vec<&LlmRequest> = requests
+        .iter()
+        .filter(|r| r.stage == Stage::ArchitectDesign && r.node == Node::ValidateInput)
+        .filter(|r| {
+            r.run
+                .as_ref()
+                .is_some_and(|c| c.agent_type.as_str() == "main")
+        })
+        .collect();
+    let mut firsts: Vec<&LlmRequest> = Vec::new();
+    for r in &vi {
+        let run_id = r.run.as_ref().expect("主 agent 请求须带 run 上下文").run_id;
+        if firsts.last().map(|p| p.run.as_ref().unwrap().run_id) != Some(run_id) {
+            firsts.push(r);
+        }
+    }
+    let last_first = firsts.last().expect("第三次续接的首条请求");
+    let count = last_first
+        .messages
+        .iter()
+        .filter(|m| {
+            m.role == agentpipeline_core::agent::client::Role::User
+                && m.content.as_deref() == Some("部署在 k8s")
+        })
+        .count();
+    assert_eq!(count, 1, "旧补充不重放：只有转录携带的那一条");
+}
+
+/// 决策 280：退化护栏的整环行为——判废那一轮的 run 行带 degraded 标记（复用
+/// error 列，API 可检索），并立即按决策 278 续接转录＋错误 turn 重试（此处判废
+/// 发生在任何响应之前，故重试起点就是那条错误 turn；流中途判废的形态由
+/// production_llm 的真 SSE 流用例钉住）。
+#[tokio::test]
+async fn a_degenerated_round_is_marked_and_retried_with_the_transcript() {
+    let ctx = setup("true", Settings::default()).await;
+    let mut script = Script::new();
+    script
+        .for_node(Stage::ArchitectDesign, Node::ValidateInput)
+        .degenerate("片段「Playwright 或」连续重复 150 次")
+        .submit(&ValidateInputMetadata {
+            readiness: true,
+            blockers: vec![],
+        });
+    ctx.agent.set_script(script);
+    testkit::seed_task(&ctx.store, "degraded", "p1")
+        .await
+        .unwrap();
+    admit(&ctx, "degraded").await;
+    ctx.executor.run("degraded").await.unwrap();
+
+    let runs = ctx.store.list_runs("degraded").await.unwrap();
+    let vi_runs: Vec<_> = runs
+        .iter()
+        .filter(|r| {
+            r.stage == Stage::ArchitectDesign
+                && r.node == Node::ValidateInput
+                && r.agent_type == "main"
+        })
+        .collect();
+    assert_eq!(vi_runs.len(), 2, "判废一轮 + 重试成功一轮：{runs:?}");
+    assert_eq!(vi_runs[0].status, NodeStatus::Failed);
+    assert!(
+        vi_runs[0]
+            .error
+            .as_deref()
+            .unwrap_or("")
+            .contains("degraded"),
+        "run 行的 error 带 degraded 标记（API 可检索）：{:?}",
+        vi_runs[0].error
+    );
+    assert_eq!(vi_runs[1].status, NodeStatus::Success, "重试轮成功");
+
+    // 重试请求从错误 turn 起步（取重试那条 run 的**首条**请求——末条请求已带工具往来）
+    let requests = ctx.agent.request_log();
+    let vi: Vec<&LlmRequest> = requests
+        .iter()
+        .filter(|r| r.stage == Stage::ArchitectDesign && r.node == Node::ValidateInput)
+        .filter(|r| {
+            r.run
+                .as_ref()
+                .is_some_and(|c| c.agent_type.as_str() == "main")
+        })
+        .collect();
+    assert!(vi.len() >= 2, "至少两次请求：{}", vi.len());
+    let mut firsts: Vec<&LlmRequest> = Vec::new();
+    for r in &vi {
+        let run_id = r.run.as_ref().expect("主 agent 请求须带 run 上下文").run_id;
+        if firsts.last().map(|p| p.run.as_ref().unwrap().run_id) != Some(run_id) {
+            firsts.push(r);
+        }
+    }
+    let retried = firsts.last().expect("重试那条 run 的首条请求");
+    let last = retried.messages.last().expect("重试请求带错误 turn");
+    assert_eq!(
+        last.role,
+        agentpipeline_core::agent::client::Role::User,
+        "错误 turn 是一条 user 消息：{last:?}"
+    );
+    let turn = last.content.as_deref().unwrap_or("");
+    assert!(turn.contains("degraded"), "错误 turn 引用判废依据：{turn}");
+    assert!(turn.contains("submit_metadata"), "明示契约要求：{turn}");
 }
 
 /// 必要条件二：续接的 run 打上 `continued_from_run_id`，任务 token 总量不双算。

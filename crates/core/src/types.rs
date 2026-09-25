@@ -505,9 +505,11 @@ impl ResumeCause {
 /// **硬编码、改它要发版**（与 [`crate::config::SUPPORTED_ADAPTERS`] 同姿态，决策 103 的先例）：
 /// 这张表是产品判断，不是配置项——「不展示在设置里、在代码中定义好」正是本决策的原话。
 ///
-/// 分界一句话：**模型的自动失败重试不给续接，人的介入才给**（决策 33 不变）。
-/// 故 `validate_attempts` 的原地重试、`agent_retry_max` 的干净重试、未耗尽的超时
-/// 都不出现在这张表里——它们根本走不到 resume 边界（`clear_cursor_pending` 才是落点）。
+/// 这张表只管 **resume 边界**（人按了键）：分界原来是「模型的自动失败重试不给续接，
+/// 人的介入才给」（决策 33 / 205 裁决②）；**决策 278 显式修订后半句**——`agent_retry_max`
+/// 的自动重试如今也续接转录＋错误 turn，但那条路在编排侧（`model_invoke`）直接保留，
+/// 不走本表。故 `validate_attempts` 的原地重试、未耗尽的超时仍不出现在这张表里
+/// ——它们根本走不到 resume 边界（`clear_cursor_pending` 才是落点）。
 ///
 /// **穷尽 `match`**：新增一个原因时不写进这个 match 就编译不过。这比「兜底 false 然后忘掉」
 /// 强——兜底仍保留（`Unknown` 那一档），但它只服务于「库里的历史值」，不服务于新代码。
@@ -790,7 +792,13 @@ pub struct ArchitectExecuteMetadata {
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize, JsonSchema)]
 pub struct ValidateInputMetadata {
     pub readiness: bool,
+    /// 决策 277②：字段描述进 submit_metadata 的 tool schema（与模板同源同步）；
+    /// 类型保持 string[] 自由文本直通——下游 `as_str` 过滤会静默丢非字符串项，
+    /// 改结构化对象等于把现有产出静默变哑。
     #[serde(default)]
+    #[schemars(
+        description = "不充分时列出要问用户的问题；每条 = 问题 + 推荐答案。能从仓库文档/代码确定默认值的约束不问（直接采用并在判定正文注明默认值）"
+    )]
     pub blockers: Vec<String>,
 }
 

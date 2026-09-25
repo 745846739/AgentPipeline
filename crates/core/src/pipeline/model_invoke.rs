@@ -48,16 +48,22 @@ use super::model_request::{
 use super::run_ledger::{since_ms, RunLedger};
 use crate::pipeline::subagent::RunTokens;
 
-/// 一次尝试的失败现场：错误 + **这一轮已经烧掉的 token**（决策 226）。
+/// 一次尝试的失败现场：错误 + **这一轮已经烧掉的 token**（决策 226）+ **这一轮的
+/// 完整对话**（决策 278）。
 ///
-/// 两者必须一起回来。此前失败路径给 `finish_run` 传的是 `RunTokens::default()`，于是台账
+/// 前两者必须一起回来：此前失败路径给 `finish_run` 传的是 `RunTokens::default()`，于是台账
 /// 里的「0」同时意味着两件事：「一次模型调用都没发生」与「发生了但记账丢了」。2026-09-19
 /// 值班长正是据那个 0 推出「两次尝试连第一次 LLM 调用都没落账」，把它当成关键证据报了
 /// 四轮——而同一个 0 也长在死因完全已知的 run 上（init 的 `git 操作超时（180s）`）。
 /// 一个既是读数又是哨兵的字段，读的人只能猜；把真读数带上，它才只是读数。
+///
+/// `messages` 服务的是另一件事（决策 278，显式修订决策 205 裁决②）：自动重试的下一轮
+/// 从「这份转录原样保留 + 一条错误 turn」起步，不再空对话——探索只付一次钱（run40/41
+/// 同批文件读了三遍的实测教训）。
 struct AttemptFailure {
     error: Error,
     tokens: RunTokens,
+    messages: Vec<Message>,
 }
 
 /// `tool_event` 的参数摘要（决策 123：只给摘要，不外发全量参数）。
@@ -101,6 +107,33 @@ fn failure_metadata(error: &Error) -> serde_json::Value {
     meta
 }
 
+/// 校验类失败的用户可见文案（决策 278「报错人话化」）：裸诊断串对用户不是话。
+/// 只翻译能确定的几族签名，认不出的一律原文返回——宁可给原始串，不给错误的翻译。
+/// 措辞对 validate / execute 两类节点通用（「输出」而非「判定」）。原始诊断不受
+/// 影响：run 行的 error 仍是 `last_error` 原文。
+fn humanize_agent_failure(raw: &str) -> String {
+    if raw.contains("未找到结构化元数据") || raw.contains("缺少结构化元数据") {
+        "输出未按契约提交（没有等到 submit_metadata）".to_string()
+    } else if raw.contains("元数据校验失败") {
+        "已提交的内容不符合输出契约".to_string()
+    } else if raw.contains("工具参数 JSON 解析失败") {
+        "提交的参数不是合法 JSON".to_string()
+    } else if raw.contains("工具失败超过 tool_retry_max") {
+        "工具连续失败超过上限".to_string()
+    } else {
+        raw.to_string()
+    }
+}
+
+/// 读「用户补充输入」的正文（决策 279）：`user-input.md` 是决策 79 落盘的留痕
+/// （带 `# 用户补充输入` 标题行），user turn 要的是用户说过的话——剥掉标题行取正文。
+/// 文件不存在 / 正文为空 → `None`（落盘纪律不动，读不到就当没有补充）。
+fn supplement_input(home: &crate::home::Home, task_id: &str) -> Option<String> {
+    let raw = std::fs::read_to_string(home.task_file(task_id, "user-input.md")).ok()?;
+    let body = raw.strip_prefix("# 用户补充输入").unwrap_or(&raw).trim();
+    (!body.is_empty()).then(|| body.to_string())
+}
+
 /// 模型调用编排片的依赖面（决策 249 · 票 03）：只拿票面点名的那几个，字段全可廉价克隆
 /// （连接池 / Arc / 配置）——留守核每次派发 `clone` 一份，不借 `&Executor`。
 pub(crate) struct ModelInvoke {
@@ -119,7 +152,8 @@ impl ModelInvoke {
     }
 
     /// agent 节点：独立对话（决策 33）+ 工具真实执行（决策 148）+
-    /// `agent_retry_max` 干净对话重试（决策 33 / G13）。
+    /// `agent_retry_max` 重试（决策 33 / G13 分层计数；决策 278 起重试轮续接转录＋错误 turn，
+    /// 不再是「干净对话重试」——显式修订决策 205 裁决②）。
     pub(crate) async fn agent_node(&self, task: &Task, cursor: &NodeCursor) -> Result<NodeOutput> {
         let kind = AgentNodeKind::of(cursor.stage, cursor.node).ok_or_else(|| {
             Error::Validation(format!("{}.{} 不是 agent 节点", cursor.stage, cursor.node))
@@ -132,31 +166,58 @@ impl ModelInvoke {
         // 下面那层 `Error::Validation` 包装吞掉，用户只剩一段没有任何指引的文本。
         let mut last_classified: Option<(String, String)> = None;
         // 续接素材只在**进循环之前**取一次（红线④ / 决策 180：读清语义与「为什么只取
-        // 一次」见 `run_ledger` 模块 doc；循环内第 2、3 次按构造永远是空起点）。
+        // 一次」见 `run_ledger` 模块 doc；resume 边界每轮只有一个，循环内的重试续接
+        // 走决策 278 的转录保留，不经这里）。
         let continuation = self.ledger().take_continuation(cursor).await?;
+        // 决策 279：info_insufficient 续接时，补充输入作为 user turn 追加到**转录末尾**
+        // （不再经 segment 重渲染进首条消息——那会把 prompt 前缀全变、缓存打穿，
+        // 且转录里查无此人）。只在真追加了 turn 时才停用 segment：
+        // `AttemptCtx.user_input_as_turn`。
+        let mut carried: Vec<Message> = continuation
+            .as_ref()
+            .map(|c| c.messages.clone())
+            .unwrap_or_default();
+        let mut supplement_as_turn = false;
+        if matches!(cursor.node, Node::ValidateInput) && !carried.is_empty() {
+            if let Some(text) = supplement_input(self.store.home(), &task.id) {
+                // 决策 79 的落盘纪律是「空输入不落文件」但**也不清旧档**——同一
+                // info_insufficient 第二次「继续」且不带新输入时，文件里还是上一次
+                // 的补充，而它已经作为 user turn 在 carried 转录里了。转录里已有的
+                // 同文 turn 不再追加（评审发现的重放边缘）。
+                let already_carried = carried.iter().any(|m| {
+                    m.role == crate::agent::client::Role::User
+                        && m.content.as_deref() == Some(text.as_str())
+                });
+                if !already_carried {
+                    carried.push(Message::user(text));
+                    supplement_as_turn = true;
+                }
+            }
+        }
         for round in 0..self.settings.agent_retry_max {
             let (run_id, attempt) = self
                 .ledger()
                 .begin(task, &cursor.cursor_id, cursor.stage, cursor.node, "main")
                 .await?;
             // 续接链接只落 round 0（红线③ / 决策 180——落错轮会让 metrics 把同一段历史
-            // 排除两次、token 少算；规则与理由见 `run_ledger` 模块 doc）。
+            // 排除两次、token 少算；规则与理由见 `run_ledger` 模块 doc）。决策 278 的
+            // 重试轮续接**不落链**：被续接的是上一 attempt 的会话行，链接语义不变。
             self.ledger()
                 .link_continuation(run_id, round, continuation.as_ref())
                 .await?;
             emit_node_started(&*self.sse, task, cursor, attempt, run_id);
             let started = self.clock.now();
-            let carried: &[Message] = if round == 0 {
-                continuation
-                    .as_ref()
-                    .map(|c| c.messages.as_slice())
-                    .unwrap_or(&[])
-            } else {
-                // agent_retry_max 的干净对话重试（决策 33）不受续接影响
-                &[]
-            };
             match self
-                .agent_attempt(task, &project, cursor, kind, run_id, attempt, carried)
+                .agent_attempt(
+                    task,
+                    &project,
+                    cursor,
+                    kind,
+                    run_id,
+                    attempt,
+                    &carried,
+                    supplement_as_turn,
+                )
                 .await
             {
                 Ok((output, tokens)) => {
@@ -177,7 +238,11 @@ impl ModelInvoke {
                     self.store.refresh_task_totals(&task.id).await?;
                     return Ok(output);
                 }
-                Err(AttemptFailure { error, tokens }) => {
+                Err(AttemptFailure {
+                    error,
+                    tokens,
+                    messages,
+                }) => {
                     // 被中止（红线② / 决策 226 / 276）：**谁判的终态谁说了算**——判超时那条路
                     // 已经写过 Timeout，人按停那条路不判终态，于是这里自己收成 `Cancelled`
                     // （行已是终态时这一笔退化成「只补用量」）。不收的话，一次被按停的 run 会
@@ -214,12 +279,22 @@ impl ModelInvoke {
                     // 出来的，不刷新它，库里那份读数会比 run 行汇总出来的小——决策 226 把失败轮的
                     // token 记真之后这个差第一次看得见（此前失败一律记 0，两者恰好相等）。
                     self.store.refresh_task_totals(&task.id).await?;
-                    // 干净对话重试：messages 不跨 attempt 保留（决策 33）
+                    // 决策 278（显式修订决策 205 裁决②）：整体失败的自动重试不再空对话起步——
+                    // 下一轮从「这一轮的转录原样保留 + 一条错误 turn」接着跑。错误 turn 由
+                    // retry_prompt（决策 33 的「错误回填」）按原始诊断生成；转录不折叠、不省略
+                    // （决策 278 明确不做有损处理），体量交给既有的 L3/L4 预算门。
+                    let mut next = messages;
+                    next.push(Message::user(crate::agent::metadata::retry_prompt(
+                        &last_error,
+                    )));
+                    carried = next;
                 }
             }
         }
         // 分类信息穿透重试耗尽包装（主流程票 03）：message 保持「哪个节点 + 可操作提示」，
-        // 原始诊断仍由 run_inner 写进 pending.context.diagnostic。
+        // 原始诊断仍由 run_inner 写进 pending.context.diagnostic。校验类的内层文案按
+        // 决策 278 人话化——裸诊断串（「未找到结构化元数据」）对用户不是话；原始诊断
+        // 仍完整落在 run 行的 error 里（finish_run_with_sse 收口时已写入）。
         match last_classified {
             Some((kind, raw)) => Err(Error::LlmClassified {
                 kind,
@@ -230,8 +305,10 @@ impl ModelInvoke {
                 raw,
             }),
             None => Err(Error::Validation(format!(
-                "agent 节点 {}.{} 重试耗尽：{last_error}",
-                cursor.stage, cursor.node
+                "agent 节点 {}.{} 重试耗尽：{}",
+                cursor.stage,
+                cursor.node,
+                humanize_agent_failure(&last_error)
             ))),
         }
     }
@@ -257,13 +334,23 @@ impl ModelInvoke {
         run_id: i64,
         attempt: u32,
         carried: &[Message],
+        supplement_as_turn: bool,
     ) -> std::result::Result<(NodeOutput, RunTokens), AttemptFailure> {
         let mut trace = AttemptTrace {
             messages: carried.to_vec(),
             ..Default::default()
         };
         match self
-            .agent_attempt_inner(task, project, cursor, kind, run_id, attempt, &mut trace)
+            .agent_attempt_inner(
+                task,
+                project,
+                cursor,
+                kind,
+                run_id,
+                attempt,
+                &mut trace,
+                supplement_as_turn,
+            )
             .await
         {
             Ok((output, tokens)) => Ok((output, tokens)),
@@ -273,6 +360,8 @@ impl ModelInvoke {
                 Err(AttemptFailure {
                     error,
                     tokens: trace.tokens,
+                    // 决策 278：转录随失败一起回来——下一轮续接它（再追加错误 turn）
+                    messages: trace.messages,
                 })
             }
         }
@@ -341,6 +430,7 @@ impl ModelInvoke {
         run_id: i64,
         attempt: u32,
         trace: &mut AttemptTrace,
+        supplement_as_turn: bool,
     ) -> Result<(NodeOutput, RunTokens)> {
         let home = self.store.home().clone();
         home.ensure_task_dirs(&task.id)?;
@@ -448,6 +538,9 @@ impl ModelInvoke {
             stage_cfg: stage_cfg.as_ref(),
             attempt,
             kind,
+            // 决策 279：补充输入已作为 user turn 进转录（validate_input 续接），
+            // segment 不再重渲染——见 `model_request::load_segments`。
+            user_input_as_turn: supplement_as_turn,
         })
         .await?;
         let (plan, mut assemble_overflow) = match prepared {
@@ -1180,7 +1273,9 @@ impl AgentNodeKind {
         let view = match self {
             AgentNodeKind::ValidateInput => {
                 let m: crate::types::ValidateInputMetadata = serde_json::from_value(value)?;
-                MetadataView::readiness(m.readiness)
+                // 决策 277④：blockers 随投影带走——info_insufficient 的 pending 消息
+                // 要把「要问什么」带给用户，而不是让他们去翻会话记录。
+                MetadataView::readiness_with_blockers(m.readiness, m.blockers)
             }
             AgentNodeKind::DesignValidateOutput => {
                 let m: crate::types::ValidateOutputMetadata = serde_json::from_value(value)?;
@@ -1536,5 +1631,31 @@ mod tests {
         assert_eq!(run.attempt, 3);
         assert_eq!(run.status, NodeStatus::Success);
         assert_eq!(run.stage, cursor.stage);
+    }
+
+    /// 决策 279：user turn 取的是用户说过的话——剥掉决策 79 落盘时的标题行。
+    #[test]
+    fn supplement_input_strips_the_header_and_ignores_empty_bodies() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let home = crate::home::Home::new(tmp.path());
+
+        // 文件不存在 → None
+        assert_eq!(supplement_input(&home, "t1"), None);
+
+        // 决策 79 的落盘形态：标题行 + 正文
+        std::fs::create_dir_all(home.task_dir("t1")).unwrap();
+        std::fs::write(
+            home.task_file("t1", "user-input.md"),
+            "# 用户补充输入\n\n部署在 k8s，单机即可\n",
+        )
+        .unwrap();
+        assert_eq!(
+            supplement_input(&home, "t1").as_deref(),
+            Some("部署在 k8s，单机即可")
+        );
+
+        // 只有标题（空输入不落正文）→ None
+        std::fs::write(home.task_file("t1", "user-input.md"), "# 用户补充输入\n\n").unwrap();
+        assert_eq!(supplement_input(&home, "t1"), None);
     }
 }

@@ -298,8 +298,26 @@ fn render_step(step: Option<Step>) -> MockRoute {
             503,
             serde_json::json!({"error": {"type": kind, "message": message}}).to_string(),
         ),
+        // 输出退化（决策 280）：「客户端护栏判废」没有服务端报文形态——护栏在流的
+        // 消费侧。故这里流一段真实的复读文本，让生产护栏自己触发 Degenerated。
+        Some(Step::Degenerate { .. }) => {
+            MockRoute::sse("/", sse_degenerate_loop("Playwright 或", 40))
+        }
         None => MockRoute::sse("/", sse_text("（脚本已结束）")),
     }
+}
+
+/// 复读循环流（决策 280）：正常结尾不写——护栏会在中途判废。
+fn sse_degenerate_loop(unit: &str, times: usize) -> String {
+    let mut s = String::new();
+    for _ in 0..times {
+        let chunk = serde_json::json!({
+            "choices": [{"index": 0, "delta": {"content": unit}}]
+        });
+        s.push_str(&format!("data: {chunk}\n\n"));
+    }
+    s.push_str("data: [DONE]\n\n");
+    s
 }
 
 fn sse_tool(name: &str, arguments: &str) -> String {

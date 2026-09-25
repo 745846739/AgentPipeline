@@ -75,10 +75,11 @@ const ARCH_VI_SYSTEM: &str = r#"你是架构设计的信息充分性检查 agent
 - 有基本的技术约束（语言、框架、兼容性等）
 - 有可识别的输入输出定义
 
-## 输出
-调用 submit_metadata 返回检查结果。
+## 输出契约（决策 277）
+- 每一轮的最终动作必须是调用 submit_metadata 返回检查结果；用户的补充输入（如有）是新证据，不是模式切换，不改变本契约
 - readiness: boolean（信息是否充分）
-- blockers: string[]（不充分时列出缺失项）"#;
+- blockers: string[]（不充分时列出要问用户的问题；每条 = 问题 + 推荐答案）
+- 能从仓库文档 / 代码确定默认值的约束不列为 blocker：直接采用该默认值，并在判定正文注明所采用的默认值与出处"#;
 
 const ARCH_EX_SYSTEM: &str = r#"你是架构设计 agent。根据用户需求生成设计文档。
 
@@ -126,8 +127,11 @@ const DEV_DESIGN_VI_SYSTEM: &str = r#"你是开发方案的输入充分性检查
 - 涉及文件列表完整
 - 数据流和接口定义明确
 
-## 输出
-调用 submit_metadata。"#;
+## 输出契约（决策 277）
+- 每一轮的最终动作必须是调用 submit_metadata；用户的补充输入（如有）是新证据，不是模式切换，不改变本契约
+- readiness: boolean（信息是否充分）
+- blockers: string[]（不充分时列出要问用户的问题；每条 = 问题 + 推荐答案）
+- 能从仓库文档 / 代码确定默认值的约束不列为 blocker：直接采用该默认值，并在判定正文注明所采用的默认值与出处"#;
 
 const DEV_DESIGN_EX_SYSTEM: &str = r#"你是开发方案 agent。根据设计文档输出详细开发方案。
 
@@ -167,8 +171,11 @@ const TEST_DESIGN_VI_SYSTEM: &str = r#"你是测试设计的输入充分性检�
 - 有输入输出定义
 - 有业务流程描述
 
-## 输出
-调用 submit_metadata。"#;
+## 输出契约（决策 277）
+- 每一轮的最终动作必须是调用 submit_metadata；用户的补充输入（如有）是新证据，不是模式切换，不改变本契约
+- readiness: boolean（信息是否充分）
+- blockers: string[]（不充分时列出要问用户的问题；每条 = 问题 + 推荐答案）
+- 能从仓库文档 / 代码确定默认值的约束不列为 blocker：直接采用该默认值，并在判定正文注明所采用的默认值与出处"#;
 
 const TEST_DESIGN_EX_SYSTEM: &str = r#"你是业务测试用例设计 agent。根据设计文档设计业务测试场景。
 
@@ -326,6 +333,36 @@ mod tests {
             assert!(
                 system_template(stage, node).contains("submit_metadata"),
                 "{stage}.{node} 模板缺少结构化输出要求"
+            );
+        }
+    }
+
+    #[test]
+    fn validate_input_templates_carry_the_output_contract() {
+        // 决策 277①：三个输入充分性检查模板都要带契约句。run40 的现场（用户补充被
+        // 模型当成对话、一轮结束没交元数据）缺的正是这个锚点：补充是新证据，不是
+        // 模式切换；要问的写进 blockers，且能自答的不问。
+        for (stage, node) in [
+            (Stage::ArchitectDesign, Node::ValidateInput),
+            (Stage::DevelopDesign, Node::ValidateInput),
+            (Stage::TestDesign, Node::ValidateInput),
+        ] {
+            let system = system_template(stage, node);
+            assert!(
+                system.contains("每一轮的最终动作必须是调用 submit_metadata"),
+                "{stage}.{node} 缺少「每轮必交元数据」契约句"
+            );
+            assert!(
+                system.contains("新证据，不是模式切换"),
+                "{stage}.{node} 缺少「补充输入是新证据」契约句"
+            );
+            assert!(
+                system.contains("问题 + 推荐答案"),
+                "{stage}.{node} 缺少 blockers 的「问题 + 推荐答案」形状"
+            );
+            assert!(
+                system.contains("默认值"),
+                "{stage}.{node} 缺少「能自答的不问」条款"
             );
         }
     }

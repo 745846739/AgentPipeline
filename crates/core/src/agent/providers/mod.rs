@@ -25,6 +25,7 @@ use futures::StreamExt;
 use reqwest::Client;
 
 use crate::agent::client::{AgentResponse, LlmClient, LlmRequest, RunContext, ToolCall};
+use crate::agent::degeneration;
 use crate::sse::{Channel, SseEvent, SseSink};
 use crate::storage::Store;
 use crate::types::Provider;
@@ -359,6 +360,16 @@ impl ProductionLlm {
                     match chunk {
                         StreamChunk::Text(t) => {
                             content.push_str(&t);
+                            // 决策 280：流式护栏——累积文本尾部陷入复读循环即判废本轮，
+                            // 立即返回（不等正常结束、不读完垃圾）；agent loop 按决策 278
+                            // 续接转录＋错误 turn 重试。
+                            if let Some(d) = degeneration::detect(&content) {
+                                return Err(Error::Degenerated(format!(
+                                    "片段「{}」连续重复 {} 次",
+                                    preview(&d.unit, 24),
+                                    d.repeats
+                                )));
+                            }
                             if !t.is_empty() {
                                 self.emit_delta(run, Channel::Content, &t, 0, 0);
                             }

@@ -1174,7 +1174,19 @@ impl Executor {
                     metadata: view,
                     merge,
                 };
-                (crate::pipeline::route(cursor, &ctx), None)
+                let edge = crate::pipeline::route(cursor, &ctx);
+                // 决策 277④：info_insufficient 的 pending 消息带上 blockers 摘要——
+                // 「要问什么」在路由处本就在手（MetadataView 投影），看板卡片直接可见，
+                // 用户不必翻会话记录才知道要答什么。
+                let reason_override = match (&edge, &ctx.metadata.blockers) {
+                    (EdgeKind::Pending(PendingKind::InfoInsufficient), blockers)
+                        if !blockers.is_empty() =>
+                    {
+                        Some(info_insufficient_message(blockers))
+                    }
+                    _ => None,
+                };
+                (edge, reason_override)
             }
             NodeOutput::Edge(edge, reason) => (edge, reason),
             // 节点自己已经把整条 `PendingReason` 造好了（含构造者指定的 stage / node，
@@ -1216,7 +1228,11 @@ impl Executor {
                 .await?;
             }
             EdgeKind::Pending(kind) => {
-                let message = pending_message(kind);
+                // 决策 277④：路由侧可随边带自定义消息（info_insufficient 的 blockers
+                // 摘要）；未带时维持静态文案。目前 Pending 边没有其他消息来源。
+                let message = reason_override
+                    .clone()
+                    .unwrap_or_else(|| pending_message(kind).to_string());
                 // 决策 130 ① / 票 05：为两类待办补上 `context.kind`，让权威表的专用动作行生效。
                 let context = self.pending_context_for(task, cursor, kind).await?;
                 self.pend_cursor_with_context(cursor, kind, message, context)
@@ -1795,6 +1811,35 @@ fn pending_message(kind: PendingKind) -> &'static str {
     }
 }
 
+/// `info_insufficient` 的 pending 消息（决策 277④）：静态文案 + blockers 摘要。
+///
+/// blockers 的语义是「要问用户的问题」（决策 277②：每条 = 问题 + 推荐答案）。此前
+/// 它们只活在会话转录里，用户得翻会话才知道要答什么；摘要进 pending 消息后看板卡片
+/// 直接可见。**摘要不全文**：超过 [`INFO_INSUFFICIENT_SUMMARY_LIMIT`] 字符即显式截断
+/// （与 `truncate_gate_log` 同一条纪律——不静默丢内容），完整清单仍在会话记录里。
+fn info_insufficient_message(blockers: &[String]) -> String {
+    if blockers.is_empty() {
+        return pending_message(PendingKind::InfoInsufficient).to_string();
+    }
+    let mut out = format!(
+        "{}。要问的问题：",
+        pending_message(PendingKind::InfoInsufficient)
+    );
+    for (i, b) in blockers.iter().enumerate() {
+        let line = format!("\n{}. {}", i + 1, b.trim());
+        if out.chars().count() + line.chars().count() > INFO_INSUFFICIENT_SUMMARY_LIMIT {
+            out.push_str(&format!("\n…（其余 {} 条见会话记录）", blockers.len() - i));
+            return out;
+        }
+        out.push_str(&line);
+    }
+    out
+}
+
+/// blockers 摘要的字符上界（决策 277④「截断」的定稿值）：pending 消息面向看板卡片，
+/// 十几条问题全文塞进去会把卡片顶没；400 字符 ≈ 卡片两三行。
+const INFO_INSUFFICIENT_SUMMARY_LIMIT: usize = 400;
+
 /// 闸门失败输出（决策 109）：命令 + 退出码 + stdout/stderr 预览，注入 test.execute 复检 prompt。
 fn gate_output(kind: &str, command: &str, code: i32, output: &str) -> String {
     let output = output.trim();
@@ -1858,6 +1903,49 @@ mod tests {
         let with_log = gate_output("测试", "cargo test", 1, "FAILED: test_login\n");
         assert!(with_log.contains("退出码 1"));
         assert!(with_log.contains("FAILED: test_login"));
+    }
+
+    #[test]
+    fn info_insufficient_message_without_blockers_is_the_static_text() {
+        // 无 blockers 时与旧文案逐字一致（决策 277④ 只做加法，不改空情形）
+        assert_eq!(info_insufficient_message(&[]), "设计输入信息不足，请补充");
+    }
+
+    #[test]
+    fn info_insufficient_message_lists_blockers_as_numbered_questions() {
+        let m = info_insufficient_message(&[
+            "部署目标是什么？推荐：本地 Docker".to_string(),
+            "并发量级？推荐：单机 < 100 QPS".to_string(),
+        ]);
+        assert!(
+            m.starts_with("设计输入信息不足，请补充。要问的问题："),
+            "{m}"
+        );
+        assert!(m.contains("\n1. 部署目标是什么？推荐：本地 Docker"), "{m}");
+        assert!(m.contains("\n2. 并发量级？推荐：单机 < 100 QPS"), "{m}");
+    }
+
+    #[test]
+    fn info_insufficient_message_truncates_with_an_explicit_notice() {
+        // 截断必须显式（与 truncate_gate_log 同纪律）：有「其余 N 条」的标注，
+        // 且总长有上界——不静默丢，也不把看板卡片顶没。
+        let blockers: Vec<String> = (0..60)
+            .map(|i| {
+                format!(
+                    "第 {i} 个问题：{}？推荐：选项 {i}",
+                    "很长的问题描述".repeat(12)
+                )
+            })
+            .collect();
+        let m = info_insufficient_message(&blockers);
+        assert!(m.contains("其余"), "截断处须有显式标注：{m}");
+        assert!(
+            m.chars().count() <= INFO_INSUFFICIENT_SUMMARY_LIMIT + 40,
+            "摘要应有上界：{}",
+            m.chars().count()
+        );
+        // 完整清单不带全文
+        assert!(!m.contains("第 59 个问题"), "{m}");
     }
 
     /// 中止请求的**来路**随请求一起落进那一格（决策 276）。

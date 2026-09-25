@@ -426,6 +426,47 @@ async fn malformed_stream_is_a_clean_llm_error() {
     mock.shutdown().await;
 }
 
+// ─────────────────── 决策 280：退化护栏（流式循环检测） ───────────────────
+
+/// 拼一段「正常开头 + 单元复读 N 次」的 OpenAI 兼容 SSE 流。
+fn degenerate_stream(unit: &str, times: usize) -> String {
+    let mut s = String::from(
+        "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"前文分析。\"}}]}\n\n",
+    );
+    for _ in 0..times {
+        let payload = serde_json::json!({"choices":[{"index":0,"delta":{"content": unit}}]});
+        s.push_str(&format!("data: {payload}\n\n"));
+    }
+    s.push_str("data: [DONE]\n\n");
+    s
+}
+
+#[tokio::test]
+async fn a_repetitive_stream_is_voided_as_degraded_mid_flight() {
+    // 决策 280：run41 的形态（「Playwright 或」×N）在流中途即被判废——
+    // 不等 [DONE]、不读完垃圾，complete 返回 Degenerated 错误。
+    let home = TestHome::new().unwrap();
+    let (store, _clock) = home.setup().await.unwrap();
+    let mock = MockLlm::start(vec![MockRoute::sse(
+        "/chat/completions",
+        degenerate_stream("Playwright 或", 40),
+    )])
+    .await;
+    store
+        .upsert_provider(&provider("openai", "gpt-x", &mock.url, "p1"))
+        .await
+        .unwrap();
+    let run_id = seed_run(&store, "t1").await;
+
+    let client = ProductionLlm::new(store.clone(), Arc::new(SseRecorder::new()));
+    let err = client.complete(request(run_id, vec![])).await.unwrap_err();
+    let msg = err.to_string();
+    assert!(msg.contains("输出退化（degraded）"), "{msg}");
+    assert!(msg.contains("Playwright"), "报文引用重复片段：{msg}");
+    assert!(!msg.contains("解析失败"), "不是流解析错误：{msg}");
+    mock.shutdown().await;
+}
+
 #[tokio::test]
 async fn unknown_vendor_and_missing_provider_fail_cleanly() {
     let home = TestHome::new().unwrap();

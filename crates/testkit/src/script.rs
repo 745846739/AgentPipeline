@@ -34,6 +34,10 @@ pub enum Step {
         message: String,
         raw: String,
     },
+    /// 输出退化注入（决策 280）：LLM 调用当场返回 `Degenerated` 错误——
+    /// 流式护栏判废本轮。生产里护栏在 `ProductionLlm` 的流中途触发；脚本替身
+    /// 在同一接缝（`complete` 的返回值）给出同型错误，供 agent loop 整环验证。
+    Degenerate { message: String },
 }
 
 /// 按 `(stage, node)` 组织的脚本；伪阶段按 `agent_type`（`pseudo:*`）单独排队（testing.md §3.2 ⑥）。
@@ -295,6 +299,13 @@ impl NodeScript<'_> {
         })
     }
 
+    /// 输出退化注入（决策 280）：本轮被护栏判废，agent loop 应按决策 278 续接重试。
+    pub fn degenerate(self, message: &str) -> Self {
+        self.push(Step::Degenerate {
+            message: message.to_string(),
+        })
+    }
+
     pub fn push(self, step: Step) -> Self {
         self.script.push(self.stage, self.node, step);
         self
@@ -541,6 +552,10 @@ impl LlmClient for FakeAgent {
                 // 当场报错：适配器层的可归因失败（票 01 的失败落库路径）
                 Some(Step::Fail { kind, message, raw }) => {
                     Err(agentpipeline_core::Error::LlmClassified { kind, message, raw })
+                }
+                // 输出退化（决策 280）：护栏判废本轮，agent loop 按决策 278 续接重试
+                Some(Step::Degenerate { message }) => {
+                    Err(agentpipeline_core::Error::Degenerated(message))
                 }
                 // 脚本耗尽：返回无 tool_call 的收尾响应，agent loop 自然结束
                 None => Ok(AgentResponse {

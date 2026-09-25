@@ -40,6 +40,14 @@ pub enum Error {
     #[error("LLM 调用失败：{0}")]
     Llm(String),
 
+    /// 模型输出退化（决策 280）：流式护栏检测到复读循环，本轮已判废。
+    ///
+    /// 与 `Llm` 的区别：调用本身没失败，是**产出**被判废——必然触发按决策 278 的
+    /// 续接重试（错误 turn 引用这里的证据），而不是算作一次普通的调用失败。
+    /// run 行的 error 以「输出退化（degraded）」开头（复用既有列，API 可检索）。
+    #[error("输出退化（degraded）：{0}")]
+    Degenerated(String),
+
     /// 可归因的 LLM 配置类失败（主流程票 03）：`message` 是中文可操作提示，
     /// `raw` 保留原始诊断（进 `pending.context.diagnostic`，不进 message）。
     ///

@@ -71,6 +71,10 @@ pub struct AttemptCtx<'a> {
     pub attempt: u32,
     /// 节点种类：`submit_metadata` 的 schema 工具按它分发（与 `tool_defs` 同源）。
     pub kind: AgentNodeKind,
+    /// 决策 279：补充输入已作为 user turn 追加进续接转录（validate_input 的续接场景）
+    /// ——「用户补充输入」segment 停止渲染，否则同一段话出现两遍、首条消息还变了
+    /// （prompt cache 整段打穿的实测根源）。execute 等其余场景恒 false，segment 照旧。
+    pub user_input_as_turn: bool,
 }
 
 /// 组装期判出的超限事实。**不是 `PendingReason`**——落点由构造者定（决策 245），
@@ -349,13 +353,19 @@ async fn load_segments(ctx: &AttemptCtx<'_>) -> Result<PromptSegments> {
             ctx.cursor.node,
             "backtrack-feedback.md",
         ),
-        user_input: architect_reentry_segment(
-            home,
-            &ctx.task.id,
-            ctx.cursor.stage,
-            ctx.cursor.node,
-            "user-input.md",
-        ),
+        user_input: if ctx.user_input_as_turn {
+            // 决策 279：补充输入已作为 user turn 在转录末尾，不再渲染进首条消息——
+            // 首条消息逐字不变，prompt cache 的前缀承诺从「run 内」延伸到「resume」。
+            None
+        } else {
+            architect_reentry_segment(
+                home,
+                &ctx.task.id,
+                ctx.cursor.stage,
+                ctx.cursor.node,
+                "user-input.md",
+            )
+        },
         review_required_changes: review_required_changes_segment(ctx.store, ctx.task, ctx.cursor)
             .await?,
         retry_feedback: architect_reentry_segment(
@@ -1135,6 +1145,7 @@ mod tests {
             stage_cfg,
             attempt: 1,
             kind,
+            user_input_as_turn: false,
         }
     }
 
@@ -1339,6 +1350,54 @@ mod tests {
         assert!(
             !develop.user.contains("## 上游回溯反馈"),
             "范围只有 architect 重入"
+        );
+    }
+
+    #[tokio::test]
+    async fn user_input_segment_yields_to_the_transcript_turn_when_appended() {
+        // 决策 279：补充输入已进转录（user turn，validate_input 续接）→ segment 停止
+        // 渲染——同一段话不出现两遍，首条消息也不因 resume 而变；未进转录（首轮 /
+        // execute 等）→ segment 照旧渲染。
+        let (_tmp, home, store, task, project, settings, cursor) = base().await;
+        std::fs::create_dir_all(home.task_dir("t1")).unwrap();
+        std::fs::write(
+            home.task_file("t1", "user-input.md"),
+            "补充的事实：部署在 k8s",
+        )
+        .unwrap();
+
+        let rendered = assemble_ok(ctx(
+            &store,
+            &settings,
+            &task,
+            &project,
+            &cursor,
+            None,
+            AgentNodeKind::ValidateInput,
+        ))
+        .await;
+        assert!(
+            rendered.user.contains("## 用户补充输入"),
+            "未进转录时照旧渲染"
+        );
+
+        let suppressed = assemble_ok(AttemptCtx {
+            user_input_as_turn: true,
+            ..ctx(
+                &store,
+                &settings,
+                &task,
+                &project,
+                &cursor,
+                None,
+                AgentNodeKind::ValidateInput,
+            )
+        })
+        .await;
+        assert!(
+            !suppressed.user.contains("用户补充输入"),
+            "进转录后 segment 让位：{}",
+            suppressed.user
         );
     }
 

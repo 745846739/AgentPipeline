@@ -3,6 +3,7 @@
 pub mod baseline;
 pub mod client;
 pub mod context;
+pub mod degeneration;
 pub mod egress;
 pub mod factory;
 pub mod file_policy;
