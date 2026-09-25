@@ -374,17 +374,27 @@ pub async fn serve(options: ServeOptions) -> anyhow::Result<ServerHandle> {
     };
 
     let store = Store::open(home.clone(), Arc::new(SystemClock)).await?;
-    // 离线通知（决策 268 / 270）：`[notify].webhook_url` 在场才挂出口——缺席 = 整段关死。
-    // 挂在 attention 的记账漏斗上（与值守轮同一信号面），投递 best-effort 在出口内部；
-    // 报文格式（`[notify].format`，决策 270）在这里透传给出口，政策语义与格式无关。
-    if let Some(url) = config.notify.webhook_url.as_deref() {
-        store.set_notifier(Arc::new(agentpipeline_core::notify::WebhookNotifier::new(
-            url.to_string(),
-            config.notify.cooldown_sec,
-            config.notify.quiet_hours,
-            config.notify.format,
-            Arc::new(SystemClock),
-        )));
+    // 离线通知（决策 268 / 270 / 272）：两级解析（界面单元 > config.toml，272⑥），
+    // 总开关关死一切（272⑧）。挂接面有两条：attention 的记账漏斗（268②）与值班长
+    // 回话收口（272②，在 `foreman.rs`）；投递 best-effort 在出口内部。解析出错只在
+    // 日志里报并把这一段关死——通知挂了不能把机器挂了（268② 的姿态）；设置页会
+    // 把同一句报文展示出来（报错不静默，272⑧）。
+    match store.notify_settings_state().await {
+        Ok(notify_state) => {
+            match agentpipeline_core::notify::resolve_notify_target(&config.notify, &notify_state) {
+                Ok(Some(target)) => {
+                    store.set_notifier(Arc::new(agentpipeline_core::notify::WebhookNotifier::new(
+                        target,
+                        config.notify.cooldown_sec,
+                        config.notify.quiet_hours,
+                        Arc::new(SystemClock),
+                    )));
+                }
+                Ok(None) => {}
+                Err(e) => tracing::error!("离线通知配置有误，这一段关死：{e}"),
+            }
+        }
+        Err(e) => tracing::error!("读不到离线通知的界面设置，这一段关死：{e}"),
     }
 
     // 恢复序列（决策 127 / 212）：三步走**唯一那一份实现**（决策 255）——`service` 提议的
@@ -550,6 +560,7 @@ pub async fn serve(options: ServeOptions) -> anyhow::Result<ServerHandle> {
         .with_allowed_origins(extra_origins)
         .with_repo(repo, market_repos)
         .with_market_override(market_override)
+        .with_notify_config(config.notify.clone())
         .with_foreman(foreman);
     let router = build_router(state.clone());
 

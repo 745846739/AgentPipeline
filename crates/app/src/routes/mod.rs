@@ -2,6 +2,7 @@
 
 pub mod foreman;
 pub mod market;
+pub mod notify;
 pub mod pairing;
 pub mod projects;
 pub mod providers;

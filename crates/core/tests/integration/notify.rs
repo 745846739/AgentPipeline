@@ -16,7 +16,9 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use agentpipeline_core::clock::Clock;
-use agentpipeline_core::notify::{notification_class, NotifyClass, NotifyFormat, WebhookNotifier};
+use agentpipeline_core::notify::{
+    notification_class, NotifyClass, NotifyFormat, NotifyTarget, WebhookNotifier,
+};
 use agentpipeline_core::storage::attention::AttentionKind;
 use agentpipeline_core::storage::Store;
 use chrono::{DateTime, Local, TimeZone, Utc};
@@ -25,7 +27,7 @@ use testkit::{ManualClock, TestHome};
 use crate::web_fetch::TinyHttp;
 
 /// 「本地恰为 `hour` 点整」的瞬间（跨零点 / DST 由 chrono 收口；测试只要判据确定）。
-fn at_local_hour(hour: u32) -> DateTime<Utc> {
+pub(crate) fn at_local_hour(hour: u32) -> DateTime<Utc> {
     let today = Local::now().date_naive();
     let naive = today.and_hms_opt(hour, 0, 0).unwrap();
     Local
@@ -85,12 +87,27 @@ impl Fixture {
 
     fn attach_format(&self, server: &TinyHttp, format: NotifyFormat) {
         self.store.set_notifier(Arc::new(WebhookNotifier::new(
-            server.url("/hook"),
+            NotifyTarget::Webhook {
+                url: server.url("/hook"),
+                format,
+            },
             300,
             [22, 8],
-            format,
             self.clock.clone(),
         )));
+    }
+
+    /// 挂上任意目标并把出口交还调用方——回话线 / 失败线的入口在**出口**上
+    /// （`notify_foreman_reply` / `notify_foreman_failure`），测试要拿得到它。
+    fn attach_target(&self, target: NotifyTarget) -> Arc<WebhookNotifier> {
+        let notifier = Arc::new(WebhookNotifier::new(
+            target,
+            300,
+            [22, 8],
+            self.clock.clone(),
+        ));
+        self.store.set_notifier(notifier.clone());
+        notifier
     }
 }
 
@@ -297,4 +314,105 @@ fn kind_to_class_mapping_is_pinned() {
     for (kind, cls) in table {
         assert_eq!(notification_class(kind), cls, "{kind:?}");
     }
+}
+
+// ───────── 决策 272：BlueBubbles 通道与回话线的礼貌语义 ────────
+
+#[tokio::test]
+async fn bluebubbles_target_posts_a_send_text_body_with_the_password_in_the_query() {
+    let f = fixture(12).await;
+    let server = TinyHttp::spawn("200", "application/json", b"{}".to_vec(), Duration::ZERO);
+    let notifier = f.attach_target(NotifyTarget::BlueBubbles {
+        endpoint: server.url(""), // 端点 = 基地址；路径由代码拼
+        password: "s3cret".into(),
+        address: "me@icloud.com".into(),
+    });
+
+    notifier.notify_foreman_reply("晚上的重构", "查完了。", f.clock.now());
+    assert!(
+        wait_hits(&server, 1, 8_000).await,
+        "BlueBubbles 通道应当出站"
+    );
+
+    // 完整 URL 是代码拼的（272⑦）：路径与 password 在 query 里，TinyHttp 首行可核。
+    let line = server.first_request_line();
+    assert!(
+        line.starts_with("POST /api/v1/message/text?password=s3cret"),
+        "{line}"
+    );
+    let payload: serde_json::Value =
+        serde_json::from_str(&String::from_utf8_lossy(&server.body())).unwrap();
+    assert_eq!(payload["chatGuid"], "iMessage;-;me@icloud.com", "{payload}");
+    assert_eq!(payload["method"], "apple-script", "{payload}");
+    let message = payload["message"].as_str().unwrap();
+    assert!(
+        message.starts_with("[AgentPipeline] 晚上的重构 回话"),
+        "正文字段是 message（官方文档写 text 是错的）：{message}"
+    );
+    assert!(message.contains("查完了。"), "{message}");
+}
+
+#[tokio::test]
+async fn foreman_reply_respects_quiet_hours_while_failure_stays_loud() {
+    // 本地 23 点 = 免打扰 [22, 8) 之内。
+    let f = fixture(23).await;
+    let server = TinyHttp::spawn("200", "application/json", b"{}".to_vec(), Duration::ZERO);
+    let notifier = f.attach_target(NotifyTarget::Webhook {
+        url: server.url("/hook"),
+        format: NotifyFormat::Generic,
+    });
+
+    // 回话线：受免打扰、不豁免（272④——回话是摘要不是警报）。
+    notifier.notify_foreman_reply("晚上的重构", "还在查。", f.clock.now());
+    // 失败线：类 = failed，恒发（272③）。
+    notifier.notify_foreman_failure("晚上的重构", "llm_network", f.clock.now());
+    assert!(
+        wait_hits(&server, 1, 8_000).await,
+        "免打扰段内只有失败线照发：hits={}",
+        server.hits()
+    );
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert_eq!(server.hits(), 1, "回话线被免打扰静音");
+    let payload: serde_json::Value =
+        serde_json::from_str(&String::from_utf8_lossy(&server.body())).unwrap();
+    assert_eq!(payload["kind"], "foreman_reply_failed", "{payload}");
+
+    // 拨出免打扰段（本地 8 点）：回话线放行。
+    f.clock.advance_secs((9 * 3600) as i64); // 23:00 → 次日 08:00（本地）
+    notifier.notify_foreman_reply("晚上的重构", "查完了。", f.clock.now());
+    assert!(wait_hits(&server, 2, 8_000).await, "出免打扰段后回话线放行");
+}
+
+#[tokio::test]
+async fn foreman_reply_has_its_own_cooldown_slot() {
+    let f = fixture(12).await;
+    let server = TinyHttp::spawn("200", "application/json", b"{}".to_vec(), Duration::ZERO);
+    let notifier = f.attach_target(NotifyTarget::Webhook {
+        url: server.url("/hook"),
+        format: NotifyFormat::Generic,
+    });
+    let t0 = f.clock.now();
+
+    notifier.notify_foreman_reply("晚上的重构", "第一条。", t0);
+    assert!(wait_hits(&server, 1, 8_000).await);
+    // cooldown 内第二条回话被挡（类内 300s 槽）。
+    notifier.notify_foreman_reply("晚上的重构", "第二条。", t0 + chrono::Duration::seconds(5));
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert_eq!(server.hits(), 1, "foreman_reply 有自己的 cooldown 槽");
+
+    // **绝不复用 done**（272④）：回话占用槽位后，真正的 task_done 照发。
+    note(
+        &f,
+        AttentionKind::TaskDone,
+        t0 + chrono::Duration::seconds(6),
+    )
+    .await;
+    assert!(
+        wait_hits(&server, 2, 8_000).await,
+        "done 的槽位独立，不能被回话吃掉：hits={}",
+        server.hits()
+    );
+    let payload: serde_json::Value =
+        serde_json::from_str(&String::from_utf8_lossy(&server.body())).unwrap();
+    assert_eq!(payload["kind"], "task_done", "{payload}");
 }

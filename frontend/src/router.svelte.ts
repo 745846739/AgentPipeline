@@ -35,6 +35,7 @@ export type Route =
   | { name: 'settings-providers'; query: RouteQuery }
   | { name: 'settings-stages'; query: RouteQuery }
   | { name: 'settings-market'; query: RouteQuery }
+  | { name: 'settings-notify'; query: RouteQuery }
   | { name: 'metrics'; query: RouteQuery }
   | { name: 'share'; query: RouteQuery }
   | { name: 'not-found'; path: string; query: RouteQuery };
@@ -77,6 +78,8 @@ export function parseRoute(hash: string): Route {
   // 技能市场（决策 194，页骨架承自 187）：仓名单 / 该仓的技能列表 / 安装。
   // 此前只有 config.toml 一条路，界面上无处可改。
   if (path === '/settings/market') return { name: 'settings-market', query };
+  // 离线通知（决策 272）：总开关 / 通道四件 / 探针。
+  if (path === '/settings/notify') return { name: 'settings-notify', query };
   if (path === '/metrics') return { name: 'metrics', query };
   if (path === '/share') return { name: 'share', query };
   return { name: 'not-found', path, query };

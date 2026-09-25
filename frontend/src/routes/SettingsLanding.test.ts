@@ -3,7 +3,7 @@ import { afterEach, describe, expect, it, vi } from 'vitest';
 import SettingsLanding from './SettingsLanding.svelte';
 
 /**
- * 设置落地页（决策 198 / design §4.3）接线层：分类两项、五个入口，
+ * 设置落地页（决策 198 / design §4.3）接线层：分类（决策 272⑧ 起三类）、六个入口，
  * 以及**「手机访问」项随来源取舍**那一条。
  *
  * 那一条的原判据钉在 `lib/localPage.test.ts`（主机名），这里钉的是**接线**——
@@ -18,8 +18,9 @@ const mocks = vi.hoisted(() => ({ onHostMachine: vi.fn() }));
 
 vi.mock('../lib/localPage', () => ({ onHostMachine: mocks.onHostMachine }));
 
-/** 两项分类与各自的项（design §4.3 的定稿项名，逐字）。 */
+/** 各分类的项（design §4.3 的定稿项名，逐字）。 */
 const WHO = ['项目', '手机访问'];
+const REACH = ['离线通知'];
 const HOW = ['模型与密钥', '阶段配置', '技能市场'];
 
 afterEach(() => {
@@ -28,12 +29,13 @@ afterEach(() => {
 });
 
 describe('设置落地页（决策 198）', () => {
-  it('标题「设置」，分类按用途两分', () => {
+  it('标题「设置」，分类按用途三分（决策 272⑧ 加「怎么找到你」）', () => {
     mocks.onHostMachine.mockReturnValue(true);
     render(SettingsLanding);
 
     expect(screen.getByRole('heading', { level: 1, name: '设置' })).not.toBeNull();
     expect(screen.getByRole('heading', { name: '谁能进来' })).not.toBeNull();
+    expect(screen.getByRole('heading', { name: '怎么找到你' })).not.toBeNull();
     expect(screen.getByRole('heading', { name: '怎么跑' })).not.toBeNull();
   });
 
@@ -44,6 +46,7 @@ describe('设置落地页（决策 198）', () => {
     const expected: Array<[RegExp, string]> = [
       [/项目/, '#/settings/projects'],
       [/手机访问/, '#/share'],
+      [/离线通知/, '#/settings/notify'],
       [/模型与密钥/, '#/settings/providers'],
       [/阶段配置/, '#/settings/stages'],
       [/技能市场/, '#/settings/market'],
@@ -64,19 +67,19 @@ describe('设置落地页（决策 198）', () => {
     mocks.onHostMachine.mockReturnValue(true);
     render(SettingsLanding);
 
-    for (const label of [...WHO, ...HOW]) {
+    for (const label of [...WHO, ...REACH, ...HOW]) {
       expect(screen.queryByRole('link', { name: new RegExp(label) }), label).not.toBeNull();
     }
   });
 
-  it('在手机（或任何非本机来源）打开：不给「手机访问」这一项，其余四项不动', () => {
+  it('在手机（或任何非本机来源）打开：不给「手机访问」这一项，其余五项不动', () => {
     mocks.onHostMachine.mockReturnValue(false);
     render(SettingsLanding);
 
     // 不渲染这一项（不是禁用、不是留个空位）：规则与后果与决策 190 逐字一致
     expect(screen.queryByRole('link', { name: /手机访问/ })).toBeNull();
     expect(screen.queryByText(/手机访问/)).toBeNull();
-    for (const label of ['项目', ...HOW]) {
+    for (const label of ['项目', ...REACH, ...HOW]) {
       expect(screen.queryByRole('link', { name: new RegExp(label) }), label).not.toBeNull();
     }
   });

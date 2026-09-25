@@ -9,6 +9,7 @@
 //! 所以「read_task 真读到了台账」这件事由真 SQL 保证，不是脚本演出来的。
 
 use std::sync::Arc;
+use std::time::Duration;
 
 use agentpipeline_core::agent::client::{AgentResponse, LlmClient, LlmRequest};
 use agentpipeline_core::agent::tools::{is_env_write_tool, is_service_write_tool, ENV_TOOLS};
@@ -35,6 +36,8 @@ use agentpipeline_core::types::{
 };
 use agentpipeline_core::Error;
 use testkit::{FakeAgent, ManualClock, Repo, Script, TestHome};
+
+use crate::web_fetch::TinyHttp;
 
 struct Harness {
     _home: TestHome,
@@ -5487,5 +5490,205 @@ async fn the_proposal_args_are_the_parameters_the_button_would_send() {
         pending[0].args.to_string(),
         expected.to_string(),
         "逐字一致：按 canonical 字节比，不只比结构"
+    );
+}
+
+// ──────────────── 值班长回话线 → 离线通知（决策 272②③④）────────────────
+
+/// 轮询等到第 `want` 次命中（投递是 best-effort 后台任务；照 `notify.rs` 的同款）。
+async fn wait_hits(server: &TinyHttp, want: usize, ms: u64) -> bool {
+    let deadline = std::time::Instant::now() + Duration::from_millis(ms);
+    while std::time::Instant::now() < deadline {
+        if server.hits() >= want {
+            return true;
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    server.hits() >= want
+}
+
+/// 挂一个 generic webhook 出口。礼貌用的时钟与 store 的时钟**分开**：免打扰按出口
+/// 自己的钟算，这里拨到本地正午——任何时区下都确定不在 `[22, 8)` 免打扰段里。
+fn attach_notifier(h: &Harness, server: &TinyHttp) {
+    h.store
+        .set_notifier(Arc::new(agentpipeline_core::notify::WebhookNotifier::new(
+            agentpipeline_core::notify::NotifyTarget::Webhook {
+                url: server.url("/hook"),
+                format: agentpipeline_core::notify::NotifyFormat::Generic,
+            },
+            300,
+            [22, 8],
+            Arc::new(ManualClock::new(crate::notify::at_local_hour(12))),
+        )));
+}
+
+#[tokio::test]
+async fn a_work_heavy_say_turn_announces_the_reply_line() {
+    let h = Harness::empty().await;
+    let sid = h.session().await;
+    let server = TinyHttp::spawn("200", "application/json", b"{}".to_vec(), Duration::ZERO);
+    attach_notifier(&h, &server);
+
+    // 三次工具调用 = 过 `FOREMAN_REPLY_MIN_TOOL_CALLS` 的门（查不存在的任务是正常回答，
+    // 故不需要真任务；「查不到」的文本回答恰好也证明正文来自模型的收口轮）。
+    let mut script = Script::new();
+    script
+        .for_foreman()
+        .read_task("t-none-1")
+        .read_task("t-none-2")
+        .read_task("t-none-3")
+        .text("三张卡都查完了：台账里没有这三张。");
+    let runner = h.runner(FakeAgent::new(script));
+    runner.say(Some(&sid), "帮我查三张卡的状态").await.unwrap();
+
+    assert!(
+        wait_hits(&server, 1, 8_000).await,
+        "过门的回话轮应当出站一条通知"
+    );
+    let payload: serde_json::Value =
+        serde_json::from_str(&String::from_utf8_lossy(&server.body())).unwrap();
+    assert_eq!(payload["kind"], "foreman_reply", "{payload}");
+    assert!(
+        payload.get("task_id").is_none(),
+        "回话线没有 task_id：省略而不是哨兵（272②）— {payload}"
+    );
+    // 会话名在 title 里（多会话时否则不知是哪一轮，272⑤）
+    let session = h
+        .store
+        .get_foreman_session(&sid)
+        .await
+        .unwrap()
+        .expect("会话应当存在");
+    assert!(
+        payload["title"].as_str().unwrap().contains(&session.title),
+        "{payload}"
+    );
+    // 正文带回话原文（268④ 的本人通道豁免只给这一段，272⑤）
+    assert!(
+        payload["body"].as_str().unwrap().contains("三张卡都查完了"),
+        "{payload}"
+    );
+}
+
+#[tokio::test]
+async fn a_short_say_turn_never_touches_the_reply_line() {
+    let h = Harness::seeded().await;
+    let sid = h.session().await;
+    let server = TinyHttp::spawn("200", "application/json", b"{}".to_vec(), Duration::ZERO);
+    attach_notifier(&h, &server);
+
+    let mut script = Script::new();
+    script.for_foreman().text("在的。");
+    let runner = h.runner(FakeAgent::new(script));
+    runner.say(Some(&sid), "在吗").await.unwrap();
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert_eq!(
+        server.hits(),
+        0,
+        "零工具的快轮不通知，且连 cooldown 槽都不碰（门在 notify() 之前，272③）"
+    );
+
+    // 金丝雀：attention 线照常出站——出口真的挂着，静默是门干的，不是没接上。
+    h.store
+        .note_attention(
+            "t1",
+            agentpipeline_core::storage::AttentionKind::TaskDone,
+            h.clock.now(),
+            None,
+        )
+        .await
+        .unwrap();
+    assert!(
+        wait_hits(&server, 1, 8_000).await,
+        "金丝雀（TaskDone）应当出站"
+    );
+}
+
+#[tokio::test]
+async fn a_watch_broadcast_announces_without_the_gate_and_a_silent_one_stays_quiet() {
+    let h = Harness::seeded().await;
+    let server = TinyHttp::spawn("200", "application/json", b"{}".to_vec(), Duration::ZERO);
+
+    // 待办**先记、出口后挂**：否则 attention 线自己的通知（RetryExhausted → failed 恒发）
+    // 会先占一次命中，两条线就分不开了。
+    note(
+        &h,
+        "t1",
+        agentpipeline_core::storage::AttentionKind::RetryExhausted,
+    )
+    .await;
+    h.clock.advance_secs(61);
+    attach_notifier(&h, &server);
+
+    // 静默轮：零工具 + 【无需处理】——恒不通知（272③）。
+    let mut silent = Script::new();
+    silent
+        .for_foreman()
+        .text("【无需处理】自行恢复，无需打扰。");
+    let runner = h.runner(FakeAgent::new(silent));
+    assert!(runner.watch().await.unwrap().is_none(), "静默轮不播报");
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert_eq!(server.hits(), 0, "静默轮恒不通知");
+
+    // 播报轮：零工具也**恒通知**（它本就是「没人在场」的定义，272③——不设 traces 门）。
+    // 这一笔 note 的 attention 线通知（TaskStale → pending 类）与回话线通知并存，
+    // 故总数是 2；TinyHttp 只留最后一次报文体，用它认出**回话线**那条真的到了。
+    // 换 t2 记待办：t1 刚被消费过、在同任务冷却里（决策 209⑤），新事件不单独唤醒。
+    h.task("t2").await;
+    note(
+        &h,
+        "t2",
+        agentpipeline_core::storage::AttentionKind::TaskStale,
+    )
+    .await;
+    h.clock.advance_secs(61);
+    let mut broadcast = Script::new();
+    broadcast
+        .for_foreman()
+        .text("t1 卡住了，需要值班经理看一眼。");
+    let runner = h.runner(FakeAgent::new(broadcast));
+    assert!(runner.watch().await.unwrap().is_some(), "播报轮照旧");
+    assert!(
+        wait_hits(&server, 2, 8_000).await,
+        "attention 线 + 回话线各一条：hits={}",
+        server.hits()
+    );
+    let payload: serde_json::Value =
+        serde_json::from_str(&String::from_utf8_lossy(&server.body())).unwrap();
+    assert_eq!(
+        payload["kind"], "foreman_reply",
+        "最后一条是回话线的播报通知：{payload}"
+    );
+}
+
+#[tokio::test]
+async fn a_failed_say_turn_announces_the_failure_line_with_only_the_kind() {
+    let h = Harness::seeded().await;
+    let sid = h.session().await;
+    let server = TinyHttp::spawn("200", "application/json", b"{}".to_vec(), Duration::ZERO);
+    attach_notifier(&h, &server);
+
+    // 模型当场报错（照 `FailingLlm` 先例）：失败收口必通知（272③），类 = failed。
+    let runner = ForemanRunner::new(
+        h.store.clone(),
+        Settings::default(),
+        h._home.home().clone(),
+        Arc::new(FailingLlm) as Arc<dyn LlmClient>,
+        Arc::new(testkit::SseRecorder::new()),
+    );
+    assert!(runner.say(Some(&sid), "动手吧").await.is_err());
+    assert!(
+        wait_hits(&server, 1, 8_000).await,
+        "失败收口应当出站一条通知"
+    );
+    let payload: serde_json::Value =
+        serde_json::from_str(&String::from_utf8_lossy(&server.body())).unwrap();
+    assert_eq!(payload["kind"], "foreman_reply_failed", "{payload}");
+    let body = payload["body"].as_str().unwrap();
+    assert!(body.contains("llm_network"), "正文只带类别：{body}");
+    // 268④ 的纪律对失败线**不豁免**（272⑤ 的豁免只给回话正文）：错误原文不出网。
+    assert!(
+        !body.contains("连接被对端关掉"),
+        "raw 原文一个字不出网：{body}"
     );
 }

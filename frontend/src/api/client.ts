@@ -15,6 +15,9 @@ import type {
   GlobalMetrics,
   NodeCommand,
   NodeConversation,
+  NotifyChannelPayload,
+  NotifyChannelTest,
+  NotifySettings,
   Project,
   ProjectAnalysis,
   ProjectCreatePayload,
@@ -518,6 +521,42 @@ export function saveMarketRepos(repos: string[]): Promise<MarketRepoConfig> {
 /** 清掉界面那份仓名单，回到 `config.toml` 的 `[market] github_repos`（决策 194 / 187）。 */
 export function clearMarketRepos(): Promise<MarketRepoConfig> {
   return request<MarketRepoConfig>('/market/repos', { method: 'DELETE' });
+}
+
+/* 离线通知（决策 272）：读数 / 总开关 / 通道单元 / 探针。 */
+
+/** 生效的通道读数（单元 > `config.toml`；秘密只回掩码）。 */
+export function getNotifySettings(): Promise<NotifySettings> {
+  return request<NotifySettings>('/notify/settings');
+}
+
+/**
+ * 拨**总开关**（决策 272⑧）：开启时后端先解析生效通道、BlueBubbles 先 ping——
+ * **够不着不当成功**（400），一个字节都不落库；关闭直接摘出口（`clear_notifier`）。
+ */
+export function setNotifyEnabled(enabled: boolean): Promise<{ ok: boolean; enabled: boolean }> {
+  return request<{ ok: boolean; enabled: boolean }>('/notify/settings', {
+    method: 'PUT',
+    body: { enabled },
+  });
+}
+
+/** 保存通道单元（**整体覆盖** `config.toml`，272⑥；掩码或留空 = 沿用已存值）。 */
+export function saveNotifyChannel(unit: NotifyChannelPayload): Promise<{ ok: boolean }> {
+  return request<{ ok: boolean }>('/notify/channel', { method: 'PUT', body: unit });
+}
+
+/** 交还 `config.toml` 那一级（照 `DELETE /market/repos`）；开关不动。 */
+export function clearNotifyChannel(): Promise<{ ok: boolean }> {
+  return request<{ ok: boolean }>('/notify/channel', { method: 'DELETE' });
+}
+
+/** BlueBubbles 连通性探针（照 `POST /providers/test`，决策 160：成功失败都 200）。 */
+export function testNotifyChannel(body: {
+  bluebubbles_url: string;
+  bluebubbles_password?: string;
+}): Promise<{ test: NotifyChannelTest }> {
+  return request<{ test: NotifyChannelTest }>('/notify/test', { method: 'POST', body });
 }
 
 /**

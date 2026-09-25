@@ -7016,3 +7016,240 @@ async fn max_rounds_accepts_only_positive_integers() {
         .unwrap();
     assert_eq!(cleared.max_rounds, None, "留空即清成默认（缺省 300）");
 }
+
+// ─────────── 离线通知设置（决策 272⑥⑦⑧）───────────
+
+/// 本机 ping 桩：只答 `GET /api/v1/ping`，把收到的请求行记下来（断言 password 真被带上）。
+struct PingStub {
+    addr: SocketAddr,
+    first_line: Arc<std::sync::Mutex<String>>,
+}
+
+impl PingStub {
+    fn spawn() -> Self {
+        use std::io::{Read, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let first_line = Arc::new(std::sync::Mutex::new(String::new()));
+        let recorded = first_line.clone();
+        std::thread::spawn(move || {
+            if let Ok((mut stream, _)) = listener.accept() {
+                let mut buf = [0u8; 2048];
+                let n = stream.read(&mut buf).unwrap_or(0);
+                let text = String::from_utf8_lossy(&buf[..n]).to_string();
+                if let Some(line) = text.lines().next() {
+                    *recorded.lock().unwrap() = line.to_string();
+                }
+                let _ = stream.write_all(
+                    b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 2\r\n\r\n{}",
+                );
+                let _ = stream.flush();
+            }
+        });
+        PingStub { addr, first_line }
+    }
+
+    fn endpoint(&self) -> String {
+        format!("http://{}", self.addr)
+    }
+
+    fn line(&self) -> String {
+        self.first_line.lock().unwrap().clone()
+    }
+}
+
+#[tokio::test]
+async fn notify_settings_defaults_report_config_origin_and_no_channel() {
+    let api = api_with(Settings::default()).await;
+    let (status, body) = get(&api, "/notify/settings").await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["enabled"], true, "{body}");
+    assert!(
+        body["channel"].is_null(),
+        "没碰过设置 = 没有通道声明：{body}"
+    );
+    assert_eq!(body["origin"], "config", "{body}");
+    assert_eq!(body["cooldown_sec"], 300, "{body}");
+    assert_eq!(body["quiet_hours"], json!([22, 8]), "{body}");
+    assert!(body.get("config_error").is_none(), "{body}");
+}
+
+#[tokio::test]
+async fn saving_a_channel_unit_overrides_the_config_whole_and_masks_secrets() {
+    let api = api_with(Settings::default()).await;
+    // 关掉总开关再存 BlueBubbles 单元：关着的时候不 ping（开了才探活）。
+    let (status, body) = put(&api, "/notify/settings", json!({ "enabled": false })).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let (status, body) = put(
+        &api,
+        "/notify/channel",
+        json!({
+            "channel": "bluebubbles",
+            "bluebubbles_url": "http://127.0.0.1:1234",
+            "bluebubbles_password": "real-secret",
+            "bluebubbles_recipient": "me@icloud.com"
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+
+    let (_, body) = get(&api, "/notify/settings").await;
+    assert_eq!(body["enabled"], false, "{body}");
+    assert_eq!(body["channel"], "bluebubbles", "{body}");
+    assert_eq!(body["origin"], "settings", "{body}");
+    assert_eq!(body["bluebubbles_url"], "http://127.0.0.1:1234", "{body}");
+    assert_eq!(
+        body["bluebubbles_password"], "***",
+        "秘密只回掩码（决策 112 范式）：{body}"
+    );
+    assert_eq!(body["bluebubbles_recipient"], "me@icloud.com", "{body}");
+}
+
+#[tokio::test]
+async fn an_incomplete_unit_is_refused_not_saved() {
+    let api = api_with(Settings::default()).await;
+    let (status, body) = put(
+        &api,
+        "/notify/channel",
+        json!({
+            "channel": "bluebubbles",
+            "bluebubbles_url": "http://127.0.0.1:1234"
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    assert!(
+        body["error"].as_str().unwrap().contains("password"),
+        "{body}"
+    );
+    // 没落库：读数仍是 config 那一级。
+    let (_, body) = get(&api, "/notify/settings").await;
+    assert_eq!(body["origin"], "config", "{body}");
+}
+
+#[tokio::test]
+async fn enabling_refuses_when_bluebubbles_is_unreachable_and_persists_nothing() {
+    let api = api_with(Settings::default()).await;
+    // 单元存得住（开关先关），但开不了：端点指向没人监听的端口。
+    put(&api, "/notify/settings", json!({ "enabled": false })).await;
+    let (status, _) = put(
+        &api,
+        "/notify/channel",
+        json!({
+            "channel": "bluebubbles",
+            "bluebubbles_url": "http://127.0.0.1:1",
+            "bluebubbles_password": "pw",
+            "bluebubbles_recipient": "me@icloud.com"
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+
+    let (status, body) = put(&api, "/notify/settings", json!({ "enabled": true })).await;
+    assert_eq!(
+        status,
+        StatusCode::BAD_REQUEST,
+        "够不着不当成功（272⑧）：{body}"
+    );
+    let (_, body) = get(&api, "/notify/settings").await;
+    assert_eq!(body["enabled"], false, "失败时一个字节都不落库：{body}");
+}
+
+#[tokio::test]
+async fn enabling_with_no_channel_anywhere_is_refused_not_a_silent_noop() {
+    let api = api_with(Settings::default()).await;
+    // 界面单元与 config.toml 两级都没有通道声明：开了也一个字节不出，
+    // 按「缺必填项报错不静默」（272⑧）显式拒掉。
+    let (status, body) = put(&api, "/notify/settings", json!({ "enabled": true })).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    assert!(
+        body["error"].as_str().unwrap().contains("通道声明"),
+        "{body}"
+    );
+    let (_, body) = get(&api, "/notify/settings").await;
+    assert_eq!(
+        body["enabled"], true,
+        "缺省（没碰过设置）的开关读数仍是开：{body}"
+    );
+}
+
+#[tokio::test]
+async fn enabling_pings_bluebubbles_with_the_stored_password_from_the_mask() {
+    let api = api_with(Settings::default()).await;
+    let stub = PingStub::spawn();
+    put(&api, "/notify/settings", json!({ "enabled": false })).await;
+    let (status, body) = put(
+        &api,
+        "/notify/channel",
+        json!({
+            "channel": "bluebubbles",
+            "bluebubbles_url": stub.endpoint(),
+            "bluebubbles_password": "real-secret",
+            "bluebubbles_recipient": "me@icloud.com"
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+
+    // 开关开启：ping 用**存的**密码——界面在保存单元时回传的掩码 `***`（= 不改）
+    // 已经把真值留在库里，开关这一路只管按它探活。
+    let (status, body) = put(&api, "/notify/settings", json!({ "enabled": true })).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert!(
+        stub.line().contains("password=real-secret"),
+        "ping 要带上已存的密码（掩码没有顶替真值）：{}",
+        stub.line()
+    );
+    let (_, body) = get(&api, "/notify/settings").await;
+    assert_eq!(body["enabled"], true, "{body}");
+}
+
+#[tokio::test]
+async fn the_test_probe_reports_unreachable_as_200_with_ok_false() {
+    let api = api_with(Settings::default()).await;
+    // 没存过密码且请求里没给 → 400（缺必填）。
+    let (status, body) = post(
+        &api,
+        "/notify/test",
+        json!({ "bluebubbles_url": "http://127.0.0.1:1" }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+
+    // 显式给了密码：够不着 = 探针结论 ok:false，仍是 200（照 providers/test，决策 160）。
+    let (status, body) = post(
+        &api,
+        "/notify/test",
+        json!({ "bluebubbles_url": "http://127.0.0.1:1", "bluebubbles_password": "pw" }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["test"]["ok"], false, "{body}");
+    assert!(
+        !body["test"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("password=pw"),
+        "探针报文不带 URL（秘密不进任何应答）：{body}"
+    );
+}
+
+#[tokio::test]
+async fn clearing_the_channel_returns_to_config_origin_and_keeps_the_switch() {
+    let api = api_with(Settings::default()).await;
+    put(&api, "/notify/settings", json!({ "enabled": false })).await;
+    put(
+        &api,
+        "/notify/channel",
+        json!({
+            "channel": "feishu",
+            "webhook_url": "https://open.feishu.cn/hook/x"
+        }),
+    )
+    .await;
+    let (status, _) = delete(&api, "/notify/channel").await;
+    assert_eq!(status, StatusCode::OK);
+    let (_, body) = get(&api, "/notify/settings").await;
+    assert_eq!(body["origin"], "config", "{body}");
+    assert_eq!(body["enabled"], false, "交还配置 ≠ 关掉通知：{body}");
+}

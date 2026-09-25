@@ -6,6 +6,7 @@
 //! 写动作的落库形态，决策 188 / 207）、`pairing`（配对令牌，票 07）、
 //! `server_bind`（界面上的绑定开关，决策 186）、`market_repos`（界面上的技能来源仓名单，
 //! 决策 194 继承决策 187 的两级结构）、`skill_sources`（已装技能的来源记录，决策 194）、
+//! `notify_channel`（离线通知的界面设置——总开关与通道单元，决策 272⑥⑦⑧）、
 //! `attention`（值班长待办——调度器发现的落点，决策 209③）、
 //! `model_requests`（模型请求台账——「现在在飞什么」与「这一次烧了多少字节」，决策 231）。
 
@@ -17,6 +18,7 @@ pub mod decisions;
 pub mod foreman;
 pub mod market_repos;
 pub mod model_requests;
+pub mod notify_channel;
 pub mod observability;
 pub mod pairing;
 pub mod proposals;
@@ -170,6 +172,16 @@ impl Store {
     /// 当前通知出口（`note_attention` 的触发点取用）。
     pub(crate) fn notifier(&self) -> Option<Arc<crate::notify::WebhookNotifier>> {
         self.notifier.read().ok().and_then(|slot| slot.clone())
+    }
+
+    /// 摘掉通知出口（决策 272⑧）：总开关关掉（或单元清掉后配置级也无通道）时的
+    /// **活生效**路径。出口是启动时建一次的，开关要在运行期把整条通道关死，就得有
+    /// 这条反向的路——今天之前没有它，「关掉」只能等重启。
+    pub fn clear_notifier(&self) {
+        match self.notifier.write() {
+            Ok(mut slot) => *slot = None,
+            Err(_) => tracing::error!("通知出口摘除失败（锁中毒），下一轮重启前仍可能出站"),
+        }
     }
 }
 

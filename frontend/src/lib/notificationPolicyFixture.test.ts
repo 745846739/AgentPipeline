@@ -70,6 +70,13 @@ describe('通知礼貌共享表（决策 268，与 Rust notify 同源）', () =>
       fixture.cases.every((c) => c.cls !== 'cancelled'),
       'cancelled 是前端偏好面差异，不该进共享表',
     ).toBe(true);
+    // foreman_reply 也不进表（决策 272③④ 的反方向差异：后端独有的类，前端没有
+    // 回话完成的 SSE 事件）——照 cancelled 先例，两侧守卫谁悄悄加了谁变红。
+    // `cls` 的静态类型是前端那个 NotificationClass，故按原始串比（ TS 会说无交集）。
+    expect(
+      fixture.cases.every((c) => (c.cls as string) !== 'foreman_reply'),
+      'foreman_reply 是决策 272 的后端独有类，不该进共享表',
+    ).toBe(true);
   });
 
   it('逐行断言 shouldNotify 与 fixture 一致（与 Rust 表测试同一方向）', () => {

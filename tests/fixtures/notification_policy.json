@@ -1,5 +1,5 @@
 {
-  "$comment": "跨语言通知礼貌表（决策 268③，照决策 246 回环表先例）：Rust 侧 crates/core/src/notify.rs 的表测试与前端 notificationPolicyFixture.test.ts 读同一份、同一断言方向——一侧改了规范另一侧没跟时，落后的那一侧变红。语义：failed 恒发（免打扰与每类节流都不拦）、免打扰 [22,8) 跨零点含头不含尾按整点、pending 免打扰豁免但节流照走、其余类两者都受；节流边界严格小于（age==300 放行、299 拦下）。时间只给「本地小时」——两侧各自不涉时区换算。不在表内（显式差异，记在决策 268 与 notify.rs 头注）：notifyOn 每类开关（前端用户偏好面，后端没有）、cancelled 类（前端缺省 false 永不弹，后端按通用类规则）——故本表只收 pending/done/failed 三类。",
+  "$comment": "跨语言通知礼貌表（决策 268③，照决策 246 回环表先例）：Rust 侧 crates/core/src/notify.rs 的表测试与前端 notificationPolicyFixture.test.ts 读同一份、同一断言方向——一侧改了规范另一侧没跟时，落后的那一侧变红。语义：failed 恒发（免打扰与每类节流都不拦）、免打扰 [22,8) 跨零点含头不含尾按整点、pending 免打扰豁免但节流照走、其余类两者都受；节流边界严格小于（age==300 放行、299 拦下）。时间只给「本地小时」——两侧各自不涉时区换算。不在表内（显式差异，记在决策 268 / 272 与 notify.rs 头注）：notifyOn 每类开关（前端用户偏好面，后端没有）、cancelled 类（前端缺省 false 永不弹，后端按通用类规则）、foreman_reply 类（决策 272③④：后端独有——值班长回话完成那条线，自有 cooldown 槽、受免打扰不豁免；前端没有回话完成的 SSE 事件，toast 面根本见不到它）——故本表只收 pending/done/failed 三类。",
   "policy": { "cooldown_sec": 300, "quiet_hours": [22, 8] },
   "cases": [
     { "id": "failed-quiet-bypass", "cls": "failed", "hour": 23, "age_sec": null, "expected": true },

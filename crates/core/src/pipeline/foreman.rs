@@ -611,6 +611,16 @@ const FOREMAN_ATTENTION_FETCH_LIMIT: usize = 50;
 /// 情况下轮数不生效（决策 233 的如实记 (i)：抬墙钟另立一条）。
 pub const FOREMAN_MAX_ROUNDS: usize = 300;
 
+/// 值班长回话完成通知（决策 272③）的**门**：`say` 轮至少动过这么多次工具，才算
+/// 「干了一轮活」、才叫通知出口。判据是这一轮自己的产出（`traces.len()`），收口处
+/// 现成可得——不用墙上时钟、不加配置项（决策 256 的尺子：没人会调的旋钮比没有更坏）。
+///
+/// 取 3 的理由：一两次工具调用多半是「顺手查一眼」，人多半还在屏幕前；连续三次是
+/// 「做了一系列动作」——那才是会离开屏幕的轮。**诚实记账**（决策 272）：零工具但
+/// 生成很慢的一轮判不到（不通知，判为可接受）。门必须在 `notify()` **之前**过
+/// ——短轮连 `foreman_reply` 的 cooldown 槽都不碰（cooldown 倒挂的坑）。
+pub const FOREMAN_REPLY_MIN_TOOL_CALLS: usize = 3;
+
 /// 触到轮数上限时那一段的标记（决策 233②）：**部分结论落库并标注**。
 ///
 /// 它必须看得见：一则让值班经理知道「这不是结论而是没说完」，二则让下一轮（或下一班）
@@ -1458,6 +1468,11 @@ impl ForemanRunner {
             self.record_failed_turn(&session, error, round_started_at, false, true)
                 .await;
         }
+        // 值班长回话完成 → 离线通知（决策 272②③）：第二触发面，**不**写 attention 表。
+        // 门（`traces.len()`）在 notify() 之前过——短轮连 cooldown 槽都不碰。
+        if let Ok(turn) = &result {
+            self.notify_reply_completed(turn, true);
+        }
         result
     }
 
@@ -2014,6 +2029,9 @@ impl ForemanRunner {
                 if silent {
                     Ok(None)
                 } else {
+                    // 值班长播报完成（决策 272②③）：恒通知——它本就是「没人在场」的
+                    // 定义，不设 traces 门；静默轮在上面那条腿里，根本走不到这里。
+                    self.notify_reply_completed(&turn, false);
                     Ok(Some(turn))
                 }
             }
@@ -2069,6 +2087,12 @@ impl ForemanRunner {
                 format!("{mark}这一轮没跑起来（{kind}）：{reason}{tail}"),
             )
             .await;
+            // 失败收口必通知（决策 272③）：类 = `failed`（恒发）。与台账**同拍**——
+            // `note_row = false` 的那一批后续失败不逐条叫人（同一把尺：决策 271 的
+            // 「同批同类只落一行」，否则失败风暴会把手机刷成第二个对讲台）。
+            if let Some(notifier) = self.store.notifier() {
+                notifier.notify_foreman_failure(&session.title, &kind, self.store.now());
+            }
         }
         self.invalidate_round_proposals(&session.id, started_at)
             .await;
@@ -2133,8 +2157,30 @@ impl ForemanRunner {
             format!("{FOREMAN_FAILED_TURN_MARK}这一轮没跑完（{why}）：回话没有落库"),
         )
         .await;
+        // 失败收口必通知（决策 272③）：panic 被端点层接住的那一条也走 `failed` 类。
+        if let Some(notifier) = self.store.notifier() {
+            notifier.notify_foreman_failure(&session.title, "interrupted", self.store.now());
+        }
         self.invalidate_round_proposals(&session.id, started_at)
             .await;
+    }
+
+    /// 值班长回话完成 → 离线通知（决策 272②③）。**第二触发面**：`respond()` 收口之后
+    /// 的新入口，**不**写 attention 表——那张表是「待办」（`task_id NOT NULL` + 外键，
+    /// 由值守轮消费 `consumed_at`），回话是播报，写进去会污染唤醒判据（§2.1）。
+    ///
+    /// `gated`：`say` 轮要过 [`FOREMAN_REPLY_MIN_TOOL_CALLS`] 的门，`watch` 播报轮
+    /// 恒通知（它本就是「没人在场」的定义）。门在 [`crate::notify::WebhookNotifier::
+    /// notify_foreman_reply`] **之前**过——短轮连 `foreman_reply` 的 cooldown 槽
+    /// 都不碰（272③ 的 cooldown 倒挂坑）。
+    fn notify_reply_completed(&self, turn: &ForemanTurn, gated: bool) {
+        if gated && turn.traces.len() < FOREMAN_REPLY_MIN_TOOL_CALLS {
+            return;
+        }
+        let Some(notifier) = self.store.notifier() else {
+            return;
+        };
+        notifier.notify_foreman_reply(&turn.session.title, &turn.reply, self.store.now());
     }
 
     /// 往台账里写一条**操作台自己**的账（`role = system`，决策 207 那条路）。

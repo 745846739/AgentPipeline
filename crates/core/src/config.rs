@@ -509,6 +509,10 @@ pub fn validate_market_repos(raw: &[String]) -> Result<Vec<String>> {
 /// `[notify]` 离线通知（决策 268）：**URL 缺席 = 整段关死**——没配 webhook 的部署
 /// 里这条路径一个字节都不出（零配置零行为）。cooldown / quiet_hours 的缺省与前端
 /// `notificationPolicy.ts` 同一张表（跨语言 fixture 钉住，268③）。
+///
+/// 决策 272 加了 BlueBubbles 通道的三件（`format = "bluebubbles"` 时**必须齐备**，
+/// `validate` 拦）：通道四件（类型 + 端点 + password + 收件人）是两级结构的**基层**，
+/// 界面那份（`kanban_notify_channel` 表）作为整体覆盖它。
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct NotifyConfig {
@@ -520,10 +524,23 @@ pub struct NotifyConfig {
     pub cooldown_sec: u64,
     /// 免打扰时段 `[start, end)` 小时，跨零点写法（如 `[22, 8]`）；按服务器本地整点。
     pub quiet_hours: [u8; 2],
-    /// 报文格式（决策 270）：`generic` = 268 的六字段通用 JSON（缺省）；
-    /// `feishu` = 飞书机器人文本消息。政策语义（cooldown / 免打扰 / 触发面）
-    /// 与格式无关，只有最后拼 payload 那一步分流。
+    /// 报文格式（决策 270，272① 扩到 `bluebubbles`）：`generic` = 268 的六字段通用
+    /// JSON（缺省）；`feishu` = 飞书机器人文本消息；`bluebubbles` = 经本机 BlueBubbles
+    /// 服务发 iMessage。政策语义（cooldown / 免打扰 / 触发面）与格式无关，只有最后拼
+    /// payload 那一步分流。
     pub format: NotifyFormat,
+    /// BlueBubbles 服务端点（决策 272①⑦，如 `http://127.0.0.1:1234`，不含路径）——
+    /// 完整 URL 由代码拼（`/api/v1/message/text?password=`），是**代码拼的**这一条
+    /// 让「除 `without_url()` 外不许进日志」变得可执行。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub bluebubbles_url: Option<String>,
+    /// BlueBubbles 的 password（秘密，同 `webhook_url` 的纪律；决策 112 同款权衡：
+    /// 明文存放、读回只给 `***` 掩码）。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub bluebubbles_password: Option<String>,
+    /// iMessage 收件地址（Apple ID / 手机号）——`chatGuid` 按它拼。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub bluebubbles_recipient: Option<String>,
 }
 
 impl Default for NotifyConfig {
@@ -533,7 +550,40 @@ impl Default for NotifyConfig {
             cooldown_sec: 300,
             quiet_hours: [22, 8],
             format: NotifyFormat::Generic,
+            bluebubbles_url: None,
+            bluebubbles_password: None,
+            bluebubbles_recipient: None,
         }
+    }
+}
+
+impl NotifyConfig {
+    /// 段内校验（`Config::validate` 调用）：`format = bluebubbles` 声明了就要求三件齐。
+    ///
+    /// 为什么拦在解析期：缺一件的表现是「启动了却一条 iMessage 都收不到」，与「我没配」
+    /// 从外面分不开——fail fast（决策 47 / 103 / 134）把这种歧义消灭在启动那一刻。
+    pub fn validate(&self) -> Result<()> {
+        if self.format == NotifyFormat::BlueBubbles {
+            let missing = [
+                ("bluebubbles_url", self.bluebubbles_url.is_none()),
+                ("bluebubbles_password", self.bluebubbles_password.is_none()),
+                (
+                    "bluebubbles_recipient",
+                    self.bluebubbles_recipient.is_none(),
+                ),
+            ]
+            .into_iter()
+            .filter(|(_, missing)| *missing)
+            .map(|(name, _)| name)
+            .collect::<Vec<_>>();
+            if !missing.is_empty() {
+                return Err(Error::Config(format!(
+                    "[notify] format = \"bluebubbles\" 需要三件齐备，缺：{}",
+                    missing.join("、")
+                )));
+            }
+        }
+        Ok(())
     }
 }
 
@@ -619,6 +669,8 @@ impl Config {
                 ));
             }
         }
+        // `[notify]` 段内校验（决策 272①⑦）：`format = bluebubbles` 声明了就要求三件齐。
+        self.notify.validate()?;
         Ok(())
     }
 
@@ -1564,6 +1616,48 @@ mod tests {
     fn notify_format_unknown_value_is_rejected() {
         let err = Config::from_toml("[notify]\nformat = \"bogus\"\n").unwrap_err();
         assert!(matches!(err, Error::Config(_)), "{err:?}");
+    }
+
+    // ── 决策 272：`[notify]` BlueBubbles 三件 ──
+
+    /// 三件齐备 + `format = bluebubbles` 整段解析。
+    #[test]
+    fn notify_bluebubbles_channel_parses_when_complete() {
+        let cfg = Config::from_toml(
+            "[notify]\nformat = \"bluebubbles\"\nbluebubbles_url = \"http://127.0.0.1:1234\"\n\
+             bluebubbles_password = \"pw\"\nbluebubbles_recipient = \"me@icloud.com\"\n",
+        )
+        .unwrap();
+        assert_eq!(cfg.notify.format, NotifyFormat::BlueBubbles);
+        assert_eq!(
+            cfg.notify.bluebubbles_url.as_deref(),
+            Some("http://127.0.0.1:1234")
+        );
+        assert_eq!(cfg.notify.bluebubbles_password.as_deref(), Some("pw"));
+        assert_eq!(
+            cfg.notify.bluebubbles_recipient.as_deref(),
+            Some("me@icloud.com")
+        );
+    }
+
+    /// 声明了 `bluebubbles` 却缺件 = 解析期拒（缺一件的表现是「启动了却一条也收不到」，
+    /// 与「没配」从外面分不开——fail fast 消灭这个歧义）。
+    #[test]
+    fn notify_bluebubbles_without_all_three_pieces_is_rejected() {
+        let err = Config::from_toml(
+            "[notify]\nformat = \"bluebubbles\"\nbluebubbles_url = \"http://127.0.0.1:1234\"\n",
+        )
+        .unwrap_err();
+        assert!(matches!(err, Error::Config(_)), "{err:?}");
+        assert!(err.to_string().contains("bluebubbles_password"), "{err}");
+    }
+
+    /// 缺省（generic）时三件缺席照旧合法——不逼老配置搬家。
+    #[test]
+    fn notify_bluebubbles_pieces_are_optional_without_the_format() {
+        let cfg = Config::from_toml("[notify]\nwebhook_url = \"https://x\"\n").unwrap();
+        assert!(cfg.notify.bluebubbles_url.is_none());
+        assert_eq!(cfg.notify.format, NotifyFormat::Generic);
     }
 
     // ── 决策 194：`[market] github_repos` 来源仓名单（取代决策 172⑤ 的 origin 白名单）──

@@ -156,6 +156,12 @@ pub struct AppState {
     /// testkit 的 `FakeAgent`，于是「空 home 也能对上话」「越权工具被拒」这些验收锚点
     /// 都能在**不打真网络**的前提下钉住。
     pub foreman: Option<Arc<ForemanRunner>>,
+    /// `config.toml` 那一级的 `[notify]` 快照（决策 272⑥）。
+    ///
+    /// 设置端点用它做两级解析的**基层**（界面单元覆盖它），活生效重建出口时也从它取
+    /// `cooldown_sec` / `quiet_hours`（272⑥：礼貌两件**只住 config.toml**，界面不改、
+    /// 但重建要用）。serve 注入真实配置；契约测试用缺省值（300s / [22,8)）。
+    pub notify_config: agentpipeline_core::config::NotifyConfig,
 }
 
 impl AppState {
@@ -178,6 +184,7 @@ impl AppState {
             market_override: Arc::new(std::sync::RwLock::new(None)),
             listings: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
             foreman: None,
+            notify_config: agentpipeline_core::config::NotifyConfig::default(),
         }
     }
 
@@ -266,6 +273,12 @@ impl AppState {
     /// 注入值班长运行器（决策 182，票 01）。
     pub fn with_foreman(mut self, runner: Arc<ForemanRunner>) -> Self {
         self.foreman = Some(runner);
+        self
+    }
+
+    /// 注入 `config.toml` 那一级的 `[notify]` 快照（决策 272⑥，仅 `serve` 调用）。
+    pub fn with_notify_config(mut self, config: agentpipeline_core::config::NotifyConfig) -> Self {
+        self.notify_config = config;
         self
     }
 

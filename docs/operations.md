@@ -692,10 +692,28 @@ async fn recover_dependency_failed(&self) -> Result<()> {
 （`frontend/src/lib/notificationPolicy.ts`，只管浏览器 toast）各有一份，由
 `tests/fixtures/notification_policy.json` 双端同表钉住（决策 246 先例）；前端还有一层
 `notifyOn` 用户偏好开关（`cancelled` 缺省关），后端没有偏好面——差异记在决策 268 与
-fixture `$comment`。飞书机器人已可 `format = "feishu"` 直连（决策 270），其余 IM / 邮件仍可由通用 webhook 转发，独立 SMTP / 专用卡片有证据再议。
+fixture `$comment`。飞书机器人已可 `format = "feishu"` 直连（决策 270），iMessage 自决策 272 起也有直连通道（见下一段）；其余 IM / 邮件仍可由通用 webhook 转发，独立 SMTP / 专用卡片有证据再议。
 **职责划分（决策 130，不动）：SSE 全量推送、不做 cooldown 合并**——它是状态同步通道，
 吞事件会丢状态；前端 toast 的 cooldown / quiet_hours 只作用于 toast 层
 （frontend-design §9.1 对齐）。
+
+**离线通知·iMessage 通道（决策 272 落地 2026-09-25）：** 经本机 **BlueBubbles** 服务发
+iMessage——`format = "bluebubbles"` 时投递目标换成 `POST {端点}/api/v1/message/text`，
+报文 `{chatGuid, tempGuid, message, method}`（正文字段名是 **`message`**，官方文档页写
+`text` 是错的，以服务端源码为准；`chatGuid` = `iMessage;-;<收件地址>`；`method` 恒
+`apple-script`，不暴露配置）。**部署前置**：一台登录着 iMessage 的 Mac 常开 BlueBubbles
+服务端（记下端点与 password），收件地址填 Apple ID 或手机号；**消息没到先查
+系统设置 → 隐私与安全性 → 自动化**里有没有被拒的授权。这一档多出两条通知线（272②③）：
+值班长**回话完成**与**失败收口**——回话线是新类 `foreman_reply`（自有 cooldown 槽、
+受免打扰不豁免；`say` 轮要过「这一轮至少 3 次工具调用」的门，快问快答不进手机，
+值守播报恒通知、静默轮恒不通知），失败线走 `failed`（恒发，与台账同批同拍）。回话正文
+**出网**（截断 200 字 + 会话名在标题里）——这是对 268④「不发正文」的一次显式修订：
+收件人是本人的 Apple ID，出机器不出账户；豁免只覆盖回话正文，失败通知仍只带类别、
+不带 `raw` 原文。**设置入口**在 `#/settings/notify`（272⑥⑦⑧）：一颗总开关 + 通道四件
+（类型 + 端点 + password + 收件人）**整体覆盖** `config.toml`（两级，不允许混；
+`origin` 说清谁生效），password 照 provider 的 `***` 掩码范式，BlueBubbles 在开启与
+保存时先探活（`GET /api/v1/ping`）、够不着不当成功，切换**活生效**不必重启；
+`cooldown_sec` / `quiet_hours` 只住 `config.toml`。
 
 **pending 超时提醒：** 任务进入 pending 超过 `pending_reminder_hours`（默认 24h）未处理，重复提醒一次；超过 `pending_timeout_hours`（默认 72h）自动标记 `stalled = 1`，看板高亮显示。提醒与高亮均通过 SSE 推送，不依赖外部渠道。**票 05 补上了那个「均通过 SSE 推送」的洞**：提醒此前只活在调度器内存的 `HashSet` 里、重启即失、从不外发——现在是 `stalled` 事件真的发出去，同时落一行 `task_stale` 待办（决策 209③）。
 

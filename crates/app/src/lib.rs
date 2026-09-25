@@ -165,6 +165,18 @@ pub fn build_router(state: AppState) -> Router {
         // pairing_guard 护住、回环豁免（丢了令牌必须还能从本机复位）。
         .route("/pairing/token", get(routes::pairing::token))
         .route("/pairing/reset", post(routes::pairing::reset))
+        // ── 离线通知设置（决策 272⑥⑦⑧）：读数 / 总开关 / 通道单元 / 探针 ──
+        // 写请求照全站护栏走（跨源 + 局域网形态下的配对令牌）；读数里秘密一律掩码
+        // （`***`），GET 与 /server-info 同一档：机器级事实，不是密钥。
+        .route(
+            "/notify/settings",
+            get(routes::notify::settings).put(routes::notify::set_enabled),
+        )
+        .route(
+            "/notify/channel",
+            axum::routing::put(routes::notify::save_channel).delete(routes::notify::clear_channel),
+        )
+        .route("/notify/test", post(routes::notify::test_channel))
         // 配对令牌层（决策 182㉖㉗㉘，票 07）：**必须最后执行**（最内层）——它要读
         // peer_address 归一后的来源地址，且排在跨源防护之后，只处理已过跨源判定的请求。
         // axum 的 `Router::layer` 后挂者在外、先执行，故它登记在 cross_origin_guard 之前。

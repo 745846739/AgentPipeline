@@ -1120,3 +1120,46 @@ export interface ForemanSendResult {
   total_tokens: number;
   total_calls: number;
 }
+
+/* ─────────────── 离线通知（crates/app/src/routes/notify.rs，决策 272）─────────────── */
+
+/** 通知通道是谁定的（决策 272⑥ 的两级结构）：界面保存的单元，还是 `config.toml` 的 `[notify]`。 */
+export type NotifyOrigin = 'settings' | 'config';
+
+/**
+ * `GET /notify/settings` 的读数。
+ *
+ * 展示的是**生效的那一份**（单元 > 配置文件，整体覆盖）；`webhook_url` 与
+ * `bluebubbles_password` 是秘密，只回常量掩码 `***`（决策 112 的范式）。
+ */
+export interface NotifySettings {
+  /** 一颗总开关（272⑧）：整条通道开/关，非每类一颗。 */
+  enabled: boolean;
+  /** 生效的通道声明；null = 还没有配置任何通道（268① 零配置零行为）。 */
+  channel: 'generic' | 'feishu' | 'bluebubbles' | null;
+  origin: NotifyOrigin;
+  webhook_url: string;
+  bluebubbles_url: string;
+  bluebubbles_password: string;
+  bluebubbles_recipient: string;
+  /** 只读（272⑥：礼貌两件只住 config.toml，界面不改）。 */
+  cooldown_sec: number;
+  quiet_hours: [number, number];
+  /** 当前两级解析不过时的原因（报错不静默，272⑧）；不在场 = 没有配置错误。 */
+  config_error?: string;
+}
+
+/** `PUT /notify/channel` 的载荷：通道单元**整体覆盖**（272⑥ 不允许混）。 */
+export interface NotifyChannelPayload {
+  channel: 'generic' | 'feishu' | 'bluebubbles';
+  webhook_url?: string;
+  bluebubbles_url?: string;
+  bluebubbles_password?: string;
+  bluebubbles_recipient?: string;
+}
+
+/** `POST /notify/test` 的结论（照 `POST /providers/test`，决策 160：成功失败都 200）。 */
+export interface NotifyChannelTest {
+  ok: boolean;
+  message: string;
+}

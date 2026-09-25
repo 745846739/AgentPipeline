@@ -235,13 +235,15 @@ pending 琥珀呼吸（2.4s 周期）、流式输出尾随光标。`prefers-redu
 
 ### 4.3 设置落地页（`#/settings`）
 
-**分类法：按用途两分——「谁能进来」/「怎么跑」。** 判据一句话：**决定「边界」的进「谁能进来」，
-决定「跑起来靠什么」的进「怎么跑」。**
+**分类法：按用途三分——「谁能进来」/「怎么找到你」/「怎么跑」。** 判据一句话：**决定
+「边界」（谁能连进来）的进「谁能进来」，决定「机器主动出站找谁」的进「怎么找到你」
+（决策 272⑧ 随离线通知落的第三类），决定「跑起来靠什么」的进「怎么跑」。**
 
 | 分类（小节标题） | 分类的一句话（定稿） | 项（定稿） | 项的一句话（定稿） | 落点 |
 |---|---|---|---|---|
 | **谁能进来** | `哪些仓库算工作对象、哪些设备能连进来。` | 项目 | `把本地仓库接进来当工作对象。` | `#/settings/projects` |
 | | | 手机访问 | `让同一局域网里的手机连进来（只在跑服务的这台电脑上配置）。` | `#/share` |
+| **怎么找到你** | `这台机器主动把动静送到哪里——没人盯着浏览器时也找得到你。` | 离线通知 | `任务待办与失败、值班长回话完成时，往手机或机器人送信。` | `#/settings/notify` |
 | **怎么跑** | `跑起来用谁的能力、按什么规矩。` | 模型与密钥 | `配 provider 台账与密钥。` | `#/settings/providers` |
 | | | 阶段配置 | `每个阶段用哪个 provider、带哪些工具与技能。` | `#/settings/stages` |
 | | | 技能市场 | `从 GitHub 仓装技能、看已装技能。` | `#/settings/market` |
@@ -468,6 +470,7 @@ pending 琥珀呼吸（2.4s 周期）、流式输出尾随光标。`prefers-redu
 | 模型与密钥 | **只剩 provider 台账与密钥提示**（阶段配置已搬去 `#/settings/stages`）：provider 行 = (vendor, model, context_window)（决策 111）；`api_key` 输入框写后即掩码回显 `***`（决策 112），旁边固定一行提示「密钥明文存于本机 `~/.agentpipeline`，目录权限 0700」；`supported_adapters` 之外的行降级灰显 + 告警，不崩（决策 103，界面文案见 §12.1） |
 | 阶段配置 | `#/settings/stages`（**新页，决策 198**）：把「模型与密钥」页里的阶段配置那一段整体搬来——每个阶段用哪个 provider、带哪些工具与技能、超时覆盖（决策 111 / 170 / 172）；小节标题 12px 档，不与页面标题同级（票 09） |
 | 技能市场 | `#/settings/market`：来源仓名单（保存即生效）+ 该仓的技能列表 + 安装后的三项预览（决策 187 / 194） |
+| 离线通知 | `#/settings/notify`（**新页，决策 272**）：一颗总开关（整条通道开/关）+ 通道四件整体覆盖 `config.toml`（通用 webhook / 飞书 / iMessage·BlueBubbles，origin 说清是谁定的）；秘密只回显掩码 `***`、掩码或留空 = 不改（provider 范式）；BlueBubbles 在开启与保存时先探活，够不着不当成功；节流与免打扰两件只读展示（只住 `config.toml`，决策 272⑥） |
 | 全局指标 | GET /metrics：成功率、各阶段平均耗时 / 重试率 / validate 通过率、token 消耗。全部以**轨道分段条形图**呈现（横条挂在轨道站点下），延续"轨道即导航"；无 KPI 卡片横排。第一段用**平实说法**说清每个数是什么、怎么算的（票 27），不带内部编号（§12.1） |
 
 ---
@@ -757,7 +760,8 @@ GET /tasks/{id}               → 详情页装载 + 断线重连后的全量校�
 | 卡片禁拖；任务卡整卡可点进详情 | `frontend/src/components/board/TaskCard.svelte` | 决策 169 沿用的交互骨架；§5.2 |
 | 页面导航行四项（对讲台 / 看板 / 指标 / 设置），其余入口从落地页进；**看板只从这一行进**（窄档这一行钉在屏幕底缘，桌面档是顶栏第二行——同一个 `nav` 元素） | `frontend/src/components/layout/TopBar.svelte`、`frontend/src/router.svelte.ts` | 决策 240（修订 198 / 169）；位置由 243 定（窄档在底部） |
 | 首屏默认落对讲台：地址栏没写 hash 就 `replaceState` 归一到 `#/talk`（带 hash 的开屏与显式 `#/` 都不动） | `frontend/src/router.svelte.ts` | 决策 241（不修订 240）；`router.test.ts` 的「开屏默认落点」用例 |
-| 设置落地页按用途两分（谁能进来 / 怎么跑），各项仍是独立路由 | `frontend/src/routes/SettingsLanding.svelte` | 决策 198 |
+| 设置落地页按用途三分（谁能进来 / 怎么找到你 / 怎么跑），各项仍是独立路由 | `frontend/src/routes/SettingsLanding.svelte` | 决策 198（三分由 272⑧ 落地） |
+| 离线通知页：一颗总开关 + 通道四件整体覆盖 `config.toml`（不许混），秘密只回显 `***` 且掩码或留空 = 不改，BlueBubbles 开启/保存先探活、够不着不当成功，节流与免打扰只读展示 | `frontend/src/routes/SettingsNotify.svelte`、`frontend/src/lib/notifyChannel.ts` | 决策 272⑥⑦⑧；判据与掩码纪律由 `notifyChannel.test.ts` 钉住，后端契约在 `crates/app/src/routes/notify.rs` |
 | 「手机访问」入口只在本机（来源回环）渲染，非本机不给入口 | `frontend/src/lib/localPage.ts`、`frontend/src/routes/SettingsLanding.svelte` | 决策 190（位子由 198 挪到落地页，行为不变） |
 | 阶段配置独立成页，从「模型与密钥」页搬出 | `frontend/src/routes/SettingsStages.svelte`、`frontend/src/components/settings/StageConfigForm.svelte` | 决策 198 / 111 / 170 |
 | 不支持的 provider 行降级灰显 + 琥珀标（**标里不带内部编号**） | `frontend/src/routes/SettingsProviders.svelte:297` | 决策 103；决策 199（编号退到 `title`） |
