@@ -67,7 +67,22 @@ function sessionOf(messages: ForemanMessage[], proposals: ForemanProposal[] = []
 }
 
 function streamOf(over: Partial<ForemanStreamState> = {}): ForemanStreamState {
-  return { text: '', thinking: '', tools: [], streaming: false, error: null, ...over };
+  return { steps: [], streaming: false, error: null, ...over };
+}
+
+/** 在飞轮末尾那一步正文（「正在说的那一句」）。 */
+function textStep(text: string) {
+  return { kind: 'text' as const, text };
+}
+
+/** 在飞轮里的一步推理。 */
+function thinkStep(text: string) {
+  return { kind: 'thinking' as const, text };
+}
+
+/** 在飞轮里的一次工具调用（相位是**此刻**的读数，落地那一份由 `ok` 给同一件事）。 */
+function toolStep(tool: string, phase: 'start' | 'end' | 'error', argsSummary = 't-1') {
+  return { kind: 'tool' as const, tool, args_summary: argsSummary, phase };
 }
 
 function inputOf(over: Partial<TalkTurnsInput> = {}): TalkTurnsInput {
@@ -127,18 +142,50 @@ describe('落地轮：分类读字段、不解析正文（决策 252 / 244 / 235
     expect(out.map((t) => t.proactive)).toEqual([true, false, false]);
   });
 
-  it('thinking：空串与纯空白都当作没产推理，非空的原样保留（不 trim 正文）', () => {
+  it('步骤：段序在就走段序（顺序与种类原样，收口那句不在里面）', () => {
     const out = buildTurns(
       inputOf({
         session: sessionOf([
-          message({ id: 1, thinking: undefined }),
-          message({ id: 2, thinking: '' }),
-          message({ id: 3, thinking: '   ' }),
-          message({ id: 4, thinking: ' 推演 ' }),
+          message({
+            id: 1,
+            content: '回话',
+            segments: [
+              { kind: 'thinking', text: '先看看板。' },
+              { kind: 'tool', tool: 'read_task', args_summary: 't1', ok: true },
+              { kind: 'text', text: '中间插一句。' },
+              { kind: 'tool', tool: 'read_board', args_summary: '{}', ok: false },
+            ],
+          }),
         ]),
       }),
     );
-    expect(out.map((t) => t.thinking)).toEqual([null, null, null, ' 推演 ']);
+    expect(out[0].steps.map((s) => s.kind)).toEqual(['thinking', 'tool', 'text', 'tool']);
+    expect(out[0].steps.map((s) => s.key)).toEqual(['m1-s0', 'm1-s1', 'm1-s2', 'm1-s3']);
+    expect(out[0].steps[1].tool).toEqual({ name: 'read_task', argsSummary: 't1', state: 'ok' });
+    expect(out[0].steps[2].text).toBe('中间插一句。');
+    expect(out[0].steps[3].tool?.state).toBe('bad');
+    // 段序里没有一个 `live`：落地的那一行每一步都已经收场
+    expect(out[0].steps.every((s) => !s.live)).toBe(true);
+  });
+
+  it('老行（段序那一列落地之前写的）：由 thinking 与 traces 两份聚合兜底，空 / 纯空白都不算一步', () => {
+    const out = buildTurns(
+      inputOf({
+        session: sessionOf([
+          message({ id: 1, thinking: '   ', traces: null }),
+          message({
+            id: 2,
+            thinking: ' 推演 ',
+            traces: [{ tool: 'read_board', args_summary: '{}', ok: false }],
+          }),
+        ]),
+      }),
+    );
+    // 兜底能给到的次序只有「先想后查」——中途说过的话在那两列里根本没有（它此前也不显示）
+    expect(out[0].steps).toEqual([]);
+    expect(out[1].steps.map((s) => s.kind)).toEqual(['thinking', 'tool']);
+    expect(out[1].steps[0].text, '不 trim 正文').toBe(' 推演 ');
+    expect(out[1].steps[1].tool).toEqual({ name: 'read_board', argsSummary: '{}', state: 'bad' });
   });
 
   it('attribution 用后端给的 label，未定位时 null——不编一个假的类别', () => {
@@ -157,16 +204,16 @@ describe('落地轮：分类读字段、不解析正文（决策 252 / 244 / 235
     expect(out.map((t) => t.attribution)).toEqual(['宿主', null, null]);
   });
 
-  it('落地轮恒非在飞：streaming / partial / liveTools / needsPairing 都是假', () => {
+  it('落地轮恒非在飞：streaming / partial / needsPairing 都是假，步骤里也没有「正在攒」那一步', () => {
     const out = buildTurns(inputOf({ session: sessionOf([message()]) }));
     expect(out[0]).toMatchObject({
       streaming: false,
       partial: false,
-      liveTools: [],
       needsPairing: false,
       proposal: null,
       at: '2026-09-23T10:00:00Z',
     });
+    expect(out[0].steps).toEqual([]);
   });
 });
 
@@ -192,7 +239,7 @@ describe('提议合流：按时刻插进台账行之间，不另起一段', () =
       at: '2026-09-23T10:01:00Z',
       streaming: false,
       partial: false,
-      thinking: null,
+      steps: [],
       attribution: null,
       proactive: false,
     });
@@ -226,7 +273,7 @@ describe('在飞三态：乐观轮 / 流式轮 / 失败轮（票 02 搬入，恒
     expect(buildTurns(inputOf({ session: sessionOf([message()]) })).map((t) => t.key)).toEqual(['m1']);
   });
 
-  it('live：没收到增量时摆实情占位句，收到了摆正文；tools / thinking 跟着流', () => {
+  it('live：没收到增量时摆实情占位句，收到了摆正文', () => {
     const idle = buildTurns(inputOf({ sending: true }));
     expect(idle).toHaveLength(1);
     expect(idle[0]).toMatchObject({
@@ -235,35 +282,102 @@ describe('在飞三态：乐观轮 / 流式轮 / 失败轮（票 02 搬入，恒
       content: '值班长正在查台账…',
       streaming: false,
       partial: false,
-      liveTools: [],
     });
+    expect(idle[0].steps).toEqual([]);
 
     const flowing = buildTurns(
-      inputOf({
-        sending: true,
-        stream: streamOf({
-          text: '正在查……',
-          streaming: true,
-          thinking: '  ',
-          tools: [{ tool: 'list_dir', args_summary: 'src', phase: 'start' }],
-        }),
-      }),
+      inputOf({ sending: true, stream: streamOf({ steps: [textStep('正在查……')], streaming: true }) }),
     );
     expect(flowing[0]).toMatchObject({
       key: 'live',
       content: '正在查……',
       streaming: true,
       partial: false,
-      thinking: null,
     });
-    expect(flowing[0].liveTools).toEqual([{ tool: 'list_dir', args_summary: 'src', phase: 'start' }]);
+    // 末尾那一步正文是**回话**（正在说的那一句），不是「过程」里的一步
+    expect(flowing[0].steps).toEqual([]);
 
     // 发送结束了、流里还攒着字（断流）：正文留着，降级为「已收到的部分」
-    const broken = buildTurns(inputOf({ stream: streamOf({ text: '收到一半' }) }));
+    const broken = buildTurns(inputOf({ stream: streamOf({ steps: [textStep('收到一半')] }) }));
     expect(broken[0]).toMatchObject({ key: 'live', content: '收到一半', streaming: false, partial: true });
 
     // 什么都没发生：连 live 这一条都没有
     expect(buildTurns(inputOf())).toEqual([]);
+  });
+
+  /**
+   * 段序在在飞轮上的两条判据（决策 273）——它们是「按实际顺序」这件事在**流上**的落点。
+   */
+  it('live：末尾那一步正文之前的各步，按发生顺序摆进 `steps`（推理 / 工具 / 中途的话）', () => {
+    const out = buildTurns(
+      inputOf({
+        sending: true,
+        stream: streamOf({
+          streaming: true,
+          steps: [
+            thinkStep('先看看板。'),
+            toolStep('read_board', 'end'),
+            textStep('看过了，再去翻台账。'),
+            thinkStep('该查 t1 了。'),
+            toolStep('read_task', 'start'),
+          ],
+        }),
+      }),
+    );
+    expect(out[0].steps.map((s) => [s.kind, s.tool?.state ?? null])).toEqual([
+      ['thinking', null],
+      ['tool', 'ok'],
+      ['text', null],
+      ['thinking', null],
+      ['tool', 'running'],
+    ]);
+    // 末尾那一步是工具（还没开始说收口的话）：正文那一格仍是那句占位实情
+    expect(out[0].content).toBe('值班长正在查台账…');
+    // 正在攒的是**末尾**那一步：摘要因此说「正在想…」/「正在查…」
+    expect(out[0].steps.map((s) => s.live)).toEqual([false, false, false, false, true]);
+    // 流停了（收口 / 断流）之后，末尾那一步不再标「正在攒」——摘要因此从「正在想…」
+    // 换成「思考过程 N 字」
+    const stopped = buildTurns(
+      inputOf({ sending: true, stream: streamOf({ steps: [thinkStep('想完了。')] }) }),
+    );
+    expect(stopped[0].steps[0].live).toBe(false);
+  });
+
+  it('live：正文被一次工具调用打断 → 那一段落定成「中途说的话」，新的一段正文重开', () => {
+    // 第一次到达：只有正文 —— 它此刻是**回话**（还没被打断）
+    const first = buildTurns(inputOf({ sending: true, stream: streamOf({ steps: [textStep('我先看一眼。')], streaming: true }) }));
+    expect(first[0]).toMatchObject({ content: '我先看一眼。' });
+    expect(first[0].steps).toEqual([]);
+
+    // 工具调用到达：同一段文字留在段序里（它就是「中途说的话」），正文那一格让位
+    const afterTool = buildTurns(
+      inputOf({
+        sending: true,
+        stream: streamOf({
+          streaming: true,
+          steps: [textStep('我先看一眼。'), toolStep('read_board', 'start')],
+        }),
+      }),
+    );
+    expect(afterTool[0].content).toBe('值班长正在查台账…');
+    expect(afterTool[0].steps.map((s) => s.kind)).toEqual(['text', 'tool']);
+    expect(afterTool[0].steps[0].text).toBe('我先看一眼。');
+
+    // 收尾：权威回话进来 → 又出现末尾那一步正文，它才是回话
+    const settled = buildTurns(
+      inputOf({
+        sending: true,
+        stream: streamOf({
+          steps: [
+            textStep('我先看一眼。'),
+            toolStep('read_board', 'end'),
+            textStep('看完了，没有待办。'),
+          ],
+        }),
+      }),
+    );
+    expect(settled[0].content).toBe('看完了，没有待办。');
+    expect(settled[0].steps.map((s) => s.kind)).toEqual(['text', 'tool']);
   });
 
   it('send-error：失败原因进正文；挂不挂配对入口只看上游判好的布尔（决策 259），报文字样说了不算', () => {
@@ -296,14 +410,16 @@ describe('在飞三态：乐观轮 / 流式轮 / 失败轮（票 02 搬入，恒
   });
 
   it('partial 的边界：在流（streaming）就不是断流；流停了但有字才是', () => {
-    const streaming = buildTurns(inputOf({ sending: true, stream: streamOf({ text: '一半', streaming: true }) }));
+    const streaming = buildTurns(
+      inputOf({ sending: true, stream: streamOf({ steps: [textStep('一半')], streaming: true }) }),
+    );
     expect(streaming[0].partial).toBe(false);
 
-    const stalled = buildTurns(inputOf({ stream: streamOf({ text: '一半', streaming: false }) }));
+    const stalled = buildTurns(inputOf({ stream: streamOf({ steps: [textStep('一半')] }) }));
     expect(stalled[0].partial).toBe(true);
 
     // 发送中、流还没开、零个字：有这一轮（说明「对面在动」），但它既不是在流也不是断流
-    const opening = buildTurns(inputOf({ sending: true, stream: streamOf({ text: '', streaming: false }) }));
+    const opening = buildTurns(inputOf({ sending: true, stream: streamOf() }));
     expect(opening[0]).toMatchObject({ key: 'live', streaming: false, partial: false });
   });
 
@@ -313,7 +429,7 @@ describe('在飞三态：乐观轮 / 流式轮 / 失败轮（票 02 搬入，恒
         session: sessionOf([message({ created_at: '2026-09-23T10:00:00Z' })]),
         pendingText: '乐观',
         sending: true,
-        stream: streamOf({ text: '一半', streaming: false, error: '断了' }),
+        stream: streamOf({ steps: [textStep('一半')], error: '断了' }),
       }),
     );
     expect(out.map((t) => t.key)).toEqual(['m1', 'pending', 'live', 'send-error']);
@@ -327,7 +443,9 @@ describe('在飞三态：乐观轮 / 流式轮 / 失败轮（票 02 搬入，恒
   it('跟一轮（决策 260）：后端说在跑、本机没在发，也要出那一轮', () => {
     // 刷新之后接上的那一轮：`sending` 是假（那一趟 POST 随旧页面走了），但它在跑——
     // 增量已经在往 `stream` 里攒，界面得有一轮来承载它，否则字收下了却没地方显示。
-    const following = buildTurns(inputOf({ following: true, stream: streamOf({ text: '正在答' }) }));
+    const following = buildTurns(
+      inputOf({ following: true, stream: streamOf({ steps: [textStep('正在答')] }) }),
+    );
     expect(following.map((t) => t.key)).toEqual(['live']);
     expect(following[0]).toMatchObject({ kind: 'fm', content: '正在答', streaming: false });
 
@@ -336,10 +454,10 @@ describe('在飞三态：乐观轮 / 流式轮 / 失败轮（票 02 搬入，恒
     expect(opening[0]).toMatchObject({ key: 'live', content: '值班长正在查台账…' });
   });
 
-  it('没在跟也没在发：只有字、没有轮——那一支由「流里已经有字」兜着', () => {
-    // 边界：`following` 为假时单靠 `stream.text` 也出轮（收尾之后到达的尾巴仍要有地方落），
+  it('没在跟也没在发：只有字、没有轮——那一支由「流里已经有步骤」兜着', () => {
+    // 边界：`following` 为假时单靠段序里已有的步骤也出轮（收尾之后到达的尾巴仍要有地方落），
     // 这一条钉的是「两条来源各管各的，不互相替代」
-    const out = buildTurns(inputOf({ stream: streamOf({ text: '尾巴' }) }));
+    const out = buildTurns(inputOf({ stream: streamOf({ steps: [textStep('尾巴')] }) }));
     expect(out.map((t) => t.key)).toEqual(['live']);
   });
 });

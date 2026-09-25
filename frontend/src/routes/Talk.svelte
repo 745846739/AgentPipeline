@@ -7,8 +7,6 @@
     ForemanProposal,
     ForemanSession,
     ForemanSessionMeta,
-    ForemanTrace,
-    SseEvent,
     Stage,
     TaskListItem,
   } from '../api/types';
@@ -75,34 +73,25 @@
     type SeenAt,
     type SessionMark,
   } from '../lib/talkSessions';
-  import { buildTurns, turnName, type TurnView } from '../lib/talkTurns';
+  import { buildTurns, turnName, type TurnStep, type TurnView } from '../lib/talkTurns';
   import { isPairingRequired } from '../lib/sharePairing';
   import { actionKey } from '../lib/actions';
-  import { TaskStream, type StreamStatus } from '../realtime/connection';
   import {
-    appendForemanDelta,
-    appendForemanTool,
     beginForemanStream,
-    emptyForeignActive,
-    emptyForemanStream,
     failForemanStream,
-    failureNotice,
     failedLedgerRowIds,
+    failureNotice,
     foreignIsReplying,
-    FOREMAN_LOST_TURN_SUFFIX,
     forgetForeignActive,
     isRequestTimeout,
     ledgerOwnsTheFailure,
-    maxLedgerId,
-    noteForeignDelta,
     pruneForeignActive,
-    resolveFollowOutcome,
     settleForemanStream,
-    type ForemanStreamState,
-    type ForeignActive,
   } from '../realtime/foreman';
+  import { talk } from '../stores/talk.svelte';
   import Sprite from '../components/render/Sprite.svelte';
   import Gauge from '../components/render/Gauge.svelte';
+  import MarkdownView from '../components/render/MarkdownView.svelte';
   import PendingActions from '../components/board/PendingActions.svelte';
   import DiffReviewPanel from '../components/task/DiffReviewPanel.svelte';
   import EmptyState from '../components/ui/EmptyState.svelte';
@@ -154,7 +143,7 @@
    * 决策 217①）。
    *
    * **回话中允许换班次**（决策 220②）：那把 `sending || busy` 的 UI 锁撤掉了——它只是第三层
-   * 自保（前两层是 `appendForemanDelta` 的班次守卫与 `send()` 里的 `generation` 比对）。
+   * 自保（前两层是 `appendForemanEvent` 的班次守卫与 `send()` 里的 `generation` 比对）。
    * 「那一轮回话去哪了」改由班次列表里的两枚标记说：**正在回话**与**有新动静**
    * （判据在 `lib/talkSessions.ts` 与 `realtime/foreman.ts`）。
    *
@@ -181,8 +170,13 @@
 
   /** 未归档的班次（chip 行的数据源），按最近活动倒序。 */
   let sessionList = $state<ForemanSessionMeta[]>([]);
-  /** 当前班次 id。**同步更新**，不从 `session` 派生——发送期间要靠它比对在途回包。 */
-  let currentId = $state<string | null>(null);
+  /**
+   * 当前班次 id。**住在 `stores/talk.svelte.ts` 里**（决策 275）：在飞一轮的现场与那条
+   * `/foreman/stream` 连接都挂在它上面，而它们必须活得比这个组件长——否则切一下界面再回来，
+   * 本轮已经收到的输出整段不见（那一轮还在服务端跑，SSE 没有回放，补不回来）。
+   * 这里只是一个**读别名**：写走 `talk.watch(id)`（它同时管换班要清的那几样）。
+   */
+  const currentId = $derived(talk.sessionId);
   /**
    * 世代记号：**每次「屏幕上换了班次」就 +1**（切换 / 新建 / 重读时发现服务端换了班）。
    * 在途的 send 结果比对这个记号，不符即丢弃（决策 204⑥）——手机与电脑同时连着时，
@@ -199,36 +193,20 @@
   let dialogError = $state<string | null>(null);
 
   let input = $state('');
-  let sending = $state(false);
-  /** 正在发的那句话（台账里还没有它的回话，故先以乐观轮显示）。 */
-  let pendingText = $state<string | null>(null);
-  let stream = $state<ForemanStreamState>(emptyForemanStream());
-  /**
-   * 当前这条流错误是不是**配对缺失**（按 `kind` 判，决策 259）。
-   *
-   * 与 `stream.error` 在同一处 catch 里设置、恒同步：错误降级成字符串之后 `kind` 就丢了，
-   * 判据必须趁 `ApiError` 还在手时做掉。
-   */
-  let sendPairingNeeded = $state(false);
-  let streamStatus = $state<StreamStatus>('idle');
-  /**
-   * **刷新之后重新接上的一轮**（决策 260）：服务端说这一班此刻有一轮在跑，而本机没有
-   * 它那一趟 POST（它随旧页面一起走了）。
-   *
-   * 那些在途轮的现场本来全住在 `sending` 那一侧——刷新即丢，于是增量到达时无从判断
-   * 「这一段字属于谁」，闸门只好一律不接（`if (!sending) return`），时间线于是**看不到
-   * 实时回话**，只剩等它落地后重读台账。这一格就是补上的那份「此刻在跑」的事实：
-   * 它在场时，增量照旧接进 `stream`，界面照旧渲染那一轮（`lib/talkTurns.ts` 的 live 轮）。
-   *
-   * `null` = 没在跟；否则是**接手那一刻台账里最大的行 id**——那之后多一行就是这个回合
-   * 落了地（判据在 `realtime/foreman.ts::turnLanded`）。
-   */
-  let followingSince = $state<number | null>(null);
+  /** 发送在途 / 乐观轮 / 在飞步骤 / 跟一轮的锚点：全在 store 里（决策 275，见 `currentId`）。 */
+  const sending = $derived(talk.sending);
+  const pendingText = $derived(talk.pendingText);
+  const stream = $derived(talk.stream);
+  const followingSince = $derived(talk.followingSince);
+  /** 当前这条流错误是不是**配对缺失**（按 `kind` 判，决策 259）：与 `stream.error` 同处设置。 */
+  const sendPairingNeeded = $derived(talk.pairingNeeded);
+  const streamStatus = $derived(talk.status);
   /**
    * 本机刚发出去、还没落地的那一班（决策 220③ 的「正在回话」前半支）。
    *
    * 记 id 而不是一个布尔：切走之后那一轮照旧在路上，标记要落在**它**那一行上，
-   * 而不是「你现在看的这一班」。
+   * 而不是「你现在看的这一班」。它只喂本页那两枚标记（切页面时这一屏本就不在），
+   * 故留在组件里——与决策 275 搬走的那几样不同，它没有「页面不在时也要成立」的语义。
    */
   let sendingSid = $state<string | null>(null);
 
@@ -236,8 +214,8 @@
   let seen = $state<SeenAt>({});
   /** 这份表建过基线没有：本机第一次读到列表时把当下当基线（否则第一屏每条都带「有新动静」）。 */
   let seenSeeded = $state(false);
-  /** 「别的班次正在回话」：SSE 广播里的 `session_id` 归位（纯前端、刷新即空）。 */
-  let foreignActive = $state<ForeignActive>(emptyForeignActive());
+  /** 「别的班次正在回话」（store 持有，决策 275——它说的是「此刻」，与页面在不在无关）。 */
+  const foreignActive = $derived(talk.foreign);
   /** 标记的时钟：只在真有「别的班次在回话」时走（静默超时熄灭用）。 */
   let markerNow = $state(Date.now());
 
@@ -426,12 +404,13 @@
       session = payload;
       const landed = payload.session?.id ?? null;
       if (landed !== currentId) generation += 1;
-      currentId = landed;
+      talk.watch(landed);
       rememberLanding(landed, payload.session);
-      // 重新接上一轮（决策 260）：服务端说这一班此刻有一轮在跑，而本机没在等它
+      // 重新接上一轮（决策 260 / 275）：服务端说这一班此刻有一轮在跑，而本机没在等它
       // （`sending` 的现场只属于本机发出的那一趟）。此时把「跟」这件事立起来，增量
-      // 才会照旧接进时间线——否则刷新之后实时回话整段看不见，只剩落地后重读台账。
-      syncFollowing(payload);
+      // 才会照旧接进时间线——否则刷新之后实时回话整段看不见，只剩落地后重读台账；
+      // 而**切走再回来**那一趟靠 store 里没走的在飞现场接着（决策 275）。
+      talk.syncFollowing(payload);
       loadError = null;
       loadErrorPairing = false;
       return true;
@@ -441,32 +420,6 @@
       return false;
     } finally {
       loading = false;
-    }
-  }
-
-  /**
-   * 按这一趟读到的台账收口「跟不跟这一轮」（决策 260）。
-   *
-   * 三条判据，各自对应一种真实情形：
-   *
-   * 1. **本机在发**（`sending`）：跟着的是本机那一趟，`send()` 的收尾负责放手——
-   *    这里一个字都不动（此时 `turn_in_flight` 也在场，两条路说的是同一件事）。
-   * 2. **服务端说没在跑**：放手（`null`）。这一条同时收掉「刚落地」那一趟——回话进了
-   *    台账，`turn_in_flight` 随之变假，下一次重读（或落地后的那一趟轮询）就撤了。
-   * 3. **服务端说在跑、本机没在发**：接手。`followingSince` 记**接手那一刻的最大行 id**，
-   *    尾部此后多一行就是它落了地（这趟 POST 的回包本机没有，只能这么读）。
-   *
-   * 已经接手且仍在跑时**不改 `followingSince`**：它是「落地」那条判据的锚点，每趟轮询
-   * 重记一次的话锚点会跟着往前爬，落地的行反而永远比它小。
-   */
-  function syncFollowing(payload: ForemanSession) {
-    if (sending) return;
-    if (!payload.turn_in_flight) {
-      followingSince = null;
-      return;
-    }
-    if (followingSince === null) {
-      followingSince = maxLedgerId(payload.messages ?? []);
     }
   }
 
@@ -502,7 +455,7 @@
       saveSeen(next);
     }
     // 落地即熄灭（决策 220③）：这一班的回话已经在台账里了，它不再是「此刻在说话」
-    if (landed) foreignActive = forgetForeignActive(foreignActive, landed);
+    if (landed) talk.foreign = forgetForeignActive(talk.foreign, landed);
     saveSessionId(landed);
     writeQuery({ session: landed }, { replace: true });
   }
@@ -514,17 +467,16 @@
    * 流式增量、以及还没发出去的输入。**不重置**的是 `details` / `chosenStop` / `crew` /
    * `pending`——它们派生自全局看板，换会话不等于换看板（同一条决策的第②条裁决）。
    *
-   * `followingSince` 在这份清单里（决策 260）：它跟的是**某一班**那一轮，而那一段流式文字
-   * 随着 `stream` 一起被清掉了——留着锚点会让新那一班的增量继续往这一格里攒。
+   * 其中「一轮的现场」（乐观轮 / 步骤 / 跟一轮的锚点）自决策 275 起住在 store 里，
+   * 由 `talk.watch(id)` 换班时一并倒空——它跟的是**某一班**那一轮，留着锚点会让新那一班的
+   * 增量继续往那一格里攒。
    */
   function resetSessionState() {
     session = null;
     loading = true;
     loadError = null;
     loadErrorPairing = false;
-    pendingText = null;
-    stream = emptyForemanStream();
-    followingSince = null;
+    talk.resetLive();
     input = '';
   }
 
@@ -532,7 +484,7 @@
    * 切到另一班。
    *
    * **回话中也可以切**（决策 220②）：那把 `sending || busy` 的锁撤掉了。它只是「别让你把
-   * 正在等的那句回话弄丢」的**第三层**自保——前两层是 `appendForemanDelta` 的班次守卫
+   * 正在等的那句回话弄丢」的**第三层**自保——前两层是 `appendForemanEvent` 的班次守卫
    * （增量串台）与 `send()` 里每个 await 之后的 `generation` 比对（回包串台），那两层一步没动。
    * 切走之后「那一轮回话去哪了」改由班次列表里的两枚标记说清楚（决策 220③）。
    *
@@ -547,11 +499,23 @@
     if (id === currentId) return;
     generation += 1;
     // 先认下这件事再写地址：地址一变，下面那个 `$effect` 会拿新值来比——认下了才不重复装载
-    currentId = id;
+    talk.watch(id);
     if (opts.write) writeQuery({ session: id });
     resetSessionState();
     await reload(id);
   }
+
+  /**
+   * 台账代次（决策 275）：store 说「这一份台账可能已经变了」就重读一次。
+   *
+   * 要它，是因为一轮的收尾**可能发生在页面之外**（切走之后那一趟 POST 才回来），而那时
+   * 在屏的这一页读的仍是旧台账——代次是那一趟收尾留给这一屏的那一声。首屏不接（代次为 0，
+   * 第一次装载归 onMount，别装载两遍）。
+   */
+  $effect(() => {
+    if (talk.ledgerEpoch === 0) return;
+    void reload();
+  });
 
   /**
    * 地址里的班次变了就跟着走（后退 / 前进，决策 217④ 的恢复语义）。
@@ -580,7 +544,7 @@
     resetSessionState();
     // 同 `switchTo`：先把落点认下来，再写地址（用户按的那一颗 push，归档后的自动开新班不写——
     // 地址的落点由随后的 `reload` 用 replaceState 规范化）
-    currentId = created.session.id;
+    talk.watch(created.session.id);
     if (opts.push) writeQuery({ session: created.session.id });
     await reload(created.session.id);
   }
@@ -655,25 +619,6 @@
     }
   }
 
-  function onStreamEvent(_taskId: string, event: SseEvent) {
-    // 「别的班次正在回话」（决策 220③）：`/foreman/stream` 把**全部**工头增量广播给所有
-    // 订阅者，而这个字段此前只被用来「丢掉不匹配的」——等于把「另一班在说话」白扔了。
-    // **不判 `sending`**：别的班次说话时本机可能什么都没发，而那正是需要告知的时候。
-    foreignActive = noteForeignDelta(foreignActive, event, currentId, Date.now());
-    // 只在等回话期间累积：收尾后到达的尾巴不得再造一轮（回话以台账为准）。
-    // **「在等」有两条来源**（决策 260）：本机发出的那一趟（`sending`），或刷新之后
-    // 从服务端重新接上的那一轮（`followingSince`）。少了后一条，刷新页面的那一刻起
-    // 增量就全被挡在这里——时间线上看不到实时回话，只有等它落地后重读台账才出现。
-    if (!sending && followingSince === null) return;
-    // 班次守卫：不是当前这一班的增量一律丢弃（决策 204⑥，判据在 realtime/foreman.ts）。
-    // 两条声道各归各的：回话进 `text`、思考进 `thinking`、工具调用进 `tools`（决策 244），
-    // 判据（类型 / 身份 / 班次）三处同源，故都收在这一个出口。
-    stream = appendForemanDelta(stream, event, currentId);
-    stream = appendForemanTool(stream, event, currentId);
-  }
-
-  let conn: TaskStream | null = null;
-
   /**
    * 现在几点（提议的过期按它算，决策 207）。
    *
@@ -703,67 +648,16 @@
     const t = setInterval(() => {
       markerNow = Date.now();
       const pruned = pruneForeignActive(foreignActive, sessionList, markerNow);
-      if (pruned !== foreignActive) foreignActive = pruned;
+      if (pruned !== foreignActive) talk.foreign = pruned;
     }, 5_000);
     return () => clearInterval(t);
   });
 
-  /**
-   * 跟一轮时的**落地哨**（决策 260）。
-   *
-   * 重新接上一轮之后，本机手里没有那一趟 POST 的回包（它随旧页面一起走了），故「它答完了」
-   * 只能从台账读：每几秒问一次服务端，`turn_in_flight` 转假、或台账尾部多出比接手时更新的
-   * 一行，就是这一轮落了地——那时重读台账（回话落地进时间线）、放下跟随（`stream` 清掉，
-   * 增量不再往这一格里攒）。
-   *
-   * **只在真的在跟时才走**（与上面两条 5s / 10s 心跳同一姿态：没有东西要看的时候，一次
-   * 状态更新都不该产生）。这是全页第三条周期请求，故间隔取得比标记那条更宽：跟随的那一轮
-   * 本来就有 SSE 增量在动，人看得见它在忙；这一条只负责把「已经答完」这件事及时收口，
-   * 快慢几秒不影响。
-   *
-   * 落地判据用**台账尾部有没有新行**而不是只看 `turn_in_flight`：后者在「回话落库、
-   * 但下一轮紧接着又起」那一瞬间会连着为真，而尾部多一行是确定无疑的信号。
-   *
-   * 收场有一支**不是落地**（决策 260 裁决③）：没换行而服务端也不再跑它——那一轮永远
-   * 不会再落一行了。此时**不许清字**（那一段是这一轮留下的全部），收成一条失败轮说清
-   * 发生了什么；三支的判据在 `resolveFollowOutcome`，这里只接线。
-   */
-  $effect(() => {
-    if (followingSince === null) return;
-    const t = setInterval(async () => {
-      const anchor = followingSince;
-      if (anchor === null) return;
-      try {
-        const payload = await getForemanSession(currentId);
-        const outcome = resolveFollowOutcome(
-          payload.messages ?? [],
-          anchor,
-          payload.turn_in_flight,
-        );
-        if (outcome.kind === 'keep') return;
-        session = payload;
-        rememberLanding(payload.session?.id ?? null, payload.session);
-        if (outcome.kind === 'lost') {
-          // 死轮：已经收到的部分原样留着（`failForemanStream` 的姿态），只多一句说明。
-          stream = failForemanStream(stream, FOREMAN_LOST_TURN_SUFFIX);
-          followingSince = null;
-          return;
-        }
-        // 落地：台账那一行接管（它带着完整回话进来），本地那一段退场。
-        stream = emptyForemanStream();
-        // **先放手再交棒**：`syncFollowing` 在收到 `turn_in_flight` 为真时重新立锚点。
-        // 那一格是「回话落了库、而同一班紧接着又起了一轮」（值守轮插进来，或这一屏刚
-        // 发出下一句）——此时该跟的是**新那一轮**，锚点必须按它落库后的台账重记；
-        // 沿用旧锚点会让下一趟立刻又判成「落地」（新那一轮的回话 id 当然大于旧锚点，
-        // 但那不是它答完了）。
-        followingSince = null;
-        syncFollowing(payload);
-      } catch {
-        // 读不到不影响这一屏：SSE 增量照旧在动，下一趟再收口
-      }
-    }, 3_000);
-    return () => clearInterval(t);
-  });
+  /* 「跟一轮」的**落地哨**自决策 275 起住在 store（`stores/talk.svelte.ts::pollFollow`）：
+   * 它与「这一轮此刻在跑」这件事实同寿，而页面来去不该影响收口——页面切走之后那一趟
+   * POST 才回来的情形，本页早已销毁，收口在那里发生的话只会写进一个死组件里
+   * （实测：切去看板再回来，落地那一刻时间线空了一格）。本页只提供**交棒的那一跳**——
+   * `talk.bindRecalibrate(() => void reload())`（见 onMount）。 */
 
   /** 提议对应的那个任务的 `allowed_actions`（不指路时用不到，判据在 `lib/proposals.ts`）。 */
   function actionsFor(p: ForemanProposal): AllowedAction[] | undefined {
@@ -807,10 +701,15 @@
     }
   }
 
+  /**
+   * 可见性恢复：重读一次台账。
+   *
+   * 流的重连不在这里——那归 store（决策 275，`talk.syncFollowing` 那条注释写着它的两条
+   * 收口）；本页只管**这一屏读到的东西**跟上服务端。
+   */
   function onVisible() {
     if (document.visibilityState !== 'visible') return;
     void reload();
-    conn?.reconnectNow();
   }
 
   onMount(() => {
@@ -822,25 +721,11 @@
       .then((l) => (toolLabels = l))
       .catch(() => {});
     void reload(urlSession ?? loadSessionId() ?? undefined);
-    // 复用任务流的分帧 / 退避 / 主动重连（票 03）：工头流只是换了一条路径
-    conn = new TaskStream(
-      '',
-      {
-        onEvent: onStreamEvent,
-        onStatus: (_id, status) => {
-          streamStatus = status;
-          // 断开即熄灭（决策 220③）：「别的班次在回话」是一份**描述此刻**的映射，
-          // 连接不在的时候它说的就不再是此刻——留着只会变成一个撤不掉的假标记。
-          if (status !== 'open') foreignActive = emptyForeignActive();
-        },
-        // 重连成功后补一次全量（票 03，stream-self-heal）：SSE 无回放，非可见性原因
-        // 断线重连后不 reload 就得切走再切回来才对齐。走与可见性恢复同一个入口
-        // （reload），不另造第二条读路径。
-        onRecalibrate: () => void reload(),
-      },
-      { path: '/foreman/stream' },
-    );
-    conn.start();
+    // 流归 store（决策 275）：那条 `/foreman/stream` 连接与在飞一轮的现场都活在页面之外，
+    // 切页面再回来时「本轮已经收到的输出」还在。这里只**登记**「重连成功后补一次全量」
+    // 的入口（票 03，stream-self-heal：SSE 无回放，不补就得切走再切回来才对齐）——
+    // 页面不在屏上时不登记，那一跳由回来那一次的装载负责。
+    talk.bindRecalibrate(() => void reload());
     // 两档断点都是 `lib/talkLayout.ts` 的常量（票 07：899 一处定义；479 只剩占位语用它）
     foldedMq = window.matchMedia(TALK_FOLD_QUERY);
     folded = foldedMq.matches;
@@ -855,8 +740,7 @@
       document.removeEventListener('visibilitychange', onVisible);
       if (foldedMq && onFoldChange) foldedMq.removeEventListener('change', onFoldChange);
       if (narrowMq && onNarrowChange) narrowMq.removeEventListener('change', onNarrowChange);
-      conn?.stop();
-      conn = null;
+      talk.bindRecalibrate(null);
     };
   });
 
@@ -983,13 +867,13 @@
   async function send() {
     const text = input.trim();
     if (!text || sending) return;
-    sending = true;
-    pendingText = text;
-    stream = beginForemanStream();
+    talk.sending = true;
+    talk.pendingText = text;
+    talk.stream = beginForemanStream();
     // 本机这一趟接手之后就不再「跟」别人（决策 260）：两条来源说的是同一件事的不同主人，
     // 留着锚点会让落地哨（那个 3s 的 `$effect`）拿旧锚点判本机这一趟，而它的收尾归
     // 下面这一趟 POST 管——两条路各收各的口，混起来会把这一轮提前判成「落地了」。
-    followingSince = null;
+    talk.followingSince = null;
     // 这一趟之前台账里已有的失败轮 id：失败回来后靠它分辨「这次新出现的那一条」
     // （判据在 realtime/foreman.ts；不记的话，早先的失败会让真正的断网静默下来）
     const failuresBefore = failedLedgerRowIds(session?.messages ?? []);
@@ -1003,7 +887,7 @@
         const created = await createForemanSession();
         if (gen !== generation) return;
         sid = created.session.id;
-        currentId = sid;
+        talk.watch(sid);
         sessionList = [created.session, ...sessionList];
         // 这是**我们自己**开的班，不算「换班」：重取记号，免得下面每一步都判成过期。
         gen = generation;
@@ -1017,28 +901,23 @@
         // 「落地即熄灭」在这里同样要办：这一班的增量此前被记进了「别的班次在回话」那张映射
         // （切走之后它的 `session_id` 就不再是「当前这一班」了），不清掉那枚
         // 「正在回话」会一直亮到静默超时——而它说的已经不是实话。
-        pendingText = null;
-        stream = emptyForemanStream();
-        foreignActive = forgetForeignActive(foreignActive, sid);
+        talk.settleTurn();
+        talk.foreign = forgetForeignActive(talk.foreign, sid);
         void refreshSessionList();
         return;
       }
       // 回话是权威值：先收敛流式文本（重取台账期间不闪空），再以台账覆盖
-      stream = settleForemanStream(stream, res.reply);
+      talk.stream = settleForemanStream(talk.stream, res.reply);
       input = '';
       // 重取之后**无条件收掉这两样本地状态**：它们是「这一轮」的东西，而重取可能发现
       // 服务端已经把我们换到了另一班（另一台设备归档了它）。那种情况下留着乐观轮，
       // 它就会挂在**另一班的**时间线上——正是决策 204⑥ 要挡的串台。
-      if (await reload(sid)) {
-        pendingText = null;
-        stream = emptyForemanStream();
-      }
+      if (await reload(sid)) talk.settleTurn();
     } catch (err) {
       // 失败不改输入框内容：后端在叫模型之前已把 user 行落库，人改几个字就能重发
       // （决策 182㉓）。失败以时间线里的一轮呈现——不弹窗、不 toast。
       if (gen !== generation) {
-        pendingText = null;
-        stream = emptyForemanStream();
+        talk.settleTurn();
         void refreshSessionList();
         return;
       }
@@ -1047,32 +926,34 @@
       // 而那一轮很可能正在把话答完。
       // 配对与超时两枚判据（票 04 / 06，决策 259）：趁 `ApiError` 还在手按 `kind` 判掉——
       // 错误降级成流里的字符串之后 `kind` 就丢了。与 `stream.error` 同一处设置，两者恒同步。
-      sendPairingNeeded = isPairingRequired(err);
+      talk.pairingNeeded = isPairingRequired(err);
       timedOut = isRequestTimeout(err);
-      stream = failForemanStream(
-        stream,
+      talk.stream = failForemanStream(
+        talk.stream,
         failureNotice((err as Error).message, timedOut),
       );
       // 重取成功才撤乐观轮：撤了之后这话由台账那一行承担，不靠重取失败时凭空消失
       if (await reload(sid)) {
-        pendingText = null;
+        talk.pendingText = null;
+        // 这一趟收尾也可能发生在页面之外（切走之后 POST 才失败回来）：提醒在屏的那一页重读
+        talk.markLedgerStale();
         // 后端**已经**把这一轮为什么没跑起来落了账（决策 211④ / 票 04）：那一行就是这次的
         // 失败轮，而且比本地这条传输报文更全（带归因、刷新后还在）。此时撤掉本地的 error，
         // 免得同一个失败在时间线里摆成两轮。台账里没有新失败行时才用它兜底——请求根本没
         // 到后端（网络断了、代理 502、配对 403 发生在进 handler 之前）时，本地是唯一信号。
         if (ledgerOwnsTheFailure(session?.messages ?? [], failuresBefore)) {
-          stream = { ...stream, error: null };
+          talk.stream = { ...talk.stream, error: null };
         }
       }
     } finally {
-      sending = false;
+      talk.sending = false;
       sendingSid = null;
       // **本地放弃、服务端还在跑**那一类（决策 223 的超时）交棒给「跟」这一支（决策 260）：
       // 这一趟的回包等不到了，但那一轮不随请求一起死——上面那一趟 `reload` 已经把
       // `turn_in_flight` 读回来，这里据此接力，增量才继续往时间线上走。
       // 成功那一趟是**空操作**：那一刻 `turn_in_flight` 已经翻假（回话落了库）。
       // 必须放在 `sending = false` **之后**——`syncFollowing` 在本机还在发时不接手。
-      if (session) syncFollowing(session);
+      if (session) talk.syncFollowing(session);
       // 接上手之后，那条本地的「发送失败」要退场——**但只退超时那一类**（决策 260）：
       // 它说的是「这一次请求没等到回包」，字是真话，可屏幕上同时摆着**一条失败轮与一轮
       // 正在流式作答**，人只会读成「它说错了、又答上了」。那一轮此刻在跑这件实情，由
@@ -1081,9 +962,9 @@
       // 其余失败**一个字都不动**：网络不通、配对 403 这些请求很可能根本没到后端，
       // 而值班长的**值守轮**完全可能在那一瞬间正在跑——按「服务端说有在跑」就把本地那条
       // 错误抹掉，等于拿一件无关的实情盖住另一件真事（配对那条尤其：它的指引是唯一出口）。
-      if (followingSince !== null && timedOut) {
-        stream = { ...stream, error: null };
-        sendPairingNeeded = false;
+      if (talk.followingSince !== null && timedOut) {
+        talk.stream = { ...talk.stream, error: null };
+        talk.pairingNeeded = false;
       }
     }
   }
@@ -1153,25 +1034,21 @@
   }
 
   /**
-   * 工具名 → 中文词（实时那一栏用；回执那一栏在 {@link receipt} 里并列拿同一张表）。
-   *
-   * 词来自后端清单（`GET /foreman/tools`，onMount 取一次缓存，决策 247⑤）——**前端不再
-   * 手抄一张表**（那张 18 键的 `TOOL_LABELS` 缺 4 个词、还带着死键，已删）。未登记的值
-   * **原样显示工具名**，不兜底成「台账查读」——那个兜底会把「值班长调了个界面还不认识的
-   * 新工具」说成一件它没做的事（决策 200 的平实口径）；取数还没回来时同理（英文原名好过
-   * 一个猜出来的中文词）。
-   */
-  function toolLabel(tool: string): string {
-    return labelFor(toolLabels, tool);
-  }
-
-  /**
-   * 工具痕迹 → 回执行（§3.3 纪律 3）。
+   * 工具那一步 → 回执行（§3.3 纪律 3）。
    *
    * 能对上该轮快照里的任务就标出来源**工位**：像素本身不可考，靠 sprite + 工位名双编码。
-   * 对不上（例如查了一次就没了的任务）就只说这是台账查读，不假装知道出处。
+   * 对不上（例如查了一次就没了的任务、或还在飞的那一步——那时这一行没有快照）就只说这是
+   * 台账查读，不假装知道出处。
+   *
+   * **入参是两个原语而不是一条工具留痕**（决策 273）：实时那一步与落地那一步的形状不同
+   * （一个带相位、一个带 `ok`），而这一行要画的东西是一样的——取值交给调用点，
+   * 这里只管「怎么画」。
    */
-  function receipt(trace: ForemanTrace, briefing: ForemanBriefing | null): {
+  function receipt(
+    tool: string,
+    argsSummary: string,
+    briefing: ForemanBriefing | null,
+  ): {
     sprite: SpriteName;
     workshop: string;
     label: string;
@@ -1180,12 +1057,29 @@
       ...(briefing?.pending ?? []),
       ...(briefing?.running ?? []),
       ...(briefing?.failed ?? []),
-    ].find((b) => trace.args_summary.includes(b.task_id));
+    ].find((b) => argsSummary.includes(b.task_id));
     return {
       sprite: known ? stageSprite(known.stage) : 'chest',
       workshop: known?.stage ?? '台账',
-      label: labelFor(toolLabels, trace.tool),
+      label: labelFor(toolLabels, tool),
     };
+  }
+
+  /**
+   * 「过程」那一组的摘要（决策 273）：**永远带条数**——收起的是版面，不是信息
+   * （决策 218 ② 的原话：「内容一个字不删」）。
+   *
+   * 词表照旧：工具那些步仍叫「N 次台账查读」（回执那一条的既有措辞，决策 247⑤），推理另计一道数。
+   * 只有中途的话（既没有工具也没有推理）的那一组理论上不存在——落地段序里 `text` 步只在
+   * 带工具调用的那次模型调用之后出现；真出现了就退回按步数说，不编一个词。
+   */
+  function stepsSummary(steps: TurnStep[]): string {
+    const tools = steps.filter((s) => s.kind === 'tool').length;
+    const thinks = steps.filter((s) => s.kind === 'thinking').length;
+    const parts: string[] = [];
+    if (thinks > 0) parts.push(`思考 ×${thinks}`);
+    if (tools > 0) parts.push(`${tools} 次台账查读`);
+    return parts.length > 0 ? parts.join(' · ') : `${steps.length} 步`;
   }
 
   /**
@@ -1735,45 +1629,85 @@
           <!-- 名牌那五个词是一张文案规格，判据住在 `lib/talkTurns.ts::turnName`（决策 252 / 271）：
                值守轮的失败账（`failed` + `proactive`）不叫「发送失败」。 -->
           <div class="dname">{turnName(turn)}</div>
-          <p class:streaming={turn.streaming}>{turn.content}</p>
 
-          <!-- 正在发生的工具调用（决策 244）：**实时**，不是等这一轮落库。
-               形态照工位回执（左缘亮度阶 + 无框 = 转述不是发言），但它是**此刻**的东西，
-               故左缘跟相位走：正在查是静的 --pane，查完点亮 --go，没查到用 --stop。
-               它与下面的「工位回执」是同一件事的两个时态：这里是进行中，落地后由回执接管
-               （所以落地轮的 `liveTools` 恒空，不会两处都画）。 -->
-          {#if turn.liveTools.length > 0}
-            <div class="livetools" data-live-tools={turn.liveTools.length}>
-              {#each turn.liveTools as t, i (`${turn.key}-lt${i}`)}
-                <div
-                  class="rcpt live"
-                  class:pending={t.phase === 'start'}
-                  class:done={t.phase === 'end'}
-                  class:bad={t.phase === 'error'}
-                >
-                  <div class="rcpt-head">
-                    <span class="dim">{toolLabel(t.tool)}</span>
-                    <span class="dim args">{t.args_summary}</span>
-                    <span class="rs" class:bad={t.phase === 'error'}>
-                      {t.phase === 'start' ? '正在查…' : t.phase === 'error' ? '没查到' : '已读'}
-                    </span>
+          <!-- ── 过程：这一轮**按发生顺序**的一步一步（决策 273）──
+               值班长的一轮常态是「先想 → 查台账 → 再想 → 收口」，而此前三份留痕是三个
+               各自累积的桶（回话在前、思考与回执在后），顺序整个丢了——用户报的
+               「命令执行、思考过程没按实际顺序来」就是它。现在按段序画：推理、中途说出口的
+               话、工具调用各是一行，谁先谁后由 `lib/talkTurns.ts` 归好的 `segments` 说了算。
+
+               **整组收在一个受控折叠里**（决策 218 ② 的口径原样）：桌面默认展开
+               （过程是这一轮结论的出处，「可追溯性不因对话而丢失」是四条纪律之一），
+               折行档默认收起——每轮 30–60px 是长会话里最大的隐性纵向开销。内容一个字不删：
+               出处按一下就在，摘要行永远带条数。展开态受控的理由与工位回执逐字相同
+               （见 `receiptOpen`）：流式增量反复重渲染同一轮时，人手动展开的那一组不该被打回。 -->
+          {#if turn.steps.length > 0}
+            <details class="rcpts process" data-steps={turn.steps.length} open={receiptIsOpen(turn.key)}>
+              <summary class="rcpts-sum" onclick={(e) => toggleReceipt(e, turn.key)}>
+                过程 <span class="dim">{stepsSummary(turn.steps)} ▸</span>
+              </summary>
+              {#each turn.steps as step (step.key)}
+                {#if step.kind === 'thinking'}
+                  <!-- 推理（决策 244）：**默认收起**，两档都是——它常常比回话本身长一个量级，
+                       展开着摆在时间线上会把对话冲垮。摘要在流式期间就说「正在想…」，
+                       收口后带字数——人不用点开就知道里面有没有东西。 -->
+                  <details class="rcpts think" data-step="thinking" open={thinkingIsOpen(step.key)}>
+                    <summary class="rcpts-sum" onclick={(e) => toggleThinking(e, step.key)}>
+                      {step.live ? '正在想…' : `思考过程 ${step.text.length} 字`} ▸
+                    </summary>
+                    <pre class="think-body">{step.text}</pre>
+                  </details>
+                {:else if step.tool}
+                  {@const r = receipt(step.tool.name, step.tool.argsSummary, turn.briefing)}
+                  <!-- 工具调用：与「正在发生的工具调用」同一形状（左缘亮度阶 + 无框 = 转述
+                       不是发言），只是这里它是**已经发生**的那一步——左缘跟它成没成走：
+                       正在查是静的 --pane，查完点亮 --go，没读到（含被拒的越权工具）用 --stop。
+                       三种状态的词只有一份：**正在查… / 已读 / 未读到**——落地前后是同一个形状、
+                       同一句话（此前实时那一栏说「没查到」、落地那一栏说「未读到」，同一件事两个词）。 -->
+                  <div
+                    class="rcpt live"
+                    data-step="tool"
+                    data-tool={step.tool.name}
+                    class:pending={step.tool.state === 'running'}
+                    class:done={step.tool.state === 'ok'}
+                    class:bad={step.tool.state === 'bad'}
+                  >
+                    <div class="rcpt-head">
+                      <Sprite name={r.sprite} size={10} />
+                      <span class="nm">{r.workshop}</span>
+                      <span class="dim">{r.label}</span>
+                      <span class="dim args">{step.tool.argsSummary}</span>
+                      <span class="rs" class:bad={step.tool.state === 'bad'}>
+                        {step.tool.state === 'running'
+                          ? '正在查…'
+                          : step.tool.state === 'bad'
+                            ? '未读到'
+                            : '已读'}
+                      </span>
+                    </div>
                   </div>
-                </div>
+                {:else}
+                  <!-- 中途说出口的话（决策 273）：它在段序里有自己的位置，故不并进收口那一句。
+                       按 markdown 渲染，与回话同一套（它也是值班长的话，只是没在那句上收口）。 -->
+                  <div class="narr" data-step="text"><MarkdownView source={step.text} /></div>
+                {/if}
               {/each}
-            </div>
+            </details>
           {/if}
 
-          <!-- 推理 / 思考（决策 244）：**默认收起**，两档都是——它常常比回话本身长一个量级，
-               展开着摆在时间线上会把对话冲垮。零新增视觉语言：复用回执那套
-               （左缘亮度阶 + 无框 + 详情块），只在措辞上把「它想的过程」与「它查的台账」分开。
-               摘要在流式期间就说「正在想…」，收口后带字数——人不用点开就知道里面有没有东西。 -->
-          {#if turn.thinking}
-            <details class="rcpts think" open={thinkingIsOpen(turn.key)}>
-              <summary class="rcpts-sum" onclick={(e) => toggleThinking(e, turn.key)}>
-                {turn.streaming ? '正在想…' : `思考过程 ${turn.thinking.length} 字`} ▸
-              </summary>
-              <pre class="think-body">{turn.thinking}</pre>
-            </details>
+          <!-- ── 回话（收口那一句）──
+               只在流式期间用等宽预换行 + 光标（那是**还在往外冒**的字，markdown 结构未必成立：
+               半个代码栅栏会被渲染成一段乱码）；收口之后按 markdown 渲染（决策 274）——
+               模型的回话本来就带标题 / 列表 / 粗体 / 行内代码，此前一律原样吐成纯文本，
+               用户读到的是一堆 `**` 与 `-`。 -->
+          {#if turn.streaming}
+            <p class="streaming">{turn.content}</p>
+          {:else if turn.kind === 'fm'}
+            <MarkdownView source={turn.content} class="reply" />
+          {:else if turn.content}
+            <!-- 操作台记的账与传输层的失败报文**不渲染 md**：它们不是模型的排版输出
+                 （「发送失败：…」里的符号拿去做标题/强调会把一句实话画歪），原文照旧。 -->
+            <p>{turn.content}</p>
           {/if}
 
           <!-- 归因类别标记（决策 235① / 238）：四类各一个词，显示在那一轮的名牌行上。
@@ -1806,32 +1740,10 @@
             </p>
           {/if}
 
-          <!-- 工位回执：转述不是发言（左缘亮度阶 + 无框，形状上就与发言不同）。
-               **默认态分档**（决策 218 ②/Q11）：桌面照旧展开（回执是这一轮结论的出处，
-               「可追溯性不因对话而丢失」是四条纪律之一）；折行档默认收起——每轮 30–60px
-               是长会话里最大的隐性纵向开销，而这一档的纵向空间是拿钉住物之间的残渣换的。
-               **内容一个字不删**：出处按一下就在，只是不再默认占屏（摘要行永远带条数）。
-               展开态**受控**（`receiptOpen`，见那边的注释）：让浏览器自己翻 `open` 的话，
-               流式增量反复重渲染同一轮时会把人手动展开的那一轮打回收起。 -->
-          {#if turn.traces.length > 0}
-            <details class="rcpts" open={receiptIsOpen(turn.key)}>
-              <summary class="rcpts-sum" onclick={(e) => toggleReceipt(e, turn.key)}>
-                工位回执 <span class="dim">{turn.traces.length} 次台账查读 ▸</span>
-              </summary>
-              {#each turn.traces as trace, i (`${turn.key}-t${i}`)}
-                {@const r = receipt(trace, turn.briefing)}
-                <div class="rcpt">
-                  <div class="rcpt-head">
-                    <Sprite name={r.sprite} size={10} />
-                    <span class="nm">{r.workshop}</span>
-                    <span class="dim">{r.label}</span>
-                    <span class="dim args">{trace.args_summary}</span>
-                    <span class="rs" class:bad={!trace.ok}>{trace.ok ? '已读' : '未读到'}</span>
-                  </div>
-                </div>
-              {/each}
-            </details>
-          {/if}
+          <!-- 工位回执那一块**已经并进上面的「过程」**（决策 273）：同一件事的两个时态此前
+               分成两处画（实时的工具条 / 落地的回执表），顺序于是两边都对不上。现在工具调用
+               就是段序里的一步，落地前后同一个形状——**内容一个字不删**（工具名 / 工位 /
+               参数摘要 / 成没成，四样都在那一行上），只是不再有第二份聚合表。 -->
         </article>
       {/if}
     {/each}
@@ -2463,12 +2375,9 @@
     color: var(--stop);
   }
 
-  /* ── 正在发生的工具调用（决策 244）：与回执同一形状，靠左缘的档位说相位 ──
+  /* ── 工具调用那一步（决策 244 / 273）：与发言同一形状，靠左缘的档位说状态 ──
      正在查是静的 --pane（还没结果可看），查完点亮 --go，没查到走 --stop。
      不用动画位：全站零新增动画位这条纪律不因「实时」破例（转的那一刻就说明在查）。 */
-  .livetools {
-    margin-top: 8px;
-  }
   .rcpt.live {
     margin-top: 4px;
   }
@@ -2480,6 +2389,26 @@
   }
   .rcpt.live.bad {
     border-left-color: var(--stop);
+  }
+
+  /* ── 过程那一组（决策 273）：这一轮按发生顺序的每一步都排在里面 ──
+     工具那一步与思考那一步各自带着自己的样式，这里只管组内的间距；推理是嵌套的一层
+     折叠块（形状照旧），中途说出口的话是一小段正文。 */
+  .rcpts.process > .rcpts {
+    margin-top: 4px;
+  }
+  .narr {
+    margin-top: 6px;
+    color: var(--text);
+  }
+  .narr :global(.md) {
+    max-width: 76ch;
+  }
+
+  /* ── 收口那一句（决策 274）：markdown 渲染，宽度与时间线里的话对齐 ──
+     作用域要写 `:global`：那些节点是 `{@html}` 出来的，拿不到本组件的 scoping class。 */
+  .turn :global(.md.reply) {
+    max-width: 76ch;
   }
 
   /* ── 思考过程（决策 244）：默认收起，展开后是一段等宽正文 ──

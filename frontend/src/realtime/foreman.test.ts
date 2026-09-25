@@ -2,10 +2,9 @@ import { describe, expect, it } from 'vitest';
 import { ApiError, mapRequestError } from '../api/client';
 import type { ConversationDeltaEvent, ForemanSessionMeta, ToolEventEvent } from '../api/types';
 import { buildTurns, type TalkTurnsInput } from '../lib/talkTurns';
-import type { LedgerRow } from './foreman';
+import type { ForemanStreamState, LedgerRow } from './foreman';
 import {
-  appendForemanDelta,
-  appendForemanTool,
+  appendForemanEvent,
   beginForemanStream,
   emptyForeignActive,
   emptyForemanStream,
@@ -28,8 +27,10 @@ import {
 } from './foreman';
 
 /**
- * 值班长流式归约（票 03 的用例口径）：文本累积的顺序、收尾、断流三件事。
- * 决策 244 又加了两条声道：思考（`reasoning`）与工具调用（`tool_event`）。
+ * 值班长流式归约（票 03 的用例口径）：段序、收尾、断流三件事。
+ * 决策 244 加了两条声道（思考 `reasoning` 与工具调用 `tool_event`），
+ * 决策 273 把三条声道归成**一份按发生顺序的段序**——本文件的断言从此大多打在 `steps` 上：
+ * 顺序本身就是被测的东西，只断言「攒到了什么」会漏掉它。
  *
  * 与 `reduce.test.ts` 同一姿态的纯函数测试——不触网、不读时钟，故不需要 DOM /
  * fetch 替身就能钉住「不丢字」这条硬约束。
@@ -74,6 +75,17 @@ function toolEvent(
 /** 当前班次。增量必须带这个 id 才被接纳（决策 204⑥）。 */
 const SESSION = 'sess-1';
 
+/**
+ * 末尾那一步正文 = 「正在说的那一句」（决策 273）。
+ *
+ * 段序的末尾若是 `text`，它就是还在往外冒的回话（随后跟来工具调用就是中途的话，
+ * 收尾则被权威回话换掉）；没有正文步时是空串。这一格是**派生**的，不是 state 上的字段。
+ */
+function tailText(state: ForemanStreamState): string {
+  const last = state.steps[state.steps.length - 1];
+  return last && last.kind === 'text' ? last.text : '';
+}
+
 /** 班次列表里的一条（只填判据用到的那两列：id 与 `last_active_at`）。 */
 function meta(id: string, lastActiveAtMs: number): ForemanSessionMeta {
   return {
@@ -86,84 +98,103 @@ function meta(id: string, lastActiveAtMs: number): ForemanSessionMeta {
 }
 
 describe('foreman 流式归约', () => {
-  it('增量按到达顺序累积，且累积期间保持流式态', () => {
+  it('同一类增量并成一步，且累积期间保持流式态', () => {
     let state = beginForemanStream();
     expect(state.streaming).toBe(true);
 
-    state = appendForemanDelta(state, delta('夜班'), SESSION);
-    state = appendForemanDelta(state, delta('安静，'), SESSION);
-    state = appendForemanDelta(state, delta('没有待办。'), SESSION);
+    state = appendForemanEvent(state, delta('夜班'), SESSION);
+    state = appendForemanEvent(state, delta('安静，'), SESSION);
+    state = appendForemanEvent(state, delta('没有待办。'), SESSION);
 
-    expect(state.text).toBe('夜班安静，没有待办。');
+    expect(state.steps).toEqual([{ kind: 'text', text: '夜班安静，没有待办。' }]);
     expect(state.streaming).toBe(true);
     expect(state.error).toBeNull();
   });
 
-  it('非工头增量 / 非增量事件旁落（返回同一 state）', () => {
-    const state = appendForemanDelta(beginForemanStream(), delta('已到'), SESSION);
-    // 别的任务的增量（agent_type = main）不得拼进值班长的话里
-    expect(appendForemanDelta(state, { ...delta('别人的'), agent_type: 'main' }, SESSION)).toBe(state);
-    // 同一条流上的其它事件类型与文本无关
-    expect(
-      appendForemanDelta(
-        state,
-        {
-          type: 'tool_event',
-          task_id: '',
-          branch: '',
-          run_id: 0,
-          tool: 'read_task',
-          phase: 'end',
-          args_summary: 'x',
-        },
-        SESSION,
-      ),
-    ).toBe(state);
+  /**
+   * 这一条是决策 273 的**承重断言**：顺序本身是被看见的东西。
+   *
+   * 值班长的一轮常态是「先想 → 查台账 → 再想 → 收口」，而此前推理与工具各自攒在
+   * 一个桶里——字都在，只是「谁先谁后」没了。段序把这一步一步按发生顺序摆出来。
+   */
+  it('推理 → 工具 → 推理：段序就是它们发生的时间顺序', () => {
+    let state = beginForemanStream();
+    state = appendForemanEvent(state, { ...delta('先看看板。'), channel: 'reasoning' }, SESSION);
+    state = appendForemanEvent(state, toolEvent('read_task', 'start'), SESSION);
+    state = appendForemanEvent(state, toolEvent('read_task', 'end'), SESSION);
+    state = appendForemanEvent(state, { ...delta('t1 还在排队。'), channel: 'reasoning' }, SESSION);
+
+    expect(state.steps).toEqual([
+      { kind: 'thinking', text: '先看看板。' },
+      { kind: 'tool', tool: 'read_task', args_summary: 't-1', phase: 'end' },
+      { kind: 'thinking', text: 't1 还在排队。' },
+    ]);
   });
 
-  it('收尾：非空回话收敛为回话，并熄灭方块光标', () => {
-    const streamed = appendForemanDelta(beginForemanStream(), delta('半句'), SESSION);
+  it('一次调用里说了话再调工具：话排在工具之前（真实顺序：先说、再调）', () => {
+    let state = beginForemanStream();
+    state = appendForemanEvent(state, { ...delta('我查一下。'), channel: 'reasoning' }, SESSION);
+    state = appendForemanEvent(state, delta('先看 t1。'), SESSION);
+    state = appendForemanEvent(state, toolEvent('read_task', 'start'), SESSION);
+
+    expect(state.steps.map((step) => step.kind)).toEqual(['thinking', 'text', 'tool']);
+  });
+
+  it('非工头增量旁落（返回同一 state）', () => {
+    const state = appendForemanEvent(beginForemanStream(), delta('已到'), SESSION);
+    // 别的任务的增量（agent_type = main）不得拼进值班长的话里
+    expect(appendForemanEvent(state, { ...delta('别人的'), agent_type: 'main' }, SESSION)).toBe(
+      state,
+    );
+  });
+
+  it('收尾：权威回话换掉末尾那一步正文（段序里没收到过正文时补一步）', () => {
+    const streamed = appendForemanEvent(beginForemanStream(), delta('半句'), SESSION);
     const settled = settleForemanStream(streamed, '完整回话');
-    expect(settled.text).toBe('完整回话');
+    expect(settled.steps).toEqual([{ kind: 'text', text: '完整回话' }]);
     expect(settled.streaming).toBe(false);
     expect(settled.error).toBeNull();
+    // 断流过、一个字都没收到：权威回话自己占一步（不然它无处安放）
+    expect(settleForemanStream(emptyForemanStream(), '完整回话').steps).toEqual([
+      { kind: 'text', text: '完整回话' },
+    ]);
   });
 
   it('收尾：空 / 全空白回话不清掉已到达的文字', () => {
-    const streamed = appendForemanDelta(beginForemanStream(), delta('已到达的部分'), SESSION);
-    expect(settleForemanStream(streamed, '').text).toBe('已到达的部分');
-    expect(settleForemanStream(streamed, '   \n ').text).toBe('已到达的部分');
-    expect(settleForemanStream(streamed, null).text).toBe('已到达的部分');
+    const streamed = appendForemanEvent(beginForemanStream(), delta('已到达的部分'), SESSION);
+    expect(tailText(settleForemanStream(streamed, ''))).toBe('已到达的部分');
+    expect(tailText(settleForemanStream(streamed, '   \n '))).toBe('已到达的部分');
+    expect(tailText(settleForemanStream(streamed, null))).toBe('已到达的部分');
     // 两者皆空仍是空，不凭空造一句
-    expect(settleForemanStream(emptyForemanStream(), '').text).toBe('');
+    expect(settleForemanStream(emptyForemanStream(), '').steps).toEqual([]);
   });
 
   it('断流：已收到的部分原文保留，只多一个说明', () => {
     let state = beginForemanStream();
-    state = appendForemanDelta(state, delta('我查到 develop 工位'), SESSION);
+    state = appendForemanEvent(state, delta('我查到 develop 工位'), SESSION);
     const failed = failForemanStream(state, '连接中断');
-    expect(failed.text).toBe('我查到 develop 工位');
+    expect(tailText(failed)).toBe('我查到 develop 工位');
     expect(failed.streaming).toBe(false);
     expect(failed.error).toBe('连接中断');
   });
 
   it('班次守卫：不是当前班次的增量一律丢弃（决策 204⑥）', () => {
-    const state = appendForemanDelta(beginForemanStream(), delta('本班的话'), SESSION);
+    const state = appendForemanEvent(beginForemanStream(), delta('本班的话'), SESSION);
     // 另一台设备在另一个班次里收到的回话——不得插进这一班
-    expect(appendForemanDelta(state, delta('别班的话', 'sess-2'), SESSION)).toBe(state);
+    expect(appendForemanEvent(state, delta('别班的话', 'sess-2'), SESSION)).toBe(state);
     // 流水线的增量为空串，同样不是这一班
-    expect(appendForemanDelta(state, delta('流水线的话', ''), SESSION)).toBe(state);
+    expect(appendForemanEvent(state, delta('流水线的话', ''), SESSION)).toBe(state);
     // 没有当前班次时也一律丢弃：那种状态下屏幕上是空态，接进来会凭空长出一段话
-    expect(appendForemanDelta(beginForemanStream(), delta('先到的'), null)).toEqual(
+    expect(appendForemanEvent(beginForemanStream(), delta('先到的'), null)).toEqual(
       beginForemanStream(),
     );
-    expect(appendForemanDelta(beginForemanStream(), delta('先到的'), '')).toEqual(
+    expect(appendForemanEvent(beginForemanStream(), delta('先到的'), '')).toEqual(
       beginForemanStream(),
     );
     // 老客户端（事件里没有 session_id）与当前班次对不上，故也丢弃——宁可少拼一段字，
     // 也不让两台设备的回话混成一段
     const legacy = { ...delta('老事件'), session_id: undefined };
-    expect(appendForemanDelta(state, legacy, SESSION)).toBe(state);
+    expect(appendForemanEvent(state, legacy, SESSION)).toBe(state);
   });
 });
 
@@ -174,19 +205,19 @@ describe('foreman 流式归约', () => {
  */
 describe('foreman 流式归约（续）', () => {
   it('两个班次各说各的：两次独立累积互不影响', () => {
-    const a = appendForemanDelta(beginForemanStream(), delta('甲班', 'sess-a'), 'sess-a');
-    const b = appendForemanDelta(beginForemanStream(), delta('乙班', 'sess-b'), 'sess-b');
-    expect(a.text).toBe('甲班');
-    expect(b.text).toBe('乙班');
+    const a = appendForemanEvent(beginForemanStream(), delta('甲班', 'sess-a'), 'sess-a');
+    const b = appendForemanEvent(beginForemanStream(), delta('乙班', 'sess-b'), 'sess-b');
+    expect(tailText(a)).toBe('甲班');
+    expect(tailText(b)).toBe('乙班');
     // 切了班次之后，上一个班次迟到的尾巴进不来
-    const switched = appendForemanDelta(a, delta('甲班的尾巴', 'sess-a'), 'sess-b');
-    expect(switched.text).toBe('甲班');
+    const switched = appendForemanEvent(a, delta('甲班的尾巴', 'sess-a'), 'sess-b');
+    expect(tailText(switched)).toBe('甲班');
   });
 
-  it('开新一轮：丢掉上一轮的残留（上一轮的文字不得串进这一轮）', () => {
-    const previous = appendForemanDelta(beginForemanStream(), delta('上一轮的话'), SESSION);
-    expect(previous.text).toBe('上一轮的话');
-    expect(beginForemanStream().text).toBe('');
+  it('开新一轮：丢掉上一轮的残留（上一轮的步骤不得串进这一轮）', () => {
+    const previous = appendForemanEvent(beginForemanStream(), delta('上一轮的话'), SESSION);
+    expect(tailText(previous)).toBe('上一轮的话');
+    expect(beginForemanStream().steps).toEqual([]);
   });
 
   it('失败轮的归属：台账里新出现的那一条才算这一次（决策 211④）', () => {
@@ -256,7 +287,7 @@ describe('别的班次「正在回话」（决策 220③）', () => {
     const active = noteForeignDelta(emptyForeignActive(), delta('别班的话', 'sess-2'), SESSION, T0);
     expect(active.bySession).toEqual({ 'sess-2': T0 });
     // 同一事件在文本那一侧仍然被丢弃（两道判据各管各的）
-    expect(appendForemanDelta(beginForemanStream(), delta('别班的话', 'sess-2'), SESSION)).toEqual(
+    expect(appendForemanEvent(beginForemanStream(), delta('别班的话', 'sess-2'), SESSION)).toEqual(
       beginForemanStream(),
     );
   });
@@ -380,93 +411,113 @@ describe('别的班次「正在回话」（决策 220③）', () => {
   });
 });
 
-describe('思考与工具调用的实时声道（决策 244）', () => {
-  it('reasoning 声道进 thinking，不进回话正文', () => {
-    const state = appendForemanDelta(
+describe('思考与工具调用的实时声道（决策 244，归成段序见决策 273）', () => {
+  it('reasoning 声道进推理那一步，不进回话正文', () => {
+    const state = appendForemanEvent(
       beginForemanStream(),
       { ...delta('我要查一下'), channel: 'reasoning' },
       SESSION,
     );
-    expect(state.thinking).toBe('我要查一下');
-    expect(state.text, '思考不得混进回话正文——那是分开两条声道的全部理由').toBe('');
+    expect(state.steps).toEqual([{ kind: 'thinking', text: '我要查一下' }]);
+    expect(tailText(state), '思考不得混进回话正文——那是分开两条声道的全部理由').toBe('');
   });
 
   it('缺省声道按回话处理（老后端不发 channel 字段）', () => {
-    const state = appendForemanDelta(beginForemanStream(), delta('缺省就是回话'), SESSION);
-    expect(state.text).toBe('缺省就是回话');
-    expect(state.thinking).toBe('');
+    const state = appendForemanEvent(beginForemanStream(), delta('缺省就是回话'), SESSION);
+    expect(state.steps).toEqual([{ kind: 'text', text: '缺省就是回话' }]);
   });
 
-  it('两条声道各攒各的，互不覆盖', () => {
+  it('两条声道交错到达：各起一步，谁也不覆盖谁', () => {
     let state = beginForemanStream();
-    state = appendForemanDelta(state, { ...delta('先想'), channel: 'reasoning' }, SESSION);
-    state = appendForemanDelta(state, delta('再说'), SESSION);
-    state = appendForemanDelta(state, { ...delta('再想一点'), channel: 'reasoning' }, SESSION);
-    state = appendForemanDelta(state, delta('再多说一点'), SESSION);
-    expect(state.thinking).toBe('先想再想一点');
-    expect(state.text).toBe('再说再多说一点');
+    state = appendForemanEvent(state, { ...delta('先想'), channel: 'reasoning' }, SESSION);
+    state = appendForemanEvent(state, delta('再说'), SESSION);
+    state = appendForemanEvent(state, { ...delta('再想一点'), channel: 'reasoning' }, SESSION);
+    state = appendForemanEvent(state, delta('再多说一点'), SESSION);
+    // 同一类连着的并成一步（前两句各并了一段），换了类就另起一步——**顺序留着**
+    expect(state.steps).toEqual([
+      { kind: 'thinking', text: '先想' },
+      { kind: 'text', text: '再说' },
+      { kind: 'thinking', text: '再想一点' },
+      { kind: 'text', text: '再多说一点' },
+    ]);
   });
 
   it('工具调用：start 与随后的 end 合成一条（它不是两件事）', () => {
     let state = beginForemanStream();
-    state = appendForemanTool(state, toolEvent('read_task', 'start'), SESSION);
-    expect(state.tools).toEqual([{ tool: 'read_task', args_summary: 't-1', phase: 'start' }]);
-    state = appendForemanTool(state, toolEvent('read_task', 'end'), SESSION);
-    expect(state.tools).toEqual([{ tool: 'read_task', args_summary: 't-1', phase: 'end' }]);
+    state = appendForemanEvent(state, toolEvent('read_task', 'start'), SESSION);
+    expect(state.steps).toEqual([
+      { kind: 'tool', tool: 'read_task', args_summary: 't-1', phase: 'start' },
+    ]);
+    state = appendForemanEvent(state, toolEvent('read_task', 'end'), SESSION);
+    expect(state.steps).toEqual([
+      { kind: 'tool', tool: 'read_task', args_summary: 't-1', phase: 'end' },
+    ]);
   });
 
   it('工具调用：error 也是收尾（这一条调用到此为止）', () => {
-    let state = appendForemanTool(beginForemanStream(), toolEvent('read_file', 'start'), SESSION);
-    state = appendForemanTool(state, toolEvent('read_file', 'error'), SESSION);
-    expect(state.tools).toHaveLength(1);
-    expect(state.tools[0].phase).toBe('error');
+    let state = appendForemanEvent(beginForemanStream(), toolEvent('read_file', 'start'), SESSION);
+    state = appendForemanEvent(state, toolEvent('read_file', 'error'), SESSION);
+    expect(state.steps).toHaveLength(1);
+    expect(state.steps[0]).toMatchObject({ kind: 'tool', phase: 'error' });
   });
 
   it('工具调用：连着查两次同一把工具是两条，不是合并成一条', () => {
     // 合并的判据是「最后一条还没收尾」，不是工具名——同一轮里连查两次是常态（决策 224）
     let state = beginForemanStream();
-    state = appendForemanTool(state, toolEvent('read_task', 'start'), SESSION);
-    state = appendForemanTool(state, toolEvent('read_task', 'end'), SESSION);
-    state = appendForemanTool(state, toolEvent('read_task', 'start', SESSION, 't-2'), SESSION);
-    expect(state.tools).toHaveLength(2);
-    expect(state.tools.map((t) => t.phase)).toEqual(['end', 'start']);
-    expect(state.tools[1].args_summary).toBe('t-2');
+    state = appendForemanEvent(state, toolEvent('read_task', 'start'), SESSION);
+    state = appendForemanEvent(state, toolEvent('read_task', 'end'), SESSION);
+    state = appendForemanEvent(state, toolEvent('read_task', 'start', SESSION, 't-2'), SESSION);
+    expect(state.steps).toHaveLength(2);
+    expect(state.steps.map((step) => step.kind)).toEqual(['tool', 'tool']);
+    expect(state.steps[1]).toMatchObject({ phase: 'start', args_summary: 't-2' });
   });
 
   it('非工头工具事件旁落：流水线节点的工具调用不得进对讲台', () => {
     const state = beginForemanStream();
     // agent_type = main（流水线）
     expect(
-      appendForemanTool(state, { ...toolEvent('write_file', 'start'), agent_type: 'main' }, SESSION),
+      appendForemanEvent(
+        state,
+        { ...toolEvent('write_file', 'start'), agent_type: 'main' },
+        SESSION,
+      ),
     ).toBe(state);
     // 老后端不发 agent_type：缺省空串不等于 "foreman"，故也丢弃（认不出来就当作别人的）
     expect(
-      appendForemanTool(state, { ...toolEvent('write_file', 'start'), agent_type: undefined }, SESSION),
+      appendForemanEvent(
+        state,
+        { ...toolEvent('write_file', 'start'), agent_type: undefined },
+        SESSION,
+      ),
     ).toBe(state);
   });
 
   it('班次守卫在工具事件上同样成立（决策 204⑥）', () => {
     const state = beginForemanStream();
-    expect(appendForemanTool(state, toolEvent('read_task', 'start', 'sess-2'), SESSION)).toBe(state);
-    expect(appendForemanTool(state, toolEvent('read_task', 'start', ''), SESSION)).toBe(state);
-    expect(appendForemanTool(state, toolEvent('read_task', 'start'), null)).toBe(state);
+    expect(appendForemanEvent(state, toolEvent('read_task', 'start', 'sess-2'), SESSION)).toBe(
+      state,
+    );
+    expect(appendForemanEvent(state, toolEvent('read_task', 'start', ''), SESSION)).toBe(state);
+    expect(appendForemanEvent(state, toolEvent('read_task', 'start'), null)).toBe(state);
   });
 
-  it('收尾不清掉思考与现场（它们在台账那一行里同样有）', () => {
+  it('收尾把回话接在段序末尾，前面的步骤一步不动（它们在台账那一行里同样有）', () => {
     let state = beginForemanStream();
-    state = appendForemanDelta(state, { ...delta('想过了'), channel: 'reasoning' }, SESSION);
-    state = appendForemanTool(state, toolEvent('read_task', 'end'), SESSION);
+    state = appendForemanEvent(state, { ...delta('想过了'), channel: 'reasoning' }, SESSION);
+    state = appendForemanEvent(state, toolEvent('read_task', 'end'), SESSION);
     const settled = settleForemanStream(state, '完整回话');
-    expect(settled.text).toBe('完整回话');
-    expect(settled.thinking, '收尾是「流完了」，不是「把刚才发生的事撤掉」').toBe('想过了');
-    expect(settled.tools).toHaveLength(1);
+    expect(settled.steps, '收尾是「流完了」，不是「把刚才发生的事撤掉」').toEqual([
+      { kind: 'thinking', text: '想过了' },
+      { kind: 'tool', tool: 'read_task', args_summary: 't-1', phase: 'end' },
+      { kind: 'text', text: '完整回话' },
+    ]);
   });
 
-  it('断流同样保留思考与现场', () => {
+  it('断流同样保留已收到的步骤', () => {
     let state = beginForemanStream();
-    state = appendForemanDelta(state, { ...delta('想了半截'), channel: 'reasoning' }, SESSION);
+    state = appendForemanEvent(state, { ...delta('想了半截'), channel: 'reasoning' }, SESSION);
     const failed = failForemanStream(state, '连接中断');
-    expect(failed.thinking).toBe('想了半截');
+    expect(failed.steps).toEqual([{ kind: 'thinking', text: '想了半截' }]);
   });
 });
 
@@ -542,12 +593,12 @@ describe('跟的那一轮怎么收场：keep / settled / lost（决策 260 裁�
   it('**半截字在 lost 那一支必须留着**——`failForemanStream` 不许清字', () => {
     // 这是本组的承重断言：死轮那一支若走 `emptyForemanStream()`，半截字就没了，
     // 而「已经出现的文字任何一支都不许清掉」是本模块文件头立的纪律（票 03）。
-    const half = appendForemanDelta(beginForemanStream(), delta('说了一半就断'), SESSION);
+    const half = appendForemanEvent(beginForemanStream(), delta('说了一半就断'), SESSION);
     const outcome = resolveFollowOutcome([row(1)], 1, false);
     expect(outcome).toEqual({ kind: 'lost' });
 
     const shown = failForemanStream(half, FOREMAN_LOST_TURN_SUFFIX);
-    expect(shown.text, '半截字必须原样留着').toBe('说了一半就断');
+    expect(tailText(shown), '半截字必须原样留着').toBe('说了一半就断');
     expect(shown.error).toBe(FOREMAN_LOST_TURN_SUFFIX);
     // 而且它仍然渲染成一轮（不是从时间线上消失）
     const turns = buildTurns(inputOf({ stream: shown }));
@@ -573,7 +624,10 @@ describe('跟的那一轮怎么收场：keep / settled / lost（决策 260 裁�
  */
 describe('本地超时之后的接力：说的与做的对上（决策 260）', () => {
   it('接力时那一轮不再是「断流」——它仍在流', () => {
-    const stalled = failForemanStream(appendForemanDelta(beginForemanStream(), delta('说了一半'), SESSION), '请求超时（300 秒没有回应）。');
+    const stalled = failForemanStream(
+      appendForemanEvent(beginForemanStream(), delta('说了一半'), SESSION),
+      '请求超时（300 秒没有回应）。',
+    );
     // 本地放弃那一刻：屏幕上是「断流」
     const before = buildTurns(inputOf({ stream: stalled }));
     expect(before[0]).toMatchObject({ key: 'live', partial: true });
@@ -587,8 +641,8 @@ describe('本地超时之后的接力：说的与做的对上（决策 260）', 
   it('接力之后到达的增量照旧接得上（那一轮没断）', () => {
     let state = failForemanStream(beginForemanStream(), '请求超时（300 秒没有回应）。');
     // 「跟」这一支的闸门在组件里；这里钉的是归约本身不因 error 在场而拒绝累积
-    state = appendForemanDelta(state, delta('后台接着说的'), SESSION);
-    expect(state.text).toBe('后台接着说的');
+    state = appendForemanEvent(state, delta('后台接着说的'), SESSION);
+    expect(tailText(state)).toBe('后台接着说的');
   });
 });
 

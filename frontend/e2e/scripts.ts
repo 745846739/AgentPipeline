@@ -8,7 +8,12 @@
  */
 
 export type Step =
-  | { kind: 'tool'; name: string; args: unknown }
+  /**
+   * 一次工具调用。`reasoning`（可选）= 这次模型调用**先滴出来的推理**（决策 244 的
+   * `reasoning` 声道，装置见决策 273 的「顺序」用例）：真实的值班长在调工具之前先想，
+   * 界面上的段序因此该是「想 → 查」。不给就是此前那条形状（一条不产推理的调用）。
+   */
+  | { kind: 'tool'; name: string; args: unknown; reasoning?: string }
   | { kind: 'submit'; value: unknown }
   /**
    * 纯文本回复。`delayMs` = **先拖住这么久再回**（缺省 0）。
@@ -18,7 +23,7 @@ export type Step =
    * 那个窗口。拖住之后「在跑」变成一段可观测的时间，「刷新那一刻它还在答」才可复现。
    * 只改**何时**回，不改**回什么**（SSE 字节与 `delayMs` 无关，跨语言 fixture 不受影响）。
    */
-  | { kind: 'text'; text: string; delayMs?: number }
+  | { kind: 'text'; text: string; delayMs?: number; reasoning?: string }
   /**
    * **分几截滴出来的回话**：`parts[0]` 先写，此后每隔 `gapMs` 补一截，最后一截带 `[DONE]` 收线。
    *
@@ -36,9 +41,19 @@ export type Step =
 
 export type NodeScript = Record<string, Step[][]>;
 
-export const tool = (name: string, args: unknown): Step => ({ kind: 'tool', name, args });
+export const tool = (name: string, args: unknown, reasoning?: string): Step => ({
+  kind: 'tool',
+  name,
+  args,
+  reasoning,
+});
 export const submit = (value: unknown): Step => ({ kind: 'submit', value });
-export const text = (value: string, delayMs = 0): Step => ({ kind: 'text', text: value, delayMs });
+export const text = (value: string, delayMs = 0, reasoning?: string): Step => ({
+  kind: 'text',
+  text: value,
+  delayMs,
+  reasoning,
+});
 /** 分几截滴：`parts[0]` 先到，此后每 `gapMs` 补一截。见 {@link Step} 的那一条说明。 */
 export const drip = (parts: string[], gapMs = 4_000): Step => ({ kind: 'drip', parts, gapMs });
 

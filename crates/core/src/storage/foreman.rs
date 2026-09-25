@@ -89,6 +89,12 @@ pub struct ForemanMessage {
     pub briefing_json: Option<Value>,
     /// 该轮调用过的只读工具痕迹（票 05）。无工具调用时为 `None`。
     pub traces_json: Option<Value>,
+    /// 该轮**按发生顺序**记下的步骤序列（决策 273）。
+    ///
+    /// 与 `thinking` / `traces_json` / `content` 是同一件事的两种看法：那三列各自只剩一类
+    /// 东西（推理拼成一段、工具合成一张表、收口那句一段），**顺序丢了**；这一列保留
+    /// 「先想 → 再查 → 然后说」的原样。无任何一步时为 `None`。
+    pub segments_json: Option<Value>,
     /// 该轮的**推理 / 思考**原文（决策 244）。不产推理的模型为 `None`。
     ///
     /// **展示留痕，永不回灌**：它不是 assistant 消息的一部分，进 `transcript` 既会被
@@ -112,6 +118,9 @@ pub struct NewForemanMessage {
     pub completion_tokens: u32,
     pub briefing_json: Option<Value>,
     pub traces_json: Option<Value>,
+    /// 顺序留痕（决策 273，见 [`ForemanMessage::segments_json`]）。便捷路径都给 `None`——
+    /// 只有值班长那一轮会填它，且由 [`crate::pipeline::foreman`] 直接赋值。
+    pub segments_json: Option<Value>,
     /// 该轮的推理原文（决策 244）。构造它的两条便捷路径都给 `None`——
     /// 只有值班长那一轮会填它，且由 [`crate::pipeline::foreman`] 直接赋值。
     pub thinking: Option<String>,
@@ -131,6 +140,7 @@ impl NewForemanMessage {
             completion_tokens: 0,
             briefing_json: None,
             traces_json: None,
+            segments_json: None,
             thinking: None,
             ask_json: None,
         }
@@ -146,6 +156,7 @@ impl NewForemanMessage {
             completion_tokens: 0,
             briefing_json: None,
             traces_json: None,
+            segments_json: None,
             thinking: None,
             ask_json: None,
         }
@@ -183,6 +194,7 @@ struct ForemanMessageRow {
     completion_tokens: i64,
     briefing_json: Option<String>,
     traces_json: Option<String>,
+    segments_json: Option<String>,
     thinking: Option<String>,
     ask_json: Option<String>,
     created_at: String,
@@ -202,6 +214,7 @@ impl ForemanMessageRow {
             completion_tokens: self.completion_tokens.max(0) as u32,
             briefing_json: self.briefing_json.as_deref().map(parse_json).transpose()?,
             traces_json: self.traces_json.as_deref().map(parse_json).transpose()?,
+            segments_json: self.segments_json.as_deref().map(parse_json).transpose()?,
             thinking: self.thinking,
             ask_json: self.ask_json.as_deref().map(parse_json).transpose()?,
             created_at: parse_ts(&self.created_at)?,
@@ -216,8 +229,8 @@ fn parse_json(raw: &str) -> Result<Value> {
 }
 
 const FOREMAN_MESSAGE_COLUMNS: &str = "id, session_id, role, content, prompt_tokens, \
-                                       completion_tokens, briefing_json, traces_json, thinking, \
-                                       ask_json, created_at";
+                                       completion_tokens, briefing_json, traces_json, \
+                                       segments_json, thinking, ask_json, created_at";
 
 const FOREMAN_SESSION_COLUMNS: &str = "id, title, created_at, last_active_at, archived_at";
 
@@ -344,8 +357,8 @@ impl Store {
         let id: i64 = sqlx::query_scalar(
             "INSERT INTO kanban_foreman_messages
              (session_id, role, content, prompt_tokens, completion_tokens, briefing_json,
-              traces_json, thinking, ask_json, created_at)
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?) RETURNING id",
+              traces_json, segments_json, thinking, ask_json, created_at)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) RETURNING id",
         )
         .bind(&msg.session_id)
         .bind(&msg.role)
@@ -354,6 +367,7 @@ impl Store {
         .bind(msg.completion_tokens as i64)
         .bind(msg.briefing_json.as_ref().map(Value::to_string))
         .bind(msg.traces_json.as_ref().map(Value::to_string))
+        .bind(msg.segments_json.as_ref().map(Value::to_string))
         .bind(msg.thinking.as_deref())
         .bind(msg.ask_json.as_ref().map(Value::to_string))
         .bind(ts(now))

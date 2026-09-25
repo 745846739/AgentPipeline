@@ -193,7 +193,7 @@ function routeKey(system: string): string | null {
  * jsdom 环境下本文件顶部的 `fileURLToPath(new URL('.', import.meta.url))` 会抛
  * （`import.meta.url` 是 http 形态），node 环境下 `import.meta.url` 才是 file: 协议。
  */
-export function sseTool(name: string, args: unknown): string {
+export function sseTool(name: string, args: unknown, reasoning?: string): string {
   const chunk = {
     choices: [
       {
@@ -214,6 +214,7 @@ export function sseTool(name: string, args: unknown): string {
     ],
   };
   return (
+    (reasoning ? sseReasoning(reasoning) : '') +
     `data: ${JSON.stringify(chunk)}\n\n` +
     `data: ${JSON.stringify({ usage: { prompt_tokens: 10, completion_tokens: 5 } })}\n\n` +
     'data: [DONE]\n\n'
@@ -221,15 +222,30 @@ export function sseTool(name: string, args: unknown): string {
 }
 
 /** 一个文本步的 SSE 字节。导出理由同 {@link sseTool}（票 e2e-mock/01）。 */
-export function sseText(text: string): string {
+export function sseText(text: string, reasoning?: string): string {
   const chunk = {
     choices: [{ index: 0, delta: { role: 'assistant', content: text }, finish_reason: 'stop' }],
   };
   return (
+    (reasoning ? sseReasoning(reasoning) : '') +
     `data: ${JSON.stringify(chunk)}\n\n` +
     `data: ${JSON.stringify({ usage: { prompt_tokens: 10, completion_tokens: 5 } })}\n\n` +
     'data: [DONE]\n\n'
   );
+}
+
+/**
+ * **推理增量**（决策 244 的 `reasoning` 声道）：一个只带 `reasoning_content` 的 delta。
+ *
+ * 字段名两个都收（`openai.rs::parse_chunk`），这里用 DeepSeek / 多数兼容网关那一个。
+ * 它存在的理由：段序（决策 273）要断言的第一件事就是「想」与「查」的先后——没有这一支，
+ * e2e 里的一轮只有工具与收口，**顺序对不对看不出来**（工具的次序本来就是脚本给的）。
+ */
+function sseReasoning(text: string): string {
+  const chunk = {
+    choices: [{ index: 0, delta: { role: 'assistant', reasoning_content: text } }],
+  };
+  return `data: ${JSON.stringify(chunk)}\n\n`;
 }
 
 /**
@@ -328,14 +344,14 @@ async function startMockLlm(
         // 脚本耗尽 → 无 tool_call 的收尾响应，agent loop 自然结束（与 FakeAgent 同语义）
         out = sseText('（脚本已结束）');
       } else if (step.kind === 'tool') {
-        out = sseTool(step.name, step.args);
+        out = sseTool(step.name, step.args, step.reasoning);
       } else if (step.kind === 'submit') {
         out = sseTool('submit_metadata', step.value);
       } else if (step.kind === 'drip') {
         // 分两截滴：走下面的 `drip` 那一支（`out` 用不到，给个空串让类型收敛）
         out = '';
       } else {
-        out = sseText(step.text);
+        out = sseText(step.text, step.reasoning);
       }
       // **拖住再回**（决策 260 的用例装置）：一轮「还在跑」因此有一段可观测的窗口，
       // 「跑着的时候刷新页面」才抢得到。字节仍是上面那一份产出的，只有**何时**发出去不同。

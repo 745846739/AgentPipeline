@@ -19,6 +19,7 @@
   import { router, type Route } from './router.svelte';
   import { board } from './stores/board.svelte';
   import { taskDetail } from './stores/taskDetail.svelte';
+  import { talk } from './stores/talk.svelte';
 
   const route = $derived(router.route);
   const taskId = $derived(route.name === 'task' ? route.id : null);
@@ -54,10 +55,14 @@
 
   onMount(() => {
     void board.init();
+    // 对讲台那条 `/foreman/stream` 也是**应用级**的（决策 275）：它随 App 起、随 App 收，
+    // 不随页面来去——页面切走时它照旧收着那一轮的步骤，回来才不是「本轮之前的输出不见了」。
+    talk.init();
   });
 
   onDestroy(() => {
     board.dispose();
+    talk.dispose();
   });
 </script>
 

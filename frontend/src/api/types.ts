@@ -867,6 +867,20 @@ export interface ForemanTrace {
   ok: boolean;
 }
 
+/**
+ * 一轮里**按发生顺序**记下的一步（决策 273，`ForemanSegment` 的镜像）。
+ *
+ * 与 `ForemanTrace` / `ForemanMessage.thinking` 是同一件事的两种看法：那些是**聚合**
+ * （工具查过什么、推理说了什么），这一份保留**顺序**——「先想 → 再查 → 然后说」。
+ * 收口那一句是 `content` 列，**不在段序里**；`text` 段说的是这一轮**中途**说出口的话。
+ *
+ * 判据（哪一步是什么）由**后端**定：界面读 `kind`，不从正文里抠。
+ */
+export type ForemanSegment =
+  | { kind: 'thinking'; text: string }
+  | { kind: 'text'; text: string }
+  | { kind: 'tool'; tool: string; args_summary: string; ok: boolean };
+
 /** 一个工具的回执标签（`GET /foreman/tools`，决策 247⑤）：界面上那个中文词。 */
 export interface ForemanToolLabel {
   name: string;
@@ -958,6 +972,13 @@ export interface ForemanMessage {
   completion_tokens: number;
   briefing: ForemanBriefing | null;
   traces: ForemanTrace[] | null;
+  /**
+   * 这一轮**按发生顺序**的步骤（决策 273）。`null` = 没有任何一步（不产推理、无工具、
+   * 只收口一句），或这一行写在那一列落地之前（老行——界面由两份聚合视图兜底）。
+   *
+   * 与 `traces` / `thinking` **并存**：聚合各服务自己的消费者，段序服务时间线的顺序。
+   */
+  segments?: ForemanSegment[] | null;
   /**
    * 这一轮的**推理 / 思考**原文（决策 244）。不产推理的模型是 `null`。
    *

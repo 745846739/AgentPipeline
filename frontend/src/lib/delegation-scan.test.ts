@@ -237,30 +237,37 @@ describe('超时判据按 kind、不摸正文（票 06，决策 259 的延伸）
   });
 });
 
-describe('跟的那一轮的收场分三支（决策 260 裁决③，票 in-flight-turn 01）', () => {
+describe('跟的那一轮的收场分三支（决策 260 裁决③，票 in-flight-turn 01；收口自决策 275 起在 store）', () => {
   const talk = read('routes/Talk.svelte');
   const foreman = read('realtime/foreman.ts');
+  // 三支的收口自决策 275 起住在 store（在飞现场随页面来去，收口自然也跟着它走）；
+  // 页面只把新台账接进这一屏。扫描面因此跟着判据走——**换文件不等于放松**：
+  // 下面每条断言一字不改地要求同一个形状。
+  const store = read('stores/talk.svelte.ts');
 
   it('落地哨把收场交给纯函数，不再就地「一把梭清字」', () => {
     // 曾经的形状：`const landed = turnLanded(...) || !turn_in_flight; if (!landed) return;`
     // 然后无条件 `emptyForemanStream()`——死轮（没换行、服务端也不在跑了）恰好也走那一支，
     // 已经收到的半截字随之被清掉、那一轮从时间线上整段消失。判据收进 `resolveFollowOutcome`
     // 之后，三支各自决定「清 / 留 + 以何姿态留」。
-    expect(talk, '落地哨该按纯函数的三支分支').toContain('resolveFollowOutcome(');
-    expect(talk, '死轮那一支要留着半截字').toContain('FOREMAN_LOST_TURN_SUFFIX');
+    expect(store, '落地哨该按纯函数的三支分支').toContain('resolveFollowOutcome(');
+    expect(store, '死轮那一支要留着半截字').toContain('FOREMAN_LOST_TURN_SUFFIX');
     // 两支要显式分出来（`settled` 是兜底那一支，故它没有字面量）：
     // keep = 还在跑、什么都不动；lost = 死轮、留字 + 一句说明
-    expect(talk, '少了「继续跟」那一支').toContain("outcome.kind === 'keep'");
-    expect(talk, '少了「死轮」那一支').toContain("outcome.kind === 'lost'");
+    expect(store, '少了「继续跟」那一支').toContain("outcome.kind === 'keep'");
+    expect(store, '少了「死轮」那一支').toContain("outcome.kind === 'lost'");
     // 死轮那一支必须留字（走 failForemanStream）、且不许顺手清掉（emptyForemanStream）
-    const lostBranch = talk.slice(talk.indexOf("outcome.kind === 'lost'"));
+    const lostBranch = store.slice(store.indexOf("outcome.kind === 'lost'"));
     const lostBody = lostBranch.slice(0, lostBranch.indexOf('return;'));
     expect(lostBody, '死轮该按「保留半截字」的姿态收').toContain('failForemanStream');
     expect(lostBody, '死轮不许清字').not.toContain('emptyForemanStream');
     // 判据不许再就地写回（那两个读数各自答一半，合起来才是三支）
-    expect(talk, '落地判据不该在组件里就地进行').not.toContain(
+    expect(store, '落地判据不该就地进行').not.toContain(
       'turnLanded(payload.messages ?? [], anchor) || !payload.turn_in_flight',
     );
+    // 页面只**接线**：收口这件事走 store 的同一个入口（页面里不许再自己判一遍三支）
+    expect(talk, '页面该把收口交给 store').toContain('talk.syncFollowing(payload)');
+    expect(talk, '页面里不该再自己算三支').not.toContain("outcome.kind === 'lost'");
   });
 
   it('三支的判据与文案住在纯函数模块里（可单测、不触 DOM）', () => {

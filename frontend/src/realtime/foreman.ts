@@ -2,119 +2,132 @@ import { ApiError, KIND_REQUEST_TIMEOUT } from '../api/client';
 import type { ForemanMessage, ForemanSessionMeta, SseEvent } from '../api/types';
 
 /**
- * 值班长流式归约（票 03）：与 `reduce.ts` 同一姿态的纯函数——不触网、不读时钟、不改入参。
+ * 值班长流式归约（票 03 / 决策 244 / 273）：与 `reduce.ts` 同一姿态的纯函数——
+ * 不触网、不读时钟、不改入参。
  *
  * 一段回话由两类事实拼成：SSE 增量（先到、可能中途断）与 POST 的权威回话（后到、完整）。
- * 两者的合并规则收在这里，界面只渲染 `text` + `streaming`；断流时 `text` 就是
- * 「已经出现的文字」，任何一支都不许把它清掉。
+ * 两者的合并规则收在这里，界面只渲染 `steps` + `streaming`；断流时 `steps` 就是
+ * 「已经发生过、已经出现过的那些」，任何一支都不许把它们清掉。
  */
 
 /** 工头事件的 `agent_type`（`crates/core/src/pipeline/foreman.rs::FOREMAN_AGENT_TYPE` 的镜像）。 */
 export const FOREMAN_AGENT_TYPE = 'foreman';
 
 export interface ForemanStreamState {
-  /** 本轮已到达的流式文本。 */
-  text: string;
   /**
-   * 本轮已到达的**推理 / 思考**文本（决策 244）。
+   * 本轮已到达的**一步一步，按发生顺序**（决策 273）。
    *
-   * 与 `text` 分开攒：合成一段之后界面分不出哪一段该当回话念、哪一段该收进折叠块。
-   * 收尾（`settleForemanStream`）时它**不清空**——回话的权威值由台账给，而这一轮的
-   * 思考在台账那一行里同样有（`thinking` 列），两边说的是同一件事。
+   * 三段合一：推理、中途说出口的话、工具调用各是一步（`ForemanLiveStep`）。此前它们是
+   * 三个各自累积的桶（`text` / `thinking` / `tools`）——字都在，**顺序丢了**，界面于是答不出
+   * 「先想了什么、再查了什么、然后说了什么」，而那正是用户报的毛病。
+   *
+   * **末尾若是 `text`，它就是「正在说的那一句」**（还没落定的回话）：随后跟来工具调用就是说
+   * 它是中途的话，跟来收尾就是它就是回话。判据在 `lib/talkTurns.ts::buildTurns`，这里只攒。
    */
-  thinking: string;
-  /** 本轮已在发生的工具调用（决策 244），按到达顺序。 */
-  tools: ForemanLiveTool[];
+  steps: ForemanLiveStep[];
   /** 是否仍在流：只有 `true` 才渲染既有方块光标（`.streaming`，不新增动画位）。 */
   streaming: boolean;
-  /** 断流 / 出错说明；非空时 `text` 照常显示（降级为一次性显示已收到的部分）。 */
+  /** 断流 / 出错说明；非空时 `steps` 照常显示（降级为一次性显示已收到的部分）。 */
   error: string | null;
 }
 
 /**
- * 一次工具调用在流里的现场（决策 244）。
+ * 在飞轮里的一步（决策 244 / 273）。
  *
- * `phase` 是**那一刻**的状态：同一把工具先 `start`（正在查）后 `end`（查到了）/
- * `error`（没查到），两次事件合成**一条**，而不是两条——它是一件正在发生的事，
- * 不是一个又一个独立事件。判据见 {@link appendForemanTool}。
+ * 与落地的 {@link import('../api/types').ForemanSegment} **同一形状**，只多一处：工具那一步
+ * 带的是**相位**（`start` → `end`/`error`）——它说的是「此刻在查什么」，落地之后由段序里
+ * 的 `ok` 接管（那时问的是「这一轮查成了没有」）。两者的唯一消费者都在
+ * `lib/talkTurns.ts`，那里把它们归成同一个渲染形状。
  */
-export interface ForemanLiveTool {
-  tool: string;
-  args_summary: string;
-  phase: 'start' | 'end' | 'error';
-}
+export type ForemanLiveStep =
+  | { kind: 'thinking'; text: string }
+  | { kind: 'text'; text: string }
+  | { kind: 'tool'; tool: string; args_summary: string; phase: 'start' | 'end' | 'error' };
 
 export function emptyForemanStream(): ForemanStreamState {
-  return { text: '', thinking: '', tools: [], streaming: false, error: null };
+  return { steps: [], streaming: false, error: null };
 }
 
 /** 开一轮新回话：丢掉上一轮的残留，点亮方块光标。 */
 export function beginForemanStream(): ForemanStreamState {
-  return { text: '', thinking: '', tools: [], streaming: true, error: null };
+  return { steps: [], streaming: true, error: null };
 }
 
 /**
- * 增量累积。
+ * 一步到达：按**声道的种类**决定它接在谁后面（决策 244 / 273）。
+ *
+ * 同一类连续到达就并进末尾那一步（推理与正文都是逐块滴出来的），换了种类就**另起一步**
+ * ——那正是「顺序」本身：一段推理、一次工具、又一段推理，各是各的位置。
+ */
+function appendStep(
+  steps: ForemanLiveStep[],
+  kind: 'thinking' | 'text',
+  text: string,
+): ForemanLiveStep[] {
+  const last = steps[steps.length - 1];
+  return last && last.kind === kind
+    ? [...steps.slice(0, -1), { ...last, text: last.text + text }]
+    : [...steps, { kind, text }];
+}
+
+/**
+ * 一次工具事件：`start` 与随后的 `end`（或 `error`）合成**一条**现场记录（决策 244）。
+ *
+ * 不合并的话，一次 `read_task` 会在时间线上留两个「正在查」——而它其实是一次调用。
+ * **合并的判据是「最后一条还没收尾」**：值班长的工具调用是一条一条顺序执行的
+ * （`run_tool` 在 for 循环里 await），故「最后一步仍处于 `start`」就是「这一次调用在等结果」。
+ * 用工具名配对是不够的：同一轮里连着查两次 `read_task` 是常态。
+ */
+function appendToolStep(steps: ForemanLiveStep[], live: ForemanLiveStep): ForemanLiveStep[] {
+  const last = steps[steps.length - 1];
+  const openCall = last && last.kind === 'tool' && last.phase === 'start';
+  return openCall ? [...steps.slice(0, -1), live] : [...steps, live];
+}
+
+/**
+ * 一个流事件（增量或工具调用）落进这一轮的步序（票 03 / 决策 244 / 273）。
  *
  * 三道判定都不能省：
  *
- * 1. **身份**——只认工头自己的对话增量。`/foreman/stream` 与任务流共用一条总线
+ * 1. **类型**——只认对话增量与工具事件；
+ * 2. **身份**——只认工头自己的事件。`/foreman/stream` 与任务流共用一条总线
  *    （决策 182⑥），漏判就会把别的任务的增量拼进值班长的话里；
- * 2. **声道**（决策 244）——`reasoning` 进 `thinking`，其余（含缺省）进 `text`。
- *    缺省按 `content` 处理：老后端不发这个字段，那正是它此前唯一见过的形状；
  * 3. **班次**（决策 204⑥）——`/foreman/stream` 把所有工头增量广播给所有订阅者，
  *    而**同一台机器上可以多处同时说话**（手机 + 电脑，配对令牌正是为此存在）。
- *    增量与当前班次不符时丢弃：否则手机上那一班的回话会插进电脑这一班的话里。
+ *    事件与当前班次不符时丢弃：否则手机上那一班的回话会插进电脑这一班的话里。
  *    `sessionId` 为空（还没有当前班次）时同样丢弃——那种状态下屏幕上是空态，
  *    没有「属于哪一班」这一说，接进来只会凭空长出一段不属于任何班次的话。
+ *
+ * 种类（决策 244）：`reasoning` 声道进推理那一步，其余（含缺省）进正文那一步
+ * ——缺省按 `content` 处理：老后端不发这个字段，那正是它此前唯一见过的形状。
  */
-export function appendForemanDelta(
+export function appendForemanEvent(
   state: ForemanStreamState,
   event: SseEvent,
   sessionId: string | null,
 ): ForemanStreamState {
-  if (event.type !== 'conversation_delta' || event.agent_type !== FOREMAN_AGENT_TYPE) return state;
+  const isChatter = event.type === 'conversation_delta' || event.type === 'tool_event';
+  if (!isChatter || event.agent_type !== FOREMAN_AGENT_TYPE) return state;
   if (!sessionId || event.session_id !== sessionId) return state;
-  return event.channel === 'reasoning'
-    ? { ...state, thinking: state.thinking + event.text }
-    : { ...state, text: state.text + event.text };
-}
-
-/**
- * 工具调用事件累积（决策 244）——诉求里「工具调用也实时展示」那一半。
- *
- * 三处判据与 {@link appendForemanDelta} 同源（类型 / 身份 / 班次），只多一条**相位合并**：
- * 同一把工具的 `start` 与随后的 `end`（或 `error`）合成**一条**现场记录。不合并的话，
- * 一次 `read_task` 会在时间线上留两个「正在查」——而它其实是一次调用。
- *
- * **合并的判据是「最后一条还没收尾」**：值班长的工具调用是一条一条顺序执行的
- * （`run_tool` 在 for 循环里 await），故「最后一条仍处于 `start`」就是「这一次调用在等结果」。
- * 用工具名配对是不够的：同一轮里连着查两次 `read_task` 是常态。
- */
-export function appendForemanTool(
-  state: ForemanStreamState,
-  event: SseEvent,
-  sessionId: string | null,
-): ForemanStreamState {
-  if (event.type !== 'tool_event' || event.agent_type !== FOREMAN_AGENT_TYPE) return state;
-  if (!sessionId || event.session_id !== sessionId) return state;
-  const live: ForemanLiveTool = {
-    tool: event.tool,
-    args_summary: event.args_summary,
-    phase: event.phase,
+  if (event.type === 'tool_event') {
+    const live: ForemanLiveStep = {
+      kind: 'tool',
+      tool: event.tool,
+      args_summary: event.args_summary,
+      phase: event.phase,
+    };
+    return { ...state, steps: appendToolStep(state.steps, live) };
+  }
+  return {
+    ...state,
+    steps: appendStep(state.steps, event.channel === 'reasoning' ? 'thinking' : 'text', event.text),
   };
-  const last = state.tools[state.tools.length - 1];
-  const tools =
-    last && last.phase === 'start'
-      ? [...state.tools.slice(0, -1), { ...last, phase: live.phase }]
-      : [...state.tools, live];
-  return { ...state, tools };
 }
 
 /**
  * 「别的班次正在回话」的映射（决策 220③）。
  *
- * 这一份与 `appendForemanDelta` 是**同一件事的两半**：那个字段（`session_id`）此前只被用来
+ * 这一份与 `appendForemanEvent` 是**同一件事的两半**：那个字段（`session_id`）此前只被用来
  * 「丢掉不匹配的增量」——等于把「别的班次正在回话」这条事实白扔了。现在丢掉还是丢掉
  * （串台必须挡），但**先把它记下来**：⋯ 的班次列表靠它点亮「正在回话」那枚标记。
  *
@@ -149,7 +162,7 @@ export function emptyForeignActive(): ForeignActive {
 /**
  * 收到一条增量：是**别的**班次的工头增量就点亮它。
  *
- * 三条过滤与 {@link appendForemanDelta} 同源（类型 / `agent_type` / 空 `session_id`），
+ * 三条过滤与 {@link appendForemanEvent} 同源（类型 / `agent_type` / 空 `session_id`），
  * 只把「与当前班次不符」从「丢弃」改成「记下来」。当前班次的那一份**不进这张表**：它由
  * 「本机发出且未落地」（`sending`）那一支说——两条路说的是同一件事，别记两遍。
  */
@@ -229,33 +242,35 @@ export function pruneForeignActive(
  * **空 / 全空白的回话不得覆盖已到达的文字**——那种回话只说明「这一轮没有新内容」，
  * 拿它收敛会把用户已经看到的字擦掉（票 03：不丢已经出现的文字）。
  *
- * **`thinking` 与 `tools` 原样留着**（决策 244）：回话的权威值由台账给，而这两样在
- * 台账那一行里同样有（`thinking` 列与 `traces`）。收尾是「这一轮流完了」，不是
- * 「把刚才发生的事撤掉」——清掉的话，人在重取台账前的那一段会看到思考与工具调用
- * 突然消失。它们随后由台账那一行接管（同一份内容，多一个来源不算脏）。
+ * 收敛的落点是**末尾那一步正文**（决策 273）：流上逐块滴出来的那段字就是这一轮的收口话，
+ * 权威值到了就换掉它；段序里其余各步（推理 / 工具 / 中途说过的话）**原样留着**——回话的
+ * 权威值由台账给，而那些步骤在台账那一行里同样有（`segments` / `thinking` / `traces`）。
+ * 收尾是「这一轮流完了」，不是「把刚才发生的事撤掉」：清掉的话，人在重取台账前的那一段
+ * 会看到思考与工具调用突然消失。
+ *
+ * 流上一个字都没收到（断流、或后端没发增量）时**补一步**正文：权威值本身也要有位置。
  */
 export function settleForemanStream(
   state: ForemanStreamState,
   reply: string | null,
 ): ForemanStreamState {
+  if (!reply || !reply.trim()) return { ...state, streaming: false, error: null };
+  const steps = state.steps;
+  const last = steps[steps.length - 1];
+  const settled: ForemanLiveStep = { kind: 'text', text: reply };
   return {
-    text: reply && reply.trim() ? reply : state.text,
-    thinking: state.thinking,
-    tools: state.tools,
+    steps:
+      last && last.kind === 'text'
+        ? [...steps.slice(0, -1), settled]
+        : [...steps, settled],
     streaming: false,
     error: null,
   };
 }
 
-/** 断流 / 出错：保留已到达的文字与现场，只落一个说明（不整轮消失）。 */
+/** 断流 / 出错：保留已到达的步骤与现场，只落一个说明（不整轮消失）。 */
 export function failForemanStream(state: ForemanStreamState, message: string): ForemanStreamState {
-  return {
-    text: state.text,
-    thinking: state.thinking,
-    tools: state.tools,
-    streaming: false,
-    error: message,
-  };
+  return { ...state, streaming: false, error: message };
 }
 
 /**

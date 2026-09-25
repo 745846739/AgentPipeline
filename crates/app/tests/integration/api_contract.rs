@@ -6620,6 +6620,78 @@ async fn an_ask_row_carries_its_options_on_the_wire() {
     );
 }
 
+/// 一轮的**步骤顺序**随消息下发（决策 273）：每条消息恒有 `segments` 键（没有就是 null），
+/// 带工具痕迹的那一行带出段序本身。
+///
+/// 断言打在线上形态而不是库里：`segments_json` 是落库那一份，而下发要回答的是「界面拿到
+/// 的是什么」——与 `traces` / `thinking` 同一条口径（原样带出去，不在后端截断），故这里
+/// 断的就是「顺序与种类原样过线」，界面不二次拼装。
+#[tokio::test]
+async fn the_session_wire_carries_the_ordered_segments_of_a_turn() {
+    let api = api_with_foreman(FakeAgent::new(Script::new())).await;
+    let sid = fresh_session(&api).await;
+    let store = &api.state.store;
+
+    store
+        .append_foreman_user_message(&sid, "t1 怎么样了？")
+        .await
+        .unwrap();
+    store
+        .append_foreman_message(NewForemanMessage {
+            segments_json: Some(json!([
+                {"kind": "thinking", "text": "先看台账。"},
+                {"kind": "tool", "tool": "read_task",
+                 "args_summary": "{\"task_id\":\"t1\"}", "ok": true},
+                {"kind": "thinking", "text": "再核一遍。"},
+            ])),
+            ..NewForemanMessage::assistant(&sid, "t1 还在排队。")
+        })
+        .await
+        .unwrap();
+    store
+        .append_foreman_message(NewForemanMessage::assistant(&sid, "（没有步骤的一轮）"))
+        .await
+        .unwrap();
+
+    let (status, body) = get(&api, &format!("/foreman/session?session={sid}")).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let messages = body["messages"].as_array().unwrap();
+    // 加性字段：每条消息都有这个键（老客户端解析不受影响），没有步骤就是 null。
+    assert!(
+        messages.iter().all(|m| m.get("segments").is_some()),
+        "每条消息都该有 segments 键：{body}"
+    );
+    assert!(
+        messages[1]["segments"].is_array(),
+        "带工具痕迹的那一行要带出段序：{}",
+        messages[1]
+    );
+    let kinds: Vec<&str> = messages[1]["segments"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|s| s["kind"].as_str().unwrap())
+        .collect();
+    assert_eq!(
+        kinds,
+        vec!["thinking", "tool", "thinking"],
+        "顺序与种类原样过线：{}",
+        messages[1]
+    );
+    assert_eq!(messages[1]["segments"][1]["tool"], "read_task", "{body}");
+    assert_eq!(messages[1]["segments"][1]["ok"], json!(true), "{body}");
+    assert!(
+        messages[0]["segments"].is_null(),
+        "用户行没有段序（那一列只有值班长那一轮会填）：{}",
+        messages[0]
+    );
+    assert!(
+        messages[2]["segments"].is_null(),
+        "无步骤的一轮是 null，不是空数组：{}",
+        messages[2]
+    );
+}
+
 /// 回话里的归因类别**由后端解析后随消息下发**（决策 235 / 238）。
 ///
 /// 为什么断言打在线上形态而不是正文：结构块住在回话文本里，但**解析点只有一处**

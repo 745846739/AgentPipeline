@@ -1083,6 +1083,22 @@ pub struct ForemanTrace {
     pub ok: bool,
 }
 
+/// 一轮里**按发生顺序**记下的一步（决策 273）。
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum ForemanSegment {
+    /// 一次模型调用的推理原文。
+    Thinking { text: String },
+    /// 这一轮**中途**说出口的话（收口那一句是 `content` 列，不在段序里）。
+    Text { text: String },
+    /// 一次工具调用（含它成没成）。
+    Tool {
+        tool: String,
+        args_summary: String,
+        ok: bool,
+    },
+}
+
 /// 一次回话的结果。
 #[derive(Debug, Clone)]
 pub struct ForemanTurn {
@@ -1665,6 +1681,11 @@ impl ForemanRunner {
         let tool_defs = Self::tool_defs(&available);
         let mut tokens = (0u32, 0u32);
         let mut traces: Vec<ForemanTrace> = Vec::new();
+        // 这一轮**按发生顺序**的步骤（决策 273）。
+        // 上面三份（`thinking` / `traces_json` / `content`）都是聚合视图，各自只剩一类东西；
+        // 顺序一丢，界面就答不出「先想了什么、再查了什么、然后说了什么」。故另记一份段序，
+        // 与聚合列并存——聚合列照旧服务各自的消费者，段序服务时间线。
+        let mut segments: Vec<ForemanSegment> = Vec::new();
         let mut reply: Option<String> = None;
         // 这一轮里各次模型调用产出的推理原文，按顺序拼起来（决策 244）。
         // **跨轮累积**：一轮可能调用模型好几次（先思考再查台账再收口），而界面上那条
@@ -1715,6 +1736,11 @@ impl ForemanRunner {
                     thinking.push_str("\n\n");
                 }
                 thinking.push_str(thought);
+                // 段序里它就在这次调用的位置上（决策 273）：聚合的 `thinking` 装得下原文，
+                // 装不下「它是在哪次工具调用之前想的」。
+                segments.push(ForemanSegment::Thinking {
+                    text: thought.to_string(),
+                });
             }
             transcript.push(Message::assistant(
                 response.content.clone(),
@@ -1736,6 +1762,20 @@ impl ForemanRunner {
                 }
                 break;
             }
+            // 走到这里说明这次调用**带工具调用**，故它说出口的正文是「中途的话」而不是
+            // 收口那一句（收口那句由 `content` 列承载，见下面 `reply` 的赋值）——决策 273。
+            // 判据与 `last_text` 同一姿态（trim 后判空）：两处认的是同一件事。
+            // 顺序上它排在这批工具之前：真实发生的就是先说话、再调工具。
+            if let Some(text) = response
+                .content
+                .as_deref()
+                .map(str::trim)
+                .filter(|t| !t.is_empty())
+            {
+                segments.push(ForemanSegment::Text {
+                    text: text.to_string(),
+                });
+            }
             for call in &response.tool_calls {
                 let args_summary = summarize_args(&call.arguments);
                 // 工具调用**当场**推给界面（决策 244）：落库的 `traces_json` 要等到这一轮
@@ -1754,6 +1794,13 @@ impl ForemanRunner {
                     if ok { ToolPhase::End } else { ToolPhase::Error },
                     &args_summary,
                 );
+                // 同一个工具事件在两处各记一份（决策 273）：`traces` 是「查过什么」的聚合，
+                // `segments` 要的是它在整轮里的**位置**。摘要先给段序，再交给聚合那一份。
+                segments.push(ForemanSegment::Tool {
+                    tool: call.name.clone(),
+                    args_summary: args_summary.clone(),
+                    ok,
+                });
                 traces.push(ForemanTrace {
                     tool: call.name.clone(),
                     args_summary,
@@ -1770,6 +1817,18 @@ impl ForemanRunner {
             Some(reply) => reply,
             None if last_text.is_some() && empty_replies == 0 => {
                 let partial = last_text.unwrap_or_default();
+                // 这段文字此前已作为 `Text` 段落进过段序（它正是随工具调用一起说出口的
+                // 「中途的话」，决策 233②），而现在它被拼成**收口的那一句**落进 `content`
+                // 列——收口的话不在段序里（决策 273），故把它从段序尾部弹掉。
+                // 只弹**尾部且内容一致**的那一段：它就是这句话本尊；内容不符说明段序里的是
+                // 另一次说话，错弹会把「中途说过什么」抹掉，那比多留一段更坏。
+                let closes_with_the_same_text = matches!(
+                    segments.last(),
+                    Some(ForemanSegment::Text { text }) if text == &partial
+                );
+                if closes_with_the_same_text {
+                    segments.pop();
+                }
                 tracing::warn!(
                     limit = round_limit,
                     "值班长触到轮数上限：部分结论落库并标注（决策 233②）"
@@ -1807,6 +1866,13 @@ impl ForemanRunner {
             None
         } else {
             Some(serde_json::to_value(&traces)?)
+        };
+        // 顺序留痕（决策 273）：与 `traces_json` 同一口径——没有任何一步时存 `None`。
+        // 「这一轮什么都没记下」与「记下了一个空序列」是两件事：前者下发时该是 null。
+        let segments_json = if segments.is_empty() {
+            None
+        } else {
+            Some(serde_json::to_value(&segments)?)
         };
         // 播报的标记由**后端**加，而模型会从历史里学会自己写一份（2026-09-25 实测：库里存成
         // 「【值守播报】【值守播报】**无需你处置。**…」）。故这里先剥一遍，再判静默、再加——
@@ -1864,6 +1930,9 @@ impl ForemanRunner {
                 completion_tokens: tokens.1,
                 briefing_json: Some(briefing_json),
                 traces_json,
+                // 顺序留痕（决策 273）：与上面两份聚合列并存——聚合各服务自己的消费者，
+                // 段序给时间线（先想了什么、再查了什么、然后说了什么）。
+                segments_json,
                 // 空串存 `None`（不存空文本）：与 `briefing_json` / `traces_json` 同一条
                 // 口径——「没有」与「有但是空的」是两件事，前者该在下发时是 null。
                 thinking: (!thinking.trim().is_empty()).then_some(thinking),

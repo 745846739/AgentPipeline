@@ -2,10 +2,11 @@ import type {
   ForemanAsk,
   ForemanBriefing,
   ForemanProposal,
+  ForemanSegment,
   ForemanSession,
   ForemanTrace,
 } from '../api/types';
-import type { ForemanLiveTool, ForemanStreamState } from '../realtime/foreman';
+import type { ForemanLiveStep, ForemanStreamState } from '../realtime/foreman';
 
 /**
  * 对讲台时间线的回合构造（票 02；决策 251 的三块判断之一）。判断全在这里，
@@ -44,6 +45,7 @@ export interface TurnView {
    * 操作台是第三种。
    */
   kind: 'fm' | 'mine' | 'failed' | 'proposal' | 'console' | 'ask';
+  /** 这一轮的**收口话**（live 轮是正在说的那一句）。 */
   content: string;
   /** 排进时间线的时刻（RFC3339）。三种在途轮（乐观轮 / 流式轮 / 失败轮）没有它，恒在末尾。 */
   at: string;
@@ -51,22 +53,15 @@ export interface TurnView {
   streaming: boolean;
   /** 断流/出错：这一轮只有已收到的部分。 */
   partial: boolean;
-  /** 该轮工具痕迹（台账查读），空数组 = 这一轮没翻台账。 */
-  traces: ForemanTrace[];
   /**
-   * 这一轮的**推理 / 思考**原文（决策 244）。`null` = 这一轮没产推理（多数模型如此）。
+   * 这一轮**按发生顺序**的步骤（决策 273）：推理、中途说出口的话、工具调用。
    *
-   * 两种来源：在途轮来自实时流（`stream.thinking`），落地轮来自台账那一行的
-   * `thinking` 列——**同一份内容的两个时态**，界面只渲染它，不关心哪来的。
+   * 三种来源归成同一个渲染形状（判断全在这里，模板只按序画）：
+   * 落地轮读那一行的 `segments`（老行没有它，由 `thinking` + `traces` 两份聚合兜底）；
+   * 在飞轮读流上的 {@link ForemanLiveStep}。
+   * **收口那一句不在里面**——它是 {@link TurnView.content}，恒排在各步之后。
    */
-  thinking: string | null;
-  /**
-   * 这一轮**正在发生**的工具调用（决策 244，只在途轮非空）。
-   *
-   * 与 `traces`（落库那一份）分工：`traces` 说「这一轮查过什么」（轮次结束后才有），
-   * 这里说「此刻在查什么」。落地之后这一栏就空了——那时 `traces` 已经把同一件事说完。
-   */
-  liveTools: ForemanLiveTool[];
+  steps: TurnStep[];
   briefing: ForemanBriefing | null;
   /** 失败原因是「这台设备还没配对」（票 07；判据是后端给的 `kind`，决策 259）：只有它会挂配对入口。 */
   needsPairing: boolean;
@@ -100,6 +95,125 @@ export interface TurnView {
    * 当成一项判据）。界面只渲染这一个词，不显示稳定标识、也不显示原因（那是排查面）。
    */
   attribution: string | null;
+}
+
+/**
+ * 时间线上的**一步**（决策 273 的渲染形状）：三类步骤归成一个形状。
+ *
+ * 归并的理由是模板只该按序画：推理那一步与工具那一步在数据上本是两种东西
+ * （一份文本 / 一次调用），而在时间线上它们是同一件事的两种样子——「这一轮里发生过的事」。
+ */
+export interface TurnStep {
+  /** 渲染键（`<每个列表项>` 唯一的那个），由本模块按段序编号。 */
+  key: string;
+  kind: 'thinking' | 'text' | 'tool';
+  /** 推理 / 中途那句话的原文；工具那一步是空串。 */
+  text: string;
+  /** 工具那一步的现场（其余步为 `null`）。 */
+  tool: { name: string; argsSummary: string; state: 'running' | 'ok' | 'bad' } | null;
+  /**
+   * 这一步**正在攒**（在飞轮的末尾那一步）：推理的摘要因此写「正在想…」。
+   * 落地轮恒假——落地那一行里每一步都已经收场了。
+   */
+  live: boolean;
+}
+
+/** 未编号的一步（{@link keyed} 补上 key）。 */
+type StepDraft = Omit<TurnStep, 'key'>;
+
+/** 给段序补上渲染键：本模块按段序编号，模板不自己数。 */
+function keyed(steps: StepDraft[], turnKey: string): TurnStep[] {
+  return steps.map((s, i) => ({ ...s, key: `${turnKey}-s${i}` }));
+}
+
+/** 落地段序里的一步（决策 273）。工具那一步落库时只有「成没成」，没有相位。 */
+function stepFromSegment(seg: ForemanSegment): StepDraft {
+  switch (seg.kind) {
+    case 'thinking':
+      return { kind: 'thinking', text: seg.text, tool: null, live: false };
+    case 'text':
+      return { kind: 'text', text: seg.text, tool: null, live: false };
+    default:
+      return {
+        kind: 'tool',
+        text: '',
+        tool: {
+          name: seg.tool,
+          argsSummary: seg.args_summary,
+          state: seg.ok ? 'ok' : 'bad',
+        },
+        live: false,
+      };
+  }
+}
+
+/** 工具痕迹（聚合视图那一份）→ 一步。老行走这条兜底。 */
+function stepFromTrace(trace: ForemanTrace): StepDraft {
+  return {
+    kind: 'tool',
+    text: '',
+    tool: { name: trace.tool, argsSummary: trace.args_summary, state: trace.ok ? 'ok' : 'bad' },
+    live: false,
+  };
+}
+
+/**
+ * 落地轮的一步步（决策 273）。
+ *
+ * **段序在就走段序**（顺序是它存在的全部理由）；不在（老行——那一列落地之前写下的）时由
+ * 两份聚合视图兜底：推理整段在前、工具在后。兜底能给的只有这个次序：中途说过的话在那两列
+ * 里根本没有（它此前也不显示），而「先想后查」比「话在前、过程在后」更接近真实。
+ */
+function landedSteps(m: { segments?: ForemanSegment[] | null; thinking?: string | null;
+  traces: ForemanTrace[] | null }): StepDraft[] {
+  const wire = m.segments ?? [];
+  if (wire.length > 0) return wire.map(stepFromSegment);
+  const out: StepDraft[] = [];
+  if (m.thinking?.trim()) {
+    out.push({ kind: 'thinking', text: m.thinking, tool: null, live: false });
+  }
+  for (const t of m.traces ?? []) out.push(stepFromTrace(t));
+  return out;
+}
+
+/** 在飞轮的一步（流上那一份）。 */
+function stepFromLive(step: ForemanLiveStep): StepDraft {
+  switch (step.kind) {
+    case 'thinking':
+      return { kind: 'thinking', text: step.text, tool: null, live: false };
+    case 'text':
+      return { kind: 'text', text: step.text, tool: null, live: false };
+    default:
+      return {
+        kind: 'tool',
+        text: '',
+        tool: {
+          name: step.tool,
+          argsSummary: step.args_summary,
+          // 相位 → 三态：正在查 / 查到了 / 没查到（落库那一份由 `ok` 给同一份读数）。
+          state: step.phase === 'start' ? 'running' : step.phase === 'error' ? 'bad' : 'ok',
+        },
+        live: false,
+      };
+  }
+}
+
+/**
+ * 在飞轮的段序与「正在说的那一句」（决策 273）。
+ *
+ * **末尾那一步正文不是步骤，是回话**：它此刻正在往外冒，收尾时会被权威回话（POST 的
+ * `reply` / 台账那一行）换掉；而被一次工具调用打断时，它就落定成「中途说的话」——
+ * 那正是同一份数据在两个时态下的样子，判据只在这一个函数里，模板不猜。
+ */
+function liveSteps(stream: ForemanStreamState): { steps: StepDraft[]; reply: string } {
+  const all = stream.steps.map(stepFromLive);
+  const last = all[all.length - 1];
+  const reply = last && last.kind === 'text' ? last.text : '';
+  const steps = reply ? all.slice(0, -1) : all;
+  // 末尾那一步是**正在攒**的那一步（流还在动）：推理的摘要因此说「正在想…」。
+  const tail = steps[steps.length - 1];
+  if (stream.streaming && tail) steps[steps.length - 1] = { ...tail, live: true };
+  return { steps, reply };
 }
 
 /** {@link buildTurns} 的四个响应式输入加一个回调——全都是平凡值，组件原样传入。 */
@@ -152,10 +266,8 @@ export function buildTurns(input: TalkTurnsInput): TurnView[] {
       at: m.created_at,
       streaming: false,
       partial: false,
-      traces: m.traces ?? [],
-      // 推理留痕（决策 244）：空串与 null 都当作「这一轮没产推理」，界面不渲染那一块。
-      thinking: m.thinking?.trim() ? m.thinking : null,
-      liveTools: [],
+      // 段序（决策 273）：落地那一行的 segments 是权威；老行由两份聚合视图兜底。
+      steps: keyed(landedSteps(m), `m${m.id}`),
       briefing: m.briefing,
       needsPairing: false,
       proposal: null,
@@ -180,9 +292,7 @@ export function buildTurns(input: TalkTurnsInput): TurnView[] {
         at: p.created_at,
         streaming: false,
         partial: false,
-        traces: [],
-        thinking: null,
-        liveTools: [],
+        steps: [],
         briefing: null,
         needsPairing: false,
         proposal: p,
@@ -203,9 +313,7 @@ export function buildTurns(input: TalkTurnsInput): TurnView[] {
       at: '',
       streaming: false,
       partial: false,
-      traces: [],
-      thinking: null,
-      liveTools: [],
+      steps: [],
       briefing: null,
       needsPairing: false,
       proposal: null,
@@ -215,18 +323,17 @@ export function buildTurns(input: TalkTurnsInput): TurnView[] {
       attribution: null,
     });
   }
-  if (sending || following || stream.text) {
+  if (sending || following || stream.steps.length > 0) {
+    const live = liveSteps(stream);
     out.push({
       key: 'live',
       kind: 'fm',
       // 还没收到第一个增量时不摆空白：给一句"对面在动"的实情，光标说明还在流
-      content: stream.text || '值班长正在查台账…',
+      content: live.reply || '值班长正在查台账…',
       at: '',
       streaming: stream.streaming,
-      partial: !stream.streaming && stream.text.length > 0,
-      traces: [],
-      thinking: stream.thinking.trim() ? stream.thinking : null,
-      liveTools: stream.tools,
+      partial: !stream.streaming && live.reply.length > 0,
+      steps: keyed(live.steps, 'live'),
       briefing: null,
       needsPairing: false,
       proposal: null,
@@ -244,9 +351,7 @@ export function buildTurns(input: TalkTurnsInput): TurnView[] {
       at: '',
       streaming: false,
       partial: false,
-      traces: [],
-      thinking: null,
-      liveTools: [],
+      steps: [],
       briefing: null,
       needsPairing: pairingNeeded,
       proposal: null,

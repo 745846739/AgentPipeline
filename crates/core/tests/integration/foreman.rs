@@ -18,10 +18,10 @@ use agentpipeline_core::config::Settings;
 use agentpipeline_core::metrics;
 use agentpipeline_core::pipeline::foreman::{
     build_briefing, foreman_turn_in_flight, parse_attribution, situation_fingerprint, trim_history,
-    Attribution, AttributionKind, ForemanRunner, COMPACTION_MARK, FOREMAN_AGENT_TYPE,
-    FOREMAN_ATTRIBUTION_MARK, FOREMAN_FAILED_TURN_MARK, FOREMAN_MAX_ROUNDS, FOREMAN_NO_ACTION_MARK,
-    FOREMAN_PARTIAL_TURN_MARK, FOREMAN_PERSONA, FOREMAN_STAGE_KEY, FOREMAN_TOOL_SPECS,
-    FOREMAN_WATCH_FAILED_TURN_MARK, FOREMAN_WATCH_MARK, OPERATION_LOG_MARK,
+    Attribution, AttributionKind, ForemanRunner, ForemanSegment, COMPACTION_MARK,
+    FOREMAN_AGENT_TYPE, FOREMAN_ATTRIBUTION_MARK, FOREMAN_FAILED_TURN_MARK, FOREMAN_MAX_ROUNDS,
+    FOREMAN_NO_ACTION_MARK, FOREMAN_PARTIAL_TURN_MARK, FOREMAN_PERSONA, FOREMAN_STAGE_KEY,
+    FOREMAN_TOOL_SPECS, FOREMAN_WATCH_FAILED_TURN_MARK, FOREMAN_WATCH_MARK, OPERATION_LOG_MARK,
 };
 use agentpipeline_core::sse::{SseEvent, SseEventType, ToolPhase};
 use agentpipeline_core::storage::foreman::NewForemanMessage;
@@ -321,6 +321,7 @@ async fn history_is_trimmed_by_character_budget_but_stays_in_the_store() {
                 completion_tokens: 0,
                 briefing_json: None,
                 traces_json: None,
+                segments_json: None,
                 thinking: None,
                 ask_json: None,
             })
@@ -3029,6 +3030,7 @@ async fn session_totals_sum_the_persisted_columns() {
             completion_tokens: 20,
             briefing_json: None,
             traces_json: None,
+            segments_json: None,
             thinking: None,
             ask_json: None,
         })
@@ -3043,6 +3045,7 @@ async fn session_totals_sum_the_persisted_columns() {
             completion_tokens: 5,
             briefing_json: None,
             traces_json: None,
+            segments_json: None,
             thinking: None,
             ask_json: None,
         })
@@ -3376,6 +3379,7 @@ async fn two_sessions_do_not_pollute_each_others_messages_or_totals() {
             completion_tokens: 10,
             briefing_json: None,
             traces_json: None,
+            segments_json: None,
             thinking: None,
             ask_json: None,
         })
@@ -5211,6 +5215,92 @@ async fn foreman_thinking_accumulates_across_the_calls_of_one_turn() {
         thinking.matches("再核一遍。").count(),
         2,
         "两次模型调用各想了一段，两段都该在：{thinking}"
+    );
+}
+
+// ──────────────────── 步骤顺序留痕（决策 273）────────────────────
+
+/// 一轮里的**顺序**留在那一行上（决策 273）：推理与工具交错，收口那句不在段序里。
+///
+/// 为什么三份聚合视图不够：`thinking` 把各次调用的推理拼成一段、`traces_json` 把工具收成
+/// 一张表、`content` 是收口那一句——各自都在，但「先想了什么、再查了什么、然后说了什么」
+/// 丢了。而值班长的一轮常态正是「先想 → 查台账 → 再想 → 收口」。
+///
+/// 脚本两步：先 `read_task`（带工具调用），再 `text(..)`（收口）。`Thinking` 给**每一次**
+/// 模型调用都补上推理，故段序是「想 → 查 → 想」，而收口那句（`text(..)` 的正文，也就是
+/// `content` 列）不进段序——收口的话由 `content` 承载，段序说的是**中途**。
+#[tokio::test]
+async fn foreman_persists_the_order_of_the_steps_of_one_turn() {
+    let h = Harness::seeded().await;
+    let mut script = Script::new();
+    script.for_foreman().read_task("t1").text("t1 还在排队。");
+    let runner = h.runner_with_llm(Arc::new(Thinking {
+        inner: FakeAgent::new(script),
+        thought: "再核一遍。".into(),
+    }));
+
+    let turn = runner.say(None, "t1 怎么样了？").await.unwrap();
+    assert_eq!(turn.traces.len(), 1, "这一轮确实调了一次工具");
+    let rows = h
+        .store
+        .list_foreman_messages(&turn.session.id, 10)
+        .await
+        .unwrap();
+    let assistant = rows
+        .iter()
+        .find(|m| m.role == "assistant")
+        .expect("值班长那一行");
+    let raw = assistant
+        .segments_json
+        .as_ref()
+        .expect("这一轮有推理与工具，段序该在场");
+    // 比 `ForemanSegment` 的**值**而不是 JSON 字节：字节比较会把键序 / 字段拼写也钉进
+    // 断言，而这里要说的是顺序与种类。
+    let segments: Vec<ForemanSegment> =
+        serde_json::from_value(raw.clone()).expect("段序要能解回类型");
+    assert_eq!(
+        segments,
+        vec![
+            ForemanSegment::Thinking {
+                text: "再核一遍。".into()
+            },
+            ForemanSegment::Tool {
+                tool: "read_task".into(),
+                // 摘要取聚合那张表里的同一份（同一个事件的两处记录），本用例要说的是
+                // 顺序，不是 `summarize_args` 的措辞。
+                args_summary: turn.traces[0].args_summary.clone(),
+                ok: true,
+            },
+            ForemanSegment::Thinking {
+                text: "再核一遍。".into()
+            },
+        ],
+        "推理与工具按发生顺序交错，收口那句不在段序里：{raw}"
+    );
+}
+
+/// 没有任何一步时落 `NULL` 而不是空数组（决策 273）：与 `traces_json` 同一条口径——
+/// 「没有」与「有但是空的」是两件事。
+#[tokio::test]
+async fn foreman_without_steps_leaves_the_segments_column_null() {
+    let h = Harness::empty().await;
+    let mut script = Script::new();
+    script.for_foreman().text("没有待办。");
+    let turn = h
+        .runner(FakeAgent::new(script))
+        .say(None, "有活吗")
+        .await
+        .unwrap();
+    let rows = h
+        .store
+        .list_foreman_messages(&turn.session.id, 10)
+        .await
+        .unwrap();
+    let assistant = rows.iter().find(|m| m.role == "assistant").unwrap();
+    assert!(
+        assistant.segments_json.is_none(),
+        "无推理、无工具、只有收口一句时该是 NULL，不是空数组：{:?}",
+        assistant.segments_json
     );
 }
 

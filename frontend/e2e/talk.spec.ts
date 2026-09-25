@@ -822,15 +822,17 @@ test.describe('对讲台 · 对话（票 03）', () => {
 
     const reply = page.locator('.timeline .turn.fm', { hasText: REPLY_MARK }).last();
     await expect(reply).toBeVisible({ timeout: 30_000 });
-    const details = reply.locator('details.rcpts');
+    // 折叠的单位是**「过程」那一组**（决策 273 起，工具调用与推理按发生顺序住在里面）。
+    // 用 `>` 取它自己那一条摘要：推理那些步是本组里的嵌套 `<details>`，各有各的摘要。
+    const details = reply.locator('details.rcpts.process');
     await expect(details).toHaveCount(1);
 
     // 默认收起：内容不可见，而 summary 仍把**出处与条数**说全（可追溯性只是换了个开销方式）
     await expect(details.locator('.rcpt').first()).toBeHidden();
-    await expect(details.locator('summary')).toContainText('次台账查读');
+    await expect(details.locator('> summary')).toContainText('次台账查读');
 
     // 人点一下 → 展开
-    await details.locator('summary').click();
+    await details.locator('> summary').click();
     await expect(details.locator('.rcpt').first()).toBeVisible();
 
     // 让这一趟慢下来：流式增量因此真的落在这个窗口里（决定性的「再来一次增量」）
@@ -2028,6 +2030,176 @@ test.describe('对讲台 · 提问轮（决策 265）', () => {
     await expect(answered.locator('.aopts button').first()).toBeDisabled();
     await expect(answered.locator('.dtag')).toContainText('已答');
 
+    expectBundleHealthy(bundle);
+  });
+});
+
+/**
+ * 对讲台 · 一轮里的步骤按**实际顺序**展开（决策 273）——用户报的「命令执行、思考过程
+ * 没按实际顺序来」。
+ *
+ * 现场：一轮的留痕此前是三份**聚合**视图（回话在前、思考与回执各自一句在后），
+ * 而值班长的一轮常态是「先想 → 查台账 → 再想 → 收口」。顺序丢了，读起来就是
+ * 「结论先说、过程随便堆在后面」。
+ *
+ * 修法两半：后端把步骤顺序留痕（`segments_json`，决策 273）、界面按那一份段序渲染。
+ * **装置是 mock 的 `reasoning` 档**（`tool(.., reasoning)` / `text(.., reasoning)`，
+ * 决策 244 的 reasoning 声道）：没有它，e2e 里的一轮只有工具与收口，而工具的次序本来
+ * 就由脚本给——**顺序对不对看不出来**（那正是本用例的牙齿所在）。
+ */
+test.describe('对讲台 · 一轮里的步骤按实际顺序（决策 273）', () => {
+  let app: App;
+  const THINK_BEFORE = '先看看板，再决定查什么。';
+  const THINK_AFTER = '知道了，可以收口了。';
+  const UNKNOWN = '01K0000000000000000000000Z';
+  /** 回话里带 markdown：**粗体** + 列表（决策 274 的格式展示由下一条用例断言）。 */
+  const REPLY = '**没有**需要你处理的事。\n\n- 工位读数 1：安静。\n- 工位读数 2：安静。';
+
+  test.beforeAll(async () => {
+    app = await startApp({
+      script: foremanScript([
+        [
+          // 第一次模型调用：先推理、再调工具；第二次：推理 + 收口（回话）
+          tool('read_task', { task_id: UNKNOWN }, THINK_BEFORE),
+          text(REPLY, 0, THINK_AFTER),
+        ],
+      ]),
+      providerOnly: true,
+    });
+  });
+
+  test.afterAll(async () => {
+    await app?.stop();
+  });
+
+  test('过程按真实顺序排在各步的位置上、回话收在它们之后；回话按 markdown 渲染', async ({ page }) => {
+    const bundle = watchBundle(page);
+    // **用直连铺这一轮**（`sayDirect`）再看这一页：要断的是**落地那一行**的段序与渲染，
+    // 而流式那一侧另有归属（归约层单测与「切走再回来」那条 e2e）。混在一起写的话，
+    // 断言会同时受流状态影响——实测：整跑（机器被别的活压着）时那一轮多出一段
+    // 「中途说的话」，判据于是在一个与本案无关的地方红（2026-09-25）。
+    await sayDirect(app, '谁在跑？');
+    await page.goto(`${app.webBase}/#/talk`);
+    await settleBundle(page, bundle);
+
+    const reply = page.locator('.timeline .turn.fm').first();
+    await expect(reply).toContainText('工位读数 2', { timeout: 30_000 });
+    await expect(page.locator('.timeline .turn.fm')).toHaveCount(1);
+
+    // **承重断言**：DOM 里各块的出现次序 = 段序（想 → 查 → 想）+ 回话在最后。
+    // 旧形状下这里是「回话在最前」，这条会红。
+    const order = await reply.evaluate((el) =>
+      Array.from(el.querySelectorAll('[data-step], .md.reply')).map(
+        (n) => n.getAttribute('data-step') ?? 'reply',
+      ),
+    );
+    expect(order, '推理 / 工具 / 推理按发生顺序，回话在它们之后').toEqual([
+      'thinking',
+      'tool',
+      'thinking',
+      'reply',
+    ]);
+
+    // 三步各在它自己的位置上、内容对得上（不是把三段拼成一段）
+    const steps = reply.locator('[data-step]');
+    await expect(steps).toHaveCount(3);
+    await expect(steps.nth(0).locator('summary')).toContainText('思考过程');
+    await expect(steps.nth(0).locator('.think-body')).toContainText(THINK_BEFORE);
+    await expect(steps.nth(1)).toHaveAttribute('data-tool', 'read_task');
+    await expect(steps.nth(1)).toContainText('已读');
+    await expect(steps.nth(2).locator('.think-body')).toContainText(THINK_AFTER);
+
+    // 回话按 markdown 渲染（决策 274）：粗体真的成了 `<strong>`、列表真的成了列表项；
+    // 且那一句不再是「过程」里的一步（它在段序之外，收口那一句由 `content` 承载）
+    const md = reply.locator('.md.reply');
+    await expect(md).toHaveCount(1);
+    await expect(md.locator('strong')).toHaveText('没有');
+    await expect(md.locator('li')).toHaveCount(2);
+    await expect(md).toContainText('需要你处理的事');
+
+    // 「过程」那一组的摘要仍带条数（收起的是版面，不是信息——决策 218 ②）。
+    // 用 `>` 取**它自己那一条**摘要：推理那些步是本组里的嵌套 `<details>`，各有各的摘要。
+    await expect(reply.locator('.rcpts.process > summary')).toContainText('次台账查读');
+
+    bundle.problems.length = 0;
+    expectBundleHealthy(bundle);
+  });
+});
+
+/**
+ * 对讲台 · 切走再回来，本轮已经收到的输出还在（决策 275）——用户报的
+ * 「切换界面后再回来，本轮之前的输出不见了」。
+ *
+ * 现场：在飞一轮的现场（正在产的步骤、正在等的那趟回话）与那条 `/foreman/stream` 连接
+ * 此前都住在 `Talk.svelte` 的组件作用域里——切一下界面（看板 / 设置 / 指标）再回来，
+ * 组件被销毁、现场随之不见，而那一轮在服务端还在跑；SSE **没有回放**，此前那些字
+ * 永远不会再到达。
+ *
+ * 修法：现场与连接搬进 store（`stores/talk.svelte.ts`），随 App 起、随 App 收。
+ * **装置是 `drip` 步**：三截滴出来，中间各有 6s 空档——「切走时 A 已经到、B 在别处到达」
+ * 因此是决定性的。旧行为下回来只会看到一句占位话（A 丢了、B 从没接住过）。
+ */
+test.describe('对讲台 · 切走再回来，本轮已经收到的输出还在（决策 275）', () => {
+  let app: App;
+
+  const A = '第一截：我开始想了';
+  const B = '；第二截：这两句之间我切去了看板';
+  const C = '；第三截：想完了。';
+
+  test.beforeAll(async () => {
+    app = await startApp({
+      script: foremanScript([[drip([A, B, C], 6_000)], [text('第二轮的收尾。')]]),
+      providerOnly: true,
+    });
+  });
+
+  test.afterAll(async () => {
+    await app?.stop();
+  });
+
+  test('切到看板再切回来：已经收到的两截都还在，增量照旧接得上', async ({ page }) => {
+    const bundle = watchBundle(page);
+    await page.goto(`${app.webBase}/#/talk`);
+    await settleBundle(page, bundle);
+
+    await page.locator('.typer textarea').fill('这一句要分三截答');
+    await page.locator('.typer button[type=submit]').click();
+
+    // A 落屏 = 这一轮真的开始了
+    const live = page.locator('.timeline .turn.fm').first();
+    await expect(live).toContainText(A, { timeout: 30_000 });
+
+    // **切走**（同一份 SPA 里的路由切换，不刷新）
+    await page
+      .getByRole('navigation', { name: '页面导航' })
+      .getByRole('link', { name: '看板' })
+      .click();
+    await expect(page.locator('.talk-head')).toHaveCount(0);
+
+    // 在看板上等一会儿：B 在这段时间里到达（旧行为下它会因为连接随组件一起停掉而丢失）
+    await page.waitForTimeout(7_000);
+
+    // **切回来**：第一截与第二截都要还在——它们不在台账里（那一轮还在跑）
+    await page
+      .getByRole('navigation', { name: '页面导航' })
+      .getByRole('link', { name: '对讲台' })
+      .click();
+    const back = page.locator('.timeline .turn.fm').first();
+    await expect(back, '切页面之前收到的第一截必须还在').toContainText(A, { timeout: 30_000 });
+    await expect(back, '切页面期间到达的那一截也要接得住').toContainText(B, { timeout: 30_000 });
+
+    // 人说的那句从台账读回来（它是落地行，不随页面走）
+    await expect(page.locator('.timeline .turn.mine', { hasText: '这一句要分三截答' })).toHaveCount(
+      1,
+    );
+
+    // 收口：C 之后回话落地，台账那一行接管（三截齐全、仍只有这一轮）
+    await expect(back).toContainText(C, { timeout: 30_000 });
+    await expect(page.locator('.timeline .turn.fm')).toHaveCount(1);
+    await expect(back).toContainText(A);
+    await expect(back).toContainText(B);
+
+    bundle.problems.length = 0;
     expectBundleHealthy(bundle);
   });
 });

@@ -1172,6 +1172,9 @@ fn message_wire(m: &ForemanMessage) -> serde_json::Value {
         "completion_tokens": m.completion_tokens,
         "briefing": m.briefing_json,
         "traces": m.traces_json,
+        // 这一轮的**步骤顺序**（决策 273）：与 `traces` / `thinking` 一样原样带出去，
+        // 不在后端截断——界面按段序渲染「先想 → 再查 → 然后说」，要的就是落库那一份。
+        "segments": m.segments_json,
         // 该轮的推理原文（决策 244）：**展示留痕**，界面把它收进一个折叠块。
         // 与 `traces` 一样原样带出去，不在后端截断——界面要显示的就是落库那一份。
         "thinking": m.thinking,
