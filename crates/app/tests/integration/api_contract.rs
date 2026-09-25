@@ -7279,6 +7279,10 @@ async fn notify_settings_defaults_report_config_origin_and_no_channel() {
     assert_eq!(body["origin"], "config", "{body}");
     assert_eq!(body["cooldown_sec"], 300, "{body}");
     assert_eq!(body["quiet_hours"], json!([22, 8]), "{body}");
+    assert_eq!(
+        body["politeness_origin"], "config",
+        "礼貌两件也各报来源（284②）：没碰过设置 = 配置文件定的：{body}"
+    );
     assert!(body.get("config_error").is_none(), "{body}");
 }
 
@@ -7460,4 +7464,128 @@ async fn clearing_the_channel_returns_to_config_origin_and_keeps_the_switch() {
     let (_, body) = get(&api, "/notify/settings").await;
     assert_eq!(body["origin"], "config", "{body}");
     assert_eq!(body["enabled"], false, "交还配置 ≠ 关掉通知：{body}");
+}
+
+/// 保存礼貌单元（决策 284②③）：读数换成单元的值、来源翻成 settings，**且出口真的重建了**
+/// ——「保存即活生效」不是只在应答里生效（断言落在在飞的那份出口上）。
+#[tokio::test]
+async fn saving_the_politeness_unit_overrides_the_config_and_rebuilds_the_exit() {
+    let api = api_with(Settings::default()).await;
+    // 先用 feishu 通道把出口挂起来（feishu 不探活，关闭状态存单元也合法）。
+    put(&api, "/notify/settings", json!({ "enabled": false })).await;
+    put(
+        &api,
+        "/notify/channel",
+        json!({ "channel": "feishu", "webhook_url": "https://open.feishu.cn/hook/x" }),
+    )
+    .await;
+    let (status, body) = put(&api, "/notify/settings", json!({ "enabled": true })).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let live = api.state.store.notifier().expect("开启后出口应当在飞");
+    assert_eq!(
+        (
+            live.politeness().cooldown_sec,
+            live.politeness().quiet_hours
+        ),
+        (300, [22, 8]),
+        "还没保存单元 = 出口用配置那一份"
+    );
+
+    let (status, body) = put(
+        &api,
+        "/notify/politeness",
+        json!({ "cooldown_sec": 60, "quiet_hours": [23, 7] }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+
+    let (_, body) = get(&api, "/notify/settings").await;
+    assert_eq!(body["cooldown_sec"], 60, "{body}");
+    assert_eq!(body["quiet_hours"], json!([23, 7]), "{body}");
+    assert_eq!(body["politeness_origin"], "settings", "{body}");
+    assert_eq!(
+        body["origin"], "settings",
+        "通道那一级不受影响（两组各自报来源）：{body}"
+    );
+    let live = api.state.store.notifier().expect("出口仍在飞");
+    assert_eq!(
+        (
+            live.politeness().cooldown_sec,
+            live.politeness().quiet_hours
+        ),
+        (60, [23, 7]),
+        "在飞的那份出口真的换上了单元的值（284③）"
+    );
+
+    // 保存通道不该把礼貌换回配置那一份（同一条活生效路径，别的写口也得带上礼貌）。
+    put(
+        &api,
+        "/notify/channel",
+        json!({ "channel": "feishu", "webhook_url": "https://open.feishu.cn/hook/y" }),
+    )
+    .await;
+    let live = api.state.store.notifier().expect("出口仍在飞");
+    assert_eq!(
+        live.politeness().cooldown_sec,
+        60,
+        "保存通道之后礼貌仍是界面那一份"
+    );
+}
+
+/// 越界的礼貌单元在**落库前**被拒（284⑤ 报错不静默）：报文点名是哪一件，读数一字不动。
+#[tokio::test]
+async fn an_out_of_range_politeness_unit_is_refused_not_saved() {
+    let api = api_with(Settings::default()).await;
+    for bad in [
+        json!({ "cooldown_sec": 86_401, "quiet_hours": [22, 8] }),
+        json!({ "cooldown_sec": 300, "quiet_hours": [24, 8] }),
+    ] {
+        let (status, body) = put(&api, "/notify/politeness", bad.clone()).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+        assert!(
+            body["error"]
+                .as_str()
+                .unwrap()
+                .contains(if bad["cooldown_sec"] == 86_401 {
+                    "节流"
+                } else {
+                    "免打扰"
+                }),
+            "报文要点名越界的是哪一件：{body}"
+        );
+    }
+    let (_, body) = get(&api, "/notify/settings").await;
+    assert_eq!(
+        body["politeness_origin"], "config",
+        "被拒的三次都没落库：{body}"
+    );
+    assert_eq!(body["cooldown_sec"], 300, "{body}");
+}
+
+/// 交还礼貌（284⑦）：回到配置文件那一份；开关与通道单元都不动。
+#[tokio::test]
+async fn clearing_the_politeness_unit_returns_to_config_and_keeps_everything_else() {
+    let api = api_with(Settings::default()).await;
+    put(&api, "/notify/settings", json!({ "enabled": false })).await;
+    put(
+        &api,
+        "/notify/channel",
+        json!({ "channel": "feishu", "webhook_url": "https://open.feishu.cn/hook/x" }),
+    )
+    .await;
+    put(
+        &api,
+        "/notify/politeness",
+        json!({ "cooldown_sec": 0, "quiet_hours": [23, 7] }),
+    )
+    .await;
+
+    let (status, _) = delete(&api, "/notify/politeness").await;
+    assert_eq!(status, StatusCode::OK);
+    let (_, body) = get(&api, "/notify/settings").await;
+    assert_eq!(body["politeness_origin"], "config", "{body}");
+    assert_eq!(body["cooldown_sec"], 300, "{body}");
+    assert_eq!(body["quiet_hours"], json!([22, 8]), "{body}");
+    assert_eq!(body["enabled"], false, "交还礼貌 ≠ 动开关：{body}");
+    assert_eq!(body["origin"], "settings", "交还礼貌 ≠ 交还通道：{body}");
 }

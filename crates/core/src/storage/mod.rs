@@ -169,8 +169,10 @@ impl Store {
         }
     }
 
-    /// 当前通知出口（`note_attention` 的触发点取用）。
-    pub(crate) fn notifier(&self) -> Option<Arc<crate::notify::WebhookNotifier>> {
+    /// 当前通知出口（`note_attention` 的触发点取用；**在飞的那一份**也是设置端点与
+    /// 契约测试核对「保存即活生效」的取证面——决策 284 起它对 app 层可见，
+    /// 免得「页面上的读数」与「出口真正用的那份」成为两回事）。
+    pub fn notifier(&self) -> Option<Arc<crate::notify::WebhookNotifier>> {
         self.notifier.read().ok().and_then(|slot| slot.clone())
     }
 

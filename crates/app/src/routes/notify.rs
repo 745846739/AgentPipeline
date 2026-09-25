@@ -1,12 +1,14 @@
-//! 离线通知设置端点（决策 272⑥⑦⑧）。
+//! 离线通知设置端点（决策 272⑥⑦⑧；284②③⑤ 添礼貌单元）。
 //!
-//! 四条路，各办一件事：
-//! - `GET /notify/settings`：读数（生效单元 + `origin` 说清是谁定的 + 秘密一律掩码 +
-//!   只读的礼貌两件 + 解析不了时的报文）。
+//! 六条路，各办一件事：
+//! - `GET /notify/settings`：读数（生效单元 + 两个 `origin` 各说清是谁定的 + 秘密一律
+//!   掩码 + 礼貌两件的**生效值** + 解析不了时的报文）。
 //! - `PUT /notify/settings`：**总开关**（`{enabled}` 一个字段）——开启时先解析生效
 //!   通道、BlueBubbles 先 ping（**够不着不当成功**），都过了才落库 + 重建出口。
 //! - `PUT /notify/channel` / `DELETE /notify/channel`：通道单元的保存与交还
 //!   （照 `/market/repos` 的先例）——保存是**整体覆盖**（272⑥ 不允许混）。
+//! - `PUT /notify/politeness` / `DELETE /notify/politeness`：**礼貌单元**的保存与交还
+//!   （284②：与通道单元**各自成立**，两级关系同构——界面整体覆盖 `config.toml`）。
 //! - `POST /notify/test`：连通性探针（照 `POST /providers/test`，决策 160——
 //!   对**未保存**的表单值发最小真实请求，成功失败都 200）。
 //!
@@ -24,8 +26,9 @@ use serde::Deserialize;
 use serde_json::json;
 
 use agentpipeline_core::notify::{
-    ping_bluebubbles, resolve_notify_target, NotifyChannelOverride, NotifyFormat,
-    NotifySettingsState, NotifyTarget, WebhookNotifier,
+    ping_bluebubbles, resolve_notify_target, resolve_politeness, validate_politeness,
+    NotifyChannelOverride, NotifyFormat, NotifyPoliteness, NotifySettingsState, NotifyTarget,
+    WebhookNotifier,
 };
 
 use crate::state::{map_core_error, ApiError, ApiResult, AppState};
@@ -59,6 +62,7 @@ pub async fn settings(State(state): State<AppState>) -> ApiResult<impl IntoRespo
     let display_state = NotifySettingsState {
         enabled: true,
         unit: stored.unit.clone(),
+        politeness: stored.politeness,
     };
     let (effective, config_error) =
         match resolve_notify_target(&state.notify_config, &display_state) {
@@ -66,6 +70,13 @@ pub async fn settings(State(state): State<AppState>) -> ApiResult<impl IntoRespo
             Err(e) => (None, Some(e.to_string())),
         };
     let origin = if stored.unit.is_some() {
+        "settings"
+    } else {
+        "config"
+    };
+    // 礼貌两件（284②）各自报来源：通道来自界面不代表礼貌也来自界面。
+    let politeness = resolve_politeness(&state.notify_config, &display_state);
+    let politeness_origin = if stored.politeness.is_some() {
         "settings"
     } else {
         "config"
@@ -128,9 +139,11 @@ pub async fn settings(State(state): State<AppState>) -> ApiResult<impl IntoRespo
         "bluebubbles_url": bb_url,
         "bluebubbles_password": bb_password,
         "bluebubbles_recipient": bb_recipient,
-        // 礼貌两件只住 config.toml（272⑥）：界面上**只读**展示，让「现在多吵」可核对。
-        "cooldown_sec": state.notify_config.cooldown_sec,
-        "quiet_hours": state.notify_config.quiet_hours,
+        // 礼貌两件（284②）：这里是**生效值**（单元 > config.toml），来源在
+        // `politeness_origin` 里说清——界面能改它们（284，修订 272⑥ 的只读姿态）。
+        "cooldown_sec": politeness.cooldown_sec,
+        "quiet_hours": politeness.quiet_hours,
+        "politeness_origin": politeness_origin,
     });
     if let Some(err) = config_error {
         body["config_error"] = json!(err);
@@ -160,6 +173,7 @@ pub async fn set_enabled(
     let target_state = NotifySettingsState {
         enabled: body.enabled,
         unit: stored.unit.clone(),
+        politeness: stored.politeness,
     };
     let target = resolve_notify_target(&state.notify_config, &target_state)
         .map_err(|e| ApiError::bad_request(e.to_string()))?;
@@ -179,7 +193,11 @@ pub async fn set_enabled(
             .set_notify_enabled(true)
             .await
             .map_err(map_core_error)?;
-        apply_target(&state, target);
+        apply_target(
+            &state,
+            target,
+            resolve_politeness(&state.notify_config, &stored),
+        );
     } else {
         state
             .store
@@ -256,6 +274,7 @@ pub async fn save_channel(
         &NotifySettingsState {
             enabled: true,
             unit: Some(unit.clone()),
+            politeness: stored.politeness,
         },
     )
     .map_err(|e| ApiError::bad_request(e.to_string()))?
@@ -271,7 +290,12 @@ pub async fn save_channel(
         .await
         .map_err(map_core_error)?;
     if enabled {
-        apply_target(&state, Some(target));
+        // 礼貌取**解析后的**那一份（284③）：保存通道不该把界面上的礼貌换回配置那一份。
+        apply_target(
+            &state,
+            Some(target),
+            resolve_politeness(&state.notify_config, &stored),
+        );
     }
     Ok(Json(json!({ "ok": true })))
 }
@@ -291,7 +315,72 @@ pub async fn clear_channel(State(state): State<AppState>) -> ApiResult<impl Into
         .map_err(map_core_error)?;
     let target = resolve_notify_target(&state.notify_config, &stored)
         .map_err(|e| ApiError::bad_request(e.to_string()))?;
-    apply_target(&state, target);
+    apply_target(
+        &state,
+        target,
+        resolve_politeness(&state.notify_config, &stored),
+    );
+    Ok(Json(json!({ "ok": true })))
+}
+
+#[derive(Debug, Deserialize)]
+pub struct PolitenessBody {
+    pub cooldown_sec: u64,
+    /// `[开始, 结束)` 本地整点（0–23）；起止相同 = 全天不静默。
+    pub quiet_hours: [u8; 2],
+}
+
+/// `PUT /notify/politeness`：保存**礼貌单元**（决策 284②③⑤，整体覆盖 `config.toml`）。
+///
+/// 顺序与通道那条同源：范围校验（越界 400，报错不静默）→ 解析当下的生效通道
+/// （出口要按它重建；缺件仍是 400）→ 落库 → **活生效**。开关关着时落库照做
+/// （先配好、后开启是合法顺序），出口维持摘除。
+pub async fn save_politeness(
+    State(state): State<AppState>,
+    Json(body): Json<PolitenessBody>,
+) -> ApiResult<impl IntoResponse> {
+    let politeness = NotifyPoliteness {
+        cooldown_sec: body.cooldown_sec,
+        quiet_hours: body.quiet_hours,
+    };
+    validate_politeness(&politeness).map_err(ApiError::bad_request)?;
+    let stored = state
+        .store
+        .notify_settings_state()
+        .await
+        .map_err(map_core_error)?;
+    // 这次写不动通道，故目标按**当下**的落库状态解析（与落库后等价）。
+    let target = resolve_notify_target(&state.notify_config, &stored)
+        .map_err(|e| ApiError::bad_request(e.to_string()))?;
+    state
+        .store
+        .set_notify_politeness(&politeness)
+        .await
+        .map_err(map_core_error)?;
+    apply_target(&state, target, politeness);
+    Ok(Json(json!({ "ok": true })))
+}
+
+/// `DELETE /notify/politeness`：交还 `config.toml` 的 `[notify]` 那一份；开关与通道
+/// 单元都不动（284⑦：三件事三个钮，各交各的）。
+pub async fn clear_politeness(State(state): State<AppState>) -> ApiResult<impl IntoResponse> {
+    state
+        .store
+        .clear_notify_politeness()
+        .await
+        .map_err(map_core_error)?;
+    let stored = state
+        .store
+        .notify_settings_state()
+        .await
+        .map_err(map_core_error)?;
+    let target = resolve_notify_target(&state.notify_config, &stored)
+        .map_err(|e| ApiError::bad_request(e.to_string()))?;
+    apply_target(
+        &state,
+        target,
+        resolve_politeness(&state.notify_config, &stored),
+    );
     Ok(Json(json!({ "ok": true })))
 }
 
@@ -352,14 +441,14 @@ async fn ping_if_bluebubbles(target: &Option<NotifyTarget>) -> ApiResult<()> {
     Ok(())
 }
 
-/// 活生效（272⑧）：出口是启动时建一次的，开关与单元的每次落库都要**重建或摘除**它。
-/// 礼貌两件从 `notify_config` 取（272⑥：只住 config.toml）；时钟走 store 的唯一时钟源。
-fn apply_target(state: &AppState, target: Option<NotifyTarget>) {
+/// 活生效（272⑧；284③ 扩到礼貌）：出口是启动时建一次的，任何一次落库都要**重建或
+/// 摘除**它。礼貌取**解析后的**那一份（284②，单元 > config.toml）——调用方负责解析，
+/// 这里只认值：出口自己不认识两级。
+fn apply_target(state: &AppState, target: Option<NotifyTarget>, politeness: NotifyPoliteness) {
     match target {
         Some(target) => state.store.set_notifier(Arc::new(WebhookNotifier::new(
             target,
-            state.notify_config.cooldown_sec,
-            state.notify_config.quiet_hours,
+            politeness,
             state.store.clock().clone(),
         ))),
         None => state.store.clear_notifier(),

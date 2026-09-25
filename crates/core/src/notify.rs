@@ -23,6 +23,12 @@
 //! 豁免（节流照走）、每类 cooldown 严格小于——由 `tests/fixtures/notification_policy.json`
 //! 把 Rust 表测试与前端 fixture 测试钉在同一份、同一断言方向（决策 246 回环表的先例）。
 //!
+//! 决策 284 把「同一张表」的**适用范围**写窄了：那张表钉的是**语义**（怎么算静音、
+//! 哪些类豁免），**数值**由这一侧的 `NotifyPoliteness` 说了算——它可以来自
+//! `config.toml` 的 `[notify]`，也可以来自设置页保存的礼貌单元（`resolve_politeness`，
+//! 272⑥ 的「只住 config.toml」由此**显式修订**）。前端那份表只管**浏览器 toast**，
+//! 出口这份只管**出机器那条线**：一个语义一处可改。
+//!
 //! **显式差异**（决策 268 允许「写清差异」而非强求同一实现）：前端还有 `notifyOn`
 //! 每类开关（用户偏好面，缺省 `cancelled: false` = 永不弹）；后端没有偏好面——
 //! `cancelled` 按通用类规则走 cooldown + 免打扰。**决策 272 又添一条反方向的**：
@@ -412,14 +418,61 @@ pub struct NotifyChannelOverride {
     pub bluebubbles_recipient: Option<String>,
 }
 
-/// 通知设置的两级状态（决策 272⑥）：总开关 + 单元覆盖。
+/// **礼貌两件**（决策 284，显式修订 272⑥）：节流秒数 + 免打扰起止。
+///
+/// 它们服务的是**出机器那条线**（webhook / 飞书 / iMessage）——浏览器 toast 有自己
+/// 一份固定表（`frontend/src/lib/notificationPolicy.ts`，268③ 的跨语言镜像），
+/// 这张设置页不动它。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct NotifyPoliteness {
+    /// 每类通知的合并窗口（秒）；`0` = 不节流（免打扰照走）。
+    pub cooldown_sec: u64,
+    /// 免打扰 `[开始, 结束)`——本地整点、含头不含尾、跨零点合法、起止相同 = 全天不静默。
+    pub quiet_hours: [u8; 2],
+}
+
+impl Default for NotifyPoliteness {
+    /// 与 `[notify]` 的缺省同源（一处定义，`config.rs` 是那一处）。
+    fn default() -> Self {
+        let defaults = crate::config::NotifyConfig::default();
+        Self {
+            cooldown_sec: defaults.cooldown_sec,
+            quiet_hours: defaults.quiet_hours,
+        }
+    }
+}
+
+/// 界面那一级可接受的节流上限（秒，一天）。再大就不是「节流」而是「关掉」——
+/// 要关掉请用总开关（284⑤：范围校验挡在端点，落库前报错不静默）。
+pub const COOLDOWN_SEC_MAX: u64 = 86_400;
+
+/// 礼貌单元的**范围**校验（完整性由类型保证）；`Err` 是面向用户的中文报文
+/// （照 `ping_bluebubbles` 的返回形状）。`config.toml` 那一级不过这道闸——它只有
+/// 解析期校验（47 / 103 / 134 的 fail fast 姿态）。
+pub fn validate_politeness(p: &NotifyPoliteness) -> std::result::Result<(), String> {
+    if p.cooldown_sec > COOLDOWN_SEC_MAX {
+        return Err(format!(
+            "节流要填 0–{COOLDOWN_SEC_MAX} 之间的整数秒（0 = 不节流）"
+        ));
+    }
+    if p.quiet_hours[0] > 23 || p.quiet_hours[1] > 23 {
+        return Err("免打扰起止要填 0–23 之间的整点（起止相同 = 全天不静默）".into());
+    }
+    Ok(())
+}
+
+/// 通知设置的两级状态（决策 272⑥；284② 添第二单元）：总开关 + 两个**各自成立**的
+/// 界面单元——通道（送到哪）与礼貌（什么时候准吵）。两边可以一个来自界面、一个来自
+/// `config.toml`；不混的是**组内**。
 #[derive(Debug, Clone, PartialEq)]
 pub struct NotifySettingsState {
     /// **一颗总开关**（272⑧）：整条通道开/关，非每类一颗。关死一切——单元与配置
     /// 那一级都不再看。
     pub enabled: bool,
-    /// 界面保存的单元；`None` = 没保存过 → 回落 `config.toml` 那一级。
+    /// 界面保存的**通道**单元；`None` = 没保存过 → 回落 `config.toml` 那一级。
     pub unit: Option<NotifyChannelOverride>,
+    /// 界面保存的**礼貌**单元（284②）；`None` = 没保存过 → 回落 `config.toml`。
+    pub politeness: Option<NotifyPoliteness>,
 }
 
 /// 两级解析（决策 272⑥）：界面单元 > `config.toml`，总开关关死一切。
@@ -444,6 +497,19 @@ pub fn resolve_notify_target(
         ),
         None => resolve_config_level(config),
     }
+}
+
+/// 礼貌两级解析（决策 284②）：界面单元 > `config.toml`。**总开关不参与**——它管的是
+/// 出口在不在（关着时 `resolve_notify_target` 已经给出 `None`），礼貌只在出口存在时
+/// 才有意义。两级都缺席时是 `[notify]` 的缺省（268 的零配置姿态）。
+pub fn resolve_politeness(
+    config: &crate::config::NotifyConfig,
+    state: &NotifySettingsState,
+) -> NotifyPoliteness {
+    state.politeness.unwrap_or(NotifyPoliteness {
+        cooldown_sec: config.cooldown_sec,
+        quiet_hours: config.quiet_hours,
+    })
 }
 
 /// 配置级（声明式缺省）：`webhook_url` 缺席 = 整段关死（268①，零配置零行为）；
@@ -549,8 +615,9 @@ pub async fn ping_bluebubbles(endpoint: &str, password: &str) -> std::result::Re
 pub struct WebhookNotifier {
     target: NotifyTarget,
     client: reqwest::Client,
-    cooldown_sec: u64,
-    quiet: [u8; 2],
+    /// 生效的礼貌两件（决策 284②：可能是界面单元，也可能是 `config.toml`）——
+    /// 由调用方解析好再构造，出口自己不认识两级。
+    politeness: NotifyPoliteness,
     clock: Arc<dyn Clock>,
     /// 每类最近一次**尝试**时刻（镜像前端 `lastNotifiedAt` 的 per-class 语义）。
     /// 「尝试」而非「成功」：best-effort 不重试，重试循环会把通知变成新的噪音源。
@@ -558,12 +625,7 @@ pub struct WebhookNotifier {
 }
 
 impl WebhookNotifier {
-    pub fn new(
-        target: NotifyTarget,
-        cooldown_sec: u64,
-        quiet: [u8; 2],
-        clock: Arc<dyn Clock>,
-    ) -> Self {
+    pub fn new(target: NotifyTarget, politeness: NotifyPoliteness, clock: Arc<dyn Clock>) -> Self {
         let client = reqwest::Client::builder()
             .timeout(WEBHOOK_TIMEOUT)
             // 不跟随重定向：这个 URL 是含 token 的秘密，302 会把它带去别的主机
@@ -574,11 +636,16 @@ impl WebhookNotifier {
         Self {
             target,
             client,
-            cooldown_sec,
-            quiet,
+            politeness,
             clock,
             last_sent: Mutex::new(HashMap::new()),
         }
+    }
+
+    /// **在飞的那一份**礼貌（决策 284）：设置端点与契约测试要能核对「保存即活生效」——
+    /// 页面上的读数与出口真正用的那份不许是两回事。
+    pub fn politeness(&self) -> NotifyPoliteness {
+        self.politeness
     }
 
     /// 一次通知机会——attention 线（调用点 = `note_attention`，`wakes()` 已由调用方判过）。
@@ -659,7 +726,13 @@ impl WebhookNotifier {
         let age = guard
             .get(&cls)
             .map(|t| (now - *t).num_seconds().max(0) as u64);
-        if !should_notify(cls, hour, age, self.cooldown_sec, self.quiet) {
+        if !should_notify(
+            cls,
+            hour,
+            age,
+            self.politeness.cooldown_sec,
+            self.politeness.quiet_hours,
+        ) {
             return;
         }
         guard.insert(cls, now);
@@ -953,6 +1026,7 @@ mod tests {
     fn the_master_switch_kills_everything() {
         let state = NotifySettingsState {
             enabled: false,
+            politeness: None,
             unit: Some(NotifyChannelOverride {
                 channel: NotifyFormat::Feishu,
                 webhook_url: Some("https://x".into()),
@@ -971,6 +1045,7 @@ mod tests {
     fn the_unit_overrides_the_config_whole() {
         let state = NotifySettingsState {
             enabled: true,
+            politeness: None,
             unit: Some(NotifyChannelOverride {
                 channel: NotifyFormat::BlueBubbles,
                 webhook_url: None,
@@ -995,6 +1070,7 @@ mod tests {
     fn config_level_without_url_stays_off() {
         let state = NotifySettingsState {
             enabled: true,
+            politeness: None,
             unit: None,
         };
         let resolved = resolve_notify_target(&config_with(NotifyFormat::Feishu), &state).unwrap();
@@ -1006,6 +1082,7 @@ mod tests {
     fn an_incomplete_unit_is_an_error_not_a_silent_off() {
         let state = NotifySettingsState {
             enabled: true,
+            politeness: None,
             unit: Some(NotifyChannelOverride {
                 channel: NotifyFormat::BlueBubbles,
                 webhook_url: None,
@@ -1024,6 +1101,7 @@ mod tests {
     fn a_webhook_url_without_scheme_is_rejected() {
         let state = NotifySettingsState {
             enabled: true,
+            politeness: None,
             unit: Some(NotifyChannelOverride {
                 channel: NotifyFormat::Feishu,
                 webhook_url: Some("open.feishu.cn/hook/x".into()),
@@ -1042,6 +1120,7 @@ mod tests {
     fn a_bluebubbles_endpoint_without_scheme_is_rejected() {
         let state = NotifySettingsState {
             enabled: true,
+            politeness: None,
             unit: Some(NotifyChannelOverride {
                 channel: NotifyFormat::BlueBubbles,
                 webhook_url: None,
@@ -1064,5 +1143,90 @@ mod tests {
         assert!(is_quiet_hours(0, [22, 8]), "跨零点的凌晨段");
         assert!(!is_quiet_hours(8, [22, 8]), "跨零点的尾点不静音");
         assert!(!is_quiet_hours(12, [22, 8]), "白天不静音");
+    }
+
+    // ── 决策 284②：礼貌两件的两级解析与范围闸 ──
+
+    /// 礼貌两级各自成立：单元在场就整体覆盖配置（两个字段都不许回落到配置），
+    /// 不在场就整体读配置——不存在「节流来自界面、免打扰来自配置」的半份。
+    #[test]
+    fn politeness_resolves_unit_over_config_as_a_whole() {
+        let config = crate::config::NotifyConfig {
+            cooldown_sec: 900,
+            quiet_hours: [21, 6],
+            ..crate::config::NotifyConfig::default()
+        };
+        let mut state = NotifySettingsState {
+            enabled: true,
+            unit: None,
+            politeness: None,
+        };
+        assert_eq!(
+            resolve_politeness(&config, &state),
+            NotifyPoliteness {
+                cooldown_sec: 900,
+                quiet_hours: [21, 6]
+            },
+            "没有单元 = 读 config.toml"
+        );
+
+        state.politeness = Some(NotifyPoliteness {
+            cooldown_sec: 0,
+            quiet_hours: [23, 7],
+        });
+        assert_eq!(
+            resolve_politeness(&config, &state),
+            NotifyPoliteness {
+                cooldown_sec: 0,
+                quiet_hours: [23, 7]
+            },
+            "单元在场 = 两件都按单元的来（0 是「不节流」，不是缺省）"
+        );
+    }
+
+    /// 总开关不参与礼貌解析：关着的时候出口整个不在（那是 `resolve_notify_target` 的事），
+    /// 礼貌照常解析出值——设置页要能在关着的时候显示「开着的话会是哪一份」。
+    #[test]
+    fn politeness_is_resolved_independently_of_the_master_switch() {
+        let config = crate::config::NotifyConfig::default();
+        let state = NotifySettingsState {
+            enabled: false,
+            unit: None,
+            politeness: Some(NotifyPoliteness {
+                cooldown_sec: 60,
+                quiet_hours: [1, 2],
+            }),
+        };
+        assert_eq!(resolve_politeness(&config, &state).cooldown_sec, 60);
+    }
+
+    /// 范围闸（284⑤）：越界的礼貌单元在落库前被拒，报文点名是哪一件、合法区间是什么。
+    #[test]
+    fn politeness_range_gate_names_the_offending_field() {
+        assert!(
+            validate_politeness(&NotifyPoliteness::default()).is_ok(),
+            "缺省必须合法"
+        );
+        assert!(
+            validate_politeness(&NotifyPoliteness {
+                cooldown_sec: COOLDOWN_SEC_MAX,
+                quiet_hours: [0, 0],
+            })
+            .is_ok(),
+            "上界含、起止相同（全天不静默）合法"
+        );
+        let too_long = validate_politeness(&NotifyPoliteness {
+            cooldown_sec: COOLDOWN_SEC_MAX + 1,
+            quiet_hours: [22, 8],
+        })
+        .unwrap_err();
+        assert!(too_long.contains("节流"), "{too_long}");
+        assert!(too_long.contains("86400"), "{too_long}");
+        let bad_hour = validate_politeness(&NotifyPoliteness {
+            cooldown_sec: 300,
+            quiet_hours: [24, 8],
+        })
+        .unwrap_err();
+        assert!(bad_hour.contains("免打扰"), "{bad_hour}");
     }
 }

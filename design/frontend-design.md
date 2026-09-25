@@ -471,7 +471,7 @@ pending 琥珀呼吸（2.4s 周期）、流式输出尾随光标。`prefers-redu
 | 模型与密钥 | **只剩 provider 台账与密钥提示**（阶段配置已搬去 `#/settings/stages`）：provider 行 = (vendor, model, context_window)（决策 111）；`api_key` 输入框写后即掩码回显 `***`（决策 112），旁边固定一行提示「密钥明文存于本机 `~/.agentpipeline`，目录权限 0700」；`supported_adapters` 之外的行降级灰显 + 告警，不崩（决策 103，界面文案见 §12.1） |
 | 阶段配置 | `#/settings/stages`（**新页，决策 198**）：把「模型与密钥」页里的阶段配置那一段整体搬来——每个阶段用哪个 provider、带哪些工具与技能、超时覆盖（决策 111 / 170 / 172）；小节标题 12px 档，不与页面标题同级（票 09） |
 | 技能市场 | `#/settings/market`：来源仓名单（保存即生效）+ 该仓的技能列表 + 安装后的三项预览（决策 187 / 194） |
-| 离线通知 | `#/settings/notify`（**新页，决策 272**）：一颗总开关（整条通道开/关）+ 通道四件整体覆盖 `config.toml`（通用 webhook / 飞书 / iMessage·BlueBubbles，origin 说清是谁定的）；秘密只回显掩码 `***`、掩码或留空 = 不改（provider 范式）；BlueBubbles 在开启与保存时先探活，够不着不当成功；节流与免打扰两件只读展示（只住 `config.toml`，决策 272⑥） |
+| 离线通知 | `#/settings/notify`（**新页，决策 272；284 添礼貌小节**）：一颗总开关（整条通道开/关）+ **两组**整体覆盖 `config.toml` 的单元（通道四件：通用 webhook / 飞书 / iMessage·BlueBubbles；礼貌两件：节流秒数 + 免打扰起止），两组**各自**报 origin——通道来自界面不代表礼貌也来自界面；秘密只回显掩码 `***`、掩码或留空 = 不改（provider 范式）；BlueBubbles 在开启与保存时先探活，够不着不当成功 |
 | 全局指标 | GET /metrics：成功率、各阶段平均耗时 / 重试率 / validate 通过率、token 消耗。全部以**轨道分段条形图**呈现（横条挂在轨道站点下），延续"轨道即导航"；无 KPI 卡片横排。第一段用**平实说法**说清每个数是什么、怎么算的（票 27），不带内部编号（§12.1） |
 
 ---
@@ -762,7 +762,7 @@ GET /tasks/{id}               → 详情页装载 + 断线重连后的全量校�
 | 页面导航行四项（对讲台 / 看板 / 指标 / 设置），其余入口从落地页进；**看板只从这一行进**（窄档这一行钉在屏幕底缘，桌面档是顶栏第二行——同一个 `nav` 元素） | `frontend/src/components/layout/TopBar.svelte`、`frontend/src/router.svelte.ts` | 决策 240（修订 198 / 169）；位置由 243 定（窄档在底部） |
 | 首屏默认落对讲台：地址栏没写 hash 就 `replaceState` 归一到 `#/talk`（带 hash 的开屏与显式 `#/` 都不动） | `frontend/src/router.svelte.ts` | 决策 241（不修订 240）；`router.test.ts` 的「开屏默认落点」用例 |
 | 设置落地页按用途三分（谁能进来 / 怎么找到你 / 怎么跑），各项仍是独立路由 | `frontend/src/routes/SettingsLanding.svelte` | 决策 198（三分由 272⑧ 落地） |
-| 离线通知页：一颗总开关 + 通道四件整体覆盖 `config.toml`（不许混），秘密只回显 `***` 且掩码或留空 = 不改，BlueBubbles 开启/保存先探活、够不着不当成功，节流与免打扰只读展示 | `frontend/src/routes/SettingsNotify.svelte`、`frontend/src/lib/notifyChannel.ts` | 决策 272⑥⑦⑧；判据与掩码纪律由 `notifyChannel.test.ts` 钉住，后端契约在 `crates/app/src/routes/notify.rs` |
+| 离线通知页：一颗总开关 + **通道四件**与**礼貌两件**两组单元各自整体覆盖 `config.toml`（组内不许混，两组互不牵动、各交各的），秘密只回显 `***` 且掩码或留空 = 不改，BlueBubbles 开启/保存先探活、够不着不当成功；礼貌管的是出机器那条线（浏览器 toast 另有自己一份固定表） | `frontend/src/routes/SettingsNotify.svelte`、`frontend/src/lib/notifyChannel.ts`、`frontend/src/lib/notifyPoliteness.ts` | 决策 272⑥⑦⑧；礼貌小节与两级解析由 284②③⑤ 定；判据与掩码纪律由 `notifyChannel.test.ts` / `notifyPoliteness.test.ts` 钉住，后端契约在 `crates/app/src/routes/notify.rs` |
 | 「手机访问」入口只在本机（来源回环）渲染，非本机不给入口 | `frontend/src/lib/localPage.ts`、`frontend/src/routes/SettingsLanding.svelte` | 决策 190（位子由 198 挪到落地页，行为不变） |
 | 阶段配置独立成页，从「模型与密钥」页搬出 | `frontend/src/routes/SettingsStages.svelte`、`frontend/src/components/settings/StageConfigForm.svelte` | 决策 198 / 111 / 170 |
 | 不支持的 provider 行降级灰显 + 琥珀标（**标里不带内部编号**） | `frontend/src/routes/SettingsProviders.svelte:297` | 决策 103；决策 199（编号退到 `title`） |

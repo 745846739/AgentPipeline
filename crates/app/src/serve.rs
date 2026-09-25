@@ -374,19 +374,23 @@ pub async fn serve(options: ServeOptions) -> anyhow::Result<ServerHandle> {
     };
 
     let store = Store::open(home.clone(), Arc::new(SystemClock)).await?;
-    // 离线通知（决策 268 / 270 / 272）：两级解析（界面单元 > config.toml，272⑥），
-    // 总开关关死一切（272⑧）。挂接面有两条：attention 的记账漏斗（268②）与值班长
-    // 回话收口（272②，在 `foreman.rs`）；投递 best-effort 在出口内部。解析出错只在
-    // 日志里报并把这一段关死——通知挂了不能把机器挂了（268② 的姿态）；设置页会
-    // 把同一句报文展示出来（报错不静默，272⑧）。
+    // 离线通知（决策 268 / 270 / 272 / 284）：两级解析（界面单元 > config.toml，
+    // 272⑥；礼貌两件自 284② 起同为两级），总开关关死一切（272⑧）。挂接面有两条：
+    // attention 的记账漏斗（268②）与值班长回话收口（272②，在 `foreman.rs`）；投递
+    // best-effort 在出口内部。解析出错只在日志里报并把这一段关死——通知挂了不能把
+    // 机器挂了（268② 的姿态）；设置页会把同一句报文展示出来（报错不静默，272⑧）。
     match store.notify_settings_state().await {
         Ok(notify_state) => {
             match agentpipeline_core::notify::resolve_notify_target(&config.notify, &notify_state) {
                 Ok(Some(target)) => {
+                    // 礼貌取**解析后的**那一份（284②）——启动这一路也不能漏掉界面单元。
+                    let politeness = agentpipeline_core::notify::resolve_politeness(
+                        &config.notify,
+                        &notify_state,
+                    );
                     store.set_notifier(Arc::new(agentpipeline_core::notify::WebhookNotifier::new(
                         target,
-                        config.notify.cooldown_sec,
-                        config.notify.quiet_hours,
+                        politeness,
                         Arc::new(SystemClock),
                     )));
                 }

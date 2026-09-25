@@ -95,6 +95,7 @@ describe('notifyChannel（决策 272）', () => {
       bluebubbles_recipient: 'me@icloud.com',
       cooldown_sec: 300,
       quiet_hours: [22, 8],
+      politeness_origin: 'config',
     };
     const d = draftFromSettings(s);
     expect(d.channel).toBe('bluebubbles');

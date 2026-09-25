@@ -1145,9 +1145,9 @@ export interface ForemanSendResult {
   total_calls: number;
 }
 
-/* ─────────────── 离线通知（crates/app/src/routes/notify.rs，决策 272）─────────────── */
+/* ─────────────── 离线通知（crates/app/src/routes/notify.rs，决策 272 / 284）─────────────── */
 
-/** 通知通道是谁定的（决策 272⑥ 的两级结构）：界面保存的单元，还是 `config.toml` 的 `[notify]`。 */
+/** 通知的某一级是谁定的（决策 272⑥ / 284② 的两级结构）：界面保存的单元，还是 `config.toml`。 */
 export type NotifyOrigin = 'settings' | 'config';
 
 /**
@@ -1155,20 +1155,28 @@ export type NotifyOrigin = 'settings' | 'config';
  *
  * 展示的是**生效的那一份**（单元 > 配置文件，整体覆盖）；`webhook_url` 与
  * `bluebubbles_password` 是秘密，只回常量掩码 `***`（决策 112 的范式）。
+ *
+ * 两级关系**两组各自成立**（决策 284②）：通道（`channel` / `origin`）与礼貌
+ * （`cooldown_sec` / `quiet_hours` / `politeness_origin`）可以一个来自界面、
+ * 一个来自配置文件。
  */
 export interface NotifySettings {
   /** 一颗总开关（272⑧）：整条通道开/关，非每类一颗。 */
   enabled: boolean;
   /** 生效的通道声明；null = 还没有配置任何通道（268① 零配置零行为）。 */
   channel: 'generic' | 'feishu' | 'bluebubbles' | null;
+  /** 通道是谁定的。 */
   origin: NotifyOrigin;
   webhook_url: string;
   bluebubbles_url: string;
   bluebubbles_password: string;
   bluebubbles_recipient: string;
-  /** 只读（272⑥：礼貌两件只住 config.toml，界面不改）。 */
+  /** 生效的节流窗口（秒，0 = 不节流；284② 起界面可改）。 */
   cooldown_sec: number;
+  /** 生效的免打扰 `[开始, 结束)` 本地整点；起止相同 = 全天不静默。 */
   quiet_hours: [number, number];
+  /** 礼貌两件是谁定的——通道的来源不代表礼貌的来源。 */
+  politeness_origin: NotifyOrigin;
   /** 当前两级解析不过时的原因（报错不静默，272⑧）；不在场 = 没有配置错误。 */
   config_error?: string;
 }
@@ -1180,6 +1188,14 @@ export interface NotifyChannelPayload {
   bluebubbles_url?: string;
   bluebubbles_password?: string;
   bluebubbles_recipient?: string;
+}
+
+/** `PUT /notify/politeness` 的载荷：礼貌单元**整体覆盖**（284②，与通道单元各自成立）。 */
+export interface NotifyPolitenessPayload {
+  /** 0–86400；0 = 不节流（免打扰照走）。 */
+  cooldown_sec: number;
+  /** 各 0–23；起止相同 = 全天不静默。 */
+  quiet_hours: [number, number];
 }
 
 /** `POST /notify/test` 的结论（照 `POST /providers/test`，决策 160：成功失败都 200）。 */

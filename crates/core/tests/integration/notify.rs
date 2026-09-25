@@ -17,7 +17,7 @@ use std::time::Duration;
 
 use agentpipeline_core::clock::Clock;
 use agentpipeline_core::notify::{
-    notification_class, NotifyClass, NotifyFormat, NotifyTarget, WebhookNotifier,
+    notification_class, NotifyClass, NotifyFormat, NotifyPoliteness, NotifyTarget, WebhookNotifier,
 };
 use agentpipeline_core::storage::attention::AttentionKind;
 use agentpipeline_core::storage::Store;
@@ -36,6 +36,14 @@ pub(crate) fn at_local_hour(hour: u32) -> DateTime<Utc> {
         .or_else(|| Local.from_local_datetime(&naive).earliest())
         .expect("本地整点应当可构造")
         .with_timezone(&Utc)
+}
+
+/// 一套礼貌（决策 284）：出口的构造参数收成一个值对象后，测试与生产同一个形状。
+pub(crate) fn politeness(cooldown_sec: u64, quiet_hours: [u8; 2]) -> NotifyPoliteness {
+    NotifyPoliteness {
+        cooldown_sec,
+        quiet_hours,
+    }
 }
 
 struct Fixture {
@@ -91,8 +99,7 @@ impl Fixture {
                 url: server.url("/hook"),
                 format,
             },
-            300,
-            [22, 8],
+            politeness(300, [22, 8]),
             self.clock.clone(),
         )));
     }
@@ -102,8 +109,7 @@ impl Fixture {
     fn attach_target(&self, target: NotifyTarget) -> Arc<WebhookNotifier> {
         let notifier = Arc::new(WebhookNotifier::new(
             target,
-            300,
-            [22, 8],
+            politeness(300, [22, 8]),
             self.clock.clone(),
         ));
         self.store.set_notifier(notifier.clone());
@@ -256,6 +262,55 @@ async fn quiet_hours_silence_done_but_pending_and_failed_stay() {
     assert_eq!(server.hits(), 2, "done 要被静音，总命中只能是 2");
     let raw = String::from_utf8_lossy(&server.body()).to_string();
     assert!(!raw.contains("\"task_done\""), "done 不该出站：{raw}");
+}
+
+/// 决策 284③：出口按**它被造出来时那份**礼貌说话。同一时刻同一类通知，配置级那套
+/// （300 / `[22, 8)`）在夜里静音，换成界面单元解析出来的那套（不节流、起止相同 =
+/// 全天不静默）就连着放行——「保存即活生效」的判据落在出口自己的行为上。
+#[tokio::test]
+async fn the_exit_obeys_the_politeness_it_was_built_with() {
+    let f = fixture(23).await; // 本地 23 点 = 配置级免打扰 [22, 8) 之内
+    let server = TinyHttp::spawn("200", "application/json", b"{}".to_vec(), Duration::ZERO);
+    let t0 = f.clock.now();
+
+    // 配置级那一份：夜里 done 静音。
+    f.attach(&server);
+    note(&f, AttentionKind::TaskDone, t0).await;
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert_eq!(server.hits(), 0, "配置级免打扰时段里 done 静音");
+
+    // 换成「单元解析出来的那一份」——夜里照发，且同类第二条不被节流挡。
+    f.store.set_notifier(Arc::new(WebhookNotifier::new(
+        NotifyTarget::Webhook {
+            url: server.url("/hook"),
+            format: NotifyFormat::Generic,
+        },
+        politeness(0, [8, 8]),
+        f.clock.clone(),
+    )));
+    // 三次 `occurred_at` 各不相同：attention 表按 `(task, kind, occurred_at)` 去重
+    // （`note_attention` 的 ON CONFLICT DO NOTHING），同一条发生时刻第二次不记账、
+    // 也就不出站——这里要的是三件独立的事。
+    note(
+        &f,
+        AttentionKind::TaskDone,
+        t0 + chrono::Duration::seconds(1),
+    )
+    .await;
+    assert!(
+        wait_hits(&server, 1, 3_000).await,
+        "起止相同 = 全天不静默：夜里的 done 应当出站"
+    );
+    note(
+        &f,
+        AttentionKind::TaskDone,
+        t0 + chrono::Duration::seconds(2),
+    )
+    .await;
+    assert!(
+        wait_hits(&server, 2, 3_000).await,
+        "节流 0 = 不挡第二条（单元的值真的换上了，不是缺省那份）"
+    );
 }
 
 #[tokio::test]

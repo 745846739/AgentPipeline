@@ -5646,8 +5646,7 @@ fn attach_notifier(h: &Harness, server: &TinyHttp) {
                 url: server.url("/hook"),
                 format: agentpipeline_core::notify::NotifyFormat::Generic,
             },
-            300,
-            [22, 8],
+            crate::notify::politeness(300, [22, 8]),
             Arc::new(ManualClock::new(crate::notify::at_local_hour(12))),
         )));
 }

@@ -17,6 +17,7 @@ import type {
   NodeConversation,
   NotifyChannelPayload,
   NotifyChannelTest,
+  NotifyPolitenessPayload,
   NotifySettings,
   Project,
   ProjectAnalysis,
@@ -565,6 +566,21 @@ export function saveNotifyChannel(unit: NotifyChannelPayload): Promise<{ ok: boo
 /** 交还 `config.toml` 那一级（照 `DELETE /market/repos`）；开关不动。 */
 export function clearNotifyChannel(): Promise<{ ok: boolean }> {
   return request<{ ok: boolean }>('/notify/channel', { method: 'DELETE' });
+}
+
+/**
+ * 保存**礼貌单元**（决策 284②：节流 + 免打扰整体覆盖 `config.toml`；越界由后端 400
+ * 点名，报错不静默）。开关开着时保存即生效——后端按新值重建出口。
+ */
+export function saveNotifyPoliteness(
+  unit: NotifyPolitenessPayload,
+): Promise<{ ok: boolean }> {
+  return request<{ ok: boolean }>('/notify/politeness', { method: 'PUT', body: unit });
+}
+
+/** 交还 `config.toml` 的 `[notify]` 那一份；开关与通道单元都不动（284⑦）。 */
+export function clearNotifyPoliteness(): Promise<{ ok: boolean }> {
+  return request<{ ok: boolean }>('/notify/politeness', { method: 'DELETE' });
 }
 
 /** BlueBubbles 连通性探针（照 `POST /providers/test`，决策 160：成功失败都 200）。 */

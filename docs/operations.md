@@ -712,8 +712,16 @@ iMessage——`format = "bluebubbles"` 时投递目标换成 `POST {端点}/api/
 不带 `raw` 原文。**设置入口**在 `#/settings/notify`（272⑥⑦⑧）：一颗总开关 + 通道四件
 （类型 + 端点 + password + 收件人）**整体覆盖** `config.toml`（两级，不允许混；
 `origin` 说清谁生效），password 照 provider 的 `***` 掩码范式，BlueBubbles 在开启与
-保存时先探活（`GET /api/v1/ping`）、够不着不当成功，切换**活生效**不必重启；
-`cooldown_sec` / `quiet_hours` 只住 `config.toml`。
+保存时先探活（`GET /api/v1/ping`）、够不着不当成功，切换**活生效**不必重启。
+**节流与免打扰自决策 284 起也在这一页**（「礼貌」小节，落实对 272⑥ 的显式修订：
+272⑥ 说这两件只住 `config.toml`，理由是「前端已有同语义的一份表，再开一个口就是两处
+能改同一个语义」——284 把那份表的适用范围写窄：它只管**浏览器 toast**，出口这条线的
+礼貌改由设置页说了算）。形状与通道同构而**各自成立**：界面保存的礼貌单元整体覆盖
+`config.toml` 的 `[notify].cooldown_sec` / `[notify].quiet_hours`（组内不许混，两组可以
+一个来自界面一个来自配置，各报各的 origin、各交各的）、0–86400 整数秒与 0–23 整点
+（越界 400 点名，报错不静默）、保存即按新值重建出口（`WebhookNotifier` 直接持有
+`NotifyPoliteness`）。**`0` 与「起止相同」是有含义的合法值**：前者 = 不节流，
+后者 = 全天不静默——想让夜里的推送照来，就把起止填成同一个数。
 
 **pending 超时提醒：** 任务进入 pending 超过 `pending_reminder_hours`（默认 24h）未处理，重复提醒一次；超过 `pending_timeout_hours`（默认 72h）自动标记 `stalled = 1`，看板高亮显示。提醒与高亮均通过 SSE 推送，不依赖外部渠道。**票 05 补上了那个「均通过 SSE 推送」的洞**：提醒此前只活在调度器内存的 `HashSet` 里、重启即失、从不外发——现在是 `stalled` 事件真的发出去，同时落一行 `task_stale` 待办（决策 209③）。
 

@@ -2,8 +2,10 @@
   import { onMount } from 'svelte';
   import {
     clearNotifyChannel,
+    clearNotifyPoliteness,
     getNotifySettings,
     saveNotifyChannel,
+    saveNotifyPoliteness,
     setNotifyEnabled,
     testNotifyChannel,
   } from '../api/client';
@@ -19,14 +21,24 @@
     type NotifyChannelKind,
     type NotifyDraft,
   } from '../lib/notifyChannel';
+  import {
+    describeCooldown,
+    describeQuietHours,
+    draftFromSettings as politenessDraftFromSettings,
+    parseNotifyPolitenessDraft,
+    type NotifyPolitenessDraft,
+  } from '../lib/notifyPoliteness';
 
   /**
-   * 离线通知设置页（`#/settings/notify`，决策 272⑥⑦⑧）。
+   * 离线通知设置页（`#/settings/notify`，决策 272⑥⑦⑧；284②③⑤ 添礼貌小节）。
    *
-   * **一颗总开关 + 通道四件**：开关管整条通道（非每类一颗）；通道四件（类型 + 端点 +
-   * password + 收件人）作为**一个整体**覆盖 `config.toml`（不允许混），「交还配置」
-   * 是它自己的钮（照 `#/settings/market`）。秘密照 provider 的掩码范式：读回 `***`，
-   * 掩码或留空 = 不改。
+   * **一颗总开关 + 两组单元**：开关管整条通道（非每类一颗）；通道四件（类型 + 端点 +
+   * password + 收件人）与礼貌两件（节流 + 免打扰）**各自**作为一个整体覆盖 `config.toml`
+   * （组内不允许混，两组互不牵动——284②），「交还配置」也是各交各的（照 `#/settings/market`）。
+   * 秘密照 provider 的掩码范式：读回 `***`，掩码或留空 = 不改。
+   *
+   * 礼貌两件此前只住 `config.toml`（272⑥）；284 把它们搬上这一页，**管的是出机器那条线**
+   * ——浏览器 toast 另有 `lib/notificationPolicy.ts` 一份固定表，本页不动它（页面写明）。
    *
    * 交互姿态照 `/share`：每一步成功失败都以**重读到的读数**为准（`note ok` / `note
    * bad`），不拿本地猜测冒充结果。与 `/share` 的差异要说明白：那页有 `202 + pending`
@@ -39,13 +51,28 @@
 
   let settings = $state<NotifySettings | null>(null);
   let draft = $state<NotifyDraft | null>(null);
+  let politeness = $state<NotifyPolitenessDraft | null>(null);
   let loading = $state(true);
   let error = $state<string | null>(null);
 
   let saving = $state(false);
   let toggling = $state(false);
   let testing = $state(false);
+  let savingPoliteness = $state(false);
   let note = $state<{ kind: 'ok' | 'bad'; message: string } | null>(null);
+
+  /** 礼貌草稿的实时判读：过了描述两句，没过把错摆出来（不拦输入，只提示）。 */
+  const politenessPreview = $derived.by(() => {
+    if (!politeness) return null;
+    const parsed = parseNotifyPolitenessDraft(politeness);
+    if (!parsed.ok) return { ok: false, text: parsed.error };
+    return {
+      ok: true,
+      text: `按现在的填写：${describeCooldown(parsed.payload.cooldown_sec)}；${describeQuietHours(
+        parsed.payload.quiet_hours,
+      )}`,
+    };
+  });
 
   async function load() {
     loading = true;
@@ -53,6 +80,7 @@
     try {
       settings = await getNotifySettings();
       draft = draftFromSettings(settings);
+      politeness = politenessDraftFromSettings(settings);
     } catch (err) {
       error = (err as Error).message;
     } finally {
@@ -135,6 +163,43 @@
       saving = false;
     }
   }
+
+  async function savePoliteness() {
+    if (!politeness) return;
+    const parsed = parseNotifyPolitenessDraft(politeness);
+    if (!parsed.ok) {
+      note = { kind: 'bad', message: parsed.error };
+      return;
+    }
+    savingPoliteness = true;
+    note = null;
+    try {
+      await saveNotifyPoliteness(parsed.payload);
+      await load();
+      note = {
+        kind: 'ok',
+        message: '礼貌已保存，作为整体覆盖配置文件；出口已按新值重建。',
+      };
+    } catch (err) {
+      note = { kind: 'bad', message: (err as Error).message };
+    } finally {
+      savingPoliteness = false;
+    }
+  }
+
+  async function handBackPoliteness() {
+    savingPoliteness = true;
+    note = null;
+    try {
+      await clearNotifyPoliteness();
+      await load();
+      note = { kind: 'ok', message: '已交还配置文件那一级的礼貌（节流与免打扰）。' };
+    } catch (err) {
+      note = { kind: 'bad', message: (err as Error).message };
+    } finally {
+      savingPoliteness = false;
+    }
+  }
 </script>
 
 <main class="page">
@@ -215,9 +280,8 @@
         </ul>
       </div>
       <p class="sec-note">
-        节流 {settings.cooldown_sec} 秒／类、免打扰 {settings.quiet_hours[0]}–
-        {settings.quiet_hours[1]} 点（按服务器本地时间）——这两件只住在 <b>config.toml</b>
-        的 [notify] 段里，界面不改它们（272⑥）。
+        这一格只说<b>通道</b>是谁定的；节流与免打扰在下面「礼貌」一节里改，那两件
+        各报各的来源——通道来自界面不代表礼貌也来自界面。
       </p>
     </section>
 
@@ -302,6 +366,86 @@
       </div>
     </section>
 
+    <!-- 礼貌两件（284②）：与通道单元**各自成立**的第二组——同构的整体覆盖 + provenance。 -->
+    {#if politeness}
+      <section class="block" aria-labelledby="polite-head">
+        <h2 class="sec-title" id="polite-head">礼貌</h2>
+        <p class="hintline">
+          什么时候<b>准吵</b>：节流窗口与免打扰时段。这两件管的是<b>出机器那条线</b>
+          （webhook / 飞书 / iMessage）；浏览器里的弹窗另有自己的一份固定表，不在这里改。
+        </p>
+        <div class="form">
+          <div class="row">
+            <span class="st dim">{notifyOriginLabel(settings.politeness_origin)}定的</span>
+            <span class="sec-note inline">
+              下面是<b>生效值</b>（预填）：保存即整体覆盖配置文件那一份。
+            </span>
+          </div>
+          <label class="field">
+            <span class="lab">节流（秒）</span>
+            <!-- 用 text + inputmode 而不是 `type=number`：number 输入绑出来的值是 number
+                 （空则是 undefined），判读那一层按字符串写就会当场抛——手机上的数字键盘
+                 由 inputmode 给，越界由判读给（有话说，不被浏览器静默吞掉）。 -->
+            <input
+              class="mono"
+              type="text"
+              inputmode="numeric"
+              bind:value={politeness.cooldownSec}
+            />
+            <span class="lab sub">同类通知在这个窗口内只出一条；0 = 不节流。</span>
+          </label>
+          <div class="hours">
+            <label class="field">
+              <span class="lab">免打扰开始（整点）</span>
+              <input
+                class="mono"
+                type="text"
+                inputmode="numeric"
+                bind:value={politeness.quietStart}
+              />
+            </label>
+            <label class="field">
+              <span class="lab">结束（整点）</span>
+              <input
+                class="mono"
+                type="text"
+                inputmode="numeric"
+                bind:value={politeness.quietEnd}
+              />
+            </label>
+          </div>
+          {#if politenessPreview}
+            <p class="sec-note" class:bad={!politenessPreview.ok}>{politenessPreview.text}</p>
+          {/if}
+          <p class="sec-note">
+            免打扰期间除<b>待办与失败</b>之外不出站（失败恒发、等人那条豁免——与前端
+            toast 同一张表的语义）；起止填同一个数 = 全天都送，跨零点直接写
+            <span class="mono">22 → 8</span>。按<b>服务器本地时间</b>算。
+          </p>
+          <div class="acts">
+            <button
+              type="button"
+              class="btn solid"
+              disabled={savingPoliteness}
+              onclick={() => void savePoliteness()}
+            >
+              {#if savingPoliteness}<span class="spin"></span>{/if}保存礼貌
+            </button>
+            {#if settings.politeness_origin === 'settings'}
+              <button
+                type="button"
+                class="btn quiet"
+                disabled={savingPoliteness}
+                onclick={() => void handBackPoliteness()}
+              >
+                交还配置文件
+              </button>
+            {/if}
+          </div>
+        </div>
+      </section>
+    {/if}
+
     {#if note}
       {#if note.kind === 'ok'}
         <div class="banner ok" role="status">{note.message}</div>
@@ -348,6 +492,17 @@
     line-height: 1.8;
     max-width: 86ch;
     margin-top: 8px;
+  }
+  /* 判读没过的那一行与红条同一档颜色（不新增 token）。 */
+  .sec-note.bad {
+    color: var(--stop);
+  }
+  .sec-note.inline {
+    margin-top: 0;
+  }
+  .hours {
+    display: flex;
+    gap: 12px;
   }
   .row {
     display: flex;

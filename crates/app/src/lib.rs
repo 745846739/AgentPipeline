@@ -170,7 +170,8 @@ pub fn build_router(state: AppState) -> Router {
         // pairing_guard 护住、回环豁免（丢了令牌必须还能从本机复位）。
         .route("/pairing/token", get(routes::pairing::token))
         .route("/pairing/reset", post(routes::pairing::reset))
-        // ── 离线通知设置（决策 272⑥⑦⑧）：读数 / 总开关 / 通道单元 / 探针 ──
+        // ── 离线通知设置（决策 272⑥⑦⑧；284② 添礼貌单元）：读数 / 总开关 / 通道单元 /
+        // 礼貌单元 / 探针 ──
         // 写请求照全站护栏走（跨源 + 局域网形态下的配对令牌）；读数里秘密一律掩码
         // （`***`），GET 与 /server-info 同一档：机器级事实，不是密钥。
         .route(
@@ -180,6 +181,11 @@ pub fn build_router(state: AppState) -> Router {
         .route(
             "/notify/channel",
             axum::routing::put(routes::notify::save_channel).delete(routes::notify::clear_channel),
+        )
+        .route(
+            "/notify/politeness",
+            axum::routing::put(routes::notify::save_politeness)
+                .delete(routes::notify::clear_politeness),
         )
         .route("/notify/test", post(routes::notify::test_channel))
         // 配对令牌层（决策 182㉖㉗㉘，票 07）：**必须最后执行**（最内层）——它要读
