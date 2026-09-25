@@ -304,11 +304,13 @@
   {/if}
 {/snippet}
 
+<!-- `--dock-h` 兜底 64px = 收起态手柄的估高（决策 281：坞默认收成一行）；实测值由
+     PendingDossier 的 ondockheight 写回，只兜首帧那一格。 -->
 <main
   class="detail"
   class:split={isPending}
   class:docked={isMobile && isPending}
-  style="--dock-h: {dockH > 0 ? `${dockH}px` : '122px'}"
+  style="--dock-h: {dockH > 0 ? `${dockH}px` : '64px'}"
 >
   <div class="main">
     <!-- 桌面档原先在这里挂一条「← 看板」面包屑（决策 240 摘除）：看板已是顶栏的一枚页签，

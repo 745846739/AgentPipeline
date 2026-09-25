@@ -78,14 +78,23 @@ test.describe('前端 E2E：档案盒不重复渲染 diff（票 08）', () => {
     await expect(dossier.getByRole('heading', { level: 3 })).toHaveCount(fileCount);
     await expect(dossier.getByRole('button', { name: '合入' })).toBeVisible();
 
-    // ── ④ 移动款（<480px）：底部动作坞不受影响 ──
-    // 坞里本来就只有动作、没有 diff 正文（`actionsOnly`），去重不该把它改坏。
+    // ── ④ 移动款（<480px）：动作坞默认收成一行（决策 281），点开才是动作面 ──
+    // 收起态只该有手柄——详情正文不再被常驻坞盖掉大半屏；动作与说明全量在展开层
+    // （坞里照旧没有 diff 正文，`actionsOnly`，去重不该把它改坏）。
     await page.setViewportSize({ width: 430, height: 900 });
     await page.reload();
     await settleBundle(page, bundle);
     const dock = page.locator('aside.dock');
     await expect(dock).toBeVisible({ timeout: 30_000 });
+    const head = dock.getByRole('button', { name: /等你拍板/ });
+    await expect(head).toBeVisible();
+    await expect(head).toHaveAttribute('aria-expanded', 'false');
+    await expect(dock.getByRole('button', { name: '合入' })).toHaveCount(0);
+
+    await head.click();
+    await expect(head).toHaveAttribute('aria-expanded', 'true');
     await expect(dock.getByRole('button', { name: '合入' })).toBeVisible();
+    await expect(dock.getByRole('button', { name: '返回修改' })).toBeVisible();
     await expect(dock.getByRole('heading', { level: 3 })).toHaveCount(0);
   });
 });

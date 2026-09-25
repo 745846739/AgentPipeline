@@ -72,6 +72,13 @@
   $effect(() => {
     if (dock) ondockheight?.(dockH);
   });
+
+  /**
+   * dock 模式的收展（决策 281）：坞**默认收成一行手柄**——说明、诊断与多颗 48px 钮
+   * 全住在坞里时能盖掉手机屏的大半，「常驻」的应是手柄本身；拍板面点开即全量，
+   * 异步按钮点击即禁用、坞钉在 `--sbar-h` 上沿的口径都不变。同一轮 pending 内记住展开态。
+   */
+  let open = $state(false);
 </script>
 
 {#snippet infoBlock()}
@@ -97,58 +104,64 @@
 {/snippet}
 
 {#if dock}
-  <aside class="dock" aria-label="待办" bind:clientHeight={dockH}>
-    <div class="dock-tag">⏸ 等你拍板 · {pendingLabel(reason)}</div>
-    {@render infoBlock()}
+  <aside class="dock" class:closed={!open} aria-label="待办" bind:clientHeight={dockH}>
+    <!-- 决策 281：手柄是唯一常驻物；收起态 ▲ / 展开态 ▼（光标画在 app.css 的 .dock-head） -->
+    <button type="button" class="dock-head" aria-expanded={open} onclick={() => (open = !open)}>
+      <span class="dock-tag">⏸ 等你拍板 · {pendingLabel(reason)}</span>
+    </button>
 
-    {#if pendingType === 'merge_approval'}
-      <DiffReviewPanel
-        actionsOnly
-        {diff}
-        raw={rawDiff}
-        stale={diffStale}
-        error={diffError}
-        loading={diffLoading}
-        {actions}
-        {cursors}
-        {busy}
-        {onaction}
-      />
-    {:else if pendingType === 'human_review'}
-      <ReviewForm
-        actionsOnly
-        {diff}
-        raw={rawDiff}
-        {reviewReport}
-        {unitTestReport}
-        stale={diffStale}
-        {busy}
-        error={diffError}
-        onsubmit={onsubmitreview}
-      />
-    {:else}
-      <PendingActions
-        {actions}
-        {cursors}
-        {pendingType}
-        {onaction}
-        disabled={busy}
-        isBusy={() => busy}
-      />
-    {/if}
+    {#if open}
+      {@render infoBlock()}
 
-    {#if triggerCursor}
-      <div class="ctx trigger">
-        触发节点：
-        <button type="button" class="linklike" onclick={() => ongotoconversation?.(triggerCursor.stage, triggerCursor.node)}>
-          {triggerCursor.stage}.{triggerCursor.node} ▸
-        </button>
+      {#if pendingType === 'merge_approval'}
+        <DiffReviewPanel
+          actionsOnly
+          {diff}
+          raw={rawDiff}
+          stale={diffStale}
+          error={diffError}
+          loading={diffLoading}
+          {actions}
+          {cursors}
+          {busy}
+          {onaction}
+        />
+      {:else if pendingType === 'human_review'}
+        <ReviewForm
+          actionsOnly
+          {diff}
+          raw={rawDiff}
+          {reviewReport}
+          {unitTestReport}
+          stale={diffStale}
+          {busy}
+          error={diffError}
+          onsubmit={onsubmitreview}
+        />
+      {:else}
+        <PendingActions
+          {actions}
+          {cursors}
+          {pendingType}
+          {onaction}
+          disabled={busy}
+          isBusy={() => busy}
+        />
+      {/if}
+
+      {#if triggerCursor}
+        <div class="ctx trigger">
+          触发节点：
+          <button type="button" class="linklike" onclick={() => ongotoconversation?.(triggerCursor.stage, triggerCursor.node)}>
+            {triggerCursor.stage}.{triggerCursor.node} ▸
+          </button>
+        </div>
+      {/if}
+
+      <div class="ctx">
+        <button type="button" class="linklike" onclick={() => onopenfiles?.()}>查看产出文件 ▸</button>
       </div>
     {/if}
-
-    <div class="ctx">
-      <button type="button" class="linklike" onclick={() => onopenfiles?.()}>查看产出文件 ▸</button>
-    </div>
   </aside>
 {:else}
   <!-- 急停对话框（决策 169 / theme-6-pixel.md §3）：奶油双线框 + 压在框沿上的琥珀名牌
@@ -324,24 +337,13 @@
     justify-content: flex-start;
   }
 
-  /* ── 移动版底部动作坞（<480px，theme-6 §5 转写 3）：对话框式常驻动作坞 ──
+  /* ── 移动版底部动作坞（<480px，theme-6 §5 转写 3）：对话框式动作坞，默认收成一行 ──
      dossier 的对话框内容（含工头头像）留在正文流，恢复动作下沉为固定底部坞；
-     坞带琥珀顶框 + ▼ 光标（对话框语汇），异步按钮点击即禁用。 */
+     坞带琥珀顶框（决策 281 起默认收起，手柄与 ▲/▼ 光标在 app.css 的 `.dock-head`），
+     异步按钮点击即禁用。 */
   .dock {
     max-height: 72vh;
     overflow: auto;
-  }
-  .dock .dock-tag {
-    position: relative;
-    color: var(--pending);
-    margin-bottom: 8px;
-  }
-  /* 坞内的 ▼ 光标（原型 .dock-tag::after）：琥珀，离散闪烁 */
-  .dock .dock-tag::after {
-    content: '▼';
-    float: right;
-    color: var(--pending);
-    animation: blink 1s steps(2) infinite;
   }
   .dock .msg {
     color: var(--text-hi);
