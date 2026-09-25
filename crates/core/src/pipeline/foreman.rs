@@ -551,6 +551,26 @@ pub const FOREMAN_WATCH_MARK: &str = "【值守播报】";
 /// 不是为省 token 设的）。
 pub const FOREMAN_NO_ACTION_MARK: &str = "【无需处理】";
 
+/// 值守轮**失败账**的标记（决策 271）。
+///
+/// 与 [`FOREMAN_FAILED_TURN_MARK`]（人的那一轮失败）分开的原因只有一个：线上形态的
+/// 「这一行是什么」由角色 + 正文前缀判（`message_wire`），而两者的**名牌**不该一样——
+/// 「发送失败」说的是「你刚发出去的那条没到」，而值守轮的失败账里值班经理一个字节都没发。
+/// 前缀是后端写的、后端认，前端仍只看字段（决策 252 的口径不变）。
+pub const FOREMAN_WATCH_FAILED_TURN_MARK: &str = "【值守没跑起来】";
+
+/// 值守轮失败后的**重试退避**（决策 271）：瞬时类 30s 起、每失败一次翻倍，600s 封顶。
+///
+/// 起因是 2026-09-24 的实测：provider 断供 6 分钟，对讲台多了 37 行一模一样的失败账——
+/// 失败轮不消费待办（对）+ 每 10 秒一趟（`WATCH_INTERVAL`）+ 失败不计入每小时唤醒上限
+/// （那片账只记成功与触顶），三条叠起来就是一台闹钟。
+const FOREMAN_WATCH_RETRY_BASE_SECS: i64 = 30;
+const FOREMAN_WATCH_RETRY_MAX_SECS: i64 = 600;
+/// **等也不会好**的那些类别另起一档（更长）：余额不足 / 密钥错 / 模型名错 / 上下文超窗——
+/// 按网络的节奏重试毫无意义，只会把噪声放大。
+const FOREMAN_WATCH_RETRY_CONFIG_BASE_SECS: i64 = 300;
+const FOREMAN_WATCH_RETRY_CONFIG_MAX_SECS: i64 = 1800;
+
 /// 值守轮（**自动那一轮**）不许用的工具（决策 209⑥ / 票 07；265 / 266 各扩一项）。
 ///
 /// 前两项的判据是「这一次你不在场」——主动播报是「固定成本 × 时间」，而你不在场时没有
@@ -1096,6 +1116,93 @@ impl TurnInput {
     }
 }
 
+/// 值守轮的失败状态（决策 271）：两次尝试之间隔多久、这一批失败落过什么账。
+///
+/// **只在内存**：退避是「这一次进程的运行节奏」，不是跨重启的账。一批失败的次数与类别链
+/// 也只在进程里活着——进程被杀则汇总行不出现，首行仍在，读起来是「失败过一次」：
+/// 比 37 行诚实，也不假装完整（2026-09-24 实测里进程正是被杀在批中间）。
+#[derive(Debug, Default)]
+struct WatchFailureState {
+    /// 连续失败次数（成功一次——含静默那一轮——即归零）。
+    consecutive: u32,
+    /// 下一次允许尝试的时刻；`None` = 不在退避里。
+    next_attempt_at: Option<chrono::DateTime<chrono::Utc>>,
+    /// 本批**最后落过账**的类别（去重键）：同类不再逐条落行，换类别才有下一行。
+    noted_kind: Option<String>,
+    /// 本批出现过的类别链（汇总行用）：去重、保序。
+    burst_kinds: Vec<String>,
+    /// 本批失败次数（含没落行的那些）。
+    burst_count: u32,
+    /// 本批最后一次失败的时刻。
+    burst_last_at: Option<chrono::DateTime<chrono::Utc>>,
+}
+
+impl WatchFailureState {
+    /// 退了多久之后再试（秒）。取值是常量不是配置项——照决策 224 的姿态：没有第二种诉求
+    /// 之前不扩契约。
+    fn delay_secs(kind: &str, consecutive: u32) -> i64 {
+        let (base, max) = if Self::waits_pointlessly(kind) {
+            (
+                FOREMAN_WATCH_RETRY_CONFIG_BASE_SECS,
+                FOREMAN_WATCH_RETRY_CONFIG_MAX_SECS,
+            )
+        } else {
+            (FOREMAN_WATCH_RETRY_BASE_SECS, FOREMAN_WATCH_RETRY_MAX_SECS)
+        };
+        let double = 1i64 << (consecutive.saturating_sub(1)).min(6);
+        base.saturating_mul(double).min(max)
+    }
+
+    /// 「等一等不会自己好」的类别：账单 / 鉴权 / 模型名 / 上下文超窗 / 配置。
+    ///
+    /// 归在这一档不是「不重试」（provider 那边续了费它就该自己恢复），而是**换一个节奏**：
+    /// 按网络的节奏重试余额不足，只是把噪声放大（2026-09-24 实测里前 20 行就是这个形状）。
+    fn waits_pointlessly(kind: &str) -> bool {
+        matches!(
+            kind,
+            "llm_auth" | "llm_model_not_found" | "llm_quota" | "llm_context_window" | "config"
+        )
+    }
+
+    /// 记一次失败，并回答「**这一次要不要落行**」（本批第一次 / 换了类别 → 落）。
+    fn note_failure(&mut self, kind: &str, now: chrono::DateTime<chrono::Utc>) -> bool {
+        self.consecutive = self.consecutive.saturating_add(1);
+        self.burst_count = self.burst_count.saturating_add(1);
+        self.burst_last_at = Some(now);
+        self.next_attempt_at =
+            Some(now + chrono::Duration::seconds(Self::delay_secs(kind, self.consecutive)));
+        if !self.burst_kinds.iter().any(|k| k == kind) {
+            self.burst_kinds.push(kind.to_string());
+        }
+        let first_of_kind = self.noted_kind.as_deref() != Some(kind);
+        if first_of_kind {
+            self.noted_kind = Some(kind.to_string());
+        }
+        first_of_kind
+    }
+
+    /// 成功一轮之后把这一批的账取走（清空状态）——`None` = 上一轮没失败过，不用收口。
+    ///
+    /// 归零的是**连续失败计数**与整批记录：下一次失败从 30s 档重新起算。
+    fn take_burst(&mut self) -> Option<(u32, Vec<String>, chrono::DateTime<chrono::Utc>)> {
+        let taken = self
+            .burst_last_at
+            .map(|last| (self.burst_count, self.burst_kinds.clone(), last));
+        self.consecutive = 0;
+        self.next_attempt_at = None;
+        self.noted_kind = None;
+        self.burst_kinds.clear();
+        self.burst_count = 0;
+        self.burst_last_at = None;
+        taken.filter(|(count, _, _)| *count > 0)
+    }
+
+    /// 现在还在退避里吗。
+    fn waiting(&self, now: chrono::DateTime<chrono::Utc>) -> bool {
+        self.next_attempt_at.is_some_and(|at| now < at)
+    }
+}
+
 /// 值班长运行器。
 ///
 /// 与 [`crate::pipeline::subagent::StoreSubAgentRunner`] 不同，它由 `AppState` 长期持有
@@ -1115,6 +1222,9 @@ pub struct ForemanRunner {
     /// 上下文压缩的每会话锚点缓存（决策 269③）。锁只在读改写缓存时短暂持有——
     /// 摘要调用本身在锁外跑，绝不持锁跨 await。
     compaction: Mutex<CompactionCache>,
+    /// 值守轮的失败状态（决策 271）：退避窗口 + 这一批失败落过什么账。
+    /// 与 `compaction` 同一姿态：锁只在读改写时短暂持有，绝不持锁跨 await。
+    watch_failures: Mutex<WatchFailureState>,
 }
 
 impl ForemanRunner {
@@ -1146,6 +1256,7 @@ impl ForemanRunner {
             steward_actions: None,
             turn_timeout: None,
             compaction: Mutex::new(CompactionCache::default()),
+            watch_failures: Mutex::new(WatchFailureState::default()),
         }
     }
 
@@ -1342,7 +1453,9 @@ impl ForemanRunner {
             .respond(&session, TurnInput::Human(text.to_string()))
             .await;
         if let Err(error) = &result {
-            self.record_failed_turn(&session, error, round_started_at)
+            // 人的轮：永远落账（没有「同批合并」这回事——人每一次都该看到自己那句话的结果），
+            // 也不受值守轮那条退避管（决策 271：退避只挡值守轮）。
+            self.record_failed_turn(&session, error, round_started_at, false, true)
                 .await;
         }
         result
@@ -1680,10 +1793,27 @@ impl ForemanRunner {
         } else {
             Some(serde_json::to_value(&traces)?)
         };
+        // 播报的标记由**后端**加，而模型会从历史里学会自己写一份（2026-09-25 实测：库里存成
+        // 「【值守播报】【值守播报】**无需你处置。**…」）。故这里先剥一遍，再判静默、再加——
+        // 标记只加一次。剥的自始至终是**我们自己**的标记，不是模型的措辞：剥完仍以别的字样
+        // 开头就照常播报（§2.4 的静默判据偏向播报，本改动不动它）。
+        let reply = if input.is_watch() {
+            reply
+                .trim_start()
+                .strip_prefix(FOREMAN_WATCH_MARK)
+                .map(str::trim_start)
+                .unwrap_or_else(|| reply.trim_start())
+                .to_string()
+        } else {
+            reply
+        };
         // 静默规则（决策 209④ / §2.4）：值守轮判定「无需处理」时不落**播报**——
         // 一次自愈的风吹草动不该变成一条消息，而消息本身会挤占历史窗口预算（24k 字符）。
         // 痕迹留在日志里；台账那一栏的「我处理过没有」由待办表的 `consumed_at` 回答。
-        if input.is_watch() && reply.trim_start().starts_with(FOREMAN_NO_ACTION_MARK) {
+        //
+        // 判据吃的是**剥完之后**的正文，且 `watch()` 那边按同一个 `turn.reply` 再判一次
+        // （那里决定唤醒账记静默还是播报）——两处因此看的是同一个东西。
+        if input.is_watch() && reply.starts_with(FOREMAN_NO_ACTION_MARK) {
             tracing::info!(
                 session = %session.id,
                 reply = %reply,
@@ -1700,7 +1830,8 @@ impl ForemanRunner {
         }
         let briefing_json = serde_json::to_value(&briefing)?;
         // 播报的标记由**后端**加上（不由模型自己说）：它是「这一轮不是回话」这个事实的载体，
-        // 前端靠它把主动播报与回话分开渲染，模型不该有机会说错。
+        // 前端靠它把主动播报与回话分开渲染，模型不该有机会说错。`reply` 已在上面剥过一遍，
+        // 故这里加的是**唯一**那一个。
         let content = if input.is_watch() {
             format!("{FOREMAN_WATCH_MARK}{reply}")
         } else {
@@ -1747,9 +1878,23 @@ impl ForemanRunner {
     ///
     /// **消费只在成功之后**：失败（模型报错 / 没回话）不置 `consumed_at`，下一趟还看得见
     /// 同一批——否则一次网络抖动就等于把这批事件丢了。
+    ///
+    /// **但「下一趟」不是 10 秒之后**（决策 271）：失败要退避（瞬时类 30s 起翻倍，600s 封顶；
+    /// 账单 / 配置类 300s 起，1800s 封顶），退避期内这一趟**不问、不看不说话**。退避只挡值守轮，
+    /// `say()` 一个字不动——人随时可以自己再试一次。见 [`WatchFailureState`] 的文档。
     pub async fn watch(&self) -> Result<Option<ForemanTurn>> {
         // 这一轮的起点（决策 233③）：与 `say()` 同一个用途——死轮只作废**它自己**提的提议。
         let started_at = self.store.now();
+        // 退避窗口（决策 271）：先问这一趟该不该开口，再谈有没有待办——provider 不通时
+        // 「有没有待办」这个问题的答案不影响结论。
+        if self
+            .watch_failures
+            .lock()
+            .unwrap()
+            .waiting(self.store.now())
+        {
+            return Ok(None);
+        }
         let open = self
             .store
             .open_attention(FOREMAN_ATTENTION_FETCH_LIMIT)
@@ -1830,11 +1975,26 @@ impl ForemanRunner {
         let brief = render_watch_brief(&waking);
         match self.respond(&session, TurnInput::WatchBrief(brief)).await {
             Ok(turn) => {
+                // 恢复汇总（决策 271）：退避之后**第一次成功**，把上一批失败的次数与类别链收口。
+                // 静默那一轮同样落——「provider 通了」正是最该被记下的一刻。
+                // 先取再 await：`std::sync::Mutex` 的锁不跨 await 持有（与 `compaction` 同规矩）。
+                let recovered = self.watch_failures.lock().unwrap().take_burst();
+                if let Some((count, kinds, last)) = recovered {
+                    self.note_turn(
+                        &session.id,
+                        format!(
+                            "【值守】已恢复：上一批连续失败 {count} 次（{}），最后一次 {last}。",
+                            kinds.join(" → ")
+                        ),
+                    )
+                    .await;
+                }
                 let ids: Vec<i64> = waking.iter().map(|i| i.id).collect();
                 if let Err(e) = self.store.consume_attention(&ids).await {
                     // 消费失败只记日志：下一趟会重复看到这批事件，多醒一次比丢事件便宜
                     tracing::error!(session = %session.id, "值守轮消费待办失败：{e}");
                 }
+                // 与 `respond` 里那条静默判据吃的是同一个 `turn.reply`（那里已剥掉自家标记）
                 let silent = turn.reply.trim_start().starts_with(FOREMAN_NO_ACTION_MARK);
                 // 唤醒账（票 07）：静默那一轮**也花钱**，故它同样入账——数「花了多少」
                 // 与数「醒了几次」用的是同一张表（会话行那边漏掉静默轮）。
@@ -1860,7 +2020,17 @@ impl ForemanRunner {
             Err(error) => {
                 // 失败也留痕（票 04 那条路），且**不消费**——这批事件下一趟还在。
                 // 值守轮的起点就是这一趟本身（它没有「人说的那句话」那条界线）。
-                self.record_failed_turn(&session, &error, started_at).await;
+                //
+                // 但两件事与人的轮不同（决策 271）：
+                // 1. **退避**：记一次失败并按类别定下一次允许尝试的时刻（`note_failure`），
+                //    退避期内 `watch()` 在顶上就返回了——不需要在这里做别的；
+                // 2. **同批同类只落一行**：`note_failure` 回答「这一次要不要落行」，
+                //    换类别才有下一行（「余额不足」与「连不上」是两个修法）。
+                let now = self.store.now();
+                let (kind, _) = turn_failure_reason(&error);
+                let note_row = self.watch_failures.lock().unwrap().note_failure(&kind, now);
+                self.record_failed_turn(&session, &error, started_at, true, note_row)
+                    .await;
                 Err(error)
             }
         }
@@ -1875,13 +2045,31 @@ impl ForemanRunner {
         session: &ForemanSession,
         error: &Error,
         started_at: chrono::DateTime<chrono::Utc>,
+        from_watch: bool,
+        // `false` = 这一批里**同类失败已经落过一行**了（决策 271）：账不重复落，但「作废
+        // 悬空提议」照做——那是这一轮失败的后果，与要不要再写一行无关。
+        note_row: bool,
     ) {
         let (kind, reason) = turn_failure_reason(error);
-        self.note_turn(
-            &session.id,
-            format!("{FOREMAN_FAILED_TURN_MARK}这一轮没跑起来（{kind}）：{reason}"),
-        )
-        .await;
+        if note_row {
+            // 两个标记分开：值守轮的失败账不该顶着「发送失败」那块名牌（决策 271）——
+            // 名牌说的是「你刚发出去的那条没到」，而那一批里值班经理一个字节都没发。
+            let mark = if from_watch {
+                FOREMAN_WATCH_FAILED_TURN_MARK
+            } else {
+                FOREMAN_FAILED_TURN_MARK
+            };
+            let tail = if from_watch {
+                "（此后同类失败不再逐条落账；本批恢复或换类别时才有下一行）"
+            } else {
+                ""
+            };
+            self.note_turn(
+                &session.id,
+                format!("{mark}这一轮没跑起来（{kind}）：{reason}{tail}"),
+            )
+            .await;
+        }
         self.invalidate_round_proposals(&session.id, started_at)
             .await;
     }

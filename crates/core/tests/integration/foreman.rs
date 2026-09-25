@@ -18,9 +18,9 @@ use agentpipeline_core::metrics;
 use agentpipeline_core::pipeline::foreman::{
     build_briefing, foreman_turn_in_flight, parse_attribution, situation_fingerprint, trim_history,
     Attribution, AttributionKind, ForemanRunner, COMPACTION_MARK, FOREMAN_AGENT_TYPE,
-    FOREMAN_ATTRIBUTION_MARK, FOREMAN_FAILED_TURN_MARK, FOREMAN_MAX_ROUNDS,
+    FOREMAN_ATTRIBUTION_MARK, FOREMAN_FAILED_TURN_MARK, FOREMAN_MAX_ROUNDS, FOREMAN_NO_ACTION_MARK,
     FOREMAN_PARTIAL_TURN_MARK, FOREMAN_PERSONA, FOREMAN_STAGE_KEY, FOREMAN_TOOL_SPECS,
-    FOREMAN_WATCH_MARK, OPERATION_LOG_MARK,
+    FOREMAN_WATCH_FAILED_TURN_MARK, FOREMAN_WATCH_MARK, OPERATION_LOG_MARK,
 };
 use agentpipeline_core::sse::{SseEvent, SseEventType, ToolPhase};
 use agentpipeline_core::storage::foreman::NewForemanMessage;
@@ -1242,6 +1242,221 @@ async fn a_no_action_verdict_is_recorded_silently() {
     );
     // 但这件事**被处理过了**：不消费的话它会一夜被反复唤醒
     assert!(h.store.open_attention(100).await.unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn a_failing_watch_backs_off_and_notes_the_burst_once() {
+    // 决策 271：2026-09-24 实测——provider 断供 6 分钟，对讲台多了 37 行一模一样的失败账
+    // （每 10 秒一条）。四条行为一起钉：退避期内零调用 / 退避到期才再试 / 台账只有一行 /
+    // 恢复时一条汇总。
+    let h = Harness::seeded().await;
+    note(
+        &h,
+        "t1",
+        agentpipeline_core::storage::AttentionKind::TaskPending,
+    )
+    .await;
+    h.clock.advance_secs(61);
+
+    let boom = || testkit::Step::Fail {
+        kind: "llm_network".into(),
+        message: "连不上 provider".into(),
+        raw: "HTTP 请求失败".into(),
+    };
+    let mut script = Script::new();
+    script
+        .for_foreman()
+        .push(boom())
+        .push(boom())
+        .text("t1 的待办看过了，需要你拍板。");
+    let agent = FakeAgent::new(script);
+    let runner = h.runner(agent.clone());
+
+    // 第一趟：真尝试、真失败；落一行失败账，待办不消费
+    assert!(runner.watch().await.is_err());
+    assert_eq!(agent.total_calls(), 1, "第一趟真的叫了模型");
+    let sid = h.latest_session().await;
+    let after_first = h.store.list_foreman_messages(&sid, 100).await.unwrap();
+    assert_eq!(after_first.len(), 1, "只有那一行失败账：{after_first:?}");
+    assert!(
+        after_first[0]
+            .content
+            .starts_with(FOREMAN_WATCH_FAILED_TURN_MARK),
+        "值守轮的失败账带自己的标记：{}",
+        after_first[0].content
+    );
+    assert!(
+        after_first[0].content.contains("不再逐条落账"),
+        "首行要说清「为什么只看到一行」：{}",
+        after_first[0].content
+    );
+    assert_eq!(
+        h.store.open_attention(100).await.unwrap().len(),
+        1,
+        "失败不消费"
+    );
+
+    // 同一时刻再来一趟：退避期内**不问、不看不说话**
+    assert!(runner.watch().await.unwrap().is_none());
+    assert_eq!(agent.total_calls(), 1, "退避期内零模型调用");
+
+    // 瞬时类 30s 到期 → 允许再试；仍失败，但**不再落第二行**
+    h.clock.advance_secs(30);
+    assert!(runner.watch().await.is_err());
+    assert_eq!(agent.total_calls(), 2, "窗口到了才再试");
+    assert_eq!(
+        h.store
+            .list_foreman_messages(&sid, 100)
+            .await
+            .unwrap()
+            .len(),
+        1,
+        "同批同类只落一行"
+    );
+
+    // 第二次失败后窗口翻倍到 60s：差一秒都不许试
+    h.clock.advance_secs(59);
+    assert!(runner.watch().await.unwrap().is_none());
+    assert_eq!(agent.total_calls(), 2, "翻倍窗口没到");
+    h.clock.advance_secs(1);
+
+    // 第三趟成功 → 播报 + 恢复汇总 + 待办被消费
+    let turn = runner.watch().await.unwrap().expect("第三趟应当醒一次");
+    assert_eq!(agent.total_calls(), 3);
+    assert!(turn.reply.contains("拍板"), "{}", turn.reply);
+    let after = h.store.list_foreman_messages(&sid, 100).await.unwrap();
+    assert_eq!(after.len(), 3, "失败账 + 播报 + 恢复汇总：{after:?}");
+    assert!(
+        after[1].content.starts_with(FOREMAN_WATCH_MARK),
+        "第二行是播报：{}",
+        after[1].content
+    );
+    assert!(
+        after[2].content.contains("已恢复")
+            && after[2].content.contains("2 次")
+            && after[2].content.contains("llm_network"),
+        "第三行是恢复汇总（次数与类别链都要在）：{}",
+        after[2].content
+    );
+    assert!(
+        h.store.open_attention(100).await.unwrap().is_empty(),
+        "成功才消费"
+    );
+}
+
+#[tokio::test]
+async fn a_billing_class_failure_backs_off_longer_than_a_network_one() {
+    // 决策 271 的分档：账单 / 配置类**等也不会自己好**，起步就是 5 分钟——
+    // 按网络的节奏重试余额不足只是把噪声放大。
+    let h = Harness::seeded().await;
+    note(
+        &h,
+        "t1",
+        agentpipeline_core::storage::AttentionKind::TaskPending,
+    )
+    .await;
+    h.clock.advance_secs(61);
+    let mut script = Script::new();
+    script
+        .for_foreman()
+        .push(testkit::Step::Fail {
+            kind: "llm_quota".into(),
+            message: "provider 额度不足（余额 / 配额）".into(),
+            raw: "HTTP 400：insufficient credits".into(),
+        })
+        .text("t1 的待办看过了。");
+    let agent = FakeAgent::new(script);
+    let runner = h.runner(agent.clone());
+
+    assert!(runner.watch().await.is_err());
+    let sid = h.latest_session().await;
+    let first = h.store.list_foreman_messages(&sid, 100).await.unwrap();
+    assert!(
+        first[0].content.contains("llm_quota"),
+        "类别要落进台账：{}",
+        first[0].content
+    );
+
+    // 瞬时类此刻（30s）就该允许了，而它是账单类——不许
+    h.clock.advance_secs(30);
+    assert!(runner.watch().await.unwrap().is_none());
+    assert_eq!(agent.total_calls(), 1, "账单类不按网络的节奏重试");
+
+    // 300s 到期才允许再试
+    h.clock.advance_secs(270);
+    let turn = runner
+        .watch()
+        .await
+        .unwrap()
+        .expect("300s 到了应当再试一次");
+    assert_eq!(agent.total_calls(), 2);
+    assert!(turn.reply.contains("看过了"), "{}", turn.reply);
+}
+
+#[tokio::test]
+async fn the_watch_mark_is_added_once_and_silence_survives_the_model_writing_it() {
+    // 决策 271：2026-09-25 实测——模型从历史里学会 `【值守播报】` 自己写了一遍，库里存成
+    // 「【值守播报】【值守播报】**无需你处置。**…」；而回话以那个前缀开头时，本该静默的一轮
+    // 被当成播报发了出去（静默判据被自家标记顶掉）。
+    //
+    // ① 模型自己写前缀：库里只留一个，回给调用方的正文是剥过的
+    let h = Harness::seeded().await;
+    note(
+        &h,
+        "t1",
+        agentpipeline_core::storage::AttentionKind::TaskPending,
+    )
+    .await;
+    h.clock.advance_secs(61);
+    let mut script = Script::new();
+    script
+        .for_foreman()
+        .text(&format!("{FOREMAN_WATCH_MARK}三条任务在跑，两条已完工。"));
+    let agent = FakeAgent::new(script);
+    let runner = h.runner(agent.clone());
+    let turn = runner.watch().await.unwrap().expect("应当醒一次");
+    assert_eq!(
+        turn.reply, "三条任务在跑，两条已完工。",
+        "回给调用方的正文不带我们自己的前缀"
+    );
+    let sid = h.latest_session().await;
+    let rows = h.store.list_foreman_messages(&sid, 100).await.unwrap();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(
+        rows[0].content,
+        format!("{FOREMAN_WATCH_MARK}三条任务在跑，两条已完工。"),
+        "前缀只加一次"
+    );
+
+    // ② 前缀 + 静默哨兵：仍然静默（不落播报行），事件照样被消费
+    let h2 = Harness::seeded().await;
+    note(
+        &h2,
+        "t1",
+        agentpipeline_core::storage::AttentionKind::TaskPending,
+    )
+    .await;
+    h2.clock.advance_secs(61);
+    let mut script2 = Script::new();
+    script2
+        .for_foreman()
+        .text(&format!("{FOREMAN_WATCH_MARK} {FOREMAN_NO_ACTION_MARK}"));
+    let agent2 = FakeAgent::new(script2);
+    let runner2 = h2.runner(agent2.clone());
+    assert!(runner2.watch().await.unwrap().is_none(), "静默轮不返回回话");
+    let sid2 = h2.latest_session().await;
+    assert!(
+        h2.store
+            .list_foreman_messages(&sid2, 100)
+            .await
+            .unwrap()
+            .is_empty(),
+        "静默 = 不落播报行"
+    );
+    assert!(
+        h2.store.open_attention(100).await.unwrap().is_empty(),
+        "但这件事被处理过了"
+    );
 }
 
 #[tokio::test]

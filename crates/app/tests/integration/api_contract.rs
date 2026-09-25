@@ -13,7 +13,8 @@ use agentpipeline_core::agent::repo::Libgit2Repo;
 use agentpipeline_core::agent::tools::CommandRecorder;
 use agentpipeline_core::config::Settings;
 use agentpipeline_core::pipeline::foreman::{
-    situation_fingerprint, FOREMAN_FAILED_TURN_MARK, FOREMAN_WATCH_MARK,
+    situation_fingerprint, FOREMAN_FAILED_TURN_MARK, FOREMAN_WATCH_FAILED_TURN_MARK,
+    FOREMAN_WATCH_MARK,
 };
 use agentpipeline_core::pipeline::ForemanRunner;
 use agentpipeline_core::sse::{SseEvent, SseEventType};
@@ -6675,9 +6676,10 @@ async fn the_session_wire_carries_the_parsed_attribution() {
 /// 系统写的」的标记。本票只改**前端怎么认**，不改**后端写什么**——故这里同时断言前缀还在，
 /// 免得后来者顺手把它当残留删掉。
 ///
-/// 三段各自独立的班次（基表一段、值守失败一段、助理轮带前缀一段）：
-/// `kind` 与 `proactive` 的分工只有在「值守轮失败了」那一格上才看得全（今天它落成
-/// `failed` 且 `proactive = false`），而「助理轮的正文前缀不参与判定」那一格防的是伪造面。
+/// 三段各自独立的班次（基表一段、值守失败与人的失败各一段、助理轮带前缀一段）：
+/// `kind` 与 `proactive` 的分工只有在「值守轮失败了」那一格上才看得全（决策 271 起它落成
+/// `failed` 且 `proactive = true`——与人的那一轮失败同名不同来历），而「助理轮的正文前缀
+/// 不参与判定」那一格防的是伪造面。
 /// 直接落库而不是走 `POST /foreman/messages`——本票验的是**线上形态**，不是写入路径。
 #[tokio::test]
 async fn the_session_wire_says_what_each_row_is() {
@@ -6756,9 +6758,10 @@ async fn the_session_wire_says_what_each_row_is() {
     );
 
     // 正交的那一格（决策 252③）：**值守轮失败**——「自发的轮」与「失败了」同时成立。
-    // 它今天落成一条 `system` + 失败前缀的行：`kind = "failed"`、`proactive = false`，
-    // 与一条普通失败轮在形状上一模一样。这正是两个字段分开承载的理由：界面此后有位置
-    // 放「这一轮是它自己醒来说的、而且没跑起来」，且不必再动线上形状。
+    // 决策 252③ 说的「两个字段分开写，将来要显示时不必再改线」在决策 271 落到了真值上：
+    // 值守轮的失败账带自己的前缀（`【值守没跑起来】`），于是这一格是
+    // `kind = "failed"` + `proactive = true`——名牌据此把它与人的「发送失败」分开写。
+    // **字段集没动**，动的只是那一格的取值。
     //
     // 注意 `assistant` 行**不**因正文前缀被判成 `failed`：失败账一律由后端以 `system` 写
     // （`record_failed_turn` / `record_interrupted_turn`），而助理轮的正文来自模型——
@@ -6771,7 +6774,15 @@ async fn the_session_wire_says_what_each_row_is() {
         ))
         .await
         .unwrap();
-    // 紧接着值守轮自己失败了（后端写 `system` 行）。
+    // 紧接着值守轮自己失败了（后端写 `system` 行，前缀带「值守」）。
+    store
+        .append_foreman_message(NewForemanMessage::system(
+            &watcher,
+            format!("{FOREMAN_WATCH_FAILED_TURN_MARK}这一轮没跑起来（llm_quota）：额度不足"),
+        ))
+        .await
+        .unwrap();
+    // 人的那一轮失败**不在**值守那一档：同样是 `failed`，而 `proactive` 是 `false`。
     store
         .append_foreman_message(NewForemanMessage::system(
             &watcher,
@@ -6782,15 +6793,16 @@ async fn the_session_wire_says_what_each_row_is() {
     let (status, body) = get(&api, &format!("/foreman/session?session={watcher}")).await;
     assert_eq!(status, StatusCode::OK, "{body}");
     let rows = body["messages"].as_array().unwrap();
-    assert_eq!(rows.len(), 2);
+    assert_eq!(rows.len(), 3);
     // 播报那一轮：`fm` + `proactive`。
     assert_eq!(rows[0]["kind"], "fm");
     assert_eq!(rows[0]["proactive"], true);
-    // 它失败的那一轮：`failed`，而「它本来是自发的」这件事今天在形状上仍无处安放
-    // （写入路径给的是 `system`）——两个字段只是**为它留了位**：决策 252③ 说的是
-    // 「分开写，将来要显示时不必再改线」，故今天照实际值断言即可。
+    // 它失败的那一轮：`failed` + `proactive`——「它本来是自发的」在形状上**有位置**了。
     assert_eq!(rows[1]["kind"], "failed");
-    assert_eq!(rows[1]["proactive"], false);
+    assert_eq!(rows[1]["proactive"], true);
+    // 人的轮失败：`failed`，而 `proactive` 是 `false`（两行同名不同来历，靠这一个布尔分开）。
+    assert_eq!(rows[2]["kind"], "failed");
+    assert_eq!(rows[2]["proactive"], false);
 
     // 助理轮的正文前缀不参与判定（防伪造）：模型自己写这个前缀，那一行仍是「值班长的话」。
     let forged = fresh_session(&api).await;

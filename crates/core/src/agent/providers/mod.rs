@@ -56,6 +56,13 @@ pub enum LlmErrorKind {
     Network,
     /// 超出上下文窗口（400 + 长度/上下文相关错误体）。
     ContextWindow,
+    /// **额度 / 账单不足**（402，或错误体里的余额 / 配额字样）——决策 271。
+    ///
+    /// 来历是 2026-09-24 的实测：本地代理回 `HTTP 400 …insufficient credits…`，`from_http`
+    /// 认不出这段体 → 落进 `Error::Llm` → 台账类别读作 `llm_network`、指引写「请检查 base_url
+    /// 是否正确、网络是否可达」。**一次账单问题被读成配置问题**，而且按网络类的节奏重试。
+    /// 等一等不会自己好，动作在 provider 那一侧（续费 / 换 provider），故它单独一档。
+    Quota,
 }
 
 impl LlmErrorKind {
@@ -72,6 +79,9 @@ impl LlmErrorKind {
             LlmErrorKind::ContextWindow => {
                 "请求超出模型上下文窗口：请换用更大上下文窗口的模型，或调大 context_window 配置"
             }
+            LlmErrorKind::Quota => {
+                "provider 额度不足（余额 / 配额）：这不是网络问题——续费或换一个 provider 再试"
+            }
         }
     }
 
@@ -82,6 +92,7 @@ impl LlmErrorKind {
             LlmErrorKind::ModelNotFound => "llm_model_not_found",
             LlmErrorKind::Network => "llm_network",
             LlmErrorKind::ContextWindow => "llm_context_window",
+            LlmErrorKind::Quota => "llm_quota",
         }
     }
 
@@ -92,6 +103,8 @@ impl LlmErrorKind {
         match status {
             401 | 403 => Some(LlmErrorKind::Auth),
             404 => Some(LlmErrorKind::ModelNotFound),
+            // 402 = Payment Required，字面就是额度。与错误体无关（有代理只给状态码）
+            402 => Some(LlmErrorKind::Quota),
             // 400 区域：模型名错误与超长是两种不同的用户动作，按错误体区分
             400 => {
                 if has(&[
@@ -111,6 +124,19 @@ impl LlmErrorKind {
                     "token limit",
                 ]) {
                     Some(LlmErrorKind::ContextWindow)
+                } else if has(&[
+                    // 额度 / 账单那一族（决策 271）。放在模型名与超长之后：那两支更具体，
+                    // 而「insufficient credits」这类体里不会同时出现模型名或长度字样。
+                    "insufficient credit",
+                    "insufficient_quota",
+                    "insufficient quota",
+                    "quota exceeded",
+                    "exceeded your quota",
+                    "payment required",
+                    "billing",
+                    "insufficient balance",
+                ]) {
+                    Some(LlmErrorKind::Quota)
                 } else {
                     None
                 }
@@ -760,6 +786,24 @@ mod tests {
             K::from_http(400, "This model's maximum context length is 8192 tokens"),
             Some(K::ContextWindow)
         );
+        // 额度 / 账单：402 与「余额不足」类错误体（决策 271 的实测来源就是这一句）
+        assert_eq!(K::from_http(402, "{}"), Some(K::Quota));
+        assert_eq!(
+            K::from_http(
+                400,
+                r#"{"error":{"message":"You have insufficient credits to make this request."}}"#
+            ),
+            Some(K::Quota)
+        );
+        assert_eq!(
+            K::from_http(400, r#"{"error":{"code":"insufficient_quota"}}"#),
+            Some(K::Quota)
+        );
+        // 新规则不吃掉老规则：只提 model 字样的 400 仍判模型不存在
+        assert_eq!(
+            K::from_http(400, r#"{"error":{"message":"model invalid"}}"#),
+            Some(K::ModelNotFound)
+        );
         // 未知情形必须退回原始串——不给错误指引比不给指引更糟
         assert_eq!(K::from_http(400, "weird vendor body"), None);
         assert_eq!(
@@ -770,7 +814,13 @@ mod tests {
         assert_eq!(K::from_http(500, "internal"), None);
 
         // 每个已知类别都有中文提示，且提示里不泄漏原始返回体
-        for kind in [K::Auth, K::ModelNotFound, K::Network, K::ContextWindow] {
+        for kind in [
+            K::Auth,
+            K::ModelNotFound,
+            K::Network,
+            K::ContextWindow,
+            K::Quota,
+        ] {
             let advice = kind.advice();
             assert!(!advice.is_empty(), "{kind:?} 缺少可操作提示");
             assert!(advice.contains('：'), "提示应含指引冒号：{advice}");
@@ -778,6 +828,7 @@ mod tests {
         // 稳定标识：进 pending.context.diagnostic 之外的 kind 字段，供断言与检索
         assert_eq!(K::Auth.as_str(), "llm_auth");
         assert_eq!(K::Network.as_str(), "llm_network");
+        assert_eq!(K::Quota.as_str(), "llm_quota");
     }
 
     #[test]

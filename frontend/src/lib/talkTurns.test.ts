@@ -1,6 +1,6 @@
 import type { ForemanMessage, ForemanProposal, ForemanSession } from '../api/types';
 import type { ForemanStreamState } from '../realtime/foreman';
-import { buildTurns, type TalkTurnsInput } from './talkTurns';
+import { buildTurns, turnName, type TalkTurnsInput } from './talkTurns';
 
 /**
  * 对讲台时间线的回合构造（票 02；决策 251 的三块判断之一）。
@@ -455,5 +455,29 @@ describe('提问轮（决策 265，第三种轮型）：载荷读字段、「已
     expect(b.ask).toBeNull();
     expect(c.kind).toBe('ask');
     expect(c.ask!.options).toHaveLength(2);
+  });
+});
+
+/**
+ * 名牌那张表（决策 271）：**值守轮的失败账不叫「发送失败」**。
+ *
+ * 2026-09-24 的实测里，值守轮因 provider 断供连失 37 轮，而那些行在时间线上顶着
+ * 「发送失败」——那一批里值班经理一个字节都没发出去。判据是两个后端字段：
+ * `failed` + `proactive`（后者由后端从自家前缀派出来，界面不解析正文）。
+ */
+describe('名牌（turnName）', () => {
+  it('人的那一轮失败：发送失败（本地那一轮与台账那一行同名）', () => {
+    expect(turnName({ kind: 'failed', proactive: false })).toBe('发送失败');
+  });
+
+  it('值守轮的失败账：值守 · 没跑起来（不再冒充「发送失败」）', () => {
+    expect(turnName({ kind: 'failed', proactive: true })).toBe('值守 · 没跑起来');
+  });
+
+  it('其余各档逐字保留', () => {
+    expect(turnName({ kind: 'mine', proactive: false })).toBe('值班经理');
+    expect(turnName({ kind: 'console', proactive: false })).toBe('操作台');
+    expect(turnName({ kind: 'fm', proactive: false })).toBe('值班长');
+    expect(turnName({ kind: 'fm', proactive: true })).toBe('值班长 · 值守');
   });
 });

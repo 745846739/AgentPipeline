@@ -32,7 +32,7 @@
 
 use agentpipeline_core::pipeline::foreman::{
     situation_drift, situation_fingerprint, FOREMAN_AGENT_TYPE, FOREMAN_FAILED_TURN_MARK,
-    FOREMAN_STAGE_KEY, FOREMAN_TOOL_SPECS, FOREMAN_WATCH_MARK,
+    FOREMAN_STAGE_KEY, FOREMAN_TOOL_SPECS, FOREMAN_WATCH_FAILED_TURN_MARK, FOREMAN_WATCH_MARK,
 };
 use agentpipeline_core::sse::SseEvent;
 use agentpipeline_core::storage::foreman::{
@@ -1133,7 +1133,14 @@ fn message_wire(m: &ForemanMessage) -> serde_json::Value {
     // 「这一行是谁说的」——四个取值只有这里是判定点（`role` 列是三个值的观测字段）。
     let kind = match m.role.as_str() {
         FOREMAN_ROLE_USER => "mine",
-        FOREMAN_ROLE_SYSTEM if m.content.starts_with(FOREMAN_FAILED_TURN_MARK) => "failed",
+        // 两种失败账同一个 `kind`（都是「没跑起来的那一轮」），差别在 `proactive`：
+        // 值守轮那一份由它自己的前缀认（决策 271）。
+        FOREMAN_ROLE_SYSTEM
+            if m.content.starts_with(FOREMAN_WATCH_FAILED_TURN_MARK)
+                || m.content.starts_with(FOREMAN_FAILED_TURN_MARK) =>
+        {
+            "failed"
+        }
         FOREMAN_ROLE_SYSTEM => "console",
         // 结构化选项提问（决策 265）：assistant 且带载荷 → `ask`。判定点与决策 252 的
         // 其余分支同一处——前端拿字段，不从正文里抠选项。
@@ -1143,9 +1150,19 @@ fn message_wire(m: &ForemanMessage) -> serde_json::Value {
         // 「值班长」一侧」）——本票只把判定点从界面挪到后端，不顺手改这一档的归属。
         _ => "fm",
     };
-    // 「是不是它自己醒来说的」——值守播报由后端加前缀（决策 209④），故判定点也在这边。
-    // 只在助理轮上成立：同样带前缀的用户行不是播报（人可能恰好引用了那个标记）。
-    let proactive = m.role == FOREMAN_ROLE_ASSISTANT && m.content.starts_with(FOREMAN_WATCH_MARK);
+    // 「是不是它自己醒来的那一轮」——播报（助理轮 + 播报前缀，决策 209④）与**值守轮的失败账**
+    // （`system` 行 + 值守失败前缀，决策 271）都算：两个前缀都由后端加，故判定点也在这边。
+    //
+    // 决策 252③ 说的「两个字段分开写，将来要显示时不必再改线」正是这一格：字段集没动，
+    // 只是「自发的轮失败了」这一格终于有了真值（此前它恒为 `false`，因为派生把「自发的」
+    // 写死在助理轮上）——名牌据此把「值守 · 没跑起来」与「发送失败」分开。
+    //
+    // 仍只在**后端写的前缀**上成立：人可能恰好在自己那句里引用那个标记，故用户行不看。
+    let proactive = match m.role.as_str() {
+        FOREMAN_ROLE_ASSISTANT => m.content.starts_with(FOREMAN_WATCH_MARK),
+        FOREMAN_ROLE_SYSTEM => m.content.starts_with(FOREMAN_WATCH_FAILED_TURN_MARK),
+        _ => false,
+    };
     json!({
         "id": m.id,
         "session_id": m.session_id,

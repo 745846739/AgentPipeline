@@ -258,3 +258,30 @@ export function buildTurns(input: TalkTurnsInput): TurnView[] {
   }
   return out;
 }
+
+/**
+ * 这一轮的名牌写什么（决策 252 的判定点收口 + 决策 271）。
+ *
+ * **值守轮的失败账与人的那一轮失败必须分开写**（决策 271）：2026-09-24 的实测里，
+ * 值守轮因 provider 断供连失 37 轮，而那些行在时间线上顶着「发送失败」——那一批里值班经理
+ * 一个字节都没发出去，读起来却像是他的话发不出去。判据是后端给的两个字段
+ * （`kind` = 没跑起来、`proactive` = 这一行属于值守轮自己醒来的那一轮）：
+ * 界面**不解析正文前缀**（决策 252 的边界一个字不动）。
+ *
+ * 为什么抽成函数：模板里那段嵌套三元式没有机器门（`Talk.svelte` 的断言只有 e2e），
+ * 而这张表是**文案规格**——决策 199 要求它可追溯、可钉住。函数在 `talkTurns.test.ts` 里逐档断言。
+ */
+export function turnName(turn: Pick<TurnView, 'kind' | 'proactive'>): string {
+  switch (turn.kind) {
+    case 'failed':
+      return turn.proactive ? '值守 · 没跑起来' : '发送失败';
+    case 'mine':
+      return '值班经理';
+    case 'console':
+      return '操作台';
+    // 认不出的也落值班长一侧（与 `message_wire` 的兜底同口径）：提案轮自带一块渲染，
+    // 走不到这里。
+    default:
+      return turn.proactive ? '值班长 · 值守' : '值班长';
+  }
+}

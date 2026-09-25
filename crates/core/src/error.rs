@@ -47,7 +47,8 @@ pub enum Error {
     /// 「该去改什么」。未识别的错误一律仍走 `Llm`——宁可退回原始串，不误标类别。
     #[error("{message}")]
     LlmClassified {
-        /// 稳定标识（`llm_auth` / `llm_model_not_found` / `llm_network` / `llm_context_window`）。
+        /// 稳定标识（`llm_auth` / `llm_model_not_found` / `llm_network` / `llm_context_window` /
+        /// `llm_quota`）。
         kind: String,
         /// 中文可操作提示（写入 `pending.message`）。
         message: String,

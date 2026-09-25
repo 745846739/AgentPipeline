@@ -75,7 +75,7 @@
     type SeenAt,
     type SessionMark,
   } from '../lib/talkSessions';
-  import { buildTurns, type TurnView } from '../lib/talkTurns';
+  import { buildTurns, turnName, type TurnView } from '../lib/talkTurns';
   import { isPairingRequired } from '../lib/sharePairing';
   import { actionKey } from '../lib/actions';
   import { TaskStream, type StreamStatus } from '../realtime/connection';
@@ -1732,17 +1732,9 @@
           class:failed={turn.kind === 'failed'}
           class:console={turn.kind === 'console'}
         >
-          <div class="dname">
-            {turn.kind === 'failed'
-              ? '发送失败'
-              : turn.kind === 'mine'
-                ? '值班经理'
-                : turn.kind === 'console'
-                  ? '操作台'
-                  : turn.proactive
-                    ? '值班长 · 值守'
-                    : '值班长'}
-          </div>
+          <!-- 名牌那五个词是一张文案规格，判据住在 `lib/talkTurns.ts::turnName`（决策 252 / 271）：
+               值守轮的失败账（`failed` + `proactive`）不叫「发送失败」。 -->
+          <div class="dname">{turnName(turn)}</div>
           <p class:streaming={turn.streaming}>{turn.content}</p>
 
           <!-- 正在发生的工具调用（决策 244）：**实时**，不是等这一轮落库。

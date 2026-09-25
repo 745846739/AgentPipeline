@@ -980,7 +980,8 @@ export interface ForemanMessage {
   attribution_reason?: string | null;
   /**
    * **这一行是什么**（决策 252）：`mine`（值班经理的话）/ `console`（操作台记的一轮）/
-   * `failed`（没跑起来的那一轮）/ `fm`（值班长的话）/ `ask`（提问轮，决策 265）。
+   * `failed`（没跑起来的那一轮，**人的与值守轮的都算**——两者由 `proactive` 分开）/
+   * `fm`（值班长的话）/ `ask`（提问轮，决策 265）。
    *
    * 由**后端判定**：这几个前缀是后端拼进正文的 / 字段是后端给的，界面此前靠 `startsWith`
    * 自己认——常量漂了只是症状，「正文即接口」才是病。认不出的 `role` 值落到 `fm`
@@ -988,10 +989,11 @@ export interface ForemanMessage {
    */
   kind: 'mine' | 'console' | 'failed' | 'fm' | 'ask';
   /**
-   * 这一轮是不是**值班长自己醒来说的**（值守播报，决策 209④）。
+   * 这一轮是不是**值班长自己醒来的那一轮**（值守播报，决策 209④；值守轮的失败账，决策 271）。
    *
    * 与 `kind` **正交**（决策 252③）：「自发的轮失败了」是可能的组合——那里 `kind = "failed"`
-   * 且 `proactive = false`（播报要求助理轮）。压成一个枚举会让这个组合从形状上不可能。
+   * 且 `proactive = true`（播报要求助理轮，而失败账是 `system` 行）。压成一个枚举会让这个
+   * 组合从形状上不可能，而界面正是靠它把「值守 · 没跑起来」与「发送失败」分开写。
    */
   proactive: boolean;
   /**
