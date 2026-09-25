@@ -21,7 +21,6 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use crate::agent::client::{LlmClient, LlmRequest, Message};
-use crate::agent::file_policy::FileToolPolicy;
 use crate::agent::metadata::parse_metadata;
 use crate::agent::prompts::{build_system_prompt, load_agents_context};
 use crate::agent::tools::{ToolCallContext, ToolExecutor};
@@ -351,7 +350,11 @@ impl ModelInvoke {
             .unwrap_or_else(|| home.worktree_path(&task.id).display().to_string());
         let task_dir = home.task_dir(&task.id).display().to_string();
 
-        let policy = FileToolPolicy::new(vec![worktree.clone().into(), task_dir.clone().into()]);
+        let policy = crate::agent::file_policy::pipeline_file_policy(
+            Path::new(&worktree),
+            Path::new(&task_dir),
+            self.settings.file_access_unrestricted,
+        );
         // 阶段配置消费（§10.6.3 / 决策 22 / 46 / 111）：persona、采样参数、工具与技能增量。
         // **在构造执行器之前读**：环境层档位要喂给执行点那道闸（决策 206），而它来自
         // 这一份配置——构造完再读就得回头改执行器的状态。

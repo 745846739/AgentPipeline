@@ -76,14 +76,42 @@ pub fn default_deny_paths() -> Vec<String> {
 /// **前缀语义**是靠 `matches_pattern` 的既有规则给的：含 `/` 且不含 `*` 的模式按
 /// 「等于它或落在它之下」判定。值是**绝对路径**，故 `data` 这个目录名在别处出现
 /// （比如某个项目自己有个 `data/`）不受影响——收的是这一个，不是所有同名目录。
-pub fn foreman_file_policy(home_root: &Path) -> FileToolPolicy {
+pub fn foreman_file_policy(home_root: &Path, unrestricted: bool) -> FileToolPolicy {
     let mut deny = default_deny_paths();
     deny.push(home_root.join("data").display().to_string());
     FileToolPolicy {
-        workdir_bound: vec![home_root.to_path_buf()],
+        workdir_bound: if unrestricted {
+            Vec::new()
+        } else {
+            vec![home_root.to_path_buf()]
+        },
         deny_paths: deny,
         ..Default::default()
     }
+}
+
+/// 流水线节点 / 子代理的文件域（决策 104）：缺省两个根 = worktree + 任务目录。
+///
+/// `unrestricted`（`[pipeline] file_access_unrestricted`，决策 283）时**允许根清空**——
+/// 文件工具可以读写任何路径，拒绝名单照旧生效。
+///
+/// 为什么是一个旋钮而不是把两根直接删掉：默认姿态（文件工具锁在任务域内）是本仓对外的
+/// 一半设计（决策 104），而「这台机器上要让 agent 像本地开发一样随手读写」是一个**部署
+/// 决定**——两个方向的读者不同，故由配置分开。它同时收掉一处自相矛盾：命令那条路从来
+/// 不受文件策略管（决策 104 / 19 修订自认不是系统级沙箱），于是此前「用 `read_file` 读不到
+/// 的路径，用 `run_command cat` 读得到」——同一个 agent 的两只手，一只被绑着。
+pub fn pipeline_file_policy(
+    worktree: &Path,
+    task_dir: &Path,
+    unrestricted: bool,
+) -> FileToolPolicy {
+    if unrestricted {
+        return FileToolPolicy {
+            workdir_bound: Vec::new(),
+            ..Default::default()
+        };
+    }
+    FileToolPolicy::new(vec![worktree.to_path_buf(), task_dir.to_path_buf()])
 }
 
 impl FileToolPolicy {
@@ -345,7 +373,7 @@ mod tests {
         // 前缀语义 = 「等于它或落在它之下」，故两个目录里的文件与目录本身都要断言到。
         let tmp = tempfile::tempdir().unwrap();
         let root = tmp.path().canonicalize().unwrap();
-        let policy = foreman_file_policy(&root);
+        let policy = foreman_file_policy(&root, false);
         let data = root.join("data");
         let logs = root.join("logs");
         for path in [data.clone(), data.join("agentpipeline.db")] {
@@ -378,6 +406,49 @@ mod tests {
         let policy = policy_for(&root);
         assert!(policy.check_read(&root.join("src/lib.rs")).is_ok());
         assert!(policy.check_read(&root.join(".env")).is_err());
+    }
+
+    /// 决策 283：`file_access_unrestricted` 清空**允许根**，拒绝名单照旧生效。
+    ///
+    /// 三件事都要钉住：① 缺省仍锁在两根内（默认姿态不变）；② 打开后根外可读可写；
+    /// ③ 打开后 `.env` / 密钥那几条仍然拒——秘密保护与操作范围不共用这个旋钮。
+    #[test]
+    fn unrestricted_pipeline_policy_drops_the_roots_but_keeps_the_deny_list() {
+        let tmp = tempfile::tempdir().unwrap();
+        let worktree = tmp.path().canonicalize().unwrap();
+        let task_dir = worktree.join("task");
+        let outside = tempfile::tempdir().unwrap();
+        let outside_file = outside.path().canonicalize().unwrap().join("x.txt");
+
+        // ① 缺省：根外拒绝，根内放行
+        let bounded = pipeline_file_policy(&worktree, &task_dir, false);
+        assert!(bounded.check_read(&outside_file).is_err());
+        assert!(bounded.check_write(&worktree.join("src/main.rs")).is_ok());
+
+        // ② 打开：根外可读可写
+        let open = pipeline_file_policy(&worktree, &task_dir, true);
+        assert!(open.check_read(&outside_file).is_ok());
+        assert!(open.check_write(&outside_file).is_ok());
+
+        // ③ 拒绝名单不受开关影响
+        assert!(open.check_read(&worktree.join(".env")).is_err());
+        assert!(open.check_read(&worktree.join("server.pem")).is_err());
+        assert!(open.check_write(&worktree.join("id_rsa")).is_err());
+    }
+
+    /// 决策 283：值班长的家目录根由同一个开关决定，`data/` 的前缀拒绝照旧。
+    #[test]
+    fn unrestricted_foreman_policy_keeps_the_key_store_denied() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().canonicalize().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let policy = foreman_file_policy(&root, true);
+        assert!(policy
+            .check_read(&outside.path().canonicalize().unwrap().join("y.txt"))
+            .is_ok());
+        assert!(policy
+            .check_read(&root.join("data/agentpipeline.db"))
+            .is_err());
     }
 
     #[test]

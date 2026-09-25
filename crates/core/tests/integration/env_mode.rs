@@ -377,7 +377,7 @@ fn foreman_executor(
 ) -> ToolExecutor {
     let mut executor = ToolExecutor::new(
         f._home.home().clone(),
-        agentpipeline_core::agent::file_policy::foreman_file_policy(f._home.home().root()),
+        agentpipeline_core::agent::file_policy::foreman_file_policy(f._home.home().root(), false),
         Settings::default(),
         Arc::new(RecordingKiller::new()),
     )

@@ -181,8 +181,14 @@ impl NetworkPolicy {
 
     /// 某个主机是否放行（回环恒放行；判据走 [`crate::host_policy::is_loopback`]——
     /// 「什么算回环」的唯一实现，决策 246）。
+    ///
+    /// **`allow_all` 在这里也生效**（决策 283）。此前它只看 `allow_hosts`，而
+    /// `web_fetch`（决策 266 的网口）问的正是本函数、`run_command` 问的是
+    /// [`Self::check`]——于是那个旋钮对网口**半个失效**：报错里印着「或置
+    /// `egress_allow_all = true` 显式放行全部出口」，照做之后 agent 的 `run_command`
+    /// 通了、值班长的 `web_fetch` 照旧被拒。两条路问同一份策略，就该得到同一个答案。
     pub fn allows(&self, host: &str) -> bool {
-        if crate::host_policy::is_loopback(host) {
+        if self.allow_all || crate::host_policy::is_loopback(host) {
             return true;
         }
         let host = normalize_host(host);
@@ -676,6 +682,24 @@ mod tests {
         };
         assert!(p.check("curl https://evil.example/x").is_ok());
         assert!(p.check("ssh root@10.0.0.1").is_ok());
+    }
+
+    /// 决策 283：`allows()` 也必须看到 `allow_all`——它是 `web_fetch` 的唯一判据。
+    ///
+    /// 只钉 `check()` 的那条（上一条）漏得掉这个洞：`web_fetch` 走的是 `allows()`，
+    /// 而它此前不看 `allow_all`，于是同一次配置在两条路上给出两个答案。
+    #[test]
+    fn allow_all_is_honoured_by_allows_too() {
+        let on = NetworkPolicy {
+            allow_hosts: Vec::new(),
+            allow_all: true,
+        };
+        assert!(on.allows("evil.example"));
+        // 关着的时候一字不变：外网主机不放行，回环照旧恒放行
+        let off = policy(&[]);
+        assert!(!off.allows("evil.example"));
+        assert!(off.allows("127.0.0.1"));
+        assert!(off.allows("localhost"));
     }
 
     // ────────────────────────── 拒绝：形态判定 ──────────────────────────

@@ -26,7 +26,6 @@ use std::time::{Duration, Instant};
 use futures::future::BoxFuture;
 
 use crate::agent::client::{AgentResponse, LlmClient, LlmRequest, Message, ToolDef};
-use crate::agent::file_policy::FileToolPolicy;
 use crate::agent::prompts::{build_system_prompt, load_agents_context};
 use crate::agent::tools::{SubAgentRequest, SubAgentRunner, ToolCallContext, ToolExecutor};
 use crate::config::Settings;
@@ -200,13 +199,18 @@ impl SubAgentRunner for StoreSubAgentRunner {
                 })
                 .await?;
 
-            // 子代理的只读工具执行器：路径策略与父节点同源（同样锁在 worktree + 任务
-            // 目录），但**不注入** `with_recorder` / `with_sse` / `with_sub_agent`——
+            // 子代理的只读工具执行器：路径策略与父节点同源（缺省同样锁在 worktree + 任务
+            // 目录；`file_access_unrestricted` 打开时与父节点一起放开，决策 283），
+            // 但**不注入** `with_recorder` / `with_sse` / `with_sub_agent`——
             // 记录器会以子代理名义记命令（子代理跑不了命令），另两者是父节点专有能力。
             //
             // `with_allowed_tools` 是安全边界的真正落点：只把 tool 定义少给几个是不够的，
             // 模型无视定义硬发 `run_command` 时必须在**执行点**被拒。
-            let policy = FileToolPolicy::new(vec![cfg.worktree_path.clone(), cfg.task_dir.clone()]);
+            let policy = crate::agent::file_policy::pipeline_file_policy(
+                &cfg.worktree_path,
+                &cfg.task_dir,
+                cfg.settings.file_access_unrestricted,
+            );
             let tools = ToolExecutor::new(
                 cfg.home.clone(),
                 policy,

@@ -906,7 +906,15 @@ allow_dirty_worktree_merge = false
 # 只约束 agent 主动经 run_command 发起的调用，**不是安全边界**（残余风险见 §12.15）。
 # egress_allow_hosts = ["api.example.com", "*.internal.example.com"]
 # 显式放行全部出口。默认 false——未配置时不得静默变成「全部放行」。
+# 它同时管两条路：agent 的 run_command 与值班长的网口 web_fetch（决策 283 补全——
+# 后者此前读不到这个开关，于是报错里印的那句放行方式照做之后也不生效）。
 # egress_allow_all = false
+# 文件工具的**允许根**开关（决策 283）。默认 false = 文件工具锁在 worktree + 任务目录内
+# （决策 104）；置 true = 允许根清空，文件工具可读写任何路径。拒绝名单（.env* / *.pem /
+# *.key / id_rsa* / ~/.ssh，以及值班长的 data/ 前缀）**不受它管**——秘密保护与操作范围
+# 是两件事。命令那条路本来就不受文件策略管（决策 104 / 19 修订），故打开它只是让文件
+# 工具与命令落在同一个域上，不改变「本仓无 OS 级沙箱」这个事实。
+# file_access_unrestricted = false
 
 [logging]
 level = "info"                       # EnvFilter 表达式；非法值回退 info，不阻断启动

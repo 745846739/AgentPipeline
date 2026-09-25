@@ -51,7 +51,10 @@ impl Fixture {
     fn executor(&self) -> ToolExecutor {
         ToolExecutor::new(
             self.home.home().clone(),
-            agentpipeline_core::agent::file_policy::foreman_file_policy(self.home.home().root()),
+            agentpipeline_core::agent::file_policy::foreman_file_policy(
+                self.home.home().root(),
+                false,
+            ),
             Settings::default(),
             Arc::new(RecordingKiller::new()),
         )

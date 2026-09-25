@@ -49,6 +49,14 @@ pub struct Settings {
     pub egress_allow_hosts: Vec<String>,
     /// 显式放行全部出口。默认 `false`：未配置时**不得**静默变成「全部放行」。
     pub egress_allow_all: bool,
+    /// **文件工具的允许根开关**（决策 283）：`false`（缺省）= 文件工具仍锁在 worktree
+    /// + 任务目录内（决策 104 的姿态）；`true` = 允许根清空，文件工具可以读写任何路径。
+    ///
+    /// 两件事**不共用这个旋钮**：① **拒绝名单**（`.env*` / `*.pem` / `*.key` /
+    /// `id_rsa*` / `~/.ssh`，以及值班长的 `data/` 前缀）照旧生效——秘密保护与操作范围
+    /// 是两件事；② 命令那条路本来就不受文件策略管（决策 104 / 19 修订），所以打开它
+    /// 只是让**文件工具**与命令落在同一个域上，并不改变「本仓无 OS 级沙箱」这个事实。
+    pub file_access_unrestricted: bool,
     /// 环境层权限档位的**全局默认**（决策 206）。
     ///
     /// 缺省 `auto` = **等于现状**：环境层工具（文件 / 命令 / 技能拉取 / 子代理）直接执行，
@@ -119,6 +127,7 @@ impl Default for Settings {
             allow_dirty_worktree_merge: false,
             egress_allow_hosts: Vec::new(),
             egress_allow_all: false,
+            file_access_unrestricted: false,
             env_mode: crate::types::EnvMode::Auto,
             watch_event_window_minutes: 30,
             watch_owner_stuck_minutes: 10,
@@ -158,6 +167,7 @@ pub struct PipelineOverrides {
     pub allow_dirty_worktree_merge: Option<bool>,
     pub egress_allow_hosts: Option<Vec<String>>,
     pub egress_allow_all: Option<bool>,
+    pub file_access_unrestricted: Option<bool>,
     /// 环境层档位（决策 206）。**用字符串接**：`deny_unknown_fields` +
     /// 枚举反序列化会把 `env_mode = "Auto"` 报成一句难读的 serde 错误，而这里要的是一句
     /// 「只能是 auto / ask / deny」——解析与校验在 [`PipelineOverrides::apply`] 里做。
@@ -204,6 +214,7 @@ impl PipelineOverrides {
             allow_dirty_worktree_merge,
             egress_allow_hosts,
             egress_allow_all,
+            file_access_unrestricted,
             watch_event_window_minutes,
             watch_owner_stuck_minutes,
             watch_debounce_sec,
@@ -1327,6 +1338,10 @@ mod tests {
         assert!(!s.cross_family_judge);
         assert_eq!(s.max_concurrent_tasks, 5);
         assert!(!s.allow_dirty_worktree_merge);
+        // 决策 283 的两个旋钮：默认都是**关**——操作范围放开是部署决定，不是默认值
+        assert!(s.egress_allow_hosts.is_empty());
+        assert!(!s.egress_allow_all);
+        assert!(!s.file_access_unrestricted);
     }
 
     /// 默认端口是「唯一事实源」（决策 171）：缺省绑定与跨源白名单的两个本机 origin
@@ -1381,6 +1396,33 @@ mod tests {
         // 其余保持默认
         assert_eq!(s.validate_retry_max, 3);
         assert_eq!(s.test_command_timeout_sec, 600);
+    }
+
+    /// 决策 283：操作环境的两个开关走通解析与合并，且**互不携带**。
+    ///
+    /// 这一条钉的是「部署侧真的能把限制关掉」这条链的上半段（下半段是
+    /// `file_policy` 的两条单测与执行点的 `NetworkPolicy::from_settings`）。
+    #[test]
+    fn env_domain_switches_are_parsed_independently() {
+        // 缺省一律关着
+        let s = Settings::default();
+        assert!(!s.file_access_unrestricted);
+        assert!(!s.egress_allow_all);
+
+        let cfg = Config::from_toml("[pipeline]\nfile_access_unrestricted = true\n").unwrap();
+        assert!(cfg.settings().file_access_unrestricted);
+        assert!(!cfg.settings().egress_allow_all, "不该顺手把出口也开了");
+
+        let cfg = Config::from_toml("[pipeline]\negress_allow_all = true\n").unwrap();
+        assert!(cfg.settings().egress_allow_all);
+        assert!(
+            !cfg.settings().file_access_unrestricted,
+            "不该顺手把文件域也开了"
+        );
+
+        // 未知键照旧 fail fast（新键写错名字会被当场拦下，而不是静默取默认）
+        let err = Config::from_toml("[pipeline]\nfile_access_unrestrict = true\n").unwrap_err();
+        assert!(err.to_string().contains("file_access_unrestrict"), "{err}");
     }
 
     // ── 票 16：`[logging]` 键名与文档一致（format / file）──

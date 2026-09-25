@@ -88,7 +88,7 @@ async fn a_repair_worktree_lives_under_home_and_is_writable_by_the_foreman() {
     );
     assert!(session.worktree.exists());
     // 文件策略：值班长写得进它（**有断言钉住**，票面明写要求）
-    let policy = foreman_file_policy(root);
+    let policy = foreman_file_policy(root, false);
     let target = session.worktree.join("crates/core/src/lib.rs");
     assert!(
         policy.check_write(&target).is_ok(),

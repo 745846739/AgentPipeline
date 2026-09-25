@@ -507,11 +507,16 @@ pub fn foreman_tooling(
     steward: Option<Arc<dyn crate::agent::tools::StewardActionRunner>>,
 ) -> (ToolExecutor, ToolCallContext) {
     // 值班长的域就是家目录根（决策 207 的「分两组」：流水线阶段仍限任务工作区），
-    // 并按路径前缀拒掉 `data/` 与 `logs/`——库里明文存着 provider 密钥（决策 112），
+    // 并按路径前缀拒掉 `data/`——库里明文存着 provider 密钥（决策 112），
     // 而默认那份**模式**名单（`.env*` / `*.pem` / …）盖不住一个 `.db` 文件。
+    // `file_access_unrestricted`（决策 283）打开时连家目录根这一层也放开：允许根由
+    // 设置决定，`data/` 的前缀拒绝照旧。
     let tools = ToolExecutor::new(
         home.clone(),
-        crate::agent::file_policy::foreman_file_policy(home.root()),
+        crate::agent::file_policy::foreman_file_policy(
+            home.root(),
+            settings.file_access_unrestricted,
+        ),
         settings.clone(),
         Arc::new(RealProcessKiller),
     )
