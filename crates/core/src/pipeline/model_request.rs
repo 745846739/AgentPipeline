@@ -310,6 +310,19 @@ impl RequestPlan {
         }
     }
 
+    /// **无条件**按轮压缩（决策 294 / 票 10）：provider 报超窗时用。
+    ///
+    /// 与 [`Self::check_budget`] 的差别只有一处：**不问软限那条线**。理由与值班长那侧
+    /// 一字不差（票 06(c)）——那次报错本身就是「算术低估了」的证据（真 tokenizer 与
+    /// 4 字符 ≈ 1 token 的估算、工具定义也占窗口），按同一条线再判一次只会得出「还没到线」
+    /// 然后原样再发一遍。返回压掉的条数，**0 = 没有可压的**（都在 keep 窗口里，回执就是极限）
+    /// ——调用方据此判「压不动了，报错才是诚实的」。
+    pub fn force_compact(&self, messages: &mut Vec<Message>, carried_len: usize) -> usize {
+        let outcome = compact_messages_from(messages, self.keep_recent_rounds, carried_len);
+        *messages = outcome.messages;
+        outcome.compacted_messages
+    }
+
     /// 把计划拼成一次 LLM 请求（身份戳与采样参数都在计划里，轮内不变）。
     pub fn request(&self, messages: &[Message], run: Option<RunContext>) -> LlmRequest {
         LlmRequest {
@@ -1640,6 +1653,31 @@ mod tests {
             Some("sys"),
             "system 段不动（§12.13.3 规则表）"
         );
+    }
+
+    #[tokio::test]
+    async fn force_compact_ignores_the_soft_limit() {
+        // 与 `check_budget` 的差别只有一处：**不问软限那条线**（票 10）。provider 报超窗时
+        // 要用它——那次报错本身就是「算术低估了」的证据，按软限再判一次只会得出「还没到线」，
+        // 然后把同一份放不下的转录原样再发一遍（正是这一票要停掉的那件事）。
+        //
+        // 软限给足 60_000：12 轮 ×1000 token 的对话在 `check_budget` 眼里还早。
+        let plan = budget_plan(60_000, 80_000).await;
+        let mut messages = conversation(12, 1_000);
+        let len_before = messages.len();
+        assert!(
+            matches!(
+                plan.check_budget(&mut messages.clone(), 0),
+                BudgetCheck::Ok { compacted: None }
+            ),
+            "前提：这份对话在软限之下，预算门不会动它"
+        );
+        let compacted = plan.force_compact(&mut messages, 0);
+        assert!(compacted > 0, "无条件压缩要压得动：得到 {compacted}");
+        assert!(messages.len() < len_before, "L3 就地压缩");
+        // 压不动时如实回 0：调用方据此判「报错才是诚实的」（超窗那一次调用的处置）。
+        let mut tiny = conversation(1, 10);
+        assert_eq!(plan.force_compact(&mut tiny, 0), 0, "没有旧轮可压 → 0");
     }
 
     #[tokio::test]

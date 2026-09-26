@@ -20,9 +20,10 @@
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use crate::agent::client::{LlmClient, LlmRequest, Message};
+use crate::agent::client::{AgentResponse, LlmClient, LlmRequest, Message};
 use crate::agent::metadata::parse_metadata;
 use crate::agent::prompts::{build_system_prompt, load_agents_context};
+use crate::agent::providers::is_context_window;
 use crate::agent::tools::{ToolCallContext, ToolExecutor};
 use crate::clock::Clock;
 use crate::config::Settings;
@@ -39,8 +40,8 @@ use crate::{Error, Result};
 
 use super::executor::{
     cancel_signal, emit_node_started, emit_tool_event, finish_run_with_sse, project_or_err,
-    NodeOutput, OUTPUT_CODE_CHANGES, OUTPUT_DESIGN_DOC, OUTPUT_DEV_DOC, OUTPUT_REVIEW_REPORT,
-    OUTPUT_TEST_REPORT, OUTPUT_TEST_SCENARIOS, PIPELINE_AGENT_TYPE,
+    CancelSignal, NodeOutput, OUTPUT_CODE_CHANGES, OUTPUT_DESIGN_DOC, OUTPUT_DEV_DOC,
+    OUTPUT_REVIEW_REPORT, OUTPUT_TEST_REPORT, OUTPUT_TEST_SCENARIOS, PIPELINE_AGENT_TYPE,
 };
 use super::model_request::{
     json_string_list, workdirs_line, AttemptCtx, BudgetCheck, OverflowFacts, Prepared, RequestPlan,
@@ -279,6 +280,21 @@ impl ModelInvoke {
                     // 出来的，不刷新它，库里那份读数会比 run 行汇总出来的小——决策 226 把失败轮的
                     // token 记真之后这个差第一次看得见（此前失败一律记 0，两者恰好相等）。
                     self.store.refresh_task_totals(&task.id).await?;
+                    // **超窗不再重试**（决策 294 / 票 10）：它是「等一等没用」的那一类——
+                    // 同一份转录原样再发一遍（`agent_retry_max` 次）不会让它变小，而这一轮
+                    // 已经在调用点上压过一次并重试过那一次调用（见 `agent_attempt_inner`）。
+                    // 到这里说明**压不动了**：报错才是诚实的，指引由分类带着走
+                    // （`LlmErrorKind::ContextWindow.advice()`：换更大窗口的模型 / 调大配置）。
+                    // 上面那一笔 run 行与任务投影已经落完，故这里只是不再进下一轮。
+                    if is_context_window(&error) {
+                        tracing::warn!(
+                            task = %task.id,
+                            stage = %cursor.stage,
+                            node = %cursor.node,
+                            "上下文超窗且已压不动：不再重试（agent_retry_max 救不了这一件事）"
+                        );
+                        return Err(error);
+                    }
                     // 决策 278（显式修订决策 205 裁决②）：整体失败的自动重试不再空对话起步——
                     // 下一轮从「这一轮的转录原样保留 + 一条错误 turn」接着跑。错误 turn 由
                     // retry_prompt（决策 33 的「错误回填」）按原始诊断生成；转录不折叠、不省略
@@ -415,6 +431,31 @@ impl ModelInvoke {
         };
         if let Err(e) = result {
             tracing::error!(run_id, "失败会话落库失败（原错误仍照原样上报）：{e}");
+        }
+    }
+
+    /// 一次模型调用，**可被中止请求打断**（决策 226 / 276）。
+    ///
+    /// 两个调用点（本次调用与超窗后的那一次重试）走同一条 select：超窗重试也必须能被打断
+    /// ——人按停时不该因为「它正在重试」而多等一轮。取不到观察点（进程内没有这一号登记）
+    /// 时照旧直连，与加这条通道之前一致。
+    async fn complete_once(
+        &self,
+        req: LlmRequest,
+        cancel: Option<&CancelSignal>,
+        cursor: &NodeCursor,
+    ) -> Result<AgentResponse> {
+        match cancel {
+            Some(signal) => tokio::select! {
+                r = self.llm.complete(req) => r,
+                _ = signal.wait() => Err(Error::Cancelled(format!(
+                    "{}.{} 的模型调用已按{}中止",
+                    cursor.stage,
+                    cursor.node,
+                    signal.origin().as_str()
+                ))),
+            },
+            None => self.llm.complete(req).await,
         }
     }
 
@@ -595,33 +636,42 @@ impl ModelInvoke {
                     .await;
             }
 
-            let req = plan.request(
-                &trace.messages,
-                Some(crate::agent::client::RunContext {
-                    task_id: task.id.clone(),
-                    session_id: String::new(),
-                    branch: cursor.branch.clone(),
-                    run_id,
-                    agent_type: PIPELINE_AGENT_TYPE.into(),
-                }),
-            );
+            // 请求身份（两处调用共用：本次调用与超窗后的那一次重试，轮内不变）。
+            let run_ctx = Some(crate::agent::client::RunContext {
+                task_id: task.id.clone(),
+                session_id: String::new(),
+                branch: cursor.branch.clone(),
+                run_id,
+                agent_type: PIPELINE_AGENT_TYPE.into(),
+            });
+            let req = plan.request(&trace.messages, run_ctx.clone());
             // 模型调用是**最容易无限期停住**的地方：一个不返回的请求两侧都没有心跳，
             // 于是它既正是调度器判超时的对象，也是执行体身上唯一能观察中止请求的 await 点
             // （决策 226）——判超时那边不需要「有进程组可杀」，从这里就能把执行体叫停。
             // 取不到观察点（进程内没有这一号登记）时照旧直连，行为与加这条通道之前一致。
-            let response = match &cancel {
-                Some(signal) => tokio::select! {
-                    r = self.llm.complete(req) => r?,
-                    _ = signal.wait() => {
-                        return Err(Error::Cancelled(format!(
-                            "{}.{} 的模型调用已按{}中止",
-                            cursor.stage,
-                            cursor.node,
-                            signal.origin().as_str()
-                        )));
+            let response = match self.complete_once(req, cancel.as_ref(), cursor).await {
+                Ok(response) => response,
+                // 超窗（决策 294 / 票 10）：provider 说这一份放不下它的窗口——**压缩一次
+                // 再重试这一次调用**（与值班长 06(c) 同一处置、同一个判据）。压缩是**无条件**的：
+                // 那次报错就是「算术低估了」的证据，按软限再判一次只会得出「还没到线」。
+                Err(e) if is_context_window(&e) => {
+                    let compacted = plan.force_compact(&mut trace.messages, carried_len);
+                    if compacted == 0 {
+                        // 压不动了（都在 keep 窗口里 / 回执就是极限）：报错才是诚实的，
+                        // 原文与指引由上面的分类带着走。
+                        return Err(e);
                     }
-                },
-                None => self.llm.complete(req).await?,
+                    tracing::warn!(
+                        task = %task.id,
+                        stage = %cursor.stage,
+                        node = %cursor.node,
+                        compacted,
+                        "provider 报上下文超窗：压缩本轮转录后重试这一次调用（票 10）"
+                    );
+                    let req = plan.request(&trace.messages, run_ctx);
+                    self.complete_once(req, cancel.as_ref(), cursor).await?
+                }
+                Err(e) => return Err(e),
             };
             trace.tokens.add(&response);
             trace.messages.push(Message::assistant(

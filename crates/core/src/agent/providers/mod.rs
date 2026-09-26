@@ -158,6 +158,18 @@ impl LlmErrorKind {
     }
 }
 
+/// 这个错误是「请求超出模型上下文窗口」吗——**两个消费者共用的判据**（决策 291 / 294）。
+///
+/// 值班长撞墙后的压缩重试（`pipeline/foreman.rs`，票 06(c)）与流水线「压缩一次、且不再
+/// 盲目重试」（`pipeline/model_invoke.rs`，票 10）判的是**同一件事**。各写一份 `matches!`
+/// 的下场是一边改了另一边不知道，而两边都靠这个字符串和 [`LlmErrorKind::ContextWindow`] 对上。
+pub fn is_context_window(error: &crate::Error) -> bool {
+    matches!(
+        error,
+        crate::Error::LlmClassified { kind, .. } if kind == LlmErrorKind::ContextWindow.as_str()
+    )
+}
+
 /// 把「HTTP 请求失败」的错误归类为网络类：连接 / DNS / TLS / 超时。
 const NETWORK_KIND: LlmErrorKind = LlmErrorKind::Network;
 

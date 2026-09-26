@@ -7,6 +7,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use agentpipeline_core::agent::client::{AgentResponse, LlmClient, LlmRequest};
+use agentpipeline_core::agent::providers::LlmErrorKind;
 use agentpipeline_core::config::Settings;
 use agentpipeline_core::pipeline::Executor;
 use agentpipeline_core::scheduler::KanbanScheduler;
@@ -920,6 +921,129 @@ async fn a_failed_round_records_the_tokens_it_burned() {
     assert_eq!(
         task.total_tokens as u64, from_runs,
         "任务投影须与 run 行汇总同源"
+    );
+}
+
+// ─────────────────────── 上下文超窗：不再盲目重试（决策 294 / 票 10）───────────────────────
+
+/// 超窗**只发生一次调用**（票 10）：不再按 `agent_retry_max` 把同一份放不下的转录重发一遍。
+///
+/// 从前这条路径一路重试到耗尽——同一份转录发 N 遍不会变小，烧的是 N 倍的时间与钱；
+/// 而唯一该做的事（换更大窗口的模型 / 调大配置）在那之前一个字都没写出来。
+#[tokio::test]
+async fn a_context_window_failure_is_not_retried_to_exhaustion() {
+    // 重试预算给足 5：从前会打 5 次，用例据此判「不再盲目重试」
+    let settings = Settings {
+        agent_retry_max: 5,
+        ..Default::default()
+    };
+    let ctx = setup("true", settings).await;
+    let mut script = Script::new();
+    script
+        .for_node(Stage::ArchitectDesign, Node::ValidateInput)
+        .submit(&ValidateInputMetadata {
+            readiness: true,
+            blockers: vec![],
+        });
+    script
+        .for_node(Stage::ArchitectDesign, Node::Execute)
+        // 第一次调用就撞窗：转录里还没有可压的旧轮（本轮刚开始），故压缩救不回来。
+        .fail_llm(
+            "llm_context_window",
+            LlmErrorKind::ContextWindow.advice(),
+            "HTTP 400：This model's maximum context length is 8192 tokens",
+        )
+        // 重试才会走到这一步；用例靠「它没被消费」验证「没有第二次调用」。
+        .text("（这一条只在重试时才会被消费）");
+    ctx.agent.set_script(script);
+    testkit::seed_task(&ctx.store, "t-ctxwin", "p1")
+        .await
+        .unwrap();
+    admit(&ctx, "t-ctxwin").await;
+    ctx.executor.run("t-ctxwin").await.unwrap();
+
+    assert_eq!(
+        ctx.agent.calls_for(Stage::ArchitectDesign, Node::Execute),
+        1,
+        "超窗只打一次调用：压不动就报错，不重试到 agent_retry_max"
+    );
+    let cursor = ctx
+        .store
+        .load_live_cursors("t-ctxwin")
+        .await
+        .unwrap()
+        .into_iter()
+        .next()
+        .expect("游标还在（挂着等处置）");
+    let reason = cursor.pending_reason.as_ref().expect("应当挂了 pending");
+    assert_eq!(reason.kind, PendingKind::RetryExhausted);
+    // 台账里读得出**下一步做什么**（票面要求）：类别是可归因的那一格，message 是它的人话。
+    assert!(
+        reason.message.contains("上下文窗口") && reason.message.contains("模型"),
+        "超窗那一条要带可操作指引：{}",
+        reason.message
+    );
+    assert!(
+        reason.context.as_ref().is_some_and(|c| c
+            .diagnostic
+            .as_deref()
+            .is_some_and(|d| d.contains("maximum context length"))),
+        "原始诊断照旧进 context（可搜）：{:?}",
+        reason.context
+    );
+}
+
+/// 压得动就**压一次再试这一次调用**（票 10，与值班长 06(c) 同一处置）：一次真实可救的超窗
+/// （算术低估）因此不必让整个节点失败——而它**不是**整轮重试：run 行仍只有一条。
+#[tokio::test]
+async fn a_context_window_failure_compacts_and_retries_that_one_call() {
+    let ctx = setup("true", Settings::default()).await;
+    let mut script = Script::new();
+    script
+        .for_node(Stage::ArchitectDesign, Node::ValidateInput)
+        .submit(&ValidateInputMetadata {
+            readiness: true,
+            blockers: vec![],
+        });
+    let mut exec = script.for_node(Stage::ArchitectDesign, Node::Execute);
+    // 先攒够**可压的**轮次（`keep_recent_rounds` 缺省 5，每轮两条消息 = assistant + tool_result；
+    // 压缩要 `len > keep + 2` 才动得了）：5 轮工具往返之后，前面的轮次才成了「旧轮」。
+    for i in 0..5 {
+        exec = exec.write_file(&format!("notes-{i}.md"), "记录一条");
+    }
+    exec.fail_llm(
+        "llm_context_window",
+        LlmErrorKind::ContextWindow.advice(),
+        "HTTP 400：This model's maximum context length is 8192 tokens",
+    )
+    // 压缩之后重试的**那一次调用**走到这里：这一轮照常收口。
+    .submit(&ArchitectExecuteMetadata {
+        readiness: true,
+        ..Default::default()
+    });
+    ctx.agent.set_script(script);
+    testkit::seed_task(&ctx.store, "t-ctxwin-ok", "p1")
+        .await
+        .unwrap();
+    admit(&ctx, "t-ctxwin-ok").await;
+    ctx.executor.run("t-ctxwin-ok").await.unwrap();
+
+    assert_eq!(
+        ctx.agent.calls_for(Stage::ArchitectDesign, Node::Execute),
+        8,
+        "5 次工具往返 + 1 次撞窗 + 1 次重试 + 1 次收口（提交之后模型还会被叫一次说收尾的话）\
+         ——压一次再试这一次调用，不多不少"
+    );
+    let runs = ctx
+        .store
+        .list_runs_at("t-ctxwin-ok", Stage::ArchitectDesign, Node::Execute)
+        .await
+        .unwrap();
+    assert_eq!(runs.len(), 1, "重试发生在**这一次调用**上，不是整轮重跑");
+    assert_eq!(
+        runs[0].status,
+        NodeStatus::Success,
+        "压缩之后那一次调用收了口：这一轮不该因为算术低估而整段失败"
     );
 }
 

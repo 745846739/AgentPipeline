@@ -291,6 +291,10 @@ impl NodeScript<'_> {
 
     /// LLM 调用当场失败（票 01）：`kind` 用生产的稳定类别标识
     /// （`llm_auth` / `llm_network` / `llm_context_window` …）。
+    ///
+    /// **`kind` 原样成为错误的类别**（`FakeAgent` 在 `complete` 那一层给
+    /// `Error::LlmClassified`）：生产里那个串是 HTTP 层分类出来的
+    /// （`LlmErrorKind::from_http`），替身这一侧直接给——两者认的是同一个稳定标识。
     pub fn fail_llm(self, kind: &str, message: &str, raw: &str) -> Self {
         self.push(Step::Fail {
             kind: kind.to_string(),

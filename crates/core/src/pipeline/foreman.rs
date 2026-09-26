@@ -38,6 +38,7 @@ use std::sync::{Arc, LazyLock, Mutex};
 use serde::{Deserialize, Serialize};
 
 use crate::agent::client::{LlmClient, LlmRequest, Message, ToolDef};
+use crate::agent::providers::is_context_window;
 use crate::agent::tools::{ToolCallContext, ToolExecutor};
 use crate::config::Settings;
 use crate::home::Home;
@@ -3563,17 +3564,6 @@ fn is_idle_timeout(error: &Error) -> bool {
     matches!(
         error,
         Error::LlmClassified { kind, .. } if kind == "llm_idle_timeout"
-    )
-}
-
-/// provider 判的这一轮请求放不下它的窗口（决策 291 / 票 06(c)）。
-///
-/// 类别串与 `LlmErrorKind::ContextWindow::as_str()` 同一份（`llm_context_window`）——
-/// 认的是**生产侧那个稳定标识**，不是错误文本里有没有「context」。
-fn is_context_window(error: &Error) -> bool {
-    matches!(
-        error,
-        Error::LlmClassified { kind, .. } if kind == "llm_context_window"
     )
 }
 
