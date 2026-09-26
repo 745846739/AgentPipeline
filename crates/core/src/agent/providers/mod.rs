@@ -331,24 +331,20 @@ impl ProductionLlm {
         // （连接阶段挂着不吐响应头，与「流中途停了」是同一种挂），不是响应完成的时限。
         // `None` = 不启用（现状一字不动）：节点路径不走这里，它们的挂死由调度器心跳收口。
         let idle_timeout = request.idle_timeout_sec.map(Duration::from_secs);
-        let idle_error = |idle: Duration, received: u64| {
-            Error::LlmClassified {
-                kind: LlmErrorKind::IdleTimeout.as_str().to_string(),
-                message: LlmErrorKind::IdleTimeout.advice().to_string(),
-                raw: format!(
-                    "流上 {} 没有任何新字节（本次已收 {received} 字节）：已中止这一次调用",
-                    human_duration(idle)
-                ),
-            }
+        let idle_error = |idle: Duration, received: u64| Error::LlmClassified {
+            kind: LlmErrorKind::IdleTimeout.as_str().to_string(),
+            message: LlmErrorKind::IdleTimeout.advice().to_string(),
+            raw: format!(
+                "流上 {} 没有任何新字节（本次已收 {received} 字节）：已中止这一次调用",
+                human_duration(idle)
+            ),
         };
         let response = match idle_timeout {
             Some(idle) => match tokio::time::timeout(idle, builder.send()).await {
-                Ok(result) => result.map_err(|e| {
-                    Error::LlmClassified {
-                        kind: NETWORK_KIND.as_str().to_string(),
-                        message: NETWORK_KIND.advice().to_string(),
-                        raw: format!("HTTP 请求失败：{e}"),
-                    }
+                Ok(result) => result.map_err(|e| Error::LlmClassified {
+                    kind: NETWORK_KIND.as_str().to_string(),
+                    message: NETWORK_KIND.advice().to_string(),
+                    raw: format!("HTTP 请求失败：{e}"),
                 })?,
                 Err(_) => return Err(idle_error(idle, 0)),
             },

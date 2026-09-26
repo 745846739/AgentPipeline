@@ -2507,13 +2507,14 @@ impl ForemanRunner {
             .await?
         {
             Some(session) => Ok(session),
-            None => self
-                .store
-                .create_foreman_session_of_kind(
-                    FOREMAN_SESSION_KIND_WATCH,
-                    FOREMAN_WATCH_SESSION_TITLE,
-                )
-                .await,
+            None => {
+                self.store
+                    .create_foreman_session_of_kind(
+                        FOREMAN_SESSION_KIND_WATCH,
+                        FOREMAN_WATCH_SESSION_TITLE,
+                    )
+                    .await
+            }
         }
     }
 

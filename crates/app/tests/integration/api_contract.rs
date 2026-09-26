@@ -5374,10 +5374,7 @@ async fn foreman_sessions_carry_a_kind_and_the_watch_ledger_is_read_only() {
     let store = api.state.store.clone();
     let talk = fresh_session(&api).await;
     let watch = store
-        .create_foreman_session_of_kind(
-            FOREMAN_SESSION_KIND_WATCH,
-            FOREMAN_WATCH_SESSION_TITLE,
-        )
+        .create_foreman_session_of_kind(FOREMAN_SESSION_KIND_WATCH, FOREMAN_WATCH_SESSION_TITLE)
         .await
         .unwrap()
         .id;
@@ -5571,7 +5568,11 @@ async fn foreman_endpoints_report_503_when_unwired() {
     assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
     // 未接线时不落任何一行会话——拒绝发生在写之前。
     let store = api.state.store.clone();
-    assert!(store.list_foreman_sessions(Some(FOREMAN_SESSION_KIND_TALK)).await.unwrap().is_empty());
+    assert!(store
+        .list_foreman_sessions(Some(FOREMAN_SESSION_KIND_TALK))
+        .await
+        .unwrap()
+        .is_empty());
     let (status, _) = get(&api, "/foreman/sessions").await;
     assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
 }

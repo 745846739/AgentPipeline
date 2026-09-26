@@ -589,7 +589,8 @@ async fn requests_without_an_idle_bound_are_not_watchdogged() {
     let sse = SseRecorder::new();
     let client = ProductionLlm::new(store.clone(), Arc::new(sse.clone()));
     let req = request(1, vec![]);
-    let result = tokio::time::timeout(std::time::Duration::from_millis(1500), client.complete(req)).await;
+    let result =
+        tokio::time::timeout(std::time::Duration::from_millis(1500), client.complete(req)).await;
     // 没有 watchdog：1.5s 时它还挂在流上（不是「1 秒就被判死」）。
     assert!(result.is_err(), "不该被判死：{result:?}");
     server.abort();

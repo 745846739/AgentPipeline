@@ -21,7 +21,7 @@ use agentpipeline_core::pipeline::foreman::{
     Attribution, AttributionKind, ForemanRunner, ForemanSegment, COMPACTION_MARK,
     FOREMAN_AGENT_TYPE, FOREMAN_ATTRIBUTION_MARK, FOREMAN_FAILED_TURN_MARK, FOREMAN_MAX_ROUNDS,
     FOREMAN_NO_ACTION_MARK, FOREMAN_PARTIAL_TURN_MARK, FOREMAN_PERSONA, FOREMAN_STAGE_KEY,
-    FOREMAN_TOOL_SPECS, FOREMAN_TALK_DIGEST_MARK, FOREMAN_WATCH_DIGEST_MARK,
+    FOREMAN_TALK_DIGEST_MARK, FOREMAN_TOOL_SPECS, FOREMAN_WATCH_DIGEST_MARK,
     FOREMAN_WATCH_FAILED_TURN_MARK, FOREMAN_WATCH_MARK, OPERATION_LOG_MARK,
 };
 use agentpipeline_core::sse::{SseEvent, SseEventType, ToolPhase};
@@ -871,7 +871,9 @@ async fn an_idle_timeout_that_fails_twice_is_recorded_with_its_kind() {
     let h = Harness::empty().await;
     let boom = || testkit::Step::Fail {
         kind: "llm_idle_timeout".into(),
-        message: "模型很久没有给出任何内容（空闲判死）：多半是 provider 临时卡住——稍等片刻重试通常能过".into(),
+        message:
+            "模型很久没有给出任何内容（空闲判死）：多半是 provider 临时卡住——稍等片刻重试通常能过"
+                .into(),
         raw: "流上 300 秒没有任何新字节（本次已收 1200 字节）：已中止这一次调用".into(),
     };
     let mut script = Script::new();
@@ -1011,7 +1013,12 @@ async fn empty_message_is_rejected_and_not_persisted() {
     let runner = h.runner(FakeAgent::new(Script::new()));
     assert!(runner.say(None, "   ").await.is_err());
     // 空消息连班次都不该开——「一句空话」不构成一次值班。
-    assert!(h.store.list_foreman_sessions(Some(FOREMAN_SESSION_KIND_TALK)).await.unwrap().is_empty());
+    assert!(h
+        .store
+        .list_foreman_sessions(Some(FOREMAN_SESSION_KIND_TALK))
+        .await
+        .unwrap()
+        .is_empty());
 
     let sid = h.session().await;
     assert!(runner.say(Some(&sid), "   ").await.is_err());
@@ -1122,7 +1129,10 @@ async fn the_global_switch_stops_the_watch_round_and_backlog_stays_put() {
     h.store.set_foreman_watch_enabled(true).await.unwrap();
     let turn = runner.watch().await.unwrap().expect("打开后下一趟立即恢复");
     assert!(turn.reply.contains("重试耗尽"));
-    assert!(h.store.open_attention(100).await.unwrap().is_empty(), "照常消费");
+    assert!(
+        h.store.open_attention(100).await.unwrap().is_empty(),
+        "照常消费"
+    );
 }
 
 /// 决策 289 / 票 03：(a) 人的那一轮读到**值守摘要**（带标记的 user 轮，且不是台账原文）；
@@ -1133,10 +1143,7 @@ async fn the_human_turn_sees_a_marked_watch_digest_not_the_verbatim_ledger() {
     // 值守台账先醒过两次（直接落库模拟既有播报）。
     let watch_sid = h
         .store
-        .create_foreman_session_of_kind(
-            FOREMAN_SESSION_KIND_WATCH,
-            FOREMAN_WATCH_SESSION_TITLE,
-        )
+        .create_foreman_session_of_kind(FOREMAN_SESSION_KIND_WATCH, FOREMAN_WATCH_SESSION_TITLE)
         .await
         .unwrap()
         .id;
@@ -1169,9 +1176,7 @@ async fn the_human_turn_sees_a_marked_watch_digest_not_the_verbatim_ledger() {
         "摘要调用的留痕按源会话归属"
     );
     assert!(
-        reqs[0]
-            .user_prompt
-            .contains("t1 重试耗尽了"),
+        reqs[0].user_prompt.contains("t1 重试耗尽了"),
         "台账原文是摘要输入：{}",
         reqs[0].user_prompt
     );
@@ -1218,7 +1223,12 @@ async fn the_watch_round_sees_a_marked_talk_digest() {
 
     // watch 的调用序 = 互喂摘要 + 主轮（say 那次在前面）：第三条是 watch 主轮。
     let reqs = agent.request_log();
-    assert_eq!(reqs.len(), 3, "say 主轮 + watch 摘要 + watch 主轮：{}", reqs.len());
+    assert_eq!(
+        reqs.len(),
+        3,
+        "say 主轮 + watch 摘要 + watch 主轮：{}",
+        reqs.len()
+    );
     let main = &reqs[2];
     let head = main.messages[0].content.as_deref().unwrap_or_default();
     assert!(
@@ -1261,7 +1271,10 @@ async fn the_watch_round_queues_while_a_human_turn_is_in_flight() {
 
     let turn = runner.watch().await.unwrap().expect("人落了：下一趟照常醒");
     assert!(turn.reply.contains("重试耗尽"));
-    assert!(h.store.open_attention(100).await.unwrap().is_empty(), "照常消费");
+    assert!(
+        h.store.open_attention(100).await.unwrap().is_empty(),
+        "照常消费"
+    );
 }
 
 #[tokio::test]
@@ -1373,9 +1386,10 @@ async fn the_watch_round_writes_to_its_own_session_and_the_talk_session_never_se
         .list_foreman_sessions(Some(FOREMAN_SESSION_KIND_WATCH))
         .await
         .unwrap();
-    assert_eq!(talk.iter().map(|s| s.id.clone()).collect::<Vec<_>>(), vec![
-        human_turn.session.id.clone()
-    ]);
+    assert_eq!(
+        talk.iter().map(|s| s.id.clone()).collect::<Vec<_>>(),
+        vec![human_turn.session.id.clone()]
+    );
     assert_eq!(watch.len(), 1);
     assert_eq!(watch[0].kind, FOREMAN_SESSION_KIND_WATCH);
     assert_eq!(
@@ -1400,11 +1414,7 @@ async fn the_watch_round_writes_to_its_own_session_and_the_talk_session_never_se
         .await
         .unwrap_err();
     assert!(matches!(err, Error::Validation(_)), "{err}");
-    assert_eq!(
-        agent.total_calls(),
-        calls_before,
-        "被拒的说话不开模型调用"
-    );
+    assert_eq!(agent.total_calls(), calls_before, "被拒的说话不开模型调用");
     let watch_messages_after = h
         .store
         .list_foreman_messages(&watch_turn.session.id, 100)
@@ -3824,7 +3834,11 @@ async fn sessions_are_listed_by_recent_activity() {
         .await
         .unwrap();
 
-    let list = h.store.list_foreman_sessions(Some(FOREMAN_SESSION_KIND_TALK)).await.unwrap();
+    let list = h
+        .store
+        .list_foreman_sessions(Some(FOREMAN_SESSION_KIND_TALK))
+        .await
+        .unwrap();
     assert_eq!(
         list.iter().map(|s| s.id.clone()).collect::<Vec<_>>(),
         vec![a, b]
@@ -3845,7 +3859,11 @@ async fn archiving_hides_it_from_the_list_but_keeps_its_messages() {
     let archived = h.store.archive_foreman_session(&a).await.unwrap().unwrap();
     assert!(archived.archived_at.is_some());
 
-    let list = h.store.list_foreman_sessions(Some(FOREMAN_SESSION_KIND_TALK)).await.unwrap();
+    let list = h
+        .store
+        .list_foreman_sessions(Some(FOREMAN_SESSION_KIND_TALK))
+        .await
+        .unwrap();
     assert_eq!(list.len(), 1);
     assert_eq!(list[0].id, b, "归档的不在列表里，剩下的照旧");
 
@@ -3892,7 +3910,12 @@ async fn sending_to_an_unknown_session_reports_it() {
     let runner = h.runner(FakeAgent::new(script));
     let err = runner.say(Some("no-such-session"), "喂").await.unwrap_err();
     assert!(matches!(err, Error::Task(_)), "{err}");
-    assert!(h.store.list_foreman_sessions(Some(FOREMAN_SESSION_KIND_TALK)).await.unwrap().is_empty());
+    assert!(h
+        .store
+        .list_foreman_sessions(Some(FOREMAN_SESSION_KIND_TALK))
+        .await
+        .unwrap()
+        .is_empty());
 }
 
 /// 值班长的命令挂**会话**，不挂任务（决策 204④）——它是迁移 0012 改 `task_id` 可空的理由。

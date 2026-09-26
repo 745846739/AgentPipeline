@@ -256,8 +256,7 @@ const FOREMAN_MESSAGE_COLUMNS: &str = "id, session_id, role, content, prompt_tok
                                        completion_tokens, briefing_json, traces_json, \
                                        segments_json, thinking, ask_json, created_at";
 
-const FOREMAN_SESSION_COLUMNS: &str =
-    "id, title, kind, created_at, last_active_at, archived_at";
+const FOREMAN_SESSION_COLUMNS: &str = "id, title, kind, created_at, last_active_at, archived_at";
 
 impl Store {
     // ─────────────────────────── 会话（班次）───────────────────────────
@@ -291,8 +290,10 @@ impl Store {
             Some(k) => query.bind(k),
             None => query,
         };
-        let rows: Vec<ForemanSessionRow> =
-            query.bind(FOREMAN_SESSION_LIST_LIMIT as i64).fetch_all(self.pool()).await?;
+        let rows: Vec<ForemanSessionRow> = query
+            .bind(FOREMAN_SESSION_LIST_LIMIT as i64)
+            .fetch_all(self.pool())
+            .await?;
         rows.into_iter()
             .map(ForemanSessionRow::into_session)
             .collect()

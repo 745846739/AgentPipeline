@@ -27,7 +27,10 @@ use crate::state::{map_core_error, ApiResult, AppState};
 /// `GET /foreman-watch`：设置页的读数。
 pub async fn settings(State(state): State<AppState>) -> ApiResult<Json<serde_json::Value>> {
     let store = state.store.clone();
-    let enabled = store.foreman_watch_enabled().await.map_err(map_core_error)?;
+    let enabled = store
+        .foreman_watch_enabled()
+        .await
+        .map_err(map_core_error)?;
     let overridden = store
         .foreman_watch_has_override()
         .await
