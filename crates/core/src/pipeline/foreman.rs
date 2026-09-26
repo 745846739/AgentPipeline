@@ -32,6 +32,7 @@
 
 use std::collections::HashMap;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, LazyLock, Mutex};
 
 use serde::{Deserialize, Serialize};
@@ -145,6 +146,39 @@ fn begin_foreman_turn(session_id: &str) -> ForemanTurnGuard {
 /// 现场（乐观轮 / 流式文本）本来就全在界面那侧，刷新即丢。
 pub fn foreman_turn_in_flight(session_id: &str) -> bool {
     FOREMAN_TURNS.lock().unwrap().contains_key(session_id)
+}
+
+/// 人的那一轮**单独**的在飞计数（决策 289 / 票 03）：`say` 起、`say` 落；值守轮不置它。
+///
+/// 为什么不读 [`FOREMAN_TURNS`]：那格答的是「这一班有没有一轮在跑」，两条时间线分家之后
+/// 各自登记各自的班次——值守轮在另一个 session_id 上，从那里看不出人正在说话。而裁决 2
+/// 的排队判据要的恰是「**人**在不在跑」：同一时刻两份十几万 token 的上下文打同一个
+/// provider（2026-09-26 实测并行 7.8 分钟），既是浪费也拖慢人的那一轮。
+///
+/// 计数挂在 **runner 实例**上而不是全局 static：生产里 `AppState` 只有一个值班长，
+/// 实例级与进程级是同一个读数；全局 static 则会让「人在跑」这个现场漏进任何一段
+/// 无关的并发代码——测试（并跑的用例各建各的 runner）是它第一个咬到的地方。
+#[derive(Default)]
+struct HumanTurns(Arc<AtomicUsize>);
+
+/// [`HumanTurns`] 的登记凭据：退出即摘（与 [`ForemanTurnGuard`] 同一姿态）。
+pub struct HumanTurnGuard(Arc<AtomicUsize>);
+
+impl Drop for HumanTurnGuard {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::SeqCst);
+    }
+}
+
+impl HumanTurns {
+    fn begin(&self) -> HumanTurnGuard {
+        self.0.fetch_add(1, Ordering::SeqCst);
+        HumanTurnGuard(Arc::clone(&self.0))
+    }
+
+    fn in_flight(&self) -> bool {
+        self.0.load(Ordering::SeqCst) > 0
+    }
 }
 
 /// 值班长的工具清单（决策 182⑭ → 决策 188 / 207）。
@@ -649,6 +683,15 @@ pub const FOREMAN_HISTORY_BUDGET_CHARS: usize = 24_000;
 /// 锚点以**一条 user 轮**的形态带头拼进历史头部（system 行重注入走 user 的先例，
 /// 204 同姿态）；测试按它认锚点（`over_budget_history_is_summarized_…`）。
 pub const COMPACTION_MARK: &str = "【更早的对话已压缩成下面这段摘要——原始轮次仍在班次台账里】";
+
+/// 跨时间线互喂的两个标记（决策 289 / 票 03）：与 [`COMPACTION_MARK`] 同族——都是
+/// 「以一条带标记的 user 轮注入的摘要」，进模型上下文才拦得住，落库之后还能审计
+/// （摘要本身不落库，落库的是它各自的原始轮次）。
+/// 人的那一轮读到**值守台账的摘要**：值班经理指着播报说「处理一下」时，模型知道
+/// 说的是哪一件——而它看到的是摘要，不是整本流水账（预算的另一半不吃）。
+pub const FOREMAN_WATCH_DIGEST_MARK: &str = "【值守摘要】";
+/// 值守轮读到**人的对话的摘要**（裁决 2：它仍读得到人说的话——以摘要形态）。
+pub const FOREMAN_TALK_DIGEST_MARK: &str = "【人的对话摘要】";
 
 /// 摘要器的专用指令（269②：同一 `llm.complete`、同 provider 的**无工具**小补全）。
 const SUMMARIZER_SYSTEM_PROMPT: &str = "你是对话历史压缩器。把给定的历史压成**一段摘要**，\
@@ -1260,6 +1303,8 @@ pub struct ForemanRunner {
     /// 值守轮的失败状态（决策 271）：退避窗口 + 这一批失败落过什么账。
     /// 与 `compaction` 同一姿态：锁只在读改写时短暂持有，绝不持锁跨 await。
     watch_failures: Mutex<WatchFailureState>,
+    /// 人的那一轮的在飞计数（决策 289 / 票 03，见 [`HumanTurns`]）。
+    human_turns: HumanTurns,
 }
 
 impl ForemanRunner {
@@ -1291,6 +1336,7 @@ impl ForemanRunner {
             steward_actions: None,
             compaction: Mutex::new(CompactionCache::default()),
             watch_failures: Mutex::new(WatchFailureState::default()),
+            human_turns: HumanTurns::default(),
         }
     }
 
@@ -1310,6 +1356,16 @@ impl ForemanRunner {
 
     pub fn store(&self) -> &Store {
         &self.store
+    }
+
+    /// 把「人的那一轮在跑」这个现场**直接摆出来**（决策 289 / 票 03 的排队判据接缝）。
+    ///
+    /// 生产里只有 [`Self::respond`] 的人的那一支会登记；值守轮不置它——这正是它与
+    /// [`FOREMAN_TURNS`] 的分野。公开给测试是因为排队判据不靠真并发验：进程级旗子在
+    /// 并跑的用例之间会互相排队（实测 4 个用例因此翻面），而「登记 → 值守让路 → 摘除 →
+    /// 值守照常」这四拍在单线程里就是全部语义。
+    pub fn begin_human_turn(&self) -> HumanTurnGuard {
+        self.human_turns.begin()
     }
 
     /// 回一句话，落进指定的会话。
@@ -1440,6 +1496,137 @@ impl ForemanRunner {
         }
     }
 
+    /// 跨时间线互喂（决策 289 / 票 03）：把**对方那条时间线**的摘要填进 `out`。
+    ///
+    /// - 人的那一轮 → 值守台账的摘要（[`FOREMAN_WATCH_DIGEST_MARK`]）：值守轮醒过几次、
+    ///   看到了什么、怎么收的场——人指着播报说「处理一下」时模型才知道说的是哪件。
+    ///   值守台账还不存在（值守轮一次都没醒过）就不注入，也不**顺手建**它——
+    ///   那本台账归值守轮所有。
+    /// - 值守轮 → 最近活动的人的班次的摘要（[`FOREMAN_TALK_DIGEST_MARK`]）：裁决 2 的
+    ///   「它仍读得到人说的话」，以摘要形态（不是整本原文）。
+    ///
+    /// 摘要机器复用 [`Self::compact_history`] 那一套（[`CompactionCache`] 增量缓存 +
+    /// [`Self::summarize_interval`]）：每条轮次一生只被压一次，边界没动零 token；
+    /// 摘要失败 → 不注入、不报错（轮次绝不因摘要挂掉而挂掉，269④ 同一姿态）。
+    async fn inject_cross_digest(
+        &self,
+        out: &mut Vec<Message>,
+        input: &TurnInput,
+        provider_id: Option<String>,
+    ) {
+        enum Source {
+            Talk,
+            Watch,
+        }
+        let (source, mark) = if input.is_watch() {
+            (Source::Talk, FOREMAN_TALK_DIGEST_MARK)
+        } else {
+            (Source::Watch, FOREMAN_WATCH_DIGEST_MARK)
+        };
+        // 两条来源各取各的「最近」，读不到就跳过（都不**顺手建**行：值守台账归值守轮所有，
+        // 人还没说过话时也没有可摘要的东西）。
+        let source_session = match source {
+            Source::Talk => match self.store.latest_foreman_session().await {
+                Ok(Some(session)) => session,
+                Ok(None) => return,
+                Err(e) => {
+                    tracing::warn!("互喂摘要读不到人的班次：{e}");
+                    return;
+                }
+            },
+            Source::Watch => {
+                match self
+                    .store
+                    .latest_foreman_session_of_kind(FOREMAN_SESSION_KIND_WATCH)
+                    .await
+                {
+                    Ok(Some(session)) => session,
+                    Ok(None) => return,
+                    Err(e) => {
+                        tracing::warn!("互喂摘要读不到值守台账：{e}");
+                        return;
+                    }
+                }
+            }
+        };
+        let history = match self
+            .store
+            .list_foreman_messages(&source_session.id, FOREMAN_HISTORY_FETCH_LIMIT)
+            .await
+        {
+            Ok(h) => h,
+            Err(e) => {
+                tracing::warn!(session = %source_session.id, "互喂摘要读不到台账：{e}");
+                return;
+            }
+        };
+        let cache_key = format!("cross:{}", source_session.id);
+        let Some(summary) = self
+            .cross_digest(&cache_key, &source_session.id, &history, provider_id)
+            .await
+        else {
+            return;
+        };
+        out.push(Message::user(format!(
+            "{mark}（以下是对方时间线的摘要，不是原文；原始轮次在它自己的台账里）\n{summary}"
+        )));
+    }
+
+    /// 摘要的本体：增量缓存 + 一次无工具小补全（[`Self::summarize_interval`]）。
+    ///
+    /// 形状与 [`Self::compact_history`] 的锚点那一半同构，差别只有一处：这里**没有**
+    /// 「窗口」——摘要覆盖到源时间线的**最新一行**（跨时间线要的是全景，不是预算内的尾巴）。
+    /// `covered_until` 之外的增量只有新掉队的那些；覆盖点找不到（行被清理）就整段重算。
+    async fn cross_digest(
+        &self,
+        cache_key: &str,
+        source_session_id: &str,
+        history: &[ForemanMessage],
+        provider_id: Option<String>,
+    ) -> Option<String> {
+        let Some(last) = history.last() else {
+            return None;
+        };
+        let boundary = last.id;
+        let entry = self
+            .compaction
+            .lock()
+            .ok()
+            .and_then(|cache| cache.get(cache_key).cloned());
+        let (summary, fresh) = match &entry {
+            // 边界没动：对方没有新动静，直接复用——一个 token 都不烧。
+            Some(e) if e.covered_until == boundary => (e.summary.clone(), false),
+            other => {
+                let (prefix, newly) = match other {
+                    Some(e) => match history.iter().position(|m| m.id == e.covered_until) {
+                        Some(i) => (Some(e.summary.as_str()), &history[i + 1..]),
+                        // 覆盖点找不到（行被清理）：防御性全量重算。
+                        _ => (None, history),
+                    },
+                    None => (None, history),
+                };
+                let input = summarize_input(newly, prefix);
+                // 留痕按**源会话**归属（决策 231 的口径）：这次摘要调用读的是那本台账。
+                let summary = self
+                    .summarize_interval(source_session_id, &input, provider_id)
+                    .await?;
+                (summary, true)
+            }
+        };
+        if fresh {
+            if let Ok(mut cache) = self.compaction.lock() {
+                cache.put(
+                    cache_key,
+                    CompactionEntry {
+                        covered_until: boundary,
+                        summary: summary.clone(),
+                    },
+                );
+            }
+        }
+        Some(summary)
+    }
+
     /// 顺序是刻意的：**值班经理说的话先落库**，再叫模型，最后落值班长的回话。
     /// 中间任何一步失败，人说过的那句话仍在台账里（审计要的是「他说了什么」，
     /// 不是「他说的哪句成功被答复」）。
@@ -1503,6 +1690,9 @@ impl ForemanRunner {
         // `watch` 都过它，故两条路各写一遍的漂移从形状上不可能。凭据在函数返回（含
         // 提前 `?` 退出）时随 `Drop` 摘掉——登记与一轮的真实寿命因此是同一条。
         let _turn = begin_foreman_turn(&session.id);
+        // 人的那一轮的独立在飞标志（决策 289 / 票 03）：值守轮据此排队，不并行。
+        // 凭据同样退出即摘——登记与一轮的真实寿命是同一条。
+        let _human = (!input.is_watch()).then(|| self.human_turns.begin());
         let cfg = self.stage_config().await?;
         self.respond_inner(session, input, cfg).await
     }
@@ -1629,14 +1819,21 @@ impl ForemanRunner {
                 }
             })
             .collect();
+        let mut head_inserts: Vec<Message> = Vec::new();
         if let Some(anchor) = anchor {
             // 锚点以**标记 user 轮**带头插在历史头部（system 行重注入走 user 的先例）。
             // 两种适配器都不会把它错位：OpenAI 把 `[system, user_prompt]` 拼在 messages
             // 之前、Anthropic 抽走 system 段后 user_prompt 仍占 wire 头——锚点只是 messages
             // 的第一条普通 user 轮（providers 的 `messages[0]` 只有 mock 在读，且读的是
             // 组装后的 wire 头，不受影响）。
-            transcript.insert(0, Message::user(format!("{COMPACTION_MARK}\n{anchor}")));
+            head_inserts.push(Message::user(format!("{COMPACTION_MARK}\n{anchor}")));
         }
+        // 跨时间线互喂（决策 289 / 票 03）：两条时间线各喂对方一份**摘要**，都以
+        // 带标记的 user 轮注入（与锚点、操作台记账轮同一先例）——进上下文才拦得住，
+        // 且两边都不是整本原文（预算不吃第二份）。锚点之后、正文之前。
+        self.inject_cross_digest(&mut head_inserts, &input, provider_id.clone())
+            .await;
+        transcript.splice(0..0, head_inserts);
         // 历史最后一条就是刚落库的这句 user 消息；但若它被 `trim_history` 之外的原因
         // 漏掉（例如库被外部清空），仍要保证本轮的问题在场。
         // 值守简报**总是**追加成最后一条：它带署名（`TurnInput::transcript_text`），
@@ -1952,6 +2149,12 @@ impl ForemanRunner {
         // 单一事实源在库里，循环每 10s 到这里问一次：界面保存后下一趟即生效，
         // 不必重启、也不需要在进程里再养一份开关状态跟库对账。
         if !self.store.foreman_watch_enabled().await? {
+            return Ok(None);
+        }
+        // 人在跑时**排队**（裁决 2 / 决策 289 / 票 03）：值守轮不起跑——返回 `Ok(None)`
+        // 且**待办不消费**，留给下一趟（与失败退避同一姿态；下一次唤醒把窗口内的事件
+        // 一起带上，一条不丢）。排队挡的是「同一时刻两份大上下文打同一个 provider」。
+        if self.human_turns.in_flight() {
             return Ok(None);
         }
         // 这一轮的起点（决策 233③）：与 `say()` 同一个用途——死轮只作废**它自己**提的提议。

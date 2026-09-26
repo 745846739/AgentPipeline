@@ -21,7 +21,8 @@ use agentpipeline_core::pipeline::foreman::{
     Attribution, AttributionKind, ForemanRunner, ForemanSegment, COMPACTION_MARK,
     FOREMAN_AGENT_TYPE, FOREMAN_ATTRIBUTION_MARK, FOREMAN_FAILED_TURN_MARK, FOREMAN_MAX_ROUNDS,
     FOREMAN_NO_ACTION_MARK, FOREMAN_PARTIAL_TURN_MARK, FOREMAN_PERSONA, FOREMAN_STAGE_KEY,
-    FOREMAN_TOOL_SPECS, FOREMAN_WATCH_FAILED_TURN_MARK, FOREMAN_WATCH_MARK, OPERATION_LOG_MARK,
+    FOREMAN_TOOL_SPECS, FOREMAN_TALK_DIGEST_MARK, FOREMAN_WATCH_DIGEST_MARK,
+    FOREMAN_WATCH_FAILED_TURN_MARK, FOREMAN_WATCH_MARK, OPERATION_LOG_MARK,
 };
 use agentpipeline_core::sse::{SseEvent, SseEventType, ToolPhase};
 use agentpipeline_core::storage::foreman::{
@@ -1124,6 +1125,145 @@ async fn the_global_switch_stops_the_watch_round_and_backlog_stays_put() {
     assert!(h.store.open_attention(100).await.unwrap().is_empty(), "照常消费");
 }
 
+/// 决策 289 / 票 03：(a) 人的那一轮读到**值守摘要**（带标记的 user 轮，且不是台账原文）；
+/// 摘要调用的留痕按**源会话**（值守台账）归属。
+#[tokio::test]
+async fn the_human_turn_sees_a_marked_watch_digest_not_the_verbatim_ledger() {
+    let h = Harness::empty().await;
+    // 值守台账先醒过两次（直接落库模拟既有播报）。
+    let watch_sid = h
+        .store
+        .create_foreman_session_of_kind(
+            FOREMAN_SESSION_KIND_WATCH,
+            FOREMAN_WATCH_SESSION_TITLE,
+        )
+        .await
+        .unwrap()
+        .id;
+    for content in [
+        format!("{FOREMAN_WATCH_MARK}t1 重试耗尽了，建议重跑。"),
+        format!("{FOREMAN_WATCH_MARK}t2 的闸门挂了三次，需要人看。"),
+    ] {
+        h.store
+            .append_foreman_message(NewForemanMessage::assistant(&watch_sid, content))
+            .await
+            .unwrap();
+    }
+
+    let mut script = Script::new();
+    script
+        .for_foreman()
+        .text("值守摘要：t1 重试耗尽、t2 闸门连挂。") // 第一次调用 = 互喂摘要器
+        .text("这两件我都看过了。"); // 第二次 = 主轮
+    let agent = FakeAgent::new(script);
+    let runner = h.runner(agent.clone());
+    let turn = runner.say(None, "刚才播报的两件事怎么办").await.unwrap();
+
+    let reqs = agent.request_log();
+    assert_eq!(reqs.len(), 2, "摘要一次 + 主轮一次：{}", reqs.len());
+    // 摘要器：无工具、留痕归属**值守台账**（决策 231 的口径：读的是那本台账）。
+    assert!(reqs[0].tools.is_empty(), "摘要器不该带工具");
+    assert_eq!(
+        reqs[0].run.as_ref().map(|r| r.session_id.as_str()),
+        Some(watch_sid.as_str()),
+        "摘要调用的留痕按源会话归属"
+    );
+    assert!(
+        reqs[0]
+            .user_prompt
+            .contains("t1 重试耗尽了"),
+        "台账原文是摘要输入：{}",
+        reqs[0].user_prompt
+    );
+    // 主轮：头部一条带标记的 user 轮 = 标记 + 摘要正文；**不是**台账原文。
+    let digest = &reqs[1].messages[0];
+    let head = digest.content.as_deref().unwrap_or_default();
+    assert!(
+        head.contains(FOREMAN_WATCH_DIGEST_MARK) && head.contains("值守摘要："),
+        "头部要同时有标记与摘要正文：{head}"
+    );
+    assert!(
+        !head.contains(FOREMAN_WATCH_MARK),
+        "摘要是重述，不是把播报原样搬进上下文：{head}"
+    );
+    // 回话照旧落在人的班次。
+    assert!(turn.session.is_talk());
+}
+
+/// 决策 289 / 票 03：(b) 值守轮读到**人的对话摘要**（裁决 2：它仍读得到人说的话——
+/// 以摘要形态），同样带标记、不是原文。
+#[tokio::test]
+async fn the_watch_round_sees_a_marked_talk_digest() {
+    let h = Harness::seeded().await;
+    let mut script = Script::new();
+    script
+        .for_foreman()
+        .text("收到，我看一下。") // say 主轮
+        .text("人的对话摘要：值班经理在盯 t1。") // watch 轮的互喂摘要器
+        .text("t1 重试耗尽了，需要值班经理看一眼。"); // watch 主轮
+    let agent = FakeAgent::new(script);
+    let runner = h.runner(agent.clone());
+
+    runner.say(None, "t1 现在什么情况").await.unwrap();
+    note(
+        &h,
+        "t1",
+        agentpipeline_core::storage::AttentionKind::RetryExhausted,
+    )
+    .await;
+    // 去抖窗口从**最早那件**（note 的时刻）算——先记事件再拨钟。
+    h.clock.advance_secs(61);
+    let turn = runner.watch().await.unwrap().expect("应当醒一次");
+    assert_eq!(turn.session.kind, FOREMAN_SESSION_KIND_WATCH);
+
+    // watch 的调用序 = 互喂摘要 + 主轮（say 那次在前面）：第三条是 watch 主轮。
+    let reqs = agent.request_log();
+    assert_eq!(reqs.len(), 3, "say 主轮 + watch 摘要 + watch 主轮：{}", reqs.len());
+    let main = &reqs[2];
+    let head = main.messages[0].content.as_deref().unwrap_or_default();
+    assert!(
+        head.contains(FOREMAN_TALK_DIGEST_MARK) && head.contains("值班经理在盯 t1"),
+        "值守轮的上下文里要有人话的摘要：{head}"
+    );
+}
+
+/// 决策 289 / 票 03：(c) 人在跑时值守轮**排队**——不起轮、待办不消费；人一落它就照常醒
+/// （与失败退避同一姿态：留给下一趟，一条不丢）。
+#[tokio::test]
+async fn the_watch_round_queues_while_a_human_turn_is_in_flight() {
+    let h = Harness::seeded().await;
+    note(
+        &h,
+        "t1",
+        agentpipeline_core::storage::AttentionKind::RetryExhausted,
+    )
+    .await;
+    h.clock.advance_secs(61);
+
+    let mut script = Script::new();
+    script
+        .for_foreman()
+        .text("t1 重试耗尽了，需要值班经理看一眼。");
+    let agent = FakeAgent::new(script);
+    let runner = h.runner(agent.clone());
+
+    // 不靠真并发（旗子是进程级的，会把并跑的其它用例一起排队）：直接把「人在跑」
+    // 的现场摆出来——生产里这一步由 `respond` 的人的那一支登记。
+    let human = runner.begin_human_turn();
+    assert!(runner.watch().await.unwrap().is_none(), "人在跑：值守排队");
+    assert_eq!(agent.total_calls(), 0, "排队不花钱");
+    assert_eq!(
+        h.store.open_attention(100).await.unwrap().len(),
+        1,
+        "待办不消费：留给下一趟"
+    );
+    drop(human);
+
+    let turn = runner.watch().await.unwrap().expect("人落了：下一趟照常醒");
+    assert!(turn.reply.contains("重试耗尽"));
+    assert!(h.store.open_attention(100).await.unwrap().is_empty(), "照常消费");
+}
+
 #[tokio::test]
 async fn a_due_attention_wakes_the_foreman_exactly_once() {
     let h = Harness::seeded().await;
@@ -1184,8 +1324,13 @@ async fn the_watch_round_writes_to_its_own_session_and_the_talk_session_never_se
     h.clock.advance_secs(61);
 
     // 先有人的班次与一轮对话（分家之后的对照组）。
+    // 值守轮醒来时会对人的班次做一次互喂摘要（决策 289 / 票 03），故多备一步。
     let mut script = Script::new();
-    script.for_foreman().text("收到，我看一下。");
+    script
+        .for_foreman()
+        .text("收到，我看一下。")
+        .text("值守摘要：值班经理刚问过 t1。")
+        .text("t1 重试耗尽了，需要值班经理看一眼。");
     let agent = FakeAgent::new(script);
     let runner = h.runner(agent.clone());
     let human_turn = runner.say(None, "t1 现在什么情况").await.unwrap();
@@ -2331,7 +2476,11 @@ async fn the_watch_cost_is_accounted_separately_from_human_turns() {
     .await;
     h.clock.advance_secs(61);
     let mut silent = Script::new();
-    silent.for_foreman().text("【无需处理】");
+    // 第二次 watch 会对人的班次做一次互喂摘要（say 那句「在吗」是新增量）——故多备一步。
+    silent
+        .for_foreman()
+        .text("人的对话摘要：值班经理打了个招呼。")
+        .text("【无需处理】");
     agent.set_script(silent);
     assert!(runner.watch().await.unwrap().is_none());
     let (wakes, _, _) = h.store.watch_cost_since(since).await.unwrap();
