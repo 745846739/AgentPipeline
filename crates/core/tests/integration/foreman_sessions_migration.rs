@@ -10,6 +10,7 @@
 use std::borrow::Cow;
 use std::sync::Arc;
 
+use agentpipeline_core::storage::foreman::FOREMAN_SESSION_KIND_TALK;
 use agentpipeline_core::storage::Store;
 use sqlx::sqlite::{SqliteConnectOptions, SqlitePoolOptions};
 use testkit::{ManualClock, TestHome};
@@ -95,7 +96,7 @@ async fn a_legacy_database_migrates_and_its_messages_land_in_the_first_session()
         .expect("在既有数据上打开必须成功");
 
     // 老消息进了第一个会话，顺序与读数都还在。
-    let sessions = store.list_foreman_sessions().await.unwrap();
+    let sessions = store.list_foreman_sessions(Some(FOREMAN_SESSION_KIND_TALK)).await.unwrap();
     assert_eq!(sessions.len(), 1, "既有消息应当回填出一个会话");
     let session = &sessions[0];
     // 标题取自首条用户消息，截到 24 字并补省略号（与 `session_title_from` 同一条规则）。
@@ -103,6 +104,9 @@ async fn a_legacy_database_migrates_and_its_messages_land_in_the_first_session()
         session.title,
         "这是我昨晚问的第一句话，后面的字只是用来看看标题…"
     );
+    // 迁移 0030（决策 286 / 票 01）：存量行全落 `talk`——裁决 12「不回填」的另一半：
+    // 老的播报留在原会话里靠 `proactive` 标对，升级不改变任何一行的归属。
+    assert_eq!(session.kind, FOREMAN_SESSION_KIND_TALK);
 
     let messages = store.list_foreman_messages(&session.id, 100).await.unwrap();
     assert_eq!(messages.len(), 2);
@@ -135,6 +139,6 @@ async fn an_empty_legacy_database_gains_no_session() {
     let store = Store::open(home.home().clone(), Arc::new(clock))
         .await
         .unwrap();
-    assert!(store.list_foreman_sessions().await.unwrap().is_empty());
+    assert!(store.list_foreman_sessions(Some(FOREMAN_SESSION_KIND_TALK)).await.unwrap().is_empty());
     assert!(store.latest_foreman_session().await.unwrap().is_none());
 }

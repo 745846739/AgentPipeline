@@ -18,7 +18,10 @@ use agentpipeline_core::pipeline::foreman::{
 };
 use agentpipeline_core::pipeline::ForemanRunner;
 use agentpipeline_core::sse::{SseEvent, SseEventType};
-use agentpipeline_core::storage::foreman::NewForemanMessage;
+use agentpipeline_core::storage::foreman::{
+    NewForemanMessage, FOREMAN_SESSION_KIND_TALK, FOREMAN_SESSION_KIND_WATCH,
+    FOREMAN_WATCH_SESSION_TITLE,
+};
 use agentpipeline_core::storage::proposals::NewForemanProposal;
 use agentpipeline_core::types::{Provider, ReviewMode, Stage, TaskStatus};
 use app::peer::PeerAddr;
@@ -5363,6 +5366,60 @@ async fn foreman_sessions_can_be_created_renamed_and_archived() {
     assert_eq!(status, StatusCode::BAD_REQUEST);
 }
 
+/// 决策 286 / 票 01：班次带身份——列表缺省只回人的班次，`?kind=watch` 取值守台账；
+/// 缺省读端点各落各的「最近」；对值守台账说话被拒（它是只读的一本账）。
+#[tokio::test]
+async fn foreman_sessions_carry_a_kind_and_the_watch_ledger_is_read_only() {
+    let api = api_with_foreman(FakeAgent::new(Script::new())).await;
+    let store = api.state.store.clone();
+    let talk = fresh_session(&api).await;
+    let watch = store
+        .create_foreman_session_of_kind(
+            FOREMAN_SESSION_KIND_WATCH,
+            FOREMAN_WATCH_SESSION_TITLE,
+        )
+        .await
+        .unwrap()
+        .id;
+
+    // 列表缺省只回人的班次；wire 上带 `kind`。
+    let (_, body) = get(&api, "/foreman/sessions").await;
+    let rows = body["sessions"].as_array().unwrap();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0]["id"], talk.as_str());
+    assert_eq!(rows[0]["kind"], "talk");
+
+    // `?kind=watch` 只回值守台账。
+    let (_, body) = get(&api, "/foreman/sessions?kind=watch").await;
+    let rows = body["sessions"].as_array().unwrap();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0]["id"], watch.as_str());
+    assert_eq!(rows[0]["kind"], "watch");
+    assert_eq!(rows[0]["title"], FOREMAN_WATCH_SESSION_TITLE);
+
+    // 认不出的 kind 是 400（不是静默当 talk）。
+    let (status, body) = get(&api, "/foreman/sessions?kind=nope").await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+
+    // 读端点的缺省落点各取各的「最近」。
+    let (_, body) = get(&api, "/foreman/session").await;
+    assert_eq!(body["session"]["id"], talk.as_str());
+    let (_, body) = get(&api, "/foreman/session?kind=watch").await;
+    assert_eq!(body["session"]["id"], watch.as_str());
+    assert_eq!(body["session"]["kind"], "watch");
+
+    // 对值守台账说话被拒：400，且不落 user 行、不开模型调用。
+    let (status, body) = post(
+        &api,
+        "/foreman/messages",
+        json!({"text": "对着播报说句话", "session_id": watch}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    let (_, body) = get(&api, &format!("/foreman/session?session={watch}")).await;
+    assert_eq!(body["messages"].as_array().unwrap().len(), 0, "不落库");
+}
+
 /// 两个班次各说各的：消息与页头合计都按班次读，互不污染（决策 204②⑤）。
 #[tokio::test]
 async fn foreman_sessions_isolate_their_own_messages_and_totals() {
@@ -5473,7 +5530,7 @@ async fn foreman_endpoints_report_503_when_unwired() {
     assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
     // 未接线时不落任何一行会话——拒绝发生在写之前。
     let store = api.state.store.clone();
-    assert!(store.list_foreman_sessions().await.unwrap().is_empty());
+    assert!(store.list_foreman_sessions(Some(FOREMAN_SESSION_KIND_TALK)).await.unwrap().is_empty());
     let (status, _) = get(&api, "/foreman/sessions").await;
     assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
 }
@@ -5861,7 +5918,7 @@ async fn proposal_endpoints_report_503_when_unwired() {
     assert!(api
         .state
         .store
-        .list_foreman_sessions()
+        .list_foreman_sessions(Some(FOREMAN_SESSION_KIND_TALK))
         .await
         .unwrap()
         .is_empty());

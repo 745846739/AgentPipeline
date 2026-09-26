@@ -24,7 +24,10 @@ use agentpipeline_core::pipeline::foreman::{
     FOREMAN_TOOL_SPECS, FOREMAN_WATCH_FAILED_TURN_MARK, FOREMAN_WATCH_MARK, OPERATION_LOG_MARK,
 };
 use agentpipeline_core::sse::{SseEvent, SseEventType, ToolPhase};
-use agentpipeline_core::storage::foreman::NewForemanMessage;
+use agentpipeline_core::storage::foreman::{
+    NewForemanMessage, FOREMAN_SESSION_KIND_TALK, FOREMAN_SESSION_KIND_WATCH,
+    FOREMAN_WATCH_SESSION_TITLE,
+};
 use agentpipeline_core::storage::model_requests::{
     ModelRequestStatus, ModelRequestUsage, NewModelRequest,
 };
@@ -124,13 +127,23 @@ impl Harness {
         self.store.create_foreman_session("").await.unwrap().id
     }
 
-    /// 最近活动的未归档会话 id（值守轮自己挑的那个）。
+    /// 最近活动的未归档会话 id（人的班次；说话面的缺省落点）。
     async fn latest_session(&self) -> String {
         self.store
             .latest_foreman_session()
             .await
             .unwrap()
             .expect("应当已有会话")
+            .id
+    }
+
+    /// 值守台账的 id（决策 286 / 票 01：值守轮写它自己的班次）。
+    async fn latest_watch_session(&self) -> String {
+        self.store
+            .latest_foreman_session_of_kind(FOREMAN_SESSION_KIND_WATCH)
+            .await
+            .unwrap()
+            .expect("值守轮应当已经建出值守台账")
             .id
     }
 
@@ -979,7 +992,7 @@ async fn empty_message_is_rejected_and_not_persisted() {
     let runner = h.runner(FakeAgent::new(Script::new()));
     assert!(runner.say(None, "   ").await.is_err());
     // 空消息连班次都不该开——「一句空话」不构成一次值班。
-    assert!(h.store.list_foreman_sessions().await.unwrap().is_empty());
+    assert!(h.store.list_foreman_sessions(Some(FOREMAN_SESSION_KIND_TALK)).await.unwrap().is_empty());
 
     let sid = h.session().await;
     assert!(runner.say(Some(&sid), "   ").await.is_err());
@@ -1100,6 +1113,123 @@ async fn a_due_attention_wakes_the_foreman_exactly_once() {
     // 第二趟：没有待办了 → 零次模型调用
     assert!(runner.watch().await.unwrap().is_none());
     assert_eq!(agent.total_calls(), 1, "空闲时零成本");
+}
+
+/// 决策 286 / 票 01：值守轮写的话落**它自己的班次**（`kind = watch`），人的班次读不到它。
+///
+/// 数据分家是两条时间线的地基：播报不再混进人的时间线，值守台账也**不许被当成聊天室**
+/// ——往里说话被拒、说话面的缺省落点也不落到它。
+#[tokio::test]
+async fn the_watch_round_writes_to_its_own_session_and_the_talk_session_never_sees_it() {
+    let h = Harness::seeded().await;
+    note(
+        &h,
+        "t1",
+        agentpipeline_core::storage::AttentionKind::RetryExhausted,
+    )
+    .await;
+    h.clock.advance_secs(61);
+
+    // 先有人的班次与一轮对话（分家之后的对照组）。
+    let mut script = Script::new();
+    script.for_foreman().text("收到，我看一下。");
+    let agent = FakeAgent::new(script);
+    let runner = h.runner(agent.clone());
+    let human_turn = runner.say(None, "t1 现在什么情况").await.unwrap();
+    assert!(human_turn.session.is_talk());
+
+    // 值守轮醒一次：播报落进值守台账。
+    let watch_turn = runner.watch().await.unwrap().expect("应当醒一次");
+    assert_eq!(watch_turn.session.kind, FOREMAN_SESSION_KIND_WATCH);
+    assert_eq!(watch_turn.session.title, FOREMAN_WATCH_SESSION_TITLE);
+    let watch_messages = h
+        .store
+        .list_foreman_messages(&watch_turn.session.id, 100)
+        .await
+        .unwrap();
+    assert!(watch_messages
+        .iter()
+        .any(|m| m.content.starts_with(FOREMAN_WATCH_MARK)));
+
+    // 人的班次一个字节没变：播报不在里面。
+    let human_messages = h
+        .store
+        .list_foreman_messages(&human_turn.session.id, 100)
+        .await
+        .unwrap();
+    assert!(
+        !human_messages
+            .iter()
+            .any(|m| m.content.starts_with(FOREMAN_WATCH_MARK)),
+        "播报不该混进人的班次：{human_messages:?}"
+    );
+
+    // 两个列表各回各的；「最近的班次」也不串（值守轮刷新过它自己的 last_active_at）。
+    let talk = h
+        .store
+        .list_foreman_sessions(Some(FOREMAN_SESSION_KIND_TALK))
+        .await
+        .unwrap();
+    let watch = h
+        .store
+        .list_foreman_sessions(Some(FOREMAN_SESSION_KIND_WATCH))
+        .await
+        .unwrap();
+    assert_eq!(talk.iter().map(|s| s.id.clone()).collect::<Vec<_>>(), vec![
+        human_turn.session.id.clone()
+    ]);
+    assert_eq!(watch.len(), 1);
+    assert_eq!(watch[0].kind, FOREMAN_SESSION_KIND_WATCH);
+    assert_eq!(
+        h.store.latest_foreman_session().await.unwrap().unwrap().id,
+        human_turn.session.id,
+        "说话面的缺省落点仍是人的班次"
+    );
+    assert_eq!(
+        h.store
+            .latest_foreman_session_of_kind(FOREMAN_SESSION_KIND_WATCH)
+            .await
+            .unwrap()
+            .unwrap()
+            .id,
+        watch_turn.session.id
+    );
+
+    // 值守台账是只读的一本账：往里说话被拒（不落 user 行、不开模型调用）。
+    let calls_before = agent.total_calls();
+    let err = runner
+        .say(Some(&watch_turn.session.id), "对着播报说句话")
+        .await
+        .unwrap_err();
+    assert!(matches!(err, Error::Validation(_)), "{err}");
+    assert_eq!(
+        agent.total_calls(),
+        calls_before,
+        "被拒的说话不开模型调用"
+    );
+    let watch_messages_after = h
+        .store
+        .list_foreman_messages(&watch_turn.session.id, 100)
+        .await
+        .unwrap();
+    assert_eq!(
+        watch_messages_after.len(),
+        watch_messages.len(),
+        "被拒的说话不落库"
+    );
+
+    // 第二趟值守：仍写同一本台账（不存在就建、存在就沿用）。
+    // 换一个任务：t1 刚被消费过，还在同任务冷却里（决策 209⑤）。
+    h.task("t2").await;
+    note(
+        &h,
+        "t2",
+        agentpipeline_core::storage::AttentionKind::GateFailure,
+    )
+    .await;
+    h.clock.advance_secs(61);
+    let second = runner.watch().await.unwrap().expect("应当再醒一次");
+    assert_eq!(second.session.id, watch_turn.session.id);
 }
 
 #[tokio::test]
@@ -1235,7 +1365,13 @@ async fn a_no_action_verdict_is_recorded_silently() {
 
     assert!(runner.watch().await.unwrap().is_none(), "静默：不返回播报");
     assert_eq!(agent.total_calls(), 1, "它仍然醒了一次并做了判断");
-    let sid = h.store.latest_foreman_session().await.unwrap().unwrap().id;
+    let sid = h
+        .store
+        .latest_foreman_session_of_kind(FOREMAN_SESSION_KIND_WATCH)
+        .await
+        .unwrap()
+        .unwrap()
+        .id;
     assert!(
         h.store
             .list_foreman_messages(&sid, 100)
@@ -1279,7 +1415,7 @@ async fn a_failing_watch_backs_off_and_notes_the_burst_once() {
     // 第一趟：真尝试、真失败；落一行失败账，待办不消费
     assert!(runner.watch().await.is_err());
     assert_eq!(agent.total_calls(), 1, "第一趟真的叫了模型");
-    let sid = h.latest_session().await;
+    let sid = h.latest_watch_session().await;
     let after_first = h.store.list_foreman_messages(&sid, 100).await.unwrap();
     assert_eq!(after_first.len(), 1, "只有那一行失败账：{after_first:?}");
     assert!(
@@ -1373,7 +1509,7 @@ async fn a_billing_class_failure_backs_off_longer_than_a_network_one() {
     let runner = h.runner(agent.clone());
 
     assert!(runner.watch().await.is_err());
-    let sid = h.latest_session().await;
+    let sid = h.latest_watch_session().await;
     let first = h.store.list_foreman_messages(&sid, 100).await.unwrap();
     assert!(
         first[0].content.contains("llm_quota"),
@@ -1423,7 +1559,7 @@ async fn the_watch_mark_is_added_once_and_silence_survives_the_model_writing_it(
         turn.reply, "三条任务在跑，两条已完工。",
         "回给调用方的正文不带我们自己的前缀"
     );
-    let sid = h.latest_session().await;
+    let sid = h.latest_watch_session().await;
     let rows = h.store.list_foreman_messages(&sid, 100).await.unwrap();
     assert_eq!(rows.len(), 1);
     assert_eq!(
@@ -1448,7 +1584,7 @@ async fn the_watch_mark_is_added_once_and_silence_survives_the_model_writing_it(
     let agent2 = FakeAgent::new(script2);
     let runner2 = h2.runner(agent2.clone());
     assert!(runner2.watch().await.unwrap().is_none(), "静默轮不返回回话");
-    let sid2 = h2.latest_session().await;
+    let sid2 = h2.latest_watch_session().await;
     assert!(
         h2.store
             .list_foreman_messages(&sid2, 100)
@@ -1885,7 +2021,7 @@ async fn hitting_the_hourly_cap_reports_instead_of_dropping_silently() {
 
     let messages = h
         .store
-        .list_foreman_messages(&h.latest_session().await, 100)
+        .list_foreman_messages(&h.latest_watch_session().await, 100)
         .await
         .unwrap();
     let note_row = messages
@@ -1908,7 +2044,7 @@ async fn hitting_the_hourly_cap_reports_instead_of_dropping_silently() {
     assert!(runner.watch().await.unwrap().is_none());
     let again = h
         .store
-        .list_foreman_messages(&h.latest_session().await, 100)
+        .list_foreman_messages(&h.latest_watch_session().await, 100)
         .await
         .unwrap()
         .iter()
@@ -3486,7 +3622,7 @@ async fn sessions_are_listed_by_recent_activity() {
         .await
         .unwrap();
 
-    let list = h.store.list_foreman_sessions().await.unwrap();
+    let list = h.store.list_foreman_sessions(Some(FOREMAN_SESSION_KIND_TALK)).await.unwrap();
     assert_eq!(
         list.iter().map(|s| s.id.clone()).collect::<Vec<_>>(),
         vec![a, b]
@@ -3507,7 +3643,7 @@ async fn archiving_hides_it_from_the_list_but_keeps_its_messages() {
     let archived = h.store.archive_foreman_session(&a).await.unwrap().unwrap();
     assert!(archived.archived_at.is_some());
 
-    let list = h.store.list_foreman_sessions().await.unwrap();
+    let list = h.store.list_foreman_sessions(Some(FOREMAN_SESSION_KIND_TALK)).await.unwrap();
     assert_eq!(list.len(), 1);
     assert_eq!(list[0].id, b, "归档的不在列表里，剩下的照旧");
 
@@ -3554,7 +3690,7 @@ async fn sending_to_an_unknown_session_reports_it() {
     let runner = h.runner(FakeAgent::new(script));
     let err = runner.say(Some("no-such-session"), "喂").await.unwrap_err();
     assert!(matches!(err, Error::Task(_)), "{err}");
-    assert!(h.store.list_foreman_sessions().await.unwrap().is_empty());
+    assert!(h.store.list_foreman_sessions(Some(FOREMAN_SESSION_KIND_TALK)).await.unwrap().is_empty());
 }
 
 /// 值班长的命令挂**会话**，不挂任务（决策 204④）——它是迁移 0012 改 `task_id` 可空的理由。

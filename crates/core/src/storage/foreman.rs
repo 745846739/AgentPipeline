@@ -40,6 +40,17 @@ pub const SESSION_TITLE_MAX_CHARS: usize = 24;
 /// 还没说出第一句话的会话叫这个（决策 204②「没有首条用户消息时给一个中性标题」）。
 pub const FOREMAN_SESSION_DEFAULT_TITLE: &str = "新班次";
 
+/// 会话的两种身份（决策 286 / 票 foreman-unbounded 01）：人的班次与值守台账。
+///
+/// 同一套表、同一批读路径，靠这一列分家——「分家」分的是**数据归属**（值守轮写的话
+/// 落它自己的班次），不是权限，也不是工具面（裁决 4：值守轮能查什么一字不改）。
+pub const FOREMAN_SESSION_KIND_TALK: &str = "talk";
+pub const FOREMAN_SESSION_KIND_WATCH: &str = "watch";
+
+/// 值守班次的固定标题（决策 286 / 票 01）。它不是给人起的名字，是「这一本是台账」的标识
+/// ——对讲台的值守入口按 `kind` 取它，标题只是列表里那行字。
+pub const FOREMAN_WATCH_SESSION_TITLE: &str = "值守台账";
+
 /// 一次列出的会话上限（不分页，照 `SESSION_PAGE_LIMIT` 的精神）。
 ///
 /// 班次是**按天/按班**的粒度，不是按调用——一个人一晚上不会新建 50 个班次。
@@ -68,11 +79,22 @@ pub fn session_title_from(first_message: Option<&str>) -> String {
 pub struct ForemanSession {
     pub id: String,
     pub title: String,
+    /// 班次身份（决策 286 / 票 01）：[`FOREMAN_SESSION_KIND_TALK`] 或
+    /// [`FOREMAN_SESSION_KIND_WATCH`]。迁移 0030 起带 CHECK，库里的值只可能是这两个；
+    /// 认不出的值原样带出去（与 `role` 同一条「观测字段不兜底」的口径）。
+    pub kind: String,
     pub created_at: DateTime<Utc>,
     /// 最近一次说话的时间。列表按它倒序（决策 204⑦）。
     pub last_active_at: DateTime<Utc>,
     /// 归档时间。归档 = 从列表里收起来，**不物理删除**，也不保护消息（决策 204⑦）。
     pub archived_at: Option<DateTime<Utc>>,
+}
+
+impl ForemanSession {
+    /// 这是人的班次吗（对讲台的说话面只落这种班次）。
+    pub fn is_talk(&self) -> bool {
+        self.kind == FOREMAN_SESSION_KIND_TALK
+    }
 }
 
 /// 一行值班长会话。
@@ -167,6 +189,7 @@ impl NewForemanMessage {
 struct ForemanSessionRow {
     id: String,
     title: String,
+    kind: String,
     created_at: String,
     last_active_at: String,
     archived_at: Option<String>,
@@ -177,6 +200,7 @@ impl ForemanSessionRow {
         Ok(ForemanSession {
             id: self.id,
             title: self.title,
+            kind: self.kind,
             created_at: parse_ts(&self.created_at)?,
             last_active_at: parse_ts(&self.last_active_at)?,
             archived_at: self.archived_at.as_deref().map(parse_ts).transpose()?,
@@ -232,25 +256,43 @@ const FOREMAN_MESSAGE_COLUMNS: &str = "id, session_id, role, content, prompt_tok
                                        completion_tokens, briefing_json, traces_json, \
                                        segments_json, thinking, ask_json, created_at";
 
-const FOREMAN_SESSION_COLUMNS: &str = "id, title, created_at, last_active_at, archived_at";
+const FOREMAN_SESSION_COLUMNS: &str =
+    "id, title, kind, created_at, last_active_at, archived_at";
 
 impl Store {
     // ─────────────────────────── 会话（班次）───────────────────────────
 
     /// 未归档的会话，按最近活动倒序、上限一条常量、不分页（决策 204⑦）。
     ///
+    /// `kind` 过滤（决策 286 / 票 01）：`Some("talk")` / `Some("watch")` 只回那一类，
+    /// `None` 回全部。路由层缺省传 talk——「对讲台的班次列表」与「值守台账的入口」
+    /// 是两个列表；混合回一份会让前端把值守台账当成一个可说话的班次。
+    ///
     /// 归档的**不在这个列表里**——「从列表里收起来」就是归档的全部含义。
     /// 它们仍在库里，也仍能按 id 单独取到（`get_foreman_session`）。
-    pub async fn list_foreman_sessions(&self) -> Result<Vec<ForemanSession>> {
-        let sql = format!(
-            "SELECT {FOREMAN_SESSION_COLUMNS} FROM kanban_foreman_sessions
-             WHERE archived_at IS NULL
-             ORDER BY last_active_at DESC, id DESC LIMIT ?"
-        );
-        let rows: Vec<ForemanSessionRow> = sqlx::query_as(&sql)
-            .bind(FOREMAN_SESSION_LIST_LIMIT as i64)
-            .fetch_all(self.pool())
-            .await?;
+    pub async fn list_foreman_sessions(&self, kind: Option<&str>) -> Result<Vec<ForemanSession>> {
+        let sql = match kind {
+            Some(_) => {
+                format!(
+                    "SELECT {FOREMAN_SESSION_COLUMNS} FROM kanban_foreman_sessions
+                     WHERE archived_at IS NULL AND kind = ?
+                     ORDER BY last_active_at DESC, id DESC LIMIT ?"
+                )
+            }
+            None => format!(
+                "SELECT {FOREMAN_SESSION_COLUMNS} FROM kanban_foreman_sessions
+                 WHERE archived_at IS NULL
+                 ORDER BY last_active_at DESC, id DESC LIMIT ?"
+            ),
+        };
+        // 占位符按出现顺序绑定：kind 过滤在前、LIMIT 在后。
+        let query = sqlx::query_as::<_, ForemanSessionRow>(&sql);
+        let query = match kind {
+            Some(k) => query.bind(k),
+            None => query,
+        };
+        let rows: Vec<ForemanSessionRow> =
+            query.bind(FOREMAN_SESSION_LIST_LIMIT as i64).fetch_all(self.pool()).await?;
         rows.into_iter()
             .map(ForemanSessionRow::into_session)
             .collect()
@@ -267,20 +309,51 @@ impl Store {
         row.map(ForemanSessionRow::into_session).transpose()
     }
 
-    /// 最近活动的未归档会话（对讲台的默认落点）。
-    pub async fn latest_foreman_session(&self) -> Result<Option<ForemanSession>> {
+    /// 最近活动的未归档会话，**限定某一类**（决策 286 / 票 01）。
+    ///
+    /// 人的班次与值守台账各取各的「最近」：值守轮往 watch 班次落账会刷新它的
+    /// `last_active_at`，若不限定类别，人的那一轮就会落进值守台账（或反过来）。
+    pub async fn latest_foreman_session_of_kind(
+        &self,
+        kind: &str,
+    ) -> Result<Option<ForemanSession>> {
         let sql = format!(
             "SELECT {FOREMAN_SESSION_COLUMNS} FROM kanban_foreman_sessions
-             WHERE archived_at IS NULL
+             WHERE archived_at IS NULL AND kind = ?
              ORDER BY last_active_at DESC, id DESC LIMIT 1"
         );
-        let row: Option<ForemanSessionRow> =
-            sqlx::query_as(&sql).fetch_optional(self.pool()).await?;
+        let row: Option<ForemanSessionRow> = sqlx::query_as(&sql)
+            .bind(kind)
+            .fetch_optional(self.pool())
+            .await?;
         row.map(ForemanSessionRow::into_session).transpose()
     }
 
-    /// 新建一个会话。`title` 为空（或全空白）时用中性标题。
+    /// 最近活动的未归档**人的**班次（对讲台的默认落点）。
+    ///
+    /// 现有调用者（`say` 的缺省落点、读端点的缺省班次、中断账的归属）说的全是这一类
+    /// ——值守台账不该被任何一条「缺省落到最近班次」的老路挑中。
+    pub async fn latest_foreman_session(&self) -> Result<Option<ForemanSession>> {
+        self.latest_foreman_session_of_kind(FOREMAN_SESSION_KIND_TALK)
+            .await
+    }
+
+    /// 新建一个**人的**班次。`title` 为空（或全空白）时用中性标题。
     pub async fn create_foreman_session(&self, title: &str) -> Result<ForemanSession> {
+        self.create_foreman_session_of_kind(FOREMAN_SESSION_KIND_TALK, title)
+            .await
+    }
+
+    /// 新建一个**指定身份**的班次（决策 286 / 票 01）。
+    ///
+    /// 值守班次由值守轮按需自建（固定标题[`FOREMAN_WATCH_SESSION_TITLE`]），不经
+    /// `POST /foreman/sessions`——那条路只开人的班次，这是「值守台账不是聊天室」
+    /// 在写入面的形状。
+    pub async fn create_foreman_session_of_kind(
+        &self,
+        kind: &str,
+        title: &str,
+    ) -> Result<ForemanSession> {
         let now = self.now();
         let id = ulid::Ulid::new().to_string();
         let title = if title.trim().is_empty() {
@@ -289,11 +362,12 @@ impl Store {
             title.trim().to_string()
         };
         sqlx::query(
-            "INSERT INTO kanban_foreman_sessions (id, title, created_at, last_active_at, archived_at)
-             VALUES (?, ?, ?, ?, NULL)",
+            "INSERT INTO kanban_foreman_sessions (id, title, kind, created_at, last_active_at, archived_at)
+             VALUES (?, ?, ?, ?, ?, NULL)",
         )
         .bind(&id)
         .bind(&title)
+        .bind(kind)
         .bind(ts(now))
         .bind(ts(now))
         .execute(self.pool())
@@ -301,6 +375,7 @@ impl Store {
         Ok(ForemanSession {
             id,
             title,
+            kind: kind.to_string(),
             created_at: now,
             last_active_at: now,
             archived_at: None,

@@ -36,7 +36,8 @@ use agentpipeline_core::pipeline::foreman::{
 };
 use agentpipeline_core::sse::SseEvent;
 use agentpipeline_core::storage::foreman::{
-    ForemanMessage, ForemanSession, NewForemanMessage, SESSION_TITLE_MAX_CHARS,
+    ForemanMessage, ForemanSession, NewForemanMessage, FOREMAN_SESSION_KIND_TALK,
+    FOREMAN_SESSION_KIND_WATCH, SESSION_TITLE_MAX_CHARS,
 };
 use agentpipeline_core::storage::proposals::{ForemanProposal, ForemanProposalStatus};
 use agentpipeline_core::storage::Store;
@@ -102,22 +103,44 @@ pub async fn session(
             .get_foreman_session(id)
             .await
             .map_err(map_core_error)?,
-        None => store
-            .latest_foreman_session()
-            .await
-            .map_err(map_core_error)?,
+        // 缺省落点按 `kind` 取各自的「最近」（决策 286 / 票 01）：值守入口不指定
+        // id 时落最近活动的值守台账，人的对讲台落最近活动的人的班次——两边不再
+        // 抢同一个「最近」。
+        None => match params.kind.as_deref() {
+            Some(FOREMAN_SESSION_KIND_WATCH) => store
+                .latest_foreman_session_of_kind(FOREMAN_SESSION_KIND_WATCH)
+                .await
+                .map_err(map_core_error)?,
+            _ => store
+                .latest_foreman_session()
+                .await
+                .map_err(map_core_error)?,
+        },
     };
     Ok(Json(session_payload(&state, &store, session).await?))
 }
 
 /// `GET /foreman/sessions`：未归档的班次，按最近活动倒序。
-pub async fn sessions(State(state): State<AppState>) -> ApiResult<impl IntoResponse> {
+///
+/// `?kind=`（决策 286 / 票 01）：`watch` 取值守台账的列表；**缺省只回人的班次**——
+/// 对讲台的班次列表与值守的独立入口是两个列表，混在一起会让值守台账被当成一个
+/// 可说话的班次（它是只读的一本账）。
+pub async fn sessions(
+    State(state): State<AppState>,
+    Query(params): Query<SessionKindQuery>,
+) -> ApiResult<impl IntoResponse> {
     if state.foreman.is_none() {
         return Err(foreman_unwired());
     }
+    let kind = params.kind.as_deref().unwrap_or(FOREMAN_SESSION_KIND_TALK);
+    if kind != FOREMAN_SESSION_KIND_TALK && kind != FOREMAN_SESSION_KIND_WATCH {
+        return Err(ApiError::bad_request(
+            "班次类型只有 talk（人的班次）与 watch（值守台账）",
+        ));
+    }
     let sessions = state
         .store
-        .list_foreman_sessions()
+        .list_foreman_sessions(Some(kind))
         .await
         .map_err(map_core_error)?;
     Ok(Json(json!({
@@ -129,6 +152,15 @@ pub async fn sessions(State(state): State<AppState>) -> ApiResult<impl IntoRespo
 pub struct SessionQuery {
     /// 要看哪个班次。缺省 = 最近活动的未归档班次。
     pub session: Option<String>,
+    /// 缺省落点取哪一类（决策 286 / 票 01）：`watch` 落值守台账，其余落人的班次。
+    /// 只在 `session` 未指定时参与解析；指定了 id 就以 id 为准。
+    pub kind: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct SessionKindQuery {
+    /// 要列哪一类班次。缺省 talk（人的班次）。
+    pub kind: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -1115,10 +1147,15 @@ fn foreman_identity(state: &AppState) -> serde_json::Value {
 }
 
 /// 一个班次 → 线上形态。
+///
+/// `kind`（决策 286 / 票 01）：班次身份，前端据此把值守台账与人的班次分开渲染——
+/// 值守账是只读的一本账（无输入坞、无发送态）。存量的旧行由迁移 0030 落成
+/// `talk`（裁决 12：不回填），靠它照旧标对。
 fn session_wire(s: &ForemanSession) -> serde_json::Value {
     json!({
         "id": s.id,
         "title": s.title,
+        "kind": s.kind,
         "created_at": s.created_at.to_rfc3339(),
         "last_active_at": s.last_active_at.to_rfc3339(),
         "archived_at": s.archived_at.map(|t| t.to_rfc3339()),

@@ -45,6 +45,7 @@ use crate::process::RealProcessKiller;
 use crate::sse::{SseEvent, SseSink, ToolPhase};
 use crate::storage::foreman::{
     ForemanMessage, ForemanSession, NewForemanMessage, FOREMAN_ROLE_ASSISTANT,
+    FOREMAN_SESSION_KIND_WATCH, FOREMAN_WATCH_SESSION_TITLE,
 };
 use crate::storage::tasks::TaskFilter;
 use crate::storage::Store;
@@ -2025,7 +2026,7 @@ impl ForemanRunner {
             // 全在冷却里：这一趟不说话（事件仍在表里，等下一条路）
             return Ok(None);
         }
-        let session = self.resolve_session(None).await?;
+        let session = self.resolve_watch_session().await?;
 
         // 全局唤醒上限（决策 209⑤）：触顶时**不静默丢弃**——留一行「本小时已达上限，
         // N 条待办未播报」给值班经理，且同一小时只留一行（否则触顶本身变成刷屏源）。
@@ -2294,12 +2295,46 @@ impl ForemanRunner {
                         "这个班次已归档——先新建或切到别的班次再说话".into(),
                     ));
                 }
+                // 值守台账是**只读的一本账**（决策 286 / 票 01）：往里说话会往一本
+                // 给人看的流水账里塞进一段对话，而且那段对话在界面上的只读约束里
+                // 没有出口。说话面只落人的班次——这一条在这里挡住，比指望每个
+                // 前端都记得藏输入坞可靠。
+                if session.kind == FOREMAN_SESSION_KIND_WATCH {
+                    return Err(Error::Validation(
+                        "值守台账是只读的一本账，不收对话——想把某条播报接进对话，\
+                         用它上面的「转去对话」"
+                            .into(),
+                    ));
+                }
                 Ok(session)
             }
             None => match self.store.latest_foreman_session().await? {
                 Some(session) => Ok(session),
                 None => self.store.create_foreman_session("").await,
             },
+        }
+    }
+
+    /// 值守班次的解析（决策 286 / 票 01）：值守轮写的话落**它自己的班次**，不再混进
+    /// 人的时间线。不存在就建一个（固定标题[`FOREMAN_WATCH_SESSION_TITLE`]）——
+    /// 与 `say` 的缺省落点同一条「没有就新开」的姿态，只是身份不同。
+    ///
+    /// 为什么不接 `session_id` 参数：值守轮没有「指定班次」的入口（它由调度器唤醒，
+    /// 不由人挑地方），一个班次就是一本台账，不存在第二本。
+    async fn resolve_watch_session(&self) -> Result<ForemanSession> {
+        match self
+            .store
+            .latest_foreman_session_of_kind(FOREMAN_SESSION_KIND_WATCH)
+            .await?
+        {
+            Some(session) => Ok(session),
+            None => self
+                .store
+                .create_foreman_session_of_kind(
+                    FOREMAN_SESSION_KIND_WATCH,
+                    FOREMAN_WATCH_SESSION_TITLE,
+                )
+                .await,
         }
     }
 
