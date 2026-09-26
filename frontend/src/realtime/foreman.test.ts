@@ -94,6 +94,7 @@ function meta(id: string, lastActiveAtMs: number): ForemanSessionMeta {
     title: id,
     created_at: new Date(0).toISOString(),
     last_active_at: new Date(lastActiveAtMs).toISOString(),
+    kind: 'talk',
     archived_at: null,
   };
 }

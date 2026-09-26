@@ -29,6 +29,7 @@ export type RouteQuery = Record<string, string>;
 export type Route =
   | { name: 'board'; query: RouteQuery }
   | { name: 'talk'; query: RouteQuery }
+  | { name: 'talk-watch'; query: RouteQuery }
   | { name: 'task'; id: string; query: RouteQuery }
   | { name: 'settings-landing'; query: RouteQuery }
   | { name: 'settings-projects'; query: RouteQuery }
@@ -67,6 +68,9 @@ export function parseRoute(hash: string): Route {
   // 对讲台（决策 174）。`v-talk` 是设计原型（theme-6-pixel.md §3.3）的视图 id，
   // 直接按原型写法手敲的地址也会来，故与正名 `/talk` 一并接受，不落 not-found。
   if (path === '/talk' || path === 'v-talk') return { name: 'talk', query };
+  // 值守台账的**独立入口**（决策 286 / 票 04）：只读的一本账，与人的对话同一个页面组件、
+  // 不同的班次面——路径分开，入口才分得开（对讲台那一屏不改成本文）。
+  if (path === '/talk/watch') return { name: 'talk-watch', query };
   const task = /^\/task\/([^/]+)$/.exec(path);
   if (task) return { name: 'task', id: decodeURIComponent(task[1]), query };
   // 设置落地页（决策 198）：分类两项、每项仍是独立路由，落地页只是入口。

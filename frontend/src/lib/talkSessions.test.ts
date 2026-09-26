@@ -30,6 +30,7 @@ function meta(id: string, lastActiveAt: string, title = id): ForemanSessionMeta 
     title,
     created_at: '2026-09-18T01:00:00Z',
     last_active_at: lastActiveAt,
+    kind: 'talk',
     archived_at: null,
   };
 }

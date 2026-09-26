@@ -1,6 +1,6 @@
 import type { ForemanMessage, ForemanProposal, ForemanSession } from '../api/types';
 import type { ForemanStreamState } from '../realtime/foreman';
-import { buildTurns, turnName, type TalkTurnsInput } from './talkTurns';
+import { buildTurns, turnName, watchDraftExcerpt, WATCH_DRAFT_MAX, type TalkTurnsInput } from './talkTurns';
 
 /**
  * 对讲台时间线的回合构造（票 02；决策 251 的三块判断之一）。
@@ -55,6 +55,7 @@ function sessionOf(messages: ForemanMessage[], proposals: ForemanProposal[] = []
       title: '班次',
       created_at: '2026-09-23T09:00:00Z',
       last_active_at: '2026-09-23T10:00:00Z',
+      kind: 'talk',
       archived_at: null,
     },
     messages,
@@ -597,5 +598,61 @@ describe('名牌（turnName）', () => {
     expect(turnName({ kind: 'console', proactive: false })).toBe('操作台');
     expect(turnName({ kind: 'fm', proactive: false })).toBe('值班长');
     expect(turnName({ kind: 'fm', proactive: true })).toBe('值班长 · 值守');
+  });
+});
+
+/**
+ * 值守台账上的名牌与占位句（票 04 / 决策 286）：**按班次类型写，不靠 `proactive` 猜**。
+ *
+ * 存量旧行不回填（裁决 12），而值守账里将来落下的每一行都出自值守轮——「这一行是谁的」
+ * 由账本类型一个判据给出，逐行的 `proactive` 在这本账上没有第二句话可说。人的账里
+ * 「值班长 · 值守」那档照旧（上面的用例钉着），两本账各念各的表。
+ */
+describe('值守台账（ledgerKind = watch）：名牌与占位句按账本类型（票 04）', () => {
+  it('名牌：fm 行一律「值守」—— proactive 在场与否都不改读法', () => {
+    expect(turnName({ kind: 'fm', proactive: true }, 'watch')).toBe('值守');
+    expect(turnName({ kind: 'fm', proactive: false }, 'watch')).toBe('值守');
+  });
+
+  it('名牌：其余各档逐字；失败账不问 proactive', () => {
+    expect(turnName({ kind: 'failed', proactive: true }, 'watch')).toBe('值守 · 没跑起来');
+    expect(turnName({ kind: 'failed', proactive: false }, 'watch')).toBe('值守 · 没跑起来');
+    expect(turnName({ kind: 'mine', proactive: false }, 'watch')).toBe('值班经理');
+    expect(turnName({ kind: 'console', proactive: false }, 'watch')).toBe('操作台');
+  });
+
+  it('buildTurns：同一行播报在两本账里 key 不变，名牌判据跟着 ledgerKind 走', () => {
+    const row = message({ id: 7, kind: 'fm', proactive: false, content: '1 号任务到了合入审批' });
+    const talkLedger = buildTurns(inputOf({ session: sessionOf([row]) }));
+    const watchLedger = buildTurns(
+      inputOf({ session: sessionOf([row]), ledgerKind: 'watch' }),
+    );
+    expect(talkLedger[0].key).toBe('m7');
+    expect(watchLedger[0].key).toBe('m7');
+    // 两本账的行分类都是后端给的那一个（决策 252 不变）；变的只是名牌的读法
+    expect(talkLedger[0].kind).toBe('fm');
+    expect(watchLedger[0].kind).toBe('fm');
+  });
+
+  it('在飞占位句：值守账说「值守正在跑…」，人的账照旧', () => {
+    const watch = buildTurns(inputOf({ following: true, ledgerKind: 'watch' }));
+    expect(watch).toHaveLength(1);
+    expect(watch[0]).toMatchObject({ key: 'live', kind: 'fm', content: '值守正在跑…' });
+
+    const talkSide = buildTurns(inputOf({ following: true }));
+    expect(talkSide[0].content).toBe('值班长正在查台账…');
+  });
+
+  it('「转去对话」的摘录：全文不超上限原样、超了截断补省略号、首尾空白收掉', () => {
+    const short = '  1 号任务到了合入审批  ';
+    expect(watchDraftExcerpt(short)).toBe('1 号任务到了合入审批');
+    expect(watchDraftExcerpt('夜班播报')).toBe('夜班播报');
+
+    const long = '长'.repeat(WATCH_DRAFT_MAX + 10);
+    const cut = watchDraftExcerpt(long);
+    expect(cut).toHaveLength(WATCH_DRAFT_MAX + 1); // 截 280 字 + 省略号
+    expect(cut.endsWith('…')).toBe(true);
+    // 边界：恰好在上限之内的不截
+    expect(watchDraftExcerpt('长'.repeat(WATCH_DRAFT_MAX))).toHaveLength(WATCH_DRAFT_MAX);
   });
 });

@@ -35,6 +35,7 @@
   const ROUTE_TITLES: Record<Route['name'], string> = {
     board: '看板',
     talk: '对讲台',
+    'talk-watch': '值守台账',
     task: '任务详情',
     metrics: '指标',
     'settings-landing': '设置',
@@ -74,6 +75,10 @@
   <Board />
 {:else if route.name === 'talk'}
   <Talk />
+{:else if route.name === 'talk-watch'}
+  <!-- 值守台账（票 04 / 决策 286）：同一个 Talk 组件的只读档——`watch` 传参切它的
+       取数（`?kind=watch`）、坞与班次动作全收起。 -->
+  <Talk watch />
 {:else if taskId}
   {#key taskId}
     <TaskDetail id={taskId} />

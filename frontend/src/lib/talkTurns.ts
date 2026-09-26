@@ -239,6 +239,13 @@ export interface TalkTurnsInput {
    * （决策 259，见上「边界 ②」）。只在 `stream.error` 在场时有意义（失败轮才读它）。
    */
   pairingNeeded: boolean;
+  /**
+   * 这本台账是不是**值守台账**（决策 286 / 票 foreman-unbounded 01，票 04）。
+   *
+   * 值守账里每一行都属于值守——名牌按**班次类型**写，不再靠 `proactive` 那个布尔猜
+   * （人的班次里的存量播报行照旧靠它，裁决 12：不回填）。
+   */
+  ledgerKind?: string;
 }
 
 /**
@@ -252,6 +259,7 @@ export interface TalkTurnsInput {
  */
 export function buildTurns(input: TalkTurnsInput): TurnView[] {
   const { session, pendingText, sending, following, stream, pairingNeeded } = input;
+  const watchLedger = input.ledgerKind === 'watch';
   const messages = session?.messages ?? [];
   // 「提问之后人又开过口」的判据（决策 265③，纯派生）：最大 mine 行 id 大于该行 id。
   const maxMineId = messages.reduce((mx, m) => (m.kind === 'mine' && m.id > mx ? m.id : mx), 0);
@@ -328,8 +336,10 @@ export function buildTurns(input: TalkTurnsInput): TurnView[] {
     out.push({
       key: 'live',
       kind: 'fm',
-      // 还没收到第一个增量时不摆空白：给一句"对面在动"的实情，光标说明还在流
-      content: live.reply || '值班长正在查台账…',
+      // 还没收到第一个增量时不摆空白：给一句"对面在动"的实情，光标说明还在流。
+      // 值守账上的对面是**值守轮**（票 04）：没有人的那句话可接，占位句说「正在跑」
+      // ——`turn_in_flight` 在这本账上的全部用途就是这一句（票面原话）。
+      content: live.reply || (watchLedger ? '值守正在跑…' : '值班长正在查台账…'),
       at: '',
       streaming: stream.streaming,
       partial: !stream.streaming && live.reply.length > 0,
@@ -376,7 +386,26 @@ export function buildTurns(input: TalkTurnsInput): TurnView[] {
  * 为什么抽成函数：模板里那段嵌套三元式没有机器门（`Talk.svelte` 的断言只有 e2e），
  * 而这张表是**文案规格**——决策 199 要求它可追溯、可钉住。函数在 `talkTurns.test.ts` 里逐档断言。
  */
-export function turnName(turn: Pick<TurnView, 'kind' | 'proactive'>): string {
+export function turnName(
+  turn: Pick<TurnView, 'kind' | 'proactive'>,
+  /** 所在台账的班次类型（决策 286 / 票 04）：值守账按类型写名牌，人的账照旧。 */
+  ledgerKind?: string,
+): string {
+  // 值守账里**每一行**都是值守那一侧的：名字按班次类型给，不再逐行猜。
+  // 「值班经理」「操作台」两档理论上不该出现（只读账不收话、提议轮不落在它上），
+  // 但落库的数据坏了时名牌仍要说真话。
+  if (ledgerKind === 'watch') {
+    switch (turn.kind) {
+      case 'failed':
+        return '值守 · 没跑起来';
+      case 'mine':
+        return '值班经理';
+      case 'console':
+        return '操作台';
+      default:
+        return '值守';
+    }
+  }
   switch (turn.kind) {
     case 'failed':
       return turn.proactive ? '值守 · 没跑起来' : '发送失败';
@@ -389,4 +418,19 @@ export function turnName(turn: Pick<TurnView, 'kind' | 'proactive'>): string {
     default:
       return turn.proactive ? '值班长 · 值守' : '值班长';
   }
+}
+
+/**
+ * 「转去对话」预填的**摘录**（票 04）：把那条播报带进人的时间线时，预填进输入坞的是
+ * 草稿，不是全文转载——人要的是一句**话头**（在上面添自己的指令再发），把几百字的
+ * 播报原样塞回对话等于让值班经理把值班长的话念一遍。超长截断、补省略号。
+ *
+ * 判据抽出来与 `turnName` 同一理由：它是文案与行为的规格（截多长、截断长什么样），
+ * 该有机器门，不该埋在组件的回调里。
+ */
+export const WATCH_DRAFT_MAX = 280;
+
+export function watchDraftExcerpt(content: string): string {
+  const text = content.trim();
+  return text.length > WATCH_DRAFT_MAX ? `${text.slice(0, WATCH_DRAFT_MAX)}…` : text;
 }

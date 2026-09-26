@@ -92,6 +92,13 @@ export interface StartOptions {
      */
     seedConfig?: boolean;
   };
+  /**
+   * 追加进 `config.toml` 的 `[pipeline]` 段的行（票 04 的值守轮用例用）：
+   * 值守的节拍旋钮（`watch_debounce_sec` 等，`crates/core/src/config.rs` 的 Settings）
+   * 都挂在这一段下。缺省不写任何行——其余用例吃全局默认（值守 60s 去抖在秒级用例里
+   * 等于「不醒」，这正是此前所有用例都不用管值守轮的原因）。
+   */
+  pipelineConfig?: string[];
 }
 
 export interface App {
@@ -606,6 +613,7 @@ export async function startApp(opts: StartOptions): Promise<App> {
   mkdirSync(homeDir, { recursive: true });
   mkdirSync(repoDir, { recursive: true });
   const configLines = ['[pipeline]', 'tick_interval_sec = 1', 'pending_resume_cooldown_sec = 0'];
+  if (opts.pipelineConfig) configLines.push(...opts.pipelineConfig);
   // 技能来源的**声明式默认**那一级（`config.toml` 的 `[market] github_repos`，决策 194）。
   // 界面上的那一份盖过它；清掉界面那份就回到这里——两级关系由 E2E ⑫ 钉住。
   if (opts.market && opts.market.seedConfig !== false) {

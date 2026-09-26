@@ -959,6 +959,11 @@ export interface ForemanBriefing {
 export interface ForemanSessionMeta {
   id: string;
   title: string;
+  /**
+   * 班次身份（决策 286 / 票 foreman-unbounded 01）：`talk`（人的班次）/
+   * `watch`（值守台账——只读的一本账，票 04）。存量旧行由迁移 0030 落成 talk。
+   */
+  kind: string;
   created_at: string;
   last_active_at: string;
   archived_at: string | null;

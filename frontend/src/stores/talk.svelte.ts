@@ -61,6 +61,12 @@ class TalkStore {
    * 最大的行 id——那之后多一行就是这一轮落了地。
    */
   followingSince = $state<number | null>(null);
+  /**
+   * 「转去对话」带过来的一句话（决策 289 / 票 04）：值守台账上那条播报的摘录。
+   * 值守账把它放进这里 → 切到人的时间线时对讲台把它预填进输入坞并聚焦——
+   * 「把这件事带进人的时间线」的载体。消费即清（预填是**草稿**，人可以改可扔）。
+   */
+  watchDraft = $state<string | null>(null);
 
   /** 当前失败是不是**配对缺失**（判据趁 `ApiError` 还在手判好，决策 259）。 */
   pairingNeeded = $state(false);

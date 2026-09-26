@@ -725,14 +725,25 @@ export function pairedUrl(base: string, token: string): string {
 export function getForemanSession(
   sessionId?: string | null,
   signal?: AbortSignal,
+  kind?: string,
 ): Promise<ForemanSession> {
-  const q = sessionId ? `?session=${encodeURIComponent(sessionId)}` : '';
+  // `?kind=`（决策 286 / 票 01）：不指定 id 时缺省落点按它取各自的「最近」。
+  const params = new URLSearchParams();
+  if (sessionId) params.set('session', sessionId);
+  if (kind) params.set('kind', kind);
+  const q = params.size > 0 ? `?${params.toString()}` : '';
   return request<ForemanSession>(`/foreman/session${q}`, { signal });
 }
 
 /** 未归档的班次，按最近活动倒序（决策 204⑦）。 */
-export function getForemanSessions(signal?: AbortSignal): Promise<ForemanSessionList> {
-  return request<ForemanSessionList>('/foreman/sessions', { signal });
+export function getForemanSessions(
+  signal?: AbortSignal,
+  kind?: string,
+): Promise<ForemanSessionList> {
+  // `?kind=watch` 取值守台账的列表（决策 286 / 票 01）；缺省只回人的班次——
+  // 「对讲台的班次列表」与「值守的独立入口」是两个列表。
+  const q = kind ? `?kind=${encodeURIComponent(kind)}` : '';
+  return request<ForemanSessionList>(`/foreman/sessions${q}`, { signal });
 }
 
 /**

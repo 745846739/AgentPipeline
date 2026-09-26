@@ -74,7 +74,13 @@
     type SeenAt,
     type SessionMark,
   } from '../lib/talkSessions';
-  import { buildTurns, turnName, type TurnStep, type TurnView } from '../lib/talkTurns';
+  import {
+    buildTurns,
+    turnName,
+    watchDraftExcerpt,
+    type TurnStep,
+    type TurnView,
+  } from '../lib/talkTurns';
   import { isPairingRequired } from '../lib/sharePairing';
   import { maskPairValue, pairingLaunchNote } from '../lib/pairingLaunch';
   import { getPairingToken } from '../api/config';
@@ -102,6 +108,15 @@
   import EmptyState from '../components/ui/EmptyState.svelte';
   import Modal from '../components/ui/Modal.svelte';
   import { router, writeQuery } from '../router.svelte';
+
+  /**
+   * 值守台账档（票 04 / 决策 286）：`<Talk watch />` 渲染**只读的一本账**——同一套
+   * 时间线，取数换到 `?kind=watch`，坞与一切「说话 / 动手」的口全部收起。prop 名刻意
+   * 与路由同名（`/talk/watch`）：它们是同一件事的两半，不是两套配置。
+   *
+   * 值守账上**唯一**的动作是「转去对话」：它不在这本账里动手，去处（写口）在人的对讲台。
+   */
+  let { watch: watchMode = false }: { watch?: boolean } = $props();
 
   /**
    * 对讲台（theme-6-pixel.md §3.3；决策 174 / 182 / 183 / 192）。版面**三分区**（票 04）：
@@ -306,9 +321,12 @@
    * 地址里那一班（`?session=`，决策 217①：「我在哪」进 URL）。**它才是权威**——
    * 前进 / 后退因此能回到上一班，刷新也照地址恢复；没有它才轮到 localStorage 兜底
    * （跨页面回来时地址会丢参数，而「我一直在看这一班」不该因此被重置）。
+   * 两条时间线各自带地址（票 04）：`/talk` 与 `/talk/watch` 都认这个参数。
    */
   const urlSession = $derived(
-    router.route.name === 'talk' ? (router.route.query.session ?? null) : null,
+    router.route.name === 'talk' || router.route.name === 'talk-watch'
+      ? (router.route.query.session ?? null)
+      : null,
   );
 
   /** 折行档里班次列表的那些行（当前那一班在下一条里单独渲染成身份行）。 */
@@ -381,7 +399,11 @@
    * `lib/talkTurns.ts`——合并与排序的坑都长在行与行的关系上，组件只把四个响应式输入
    * 加一枚判好的布尔传进去；行分类读决策 252 给的 `kind` / `proactive`，配对与否读
    * 决策 259 的 `kind`——正文哨兵不再由界面解析）。
+   *
+   * `ledgerKind`（票 04）把**这本账是谁的**一并交给归约：值守账里名牌按班次类型写
+   * （不靠 `proactive` 逐行猜）、在飞占位句说「值守正在跑」。
    */
+  const ledgerKind = $derived(watchMode ? 'watch' : 'talk');
   const turns = $derived.by<TurnView[]>(() =>
     buildTurns({
       session,
@@ -390,6 +412,7 @@
       following: followingSince !== null,
       stream,
       pairingNeeded: sendPairingNeeded,
+      ledgerKind,
     }),
   );
 
@@ -409,10 +432,13 @@
    */
   async function reload(want?: string | null): Promise<boolean> {
     try {
-      const list = await getForemanSessions();
+      // 两本账各读各的（票 04 / 决策 286）：`?kind=` 缺省只回人的班次，值守账要显式要。
+      // 「指定的 id 不在这一班的列表里」因此按账本各自判——把 talk 的 id 递到值守账
+      // （或反过来，刷新后的 localStorage 兜底就是这条路径）回落到本账的默认落点。
+      const list = await getForemanSessions(undefined, ledgerKind);
       const target = want === undefined ? currentId : want;
       const known = !!target && list.sessions.some((s) => s.id === target);
-      const payload = await getForemanSession(known ? target : null);
+      const payload = await getForemanSession(known ? target : null, undefined, ledgerKind);
       sessionList = list.sessions;
       session = payload;
       const landed = payload.session?.id ?? null;
@@ -446,30 +472,38 @@
    *     落回默认，此时该记住的是默认那一班；
    *   - 地址用 `replaceState`（决策 217③：程序改地址一律 replace），否则装载时的规范化
    *     会在历史里多塞一条，后退就不再是「回到上一页」。
+   *
+   * **看过表只属于人的班次列表**（票 04）：两枚标记（「正在回话」/「有新动静」）挂在
+   * 班次列表的行上，而值守账只有**一本**（固定的一行，没有「哪一班有新动静」可说）；
+   * 它的动静在屏上有更直接的读法（在飞那一轮 + 「值守正在跑」）。基线与清理若在值守页上跑，
+   * 会把人的班次从表里剪掉——回来时每一班都亮假的「有新动静」。故整段跳过；
+   * 兜底文件同理不写（写进去只会把人对讲台的兜底落点冲掉）。
    */
   function rememberLanding(landed: string | null, meta: ForemanSessionMeta | null) {
-    let next = seen;
-    if (!seenSeeded) {
-      // 立基线只在**本机一条记录都没有**时做（判据在 `seedBaselineIfFirstRun`）：
-      // 少了它，第一屏每一条都带「有新动静」——而它们只是刚被列出来；写成「每次装载都
-      // 拿当下的列表立基线」则相反：**关机期间别处发生的动静会被记成「看过了」**，
-      // 而那正是这枚标记最该说话的场合（实测：手机在别处开了新班次、说了话，回到这台
-      // 电脑打开对讲台，菜单里那条不该是安静的）。
-      next = seedBaselineIfFirstRun(next, sessionList);
-      seenSeeded = true;
-    }
-    if (meta) next = markSeen(next, meta.id, meta.last_active_at);
-    next = pruneSeen(
-      next,
-      sessionList.map((s) => s.id),
-    );
-    if (next !== seen) {
-      seen = next;
-      saveSeen(next);
+    if (!watchMode) {
+      let next = seen;
+      if (!seenSeeded) {
+        // 立基线只在**本机一条记录都没有**时做（判据在 `seedBaselineIfFirstRun`）：
+        // 少了它，第一屏每一条都带「有新动静」——而它们只是刚被列出来；写成「每次装载都
+        // 拿当下的列表立基线」则相反：**关机期间别处发生的动静会被记成「看过了」**，
+        // 而那正是这枚标记最该说话的场合（实测：手机在别处开了新班次、说了话，回到这台
+        // 电脑打开对讲台，菜单里那条不该是安静的）。
+        next = seedBaselineIfFirstRun(next, sessionList);
+        seenSeeded = true;
+      }
+      if (meta) next = markSeen(next, meta.id, meta.last_active_at);
+      next = pruneSeen(
+        next,
+        sessionList.map((s) => s.id),
+      );
+      if (next !== seen) {
+        seen = next;
+        saveSeen(next);
+      }
+      saveSessionId(landed);
     }
     // 落地即熄灭（决策 220③）：这一班的回话已经在台账里了，它不再是「此刻在说话」
     if (landed) talk.foreign = forgetForeignActive(talk.foreign, landed);
-    saveSessionId(landed);
     writeQuery({ session: landed }, { replace: true });
   }
 
@@ -726,6 +760,14 @@
   }
 
   onMount(() => {
+    // 「转去对话」的交接（票 04）：值守账把摘录放进 store，这里消费——预填是**草稿**
+    // （人可以改、可以扔），故填进输入框即清，不做任何「未发送」的持久账。
+    // 在人的对讲台上才消费：值守账自己没有坞。
+    if (!watchMode && talk.watchDraft !== null) {
+      input = talk.watchDraft;
+      talk.watchDraft = null;
+      void tick().then(() => typerField?.focus());
+    }
     // 地址权威、localStorage 兜底（决策 217④）：「我一直在看这一班」不该因为从看板点回来而重置
     seen = loadSeen();
     // 回执标签取一次（模块级缓存，之后别的页签再挂载不再发第二跳）。失败**不打断对话**：
@@ -995,7 +1037,7 @@
    */
   async function refreshSessionList() {
     try {
-      const list = await getForemanSessions();
+      const list = await getForemanSessions(undefined, ledgerKind);
       sessionList = list.sessions;
       const next = pruneSeen(
         seen,
@@ -1152,6 +1194,8 @@
 
   let lastKey = $state<string | null>(null);
   $effect(() => {
+    // 值守账不渲染急停轮（只读的一本账，动作在对讲台），不拉那批详情（票 04）
+    if (watchMode) return;
     const key = pendingKey;
     if (key === lastKey) return;
     lastKey = key;
@@ -1173,11 +1217,35 @@
     await board.handleTaskAction(taskId, action, opts);
     await loadDetails(board.pendingTasks);
   }
+
+  /**
+   * 「转去对话」（票 04）：把这条播报带进人的时间线。**动作本体在那边**——这里只
+   * 把摘录交给 {@link talk.watchDraft}（预填草稿，消费即清），跳过去之后由人的对讲台
+   * 装载时把它填进输入坞并聚焦。在人少的这一本账上，这是唯一的一颗钮。
+   */
+  function takeToTalk(content: string) {
+    talk.watchDraft = watchDraftExcerpt(content);
+    router.navigate('/talk');
+  }
+
+  /**
+   * 值守台账这会儿「正在跑」吗（票 04：入口上的那一枚标记）。
+   *
+   * `/foreman/stream` 把全部工头增量广播给所有订阅者，每条都带 `session_id`——人的
+   * 班次的增量都能对上这一页的列表（判据在 `noteForeignDelta`），对不上的那份就是
+   * **人的班次之外**的工头在说话，而那只有值守轮（它住在本页列表之外的那本账里）。
+   * 静默超时与落地清理由既有那套映射管着，这里只读。
+   */
+  const watchLedgerActive = $derived(
+    Object.keys(talk.foreign.bySession).some(
+      (id) => !sessionList.some((s) => s.id === id),
+    ),
+  );
 </script>
 
-<main class="talk">
+<main class="talk" class:ledger={watchMode}>
   <div class="talk-head">
-    <h1 class="tt">对讲台</h1>
+    <h1 class="tt">{watchMode ? '值守台账' : '对讲台'}</h1>
     <div class="ts">
       <!-- 车间隐喻的**首现平实说法**（决策 200 / design §12.2）：行内、全宽括号、紧跟词后，
            词与译文同字号同色档。口径**按页面**、同一页面内不重复——故本页每个词只译一次。
@@ -1196,13 +1264,36 @@
         <span class="sess-name" title={session.session.title}>{session.session.title}</span>
         <span class="sep sess-sep">▪</span>
       {/if}
-      <span>{session?.foreman.wired === false ? '值班长未接线' : '值班中'}</span>
+      <span>{session?.foreman.wired === false
+        ? '值班长未接线'
+        : watchMode
+          ? '值守中'
+          : '值班中'}</span>
       <span class="sep">▪</span>
       <!-- `工位` 的译文只在这一行（`.stat-wide` 窄屏收起）：窄屏上这个词不再出现
            （值班板的「8 工位」与那两行说明都收进了桌面款），故窄屏没有漏译。 -->
       <span class="stat-wide">夜班态势：8 工位（流水线的阶段）</span>
       <span class="sep stat-wide">▪</span>
       <span>本次会话 {session ? formatTokens(session.total_tokens) : '—'} tok</span>
+      {#if watchMode}
+        <!-- 回对讲台（票 04）：只读账上唯一的出口，与人的对讲台页头末尾那条「值守台账」
+             是同一对进法的两半。挂页头元信息行而不是班次行——值守台账**不是一班**，
+             不进「选一条班次」的那一排。 -->
+        <span class="sep">▪</span>
+        <a class="crumb" href="#/talk" onclick={() => router.navigate('/talk')}>回对讲台</a>
+      {:else}
+        <!-- 值守台账的入口（票 04 / 决策 240 的「同一个目的地只摆一套进法」）：两条页头
+             元信息行互指，不另造第三处。带「值守正在跑」的读数（票 04：`turn_in_flight`
+             的用途）：它在说话时这一条亮一档，让人知道那本账此刻有动静。 -->
+        <span class="sep">▪</span>
+        <a
+          class="crumb"
+          href="#/talk/watch"
+          title={watchLedgerActive ? '值守轮这会儿正在跑' : '值守轮自己的台账（只读）'}
+          onclick={() => router.navigate('/talk/watch')}
+        >{watchLedgerActive ? '值守台账 · 正在跑' : '值守台账'}</a
+        >
+      {/if}
       <!-- 页头末尾原先还有一颗「看板」面包屑（决策 240 摘除）：看板是顶栏那一行里的一枚页签，
            本页不再代它递入口。`router` 仍为本页其余跳转所用（见下）。 -->
     </div>
@@ -1228,31 +1319,38 @@
             {s.title}
           </button>
         {/each}
-        <button
-          type="button"
-          class="runchip plus"
-          disabled={sending || busy}
-          title="开一个新班次"
-          onclick={() => void newSession()}
-        >
-          + 新班次
-        </button>
-        {#if currentId}
-          <button type="button" class="runchip act" disabled={sending || busy} onclick={openRename}
-            >改名</button
-          >
+        {#if !watchMode}
+          <!-- 只读账上这些「说话 / 动手」的班次动作全部收起（票 04）：值守台账不是一班，
+               不开新班、不改名、不归档。 -->
           <button
             type="button"
-            class="runchip act"
+            class="runchip plus"
             disabled={sending || busy}
-            onclick={() => {
-              dialogError = null;
-              dialog = 'archive';
-            }}>归档</button
+            title="开一个新班次"
+            onclick={() => void newSession()}
           >
+            + 新班次
+          </button>
+          {#if currentId}
+            <button
+              type="button"
+              class="runchip act"
+              disabled={sending || busy}
+              onclick={openRename}>改名</button
+            >
+            <button
+              type="button"
+              class="runchip act"
+              disabled={sending || busy}
+              onclick={() => {
+                dialogError = null;
+                dialog = 'archive';
+              }}>归档</button
+            >
+          {/if}
         {/if}
       </div>
-    {:else}
+    {:else if !watchMode}
       <!-- ── ⋯ 班次菜单（折行档，决策 218 ②/Q10/Q12/Q13）。桌面**不渲染**它
            （Q14：桌面横向宽裕，把每一班的名字收进菜单是净丢信息）。
            面板常驻 DOM 用 `hidden` 开合——`aria-controls` 指过去的目标必须真的存在。 -->
@@ -1353,7 +1451,7 @@
        **一张急停都没有时整块退场**（折行档；决策 218 修订 ⑦b）——430px 上它今天约 65px。
        但 `loadError` 是另一回事：读不到台账时这里必须还说得出话，故它单独把关。
        桌面款照旧保留那个引导块。 ── -->
-  {#if !folded || pending.length > 0 || loadError}
+  {#if loadError || (!watchMode && (!folded || pending.length > 0))}
   <section
     class="zone-status"
     class:stops={pending.length > 0}
@@ -1394,7 +1492,10 @@
       </div>
     {/if}
 
-    {#each pending as task, i (task.id)}
+    {#if !watchMode}
+      <!-- 急停轮与其空态只在人的对讲台上渲染（票 04）：值守台账是只读的一本账，
+           拍板的动作在对讲台。loadError 在两种形态里都要有处可读（见上面的把关）。 -->
+      {#each pending as task, i (task.id)}
       {@const detail = details[task.id]}
       {@const count = stopActionCount(detail)}
       {@const open = isStopOpen(foldable, openStop, task.id)}
@@ -1520,6 +1621,7 @@
         />
       </div>
     {/if}
+    {/if}
   </section>
   {/if}
 
@@ -1536,13 +1638,22 @@
     {#if loading && !session}
       <div class="quiet">正在读会话台账…</div>
     {:else if turns.length === 0}
-      <!-- 空态：状态 → 下一步（票 13 / parallel-brief §三.3）。`值班长` 的**首现平实说法**
-           落在这里（决策 200）：页头那一行是标题栏、不承载翻译，而这一句正是第一次进这一页的
-           人读到这个词的地方——本页其余地方（名牌、状态区）保持原词，同一页面内不重复。 -->
-      <EmptyState
-        state="还没有对话。"
-        next="说一句，值班长（跟我对话的 AI）就在对面——它与任务无关，空班也答得上。"
-      />
+      {#if watchMode}
+        <!-- 值守账的空态（票 04）：`值守轮` 的**首现平实说法**落在这里（决策 200，
+             与人的账那一句同一手法）——本页其余地方保持原词，同一页面内不重复。 -->
+        <EmptyState
+          state="值守台账还是空的。"
+          next="值守轮（不用人开口、自己定期醒来看一圈的那一轮）有该说的事时，账就记在这里。这本账只读——想跟它说话，回对讲台。"
+        />
+      {:else}
+        <!-- 空态：状态 → 下一步（票 13 / parallel-brief §三.3）。`值班长` 的**首现平实说法**
+             落在这里（决策 200）：页头那一行是标题栏、不承载翻译，而这一句正是第一次进这一页的
+             人读到这个词的地方——本页其余地方（名牌、状态区）保持原词，同一页面内不重复。 -->
+        <EmptyState
+          state="还没有对话。"
+          next="说一句，值班长（跟我对话的 AI）就在对面——它与任务无关，空班也答得上。"
+        />
+      {/if}
     {/if}
 
     {#each turns as turn (turn.key)}
@@ -1592,6 +1703,10 @@
             <!-- 终态：两颗钮都收掉，这一轮仍在（审计）。**先判终态再判指路**——反过来的话，
                  一条已经执行过的提议只要那个动作还在动作集里，就会继续显示「去那里按」。 -->
             <p class="dim note">这条提议{proposalStateLabel(p, now)}，不再可按键。</p>
+          {:else if watchMode}
+            <!-- 只读账上的提议轮（票 04；防御性：值守轮的工具被 deny 清单挡着，提议
+                 理论上不落在这本账）：不画钮，处理在对讲台。 -->
+            <p class="dim note">这本账只读——要处理这条提议，去对讲台。</p>
           {:else if pointer}
             <!-- 同一个动作已经在状态区那张急停轮里有一颗钮 → **只指路，不画第二颗**
                  （决策 207③，保留决策 176④ 的原顾虑：两处各一颗钮会让「哪颗是真的」
@@ -1647,18 +1762,22 @@
             <p>{turn.content}</p>
           {/if}
           <p class="ask-q">{turn.ask.question}</p>
-          <div class="aopts">
-            {#each turn.ask.options as option}
-              <button
-                type="button"
-                class="btn solid"
-                disabled={turn.askAnswered || sending}
-                onclick={() => answerAsk(option)}
-              >
-                {option}
-              </button>
-            {/each}
-          </div>
+          {#if !watchMode}
+            <div class="aopts">
+              {#each turn.ask.options as option}
+                <button
+                  type="button"
+                  class="btn solid"
+                  disabled={turn.askAnswered || sending}
+                  onclick={() => answerAsk(option)}
+                >
+                  {option}
+                </button>
+              {/each}
+            </div>
+          {:else}
+            <p class="dim note">这本账只读——想答这个问题，去对讲台。</p>
+          {/if}
         </article>
       {:else}
         <article
@@ -1669,8 +1788,9 @@
           class:console={turn.kind === 'console'}
         >
           <!-- 名牌那五个词是一张文案规格，判据住在 `lib/talkTurns.ts::turnName`（决策 252 / 271）：
-               值守轮的失败账（`failed` + `proactive`）不叫「发送失败」。 -->
-          <div class="dname">{turnName(turn)}</div>
+               值守轮的失败账（`failed` + `proactive`）不叫「发送失败」；值守账按**班次类型**
+               写名牌（票 04），不靠 `proactive` 逐行猜。 -->
+          <div class="dname">{turnName(turn, ledgerKind)}</div>
 
           <!-- ── 过程：这一轮**按发生顺序**的一步一步（决策 273）──
                值班长的一轮常态是「先想 → 查台账 → 再想 → 收口」，而此前三份留痕是三个
@@ -1765,6 +1885,17 @@
             <p class="dim note">流断了，上面是已经收到的部分；完整回话会在台账里补齐。</p>
           {/if}
 
+          {#if watchMode && turn.kind === 'fm' && !turn.streaming && turn.content.trim()}
+            <!-- 转去对话（票 04）：每条播报的「把这件事带进人的时间线」。只读账上唯一的
+                 钮，且它不在这本账里动手——摘录预填进**人的对讲台**的输入坞并聚焦，
+                 写口在那边（`talk.watchDraft`，装载时消费）。在飞那一轮不挂（话还没说完）。 -->
+            <div class="pacts">
+              <button type="button" class="btn quiet" onclick={() => takeToTalk(turn.content)}>
+                转去对话
+              </button>
+            </div>
+          {/if}
+
           <!-- 配对入口（决策 182㉙，票 07）：非回环形态下缺令牌时后端回 403，报文里已经说清
                「这台设备还没配对」。这里补的是**动作**——报文让人知道发生了什么，链接让人知道
                下一步去哪。只在 403 且报文提到配对时出现，普通失败不挂这个出口。
@@ -1799,44 +1930,47 @@
     {/each}
   </section>
 
-  <!-- ── 输入坞：钉底。Enter 发送 / Shift+Enter 换行；发送中禁用 ── -->
-  <form
-    class="typer"
-    class:warn={streamStatus === 'error'}
-    onsubmit={(e) => {
-      e.preventDefault();
-      void send();
-    }}
-  >
-    <div class="dname">值班经理</div>
-    <textarea
-      class="input"
-      rows="2"
-      {placeholder}
-      bind:value={input}
-      bind:this={typerField}
-      disabled={sending}
-      onkeydown={onKeydown}
-      oncompositionstart={() => composing.start()}
-      oncompositionend={() => composing.end()}
-    ></textarea>
-    <div class="typer-foot">
-      <!-- 这一行**只剩传输层断线**这一件事（决策 218 修订 ⑤ / 220④）：
-           - 「值班长正在回话…」**删掉**——流式尾随光标本就在说这件事（`.turn p.streaming`），
-             用户裁决「光标跳动已经代表了正在回复，不需要这条提示了」；不新增动画位。
-           - 「流断了」**删不得**：`streamStatus === 'error'` 是全页**唯一**的断线告知
-             （这个状态在仓里只有这一个消费者），而「实时流断了不能静静不更新」是审计 R2-18
-             的既有能力。时间线里那句「流断了，上面是已经收到的部分」是**另一件事**
-             （那一轮只收到半截，`turn.partial`）。
-           - 于是这一行**空闲时高度 0**：决策 192 当初是用 19.2px 的常驻死白换「坞不上下跳」
-             （那句「说的每句话都会记进审计」），撤掉告知之后这笔买卖不划算——而且它只在
-             异常态发生。**撤的是告知，不是纪律**：决策 182 §3.3 纪律 4 照旧，审计照旧全量落库。 -->
-      {#if streamStatus === 'error'}
-        <span class="dim hint">流断了：回话仍会以台账为准补上。</span>
-      {/if}
-      <button type="submit" class="btn solid" disabled={sending || !input.trim()}>发送</button>
-    </div>
-  </form>
+  <!-- ── 输入坞：钉底。Enter 发送 / Shift+Enter 换行；发送中禁用。
+       只读账不渲染它（票 04）——值守台账不出输入坞、不出发送态，说话回对讲台。 ── -->
+  {#if !watchMode}
+    <form
+      class="typer"
+      class:warn={streamStatus === 'error'}
+      onsubmit={(e) => {
+        e.preventDefault();
+        void send();
+      }}
+    >
+      <div class="dname">值班经理</div>
+      <textarea
+        class="input"
+        rows="2"
+        {placeholder}
+        bind:value={input}
+        bind:this={typerField}
+        disabled={sending}
+        onkeydown={onKeydown}
+        oncompositionstart={() => composing.start()}
+        oncompositionend={() => composing.end()}
+      ></textarea>
+      <div class="typer-foot">
+        <!-- 这一行**只剩传输层断线**这一件事（决策 218 修订 ⑤ / 220④）：
+             - 「值班长正在回话…」**删掉**——流式尾随光标本就在说这件事（`.turn p.streaming`），
+               用户裁决「光标跳动已经代表了正在回复，不需要这条提示了」；不新增动画位。
+             - 「流断了」**删不得**：`streamStatus === 'error'` 是全页**唯一**的断线告知
+               （这个状态在仓里只有这一个消费者），而「实时流断了不能静静不更新」是审计 R2-18
+               的既有能力。时间线里那句「流断了，上面是已经收到的部分」是**另一件事**
+               （那一轮只收到半截，`turn.partial`）。
+             - 于是这一行**空闲时高度 0**：决策 192 当初是用 19.2px 的常驻死白换「坞不上下跳」
+               （那句「说的每句话都会记进审计」），撤掉告知之后这笔买卖不划算——而且它只在
+               异常态发生。**撤的是告知，不是纪律**：决策 182 §3.3 纪律 4 照旧，审计照旧全量落库。 -->
+        {#if streamStatus === 'error'}
+          <span class="dim hint">流断了：回话仍会以台账为准补上。</span>
+        {/if}
+        <button type="submit" class="btn solid" disabled={sending || !input.trim()}>发送</button>
+      </div>
+    </form>
+  {/if}
 
   <!-- ── 班次的重命名与归档（决策 204③：走 Modal，不另造第二套对话框） ── -->
   <Modal
@@ -1886,8 +2020,10 @@
   </Modal>
 
   <!-- ── 值班板：**桌面右栏**（折行档整块不渲染，CSS 那条 `display: none` 管着；
-       同一份读数在看板 8 列与顶栏灯带上各有一份，这一条是第三份——决策 218 ②） ── -->
-  <aside class="talk-side crew">
+       同一份读数在看板 8 列与顶栏灯带上各有一份，这一条是第三份——决策 218 ②）。
+       只读账不渲染（票 04）：那一页只剩账，读数在看板与顶栏灯带上都有。 ── -->
+  {#if !watchMode}
+    <aside class="talk-side crew">
     <div class="reg">
       <div class="reg-head"><span>值班板</span><span class="n">8 工位</span></div>
       <ul class="brows no-scrollbar">
@@ -1909,6 +2045,7 @@
       </div>
     </div>
   </aside>
+  {/if}
 </main>
 
 <!-- ⋯ 班次菜单的三条出口（票 04）：Escape 关得掉（焦点没进过面板时也算）、点面板外面关、
@@ -1947,6 +2084,17 @@
        `height` 公式同一手法——**宁可少给状态区几像素，也不能让对话区掉到下限之下**，
        故实测值向上取整、再让出几像素。估计偏大只会让时间线多十几像素，不会再回到 26px。 */
     --talk-chrome: 386px;
+  }
+  /* ── 值守台账档（票 04）：只读的一本账 —— 状态区、输入坞与值班板都不渲染，
+     时间线独占整个主列。网格行相应收成两行（页头 + 时间线）：不收的话，缺席的两块
+     会留下两条空的行与三道 20px 行距——对话区上下各白一条。折行档（≤899）是
+     flex 列、缺席的块本来就不占位，无需另写。 ── */
+  .talk.ledger {
+    grid-template-columns: minmax(420px, 1fr);
+    grid-template-rows: auto minmax(0, 1fr);
+  }
+  .talk.ledger .timeline {
+    grid-row: 2;
   }
   .talk-head {
     grid-column: 1 / -1;
@@ -1990,6 +2138,12 @@
   }
   .crumb:hover {
     color: var(--text-hi);
+  }
+  /* 页头元信息行里的那两条 crumb（票 04）：与 `.ts > span` 同一口径——不参与折行、
+     不被压窄（折行档那行是 nowrap + overflow hidden，被压窄的只有班次名）。 */
+  .ts .crumb {
+    flex: none;
+    white-space: nowrap;
   }
 
   /* ── 状态区：钉在第一屏。上限留出时间线与输入坞的位置，超高时自己滚（急停永不消失） ── */

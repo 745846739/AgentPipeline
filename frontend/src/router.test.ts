@@ -37,6 +37,15 @@ describe('parseRoute', () => {
     expect(parseRoute('#v-talk')).toEqual({ name: 'talk', query: {} });
   });
 
+  it('值守台账（决策 286 / 票 04）是自己的路由，且不能被 /talk 的前缀吃掉', () => {
+    expect(parseRoute('#/talk/watch')).toEqual({ name: 'talk-watch', query: {} });
+    // 与班次参数同一条约定（决策 217①）：?session= 进地址
+    expect(parseRoute('#/talk/watch?session=w1')).toEqual({
+      name: 'talk-watch',
+      query: { session: 'w1' },
+    });
+  });
+
   it('技能市场（决策 187）可被解析', () => {
     expect(parseRoute('#/settings/market')).toEqual({ name: 'settings-market', query: {} });
     // 与既有两个设置页并列，且不能被它们的前缀吃掉
