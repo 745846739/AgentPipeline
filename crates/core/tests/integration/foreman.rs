@@ -127,16 +127,6 @@ impl Harness {
         self.store.create_foreman_session("").await.unwrap().id
     }
 
-    /// 最近活动的未归档会话 id（人的班次；说话面的缺省落点）。
-    async fn latest_session(&self) -> String {
-        self.store
-            .latest_foreman_session()
-            .await
-            .unwrap()
-            .expect("应当已有会话")
-            .id
-    }
-
     /// 值守台账的 id（决策 286 / 票 01：值守轮写它自己的班次）。
     async fn latest_watch_session(&self) -> String {
         self.store
@@ -844,32 +834,60 @@ async fn say_persists_the_user_message_even_when_the_model_fails() {
     );
 }
 
-/// 挂住的模型流不再把这一轮无限拖住（2026-09-18 实测的形状）。
-///
-/// 现场那一轮没有 run 行、也就没有任何时限约束：模型流一挂住，`say()` 就一直挂在
-/// `stream.next()` 上，`Err` 到不了、失败外框也不执行——库里只剩一条孤立的用户行。
-///
-/// 牙齿：把 `ForemanRunner::respond` 的 `tokio::time::timeout` 摘掉，这个用例会挂死在
-/// 这里（`Step::Stall` 的 future 永不返回）。
+/// 空闲判死的失败**按瞬时类重试一次**（决策 288 / 票 05）：同一份请求原样再发一次，
+/// 仍失败才让这一轮失败。这里用替身直接产出 `llm_idle_timeout` 类——生产里它由
+/// provider 流循环的 watchdog 判出（`production_llm.rs` 那一组用例钉的就是那半）。
 #[tokio::test]
-async fn a_hung_model_is_bounded_and_recorded() {
+async fn an_idle_timeout_is_retried_once_and_then_succeeds() {
     let h = Harness::empty().await;
     let mut script = Script::new();
-    script.for_foreman().stall();
-    let runner = h
-        .runner(FakeAgent::new(script))
-        .with_turn_timeout(std::time::Duration::from_millis(1200));
+    script
+        .for_foreman()
+        .push(testkit::Step::Fail {
+            kind: "llm_idle_timeout".into(),
+            message: "模型很久没有给出任何内容（空闲判死）".into(),
+            raw: "流上 1 秒没有任何新字节".into(),
+        })
+        .text("在的，我看完了。");
+    let agent = FakeAgent::new(script);
+    let runner = h.runner(agent.clone());
+    let sid = h.session().await;
+
+    let turn = runner.say(Some(&sid), "盯着 t1").await.unwrap();
+    assert_eq!(turn.reply, "在的，我看完了。");
+    assert_eq!(agent.total_calls(), 2, "判死一次 + 重试一次");
+
+    // 用户那一句 + 成功的回话。
+    let messages = h.store.list_foreman_messages(&sid, 100).await.unwrap();
+    assert_eq!(messages.len(), 2, "{messages:?}");
+    assert_eq!(messages[1].role, "assistant");
+}
+
+/// 空闲判死**重试仍失败**才是这一轮的失败（决策 288 / 票 05）：类别原样进失败账，
+/// 人的那句话照旧落库——失败外框的既有行为只换了一个触发类别。
+#[tokio::test]
+async fn an_idle_timeout_that_fails_twice_is_recorded_with_its_kind() {
+    let h = Harness::empty().await;
+    let boom = || testkit::Step::Fail {
+        kind: "llm_idle_timeout".into(),
+        message: "模型很久没有给出任何内容（空闲判死）：多半是 provider 临时卡住——稍等片刻重试通常能过".into(),
+        raw: "流上 300 秒没有任何新字节（本次已收 1200 字节）：已中止这一次调用".into(),
+    };
+    let mut script = Script::new();
+    script.for_foreman().push(boom()).push(boom());
+    let agent = FakeAgent::new(script);
+    let runner = h.runner(agent.clone());
     let sid = h.session().await;
 
     let err = runner.say(Some(&sid), "盯着 t1").await.unwrap_err();
     match &err {
-        // 时限按人话写出来（不足一分钟说秒）：账里那一句是人判断「挂了多久」的凭据。
-        Error::Llm(m) => {
-            assert!(m.contains("没有结束"), "时限说明要读得懂：{m}");
-            assert!(m.contains("1 秒"), "要带出实际的时限：{m}");
+        Error::LlmClassified { kind, raw, .. } => {
+            assert_eq!(kind, "llm_idle_timeout");
+            assert!(raw.contains("没有任何新字节"), "{raw}");
         }
-        other => panic!("应当是「这一轮没结束」这一类失败，实际：{other:?}"),
+        other => panic!("应当是空闲判死这一类，实际：{other:?}"),
     }
+    assert_eq!(agent.total_calls(), 2, "判死一次 + 重试一次，不再更多");
 
     // 用户那一句 + 失败那一句：这一轮**不再**只剩孤立的用户行。
     let messages = h.store.list_foreman_messages(&sid, 100).await.unwrap();
@@ -877,8 +895,8 @@ async fn a_hung_model_is_bounded_and_recorded() {
     assert_eq!(messages[0].role, "user");
     assert!(
         messages[1].content.starts_with(FOREMAN_FAILED_TURN_MARK)
-            && messages[1].content.contains("没有结束"),
-        "失败那一行要说清是时限：{}",
+            && messages[1].content.contains("空闲判死"),
+        "失败那一行要带类别：{}",
         messages[1].content
     );
 }

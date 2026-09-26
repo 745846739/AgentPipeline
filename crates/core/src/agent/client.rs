@@ -316,6 +316,12 @@ pub struct LlmRequest {
     pub provider_id: Option<String>,
     /// 流式 run 上下文（决策 123）；None = 无流式（FakeAgent / 纯单元场景）。
     pub run: Option<RunContext>,
+    /// **逐调用空闲判死**（决策 288 / 票 foreman-unbounded 05）：流上 N 秒没有新字节即中止
+    /// 本次调用（按 LlmErrorKind::IdleTimeout 归类）。判据是**流上的字节**，从发出请求
+    /// 那一刻起算——不是响应完成的时限。`None` = 不启用（现状一字不动）：流水线节点的
+    /// 挂死由调度器的心跳判定收口（决策 64/66/88，进程级的另一把尺）；目前只有值班长
+    /// 的调用带这个值（foreman 行的 `idle_timeout_sec`，缺省与节点同数 300s）。
+    pub idle_timeout_sec: Option<u64>,
 }
 
 /// LLM 客户端接缝。

@@ -348,6 +348,7 @@ impl StoreSubAgentRunner {
                     // 子代理不是对讲台的一部分：增量归父节点，与班次无关。
                     session_id: String::new(),
                 }),
+                idle_timeout_sec: None,
             };
             let response = self.cfg.llm.complete(req).await?;
             session.tokens.lock().unwrap().add(&response);

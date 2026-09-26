@@ -12,6 +12,7 @@ import {
   failForemanStream,
   FOREMAN_LOST_TURN_SUFFIX,
   failureNotice,
+  quietAfterLocalGiveUp,
   FOREIGN_TTL_MS,
   foreignIsReplying,
   forgetForeignActive,
@@ -643,6 +644,40 @@ describe('本地超时之后的接力：说的与做的对上（决策 260）', 
     // 「跟」这一支的闸门在组件里；这里钉的是归约本身不因 error 在场而拒绝累积
     state = appendForemanEvent(state, delta('后台接着说的'), SESSION);
     expect(tailText(state)).toBe('后台接着说的');
+  });
+});
+
+/**
+ * 本地放弃的**安静态**（决策 288 / 票 foreman-unbounded 05）。
+ *
+ * 超时不再渲染成失败轮：墙钟已撤，那一轮跑多久由逐调用空闲判死管，本地等多久只决定
+ * 这一屏。钉三件事：错误清空、已收到的字与流式现场原样保留（光标继续走）、
+ * 它与「跟」那一支的收场形状拼得上（接手时那一轮本来就在流之中）。
+ */
+describe('本地放弃的安静态（决策 288 / 票 05）', () => {
+  it('超时：不落失败轮——错误清空、流式现场保留', () => {
+    const state = appendForemanEvent(beginForemanStream(), delta('说了一半'), SESSION);
+    const quiet = quietAfterLocalGiveUp(state);
+    expect(quiet.error).toBeNull();
+    expect(quiet.streaming).toBe(true);
+    expect(tailText(quiet)).toBe('说了一半');
+    // 与「跟」那一支的既有形状拼得上：接手之后就是「仍在流之中」的那一轮
+    const turns = buildTurns(inputOf({ following: true, stream: quiet }));
+    expect(turns[0]).toMatchObject({ key: 'live', partial: false, streaming: true });
+  });
+
+  it('安静态之后到达的增量照旧接得上（那一轮没断）', () => {
+    let state = quietAfterLocalGiveUp(beginForemanStream());
+    state = appendForemanEvent(state, delta('后台接着说的'), SESSION);
+    expect(tailText(state)).toBe('后台接着说的');
+  });
+
+  it('安静态不改 streaming 之外的任何东西：非超时失败仍走 failForemanStream', () => {
+    const state = quietAfterLocalGiveUp(beginForemanStream());
+    expect(state).toEqual(beginForemanStream());
+    const failed = failForemanStream(state, '网络不通');
+    expect(failed.error).toBe('网络不通');
+    expect(failed.streaming).toBe(false);
   });
 });
 

@@ -64,6 +64,12 @@ pub enum LlmErrorKind {
     /// 是否正确、网络是否可达」。**一次账单问题被读成配置问题**，而且按网络类的节奏重试。
     /// 等一等不会自己好，动作在 provider 那一侧（续费 / 换 provider），故它单独一档。
     Quota,
+    /// **空闲判死**（决策 288 / 票 foreman-unbounded 05）：一次调用的流上 N 秒没有新字节。
+    ///
+    /// 它不是 HTTP 层的失败（`from_http` **永不**返回它）——是消费侧的 watchdog 在流循环里
+    /// 判的：请求已经发出去、连接也在，只是对面一个字节都不再给。与「挂住」同一形状的还有
+    /// 连接阶段；判据从发出请求那一刻起算。按瞬时类处置：值班长这一侧重试一次这一次调用。
+    IdleTimeout,
 }
 
 impl LlmErrorKind {
@@ -83,6 +89,9 @@ impl LlmErrorKind {
             LlmErrorKind::Quota => {
                 "provider 额度不足（余额 / 配额）：这不是网络问题——续费或换一个 provider 再试"
             }
+            LlmErrorKind::IdleTimeout => {
+                "模型很久没有给出任何内容（空闲判死）：多半是 provider 临时卡住——稍等片刻重试通常能过"
+            }
         }
     }
 
@@ -94,6 +103,7 @@ impl LlmErrorKind {
             LlmErrorKind::Network => "llm_network",
             LlmErrorKind::ContextWindow => "llm_context_window",
             LlmErrorKind::Quota => "llm_quota",
+            LlmErrorKind::IdleTimeout => "llm_idle_timeout",
         }
     }
 
@@ -150,6 +160,19 @@ impl LlmErrorKind {
 
 /// 把「HTTP 请求失败」的错误归类为网络类：连接 / DNS / TLS / 超时。
 const NETWORK_KIND: LlmErrorKind = LlmErrorKind::Network;
+
+/// 时限的人话说法（写进失败账里给人看的那一句）。
+///
+/// **整分钟才说分钟**：90 秒按整除写成「1 分钟」是在少报现场——
+/// 这一句正是人拿去判断「它到底挂了多久」的东西。
+fn human_duration(limit: Duration) -> String {
+    let secs = limit.as_secs();
+    if secs >= 60 && secs % 60 == 0 {
+        format!("{} 分钟", secs / 60)
+    } else {
+        format!("{secs} 秒")
+    }
+}
 
 /// vendor 是否走 OpenAI 兼容协议（deepseek 与 openai 同族）。
 pub fn is_openai_compatible(vendor: &str) -> bool {
@@ -303,11 +326,38 @@ impl ProductionLlm {
         let url = format!("{}{}", base_url(provider), adapter.endpoint_path());
         let body = adapter.build_body(provider, request)?;
         let builder = adapter.apply_auth(self.http.post(&url).json(&body), provider);
-        let response = builder.send().await.map_err(|e| Error::LlmClassified {
-            kind: NETWORK_KIND.as_str().to_string(),
-            message: NETWORK_KIND.advice().to_string(),
-            raw: format!("HTTP 请求失败：{e}"),
-        })?;
+        // 逐调用空闲判死（决策 288 / 票 foreman-unbounded 05）：请求带了空闲界才启用。
+        // 判据是**流上的字节**——「距上一个字节超过阈值」从发出请求那一刻起算
+        // （连接阶段挂着不吐响应头，与「流中途停了」是同一种挂），不是响应完成的时限。
+        // `None` = 不启用（现状一字不动）：节点路径不走这里，它们的挂死由调度器心跳收口。
+        let idle_timeout = request.idle_timeout_sec.map(Duration::from_secs);
+        let idle_error = |idle: Duration, received: u64| {
+            Error::LlmClassified {
+                kind: LlmErrorKind::IdleTimeout.as_str().to_string(),
+                message: LlmErrorKind::IdleTimeout.advice().to_string(),
+                raw: format!(
+                    "流上 {} 没有任何新字节（本次已收 {received} 字节）：已中止这一次调用",
+                    human_duration(idle)
+                ),
+            }
+        };
+        let response = match idle_timeout {
+            Some(idle) => match tokio::time::timeout(idle, builder.send()).await {
+                Ok(result) => result.map_err(|e| {
+                    Error::LlmClassified {
+                        kind: NETWORK_KIND.as_str().to_string(),
+                        message: NETWORK_KIND.advice().to_string(),
+                        raw: format!("HTTP 请求失败：{e}"),
+                    }
+                })?,
+                Err(_) => return Err(idle_error(idle, 0)),
+            },
+            None => builder.send().await.map_err(|e| Error::LlmClassified {
+                kind: NETWORK_KIND.as_str().to_string(),
+                message: NETWORK_KIND.advice().to_string(),
+                raw: format!("HTTP 请求失败：{e}"),
+            })?,
+        };
         let status = response.status();
         if !status.is_success() {
             let text = response.text().await.unwrap_or_default();
@@ -338,7 +388,14 @@ impl ProductionLlm {
         let mut last_byte_at: Option<chrono::DateTime<chrono::Utc>> = None;
 
         while !done {
-            let Some(chunk) = stream.next().await else {
+            let next = match idle_timeout {
+                Some(idle) => match tokio::time::timeout(idle, stream.next()).await {
+                    Ok(next) => next,
+                    Err(_) => return Err(idle_error(idle, bytes_received)),
+                },
+                None => stream.next().await,
+            };
+            let Some(chunk) = next else {
                 break;
             };
             let bytes = chunk.map_err(|e| Error::Llm(format!("读取流失败：{e}")))?;
@@ -580,6 +637,7 @@ pub async fn test_provider_connection(provider: &Provider) -> ConnectionTest {
         max_tokens: Some(1),
         provider_id: None,
         run: None,
+        idle_timeout_sec: None,
     };
     let body = match adapter.build_body(provider, &request) {
         Ok(b) => b,

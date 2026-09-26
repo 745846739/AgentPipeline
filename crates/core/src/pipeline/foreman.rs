@@ -617,9 +617,9 @@ const FOREMAN_ATTENTION_FETCH_LIMIT: usize = 50;
 /// HTTP 500、**回话一条没落库**，而那 30 轮其实查到了东西。300 是「有人喊停」的兜底而**不是
 /// 预算目标**；它兜的那笔账由「触顶时部分结论落库 + 标注」（决策 233②）接着。
 ///
-/// **它不管墙钟**：一轮跑多久由 [`Self::respond`] 的 timeout 兜底（决策 223②，默认
-/// 1800s）。两个数是**两条正交的界**，实际最坏值是 `min(max_rounds, 1800s)`——在墙钟先到的
-/// 情况下轮数不生效（决策 233 的如实记 (i)：抬墙钟另立一条）。
+/// **它不管时间也不管 token**：整轮墙钟已撤（决策 288 / 票 05，兑现决策 233 如实记 (i)），
+/// 单次调用的界是流上的空闲判死（foreman 行的 `idle_timeout_sec`）；整轮的预算界归票 07
+/// 的 token 分档。轮数上限退为模型行为失控时的最后一道兜底。
 pub const FOREMAN_MAX_ROUNDS: usize = 300;
 
 /// 值班长回话完成通知（决策 272③）的**门**：`say` 轮至少动过这么多次工具，才算
@@ -1254,8 +1254,6 @@ pub struct ForemanRunner {
     sse: Arc<dyn SseSink>,
     /// 托管放行的自动动作的执行者（决策 210② / 票 08）。`None` = 不放行。
     steward_actions: Option<Arc<dyn crate::agent::tools::StewardActionRunner>>,
-    /// 一轮回话的绝对上限（测试注入；生产走 `node_max_duration_sec` / 阶段覆盖）。
-    turn_timeout: Option<std::time::Duration>,
     /// 上下文压缩的每会话锚点缓存（决策 269③）。锁只在读改写缓存时短暂持有——
     /// 摘要调用本身在锁外跑，绝不持锁跨 await。
     compaction: Mutex<CompactionCache>,
@@ -1291,20 +1289,9 @@ impl ForemanRunner {
             llm,
             sse,
             steward_actions: None,
-            turn_timeout: None,
             compaction: Mutex::new(CompactionCache::default()),
             watch_failures: Mutex::new(WatchFailureState::default()),
         }
-    }
-
-    /// 测试用：把一轮回话的上限压到可观测的量级（生产走 [`Self::turn_limit`]）。
-    ///
-    /// 与 [`crate::agent::providers::ProductionLlm::with_heartbeat_interval`] 同一姿态：
-    /// 上限在生产里是一个配置值（默认半小时），而「挂住的模型流会被掐断并留账」这件事
-    /// 不可能靠真等半小时来验。
-    pub fn with_turn_timeout(mut self, limit: std::time::Duration) -> Self {
-        self.turn_timeout = Some(limit);
-        self
     }
 
     /// 注入托管动作的执行者（决策 210② / 票 08）。
@@ -1435,6 +1422,7 @@ impl ForemanRunner {
                 agent_type: FOREMAN_AGENT_TYPE.to_string(),
                 session_id: session_id.to_string(),
             }),
+            idle_timeout_sec: None,
         };
         let response = tokio::time::timeout(SUMMARIZER_TIMEOUT, self.llm.complete(request))
             .await
@@ -1503,55 +1491,27 @@ impl ForemanRunner {
         result
     }
 
-    /// 一轮回话的**外框**：给这一轮加上时限，让它有界。
+    /// 一轮回话的**外框**（决策 288 / 票 05）：登记「这一班有一轮在跑」，然后进内里。
     ///
-    /// **为什么必须有界**（2026-09-18 实测）：对讲台这一轮没有 run 行，也就没有心跳可打
-    /// （决策 182⑨），于是它此前**完全不受任何时限约束**——模型流一挂住，`say()` 就一直
-    /// 挂在 `stream.next()` 上。那一晚两条消息都是这个形状：`Err` 到不了，失败外框也
-    /// 就不执行，库里只剩孤立的用户行。有界之后，「挂住」变成一条**可归因的失败**——
-    /// 与流水线节点同一个口径（见 [`Self::turn_limit`]）。
+    /// **这一轮不再有整轮墙钟**（显式兑现决策 233 的如实记 (i)：「抬墙钟另立一条」）：
+    /// 2026-09-26 的实测里一轮 23 次调用**全部成功**仍被 30 分钟墙钟整段砍掉——墙钟杀的是
+    /// 「跑了很久但一直在干活」，而真正该杀的是「一个字节都没有」。后者的界在
+    /// [`Self::respond_inner`] 的逐调用空闲判死上（foreman 行的 `idle_timeout_sec`，
+    /// 缺省与节点同数 300s）；前者的终点由人决定（值守轮由 token 预算收口，票 07）。
     async fn respond(&self, session: &ForemanSession, input: TurnInput) -> Result<ForemanTurn> {
         // 「这一班有一轮在跑」的登记（决策 260）就落在这个**唯一漏斗**上：`say` 与
         // `watch` 都过它，故两条路各写一遍的漂移从形状上不可能。凭据在函数返回（含
         // 提前 `?` 退出）时随 `Drop` 摘掉——登记与一轮的真实寿命因此是同一条。
         let _turn = begin_foreman_turn(&session.id);
         let cfg = self.stage_config().await?;
-        let limit = self.turn_limit(cfg.as_ref());
-        match tokio::time::timeout(limit, self.respond_inner(session, input, cfg)).await {
-            Ok(inner) => inner,
-            Err(_) => Err(Error::Llm(format!(
-                "这一轮超过 {} 没有结束（模型或网络挂住）：已中止，重发一次通常能过去",
-                human_duration(limit)
-            ))),
-        }
-    }
-
-    /// 一轮回话的时限：**与流水线节点取同一个数**（决策 66 的四级解析）。
-    ///
-    /// 节点级覆盖 > 阶段配置（`[foreman]` 那行的 `max_duration_sec`）> 全局
-    /// `node_max_duration_sec`（默认 1800s = 半小时）。取同一个数的理由是：对讲台这一轮
-    /// 与一个节点在「一次有界的执行」这件事上是同一种东西，各写一个数字只会让两个地方
-    /// 各自漂移。
-    ///
-    /// 取值**宁可宽**：它的职责是让挂死有界，不是让长轮次失败——一轮里可以有多次模型
-    /// 调用（`FOREMAN_MAX_ROUNDS` 次上限），每次实测在分钟量级。
-    fn turn_limit(&self, cfg: Option<&crate::types::StageConfig>) -> std::time::Duration {
-        if let Some(injected) = self.turn_timeout {
-            return injected;
-        }
-        let secs = crate::config::effective_max_duration(
-            self.settings.node_max_duration_sec,
-            cfg.and_then(|c| c.max_duration_sec),
-            crate::config::NodeTimeouts::default(),
-        );
-        std::time::Duration::from_secs(secs)
+        self.respond_inner(session, input, cfg).await
     }
 
     /// 这一轮的**轮数上限**（决策 233① / 239）：`stage_configs` 的 `foreman` 行配了就用它，
     /// 没配过用缺省 [`FOREMAN_MAX_ROUNDS`]。
     ///
-    /// 与 [`Self::turn_limit`]（墙钟）并列：两个数管两件事，实际最坏值是它们的较小者。
-    /// 解析**只有这一处**——写入路径只收正整数，读回来是 `None` = 没配过（`0` / 负数在
+    /// 墙钟已撤（决策 288 / 票 05）：它不再是「另一个界」，只是模型行为失控时的兜底
+    /// （真正的预算界见票 07 的 token 分档）。解析**只有这一处**——写入路径只收正整数，读回来是 `None` = 没配过（`0` / 负数在
     /// `StageConfigRow::into_config` 里已经被挡在门外，而 `validate_startup` 对存量里的
     /// `0` 直接拒绝启动）。
     fn round_limit(&self, cfg: Option<&crate::types::StageConfig>) -> usize {
@@ -1710,6 +1670,14 @@ impl ForemanRunner {
         // 分开记——`reply` 只在「这一轮收口了」时赋值。
         let mut last_text: Option<String> = None;
         let round_limit = self.round_limit(cfg.as_ref());
+        // 逐调用空闲界（决策 288 / 票 05）：foreman 行的 `idle_timeout_sec` > 全局
+        // `node_idle_timeout_sec`（缺省 300s，与节点同一个数）。每一次模型调用各带一份
+        // ——「N 秒没有新字节」判的是单次调用，不是整轮。
+        let idle_timeout_secs = crate::config::effective_idle_timeout(
+            self.settings.node_idle_timeout_sec,
+            cfg.as_ref().and_then(|c| c.idle_timeout_sec),
+            crate::config::NodeTimeouts::default(),
+        );
 
         for _ in 0..round_limit {
             let request = LlmRequest {
@@ -1736,8 +1704,9 @@ impl ForemanRunner {
                     // 归到正确的会话，而不是把两台设备的回话混成一段。
                     session_id: session.id.clone(),
                 }),
+                idle_timeout_sec: Some(idle_timeout_secs),
             };
-            let response = self.llm.complete(request).await?;
+            let response = self.complete_with_retry(request).await?;
             tokens.0 += response.prompt_tokens;
             tokens.1 += response.completion_tokens;
             // 推理原文（决策 244）：**只攒起来展示，不回灌**——既不进 `transcript`，
@@ -2376,6 +2345,28 @@ impl ForemanRunner {
         tools.execute(call, ctx).await
     }
 
+    /// 一次模型调用，**空闲判死重试一次**（决策 288 / 票 05）。
+    ///
+    /// 空闲判死是最典型的瞬时失败：provider 抖一下、流断在半路——同一份请求原样再发
+    /// 一次，仍失败才让这一轮失败。只认 `llm_idle_timeout` 这一类（别的类别各有各的
+    /// 处置：配置类重试无益、上下文超窗归票 06 的压缩重试）。请求是值，克隆无妨。
+    async fn complete_with_retry(
+        &self,
+        request: crate::agent::client::LlmRequest,
+    ) -> Result<crate::agent::client::AgentResponse> {
+        match self.llm.complete(request.clone()).await {
+            Ok(response) => Ok(response),
+            Err(e) if is_idle_timeout(&e) => {
+                tracing::warn!(
+                    kind = "llm_idle_timeout",
+                    "模型调用空闲判死：同一份请求重试一次"
+                );
+                self.llm.complete(request).await
+            }
+            Err(e) => Err(e),
+        }
+    }
+
     /// 工具调用事件的发射（决策 244）。
     ///
     /// 身份串填 [`FOREMAN_AGENT_TYPE`] + 本班次 `session_id`——路由那头按**同一个判据**
@@ -2521,19 +2512,6 @@ impl ForemanRunner {
 
 /// 失败回合在台账里的标记（票 04）。对讲台按它把这一轮渲染成失败轮，不是一个中性轮。
 pub const FOREMAN_FAILED_TURN_MARK: &str = "【没跑起来】";
-
-/// 时限的人话说法（写进失败账里给人看的那一句）。
-///
-/// **整分钟才说分钟**：`max_duration_sec` 是个秒数，90 秒按整除写成「1 分钟」是在少报现场——
-/// 而这一句正是人拿去判断「它到底挂了多久」的东西。
-fn human_duration(limit: std::time::Duration) -> String {
-    let secs = limit.as_secs();
-    if secs >= 60 && secs % 60 == 0 {
-        format!("{} 分钟", secs / 60)
-    } else {
-        format!("{secs} 秒")
-    }
-}
 
 // ───────────────── 播报的归因类别（决策 227 / 235 / 238）─────────────────
 
@@ -2772,6 +2750,17 @@ fn attribution_discipline() -> String {
          说某一条 run 时**同时带上它的 id**（`run_id`，正整数，取台账里的那一行）：\n\
          你采到的证据是**哪一条 run 的**，写在别处没人对得了账——报错 run 与没有 run 同判未定位。\n\
          说的若是任务级态势、指不出单条 run，就**不写** `run_id`（不写是诚实的，编一个数不是）。\n"
+    )
+}
+
+/// 这次失败是「空闲判死」吗（决策 288 / 票 05）——重试外框的判据。
+///
+/// 按 **kind 字段**判，不按报文字样（决策 259 的同一口径）：类别在构造点带上
+/// （`LlmErrorKind::IdleTimeout`），这里只认那枚字段。
+fn is_idle_timeout(error: &Error) -> bool {
+    matches!(
+        error,
+        Error::LlmClassified { kind, .. } if kind == "llm_idle_timeout"
     )
 }
 

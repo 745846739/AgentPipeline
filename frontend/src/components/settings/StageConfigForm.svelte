@@ -231,12 +231,23 @@
     <label class="field">
       <span>idle_timeout_sec</span>
       <input class="input mono" type="number" min="0" bind:value={draft.idle_timeout_sec} />
+      {#if draft.stage === FOREMAN_STAGE_KEY}
+        <!-- 决策 288 / 票 05：foreman 行的这个数从死旋钮变成真生效——它现在管的是
+             对讲台每一轮里**单次模型调用**「多少秒没有新字节判死」（缺省 300）。 -->
+        <span class="sub">
+          对讲台：单次模型调用「{draft.idle_timeout_sec ?? 300} 秒没有新字节」判死并重试一次。
+        </span>
+      {/if}
     </label>
 
-    <label class="field">
-      <span>max_duration_sec</span>
-      <input class="input mono" type="number" min="0" bind:value={draft.max_duration_sec} />
-    </label>
+    <!-- 决策 288 / 票 05：整轮墙钟已撤，max_duration_sec 对 foreman 行成了死旋钮——
+         死旋钮比没有更坏（决策 256），故在 foreman 行上整个隐藏（其余阶段照旧）。 -->
+    {#if draft.stage !== FOREMAN_STAGE_KEY}
+      <label class="field">
+        <span>max_duration_sec</span>
+        <input class="input mono" type="number" min="0" bind:value={draft.max_duration_sec} />
+      </label>
+    {/if}
 
     <!-- 轮数上限（决策 233① / 239）：只对值班长那一行有意义，故只在 foreman 上摆出来
          ——14 行里 13 行都看不见这个格子，比「一个对多数行都无意义的旋钮」安静。

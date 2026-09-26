@@ -77,6 +77,7 @@ fn request(run_id: i64, messages: Vec<Message>) -> LlmRequest {
             agent_type: "main".into(),
             session_id: String::new(),
         }),
+        idle_timeout_sec: None,
     }
 }
 
@@ -502,4 +503,94 @@ async fn unknown_vendor_and_missing_provider_fail_cleanly() {
     let err = client.complete(req).await.unwrap_err();
     assert!(err.to_string().contains("已被禁用"), "{err}");
     mock.shutdown().await;
+}
+
+// ─────────────────── 逐调用空闲判死（决策 288 / 票 foreman-unbounded 05）───────────────────
+
+/// 一台「先吐几个字节、然后一声不吭挂住」的 raw server：MockLlm 写完就关连接，
+/// 造不出「流停了但连接还在」的真挂——空闲判死要杀的正是这个形状。
+async fn spawn_dribble_then_hold() -> (String, tokio::task::JoinHandle<()>) {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let handle = tokio::spawn(async move {
+        let (mut sock, _) = listener.accept().await.unwrap();
+        // 读掉请求头（读到空行为止）。
+        let mut buf = vec![0u8; 8192];
+        let mut read_total = 0usize;
+        loop {
+            let n = sock.read(&mut buf).await.unwrap();
+            read_total += n;
+            if n == 0 || buf[..read_total].windows(4).any(|w| w == b"\r\n\r\n") {
+                break;
+            }
+        }
+        // 回一个 200 的 SSE 头 + 一段真增量，然后**不关流**：对面等 [DONE] 等到地老天荒。
+        sock.write_all(
+            b"HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\n\r\n\
+              data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"hello\"}}]}\n\n",
+        )
+        .await
+        .unwrap();
+        sock.flush().await.unwrap();
+        // 挂住足够久，让 1 秒的空闲界一定先到。
+        tokio::time::sleep(std::time::Duration::from_secs(30)).await;
+    });
+    (format!("http://127.0.0.1:{port}"), handle)
+}
+
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+/// 流上超过空闲界没有新字节 → 中止这一次调用，类别是 `llm_idle_timeout`，
+/// 报文里带「多久没有字节」与「已收多少字节」——排障要的两样都有。
+#[tokio::test]
+async fn idle_stream_is_aborted_with_a_classified_error() {
+    let home = TestHome::new().unwrap();
+    let (store, _clock) = home.setup().await.unwrap();
+    let (url, server) = spawn_dribble_then_hold().await;
+    store
+        .upsert_provider(&provider("openai", "gpt-x", &url, "p-idle"))
+        .await
+        .unwrap();
+
+    let sse = SseRecorder::new();
+    let client = ProductionLlm::new(store.clone(), Arc::new(sse.clone()));
+    let mut req = request(1, vec![]);
+    req.idle_timeout_sec = Some(1);
+    let started = std::time::Instant::now();
+    let err = client.complete(req).await.unwrap_err();
+    let elapsed = started.elapsed();
+
+    match &err {
+        agentpipeline_core::Error::LlmClassified { kind, raw, .. } => {
+            assert_eq!(kind, "llm_idle_timeout");
+            assert!(raw.contains("没有任何新字节"), "{raw}");
+            assert!(raw.contains("1 秒"), "要带出实际的空闲界：{raw}");
+            assert!(raw.contains("已收"), "要带出已收字节数：{raw}");
+        }
+        other => panic!("应当是空闲判死这一类，实际：{other:?}"),
+    }
+    // 判死在空闲界附近发生，而不是等满挂住时长（30s）——这是「逐调用」的全部意义。
+    assert!(elapsed < std::time::Duration::from_secs(10), "{elapsed:?}");
+    server.abort();
+}
+
+/// `idle_timeout_sec: None` 的请求**不走** watchdog：挂住的流保持现状
+/// （节点路径由调度器的心跳判定收口，决策 64/66/88——两把尺互不越界）。
+#[tokio::test]
+async fn requests_without_an_idle_bound_are_not_watchdogged() {
+    let home = TestHome::new().unwrap();
+    let (store, _clock) = home.setup().await.unwrap();
+    let (url, server) = spawn_dribble_then_hold().await;
+    store
+        .upsert_provider(&provider("openai", "gpt-x", &url, "p-none"))
+        .await
+        .unwrap();
+
+    let sse = SseRecorder::new();
+    let client = ProductionLlm::new(store.clone(), Arc::new(sse.clone()));
+    let req = request(1, vec![]);
+    let result = tokio::time::timeout(std::time::Duration::from_millis(1500), client.complete(req)).await;
+    // 没有 watchdog：1.5s 时它还挂在流上（不是「1 秒就被判死」）。
+    assert!(result.is_err(), "不该被判死：{result:?}");
+    server.abort();
 }

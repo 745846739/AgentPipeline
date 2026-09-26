@@ -88,7 +88,9 @@
     forgetForeignActive,
     isRequestTimeout,
     ledgerOwnsTheFailure,
+    maxLedgerId,
     pruneForeignActive,
+    quietAfterLocalGiveUp,
     settleForemanStream,
   } from '../realtime/foreman';
   import { talk } from '../stores/talk.svelte';
@@ -939,10 +941,17 @@
       // 错误降级成流里的字符串之后 `kind` 就丢了。与 `stream.error` 同一处设置，两者恒同步。
       talk.pairingNeeded = isPairingRequired(err);
       timedOut = isRequestTimeout(err);
-      talk.stream = failForemanStream(
-        talk.stream,
-        failureNotice((err as Error).message, timedOut),
-      );
+      if (timedOut) {
+        // 本地放弃 = 安静态（决策 288 / 票 05）：**不落失败轮**。那一轮在服务端不随请求死
+        // （决策 223），而且整轮墙钟已撤——它跑多久由逐调用空闲判死管，本地等多久只决定
+        // 这一屏。光标继续走；收场交给 finally 的落地哨。
+        talk.stream = quietAfterLocalGiveUp(talk.stream);
+      } else {
+        talk.stream = failForemanStream(
+          talk.stream,
+          failureNotice((err as Error).message, false),
+        );
+      }
       // 重取成功才撤乐观轮：撤了之后这话由台账那一行承担，不靠重取失败时凭空消失
       if (await reload(sid)) {
         talk.pendingText = null;
@@ -965,17 +974,15 @@
       // 成功那一趟是**空操作**：那一刻 `turn_in_flight` 已经翻假（回话落了库）。
       // 必须放在 `sending = false` **之后**——`syncFollowing` 在本机还在发时不接手。
       if (session) talk.syncFollowing(session);
-      // 接上手之后，那条本地的「发送失败」要退场——**但只退超时那一类**（决策 260）：
-      // 它说的是「这一次请求没等到回包」，字是真话，可屏幕上同时摆着**一条失败轮与一轮
-      // 正在流式作答**，人只会读成「它说错了、又答上了」。那一轮此刻在跑这件实情，由
-      // 上面那一轮自己说（光标在动）。
-      //
-      // 其余失败**一个字都不动**：网络不通、配对 403 这些请求很可能根本没到后端，
-      // 而值班长的**值守轮**完全可能在那一瞬间正在跑——按「服务端说有在跑」就把本地那条
-      // 错误抹掉，等于拿一件无关的实情盖住另一件真事（配对那条尤其：它的指引是唯一出口）。
-      if (talk.followingSince !== null && timedOut) {
-        talk.stream = { ...talk.stream, error: null };
+      // 本地放弃（决策 288 / 票 05）：安静态**不落失败轮**，接手是**无条件**的——
+      // 上一行 syncFollowing 只认「服务端此刻说在跑」，而本地超时那一刻的读数很可能
+      // 已经过期（重读失败 / 正好落地）。落地哨的下一趟轮询按 fresh 读数收场：
+      // 落地 → 台账接管；还在跑 → 继续跟（增量照旧走时间线）；不再跑也没落地 →
+      // 按「跟的那一轮」的既有形状收成死轮失败。锚点取重读之后那本台账的尾部——
+      // 用户那一句已在其中，此后多出的行才是这一轮的收场。
+      if (timedOut && session) {
         talk.pairingNeeded = false;
+        talk.followAfterGiveUp(maxLedgerId(session.messages ?? []));
       }
     }
   }

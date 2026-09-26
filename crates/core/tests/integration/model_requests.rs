@@ -129,6 +129,7 @@ fn request(ctx: Option<RunContext>) -> LlmRequest {
         max_tokens: None,
         provider_id: None,
         run: ctx,
+        idle_timeout_sec: None,
     }
 }
 

@@ -895,6 +895,7 @@ impl ModelInvoke {
                 agent_type: pseudo.agent_type().to_string(),
                 session_id: String::new(),
             }),
+            idle_timeout_sec: None,
         };
 
         let started = self.clock.now();
@@ -1022,6 +1023,7 @@ impl ModelInvoke {
                 agent_type: PseudoStage::ProjectAnalysis.agent_type().to_string(),
                 session_id: String::new(),
             }),
+            idle_timeout_sec: None,
         };
         let response = self.llm.complete(request).await?;
         let extracted = crate::agent::metadata::extract_metadata(&response);

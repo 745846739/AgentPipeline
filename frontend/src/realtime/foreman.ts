@@ -274,6 +274,19 @@ export function failForemanStream(state: ForemanStreamState, message: string): F
 }
 
 /**
+ * 本地放弃的**安静态**（决策 288 / 票 foreman-unbounded 05）。
+ *
+ * 本地等不到回包**不再渲染成失败轮**：那一轮在服务端不随请求死（决策 223），而且整轮
+ * 墙钟已撤——它跑多久由逐调用空闲判死管，本地等多久只决定这一屏。已收到的步骤与流式
+ * 现场原样保留（光标继续走），错误清空；收场交给「跟」那一支的落地哨
+ * （{@link resolveFollowOutcome}：落地 → 台账接管；还在跑 → 继续跟；不再跑也没落地 →
+ * 在那里收成失败轮）。
+ */
+export function quietAfterLocalGiveUp(state: ForemanStreamState): ForemanStreamState {
+  return { ...state, error: null };
+}
+
+/**
  * 台账里最大的一行 id（0 = 一行都没有）。
  *
  * 与 {@link turnLanded} 配对使用：接手一轮时记下它，落地时拿它比对。**只看 id**，

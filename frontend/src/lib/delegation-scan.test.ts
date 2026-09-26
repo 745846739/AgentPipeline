@@ -224,16 +224,28 @@ describe('超时判据按 kind、不摸正文（票 06，决策 259 的延伸）
 
   it('Talk 趁 ApiError 还在手把判好的布尔交给 failureNotice（判上移、拼接留下游）', () => {
     expect(talk, 'Talk 该调 isRequestTimeout').toContain('isRequestTimeout(err)');
-    // 判好的布尔**存进一个具名变量**再交给 `failureNotice`（决策 260）：`finally` 里还要
-    // 用它决定那条本地失败轮退不退场（超时那一类交棒给「跟」），故不能在实参位置上判一次完事。
+    // 判好的布尔**存进一个具名变量**再交给下面的分支（决策 260）：`finally` 里还要
+    // 用它决定接不接那一轮，故不能在实参位置上判一次完事。
     expect(talk, '该把判好的布尔存下来').toContain('timedOut = isRequestTimeout(err)');
-    expect(talk, '该把那个布尔传给 failureNotice').toContain(
-      'failureNotice((err as Error).message, timedOut)',
-    );
     expect(
       talk.match(/import \{[^}]*isRequestTimeout[^}]*\} from '\.\..*\/realtime\/foreman'/)?.[0],
       'isRequestTimeout 不是从 realtime/foreman 来的',
     ).toBeTruthy();
+  });
+
+  it('本地放弃走安静态：超时不落失败轮、接手无条件（决策 288 / 票 05）', () => {
+    expect(talk, '超时该走安静态（不清字、不落失败轮）').toContain(
+      'talk.stream = quietAfterLocalGiveUp(talk.stream)',
+    );
+    expect(talk, '接手该走 followAfterGiveUp（无条件，不等 stale 读数）').toContain(
+      'talk.followAfterGiveUp(maxLedgerId(session.messages ?? []))',
+    );
+    expect(
+      talk.match(/import \{[^}]*quietAfterLocalGiveUp[^}]*\} from '\.\..*\/realtime\/foreman'/)?.[0],
+      'quietAfterLocalGiveUp 不是从 realtime/foreman 来的',
+    ).toBeTruthy();
+    // 非超时的失败仍走失败轮（网络不通 / 配对 403 是真失败，一个字都不动）。
+    expect(talk, '非超时失败照旧落失败轮').toContain('failForemanStream(');
   });
 });
 

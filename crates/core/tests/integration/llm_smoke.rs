@@ -90,6 +90,7 @@ async fn real_llm_completes_architect_execute_with_structured_metadata() {
             agent_type: "main".into(),
             session_id: String::new(),
         }),
+        idle_timeout_sec: None,
     };
     let response = client.complete(request).await.unwrap();
 

@@ -601,6 +601,7 @@ mod tests {
             max_tokens: None,
             provider_id: None,
             run: None,
+            idle_timeout_sec: None,
         }
     }
 

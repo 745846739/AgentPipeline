@@ -337,6 +337,8 @@ impl RequestPlan {
             max_tokens: self.max_tokens,
             provider_id: self.provider_id.clone(),
             run,
+            // 节点的挂死由调度器的心跳判定收口（决策 64/66/88），不走流上 watchdog。
+            idle_timeout_sec: None,
         }
     }
 }

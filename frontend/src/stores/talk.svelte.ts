@@ -266,6 +266,20 @@ class TalkStore {
    * 已经接手且仍在跑时**不改 `followingSince`**：它是「落地」那条判据的锚点，每趟轮询
    * 重记一次的话锚点会跟着往前爬，落地的行反而永远比它小。
    */
+  /**
+   * 本地放弃后的**无条件**接手（决策 288 / 票 05）。
+   *
+   * 与 {@link syncFollowing} 的差别只有一条：「服务端此刻说在跑」不是接手的前提——
+   * 本地超时那一刻读到的 `turn_in_flight` 很可能已经过期（重读失败 / 正好落地），
+   * 按它决定接不接会把「还在跑」误判成「没了」。落地哨的下一趟轮询按 fresh 读数收场：
+   * 落地 → 台账接管；还在跑 → 继续跟；不再跑也没落地 → 收成死轮失败。
+   * `anchor` 是**重读之后**的最大行 id（落地判据的起点；用户那一句已在其内）。
+   */
+  followAfterGiveUp(anchor: number): void {
+    this.followingSince = anchor;
+    this.startSentinel();
+  }
+
   syncFollowing(payload: ForemanSession): void {
     if (this.sending) return;
     const anchor = this.followingSince;
