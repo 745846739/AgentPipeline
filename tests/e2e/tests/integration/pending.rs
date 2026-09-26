@@ -72,23 +72,33 @@ async fn e2e_21_info_insufficient_requires_input_then_reruns_validate_input() {
     f.agent.set_script(rerun);
     f.executor.run("t21").await.unwrap();
 
-    // 决策 79 / 票 08：补充输入注入 validate_input 重入的 user prompt（不只落流转原因）。
+    // 决策 79 / 票 08，由决策 279 改形状：补充输入不再渲染进重入的首条消息——它作为
+    // **对话末尾的 user turn** 随续接转录重入（首条消息逐字不变，prompt cache 的前缀
+    // 承诺从「run 内」延伸到「resume」）。首轮断言仍是「不渲染该段」；重入改查
+    // `messages` 里的 user turn，不再查 `user_prompt`（那查的正是决策 279 要停掉的旧形状）。
     let vi_prompts: Vec<String> = f
         .requests_for(Stage::ArchitectDesign, Node::ValidateInput)
         .into_iter()
         .map(|r| r.user_prompt)
         .collect();
     assert!(
-        !vi_prompts[0].contains("用户补充输入"),
+        !vi_prompts[0].contains("用户补充输入") && !vi_prompts[0].contains(input),
         "首轮（无补充输入）不渲染该段：{}",
         vi_prompts[0]
     );
+    // 决策 279 的 cache 前缀承诺：重入的首条消息与首轮逐字相同
+    for (i, p) in vi_prompts.iter().enumerate().skip(1) {
+        assert_eq!(p, &vi_prompts[0], "第 {i} 次请求的首条消息应与首轮逐字相同");
+    }
+    let vi_reqs = f.requests_for(Stage::ArchitectDesign, Node::ValidateInput);
     assert!(
-        vi_prompts
+        vi_reqs.iter().skip(1).any(|r| r
+            .messages
             .iter()
-            .skip(1)
-            .any(|p| p.contains("用户补充输入") && p.contains(input)),
-        "重入 prompt 应含补充输入：{vi_prompts:?}"
+            .any(|m| m.role == agentpipeline_core::agent::client::Role::User
+                && m.content.as_deref() == Some(input))),
+        "重入请求应把补充输入作为转录末尾的 user turn 带上（各请求的 messages 数：{:?}）",
+        vi_reqs.iter().map(|r| r.messages.len()).collect::<Vec<_>>()
     );
 
     assert!(
