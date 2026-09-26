@@ -1,7 +1,6 @@
 {
   "name": "AgentPipeline · 像素机房",
   "short_name": "AgentPipeline",
-  "start_url": "/",
   "scope": "/",
   "display": "standalone",
   "background_color": "#1b1d2c",

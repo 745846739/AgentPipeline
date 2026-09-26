@@ -76,6 +76,8 @@
   } from '../lib/talkSessions';
   import { buildTurns, turnName, type TurnStep, type TurnView } from '../lib/talkTurns';
   import { isPairingRequired } from '../lib/sharePairing';
+  import { maskPairValue, pairingLaunchNote } from '../lib/pairingLaunch';
+  import { getPairingToken } from '../api/config';
   import { actionKey } from '../lib/actions';
   import {
     beginForemanStream,
@@ -166,6 +168,12 @@
   let loadError = $state<string | null>(null);
   /** `loadError` 是不是**配对缺失**（按后端给的 `kind` 判，决策 259）——挂不挂配对入口读它，不读报文字样。 */
   let loadErrorPairing = $state(false);
+  /**
+   * 这个组件**装载那一刻**的地址（决策 285）。standalone 窗口没有地址栏，而主屏图标的
+   * 启动地址决定令牌能不能递进来（191）——「图标没带上参数」这句话在界面上本该有处可读。
+   * 取装载时那一刻而不是渲染时：渲染时地址可能已经被页内导航改过，而要看的是启动那条。
+   */
+  const launchHref = typeof window === 'undefined' ? '' : window.location.href;
   /** 会话台账（时间线的权威内容；每次回话后重取，不自攒一份账）。 */
   let session = $state<ForemanSession | null>(null);
 
@@ -1367,6 +1375,14 @@
             >（没有地址栏与底栏）；<b>换过令牌后要重新添加一次</b
             >（图标里记的是当时那条带令牌的地址）。
           </p>
+          <!-- 这次启动的地址摊开（决策 285）：standalone 没有地址栏，「图标到底带没带参数」
+               在界面上本该有处可读——判混了就会把人送去重扫一个本来就对的码。令牌值打码。 -->
+          <p class="note">
+            本次启动地址：<code>{maskPairValue(launchHref)}</code>——{pairingLaunchNote(
+              launchHref,
+              getPairingToken(),
+            )}
+          </p>
         {/if}
       </div>
     {/if}
@@ -1757,6 +1773,13 @@
                 >独立窗口</b
               >（没有地址栏与底栏）；<b>换过令牌后要重新添加一次</b
               >（图标里记的是当时那条带令牌的地址）。
+            </p>
+            <!-- 同上方读失败那条：这次启动的地址在本条上也摊开（决策 285）。 -->
+            <p class="note">
+              本次启动地址：<code>{maskPairValue(launchHref)}</code>——{pairingLaunchNote(
+                launchHref,
+                getPairingToken(),
+              )}
             </p>
           {/if}
 

@@ -46,15 +46,7 @@ pub fn static_routes() -> Router<AppState> {
 /// 根层字面路由的按名分发（`/index.html`、`/favicon.ico` 等）。
 async fn serve_named(name: &'static str) -> Response {
     match lookup(name) {
-        Some((bytes, mime)) => serve(
-            bytes,
-            mime,
-            if name == "index.html" {
-                CACHE_NO_CACHE
-            } else {
-                CACHE_IMMUTABLE
-            },
-        ),
+        Some((bytes, mime)) => serve(bytes, mime, cache_for(name)),
         None => (StatusCode::NOT_FOUND, format!("静态资源不存在：{name}")).into_response(),
     }
 }
@@ -62,7 +54,7 @@ async fn serve_named(name: &'static str) -> Response {
 /// `GET /`：内嵌 index.html；未内嵌时给构建提示页（不 404，避免误读成服务挂了）。
 async fn index() -> Response {
     match lookup("index.html") {
-        Some((bytes, mime)) => serve(bytes, mime, CACHE_NO_CACHE),
+        Some((bytes, mime)) => serve(bytes, mime, cache_for("index.html")),
         None => (
             StatusCode::OK,
             [(header::CONTENT_TYPE, "text/html; charset=utf-8")],
@@ -77,21 +69,32 @@ async fn index() -> Response {
 async fn asset(Path(path): Path<String>) -> Response {
     let key = format!("assets/{path}");
     match lookup(&key) {
-        Some((bytes, mime)) => serve(
-            bytes,
-            mime,
-            if key == "index.html" {
-                CACHE_NO_CACHE
-            } else {
-                CACHE_IMMUTABLE
-            },
-        ),
+        Some((bytes, mime)) => serve(bytes, mime, cache_for(&key)),
         None => (StatusCode::NOT_FOUND, format!("静态资源不存在：{key}")).into_response(),
     }
 }
 
 const CACHE_NO_CACHE: &str = "no-cache";
 const CACHE_IMMUTABLE: &str = "public, max-age=31536000, immutable";
+
+/// 该文件的 `Cache-Control`：**地址固定、内容会变的必须复验**（决策 285）。
+///
+/// `no-cache` 不是「不缓存」，是「可缓存、每次用前回源复验」；`immutable` 则承诺
+/// 「地址不变内容也不变」，只有 Vite 的 `assets/` 产物配得上——它的文件名里带内容哈希，
+/// 内容一改就是另一个地址。根层这些名字（页面 shell 与 manifest）改内容不改地址，长缓存
+/// 会把旧副本钉死在客户端上，而这两份都是**行为**：`index.html` 决定加载哪个产物，
+/// `manifest.webmanifest` 里的 `start_url` 决定主屏图标的启动地址，配对令牌正是靠那条
+/// 地址递进去的（决策 191）。manifest 被这么钉过一次的后果很重——手机拿旧副本建图标，
+/// 等于把决策 285 的修复挡在门外。
+///
+/// **图标与字体仍走 `immutable`**（有意）：它们陈旧只是观感问题，而代价是实打实的——
+/// 主题六自托管 78 个 woff2 子集（决策 169），改成每次回源就是每次开页重取一遍。
+fn cache_for(name: &str) -> &'static str {
+    match name {
+        "index.html" | "manifest.webmanifest" => CACHE_NO_CACHE,
+        _ => CACHE_IMMUTABLE,
+    }
+}
 
 /// 页面一律声明**不发送 `Referer`**（决策 191）。
 ///
@@ -206,6 +209,18 @@ mod tests {
                 .and_then(|value| value.to_str().ok()),
             Some("no-referrer"),
         );
+    }
+
+    /// 缓存策略的牙齿（决策 285）：**地址固定、内容会变的那两份必须复验**。
+    /// 少了它，manifest 会被当带哈希的产物发一年期 `immutable`——手机拿旧副本建主屏图标，
+    /// 图标就丢掉了地址里的配对令牌（决策 191 的契约），而源码里怎么改都推不过去。
+    #[test]
+    fn mutable_behavioral_files_revalidate() {
+        assert_eq!(cache_for("index.html"), CACHE_NO_CACHE);
+        assert_eq!(cache_for("manifest.webmanifest"), CACHE_NO_CACHE);
+        // 带内容哈希的产物与纯视觉资产仍长缓存（理由见 cache_for 的注释）。
+        assert_eq!(cache_for("assets/index-CnQTDGQQ.js"), CACHE_IMMUTABLE);
+        assert_eq!(cache_for("icons/icon-192.png"), CACHE_IMMUTABLE);
     }
 
     #[test]

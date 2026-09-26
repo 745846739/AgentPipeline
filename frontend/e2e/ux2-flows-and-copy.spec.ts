@@ -160,6 +160,11 @@ test.describe('UX2 ⑧ 新建任务 / 表单校验 / 文案（票 10 / 11 / 15�
     await expect(note).toBeVisible({ timeout: 30_000 });
     // 加粗走真样式（模板里此前是字面的 **，Svelte 不解析 Markdown）
     expect(await note.locator('b').count()).toBeGreaterThan(0);
+    // 「本次启动地址」那一行（决策 285）：standalone 窗口没有地址栏，这一行是排障唯一的读数处
+    // ——这一栏是这条地址里没有令牌、本机也没存过的那一档（e2e 用的是干净上下文）。
+    const launch = page.locator('p.note', { hasText: '本次启动地址' }).first();
+    await expect(launch).toBeVisible();
+    await expect(launch).toContainText('不带令牌的地址');
     const body = await page.evaluate(() => document.body.innerText);
     expect(body, '页面上不该出现字面的 **').not.toContain('**');
     expectBundleHealthy(bundle);

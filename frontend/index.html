@@ -19,7 +19,13 @@
            基建（--safeb），黑透明会把顶栏压进刘海，那是另一笔账；
          · iOS 主屏 web app 与 Safari 存储隔离，配对令牌靠图标记下的 `?pair=` 地址（决策 191），
            换过令牌要重新添加一次——这句提醒住在对讲台的配对指引里。 -->
-    <link rel="manifest" href="/manifest.webmanifest" />
+    <!-- `?v=2`（决策 285）：manifest 曾被服务器按「带哈希产物」发成一年期 `immutable`，那段时间
+         取走过旧副本的设备会把它一直用下去——旧副本里有 `start_url`，会顶掉主屏图标的启动地址，
+         连「重新添加一次」都救不回来（iOS 主屏容器与 Safari 存储隔离，令牌只能靠那条地址递进去，
+         决策 191）。改查询串就是换一条地址，逼这些设备重新取一份；`index.html` 本身是
+         `no-cache`，新查询串必定被看见。服务器那边已按 285 把 manifest 改回 `no-cache`，
+         **往后改 manifest 不必再动这里**——这个参数只为换掉已经发出去的那些旧副本。 -->
+    <link rel="manifest" href="/manifest.webmanifest?v=2" />
     <meta name="theme-color" content="#1b1d2c" />
     <meta name="mobile-web-app-capable" content="yes" />
     <meta name="apple-mobile-web-app-capable" content="yes" />
