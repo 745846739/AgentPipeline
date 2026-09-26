@@ -687,14 +687,17 @@ pub const FOREMAN_WATCH_TOKEN_BUDGET: u32 = 120_000;
 /// ——短轮连 `foreman_reply` 的 cooldown 槽都不碰（cooldown 倒挂的坑）。
 pub const FOREMAN_REPLY_MIN_TOOL_CALLS: usize = 3;
 
-/// 这一轮**为什么没能正常收口**（决策 292 / 票 07）。
+/// 这一轮**为什么没能正常收口**（决策 292 / 票 07 / 293 / 票 08）。
 ///
-/// 它只管「触顶」与「中途失败」两类——轮数上限那一类由循环自然跑完表达（`stop` 为空，
-/// 决策 233② 那条最老的路）。三条非正常结束共用同一条收口路径，差别写在这里。
+/// 它管「触顶」「中途失败」「打转」三类——轮数上限那一类由循环自然跑完表达（`stop` 为空，
+/// 决策 233② 那条最老的路）。四条非正常结束共用同一条收口路径，差别写在这里
+/// （「人按停」是第四条，票 09）。
 #[derive(Debug)]
 enum StopReason {
     /// 成本门（值守轮）：生成 token 到了预算线。带的是**触发那一刻的累计值**（标注里要写它）。
     Budget(u32),
+    /// 循环检测（票 08）：提醒过一次仍在打转，强制收口。带的是判定本身（证据要进标注）。
+    Loop(crate::agent::loops::Loop),
     /// 中途失败（空闲判死 / 超长 / 取消 / 内部错误）：错误原样带回外框做失败记账。
     Failed(Error),
 }
@@ -707,6 +710,20 @@ enum StopReason {
 /// 决策 292 起它不再只挂「轮数上限」那一支：**所有非正常结束**（触顶 / 中途失败 / 取消）
 /// 都走同一条收口路径带上它（行为一样的几个理由共用同一个标记；「为什么」写在标记之后）。
 pub const FOREMAN_PARTIAL_TURN_MARK: &str = "【未收口】";
+
+/// 「在原地打转」的收口标记（决策 293 / 票 08，与 [`FOREMAN_PARTIAL_TURN_MARK`] **同族**）：
+/// 停止的原因不同、形状要能一眼分开（裁决 9 的三个标记：触顶 / 打转 / 人按停）。
+pub const FOREMAN_LOOP_TURN_MARK: &str = "【未收口·在打转】";
+
+/// 打转提醒的标记（决策 293 / 票 08）：以**一条带标记的 user 轮**注入本轮转录
+/// （与 [`COMPACTION_MARK`] / [`FOREMAN_WATCH_DIGEST_MARK`] 同一先例——进模型上下文才拦得住；
+/// user 轮这一形态是必须的：值班长的转录里「该轮到谁说话」由最后一条 user 承担）。
+///
+/// 提醒本身**不落库**：落库的 user 行是值班经理说的话，把系统提醒写进去会让时间线上
+/// 凭空多出一句「他说过的话」（前端只看角色，分不开）。提醒的证据留在两处——`tracing::warn!`
+/// 那一条日志，和这一轮 `traces` 里那串重复的调用本身；真收口时还有收口行上的标记与
+/// 写明的原因（[`FOREMAN_LOOP_TURN_MARK`]）。
+pub const FOREMAN_LOOP_REMINDER_MARK: &str = "【操作台提醒·别在原地打转】";
 
 /// 历史窗口的字符预算（决策 182⑫）。
 ///
@@ -2025,6 +2042,13 @@ impl ForemanRunner {
         // 这一轮**为什么出循环**（票 07）：`None` = 正常收口（模型自己说完了）或轮数触顶
         // （那一条的文案在下面现成拼，见 `reply` 的收口）。
         let mut stop: Option<StopReason> = None;
+        // 循环检测（决策 293 / 票 08）的流水：这一轮每一次工具调用的（工具 + 参数原串 + 结果指纹）。
+        // 判等用**参数原串**而不是 `traces` 里那份截断过的 `args_summary`——摘要会把两个
+        // 不同的调用判成同一个，而误伤的代价正是它要防的那件事（好轮被收口）。
+        let mut loop_log: Vec<crate::agent::loops::CallRecord> = Vec::new();
+        // 提醒注入点的**下一位**：`Some(n)` = 已经提醒过，从此只判 `loop_log[n..]`
+        // （「提醒过了再犯」与「第一次犯」用同一个函数、同一把尺子，只是换了窗口）。
+        let mut loop_reminded_at: Option<usize> = None;
         // 逐调用空闲界（决策 288 / 票 05）：foreman 行的 `idle_timeout_sec` > 全局
         // `node_idle_timeout_sec`（缺省 300s，与节点同一个数）。每一次模型调用各带一份
         // ——「N 秒没有新字节」判的是单次调用，不是整轮。
@@ -2209,7 +2233,39 @@ impl ForemanRunner {
                 } else {
                     content
                 };
+                // 循环检测的流水（决策 293 / 票 08）：结果指纹要在 `content` 被移进转录**之前**
+                // 算——判定它「有没有读到新东西」看的正是回灌给模型的那一份。
+                loop_log.push(crate::agent::loops::CallRecord {
+                    tool: call.name.clone(),
+                    arguments: call.arguments.clone(),
+                    result_digest: crate::agent::loops::result_digest(&content),
+                });
                 transcript.push(Message::tool_result(call, content));
+            }
+            // 循环检测（决策 293 / 票 08）：**一批工具跑完再判**——工具结果必须紧跟发起它们的
+            // assistant 消息（转录的契约），中途插一条 user 轮会把那一批切成两半。
+            if let Some(hit) =
+                crate::agent::loops::detect(&loop_log[loop_reminded_at.unwrap_or(0)..])
+            {
+                let reason = hit.reason();
+                match loop_reminded_at {
+                    // 第一次：注入一条带标记的 user 轮提醒，**只提醒一次**、不拦——模型多半
+                    // 只是没意识到自己在重复。提醒进转录（下一轮调用带着它出去）才拦得住。
+                    None => {
+                        tracing::warn!(session = %session.id, %reason, "值班长在原地打转：注入提醒（票 08）");
+                        transcript.push(Message::user(format!(
+                            "{FOREMAN_LOOP_REMINDER_MARK}{reason}。若现有信息已经够回答这一轮的\
+                             问题，现在就收口；若确实还要查，**换个角度**——别再重复刚才那几个调用。"
+                        )));
+                        loop_reminded_at = Some(loop_log.len());
+                    }
+                    // 提醒过了仍在打转：收口（部分结论 + 【未收口·在打转】），不再陪着烧 token。
+                    Some(_) => {
+                        tracing::warn!(session = %session.id, %reason, "提醒之后仍在打转：强制收口（票 08）");
+                        stop = Some(StopReason::Loop(hit));
+                        break;
+                    }
+                }
             }
         }
 
@@ -2239,19 +2295,30 @@ impl ForemanRunner {
                 if closes_with_the_same_text {
                     segments.pop();
                 }
-                // 「为什么没说完」按停机原因分（票 07）：三条非正常结束共用同一个标记
-                // （行为一样的东西不该长得像三件事），差别写在这儿。
-                let (why, error) = match stop {
+                // 「为什么没说完」与**挂哪个标记**按停机原因分（票 07 / 08）：打转那条有自己的
+                // 标记（与【未收口】同族、形状不同——裁决 9 让三种停法一眼分得开），其余共用它。
+                let (mark, why, error) = match stop {
                     Some(StopReason::Budget(used)) => (
+                        FOREMAN_PARTIAL_TURN_MARK,
                         format!(
                             "这一轮的 token 预算到了（{token_line} 生成 token，已烧 {used}），\
                              话没说完——以上是已经确定的部分。要接着查可以让我再来一轮（带上线索）。"
                         ),
                         None,
                     ),
+                    Some(StopReason::Loop(hit)) => (
+                        FOREMAN_LOOP_TURN_MARK,
+                        format!(
+                            "{}——提醒过一次仍未改道，这一轮我就停了。\
+                             以上是已经确定的部分。要接着查可以让我再来一轮（换个线索）。",
+                            hit.reason()
+                        ),
+                        None,
+                    ),
                     Some(StopReason::Failed(e)) => {
                         let reason = turn_failure_reason(&e).1;
                         (
+                            FOREMAN_PARTIAL_TURN_MARK,
                             format!(
                                 "这一轮中途断了（{reason}），话没说完——以上是已经确定的部分。\
                                  要接着查可以让我再来一轮（带上线索）。"
@@ -2261,6 +2328,7 @@ impl ForemanRunner {
                     }
                     // 轮数上限（决策 233② 的那条老路）：循环自然跑完，`stop` 为空。
                     None => (
+                        FOREMAN_PARTIAL_TURN_MARK,
                         format!(
                             "这一轮到了 {round_limit} 轮的收口上限，\
                              话没说完——以上是已经确定的部分。要接着查可以让我再来一轮（带上线索）。"
@@ -2272,15 +2340,22 @@ impl ForemanRunner {
                     round_limit,
                     token_line,
                     used = tokens.1,
-                    "值班长没能收口：部分结论落库并标注（决策 233② / 292）"
+                    "值班长没能收口：部分结论落库并标注（决策 233② / 292 / 293）"
                 );
-                (
-                    format!("{partial}\n\n{FOREMAN_PARTIAL_TURN_MARK}{why}"),
-                    error,
-                )
+                (format!("{partial}\n\n{mark}{why}"), error)
             }
             // 中途失败且**一句有内容的话都没说过**：没有东西可留，错误原样带回。
             (None, Some(StopReason::Failed(e))) => return Err(e),
+            // 打转到底**一句话都没说过**：同样没有部分结论可留（与上面那一支同姿态），
+            // 但归因要说实话——「它在原地打转」与「它一直在查台账」是两件事，指错方向
+            // 会让人去查一个不存在的毛病。
+            (None, Some(StopReason::Loop(hit))) => {
+                return Err(Error::LlmClassified {
+                    kind: "model_looping".into(),
+                    message: format!("值班长在原地打转（{}），一句话都没说就停了", hit.reason()),
+                    raw: format!("循环检测命中：{}", hit.reason()),
+                });
+            }
             (None, _) => {
                 // 归因**走 `LlmClassified` 的 kind 机制**而不是新造一种错误（票 04）：
                 // 这两条是模型行为，不是内部故障，而「哪一类」正是排查要的入口。

@@ -19,10 +19,11 @@ use agentpipeline_core::metrics;
 use agentpipeline_core::pipeline::foreman::{
     build_briefing, foreman_turn_in_flight, parse_attribution, situation_fingerprint, trim_history,
     Attribution, AttributionKind, ForemanRunner, ForemanSegment, COMPACTION_MARK,
-    FOREMAN_AGENT_TYPE, FOREMAN_ATTRIBUTION_MARK, FOREMAN_FAILED_TURN_MARK, FOREMAN_MAX_ROUNDS,
-    FOREMAN_NO_ACTION_MARK, FOREMAN_PARTIAL_TURN_MARK, FOREMAN_PERSONA, FOREMAN_STAGE_KEY,
-    FOREMAN_TALK_DIGEST_MARK, FOREMAN_TOOL_SPECS, FOREMAN_WATCH_DIGEST_MARK,
-    FOREMAN_WATCH_FAILED_TURN_MARK, FOREMAN_WATCH_MARK, OPERATION_LOG_MARK,
+    FOREMAN_AGENT_TYPE, FOREMAN_ATTRIBUTION_MARK, FOREMAN_FAILED_TURN_MARK,
+    FOREMAN_LOOP_REMINDER_MARK, FOREMAN_LOOP_TURN_MARK, FOREMAN_MAX_ROUNDS, FOREMAN_NO_ACTION_MARK,
+    FOREMAN_PARTIAL_TURN_MARK, FOREMAN_PERSONA, FOREMAN_STAGE_KEY, FOREMAN_TALK_DIGEST_MARK,
+    FOREMAN_TOOL_SPECS, FOREMAN_WATCH_DIGEST_MARK, FOREMAN_WATCH_FAILED_TURN_MARK,
+    FOREMAN_WATCH_MARK, OPERATION_LOG_MARK,
 };
 use agentpipeline_core::sse::{SseEvent, SseEventType, ToolPhase};
 use agentpipeline_core::storage::foreman::{
@@ -985,18 +986,23 @@ async fn a_silent_model_is_recorded_with_its_own_kind() {
 
 /// 轮数耗尽与空回话是**两种不同的失败**（票 04 的 kind 机制）：脚本每一轮都发起工具调用，
 /// 模型一直在查台账、从不收口——到上限必须有人喊停，否则它会烧 token 直到 HTTP 超时
-/// （决策 182④）。这正是 2026-09-18 那两轮的形状（决策 224）。
+/// （决策 182④）。
 ///
 /// 脚本按常量声明而不是写死轮数：本用例钉的是「耗尽就报这一类别、并且落一条可归因的账、
 /// 模型确实被叫了整整数轮」，不是「上限恰好是几」——那个数没有用例值得钉。
+///
+/// **每一轮查的是另一个 id**（`read_task` 对不存在的 id 回一句带 id 的「台账里没有任务…」），
+/// 于是调用与结果都各不相同：这个用例要的是「叫满整整数轮」那条路，而「同一个调用重复」
+/// 那条路已由票 08 的循环检测提前拦下（`a_repeating_tool_call_is_reminded_once_then_closed_out`）
+/// ——从前两者共用同一份「一查到底」的脚本，加了检测之后必须分开。
 #[tokio::test]
 async fn a_foreman_that_never_wraps_up_is_capped_and_named() {
     let h = Harness::empty().await;
     let mut script = Script::new();
-    for _ in 0..FOREMAN_MAX_ROUNDS {
+    for i in 0..FOREMAN_MAX_ROUNDS {
         script
             .for_foreman()
-            .tool("read_task", serde_json::json!({"task_id": "t1"}));
+            .tool("read_task", serde_json::json!({"task_id": format!("t{i}")}));
     }
     let agent = FakeAgent::new(script);
     let runner = h.runner(agent.clone());
@@ -5460,12 +5466,17 @@ async fn a_capped_turn_keeps_what_it_already_established() {
 }
 
 /// 一句话都没说过的触顶**仍旧按失败处置**（没有东西可留，报错才是诚实的）。
+///
+/// 同 [`a_foreman_that_never_wraps_up_is_capped_and_named`]：脚本每轮查另一个 id，
+/// 好让这个用例落在**轮数上限**那条路上（同参重复那条已由票 08 提前拦下）。
 #[tokio::test]
 async fn a_capped_turn_with_nothing_to_keep_is_still_a_failure() {
     let h = Harness::empty().await;
     let mut script = Script::new();
-    for _ in 0..FOREMAN_MAX_ROUNDS {
-        script.for_foreman().read_task("t1");
+    for i in 0..FOREMAN_MAX_ROUNDS {
+        script
+            .for_foreman()
+            .tool("read_task", serde_json::json!({"task_id": format!("t{i}")}));
     }
     let runner = h.runner(FakeAgent::new(script));
     let sid = h.session().await;
@@ -5679,6 +5690,116 @@ async fn a_mid_turn_failure_keeps_what_was_already_said() {
             .iter()
             .any(|m| m.role == "system" && m.content.contains("llm_idle_timeout")),
         "失败账照旧：{stored:?}"
+    );
+}
+
+/// 一直重复**同一个调用**、从不收口的替身（票 08 的循环检测用例）。
+///
+/// 与 [`TalkyThenStop`] 的差别是参数固定：每次都发 `read_task {"task_id":"t1"}`——工具结果
+/// 逐字相同，于是「同参重复」与「读不到新东西」两条判据都指着它。
+/// 它另外把每次请求里那几条**带标记的 user 轮**记下来：提醒必须进模型上下文才算拦得住，
+/// 而提醒本身不落库（不往值班经理的时间线上塞一句他没说过的话）——这是它唯一的可观测面。
+struct LoopingForever {
+    calls: Arc<std::sync::atomic::AtomicUsize>,
+    /// 第 n 次调用收到的请求里，带 [`FOREMAN_LOOP_REMINDER_MARK`] 的条目（按调用顺序）。
+    reminders: Arc<std::sync::Mutex<Vec<Vec<String>>>>,
+}
+
+impl LlmClient for LoopingForever {
+    fn complete(
+        &self,
+        request: LlmRequest,
+    ) -> futures::future::BoxFuture<'static, agentpipeline_core::Result<AgentResponse>> {
+        let n = self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
+        let seen = request
+            .messages
+            .iter()
+            .filter(|m| m.role == agentpipeline_core::agent::client::Role::User)
+            .filter_map(|m| m.content.as_deref())
+            .filter(|c| c.contains(FOREMAN_LOOP_REMINDER_MARK))
+            .map(str::to_string)
+            .collect();
+        self.reminders.lock().unwrap().push(seen);
+        Box::pin(async move {
+            Ok(AgentResponse {
+                content: Some(format!("（第 {n} 步）我先看看 t1。")),
+                tool_calls: vec![agentpipeline_core::agent::client::ToolCall {
+                    id: format!("c{n}"),
+                    name: "read_task".into(),
+                    arguments: r#"{"task_id":"t1"}"#.into(),
+                }],
+                prompt_tokens: 10,
+                completion_tokens: 5,
+                ..Default::default()
+            })
+        })
+    }
+}
+
+/// 循环检测（决策 293 / 票 08）：同一个调用连着做 → **提醒一次**（进模型上下文）→
+/// 还在做 → 强制收口，落库那一行挂 `【未收口·在打转】` 且写清为什么。
+#[tokio::test]
+async fn a_repeating_tool_call_is_reminded_once_then_closed_out() {
+    let h = Harness::seeded().await;
+    let sid = h.session().await;
+    let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let reminders = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let runner = h.runner_with_llm(Arc::new(LoopingForever {
+        calls: calls.clone(),
+        reminders: reminders.clone(),
+    }) as Arc<dyn LlmClient>);
+
+    let turn = runner.say(Some(&sid), "盯着 t1").await.unwrap();
+
+    // ① 提醒那一次之后**再犯两次**才收口：3 次触发提醒 → 提醒之后又攒 3 次。
+    //    若判据坏掉（比如窗口没在提醒处重置），这里会一路跑到轮数上限。
+    assert_eq!(
+        calls.load(std::sync::atomic::Ordering::SeqCst),
+        6,
+        "第 3 次触发提醒、第 6 次强制收口——提醒之后同样只给两次机会"
+    );
+    // ② 提醒**进过模型上下文**（不落库，故这是它唯一的证据）；且只进过一次。
+    let seen = reminders.lock().unwrap().clone();
+    assert!(
+        seen[..3].iter().all(|r| r.is_empty()),
+        "第 3 次调用之前不该有提醒：{seen:?}"
+    );
+    assert_eq!(
+        seen.iter().filter(|r| !r.is_empty()).count(),
+        3,
+        "提醒从那之后一直在上下文里（第 4/5/6 次调用各带一份）：{seen:?}"
+    );
+    assert_eq!(
+        seen[5].len(),
+        1,
+        "同一份提醒不重复注入（转录里只该有一条）：{seen:?}"
+    );
+    // ③ 收口：部分结论 + 打转的标记 + 为什么（说的是哪件事，不是一个笼统的「出错」）。
+    assert!(
+        turn.reply.contains(FOREMAN_LOOP_TURN_MARK)
+            && turn
+                .reply
+                .contains("同一个调用（read_task + 同一份参数）连着做了 3 次")
+            && turn.reply.contains("（第 6 步）我先看看 t1。"),
+        "收口要带标记、原因与已确定的部分：{}",
+        turn.reply
+    );
+    let stored = h.store.list_foreman_messages(&sid, 10).await.unwrap();
+    let closed = stored
+        .iter()
+        .find(|m| m.role == "assistant")
+        .unwrap_or_else(|| panic!("收口那一行要落库：{stored:?}"));
+    assert!(
+        closed.content.contains(FOREMAN_LOOP_TURN_MARK),
+        "落库那一行带打转的标记：{}",
+        closed.content
+    );
+    // ④ 收口不是失败：没有失败账（打转是模型行为，被拦下来了就是要它停，不是这一轮坏了）。
+    assert!(
+        !stored
+            .iter()
+            .any(|m| m.role == "system" && m.content.contains("没跑起来")),
+        "打转收口不该落一条失败账：{stored:?}"
     );
 }
 

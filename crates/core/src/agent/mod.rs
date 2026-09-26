@@ -7,6 +7,7 @@ pub mod degeneration;
 pub mod egress;
 pub mod factory;
 pub mod file_policy;
+pub mod loops;
 pub mod metadata;
 pub mod prompts;
 pub mod providers;
