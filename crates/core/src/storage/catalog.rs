@@ -90,6 +90,8 @@ struct StageConfigRow {
     env_mode: Option<String>,
     /// 值班长一轮的轮数上限（决策 233① / 239）。可空 = 没配过。
     max_rounds: Option<i64>,
+    /// 值班长一轮的生成 token 预算（决策 292 / 票 07）。可空 = 没配过。
+    watch_token_budget: Option<i64>,
     updated_at: String,
 }
 
@@ -124,6 +126,9 @@ impl StageConfigRow {
             // **`0` 照原样带出去**——它不许被静默当成缺省：`validate_startup` 要拿它拒绝启动
             // （决策 239：`0` 既不是「无上限」，也不是「没配过」）。
             max_rounds: self.max_rounds.and_then(|v| u32::try_from(v).ok()),
+            // 与 `max_rounds` 同一条口径：负数当「没配过」，**`0` 照原样带出去**让
+            // `validate_startup` 拒绝启动（决策 292：`0` 既不是「无预算」也不是「没配过」）。
+            watch_token_budget: self.watch_token_budget.and_then(|v| u32::try_from(v).ok()),
             updated_at: parse_ts(&self.updated_at)?,
         })
     }
@@ -392,8 +397,8 @@ impl Store {
             "INSERT INTO stage_configs
              (stage, provider_id, temperature, max_tokens, persona_path, persona_append,
               tools_json, skills_json, idle_timeout_sec, max_duration_sec, node_overrides_json,
-              env_mode, max_rounds, updated_at)
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+              env_mode, max_rounds, watch_token_budget, updated_at)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
              ON CONFLICT(stage) DO UPDATE SET
                  provider_id = excluded.provider_id, temperature = excluded.temperature,
                  max_tokens = excluded.max_tokens, persona_path = excluded.persona_path,
@@ -403,6 +408,7 @@ impl Store {
                  node_overrides_json = excluded.node_overrides_json,
                  env_mode = excluded.env_mode,
                  max_rounds = excluded.max_rounds,
+                 watch_token_budget = excluded.watch_token_budget,
                  updated_at = excluded.updated_at",
         )
         .bind(&cfg.stage)
@@ -418,6 +424,7 @@ impl Store {
         .bind(cfg.node_overrides_json.as_ref().map(|v| v.to_string()))
         .bind(cfg.env_mode.map(|m| m.as_str()))
         .bind(cfg.max_rounds.map(|v| v as i64))
+        .bind(cfg.watch_token_budget.map(|v| v as i64))
         .bind(ts(self.now()))
         .execute(self.pool())
         .await?;
@@ -428,7 +435,7 @@ impl Store {
         let rows: Vec<StageConfigRow> = sqlx::query_as(
             "SELECT stage, provider_id, temperature, max_tokens, persona_path, persona_append,
                     tools_json, skills_json, idle_timeout_sec, max_duration_sec,
-                    node_overrides_json, env_mode, max_rounds, updated_at
+                    node_overrides_json, env_mode, max_rounds, watch_token_budget, updated_at
              FROM stage_configs ORDER BY stage",
         )
         .fetch_all(self.pool())

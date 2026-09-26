@@ -257,6 +257,13 @@
         <span>max_rounds</span>
         <input class="input mono" type="number" min="1" bind:value={draft.max_rounds} />
       </label>
+      <!-- 值守轮的生成 token 预算（决策 292 / 票 07）：与上面同一条纪律（只对 foreman 行
+           有意义、只收正整数、留空即缺省），差别在语义——**只对值守轮是硬界**；
+           人的那一轮没有硬界（终点由人定），同一条线在那里只落一条软告警。 -->
+      <label class="field">
+        <span>watch_token_budget</span>
+        <input class="input mono" type="number" min="1" bind:value={draft.watch_token_budget} />
+      </label>
     {/if}
 
     <label class="field wide">

@@ -1112,6 +1112,7 @@ mod tests {
             node_overrides_json: None,
             env_mode: None,
             max_rounds: None,
+            watch_token_budget: None,
             updated_at: Utc::now(),
         }
     }

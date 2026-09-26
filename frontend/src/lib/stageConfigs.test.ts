@@ -30,8 +30,10 @@ function config(overrides: Partial<StageConfig> = {}): StageConfig {
     // 环境层档位（决策 206）：缺省行里它是 null（没配过）——真实阶段的缺省 `auto`
     // 由后端的两层解析给出，不在这一行里。
     env_mode: null,
-    // 轮数上限（决策 233① / 239）：没配过是 null（缺省 300）。
+    // 轮数上限（决策 233① / 239）：没配过是 null（用后端那份缺省）。
     max_rounds: null,
+    // token 预算（决策 292 / 票 07）：没配过是 null（缺省 120000）。
+    watch_token_budget: null,
     updated_at: '2026-09-12T00:00:00Z',
     ...overrides,
   };
@@ -367,5 +369,41 @@ describe('max_rounds（票 06）', () => {
   it('预填把库里的值读回来', () => {
     const draft = draftFromStageConfig(config({ stage: 'foreman', max_rounds: 300 }));
     expect(draft.max_rounds).toBe('300');
+  });
+});
+
+/**
+ * token 预算（决策 292 / 票 07）：与轮数上限同一姿态（只收正整数、留空即省略），
+ * 但语义不同——它**只对值守轮是硬界**，人的那一轮在同一条线上只落一条软告警。
+ * 界面这一层挡的同样是**人**：0 / 负数在按下之前就该看见原因。
+ */
+describe('watch_token_budget（票 07）', () => {
+  it('正整数写进 payload', () => {
+    const draft = { ...emptyStageConfigDraft('foreman'), watch_token_budget: '120000' };
+    const built = buildStageConfigPut(draft);
+    expect(built.ok).toBe(true);
+    if (built.ok) expect(built.payload.watch_token_budget).toBe(120000);
+  });
+
+  it('留空 = 省略（整条替换的既有语义：回到后端那份缺省）', () => {
+    const built = buildStageConfigPut(emptyStageConfigDraft('foreman'));
+    expect(built.ok).toBe(true);
+    if (built.ok) expect('watch_token_budget' in built.payload).toBe(false);
+  });
+
+  it('0 与负数被拒：没有「无预算」这一档', () => {
+    for (const bad of ['0', '-1000']) {
+      const built = buildStageConfigPut({
+        ...emptyStageConfigDraft('foreman'),
+        watch_token_budget: bad,
+      });
+      expect(built.ok).toBe(false);
+      if (!built.ok) expect(built.error).toContain('正整数');
+    }
+  });
+
+  it('预填把库里的值读回来', () => {
+    const draft = draftFromStageConfig(config({ stage: 'foreman', watch_token_budget: 80000 }));
+    expect(draft.watch_token_budget).toBe('80000');
   });
 });

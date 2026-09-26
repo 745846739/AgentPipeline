@@ -628,6 +628,12 @@ export interface StageConfig {
    * 只收正整数——`0` 与「无上限」都不存在（后端会拒 400）。只对 `foreman` 那一行有意义。
    */
   max_rounds: number | null;
+  /**
+   * 值班长一轮的生成 token 预算（决策 292 / 票 07）：`null` = 没配过（缺省 120000）。
+   * **只对值守轮是硬界**（人的那一轮只落软告警）；只收正整数——`0` 与「无预算」都不存在
+   * （后端会拒 400）。只对 `foreman` 那一行有意义。
+   */
+  watch_token_budget: number | null;
   updated_at: string;
 }
 
@@ -657,6 +663,7 @@ export interface StageConfigPutPayload {
   node_overrides_json?: unknown;
   env_mode?: EnvMode;
   max_rounds?: number;
+  watch_token_budget?: number;
 }
 
 /* ─────────────── server-info（crates/app/src/routes/server_info.rs，决策 167）─────────────── */

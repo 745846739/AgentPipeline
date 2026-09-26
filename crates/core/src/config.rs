@@ -1275,13 +1275,25 @@ pub fn validate_startup(inputs: &StartupInputs) -> Result<StartupReport> {
         // 写入路径（`PUT /stage-configs` / 值班长的 `config set`）已经按这条拒过，这里管的是
         // **存量**（手工改库、老版本写下的值）：与 `tools_json` 的未知名字同一姿态——
         // 启动即报错并说清怎么改，**不静默放行、也不自动清理**（静默把 0 当成缺省，等于让
-        // 「配了个无效值」这件事永远不被发现）。`None` = 没配过 = 用缺省 300，那是合法的。
+        // 「配了个无效值」这件事永远不被发现）。`None` = 没配过 = 用缺省
+        // `FOREMAN_MAX_ROUNDS`，那是合法的。
         if cfg.max_rounds == Some(0) {
             return Err(Error::Config(format!(
                 "阶段 {} 的 max_rounds 必须是正整数（当前是 0）：它管「一轮里能跑几次模型调用」，\
                  缺省 {}。要恢复缺省就删掉这一格（或整条阶段配置），**没有「无上限」这一档**。",
                 cfg.stage,
                 crate::pipeline::foreman::FOREMAN_MAX_ROUNDS,
+            )));
+        }
+        // `watch_token_budget` 与它同一条纪律（决策 292 / 票 07）：只收正整数，`0` 拒。
+        // 「无预算」不由 `0` 表达——`None`（没配过）已经表达了「用缺省」。
+        if cfg.watch_token_budget == Some(0) {
+            return Err(Error::Config(format!(
+                "阶段 {} 的 watch_token_budget 必须是正整数（当前是 0）：它管「值守轮一轮能生成\
+                 多少 token」，缺省 {}。要恢复缺省就删掉这一格（或整条阶段配置），\
+                 **没有「无预算」这一档**。",
+                cfg.stage,
+                crate::pipeline::foreman::FOREMAN_WATCH_TOKEN_BUDGET,
             )));
         }
         // §10.6.4：persona「必须存在且非空」在启动时校验（运行时 resolve_stage_persona
@@ -2411,6 +2423,31 @@ mod tests {
         assert!(err.contains("正整数"), "{err}");
         assert!(
             err.contains(&crate::pipeline::foreman::FOREMAN_MAX_ROUNDS.to_string()),
+            "{err}"
+        );
+    }
+
+    /// 与上一条同一姿态（决策 292 / 票 07）：`watch_token_budget` 的存量 `0` 也拒绝启动——
+    /// 「无预算」不由 `0` 表达（`None` = 没配过已经表达了「用缺省」）。
+    #[test]
+    fn a_stored_zero_watch_token_budget_fails_startup_validation() {
+        let cfg = |watch_token_budget: Option<u32>| StartupInputs {
+            stage_configs: vec![StageConfig {
+                stage: crate::pipeline::foreman::FOREMAN_STAGE_KEY.into(),
+                watch_token_budget,
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        // 没配过 / 正整数都能启动
+        validate_startup(&cfg(None)).unwrap();
+        validate_startup(&cfg(Some(1))).unwrap();
+        // 0 拒，且报文说清取值面与缺省值
+        let err = validate_startup(&cfg(Some(0))).unwrap_err().to_string();
+        assert!(err.contains("watch_token_budget"), "{err}");
+        assert!(err.contains("正整数"), "{err}");
+        assert!(
+            err.contains(&crate::pipeline::foreman::FOREMAN_WATCH_TOKEN_BUDGET.to_string()),
             "{err}"
         );
     }

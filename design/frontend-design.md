@@ -855,3 +855,4 @@ GET /tasks/{id}               → 详情页装载 + 断线重连后的全量校�
 落地后补**——按本表第 5 条的规矩，位置必须现在就在磁盘上，而这两条的行为现在**还没有落点**。
 同一条规矩下，决策 215 的「详情页 / 对讲台中间档折行 + hero 轨道容器内横滚」也还没有行
 （那两格是票 18 / 19），**已经落地的状态行档位在上面**。
+| 值守轮的**成本线**那一格（`watch_token_budget`）：只对 `foreman` 那一行摆出来——与 `max_rounds` 同一处、同一姿态（只收正整数，留空即缺省），语义不同：它**只对值守轮是硬界**，人的那一轮没有硬界（同一条线只落一条软告警，落在该轮台账上） | `frontend/src/components/settings/StageConfigForm.svelte`、`frontend/src/lib/stageConfigs.ts`、`frontend/src/api/types.ts` | 决策 292（票 foreman-unbounded 07）；留空即省略 / 0 与负数在按下之前被拒由 `stageConfigs.test.ts` 钉住 |

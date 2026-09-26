@@ -426,7 +426,7 @@ pub const FOREMAN_TOOL_SPECS: [ForemanToolSpec; 24] = [
                       留空的字段会被清成默认——这是整条替换不是局部修改）、\
                       `delete`（删掉这个阶段的覆盖行，回到系统默认，要 stage）。\
                       要值班经理按键确认。",
-        parameters: r#"{"type":"object","properties":{"action":{"type":"string","enum":["set","delete"],"description":"set 或 delete"},"stage":{"type":"string","description":"阶段键（如 develop / review / foreman）"},"provider_id":{"type":"string","description":"set：用哪个 provider"},"temperature":{"type":"number","description":"set：采样温度"},"max_tokens":{"type":"integer","description":"set：输出上限"},"persona_path":{"type":"string","description":"set：人格文件路径"},"persona_append":{"type":"string","description":"set：追加指令"},"env_mode":{"type":"string","enum":["auto","ask","deny"],"description":"set：环境层权限档位"},"tools_json":{"description":"set：工具声明（与界面那个框同形）"},"skills_json":{"description":"set：技能声明（与界面那个框同形）"},"node_overrides_json":{"description":"set：节点级覆盖（与界面那个框同形）"},"idle_timeout_sec":{"type":"integer","description":"set：空闲超时"},"max_duration_sec":{"type":"integer","description":"set：最长时长"},"max_rounds":{"type":"integer","description":"set：只对 foreman 行有意义——一轮里最多几次模型调用，**正整数**（缺省 300；0 / 负数会被拒，没有「无上限」）"}},"required":["action","stage"]}"#,
+        parameters: r#"{"type":"object","properties":{"action":{"type":"string","enum":["set","delete"],"description":"set 或 delete"},"stage":{"type":"string","description":"阶段键（如 develop / review / foreman）"},"provider_id":{"type":"string","description":"set：用哪个 provider"},"temperature":{"type":"number","description":"set：采样温度"},"max_tokens":{"type":"integer","description":"set：输出上限"},"persona_path":{"type":"string","description":"set：人格文件路径"},"persona_append":{"type":"string","description":"set：追加指令"},"env_mode":{"type":"string","enum":["auto","ask","deny"],"description":"set：环境层权限档位"},"tools_json":{"description":"set：工具声明（与界面那个框同形）"},"skills_json":{"description":"set：技能声明（与界面那个框同形）"},"node_overrides_json":{"description":"set：节点级覆盖（与界面那个框同形）"},"idle_timeout_sec":{"type":"integer","description":"set：空闲超时"},"max_duration_sec":{"type":"integer","description":"set：最长时长"},"max_rounds":{"type":"integer","description":"set：只对 foreman 行有意义——一轮里最多几次模型调用，**正整数**（0 / 负数会被拒，没有「无上限」）"},"watch_token_budget":{"type":"integer","description":"set：只对 foreman 行有意义——值守轮一轮的生成 token 预算，**正整数**（缺省 120000；0 / 负数会被拒，没有「无预算」这一档）"}},"required":["action","stage"]}"#,
     },
     ForemanToolSpec {
         name: "skills",
@@ -646,23 +646,36 @@ pub const FOREMAN_WATCH_TOOL_DENY: [&str; 4] =
 /// 事件都塞进一次简报」的粗兜底。超出的部分留在表里，下一轮（或被追问时）再处理。
 const FOREMAN_ATTENTION_FETCH_LIMIT: usize = 50;
 
-/// 单次回话的工具往返轮数**缺省值**（决策 182④，8 → 30 由决策 224，30 → 300 由决策 233①/239）。
+/// 单次回话的工具往返轮数**缺省值**（决策 182④，8 → 30 由决策 224，30 → 300 由决策 233①/239，
+/// 300 → 1000 由决策 292 / 票 07）。
 ///
 /// 正常靠「模型不再发起 tool_call」自然结束；这个上限是防御性的——模型若陷入
-/// 「查一个任务 → 再查一个」的循环，必须有人喊停，否则会持续烧 token 直到 HTTP 超时。
+/// 「查一个任务 → 再查一个」的循环，必须有人喊停。
 ///
 /// **现在它是「缺省」而不是「唯一取值」**（决策 233① / 239）：真正生效的数住在
 /// `stage_configs` 的 `foreman` 行（`max_rounds`，只收正整数，见 `Store::upsert_stage_config`
 /// 的写入校验与 `validate_startup`），这一份是没配过时的缺省。
 ///
-/// 取值 300 的来历（决策 233①）：本轮实测里同一类问题用满 30 轮仍未收口 → `model_no_reply`、
-/// HTTP 500、**回话一条没落库**，而那 30 轮其实查到了东西。300 是「有人喊停」的兜底而**不是
-/// 预算目标**；它兜的那笔账由「触顶时部分结论落库 + 标注」（决策 233②）接着。
+/// **抬到 1000 的来历**（决策 292 / 票 07）：真正的成本界是 token 预算（值守轮 120k 硬界、
+/// 人的那一轮只落软告警），轮数退为**兜底**——而它要兜的是「模型行为失控」，那件事在
+/// 300 上会被一次正常的深查误伤（实测里 24 次调用就有一次被别的界砍掉，那时它还在干活）。
+/// 数量级上 1000 轮 × 每轮千级 token 已远超任何一条 token 预算，故它够不着正常路径，
+/// 只在预算管不到的地方（人的那一轮没有硬界）当最后一道闸；人真正的停法是票 09 那颗钮。
 ///
 /// **它不管时间也不管 token**：整轮墙钟已撤（决策 288 / 票 05，兑现决策 233 如实记 (i)），
-/// 单次调用的界是流上的空闲判死（foreman 行的 `idle_timeout_sec`）；整轮的预算界归票 07
-/// 的 token 分档。轮数上限退为模型行为失控时的最后一道兜底。
-pub const FOREMAN_MAX_ROUNDS: usize = 300;
+/// 单次调用的界是流上的空闲判死（foreman 行的 `idle_timeout_sec`）；整轮的预算界是
+/// [`FOREMAN_WATCH_TOKEN_BUDGET`] 那条 token 分档（决策 292）。
+pub const FOREMAN_MAX_ROUNDS: usize = 1000;
+
+/// 值班长一轮的**生成 token 预算**缺省值（决策 292 / 票 07）：**只对值守轮是硬界**。
+///
+/// 取值 120k 的来历（票面）：2026-09-26 那次实测一轮烧了 85,135 生成 token，120k 是它的
+/// 约 1.4 倍——按同一批实测的 ~45 token/s 折算约 45 分钟，足够一次夜巡把该查的查完，
+/// 又能在真失控时（重复查同一件事）及时收口。
+///
+/// **分档**（裁决 7）：人的那一轮**无硬界**——终点由人决定（人在看着本身就是那道界，
+/// 票 09 的停钮是它的动作面）；同一条线在人的那一轮上只落一条**软告警**（只落账不拦）。
+pub const FOREMAN_WATCH_TOKEN_BUDGET: u32 = 120_000;
 
 /// 值班长回话完成通知（决策 272③）的**门**：`say` 轮至少动过这么多次工具，才算
 /// 「干了一轮活」、才叫通知出口。判据是这一轮自己的产出（`traces.len()`），收口处
@@ -674,10 +687,25 @@ pub const FOREMAN_MAX_ROUNDS: usize = 300;
 /// ——短轮连 `foreman_reply` 的 cooldown 槽都不碰（cooldown 倒挂的坑）。
 pub const FOREMAN_REPLY_MIN_TOOL_CALLS: usize = 3;
 
-/// 触到轮数上限时那一段的标记（决策 233②）：**部分结论落库并标注**。
+/// 这一轮**为什么没能正常收口**（决策 292 / 票 07）。
+///
+/// 它只管「触顶」与「中途失败」两类——轮数上限那一类由循环自然跑完表达（`stop` 为空，
+/// 决策 233② 那条最老的路）。三条非正常结束共用同一条收口路径，差别写在这里。
+#[derive(Debug)]
+enum StopReason {
+    /// 成本门（值守轮）：生成 token 到了预算线。带的是**触发那一刻的累计值**（标注里要写它）。
+    Budget(u32),
+    /// 中途失败（空闲判死 / 超长 / 取消 / 内部错误）：错误原样带回外框做失败记账。
+    Failed(Error),
+}
+
+/// 触到上限时那一段的标记（决策 233② / 292）：**部分结论落库并标注**。
 ///
 /// 它必须看得见：一则让值班经理知道「这不是结论而是没说完」，二则让下一轮（或下一班）
 /// 读历史时知道那一段是半成品——把半成品当结论用，正是这一批要修的那类失真。
+///
+/// 决策 292 起它不再只挂「轮数上限」那一支：**所有非正常结束**（触顶 / 中途失败 / 取消）
+/// 都走同一条收口路径带上它（行为一样的几个理由共用同一个标记；「为什么」写在标记之后）。
 pub const FOREMAN_PARTIAL_TURN_MARK: &str = "【未收口】";
 
 /// 历史窗口的字符预算（决策 182⑫）。
@@ -1813,6 +1841,21 @@ impl ForemanRunner {
             .unwrap_or(FOREMAN_MAX_ROUNDS)
     }
 
+    /// 这一轮的**成本线**（决策 292 / 票 07）：`stage_configs` 的 `foreman` 行配了就用它，
+    /// 没配过用缺省 [`FOREMAN_WATCH_TOKEN_BUDGET`]。
+    ///
+    /// 它是**生成 token** 的线（不是 prompt token）：一轮的真实成本 = 生成 token ÷ provider
+    /// 吞吐（2026-09-26 实测三个链都稳定在 ~45 token/s，与上下文大小无关），故「能烧多少」
+    /// 由它量。分档在调用点：值守轮触顶即停，人的那一轮只落一条软告警。
+    ///
+    /// 解析**只有这一处**——写入路径只收正整数，读回来 `None` = 没配过（`0` / 负数在
+    /// `StageConfigRow::into_config` 里已被挡在门外，`validate_startup` 对存量里的 `0`
+    /// 直接拒绝启动）。
+    fn token_budget(&self, cfg: Option<&crate::types::StageConfig>) -> u32 {
+        cfg.and_then(|c| c.watch_token_budget)
+            .unwrap_or(FOREMAN_WATCH_TOKEN_BUDGET)
+    }
+
     /// 一轮回话的**内里**（现场由 [`Self::say`] / [`Self::watch`] 的外框记账，
     /// 时限由 [`Self::respond`] 给）。
     async fn respond_inner(
@@ -1975,6 +2018,13 @@ impl ForemanRunner {
         // 分开记——`reply` 只在「这一轮收口了」时赋值。
         let mut last_text: Option<String> = None;
         let round_limit = self.round_limit(cfg.as_ref());
+        // 成本线（决策 292 / 票 07）：值守轮触顶即停（下面 `break` 走收口路径），
+        // 人的那一轮只在这条线上落一条软告警（`cost_warned`，收口时附在该轮台账上）。
+        let token_line = self.token_budget(cfg.as_ref());
+        let mut cost_warned = false;
+        // 这一轮**为什么出循环**（票 07）：`None` = 正常收口（模型自己说完了）或轮数触顶
+        // （那一条的文案在下面现成拼，见 `reply` 的收口）。
+        let mut stop: Option<StopReason> = None;
         // 逐调用空闲界（决策 288 / 票 05）：foreman 行的 `idle_timeout_sec` > 全局
         // `node_idle_timeout_sec`（缺省 300s，与节点同一个数）。每一次模型调用各带一份
         // ——「N 秒没有新字节」判的是单次调用，不是整轮。
@@ -2001,6 +2051,17 @@ impl ForemanRunner {
                 &user_prompt,
                 capacity,
             );
+            // 成本门（决策 292 / 票 07）：每次调用前查一次——与上面那条窗口门同一位置，
+            // 故「已经不划算的下一轮」根本不会发出去。**分档**：值守轮触顶即停（出循环走
+            // 收口路径，部分结论 + 【未收口】）；人的那一轮无硬界（终点由人决定），
+            // 只把这条线记下来，收口时落一条软告警（只落账不拦）。
+            if tokens.1 >= token_line {
+                if input.is_watch() {
+                    stop = Some(StopReason::Budget(tokens.1));
+                    break;
+                }
+                cost_warned = true;
+            }
             let mut request = LlmRequest {
                 // 占位阶段：让既有的 provider 解析链跑通。真正生效的 provider 从
                 // `provider_id` 进来（决策 182②，与 project_analysis 同一路子）。
@@ -2036,7 +2097,8 @@ impl ForemanRunner {
                 Err(e) if is_context_window(&e) => {
                     let compacted = self.compact_inline_forced(&mut transcript, &question);
                     if compacted == 0 {
-                        return Err(e);
+                        stop = Some(StopReason::Failed(e));
+                        break;
                     }
                     tracing::warn!(
                         session = %session.id,
@@ -2044,9 +2106,21 @@ impl ForemanRunner {
                         "provider 报上下文超长：压缩本轮转录后重试这一次调用（票 06(c)）"
                     );
                     request.messages = transcript.clone();
-                    self.complete_with_retry(request).await?
+                    match self.complete_with_retry(request).await {
+                        Ok(response) => response,
+                        Err(e) => {
+                            stop = Some(StopReason::Failed(e));
+                            break;
+                        }
+                    }
                 }
-                Err(e) => return Err(e),
+                // 中途失败（决策 292 / 票 07）：**不原地把这一轮丢掉**——出循环走收口路径
+                // （有话说就带上标注落库），错误原样带去外框做失败记账（类别 / 通知 /
+                // 悬空提议作废都不变）。
+                Err(e) => {
+                    stop = Some(StopReason::Failed(e));
+                    break;
+                }
             };
             tokens.0 += response.prompt_tokens;
             tokens.1 += response.completion_tokens;
@@ -2142,9 +2216,16 @@ impl ForemanRunner {
         // 触到上限**不再整轮作废**（决策 233②）：那 30 轮其实查到了东西（实测里两条提议
         // 就是证明），把已经付过钱的结论整段扔掉是那次实测里最贵的一件事。故只要有话说，
         // 就带上标注落库；**一句话都没说过的**仍旧按失败处置（没有东西可留，报错才是诚实的）。
-        let reply = match reply {
-            Some(reply) => reply,
-            None if last_text.is_some() && empty_replies == 0 => {
+        //
+        // 决策 292 / 票 07 把这一支扩成**一条收口路径**：轮数上限 / token 预算 / 中途失败
+        // 三条非正常结束共用它（票 08 的循环、票 09 的按停接在后面）——差别只有「为什么」。
+        // 失败那一条同时把错误**原样带回**外框，失败记账（类别 / 通知 / 悬空提议作废）不变。
+        // 中途失败但有话说：**先把那一轮落库再报错**（票 07 的全部意义——不许把已经查到
+        // 的东西整段丢掉）。`stop_error` 就是原样的那个错误，由下面的 `?` 带给外框。
+        let (reply, stop_error) = match (reply, stop) {
+            // 模型自己收口了：正常那一句（预算门在它之后才可能踩线，故这里不看 `stop`）。
+            (Some(reply), _) => (reply, None),
+            (None, stop) if last_text.is_some() && empty_replies == 0 => {
                 let partial = last_text.unwrap_or_default();
                 // 这段文字此前已作为 `Text` 段落进过段序（它正是随工具调用一起说出口的
                 // 「中途的话」，决策 233②），而现在它被拼成**收口的那一句**落进 `content`
@@ -2158,16 +2239,49 @@ impl ForemanRunner {
                 if closes_with_the_same_text {
                     segments.pop();
                 }
+                // 「为什么没说完」按停机原因分（票 07）：三条非正常结束共用同一个标记
+                // （行为一样的东西不该长得像三件事），差别写在这儿。
+                let (why, error) = match stop {
+                    Some(StopReason::Budget(used)) => (
+                        format!(
+                            "这一轮的 token 预算到了（{token_line} 生成 token，已烧 {used}），\
+                             话没说完——以上是已经确定的部分。要接着查可以让我再来一轮（带上线索）。"
+                        ),
+                        None,
+                    ),
+                    Some(StopReason::Failed(e)) => {
+                        let reason = turn_failure_reason(&e).1;
+                        (
+                            format!(
+                                "这一轮中途断了（{reason}），话没说完——以上是已经确定的部分。\
+                                 要接着查可以让我再来一轮（带上线索）。"
+                            ),
+                            Some(e),
+                        )
+                    }
+                    // 轮数上限（决策 233② 的那条老路）：循环自然跑完，`stop` 为空。
+                    None => (
+                        format!(
+                            "这一轮到了 {round_limit} 轮的收口上限，\
+                             话没说完——以上是已经确定的部分。要接着查可以让我再来一轮（带上线索）。"
+                        ),
+                        None,
+                    ),
+                };
                 tracing::warn!(
-                    limit = round_limit,
-                    "值班长触到轮数上限：部分结论落库并标注（决策 233②）"
+                    round_limit,
+                    token_line,
+                    used = tokens.1,
+                    "值班长没能收口：部分结论落库并标注（决策 233② / 292）"
                 );
-                format!(
-                    "{partial}\n\n{FOREMAN_PARTIAL_TURN_MARK}这一轮到了 {round_limit} 轮的收口上限，\
-                     话没说完——以上是已经确定的部分。要接着查可以让我再来一轮（带上线索）。"
+                (
+                    format!("{partial}\n\n{FOREMAN_PARTIAL_TURN_MARK}{why}"),
+                    error,
                 )
             }
-            None => {
+            // 中途失败且**一句有内容的话都没说过**：没有东西可留，错误原样带回。
+            (None, Some(StopReason::Failed(e))) => return Err(e),
+            (None, _) => {
                 // 归因**走 `LlmClassified` 的 kind 机制**而不是新造一种错误（票 04）：
                 // 这两条是模型行为，不是内部故障，而「哪一类」正是排查要的入口。
                 return Err(if empty_replies > 0 {
@@ -2223,7 +2337,9 @@ impl ForemanRunner {
         //
         // 判据吃的是**剥完之后**的正文，且 `watch()` 那边按同一个 `turn.reply` 再判一次
         // （那里决定唤醒账记静默还是播报）——两处因此看的是同一个东西。
-        if input.is_watch() && reply.starts_with(FOREMAN_NO_ACTION_MARK) {
+        // 中途失败那一支**不判静默**：静默是「模型看过一圈、判定无需处理」，而这一轮是断掉的
+        // ——把它说成静默等于把失败藏起来（票 07）。
+        if input.is_watch() && stop_error.is_none() && reply.starts_with(FOREMAN_NO_ACTION_MARK) {
             tracing::info!(
                 session = %session.id,
                 reply = %reply,
@@ -2242,8 +2358,17 @@ impl ForemanRunner {
         // 播报的标记由**后端**加上（不由模型自己说）：它是「这一轮不是回话」这个事实的载体，
         // 前端靠它把主动播报与回话分开渲染，模型不该有机会说错。`reply` 已在上面剥过一遍，
         // 故这里加的是**唯一**那一个。
+        // 成本软告警（决策 292 / 票 07）：**只落账不拦**——人的那一轮无硬界（终点由人定），
+        // 但「这一轮已经烧了这么多」该被看见。落在**这一轮自己的台账行**上（不另起一条
+        // 系统消息：那会刷屏，还会挤占历史窗口），不进 `turn.reply`——通知出口发的是模型
+        // 自己说过的话，账目跟着台账走。
         let content = if input.is_watch() {
             format!("{FOREMAN_WATCH_MARK}{reply}")
+        } else if cost_warned {
+            format!(
+                "{reply}\n\n{OPERATION_LOG_MARK}这一轮已烧 {} 生成 token，过了值守轮那条预算线（{}）——人的那一轮没有硬界，继续还是停由你定。",
+                tokens.1, token_line
+            )
         } else {
             reply.clone()
         };
@@ -2269,6 +2394,11 @@ impl ForemanRunner {
             })
             .await?;
 
+        // 半份结论已经落库，中途失败的那个错误现在才带出去（票 07）：外框照旧按类别落失败账、
+        // 通知、作废这一轮提的悬空提议——两条记载各说各的，一条也不丢。
+        if let Some(error) = stop_error {
+            return Err(error);
+        }
         Ok(ForemanTurn {
             session: session.clone(),
             reply,

@@ -73,6 +73,11 @@ pub struct PutStageConfig {
     /// 接的话 `-1` 会退化成 serde 的通用 422 报文，说不出「必须是正整数」这句话。
     #[serde(default)]
     pub max_rounds: Option<i64>,
+    /// 值守轮一轮的生成 token 预算（决策 292 / 票 07）。**用 `i64` 接**：与 `max_rounds`
+    /// 同一条口径——只收正整数，用 `u32` 接的话 `-1` 会退化成 serde 的通用 422 报文，
+    /// 说不出「必须是正整数」这句话。
+    #[serde(default)]
+    pub watch_token_budget: Option<i64>,
 }
 
 /// 用「现有配置 + 待改动」跑一遍启动校验；`removed` 是本次要从集合里去掉的阶段键。
@@ -153,6 +158,21 @@ pub async fn put(
             )))
         }
     };
+    // token 预算与轮数上限同一条纪律（决策 292）：`0` / 负数都不许，也没有「无预算」——
+    // 「留空即清成默认」已经表达了「用缺省 120k」。
+    let watch_token_budget = match body.watch_token_budget {
+        None => None,
+        Some(v) if v > 0 => Some(u32::try_from(v).map_err(|_| {
+            ApiError::bad_request(format!(
+                "watch_token_budget 超出口径（收到 {v}）：它管「值守轮一轮能生成多少 token」，                 请给一个正整数"
+            ))
+        })?),
+        Some(v) => {
+            return Err(ApiError::bad_request(format!(
+                "watch_token_budget 必须是正整数（收到 {v}）：`0` / 负数都不许，也没有「无预算」这一档。                 要恢复缺省就删掉这一格。"
+            )))
+        }
+    };
     let candidate = StageConfig {
         stage: stage.clone(),
         provider_id: body.provider_id,
@@ -167,6 +187,7 @@ pub async fn put(
         node_overrides_json: body.node_overrides_json,
         env_mode,
         max_rounds,
+        watch_token_budget,
         updated_at: state.store.now(),
     };
 

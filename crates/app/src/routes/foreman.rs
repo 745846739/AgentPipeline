@@ -718,6 +718,8 @@ async fn run_config_tool(
                     // 轮数上限（决策 233① / 239）：只收正整数，越界由 `put` 那条路拒
                     // （报文与界面上写错时同一句）。
                     max_rounds: args.get("max_rounds").and_then(|v| v.as_i64()),
+                    // token 预算（决策 292 / 票 07）：同一条路、同一道门。
+                    watch_token_budget: args.get("watch_token_budget").and_then(|v| v.as_i64()),
                 }),
             )
             .await;

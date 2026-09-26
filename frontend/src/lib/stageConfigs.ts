@@ -97,6 +97,13 @@ export interface StageConfigDraft {
    * 只对 `foreman` 那一行有意义，而表单是逐阶段通用的，故它在其它阶段上只是「没填」。
    */
   max_rounds: string;
+  /**
+   * 值守轮一轮的生成 token 预算（决策 292 / 票 07）。空串 = 没配过（缺省 120000）。
+   *
+   * 与 `max_rounds` 同一条纪律（只对 `foreman` 有意义、只收正整数），差别在语义：
+   * 它**只对值守轮是硬界**——人的那一轮没有硬界，同一条线在那里只落一条软告警。
+   */
+  watch_token_budget: string;
   /** 环境层档位（决策 206）。空串 = 没配过（用全局默认 / 该阶段的缺省）。 */
   env_mode: EnvMode | '';
 }
@@ -115,6 +122,7 @@ export function emptyStageConfigDraft(stage: string = STAGE_KEYS[0]): StageConfi
     max_duration_sec: '',
     node_overrides_json: '',
     max_rounds: '',
+    watch_token_budget: '',
     env_mode: '',
   };
 }
@@ -134,6 +142,10 @@ export function draftFromStageConfig(config: StageConfig): StageConfigDraft {
     max_duration_sec: config.max_duration_sec === null ? '' : String(config.max_duration_sec),
     node_overrides_json: stringifyJson(config.node_overrides_json),
     max_rounds: config.max_rounds === null || config.max_rounds === undefined ? '' : String(config.max_rounds),
+    watch_token_budget:
+      config.watch_token_budget === null || config.watch_token_budget === undefined
+        ? ''
+        : String(config.watch_token_budget),
     env_mode: config.env_mode ?? '',
   };
 }
@@ -239,6 +251,17 @@ export function buildStageConfigPut(draft: StageConfigDraft): StageConfigPutResu
       return { ok: false, error: 'max_rounds 必须为正整数（没有「无上限」这一档）。' };
     }
     payload.max_rounds = rounds.value;
+  }
+
+  // token 预算（决策 292 / 票 07）：与轮数上限同一姿态——只收正整数，留空 = 省略
+  // （整条替换下即「清成缺省 120000」）。「无预算」这一档不存在，故 0 / 负数在按下之前挡。
+  const budget = parseOptionalNumber(draft.watch_token_budget, 'watch_token_budget', true);
+  if ('error' in budget) return { ok: false, error: budget.error };
+  if (budget.value !== undefined) {
+    if (budget.value <= 0) {
+      return { ok: false, error: 'watch_token_budget 必须为正整数（没有「无预算」这一档）。' };
+    }
+    payload.watch_token_budget = budget.value;
   }
 
   // 环境层档位（决策 206）：空串 = 不配置（留给全局默认 / 该阶段的缺省），

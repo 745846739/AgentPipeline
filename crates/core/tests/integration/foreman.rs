@@ -5478,6 +5478,210 @@ async fn a_capped_turn_with_nothing_to_keep_is_still_a_failure() {
     );
 }
 
+/// 一边查一边说、到第 `stop_after` 次调用才收口的替身（票 07 的成本门用例）。
+///
+/// 与 [`ChattyForever`] 同一姿态：票 07 要验的三条收口路径都要求**中途说过话**
+/// （`last_text` 有值），而 FakeAgent 的脚本步要么文本要么工具。这里多一格
+/// 「第几次收口」，于是「人的那一轮不触顶、会自己说完」这件事也能表达。
+struct TalkyThenStop {
+    calls: Arc<std::sync::atomic::AtomicUsize>,
+    /// 第几次调用换成纯文本收口（`None` = 一直干活）。
+    stop_after: Option<usize>,
+    /// 第几次调用**起**当场报错（`None` = 不报错；「起」而不是「那一次」——空闲判死那一类
+    /// 会被 `complete_with_retry` 重试一次，只错一次的话那一轮会照旧跑下去），类别由
+    /// `fail_kind` 给。
+    fail_at: Option<usize>,
+    fail_kind: &'static str,
+    /// 每次调用的生成 token 读数（成本门按它算）。
+    completion_tokens: u32,
+}
+
+impl LlmClient for TalkyThenStop {
+    fn complete(
+        &self,
+        _request: LlmRequest,
+    ) -> futures::future::BoxFuture<'static, agentpipeline_core::Result<AgentResponse>> {
+        let n = self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
+        let (stop_after, fail_at, fail_kind, tokens) = (
+            self.stop_after,
+            self.fail_at,
+            self.fail_kind,
+            self.completion_tokens,
+        );
+        Box::pin(async move {
+            if fail_at.is_some_and(|from| n >= from) {
+                return Err(Error::LlmClassified {
+                    kind: fail_kind.to_string(),
+                    message: "（用例）这一轮中途断了".into(),
+                    raw: "（用例）".into(),
+                });
+            }
+            Ok(AgentResponse {
+                content: Some(format!("到目前为止（第 {n} 步）：它挂在 test.execute 上。")),
+                tool_calls: if stop_after == Some(n) {
+                    Vec::new()
+                } else {
+                    vec![agentpipeline_core::agent::client::ToolCall {
+                        id: format!("c{n}"),
+                        name: "read_task".into(),
+                        arguments: r#"{"task_id":"t1"}"#.into(),
+                    }]
+                },
+                prompt_tokens: 10,
+                completion_tokens: tokens,
+                ..Default::default()
+            })
+        })
+    }
+}
+
+/// 成本门**分档**（决策 292 / 票 07）：同一条线，值守轮触顶即停（部分结论 + 【未收口】），
+/// 人的那一轮不触顶。
+#[tokio::test]
+async fn the_token_budget_stops_the_watch_round_but_never_the_human_one() {
+    // 值守轮：预算配成 20、每次 5 token → 第 5 次调用之前就被拦住。
+    let h = Harness::seeded().await;
+    h.store
+        .upsert_stage_config(&StageConfig {
+            stage: FOREMAN_STAGE_KEY.to_string(),
+            watch_token_budget: Some(20),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+    let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let runner = h.runner_with_llm(Arc::new(TalkyThenStop {
+        calls: calls.clone(),
+        stop_after: None,
+        fail_at: None,
+        fail_kind: "llm_idle_timeout",
+        completion_tokens: 5,
+    }) as Arc<dyn LlmClient>);
+    note(
+        &h,
+        "t1",
+        agentpipeline_core::storage::AttentionKind::RetryExhausted,
+    )
+    .await;
+    h.clock.advance_secs(61);
+
+    let turn = runner.watch().await.unwrap().expect("应当醒一次");
+    assert_eq!(
+        calls.load(std::sync::atomic::Ordering::SeqCst),
+        4,
+        "到线就停：4 次 × 5 token = 20，第 5 次不该发出去"
+    );
+    assert!(
+        turn.reply.contains(FOREMAN_PARTIAL_TURN_MARK) && turn.reply.contains("token 预算"),
+        "触顶要标注、且说清是预算那条线：{}",
+        turn.reply
+    );
+    let stored = h
+        .store
+        .list_foreman_messages(&turn.session.id, 10)
+        .await
+        .unwrap();
+    assert!(
+        stored
+            .iter()
+            .any(|m| m.role == "assistant" && m.content.contains(FOREMAN_PARTIAL_TURN_MARK)),
+        "半份结论要落库：{stored:?}"
+    );
+    assert!(
+        !stored
+            .iter()
+            .any(|m| m.role == "system" && m.content.contains("没跑起来")),
+        "触顶不是失败（也不该顺手把待办消费掉）：{stored:?}"
+    );
+
+    // 人的那一轮：同一条线，不拦——只落一条软告警（只落账不拦），并**自己说完**。
+    let h2 = Harness::seeded().await;
+    h2.store
+        .upsert_stage_config(&StageConfig {
+            stage: FOREMAN_STAGE_KEY.to_string(),
+            watch_token_budget: Some(20),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+    let calls2 = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let runner2 = h2.runner_with_llm(Arc::new(TalkyThenStop {
+        calls: calls2.clone(),
+        stop_after: Some(6),
+        fail_at: None,
+        fail_kind: "llm_idle_timeout",
+        completion_tokens: 5,
+    }) as Arc<dyn LlmClient>);
+    let sid = h2.session().await;
+    let turn = runner2.say(Some(&sid), "盯着 t1").await.unwrap();
+    assert_eq!(
+        calls2.load(std::sync::atomic::Ordering::SeqCst),
+        6,
+        "人的那一轮没有硬界：过了线也照跑，直到模型自己说完"
+    );
+    assert!(
+        !turn.reply.contains(FOREMAN_PARTIAL_TURN_MARK),
+        "没触顶就不标注：{}",
+        turn.reply
+    );
+    let stored = h2.store.list_foreman_messages(&sid, 10).await.unwrap();
+    let last = stored.last().unwrap();
+    assert_eq!(last.role, "assistant");
+    assert!(
+        last.content.contains("这一轮已烧 30 生成 token") && last.content.contains("没有硬界"),
+        "软告警落在该轮台账上（只落账不拦）：{}",
+        last.content
+    );
+    assert!(
+        !stored.iter().any(|m| m.role == "system"),
+        "软告警不另起系统消息（避免刷屏）：{stored:?}"
+    );
+}
+
+/// 中途失败**也要留住半份结论**（决策 292 / 票 07）：有话说就先落库再报错，
+/// 失败记账照旧（类别 + 那条系统账）。
+#[tokio::test]
+async fn a_mid_turn_failure_keeps_what_was_already_said() {
+    let h = Harness::seeded().await;
+    let sid = h.session().await;
+    let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let runner = h.runner_with_llm(Arc::new(TalkyThenStop {
+        calls: calls.clone(),
+        stop_after: None,
+        fail_at: Some(3),
+        fail_kind: "llm_idle_timeout",
+        completion_tokens: 5,
+    }) as Arc<dyn LlmClient>);
+
+    // ① 错误照旧报出来（失败记账、通知、悬空提议作废都指望它）
+    let err = runner.say(Some(&sid), "盯着 t1").await.unwrap_err();
+    assert_eq!(
+        err.llm_classified().map(|(k, _)| k.to_string()).as_deref(),
+        Some("llm_idle_timeout"),
+        "中途失败照旧带自己的类别：{err}"
+    );
+    // ② 已经说过的那半句**没有跟着错误一起丢掉**
+    let stored = h.store.list_foreman_messages(&sid, 10).await.unwrap();
+    let partial = stored
+        .iter()
+        .find(|m| m.role == "assistant")
+        .unwrap_or_else(|| panic!("半份结论要落库：{stored:?}"));
+    assert!(
+        partial.content.contains(FOREMAN_PARTIAL_TURN_MARK)
+            && partial.content.contains("它挂在 test.execute 上")
+            && partial.content.contains("中途断了"),
+        "半份结论要带标注与原因：{}",
+        partial.content
+    );
+    // ③ 失败那一行也在（两条记载各说各的，一条也不丢）
+    assert!(
+        stored
+            .iter()
+            .any(|m| m.role == "system" && m.content.contains("llm_idle_timeout")),
+        "失败账照旧：{stored:?}"
+    );
+}
+
 /// 一轮死了之后，**它那一轮提的提议随之失效**（决策 233③）。
 #[tokio::test]
 async fn a_failed_turn_invalidates_the_proposals_it_left_behind() {

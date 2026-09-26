@@ -7324,6 +7324,69 @@ async fn max_rounds_accepts_only_positive_integers() {
     assert_eq!(cleared.max_rounds, None, "留空即清成默认（缺省 300）");
 }
 
+/// token 预算只收正整数（决策 292 / 票 07）：与 `max_rounds` 同一道门——`0` / 负数当场拒，
+/// 缺省（不传）与显式清空都合法。
+#[tokio::test]
+async fn watch_token_budget_accepts_only_positive_integers() {
+    let api = api().await;
+
+    // 正面：正整数写得进去、读得回来。
+    let (status, body) = put(
+        &api,
+        "/stage-configs/foreman",
+        serde_json::json!({"watch_token_budget": 80000}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["stage_config"]["watch_token_budget"], 80000);
+    let stored = api
+        .state
+        .store
+        .get_stage_config("foreman")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(stored.watch_token_budget, Some(80000));
+
+    // `0` 与负数：拒，且报文说清「没有无预算这一档」。
+    for bad in [serde_json::json!(0), serde_json::json!(-1)] {
+        let (status, body) = put(
+            &api,
+            "/stage-configs/foreman",
+            serde_json::json!({"watch_token_budget": bad}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+        let message = body["error"].as_str().unwrap_or_default();
+        assert!(message.contains("正整数"), "{message}");
+        assert!(message.contains("无预算"), "要说清没有那一档：{message}");
+    }
+    // 被拒的两次都没改动旧值。
+    let stored = api
+        .state
+        .store
+        .get_stage_config("foreman")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(stored.watch_token_budget, Some(80000));
+
+    // 不传 = 回到缺省（整条替换的既有语义）。
+    let (status, _) = put(&api, "/stage-configs/foreman", serde_json::json!({})).await;
+    assert_eq!(status, StatusCode::OK);
+    let cleared = api
+        .state
+        .store
+        .get_stage_config("foreman")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        cleared.watch_token_budget, None,
+        "留空即清成默认（缺省 120000）"
+    );
+}
+
 // ─────────── 离线通知设置（决策 272⑥⑦⑧）───────────
 
 /// 本机 ping 桩：只答 `GET /api/v1/ping`，把收到的请求行记下来（断言 password 真被带上）。
