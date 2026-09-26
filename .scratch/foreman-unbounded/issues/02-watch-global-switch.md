@@ -4,14 +4,14 @@
 
 **Blocked by:** None（可立即开始）
 
-**Status:** ready-for-agent
+**Status:** done（已实现，决策 287）
 
-- [ ] 存储 + 读写端点 + 设置页小节：照通知通道 / 礼貌两件的先例（决策 272 / 284）——**不要只写 config.toml**，装 dmg 的机器上那个文件不在手边（284 已裁过的理由）
-- [ ] `crates/app/src/serve.rs:555` / `crates/app/src/runtime.rs:280-312`：循环按开关起停（运行中关掉 → 退出；打开 → 重新 spawn），沿用现有的 shutdown watch 通道，不新造信号
-- [ ] `config.toml` 的 `[foreman] watch_*` 五个数（debounce / cooldown / 上限等）本票只做**只读展示**，不开写口
-- [ ] 不造「跑着但不吵」这一档：通知的礼貌归 `SettingsNotify` 已有的总开关 + 礼貌两件；也不做班次级开关（裁决 3）
-- [ ] 后端测试：关掉时有 10 条待办也不起轮、打开后起轮；前端测试：设置页往返 + 保存即活
-- [ ] 四门 + 决策落号
+- [x] 存储 + 读写端点 + 设置页小节：照通知通道 / 礼貌两件的先例（决策 272 / 284）——**不要只写 config.toml**，装 dmg 的机器上那个文件不在手边（284 已裁过的理由）
+- [x] `crates/app/src/serve.rs:555` / `crates/app/src/runtime.rs:280-312`：循环按开关起停（运行中关掉 → 退出；打开 → 重新 spawn），沿用现有的 shutdown watch 通道，不新造信号
+- [x] `config.toml` 的 `[foreman] watch_*` 五个数（debounce / cooldown / 上限等）本票只做**只读展示**，不开写口
+- [x] 不造「跑着但不吵」这一档：通知的礼貌归 `SettingsNotify` 已有的总开关 + 礼貌两件；也不做班次级开关（裁决 3）
+- [x] 后端测试：关掉时有 10 条待办也不起轮、打开后起轮；前端测试：设置页往返 + 保存即活
+- [x] 四门 + 决策落号
 
 ## Comments
 

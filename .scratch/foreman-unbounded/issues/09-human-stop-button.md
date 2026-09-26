@@ -4,16 +4,17 @@
 
 **Blocked by:** 07（收场路径与标记族）
 
-**Status:** ready-for-agent
+**Status:** done（已实现，决策 294）
 
-- [ ] 形状照流水线那套：`CancelSignal` / `EXECUTOR_REGISTRY`(`crates/core/src/pipeline/executor.rs:67-140`、:142-264)——进程内登记 + 观察点，模型调用处 select 命中即中止；值班长这边今天**一个中止入口都没有**（`POST /foreman/messages` 把轮 spawn 到独立 task 后 await，`routes/foreman.rs:962`）
-- [ ] 新端点（`POST /foreman/turns/{id}/cancel`，或班次维度）挂 `crates/app/src/lib.rs:120-150`；前端按钮进 Talk 的动作区，只在这一轮在飞时出现
-- [ ] `invalidate_round_proposals`(foreman.rs:2223-2248) 增加「人停」分支：**不作废**，并在提议上标注它来自一轮被停在半路的话
-- [ ] **显式修订决策 233③**：作废只对「轮**自己**死了」（失败 / 挂死）；人主动停不算——那是「这话先这样，按你提的第 2 条办」。`docs/decisions.md` 在 233③ 那条上标修订，新决策记全理由
-- [ ] 标记 `【已停】`（裁决 9 的三族之一），界面与读历史的地方按前缀家族认
-- [ ] core 测试：取消 → 部分结论落库 + 提议仍在 + 标记正确；前端测试：按钮出现与阶段态
-- [ ] 四门 + 决策落号
+- [x] 形状照流水线那套：`CancelSignal` / `EXECUTOR_REGISTRY`(`crates/core/src/pipeline/executor.rs:67-140`、:142-264)——进程内登记 + 观察点，模型调用处 select 命中即中止；值班长这边今天**一个中止入口都没有**（`POST /foreman/messages` 把轮 spawn 到独立 task 后 await，`routes/foreman.rs:962`）
+- [x] 新端点（`POST /foreman/turns/{id}/cancel`，或班次维度）挂 `crates/app/src/lib.rs:120-150`；前端按钮进 Talk 的动作区，只在这一轮在飞时出现
+- [x] `invalidate_round_proposals`(foreman.rs:2223-2248) 增加「人停」分支：**不作废**，并在提议上标注它来自一轮被停在半路的话
+- [x] **显式修订决策 233③**：作废只对「轮**自己**死了」（失败 / 挂死）；人主动停不算——那是「这话先这样，按你提的第 2 条办」。`docs/decisions.md` 在 233③ 那条上标修订，新决策记全理由
+- [x] 标记 `【已停】`（裁决 9 的三族之一），界面与读历史的地方按前缀家族认
+- [x] core 测试：取消 → 部分结论落库 + 提议仍在 + 标记正确；前端测试：按钮出现与阶段态
+- [x] 四门 + 决策落号
 
 ## Comments
 
 - 来源：拷问 Q9 与裁决 9、10。这一票是**唯一一处会改动既有决策**的地方；修订的形状已在 spec §二 裁决 10 定死，实现时不要顺手扩大（「轮自己死了」那条语义一字不动）。
+- **实现者记事（「按前缀家族认」落在哪里）**：三族的**标记串**分得开（`【未收口】` / `【未收口·在打转】` / `【已停】`，与裁决 9 逐字一致），但界面**不解析正文前缀**——那与决策 252 的「界面不解析正文」直接冲突，且会让模型的措辞能把自己那一行染成别的种类。真实需要机器可读的那一处（提议卡上的来路「来自一轮被人按停的话」）改用**字段**：`kanban_foreman_proposals.stopped_round`（迁移 0033），前端按布尔渲染，不认前缀。人在时间线上读到的仍是标记本身那行字（原样渲染）。另：停钮那条端点答的 `{"cancelled": bool}` 是「有没有一轮可停」，界面按它撤钮（两轴 code-review 收口时补上的那一支——原先只看 `true`，`false` 会让钮钉在「正在停…」上，而人的那一轮没有时间界）。

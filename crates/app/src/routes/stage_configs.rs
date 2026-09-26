@@ -154,7 +154,8 @@ pub async fn put(
         })?),
         Some(v) => {
             return Err(ApiError::bad_request(format!(
-                "max_rounds 必须是正整数（收到 {v}）：`0` / 负数都不许，也没有「无上限」这一档。                 要恢复缺省就删掉这一格。"
+                "max_rounds 必须是正整数（收到 {v}）：`0` / 负数都不许，也没有「无上限」这一档。\
+                 要恢复缺省就删掉这一格。"
             )))
         }
     };
@@ -164,12 +165,14 @@ pub async fn put(
         None => None,
         Some(v) if v > 0 => Some(u32::try_from(v).map_err(|_| {
             ApiError::bad_request(format!(
-                "watch_token_budget 超出口径（收到 {v}）：它管「值守轮一轮能生成多少 token」，                 请给一个正整数"
+                "watch_token_budget 超出口径（收到 {v}）：它管「值守轮一轮能生成多少 token」，\
+                 请给一个正整数"
             ))
         })?),
         Some(v) => {
             return Err(ApiError::bad_request(format!(
-                "watch_token_budget 必须是正整数（收到 {v}）：`0` / 负数都不许，也没有「无预算」这一档。                 要恢复缺省就删掉这一格。"
+                "watch_token_budget 必须是正整数（收到 {v}）：`0` / 负数都不许，也没有「无预算」这一档。\
+                 要恢复缺省就删掉这一格。"
             )))
         }
     };

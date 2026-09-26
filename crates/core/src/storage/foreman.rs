@@ -90,13 +90,6 @@ pub struct ForemanSession {
     pub archived_at: Option<DateTime<Utc>>,
 }
 
-impl ForemanSession {
-    /// 这是人的班次吗（对讲台的说话面只落这种班次）。
-    pub fn is_talk(&self) -> bool {
-        self.kind == FOREMAN_SESSION_KIND_TALK
-    }
-}
-
 /// 一行值班长会话。
 #[derive(Debug, Clone, PartialEq)]
 pub struct ForemanMessage {

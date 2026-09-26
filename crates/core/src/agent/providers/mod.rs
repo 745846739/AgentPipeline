@@ -158,7 +158,7 @@ impl LlmErrorKind {
     }
 }
 
-/// 这个错误是「请求超出模型上下文窗口」吗——**两个消费者共用的判据**（决策 291 / 294）。
+/// 这个错误是「请求超出模型上下文窗口」吗——**两个消费者共用的判据**（决策 291 / 295）。
 ///
 /// 值班长撞墙后的压缩重试（`pipeline/foreman.rs`，票 06(c)）与流水线「压缩一次、且不再
 /// 盲目重试」（`pipeline/model_invoke.rs`，票 10）判的是**同一件事**。各写一份 `matches!`
@@ -341,6 +341,7 @@ impl ProductionLlm {
         // 逐调用空闲判死（决策 288 / 票 foreman-unbounded 05）：请求带了空闲界才启用。
         // 判据是**流上的字节**——「距上一个字节超过阈值」从发出请求那一刻起算
         // （连接阶段挂着不吐响应头，与「流中途停了」是同一种挂），不是响应完成的时限。
+        // **空块不重置这条界**：能把它往后挪的只有真收到的字节（[`advance_idle_deadline`]）。
         // `None` = 不启用（现状一字不动）：节点路径不走这里，它们的挂死由调度器心跳收口。
         let idle_timeout = request.idle_timeout_sec.map(Duration::from_secs);
         let idle_error = |idle: Duration, received: u64| Error::LlmClassified {
@@ -394,20 +395,36 @@ impl ProductionLlm {
         // ——再往外一层只看得到最终响应，分不清「流快但 prompt 大」与「流被压到极慢」。
         let mut bytes_received: u64 = 0;
         let mut last_byte_at: Option<chrono::DateTime<chrono::Utc>> = None;
+        // 空闲界的**期限**（不是「距上一次 `next()` 返回」）：每次真收到字节才往后挪，
+        // 见 [`advance_idle_deadline`]。
+        let mut idle_deadline = idle_timeout.map(|idle| tokio::time::Instant::now() + idle);
 
         while !done {
-            let next = match idle_timeout {
-                Some(idle) => match tokio::time::timeout(idle, stream.next()).await {
-                    Ok(next) => next,
-                    Err(_) => return Err(idle_error(idle, bytes_received)),
-                },
-                None => stream.next().await,
+            let next = match (idle_deadline, idle_timeout) {
+                (Some(deadline), Some(idle)) => {
+                    match tokio::time::timeout_at(deadline, stream.next()).await {
+                        Ok(next) => next,
+                        Err(_) => return Err(idle_error(idle, bytes_received)),
+                    }
+                }
+                _ => stream.next().await,
             };
             let Some(chunk) = next else {
                 break;
             };
             let bytes = chunk.map_err(|e| Error::Llm(format!("读取流失败：{e}")))?;
             bytes_received += bytes.len() as u64;
+            // 字节 ⇄ 时刻同源：`last_byte_at` 是**读数**（决策 231 的量速），这里同时是
+            // 判死那条界的推进点——空块不进这两个读数（判据是字节，见上）。
+            idle_deadline = advance_idle_deadline(
+                idle_deadline,
+                idle_timeout,
+                tokio::time::Instant::now(),
+                bytes.len(),
+            );
+            if bytes.is_empty() {
+                continue;
+            }
             last_byte_at = Some(self.store.now());
             buffer.push_str(&String::from_utf8_lossy(&bytes));
             while let Some(pos) = buffer.find('\n') {
@@ -797,9 +814,67 @@ pub(crate) fn fixture_provider(vendor: &str, model: &str, base_url: Option<&str>
     }
 }
 
+/// 逐调用空闲界的**推进**（决策 288 / 票 05）：**只有真的收到字节**才把界往后挪。
+///
+/// 为什么单拎出来：判据是「**流上的字节**」，而 `stream.next()` 返回一次不等于流上多了
+/// 一个字节——空块（HTTP/2 的空 DATA 帧、被解码器吞掉的保活帧）不带字节却照样返回。
+/// 按「返回了就重置」写，一条只发空帧的连接能把这一次调用挂到天荒地老，而那正是这一票
+/// 要杀的那件事（「一个字都没有」）。真流的空块造不出来（TCP 上写 0 字节等于没写），
+/// 故这条判据落在这里由单测钉住；网络那一层只钉「超时就判死」。
+///
+/// 空闲界没启用（`idle` 为 `None`）时恒返回原值——`None` 就是「不启用 watchdog」，
+/// 这条函数不替调用方做那个决定。
+fn advance_idle_deadline(
+    deadline: Option<tokio::time::Instant>,
+    idle: Option<Duration>,
+    now: tokio::time::Instant,
+    bytes: usize,
+) -> Option<tokio::time::Instant> {
+    match (deadline, idle) {
+        (Some(_), Some(idle)) if bytes > 0 => Some(now + idle),
+        _ => deadline,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 收到字节 → 界往后挪到「此刻 + 空闲界」。
+    #[test]
+    fn idle_bytes_move_the_deadline_forward() {
+        let start = tokio::time::Instant::now();
+        let moved = advance_idle_deadline(
+            Some(start),
+            Some(Duration::from_secs(300)),
+            start + Duration::from_secs(10),
+            3,
+        );
+        assert_eq!(moved, Some(start + Duration::from_secs(310)));
+    }
+
+    /// **空块不挪界**（票 05：判据是字节，不是「`next()` 返回了一次」）。
+    #[test]
+    fn an_empty_chunk_does_not_move_the_idle_deadline() {
+        let start = tokio::time::Instant::now();
+        let kept = advance_idle_deadline(
+            Some(start),
+            Some(Duration::from_secs(300)),
+            start + Duration::from_secs(299),
+            0,
+        );
+        assert_eq!(kept, Some(start), "空块不许重置空闲界");
+    }
+
+    /// 没启用空闲界时这条函数一个决定都不做。
+    #[test]
+    fn no_idle_bound_means_no_deadline() {
+        let start = tokio::time::Instant::now();
+        assert_eq!(
+            advance_idle_deadline(None, None, start + Duration::from_secs(9), 42),
+            None
+        );
+    }
 
     #[test]
     fn base_url_strips_trailing_slash_and_falls_back_by_vendor() {

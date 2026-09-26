@@ -4,12 +4,12 @@
 
 **Blocked by:** None（可立即开始）
 
-**Status:** ready-for-agent
+**Status:** done（已实现，决策 295）
 
-- [ ] 分类已在手：`LlmErrorKind::from_http`(providers/mod.rs:101-148) 的 `llm_context_window`——只在**重试耗尽时**才穿透（:298-306），中途完全不分流
-- [ ] 值守轮那侧已有先例：`foreman.rs:1192-1209` 把这一类归进「等一等没用」的慢档退避——本票是把同一判断用到流水线的重试循环上
-- [ ] executor 测试：超长只发生一次调用（不是 `agent_retry_max` 次），台账里读得出下一步指引
-- [ ] 四门 + 决策落号
+- [x] 分类已在手：`LlmErrorKind::from_http`(providers/mod.rs:101-148) 的 `llm_context_window`——只在**重试耗尽时**才穿透（:298-306），中途完全不分流
+- [x] 值守轮那侧已有先例：`foreman.rs:1192-1209` 把这一类归进「等一等没用」的慢档退避——本票是把同一判断用到流水线的重试循环上
+- [x] executor 测试：超长只发生一次调用（不是 `agent_retry_max` 次），台账里读得出下一步指引
+- [x] 四门 + 决策落号
 
 ## Comments
 

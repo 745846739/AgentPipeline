@@ -4,15 +4,15 @@
 
 **Blocked by:** None（可立即开始）
 
-**Status:** ready-for-agent
+**Status:** done（已实现，决策 286）
 
-- [ ] 迁移 `0030_foreman_session_kind.sql`：`kanban_foreman_sessions` 加 `kind TEXT NOT NULL DEFAULT 'talk'`（值 `talk` / `watch`）；存量行因此全落 `talk`（配合裁决 12：不回填）
-- [ ] `crates/core/src/storage/foreman.rs`：`list_foreman_sessions`(:244)、`latest_foreman_session`(:271)、`create`(:283) 接受/返回类型
-- [ ] `ForemanRunner::resolve_session`(foreman.rs:2283-2304) 拆成两条：人的班次（现状语义）与值守班次（不存在就建一个，固定标题如「值守台账」）；`say()` 仍落人的班次，`watch()`(:2028) 落值守班次
-- [ ] 路由：`session_wire`/`session_payload`(routes/foreman.rs:1064-1126) 带出 `kind`；`GET /foreman/sessions` 支持按类型取（缺省只回人的班次）
-- [ ] `kind` / `proactive` 两个派生布尔保留不动——存量行靠它们照旧标对（裁决 12 的另一半）
-- [ ] core 集成：值守播报落值守班次、人的班次读不到它；迁移测试：存量库升级后人的班次列表与消息归属一个字节不变
-- [ ] 四门 + 决策落号
+- [x] 迁移 `0030_foreman_session_kind.sql`：`kanban_foreman_sessions` 加 `kind TEXT NOT NULL DEFAULT 'talk'`（值 `talk` / `watch`）；存量行因此全落 `talk`（配合裁决 12：不回填）
+- [x] `crates/core/src/storage/foreman.rs`：`list_foreman_sessions`(:244)、`latest_foreman_session`(:271)、`create`(:283) 接受/返回类型
+- [x] `ForemanRunner::resolve_session`(foreman.rs:2283-2304) 拆成两条：人的班次（现状语义）与值守班次（不存在就建一个，固定标题如「值守台账」）；`say()` 仍落人的班次，`watch()`(:2028) 落值守班次
+- [x] 路由：`session_wire`/`session_payload`(routes/foreman.rs:1064-1126) 带出 `kind`；`GET /foreman/sessions` 支持按类型取（缺省只回人的班次）
+- [x] `kind` / `proactive` 两个派生布尔保留不动——存量行靠它们照旧标对（裁决 12 的另一半）
+- [x] core 集成：值守播报落值守班次、人的班次读不到它；迁移测试：存量库升级后人的班次列表与消息归属一个字节不变
+- [x] 四门 + 决策落号
 
 ## Comments
 

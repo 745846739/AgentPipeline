@@ -4,17 +4,18 @@
 
 **Blocked by:** None（可立即开始）
 
-**Status:** ready-for-agent
+**Status:** done（已实现，决策 288）
 
-- [ ] `turn_limit`(foreman.rs:1537-1547) 与 `respond`(:1512-1526) 的 `tokio::time::timeout` 去掉；测试注入口 `turn_timeout`(:1256/:1304) 随之删或改语义（现在只有测试在用）
-- [ ] 接线 foreman 行的 `idle_timeout_sec`——**它今天画在设置页却不被任何代码读取**（只有节点路径读，`scheduler/mod.rs:198-203`），缺省取与节点同数 **300s**；判据是**流上的字节**（`bytes_received` / `last_byte_at` 已在量：providers/mod.rs:337-347/461-462），不是响应完成
-- [ ] watchdog 落点：`providers/mod.rs` 的流循环(:340-423) 里「距上一个字节超阈值 → 中止本调用」；循环内 `self.llm.complete`(foreman.rs:1739) 包一层带重试的调用，而不是裸 `?`
-- [ ] 归因：`turn_failure_reason`(foreman.rs:2740-2762) 现在会把退化/中止这类落到 `other => internal`；给「空闲判死」一个明确的 kind 与「可重试」语义
-- [ ] 设置页：foreman 行的 `max_duration_sec` **隐藏**（它成了死旋钮）；`idle_timeout_sec` 从死旋钮变成真生效
-- [ ] 前端安静态：`api/client.ts:772-773` 的 `timeoutMs: 300_000` 与 `Talk.svelte:917-975` 的失败轮分支——本地放弃改成「仍在跑」的安静态（不落失败轮）；网络不通 / 配对 403 两类真失败照旧
-- [ ] core 测试：假 LLM 卡住不发字节 → 判死重试一次 → 成功续跑；台账里不再出现「超过 30 分钟没有结束」那条文案
-- [ ] 前端单测：本地超时不落失败轮
-- [ ] 四门 + 决策落号（兑现决策 233 的如实记 (i)：抬墙钟）
+- [x] `turn_limit`(foreman.rs:1537-1547) 与 `respond`(:1512-1526) 的 `tokio::time::timeout` 去掉；测试注入口 `turn_timeout`(:1256/:1304) 随之删或改语义（现在只有测试在用）
+- [x] 接线 foreman 行的 `idle_timeout_sec`——**它今天画在设置页却不被任何代码读取**（只有节点路径读，`scheduler/mod.rs:198-203`），缺省取与节点同数 **300s**；判据是**流上的字节**（`bytes_received` / `last_byte_at` 已在量：providers/mod.rs:337-347/461-462），不是响应完成
+      （两轴 code-review 收口时补齐一处：界原先按「`stream.next()` 返回了一次」重置，于是**空块**——HTTP/2 空 DATA 帧那类不带字节的推进——能把它一直往后推。改成 `advance_idle_deadline`：只有真收到字节才挪界，三条单测钉住）
+- [x] watchdog 落点：`providers/mod.rs` 的流循环(:340-423) 里「距上一个字节超阈值 → 中止本调用」；循环内 `self.llm.complete`(foreman.rs:1739) 包一层带重试的调用，而不是裸 `?`
+- [x] 归因：`turn_failure_reason`(foreman.rs:2740-2762) 现在会把退化/中止这类落到 `other => internal`；给「空闲判死」一个明确的 kind 与「可重试」语义
+- [x] 设置页：foreman 行的 `max_duration_sec` **隐藏**（它成了死旋钮）；`idle_timeout_sec` 从死旋钮变成真生效
+- [x] 前端安静态：`api/client.ts:772-773` 的 `timeoutMs: 300_000` 与 `Talk.svelte:917-975` 的失败轮分支——本地放弃改成「仍在跑」的安静态（不落失败轮）；网络不通 / 配对 403 两类真失败照旧
+- [x] core 测试：假 LLM 卡住不发字节 → 判死重试一次 → 成功续跑；台账里不再出现「超过 30 分钟没有结束」那条文案
+- [x] 前端单测：本地超时不落失败轮
+- [x] 四门 + 决策落号（兑现决策 233 的如实记 (i)：抬墙钟）
 
 ## Comments
 

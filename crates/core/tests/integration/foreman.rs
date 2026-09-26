@@ -23,7 +23,8 @@ use agentpipeline_core::pipeline::foreman::{
     FOREMAN_LOOP_REMINDER_MARK, FOREMAN_LOOP_TURN_MARK, FOREMAN_MAX_ROUNDS, FOREMAN_NO_ACTION_MARK,
     FOREMAN_PARTIAL_TURN_MARK, FOREMAN_PERSONA, FOREMAN_STAGE_KEY, FOREMAN_STOPPED_TURN_MARK,
     FOREMAN_TALK_DIGEST_MARK, FOREMAN_TOOL_SPECS, FOREMAN_WATCH_DIGEST_MARK,
-    FOREMAN_WATCH_FAILED_TURN_MARK, FOREMAN_WATCH_MARK, OPERATION_LOG_MARK,
+    FOREMAN_WATCH_FAILED_TURN_MARK, FOREMAN_WATCH_MARK, FOREMAN_WATCH_TOKEN_BUDGET,
+    OPERATION_LOG_MARK,
 };
 use agentpipeline_core::sse::{SseEvent, SseEventType, ToolPhase};
 use agentpipeline_core::storage::foreman::{
@@ -1219,7 +1220,7 @@ async fn the_human_turn_sees_a_marked_watch_digest_not_the_verbatim_ledger() {
         "摘要是重述，不是把播报原样搬进上下文：{head}"
     );
     // 回话照旧落在人的班次。
-    assert!(turn.session.is_talk());
+    assert_eq!(turn.session.kind, FOREMAN_SESSION_KIND_TALK);
 }
 
 /// 决策 289 / 票 03：(b) 值守轮读到**人的对话摘要**（裁决 2：它仍读得到人说的话——
@@ -1374,7 +1375,7 @@ async fn the_watch_round_writes_to_its_own_session_and_the_talk_session_never_se
     let agent = FakeAgent::new(script);
     let runner = h.runner(agent.clone());
     let human_turn = runner.say(None, "t1 现在什么情况").await.unwrap();
-    assert!(human_turn.session.is_talk());
+    assert_eq!(human_turn.session.kind, FOREMAN_SESSION_KIND_TALK);
 
     // 值守轮醒一次：播报落进值守台账。
     let watch_turn = runner.watch().await.unwrap().expect("应当醒一次");
@@ -5463,6 +5464,18 @@ async fn a_capped_turn_keeps_what_it_already_established() {
             .any(|m| m.role == "system" && m.content.contains(FOREMAN_FAILED_TURN_MARK)),
         "触顶不再是失败：{stored:?}"
     );
+}
+
+/// 两个缺省界**钉住**（决策 292 / 票 07）：它们是决策的值，不是随手取的数字。
+///
+/// 改它要连着改这一行与决策 292 的来历段（`FOREMAN_MAX_ROUNDS` 为什么抬到 1000、
+/// 120k 是「实测 85,135 生成 token 的约 1.4 倍」）——照 `agent::loops::constants_are_pinned`
+/// 与 `config::default_server_port_is_8788` 的姿态：**决策的取值由测试守着**，
+/// 免得它在下一次重构里被静默调小。
+#[test]
+fn the_default_bounds_are_pinned() {
+    assert_eq!(FOREMAN_MAX_ROUNDS, 1000);
+    assert_eq!(FOREMAN_WATCH_TOKEN_BUDGET, 120_000);
 }
 
 /// 一句话都没说过的触顶**仍旧按失败处置**（没有东西可留，报错才是诚实的）。

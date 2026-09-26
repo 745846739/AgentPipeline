@@ -543,8 +543,6 @@ export function clearMarketRepos(): Promise<MarketRepoConfig> {
 
 /* 离线通知（决策 272）：读数 / 总开关 / 通道单元 / 探针。 */
 
-/** 值守轮设置（决策 287 / 票 02）：读数与开关。 */
-
 /** 值守轮的读数：开关 + provenance + 只读的节奏五个数。 */
 export function getForemanWatch(): Promise<ForemanWatchSettings> {
   return request<ForemanWatchSettings>('/foreman-watch');
