@@ -1584,9 +1584,7 @@ impl ForemanRunner {
         history: &[ForemanMessage],
         provider_id: Option<String>,
     ) -> Option<String> {
-        let Some(last) = history.last() else {
-            return None;
-        };
+        let last = history.last()?;
         let boundary = last.id;
         let entry = self
             .compaction
