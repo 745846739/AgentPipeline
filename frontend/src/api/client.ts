@@ -18,6 +18,7 @@ import type {
   NotifyChannelPayload,
   NotifyChannelTest,
   NotifyPolitenessPayload,
+  ForemanWatchSettings,
   NotifySettings,
   Project,
   ProjectAnalysis,
@@ -541,6 +542,25 @@ export function clearMarketRepos(): Promise<MarketRepoConfig> {
 }
 
 /* 离线通知（决策 272）：读数 / 总开关 / 通道单元 / 探针。 */
+
+/** 值守轮设置（决策 287 / 票 02）：读数与开关。 */
+
+/** 值守轮的读数：开关 + provenance + 只读的节奏五个数。 */
+export function getForemanWatch(): Promise<ForemanWatchSettings> {
+  return request<ForemanWatchSettings>('/foreman-watch');
+}
+
+/**
+ * 拨**值守开关**（决策 287）：保存即活——值守循环每 10s 读一次库里的这一行，
+ * 下一趟按新值走，不必重启；在飞的那一轮不受影响。
+ */
+export function setForemanWatch(enabled: boolean): Promise<{ enabled: boolean; origin: string }> {
+  return request<{ enabled: boolean; origin: string }>('/foreman-watch', {
+    method: 'PUT',
+    body: { enabled },
+  });
+}
+
 
 /** 生效的通道读数（单元 > `config.toml`；秘密只回掩码）。 */
 export function getNotifySettings(): Promise<NotifySettings> {

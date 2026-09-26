@@ -570,6 +570,50 @@ impl Store {
     }
 }
 
+// ─────────────────────────── 值守开关（决策 287 / 票 02）───────────────────────────
+
+impl Store {
+    /// 值守轮的**全局开关**：行不存在 = 缺省**开**（决策 287 / 票 02）。
+    ///
+    /// 语义是「关掉跑」：关掉后 `ForemanRunner::watch` 在最前面就返回——有待办也不醒、
+    /// 不花钱；在飞的那一轮不受影响（它已经过了这道门）。**单一事实源在库里**：
+    /// 值守循环每 10s 问一次（一次单行 SELECT），界面保存后下一趟即生效——
+    /// 不需要在进程里再养一份「开关状态」跟库对账。
+    pub async fn foreman_watch_enabled(&self) -> Result<bool> {
+        let enabled: Option<bool> =
+            sqlx::query_scalar("SELECT enabled FROM kanban_foreman_watch WHERE id = 1")
+                .fetch_optional(self.pool())
+                .await?;
+        Ok(enabled.unwrap_or(true))
+    }
+
+    /// 写值守开关（UPSERT；行不存在就建）。缺省开的那一格由「行不存在」表达，
+    /// 故没有「清除」动作——关掉再打开就落 `true`，与缺省同值不同 provenance
+    /// （设置页报「界面保存的」还是「缺省开」）。
+    pub async fn set_foreman_watch_enabled(&self, enabled: bool) -> Result<()> {
+        let mut tx = self.begin_write().await?;
+        sqlx::query(
+            "INSERT INTO kanban_foreman_watch (id, enabled, updated_at) VALUES (1, ?, ?)
+             ON CONFLICT(id) DO UPDATE SET enabled = excluded.enabled, updated_at = excluded.updated_at",
+        )
+        .bind(enabled)
+        .bind(ts(self.now()))
+        .execute(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        Ok(())
+    }
+
+    /// 界面保存过值守开关吗（provenance 读数）：行存在 = 界面定的。
+    pub async fn foreman_watch_has_override(&self) -> Result<bool> {
+        let exists: Option<i64> =
+            sqlx::query_scalar("SELECT 1 FROM kanban_foreman_watch WHERE id = 1")
+                .fetch_optional(self.pool())
+                .await?;
+        Ok(exists.is_some())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -607,6 +651,27 @@ mod tests {
         assert_eq!(
             session_title_from(Some("  \n\t ")),
             FOREMAN_SESSION_DEFAULT_TITLE
+        );
+    }
+
+    /// 决策 287 / 票 02：行不存在 = 缺省开；写进去读得回来；provenance 随行出现。
+    #[tokio::test]
+    async fn the_watch_switch_defaults_on_and_persists() {
+        let store = Store::open_in_memory(std::sync::Arc::new(crate::clock::SystemClock))
+            .await
+            .unwrap();
+        assert!(store.foreman_watch_enabled().await.unwrap(), "缺省开");
+        assert!(!store.foreman_watch_has_override().await.unwrap());
+
+        store.set_foreman_watch_enabled(false).await.unwrap();
+        assert!(!store.foreman_watch_enabled().await.unwrap());
+        assert!(store.foreman_watch_has_override().await.unwrap());
+
+        store.set_foreman_watch_enabled(true).await.unwrap();
+        assert!(store.foreman_watch_enabled().await.unwrap());
+        assert!(
+            store.foreman_watch_has_override().await.unwrap(),
+            "打开也记 provenance：是界面保存的，不是缺省"
         );
     }
 }

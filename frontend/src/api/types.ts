@@ -1181,6 +1181,22 @@ export interface NotifySettings {
   config_error?: string;
 }
 
+/** 值守轮设置页的读数（决策 287 / 票 02）：开关 + provenance + 只读的节奏五个数。 */
+export interface ForemanWatchSettings {
+  /** 全局开关：关掉 = 值守轮不再自己醒（跑都不跑）；在飞的那一轮不受影响。 */
+  enabled: boolean;
+  /** 这一份是谁定的：`default` = 从没碰过设置（缺省开）；`settings` = 界面保存过。 */
+  origin: 'default' | 'settings';
+  /** `[pipeline] watch_*` 五个数，config.toml 那一级——**只读展示**，不开写口。 */
+  config: {
+    watch_event_window_minutes: number;
+    watch_owner_stuck_minutes: number;
+    watch_debounce_sec: number;
+    watch_task_cooldown_minutes: number;
+    watch_max_wakes_per_hour: number;
+  };
+}
+
 /** `PUT /notify/channel` 的载荷：通道单元**整体覆盖**（272⑥ 不允许混）。 */
 export interface NotifyChannelPayload {
   channel: 'generic' | 'feishu' | 'bluebubbles';

@@ -66,6 +66,11 @@
       note: '跑起来用谁的能力、按什么规矩。',
       items: [
         {
+          path: '/settings/foreman',
+          label: '值守轮',
+          note: '夜班值守的开关与节奏——关掉后今晚不会再自己醒。',
+        },
+        {
           path: '/settings/providers',
           label: '模型与密钥',
           // `台账` 本页首现，按决策 200② 的定稿说法给一次平实解释（同一页面内不重复）。

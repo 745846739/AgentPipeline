@@ -1978,6 +1978,13 @@ impl ForemanRunner {
     /// 账单 / 配置类 300s 起，1800s 封顶），退避期内这一趟**不问、不看不说话**。退避只挡值守轮，
     /// `say()` 一个字不动——人随时可以自己再试一次。见 [`WatchFailureState`] 的文档。
     pub async fn watch(&self) -> Result<Option<ForemanTurn>> {
+        // 全局开关（决策 287 / 票 02）：**最前面**问这一趟该不该开口——关掉 = 跑都不跑
+        // （有待办也不醒、不消费、不花钱）；在飞的那一轮不受影响（它已经过了这道门）。
+        // 单一事实源在库里，循环每 10s 到这里问一次：界面保存后下一趟即生效，
+        // 不必重启、也不需要在进程里再养一份开关状态跟库对账。
+        if !self.store.foreman_watch_enabled().await? {
+            return Ok(None);
+        }
         // 这一轮的起点（决策 233③）：与 `say()` 同一个用途——死轮只作废**它自己**提的提议。
         let started_at = self.store.now();
         // 退避窗口（决策 271）：先问这一趟该不该开口，再谈有没有待办——provider 不通时

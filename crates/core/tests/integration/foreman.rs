@@ -1071,6 +1071,41 @@ async fn note(h: &Harness, task_id: &str, kind: agentpipeline_core::storage::Att
         .unwrap();
 }
 
+/// 决策 287 / 票 02：全局开关关掉的是「跑」——有待办也不醒、不消费、不花钱；
+/// 打开后下一趟立即恢复。这道门在 `watch()` 的最前面，故待办表原封不动。
+#[tokio::test]
+async fn the_global_switch_stops_the_watch_round_and_backlog_stays_put() {
+    let h = Harness::seeded().await;
+    note(
+        &h,
+        "t1",
+        agentpipeline_core::storage::AttentionKind::RetryExhausted,
+    )
+    .await;
+    h.clock.advance_secs(61);
+    h.store.set_foreman_watch_enabled(false).await.unwrap();
+
+    let mut script = Script::new();
+    script
+        .for_foreman()
+        .text("t1 重试耗尽了，需要值班经理看一眼。");
+    let agent = FakeAgent::new(script);
+    let runner = h.runner(agent.clone());
+
+    assert!(runner.watch().await.unwrap().is_none(), "关掉：这一趟不醒");
+    assert_eq!(agent.total_calls(), 0, "关掉 = 零次模型调用，一分钱不花");
+    assert_eq!(
+        h.store.open_attention(100).await.unwrap().len(),
+        1,
+        "待办不消费：打开后这一批还在"
+    );
+
+    h.store.set_foreman_watch_enabled(true).await.unwrap();
+    let turn = runner.watch().await.unwrap().expect("打开后下一趟立即恢复");
+    assert!(turn.reply.contains("重试耗尽"));
+    assert!(h.store.open_attention(100).await.unwrap().is_empty(), "照常消费");
+}
+
 #[tokio::test]
 async fn a_due_attention_wakes_the_foreman_exactly_once() {
     let h = Harness::seeded().await;

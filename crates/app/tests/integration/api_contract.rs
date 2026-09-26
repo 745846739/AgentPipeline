@@ -5420,6 +5420,47 @@ async fn foreman_sessions_carry_a_kind_and_the_watch_ledger_is_read_only() {
     assert_eq!(body["messages"].as_array().unwrap().len(), 0, "不落库");
 }
 
+/// 决策 287 / 票 02：值守开关的读写——缺省开（没保存过 = `default`）、保存后 provenance
+/// 变 `settings`（哪怕值与缺省相同）、五个节奏数只读在场（config.toml 那一级，不开写口）。
+#[tokio::test]
+async fn foreman_watch_switch_round_trips_with_provenance() {
+    let api = api_with_foreman(FakeAgent::new(Script::new())).await;
+
+    // 缺省：开、没保存过。
+    let (_, body) = get(&api, "/foreman-watch").await;
+    assert_eq!(body["enabled"], true);
+    assert_eq!(body["origin"], "default");
+    // 节奏五个数（只读展示）：都在场且是数字。
+    for key in [
+        "watch_event_window_minutes",
+        "watch_owner_stuck_minutes",
+        "watch_debounce_sec",
+        "watch_task_cooldown_minutes",
+        "watch_max_wakes_per_hour",
+    ] {
+        assert!(body["config"][key].is_number(), "{key} 该只读在场");
+    }
+
+    // 关掉：保存读数原样回来，provenance 变「界面定的」。
+    let (status, body) = put(&api, "/foreman-watch", json!({"enabled": false})).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["enabled"], false);
+    assert_eq!(body["origin"], "settings");
+    let (_, body) = get(&api, "/foreman-watch").await;
+    assert_eq!(body["enabled"], false);
+    assert_eq!(body["origin"], "settings");
+
+    // 再打开：值与缺省相同，但 provenance 仍是「界面保存的」——保存过就是保存过。
+    let (status, body) = put(&api, "/foreman-watch", json!({"enabled": true})).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["enabled"], true);
+    assert_eq!(body["origin"], "settings");
+
+    // 缺体是 4xx（不是 500、不是静默成功）。
+    let (status, _) = put(&api, "/foreman-watch", json!({})).await;
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
+}
+
 /// 两个班次各说各的：消息与页头合计都按班次读，互不污染（决策 204②⑤）。
 #[tokio::test]
 async fn foreman_sessions_isolate_their_own_messages_and_totals() {

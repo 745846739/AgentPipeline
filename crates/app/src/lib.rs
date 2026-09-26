@@ -148,6 +148,13 @@ pub fn build_router(state: AppState) -> Router {
             "/foreman/proposals/{id}/reject",
             post(routes::foreman::reject_proposal),
         )
+        // ── 值守轮的全局开关（决策 287 / 票 02）──
+        // **不落 /foreman/**：那一族未接线时 503，而开关是机器级事实（机器级设置页要看得到）。
+        // 保存即活：值守循环每 10s 读一次库里的这一行。
+        .route(
+            "/foreman-watch",
+            get(routes::foreman_watch::settings).put(routes::foreman_watch::set_enabled),
+        )
         // ── 技能市场（决策 172⑤，票 09）：本地导入 / 目录扫描 / 卸载。全程离线 ──
         // 子 router 自带 state（import 路由要单独放宽请求体上限），故先 merge 再进防护层。
         .merge(routes::skills::routes(state.clone()))

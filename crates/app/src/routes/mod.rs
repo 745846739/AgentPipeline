@@ -1,6 +1,7 @@
 //! 路由模块。
 
 pub mod foreman;
+pub mod foreman_watch;
 pub mod market;
 pub mod notify;
 pub mod pairing;

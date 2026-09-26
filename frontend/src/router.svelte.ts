@@ -35,6 +35,7 @@ export type Route =
   | { name: 'settings-providers'; query: RouteQuery }
   | { name: 'settings-stages'; query: RouteQuery }
   | { name: 'settings-market'; query: RouteQuery }
+  | { name: 'settings-foreman'; query: RouteQuery }
   | { name: 'settings-notify'; query: RouteQuery }
   | { name: 'metrics'; query: RouteQuery }
   | { name: 'share'; query: RouteQuery }
@@ -79,6 +80,8 @@ export function parseRoute(hash: string): Route {
   // 此前只有 config.toml 一条路，界面上无处可改。
   if (path === '/settings/market') return { name: 'settings-market', query };
   // 离线通知（决策 272）：总开关 / 通道四件 / 探针。
+  // 值守轮（决策 287 / 票 02）：全局开关 + 只读的节奏五个数。
+  if (path === '/settings/foreman') return { name: 'settings-foreman', query };
   if (path === '/settings/notify') return { name: 'settings-notify', query };
   if (path === '/metrics') return { name: 'metrics', query };
   if (path === '/share') return { name: 'share', query };
