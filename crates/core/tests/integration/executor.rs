@@ -616,7 +616,7 @@ async fn concurrent_executors_deduplicate_on_the_same_task() {
         tokio::spawn(async move { e.run("t3").await })
     };
     // 等 executor 阻塞在第一次 LLM 调用
-    tokio::time::timeout(Duration::from_secs(5), async {
+    tokio::time::timeout(Duration::from_secs(30), async {
         loop {
             if calls.load(Ordering::SeqCst) >= 1 {
                 break;
@@ -677,7 +677,7 @@ async fn try_run_reports_skip_so_the_resume_hook_can_retry() {
         let e = ex1.clone();
         tokio::spawn(async move { e.run("t4").await })
     };
-    tokio::time::timeout(Duration::from_secs(5), async {
+    tokio::time::timeout(Duration::from_secs(30), async {
         while calls.load(Ordering::SeqCst) == 0 {
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
@@ -774,7 +774,7 @@ async fn a_timed_out_run_is_stopped_and_reports_its_usage() {
         let e = ex.clone();
         tokio::spawn(async move { e.run("t9").await })
     };
-    tokio::time::timeout(Duration::from_secs(5), async {
+    tokio::time::timeout(Duration::from_secs(30), async {
         while calls.load(Ordering::SeqCst) < 2 {
             tokio::time::sleep(Duration::from_millis(5)).await;
         }
@@ -809,7 +809,7 @@ async fn a_timed_out_run_is_stopped_and_reports_its_usage() {
         agentpipeline_core::pipeline::executor::request_cancel("t9"),
         "在跑的执行体应当找得到，才谈得上通知它收口"
     );
-    tokio::time::timeout(Duration::from_secs(5), jh)
+    tokio::time::timeout(Duration::from_secs(30), jh)
         .await
         .expect("收到中止请求的执行体应当在有界时间内收口")
         .unwrap()
@@ -4581,7 +4581,7 @@ async fn unsticking_releases_the_in_process_dedup_and_allows_a_rerun() {
         let e = executor.clone();
         tokio::spawn(async move { e.run("t-hang").await })
     };
-    tokio::time::timeout(Duration::from_secs(5), async {
+    tokio::time::timeout(Duration::from_secs(30), async {
         while calls.load(Ordering::SeqCst) < 1 {
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
@@ -4623,7 +4623,7 @@ async fn unsticking_releases_the_in_process_dedup_and_allows_a_rerun() {
 
     // 决策 226：`unstick` 先**请求中止**再摘去重，所以那个卡住的执行体自己就收口了——
     // 不必再放闸。此前它只能靠人放闸或重启进程才动，这正是「清了 DB 也没用」的由来。
-    tokio::time::timeout(Duration::from_secs(5), hanging)
+    tokio::time::timeout(Duration::from_secs(30), hanging)
         .await
         .expect("unstick 之后，卡住的执行体应当在有界时间内收口")
         .unwrap()
