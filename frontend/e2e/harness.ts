@@ -327,14 +327,21 @@ async function startMockLlm(
       // 这个值不会被读到；写成 string 是为了让类型检查看得懂这件事（svelte-check 会
       // 顺着 vitest 的 import 检查本文件——票 e2e-mock/01）。
       const nodeKey = key === null ? '' : owner ? `${owner}\u0000${key}` : key;
-      // 新节点运行：请求只有 system + user（openai.rs 的 build_body 在上述两条之后再追加
-      // 历史 messages）。每见到一次新一轮，轮指针 +1（首次 → 0），步骤指针归零。
+      // 新节点运行：**最后一条是 user**（与值班长同一条判据，2026-09-26 统一）。
       //
-      // 值班长不同：它没有「节点运行」这回事，每轮请求都带同一段态势快照前言 + 历史对话，
-      // 条数不固定，`messages.length <= 2` 对它永不成立。改为按「最后一条是 user」认新轮——
-      // 同一次回话里的工具往返以 tool 收尾，不会被误判成新轮（否则查一次台账就吃掉下一轮）。
+      // 从前节点用「`messages.length <= 2`」（system + user，openai.rs 的 build_body 在
+      // 那两条之后追加历史 messages），那条在**转录被续接**的几处形状上不再成立：
+      //   · pending → resume 重入（决策 279：补充输入 = 转录末尾的 user 轮）
+      //   · 失败重试（决策 278：转录原样保留 + 一条错误 turn = 末尾的 user 轮）
+      // 两种重入**都该**是新一轮，而旧判据把它们看成同一次工具往返——轮指针不前进、
+      // 脚本被耗尽、节点判「没等到 submit_metadata」（pending-resume ① 与 review-branch
+      // ②③ 就是这么红的：`msgs=6 new=false` 一条条打出来，轮号一直停在 0）。
+      //
+      // 同一次工具往返以 **tool** 收尾（assistant 发起、tool 结果回来），故两种情形仍分得开；
+      // 值班长本来就是这个判据（它每轮请求都带同一段态势快照前言 + 历史对话，条数不固定，
+      // 「≤2」对它永不成立）——两条路从此同源。
       const lastRole = messages[messages.length - 1]?.role ?? '';
-      const isNewRound = key === FOREMAN ? lastRole === 'user' : messages.length <= 2;
+      const isNewRound = lastRole === 'user';
       if (key && isNewRound) {
         state.round.set(nodeKey, (state.round.get(nodeKey) ?? -1) + 1);
         state.step.set(nodeKey, 0);

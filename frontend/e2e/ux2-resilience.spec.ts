@@ -330,7 +330,11 @@ test.describe('解锁恢复链（票 04，stream-self-heal）', () => {
   }) => {
     const bundle = watchBundle(page);
     let sessionReads = 0;
-    await page.route('**/foreman/session', async (route) => {
+    // **正则而不是 glob**：Playwright 的 glob 是对**整条 URL（含查询串）**匹配的
+    // （`urlMatch.js`：`isRegExp(match) ? match.test(url) : globToRegex(...)`），
+    // 而票 04 之后这一页读的是 `/foreman/session?session=…&kind=talk`——`**/foreman/session`
+    // 因此一条也拦不到（本用例第一版就是这么红的：读数恒 0）。
+    await page.route(/\/foreman\/session(\?|$)/, async (route) => {
       if (route.request().method() === 'GET') sessionReads += 1;
       return route.continue();
     });
