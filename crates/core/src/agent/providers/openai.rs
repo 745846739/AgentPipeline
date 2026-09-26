@@ -199,6 +199,7 @@ mod tests {
             max_tokens: Some(512),
             provider_id: None,
             run: None,
+            idle_timeout_sec: None,
         }
     }
 
