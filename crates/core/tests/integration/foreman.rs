@@ -142,6 +142,27 @@ impl Harness {
         self.runner_with(Settings::default(), agent)
     }
 
+    /// 配一个**窗口很小**的 provider（决策 291 / 票 06(b)：轮内压缩要能到线）。
+    ///
+    /// 窗口是唯一决定触发线的量（`estimate_context_capacity` 按 `Settings` 的比例算），
+    /// 故用例拿它当旋钮——不必造一套「让上下文长大」的假读数。
+    async fn provider_with_window(&self, window: u32) {
+        self.store
+            .upsert_provider(&agentpipeline_core::types::Provider {
+                id: "p-win".into(),
+                vendor: "openai".into(),
+                model: "window-model".into(),
+                context_window: window,
+                base_url: None,
+                api_key: None,
+                enabled: true,
+                created_at: self.store.now(),
+                updated_at: self.store.now(),
+            })
+            .await
+            .unwrap();
+    }
+
     /// 注入托管动作执行替身的那一种构造（票 08）。
     fn runner_with_steward(
         &self,
@@ -2783,18 +2804,341 @@ async fn the_diagnosis_pack_keeps_the_reason_when_truncated() {
 
     let requests = agent.request_log();
     let fed_back = serde_json::to_string(&requests[1].messages).unwrap();
+    // 人的那一轮**不预截**（决策 291 / 票 06(a)）：包超过卸载阈值就落盘，回灌的是
+    // 「回执 + 预览 + 路径」。顺序那条牙齿因此改挂到**预览**上——被切掉的必须是长尾，
+    // 不是「为什么卡住」那一屏（原话见 `read_diagnosis` 的分节顺序注释）。
     assert!(
-        fed_back.contains("已截断"),
-        "超过 12k 要留截断标记，不许静默截短"
+        fed_back.contains("已卸载") && fed_back.contains("foreman/context/"),
+        "人的那一轮超过阈值要走 L2 卸载：{fed_back}"
+    );
+    assert!(
+        !fed_back.contains("已截断"),
+        "人的那一轮不预截：体量归卸载管，不归 12k 截断管"
     );
     assert!(
         fed_back.contains("闸门失败：测试命令退出码 1"),
-        "失败原因是重点证据，必须在截断后的前 12k 里：{}",
+        "失败原因是重点证据，必须在卸载回执的预览里：{}",
         &fed_back[..fed_back.len().min(400)]
     );
     assert!(
         fed_back.contains("重试耗尽"),
-        "pending 原因必须在截断后的前 12k 里"
+        "pending 原因必须在卸载回执的预览里"
+    );
+}
+
+/// 值守轮**不放开**（裁决 4 / 票 06(a)）：`read_diagnosis` 的 12k 是「只读台账与诊断包
+/// **摘要**」那条分级纪律的一部分（决策 265 / 266），本次一字不改。
+///
+/// 故同一个包、同一个工具，两轮的收口不同：人的那一轮走卸载 + 逐字，值守轮走 12k 预截。
+#[tokio::test]
+async fn the_watch_round_keeps_the_12k_truncation_on_ledger_reads() {
+    let h = Harness::seeded().await;
+    let run_id = seed_failed_task(&h, "t1").await;
+    for i in 0..40 {
+        record_command(
+            &h,
+            "t1",
+            Some(run_id),
+            &format!("echo {}{}", "x".repeat(600), i),
+        )
+        .await;
+    }
+    park_task(&h.store, "t1", PendingKind::RetryExhausted, "重试耗尽").await;
+
+    let outcome = ledger_tool(
+        &h,
+        "s1",
+        false,
+        "read_diagnosis",
+        serde_json::json!({"task_id": "t1"}),
+    )
+    .await;
+    assert!(
+        outcome.contains("已截断"),
+        "值守轮超过 12k 要留截断标记，不许静默截短"
+    );
+    assert!(
+        !outcome.contains("已卸载"),
+        "值守轮不走卸载（诊断包只读摘要形态）：{outcome}"
+    );
+    assert!(
+        outcome.contains("闸门失败：测试命令退出码 1") && outcome.contains("重试耗尽"),
+        "截断不许吃掉最要紧的那一屏"
+    );
+}
+
+// ───────────── 窗口界（决策 291 / 票 06）：卸载放开 · 轮内压缩 · 撞墙恢复 ─────────────
+
+/// 直接拿工头的工具集跑一次台账工具（票 06：两轮的收口差异在**执行器**上，
+/// 故不必绕一整轮对话来验它）。
+async fn ledger_tool(
+    h: &Harness,
+    session_id: &str,
+    ledger_unbounded: bool,
+    tool: &str,
+    args: serde_json::Value,
+) -> String {
+    use agentpipeline_core::agent::client::ToolCall;
+    use agentpipeline_core::pipeline::foreman::{
+        foreman_available_tools_except, foreman_tooling, ForemanMoment,
+    };
+
+    let env_mode = agentpipeline_core::types::EnvMode::Ask;
+    let available = foreman_available_tools_except(env_mode, &[]);
+    let (tools, ctx) = foreman_tooling(
+        &h.store,
+        &Settings::default(),
+        h._home.home(),
+        Arc::new(testkit::SseRecorder::new()),
+        session_id,
+        env_mode,
+        ForemanMoment::Conversation,
+        &available,
+        None,
+        ledger_unbounded,
+    );
+    let call = ToolCall {
+        id: "call-1".into(),
+        name: tool.into(),
+        arguments: args.to_string(),
+    };
+    tools.execute(&call, &ctx).await.unwrap().content
+}
+
+/// 卸载回执里的路径（`完整内容：{path}（{n} token）` 那一段）。
+fn offloaded_path(receipt: &str) -> String {
+    receipt
+        .lines()
+        .find_map(|l| l.strip_prefix("完整内容："))
+        .and_then(|rest| rest.split('（').next())
+        .expect("回执里应当有「完整内容：<路径>」那一行")
+        .to_string()
+}
+
+/// 人的那一轮读台账：**大结果真卸载，且可按路径回读全文**（票 06(a) 的验收面）。
+///
+/// 「可按路径回读」是这条改动的全部意义——12k 预截时模型丢了那半截就真没了（没有路径
+/// 可回读），卸载之后它丢的是**可再取回**的那半截。故用例必须把回读那一步也走一遍，
+/// 而不是只断言回执里有路径。
+#[tokio::test]
+async fn a_human_turn_offloads_ledger_reads_and_can_read_them_back() {
+    use agentpipeline_core::agent::client::ToolCall;
+
+    let h = Harness::seeded().await;
+    let sid = h.session().await;
+    let run_id = seed_failed_task(&h, "t1").await;
+    // 40 条超长命令台账把包顶过卸载阈值（4000 token ≈ 16000 字符）
+    for i in 0..40 {
+        record_command(
+            &h,
+            "t1",
+            Some(run_id),
+            &format!("echo {}{}", "x".repeat(600), i),
+        )
+        .await;
+    }
+    park_task(&h.store, "t1", PendingKind::RetryExhausted, "重试耗尽").await;
+
+    let receipt = ledger_tool(
+        &h,
+        &sid,
+        true,
+        "read_diagnosis",
+        serde_json::json!({"task_id": "t1"}),
+    )
+    .await;
+    assert!(
+        receipt.contains("已卸载"),
+        "人的那一轮大结果要卸载：{receipt}"
+    );
+    let path = offloaded_path(&receipt);
+
+    // 回读：同一个执行器的 `read_file`（分段读中段——200 行的默认读法看不到命令台账中段）。
+    let env_mode = agentpipeline_core::types::EnvMode::Ask;
+    let available =
+        agentpipeline_core::pipeline::foreman::foreman_available_tools_except(env_mode, &[]);
+    let (tools, ctx) = agentpipeline_core::pipeline::foreman::foreman_tooling(
+        &h.store,
+        &Settings::default(),
+        h._home.home(),
+        Arc::new(testkit::SseRecorder::new()),
+        &sid,
+        env_mode,
+        agentpipeline_core::pipeline::foreman::ForemanMoment::Conversation,
+        &available,
+        None,
+        true,
+    );
+    // 中段那一条（第 20 条命令）只在盘上：预览是头 30 + 尾 30 行，够不着它。
+    let middle_marker = format!("echo {}{}", "x".repeat(600), 20);
+    let on_disk = std::fs::read_to_string(&path).unwrap();
+    assert!(on_disk.contains(&middle_marker), "全文应当落在盘上");
+    assert!(
+        !receipt.contains(&middle_marker),
+        "中段不该出现在回执预览里（否则这条用例证明不了「回读拿到了更多」）"
+    );
+    // 回读按行定位、只取窄窄一段：整份读回来又会超阈值、再被卸载一次（这本身是对的
+    // 行为，但那样证不了「回读拿到了预览里没有的东西」）。
+    let line = on_disk
+        .lines()
+        .position(|l| l.contains(&middle_marker))
+        .expect("中段行号") as u64;
+    let read = ToolCall {
+        id: "call-2".into(),
+        name: "read_file".into(),
+        arguments: serde_json::json!({"path": path, "offset": line, "limit": 3}).to_string(),
+    };
+    let window = tools.execute(&read, &ctx).await.unwrap().content;
+    assert!(
+        window.contains(&middle_marker),
+        "按路径分段回读应当能拿到预览之外的中段：{window}"
+    );
+}
+
+/// 轮内到线就压缩（票 06(b)），且**锚点是本轮那句问题**（决策 180 的语义）：
+/// 摘要插在它之后，被压掉的是它之前的历史——历史不得顶替本轮起点。
+#[tokio::test]
+async fn an_over_budget_transcript_compacts_inline_anchored_at_the_current_question() {
+    let h = Harness::seeded().await;
+    let sid = h.session().await;
+    // 窗口 8000 → 轮内触发线 80% = 6400 token ≈ 25600 字符。
+    h.provider_with_window(8_000).await;
+    // 历史（够长到有东西可压）：6 条
+    for i in 0..3 {
+        h.store
+            .append_foreman_user_message(&sid, &format!("旧问题{i} {}", "史".repeat(80)))
+            .await
+            .unwrap();
+        h.store
+            .append_foreman_message(NewForemanMessage::assistant(
+                &sid,
+                format!("旧回答{i} {}", "案".repeat(80)),
+            ))
+            .await
+            .unwrap();
+    }
+    // 一个够大但**低于卸载阈值**的文件：结果整份进 transcript（每份 ≈ 2000 token）
+    // 每份 ≈ 12000 字符（read_file 留 200 行）× 4 次 ≈ 12000 token —— 稳稳过线，
+    // 而单份 3000 token 又低于卸载阈值（4000），于是它们**整份进 transcript**。
+    std::fs::write(
+        h._home.path().join("notes.txt"),
+        (1..=260)
+            .map(|i| format!("第{i}行：这一段是现场笔记，用来把上下文顶过触发线，写得长一点。{i}"))
+            .collect::<Vec<_>>()
+            .join("\n"),
+    )
+    .unwrap();
+
+    let question = "现在怎么办？";
+    let mut script = Script::new();
+    for _ in 0..4 {
+        script
+            .for_foreman()
+            .tool("read_file", serde_json::json!({"path": "notes.txt"}));
+    }
+    script.for_foreman().text("看完了。");
+    let agent = FakeAgent::new(script);
+    h.runner(agent.clone())
+        .say(Some(&sid), question)
+        .await
+        .unwrap();
+
+    let requests = agent.request_log();
+    let last = requests.last().unwrap();
+    let texts: Vec<String> = last
+        .messages
+        .iter()
+        .map(|m| m.content.clone().unwrap_or_default())
+        .collect();
+    let summary_at = texts
+        .iter()
+        .position(|t| t.starts_with("[摘要] 已完成的操作："))
+        .expect("过线之后应当出现规则化摘要");
+    let question_at = texts
+        .iter()
+        .position(|t| t == question)
+        .expect("本轮那句问题必须在场");
+    assert_eq!(
+        question_at + 1,
+        summary_at,
+        "摘要要插在本轮起点（那句问题）之后、最近轮次之前：{texts:?}"
+    );
+    assert!(
+        texts[..question_at]
+            .iter()
+            .all(|t| !t.starts_with("旧问题")),
+        "被压掉的必须是本轮起点之前的载入历史：{texts:?}"
+    );
+}
+
+/// 撞墙恢复（票 06(c)）：provider 报上下文超长 → 压缩本轮转录后**重试这一次调用**，
+/// 而不是原地判败。
+#[tokio::test]
+async fn a_context_window_error_compacts_the_transcript_and_retries_the_call() {
+    let h = Harness::seeded().await;
+    let sid = h.session().await;
+    for i in 0..3 {
+        h.store
+            .append_foreman_user_message(&sid, &format!("旧问题{i} {}", "史".repeat(40)))
+            .await
+            .unwrap();
+        h.store
+            .append_foreman_message(NewForemanMessage::assistant(
+                &sid,
+                format!("旧回答{i} {}", "案".repeat(40)),
+            ))
+            .await
+            .unwrap();
+    }
+    std::fs::write(
+        h._home.path().join("notes.txt"),
+        (1..=200)
+            .map(|i| format!("第{i}行：现场笔记。"))
+            .collect::<Vec<_>>()
+            .join("\n"),
+    )
+    .unwrap();
+
+    let mut script = Script::new();
+    script
+        .for_foreman()
+        .tool("read_file", serde_json::json!({"path": "notes.txt"}));
+    script.for_foreman().push(testkit::Step::Fail {
+        kind: "llm_context_window".into(),
+        message: "这次请求放不下模型窗口".into(),
+        raw: "context_length_exceeded".into(),
+    });
+    script.for_foreman().text("压缩之后能跑了。");
+    let agent = FakeAgent::new(script);
+    let turn = h
+        .runner(agent.clone())
+        .say(Some(&sid), "帮我看看")
+        .await
+        .expect("压缩之后这一次调用应当成功");
+
+    assert_eq!(turn.reply, "压缩之后能跑了。");
+    let requests = agent.request_log();
+    assert_eq!(requests.len(), 3, "工具那一轮 + 撞墙 + 重试");
+    let failed = &requests[1].messages;
+    let retried = &requests[2].messages;
+    assert!(
+        retried.len() < failed.len(),
+        "重试那一趟必须是压过的（{} → {}）",
+        failed.len(),
+        retried.len()
+    );
+    assert!(
+        retried.iter().any(|m| m
+            .content
+            .as_deref()
+            .is_some_and(|c| c.starts_with("[摘要]"))),
+        "压缩留痕要看得见：{retried:?}"
+    );
+    assert!(
+        retried
+            .iter()
+            .any(|m| m.content.as_deref() == Some("帮我看看")),
+        "本轮那句问题在压缩后仍在场"
     );
 }
 

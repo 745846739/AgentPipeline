@@ -76,6 +76,8 @@ pub async fn run_env(
         &available,
         // 也不注入托管执行者：按键那一趟根本走不到托管分支（`confirmed_once` 已短路）
         None,
+        // 按下的是一个人按的动作：台账读数照人的那一轮放开（决策 291 / 票 06(a)）。
+        true,
     );
     let call = ToolCall {
         id: proposal.id.clone(),

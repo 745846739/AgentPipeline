@@ -540,6 +540,9 @@ pub fn foreman_tooling(
     available: &[&'static str],
     // 托管动作的执行者（票 08）。`None` = 不放行：D 层照旧恒提议。
     steward: Option<Arc<dyn crate::agent::tools::StewardActionRunner>>,
+    // 台账读数**不预截**（决策 291 / 票 06(a)）：人的那一轮与「按键执行」那一趟为真，
+    // 值守轮为假——分级纪律（它只读台账与诊断包摘要，决策 265 / 266）一字不动。
+    ledger_unbounded: bool,
 ) -> (ToolExecutor, ToolCallContext) {
     // 值班长的域就是家目录根（决策 207 的「分两组」：流水线阶段仍限任务工作区），
     // 并按路径前缀拒掉 `data/`——库里明文存着 provider 密钥（决策 112），
@@ -562,6 +565,11 @@ pub fn foreman_tooling(
     .with_recorder(Arc::new(store.clone()))
     .with_env_mode(env_mode)
     .with_allowed_tools(available.to_vec());
+    let tools = if ledger_unbounded {
+        tools.with_ledger_unbounded()
+    } else {
+        tools
+    };
     let tools = match steward {
         Some(runner) => tools.with_steward_actions(runner),
         None => tools,
@@ -1368,6 +1376,103 @@ impl ForemanRunner {
         self.human_turns.begin()
     }
 
+    /// 轮内压缩的触发线（决策 291 / 票 06(b)）：**窗口的 80%**。
+    ///
+    /// 复用流水线那套容量算术（[`crate::agent::context::estimate_context_capacity`] 的
+    /// 系统/用户预留与 `OUTPUT_RESERVE`），只把触发线从软限 60% 抬到 80%——理由见票面：
+    /// 压缩会打断 provider 的 prefix 缓存（2026-09-26 实测 94% 命中，是这套东西唯一便宜的
+    /// 地方），压一次之后下一次调用几乎全量重算，故触发要**迟钝**（到窗口 ~80% 才压）。
+    const FOREMAN_INLOOP_COMPACT_RATIO: f64 = 0.8;
+
+    /// 这一轮的窗口容量（决策 291 / 票 06(b)）：provider 行的 `context_window` + 上面那份
+    /// 算术。查不到（无可用 provider / 未登记窗口 / 读库失败）→ `None` = 跳过分档。
+    ///
+    /// **不因为查不到窗口就让这一轮失败**：流水线侧的显式失败（决策 110）守的是「超硬限
+    /// 时挂 pending」那条路——对讲台没有那条路，而「窗口没登记」不该让一次对话说不了话。
+    /// 真撞墙还有 (c) 那条恢复路兜着（靠 provider 自己的报错，不靠我们猜的窗口）。
+    async fn turn_capacity(
+        &self,
+        cfg: Option<&crate::types::StageConfig>,
+        system_prompt: &str,
+        user_prompt: &str,
+    ) -> Option<crate::agent::context::ContextCapacity> {
+        let providers = self.store.load_providers().await.ok()?;
+        let fallback = providers.iter().find(|p| p.enabled).map(|p| p.id.as_str());
+        let provider_id = crate::storage::catalog::resolve_provider_id(None, None, cfg, fallback)?;
+        let provider = providers.into_iter().find(|p| p.id == provider_id)?;
+        if provider.context_window == 0 {
+            return None;
+        }
+        let mut capacity = crate::agent::context::estimate_context_capacity(
+            provider.context_window as usize,
+            system_prompt,
+            user_prompt,
+            &self.settings,
+        );
+        capacity.soft_limit = (capacity.total as f64 * Self::FOREMAN_INLOOP_COMPACT_RATIO) as usize;
+        Some(capacity)
+    }
+
+    /// 本轮起点的下标（决策 291 / 票 06(b)）：`transcript` 里承载「这一轮要处理的那句话」
+    /// 的那条消息。压缩拿它当锚点（[`crate::agent::context::compact_messages_from`] 的
+    /// `current_start`）——载入的历史不得顶替它，否则真正的起点会被压成摘要。
+    ///
+    /// 按内容倒着找而不是记住一个下标：压缩会重排下标，而这句话本身不变。
+    fn round_start_of(transcript: &[Message], question: &str) -> usize {
+        transcript
+            .iter()
+            .rposition(|m| {
+                m.role == crate::agent::client::Role::User && m.content.as_deref() == Some(question)
+            })
+            .unwrap_or(0)
+    }
+
+    /// 轮内预算门（票 06(b)）：过线就按轮压缩，返回压掉的段数（0 = 没触发 / 压不动）。
+    ///
+    /// 判据与流水线逐字同源（[`crate::agent::context::should_compact`] 对
+    /// [`crate::agent::context::estimate_messages_tokens`] 的全文读数）——差别只有那条
+    /// 触发线（80% 而不是软限 60%，理由见 [`Self::FOREMAN_INLOOP_COMPACT_RATIO`]）。
+    fn compact_inline_if_over_budget(
+        &self,
+        transcript: &mut Vec<Message>,
+        question: &str,
+        system_prompt: &str,
+        user_prompt: &str,
+        capacity: Option<crate::agent::context::ContextCapacity>,
+    ) -> usize {
+        let Some(capacity) = capacity else {
+            return 0;
+        };
+        let estimate =
+            crate::agent::context::estimate_messages_tokens(system_prompt, user_prompt, transcript);
+        if !crate::agent::context::should_compact(estimate, capacity) {
+            return 0;
+        }
+        self.compact_inline_forced(transcript, question)
+    }
+
+    /// 无条件压一轮（票 06(b) 的触发与 (c) 的撞墙恢复共用）。
+    fn compact_inline_forced(&self, transcript: &mut Vec<Message>, question: &str) -> usize {
+        let before = transcript.len();
+        let start = Self::round_start_of(transcript, question);
+        let outcome = crate::agent::context::compact_messages_from(
+            transcript,
+            self.settings.keep_recent_rounds,
+            start,
+        );
+        if outcome.compacted_messages == 0 {
+            return 0;
+        }
+        tracing::info!(
+            before,
+            after = outcome.messages.len(),
+            compacted = outcome.compacted_messages,
+            "值班长轮内上下文超线，已按轮压缩（票 06(b)）"
+        );
+        *transcript = outcome.messages;
+        outcome.compacted_messages
+    }
+
     /// 回一句话，落进指定的会话。
     ///
     /// 超预算才摘要（决策 269 / 票 foreman-within-boundary 03）：把**掉出预算**的最老
@@ -1792,6 +1897,8 @@ impl ForemanRunner {
             ForemanMoment::Conversation,
             &available,
             self.steward_actions.clone(),
+            // 人的那一轮放开台账读数（票 06(a)）：值守轮按摘要形态读（分级纪律）。
+            !input.is_watch(),
         );
         let tools = tools.with_ask_slot(ask_slot.clone());
 
@@ -1837,11 +1944,14 @@ impl ForemanRunner {
         // 值守简报**总是**追加成最后一条：它带署名（`TurnInput::transcript_text`），
         // 而历史里最后一条也是 user（刚落的用户行）时不能靠「已经有了」跳过它——
         // 那会让这一轮真正要处理的东西消失。人的话反过来：历史里最后一条就是它。
+        // 这一轮要处理的那句话（本轮起点）：人格里那句「问题由 transcript 的最后一条承担」
+        // 说的就是它。两处用它——末尾那条消息由它兜底（见上），轮内压缩拿它当锚点（票 06(b)）。
+        let question = input.transcript_text();
         match (&input, transcript.last()) {
             (TurnInput::Human(text), Some(m)) if m.role == crate::agent::client::Role::User => {
                 let _ = text;
             }
-            _ => transcript.push(Message::user(input.transcript_text())),
+            _ => transcript.push(Message::user(question.clone())),
         }
 
         let tool_defs = Self::tool_defs(&available);
@@ -1873,9 +1983,25 @@ impl ForemanRunner {
             cfg.as_ref().and_then(|c| c.idle_timeout_sec),
             crate::config::NodeTimeouts::default(),
         );
+        // 轮内窗口预算（决策 291 / 票 06(b)）：**把已经造好的那套机器接上**——流水线的
+        // 容量算术（系统/用户两段预留 + `OUTPUT_RESERVE` + 软硬限）对讲台此前一次都没读过。
+        // 窗口来自 provider 行（`context_window`）；查不到（无可用 provider / 未登记）→
+        // `None` = 跳过分档，不臆造窗口（决策 110 的姿态）——撞墙那条路（c）还在。
+        let capacity = self
+            .turn_capacity(cfg.as_ref(), &system_prompt, &user_prompt)
+            .await;
 
         for _ in 0..round_limit {
-            let request = LlmRequest {
+            // 每次调用前查一次预算（票 06(b)）：到线就按轮压缩（规则化、不调 LLM）。
+            // **查在组装请求之前**，故这一轮发出去的已经是压过的那一份。
+            self.compact_inline_if_over_budget(
+                &mut transcript,
+                &question,
+                &system_prompt,
+                &user_prompt,
+                capacity,
+            );
+            let mut request = LlmRequest {
                 // 占位阶段：让既有的 provider 解析链跑通。真正生效的 provider 从
                 // `provider_id` 进来（决策 182②，与 project_analysis 同一路子）。
                 stage: Stage::Init,
@@ -1901,7 +2027,27 @@ impl ForemanRunner {
                 }),
                 idle_timeout_sec: Some(idle_timeout_secs),
             };
-            let response = self.complete_with_retry(request).await?;
+            let response = match self.complete_with_retry(request.clone()).await {
+                Ok(response) => response,
+                // 撞墙恢复（决策 291 / 票 06(c)）：provider 报上下文超长时**不原地判败**
+                // ——把这一轮的转录压一遍再重试这一次调用（只一次；再撞就是真的放不下，
+                // 那时报错才是诚实的）。压缩是**无条件**的：这个错误说明算术低估了
+                // （真 tokenizer 与 4 字符≈1 的估算、工具定义都占窗口），不按触发线走。
+                Err(e) if is_context_window(&e) => {
+                    let compacted = self.compact_inline_forced(&mut transcript, &question);
+                    if compacted == 0 {
+                        return Err(e);
+                    }
+                    tracing::warn!(
+                        session = %session.id,
+                        compacted,
+                        "provider 报上下文超长：压缩本轮转录后重试这一次调用（票 06(c)）"
+                    );
+                    request.messages = transcript.clone();
+                    self.complete_with_retry(request).await?
+                }
+                Err(e) => return Err(e),
+            };
             tokens.0 += response.prompt_tokens;
             tokens.1 += response.completion_tokens;
             // 推理原文（决策 244）：**只攒起来展示，不回灌**——既不进 `transcript`，
@@ -1981,7 +2127,15 @@ impl ForemanRunner {
                     args_summary,
                     ok,
                 });
-                transcript.push(Message::tool_result(call, truncate(&content)));
+                // 回灌的上限（决策 291 / 票 06(a)）：值守轮照旧按 12k 预截；人的那一轮
+                // **逐字回灌**——体量已由 L2 卸载管住（大结果只剩回执 + 路径），再截一次
+                // 只会把「卸载了可以回读」这件事变成假话（截掉的那半没有路径可回读）。
+                let content = if input.is_watch() {
+                    truncate(&content)
+                } else {
+                    content
+                };
+                transcript.push(Message::tool_result(call, content));
             }
         }
 
@@ -2963,6 +3117,17 @@ fn is_idle_timeout(error: &Error) -> bool {
     matches!(
         error,
         Error::LlmClassified { kind, .. } if kind == "llm_idle_timeout"
+    )
+}
+
+/// provider 判的这一轮请求放不下它的窗口（决策 291 / 票 06(c)）。
+///
+/// 类别串与 `LlmErrorKind::ContextWindow::as_str()` 同一份（`llm_context_window`）——
+/// 认的是**生产侧那个稳定标识**，不是错误文本里有没有「context」。
+fn is_context_window(error: &Error) -> bool {
+    matches!(
+        error,
+        Error::LlmClassified { kind, .. } if kind == "llm_context_window"
     )
 }
 

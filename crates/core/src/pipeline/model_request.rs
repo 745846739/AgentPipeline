@@ -273,22 +273,9 @@ impl RequestPlan {
             return BudgetCheck::Ok { compacted: None };
         };
         let estimate = |msgs: &[Message]| {
-            count_tokens(&self.user)
-                + count_tokens(&self.system)
-                + msgs
-                    .iter()
-                    .map(|m| {
-                        // 上下文里既有文本，也有 assistant 的 tool_calls 参数
-                        // （模型自己发出的 payload 同样占窗口，漏算会低估）
-                        let text = count_tokens(m.content.as_deref().unwrap_or(""));
-                        let args: usize = m
-                            .tool_calls
-                            .iter()
-                            .map(|c| count_tokens(&c.name) + count_tokens(&c.arguments))
-                            .sum();
-                        text + args
-                    })
-                    .sum::<usize>()
+            // 算术在 `agent::context`（决策 291 / 票 foreman-unbounded 06）：值班长的轮内
+            // 压缩与这里必须是同一份——两处各写一份就会各到各的线。
+            crate::agent::context::estimate_messages_tokens(&self.system, &self.user, msgs)
         };
 
         if !should_compact(estimate(messages), capacity) {

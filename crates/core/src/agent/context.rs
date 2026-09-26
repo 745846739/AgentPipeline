@@ -68,6 +68,26 @@ pub fn estimate_context_capacity(
     }
 }
 
+/// 一次请求全文的 token 估算：两段静态 prompt + 一组消息。
+///
+/// 两端同源（决策 291 / 票 06）：流水线每轮的预算检查（`RequestPlan::check_budget`）
+/// 与值班长的轮内压缩吃**同一份**算术——两处各写一份的下场是「一边到线了、另一边还没到」，
+/// 而它们说的是同一件事。
+pub fn estimate_messages_tokens(system: &str, user: &str, messages: &[Message]) -> usize {
+    count_tokens(user) + count_tokens(system) + messages.iter().map(message_tokens).sum::<usize>()
+}
+
+/// 单条消息的估算：正文 + 模型自己发出的 tool_calls 参数（同样占窗口，漏算会低估）。
+fn message_tokens(message: &Message) -> usize {
+    let text = count_tokens(message.content.as_deref().unwrap_or(""));
+    let args: usize = message
+        .tool_calls
+        .iter()
+        .map(|c| count_tokens(&c.name) + count_tokens(&c.arguments))
+        .sum();
+    text + args
+}
+
 /// 是否触发 L3 压缩（超过 soft limit）。
 pub fn should_compact(current_tokens: usize, capacity: ContextCapacity) -> bool {
     current_tokens > capacity.soft_limit

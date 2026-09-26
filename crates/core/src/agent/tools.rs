@@ -460,6 +460,14 @@ pub struct ToolExecutor {
     /// 载荷写进槽，`respond_inner` 收口时取走挂到那一轮的 assistant 行上——行还没写出来时
     /// 载荷无处可挂，故走槽不走工具直写（那会造出「问题在、回话没落」的半截状态）。
     ask_slot: Option<Arc<tokio::sync::Mutex<Option<serde_json::Value>>>>,
+    /// 台账读数**不预截**（决策 291 / 票 06(a)）：人的那一轮读台账时，三件台账工具不做
+    /// 12k 内部截断，大结果改由 L2 卸载接管（回执给绝对路径 + 预览，模型用 `read_file`
+    /// 回读需要的那一段）。
+    ///
+    /// 值守轮**保持原样**：它的 `read_diagnosis` 12k 是「只读台账与诊断包**摘要**」那条
+    /// 分级纪律的一部分（决策 265 / 266），本次一字不动（裁决 4：放开的是它**能查多久**，
+    /// 不是**能查什么**）。
+    ledger_unbounded: bool,
 }
 
 /// 命令输出推流的上下文（票 14）：SSE 去向 + 事件里要带的任务/分支。
@@ -512,6 +520,7 @@ impl ToolExecutor {
             confirmed: false,
             steward_actions: None,
             ask_slot: None,
+            ledger_unbounded: false,
         }
     }
 
@@ -572,6 +581,13 @@ impl ToolExecutor {
     /// 而这两个工具要验的恰恰是「读得到真台账」。
     pub fn with_ledger(mut self, store: Store) -> Self {
         self.ledger = Some(store);
+        self
+    }
+
+    /// 台账读数**不预截**（决策 291 / 票 06(a)）：人的那一轮读台账时连 12k 都不设，
+    /// 大结果由 L2 卸载接管。只给人的那一轮（含按键执行那一趟）用。
+    pub fn with_ledger_unbounded(mut self) -> Self {
+        self.ledger_unbounded = true;
         self
     }
 
@@ -854,23 +870,24 @@ impl ToolExecutor {
     /// `run_command` 在自身路径里已按 stdout/stderr 语义卸载（保留退出码与失败行），
     /// 此处跳过避免二次卸载；`submit_metadata` 是极小 JSON，无需处理。
     ///
-    /// 值班长的两个台账工具同样跳过：卸载要写 `home.context_dir(&ctx.task_id)`，
-    /// 而值班长**没有 task_id**（空串会落到上下文根目录，污染下一个真实任务的文件）。
-    /// 它们的结果在工具内部已按字符上限截断，不会无界增长。
+    /// 三件台账工具的跳过**只对值守轮成立**（决策 291 / 票 06(a)）：那条跳过最初的理由
+    /// 是「值班长没有 task_id，卸载无处可写」，而它会话维度目录早已通
+    /// （[`Self::offload_dir`] 的 `foreman_context_dir` 一支，决策 204④）。人的那一轮
+    /// 于是按**全部工具**的同一姿态走卸载；值守轮照旧跳过——它读的是台账与诊断包
+    /// **摘要**（决策 265 / 266），那次跳过今天由 `ledger_unbounded` 表达，而不是由
+    /// 「无处可写」这个已经不成立的理由。
     fn apply_l2_offload(
         &self,
         call: &ToolCall,
         ctx: &ToolCallContext,
         outcome: ToolOutcome,
     ) -> Result<ToolOutcome> {
-        if matches!(
-            call.name.as_str(),
-            "run_command"
-                | "submit_metadata"
-                | "read_task"
-                | "read_conversation"
-                | "read_diagnosis"
-        ) {
+        let ledger_skipped = !self.ledger_unbounded
+            && matches!(
+                call.name.as_str(),
+                "read_task" | "read_conversation" | "read_diagnosis"
+            );
+        if ledger_skipped || matches!(call.name.as_str(), "run_command" | "submit_metadata") {
             return Ok(outcome);
         }
         if !needs_offload(&outcome.content, &self.settings) {
@@ -1170,11 +1187,24 @@ impl ToolExecutor {
             "stalled": task.stalled,
             "updated_at": task.updated_at.to_rfc3339(),
         });
-        // `description` 与 `allowed_actions` 都可能很长，而这个结果**不走** L2 卸载
-        // （见 `apply_l2_offload`），所以上限必须在这里落。
-        Ok(ToolOutcome::ok(
-            crate::pipeline::foreman::truncate_tool_result(&serde_json::to_string_pretty(&value)?),
-        ))
+        // `description` 与 `allowed_actions` 都可能很长，而值守轮的这个结果**不走** L2
+        // 卸载（见 `apply_l2_offload`），所以上限必须在这里落——人的那一轮反过来：
+        // 上限交给卸载（回执带路径），这里逐字交出去（决策 291 / 票 06(a)）。
+        Ok(self.ledger_result(serde_json::to_string_pretty(&value)?))
+    }
+
+    /// 台账工具结果的收口（决策 291 / 票 06(a)）：人的那一轮**逐字交出去**——大结果由
+    /// L2 卸载接管（落会话维度目录、回执给绝对路径，模型用 `read_file` 回读需要的那一段）；
+    /// 值守轮按 12k 预截（「只读台账与诊断包摘要」那条分级纪律，决策 265 / 266）。
+    ///
+    /// 两档用的是同一份结果构造，只是收口不同——故它是一处收口而不是三个工具里各写一遍
+    /// 的 `if`。
+    fn ledger_result(&self, text: String) -> ToolOutcome {
+        if self.ledger_unbounded {
+            ToolOutcome::ok(text)
+        } else {
+            ToolOutcome::ok(crate::pipeline::foreman::truncate_tool_result(&text))
+        }
     }
 
     /// 台账读句柄。六个 A 层读数与两个台账工具共用它（票 01）。
@@ -1366,9 +1396,7 @@ impl ToolExecutor {
         let text = serde_json::to_string_pretty(
             &serde_json::json!({ "task_id": task.id, "evidence": sections }),
         )?;
-        Ok(ToolOutcome::ok(
-            crate::pipeline::foreman::truncate_tool_result(&text),
-        ))
+        Ok(self.ledger_result(text))
     }
 
     /// 一个读数 → 交出去的文本。
@@ -1759,7 +1787,18 @@ impl ToolExecutor {
                 )))
             }
         };
-        let messages = trim_conversation_messages(&conversation.messages_json);
+        // 值守轮：消息按条数与字符双重截断，包上 stage / agent_type 等字段后仍可能略超
+        // 上限，这里再兜一次；人的那一轮两条截断都不做——整份会话逐字交出去，大结果由
+        // L2 卸载接管（决策 291 / 票 06(a)：读回执要能看到全文，而卸载回执正是那条路）。
+        let messages = if self.ledger_unbounded {
+            conversation
+                .messages_json
+                .as_array()
+                .cloned()
+                .unwrap_or_default()
+        } else {
+            trim_conversation_messages(&conversation.messages_json)
+        };
         let value = serde_json::json!({
             "task_id": task_id,
             "run_id": run_id,
@@ -1771,11 +1810,7 @@ impl ToolExecutor {
             "completion_tokens": conversation.completion_tokens,
             "messages": messages,
         });
-        // 消息已按条数与字符双重截断，但包上 stage / agent_type 等字段后仍可能略超上限；
-        // 这里再兜一次（与 `read_task` 同一理由：它不走 L2 卸载）。
-        Ok(ToolOutcome::ok(
-            crate::pipeline::foreman::truncate_tool_result(&serde_json::to_string_pretty(&value)?),
-        ))
+        Ok(self.ledger_result(serde_json::to_string_pretty(&value)?))
     }
 
     async fn run_command(&self, call: &ToolCall, ctx: &ToolCallContext) -> Result<ToolOutcome> {
