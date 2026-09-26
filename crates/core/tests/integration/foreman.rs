@@ -21,9 +21,9 @@ use agentpipeline_core::pipeline::foreman::{
     Attribution, AttributionKind, ForemanRunner, ForemanSegment, COMPACTION_MARK,
     FOREMAN_AGENT_TYPE, FOREMAN_ATTRIBUTION_MARK, FOREMAN_FAILED_TURN_MARK,
     FOREMAN_LOOP_REMINDER_MARK, FOREMAN_LOOP_TURN_MARK, FOREMAN_MAX_ROUNDS, FOREMAN_NO_ACTION_MARK,
-    FOREMAN_PARTIAL_TURN_MARK, FOREMAN_PERSONA, FOREMAN_STAGE_KEY, FOREMAN_TALK_DIGEST_MARK,
-    FOREMAN_TOOL_SPECS, FOREMAN_WATCH_DIGEST_MARK, FOREMAN_WATCH_FAILED_TURN_MARK,
-    FOREMAN_WATCH_MARK, OPERATION_LOG_MARK,
+    FOREMAN_PARTIAL_TURN_MARK, FOREMAN_PERSONA, FOREMAN_STAGE_KEY, FOREMAN_STOPPED_TURN_MARK,
+    FOREMAN_TALK_DIGEST_MARK, FOREMAN_TOOL_SPECS, FOREMAN_WATCH_DIGEST_MARK,
+    FOREMAN_WATCH_FAILED_TURN_MARK, FOREMAN_WATCH_MARK, OPERATION_LOG_MARK,
 };
 use agentpipeline_core::sse::{SseEvent, SseEventType, ToolPhase};
 use agentpipeline_core::storage::foreman::{
@@ -5800,6 +5800,191 @@ async fn a_repeating_tool_call_is_reminded_once_then_closed_out() {
             .iter()
             .any(|m| m.role == "system" && m.content.contains("没跑起来")),
         "打转收口不该落一条失败账：{stored:?}"
+    );
+}
+
+/// 第 N 次调用起**挂住不返回**的替身（票 09 的停钮用例）：只有停钮能把它打断。
+///
+/// 与 [`ChattyForever`] 的差别只有一个：它在某一次调用上不返回——而「停钮必须能打断
+/// **正在跑的那一次调用**」正是本票要证的那件事（只在下一次调用才查的协作式中止，
+/// 在人按停这件事上等于没停）。
+struct StallingAfter {
+    calls: Arc<std::sync::atomic::AtomicUsize>,
+    /// 第几次调用**起**挂住。
+    stall_at: usize,
+    /// 第 1 次调用里由它提一条提议（要验「被停在半路那一轮提的提议留着」，而提议必须
+    /// 在**轮内**创建——判据是 `created_at >= 这一轮起点`）。
+    propose: Option<(Store, String)>,
+    /// 挂住之前先通知一声：用例据此在**调用在飞**时按停。
+    stalled: Arc<tokio::sync::Notify>,
+}
+
+impl LlmClient for StallingAfter {
+    fn complete(
+        &self,
+        _request: LlmRequest,
+    ) -> futures::future::BoxFuture<'static, agentpipeline_core::Result<AgentResponse>> {
+        let n = self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
+        let (stall_at, stalled) = (self.stall_at, Arc::clone(&self.stalled));
+        let propose = (n == 1).then(|| self.propose.clone()).flatten();
+        Box::pin(async move {
+            if let Some((store, session_id)) = propose {
+                store
+                    .create_foreman_proposal(
+                        agentpipeline_core::storage::proposals::NewForemanProposal {
+                            kind: agentpipeline_core::storage::proposals::ForemanProposalKind::ApiCall,
+                            payload: None,
+                            session_id,
+                            tool: "task".into(),
+                            args: serde_json::json!({"task_id": "t1", "action": "resume"}),
+                            summary: "（用例）把 t1 接着跑".into(),
+                            situation: None,
+                        },
+                    )
+                    .await?;
+            }
+            if n >= stall_at {
+                stalled.notify_one();
+                std::future::pending::<()>().await;
+            }
+            Ok(AgentResponse {
+                content: Some(format!("（第 {n} 步）我先看看 t1。")),
+                tool_calls: vec![agentpipeline_core::agent::client::ToolCall {
+                    id: format!("c{n}"),
+                    name: "read_task".into(),
+                    arguments: r#"{"task_id":"t1"}"#.into(),
+                }],
+                prompt_tokens: 10,
+                completion_tokens: 5,
+                ..Default::default()
+            })
+        })
+    }
+}
+
+/// 停钮（决策 294 / 票 09）：按下去 → **正在跑的那一次调用**被打断、部分结论落库并挂
+/// `【已停】`、**它提的悬空提议留着**（显式修订决策 233③）且标了来路、失败账为零。
+#[tokio::test]
+async fn pressing_stop_ends_the_human_turn_and_keeps_its_proposals() {
+    let h = Harness::seeded().await;
+    let sid = h.session().await;
+    let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let stalled = Arc::new(tokio::sync::Notify::new());
+    let runner = Arc::new(h.runner_with_llm(Arc::new(StallingAfter {
+        calls: calls.clone(),
+        // 第 2 次调用上挂住：那时这一轮已经说过一句话（第 1 步），
+        // 也提过一条提议——正是「停在半路」的形状。
+        stall_at: 2,
+        propose: Some((h.store.clone(), sid.clone())),
+        stalled: stalled.clone(),
+    }) as Arc<dyn LlmClient>));
+
+    let who = Arc::clone(&runner);
+    let sid_for_turn = sid.clone();
+    let turn_task = tokio::spawn(async move { who.say(Some(&sid_for_turn), "盯着 t1").await });
+    // 等第 2 次调用真的发出去（在飞），再按停——这一格是 `select!` 那条路，
+    // 只在下一次调用才查的协作式中止在这里会挂着不动。
+    stalled.notified().await;
+    assert!(
+        agentpipeline_core::pipeline::foreman::cancel_foreman_turn(&sid),
+        "这一班确实有一轮在飞：停钮必须找得到它的通道"
+    );
+    let turn = turn_task.await.unwrap().unwrap();
+
+    // ① 收口：部分结论 + 【已停】+ 停在第几轮（读者可能不是按停的那个人）
+    assert!(turn.stopped, "这一轮是被按停的");
+    assert!(
+        turn.reply.contains(FOREMAN_STOPPED_TURN_MARK)
+            && turn.reply.contains("（第 1 步）我先看看 t1。")
+            && turn.reply.contains("停在第 2 轮"),
+        "收口要带标记、部分结论与为什么：{}",
+        turn.reply
+    );
+    assert_eq!(
+        calls.load(std::sync::atomic::Ordering::SeqCst),
+        2,
+        "第 2 次调用被放弃：它永远不返回，而这一轮照常收了口"
+    );
+    // ② 落库那一行：标注在、**失败账不在**（按停不是失败）
+    let stored = h.store.list_foreman_messages(&sid, 10).await.unwrap();
+    let closed = stored
+        .iter()
+        .find(|m| m.role == "assistant")
+        .unwrap_or_else(|| panic!("收口那一行要落库：{stored:?}"));
+    assert!(
+        closed.content.contains(FOREMAN_STOPPED_TURN_MARK),
+        "落库那一行带【已停】：{}",
+        closed.content
+    );
+    assert!(
+        !stored.iter().any(|m| m.role == "system"),
+        "按停不落失败账（它不是它坏了）：{stored:?}"
+    );
+    // ③ 提议：**留着**（决策 294 修订 233③），且标了「来自一轮被停在半路的话」
+    let proposals = h.store.list_pending_foreman_proposals(&sid).await.unwrap();
+    assert_eq!(proposals.len(), 1, "被停在半路那一轮提的提议不许被作废");
+    assert!(
+        proposals[0].stopped_round,
+        "要在提议上标注它来自一轮被停在半路的话"
+    );
+}
+
+/// 人按停而它**一句话都没说过**（决策 294 / 票 09）：照样落一行（标记 + 停在第几轮），
+/// 且**不**走失败处置——把「你要它停」写成「它没跑起来」是归因失真，还会顺手发一条
+/// 失败通知（按停的人就在屏幕前，那是纯噪声）。
+#[tokio::test]
+async fn pressing_stop_before_it_says_anything_still_leaves_a_row() {
+    let h = Harness::empty().await;
+    let sid = h.session().await;
+    let server = TinyHttp::spawn("200", "application/json", b"{}".to_vec(), Duration::ZERO);
+    attach_notifier(&h, &server);
+    let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let stalled = Arc::new(tokio::sync::Notify::new());
+    let runner = Arc::new(h.runner_with_llm(Arc::new(StallingAfter {
+        calls: calls.clone(),
+        // 第 1 次调用就挂住：这一轮连一句话都还没说
+        stall_at: 1,
+        propose: None,
+        stalled: stalled.clone(),
+    }) as Arc<dyn LlmClient>));
+
+    let who = Arc::clone(&runner);
+    let sid_for_turn = sid.clone();
+    let turn_task = tokio::spawn(async move { who.say(Some(&sid_for_turn), "盯着 t1").await });
+    stalled.notified().await;
+    assert!(agentpipeline_core::pipeline::foreman::cancel_foreman_turn(
+        &sid
+    ));
+    let turn = turn_task.await.unwrap().unwrap();
+
+    assert!(turn.stopped);
+    assert!(
+        turn.reply.contains(FOREMAN_STOPPED_TURN_MARK)
+            && turn.reply.contains("停在第 1 轮")
+            && turn.reply.contains("没有部分结论可留"),
+        "没有部分结论时那行说的是这件事本身：{}",
+        turn.reply
+    );
+    let stored = h.store.list_foreman_messages(&sid, 10).await.unwrap();
+    assert!(
+        stored
+            .iter()
+            .any(|m| m.role == "assistant" && m.content.contains(FOREMAN_STOPPED_TURN_MARK)),
+        "照样落一行：{stored:?}"
+    );
+    assert!(
+        !stored.iter().any(|m| m.role == "system"),
+        "按停不落失败账：{stored:?}"
+    );
+    assert_eq!(
+        server.hits(),
+        0,
+        "按停不是失败：不发失败通知，也没有回话完成通知"
+    );
+    // 通道随这一轮结束一起摘掉：没有在飞轮的班次上，停钮**如实**回 false
+    assert!(
+        !agentpipeline_core::pipeline::foreman::cancel_foreman_turn(&sid),
+        "这一轮已经结束了：停钮没有东西可停"
     );
 }
 

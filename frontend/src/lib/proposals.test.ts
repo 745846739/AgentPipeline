@@ -35,6 +35,8 @@ function proposal(over: Partial<ForemanProposal> = {}): ForemanProposal {
     args: { path: 'notes.md' },
     summary: '写文件 notes.md',
     status: 'pending',
+    // 来路（决策 294 / 票 09）：这个替身造的是正常来路的提议
+    stopped_round: false,
     created_at: '2026-09-17T21:55:00Z',
     // TTL 10 分钟（决策 207）：下面这批用例的「现在」落在到期前 5 分钟
     expires_at: '2026-09-17T22:05:00Z',

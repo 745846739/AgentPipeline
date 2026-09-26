@@ -11,6 +11,7 @@
 //! | POST | `/foreman/sessions` | 新开一个班次 |
 //! | PATCH | `/foreman/sessions/{id}` | 改名 |
 //! | POST | `/foreman/sessions/{id}/archive` | 归档（从列表里收起来，不删行） |
+//! | POST | `/foreman/sessions/{id}/cancel` | 停钮：请这一班正在跑的那一轮停下（票 09） |
 //! | GET | `/foreman/session?session=<id>` | 某个班次的全部轮次 + 提议 + 合计 token |
 //! | POST | `/foreman/messages` | 说一句话，得到一次回话 |
 //! | GET | `/foreman/stream` | 订阅回话的逐字增量与提议事件 |
@@ -248,6 +249,32 @@ pub async fn archive_session(
         .map_err(map_core_error)?
         .ok_or_else(|| session_not_found(&id))?;
     Ok(Json(json!({ "session": session_wire(&session) })))
+}
+
+/// `POST /foreman/sessions/{id}/cancel`：**停钮**——请这一班正在跑的那一轮停下
+/// （决策 294 / 票 09）。
+///
+/// 只管**人这一轮**：值守轮压根不登记停钮通道（裁决 10：它归开关），故这里返回 `false`，
+/// 而那不是错误——「没有一轮在跑」本身就是答案，界面据此把那颗钮收回去。
+///
+/// **这不是硬中止**（与流水线的 `request_cancel` 同一句话，决策 226）：那一轮在可被打断的
+/// 观察点收口（正在跑的那次模型调用 / 下一轮开头），已经烧掉的 token 照常落库，
+/// **部分结论与它提的提议都留着**（决策 294 显式修订 233③）。收口是**协作**的，故
+/// `cancelled: true` 说的是「请求已经送到」，不是「它已经停了」——停了这件事由那一轮自己
+/// 落的那一行（`【已停】`）回答。
+///
+/// 为什么不校验班次是否存在：这个端点的答案与台账无关（在飞现场是**进程内**的登记，
+/// 与 `foreman_turn_in_flight` 同一姿态）。查库只会给「班次已被清掉、但那一轮还在跑」
+/// 这种真实现场添一条假的 404。
+pub async fn cancel_session(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+) -> ApiResult<impl IntoResponse> {
+    if state.foreman.is_none() {
+        return Err(foreman_unwired());
+    }
+    let cancelled = agentpipeline_core::pipeline::foreman::cancel_foreman_turn(&id);
+    Ok(Json(json!({ "cancelled": cancelled })))
 }
 
 // ───────────────────────── 命令（决策 204④ / 206，票 03）─────────────────────────
@@ -917,6 +944,9 @@ fn proposal_wire(p: &ForemanProposal) -> serde_json::Value {
         "args": p.args,
         "summary": p.summary,
         "status": p.status.as_str(),
+        // 来路（决策 294 / 票 09）：它来自一轮被人按停的话——那一条的正文里有一句
+        // 没说完的结论，按之前多看一眼。界面据此在卡片上多写一行（不另加钮）。
+        "stopped_round": p.stopped_round,
         // 形态与载荷（票 12）：前端按 `kind` 决定渲染哪一块（diff + 闸门读数 vs 参数摘要）
         "kind": p.kind.as_str(),
         "payload": p.payload,

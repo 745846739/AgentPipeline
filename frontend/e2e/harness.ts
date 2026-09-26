@@ -363,37 +363,51 @@ async function startMockLlm(
       // **拖住再回**（决策 260 的用例装置）：一轮「还在跑」因此有一段可观测的窗口，
       // 「跑着的时候刷新页面」才抢得到。字节仍是上面那一份产出的，只有**何时**发出去不同。
       const delayMs = step && step.kind === 'text' ? (step.delayMs ?? 0) : 0;
-      const send = () => {
-        res.writeHead(200, {
-          'content-type': 'text/event-stream',
-          'cache-control': 'no-cache',
-          connection: 'close',
-        });
-        res.end(out);
+      // 客户端**中途走了**是常态，不是装置故障：停钮（决策 294）与关页都会把这一条
+      // 连接掐掉，而这里可能还在 `setTimeout` 里等着写。写一个已销毁的 socket 会抛，
+      // 抛在定时器里就是未捕获异常——那会把整个 mock 进程带走，后续用例跟着全红。
+      const write = (fn: () => void) => {
+        try {
+          fn();
+        } catch {
+          /* 客户端已经走了：这一份字节没有收件人，不是错误 */
+        }
       };
+      const send = () =>
+        write(() => {
+          res.writeHead(200, {
+            'content-type': 'text/event-stream',
+            'cache-control': 'no-cache',
+            connection: 'close',
+          });
+          res.end(out);
+        });
       // **分两截滴**（同上）：前半截先真写出去，隔 `gapMs` 再补后半截并收线。刷新之后的
       // 那一段增量因此是**真的在刷新之后到达的**——旧闸门会把它丢掉，用例于是有牙齿。
       if (step && step.kind === 'drip') {
-        res.writeHead(200, {
-          'content-type': 'text/event-stream',
-          'cache-control': 'no-cache',
-          connection: 'close',
+        write(() => {
+          res.writeHead(200, {
+            'content-type': 'text/event-stream',
+            'cache-control': 'no-cache',
+            connection: 'close',
+          });
+          res.write(sseDelta(step.parts[0] ?? ''));
         });
-        res.write(sseDelta(step.parts[0] ?? ''));
         step.parts.slice(1).forEach((part, i) => {
           const last = i === step.parts.length - 2;
           setTimeout(
-            () => {
-              if (last) {
-                res.end(
-                  sseDelta(part) +
-                    `data: ${JSON.stringify({ usage: { prompt_tokens: 10, completion_tokens: 5 } })}\n\n` +
-                    'data: [DONE]\n\n',
-                );
-              } else {
-                res.write(sseDelta(part));
-              }
-            },
+            () =>
+              write(() => {
+                if (last) {
+                  res.end(
+                    sseDelta(part) +
+                      `data: ${JSON.stringify({ usage: { prompt_tokens: 10, completion_tokens: 5 } })}\n\n` +
+                      'data: [DONE]\n\n',
+                  );
+                } else {
+                  res.write(sseDelta(part));
+                }
+              }),
             step.gapMs * (i + 1),
           );
         });

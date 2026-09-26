@@ -783,6 +783,20 @@ export function archiveForemanSession(sessionId: string): Promise<{ session: For
 }
 
 /**
+ * 停钮：请这一班**正在跑的那个人这一轮**停下（决策 294 / 票 09）。
+ *
+ * `cancelled: false` 不是错误——「没有一轮在跑」本身就是答案（值守轮压根不设停钮，
+ * 裁决 10：它归开关），界面据此把那颗钮收回去。`true` 也只说**请求送到了**：收口是
+ * 协作的（决策 226 的同一句话），它停没停由那一轮自己落的那一行（`【已停】`）回答。
+ */
+export function cancelForemanTurn(sessionId: string): Promise<{ cancelled: boolean }> {
+  return request<{ cancelled: boolean }>(`/foreman/sessions/${sessionId}/cancel`, {
+    method: 'POST',
+    body: {},
+  });
+}
+
+/**
  * 说一句话并拿回一次回话。
  *
  * **失败时不要清空输入框**：后端在叫模型之前就把 user 行落了库，所以失败是「这句话

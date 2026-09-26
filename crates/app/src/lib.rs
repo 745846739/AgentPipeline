@@ -130,6 +130,11 @@ pub fn build_router(state: AppState) -> Router {
             "/foreman/sessions/{id}/archive",
             post(routes::foreman::archive_session),
         )
+        // 停钮（决策 294 / 票 09）：只停**人这一轮**（值守轮归开关，裁决 10）。
+        .route(
+            "/foreman/sessions/{id}/cancel",
+            post(routes::foreman::cancel_session),
+        )
         .route("/foreman/messages", post(routes::foreman::send))
         .route("/foreman/stream", get(routes::foreman::stream))
         // 回执标签（决策 247⑤）：全量清单的 `{name, label}`，**不按档位滤**——回执标的是

@@ -32,7 +32,7 @@
 
 use std::collections::HashMap;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, LazyLock, Mutex};
 
 use serde::{Deserialize, Serialize};
@@ -178,6 +178,101 @@ impl HumanTurns {
 
     fn in_flight(&self) -> bool {
         self.0.load(Ordering::SeqCst) > 0
+    }
+}
+
+/// 人这一轮的**停钮**通道（决策 294 / 票 09）：一次「请求停下」的观察点。
+///
+/// 形状照流水线那套（[`crate::pipeline::executor`] 的 `CancelSignal` / `EXECUTOR_REGISTRY`，
+/// 决策 226 / 276），只有一条来路（人按停，值守轮归开关——裁决 10），故没有 origin 那一格：
+/// 用 `AtomicBool` + `Notify` 而不是单一个 `Notify` 的理由与那边一字不差——**两条路都要走通**，
+/// 轮停在模型调用上时靠 `wait()` 把它唤醒，信号先于观察者到达（或它正走在两轮之间）时靠
+/// 那个布尔值在下一轮开头拦住它。只用 `notify_waiters()` 会丢信号，只用布尔值则要等到
+/// 下一轮开头——而停住的恰恰就是那一轮。
+#[derive(Clone, Default)]
+struct TurnCancel {
+    requested: Arc<AtomicBool>,
+    notify: Arc<tokio::sync::Notify>,
+}
+
+impl TurnCancel {
+    fn request(&self) {
+        self.requested.store(true, Ordering::SeqCst);
+        // `notify_one` 而非 `notify_waiters`：无人等待时它**存一个许可**，
+        // 于是「信号先到、观察者后建」这个窗口也不会丢。
+        self.notify.notify_one();
+    }
+
+    fn is_requested(&self) -> bool {
+        self.requested.load(Ordering::SeqCst)
+    }
+
+    async fn wait(&self) {
+        self.notify.notified().await;
+    }
+}
+
+/// 会话 → 在飞那个人这一轮的停钮通道（进程内，照 `EXECUTOR_REGISTRY` 的先例）。
+///
+/// **为什么挂在班次上而不是 runner 实例上**：停钮的发出方是**另一个 HTTP 请求**
+/// （`POST /foreman/sessions/{id}/cancel`），它只拿得到班次 id——实例级的登记（`HumanTurns`
+/// 那格）对它是不可见的。跨进程的情形与 `FOREMAN_TURNS` 同一姿态：那一个实例里的在飞轮
+/// 本来就随它的进程一起没了，本进程查不到登记就是「没有在跑」。
+static FOREMAN_TURN_CANCELS: LazyLock<Mutex<HashMap<String, TurnCancel>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
+
+/// 请求停掉 `session_id` 上正在跑的那个人这一轮，返回「当时确实有一轮在跑」。
+///
+/// `false` 的两种来路都要如实带上：① 还没有人在说话（或已经说完了）；② 那一轮是**值守轮**
+/// ——自动轮不设停钮（裁决 10：值守轮归开关），它的通道根本不登记。
+pub fn cancel_foreman_turn(session_id: &str) -> bool {
+    match FOREMAN_TURN_CANCELS.lock().unwrap().get(session_id) {
+        Some(signal) => {
+            signal.request();
+            true
+        }
+        None => false,
+    }
+}
+
+/// 人这一轮停钮通道的登记凭据：退出即摘（与 [`ForemanTurnGuard`] / [`HumanTurnGuard`] 同一姿态）。
+///
+/// 只摘**自己那一格**：同一班理论上可以并排起两轮（界面拦着，但服务端不假定），后来的
+/// 那一轮会覆盖前一轮的槽——按指针比一下才知道这格是不是自己的，否则先退出的那一轮会把
+/// 另一轮的停钮通道顺手摘掉（执行体那边用「代次」表达同一件事，见 `RegistryEntry`）。
+struct TurnCancelGuard {
+    session_id: String,
+    signal: TurnCancel,
+}
+
+impl TurnCancelGuard {
+    fn signal(&self) -> &TurnCancel {
+        &self.signal
+    }
+}
+
+impl Drop for TurnCancelGuard {
+    fn drop(&mut self) {
+        let mut registry = FOREMAN_TURN_CANCELS.lock().unwrap();
+        let mine = registry
+            .get(&self.session_id)
+            .is_some_and(|s| Arc::ptr_eq(&s.notify, &self.signal.notify));
+        if mine {
+            registry.remove(&self.session_id);
+        }
+    }
+}
+
+/// 登记这一班的人这一轮，返回退出即自动摘的凭据（决策 294 / 票 09）。
+fn begin_turn_cancel(session_id: &str) -> TurnCancelGuard {
+    let signal = TurnCancel::default();
+    FOREMAN_TURN_CANCELS
+        .lock()
+        .unwrap()
+        .insert(session_id.to_string(), signal.clone());
+    TurnCancelGuard {
+        session_id: session_id.to_string(),
+        signal,
     }
 }
 
@@ -687,20 +782,34 @@ pub const FOREMAN_WATCH_TOKEN_BUDGET: u32 = 120_000;
 /// ——短轮连 `foreman_reply` 的 cooldown 槽都不碰（cooldown 倒挂的坑）。
 pub const FOREMAN_REPLY_MIN_TOOL_CALLS: usize = 3;
 
-/// 这一轮**为什么没能正常收口**（决策 292 / 票 07 / 293 / 票 08）。
+/// 这一轮**为什么没能正常收口**（决策 292 / 票 07 / 293 / 票 08 / 294 / 票 09）。
 ///
-/// 它管「触顶」「中途失败」「打转」三类——轮数上限那一类由循环自然跑完表达（`stop` 为空，
-/// 决策 233② 那条最老的路）。四条非正常结束共用同一条收口路径，差别写在这里
-/// （「人按停」是第四条，票 09）。
+/// 它管「触顶」「中途失败」「打转」「人按停」四类——轮数上限那一类由循环自然跑完表达
+/// （`stop` 为空，决策 233② 那条最老的路）。五条非正常结束共用同一条收口路径，
+/// 差别写在这里。
 #[derive(Debug)]
 enum StopReason {
     /// 成本门（值守轮）：生成 token 到了预算线。带的是**触发那一刻的累计值**（标注里要写它）。
     Budget(u32),
     /// 循环检测（票 08）：提醒过一次仍在打转，强制收口。带的是判定本身（证据要进标注）。
     Loop(crate::agent::loops::Loop),
+    /// **人按停**（票 09）：值班经理按了停钮。带的是**停在第几轮**（标注里要写它）。
+    Stopped(usize),
     /// 中途失败（空闲判死 / 超长 / 取消 / 内部错误）：错误原样带回外框做失败记账。
     Failed(Error),
 }
+
+/// 一次**可被打断**的模型调用的结果（决策 294 / 票 09）。
+enum CallOutcome {
+    /// 停钮先到：这一次调用被放弃，整轮走收口路径。
+    Stopped,
+    /// 调用自己有了结果（成功或失败，与从前一字不差）。
+    Done(Result<crate::agent::client::AgentResponse>),
+}
+
+/// 「人按停」的收口标记（决策 294 / 票 09，与 [`FOREMAN_PARTIAL_TURN_MARK`] /
+/// [`FOREMAN_LOOP_TURN_MARK`] 同族）：裁决 9 的三族标记要一眼分得开——触顶 / 打转 / 人按停。
+pub const FOREMAN_STOPPED_TURN_MARK: &str = "【已停】";
 
 /// 触到上限时那一段的标记（决策 233② / 292）：**部分结论落库并标注**。
 ///
@@ -1213,6 +1322,13 @@ pub struct ForemanTurn {
     /// 客户端据此更新自己的「当前班次」——否则第一次说话会落进一个它不知道的会话。
     pub session: ForemanSession,
     pub reply: String,
+    /// 这一轮是**被人按停**的吗（决策 294 / 票 09）。
+    ///
+    /// 它与 `reply` 里有没有 [`FOREMAN_STOPPED_TURN_MARK`] 是同一件事，分成两个字段是因为
+    /// 判它的那一处（`say` 外框）要据此分流一件事：被停在半路那一轮提的**悬空提议保留**
+    /// （显式修订 233③），失败那一轮才作废——而两个字段各说各的（`content` 列里那句标注
+    /// 是给人读的，这个布尔是给代码判的），从字符串前缀反推会把它变成一条脆耦合。
+    pub stopped: bool,
     pub prompt_tokens: u32,
     pub completion_tokens: u32,
     pub briefing: ForemanBriefing,
@@ -1821,6 +1937,12 @@ impl ForemanRunner {
         // 值班长回话完成 → 离线通知（决策 272②③）：第二触发面，**不**写 attention 表。
         // 门（`traces.len()`）在 notify() 之前过——短轮连 cooldown 槽都不碰。
         if let Ok(turn) = &result {
+            // 被人按停的那一轮：它提的悬空提议**保留**（决策 294，显式修订 233③），
+            // 只标一个「来自一轮没说完的话」。失败轮走的是另一条路（作废）——分流就在这里。
+            if turn.stopped {
+                self.keep_round_proposals(&turn.session.id, round_started_at)
+                    .await;
+            }
             self.notify_reply_completed(turn, true);
         }
         result
@@ -1841,8 +1963,18 @@ impl ForemanRunner {
         // 人的那一轮的独立在飞标志（决策 289 / 票 03）：值守轮据此排队，不并行。
         // 凭据同样退出即摘——登记与一轮的真实寿命是同一条。
         let _human = (!input.is_watch()).then(|| self.human_turns.begin());
+        // 停钮通道（决策 294 / 票 09）：**只有人这一轮**登记（值守轮归开关，裁决 10），
+        // 凭据退出即摘。登记在这一层而不是内里，是因为它是「这一轮的寿命」的另一面——
+        // 与上面两格同一条：请求到达时那一轮要么还在（通道在），要么已经结束了（通道没了）。
+        let cancel = (!input.is_watch()).then(|| begin_turn_cancel(&session.id));
         let cfg = self.stage_config().await?;
-        self.respond_inner(session, input, cfg).await
+        self.respond_inner(
+            session,
+            input,
+            cfg,
+            cancel.as_ref().map(TurnCancelGuard::signal),
+        )
+        .await
     }
 
     /// 这一轮的**轮数上限**（决策 233① / 239）：`stage_configs` 的 `foreman` 行配了就用它，
@@ -1875,11 +2007,14 @@ impl ForemanRunner {
 
     /// 一轮回话的**内里**（现场由 [`Self::say`] / [`Self::watch`] 的外框记账，
     /// 时限由 [`Self::respond`] 给）。
+    ///
+    /// `cancel`（决策 294 / 票 09）：人这一轮的停钮通道，`None` = 值守轮（没有停钮）。
     async fn respond_inner(
         &self,
         session: &ForemanSession,
         input: TurnInput,
         cfg: Option<crate::types::StageConfig>,
+        cancel: Option<&TurnCancel>,
     ) -> Result<ForemanTurn> {
         let briefing = build_briefing(&self.store).await?;
         // 阶段配置由外框读了一次传进来（人格 + provider / 采样参数共用那一份）。
@@ -2065,7 +2200,15 @@ impl ForemanRunner {
             .turn_capacity(cfg.as_ref(), &system_prompt, &user_prompt)
             .await;
 
-        for _ in 0..round_limit {
+        for round in 0..round_limit {
+            // 停钮（决策 294 / 票 09）：**每次调用前看一眼**。信号可能在上一次工具调用
+            // 期间到达（那一批跑完才回到这里），也可能是「信号先到、观察者后建」那一格
+            // ——`Notify` 存的许可只在 `wait()` 上兑现，故这里必须另查一次布尔值
+            // （与流水线 `CancelSignal` 的两条路同一条理由）。命中就不再把下一次调用发出去。
+            if cancel.is_some_and(TurnCancel::is_requested) {
+                stop = Some(StopReason::Stopped(round + 1));
+                break;
+            }
             // 每次调用前查一次预算（票 06(b)）：到线就按轮压缩（规则化、不调 LLM）。
             // **查在组装请求之前**，故这一轮发出去的已经是压过的那一份。
             self.compact_inline_if_over_budget(
@@ -2112,13 +2255,19 @@ impl ForemanRunner {
                 }),
                 idle_timeout_sec: Some(idle_timeout_secs),
             };
-            let response = match self.complete_with_retry(request.clone()).await {
-                Ok(response) => response,
+            let response = match self.complete_cancellable(request.clone(), cancel).await {
+                // 人按停（决策 294 / 票 09）：这一次调用被放弃，整轮走收口路径
+                // （部分结论 + 【已停】）。**不是失败**——不落失败账、不发失败通知。
+                CallOutcome::Stopped => {
+                    stop = Some(StopReason::Stopped(round + 1));
+                    break;
+                }
+                CallOutcome::Done(Ok(response)) => response,
                 // 撞墙恢复（决策 291 / 票 06(c)）：provider 报上下文超长时**不原地判败**
                 // ——把这一轮的转录压一遍再重试这一次调用（只一次；再撞就是真的放不下，
                 // 那时报错才是诚实的）。压缩是**无条件**的：这个错误说明算术低估了
                 // （真 tokenizer 与 4 字符≈1 的估算、工具定义都占窗口），不按触发线走。
-                Err(e) if is_context_window(&e) => {
+                CallOutcome::Done(Err(e)) if is_context_window(&e) => {
                     let compacted = self.compact_inline_forced(&mut transcript, &question);
                     if compacted == 0 {
                         stop = Some(StopReason::Failed(e));
@@ -2130,9 +2279,15 @@ impl ForemanRunner {
                         "provider 报上下文超长：压缩本轮转录后重试这一次调用（票 06(c)）"
                     );
                     request.messages = transcript.clone();
-                    match self.complete_with_retry(request).await {
-                        Ok(response) => response,
-                        Err(e) => {
+                    // 这一次重试同样可被按停（票 09）：人按停的那一刻不该因为「它正在
+                    // 重试」而多等一轮。
+                    match self.complete_cancellable(request, cancel).await {
+                        CallOutcome::Stopped => {
+                            stop = Some(StopReason::Stopped(round + 1));
+                            break;
+                        }
+                        CallOutcome::Done(Ok(response)) => response,
+                        CallOutcome::Done(Err(e)) => {
                             stop = Some(StopReason::Failed(e));
                             break;
                         }
@@ -2141,7 +2296,7 @@ impl ForemanRunner {
                 // 中途失败（决策 292 / 票 07）：**不原地把这一轮丢掉**——出循环走收口路径
                 // （有话说就带上标注落库），错误原样带去外框做失败记账（类别 / 通知 /
                 // 悬空提议作废都不变）。
-                Err(e) => {
+                CallOutcome::Done(Err(e)) => {
                     stop = Some(StopReason::Failed(e));
                     break;
                 }
@@ -2278,9 +2433,14 @@ impl ForemanRunner {
         // 失败那一条同时把错误**原样带回**外框，失败记账（类别 / 通知 / 悬空提议作废）不变。
         // 中途失败但有话说：**先把那一轮落库再报错**（票 07 的全部意义——不许把已经查到
         // 的东西整段丢掉）。`stop_error` 就是原样的那个错误，由下面的 `?` 带给外框。
-        let (reply, stop_error) = match (reply, stop) {
+        //
+        // 第三个返回值是**「这一轮被人按停了吗」**（票 09）：它决定外框要不要在那一轮提的
+        // 悬空提议上做标注（`ForemanTurn::stopped`）。判据是「收口这一行挂的是【已停】」，
+        // 而不是「通道上收到过请求」——请求可能在模型已经收口之后才到（那一刻这一轮没被
+        // 停掉，只是慢了一步），拿那个当判据会把一条正常收口的轮标注成半成品。
+        let (reply, stopped, stop_error) = match (reply, stop) {
             // 模型自己收口了：正常那一句（预算门在它之后才可能踩线，故这里不看 `stop`）。
-            (Some(reply), _) => (reply, None),
+            (Some(reply), _) => (reply, false, None),
             (None, stop) if last_text.is_some() && empty_replies == 0 => {
                 let partial = last_text.unwrap_or_default();
                 // 这段文字此前已作为 `Text` 段落进过段序（它正是随工具调用一起说出口的
@@ -2295,8 +2455,10 @@ impl ForemanRunner {
                 if closes_with_the_same_text {
                     segments.pop();
                 }
-                // 「为什么没说完」与**挂哪个标记**按停机原因分（票 07 / 08）：打转那条有自己的
-                // 标记（与【未收口】同族、形状不同——裁决 9 让三种停法一眼分得开），其余共用它。
+                // 「为什么没说完」与**挂哪个标记**按停机原因分（票 07 / 08 / 09）：打转与
+                // 按停各有自己的标记（与【未收口】同族、形状不同——裁决 9 让三种停法一眼
+                // 分得开），其余共用它。
+                let was_stopped = matches!(stop, Some(StopReason::Stopped(_)));
                 let (mark, why, error) = match stop {
                     Some(StopReason::Budget(used)) => (
                         FOREMAN_PARTIAL_TURN_MARK,
@@ -2312,6 +2474,16 @@ impl ForemanRunner {
                             "{}——提醒过一次仍未改道，这一轮我就停了。\
                              以上是已经确定的部分。要接着查可以让我再来一轮（换个线索）。",
                             hit.reason()
+                        ),
+                        None,
+                    ),
+                    // 人按停（决策 294 / 票 09）：说清「是你停的」而不是「它自己断了」——
+                    // 这一行的读者可能不是按停的那个人（手机与电脑同时开着的时候）。
+                    Some(StopReason::Stopped(round)) => (
+                        FOREMAN_STOPPED_TURN_MARK,
+                        format!(
+                            "这一轮你按了停（停在第 {round} 轮），话没说完——以上是已经确定的部分。\
+                             要接着查可以让我再来一轮（带上线索）；这一轮提的提议都还在，照样可以按。"
                         ),
                         None,
                     ),
@@ -2340,10 +2512,23 @@ impl ForemanRunner {
                     round_limit,
                     token_line,
                     used = tokens.1,
-                    "值班长没能收口：部分结论落库并标注（决策 233② / 292 / 293）"
+                    "值班长没能收口：部分结论落库并标注（决策 233② / 292 / 293 / 294）"
                 );
-                (format!("{partial}\n\n{mark}{why}"), error)
+                (format!("{partial}\n\n{mark}{why}"), was_stopped, error)
             }
+            // 人按停而它**一句话都没说过**：照样落一行（决策 294 / 票 09）。
+            // 这一支刻意**不走**失败处置（与上面那两支不同）：把「你要它停」写成「它没跑起来」
+            // 是两处失真——归因反了（人干的，不是它坏的），还会顺手发一条失败通知（按停的人
+            // 就在屏幕前，那是纯噪声）。行里也没有部分结论可留，故只留这句事实本身。
+            (None, Some(StopReason::Stopped(round))) => (
+                format!(
+                    "{FOREMAN_STOPPED_TURN_MARK}这一轮你按了停（停在第 {round} 轮）——\
+                     它还没说出什么，没有部分结论可留。要接着查可以让我再来一轮（带上线索）；\
+                     这一轮提的提议都还在，照样可以按。"
+                ),
+                true,
+                None,
+            ),
             // 中途失败且**一句有内容的话都没说过**：没有东西可留，错误原样带回。
             (None, Some(StopReason::Failed(e))) => return Err(e),
             // 打转到底**一句话都没说过**：同样没有部分结论可留（与上面那一支同姿态），
@@ -2423,6 +2608,7 @@ impl ForemanRunner {
             return Ok(ForemanTurn {
                 session: session.clone(),
                 reply,
+                stopped,
                 prompt_tokens: tokens.0,
                 completion_tokens: tokens.1,
                 briefing,
@@ -2477,6 +2663,7 @@ impl ForemanRunner {
         Ok(ForemanTurn {
             session: session.clone(),
             reply,
+            stopped,
             prompt_tokens: tokens.0,
             completion_tokens: tokens.1,
             briefing,
@@ -2744,6 +2931,37 @@ impl ForemanRunner {
         }
     }
 
+    /// **人按停**那一轮提的悬空提议：**保留**，只标一个来路（决策 294 / 票 09）。
+    ///
+    /// 与 [`Self::invalidate_round_proposals`] 是同一把判据、相反的两条出路，分岔全在
+    /// 「轮是怎么结束的」：轮**自己**死了（失败 / panic）→ 等它的人已经没了，钮必须作废；
+    /// 人主动按停 → 「这话先这样，按你提的第 2 条办」——提议正是他还想按的东西。
+    /// 作废它等于把他刚点的菜端走，而这正是**显式修订决策 233③** 的那一条：
+    /// 作废只对「轮自己死了」，人按停不算。
+    ///
+    /// 标注（`stopped_round`）只落库里那一个读数，不改状态也不另发事件：界面重读会话时
+    /// 看到它，在那一张卡片上多写一行来路——与作废那条「不额外广播」同一姿态。
+    async fn keep_round_proposals(
+        &self,
+        session_id: &str,
+        started_at: chrono::DateTime<chrono::Utc>,
+    ) {
+        match self
+            .store
+            .mark_pending_foreman_proposals_stopped(session_id, started_at)
+            .await
+        {
+            Ok(0) => {}
+            Ok(count) => tracing::info!(
+                session = session_id,
+                count,
+                "这一轮被按停：它提的悬空提议保留并标注来路（决策 294）"
+            ),
+            // 标注失败不改变「这一轮被按停了」这个事实，故只记一行（与作废那条同一姿态）。
+            Err(e) => tracing::warn!(session = session_id, error = %e, "标注被停轮的悬空提议失败"),
+        }
+    }
+
     /// 落一条**没跑完**的账（决策 223）：这一轮的 future 被 panic 带走时用。
     ///
     /// 与 [`Self::record_failed_turn`] 分开的理由是它拿不到 `Error`——`say()` 的失败外框
@@ -2925,6 +3143,29 @@ impl ForemanRunner {
                 self.llm.complete(request).await
             }
             Err(e) => Err(e),
+        }
+    }
+
+    /// 一次**可被停钮打断**的模型调用（决策 294 / 票 09）。
+    ///
+    /// `select!` 的形状照流水线那套（决策 226 / 276 的 `CancelSignal`）：停在 await 上的
+    /// 正是这次调用，故停钮必须能把它唤醒——只在下一次调用去查的**协作式**中止在这里不够用
+    /// （一次调用可以跑几分钟，而人按停要的是「现在」）。`biased;` 让它先被看见：信号已经
+    /// 在那儿（`Notify` 存的许可）时，这一次调用根本不该发出去。
+    ///
+    /// `None`（值守轮）走的分支与从前一字不差：没有停钮可等的调用就是普通调用。
+    async fn complete_cancellable(
+        &self,
+        request: crate::agent::client::LlmRequest,
+        cancel: Option<&TurnCancel>,
+    ) -> CallOutcome {
+        match cancel {
+            Some(signal) => tokio::select! {
+                biased;
+                _ = signal.wait() => CallOutcome::Stopped,
+                result = self.complete_with_retry(request) => CallOutcome::Done(result),
+            },
+            None => CallOutcome::Done(self.complete_with_retry(request).await),
         }
     }
 

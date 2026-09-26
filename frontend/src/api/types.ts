@@ -1110,6 +1110,14 @@ export interface ForemanProposal {
    */
   kind?: 'api_call' | 'repair';
   payload?: RepairPayload | null;
+  /**
+   * **来路**：它来自一轮被人按停的话吗（决策 294 / 票 09）。
+   *
+   * 人按停那一轮提的悬空提议**不作废**（显式修订 233③：作废只对「轮自己死了」）——
+   * 于是这一条与正常来路的提议在卡片上唯一的差别就是这个读数：多写一行
+   * 「那份结论没说完，按之前多看一眼」。地位同 `expires_at`：只影响怎么读，不影响能不能按。
+   */
+  stopped_round: boolean;
   created_at: string;
   /**
    * 有效期到点（决策 207：TTL 10 分钟）。**前端按它自己算过期**，不等后端标。

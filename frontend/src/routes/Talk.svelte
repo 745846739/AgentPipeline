@@ -14,6 +14,7 @@
   import { createMenuTrap } from '../lib/menuTrap';
   import {
     archiveForemanSession,
+    cancelForemanTurn,
     createForemanSession,
     executeForemanProposal,
     getForemanSession,
@@ -56,6 +57,7 @@
   } from '../lib/proposals';
   import { CompositionGuard, shouldSubmitOnEnter } from '../lib/enterToSend';
   import { growTextarea } from '../lib/talkDock';
+  import { stopButtonLabel, stopButtonState } from '../lib/stopButton';
   import { labelFor, loadToolLabels } from '../lib/toolLabels';
   import { formatDateTime } from '../lib/format';
   import {
@@ -235,6 +237,36 @@
    * 故留在组件里——与决策 275 搬走的那几样不同，它没有「页面不在时也要成立」的语义。
    */
   let sendingSid = $state<string | null>(null);
+
+  /**
+   * 本机已经按过停、那一轮还没收口（决策 294 / 票 09）。
+   *
+   * 它只喂停钮自己那一个「正在停…」态：按下之后那一轮还要把结论与半成品落库（协作式收口，
+   * 决策 226 的同一句话），人在等的那几秒里该看得见「按下去了」。**在飞一结束它就失去意义**
+   * ——态由 `stopButtonState` 的 `inFlight` 归零（`session.turn_in_flight` 翻假 / 本机这一趟
+   * 的回包到了），故这里不做显式重置：多一处重置就多一处忘记重置的地方。
+   */
+  let stopAsked = $state(false);
+  /** 上一次按停**没送到**的原因（就地显示在坞里；成功那一趟与一轮收口后都清空）。 */
+  let stopError = $state<string | null>(null);
+  /**
+   * 这一班此刻有一轮在飞吗（决策 260 的读数 + 本机这一趟）。
+   *
+   * 两个来源都要：`sending` 管「我刚发出去的那一趟」（服务端登记之前有一段空隙），
+   * `turn_in_flight` 管「刷新 / 换设备之后它仍在跑」——只认前者的话刷新页面就没法停。
+   * 值守轮不在此列：它在**另一本条账**上（`watchMode` 下整个输入坞都不渲染）。
+   */
+  const turnRunning = $derived(sending || Boolean(session?.turn_in_flight));
+  const stopState = $derived(stopButtonState({ inFlight: turnRunning, asked: stopAsked }));
+  // 这一轮收口之后把停钮那两样一起归零：`stopAsked` 的失效判据本来就在 `stopButtonState`
+  // 里（`inFlight` 一假就 hidden，故它不影响下一个态），但 `stopError` 没有那样的判据——
+  // 不在这儿清，它会在**下一轮**一开始就浮出来，说一件与这一轮无关的事。
+  $effect(() => {
+    if (!turnRunning) {
+      stopAsked = false;
+      stopError = null;
+    }
+  });
 
   /** 「哪一条我看过」的时刻表（决策 220③ 的「有新动静」判据）。 */
   let seen = $state<SeenAt>({});
@@ -917,6 +949,31 @@
     if (sending) return;
     input = option;
     void send();
+  }
+
+  /**
+   * 停钮（决策 294 / 票 09）：请这一轮停下。
+   *
+   * **不把 `cancelled` 当结论**：`false` 只说明「已经没在跑了」（那一轮刚收口），
+   * 而它对屏幕前的人是同一件事——它停下来了；`true` 也只说请求送到了（收口是协作的，
+   * 决策 226 的同一句话）。那一轮真停下的证据是它自己落的那一行（`【已停】`），
+   * 本机这一趟的 POST 回包也会照常把台账重读一遍，两条路都不靠这里假装。
+   */
+  async function stopTurn() {
+    if (stopState !== 'ready') return;
+    const sid = sendingSid ?? currentId;
+    if (!sid) return;
+    stopAsked = true;
+    stopError = null;
+    try {
+      await cancelForemanTurn(sid);
+    } catch (err) {
+      // 请求没送到（网络 / 配对 / 本机这条链路）：**如实撤态**回到可按的「停」，
+      // 并把原因写在坞里——不弹窗、不落失败轮（按停不成，不改变「那一轮还在跑」这个事实，
+      // 而它会在该收口时收口）。与「流断了」那一行同一姿态：只在异常态占高。
+      stopAsked = false;
+      stopError = err instanceof Error ? err.message : String(err);
+    }
   }
 
   async function send() {
@@ -1675,6 +1732,12 @@
             {#if st === 'pending'}· <span class="pleft">{proposalRemainingLabel(p, now)}</span>{/if}
           </div>
           <p>{p.summary}</p>
+          {#if p.stopped_round}
+            <!-- 来路（决策 294 / 票 09）：这一条提在一轮**被按停**的话里——那一轮的结论是
+                 半截的，按之前值得多看一眼。与「过期只让按钮变灰」同一条口径：不改它能不能按，
+                 只多一句读数。 -->
+            <p class="dim note">这条提议来自一轮被你按停的话（那份结论没说完），按之前多看一眼。</p>
+          {/if}
           {#if isRepairProposal(p)}
             <!-- 修复提议（票 12）：人要看的是那份补丁，不是参数摘要。
                  闸门读数先说「有没有补丁」——没过闸门时**根本没有** diff（决策 210④），
@@ -1967,7 +2030,26 @@
         {#if streamStatus === 'error'}
           <span class="dim hint">流断了：回话仍会以台账为准补上。</span>
         {/if}
-        <button type="submit" class="btn solid" disabled={sending || !input.trim()}>发送</button>
+        {#if stopError}
+          <span class="dim hint ferr">按停没送到：{stopError}</span>
+        {/if}
+        {#if stopState !== 'hidden'}
+          <!-- 停钮（决策 294 / 票 09）：这一轮在飞时，**发送那颗钮的位置就是它**。
+               两颗钮从不同时可用——一轮没落地就发不出第二句（决策 182㉓），故这是换位
+               不是抢位；而同一格、同一尺寸让它对版面零影响（决策 282 实测的坞高不动）。
+               次级样式（`.quiet`）：按停不是破坏性动作——部分结论、它提的提议、
+               已经烧掉的 token 都留着（决策 294），故刻意**不吃** `.danger`
+               （决策 195 那一档留给删除/覆盖这类真会丢东西的动作）。 -->
+          <button
+            type="button"
+            class="btn quiet"
+            data-stop="turn"
+            disabled={stopState === 'stopping'}
+            onclick={() => void stopTurn()}
+          >{stopButtonLabel(stopState)}</button>
+        {:else}
+          <button type="submit" class="btn solid" disabled={sending || !input.trim()}>发送</button>
+        {/if}
       </div>
     </form>
   {/if}

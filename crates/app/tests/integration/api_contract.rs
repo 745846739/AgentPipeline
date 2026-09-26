@@ -5575,6 +5575,27 @@ async fn foreman_endpoints_report_503_when_unwired() {
         .is_empty());
     let (status, _) = get(&api, "/foreman/sessions").await;
     assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+    // 停钮（决策 294 / 票 09）也在列：`/foreman/*` 下没有「接线外可用」的特例。
+    let (status, _) = post(&api, "/foreman/sessions/x/cancel", json!({})).await;
+    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+}
+
+/// 停钮端点（决策 294 / 票 09）：**没有一轮在跑**时如实回 `false`——那本身是答案，
+/// 不是错误（界面据此把那颗钮收回去）。班次存不存在不影响这个答案：在飞现场是**进程内**
+/// 的登记（与 `turn_in_flight` 同一姿态），查库只会给「班次被清掉、那一轮还在跑」添一条假 404。
+#[tokio::test]
+async fn the_stop_button_answers_whether_anything_was_running() {
+    let api = api_with_foreman(FakeAgent::new(Script::new())).await;
+    let (_, body) = post(&api, "/foreman/sessions", json!({})).await;
+    let sid = body["session"]["id"].as_str().unwrap().to_string();
+
+    let (status, body) = post(&api, &format!("/foreman/sessions/{sid}/cancel"), json!({})).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["cancelled"], false, "没有一轮在飞：{body}");
+
+    let (status, body) = post(&api, "/foreman/sessions/no-such-session/cancel", json!({})).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["cancelled"], false, "{body}");
 }
 
 /// 空消息被拒且不入账（400，不是 500）。

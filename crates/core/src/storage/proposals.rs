@@ -120,6 +120,11 @@ pub struct ForemanProposal {
     pub payload: Option<Value>,
     /// 执行占用时间戳（见模块头）。
     pub claimed_at: Option<DateTime<Utc>>,
+    /// **来路**：它来自一轮被人按停的话吗（决策 294 / 票 09）。
+    ///
+    /// 人按停那一轮提的悬空提议**不作废**（显式修订 233③），于是这一列是它与正常来路的
+    /// 提议之间唯一的差别——提议提在一轮没说完的话里，按之前值得多看一眼。
+    pub stopped_round: bool,
     pub created_at: DateTime<Utc>,
     pub expires_at: DateTime<Utc>,
     pub status: ForemanProposalStatus,
@@ -148,8 +153,8 @@ pub struct NewForemanProposal {
 }
 
 const PROPOSAL_COLUMNS: &str = "id, session_id, tool, args_json, summary, situation_json, kind, \
-                                payload_json, claimed_at, created_at, expires_at, status, \
-                                resolved_at";
+                                payload_json, claimed_at, stopped_round, created_at, expires_at, \
+                                status, resolved_at";
 
 #[derive(FromRow)]
 struct ForemanProposalRow {
@@ -162,6 +167,7 @@ struct ForemanProposalRow {
     kind: String,
     payload_json: Option<String>,
     claimed_at: Option<String>,
+    stopped_round: i64,
     created_at: String,
     expires_at: String,
     status: String,
@@ -192,6 +198,7 @@ impl ForemanProposalRow {
                 .map(serde_json::from_str)
                 .transpose()?,
             claimed_at: self.claimed_at.as_deref().map(parse_ts).transpose()?,
+            stopped_round: self.stopped_round != 0,
             created_at: parse_ts(&self.created_at)?,
             expires_at: parse_ts(&self.expires_at)?,
             // status 决定这一轮在界面上是什么模样，认不出时按「已作废」读（见 `parse`），
@@ -248,6 +255,9 @@ impl Store {
             kind: new.kind,
             payload: new.payload,
             claimed_at: None,
+            // 落库时**恒 false**：来路这一列只由「人按停」那条路事后标（决策 294），
+            // 而它标注的是「提出它的那一轮后来被停了」——落这一行时那件事还没发生。
+            stopped_round: false,
             created_at: now,
             expires_at,
             status: ForemanProposalStatus::Pending,
@@ -459,6 +469,35 @@ impl Store {
         )
         .bind(FOREMAN_PROPOSAL_EXPIRED)
         .bind(ts(self.now()))
+        .bind(session_id)
+        .bind(FOREMAN_PROPOSAL_PENDING)
+        .bind(ts(since))
+        .execute(self.pool())
+        .await?
+        .rows_affected();
+        Ok(affected as usize)
+    }
+
+    /// **人按停**那一轮提的、此刻仍悬空的提议：**保留**，只标它来自一轮没说完的话
+    /// （决策 294 / 票 09，显式修订决策 233③）。
+    ///
+    /// 与 [`Self::invalidate_pending_foreman_proposals`] 是同一把判据（班次 + `created_at >=
+    /// since` + `claimed_at IS NULL`）、相反的两条出路，差别只在**轮是怎么结束的**：
+    /// 轮**自己**死了（失败 / panic）→ 等它的人已经没了，钮必须作废；人主动按停 →
+    /// 「这话先这样，按你提的第 2 条办」——提议正是他还想按的东西，作废它等于把他刚点的
+    /// 菜端走（实测里那两条悬空提议要的正是前一条，本条不改它的语义一个字）。
+    ///
+    /// 标注（`stopped_round`）是给人看的：这一条提在一轮没说完的话里，按之前多看一眼。
+    /// 状态**不动**（`pending` 是它的归宿），故按钮照旧按得动。
+    pub async fn mark_pending_foreman_proposals_stopped(
+        &self,
+        session_id: &str,
+        since: DateTime<Utc>,
+    ) -> Result<usize> {
+        let affected = sqlx::query(
+            "UPDATE kanban_foreman_proposals SET stopped_round = 1
+             WHERE session_id = ? AND status = ? AND claimed_at IS NULL AND created_at >= ?",
+        )
         .bind(session_id)
         .bind(FOREMAN_PROPOSAL_PENDING)
         .bind(ts(since))
