@@ -814,8 +814,8 @@
       padding: 0 12px calc(30px + var(--safeb));
     }
     /* pending 时底部动作坞常驻，内容留出坞高（原型 #v-approve .detail padding-bottom） */
-    /* 坞钉在底栏上沿（票 05），故内容要同时让出坞与底栏两份高度；
-       `--dock-h` 与 `--sbar-h` 都已含各自的安全区那一份。 */
+    /* 坞钉在底部堆叠上沿（票 05；窄档那一层现在只有页签栏，决策 300 摘掉了状态条），
+       故内容要同时让出坞与底栏两份高度；`--dock-h` 与 `--sbar-h` 都已含各自的安全区那一份。 */
     .detail.docked {
       padding-bottom: calc(var(--dock-h) + var(--sbar-h) + 14px);
     }

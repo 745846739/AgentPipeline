@@ -227,12 +227,21 @@ pending 琥珀呼吸（2.4s 周期）、流式输出尾随光标。`prefers-redu
   （logo / wordmark / 会话名 / 信号灯缩略条都不再露出——决策 218 ⑥ 的「点灯跳段」随灯一起
   没有了，故决策 240 记的那条例外作废）；**页面导航行不再属于顶栏——`position: fixed` 钉到
   屏幕底缘**，成为底部页签栏：四项等分整宽、图标在上文字在下、命中区定死 44px、
-  `padding-bottom: var(--safeb)` 独占安全区、项目切换器 `.proj` 落行内右端；**状态条叠在
-  页签栏上方**（`bottom: var(--nav-h)`）。顶栏只剩**道具栏行且只在看板路由露出**，高度因此
+  `padding-bottom: var(--safeb)` 独占安全区、项目切换器 `.proj` 落行内右端。顶栏只剩
+  **道具栏行且只在看板路由露出**，高度因此
   **按路由分两档：看板 52px、其余 0px（清零）**，连带的 `scroll-margin-top` / 横幅 `top` /
   待处理下拉 `top` 一律改读实测的 `--topbar-h`（**0 也是合法值**，写死一个数必错一档）；
-  底部让位读重定义后的 `--sbar-h`（= 状态条 42 + `--nav-h`）。桌面档（≥480px）的两行结构
-  一字不动。四项的 DOM、role、`aria-current` 契约一个字不动——变的只是位置。
+  底部让位读 `--sbar-h`——**决策 300 起它在窄档 = `--nav-h`**（状态条整条退场，那 42px 摘掉）。
+  桌面档（≥480px）的两行结构一字不动。四项的 DOM、role、`aria-current` 契约一个字不动——
+  变的只是位置。
+
+> **修订决策 300（2026-09-27，起因见 decisions 300 行）：窄档状态条整条退场。** 本段原写
+> 「状态条叠在页签栏上方（`bottom: var(--nav-h)`）」与「`--sbar-h` = 状态条 42 + `--nav-h`
+> （两层账本）」——两句同时作废：≤479 的 `.statusline` 改为 `display:none`（元素仍在 DOM，
+> 桌面档照旧露出），`--sbar-h` 相应收成 `var(--nav-h)`，**变量名与五个消费点一个都不改**。
+> 条上的三个读数各有去处（待处理 / 执行中 → 看板顶栏道具栏行；token 总量 → 指标页），
+> 唯一的动作（深浅切换）迁到设置落地页页头。本修订**只改 243 的 ②④**，页签栏本身的
+> 四项 / 44px / `--nav-h` 账本一字不动。
 
 ### 4.3 设置落地页（`#/settings`）
 
@@ -309,7 +318,7 @@ pending 琥珀呼吸（2.4s 周期）、流式输出尾随光标。`prefers-redu
 | 「待处理 N」芯片 | **保留原位**，成为 pending 数的**唯一显示位**（决策 92 的入口与下拉逐字不变） |
 | 第 3 槽的 `title` / `aria-label` | **保留数量**（`aria-label="待处理（3）"` 照旧）——去掉的是**视觉重复**，不是信息 |
 | 其余六槽的徽章 | 保留（各自桶唯一的就地读数） |
-| 底部状态行 | **不去数、不减项**：它在页面另一端固定位置，是「流水线整体态势」的读数（含 token 总量与主题切换），与顶栏中枢不构成相邻同屏重复；五组数与顶栏徽章的重复是「位置即用途」的重复，不是噪声 |
+| 底部状态行 | **不去数、不减项——只对 ≥480 成立**：它在页面另一端固定位置，是「流水线整体态势」的读数（含 token 总量与主题切换），与顶栏中枢不构成相邻同屏重复；五组数与顶栏徽章的重复是「位置即用途」的重复，不是噪声。**窄档（≤479）不在本条辖内**：那一条整条已退场（决策 300），读数改由看板顶栏与指标页各就各位 |
 
 ### 4.5 输入与入口
 
@@ -801,7 +810,7 @@ GET /tasks/{id}               → 详情页装载 + 断线重连后的全量校�
 | 输入坞不常驻提示语；传输层断线（`streamStatus === 'error'`）时才有那一行，且是全页**唯一**的断线告知（空闲态空坞 69px——决策 282③ 起自长 1 行起步，88px 的定值作废） | `frontend/src/routes/Talk.svelte` | 决策 218 当日修订②、220④；「值班长正在回话…」那半句已删（流式尾随光标已在说） |
 | 折行档（≤899）输入坞自长：1 行起步、随内容自长、封顶 6 行（软换行以 `scrollHeight` 实测校正、空值不量测），坞前净空 40→24px（悬出实测 14 + 呼吸 10）；发送钮 ≥44px（折行档显式 `min-height`——1 行时 stretch 只有 37.6px）与 16px 输入字号两条底线不破；桌面款（≥900）`rows=2` 逐像素不变 | `frontend/src/lib/talkDock.ts`、`frontend/src/routes/Talk.svelte` | 决策 282②③（显式修订 218④ 的「40 = 14 + 26」与 rows=2 口径）；判据由 `talkDock.test.ts` 钉住，几何（空态 69 / 封顶 / 贴合 / 桌面 60px）在 `frontend/e2e/talk.spec.ts` |
 | 浏览器壳让位：manifest 声明 standalone、apple meta + 图标（与桌面壳同一份母版，any / maskable 各 192 / 512）、viewport 带 `interactive-widget=resizes-content`；**manifest 不写 `start_url`**（写它等于把图标启动地址钉成 `/`，主屏图标就丢掉了添加时地址栏里的配对令牌——决策 285）；对讲台配对指引与行为一致（「从图标打开即是独立窗口」+ 既有「换过令牌重新添加」提醒照旧） | `frontend/index.html`、`frontend/public/manifest.webmanifest`、`scripts/make-icon.mjs`、`frontend/src/routes/Talk.svelte` | 决策 282④；**285 去掉 `start_url`**；图标规格见 theme-6-pixel §2.5 修订块，`frontend/e2e/shell.spec.ts` 钉 meta 与资源可取 |
-| 窄档（≤479px）**页面导航行钉在屏幕底缘**（`position: fixed; bottom: 0`，四项等分、图标上文字下、页签 `height: 44px`、`padding-bottom: var(--safeb)` 独占安全区、`z-index: 32`）、**铭牌行整行 `display:none`**、**道具栏行只在看板路由露出**（`class:on-board` 判据，**不叫 `.board`**——那是看板页容器的类名）且自带下框；高度按路由两档（看板 52px / 其余 **0px 清零**），下游钉位一律读 `--topbar-h`（**0 也写入**）；状态条 `bottom: var(--nav-h)` 叠页签栏上方，底部让位读 `--sbar-h`（= 42 + `--nav-h`，两层账本） | `frontend/src/components/layout/TopBar.svelte`、`frontend/src/app.css`、`frontend/src/components/layout/StatusLine.svelte` | 决策 243（修订 242 的 ② 导航行位置与高度两档；242 的铭牌行退场、`class:on-board` 判据照旧）；e2e 钉在 `frontend/e2e/pixel-theme.spec.ts`（52 / 58 / 页签贴底缘 / 状态条贴页签上沿 / `scroll-margin` 62）与 `frontend/e2e/talk.spec.ts`（非看板顶栏 0） |
+| 窄档（≤479px）**页面导航行钉在屏幕底缘**（`position: fixed; bottom: 0`，四项等分、图标上文字下、页签 `height: 44px`、`padding-bottom: var(--safeb)` 独占安全区、`z-index: 32`）、**铭牌行整行 `display:none`**、**道具栏行只在看板路由露出**（`class:on-board` 判据，**不叫 `.board`**——那是看板页容器的类名）且自带下框；高度按路由两档（看板 52px / 其余 **0px 清零**），下游钉位一律读 `--topbar-h`（**0 也写入**）；**状态条在窄档整条不露出**（`display:none`、元素仍在 DOM），底部让位读 `--sbar-h`（**窄档 = `--nav-h` 一层**，42 那层由决策 300 摘掉） | `frontend/src/components/layout/TopBar.svelte`、`frontend/src/app.css`、`frontend/src/components/layout/StatusLine.svelte` | 决策 243（修订 242 的 ② 导航行位置与高度两档；242 的铭牌行退场、`class:on-board` 判据照旧）+ **决策 300 修订 243 的 ②④（状态条退场与账本）**；e2e 钉在 `frontend/e2e/pixel-theme.spec.ts`（52 / 58 / 页签贴底缘 / **状态条 `toBeHidden`** / `scroll-margin` 62）与 `frontend/e2e/talk.spec.ts`（非看板顶栏 0、输入坞贴**页签栏**上沿） |
 | 「急停」的首现平实说法落在急停摘要条的琥珀标签上（折行档没有急停时那整块退场、词与译文一起不在） | `frontend/src/routes/Talk.svelte` | 决策 200（口径不变）＋ 218 ⑦b（换落点） |
 | 值班长没回话的那一轮渲染成失败轮**并显示原因**（后端落的 `system` 账以 `【没跑起来】` 开头，值守轮那一份是 `【值守没跑起来】`——决策 271；判定走后端给的字段，**不由前端解析正文前缀**——决策 252），不再是一条只有红轮、无处看原因的静默失败 | `frontend/src/routes/Talk.svelte`、`frontend/src/lib/talkTurns.ts`、`frontend/src/realtime/foreman.ts`、`frontend/src/api/types.ts`、`crates/app/src/routes/foreman.rs` | 决策 211④；票 04；决策 252 改判定来源（后端给字段、前端不解析正文） |
 | 本地等不到回包**不等于**这一轮失败：超时那一类补一句「它在服务端仍在继续」（回话会随流式增量到达，切走再切回本班次也能看到），其余失败照原样说 | `frontend/src/api/client.ts`、`frontend/src/realtime/foreman.ts`、`frontend/src/routes/Talk.svelte` | 决策 223；talk-judgments 票 06 把判据改成按 `kind`（决策 259 的延伸），判据由 `frontend/src/realtime/foreman.test.ts` 钉住（`failureNotice` / `isRequestTimeout`） |
@@ -831,7 +840,7 @@ GET /tasks/{id}               → 详情页装载 + 断线重连后的全量校�
 | 端口不是配置里那个（被别的程序占着，退让到临时端口）时，分享页说出「这次为什么变了」 | `frontend/src/routes/Share.svelte`、`frontend/src/lib/sharePairing.ts` | 决策 213；判定在 `portFallbackNote`，只绑回环时不说 |
 | 通知策略：toast 只对 pending / done / failed 弹，同类 5 分钟 cooldown，22–8 免打扰 | `frontend/src/lib/notificationPolicy.ts` | 决策 65 |
 | 实时：逐任务开 SSE 流 + 10s 对齐 tick 兜底 refetch；断流自愈——服务端静默也每 15s 发心跳、客户端「已连接」超 3×心跳无字节判死重连（看门狗）、任何重连成功后必补一次全量校准（解锁竞态与对讲台 reload 同走这一个入口） | `frontend/src/realtime/connection.ts`、`frontend/src/stores/board.svelte.ts`、`frontend/src/stores/taskDetail.svelte.ts`、`frontend/src/routes/Talk.svelte`、`crates/app/src/stream.rs` | 决策 76；spec `stream-self-heal` 票 01–04（心跳常量 SSE_KEEPALIVE_INTERVAL，阈值在连接层 options 注入） |
-| 主题切换（夜班靛 / 掌机背光）并入底部状态行 | `frontend/src/components/layout/StatusLine.svelte` | 决策 169 |
+| 主题切换（夜班靛 / 掌机背光）：**两处挂载、一份状态**——桌面档在底部状态行，窄档（状态条退场后）在设置落地页页头右侧 | `frontend/src/components/layout/ThemeToggle.svelte`、`frontend/src/stores/theme.svelte.ts`、`frontend/src/components/layout/StatusLine.svelte`、`frontend/src/routes/SettingsLanding.svelte` | 决策 169（两套配色与键名）；决策 300（抽组件、迁到落地页页头——手机端唯一入口） |
 | 详情页加载失败 / 换 id：把上一个任务连同它的动作按钮一起收走，并给一颗能按的「重新加载」（「这个 id 没有」与「没读到」分开说） | `frontend/src/stores/taskDetail.svelte.ts`、`frontend/src/routes/TaskDetail.svelte` | 票 01（R2-01）；清空是 `resetTaskContent()`，两条出路是「重试」与「重新加载」 |
 | 错误可见、可说、可恢复：错误横幅进 live region（`role=alert`）、表单给字段级 `aria-invalid` + `aria-describedby`、市场刷新失败**保留已列出的列表**并自带重试 | `frontend/src/routes/SettingsMarket.svelte`、`frontend/src/routes/Board.svelte`、`frontend/src/components/settings/ProjectForm.svelte`、`frontend/src/components/settings/ProviderForm.svelte` | 票 02（R2-06 / 07a / 07c） |
 | 终端旁路动作（重试 / 归档）失败不静默：写进页面既有的动作错误位并播报 | `frontend/src/routes/TaskDetail.svelte`、`frontend/src/stores/taskDetail.svelte.ts` | 票 02（R2-08）；审计 ②.1 的取证是假阳性（注入的路径对不上），代码结论成立并已修 |
@@ -839,9 +848,9 @@ GET /tasks/{id}               → 详情页装载 + 断线重连后的全量校�
 | 「待处理」下拉是真链接列表而不是假菜单：Escape / 点外关得掉、方向键进得去、面板常驻 DOM 用 `hidden` 收 | `frontend/src/components/layout/TopBar.svelte`、`frontend/src/stores/board.svelte.ts`、`frontend/src/lib/menuTrap.ts` | 票 04（R2-04）；**降级**掉 `role=menu`（ARIA 1.2 里它是「菜单」，补不起契约就别用它）；判据自决策 251⑤ 收进 `lib/menuTrap`，本行的 `frontend/src/components/layout/TopBar.test.ts` 11 条是它的黑盒闸门（**一条不改、全绿**） |
 | 全站地标与标题：每页一个 `<main>`、每页有 `<h1>`（看板与 404 也补）、页签是真 `tablist`（方向键 + roving tabindex）、当前项 `aria-current`、每页 `document.title` 各不相同 | `frontend/src/routes/Board.svelte`、`frontend/src/routes/TaskDetail.svelte`、`frontend/src/App.svelte`、`frontend/src/router.svelte.ts` | 票 06（R2-19 / 20） |
 | 装饰不进可访问名：按钮上的 `▶` 用 `::before` 画（`clip-path` 三角），DOM 里没有那个字符 | `frontend/src/app.css`、`frontend/src/components/layout/TopBar.svelte` | 票 06（R2-19）；像素纪律「只有 2px 一档描边」由 `frontend/src/theme/css-parity.test.ts` 守 |
-| 钉边元素按**变量**让位：动作坞钉在底栏上沿（`--sbar-h`）、档案盒吸顶避开**实测**顶栏高度（`--topbar-h`，由顶栏量出来写回） | `frontend/src/app.css`、`frontend/src/components/layout/TopBar.svelte`、`frontend/src/components/task/PendingDossier.svelte` | 票 05 / 09（R2-02 / R2-11）；两个高度的单一出处都在 `app.css` 的 `:root` |
+| 钉边元素按**变量**让位：动作坞钉在整个底部堆叠上沿（`--sbar-h`；**窄档那层现在只有页签栏**，决策 300 摘掉了状态条）、档案盒吸顶避开**实测**顶栏高度（`--topbar-h`，由顶栏量出来写回） | `frontend/src/app.css`、`frontend/src/components/layout/TopBar.svelte`、`frontend/src/components/task/PendingDossier.svelte` | 票 05 / 09（R2-02 / R2-11）；两个高度的单一出处都在 `app.css` 的 `:root` |
 | 窄屏（<480px）pending 动作坞**默认收成一行手柄**（「⏸ 等你拍板 · {label}」+ `aria-expanded` 翻转、▲/▼ 闪烁光标），点开才是完整动作面——说明与动作全量在展开层，坞的实测高度照旧写回 `--dock-h`（收起态详情正文只让出这一行） | `frontend/src/components/task/PendingDossier.svelte`、`frontend/src/app.css`、`frontend/src/routes/TaskDetail.svelte` | 决策 281（修「pending 时详情被坞挡了大半」的用户报告）；判据由 `frontend/src/components/task/PendingDossier.test.ts` 4 条与 `frontend/e2e/pending-dossier.spec.ts` ④ 钉住 |
-| 状态行档位：`≤748` 舍三格汇总、`≤560` 再舍 token 量表（数字逐字保留），容器加横滚兜底——**舍格优先、可滚兜底，绝不静默裁切** | `frontend/src/components/layout/StatusLine.svelte` | 决策 215 的档位表；票 08（R2-10） |
+| 状态行档位（**只在 ≥480 生效**）：`≤748` 舍三格汇总、`≤560` 再舍 token 量表（数字逐字保留），容器加横滚兜底——**舍格优先、可滚兜底，绝不静默裁切**；`≤479` 不再走这套舍格，整条 `display:none` | `frontend/src/components/layout/StatusLine.svelte` | 决策 215 的档位表；票 08（R2-10）；`≤479` 那一档由决策 300 收掉 |
 | 同名动作不是一个动作：身份 = 动作名 + 游标 + **落点**，渲染层的 each key 与「提交中」态共用同一把尺子 | `frontend/src/lib/actions.ts`、`frontend/src/components/board/PendingActions.svelte`、`frontend/src/components/task/DiffReviewPanel.svelte`、`frontend/src/stores/board.svelte.ts`、`frontend/src/routes/Talk.svelte`、`frontend/src/components/board/TaskCard.svelte` | 票 20；`retry_exhausted` 的两条 `goto` 撞 key 会让整块动作区停更；票 05（看板的忙态此前是第二把尺子：store 写两段 `${taskId}:${action}`、TaskCard 手工桥两种拼法——并入 `actionKey` 后生产者与消费者同一把） |
 | 新建任务按服务端返回的 id 跳转（不靠列表里的第一个去猜） | `frontend/src/stores/board.svelte.ts`、`frontend/src/components/board/NewTaskDialog.svelte` | 票 10（R2-12） |
 | 提交前拦下明显非法的值：`base_url` 形状、拆分里空标题的行**指出第几行**、文本域全空给提示而不是静默 no-op | `frontend/src/lib/providers.ts`、`frontend/src/components/task/SplitDialog.svelte` | 票 11（R2-13） |

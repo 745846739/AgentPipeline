@@ -867,8 +867,9 @@ test.describe('对讲台 · 对话（票 03）', () => {
  * （页头 46px 带子 / 急停摘要条 / 输入坞）。
  *
  * 桌面靠「整页钉住 + 时间线是唯一滚动容器」；这一档反过来——页头那一行钉在顶栏下沿
- * （`top: var(--topbar-h)`，带子 46px），急停摘要条钉在**它的**下沿，输入坞钉在底栏上沿
- * （`bottom: var(--sbar-h)`），对话从三者之间滚过去。
+ * （`top: var(--topbar-h)`，带子 46px），急停摘要条钉在**它的**下沿，输入坞钉在
+ * 底部页签栏上沿（`bottom: var(--sbar-h)`，窄档那个值就是 `--nav-h`——状态条已随
+ * 决策 300 整条退场），对话从三者之间滚过去。
  *
  * **这一组自带装置**（不复用上面那组的）：那组最后一条用例会把唯一的急停按掉（点合入），
  * 之后再进来就没有 pending 了——几何断言会退化成「空状态区当然不挤」，绿灯但无意义。
@@ -947,14 +948,15 @@ test.describe('对讲台 · 折行档（决策 192 / 218）', () => {
     const timelineBox = await page.locator('.timeline').boundingBox();
     expect(timelineBox?.height ?? 0, '对话区又被挤小了').toBeGreaterThanOrEqual(440);
 
-    // ⑤ 输入坞钉在底栏（`.statusline`）上沿：底边与底栏顶边不许有缝
+    // ⑤ 输入坞钉在底部页签栏（`.navbar`，窄档钉视口底缘）上沿：底边与页签栏顶边不许有缝。
+    // 判据的对象换过一次：状态条整条退场前，这一条量的是「贴状态条上沿」（决策 300）。
     const typerBox = await page.locator('.typer').boundingBox();
-    const sbarBox = await page.locator('.statusline').boundingBox();
+    const navBox = await page.locator('header.top .navbar').boundingBox();
     expect(typerBox).not.toBeNull();
-    expect(sbarBox).not.toBeNull();
+    expect(navBox, '底部页签栏应当有几何').not.toBeNull();
     expect(
-      Math.abs((typerBox?.y ?? 0) + (typerBox?.height ?? 0) - (sbarBox?.y ?? 0)),
-      '输入坞没有贴在底栏上沿',
+      Math.abs((typerBox?.y ?? 0) + (typerBox?.height ?? 0) - (navBox?.y ?? 0)),
+      '输入坞没有贴在页签栏上沿',
     ).toBeLessThanOrEqual(1);
 
     // ⑥ 整页不空滚：没有对话时文档高度就是视口高度（多出来的每一像素都是从对话区借的）
@@ -1037,10 +1039,10 @@ test.describe('对讲台 · 折行档（决策 192 / 218）', () => {
 
     // 输入坞也还在（同一时刻三样都在 = 这一档版面的全部合同）
     const typerBox = await page.locator('.typer').boundingBox();
-    const sbarBox = await page.locator('.statusline').boundingBox();
+    const navBox = await page.locator('header.top .navbar').boundingBox();
     expect(
-      Math.abs((typerBox?.y ?? 0) + (typerBox?.height ?? 0) - (sbarBox?.y ?? 0)),
-      '滚到底后输入坞没贴在底栏上沿',
+      Math.abs((typerBox?.y ?? 0) + (typerBox?.height ?? 0) - (navBox?.y ?? 0)),
+      '滚到底后输入坞没贴在页签栏上沿',
     ).toBeLessThanOrEqual(1);
     await expect(page.locator('.typer textarea')).toBeInViewport();
 
@@ -1121,14 +1123,14 @@ test.describe('对讲台 · 折行档（决策 192 / 218）', () => {
   /* 决策 218 ⑥ 的「顶栏信号灯跳段」用例已随**铭牌行整行退场**删除：窄档顶栏不再有
      `.railnav`（导航行升为首行、道具栏行只在看板露出），那颗灯没有了，判据自然无处落。 */
 
-  test('输入坞：没有提示语行，空态 69px（自长 1 行起步，决策 282 ③）、贴底栏上沿', async ({ page }) => {
+  test('输入坞：没有提示语行，空态 69px（自长 1 行起步，决策 282 ③）、贴页签栏上沿', async ({ page }) => {
     const bundle = watchBundle(page);
     await page.setViewportSize({ width: 430, height: 900 });
     await page.goto(`${app.webBase}/#/talk`);
     await settleBundle(page, bundle);
 
     const typerBox = await page.locator('.typer').boundingBox();
-    const sbarBox = await page.locator('.statusline').boundingBox();
+    const navBox = await page.locator('header.top .navbar').boundingBox();
     // 决策 282 ③ 把「常态 88px」的定高断言改成空态坞高：rows=2 固定改为 1 行起步后，
     // 坞 = 44px 的网格行（被发送钮的 44px 触控底线抬住，textarea 自身 1 行只有 37.6px）
     // + 21px 坞内边距 + 4px 边框 ≈ 69px。修订 218④ 当日修订 ② 撤提示语后的那个数作废。
@@ -1138,8 +1140,8 @@ test.describe('对讲台 · 折行档（决策 192 / 218）', () => {
     ).toBeLessThanOrEqual(1);
     // 贴合钉的是**贴合**不是定高：自长改变坞高，这条不该也不用跟着改
     expect(
-      Math.abs((typerBox?.y ?? 0) + (typerBox?.height ?? 0) - (sbarBox?.y ?? 0)),
-      '输入坞没有贴在底栏上沿',
+      Math.abs((typerBox?.y ?? 0) + (typerBox?.height ?? 0) - (navBox?.y ?? 0)),
+      '输入坞没有贴在页签栏上沿',
     ).toBeLessThanOrEqual(1);
 
     // 那一行整行撤掉了：坞里既没有「说的每句话都会记进审计」，也没有「值班长正在回话…」
@@ -1159,18 +1161,18 @@ test.describe('对讲台 · 折行档（决策 192 / 218）', () => {
 
     const ta = page.locator('.typer textarea');
     const typer = page.locator('.typer');
-    const sbarBox = await page.locator('.statusline').boundingBox();
+    const navBox = await page.locator('header.top .navbar').boundingBox();
     const dockH = async () => (await typer.boundingBox())?.height ?? 0;
     const stillFlush = async () => {
       const t = await typer.boundingBox();
-      return Math.abs((t?.y ?? 0) + (t?.height ?? 0) - (sbarBox?.y ?? 0));
+      return Math.abs((t?.y ?? 0) + (t?.height ?? 0) - (navBox?.y ?? 0));
     };
 
     // 粘贴 10 行硬换行 → 封顶 6 行：坞 = 6×25.6 + 21 + 4 ≈ 191px，到顶后框内滚
     await ta.fill(Array.from({ length: 10 }, (_, i) => `第${i + 1}行`).join('\n'));
     await expect.poll(dockH).toBeGreaterThanOrEqual(190);
     expect(await dockH(), '封顶之后不应继续长高').toBeLessThanOrEqual(192);
-    expect(await stillFlush(), '自长之后没有贴在底栏上沿').toBeLessThanOrEqual(1);
+    expect(await stillFlush(), '自长之后没有贴在页签栏上沿').toBeLessThanOrEqual(1);
 
     // 软换行（无换行符的长句）也要自长到封顶——判据只认硬换行，接线层用 scrollHeight 校正
     await ta.fill('长句'.repeat(120));
@@ -1187,7 +1189,7 @@ test.describe('对讲台 · 折行档（决策 192 / 218）', () => {
       timeout: 30_000,
     });
     await expect.poll(dockH).toBeLessThanOrEqual(70);
-    expect(await stillFlush(), '发完清空之后没有贴在底栏上沿').toBeLessThanOrEqual(1);
+    expect(await stillFlush(), '发完清空之后没有贴在页签栏上沿').toBeLessThanOrEqual(1);
 
     expectBundleHealthy(bundle);
   });

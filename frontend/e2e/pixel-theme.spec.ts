@@ -375,7 +375,7 @@ test.describe('前端 E2E ⑨：像素主题（决策 169）', () => {
     ).toBe(900);
     // 页签栏自身几何：上框 2 + 上留白 6 + 页签 44 + 下留白 6 = 58（无安全区的桌面上下文）
     expect(Math.round(navBox!.height)).toBe(58);
-    // 四枚页签命中区 ≥44px（移动基线），状态条叠在页签栏上方、交集为 0
+    // 四枚页签命中区 ≥44px（移动基线）
     const chips = page.locator('header.top .navbar .navchip');
     await expect(chips).toHaveCount(4);
     const chipBoxes = await chips.evaluateAll((els) =>
@@ -384,12 +384,11 @@ test.describe('前端 E2E ⑨：像素主题（决策 169）', () => {
     for (const h of chipBoxes) {
       expect(h).toBeGreaterThanOrEqual(44);
     }
-    const statusBox = await page.locator('footer.statusline').boundingBox();
-    expect(statusBox, '状态条应当有几何').not.toBeNull();
-    expect(
-      Math.round(statusBox!.y + statusBox!.height),
-      '状态条下沿必须贴住页签栏上沿',
-    ).toBe(Math.round(navBox!.y));
+    // 状态条在窄档整条退场（决策 300，修订决策 243 的 ②）：**元素仍在 DOM**（桌面档
+    // 还要用它，同铭牌行的处置），只是不露出——底部从此只剩页签栏一层，`--sbar-h`
+    // 随之收成 `--nav-h`（那 42px 不再让出来）。断言写 `toBeHidden` 而不是「不存在」，
+    // 正是为了守住「桌面那份 DOM 没被顺手删掉」这一点。
+    await expect(page.locator('footer.statusline')).toBeHidden();
 
     // 铭牌行（logo / wordmark / 会话名 / 信号灯缩略条）在窄档整行不渲染
     // （元素仍在 DOM——桌面档要靠它，故断的是 `display:none` 而不是不存在）

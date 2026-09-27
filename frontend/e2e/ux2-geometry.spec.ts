@@ -1,11 +1,13 @@
 /**
- * UX 第二轮 · 票 05 / 08 / 09（R2-02 / R2-10 / R2-11）：三处几何——动作坞与状态行、
- * 状态行自己的宽度档位、档案盒的 sticky 让位。
+ * UX 第二轮 · 票 05 / 08 / 09（R2-02 / R2-10 / R2-11）：三处几何——窄档动作坞与底部
+ * 页签栏、状态行自己的宽度档位（仅 ≥480）、档案盒的 sticky 让位。
  *
  * 这一组**断言数字与矩形**，不靠截图肉眼：叠放关系用矩形的交集、可达性用 `toBeInViewport`
  * 加一次真按（深浅切换按得到、主题真的变了）、让位用铭牌与顶栏的交集。
  * 宽度扫描的采样点按决策 215 的档位边界取（1440 / 1024 / 900 / 820 / 768 / 700 / 600 /
  * 560 / 520 / 500 / 480），**中段必须有**——上一轮就是只取了两个端点才漏掉这一整段。
+ * **窄档（≤479）的状态条已整条退场**（决策 300，修订决策 243 的 ②④）：那一条的让位
+ * 判据改盯页签栏，深浅切换的可达性改在设置落地页页头上验（手机端唯一入口）。
  *
  * 真 axum 后端 + mock LLM + 临时 home；只 Chromium（决策 144）。
  */
@@ -39,36 +41,44 @@ test.describe('UX2 ⑥ 几何：坞 / 状态行 / 档案盒（票 05 / 08 / 09�
     await app?.stop();
   });
 
-  test('手机上动作坞给状态行让位：矩形交集为 0，深浅切换按得到', async ({ page }) => {
+  test('手机上动作坞贴页签栏上沿（交集为 0），换配色在设置落地页按得到', async ({ page }) => {
     const bundle = watchBundle(page);
     await page.setViewportSize({ width: 430, height: 932 });
     await page.goto(`${app.webBase}/#/task/${app.taskId}`);
     await settleBundle(page, bundle);
     await page.waitForTimeout(400);
 
+    // 状态条在窄档整条退场（决策 300）：底部从此只有页签栏一层，`--sbar-h` = `--nav-h`
+    await expect(page.locator('footer.statusline')).toBeHidden();
+
     const boxes = await page.evaluate(() => {
       const dock = document.querySelector('.dock') as HTMLElement | null;
-      const bar = document.querySelector('footer.statusline') as HTMLElement | null;
-      if (!dock || !bar) return null;
+      const nav = document.querySelector('header.top .navbar') as HTMLElement | null;
+      if (!dock || !nav) return null;
       const d = dock.getBoundingClientRect();
-      const b = bar.getBoundingClientRect();
+      const n = nav.getBoundingClientRect();
       return {
         dock: { top: Math.round(d.top), bottom: Math.round(d.bottom) },
-        status: { top: Math.round(b.top), bottom: Math.round(b.bottom) },
-        overlap: Math.round(Math.max(0, Math.min(d.bottom, b.bottom) - Math.max(d.top, b.top))),
-        statusText: (bar.textContent ?? '').trim().replace(/\s+/g, ' ').slice(0, 40),
+        nav: { top: Math.round(n.top), bottom: Math.round(n.bottom) },
+        overlap: Math.round(Math.max(0, Math.min(d.bottom, n.bottom) - Math.max(d.top, n.top))),
       };
     });
-    expect(boxes, '这一态应当同时有动作坞与状态行').not.toBeNull();
-    expect(boxes!.overlap, '动作坞不应压住状态行（此前实测压掉 42px = 100%）').toBe(0);
-    expect(boxes!.status.top).toBeGreaterThanOrEqual(boxes!.dock.bottom - 1);
+    expect(boxes, '这一态应当同时有动作坞与底部页签栏').not.toBeNull();
+    expect(boxes!.overlap, '动作坞不应压住页签栏').toBe(0);
+    expect(boxes!.nav.top, '坞的下沿不该越过页签栏的上沿').toBeGreaterThanOrEqual(
+      boxes!.dock.bottom - 1,
+    );
 
-    // 状态行真的可见（不是被盖住的那种「在 DOM 里」）
-    const status = page.locator('footer.statusline');
-    await expect(status).toBeInViewport();
+    // 坞上的按钮仍然按得到（没有被新的让位顶出屏幕）
+    const dockBtn = page.locator('.dock button').first();
+    await expect(dockBtn).toBeInViewport();
 
-    // 深浅切换：按得到，且主题真的变了
-    const toggle = page.getByRole('button', { name: /切换到(浅色|深色)主题/ });
+    // 深浅切换：窄档唯一入口在**设置落地页页头**（决策 300）——按得到，且主题真的变了。
+    // 用 `.p-head` 限定作用域：桌面档状态行那枚还在 DOM 里，虽然窄档 `display:none`
+    // 不参与 role 查询，但作用域写死在源头，将来谁把状态条放回来也不会撞 strict mode。
+    await page.goto(`${app.webBase}/#/settings`);
+    await settleBundle(page, bundle);
+    const toggle = page.locator('.p-head .theme-tog');
     await expect(toggle).toBeInViewport();
     const before = await themeOf(page);
     await toggle.click();
@@ -76,9 +86,6 @@ test.describe('UX2 ⑥ 几何：坞 / 状态行 / 档案盒（票 05 / 08 / 09�
       .poll(async () => themeOf(page), { message: '按下深浅切换后主题应当真的变' })
       .not.toBe(before);
 
-    // 坞上的按钮仍然按得到（没有被新的让位顶出屏幕）
-    const dockBtn = page.locator('.dock button').first();
-    await expect(dockBtn).toBeInViewport();
     expectBundleHealthy(bundle);
   });
 

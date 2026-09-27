@@ -1,6 +1,7 @@
 <script lang="ts">
   import { router } from '../router.svelte';
   import { onHostMachine } from '../lib/localPage';
+  import ThemeToggle from '../components/layout/ThemeToggle.svelte';
 
   /**
    * 设置落地页（`#/settings`，`route.name === 'settings-landing'`；决策 198 / design §4.3）。
@@ -12,6 +13,12 @@
    * **各项仍是独立路由，落地页只是入口**：这里不复制任何设置内容、不内嵌表单、
    * 不替子页保存状态——它是一张门牌，点进去才是那一页。指标**不列**在这里：
    * 它不是设置，留在顶栏（第一屏三项之一）。
+   *
+   * **页头那一枚深浅切换钮是唯一的例外，且它不是「一项」**（决策 300）：分类法里没有
+   * 它、它不对应任何路由，只是一颗开关——窄档状态条整条退场后，它是手机端换配色的
+   * 唯一入口（桌面档状态行那枚照旧还在）。把开关做成一条通往子页的链接，等于为了形式
+   * 整齐让用户多点一次；这里破的是「落地页不放控件」这条**隐含**惯例，明写在上面这段
+   * 注释里，而不是悄悄破。
    *
    * 「手机访问」那一项**只在跑服务的这台机器本机上渲染**（决策 190 / 198）：
    * 判据是**来源是否回环**（`onHostMachine()`，**不看视口宽度**），非本机来源**不渲染**
@@ -104,6 +111,7 @@
 <main class="page">
   <div class="p-head">
     <h1 class="p-title">设置</h1>
+    <ThemeToggle boxed={true} />
   </div>
   <p class="hintline">这台机器上的流水线怎么跑、谁能进来。</p>
 

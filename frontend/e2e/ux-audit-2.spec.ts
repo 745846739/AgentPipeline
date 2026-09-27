@@ -278,7 +278,12 @@ test.describe('① 有数据：无障碍语义、键盘、失败态、窄档几�
     await shot(page, 'r2-detail-dossier-scrolled');
   });
 
-  /** 移动款：底部动作坞与状态行是否重叠（同一 bottom:0 的两个 fixed 层）。 */
+  /**
+   * 移动款：底部动作坞与底缘那一层是否重叠（两个 fixed 层）。
+   * **≤479 状态条已整条退场**（决策 300）：这里读到的 `display: none` 就是预期值，
+   * 于是 `overlapPx` 恒为 0、`status.h` 恒为 0——取证看 `statusDisplay` 那一列，
+   * 别把 0 当成「两层各就各位」的功劳。
+   */
   test('①.6 移动款：动作坞 vs 状态行重叠', async ({ page }) => {
     await go(page, 430, 932);
     await open(page, app, `#/task/${app.taskIds[0]}`);
@@ -295,6 +300,7 @@ test.describe('① 有数据：无障碍语义、键盘、失败态、窄档几�
       return {
         dock: dr ? { top: Math.round(dr.top), bottom: Math.round(dr.bottom), h: Math.round(dr.height), z: dock ? getComputedStyle(dock).zIndex : null } : null,
         status: br ? { top: Math.round(br.top), bottom: Math.round(br.bottom), h: Math.round(br.height), z: bar ? getComputedStyle(bar).zIndex : null } : null,
+        statusDisplay: bar ? getComputedStyle(bar).display : null,
         overlapPx: Math.round(overlap),
         statusVisibleText: bar ? (bar.textContent ?? '').trim().replace(/\s+/g, ' ').slice(0, 80) : null,
       };
@@ -335,7 +341,11 @@ test.describe('① 有数据：无障碍语义、键盘、失败态、窄档几�
     }
   });
 
-  /** 状态行：宽度扫描——这一刻的时钟/主题钮是否被裁掉且无横滚。 */
+  /**
+   * 状态行：宽度扫描——这一刻的时钟/主题钮是否被裁掉且无横滚。
+   * **430 那一档是负对照**：状态条在 ≤479 整条退场（决策 300），故 `display: none`、
+   * `clockRight` / `togRight` 全为 0——那不是「没裁」，是「没有这一条」。
+   */
   test('①.8 状态行裁剪扫描', async ({ page }) => {
     await open(page, app, '#/');
     await setTheme(page, 'dark');
@@ -347,6 +357,7 @@ test.describe('① 有数据：无障碍语义、键盘、失败态、窄档几�
         const clock = bar.querySelector('.clock') as HTMLElement | null;
         const tog = bar.querySelector('.theme-tog') as HTMLElement | null;
         return {
+          display: getComputedStyle(bar).display,
           scrollW: bar.scrollWidth,
           clientW: bar.clientWidth,
           clipped: bar.scrollWidth - bar.clientWidth,

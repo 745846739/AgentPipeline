@@ -5,12 +5,19 @@
   import { formatTokens } from '../../lib/pipeline';
   import { GEOMETRY, gaugeFilled } from '../../theme/contract';
   import Gauge from '../render/Gauge.svelte';
+  import ThemeToggle from './ThemeToggle.svelte';
 
   /**
    * 底部车间看板条（决策 169 / theme-6-pixel.md §3）。
-   * 桌面为常驻看板条；窄屏同一条作载波行（§5 移动原型 `.carrier`），
-   * **叠在底部页签栏上方**（决策 243：`bottom: var(--nav-h)`，安全区归页签栏）。
    * 状态用实心像素灯 + 文字双编码，字符标记（⏸ / ▶ / 中点）已退役。
+   *
+   * **只在 ≥480px 露出**（决策 300，修订决策 243 的 ②④）：窄档整条 `display:none`——
+   * 手机自己那条状态栏在报时、屏幕本来就窄，条上的读数另有去处（看板顶栏道具栏行的
+   * 待处理 / 执行中、指标页的 token 总量），而唯一的动作（深浅切换）已随
+   * `ThemeToggle` 迁到设置落地页页头。**元素仍在 DOM**（桌面档要靠它），与铭牌行
+   * 退场（决策 242①）同一处置；底部让位账本 `--sbar-h` 在窄档随之收成 `--nav-h`
+   * （只剩页签栏一层），五个消费点一个都不用改。中间档（480–1240）的舍格逻辑
+   * （决策 215）原样保留在下面。
    */
   let clock = $state('');
   let timer: ReturnType<typeof setInterval> | null = null;
@@ -25,31 +32,9 @@
     gaugeFilled(totalTokens) >= GEOMETRY.gaugeSegments - 2 ? 'warn' : 'go',
   );
 
-  /* 深浅两款是像素机房的两套配色：夜班靛 / 掌机背光（§2.1 / §2.4）。 */
-  const STORAGE_KEY = 'agentpipeline.theme';
-  let theme = $state<'dark' | 'light'>('dark');
-
-  function applyTheme(next: 'dark' | 'light') {
-    theme = next;
-    if (typeof document !== 'undefined') document.documentElement.dataset.theme = next;
-    try {
-      localStorage.setItem(STORAGE_KEY, next);
-    } catch {
-      // 隐私模式等禁用 localStorage：本次会话仍生效
-    }
-  }
-
-  function toggleTheme() {
-    applyTheme(theme === 'dark' ? 'light' : 'dark');
-  }
+  /* 深浅切换的状态住在 `stores/theme.svelte.ts`（决策 300：切换钮两处挂载、一份状态）。 */
 
   onMount(() => {
-    try {
-      const saved = localStorage.getItem(STORAGE_KEY);
-      if (saved === 'light' || saved === 'dark') theme = saved;
-    } catch {
-      // 忽略
-    }
     // 时钟也走全站口径（票 15）：时间格式只有 `lib/format.ts` 一处出处
     const tick = () => {
       clock = formatClockAt(new Date());
@@ -81,15 +66,7 @@
   <span class="cell tok">
     <Gauge tokens={totalTokens} tone={tokenTone} /> 总量 <b>{formatTokens(totalTokens)}</b> tok
   </span>
-  <button
-    type="button"
-    class="theme-tog"
-    onclick={toggleTheme}
-    aria-label={theme === 'dark' ? '切换到浅色主题' : '切换到深色主题'}
-    title="切换像素机房配色（夜班靛 / 掌机背光）"
-  >
-    <span class="sw" aria-hidden="true"></span>{theme === 'dark' ? '浅色' : '深色'}
-  </button>
+  <ThemeToggle />
   <span class="clock">{clock}</span>
 </footer>
 
@@ -143,22 +120,6 @@
   .tok {
     gap: 6px;
   }
-  .theme-tog {
-    display: inline-flex;
-    align-items: center;
-    gap: 5px;
-    color: var(--text-3);
-    white-space: nowrap;
-  }
-  .theme-tog:hover {
-    color: var(--text-hi);
-  }
-  .theme-tog .sw {
-    width: 8px;
-    height: 8px;
-    background: var(--go);
-    border: 2px solid var(--ink);
-  }
   .statusline .clock {
     margin-left: auto;
     color: var(--text-2);
@@ -192,32 +153,18 @@
   }
 
   @media (max-width: 479px) {
-    /* 窄屏：载波行（§5 视图 0），**叠在底部页签栏上方**（决策 243：`bottom: var(--nav-h)`，
-       安全区归页签栏，这一层不再带 safeb——故 min-height/padding 里都没有 `--safeb`）。
-       桌面款的五组信号（待处理 / 执行中 / 总量 / 主题 / 时钟）在 430px 上实测要
-       501px：时钟整块、主题钮一部分滚出屏幕外——**静默不可见**，比不看更糟。
-       窄屏只留四组，把两处纯装饰收进桌面款：
-         · 时钟：手机自己的状态栏就在显示时间；
-         · token 量表：数字（`总量 N tok`）仍逐字保留，量表的 16 段约 110px 是这一行
-           放不下的主因。实测四组在 360px 上仍有余量，320px 也不折行。 */
+    /* 窄档整条退场（决策 300，修订决策 243 的 ②④）。
+       这一条在退场之前就已经收得只剩四组（时钟交给手机状态栏、16 段量表放不下——
+       决策 215 的舍格在这一档走过一轮），剩下的读数各有去处、唯一的动作已随
+       `ThemeToggle` 迁到设置落地页页头，于是**整条不再露出**：
+         · 待处理 / 执行中 → 看板顶栏道具栏行的过滤槽徽章与「待处理 N」芯片；
+         · token 总量 → 指标页的「到现在用掉 N 个 token」；
+         · 深浅切换 → `#/settings` 页头（手机从底部「设置」页签一进就看得到）。
+       `display:none` 而不是卸载：桌面档同一份 DOM 还要用（同铭牌行的处置，决策 242①），
+       也让 `pixel-theme.spec` 断言的是「不露出」而不是「不存在」。
+       钉底的东西随之少让 42px——那一层在 `app.css` 的 `--sbar-h` 账本里一并摘掉。 */
     .statusline {
-      bottom: var(--nav-h);
-      min-height: 40px;
-      height: auto;
-      padding: 0 12px;
-      gap: 12px;
-    }
-    .statusline .dep {
       display: none;
-    }
-    .statusline .clock {
-      display: none;
-    }
-    .statusline .tok :global(.gauge) {
-      display: none;
-    }
-    .statusline .theme-tog {
-      min-height: 40px;
     }
   }
 </style>

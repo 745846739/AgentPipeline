@@ -5,12 +5,14 @@
  * 按用户动作断言；断言落在可访问性契约（导航区的名字、heading 的层级与名字、链接的可读名）
  * 与计算样式上，不落 class 名，也不做说明性段落的精确文案匹配。
  *
- * 覆盖五条：
+ * 覆盖六条：
  *   ① 顶栏**页面导航行恰四项**（对讲台 / 看板 / 指标 / 设置，决策 240 修订决策 198）；
  *   ② 设置落地页两组分类、每一项可点且落到各自的路由；
  *   ③ 非本机来源下「手机访问」项**不渲染**；
  *   ④ `#/settings/stages` 有自己的页面、阶段配置在那里（小节标题不与页面标题同级）；
- *   ⑤ 404 说清状态与下一步，出口是顶栏那一行页签（决策 240：此处不再自带「回看板」）。
+ *   ⑤ 404 说清状态与下一步，出口是顶栏那一行页签（决策 240：此处不再自带「回看板」）；
+ *   ⑥ 窄档（430）状态条整条退场后，**换配色的唯一入口在落地页页头**且按得到
+ *     （决策 300 修订决策 243 的 ②④）。
  *
  * ③ 的做法：`onHostMachine()`（决策 190）的判据是**来源是否回环**——`api base` 非空时看它，
  * 否则看当前地址（`lib/localPage.ts`）。playwright 造不出一个非回环的浏览器来源，但可以按
@@ -22,6 +24,10 @@
 import { expect, test } from '@playwright/test';
 import { startApp, settleBundle, watchBundle, expectBundleHealthy, type App } from './harness';
 import { foremanScript } from './scripts';
+
+async function themeOf(page: import('@playwright/test').Page): Promise<string> {
+  return page.evaluate(() => document.documentElement.dataset.theme ?? '');
+}
 
 /** 非回环的 base（TEST-NET-1，RFC 5737 的文档用网段）：判据只看主机名，故请求打不到谁。 */
 const OFF_HOST_BASE = 'http://192.0.2.10:8788';
@@ -167,6 +173,36 @@ test.describe('前端 E2E：设置的信息架构（票 21 / 决策 198）', () 
     await settleBundle(page, bundle);
     await expect(page.getByRole('heading', { level: 1 })).toHaveCSS('font-size', '24px');
     await expect(page.getByRole('heading', { name: '谁能进来' })).toHaveCSS('font-size', '12px');
+
+    expectBundleHealthy(bundle);
+  });
+
+  test('窄档（430）：状态条不露出，换配色在落地页页头按得到（决策 300）', async ({ page }) => {
+    const bundle = watchBundle(page);
+    await page.setViewportSize({ width: 430, height: 932 });
+    await page.goto(`${app.webBase}/#/`);
+    await settleBundle(page, bundle);
+
+    // 状态条整条退场：元素仍在 DOM（桌面档要用它），只是不露出
+    await expect(page.locator('footer.statusline')).toBeHidden();
+
+    // 手机上的真实路径：底部「设置」页签 → 落地页页头那一枚
+    await page
+      .getByRole('navigation', { name: '页面导航' })
+      .getByRole('link', { name: '设置' })
+      .click();
+    await expect(page).toHaveURL(/#\/settings$/);
+
+    // 只按可访问名找（这一份规格不落 class 名）：窄档状态行那枚是 display:none、
+    // 不参与 role 查询，故这里命中的必是页头这一枚
+    const toggle = page.getByRole('button', { name: /切换到(浅色|深色)主题/ });
+    await expect(toggle).toBeInViewport();
+    const before = await themeOf(page);
+    await toggle.click();
+    await expect
+      .poll(async () => themeOf(page), { message: '按下深浅切换后主题应当真的变' })
+      .not.toBe(before);
+    await expect(toggle).toHaveAttribute('aria-label', /切换到(浅色|深色)主题/);
 
     expectBundleHealthy(bundle);
   });

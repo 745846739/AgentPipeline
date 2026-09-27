@@ -1,17 +1,18 @@
-import { render, screen } from '@testing-library/svelte';
+import { fireEvent, render, screen } from '@testing-library/svelte';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import SettingsLanding from './SettingsLanding.svelte';
+import { theme } from '../stores/theme.svelte';
 
 /**
- * 设置落地页（决策 198 / design §4.3）接线层：分类（决策 272⑧ 起三类）、八个入口，
- * 以及**「手机访问」项随来源取舍**那一条。
+ * 设置落地页（决策 198 / design §4.3）接线层：分类（决策 272⑧ 起三类）、八个入口、
+ * **页头那枚深浅切换钮**（决策 300），以及**「手机访问」项随来源取舍**那一条。
  *
- * 那一条的原判据钉在 `lib/localPage.test.ts`（主机名），这里钉的是**接线**——
+ * 「手机访问」的原判据钉在 `lib/localPage.test.ts`（主机名），这里钉的是**接线**——
  * 组件确实按 `onHostMachine()` 取舍了「手机访问」这一项，且其余四项一个不少
  * （藏一个入口顺带把别的一起藏了，是这类改动最容易犯的错）。这条接线测试原先在
  * `TopBar.test.ts`：入口从顶栏挪进落地页，接线跟着一起挪。
  *
- * 断言只落在可访问性契约上（heading / link 的可读名与 href），不落 class 名。
+ * 断言只落在可访问性契约上（heading / link / button 的可读名与 href），不落 class 名。
  */
 
 const mocks = vi.hoisted(() => ({ onHostMachine: vi.fn() }));
@@ -26,6 +27,7 @@ const HOW = ['值守轮', '命令执行', '模型与密钥', '阶段配置', '�
 afterEach(() => {
   vi.resetAllMocks();
   document.body.innerHTML = '';
+  theme.reset();
 });
 
 describe('设置落地页（决策 198）', () => {
@@ -63,6 +65,23 @@ describe('设置落地页（决策 198）', () => {
     render(SettingsLanding);
 
     expect(screen.queryByRole('link', { name: /指标/ })).toBeNull();
+  });
+
+  it('页头那枚深浅切换钮按得动：data-theme 与本地记忆都真变（决策 300）', async () => {
+    mocks.onHostMachine.mockReturnValue(true);
+    theme.reset();
+    render(SettingsLanding);
+
+    const before = theme.current;
+    const tog = screen.getByRole('button', { name: /切换到(浅色|深色)主题/ });
+    await fireEvent.click(tog);
+
+    expect(theme.current, '切换后 store 该翻面').not.toBe(before);
+    expect(document.documentElement.dataset.theme).toBe(theme.current);
+    expect(localStorage.getItem('agentpipeline.theme')).toBe(theme.current);
+    // 可访问名跟着换（按钮写的是「按下去去哪儿」）——重新查一次，别拿旧节点的快照
+    const after = theme.current === 'dark' ? '切换到浅色主题' : '切换到深色主题';
+    expect(screen.getByRole('button', { name: after })).not.toBeNull();
   });
 
   it('在本机打开：「手机访问」项在', () => {
