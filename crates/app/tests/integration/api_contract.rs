@@ -4842,7 +4842,7 @@ async fn a_stewarded_task_is_resumed_by_the_foreman_without_a_press() {
     let messages = api
         .state
         .store
-        .list_foreman_messages(&sid, 100)
+        .list_foreman_messages(&sid, 100, None)
         .await
         .unwrap();
     assert!(
@@ -4935,7 +4935,7 @@ async fn a_stewarded_task_can_be_unstuck_by_the_foreman_without_a_press() {
         "僵死的 run 要标终态——「它还在跑」这句话得从台账里消失"
     );
     // 留账（硬要求）：那一行说的是**实际做的动作**
-    let messages = store.list_foreman_messages(&sid, 100).await.unwrap();
+    let messages = store.list_foreman_messages(&sid, 100, None).await.unwrap();
     assert!(
         messages
             .iter()
@@ -5014,6 +5014,75 @@ async fn foreman_session_is_available_on_an_empty_home() {
     assert_eq!(body["foreman"]["agent_type"], "foreman");
     assert_eq!(body["foreman"]["stage_key"], "foreman");
     assert_eq!(body["foreman"]["wired"].as_bool(), Some(true));
+}
+
+/// 会话内**向上游标**（票 05，显式修订读接口「不分页」的产品立场 → 500 缺省 +
+/// `before_id` 游标）：缺省仍是最近 500 条（老客户端逐字不变），给了游标就回更早
+/// 一段（段内升序），到头回空。
+///
+/// 三段各钉一颗牙：缺省段短了 / 长了 → 「500 缺省」断言红；游标排序或边界写反 →
+/// 分段断言红；到头不回空（比如回全量）→ 前端会永远滚下去，终点断言红。
+#[tokio::test]
+async fn foreman_session_messages_page_up_with_before_id() {
+    let api = api_with_foreman(FakeAgent::new(Script::new())).await;
+    let (_, body) = post(&api, "/foreman/sessions", json!({"title": "长班"})).await;
+    let sid = body["session"]["id"].as_str().unwrap().to_string();
+
+    // 502 条直写库：走 HTTP 一条条说话要 502 轮模型调用，而这里测的是**读接口**。
+    for i in 1..=502 {
+        api.state
+            .store
+            .append_foreman_message(NewForemanMessage::assistant(&sid, format!("第 {i} 句")))
+            .await
+            .unwrap();
+    }
+
+    // 缺省：最近 500 条、升序——「500 缺省」这条语义一个字没动。
+    let (status, body) = get(&api, &format!("/foreman/session?session={sid}")).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let latest = body["messages"].as_array().unwrap();
+    assert_eq!(latest.len(), 500, "缺省仍是最近 500 条");
+    assert_eq!(latest[0]["content"], "第 3 句", "掐头掐的是最老的两条");
+    assert_eq!(latest[499]["content"], "第 502 句", "尾部到最新那条");
+
+    // 游标：从缺省段最老那条往上取——回更早一段（2 条），段内升序且都严格更早。
+    let first_id = latest[0]["id"].as_i64().unwrap();
+    let (status, body) = get(
+        &api,
+        &format!("/foreman/session?session={sid}&before_id={first_id}"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let earlier = body["messages"].as_array().unwrap();
+    assert_eq!(earlier.len(), 2, "502 - 500 = 2 条更早的");
+    assert_eq!(earlier[0]["content"], "第 1 句");
+    assert_eq!(earlier[1]["content"], "第 2 句");
+    assert!(
+        earlier.iter().all(|m| m["id"].as_i64().unwrap() < first_id),
+        "段内每条都严格早于游标"
+    );
+
+    // 不重不漏：缺省段 + 游标段恰是全部 502 条（两段 id 不相交、无重复）。
+    let all_ids: std::collections::HashSet<i64> = latest
+        .iter()
+        .chain(earlier.iter())
+        .filter_map(|m| m["id"].as_i64())
+        .collect();
+    assert_eq!(all_ids.len(), 502, "两段拼起来恰是全量，不重不漏");
+
+    // 到头：游标指到最老那条 → 空。空**就是**终点信号（不另加 has_more 字段）。
+    let oldest = earlier[0]["id"].as_i64().unwrap();
+    let (status, body) = get(
+        &api,
+        &format!("/foreman/session?session={sid}&before_id={oldest}"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(
+        body["messages"].as_array().unwrap().len(),
+        0,
+        "到头回空：{body}"
+    );
 }
 
 /// 空 home 下发一句话、拿到回话——**本 spec 的验收锚点**。
@@ -5127,10 +5196,15 @@ async fn a_dropped_request_does_not_kill_the_turn() {
         let messages = api
             .state
             .store
-            .list_foreman_messages(&sid, 100)
+            .list_foreman_messages(&sid, 100, None)
             .await
             .unwrap();
-        if let Some(assistant) = messages.iter().find(|m| m.role == "assistant") {
+        // 只认**收口了**的 assistant 行（票 01：在飞时库里先有一条 `status = "in_flight"`
+        // 的半截行，拿它当回话会读到还没说完的空 / 半截字——这一条钉的是「回话落了库」）。
+        if let Some(assistant) = messages
+            .iter()
+            .find(|m| m.role == "assistant" && m.status.is_none())
+        {
             reply = Some(assistant.content.clone());
             break;
         }
@@ -5145,7 +5219,7 @@ async fn a_dropped_request_does_not_kill_the_turn() {
     let messages = api
         .state
         .store
-        .list_foreman_messages(&sid, 100)
+        .list_foreman_messages(&sid, 100, None)
         .await
         .unwrap();
     assert!(
@@ -5156,14 +5230,22 @@ async fn a_dropped_request_does_not_kill_the_turn() {
     );
 }
 
-/// 刷新页面之后，**服务端说得出「这一班此刻有一轮在跑」**（决策 260）。
+/// 刷新页面之后，**服务端说得出「这一班此刻有一轮在跑」**，且**半截话已在台账里**
+/// （决策 260；由票 01 显式修订——见下）。
 ///
 /// 这是用户报的那条毛病的服务端半边：正在答话时刷新对讲台，那一轮整段看不见——因为界面上
 /// 「在途」的现场（乐观轮 / 流式文本）刷新即丢，而它此前**没有任何权威读数**可依。
 /// `GET /foreman/session` 现在带 `turn_in_flight`，界面据此重新接上那一轮（把到达的增量
 /// 接进时间线）。这一条钉的是这个字段随一轮的寿命翻转。
 ///
-/// 牙齿：把 `session_payload` 的 `turn_in_flight` 改成恒 `false`，本用例停在第一个断言上。
+/// **对决策 260 的显式修订**（spec .scratch/talk-replay 决策 13 / 12）：从前「回话落库才算数」
+/// ——在飞时 messages 里只有人那一句，界面手里那段流式文字是唯一现场、刷新即丢；现在
+/// **在途即落库**：一轮开工就建这条回话的 assistant 半截行（`status = "in_flight"`），
+/// 收口才写成完整行。`turn_in_flight` 这个进程内读数照旧（决策 260 的登记语义不动，
+/// spec 决策 7：它答「此刻有没有轮在跑」，台账答「此前发生了什么」）。
+///
+/// 牙齿：把 `session_payload` 的 `turn_in_flight` 改成恒 `false`，本用例停在第一个断言上；
+/// 把建行挪回「整轮结束才追加」，第二个断言（半截行）停在 `expect` 上。
 #[tokio::test]
 async fn the_session_payload_says_whether_a_turn_is_running() {
     /// 收到信号才回话的模型：把「正在跑」变成一个可观测的窗口（时序照
@@ -5222,17 +5304,20 @@ async fn the_session_payload_says_whether_a_turn_is_running() {
     }
     assert!(!sid.is_empty(), "这一轮应当先把用户那一句落库");
 
-    // **刷新那一屏**读到的就是这一趟：`turn_in_flight` 为真（这正是界面重新接上一轮的依据）。
+    // **刷新那一屏**读到的就是这一趟：`turn_in_flight` 为真（这正是界面重新接上一轮的依据），
+    // 且台账里已有这条回话的**半截行**（票 01 修订决策 260 的那一半）。
     // 轮询而不是单次断言（与下面落地那次对称）：用户行先落库、「在跑」的登记在随后起来的
-    // 那一轮里——两步之间有窗口，全量测试满载时单次断言会输掉这场竞态（单独跑 3/3 绿、
-    // `make check-test` 整跑里红过一次）。
+    // 那一轮里、半截行又晚一步（建行在历史读完之后）——三步之间有窗口，全量测试满载时
+    // 单次断言会输掉这场竞态（单独跑 3/3 绿、`make check-test` 整跑里红过一次）。
     let mut body = serde_json::Value::Null;
     let mut running = false;
     for _ in 0..300 {
         let (status, b) = get(&api, &format!("/foreman/session?session={sid}")).await;
         assert_eq!(status, StatusCode::OK, "{b}");
         body = b;
-        if body["turn_in_flight"].as_bool() == Some(true) {
+        if body["turn_in_flight"].as_bool() == Some(true)
+            && body["messages"].as_array().is_some_and(|m| m.len() == 2)
+        {
             running = true;
             break;
         }
@@ -5240,11 +5325,26 @@ async fn the_session_payload_says_whether_a_turn_is_running() {
     }
     assert!(
         running,
-        "一轮正在跑时，刷新页面读到的必须是「在跑」：{body}"
+        "一轮正在跑时，刷新页面读到的必须是「在跑」+ 半截行：{body}"
     );
-    // 这一轮还没答完，故台账里只有用户那一句——界面手里那段流式文字不在台账里，
-    // 「在跑」这个读数正是它唯一的依据。
-    assert_eq!(body["messages"].as_array().unwrap().len(), 1);
+    // 半截行是这条回话自己的行：assistant 角色、`status = "in_flight"`、还一个字没说
+    // （第一轮模型调用被闸停着，故 content 为空——「还没说」不是「说了个空」）。
+    let half = body["messages"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|m| m["role"] == "assistant")
+        .expect("在飞时 messages 里已有 assistant 半截行");
+    assert_eq!(
+        half["status"].as_str(),
+        Some("in_flight"),
+        "半截行要标出自己在途：{half}"
+    );
+    assert_eq!(
+        half["content"].as_str(),
+        Some(""),
+        "闸还停着第一轮调用：它还没说过话：{half}"
+    );
 
     // 放行：这一轮答完。**回话落库之后的读数必须翻回 false**——否则界面会永远以为它在说话，
     // 那比没有这个读数更坏（假读数）。
@@ -5255,10 +5355,25 @@ async fn the_session_payload_says_whether_a_turn_is_running() {
         let (_, body) = get(&api, &format!("/foreman/session?session={sid}")).await;
         if body["turn_in_flight"].as_bool() == Some(false) {
             landed = true;
+            let messages = body["messages"].as_array().unwrap();
             assert_eq!(
-                body["messages"].as_array().unwrap().len(),
+                messages.len(),
                 2,
-                "答完之后台账里是两句（人一句、值班长一句）：{body}"
+                "答完之后台账里是两句（人一句、值班长一句）——半截行收口成同一行，不另追加：{body}"
+            );
+            let assistant = messages
+                .iter()
+                .find(|m| m["role"] == "assistant")
+                .expect("收口那一行");
+            assert_eq!(
+                assistant["status"],
+                serde_json::Value::Null,
+                "收口即不再是半截行：{assistant}"
+            );
+            assert_eq!(
+                assistant["content"].as_str(),
+                Some("收到，我盯着 t1。"),
+                "收口那句写成完整行：{assistant}"
             );
             break;
         }
@@ -5614,6 +5729,8 @@ async fn foreman_sessions_isolate_their_own_messages_and_totals() {
     // 增量事件带会话身份（决策 204⑥）：前端据此把回话归到正确的班次。
     let mut rx = api.state.sse.subscribe();
     api.state.sse.publish(SseEvent::ConversationDelta {
+        ledger_id: None,
+        seq: None,
         task_id: String::new(),
         branch: String::new(),
         run_id: 0,
@@ -5629,6 +5746,59 @@ async fn foreman_sessions_isolate_their_own_messages_and_totals() {
         SseEvent::ConversationDelta { session_id, .. } => assert_eq!(session_id, a),
         other => panic!("应是会话增量：{other:?}"),
     }
+}
+
+/// 会话列表的 `include_archived`（票 06）：缺省照旧只列未归档（决策 204⑦ 的口径
+/// 一个字没动），给出开关后归档的也在列——「翻得回」靠这条读路径，按 id 读那条本就在。
+#[tokio::test]
+async fn foreman_session_list_includes_archived_only_when_asked() {
+    let api = api_with_foreman(FakeAgent::new(Script::new())).await;
+    let (_, body) = post(&api, "/foreman/sessions", json!({"title": "会被归档"})).await;
+    let archived = body["session"]["id"].as_str().unwrap().to_string();
+    let (_, body) = post(&api, "/foreman/sessions", json!({"title": "留着的"})).await;
+    let kept = body["session"]["id"].as_str().unwrap().to_string();
+    let (status, _) = post(
+        &api,
+        &format!("/foreman/sessions/{archived}/archive"),
+        json!({}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+
+    let ids = |body: &serde_json::Value| -> Vec<String> {
+        body["sessions"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|s| s["id"].as_str().map(String::from))
+            .collect()
+    };
+
+    // 缺省：归档的不在列（「从列表里收起来」照旧是归档的全部含义）。
+    let (_, body) = get(&api, "/foreman/sessions").await;
+    let listed = ids(&body);
+    assert!(!listed.contains(&archived), "缺省不含归档：{listed:?}");
+    assert!(listed.contains(&kept), "{listed:?}");
+
+    // 开关打开：归档的照常在列，且带 `archived_at`（界面画灰 chip 的判据在字段上）。
+    let (_, body) = get(&api, "/foreman/sessions?include_archived=true").await;
+    let listed = ids(&body);
+    assert!(listed.contains(&archived), "含归档时该在列：{listed:?}");
+    assert!(listed.contains(&kept), "{listed:?}");
+    let hit = body["sessions"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|s| s["id"] == archived.as_str())
+        .expect("归档那条在列");
+    assert!(
+        hit["archived_at"].is_string(),
+        "灰 chip 要按字段画，archived_at 必须带出来：{hit}"
+    );
+
+    // `false` 与缺省同义（显式关 = 关）。
+    let (_, body) = get(&api, "/foreman/sessions?include_archived=false").await;
+    assert!(!ids(&body).contains(&archived));
 }
 
 /// 往已归档的班次说话被拒（400）——那种记录谁也看不见。
@@ -5663,6 +5833,10 @@ async fn foreman_endpoints_report_503_when_unwired() {
     let (status, body) = get(&api, "/foreman/tools").await;
     assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{body}");
 
+    // 待办读数（决策 307）同样在列：它读的是库，但 `/foreman/*` 下没有「接线外可用」的特例。
+    let (status, body) = get(&api, "/foreman/attention").await;
+    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{body}");
+
     let (status, body) = get(&api, "/foreman/session").await;
     assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{body}");
     assert!(body["error"].as_str().unwrap().contains("未接线"));
@@ -5676,7 +5850,7 @@ async fn foreman_endpoints_report_503_when_unwired() {
     // 未接线时不落任何一行会话——拒绝发生在写之前。
     let store = api.state.store.clone();
     assert!(store
-        .list_foreman_sessions(Some(FOREMAN_SESSION_KIND_TALK))
+        .list_foreman_sessions(Some(FOREMAN_SESSION_KIND_TALK), false)
         .await
         .unwrap()
         .is_empty());
@@ -5728,6 +5902,8 @@ async fn foreman_stream_carries_conversation_deltas_to_subscribers() {
 
     // 直接发一条工头增量（生产里由适配器在流式回话时发）。
     api.state.sse.publish(SseEvent::ConversationDelta {
+        ledger_id: None,
+        seq: None,
         task_id: String::new(),
         branch: String::new(),
         run_id: 0,
@@ -5741,6 +5917,8 @@ async fn foreman_stream_carries_conversation_deltas_to_subscribers() {
     });
     // 一条任务事件混在同一条总线上——它不该被工头过滤放行。
     api.state.sse.publish(SseEvent::ConversationDelta {
+        ledger_id: None,
+        seq: None,
         task_id: "t-other".into(),
         branch: "main".into(),
         run_id: 42,
@@ -5785,6 +5963,8 @@ async fn task_stream_never_receives_foreman_events() {
     // 真实任务流按 task id 精确匹配（routes/tasks.rs::stream）。
     let mut rx = api.state.sse.subscribe();
     api.state.sse.publish(SseEvent::ConversationDelta {
+        ledger_id: None,
+        seq: None,
         task_id: String::new(),
         branch: String::new(),
         run_id: 0,
@@ -5797,6 +5977,8 @@ async fn task_stream_never_receives_foreman_events() {
         completion_tokens: 1,
     });
     api.state.sse.publish(SseEvent::ConversationDelta {
+        ledger_id: None,
+        seq: None,
         task_id: task_id.clone(),
         branch: "main".into(),
         run_id: 9,
@@ -6088,7 +6270,7 @@ async fn proposal_endpoints_report_503_when_unwired() {
     assert!(api
         .state
         .store
-        .list_foreman_sessions(Some(FOREMAN_SESSION_KIND_TALK))
+        .list_foreman_sessions(Some(FOREMAN_SESSION_KIND_TALK), false)
         .await
         .unwrap()
         .is_empty());
@@ -6908,6 +7090,68 @@ async fn a_repair_proposal_whose_base_moved_conflicts_and_is_refused() {
     assert_eq!(body["proposals"][0]["status"], "pending", "{body}");
 }
 
+/// `GET /foreman/attention`（决策 307，票 06）：未消费待办的**只读计数 + 类别摘要**。
+///
+/// 三条一起钉：① 计数是**跨任务**的（待办按任务记账，页头读数是全板一个数）；
+/// ② `by_kind` 的键是**落库值**（前端按它查中文名，不按文案）；③ 这个端点**纯只读**——
+/// 连读两次计数不变、已消费的不算进来。
+#[tokio::test]
+async fn the_attention_readout_counts_unconsumed_rows_across_tasks() {
+    use agentpipeline_core::storage::AttentionKind;
+
+    let api = api_with_foreman(FakeAgent::new(Script::new())).await;
+    let store = api.state.store.clone();
+    // 待办表对 `kanban_tasks` 有**真外键**（一条「关于不存在任务的待办」是坏数据）：
+    // 造事件之前先把两条任务建出来。
+    seed(&api, "t1").await;
+    seed(&api, "t2").await;
+    store
+        .note_attention("t1", AttentionKind::OwnerStuck, store.now(), None)
+        .await
+        .unwrap();
+    store
+        .note_attention("t2", AttentionKind::ResumeBlocked, store.now(), None)
+        .await
+        .unwrap();
+    // 第二条 owner_stuck 换个时刻（去重键含 occurred_at）
+    store
+        .note_attention(
+            "t1",
+            AttentionKind::OwnerStuck,
+            store.now() + chrono::Duration::minutes(1),
+            None,
+        )
+        .await
+        .unwrap();
+
+    let (status, body) = get(&api, "/foreman/attention").await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["open"], 3, "跨任务一起算：{body}");
+    assert_eq!(body["by_kind"]["owner_stuck"], 2, "{body}");
+    assert_eq!(body["by_kind"]["resume_blocked"], 1, "{body}");
+    // 阻塞池读数（决策 308）搭同一个来回；没有卡住的读时是零。
+    assert_eq!(body["blocked_reads"]["stuck_now"], 0, "{body}");
+    assert!(body["blocked_reads"]["stuck_total"].is_u64(), "{body}");
+
+    // 纯只读：再读一次数字不动，且**没有把行消费掉**。
+    let ids: Vec<i64> = store
+        .open_attention(10)
+        .await
+        .unwrap()
+        .iter()
+        .map(|a| a.id)
+        .collect();
+    assert_eq!(ids.len(), 3, "读端点不许消费");
+    let (_, again) = get(&api, "/foreman/attention").await;
+    assert_eq!(again["open"], 3, "读两次数字要一样：{again}");
+
+    // 消费一条之后，计数与该类别一起掉下来。
+    let consumed = store.consume_attention(&[ids[0]]).await.unwrap();
+    assert_eq!(consumed, 1);
+    let (_, after) = get(&api, "/foreman/attention").await;
+    assert_eq!(after["open"], 2, "{after}");
+}
+
 /// `GET /foreman/tools`（决策 247⑤）：**全量 24 条、与清单同序、label 均非空、只出两个字段**。
 ///
 /// 回执标的是**历史**上的工具调用，故条目数 == 清单长度本身就是「不按档位滤」的形状
@@ -7005,7 +7249,13 @@ async fn the_session_wire_carries_the_ordered_segments_of_a_turn() {
             segments_json: Some(json!([
                 {"kind": "thinking", "text": "先看台账。"},
                 {"kind": "tool", "tool": "read_task",
-                 "args_summary": "{\"task_id\":\"t1\"}", "ok": true},
+                 "args_summary": "{\"task_id\":\"t1\"}",
+                 "args": "{\"task_id\":\"t1\"}", "result": "t1 还在排队。",
+                 "ok": true},
+                // 老行形状（决策 301 之前的 `segments_json`）：没有 `args` / `result`，
+                // 原样过线——前端照旧回落到 `args_summary`，后端不代填。
+                {"kind": "tool", "tool": "read_task",
+                 "args_summary": "{\"task_id\":\"t2\"}", "ok": true},
                 {"kind": "thinking", "text": "再核一遍。"},
             ])),
             ..NewForemanMessage::assistant(&sid, "t1 还在排队。")
@@ -7038,12 +7288,30 @@ async fn the_session_wire_carries_the_ordered_segments_of_a_turn() {
         .collect();
     assert_eq!(
         kinds,
-        vec!["thinking", "tool", "thinking"],
+        vec!["thinking", "tool", "tool", "thinking"],
         "顺序与种类原样过线：{}",
         messages[1]
     );
     assert_eq!(messages[1]["segments"][1]["tool"], "read_task", "{body}");
     assert_eq!(messages[1]["segments"][1]["ok"], json!(true), "{body}");
+    // 决策 301：展开详情的两个字段原样过线（截断已在发射/落库侧压过，线上不代截）。
+    assert_eq!(
+        messages[1]["segments"][1]["args"],
+        json!("{\"task_id\":\"t1\"}"),
+        "{body}"
+    );
+    assert_eq!(
+        messages[1]["segments"][1]["result"],
+        json!("t1 还在排队。"),
+        "{body}"
+    );
+    // 老行没有详情字段：键**缺席**而不是被填成空串——「没有记过」与「记了个空」是两件事。
+    assert!(
+        messages[1]["segments"][2].get("args").is_none()
+            && messages[1]["segments"][2].get("result").is_none(),
+        "老行原样过线，后端不代填：{}",
+        messages[1]
+    );
     assert!(
         messages[0]["segments"].is_null(),
         "用户行没有段序（那一列只有值班长那一轮会填）：{}",

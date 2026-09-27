@@ -137,11 +137,13 @@ impl KanbanScheduler {
     /// 小时级维护：会话清理 + 指标聚合（决策 55）。
     pub async fn maintenance(&self) -> Result<MaintenanceReport> {
         let purged = self.purge_expired_conversations().await?;
-        // 值班长对话走**同一个保留天数**（票 05 / 决策 182）：对讲台不做全仓唯一一张
-        // 不设保留期的表。两者分开计数，使维护报告说得出清掉的是哪一类。
+        // 值班长的**对话消息永久保留**（票 04，显式修订决策 182④「对讲台与全仓同一把
+        // 保留期尺」与决策 204⑦「归档不保护消息」——消息表豁免之后，归档与否、超龄与否
+        // 都不再删它）：`kanban_foreman_messages` 退出按 `conversation_retention_days` 的
+        // 年龄清理。下面的提议 / 待办 / 任务会话与 worktree 回收照旧吃这同一个 cutoff，
+        // 一张表都不豁免——维护作业只摘了消息这一张表。
         let cutoff =
             self.clock.now() - Duration::days(self.settings.conversation_retention_days as i64);
-        let purged_foreman = self.store.purge_foreman_messages(cutoff).await?;
         // 提议两件事分开做（决策 207）：**过期清扫**改状态、留行；**年龄清理**删行。
         // 合成一步就会让「过期只让按钮变灰、那一轮留在时间线」这条规则在维护作业里失效。
         let expired_proposals = self
@@ -154,12 +156,11 @@ impl KanbanScheduler {
             crate::pipeline::repair::recycle_unpressed_repair_worktrees(&self.store, cutoff)
                 .await?;
         let purged_proposals = self.store.purge_foreman_proposals(cutoff).await?;
-        // 待办表与其余各表**同一口径**的年龄清理（票 05）：不做全仓唯一一张不设保留期的表。
+        // 待办表与其余各表**同一口径**的年龄清理（票 05）：同一个 cutoff，不做第二把尺。
         let purged_attention = self.store.purge_attention(cutoff).await?;
         let aggregated = self.aggregate_node_metrics().await?;
         Ok(MaintenanceReport {
             purged_conversations: purged,
-            purged_foreman_messages: purged_foreman,
             expired_foreman_proposals: expired_proposals,
             purged_foreman_proposals: purged_proposals,
             recycled_repair_worktrees: recycled_repairs,
@@ -317,7 +318,16 @@ impl KanbanScheduler {
         // 整段写入（`RunOutcome::default()` 的 token 是 0）。先通知就先被覆盖——那正是这条
         // 要修的那类「读数看起来像真值，其实是占位符」。先用例 `a_timed_out_run_is_stopped_
         // and_reports_its_usage` 也是这个顺序（判超时写入在前、通知在后）。
-        if !crate::pipeline::executor::request_cancel(task_id) {
+        //
+        // **决策 303（显式修订决策 226 的一格）：判终态的这一处放开执行权的两半**，与那个
+        // `run_inner` 会不会返回**无关**。226 原来在这里只发中止请求、不摘去重登记，前提是
+        // 「执行体会在下一个 await 点自己收口」——2026-09-27 实测那个前提不成立：执行体停在
+        // 一次不返回的同步文件读里（`open()` 挂在完全磁盘访问的授权弹窗上），既到不了 await
+        // 点也返回不了，于是进程内去重与 `executor_owner` 双双占死，紧随其后的 resume 被逐次
+        // 拒掉 30 秒后放弃、任务僵死 2.5 小时，只能靠重启——正是这条要停掉的那件事。
+        let had_executor =
+            crate::pipeline::executor::release_ownership(&self.store, task_id).await?;
+        if !had_executor {
             // 取不到登记：进程内没有这一号执行体（例如本进程刚重启，台账里留着上一进程的
             // running run）。此时既没有通道可通知，也没有人要等——照旧往下走。
             tracing::debug!(
@@ -817,12 +827,20 @@ impl KanbanScheduler {
                 }
             }
 
-            // ⑤ 调度器处置未生效 + ⑥ owner 持有超时：两条缝，都要求「任务还在 running」。
+            // ⑤ 调度器处置未生效 + ⑥ owner 持有超时（三类判据）：都要求「任务还在动」
+            //    ——`running` **或** `pending`（决策 305 把这一格放宽）。
             //    实测（2026-09-17）：run 已被标 timeout、transition 也写了「干净对话重试」，
             //    但**没有 attempt-2 的 run 行**，任务从此停在 running——check_timeouts 只看
             //    active_runs()（run 已是终态就不再被扫），remind_pending_tasks 的 stalled
             //    判据也不成立。这条缝此前零信号。
-            if task.status == TaskStatus::Running {
+            //
+            //    **为什么要放 `Pending` 进来**（2026-09-27 那次的形状）：游标挂成 `pending`
+            //    之后，`sync_task_projection` 会把任务投影成 `TaskStatus::Pending`——于是
+            //    只看 `Running` 的话，第三类证据（执行权持有超阈值）在它本该兜的那一格
+            //    永远不会被问到，任务只能靠重启（实测僵死 2.5 小时）。
+            //    任务的状态是**游标的投影**，而「执行权还攥在谁手上」是另一件事：
+            //    `stuck_evidence` 自己按「有主 + 持有超阈值」判，不受投影影响。
+            if matches!(task.status, TaskStatus::Running | TaskStatus::Pending) {
                 // 判据只有一处（`pipeline::unstick::stuck_evidence`）：报出来的卡住与解得开的
                 // 卡住必须是同一个集合，否则「它说卡了、我却解不开」迟早发生（票 09）。
                 if let Some(evidence) =
@@ -904,10 +922,8 @@ impl KanbanScheduler {
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct MaintenanceReport {
+    /// 被保留期清掉的**终态任务**会话行（与值班长消息无关——那张表已豁免，票 04）。
     pub purged_conversations: usize,
-    /// 被保留期清掉的值班长会话行（票 05）。与上一项分开计数——它们挂在不同表上，
-    /// 混成一个数就看不出是哪一类在增长。
-    pub purged_foreman_messages: usize,
     /// 被过期清扫标成 `expired` 的提议（决策 207）。**清的是状态不是行**——那一轮留在
     /// 时间线里，故它与上面两项的「清掉了多少行」不是同一个量。
     pub expired_foreman_proposals: usize,

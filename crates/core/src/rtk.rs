@@ -344,15 +344,24 @@ fn is_executable_file(path: &Path) -> bool {
 /// **不缓存上一次的结果**——`lanToggle` 那条纪律：重读目标态才算数（决策 257 是「漏读」
 /// 的学费）。每次打开页面都重新问一遍这台机器。
 pub async fn probe(manual: Option<&Path>) -> Availability {
+    probe_within(manual, PROBE_TIMEOUT).await
+}
+
+/// 同 [`probe`]，但每一格的预算由调用点给——**这一格存在的理由是测试**（同 [`rewrite_within`]）。
+///
+/// 生产的预算就是 [`PROBE_TIMEOUT`]；测「失败形态认不认得出来」的那些用例要给宽松预算。
+/// 不这么做的话，在几百个用例并排跑的全量套件里，`/bin/sh` 起一个进程这句会偶发超过 5s，
+/// 于是**每一格**都变成「它卡住了？」——那是设计本身造出来的红，不是被测的那件事。
+pub async fn probe_within(manual: Option<&Path>, budget: std::time::Duration) -> Availability {
     let resolved = match resolve(manual) {
         Ok(r) => r,
         Err(reason) => return Availability::failed(reason),
     };
-    let version = match read_version(&resolved.path).await {
+    let version = match read_version(&resolved.path, budget).await {
         Ok(v) => v,
         Err(reason) => return Availability::failed(reason),
     };
-    if let Err(reason) = can_rewrite(&resolved.path).await {
+    if let Err(reason) = can_rewrite(&resolved.path, budget).await {
         return Availability {
             path: Some(resolved.path),
             source: Some(resolved.source),
@@ -369,8 +378,8 @@ pub async fn probe(manual: Option<&Path>) -> Availability {
     }
 }
 
-async fn read_version(binary: &Path) -> Result<String, String> {
-    let out = tokio::time::timeout(PROBE_TIMEOUT, async {
+async fn read_version(binary: &Path, budget: std::time::Duration) -> Result<String, String> {
+    let out = tokio::time::timeout(budget, async {
         tokio::process::Command::new(binary)
             .arg("--version")
             .stdin(std::process::Stdio::null())
@@ -385,7 +394,7 @@ async fn read_version(binary: &Path) -> Result<String, String> {
             return Err(format!(
                 "找到了 {}，但 `--version` 在 {}s 内没有回来（它卡住了？）",
                 binary.display(),
-                PROBE_TIMEOUT.as_secs()
+                budget.as_secs()
             ))
         }
     };
@@ -408,11 +417,11 @@ async fn read_version(binary: &Path) -> Result<String, String> {
 }
 
 /// 判据③：喂一条 `ls`，看它能不能回一段**可解析的**改写。
-async fn can_rewrite(binary: &Path) -> Result<(), String> {
-    // 用探测那一档预算（5s）而不是改写那一档（2s）：见 `PROBE_TIMEOUT` 的说明——这一句
+async fn can_rewrite(binary: &Path, budget: std::time::Duration) -> Result<(), String> {
+    // 生产那一档是探测预算（5s）而不是改写预算（2s）：见 `PROBE_TIMEOUT` 的说明——这一句
     // 的结论会**显示在设置页上**，拿一个到点就放行的短预算去判它，等于把「机器忙」说成
     // 「这台机器的 rtk 不能改写」。
-    match rewrite_within(binary, "ls", PROBE_TIMEOUT).await {
+    match rewrite_within(binary, "ls", budget).await {
         Some(_) => Ok(()),
         None => Err(format!(
             "找到了 {}，但它不能改写：`rtk hook claude` 没有回出可解析的改写\
@@ -531,11 +540,12 @@ mod tests {
         path
     }
 
-    /// 下面这几条「起真进程」的断言用的宽松预算，**不是** `REWRITE_TIMEOUT`。
+    /// 下面这几条「起真进程」的断言用的宽松预算，**不是**生产里那两档
+    /// （[`REWRITE_TIMEOUT`] 2s / [`PROBE_TIMEOUT`] 5s）。
     ///
-    /// 它们说的是「映射对不对」与「失败形态认不认得出来」，不是「2s 够不够」——而在几百个
-    /// 用例并排跑的全量套件里，「`/bin/sh` 起一个进程读一行」偶发超过 2s，那条路按设计回
-    /// `None`，于是断言会**因为设计本身**变红。要用生产预算去测超时，就去看
+    /// 它们说的是「映射对不对」与「失败形态认不认得出来」，不是「2s / 5s 够不够」——而在几百个
+    /// 用例并排跑的全量套件里，「`/bin/sh` 起一个进程读一行」偶发超过那一档，那条路按设计回
+    /// `None` / 报「它卡住了？」，于是断言会**因为设计本身**变红。要用生产预算去测超时，就去看
     /// [`a_rewriter_that_hangs_is_not_waited_for`]（它给的是短预算，故那条分支既测得到也不慢）。
     const GENEROUS: std::time::Duration = std::time::Duration::from_secs(60);
 
@@ -645,15 +655,19 @@ mod tests {
         // 判据①：解析不到
         let empty = tempfile::tempdir().unwrap();
         let manual_missing = empty.path().join("rtk");
-        let missing = probe(Some(&manual_missing)).await;
+        let missing = probe_within(Some(&manual_missing), GENEROUS).await;
         assert!(!missing.available);
         assert!(missing.reason.unwrap().contains("没有可执行的 rtk"));
 
         // 判据②：`--version` 非零
         let broken = fake_rtk(tmp.path(), "rtk-broken", "#!/bin/sh\nexit 2\n");
-        let broken_run = probe(Some(&broken)).await;
+        let broken_run = probe_within(Some(&broken), GENEROUS).await;
         assert!(!broken_run.available);
-        assert!(broken_run.reason.unwrap().contains("非零退出"));
+        let broken_reason = broken_run.reason.clone().unwrap_or_default();
+        assert!(
+            broken_reason.contains("非零退出"),
+            "判据②要可归因，实际原因串：{broken_reason}"
+        );
 
         // 判据③：版本能跑，但改写回不出可解析的东西
         let mute = fake_rtk(
@@ -661,10 +675,19 @@ mod tests {
             "rtk-mute",
             "#!/bin/sh\nif [ \"$1\" = \"--version\" ]; then echo 'rtk 0.1.0'; else read x; fi\n",
         );
-        let unrewritable = probe(Some(&mute)).await;
+        let unrewritable = probe_within(Some(&mute), GENEROUS).await;
         assert!(!unrewritable.available);
-        assert_eq!(unrewritable.version.as_deref(), Some("rtk 0.1.0"));
-        assert!(unrewritable.reason.unwrap().contains("不能改写"));
+        assert_eq!(
+            unrewritable.version.as_deref(),
+            Some("rtk 0.1.0"),
+            "版本这一格要读出来，实际原因串：{:?}",
+            unrewritable.reason
+        );
+        let unrewritable_reason = unrewritable.reason.clone().unwrap_or_default();
+        assert!(
+            unrewritable_reason.contains("不能改写"),
+            "判据③要可归因，实际原因串：{unrewritable_reason}"
+        );
 
         // 三条全过
         let good = fake_rtk(
@@ -675,7 +698,7 @@ mod tests {
              read -r payload\n\
              printf '%s' '{\"hookSpecificOutput\":{\"updatedInput\":{\"command\":\"rtk ls\"}}}'\n",
         );
-        let ok = probe(Some(&good)).await;
+        let ok = probe_within(Some(&good), GENEROUS).await;
         assert!(ok.available);
         assert_eq!(ok.version.as_deref(), Some("rtk 0.42.4"));
         assert_eq!(ok.source, Some(Source::Manual));

@@ -37,6 +37,7 @@
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
+use crate::agent::bounded_read::{self, Offloaded};
 use crate::error::{Error, Result};
 
 /// 默认技能目录名（`{home}/skills`）。镜像 ZCode 的 `~/.zcode/skills/{name}/SKILL.md`。
@@ -408,6 +409,52 @@ pub fn catalogue(skills_root: &Path, declared: &[String]) -> Vec<ResolvedSkill> 
             (!fm.disable_model_invocation).then(|| ResolvedSkill::catalogue(name, fm.description))
         })
         .collect()
+}
+
+/// 有界版 [`resolve`]（决策 302，票 01）：**整段**目录扫描 + 正文读取挪进阻塞池。
+///
+/// **组装层只走这个入口**。同步那一份留给启动校验（`config::validate_startup`，本来就在
+/// 同步上下文里）与技能来源安装；组装层直接调同步版，就等于把技能根的读留在 worker
+/// 线程上——技能根可配置（`[skills] dir`），指到受保护路径时与 AGENTS.md 是同一个形状。
+///
+/// 超界 → `Error::Config`：**不静默给空表**。全文态技能缺失会静默改变 system prompt 与
+/// `prompt_template_hash`，而这是决策 170 / 137 明确要敏感的那件事；报错至少让人看见。
+pub async fn resolve_bounded(
+    skills_root: &Path,
+    declared: &[SkillDecl],
+) -> Result<Vec<ResolvedSkill>> {
+    let root = skills_root.to_path_buf();
+    let decls = declared.to_vec();
+    let label = root.display().to_string();
+    let scanned = bounded_read::run("skills_resolve", label.clone(), move || {
+        resolve(&root, &decls)
+    })
+    .await;
+    match scanned {
+        Offloaded::Done(Ok(skills)) => Ok(skills),
+        Offloaded::Done(Err(e)) => Err(e),
+        Offloaded::Panicked(msg) => Err(Error::Config(format!("技能解析任务未能执行：{msg}"))),
+        Offloaded::Stuck => Err(Error::Config(format!(
+            "技能目录扫描超界（{}s，读仍挂在系统调用里）：{label}",
+            bounded_read::BOUNDED_READ_SEC,
+        ))),
+    }
+}
+
+/// 有界版 [`catalogue`]（决策 302，票 01）。扫不动 → 空目录：目录态是**增量信息**
+/// （「还有哪些技能可用」），拿不到就让它让位，不因此判整个节点失败——已声明的技能
+/// 照旧注入，缺的只是「还有别的可用」那几行。
+pub async fn catalogue_bounded(skills_root: &Path, declared: &[String]) -> Vec<ResolvedSkill> {
+    let root = skills_root.to_path_buf();
+    let decls = declared.to_vec();
+    match bounded_read::run("skills_catalogue", root.display().to_string(), move || {
+        catalogue(&root, &decls)
+    })
+    .await
+    {
+        Offloaded::Done(skills) => skills,
+        _ => Vec::new(),
+    }
 }
 
 /// 兄弟文件**一级**展开（决策 172③，票 07）：把正文里的相对 markdown 引用内联。

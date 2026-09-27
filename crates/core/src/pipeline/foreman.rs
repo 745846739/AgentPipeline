@@ -44,10 +44,10 @@ use crate::config::Settings;
 use crate::home::Home;
 use crate::pipeline::proposals::StoreProposalSink;
 use crate::process::RealProcessKiller;
-use crate::sse::{SseEvent, SseSink, ToolPhase};
+use crate::sse::{Channel, SseEvent, SseSink, ToolPhase};
 use crate::storage::foreman::{
-    ForemanMessage, ForemanSession, NewForemanMessage, FOREMAN_ROLE_ASSISTANT,
-    FOREMAN_SESSION_KIND_WATCH, FOREMAN_WATCH_SESSION_TITLE,
+    ForemanMessage, ForemanSession, InFlightPatch, NewForemanMessage, FOREMAN_MESSAGE_IN_FLIGHT,
+    FOREMAN_ROLE_ASSISTANT, FOREMAN_SESSION_KIND_WATCH, FOREMAN_WATCH_SESSION_TITLE,
 };
 use crate::storage::tasks::TaskFilter;
 use crate::storage::Store;
@@ -147,6 +147,330 @@ fn begin_foreman_turn(session_id: &str) -> ForemanTurnGuard {
 /// 现场（乐观轮 / 流式文本）本来就全在界面那侧，刷新即丢。
 pub fn foreman_turn_in_flight(session_id: &str) -> bool {
     FOREMAN_TURNS.lock().unwrap().contains_key(session_id)
+}
+
+// ─────────── 在途半截行的现场（票 01，spec .scratch/talk-replay 决策 1 / 3 / 5）───────────
+
+/// 节流拍（接缝窗口 ≲300ms）：两次刷库之间至少隔这么久，攒下的增量下拍一起写。
+///
+/// **实现细节，不是可测契约**（spec Testing Decisions：不断言内部调用了几次批写）。
+/// 取 250ms 是给 300ms 目标留的余量——重连时最多回退这么久没落库的字，而那部分字
+/// 本来也没进库，与决策 275（不回放、只 refetch 校准）相容。收口那一下**不受它管**：
+/// 终态永远以收口写为准，节流只管中途。
+const LIVE_FLUSH_INTERVAL: std::time::Duration = std::time::Duration::from_millis(250);
+
+/// 一轮在飞时**台账那半截行的进程内现场**（票 01）。
+///
+/// 一份现场、两个写者、一个读口：
+/// - [`Self::observe_call`] / [`Self::settle_round`]：`respond_inner` 在模型调用的边界上
+///   给**权威值**（段序 / 痕迹 / 累计推理 / token）整体覆盖；
+/// - [`push_foreman_live_delta`]：provider 把逐字正文与推理增量推进来——「随广播落库」
+///   的字面意思，流式途中每 250ms 落一次（[`flush_foreman_live_turn`]）。
+///
+/// 读口只有 [`Store::update_foreman_inflight`]：一次 UPDATE 写整行，`WHERE status =
+/// 'in_flight'` 让迟到的刷写改不动收口后的终态。
+///
+/// **进程内登记**（与 [`FOREMAN_TURNS`] 同姿态）：流式增量按 `session_id` 找现场，故
+/// 这里也按班次登记；同班次撞上第二轮时后者顶掉前者的流式入口（两个现场各写各的行，
+/// 只有逐字增量这一个读口会串——同班两轮并跑本就是罕见形态）。
+pub struct LiveTurn {
+    session_id: String,
+    row_id: i64,
+    store: Store,
+    state: Mutex<LiveState>,
+}
+
+#[derive(Default)]
+struct LiveState {
+    /// 已收场的段序（权威，由 `respond_inner` 整体覆盖）。
+    segments: Vec<ForemanSegment>,
+    /// 已收场的推理（权威累计：跨调用按 `\n\n` 拼的那份）。
+    thinking_done: String,
+    /// 正在冒的**这一次调用**的推理增量（收场时并进 `thinking_done` 并清零）。
+    thinking_live: String,
+    /// 正在冒的**这一次调用**的正文：收口那句的半成品（收口时被权威 `content` 换掉，
+    /// 中途挪进段序时清零）。
+    content_live: String,
+    /// 工具痕迹聚合（权威，随 `segments` 一起在调用边界上覆盖）。
+    traces: Vec<ForemanTrace>,
+    /// 这一轮到目前的 `(prompt, completion)` token（调用边界上更新）。
+    tokens: (u32, u32),
+    /// **行内位置序号**（票 02）：每一段进现场的增量 +1，刷库时原样写进 `seq` 列——
+    /// 它因此**只数已经进现场的东西**（见 [`LiveState::to_patch`]）。
+    seq: u64,
+    /// **已广播、尚未进场**的位置（票 02）：工具事件在**发射那一刻**就要一个位置号
+    /// （它广播给了界面），但它的段序要等这一批工具跑完才进现场。刷库时不写它
+    /// ——否则快照会声称覆盖了一个其实还没有的事件，接缝处就丢字。
+    /// 收场时并进 `seq`（段序进现场了），见 [`Self::settle_round`]。
+    reserved: u64,
+    /// 上次真写库的时刻（节流拍）。`None` = 还没写过——第一拍不等（第一个字尽快落地）。
+    last_flush: Option<std::time::Instant>,
+    /// 有东西还没写（被节流跳过的增量）。
+    dirty: bool,
+    /// 已收口 / 已丢弃：迟到的刷写一律空操作。
+    finished: bool,
+}
+
+impl LiveState {
+    /// 现场 → 一次刷库的载荷。**纯函数**：序列化失败不改状态（`dirty` 留给下次）。
+    fn to_patch(&self) -> Result<InFlightPatch> {
+        // 「正在冒」的那两段以**尾段**的形式并进段序：重进后读到的半截行与当时直播
+        // 所见同构（spec 决策 3 全保真）——推理是折叠块、正文是回话位，两者都不丢。
+        let mut segments = self.segments.clone();
+        if !self.thinking_live.is_empty() {
+            segments.push(ForemanSegment::Thinking {
+                text: self.thinking_live.clone(),
+            });
+        }
+        let mut thinking = self.thinking_done.clone();
+        if !self.thinking_live.is_empty() {
+            if !thinking.is_empty() {
+                thinking.push_str("\n\n");
+            }
+            thinking.push_str(&self.thinking_live);
+        }
+        Ok(InFlightPatch {
+            content: self.content_live.clone(),
+            thinking: (!thinking.trim().is_empty()).then_some(thinking),
+            segments_json: if segments.is_empty() {
+                None
+            } else {
+                Some(serde_json::to_value(&segments)?)
+            },
+            traces_json: if self.traces.is_empty() {
+                None
+            } else {
+                Some(serde_json::to_value(&self.traces)?)
+            },
+            prompt_tokens: self.tokens.0,
+            completion_tokens: self.tokens.1,
+            seq: self.seq,
+        })
+    }
+}
+
+/// 按班次登记的在飞现场（见 [`LiveTurn`] 的说明）。
+static FOREMAN_LIVE_TURNS: LazyLock<Mutex<HashMap<String, Arc<LiveTurn>>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
+
+impl LiveTurn {
+    /// **一轮开工**：台账里当场建这条回话的半截行（spec 决策 1），并登记现场。
+    async fn begin(
+        store: Store,
+        session_id: &str,
+        briefing_json: Option<serde_json::Value>,
+    ) -> Result<Arc<LiveTurn>> {
+        let row_id = store
+            .begin_foreman_inflight(session_id, briefing_json)
+            .await?;
+        let turn = Arc::new(LiveTurn {
+            session_id: session_id.to_string(),
+            row_id,
+            store,
+            state: Mutex::new(LiveState::default()),
+        });
+        if FOREMAN_LIVE_TURNS
+            .lock()
+            .unwrap()
+            .insert(session_id.to_string(), turn.clone())
+            .is_some()
+        {
+            tracing::warn!(
+                session_id,
+                "同一班次已有在飞的半截行现场：后来者顶掉流式入口（两行各写各的，只有逐字增量串）"
+            );
+        }
+        Ok(turn)
+    }
+
+    /// 流式增量（正文 / 推理）推进现场。**同步**：它挂在 `emit_delta` 上，逐字到达的
+    /// 频率容不下一次锁之外的任何开销，写库交给节流的那一拍。
+    ///
+    /// 返回这一段的**位置戳** `(行 id, seq)`（票 02），由发射方挂进事件——增量与它的字
+    /// **同时**进现场，故 `seq` 刷进库里时它必然已被覆盖（快照不会漏掉它）。
+    /// `None` = 现场不在（已收口 / 没登记）：事件照发、不带戳，前端按老路径接。
+    fn push_delta(&self, channel: Channel, text: &str) -> Option<(i64, u64)> {
+        let mut st = self.state.lock().unwrap();
+        if st.finished || text.is_empty() {
+            return None;
+        }
+        match channel {
+            Channel::Content => st.content_live.push_str(text),
+            Channel::Reasoning => st.thinking_live.push_str(text),
+        }
+        st.seq += 1;
+        st.dirty = true;
+        Some((self.row_id, st.seq))
+    }
+
+    /// **一个工具事件的发射位**（票 02）：先领一个位置号再广播，但**不进现场**
+    /// （段序要等这一批工具跑完才落）。故它此后第一次刷库时**不会**被写进 `seq`——
+    /// 快照不会声称覆盖一个还没有的事件；收场时段序进场，`settle_round` 把它并进去。
+    fn reserve_event_seq(&self) -> (i64, u64) {
+        let mut st = self.state.lock().unwrap();
+        st.reserved = st.reserved.max(st.seq) + 1;
+        (self.row_id, st.reserved)
+    }
+
+    /// **一次模型调用收齐了**（`respond_inner` 在调用边界上叫）：段序、累计推理与 token
+    /// 是此刻的权威值，整体覆盖；这一次调用的推理增量已经并进 `thinking_done`，清零。
+    ///
+    /// 正文**不清**：它此刻要么还在 `content_live` 里（还没进段序），要么马上作为
+    /// 中途的 `Text` 段进段序——两种时态之间没有刷库点，不会两处都显示。
+    fn observe_call(&self, segments: &[ForemanSegment], thinking: &str, tokens: (u32, u32)) {
+        let mut st = self.state.lock().unwrap();
+        st.segments = segments.to_vec();
+        st.thinking_done = thinking.to_string();
+        st.thinking_live.clear();
+        st.tokens = tokens;
+        st.dirty = true;
+    }
+
+    /// **一轮迭代收场**（工具都跑完了）：段序与痕迹此刻含这一轮的全部已收场步骤，
+    /// 「正在冒」的两段并了进去、清零——下一次调用的增量从干净的底子上长。
+    fn settle_round(
+        &self,
+        segments: &[ForemanSegment],
+        thinking: &str,
+        traces: &[ForemanTrace],
+        tokens: (u32, u32),
+    ) {
+        self.observe_call(segments, thinking, tokens);
+        let mut st = self.state.lock().unwrap();
+        st.traces = traces.to_vec();
+        st.content_live.clear();
+        // 段序进现场了：这一批工具事件的位置号从此**被覆盖**（刷库可以写它们）。
+        st.seq = st.seq.max(st.reserved);
+        st.reserved = 0;
+        st.dirty = true;
+    }
+
+    /// 节流刷库（`force` = 调用边界上不等拍）。
+    async fn flush(&self, force: bool) -> Result<()> {
+        let patch = {
+            let mut st = self.state.lock().unwrap();
+            if st.finished || !st.dirty {
+                return Ok(());
+            }
+            if !force
+                && st
+                    .last_flush
+                    .is_some_and(|t| t.elapsed() < LIVE_FLUSH_INTERVAL)
+            {
+                return Ok(());
+            }
+            let patch = st.to_patch()?;
+            st.dirty = false;
+            st.last_flush = Some(std::time::Instant::now());
+            patch
+        };
+        self.store
+            .update_foreman_inflight(self.row_id, &patch)
+            .await
+    }
+
+    /// **收口**（spec 决策 1）：把半截行写成完整行，`status` 落 `NULL`。
+    async fn close(&self, msg: NewForemanMessage) -> Result<i64> {
+        let seq = {
+            let mut st = self.state.lock().unwrap();
+            st.finished = true;
+            // 收口时全部段序都已随终值落库，预留的位置号在这里一并算数。
+            st.seq.max(st.reserved)
+        };
+        self.unregister();
+        self.store
+            .close_foreman_inflight(self.row_id, msg, seq)
+            .await
+    }
+
+    /// **丢弃**：这一轮在本进程里没跑起来 / 不落回话行——今天的语义是库里没有它那一行
+    /// （决策 211④ 的失败账另有 `system` 行承载），故半截行跟着一起消失，不留一条永远
+    /// 「正在说」的空壳。失败只记日志：丢弃本身不该把这一轮的结局改成失败。
+    async fn discard(&self, why: &'static str) {
+        {
+            let mut st = self.state.lock().unwrap();
+            if st.finished {
+                return;
+            }
+            st.finished = true;
+        }
+        self.unregister();
+        if let Err(e) = self.store.discard_foreman_inflight(self.row_id).await {
+            tracing::warn!(row_id = self.row_id, why, error = %e, "丢弃在途半截行失败");
+        }
+    }
+
+    /// 摘登记（只摘自己那一条：同班次被后来者顶掉时，别人家的入口不该被我带走）。
+    fn unregister(&self) {
+        let mut live = FOREMAN_LIVE_TURNS.lock().unwrap();
+        if live
+            .get(&self.session_id)
+            .is_some_and(|t| t.row_id == self.row_id)
+        {
+            live.remove(&self.session_id);
+        }
+    }
+}
+
+impl Drop for LiveTurn {
+    fn drop(&mut self) {
+        let finished = match self.state.lock() {
+            Ok(st) => st.finished,
+            Err(e) => e.into_inner().finished,
+        };
+        if finished {
+            return;
+        }
+        // 没走到收口也没走到丢弃（`?` 早退 / panic）：尽力把半截行摘掉——同上，
+        // 今天这一轮在库里不该有行。摘不掉（运行时已退）时行留在库里，由票 03 的
+        // 启动恢复标成「已中断」——进程被杀那条路走不到 Drop，靠的正是那一步。
+        self.unregister();
+        let store = self.store.clone();
+        let row_id = self.row_id;
+        if let Ok(handle) = tokio::runtime::Handle::try_current() {
+            handle.spawn(async move {
+                if let Err(e) = store.discard_foreman_inflight(row_id).await {
+                    tracing::warn!(row_id, error = %e, "清理未收口的在途半截行失败");
+                }
+            });
+        }
+    }
+}
+
+/// 流式增量的入口（provider 的 `emit_delta` 调）：按班次找到在飞现场并推进它。
+///
+/// **没登记就是零成本的一次锁 + 空查**：流水线节点的 `session_id` 恒为空串，
+/// 连查表都到不了。
+pub fn push_foreman_live_delta(
+    session_id: &str,
+    channel: Channel,
+    text: &str,
+) -> Option<(i64, u64)> {
+    if session_id.is_empty() || text.is_empty() {
+        return None;
+    }
+    let turn = FOREMAN_LIVE_TURNS
+        .lock()
+        .unwrap()
+        .get(session_id)
+        .cloned()?;
+    turn.push_delta(channel, text)
+}
+
+/// 节流刷库的入口（provider 的流式循环每收一块调一次）。
+///
+/// 节拍判据在现场里（`last_flush` / `dirty`），这里只负责取到现场——取不到就什么都不做：
+/// 这一轮已经收口，迟到的块没有地方可落（收口写是终态）。
+pub async fn flush_foreman_live_turn(session_id: &str) {
+    if session_id.is_empty() {
+        return;
+    }
+    let Some(turn) = FOREMAN_LIVE_TURNS.lock().unwrap().get(session_id).cloned() else {
+        return;
+    };
+    if let Err(e) = turn.flush(false).await {
+        tracing::warn!(session_id, error = %e, "在途半截行的节流刷写失败");
+    }
 }
 
 /// 人的那一轮**单独**的在飞计数（决策 289 / 票 03）：`say` 起、`say` 落；值守轮不置它。
@@ -1297,9 +1621,15 @@ pub fn trim_history(history: &[ForemanMessage], budget_chars: usize) -> Vec<Fore
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ForemanTrace {
     pub tool: String,
-    /// 参数摘要（截断的紧凑 JSON）。不存完整参数是因为它可能很长，
-    /// 而审计要回答的是「它查了哪个任务的什么」，不是逐字复现调用。
+    /// 参数摘要（截断的紧凑 JSON，200 字符）：收起的那一行用它。
     pub args_summary: String,
+    /// 完整参数原串，截到 [`FOREMAN_TOOL_RESULT_MAX_CHARS`]（决策 301，修订本结构
+    /// 「不存完整参数」的旧口径——界面要能展开看工具详情，审计与展示同一份原文）。
+    #[serde(default)]
+    pub args: String,
+    /// 工具结果 / 错误文本，同一上限（决策 301）。老行没有这个字段，缺省空串。
+    #[serde(default)]
+    pub result: String,
     pub ok: bool,
 }
 
@@ -1315,6 +1645,13 @@ pub enum ForemanSegment {
     Tool {
         tool: String,
         args_summary: String,
+        /// 完整参数原文与工具结果（决策 301，给界面的展开详情），各截到 12k。
+        /// 老行（决策 273 之前的 `segments_json`）没有这两个字段，缺省空串——
+        /// 前端照旧回落到 `args_summary`（决策 273⑤ 的老行回退口径）。
+        #[serde(default)]
+        args: String,
+        #[serde(default)]
+        result: String,
         ok: bool,
     },
 }
@@ -1821,7 +2158,7 @@ impl ForemanRunner {
         };
         let history = match self
             .store
-            .list_foreman_messages(&source_session.id, FOREMAN_HISTORY_FETCH_LIMIT)
+            .list_foreman_messages(&source_session.id, FOREMAN_HISTORY_FETCH_LIMIT, None)
             .await
         {
             Ok(h) => h,
@@ -1830,6 +2167,12 @@ impl ForemanRunner {
                 return;
             }
         };
+        // 对方时间线上的在途半截行同样不进摘要（票 01，与本会话历史同一条口径）：
+        // 半截话既不该被当成品格化引用，也不该把 `covered_until` 的边界推到一行还没说完的话上。
+        let history: Vec<ForemanMessage> = history
+            .into_iter()
+            .filter(|m| m.status.as_deref() != Some(FOREMAN_MESSAGE_IN_FLIGHT))
+            .collect();
         let cache_key = format!("cross:{}", source_session.id);
         let Some(summary) = self
             .cross_digest(&cache_key, &source_session.id, &history, provider_id)
@@ -2056,10 +2399,21 @@ impl ForemanRunner {
         let provider_id =
             crate::storage::catalog::resolve_provider_id(None, None, cfg.as_ref(), None);
 
-        let history = self
+        let mut history = self
             .store
-            .list_foreman_messages(&session.id, FOREMAN_HISTORY_FETCH_LIMIT)
+            .list_foreman_messages(&session.id, FOREMAN_HISTORY_FETCH_LIMIT, None)
             .await?;
+        // 在途半截行**不进上下文**（票 01）：它是这一轮（或没跑完的残留）给人看的现场，
+        // 喂给模型等于让它读到自己正在说的半句话——历史要的是**收口了**的话。
+        history.retain(|m| m.status.as_deref() != Some(FOREMAN_MESSAGE_IN_FLIGHT));
+        // 「这一轮」从哪一刻算起（决策 311，票 03）：**本轮那条 user 消息的时刻**。
+        // 与作废 / 标注那两条路（`created_at >= since`）同一把尺，收场文案数的是同一批东西。
+        // 在这里取而不是在收口处取 `history.last()`：循环里会往里 push 助手消息，
+        // 到那时 `last()` 已经不是本轮起点。
+        let round_since = history
+            .last()
+            .map(|m| m.created_at)
+            .unwrap_or_else(|| self.store.now());
         // 超预算才摘要（决策 269 / 票 03）：预算内逐字照旧；跨线时把掉出预算的最老
         // 区间压成锚点（会话缓存增量、失败回退现状），锚点与窗口共用同一本预算。
         // 值守轮同路径（共用 respond），零分支（269⑤）。
@@ -2214,6 +2568,14 @@ impl ForemanRunner {
             .turn_capacity(cfg.as_ref(), &system_prompt, &user_prompt)
             .await;
 
+        // ── 在途半截行（票 01，spec 决策 1）：一轮开工即建，收口时写成完整行。
+        // 建在**历史读完、请求组装完之后**：这一轮喂给模型的历史因此一个字都不变
+        // （半截行既不进上下文，也不与收口那行抢 id——它就是收口那行自己）。
+        // `briefing_json` 在这里一并算好：快照从开工那一刻就成立，建行时就该在场上。
+        let briefing_json = serde_json::to_value(&briefing)?;
+        let live =
+            LiveTurn::begin(self.store.clone(), &session.id, Some(briefing_json.clone())).await?;
+
         for round in 0..round_limit {
             // 停钮（决策 294 / 票 09）：**每次调用前看一眼**。信号可能在上一次工具调用
             // 期间到达（那一批跑完才回到这里），也可能是「信号先到、观察者后建」那一格
@@ -2342,6 +2704,11 @@ impl ForemanRunner {
             {
                 last_text = Some(text.to_string());
             }
+            // 在途现场的**调用边界**（票 01）：段序 / 累计推理 / token 此刻是权威值，
+            // 整体覆盖并立刻刷一次——不等这一轮的工具跑完（一次工具可以跑几十秒，
+            // 那段等待里「它刚才想了什么」就该已经能从台账读回来）。
+            live.observe_call(&segments, &thinking, tokens);
+            live.flush(true).await?;
 
             if response.tool_calls.is_empty() {
                 reply = response.content.filter(|s| !s.trim().is_empty());
@@ -2366,32 +2733,54 @@ impl ForemanRunner {
             }
             for call in &response.tool_calls {
                 let args_summary = summarize_args(&call.arguments);
+                // 展开详情的原文（决策 301）：与摘要同一刻取，事件与两份留痕共用这一份——
+                // 各截各的会让「界面看到的」与「台账记的」出现两个版本。
+                let args_detail = truncate(&call.arguments);
                 // 工具调用**当场**推给界面（决策 244）：落库的 `traces_json` 要等到这一轮
                 // 收口才写，而诉求正是「不要在对话完结后才展示」。两处记的是同一件事的两种
                 // 时态——实时事件说「此刻在查什么」，落库痕迹说「这一轮查过什么」（审计）。
-                self.emit_tool_event(&session.id, &call.name, ToolPhase::Start, &args_summary);
+                // 位置戳（票 02）：每个事件先领号再广播，段序收场时才把号变成「已覆盖」。
+                self.emit_tool_event(
+                    &session.id,
+                    &call.name,
+                    ToolPhase::Start,
+                    &args_summary,
+                    &args_detail,
+                    None,
+                    Some(live.reserve_event_seq()),
+                );
                 let (content, ok) = match self.run_tool(&tools, call, &ctx).await {
                     Ok(outcome) => (outcome.content, true),
                     // 工具失败**不**上升为整次回话失败（§12.8 的同一姿态）：
                     // 把错误文本回给模型让它改道，而不是让人看到一条报错。
                     Err(e) => (format!("工具执行失败：{e}"), false),
                 };
+                // 结果详情（决策 301）：给界面展开用，恒截 12k。与回灌那份**不是同一件事**：
+                // 回灌只在值守轮预截（决策 291，人那一轮逐字回灌），详情则两条轮一视同仁。
+                let result_detail = truncate(&content);
                 self.emit_tool_event(
                     &session.id,
                     &call.name,
                     if ok { ToolPhase::End } else { ToolPhase::Error },
                     &args_summary,
+                    &args_detail,
+                    Some(&result_detail),
+                    Some(live.reserve_event_seq()),
                 );
                 // 同一个工具事件在两处各记一份（决策 273）：`traces` 是「查过什么」的聚合，
                 // `segments` 要的是它在整轮里的**位置**。摘要先给段序，再交给聚合那一份。
                 segments.push(ForemanSegment::Tool {
                     tool: call.name.clone(),
                     args_summary: args_summary.clone(),
+                    args: args_detail.clone(),
+                    result: result_detail.clone(),
                     ok,
                 });
                 traces.push(ForemanTrace {
                     tool: call.name.clone(),
                     args_summary,
+                    args: args_detail,
+                    result: result_detail,
                     ok,
                 });
                 // 回灌的上限（决策 291 / 票 06(a)）：值守轮照旧按 12k 预截；人的那一轮
@@ -2404,13 +2793,27 @@ impl ForemanRunner {
                 };
                 // 循环检测的流水（决策 293 / 票 08）：结果指纹要在 `content` 被移进转录**之前**
                 // 算——判定它「有没有读到新东西」看的正是回灌给模型的那一份。
+                //
+                // 顺带带上**当时的落库状态指纹**（决策 310 判据③）：提议数 / 任务状态 /
+                // 游标位置。取不到（读库失败）就用 `Default`——那会让连续计数按「没变」走，
+                // 方向是**偏保守**（宁可能提醒一次，也不要因为一次读库失败而漏掉整整一段）。
+                let readings = self
+                    .store
+                    .foreman_state_readings(&session.id, round_since)
+                    .await
+                    .unwrap_or_default();
                 loop_log.push(crate::agent::loops::CallRecord {
                     tool: call.name.clone(),
                     arguments: call.arguments.clone(),
                     result_digest: crate::agent::loops::result_digest(&content),
+                    state_digest: readings.digest(),
                 });
                 transcript.push(Message::tool_result(call, content));
             }
+            // 在途现场的**迭代收场**（票 01）：这一轮的段序与痕迹此刻含全部已收场步骤，
+            // 正文与推理的「正在冒」两段并了进去、清零——下一次调用的增量从干净底子上长。
+            live.settle_round(&segments, &thinking, &traces, tokens);
+            live.flush(true).await?;
             // 循环检测（决策 293 / 票 08）：**一批工具跑完再判**——工具结果必须紧跟发起它们的
             // assistant 消息（转录的契约），中途插一条 user 轮会把那一批切成两半。
             if let Some(hit) =
@@ -2429,6 +2832,20 @@ impl ForemanRunner {
                         loop_reminded_at = Some(loop_log.len());
                     }
                     // 提醒过了仍在打转：收口（部分结论 + 【未收口·在打转】），不再陪着烧 token。
+                    //
+                    // **判据③ 不在此列**（决策 310）：它是**提醒级、不收口**——「提醒过了
+                    // 仍在原地」对它只意味着「再提醒一次」，收口的权力仍留在 293 原两条判据
+                    // 手里。它比另两条更容易误伤（开放型问题上「三项读数全无变化」是常态），
+                    // 而一刀切断一轮正当的深查，比多花一点钱坏得多。
+                    Some(_) if hit.is_remind_only() => {
+                        tracing::warn!(session = %session.id, %reason, "判据③ 又攒满一段无进展：只提醒，不收口（决策 310）");
+                        transcript.push(Message::user(format!(
+                            "{FOREMAN_LOOP_REMINDER_MARK}{reason}。若现有信息已经够回答这一轮的\
+                             问题，现在就收口；若确实还要查，**换个角度**——别再重复刚才那几个调用。"
+                        )));
+                        // 提醒过的那一段划掉：下一次只在**又攒满一整段**时才再提醒一次。
+                        loop_reminded_at = Some(loop_log.len());
+                    }
                     Some(_) => {
                         tracing::warn!(session = %session.id, %reason, "提醒之后仍在打转：强制收口（票 08）");
                         stop = Some(StopReason::Loop(hit));
@@ -2452,6 +2869,28 @@ impl ForemanRunner {
         // 悬空提议上做标注（`ForemanTurn::stopped`）。判据是「收口这一行挂的是【已停】」，
         // 而不是「通道上收到过请求」——请求可能在模型已经收口之后才到（那一刻这一轮没被
         // 停掉，只是慢了一步），拿那个当判据会把一条正常收口的轮标注成半成品。
+        // 收场文案要按**实际提议数**说话（决策 311，票 foreman-burns 03）。
+        //
+        // 2026-09-27 实测：该会话提议数为 **0**，而收场文案写着「这一轮提的提议都还在，
+        // 照样可以按」——它让人去按一个不存在的东西（唯一相关的那张提议属于上一个会话，
+        // 且早在一小时前过期作废）。故这一格先问库：这一轮到底提了几条。
+        //
+        // 问不出来（读库失败）按 **0** 处置：宁说「本轮没有提任何提议」，也不要再复述一次
+        // 那句可能不成立的保证——这句话的谎正是本票要停掉的东西。
+        let round_proposals = self
+            .store
+            .count_round_foreman_proposals(&session.id, round_since)
+            .await
+            .unwrap_or(0);
+        // 收场那一句按实际提议数分支（决策 311）：
+        // - **有提议**：原句**一字不改**——它是决策 294 / 修订 233③「被停在半路那轮提的
+        //   提议保留」的兑现点，丢了它人就不会去看那批卡片了；
+        // - **0 条**：明说 0 条，不再复述一句不成立的保证（2026-09-27 那次它就是这么说的谎）。
+        let proposal_note = if round_proposals > 0 {
+            "这一轮提的提议都还在，照样可以按。"
+        } else {
+            "本轮没有提任何提议。"
+        };
         let (reply, stopped, stop_error) = match (reply, stop) {
             // 模型自己收口了：正常那一句（预算门在它之后才可能踩线，故这里不看 `stop`）。
             (Some(reply), _) => (reply, false, None),
@@ -2497,7 +2936,7 @@ impl ForemanRunner {
                         FOREMAN_STOPPED_TURN_MARK,
                         format!(
                             "这一轮你按了停（停在第 {round} 轮），话没说完——以上是已经确定的部分。\
-                             要接着查可以让我再来一轮（带上线索）；这一轮提的提议都还在，照样可以按。"
+                             要接着查可以让我再来一轮（带上线索）；{proposal_note}"
                         ),
                         None,
                     ),
@@ -2538,17 +2977,23 @@ impl ForemanRunner {
                 format!(
                     "{FOREMAN_STOPPED_TURN_MARK}这一轮你按了停（停在第 {round} 轮）——\
                      它还没说出什么，没有部分结论可留。要接着查可以让我再来一轮（带上线索）；\
-                     这一轮提的提议都还在，照样可以按。"
+                     {proposal_note}"
                 ),
                 true,
                 None,
             ),
             // 中途失败且**一句有内容的话都没说过**：没有东西可留，错误原样带回。
-            (None, Some(StopReason::Failed(e))) => return Err(e),
+            // 半截行跟着一起丢（票 01）：今天这一轮在库里没有回话行，失败账由外框的
+            // `record_failed_turn` 落 `system` 行——留着半截行会让它永远显示「正在说」。
+            (None, Some(StopReason::Failed(e))) => {
+                live.discard("中途失败且没有可留的话").await;
+                return Err(e);
+            }
             // 打转到底**一句话都没说过**：同样没有部分结论可留（与上面那一支同姿态），
             // 但归因要说实话——「它在原地打转」与「它一直在查台账」是两件事，指错方向
             // 会让人去查一个不存在的毛病。
             (None, Some(StopReason::Loop(hit))) => {
+                live.discard("原地打转且一句话都没说过").await;
                 return Err(Error::LlmClassified {
                     kind: "model_looping".into(),
                     message: format!("值班长在原地打转（{}），一句话都没说就停了", hit.reason()),
@@ -2558,6 +3003,7 @@ impl ForemanRunner {
             (None, _) => {
                 // 归因**走 `LlmClassified` 的 kind 机制**而不是新造一种错误（票 04）：
                 // 这两条是模型行为，不是内部故障，而「哪一类」正是排查要的入口。
+                live.discard("一轮到底没有回话").await;
                 return Err(if empty_replies > 0 {
                     Error::LlmClassified {
                         kind: "model_empty_reply".into(),
@@ -2619,6 +3065,9 @@ impl ForemanRunner {
                 reply = %reply,
                 "值守轮判定无需处理：静默入库，不播报"
             );
+            // 静默轮**不落回话行**（这一支此前就返回在追加之前）：半截行跟着一起丢，
+            // 语义与今天逐字一致——库里没有这一轮的话，只是中途曾经有过现场。
+            live.discard("值守轮判定无需处理：不落回话行").await;
             return Ok(ForemanTurn {
                 session: session.clone(),
                 reply,
@@ -2629,7 +3078,7 @@ impl ForemanRunner {
                 traces,
             });
         }
-        let briefing_json = serde_json::to_value(&briefing)?;
+        // `briefing_json` 用开工时算好的那一份（建在途行时已写进同一行，两处同一值）。
         // 播报的标记由**后端**加上（不由模型自己说）：它是「这一轮不是回话」这个事实的载体，
         // 前端靠它把主动播报与回话分开渲染，模型不该有机会说错。`reply` 已在上面剥过一遍，
         // 故这里加的是**唯一**那一个。
@@ -2650,24 +3099,26 @@ impl ForemanRunner {
         // 问话载荷随行落地（决策 265②）：取走即清——一轮至多挂一行，坏轮 / 失败轮
         // 走不到这里（没有 assistant 行可挂，半截的问题不该比它所属的那一轮活得久）。
         let ask_json = ask_slot.lock().await.take();
-        self.store
-            .append_foreman_message(NewForemanMessage {
-                session_id: session.id.clone(),
-                role: FOREMAN_ROLE_ASSISTANT.to_string(),
-                content,
-                prompt_tokens: tokens.0,
-                completion_tokens: tokens.1,
-                briefing_json: Some(briefing_json),
-                traces_json,
-                // 顺序留痕（决策 273）：与上面两份聚合列并存——聚合各服务自己的消费者，
-                // 段序给时间线（先想了什么、再查了什么、然后说了什么）。
-                segments_json,
-                // 空串存 `None`（不存空文本）：与 `briefing_json` / `traces_json` 同一条
-                // 口径——「没有」与「有但是空的」是两件事，前者该在下发时是 null。
-                thinking: (!thinking.trim().is_empty()).then_some(thinking),
-                ask_json,
-            })
-            .await?;
+        // **收口**（票 01，spec 决策 1）：写开工时建的那条在途行，而不是追加新行——
+        // 台账最终形状与从前逐字一致（一次回话 = user 行 + assistant 行），边流边写
+        // 只改中途是否可见。终态以这里的权威值为准，此前的节流刷写全部作废。
+        live.close(NewForemanMessage {
+            session_id: session.id.clone(),
+            role: FOREMAN_ROLE_ASSISTANT.to_string(),
+            content,
+            prompt_tokens: tokens.0,
+            completion_tokens: tokens.1,
+            briefing_json: Some(briefing_json),
+            traces_json,
+            // 顺序留痕（决策 273）：与上面两份聚合列并存——聚合各服务自己的消费者，
+            // 段序给时间线（先想了什么、再查了什么、然后说了什么）。
+            segments_json,
+            // 空串存 `None`（不存空文本）：与 `briefing_json` / `traces_json` 同一条
+            // 口径——「没有」与「有但是空的」是两件事，前者该在下发时是 null。
+            thinking: (!thinking.trim().is_empty()).then_some(thinking),
+            ask_json,
+        })
+        .await?;
 
         // 半份结论已经落库，中途失败的那个错误现在才带出去（票 07）：外框照旧按类别落失败账、
         // 通知、作废这一轮提的悬空提议——两条记载各说各的，一条也不丢。
@@ -2995,7 +3446,7 @@ impl ForemanRunner {
         // 而它就是这一轮的起点）。读不到就退到「现在」——那只会收得更少，不会误收上一轮的。
         let started_at = self
             .store
-            .list_foreman_messages(&session.id, 1)
+            .list_foreman_messages(&session.id, 1, None)
             .await
             .ok()
             .and_then(|m| m.last().map(|m| m.created_at))
@@ -3189,7 +3640,20 @@ impl ForemanRunner {
     /// （`SseEvent::is_foreman_event`）过滤，与对话增量走同一条路。`task_id` / `branch`
     /// 是恒空串、`run_id` 恒 0，与值班长的对话增量同一条口径（决策 182⑥/⑨：它不挂任务、
     /// 不落 run 行）。
-    fn emit_tool_event(&self, session_id: &str, tool: &str, phase: ToolPhase, args_summary: &str) {
+    ///
+    /// `stamp`（票 02）：`(在途行 id, 行内位置号)`，由 [`LiveTurn::reserve_event_seq`]
+    /// 先领后发——前端据此与快照对账（`seq > seq0` 才接）。
+    #[allow(clippy::too_many_arguments)] // 与流水线那个同形出口同宽（详情两列 + `stamp` 都是这条 wire 的字段）
+    fn emit_tool_event(
+        &self,
+        session_id: &str,
+        tool: &str,
+        phase: ToolPhase,
+        args_summary: &str,
+        args: &str,
+        result: Option<&str>,
+        stamp: Option<(i64, u64)>,
+    ) {
         self.sse.emit(SseEvent::ToolEvent {
             task_id: String::new(),
             branch: String::new(),
@@ -3199,6 +3663,12 @@ impl ForemanRunner {
             tool: tool.to_string(),
             phase,
             args_summary: args_summary.to_string(),
+            // 原文与结果由调用点按 [`FOREMAN_TOOL_RESULT_MAX_CHARS`] 截好——与同一刻写进
+            // `segments` / `traces` 的是同一份（决策 301）：事件与留痕不许各截各的。
+            args: args.to_string(),
+            result: result.map(str::to_string),
+            ledger_id: stamp.map(|(id, _)| id),
+            seq: stamp.map(|(_, seq)| seq),
         });
     }
 
@@ -3657,6 +4127,7 @@ fn truncate(text: &str) -> String {
 ///
 /// 与 [`truncate`] 同一份上限：会话循环里的回灌截断与工具自己产出的截断必须是同一个数，
 /// 两处各写一份会让「工具说它截到 12000、循环又按 8000 截一次」这种无声缩水出现。
+/// 流水线出口 `executor::emit_tool_event` 的 `args` / `result` 详情（决策 301）也走这份。
 pub(crate) fn truncate_tool_result(text: &str) -> String {
     truncate(text)
 }

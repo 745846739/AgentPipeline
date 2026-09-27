@@ -1,9 +1,11 @@
 //! Agent 子系统：LLM 接缝、结构化输出解析、文件工具策略、脱敏、上下文压缩、prompt 组装。
 
 pub mod baseline;
+pub mod bounded_read;
 pub mod client;
 pub mod context;
 pub mod degeneration;
+pub mod disk_access;
 pub mod egress;
 pub mod factory;
 pub mod file_policy;

@@ -55,6 +55,26 @@ pub enum AttentionKind {
     /// 实证：09-18 那三条任务被一并标 cancelled 之后，值守班次从 `01:25` 起**再没被叫醒过**，
     /// 值班长只能报「是谁下的手，我没有证据」。
     TaskCancelled,
+    /// **续跑被在跑的执行体挡满预算、放弃了**（决策 304，票 executor-never-returns 03）。
+    ///
+    /// 实证：2026-09-27 03:49:30，一条卡死在文件读里的任务被按了续跑，`try_run` 被那个
+    /// 已判死却仍登记着的执行体逐个拒掉，重试预算 30 秒耗尽后只打了一行 warn——此后
+    /// 2 小时 27 分无人知晓，值守轮一次没醒，而**系统其实早就知道**。
+    ///
+    /// **不复用 [`Self::SchedulerNoEffect`]**：后者说的是「调度器处置未生效」，是台账与调度器
+    /// 之间的一条缝；这一条说的是「有人按了续跑、系统试了、没成」。混用会让「这次续跑到底
+    /// 试过没有」永远答不出来。
+    ResumeBlocked,
+    /// **一次文件读卡住了、并且这种卡住在累积**（决策 308，票 executor-never-returns 07）。
+    ///
+    /// 与 [`Self::ResumeBlocked`] **分开记账**（票 03 把类别推到 13，这一条推到 14）：
+    /// 前者是「一次续跑被挡住」，后者是「这台机器上有读挂在系统调用里」。两件事的处置
+    /// 与归因都不同，合成一条会让「到底是环境问题还是续跑问题」答不出来。
+    ///
+    /// 为什么需要它：读挪进阻塞池之后（决策 302），闭包被放弃等待、**线程仍跑到结束**，
+    /// 泄漏是显式接受的；阻塞池上限 512，所以「卡住的读」必须是个**能读的数**，而不是
+    /// 静默攒满池子（那时新节点会真的起不来）。
+    BlockedRead,
 }
 
 impl AttentionKind {
@@ -72,6 +92,8 @@ impl AttentionKind {
             AttentionKind::SlowRun => "slow_run",
             AttentionKind::RunFailed => "run_failed",
             AttentionKind::TaskCancelled => "task_cancelled",
+            AttentionKind::ResumeBlocked => "resume_blocked",
+            AttentionKind::BlockedRead => "blocked_read",
         }
     }
 
@@ -100,6 +122,8 @@ impl AttentionKind {
             "slow_run" => AttentionKind::SlowRun,
             "run_failed" => AttentionKind::RunFailed,
             "task_cancelled" => AttentionKind::TaskCancelled,
+            "resume_blocked" => AttentionKind::ResumeBlocked,
+            "blocked_read" => AttentionKind::BlockedRead,
             other => {
                 return Err(crate::Error::Validation(format!(
                     "未知的值班长待办类别：{other}"
@@ -174,6 +198,41 @@ impl AttentionRow {
 
 const ATTENTION_COLUMNS: &str =
     "id, task_id, kind, occurred_at, detail_json, created_at, consumed_at";
+
+/// 未消费待办的**总条数 + 按类别汇总**（决策 307，票 executor-never-returns 06）。
+///
+/// 页头那枚只读读数要的就是这两个数：现有 `open_attention` 是「把行取回来」（限 500 条
+/// 那种读法），而页头要的是「几条、哪几类」——为它把整表拉回来是本末倒置。
+///
+/// 类别经 [`AttentionKind::parse`] 走白名单：未知值**照旧报错**（不静默吞），
+/// 与 `/foreman/sessions` 那批读端点的口径一致。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AttentionSummary {
+    /// 未消费的条数。
+    pub open: usize,
+    /// 类别 → 条数（按类别名升序）。
+    pub by_kind: std::collections::BTreeMap<String, usize>,
+}
+
+impl Store {
+    /// 未消费待办的汇总（决策 307）。计数 SQL 只此一处——页头读数与播报都读它。
+    pub async fn open_attention_summary(&self) -> Result<AttentionSummary> {
+        let rows: Vec<(String, i64)> = sqlx::query_as(
+            "SELECT kind, COUNT(*) FROM kanban_foreman_attention
+             WHERE consumed_at IS NULL GROUP BY kind ORDER BY kind",
+        )
+        .fetch_all(self.pool())
+        .await?;
+        let mut by_kind = std::collections::BTreeMap::new();
+        for (raw, n) in rows {
+            // 白名单校验：库里的值只可能由 `as_str` 写进来，认不出就是有人手改过库。
+            let kind = AttentionKind::parse(&raw)?.as_str();
+            by_kind.insert(kind.to_string(), n as usize);
+        }
+        let open = by_kind.values().sum();
+        Ok(AttentionSummary { open, by_kind })
+    }
+}
 
 impl Store {
     /// 记一条待办。同一 `(task_id, kind, occurred_at)` 已存在时**什么都不做**。

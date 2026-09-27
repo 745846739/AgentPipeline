@@ -28,8 +28,8 @@ use agentpipeline_core::pipeline::foreman::{
 };
 use agentpipeline_core::sse::{SseEvent, SseEventType, ToolPhase};
 use agentpipeline_core::storage::foreman::{
-    NewForemanMessage, FOREMAN_SESSION_KIND_TALK, FOREMAN_SESSION_KIND_WATCH,
-    FOREMAN_WATCH_SESSION_TITLE,
+    InFlightPatch, NewForemanMessage, FOREMAN_MESSAGE_INTERRUPTED, FOREMAN_MESSAGE_IN_FLIGHT,
+    FOREMAN_SESSION_KIND_TALK, FOREMAN_SESSION_KIND_WATCH, FOREMAN_WATCH_SESSION_TITLE,
 };
 use agentpipeline_core::storage::model_requests::{
     ModelRequestStatus, ModelRequestUsage, NewModelRequest,
@@ -360,7 +360,11 @@ async fn history_is_trimmed_by_character_budget_but_stays_in_the_store() {
             .await
             .unwrap();
     }
-    let all = h.store.list_foreman_messages(&sid, 100).await.unwrap();
+    let all = h
+        .store
+        .list_foreman_messages(&sid, 100, None)
+        .await
+        .unwrap();
     assert_eq!(all.len(), 3);
 
     let kept = trim_history(&all, 250);
@@ -369,7 +373,11 @@ async fn history_is_trimmed_by_character_budget_but_stays_in_the_store() {
     assert_eq!(kept[1].id, all[2].id);
 
     // 被裁掉的历史**仍在库里**：裁剪只影响这一轮注入了什么。
-    let after = h.store.list_foreman_messages(&sid, 100).await.unwrap();
+    let after = h
+        .store
+        .list_foreman_messages(&sid, 100, None)
+        .await
+        .unwrap();
     assert_eq!(after.len(), 3);
 }
 
@@ -385,7 +393,11 @@ async fn history_trimming_always_keeps_the_newest_message_even_over_budget() {
         .append_foreman_user_message(&sid, &"长".repeat(500))
         .await
         .unwrap();
-    let all = h.store.list_foreman_messages(&sid, 100).await.unwrap();
+    let all = h
+        .store
+        .list_foreman_messages(&sid, 100, None)
+        .await
+        .unwrap();
 
     // 预算小到连最新一条都装不下——仍必须保留它，否则值班长会答非所问。
     let kept = trim_history(&all, 10);
@@ -708,14 +720,14 @@ async fn session_listing_returns_the_newest_tail_in_chronological_order() {
             .await
             .unwrap();
     }
-    let tail = h.store.list_foreman_messages(&sid, 2).await.unwrap();
+    let tail = h.store.list_foreman_messages(&sid, 2, None).await.unwrap();
     // LIMIT 必须作用在最新那一端，再按时间升序交出去。
     assert_eq!(tail.len(), 2);
     assert_eq!(tail[0].content, "第3句");
     assert_eq!(tail[1].content, "第4句");
     assert!(h
         .store
-        .list_foreman_messages(&sid, 0)
+        .list_foreman_messages(&sid, 0, None)
         .await
         .unwrap()
         .is_empty());
@@ -756,6 +768,8 @@ async fn foreman_tool_calls_are_published_live_not_only_after_the_turn() {
                 tool,
                 phase,
                 args_summary,
+                args,
+                result,
                 task_id,
                 branch,
                 ..
@@ -766,12 +780,17 @@ async fn foreman_tool_calls_are_published_live_not_only_after_the_turn() {
                 assert_eq!(session_id, &turn.session.id);
                 assert_eq!(tool, "read_task");
                 assert!(args_summary.contains("t1"));
+                // 决策 301：详情原文与结果随事件**当场**到（start 只有参数，end 才有结果）。
+                assert!(args.contains("t1"), "start 也带完整参数原文：{args:?}");
                 // 空 task id / 空分支（决策 182⑥）：工头事件不挂流水线的坐标。
                 assert_eq!(task_id, "");
                 assert_eq!(branch, "");
                 let expected = if i == 0 {
+                    assert!(result.is_none(), "start 还没有结果：{result:?}");
                     ToolPhase::Start
                 } else {
+                    let detail = result.as_ref().expect("end 事件要带结果详情");
+                    assert!(!detail.is_empty(), "结果详情不是空串");
                     ToolPhase::End
                 };
                 assert_eq!(*phase, expected, "相位顺序必须是 start → end");
@@ -817,6 +836,26 @@ async fn foreman_reports_a_failed_tool_call_live_with_the_error_phase() {
         })
         .collect();
     assert_eq!(phases, vec![ToolPhase::Start, ToolPhase::Error]);
+
+    // 决策 301：失败的详情也进 `result`（error 事件与留痕同一份）——
+    // 否则界面点开那次调用只有摘要一行，「为什么没读到」看不见。
+    let error_result = recorder
+        .events()
+        .iter()
+        .find_map(|e| match e {
+            SseEvent::ToolEvent {
+                phase: ToolPhase::Error,
+                result: Some(r),
+                ..
+            } => Some(r.clone()),
+            _ => None,
+        })
+        .expect("error 事件带错误文本");
+    assert!(
+        error_result.contains("工具执行失败"),
+        "错误文本进 result：{error_result}"
+    );
+    assert_eq!(turn.traces[0].result, error_result, "事件与留痕同一份");
 }
 
 // ─────────────────────────── 会话（票 01 / 02）───────────────────────────
@@ -843,7 +882,11 @@ async fn empty_home_can_hold_a_conversation_and_it_survives_a_reload() {
     assert_eq!(turn.session.title, "现在能做什么？");
 
     // 两句都落库，且顺序是「人先说、值班长后答」。
-    let messages = h.store.list_foreman_messages(&sid, 100).await.unwrap();
+    let messages = h
+        .store
+        .list_foreman_messages(&sid, 100, None)
+        .await
+        .unwrap();
     assert_eq!(messages.len(), 2);
     assert_eq!(messages[0].role, "user");
     assert_eq!(messages[0].content, "现在能做什么？");
@@ -858,7 +901,11 @@ async fn empty_home_can_hold_a_conversation_and_it_survives_a_reload() {
     let runner2 = h.runner(FakeAgent::new(again));
     // 指定同一个班次：这就是「切换 / 重开页面后接着上一班说」的存储侧形态。
     runner2.say(Some(&sid), "再问一次").await.unwrap();
-    let after = h.store.list_foreman_messages(&sid, 100).await.unwrap();
+    let after = h
+        .store
+        .list_foreman_messages(&sid, 100, None)
+        .await
+        .unwrap();
     assert_eq!(after.len(), 4);
 }
 
@@ -958,7 +1005,11 @@ async fn say_persists_the_user_message_even_when_the_model_fails() {
 
     // 票 04 改了这条口径：user 行**不再孤立**——失败当场落一条 `system` 账，
     // 把「为什么没回话」写下来（2026-09-17 实测里那两次静默失败，库里一个字都没有）。
-    let messages = h.store.list_foreman_messages(&sid, 100).await.unwrap();
+    let messages = h
+        .store
+        .list_foreman_messages(&sid, 100, None)
+        .await
+        .unwrap();
     assert_eq!(messages.len(), 2, "用户那一行 + 失败那一行：{messages:?}");
     assert_eq!(messages[0].role, "user");
     assert_eq!(messages[0].content, "喂");
@@ -999,7 +1050,11 @@ async fn an_idle_timeout_is_retried_once_and_then_succeeds() {
     assert_eq!(agent.total_calls(), 2, "判死一次 + 重试一次");
 
     // 用户那一句 + 成功的回话。
-    let messages = h.store.list_foreman_messages(&sid, 100).await.unwrap();
+    let messages = h
+        .store
+        .list_foreman_messages(&sid, 100, None)
+        .await
+        .unwrap();
     assert_eq!(messages.len(), 2, "{messages:?}");
     assert_eq!(messages[1].role, "assistant");
 }
@@ -1033,7 +1088,11 @@ async fn an_idle_timeout_that_fails_twice_is_recorded_with_its_kind() {
     assert_eq!(agent.total_calls(), 2, "判死一次 + 重试一次，不再更多");
 
     // 用户那一句 + 失败那一句：这一轮**不再**只剩孤立的用户行。
-    let messages = h.store.list_foreman_messages(&sid, 100).await.unwrap();
+    let messages = h
+        .store
+        .list_foreman_messages(&sid, 100, None)
+        .await
+        .unwrap();
     assert_eq!(messages.len(), 2, "{messages:?}");
     assert_eq!(messages[0].role, "user");
     assert!(
@@ -1060,7 +1119,11 @@ async fn an_interrupted_turn_is_recorded_in_the_latest_session() {
 
     runner.record_interrupted_turn("内部错误").await;
 
-    let messages = h.store.list_foreman_messages(&sid, 100).await.unwrap();
+    let messages = h
+        .store
+        .list_foreman_messages(&sid, 100, None)
+        .await
+        .unwrap();
     let last = messages.last().expect("至少两行");
     assert_eq!(last.role, "system");
     assert!(
@@ -1089,7 +1152,11 @@ async fn a_silent_model_is_recorded_with_its_own_kind() {
         "空回话要带自己的类别：{err}"
     );
 
-    let messages = h.store.list_foreman_messages(&sid, 100).await.unwrap();
+    let messages = h
+        .store
+        .list_foreman_messages(&sid, 100, None)
+        .await
+        .unwrap();
     let failed = messages
         .iter()
         .find(|m| m.role == "system")
@@ -1140,7 +1207,11 @@ async fn a_foreman_that_never_wraps_up_is_capped_and_named() {
         "该停在上限上"
     );
 
-    let messages = h.store.list_foreman_messages(&sid, 100).await.unwrap();
+    let messages = h
+        .store
+        .list_foreman_messages(&sid, 100, None)
+        .await
+        .unwrap();
     let failed = messages
         .iter()
         .find(|m| m.role == "system")
@@ -1160,7 +1231,7 @@ async fn empty_message_is_rejected_and_not_persisted() {
     // 空消息连班次都不该开——「一句空话」不构成一次值班。
     assert!(h
         .store
-        .list_foreman_sessions(Some(FOREMAN_SESSION_KIND_TALK))
+        .list_foreman_sessions(Some(FOREMAN_SESSION_KIND_TALK), false)
         .await
         .unwrap()
         .is_empty());
@@ -1169,7 +1240,7 @@ async fn empty_message_is_rejected_and_not_persisted() {
     assert!(runner.say(Some(&sid), "   ").await.is_err());
     assert!(h
         .store
-        .list_foreman_messages(&sid, 10)
+        .list_foreman_messages(&sid, 10, None)
         .await
         .unwrap()
         .is_empty());
@@ -1218,7 +1289,7 @@ async fn read_task_tool_actually_reads_the_ledger_and_feeds_the_reply() {
     // 痕迹落库（票 05）。
     let messages = h
         .store
-        .list_foreman_messages(&turn.session.id, 100)
+        .list_foreman_messages(&turn.session.id, 100, None)
         .await
         .unwrap();
     let assistant = messages.iter().find(|m| m.role == "assistant").unwrap();
@@ -1468,7 +1539,7 @@ async fn a_due_attention_wakes_the_foreman_exactly_once() {
     // 播报落进班次，且**带主动播报的标记**（前端靠它把两种轮分开）
     let messages = h
         .store
-        .list_foreman_messages(&turn.session.id, 100)
+        .list_foreman_messages(&turn.session.id, 100, None)
         .await
         .unwrap();
     assert_eq!(messages.len(), 1, "只有播报那一行：{messages:?}");
@@ -1520,7 +1591,7 @@ async fn the_watch_round_writes_to_its_own_session_and_the_talk_session_never_se
     assert_eq!(watch_turn.session.title, FOREMAN_WATCH_SESSION_TITLE);
     let watch_messages = h
         .store
-        .list_foreman_messages(&watch_turn.session.id, 100)
+        .list_foreman_messages(&watch_turn.session.id, 100, None)
         .await
         .unwrap();
     assert!(watch_messages
@@ -1530,7 +1601,7 @@ async fn the_watch_round_writes_to_its_own_session_and_the_talk_session_never_se
     // 人的班次一个字节没变：播报不在里面。
     let human_messages = h
         .store
-        .list_foreman_messages(&human_turn.session.id, 100)
+        .list_foreman_messages(&human_turn.session.id, 100, None)
         .await
         .unwrap();
     assert!(
@@ -1543,12 +1614,12 @@ async fn the_watch_round_writes_to_its_own_session_and_the_talk_session_never_se
     // 两个列表各回各的；「最近的班次」也不串（值守轮刷新过它自己的 last_active_at）。
     let talk = h
         .store
-        .list_foreman_sessions(Some(FOREMAN_SESSION_KIND_TALK))
+        .list_foreman_sessions(Some(FOREMAN_SESSION_KIND_TALK), false)
         .await
         .unwrap();
     let watch = h
         .store
-        .list_foreman_sessions(Some(FOREMAN_SESSION_KIND_WATCH))
+        .list_foreman_sessions(Some(FOREMAN_SESSION_KIND_WATCH), false)
         .await
         .unwrap();
     assert_eq!(
@@ -1582,7 +1653,7 @@ async fn the_watch_round_writes_to_its_own_session_and_the_talk_session_never_se
     assert_eq!(agent.total_calls(), calls_before, "被拒的说话不开模型调用");
     let watch_messages_after = h
         .store
-        .list_foreman_messages(&watch_turn.session.id, 100)
+        .list_foreman_messages(&watch_turn.session.id, 100, None)
         .await
         .unwrap();
     assert_eq!(
@@ -1642,7 +1713,7 @@ async fn several_events_are_batched_into_one_brief() {
     assert_eq!(agent.total_calls(), 1, "三件事只唤醒一次");
     assert_eq!(
         h.store
-            .list_foreman_messages(&turn.session.id, 100)
+            .list_foreman_messages(&turn.session.id, 100, None)
             .await
             .unwrap()
             .len(),
@@ -1710,7 +1781,7 @@ async fn no_attention_means_no_model_call() {
     let sid = h.session().await;
     assert!(h
         .store
-        .list_foreman_messages(&sid, 100)
+        .list_foreman_messages(&sid, 100, None)
         .await
         .unwrap()
         .is_empty());
@@ -1747,7 +1818,7 @@ async fn a_no_action_verdict_is_recorded_silently() {
         .id;
     assert!(
         h.store
-            .list_foreman_messages(&sid, 100)
+            .list_foreman_messages(&sid, 100, None)
             .await
             .unwrap()
             .is_empty(),
@@ -1789,7 +1860,11 @@ async fn a_failing_watch_backs_off_and_notes_the_burst_once() {
     assert!(runner.watch().await.is_err());
     assert_eq!(agent.total_calls(), 1, "第一趟真的叫了模型");
     let sid = h.latest_watch_session().await;
-    let after_first = h.store.list_foreman_messages(&sid, 100).await.unwrap();
+    let after_first = h
+        .store
+        .list_foreman_messages(&sid, 100, None)
+        .await
+        .unwrap();
     assert_eq!(after_first.len(), 1, "只有那一行失败账：{after_first:?}");
     assert!(
         after_first[0]
@@ -1819,7 +1894,7 @@ async fn a_failing_watch_backs_off_and_notes_the_burst_once() {
     assert_eq!(agent.total_calls(), 2, "窗口到了才再试");
     assert_eq!(
         h.store
-            .list_foreman_messages(&sid, 100)
+            .list_foreman_messages(&sid, 100, None)
             .await
             .unwrap()
             .len(),
@@ -1837,7 +1912,11 @@ async fn a_failing_watch_backs_off_and_notes_the_burst_once() {
     let turn = runner.watch().await.unwrap().expect("第三趟应当醒一次");
     assert_eq!(agent.total_calls(), 3);
     assert!(turn.reply.contains("拍板"), "{}", turn.reply);
-    let after = h.store.list_foreman_messages(&sid, 100).await.unwrap();
+    let after = h
+        .store
+        .list_foreman_messages(&sid, 100, None)
+        .await
+        .unwrap();
     assert_eq!(after.len(), 3, "失败账 + 播报 + 恢复汇总：{after:?}");
     assert!(
         after[1].content.starts_with(FOREMAN_WATCH_MARK),
@@ -1883,7 +1962,11 @@ async fn a_billing_class_failure_backs_off_longer_than_a_network_one() {
 
     assert!(runner.watch().await.is_err());
     let sid = h.latest_watch_session().await;
-    let first = h.store.list_foreman_messages(&sid, 100).await.unwrap();
+    let first = h
+        .store
+        .list_foreman_messages(&sid, 100, None)
+        .await
+        .unwrap();
     assert!(
         first[0].content.contains("llm_quota"),
         "类别要落进台账：{}",
@@ -1933,7 +2016,11 @@ async fn the_watch_mark_is_added_once_and_silence_survives_the_model_writing_it(
         "回给调用方的正文不带我们自己的前缀"
     );
     let sid = h.latest_watch_session().await;
-    let rows = h.store.list_foreman_messages(&sid, 100).await.unwrap();
+    let rows = h
+        .store
+        .list_foreman_messages(&sid, 100, None)
+        .await
+        .unwrap();
     assert_eq!(rows.len(), 1);
     assert_eq!(
         rows[0].content,
@@ -1960,7 +2047,7 @@ async fn the_watch_mark_is_added_once_and_silence_survives_the_model_writing_it(
     let sid2 = h2.latest_watch_session().await;
     assert!(
         h2.store
-            .list_foreman_messages(&sid2, 100)
+            .list_foreman_messages(&sid2, 100, None)
             .await
             .unwrap()
             .is_empty(),
@@ -2101,7 +2188,7 @@ async fn a_stewarded_resume_runs_without_a_button() {
     // 留账：会话里一条【托管】行 + 任务行上的计数
     let messages = h
         .store
-        .list_foreman_messages(&turn.session.id, 100)
+        .list_foreman_messages(&turn.session.id, 100, None)
         .await
         .unwrap();
     let ledger = messages
@@ -2394,7 +2481,7 @@ async fn hitting_the_hourly_cap_reports_instead_of_dropping_silently() {
 
     let messages = h
         .store
-        .list_foreman_messages(&h.latest_watch_session().await, 100)
+        .list_foreman_messages(&h.latest_watch_session().await, 100, None)
         .await
         .unwrap();
     let note_row = messages
@@ -2417,7 +2504,7 @@ async fn hitting_the_hourly_cap_reports_instead_of_dropping_silently() {
     assert!(runner.watch().await.unwrap().is_none());
     let again = h
         .store
-        .list_foreman_messages(&h.latest_watch_session().await, 100)
+        .list_foreman_messages(&h.latest_watch_session().await, 100, None)
         .await
         .unwrap()
         .iter()
@@ -2507,7 +2594,7 @@ async fn an_ask_lands_on_its_row_with_options_and_never_becomes_a_proposal() {
 
     let messages = h
         .store
-        .list_foreman_messages(&turn.session.id, 100)
+        .list_foreman_messages(&turn.session.id, 100, None)
         .await
         .unwrap();
     let ask_row = messages
@@ -2556,7 +2643,7 @@ async fn only_the_first_ask_of_a_round_lands() {
 
     let messages = h
         .store
-        .list_foreman_messages(&turn.session.id, 100)
+        .list_foreman_messages(&turn.session.id, 100, None)
         .await
         .unwrap();
     let asks: Vec<_> = messages.iter().filter(|m| m.ask_json.is_some()).collect();
@@ -2593,7 +2680,7 @@ async fn a_malformed_ask_is_refused_to_the_model_and_lands_nothing() {
 
     let messages = h
         .store
-        .list_foreman_messages(&turn.session.id, 100)
+        .list_foreman_messages(&turn.session.id, 100, None)
         .await
         .unwrap();
     assert!(
@@ -3347,7 +3434,7 @@ async fn read_conversation_tool_returns_the_workshop_receipt() {
 
     let messages = h
         .store
-        .list_foreman_messages(&turn.session.id, 100)
+        .list_foreman_messages(&turn.session.id, 100, None)
         .await
         .unwrap();
     let assistant = messages.iter().find(|m| m.role == "assistant").unwrap();
@@ -3937,67 +4024,129 @@ async fn session_totals_sum_the_persisted_columns() {
     assert_eq!(calls, 2);
 }
 
+/// 保留期**只摘消息表**（票 04，显式修订决策 182④「对讲台与全仓同一把保留期尺」与
+/// 决策 204⑦「归档不保护消息」——豁免之后，归档与否、超龄与否都不再删对话消息）。
+///
+/// 假时钟推过 30 天跑一趟维护：值班长消息**一条不少**（反向断言），运维侧三张表
+/// （提议行 / 待办行 / 终态任务的会话行）照旧按**同一个 cutoff** 清，一张表都不豁免。
+/// worktree 回收另有专条（`maintenance_recycles_a_repair_worktree_nobody_pressed`）。
+///
+/// 牙齿：把清理函数又接回消息表（或在 `maintenance` 里补一句 DELETE）→ 本条的反向
+/// 断言当场红——正是 spec 牙齿表那颗「清理函数又被接回消息表」。
 #[tokio::test]
-async fn maintenance_purges_foreman_messages_past_the_retention_window() {
+async fn maintenance_keeps_foreman_messages_forever_and_still_purges_the_rest() {
     let h = Harness::seeded().await;
     let sid = h.session().await;
+
+    // 四类各放一条：对话消息（豁免方）+ 提议 + 待办 + 终态任务的会话行。
     h.store
         .append_foreman_user_message(&sid, "很久以前说的")
         .await
         .unwrap();
-
-    // 未到期：一条不少。
-    let purged = h
-        .store
-        .purge_foreman_messages(h.clock.now() - chrono::Duration::days(30))
+    h.store
+        .create_foreman_proposal(agentpipeline_core::storage::proposals::NewForemanProposal {
+            kind: agentpipeline_core::storage::proposals::ForemanProposalKind::ApiCall,
+            payload: None,
+            session_id: sid.clone(),
+            tool: "write_file".into(),
+            args: serde_json::json!({"path": "notes.md"}),
+            summary: "写入 notes.md".into(),
+            situation: None,
+        })
         .await
         .unwrap();
-    assert_eq!(purged, 0);
+    note(
+        &h,
+        "t1",
+        agentpipeline_core::storage::AttentionKind::TaskPending,
+    )
+    .await;
+    // 会话行要被清，任务得先到终态（清理只对 done / failed / cancelled 生效）——
+    // 真 run 行 + 真收尾，不伪造。
+    let cursor = h.store.load_live_cursors("t1").await.unwrap()[0].clone();
+    let run_id = h
+        .store
+        .insert_run(&agentpipeline_core::storage::observability::NewRun {
+            task_id: "t1".into(),
+            cursor_id: cursor.cursor_id.clone(),
+            stage: Stage::Develop,
+            node: Node::Execute,
+            attempt: 1,
+            agent_type: "main".into(),
+            parent_run_id: None,
+            prompt_template_hash: None,
+            process_group_id: None,
+        })
+        .await
+        .unwrap();
+    h.store
+        .finish_run(
+            run_id,
+            &agentpipeline_core::storage::observability::RunOutcome {
+                status: Some(agentpipeline_core::types::NodeStatus::Success),
+                prompt_tokens: 0,
+                completion_tokens: 0,
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+    h.store
+        .insert_conversation(
+            "t1",
+            run_id,
+            Stage::Develop,
+            Node::Execute,
+            1,
+            "main",
+            None,
+            &serde_json::json!([{"role": "user", "content": "x"}]),
+            None,
+            None,
+            0,
+            0,
+        )
+        .await
+        .unwrap();
+    h.store.mark_terminal("t1", TaskStatus::Done).await.unwrap();
+
+    // 未到期先跑一遍：什么都不动（免得用例退化成「总是清」）。
+    let fresh = maintenance(&h).await;
+    assert_eq!(fresh.purged_conversations, 0);
+    assert_eq!(fresh.purged_foreman_proposals, 0);
+    assert_eq!(fresh.purged_attention, 0);
+
+    // 假时钟推进 31 天（等不了真实 30 天）。
+    h.clock.advance_secs(31 * 24 * 3600);
+    let report = maintenance(&h).await;
+
+    // 反向断言：消息表豁免——31 天后一条不少（牙齿钉在这一句上）。
+    let rows = h.store.list_foreman_messages(&sid, 10, None).await.unwrap();
     assert_eq!(
-        h.store.list_foreman_messages(&sid, 10).await.unwrap().len(),
-        1
+        rows.len(),
+        1,
+        "消息表退出保留期清理，超龄的对话消息永久在库：{rows:?}"
     );
 
-    // 假时钟推进 31 天（等不了真实 30 天）；清理按创建时间判年龄，与任务终态无关
-    // ——值班长对话不挂任务，没有「任务还没结束所以先留着」这一说。
-    h.clock.advance_secs(31 * 24 * 3600);
-    let purged = h
-        .store
-        .purge_foreman_messages(h.clock.now() - chrono::Duration::days(30))
-        .await
-        .unwrap();
-    assert_eq!(purged, 1);
+    // 运维侧照旧：三张表同一个 cutoff，各清各的。
+    assert_eq!(report.purged_foreman_proposals, 1, "提议行照旧按年龄删");
     assert!(h
         .store
-        .list_foreman_messages(&sid, 10)
+        .list_foreman_proposals(&sid, 10)
         .await
         .unwrap()
         .is_empty());
-}
-
-#[tokio::test]
-async fn scheduler_maintenance_reports_foreman_purges_separately() {
-    let h = Harness::seeded().await;
-    let sid = h.session().await;
-    h.store
-        .append_foreman_user_message(&sid, "昨晚说的")
-        .await
-        .unwrap();
-    h.clock.advance_secs(31 * 24 * 3600);
-
-    use agentpipeline_core::scheduler::KanbanScheduler;
-    let scheduler = KanbanScheduler::new(
-        h.store.clone(),
-        Settings::default(),
-        Arc::new(h.clock.clone()),
-        Arc::new(testkit::RecordingKiller::new()),
-        Arc::new(testkit::SseRecorder::new()),
-        Arc::new(|_: &str| {}),
+    assert_eq!(report.purged_attention, 1, "待办行照旧按年龄删");
+    assert_eq!(
+        report.purged_conversations, 1,
+        "终态任务的会话行照旧按年龄删"
     );
-    let report = scheduler.maintenance().await.unwrap();
-    // 两类分开计数——混成一个数就看不出是哪一类在增长。
-    assert_eq!(report.purged_foreman_messages, 1);
-    assert_eq!(report.purged_conversations, 0);
+    assert!(h
+        .store
+        .list_conversations("t1", false)
+        .await
+        .unwrap()
+        .is_empty());
 }
 
 /// 维护作业管提议的两件事（决策 207）：**过期清扫改状态、年龄清理删行**。
@@ -4272,8 +4421,8 @@ async fn two_sessions_do_not_pollute_each_others_messages_or_totals() {
         .await
         .unwrap();
 
-    let in_a = h.store.list_foreman_messages(&a, 100).await.unwrap();
-    let in_b = h.store.list_foreman_messages(&b, 100).await.unwrap();
+    let in_a = h.store.list_foreman_messages(&a, 100, None).await.unwrap();
+    let in_b = h.store.list_foreman_messages(&b, 100, None).await.unwrap();
     assert_eq!(in_a.len(), 2);
     assert_eq!(in_b.len(), 1);
     assert!(in_a.iter().all(|m| m.session_id == a));
@@ -4330,7 +4479,7 @@ async fn sessions_are_listed_by_recent_activity() {
 
     let list = h
         .store
-        .list_foreman_sessions(Some(FOREMAN_SESSION_KIND_TALK))
+        .list_foreman_sessions(Some(FOREMAN_SESSION_KIND_TALK), false)
         .await
         .unwrap();
     assert_eq!(
@@ -4355,14 +4504,18 @@ async fn archiving_hides_it_from_the_list_but_keeps_its_messages() {
 
     let list = h
         .store
-        .list_foreman_sessions(Some(FOREMAN_SESSION_KIND_TALK))
+        .list_foreman_sessions(Some(FOREMAN_SESSION_KIND_TALK), false)
         .await
         .unwrap();
     assert_eq!(list.len(), 1);
     assert_eq!(list[0].id, b, "归档的不在列表里，剩下的照旧");
 
     assert_eq!(
-        h.store.list_foreman_messages(&a, 100).await.unwrap().len(),
+        h.store
+            .list_foreman_messages(&a, 100, None)
+            .await
+            .unwrap()
+            .len(),
         1,
         "归档不删消息——它是收起来，不是永久保存的反面"
     );
@@ -4389,7 +4542,7 @@ async fn sending_to_an_archived_session_is_refused() {
     );
     assert!(h
         .store
-        .list_foreman_messages(&sid, 10)
+        .list_foreman_messages(&sid, 10, None)
         .await
         .unwrap()
         .is_empty());
@@ -4406,7 +4559,7 @@ async fn sending_to_an_unknown_session_reports_it() {
     assert!(matches!(err, Error::Task(_)), "{err}");
     assert!(h
         .store
-        .list_foreman_sessions(Some(FOREMAN_SESSION_KIND_TALK))
+        .list_foreman_sessions(Some(FOREMAN_SESSION_KIND_TALK), false)
         .await
         .unwrap()
         .is_empty());
@@ -4995,7 +5148,7 @@ async fn the_repair_tool_opens_a_worktree_and_lands_a_proposal() {
     // 人在看板上盯着那条任务，看不出它卡在哪儿。
     let messages = h
         .store
-        .list_foreman_messages(&session_id, 50)
+        .list_foreman_messages(&session_id, 50, None)
         .await
         .unwrap();
     assert!(
@@ -5595,7 +5748,7 @@ async fn a_capped_turn_keeps_what_it_already_established() {
     );
 
     // 落库的是同一段（「那 30 轮其实查到了东西、却整段扔掉」是实测里最贵的一次浪费）。
-    let stored = h.store.list_foreman_messages(&sid, 10).await.unwrap();
+    let stored = h.store.list_foreman_messages(&sid, 10, None).await.unwrap();
     assert!(
         stored
             .iter()
@@ -5747,7 +5900,7 @@ async fn the_token_budget_stops_the_watch_round_but_never_the_human_one() {
     );
     let stored = h
         .store
-        .list_foreman_messages(&turn.session.id, 10)
+        .list_foreman_messages(&turn.session.id, 10, None)
         .await
         .unwrap();
     assert!(
@@ -5793,7 +5946,11 @@ async fn the_token_budget_stops_the_watch_round_but_never_the_human_one() {
         "没触顶就不标注：{}",
         turn.reply
     );
-    let stored = h2.store.list_foreman_messages(&sid, 10).await.unwrap();
+    let stored = h2
+        .store
+        .list_foreman_messages(&sid, 10, None)
+        .await
+        .unwrap();
     let last = stored.last().unwrap();
     assert_eq!(last.role, "assistant");
     assert!(
@@ -5830,7 +5987,7 @@ async fn a_mid_turn_failure_keeps_what_was_already_said() {
         "中途失败照旧带自己的类别：{err}"
     );
     // ② 已经说过的那半句**没有跟着错误一起丢掉**
-    let stored = h.store.list_foreman_messages(&sid, 10).await.unwrap();
+    let stored = h.store.list_foreman_messages(&sid, 10, None).await.unwrap();
     let partial = stored
         .iter()
         .find(|m| m.role == "assistant")
@@ -5942,7 +6099,7 @@ async fn a_repeating_tool_call_is_reminded_once_then_closed_out() {
         "收口要带标记、原因与已确定的部分：{}",
         turn.reply
     );
-    let stored = h.store.list_foreman_messages(&sid, 10).await.unwrap();
+    let stored = h.store.list_foreman_messages(&sid, 10, None).await.unwrap();
     let closed = stored
         .iter()
         .find(|m| m.role == "assistant")
@@ -6064,7 +6221,7 @@ async fn pressing_stop_ends_the_human_turn_and_keeps_its_proposals() {
         "第 2 次调用被放弃：它永远不返回，而这一轮照常收了口"
     );
     // ② 落库那一行：标注在、**失败账不在**（按停不是失败）
-    let stored = h.store.list_foreman_messages(&sid, 10).await.unwrap();
+    let stored = h.store.list_foreman_messages(&sid, 10, None).await.unwrap();
     let closed = stored
         .iter()
         .find(|m| m.role == "assistant")
@@ -6123,7 +6280,28 @@ async fn pressing_stop_before_it_says_anything_still_leaves_a_row() {
         "没有部分结论时那行说的是这件事本身：{}",
         turn.reply
     );
-    let stored = h.store.list_foreman_messages(&sid, 10).await.unwrap();
+    // **收场文案按实际提议数分支**（决策 311，票 foreman-burns 03）：这一轮一条提议都没有，
+    // 就不许再说「这一轮提的提议都还在，照样可以按」——2026-09-27 那次它就是这么说的谎，
+    // 而那个会话的提议计数是 **0**（唯一相关的那张属于上一个会话，且早在一小时前作废）。
+    assert!(
+        !turn.reply.contains("提议都还在"),
+        "0 条提议时不许再说「提议都还在」：{}",
+        turn.reply
+    );
+    assert!(
+        turn.reply.contains("本轮没有提任何提议"),
+        "0 条提议要明说 0 条：{}",
+        turn.reply
+    );
+    assert_eq!(
+        h.store
+            .count_round_foreman_proposals(&sid, h.store.now() - chrono::Duration::hours(1))
+            .await
+            .unwrap(),
+        0,
+        "前提：这一轮确实一条提议都没提"
+    );
+    let stored = h.store.list_foreman_messages(&sid, 10, None).await.unwrap();
     assert!(
         stored
             .iter()
@@ -6143,6 +6321,52 @@ async fn pressing_stop_before_it_says_anything_still_leaves_a_row() {
     assert!(
         !agentpipeline_core::pipeline::foreman::cancel_foreman_turn(&sid),
         "这一轮已经结束了：停钮没有东西可停"
+    );
+}
+
+/// **有提议时那句提醒一个字不改**（决策 311 的反向）：它是决策 294 / 修订 233③「被停在
+/// 半路那轮提的提议保留」的兑现点——丢了它，人就不会去看那批卡片了。
+#[tokio::test]
+async fn the_closeout_keeps_the_proposal_note_when_the_round_proposed_something() {
+    let h = Harness::seeded().await;
+    let sid = h.session().await;
+    let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let stalled = Arc::new(tokio::sync::Notify::new());
+    let runner = Arc::new(h.runner_with_llm(Arc::new(StallingAfter {
+        calls: calls.clone(),
+        // 第 2 次调用上挂住：第 1 次已经提过一条提议（`StallingAfter` 的 `propose`）
+        stall_at: 2,
+        propose: Some((h.store.clone(), sid.clone())),
+        stalled: stalled.clone(),
+    }) as Arc<dyn LlmClient>));
+
+    let who = Arc::clone(&runner);
+    let sid_for_turn = sid.clone();
+    let turn_task = tokio::spawn(async move { who.say(Some(&sid_for_turn), "盯着 t1").await });
+    stalled.notified().await;
+    assert!(agentpipeline_core::pipeline::foreman::cancel_foreman_turn(
+        &sid
+    ));
+    let turn = turn_task.await.unwrap().unwrap();
+
+    assert!(turn.stopped);
+    assert_eq!(
+        h.store
+            .count_round_foreman_proposals(&sid, h.store.now() - chrono::Duration::hours(1))
+            .await
+            .unwrap(),
+        1,
+        "前提：这一轮提过一条提议"
+    );
+    assert!(
+        turn.reply.contains("这一轮提的提议都还在，照样可以按。"),
+        "有提议时那句**一字不改**：{}",
+        turn.reply
+    );
+    assert!(
+        !turn.reply.contains("本轮没有提任何提议"),
+        "有提议就不许说 0 条：{}",
+        turn.reply
     );
 }
 
@@ -6428,7 +6652,7 @@ async fn one_watch_round_closes_all_four_criteria_on_the_same_run() {
     // 加在入库的那一份上，`turn.reply` 是模型原话，故这里读库），且归因类别已经解析出来。
     let stored = h
         .store
-        .list_foreman_messages(&turn.session.id, 10)
+        .list_foreman_messages(&turn.session.id, 10, None)
         .await
         .unwrap();
     let broadcast = stored
@@ -6552,7 +6776,7 @@ async fn foreman_persists_what_it_thought() {
     let turn = runner.say(None, "有活吗").await.unwrap();
     let rows = h
         .store
-        .list_foreman_messages(&turn.session.id, 10)
+        .list_foreman_messages(&turn.session.id, 10, None)
         .await
         .unwrap();
     let assistant = rows
@@ -6582,7 +6806,7 @@ async fn foreman_without_reasoning_leaves_the_column_null() {
         .unwrap();
     let rows = h
         .store
-        .list_foreman_messages(&turn.session.id, 10)
+        .list_foreman_messages(&turn.session.id, 10, None)
         .await
         .unwrap();
     let assistant = rows.iter().find(|m| m.role == "assistant").unwrap();
@@ -6616,7 +6840,7 @@ async fn foreman_thinking_accumulates_across_the_calls_of_one_turn() {
     );
     let rows = h
         .store
-        .list_foreman_messages(&turn.session.id, 10)
+        .list_foreman_messages(&turn.session.id, 10, None)
         .await
         .unwrap();
     let thinking = rows
@@ -6656,7 +6880,7 @@ async fn foreman_persists_the_order_of_the_steps_of_one_turn() {
     assert_eq!(turn.traces.len(), 1, "这一轮确实调了一次工具");
     let rows = h
         .store
-        .list_foreman_messages(&turn.session.id, 10)
+        .list_foreman_messages(&turn.session.id, 10, None)
         .await
         .unwrap();
     let assistant = rows
@@ -6680,8 +6904,11 @@ async fn foreman_persists_the_order_of_the_steps_of_one_turn() {
             ForemanSegment::Tool {
                 tool: "read_task".into(),
                 // 摘要取聚合那张表里的同一份（同一个事件的两处记录），本用例要说的是
-                // 顺序，不是 `summarize_args` 的措辞。
+                // 顺序，不是 `summarize_args` 的措辞。详情两字段同理：段序与痕迹是
+                // 同一次调用的两处记录（决策 301），必须逐字相同。
                 args_summary: turn.traces[0].args_summary.clone(),
+                args: turn.traces[0].args.clone(),
+                result: turn.traces[0].result.clone(),
                 ok: true,
             },
             ForemanSegment::Thinking {
@@ -6689,6 +6916,17 @@ async fn foreman_persists_the_order_of_the_steps_of_one_turn() {
             },
         ],
         "推理与工具按发生顺序交错，收口那句不在段序里：{raw}"
+    );
+    // 决策 301：展开详情真的带了原文与结果——空串意味着界面点开只有摘要那一行。
+    assert!(
+        !turn.traces[0].args.is_empty(),
+        "工具详情要带完整参数：{:?}",
+        turn.traces[0]
+    );
+    assert!(
+        !turn.traces[0].result.is_empty(),
+        "工具详情要带结果：{:?}",
+        turn.traces[0]
     );
 }
 
@@ -6706,7 +6944,7 @@ async fn foreman_without_steps_leaves_the_segments_column_null() {
         .unwrap();
     let rows = h
         .store
-        .list_foreman_messages(&turn.session.id, 10)
+        .list_foreman_messages(&turn.session.id, 10, None)
         .await
         .unwrap();
     let assistant = rows.iter().find(|m| m.role == "assistant").unwrap();
@@ -6714,6 +6952,371 @@ async fn foreman_without_steps_leaves_the_segments_column_null() {
         assistant.segments_json.is_none(),
         "无推理、无工具、只有收口一句时该是 NULL，不是空数组：{:?}",
         assistant.segments_json
+    );
+}
+
+// ─────── 在途轮边流边写（票 01，spec .scratch/talk-replay）───────
+
+/// 第 `1..=gates` 次模型调用**各停在闸上**的替身：把「这一轮正在跑」变成可观测的窗口。
+///
+/// 为什么要闸而不是轮询：半截行的两个状态（「刚建出来、一个字都没有」与「第一轮查完、
+/// 段序已在」）之间隔着一次**真实执行**的工具调用，轮询抓哪一个全凭运气——闸让用例
+/// 恰好停在两次调用之间的缝上，两次台账断言因此都是确定的。
+struct GatedAt {
+    inner: Arc<dyn LlmClient>,
+    gates: usize,
+    /// 第 `n` 次调用到闸了（用例可以来读库了）。
+    arrived: Arc<tokio::sync::Notify>,
+    /// 放行这一次调用。
+    release: Arc<tokio::sync::Notify>,
+    calls: Arc<std::sync::atomic::AtomicUsize>,
+}
+
+impl LlmClient for GatedAt {
+    fn complete(
+        &self,
+        request: LlmRequest,
+    ) -> futures::future::BoxFuture<'static, agentpipeline_core::Result<AgentResponse>> {
+        let n = self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
+        if n > self.gates {
+            return self.inner.complete(request);
+        }
+        let inner = self.inner.clone();
+        let arrived = self.arrived.clone();
+        let release = self.release.clone();
+        Box::pin(async move {
+            arrived.notify_one();
+            // `Notify` 存许可：用例先放行、这里后到闸也不会错过（1:1 的节奏里两种顺序都对）。
+            release.notified().await;
+            inner.complete(request).await
+        })
+    }
+}
+
+/// 在途轮的半截行**当场在库里、随轮推进增长、收口后收成完整行**（票 01，spec 决策 1 / 3）。
+///
+/// 这条钉的是用户报的那条毛病的服务端半边：此前整轮结束才追加一行 assistant，刷新、
+/// 重启之后那一轮的前半段**既不在库里、也补不回来**（SSE 无回放，决策 275）。现在一轮
+/// 开工即建半截行，四次台账断言各盯一个时态：
+///
+/// 1. **刚开工**：库里已有 `user` 行 + `status='in_flight'` 的半截行（一个字都还没说）；
+/// 2. **第一轮查完**：半截行长出段序与推理（内容随轮推进增长），`status` 照旧在途；
+/// 3. **流式途中**：逐字正文随广播推进现场、一次刷写就进库（spec 决策 3 的那条路）；
+/// 4. **收口后**：台账恰两行，assistant 行是完整行——`status` 落空、收口那句在 `content`、
+///    段序不重复它（决策 273 的既有形状一字不改）。
+///
+/// 牙齿：把建行挪回「整轮结束才追加」，第一个断言（`expect`）当场红。
+#[tokio::test]
+async fn an_inflight_turn_leaves_a_growing_half_row_in_the_ledger() {
+    let h = Harness::seeded().await;
+    let mut script = Script::new();
+    script.for_foreman().read_task("t1").text("t1 还在排队。");
+    let arrived = Arc::new(tokio::sync::Notify::new());
+    let release = Arc::new(tokio::sync::Notify::new());
+    let llm = Arc::new(GatedAt {
+        inner: Arc::new(Thinking {
+            inner: FakeAgent::new(script),
+            thought: "再核一遍。".into(),
+        }),
+        gates: 2,
+        arrived: arrived.clone(),
+        release: release.clone(),
+        calls: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+    });
+    // 带可读事件录制器的构造：位置戳（票 02）是事件上的字段，要断言就得留着事件。
+    let recorder = Arc::new(testkit::SseRecorder::new());
+    let runner = Arc::new(ForemanRunner::new(
+        h.store.clone(),
+        Settings::default(),
+        h._home.home().clone(),
+        llm,
+        recorder.clone() as Arc<dyn agentpipeline_core::sse::SseSink>,
+    ));
+    let sid = h.session().await;
+
+    let speaker = runner.clone();
+    let sid_for_turn = sid.clone();
+    let turn = tokio::spawn(async move { speaker.say(Some(&sid_for_turn), "t1 怎么样了？").await });
+
+    // ① 刚开工：第一轮还没发出去，半截行已经当场在库里。
+    arrived.notified().await;
+    let rows = h.store.list_foreman_messages(&sid, 10, None).await.unwrap();
+    let half = rows
+        .iter()
+        .find(|m| m.role == "assistant")
+        .expect("在飞时库里已有这条回话的半截行");
+    assert_eq!(
+        rows.len(),
+        2,
+        "开工即两行（人一句 + 在途半截行），不是只有一句人话：{rows:?}"
+    );
+    assert_eq!(
+        half.status.as_deref(),
+        Some(FOREMAN_MESSAGE_IN_FLIGHT),
+        "半截行要标出自己在途：{half:?}"
+    );
+    assert!(
+        half.content.is_empty() && half.thinking.is_none() && half.segments_json.is_none(),
+        "一个字都还没说过：「还没说」不是「说了个空」：{half:?}"
+    );
+
+    // 放行第一轮（工具真实执行），停在第二次调用上。
+    release.notify_one();
+    arrived.notified().await;
+    // ② 第一轮查完：段序与推理都长出来了，`status` 照旧在途（内容随轮推进增长）。
+    let rows = h.store.list_foreman_messages(&sid, 10, None).await.unwrap();
+    let half = rows
+        .iter()
+        .find(|m| m.role == "assistant")
+        .expect("半截行还在");
+    assert_eq!(
+        half.status.as_deref(),
+        Some(FOREMAN_MESSAGE_IN_FLIGHT),
+        "第二轮调用在飞：仍是半截行，不是提前收口：{half:?}"
+    );
+    let raw = half
+        .segments_json
+        .clone()
+        .expect("第一轮查完了：段序随轮推进长出来了");
+    let segments: Vec<ForemanSegment> = serde_json::from_value(raw.clone()).unwrap();
+    // 结果详情取直播那条 end 事件里的同一份（决策 301：事件与留痕不许各记各的）——
+    // 这里没有收口后的 `turn` 可引，recorder 就是那份「直播所见」。
+    let end_result: String = recorder
+        .events()
+        .iter()
+        .find_map(|e| match e {
+            SseEvent::ToolEvent {
+                phase: ToolPhase::End,
+                result: Some(r),
+                ..
+            } => Some(r.clone()),
+            _ => None,
+        })
+        .expect("end 事件要带结果详情（决策 301）");
+    assert!(!end_result.is_empty(), "结果详情不是空串");
+    assert_eq!(
+        segments,
+        vec![
+            ForemanSegment::Thinking {
+                text: "再核一遍。".into()
+            },
+            ForemanSegment::Tool {
+                tool: "read_task".into(),
+                // 摘要取聚合那张表里的同一份（同一个事件的两处记录），与决策 273 的
+                // 顺序用例同一条判据——这里说的是「工具那一步在半截行里」，不是措辞。
+                args_summary: "{\"task_id\":\"t1\"}".into(),
+                args: "{\"task_id\":\"t1\"}".into(),
+                result: end_result,
+                ok: true,
+            },
+        ],
+        "thinking 与工具步骤都在半截行里，与直播所见同构：{raw}"
+    );
+    assert_eq!(
+        half.thinking.as_deref(),
+        Some("再核一遍。"),
+        "推理也随轮推进落库（此刻只跑过第一次调用，故只有一段）"
+    );
+
+    // 位置戳（票 02）：工具事件带着**行 id + 行内序号**广播出去；这一批工具收场之后，
+    // 行上的 `seq` 必须**盖过**这些号——快照的 `seq0` 于是能挡住「已经在库里」的那些
+    // （不重），又不会挡住「还没进库」的（不漏）。号本身只做去重，不做回放（决策 275）。
+    let stamps: Vec<(Option<i64>, Option<u64>)> = recorder
+        .events()
+        .iter()
+        .filter_map(|e| match e {
+            SseEvent::ToolEvent { ledger_id, seq, .. } => Some((*ledger_id, *seq)),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        stamps.len(),
+        2,
+        "一次工具调用 = start + end 两件：{stamps:?}"
+    );
+    assert!(
+        stamps
+            .iter()
+            .all(|(ledger, seq)| *ledger == Some(half.id) && seq.is_some()),
+        "每件都挂在半截行上、都带行内序号：{stamps:?}"
+    );
+    let covered = stamps.iter().filter_map(|(_, seq)| *seq).max().unwrap();
+    assert!(
+        covered as i64 <= half.seq,
+        "收场刷写后的行 seq（{}）必须盖过已广播的事件（{}）——否则接缝会丢字",
+        half.seq,
+        covered
+    );
+
+    // ③ 逐字正文**随广播落库**（spec 决策 3）：替身不走流式，故由测试按 provider 的
+    // 同一条路推增量（`emit_delta` 就是调这两个入口）——正文当场出现在半截行的
+    // 回话位上，与直播所见的「正在说的那一句」同构。
+    agentpipeline_core::pipeline::foreman::push_foreman_live_delta(
+        &sid,
+        agentpipeline_core::sse::Channel::Content,
+        "t1 还在排队",
+    );
+    // 节流拍（250ms）已经由上一次调用边界刷写起过头了：等它过去，下一拍才允许再写——
+    // 这段等待本身就是「节流批写」的行为（不是测内部计数，是等一个真实的拍）。
+    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+    agentpipeline_core::pipeline::foreman::flush_foreman_live_turn(&sid).await;
+    let rows = h.store.list_foreman_messages(&sid, 10, None).await.unwrap();
+    let half = rows
+        .iter()
+        .find(|m| m.role == "assistant")
+        .expect("半截行还在");
+    assert_eq!(
+        half.content, "t1 还在排队",
+        "流式正文推进现场后一次刷写就该在库里（节流拍的第一拍不等）：{half:?}"
+    );
+    assert_eq!(
+        half.status.as_deref(),
+        Some(FOREMAN_MESSAGE_IN_FLIGHT),
+        "刷写只动在途行的内容，不动它的身份：{half:?}"
+    );
+
+    // 放行第二轮：收口。
+    release.notify_one();
+    let turn = turn.await.unwrap().unwrap();
+    assert_eq!(turn.reply, "t1 还在排队。");
+
+    // ④ 收口后：恰两行，assistant 行是完整行——行数语义与今天一致（决策 260 的形状）。
+    let rows = h
+        .store
+        .list_foreman_messages(&turn.session.id, 10, None)
+        .await
+        .unwrap();
+    assert_eq!(rows.len(), 2, "收口后台账仍是「一次回话 = 两行」：{rows:?}");
+    let assistant = rows
+        .iter()
+        .find(|m| m.role == "assistant")
+        .expect("收口那一行");
+    assert!(
+        assistant.status.is_none(),
+        "收口即不再是半截行：{:?}",
+        assistant.status
+    );
+    assert_eq!(assistant.content, "t1 还在排队。", "收口那句在 content 上");
+    let segments: Vec<ForemanSegment> =
+        serde_json::from_value(assistant.segments_json.clone().unwrap()).unwrap();
+    // 段序与「整轮结束才落」的从前**逐字同形**（决策 273）：两次调用的推理 + 中间那次工具
+    // 调用，而收口那句由 `content` 承载、不进段序——边流边写改的只是中途是否可见。
+    assert_eq!(
+        segments.len(),
+        3,
+        "段序仍是中途那些步、收口那句不进去（决策 273 一字不改）：{segments:?}"
+    );
+    assert!(
+        segments
+            .iter()
+            .all(|s| !matches!(s, ForemanSegment::Text { .. })),
+        "收口那句在 content 上，不在段序里：{segments:?}"
+    );
+    assert_eq!(
+        assistant
+            .thinking
+            .as_deref()
+            .unwrap()
+            .matches("再核一遍。")
+            .count(),
+        2,
+        "两次模型调用的推理都收在这一行里（按次累积，决策 244）"
+    );
+}
+
+/// 启动恢复把**上一个进程遗留的悬挂行**标成已中断（票 03，显式修订决策 223）。
+///
+/// 进程被杀时收口那次写入永远不会发生：库里只剩一条 `status='in_flight'` 的行，界面会
+/// 永远以为它「正在说」——比没有读数更坏的假读数（与决策 226③ 根除的是同一类失真，
+/// 只是方向相反）。本步只在**启动**时跑（此刻进程里没有任何活跃轮，挂着在途的只可能是
+/// 上一个实例留下的），与 `orphan_inflight_model_requests` 同姿势。
+///
+/// 三条判据各钉一颗牙：
+/// 1. 悬挂行标成 `interrupted`、`interrupted_at` 取自 **Clock 接缝**（决策 143——
+///    假时钟推进多少就是多少，不是建行那一刻）；
+/// 2. **内容原样不动**：thinking 与正文是「断在哪一步」的证据，中断是终态、只加状态；
+/// 3. 已收口的行（`status IS NULL`）**一个字都不碰**——谓词丢了 `WHERE status=
+///    'in_flight'` 会让正常回话平白背一个中断时刻，断言 3 当场红。
+///
+/// 牙齿：启动恢复那一步被删掉 → 断言 1 红；改成连内容一起重写 → 断言 2 红。
+#[tokio::test]
+async fn startup_marks_a_hanging_inflight_row_interrupted_without_touching_content() {
+    let h = Harness::empty().await;
+    let sid = h.session().await;
+
+    // 上一进程留下的形状：开工建了半截行、跑过一次调用，收口永远没来得及发生。
+    let row_id = h.store.begin_foreman_inflight(&sid, None).await.unwrap();
+    h.store
+        .update_foreman_inflight(
+            row_id,
+            &InFlightPatch {
+                content: "断在这半句".into(),
+                thinking: Some("先想了一半".into()),
+                segments_json: None,
+                traces_json: None,
+                prompt_tokens: 0,
+                completion_tokens: 0,
+                seq: 0,
+            },
+        )
+        .await
+        .unwrap();
+    // 对照组：同一班里一条**已收口**的行——启动恢复不许碰它。
+    let closed_id = h
+        .store
+        .append_foreman_message(NewForemanMessage {
+            session_id: sid.clone(),
+            role: "assistant".into(),
+            content: "正常收口的回话".into(),
+            prompt_tokens: 0,
+            completion_tokens: 0,
+            briefing_json: None,
+            traces_json: None,
+            segments_json: None,
+            thinking: None,
+            ask_json: None,
+        })
+        .await
+        .unwrap();
+
+    // 中断时刻走 Clock 接缝：推进到「重启那一刻」，标下来的必须是它。
+    h.clock.advance_secs(600);
+    let marked = h.store.mark_orphan_foreman_inflights().await.unwrap();
+    assert_eq!(marked, 1, "只标那一条悬挂的在途行");
+
+    let rows = h.store.list_foreman_messages(&sid, 10, None).await.unwrap();
+    let half = rows.iter().find(|m| m.id == row_id).expect("半截行还在");
+    assert_eq!(
+        half.status.as_deref(),
+        Some(FOREMAN_MESSAGE_INTERRUPTED),
+        "悬挂行标成已中断"
+    );
+    assert_eq!(
+        half.interrupted_at,
+        Some(h.clock.now()),
+        "中断时刻来自 Clock 接缝——假时钟推进了 600s，不是建行那一刻"
+    );
+    assert_eq!(
+        half.content, "断在这半句",
+        "中断只加状态：正文是断在哪一步的证据"
+    );
+    assert_eq!(
+        half.thinking.as_deref(),
+        Some("先想了一半"),
+        "推理原样保留（spec 决策 13：只写状态与时刻，不动内容）"
+    );
+
+    let closed = rows.iter().find(|m| m.id == closed_id).expect("收口行还在");
+    assert!(
+        closed.status.is_none() && closed.interrupted_at.is_none(),
+        "已收口的行一个字都不碰（谓词必须钉在 status='in_flight' 上）：{closed:?}"
+    );
+
+    // 幂等：再跑一次（第二次启动）标不出新的。
+    assert_eq!(
+        h.store.mark_orphan_foreman_inflights().await.unwrap(),
+        0,
+        "已中断是终态，不重复标"
     );
 }
 
@@ -7193,4 +7796,124 @@ async fn a_failed_say_turn_announces_the_failure_line_with_only_the_kind() {
         !body.contains("连接被对端关掉"),
         "raw 原文一个字不出网：{body}"
     );
+}
+
+// ─────────────────── 真实台账回放（决策 309 / 310 / 311，票 foreman-burns 04）───────────────────
+
+/// **回放 2026-09-27 那本台账**：三道护栏各自该在第几格响，用**真实读数**算给他看。
+///
+/// **诚实标注（票面要求原样写进测试，不许含糊）**：
+/// - **真实的部分**：94 条 `prompt_tokens` 读数（首 6,602 → 末 561,210，逐条抄自
+///   `kanban_model_requests`）、95 行里那条 `timeout` 无读数、**0 条提议**、
+///   433,628 生成 token、窗口下界 576,210 的推导——都来自那本台账。
+/// - **构造的部分**：那次会话的 `kanban_foreman_messages.traces_json` **只存了工具名 +
+///   参数摘要 + 成败、没存结果正文**，而这里要回放的「每次调用的字节都不同」这一面需要
+///   结果正文。故**按真实长度与真实形状构造**：次数按台账的 95 轮、每次结果都是新字节
+///   （正是判据② 看不到的那一面）、落库状态一次没动（0 条提议 / 任务状态与游标都没变）。
+/// - **效力因此有边界**：它证的是「**在真实读数与真实形状下，判据会在它该响的那一格响**」，
+///   不是「那天系统真的会这么做」（那要接真模型跑一遍，属 opt-in，不进默认门）。
+#[tokio::test]
+async fn replaying_the_incident_ledger_turns_the_three_guards_on() {
+    use agentpipeline_core::agent::loops::{self, CallRecord, Loop, STALLED_STATE_LIMIT};
+    use agentpipeline_core::pipeline::window_calibration::{
+        trigger_line_in_real_tokens, COMPACT_TRIGGER_RATIO, INCIDENT_PROMPT_TOKENS,
+        MEASURED_UNDERESTIMATE_FACTOR, MISCONFIGURED_WINDOW, PROVIDER_WINDOW_LOWER_BOUND,
+    };
+
+    // ── 护栏一：窗口界该在第几轮触发 ────────────────────────────────────────
+    //
+    // 触发线（估算侧）= 窗口的 80%；折算成真实 token 就是 `0.8 × 窗口 × 低估倍数`。
+    // 有读数的台账里，**第一次越过这条线的那一格**就是压缩该发生的地方。
+    let first_over = |line: f64| {
+        INCIDENT_PROMPT_TOKENS
+            .iter()
+            .position(|r| *r as f64 > line)
+            .map(|i| i + 1)
+    };
+
+    // 标定之后：线落在真实窗口的 80% → 会在末段那几轮触发（不是 0 次）。
+    let calibrated_line = trigger_line_in_real_tokens(PROVIDER_WINDOW_LOWER_BOUND, 1.0);
+    let n = first_over(calibrated_line)
+        .unwrap_or_else(|| panic!("标定之后必须触得到：线 = {calibrated_line}"));
+    assert!(
+        n > INCIDENT_PROMPT_TOKENS.len() / 2,
+        "它该在**后段**才触发（前面还很宽裕）：第 {n} 格"
+    );
+    assert!(
+        n <= INCIDENT_PROMPT_TOKENS.len(),
+        "台账里必须有一格越过它：第 {n} 格"
+    );
+
+    // 事故当时那一对（配置 128,000 + 低估 5.5 倍）：线压在真实窗口边缘，
+    // 台账里**没有一格**明显越过它——「95 轮一次都没触发」就是这么来的。
+    let broken_line =
+        trigger_line_in_real_tokens(MISCONFIGURED_WINDOW, MEASURED_UNDERESTIMATE_FACTOR);
+    assert!(
+        broken_line > COMPACT_TRIGGER_RATIO * PROVIDER_WINDOW_LOWER_BOUND as f64,
+        "旧的那条线高过标定后的（所以它才是「太晚」）：{broken_line}"
+    );
+    assert!(
+        first_over(broken_line).is_none()
+            || first_over(broken_line) == Some(INCIDENT_PROMPT_TOKENS.len()),
+        "旧的那条线要么一次都碰不到、要么只在最后一格：{:?}",
+        first_over(broken_line)
+    );
+
+    // ── 护栏二：判据③ 该在哪一格提醒，且只提醒一次 ────────────────────────────
+    //
+    // 回的流按台账形状构造：每轮一次调用（台账 95 行的量级）、**每次结果都是新字节**
+    // （判据② 因此 0 次命中——那正是那天的实况），而落库状态一次没动（0 条提议）。
+    let mut stream: Vec<CallRecord> = (0..INCIDENT_PROMPT_TOKENS.len())
+        .map(|i| CallRecord {
+            tool: "read_file".into(),
+            arguments: format!(r#"{{"path":"logs/serve.log","offset":{i}}}"#),
+            // 每次的字节都不同（偏移 / updated_at / sqlite 行）——别用同一个结果，
+            // 那会变成判据② 的假命中，回放就不再是那天的形状了。
+            result_digest: loops::result_digest(&format!(
+                "第 {i} 段：updated_at=2026-09-27T0{}:00Z prompt={}",
+                i % 10,
+                INCIDENT_PROMPT_TOKENS[i]
+            )),
+            state_digest: loops::result_digest("s0"),
+        })
+        .collect();
+
+    assert_eq!(
+        loops::detect(&stream[..STALLED_STATE_LIMIT - 1]),
+        None,
+        "没攒满一段之前不响"
+    );
+    let hit = loops::detect(&stream[..STALLED_STATE_LIMIT]).expect("攒满第 12 次就该提醒");
+    assert!(matches!(hit, Loop::Stalled { .. }), "{hit:?}");
+    assert!(hit.is_remind_only(), "判据③ 只提醒、**不收口**（决策 310）");
+
+    // 「只提醒一次」的机制在调用方：提醒过的那一段被划掉（`loop_reminded_at`），
+    // 于是下一次只在**又攒满一整段**时才再提醒——这里按同一把尺回放一次。
+    let reminded_at = STALLED_STATE_LIMIT;
+    assert_eq!(
+        loops::detect(&stream[reminded_at..reminded_at + STALLED_STATE_LIMIT - 1]),
+        None,
+        "刚提醒过的那一段划掉之后，下一段也要攒满才响"
+    );
+    assert!(
+        loops::detect(&stream[reminded_at..reminded_at + STALLED_STATE_LIMIT]).is_some(),
+        "又攒满一整段照样会提醒（提醒级、不做第二次升级）"
+    );
+
+    // 一路到最后都只是 `Stalled`：**整本台账里收口一次都不该发生**（收口归 293 原两条判据）。
+    assert!(
+        matches!(
+            loops::detect(&stream[reminded_at..]).unwrap_or(Loop::Stalled { times: 0 }),
+            Loop::Stalled { .. }
+        ),
+        "这条判据在任何时候都不升级成收口"
+    );
+
+    // ── 护栏三：收场文案按实际提议数分支 ────────────────────────────────────
+    //
+    // 那本台账的提议数是 **0**（本用例前面的断言已把「真实」这一半写死），故那天该说的是
+    // 「本轮没有提任何提议」而不是「提议都还在，照样可以按」。两个分支各自端到端的断言在
+    // `pressing_stop_before_it_says_anything_still_leaves_a_row`（0 条）与
+    // `the_closeout_keeps_the_proposal_note_when_the_round_proposed_something`（1 条）里。
+    let _ = stream.pop();
 }

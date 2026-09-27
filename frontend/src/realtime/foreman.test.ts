@@ -10,6 +10,7 @@ import {
   emptyForemanStream,
   failedLedgerRowIds,
   failForemanStream,
+  foldForemanEvents,
   FOREMAN_LOST_TURN_SUFFIX,
   failureNotice,
   quietAfterLocalGiveUp,
@@ -24,6 +25,7 @@ import {
   pruneForeignActive,
   resolveFollowOutcome,
   settleForemanStream,
+  spliceAccepts,
   turnLanded,
 } from './foreman';
 
@@ -128,7 +130,14 @@ describe('foreman 流式归约', () => {
 
     expect(state.steps).toEqual([
       { kind: 'thinking', text: '先看看板。' },
-      { kind: 'tool', tool: 'read_task', args_summary: 't-1', phase: 'end' },
+      {
+        kind: 'tool',
+        tool: 'read_task',
+        args_summary: 't-1',
+        args: '',
+        result: '',
+        phase: 'end',
+      },
       { kind: 'thinking', text: 't1 还在排队。' },
     ]);
   });
@@ -448,11 +457,25 @@ describe('思考与工具调用的实时声道（决策 244，归成段序见决
     let state = beginForemanStream();
     state = appendForemanEvent(state, toolEvent('read_task', 'start'), SESSION);
     expect(state.steps).toEqual([
-      { kind: 'tool', tool: 'read_task', args_summary: 't-1', phase: 'start' },
+      {
+        kind: 'tool',
+        tool: 'read_task',
+        args_summary: 't-1',
+        args: '',
+        result: '',
+        phase: 'start',
+      },
     ]);
     state = appendForemanEvent(state, toolEvent('read_task', 'end'), SESSION);
     expect(state.steps).toEqual([
-      { kind: 'tool', tool: 'read_task', args_summary: 't-1', phase: 'end' },
+      {
+        kind: 'tool',
+        tool: 'read_task',
+        args_summary: 't-1',
+        args: '',
+        result: '',
+        phase: 'end',
+      },
     ]);
   });
 
@@ -510,7 +533,14 @@ describe('思考与工具调用的实时声道（决策 244，归成段序见决
     const settled = settleForemanStream(state, '完整回话');
     expect(settled.steps, '收尾是「流完了」，不是「把刚才发生的事撤掉」').toEqual([
       { kind: 'thinking', text: '想过了' },
-      { kind: 'tool', tool: 'read_task', args_summary: 't-1', phase: 'end' },
+      {
+        kind: 'tool',
+        tool: 'read_task',
+        args_summary: 't-1',
+        args: '',
+        result: '',
+        phase: 'end',
+      },
       { kind: 'text', text: '完整回话' },
     ]);
   });
@@ -574,21 +604,56 @@ describe('重新接上一轮：锚点与落地判据（决策 260）', () => {
  * 钉死，并钉住「任何一支都不许清掉已经出现的文字」这条模块级纪律。
  */
 describe('跟的那一轮怎么收场：keep / settled / lost（决策 260 裁决③）', () => {
-  const row = (id: number): LedgerRow => ({ id, kind: 'fm' });
+  const row = (
+    id: number,
+    kind: LedgerRow['kind'] = 'fm',
+    status: LedgerRow['status'] = null,
+  ): LedgerRow => ({ id, kind, status });
+  /** 接手那一刻的**半截行**（票 01）：接手锚的就是它，收口**就地写它**。 */
+  const inflight = (id: number): LedgerRow => ({ id, kind: 'fm', status: 'in_flight' });
 
   it('仍在跑：继续跟（哪怕台账一动不动）', () => {
-    expect(resolveFollowOutcome([row(1), row(2)], 2, true)).toEqual({ kind: 'keep' });
+    expect(resolveFollowOutcome([row(1), inflight(2)], 2, true)).toEqual({ kind: 'keep' });
   });
 
   it('台账尾部多了一行：落地（台账那一行接管回话）', () => {
-    expect(resolveFollowOutcome([row(1), row(2), row(3)], 2, true)).toEqual({ kind: 'settled' });
+    expect(resolveFollowOutcome([row(1), inflight(2), row(3)], 2, true)).toEqual({
+      kind: 'settled',
+    });
     // 落了地而同一班紧接着又起一轮（下一轮已在跑）：**落地优先**——这一轮的回话确实落库了
-    expect(resolveFollowOutcome([row(1), row(2), row(3)], 2, true).kind).toBe('settled');
+    expect(resolveFollowOutcome([row(1), inflight(2), row(3)], 2, true).kind).toBe('settled');
+  });
+
+  it('**就地收口**（票 01）：半截行 status 落成 null 就是落地——尾部不多一行也判得出', () => {
+    // 收口写的是同一行：只有「多一行」那条老判据的话这里会一直 keep，
+    // 最终把正常收口误判成死轮（半截字顶着「不会再来」的说明）。
+    expect(resolveFollowOutcome([row(1), row(2)], 2, true)).toEqual({ kind: 'settled' });
+    expect(resolveFollowOutcome([row(1), row(2)], 2, false)).toEqual({ kind: 'settled' });
+  });
+
+  it('**台账中断行**接手（票 03）：锚那条半截行标成 interrupted → 落地，由台账重算时间线', () => {
+    // 重启后启动恢复把悬挂行标成 interrupted（显式修订决策 223）——那一行就是这一轮的
+    // 终态。按台账渲染「已中断」，而不是把它当死轮就地合成一条失败轮（决策 260 裁决③
+    // 的 settled 支从此含中断行：**两套真相**由此只剩台账一套）。
+    const interrupted = row(2, 'fm', 'interrupted');
+    expect(resolveFollowOutcome([row(1), interrupted], 2, false)).toEqual({ kind: 'settled' });
+    // 同一班紧接着又在跑（重启后 turn_in_flight 又为真）：中断是终态，照样落地
+    expect(resolveFollowOutcome([row(1), interrupted], 2, true)).toEqual({ kind: 'settled' });
+    // ask 行同口径：结构化提问那一轮被杀，也是由台账那条中断行收场
+    expect(resolveFollowOutcome([row(1), row(2, 'ask', 'interrupted')], 2, false)).toEqual({
+      kind: 'settled',
+    });
+  });
+
+  it('锚点是**用户行**（半截行还没建出来的竞态）：不算落地——收口与它无关', () => {
+    // 按用户行判会把「还没落」误判成「落了」，而 settled 那一支要清流（半截字没了）。
+    expect(resolveFollowOutcome([row(1, 'mine')], 1, true)).toEqual({ kind: 'keep' });
+    expect(resolveFollowOutcome([row(1, 'mine')], 1, false)).toEqual({ kind: 'lost' });
   });
 
   it('没换行而服务端也不再跑它：lost，不是 settled', () => {
-    // 进程被杀 / 重启（决策 223 明确不做那一轮的落账）：台账永远不会有它那一行
-    expect(resolveFollowOutcome([row(1), row(2)], 2, false)).toEqual({ kind: 'lost' });
+    // 进程被杀 / 重启：半截行还挂在库里（status 仍是 in_flight），回话永远不会来
+    expect(resolveFollowOutcome([row(1), inflight(2)], 2, false)).toEqual({ kind: 'lost' });
     expect(resolveFollowOutcome([], 0, false)).toEqual({ kind: 'lost' });
   });
 
@@ -596,7 +661,7 @@ describe('跟的那一轮怎么收场：keep / settled / lost（决策 260 裁�
     // 这是本组的承重断言：死轮那一支若走 `emptyForemanStream()`，半截字就没了，
     // 而「已经出现的文字任何一支都不许清掉」是本模块文件头立的纪律（票 03）。
     const half = appendForemanEvent(beginForemanStream(), delta('说了一半就断'), SESSION);
-    const outcome = resolveFollowOutcome([row(1)], 1, false);
+    const outcome = resolveFollowOutcome([inflight(1)], 1, false);
     expect(outcome).toEqual({ kind: 'lost' });
 
     const shown = failForemanStream(half, FOREMAN_LOST_TURN_SUFFIX);
@@ -694,3 +759,70 @@ function inputOf(over: Partial<TalkTurnsInput>): TalkTurnsInput {
     ...over,
   };
 }
+
+/**
+ * 快照与直播的**拼接判据**（票 02）：三支各有单测——「接缝处不重不漏」的机器门。
+ *
+ * 为什么三支必须分开钉：它们各自对应一种**事实**（已在快照里 / 快照之后才发生 /
+ * 这条流压根没有位置戳），混成一个 `seq > seq0` 的话，第三支会在老后端下把所有
+ * 增量丢光（`undefined > n` 是 `false`）——界面看起来只是「不刷新」，最难查。
+ */
+describe('拼接判据 spliceAccepts（票 02）', () => {
+  const base = { id: 7, seq: 12 };
+
+  it('seq <= seq0 → 丢：它已经在快照那一行里（再接就是重复字）', () => {
+    expect(spliceAccepts({ ledger_id: 7, seq: 12 }, base)).toBe(false);
+    expect(spliceAccepts({ ledger_id: 7, seq: 3 }, base)).toBe(false);
+  });
+
+  it('seq > seq0 → 接：快照之后才广播的，快照里没有它', () => {
+    expect(spliceAccepts({ ledger_id: 7, seq: 13 }, base)).toBe(true);
+    expect(spliceAccepts({ ledger_id: 7, seq: 1000 }, base)).toBe(true);
+  });
+
+  it('不带 seq（老后端 / 流水线事件）→ 按既有路径接', () => {
+    expect(spliceAccepts({ ledger_id: 7, seq: null }, base)).toBe(true);
+    expect(spliceAccepts({ ledger_id: null, seq: null }, base)).toBe(true);
+    expect(spliceAccepts({ ledger_id: 7 }, base)).toBe(true);
+  });
+
+  it('没有基准（快照里没有在途行）→ 一律按既有路径接', () => {
+    expect(spliceAccepts({ ledger_id: 7, seq: 1 }, null)).toBe(true);
+    expect(spliceAccepts({ ledger_id: 7, seq: 99 }, null)).toBe(true);
+  });
+
+  it('ledger_id 对不上（另一条在途行）→ 按既有路径接：别人的基准丢它才是丢字', () => {
+    expect(spliceAccepts({ ledger_id: 9, seq: 1 }, base)).toBe(true);
+  });
+});
+
+/** 筛过之后的尾巴怎么归约（与 `steps` 同一套规则——两份不该各说各话）。 */
+describe('筛过再归约：尾巴与整条流同形（票 02）', () => {
+  it('seq0 之前的增量不进尾巴、之后的按原顺序进（不重不漏的下半边）', () => {
+    let state = beginForemanStream();
+    state = appendForemanEvent(state, { ...delta('快照里已经有'), seq: 12, ledger_id: 7 }, SESSION);
+    state = appendForemanEvent(state, toolEvent('read_task', 'start', SESSION), SESSION);
+    state = appendForemanEvent(state, { ...delta('快照之后才说的'), seq: 14, ledger_id: 7 }, SESSION);
+    const base = { id: 7, seq: 12 };
+    const tail = foldForemanEvents(state.events.filter((e) => spliceAccepts(e, base)));
+    expect(tail).toEqual([
+      {
+        kind: 'tool',
+        tool: 'read_task',
+        args_summary: 't-1',
+        args: '',
+        result: '',
+        phase: 'start',
+      },
+      { kind: 'text', text: '快照之后才说的' },
+    ]);
+  });
+
+  it('没有基准时 `fold(events)` 与攒出来的 `steps` 逐字一致（既有路径不动）', () => {
+    let state = beginForemanStream();
+    state = appendForemanEvent(state, { ...delta('先想'), seq: 1, ledger_id: 7 }, SESSION);
+    state = appendForemanEvent(state, toolEvent('read_task', 'end', SESSION), SESSION);
+    state = appendForemanEvent(state, { ...delta('再说'), seq: 3, ledger_id: 7 }, SESSION);
+    expect(foldForemanEvents(state.events)).toEqual(state.steps);
+  });
+});

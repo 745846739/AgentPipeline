@@ -70,7 +70,7 @@ function sessionOf(messages: ForemanMessage[], proposals: ForemanProposal[] = []
 }
 
 function streamOf(over: Partial<ForemanStreamState> = {}): ForemanStreamState {
-  return { steps: [], streaming: false, error: null, ...over };
+  return { steps: [], events: [], streaming: false, error: null, ...over };
 }
 
 /** 在飞轮末尾那一步正文（「正在说的那一句」）。 */
@@ -85,7 +85,15 @@ function thinkStep(text: string) {
 
 /** 在飞轮里的一次工具调用（相位是**此刻**的读数，落地那一份由 `ok` 给同一件事）。 */
 function toolStep(tool: string, phase: 'start' | 'end' | 'error', argsSummary = 't-1') {
-  return { kind: 'tool' as const, tool, args_summary: argsSummary, phase };
+  return {
+    kind: 'tool' as const,
+    tool,
+    args_summary: argsSummary,
+    // 详情字段（决策 301）：原文随 start 就到，结果只在收场后非空。
+    args: `{"id":"${argsSummary}"}`,
+    result: phase === 'start' ? '' : `读到了 ${argsSummary}`,
+    phase,
+  };
 }
 
 function inputOf(over: Partial<TalkTurnsInput> = {}): TalkTurnsInput {
@@ -164,7 +172,14 @@ describe('落地轮：分类读字段、不解析正文（决策 252 / 244 / 235
     );
     expect(out[0].steps.map((s) => s.kind)).toEqual(['thinking', 'tool', 'text', 'tool']);
     expect(out[0].steps.map((s) => s.key)).toEqual(['m1-s0', 'm1-s1', 'm1-s2', 'm1-s3']);
-    expect(out[0].steps[1].tool).toEqual({ name: 'read_task', argsSummary: 't1', state: 'ok' });
+    // 详情字段缺省时 args 回落摘要那份（决策 301 的加性口径），result 空串
+    expect(out[0].steps[1].tool).toEqual({
+      name: 'read_task',
+      argsSummary: 't1',
+      args: 't1',
+      result: '',
+      state: 'ok',
+    });
     expect(out[0].steps[2].text).toBe('中间插一句。');
     expect(out[0].steps[3].tool?.state).toBe('bad');
     // 段序里没有一个 `live`：落地的那一行每一步都已经收场
@@ -188,7 +203,13 @@ describe('落地轮：分类读字段、不解析正文（决策 252 / 244 / 235
     expect(out[0].steps).toEqual([]);
     expect(out[1].steps.map((s) => s.kind)).toEqual(['thinking', 'tool']);
     expect(out[1].steps[0].text, '不 trim 正文').toBe(' 推演 ');
-    expect(out[1].steps[1].tool).toEqual({ name: 'read_board', argsSummary: '{}', state: 'bad' });
+    expect(out[1].steps[1].tool).toEqual({
+      name: 'read_board',
+      argsSummary: '{}',
+      args: '{}',
+      result: '',
+      state: 'bad',
+    });
   });
 
   it('attribution 用后端给的 label，未定位时 null——不编一个假的类别', () => {
@@ -217,6 +238,25 @@ describe('落地轮：分类读字段、不解析正文（决策 252 / 244 / 235
       at: '2026-09-23T10:00:00Z',
     });
     expect(out[0].steps).toEqual([]);
+  });
+
+  it('中断时刻字段透传（票 03）：`interrupted_at` 原样过去，其余行恒 null', () => {
+    // 与 attribution 同一条边界（决策 252）：后端给的字段只搬不判——界面不自己从
+    // `status` 推时刻、也不从正文里抠「中断」两个字，两份判定点迟早不一致。
+    const out = buildTurns(
+      inputOf({
+        session: sessionOf([
+          message({ id: 1, status: 'interrupted', interrupted_at: '2026-09-23T10:05:00Z' }),
+          message({ id: 2, created_at: '2026-09-23T10:01:00Z' }),
+          message({ id: 3, status: 'in_flight', created_at: '2026-09-23T10:02:00Z' }),
+        ]),
+      }),
+    );
+    expect(out.map((t) => t.interruptedAt)).toEqual([
+      '2026-09-23T10:05:00Z',
+      null,
+      null,
+    ]);
   });
 });
 
@@ -656,5 +696,78 @@ describe('值守台账（ledgerKind = watch）：名牌与占位句按账本类�
     expect(cut.endsWith('…')).toBe(true);
     // 边界：恰好在上限之内的不截
     expect(watchDraftExcerpt('长'.repeat(WATCH_DRAFT_MAX))).toHaveLength(WATCH_DRAFT_MAX);
+  });
+});
+
+/**
+ * 快照与直播的**拼接**（票 02）：在途半截行是基准，直播只摆 `seq > seq0` 的尾巴。
+ *
+ * 「中途刷新」那条用户诉求的下半边：上半边（前半段完整可见）由半截行自己渲染，
+ * 这一组钉的是两半**拼起来不重不漏**——判据在 `realtime/foreman.test.ts::spliceAccepts`
+ * （三支各有单测），这里钉它们接到时间线上的样子。
+ */
+describe('快照与直播的拼接：在途半截行是基准（票 02）', () => {
+  const half = () =>
+    message({
+      id: 5,
+      status: 'in_flight',
+      content: '快照里已有的半句',
+      seq: 12,
+      created_at: '2026-09-23T10:02:00Z',
+    });
+
+  it('半截行摆前半段、直播只摆 seq > seq0 的尾巴：不重不漏', () => {
+    const stream = streamOf({
+      // 到达时**不筛**（筛在渲染时按基准做）——两件事都攒着，正是这条判据的输入
+      events: [
+        { kind: 'delta', channel: 'content', text: '快照里已有的半句', ledger_id: 5, seq: 12 },
+        { kind: 'delta', channel: 'content', text: '之后才说的字', ledger_id: 5, seq: 13 },
+      ],
+      steps: [textStep('快照里已有的半句'), textStep('之后才说的字')],
+      streaming: true,
+    });
+    const turns = buildTurns(
+      inputOf({
+        session: sessionOf([message({ id: 4, role: 'user', kind: 'mine', content: '问' }), half()]),
+        following: true,
+        stream,
+      }),
+    );
+
+    const landed = turns.find((t) => t.key === 'm5');
+    expect(landed?.content, '前半段在快照那一行里').toBe('快照里已有的半句');
+
+    const live = turns.find((t) => t.key === 'live');
+    expect(live, '尾巴非空：另起一轮接着说').toBeTruthy();
+    expect(live?.content, 'seq0 之前的字不许在尾巴里再出现一遍').toBe('之后才说的字');
+    expect(live?.steps, '尾巴里也没有快照已有的步骤').toEqual([]);
+
+    // 合起来：两半各说各的，全文不丢字
+    const joined = turns.map((t) => t.content).join('\n');
+    expect(joined).toContain('快照里已有的半句');
+    expect(joined).toContain('之后才说的字');
+  });
+
+  it('尾巴为空：不摆占位句那一轮——半截行自己就是此刻的状态', () => {
+    const stream = streamOf({
+      events: [{ kind: 'delta', channel: 'content', text: '快照里已有的半句', ledger_id: 5, seq: 12 }],
+      steps: [textStep('快照里已有的半句')],
+      streaming: false,
+    });
+    const turns = buildTurns(
+      inputOf({ session: sessionOf([half()]), following: true, stream }),
+    );
+    expect(turns.map((t) => t.key)).toEqual(['m5']);
+  });
+
+  it('没有在途行（快照里还没有半截行）：直播照旧摆整条流——既有路径一个字不动', () => {
+    const stream = streamOf({
+      events: [{ kind: 'delta', channel: 'content', text: '整条流', ledger_id: 5, seq: 3 }],
+      steps: [textStep('整条流')],
+      streaming: true,
+    });
+    const turns = buildTurns(inputOf({ session: sessionOf([message()]), following: true, stream }));
+    const live = turns.find((t) => t.key === 'live');
+    expect(live?.content).toBe('整条流');
   });
 });

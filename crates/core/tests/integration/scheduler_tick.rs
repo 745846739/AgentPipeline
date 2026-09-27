@@ -519,6 +519,125 @@ async fn an_owner_held_run_without_heartbeat_is_noted() {
     );
 }
 
+/// **第三类判据（决策 305，票 04）**：游标 **`pending`** + run 已终态 + 执行权仍持有。
+///
+/// 这是 2026-09-27 实测的形态（任务 `01M3BGVCXDWFPT0Q3BZYAGZP8Q`）。旧判据两条都不覆盖：
+/// 「调度器处置未生效」被「游标必须可运行」先行挡掉，「owner 持有超时」要求 run 仍 `Running`
+/// ——于是兜底机制在它本该兜的那一格失效，只能靠重启。断言的是**这一格被认出来了**。
+#[tokio::test]
+async fn a_held_owner_behind_a_pending_cursor_is_noted() {
+    let h = Harness::new().await;
+    h.seed_task("t1").await;
+    h.mark_running("t1").await;
+    assert!(h.store.try_claim_executor("t1", "owner-1").await.unwrap());
+    let cursor = h.store.load_live_cursors("t1").await.unwrap()[0].clone();
+    // run 30 分钟前就终态了（远过 watch_owner_stuck_minutes = 10），而执行权还在 owner-1 手上
+    terminal_run_at_init(&h, "t1", NodeStatus::Timeout, 30).await;
+    // 超时耗尽了重试预算 → 调度器把游标挂成了 pending（正是那次实测的形状）
+    let reason = PendingReason::new(
+        PendingKind::Timeout,
+        cursor.stage,
+        cursor.node,
+        "执行超时（attempt 3）",
+    );
+    h.store
+        .set_cursor_pending(&cursor.cursor_id, &reason)
+        .await
+        .unwrap();
+    h.store.sync_task_projection("t1").await.unwrap();
+
+    let report = h.scheduler(Settings::default()).tick().await.unwrap();
+    assert!(report.attention_noted >= 1, "{report:?}");
+    let open = h.store.open_attention(100).await.unwrap();
+    let noted = open
+        .iter()
+        .find(|a| a.kind == agentpipeline_core::storage::AttentionKind::OwnerStuck)
+        .unwrap_or_else(|| {
+            panic!("游标 pending + run 已终态 + 执行权仍持有必须被认出来：{open:?}")
+        });
+    assert_eq!(
+        noted.detail_json.as_ref().unwrap()["shape"],
+        "terminal_run",
+        "第三类的这个分支要标出来（run 已终态）"
+    );
+    assert_eq!(noted.detail_json.as_ref().unwrap()["owner"], "owner-1");
+}
+
+/// **第三类判据的第三个形态**：已抢占执行权、**还没有 run 行**，而执行权攥着超过宽限。
+///
+/// 这一格旧判据同样看不到（连 run 都没有，`list_runs_at` 返回空、旧代码 `continue` 掉）。
+#[tokio::test]
+async fn a_held_owner_with_no_run_at_all_is_noted() {
+    let h = Harness::new().await;
+    h.seed_task("t1").await;
+    h.mark_running("t1").await;
+    assert!(h.store.try_claim_executor("t1", "owner-1").await.unwrap());
+    // 持有权的换手会碰 `updated_at`，故回拨它就是回拨「攥了多久」（决策 305 的读法）。
+    let held = h.clock.now() - chrono::Duration::minutes(30);
+    sqlx::query("UPDATE kanban_tasks SET updated_at = ? WHERE id = ?")
+        .bind(agentpipeline_core::storage::ts(held))
+        .bind("t1")
+        .execute(h.store.pool())
+        .await
+        .unwrap();
+
+    let report = h.scheduler(Settings::default()).tick().await.unwrap();
+    assert!(report.attention_noted >= 1, "{report:?}");
+    let open = h.store.open_attention(100).await.unwrap();
+    let noted = open
+        .iter()
+        .find(|a| a.kind == agentpipeline_core::storage::AttentionKind::OwnerStuck)
+        .unwrap_or_else(|| panic!("尚无 run 也应被认出来：{open:?}"));
+    assert_eq!(
+        noted.detail_json.as_ref().unwrap()["shape"],
+        "no_run",
+        "第三类的这个分支要标出来（还没有 run 行）"
+    );
+}
+
+/// **反向断言（票 04）**：有主、心跳**新鲜**、未超阈值的在跑任务**不被误判**。
+///
+/// 这正是 `unstick` 文件头那句警告——判成卡住会清掉健康占用，同一任务就会跑出两个执行体。
+#[tokio::test]
+async fn an_owner_held_run_with_a_fresh_heartbeat_is_not_misjudged() {
+    let h = Harness::new().await;
+    h.seed_task("t1").await;
+    h.mark_running("t1").await;
+    assert!(h
+        .store
+        .try_claim_executor("t1", "owner-live")
+        .await
+        .unwrap());
+    let cursor = h.store.load_live_cursors("t1").await.unwrap()[0].clone();
+    // 跑了 900s（远长于 10 分钟那条线）但心跳 5 秒前刚刷过 —— 「跑得久」不是判据。
+    h.running_run("t1", &cursor.cursor_id, 1, 900, 5, None)
+        .await;
+
+    let settings = Settings {
+        node_idle_timeout_sec: 7200, // 长跑节点：空闲超时不会先来收走这一条
+        ..Default::default()
+    };
+    let report = h.scheduler(settings).tick().await.unwrap();
+    let open = h.store.open_attention(100).await.unwrap();
+    assert!(
+        !open
+            .iter()
+            .any(|a| a.kind == agentpipeline_core::storage::AttentionKind::OwnerStuck),
+        "心跳在走 = 正常在跑，不许误判（noted={}）：{open:?}",
+        report.attention_noted
+    );
+    assert_eq!(
+        h.store
+            .get_task("t1")
+            .await
+            .unwrap()
+            .executor_owner
+            .as_deref(),
+        Some("owner-live"),
+        "占用一个字都不许动"
+    );
+}
+
 /// §2.1 那条纪律的牙齿：**正常在跑的东西不产生待办**（成功、心跳、工具调用都不写）。
 #[tokio::test]
 async fn healthy_activity_produces_no_attention() {

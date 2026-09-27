@@ -34,7 +34,7 @@ use crate::storage::observability::{NewRun, PromptSnapshot, RunOutcome};
 use crate::storage::Store;
 use crate::types::{
     CommandSource, DuplicateRisk, Gate, GateFailureKind, Node, NodeCursor, NodeStatus,
-    PendingContext, PendingKind, PendingReason, Project, Stage, Task,
+    PendingContext, PendingKind, PendingReason, Project, Stage, StageConfig, Task,
 };
 use crate::{Error, Result};
 
@@ -450,6 +450,53 @@ impl ModelInvoke {
     /// 两个调用点（本次调用与超窗后的那一次重试）走同一条 select：超窗重试也必须能被打断
     /// ——人按停时不该因为「它正在重试」而多等一轮。取不到观察点（进程内没有这一号登记）
     /// 时照旧直连，与加这条通道之前一致。
+    /// 撞墙就是「这一行的窗口低估了」的证据：把该行**只上调**（决策 309，票 01）。
+    ///
+    /// 解析顺序与 `model_context_window` **同源**（决策 129 四级：节点级 > 任务覆盖 >
+    /// 阶段配置 > 首个 enabled）——因为「改哪一行」必须与「哪一行算出了这次的触发线」
+    /// 是同一行，否则会去改另一个模型的行。
+    async fn calibrate_window_on_the_wall(
+        &self,
+        task: &Task,
+        cursor: &NodeCursor,
+        stage_cfg: Option<&StageConfig>,
+        observed: usize,
+    ) -> Result<()> {
+        let providers = self.store.load_providers().await?;
+        let node_override =
+            crate::storage::catalog::node_provider_override(stage_cfg, cursor.node.as_str());
+        let resolved = crate::storage::catalog::resolve_provider_id(
+            node_override.as_deref(),
+            task.model_override.as_deref(),
+            stage_cfg,
+            providers.iter().find(|p| p.enabled).map(|p| p.id.as_str()),
+        );
+        let Some(id) = resolved else {
+            return Ok(());
+        };
+        let current = providers
+            .iter()
+            .find(|p| p.id == id)
+            .map(|p| p.context_window as usize)
+            .unwrap_or(0);
+        let raised = crate::pipeline::window_calibration::calibrated_window(current, observed);
+        if raised > current
+            && self
+                .store
+                .raise_provider_context_window(&id, raised)
+                .await?
+        {
+            tracing::warn!(
+                provider = %id,
+                from = current,
+                to = raised,
+                observed,
+                "撞墙自校准：provider 行的上下文窗口上调并落账（决策 309）"
+            );
+        }
+        Ok(())
+    }
+
     async fn complete_once(
         &self,
         req: LlmRequest,
@@ -595,6 +642,8 @@ impl ModelInvoke {
             // 决策 279：补充输入已作为 user turn 进转录（validate_input 续接），
             // segment 不再重渲染——见 `model_request::load_segments`。
             user_input_as_turn: supplement_as_turn,
+            // 启动探测的授权快照（决策 306）：值在这里贴上组装层，缺授权时组装**立刻**失败。
+            disk_access: crate::agent::disk_access::state(),
         })
         .await?;
         let (plan, mut assemble_overflow) = match prepared {
@@ -668,6 +717,26 @@ impl ModelInvoke {
                 // 再重试这一次调用**（与值班长 06(c) 同一处置、同一个判据）。压缩是**无条件**的：
                 // 那次报错就是「算术低估了」的证据，按软限再判一次只会得出「还没到线」。
                 Err(e) if is_context_window(&e) => {
+                    // **撞墙自校准**（决策 309，票 foreman-burns 01）：provider 报上下文超长
+                    // 同时告诉我们「这一行的窗口值低估了」。只上调、且不低于实测下界
+                    // （576,210 = 561,210 实测输入 + 输出预留）；登记的方向由
+                    // `raise_provider_context_window` 的 `WHERE context_window < ?` 保证。
+                    //
+                    // **反向**：传输 / 鉴权 / 配额那几类**一个字节都不改**——它们到不了
+                    // 这个分支（判据就是 `is_context_window`），走下面那条 `Err(e) => return`。
+                    //
+                    // 校准失败不拖累这一轮：它是兜底，处置本身是下面那次「就地压缩再重试」。
+                    let observed = crate::agent::context::estimate_messages_tokens(
+                        &plan.system,
+                        &plan.user,
+                        &trace.messages,
+                    );
+                    if let Err(cal) = self
+                        .calibrate_window_on_the_wall(task, cursor, stage_cfg.as_ref(), observed)
+                        .await
+                    {
+                        tracing::debug!(error = %cal, "窗口撞墙自校准未完成（不拖累这一轮）");
+                    }
                     let compacted = plan.force_compact(&mut trace.messages, carried_len);
                     if compacted == 0 {
                         // 压不动了（都在 keep 窗口里 / 回执就是极限）：报错才是诚实的，
@@ -706,6 +775,8 @@ impl ModelInvoke {
                     &call.name,
                     ToolPhase::Start,
                     &summary,
+                    &call.arguments,
+                    None,
                 );
                 let ctx = ToolCallContext {
                     task_id: task.id.clone(),
@@ -723,9 +794,8 @@ impl ModelInvoke {
                         if let Some(m) = outcome.metadata {
                             submitted = Some(m);
                         }
-                        trace
-                            .messages
-                            .push(Message::tool_result(call, outcome.content));
+                        // 结果详情（决策 301）在 `content` 被移进转录**之前**递出去——
+                        // 事件是它的第一读者，转录是第二份。
                         emit_tool_event(
                             &*self.sse,
                             task,
@@ -734,11 +804,16 @@ impl ModelInvoke {
                             &call.name,
                             ToolPhase::End,
                             &summary,
+                            &call.arguments,
+                            Some(&outcome.content),
                         );
+                        trace
+                            .messages
+                            .push(Message::tool_result(call, outcome.content));
                     }
                     Err(e) => {
                         // error 阶段的 args_summary 仍是参数摘要（决策 123）；
-                        // 错误详情走 messages 的 tool_result（已脱敏）
+                        // 错误文本进 `result`（决策 301），messages 的 tool_result 照旧一份。
                         emit_tool_event(
                             &*self.sse,
                             task,
@@ -747,6 +822,8 @@ impl ModelInvoke {
                             &call.name,
                             ToolPhase::Error,
                             &summary,
+                            &call.arguments,
+                            Some(&format!("工具执行失败：{e}")),
                         );
                         // G13：工具失败在 agent loop 内重试，只计 tool_retry_max 次
                         tool_failures += 1;
@@ -913,7 +990,8 @@ impl ModelInvoke {
                 Path::new(&project.local_path),
                 project.language.as_deref(),
                 project.test_framework.as_deref(),
-            ),
+            )
+            .await,
             &persona,
             &workdirs_line(&worktree, &task_dir),
             &[],
@@ -1048,8 +1126,30 @@ impl ModelInvoke {
             .get_stage_config(PseudoStage::ProjectAnalysis.stage_key())
             .await?;
         let persona = match stage_cfg.as_ref().and_then(|c| c.persona_path.as_deref()) {
-            Some(path) => std::fs::read_to_string(self.store.home().root().join(path))
-                .map_err(|e| Error::Config(format!("project_analysis persona_path 不可读：{e}")))?,
+            Some(path) => {
+                // persona 读与节点那一侧同口径：走有界阻塞读（决策 302，票 01）。
+                let p = self.store.home().root().join(path);
+                match crate::agent::bounded_read::read_to_string("pseudo_persona_path", &p).await {
+                    crate::agent::bounded_read::Offloaded::Done(Ok(read)) => read,
+                    crate::agent::bounded_read::Offloaded::Done(Err(e)) => {
+                        return Err(Error::Config(format!(
+                            "project_analysis persona_path 不可读：{e}"
+                        )))
+                    }
+                    crate::agent::bounded_read::Offloaded::Panicked(msg) => {
+                        return Err(Error::Config(format!(
+                            "project_analysis persona_path 不可读：{msg}"
+                        )))
+                    }
+                    crate::agent::bounded_read::Offloaded::Stuck => {
+                        return Err(Error::Config(format!(
+                            "project_analysis persona_path 不可读：读超界 {}s，仍挂在系统调用里（{}）",
+                            crate::agent::bounded_read::BOUNDED_READ_SEC,
+                            p.display()
+                        )))
+                    }
+                }
+            }
             None => PseudoStage::ProjectAnalysis.embedded_persona().to_string(),
         };
         let system_prompt = build_system_prompt(
@@ -1057,7 +1157,8 @@ impl ModelInvoke {
                 Path::new(&project.local_path),
                 project.language.as_deref(),
                 project.test_framework.as_deref(),
-            ),
+            )
+            .await,
             &persona,
             &workdirs_line(&project.local_path, &project.local_path),
             &[],

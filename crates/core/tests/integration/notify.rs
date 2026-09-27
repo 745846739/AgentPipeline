@@ -365,6 +365,8 @@ fn kind_to_class_mapping_is_pinned() {
         (RunFailed, Some(NotifyClass::Failed)),
         (TaskDone, Some(NotifyClass::Done)),
         (TaskCancelled, Some(NotifyClass::Cancelled)),
+        (ResumeBlocked, Some(NotifyClass::Pending)),
+        (BlockedRead, Some(NotifyClass::Pending)),
     ];
     for (kind, cls) in table {
         assert_eq!(notification_class(kind), cls, "{kind:?}");

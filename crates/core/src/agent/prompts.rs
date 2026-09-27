@@ -6,6 +6,7 @@
 
 use std::path::{Path, PathBuf};
 
+use crate::agent::bounded_read::{self, Offloaded};
 use crate::types::{Node, Stage};
 
 /// 基线前言（不可覆盖）。
@@ -34,16 +35,22 @@ pub fn default_agents_context(
 
 /// 加载项目上下文（G3）：优先读 `{project_root}/AGENTS.md`，缺失或为空时
 /// 回退到非空默认上下文（决策 51）。
-pub fn load_agents_context(
+///
+/// **读走阻塞池**（决策 302）：这个读点正是 2026-09-27 那次 4 小时挂死的那一处
+/// （完全磁盘访问弹窗无人应答 → `open()` 挂在同步系统调用里 → 占死一个 worker）。
+/// 「读不到」与「读超界」在这里是**同一条降级路**——都是「拿不到项目上下文」，
+/// 差别只在可观测性（超界会进 `bounded_read::stats()` 与日志）。
+pub async fn load_agents_context(
     project_root: &Path,
     language: Option<&str>,
     test_framework: Option<&str>,
 ) -> String {
-    match std::fs::read_to_string(project_root.join("AGENTS.md")) {
-        Ok(content) if !content.trim().is_empty() => {
+    let fallback = || default_agents_context(project_root, language, test_framework);
+    match bounded_read::read_to_string("agents_md", &project_root.join("AGENTS.md")).await {
+        Offloaded::Done(Ok(content)) if !content.trim().is_empty() => {
             format!("## 项目上下文（AGENTS.md）\n{}", content.trim())
         }
-        _ => default_agents_context(project_root, language, test_framework),
+        _ => fallback(),
     }
 }
 
@@ -111,7 +118,11 @@ pub struct ResolvedPersona {
 }
 
 /// 解析 persona：用户 `{home}/prompts/{stage}/{node}.md` 覆盖内嵌默认（决策 7）。
-pub fn resolve_persona(
+///
+/// **读走阻塞池**（决策 302）：persona 覆盖目录同样可能落在受保护路径上
+/// （`[prompts] dir` 指到 `~/Documents/...` 时），只包住 AGENTS.md 就是打地鼠。
+/// 读不到 / 读超界都回落内嵌默认——与「覆盖文件不存在」同一条路。
+pub async fn resolve_persona(
     prompts_dir: &Path,
     stage: Stage,
     node: Node,
@@ -120,8 +131,8 @@ pub fn resolve_persona(
     let path = prompts_dir
         .join(stage.prompt_dir())
         .join(format!("{}.md", node.as_str()));
-    match std::fs::read_to_string(&path) {
-        Ok(content) if !content.trim().is_empty() => ResolvedPersona {
+    match bounded_read::read_to_string("persona", &path).await {
+        Offloaded::Done(Ok(content)) if !content.trim().is_empty() => ResolvedPersona {
             content,
             from_override: true,
             path: Some(path),
@@ -474,34 +485,36 @@ mod tests {
 
     // ── AGENTS.md 加载（G3）──
 
-    #[test]
-    fn agents_md_content_becomes_agents_context() {
+    #[tokio::test]
+    async fn agents_md_content_becomes_agents_context() {
         let tmp = tempfile::tempdir().unwrap();
         std::fs::write(
             tmp.path().join("AGENTS.md"),
             "# 项目约定\n- 用 just test 跑测试",
         )
         .unwrap();
-        let ctx = load_agents_context(tmp.path(), Some("Rust"), Some("cargo"));
+        let ctx = load_agents_context(tmp.path(), Some("Rust"), Some("cargo")).await;
         assert!(ctx.starts_with("## 项目上下文（AGENTS.md）"));
         assert!(ctx.contains("# 项目约定"));
         assert!(ctx.contains("just test"));
     }
 
-    #[test]
-    fn missing_or_blank_agents_md_falls_back_to_default() {
+    #[tokio::test]
+    async fn missing_or_blank_agents_md_falls_back_to_default() {
         let tmp = tempfile::tempdir().unwrap();
-        let ctx = load_agents_context(tmp.path(), Some("Rust"), None);
+        let ctx = load_agents_context(tmp.path(), Some("Rust"), None).await;
         assert!(ctx.contains("本仓库无 AGENTS.md"));
 
         std::fs::write(tmp.path().join("AGENTS.md"), "   \n").unwrap();
-        assert!(load_agents_context(tmp.path(), None, None).contains("本仓库无 AGENTS.md"));
+        assert!(load_agents_context(tmp.path(), None, None)
+            .await
+            .contains("本仓库无 AGENTS.md"));
     }
 
     // ── prompts/ 覆盖生效 ──
 
-    #[test]
-    fn prompts_dir_override_wins_over_embedded() {
+    #[tokio::test]
+    async fn prompts_dir_override_wins_over_embedded() {
         let tmp = tempfile::tempdir().unwrap();
         let dir = tmp.path().join("architect_design");
         std::fs::create_dir_all(&dir).unwrap();
@@ -512,7 +525,8 @@ mod tests {
             Stage::ArchitectDesign,
             Node::Execute,
             "内嵌 persona",
-        );
+        )
+        .await;
         assert!(got.from_override);
         assert_eq!(got.content, "覆盖后的 persona");
         assert!(got.path.unwrap().ends_with("architect_design/execute.md"));
@@ -529,8 +543,8 @@ mod tests {
         assert_eq!(prompts_root(home_prompts, None), home_prompts);
     }
 
-    #[test]
-    fn overridden_prompts_root_is_what_resolve_persona_reads() {
+    #[tokio::test]
+    async fn overridden_prompts_root_is_what_resolve_persona_reads() {
         // 覆盖目录中存在 persona 时，resolve_persona 必须读到它而不是内嵌默认
         let home = tempfile::tempdir().unwrap();
         let custom = tempfile::tempdir().unwrap();
@@ -539,34 +553,34 @@ mod tests {
         std::fs::write(dir.join("execute.md"), "自定义目录 persona").unwrap();
 
         let root = prompts_root(&home.path().join("prompts"), Some(custom.path()));
-        let got = resolve_persona(&root, Stage::Develop, Node::Execute, "内嵌 persona");
+        let got = resolve_persona(&root, Stage::Develop, Node::Execute, "内嵌 persona").await;
         assert!(got.from_override);
         assert_eq!(got.content, "自定义目录 persona");
 
         // 覆盖目录里没有该文件 → 回落内嵌默认（不因目录缺失而报错）
         let empty = tempfile::tempdir().unwrap();
         let root = prompts_root(&home.path().join("prompts"), Some(empty.path()));
-        let got = resolve_persona(&root, Stage::Develop, Node::Execute, "内嵌 persona");
+        let got = resolve_persona(&root, Stage::Develop, Node::Execute, "内嵌 persona").await;
         assert!(!got.from_override);
         assert_eq!(got.content, "内嵌 persona");
     }
 
-    #[test]
-    fn embedded_persona_used_when_no_override() {
+    #[tokio::test]
+    async fn embedded_persona_used_when_no_override() {
         let tmp = tempfile::tempdir().unwrap();
-        let got = resolve_persona(tmp.path(), Stage::Develop, Node::Execute, "内嵌 persona");
+        let got = resolve_persona(tmp.path(), Stage::Develop, Node::Execute, "内嵌 persona").await;
         assert!(!got.from_override);
         assert_eq!(got.content, "内嵌 persona");
         assert!(got.path.is_none());
     }
 
-    #[test]
-    fn empty_override_file_falls_back_to_embedded() {
+    #[tokio::test]
+    async fn empty_override_file_falls_back_to_embedded() {
         let tmp = tempfile::tempdir().unwrap();
         let dir = tmp.path().join("develop");
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(dir.join("execute.md"), "   \n").unwrap();
-        let got = resolve_persona(tmp.path(), Stage::Develop, Node::Execute, "内嵌 persona");
+        let got = resolve_persona(tmp.path(), Stage::Develop, Node::Execute, "内嵌 persona").await;
         assert!(!got.from_override);
         assert_eq!(got.content, "内嵌 persona");
     }

@@ -32,6 +32,7 @@
 
 use std::path::Path;
 
+use crate::agent::bounded_read::{self, Offloaded};
 use crate::agent::client::{LlmRequest, Message, RunContext, ToolDef};
 use crate::agent::context::{
     compact_messages_from, count_tokens, estimate_context_capacity, over_hard_limit,
@@ -46,7 +47,7 @@ use crate::agent::{effective_skills, effective_tools, submit_metadata_tool, SKIL
 use crate::config::Settings;
 use crate::home::Home;
 use crate::storage::observability::PromptSnapshot;
-use crate::storage::Store;
+use crate::storage::{AttentionKind, Store};
 use crate::types::{Node, NodeCursor, Project, Stage, StageConfig, Task};
 use crate::{Error, Result};
 
@@ -75,6 +76,16 @@ pub struct AttemptCtx<'a> {
     /// ——「用户补充输入」segment 停止渲染，否则同一段话出现两遍、首条消息还变了
     /// （prompt cache 整段打穿的实测根源）。execute 等其余场景恒 false，segment 照旧。
     pub user_input_as_turn: bool,
+    /// 启动时探到的完全磁盘访问授权（决策 306）。
+    ///
+    /// **值注入，不是缝**：进程级快照由启动探测写入（`agent::disk_access::record`），
+    /// 执行体在这里把它填进来；测试直接置值。照第五条接缝
+    /// （`AGENTPIPELINE_MARKET_GIT_BASE` 那条「远端地址替换点」）的**非类型缝**先例——
+    /// 明确不新造 `DiskAccessProbe` trait（决策 250 刚删掉一条只有一处 `impl` 的假 seam）。
+    ///
+    /// 为什么必须在**读之前**用快照判：`access()` / `stat()` 对受保护路径同样会阻塞，
+    /// 在读的那一刻探等于把「检查授权」变成第二个挂起现场。
+    pub disk_access: crate::agent::disk_access::DiskAccessState,
 }
 
 /// 组装期判出的超限事实。**不是 `PendingReason`**——落点由构造者定（决策 245），
@@ -137,6 +148,23 @@ pub struct RequestPlan {
 impl RequestPlan {
     /// 默认入口：常见路径这一行（零段参数——段自己去取；重试轮同形重调）。
     pub async fn assemble(ctx: AttemptCtx<'_>) -> Result<Prepared> {
+        // **缺授权时快速失败**（决策 306）：先给一句可操作的话，**不等那 300 秒**。
+        // 放在取段之前——这一层判的是环境，不是这一轮的输入。判据取自**值**（`ctx.disk_access`，
+        // 启动探测写进快照、执行体填进来的那一份），不在读的那一刻现探（`access()` / `stat()`
+        // 对受保护路径同样会阻塞，现探等于把「检查授权」变成第二个挂起现场）。
+        //
+        // 节点因此**立刻**转 pending（错误沿 `model_invoke` 的 `?` 出去，落进执行体既有的
+        // 错误路径），而**不会产生任何超时记账**：这里连一次模型调用都还没发出去。
+        // 判据是**两个条件的合取**：快照说缺授权，**且**这一轮的根落在受保护的地方
+        // （`~/Documents` / `~/Desktop` / `~/Downloads`）——只有那时缺授权才会让读挂住。
+        // 只看前者会把每一台没开授权的机器都变成跑不动（实现期实测踩到：`smoke` /
+        // `restart_recovery` 两条真二进制用例当场红）。
+        if let Some(err) = ctx
+            .disk_access
+            .denied_error_for_project(Path::new(&ctx.project.local_path))
+        {
+            return Err(err);
+        }
         let segments = load_segments(&ctx).await?;
         Self::assemble_seeded(ctx, segments).await
     }
@@ -157,6 +185,9 @@ impl RequestPlan {
         // 名字态只列名字（正文交给 `Skill` 工具按需拉取，票 06）、目录态给出「还有哪些
         // 技能可用」（渐进披露）。技能根经 `Home::skills_dir` 取（默认 `{home}/skills`，
         // `[skills] dir` 可覆盖，决策 172）。
+        //
+        // 两处读都走**有界阻塞读**（决策 302，票 01）：技能根可配置，指到受保护路径时
+        // 与 AGENTS.md 是同一个卡死形状。
         let skills_root = home.skills_dir();
         let mut declared = crate::config::stage_skills(ctx.stage_cfg)?;
         declared.extend(crate::config::node_skills(
@@ -166,20 +197,18 @@ impl RequestPlan {
         let declared = effective_skills(&declared);
         let declared_names = crate::agent::baseline::effective_skill_names(&declared);
         // 声明的技能排在目录之前（保持 golden 顺序「先看已启用的」）
-        let mut skills = crate::agent::skills::resolve(&skills_root, &declared)?;
-        skills.extend(crate::agent::skills::catalogue(
-            &skills_root,
-            &declared_names,
-        ));
+        let mut skills = crate::agent::skills::resolve_bounded(&skills_root, &declared).await?;
+        skills.extend(crate::agent::skills::catalogue_bounded(&skills_root, &declared_names).await);
 
         // system prompt：[基线前言][工作目录(G12)][AGENTS.md(G3)][persona][技能][格式规则]
-        let persona = resolve_stage_persona(home, ctx.stage_cfg, cursor.stage, cursor.node)?;
+        let persona = resolve_stage_persona(home, ctx.stage_cfg, cursor.stage, cursor.node).await?;
         let system = build_system_prompt(
             &load_agents_context(
                 Path::new(&ctx.project.local_path),
                 ctx.project.language.as_deref(),
                 ctx.project.test_framework.as_deref(),
-            ),
+            )
+            .await,
             &persona,
             &workdirs_line(&worktree, &task_dir),
             &skills,
@@ -195,6 +224,38 @@ impl RequestPlan {
             &segments,
         );
         let hash = prompt_template_hash(&system);
+
+        // ── 卡住的读在累积 → 落一条待办（决策 308，票 07）──────────────────────────
+        //
+        // 计数器是**进程级**的（读点深在调用链里，拿不到 store 句柄），而待办表按**任务**
+        // 记账——两者在这里交汇一次：`take_attention_due` 靠一次 swap 保证一次发作只让
+        // 一个调用方拿到账，于是只落一条。落点在读做完之后、容量分档之前，超限那条早退
+        // 路径也照落（它是同一个组装里的事实）。
+        //
+        // 落账失败只记日志、不拖累组装：这是一条观测，不是组装的一部分。
+        if bounded_read::take_attention_due() {
+            let s = bounded_read::stats();
+            if let Err(e) = ctx
+                .store
+                .note_attention(
+                    &ctx.task.id,
+                    AttentionKind::BlockedRead,
+                    ctx.store.now(),
+                    Some(&serde_json::json!({
+                        "stuck_now": s.stuck_now,
+                        "stuck_total": s.stuck_total,
+                        "longest_wait_ms": s.longest_wait_ms,
+                        "threshold": bounded_read::STUCK_READ_ATTENTION_THRESHOLD,
+                        "blocking_pool_cap": bounded_read::BLOCKING_POOL_CAP,
+                        "stage": cursor.stage.as_str(),
+                        "node": cursor.node.as_str(),
+                    })),
+                )
+                .await
+            {
+                tracing::warn!(task = %ctx.task.id, error = %e, "卡住的读待办落账失败");
+            }
+        }
 
         // 工具与技能同源（阶段声明 + 档位）：deny 档连广告都不给（决策 206）；
         // 未知工具名 fail fast（决策 154 的后续票，报文与写入侧校验同源）。
@@ -344,6 +405,9 @@ impl RequestPlan {
 }
 
 /// 五追加段的取数（首轮为空不渲染；打回/复检态先落库或落文件、再由重入渲染）。
+///
+/// 三处注入文件的读**全走有界阻塞读**（决策 302，票 01）：任务目录可配置在受保护路径下
+/// （`AGENTPIPELINE_HOME` 指到 `~/Documents/...` 就是本机今天的实际形态）。
 async fn load_segments(ctx: &AttemptCtx<'_>) -> Result<PromptSegments> {
     let home = ctx.store.home();
     Ok(PromptSegments {
@@ -354,7 +418,8 @@ async fn load_segments(ctx: &AttemptCtx<'_>) -> Result<PromptSegments> {
             ctx.cursor.stage,
             ctx.cursor.node,
             "backtrack-feedback.md",
-        ),
+        )
+        .await,
         user_input: if ctx.user_input_as_turn {
             // 决策 279：补充输入已作为 user turn 在转录末尾，不再渲染进首条消息——
             // 首条消息逐字不变，prompt cache 的前缀承诺从「run 内」延伸到「resume」。
@@ -367,6 +432,7 @@ async fn load_segments(ctx: &AttemptCtx<'_>) -> Result<PromptSegments> {
                 ctx.cursor.node,
                 "user-input.md",
             )
+            .await
         },
         review_required_changes: review_required_changes_segment(ctx.store, ctx.task, ctx.cursor)
             .await?,
@@ -376,7 +442,8 @@ async fn load_segments(ctx: &AttemptCtx<'_>) -> Result<PromptSegments> {
             ctx.cursor.stage,
             ctx.cursor.node,
             "retry-feedback.md",
-        ),
+        )
+        .await,
     })
 }
 
@@ -453,9 +520,13 @@ async fn gate_recheck_segment(
         &task.id,
         &format!("gate-output-{}.log", Stage::Merge.as_str()),
     );
-    let full_log = std::fs::read_to_string(&gate_log_path)
-        .ok()
-        .filter(|s| !s.trim().is_empty());
+    // 闸门日志可能很大（决策 109 注入上限 120k 字符）：读进阻塞池，超界按「完整日志
+    // 不可读」处置——下面那条显式回退（退 metadata 预览 + 标注）本来就是为这种情形写的。
+    let full_log = match bounded_read::read_to_string("gate_log", &gate_log_path).await {
+        Offloaded::Done(Ok(log)) => Some(log),
+        _ => None,
+    }
+    .filter(|s| !s.trim().is_empty());
     match full_log {
         Some(log) => {
             out.push_str("### 闸门失败完整日志\n");
@@ -767,7 +838,9 @@ pub(crate) fn workdirs_line(worktree: &str, task_dir: &str) -> String {
 /// - `backtrack-feedback.md`：sync-check backtrack 的双方 blockers（决策 126）；
 /// - `user-input.md`：`info_insufficient` 的用户补充输入（决策 79 / 票 08）；
 /// - `retry-feedback.md`：develop / test 重试耗尽回架构设计的失败摘要（决策 138）。
-fn architect_reentry_segment(
+///
+/// 读不到（含读超界，决策 302）一律不渲染——「首轮为空不渲染」与「读不到不渲染」是同一支。
+async fn architect_reentry_segment(
     home: &Home,
     task_id: &str,
     stage: Stage,
@@ -777,15 +850,20 @@ fn architect_reentry_segment(
     if stage != Stage::ArchitectDesign || !matches!(node, Node::ValidateInput | Node::Execute) {
         return None;
     }
-    std::fs::read_to_string(home.task_file(task_id, file))
-        .ok()
-        .filter(|s| !s.trim().is_empty())
+    match bounded_read::read_to_string("task_file", &home.task_file(task_id, file)).await {
+        Offloaded::Done(Ok(content)) if !content.trim().is_empty() => Some(content),
+        _ => None,
+    }
 }
 
 /// persona 解析（决策 7 / §10.6.3）：`stage_configs.persona_path` 显式指定优先，
 /// 其次 `prompts/{stage}/{node}.md` 用户覆盖，最后内嵌 §10.3 模板；
 /// `persona_append` 追加为额外指令段。
-fn resolve_stage_persona(
+///
+/// 两处读都走有界阻塞读（决策 302，票 01）：`persona_path` 相对 home 解析、home 又可
+/// 被指到受保护路径；`prompts/` 覆盖目录同理。读超界与「读不到」在 `persona_path` 这支
+/// 上仍报 `Config`（它的契约是「显式指定的路径必须可读」），只是报文里如实写超界。
+async fn resolve_stage_persona(
     home: &Home,
     stage_cfg: Option<&StageConfig>,
     stage: Stage,
@@ -796,21 +874,42 @@ fn resolve_stage_persona(
         Some(path) => {
             // 相对路径按 home 根解析；绝对路径原样使用
             let p = home.root().join(path);
-            let read = std::fs::read_to_string(&p).map_err(|e| {
-                Error::Config(format!(
-                    "阶段 {stage} 的 persona_path 不可读：{}（{e}）",
-                    p.display()
-                ))
-            })?;
-            if read.trim().is_empty() {
-                return Err(Error::Config(format!(
-                    "阶段 {stage} 的 persona_path 内容为空：{}",
-                    p.display()
-                )));
+            match bounded_read::read_to_string("persona_path", &p).await {
+                Offloaded::Done(Ok(read)) => {
+                    if read.trim().is_empty() {
+                        return Err(Error::Config(format!(
+                            "阶段 {stage} 的 persona_path 内容为空：{}",
+                            p.display()
+                        )));
+                    }
+                    read
+                }
+                Offloaded::Done(Err(e)) => {
+                    return Err(Error::Config(format!(
+                        "阶段 {stage} 的 persona_path 不可读：{}（{e}）",
+                        p.display()
+                    )))
+                }
+                Offloaded::Panicked(msg) => {
+                    return Err(Error::Config(format!(
+                        "阶段 {stage} 的 persona_path 不可读：{}（{msg}）",
+                        p.display()
+                    )))
+                }
+                Offloaded::Stuck => {
+                    return Err(Error::Config(format!(
+                        "阶段 {stage} 的 persona_path 不可读：{}（读超界 {}s，仍挂在系统调用里）",
+                        p.display(),
+                        bounded_read::BOUNDED_READ_SEC
+                    )))
+                }
             }
-            read
         }
-        None => resolve_persona(&home.prompts_dir(), stage, node, embedded).content,
+        None => {
+            resolve_persona(&home.prompts_dir(), stage, node, embedded)
+                .await
+                .content
+        }
     };
     if let Some(append) = stage_cfg.and_then(|c| c.persona_append.as_deref()) {
         if !append.trim().is_empty() {
@@ -903,8 +1002,8 @@ mod tests {
 
     // ───────────────── 既有用例随搬（一条不删，决策 249 Q3）─────────────────
 
-    #[test]
-    fn backtrack_feedback_only_injected_for_architect_reentry() {
+    #[tokio::test]
+    async fn backtrack_feedback_only_injected_for_architect_reentry() {
         let tmp = tempfile::TempDir::new().unwrap();
         let home = Home::new(tmp.path());
         std::fs::create_dir_all(home.task_dir("t1")).unwrap();
@@ -917,7 +1016,8 @@ mod tests {
                 Stage::ArchitectDesign,
                 Node::ValidateInput,
                 "backtrack-feedback.md"
-            ),
+            )
+            .await,
             None
         );
 
@@ -933,6 +1033,7 @@ mod tests {
             Node::ValidateInput,
             "backtrack-feedback.md"
         )
+        .await
         .is_some());
         assert!(architect_reentry_segment(
             &home,
@@ -941,6 +1042,7 @@ mod tests {
             Node::Execute,
             "backtrack-feedback.md"
         )
+        .await
         .is_some());
 
         // 决策 126 的注入范围只有 validate_input / execute
@@ -951,7 +1053,8 @@ mod tests {
                 Stage::ArchitectDesign,
                 Node::ValidateOutput,
                 "backtrack-feedback.md"
-            ),
+            )
+            .await,
             None
         );
         assert_eq!(
@@ -961,7 +1064,8 @@ mod tests {
                 Stage::Develop,
                 Node::Execute,
                 "backtrack-feedback.md"
-            ),
+            )
+            .await,
             None
         );
 
@@ -974,7 +1078,8 @@ mod tests {
                 Stage::ArchitectDesign,
                 Node::ValidateInput,
                 "backtrack-feedback.md"
-            ),
+            )
+            .await,
             None
         );
     }
@@ -1149,6 +1254,9 @@ mod tests {
             attempt: 1,
             kind,
             user_input_as_turn: false,
+            // 组装层大部分用例与授权无关：这一份是「还没探过」（判不出来就不拦人）。
+            // 缺授权那条路自己在 `a_denied_disk_access_snapshot_fails_fast` 里置值。
+            disk_access: crate::agent::disk_access::DiskAccessState::NotProbed,
         }
     }
 
@@ -1776,5 +1884,338 @@ mod tests {
                 .starts_with("[摘要]"),
             "历史上那条被压成摘要，紧跟锚点之后"
         );
+    }
+
+    // ───────────── 票 01（决策 302）：组装层的读全在阻塞池里，挂住也不再拖垮运行时 ─────────────
+
+    /// **静态断言**：组装层里不再有直接的同步文件读。覆盖范围写死在这里。
+    ///
+    /// 为什么要有这一条：功能测试**看不出**这件事——环境不卡时，`std::fs::read_to_string`
+    /// 与阻塞池里的读行为完全一样。而「只包住这次报错的那一处」是打地鼠（下一次卡的是
+    /// persona 或技能根，症状一模一样），所以要靠一条读源码的断言把整层钉住。
+    ///
+    /// **不能靠删文件蒙混过关**：下面每条路径都必须存在且非空，正面清单还要求五处有界读
+    /// 都在场——删函数、改名、把裸读挪回来，三者都会红。
+    #[test]
+    fn the_assembly_layer_has_no_direct_sync_reads() {
+        let source = |rel: &str| -> String {
+            let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join(rel);
+            let src = std::fs::read_to_string(&path)
+                .unwrap_or_else(|e| panic!("覆盖范围内的文件必须存在（{}）：{e}", path.display()));
+            assert!(!src.trim().is_empty(), "{} 是空文件", path.display());
+            // 只看非测试段：测试里造 fixture 本来就该直接写文件。
+            src.split("#[cfg(test)]")
+                .next()
+                .unwrap_or_default()
+                .to_string()
+        };
+
+        // 覆盖面①：组装层主体。
+        let assembly = source("src/pipeline/model_request.rs");
+        for banned in [
+            "std::fs::read",
+            "std::fs::read_dir",
+            "File::open",
+            // 技能两大读（目录扫描 + 正文）只准经有界入口——裸调用会把读留在 worker 上。
+            "skills::resolve(",
+            "skills::catalogue(",
+        ] {
+            assert!(
+                !assembly.contains(banned),
+                "组装层不得出现 `{banned}`：读要走 crate::agent::bounded_read"
+            );
+        }
+        for anchor in [
+            "resolve_bounded(",
+            "catalogue_bounded(",
+            "read_to_string(\"gate_log\"",
+            "read_to_string(\"task_file\"",
+            "read_to_string(\"persona_path\"",
+        ] {
+            assert!(assembly.contains(anchor), "组装层缺一处有界读：`{anchor}`");
+        }
+
+        // 覆盖面②：组装层调用的两个 prompt helper（项目指令文件 / persona）。
+        let prompts = source("src/agent/prompts.rs");
+        for banned in ["std::fs::read", "File::open"] {
+            assert!(!prompts.contains(banned), "prompts.rs 不得出现 `{banned}`");
+        }
+        for anchor in [
+            "bounded_read::read_to_string(\"agents_md\"",
+            "bounded_read::read_to_string(\"persona\"",
+        ] {
+            assert!(
+                prompts.contains(anchor),
+                "prompts.rs 缺一处有界读：`{anchor}`"
+            );
+        }
+
+        // 覆盖面③：技能那两处的有界版真的把扫描挪进了阻塞池。
+        let skills = source("src/agent/skills.rs");
+        for anchor in [
+            "pub async fn resolve_bounded",
+            "pub async fn catalogue_bounded",
+            "bounded_read::run(\"skills_resolve\"",
+            "bounded_read::run(\"skills_catalogue\"",
+        ] {
+            assert!(skills.contains(anchor), "skills.rs 缺 `{anchor}`");
+        }
+    }
+
+    /// **真会挂住的读**（票 01 的核心用例）：命名管道充当项目指令文件。
+    ///
+    /// 为什么非造一个真挂住的：这次故障的形状就是「一次文件读挂在系统调用里 4 小时」，
+    /// mock 一个慢读只会测到 mock。FIFO 的 `open()` 在写端出现之前**真的**不返回。
+    /// 装置用的就是临时目录（与 `AGENTPIPELINE_HOME` 那条接缝同一个形状）——**不新增接缝**。
+    ///
+    /// 三条断言对着票面三条要求：挂住期间别的任务照常推进（worker 没被占死）、
+    /// 挂住的读走完有界等待后被放弃而组装照常出结果、这次挂住被计入观测。
+    #[tokio::test]
+    // 计数器是进程级的，这条与 `bounded_read` 里那几条必须互斥跑；拿锁跨 await 是有意的。
+    #[allow(clippy::await_holding_lock)]
+    async fn a_hung_read_is_abandoned_within_the_bound_and_counted() {
+        use std::io::Write as _;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::Arc;
+        use std::time::Duration;
+
+        let _guard = crate::agent::bounded_read::test_guard();
+        let (_tmp, _home, store, task, project, settings, cursor) = base().await;
+        // 时钟在**建好 fixture 之后**再暂停：`start_paused` 会把 sqlx 连接池的 acquire
+        // 超时一起快进掉（实测 `Db(PoolTimedOut)` 炸在 `Store::open`）。
+        tokio::time::pause();
+        bounded_read::reset_stats();
+
+        // 项目指令文件换成命名管道：`open()` 阻塞到有写端为止。
+        let fifo = Path::new(&project.local_path).join("AGENTS.md");
+        assert!(std::process::Command::new("mkfifo")
+            .arg(&fifo)
+            .status()
+            .expect("mkfifo 不可用")
+            .success());
+
+        // 心跳：一条只让出执行权、不等任何计时器的任务——它跳一下 = 运行时还能调度别的东西。
+        // （故意不用 `sleep`：那会把假时钟推起来，下面的读数就不确定了。）
+        let beats = Arc::new(AtomicUsize::new(0));
+        let beats_in_task = beats.clone();
+        let heartbeat = tokio::spawn(async move {
+            loop {
+                beats_in_task.fetch_add(1, Ordering::Relaxed);
+                tokio::task::yield_now().await;
+            }
+        });
+
+        let assembling = tokio::spawn(async move {
+            let c = AttemptCtx {
+                store: &store,
+                settings: &settings,
+                task: &task,
+                project: &project,
+                cursor: &cursor,
+                stage_cfg: None,
+                attempt: 1,
+                kind: AgentNodeKind::ValidateInput,
+                user_input_as_turn: false,
+                disk_access: crate::agent::disk_access::DiskAccessState::NotProbed,
+            };
+            RequestPlan::assemble(c).await
+        });
+
+        // 暖机：把组装推到管道那一次读上。时钟**一步不推**，所以这期间不可能有超时——
+        // 真等 1ms 是给阻塞池里的几个快读（不存在的任务文件、空的技能根）收尾的时间。
+        for _ in 0..60 {
+            std::thread::sleep(Duration::from_millis(1));
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(
+            bounded_read::stats().stuck_total,
+            0,
+            "没到上界就不该记账（上界 {}s）",
+            bounded_read::BOUNDED_READ_SEC
+        );
+
+        // ① 挂住期间运行时照常推进：心跳在跳，而组装还挂在那里。
+        assert!(
+            beats.load(Ordering::Relaxed) > 0,
+            "worker 被占死了：心跳一次都没跳"
+        );
+        assert!(!assembling.is_finished(), "读还挂着，组装不该已经返回");
+
+        // ② 越过上界：挂住的读被放弃，组装照常出结果（回落到既有的缺省上下文）。
+        tokio::time::advance(Duration::from_secs(bounded_read::BOUNDED_READ_SEC + 1)).await;
+        for _ in 0..10 {
+            tokio::task::yield_now().await;
+        }
+        let prepared = assembling.await.unwrap().unwrap();
+        let Prepared::Ready(plan) = prepared else {
+            panic!("没配 provider，不该判 Overflow")
+        };
+        assert!(
+            plan.system.contains("本仓库无 AGENTS.md"),
+            "读不到 → 既有的缺省上下文（读超界与读失败同一条降级路）"
+        );
+
+        // ③ 这次挂住被计入观测（票 07 的落点就在这个读数上）。
+        let hung = bounded_read::stats();
+        assert_eq!(hung.stuck_total, 1, "挂住的读要记账");
+        assert_eq!(hung.stuck_now, 1, "线程还在系统调用里：卡着的就是 1");
+        assert!(
+            hung.longest_wait_ms >= bounded_read::BOUNDED_READ_SEC * 1000,
+            "最长等待要如实记到上界：{}",
+            hung.longest_wait_ms
+        );
+
+        heartbeat.abort();
+
+        // 收尾：写端出现 → 那个读真的返回。「卡着的」跌回 0 是断言的一部分；
+        // 顺带把阻塞线程放掉（不放，测试二进制退出时会等它，整轮挂住）。
+        let mut writer = std::fs::OpenOptions::new().write(true).open(&fifo).unwrap();
+        writer.write_all(b"x").unwrap();
+        drop(writer);
+        for _ in 0..200 {
+            if bounded_read::stats().stuck_now == 0 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert_eq!(
+            bounded_read::stats().stuck_now,
+            0,
+            "读返回后「卡着的」要跌回去"
+        );
+    }
+
+    /// **缺授权时组装立刻失败，并给一句可操作的话**（决策 306，票 05）。
+    ///
+    /// 这是这次故障的第四层：真因是授权随重建失效（未签名 app 换 CDHash），而节点会白等
+    /// 300 秒再失败——每一处读都挂在系统调用里。这里改成一进组装就判**启动时记下的快照**
+    /// （值注入，`ctx.disk_access`），判词里带「若你刚刚已开启，请重启应用」。
+    ///
+    /// 反过来说：**判不出来（`NotProbed`）与有授权（`Granted`）都放行**——这个开关只拦
+    /// 一种确定的状态。错误是 [`crate::Error::Config`]，沿 `model_invoke` 的 `?` 出去落进
+    /// 执行体既有的错误路径 → 节点转 pending；而它发生在**任何模型调用之前**，
+    /// 故不可能产生超时记账。
+    #[tokio::test]
+    async fn a_denied_disk_access_snapshot_fails_fast_with_the_next_step() {
+        use crate::agent::disk_access::DiskAccessState;
+
+        let (_tmp, home, store, task, mut project, settings, cursor) = base().await;
+        // 判据是「缺授权 **且** 项目根在受保护的地方」（决策 306 的收窄）：把项目指到
+        // 真实 `$HOME` 下的 `Documents`——**不必真存在**，缺授权那条路在读之前就返回了。
+        let protected = std::env::var_os("HOME")
+            .map(|h| {
+                std::path::Path::new(&h)
+                    .join("Documents")
+                    .join("never-read-this")
+                    .display()
+                    .to_string()
+            })
+            .expect("用例要拿真实 $HOME 拼受保护路径");
+        project.local_path = protected.clone();
+        let ctx = |state: DiskAccessState| AttemptCtx {
+            store: &store,
+            settings: &settings,
+            task: &task,
+            project: &project,
+            cursor: &cursor,
+            stage_cfg: None,
+            attempt: 1,
+            kind: AgentNodeKind::ArchitectExecute,
+            user_input_as_turn: false,
+            disk_access: state,
+        };
+
+        let err = RequestPlan::assemble(ctx(DiskAccessState::Denied))
+            .await
+            .expect_err("缺授权时不许继续组装");
+        let text = err.to_string();
+        assert!(text.contains("完全磁盘访问权限"), "{text}");
+        assert!(
+            text.contains("若你刚刚已开启，请重启应用"),
+            "快照有滞后，必须说清「改了设置也要重启」：{text}"
+        );
+        // **类别也钉住**：它是 `Error::Config` ⇒ 沿执行体既有的错误路径走（游标转 pending），
+        // 而它发生在任何模型调用之前 ⇒ 不可能产生超时记账。那两句话的端到端断言在
+        // `executor::an_assembly_config_failure_pends_without_any_timeout_accounting`——
+        // 两处合起来才是票 05 那条反向断言的完整链条。
+        assert!(
+            matches!(err, crate::Error::Config(_)),
+            "缺授权是**配置类**失败（不是传输类、不该重试等一等）：{err:?}"
+        );
+
+        // 反向一：有授权（这一支永远静默）与判不出来（这一支不拦人）都要放行——
+        // 缺授权那条路只拦**一种确定的状态**。
+        for state in [DiskAccessState::Granted, DiskAccessState::NotProbed] {
+            assert!(
+                RequestPlan::assemble(ctx(state)).await.is_ok(),
+                "{state:?} 不该被拦"
+            );
+        }
+        // 反向二：**同样缺授权，但项目不在受保护目录下**（临时目录）→ 放行。
+        // 这一条是收窄的那一半：不然没开完全磁盘访问的机器整个跑不动。
+        let mut safe_project = project.clone();
+        safe_project.local_path = protected.replace("/Documents/", "/tmp-");
+        let safe_ctx = AttemptCtx {
+            store: &store,
+            settings: &settings,
+            task: &task,
+            project: &safe_project,
+            cursor: &cursor,
+            stage_cfg: None,
+            attempt: 1,
+            kind: AgentNodeKind::ArchitectExecute,
+            user_input_as_turn: false,
+            disk_access: DiskAccessState::Denied,
+        };
+        assert!(
+            RequestPlan::assemble(safe_ctx).await.is_ok(),
+            "缺授权 + 项目在临时目录下不该被拦（那些读不需要授权）"
+        );
+        drop(home);
+    }
+
+    /// 正常路径**逐字不变**（决策 249 组装侧 golden 的先例）：
+    /// 五处读挪进阻塞池之后，组装出的 system / user 两段与实际文件取数时**一字不差**。
+    ///
+    /// 归一化说明：worktree / 任务目录 / 家目录都落在临时目录里，故把 home 根前缀换成
+    /// `<HOME>`；其余全部逐字进 golden（含 AGENTS.md 正文、persona 正文、技能三态渲染、
+    /// 目录态、模板变量、格式规则）。
+    #[tokio::test]
+    async fn the_assembled_prompt_is_byte_identical_to_the_golden() {
+        let (_tmp, home, store, task, project, settings, cursor) = base().await;
+        std::fs::write(
+            Path::new(&project.local_path).join("AGENTS.md"),
+            "AGENTS_MARKER_XYZ\n第二行\n",
+        )
+        .unwrap();
+        std::fs::write(home.root().join("persona.md"), "PERSONA_MARKER_XYZ\n").unwrap();
+        write_skill(&home, "skill-a", "SKILL_BODY_XYZ");
+        // 未声明的技能进目录态（名字 + 描述，正文不进 prompt）
+        let catalogue_dir = home.skills_dir().join("skill-b");
+        std::fs::create_dir_all(&catalogue_dir).unwrap();
+        std::fs::write(
+            catalogue_dir.join("SKILL.md"),
+            "---\nname: skill-b\ndescription: 目录态描述\n---\n目录态正文不进 prompt\n",
+        )
+        .unwrap();
+        let mut cfg = empty_stage_cfg(Stage::ArchitectDesign);
+        cfg.persona_path = Some("persona.md".into());
+        cfg.persona_append = Some("APPEND_MARKER_XYZ".into());
+        cfg.skills_json = Some(serde_json::json!(["skill-a"]));
+
+        let plan = assemble_ok(ctx(
+            &store,
+            &settings,
+            &task,
+            &project,
+            &cursor,
+            Some(&cfg),
+            AgentNodeKind::ValidateInput,
+        ))
+        .await;
+        let home_prefix = home.root().display().to_string();
+        let norm = |s: &str| s.replace(&home_prefix, "<HOME>");
+        insta::assert_snapshot!("assembled_system_prompt", norm(&plan.system));
+        insta::assert_snapshot!("assembled_user_prompt", norm(&plan.user));
     }
 }

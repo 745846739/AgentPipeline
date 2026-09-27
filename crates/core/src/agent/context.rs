@@ -31,9 +31,58 @@ pub const RUN_COMMAND_TAIL_LINES: usize = 100;
 /// L1：`list_dir` 最多列出的条目数。
 pub const LIST_DIR_MAX_ITEMS: usize = 200;
 
-/// 粗略 token 估算（4 字符 ≈ 1 token）。仅用于分层阈值判定，不用于计费。
+/// 粗略 token 估算——**加权启发式**（决策 309，票 foreman-burns-without-guard 01）。
+///
+/// 规则：**CJK 字符按 1 token 计，其余按 4 字符 ≈ 1 token**。
+///
+/// **为什么必须加权**（实测，2026-09-27）：旧口径 `chars ÷ 4` 对这个仓库的**中英混合日志**
+/// 低估 **≥ 5.5 倍**——第 94 轮真实输入 **561,210** 时估算只有 ≤ 102,400。后果不是「估算
+/// 不准」这么轻：轮内压缩的触发线是「估算是窗口的 80%」，而估算永远摸不到那条线，
+/// **95 轮一次都没触发**（全库 0 条「值班长轮内上下文超线」，而管道侧同款压缩有命中）。
+///
+/// **为什么不上 tokenizer**：全仓当前没有任何 tokenizer 依赖；vendor 是 `openai` 但 model 经
+/// 第三方代理，**词表未必相同**——引 `tiktoken` 可能把「已知偏低 5.5 倍」换成「不可见的
+/// 偏差」，后者更难查（哪个才对没有台账可对）。加权启发式的偏差方向与量级都是**可测**的，
+/// 而偏差可测才谈得上标定（见 [`TOKEN_ESTIMATE_TOLERANCE`] 与
+/// [`crate::pipeline::window_calibration`] 里那 95 条真实读数）。
+///
+/// **单点实现**：这一处同时供流水线 L3 压缩与值班长的轮内压缩用（决策 291「两端同源」），
+/// 所以改这里两侧一起变——这正是「同一批改动要同时跑两侧压缩测试」的由来。
+///
+/// 判 CJK 用码点区间而不是「非 ASCII」：日文假名、韩文谚语与中文一样是 1 token/字，
+/// 而带重音的拉丁字母（`é`）属于「其余」那一档。
 pub fn count_tokens(text: &str) -> usize {
-    text.chars().count().div_ceil(4)
+    let mut cjk = 0usize;
+    let mut other = 0usize;
+    for ch in text.chars() {
+        if is_cjk(ch) {
+            cjk += 1;
+        } else {
+            other += 1;
+        }
+    }
+    cjk + other.div_ceil(4)
+}
+
+/// 估算与真读数的允许区间（决策 309）：`估算 ÷ 真读数 ∈ [0.7, 1.5]`。
+///
+/// **故意不对称**：估算偏低会让触发线摸不到（这次的病），故下界卡得紧（7 折）；
+/// 估算偏高只会早一点压缩（代价是 prefix 缓存命中率），允许更松（1.5 倍）。
+pub const TOKEN_ESTIMATE_TOLERANCE: (f64, f64) = (0.7, 1.5);
+
+/// 这个码点算不算「一个字一个 token」的那一档：CJK 表意文字、假名、谚文、全角标点。
+fn is_cjk(ch: char) -> bool {
+    matches!(ch as u32,
+        0x3000..=0x303F        // CJK 标点（全角逗号句号、括号、顿号）
+        | 0x3040..=0x30FF      // 平假名 / 片假名
+        | 0x3400..=0x4DBF      // 扩展 A
+        | 0x4E00..=0x9FFF      // 基本区
+        | 0xAC00..=0xD7AF      // 谚文音节
+        | 0xF900..=0xFAFF      // 兼容表意文字
+        | 0xFF00..=0xFF60      // 全角 ASCII
+        | 0xFFE0..=0xFFE6      // 全角符号（¥ 那一档）
+        | 0x20000..=0x2FA1F    // 扩展 B 及以上
+    )
 }
 
 // ─────────────────────────────── L0 容量预估 ───────────────────────────────
@@ -472,6 +521,51 @@ mod tests {
 
     fn settings() -> Settings {
         Settings::default()
+    }
+
+    /// **加权估算**（决策 309，票 01）：中文一个字算一个 token，其余仍是四字符一个。
+    ///
+    /// 旧口径 `chars ÷ 4` 对中英混合日志低估 ≥ 5.5 倍——这一条把那 5.5 倍的来路钉在
+    /// 最小可复现的形状上：同一段中文，新口径的读数是旧口径的 **4 倍**。
+    #[test]
+    fn count_tokens_charges_one_token_per_cjk_character() {
+        let chinese = "值班长在执行体里挂住了四小时";
+        let chars = chinese.chars().count();
+        assert_eq!(chars, 14);
+        assert_eq!(count_tokens(chinese), chars, "中文：一字一 token");
+        // 旧口径（chars ÷ 4）在同一段上只报 4：一字一 token 与四字一 token 的差，
+        // 就是那 5.5 倍偏差的主体。
+        assert_eq!(chars.div_ceil(4), 4);
+        assert_eq!(count_tokens(chinese), 4 * chars.div_ceil(4) - 2);
+    }
+
+    /// 英文/ASCII 那一档**逐字沿用旧口径**（4 字符 ≈ 1 token）：加权只加在中文上。
+    #[test]
+    fn count_tokens_leaves_ascii_on_the_old_rule() {
+        for text in [
+            "hello world",
+            "{\"tool\":\"read_file\",\"arguments\":{\"path\":\"src/lib.rs\"}}",
+            "",
+            "a",
+            "abcd",
+            "abcde",
+        ] {
+            assert_eq!(
+                count_tokens(text),
+                text.chars().count().div_ceil(4),
+                "{text:?} 这一档不该变"
+            );
+        }
+    }
+
+    /// 混排：中英各算各的，再相加——不是一个整体比例。
+    #[test]
+    fn count_tokens_mixes_the_two_bands() {
+        // 3 个中文 + 6 个 ASCII（4 字符 ≈ 1 token ⇒ 6/4 上取整 = 2）
+        assert_eq!(count_tokens("值班长 hello"), 3 + 2);
+        // 日文假名与韩文谚文与中文同档（它们同样是「一字一 token」的语言）
+        assert_eq!(count_tokens("テスト"), 3);
+        assert_eq!(count_tokens("한국어"), 3);
     }
 
     #[test]

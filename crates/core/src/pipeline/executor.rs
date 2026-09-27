@@ -6,11 +6,13 @@
 //! 关键语义（出处见行内标注）：
 //! - **单执行者保证**（决策 36）：进程内注册表（`task_id` → 代次 + 取消观察点）
 //!   非阻塞去重 + DB `executor_owner` 乐观锁兜底跨进程；
-//! - **判超时先通知执行体收口**（决策 226）：超时是从台账**外面**判的，而执行体可能正
-//!   停在一个不返回的模型调用上——那种 run 的 `process_group_id` 是 NULL（只有
-//!   `run_command` 起过子进程才回填），`kill_process_group` 没有东西可杀。
-//!   [`request_cancel`] 是让 run **真的停下来**的那条线；缺了它，去重与
-//!   `executor_owner` 会被一个已判死的执行体占住，紧随其后的重试会被逐次拒掉；
+//! - **判超时先通知执行体收口，并在同一处放开执行权**（决策 226，**由决策 303 补后半句**）：
+//!   超时是从台账**外面**判的，而执行体可能正停在一个不返回的模型调用上——那种 run 的
+//!   `process_group_id` 是 NULL（只有 `run_command` 起过子进程才回填），
+//!   `kill_process_group` 没有东西可杀。[`request_cancel`] 是让 run **真的停下来**的那条线；
+//!   缺了它，去重与 `executor_owner` 会被一个已判死的执行体占住。而「协作收口」这个前提
+//!   在 2026-09-27 被证伪（执行体停在不返回的同步文件读里、到不了 await 点），故
+//!   [`release_ownership`] 由判终态的调度器**当场**放掉两半——不再等那个 future 回来；
 //! - **单游标失败不传播**（决策 89）：一条游标的节点失败只把该游标置 pending，
 //!   另一分支继续跑完本阶段后停在 join 边界；
 //! - **`waiting_join` 只由 `advance_cursor` 写入**（决策 107）；join 由
@@ -175,6 +177,48 @@ pub fn force_release(task_id: &str) -> bool {
     EXECUTOR_REGISTRY.lock().unwrap().remove(task_id).is_some()
 }
 
+/// **判 run 终态时放开执行权**（决策 303，显式修订决策 226 的一格）。
+///
+/// 决策 226 原来的口径是「判超时那条路**只发请求、不摘登记**」——它把「执行体会收口」
+/// 当成前提（协作式中止：执行体在下一个 await 点自己退出）。2026-09-27 的实测把这个前提
+/// 打掉了：执行体停在一次**同步文件读**里（`open()` 挂在完全磁盘访问的授权弹窗上），
+/// 既到不了 await 点、也返回不了。于是执行权的**两半同时被占死**：
+///
+/// - 进程内去重登记永远摘不掉 → `try_run` 逐个拒掉紧随其后的 resume；
+/// - `executor_owner` 只在 `run_inner` 返回后才清 → 乐观锁 `IS NULL` 恒为假。
+///
+/// 两半合起来 = 任务永久停住，只能重启应用或按 `unstick`——而那两件事本该是例外。
+/// 注意「执行权」在本仓就是这两半（[`try_acquire`] 与 `Store::try_claim_executor`），
+/// 只清一半等于没清：resume 会先被去重拒掉，压根走不到乐观锁那一问。
+///
+/// 动作与 [`force_release`]（`unstick` 用的那个）**同一套**：先 `request_cancel` 再摘登记，
+/// 随后清 owner；代价也同一份（那个仍卡着的旧执行体若哪天活过来，可能与新执行体同时写库
+/// ——决策 210⑧ 已记档，决策 226 用「先请求中止」把它收窄）。区别只在**触发者**：
+/// 这一处是「台账已经判它终态」，`unstick` 是「人按的」。
+///
+/// **与恢复序列（决策 127 / 212）不重复也不漏**——两者判据的**对象**不同，不是同一件事的两个写法：
+///
+/// - `run_recovery_sequence`（`foreman_actions.rs`）是**启动期的一次全表扫**，对象是「上一个
+///   进程留下的任何持有者」（`kill -9` 残留），副作用有三步（清 owner / `running` 归队 /
+///   项目级 run 标终态），它**不看 run 的终态**、也不认具体是哪个任务；
+/// - 本函数是**运行期针对某一个任务**的一格：触发者恰好是「这一行 run 刚被判终态」，对象是
+///   那个已被判死的执行体，副作用只有清执行权那一件（不归队、不收项目级 run）。
+///
+/// 因此不漏：启动扫不到「运行中才判死的持有者」（它只在启动那一刻跑一次），本函数补这一格；
+/// 也不重复：本函数不碰状态与游标（归队那步归恢复序列），单跑本函数不会把任务变成 `queued`。
+/// 运行期真正的重复风险是**本函数与 `unstick` 撞在同一任务上**，而两者都走
+/// [`force_release`] 的幂等路径（摘不到登记返回 `false`、`release_executor` 命中的是同一行
+/// 且置 `NULL`），重复调用没有第二种后果。
+///
+/// 返回值：进程内**当时确实有一个在跑的执行体**（与 [`request_cancel`] 同一个读数）。
+pub async fn release_ownership(store: &Store, task_id: &str) -> Result<bool> {
+    let had_executor = force_release(task_id);
+    // owner 此刻只可能是那个已判死的执行体：`try_claim_executor` 要求 `IS NULL`，
+    // 于是没有任何新执行体能在这一句之前抢进来（清完才可能被抢）。
+    store.release_executor(task_id).await?;
+    Ok(had_executor)
+}
+
 /// 请求中止 `task_id` 正在跑的执行体（决策 226），返回「当时确实有一个在跑」。
 ///
 /// 存在的理由是一条实测：2026-09-19 任务 `01M2QH0DHKGSGNVHC0WT2Q4CG0` 的
@@ -233,8 +277,9 @@ pub(crate) fn held_by_human(task_id: &str) -> bool {
 /// 两轮之间**，再取就取不到自己的观察点了——它那一次中止请求只对「当时已经停在 await 上」
 /// 的那一半有效（`notify_one` 已经把等待者唤醒）。两轮之间的那一半回到决策 210⑧ 记的老
 /// 样子（旧执行体可能继续跑到自己结束）。
-/// **判超时那条路不在此列**：它只发请求、不摘登记，故那个执行体在本轮的任何位置都看得见
-/// 自己那一格——而这正是 2026-09-19 那次僵死的形状。
+/// **判超时那条路自决策 303 起也摘登记**（原来只发请求）：它多担了上面这条代价，换来的是
+/// 「执行权不再依赖 `run_inner` 返回」——否则那个卡住的执行体永远锁着去重登记，任务只能靠
+/// 重启或 `unstick`，正是 2026-09-27 那次的形状（决策 226 原文的「只发请求」一句由 303 修订）。
 pub(crate) fn cancel_signal(task_id: &str) -> Option<CancelSignal> {
     EXECUTOR_REGISTRY
         .lock()
@@ -1700,6 +1745,7 @@ pub(crate) async fn pend_reason(
 ///
 /// 决策 249 · 票 03：出口留在留守核、**形状只此一处**——模型调用编排片经本函数发事件，
 /// 不自建事件面。
+#[allow(clippy::too_many_arguments)] // 事件出口那一族（详情两列 + 身份 + 相位都是这条 wire 的字段，收成结构体等于把 wire 形状抄第二遍）
 pub(crate) fn emit_tool_event(
     sse: &dyn SseSink,
     task: &Task,
@@ -1708,6 +1754,8 @@ pub(crate) fn emit_tool_event(
     tool: &str,
     phase: ToolPhase,
     args_summary: &str,
+    args: &str,
+    result: Option<&str>,
 ) {
     sse.emit(SseEvent::ToolEvent {
         task_id: task.id.clone(),
@@ -1719,6 +1767,13 @@ pub(crate) fn emit_tool_event(
         tool: tool.to_string(),
         phase,
         args_summary: args_summary.to_string(),
+        // 详情的 12k 上限在这一个出口里压（决策 301）：调用点只管把原文递进来，
+        // 截断写两处就会出现「界面一份、别处另一份」的无声缩水。
+        args: crate::pipeline::foreman::truncate_tool_result(args),
+        result: result.map(crate::pipeline::foreman::truncate_tool_result),
+        // 流水线节点不挂在途台账行（`ledger_id` / `seq` 是值班长在途轮的去重基准，票 02）。
+        ledger_id: None,
+        seq: None,
     });
 }
 

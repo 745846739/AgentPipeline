@@ -11,6 +11,7 @@ import type {
   ForemanSessionMeta,
   ForemanProposalResult,
   ForemanToolLabelList,
+  ForemanAttention,
   ForemanCommand,
   GlobalMetrics,
   NodeCommand,
@@ -746,28 +747,38 @@ export function pairedUrl(base: string, token: string): string {
  * 本会话台账（按 id 升序）。**这是对讲台唯一的权威状态入口**：界面重取它来对齐
  * 「值班经理说了什么 / 值班长回了什么 / 合计烧了多少 token」，不自己攒一份账。
  * 工头未接线时后端回 503，由 `request` 抛出 `ApiError`。
+ *
+ * `beforeId`（票 05，向上游标）：只取**更早的一段**（`id < beforeId`，段内升序，
+ * 到头回空）。不给 = 缺省最近 500 条，与从前逐字一致。
  */
 export function getForemanSession(
   sessionId?: string | null,
   signal?: AbortSignal,
   kind?: string,
+  beforeId?: number | null,
 ): Promise<ForemanSession> {
   // `?kind=`（决策 286 / 票 01）：不指定 id 时缺省落点按它取各自的「最近」。
   const params = new URLSearchParams();
   if (sessionId) params.set('session', sessionId);
   if (kind) params.set('kind', kind);
+  if (beforeId != null) params.set('before_id', String(beforeId));
   const q = params.size > 0 ? `?${params.toString()}` : '';
   return request<ForemanSession>(`/foreman/session${q}`, { signal });
 }
 
-/** 未归档的班次，按最近活动倒序（决策 204⑦）。 */
+/** 班次列表，按最近活动倒序（决策 204⑦）。`includeArchived`（票 06）：true 时含归档。 */
 export function getForemanSessions(
   signal?: AbortSignal,
   kind?: string,
+  includeArchived?: boolean,
 ): Promise<ForemanSessionList> {
   // `?kind=watch` 取值守台账的列表（决策 286 / 票 01）；缺省只回人的班次——
-  // 「对讲台的班次列表」与「值守的独立入口」是两个列表。
-  const q = kind ? `?kind=${encodeURIComponent(kind)}` : '';
+  // 「对讲台的班次列表」与「值守的独立入口」是两个列表。`?include_archived=true`
+  // 是「显示已归档」那颗开关的后端一半（票 06）；不给 = 现状，只列未归档。
+  const params = new URLSearchParams();
+  if (kind) params.set('kind', kind);
+  if (includeArchived) params.set('include_archived', 'true');
+  const q = params.size > 0 ? `?${params.toString()}` : '';
   return request<ForemanSessionList>(`/foreman/sessions${q}`, { signal });
 }
 
@@ -779,6 +790,16 @@ export function getForemanSessions(
  */
 export function getForemanToolLabels(signal?: AbortSignal): Promise<ForemanToolLabelList> {
   return request<ForemanToolLabelList>('/foreman/tools', { signal });
+}
+
+/**
+ * 未消费待办的只读计数（决策 307，票 06）。
+ *
+ * **只读**：不建行、不改行、不消费——消费归值守轮。页头那枚读数读它，
+ * 与 `turn_in_flight` 无关（值守轮排队时也要看得见，那正是它存在的理由）。
+ */
+export function getForemanAttention(signal?: AbortSignal): Promise<ForemanAttention> {
+  return request<ForemanAttention>('/foreman/attention', { signal });
 }
 
 /** 新开一个班次。标题留空 = 中性标题，第一句话说出来时按它命名（决策 204②）。 */

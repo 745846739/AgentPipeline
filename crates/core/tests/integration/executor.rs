@@ -457,6 +457,23 @@ async fn tool_events_are_emitted_around_real_tool_execution() {
         "参数摘要应含文件名：{:?}",
         starts.first()
     );
+    // 决策 301：详情原文与结果也随流水线的事件出去（摘要给收起行，详情给展开）。
+    assert!(
+        matches!(
+            starts.first(),
+            Some(SseEvent::ToolEvent { args, .. }) if args.contains("design.md")
+        ),
+        "完整参数原文应含文件名：{:?}",
+        starts.first()
+    );
+    assert!(
+        matches!(
+            ends.first(),
+            Some(SseEvent::ToolEvent { result: Some(r), .. }) if !r.is_empty()
+        ),
+        "end 事件要带非空结果：{:?}",
+        ends.first()
+    );
 }
 
 #[tokio::test]
@@ -740,6 +757,449 @@ impl LlmClient for StallingAgent {
             Ok(AgentResponse::default())
         })
     }
+}
+
+/// **永不返回**的替身（票 02 / 决策 303）：executor 的 future 停在这里，永远不回来。
+///
+/// 与 `StallingAgent` 的差别是**没有闸**——那个放闸后还会回来（协作式中止够得着），
+/// 而这条要造的是「协作式中止**够不着**」的形态：`run_inner` 无论等多久都不会返回，
+/// 于是执行权只能靠「判终态那一处当场放开」，不能靠它自己收口让出来。
+struct PendingAgent;
+
+impl LlmClient for PendingAgent {
+    fn complete(
+        &self,
+        _request: LlmRequest,
+    ) -> BoxFuture<'static, agentpipeline_core::Result<AgentResponse>> {
+        Box::pin(std::future::pending())
+    }
+}
+
+/// 等执行体真的起来：任务被持有执行权 + 落了一条 running run（票 02 的用例都要这个起点）。
+async fn wait_for_a_held_running_run(ctx: &Ctx, task_id: &str) -> i64 {
+    tokio::time::timeout(Duration::from_secs(30), async {
+        loop {
+            let owned = ctx
+                .store
+                .get_task(task_id)
+                .await
+                .unwrap()
+                .executor_owner
+                .is_some();
+            let run = ctx
+                .store
+                .active_runs()
+                .await
+                .unwrap()
+                .into_iter()
+                .find(|r| r.task_id.as_deref() == Some(task_id));
+            if owned {
+                if let Some(run) = run {
+                    return run.id;
+                }
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .expect("执行体应当起来：持有执行权 + 落一条 running run")
+}
+
+/// **票 02（决策 303，显式修订决策 226 的一格）**：run 被判终态的**同一处**放开执行权，
+/// 与那个 future 会不会返回**无关**——哪怕它永远不返回。
+///
+/// 这是 2026-09-27 那次的直接反面：执行体停在一次不返回的同步文件读里，看门狗把 run 判了
+/// timeout，而执行权的两半（进程内去重 + `executor_owner`）仍被它占着；03:49 的 resume 被
+/// 逐次拒掉，30 秒后放弃，任务僵死 2 小时 27 分。
+///
+/// 断言链：判终态 → `executor_owner` 为 NULL → 去重登记也放了（探法 = 另一个执行体抢得到）
+/// → 紧接着的 `try_run` **真的取得执行权**。
+#[tokio::test]
+async fn a_terminal_run_frees_its_ownership_even_when_the_future_never_returns() {
+    let ctx = setup("true", Settings::default()).await;
+    let llm: Arc<dyn LlmClient> = Arc::new(PendingAgent);
+    let stuck = Arc::new(Executor::new(
+        ctx.store.clone(),
+        Settings::default(),
+        Arc::new(ctx.sse.clone()),
+        llm,
+        Arc::new(ctx.killer.clone()),
+    ));
+
+    testkit::seed_task(&ctx.store, "t-stuck", "p1")
+        .await
+        .unwrap();
+    admit(&ctx, "t-stuck").await;
+    let hanging = {
+        let e = stuck.clone();
+        tokio::spawn(async move { e.run("t-stuck").await })
+    };
+    let run_id = wait_for_a_held_running_run(&ctx, "t-stuck").await;
+    assert!(
+        ctx.store
+            .get_task("t-stuck")
+            .await
+            .unwrap()
+            .executor_owner
+            .is_some(),
+        "前提：执行权已被那个卡住的执行体持有"
+    );
+
+    // 心跳在这段时间里一次都没刷新过 → 空闲超时判它终态（ManualClock 手动推进）。
+    ctx.clock.advance_secs(400);
+    let scheduler = KanbanScheduler::new(
+        ctx.store.clone(),
+        Settings::default(),
+        Arc::new(ctx.clock.clone()),
+        Arc::new(ctx.killer.clone()),
+        Arc::new(ctx.sse.clone()),
+        Arc::new(|_| {}),
+    );
+    let report = scheduler.tick().await.unwrap();
+    assert!(
+        report.timed_out_runs.contains(&run_id),
+        "看门狗要判它终态：{:?}",
+        report.timed_out_runs
+    );
+
+    // ① DB 那一半：乐观锁放开了（原来只有 `run_inner` 返回才清）。
+    assert!(
+        ctx.store
+            .get_task("t-stuck")
+            .await
+            .unwrap()
+            .executor_owner
+            .is_none(),
+        "判终态的同一处就要清 executor_owner，不等那个 future 回来"
+    );
+
+    // ② 去重那一半 + ③ 紧接着的 try_run 真的取得执行权：一个**新的**执行体（脚本为空，
+    //    跑完即退）必须抢得到——旧的那个还停在永不返回的 future 上，一个字都没收。
+    let fresh = Executor::new(
+        ctx.store.clone(),
+        Settings::default(),
+        Arc::new(ctx.sse.clone()),
+        Arc::new(FakeAgent::new(Script::new())),
+        Arc::new(ctx.killer.clone()),
+    );
+    assert!(
+        fresh.try_run("t-stuck").await.unwrap(),
+        "判终态之后，紧接着的 try_run 应当取得执行权（去重与乐观锁两半都要放开）"
+    );
+
+    // 收尾：那个永不返回的 future 还在跑，没人能叫它回来，abort 掉免得留到尾。
+    hanging.abort();
+}
+
+/// **主链集成验收（决策 302 / 305，票 08）**：卡住 → 自愈，**全程不重启**。
+///
+/// 这是 2026-09-27 那次故障的完整反面：03:30 卡住 → 03:49 续跑被挡满预算放弃 →
+/// 此后 2 小时 27 分零调度活动 → 只能重启。
+///
+/// 断言链（一条用例串完，免得三格各自为政）：
+/// 1. future 不返回、run 被判终态 → **执行权为 NULL**（票 02 那一层）；
+/// 2. **反向断言**：此刻启动期那条「清残留持有者」的路**无事可清**——自愈不靠重启；
+/// 3. 紧接着的 `try_run` 真的取得执行权并**落出新 run 行**（不是「取得执行权」这种半句话）；
+/// 4. 第三类判据认得出「游标 `pending` + run 已终态 + 执行权仍持有」，且 `unstick` 解得开。
+///
+/// **诚实标注**：测试里没有可阻塞的受保护路径，验的是**可观察契约**而不是真 TCC
+/// ——「future 不返回 + run 已判终态 → 执行权仍被清、下一次 `try_run` 仍能拿到」用
+/// `PendingAgent` + `Clock` 推进造出来。真授权那一层不进默认门。
+#[tokio::test]
+async fn the_stuck_to_self_healed_chain_needs_no_restart() {
+    use agentpipeline_core::pipeline::unstick::{stuck_evidence, unstick};
+
+    let ctx = setup("true", Settings::default()).await;
+    let llm: Arc<dyn LlmClient> = Arc::new(PendingAgent);
+    let stuck = Arc::new(Executor::new(
+        ctx.store.clone(),
+        Settings::default(),
+        Arc::new(ctx.sse.clone()),
+        llm,
+        Arc::new(ctx.killer.clone()),
+    ));
+    testkit::seed_task(&ctx.store, "t-chain", "p1")
+        .await
+        .unwrap();
+    admit(&ctx, "t-chain").await;
+    let hanging = {
+        let e = stuck.clone();
+        tokio::spawn(async move { e.run("t-chain").await })
+    };
+    let run_id = wait_for_a_held_running_run(&ctx, "t-chain").await;
+
+    // 心跳一次都没刷过 → 看门狗判它终态。
+    ctx.clock.advance_secs(400);
+    let scheduler = KanbanScheduler::new(
+        ctx.store.clone(),
+        Settings::default(),
+        Arc::new(ctx.clock.clone()),
+        Arc::new(ctx.killer.clone()),
+        Arc::new(ctx.sse.clone()),
+        Arc::new(|_| {}),
+    );
+    let report = scheduler.tick().await.unwrap();
+    assert!(
+        report.timed_out_runs.contains(&run_id),
+        "看门狗要判它终态：{:?}",
+        report.timed_out_runs
+    );
+
+    // ① 执行权为 NULL。
+    assert!(
+        ctx.store
+            .get_task("t-chain")
+            .await
+            .unwrap()
+            .executor_owner
+            .is_none(),
+        "判终态的同一处就要清 executor_owner"
+    );
+
+    // ② **反向断言**：不靠重启——启动期那条路（清全表持有者）此刻无事可清。
+    //    它的语义是「kill -9 残留」，而这里执行权是被**运行期**那一处放开的。
+    assert_eq!(
+        ctx.store.clear_executor_owners().await.unwrap(),
+        0,
+        "自愈不靠重启：没有残留持有者等着启动期去清"
+    );
+
+    // ③ **真的跑起来**：新执行体取得执行权并落出新 run 行。
+    let before = ctx.store.list_runs("t-chain").await.unwrap().len();
+    let fresh = Executor::new(
+        ctx.store.clone(),
+        Settings::default(),
+        Arc::new(ctx.sse.clone()),
+        Arc::new(FakeAgent::new(Script::new())),
+        Arc::new(ctx.killer.clone()),
+    );
+    assert!(
+        fresh.try_run("t-chain").await.unwrap(),
+        "判终态之后，紧接着的 try_run 应当取得执行权"
+    );
+    assert!(
+        ctx.store.list_runs("t-chain").await.unwrap().len() > before,
+        "「取得执行权」要落成一条真的 run 行，不是半句话"
+    );
+
+    // ④ 第三类判据 + unstick 解得开（另一条任务上单独构造那一格，免得与上面那条互相污染）。
+    testkit::seed_task(&ctx.store, "t-third", "p1")
+        .await
+        .unwrap();
+    admit(&ctx, "t-third").await;
+    ctx.store
+        .set_task_status("t-third", TaskStatus::Running)
+        .await
+        .unwrap();
+    assert!(ctx
+        .store
+        .try_claim_executor("t-third", "executor:dead")
+        .await
+        .unwrap());
+    let cursor3 = ctx.store.load_live_cursors("t-third").await.unwrap()[0].clone();
+    let dead = ctx
+        .store
+        .insert_run(&agentpipeline_core::storage::observability::NewRun {
+            task_id: "t-third".into(),
+            cursor_id: cursor3.cursor_id.clone(),
+            stage: cursor3.stage,
+            node: cursor3.node,
+            attempt: 3,
+            agent_type: "main".into(),
+            parent_run_id: None,
+            prompt_template_hash: None,
+            process_group_id: None,
+        })
+        .await
+        .unwrap();
+    ctx.store
+        .finish_run(
+            dead,
+            &agentpipeline_core::storage::observability::RunOutcome {
+                status: Some(NodeStatus::Timeout),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+    let finished =
+        agentpipeline_core::clock::Clock::now(&ctx.clock) - chrono::Duration::minutes(30);
+    sqlx::query("UPDATE kanban_node_runs SET finished_at = ? WHERE id = ?")
+        .bind(agentpipeline_core::storage::ts(finished))
+        .bind(dead)
+        .execute(ctx.store.pool())
+        .await
+        .unwrap();
+    ctx.store
+        .set_cursor_pending(
+            &cursor3.cursor_id,
+            &agentpipeline_core::types::PendingReason::new(
+                PendingKind::Timeout,
+                cursor3.stage,
+                cursor3.node,
+                "执行超时（attempt 3）",
+            ),
+        )
+        .await
+        .unwrap();
+    ctx.store.sync_task_projection("t-third").await.unwrap();
+
+    let task3 = ctx.store.get_task("t-third").await.unwrap();
+    let evidence = stuck_evidence(
+        &ctx.store,
+        &task3,
+        agentpipeline_core::clock::Clock::now(&ctx.clock),
+        chrono::Duration::minutes(10),
+    )
+    .await
+    .unwrap()
+    .expect("第三类判据必须认得出这一格（游标 pending + run 已终态 + 执行权仍持有）");
+    assert_eq!(evidence.detail["shape"], "terminal_run");
+
+    let unstuck = unstick(
+        &ctx.store,
+        &agentpipeline_core::pipeline::executor::force_release,
+        "t-third",
+        agentpipeline_core::clock::Clock::now(&ctx.clock),
+        chrono::Duration::minutes(10),
+    )
+    .await
+    .expect("unstick 要解得开它");
+    assert_eq!(
+        unstuck.kind,
+        agentpipeline_core::storage::AttentionKind::OwnerStuck
+    );
+    assert!(
+        ctx.store
+            .get_task("t-third")
+            .await
+            .unwrap()
+            .executor_owner
+            .is_none(),
+        "解得开 = 执行权被清掉"
+    );
+    hanging.abort();
+}
+
+/// **反向断言（票 02）**：健康在跑的任务（owner 持有、心跳新鲜、未超阈值）**不被这条链误伤**。
+///
+/// 这正是 `unstick` 文件头写的那句警告——把「有健康执行体在跑」判成卡住会**清掉健康占用**，
+/// 于是同一任务被两个执行体同时写库。所以 `release_ownership` 只挂在判终态那一处，
+/// 而不是挂在「有主」或「跑得久」上。
+#[tokio::test]
+async fn a_healthy_running_executor_keeps_its_ownership_across_a_tick() {
+    let ctx = setup("true", Settings::default()).await;
+    let llm: Arc<dyn LlmClient> = Arc::new(PendingAgent);
+    let running = Arc::new(Executor::new(
+        ctx.store.clone(),
+        Settings::default(),
+        Arc::new(ctx.sse.clone()),
+        llm,
+        Arc::new(ctx.killer.clone()),
+    ));
+
+    testkit::seed_task(&ctx.store, "t-ok", "p1").await.unwrap();
+    admit(&ctx, "t-ok").await;
+    let inflight = {
+        let e = running.clone();
+        tokio::spawn(async move { e.run("t-ok").await })
+    };
+    wait_for_a_held_running_run(&ctx, "t-ok").await;
+
+    // 一次 tick：心跳是新鲜的（时钟没推），它不该被扫成超时。
+    let scheduler = KanbanScheduler::new(
+        ctx.store.clone(),
+        Settings::default(),
+        Arc::new(ctx.clock.clone()),
+        Arc::new(ctx.killer.clone()),
+        Arc::new(ctx.sse.clone()),
+        Arc::new(|_| {}),
+    );
+    let report = scheduler.tick().await.unwrap();
+    assert!(report.timed_out_runs.is_empty(), "健康在跑的 run 不判超时");
+
+    let owner = ctx.store.get_task("t-ok").await.unwrap().executor_owner;
+    assert!(
+        owner.is_some(),
+        "健康在跑的任务：执行权一个字都不许动（owner = {owner:?}）"
+    );
+    // 去重那一半同样没动：另一个执行体抢不到。
+    let fresh = Executor::new(
+        ctx.store.clone(),
+        Settings::default(),
+        Arc::new(ctx.sse.clone()),
+        Arc::new(FakeAgent::new(Script::new())),
+        Arc::new(ctx.killer.clone()),
+    );
+    assert!(
+        !fresh.try_run("t-ok").await.unwrap(),
+        "健康在跑时 try_run 必须被进程内去重拒掉"
+    );
+
+    inflight.abort();
+}
+
+/// **票 02 的「与启动恢复不重复也不漏」**：判终态那一处只放开执行权、不替恢复序列干活；
+/// 而恢复序列够不着「启动之后才出现的持有者」——两条路各管一格，谁也替代不了谁。
+///
+/// 判据的**对象**不同才是它们不重复的根据：恢复序列（决策 127 / 212）是启动期的一次
+/// **全表扫**，对象是「上一个进程留下的任何持有者」；这一处是运行期针对**某一个刚被判终态的
+/// 任务**。全表扫只在启动那一刻跑一次，所以运行期新出现的持有者它**永远看不到**——那正是
+/// 2026-09-27 那次的形状（持有者产生于运行期，重启才被清掉）。
+#[tokio::test]
+async fn releasing_at_run_terminal_and_the_startup_recovery_cover_different_ground() {
+    let ctx = setup("true", Settings::default()).await;
+    testkit::seed_task(&ctx.store, "t-x", "p1").await.unwrap();
+
+    // ① 启动那一刻：全表扫一次，此时无人持有。
+    let at_boot = agentpipeline_core::pipeline::foreman_actions::run_recovery_sequence(&ctx.store)
+        .await
+        .unwrap();
+    assert_eq!(at_boot.cleared, 0, "启动时没有任何持有者");
+
+    // ② 启动**之后**才出现的持有者：恢复序列已经跑过了，它看不到这一格。
+    ctx.store
+        .set_task_status("t-x", TaskStatus::Running)
+        .await
+        .unwrap();
+    assert!(
+        ctx.store
+            .try_claim_executor("t-x", "owner-x")
+            .await
+            .unwrap(),
+        "前提：乐观锁拿得到（此刻无人持有）"
+    );
+
+    // 判终态那一处放开它（本用例不起执行体，只验 DB 那一半）。
+    let had = agentpipeline_core::pipeline::executor::release_ownership(&ctx.store, "t-x")
+        .await
+        .unwrap();
+    assert!(!had, "进程内没有这一号登记：本用例只验 DB 那一半");
+    assert!(
+        ctx.store
+            .get_task("t-x")
+            .await
+            .unwrap()
+            .executor_owner
+            .is_none(),
+        "运行期这一处要清得掉恢复序列够不着的那个持有者"
+    );
+    assert_eq!(
+        ctx.store.get_task("t-x").await.unwrap().status,
+        TaskStatus::Running,
+        "它不越权替恢复序列归队：状态一个字不动"
+    );
+
+    // ③ 再跑一次恢复序列：不重复清，但归队仍是它的活（运行期那一处没做、也不该做）。
+    let after = agentpipeline_core::pipeline::foreman_actions::run_recovery_sequence(&ctx.store)
+        .await
+        .unwrap();
+    assert_eq!(after.cleared, 0, "持有者已被运行期那一处清掉，不重复清");
+    assert!(
+        after.requeued.contains(&"t-x".to_string()),
+        "归队归恢复序列管（运行期那一处只放执行权）：{:?}",
+        after.requeued
+    );
 }
 
 /// 被判超时的 run 必须**真的停下来**（决策 226）。
@@ -1049,6 +1509,108 @@ async fn a_context_window_failure_compacts_and_retries_that_one_call() {
 
 // ─────────── 失败重试按错误类别分流（决策 298，收窄决策 278 的适用边界）───────────
 
+/// 造一个「provider 行写着 128,000」的现场——**事故当时那一行的值**（决策 309 的实测底稿：
+/// 561,210 的输入照样 `ok`，而那一行写着 128,000）。
+///
+/// 后面两条用例共用它：一条钉「撞墙把它抬起来」，一条钉「别的错误动不了它」。
+async fn setup_with_misconfigured_window() -> Ctx {
+    use agentpipeline_core::types::{Provider, StageConfig};
+
+    let ctx = setup("true", Settings::default()).await;
+    ctx.store
+        .upsert_provider(&Provider {
+            id: "prov-ctx".into(),
+            vendor: "deepseek".into(),
+            model: "deepseek-chat".into(),
+            context_window: 128_000,
+            base_url: None,
+            api_key: None,
+            enabled: true,
+            created_at: ctx.store.now(),
+            updated_at: ctx.store.now(),
+        })
+        .await
+        .unwrap();
+    // 显式把这一阶段指到那一行：校准「改哪一行」必须与算出触发线的那一行同一行
+    // （`resolve_provider_id` 四级里的第三级）。
+    ctx.store
+        .upsert_stage_config(&StageConfig {
+            stage: "architect-design".into(),
+            provider_id: Some("prov-ctx".into()),
+            updated_at: ctx.store.now(),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+    ctx
+}
+
+/// 撞墙自校准（决策 309 / 票 01）：上下文超长那一类**会把 provider 行的窗口上调**——
+/// 那次报错就是「这一行的窗口值低估了」的书面证据。
+#[tokio::test]
+async fn a_context_window_failure_raises_the_provider_row() {
+    use agentpipeline_core::pipeline::window_calibration::PROVIDER_WINDOW_LOWER_BOUND;
+
+    let ctx = setup_with_misconfigured_window().await;
+    let mut script = Script::new();
+    script
+        .for_node(Stage::ArchitectDesign, Node::ValidateInput)
+        .fail_llm(
+            "llm_context_window",
+            LlmErrorKind::ContextWindow.advice(),
+            "HTTP 400：This model's maximum context length is 8192 tokens",
+        );
+    ctx.agent.set_script(script);
+    testkit::seed_task(&ctx.store, "t-wall", "p1")
+        .await
+        .unwrap();
+    admit(&ctx, "t-wall").await;
+    ctx.executor.run("t-wall").await.unwrap();
+
+    let row = ctx
+        .store
+        .get_provider("prov-ctx")
+        .await
+        .unwrap()
+        .expect("provider 行还在");
+    assert_eq!(
+        row.context_window as usize, PROVIDER_WINDOW_LOWER_BOUND,
+        "撞墙之后抬到**实测下界**（本机已被证明装得下的规模），不再是那行偏低的配置值"
+    );
+}
+
+/// 反向断言（同票）：传输类**一个字节都不改** provider 行——判据就是 `is_context_window`，
+/// 那几类到不了校准那个分支。
+#[tokio::test]
+async fn a_transport_failure_leaves_the_provider_row_untouched() {
+    let ctx = setup_with_misconfigured_window().await;
+    let mut script = Script::new();
+    script
+        .for_node(Stage::ArchitectDesign, Node::ValidateInput)
+        .fail_llm(
+            "llm_network",
+            LlmErrorKind::Network.advice(),
+            "HTTP 请求失败：connect: connection refused",
+        );
+    ctx.agent.set_script(script);
+    testkit::seed_task(&ctx.store, "t-nowall", "p1")
+        .await
+        .unwrap();
+    admit(&ctx, "t-nowall").await;
+    ctx.executor.run("t-nowall").await.unwrap();
+
+    let row = ctx
+        .store
+        .get_provider("prov-ctx")
+        .await
+        .unwrap()
+        .expect("provider 行还在");
+    assert_eq!(
+        row.context_window, 128_000,
+        "连不上与窗口值无关：这一行必须原样（改它就等于把「机器忙」记成「窗口更大」）"
+    );
+}
+
 /// 传输类失败（连不上）：**重试，但不追加错误 turn**——请求根本没送到模型，转录末尾是
 /// 上一次成功的完好回合，`retry_prompt` 那句「上一轮的输出未按输出契约提交、已判废」
 /// 对它是假话，括号里那句（「请检查 base_url…」）还是写给人看的运维指引。
@@ -1206,6 +1768,87 @@ async fn a_config_failure_fails_fast_without_burning_retries() {
             .is_some_and(|d| d.contains("Incorrect API key"))),
         "原始诊断照旧进 context（可搜）：{:?}",
         reason.context
+    );
+}
+
+/// 组装层的**配置类**失败（票 05 那条反向断言的落点）：节点**转 pending**，
+/// 且**不产生超时记账**。
+///
+/// 缺完全磁盘访问那条快速失败就是这个类：`assemble` 在任何模型调用之前返回
+/// `Error::Config`（判词与「改了设置也要重启」那一句由
+/// `model_request::tests::a_denied_disk_access_snapshot_fails_fast_with_the_next_step` 钉住）。
+/// 它到不了模型调用，故「一次调用都没发」与「一条 `timeout` 的 run 行都没有」说的是同一件事
+/// ——这正是票面那条反向断言要的形态。
+///
+/// **为什么不用真缺授权在这里端到端跑一遍**：那条路还要项目根落在真实 `$HOME/Documents`
+/// 下，而用例的仓库建在临时目录里（家目录隔离是决策 143 的另一半）；为了造这个现场去写
+/// 开发机真实的 `~/Documents` 是拿环境换覆盖。故这里用同一类错误的**另一个来源**——
+/// provider 行没登记 `context_window`（决策 110），它在组装期同步返回同一个 `Error::Config`。
+#[tokio::test]
+async fn an_assembly_config_failure_pends_without_any_timeout_accounting() {
+    use agentpipeline_core::types::{Provider, StageConfig};
+
+    let ctx = setup("true", Settings::default()).await;
+    // 未登记窗口（0）⇒ 组装期 `Error::Config`（决策 110：显式失败，不静默取默认）
+    ctx.store
+        .upsert_provider(&Provider {
+            id: "prov-unset".into(),
+            vendor: "deepseek".into(),
+            model: "deepseek-chat".into(),
+            context_window: 0,
+            base_url: None,
+            api_key: None,
+            enabled: true,
+            created_at: ctx.store.now(),
+            updated_at: ctx.store.now(),
+        })
+        .await
+        .unwrap();
+    ctx.store
+        .upsert_stage_config(&StageConfig {
+            stage: "architect-design".into(),
+            provider_id: Some("prov-unset".into()),
+            updated_at: ctx.store.now(),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+    ctx.agent.set_script(Script::new());
+
+    testkit::seed_task(&ctx.store, "t-cfg", "p1").await.unwrap();
+    admit(&ctx, "t-cfg").await;
+    ctx.executor.run("t-cfg").await.unwrap();
+
+    assert_eq!(
+        ctx.agent
+            .calls_for(Stage::ArchitectDesign, Node::ValidateInput),
+        0,
+        "组装期的失败在模型调用之前：一次调用都不该发出去"
+    );
+    let runs = ctx
+        .store
+        .list_runs_at("t-cfg", Stage::ArchitectDesign, Node::ValidateInput)
+        .await
+        .unwrap();
+    assert!(
+        runs.iter().all(|r| r.status != NodeStatus::Timeout),
+        "不产生超时记账：{:?}",
+        runs.iter().map(|r| r.status).collect::<Vec<_>>()
+    );
+    let cursor = ctx
+        .store
+        .load_live_cursors("t-cfg")
+        .await
+        .unwrap()
+        .into_iter()
+        .next()
+        .expect("游标还在（挂着等处置）");
+    let reason = cursor.pending_reason.as_ref().expect("应当挂了 pending");
+    assert_eq!(reason.kind, PendingKind::RetryExhausted);
+    assert!(
+        reason.message.contains("context_window"),
+        "台账里读得出下一步做什么：{}",
+        reason.message
     );
 }
 
@@ -3157,11 +3800,10 @@ async fn tool_failure_within_budget_does_not_retry_the_node() {
         .unwrap();
     assert_eq!(runs.len(), 1, "单次工具失败不触发节点重试（G13）");
     assert_eq!(runs[0].status, NodeStatus::Success);
-    // 失败以 tool_event error 形态外发（决策 123）
-    let errors = ctx
-        .sse
-        .events()
-        .into_iter()
+    // 失败以 tool_event error 形态外发（决策 123），且错误文本进 `result`（决策 301）
+    let events = ctx.sse.events();
+    let error_events: Vec<&SseEvent> = events
+        .iter()
         .filter(|e| {
             matches!(
                 e,
@@ -3169,8 +3811,16 @@ async fn tool_failure_within_budget_does_not_retry_the_node() {
                     if tool == "write_file"
             )
         })
-        .count();
-    assert_eq!(errors, 1, "工具失败应发 error 事件");
+        .collect();
+    assert_eq!(error_events.len(), 1, "工具失败应发 error 事件");
+    assert!(
+        matches!(
+            error_events.first(),
+            Some(SseEvent::ToolEvent { result: Some(r), .. }) if r.contains("工具执行失败")
+        ),
+        "错误文本进 result：{:?}",
+        error_events.first()
+    );
     assert!(ctx.sse.count_of(SseEventType::ToolEvent) >= 2);
 }
 
@@ -4898,7 +5548,7 @@ async fn unsticking_releases_the_in_process_dedup_and_allows_a_rerun() {
     )
     .await
     .unwrap();
-    assert!(unstuck.run_id > 0);
+    assert!(unstuck.run_id.unwrap() > 0);
     assert!(
         ctx.store
             .get_task("t-hang")
@@ -5009,5 +5659,149 @@ async fn a_healthy_running_task_cannot_be_unstuck() {
             .as_deref(),
         Some("executor:live"),
         "占用没被动过"
+    );
+}
+
+/// **决策 305（票 04）的第三类真的解得开**：游标 `pending` + run 已终态 + 执行权仍持有
+/// → `unstick` 清执行权 + 游标留 pending（可 resume）+ **后续 resume 真的跑起来**。
+///
+/// 「认出来」与「解得开」是同一份判据的两端：这一条把第二端钉住——否则会出现
+/// 「它说卡了、我却解不开」（`unstick` 文件头那句警告）。
+#[tokio::test]
+async fn unsticking_the_pending_cursor_shape_frees_the_owner_and_resume_runs() {
+    use agentpipeline_core::pipeline::unstick::unstick;
+
+    let ctx = setup("true", Settings::default()).await;
+    testkit::seed_task(&ctx.store, "t3", "p1").await.unwrap();
+    admit(&ctx, "t3").await;
+    ctx.store
+        .set_task_status("t3", TaskStatus::Running)
+        .await
+        .unwrap();
+    assert!(ctx
+        .store
+        .try_claim_executor("t3", "executor:dead")
+        .await
+        .unwrap());
+    let cursor = ctx.store.load_live_cursors("t3").await.unwrap()[0].clone();
+
+    // 30 分钟前就终态的 run（远过 unstick 的 10 分钟宽限）+ 游标已挂 pending。
+    let run_id = ctx
+        .store
+        .insert_run(&agentpipeline_core::storage::observability::NewRun {
+            task_id: "t3".into(),
+            cursor_id: cursor.cursor_id.clone(),
+            stage: cursor.stage,
+            node: cursor.node,
+            attempt: 3,
+            agent_type: "main".into(),
+            parent_run_id: None,
+            prompt_template_hash: None,
+            process_group_id: None,
+        })
+        .await
+        .unwrap();
+    ctx.store
+        .finish_run(
+            run_id,
+            &agentpipeline_core::storage::observability::RunOutcome {
+                status: Some(NodeStatus::Timeout),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+    let finished =
+        agentpipeline_core::clock::Clock::now(&ctx.clock) - chrono::Duration::minutes(30);
+    sqlx::query("UPDATE kanban_node_runs SET finished_at = ? WHERE id = ?")
+        .bind(agentpipeline_core::storage::ts(finished))
+        .bind(run_id)
+        .execute(ctx.store.pool())
+        .await
+        .unwrap();
+    let reason = agentpipeline_core::types::PendingReason::new(
+        PendingKind::Timeout,
+        cursor.stage,
+        cursor.node,
+        "执行超时（attempt 3）",
+    );
+    ctx.store
+        .set_cursor_pending(&cursor.cursor_id, &reason)
+        .await
+        .unwrap();
+    ctx.store.sync_task_projection("t3").await.unwrap();
+
+    // 前提：旧判据解不开这一格（游标 pending，`is_runnable` 为假）。
+    assert_eq!(
+        ctx.store
+            .get_cursor(&cursor.cursor_id)
+            .await
+            .unwrap()
+            .status,
+        CursorStatus::Pending,
+        "前提：游标已挂 pending——正是旧两条判据都够不着的那一格"
+    );
+
+    let unstuck = unstick(
+        &ctx.store,
+        &agentpipeline_core::pipeline::executor::force_release,
+        "t3",
+        agentpipeline_core::clock::Clock::now(&ctx.clock),
+        chrono::Duration::minutes(10),
+    )
+    .await
+    .expect("第三类必须解得开");
+    assert_eq!(
+        unstuck.kind,
+        agentpipeline_core::storage::AttentionKind::OwnerStuck
+    );
+    assert!(
+        unstuck.finished_runs.is_empty(),
+        "run 早已终态，没有要再标终态的东西"
+    );
+    assert!(
+        ctx.store
+            .get_task("t3")
+            .await
+            .unwrap()
+            .executor_owner
+            .is_none(),
+        "执行权要清掉"
+    );
+    assert_eq!(
+        ctx.store
+            .get_cursor(&cursor.cursor_id)
+            .await
+            .unwrap()
+            .status,
+        CursorStatus::Pending,
+        "解完仍是 pending（等人 resume）——unstick 不替人拍板"
+    );
+
+    // 后续 resume 真的跑起来：清 pending → 一个干净执行体取得执行权并落下新 run 行。
+    let before = ctx.store.list_runs("t3").await.unwrap().len();
+    agentpipeline_core::pipeline::resume::apply_action(
+        &ctx.store,
+        &ctx.store.get_cursor(&cursor.cursor_id).await.unwrap(),
+        ResumeAction::Continue,
+        None,
+        None,
+    )
+    .await
+    .unwrap();
+    let fresh = Executor::new(
+        ctx.store.clone(),
+        Settings::default(),
+        Arc::new(ctx.sse.clone()),
+        Arc::new(FakeAgent::new(Script::new())),
+        Arc::new(ctx.killer.clone()),
+    );
+    assert!(
+        fresh.try_run("t3").await.unwrap(),
+        "unstick 之后新执行体应当取得执行权"
+    );
+    assert!(
+        ctx.store.list_runs("t3").await.unwrap().len() > before,
+        "resume 之后真的重跑了"
     );
 }

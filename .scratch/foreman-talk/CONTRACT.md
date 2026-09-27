@@ -48,14 +48,31 @@ CREATE INDEX IF NOT EXISTS idx_foreman_messages_id ON kanban_foreman_messages(id
 #[derive(Debug, Clone, PartialEq)]
 pub struct ForemanMessage {
     pub id: i64,
+    pub session_id: String,         // 会话隔离的必填入口参数（决策 204）
     pub role: String,               // "user" | "assistant"
     pub content: String,
     pub prompt_tokens: u32,
     pub completion_tokens: u32,
     pub briefing_json: Option<serde_json::Value>,
     pub traces_json: Option<serde_json::Value>,
-    pub created_at: chrono::DateTime<chrono::Utc>,
+    pub status: Option<String>,     // null=收口行 | "in_flight"=半截行 | "interrupted"（迁移 0036，票 01/03）
+    pub seq: i64,                   // 行内位置序号：只对在途行有意义，存量行与收口行恒 0（票 02）
+    pub interrupted_at: Option<chrono::DateTime<Utc>>, // 仅 status="interrupted" 行（票 03）
+    pub created_at: chrono::DateTime<Utc>,
 }
+
+/// 在途行的节流刷写载荷（票 01/02）：整体写、不增量拼；`seq` 只记**已进现场**的位置
+/// （广播了但还没落库的坐标不计，否则快照会声称覆盖了它其实没有的字）。
+pub struct InFlightPatch {
+    pub content: String,
+    pub thinking: Option<String>,
+    pub segments_json: Option<serde_json::Value>,
+    pub traces_json: Option<serde_json::Value>,
+    pub prompt_tokens: u32,
+    pub completion_tokens: u32,
+    pub seq: u64,
+}
+
 
 #[derive(Debug, Clone)]
 pub struct NewForemanMessage {
@@ -69,12 +86,29 @@ pub struct NewForemanMessage {
 
 impl Store {
     pub async fn append_foreman_message(&self, msg: NewForemanMessage) -> Result<i64>;
+    /// 在途半截行的四个动作（票 01）：建（`status='in_flight'`）/ 节流刷（谓词只认在途行，
+    /// 迟到的刷写改不动终态）/ 收口（同一行写成完整行、`status→NULL`）/ 丢弃（失败轮不落行）。
+    pub async fn begin_foreman_inflight(&self, session_id: &str,
+        briefing_json: Option<serde_json::Value>) -> Result<i64>;
+    pub async fn update_foreman_inflight(&self, row_id: i64, patch: &InFlightPatch) -> Result<()>;
+    /// 收口：同一行写成完整行、`status→NULL`，并把这一轮**已进现场**的位置写进 `seq`
+    /// （前端拼接的 `seq0`）。失败 / 静默的轮走 `discard`，不落行。
+    pub async fn close_foreman_inflight(&self, row_id: i64, msg: NewForemanMessage,
+        seq: u64) -> Result<i64>;
+    pub async fn discard_foreman_inflight(&self, row_id: i64) -> Result<()>;
+    /// 启动恢复（票 03）：把没有活跃轮对应的悬挂在途行标成 `interrupted` + 中断时刻
+    /// ——与 `orphan_inflight_model_requests` 同姿势，排在 READY 之前。返回标了几行。
+    pub async fn mark_orphan_foreman_inflights(&self) -> Result<u64>;
     /// 最近 `limit` 条，按 id **升序**返回（时间线顺序）。`limit = 0` → 空表。
-    pub async fn list_foreman_messages(&self, limit: usize) -> Result<Vec<ForemanMessage>>;
+    /// `before_id`（票 05）：给了就只取**更早的一段**（`id < before_id` 里最新 `limit` 条），
+    /// 到头返回空表——500 条缺省语义一个字不变（显式修订读接口「不分页」立场）。
+    pub async fn list_foreman_messages(&self, session_id: &str, limit: usize,
+        before_id: Option<i64>) -> Result<Vec<ForemanMessage>>;
     /// 本会话合计 `(total_tokens, total_calls)`；calls = assistant 行数。
     pub async fn foreman_session_totals(&self) -> Result<(u64, u64)>;
-    /// 保留期清理（与 `conversation_retention_days` 同口径，票 05）。返回删除行数。
-    pub async fn purge_foreman_messages(&self, cutoff: chrono::DateTime<chrono::Utc>) -> Result<usize>;
+    // 对话消息**没有**保留期清理（票 04，显式修订 182④「同一把保留期尺」与 204⑦
+    // 「归档不保护消息」）：`purge_foreman_messages` 已删除，消息表永久保留；
+    // 维护作业里提议 / 待办 / 终态会话 / worktree 照旧吃同一个 cutoff。
 }
 ```
 
@@ -120,10 +154,25 @@ pub struct ForemanTurn {
 pub struct ForemanRunner { /* store, settings, home, llm */ }
 impl ForemanRunner {
     pub fn new(store: Store, settings: Settings, home: Home, llm: Arc<dyn LlmClient>) -> Self;
-    /// 一次回话：写 user 行 → 循环（LLM → 只读工具）→ 写 assistant 行。
+    /// 一次回话：写 user 行 + **建在途 assistant 行** → 循环（每步**边广播边落库**）→ **收口**。
     pub async fn say(&self, user_text: &str) -> Result<ForemanTurn>;
 }
 ```
+
+**一轮的写入顺序**（`.scratch/talk-replay` 票 01，**显式修订**「回话落库才算数」的旧口径）：
+
+1. `say` 写 user 行（不变）；`respond` 这个唯一漏斗登记「有一轮在跑」（决策 260 不变）；
+2. 历史读完、请求组装完之后**建在途 assistant 行**（`status = 'in_flight'`，`content` 空）——
+   这一轮的历史因此一个字不变（在途行不进上下文）；
+3. 循环里每次模型调用的边界（段序 / 痕迹 / 推理 / token）与流式途中（逐字正文、推理
+   增量，随 `conversation_delta` 广播、**250ms 一拍**节流）刷进这一行；
+4. **收口**：同一行写成完整行（`status → NULL`）——台账终是「一次回话 = user 行 +
+   assistant 行」两行，与从前逐字一致；失败 / 静默的轮**丢弃**这行（今天它们库里本来
+   就没有回话行，失败账由 `system` 行承载，决策 211④ 不变）。
+
+读侧配套：`GET /foreman/session` 的 `messages` 在飞时含半截行（`status` 字段随之下发）；
+喂给模型的历史、跨时间线摘要与归因回看都**滤掉在途行**。`turn_in_flight` 仍是进程内
+登记的直接读数（spec 决策 7：它答「此刻有没有轮在跑」，台账答「此前发生了什么」）。
 
 `say()` 的 LLM 请求固定填：`stage = Stage::Init`（占位，让既有解析链跑通）、
 `node = Node::Execute`、`attempt = 1`、`provider_id` 由 `FOREMAN_STAGE_KEY` 读到的
@@ -173,12 +222,14 @@ impl SseEvent {
 
 | 方法 | 路径 | 说明 |
 |---|---|---|
-| GET | `/foreman/session` | `{ messages: ForemanMessageWire[], total_tokens, total_calls }` |
+| GET | `/foreman/session` | 查询 `?session=<id>&kind=<talk\|watch>&before_id=<id>`（票 05：`before_id` = 向上游标，只取更早一段；缺省仍是最近 500 条）→ `{ messages: ForemanMessageWire[], total_tokens, total_calls }`；`messages` 在飞时含半截行 |
+| GET | `/foreman/sessions` | 查询 `?kind=<talk\|watch>&include_archived=<bool>`（票 06：`include_archived` 打开时归档班次也在列；缺省与从前逐字一致） |
 | POST | `/foreman/messages` | 体 `{ text }` → `{ message, total_tokens, total_calls }`；LLM 失败 → 错误状态 + `{error}`，**user 行已落库** |
-| GET | `/foreman/stream` | SSE，只转发 `event.is_foreman_event()` 的事件；复用同一 `SseBus` |
+| GET | `/foreman/stream` | SSE，只转发 `event.is_foreman_event()` 的事件；复用同一 `SseBus`（在途事件带 `ledger_id` / `seq`，票 02） |
 
 `ForemanMessageWire`：`{ id, role, content, prompt_tokens, completion_tokens,
-briefing, traces, created_at }`（`briefing`/`traces` 可为 null）。
+briefing, traces, status, seq, interrupted_at, created_at }`（`briefing`/`traces`/
+`status`/`interrupted_at` 可为 null；`seq` 只对在途行有意义，其余为 0）。
 
 `AppState` 新增：
 

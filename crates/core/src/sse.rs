@@ -131,6 +131,14 @@ pub enum SseEvent {
         text: String,
         prompt_tokens: u32,
         completion_tokens: u32,
+        /// 所属的**在途台账行**（票 02）。`None` = 这个增量不挂在任何在途行上
+        /// （流水线节点 / 老后端），前端按既有路径接。
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        ledger_id: Option<i64>,
+        /// 该行内的**位置序号**（票 02）：前端取快照记 `seq0`，只接 `seq > seq0` 的增量
+        /// ——**只做去重，不做回放**（没有到过的字靠下一次快照读回，决策 275 不变）。
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        seq: Option<u64>,
     },
     /// 决策 207：值班长提议的生命周期事件（到达 / 执行 / 作废）。
     ///
@@ -154,7 +162,8 @@ pub enum SseEvent {
         summary: String,
         expires_at: String,
     },
-    /// 决策 123：工具调用事件（参数只给摘要）。
+    /// 决策 123：工具调用事件。**摘要与原文各一份**（决策 301，修订 123 的「只给摘要」）：
+    /// 摘要给收起的一行，`args` / `result` 给展开的工具详情——界面能展开看，靠的就是这两个字段。
     ///
     /// **身份串进载荷**（决策 244）：这个事件原先没有 `agent_type`，于是
     /// `is_foreman_event` 无法把它与流水线节点的工具调用区分，值班长的工具痕迹只能等
@@ -175,6 +184,19 @@ pub enum SseEvent {
         tool: String,
         phase: ToolPhase,
         args_summary: String,
+        /// 完整参数原串（决策 301），发射侧截到 12k（`FOREMAN_TOOL_RESULT_MAX_CHARS`）。
+        /// 老事件缺这个字段照空串——与 `agent_type` 同一条口径（决策 244①）。
+        #[serde(default)]
+        args: String,
+        /// 工具结果 / 错误文本（决策 301）：只在 end / error 阶段带，start 没有。同一上限。
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        result: Option<String>,
+        /// 所属的**在途台账行**与**行内位置序号**（票 02）：与 `conversation_delta`
+        /// 同一条去重口径（`seq > seq0` 才接）。流水线节点 / 老后端为 `None`。
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        ledger_id: Option<i64>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        seq: Option<u64>,
     },
     Stalled {
         task_id: String,
@@ -447,6 +469,8 @@ mod tests {
                 duration_ms: 12,
             },
             SseEvent::ConversationDelta {
+                ledger_id: None,
+                seq: None,
                 task_id: "t".into(),
                 branch: "develop-design".into(),
                 run_id: 7,
@@ -469,6 +493,8 @@ mod tests {
                 expires_at: "2026-09-17T00:10:00+00:00".into(),
             },
             SseEvent::ToolEvent {
+                ledger_id: None,
+                seq: None,
                 task_id: "t".into(),
                 branch: "main".into(),
                 run_id: 7,
@@ -477,6 +503,8 @@ mod tests {
                 tool: "write_file".into(),
                 phase: ToolPhase::End,
                 args_summary: "design.md".into(),
+                args: "{\"path\":\"design.md\"}".into(),
+                result: Some("已写入".into()),
             },
             SseEvent::Stalled {
                 task_id: "t".into(),
@@ -514,6 +542,8 @@ mod tests {
     #[test]
     fn conversation_delta_fields_complete() {
         let ev = SseEvent::ConversationDelta {
+            ledger_id: None,
+            seq: None,
             task_id: "t".into(),
             branch: "test-design".into(),
             run_id: 42,
@@ -580,6 +610,8 @@ mod tests {
 
         // 显式给 reasoning 时要真的读出来（并且序列化成 snake_case）
         let thought = SseEvent::ConversationDelta {
+            ledger_id: None,
+            seq: None,
             task_id: "t".into(),
             branch: "main".into(),
             run_id: 1,
@@ -602,6 +634,8 @@ mod tests {
     #[test]
     fn tool_events_are_routed_to_the_foreman_stream_by_identity() {
         let foreman_tool = SseEvent::ToolEvent {
+            ledger_id: None,
+            seq: None,
             task_id: String::new(),
             branch: String::new(),
             run_id: 0,
@@ -610,6 +644,8 @@ mod tests {
             tool: "read_task".into(),
             phase: ToolPhase::Start,
             args_summary: "t-1".into(),
+            args: "{\"task_id\":\"t-1\"}".into(),
+            result: None,
         };
         assert!(
             foreman_tool.is_foreman_event(),
@@ -623,6 +659,8 @@ mod tests {
         // 流水线节点的工具调用照旧不进对讲台（身份串对不上）
         for agent_type in ["main", "system", "pseudo:project_analysis"] {
             let pipeline_tool = SseEvent::ToolEvent {
+                ledger_id: None,
+                seq: None,
                 task_id: "t".into(),
                 branch: "main".into(),
                 run_id: 7,
@@ -631,6 +669,8 @@ mod tests {
                 tool: "write_file".into(),
                 phase: ToolPhase::End,
                 args_summary: "x".into(),
+                args: "x".into(),
+                result: Some("ok".into()),
             };
             assert!(
                 !pipeline_tool.is_foreman_event(),
@@ -673,6 +713,8 @@ mod tests {
         assert!(proposal.is_foreman_event());
         assert_eq!(proposal.event_type(), SseEventType::ForemanProposal);
         assert!(!SseEvent::ToolEvent {
+            ledger_id: None,
+            seq: None,
             task_id: "t".into(),
             branch: "main".into(),
             run_id: 1,
@@ -681,9 +723,13 @@ mod tests {
             tool: "write_file".into(),
             phase: ToolPhase::Start,
             args_summary: "x".into(),
+            args: "x".into(),
+            result: None,
         }
         .is_foreman_event());
         let pipeline_delta = SseEvent::ConversationDelta {
+            ledger_id: None,
+            seq: None,
             task_id: "t".into(),
             branch: "main".into(),
             run_id: 1,
@@ -701,6 +747,8 @@ mod tests {
     #[test]
     fn tool_event_fields_complete() {
         let ev = SseEvent::ToolEvent {
+            ledger_id: None,
+            seq: None,
             task_id: "t".into(),
             branch: "main".into(),
             run_id: 1,
@@ -709,6 +757,8 @@ mod tests {
             tool: "read_file".into(),
             phase: ToolPhase::Start,
             args_summary: "src/a.rs".into(),
+            args: "{\"path\":\"src/a.rs\"}".into(),
+            result: None,
         };
         let json: serde_json::Value = serde_json::from_str(&ev.to_json()).unwrap();
         for key in [
@@ -719,10 +769,48 @@ mod tests {
             "tool",
             "phase",
             "args_summary",
+            // 决策 301：展开详情的原文与结果——摘要给收起的一行，这两个给展开的详情。
+            "args",
         ] {
             assert!(json.get(key).is_some(), "tool_event 缺少 {key}");
         }
         assert_eq!(json["phase"], "start");
+        // start 没有结果：`result` 省略不发，而不是发个 null（老客户端解析口径不变）。
+        assert!(json.get("result").is_none());
+
+        // end 阶段带结果，且同样是原样透传（截断在发射出口压，12k）。
+        let done = SseEvent::ToolEvent {
+            ledger_id: None,
+            seq: None,
+            task_id: "t".into(),
+            branch: "main".into(),
+            run_id: 1,
+            agent_type: "main".into(),
+            session_id: String::new(),
+            tool: "read_file".into(),
+            phase: ToolPhase::End,
+            args_summary: "src/a.rs".into(),
+            args: "{\"path\":\"src/a.rs\"}".into(),
+            result: Some("读到了".into()),
+        };
+        let json: serde_json::Value = serde_json::from_str(&done.to_json()).unwrap();
+        assert_eq!(json["result"], "读到了");
+    }
+
+    /// 决策 301 的**加性**口径：老事件没有 `args` / `result`，照旧能解析——
+    /// `args` 缺省空串（收起行只用 `args_summary`，不受影响），`result` 缺省 `None`。
+    #[test]
+    fn tool_event_without_detail_fields_still_parses() {
+        let raw = r#"{"type":"tool_event","task_id":"t","branch":"main","run_id":7,
+                       "tool":"write_file","phase":"end","args_summary":"x"}"#;
+        let ev: SseEvent = serde_json::from_str(raw).unwrap();
+        match ev {
+            SseEvent::ToolEvent { args, result, .. } => {
+                assert_eq!(args, "");
+                assert!(result.is_none());
+            }
+            other => panic!("解成了别的变体：{other:?}"),
+        }
     }
 
     #[tokio::test]

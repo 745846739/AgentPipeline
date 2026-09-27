@@ -97,7 +97,7 @@ async fn a_legacy_database_migrates_and_its_messages_land_in_the_first_session()
 
     // 老消息进了第一个会话，顺序与读数都还在。
     let sessions = store
-        .list_foreman_sessions(Some(FOREMAN_SESSION_KIND_TALK))
+        .list_foreman_sessions(Some(FOREMAN_SESSION_KIND_TALK), false)
         .await
         .unwrap();
     assert_eq!(sessions.len(), 1, "既有消息应当回填出一个会话");
@@ -111,7 +111,10 @@ async fn a_legacy_database_migrates_and_its_messages_land_in_the_first_session()
     // 老的播报留在原会话里靠 `proactive` 标对，升级不改变任何一行的归属。
     assert_eq!(session.kind, FOREMAN_SESSION_KIND_TALK);
 
-    let messages = store.list_foreman_messages(&session.id, 100).await.unwrap();
+    let messages = store
+        .list_foreman_messages(&session.id, 100, None)
+        .await
+        .unwrap();
     assert_eq!(messages.len(), 2);
     assert_eq!(messages[0].role, "user");
     assert_eq!(messages[1].role, "assistant");
@@ -143,7 +146,7 @@ async fn an_empty_legacy_database_gains_no_session() {
         .await
         .unwrap();
     assert!(store
-        .list_foreman_sessions(Some(FOREMAN_SESSION_KIND_TALK))
+        .list_foreman_sessions(Some(FOREMAN_SESSION_KIND_TALK), false)
         .await
         .unwrap()
         .is_empty());

@@ -54,11 +54,16 @@ use serde_json::json;
 use crate::state::{map_core_error, ApiError, ApiResult, AppState};
 use crate::stream::SSE_KEEPALIVE_INTERVAL;
 
-/// 单次读取的会话上限。
+/// 单次读取的会话缺省条数（**缺省语义不动**，票 05）。
 ///
-/// 一条班次里说的话看不到头是不现实的（一个班次就是一晚的台账），故这里给一个够看到
-/// 本班次全部对话的上限，而不是分页——分页会把「滚上去看两小时前说的那句」变成一个
-/// 要写代码的交互。跨班次翻找是**列表**的职责（`GET /foreman/sessions`）。
+/// 一条班次里说的话看不到头是不现实的（一个班次就是一晚的台账），故缺省给一个够看到
+/// 本班次全部对话的条数；跨班次翻找仍是**列表**的职责（`GET /foreman/sessions`）。
+///
+/// **显式修订「不分页」的产品立场**（票 05，spec 落表项）：此前这里把「不分页」说成
+/// 与「滚上去看两小时前说的那句」的取舍——那句话在超过 500 条时恰好是假的（更早的
+/// 根本读不到）。立场改为「**500 缺省 + 向上游标**」：缺省一次读最近 500 条（500 条内
+/// 的班次与从前逐字相同、零额外请求），更早的由 `?before_id=` 游标往上滚着补——
+/// 「滚上去接着看」仍旧不需要人写代码，只是从「不支持」变成了滚轮本身。
 const SESSION_PAGE_LIMIT: usize = 500;
 
 /// `GET /foreman/tools`：清单的**回执标签**（决策 247⑤）。
@@ -79,6 +84,37 @@ pub async fn tools(State(state): State<AppState>) -> ApiResult<Json<serde_json::
             .iter()
             .map(|s| json!({ "name": s.name, "label": s.label }))
             .collect::<Vec<_>>(),
+    })))
+}
+
+/// `GET /foreman/attention`：未消费待办的**只读计数**（决策 307，票 06）。
+///
+/// 页头那枚读数读它。三条口径写在这里：
+/// - **未接线照旧 503**——`/foreman/*` 下没有例外（这条规则由既有 503 用例与 testing.md 钉着）；
+/// - **纯只读**：不建行、不改行、不消费（消费是值守轮的事）。它也因此**与 `turn_in_flight`
+///   无关**：值守轮排队时（决策 289）最需要看见它，而那正是 crumb 不出现的时候；
+/// - **0 条时形状不变**（`open: 0, by_kind: {}`）——渲染与否是界面的判断，端点不改契约。
+///
+/// 顺带带上阻塞池里卡住的读（决策 308，票 07）：两者都是「我该不该去看一眼」的读数，
+/// 一个来回取完。
+pub async fn attention(State(state): State<AppState>) -> ApiResult<Json<serde_json::Value>> {
+    if state.foreman.is_none() {
+        return Err(foreman_unwired());
+    }
+    let summary = state
+        .store
+        .open_attention_summary()
+        .await
+        .map_err(map_core_error)?;
+    let blocked = agentpipeline_core::agent::bounded_read::stats();
+    Ok(Json(json!({
+        "open": summary.open,
+        "by_kind": summary.by_kind,
+        "blocked_reads": {
+            "stuck_now": blocked.stuck_now,
+            "stuck_total": blocked.stuck_total,
+            "longest_wait_ms": blocked.longest_wait_ms,
+        },
     })))
 }
 
@@ -118,7 +154,9 @@ pub async fn session(
                 .map_err(map_core_error)?,
         },
     };
-    Ok(Json(session_payload(&state, &store, session).await?))
+    Ok(Json(
+        session_payload(&state, &store, session, params.before_id).await?,
+    ))
 }
 
 /// `GET /foreman/sessions`：未归档的班次，按最近活动倒序。
@@ -141,7 +179,7 @@ pub async fn sessions(
     }
     let sessions = state
         .store
-        .list_foreman_sessions(Some(kind))
+        .list_foreman_sessions(Some(kind), params.include_archived.unwrap_or(false))
         .await
         .map_err(map_core_error)?;
     Ok(Json(json!({
@@ -156,12 +194,20 @@ pub struct SessionQuery {
     /// 缺省落点取哪一类（决策 286 / 票 01）：`watch` 落值守台账，其余落人的班次。
     /// 只在 `session` 未指定时参与解析；指定了 id 就以 id 为准。
     pub kind: Option<String>,
+    /// **向上游标**（票 05）：只回 `id < before_id` 的更早一段（段内升序、最多
+    /// `SESSION_PAGE_LIMIT` 条），到头回空。缺省（不给）= 现状：最近那一段。
+    /// 加性参数：老客户端不带它，行为逐字不变。
+    pub before_id: Option<i64>,
 }
 
 #[derive(Debug, Deserialize)]
 pub struct SessionKindQuery {
     /// 要列哪一类班次。缺省 talk（人的班次）。
     pub kind: Option<String>,
+    /// **含归档**（票 06：chip 行的「显示已归档」开关）。缺省 / `false` = 现状，
+    /// 只列未归档（决策 204⑦「从列表里收起来」的口径一个字没动）；`true` 时归档的
+    /// 照常在列，灰不灰由界面按 `archived_at` 判。加性参数，老客户端逐字不变。
+    pub include_archived: Option<bool>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -888,7 +934,7 @@ async fn record_proposal_outcome(
         .map_err(map_core_error)?;
     // 回话行的 id / created_at 由落库产生，重取尾部一行（与 `send` 同一手法）。
     Ok(store
-        .list_foreman_messages(&proposal.session_id, 1)
+        .list_foreman_messages(&proposal.session_id, 1, None)
         .await
         .map_err(map_core_error)?
         .pop())
@@ -1045,7 +1091,7 @@ pub async fn send(
     // ——`ForemanTurn` 是领域层的一次回话，`id` 是存储层的概念，不该混进去。
     // 只取该会话的 1 条：这里要的是刚落库的那一行，不是整段会话。
     let last = store
-        .list_foreman_messages(&turn.session.id, 1)
+        .list_foreman_messages(&turn.session.id, 1, None)
         .await
         .map_err(map_core_error)?
         .pop();
@@ -1129,6 +1175,7 @@ async fn session_payload(
     state: &AppState,
     store: &Store,
     session: Option<ForemanSession>,
+    before_id: Option<i64>,
 ) -> ApiResult<serde_json::Value> {
     let Some(session) = session else {
         return Ok(json!({
@@ -1141,8 +1188,11 @@ async fn session_payload(
             "foreman": foreman_identity(state),
         }));
     };
+    // `before_id` 只挪动 `messages` 那一段的取法（票 05）：给出时回更早一段
+    // （段内升序，到头为空），其余字段照旧是这一班此刻的全量读数——游标是**读历史**
+    // 的口子，不是另一种 payload。
     let messages = store
-        .list_foreman_messages(&session.id, SESSION_PAGE_LIMIT)
+        .list_foreman_messages(&session.id, SESSION_PAGE_LIMIT, before_id)
         .await
         .map_err(map_core_error)?;
     let proposals = store
@@ -1270,6 +1320,16 @@ fn message_wire(m: &ForemanMessage) -> serde_json::Value {
         // 结构化选项提问的载荷（决策 265）：恒在场、没有就是 null——加性字段，
         // 老客户端解析不受影响；用户 / system 行恒 null（那一列只有 assistant 会填）。
         "ask": m.ask_json,
+        // 行的在途状态（迁移 0036，票 01）：`null` = 收口的正常行（绝大多数），
+        // `"in_flight"` = 正在跑的半截行，`"interrupted"` = 进程被杀留下的半截行（票 03）。
+        // 恒在场的加性字段：老客户端读到 null 照旧当普通行渲染。
+        "status": m.status,
+        // 行内位置序号（迁移 0036，票 02）：前端拿它当拼接的 `seq0`（`seq > seq0` 的
+        // 增量才接）。只对在途行有意义，其余恒 0。
+        "seq": m.seq,
+        // 中断时刻（迁移 0036，票 03）：`status = "interrupted"` 的行记下什么时候断的，
+        // 时间线把「已中断 + 那一刻」一起摆出来。其余行恒 null。
+        "interrupted_at": m.interrupted_at.map(|t| t.to_rfc3339()),
     })
 }
 

@@ -436,6 +436,16 @@ export interface ConversationDeltaEvent extends SseBase {
   text: string;
   prompt_tokens: number;
   completion_tokens: number;
+  /**
+   * 所属的**在途台账行**（票 02）。**可选**：流水线事件 / 老后端没有它，判据里
+   * 「没有就按老路径接」的那一支说的就是它。
+   */
+  ledger_id?: number | null;
+  /**
+   * 该行内的**位置序号**（票 02）：与快照的 `seq0` 对账——`seq > seq0` 才接。
+   * **只做去重，不做回放**（决策 275）：判据只决定到达的这条接不接，不触发任何补取。
+   */
+  seq?: number | null;
 }
 export interface ToolEventEvent extends SseBase {
   type: 'tool_event';
@@ -453,6 +463,15 @@ export interface ToolEventEvent extends SseBase {
   tool: string;
   phase: ToolPhase;
   args_summary: string;
+  /**
+   * 完整参数原文与工具结果（决策 301）：截到 12k，给展开的工具详情。
+   * `args` 老后端不发（缺省）；`result` 只在 end / error 相位带。
+   */
+  args?: string;
+  result?: string;
+  /** 所属在途台账行与行内位置序号（票 02，与增量同一条去重口径）。 */
+  ledger_id?: number | null;
+  seq?: number | null;
 }
 export interface StalledEvent extends SseBase {
   type: 'stalled';
@@ -877,10 +896,14 @@ export interface OneClickInstallResult {
 
 /* ─────────────── 值班长 / 对讲台（crates/app/src/routes/foreman.rs，决策 182）─────────────── */
 
-/** 该轮工具痕迹的一项（`ForemanTrace`）。`args_summary` 是参数摘要，不是原文。 */
+/** 该轮工具痕迹的一项（`ForemanTrace`）。`args_summary` 是参数摘要，原文在 `args`（决策 301）。 */
 export interface ForemanTrace {
   tool: string;
   args_summary: string;
+  /** 完整参数原文（截到 12k，决策 301）。老行没有这个字段 → 缺省，界面回落到摘要。 */
+  args?: string;
+  /** 工具结果 / 错误文本（同一上限）。老行同样缺省。 */
+  result?: string;
   ok: boolean;
 }
 
@@ -896,7 +919,15 @@ export interface ForemanTrace {
 export type ForemanSegment =
   | { kind: 'thinking'; text: string }
   | { kind: 'text'; text: string }
-  | { kind: 'tool'; tool: string; args_summary: string; ok: boolean };
+  | {
+      kind: 'tool';
+      tool: string;
+      args_summary: string;
+      /** 展开详情的原文与结果（决策 301）：老行缺省，界面回落到 `args_summary`。 */
+      args?: string;
+      result?: string;
+      ok: boolean;
+    };
 
 /** 一个工具的回执标签（`GET /foreman/tools`，决策 247⑤）：界面上那个中文词。 */
 export interface ForemanToolLabel {
@@ -910,6 +941,23 @@ export interface ForemanToolLabel {
  */
 export interface ForemanToolLabelList {
   tools: ForemanToolLabel[];
+}
+
+/**
+ * 未消费待办的只读读数（决策 307，票 executor-never-returns 06）。
+ *
+ * `by_kind` 的键是待办类别的**稳定标识**（落库列，如 `owner_stuck` / `resume_blocked`），
+ * 前端按它判、不按文案。`blocked_reads` 是阻塞池里卡住的读（决策 308，票 07）——
+ * 与待办同一个来回取，因为两者都是「我该不该去看一眼」的读数。
+ */
+export interface ForemanAttention {
+  open: number;
+  by_kind: Record<string, number>;
+  blocked_reads: {
+    stuck_now: number;
+    stuck_total: number;
+    longest_wait_ms: number;
+  };
 }
 
 /**
@@ -968,7 +1016,9 @@ export interface ForemanBriefing {
 /**
  * 一个班次（会话）。**决策 204**：一条长台账拆成一排可新建 / 切换 / 重命名 / 归档的班次。
  *
- * 归档 = 置 `archived_at`：从列表里收起来，**不物理删除**（消息也照旧吃保留期）。
+ * 归档 = 置 `archived_at`：从列表里收起来，**不物理删除**。消息**已豁免保留期**
+ * （票 04，显式修订决策 204⑦「归档不保护消息」与 182④「同一把保留期尺」）：
+ * 归档且超龄之后消息照样在——归档与否不再改变消息的去留。
  */
 export interface ForemanSessionMeta {
   id: string;
@@ -1046,6 +1096,23 @@ export interface ForemanMessage {
    * 用户行的 INSERT 不写它。
    */
   ask?: ForemanAsk | null;
+  /**
+   * 行的**在途状态**（迁移 0036，票 01）：`null` = 已收口的正常行（绝大多数），
+   * `'in_flight'` = 正在跑的半截行，`'interrupted'` = 进程被杀留下的半截行（票 03）。
+   *
+   * **可选**：老后端不发这个字段（加性改动）——缺省当普通行渲染，正是它此前的行为。
+   */
+  status?: string | null;
+  /**
+   * 行内**位置序号**（迁移 0036，票 02）：拼接基准 `seq0` 的来源——直播里 `seq > seq0`
+   * 的增量才接。只对在途行有意义，其余恒 0。
+   */
+  seq?: number;
+  /**
+   * **中断时刻**（迁移 0036，票 03）：`status === 'interrupted'` 的行记下什么时候断的。
+   * 时间线把「已中断 + 这一刻」摆在名牌旁边——**可选**：老后端不发（加性改动）。
+   */
+  interrupted_at?: string | null;
 }
 
 /**

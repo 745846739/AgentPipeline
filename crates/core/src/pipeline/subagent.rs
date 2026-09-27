@@ -176,7 +176,8 @@ impl SubAgentRunner for StoreSubAgentRunner {
                     &cfg.project_root,
                     cfg.language.as_deref(),
                     cfg.test_framework.as_deref(),
-                ),
+                )
+                .await,
                 SUB_AGENT_PERSONA,
                 &workdirs,
                 // 子代理不注入技能：它是检索工，不是技能执行者。注入全文态技能会把

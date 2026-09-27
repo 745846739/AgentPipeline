@@ -12,7 +12,8 @@ import { talk } from './talk.svelte';
  * ① **切页面（同一班次）什么都不丢**：`watch()` 认到同一个 id 就不动现场；
  * ② **换班次仍然清现场**：那是决策 204③ / 220⑤ 的既有口径，本次一个字没改。
  *
- * 另加三支收口（决策 260）与增量闸门（只在等一轮期间攒）——它们此前只有 e2e 覆盖。
+ * 另加三支收口（决策 260）与**到得就攒、读台账收口**的尾巴纪律（票 02 把旧的到达闸门
+ * 换掉了：筛在渲染时按快照做，到达时挑会丢掉补不回的字）——它们此前只有 e2e 覆盖。
  */
 
 const SESSION = 'sess-1';
@@ -32,8 +33,9 @@ function delta(text: string, sessionId = SESSION): ConversationDeltaEvent {
   };
 }
 
-/** 台账里的一行（本组只用得到它的 id——判据全是「尾部有没有更新的行」）。 */
-function row(id: number): ForemanMessage {
+/** 台账里的一行（本组只用得到它的 id 与 status——判据是「尾部有没有更新的行」与
+ * 「接手那条半截行收口没有」）。 */
+function row(id: number, over: Partial<ForemanMessage> = {}): ForemanMessage {
   return {
     id,
     session_id: SESSION,
@@ -46,7 +48,14 @@ function row(id: number): ForemanMessage {
     created_at: '2026-09-25T00:05:00Z',
     kind: 'fm',
     proactive: false,
+    status: null,
+    ...over,
   };
+}
+
+/** 接手那一刻的**半截行**（票 01）：锚的就是它，收口就地写它（status 落 null）。 */
+function inflight(id: number): ForemanMessage {
+  return row(id, { status: 'in_flight', content: '' });
 }
 
 function payload(over: Partial<ForemanSession> = {}): ForemanSession {
@@ -138,9 +147,16 @@ describe('在飞现场随页面来去（决策 275）', () => {
 });
 
 describe('增量闸门与收口（决策 260 的三支）', () => {
-  it('没在等一轮时增量不攒（省得收尾后到达的尾巴凭空造一轮）', () => {
+  it('没在等一轮时增量**也攒**（票 02：筛在渲染时按快照做）——但下一次读台账就把它收口', () => {
+    // 旧口径是「到达时就丢」：那会在快照读回来之前的那几拍里丢掉补不回的字
+    // （SSE 无回放，决策 275）。现在到得就攒，尾巴的收口交给下一次读台账。
     reset(SESSION);
-    talk.note(delta('不属于任何一轮的字'));
+    talk.note(delta('接手前到达的半句'));
+    expect(talk.stream.steps).toEqual([{ kind: 'text', text: '接手前到达的半句' }]);
+
+    // 没在跟、服务端也没在跑：这条尾巴是残渣（收场发生在这一屏之外）——读一次台账就清掉，
+    // 不许它凭空造一轮久驻。
+    talk.syncFollowing(payload({ messages: [row(1)], turn_in_flight: false }));
     expect(talk.stream.steps).toEqual([]);
   });
 
@@ -157,7 +173,10 @@ describe('增量闸门与收口（决策 260 的三支）', () => {
     talk.stream = beginForemanStream();
     talk.note(delta('正在答'));
 
-    talk.syncFollowing(payload({ messages: [row(1), row(2)], turn_in_flight: true }));
+    // 接手的锚点就是那条半截行（票 01）：它 status 还在途 → keep，现场一个字不动
+    talk.syncFollowing(
+      payload({ messages: [row(1), inflight(2)], turn_in_flight: true }),
+    );
 
     expect(talk.followingSince, '锚点必须留在接手那一刻').toBe(2);
     expect(talk.stream.steps).toHaveLength(1);
@@ -187,11 +206,59 @@ describe('增量闸门与收口（决策 260 的三支）', () => {
     talk.stream = beginForemanStream();
     talk.note(delta('说了一半就断'));
 
-    talk.syncFollowing(payload({ messages: [row(1), row(2)], turn_in_flight: false }));
+    // 进程被杀：半截行还挂着（status 仍是 in_flight）、服务端也不再报在跑 → 死轮
+    talk.syncFollowing(
+      payload({ messages: [row(1), inflight(2)], turn_in_flight: false }),
+    );
 
     expect(talk.stream.steps).toEqual([{ kind: 'text', text: '说了一半就断' }]);
     expect(talk.stream.error).toBe(FOREMAN_LOST_TURN_SUFFIX);
     expect(talk.followingSince).toBeNull();
+  });
+
+  it('**就地收口**（票 01）：接手那条半截行 status 落成 null → 落地，不误判成死轮', () => {
+    // 收口写的是同一行（尾部不多一行）：老判据在这里会走 lost，半截字顶着
+    // 「不会再来」的说明——而它其实答完了。
+    reset(SESSION);
+    talk.followingSince = 2;
+    talk.stream = beginForemanStream();
+    talk.note(delta('说了一半'));
+
+    talk.syncFollowing(payload({ messages: [row(1), row(2)], turn_in_flight: false }));
+
+    expect(talk.stream.steps, '落地：台账那一行接管，本地那一段退场').toEqual([]);
+    expect(talk.stream.error).toBeNull();
+    expect(talk.followingSince).toBeNull();
+  });
+
+  it('**台账中断行接手**（票 03）：重启后半截行标成 interrupted → 落地，由台账接管', () => {
+    // 进程被杀、重启后启动恢复把悬挂行标成 interrupted（显式修订决策 223）——那一行
+    // 就是这一轮的终态。若这里走 lost，界面会**本地合成**一条失败轮，与台账那条中断行
+    // 并排成两套真相（决策 260 裁决③从此以台账为准：清本地、信台账、代次 +1 重读）。
+    reset(SESSION);
+    talk.followingSince = 2;
+    talk.stream = beginForemanStream();
+    talk.note(delta('说了一半就断'));
+    const epochBefore = talk.ledgerEpoch;
+
+    talk.syncFollowing(
+      payload({
+        messages: [
+          row(1),
+          row(2, {
+            status: 'interrupted',
+            interrupted_at: '2026-09-25T00:09:00Z',
+            content: '说了一半就断',
+          }),
+        ],
+        turn_in_flight: false,
+      }),
+    );
+
+    expect(talk.stream.steps, '台账那一行接管，本地那一段退场').toEqual([]);
+    expect(talk.stream.error, '中断不是失败轮：标记由台账那条行自己渲染').toBeNull();
+    expect(talk.followingSince).toBeNull();
+    expect(talk.ledgerEpoch, '重读台账，按中断行重算时间线').toBe(epochBefore + 1);
   });
 
   it('收尾的两声：`settleTurn` 清现场并给台账代次 +1；`markLedgerStale` 只加代次', () => {

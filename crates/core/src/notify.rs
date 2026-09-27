@@ -125,18 +125,19 @@ impl NotifyClass {
 
 /// attention kind → 通知分类。
 ///
-/// 这是**后端独有**的一张小表（前端映射的是 SSE 事件，两边的「类」同名同义、进表的
+/// 这张表是**后端独有**的一张小表（前端映射的是 SSE 事件，两边的「类」同名同义、进表的
 /// 成员各自钉）：`SlowRun` 不给类——它是 `wakes()` 唯一为 false 的那个，双重挡死；
-/// 卡住等人的五个（pending / repeated / owner / scheduler / stale）归 `pending`——
-/// 免打扰豁免正是为「等人处理」那一类设的；失败族四个归 `failed`（恒发）。
+/// 卡住等人的七个（pending / repeated / owner / scheduler / stale / **resume blocked** /
+/// **blocked read**）归 `pending`——免打扰豁免正是为「等人处理」那一类设的
+/// （`resume_blocked` 是「系统试过、放弃了，该有人接手」，`blocked_read` 是「这台机器上
+/// 有读挂在系统调用里，得有人去看授权」——两件都是要人动手的）；失败族四个归 `failed`（恒发）。
 /// 由 `tests/integration/notify.rs::kind_to_class_mapping_is_pinned` 逐个钉住。
 pub fn notification_class(kind: AttentionKind) -> Option<NotifyClass> {
     use AttentionKind::*;
     Some(match kind {
         SlowRun => return None,
-        TaskPending | RepeatedPending | OwnerStuck | SchedulerNoEffect | TaskStale => {
-            NotifyClass::Pending
-        }
+        TaskPending | RepeatedPending | OwnerStuck | SchedulerNoEffect | TaskStale
+        | ResumeBlocked | BlockedRead => NotifyClass::Pending,
         RetryExhausted | ContextOverflow | GateFailure | RunFailed => NotifyClass::Failed,
         TaskDone => NotifyClass::Done,
         TaskCancelled => NotifyClass::Cancelled,

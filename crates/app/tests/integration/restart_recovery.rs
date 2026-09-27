@@ -401,6 +401,199 @@ async fn kill_9_mid_run_then_restart_recovers_to_done() {
     let _ = json_i64(&last, "total_tokens").expect("任务计量字段存在");
 }
 
+/// 挂住的 provider：收下连接、发一帧正文就**再也不收尾**——不发 `[DONE]`、不关连接。
+///
+/// 与 `MockLlm` 的分工：那个按脚本回完整一轮，这个的用途是让**一轮永远悬在半空**——
+/// 模型调用既不成功也不失败，直到进程被杀。这正是「kill -9 那一刻」的形状：收口那次
+/// 写入永远不会发生，库里只剩一条 `status='in_flight'` 的半截行（票 03 的前置）。
+///
+/// 发一帧正文再挂住（而不是空等）：半截行因此**带着断在哪一步的字**被杀，重启后的
+/// 断言才有「内容原样保留、只有状态变了」可做。
+fn hang_provider() -> String {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("挂住的 provider 能绑定");
+    let addr = listener.local_addr().expect("能取到地址");
+    std::thread::spawn(move || {
+        // 持住已发出的连接：不关 = 永远不到 EOF，调用方永远等不到收尾。
+        let mut held = Vec::new();
+        for stream in listener.incoming() {
+            let Ok(mut s) = stream else { break };
+            let _ = s.set_read_timeout(Some(Duration::from_secs(10)));
+            let _ = s.set_write_timeout(Some(Duration::from_secs(10)));
+            // 读掉请求（内容不看：只需要「有人来问过」这个事实）。
+            let mut buf = [0u8; 8192];
+            let _ = s.read(&mut buf);
+            let chunk = serde_json::json!({
+                "choices": [{"index": 0, "delta": {"role": "assistant", "content": "断电前说到这"}}]
+            });
+            let frame = format!("data: {chunk}\n\n");
+            let head = "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\ntransfer-encoding: chunked\r\n\r\n";
+            let _ = s.write_all(head.as_bytes());
+            let _ = s.write_all(format!("{:x}\r\n", frame.len()).as_bytes());
+            let _ = s.write_all(frame.as_bytes());
+            let _ = s.write_all(b"\r\n");
+            let _ = s.flush();
+            held.push(s);
+        }
+    });
+    format!("http://{addr}")
+}
+
+/// 票 03：**进程被杀形态**——在途轮悬在半空时 kill -9，重启后半截行标成已中断，
+/// 界面不再显示「正在说」（显式修订决策 223：进程退出轮不落账 → 落一条已中断行）。
+///
+/// 与假时钟用例（core `startup_marks_a_hanging_inflight_row_interrupted…`）的分工：
+/// 那条钉恢复步骤的**谓词与时刻来源**（存储层），这条钉**真实进程边界**上的整条链——
+/// 真二进制、真 SIGKILL、同 home 重启、经 HTTP 观测（与本文件既有 kill -9 用例同姿势）。
+///
+/// 三条判据各钉一颗牙：
+/// 1. 杀之前：半截行 `status='in_flight'`、`interrupted_at` 为空、`turn_in_flight=true`
+///    ——断言 1 当场红，若「在途」在活着的进程里就显示不出来；
+/// 2. 重启后：`status='interrupted'` + `interrupted_at` 有值 + `turn_in_flight=false`
+///    ——启动恢复那一步被删掉则状态永远停在 `in_flight`，断言 2 当场红；
+/// 3. 内容原样不动——改成连内容一起重写（或恢复时清字）则断言 3 红。
+#[tokio::test]
+async fn kill_9_mid_foreman_turn_marks_the_hanging_row_interrupted_on_restart() {
+    let home = TestHome::new().unwrap();
+    let hang_url = hang_provider();
+
+    let store = home.store(Arc::new(SystemClock)).await.unwrap();
+    let now = store.now();
+    store
+        .upsert_provider(&Provider {
+            id: "prov".into(),
+            vendor: "openai".into(),
+            model: "mock".into(),
+            context_window: 8000,
+            base_url: Some(hang_url),
+            api_key: Some("sk-test".into()),
+            enabled: true,
+            created_at: now,
+            updated_at: now,
+        })
+        .await
+        .unwrap();
+
+    let (mut child, port) = spawn_server(&home).await;
+    wait_until_ready(port).await;
+
+    // ── 开班 ──
+    let (status, body) = http(
+        "POST",
+        port,
+        "/foreman/sessions",
+        Some(r#"{"title":"中断班"}"#),
+    )
+    .unwrap();
+    assert_eq!(status, 201, "{body}");
+    let session_id = serde_json::from_str::<serde_json::Value>(&body)
+        .expect("开班回包是 JSON")
+        .get("session")
+        .and_then(|s| s.get("id"))
+        .and_then(|v| v.as_str())
+        .expect("session.id 在场")
+        .to_string();
+
+    // ── 说一句话：handler 会把这一轮等到天荒地老（provider 挂着），放到独立线程里打 ──
+    // 用 std 线程而不是 tokio::spawn：`http` 是阻塞的 std::net，在单线程测试运行时上
+    // 会把轮询一起卡住。
+    let say_session = session_id.clone();
+    std::thread::spawn(move || {
+        let payload = serde_json::json!({"text": "喂？", "session_id": say_session});
+        let _ = http(
+            "POST",
+            port,
+            "/foreman/messages",
+            Some(&payload.to_string()),
+        );
+    });
+
+    // ── 杀之前：半截行带着断点的字在库，这一轮算「在跑」──
+    let deadline = Instant::now() + Duration::from_secs(15);
+    let mut last = String::new();
+    let half = loop {
+        assert!(
+            Instant::now() < deadline,
+            "半截行没在 15s 内出现（模型调用没发出去？最后回包：{last}）"
+        );
+        let (status, body) = http(
+            "GET",
+            port,
+            &format!("/foreman/session?session={session_id}"),
+            None,
+        )
+        .unwrap();
+        assert_eq!(status, 200, "{body}");
+        last = body.clone();
+        let Ok(v) = serde_json::from_str::<serde_json::Value>(&body) else {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            continue;
+        };
+        if let Some(hit) = v["messages"]
+            .as_array()
+            .and_then(|msgs| msgs.iter().find(|m| m["status"] == "in_flight"))
+            .filter(|m| {
+                m["content"]
+                    .as_str()
+                    .is_some_and(|c| c.contains("断电前说到这"))
+            })
+        {
+            assert_eq!(
+                v["turn_in_flight"],
+                serde_json::json!(true),
+                "活着的进程里这一轮算在跑：{body}"
+            );
+            assert!(
+                hit["interrupted_at"].is_null(),
+                "还没断，不该有中断时刻：{hit}"
+            );
+            break hit.clone();
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    };
+
+    // ── kill -9：收口那次写入永远不会发生 ──
+    child.start_kill().expect("kill -9");
+    let _ = tokio::time::timeout(Duration::from_secs(5), child.wait()).await;
+
+    // ── 同一个 home 重启：启动恢复必须在就绪之前标完（serve.rs：恢复 → READY 打印）──
+    let (_child2, port2) = spawn_server(&home).await;
+    wait_until_ready(port2).await;
+
+    let (status, body) = http(
+        "GET",
+        port2,
+        &format!("/foreman/session?session={session_id}"),
+        None,
+    )
+    .unwrap();
+    assert_eq!(status, 200, "{body}");
+    let v: serde_json::Value = serde_json::from_str(&body).expect("时间线回包是 JSON");
+    assert_eq!(
+        v["turn_in_flight"],
+        serde_json::json!(false),
+        "启动后不再显示「正在说」：{body}"
+    );
+    let msgs = v["messages"].as_array().expect("messages 在场");
+    let row = msgs
+        .iter()
+        .find(|m| m["id"] == half["id"])
+        .expect("半截行还在库里（中断是加状态，不是删行）");
+    assert_eq!(
+        row["status"], "interrupted",
+        "悬挂行标成已中断（票 03，修订决策 223）：{row}"
+    );
+    assert!(
+        row["interrupted_at"]
+            .as_str()
+            .is_some_and(|s| !s.is_empty()),
+        "中断时刻记下了：{row}"
+    );
+    assert_eq!(
+        row["content"], half["content"],
+        "中断只加状态：正文是断在哪一步的证据，原样保留：{row}"
+    );
+}
+
 // ─────────────────── 决策 257：界面保存的仓名单跨重启 ───────────────────
 
 /// 界面保存的仓名单**跨真进程重启仍在**，且 `origin` 如实说是「界面」定的。

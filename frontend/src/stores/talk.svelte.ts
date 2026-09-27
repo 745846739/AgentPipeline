@@ -242,16 +242,19 @@ class TalkStore {
   }
 
   /**
-   * 一个流事件落进这一格：先归位「别的班次在回话」，再（若在等一轮）攒进步骤。
+   * 一个流事件落进这一格：先归位「别的班次在回话」，再攒进现场。
    *
-   * **只在等回话期间累积**：收尾后到达的尾巴不得再造一轮（回话以台账为准）。
-   * 「在等」有两条来源（决策 260）：本机发出的那一趟（`sending`），或刷新 / 切页之后
-   * 从服务端重新接上的那一轮（`followingSince`）。少了后一条，页面切走再回来就只看得见
-   * 此后到达的增量——本轮之前那些字整段丢了，那正是用户报的毛病（决策 275）。
+   * **到得就攒，不按「在不在等一轮」挑**（票 02 改）：接不接由**渲染时对着快照**判
+   * （`spliceAccepts`，`seq > seq0` 才进时间线），到达时挑反而造出一个丢字的窗口——
+   * 快照（`GET /foreman/session`）还没读回来的那几拍里，事件若在这里被丢掉，
+   * 快照的 `seq0` 再准也补不回它（SSE 无回放，决策 275）。
+   *
+   * 班次守卫照旧（`appendForemanEvent` 里那一道）：别的班次、流水线的事件进不来。
+   * 没在跟也没在发时攒下的尾巴由**下一次读台账**收口（`syncFollowing` 里那一支）——
+   * 那一轮已经收场的话，它的完整行就在台账里，尾巴本就多余。
    */
   note(event: SseEvent): void {
     this.foreign = noteForeignDelta(this.foreign, event, this.sessionId, Date.now());
-    if (!this.sending && this.followingSince === null) return;
     this.stream = appendForemanEvent(this.stream, event, this.sessionId);
   }
 
@@ -279,6 +282,11 @@ class TalkStore {
       if (payload.turn_in_flight) {
         this.followingSince = maxLedgerId(payload.messages ?? []);
         this.startSentinel();
+      } else if (this.stream.events.length > 0 || this.stream.steps.length > 0) {
+        // 没在跟、服务端也没在跑：手里攒的直播是**上一轮的残渣**（收场发生在这一屏
+        // 之外 / 没有人接手过）——清掉。台账里那一轮的完整行会把它接住（票 02：
+        // 到得就攒之后，这一支是尾巴唯一的收口）。
+        this.stream = emptyForemanStream();
       }
       return;
     }

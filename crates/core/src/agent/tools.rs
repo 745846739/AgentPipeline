@@ -2542,11 +2542,14 @@ async fn latest_attribution(store: &Store, ctx: &ToolCallContext) -> Result<serd
         return Ok(serde_json::Value::Null);
     };
     let messages = store
-        .list_foreman_messages(session_id, FOREMAN_ATTRIBUTION_LOOKBACK)
+        .list_foreman_messages(session_id, FOREMAN_ATTRIBUTION_LOOKBACK, None)
         .await?;
+    // 在途半截行不算「上一轮」（票 01）：它这一轮还没收口、归因块还没写，拿它当
+    // 「最近一次助理轮」会让正在跑的这一轮把自己的归因读成未定位。
     let Some(last) = messages
         .iter()
         .rev()
+        .filter(|m| m.status.as_deref() != Some(crate::storage::foreman::FOREMAN_MESSAGE_IN_FLIGHT))
         .find(|m| m.role == crate::storage::foreman::FOREMAN_ROLE_ASSISTANT)
     else {
         return Ok(serde_json::Value::Null);

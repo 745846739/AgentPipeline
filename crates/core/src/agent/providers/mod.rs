@@ -539,6 +539,10 @@ impl ProductionLlm {
                         self.store.touch_run_heartbeat(run.run_id).await?;
                         last_heartbeat = Instant::now();
                     }
+                    // 在途半截行的**节流拍**（票 01）：每收一块顺手问一次要不要落库。
+                    // 节拍在现场里（250ms 一拍、只写有变化的），没登记的会话（流水线
+                    // 节点 `session_id` 恒空）到这里是一次早退的空查。
+                    crate::pipeline::foreman::flush_foreman_live_turn(&run.session_id).await;
                 }
             }
         }
@@ -592,6 +596,15 @@ impl ProductionLlm {
         completion: u32,
     ) {
         let Some(run) = run else { return };
+        // 在途半截行的**逐字正文 / 推理**（票 01，spec 决策 3「随广播落库」）：这里正是
+        // 「广播」发生的那一刻——同一声道、同一段字先推进台账的现场（写库由流式循环里
+        // 那一拍节流完成），再发给界面。流水线节点没有 `session_id`，连查表都到不了。
+        // 推进的同时领到**位置戳**（票 02），随事件带下去做快照去重（`seq > seq0` 才接）。
+        let stamp = if run.session_id.is_empty() {
+            None
+        } else {
+            crate::pipeline::foreman::push_foreman_live_delta(&run.session_id, channel, text)
+        };
         self.sse.emit(SseEvent::ConversationDelta {
             task_id: run.task_id.clone(),
             branch: run.branch.clone(),
@@ -603,6 +616,8 @@ impl ProductionLlm {
             text: text.to_string(),
             prompt_tokens: prompt,
             completion_tokens: completion,
+            ledger_id: stamp.map(|(id, _)| id),
+            seq: stamp.map(|(_, seq)| seq),
         });
     }
 }

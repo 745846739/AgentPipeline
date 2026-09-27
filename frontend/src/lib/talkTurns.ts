@@ -7,6 +7,7 @@ import type {
   ForemanTrace,
 } from '../api/types';
 import type { ForemanLiveStep, ForemanStreamState } from '../realtime/foreman';
+import { foldForemanEvents, spliceAccepts } from '../realtime/foreman';
 
 /**
  * 对讲台时间线的回合构造（票 02；决策 251 的三块判断之一）。判断全在这里，
@@ -89,12 +90,21 @@ export interface TurnView {
    */
   proactive: boolean;
   /**
-   * 这一轮的归因类别词（决策 235①）：四类之一，由**后端解析**后随消息下来。
+   * 这一轮的归因类别词（决策 235① / 238）：四类之一，由**后端解析**后随消息下来。
    *
    * `null` = 未定位或非助理轮——**不编一个假的类别**（决策 230 把「没有类别」也
-   * 当成一项判据）。界面只渲染这一个词，不显示稳定标识、也不显示原因（那是排查面）。
+   * 当成一项判据）。界面只渲染这一个词，不显示稳定标识、不显示原因（那是排查面）。
    */
   attribution: string | null;
+  /**
+   * 这一轮的**中断时刻**（票 03）：非 `null` = 它是进程被杀留下的半截轮，时间线把
+   * 「已中断 + 那一刻」摆在名牌旁边——与正常轮**只差这个标记**，过程与回话照旧渲染
+   * （断在哪一步正是排查要的证据）。
+   *
+   * 判据是后端给的 `m.interrupted_at` 字段（决策 252 同一条边界：读字段、不猜正文），
+   * 界面不自己合成一条「中断轮」——台账那一行就是唯一真相（票 03）。
+   */
+  interruptedAt: string | null;
 }
 
 /**
@@ -109,8 +119,19 @@ export interface TurnStep {
   kind: 'thinking' | 'text' | 'tool';
   /** 推理 / 中途那句话的原文；工具那一步是空串。 */
   text: string;
-  /** 工具那一步的现场（其余步为 `null`）。 */
-  tool: { name: string; argsSummary: string; state: 'running' | 'ok' | 'bad' } | null;
+  /**
+   * 工具那一步的现场（其余步为 `null`）。
+   *
+   * `args` / `result` 是展开详情（决策 301）：`args` 恒有值（老行回落到摘要那份），
+   * `result` 收场后才有（运行中是空串，界面显示「执行中…」）。
+   */
+  tool: {
+    name: string;
+    argsSummary: string;
+    args: string;
+    result: string;
+    state: 'running' | 'ok' | 'bad';
+  } | null;
   /**
    * 这一步**正在攒**（在飞轮的末尾那一步）：推理的摘要因此写「正在想…」。
    * 落地轮恒假——落地那一行里每一步都已经收场了。
@@ -140,6 +161,10 @@ function stepFromSegment(seg: ForemanSegment): StepDraft {
         tool: {
           name: seg.tool,
           argsSummary: seg.args_summary,
+          // 决策 301：详情字段是加性的，老行（写于 301 之前）缺省 → 回落摘要，
+          // 「没有记过」不许被渲染成一次假的空参数调用。
+          args: seg.args ?? seg.args_summary,
+          result: seg.result ?? '',
           state: seg.ok ? 'ok' : 'bad',
         },
         live: false,
@@ -152,7 +177,13 @@ function stepFromTrace(trace: ForemanTrace): StepDraft {
   return {
     kind: 'tool',
     text: '',
-    tool: { name: trace.tool, argsSummary: trace.args_summary, state: trace.ok ? 'ok' : 'bad' },
+    tool: {
+      name: trace.tool,
+      argsSummary: trace.args_summary,
+      args: trace.args ?? trace.args_summary,
+      result: trace.result ?? '',
+      state: trace.ok ? 'ok' : 'bad',
+    },
     live: false,
   };
 }
@@ -190,6 +221,8 @@ function stepFromLive(step: ForemanLiveStep): StepDraft {
         tool: {
           name: step.tool,
           argsSummary: step.args_summary,
+          args: step.args,
+          result: step.result,
           // 相位 → 三态：正在查 / 查到了 / 没查到（落库那一份由 `ok` 给同一份读数）。
           state: step.phase === 'start' ? 'running' : step.phase === 'error' ? 'bad' : 'ok',
         },
@@ -204,16 +237,35 @@ function stepFromLive(step: ForemanLiveStep): StepDraft {
  * **末尾那一步正文不是步骤，是回话**：它此刻正在往外冒，收尾时会被权威回话（POST 的
  * `reply` / 台账那一行）换掉；而被一次工具调用打断时，它就落定成「中途说的话」——
  * 那正是同一份数据在两个时态下的样子，判据只在这一个函数里，模板不猜。
+ *
+ * `steps` 由调用方给（票 02）：有在途半截行时是**按快照基准筛过再归约**的尾巴，
+ * 没有时就是流上攒着的全部——两种来源进同一个渲染形状。
  */
-function liveSteps(stream: ForemanStreamState): { steps: StepDraft[]; reply: string } {
-  const all = stream.steps.map(stepFromLive);
+function liveStepsFrom(
+  steps: ForemanLiveStep[],
+  streaming: boolean,
+): { steps: StepDraft[]; reply: string } {
+  const all = steps.map(stepFromLive);
   const last = all[all.length - 1];
   const reply = last && last.kind === 'text' ? last.text : '';
-  const steps = reply ? all.slice(0, -1) : all;
+  const rest = reply ? all.slice(0, -1) : all;
   // 末尾那一步是**正在攒**的那一步（流还在动）：推理的摘要因此说「正在想…」。
-  const tail = steps[steps.length - 1];
-  if (stream.streaming && tail) steps[steps.length - 1] = { ...tail, live: true };
-  return { steps, reply };
+  const tail = rest[rest.length - 1];
+  if (streaming && tail) rest[rest.length - 1] = { ...tail, live: true };
+  return { steps: rest, reply };
+}
+
+/**
+ * 台账里的**在途半截行** = 快照与直播的拼接基准（票 02）。
+ *
+ * 没有在途行时是 `null`：判据（{@link spliceAccepts}）于是走「没有基准」那一支，
+ * 流怎么攒就怎么渲染——与快照进来之前逐字一致。
+ */
+function inFlightBase(
+  messages: readonly { id: number; status?: string | null; seq?: number }[],
+): { id: number; seq: number } | null {
+  const row = messages.find((m) => m.status === 'in_flight');
+  return row ? { id: row.id, seq: row.seq ?? 0 } : null;
 }
 
 /** {@link buildTurns} 的四个响应式输入加一个回调——全都是平凡值，组件原样传入。 */
@@ -288,6 +340,8 @@ export function buildTurns(input: TalkTurnsInput): TurnView[] {
       // 界面不自己从稳定标识再映射一遍——两份映射迟早给出两个词，而「四类各一个词」
       // 是同一件事。未定位时后端给 null，界面就不显示（不编一个假的类别）。
       attribution: m.attribution_label ?? null,
+      // 中断时刻（票 03）：后端给的字段，只搬不判（决策 252 同一条边界）。
+      interruptedAt: m.interrupted_at ?? null,
     },
   }));
   for (const p of session?.proposals ?? []) {
@@ -308,6 +362,7 @@ export function buildTurns(input: TalkTurnsInput): TurnView[] {
         askAnswered: false,
         proactive: false,
         attribution: null,
+        interruptedAt: null,
       },
     });
   }
@@ -329,15 +384,26 @@ export function buildTurns(input: TalkTurnsInput): TurnView[] {
       askAnswered: false,
       proactive: false,
       attribution: null,
+      interruptedAt: null,
     });
   }
-  if (sending || following || stream.steps.length > 0) {
-    const live = liveSteps(stream);
+  // 在途半截行 = **拼接基准**（票 02）：直播那一段只渲染快照之后的尾巴（`seq > seq0`），
+  // 快照已经把 `seq <= seq0` 的字摆在上面那条在途行里了——再接一遍就是重复字。
+  // 没有在途行时基准为 `null`，判据整段放行，流怎么攒就怎么渲染（既有路径）。
+  const base = inFlightBase(messages);
+  const tailSteps = base
+    ? foldForemanEvents(stream.events.filter((e) => spliceAccepts(e, base)))
+    : stream.steps;
+  // 有在途行时**不摆占位句**：半截行本身就是「此刻说到哪了」，占位句会与它并排各说
+  // 一遍；尾巴长出来之前不另起一轮。没有在途行时条件与从前逐字一致。
+  const showLive = base ? tailSteps.length > 0 : sending || following || tailSteps.length > 0;
+  if (showLive) {
+    const live = liveStepsFrom(tailSteps, stream.streaming);
     out.push({
       key: 'live',
       kind: 'fm',
       // 还没收到第一个增量时不摆空白：给一句"对面在动"的实情，光标说明还在流。
-      // 值守账上的对面是**值守轮**（票 04）：没有人的那句话可接，占位句说「正在跑」
+      // 值守账上的对面是**值守轮**（票 04）：没有人的那句话可接，占位句说的「正在跑」
       // ——`turn_in_flight` 在这本账上的全部用途就是这一句（票面原话）。
       content: live.reply || (watchLedger ? '值守正在跑…' : '值班长正在查台账…'),
       at: '',
@@ -351,6 +417,7 @@ export function buildTurns(input: TalkTurnsInput): TurnView[] {
       askAnswered: false,
       proactive: false,
       attribution: null,
+      interruptedAt: null,
     });
   }
   if (stream.error) {
@@ -369,6 +436,7 @@ export function buildTurns(input: TalkTurnsInput): TurnView[] {
       askAnswered: false,
       proactive: false,
       attribution: null,
+      interruptedAt: null,
     });
   }
   return out;

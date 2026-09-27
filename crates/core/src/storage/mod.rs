@@ -28,7 +28,7 @@ pub mod server_bind;
 pub mod skill_sources;
 pub mod tasks;
 
-pub use attention::{AttentionItem, AttentionKind, WatchWakeOutcome};
+pub use attention::{AttentionItem, AttentionKind, AttentionSummary, WatchWakeOutcome};
 pub use foreman::{ForemanMessage, NewForemanMessage};
 pub use model_requests::{ModelRequest, ModelRequestStatus, ModelRequestUsage, NewModelRequest};
 pub use rtk::RtkSwitch;

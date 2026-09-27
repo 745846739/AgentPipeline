@@ -445,6 +445,21 @@ pub async fn serve(options: ServeOptions) -> anyhow::Result<ServerHandle> {
         tracing::info!(count = orphaned, "已把上一进程遗留的在飞模型请求标成终态");
     }
 
+    // 恢复流程第五步（票 talk-replay 03）：把上一进程遗留的**在途半截行**标成已中断。
+    //
+    // 与上一步同一条理由、同一个姿势——**显式修订决策 223**（「不做进程退出那一轮的
+    // 落账」）：进程被杀时半截行的收口写永远不会发生，不标的话它会永远以「正在说」的
+    // 样子挂在时间线上——那是比「什么都不留」更坏的失真（假装还活着），而 223 立的
+    // 那一半（失败账照旧由 `system` 行承载）一个字没改。**只写状态与中断时刻，内容
+    // 一个字不动**：thinking 与工具步骤是排查断点的证据；中断是终态，不提供续跑。
+    let orphaned_turns = store.mark_orphan_foreman_inflights().await?;
+    if orphaned_turns > 0 {
+        tracing::info!(
+            count = orphaned_turns,
+            "已把上一进程遗留的在途半截行标成已中断（票 03，修订决策 223）"
+        );
+    }
+
     // 出厂技能与点名的幂等播种（决策 261）：只补缺失、不覆盖用户改过的。
     //
     // 必须在下面的 `validate_startup` **之前**：用户若在阶段配置里声明了出厂技能，
@@ -504,6 +519,9 @@ pub async fn serve(options: ServeOptions) -> anyhow::Result<ServerHandle> {
     let runtime = Runtime::new(store.clone(), settings.clone(), sse.clone());
     runtime.spawn_tick_loop(store.clone(), settings.clone(), shutdown_tx.subscribe());
     runtime.spawn_maintenance_loop(store.clone(), settings.clone(), shutdown_tx.subscribe());
+    // 完全磁盘访问：**每次启动探一次**（决策 306，票 05）。后台跑、不阻塞启动——
+    // 缺授权时应用仍要开得起来、人仍要能被引导；有授权时一个字都不输出。
+    Runtime::spawn_disk_access_check();
 
     // 先绑定再建 state：端口 0 时把内核分配的真实端口交给 AppState，
     // 决策 128 的本机 origin 白名单必须用真实端口（用 0 会拒掉桌面壳的同源请求）。

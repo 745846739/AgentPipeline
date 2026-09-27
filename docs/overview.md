@@ -120,7 +120,7 @@ graph TD
 | `file_access_unrestricted` | false | 文件工具的**允许根**开关（决策 283）：`false` = 文件工具锁在 worktree + 任务目录内（决策 104）；`true` = 允许根清空，文件工具可读写任何路径。**拒绝名单不受它管**（`.env*` / `*.pem` / `*.key` / `id_rsa*` / `~/.ssh`，以及值班长的 `data/` 前缀）——秘密保护与操作范围是两件事。命令那条路本来就不受文件策略管（决策 104 / 19 修订），故打开它只是让**文件工具**与命令落在同一个域上，不改变「本仓无 OS 级沙箱」这个事实 |
 | `env_mode` | `auto` | 环境层权限档位的**全局默认**（决策 206）。口径见 [glossary.md](glossary.md) 的「权限档位（环境层档位）」条——三层解析的唯一实现在 `types::effective_env_mode`，本层只收 `auto` / `deny`（`ask` 在这里是「所有阶段都变 ask」，流水线无人按确认钮，故解析期拒） |
 | `watch_event_window_minutes` | 30 | 值班长待办只收**这么新**的事件；同时是「同一任务在窗口内再次 pending」的计数窗口（决策 209②，票 05） |
-| `watch_owner_stuck_minutes` | 10 | 判「卡住」的宽限：`scheduler_no_effect`（run 已终态而游标仍 active）与 `owner_stuck`（有主但心跳停了）都用它（票 05） |
+| `watch_owner_stuck_minutes` | 10 | 判「卡住」的宽限，三类判据都用它：`scheduler_no_effect`（run 已终态而游标仍 active）、`owner_stuck`（有主但心跳停了）、`owner_stuck` 的第三类（**执行权持有超过阈值**，run 已终态或尚无 run、游标可以是 `pending`——决策 305） |
 | `watch_debounce_sec` | 60 | 值守轮的去抖窗口：窗口内攒批、到期唤醒一次；窗口内没有新事件则一次都不醒（票 06） |
 | `watch_task_cooldown_minutes` | 30 | 同任务冷却：刚处理过的任务，新事件不单独唤醒，等冷却到期后合并播报（票 07） |
 | `watch_max_wakes_per_hour` | 12 | 全局唤醒上限（次/小时）；触顶不再唤醒但留一行「N 条待办未播报」，待办不消费（票 07） |

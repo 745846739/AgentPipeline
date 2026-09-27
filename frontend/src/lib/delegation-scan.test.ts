@@ -26,6 +26,19 @@ function read(rel: string): string {
   return readFileSync(resolve(srcRoot, rel), 'utf8');
 }
 
+/**
+ * 把注释换成空格——**长度与行号不变**。本文件头那条「注释里的引用不参与断言」对正反
+ * 两向都成立：口头引用既不该满足正向断言，也不该触发反向牙齿。
+ */
+const mask = (text: string, html: boolean): string => {
+  const blank = (source: string, re: RegExp): string =>
+    source.replace(re, (m) => m.replace(/[^\n]/g, ' '));
+  let out = blank(text, /\/\*[\s\S]*?\*\//g);
+  out = blank(out, /(?<!:)\/\/[^\n]*/g);
+  if (html) out = blank(out, /<!--[\s\S]*?-->/g);
+  return out;
+};
+
 describe('键盘陷阱只有一份（lib/menuTrap，决策 251⑤）', () => {
   const talk = read('routes/Talk.svelte');
   const topBar = read('components/layout/TopBar.svelte');
@@ -288,5 +301,84 @@ describe('跟的那一轮的收场分三支（决策 260 裁决③，票 in-flig
     // 「任何一支都不许清掉已出现的文字」这条纪律的落点：死轮走 failForemanStream（留字），
     // 不是 emptyForemanStream（清字）
     expect(foreman, '死轮该按「保留」的姿态收').toContain('failForemanStream');
+  });
+});
+
+describe('中断标记只有一个来源（票 03：台账字段 → 回合构造 → 界面）', () => {
+  const talk = mask(read('routes/Talk.svelte'), true);
+  const turns = mask(read('lib/talkTurns.ts'), false);
+  const store = mask(read('stores/talk.svelte.ts'), false);
+  const foreman = mask(read('realtime/foreman.ts'), false);
+
+  it('标记按字段渲染：回合构造只搬 `interrupted_at`，页面只看 `turn.interruptedAt`', () => {
+    // 判据在后端给的字段上（决策 252 同一条边界）：页面自己从 status / 正文推「已中断」
+    // 就是第二份判定点——两份迟早不一致，而这条标记说的正是「库里那条行是什么状态」。
+    expect(turns, '回合构造该把字段原样搬过去').toContain(
+      'interruptedAt: m.interrupted_at ?? null',
+    );
+    expect(talk, '页面该按字段渲染').toContain('{#if turn.interruptedAt}');
+    // 标记与时刻一起摆出来（票 03 的 checklist：带标记 + 中断时刻）——时刻走
+    // `formatDateTime`（时间格式唯一出处，format.test.ts 那条静态扫描钉着），不裸 toLocaleString
+    expect(talk, '标记要带上时刻').toContain('已中断 · {formatDateTime(turn.interruptedAt)}');
+    // 反向牙齿：页面里不许再长出第二份推导
+    expect(talk, '页面不该自己判行状态').not.toContain("status === 'interrupted'");
+    expect(talk, '页面不该从正文里抠标记').not.toContain('interrupted_at');
+  });
+
+  it('store 与判据模块都不合成「已中断」——标记的来路只有台账字段那一条', () => {
+    // 改回就地合成（在 store / foreman 里自己拼一条中断轮或标记）即红。
+    expect(store, 'store 不该自己合成标记').not.toContain('interrupted');
+    expect(store, 'store 不该出现界面文案').not.toContain('已中断');
+    expect(foreman, '三支判据只认 status 字段，不带界面文案').not.toContain('已中断');
+    // 中断行落进哪一支由纯函数判（就地收口那条：status 离开 in_flight 就是落地），
+    // 单测 foreman.test.ts 钉着 interrupted → settled 的实际取值。
+    expect(foreman, '中断行该在纯函数里被判成收口').toContain("anchored.status !== 'in_flight'");
+  });
+});
+
+describe('值守台账与对讲台同源受益（票 07：同组件同 store，不写分支逻辑）', () => {
+  const app = mask(read('App.svelte'), true);
+  const talk = mask(read('routes/Talk.svelte'), true);
+
+  /**
+   * 取两个锚点之间的源码。锚点缺席时返回 `null`，随后的断言当场变红——
+   * 静态扫描最怕的不是误报，是**锚点悄悄挪走后整段空转地绿着**。
+   */
+  const region = (src: string, from: string, to: string): string | null => {
+    const a = src.indexOf(from);
+    if (a < 0) return null;
+    const b = src.indexOf(to, a + from.length);
+    return b < 0 ? null : src.slice(a, b);
+  };
+
+  it('两条路由渲染同一个 Talk 组件——watch 只是一个传参，不是第二份实现', () => {
+    expect(app, '对讲台该渲染 Talk').toContain('<Talk />');
+    expect(app, '值守台账该渲染同一个 Talk').toContain('<Talk watch />');
+    expect(app, 'Talk 只从 routes/Talk.svelte 导入一次').toContain(
+      "import Talk from './routes/Talk.svelte'",
+    );
+    expect(app, '不该存在第二份值守实现').not.toContain('TalkWatch');
+  });
+
+  it('回看的三处都不按账本分叉（loadEarlier / 中断标记 / 归档开关——分支是分叉的起点）', () => {
+    // 向上加载：两本账走同一条路径，唯一差异是 `ledgerKind`（`?kind=`，同源判据里
+    // 明写的那「一个参数」）——所以正向认它、反向拒 watchMode。
+    const earlier = region(talk, 'async function loadEarlier', 'function onTimelineScroll');
+    expect(earlier, 'loadEarlier 锚点该在 Talk.svelte 里').not.toBeNull();
+    expect(earlier, '取数差异只许走 ledgerKind（?kind=）').toContain('ledgerKind');
+    expect(earlier, '向上加载不许按账本分叉').not.toContain('watchMode');
+
+    // 中断标记：同一行渲染、同一句文案，值守账里长得一模一样。
+    const cut = region(talk, '{#if turn.interruptedAt}', '{/if}');
+    expect(cut, '中断标记块该在 Talk.svelte 里').not.toBeNull();
+    expect(cut, '中断标记不许按账本分叉').not.toContain('watchMode');
+
+    // 归档开关住在 `{#if !watchMode}` 动作门**外**（新班次 / 改名 / 归档才是门内的）：
+    // 挪进那道门，值守账当场失去翻归档的口子——而 e2e 只在桌面视口断言它在场。
+    const toggleAt = talk.indexOf('class="runchip arch-toggle"');
+    const gateAt = talk.indexOf('{#if !watchMode}');
+    expect(toggleAt, 'arch-toggle 锚点该在 Talk.svelte 里').toBeGreaterThan(-1);
+    expect(gateAt, '{#if !watchMode} 动作门该在 Talk.svelte 里').toBeGreaterThan(-1);
+    expect(toggleAt, '归档开关在 watch 门之外——值守账同样开得开').toBeLessThan(gateAt);
   });
 });

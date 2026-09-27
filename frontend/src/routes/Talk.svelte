@@ -1,8 +1,9 @@
 <script lang="ts">
-  import { onMount, tick } from 'svelte';
+  import { onMount, tick, untrack } from 'svelte';
   import type {
     AllowedAction,
     BranchCursor,
+    ForemanAttention,
     ForemanBriefing,
     ForemanProposal,
     ForemanSession,
@@ -12,11 +13,13 @@
   } from '../api/types';
   import type { SpriteName } from '../theme/contract';
   import { createMenuTrap } from '../lib/menuTrap';
+  import { chipRow } from '../lib/sessionChips';
   import {
     archiveForemanSession,
     cancelForemanTurn,
     createForemanSession,
     executeForemanProposal,
+    getForemanAttention,
     getForemanSession,
     getForemanSessions,
     getTask,
@@ -59,6 +62,7 @@
   import { growTextarea } from '../lib/talkDock';
   import { stopButtonLabel, stopButtonState } from '../lib/stopButton';
   import { labelFor, loadToolLabels } from '../lib/toolLabels';
+  import { attentionKindSummary, visibleAttention } from '../lib/attentionKind';
   import { formatDateTime } from '../lib/format';
   import {
     TALK_FOLD_QUERY,
@@ -195,9 +199,45 @@
   const launchHref = typeof window === 'undefined' ? '' : window.location.href;
   /** 会话台账（时间线的权威内容；每次回话后重取，不自攒一份账）。 */
   let session = $state<ForemanSession | null>(null);
+  /**
+   * 上面还有更早的消息没加载（票 05：向上游标）。**首屏读满 `SESSION_PAGE_LIMIT`
+   * 条才置真**——500 条内的班次这条路径一次都不会走到，加载与从前逐字一致、零额外
+   * 请求；到头（游标回空段）置假，不再有向上的动作。
+   */
+  let hasMoreEarlier = $state(false);
+  /** 向上加载在途：滚到顶会连着 fire 一串 scroll 事件，靠它去重。 */
+  let loadingEarlier = $state(false);
+  /** 与后端 `routes/foreman.rs::SESSION_PAGE_LIMIT` 同一个数——判「首屏读满」的尺。 */
+  const SESSION_PAGE_LIMIT = 500;
 
   /** 未归档的班次（chip 行的数据源），按最近活动倒序。 */
   let sessionList = $state<ForemanSessionMeta[]>([]);
+  /**
+   * 未消费待办的**只读**读数（决策 307，票 executor-never-returns 06）。
+   *
+   * `null` = 还没读到 / 读不到——那时**不渲染**页头那枚读数（未接线、离线都走这一支）。
+   * 它与 `session.turn_in_flight` 无关，这正是它存在的一半理由：值守轮排队时（决策 289）
+   * 那条「值守台账 · 正在跑」的 crumb 根本不出现，而系统此刻正在报警。
+   */
+  let attention = $state<ForemanAttention | null>(null);
+  /**
+   * 页头那枚读数的渲染条件：**有未消费待办才渲染**（0 条不占窄档空间——这是一条决策，
+   * 不是顺手写的缺省值）。判据本体在 `visibleAttention` 里，由 `attentionKind.test.ts` 钉住。
+   */
+  const openAttention = $derived(visibleAttention(attention));
+  /** 类别摘要进 `title`（一行几何不许被撑开）：条数是读数，明细是悬停时看的。 */
+  const attentionTitle = $derived.by(() => {
+    if (!openAttention) return '';
+    const kinds = attentionKindSummary(openAttention.by_kind);
+    const stuck = openAttention.blocked_reads.stuck_now;
+    return [kinds, stuck > 0 ? `有 ${stuck} 个文件读卡着` : ''].filter(Boolean).join('；');
+  });
+  /**
+   * 「显示已归档」开关（票 06）：关 = 现状（chip 行只见活跃班次）。只换**列表给谁看**，
+   * 不动当前在读的那一班；不持久化——它是一次浏览动作，不是身份（与「地址记住落点」
+   * 那套不是一回事），下次进本页回到关。
+   */
+  let showArchived = $state(false);
   /**
    * 当前班次 id。**住在 `stores/talk.svelte.ts` 里**（决策 275）：在飞一轮的现场与那条
    * `/foreman/stream` 连接都挂在它上面，而它们必须活得比这个组件长——否则切一下界面再回来，
@@ -361,8 +401,18 @@
       : null,
   );
 
+  /**
+   * chip 行与 ⋯ 菜单共用的那一份（票 06：归档开关的取舍住在 `lib/sessionChips.ts`，
+   * 两处各写各的迟早分叉）。当前所在的归档班次永远在行里——见那里的判据说明。
+   */
+  const chips = $derived(chipRow(sessionList, showArchived));
   /** 折行档里班次列表的那些行（当前那一班在下一条里单独渲染成身份行）。 */
-  const otherSessions = $derived(sessionList.filter((s) => s.id !== currentId));
+  const otherSessions = $derived(chips.filter((s) => s.id !== currentId));
+  /**
+   * 当前开着的是归档班次（票 06）：只读时间线——输入坞整块不渲染、不给「恢复归档」
+   * 的口子（Q6：不做额外管理），消息内容照旧完整可读。
+   */
+  const archivedOpen = $derived(session?.session?.archived_at != null);
 
   /**
    * 展开的那张急停（决策 183）。`undefined` = 还没选过（跟随默认：**宽屏只有一张时展开它，
@@ -462,18 +512,53 @@
    * 这一条同时覆盖了「另一台设备把当前班次归档了」那条被动路径——它不在「发送中禁止切换」
    * 那把 UI 锁的覆盖范围内。
    */
+  /**
+   * 读未消费待办（决策 307，票 06）。
+   *
+   * **不进 `session` 载荷**：那一条的契约是「这一班的台账」，而待办是**跨班次的任务侧**
+   * 事件（值守轮在那里排队时，人正看着人的班次，两条读数来自两处）。另起一个只读端点，
+   * 也就让它能在值守轮排队期间独立刷新——那正是它存在的理由。
+   *
+   * 读失败只是**不显示**：未接线 / 离线时它不该把「读台账」也弄红（本页的主责是对话）。
+   */
+  async function loadAttention(): Promise<void> {
+    try {
+      attention = await getForemanAttention();
+    } catch {
+      attention = null;
+    }
+  }
+
   async function reload(want?: string | null): Promise<boolean> {
     try {
       // 两本账各读各的（票 04 / 决策 286）：`?kind=` 缺省只回人的班次，值守账要显式要。
       // 「指定的 id 不在这一班的列表里」因此按账本各自判——把 talk 的 id 递到值守账
       // （或反过来，刷新后的 localStorage 兜底就是这条路径）回落到本账的默认落点。
-      const list = await getForemanSessions(undefined, ledgerKind);
+      const list = await getForemanSessions(undefined, ledgerKind, showArchived);
       const target = want === undefined ? currentId : want;
-      const known = !!target && list.sessions.some((s) => s.id === target);
+      // 「找得到」多认一种（票 06）：**已经在读的那一班**——归档开关关着时它不在
+      // 列表里，但人正看着它，把人弹去默认班才是错。只宽这一种：地址 / 兜底文件指到
+      // 一班**没加载的**归档班，照旧回落默认（决策 204⑥：指定的不在列表里 → 去最近
+      // 有人说话的那一班）。
+      const known =
+        !!target &&
+        (list.sessions.some((s) => s.id === target) ||
+          target === (session?.session?.id ?? null));
       const payload = await getForemanSession(known ? target : null, undefined, ledgerKind);
       sessionList = list.sessions;
-      session = payload;
       const landed = payload.session?.id ?? null;
+      // 同一班的重读（台账代次那一声，一轮落地后常见）：**已在屏的更早段留着**——
+      // 重读只回最近 500 条，直接盖上去会把滚上去加载的那段历史变没（票 05：已加载的
+      // 消息不重不漏）。换班（`landed !== prevId`）不并：那是另一班的账。
+      const prevId = session?.session?.id ?? null;
+      const fresh = payload.messages ?? [];
+      if (landed !== null && landed === prevId && fresh.length > 0) {
+        const older = (session?.messages ?? []).filter((m) => m.id < fresh[0].id);
+        if (older.length > 0) payload.messages = [...older, ...fresh];
+      }
+      session = payload;
+      // 首屏读满才有「更上一层」可言；同一班重读也按这一拍重算（台账可能长过了 500）。
+      hasMoreEarlier = fresh.length >= SESSION_PAGE_LIMIT;
       if (landed !== currentId) generation += 1;
       talk.watch(landed);
       rememberLanding(landed, payload.session);
@@ -482,6 +567,8 @@
       // 才会照旧接进时间线——否则刷新之后实时回话整段看不见，只剩落地后重读台账；
       // 而**切走再回来**那一趟靠 store 里没走的在飞现场接着（决策 275）。
       talk.syncFollowing(payload);
+      // 未消费待办的读数与班次同一次重读刷一遍（决策 307，票 06）。
+      await loadAttention();
       loadError = null;
       loadErrorPairing = false;
       return true;
@@ -492,6 +579,54 @@
     } finally {
       loading = false;
     }
+  }
+
+  /**
+   * 滚到顶加载更早的消息（票 05：`before_id` 向上游标）。
+   *
+   * **阅读位置不跳**：接上去之前记下滚动高度与位置，段接到头部、`tick()` 等 DOM 长高
+   * 之后把 scrollTop 补上长高的那一截——眼睛看着的那一行 stays put。
+   * 到头的信号就是**空段**（后端不另给 `has_more`）；到头后 `hasMoreEarlier` 置假，
+   * 这条路不再走到。读失败只收手：位置不动、游标不废，下一次滚到顶自然重试。
+   */
+  async function loadEarlier(): Promise<void> {
+    if (loadingEarlier || !hasMoreEarlier) return;
+    const oldest = session?.messages?.[0]?.id;
+    if (oldest == null) {
+      hasMoreEarlier = false;
+      return;
+    }
+    const gen = generation;
+    const el = timelineEl;
+    const prevHeight = el?.scrollHeight ?? 0;
+    const prevTop = el?.scrollTop ?? 0;
+    loadingEarlier = true;
+    try {
+      const page = await getForemanSession(currentId, undefined, ledgerKind, oldest);
+      // 这一趟之间换班 / 重读了：这一段是对着旧台账取的，接上去就是串台（决策 204⑥
+      // 同一条纪律——await 之后比对记号，不符即丢）。
+      if (gen !== generation) return;
+      const older = page.messages ?? [];
+      if (older.length === 0) {
+        hasMoreEarlier = false;
+        return;
+      }
+      if (session) session = { ...session, messages: [...older, ...session.messages] };
+      // 整段读满才可能还有更上一层（后端每段最多 500 条）。
+      hasMoreEarlier = older.length >= SESSION_PAGE_LIMIT;
+      await tick();
+      if (el) el.scrollTop = prevTop + (el.scrollHeight - prevHeight);
+    } catch {
+      // 读失败不碰现场：游标没变、位置没动，下次滚到顶重试。
+    } finally {
+      loadingEarlier = false;
+    }
+  }
+
+  /** 滚到顶触发向上加载（票 05）：留一小段余量，免得要滚得严丝合缝才触发。 */
+  function onTimelineScroll(): void {
+    const el = timelineEl;
+    if (el && el.scrollTop < 160) void loadEarlier();
   }
 
   /**
@@ -683,10 +818,13 @@
       dialog = null;
       generation += 1;
       resetSessionState();
-      const list = await getForemanSessions();
+      const list = await getForemanSessions(undefined, ledgerKind, showArchived);
       sessionList = list.sessions;
-      if (list.sessions.length > 0) {
-        await reload(list.sessions[0].id);
+      // 切去**最近活动的未归档班**（决策 204）：开关开着时列表含归档，而刚归档的那班
+      // `last_active_at` 最新会排第一——照 `sessions[0]` 切就是「归档完原地不动」。
+      const next = list.sessions.find((s) => !s.archived_at);
+      if (next) {
+        await reload(next.id);
       } else {
         // 一个不剩：新开一班（走不带守卫的那条，见 `openFreshSession`）
         await openFreshSession();
@@ -851,10 +989,16 @@
   /**
    * 只在**轮数**变化时滚：流式增量改的是某一轮的内容，不是轮数，故流式期间视口不乱动；
    * 而发送（乐观轮 + 值班长那一轮进来）与回话落地（台账覆盖）都是轮数变化。
+   *
+   * **向上补历史那一拍不滚**（票 05）：`loadEarlier` 把更早的段接进头部，轮数同样变多，
+   * 但那不是「新轮落地」——滚到底会把刚用 scrollTop 保住的阅读位置当场掀翻（e2e 那条
+   * 「不许挪窝」量的就是它）。用 `untrack` 读在途标记：订阅它的话，标记在收尾落回
+   * `false` 会让这条效果再跑一次，照样滚到底。
    */
   $effect(() => {
     const n = turns.length;
     if (n === 0) return;
+    if (untrack(() => loadingEarlier)) return;
     void tick().then(scrollToNewest);
   });
 
@@ -1099,7 +1243,7 @@
    */
   async function refreshSessionList() {
     try {
-      const list = await getForemanSessions(undefined, ledgerKind);
+      const list = await getForemanSessions(undefined, ledgerKind, showArchived);
       sessionList = list.sessions;
       const next = pruneSeen(
         seen,
@@ -1112,6 +1256,16 @@
     } catch {
       // 列表读不到不影响这一屏：标记晚一步出现而已，台账是权威
     }
+  }
+
+  /**
+   * 「显示已归档」开关（票 06）。只换**列表给谁看**，不动当前在读的那一班——
+   * 关掉时归档的从行里**全部**退场（含正在读的这班：开关关着还挂一枚灰 chip
+   * 就是在说谎），正在读这件事由时间线与只读提示自己说，选中错不到活跃班头上。
+   */
+  async function toggleShowArchived() {
+    showArchived = !showArchived;
+    await refreshSessionList();
   }
 
   /**
@@ -1336,7 +1490,18 @@
            （值班板的「8 工位」与那两行说明都收进了桌面款），故窄屏没有漏译。 -->
       <span class="stat-wide">夜班态势：8 工位（流水线的阶段）</span>
       <span class="sep stat-wide">▪</span>
-      <span>本次会话 {session ? formatTokens(session.total_tokens) : '—'} tok</span>
+      <span class="tok">本次会话 {session ? formatTokens(session.total_tokens) : '—'} tok</span>
+      <!-- 未消费待办的读数（决策 307，票 06）：**独立一枚只读 span**，不并进下面那条
+           「值守台账 · 正在跑」的 crumb——后者的判据是「值守轮在飞」，而本读数最该被看见的
+           时候恰好是值守轮**正在排队**（决策 289），那一刻 `in_flight = false`、crumb
+           根本不出现。条数为 0 时不渲染（省窄档空间）。
+           窄档用「本次会话 N tok」腾位置（`.tok` 在 ≤479 收起）：决策 300 摘掉状态条时
+           腾出的位置补的是**这一类读数**——不是决策 300 明说不做的 pending，两者语义不同
+           （一个报「系统在报警」，一个报「看板上的待办列」，后者看板顶栏已有）。 -->
+      {#if openAttention}
+        <span class="sep">▪</span>
+        <span class="attn" title={attentionTitle}>{`待办 ${openAttention.open} 条`}</span>
+      {/if}
       {#if watchMode}
         <!-- 回对讲台（票 04）：只读账上唯一的出口，与人的对讲台页头末尾那条「值守台账」
              是同一对进法的两半。挂页头元信息行而不是班次行——值守台账**不是一班**，
@@ -1367,20 +1532,34 @@
          **不得渲染成 `.turn`**：时间线里那些是发言，而这是一排控件。 -->
     {#if !folded}
       <div class="runrow no-scrollbar" role="group" aria-label="班次">
-        {#each sessionList as s (s.id)}
+        {#each chips as s (s.id)}
           <!-- 切换**不因 `sending || busy` 禁用**（决策 220②）：回话中也可以换班次，
-               「那一轮回话去哪了」由 ⋯ 列表里的两枚标记说。 -->
+               「那一轮回话去哪了」由 ⋯ 列表里的两枚标记说。灰 chip = 已归档（票 06）：
+               判据在 `archived_at` 字段上，与活跃班次一眼可辨。 -->
           <button
             type="button"
             class="runchip"
             class:now={s.id === currentId}
+            class:arch={s.archived_at != null}
             aria-pressed={s.id === currentId}
-            title={s.title}
+            title={s.archived_at != null ? `${s.title}（已归档，只读）` : s.title}
             onclick={() => void switchTo(s.id, { write: true })}
           >
             {s.title}
           </button>
         {/each}
+        <!-- 「显示已归档」开关（票 06）：放在动作块**之外**——值守账同样能翻归档
+             （只读账本来就只读，开关与它不冲突）。 -->
+        <button
+          type="button"
+          class="runchip arch-toggle"
+          class:on={showArchived}
+          aria-pressed={showArchived}
+          title="列表里显不显示已归档的班次"
+          onclick={() => void toggleShowArchived()}
+        >
+          显示已归档
+        </button>
         {#if !watchMode}
           <!-- 只读账上这些「说话 / 动手」的班次动作全部收起（票 04）：值守台账不是一班，
                不开新班、不改名、不归档。 -->
@@ -1400,15 +1579,19 @@
               disabled={sending || busy}
               onclick={openRename}>改名</button
             >
-            <button
-              type="button"
-              class="runchip act"
-              disabled={sending || busy}
-              onclick={() => {
-                dialogError = null;
-                dialog = 'archive';
-              }}>归档</button
-            >
+            {#if !archivedOpen}
+              <!-- 归档按钮对已归档的班退场（票 06 的只读）：它已经归档了，再按一次
+                   没有意义，而「恢复归档」这个口子本轮明确不做（Q6：不做额外管理）。 -->
+              <button
+                type="button"
+                class="runchip act"
+                disabled={sending || busy}
+                onclick={() => {
+                  dialogError = null;
+                  dialog = 'archive';
+                }}>归档</button
+              >
+            {/if}
           {/if}
         {/if}
       </div>
@@ -1449,8 +1632,8 @@
             {@const cur = session.session}
             {@const curMark = markersFor(cur)}
             <!-- 当前班次是**身份行**不是按钮：点了它没有去处（你已经在这一班）。
-                 `aria-current` 让它既可见又播报（票 04）。 -->
-            <div class="mi now" aria-current="true">
+                 `aria-current` 让它既可见又播报（票 04）。灰 = 已归档（票 06）。 -->
+            <div class="mi now" class:arch={cur.archived_at != null} aria-current="true">
               <span class="mi-nm">{cur.title}</span>
               <span class="mi-meta dim">{formatDateTime(cur.last_active_at)}</span>
               {#if curMark === 'replying'}<span class="mi-mark rep">正在回话</span>{/if}
@@ -1463,6 +1646,7 @@
             <button
               type="button"
               class="mi"
+              class:arch={s.archived_at != null}
               data-menu-item
               onclick={() => {
                 menuTrap.close(false);
@@ -1489,16 +1673,31 @@
               openRename();
             }}>改名</button
           >
+          {#if !archivedOpen}
+            <button
+              type="button"
+              class="mi act"
+              data-menu-item
+              disabled={sending || busy || !currentId}
+              onclick={() => {
+                menuTrap.close(false);
+                dialogError = null;
+                dialog = 'archive';
+              }}>归档</button
+            >
+          {/if}
+          <!-- 「显示已归档」开关（票 06）：折行档的镜像位——班次行收进这颗菜单之后，
+               开关也跟着进来（桌面在 `.runrow` 里，两处同一个动作）。 -->
           <button
             type="button"
             class="mi act"
+            class:on={showArchived}
             data-menu-item
-            disabled={sending || busy || !currentId}
+            aria-pressed={showArchived}
             onclick={() => {
               menuTrap.close(false);
-              dialogError = null;
-              dialog = 'archive';
-            }}>归档</button
+              void toggleShowArchived();
+            }}>显示已归档</button
           >
         </div>
       </div>
@@ -1695,6 +1894,7 @@
     class="timeline"
     class:empty={timelineEmpty}
     bind:this={timelineEl}
+    onscroll={onTimelineScroll}
     aria-label="对话时间线"
   >
     {#if loading && !session}
@@ -1860,6 +2060,16 @@
                写名牌（票 04），不靠 `proactive` 逐行猜。 -->
           <div class="dname">{turnName(turn, ledgerKind)}</div>
 
+          {#if turn.interruptedAt}
+            <!-- 已中断（票 03）：进程被杀留下的半截轮——与正常轮**只差这一行**，过程与
+                 回话照旧按正常轮渲染（断在哪一步正是排查要的证据；修订决策 223）。时刻是
+                 后端给的 `interrupted_at` 字段——界面不自己合成一条「中断轮」，台账那一行
+                 就是唯一真相（退役决策 260 裁决③ 的本地合成）。 -->
+            <div class="cut" data-interrupted="1">
+              已中断 · {formatDateTime(turn.interruptedAt)}
+            </div>
+          {/if}
+
           <!-- ── 过程：这一轮**按发生顺序**的一步一步（决策 273）──
                值班长的一轮常态是「先想 → 查台账 → 再想 → 收口」，而此前三份留痕是三个
                各自累积的桶（回话在前、思考与回执在后），顺序整个丢了——用户报的
@@ -1998,9 +2208,11 @@
     {/each}
   </section>
 
-  <!-- ── 输入坞：钉底。Enter 发送 / Shift+Enter 换行；发送中禁用。
-       只读账不渲染它（票 04）——值守台账不出输入坞、不出发送态，说话回对讲台。 ── -->
-  {#if !watchMode}
+  <!-- ── 输入坞：钉底。Enter 发送 / Shift+换行；发送中禁用。
+       只读账不渲染它（票 04）——值守台账不出输入坞、不出发送态，说话回对讲台。
+       归档班次同样不渲染（票 06）：只读时间线，消息完整可读，但说不了话——归档的
+       语义仍是「收起来」，不因为翻回来看一眼就变回活跃（也没有「恢复归档」的口子）。 ── -->
+  {#if !watchMode && !archivedOpen}
     <form
       class="typer"
       class:warn={streamStatus === 'error'}
@@ -2057,6 +2269,10 @@
         {/if}
       </div>
     </form>
+  {:else if archivedOpen}
+    <!-- 归档班次的坞位（票 06）：留一句实情，免得输入区的空白看起来像「坏了」——
+         只读，且说清去处（对话一字不少，说话去活跃的班次）。 -->
+    <div class="ro-note dim">已归档的班次只读——说的话都在上面；要接着聊，去没归档的班次。</div>
   {/if}
 
   <!-- ── 班次的重命名与归档（决策 204③：走 Modal，不另造第二套对话框） ── -->
@@ -2097,8 +2313,11 @@
     <p>
       归档只是把「{session?.session?.title ?? ''}」从班次列表里收起来。
     </p>
+    <!-- 票 04：消息表豁免保留期后，这句不再提「按保留期 30 天到期清理」——照旧那么说
+         是与永久语义**相反**的困惑。显式修订决策 204⑦「归档不保护消息，照旧吃保留期」
+         与 182④「同一把保留期尺」：归档且豁免之后消息永存。 -->
     <p class="dim note">
-      说的话不会被删，但照旧按保留期（默认 30 天，可配）到期清理——归档是收起来，不是永久保存。
+      说的话不会被删，也不会到期清理——历史对话永久保留。
       归档后自动切到最近有说话的班次；如果这是最后一个，就新开一班。
     </p>
     {#if dialogError}
@@ -2328,6 +2547,25 @@
   .runchip:disabled {
     opacity: 0.5;
   }
+  /* 已归档的班（票 06）：灰一档、描边降一档——与活跃班次一眼可辨。选中时照样是灰的
+     （「归档」说的是它的身份、「now」说的是选中，两件事正交：灰不许因为选中而退场，
+     「打开归档班次不把选中项弄脏」的可见一半就在这里）。 */
+  .runchip.arch {
+    opacity: 0.55;
+    border-color: var(--text-3);
+  }
+  .runchip.now.arch {
+    opacity: 0.8;
+    background: var(--wash);
+    border-color: var(--text-2);
+  }
+  /* 「显示已归档」开关（票 06）：按下态借 `.now` 那档 wash 表示「开着」——
+     它是开关不是班次，故只借底色，不借「选一条班次」的边框语义。 */
+  .runchip.arch-toggle.on {
+    background: var(--wash);
+    color: var(--text-hi);
+    border-color: var(--text-2);
+  }
   .quiet {
     color: var(--text-3);
     line-height: 1.8;
@@ -2409,6 +2647,15 @@
   }
   .turn.failed p {
     color: var(--stop);
+  }
+  /* 已中断（票 03）：与失败灯同一个 token——它同样是「这一轮没跑完」，不另造色。
+     但**整轮不染红**：它与正常轮只差这一行标记（同构是票面的验收项），过程与回话
+     照旧按正常轮读。 */
+  .turn .cut {
+    color: var(--stop);
+    font-size: 12px;
+    line-height: 1.6;
+    margin: 2px 0 4px;
   }
   /* ── 提议轮（决策 188 / 207，票 03）：操作台记的一笔账 + 一颗等人按的钮。
      **不占琥珀、不加 ▼、不加硬投影**——决策 203 把「全站唯一的响」留给急停轮，
@@ -2732,6 +2979,16 @@
       inset 0 0 0 2px var(--bg),
       inset 0 0 0 4px var(--pane);
   }
+  /* 归档班次的只读坞位（票 06）：占输入坞那一**格**——只换一句实情，
+     版面骨架（网格三行两列）一个数都不动。 */
+  .ro-note {
+    grid-column: 1;
+    grid-row: 4;
+    padding: 10px 12px 11px;
+    background: var(--bg);
+    border: 2px solid var(--pane);
+    font-size: 12px;
+  }
   .typer .dname {
     color: var(--text-3);
   }
@@ -3039,6 +3296,15 @@
       background: var(--wash);
       color: var(--text-hi);
     }
+    /* 已归档的行（票 06）：灰一档——身份行与可点的行同一套灰（与 chip 行同判据）。 */
+    .mi.arch {
+      opacity: 0.55;
+    }
+    /* 「显示已归档」开关的按下态（票 06）：借 `.now` 那档 wash 表示「开着」。 */
+    .mi.act.on {
+      background: var(--wash);
+      color: var(--text-hi);
+    }
     /* 两枚标记（决策 220③）：**用词而不是纯色块**（决策 195 的次级必读档门槛），
        且不加动画位。「有新动静」比行右端的时间戳亮一档——它是叫你回去看一眼的那一句。 */
     .mi-mark.fresh {
@@ -3155,6 +3421,15 @@
       grid-template-areas: 'field send';
       gap: 6px 10px;
     }
+    /* 只读坞位同档处理（票 06）：同序、同钉位、同呼吸——换的只是那一句，不是骨架。 */
+    .ro-note {
+      order: 4;
+      flex: none;
+      position: sticky;
+      bottom: var(--sbar-h);
+      z-index: 25;
+      margin-top: 24px;
+    }
     .typer textarea {
       grid-area: field;
       /* 自长 1 行起步（决策 282 ③）：`app.css` 的 `textarea.input` 基线是
@@ -3204,6 +3479,12 @@
        （不改的话会白吃 4px）。 */
     .talk {
       margin-bottom: 0;
+    }
+    /* 窄档：把「本次会话 N tok」让给页头那枚待办读数（决策 307）。
+       `textContent` 仍在 DOM 里（既有 e2e 那条 `toContainText(/本次会话 … tok/)` 不受影响），
+       只是不再占这一行的宽度。 */
+    .tok {
+      display: none;
     }
   }
 </style>

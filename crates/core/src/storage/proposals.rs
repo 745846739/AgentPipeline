@@ -507,6 +507,32 @@ impl Store {
         Ok(affected as usize)
     }
 
+    /// 这一轮**实际提了几条提议**（决策 311，票 foreman-burns 03）。
+    ///
+    /// 判据与 [`Self::invalidate_pending_foreman_proposals`] /
+    /// [`Self::mark_pending_foreman_proposals_stopped`] **同一把尺**（`session_id` +
+    /// `created_at >= since`），不另造一个「这一轮」的定义——收场文案要说的正是那两条路
+    /// 处理的那批东西，两把尺不一致就会再出现一次「文案说有一批、库里其实没有」。
+    ///
+    /// 与它们不同的是**不筛状态**：文案问的是「这一轮提没提过提议」，提过就是提过
+    /// （按掉的、过期的不改变「提过」这个事实）。这才对得上 2026-09-27 那次的事实——
+    /// 该会话的提议计数是 **0**，而文案说「这一轮提的提议都还在」。
+    pub async fn count_round_foreman_proposals(
+        &self,
+        session_id: &str,
+        since: DateTime<Utc>,
+    ) -> Result<usize> {
+        let count: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM kanban_foreman_proposals
+             WHERE session_id = ? AND created_at >= ?",
+        )
+        .bind(session_id)
+        .bind(ts(since))
+        .fetch_one(self.pool())
+        .await?;
+        Ok(count as usize)
+    }
+
     /// 超过保留期、**没人按过**的修复提议（决策 212③ / 票 12 的最后一格）。
     ///
     /// 为什么需要它：修复提议的 worktree 只被两条路回收——人按「合入」、人按「拒绝」。

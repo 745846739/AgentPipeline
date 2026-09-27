@@ -23,12 +23,101 @@ export interface ForemanStreamState {
    *
    * **末尾若是 `text`，它就是「正在说的那一句」**（还没落定的回话）：随后跟来工具调用就是说
    * 它是中途的话，跟来收尾就是它就是回话。判据在 `lib/talkTurns.ts::buildTurns`，这里只攒。
+   *
+   * 这是**到得就攒、不挑**的那一份（不按 `seq` 过滤）：过滤是渲染时对着快照做的
+   * （{@link spliceAccepts}），故快照刷新、基准前进之后能**重新**按新基准筛一遍——
+   * 到达时就筛会让「基准后来长了」变成重复字。
    */
   steps: ForemanLiveStep[];
+  /**
+   * 本轮到达的**原始事件**（带位置戳，票 02）：`steps` 是它的归约，这一份是**拼接的原料**。
+   *
+   * 为什么两份都要：`steps` 归约时把逐块滴出来的字并成了一段，位置号随之丢失——
+   * 而「快照到 seq0、接 seq > seq0 的尾巴」要的正是逐事件的位置。渲染时有在途行就
+   * 按 {@link foldForemanEvents} 重归约（先按 {@link spliceAccepts} 筛），没有就直接用
+   * `steps`（与快照进来之前逐字一致）。
+   */
+  events: ForemanLiveEvent[];
   /** 是否仍在流：只有 `true` 才渲染既有方块光标（`.streaming`，不新增动画位）。 */
   streaming: boolean;
   /** 断流 / 出错说明；非空时 `steps` 照常显示（降级为一次性显示已收到的部分）。 */
   error: string | null;
+}
+
+/**
+ * 一条**原始**直播事件（票 02）：与 SSE 载荷同形，只留归约要的字段。
+ *
+ * `ledger_id` / `seq` 都是**可选**的（老后端 / 流水线事件不带），判据里
+ * 「不带 seq 的按既有路径处理」那一支正是为它们留的。
+ */
+export type ForemanLiveEvent =
+  | {
+      kind: 'delta';
+      channel: 'content' | 'reasoning';
+      text: string;
+      ledger_id?: number | null;
+      seq?: number | null;
+    }
+  | {
+      kind: 'tool';
+      tool: string;
+      args_summary: string;
+      /** 完整参数原文与结果（决策 301）：老后端不发 → 缺省，归约时落成空串。 */
+      args?: string;
+      result?: string;
+      phase: 'start' | 'end' | 'error';
+      ledger_id?: number | null;
+      seq?: number | null;
+    };
+
+/**
+ * 快照与直播的**拼接判据**（票 02）：到达的这一条增量要不要接进时间线。
+ *
+ * 三支，各对一种事实：
+ * - `seq <= seq0` → **丢**：它已经在快照那一行里了（快照是行的当前全量），再接就是重复字；
+ * - `seq > seq0` → **接**：快照之后才广播的，快照里没有它，不接就丢字；
+ * - **不带 seq**（老后端 / 流水线事件 / 手里没有基准）→ 按**既有路径**接——加性字段的
+ *   老规矩：不认识就不改变行为。
+ *
+ * `ledger_id` 对不上（这条事件属于另一条在途行）同样按既有路径接：那一行的内容不归
+ * 这一屏的基准管，拿别人的基准丢它才是丢字。
+ *
+ * **seq 只做去重，不做回放**（决策 275 原样）：本判据只决定「到达的这条接不接」，
+ * 从不触发任何补取——没到过的字靠**下一次快照**（`GET /foreman/session`）读回，
+ * 而不是靠事件重发。
+ */
+export function spliceAccepts(
+  event: Pick<ForemanLiveEvent, 'ledger_id' | 'seq'>,
+  base: { id: number; seq: number } | null,
+): boolean {
+  if (!base || event.seq == null) return true;
+  if (event.ledger_id != null && event.ledger_id !== base.id) return true;
+  return event.seq > base.seq;
+}
+
+/**
+ * 原始事件 → 步序（与 {@link appendForemanEvent} 里那条归约**同一套规则**）。
+ *
+ * 单独存在的理由：渲染时要**先按快照筛、再归约**（见 {@link ForemanStreamState::events}）
+ * ——归约不可逆（逐块滴的字并成了一段），筛在归约之后就没法做了。
+ */
+export function foldForemanEvents(events: readonly ForemanLiveEvent[]): ForemanLiveStep[] {
+  let steps: ForemanLiveStep[] = [];
+  for (const ev of events) {
+    if (ev.kind === 'tool') {
+      steps = appendToolStep(steps, {
+        kind: 'tool',
+        tool: ev.tool,
+        args_summary: ev.args_summary,
+        args: ev.args ?? '',
+        result: ev.result ?? '',
+        phase: ev.phase,
+      });
+    } else {
+      steps = appendStep(steps, ev.channel === 'reasoning' ? 'thinking' : 'text', ev.text);
+    }
+  }
+  return steps;
 }
 
 /**
@@ -42,15 +131,26 @@ export interface ForemanStreamState {
 export type ForemanLiveStep =
   | { kind: 'thinking'; text: string }
   | { kind: 'text'; text: string }
-  | { kind: 'tool'; tool: string; args_summary: string; phase: 'start' | 'end' | 'error' };
+  | {
+      kind: 'tool';
+      tool: string;
+      args_summary: string;
+      /** 展开详情（决策 301）：原文恒在场（start 就带），结果只在收尾后非空。 */
+      args: string;
+      result: string;
+      phase: 'start' | 'end' | 'error';
+    };
+
+/** 工具那一步（{@link ForemanLiveStep} 的工具分支）：合并相位时按这个形状替换。 */
+export type ForemanToolStep = Extract<ForemanLiveStep, { kind: 'tool' }>;
 
 export function emptyForemanStream(): ForemanStreamState {
-  return { steps: [], streaming: false, error: null };
+  return { steps: [], events: [], streaming: false, error: null };
 }
 
 /** 开一轮新回话：丢掉上一轮的残留，点亮方块光标。 */
 export function beginForemanStream(): ForemanStreamState {
-  return { steps: [], streaming: true, error: null };
+  return { steps: [], events: [], streaming: true, error: null };
 }
 
 /**
@@ -78,10 +178,14 @@ function appendStep(
  * （`run_tool` 在 for 循环里 await），故「最后一步仍处于 `start`」就是「这一次调用在等结果」。
  * 用工具名配对是不够的：同一轮里连着查两次 `read_task` 是常态。
  */
-function appendToolStep(steps: ForemanLiveStep[], live: ForemanLiveStep): ForemanLiveStep[] {
+function appendToolStep(steps: ForemanLiveStep[], live: ForemanToolStep): ForemanLiveStep[] {
   const last = steps[steps.length - 1];
-  const openCall = last && last.kind === 'tool' && last.phase === 'start';
-  return openCall ? [...steps.slice(0, -1), live] : [...steps, live];
+  if (last && last.kind === 'tool' && last.phase === 'start') {
+    // 收尾那条事件整条换掉开调那一条（同一次调用），但 `args` 若这一条没带
+    // （老后端只发摘要），保住 start 那一份——详情字段不许在合并里凭空丢。
+    return [...steps.slice(0, -1), { ...live, args: live.args || last.args }];
+  }
+  return [...steps, live];
 }
 
 /**
@@ -110,17 +214,44 @@ export function appendForemanEvent(
   if (!isChatter || event.agent_type !== FOREMAN_AGENT_TYPE) return state;
   if (!sessionId || event.session_id !== sessionId) return state;
   if (event.type === 'tool_event') {
-    const live: ForemanLiveStep = {
+    const live: ForemanToolStep = {
       kind: 'tool',
       tool: event.tool,
       args_summary: event.args_summary,
+      // 详情字段老后端不发 → 空串（界面回落到摘要那一行，决策 301 的加性口径）。
+      args: event.args ?? '',
+      result: event.result ?? '',
       phase: event.phase,
     };
-    return { ...state, steps: appendToolStep(state.steps, live) };
+    // 原始事件带着位置戳一起攒（票 02）：`steps` 供没有基准时的渲染，`events` 供
+    // 有在途行时按快照重新筛。两份同一次到达、同一条守卫，不会各走各的。
+    const raw: ForemanLiveEvent = {
+      kind: 'tool',
+      tool: event.tool,
+      args_summary: event.args_summary,
+      args: event.args,
+      result: event.result,
+      phase: event.phase,
+      ledger_id: event.ledger_id,
+      seq: event.seq,
+    };
+    return {
+      ...state,
+      steps: appendToolStep(state.steps, live),
+      events: [...state.events, raw],
+    };
   }
+  const raw: ForemanLiveEvent = {
+    kind: 'delta',
+    channel: event.channel === 'reasoning' ? 'reasoning' : 'content',
+    text: event.text,
+    ledger_id: event.ledger_id,
+    seq: event.seq,
+  };
   return {
     ...state,
     steps: appendStep(state.steps, event.channel === 'reasoning' ? 'thinking' : 'text', event.text),
+    events: [...state.events, raw],
   };
 }
 
@@ -258,11 +389,33 @@ export function settleForemanStream(
   const steps = state.steps;
   const last = steps[steps.length - 1];
   const settled: ForemanLiveStep = { kind: 'text', text: reply };
+  // 原始事件那一份跟着一起收敛（票 02）：把末尾那段正文增量整段换成权威回话，
+  // 位置戳沿用段尾那一条——它是同一句说话的更完整版本，不该凭空领一个新号。
+  const events = (() => {
+    const evs = state.events;
+    let cut = evs.length;
+    while (cut > 0) {
+      const e = evs[cut - 1];
+      if (e.kind === 'delta' && e.channel === 'content') cut--;
+      else break;
+    }
+    const tail = evs.slice(cut);
+    const stamp = [...tail].reverse().find((e) => e.seq != null);
+    const settledRaw: ForemanLiveEvent = {
+      kind: 'delta',
+      channel: 'content',
+      text: reply,
+      ledger_id: stamp?.ledger_id,
+      seq: stamp?.seq,
+    };
+    return [...evs.slice(0, cut), settledRaw];
+  })();
   return {
     steps:
       last && last.kind === 'text'
         ? [...steps.slice(0, -1), settled]
         : [...steps, settled],
+    events,
     streaming: false,
     error: null,
   };
@@ -320,7 +473,10 @@ export type FollowOutcome =
   /** 落了地：台账那一行接管（它会带着完整回话进来），本地那一段该收掉了。 */
   | { kind: 'settled' }
   /**
-   * **没落地而服务端也不再报在跑**（进程被杀 / 重启）：这一轮永远不会再落一行。
+   * **没落地、服务端也不再报在跑、台账里也没有那条行的终态**——只剩「半截行还没建出来 /
+   * 还没轮到标」的竞态窗口。进程被杀**又重启**的那一类不走这里：启动恢复把悬挂行标成
+   * `interrupted`，由上面 `settled` 那一支交给台账接管（talk-replay 票 03，显式修订
+   * 决策 223「不做进程退出那一轮的落账」）。
    *
    * 收成一条**失败轮**——不是把半截字清掉。这是本仓那条一以贯之的纪律的落点：
    * 「已经出现的文字，任何一支都不许把它清掉」（本模块文件头，票 03 立的）。
@@ -335,10 +491,14 @@ export type FollowOutcome =
  * - {@link turnLanded}（台账尾部有没有新行）——答「它答完了吗」；
  * - `turn_in_flight`——答「服务端还认不认这一轮」。
  *
- * 两件都是假，就是**死轮**：回话永远不会来（决策 223 明确不做进程退出那一轮的落账）。
- * 此时**不许清字**——那一段是这一轮留下的全部，清掉正是用户报的那条毛病
- * （「刷新就看不到实时对话流」）在死轮场景下的残留子集。故这一支收成一条失败轮，
- * 把已经收到的部分原样留着（{@link failForemanStream} 的既有姿态），并说清发生了什么。
+ * 两件都是假、而台账里也没有它的终态，就是**死轮**：回话永远不会来。进程被杀**又重启**
+ * 的那一类不算死轮——启动恢复把悬挂行标成 `interrupted`，下面就地收口那一支把时间线
+ * 交给台账重算（talk-replay 票 03：**显式修订决策 223**「不做进程退出那一轮的落账」，
+ * 并让**决策 260 裁决③** 的本地合成对这一类退役——中断行即终态，界面不再自己拼一条
+ * 失败轮与台账并排成两套真相）。剩下的死轮仍**不许清字**——那一段是这一轮留下的全部，
+ * 清掉正是用户报的那条毛病（「刷新就看不到实时对话流」）在死轮场景下的残留子集。
+ * 故这一支收成一条失败轮，把已经收到的部分原样留着（{@link failForemanStream} 的既有
+ * 姿态），并说清发生了什么。
  *
  * `|| !turn_in_flight` **不能摘**（只按 `turnLanded` 判的话，死轮会永远跟下去——每 3s
  * 一趟，永远不落地）。
@@ -349,6 +509,25 @@ export function resolveFollowOutcome(
   turnInFlight: boolean,
 ): FollowOutcome {
   if (turnLanded(rows, anchor)) return { kind: 'settled' };
+  // **就地收口那一条支路**（票 01 修订了「多一行才算落地」）：半截行收口时写的是
+  // **同一行**（`status` 从 `in_flight` 落成 `null`），尾部不会多出任何一行——判不出
+  // 落地就会把正常收口误判成死轮（`lost`），半截字于是顶着「不会再来」的说明。
+  //
+  // **中断行同支**（talk-replay 票 03）：`status` 落成 `interrupted` 同样是终态——判据
+  // 只看「离开 in_flight」，时间线由台账那条行重算（决策 260 裁决③的本地合成对这一类
+  // 退役：不再拼一条失败轮与台账那条行并排成两套真相）。
+  //
+  // 只认**助理侧的行**（`fm` / `ask`）：接手时锚点可能是**用户行**（半截行还没建出来的
+  // 那个竞态窗口）——用户行从没在过途、收口也与它无关，按它判会把「还没落」误判成
+  // 「落了」，而那一支会清掉流（「任何一支都不许清字」的纪律在票 03 立着）。
+  const anchored = rows.find((m) => m.id === anchor);
+  if (
+    anchored &&
+    anchored.status !== 'in_flight' &&
+    (anchored.kind === 'fm' || anchored.kind === 'ask')
+  ) {
+    return { kind: 'settled' };
+  }
   return turnInFlight ? { kind: 'keep' } : { kind: 'lost' };
 }
 
@@ -407,7 +586,7 @@ export function failureNotice(message: string, timedOut: boolean): string {
  * （决策 253② 要挡的形状），且后端将来加一种 `kind` 时这里不会跟着宽、只会静默落在
  * 「不是 failed」那一支。`Pick` 让它们是**同一个**类型。
  */
-export type LedgerRow = Pick<ForemanMessage, 'id' | 'kind'>;
+export type LedgerRow = Pick<ForemanMessage, 'id' | 'kind' | 'status'>;
 
 /** 这批轮次里**没跑起来**的那些行的 id。 */
 export function failedLedgerRowIds(rows: LedgerRow[]): Set<number> {

@@ -15,6 +15,7 @@
 import { expect, test, type Locator, type Page } from '@playwright/test';
 import { existsSync, readdirSync, readFileSync } from 'node:fs';
 import { join } from 'node:path';
+import { DatabaseSync } from 'node:sqlite';
 import {
   startApp,
   waitForTask,
@@ -1344,6 +1345,12 @@ test.describe('对讲台 · 空看板也能对话（票 04 的验收锚点）', 
  * 修法：`GET /foreman/session` 带 `turn_in_flight`（服务端进程内登记，见 `foreman.rs`），
  * 界面据此把「跟这一轮」这件事重新立起来——增量照旧接进时间线，落地后收口。
  *
+ * **票 01 / 02 把这条用例扩成拼接的完整取证**（spec：续写不新开 spec）：
+ * ① **前半段从台账读回**——半截行随广播落库（票 01），刷新后 B 还没到的那 6 秒里屏上
+ *    就有 A，而 SSE 无回放，它只可能来自快照；
+ * ② **后半截由流接上且不重**（票 02）——`seq > seq0` 的增量进直播尾巴，快照那一行
+ *    仍只到 A 为止，A 全页只出现一次。
+ *
  * **装置是 `drip` 步**（脚本那条 `drip(head, tail, gapMs)`）：回话分两截滴出来，中间留一段
  * 空档。用例因此有一个**决定性的中间态**——前半截已经在流上、后半截还没发生：
  *
@@ -1374,7 +1381,7 @@ test.describe('对讲台 · 回话中刷新页面（决策 260）', () => {
     await app?.stop();
   });
 
-  test('刷新之后增量照旧到达：中段（还没落地时来的那一截）接得住，落地后收口', async ({
+  test('刷新之后：前半段从台账读回、后半截由流接上、落地后收口（票 01/02 拼接）', async ({
     page,
   }) => {
     const bundle = watchBundle(page);
@@ -1397,27 +1404,45 @@ test.describe('对讲台 · 回话中刷新页面（决策 260）', () => {
       page.locator('.timeline .turn.mine', { hasText: '这一句要分三截答' }),
     ).toHaveCount(1, { timeout: 30_000 });
 
-    // **这一条是用例的牙齿**：B 必须在这一轮**还没落地**的时候就出现在屏上——那时台账里
-    // 只有用户那一句，故 B 只可能来自 `/foreman/stream`。界面此刻也没有本机那一趟 POST
-    // （随旧页面走了）：它靠 `turn_in_flight` 把「跟这一轮」立起来，B 才接得住。
-    // 旧行为（`if (!sending) return`）下 B 被丢掉，这里永远只有 A。
+    // **前半段从台账读回**（票 01 + 票 02 的合体，这条用例的前半颗牙）：刷新后、B 还没到
+    // 的这 6 秒里屏上已经有 A——SSE 无回放（决策 275），A 不可能来自流，它只可能来自
+    // 在途半截行。旧行为下这一段要等回话落地才看得见。
     await expect(
-      page.locator('.timeline .turn.fm').first(),
-      '刷新之后、落地之前到达的那一截必须接得住——正是这条毛病要修的东西',
-    ).toContainText(B, { timeout: 30_000 });
+      page.locator('.timeline .turn.fm', { hasText: A }),
+      '刷新后前半段必须当场可见（来自台账快照，不是等流重发）',
+    ).toHaveCount(1, { timeout: 30_000 });
 
-    // **落地之前**这一条要当场取证，否则上面那句会退化成「等台账把整段回话送回来」——
-    // 那种写法下 B 从哪来分不出（实测：第一版就是这样，摘掉闸门照样绿）。读一次服务端：
-    // 台账里仍只有用户那一句、且这一轮仍在跑，而屏幕上已经有 B 了。
+    // 读一次服务端取证：半截行在场、装着前半段、这一轮仍在跑——「前半段看得见」的来源
+    // 是它，不是别的什么地方攒着的残留。
     const live = await page.evaluate(async (apiBase) => {
       const res = await fetch(`${apiBase}/foreman/session`);
-      const body = (await res.json()) as { messages: unknown[]; turn_in_flight: boolean };
-      return { rows: body.messages.length, inFlight: body.turn_in_flight };
+      const body = (await res.json()) as {
+        messages: Array<{ role: string; content: string; status: string | null }>;
+        turn_in_flight: boolean;
+      };
+      return { messages: body.messages, inFlight: body.turn_in_flight };
     }, app.apiBase);
-    expect(live.rows, 'B 到达时台账里应当只有用户那一句（回话还没落）').toBe(1);
-    expect(live.inFlight, 'B 到达时这一轮应当仍在跑——这正是它只能来自流的前提').toBe(true);
+    expect(live.inFlight, '刷新时这一轮仍在跑').toBe(true);
+    expect(live.messages.length, 'user 行 + 在途半截行').toBe(2);
+    const half = live.messages.find((m) => m.status === 'in_flight');
+    expect(half, '在飞时台账里必须有这条回话的半截行').toBeTruthy();
+    expect(half!.content, '前半段已经在库里').toContain(A);
 
-    // 收口：C 之后回话落地，台账那一行接管（时间线上仍是这一轮，且三截齐全）。
+    // **后半截由流接上**（后半颗牙）：B 必须在这一轮**还没落地**的时候出现——而且快照
+    // 那一行仍只到 A 为止，两半各说各的：**不重**（A 全页只出现一次）、**不漏**（B 到了）。
+    // 界面此刻没有本机那一趟 POST（随旧页面走了）：它靠 `turn_in_flight` 接手、靠
+    // `seq > seq0` 把快照之后的增量接进时间线（票 02）。
+    await expect(
+      page.locator('.timeline .turn.fm').filter({ hasText: B }),
+      '刷新之后、落地之前到达的那一截必须接得住——正是这条毛病要修的东西',
+    ).toHaveCount(1, { timeout: 30_000 });
+    const timeline = await page.locator('.timeline').innerText();
+    expect(
+      timeline.split(A).length - 1,
+      '快照那一行之外不许再出现一遍 A——拼接的「不重」',
+    ).toBe(1);
+
+    // 收口：C 之后回话落地（就地写同一行），台账那一行接管——时间线上仍是这一轮，三截齐全。
     await expect(page.locator('.timeline .turn.fm').first()).toContainText(C, { timeout: 30_000 });
     await expect(page.locator('.timeline .turn.fm')).toHaveCount(1);
     const reply = page.locator('.timeline .turn.fm').first();
@@ -1567,8 +1592,11 @@ test.describe('对讲台 · 班次（决策 204）', () => {
     const row = page.locator('.talk-head .runrow');
     await expect(row).toBeVisible();
 
-    // ① 首启一个班次都没有：chip 行只有「+ 新班次」那一颗，没有改名 / 归档（还没有当前班）
-    const chips = row.locator('.runchip:not(.plus):not(.act)');
+    // ① 首启一个班次都没有：一行里**一枚班次 chip 都没有**，也没有改名 / 归档（还没有当前班）。
+    // 「显示已归档」开关（票 06）不在这条判据里——它不是班次 chip，是行里常驻的模式开关
+    // （桌面的 `.arch-toggle` 与折行档 ⋯ 菜单里那一枚是同一个动作），故选择器像变量名那样
+    // 只认班次 chip。
+    const chips = row.locator('.runchip:not(.plus):not(.act):not(.arch-toggle)');
     await expect(chips).toHaveCount(0);
     await expect(row.locator('.runchip.plus')).toHaveText('+ 新班次');
     await expect(row.locator('.runchip.act')).toHaveCount(0);
@@ -2258,6 +2286,213 @@ test.describe('对讲台 · 切走再回来，本轮已经收到的输出还在�
     await expect(back).toContainText(B);
 
     bundle.problems.length = 0;
+    expectBundleHealthy(bundle);
+  });
+});
+
+// ─────────────────────── 向上加载更早的消息（票 05）───────────────────────
+
+/**
+ * 直写库补足一个长班次的消息行（HTTP 一条条说话要几百轮模型调用——这两条用例测的
+ * 是**读历史**那条路）。
+ *
+ * 走真库（`node:sqlite`，同一个 `agentpipeline.db`）而不是 mock 端点：要证的正是
+ * 「500 缺省 + `before_id` 游标」这条真实读路径，mock 出来的分页证明不了它。
+ * app 此刻空转（`providerOnly`、没有在跑的任务），短暂的直写不会与后端的写相撞。
+ */
+function seedMessages(app: App, sessionId: string, count: number): void {
+  const db = new DatabaseSync(join(app.homeDir, 'data', 'agentpipeline.db'));
+  db.exec('PRAGMA busy_timeout = 5000');
+  const insert = db.prepare(
+    'INSERT INTO kanban_foreman_messages (session_id, role, content, created_at) VALUES (?, ?, ?, ?)',
+  );
+  const base = Date.parse('2026-09-23T10:00:00Z');
+  for (let i = 1; i <= count; i += 1) {
+    insert.run(sessionId, 'assistant', `第 ${i} 句`, new Date(base + i * 1000).toISOString());
+  }
+  db.close();
+}
+
+test.describe('对讲台 · 向上加载更早的消息（票 05）', () => {
+  let app: App;
+
+  test.beforeAll(async () => {
+    // 只要 provider（本组一个模型调用都不发），没有任务与流水线噪声。
+    app = await startApp({ script: {}, title: 'E2E 向上加载', providerOnly: true });
+  });
+
+  test.afterAll(async () => {
+    await app?.stop();
+  });
+
+  test('滚到顶加载更早一段：阅读位置不跳、不重不漏、到头即止', async ({ page }) => {
+    const bundle = watchBundle(page);
+    const sid = await makeSession(app, '长班');
+    seedMessages(app, sid, 502);
+
+    // 向上那一跳先扣住不放：有了确定的「加载中」窗口，位置快照才不是在赌时序。
+    let earlierRequests = 0;
+    let release!: () => void;
+    const gate = new Promise<void>((resolve) => (release = resolve));
+    await page.route('**/foreman/session*before_id*', async (route) => {
+      earlierRequests += 1;
+      await gate;
+      await route.continue();
+    });
+
+    await page.goto(`${app.webBase}/#/talk?session=${sid}`);
+    await settleBundle(page, bundle);
+
+    // 缺省：最近 500 条（第 3..502 句）——最老的两条还没加载，也不为它们发请求。
+    const turns = page.locator('.timeline .turn');
+    await expect(turns).toHaveCount(500, { timeout: 30_000 });
+    await expect(page.locator('.timeline .turn', { hasText: '第 1 句' })).toHaveCount(0);
+
+    // 滚到顶。位置先挪开再归零：原地不动没有 scroll 事件，触发不了加载。
+    const timeline = page.locator('.timeline');
+    await timeline.evaluate((el) => {
+      el.scrollTop = 400;
+      el.scrollTop = 0;
+    });
+    await expect.poll(() => earlierRequests, { timeout: 10_000 }).toBe(1);
+
+    // 「加载中」这一刻的阅读位置：屏顶第一条（第 3 句）在哪。
+    const topBefore = await page
+      .locator('.timeline .turn', { hasText: '第 3 句' })
+      .boundingBox();
+    expect(topBefore).not.toBeNull();
+
+    release();
+    await expect(page.locator('.timeline .turn', { hasText: '第 1 句' })).toBeVisible({
+      timeout: 30_000,
+    });
+    await expect(turns).toHaveCount(502);
+
+    // 位置不跳：两段接上之后第 3 句仍在原处（scrollTop 补上了长高的那一截）。
+    const topAfter = await page
+      .locator('.timeline .turn', { hasText: '第 3 句' })
+      .boundingBox();
+    expect(
+      Math.abs((topAfter?.y ?? 0) - (topBefore?.y ?? 0)),
+      '接上更早一段之后，正在读的那一行不许挪窝',
+    ).toBeLessThanOrEqual(2);
+
+    // 不重不漏：接缝两边各只有一份（第 3 句不重复），总数恰是 502。
+    await expect(page.locator('.timeline .turn', { hasText: '第 3 句' })).toHaveCount(1);
+
+    // 到头即止：2 条一次取完，再怎么滚到顶也没有第二跳（空段就是终点）。
+    await timeline.evaluate((el) => {
+      el.scrollTop = 400;
+      el.scrollTop = 0;
+    });
+    await page.waitForTimeout(400);
+    expect(earlierRequests, '到头之后不再发向上的请求').toBe(1);
+
+    expectBundleHealthy(bundle);
+  });
+
+  test('500 条以内的班次：加载路径与现状一致（不新增请求）', async ({ page }) => {
+    const bundle = watchBundle(page);
+    const sid = await makeSession(app, '短班');
+    seedMessages(app, sid, 5);
+
+    let earlierRequests = 0;
+    await page.route('**/foreman/session*before_id*', async (route) => {
+      earlierRequests += 1;
+      await route.continue();
+    });
+
+    await page.goto(`${app.webBase}/#/talk?session=${sid}`);
+    await settleBundle(page, bundle);
+    await expect(page.locator('.timeline .turn')).toHaveCount(5, { timeout: 30_000 });
+
+    // 反复滚到顶：「还有更早」压根不成立，一个 `before_id` 请求都不该发。
+    const timeline = page.locator('.timeline');
+    for (let i = 0; i < 3; i += 1) {
+      await timeline.evaluate((el) => {
+        el.scrollTop = 400;
+        el.scrollTop = 0;
+      });
+    }
+    await page.waitForTimeout(400);
+    expect(earlierRequests, '500 条内零额外请求').toBe(0);
+
+    expectBundleHealthy(bundle);
+  });
+});
+
+// ─────────────────────── 归档班次翻得回（票 06）───────────────────────
+
+test.describe('对讲台 · 归档班次翻得回（票 06）', () => {
+  let app: App;
+
+  test.beforeAll(async () => {
+    // 只要 provider：本组全程不发模型调用（历史消息由直写库供上）。
+    app = await startApp({ script: {}, title: 'E2E 归档翻回', providerOnly: true });
+  });
+
+  test.afterAll(async () => {
+    await app?.stop();
+  });
+
+  test('归档 → 列表消失 → 开关打开 → 灰 chip → 只读读历史 → 关开关复原', async ({ page }) => {
+    const bundle = watchBundle(page);
+    const a = await makeSession(app, '甲班');
+    seedMessages(app, a, 3);
+    const b = await makeSession(app, '乙班');
+
+    // 打开甲班（开关缺省关，它此时还在列表里——没归档）
+    await page.goto(`${app.webBase}/#/talk?session=${a}`);
+    await settleBundle(page, bundle);
+    const row = page.locator('.runrow');
+    await expect(row.locator('.runchip', { hasText: '甲班' })).toHaveCount(1);
+    await expect(page.locator('.timeline .turn')).toHaveCount(3, { timeout: 30_000 });
+
+    // ① 归档 → 从列表里收起来（现状不变），并自动切到最近有说话的未归档班（乙）
+    await row.locator('.runchip.act', { hasText: '归档' }).click();
+    const dialog = page.getByRole('dialog');
+    await dialog.getByRole('button', { name: '归档' }).click();
+    await expect(dialog).toBeHidden();
+    await expect(row.locator('.runchip', { hasText: '甲班' })).toHaveCount(0);
+    await expect(row.locator('.runchip.now')).toHaveText('乙班');
+
+    // ② 打开开关：甲班以**灰 chip** 回到行里（判据在字段上：class + 标题都说它是归档的）
+    const toggle = row.locator('.runchip.arch-toggle');
+    await expect(toggle).toHaveAttribute('aria-pressed', 'false');
+    await toggle.click();
+    await expect(toggle).toHaveAttribute('aria-pressed', 'true');
+    const archChip = row.locator('.runchip.arch', { hasText: '甲班' });
+    await expect(archChip).toHaveCount(1);
+    await expect(archChip).toHaveAttribute('title', /已归档/);
+    const opacity = parseFloat(await archChip.evaluate((el) => getComputedStyle(el).opacity));
+    expect(opacity, '灰 chip 要真的暗一档').toBeLessThan(1);
+
+    // ③ 点开：只读时间线——历史消息完整，输入坞不在、归档动作也不在（没有「恢复」口子）
+    await archChip.click();
+    await expect(page.locator('.timeline .turn')).toHaveCount(3, { timeout: 30_000 });
+    await expect(page.locator('.timeline .turn', { hasText: '第 2 句' })).toHaveCount(1);
+    await expect(page.locator('.typer'), '只读：没有输入坞').toHaveCount(0);
+    await expect(page.locator('.ro-note')).toBeVisible();
+    await expect(row.locator('.runchip.act', { hasText: '归档' }), '已归档的不再给归档钮').toHaveCount(
+      0,
+    );
+    // 选中项不弄脏：当前是归档的甲（灰而选中），乙没有被错点亮
+    await expect(archChip).toHaveClass(/\bnow\b/);
+    await expect(row.locator('.runchip', { hasText: '乙班' })).not.toHaveClass(/\bnow\b/);
+
+    // ④ 关开关复原：其余归档的从行里退场；当前在读的那一班照旧在读（只是行里不再列它）
+    await toggle.click();
+    await expect(toggle).toHaveAttribute('aria-pressed', 'false');
+    await expect(row.locator('.runchip', { hasText: '甲班' })).toHaveCount(0);
+    await expect(page.locator('.ro-note'), '关开关不动正在读的那一班').toBeVisible();
+    await expect(page.locator('.timeline .turn')).toHaveCount(3);
+
+    // ⑤ 值守台账同样能开开关（只读账本来就只读，开关与它不冲突）
+    await page.goto(`${app.webBase}/#/talk/watch`);
+    await settleBundle(page, bundle);
+    await expect(page.locator('.runrow .runchip.arch-toggle')).toBeVisible();
+    await expect(page.locator('.typer'), '值守账照旧不出输入坞').toHaveCount(0);
+
     expectBundleHealthy(bundle);
   });
 });
