@@ -170,6 +170,44 @@ pub fn is_context_window(error: &crate::Error) -> bool {
     )
 }
 
+/// 这次失败是「等一等也没用」的那一类吗——超窗 / 鉴权 / 模型名 / 额度（决策 295 / 298）。
+///
+/// 外层重试轮拿它决定**要不要再进下一轮**：超窗在调用点上还有一道「压缩一次再试这一次
+/// 调用」（决策 295），压不动了才走到这里；其余三支连那一步都没有——重试烧的是同一份
+/// 坏配置的 N 倍 token，而唯一该做的事（改 api_key、换模型名、续费）在那几轮里一个字
+/// 都不会发生。**判据按 `kind` 字段，不按报文字样**（决策 259 的同一口径）。
+pub fn is_wait_useless(error: &crate::Error) -> bool {
+    matches!(
+        error,
+        crate::Error::LlmClassified { kind, .. }
+            if kind == LlmErrorKind::ContextWindow.as_str()
+                || kind == LlmErrorKind::Auth.as_str()
+                || kind == LlmErrorKind::ModelNotFound.as_str()
+                || kind == LlmErrorKind::Quota.as_str()
+    )
+}
+
+/// 这次失败是传输类吗——连不上 / 空闲判死 / 适配器层的未分类失败（决策 298）。
+///
+/// 外层重试轮拿它决定**要不要追加错误 turn**：传输类**重试，但不追加**——请求根本没送到
+/// 模型，转录末尾是上一次成功的完好回合，`retry_prompt` 那句「上一轮的输出未按输出契约
+/// 提交、已判废」是假话；括号里那个诊断还是写给人看的运维指引（「请检查 base_url…」），
+/// 模型既改不了也无从核对。转录照旧原样续接，决策 278 省下的探索钱一分不丢。
+///
+/// 未分类的 `Error::Llm`（HTTP 429 / 5xx、流读失败、chunk 解析失败……）归传输类不是本条
+/// 新下的判断：值班长的归因 `turn_failure_reason`（`pipeline/foreman.rs`）早写着「适配器层
+/// 的失败……它就是网络那一类」。`provider 不存在 / 已被禁用` 也落在这支——它们此前一直
+/// 被重试，本条只是不再给它们加那句假话（把它们判成配置类属分类那一层的事，不在本条范围）。
+pub fn is_transport(error: &crate::Error) -> bool {
+    match error {
+        crate::Error::LlmClassified { kind, .. } => {
+            kind == LlmErrorKind::Network.as_str() || kind == LlmErrorKind::IdleTimeout.as_str()
+        }
+        crate::Error::Llm(_) => true,
+        _ => false,
+    }
+}
+
 /// 把「HTTP 请求失败」的错误归类为网络类：连接 / DNS / TLS / 超时。
 const NETWORK_KIND: LlmErrorKind = LlmErrorKind::Network;
 
@@ -999,5 +1037,49 @@ mod tests {
         let (kind, raw) = err.llm_classified().expect("应可取回分类与原始诊断");
         assert_eq!(kind, "llm_auth");
         assert!(raw.contains("Incorrect API key"), "raw 应保留原始返回体");
+    }
+
+    /// 决策 298 的分流判据：两支**互不重叠、互不漏**——输出契约类失败（校验不过 / 退化）
+    /// 两支都不属于，它们照旧走决策 278 的「转录 + 错误 turn」。
+    #[test]
+    fn retry_split_predicates_have_disjoint_truth_tables() {
+        let classified = |kind: &str| Error::LlmClassified {
+            kind: kind.into(),
+            message: "人话".into(),
+            raw: "原始诊断".into(),
+        };
+        // 「等一等也没用」：不进下一轮（决策 295 的超窗 + 298 的三类配置）
+        for kind in [
+            "llm_context_window",
+            "llm_auth",
+            "llm_model_not_found",
+            "llm_quota",
+        ] {
+            assert!(
+                is_wait_useless(&classified(kind)),
+                "{kind} 应判「等一等没用」"
+            );
+            assert!(!is_transport(&classified(kind)), "{kind} 不是传输类");
+        }
+        // 「等一等会好」：重试但不追加错误 turn（决策 298）
+        for kind in ["llm_network", "llm_idle_timeout"] {
+            assert!(is_transport(&classified(kind)), "{kind} 应判传输类");
+            assert!(
+                !is_wait_useless(&classified(kind)),
+                "{kind} 不属「等一等没用」"
+            );
+        }
+        // 适配器层的未分类失败（429 / 5xx / 流读失败）按传输类处置
+        let adapter = Error::Llm("HTTP 429：rate limited".into());
+        assert!(is_transport(&adapter));
+        assert!(!is_wait_useless(&adapter));
+        // 输出契约类失败不在两支里：错误 turn 照旧（决策 278 的适用边界）
+        for contract in [
+            Error::Validation("未找到结构化元数据".into()),
+            Error::Degenerated("片段连续重复 150 次".into()),
+        ] {
+            assert!(!is_wait_useless(&contract), "{contract:?}");
+            assert!(!is_transport(&contract), "{contract:?}");
+        }
     }
 }

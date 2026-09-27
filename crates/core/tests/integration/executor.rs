@@ -1047,6 +1047,168 @@ async fn a_context_window_failure_compacts_and_retries_that_one_call() {
     );
 }
 
+// ─────────── 失败重试按错误类别分流（决策 298，收窄决策 278 的适用边界）───────────
+
+/// 传输类失败（连不上）：**重试，但不追加错误 turn**——请求根本没送到模型，转录末尾是
+/// 上一次成功的完好回合，`retry_prompt` 那句「上一轮的输出未按输出契约提交、已判废」
+/// 对它是假话，括号里那句（「请检查 base_url…」）还是写给人看的运维指引。
+///
+/// 同一用例里的对照组：第 2 轮由**输出契约类**失败（元数据抽不出）触发，那条照旧
+/// 「转录 + 错误 turn」——分流只收窄传输类，没动决策 278 的本体。
+#[tokio::test]
+async fn a_transport_failure_retries_without_an_error_turn() {
+    let settings = Settings {
+        agent_retry_max: 3,
+        ..Default::default()
+    };
+    let ctx = setup("true", settings).await;
+    let mut script = Script::new();
+    script
+        .for_node(Stage::ArchitectDesign, Node::ValidateInput)
+        // 第 1 轮先走一次真实工具往返（失败时转录非空，「不追加」的断言才有牙齿），再连不上
+        .list_dir(".")
+        .fail_llm(
+            "llm_network",
+            LlmErrorKind::Network.advice(),
+            "HTTP 请求失败：connect: connection refused",
+        );
+    // 第 2/3 轮走「脚本耗尽」→ 收尾纯文本 → 元数据抽不出 → 输出契约类失败（对照组）
+    ctx.agent.set_script(script);
+
+    testkit::seed_task(&ctx.store, "t-transport", "p1")
+        .await
+        .unwrap();
+    admit(&ctx, "t-transport").await;
+    ctx.executor.run("t-transport").await.unwrap();
+
+    let runs = ctx
+        .store
+        .list_runs_at("t-transport", Stage::ArchitectDesign, Node::ValidateInput)
+        .await
+        .unwrap();
+    assert_eq!(
+        runs.len(),
+        3,
+        "传输类照旧按 agent_retry_max 重试（它是「等一等会好」的那一类）：{} 行 run",
+        runs.len()
+    );
+
+    // 按 run 分组取每轮的**首条请求**（一次 attempt 内的后续请求是工具往来，不算起点）
+    let requests = ctx.agent.request_log();
+    let mut firsts: Vec<&LlmRequest> = Vec::new();
+    for r in requests
+        .iter()
+        .filter(|r| r.stage == Stage::ArchitectDesign && r.node == Node::ValidateInput)
+        .filter(|r| {
+            r.run
+                .as_ref()
+                .is_some_and(|c| c.agent_type.as_str() == "main")
+        })
+    {
+        let run_id = r.run.as_ref().expect("主 agent 请求须带 run 上下文").run_id;
+        if firsts.last().map(|p| p.run.as_ref().unwrap().run_id) != Some(run_id) {
+            firsts.push(r);
+        }
+    }
+    assert_eq!(firsts.len(), 3, "三轮各一条起点：{}", firsts.len());
+    assert_eq!(firsts[0].messages.len(), 0, "首轮起点为空");
+
+    // 决策 298：第 1 轮是传输类失败 → 第 2 轮从**那份转录原样**接着跑，一条不多
+    assert_eq!(
+        firsts[1].messages.len(),
+        2,
+        "传输类重试的起点是失败时的转录（assistant + tool_result），没有错误 turn"
+    );
+    assert!(
+        firsts[1]
+            .messages
+            .iter()
+            .all(|m| !m.content.as_deref().unwrap_or("").contains("已判废")),
+        "传输类不许把「已判废」这句假话灌给模型：{:?}",
+        firsts[1].messages
+    );
+
+    // 对照组：第 2 轮是输出契约类失败 → 第 3 轮照旧 +2（assistant 回复 + 错误 turn）
+    assert_eq!(
+        firsts[2].messages.len(),
+        firsts[1].messages.len() + 2,
+        "输出契约类失败的重试轮仍带错误 turn（决策 278 本体不动）"
+    );
+    let last = firsts[2].messages.last().expect("重试请求不应为空");
+    assert!(
+        last.content.as_deref().unwrap_or("").contains("已判废"),
+        "错误 turn 照旧给输出契约类失败：{:?}",
+        last
+    );
+}
+
+/// 配置类失败（鉴权）：**一次都不重试**——等一等没用，重试烧的是同一份坏密钥的 N 倍
+/// token，而改 api_key 这件事一个字都不会在重试里发生（与超窗同一处置，决策 295 / 298）。
+/// 台账里读得出下一步做什么（分类自带的人话），原始诊断照旧进 context（可搜）。
+#[tokio::test]
+async fn a_config_failure_fails_fast_without_burning_retries() {
+    // 重试预算给足 5：从前会打 5 次，用例据此判「不再盲目重试」
+    let settings = Settings {
+        agent_retry_max: 5,
+        ..Default::default()
+    };
+    let ctx = setup("true", settings).await;
+    let mut script = Script::new();
+    script
+        .for_node(Stage::ArchitectDesign, Node::ValidateInput)
+        .fail_llm(
+            "llm_auth",
+            LlmErrorKind::Auth.advice(),
+            "HTTP 401：{\"error\":{\"message\":\"Incorrect API key provided\"}}",
+        )
+        // 只有真的重试才会走到这一步；用例靠「它没被消费」验证「没有第二次调用」
+        .text("（这一条只在重试时才会被消费）");
+    ctx.agent.set_script(script);
+
+    testkit::seed_task(&ctx.store, "t-auth", "p1")
+        .await
+        .unwrap();
+    admit(&ctx, "t-auth").await;
+    ctx.executor.run("t-auth").await.unwrap();
+
+    assert_eq!(
+        ctx.agent
+            .calls_for(Stage::ArchitectDesign, Node::ValidateInput),
+        1,
+        "鉴权失败只打一次调用：等一等没用，不重试到 agent_retry_max"
+    );
+    let runs = ctx
+        .store
+        .list_runs_at("t-auth", Stage::ArchitectDesign, Node::ValidateInput)
+        .await
+        .unwrap();
+    assert_eq!(runs.len(), 1, "台账里只该有这一条失败 run");
+
+    let cursor = ctx
+        .store
+        .load_live_cursors("t-auth")
+        .await
+        .unwrap()
+        .into_iter()
+        .next()
+        .expect("游标还在（挂着等处置）");
+    let reason = cursor.pending_reason.as_ref().expect("应当挂了 pending");
+    assert_eq!(reason.kind, PendingKind::RetryExhausted);
+    assert!(
+        reason.message.contains("api_key"),
+        "台账里读得出下一步做什么（分类自带的人话，不写「重试耗尽」）：{}",
+        reason.message
+    );
+    assert!(
+        reason.context.as_ref().is_some_and(|c| c
+            .diagnostic
+            .as_deref()
+            .is_some_and(|d| d.contains("Incorrect API key"))),
+        "原始诊断照旧进 context（可搜）：{:?}",
+        reason.context
+    );
+}
+
 // ─────────────────────────── 节点重试耗尽（决策 33 / G13）───────────────────────────
 
 #[tokio::test]
