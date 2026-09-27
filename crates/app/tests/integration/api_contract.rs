@@ -2060,6 +2060,7 @@ async fn command_log_endpoints_expose_卸载_output() {
             source: agentpipeline_core::types::CommandSource::System,
             command: "cargo test".into(),
             cwd: "/tmp".into(),
+            original_command: None,
         })
         .await
         .unwrap();
@@ -2309,6 +2310,7 @@ async fn commands_are_scoped_to_their_task() {
             source: agentpipeline_core::types::CommandSource::System,
             command: "cargo test".into(),
             cwd: ".".into(),
+            original_command: None,
         })
         .await
         .unwrap();
@@ -5458,6 +5460,111 @@ async fn foreman_watch_switch_round_trips_with_provenance() {
     assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
 }
 
+/// 写一个假 rtk：`--version` 有读数、`hook claude` 回一段可解析的改写（票 03 的三条判据）。
+fn fake_rtk(dir: &std::path::Path) -> std::path::PathBuf {
+    std::fs::create_dir_all(dir).unwrap();
+    let path = dir.join("rtk");
+    std::fs::write(
+        &path,
+        "#!/bin/sh\n\
+         if [ \"$1\" = \"--version\" ]; then echo 'rtk 0.42.4'; exit 0; fi\n\
+         read -r payload\n\
+         printf '%s' '{\"hookSpecificOutput\":{\"updatedInput\":{\"command\":\"rtk ls\"}}}'\n",
+    )
+    .unwrap();
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+    path
+}
+
+/// `GET/PUT /rtk`：开关 + **活体探测**的读数契约（决策 297 / 票 03、05）。
+#[tokio::test]
+async fn rtk_switch_round_trips_with_a_live_probe() {
+    let api = api().await;
+
+    // 缺省：关，且 provenance 是「缺省」而不是「界面保存的关」。
+    // 探测那一格只断言形状：这台机器上装没装真的 rtk 不该影响契约用例。
+    let (_, body) = get(&api, "/rtk").await;
+    assert_eq!(body["enabled"], false);
+    assert_eq!(body["origin"], "default");
+    assert!(body["probe"]["available"].is_boolean());
+    assert!(body["probe"].is_object(), "读端必须带一次活体探测");
+
+    // 手填一条能用的路径：探测三条全过（版本读得出来、改写回得出来），source 说得出是手填
+    let bin = fake_rtk(&api._home.home().root().join("fake-bin"));
+    let (status, body) = put(
+        &api,
+        "/rtk",
+        json!({"enabled": true, "path": bin.display().to_string()}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["enabled"], true);
+    assert_eq!(body["origin"], "settings");
+    assert_eq!(body["probe"]["available"], true, "{body}");
+    assert_eq!(body["probe"]["version"], "rtk 0.42.4");
+    assert_eq!(body["probe"]["source"], "manual");
+    assert_eq!(body["probe"]["path"], bin.display().to_string());
+
+    // 存下来了：GET 与 PUT 同形（探测是**每次现做**，不是缓存）
+    let (_, body) = get(&api, "/rtk").await;
+    assert_eq!(body["enabled"], true);
+    assert_eq!(body["origin"], "settings");
+    assert_eq!(body["probe"]["available"], true);
+}
+
+/// 探测失败**不拦保存**（决策 297）：两个结果都 200，差别只在 `probe`。
+///
+/// 一个输出优化器不该有权限拦人，而开发机上「先开开关、后装二进制」是常见顺序。
+/// 失败要**可归因**——解析不到东西时绝不假装可用。
+#[tokio::test]
+async fn rtk_probe_failure_is_reported_but_does_not_block_saving() {
+    let api = api().await;
+    let missing = api._home.home().root().join("nope-rtk");
+
+    let (status, body) = put(
+        &api,
+        "/rtk",
+        json!({"enabled": true, "path": missing.display().to_string()}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "探测失败不该是 4xx/5xx：{body}");
+    assert_eq!(body["enabled"], true, "照样存下来");
+    assert_eq!(body["probe"]["available"], false);
+    let reason = body["probe"]["reason"].as_str().unwrap_or_default();
+    assert!(!reason.is_empty(), "失败要可归因：{body}");
+    assert!(reason.contains("没有可执行的 rtk"), "{reason}");
+
+    // GET 读到的就是存下来的那一份（假不可用，但如实说）
+    let (_, body) = get(&api, "/rtk").await;
+    assert_eq!(body["enabled"], true);
+    assert_eq!(body["probe"]["available"], false);
+
+    // 关掉：关也是一个正常读数，探测照做（手填路径留着，便于下次打开就可用）
+    let (status, body) = put(
+        &api,
+        "/rtk",
+        json!({"enabled": false, "path": missing.display().to_string()}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["enabled"], false);
+    assert_eq!(
+        body["origin"], "settings",
+        "按过关就是按过：provenance 不回落"
+    );
+}
+
+/// 缺体是 4xx（不是 500、不是静默成功）。
+#[tokio::test]
+async fn rtk_put_requires_the_enabled_field() {
+    let api = api().await;
+    let (status, _) = put(&api, "/rtk", json!({})).await;
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
+}
+
 /// 两个班次各说各的：消息与页头合计都按班次读，互不污染（决策 204②⑤）。
 #[tokio::test]
 async fn foreman_sessions_isolate_their_own_messages_and_totals() {
@@ -6171,6 +6278,7 @@ async fn foreman_commands_are_readable_from_the_session_dimension_only() {
             source: CommandSource::Agent,
             command: "ls tasks".into(),
             cwd: api.state.home.root().display().to_string(),
+            original_command: None,
         })
         .await
         .unwrap();

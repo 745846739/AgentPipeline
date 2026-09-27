@@ -43,7 +43,7 @@ use crate::{Error, Result};
 
 use super::merge::test_command_for;
 use super::model_invoke::ModelInvoke;
-use super::run_ledger::{since_ms, RunLedger};
+use super::run_ledger::RunLedger;
 
 /// 闸门结果（决策 62 / 139）：非零退出是**闸门结果**，不是节点错误。
 pub(crate) struct GateOutcome {
@@ -721,6 +721,7 @@ impl Executor {
             &self.store,
             &self.settings,
             self.clock.as_ref(),
+            &self.killer,
             task,
             &project,
             run_id,
@@ -810,6 +811,7 @@ impl Executor {
             settings: &self.settings,
             sse: self.sse.as_ref(),
             clock: self.clock.as_ref(),
+            killer: &self.killer,
         }
     }
 
@@ -1125,6 +1127,8 @@ impl Executor {
                 source: CommandSource::System,
                 command: crate::agent::sanitize::sanitize_command_line(command),
                 cwd: self.store.home().root().display().to_string(),
+                // 取消 / 归档时那条任务级清理命令（决策 131）不走收口，故不可能有改写。
+                original_command: None,
             })
             .await?;
         let preview = crate::agent::tools::head_tail(output, 50, 100);
@@ -1476,11 +1480,16 @@ impl Executor {
 
 /// 跑系统命令并记录 `kanban_node_commands`（source=system）。返回
 /// `(exit code, 输出预览)`；启动失败是节点错误，非零退出是**闸门结果**而非节点错误。
-#[allow(clippy::too_many_arguments)] // 三个显式依赖（store/settings/clock）是依赖显式化（票 04）加的——原参数一个没少
+///
+/// **闸门走命令收口**（决策 297 / 票 02）。它在收口之前是两个 `sh -c` 旁路（本函数与
+/// `repair.rs` 那条），于是比 agent 那一侧少了四件事里的三件：没有进程组（超时杀不着
+/// 子孙）、从不回填 `process_group_id`（调度器那条超时收口也就够不着它）、没有心跳。
+/// 收口之后闸门与 `run_command` 是同一条管道，差别只剩「不改写」与「输出落哪儿」。
+#[allow(clippy::too_many_arguments)] // 显式依赖那套（store/settings/killer）照旧；`clock` 在收口之后没有读者（时长由收口量），故退掉
 async fn run_system_command(
     store: &Store,
     settings: &Settings,
-    clock: &dyn Clock,
+    killer: &Arc<dyn ProcessKiller>,
     task: &Task,
     run_id: i64,
     stage: Stage,
@@ -1488,87 +1497,86 @@ async fn run_system_command(
     command: &str,
     cwd: &Path,
 ) -> Result<(i32, String)> {
-    let sanitized = crate::agent::sanitize::sanitize_command_line(command);
-    let command_id = store
-        .record_start(CommandStart {
-            task_id: Some(task.id.clone()),
-            session_id: None,
-            run_id: Some(run_id),
-            stage,
-            node,
-            source: CommandSource::System,
-            command: sanitized,
-            cwd: cwd.display().to_string(),
-        })
-        .await?;
-    store.touch_run_heartbeat(run_id).await?;
-
-    let started = clock.now();
-    let output = tokio::time::timeout(
-        std::time::Duration::from_secs(settings.test_command_timeout_sec),
-        tokio::process::Command::new("sh")
-            .arg("-c")
-            .arg(command)
-            .current_dir(cwd)
-            .output(),
-    )
-    .await;
-    let duration_ms = since_ms(clock.now(), started);
-    let (exit_code, stdout, stderr) = match output {
-        Ok(Ok(out)) => (
-            out.status.code().unwrap_or(-1),
-            String::from_utf8_lossy(&out.stdout).to_string(),
-            String::from_utf8_lossy(&out.stderr).to_string(),
-        ),
-        Ok(Err(e)) => return Err(Error::Git(format!("闸门命令启动失败：{e}"))),
-        Err(_) => {
-            // 超时按闸门失败处理（exit = -1），错误信息进输出
-            let note = format!("命令超时（{}s）", settings.test_command_timeout_sec);
-            store
-                .record_finish(
-                    command_id,
-                    CommandFinish {
-                        exit_code: Some(-1),
-                        stdout_preview: None,
-                        stderr_preview: Some(note.clone()),
-                        duration_ms,
-                        ..Default::default()
-                    },
-                )
-                .await?;
-            return Ok((-1, note));
-        }
-    };
-    let stdout = crate::agent::sanitize::sanitize_text(&stdout);
-    let stderr = crate::agent::sanitize::sanitize_text(&stderr);
-    let stdout_preview = crate::agent::tools::head_tail(&stdout, 50, 100);
-    let stderr_preview = crate::agent::tools::head_tail(&stderr, 50, 100);
     // 决策 109 / 票 09：闸门命令的**完整** stdout/stderr 落可读路径（路径确定、覆盖
     // 写入可重入），复检段读全文而非首尾预览。按 stage 命名，同一阶段的闸门重跑覆盖同一文件。
     let full_path = store
         .home()
         .task_file(&task.id, &format!("gate-output-{}.log", stage.as_str()));
     store.home().ensure_task_dirs(&task.id)?;
-    let full_log = match (stdout.is_empty(), stderr.is_empty()) {
-        (false, false) => format!("[stdout]\n{stdout}\n[stderr]\n{stderr}"),
-        (false, true) => stdout.clone(),
-        (true, false) => stderr.clone(),
-        (true, true) => String::new(),
-    };
-    std::fs::write(&full_path, &full_log)?;
-    store
-        .record_finish(
-            command_id,
-            CommandFinish {
-                exit_code: Some(exit_code),
-                stdout_path: Some(full_path.display().to_string()),
-                stdout_preview: Some(stdout_preview.clone()),
-                stderr_preview: Some(stderr_preview.clone()),
-                duration_ms,
+    let timeout_sec = settings.test_command_timeout_sec;
+
+    let runner =
+        crate::exec::CommandRunner::new(killer.clone()).with_recorder(Arc::new(store.clone()));
+    let (out, ()) = runner
+        .run(
+            crate::exec::CommandRequest {
+                owner: crate::exec::CommandOwner {
+                    task_id: Some(task.id.clone()),
+                    session_id: None,
+                    run_id: Some(run_id),
+                    stage,
+                    node,
+                    source: CommandSource::System,
+                },
+                command,
+                cwd,
+                timeout_sec,
+                spawn: crate::exec::SpawnForm::Shell,
+                // 闸门**不改写**（决策 297 / spec §2）：exit code 原样透传，但输出会被重排成
+                // 摘要——pytest 的 `assert 1 == 2` 丢了文件与行号；运行器输出不是 rtk 认得的
+                // 样子时，输出会被换成**零行**或一句误导性摘要（`Pytest: No tests collected`）。
+                // 闸门的输出同时是模型改代码的**唯一证据**与 `gate-output-<stage>.log` 那份
+                // **取证物**（决策 211 一脉），而一条命令只跑一次、拿不到「既过滤又原样」两份。
+                // **给模型省 token 不能拿证据的面做交换。**
+                rewrite: crate::exec::Rewrite::None,
+            },
+            |out| {
+                if out.timed_out {
+                    // 超时按闸门失败处理（exit = -1），错误信息进输出；不落全文日志
+                    //（与收口之前逐字一致：超时那条路只记一行摘要）。
+                    return Ok((
+                        CommandFinish {
+                            exit_code: Some(-1),
+                            stdout_preview: None,
+                            stderr_preview: Some(format!("命令超时（{timeout_sec}s）")),
+                            duration_ms: out.duration_ms,
+                            ..Default::default()
+                        },
+                        (),
+                    ));
+                }
+                // 闸门命令的全文日志（决策 109 / 211）：完整 stdout/stderr 落可读路径。
+                let full_log = match (out.stdout.is_empty(), out.stderr.is_empty()) {
+                    (false, false) => format!("[stdout]\n{}\n[stderr]\n{}", out.stdout, out.stderr),
+                    (false, true) => out.stdout.clone(),
+                    (true, false) => out.stderr.clone(),
+                    (true, true) => String::new(),
+                };
+                std::fs::write(&full_path, &full_log)?;
+                Ok((
+                    CommandFinish {
+                        exit_code: Some(out.exit_code.unwrap_or(-1)),
+                        stdout_path: Some(full_path.display().to_string()),
+                        stdout_preview: Some(crate::agent::tools::head_tail(&out.stdout, 50, 100)),
+                        stderr_preview: Some(crate::agent::tools::head_tail(&out.stderr, 50, 100)),
+                        duration_ms: out.duration_ms,
+                    },
+                    (),
+                ))
             },
         )
         .await?;
-    store.touch_run_heartbeat(run_id).await?;
+
+    // 启动失败是节点错误（不是闸门结果）：收口把三种结局都收成读数，这里把它们分开。
+    if out.spawn_failed() {
+        return Err(Error::Git(format!("闸门命令启动失败：{}", out.stderr)));
+    }
+    if out.timed_out {
+        return Ok((-1, format!("命令超时（{timeout_sec}s）")));
+    }
+
+    let stdout_preview = crate::agent::tools::head_tail(&out.stdout, 50, 100);
+    let stderr_preview = crate::agent::tools::head_tail(&out.stderr, 50, 100);
     // merge metadata 里的 `gate_failure_output` 保持原有的命令摘要 + 首尾预览（体积有界，
     // UI / 观测面消费）；**完整日志**已落上方 `full_path`，复检段按确定路径读全文
     // （决策 109 / 票 09）。
@@ -1581,7 +1589,7 @@ async fn run_system_command(
         (true, false) => stderr_preview,
         (true, true) => String::new(),
     };
-    Ok((exit_code, combined))
+    Ok((out.exit_code.unwrap_or(-1), combined))
 }
 
 /// develop / merge 共用的闸门：lint（如配置）+ 测试（决策 139）。
@@ -1590,6 +1598,7 @@ pub(crate) async fn run_code_gate(
     store: &Store,
     settings: &Settings,
     clock: &dyn Clock,
+    killer: &Arc<dyn ProcessKiller>,
     task: &Task,
     project: &Project,
     run_id: i64,
@@ -1603,9 +1612,10 @@ pub(crate) async fn run_code_gate(
             RunLedger::new(store, clock)
                 .mark_step(run_id, &format!("跑 lint：{lint}"))
                 .await;
-            let (code, output) =
-                run_system_command(store, settings, clock, task, run_id, stage, node, lint, cwd)
-                    .await?;
+            let (code, output) = run_system_command(
+                store, settings, killer, task, run_id, stage, node, lint, cwd,
+            )
+            .await?;
             if code != 0 {
                 return Ok(GateOutcome {
                     passed: false,
@@ -1620,7 +1630,7 @@ pub(crate) async fn run_code_gate(
         .mark_step(run_id, &format!("跑测试：{test}"))
         .await;
     let (code, output) = run_system_command(
-        store, settings, clock, task, run_id, stage, node, &test, cwd,
+        store, settings, killer, task, run_id, stage, node, &test, cwd,
     )
     .await?;
     if code != 0 {

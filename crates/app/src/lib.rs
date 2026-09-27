@@ -160,6 +160,13 @@ pub fn build_router(state: AppState) -> Router {
             "/foreman-watch",
             get(routes::foreman_watch::settings).put(routes::foreman_watch::set_enabled),
         )
+        // ── 命令执行走 rtk 的开关（决策 297 / 票 03、05）──
+        // 与 `/foreman-watch` 同族的机器级事实（**不是** `/foreman/*`：那族未接线时 503，
+        // 而设置页要能读到「现在是缺省关」）。GET 带一次**活体探测**；PUT 探测失败也 200。
+        .route(
+            "/rtk",
+            get(routes::rtk::settings).put(routes::rtk::set_enabled),
+        )
         // ── 技能市场（决策 172⑤，票 09）：本地导入 / 目录扫描 / 卸载。全程离线 ──
         // 子 router 自带 state（import 路由要单独放宽请求体上限），故先 merge 再进防护层。
         .merge(routes::skills::routes(state.clone()))

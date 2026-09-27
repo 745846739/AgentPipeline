@@ -16,6 +16,15 @@ use agentpipeline_core::storage::Store;
 use agentpipeline_core::types::Project;
 use testkit::{ManualClock, Repo, TestHome};
 
+/// 闸门走命令收口之后要显式拿到设置与终止器（决策 297 / 票 02）：
+/// 超时上限是 `test_command_timeout_sec`，终止器是本文件唯一显式依赖。
+static SETTINGS: std::sync::LazyLock<agentpipeline_core::config::Settings> =
+    std::sync::LazyLock::new(agentpipeline_core::config::Settings::default);
+
+fn killer() -> Arc<dyn agentpipeline_core::process::ProcessKiller> {
+    Arc::new(agentpipeline_core::process::RealProcessKiller)
+}
+
 /// 开一个班次：修复的命令台账按**严格 XOR** 归属（迁移 0012），而修复属于
 /// 「值班长在一次对话里决定做的事」——归它，不归任务。
 async fn foreman_session(store: &Store) -> String {
@@ -191,6 +200,8 @@ async fn a_failed_gate_produces_no_diff() {
     let readings = run_repair_gate(
         &store,
         home.home(),
+        &SETTINGS,
+        &killer(),
         &session,
         None,
         Some("false"), // 测试命令恒非零（fixture 惯例）
@@ -252,9 +263,17 @@ async fn a_passing_gate_leads_to_a_marked_commit_and_a_scoped_diff() {
     )
     .unwrap();
 
-    let readings = run_repair_gate(&store, home.home(), &session, None, Some("true"))
-        .await
-        .unwrap();
+    let readings = run_repair_gate(
+        &store,
+        home.home(),
+        &SETTINGS,
+        &killer(),
+        &session,
+        None,
+        Some("true"),
+    )
+    .await
+    .unwrap();
     assert_eq!(readings[0].exit_code, 0, "闸门通过");
     let commit = commit_repair(
         &session,
@@ -315,6 +334,8 @@ async fn a_failed_gate_round_stops_before_commit_diff_and_proposal() {
     let round = finish_repair_round(
         &store,
         home.home(),
+        &SETTINGS,
+        &killer(),
         &project,
         &session,
         "改了一半",
@@ -384,6 +405,8 @@ async fn a_passing_gate_round_lands_the_commit_the_diff_and_the_repair_proposal(
     let round = finish_repair_round(
         &store,
         home.home(),
+        &SETTINGS,
+        &killer(),
         &project,
         &session,
         "补上缺的约束",
@@ -467,7 +490,16 @@ async fn the_repair_never_touches_the_project_working_tree() {
     .await
     .unwrap();
     std::fs::write(session.worktree.join("x.rs"), "pub fn x() {}\n").unwrap();
-    let _ = run_repair_gate(&store, home.home(), &session, None, Some("true")).await;
+    let _ = run_repair_gate(
+        &store,
+        home.home(),
+        &SETTINGS,
+        &killer(),
+        &session,
+        None,
+        Some("true"),
+    )
+    .await;
     let _ = commit_repair(
         &session,
         "结论",
@@ -480,6 +512,128 @@ async fn the_repair_never_touches_the_project_working_tree() {
         "项目工作区必须干净：修复只碰 worktree（本仓不许热修）"
     );
     assert!(!repo.exists("x.rs"), "改动不该出现在项目工作区里");
+}
+
+/// 修复闸门受 `test_command_timeout_sec` 管（票 02 的判据，**不新增配置键**）。
+///
+/// 收口之前这条路上是 `.output().await` 裸调——**完全没有超时**：一条挂住的测试命令能把
+/// 这一班永久钉在那里，而「今夜修复跑过没有」在界面上只会显示成「还在跑」。
+#[tokio::test]
+async fn the_repair_gate_is_bounded_by_the_test_command_timeout() {
+    let (home, store, _clock, repo) = fixture().await;
+    let session = start_repair(
+        home.home(),
+        repo.path(),
+        "main",
+        &new_repair_id(),
+        &foreman_session(&store).await,
+    )
+    .await
+    .unwrap();
+    let settings = agentpipeline_core::config::Settings {
+        test_command_timeout_sec: 1,
+        ..Default::default()
+    };
+
+    let started = std::time::Instant::now();
+    let readings = run_repair_gate(
+        &store,
+        home.home(),
+        &settings,
+        &killer(),
+        &session,
+        None,
+        Some("sleep 30"),
+    )
+    .await
+    .unwrap();
+    let elapsed = started.elapsed();
+
+    assert_eq!(readings.len(), 1, "lint 未配置时只跑测试");
+    assert_eq!(readings[0].exit_code, -1, "超时按闸门失败收成 -1");
+    assert!(
+        readings[0].output_preview.contains("命令超时"),
+        "读数要说得出是超时：{:?}",
+        readings[0].output_preview
+    );
+    assert!(
+        elapsed < std::time::Duration::from_secs(15),
+        "1s 上限的命令不该跑满 30s（实际 {:?}）——闸门没有超时",
+        elapsed
+    );
+
+    // 台账也照记：闸门跑了什么、结果如何，「它到底在哪跑的这一条」不必靠猜
+    let commands = store
+        .list_foreman_commands(&session.session_id)
+        .await
+        .unwrap();
+    assert_eq!(commands.len(), 1);
+    assert_eq!(commands[0].exit_code, Some(-1));
+}
+
+/// 修复闸门**不改写**：命令原样执行，台账里不出现 `original_command`（票 02 / 03 的判据）。
+///
+/// 钉法与环境无关：把开关打开、并把「rtk」指向一个**会写标记文件**的假二进制——若闸门
+/// 也被改写（或子进程 PATH 被前置 shim），那个标记就会出现。闸门的输出同时是模型改代码的
+/// 唯一证据与落盘的取证物，故它必须逐字是原来那条命令。
+#[tokio::test]
+async fn the_repair_gate_never_rewrites_its_command() {
+    let (home, store, _clock, repo) = fixture().await;
+    let marker = home.scratch_dir("marker").join("rtk-ran");
+    let bin = home.scratch_dir("bin").join("rtk");
+    std::fs::create_dir_all(bin.parent().unwrap()).unwrap();
+    std::fs::write(
+        &bin,
+        format!(
+            "#!/bin/sh\n\
+             if [ \"$1\" = \"hook\" ]; then\n\
+               read -r payload\n\
+               printf '%s' '{{\"hookSpecificOutput\":{{\"updatedInput\":{{\"command\":\"rtk true\"}}}}}}'\n\
+             else\n\
+               echo ran > {}\n\
+             fi\n",
+            marker.display()
+        ),
+    )
+    .unwrap();
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+    // 开关打开 + 手填那个假 rtk：生产里闸门也不接这一行（`CommandRunner` 只接 recorder），
+    // 故这里连开关都不该被读到。
+    store.set_rtk_switch(true, Some(&bin)).await.unwrap();
+
+    let session = start_repair(
+        home.home(),
+        repo.path(),
+        "main",
+        &new_repair_id(),
+        &foreman_session(&store).await,
+    )
+    .await
+    .unwrap();
+    let readings = run_repair_gate(
+        &store,
+        home.home(),
+        &SETTINGS,
+        &killer(),
+        &session,
+        None,
+        Some("true"),
+    )
+    .await
+    .unwrap();
+    assert_eq!(readings[0].exit_code, 0);
+    assert!(!marker.exists(), "闸门命令被改写了——假 rtk 跑过了");
+
+    let commands = store
+        .list_foreman_commands(&session.session_id)
+        .await
+        .unwrap();
+    assert_eq!(commands.len(), 1);
+    assert_eq!(commands[0].original_command, None, "闸门不记原串");
+    assert_eq!(commands[0].command, "true", "执行的就是原文");
 }
 
 /// 修复的判据：不是 git 仓就说清「为什么不能修」。
@@ -523,9 +677,17 @@ async fn a_repair_proposal_survives_the_night() {
     .await
     .unwrap();
     std::fs::write(session.worktree.join("x.rs"), "pub fn x() {}\n").unwrap();
-    let gate = run_repair_gate(&store, home.home(), &session, None, Some("true"))
-        .await
-        .unwrap();
+    let gate = run_repair_gate(
+        &store,
+        home.home(),
+        &SETTINGS,
+        &killer(),
+        &session,
+        None,
+        Some("true"),
+    )
+    .await
+    .unwrap();
     let commit = commit_repair(
         &session,
         "结论一句话",
@@ -591,7 +753,16 @@ async fn the_repair_rebase_check_speaks_up_on_conflicts() {
         "pub fn add(a: i32, b: i32) -> i32 { a - b }\n",
     )
     .unwrap();
-    let _ = run_repair_gate(&store, home.home(), &session, None, Some("true")).await;
+    let _ = run_repair_gate(
+        &store,
+        home.home(),
+        &SETTINGS,
+        &killer(),
+        &session,
+        None,
+        Some("true"),
+    )
+    .await;
     let _ = commit_repair(
         &session,
         "改掉一个符号",

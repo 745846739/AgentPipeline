@@ -255,6 +255,10 @@ function commandFromEvent(
     node: cursor?.node ?? state.task?.current_node ?? 'execute',
     source: event.source as CommandSource,
     command: event.command,
+    // SSE 那个事件不带原串（决策 297 只把原串落在台账里）：这一行是**乐观**的，
+    // 原串要等台账重读才到（`command_finished` 与 10s 对齐 tick 都会重取）。
+    // 不在这里编一个：编出来的「原串」比晚几秒到的真相更坏。
+    original_command: null,
     cwd: '',
     exit_code: null,
     stdout_path: null,

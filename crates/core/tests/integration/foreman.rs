@@ -49,6 +49,9 @@ struct Harness {
     _home: TestHome,
     store: Store,
     clock: ManualClock,
+    /// 修复闸门走命令收口之后要显式拿到这两件（决策 297 / 票 02）。
+    settings: Settings,
+    killer: Arc<dyn agentpipeline_core::process::ProcessKiller>,
 }
 
 impl Harness {
@@ -64,6 +67,8 @@ impl Harness {
             _home: home,
             store,
             clock,
+            settings: Settings::default(),
+            killer: Arc::new(agentpipeline_core::process::RealProcessKiller),
         }
     }
 
@@ -2613,6 +2618,7 @@ async fn record_command(h: &Harness, task_id: &str, run_id: Option<i64>, command
             source: agentpipeline_core::types::CommandSource::System,
             command: command.to_string(),
             cwd: h._home.path().display().to_string(),
+            original_command: None,
         })
         .await
         .unwrap();
@@ -3942,6 +3948,8 @@ async fn maintenance_recycles_a_repair_worktree_nobody_pressed() {
     finish_repair_round(
         &h.store,
         h._home.home(),
+        &h.settings,
+        &h.killer,
         &project,
         &session,
         "结论一句话",
@@ -3995,6 +4003,8 @@ async fn a_failed_repair_recycle_does_not_stop_the_maintenance() {
     finish_repair_round(
         &h.store,
         h._home.home(),
+        &h.settings,
+        &h.killer,
         &project,
         &session,
         "结论一句话",
@@ -4290,6 +4300,7 @@ async fn a_foreman_command_lands_under_the_session_not_a_task() {
             source: CommandSource::Agent,
             command: "ls tasks".into(),
             cwd: h._home.path().display().to_string(),
+            original_command: None,
         })
         .await
         .unwrap();
@@ -4345,6 +4356,7 @@ async fn a_command_without_an_owner_is_refused() {
             source: CommandSource::System,
             command: "true".into(),
             cwd: "/tmp".into(),
+            original_command: None,
         })
         .await
         .unwrap_err();

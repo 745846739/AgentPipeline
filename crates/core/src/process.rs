@@ -3,13 +3,27 @@
 //! 超时路径必须断言"杀了进程组"，但测试里没有真进程可杀。把终止动作抽成 trait：
 //! 生产实现真杀，测试实现只记录调用。
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use crate::Result;
 
 pub trait ProcessKiller: Send + Sync + 'static {
     /// 向进程组发送终止信号（先 TERM，必要时 KILL）。
     fn kill_process_group(&self, pgid: i32) -> Result<()>;
+}
+
+/// 子进程的环境调整（决策 297 / 票 04）：目前只有「把私有 shim 目录前置进 `PATH`」一件事。
+///
+/// **只作用于子进程**：服务进程自己的 `PATH` 一个字不改——在服务进程里前置一个目录会顺手
+/// 改掉**别的**命令的解析（`/usr/local/bin` 里还有一堆别的二进制），而 shim 目录里只放
+/// `rtk` 一个名字，故它只影响 `rtk`。
+///
+/// 为什么必须靠 PATH 前置而不是把绝对路径插进命令串：改写器吐出来的是裸 `rtk`，靠 PATH 找；
+/// 对每段做字符串手术（把 `rtk ` 换成绝对路径）既脆，还要在有引号的地方做手术。
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ChildEnv {
+    /// 前置进 `PATH` 的目录（`None` = 不动 `PATH`）。
+    pub path_prefix: Option<PathBuf>,
 }
 
 /// 在**独立进程组**里启动 `sh -c <command>`（决策 66 / 票 17）。
@@ -22,10 +36,11 @@ pub trait ProcessKiller: Send + Sync + 'static {
 pub fn spawn_in_own_process_group(
     command: &str,
     cwd: &Path,
+    env: &ChildEnv,
 ) -> std::io::Result<tokio::process::Child> {
     let mut cmd = tokio::process::Command::new("sh");
     cmd.arg("-c").arg(command);
-    spawn_with_stdio_and_group(cmd, cwd)
+    spawn_with_stdio_and_group(cmd, cwd, env)
 }
 
 /// 在**独立进程组**里按 **argv 直出**启动一个命令（决策 232 / 237）：不经 `sh`。
@@ -39,10 +54,11 @@ pub fn spawn_argv_in_own_process_group(
     program: &str,
     args: &[String],
     cwd: &Path,
+    env: &ChildEnv,
 ) -> std::io::Result<tokio::process::Child> {
     let mut cmd = tokio::process::Command::new(program);
     cmd.args(args);
-    spawn_with_stdio_and_group(cmd, cwd)
+    spawn_with_stdio_and_group(cmd, cwd, env)
 }
 
 /// stdio + 独立进程组的共同配置（`spawn()` 不自动接管 stdio，必须显式管道化，
@@ -51,6 +67,7 @@ pub fn spawn_argv_in_own_process_group(
 fn spawn_with_stdio_and_group(
     mut cmd: tokio::process::Command,
     cwd: &Path,
+    env: &ChildEnv,
 ) -> std::io::Result<tokio::process::Child> {
     cmd.current_dir(cwd);
     cmd.stdin(std::process::Stdio::null())
@@ -58,7 +75,38 @@ fn spawn_with_stdio_and_group(
         .stderr(std::process::Stdio::piped());
     // 0 = 以自身 pid 新建进程组（setsid 的轻量等价物，无需 libc）
     cmd.process_group(0);
+    apply_child_env(&mut cmd, env);
     cmd.spawn()
+}
+
+/// 把 [`ChildEnv`] 落到 `Command` 上（决策 297 / 票 04）。
+///
+/// `join_paths` 失败（路径含 `:`）时**不动 `PATH`**：拿不到一个合法的前置，就不要把
+/// 一个坏掉的 `PATH` 交给子进程——那会让本来能跑的命令全挂掉，而这一步的收益只是优化。
+#[cfg(unix)]
+fn apply_child_env(cmd: &mut tokio::process::Command, env: &ChildEnv) {
+    let Some(dir) = &env.path_prefix else {
+        return;
+    };
+    let base = std::env::var_os("PATH").unwrap_or_default();
+    if let Ok(joined) = child_path(dir, &base) {
+        cmd.env("PATH", joined);
+    }
+}
+
+/// `PATH` 的合成规则：`<shim 目录>:<原有 PATH>`——**纯函数**，故「最小 PATH 也能用」
+/// 这件事可以直接喂一个最小 PATH 来断言，不必去动测试进程自己的环境（票 04 的判据）。
+///
+/// 前置而不是替换：服务进程的 `PATH` 该怎么用还怎么用（`cargo` / `node` 都在里面），
+/// 这一条只保证 `rtk` 这个名字**先**解析到钉住的那一份。
+#[cfg(unix)]
+fn child_path(
+    prefix: &Path,
+    base: &std::ffi::OsStr,
+) -> std::result::Result<std::ffi::OsString, std::env::JoinPathsError> {
+    let mut paths = vec![prefix.to_path_buf()];
+    paths.extend(std::env::split_paths(base));
+    std::env::join_paths(paths)
 }
 
 /// 非 Unix 兜底：无进程组语义，原样 spawn（本项目只跑 macOS / Linux）。
@@ -66,6 +114,7 @@ fn spawn_with_stdio_and_group(
 pub fn spawn_in_own_process_group(
     command: &str,
     cwd: &Path,
+    _env: &ChildEnv,
 ) -> std::io::Result<tokio::process::Child> {
     let mut cmd = tokio::process::Command::new("sh");
     cmd.arg("-c").arg(command).current_dir(cwd);
@@ -98,5 +147,75 @@ impl ProcessKiller for RealProcessKiller {
                 .status();
         }
         Ok(())
+    }
+}
+
+#[cfg(all(test, unix))]
+mod tests {
+    use super::*;
+
+    /// 票 04 的判据：**最小 PATH 下前置 shim 也够用**。
+    ///
+    /// 桌面壳由 Finder 直接 exec，继承 launchd 的最小 PATH
+    /// （`/usr/bin:/bin:/usr/sbin:/sbin`），`/usr/local/bin/rtk` 不在里面。合成规则是
+    /// 「前置」而不是「替换」，故最小 PATH 与 shell 里那条长 PATH 得到的是同一个性质：
+    /// **`rtk` 这个名字先解析到钉住的那一份**。
+    ///
+    /// 喂字符串而不是去改测试进程自己的 `PATH`：这是个纯函数，改全局环境会让同进程里
+    /// 并行的用例跟着漂。
+    #[test]
+    fn the_shim_is_prepended_to_any_base_path_including_the_minimal_one() {
+        let shim = Path::new("/Users/me/.agentpipeline/rtk-shim");
+        let minimal = std::ffi::OsStr::new("/usr/bin:/bin:/usr/sbin:/sbin");
+        let joined = child_path(shim, minimal).unwrap();
+        let entries: Vec<_> = std::env::split_paths(&joined).collect();
+        assert_eq!(
+            entries[0], shim,
+            "shim 必须排在最前，否则先撞上 PATH 里的别的 rtk"
+        );
+        assert_eq!(
+            &entries[1..],
+            &[
+                PathBuf::from("/usr/bin"),
+                PathBuf::from("/bin"),
+                PathBuf::from("/usr/sbin"),
+                PathBuf::from("/sbin"),
+            ],
+            "原有的 PATH 逐项保留（`cargo` / `node` 还在里面），只在其前插一项"
+        );
+
+        // 票 04 的存在理由，端到端跑一遍：**最小 PATH 下 shim 里的 rtk 仍是那一个被找到的**。
+        // 上面钉的是合成规则，这里把合成结果真的喂给一个子进程——Finder 起的桌面壳继承
+        // 的就是这条最小 PATH。**不动本进程的 PATH**：只把结果交给这一个子进程。
+        let tmp = tempfile::tempdir().unwrap();
+        let fake_shim = tmp.path().join("rtk-shim");
+        std::fs::create_dir_all(&fake_shim).unwrap();
+        let fake = tmp.path().join("rtk");
+        std::fs::write(&fake, "#!/bin/sh\necho SHIM-RTK\n").unwrap();
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&fake, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        std::os::unix::fs::symlink(&fake, fake_shim.join("rtk")).unwrap();
+
+        let joined = child_path(&fake_shim, minimal).unwrap();
+        let out = std::process::Command::new("/bin/sh")
+            .arg("-c")
+            .arg("command -v rtk")
+            .env("PATH", &joined)
+            .output()
+            .unwrap();
+        assert!(out.status.success(), "最小 PATH 下该找得到 rtk");
+        assert_eq!(
+            String::from_utf8_lossy(&out.stdout).trim(),
+            fake_shim.join("rtk").display().to_string(),
+            "解析到的必须是 shim 里那一份"
+        );
+
+        // 空 PATH（环境里没有这一项）也要能前置。`split_paths("")` 会给出一项空串
+        // （POSIX 里空项表示当前目录），故这里只断言**次序**：shim 排在最前。
+        let joined = child_path(shim, std::ffi::OsStr::new("")).unwrap();
+        let entries: Vec<_> = std::env::split_paths(&joined).collect();
+        assert_eq!(entries[0], shim, "空 PATH 下 shim 照样排在最前");
     }
 }

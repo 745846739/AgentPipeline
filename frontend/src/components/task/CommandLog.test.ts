@@ -46,6 +46,42 @@ describe('命令与输出（票 12 / R2-16）', () => {
     expect(screen.queryByText(/正在加载完整输出/)).toBeNull();
   });
 
+  it('改写过的行：折叠显示**原串**、带「改写」标，展开时两条都摆出来（决策 297）', async () => {
+    render(CommandLog, {
+      props: {
+        commands: [
+          command({ command: 'rtk read src/lib.rs', original_command: 'cat src/lib.rs' }),
+        ],
+        outputFor: () => '全文',
+        onload: () => undefined,
+        errorFor: () => null,
+      },
+    });
+
+    // 折叠行显示的是模型想要的那一条，不是被换成的那一条
+    const button = screen.getByRole('button', { name: /cat src\/lib\.rs/ });
+    expect(screen.getByText('改写')).not.toBeNull();
+    expect(button.textContent).toContain('cat src/lib.rs');
+
+    await fireEvent.click(button);
+    // 展开里两条都在：原串与实际执行的那条
+    expect(screen.getByText(/实际执行：rtk read src\/lib\.rs/)).not.toBeNull();
+  });
+
+  it('没改写过的行（绝大多数）：照旧只显示那一条，不带标（决策 297）', async () => {
+    render(CommandLog, {
+      props: {
+        commands: [command({ command: 'cargo test', original_command: null })],
+        outputFor: () => 'ok',
+        onload: () => undefined,
+        errorFor: () => null,
+      },
+    });
+
+    expect(screen.getByText('cargo test')).not.toBeNull();
+    expect(screen.queryByText('改写')).toBeNull();
+  });
+
   it('没有错误时：preview 照旧显示（失败分支不误伤正常路径）', async () => {
     render(CommandLog, {
       props: {

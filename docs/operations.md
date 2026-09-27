@@ -396,7 +396,8 @@ CREATE TABLE IF NOT EXISTS kanban_node_commands (
     stage TEXT NOT NULL,
     node TEXT NOT NULL,
     source TEXT NOT NULL,               -- "agent"（run_command 工具）| "system"（框架执行）
-    command TEXT NOT NULL,              -- 完整命令行（脱敏后）
+    command TEXT NOT NULL,              -- **实际执行**的完整命令行（脱敏后）
+    original_command TEXT,              -- 改写前的原串（迁移 0034）。**只有真的发生过改写才写**（决策 297）
     cwd TEXT NOT NULL,                  -- 执行目录（worktree 绝对路径）
     exit_code INTEGER,                  -- NULL = 执行中
     stdout_path TEXT,                   -- 完整输出文件路径（超过阈值时卸载）
@@ -424,6 +425,29 @@ CREATE TABLE IF NOT EXISTS kanban_node_commands (
 | 取消 / 归档 | `git worktree remove --force`、`git branch -D` |
 
 系统命令的 `run_id` 挂在其所属节点**自己的 run 行**上——纯代码节点按决策 99 / 114 落 system run 行（`sync-check` 的 run 指向推进事务内新建的 main 游标，决策 113）。
+
+**两列的分工（决策 297 / 迁移 0034）：**`command` 记**实际执行**的那条串，`original_command` 记**改写前**的原串——且**只有真的发生过改写才写**。
+三处「按原样跑」（开关关着 / 闸门 / `run_readonly`）对台账是同一件事：`original_command` 为 `NULL`。
+只记实际执行的串会丢掉原串；只记原串则 `cat X` 与 `rtk read X` 的输出不一样、排障会看错；记两行会混淆「跑了几条命令」这个计数。
+故「加一列」是这里唯一正确的形状。**台账的折叠行显示原串**（改写过的行带一枚「改写」小标），**展开时原串与实际执行的那条都摆出来**——排障的人先要看到的是「模型想干什么」而不是「这条命令被换成了什么」。
+
+**四条写路径收在同一条管道里（决策 297）：**agent 的 `run_command` / `run_readonly`、执行器的闸门、修复的闸门都走
+`crates/core/src/exec.rs::CommandRunner`——启动 → 流式采集 → 超时收口（杀**进程组**，连子孙一起）→ 脱敏 → 台账。
+收口之前两个闸门是裸 `sh -c` 旁路：没有进程组（超时只丢 future、不杀进程）、从不回填 `process_group_id`（调度器那条
+超时收口够不着它）、没有心跳，而修复闸门**完全没有超时**（一条挂住的测试命令能把这一班永久钉住）、命令串还漏了脱敏。
+判决顺序是**不变量**：`check(原命令) → 改写 → 落台账 → spawn`——被拒的命令既不改写也不启动。
+
+**命令改写与它的降级（决策 297）：**设置页「命令执行」那一颗开关打开后，`run_command` 的命令经本机 rtk 改写
+（`cat X` → `rtk read X` 之类）；**闸门与 `run_readonly` 一律不改写**。**rtk 不在场时命令原样执行**、exit code 照常，
+每条命令现读一次库里的开关，找不到二进制时**留一条 `tracing::warn`** 并按原样跑——优化器不可用不该升级成整条命令失败。
+开关那一行住 `kanban_rtk`（迁移 0035，单行 + `CHECK (id = 1)`，行缺席 = 缺省关），`GET /rtk` 带一次**活体探测**，
+探测失败**不拦保存**（界面把失败原样摆出来）。**关掉时 shim 目录一并拆掉**（不留残迹：留着那条链接是「这台机器还在用 rtk」
+的假证据，二进制被卸掉之后它还是一条悬空链接）；**同一个不可用原因只留一条 `tracing::warn`**（命令是热路径，这类失败是持续性的，
+按条报只会把日志刷成噪声）；启用时把解析到的绝对路径钉成 `{home}/rtk-shim/` 里那**唯一**一个符号链接、前置进**子进程**的 PATH
+——同一目标上这一步是**幂等**的（不重建目录，故并发命令下不会开一个「shim 里暂时没有 rtk」的空窗）。
+**改写这一跳有自己的预算，到点就放行**：热路径上给 2s（`rtk hook claude` 是一次本地进程调用，实测 ~0.7s；机器忙时它会到点，
+那一刻**这条命令按原样跑**——少省一次 token，而不是失败）；`GET /rtk` 那次探测给 5s，因为它的结论是**显示在设置页上的**，
+拿短预算去判等于把「机器忙」说成「这台机器的 rtk 不能改写」。
 
 **记录范围 —— agent 驱动的命令：** agent 通过 `run_command` 工具执行的所有命令（写代码后的自测、跑 lint 等）同样写入该表，`source = "agent"`，并通过 `run_id` 关联到对应会话。这样用户在一个地方看到**所有**实际执行的命令，不用在会话和系统日志之间切换。
 

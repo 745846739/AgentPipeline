@@ -19,14 +19,18 @@
 //! 不进 `kanban_node_cursors` 那套账——账由修复提议（票 12）承担。
 
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
-use crate::agent::tools::{CommandFinish, CommandRecorder, CommandStart};
+use crate::agent::tools::CommandFinish;
+use crate::config::Settings;
 use crate::git::Git;
+
 use crate::home::Home;
 use crate::pipeline::merge::test_command_for;
+use crate::process::ProcessKiller;
 use crate::storage::Store;
 use crate::types::{CommandSource, Node, Stage};
 use crate::{Error, Result};
@@ -179,9 +183,12 @@ pub enum RepairRound {
 /// `task_id` 是这条修复为之而做的任务（可选）：给了就留两处痕——班次里一条
 /// 「等修复合入」（人读对话时知道它在等什么），**任务上**也一句（人在看板上看那条任务时
 /// 知道它在等什么）。两处都要，因为它们回答的是两个场景的问题（票 11 / 决策 210⑨）。
+#[allow(clippy::too_many_arguments)] // 依赖显式化那一族（决策 249 的姿态）：settings / killer 是闸门收口要的
 pub async fn finish_repair_round(
     store: &Store,
     home: &Home,
+    settings: &Settings,
+    killer: &Arc<dyn ProcessKiller>,
     project: &crate::types::Project,
     session: &RepairSession,
     conclusion: &str,
@@ -191,6 +198,8 @@ pub async fn finish_repair_round(
     let gate = run_repair_gate(
         store,
         home,
+        settings,
+        killer,
         session,
         project.lint_command.as_deref(),
         project.test_framework.as_deref(),
@@ -263,6 +272,8 @@ pub async fn finish_repair_round(
 pub async fn run_repair_gate(
     store: &Store,
     home: &Home,
+    settings: &Settings,
+    killer: &Arc<dyn ProcessKiller>,
     session: &RepairSession,
     lint_command: Option<&str>,
     test_framework: Option<&str>,
@@ -275,7 +286,8 @@ pub async fn run_repair_gate(
     commands.push(("test", test_command_for(test_framework).to_string()));
 
     for (kind, command) in commands {
-        let reading = run_gate_command(store, home, session, kind, &command).await?;
+        let reading =
+            run_gate_command(store, home, settings, killer, session, kind, &command).await?;
         let failed = reading.exit_code != 0;
         readings.push(reading);
         if failed {
@@ -292,69 +304,80 @@ pub async fn run_repair_gate(
 /// 修复没有任务、没有游标，故 `task_id` / `run_id` 都是 `None`；归属是**那一班**——
 /// 迁移 0012 的 CHECK 要求「任务 xor 班次」恰好一个，命令台账里于是能读到
 /// 「值班长为了这次修复跑了什么」，与它别的命令排在同一条时间线上。
+///
+/// **走命令收口**（决策 297 / 票 02）。收口之前这条路上有两个既有缺陷，它们是
+/// 「两个实现」的产物而**不是**新需求：
+///
+/// 1. **完全没有超时**（`.output().await` 裸调）——一条挂住的测试命令能把这个班次
+///    永久钉在这里。现在归 `test_command_timeout_sec`（默认 600）。
+/// 2. 命令串**直接落库、漏了脱敏**（四条台账路径里唯独它漏了）——现在由收口统一过
+///    [`crate::agent::sanitize::sanitize_command_line`]。
+///
+/// 顺带拿到的还有进程组（超时杀得着子孙）与心跳。**闸门不改写**（决策 297 / spec §2）：
+/// 这里的 pass/fail 判据是 exit code，而全文日志是取证物——过滤后的输出不能当证据。
 async fn run_gate_command(
     store: &Store,
     home: &Home,
+    settings: &Settings,
+    killer: &Arc<dyn ProcessKiller>,
     session: &RepairSession,
     kind: &str,
     command: &str,
 ) -> Result<GateReading> {
-    let command_id = store
-        .record_start(CommandStart {
-            task_id: None,
-            session_id: Some(session.session_id.clone()),
-            run_id: None,
-            stage: REPAIR_STAGE,
-            node: Node::Execute,
-            source: CommandSource::System,
-            command: command.to_string(),
-            cwd: session.worktree.display().to_string(),
-        })
-        .await?;
-
-    let started = std::time::Instant::now();
-    let output = tokio::process::Command::new("sh")
-        .arg("-c")
-        .arg(command)
-        .current_dir(&session.worktree)
-        .output()
-        .await;
-    let duration_ms = started.elapsed().as_millis() as u64;
-    let (exit_code, stdout, stderr) = match output {
-        Ok(out) => (
-            out.status.code().unwrap_or(-1),
-            String::from_utf8_lossy(&out.stdout).to_string(),
-            String::from_utf8_lossy(&out.stderr).to_string(),
-        ),
-        Err(e) => (-1, String::new(), format!("命令无法执行：{e}")),
-    };
     // 全文落可读路径（与 executor 的闸门日志同一约定，文件名自洽：带修复 id 与 kind）
     let full_path = home.worktrees_dir().join(format!(
         "gate-output-repair-{}-{kind}.log",
         session.repair_id
     ));
-    let full_log = format!("[stdout]\n{stdout}\n[stderr]\n{stderr}");
-    let _ = std::fs::write(&full_path, &full_log);
-    let preview = crate::agent::tools::head_tail(&full_log, 10, 20);
+    let timeout_sec = settings.test_command_timeout_sec;
 
-    store
-        .record_finish(
-            command_id,
-            CommandFinish {
-                exit_code: Some(exit_code),
-                stdout_path: Some(full_path.display().to_string()),
-                stdout_preview: Some(preview.clone()),
-                stderr_preview: None,
-                duration_ms,
+    let runner =
+        crate::exec::CommandRunner::new(killer.clone()).with_recorder(Arc::new(store.clone()));
+    let (out, ()) = runner
+        .run(
+            crate::exec::CommandRequest {
+                owner: crate::exec::CommandOwner {
+                    task_id: None,
+                    session_id: Some(session.session_id.clone()),
+                    run_id: None,
+                    stage: REPAIR_STAGE,
+                    node: Node::Execute,
+                    source: CommandSource::System,
+                },
+                command,
+                cwd: &session.worktree,
+                timeout_sec,
+                spawn: crate::exec::SpawnForm::Shell,
+                rewrite: crate::exec::Rewrite::None,
+            },
+            |out| {
+                let full_log = format!("[stdout]\n{}\n[stderr]\n{}", out.stdout, out.stderr);
+                let _ = std::fs::write(&full_path, &full_log);
+                let preview = crate::agent::tools::head_tail(&full_log, 10, 20);
+                Ok((
+                    CommandFinish {
+                        exit_code: Some(out.exit_code.unwrap_or(-1)),
+                        stdout_path: Some(full_path.display().to_string()),
+                        stdout_preview: Some(preview),
+                        stderr_preview: None,
+                        duration_ms: out.duration_ms,
+                    },
+                    (),
+                ))
             },
         )
         .await?;
 
+    // 闸门判据是 **exit code**（逐字不变）：超时收成 -1（闸门失败），启动失败也收成 -1
+    // ——收口之前这两条路一个记 `-1`、一个记「命令无法执行」后继续，都**不是** Err。
+    let full_log = format!("[stdout]\n{}\n[stderr]\n{}", out.stdout, out.stderr);
+    let preview = crate::agent::tools::head_tail(&full_log, 10, 20);
+
     Ok(GateReading {
         kind: kind.to_string(),
         command: command.to_string(),
-        exit_code,
-        duration_ms,
+        exit_code: out.exit_code.unwrap_or(-1),
+        duration_ms: out.duration_ms,
         output_path: Some(full_path.display().to_string()),
         output_preview: preview,
     })

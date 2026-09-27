@@ -405,6 +405,8 @@ pub async fn retry(
                     source: CommandSource::System,
                     command: format!("git reset --hard {base_ref} && git clean -fdx"),
                     cwd: worktree.clone(),
+                    // 这条 `git reset` 不经命令收口（它是 git2 调用的直接记录），故没有原串可言。
+                    original_command: None,
                 })
                 .await
                 .map_err(map_core_error)?;

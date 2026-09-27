@@ -256,7 +256,14 @@ export interface NodeCommand {
   stage: Stage;
   node: Node;
   source: CommandSource;
+  /** **实际执行的**命令串（脱敏后）。 */
   command: string;
+  /**
+   * 改写之前模型（或项目配置）原本写的那一条（决策 297）。
+   *
+   * `null` = 按原样跑。界面默认显示**原串**（那才是模型想要的东西），能展开看实际执行的串。
+   */
+  original_command: string | null;
   cwd: string;
   exit_code: number | null;
   stdout_path: string | null;
@@ -1215,6 +1222,39 @@ export interface ForemanWatchSettings {
     watch_task_cooldown_minutes: number;
     watch_max_wakes_per_hour: number;
   };
+}
+
+/**
+ * 一次可用性探测的读数（决策 297 / 票 03、05）。
+ *
+ * 三条判据全过才算 `available`：解析到绝对路径、`--version` 跑得起来、`hook claude`
+ * 回得出一段可解析的改写。哪一条没过都写在 `reason` 里，界面原样摆出来——**不假装可用**。
+ */
+export interface RtkProbe {
+  available: boolean;
+  /** 解析到的绝对路径（判据①）。 */
+  path: string | null;
+  /** 这一份路径是谁定的：手填 / 服务进程的 PATH / 五个已知目录之一。 */
+  source: 'manual' | 'path' | 'known-dir' | null;
+  /** `rtk --version` 的第一行（判据②）。 */
+  version: string | null;
+  /** 不可用时的原因（三种失败各有各的说法）；可用时不在场。 */
+  reason: string | null;
+}
+
+/**
+ * 命令执行设置页的读数（决策 297 / 票 03、05）：开关 + provenance + **活体探测**。
+ *
+ * 探测**每次读都重做**（不缓存上次结果）：重读目标态才算数。
+ */
+export interface RtkSettings {
+  /** 全局开关：关掉 = 命令按原样跑（逐字等于这个功能出现之前）。 */
+  enabled: boolean;
+  /** 这一份是谁定的：`default` = 从没碰过设置（缺省关）；`settings` = 界面保存过。 */
+  origin: 'default' | 'settings';
+  /** 手填的兜底路径（绝对路径）；`null` = 自动解析。 */
+  path: string | null;
+  probe: RtkProbe;
 }
 
 /** `PUT /notify/channel` 的载荷：通道单元**整体覆盖**（272⑥ 不允许混）。 */

@@ -13,6 +13,7 @@
   import SettingsStages from './routes/SettingsStages.svelte';
   import SettingsMarket from './routes/SettingsMarket.svelte';
   import SettingsForeman from './routes/SettingsForeman.svelte';
+  import SettingsTools from './routes/SettingsTools.svelte';
   import SettingsNotify from './routes/SettingsNotify.svelte';
   import Share from './routes/Share.svelte';
   import Talk from './routes/Talk.svelte';
@@ -44,6 +45,7 @@
     'settings-stages': '设置 · 阶段配置',
     'settings-market': '设置 · 技能市场',
     'settings-foreman': '设置 · 值守轮',
+    'settings-tools': '设置 · 命令执行',
     'settings-notify': '设置 · 离线通知',
     share: '手机访问',
     'not-found': '页面不存在',
@@ -95,6 +97,8 @@
   <SettingsMarket />
 {:else if route.name === 'settings-foreman'}
   <SettingsForeman />
+{:else if route.name === 'settings-tools'}
+  <SettingsTools />
 {:else if route.name === 'settings-notify'}
   <SettingsNotify />
 {:else if route.name === 'metrics'}

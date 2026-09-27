@@ -720,6 +720,7 @@ CREATE TABLE IF NOT EXISTS stage_configs (
 
 > **其余表的位置：** `kanban_transitions`（§12.4.2）、`kanban_node_conversations`（§12.4.3）、`kanban_node_commands`（§12.4.4）分列在可观测性各节，此处不重复。`kanban_project_analyses`（决策 130⑦）：`analysis_id TEXT PRIMARY KEY`、`project_id TEXT NOT NULL REFERENCES kanban_projects(id)`、`status TEXT NOT NULL`、`result_json`、`error`、`created_at`、`updated_at`——配套 `POST /projects/analyze` 异步 202 + `GET /projects/{id}/analysis` 轮询。全部表由 sqlx migrations 统一管理（决策 13）。
 
+> **命令改写开关的表（决策 297）：**`kanban_rtk`（迁移 **`0035_rtk_switch.sql`**：单行表 + `CHECK (id = 1)`，与 0008 / 0009 / 0010 那几张单行表同族）——`enabled` + 可选的手填 `path`；**行缺席 = 缺省关**（一个会改写命令串的优化器要人显式打开）。同批的迁移 **`0034_run_command_original_command.sql`** 给 `kanban_node_commands` 加一列 `original_command`（改写前的原串，**只有真的发生过改写才写**；语义见 §12.4.4）。
 > **技能来源相关的表（决策 194）：** 仓名单住 `kanban_market_repos`（迁移 **`0010_market_repos.sql`**：机器级**单行表 + `CHECK (id = 1)`**，与迁移 0008 / 0009 那两张单行表同族）——「显式清空」与「没保存过」必须分得开；装下来的技能来源住 `skill_sources`（迁移 **`0011_skill_sources.sql`**：`name TEXT PRIMARY KEY` + `owner` / `repo` / `commit_sha` / `subpath` / `installed_at`，**一行一技能**，卸载时一并删）。
 > **迁移 `0009_market_sources.sql` 的文件保留、读写它的代码退场**——`sqlx::migrate!` 对每个**已应用过**的迁移文件记校验和，**改动或删除已应用的迁移都会让既有库在启动时报版本不符**（与决策 193 记的是同一条性质）；要连表一起清掉得是一条**新迁移**（`DROP TABLE`）加一次显式的数据处置决定，不是删文件。
 
@@ -784,6 +785,8 @@ executor checkpoint 机制天然支持：
 | `POST /projects/analyze` | POST | 触发 `project_analysis` 伪阶段静态分析（决策 48）。**异步**（决策 130）：立即返回 `202 {analysis_id}`（分析含 LLM 调用，不阻塞 HTTP），前端轮询 `GET /projects/{id}/analysis` 至完成 |
 | `GET /projects/{id}/analysis` | GET | 最近一次项目分析的状态与结果（决策 130） |
 | `GET/POST/PATCH/DELETE /providers` | — | provider / model 配置 CRUD（存 DB，决策 22/46）。**`api_key` 为明文内联字段**（决策 112）；读接口只回显 `***`，不返回原值 |
+| `GET /rtk` | GET | **命令执行**的读数（决策 297）：存下来的开关 + `origin` + 每次读都**现做一次**的活体探测（`probe`：`available` / `path` / `source` / `version` / `reason`）。不缓存上次结果——重读目标态才算数 |
+| `PUT /rtk` | PUT | 保存命令改写开关（`{enabled, path?}`），回同一份读数（含一次新探测，保存即活、不必重启）。**探测失败不拦保存**：两个结果都 200，差别只在 `probe`；`path` 留空 = 回到自动解析，填了则**以它为准**（填错如实报错、不静默回落） |
 | `GET /metrics` | GET | 全局统计（成功率、平均耗时、token 消耗） |
 | `GET /skills` | GET | 已安装技能清单（名字 / 描述 / 来源 / `declared_in`——被哪些阶段与节点引用，供卸载前看后果）（决策 172⑤，票 09） |
 | `POST /skills/import` | POST | 上传 **zip 原始字节**（`?name=&overwrite=`）装技能；校验含 `SKILL.md`、frontmatter 可解析、正文非空，落到技能根 `{name}/SKILL.md` + 兄弟文件；同名默认 409 并报出现有来源，`overwrite=true` 才覆盖；`name` 可省略（包为 `{name}/SKILL.md` 布局时自动推断，平铺包须显式给）（票 09） |

@@ -1326,7 +1326,14 @@ pub struct NodeCommand {
     pub stage: Stage,
     pub node: Node,
     pub source: CommandSource,
+    /// **实际执行的**命令串（脱敏后，§12.4.4）。
     pub command: String,
+    /// 改写之前模型（或项目配置）原本写的那一条（决策 297）。
+    ///
+    /// `None` = 按原样跑——「没启用 / 这一次调用点不改写 / rtk 不在场」这三件事对台账是
+    /// 同一件事。台账的折叠行显示**原串**（那才是模型想要的东西），改写过的行带一枚小标，
+    /// 展开时两条都摆出来（`components/task/CommandLog.svelte`）。
+    pub original_command: Option<String>,
     pub cwd: String,
     pub exit_code: Option<i32>,
     pub stdout_path: Option<String>,

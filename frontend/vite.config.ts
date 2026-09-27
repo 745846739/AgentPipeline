@@ -19,7 +19,7 @@ export default defineConfig({
     proxy: {
       // skills / market 是票 09–16 新增的端点组：漏在这里的表现是「dev 下 404、打包后正常」
       // foreman（票 01 的对讲台三端点）同理。
-      '^/(tasks|projects|providers|stage-configs|skills|market|metrics|health|server-info|foreman)': {
+      '^/(tasks|projects|providers|stage-configs|skills|market|metrics|health|server-info|foreman|rtk)': {
         target: apiTarget,
         changeOrigin: true,
       },

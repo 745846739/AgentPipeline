@@ -29,6 +29,8 @@ const OFF_HOST_BASE = 'http://192.0.2.10:8788';
 /** 落地页每一项 → 它该落地的那一页的标题（`h1` 的可见文字）。 */
 const ITEMS: Array<{ label: string; hash: string; title: string }> = [
   { label: '项目', hash: '#/settings/projects', title: '设置 · 项目' },
+  { label: '值守轮', hash: '#/settings/foreman', title: '设置 · 值守轮' },
+  { label: '命令执行', hash: '#/settings/tools', title: '设置 · 命令执行' },
   { label: '模型与密钥', hash: '#/settings/providers', title: '设置 · 模型与密钥' },
   { label: '阶段配置', hash: '#/settings/stages', title: '设置 · 阶段配置' },
   { label: '技能市场', hash: '#/settings/market', title: '设置 · 技能市场' },
@@ -93,7 +95,7 @@ test.describe('前端 E2E：设置的信息架构（票 21 / 决策 198）', () 
     expectBundleHealthy(bundle);
   });
 
-  test('顶栏「设置」在设置类各页面都高亮（六处判据）', async ({ page }) => {
+  test('顶栏「设置」在设置类各页面都高亮（每一个设置类路由）', async ({ page }) => {
     const bundle = watchBundle(page);
     const nav = page.getByRole('navigation', { name: '页面导航' });
     const bg = (label: string) =>
@@ -104,6 +106,9 @@ test.describe('前端 E2E：设置的信息架构（票 21 / 决策 198）', () 
     for (const hash of [
       '#/settings',
       '#/settings/projects',
+      '#/settings/foreman',
+      '#/settings/tools',
+      '#/settings/notify',
       '#/settings/providers',
       '#/settings/stages',
       '#/settings/market',
@@ -134,8 +139,8 @@ test.describe('前端 E2E：设置的信息架构（票 21 / 决策 198）', () 
     // 不渲染这一项（不是禁用、不是留个空位）
     await expect(page.getByRole('link', { name: /手机访问/ })).toHaveCount(0);
     await expect(page.getByText(/手机访问/)).toHaveCount(0);
-    // 其余四项一个不少
-    for (const label of ['项目', '模型与密钥', '阶段配置', '技能市场']) {
+    // 其余各项一个不少
+    for (const label of ['项目', '值守轮', '命令执行', '模型与密钥', '阶段配置', '技能市场']) {
       await expect(page.getByRole('link', { name: new RegExp(label) }), label).toBeVisible();
     }
 

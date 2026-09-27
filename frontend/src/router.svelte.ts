@@ -5,8 +5,9 @@
  * `/talk`      对讲台（决策 174；主题六 §3.3 的稿件落地）
  * `/task/:id`  任务详情
  * `/settings`  设置落地页（决策 198；分类「谁能进来」/「怎么跑」）
- * `/settings/projects` · `/settings/providers` · `/settings/stages` · `/settings/market` · `/metrics` · `/share`
- * （票 22 / 决策 167 / 决策 187 / 决策 198）
+ * `/settings/projects` · `/settings/providers` · `/settings/stages` · `/settings/market` ·
+ * `/settings/foreman` · `/settings/tools` · `/settings/notify` · `/metrics` · `/share`
+ * （票 22 / 决策 167 / 决策 187 / 决策 198 / 决策 287 / 决策 297）
  *
  * **开屏默认是对讲台（决策 241）**：地址栏**没写 hash**（`''` / `#`）时，进 store 之前先归一成
  * `#/talk`（见 `normalizeBareHash`）。「默认落点」问的是**什么都不指定时去哪儿**，所以它只接管
@@ -37,6 +38,7 @@ export type Route =
   | { name: 'settings-stages'; query: RouteQuery }
   | { name: 'settings-market'; query: RouteQuery }
   | { name: 'settings-foreman'; query: RouteQuery }
+  | { name: 'settings-tools'; query: RouteQuery }
   | { name: 'settings-notify'; query: RouteQuery }
   | { name: 'metrics'; query: RouteQuery }
   | { name: 'share'; query: RouteQuery }
@@ -86,6 +88,8 @@ export function parseRoute(hash: string): Route {
   // 离线通知（决策 272）：总开关 / 通道四件 / 探针。
   // 值守轮（决策 287 / 票 02）：全局开关 + 只读的节奏五个数。
   if (path === '/settings/foreman') return { name: 'settings-foreman', query };
+  // 命令执行（决策 297 / 票 05）：rtk 改写开关 + 活体探测。
+  if (path === '/settings/tools') return { name: 'settings-tools', query };
   if (path === '/settings/notify') return { name: 'settings-notify', query };
   if (path === '/metrics') return { name: 'metrics', query };
   if (path === '/share') return { name: 'share', query };

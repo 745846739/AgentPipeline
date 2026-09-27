@@ -659,6 +659,9 @@ pub fn foreman_tooling(
     // 归属走会话（迁移 0012）。它同时是**出口策略拒绝**的落点（决策 179）——被拒的命令
     // 也要留一行，否则策略在审计面完全不可见，只剩模型侧的一次报错。
     .with_recorder(Arc::new(store.clone()))
+    // rtk 开关（决策 297 / 票 04）：每条命令现读一次库里的那一行（`RtkSource::Store`），
+    // 于是「保存即活」；**不注入 = 不改写**，命令按原样跑。
+    .with_rtk_store(store.clone())
     .with_env_mode(env_mode)
     .with_allowed_tools(available.to_vec());
     let tools = if ledger_unbounded {

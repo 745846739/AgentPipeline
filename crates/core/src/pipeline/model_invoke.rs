@@ -502,6 +502,8 @@ impl ModelInvoke {
             self.killer.clone(),
         )
         .with_recorder(Arc::new(self.store.clone()))
+        // rtk 开关（决策 297 / 票 04）：每条命令现读一次库里的那一行，保存即活。
+        .with_rtk_store(self.store.clone())
         // 命令输出按行推流（票 14 / 决策 100）：长命令期间前端能看到增量输出。
         .with_sse(crate::agent::tools::CommandSse {
             sink: self.sse.clone(),

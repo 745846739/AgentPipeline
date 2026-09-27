@@ -42,6 +42,20 @@
     }
   }
 
+  /**
+   * 折叠行上显示哪一条（决策 297）：**有原串就显示原串**——那才是模型（或项目配置）想要
+   * 的那件事，排障的人先要看到的是「它想干什么」而不是「这条命令被换成了什么」。
+   * `original_command` 为 `null` 的行（没改写过，绝大多数）显示的就是实际执行的那条。
+   */
+  function shownCommand(command: NodeCommand): string {
+    return command.original_command ?? command.command;
+  }
+
+  /** 这一行真的被改写了吗（展开时才需要把两条都摆出来）。 */
+  function wasRewritten(command: NodeCommand): boolean {
+    return command.original_command !== null && command.original_command !== command.command;
+  }
+
   function outputText(command: NodeCommand): string {
     return (
       outputFor?.(command) ??
@@ -71,7 +85,12 @@
             exit {command.exit_code ?? '—'}
           </span>
         </span>
-        <span class="cmd-l2"><span class="c" title={command.command}>{command.command}</span></span>
+        <span class="cmd-l2">
+          <span class="c" title={shownCommand(command)}>{shownCommand(command)}</span>
+          {#if wasRewritten(command)}
+            <span class="rw" title="这一条被 rtk 改写后再执行">改写</span>
+          {/if}
+        </span>
       </button>
       {#if expanded === command.id}
         {#if loading === command.id}
@@ -82,8 +101,10 @@
             完整输出没读回来：{errorFor?.(command)}
           </div>
         {:else}
-          <pre class="cmdout"><span class="ln">$ {command.command}</span>
-{outputText(command)}{#if command.exit_code !== null}
+          <pre class="cmdout">{#if wasRewritten(command)}<span class="ln">$ {command.original_command}</span>
+<span class="rw">→ 实际执行：{command.command}</span>
+{:else}<span class="ln">$ {command.command}</span>
+{/if}{outputText(command)}{#if command.exit_code !== null}
 <span class="fin">[exit {command.exit_code}]{command.duration_ms !== null ? `  ${formatDuration(command.duration_ms)}` : ''}</span>{/if}</pre>
         {/if}
       {/if}
@@ -94,6 +115,23 @@
 <style>
   .cmds {
     max-width: 900px;
+  }
+  /* 「改写」标：只在真的换过命令的行上出现（决策 297）——不喧哗，但一眼看得出这条
+     跑的不是它写的那个样子。描边 2px、字号 12px 是 §3.1 / §5 的全站像素纪律：1px 与
+     11px 会被 `theme/css-parity.test.ts` 当场拦下。 */
+  .rw {
+    margin-left: 6px;
+    padding: 0 4px;
+    border: 2px solid var(--pane);
+    color: var(--text-3);
+    font-size: 12px;
+  }
+  .cmdout .rw {
+    display: block;
+    margin: 0 0 4px;
+    padding: 0;
+    border: 0;
+    color: var(--text-3);
   }
   /* 桌面单表多列：命令 · 时间 · 来源徽标 · 耗时 · 退出码；移动款两行制见下方 */
   .cmd {

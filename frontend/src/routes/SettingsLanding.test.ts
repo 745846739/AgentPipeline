@@ -3,7 +3,7 @@ import { afterEach, describe, expect, it, vi } from 'vitest';
 import SettingsLanding from './SettingsLanding.svelte';
 
 /**
- * 设置落地页（决策 198 / design §4.3）接线层：分类（决策 272⑧ 起三类）、六个入口，
+ * 设置落地页（决策 198 / design §4.3）接线层：分类（决策 272⑧ 起三类）、八个入口，
  * 以及**「手机访问」项随来源取舍**那一条。
  *
  * 那一条的原判据钉在 `lib/localPage.test.ts`（主机名），这里钉的是**接线**——
@@ -21,7 +21,7 @@ vi.mock('../lib/localPage', () => ({ onHostMachine: mocks.onHostMachine }));
 /** 各分类的项（design §4.3 的定稿项名，逐字）。 */
 const WHO = ['项目', '手机访问'];
 const REACH = ['离线通知'];
-const HOW = ['模型与密钥', '阶段配置', '技能市场'];
+const HOW = ['值守轮', '命令执行', '模型与密钥', '阶段配置', '技能市场'];
 
 afterEach(() => {
   vi.resetAllMocks();
@@ -47,6 +47,8 @@ describe('设置落地页（决策 198）', () => {
       [/项目/, '#/settings/projects'],
       [/手机访问/, '#/share'],
       [/离线通知/, '#/settings/notify'],
+      [/值守轮/, '#/settings/foreman'],
+      [/命令执行/, '#/settings/tools'],
       [/模型与密钥/, '#/settings/providers'],
       [/阶段配置/, '#/settings/stages'],
       [/技能市场/, '#/settings/market'],

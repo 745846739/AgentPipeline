@@ -6,7 +6,7 @@
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use chrono::{DateTime, Utc};
 use futures::future::BoxFuture;
@@ -17,7 +17,6 @@ use super::context::{
     trim_run_command,
 };
 use super::file_policy::FileToolPolicy;
-use super::sanitize::sanitize_text;
 use crate::config::{effective_run_command_timeout, Settings};
 use crate::home::Home;
 use crate::process::ProcessKiller;
@@ -251,8 +250,18 @@ pub struct CommandStart {
     pub stage: Stage,
     pub node: Node,
     pub source: CommandSource,
+    /// **实际执行的**命令串（脱敏后，§12.4.4）。
     pub command: String,
     pub cwd: String,
+    /// 改写之前模型（或项目配置）原本写的那一条——**只有真的发生过改写才写**（决策 297）。
+    ///
+    /// `NULL` = 按原样跑。三种情形对台账是同一件事：没启用 / 这一次调用点传了
+    /// [`Rewrite::None`](crate::exec::Rewrite::None) / rtk 不在场。
+    ///
+    /// 为什么两份都要记：只记实际执行的串 → 原串丢了（而原串是模型想要的东西）；
+    /// 只记原串 → `cat` 与 `rtk read` 的输出不一样，排障会看错；
+    /// 记两行 → 混淆「跑了几条命令」这个计数。
+    pub original_command: Option<String>,
 }
 
 /// 命令日志记录的收尾信息。
@@ -468,6 +477,13 @@ pub struct ToolExecutor {
     /// 分级纪律的一部分（决策 265 / 266），本次一字不动（裁决 4：放开的是它**能查多久**，
     /// 不是**能查什么**）。
     ledger_unbounded: bool,
+    /// 命令执行的 rtk 开关的**读句柄**（决策 297 / 票 04）：收口函数每条命令现读一次它，
+    /// 于是「改完设置下一条命令即生效」。
+    ///
+    /// 与 `ledger` 分开而不是复用：那个字段是「只读台账工具可用」的开关（只给值班长），
+    /// 而这条读写的是**机器级事实**——流水线节点也跑 `run_command`，也必须吃到它。
+    /// `None` = 这台执行器不带开关（测试与「确定不接线」的构造点），命令按原样跑。
+    rtk_store: Option<Store>,
 }
 
 /// 命令输出推流的上下文（票 14）：SSE 去向 + 事件里要带的任务/分支。
@@ -478,23 +494,11 @@ pub struct CommandSse {
     pub branch: String,
 }
 
-/// 单行推流上限（票 14 的节流策略之一）：超长行截断并标注，避免一行撑爆事件。
-pub const STREAM_MAX_LINE_CHARS: usize = 4_000;
-/// 单条命令最多推送的行数（票 14 的节流策略之二）：高频输出超过后停止推流并标注，
-/// **完整输出仍全量缓冲**用于命令记录与回填——推流是观测面，不是数据来源。
-pub const STREAM_MAX_LINES: usize = 2_000;
-
-/// 逐行收集的命令输出（票 14）：完整缓冲 + 推流计数。
-#[derive(Debug, Clone, Default)]
-struct CollectedOutput {
-    stdout: String,
-    stderr: String,
-    /// 已推送的行数（用于节流；两条流合计）。
-    streamed_lines: usize,
-}
-
-/// 心跳默认周期：远小于 300s 空闲超时，600s 级测试命令也能存活（决策 100）。
-pub const COMMAND_HEARTBEAT_INTERVAL: Duration = Duration::from_secs(5);
+/// 推流的两条节流上限与心跳周期：**住在收口里**（决策 297 / 票 01）。
+///
+/// 再从本模块转出去一次，是因为它们此前从这里公开出去过（推流是工具层的既有语义，
+/// 票 14 / 决策 100），改名会波及调用点而收益为零。
+pub use crate::exec::{COMMAND_HEARTBEAT_INTERVAL, STREAM_MAX_LINES, STREAM_MAX_LINE_CHARS};
 
 impl ToolExecutor {
     pub fn new(
@@ -521,7 +525,17 @@ impl ToolExecutor {
             steward_actions: None,
             ask_slot: None,
             ledger_unbounded: false,
+            rtk_store: None,
         }
+    }
+
+    /// 接上 rtk 开关的读句柄（决策 297 / 票 04）：`run_command` 每条命令现读一次它。
+    ///
+    /// **不注入就不改写**（命令按原样跑）——与 `recorder` / `ledger` 同一种构造姿态：
+    /// 这条能力从哪来，在构造点看得见。
+    pub fn with_rtk_store(mut self, store: Store) -> Self {
+        self.rtk_store = Some(store);
+        self
     }
 
     /// 设定环境层档位（决策 206）。生产路径由调用方按阶段配置解析后传入
@@ -1557,6 +1571,8 @@ impl ToolExecutor {
                 match repair::finish_repair_round(
                     &store,
                     &self.home,
+                    &self.settings,
+                    &self.killer,
                     &project,
                     &session,
                     &conclusion,
@@ -1828,13 +1844,15 @@ impl ToolExecutor {
             .or_else(|| ctx.default_cwd.clone())
             .unwrap_or_else(|| ctx.worktree_path.clone());
 
-        // 命令脱敏后落库（§12.4.4）
-        let sanitized = super::sanitize::sanitize_command_line(&command);
-
         // 出口策略（决策 179，票 12）在**启动进程之前**判定：被拒的命令根本不执行。
         // 拒绝也要落 `kanban_node_commands`（与放行的命令同表）——审计面必须看得见
         // 「有过一次被拒的出口尝试」，否则策略只是一次静默失败。
+        //
+        // **顺序是不变量**（决策 297 / spec §6）：`check(原命令) → 改写 → 落台账 → spawn`。
+        // 被拒的命令既不改写也不启动——出口策略的对象是模型**想**访问网络这件事，
+        // 拿改写后的串去判会让「模型写 `cat url` 被判成本地命令」这种漏判成立。
         if let Err(denied) = self.egress.check(&command) {
+            let sanitized = super::sanitize::sanitize_command_line(&command);
             let id = self.record_command_start(ctx, &sanitized, &cwd).await?;
             if let (Some(rec), Some(id)) = (self.recorder.as_ref(), id) {
                 rec.record_finish(
@@ -1850,125 +1868,71 @@ impl ToolExecutor {
             return Err(denied);
         }
 
-        let command_id = self.record_command_start(ctx, &sanitized, &cwd).await?;
-
-        // 命令开始即刷新心跳（决策 100）
-        if let Some(rec) = &self.recorder {
-            rec.touch_heartbeat(ctx.run_id).await?;
-        }
-        self.run_child_to_outcome(
-            ctx,
-            command_id,
-            || crate::process::spawn_in_own_process_group(&command, &cwd),
-            explicit_timeout,
-        )
-        .await
-    }
-
-    /// 启动 → 流式收集 → 超时收口 → 台账回填的**共同管道**（`run_command` 与 `run_readonly`
-    /// 只有「怎么启动」不一样）。
-    ///
-    /// 为什么抽出来：两处各写一遍时**已经漂移过一次**——只有 `run_command` 那一支在超时后补了
-    /// 一次 `kill_process_group`，`run_readonly` 那一支漏了（进程组没杀干净，超时的取证进程会
-    /// 留到天荒地老）。这个管道里每一步的理由都是同一条（心跳 / 进程组 / 脱敏 / 裁剪 / 卸载），
-    /// copy 一份就是给下一次漂移留位置。
-    ///
-    /// `spawn` 是一个闭包而不是一个 `Command`：两条路启动方式不同（`sh -c` 一行 vs argv 直出，
-    /// 决策 232 的「不经 shell」是 `run_readonly` 的安全面本身），而这个差别**只在启动**。
-    /// 调用方负责在调它之前落台账与刷心跳（被拒的那一类也要落账，故那一步不在管道里）。
-    async fn run_child_to_outcome(
-        &self,
-        ctx: &ToolCallContext,
-        command_id: Option<i64>,
-        spawn: impl FnOnce() -> std::io::Result<tokio::process::Child>,
-        explicit_timeout: Option<u64>,
-    ) -> Result<ToolOutcome> {
-        // 决策 100：运行期间周期心跳——600s 级命令不被 300s 空闲超时误杀
-        let heartbeat = self.spawn_command_heartbeat(ctx.run_id);
-        let started = Instant::now();
-        // 独立进程组启动（票 17 / 决策 66）：捕获真实 pgid 回填 node_runs，
-        // 超时回调终止器杀整个进程组（此前 kill(0) 是 no-op）。
-        let mut child_pgid: Option<i32> = None;
-        // 逐行读 + 按行推流（票 14 / 决策 100 / §12.4.4）：输出经管道进入后台收集任务，
-        // 完整内容全量缓冲用于落库与回填（推流是观测面，不改变 kanban_node_commands 口径）。
-        let collected = std::sync::Arc::new(std::sync::Mutex::new(CollectedOutput::default()));
+        // 启动之后的一切走**唯一收口**（决策 297 / 票 01）：进程组 / 心跳 / 超时杀干净 /
+        // 脱敏台账都在 [`crate::exec::CommandRunner`] 里，本函数只剩「这道命令是什么」。
+        // 改写挂在这一处（票 02）：命令是模型随手写的探索命令，输出是给模型的，过滤是净收益。
         let timeout_sec =
             effective_run_command_timeout(&self.settings, ctx.stage, explicit_timeout);
-        let output = match spawn() {
-            Ok(child) => {
-                child_pgid = child.id().map(|id| id as i32);
-                if let (Some(rec), Some(run_id), Some(pgid)) =
-                    (self.recorder.as_ref(), ctx.run_id, child_pgid)
-                {
-                    rec.set_process_group(run_id, pgid).await?;
-                }
-                let collect = self.spawn_streaming_collector(child, command_id, collected.clone());
-                tokio::time::timeout(std::time::Duration::from_secs(timeout_sec), collect).await
-            }
-            Err(e) => Ok(Err(e)),
-        };
-        if let Some(task) = &heartbeat {
-            task.abort();
-        }
+        let (_, outcome) = self
+            .runner()
+            .run(
+                crate::exec::CommandRequest {
+                    owner: crate::exec::CommandOwner::from_ctx(ctx),
+                    command: &command,
+                    cwd: &cwd,
+                    timeout_sec,
+                    spawn: crate::exec::SpawnForm::Shell,
+                    rewrite: crate::exec::Rewrite::Rtk,
+                },
+                |out| self.finish_command_output(ctx, out),
+            )
+            .await?;
+        Ok(outcome)
+    }
 
-        let duration_ms = started.elapsed().as_millis() as u64;
-        let (exit_code, stdout, stderr, timed_out) = match output {
-            Ok(Ok(status)) => {
-                let out = collected.lock().unwrap().clone();
-                (status.code(), out.stdout, out.stderr, false)
-            }
-            Ok(Err(e)) => (None, String::new(), format!("命令启动失败：{e}"), false),
-            Err(_) => {
-                // 超时：杀掉整个进程组，已收到的输出仍保留（推流过的部分不丢）
-                let out = collected.lock().unwrap().clone();
-                if let Some(pgid) = child_pgid {
-                    let _ = self.killer.kill_process_group(pgid);
-                }
-                (
-                    None,
-                    out.stdout,
-                    format!("命令超时（{timeout_sec}s）"),
-                    true,
-                )
-            }
-        };
+    /// 命令收尾：**L1 裁剪 + L2 卸载**（唯一阈值，决策 110）+ 台账那一行要的四格。
+    ///
+    /// `run_command` 与 `run_readonly` 逐字共用这一份（`stdout_path` 记的是卸载落点，预览
+    /// 取首尾 50/100 行）——它是收口留给调用点的唯一一格，两条路在这一格上恰好一致，故不给
+    /// 它们各写一遍（写两遍已经漂移过一次，见 `exec.rs` 的模块说明）。
+    fn finish_command_output(
+        &self,
+        ctx: &ToolCallContext,
+        out: &crate::exec::CommandOutput,
+    ) -> Result<(CommandFinish, ToolOutcome)> {
+        // L1 裁剪 + L2 卸载（唯一阈值，决策 110）：`stdout_path` 记的是卸载落点。
+        let (in_context, offload_path) = self.prepare_output(ctx, &out.stdout, &out.stderr)?;
+        Ok((
+            CommandFinish {
+                exit_code: out.exit_code,
+                stdout_path: offload_path,
+                stdout_preview: Some(head_tail(&out.stdout, 50, 100)),
+                stderr_preview: Some(head_tail(&out.stderr, 50, 100)),
+                duration_ms: out.duration_ms,
+            },
+            ToolOutcome::ok(in_context),
+        ))
+    }
 
-        // 决策 118：输出脱敏在**回填 messages 之前**执行
-        let stdout = sanitize_text(&stdout);
-        let stderr = sanitize_text(&stderr);
-
-        // L1 裁剪 + L2 卸载（唯一阈值，决策 110）
-        let (in_context, offload_path) = self.prepare_output(ctx, &stdout, &stderr)?;
-
+    /// 这一轮要用的命令执行收口（决策 297 / 票 01）。
+    ///
+    /// 按**当前字段**现建一个：`recorder` / `sse` / 心跳周期都是构造后可改的
+    /// （`.with_recorder()` 等），现建保证收口看到的就是这一轮生效的那一份。
+    /// rtk 那条线走 `Store` 现读（票 04），故开关改完下一条命令即生效。
+    fn runner(&self) -> crate::exec::CommandRunner {
+        let mut runner = crate::exec::CommandRunner::new(self.killer.clone())
+            .with_heartbeat_interval(self.command_heartbeat_interval);
         if let Some(rec) = &self.recorder {
-            if let Some(id) = command_id {
-                rec.record_finish(
-                    id,
-                    CommandFinish {
-                        exit_code,
-                        stdout_path: offload_path.clone(),
-                        stdout_preview: Some(head_tail(&stdout, 50, 100)),
-                        stderr_preview: Some(head_tail(&stderr, 50, 100)),
-                        duration_ms,
-                    },
-                )
-                .await?;
-            }
-            // 命令结束刷新心跳（决策 100）
-            rec.touch_heartbeat(ctx.run_id).await?;
+            runner = runner.with_recorder(rec.clone());
         }
-
-        if timed_out {
-            // 超时由节点级重试处理；这里把失败形态交给 agent loop，并杀掉整个进程组
-            //（pgid 已在启动时捕获并回填 node_runs，决策 66 / 票 17）
-            if let Some(pgid) = child_pgid {
-                self.killer.kill_process_group(pgid)?;
-            }
+        if let Some(sse) = &self.sse {
+            runner = runner.with_sse(sse.clone());
         }
-
-        // 命令自己以非零退出（`tail` 的文件不存在之类）**不是**策略拒绝：回执原样交回去，
-        // 让模型看着真输出改道——它正在取证，一条读不到的文件本来就是要报出来的事实。
-        Ok(ToolOutcome::ok(in_context))
+        // 只有 `run_command` 会挂改写；接线本身在收口里（`Rewrite::None` 时它不去解析）。
+        if let Some(store) = &self.rtk_store {
+            runner = runner.with_rtk_store(store.clone());
+        }
+        runner
     }
 
     /// `run_readonly`（决策 232 / 237）：**只读取证**——白名单命令、argv 直出、不经 shell。
@@ -2081,24 +2045,35 @@ impl ToolExecutor {
             }
         }
 
-        // 命令台账（§12.4.4）：值与 `run_command` 同一条口径——argv 拼回一行、过脱敏、
-        // 归属走会话（值班长）或任务（决策 204④）。审计面要看得见每一次取证。
-        let sanitized = super::sanitize::sanitize_command_line(&rendered);
-        let command_id = self.record_command_start(ctx, &sanitized, &cwd).await?;
-        if let Some(rec) = &self.recorder {
-            rec.touch_heartbeat(ctx.run_id).await?;
-        }
-
+        // 台账那一行由收口函数落（它与 `run_command` 同一条口径：argv 拼回一行、过脱敏、
+        // 归属走会话（值班长）或任务（决策 204④））——审计面要看得见每一次取证。
         let explicit_timeout = args.get("timeout_sec").and_then(|v| v.as_u64());
         // 启动之后的一切与 `run_command` **同一条管道**（心跳 / 进程组 / 超时收口 / 脱敏 /
         // 裁剪卸载 / 台账回填）：唯一不同的只有启动那一句——argv 直出、不经 shell。
-        self.run_child_to_outcome(
-            ctx,
-            command_id,
-            || crate::process::spawn_argv_in_own_process_group(&program, &argv, &cwd),
-            explicit_timeout,
-        )
-        .await
+        //
+        // **改写永远为 `None`**（决策 297 / spec §2）：决策 232 的安全面是「命令名与参数是
+        // 两个独立的数组元素」，把 `argv[0]` 换成 `rtk`，`sh -c "date; rm -rf x"` 那种
+        // 「按命令名判定」的性质就丢了。收口里对这一支再挡一次。
+        let timeout_sec =
+            effective_run_command_timeout(&self.settings, ctx.stage, explicit_timeout);
+        let (_, outcome) = self
+            .runner()
+            .run(
+                crate::exec::CommandRequest {
+                    owner: crate::exec::CommandOwner::from_ctx(ctx),
+                    command: &rendered,
+                    cwd: &cwd,
+                    timeout_sec,
+                    spawn: crate::exec::SpawnForm::Argv {
+                        program: &program,
+                        args: &argv,
+                    },
+                    rewrite: crate::exec::Rewrite::None,
+                },
+                |out| self.finish_command_output(ctx, out),
+            )
+            .await?;
+        Ok(outcome)
     }
 
     /// 内容搜索（决策 267 / 票 01）：纯 Rust 正则检索文件域——`regex` crate + `std::fs`
@@ -2513,113 +2488,12 @@ impl ToolExecutor {
                 source: ctx.command_source,
                 command: sanitized.to_string(),
                 cwd: cwd.display().to_string(),
+                // 这一条路**没有经过收口**（被拒的 / 非命令型工具的自记一行），故它不可能
+                // 发生过改写：`original_command` 恒为 NULL 是事实，不是缺省。
+                original_command: None,
             })
             .await?,
         ))
-    }
-
-    /// 逐行读子进程输出、全量缓冲并**按行推流**（票 14 / 决策 100 / §12.4.4）。
-    ///
-    /// 返回子进程退出状态；stdout / stderr 的完整内容写进 `collected`。
-    /// 推流只作用于观测面：超长行截断、超高频停止推流，均**不影响**缓冲的完整输出
-    /// （`kanban_node_commands` 的落库口径不变）。无 `sse` 或无 `command_id` 时
-    /// 退化为纯缓冲（不阻塞、不漏内容，短命令与无订阅者场景不退化）。
-    async fn spawn_streaming_collector(
-        &self,
-        mut child: tokio::process::Child,
-        command_id: Option<i64>,
-        collected: std::sync::Arc<std::sync::Mutex<CollectedOutput>>,
-    ) -> std::io::Result<std::process::ExitStatus> {
-        use tokio::io::{AsyncBufReadExt, BufReader};
-        let stdout_pipe = child
-            .stdout
-            .take()
-            .map(|p| Box::new(p) as Box<dyn tokio::io::AsyncRead + Unpin + Send>);
-        let stderr_pipe = child
-            .stderr
-            .take()
-            .map(|p| Box::new(p) as Box<dyn tokio::io::AsyncRead + Unpin + Send>);
-        let sse = self.sse.clone();
-
-        let pump = |pipe: Option<Box<dyn tokio::io::AsyncRead + Unpin + Send>>,
-                    is_stderr: bool,
-                    collected: std::sync::Arc<std::sync::Mutex<CollectedOutput>>,
-                    sse: Option<CommandSse>| async move {
-            let Some(pipe) = pipe else { return };
-            let mut lines = BufReader::new(pipe).lines();
-            while let Ok(Some(line)) = lines.next_line().await {
-                // 1) 完整缓冲（未脱敏原样；脱敏在回填前统一做，保持既有顺序）
-                {
-                    let mut c = collected.lock().unwrap();
-                    if is_stderr {
-                        c.stderr.push_str(&line);
-                        c.stderr.push('\n');
-                    } else {
-                        c.stdout.push_str(&line);
-                        c.stdout.push('\n');
-                    }
-                    // 2) 推流（受节流约束）
-                    if let (Some(sse), Some(cmd_id)) = (sse.as_ref(), command_id) {
-                        if c.streamed_lines < STREAM_MAX_LINES {
-                            c.streamed_lines += 1;
-                            drop(c);
-                            let chunk = if line.chars().count() > STREAM_MAX_LINE_CHARS {
-                                let head: String =
-                                    line.chars().take(STREAM_MAX_LINE_CHARS).collect();
-                                format!("{head}…[本行超长已截断]")
-                            } else {
-                                line.clone()
-                            };
-                            // 推流内容同样脱敏（§12.4.4：四条路径一致）
-                            let chunk = sanitize_text(&chunk);
-                            sse.sink.emit(crate::sse::SseEvent::CommandOutput {
-                                task_id: sse.task_id.clone(),
-                                branch: sse.branch.clone(),
-                                command_id: cmd_id,
-                                chunk,
-                            });
-                            continue;
-                        }
-                        // 超过行数上限：只推一次「已停止推流」标注
-                        if c.streamed_lines == STREAM_MAX_LINES {
-                            c.streamed_lines += 1;
-                            drop(c);
-                            sse.sink.emit(crate::sse::SseEvent::CommandOutput {
-                                task_id: sse.task_id.clone(),
-                                branch: sse.branch.clone(),
-                                command_id: cmd_id,
-                                chunk: format!(
-                                    "…[输出超过 {STREAM_MAX_LINES} 行，已停止推流；完整内容以命令记录为准]"
-                                ),
-                            });
-                        }
-                    }
-                }
-            }
-        };
-
-        tokio::join!(
-            pump(stdout_pipe, false, collected.clone(), sse.clone()),
-            pump(stderr_pipe, true, collected, sse)
-        );
-        child.wait().await
-    }
-
-    /// 周期心跳任务：命令结束（含超时）时由调用方 abort（决策 100）。
-    fn spawn_command_heartbeat(&self, run_id: Option<i64>) -> Option<tokio::task::JoinHandle<()>> {
-        let recorder = self.recorder.clone()?;
-        let interval = self.command_heartbeat_interval;
-        Some(tokio::spawn(async move {
-            let mut tick = tokio::time::interval(interval);
-            tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-            tick.tick().await; // interval 的首次 tick 立即完成，跳过（起止心跳已覆盖）
-            loop {
-                tick.tick().await;
-                if recorder.touch_heartbeat(run_id).await.is_err() {
-                    break;
-                }
-            }
-        }))
     }
 
     /// 输出裁剪 + 卸载，返回（进 context 的文本，卸载路径）。

@@ -19,6 +19,7 @@ import type {
   NotifyChannelTest,
   NotifyPolitenessPayload,
   ForemanWatchSettings,
+  RtkSettings,
   NotifySettings,
   Project,
   ProjectAnalysis,
@@ -557,6 +558,32 @@ export function setForemanWatch(enabled: boolean): Promise<{ enabled: boolean; o
     method: 'PUT',
     body: { enabled },
   });
+}
+
+
+/* 命令执行（决策 297）：开关 + 活体探测；保存时探测失败也照存。 */
+
+/**
+ * 读**命令执行**设置（票 05）：存的状态 + **每次现做一次**的活体探测。
+ *
+ * 「现做」不是实现细节而是契约的一部分：这台机器上 rtk 装没装、还灵不灵，只有在读的
+ * 那一刻问一遍才算数（决策 257 的「重读目标态」）。
+ */
+export function getRtk(): Promise<RtkSettings> {
+  return request<RtkSettings>('/rtk');
+}
+
+/**
+ * 拨**命令执行开关**（票 05）：保存即活——每条命令现读库里的这一行，下一条就按新值走。
+ *
+ * 启用时后端先探测，但**探测失败不拦**（决策 297）：照样存下来，把 `probe` 摆出来给
+ * 用户看。`path` 传空串或省略 = 回到自动解析。
+ */
+export function setRtk(payload: {
+  enabled: boolean;
+  path?: string | null;
+}): Promise<RtkSettings> {
+  return request<RtkSettings>('/rtk', { method: 'PUT', body: payload });
 }
 
 

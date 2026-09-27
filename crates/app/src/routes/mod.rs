@@ -7,6 +7,7 @@ pub mod notify;
 pub mod pairing;
 pub mod projects;
 pub mod providers;
+pub mod rtk;
 pub mod server_info;
 pub mod skills;
 pub mod stage_configs;

@@ -77,6 +77,11 @@
           note: '配 provider 台账（设置这一类页面）与密钥。',
         },
         {
+          path: '/settings/tools',
+          label: '命令执行',
+          note: '命令交给 rtk 改写（更省 Token）——开关与本机可用性。',
+        },
+        {
           path: '/settings/stages',
           label: '阶段配置',
           note: '每个阶段用哪个 provider、带哪些工具与技能。',

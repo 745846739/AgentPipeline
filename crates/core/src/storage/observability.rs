@@ -1051,8 +1051,9 @@ impl Store {
         node: Option<Node>,
     ) -> Result<Vec<NodeCommand>> {
         let mut sql = String::from(
-            "SELECT id, task_id, session_id, run_id, stage, node, source, command, cwd, exit_code,
-                    stdout_path, stdout_preview, stderr_preview, duration_ms, started_at, finished_at
+            "SELECT id, task_id, session_id, run_id, stage, node, source, command, original_command,
+                    cwd, exit_code, stdout_path, stdout_preview, stderr_preview, duration_ms,
+                    started_at, finished_at
              FROM kanban_node_commands WHERE task_id = ?",
         );
         if stage.is_some() {
@@ -1079,8 +1080,9 @@ impl Store {
     /// ——归属列恰好一个非空，故两者永不重叠。
     pub async fn list_foreman_commands(&self, session_id: &str) -> Result<Vec<NodeCommand>> {
         let rows: Vec<CommandRow> = sqlx::query_as(
-            "SELECT id, task_id, session_id, run_id, stage, node, source, command, cwd, exit_code,
-                    stdout_path, stdout_preview, stderr_preview, duration_ms, started_at, finished_at
+            "SELECT id, task_id, session_id, run_id, stage, node, source, command, original_command,
+                    cwd, exit_code, stdout_path, stdout_preview, stderr_preview, duration_ms,
+                    started_at, finished_at
              FROM kanban_node_commands WHERE session_id = ? ORDER BY id",
         )
         .bind(session_id)
@@ -1091,8 +1093,9 @@ impl Store {
 
     pub async fn get_command(&self, command_id: i64) -> Result<Option<NodeCommand>> {
         let row: Option<CommandRow> = sqlx::query_as(
-            "SELECT id, task_id, session_id, run_id, stage, node, source, command, cwd, exit_code,
-                    stdout_path, stdout_preview, stderr_preview, duration_ms, started_at, finished_at
+            "SELECT id, task_id, session_id, run_id, stage, node, source, command, original_command,
+                    cwd, exit_code, stdout_path, stdout_preview, stderr_preview, duration_ms,
+                    started_at, finished_at
              FROM kanban_node_commands WHERE id = ?",
         )
         .bind(command_id)
@@ -1160,6 +1163,7 @@ struct CommandRow {
     node: String,
     source: String,
     command: String,
+    original_command: Option<String>,
     cwd: String,
     exit_code: Option<i64>,
     stdout_path: Option<String>,
@@ -1182,6 +1186,7 @@ impl CommandRow {
             // 观测类字段：非法值 warn + 兜底（Q6 分类）
             source: decode_lossy(&self.source, "命令来源", CommandSource::System),
             command: self.command,
+            original_command: self.original_command,
             cwd: self.cwd,
             exit_code: self.exit_code.map(|v| v as i32),
             stdout_path: self.stdout_path,
@@ -1211,9 +1216,10 @@ impl CommandRecorder for Store {
             }
             let id: i64 = sqlx::query_scalar(
                 "INSERT INTO kanban_node_commands
-                 (task_id, session_id, run_id, stage, node, source, command, cwd, exit_code,
-                  stdout_path, stdout_preview, stderr_preview, duration_ms, started_at, finished_at)
-                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, NULL, NULL, NULL, NULL, NULL, ?, NULL)
+                 (task_id, session_id, run_id, stage, node, source, command, original_command, cwd,
+                  exit_code, stdout_path, stdout_preview, stderr_preview, duration_ms, started_at,
+                  finished_at)
+                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, NULL, NULL, NULL, NULL, ?, NULL)
                  RETURNING id",
             )
             .bind(&task_id)
@@ -1223,6 +1229,7 @@ impl CommandRecorder for Store {
             .bind(start.node.as_str())
             .bind(start.source.as_str())
             .bind(&start.command)
+            .bind(&start.original_command)
             .bind(&start.cwd)
             .bind(ts(store.now()))
             .fetch_one(store.pool())

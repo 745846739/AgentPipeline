@@ -12,11 +12,13 @@
 //!   脏工作区是 Pending 不是 Route；`Approval::Approved → None` 的中间态只在循环内。
 
 use std::path::Path;
+use std::sync::Arc;
 
 use crate::clock::Clock;
 use crate::config::Settings;
 use crate::git::Git;
 use crate::pipeline::subagent::RunTokens;
+use crate::process::ProcessKiller;
 use crate::sse::SseSink;
 use crate::storage::Store;
 use crate::types::{
@@ -30,12 +32,14 @@ use super::executor::{
 };
 use super::run_ledger::RunLedger;
 
-/// merge 状态机的依赖面（决策 249 · 票 04）：四件全是借用——留守核每次派发借一遍。
+/// merge 状态机的依赖面（决策 249 · 票 04）：五件全是借用——留守核每次派发借一遍。
 pub(crate) struct MergeFlow<'a> {
     pub(crate) store: &'a Store,
     pub(crate) settings: &'a Settings,
     pub(crate) sse: &'a dyn SseSink,
     pub(crate) clock: &'a dyn Clock,
+    /// 合入前的闸门走命令收口（决策 297 / 票 02），收口要一个终止器。
+    pub(crate) killer: &'a Arc<dyn ProcessKiller>,
 }
 
 impl MergeFlow<'_> {
@@ -259,6 +263,7 @@ impl MergeFlow<'_> {
             self.store,
             self.settings,
             self.clock,
+            self.killer,
             task,
             project,
             run_id,
@@ -529,11 +534,13 @@ mod tests {
         let settings = Settings::default();
         let sse = NoopSse;
         let clock = SystemClock;
+        let killer: Arc<dyn ProcessKiller> = Arc::new(crate::process::RealProcessKiller);
         let flow = MergeFlow {
             store: &store,
             settings: &settings,
             sse: &sse,
             clock: &clock,
+            killer: &killer,
         };
         store
             .upsert_merge_result(

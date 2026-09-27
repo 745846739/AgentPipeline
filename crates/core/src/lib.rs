@@ -13,6 +13,8 @@ pub mod agent;
 pub mod clock;
 pub mod config;
 pub mod error;
+/// 命令执行的唯一收口（决策 297）：启动 → 采集 → 超时收口 → 脱敏 → 台账。
+pub mod exec;
 pub mod git;
 pub mod home;
 pub mod host_policy;
@@ -20,6 +22,8 @@ pub mod metrics;
 pub mod notify;
 pub mod pipeline;
 pub mod process;
+/// rtk（Rust Token Killer）的改写与可用性（决策 297）。
+pub mod rtk;
 pub mod scheduler;
 pub mod sse;
 pub mod storage;
