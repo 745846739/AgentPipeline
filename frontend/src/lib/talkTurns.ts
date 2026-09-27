@@ -502,3 +502,99 @@ export function watchDraftExcerpt(content: string): string {
   const text = content.trim();
   return text.length > WATCH_DRAFT_MAX ? `${text.slice(0, WATCH_DRAFT_MAX)}…` : text;
 }
+
+/**
+ * 推理收起行里那一行 **ticker**（决策 301）：正在想的时候，摘要行不只说「正在想…」，
+ * 还把**此刻最新的一行原文**带出来——人不用点开就知道它想到哪了。
+ *
+ * **取最后一行非空文本**（ZCode 的读数）：模型的推理是逐行往外写的，最后一行就是它此刻
+ * 停在哪。空白折成单空格（它要落在 `nowrap` 的一行里，换行符会把摘要行撑成两块）；
+ * 全空时回空串，模板据此只显示「正在想…」。
+ *
+ * 判据抽出来与 `watchDraftExcerpt` 同一理由：它是**文案与行为的规格**（取哪一行、
+ * 怎么折算），该有机器门，不该埋在组件的回调里。
+ */
+export function thinkTicker(text: string): string {
+  const lines = text.split('\n');
+  for (let i = lines.length - 1; i >= 0; i -= 1) {
+    const line = lines[i].replace(/\s+/g, ' ').trim();
+    if (line) return line;
+  }
+  return '';
+}
+
+/**
+ * 工具展开详情里的**参数正文**（决策 301）：能 parse 的 JSON 美化两空格，否则原文照旧。
+ *
+ * 后端给的是参数原串（`args`，决策 301 的 12k 上限那一份）。美化只对**看得懂**的输入做
+ * ——参数不总是 JSON（有的工具收的是纯文本或半截 JSON），那种一律原样吐出来，
+ * 绝不在界面上替它编一个结构。与决策 274 同一条口径：留痕不渲染 markdown。
+ */
+export function prettyArgs(args: string): string {
+  const raw = args.trim();
+  if (!raw) return '';
+  try {
+    return JSON.stringify(JSON.parse(raw), null, 2);
+  } catch {
+    return args;
+  }
+}
+
+/**
+ * 收口时接住在飞轮那一步折叠态的**是哪一轮**（决策 301）：最后一条**带步骤**的落地轮。
+ *
+ * 「带步骤」这一条是判据的全部：失败轮、乐观轮、提议轮与提问轮都没有步骤，落到它们身上
+ * 等于把人的展开态扔进一个画不出步骤的地方（而那一轮本身也不是在飞轮的接任者）。
+ *
+ * 判据抽出来与 `watchDraftExcerpt` 同一理由：它是**行为规格**（谁接住），该有机器门。
+ */
+export function settlingTurn(list: TurnView[]): TurnView | null {
+  for (let i = list.length - 1; i >= 0; i -= 1) {
+    const t = list[i];
+    if (t.key !== 'live' && t.steps.length > 0) return t;
+  }
+  return null;
+}
+
+/**
+ * 把记在在飞键（`live-s<i>`）上的人为折叠态搬到落地轮的键上（决策 301）。
+ *
+ * 在飞轮的渲染键是常量 `'live'`，落地那一轮是 `m<id>`——键一换，人在流式期间点开的
+ * 推理 / 工具详情就会全部失联、在收口那一刻自己合上。只搬**有条目的**（= 人碰过的）：
+ * 没碰过的块在两个 map 里根本没有条目，落地后照默认态收起，这正是「收口自动折叠」
+ * 要的那一半，而它是白拿的。
+ *
+ * 步号对齐：落地段序与流上段序由同一份数据归出来（本模块），`-s<i>` 的序号在两侧一致；
+ * 步数不一时按序号取交集，多出来的落地步用默认态。
+ */
+export function carryLiveStepOpen(
+  map: Record<string, boolean>,
+  landedKey: string,
+): Record<string, boolean> {
+  // 这一份里根本没有在飞键（`live` / `live-s<i>`）时**原样返回同一个对象**：
+  // 不写一次同值的新对象去白触发依赖它的那些效果。
+  const keys = Object.keys(map);
+  if (!keys.some((k) => k === 'live' || /^live-s\d+$/.test(k))) return map;
+  const next: Record<string, boolean> = {};
+  for (const [key, open] of Object.entries(map)) {
+    const m = /^live-s(\d+)$/.exec(key);
+    if (m) next[`${landedKey}-s${m[1]}`] = open;
+    // `live`（整条轮键那一份）在这里就此丢掉——它归 `carryLiveTurnOpen` 搬。
+    else if (key !== 'live') next[key] = open;
+  }
+  return next;
+}
+
+/**
+ * 「过程」那一组的键**就是轮键**，故搬法是整条改键（决策 301）。
+ * 同样只在确有条目时动手。
+ */
+export function carryLiveTurnOpen(
+  map: Record<string, boolean>,
+  landedKey: string,
+): Record<string, boolean> {
+  if (!('live' in map)) return map;
+  const next = { ...map, [landedKey]: map['live'] };
+  delete next['live'];
+  return next;
+}

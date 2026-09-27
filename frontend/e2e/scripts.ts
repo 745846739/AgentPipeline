@@ -37,7 +37,19 @@ export type Step =
    * 最后一截，它出现时这一轮已经落地，而落地会触发重读台账，于是「字是从流来的」与
    * 「字是从台账来的」在屏幕上分不开（实测：那时摘掉闸门，用例照样绿）。
    */
-  | { kind: 'drip'; parts: string[]; gapMs: number };
+  | { kind: 'drip'; parts: string[]; gapMs: number }
+  /**
+   * **分几截滴出来的推理**，最后接一句收口正文：与 {@link Step}`['drip']` 同一个理由——
+   * 它给出**决定性的中间态**，而这一支要的中间态是「推理已经写到第 k 行、后面还没写」。
+   *
+   * 为什么现有的两个 `reasoning` 口子不够：`sseTool` / `sseText` 把推理与它后面那一步
+   * **同一条 SSE 里一次发完**，于是「推理那一步正在攒」这个状态只在毫秒级存在——用例抢不到，
+   * 而推理收起行的 ticker（决策 301：跟着最新一行走）**只在那个状态里**才画得出来。
+   *
+   * `parts` 各截之间用 `gapMs` 隔开，请让每一截以换行结尾（ticker 取的是最后一行）；
+   * 最后一截与 `text` 一起收线（`[DONE]`）。
+   */
+  | { kind: 'think'; parts: string[]; gapMs: number; text: string };
 
 export type NodeScript = Record<string, Step[][]>;
 
@@ -56,6 +68,16 @@ export const text = (value: string, delayMs = 0, reasoning?: string): Step => ({
 });
 /** 分几截滴：`parts[0]` 先到，此后每 `gapMs` 补一截。见 {@link Step} 的那一条说明。 */
 export const drip = (parts: string[], gapMs = 4_000): Step => ({ kind: 'drip', parts, gapMs });
+/**
+ * 分几截滴推理、末了收一句正文（见 {@link Step} 那条 `think` 的说明）。
+ * 每一截以换行结尾时，ticker 逐截换行（决策 301 要验的正是这件事）。
+ */
+export const think = (parts: string[], text: string, gapMs = 4_000): Step => ({
+  kind: 'think',
+  parts,
+  gapMs,
+  text,
+});
 
 export const writeFile = (path: string, content: string): Step =>
   tool('write_file', { path, content });

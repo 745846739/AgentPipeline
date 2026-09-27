@@ -1,6 +1,19 @@
 import type { ForemanMessage, ForemanProposal, ForemanSession } from '../api/types';
 import type { ForemanStreamState } from '../realtime/foreman';
-import { buildTurns, turnName, watchDraftExcerpt, WATCH_DRAFT_MAX, type TalkTurnsInput } from './talkTurns';
+import {
+  buildTurns,
+  carryLiveStepOpen,
+  carryLiveTurnOpen,
+  prettyArgs,
+  settlingTurn,
+  thinkTicker,
+  turnName,
+  watchDraftExcerpt,
+  WATCH_DRAFT_MAX,
+  type TalkTurnsInput,
+  type TurnStep,
+  type TurnView,
+} from './talkTurns';
 
 /**
  * 对讲台时间线的回合构造（票 02；决策 251 的三块判断之一）。
@@ -769,5 +782,148 @@ describe('快照与直播的拼接：在途半截行是基准（票 02）', () =
     const turns = buildTurns(inputOf({ session: sessionOf([message()]), following: true, stream }));
     const live = turns.find((t) => t.key === 'live');
     expect(live?.content).toBe('整条流');
+  });
+});
+
+/**
+ * 展开详情的三件文案 / 行为规格（决策 301）。
+ *
+ * 它们都住在模块里而不是组件的回调里：取哪一行、折成什么形状、收口时谁接住——都是
+ * **规格**（换一个实现就该红），不是排版细节。
+ */
+describe('展开详情的规格（决策 301）', () => {
+  function stepOf(over: Partial<TurnStep> = {}): TurnStep {
+    return { key: 'm1-s0', kind: 'thinking', text: '', tool: null, live: false, ...over };
+  }
+
+  function viewOf(over: Partial<TurnView> = {}): TurnView {
+    return {
+      key: 'm1',
+      kind: 'fm',
+      content: '',
+      at: '',
+      streaming: false,
+      partial: false,
+      steps: [],
+      briefing: null,
+      needsPairing: false,
+      proposal: null,
+      ask: null,
+      askAnswered: false,
+      proactive: false,
+      attribution: null,
+      interruptedAt: null,
+      ...over,
+    };
+  }
+
+  describe('thinkTicker：收起行里那一行「它想到哪了」', () => {
+    it('取最后一行非空文本——推理是逐行往外写的，最后一行就是它此刻停在哪', () => {
+      expect(thinkTicker('先看一遍\n再查台账\n正在核对第 3 条')).toBe('正在核对第 3 条');
+    });
+
+    it('末尾的空行不算「最新」——流式下每一段都跟在换行之后', () => {
+      expect(thinkTicker('第一行\n第二行\n\n  \n')).toBe('第二行');
+    });
+
+    it('行内空白折成单空格（它要落在 nowrap 的一行里，换行符会把摘要行撑成两块）', () => {
+      expect(thinkTicker('not  quite\t\t这里   还有空白')).toBe('not quite 这里 还有空白');
+    });
+
+    it('一个字都没有时回空串——模板据此只显示「正在想…」', () => {
+      expect(thinkTicker('')).toBe('');
+      expect(thinkTicker('\n\n   \n')).toBe('');
+    });
+
+    it('只有一行时就是它自己', () => {
+      expect(thinkTicker('正在想一件事')).toBe('正在想一件事');
+    });
+  });
+
+  describe('prettyArgs：参数原串 → 看得懂的正文', () => {
+    it('能 parse 的 JSON 美化两空格（人要在展开体里读它，不是机读）', () => {
+      expect(prettyArgs('{"task_id":"t1","n":2}')).toBe(
+        '{\n  "task_id": "t1",\n  "n": 2\n}',
+      );
+    });
+
+    it('parse 不了的照原文吐——绝不在界面上替它编一个结构', () => {
+      expect(prettyArgs('--flag value')).toBe('--flag value');
+      expect(prettyArgs('{"task_id": ')).toBe('{"task_id": ');
+    });
+
+    it('空串与纯空白都由模板另说（回空串，不编「{}」）', () => {
+      expect(prettyArgs('')).toBe('');
+      expect(prettyArgs('   \n ')).toBe('');
+    });
+
+    it('JSON 标量也算 parse 得动：原样给回去（不做多余包装）', () => {
+      expect(prettyArgs('123')).toBe('123');
+    });
+  });
+
+  describe('settlingTurn：收口后谁接住在飞轮那一步的折叠态', () => {
+    it('取最后一条**带步骤**的落地轮', () => {
+      const older = viewOf({ key: 'm1', steps: [stepOf({ key: 'm1-s0' })] });
+      const newer = viewOf({ key: 'm2', steps: [stepOf({ key: 'm2-s0' })] });
+      expect(settlingTurn([older, newer])?.key).toBe('m2');
+    });
+
+    it('在飞轮自己不算——它正是要被接住的那一个', () => {
+      const live = viewOf({ key: 'live', steps: [stepOf({ key: 'live-s0' })] });
+      const landed = viewOf({ key: 'm2', steps: [stepOf({ key: 'm2-s0' })] });
+      expect(settlingTurn([landed, live])?.key).toBe('m2');
+    });
+
+    it('失败轮 / 乐观轮 / 提议轮都不接（没有步骤，接住等于把人的展开态扔进画不出步骤的地方）', () => {
+      const landed = viewOf({ key: 'm7', steps: [stepOf({ key: 'm7-s0' })] });
+      const failed = viewOf({ key: 'send-error', kind: 'failed' });
+      expect(settlingTurn([landed, failed])?.key).toBe('m7');
+    });
+
+    it('一轮带步骤的都没有时回 null——调用方据此不动任何折叠态', () => {
+      expect(settlingTurn([])).toBeNull();
+      expect(settlingTurn([viewOf({ key: 'm1' })])).toBeNull();
+    });
+  });
+
+  describe('carryLiveStepOpen：把在飞键上的人为展开态改成落地键', () => {
+    it('`live-s<i>` 按序号搬到落地轮的键上', () => {
+      expect(carryLiveStepOpen({ 'live-s0': true, 'live-s2': false }, 'm9')).toEqual({
+        'm9-s0': true,
+        'm9-s2': false,
+      });
+    });
+
+    it('别轮的条目原样留着（只搬这一轮那一份）', () => {
+      expect(carryLiveStepOpen({ 'm3-s1': true, 'live-s0': true }, 'm9')).toEqual({
+        'm3-s1': true,
+        'm9-s0': true,
+      });
+    });
+
+    it('「过程」那一组的键（就是 `live`）不在这里搬——它走 carryLiveTurnOpen', () => {
+      expect(carryLiveStepOpen({ live: true }, 'm9')).toEqual({});
+      expect(carryLiveStepOpen({ live: true, 'live-s0': true }, 'm9')).toEqual({ 'm9-s0': true });
+    });
+
+    it('这一份里没有在飞键时**原样返回同一个对象**：不写一次同值的新对象去白触发效果', () => {
+      const map = { 'm3-s1': true };
+      expect(carryLiveStepOpen(map, 'm9')).toBe(map);
+    });
+  });
+
+  describe('carryLiveTurnOpen：「过程」那一组按整条轮键搬', () => {
+    it('`live` 那一份落到落地轮的键上，旧键随之消失', () => {
+      expect(carryLiveTurnOpen({ live: false, 'm1': true }, 'm9')).toEqual({
+        'm1': true,
+        'm9': false,
+      });
+    });
+
+    it('没有 `live` 条目时原样返回同一个对象', () => {
+      const map = { 'm1': true };
+      expect(carryLiveTurnOpen(map, 'm9')).toBe(map);
+    });
   });
 });

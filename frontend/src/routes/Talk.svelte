@@ -82,6 +82,11 @@
   } from '../lib/talkSessions';
   import {
     buildTurns,
+    carryLiveStepOpen,
+    carryLiveTurnOpen,
+    prettyArgs,
+    settlingTurn,
+    thinkTicker,
     turnName,
     watchDraftExcerpt,
     type TurnStep,
@@ -355,6 +360,26 @@
     thinkingOpen = { ...thinkingOpen, [key]: !thinkingIsOpen(key) };
   }
 
+  /**
+   * 工具那一步的展开态，按 `step.key` 记（决策 301）。
+   *
+   * **两档都默认收起**（ZCode 的口径）：收起行已经把「谁、查什么、成没成」说全了，完整参数
+   * 与结果是排查时才要的深度——默认摊开会让一次长查读把时间线撑成终端日志。受控的理由与
+   * `receiptOpen` / `thinkingOpen` 逐字相同：流式增量反复重渲染同一轮时，人手动展开的那一步
+   * 不该被打回收起。
+   *
+   * 展开体的正文只有**展开时**才进 DOM（模板里那道 `{#if}`）：收起行因此与从前逐字一致，
+   * 参数原串也不会在每一轮收起状态下白占 DOM。
+   */
+  let toolOpen = $state<Record<string, boolean>>({});
+  const toolIsOpen = (key: string) => toolOpen[key] ?? false;
+
+  function toggleTool(e: MouseEvent, key: string) {
+    // 与 `toggleThinking` / `toggleReceipt` 同一手法：默认的 `open` 翻转由状态接管。
+    e.preventDefault();
+    toolOpen = { ...toolOpen, [key]: !toolIsOpen(key) };
+  }
+
   /** 每个 pending 任务的详情（allowed_actions 只在详情里下发，决策 101）。 */
   let details = $state<Record<string, { actions: AllowedAction[]; cursors: BranchCursor[] }>>({});
 
@@ -386,6 +411,36 @@
   let zoneEl = $state<HTMLElement | undefined>();
   /** 输入坞的 textarea（折行档自长的接线点，见下面那个 `$effect`）。 */
   let typerField = $state<HTMLTextAreaElement | undefined>();
+
+  /**
+   * 贴底跟随（决策 301）：视口还在最新那一头吗。
+   *
+   * 三件事共用这一枚状态——流式增量要不要把视口带下去、悬浮的回底钮出不出现、
+   * 「新轮落地」那一拍滚不滚。初始为**真**：打开这一页当然是在看最新那一头；
+   * 人上滑超过容差即为假，滚回底部又为真（判据在下面挂着的那个 scroll 监听里）。
+   */
+  let following = $state(true);
+  /**
+   * 贴底容差（沿用 ZCode 那一档）：48px 之内视作「还在底上」——一两像素的抖动、
+   * 一轮落地时那点高度差都不该把跟随关掉，而真上滑一屏必然超过它。
+   */
+  const FOLLOW_BOTTOM_PX = 48;
+
+  /**
+   * 这一档的滚动容器（决策 301）：折行档**整页随手指滚**，故是 `document.scrollingElement`；
+   * 桌面款滚的是时间线自己（它是唯一会滚的区域）。
+   *
+   * `scrollToNewest` 与贴底判据共用这一处——档位判别只此一份，两处各写各的迟早分叉。
+   */
+  function scrollContainer(): HTMLElement | Element | null {
+    return folded ? document.scrollingElement : (timelineEl ?? null);
+  }
+
+  /** 视口在不在底（差 FOLLOW_BOTTOM_PX 以内算在）：没量到容器时按「在」——不误判成人在读历史。 */
+  function atBottom(): boolean {
+    const el = scrollContainer();
+    return el === null ? true : el.scrollHeight - el.scrollTop - el.clientHeight <= FOLLOW_BOTTOM_PX;
+  }
 
   const pending = $derived(board.pendingTasks);
 
@@ -987,19 +1042,159 @@
   }
 
   /**
-   * 只在**轮数**变化时滚：流式增量改的是某一轮的内容，不是轮数，故流式期间视口不乱动；
-   * 而发送（乐观轮 + 值班长那一轮进来）与回话落地（台账覆盖）都是轮数变化。
+   * 悬浮「滚动到底部」那颗钮的动作（决策 301）：回到底 + **恢复跟随**。
+   *
+   * 恢复跟随是它存在的理由：只滚不恢复的话，下一串流式增量又不会跟——人得反复按同一颗钮，
+   * 而那正是他按第一次时想结束的状态。
+   */
+  function jumpToBottom() {
+    following = true;
+    scrollToNewest();
+  }
+
+  /**
+   * 视口跟着最新那一头走（决策 301；决策 217 那一条「新轮落地滚过去」是它的前身）。
+   *
+   * 两件事一起管，判据都是「人还在底上吗」：
+   *   - **轮数变化**（发送、回话落地）——贴底才跟，人在读历史就交给回底钮；
+   *   - **在飞轮的内容在长**（逐字正文 + 步骤数）——这正是「流式跟随」，
+   *     此前视口在整个流式期间一动不动，人得自己往下拨。
+   *
+   * `following` 用 `untrack` 读：它只做**闸门**，不该成为这条效果的依赖——订阅它的话，
+   * 人按下回底钮（`following` 翻真）会让这条效果自己再跑一次，而那一刻滚不滚已经由
+   * `jumpToBottom` 决定了。
    *
    * **向上补历史那一拍不滚**（票 05）：`loadEarlier` 把更早的段接进头部，轮数同样变多，
    * 但那不是「新轮落地」——滚到底会把刚用 scrollTop 保住的阅读位置当场掀翻（e2e 那条
-   * 「不许挪窝」量的就是它）。用 `untrack` 读在途标记：订阅它的话，标记在收尾落回
+   * 「不许挪窝」量的就是它）。故读在途标记时同样 `untrack`：订阅它的话，标记在收尾落回
    * `false` 会让这条效果再跑一次，照样滚到底。
    */
   $effect(() => {
     const n = turns.length;
+    // 依赖：在飞轮的逐字正文长度 + 步数（内容每长一次就跟一次）
+    let grow = 0;
+    for (const t of turns) if (t.streaming) grow += t.content.length + t.steps.length;
+    void grow;
+    // 依赖：贴底容差用到的容器（换档时重判一次，免得旧容器的读数留着）
+    void folded;
     if (n === 0) return;
     if (untrack(() => loadingEarlier)) return;
-    void tick().then(scrollToNewest);
+    void tick().then(() => {
+      if (untrack(() => following)) scrollToNewest();
+    });
+  });
+
+  /**
+   * 谁在滚都逃不过这一关：容器每滚一次就重算「人还在底上吗」（决策 301）。
+   *
+   * **不区分「程序化滚动」与「人的滚动」**：我们自己写的滚动只有一种落点——底部，
+   * 而它代入判据本来就得出「在底上」。为它加一个标志位反而多一条会漂的状态。
+   *
+   * 容器随档位换（折行档整页、桌面时间线），故这条效果读 `folded` 与 `timelineEl`：
+   * 换档时重挂，旧容器上的监听一并撤掉。`passive` 是因为监听体里只读几何、不阻止默认行为。
+   */
+  $effect(() => {
+    const el = folded ? document.scrollingElement : timelineEl;
+    if (!el) return;
+    const onScroll = () => {
+      following = atBottom();
+    };
+    el.addEventListener('scroll', onScroll, { passive: true });
+    return () => el.removeEventListener('scroll', onScroll);
+  });
+
+  /* ───────────── 推理正文的贴底跟随（决策 301） ─────────────
+   *
+   * 展开着的推理正文在流式期间**自己往下滚**（ZCode 的口径）：不放的话，人看到的是这块
+   * 滚动区冻在最初那几行，而它每毫秒都在长——「正在想」的现场感全在末尾那几行上。
+   *
+   * 暂停只看这一块的**内滚位置**（人上滑读历史即暂停），与整页那一套彼此独立：
+   * 它们是两个滚动容器，混用一个「在底上吗」会在人读整页历史时把内滚也冻住。
+   */
+  /** 展开着的推理正文（按 `step.key`）。非响应式：它只被效果读，不驱动渲染。 */
+  const thinkBodies = new Map<string, HTMLPreElement>();
+  /** 人在某一块的内滚里上滑了——那一块暂停贴底，直到他自己滚回底部。 */
+  const thinkPeeked = new Set<string>();
+
+  function trackThinkBody(node: HTMLPreElement, key: string) {
+    thinkBodies.set(key, node);
+    return {
+      update(next: string) {
+        if (next !== key) {
+          thinkBodies.delete(key);
+          thinkBodies.set(next, node);
+        }
+      },
+      destroy() {
+        thinkBodies.delete(key);
+        thinkPeeked.delete(key);
+      },
+    };
+  }
+
+  function onThinkScroll(e: Event, key: string) {
+    const el = e.currentTarget as HTMLPreElement;
+    if (el.scrollHeight - el.scrollTop - el.clientHeight > FOLLOW_BOTTOM_PX) thinkPeeked.add(key);
+    else thinkPeeked.delete(key);
+  }
+
+  /**
+   * 流式期间把展开着的推理正文钉在底部（决策 301）。
+   *
+   * 只跟**在飞轮**那些块：落地轮的正文是死的（不再增长），人正在读的那一段不该被别处的
+   * 变化拽走。依赖取「在飞轮的字数总和 + 步数」——它每长一次这条效果就跑一次，
+   * 正是要跟随的那个时刻。
+   */
+  $effect(() => {
+    const live = new Set<string>();
+    let grow = 0;
+    for (const t of turns) {
+      if (!t.streaming) continue;
+      for (const s of t.steps) {
+        live.add(s.key);
+        grow += s.text.length;
+      }
+    }
+    void grow;
+    for (const [key, el] of thinkBodies) {
+      if (!live.has(key) || thinkPeeked.has(key)) continue;
+      el.scrollTop = el.scrollHeight;
+    }
+  });
+
+  /**
+   * 收口时把人碰过的折叠态交给落地那一轮（决策 301）——**这就是「什么时候自动折叠」
+   * 在这套受控折叠里的真身**。在飞轮的渲染键是常量 `'live'`，落地那一轮是 `m<id>`；
+   * 键一换，人在流式期间点开的推理 / 工具详情就会失联、在收口那一刻自己合上。
+   *
+   * 另一半是白拿的：**没碰过的块本来就默认收起**（map 里没有它们的条目），故「收口时把
+   * 没碰过的收起」不需要任何动作——要做的只有一件事，把人碰过的带过去。这与 ZCode 的
+   * `autoCollapseKey` + `userInteracted` 是同一件事的两面。判据全在 `lib/talkTurns.ts`。
+   */
+  let liveSeen = false;
+  let liveGen = -1;
+
+  $effect(() => {
+    const list = turns;
+    if (list.some((t) => t.key === 'live')) {
+      liveSeen = true;
+      liveGen = untrack(() => generation);
+      return;
+    }
+    if (!liveSeen) return;
+    // 换班了：这点折叠态属于已经不显示的那一班（与决策 204⑥ 同一条纪律），就地作废。
+    if (liveGen !== untrack(() => generation)) {
+      liveSeen = false;
+      return;
+    }
+    // **在飞轮先退场、台账那一行后到**那一拍（两条状态各写各的时刻）：留着等下一拍，
+    // 别把记下的态丢了——丢了就退回「人点开的块自己合上」那个现象。
+    const landed = settlingTurn(list);
+    if (!landed) return;
+    liveSeen = false;
+    thinkingOpen = carryLiveStepOpen(thinkingOpen, landed.key);
+    toolOpen = carryLiveStepOpen(toolOpen, landed.key);
+    receiptOpen = carryLiveTurnOpen(receiptOpen, landed.key);
   });
 
   /**
@@ -1128,6 +1323,10 @@
   async function send() {
     const text = input.trim();
     if (!text || sending) return;
+    // **发话就是一次回底**（决策 301）：人自己按下的那一句必须看得见——他可能正往上翻
+    // 历史，若把这一轮也交给「贴在底上才跟」那条判据，他发完话屏幕上什么都没动，
+    // 只会以为没发出去。故这一档与「回底钮」同级：无条件恢复跟随，再由下面那条效果滚过去。
+    following = true;
     talk.sending = true;
     talk.pendingText = text;
     talk.stream = beginForemanStream();
@@ -2089,13 +2288,22 @@
               {#each turn.steps as step (step.key)}
                 {#if step.kind === 'thinking'}
                   <!-- 推理（决策 244）：**默认收起**，两档都是——它常常比回话本身长一个量级，
-                       展开着摆在时间线上会把对话冲垮。摘要在流式期间就说「正在想…」，
-                       收口后带字数——人不用点开就知道里面有没有东西。 -->
+                       展开着摆在时间线上会把对话冲垮。摘要在流式期间就说「正在想…」并带出
+                       **最新一行原文**（ticker，决策 301：人不用点开就知道它想到哪了），
+                       收口后带字数。 -->
                   <details class="rcpts think" data-step="thinking" open={thinkingIsOpen(step.key)}>
                     <summary class="rcpts-sum" onclick={(e) => toggleThinking(e, step.key)}>
-                      {step.live ? '正在想…' : `思考过程 ${step.text.length} 字`} ▸
+                      {#if step.live}
+                        正在想… <span class="tick" data-think-tick>{thinkTicker(step.text)}</span>
+                      {:else}
+                        思考过程 {step.text.length} 字
+                      {/if}
+                      ▸
                     </summary>
-                    <pre class="think-body">{step.text}</pre>
+                    <pre
+                      class="think-body"
+                      use:trackThinkBody={step.key}
+                      onscroll={(e) => onThinkScroll(e, step.key)}>{step.text}</pre>
                   </details>
                 {:else if step.tool}
                   {@const r = receipt(step.tool.name, step.tool.argsSummary, turn.briefing)}
@@ -2103,16 +2311,28 @@
                        不是发言），只是这里它是**已经发生**的那一步——左缘跟它成没成走：
                        正在查是静的 --pane，查完点亮 --go，没读到（含被拒的越权工具）用 --stop。
                        三种状态的词只有一份：**正在查… / 已读 / 未读到**——落地前后是同一个形状、
-                       同一句话（此前实时那一栏说「没查到」、落地那一栏说「未读到」，同一件事两个词）。 -->
-                  <div
+                       同一句话（此前实时那一栏说「没查到」、落地那一栏说「未读到」，同一件事两个词）。
+
+                       **收起行就是上面那一行**（决策 301 加展开）：摘要把「谁、查什么、成没成」
+                       说全了，完整参数与结果是排查时才要的深度。默认收起（ZCode 的口径）——
+                       一次长查读摊开参数会直接盖住半屏对话。 -->
+                  <details
                     class="rcpt live"
                     data-step="tool"
                     data-tool={step.tool.name}
                     class:pending={step.tool.state === 'running'}
                     class:done={step.tool.state === 'ok'}
                     class:bad={step.tool.state === 'bad'}
+                    open={toolIsOpen(step.key)}
                   >
-                    <div class="rcpt-head">
+                    <!-- `title` 只说**动作**，不夹编号（文案纪律）；不给 `summary` 挂
+                         `aria-label` 是有意的——那会把「读到了什么、成没成」这句可读名整个换掉，
+                         而展开态 `details` 自己就报给辅助技术了。 -->
+                    <summary
+                      class="rcpt-head"
+                      onclick={(e) => toggleTool(e, step.key)}
+                      title={toolIsOpen(step.key) ? '收起工具详情' : '展开工具详情'}
+                    >
                       <Sprite name={r.sprite} size={10} />
                       <span class="nm">{r.workshop}</span>
                       <span class="dim">{r.label}</span>
@@ -2124,8 +2344,26 @@
                             ? '未读到'
                             : '已读'}
                       </span>
-                    </div>
-                  </div>
+                      <span class="chev" aria-hidden="true">▸</span>
+                    </summary>
+                    {#if toolIsOpen(step.key)}
+                      <!-- 展开体：参数与结果各一份，纯文本（决策 274：留痕不渲染 markdown——
+                           它是模型的排版输出之外的东西，符号拿去做标题/强调会把一句实话画歪）。
+                           正文只有展开时才进 DOM：收起行因此与从前逐字一致。 -->
+                      <div class="rcpt-more">
+                        <div class="rm-label dim">完整参数</div>
+                        <pre class="rm-body mono" data-tool-args>{prettyArgs(step.tool.args)}</pre>
+                        <div class="rm-label dim">结果</div>
+                        {#if step.tool.state === 'running'}
+                          <pre class="rm-body mono dim" data-tool-result>执行中…</pre>
+                        {:else}
+                          <pre class="rm-body mono" data-tool-result
+                            >{step.tool.result || '（没有输出）'}</pre
+                          >
+                        {/if}
+                      </div>
+                    {/if}
+                  </details>
                 {:else}
                   <!-- 中途说出口的话（决策 273）：它在段序里有自己的位置，故不并进收口那一句。
                        按 markdown 渲染，与回话同一套（它也是值班长的话，只是没在那句上收口）。 -->
@@ -2268,11 +2506,20 @@
           <button type="submit" class="btn solid" disabled={sending || !input.trim()}>发送</button>
         {/if}
       </div>
+      <!-- 回底钮**必须是坞的子元素**（决策 301）：它靠 `bottom: calc(100% + 8px)` 钉在坞的上沿，
+           而要这样定位就得有一个**定位祖先**——坞正是那一个（`position: relative`，折行档是
+           `sticky`，两者都为绝对定位子元素立定位盒）。放到坞外面写成它的兄弟节点，这个百分比
+           就改成按**视口**算，按钮会飞到屏幕上方之外（实测 `bottom: 728px`、`y = -37.6`）。 -->
+      {#if !following && turns.length > 0}{@render jumpToBottomButton(false)}{/if}
     </form>
   {:else if archivedOpen}
     <!-- 归档班次的坞位（票 06）：留一句实情，免得输入区的空白看起来像「坏了」——
          只读，且说清去处（对话一字不少，说话去活跃的班次）。 -->
     <div class="ro-note dim">已归档的班次只读——说的话都在上面；要接着聊，去没归档的班次。</div>
+  {:else if !following && turns.length > 0}
+    <!-- 只读账没有坞位，回底钮按**视口**固定（`floating`）：值守账照样在长，
+         钉在坞位上的那条路在这里没有东西可钉。 -->
+    {@render jumpToBottomButton(true)}
   {/if}
 
   <!-- ── 班次的重命名与归档（决策 204③：走 Modal，不另造第二套对话框） ── -->
@@ -2353,6 +2600,21 @@
   </aside>
   {/if}
 </main>
+
+<!-- 悬浮回底钮（决策 301）：人上滑之后还源源不断有新内容时，**回底这条路必须摆在眼前**
+     ——没有它，人只看得到「它不跟了」，看不到「怎么让它再跟」。两处引用同一份标记：
+     坞在时钉在坞的上沿（`floating` 为假），只读账没有坞位、按视口固定（`floating` 为真）。 -->
+{#snippet jumpToBottomButton(floating: boolean)}
+  <button
+    type="button"
+    class="btn quiet jump"
+    class:float={floating}
+    data-jump-bottom
+    onclick={jumpToBottom}
+  >
+    滚动到底部
+  </button>
+{/snippet}
 
 <!-- ⋯ 班次菜单的三条出口（票 04）：Escape 关得掉（焦点没进过面板时也算）、点面板外面关、
      上下方向键走项。与顶栏那个下拉同一姿态——键盘一律在 `window` 上收。 -->
@@ -2891,6 +3153,13 @@
     align-items: center;
     gap: 7px;
     color: var(--text-3);
+    cursor: pointer;
+    /* 收起行同时是那一段的 `summary`（决策 301）：默认那个三角标与列表符都撤掉，
+       chevron 由下面的 `.chev` 自己画（`▸` 是全站既有语汇，与 `.rcpts-sum` 一致）。 */
+    list-style: none;
+  }
+  .rcpt-head::-webkit-details-marker {
+    display: none;
   }
   .rcpt-head .nm {
     color: var(--text-2);
@@ -2902,6 +3171,38 @@
     overflow: hidden;
     text-overflow: ellipsis;
     white-space: nowrap;
+  }
+  /* 展开提示（决策 301）：常驻但走装饰档（--text-4）——触屏没有 hover，
+     藏到 hover 才出现等于这一档的人看不到它。旋转换向不用缓动（全站零缓动）。 */
+  .rcpt-head .chev {
+    flex: none;
+    color: var(--text-4);
+  }
+  .rcpt[open] > .rcpt-head .chev {
+    transform: rotate(90deg);
+  }
+  /* ── 工具展开详情（决策 301）：完整参数与结果各一份 ──
+     上限 320px 与 `.think-body` / `.diff-body` 同一个数：展开的是**深度**，不是版面。
+     纯文本、等宽、可选中（决策 274：留痕不渲染 markdown，也不做语法高亮）。 */
+  .rcpt-more {
+    margin-top: 4px;
+  }
+  .rm-label {
+    font-size: 12px;
+    color: var(--text-3);
+  }
+  .rm-body {
+    margin: 2px 0 4px;
+    padding: 6px 8px;
+    background: var(--pane);
+    color: var(--text-2);
+    font-size: 12px;
+    line-height: 1.5;
+    white-space: pre-wrap;
+    overflow-wrap: break-word;
+    max-height: 320px;
+    overflow-y: auto;
+    user-select: text;
   }
   .rcpt-head .rs {
     margin-left: auto;
@@ -2965,6 +3266,36 @@
     overflow-wrap: break-word;
     max-height: 320px;
     overflow-y: auto;
+  }
+
+  /* ── 流式期的推理 ticker（决策 301）：跟在「正在想…」后面的一行原文 ──
+     单行 + 溢出省略号，**不用左右渐隐遮罩**：全站禁平滑渐变（`theme/css-parity.test.ts`
+     钉着 `linear-gradient` 那一条），而省略号本来就是本页 `.args` 那一栏的既有手法。 */
+  .tick {
+    display: inline-block;
+    max-width: 46ch;
+    vertical-align: bottom;
+    color: var(--text-4);
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+  }
+
+  /* ── 悬浮回底钮（决策 301）──
+     坞在时钉在坞的上沿（`bottom: 100%`，绝对定位相对 `.typer` 那个定位盒），
+     只读账没有坞位时按视口固定（`.float`）。两处同款，只差锚点。 */
+  .jump {
+    position: absolute;
+    right: 0;
+    bottom: calc(100% + 8px);
+    z-index: 6;
+  }
+  .jump.float {
+    position: fixed;
+    right: 20px;
+    /* 桌面款：整页钉在视口里，坞位于底栏（46px 的 `body` 下边距）之上 */
+    bottom: 58px;
+    z-index: 26;
   }
 
   /* ── 输入坞：对话框形（双线框），描边 --pane、名牌收 --t3；主动作交给既有实心 ▶ 钮 ── */
@@ -3429,6 +3760,17 @@
       bottom: var(--sbar-h);
       z-index: 25;
       margin-top: 24px;
+    }
+    /* 悬浮回底钮这一档的锚点（决策 301）：底栏是页签栏（`--sbar-h`），
+       dock 在它上面——没坞位时按钮就贴在它上沿，与坞在时同一条视觉基线。 */
+    .jump.float {
+      right: 12px;
+      bottom: calc(var(--sbar-h) + 12px);
+    }
+    /* 这一档的摘要行比桌面窄得多，ticker 跟着收：它只是「它想到哪了」的一瞥，
+       不是给人读推理的地方（要读就点开）。 */
+    .tick {
+      max-width: 24ch;
     }
     .typer textarea {
       grid-area: field;

@@ -33,6 +33,7 @@ import {
   fullPassScript,
   readTask,
   text,
+  think,
   tool,
 } from './scripts';
 
@@ -2492,6 +2493,287 @@ test.describe('对讲台 · 归档班次翻得回（票 06）', () => {
     await settleBundle(page, bundle);
     await expect(page.locator('.runrow .runchip.arch-toggle')).toBeVisible();
     await expect(page.locator('.typer'), '值守账照旧不出输入坞').toHaveCount(0);
+
+    expectBundleHealthy(bundle);
+  });
+});
+
+/**
+ * 对讲台 · 工具详情、推理 ticker 与滚动跟随（决策 301）。
+ *
+ * 四条各钉一件用户看得见的事，且都要**有牙齿**（拆掉实现里的那一半即红）：
+ *   ① 工具那一步默认收起，展开才见完整参数与结果——`args` / `result` 是后端新带的两份原文，
+ *      只把 `args_summary` 拿来用的话这一条会红（摘要里没有结果）；
+ *   ② 推理收起行在流式期间跟着**最新一行**走（ticker，装置是新加的分截滴推理的 mock 步，
+ *      见 `scripts.ts` 的 `think`），且人点开过的那一块收口后**不被自动打回**；
+ *   ③ 滚动跟随：贴在底上时跟着长、**自己发话无条件回底**、人上滑即暂停、回底钮可回；
+ *   ④ 折行档：过程那一组在流式期间被点开后，收口时**不被自动收起**（同一件事的另一档）。
+ */
+test.describe('对讲台 · 工具详情可展开（决策 301）', () => {
+  let app: App;
+  const TASK_ID = '01K0000000000000000000000T';
+  const DETAIL_REPLY = '本轮态势：没有需要你处理的事。';
+
+  test.beforeAll(async () => {
+    // 三轮**同文**：CI 重试会接着消费脚本的下一轮（照本文件既有的那条口径），同文就不怕轮号错位。
+    app = await startApp({
+      script: foremanScript(
+        Array.from({ length: 3 }, () => [
+          tool('read_task', { task_id: TASK_ID }),
+          text(DETAIL_REPLY),
+        ]),
+      ),
+      providerOnly: true,
+    });
+  });
+
+  test.afterAll(async () => {
+    await app?.stop();
+  });
+
+  test('收起行只说「谁 / 查什么 / 成没成」，展开才见完整参数与结果', async ({ page }) => {
+    const bundle = watchBundle(page);
+    await sayDirect(app, '看一下台账');
+    await page.goto(`${app.webBase}/#/talk`);
+    await settleBundle(page, bundle);
+
+    const reply = page.locator('.timeline .turn.fm', { hasText: DETAIL_REPLY }).first();
+    await expect(reply).toBeVisible({ timeout: 30_000 });
+
+    // 桌面档过程那一组默认展开（决策 218 ②），故工具那一步就在眼前
+    const row = reply.locator('details.rcpt[data-step="tool"]').first();
+    await expect(row).toHaveCount(1);
+    await expect(row).toHaveAttribute('data-tool', 'read_task');
+    // 收起行的三样一个字不删（与决策 273 的形状一致）
+    await expect(row.locator('> summary')).toContainText('台账');
+    await expect(row.locator('> summary')).toContainText('已读');
+    // 收起态：详情正文**根本不在 DOM 里**（不是藏起来）——收起行因此与从前逐字一致
+    await expect(row.locator('[data-tool-args]')).toHaveCount(0);
+    await expect(row.locator('[data-tool-result]')).toHaveCount(0);
+
+    // 点开：完整参数（JSON 美化）与结果各一份
+    await row.locator('> summary').click();
+    await expect(row.locator('[data-tool-args]')).toContainText(TASK_ID);
+    await expect(row.locator('[data-tool-result]')).not.toBeEmpty();
+    // 纯文本：结果里**没有**渲染出来的 markdown 结构（决策 274 的口径；与下面那条回话轮里
+    // 的 `strong` / `li` 正好相反——留痕不渲染 md）
+    await expect(row.locator('[data-tool-result] strong, [data-tool-result] li')).toHaveCount(0);
+
+    // 再点一下收回：受控折叠（不是浏览器自己管 `open`），正文随之离场
+    await row.locator('> summary').click();
+    await expect(row.locator('[data-tool-args]')).toHaveCount(0);
+
+    expectBundleHealthy(bundle);
+  });
+});
+
+test.describe('对讲台 · 推理 ticker 与收口接力（决策 301）', () => {
+  let app: App;
+  const TICK_1 = '先看一遍台账。';
+  const TICK_2 = '再核对第 3 条。';
+  const TICK_3 = '可以收口了。';
+  const REPLY = '**没有**需要你处理的事。';
+
+  test.beforeAll(async () => {
+    app = await startApp({
+      script: foremanScript(
+        Array.from({ length: 3 }, () => [
+          // 推理分三截滴出来（各 2.5s），末了收一句正文：中间那两段空档里「推理正在攒」
+          // 是真的——ticker 只在这个状态里画得出来（见 `scripts.ts` 的 `think`）
+          think([`${TICK_1}\n`, `${TICK_2}\n`, TICK_3], REPLY, 2_500),
+        ]),
+      ),
+      providerOnly: true,
+    });
+  });
+
+  test.afterAll(async () => {
+    await app?.stop();
+  });
+
+  test('收起行跟着最新一行走；点开过的那一块收口后不被自动打回', async ({ page }) => {
+    const bundle = watchBundle(page);
+    await page.goto(`${app.webBase}/#/talk`);
+    await settleBundle(page, bundle);
+
+    // 必须用**界面真的发一句话**（与折行档那条回执用例同一个理由）：收口接力要的是
+    // 「这一轮由本页收发」，直连发出的轮不会把落地那一刻带回这一屏。
+    await page.locator('.typer textarea').fill('说说你在想什么');
+    await page.locator('.typer button[type=submit]').click();
+
+    const tick = page.locator('.timeline [data-think-tick]');
+    await expect(tick).toHaveText(TICK_1, { timeout: 30_000 });
+
+    // 趁它还在想，把这一步点开（收起行的摘要就是那颗开关）
+    const thinkRow = page.locator('.timeline details.rcpts.think').last();
+    await thinkRow.locator('> summary').click();
+    await expect(thinkRow.locator('.think-body')).toBeVisible();
+
+    // ticker 跟着最新一行走（第二截到了）
+    await expect(tick).toHaveText(TICK_2, { timeout: 30_000 });
+
+    // 收口：落在台账那一轮上，ticker 随之退场（它只在「正在攒」时说话）
+    const landed = page.locator('.timeline .turn.fm').last();
+    await expect(landed).toContainText('需要你处理的事', { timeout: 30_000 });
+    await expect(page.locator('.timeline [data-think-tick]')).toHaveCount(0);
+
+    // **接力**：在飞轮的键是 `live`、落地那一轮的键是 `m<id>`——键一换而折叠态没跟过去的话，
+    // 人刚点开的这一块会在收口那一刻自己合上（用户报的正是这个现象）
+    await expect(
+      page.locator('.timeline details.rcpts.think').last().locator('.think-body'),
+    ).toBeVisible();
+    await expect(landed.locator('details.rcpts.think > summary')).toContainText('思考过程');
+
+    expectBundleHealthy(bundle);
+  });
+});
+
+test.describe('对讲台 · 滚动跟随（决策 301）', () => {
+  let app: App;
+  const TALL_REPLY = [
+    '铺垫回话标记',
+    ...Array.from({ length: 10 }, (_, i) => `- 工位读数 ${i + 1}：安静。`),
+  ].join('\n');
+  const HEAD_MARK = '第一截先到';
+  const TAIL_MARK = '第二截后到';
+  const LAST_MARK = '末了一截';
+  const TAIL = [
+    TAIL_MARK,
+    ...Array.from({ length: 12 }, (_, i) => `- 后来的读数 ${i + 1}：安静。`),
+  ].join('\n');
+
+  test.beforeAll(async () => {
+    // 六轮同文给铺垫用（`setForemanRounds` 会把指针归零再装那一轮滴出来的回话，见下）
+    app = await startApp({
+      script: foremanScript(Array.from({ length: 6 }, () => [text(TALL_REPLY)])),
+      providerOnly: true,
+    });
+  });
+
+  test.afterAll(async () => {
+    await app?.stop();
+  });
+
+  test('贴底就跟着长、上滑即暂停、自己发话必回底、回底钮可回', async ({ page }) => {
+    const bundle = watchBundle(page);
+    // 铺长：时间线要真的溢出，才谈得上「人在哪」
+    for (let i = 1; i <= 3; i += 1) await sayDirect(app, `铺垫-${i}`);
+    await page.goto(`${app.webBase}/#/talk`);
+    await settleBundle(page, bundle);
+    await expect
+      .poll(() => page.locator('.timeline .turn.fm').count(), { timeout: 30_000 })
+      .toBeGreaterThanOrEqual(3);
+
+    const timeline = page.locator('.timeline');
+    /** 距底还有多少像素（负值当 0 计）。 */
+    const gap = () =>
+      timeline.evaluate((el) => Math.max(0, el.scrollHeight - el.scrollTop - el.clientHeight));
+    const top = () => timeline.evaluate((el) => el.scrollTop);
+    const jump = page.locator('[data-jump-bottom]');
+
+    // 时间线真的溢出（不溢出就谈不上「滚到哪」）
+    expect(await timeline.evaluate((el) => el.scrollHeight - el.clientHeight)).toBeGreaterThan(
+      200,
+    );
+
+    // ① 初始贴底：打开这一页当然在看最新那一头
+    await expect.poll(gap, { timeout: 10_000 }).toBeLessThanOrEqual(48);
+    await expect(jump).toHaveCount(0);
+
+    // ② 人上滑 → 暂停跟随，回底钮出现（没有它，人只看得到「它不跟了」）
+    await timeline.evaluate((el) => {
+      el.scrollTop = 0;
+    });
+    await expect.poll(top).toBeLessThanOrEqual(1);
+    await expect(jump).toBeVisible();
+
+    // ③ **自己发话无条件回底**：他可能正往上翻历史，发出去的那一句必须看得见。
+    //    这一档若跟着「贴在底上才跟」那条判据走，下面两条都会红（视口留在顶上 + 钮还在）。
+    //    这一轮的回话**分三截滴**出来（各隔 4s）：中间那两段空档就是可观测的窗口。
+    app.setForemanRounds([[drip([HEAD_MARK, TAIL, LAST_MARK], 4_000)]]);
+    await page.locator('.typer textarea').fill('接着说');
+    await page.locator('.typer button[type=submit]').click();
+    await expect(page.locator('.timeline p.streaming')).toContainText(HEAD_MARK, {
+      timeout: 30_000,
+    });
+    await expect.poll(gap, { timeout: 10_000 }).toBeLessThanOrEqual(48);
+    await expect(jump).toHaveCount(0);
+
+    // ④ 贴底时**跟着长**：第二截（十来行）到齐之后仍在底上——不跟的话它早把视口甩开了
+    await expect(page.locator('.timeline p.streaming')).toContainText(TAIL_MARK, {
+      timeout: 30_000,
+    });
+    await expect.poll(gap).toBeLessThanOrEqual(48);
+
+    // ⑤ 人上滑即暂停：第三截还没到，此刻上滑——此后视口不许再被拽回底。
+    //    ③④ 那条写成了「贴底才跟」才算数：不看人在哪的话，第三截一到就把人拽走了。
+    await timeline.evaluate((el) => {
+      el.scrollTop = 0;
+    });
+    await expect.poll(top).toBeLessThanOrEqual(1);
+    await expect(jump).toBeVisible();
+    // 落地：在飞那一轮退场（流式那段正文随之消失），回话进了台账那一轮
+    await expect(page.locator('.timeline p.streaming')).toHaveCount(0, { timeout: 30_000 });
+    await expect(page.locator('.timeline .turn.fm')).toHaveCount(4);
+    await expect
+      .poll(() => page.locator('.timeline .turn.fm').last().innerText())
+      .toContain(LAST_MARK);
+    await expect.poll(top).toBeLessThanOrEqual(1);
+    await expect(jump).toBeVisible();
+
+    // ⑥ 按回底钮：回到底 + **恢复跟随**（钮随之消失）
+    await jump.click();
+    await expect.poll(gap).toBeLessThanOrEqual(48);
+    await expect(jump).toHaveCount(0);
+
+    expectBundleHealthy(bundle);
+  });
+});
+
+test.describe('对讲台 · 折行档的收口接力（决策 301）', () => {
+  let app: App;
+  const TICK = '先想一句。';
+  const REPLY = '折行档的收口句。';
+
+  test.beforeAll(async () => {
+    app = await startApp({
+      script: foremanScript(
+        Array.from({ length: 3 }, () => [think([`${TICK}\n`, '想完了。'], REPLY, 2_500)]),
+      ),
+      providerOnly: true,
+    });
+  });
+
+  test.afterAll(async () => {
+    await app?.stop();
+  });
+
+  test('流式期间点开的过程那一组，收口时不被自动收起', async ({ page }) => {
+    const bundle = watchBundle(page);
+    // 折行档：过程那一组**默认收起**（决策 218 ②），故「点开 → 收口后仍开着」是一件
+    // 用户一眼看得见的事——而它此前会因为渲染键从 `live` 换成 `m<id>` 而自己合上。
+    await page.setViewportSize({ width: 430, height: 900 });
+    await page.goto(`${app.webBase}/#/talk`);
+    await settleBundle(page, bundle);
+
+    await page.locator('.typer textarea').fill('折行档看一眼');
+    await page.locator('.typer button[type=submit]').click();
+
+    const process = page.locator('.timeline details.rcpts.process').last();
+    await expect(process).toHaveCount(1, { timeout: 30_000 });
+    // 默认收起：里面的步骤不可见
+    await expect(process.locator('details.rcpts.think > summary')).toBeHidden();
+
+    // 人点一下 → 展开（收起行就是那颗开关）
+    await process.locator('> summary').click();
+    await expect(process.locator('details.rcpts.think > summary')).toBeVisible();
+
+    // 等这一轮收口落地，过程那一组**仍在展开态**
+    const landed = page.locator('.timeline .turn.fm').last();
+    await expect(landed).toContainText(REPLY, { timeout: 30_000 });
+    await expect(
+      page.locator('.timeline details.rcpts.process').last().locator('details.rcpts.think > summary'),
+    ).toBeVisible();
 
     expectBundleHealthy(bundle);
   });

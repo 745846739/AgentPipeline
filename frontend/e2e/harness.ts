@@ -364,6 +364,9 @@ async function startMockLlm(
       } else if (step.kind === 'drip') {
         // 分两截滴：走下面的 `drip` 那一支（`out` 用不到，给个空串让类型收敛）
         out = '';
+      } else if (step.kind === 'think') {
+        // 分几截滴推理：同上（走下面的 `think` 那一支）
+        out = '';
       } else {
         out = sseText(step.text, step.reasoning);
       }
@@ -414,6 +417,32 @@ async function startMockLlm(
                 } else {
                   res.write(sseDelta(part));
                 }
+              }),
+            step.gapMs * (i + 1),
+          );
+        });
+        return;
+      }
+      // **分几截滴推理**（`think` 步，决策 301 的 ticker 装置）：与上面那一支同一个形状，
+      // 只把每截的内容换成**推理声道**；最后一截与收口正文一起收线——收线之前那一段里
+      // 「推理正在攒」这个状态是真的，ticker 因此可观测。
+      if (step && step.kind === 'think') {
+        const parts = step.parts.length > 0 ? step.parts : [''];
+        write(() => {
+          res.writeHead(200, {
+            'content-type': 'text/event-stream',
+            'cache-control': 'no-cache',
+            connection: 'close',
+          });
+          res.write(sseReasoning(parts[0]));
+        });
+        parts.slice(1).forEach((part, i) => {
+          const last = i === parts.length - 2;
+          setTimeout(
+            () =>
+              write(() => {
+                if (last) res.end(sseReasoning(part) + sseText(step.text));
+                else res.write(sseReasoning(part));
               }),
             step.gapMs * (i + 1),
           );
