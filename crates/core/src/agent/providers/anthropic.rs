@@ -42,20 +42,37 @@ impl Adapter for Anthropic {
                 }
             }
         }
-        let system = if system_parts.len() == 1 {
-            serde_json::json!(system_parts[0])
-        } else {
-            serde_json::json!(system_parts)
-        };
+        // system 恒为 content block 形式：最后一块打 prompt-cache 断点（ephemeral），
+        // 断点之前的 system 前缀可增量命中（spec `.scratch/prompt-cache`——
+        // docs/agents.md 的「LLM Cache 策略」至此与实现对上）。
+        let mut system: Vec<serde_json::Value> = system_parts
+            .iter()
+            .map(|p| serde_json::json!({"type": "text", "text": p}))
+            .collect();
+        if let Some(last) = system.last_mut() {
+            last["cache_control"] = serde_json::json!({"type": "ephemeral"});
+        }
+        let system = serde_json::Value::Array(system);
 
         let mut wire = wire_messages(&request.messages)?;
-        wire.insert(
-            0,
-            serde_json::json!({
-                "role": "user",
-                "content": [{"type": "text", "text": request.user_prompt}],
-            }),
-        );
+        // 空 user_prompt 不占 wire 头（值班长主轮的快照并进末尾轮之后就是这个形状）：
+        // 空 user 消息是无效报文（Anthropic 拒收空文本块），也白吃一段前缀。
+        if !request.user_prompt.is_empty() {
+            wire.insert(
+                0,
+                serde_json::json!({
+                    "role": "user",
+                    "content": [{"type": "text", "text": request.user_prompt}],
+                }),
+            );
+        }
+        // 第二个断点打在最后一条消息的最后一个内容块上：断点之前的全部消息前缀可命中，
+        // 下一轮在其后追加即可续用（增量缓存）。全请求恰 2 个断点（provider 上限 4，留余量）。
+        if let Some(blocks) = wire.last_mut().and_then(|m| m["content"].as_array_mut()) {
+            if let Some(last) = blocks.last_mut() {
+                last["cache_control"] = serde_json::json!({"type": "ephemeral"});
+            }
+        }
 
         let mut body = serde_json::json!({
             "model": provider.model,
@@ -308,7 +325,7 @@ mod tests {
         assert_eq!(body["model"], "claude-test");
         assert_eq!(body["stream"], true);
         assert_eq!(body["max_tokens"], super::super::DEFAULT_MAX_TOKENS);
-        assert_eq!(body["system"], "系统提示");
+        assert_eq!(body["system"][0]["text"], "系统提示");
 
         let msgs = body["messages"].as_array().unwrap();
         // [user_prompt, assistant(tool_use), user(两个 tool_result 合并)]
@@ -338,6 +355,68 @@ mod tests {
         assert_eq!(body["system"].as_array().unwrap().len(), 2);
         let msgs = body["messages"].as_array().unwrap();
         assert_eq!(msgs.len(), 1, "system 消息不得进入 messages");
+    }
+
+    #[test]
+    fn cache_breakpoints_mark_the_system_tail_and_the_last_message() {
+        // prompt-cache spec（.scratch/prompt-cache）：断点打在 system 尾与最后一条消息尾，
+        // 断点之前的全部前缀（system + 历史）可增量命中；数量恰为 2（上限度 4 留余量）。
+        let messages = vec![
+            Message::user("第一句"),
+            Message::assistant(Some("答了".into()), Vec::new()),
+            Message::user("第二句"),
+        ];
+        let body = Anthropic
+            .build_body(
+                &fixture_provider("anthropic", "claude-test", Some("http://127.0.0.1:1")),
+                &request(messages),
+            )
+            .unwrap();
+
+        // system 恒为 content block 形式，最后一块带 ephemeral 断点
+        let sys = body["system"].as_array().expect("system 恒为 block 数组");
+        assert_eq!(sys[0]["type"], "text");
+        assert_eq!(sys[0]["text"], "系统提示");
+        assert_eq!(
+            sys.last().unwrap()["cache_control"]["type"],
+            "ephemeral",
+            "system 尾要打缓存断点：{sys:?}"
+        );
+
+        // 最后一条消息的最后一个内容块带断点
+        let msgs = body["messages"].as_array().unwrap();
+        let blocks = msgs.last().unwrap()["content"]
+            .as_array()
+            .expect("消息内容恒为 block 数组");
+        assert_eq!(
+            blocks.last().unwrap()["cache_control"]["type"],
+            "ephemeral",
+            "消息尾要打缓存断点：{blocks:?}"
+        );
+
+        let raw = serde_json::to_string(&body).unwrap();
+        assert_eq!(
+            raw.matches("\"cache_control\"").count(),
+            2,
+            "全请求断点数恰为 2（system 尾 + 消息尾）：{raw}"
+        );
+    }
+
+    #[test]
+    fn an_empty_user_prompt_leaves_no_empty_wire_head_message() {
+        // 值班长主轮的 user_prompt 是空的（快照并进末尾轮之后）——
+        // 空槽不得变成一条空 user 消息占住 wire 头（Anthropic 拒收空文本块）。
+        let mut req = request(vec![Message::user("第一句")]);
+        req.user_prompt = String::new();
+        let body = Anthropic
+            .build_body(
+                &fixture_provider("anthropic", "claude-test", Some("http://127.0.0.1:1")),
+                &req,
+            )
+            .unwrap();
+        let msgs = body["messages"].as_array().unwrap();
+        assert_eq!(msgs.len(), 1, "空 user_prompt 不占 wire 头：{msgs:?}");
+        assert_eq!(msgs[0]["content"][0]["text"], "第一句");
     }
 
     #[test]

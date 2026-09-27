@@ -414,7 +414,7 @@ export function parallelBlockerRounds(): NodeScript {
  * 一轮 = 一次回话。
  *
  * 与节点脚本的区别在 mock 的轮判定上：节点用 `messages.length <= 2`（system + user）
- * 认「新一轮节点运行」，而值班长的每轮请求都带同一段态势快照前言 + 历史对话，
+ * 认「新一轮节点运行」，而值班长的每轮请求 = 历史对话 + 末尾一轮快照合并的 user 轮，
  * 数量不固定，故 mock 改按「最后一条消息是 user」认新轮——同一次回话里的工具往返
  * 以 tool 结尾，不会被误判成新轮（否则一次查台账就吃掉下一轮的步骤）。
  */

@@ -2071,14 +2071,14 @@ impl ForemanRunner {
                 provider_id.clone(),
             )
             .await;
-        // `user_prompt` **只放快照**，问题由 transcript 的最后一条承担。
-        //
-        // 适配器组装的 body 是 `[system][user(user_prompt)] + messages`（见
-        // `openai.rs::build_body`），所以把问题同时写进 user_prompt 和在 transcript 里
-        // 再带一遍，模型会连着看到同一个问题两三次——白烧 token，还会让它以为是不同的话。
-        // 快照放 user_prompt 而不是塞进 system：它每轮都变，进系统段会让 prompt cache
-        // 每轮全失效（§12.13.5）。
-        let user_prompt = briefing.render();
+        // `user_prompt` 槽位**留空**（spec .scratch/prompt-cache）。适配器组装的 body 是
+        // `[system][user(user_prompt)] + messages`——user_prompt 占的是**全部历史之前**的
+        // 位置，而快照每轮必变，放这儿等于每轮把整段历史的前缀缓存打穿（决策 182⑤
+        // 「快照夹在历史之后」要防的正是这件事；原文的「之后」指稳定前缀之后）。
+        // 快照改并进本轮最后一条 user 轮（见下），历史窗口从此逐轮稳定；
+        // 空槽由两个适配器跳过——wire 头不塞空 user 消息。
+        let user_prompt = String::new();
+        let briefing_text = briefing.render();
 
         // 分级诊断摘在**源头上**（决策 247）：`deny` 早于三处消费者算好，广告集、
         // 执行点白名单与纪律段都吃 `available`，故「模型看得见一个调用就被拒的工具」
@@ -2123,35 +2123,45 @@ impl ForemanRunner {
                 }
             })
             .collect();
-        let mut head_inserts: Vec<Message> = Vec::new();
+        // ── 尾部注入（spec .scratch/prompt-cache）：锚点与互喂摘要**追加在历史之后、
+        // 本轮问题之前**，不再 splice 在转录头部。头部注入每变一次，其后全部历史的前缀
+        // 缓存就整体打穿；尾部注入让稳定前缀 = system + 历史窗口，逐轮命中。这是对决策
+        // 269 / 289 注入位置的显式修订——标记、不落库、失败不注入不报错（269④）一概不变。
+        let mut tail_inserts: Vec<Message> = Vec::new();
         if let Some(anchor) = anchor {
-            // 锚点以**标记 user 轮**带头插在历史头部（system 行重注入走 user 的先例）。
-            // 两种适配器都不会把它错位：OpenAI 把 `[system, user_prompt]` 拼在 messages
-            // 之前、Anthropic 抽走 system 段后 user_prompt 仍占 wire 头——锚点只是 messages
-            // 的第一条普通 user 轮（providers 的 `messages[0]` 只有 mock 在读，且读的是
-            // 组装后的 wire 头，不受影响）。
-            head_inserts.push(Message::user(format!("{COMPACTION_MARK}\n{anchor}")));
+            // 锚点以**标记 user 轮**注入（system 行重注入走 user 的先例）。
+            tail_inserts.push(Message::user(format!("{COMPACTION_MARK}\n{anchor}")));
         }
         // 跨时间线互喂（决策 289 / 票 03）：两条时间线各喂对方一份**摘要**，都以
-        // 带标记的 user 轮注入（与锚点、操作台记账轮同一先例）——进上下文才拦得住，
-        // 且两边都不是整本原文（预算不吃第二份）。锚点之后、正文之前。
-        self.inject_cross_digest(&mut head_inserts, &input, provider_id.clone())
+        // 带标记的 user 轮注入——进上下文才拦得住，且两边都不是整本原文（预算不吃
+        // 第二份）。位置随之从「锚点之后、正文之前」改为「正文之后、本轮问题之前」。
+        self.inject_cross_digest(&mut tail_inserts, &input, provider_id.clone())
             .await;
-        transcript.splice(0..0, head_inserts);
+        // ── 本轮的末尾合并轮：快照并进最后一条 user 轮，问题仍是这一轮的最后一句。
+        // 人格那句「问题由 transcript 的最后一条承担」由它兑现；快照每轮必变，放末尾
+        // 只重算这一条，历史前缀不受伤（落实决策 182⑤「快照夹在历史之后」）。
+        //
         // 历史最后一条就是刚落库的这句 user 消息；但若它被 `trim_history` 之外的原因
         // 漏掉（例如库被外部清空），仍要保证本轮的问题在场。
         // 值守简报**总是**追加成最后一条：它带署名（`TurnInput::transcript_text`），
         // 而历史里最后一条也是 user（刚落的用户行）时不能靠「已经有了」跳过它——
         // 那会让这一轮真正要处理的东西消失。人的话反过来：历史里最后一条就是它。
-        // 这一轮要处理的那句话（本轮起点）：人格里那句「问题由 transcript 的最后一条承担」
-        // 说的就是它。两处用它——末尾那条消息由它兜底（见上），轮内压缩拿它当锚点（票 06(b)）。
-        let question = input.transcript_text();
-        match (&input, transcript.last()) {
-            (TurnInput::Human(text), Some(m)) if m.role == crate::agent::client::Role::User => {
-                let _ = text;
+        let base_question = input.transcript_text();
+        let final_text = match (&input, transcript.last()) {
+            (TurnInput::Human(_), Some(m)) if m.role == crate::agent::client::Role::User => {
+                // 人的轮：问题已在历史里（刚落库的那条 user 行）。取出来与快照合并，
+                // 锚点 / 摘要隔着正文插进它之前——「正文之后、本轮问题之前」对它同样成立。
+                let last = transcript.pop().expect("上一行刚判过 Some");
+                let base = last.content.unwrap_or_else(|| base_question.clone());
+                format!("{briefing_text}\n{base}")
             }
-            _ => transcript.push(Message::user(question.clone())),
-        }
+            _ => format!("{briefing_text}\n{base_question}"),
+        };
+        transcript.extend(tail_inserts);
+        transcript.push(Message::user(final_text.clone()));
+        // 轮内压缩的锚点（本轮起点，票 06(b)）就是末尾合并轮的**全文**——按内容倒着找
+        // 必须逐字命中，下面两处调用直接吃 `final_text`（别名成「question」会名不副实：
+        // 它带的是快照 + 问题，不是裸问题）。
 
         let tool_defs = Self::tool_defs(&available);
         let mut tokens = (0u32, 0u32);
@@ -2217,7 +2227,7 @@ impl ForemanRunner {
             // **查在组装请求之前**，故这一轮发出去的已经是压过的那一份。
             self.compact_inline_if_over_budget(
                 &mut transcript,
-                &question,
+                &final_text,
                 &system_prompt,
                 &user_prompt,
                 capacity,
@@ -2272,7 +2282,7 @@ impl ForemanRunner {
                 // 那时报错才是诚实的）。压缩是**无条件**的：这个错误说明算术低估了
                 // （真 tokenizer 与 4 字符≈1 的估算、工具定义都占窗口），不按触发线走。
                 CallOutcome::Done(Err(e)) if is_context_window(&e) => {
-                    let compacted = self.compact_inline_forced(&mut transcript, &question);
+                    let compacted = self.compact_inline_forced(&mut transcript, &final_text);
                     if compacted == 0 {
                         stop = Some(StopReason::Failed(e));
                         break;

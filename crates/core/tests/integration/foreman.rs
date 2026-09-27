@@ -395,6 +395,18 @@ async fn history_trimming_always_keeps_the_newest_message_even_over_budget() {
 
 // ─────────────── 上下文压缩（决策 269 / 票 foreman-within-boundary 03）───────────────
 
+/// 按标记找注入的那条 user 轮（锚点 / 互喂摘要）——决策 299 后它们尾部注入，
+/// 下标会随历史长度漂，标记才是它们的身份。
+fn find_marked(
+    msgs: &[agentpipeline_core::agent::client::Message],
+    mark: &str,
+) -> Option<(usize, String)> {
+    msgs.iter().enumerate().find_map(|(i, m)| {
+        let text = m.content.clone().unwrap_or_default();
+        text.contains(mark).then_some((i, text))
+    })
+}
+
 /// 把会话塞到**超预算**（24k）：首条带「最早标记」，其后 30 条各约千字。
 /// 掉出预算的必然包含首条——摘要器的输入里要看得见它。
 async fn seed_over_budget(h: &Harness, sid: &str) {
@@ -420,7 +432,7 @@ async fn seed_over_budget(h: &Harness, sid: &str) {
 }
 
 #[tokio::test]
-async fn over_budget_history_is_summarized_into_a_head_anchor_within_budget() {
+async fn over_budget_history_is_summarized_into_a_tail_anchor_within_budget() {
     let h = Harness::empty().await;
     let sid = h.session().await;
     seed_over_budget(&h, &sid).await;
@@ -448,17 +460,21 @@ async fn over_budget_history_is_summarized_into_a_head_anchor_within_budget() {
         "掉出预算的最老轮次是摘要输入：{}",
         reqs[0].user_prompt
     );
-    // 主轮：头部一条锚点 user 轮 = 标记 + 摘要正文；且锚点与窗口**同一本预算**
-    let m0 = &reqs[1].messages[0];
+    // 主轮：锚点 user 轮 = 标记 + 摘要正文；落在**历史之后、本轮问题之前**
+    // （spec .scratch/prompt-cache：每轮会变的内容在稳定前缀之后，决策 269 的注入位置随之修订）。
+    let (pos, head) = find_marked(&reqs[1].messages, COMPACTION_MARK).expect("锚点要在场");
     assert_eq!(
-        m0.role,
+        reqs[1].messages[pos].role,
         agentpipeline_core::agent::client::Role::User,
         "锚点按 system 行重注入的先例走 user 角色"
     );
-    let head = m0.content.as_deref().unwrap_or_default();
     assert!(
         head.contains(COMPACTION_MARK) && head.contains("压缩后的摘要"),
-        "头部要同时有标记与摘要正文：{head}"
+        "锚点要同时有标记与摘要正文：{head}"
+    );
+    assert!(
+        pos > 0 && pos < reqs[1].messages.len() - 1,
+        "锚点在历史窗口之后、本轮问题之前——不再占 wire 头：{pos}"
     );
     let total: usize = reqs[1]
         .messages
@@ -546,8 +562,8 @@ async fn successive_over_budget_rounds_incrementally_recompress_only_new_drops()
         "最老原文已经压进旧摘要，不整段重发（每条轮次一生只被压一次）：{}",
         reqs[2].user_prompt
     );
-    // 第二轮主轮的锚点换成了新摘要
-    let head2 = reqs[3].messages[0].content.as_deref().unwrap_or_default();
+    // 第二轮主轮的锚点换成了新摘要（尾部注入：按标记找，不按下标）
+    let (_, head2) = find_marked(&reqs[3].messages, COMPACTION_MARK).expect("第二轮锚点要在场");
     assert!(head2.contains("摘要二"), "锚点要跟上最新摘要：{head2}");
 }
 
@@ -583,6 +599,102 @@ async fn a_failed_summarizer_falls_back_to_plain_dropping() {
             .unwrap_or_default()
             .contains(COMPACTION_MARK)),
         "回退路径不许有锚点——与现状（从头丢）逐字相同"
+    );
+}
+
+// ─────────── 注入位置（spec .scratch/prompt-cache：每轮会变的内容在稳定前缀之后）───────────
+
+/// 快照不再占 `user_prompt` 槽（wire 第 2 条、全部历史之前）——它并进本轮最后一条
+/// user 轮，历史窗口逐字在前。落实决策 182⑤ 的字面承诺（「快照夹在历史之后」）。
+#[tokio::test]
+async fn the_briefing_lands_in_the_final_turn_not_before_the_history() {
+    let h = Harness::empty().await;
+    let sid = h.session().await;
+    h.store
+        .append_foreman_user_message(&sid, "第一句")
+        .await
+        .unwrap();
+    h.store
+        .append_foreman_message(NewForemanMessage::assistant(&sid, "答了"))
+        .await
+        .unwrap();
+
+    let mut script = Script::new();
+    script.for_foreman().text("收口。");
+    let agent = FakeAgent::new(script);
+    let runner = h.runner(agent.clone());
+    runner.say(Some(&sid), "第二句").await.unwrap();
+
+    let reqs = agent.request_log();
+    assert_eq!(reqs.len(), 1, "{}", reqs.len());
+    let req = &reqs[0];
+    assert!(
+        req.user_prompt.is_empty(),
+        "user_prompt 槽退化为空（每轮变化的内容不在历史之前）：{}",
+        req.user_prompt
+    );
+    assert_eq!(req.messages[0].content.as_deref(), Some("第一句"));
+    assert_eq!(req.messages[1].content.as_deref(), Some("答了"));
+    let last = req.messages.last().expect("末尾轮在场");
+    let text = last.content.as_deref().unwrap_or_default();
+    assert!(text.contains("夜班态势快照"), "快照并进末尾轮：{text}");
+    assert!(
+        text.ends_with("第二句"),
+        "问题仍是末尾轮的最后一句（人格「问题由最后一条承担」）：{text}"
+    );
+    assert!(
+        req.messages[..2].iter().all(|m| !m
+            .content
+            .as_deref()
+            .unwrap_or_default()
+            .contains("夜班态势快照")),
+        "历史前半一处快照都不许有"
+    );
+}
+
+/// 前缀稳定：上一轮除末尾合并轮之外的全部消息是下一轮的**逐字前缀**——
+/// 无压缩、无互喂的相邻两轮之间，历史窗口逐轮命中（本 spec 的核心判据）。
+#[tokio::test]
+async fn the_history_prefix_is_byte_stable_across_rounds() {
+    let h = Harness::empty().await;
+    let sid = h.session().await;
+    h.store
+        .append_foreman_user_message(&sid, "第一句")
+        .await
+        .unwrap();
+    h.store
+        .append_foreman_message(NewForemanMessage::assistant(&sid, "答了"))
+        .await
+        .unwrap();
+
+    let mut script = Script::new();
+    script.for_foreman().text("回一").text("回二");
+    let agent = FakeAgent::new(script);
+    let runner = h.runner(agent.clone());
+    runner.say(Some(&sid), "第二句").await.unwrap();
+    runner.say(Some(&sid), "第三句").await.unwrap();
+
+    let reqs = agent.request_log();
+    assert_eq!(reqs.len(), 2, "{}", reqs.len());
+    let (r1, r2) = (&reqs[0], &reqs[1]);
+    assert!(r1.user_prompt.is_empty() && r2.user_prompt.is_empty());
+    let head1 = &r1.messages[..r1.messages.len() - 1];
+    assert!(!head1.is_empty(), "第一轮要有历史在前");
+    let key = |m: &agentpipeline_core::agent::client::Message| (m.role, m.content.clone());
+    assert_eq!(
+        head1.iter().map(key).collect::<Vec<_>>(),
+        r2.messages[..head1.len()]
+            .iter()
+            .map(key)
+            .collect::<Vec<_>>(),
+        "上一轮的历史段是下一轮的逐字前缀"
+    );
+    // 分歧点之后，落库的原问以**原文**（不带快照）续在前缀之后——库里那行不被改写。
+    assert_eq!(
+        r2.messages[head1.len()].content.as_deref(),
+        Some("第二句"),
+        "原问以原文续在前缀之后：{:?}",
+        r2.messages[head1.len()].content
     );
 }
 
@@ -1173,6 +1285,16 @@ async fn the_global_switch_stops_the_watch_round_and_backlog_stays_put() {
 #[tokio::test]
 async fn the_human_turn_sees_a_marked_watch_digest_not_the_verbatim_ledger() {
     let h = Harness::empty().await;
+    // 先有一轮真对话：有正文才有「正文之后」可言（决策 299 的位次判据要钉住）。
+    let sid = h.session().await;
+    h.store
+        .append_foreman_user_message(&sid, "上一句")
+        .await
+        .unwrap();
+    h.store
+        .append_foreman_message(NewForemanMessage::assistant(&sid, "上一轮的回答"))
+        .await
+        .unwrap();
     // 值守台账先醒过两次（直接落库模拟既有播报）。
     let watch_sid = h
         .store
@@ -1197,7 +1319,10 @@ async fn the_human_turn_sees_a_marked_watch_digest_not_the_verbatim_ledger() {
         .text("这两件我都看过了。"); // 第二次 = 主轮
     let agent = FakeAgent::new(script);
     let runner = h.runner(agent.clone());
-    let turn = runner.say(None, "刚才播报的两件事怎么办").await.unwrap();
+    let turn = runner
+        .say(Some(&sid), "刚才播报的两件事怎么办")
+        .await
+        .unwrap();
 
     let reqs = agent.request_log();
     assert_eq!(reqs.len(), 2, "摘要一次 + 主轮一次：{}", reqs.len());
@@ -1213,12 +1338,18 @@ async fn the_human_turn_sees_a_marked_watch_digest_not_the_verbatim_ledger() {
         "台账原文是摘要输入：{}",
         reqs[0].user_prompt
     );
-    // 主轮：头部一条带标记的 user 轮 = 标记 + 摘要正文；**不是**台账原文。
-    let digest = &reqs[1].messages[0];
-    let head = digest.content.as_deref().unwrap_or_default();
+    // 主轮：一条带标记的 user 轮 = 标记 + 摘要正文，落在**正文之后、问题之前**
+    // （位次精确判——尾部注入与头部 splice 在这条历史里恰好差两位）；**不是**台账原文。
+    let (digest_pos, head) =
+        find_marked(&reqs[1].messages, FOREMAN_WATCH_DIGEST_MARK).expect("带标记的值守摘要要在场");
+    assert_eq!(
+        digest_pos,
+        reqs[1].messages.len() - 2,
+        "摘要在正文之后、本轮问题之前（尾部注入）：{digest_pos}"
+    );
     assert!(
         head.contains(FOREMAN_WATCH_DIGEST_MARK) && head.contains("值守摘要："),
-        "头部要同时有标记与摘要正文：{head}"
+        "要同时有标记与摘要正文：{head}"
     );
     assert!(
         !head.contains(FOREMAN_WATCH_MARK),
@@ -1263,7 +1394,8 @@ async fn the_watch_round_sees_a_marked_talk_digest() {
         reqs.len()
     );
     let main = &reqs[2];
-    let head = main.messages[0].content.as_deref().unwrap_or_default();
+    let (_, head) =
+        find_marked(&main.messages, FOREMAN_TALK_DIGEST_MARK).expect("带标记的人话摘要要在场");
     assert!(
         head.contains(FOREMAN_TALK_DIGEST_MARK) && head.contains("值班经理在盯 t1"),
         "值守轮的上下文里要有人话的摘要：{head}"
@@ -3069,8 +3201,8 @@ async fn an_over_budget_transcript_compacts_inline_anchored_at_the_current_quest
         .expect("过线之后应当出现规则化摘要");
     let question_at = texts
         .iter()
-        .position(|t| t == question)
-        .expect("本轮那句问题必须在场");
+        .position(|t| t.ends_with(question))
+        .expect("本轮那句问题必须在场（快照并进末尾轮，问题在该轮结尾）");
     assert_eq!(
         question_at + 1,
         summary_at,
@@ -3148,10 +3280,11 @@ async fn a_context_window_error_compacts_the_transcript_and_retries_the_call() {
         "压缩留痕要看得见：{retried:?}"
     );
     assert!(
-        retried
-            .iter()
-            .any(|m| m.content.as_deref() == Some("帮我看看")),
-        "本轮那句问题在压缩后仍在场"
+        retried.iter().any(|m| m
+            .content
+            .as_deref()
+            .is_some_and(|c| c.ends_with("帮我看看"))),
+        "本轮那句问题在压缩后仍在场（快照并进末尾轮，问题在该轮结尾）"
     );
 }
 

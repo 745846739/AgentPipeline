@@ -28,10 +28,13 @@ impl Adapter for OpenAiCompatible {
     }
 
     fn build_body(&self, provider: &Provider, request: &LlmRequest) -> Result<serde_json::Value> {
-        let mut messages = vec![
-            serde_json::json!({"role": "system", "content": request.system_prompt}),
-            serde_json::json!({"role": "user", "content": request.user_prompt}),
-        ];
+        let mut messages =
+            vec![serde_json::json!({"role": "system", "content": request.system_prompt})];
+        // 空 user_prompt 不占 wire 头（值班长主轮的快照并进末尾轮之后就是这个形状）：
+        // 一条空 user 消息改变的不只是前缀长度——它还会被 provider 当成一次真实发言。
+        if !request.user_prompt.is_empty() {
+            messages.push(serde_json::json!({"role": "user", "content": request.user_prompt}));
+        }
         for m in &request.messages {
             messages.push(wire_message(m)?);
         }
@@ -233,6 +236,24 @@ mod tests {
         assert_eq!(msgs[2]["tool_calls"][0]["function"]["name"], "write_file");
         assert_eq!(msgs[3]["role"], "tool");
         assert_eq!(msgs[3]["tool_call_id"], "call_1");
+    }
+
+    #[test]
+    fn an_empty_user_prompt_leaves_no_empty_wire_head_message() {
+        // 值班长主轮的 user_prompt 是空的（快照并进末尾轮之后）——
+        // 空槽不得变成一条空 user 消息占住 wire 头。
+        let mut req = request(vec![Message::user("第一句")]);
+        req.user_prompt = String::new();
+        let body = OpenAiCompatible
+            .build_body(
+                &fixture_provider("openai", "gpt-test", Some("http://127.0.0.1:1")),
+                &req,
+            )
+            .unwrap();
+        let msgs = body["messages"].as_array().unwrap();
+        assert_eq!(msgs.len(), 2, "空 user_prompt 不占 wire 头：{msgs:?}");
+        assert_eq!(msgs[0]["role"], "system");
+        assert_eq!(msgs[1]["content"], "第一句");
     }
 
     #[test]

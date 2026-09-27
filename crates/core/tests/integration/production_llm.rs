@@ -288,7 +288,9 @@ async fn anthropic_stream_maps_usage_tool_blocks_and_request_shape() {
     let body: serde_json::Value = serde_json::from_str(&requests[0].body).unwrap();
     assert_eq!(body["model"], "claude-x");
     assert_eq!(body["max_tokens"], 2048);
-    assert_eq!(body["system"], "系统提示");
+    // system 恒为 block 形式，末块带 prompt-cache 断点（决策 299）
+    assert_eq!(body["system"][0]["text"], "系统提示");
+    assert_eq!(body["system"][0]["cache_control"]["type"], "ephemeral");
     let msgs = body["messages"].as_array().unwrap();
     // [user_prompt, assistant(tool_use), user(tool_result)]
     assert_eq!(msgs.len(), 3, "{msgs:?}");

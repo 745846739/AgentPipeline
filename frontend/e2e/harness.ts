@@ -338,8 +338,8 @@ async function startMockLlm(
       // ②③ 就是这么红的：`msgs=6 new=false` 一条条打出来，轮号一直停在 0）。
       //
       // 同一次工具往返以 **tool** 收尾（assistant 发起、tool 结果回来），故两种情形仍分得开；
-      // 值班长本来就是这个判据（它每轮请求都带同一段态势快照前言 + 历史对话，条数不固定，
-      // 「≤2」对它永不成立）——两条路从此同源。
+      // 值班长本来就是这个判据（它每轮请求 = 历史对话 + 末尾一轮快照合并的 user 轮，条数
+      // 不固定，「≤2」对它永不成立）——两条路从此同源。
       const lastRole = messages[messages.length - 1]?.role ?? '';
       const isNewRound = lastRole === 'user';
       if (key && isNewRound) {
