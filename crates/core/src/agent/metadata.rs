@@ -60,7 +60,13 @@ pub fn extract_metadata(response: &AgentResponse) -> MetadataExtraction {
         if tc.name == "submit_metadata" {
             return match serde_json::from_str::<serde_json::Value>(&tc.arguments) {
                 Ok(value) => MetadataExtraction::ok(value, MetadataSource::ToolCall),
-                Err(e) => MetadataExtraction::err(format!("工具参数 JSON 解析失败：{e}")),
+                // 「坏掉即快速失败」不变（不静默改用文本），但**截断型（EOF）**先救援：
+                // 输出被 max_tokens 掐断时缺的只是尾部引号与括号，内容本身没有矛盾，
+                // 补齐后照旧走下游 schema 校验。救援不了的按原样报错。
+                Err(e) => match rescue_truncated_json(&tc.arguments) {
+                    Some(value) => MetadataExtraction::ok(value, MetadataSource::ToolCall),
+                    None => MetadataExtraction::err(format!("工具参数 JSON 解析失败：{e}")),
+                },
             };
         }
     }
@@ -84,6 +90,76 @@ pub fn extract_metadata(response: &AgentResponse) -> MetadataExtraction {
     }
 
     MetadataExtraction::err("未找到结构化元数据")
+}
+
+/// 救援被 max_tokens 掐断的 JSON（run59 实证：EOF while parsing at column 1697）。
+///
+/// 只救「尾部被截断」这一种形态：截断处缺的只是收尾的引号与括号，内容本身没有矛盾。
+/// 从截断点逐字符往回退，找**最长**的可解析前缀——按该前缀的扫描状态补齐未闭合的
+/// 字符串与括号栈后能解析成**非空对象**即返回。退到只剩空对象说明原参数根本不是
+/// JSON（如 `{not json`），返回 `None`，调用方照旧快速失败——非截断型的坏 JSON
+/// 不在救援范围。
+pub fn rescue_truncated_json(raw: &str) -> Option<serde_json::Value> {
+    if let Ok(value) = serde_json::from_str::<serde_json::Value>(raw) {
+        return Some(value);
+    }
+    let base = raw.trim_end();
+    // 逐字符回退（UTF-8 边界上），最长可解析前缀优先。
+    let mut cut = base.len();
+    while cut > 0 {
+        let prefix = &base[..cut];
+        let (stack, in_string, ends_with_escape) = scan_json_tail(prefix);
+        let mut candidate = prefix.to_string();
+        if in_string {
+            if ends_with_escape {
+                candidate.pop(); // 悬空的尾反斜杠会把补上的引号吃掉
+            }
+            candidate.push('"');
+        }
+        for open in stack.iter().rev() {
+            candidate.push(if *open == b'{' { '}' } else { ']' });
+        }
+        if let Ok(value) = serde_json::from_str::<serde_json::Value>(&candidate) {
+            if value.as_object().is_some_and(|o| !o.is_empty()) {
+                return Some(value);
+            }
+        }
+        let prev = base[..cut]
+            .char_indices()
+            .next_back()
+            .map(|(i, _)| i)
+            .unwrap_or(0);
+        cut = prev;
+    }
+    None
+}
+
+/// 扫描前缀的截断态：未闭合的括号栈、是否落在字符串里、字符串尾是否悬空反斜杠。
+fn scan_json_tail(prefix: &str) -> (Vec<u8>, bool, bool) {
+    let mut stack: Vec<u8> = Vec::new();
+    let mut in_string = false;
+    let mut escaped = false;
+    for &b in prefix.as_bytes() {
+        if in_string {
+            if escaped {
+                escaped = false;
+            } else if b == b'\\' {
+                escaped = true;
+            } else if b == b'"' {
+                in_string = false;
+            }
+            continue;
+        }
+        match b {
+            b'"' => in_string = true,
+            b'{' | b'[' => stack.push(b),
+            b'}' | b']' => {
+                stack.pop();
+            }
+            _ => {}
+        }
+    }
+    (stack, in_string, in_string && escaped)
 }
 
 /// 把提取到的 JSON 反序列化为阶段结构体（schema 与脚本编译期同源，决策 38）。
@@ -277,6 +353,41 @@ mod tests {
         let got = extract_metadata(&resp);
         assert!(!got.is_ok());
         assert!(got.error.unwrap().contains("工具参数 JSON 解析失败"));
+    }
+
+    #[test]
+    fn rescue_closes_truncated_object_mid_value() {
+        // run59 同型：尾部 token 被掐断，缺的只是收尾括号
+        let raw = r#"{"readiness": true, "affected_files": ["src/a.rs"], "new_sym"#;
+        let v = rescue_truncated_json(raw).unwrap();
+        assert_eq!(v["readiness"], true);
+        assert_eq!(v["affected_files"][0], "src/a.rs");
+    }
+
+    #[test]
+    fn rescue_closes_truncated_string_inside_array() {
+        let raw = r#"{"readiness": false, "blockers": ["缺约束，建议"#;
+        let v = rescue_truncated_json(raw).unwrap();
+        assert_eq!(v["blockers"][0], "缺约束，建议");
+    }
+
+    #[test]
+    fn rescue_refuses_non_truncated_garbage() {
+        // 非截断型坏 JSON 照旧快速失败——救援只对 EOF 型负责
+        assert!(rescue_truncated_json("{not json").is_none());
+        assert!(rescue_truncated_json("").is_none());
+    }
+
+    #[test]
+    fn rescue_truncated_arguments_flow_through_extraction() {
+        let resp = response_with_tool(
+            "submit_metadata",
+            r#"{"readiness": true, "affected_files": ["src/a.rs"], "new_symb"#,
+        );
+        let got = extract_metadata(&resp);
+        assert!(got.is_ok(), "截断的工具参数应被救援：{:?}", got.error);
+        assert_eq!(got.source, Some(MetadataSource::ToolCall));
+        assert_eq!(got.value.unwrap()["readiness"], true);
     }
 
     #[test]

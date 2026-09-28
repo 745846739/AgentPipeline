@@ -763,6 +763,9 @@ impl ModelInvoke {
             self.store.touch_run_heartbeat(run_id).await?;
 
             if response.tool_calls.is_empty() {
+                // 收口即退出，交给下面的元数据抽取（含助手正文三级降级）判定；
+                // 判不出由外层 attempt 按决策 278 续接转录重试——轮内不追加错误
+                // turn，那是 attempt 级的语义（决策 298 按错误类别分流）。
                 break;
             }
             for call in &response.tool_calls {
@@ -844,11 +847,41 @@ impl ModelInvoke {
         let value = match submitted {
             Some(v) => v,
             None => {
-                let final_resp = crate::agent::client::AgentResponse {
-                    content: trace.messages.iter().rev().find_map(|m| m.content.clone()),
-                    ..Default::default()
-                };
-                let extracted = crate::agent::metadata::extract_metadata(&final_resp);
+                // 只扫**助手**消息的正文：倒序第一条带 content 的可能是 tool_result
+                //（工具输出/报错文本），拿它搜元数据会搜出一段与提交无关的 JSON。
+                // 从最新往旧逐条找，第一条能抽出元数据的胜出；全都抽不出时用最新一条
+                // 的诊断做报错（它最接近模型最后说的话）。
+                let mut extracted = None;
+                let mut first_error = None;
+                for m in trace
+                    .messages
+                    .iter()
+                    .rev()
+                    .filter(|m| matches!(m.role, crate::agent::client::Role::Assistant))
+                {
+                    let Some(content) = m.content.clone() else {
+                        continue;
+                    };
+                    let resp = crate::agent::client::AgentResponse {
+                        content: Some(content),
+                        ..Default::default()
+                    };
+                    let got = crate::agent::metadata::extract_metadata(&resp);
+                    if got.is_ok() {
+                        extracted = Some(got);
+                        break;
+                    }
+                    first_error.get_or_insert(got.error);
+                }
+                let extracted = extracted
+                    .or_else(|| {
+                        first_error
+                            .flatten()
+                            .map(crate::agent::metadata::MetadataExtraction::err)
+                    })
+                    .unwrap_or_else(|| {
+                        crate::agent::metadata::MetadataExtraction::err("未找到结构化元数据")
+                    });
                 extracted.value.ok_or_else(|| {
                     Error::Validation(extracted.error.unwrap_or_else(|| "缺少结构化元数据".into()))
                 })?
