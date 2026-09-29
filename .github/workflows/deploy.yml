@@ -8,11 +8,20 @@
 # 密钥与主机信息全部走 repo secrets（SSH_PRIVATE_KEY / SSH_KNOWN_HOSTS / DEPLOY_HOST /
 # DEPLOY_USER）；服务器端 sudoers 仅放行 /opt/deploy.sh 的 start|status 两个子命令，
 # CI 专用密钥不能登 shell 做别的——见 deploy 用户与 /etc/sudoers.d/deploy-pipeline。
+#
+# 触发形状（决策 330）：**不再是「push 到 main 就部」**。闸门（编译 + 测试 + 前端 + E2E）
+# 已搬到 GitHub runner（`.github/workflows/check.yml`），本工作流挂在它的结论之后——
+# 只有 check 成功、且被验的那个 commit 仍是 main 尖端时才部署。本文件**不跑任何测试**，
+# 覆盖面的唯一出处仍是 Makefile（决策 168）。
 name: deploy-106
 
 on:
-  push:
+  workflow_run:
+    workflows: ["check"]
+    types: [completed]
+    # 只认跑在 main 上的那一轮：PR 的检查跑在 PR 分支上，不该触发部署。
     branches: [main]
+  # 手动部署始终保留：需要回滚、check 自己挂了要重推一遍 106、或调试部署脚本时用。
   workflow_dispatch:
 
 concurrency:
@@ -23,6 +32,19 @@ jobs:
   deploy:
     runs-on: ubuntu-latest
     timeout-minutes: 30
+    # 两道闸，缺一不可：
+    #   ① 结论必须是 success —— cancelled / failure / skipped 都不是「验过了」；
+    #   ② 被验的 commit 必须**仍是 main 的尖端** —— 否则这轮检查已经过时，部上去的是
+    #      没人验过的更新代码（workflow_run 事件下 `github.sha` 即默认分支尖端，故这句
+    #      就是「检查对象 == 当前 main」的比对）。
+    # 第 ② 条同时封掉连续推送的窗口：旧 commit 的检查跑完时 main 已前移 → 直接跳过，
+    # 等新 commit 那轮检查的结论。代价是「检查成功后 main 又变了」永远不会只靠旧结论部上去，
+    # 这正是想要的（宁可晚一轮，不部没验过的）。
+    # if 里的 `||` 短路：手动触发时没有 workflow_run，那一支不会被求值。
+    if: >-
+      github.event_name == 'workflow_dispatch' ||
+      (github.event.workflow_run.conclusion == 'success' &&
+      github.event.workflow_run.head_sha == github.sha)
     steps:
       # 跨境 SSH（Azure 出口 → 大陆云主机）对默认 QoS 标记的包会丢：
       # IPQoS=cs0 规避；ConnectTimeout/ServerAlive + timeout 包裹，快速失败不挂死。

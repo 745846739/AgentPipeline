@@ -18,6 +18,24 @@
 #   make check-frontend 前端单元 + 类型检查 + 构建
 #   make check-e2e      前端 E2E（含产物新鲜度守卫，决策 166）
 #
+# ── 谁在哪儿跑（决策 331）：别再按「一律本机跑全量」的老口径办 ──────────────
+# 闸门跑两处（决策 330），分工是定好的：
+#
+#   本地必跑：`make check-lint`（暖树上实测 18 秒）+ **改动所在那一层的窄跑**
+#             （`make unit PKG=<crate>` / `make integration TESTS=<模块>`）。这一档执行是
+#             秒级——决策 178 的增量加 218 的合并二进制让它便宜到没理由省；省掉它换来的
+#             只是「推上去等 CI 说 clippy 挂了」的往返。
+#   交给 CI ：完整的 `make check`。**尤其 check-e2e**——33 条 spec 在 `workers: 1` 下串行，
+#             是本机最大的时间黑洞。CI 是 `x86_64-linux`，**与 106 上的生产运行时同族**，
+#             故它对「生产会不会坏」的说服力比本机那套 darwin 形态更强。
+#   只有本机：`make desktop`（Tauri dmg 是 macOS 专属）与 `#[cfg(target_os = "macos")]`
+#             那类分支——CI 永远看不到它们（反过来，linux 那一侧是本机的盲区）。
+#   推完必读结论：`gh run list --workflow check`；红了看 `gh run view --log-failed`。
+#             **部署有没有发生，看 `deploy-106` 有没有起 run**——check 红就是没部署
+#             （部署挂在 check 的结论上，决策 330），不是「再等等」。
+#   一个例外：**首次 CI 跑绿之前**仍在本机跑完整 `make check`——linux 侧还没被证明过
+#             （`cfg(not(target_os = "macos"))` 那些分支从没被 clippy 看过）。
+#
 # 分层子集（原 justfile 的目标，名字与语义原样保留）：
 #
 #   make unit           只跑单元层（L1）

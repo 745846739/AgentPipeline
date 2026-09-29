@@ -227,10 +227,16 @@ impl Repo {
         self.checkout(&original);
     }
 
-    /// macOS `/tmp` → `/private/tmp` 符号链接陷阱（决策 104）。
+    /// realpath 前缀陷阱（决策 104，形状由决策 330 校正）：在**符号链接前缀**下放一个
+    /// 指向外部的符号链接文件。返回（受符号链接影响的目录，指向外部的链接路径）。
     ///
-    /// 在**符号链接前缀**下建一个临时目录，并在其中放一个指向外部的符号链接文件。
-    /// 返回（受符号链接影响的目录，指向外部的链接路径）。
+    /// 前缀由**本 fixture 自己造**（真临时目录 + 指向它的符号链接），不蹭平台事实。
+    /// 旧写法写死 `/tmp` 并指望「`/tmp` 是符号链接」——那是 macOS（`/tmp` → `/private/tmp`）
+    /// 独有的事实，Linux 上 `/tmp` 是普通目录，realpath 那条断言因此在 GitHub runner 上必红
+    /// （闸门搬上 runner 时才暴露）。自造前缀在任何平台都成立。
+    ///
+    /// 顺带修掉一处泄漏：旧写法在 `/tmp` 下裸建 `agentpipeline-linked-*` 目录，既不在
+    /// `extra` 里也没有别的清理，跑一次漏一个；现在两个目录都是 TempDir，随 `Repo` 析构收走。
     pub fn symlink_trap(&mut self) -> std::io::Result<(PathBuf, PathBuf)> {
         let outside = tempfile::Builder::new()
             .prefix("agentpipeline-secret-")
@@ -238,15 +244,18 @@ impl Repo {
         let secret = outside.path().join("secret.txt");
         std::fs::write(&secret, "top secret\n")?;
 
-        // /tmp 在 macOS 上是符号链接，realpath 后才能与 canonicalize 结果对上
-        let linked_root = std::path::PathBuf::from("/tmp")
-            .join(format!("agentpipeline-linked-{}", ulid::Ulid::new()));
-        std::fs::create_dir_all(&linked_root)?;
+        let real = tempfile::Builder::new()
+            .prefix("agentpipeline-linked-real-")
+            .tempdir()?;
+        let linked_root = real.path().join("linked");
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(real.path(), &linked_root)?;
         let link = linked_root.join("escape.txt");
         #[cfg(unix)]
         std::os::unix::fs::symlink(&secret, &link)?;
 
         self.extra.push(outside);
+        self.extra.push(real);
         Ok((linked_root, link))
     }
 
@@ -381,10 +390,18 @@ mod tests {
         let mut repo = Repo::clean().unwrap();
         let (linked_root, link) = repo.symlink_trap().unwrap();
         assert!(link.exists() || std::fs::symlink_metadata(&link).is_ok());
+        // 前缀是 fixture 自造的符号链接，故「realpath 会改写这个路径」在任何平台都成立。
+        // 旧断言把这件事寄托在 macOS 的 `/tmp` → `/private/tmp` 上，Linux 上必红（决策 330）。
         let resolved = linked_root.canonicalize().unwrap();
         assert_ne!(
             resolved, linked_root,
-            "该路径应位于符号链接之下（macOS /tmp），否则 realpath 断言无意义"
+            "该路径应位于符号链接之下，否则 realpath 断言无意义"
+        );
+        // 陷阱成不成立就看这一条：realpath 之后落在被链接目录（允许根）**之外**
+        let target = link.canonicalize().unwrap();
+        assert!(
+            !target.starts_with(&resolved),
+            "链接应指向前缀之外：{target:?} 落在 {resolved:?} 之内"
         );
     }
 

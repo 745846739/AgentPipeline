@@ -21,5 +21,11 @@
 #
 # 仍不是万能：直接调用 MacPorts 的 /opt/local/bin/cargo 会绕过 rustup（MacPorts
 # 不读本文件），故 Makefile 同时把 ~/.cargo/bin 提到 PATH 最前。
+#
+# `components`（决策 330）：闸门要用的两个工具显式声明，不靠 rustup 默认 profile 带进来。
+# 注意它**管不到 Makefile / CI 那条路**——RUSTUP_TOOLCHAIN 一定，rustup 就完全不读本文件
+# （见上），故 CI 的 lint job 另有一条 `rustup component add clippy rustfmt`。这里这一行
+# 是给编辑器与裸 `cargo` 用的。
 [toolchain]
 channel = "1.98.0"
+components = ["clippy", "rustfmt"]

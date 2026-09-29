@@ -1,0 +1,133 @@
+# 提交前闸门的 CI 镜像（决策 330）：把「编译 + 测试」从开发机搬到 GitHub runner。
+#
+# 为什么这套代码搬得动（三条都是既有决策的既成事实，不是为 CI 新做的改造）：
+#   ① 默认门**不打真网络**（决策 142 / 194）：真 LLM（`llm_smoke` / `production_llm` /
+#      `foreman_golden`）与真 GitHub（`repo_live`）都是 `#[ignore]` + 环境变量的双锁，
+#      故本工作流**不需要任何 secret**，也没有「runner 在境外连不连得上」的问题。
+#   ② 前端 E2E 自洽（`frontend/e2e/harness.ts`）：临时 home、mock LLM、`serve --port 0`
+#      回读端口、离线 smart-HTTP git fixture；`playwright.config.ts` 早就按 CI 姿态写好
+#      （`forbidOnly` / `retries` 都看 `process.env.CI`，GitHub 自动设它）。
+#   ③ 平台假设已清干净：Rust 侧唯一的 macOS 分支（`agent/disk_access.rs` 打开系统设置
+#      面板）带 `cfg(not(macos))` 兜底；`testkit` 里那条写死 `/tmp` 是符号链接的断言已
+#      按决策 330 改成自造前缀（它是**唯一**一条在 Linux 上必红的用例，见 330 的记录）。
+#
+# **闸门定义不在这里复述**（决策 168：Makefile 是闸门的唯一权威）。本文件只负责装环境
+# 与调 `make check-*`——同样的命令写两份必然漂移，justfile 就是那么被删掉的。
+#
+# 与部署的关系：`deploy.yml` 以 `workflow_run` 挂在本工作流之后，只有**本工作流成功**
+# 且被验的那个 commit 仍是 main 尖端时才部署。push 到 main 不再无门直部。
+name: check
+
+on:
+  # 全分支 push：main 走部署闸门，其余分支（含本仓 kanban 那类工作分支）只出结论。
+  push:
+    branches: ["**"]
+  # 本仓当前不用 PR（`gh pr list --state all` 为空），这一条是给将来的 PR 留的口子：
+  # 同仓 PR 会与 push 各跑一次，多花的是免费额度，换的是「以后不用想起来补」。
+  pull_request:
+  workflow_dispatch:
+
+# 同一 ref 只留最新一次：连续推送时旧的检查没有意义，取消它省的是看日志的人的注意力。
+concurrency:
+  group: check-${{ github.ref }}
+  cancel-in-progress: true
+
+# 本工作流不碰 secrets、不写仓库。显式收窄：它会在 PR 上跑，权限越小越好。
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  # 决策 175 的进程级钉法，与 Makefile 里那句 `export RUSTUP_TOOLCHAIN` 同一用意
+  # （优先级高于 rust-toolchain.toml，后者管不到那些自带工具链文件的第三方 crate）。
+  RUSTUP_TOOLCHAIN: "1.98.0"
+  # 这两条是**覆盖提交进仓库的 `.cargo/config.toml`**，因为那份配置是照开发机写的
+  # （它的注释自己写着「开发机是 4 线程（2 物理核）/ 8 GB」），跟着仓库一起漂到 runner 上：
+  #   · `jobs = 2` → runner 有 4 vCPU，压到物理核数这条理由在那边对应的是 4，不是 2；
+  #     不覆盖就等于白扔一半并发（env 优先级高于 config 文件，故这里能压过它）。
+  #   · `incremental = true` → CI 每次都是全新 checkout + 一份被 rust-cache 剔过增量的
+  #     target，增量产物活不过一轮、却每轮都要写（决策 178 记的「首次全量编译会略慢」
+  #     那笔成本照付）——那是给「改一处 → 跑一层」的日常形态买的，CI 里没有这个形态。
+  CARGO_BUILD_JOBS: "4"
+  CARGO_INCREMENTAL: "0"
+
+jobs:
+  # ── Rust 静态检查：fmt --check + clippy -D warnings ─────────────────────────
+  lint:
+    name: lint（fmt + clippy）
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: Swatinem/rust-cache@v2
+      - name: 工具链自证
+        # 决策 175 折腾过「到底哪套 rustc 在编」；CI 里也该一眼看得到，别猜。
+        run: rustc -vV && cargo -V
+      - name: 装 lint 组件
+        # RUSTUP_TOOLCHAIN 一定，rustup 就不读 rust-toolchain.toml 的 `components` 表，
+        # 故这里显式装。只多两个二进制，不触发任何重编。
+        run: rustup component add clippy rustfmt
+      - run: make check-lint
+
+  # ── Rust 全量测试：L1 单元 + L2 集成 + L3 API + L4 场景 + 冒烟 ───────────────
+  # **不装 Node**：`crates/app/build.rs` 对缺失的 `frontend/dist` 生成空资产表，首页退化
+  # 为「前端未构建」提示页，而两条资产契约用例明确接受这一态
+  # （`root_serves_embedded_frontend_or_build_hint` 的 else 支 /
+  # `embedded_assets_are_served_verbatim_with_mime` 的 None 支），故本 job 不需要前端产物。
+  test:
+    name: test（cargo test --workspace）
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+      - uses: Swatinem/rust-cache@v2
+      - name: 工具链自证
+        run: rustc -vV
+      - run: make check-test
+
+  # ── 前端：vitest + svelte-check + vite build ────────────────────────────────
+  frontend:
+    name: frontend（vitest + svelte-check + build）
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          # 跟开发机的 major 对齐（本机 v24），别让「本地过、CI 挂」多一个来源。
+          node-version: "24"
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+      - name: 装前端依赖
+        # 必须无条件 `npm ci`（Makefile 的 `frontend` 目标只在 node_modules 缺失或锁文件
+        # 更新时才装——那是给开发机的省事，runner 每次都是干净的，没有可省的那一份）。
+        run: npm ci --no-audit --no-fund
+        working-directory: frontend
+      - run: make check-frontend
+
+  # ── 前端 E2E：真二进制 + Chromium ───────────────────────────────────────────
+  # 单独一个 job：33 个 spec 串行（`playwright.config.ts` 的 `workers: 1`——每条用例自己
+  # spawn 后端与 Vite，串行避免端口/资源互扰），大概率是最长的一杆，别拖住 lint 的反馈。
+  # `make check-e2e` 内置产物新鲜度守卫（决策 166）：dist 缺失或落后于前端源码就先
+  # `npm run build`，随后 cargo 按 `build.rs` 的 rerun-if-changed 重编内嵌资产表。
+  e2e:
+    name: e2e（playwright chromium）
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+      - uses: Swatinem/rust-cache@v2
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "24"
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+      - name: 装前端依赖
+        run: npm ci --no-audit --no-fund
+        working-directory: frontend
+      - name: 装 Chromium
+        # 只跑 chromium 项目（`playwright.config.ts` 只有一个 project）。--with-deps 装的是
+        # 系统库，runner 上 sudo 免密，能过。
+        run: npx playwright install --with-deps chromium
+        working-directory: frontend
+      - run: make check-e2e

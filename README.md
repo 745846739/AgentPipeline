@@ -126,7 +126,11 @@ rlib / rmeta 一律保留，故清完不必重编整棵依赖树。`DRY=1 make s
 `crates/app/build.rs` 的 `rerun-if-changed` 传递，二进制必然跟着重编）。没有这一步，
 改了代码不重建就会得到「旧二进制的绿」。
 
-**本项目无 CI**（无 `.github/workflows/`）：闸门靠本地执行，这是当前形态而非遗漏。
+**闸门跑在两处（决策 330）**：本地 `make check`，以及 GitHub runner 上的
+`.github/workflows/check.yml`（四个并行 job：lint / test / frontend / e2e，**只调 `make check-*`**，
+不另写一套命令——决策 168 说定 Makefile 是唯一权威）。默认门**不打真网络**（决策 142 / 194 的双锁），
+故 CI 里不需要任何 secret。**部署挂在 check 的结论之后**：`deploy.yml` 改由 `workflow_run` 触发，
+结论为 `success` **且**被验 commit 仍是 main 尖端时才部署——push 到 main 不再无门直部。
 
 当前状态：**Rust 848 个用例全过**（另有 2 个 `#[ignore]` 真 LLM 冒烟：单节点 + 全流程），
 `fmt` / `clippy -D warnings` 干净；前端 **290 个 vitest 全过** + `svelte-check` 0 error /
