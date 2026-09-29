@@ -11,14 +11,21 @@ use crate::Result;
 pub const HOME_ENV: &str = "AGENTPIPELINE_HOME";
 
 /// 解析家目录：`$AGENTPIPELINE_HOME` 优先，否则 `~/.agentpipeline`。
+///
+/// 「用户家目录」跟**用户**走，不跟 cwd 走（决策 322）：`$HOME` 未设的环境
+/// （典型是 systemd 服务——unit 不注入 HOME）旧实现落回 `"."`，把数据根解析成
+/// 了部署目录（`/opt/AgentPipeline/.agentpipeline`），人按家目录放的库永远读不到。
+/// 现经 `std::env::home_dir()` 取真实家目录（`$HOME` 非空 → passwd），三者都
+/// 取不到才落回 `.`。
 pub fn agentpipeline_home() -> PathBuf {
     if let Ok(v) = std::env::var(HOME_ENV) {
         if !v.trim().is_empty() {
             return PathBuf::from(v);
         }
     }
-    let user_home = std::env::var("HOME").unwrap_or_else(|_| ".".to_string());
-    PathBuf::from(user_home).join(".agentpipeline")
+    std::env::home_dir()
+        .unwrap_or_else(|| PathBuf::from("."))
+        .join(".agentpipeline")
 }
 
 /// 家目录句柄：所有路径派生的唯一入口。
@@ -258,6 +265,19 @@ pub fn check_permissions(_home: &Home) -> Vec<(PathBuf, u32)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn home_resolves_to_absolute_path() {
+        // 决策 322：家目录必须是绝对路径——旧实现在 `$HOME` 缺失（如 systemd 服务）
+        // 时落回 `"."`（cwd 相对），把数据根写进部署目录。不断言具体路径也**不动**
+        // 环境变量（并行约束见下一条测试的注），只断言「永不 cwd 相对」这条不变量；
+        // `$HOME` 在测试环境恒在，落回 `"."` 即红。
+        assert!(
+            agentpipeline_home().is_absolute(),
+            "家目录不得 cwd 相对：{:?}",
+            agentpipeline_home()
+        );
+    }
 
     #[test]
     fn home_env_overrides_default() {
