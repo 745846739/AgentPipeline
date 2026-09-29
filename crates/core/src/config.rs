@@ -1889,6 +1889,40 @@ mod tests {
     // ── 决策 334：[server] public_base_url（公网入口）──
 
     /// 键认得出来、缺省是「没有」，且形态校验与 `allowed_origins` 同一套。
+    #[test]
+    fn public_base_url_parses_and_rejects_non_origin_forms() {
+        let cfg = Config::from_toml(
+            r#"
+            [server]
+            public_base_url = "https://106.12.12.6:3389"
+            "#,
+        )
+        .unwrap();
+        assert_eq!(
+            cfg.server.public_base_url.as_deref(),
+            Some("https://106.12.12.6:3389")
+        );
+        // 不配 = None（本机 / 局域网直连形态；不是空串那种「配了但没意义」的第三态）
+        assert!(Config::from_toml("[server]\nport = 8788\n")
+            .unwrap()
+            .server
+            .public_base_url
+            .is_none());
+
+        for bad in [
+            "106.12.12.6:3389",             // 缺 scheme
+            "https://106.12.12.6:3389/app", // 带路径：二维码是 origin 加 `/?pair=…`，多一段路径必然拼错
+            "ftp://106.12.12.6",            // scheme 不支持
+        ] {
+            let toml = format!("[server]\npublic_base_url = \"{bad}\"\n");
+            let err = Config::from_toml(&toml).unwrap_err().to_string();
+            assert!(
+                err.contains("public_base_url"),
+                "报错要点名是哪一行配置：{err}"
+            );
+        }
+    }
+
     // ── 决策 335：[server] tls_cert / tls_key（应用自己终止 TLS）──
 
     /// 两个都不给 = 明文（缺省形态）；两个都给 = 启用 TLS。
@@ -1928,40 +1962,6 @@ mod tests {
             assert!(
                 err.contains("tls_cert") && err.contains("tls_key"),
                 "两个键名都要出现（否则读的人不知道另一半叫什么）：{err}"
-            );
-        }
-    }
-
-    #[test]
-    fn public_base_url_parses_and_rejects_non_origin_forms() {
-        let cfg = Config::from_toml(
-            r#"
-            [server]
-            public_base_url = "https://106.12.12.6:3389"
-            "#,
-        )
-        .unwrap();
-        assert_eq!(
-            cfg.server.public_base_url.as_deref(),
-            Some("https://106.12.12.6:3389")
-        );
-        // 不配 = None（本机 / 局域网直连形态；不是空串那种「配了但没意义」的第三态）
-        assert!(Config::from_toml("[server]\nport = 8788\n")
-            .unwrap()
-            .server
-            .public_base_url
-            .is_none());
-
-        for bad in [
-            "106.12.12.6:3389",             // 缺 scheme
-            "https://106.12.12.6:3389/app", // 带路径：二维码是 origin 加 `/?pair=…`，多一段路径必然拼错
-            "ftp://106.12.12.6",            // scheme 不支持
-        ] {
-            let toml = format!("[server]\npublic_base_url = \"{bad}\"\n");
-            let err = Config::from_toml(&toml).unwrap_err().to_string();
-            assert!(
-                err.contains("public_base_url"),
-                "报错要点名是哪一行配置：{err}"
             );
         }
     }

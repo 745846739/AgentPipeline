@@ -1793,12 +1793,15 @@ async fn pairing_lan_pair_param_enrolls_this_device() {
         cookie.contains(&format!("agentpipeline_pairing={token}")),
         "{cookie}"
     );
-    for attribute in ["Path=/", "Secure", "HttpOnly", "SameSite=Lax"] {
+    // **`Secure` 特意不在列**（决策 336 的实测账）：带上它，明文部署里浏览器会拒收这个
+    // cookie，而外壳的子资源（`/assets/*.js`、`/sw.js`）只能靠它过闸门——配对成功却整页空白。
+    for attribute in ["Path=/", "HttpOnly", "SameSite=Lax"] {
         assert!(
             cookie.contains(attribute),
             "cookie 少了 {attribute}：{cookie}"
         );
     }
+    assert!(!cookie.contains("Secure"), "别把 Secure 加回来：{cookie}");
 }
 
 /// 令牌不对时**不放行**，且落点仍是配对页（页面自己会说「这条地址里的令牌不认」）。

@@ -226,15 +226,22 @@ fn cookie_value<'a>(headers: &'a axum::http::HeaderMap, name: &str) -> Option<&'
 
 /// 配对成功时种下的 cookie（决策 336）。
 ///
-/// 四处属性各有理由：`Path=/`（全站都要带）；`HttpOnly`（前端从不需要读它——它只回答
+/// 三条属性各有理由：`Path=/`（全站都要带）；`HttpOnly`（前端从不需要读它——它只回答
 /// 「这台设备配过没有」，而值本身仍由头与地址两条老路带着走）；`SameSite=Lax`（跨站子请求
-/// 不携带，写请求的 CSRF 面因此归零，而**顶层导航照带**——第一次扫码进来正是导航）；
-/// `Secure` **无条件带上**：TLS 形态下它就该只在加密连接上走，明文形态（局域网 HTTP）下
-/// 浏览器会直接拒收这个 cookie——而那正是想要的，明文连接不该让凭据驻留。
+/// 不携带，写请求的 CSRF 面因此归零，而**顶层导航照带**——第一次扫码进来正是导航）。
 /// `Max-Age` 一年：与「主屏图标里那条地址长期有效」同一量级；令牌一重置它就立刻失效
 /// （服务端比的是当前令牌），故不需要更短的寿命。
+///
+/// **没有 `Secure`——这是实测出来的（2026-09-30）**：一开头带了它，理由听上去很正当
+/// （「别让凭据在明文连接上走」），可这个进程只有**一种**传输形态（要么明文、要么 TLS，
+/// 启动时定死），于是它挡不住任何真实威胁，却把明文形态**整条打断**：带 `Secure` 的
+/// cookie 在 `http://` 上被浏览器直接拒收，而**页面外壳的子资源（`/assets/*.js`、
+/// `/sw.js`）既带不了自定义头、地址里又没有 `?pair=`**——它们只能靠这个 cookie 过闸门。
+/// 实测症状是一张**整页空白**：HTML 放行，每个 JS/CSS 请求 403。明文形态下真正的保护是
+/// 「局域网 + 决策 167 已接受的明文面」，与请求头那条老路同一档；TLS 形态下明文连接
+/// 根本不存在，`Secure` 无事可做。
 fn enrollment_cookie(token: &str) -> String {
-    format!("{PAIRING_COOKIE}={token}; Path=/; Max-Age=31536000; HttpOnly; Secure; SameSite=Lax")
+    format!("{PAIRING_COOKIE}={token}; Path=/; Max-Age=31536000; HttpOnly; SameSite=Lax")
 }
 
 /// 这次请求要的是「一张给人看的页面」吗（而不是 JSON / 脚本 / 图片）。
@@ -362,15 +369,26 @@ mod tests {
     }
 
     #[test]
-    fn enrollment_cookie_carries_the_four_attributes_that_matter() {
+    fn enrollment_cookie_carries_the_attributes_that_matter() {
         let cookie = enrollment_cookie("tok");
         assert!(cookie.starts_with(&format!("{PAIRING_COOKIE}=tok;")));
-        for attribute in ["Path=/", "HttpOnly", "Secure", "SameSite=Lax", "Max-Age="] {
+        for attribute in ["Path=/", "HttpOnly", "SameSite=Lax", "Max-Age="] {
             assert!(
                 cookie.contains(attribute),
                 "cookie 少了 {attribute}：{cookie}"
             );
         }
+    }
+
+    /// **`Secure` 不许回来**（决策 336 的实测账）：带上它，浏览器在明文形态下会拒收这个
+    /// cookie，而外壳的子资源（`/assets/*.js`、`/sw.js`）只能靠它过闸门——症状是配对
+    /// 明明成功、页面却**整页空白**。
+    #[test]
+    fn enrollment_cookie_carries_no_secure_flag() {
+        assert!(
+            !enrollment_cookie("tok").contains("Secure"),
+            "带上 Secure 会让明文部署里的外壳子资源全部 403（实测空白页）"
+        );
     }
 
     #[test]
