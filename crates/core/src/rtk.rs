@@ -777,6 +777,12 @@ mod tests {
     /// 重建 = 清空 + 重链，于是并发命令下会开一个「shim 里暂时没有 `rtk`」的窗口——
     /// 那一刻起跳的子进程拿到的是 PATH 里的另一份，或者干脆 127。判据是链接自己的 inode：
     /// 不重建则不变；目标变了才重建。顺手钉住「目录里多出别的东西时照旧重建」。
+    /// `pin` 钉的是**解析后**的路径（`canonicalize`，失败则退回原路径）。断言同一口径，
+    /// 免得又把 `/bin/sh` 这种符号链接型路径写成期望值——那在 Linux 上必红。
+    fn resolved_path(path: &std::path::Path) -> std::path::PathBuf {
+        std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf())
+    }
+
     #[test]
     fn pinning_keeps_the_same_target_without_rebuilding() {
         use std::os::unix::fs::MetadataExt;
@@ -802,7 +808,14 @@ mod tests {
         if second.exists() {
             pin(&home, &second).unwrap();
             assert_ne!(before, inode(), "换了目标就得重建");
-            assert_eq!(std::fs::read_link(dir.join(SHIM_NAME)).unwrap(), second);
+            // 比的是**解析后**的目标（`pin` 先 `canonicalize`）：`/bin/sh` 在 Linux 上是
+            // 指向 `/usr/bin/dash` 的符号链接、`/bin/ls` 同理——写死原路径的断言在
+            // macOS 上过、在 CI 的 Linux 上必红（2026-09-30 实测：CI 首跑红在这里）。
+            assert_eq!(
+                std::fs::read_link(dir.join(SHIM_NAME)).unwrap(),
+                resolved_path(&second),
+                "链接必须指向解析后的目标"
+            );
         }
 
         // 「只含一个名字」是性质不是巧合：目录里多出别的东西时，捷径不生效、照旧清干净
@@ -844,7 +857,7 @@ mod tests {
         );
         // 指向的是原处（绝对化过，故不随 shim 目录解析）
         let link = std::fs::read_link(dir.join(SHIM_NAME)).unwrap();
-        assert_eq!(link, target);
+        assert_eq!(link, resolved_path(&target));
 
         unpin(&home).unwrap();
         assert!(!shim_dir(&home).exists(), "关掉之后不留残迹");
