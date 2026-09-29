@@ -1,0 +1,58 @@
+# push 到 main 即部署到 106（也支持 Actions 页手动 workflow_dispatch）。
+# 流水线：构建前端 dist → cargo release 构建（dist 被 build.rs 内嵌进单二进制）
+#         → ssh 上传二进制（服务器预检版本可执行，glibc 不兼容当场失败、不碰现役服务）
+#         → 服务器端安装、重启 systemd、健康检查。
+# 密钥与主机信息全部走 repo secrets（SSH_PRIVATE_KEY / SSH_KNOWN_HOSTS / DEPLOY_HOST /
+# DEPLOY_USER）；服务器端 sudoers 仅放行 /opt/deploy.sh 的 upload|deploy 两个子命令，
+# CI 专用密钥不能登 shell 做别的——见 deploy 用户与 /etc/sudoers.d/deploy-pipeline。
+name: deploy-106
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+concurrency:
+  group: deploy-106
+  cancel-in-progress: false
+
+jobs:
+  build-and-deploy:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - name: Build frontend
+        run: cd frontend && npm ci --no-audit --no-fund && npm run build
+
+      # 工具链取 rust-toolchain.toml 钉死的 1.98.0，带构建缓存
+      - uses: actions-rust-lang/setup-rust-toolchain@v1
+        with:
+          cache: true
+
+      - name: Build backend
+        run: cargo build --release
+
+      - name: Set up SSH
+        run: |
+          mkdir -p ~/.ssh
+          printf '%s\n' "${{ secrets.SSH_PRIVATE_KEY }}" > ~/.ssh/deploy_key
+          printf '%s\n' "${{ secrets.SSH_KNOWN_HOSTS }}" > ~/.ssh/known_hosts
+          chmod 600 ~/.ssh/deploy_key ~/.ssh/known_hosts
+
+      - name: Upload binary
+        run: |
+          cat target/release/agent-pipeline | ssh -i ~/.ssh/deploy_key \
+            -o BatchMode=yes "${{ secrets.DEPLOY_USER }}@${{ secrets.DEPLOY_HOST }}" \
+            "sudo -n /opt/deploy.sh upload"
+
+      - name: Deploy and verify
+        run: |
+          ssh -i ~/.ssh/deploy_key -o BatchMode=yes \
+            "${{ secrets.DEPLOY_USER }}@${{ secrets.DEPLOY_HOST }}" \
+            "sudo -n /opt/deploy.sh deploy"
