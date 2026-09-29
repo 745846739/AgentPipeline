@@ -1,6 +1,6 @@
 //! E2E 超时与 resume 防连点（testing.md §8）：E2E-14 超时链、E2E-24 resume 防连点。
 //!
-//! 决策 33 / 36 / 64 / 66 / 100 / 122 / §3：假时钟驱动，手动 tick。
+//! 决策 33 / 36 / 64 / 66 / 100 / 122 / 320 / §3：假时钟驱动，手动 tick。
 
 use std::time::Duration;
 
@@ -64,7 +64,7 @@ async fn e2e_14_timeout_chain_kills_retries_then_pends_and_merge_has_no_skip() {
     let handle = tokio::spawn(async move { ex.run("t14").await });
     let run = wait_for_active_run(&f, "t14").await;
 
-    // 心跳停 → 空闲超时 → 杀进程组 → 未耗尽 → 干净对话重试（决策 33 / 64 / 66）
+    // 心跳停 → 空闲超时 → 杀进程组 → 连续第 1 次超时 → 自动续接拉起重试（决策 64 / 66 / 320）
     f.store.set_run_process_group(run.id, 4242).await.unwrap();
     backdate_run(&f.store, run.id, 400, 400).await.unwrap();
     let report = f.scheduler_with(settings.clone()).tick().await.unwrap();
@@ -72,7 +72,7 @@ async fn e2e_14_timeout_chain_kills_retries_then_pends_and_merge_has_no_skip() {
     assert_eq!(f.killer.killed_groups(), vec![4242], "杀整个进程组");
     assert!(
         report.timeout_pending_cursors.is_empty(),
-        "未耗尽不得 pending"
+        "连续第 1 次超时走续接支，不得 pending"
     );
     assert!(
         f.resumes.load(std::sync::atomic::Ordering::SeqCst) >= 1,
@@ -89,35 +89,72 @@ async fn e2e_14_timeout_chain_kills_retries_then_pends_and_merge_has_no_skip() {
     assert_eq!(finished.status, NodeStatus::Timeout);
     handle.abort();
 
-    // attempt = agent_retry_max：耗尽 → pending(timeout) 挂该游标
+    // 决策 320 梯子：挂起看「该节点连续超时的轮数」，attempt 不再参与判断——
+    // run1 已是连续第 1 次（上面那轮），第 2 次自动续接、第 3 次空白重跑，
+    // 都不得挂起；连续第 4 次才 pending(timeout) 交回人工。
     let cursor = f.sole_cursor("t14").await;
-    let run2 = f
+    let mut resumes = f.resumes.load(std::sync::atomic::Ordering::SeqCst);
+    for round in 2..=3u32 {
+        let pg = 4241 + round as i32;
+        let run_n = f
+            .store
+            .insert_run(&NewRun {
+                task_id: "t14".into(),
+                cursor_id: cursor.cursor_id.clone(),
+                stage: cursor.stage,
+                node: cursor.node,
+                attempt: round,
+                agent_type: "main".into(),
+                parent_run_id: None,
+                prompt_template_hash: None,
+                process_group_id: Some(pg),
+            })
+            .await
+            .unwrap();
+        backdate_run(&f.store, run_n, 400, 400).await.unwrap();
+        let report = f.scheduler_with(settings.clone()).tick().await.unwrap();
+        assert!(
+            report.timeout_pending_cursors.is_empty(),
+            "连续第 {round} 次超时走续接/空白重跑支，不得挂起"
+        );
+        assert!(
+            f.killer.killed_groups().contains(&pg),
+            "第 {round} 次超时照样杀进程组 {pg}"
+        );
+        let now = f.resumes.load(std::sync::atomic::Ordering::SeqCst);
+        assert!(now > resumes, "第 {round} 次超时应拉起重试");
+        resumes = now;
+    }
+
+    // 连续第 4 次：耗尽 → pending(timeout) 挂该游标
+    let run4 = f
         .store
         .insert_run(&NewRun {
             task_id: "t14".into(),
             cursor_id: cursor.cursor_id.clone(),
             stage: cursor.stage,
             node: cursor.node,
-            attempt: settings.agent_retry_max,
+            attempt: 4,
             agent_type: "main".into(),
             parent_run_id: None,
             prompt_template_hash: None,
-            process_group_id: Some(4243),
+            process_group_id: Some(4245),
         })
         .await
         .unwrap();
-    backdate_run(&f.store, run2, 400, 400).await.unwrap();
+    backdate_run(&f.store, run4, 400, 400).await.unwrap();
     let report = f.scheduler_with(settings.clone()).tick().await.unwrap();
     assert_eq!(
         report.timeout_pending_cursors,
-        vec![cursor.cursor_id.clone()]
+        vec![cursor.cursor_id.clone()],
+        "连续第 4 次超时挂起交回人工（决策 320）"
     );
     let after = f.store.get_cursor(&cursor.cursor_id).await.unwrap();
     assert_eq!(
         after.pending_reason.as_ref().unwrap().kind,
         PendingKind::Timeout
     );
-    assert!(f.killer.killed_groups().contains(&4243));
+    assert!(f.killer.killed_groups().contains(&4245));
 
     // merge 的 timeout 动作集无 skip（决策 122）
     testkit::seed_task(&f.store, "t14m", "p1").await.unwrap();

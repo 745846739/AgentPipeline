@@ -290,7 +290,7 @@ harness = FakeAgent（§3.2）+ testkit fixture（§3.3）+ 临时 home + 手动
 | E2E-11 | skip 落点矩阵 | 93 / 115 / 86 | architect skip → 分裂；develop-design skip → `waiting_join`+`skipped_to_join`、sync-check 视 readiness=true、下游 prompt 降级；merge 无 skip；skip 不改产出元数据 | P0 |
 | E2E-12 | 并行互不阻塞 | 82 / 89 | develop-design 分支 pending → test-design 照常跑完停在 `waiting_join`；resume 后 join 正常 | P0 |
 | E2E-13 | 中断恢复 | 80 / 113 / 127 | develop.execute 中途 abort → 重启 → executor_owner 清理 → 节点级恢复；并行双游标独立恢复（决策 152：in-process） | P0 |
-| E2E-14 | 超时链 | 33 / 64 / 66 / 100 / 122 | 心跳停 → idle 超时 → 杀进程组（终止器记录）→ 干净对话重试 → 耗尽 → pending(timeout) 挂游标；merge timeout 动作集无 skip；600s 系统命令不被 300s idle 误杀 | P0 |
+| E2E-14 | 超时链 | 33 / 64 / 66 / 100 / 122 / 320 | 心跳停 → idle 超时 → 杀进程组（终止器记录）→ 连续第 1–2 次自动续接、第 3 次空白重跑 → 第 4 次 pending(timeout) 挂游标；merge timeout 动作集无 skip；600s 系统命令不被 300s idle 误杀 | P0 |
 | E2E-15 | judge_disagreement | 134 / 135 | 首判不合格 + 复判合格 → pending(user_decision, judge_disagreement)；continue 特判直接 next_stage（不重跑）；goto execute → attempts+1 | P1 |
 | E2E-16 | design_refs 完整性 | 136 | high 悬空 → blocker → backtrack；medium 悬空 → 仅 warning（sync-check run metadata） | P1 |
 | E2E-17 | conflict_wait | 71 / 102 / 120 | 晚者让步（同秒 id 字典序）；`conflict_task_ids` 全量；全部终态 + 复检无交集 → 自动恢复；纯 name 重合仅 warning | P1 |
