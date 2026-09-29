@@ -241,6 +241,15 @@ pub struct ServerConfig {
     pub port: u16,
     /// 绑定地址（§10.6.5：`[server] host`）。只允许 IP 字面量。
     pub host: String,
+    /// **手机实际访问的那个入口**（决策 334）：反向代理 / 公网域名后面部署时，手机够得着的
+    /// 是代理那一个 origin，而不是本进程绑的 `host:port`（106 上后端绑回环、门外是 Caddy 的
+    /// `https://106.12.12.6:3389`）。
+    ///
+    /// 形状与 `allowed_origins` 同一种：`scheme://host[:port]`、**不带路径**（经
+    /// `normalize_origin` 归一，解析期 fail fast）；CLI `--public-base-url` 覆盖它。
+    /// 设了它，「手机访问」页的配对二维码就指向它；不设时照旧按网卡枚举拼地址。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub public_base_url: Option<String>,
     /// 额外放行的跨源写 origin 白名单（决策 157）。缺省恒含
     /// `http://127.0.0.1:{port}` / `http://localhost:{port}`（决策 128），本键
     /// 用于局域网等**显式扩权**；值须为 `scheme://host[:port]`，尾部斜杠在
@@ -254,6 +263,7 @@ impl Default for ServerConfig {
         ServerConfig {
             port: 8788,
             host: "127.0.0.1".to_string(),
+            public_base_url: None,
             allowed_origins: Vec::new(),
         }
     }
@@ -636,6 +646,12 @@ impl Config {
         for origin in &self.server.allowed_origins {
             normalize_origin(origin)
                 .map_err(|e| Error::Config(format!("[server] allowed_origins 校验失败：{e}")))?;
+        }
+        // 公网入口与白名单同一套形状校验（决策 334）：写错的形态放过去，症状是
+        // 「手机上的二维码指向一个打不开的地址」——那正是这一页最不该出的一种错
+        if let Some(raw) = self.server.public_base_url.as_ref() {
+            normalize_origin(raw)
+                .map_err(|e| Error::Config(format!("[server] public_base_url 校验失败：{e}")))?;
         }
         // 已退场的旧键：`[market] allowed_sources`（决策 194 之前那份 registry 的 origin 白名单）。
         // **拦在这里而不是靠 `deny_unknown_fields`**：那条会报「unknown field `allowed_sources`」，
@@ -1363,6 +1379,10 @@ mod tests {
         let server = ServerConfig::default();
         assert_eq!(server.port, 8788);
         assert_eq!(server.host, "127.0.0.1");
+        assert_eq!(
+            server.public_base_url, None,
+            "缺省没有公网入口（决策 334）：本机 / 局域网直连形态照旧按网卡枚举拼地址"
+        );
     }
 
     /// `[pipeline] env_mode` 走通两层解析，且**只收 `auto` / `deny`**（决策 206）。
@@ -1824,6 +1844,43 @@ mod tests {
             assert!(
                 Config::from_toml(&toml).is_err(),
                 "非法 origin 应 fail fast：{bad}"
+            );
+        }
+    }
+
+    // ── 决策 334：[server] public_base_url（公网入口）──
+
+    /// 键认得出来、缺省是「没有」，且形态校验与 `allowed_origins` 同一套。
+    #[test]
+    fn public_base_url_parses_and_rejects_non_origin_forms() {
+        let cfg = Config::from_toml(
+            r#"
+            [server]
+            public_base_url = "https://106.12.12.6:3389"
+            "#,
+        )
+        .unwrap();
+        assert_eq!(
+            cfg.server.public_base_url.as_deref(),
+            Some("https://106.12.12.6:3389")
+        );
+        // 不配 = None（本机 / 局域网直连形态；不是空串那种「配了但没意义」的第三态）
+        assert!(Config::from_toml("[server]\nport = 8788\n")
+            .unwrap()
+            .server
+            .public_base_url
+            .is_none());
+
+        for bad in [
+            "106.12.12.6:3389",             // 缺 scheme
+            "https://106.12.12.6:3389/app", // 带路径：二维码是 origin 加 `/?pair=…`，多一段路径必然拼错
+            "ftp://106.12.12.6",            // scheme 不支持
+        ] {
+            let toml = format!("[server]\npublic_base_url = \"{bad}\"\n");
+            let err = Config::from_toml(&toml).unwrap_err().to_string();
+            assert!(
+                err.contains("public_base_url"),
+                "报错要点名是哪一行配置：{err}"
             );
         }
     }

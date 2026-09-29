@@ -722,7 +722,12 @@ export interface ServerInfo {
   /** 实际绑定地址（`0.0.0.0` 表示全网卡）。 */
   host: string;
   port: number;
-  /** 仅绑定回环时为 true——手机连不上，分享页需给出开启指引。 */
+  /**
+   * 仅绑定回环时为 true——**默认形态下**手机连不上，分享页需给出开启指引。
+   *
+   * 注意它是**绑定**的事实，不是「手机够不够得着」的判据：配了 `public_base_url`
+   * （决策 334）时外面那道反代就是手机的门，判据收在 `lib/sharePairing.ts::phoneCanReach`。
+   */
   loopback_only: boolean;
   /**
    * `host` 的来源（决策 186）。界面必须能说出「这颗钮按了重启还算不算数」：
@@ -735,6 +740,13 @@ export interface ServerInfo {
    * 手机上的旧书签会因此失效，见 `lib/sharePairing.ts::portFallbackNote`。
    */
   port_source: PortSource;
+  /**
+   * **手机实际访问的入口**（决策 334）：`[server] public_base_url` /
+   * `--public-base-url` 给出的公网 origin；`null` = 没有这一层（手机直连本机 / 局域网）。
+   *
+   * 有它时后端往往只绑回环（外面是 Caddy / Nginx）、地址表里也只有它一项。
+   */
+  public_base_url: string | null;
   addresses: ServerAddress[];
 }
 

@@ -106,3 +106,53 @@ test.describe('手机访问 · 绑定全网卡（决策 186）', () => {
     expectBundleHealthy(bundle);
   });
 });
+
+/**
+ * E2E ⑪b：配了**公网入口**时的「手机访问」页（决策 334）。
+ *
+ * 这一条钉的是 106 上那个真实的尴尬：后端只绑回环、门外是反向代理，而这一页只说
+ * 「手机现在连不上这台机器」并递上一颗按下去会把明文入口装回来的「绑定全网卡」。
+ * 真后端 + 真 `/server-info` + 真二维码端点一起跑，故**字段名在后端与前端之间漂了**
+ * （组件层喂假读数时不会红的那种漂）在这里会红。
+ */
+test.describe('手机访问 · 公网入口（决策 334）', () => {
+  let app: App;
+
+  test.beforeAll(async () => {
+    app = await startApp({
+      script: foremanScript([[]]),
+      providerOnly: true,
+      // 缺省绑定仍是回环（`serve --port 0`）：这正是「绑在回环、门在外面」的形态
+      serverConfig: ['public_base_url = "https://phone.example:3389"'],
+    });
+  });
+
+  test.afterAll(async () => {
+    await app?.stop();
+  });
+
+  test('画的是指向入口的码，不再说「手机连不上」、也不给改绑钮', async ({ page }) => {
+    const bundle = watchBundle(page);
+    await page.goto(`${app.webBase}/#/share`);
+    await settleBundle(page, bundle);
+
+    // ① 二维码指向配置的入口，且带着令牌（这一页在本机打开，令牌读得到）
+    const img = page.getByAltText(/扫码访问 https:\/\/phone\.example:3389\/\?pair=/);
+    await expect(img).toBeVisible();
+    await expect(img).toHaveAttribute(
+      'src',
+      /\/server-info\/qr\.svg\?url=https%3A%2F%2Fphone\.example%3A3389%2F%3Fpair%3D/,
+    );
+    // 地址栏里那一行就是入口（不是私网 eth0 + 后端端口）
+    await expect(page.locator('.picked')).toContainText('https://phone.example:3389/?pair=');
+    // ② 「只绑回环」那两块内容都不在：指引块与那颗会把明文入口装回来的钮
+    await expect(page.locator('.gate')).toHaveCount(0);
+    await expect(page.getByRole('button', { name: /绑定全网卡/ })).toHaveCount(0);
+    await expect(page.getByRole('button', { name: /改回只绑本机/ })).toHaveCount(0);
+    // ③ 文案改口：手机走的是外面那道门，不再是「同一 Wi-Fi」
+    await expect(page.locator('.qr-cap')).toContainText('反向代理');
+    await expect(page.getByText(/由外面那道反向代理转发进来/)).toBeVisible();
+
+    expectBundleHealthy(bundle);
+  });
+});

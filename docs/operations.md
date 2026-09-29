@@ -1509,5 +1509,27 @@ printf '用户名 me\n口令 %s\n' "$PW" > ~/ca-106/basic-auth.txt && chmod 600 
 
 **现状（2026-09-29 晚，切换已完成）。** 106 上的入口现在**只有一条**：**`https://106.12.12.6:3389/`**（Caddy 全站 Basic；443 与 80 也都在听，但被云安全组挡着，放行之后把 URL 里的端口去掉即可）。落地清单：Caddy 2.6.4（EPEL 直装）+ mkcert 叶子证书（IP SAN，2028-12-29 到期，根 CA 私钥只在开发机）+ 全站 `basicauth` + 后端改绑回环（unit 的 `--host 127.0.0.1`）+ 明文入口关闭。**外网实测**：无凭据 401 / 带凭据 200（HTTP/2，返回应用本体）/ 经代理 `/server-info`、`/tasks`、`/notify/settings` 均 200 / `/foreman/stream` 26 秒内见心跳帧 / `http://106.12.12.6:3333/` 已是 `connection refused`。**为什么是 3389**：443 与 80 在云安全组里没放行（服务器侧没有防火墙挡着；外网探测 443/80/8443/8080/8888/8000 一律超时），3389 恰好放行（探测得 `Connection refused` 而非超时，即包能到、只是当时没服务在听）——Caddyfile 写成 `:443, :3389`，将来放行 443 无需改配置。
 
-**一个已知缺口（切换带出来的，如实记）。** 「手机访问」页的**配对二维码**仍按后端自己的绑定地址拼 URL（`server_info.rs::allowed_qr_urls` = 局域网候选 + 回环，形如 `http://192.168.16.2:3333/?pair=…`）：那台机器的 eth0 是私网地址、3333 现在也只在回环上听——**这个二维码已经指向不可达的地址**。推送深链不受影响（那是相对路由 `#/task/…`，由 service worker 按自己的 origin 解析），手机进站直接开 `https://106.12.12.6:3389/` 输一次 Basic 口令即可。真要修得让二维码知道公网 origin（加一个 `public_base_url` 配置键进白名单 + 决策 + 测试），单独立票。另：`~/.zcode/skills/agentpipeline-deploy-106/SKILL.md` 已同步（入口、验证命令、3389 这个事实）。
+**手机访问指向公网入口（决策 334，切换带出来的那个缺口已收口）。** 后端绑回环之后，「手机访问」页原先会走进两条错路：① 判据只看绑定形态，于是永远显示「手机现在连不上这台机器」并递上一颗**按得动**的「绑定全网卡」钮（经反代进来的请求源地址是 `127.0.0.1`，回环豁免命中）——按下去等于把刚关掉的明文入口装回来；② 配对二维码按后端自己的绑定地址拼 URL（网卡候选 + 回环），那台机器的 eth0 是私网、3333 又只在回环上听，指向的是不可达地址。修法是给应用一个**公网入口**（`[server] public_base_url`，形状与 `allowed_origins` 同一种：`scheme://host[:port]`、不带路径）：
+
+```bash
+# ① 106：把入口写进 unit 的启动参数（那台机器上没有 config.toml，绑定本来就由 unit 定）
+#    老二进制不认识这个参数会同一条规矩**静默忽略**（`parse_serve_args` 的宽容姿态），
+#    故这一步可以先做、也可以在部署之后做。
+ssh -i ~/.ssh/106.key -o IdentitiesOnly=yes root@106.12.12.6 '
+  cp /etc/systemd/system/agent-pipeline.service /root/agent-pipeline.service.bak-$(date +%Y%m%d-%H%M)
+  sed -i "s|--host 127.0.0.1 --port 3333|--host 127.0.0.1 --port 3333 --public-base-url https://106.12.12.6:3389|" \
+    /etc/systemd/system/agent-pipeline.service
+  systemctl daemon-reload && systemctl restart agent-pipeline && systemctl is-active agent-pipeline'
+
+# ② 外网验证：/server-info 要同时给出「只绑回环」与那个入口，地址表里只有它一项
+curl -sS --cacert ~/ca-106/rootCA.pem -u 'me:<口令>' https://106.12.12.6:3389/server-info \
+  | python3 -c 'import json,sys; d=json.load(sys.stdin); print(d["loopback_only"], d["public_base_url"], d["addresses"])'
+#   → True https://106.12.12.6:3389 [{'interface': '公网入口', 'url': 'https://106.12.12.6:3389', 'preferred': True}]
+
+# ③ 二维码端点认这个入口（带令牌的配对 URL 与原样渲染）
+curl -sS -o /dev/null -w '%{http_code}\n' --cacert ~/ca-106/rootCA.pem -u 'me:<口令>' \
+  'https://106.12.12.6:3389/server-info/qr.svg?url=https%3A%2F%2F106.12.12.6%3A3389%2F%3Fpair%3Dtest'   # → 200
+```
+
+改完这一页应当：画出**指向 `https://106.12.12.6:3389/?pair=…` 的二维码**、不再出现「手机现在连不上这台机器」与两颗改绑钮、底部改为说清入口来自哪里。**注意这一页仍要在能读到令牌的入口打开**（106 上经反代进来的请求算本机，故从任何设备进站都读得到；见下面的警告框）。另外：`~/.zcode/skills/agentpipeline-deploy-106/SKILL.md` 已同步（入口、验证命令、3389 这个事实、这一条参数）。
 

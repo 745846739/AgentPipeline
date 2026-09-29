@@ -895,6 +895,11 @@ def validate_stage_config(cfg: StageAgentConfig, baseline: SystemBaseline, provi
 [server]
 host = "127.0.0.1"
 port = 8788
+# 手机实际访问的入口（决策 334）：反向代理 / 公网域名后面部署时（后端绑回环、外面是
+# Caddy / Nginx），「手机访问」页的配对二维码指向它。形状与 allowed_origins 同一种：
+# scheme://host[:port]、**不带路径**；写错在解析期 fail fast（CLI `--public-base-url` 覆盖它）。
+# 不配 = 没有这一层，手机直连本机 / 局域网（照旧按网卡枚举拼地址）。
+# public_base_url = "https://106.12.12.6:3389"
 
 [pipeline]
 validate_retry_max = 3

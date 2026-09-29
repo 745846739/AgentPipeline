@@ -1,6 +1,13 @@
 import { describe, expect, it } from 'vitest';
 import { ApiError } from '../api/client';
-import { bindSourceLabel, isPairingRequired, portFallbackNote, sharePanel } from './sharePairing';
+import {
+  bindSourceLabel,
+  isPairingRequired,
+  phoneCanReach,
+  portFallbackNote,
+  qrCaption,
+  sharePanel,
+} from './sharePairing';
 
 /**
  * 「手机访问」页的形态判定（决策 189）。
@@ -15,10 +22,19 @@ const addr = [
   { url: 'http://10.0.0.5:8788', preferred: false },
 ];
 
+// 服务读数的三种形态（决策 334 起 `public_base_url` 是必填的一栏）。
+
+/** 绑全网卡、没有公网入口：手机直连（决策 167 的经典形态）。 */
+const LAN = { loopback_only: false, public_base_url: null };
+/** 只绑回环、没有公网入口：手机真的够不着（决策 186 的改绑指引）。 */
+const LOOPBACK = { loopback_only: true, public_base_url: null };
+/** 只绑回环**但有公网入口**：106 的形态——后端在回环上听，门外是 Caddy（决策 334）。 */
+const PUBLIC_ENTRY = { loopback_only: true, public_base_url: 'https://106.12.12.6:3389' };
+
 describe('sharePanel（决策 189）', () => {
   it('有地址、有令牌 → 画带令牌的码，形状与后端 pairing_url 同约定', () => {
     const panel = sharePanel({
-      info: { loopback_only: false },
+      info: LAN,
       addresses: addr,
       selected: null,
       token: 'tok',
@@ -28,7 +44,7 @@ describe('sharePanel（决策 189）', () => {
 
   it('选中项优先于后端推荐的首项', () => {
     const panel = sharePanel({
-      info: { loopback_only: false },
+      info: LAN,
       addresses: addr,
       selected: 'http://10.0.0.5:8788',
       token: 'tok',
@@ -38,7 +54,7 @@ describe('sharePanel（决策 189）', () => {
 
   it('令牌里的保留字符被编码（URL 形状不依赖令牌字符集的巧合）', () => {
     const panel = sharePanel({
-      info: { loopback_only: false },
+      info: LAN,
       addresses: addr,
       selected: null,
       token: 'a/b+c',
@@ -48,7 +64,7 @@ describe('sharePanel（决策 189）', () => {
 
   it('有地址、没令牌 → 指引块，**不画码**（这是本条决策的裁决）', () => {
     const panel = sharePanel({
-      info: { loopback_only: false },
+      info: LAN,
       addresses: addr,
       selected: null,
       token: null,
@@ -58,7 +74,7 @@ describe('sharePanel（决策 189）', () => {
 
   it('令牌是空串也当没取到——不画一张配不上的码', () => {
     const panel = sharePanel({
-      info: { loopback_only: false },
+      info: LAN,
       addresses: addr,
       selected: null,
       token: '',
@@ -68,7 +84,7 @@ describe('sharePanel（决策 189）', () => {
 
   it('只绑回环 → 改绑指引优先于一切（手机连不上，画了也扫不开）', () => {
     const panel = sharePanel({
-      info: { loopback_only: true },
+      info: LOOPBACK,
       addresses: [],
       selected: null,
       token: 'tok',
@@ -79,7 +95,7 @@ describe('sharePanel（决策 189）', () => {
   it('枚举不出地址 → 无地址指引；选中项还留着也无处可指', () => {
     expect(
       sharePanel({
-        info: { loopback_only: false },
+        info: LAN,
         addresses: [],
         selected: 'http://192.168.1.10:8788',
         token: 'tok',
@@ -90,6 +106,58 @@ describe('sharePanel（决策 189）', () => {
   it('服务读数还没到（info 为 null）不当作回环形态', () => {
     const panel = sharePanel({ info: null, addresses: addr, selected: null, token: 'tok' });
     expect(panel.kind).toBe('paired-qr');
+  });
+});
+
+/**
+ * 公网入口（决策 334）：手机上那个「扫码进去还是连不上」的抱怨，根因是这一页把
+ * **绑定形态**当成了**可达性**——106 上后端只绑回环（门外是 Caddy），于是这一页永远说
+ * 「手机现在连不上这台机器」，还递上一颗按下去会把刚关掉的明文入口装回来的钮。
+ *
+ * 判据因此换成 `phoneCanReach`：有一个手机走得到的入口就够了，绑在哪是另一回事。
+ */
+describe('phoneCanReach（决策 334：绑回环 ≠ 手机够不着）', () => {
+  it('绑全网卡 → 够得着（三种形态里唯一不发公网入口的也行）', () => {
+    expect(phoneCanReach(LAN)).toBe(true);
+  });
+
+  it('只绑回环、没配公网入口 → 够不着（决策 186 的改绑指引仍然成立）', () => {
+    expect(phoneCanReach(LOOPBACK)).toBe(false);
+  });
+
+  it('只绑回环但配了公网入口 → 够得着（106 的形态：门在外面）', () => {
+    expect(phoneCanReach(PUBLIC_ENTRY)).toBe(true);
+  });
+
+  it('读数还没到 → 不下结论（与「null 不当作回环」同一姿态）', () => {
+    expect(phoneCanReach(null)).toBe(true);
+  });
+
+  it('配了公网入口就走二维码那条路，而不是改绑指引', () => {
+    const panel = sharePanel({
+      info: PUBLIC_ENTRY,
+      addresses: [{ url: 'https://106.12.12.6:3389' }],
+      selected: null,
+      token: 'tok',
+    });
+    expect(panel).toEqual({
+      kind: 'paired-qr',
+      target: 'https://106.12.12.6:3389/?pair=tok',
+    });
+  });
+});
+
+describe('qrCaption（决策 334：这句话说错了，人就往错的方向查）', () => {
+  it('有公网入口 → 说清走的是那个入口、后端只绑回环', () => {
+    const text = qrCaption(PUBLIC_ENTRY);
+    expect(text).toContain('https://106.12.12.6:3389');
+    expect(text).toContain('反向代理');
+    expect(text).not.toContain('同一 Wi-Fi');
+  });
+
+  it('没有公网入口 → 照旧是「同一局域网」（决策 167 的形态一字不动）', () => {
+    expect(qrCaption(LAN)).toContain('同一 Wi-Fi');
+    expect(qrCaption(null)).toContain('同一 Wi-Fi');
   });
 });
 

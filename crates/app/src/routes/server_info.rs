@@ -5,7 +5,9 @@
 //! - `GET /server-info`：JSON，含绑定 host / 端口 / 候选局域网地址 / 当前是否
 //!   仅回环绑定（决定分享页是否该提示「需要绑定 0.0.0.0」）/ **这个 host 是谁定的**
 //!   （启动参数 / 界面设置 / 配置文件，决策 186）/ **这个端口是谁给的**（决策 213：
-//!   `fallback` = 首选端口被占、退让到了内核随机端口，手机上的旧书签会因此失效）；
+//!   `fallback` = 首选端口被占、退让到了内核随机端口，手机上的旧书签会因此失效）/
+//!   **手机实际访问的那个入口**（决策 334：反向代理后面部署时是 `public_base_url`
+//!   那一个 origin，不是本进程绑的地址）；
 //! - `GET /server-info/qr.svg`：把指定 URL 渲染成 SVG 二维码，供分享页 `<img>`
 //!   直接引用——前端不必引入 QR 库，也不用把二维码画进 canvas；
 //! - `POST /server/lan`（决策 186）：**界面上的那颗钮**——把绑定切成全网卡或只回环，
@@ -45,7 +47,16 @@ pub struct ServerInfo {
     /// `fallback` 是唯一需要界面出声的一档：首选端口被别的进程占着，这个端口是内核
     /// 临时给的，**重启后会变**——手机上存过的地址这次就是打不开的原因。
     pub port_source: String,
+    /// **手机实际访问的入口**（决策 334）：`[server] public_base_url` /
+    /// `--public-base-url` 归一后的 origin；`null` = 没有这一层，手机直连本机 / 局域网。
+    ///
+    /// 有它时分享页**不再**把「只绑回环」读成「手机连不上」——外面那道反向代理正是给手机
+    /// 准备的入口，`addresses` 也随之只列它（网卡地址在那种部署下对手机毫无意义）。
+    pub public_base_url: Option<String>,
     /// 候选局域网地址，已按推荐度排序（`lan::rank_ipv4`）。
+    ///
+    /// 配了 `public_base_url` 时这里**只有那一项**（标签见 [`PUBLIC_ENTRY_LABEL`]）：
+    /// 一个手机够不着的地址列在「首选不通时可换一个试试」下面，是把误导当备选。
     pub addresses: Vec<AddressEntry>,
 }
 
@@ -78,7 +89,12 @@ fn server_info(state: &AppState) -> ServerInfo {
         port_source: state.port_source().as_str().to_string(),
         host,
         port: state.port,
-        addresses: build_addresses(&lan::lan_addresses(), state.port),
+        public_base_url: state.public_base_url.clone(),
+        addresses: build_addresses(
+            &lan::lan_addresses(),
+            state.port,
+            state.public_base_url.as_deref(),
+        ),
     }
 }
 
@@ -315,8 +331,27 @@ fn resolve_qr_target(
     }
 }
 
+/// 配了公网入口时，地址表里那一项的「网卡名」栏位（`interface` 本义是诊断用的网卡名，
+/// 这一项没有网卡）。界面在只有一项时不渲染这张表，故它只在排查（读 JSON / 日志）时露面。
+pub const PUBLIC_ENTRY_LABEL: &str = "公网入口";
+
 /// 把候选地址转成响应项（含端口拼装）。抽成纯函数便于单测。
-fn build_addresses(addresses: &[lan::LanAddress], port: u16) -> Vec<AddressEntry> {
+///
+/// `public_base_url` 有值时**取代**网卡枚举（决策 334）：那种部署下手机走的是代理那一条路，
+/// 后端绑的 `host:port` 与网卡地址它一个也够不着——把它们列在「首选不通时可换一个试试」
+/// 旁边，只会让人拿着扫不开的码反复试。
+fn build_addresses(
+    addresses: &[lan::LanAddress],
+    port: u16,
+    public_base_url: Option<&str>,
+) -> Vec<AddressEntry> {
+    if let Some(url) = public_base_url {
+        return vec![AddressEntry {
+            interface: PUBLIC_ENTRY_LABEL.to_string(),
+            url: url.to_string(),
+            preferred: true,
+        }];
+    }
     addresses
         .iter()
         .map(|a| AddressEntry {
@@ -327,18 +362,39 @@ fn build_addresses(addresses: &[lan::LanAddress], port: u16) -> Vec<AddressEntry
         .collect()
 }
 
-/// 允许被编码成二维码的 origin 集合：局域网候选地址 + 回环地址。
+/// 允许被编码成二维码的 origin 集合：**公网入口 + 局域网候选地址 + 回环地址**。
 ///
 /// 返回的字符串本身就是 origin 形态（`scheme://host:port`），既可直接作为
 /// [`resolve_qr_target`] 的白名单，也可在「未指定 url」时直接当默认地址渲染。
 /// 回环也在集合内，是为了让「本机打开验证」这件事能复用同一端点。
+///
+/// 公网入口排在最前（决策 334）：它同时是「未指定 url」时的默认目标——配了它，手机访问页
+/// 那张码就该指向外面那道门，而不是后端自己绑的那个（代理后面往往是回环）地址。
 fn allowed_qr_urls(state: &AppState) -> Vec<String> {
-    let mut urls: Vec<String> = build_addresses(&lan::lan_addresses(), state.port)
-        .into_iter()
-        .map(|a| a.url)
-        .collect();
-    urls.push(format!("http://127.0.0.1:{}", state.port));
-    urls.push(format!("http://localhost:{}", state.port));
+    qr_whitelist(
+        state.public_base_url.as_deref(),
+        &lan::lan_addresses(),
+        state.port,
+    )
+}
+
+/// [`allowed_qr_urls`] 的纯函数本体（便于单测）：公网入口 → 网卡候选 → 回环两个。
+fn qr_whitelist(
+    public_base_url: Option<&str>,
+    addresses: &[lan::LanAddress],
+    port: u16,
+) -> Vec<String> {
+    let mut urls: Vec<String> = Vec::new();
+    if let Some(public) = public_base_url {
+        urls.push(public.to_string());
+    }
+    urls.extend(
+        build_addresses(addresses, port, None)
+            .into_iter()
+            .map(|a| a.url),
+    );
+    urls.push(format!("http://127.0.0.1:{port}"));
+    urls.push(format!("http://localhost:{port}"));
     urls
 }
 
@@ -365,9 +421,53 @@ mod tests {
 
     #[test]
     fn addresses_carry_port_in_url() {
-        let built = build_addresses(&[addr("en0", "192.168.1.10", true)], 8787);
+        let built = build_addresses(&[addr("en0", "192.168.1.10", true)], 8787, None);
         assert_eq!(built[0].url, "http://192.168.1.10:8787");
         assert!(built[0].preferred);
+    }
+
+    /// 公网入口在时**取代**网卡枚举（决策 334）：手机走代理那条路，后端绑的地址它够不着。
+    #[test]
+    fn public_entry_replaces_the_interface_enumeration() {
+        let built = build_addresses(
+            &[addr("en0", "192.168.1.10", true)],
+            8787,
+            Some("https://106.12.12.6:3389"),
+        );
+        assert_eq!(built.len(), 1, "只列公网入口，不列手机够不着的网卡地址");
+        assert_eq!(built[0].url, "https://106.12.12.6:3389");
+        assert!(built[0].preferred, "它就该是首选（也只会是唯一一项）");
+        assert_eq!(built[0].interface, PUBLIC_ENTRY_LABEL);
+    }
+
+    /// 公网入口进白名单，且排在首位（= 未指定 url 时的默认目标，决策 334）。
+    #[test]
+    fn public_entry_leads_the_qr_whitelist() {
+        let lan = [addr("en0", "192.168.1.10", true)];
+        let without = qr_whitelist(None, &lan, 8787);
+        assert_eq!(
+            without.first().map(String::as_str),
+            Some("http://192.168.1.10:8787"),
+            "没配公网入口时首位是首选网卡地址（手机直连的形态）"
+        );
+        assert_eq!(
+            without.last().map(String::as_str),
+            Some("http://localhost:8787"),
+            "回环两项恒在：本机打开验证要复用同一端点"
+        );
+
+        let with = qr_whitelist(Some("https://106.12.12.6:3389"), &lan, 8787);
+        assert_eq!(
+            with.first().map(String::as_str),
+            Some("https://106.12.12.6:3389"),
+            "公网入口排最前：配了它，默认那张码就该指外面那道门"
+        );
+        // 配对 URL（origin + `?pair=`）必须落在白名单里，否则手机上那张码根本渲染不出来
+        assert!(qr_url_allowed(
+            &pairing_url("https://106.12.12.6:3389", "TOK"),
+            &with
+        ));
+        assert!(!qr_url_allowed("https://evil.example/?pair=TOK", &with));
     }
 
     #[test]
@@ -479,6 +579,7 @@ mod tests {
             loopback_only: false,
             bind_source: "settings".into(),
             port_source: "fallback".into(),
+            public_base_url: None,
             addresses: vec![AddressEntry {
                 interface: "en0".into(),
                 url: "http://192.168.1.10:8787".into(),

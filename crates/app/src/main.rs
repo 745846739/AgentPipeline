@@ -33,10 +33,14 @@ async fn main() -> anyhow::Result<()> {
 
 fn print_help() {
     println!(
-        "用法：agent-pipeline [serve] [--port <PORT>] [--host <IP>] [--allowed-origin <ORIGIN>]"
+        "用法：agent-pipeline [serve] [--port <PORT>] [--host <IP>] \
+         [--public-base-url <ORIGIN>] [--allowed-origin <ORIGIN>]"
     );
     println!("  --port <PORT>              覆盖 [server] port（0 = 内核随机分配）");
     println!("  --host <IP>                覆盖 [server] host（局域网访问用 0.0.0.0）");
+    println!("  --public-base-url <ORIGIN> 覆盖 [server] public_base_url（决策 334）：");
+    println!("                             反向代理 / 公网入口后面部署时，手机访问页的二维码");
+    println!("                             指向它，如 --public-base-url https://example.com:3389");
     println!("  --allowed-origin <ORIGIN>  额外放行的跨源写 origin，可重复（决策 157）：");
     println!("                             局域网浏览器要操作写接口，需放行其页面 origin，");
     println!("                             如 --allowed-origin http://192.168.1.10:8788");
@@ -65,6 +69,12 @@ fn parse_serve_args(args: &[String]) -> anyhow::Result<ServeOptions> {
                     Some(take_value()?.parse::<u16>().context("--port 需要数字")?);
             }
             "--host" => options.host_override = Some(take_value()?),
+            "--public-base-url" => {
+                let raw = take_value()?;
+                let url = normalize_origin(&raw)
+                    .map_err(|e| anyhow::anyhow!("--public-base-url 无效：{e}"))?;
+                options.public_base_url_override = Some(url);
+            }
             "--allowed-origin" => {
                 let raw = take_value()?;
                 for part in raw.split(',').map(str::trim).filter(|p| !p.is_empty()) {
@@ -139,7 +149,44 @@ mod tests {
         let options = parse_serve_args(&[]).unwrap();
         assert_eq!(options.port_override, None);
         assert_eq!(options.host_override, None);
+        assert_eq!(options.public_base_url_override, None);
         assert!(options.extra_allowed_origins.is_empty());
+    }
+
+    /// 公网入口（决策 334）：`--public-base-url` 认两种写法、经 `normalize_origin` 归一，
+    /// 非法形态**启动期**就失败（不是等到手机上扫出一张打不开的码）。
+    #[test]
+    fn serve_args_accept_public_base_url_in_both_forms() {
+        let split: Vec<String> = ["--public-base-url", "HTTPS://106.12.12.6:3389/"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        assert_eq!(
+            parse_serve_args(&split)
+                .unwrap()
+                .public_base_url_override
+                .as_deref(),
+            Some("https://106.12.12.6:3389"),
+            "归一：小写化 + 剥尾部斜杠（否则二维码会拼出 `//?pair=…`）"
+        );
+        let inline: Vec<String> = ["--public-base-url=https://ap.example.com"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        assert_eq!(
+            parse_serve_args(&inline)
+                .unwrap()
+                .public_base_url_override
+                .as_deref(),
+            Some("https://ap.example.com")
+        );
+        for bad in ["106.12.12.6:3389", "https://ap.example.com/app"] {
+            let args: Vec<String> = vec!["--public-base-url".into(), bad.into()];
+            assert!(
+                parse_serve_args(&args).is_err(),
+                "非法入口形态应启动期失败：{bad}"
+            );
+        }
     }
 
     #[test]

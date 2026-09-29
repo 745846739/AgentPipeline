@@ -8467,3 +8467,113 @@ async fn the_notify_settings_read_stays_open_while_the_subscription_family_is_gu
     assert_eq!(status, StatusCode::OK, "{body}");
     assert_eq!(body["vapid_private_key"], "", "没生成过时是空串：{body}");
 }
+
+/* ─────────── 公网入口（决策 334）：反向代理 / 公网域名后面的「手机访问」 ─────────── */
+
+/// 配了 `[server] public_base_url` 时，「手机访问」页拿到的三个事实必须同时成立：
+/// ① 后端**仍然**只绑回环（`loopback_only = true`，这是绑定的事实）；
+/// ② `public_base_url` 如实上报（手机走的是外面那道门）；
+/// ③ 地址表里**只剩它一项**（网卡地址对手机毫无意义，列在「换一个试试」旁边只会误导）。
+///
+/// 这三条合起来正是前端判据的输入：**回环 + 公网入口 ≠ 手机连不上**。
+#[tokio::test]
+async fn server_info_reports_the_public_entry_alongside_a_loopback_bind() {
+    let home = TestHome::new().unwrap();
+    let (store, _clock) = home.setup().await.unwrap();
+    let state = AppState::new(store, home.home().clone(), Settings::default(), PORT)
+        .with_public_base_url(Some("https://106.12.12.6:3389".to_string()));
+    let router = build_router(state);
+
+    let (status, body) = json_body(
+        router
+            .clone()
+            .oneshot(request("GET", "/server-info").body(Body::empty()).unwrap())
+            .await
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["loopback_only"], true, "绑定事实不因配了入口而改变");
+    assert_eq!(body["public_base_url"], "https://106.12.12.6:3389");
+    assert_eq!(
+        body["addresses"].as_array().map(Vec::len),
+        Some(1),
+        "只列公网入口：{body}"
+    );
+    assert_eq!(body["addresses"][0]["url"], "https://106.12.12.6:3389");
+    assert_eq!(body["addresses"][0]["preferred"], true);
+}
+
+/// 没配公网入口时，那个字段是 `null` 而**不是空串**——界面据它分支「有没有这一层」，
+/// 第三态（配了个没意义的空值）会让「本机 / 局域网直连」这条既有形态无从判定。
+#[tokio::test]
+async fn server_info_reports_no_public_entry_as_null() {
+    let api = api().await;
+    let (status, body) = get(&api, "/server-info").await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert!(body["public_base_url"].is_null(), "{body}");
+}
+
+/// 二维码端点认公网入口（含带令牌的配对 URL 形状）——手机扫的那张码指的就是它。
+/// 反面同批：白名单之外的 origin 照旧 400（拓宽默认目标不等于放开任意 URL）。
+#[tokio::test]
+async fn qr_svg_accepts_the_public_entry_and_still_rejects_strangers() {
+    let home = TestHome::new().unwrap();
+    let (store, _clock) = home.setup().await.unwrap();
+    let state = AppState::new(store, home.home().clone(), Settings::default(), PORT)
+        .with_public_base_url(Some("https://106.12.12.6:3389".to_string()));
+    let router = build_router(state);
+
+    let paired = app::routes::server_info::pairing_url("https://106.12.12.6:3389", "PAIRTOKEN");
+    let (status, _) = json_body(
+        router
+            .clone()
+            .oneshot(
+                request(
+                    "GET",
+                    &format!("/server-info/qr.svg?url={}", encode_query_value(&paired)),
+                )
+                .body(Body::empty())
+                .unwrap(),
+            )
+            .await
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "公网入口 + 令牌应能编码成二维码");
+
+    // 不指定 url 时默认目标就是它（白名单首位）——同样渲染得出来
+    let (status, _) = json_body(
+        router
+            .clone()
+            .oneshot(
+                request("GET", "/server-info/qr.svg")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "缺省目标应是公网入口");
+
+    let (status, body) = json_body(
+        router
+            .oneshot(
+                request(
+                    "GET",
+                    "/server-info/qr.svg?url=https%3A%2F%2Fevil.example%2F%3Fpair%3Dx",
+                )
+                .body(Body::empty())
+                .unwrap(),
+            )
+            .await
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::BAD_REQUEST,
+        "白名单之外照旧拒绝：{body}"
+    );
+}

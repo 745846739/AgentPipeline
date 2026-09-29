@@ -10,6 +10,7 @@ function info(host: string): ServerInfo {
     loopback_only: host === '127.0.0.1',
     bind_source: 'settings',
     port_source: 'config',
+    public_base_url: null,
     addresses: [],
   };
 }

@@ -124,6 +124,12 @@ pub struct AppState {
     pub rebind: Option<RebindTx>,
     /// 配置 / CLI 注入的额外放行 origin（决策 157），与缺省本机集合合并。
     pub extra_allowed_origins: Vec<String>,
+    /// **手机实际访问的入口**（决策 334）：`[server] public_base_url` / `--public-base-url`
+    /// 归一后的 origin；`None` = 没有这一层（本机 / 局域网直连，分享页按网卡枚举拼地址）。
+    ///
+    /// 与 `bind_host` 不同，它**运行期不可改**（改绑是「服务听哪儿」，这个是「外面从哪儿进来」，
+    /// 由部署形态决定），故是常量而不是共享单元。
+    pub public_base_url: Option<String>,
     /// 技能来源仓的访问层（决策 194——本 effort 唯一新增接缝，取代票 10 的 `MarketClient`）。
     ///
     /// **不是 `Option`**：GitHub 模式下它没有"没配就用不了"的形态（URL 由 `owner/repo` 拼，
@@ -179,6 +185,7 @@ impl AppState {
             bind_source: Arc::new(std::sync::RwLock::new(BindSource::Config)),
             rebind: None,
             extra_allowed_origins: Vec::new(),
+            public_base_url: None,
             repo: Arc::new(Libgit2Repo::default()),
             configured_repos: Vec::new(),
             market_override: Arc::new(std::sync::RwLock::new(None)),
@@ -354,6 +361,12 @@ impl AppState {
     /// 传入值应已过 `normalize_origin` 归一。
     pub fn with_allowed_origins(mut self, origins: Vec<String>) -> Self {
         self.extra_allowed_origins = origins;
+        self
+    }
+
+    /// 注入公网入口 origin（决策 334）。传入值应已过 `normalize_origin` 归一。
+    pub fn with_public_base_url(mut self, url: Option<String>) -> Self {
+        self.public_base_url = url;
         self
     }
 

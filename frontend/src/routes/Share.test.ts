@@ -36,6 +36,7 @@ const lanInfo: ServerInfo = {
   loopback_only: false,
   bind_source: 'settings',
   port_source: 'config',
+  public_base_url: null,
   addresses: [{ interface: 'en0', url: 'http://192.168.1.10:8788', preferred: true }],
 };
 
@@ -89,7 +90,7 @@ describe('手机访问页 · 没有配对令牌时不画码（决策 189）', ()
     expect(screen.queryByAltText(/扫码访问/)).toBeNull();
   });
 
-  it('只绑回环：仍是改绑指引（决策 186 的行为不被这次改动挤掉）', async () => {
+  it('只绑回环（没有公网入口）：仍是改绑指引（决策 186 的行为不被这次改动挤掉）', async () => {
     mocks.getServerInfo.mockResolvedValue({
       ...lanInfo,
       host: '127.0.0.1',
@@ -103,6 +104,36 @@ describe('手机访问页 · 没有配对令牌时不画码（决策 189）', ()
     await screen.findByText('手机现在连不上这台机器');
     expect(screen.queryByAltText(/扫码访问/)).toBeNull();
     expect(screen.getByRole('button', { name: /绑定全网卡/ })).toBeTruthy();
+  });
+
+  /**
+   * 106 的形态（决策 334）：后端只绑回环、门外是 Caddy 的公网入口。
+   *
+   * 这一页此前在这里说「手机现在连不上这台机器」并递上「绑定全网卡」——按下去不但治不了
+   * 病，还会把刚关掉的明文入口装回来（经反向代理进来的请求在守卫眼里是回环，那颗钮按得动）。
+   * 现在它该画出指向公网入口的码，且**没有**那颗钮。
+   */
+  it('只绑回环但有公网入口：画指向入口的码，不再劝你去绑全网卡', async () => {
+    mocks.getServerInfo.mockResolvedValue({
+      ...lanInfo,
+      host: '127.0.0.1',
+      loopback_only: true,
+      bind_source: 'startup',
+      public_base_url: 'https://106.12.12.6:3389',
+      addresses: [{ interface: '公网入口', url: 'https://106.12.12.6:3389', preferred: true }],
+    });
+    mocks.fetchPairingToken.mockResolvedValue({ token: 'tok' });
+    render(Share);
+
+    const img = await screen.findByAltText('扫码访问 https://106.12.12.6:3389/?pair=tok');
+    expect(img.getAttribute('src')).toContain('pair%3Dtok');
+    // 那句「手机现在连不上这台机器」与它的钮都不该出现
+    expect(screen.queryByText('手机现在连不上这台机器')).toBeNull();
+    expect(screen.queryByRole('button', { name: /绑定全网卡/ })).toBeNull();
+    expect(screen.queryByRole('button', { name: /改回只绑本机/ })).toBeNull();
+    // 换成说清入口与「怎么改入口」
+    expect(screen.getByText(/由外面那道反向代理转发进来/)).toBeTruthy();
+    expect(screen.getByText('--public-base-url')).toBeTruthy();
   });
 
   it('端口是退让来的：页面上说清「这次为什么变了」（决策 213）', async () => {

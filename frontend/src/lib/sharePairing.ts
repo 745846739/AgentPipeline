@@ -16,11 +16,11 @@ import type { ServerInfo } from '../api/types';
  */
 
 /** 本模块用到的服务读数（生产是 `GET /server-info` 的应答）。 */
-export type ShareInfo = Pick<ServerInfo, 'loopback_only'>;
+export type ShareInfo = Pick<ServerInfo, 'loopback_only' | 'public_base_url'>;
 
 /** 页面该呈现的形态。 */
 export type SharePanel =
-  /** 服务只绑回环：手机根本连不上，先给运行期改绑的入口（决策 186）。 */
+  /** 服务只绑回环**且没有公网入口**：手机根本连不上，先给运行期改绑的入口（决策 186）。 */
   | { kind: 'loopback-gate' }
   /** 已绑全网卡但枚举不出可用地址：给可手动输入的地址形状。 */
   | { kind: 'no-address-gate' }
@@ -30,7 +30,22 @@ export type SharePanel =
   | { kind: 'paired-qr'; target: string };
 
 /**
- * 判定顺序：绑定形态 → 有没有地址 → 有没有令牌。
+ * 手机够不够得着这个服务（决策 334）——**判据是「有没有一个它能走到的入口」，不是「绑在哪」**。
+ *
+ * 屏幕上那句「手机现在连不上这台机器」此前只看 `loopback_only`，于是 106（后端绑回环、
+ * 门外是 Caddy 的 `https://106.12.12.6:3389`）上这一页**永远**这么说，还递上一颗
+ * 「绑定全网卡」的钮：按下去不但治不了病（手机走的是外面那道门），还会把只该在回环上听的
+ * 后端重新暴露到全网卡——把一条已经关掉的明文入口装回来。配了公网入口时它就该闭嘴。
+ *
+ * 采集策略（用户 2026-09-29「修复手机访问的问题」；决策 333 记的就是这条缺口）。
+ */
+export function phoneCanReach(info: ShareInfo | null): boolean {
+  if (!info) return true; // 读数还没到：别先下结论，交给后面的分支（与「null 不当作回环」同一姿态）
+  return Boolean(info.public_base_url) || !info.loopback_only;
+}
+
+/**
+ * 判定顺序：手机够不够得着 → 有没有地址 → 有没有令牌。
  *
  * 前两项各自对应「这一页的用途本身不成立」，令牌那条是决策 189 的裁决。地址表为空时
  * 直接落到无地址指引：此时选中项即便还留着也无处可指（`selected` 只能来自地址表）。
@@ -43,11 +58,24 @@ export function sharePanel(input: {
   /** 配对令牌；`null` = 没取到（未配对 / 这页不是从本机打开的）。 */
   token: string | null;
 }): SharePanel {
-  if (input.info?.loopback_only) return { kind: 'loopback-gate' };
+  if (!phoneCanReach(input.info)) return { kind: 'loopback-gate' };
   if (input.addresses.length === 0) return { kind: 'no-address-gate' };
   if (!input.token) return { kind: 'local-only-gate' };
   const base = input.selected ?? input.addresses[0]?.url ?? '';
   return { kind: 'paired-qr', target: pairedUrl(base, input.token) };
+}
+
+/**
+ * 二维码那一栏底下那句话（决策 334）：手机是经外面那道门进来，还是得跟这台机器同网。
+ *
+ * 说错的代价不是「不好看」：106 上原文写着「手机需与电脑在同一局域网（同一 Wi-Fi）」，
+ * 而手机走的其实是公网入口——照这句话去查 Wi-Fi，永远查不出那张码为什么扫不动。
+ */
+export function qrCaption(info: ShareInfo | null): string {
+  if (info?.public_base_url) {
+    return `手机经公网入口 ${info.public_base_url} 访问（服务自己只绑回环，由反向代理转发）；进站后实时进度照旧走 SSE。`;
+  }
+  return '手机需与电脑在同一局域网（同一 Wi-Fi）。扫码后可直接使用看板与任务详情，实时进度经 SSE 推送。';
 }
 
 /**

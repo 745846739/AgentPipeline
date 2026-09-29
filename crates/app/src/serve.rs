@@ -324,6 +324,9 @@ pub struct ServeOptions {
     /// CLI `--allowed-origin` 注入的额外放行 origin（已归一）；
     /// 与 `[server] allowed_origins` 取并集，缺省本机集合恒在（决策 128）。
     pub extra_allowed_origins: Vec<String>,
+    /// CLI `--public-base-url`（决策 334）；缺省回落 `[server] public_base_url`。
+    /// 反向代理 / 公网入口后面部署时给「手机访问」页指一条真能走通的地址。
+    pub public_base_url_override: Option<String>,
 }
 
 /// 以给定配置启动服务，返回可读回真实端口的句柄。
@@ -511,6 +514,18 @@ pub async fn serve(options: ServeOptions) -> anyhow::Result<ServerHandle> {
         extra_origins
             .push(normalize_origin(raw).map_err(|e| anyhow::anyhow!("allowed_origin 无效：{e}"))?);
     }
+    // 公网入口（决策 334）：CLI 压配置文件，两处都过 `normalize_origin`（与上面同一种形状）。
+    // 这里归一而不是信原值：「手机访问」页的二维码直接拿它拼 URL，尾斜杠会拼出 `//?pair=…`。
+    let public_base_url = match options
+        .public_base_url_override
+        .as_deref()
+        .or(server.public_base_url.as_deref())
+    {
+        Some(raw) => {
+            Some(normalize_origin(raw).map_err(|e| anyhow::anyhow!("public_base_url 无效：{e}"))?)
+        }
+        None => None,
+    };
 
     // 停机信号（决策 54）：一处广播，三处消费——监听器主管、tick 循环、维护循环。
     // 不再有第 4 个接收者直接挂在 axum 上：监听器的停机由主管转达（决策 186），
@@ -583,6 +598,7 @@ pub async fn serve(options: ServeOptions) -> anyhow::Result<ServerHandle> {
         .with_port_source(port_source)
         .with_rebind(rebind_tx)
         .with_allowed_origins(extra_origins)
+        .with_public_base_url(public_base_url.clone())
         .with_repo(repo, market_repos)
         .with_market_override(market_override)
         .with_notify_config(config.notify.clone())
@@ -590,6 +606,11 @@ pub async fn serve(options: ServeOptions) -> anyhow::Result<ServerHandle> {
     let router = build_router(state.clone());
 
     tracing::info!(%bound, port = bound.port(), host_source = bind_source.as_str(), "AgentPipeline 已启动");
+    // 公网入口（决策 334）：配了就说一声——「手机访问」页的二维码会指向它，而这一页是
+    // 手机上唯一能拿到令牌的地方，指错了只能靠这条日志回头对。
+    if let Some(url) = state.public_base_url.as_deref() {
+        tracing::info!(public_base_url = url, "手机访问页将使用这个公网入口");
+    }
     // 就绪标记（决策 153⑤）：tracing 输出受 `RUST_LOG` 过滤，子进程（冒烟测试 / 桌面壳）
     // 需要一条不受日志级别影响的确定性信号来读取内核分配的真实端口。
     println!("AGENTPIPELINE_READY port={}", bound.port());

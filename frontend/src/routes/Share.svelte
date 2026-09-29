@@ -12,7 +12,13 @@
   import type { ServerAddress, ServerInfo } from '../api/types';
   import EmptyState from '../components/ui/EmptyState.svelte';
   import { changeLanMode } from '../lib/lanToggle';
-  import { bindSourceLabel, portFallbackNote, sharePanel } from '../lib/sharePairing';
+  import {
+    bindSourceLabel,
+    phoneCanReach,
+    portFallbackNote,
+    qrCaption,
+    sharePanel,
+  } from '../lib/sharePairing';
 
   /**
    * 局域网分享页（决策 167 / 186 / 189）：手机扫码接入。
@@ -21,10 +27,14 @@
    * 枚举网卡得出（crates/app/src/lan.rs），前端不做任何猜测：多网卡 / VPN 环境下
    * 选错地址的表现是「扫了打不开」，故这里把后端排好序的推荐项放大，其余列为备选。
    *
-   * 仅回环绑定时不显示二维码（拷给手机也连不上），改为给出**一颗真的能按的钮**
-   * （决策 186）：绑定可以在运行时改，不必再去改环境变量重启。**这一页跑在
+   * 仅回环绑定**且没有公网入口**时不显示二维码（拷给手机也连不上），改为给出**一颗真的
+   * 能按的钮**（决策 186）：绑定可以在运行时改，不必再去改环境变量重启。**这一页跑在
    * localhost，所以那颗钮按得动**——后端只允许回环来源改绑（局域网来源 403）。
    * 二维码由**后端渲染** SVG（决策 167），前端不引 QR 库。
+   *
+   * 配了公网入口（`[server] public_base_url`，决策 334）时上面两条都反过来：手机经外面
+   * 那道反代进来，后端绑不绑回环与它无关，地址表里也只有那一个入口——所以这一页照画码、
+   * 也不再递那颗会把它自己暴露到全网卡的钮。
    *
    * **取不到配对令牌时也不画码**（决策 189）：那张码里没有令牌，扫了配不上，却与正常的
    * 那张看起来完全一样。这一条把「骗人的码」换成了「说清要去哪台机器上打开」的指引块。
@@ -58,6 +68,15 @@
   const origin = typeof window !== 'undefined' ? window.location.origin : '';
 
   const addresses = $derived(info?.addresses ?? []);
+  /**
+   * 手机够不够得着（决策 334）：配了公网入口就够得着，**哪怕后端只绑回环**——外面那道
+   * 反向代理正是给手机准备的门。此前这里只看 `loopback_only`，于是在 106 上这一页永远
+   * 说「手机现在连不上这台机器」，还递上一颗按下去会把明文入口装回来的「绑定全网卡」。
+   * 判据住在 `lib/sharePairing.ts`，模板只按它分支。
+   */
+  const reachable = $derived(phoneCanReach(info));
+  /** 二维码下面那句话：走公网入口与走同一局域网，说给使用者的不是同一件事（决策 334）。 */
+  const caption = $derived(qrCaption(info));
   /**
    * 二维码/复制栏里那个地址。**没有令牌就不画码**（决策 189）——判定住在
    * `lib/sharePairing.ts`，那里钉着「裸地址的码扫了也配不上，而它看起来与正常的那张一样」。
@@ -207,7 +226,8 @@
     {#if portNote}
       <p class="note">{portNote}</p>
     {/if}
-    {#if info.loopback_only}
+    {#if !reachable}
+      <!-- 只绑回环**且没有公网入口**（决策 334）：此时手机确实够不着，这一块才成立。 -->
       <section class="gate">
         <!-- 空态（票 13）+ 琥珀收敛（票 12）：这一块是「现在什么也拿不到 + 下一步按哪颗钮」，
              不是告警，故标题回到中性亮档；片段形状来自 `<EmptyState>`。 -->
@@ -285,7 +305,11 @@ host = "0.0.0.0"</code></pre>
           <div class="qr-side">
             <div class="chart-head">
               <span class="reg-name">扫码在手机上打开</span>
-              <span class="port mono">:{info.port}</span>
+              <!-- 端口只在「手机直连本机」时才与地址同源；走公网入口时它是后端自己的
+                   监听端口（`:3333` 与地址里的 `:3389` 并列会把这一栏变成误导，决策 334）。 -->
+              {#if !info.public_base_url}
+                <span class="port mono">:{info.port}</span>
+              {/if}
             </div>
             <div class="picked mono">{qrTarget}</div>
             <button
@@ -295,10 +319,7 @@ host = "0.0.0.0"</code></pre>
             >
               {copied === qrTarget ? '已复制' : '复制地址'}
             </button>
-            <p class="qr-cap">
-              手机需与电脑在同一局域网（同一 Wi-Fi）。扫码后可直接使用看板与任务详情，
-              实时进度经 SSE 推送。
-            </p>
+            <p class="qr-cap">{caption}</p>
             <!-- 走到这里必定带着令牌（决策 189）：没有令牌的码根本不会画出来 -->
             <div class="pair">
               <span class="pair-note">
@@ -367,19 +388,36 @@ host = "0.0.0.0"</code></pre>
         怀疑泄露时点「重置配对」，旧令牌立即失效，各设备重扫一次即可。
       </p>
 
-      <!-- 决策 186：开了之后要能关回来，且说清这次绑定是谁定的 -->
-      <div class="switch">
-        <button type="button" class="btn" disabled={switching} onclick={() => void switchLan(false)}>
-          {switching ? '正在改绑…' : '改回只绑本机（关掉手机访问）'}
-        </button>
-        <span class="switch-note">
-          当前绑定 <span class="mono">{info.host}:{info.port}</span>，来自 <span class="mono"
-            >{bindSourceLabel(info.bind_source)}</span
-          >。
-        </span>
-      </div>
-      {#if switchNote}<p class="note ok">{switchNote}</p>{/if}
-      {#if switchError}<p class="note bad">{switchError}</p>{/if}
+      {#if info.public_base_url}
+        <!-- 有公网入口时**没有**「改回只绑本机」那颗钮（决策 334）：绑定是不是回环与
+             手机能不能访问已经无关，那颗钮在这一页只剩误伤——按下去等于把后端暴露到
+             全网卡（106 上正是刚关掉的明文入口）。入口是部署事实，改它要去配置那一级。 -->
+        <p class="note">
+          手机走的是公网入口 <span class="mono">{info.public_base_url}</span>——本进程只绑
+          <span class="mono">{info.host}:{info.port}</span>，由外面那道反向代理转发进来。
+          要换入口，改配置里的 <span class="mono">[server] public_base_url</span>（或启动参数
+          <span class="mono">--public-base-url</span>）后重启。
+        </p>
+      {:else}
+        <!-- 决策 186：开了之后要能关回来，且说清这次绑定是谁定的 -->
+        <div class="switch">
+          <button
+            type="button"
+            class="btn"
+            disabled={switching}
+            onclick={() => void switchLan(false)}
+          >
+            {switching ? '正在改绑…' : '改回只绑本机（关掉手机访问）'}
+          </button>
+          <span class="switch-note">
+            当前绑定 <span class="mono">{info.host}:{info.port}</span>，来自 <span class="mono"
+              >{bindSourceLabel(info.bind_source)}</span
+            >。
+          </span>
+        </div>
+        {#if switchNote}<p class="note ok">{switchNote}</p>{/if}
+        {#if switchError}<p class="note bad">{switchError}</p>{/if}
+      {/if}
     {/if}
   {/if}
 </main>

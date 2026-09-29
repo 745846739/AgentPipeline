@@ -99,6 +99,13 @@ export interface StartOptions {
    * 等于「不醒」，这正是此前所有用例都不用管值守轮的原因）。
    */
   pipelineConfig?: string[];
+  /**
+   * 写进 `config.toml` 的 `[server]` 段的行（决策 334）。目前只有 `public_base_url`
+   * 用得上：「手机访问」页在**有公网入口**时的形态（画码、不给改绑钮）与缺省的回环形态
+   * 是两条不同的路径，而它只有把真后端配起来才跑得到——组件层只能喂假读数，
+   * 字段名在后端与前端之间漂了它照样绿。
+   */
+  serverConfig?: string[];
 }
 
 export interface App {
@@ -668,6 +675,10 @@ export async function startApp(opts: StartOptions): Promise<App> {
   // 界面上的那一份盖过它；清掉界面那份就回到这里——两级关系由 E2E ⑫ 钉住。
   if (opts.market && opts.market.seedConfig !== false) {
     configLines.push('[market]', `github_repos = ["${opts.market.owner}/${opts.market.repo}"]`);
+  }
+  // `[server]`（决策 334）：公网入口那一套。写在最后，与上面的段各自成节。
+  if (opts.serverConfig?.length) {
+    configLines.push('[server]', ...opts.serverConfig);
   }
   writeFileSync(path.join(homeDir, 'config.toml'), `${configLines.join('\n')}\n`);
 
