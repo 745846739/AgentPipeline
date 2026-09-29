@@ -8,6 +8,6 @@ run 药丸行（:70）加关键词过滤（run id / 节点 / 状态）；选中 
 
 **Status:** ready-for-agent
 
-- [ ] 药丸过滤框（placeholder 讲清它滤的是 run 行）
-- [ ] 消息列表切片显尾部 + 展开提示；MessageBubble / ToolCallCard 渲染不变
-- [ ] 单测：过滤纯函数；长会话（500+ 消息 mock）首屏只渲 50 条
+- [x] 药丸过滤框（placeholder 讲清它滤的是 run 行）
+- [x] 消息列表切片显尾部 + 展开提示；MessageBubble / ToolCallCard 渲染不变
+- [x] 单测：过滤纯函数；长会话（500+ 消息 mock）首屏只渲 50 条

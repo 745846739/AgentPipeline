@@ -2,6 +2,8 @@
   import type { AllowedAction, BranchCursor, TaskListItem } from '../../api/types';
   import type { BoardColumnDef } from '../../lib/pipeline';
   import { COLUMN_SPRITES, EMPTY_HINTS, aggregateStationState, workerRhythm } from '../../lib/pipeline';
+  import { DEFAULT_PAGE, nextPage, windowSlice } from '../../lib/windowSlice';
+  import MoreRow from '../ui/MoreRow.svelte';
   import Sprite from '../render/Sprite.svelte';
   import Worker from '../pipeline/Worker.svelte';
   import TaskCard from './TaskCard.svelte';
@@ -9,6 +11,11 @@
   interface Props {
     column: BoardColumnDef;
     tasks: TaskListItem[];
+    /**
+     * 顶栏状态粗过滤档（spec list-windowing 票 04）：换档时列内窗口游标重置。
+     * 缺省空串＝调用点没有过滤档，游标不重置。
+     */
+    filterKey?: string;
     /**
      * 该列未过滤任务（移动版脊线/段头状态与 hide-cards 判定用）。
      * 缺省退回 tasks，桌面版不读。
@@ -24,6 +31,7 @@
   let {
     column,
     tasks,
+    filterKey = '',
     allTasks,
     actionsFor,
     cursorsFor,
@@ -75,6 +83,19 @@
 
   /** 该列有任务但被当前过滤全部滤掉（移动版隐藏卡与空态，保留脊线/段头）。 */
   const hideCards = $derived(tasks.length === 0 && spineTasks.length > 0);
+
+  /**
+   * 列内上限折叠（spec list-windowing 票 04）：done 列几十张卡撑超长页面——显**头部**
+   * 50 张，其余折进「还有 M 张，加载更多」。列头计数 `tasks.length` 仍是过滤后全量。
+   */
+  let shown = $state(DEFAULT_PAGE);
+  const slice = $derived(windowSlice(tasks, shown, 'head'));
+
+  // 换过滤档（顶栏状态粗过滤）时窗口游标回缺省：旧游标对着另一批卡只会多画
+  $effect(() => {
+    filterKey;
+    shown = DEFAULT_PAGE;
+  });
 </script>
 
 <section class="col {colState} {hideCards ? 'hide-cards' : ''}" id={`s-${column.key}`}>
@@ -94,7 +115,7 @@
       {#if tasks.length === 0}
         <div class="col-empty">{EMPTY_HINTS[column.key]}</div>
       {:else}
-        {#each tasks as task (task.id)}
+        {#each slice.visible as task (task.id)}
           <TaskCard
             {task}
             actions={actionsFor?.(task.id) ?? []}
@@ -104,6 +125,12 @@
             onaction={(action, opts) => onaction?.(task.id, action, opts)}
           />
         {/each}
+        {#if slice.omittedAfter > 0}
+          <MoreRow
+            label={`还有 ${slice.omittedAfter} 张，加载更多`}
+            onclick={() => (shown = nextPage(shown, tasks.length))}
+          />
+        {/if}
       {/if}
     </div>
   </div>

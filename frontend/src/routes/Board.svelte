@@ -208,6 +208,7 @@
           <BoardColumn
             {column}
             tasks={tasksByColumn.get(column.key) ?? []}
+            filterKey={board.filter}
             allTasks={allByColumn.get(column.key) ?? []}
             actionsFor={(id) => board.pendingActions[id] ?? []}
             cursorsFor={(id) => board.pendingCursors[id] ?? []}

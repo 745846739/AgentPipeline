@@ -1,8 +1,11 @@
 <script lang="ts">
   import type { NodeCommand } from '../../api/types';
+  import { filterCommands, type ExitFilter } from '../../lib/commandFilter';
   import { formatClock } from '../../lib/format';
   import { formatDuration } from '../../lib/pipeline';
+  import { DEFAULT_PAGE, nextPage, windowSlice } from '../../lib/windowSlice';
   import EmptyState from '../ui/EmptyState.svelte';
+  import MoreRow from '../ui/MoreRow.svelte';
 
   interface Props {
     commands: NodeCommand[];
@@ -24,6 +27,25 @@
 
   let expanded = $state<number | null>(null);
   let loading = $state<number | null>(null);
+
+  /**
+   * 长列表窗口化（spec list-windowing 票 02）：数百条命令全量平铺不可读——过滤与切片
+   * 叠加，判据是**先过滤后切**（过滤后的名单喂 `windowSlice`，默认显尾部 50 条：
+   * 最新的一条永远在场）。过滤状态不进 URL，与折叠态同一口径（决策 217 类比）。
+   */
+  let keyword = $state('');
+  let exitFilter = $state<ExitFilter>('all');
+  let shown = $state(DEFAULT_PAGE);
+
+  const filtered = $derived(filterCommands(commands, keyword, exitFilter));
+  const slice = $derived(windowSlice(filtered, shown, 'tail'));
+
+  // 换过滤档（关键词 / 退出码）时窗口游标回缺省：省略计数是按当前名单算的，旧游标只会有害
+  $effect(() => {
+    keyword;
+    exitFilter;
+    shown = DEFAULT_PAGE;
+  });
 
   async function toggle(command: NodeCommand) {
     if (expanded === command.id) {
@@ -73,8 +95,34 @@
     next="节点每跑一条命令都会记在这里：命令、耗时、退出码，点开看完整输出。"
   />
 {:else}
+  <div class="filters">
+    <input
+      class="finput"
+      type="search"
+      placeholder="搜命令行…"
+      aria-label="按命令行关键词过滤"
+      bind:value={keyword}
+    />
+    <div class="fexits" role="group" aria-label="按退出码过滤">
+      {#each [['all', '全部'], ['nonzero', '非零'], ['zero', '零']] as [key, label] (key)}
+        <button
+          type="button"
+          class="fopt"
+          class:on={exitFilter === key}
+          aria-pressed={exitFilter === key}
+          onclick={() => (exitFilter = key as ExitFilter)}
+        >{label}</button>
+      {/each}
+    </div>
+  </div>
+  {#if slice.omittedBefore > 0}
+    <MoreRow
+      label={`已省略前 ${slice.omittedBefore} 条，点此展开`}
+      onclick={() => (shown = nextPage(shown, filtered.length))}
+    />
+  {/if}
   <div class="cmds">
-    {#each commands as command (command.id)}
+    {#each slice.visible as command (command.id)}
       <button type="button" class="cmd" onclick={() => toggle(command)}>
         <span class="cmd-l1">
           <i class={command.exit_code === null || command.exit_code === 0 ? 'ok' : 'bad'}></i>
@@ -115,6 +163,43 @@
 <style>
   .cmds {
     max-width: 900px;
+  }
+  /* 过滤行（票 02）：输入框与退出码三档。描边 2px、字号 12px 是全站像素纪律 */
+  .filters {
+    display: flex;
+    gap: 6px;
+    align-items: center;
+    max-width: 900px;
+    margin-bottom: 8px;
+  }
+  .finput {
+    flex: 1;
+    min-width: 0;
+    padding: 4px 8px;
+    border: 2px solid var(--pane);
+    background: var(--panel);
+    color: var(--text);
+    font-family: var(--font-mono);
+    font-size: 12px;
+  }
+  .fexits {
+    display: flex;
+    flex: none;
+  }
+  .fopt {
+    padding: 4px 8px;
+    border: 2px solid var(--pane);
+    background: none;
+    color: var(--text-3);
+    font-size: 12px;
+    cursor: pointer;
+  }
+  .fopt + .fopt {
+    border-left: 0;
+  }
+  .fopt.on {
+    background: var(--wash);
+    color: var(--text-hi);
   }
   /* 「改写」标：只在真的换过命令的行上出现（决策 297）——不喧哗，但一眼看得出这条
      跑的不是它写的那个样子。描边 2px、字号 12px 是 §3.1 / §5 的全站像素纪律：1px 与

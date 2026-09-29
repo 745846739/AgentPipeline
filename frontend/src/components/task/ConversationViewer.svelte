@@ -2,10 +2,13 @@
   import type { ChatMessage, ConversationSummary, NodeConversation } from '../../api/types';
   import type { LiveDelta, LiveTool } from '../../realtime/reduce';
   import { formatTokens } from '../../lib/format';
+  import { filterRuns } from '../../lib/runFilter';
+  import { DEFAULT_PAGE, windowSlice } from '../../lib/windowSlice';
   import MessageBubble from '../render/MessageBubble.svelte';
   import MetadataCard from '../render/MetadataCard.svelte';
   import ToolCallCard from '../render/ToolCallCard.svelte';
   import EmptyState from '../ui/EmptyState.svelte';
+  import MoreRow from '../ui/MoreRow.svelte';
 
   interface Props {
     conversations: ConversationSummary[];
@@ -57,6 +60,34 @@
   });
 
   const selectedTools = $derived(liveTools.filter((t) => t.run_id === selectedRunId));
+
+  /**
+   * 长列表窗口化（spec list-windowing 票 03）：run 药丸墙加关键词过滤，选中 run 的
+   * 消息列表接切片原语（默认显尾部 50 条——收尾的元数据卡与流式尾巴都在最底下，
+   * 窗口化了才看得见「现在」）。过滤态不进 URL，与折叠态同一口径（决策 217 类比）。
+   */
+  let runQuery = $state('');
+  let shownMsg = $state(DEFAULT_PAGE);
+
+  const shownRuns = $derived(filterRuns(sorted, runQuery));
+
+  // 换 run：窗口游标回缺省——省略计数是按选中 run 的名单算的，旧游标只会有害
+  $effect(() => {
+    selectedRunId;
+    shownMsg = DEFAULT_PAGE;
+  });
+
+  /**
+   * tool 消息中空 content 的行不渲染（既有判据）；键用**原数组下标**——窗口化之后
+   * `each` 的局部 i 不再等于消息在会话里的位置，拿它当键会随窗口滑动而错位。
+   */
+  const displayed = $derived.by(() => {
+    if (!conversation) return [];
+    return conversation.messages_json
+      .map((message, idx) => ({ message, idx }))
+      .filter(({ message }) => message.role !== 'tool' || message.content);
+  });
+  const msgSlice = $derived(windowSlice(displayed, shownMsg, 'tail'));
 </script>
 
 {#if sorted.length === 0}
@@ -66,8 +97,20 @@
     next="流水线跑起来后，每个节点的会话都会出现在这里：模型说了什么、调了哪些工具。"
   />
 {:else}
+  <div class="runfilter">
+    <input
+      class="rinput"
+      type="search"
+      placeholder="滤上面的 run 行：阶段 · 节点 · 子代理 · run id"
+      aria-label="按阶段、节点、子代理或 run id 过滤 run 行"
+      bind:value={runQuery}
+    />
+  </div>
+  {#if shownRuns.length === 0}
+    <div class="empty">没有匹配的 run 行。</div>
+  {/if}
   <div class="runrow no-scrollbar">
-    {#each sorted as c (c.run_id)}
+    {#each shownRuns as c (c.run_id)}
       <button
         type="button"
         class="runchip"
@@ -100,10 +143,14 @@
       <div class="empty">正在加载会话…</div>
     {:else}
       {#if conversation}
-        {#each conversation.messages_json as message, i (i)}
-          {#if message.role !== 'tool' || message.content}
-            <MessageBubble {message} />
-          {/if}
+        {#if msgSlice.omittedBefore > 0}
+          <MoreRow
+            label={`已省略前 ${msgSlice.omittedBefore} 条，点此展开`}
+            onclick={() => (shownMsg = Math.min(shownMsg + DEFAULT_PAGE, displayed.length))}
+          />
+        {/if}
+        {#each msgSlice.visible as row (row.idx)}
+          <MessageBubble message={row.message} />
         {/each}
         {#if conversation.metadata_json}
           <MetadataCard metadata={conversation.metadata_json} />
@@ -128,6 +175,19 @@
 {/if}
 
 <style>
+  /* run 行的过滤框（票 03）：2px 描边、12px 字号是全站像素纪律 */
+  .runfilter {
+    margin-bottom: 8px;
+  }
+  .rinput {
+    width: 100%;
+    max-width: 420px;
+    padding: 4px 8px;
+    border: 2px solid var(--pane);
+    background: var(--panel);
+    color: var(--text);
+    font-size: 12px;
+  }
   .runrow {
     display: flex;
     gap: 6px;
