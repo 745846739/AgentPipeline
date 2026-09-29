@@ -45,14 +45,26 @@ jobs:
           printf '%s\n' "${{ secrets.SSH_KNOWN_HOSTS }}" > ~/.ssh/known_hosts
           chmod 600 ~/.ssh/deploy_key ~/.ssh/known_hosts
 
+      # 跨境 SSH（Azure 出口 → 大陆云主机）会在握手阶段静默挂死：
+      # OpenSSH 默认 IPQoS 标记的包会被部分跨境链路丢弃，IPQoS=cs0 规避；
+      # 全部 ssh 命令配 ConnectTimeout/ServerAlive + timeout 包裹，快速失败不挂 25 分钟。
+      - name: SSH smoke test
+        run: |
+          timeout 30 ssh -i ~/.ssh/deploy_key -o BatchMode=yes -o ConnectTimeout=15 \
+            -o ServerAliveInterval=15 -o ServerAliveCountMax=4 -o IPQoS=cs0 \
+            "${{ secrets.DEPLOY_USER }}@${{ secrets.DEPLOY_HOST }}" 'echo CONN_OK'
+
       - name: Upload binary
         run: |
-          cat target/release/agent-pipeline | ssh -i ~/.ssh/deploy_key \
-            -o BatchMode=yes "${{ secrets.DEPLOY_USER }}@${{ secrets.DEPLOY_HOST }}" \
-            "sudo -n /opt/deploy.sh upload"
+          timeout 300 sh -c 'cat target/release/agent-pipeline | ssh -i ~/.ssh/deploy_key \
+            -o BatchMode=yes -o ConnectTimeout=15 -o ServerAliveInterval=15 \
+            -o ServerAliveCountMax=4 -o IPQoS=cs0 \
+            "${{ secrets.DEPLOY_USER }}@${{ secrets.DEPLOY_HOST }}" \
+            "sudo -n /opt/deploy.sh upload"'
 
       - name: Deploy and verify
         run: |
-          ssh -i ~/.ssh/deploy_key -o BatchMode=yes \
+          timeout 120 ssh -i ~/.ssh/deploy_key -o BatchMode=yes -o ConnectTimeout=15 \
+            -o ServerAliveInterval=15 -o ServerAliveCountMax=4 -o IPQoS=cs0 \
             "${{ secrets.DEPLOY_USER }}@${{ secrets.DEPLOY_HOST }}" \
             "sudo -n /opt/deploy.sh deploy"
