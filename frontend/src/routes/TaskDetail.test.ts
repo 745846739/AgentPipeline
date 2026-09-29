@@ -3,6 +3,7 @@ import { afterEach, beforeAll, beforeEach, describe, expect, it, vi } from 'vite
 import type { AllowedAction, BranchCursor, Task } from '../api/types';
 import { parseUnifiedDiff, type ParsedDiff } from '../lib/diff';
 import { emptyTaskDetailState } from '../realtime/reduce';
+import { router } from '../router.svelte';
 import TaskDetail from './TaskDetail.svelte';
 
 /**
@@ -352,5 +353,85 @@ describe('任务详情 · 加载失败有出口（票 01 / R2-01）', () => {
     render(TaskDetail, { props: { id: 'task-1' } });
     expect(screen.getByText(/正在加载任务/)).toBeTruthy();
     expect(screen.queryByRole('button', { name: '重新加载' })).toBeNull();
+  });
+});
+
+describe('任务详情 · 通知深链 `?run=`（pwa-webpush 票 02/03）', () => {
+  /** 一个 run 的会话摘要（`ConversationViewer` 的 run 行要有一条才摆得开）。 */
+  function summary(runId: number) {
+    return {
+      run_id: runId,
+      stage: 'develop' as const,
+      node: 'execute' as const,
+      attempt: 1,
+      agent_type: 'main',
+      parent_run_id: null,
+      prompt_tokens: 10,
+      completion_tokens: 20,
+      status: 'failed',
+    };
+  }
+
+  /** 地址栏与路由镜像一起摆到位（`writeQuery` 读的是地址栏本身，见 `currentHash`）。 */
+  function armDeepLink(hash: string): void {
+    window.location.hash = hash;
+    router.hash = hash;
+  }
+
+  function armTask(): void {
+    mocks.detail.state = emptyTaskDetailState({
+      task: { ...pendingTask(), status: 'failed', current_stage: 'develop' },
+      cursors: [],
+      allowedActions: [],
+      conversations: [summary(42)],
+    });
+    mocks.detail.error = null;
+    mocks.detail.errorStatus = null;
+    mocks.detail.loading = false;
+  }
+
+  beforeEach(() => {
+    armTask();
+  });
+
+  afterEach(() => {
+    window.location.hash = '';
+  });
+
+  it('落在那一轮对话上：切到会话页签、选中该 run 并拉着它取数', () => {
+    armDeepLink('#/task/task-1?run=42');
+    render(TaskDetail, { props: { id: 'task-1' } });
+
+    expect(screen.getByRole('tab', { name: '会话' }).getAttribute('aria-selected')).toBe('true');
+    expect(mocks.detail.loadConversation).toHaveBeenCalledWith(42);
+    // 「选中」是看得见的那件事：run 行的药丸被按下
+    expect(screen.getByRole('button', { name: /develop · execute/ }).getAttribute('aria-pressed')).toBe(
+      'true',
+    );
+  });
+
+  it('消费一次就抹掉参数（replace 不进历史）：地址不再挂着 `run`', () => {
+    armDeepLink('#/task/task-1?run=42');
+    render(TaskDetail, { props: { id: 'task-1' } });
+
+    expect(window.location.hash).toBe('#/task/task-1');
+    expect(router.route).toEqual({ name: 'task', id: 'task-1', query: {} });
+  });
+
+  it('没有这个参数时一动不动：默认落时间线，也不去取哪一轮会话', () => {
+    armDeepLink('#/task/task-1');
+    render(TaskDetail, { props: { id: 'task-1' } });
+
+    expect(screen.getByRole('tab', { name: '时间线' }).getAttribute('aria-selected')).toBe('true');
+    expect(mocks.detail.loadConversation).not.toHaveBeenCalled();
+    expect(window.location.hash).toBe('#/task/task-1');
+  });
+
+  it('脏值（非正整数）清掉不留，且不拿它去取数', () => {
+    armDeepLink('#/task/task-1?run=abc');
+    render(TaskDetail, { props: { id: 'task-1' } });
+
+    expect(window.location.hash).toBe('#/task/task-1');
+    expect(mocks.detail.loadConversation).not.toHaveBeenCalled();
   });
 });

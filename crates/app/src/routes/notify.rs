@@ -1,25 +1,30 @@
-//! 离线通知设置端点（决策 272⑥⑦⑧；284②③⑤ 添礼貌单元）。
+//! 离线通知设置端点（决策 272⑥⑦⑧；284②③⑤ 添礼貌单元；pwa-webpush 02 添第五通道）。
 //!
 //! 六条路，各办一件事：
 //! - `GET /notify/settings`：读数（生效单元 + 两个 `origin` 各说清是谁定的 + 秘密一律
-//!   掩码 + 礼貌两件的**生效值** + 解析不了时的报文）。
+//!   掩码 + 礼貌两件的**生效值** + VAPID 公钥原样 / 私钥掩码 + 解析不了时的报文）。
 //! - `PUT /notify/settings`：**总开关**（`{enabled}` 一个字段）——开启时先解析生效
 //!   通道、BlueBubbles 先 ping（**够不着不当成功**），都过了才落库 + 重建出口。
 //! - `PUT /notify/channel` / `DELETE /notify/channel`：通道单元的保存与交还
-//!   （照 `/market/repos` 的先例）——保存是**整体覆盖**（272⑥ 不允许混）。
+//!   （照 `/market/repos` 的先例）——保存是**整体覆盖**（272⑥ 不允许混）；
+//!   存 `webpush` 时顺带把 VAPID 密钥对生成出来（pwa-webpush 02，零手工配置）。
 //! - `PUT /notify/politeness` / `DELETE /notify/politeness`：**礼貌单元**的保存与交还
 //!   （284②：与通道单元**各自成立**，两级关系同构——界面整体覆盖 `config.toml`）。
 //! - `POST /notify/test`：连通性探针（照 `POST /providers/test`，决策 160——
 //!   对**未保存**的表单值发最小真实请求，成功失败都 200）。
+//! - `GET/POST/DELETE /notify/push/subscriptions[/{id}]`：浏览器推送的订阅清单
+//!   （pwa-webpush 02）——**读也过配对令牌守卫**（`stream::pairing_guard` 的前缀白名单），
+//!   因为清单里的每一条都是「往那台设备推任意报文」的能力的一半（见 `storage::push`）。
 //!
 //! **秘密面**（272⑦）：`webhook_url` 与 `bluebubbles_password` 读回只给常量掩码 `***`
 //! （provider `api_key` 同款，决策 112）；提交掩码或留空 = 不改；BlueBubbles 的完整
-//! URL 由代码拼，本文件**不拼发送 URL**（那是 `notify.rs::NotifyTarget::send_url` 的
-//! 事），探针走的也是 core 的 `ping_bluebubbles`。
+//! URL 由代码拼，本文件**不拼发送 URL**（那是 `notify.rs::NotifyTarget::delivery` 的
+//! 事），探针走的也是 core 的 `ping_bluebubbles`。VAPID 私钥同一档：**永不回显原值**。
 
 use std::sync::Arc;
 
-use axum::extract::State;
+use axum::extract::{Path, State};
+use axum::http::HeaderMap;
 use axum::response::IntoResponse;
 use axum::Json;
 use serde::Deserialize;
@@ -30,6 +35,7 @@ use agentpipeline_core::notify::{
     NotifyChannelOverride, NotifyFormat, NotifyPoliteness, NotifySettingsState, NotifyTarget,
     WebhookNotifier,
 };
+use agentpipeline_core::webpush::validate_subscription;
 
 use crate::state::{map_core_error, ApiError, ApiResult, AppState};
 
@@ -74,6 +80,13 @@ pub async fn settings(State(state): State<AppState>) -> ApiResult<impl IntoRespo
     } else {
         "config"
     };
+    // VAPID 密钥对（pwa-webpush 02）：读接口**不生成**（GET 不该写库），只如实报
+    // 「有 / 没有」——没有时读数是两个空串，设置页据此提示「保存一次通道」。
+    let vapid = state
+        .store
+        .push_vapid_keys()
+        .await
+        .map_err(map_core_error)?;
     // 礼貌两件（284②）各自报来源：通道来自界面不代表礼貌也来自界面。
     let politeness = resolve_politeness(&state.notify_config, &display_state);
     let politeness_origin = if stored.politeness.is_some() {
@@ -112,6 +125,15 @@ pub async fn settings(State(state): State<AppState>) -> ApiResult<impl IntoRespo
             bluebubbles_password: Some(password.as_str()),
             bluebubbles_recipient: Some(address.as_str()),
         }),
+        // 浏览器推送：**没有件可回显**（订阅与密钥对都在库里，不是这一格的字段）——
+        // 通道名照给，四件全空（设置页据此只显示「浏览器推送」那一个名字）。
+        (None, Some(NotifyTarget::WebPush)) => Some(DeclaredChannel {
+            channel: NotifyFormat::WebPush,
+            webhook_url: None,
+            bluebubbles_url: None,
+            bluebubbles_password: None,
+            bluebubbles_recipient: None,
+        }),
         (None, None) => None,
     };
     let (channel, webhook_url, bb_url, bb_password, bb_recipient) = declared
@@ -144,6 +166,11 @@ pub async fn settings(State(state): State<AppState>) -> ApiResult<impl IntoRespo
         "cooldown_sec": politeness.cooldown_sec,
         "quiet_hours": politeness.quiet_hours,
         "politeness_origin": politeness_origin,
+        // VAPID 两件（pwa-webpush 02）：**公钥原样**（浏览器订阅时就要拿它当
+        // applicationServerKey，它不是秘密）、**私钥只给掩码**（对齐 provider api_key，
+        // 决策 112）。没生成过时两个都是空串。
+        "vapid_public_key": vapid.as_ref().map(|k| k.public_key.as_str()).unwrap_or(""),
+        "vapid_private_key": vapid.as_ref().map(|_| SECRET_MASK).unwrap_or(""),
     });
     if let Some(err) = config_error {
         body["config_error"] = json!(err);
@@ -284,11 +311,22 @@ pub async fn save_channel(
         // 保存即生效（开关开着）：BlueBubbles 先 ping，够不着不当成功。
         ping_if_bluebubbles(&Some(target.clone())).await?;
     }
+    // 浏览器推送：**首次启用自动生成** VAPID 密钥对（pwa-webpush 02，票面「零手工配置」）。
+    // 生成放在落库**之后**（先接受这次保存，再补密钥）——两者都在同一次动作里，
+    // 而生成失败是真错误（系统随机源不可用），故它照 272⑧ 报出来而不是静默吞掉。
+    // 订阅上报那边也兜了一次 `ensure`：手改过库 / 配置级声明的 webpush 都走得到。
     state
         .store
         .set_notify_channel(&unit)
         .await
         .map_err(map_core_error)?;
+    if channel == NotifyFormat::WebPush {
+        state
+            .store
+            .ensure_push_vapid_keys()
+            .await
+            .map_err(map_core_error)?;
+    }
     if enabled {
         // 礼貌取**解析后的**那一份（284③）：保存通道不该把界面上的礼貌换回配置那一份。
         apply_target(
@@ -441,6 +479,108 @@ async fn ping_if_bluebubbles(target: &Option<NotifyTarget>) -> ApiResult<()> {
     Ok(())
 }
 
+// ─────────────── 浏览器推送的订阅（spec `.scratch/pwa-webpush/` 票 02）───────────────
+//
+// 三条路 + 一条单删。**读也过配对令牌守卫**（`stream::pairing_guard` 认
+// `PUSH_SUBSCRIPTIONS_PREFIX`）：清单里的每一条都是「往那台设备推任意报文」的能力的
+// 一半，而订阅是**持续的**外泄管道（读接口是一次性的偷看，写接口是永久的）——这是对
+// 决策 167「v1 无鉴权」的定点加强，回环豁免与报文形状照 182⑦。
+//
+// 读接口只给**摘要**（`endpoint_hint`），不给完整 endpoint、更不给 `p256dh` / `auth`：
+// 清单要能回答「这是哪台设备」，不需要交出「怎么推它」（`storage::push` 的头注）。
+
+/// `POST /notify/push/subscriptions` 的载荷：**浏览器 `PushSubscription.toJSON()` 的形状**
+/// 原样收（`{endpoint, keys:{p256dh, auth}}`）——前端不做转换，少一层就少一处漂移。
+#[derive(Debug, Deserialize)]
+pub struct SubscribeBody {
+    pub endpoint: String,
+    pub keys: SubscriptionKeys,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct SubscriptionKeys {
+    pub p256dh: String,
+    pub auth: String,
+}
+
+/// `POST /notify/push/subscriptions`：按 `endpoint` upsert 一条订阅（同设备两次订阅一行）。
+///
+/// 校验在落库前（形状不对 400 报错不静默，272⑧）：坏行静静躺在清单里、直到某次通知
+/// 才发现它永远发不出去，是这一族里最难查的一种「配置错」。
+pub async fn subscribe(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(body): Json<SubscribeBody>,
+) -> ApiResult<impl IntoResponse> {
+    let endpoint = body.endpoint.trim();
+    let p256dh = body.keys.p256dh.trim();
+    let auth = body.keys.auth.trim();
+    validate_subscription(endpoint, p256dh, auth).map_err(ApiError::bad_request)?;
+    // 兜一次密钥生成（幂等）：通道来自 `config.toml`、或有人手改过库时，走到这里的
+    // 这一刻库里可能还没有那一对——而没有它这条订阅**永远不会被推到**，而用户看到的
+    // 是「订阅成功了」。宁可在上报时补上。
+    state
+        .store
+        .ensure_push_vapid_keys()
+        .await
+        .map_err(map_core_error)?;
+    let user_agent = headers
+        .get(axum::http::header::USER_AGENT)
+        .and_then(|value| value.to_str().ok())
+        .map(str::to_string);
+    let id = state
+        .store
+        .upsert_push_subscription(endpoint, p256dh, auth, user_agent.as_deref())
+        .await
+        .map_err(map_core_error)?;
+    Ok(Json(json!({ "ok": true, "id": id })))
+}
+
+/// `GET /notify/push/subscriptions`：设备清单（订阅时间升序）。
+pub async fn list_subscriptions(State(state): State<AppState>) -> ApiResult<impl IntoResponse> {
+    let subscriptions = state
+        .store
+        .list_push_subscriptions()
+        .await
+        .map_err(map_core_error)?;
+    let items: Vec<serde_json::Value> = subscriptions
+        .iter()
+        .map(|sub| {
+            json!({
+                "id": sub.id,
+                // 摘要而非完整 endpoint（掩码先例：清单是给人认设备的，不是能力包）。
+                "endpoint_hint": sub.endpoint_hint(),
+                "user_agent": sub.user_agent.clone().unwrap_or_default(),
+                "created_at": sub.created_at.to_rfc3339(),
+            })
+        })
+        .collect();
+    Ok(Json(json!({ "subscriptions": items })))
+}
+
+/// `DELETE /notify/push/subscriptions/{id}`：撤销一台设备（单个撤销）。
+pub async fn delete_subscription(
+    State(state): State<AppState>,
+    Path(id): Path<i64>,
+) -> ApiResult<impl IntoResponse> {
+    let removed = state
+        .store
+        .delete_push_subscription(id)
+        .await
+        .map_err(map_core_error)?;
+    Ok(Json(json!({ "ok": true, "removed": removed })))
+}
+
+/// `DELETE /notify/push/subscriptions`：一键清空（换手机 / 怀疑被订阅过时的收回动作）。
+pub async fn clear_subscriptions(State(state): State<AppState>) -> ApiResult<impl IntoResponse> {
+    let removed = state
+        .store
+        .clear_push_subscriptions()
+        .await
+        .map_err(map_core_error)?;
+    Ok(Json(json!({ "ok": true, "removed": removed })))
+}
+
 /// 活生效（272⑧；284③ 扩到礼貌）：出口是启动时建一次的，任何一次落库都要**重建或
 /// 摘除**它。礼貌取**解析后的**那一份（284②，单元 > config.toml）——调用方负责解析，
 /// 这里只认值：出口自己不认识两级。
@@ -450,6 +590,8 @@ fn apply_target(state: &AppState, target: Option<NotifyTarget>, politeness: Noti
             target,
             politeness,
             state.store.clock().clone(),
+            // 浏览器推送要读库（订阅行 + VAPID 密钥对）：出口持一个 Store 句柄克隆。
+            state.store.clone(),
         ))),
         None => state.store.clear_notifier(),
     }

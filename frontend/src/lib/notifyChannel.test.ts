@@ -43,6 +43,13 @@ describe('notifyChannel（决策 272）', () => {
     expect(test.bluebubbles_password).toBeUndefined();
   });
 
+  it('浏览器推送（第四支）：没有必填件，载荷只带通道名', () => {
+    const d = draft({ channel: 'webpush', bluebubblesUrl: '', bluebubblesPassword: '', bluebubblesRecipient: '' });
+    expect(validateNotifyDraft(d)).toBeNull();
+    expect(buildNotifyChannelPayload(d)).toEqual({ channel: 'webpush' });
+    expect(CHANNEL_LABELS.webpush).toBe('浏览器推送');
+  });
+
   it('保存载荷只带当前通道的件：generic/feishu 只送 webhook_url，bluebubbles 只送三件', () => {
     const bb = buildNotifyChannelPayload(draft());
     expect(bb.webhook_url).toBeUndefined();
@@ -96,6 +103,8 @@ describe('notifyChannel（决策 272）', () => {
       cooldown_sec: 300,
       quiet_hours: [22, 8],
       politeness_origin: 'config',
+      vapid_public_key: '',
+      vapid_private_key: '',
     };
     const d = draftFromSettings(s);
     expect(d.channel).toBe('bluebubbles');
@@ -109,7 +118,12 @@ describe('notifyChannel（决策 272）', () => {
     expect(notifyOriginLabel(null)).toBe('配置文件');
   });
 
-  it('三个通道的界面名一个不少（值域与后端 NotifyFormat 的 serde 小写形一致）', () => {
-    expect(Object.keys(CHANNEL_LABELS).sort()).toEqual(['bluebubbles', 'feishu', 'generic']);
+  it('四个通道的界面名一个不少（值域与后端 NotifyFormat 的 serde 小写形一致）', () => {
+    expect(Object.keys(CHANNEL_LABELS).sort()).toEqual([
+      'bluebubbles',
+      'feishu',
+      'generic',
+      'webpush',
+    ]);
   });
 });

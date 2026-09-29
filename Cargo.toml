@@ -16,11 +16,17 @@ license = "MIT"
 [workspace.dependencies]
 anyhow = "1"
 axum = { version = "0.8", features = ["macros"] }
+# Web Push 的 base64url 无填充编解码（票 pwa-webpush 02）：0.22 已在依赖树里
+# （rustls 一带的传递依赖），提为直接依赖不引新下载。
+base64 = "0.22"
 chrono = { version = "0.4", features = ["serde"] }
 futures = "0.3"
 git2 = "0.20"
 insta = { version = "1", features = ["json"] }
 regex = "1"
+# Web Push 的三件密码学原语（票 pwa-webpush 02）：P-256 的 ECDH/ECDSA、AES-128-GCM、
+# HKDF-SHA256。同上——ring 0.17 已在依赖树里（reqwest 的 rustls-tls）。
+ring = "0.17"
 reqwest = { version = "0.12", default-features = false, features = [
     "json",
     "stream",

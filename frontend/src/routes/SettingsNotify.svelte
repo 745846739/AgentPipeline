@@ -3,13 +3,18 @@
   import {
     clearNotifyChannel,
     clearNotifyPoliteness,
+    clearPushSubscriptions,
+    deletePushSubscription,
     getNotifySettings,
+    listPushSubscriptions,
     saveNotifyChannel,
     saveNotifyPoliteness,
     setNotifyEnabled,
+    subscribePushDevice,
     testNotifyChannel,
   } from '../api/client';
-  import type { NotifySettings } from '../api/types';
+  import type { NotifySettings, PushSubscriptionRow } from '../api/types';
+  import { formatDateTime } from '../lib/format';
   import {
     CHANNEL_LABELS,
     NOTIFY_SECRET_MASK,
@@ -28,9 +33,21 @@
     parseNotifyPolitenessDraft,
     type NotifyPolitenessDraft,
   } from '../lib/notifyPoliteness';
+  import {
+    pushFace,
+    pushFaceHint,
+    pushFaceLabel,
+    readPushEnv,
+    readLocalSubscriptionId,
+    rememberLocalSubscriptionId,
+    forgetLocalSubscriptionId,
+    urlBase64ToUint8Array,
+    type PushFace,
+  } from '../lib/pushSubscribe';
 
   /**
-   * 离线通知设置页（`#/settings/notify`，决策 272⑥⑦⑧；284②③⑤ 添礼貌小节）。
+   * 离线通知设置页（`#/settings/notify`，决策 272⑥⑦⑧；284②③⑤ 添礼貌小节；
+   * pwa-webpush 02 添第四通道「浏览器推送」）。
    *
    * **一颗总开关 + 两组单元**：开关管整条通道（非每类一颗）；通道四件（类型 + 端点 +
    * password + 收件人）与礼貌两件（节流 + 免打扰）**各自**作为一个整体覆盖 `config.toml`
@@ -39,6 +56,12 @@
    *
    * 礼貌两件此前只住 `config.toml`（272⑥）；284 把它们搬上这一页，**管的是出机器那条线**
    * ——浏览器 toast 另有 `lib/notificationPolicy.ts` 一份固定表，本页不动它（页面写明）。
+   *
+   * **第四通道「浏览器推送」**（pwa-webpush 02/03）：通道那一格没有任何必填件（订阅行与
+   * VAPID 密钥对都在服务端库里，保存通道时自动生成）；选中它之后多出两段——
+   * 「订阅此设备」与「已订阅设备」清单。权限弹窗**只在点击手势里**弹（票面 12 号故事），
+   * 进页面不弹；四态（未申请 / 已授权 / 已拒绝给系统设置指引 / iOS 非主屏给添加主屏幕
+   * 引导）的判据在 `lib/pushSubscribe.ts::pushFace`，本页只做展示。
    *
    * 交互姿态照 `/share`：每一步成功失败都以**重读到的读数**为准（`note ok` / `note
    * bad`），不拿本地猜测冒充结果。与 `/share` 的差异要说明白：那页有 `202 + pending`
@@ -61,6 +84,16 @@
   let savingPoliteness = $state(false);
   let note = $state<{ kind: 'ok' | 'bad'; message: string } | null>(null);
 
+  // ── 浏览器推送（票 03）──
+  /** 这台设备的四态（`readPushEnv` 读环境 → `pushFace` 判据）。 */
+  let face = $state<PushFace>({ kind: 'prompt', canSubscribe: true });
+  /** 服务端清单（`null` = 这一节还没读到 / 读失败，`listError` 说原因）。 */
+  let subscriptions = $state<PushSubscriptionRow[] | null>(null);
+  let listError = $state<string | null>(null);
+  /** 这台浏览器里现在有没有一条活的订阅（`pushManager.getSubscription()`）。 */
+  let subscribedHere = $state(false);
+  let pushBusy = $state(false);
+
   /** 礼貌草稿的实时判读：过了描述两句，没过把错摆出来（不拦输入，只提示）。 */
   const politenessPreview = $derived.by(() => {
     if (!politeness) return null;
@@ -74,6 +107,9 @@
     };
   });
 
+  /** 通道是浏览器推送时，这一节才摆出来（清单也是那一刻才去读）。 */
+  const pushSection = $derived(settings?.channel === 'webpush');
+
   async function load() {
     loading = true;
     error = null;
@@ -81,10 +117,40 @@
       settings = await getNotifySettings();
       draft = draftFromSettings(settings);
       politeness = politenessDraftFromSettings(settings);
+      if (settings.channel === 'webpush') await loadSubscriptions();
+      else {
+        subscriptions = null;
+        listError = null;
+      }
     } catch (err) {
       error = (err as Error).message;
     } finally {
       loading = false;
+    }
+  }
+
+  /** 读清单 + 本机订阅态。清单读不到不炸整页：那一节自己说原因（局域网未配对是最常见的）。 */
+  async function loadSubscriptions() {
+    face = pushFace(readPushEnv());
+    subscribedHere = await localSubscriptionAlive();
+    try {
+      subscriptions = (await listPushSubscriptions()).subscriptions;
+      listError = null;
+    } catch (err) {
+      subscriptions = null;
+      listError = (err as Error).message;
+    }
+  }
+
+  /** 本机（这台浏览器）有没有一条活订阅——service worker 没注册 / 不支持时就是没有。 */
+  async function localSubscriptionAlive(): Promise<boolean> {
+    if (typeof navigator === 'undefined' || !('serviceWorker' in navigator)) return false;
+    try {
+      const registration = await navigator.serviceWorker.getRegistration();
+      const subscription = await registration?.pushManager.getSubscription();
+      return Boolean(subscription);
+    } catch {
+      return false;
     }
   }
 
@@ -128,7 +194,13 @@
     try {
       await saveNotifyChannel(buildNotifyChannelPayload(draft));
       await load();
-      note = { kind: 'ok', message: '通道已保存，作为整体覆盖配置文件。' };
+      note = {
+        kind: 'ok',
+        message:
+          draft.channel === 'webpush'
+            ? '通道已保存；VAPID 密钥对已在服务端生成（公钥见下方订阅一节）。'
+            : '通道已保存，作为整体覆盖配置文件。',
+      };
     } catch (err) {
       note = { kind: 'bad', message: (err as Error).message };
     } finally {
@@ -161,6 +233,134 @@
       note = { kind: 'bad', message: (err as Error).message };
     } finally {
       saving = false;
+    }
+  }
+
+  /**
+   * 订阅此设备（票面 12 号故事）：**整条链都在这一次点击的手势里**——
+   * `requestPermission` → `pushManager.subscribe` → 上报服务端。
+   *
+   * 权限弹窗只能由用户手势触发：进页面自动弹会被系统记成「骚扰」并可能被永久拒绝
+   * （那之后连点按钮都不再弹），故本页**没有**任何自动弹窗的路径。
+   */
+  async function subscribeThisDevice() {
+    if (!settings) return;
+    pushBusy = true;
+    note = null;
+    try {
+      const key = urlBase64ToUint8Array(settings.vapid_public_key);
+      if (!key) {
+        throw new Error('服务端还没有 VAPID 公钥：先保存一次「浏览器推送」通道（保存时自动生成）。');
+      }
+      if (!('serviceWorker' in navigator)) {
+        throw new Error('这个浏览器没有 service worker，用不了浏览器推送。');
+      }
+      // ① 权限（必须在手势里）
+      const permission = await Notification.requestPermission();
+      face = pushFace(readPushEnv());
+      if (permission !== 'granted') {
+        note = {
+          kind: 'bad',
+          message:
+            permission === 'denied'
+              ? pushFaceHint('denied')
+              : '这次没有授权。想订阅的话再点一次这颗钮即可。',
+        };
+        return;
+      }
+      // ② 订阅（浏览器与推送服务打交道——服务端不参与这一步）
+      const registration = await navigator.serviceWorker.ready;
+      const subscription = await registration.pushManager.subscribe({
+        userVisibleOnly: true,
+        applicationServerKey: key,
+      });
+      // ③ 上报服务端（过配对令牌守卫：`request` 自动带令牌）
+      const json = subscription.toJSON();
+      const endpoint = json.endpoint;
+      const keys = json.keys;
+      if (!endpoint || !keys?.p256dh || !keys.auth) {
+        throw new Error('浏览器给的订阅缺件（endpoint / p256dh / auth），这次没上报。');
+      }
+      const saved = await subscribePushDevice({
+        endpoint,
+        keys: { p256dh: keys.p256dh, auth: keys.auth },
+      });
+      rememberLocalSubscriptionId(saved.id);
+      await load();
+      note = { kind: 'ok', message: '这台设备已订阅：流水线的通知会推到它的通知中心。' };
+    } catch (err) {
+      await load();
+      note = { kind: 'bad', message: (err as Error).message };
+    } finally {
+      pushBusy = false;
+    }
+  }
+
+  /** 退订此设备：本地先退、再按记得的行 id 删服务端那一行（记不到就只本地退）。 */
+  async function unsubscribeThisDevice() {
+    pushBusy = true;
+    note = null;
+    try {
+      const registration = await navigator.serviceWorker.getRegistration();
+      const subscription = await registration?.pushManager.getSubscription();
+      await subscription?.unsubscribe();
+      const id = readLocalSubscriptionId();
+      if (id !== null) {
+        await deletePushSubscription(id);
+        forgetLocalSubscriptionId();
+      }
+      await load();
+      note = {
+        kind: 'ok',
+        message:
+          id !== null
+            ? '这台设备已退订，服务端那一行也删掉了。'
+            : '这台设备已退订（服务端那一行会在下次投递收到 410 时自动清掉）。',
+      };
+    } catch (err) {
+      note = { kind: 'bad', message: (err as Error).message };
+    } finally {
+      pushBusy = false;
+    }
+  }
+
+  async function revokeSubscriptions() {
+    pushBusy = true;
+    note = null;
+    try {
+      const res = await clearPushSubscriptions();
+      forgetLocalSubscriptionId();
+      await load();
+      note = {
+        kind: 'ok',
+        message: `已清空 ${res.removed} 条订阅${subscribedHere ? '（这台设备的浏览器里那份订阅还在，可从浏览器设置里撤销）' : ''}。`,
+      };
+    } catch (err) {
+      note = { kind: 'bad', message: (err as Error).message };
+    } finally {
+      pushBusy = false;
+    }
+  }
+
+  async function revokeSubscription(id: number) {
+    pushBusy = true;
+    note = null;
+    try {
+      await deletePushSubscription(id);
+      // 撤掉的正是这台设备那一行时，浏览器里那份订阅也一并退掉（否则本机仍算「已订阅」，
+      // 而服务端已经没有它了——清单与事实会对不上）。
+      if (readLocalSubscriptionId() === id) {
+        forgetLocalSubscriptionId();
+        const registration = await navigator.serviceWorker.getRegistration();
+        const subscription = await registration?.pushManager.getSubscription();
+        await subscription?.unsubscribe();
+      }
+      await load();
+      note = { kind: 'ok', message: '那一台设备已撤销。' };
+    } catch (err) {
+      note = { kind: 'bad', message: (err as Error).message };
+    } finally {
+      pushBusy = false;
     }
   }
 
@@ -339,6 +539,20 @@
             前置：Mac 上装好 <b>BlueBubbles</b> 并登录 iMessage，服务端开启；消息没到先查
             系统设置 → 隐私与安全性 → 自动化里有没有被拒的授权。
           </p>
+        {:else if draft.channel === 'webpush'}
+          <!-- 浏览器推送（pwa-webpush 02）：这一格没有必填件——订阅与 VAPID 密钥对都在
+               服务端库里，保存这个动作本身就会把密钥对生成出来。 -->
+          <p class="sec-note">
+            这一格没有要填的东西：保存一次就会在服务端生成一对 <b>VAPID</b> 密钥（首次
+            启用自动生成），然后在下面的「订阅」一节里把这台设备订上。
+          </p>
+          {#if settings.vapid_public_key}
+            <p class="sec-note mono">
+              公钥 {settings.vapid_public_key.slice(0, 16)}… · 私钥 {settings.vapid_private_key}
+            </p>
+          {:else}
+            <p class="sec-note bad">还没有 VAPID 密钥——保存一次这个通道就会生成。</p>
+          {/if}
         {:else}
           <label class="field">
             <span class="lab">webhook 地址（含 token 的完整 URL）</span>
@@ -365,6 +579,105 @@
         </p>
       </div>
     </section>
+
+    <!-- 浏览器推送的订阅（pwa-webpush 03）：权限四态 + 订阅钮 + 已订阅设备清单。
+         只在通道 = 浏览器推送时摆出来——别的通道下这一节没有意义（订阅了也不会被推）。 -->
+    {#if pushSection}
+      <section class="block" aria-labelledby="push-head">
+        <h2 class="sec-title" id="push-head">订阅</h2>
+        <p class="hintline">
+          推送由浏览器的推送服务转交（iOS 走 APNs），**同一条通知每台订阅设备各收一份**；
+          一个设备一份订阅，这里管的就是这份清单。
+        </p>
+        <div class="form">
+          <div class="row">
+            <span class="st dim">{pushFaceLabel(face.kind)}</span>
+            <span class="sec-note inline">{pushFaceHint(face.kind)}</span>
+          </div>
+          <div class="acts">
+            {#if face.canSubscribe}
+              {#if subscribedHere}
+                <span class="st run">[已订阅]</span>
+                <button
+                  type="button"
+                  class="btn"
+                  disabled={pushBusy}
+                  onclick={() => void unsubscribeThisDevice()}
+                >
+                  {#if pushBusy}<span class="spin"></span>{/if}退订此设备
+                </button>
+              {:else}
+                <button
+                  type="button"
+                  class="btn solid"
+                  disabled={pushBusy || !settings.vapid_public_key}
+                  onclick={() => void subscribeThisDevice()}
+                >
+                  {#if pushBusy}<span class="spin"></span>{/if}订阅此设备
+                </button>
+                {#if !settings.vapid_public_key}
+                  <span class="sec-note inline">先保存一次「浏览器推送」通道。</span>
+                {/if}
+              {/if}
+            {:else if face.kind === 'ios-needs-install'}
+              <span class="banner-inline">请先添加到主屏幕</span>
+            {/if}
+          </div>
+        </div>
+
+        <!-- 已订阅设备清单（票 04）：时间 / UA / 单个撤销 / 全部清空。 -->
+        <div class="reg">
+          {#if listError}
+            <div class="banner error" role="alert">{listError}</div>
+          {:else if subscriptions === null}
+            <div class="banner">正在读取已订阅设备…</div>
+          {:else if subscriptions.length === 0}
+            <p class="sec-note">
+              还没有设备订阅。在这台设备上点上面的「订阅此设备」——或者在手机上打开
+              同样的地址（HTTPS）再订一次。
+            </p>
+          {:else}
+            <ul class="reg-rows">
+              {#each subscriptions as sub (sub.id)}
+                <li class="reg-row">
+                  <div class="reg-main">
+                    <div class="reg-l1">
+                      <span class="reg-name mono">{sub.endpoint_hint}</span>
+                      <span class="st dim">{formatDateTime(sub.created_at)}</span>
+                    </div>
+                    <div class="reg-l2 mono">
+                      <span>{sub.user_agent || '（浏览器没报 UA）'}</span>
+                    </div>
+                  </div>
+                  <button
+                    type="button"
+                    class="btn quiet"
+                    disabled={pushBusy}
+                    onclick={() => void revokeSubscription(sub.id)}
+                  >
+                    撤销
+                  </button>
+                </li>
+              {/each}
+            </ul>
+            <div class="acts">
+              <button
+                type="button"
+                class="btn quiet"
+                disabled={pushBusy}
+                onclick={() => void revokeSubscriptions()}
+              >
+                全部清空
+              </button>
+            </div>
+          {/if}
+        </div>
+        <p class="sec-note">
+          清单只显示 endpoint 的**摘要**（它是能往那台设备推报文的能力地址，不该整条摆出来）；
+          服务端发现某条订阅已失效（推送服务回 410）时会自动把它从清单里删掉。
+        </p>
+      </section>
+    {/if}
 
     <!-- 礼貌两件（284②）：与通道单元**各自成立**的第二组——同构的整体覆盖 + provenance。 -->
     {#if politeness}
@@ -475,6 +788,19 @@
   .banner.ok {
     border-color: var(--go);
     color: var(--go);
+  }
+  /* 权限态里那种「一句话代替按钮」的标牌（iOS 非主屏）：与 .st 同一套基元形状，
+     颜色取 --pending（「等你动手」那一档，不新增 token）。 */
+  .banner-inline {
+    padding: 6px 10px;
+    border: 2px solid var(--pending);
+    color: var(--text-hi);
+    font-size: 12px;
+  }
+  /* 设备清单每行右侧那颗「撤销」钮：标题行与它同行、正文行在下面。 */
+  .reg-row {
+    align-items: flex-start;
+    gap: 10px;
   }
   .retry {
     margin: 8px 0 12px;

@@ -28,5 +28,9 @@ pub mod scheduler;
 pub mod sse;
 pub mod storage;
 pub mod types;
+/// 浏览器推送的密码学三件（spec `.scratch/pwa-webpush/` 票 02）：RFC 8291 的报文加密、
+/// RFC 8188 的 `aes128gcm` 记录、RFC 8292 的 VAPID 鉴权。原语走 ring（已在依赖树里），
+/// 组装那几行由 RFC 的公开测试向量钉住（`webpush.rs` 的 KAT）。
+pub mod webpush;
 
 pub use error::{Error, Result};

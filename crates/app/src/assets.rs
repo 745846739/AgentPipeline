@@ -87,11 +87,17 @@ const CACHE_IMMUTABLE: &str = "public, max-age=31536000, immutable";
 /// 地址递进去的（决策 191）。manifest 被这么钉过一次的后果很重——手机拿旧副本建图标，
 /// 等于把决策 285 的修复挡在门外。
 ///
+/// `sw.js` 同属这一族（决策 323）：service worker 的地址固定（注册时写死 `/sw.js`，
+/// 浏览器按地址判断「是否同一个 worker」）、内容随每次构建而变，且**它就是行为本身**——
+/// 旧的 `push`/`notificationclick` 处理器被长缓存钉住，服务端改了通知的跳转语义也推不到
+/// 设备上。它比 manifest 更急：manifest 有 24 小时兜底重取，而 SW 脚本的复验时机由
+/// 浏览器决定，长缓存会把它推到「最长一年」。
+///
 /// **图标与字体仍走 `immutable`**（有意）：它们陈旧只是观感问题，而代价是实打实的——
 /// 主题六自托管 78 个 woff2 子集（决策 169），改成每次回源就是每次开页重取一遍。
 fn cache_for(name: &str) -> &'static str {
     match name {
-        "index.html" | "manifest.webmanifest" => CACHE_NO_CACHE,
+        "index.html" | "manifest.webmanifest" | "sw.js" => CACHE_NO_CACHE,
         _ => CACHE_IMMUTABLE,
     }
 }
@@ -211,13 +217,16 @@ mod tests {
         );
     }
 
-    /// 缓存策略的牙齿（决策 285）：**地址固定、内容会变的那两份必须复验**。
+    /// 缓存策略的牙齿（决策 285）：**地址固定、内容会变的那几份必须复验**。
     /// 少了它，manifest 会被当带哈希的产物发一年期 `immutable`——手机拿旧副本建主屏图标，
     /// 图标就丢掉了地址里的配对令牌（决策 191 的契约），而源码里怎么改都推不过去。
+    /// `sw.js` 同理（决策 323）：浏览器按地址判断「同一个 worker」，旧副本被钉住就等于
+    /// 通知的跳转语义永远停在部署那一刻。
     #[test]
     fn mutable_behavioral_files_revalidate() {
         assert_eq!(cache_for("index.html"), CACHE_NO_CACHE);
         assert_eq!(cache_for("manifest.webmanifest"), CACHE_NO_CACHE);
+        assert_eq!(cache_for("sw.js"), CACHE_NO_CACHE);
         // 带内容哈希的产物与纯视觉资产仍长缓存（理由见 cache_for 的注释）。
         assert_eq!(cache_for("assets/index-CnQTDGQQ.js"), CACHE_IMMUTABLE);
         assert_eq!(cache_for("icons/icon-192.png"), CACHE_IMMUTABLE);

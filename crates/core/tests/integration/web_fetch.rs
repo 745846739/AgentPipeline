@@ -132,6 +132,7 @@ pub struct TinyHttp {
     addr: std::net::SocketAddr,
     hits: Arc<AtomicUsize>,
     first_line: Arc<Mutex<String>>,
+    head: Arc<Mutex<String>>,
     body: Arc<Mutex<Vec<u8>>>,
     alive: Arc<AtomicBool>,
 }
@@ -146,6 +147,15 @@ impl TinyHttp {
     pub fn body(&self) -> Vec<u8> {
         self.body.lock().unwrap().clone()
     }
+
+    /// 最近一次请求的**完整头部**（方法行 + 头字段，到空行为止）。
+    ///
+    /// 比 `first_request_line` 多看一层头：浏览器推送的判据里有几条只在头上
+    /// （`authorization: vapid …` / `content-encoding: aes128gcm` / `ttl`）——
+    /// 那几条正是「推送服务会不会收下这条」的区别所在。
+    pub fn request_head(&self) -> String {
+        self.head.lock().unwrap().clone()
+    }
 }
 
 impl TinyHttp {
@@ -157,13 +167,15 @@ impl TinyHttp {
         let addr = listener.local_addr().unwrap();
         let hits = Arc::new(AtomicUsize::new(0));
         let first_line = Arc::new(Mutex::new(String::new()));
+        let head = Arc::new(Mutex::new(String::new()));
         // 请求报文体捕获——**不叫 `body`**：`spawn` 的形参 `body` 是应答正文，撞名会把
         // 下面 `write_all(&body)` 静默改成写这段 Arc（编译器会叫，但别给它机会）。
         let captured = Arc::new(Mutex::new(Vec::new()));
         let alive = Arc::new(AtomicBool::new(true));
-        let (h2, f2, b2, a2) = (
+        let (h2, f2, hd2, b2, a2) = (
             hits.clone(),
             first_line.clone(),
+            head.clone(),
             captured.clone(),
             alive.clone(),
         );
@@ -173,7 +185,6 @@ impl TinyHttp {
             while a2.load(Ordering::SeqCst) {
                 match listener.accept() {
                     Ok((mut sock, _)) => {
-                        h2.fetch_add(1, Ordering::SeqCst);
                         // 读到「头 + Content-Length 齐了」或对端停手（测试载荷都是小 JSON，
                         // 几轮就读完；500ms 读超时只是兜底，齐了立刻收工不等下一拍）。
                         let _ = sock.set_read_timeout(Some(Duration::from_millis(500)));
@@ -202,8 +213,15 @@ impl TinyHttp {
                             }
                         }
                         if let Some(h) = body_start {
+                            *hd2.lock().unwrap() = String::from_utf8_lossy(&raw[..h]).to_string();
                             *b2.lock().unwrap() = raw[h..].to_vec();
                         }
+                        // **命中计数放在这里，不是 accept 那一刻**：`wait_hits` 的调用方
+                        // 一律是「等它到了 → 读 `body()` / `request_head()`」，而先计数后读
+                        // 报文之间有一个窗口——实测在机器同时跑别的构建时踩到过（body 还是空
+                        // 的，`serde_json::from_str` 报 `EOF while parsing a value`）。
+                        // 计数的语义因此是「这一条请求已经收全、可读了」。
+                        h2.fetch_add(1, Ordering::SeqCst);
                         if !delay.is_zero() {
                             std::thread::sleep(delay);
                         }
@@ -226,6 +244,7 @@ impl TinyHttp {
             addr,
             hits,
             first_line,
+            head,
             body: captured,
             alive,
         }

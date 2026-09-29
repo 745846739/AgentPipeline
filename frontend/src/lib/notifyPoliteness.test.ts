@@ -35,6 +35,8 @@ describe('notifyPoliteness（决策 284）', () => {
       cooldown_sec: 60,
       quiet_hours: [23, 7],
       politeness_origin: 'settings',
+      vapid_public_key: '',
+      vapid_private_key: '',
     } satisfies NotifySettings;
     expect(draftFromSettings(s)).toEqual({
       cooldownSec: '60',

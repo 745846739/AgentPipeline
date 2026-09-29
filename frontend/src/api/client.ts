@@ -19,6 +19,8 @@ import type {
   NotifyChannelPayload,
   NotifyChannelTest,
   NotifyPolitenessPayload,
+  PushSubscriptionList,
+  PushSubscriptionPayload,
   ForemanWatchSettings,
   RtkSettings,
   NotifySettings,
@@ -627,6 +629,40 @@ export function saveNotifyPoliteness(
 /** 交还 `config.toml` 的 `[notify]` 那一份；开关与通道单元都不动（284⑦）。 */
 export function clearNotifyPoliteness(): Promise<{ ok: boolean }> {
   return request<{ ok: boolean }>('/notify/politeness', { method: 'DELETE' });
+}
+
+/**
+ * 订阅此设备（`POST /notify/push/subscriptions`，pwa-webpush 02）：按 `endpoint`
+ * upsert（同设备两次订阅落一行），返回那一行的 id（本机退订时按它删）。
+ *
+ * **过配对令牌守卫**：局域网来源要带令牌（`request` 自动带上），回环豁免。
+ */
+export function subscribePushDevice(
+  payload: PushSubscriptionPayload,
+): Promise<{ ok: boolean; id: number }> {
+  return request<{ ok: boolean; id: number }>('/notify/push/subscriptions', {
+    method: 'POST',
+    body: payload,
+  });
+}
+
+/** 已订阅设备清单（`GET`，**读也过配对守卫**——它是外泄管道，不是公开读数）。 */
+export function listPushSubscriptions(): Promise<PushSubscriptionList> {
+  return request<PushSubscriptionList>('/notify/push/subscriptions');
+}
+
+/** 撤销一台设备（单个撤销）。 */
+export function deletePushSubscription(id: number): Promise<{ ok: boolean; removed: boolean }> {
+  return request<{ ok: boolean; removed: boolean }>(`/notify/push/subscriptions/${id}`, {
+    method: 'DELETE',
+  });
+}
+
+/** 一键清空订阅（换手机 / 怀疑被订阅过时的收回动作）。 */
+export function clearPushSubscriptions(): Promise<{ ok: boolean; removed: number }> {
+  return request<{ ok: boolean; removed: number }>('/notify/push/subscriptions', {
+    method: 'DELETE',
+  });
 }
 
 /** BlueBubbles 连通性探针（照 `POST /providers/test`，决策 160：成功失败都 200）。 */

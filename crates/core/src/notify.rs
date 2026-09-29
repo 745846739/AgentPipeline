@@ -35,6 +35,22 @@
 //! `foreman_reply` 是后端独有的类（前端没有回话完成的 SSE 事件，toast 面根本见不到它），
 //! 同样不进共享表。两条都记在 fixture 的 `$comment` 与两侧守卫里。共享表因此只收
 //! 两边共有的语义子集（`pending` / `done` / `failed` × 免打扰 × 节流）。
+//!
+//! **第五支：浏览器推送（spec `.scratch/pwa-webpush/` 票 02）**。它是**第四个互斥通道**
+//! （与 generic / feishu / bluebubbles 四选一，沿 272 的单行三选一形状；「多出口并存」
+//! 仍归 272 踢出的那一票），触发面与礼貌门**零新增**——同一条 attention 漏斗、同三处
+//! 值班长直调、同一道 `dispatch()`。三处与既有通道不同：
+//!
+//! 1. **通道没有寻址件**：订阅行（每设备一行）与 VAPID 密钥对都在库里
+//!    （`storage::push`，0037），出口按 `Store` 现场读——故 `NotifyTarget::WebPush`
+//!    是不带字段的一个值，解析层不需要任何必填件。
+//! 2. **一条通知扇出到 N 条 HTTP**（N = 活订阅数），每条各做一次 RFC 8291 加密
+//!    （`crate::webpush`）；推送服务回 404 / 410 = 那台设备的订阅死了，**删行**。
+//! 3. **报文多一个 `url`**（push 独有，其余三种格式一字不改）：深链由服务端拼好，
+//!    service worker 只消费。规则见 [`attention_deep_link`] / [`talk_deep_link`]。
+//!
+//! 触发事件集与 iMessage 通道**完全一致**（票面 29：将来同批增减）——`SlowRun` 照旧
+//! 一个字节不出站。
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
@@ -45,10 +61,12 @@ use serde::{Deserialize, Serialize};
 
 use crate::clock::Clock;
 use crate::storage::attention::AttentionKind;
+use crate::storage::Store;
 use crate::{Error, Result};
 
-/// 报文格式（决策 270，272① 扩到第四支）：同一份通用事件、按目标选序列化——政策语义
-/// （cooldown / 免打扰 / `wakes()` 触发面）与格式无关，只有最后拼 payload 分流。
+/// 报文格式（决策 270，272① 扩到第四支、pwa-webpush 02 扩到第五支）：同一份通用事件、
+/// 按目标选序列化——政策语义（cooldown / 免打扰 / `wakes()` 触发面）与格式无关，
+/// 只有最后拼 payload 分流。
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum NotifyFormat {
@@ -62,6 +80,10 @@ pub enum NotifyFormat {
     /// POST 到 `{端点}/api/v1/message/text?password=`。`method` 恒 `apple-script`
     /// 且**不暴露配置**（`private-api` 要另装私有 API helper，属部署面额外要求）。
     BlueBubbles,
+    /// 浏览器推送（spec `.scratch/pwa-webpush/` 票 02）：标准 Web Push——每条**活订阅**
+    /// 各发一条 RFC 8291 加密的 `{title, body, url}`（`url` 是这一支独有的字段）。
+    /// 它没有单一寻址件（订阅在库里、密钥对也在库里），见 [`NotifyTarget::WebPush`]。
+    WebPush,
 }
 
 impl NotifyFormat {
@@ -70,6 +92,7 @@ impl NotifyFormat {
             "generic" => Some(NotifyFormat::Generic),
             "feishu" => Some(NotifyFormat::Feishu),
             "bluebubbles" => Some(NotifyFormat::BlueBubbles),
+            "webpush" => Some(NotifyFormat::WebPush),
             _ => None,
         }
     }
@@ -80,6 +103,7 @@ impl NotifyFormat {
             NotifyFormat::Generic => "generic",
             NotifyFormat::Feishu => "feishu",
             NotifyFormat::BlueBubbles => "bluebubbles",
+            NotifyFormat::WebPush => "webpush",
         }
     }
 }
@@ -246,16 +270,54 @@ fn encode_query_component(s: &str) -> String {
 /// 一条通知的**内容**（分流前的最后一层）：`title` 已带 `[AgentPipeline]` 前缀，
 /// `body` 在各自入口处就定型——attention 线只带归因白名单（268④），回话线带回话
 /// 正文（272⑤ 对本人通道的显式豁免，截断 200 字），失败线只带类别不带原文。
+///
+/// `url`（pwa-webpush 02）是**浏览器推送独有的字段**：深链由服务端拼好（前端那几条
+/// hash 路由的形状见 [`attention_deep_link`] / [`talk_deep_link`]），service worker
+/// 只消费。其余三种格式一个字都不用它——于是「深链规则」这一件只在有 service worker
+/// 的那条线上存在。
 struct Notice<'a> {
     kind: &'a str,
     task_id: Option<&'a str>,
     occurred_at: DateTime<Utc>,
     title: String,
     body: String,
+    url: String,
 }
 
-/// **唯一分流点**（决策 270②；272① 扩到第四支 BlueBubbles）。归因白名单与
-/// 「detail 原文不出网」在分流前共用——一个字节的纪律不因格式松动。
+// 看板首页 `#/` 这个兜底落点**只在前端存在**（`lib/pushPayload.ts` 的 `BOARD_HOME_HASH`：
+// payload 里的 `url` 不可用时的降级）。服务端这一侧不发 `#/`：每一条出站通知都挂在一个具体
+// 的任务或班次上，拼不出落点的情形不存在（票面「不可达时降级到看板首页而不是白屏」）。
+// 原先这里有一个 `BOARD_HOME` 常量，没有任何消费者，落地时删掉（决策 323 的记录口径：
+// 不留只为「以后可能用」的钩子）。
+
+/// attention 线的深链落点（票面「深链规则」的后半句）。
+///
+/// 两类事件两种落点，判据是 detail 里有没有 `run_id`：
+/// - **卡片级**（待拍板 / 完成 / 取消 / 停滞 / 等人处理这一族：事件挂在任务上）→
+///   任务详情 `#/task/<task_id>`，也就是那张卡的现场。
+/// - **流水线级**（失败族：`run_failed` / `retry_exhausted` / `context_overflow`，以及
+///   带 `run_id` 的卡住类）→ 同一页再带上 `?run=<run_id>`：任务详情里的**对话页签**
+///   按它定位到那一次运行（`?run=` 是决策 326 定的查询串契约，消费者见 `TaskDetail.svelte`）。
+///   落点仍是那张卡（用户要的是「哪台机器停了」，而卡是它的身份），多的那一段是
+///   「停在哪一次运行」。
+pub fn attention_deep_link(task_id: &str, detail: Option<&serde_json::Value>) -> String {
+    match detail
+        .and_then(|d| d.get("run_id"))
+        .and_then(|v| v.as_i64())
+    {
+        Some(run_id) => format!("#/task/{task_id}?run={run_id}"),
+        None => format!("#/task/{task_id}"),
+    }
+}
+
+/// 值班长那条线的深链落点：对讲台的**那一班**（`?session=` 是决策 217① 起的既有参数，
+/// 地址里那一班才是权威）。
+pub fn talk_deep_link(session_id: &str) -> String {
+    format!("#/talk?session={session_id}")
+}
+
+/// **唯一分流点**（决策 270②；272① 扩到 BlueBubbles、pwa-webpush 02 扩到 Web Push）。
+/// 归因白名单与「detail 原文不出网」在分流前共用——一个字节的纪律不因格式松动。
 ///
 /// `bb_address` 只在 `format = BlueBubbles` 时被读（拼 `chatGuid`）。
 fn render(format: NotifyFormat, notice: &Notice, bb_address: Option<&str>) -> serde_json::Value {
@@ -291,10 +353,18 @@ fn render(format: NotifyFormat, notice: &Notice, bb_address: Option<&str>) -> se
                 "method": "apple-script",
             })
         }
+        // 浏览器推送的报文体（票面点名三件：title / body / url）——这份 JSON 就是
+        // RFC 8291 要加密的明文，浏览器侧 `push` 事件里 `event.data.json()` 读它。
+        NotifyFormat::WebPush => serde_json::json!({
+            "title": notice.title,
+            "body": notice.body,
+            "url": notice.url,
+        }),
     }
 }
 
-/// attention 线的报文（268④ 六字段契约 / 270② feishu / 272① bluebubbles）。
+/// attention 线的报文（268④ 六字段契约 / 270② feishu / 272① bluebubbles /
+/// pwa-webpush 02 webpush）。落点由 [`attention_deep_link`] 按 detail 里的 `run_id` 定。
 pub fn payload_for(
     format: NotifyFormat,
     kind: AttentionKind,
@@ -309,6 +379,7 @@ pub fn payload_for(
         occurred_at,
         title: format!("[AgentPipeline] {task_id} {}", kind.as_str()),
         body: attribution_body(kind, task_id, detail),
+        url: attention_deep_link(task_id, detail),
     };
     render(format, &notice, bb_address)
 }
@@ -320,8 +391,12 @@ const FOREMAN_REPLY_BODY_CHARS: usize = 200;
 /// 值班长**回话完成**的报文（决策 272②⑤）：正文 = 回话原文（截断）+ 会话名在
 /// `title` 里——多会话时否则不知是哪一轮。这是对 268④ 的一次**显式修订**（本人通道）：
 /// 出机器、不出账户；豁免只覆盖回话正文，不覆盖日志/命令输出/`detail` 原文。
+///
+/// `session_id`（pwa-webpush 02 添）只服务深链：点开推送落到**这一班**的对话，
+/// 而不是对讲台的第一班。
 pub fn foreman_reply_payload_for(
     format: NotifyFormat,
+    session_id: &str,
     session_name: &str,
     reply: &str,
     occurred_at: DateTime<Utc>,
@@ -333,6 +408,7 @@ pub fn foreman_reply_payload_for(
         occurred_at,
         title: format!("[AgentPipeline] {session_name} 回话"),
         body: truncate_chars(reply.trim(), FOREMAN_REPLY_BODY_CHARS),
+        url: talk_deep_link(session_id),
     };
     render(format, &notice, bb_address)
 }
@@ -342,6 +418,7 @@ pub fn foreman_reply_payload_for(
 /// 这一条线；类别已足够把「续费」与「查网络」分开，现场在对讲台里）。
 pub fn foreman_failure_payload_for(
     format: NotifyFormat,
+    session_id: &str,
     session_name: &str,
     kind: &str,
     occurred_at: DateTime<Utc>,
@@ -353,11 +430,12 @@ pub fn foreman_failure_payload_for(
         occurred_at,
         title: format!("[AgentPipeline] {session_name} 回话失败"),
         body: format!("这一轮没跑起来（{kind}）——详情见对讲台的失败账。"),
+        url: talk_deep_link(session_id),
     };
     render(format, &notice, bb_address)
 }
 
-/// 投递目标（决策 272⑥）：两条通道的寻址面。完整 URL 的拼法**只有这里认识**——
+/// 投递目标（决策 272⑥）：通道的寻址面。完整 URL 的拼法**只有这里认识**——
 /// 组合出的 URL 是秘密（password 在 query 里），除 `without_url()` 外不许进任何日志。
 #[derive(Debug, Clone, PartialEq)]
 pub enum NotifyTarget {
@@ -371,6 +449,11 @@ pub enum NotifyTarget {
         password: String,
         address: String,
     },
+    /// 浏览器推送（pwa-webpush 02）：**没有寻址件**——每条订阅的 endpoint 在
+    /// `kanban_push_subscription` 里（每设备一行），VAPID 密钥对在 `kanban_notify_channel`
+    /// 那行（首次启用自动生成）。两者都由出口按 `Store` 现场读，故这里是一个不带字段的值
+    /// （「通道选它就够」——与 272⑥ 的整体覆盖不冲突：没有任何东西需要用户填）。
+    WebPush,
 }
 
 impl NotifyTarget {
@@ -379,6 +462,7 @@ impl NotifyTarget {
         match self {
             NotifyTarget::Webhook { format, .. } => *format,
             NotifyTarget::BlueBubbles { .. } => NotifyFormat::BlueBubbles,
+            NotifyTarget::WebPush => NotifyFormat::WebPush,
         }
     }
 
@@ -386,22 +470,30 @@ impl NotifyTarget {
     fn bb_address(&self) -> Option<&str> {
         match self {
             NotifyTarget::BlueBubbles { address, .. } => Some(address),
-            NotifyTarget::Webhook { .. } => None,
+            NotifyTarget::Webhook { .. } | NotifyTarget::WebPush => None,
         }
     }
 
-    /// 发送用的完整 URL——**只在 `tokio::spawn` 的闭包里现拼**，拼出来的字符串
-    /// 不落任何变量名带 `log` / `debug` 的地方（272⑦）。
-    fn send_url(&self) -> String {
+    /// 这份目标怎么投（pwa-webpush 02 添第二支）：一条 POST 到固定地址，还是扇出到
+    /// 所有活订阅。**分流与地址拼装都在这一处**——早先是「`delivery()` 判一次通道、
+    /// `send_url()` 再对同一个枚举判一次」，于是 Web Push 那一支只能给一个 `unreachable!()`
+    /// 的臂；一个运行期会 panic 的形状正是 `Delivery` 想消灭的东西（决策 323）。
+    ///
+    /// 地址**只在 HTTP 那一支现拼**，且拼出来的字符串不落任何名字带 `log` / `debug` 的
+    /// 地方（272⑦：URL 里带 password / token）。
+    fn delivery(&self) -> Delivery {
         match self {
-            NotifyTarget::Webhook { url, .. } => url.clone(),
+            NotifyTarget::Webhook { url, .. } => Delivery::Http(url.clone()),
             NotifyTarget::BlueBubbles {
                 endpoint, password, ..
-            } => format!(
+            } => Delivery::Http(format!(
                 "{}/api/v1/message/text?password={}",
                 endpoint.trim_end_matches('/'),
                 encode_query_component(password)
-            ),
+            )),
+            // 浏览器推送没有**单一**地址：它扇出到每一条订阅的 endpoint，那些地址在库里
+            // （`storage::push`），且是逐条从 DB 读的。
+            NotifyTarget::WebPush => Delivery::Push,
         }
     }
 }
@@ -514,7 +606,9 @@ pub fn resolve_politeness(
 }
 
 /// 配置级（声明式缺省）：`webhook_url` 缺席 = 整段关死（268①，零配置零行为）；
-/// `format = bluebubbles` 声明了就要求三件齐（缺件是配置错误，不是「没配」）。
+/// `format = bluebubbles` 声明了就要求三件齐（缺件是配置错误，不是「没配」）；
+/// `format = webpush` 没有任何必填件（订阅与密钥对都在库里，见 [`NotifyTarget::WebPush`]）
+/// ——声明了就是开了。
 fn resolve_config_level(config: &crate::config::NotifyConfig) -> Result<Option<NotifyTarget>> {
     match config.format {
         NotifyFormat::Generic | NotifyFormat::Feishu => match config.webhook_url.as_deref() {
@@ -531,6 +625,7 @@ fn resolve_config_level(config: &crate::config::NotifyConfig) -> Result<Option<N
             config.bluebubbles_password.as_deref(),
             config.bluebubbles_recipient.as_deref(),
         ),
+        NotifyFormat::WebPush => Ok(Some(NotifyTarget::WebPush)),
     }
 }
 
@@ -582,6 +677,10 @@ fn resolve_unit(
                 address: address.to_string(),
             }))
         }
+        // 浏览器推送：**没有必填件**（订阅行与 VAPID 密钥对都在库里，票面「零手工配置」）。
+        // 声明了就是开了——「通道选它」本身就是完整的声明，故这里不看那几个
+        // Option 参数（客户端传来的字段一律忽略）。
+        NotifyFormat::WebPush => Ok(Some(NotifyTarget::WebPush)),
     }
 }
 
@@ -613,6 +712,11 @@ pub async fn ping_bluebubbles(endpoint: &str, password: &str) -> std::result::Re
 ///
 /// 与 `Store` 的挂接是 **可选** 的（`set_notifier`）：没配通道 = 整段关死，没配
 /// webhook 的部署里这条路径一个字节都不出。
+///
+/// `store`（pwa-webpush 02）：浏览器推送的**订阅行与 VAPID 密钥对**都在库里，出口
+/// 按它现场读（其余三条通道不看这个字段）。持的是一个 `Store` 句柄克隆——它本身
+/// 就是 Clone 的（内部 `Arc` 的池与出口槽），不构成引用环：`clear_notifier` /
+/// `set_notifier` 换掉出口时这个克隆随旧出口一起落地。
 pub struct WebhookNotifier {
     target: NotifyTarget,
     client: reqwest::Client,
@@ -620,17 +724,31 @@ pub struct WebhookNotifier {
     /// 由调用方解析好再构造，出口自己不认识两级。
     politeness: NotifyPoliteness,
     clock: Arc<dyn Clock>,
+    store: Store,
     /// 每类最近一次**尝试**时刻（镜像前端 `lastNotifiedAt` 的 per-class 语义）。
     /// 「尝试」而非「成功」：best-effort 不重试，重试循环会把通知变成新的噪音源。
     last_sent: Mutex<HashMap<NotifyClass, DateTime<Utc>>>,
 }
 
+/// 一次投递的形态（pwa-webpush 02 添第二支）：固定地址一条 POST，还是扇出到所有活订阅。
+/// 分流只发生一次（[`NotifyTarget::delivery`]），`dispatch` 的礼貌门与占坑对两支完全相同。
+enum Delivery {
+    Http(String),
+    Push,
+}
+
 impl WebhookNotifier {
-    pub fn new(target: NotifyTarget, politeness: NotifyPoliteness, clock: Arc<dyn Clock>) -> Self {
+    pub fn new(
+        target: NotifyTarget,
+        politeness: NotifyPoliteness,
+        clock: Arc<dyn Clock>,
+        store: Store,
+    ) -> Self {
         let client = reqwest::Client::builder()
             .timeout(WEBHOOK_TIMEOUT)
             // 不跟随重定向：这个 URL 是含 token 的秘密，302 会把它带去别的主机
-            // （与决策 266 网口同一条姿态——出站面的跳转就是洞）。
+            // （与决策 266 网口同一条姿态——出站面的跳转就是洞）。浏览器的推送
+            // endpoint 同理：它是能力 URL，跟一次 302 就是把它交给别人。
             .redirect(reqwest::redirect::Policy::none())
             .build()
             .expect("reqwest 客户端构造不该失败");
@@ -639,6 +757,7 @@ impl WebhookNotifier {
             client,
             politeness,
             clock,
+            store,
             last_sent: Mutex::new(HashMap::new()),
         }
     }
@@ -677,14 +796,19 @@ impl WebhookNotifier {
     /// **`traces.len()` 的门由调用方先过**（272③）：门必须发生在本方法之前——短轮
     /// 连 cooldown 槽都不碰，否则一次快问快答会把 `foreman_reply` 的 300 秒槽占掉、
     /// 把真正要追人的那条吞掉（cooldown 倒挂）。
+    ///
+    /// `session_id`（pwa-webpush 02 添）只进深链：点开推送落到**这一班**（其余三种
+    /// 格式看不见它）。
     pub fn notify_foreman_reply(
         &self,
+        session_id: &str,
         session_name: &str,
         reply: &str,
         occurred_at: DateTime<Utc>,
     ) {
         let payload = foreman_reply_payload_for(
             self.target.format(),
+            session_id,
             session_name,
             reply,
             occurred_at,
@@ -698,12 +822,14 @@ impl WebhookNotifier {
     /// `record_interrupted_turn`，与台账同拍（同批同类只落一行的那一格才叫人）。
     pub fn notify_foreman_failure(
         &self,
+        session_id: &str,
         session_name: &str,
         kind: &str,
         occurred_at: DateTime<Utc>,
     ) {
         let payload = foreman_failure_payload_for(
             self.target.format(),
+            session_id,
             session_name,
             kind,
             occurred_at,
@@ -739,19 +865,129 @@ impl WebhookNotifier {
         guard.insert(cls, now);
         drop(guard);
 
-        let url = self.target.send_url();
+        match self.target.delivery() {
+            Delivery::Http(url) => {
+                let client = self.client.clone();
+                tokio::spawn(async move {
+                    match client.post(&url).json(&payload).send().await {
+                        Ok(resp) if resp.status().is_success() => {}
+                        Ok(resp) => tracing::warn!(
+                            status = %resp.status(),
+                            "通知 webhook 返回非 2xx（best-effort，不重试）"
+                        ),
+                        Err(e) => tracing::warn!(
+                            error = %e.without_url(),
+                            "通知 webhook 投递失败（best-effort，不重试）"
+                        ),
+                    }
+                });
+            }
+            Delivery::Push => self.fan_out_push(payload, now),
+        }
+    }
+
+    /// 浏览器推送的扇出（pwa-webpush 02）：**每条活订阅各发一条**（票面：N 条 HTTP，
+    /// N = 活订阅数），每条各做一次 RFC 8291 加密。
+    ///
+    /// 记账位置与 HTTP 那一支一致（礼貌门在 `dispatch` 里已经过了、坑也占了）——
+    /// 「一类事件在窗口内只推一条」，与推到几台设备无关（那是同一件事的多个副本）。
+    ///
+    /// 逐条的错误处置（票面「410 / 失败即删行」的落点，**写清口径**）：
+    /// - **404 / 410** = 推送服务说这条订阅没了（RFC 8030 §5.4）→ **删行**。这是唯一
+    ///   一种「行是死」的证据，也是设备清单能保持干净的全部机制。
+    /// - 其余非 2xx（5xx / 429 / 401…）与网络错 → 只记日志、**不删行**：那些说的是
+    ///   「这一次没送出去」（推送服务在抖、VAPID 配错了），删行等于一次网络抖动就把
+    ///   用户的设备清单清空——那比「清单里留着一条暂时收不到的行」坏得多。
+    fn fan_out_push(&self, payload: serde_json::Value, now: DateTime<Utc>) {
+        let store = self.store.clone();
         let client = self.client.clone();
         tokio::spawn(async move {
-            match client.post(&url).json(&payload).send().await {
-                Ok(resp) if resp.status().is_success() => {}
-                Ok(resp) => tracing::warn!(
-                    status = %resp.status(),
-                    "通知 webhook 返回非 2xx（best-effort，不重试）"
-                ),
-                Err(e) => tracing::warn!(
-                    error = %e.without_url(),
-                    "通知 webhook 投递失败（best-effort，不重试）"
-                ),
+            let keys = match store.push_vapid_keys().await {
+                Ok(Some(keys)) => keys,
+                Ok(None) => {
+                    tracing::warn!(
+                        "浏览器推送缺 VAPID 密钥对（在设置页保存一次通道即可生成），这一条不出站"
+                    );
+                    return;
+                }
+                Err(e) => {
+                    tracing::warn!(error = %e, "读 VAPID 密钥对失败，这一条不出站");
+                    return;
+                }
+            };
+            let subscriptions = match store.list_push_subscriptions().await {
+                Ok(list) => list,
+                Err(e) => {
+                    tracing::warn!(error = %e, "读推送订阅失败，这一条不出站");
+                    return;
+                }
+            };
+            if subscriptions.is_empty() {
+                tracing::debug!("浏览器推送没有订阅设备，这一条不出站");
+                return;
+            }
+            let body = match serde_json::to_vec(&payload) {
+                Ok(body) => body,
+                Err(e) => {
+                    tracing::warn!(error = %e, "推送报文序列化失败");
+                    return;
+                }
+            };
+            for subscription in subscriptions {
+                // 每条订阅各自签一次（aud 是**那条** endpoint 的 origin）、各自加密
+                // （临时密钥与 salt 每条都新）。
+                let authorization =
+                    match crate::webpush::vapid_authorization(&keys, &subscription.endpoint, now) {
+                        Ok(value) => value,
+                        Err(e) => {
+                            tracing::warn!(error = %e, "VAPID 签名失败，跳过这条订阅");
+                            continue;
+                        }
+                    };
+                let encrypted = match crate::webpush::encrypt_payload(
+                    &subscription.p256dh,
+                    &subscription.auth,
+                    &body,
+                ) {
+                    Ok(bytes) => bytes,
+                    Err(e) => {
+                        tracing::warn!(error = %e, "推送报文集不上，跳过这条订阅");
+                        continue;
+                    }
+                };
+                let response = client
+                    .post(&subscription.endpoint)
+                    .header("Authorization", authorization)
+                    .header("Content-Encoding", "aes128gcm")
+                    .header("Content-Type", "application/octet-stream")
+                    .header("TTL", crate::webpush::PUSH_TTL_SECS.to_string())
+                    .body(encrypted)
+                    .send()
+                    .await;
+                match response {
+                    Ok(resp) if resp.status().is_success() => {}
+                    Ok(resp) if matches!(resp.status().as_u16(), 404 | 410) => {
+                        // 订阅已失效：删掉它（这就是设备清单永远只有活订阅的那条路）。
+                        match store.delete_push_subscription(subscription.id).await {
+                            Ok(_) => tracing::info!(
+                                device = %subscription.endpoint_hint(),
+                                "推送服务说这条订阅已失效（{}），已从清单里删掉",
+                                resp.status()
+                            ),
+                            Err(e) => tracing::warn!(error = %e, "删除失效订阅失败"),
+                        }
+                    }
+                    Ok(resp) => tracing::warn!(
+                        status = %resp.status(),
+                        device = %subscription.endpoint_hint(),
+                        "推送服务回非 2xx（best-effort，不重试；不清行）"
+                    ),
+                    Err(e) => tracing::warn!(
+                        error = %e.without_url(),
+                        device = %subscription.endpoint_hint(),
+                        "推送投递失败（best-effort，不重试；不清行）"
+                    ),
+                }
             }
         });
     }
@@ -957,6 +1193,7 @@ mod tests {
         let reply = "查完了：闸门挂在 lint。".repeat(30); // > 200 字
         let p = foreman_reply_payload_for(
             NotifyFormat::Generic,
+            "s1",
             "晚上的重构",
             &reply,
             Utc::now(),
@@ -980,6 +1217,7 @@ mod tests {
     fn foreman_failure_payload_carries_only_the_kind_not_the_raw_text() {
         let p = foreman_failure_payload_for(
             NotifyFormat::Feishu,
+            "s1",
             "晚上的重构",
             "llm_quota",
             Utc::now(),
@@ -994,6 +1232,172 @@ mod tests {
         assert!(!text.contains("原文"), "raw 原文段不出网：{text}");
     }
 
+    // ── pwa-webpush 02：第五支（浏览器推送）的报文与深链 ──
+
+    /// 推送报文就是票面点名的三件：`title` / `body` / `url`——**没有**通用格式的
+    /// `source` / `occurred_at`（那一份是 webhook 的契约，浏览器侧只消费这三件）。
+    #[test]
+    fn webpush_payload_carries_title_body_and_url_only() {
+        let p = payload_for(
+            NotifyFormat::WebPush,
+            AttentionKind::TaskPending,
+            "t1",
+            Utc::now(),
+            Some(&serde_json::json!({ "pending_kind": "gate", "error": "boom" })),
+            None,
+        );
+        assert_eq!(p.as_object().unwrap().len(), 3, "{p}");
+        assert!(p["title"].as_str().unwrap().contains("[AgentPipeline]"));
+        assert!(p["body"].as_str().unwrap().contains("pending_kind=gate"));
+        assert!(!p["body"].as_str().unwrap().contains("boom"), "{p}");
+        assert_eq!(p["url"], "#/task/t1", "{p}");
+    }
+
+    /// **深链规则**（票面两句）：卡片级（无 `run_id`）→ 那张卡；流水线级（带 `run_id`）
+    /// → 同一页的**那次运行**（`?run=` 是任务详情对话页签认的参数）。
+    #[test]
+    fn the_deep_link_tells_the_card_from_the_run() {
+        assert_eq!(attention_deep_link("t1", None), "#/task/t1");
+        assert_eq!(
+            attention_deep_link("t1", Some(&serde_json::json!({ "pending_kind": "gate" }))),
+            "#/task/t1",
+            "没有 run_id 的事件落在卡片上"
+        );
+        assert_eq!(
+            attention_deep_link("t1", Some(&serde_json::json!({ "run_id": 42 }))),
+            "#/task/t1?run=42"
+        );
+        // 回话 / 失败线没有 task_id，落点是对讲台的那一班。
+        assert_eq!(talk_deep_link("s9"), "#/talk?session=s9");
+    }
+
+    /// 回话线与失败线的推送报文同样带 url（落点是那一班）——三种格式的正文一字不改，
+    /// 只有 webpush 这一支多出 url。
+    #[test]
+    fn the_foreman_lines_carry_a_talk_deep_link_for_push_only() {
+        let reply = foreman_reply_payload_for(
+            NotifyFormat::WebPush,
+            "s7",
+            "晚上的重构",
+            "查完了。",
+            Utc::now(),
+            None,
+        );
+        assert_eq!(reply["url"], "#/talk?session=s7", "{reply}");
+        assert_eq!(reply["title"], "[AgentPipeline] 晚上的重构 回话", "{reply}");
+
+        let failure = foreman_failure_payload_for(
+            NotifyFormat::WebPush,
+            "s7",
+            "晚上的重构",
+            "llm_quota",
+            Utc::now(),
+            None,
+        );
+        assert_eq!(failure["url"], "#/talk?session=s7", "{failure}");
+
+        // 非 push 格式里**没有** url 这个字段（三个既有报文一字不改）。
+        let generic = foreman_reply_payload_for(
+            NotifyFormat::Generic,
+            "s7",
+            "晚上的重构",
+            "查完了。",
+            Utc::now(),
+            None,
+        );
+        assert!(generic.get("url").is_none(), "{generic}");
+        let generic_attention = payload_for(
+            NotifyFormat::Generic,
+            AttentionKind::TaskDone,
+            "t1",
+            Utc::now(),
+            None,
+            None,
+        );
+        assert!(
+            generic_attention.get("url").is_none(),
+            "{generic_attention}"
+        );
+    }
+
+    /// 格式的串形往返（落库 / 回显 / 设置页的三个消费方都认它）。
+    #[test]
+    fn the_webpush_format_round_trips_through_its_string_form() {
+        assert_eq!(NotifyFormat::parse("webpush"), Some(NotifyFormat::WebPush));
+        assert_eq!(NotifyFormat::WebPush.as_str(), "webpush");
+        assert_eq!(
+            serde_json::to_value(NotifyFormat::WebPush).unwrap(),
+            serde_json::json!("webpush")
+        );
+    }
+
+    /// 通道声明 = 目标：webpush 没有任何必填件（订阅与密钥对都在库里），
+    /// 声明了就解析得出目标；卡关（总开关）照旧关死一切。
+    #[test]
+    fn the_webpush_channel_needs_no_fields_and_obeys_the_master_switch() {
+        let unit = NotifyChannelOverride {
+            channel: NotifyFormat::WebPush,
+            webhook_url: None,
+            bluebubbles_url: None,
+            bluebubbles_password: None,
+            bluebubbles_recipient: None,
+        };
+        let state = NotifySettingsState {
+            enabled: true,
+            unit: Some(unit.clone()),
+            politeness: None,
+        };
+        assert_eq!(
+            resolve_notify_target(&config_with(NotifyFormat::Generic), &state).unwrap(),
+            Some(NotifyTarget::WebPush),
+            "单元四件全空也解析得出（它本来就不需要那些件）"
+        );
+
+        // 配置级同一把尺：`format = webpush` + 没有 webhook_url 也算声明了。
+        let config = config_with(NotifyFormat::WebPush);
+        assert_eq!(
+            resolve_notify_target(
+                &config,
+                &NotifySettingsState {
+                    enabled: true,
+                    unit: None,
+                    politeness: None,
+                }
+            )
+            .unwrap(),
+            Some(NotifyTarget::WebPush)
+        );
+
+        // 总开关关死一切（272⑧ 原样）。
+        assert_eq!(
+            resolve_notify_target(
+                &config,
+                &NotifySettingsState {
+                    enabled: false,
+                    unit: Some(unit),
+                    politeness: None,
+                }
+            )
+            .unwrap(),
+            None
+        );
+    }
+
+    /// 推送目标**没有单一发送地址**（扇出到每条订阅的 endpoint），故它不走
+    /// `Delivery::Http`——`delivery()` 的三支里只有它给出另一个形状。
+    #[test]
+    fn the_push_target_is_its_own_delivery_shape() {
+        assert!(matches!(NotifyTarget::WebPush.delivery(), Delivery::Push));
+        assert!(matches!(
+            NotifyTarget::Webhook {
+                url: "https://x".into(),
+                format: NotifyFormat::Generic,
+            }
+            .delivery(),
+            Delivery::Http(url) if url == "https://x"
+        ));
+    }
+
     /// query 参数编码：password 里的结构字符不把 query 拼坏。
     #[test]
     fn bluebubbles_send_url_percent_encodes_the_password() {
@@ -1002,7 +1406,10 @@ mod tests {
             password: "a&b=c d%e".to_string(),
             address: "me@icloud.com".to_string(),
         };
-        let url = target.send_url();
+        let url = match target.delivery() {
+            Delivery::Http(url) => url,
+            Delivery::Push => panic!("BlueBubbles 走 HTTP"),
+        };
         assert!(
             url.starts_with("http://127.0.0.1:1234/api/v1/message/text?password="),
             "{url}"

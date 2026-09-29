@@ -392,6 +392,9 @@ pub async fn serve(options: ServeOptions) -> anyhow::Result<ServerHandle> {
                         target,
                         politeness,
                         Arc::new(SystemClock),
+                        // 浏览器推送的订阅与 VAPID 密钥都在库里（pwa-webpush 02）——
+                        // 出口按这个句柄现场读（其余三条通道不看它）。
+                        store.clone(),
                     )));
                 }
                 Ok(None) => {}

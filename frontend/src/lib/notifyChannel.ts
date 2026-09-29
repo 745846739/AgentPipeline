@@ -17,13 +17,14 @@ import type { NotifyChannelPayload, NotifySettings } from '../api/types';
 /** 读接口回显的掩码（`lib/providers.ts::API_KEY_MASK` 同一个值）。 */
 export const NOTIFY_SECRET_MASK = '***';
 
-export type NotifyChannelKind = 'generic' | 'feishu' | 'bluebubbles';
+export type NotifyChannelKind = 'generic' | 'feishu' | 'bluebubbles' | 'webpush';
 
 /** 通道的界面名。值域与后端 `NotifyFormat` 的 serde 小写形一致。 */
 export const CHANNEL_LABELS: Record<NotifyChannelKind, string> = {
   generic: '通用 webhook',
   feishu: '飞书机器人',
   bluebubbles: 'iMessage（BlueBubbles）',
+  webpush: '浏览器推送',
 };
 
 /**
@@ -71,8 +72,12 @@ export function isUsableEndpoint(raw: string): boolean {
  * 只校验**当前选中通道**的必填件（后端按整体收，别通道的字段不送也不查）。
  * `***` 在 password 上是合法通过项——它表示「沿用已存值」；若其实没有存过
  * （交还配置后第一次保存），后端 400 会把这一格点名，页面照 `note bad` 接住。
+ *
+ * **浏览器推送没有必填件**（pwa-webpush 02）：订阅与 VAPID 密钥对都在服务端库里，
+ * 用户在这张表单上没有任何东西要填——保存这个动作本身就会把密钥对生成出来。
  */
 export function validateNotifyDraft(d: NotifyDraft): string | null {
+  if (d.channel === 'webpush') return null;
   if (d.channel === 'bluebubbles') {
     if (!isUsableEndpoint(d.bluebubblesUrl.trim())) {
       return 'BlueBubbles 端点要写成 http:// 或 https:// 开头的完整地址（如 http://127.0.0.1:1234）。';
@@ -98,6 +103,10 @@ export function validateNotifyDraft(d: NotifyDraft): string | null {
  */
 export function buildNotifyChannelPayload(d: NotifyDraft): NotifyChannelPayload {
   const payload: NotifyChannelPayload = { channel: d.channel };
+  if (d.channel === 'webpush') {
+    // 只送通道名——四件一个都不带（后端对 webpush 分支也不看它们）。
+    return payload;
+  }
   if (d.channel === 'bluebubbles') {
     payload.bluebubbles_url = d.bluebubblesUrl.trim();
     payload.bluebubbles_recipient = d.bluebubblesRecipient.trim();

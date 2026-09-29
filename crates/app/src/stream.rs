@@ -11,6 +11,11 @@ use crate::state::{ApiError, AppState};
 /// 配对令牌请求头（决策 182㉗，票 07）。
 pub const PAIRING_TOKEN_HEADER: &str = "x-agentpipeline-token";
 
+/// 订阅族的路由前缀（pwa-webpush 02）：它下面的**读接口也要令牌**（见 `pairing_guard`）。
+/// **唯一事实源**：`lib.rs` 那两条路由注册从这个常量拼出来——守卫的白名单与注册的地址
+/// 一旦不一致，症状是「接口在、守卫不认」，而靠手写注释对齐是迟早会漂的。
+pub const PUSH_SUBSCRIPTIONS_PREFIX: &str = "/notify/push/";
+
 /// SSE 心跳间隔（票 01，stream-self-heal）：静默的流每 15 秒发一帧
 /// **不携带 data 的注释帧**——客户端分帧器只认 data 行，解析器因此零改动。
 ///
@@ -89,10 +94,10 @@ pub async fn cross_origin_guard(
     }
 }
 
-/// 配对令牌校验（决策 182㉖㉗㉘，票 07）。
+/// 配对令牌校验（决策 182㉖㉗㉘，票 07；pwa-webpush 02 扩一处「读也护」）。
 ///
 /// 用户批的边界是「看的随便看，动手和花钱要凭据」：只读 GET（看板 / 会话 / 指标 /
-/// 分享页）不护，写请求与全部 `/foreman/*` 要持有令牌。
+/// 分享页）不护，写请求与**两个前缀下的全部方法**要持有令牌。
 ///
 /// 三个前置判断，缺一不可：
 /// 1. **非局域网形态直接放行**——默认回环绑定是「本机自己用」，零摩擦是硬约束
@@ -100,7 +105,15 @@ pub async fn cross_origin_guard(
 /// 2. **回环来源直接放行**——局域网形态下仍有从本机发来的请求（本机浏览器、CLI），
 ///    对它们要求令牌等于把本机也变成需配对的设备。这一条同时是「令牌泄露后还能
 ///    从本机一键重置」的前提（见 `routes::pairing::reset`）；
-/// 3. 放行集合只含安全方法（GET / HEAD / OPTIONS）与**不以 `/foreman/` 开头**的路径。
+/// 3. 放行集合只含安全方法（GET / HEAD / OPTIONS）与**不以护住的那两个前缀开头的路径**。
+///
+/// **读也护的两个前缀**（`/foreman/` 决策 182㉘；`/notify/push/` pwa-webpush 02）：
+/// 那条「花钱要凭据」的理由（读对话会触发真实 LLM 调用）在通知订阅这一族上是另一样
+/// 东西——**读接口本身是一条外泄管道**：设备清单里的每一条都是「往这台设备推任意
+/// 报文」的能力的一半（endpoint 是能力 URL，`p256dh`/`auth` 是另一半，故清单只给摘要），
+/// 而写接口（订阅）**是持续的**：同网段的别人一旦把自己的 endpoint 订进来，你的每一条
+/// 任务动态都会流到他那里——读接口是一次性的偷看，订阅是永久的外泄管道。
+/// 这是对决策 167「v1 无鉴权」的**定点加强**（只加这一族），回环豁免与报文形状照 182⑦。
 pub async fn pairing_guard(
     State(state): State<AppState>,
     request: Request,
@@ -115,7 +128,10 @@ pub async fn pairing_guard(
 
     let method = request.method().clone();
     let is_read_only = method == Method::GET || method == Method::HEAD || method == Method::OPTIONS;
-    let guarded = !is_read_only || request.uri().path().starts_with("/foreman/");
+    let path = request.uri().path();
+    let guarded = !is_read_only
+        || path.starts_with("/foreman/")
+        || path.starts_with(PUSH_SUBSCRIPTIONS_PREFIX);
     if !guarded {
         return next.run(request).await;
     }

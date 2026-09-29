@@ -8,6 +8,13 @@ description = "AgentPipeline 核心库：pipeline / agent / storage / scheduler 
 
 [dependencies]
 anyhow.workspace = true
+# Web Push 的三件密码学原语（票 pwa-webpush 02，`src/webpush.rs`）：P-256 的 ECDH 与
+# ECDSA、AES-128-GCM、HKDF-SHA256。**零新依赖**——ring 早就在依赖树里（reqwest 的
+# rustls-tls 传递依赖），提为直接依赖只多一条 Cargo.lock 边；base64 同（0.22 已在树里）。
+# 不引 `web-push` 之类的整包：本票要的只是「RFC 8291 的密钥派生 + 一节 aes128gcm 记录」，
+# 自写才能拿 RFC 的公开测试向量把每一段钉住（票 02 判据）。
+ring.workspace = true
+base64.workspace = true
 chrono.workspace = true
 futures.workspace = true
 git2.workspace = true

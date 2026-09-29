@@ -8148,3 +8148,268 @@ async fn clearing_the_politeness_unit_returns_to_config_and_keeps_everything_els
     assert_eq!(body["enabled"], false, "交还礼貌 ≠ 动开关：{body}");
     assert_eq!(body["origin"], "settings", "交还礼貌 ≠ 交还通道：{body}");
 }
+
+// ───────── pwa-webpush 02：浏览器推送（通道 / 订阅三端点 / VAPID 掩码 / 配对守卫）─────────
+//
+// 判据全是**端点可观察的行为**：状态码、落库行、读数里的字段。订阅行的 endpoint 在
+// L2（`core/tests/integration/notify.rs`）才被指向假推送服务——这一层不发出站请求。
+
+/// 局域网来源的写请求（带 JSON 体，便于订阅端点的载荷）。
+fn lan_json(method: &str, uri: &str, token: Option<&str>, body: Value) -> Request<Body> {
+    let mut builder = request(method, uri).header(header::CONTENT_TYPE, "application/json");
+    if let Some(token) = token {
+        builder = builder.header("X-AgentPipeline-Token", token);
+    }
+    let mut req = builder.body(Body::from(body.to_string())).unwrap();
+    req.extensions_mut()
+        .insert(ConnectInfo(SocketAddr::from(([192, 168, 1, 50], 40000))));
+    req
+}
+
+/// 一条形状正确的订阅（P-256 未压缩点 65 字节 + 16 字节 auth，都是 base64url 无填充）。
+fn fake_subscription(endpoint: &str) -> Value {
+    use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+    use base64::Engine as _;
+    let mut point = vec![0x04u8];
+    point.extend_from_slice(&[7u8; 64]);
+    json!({
+        "endpoint": endpoint,
+        "keys": {
+            "p256dh": URL_SAFE_NO_PAD.encode(&point),
+            "auth": URL_SAFE_NO_PAD.encode([9u8; 16]),
+        },
+    })
+}
+
+/// 通道第四支：保存 `webpush` 落库、读数回显、**VAPID 公钥可读而私钥只有掩码**；
+/// 再保存一次拿回同一对（首次启用自动生成 = 一次，不是每次）。
+#[tokio::test]
+async fn the_webpush_channel_saves_and_reports_its_vapid_keys_with_the_private_one_masked() {
+    let api = api_with(Settings::default()).await;
+    put(&api, "/notify/settings", json!({ "enabled": false })).await;
+
+    let (status, body) = put(&api, "/notify/channel", json!({ "channel": "webpush" })).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+
+    let (_, body) = get(&api, "/notify/settings").await;
+    assert_eq!(body["channel"], "webpush", "{body}");
+    assert_eq!(body["origin"], "settings", "{body}");
+    assert!(
+        body["config_error"].is_null(),
+        "四个件全空也是完整声明（它本来就不需要那些件）：{body}"
+    );
+    let public = body["vapid_public_key"].as_str().unwrap();
+    assert_eq!(public.len(), 87, "未压缩点的 base64url 长度：{body}");
+    assert_eq!(
+        body["vapid_private_key"], "***",
+        "私钥只给掩码（决策 112 的范式）：{body}"
+    );
+
+    // 再存一次：密钥对**不换**（换掉会让已经订阅出去的浏览器全部作废）。
+    put(&api, "/notify/channel", json!({ "channel": "webpush" })).await;
+    let (_, body2) = get(&api, "/notify/settings").await;
+    assert_eq!(body2["vapid_public_key"], public, "密钥对是幂等的：{body2}");
+}
+
+/// 总开关开在浏览器推送通道上：**没有必填件**也要能开（不像 webhook 缺 URL 那样 400）。
+#[tokio::test]
+async fn the_webpush_channel_can_be_enabled_without_any_endpoint_fields() {
+    let api = api_with(Settings::default()).await;
+    put(&api, "/notify/channel", json!({ "channel": "webpush" })).await;
+    let (status, body) = put(&api, "/notify/settings", json!({ "enabled": true })).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let (_, body) = get(&api, "/notify/settings").await;
+    assert_eq!(body["enabled"], true, "{body}");
+    assert_eq!(body["channel"], "webpush", "{body}");
+}
+
+/// 订阅端点：upsert（同 endpoint 两次一行）、清单读得到、单个撤销、全部清空。
+#[tokio::test]
+async fn push_subscriptions_upsert_list_and_delete() {
+    let api = api_with(Settings::default()).await;
+    let sub = fake_subscription("https://push.example.net/device-abc123def456");
+
+    let (status, body) = post(&api, "/notify/push/subscriptions", sub.clone()).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let first_id = body["id"].as_i64().unwrap();
+
+    // 同 endpoint 再订一次：**一行**（id 不变）。
+    let (status, body) = post(&api, "/notify/push/subscriptions", sub).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(
+        body["id"].as_i64().unwrap(),
+        first_id,
+        "同 endpoint 是同一行"
+    );
+
+    // 第二台设备。
+    post(
+        &api,
+        "/notify/push/subscriptions",
+        fake_subscription("https://push.example.net/device-zzz999"),
+    )
+    .await;
+
+    let (status, body) = get(&api, "/notify/push/subscriptions").await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let list = body["subscriptions"].as_array().unwrap();
+    assert_eq!(list.len(), 2, "{body}");
+    // 清单只给摘要：完整 endpoint 与那两件密钥一个字节都不回。
+    let raw = body.to_string();
+    assert!(!raw.contains("push.example.net"), "主机名不进清单：{raw}");
+    assert!(!raw.contains("p256dh") && !raw.contains("auth"), "{raw}");
+    // 认得出是哪台设备 = 尾段留首尾各 6 位。尺子见 `endpoint_hint`：尾段 ≤ 16 字符
+    // 就不回省（短的那台整段可见），长的那台中段必须真的被省略号吃掉。
+    let hints: Vec<&str> = list
+        .iter()
+        .map(|s| s["endpoint_hint"].as_str().unwrap())
+        .collect();
+    assert!(
+        hints
+            .iter()
+            .any(|h| h.contains("device") && h.contains("def456")),
+        "{body}"
+    );
+    assert!(hints.iter().any(|h| h.contains("device-zzz999")), "{body}");
+    assert!(hints.iter().all(|h| h.starts_with('…')), "{body}");
+    assert!(
+        !raw.contains("device-abc123def456"),
+        "长尾段的中段不该整段回显：{raw}"
+    );
+    assert!(list[0]["created_at"].is_string(), "{body}");
+
+    // 单个撤销。
+    let (status, body) = delete(&api, &format!("/notify/push/subscriptions/{first_id}")).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["removed"], true, "{body}");
+    let (_, body) = get(&api, "/notify/push/subscriptions").await;
+    assert_eq!(body["subscriptions"].as_array().unwrap().len(), 1, "{body}");
+
+    // 全部清空。
+    let (status, body) = delete(&api, "/notify/push/subscriptions").await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["removed"], 1, "{body}");
+    let (_, body) = get(&api, "/notify/push/subscriptions").await;
+    assert!(
+        body["subscriptions"].as_array().unwrap().is_empty(),
+        "{body}"
+    );
+}
+
+/// 形状不对的订阅在落库前被拒（400 点名哪一件），**一行都不落**（报错不静默，272⑧）。
+#[tokio::test]
+async fn a_malformed_subscription_is_rejected_before_it_lands() {
+    use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+    use base64::Engine as _;
+    let api = api_with(Settings::default()).await;
+
+    let mut bad = fake_subscription("https://push.example.net/x");
+    bad["keys"]["p256dh"] = json!(URL_SAFE_NO_PAD.encode([1u8; 32]));
+    let (status, body) = post(&api, "/notify/push/subscriptions", bad).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    assert!(body["error"].as_str().unwrap().contains("p256dh"), "{body}");
+
+    let mut bad = fake_subscription("https://push.example.net/x");
+    bad["keys"]["auth"] = json!(URL_SAFE_NO_PAD.encode([1u8; 8]));
+    let (status, body) = post(&api, "/notify/push/subscriptions", bad).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    assert!(body["error"].as_str().unwrap().contains("auth"), "{body}");
+
+    let mut bad = fake_subscription("https://push.example.net/x");
+    bad["endpoint"] = json!("mailto:someone@example.com");
+    let (status, body) = post(&api, "/notify/push/subscriptions", bad).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+
+    let (_, body) = get(&api, "/notify/push/subscriptions").await;
+    assert!(
+        body["subscriptions"].as_array().unwrap().is_empty(),
+        "三次都被拒，一行都不该落：{body}"
+    );
+}
+
+/// **配对守卫的定点加强**（对决策 167 的显式收窄，形状照 182⑦）：订阅这一族的
+/// **读也要令牌**——清单里每条都是往那台设备推报文的能力的一半，而订阅是持续的外泄
+/// 管道。三个方法一起验：无令牌 403（报文指去配对）、带令牌放行、回环豁免。
+#[tokio::test]
+async fn the_push_subscription_family_is_behind_the_pairing_guard_on_lan() {
+    let api = api_lan().await;
+    let token = loopback_token(&api).await;
+
+    // ① 局域网来源、无令牌：读 / 写 / 删三路都是 403，报文指去配对。
+    for req in [
+        lan_get("/notify/push/subscriptions", None),
+        lan_json(
+            "POST",
+            "/notify/push/subscriptions",
+            None,
+            fake_subscription("https://push.example.net/x"),
+        ),
+        lan_json("DELETE", "/notify/push/subscriptions", None, json!({})),
+        lan_json("DELETE", "/notify/push/subscriptions/1", None, json!({})),
+    ] {
+        let method = req.method().clone();
+        let uri = req.uri().clone();
+        let (status, body) = json_body(api.router.clone().oneshot(req).await.unwrap()).await;
+        assert_eq!(status, StatusCode::FORBIDDEN, "{method} {uri}：{body}");
+        assert!(
+            body["error"].as_str().unwrap().contains("配对"),
+            "{method} {uri} 的报文应告诉用户去配对：{body}"
+        );
+    }
+
+    // ② 带令牌：三路都放行（订阅真的落库了）。
+    let (status, body) = json_body(
+        api.router
+            .clone()
+            .oneshot(lan_json(
+                "POST",
+                "/notify/push/subscriptions",
+                Some(&token),
+                fake_subscription("https://push.example.net/x"),
+            ))
+            .await
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let (status, body) = json_body(
+        api.router
+            .clone()
+            .oneshot(lan_get("/notify/push/subscriptions", Some(&token)))
+            .await
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["subscriptions"].as_array().unwrap().len(), 1, "{body}");
+
+    // ③ 回环来源：一律豁免（本机零摩擦）——写请求不带令牌也过。
+    let mut loopback = request("POST", "/notify/push/subscriptions")
+        .header(header::CONTENT_TYPE, "application/json")
+        .body(Body::from(
+            fake_subscription("https://push.example.net/loopback").to_string(),
+        ))
+        .unwrap();
+    loopback
+        .extensions_mut()
+        .insert(ConnectInfo(SocketAddr::from(([127, 0, 0, 1], 51234))));
+    let (status, body) = json_body(api.router.clone().oneshot(loopback).await.unwrap()).await;
+    assert_eq!(status, StatusCode::OK, "回环豁免：{body}");
+}
+
+/// 通知设置页的读数照旧不护（它是只读的机器事实，秘密一律掩码）——订阅那两族才是
+/// 例外（上一用例）。这条守的是「定点加强没有把整个 /notify/ 都拖下水」。
+#[tokio::test]
+async fn the_notify_settings_read_stays_open_while_the_subscription_family_is_guarded() {
+    let api = api_lan().await;
+    let (status, body) = json_body(
+        api.router
+            .clone()
+            .oneshot(lan_get("/notify/settings", None))
+            .await
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["vapid_private_key"], "", "没生成过时是空串：{body}");
+}

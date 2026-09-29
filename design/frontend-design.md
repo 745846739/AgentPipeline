@@ -67,6 +67,19 @@
 > `allowed_actions` 纯渲染不变——确认步只加在**在册动作**的提交路径上，不改动作集；
 > 决策 132 已移出的无端点动作（「放弃合入」「合并任务」）不复活。
 
+> **修订（2026-09-29「pwa-webpush」票 03 / 04 / 决策 323）：设置页添第四个互斥通道与它的一节订阅面，另加一条通知深链。**
+> 这一轮不动版面骨架，只在既有的「离线通知」页上多一格、多一节，并给任务详情页添一条查询串的消费：
+>
+> | 改了什么 | 结论一句话 | 本文落点 | 决策 |
+> |---|---|---|---|
+> | 通道第四格「浏览器推送」 | 没有必填件，保存那一次在服务端生成 VAPID 密钥对；公钥可读、私钥只回掩码 | §7、§12.3 | 323（突破 65；沿用 272 的互斥格局） |
+> | 「订阅」一节（只在通道 = 浏览器推送时摆） | 权限弹窗只在点「订阅此设备」那一次的手势里弹；四态各有文案（未申请 / 已授权 / 已拒绝给系统设置指引 / iOS 非主屏给「添加到主屏幕」）；下面是已订阅设备清单（摘要 / 时间 / UA / 撤销 / 全部清空） | §7、§12.3 | 323 |
+> | 通知深链 `#/task/<id>?run=<n>` | 点开推送落在那一次对话上；`?run=` 消费一次即抹掉（不进历史） | §4.1、§9.4、§12.3 | 326 |
+>
+> **不变的部分写死**：像素纪律与全部视觉规格一字不动（新样式只用既有 token：红/绿/琥珀三档语义色 +
+> `--pending` 那一档的「等你动手」标记）；其余三个通道的界面与报文一字不改；礼貌两件仍是**出机器那条线**
+> 的配置，浏览器 toast 与推送的礼貌语义由后端同一道 `dispatch()` 门管、不在这页另立一份。
+
 ---
 
 ## 1. 定位
@@ -197,8 +210,10 @@ pending 琥珀呼吸（2.4s 周期）、流式输出尾随光标。`prefers-redu
   `#/talk`。默认落点只接管**空地址**——显式 `#/` 照旧是看板（本表第一行、§4.2 第 2 项，
   决策 240 的「看板是根路由」不修订）；带 hash 的开屏一律不动。
 - **query 是这条路由表的一部分**（决策 217）：`#/task/:id?tab=`、`#/?filter=`、`#/talk?session=`、
-  `#/metrics?task=`、`#/settings/projects?project=&analyze=1`。参数是短枚举、缺省值不写进地址；
-  谁写地址（用户 `pushState` / 程序 `replaceState`）与刷新恢复语义见 §9.4。
+  `#/metrics?task=`、`#/settings/projects?project=&analyze=1`、`#/task/:id?run=`（通知深链，决策 323）。
+  参数是短枚举、缺省值不写进地址；谁写地址（用户 `pushState` / 程序 `replaceState`）与刷新恢复语义见 §9.4。
+  **`?run=` 是唯一一条「消费即抹掉」的**：它是推送点开时的落点，落定之后地址仍旧描述屏幕上那一屏
+  （不抹的话切页签后地址栏还说旧话、刷新又把人拽回去）；**参数名同属跨流契约，改名会静默断掉推送的落点**。
 - **传输层 Tauri 防御（决策 153）：** ① 本前端是**纯 API 客户端**，一切数据经 HTTP + SSE，不假设部署形态（桌面化 = Tauri 只当外壳，不走 IPC 重写）；② SSE 消费用 **fetch 流式读取**（可携带自定义头），不用 `EventSource`——它带不了自定义头，跨源过不了决策 128 防护；③ 所有写请求**恒携带** `X-AgentPipeline` 头（决策 128 旁路，桌面 webview origin 靠它放行）；④ API base 收敛**单一配置点**：默认同源相对路径，留注入覆盖口（桌面壳注入 `http://127.0.0.1:{port}`）。
 
 ### 4.2 顶栏：页面导航行四项（定稿，决策 240 修订决策 198）
@@ -595,12 +610,16 @@ GET /tasks/{id}               → 详情页装载 + 断线重连后的全量校�
 | 看板过滤 | `#/?filter=all\|running\|pending\|…`（缺省 `all` 不写） | `agentpipeline.board_filter`（URL 里没有时兜底） | 用户切过滤 = `pushState` |
 | 对讲台班次 | `#/talk?session=42` | `agentpipeline.talk_session`（URL 里没有时兜底） | 用户换班次 = `pushState` |
 | 对讲台输入草稿 | **不进** | `agentpipeline.talk_draft`（`{sessionId, text, at}`） | — |
-| 会话页签里选中的 run | **不进** | **不进** | — |
+| 会话页签里选中的 run | **只读一次**：`?run=<id>` 由通知深链带进来，消费后**立刻抹掉**（决策 323） | **不进** | 用户点 run 行**不写地址**；深链那一次是 `replaceState` 抹参数 |
 
 - **「我在哪」进 URL，「我平常怎么用」与没写完的草稿进 localStorage。** 草稿不是位置：
   把半句话塞进地址，分享出去的是一个别人看不懂的 URL，而地址栏还会在打字时被反复改写。
 - **程序改地址一律 `replaceState`**（触发节点直达、打开产出文件、`?task=` 自动就位、
   `?project=&analyze=1` 自动触发）——否则自动联动会把历史灌满，后退不再是「回到上一页」。
+- **`?run=` 是一次性的落点，不是位置**（决策 323）：推送把「那一次对话」送进来，页面消费完就把它
+  从地址里抹掉（`replaceState`，不进历史）——留着它，用户切到时间线后地址栏还在说旧话，刷新又
+  把人拽回会话页签。抹掉之后地址始终描述屏幕上那一屏；**同一条推送点第二次照样有效**（地址真的变了，
+  那次改址会把 run 重新交给消费点；挂着不动时第二次点开是同一地址，浏览器根本不发 `hashchange`）。
 - **刷新恢复**：地址里有就照地址；没有就用缺省，**不拿 localStorage 去覆盖**——过滤与班次
   是两个例外（跨页面的工作语境：从看板点进任务再点「← 看板」回来时地址会丢参数，
   而「我一直在看 pending」不该因此被重置）。取值非法（枚举外 / 库里已不存在）回落缺省**并删键**。
@@ -778,6 +797,11 @@ GET /tasks/{id}               → 详情页装载 + 断线重连后的全量校�
 | 命令台账的折叠行显示**原串**（`original_command ?? command`）：改写过的行带一枚「改写」小标，展开时原串与实际执行的那条**都摆出来** | `frontend/src/components/task/CommandLog.svelte` | 决策 297；两条从「有哪些命令要跑」排障的人先要看到的是**模型想干什么**，而 `cat X` 与 `rtk read X` 的输出不一样、只记一份会看错；判据由 `frontend/src/components/task/CommandLog.test.ts` 钉住（改写过的行两条都在、没改写的不带标） |
 | 命令执行页：开关 + **每次读都现做一次**的活体探测（路径 / 版本 / 可用 / 原因）；探测失败仍然保存并把失败原样说出来（不静默成功、不静默失败）；本机用不了时就地给「手填绝对路径」的出路 | `frontend/src/routes/SettingsTools.svelte`、`frontend/src/lib/rtkToggle.ts` | 决策 297；三态分界与那两句话由 `frontend/src/lib/rtkToggle.test.ts` 钉住，接线（每次打开都重读、保存失败不静默）由 `frontend/src/routes/SettingsTools.test.ts` 钉住，后端契约在 `crates/app/src/routes/rtk.rs` |
 | 离线通知页：一颗总开关 + **通道四件**与**礼貌两件**两组单元各自整体覆盖 `config.toml`（组内不许混，两组互不牵动、各交各的），秘密只回显 `***` 且掩码或留空 = 不改，BlueBubbles 开启/保存先探活、够不着不当成功；礼貌管的是出机器那条线（浏览器 toast 另有自己一份固定表） | `frontend/src/routes/SettingsNotify.svelte`、`frontend/src/lib/notifyChannel.ts`、`frontend/src/lib/notifyPoliteness.ts` | 决策 272⑥⑦⑧；礼貌小节与两级解析由 284②③⑤ 定；判据与掩码纪律由 `notifyChannel.test.ts` / `notifyPoliteness.test.ts` 钉住，后端契约在 `crates/app/src/routes/notify.rs` |
+| 第四个互斥通道「浏览器推送」：这一格**没有必填件**（VAPID 密钥对与订阅行都在服务端库里），保存那一次就把密钥对生成出来；公钥可读、私钥只回掩码 | `frontend/src/routes/SettingsNotify.svelte`、`frontend/src/lib/notifyChannel.ts`、`crates/app/src/routes/notify.rs` | 决策 323（突破 65 的第四次通道扩面；沿用 272 的互斥格局，多出口并存仍另立票）；判据 `notifyChannel.test.ts`，契约 `api_contract.rs::the_webpush_channel_*` |
+| 订阅此设备：权限弹窗**只在点击手势里**弹（进页面一次也不弹，模型一、失败即永久拒绝）；四态各有各的文案与按钮形状——未申请（可点）/ 已授权（可订阅或可退订）/ 已拒绝（摆去系统设置的指引）/ iOS 非主屏（按钮位换成「请先添加到主屏幕」） | `frontend/src/routes/SettingsNotify.svelte`、`frontend/src/lib/pushSubscribe.ts` | 决策 323；四态判据是纯函数 `pushFace`（`pushSubscribe.test.ts`），接线由 `SettingsNotify.test.ts` 与 e2e `push-subscribe.spec.ts` 钉住 |
+| 已订阅设备清单：每行给 endpoint **摘要**（`…前6…后6`，完整值是一枚能力 URL 不回显）+ 创建时间 + UA，单个撤销、全部清空；空清单摆订阅引导而不是空白 | `frontend/src/routes/SettingsNotify.svelte`、`crates/core/src/storage/push.rs` | 决策 323；掩码口径对齐 providers `api_key`（决策 112）；撤销走配对守卫端点，回环与局域网行为与订阅一致（决策 323 对 167 的定点加强） |
+| service worker 只做两件事（`push` → 显示通知、`notificationclick` → 开窗 / 聚焦并导航），**零离线缓存**；地址固定为 `/sw.js`（作用域 = 根），故这一份走 `no-cache` 复验 | `frontend/src/sw.ts`、`frontend/src/lib/pushPayload.ts`、`crates/app/src/assets.rs` | 决策 323（缓存纪律沿 285：地址固定、内容会变的那一类必须每次复验）；两个处理器抽成纯函数由 `pushPayload.test.ts` 钉住，注册与作用域由 e2e `push-subscribe.spec.ts` 钉住 |
+| 通知深链由服务端拼好放进 push payload（前端不猜）：卡片级 `#/task/<id>`、流水线级 `#/task/<id>?run=<n>`（落那一次运行的会话页签）、回话类 `#/talk?session=<id>`；payload 里的 `url` 拼不出可用地址（绝对地址 / `#//` / 空）时降级看板首页 `#/`；`?run=` **消费一次就抹掉**（不进历史，免得切页签后地址栏还说旧话） | `crates/core/src/notify.rs`、`frontend/src/lib/pushPayload.ts`、`frontend/src/routes/TaskDetail.svelte` | 决策 326；拼装规则在 `notify.rs::attention_deep_link` / `talk_deep_link`，消费由 `TaskDetail.test.ts` 的「通知深链」一组钉住；**两处与 spec 票面措辞的差异显式记**：① 票面写「流水线级 → 该任务看板视图」，而本应用没有按任务收窄的看板路由（看板是 `#/` 全量），故流水线级也落在**那张卡**上、多带一段 `?run=` 指向停在哪一次运行；② 票面写「深链不可达时（对象已归档等）降级到看板首页」，实现里 **payload 层**的降级是语法面的（拼不出可用地址才回 `#/`），而**对象层**的不可达（任务已归档 / 不存在）落在任务详情页的空态——状态 + 下一步 + 顶栏看板入口（决策 240 的出口就在那一行），**不做静默重定向**（把人从他在的地方悄悄挪走，比说清「这个任务不在了」更差） |
 | 「手机访问」入口只在本机（来源回环）渲染，非本机不给入口 | `frontend/src/lib/localPage.ts`、`frontend/src/routes/SettingsLanding.svelte` | 决策 190（位子由 198 挪到落地页，行为不变） |
 | 阶段配置独立成页，从「模型与密钥」页搬出 | `frontend/src/routes/SettingsStages.svelte`、`frontend/src/components/settings/StageConfigForm.svelte` | 决策 198 / 111 / 170 |
 | 不支持的 provider 行降级灰显 + 琥珀标（**标里不带内部编号**） | `frontend/src/routes/SettingsProviders.svelte:297` | 决策 103；决策 199（编号退到 `title`） |

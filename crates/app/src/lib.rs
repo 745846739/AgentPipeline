@@ -27,6 +27,7 @@ pub use stream::cross_origin_guard;
 
 use axum::routing::{get, patch, post};
 use axum::Router;
+use stream::PUSH_SUBSCRIPTIONS_PREFIX;
 
 /// 构建完整 router。
 pub fn build_router(state: AppState) -> Router {
@@ -211,6 +212,21 @@ pub fn build_router(state: AppState) -> Router {
                 .delete(routes::notify::clear_politeness),
         )
         .route("/notify/test", post(routes::notify::test_channel))
+        // ── 浏览器推送的订阅（spec `.scratch/pwa-webpush/` 票 02）──
+        // **读也过配对守卫**（`stream::PUSH_SUBSCRIPTIONS_PREFIX` 那一族）：清单里每条
+        // 都是往那台设备推报文的能力的一半，而订阅是持续的外泄管道（决策 167 的定点加强）。
+        // 地址由那个常量拼出来而不是各写一遍字面量——两处对齐靠手写注释是迟早会漂的东西，
+        // 而守卫的白名单与这里的注册一旦不一致，症状是「接口在，守卫不认」。
+        .route(
+            &format!("{PUSH_SUBSCRIPTIONS_PREFIX}subscriptions"),
+            get(routes::notify::list_subscriptions)
+                .post(routes::notify::subscribe)
+                .delete(routes::notify::clear_subscriptions),
+        )
+        .route(
+            &format!("{PUSH_SUBSCRIPTIONS_PREFIX}subscriptions/{{id}}"),
+            axum::routing::delete(routes::notify::delete_subscription),
+        )
         // 配对令牌层（决策 182㉖㉗㉘，票 07）：**必须最后执行**（最内层）——它要读
         // peer_address 归一后的来源地址，且排在跨源防护之后，只处理已过跨源判定的请求。
         // axum 的 `Router::layer` 后挂者在外、先执行，故它登记在 cross_origin_guard 之前。

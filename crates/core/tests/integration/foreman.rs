@@ -7624,6 +7624,7 @@ fn attach_notifier(h: &Harness, server: &TinyHttp) {
             },
             crate::notify::politeness(300, [22, 8]),
             Arc::new(ManualClock::new(crate::notify::at_local_hour(12))),
+            h.store.clone(),
         )));
 }
 

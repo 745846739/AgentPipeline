@@ -8,6 +8,22 @@ const apiTarget = process.env.VITE_API_PROXY_TARGET ?? 'http://127.0.0.1:8788';
 
 export default defineConfig({
   plugins: [svelte()],
+  build: {
+    // 第二个入口：service worker（`src/sw.ts` → `dist/sw.js`，**不带 hash**）。
+    // 理由：注册地址是约定（`/sw.js`），带 hash 就没人认得出它；而它的作用域由**地址**
+    // 决定（根层 = 管全站），改地址等于换了作用域。内容变化由 `assets.rs` 的
+    // `no-cache` 兜（决策 285：地址固定、内容会变的那一类必须每次复验）。
+    rollupOptions: {
+      input: {
+        index: 'index.html',
+        sw: 'src/sw.ts',
+      },
+      output: {
+        // 只有 sw 这一个入口固定文件名，其余产物照旧交给 vite 的 hash 命名。
+        entryFileNames: (chunk) => (chunk.name === 'sw' ? 'sw.js' : 'assets/[name]-[hash].js'),
+      },
+    },
+  },
   // Svelte 5 组件测试：解析到浏览器构建（否则 mount 在 server build 上不可用）。
   resolve: {
     conditions: ['browser'],
@@ -18,11 +34,13 @@ export default defineConfig({
     // 前端 api base 默认为同源相对路径（决策 153④），因此这里按路径前缀代理。
     proxy: {
       // skills / market 是票 09–16 新增的端点组：漏在这里的表现是「dev 下 404、打包后正常」
-      // foreman（票 01 的对讲台三端点）同理。
-      '^/(tasks|projects|providers|stage-configs|skills|market|metrics|health|server-info|foreman|rtk)': {
-        target: apiTarget,
-        changeOrigin: true,
-      },
+      // foreman（票 01 的对讲台三端点）同理；notify（离线通知一族——pwa-webpush 02 的
+      // 订阅端点也走它）是同一件事，这一票才发现它一直漏着。
+      '^/(tasks|projects|providers|stage-configs|skills|market|metrics|health|server-info|foreman|rtk|notify)':
+        {
+          target: apiTarget,
+          changeOrigin: true,
+        },
     },
   },
   test: {

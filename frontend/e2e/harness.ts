@@ -939,7 +939,9 @@ export function watchBundle(page: Page): BundleGuard {
     const url = res.url();
     // `/assets/*` 是 Vite 产物；`/fonts/*` 是主题六自托管的像素字体子集
     // （决策 169）——字体 404 会让主题静默回退成系统 monospace，必须一并堵住。
-    if ((url.includes('/assets/') || url.includes('/fonts/')) && !res.ok()) {
+    // `/sw.js` 是 service worker 的脚本（pwa-webpush 票 03）：它 404 时
+    // `register()` 只会静默 reject，页面照常——那条线只有在推送那一节才看得见。
+    if ((url.includes('/assets/') || url.includes('/fonts/') || url.includes('/sw.js')) && !res.ok()) {
       guard.problems.push(`静态资源非 2xx：${res.status()} ${url}`);
     }
   });

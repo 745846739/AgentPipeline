@@ -1260,7 +1260,7 @@ export interface NotifySettings {
   /** 一颗总开关（272⑧）：整条通道开/关，非每类一颗。 */
   enabled: boolean;
   /** 生效的通道声明；null = 还没有配置任何通道（268① 零配置零行为）。 */
-  channel: 'generic' | 'feishu' | 'bluebubbles' | null;
+  channel: 'generic' | 'feishu' | 'bluebubbles' | 'webpush' | null;
   /** 通道是谁定的。 */
   origin: NotifyOrigin;
   webhook_url: string;
@@ -1273,6 +1273,14 @@ export interface NotifySettings {
   quiet_hours: [number, number];
   /** 礼貌两件是谁定的——通道的来源不代表礼貌的来源。 */
   politeness_origin: NotifyOrigin;
+  /**
+   * VAPID 公钥（pwa-webpush 02；base64url 无填充）——浏览器订阅时拿它当
+   * `applicationServerKey`。**不是秘密**（本来就要交给浏览器），故原样回显。
+   * 空串 = 还没生成过（在通道里保存一次「浏览器推送」就会生成）。
+   */
+  vapid_public_key: string;
+  /** VAPID 私钥：**只给常量掩码** `***`（对齐 provider `api_key`，决策 112）。 */
+  vapid_private_key: string;
   /** 当前两级解析不过时的原因（报错不静默，272⑧）；不在场 = 没有配置错误。 */
   config_error?: string;
 }
@@ -1328,7 +1336,7 @@ export interface RtkSettings {
 
 /** `PUT /notify/channel` 的载荷：通道单元**整体覆盖**（272⑥ 不允许混）。 */
 export interface NotifyChannelPayload {
-  channel: 'generic' | 'feishu' | 'bluebubbles';
+  channel: 'generic' | 'feishu' | 'bluebubbles' | 'webpush';
   webhook_url?: string;
   bluebubbles_url?: string;
   bluebubbles_password?: string;
@@ -1347,4 +1355,39 @@ export interface NotifyPolitenessPayload {
 export interface NotifyChannelTest {
   ok: boolean;
   message: string;
+}
+
+/**
+ * `POST /notify/push/subscriptions` 的载荷（pwa-webpush 02）：**浏览器
+ * `PushSubscription.toJSON()` 的形状**原样——前端不做转换，少一层就少一处漂移。
+ */
+export interface PushSubscriptionPayload {
+  /** 推送服务给这台设备的地址（能力 URL）。 */
+  endpoint: string;
+  keys: {
+    /** 浏览器公钥（P-256 未压缩点，base64url）。 */
+    p256dh: string;
+    /** 鉴权秘密（16 字节，base64url）。 */
+    auth: string;
+  };
+}
+
+/**
+ * `GET /notify/push/subscriptions` 清单里的一行（pwa-webpush 02）。
+ *
+ * **只给摘要**：`endpoint_hint` 够认出「这是我那台 iPhone」，而完整 endpoint 是能力
+ * URL（拿到它 + 密钥就能往那台设备推）——读接口是清单，不是能力包。
+ */
+export interface PushSubscriptionRow {
+  id: number;
+  /** endpoint 的摘要形（`…abc…xyz`）；不含主机名。 */
+  endpoint_hint: string;
+  /** 订阅那一刻的 UA（空串 = 浏览器没报）。 */
+  user_agent: string;
+  /** 订阅创建时刻（RFC3339）。 */
+  created_at: string;
+}
+
+export interface PushSubscriptionList {
+  subscriptions: PushSubscriptionRow[];
 }

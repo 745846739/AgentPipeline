@@ -15,6 +15,7 @@
   import EmptyState from '../components/ui/EmptyState.svelte';
   import { buildHeroStations, formatDuration, formatTokens, pendingLabel, statusCode } from '../lib/pipeline';
   import { stewardshipFace, toggleStewardship } from '../lib/stewardship';
+  import { router, writeQuery } from '../router.svelte';
   import { taskDetail } from '../stores/taskDetail.svelte';
 
   interface Props {
@@ -187,6 +188,45 @@
     selectedRunId = runId;
     void taskDetail.loadConversation(runId);
   }
+
+  /**
+   * 通知深链 `?run=<id>` 的消费（pwa-webpush 票 02/03，决策 323）。
+   *
+   * 浏览器推送落在锁屏上，点开后要**直接到那一次对话**——值班长回话的推送落在它的会话上，
+   * 失败推送落在失败那次 run 上（地址由 `notify.rs::attention_deep_link` 拼出）。形状是
+   * `#/task/<task_id>?run=<run_id>`，与 `#/metrics?task=` 同一族的查询串契约。
+   *
+   * 三段语义，缺一段都会出毛病：
+   * ① **消费一次就抹掉**（`replace`，不进历史）：留着它，用户切到时间线后地址栏还在说
+   *    「看第 42 次对话」，刷新又会把人拽回会话页签；抹掉之后地址始终描述屏幕上那一屏。
+   *    用 `replace` 而不是 `push`：深链的落点不是「用户走过的一步」，后退应当离开本页。
+   * ② **`consumedRun` 记忆**挡住重复消费：抹地址会改 hash，不记一笔就自己咬自己。
+   *    它同时是「同一条推送点第二次」的修复路径——抹掉参数后地址真的变了，那次改址会把
+   *    run 重新交给这里；`?run=` 一直挂着时第二次点开是同一地址，浏览器不发 `hashchange`，
+   *    什么也不会发生。
+   * ③ **非法值清掉不留**：`?run=abc` / `?run=0` / `?run=-1` 不是「定位失败」，是脏地址；
+   *    留着它只会让人以为页面没反应。
+   *
+   * 不校验「这个 run 属不属于这个 task」——那是服务端的事（`GET /tasks/:id/conversations/:run`
+   * 查不到自会报错），前端多一道白名单只会把合法的深链挡在门外。
+   */
+  let consumedRun: number | null = null;
+  $effect(() => {
+    const r = router.route;
+    if (r.name !== 'task' || r.id !== id) return;
+    const raw = r.query.run;
+    if (raw === undefined) return;
+    const runId = Number(raw);
+    if (!Number.isInteger(runId) || runId <= 0) {
+      writeQuery({ run: null }, { replace: true });
+      return;
+    }
+    if (consumedRun === runId) return;
+    consumedRun = runId;
+    selectRun(runId);
+    tab = 'conversation';
+    writeQuery({ run: null }, { replace: true });
+  });
 
   function handleDockHeight(h: number) {
     dockH = h;

@@ -9,7 +9,8 @@
 //! `notify_channel`（离线通知的界面设置——总开关与通道单元，决策 272⑥⑦⑧）、
 //! `attention`（值班长待办——调度器发现的落点，决策 209③）、
 //! `model_requests`（模型请求台账——「现在在飞什么」与「这一次烧了多少字节」，决策 231）、
-//! `rtk`（命令执行走 rtk 的全局开关，决策 297）。
+//! `rtk`（命令执行走 rtk 的全局开关，决策 297）、
+//! `push`（浏览器推送的订阅行与 VAPID 密钥对，spec `.scratch/pwa-webpush/` 票 02）。
 
 pub mod attention;
 pub mod catalog;
@@ -24,6 +25,7 @@ pub mod notify_channel;
 pub mod observability;
 pub mod pairing;
 pub mod proposals;
+pub mod push;
 pub mod rtk;
 pub mod server_bind;
 pub mod skill_sources;
@@ -32,6 +34,7 @@ pub mod tasks;
 pub use attention::{AttentionItem, AttentionKind, AttentionSummary, WatchWakeOutcome};
 pub use foreman::{ForemanMessage, NewForemanMessage};
 pub use model_requests::{ModelRequest, ModelRequestStatus, ModelRequestUsage, NewModelRequest};
+pub use push::{PushSubscription, VapidKeys};
 pub use rtk::RtkSwitch;
 pub use skill_sources::SkillSource;
 

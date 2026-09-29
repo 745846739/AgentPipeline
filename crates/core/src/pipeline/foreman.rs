@@ -3359,7 +3359,12 @@ impl ForemanRunner {
             // `note_row = false` 的那一批后续失败不逐条叫人（同一把尺：决策 271 的
             // 「同批同类只落一行」，否则失败风暴会把手机刷成第二个对讲台）。
             if let Some(notifier) = self.store.notifier() {
-                notifier.notify_foreman_failure(&session.title, &kind, self.store.now());
+                notifier.notify_foreman_failure(
+                    &session.id,
+                    &session.title,
+                    &kind,
+                    self.store.now(),
+                );
             }
         }
         self.invalidate_round_proposals(&session.id, started_at)
@@ -3458,7 +3463,12 @@ impl ForemanRunner {
         .await;
         // 失败收口必通知（决策 272③）：panic 被端点层接住的那一条也走 `failed` 类。
         if let Some(notifier) = self.store.notifier() {
-            notifier.notify_foreman_failure(&session.title, "interrupted", self.store.now());
+            notifier.notify_foreman_failure(
+                &session.id,
+                &session.title,
+                "interrupted",
+                self.store.now(),
+            );
         }
         self.invalidate_round_proposals(&session.id, started_at)
             .await;
@@ -3479,7 +3489,12 @@ impl ForemanRunner {
         let Some(notifier) = self.store.notifier() else {
             return;
         };
-        notifier.notify_foreman_reply(&turn.session.title, &turn.reply, self.store.now());
+        notifier.notify_foreman_reply(
+            &turn.session.id,
+            &turn.session.title,
+            &turn.reply,
+            self.store.now(),
+        );
     }
 
     /// 往台账里写一条**操作台自己**的账（`role = system`，决策 207 那条路）。

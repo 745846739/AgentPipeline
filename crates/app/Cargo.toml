@@ -32,6 +32,9 @@ qrcode = { version = "0.14.1", default-features = false, features = ["svg"] }
 if-addrs = "0.15.0"
 
 [dev-dependencies]
+# 契约测试要造形状正确的推送订阅（pwa-webpush 02）：p256dh / auth 是 base64url ——
+# 与 core 同一条理由（0.22 已在依赖树里，提为直接依赖不引新下载）。
+base64.workspace = true
 tempfile.workspace = true
 testkit.workspace = true
 tokio = { workspace = true, features = ["full", "test-util"] }

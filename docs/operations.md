@@ -1351,3 +1351,125 @@ CONTEXT_ALERTS = {
 **令牌留在地址栏里（决策 191，2026-09-16；修订 182㉙ 的「从地址栏抹掉」）。** 起因是实测反馈「**添加到主屏幕后无法二次访问**」：手机「添加到主屏幕」保存的就是**当时地址栏里那条 URL**，而 **iOS 的主屏 web app 与 Safari 各有独立存储**（localStorage / cookie 都不互通，Apple 文档明说）。于是「装载后把 `?pair=` 抹掉」这件事，等于让主屏图标在「URL 里没有令牌、自己的容器里也没有存储」的空状态下启动：看板读得到（只读 GET 不护），一进对讲台或动写操作就是 403「这台设备还没配对」，而且**再也回不来**——扫码只会打开 Safari，救不了那个图标。故 `capturePairingFromLocation()` 现在只做「读出来 → 存 localStorage」，**不动地址栏**；令牌的取用有三条途径并存：URL（主屏 / 书签）→ localStorage（同一浏览器跨标签页）→ 进程内缓存。
 
 **当初的三条理由怎么处置的：** `Referer` 泄给第三方那一条，改由**响应头**关掉（`assets.rs` 给所有静态响应加 `Referrer-Policy: no-referrer`）——本应用不引外部资源（字体自托管），这个头是给「以后顺手加外链 / 外图」留的保险，一个头换掉一条理由，划算；**截图与浏览历史里有凭据那两条如实留下**，出路是既有的「重置配对」（旧令牌立即失效）。**残余风险两条，如实记**：① 重置后各设备必须重扫，**已添加到主屏幕的还要重新添加一次**（图标里记的是旧地址），对讲台的失败指引里已写明这句；② 「URL 为准」意味着陈旧的书签会覆盖本地较新的令牌——URL 是使用者的显式动作（点图标 / 点书签 / 扫新码），故取它为准，代价是一次 403 加一次重扫。
+
+### 12.17 106 的 HTTPS 入口（mkcert 长效 IP 证书 + Caddy，决策 327）
+
+**为什么必须上 HTTPS。** 浏览器推送（service worker + Push API）只在**安全上下文**里可用：`https://…` 或本机 `localhost`。106 是裸 IP（`106.12.12.6`）且只有明文 `http://…:3333`，手机上打开它既注册不了 service worker、也订不了推送——「锁屏收推送」这件事必须先把安全上下文建起来。本机开发不受影响（`localhost` 本身就是安全上下文，不需要 CA 也不需要 Caddy）。
+
+**信任链的边界（一条硬约束）。** 根 CA 生成在**开发机**上，**根 CA 私钥永不上 106**：服务器被拿下时偷走的只有一张已签发的叶子证书与它的私钥（换一张重签即可，重签不碰任何设备上的信任），而不是整条信任链的根（那意味着攻击者可以给任意域名签一张被你的设备信任的证书）。**上机的只有两项**：叶子证书 `106.12.12.6.pem` 与它的私钥 `106.12.12.6-key.pem`。
+
+> **⚠️ 切换前先读这一条：拆明文会让配对令牌在 106 上失去牙齿。**
+>
+> 配对守卫（§12.16、决策 167 / 182⑦）的豁免判据是**来源地址是否回环**，而守卫整体只在**绑非回环地址**时才启用。Caddy 与后端同机，它转发过来的请求源地址就是 `127.0.0.1`；后端一旦按本节的方案改绑 `127.0.0.1`，`lan_mode()` 也变假——**两条豁免同时命中，等于 `https://106.12.12.6` 上的写请求与 `/foreman/*` 全都不再要求令牌**（不装 CA 的浏览器点一次「继续访问」就能全程使用，包括花 token 的对讲台）。这不是「比以前安全一点还是差一点」的取舍，而是**今天那层保护会消失**，故**切换被显式挂起**（决策 323 如实记）。
+>
+> 两条出路，选一条再动服务器（都不需要改后端代码、都能与 CA 那一套并存）：
+>
+> | 出路 | 做法 | 代价 |
+> |---|---|---|
+> | **① Caddy 加一道 HTTP Basic（推荐先走这条）** | `caddy hash-password` 生成一串哈希写进 `basic_auth`，全站一层 | 每台设备第一次进站要输一次用户名口令（浏览器会记住）；与 App 自己的配对令牌**并存**——经代理进来的请求在守卫眼里是回环，靠 Basic 挡外面 |
+> | ② 后端学会认可信代理的转发地址 | 让后端在「来源回环 **且**带可信代理标头」时**不再豁免**（读 `X-Forwarded-For` 取真实来源） | 要动 `stream.rs` 的判据 + 一条新决策 + 一组测试；转发头本身可伪造，必须与「只信本机代理」的约束一起落地 |
+>
+> 换句话说：**HTTPS 与「谁动手要凭据」是两件事，别让前者把后者顺手关掉。**
+
+**一次性签发（在开发机上）。** mkcert 是本地 CA 工具，只在开发机装：
+
+```bash
+brew install mkcert nss           # nss 用于让 Firefox 也认（可选）
+mkcert -install                   # 生成并信任根 CA（进 macOS 钥匙串）
+mkcert -CAROOT                    # 根 CA 在哪：rootCA.pem + rootCA-key.pem
+```
+
+签一张含 **IP SAN** 的长效证书（浏览器对「裸 IP 的 HTTPS」要求 SAN 里真的有这个 IP；主机名与 IP 的 SAN 类型不同，写错等于没签）：
+
+```bash
+cd ~/ca-106                              # 建议单独放一个目录，别混进仓库
+mkcert -cert-file 106.12.12.6.pem -key-file 106.12.12.6-key.pem 106.12.12.6
+openssl x509 -in 106.12.12.6.pem -noout -text | grep -A2 'Subject Alternative Name'
+#   → DNS:…（若有）IP Address:106.12.12.6
+openssl x509 -in 106.12.12.6.pem -noout -enddate      # 有效期（mkcert 缺省约 27 个月）
+```
+
+**注意两条**：① **不要**把 `-cert-file` 指到 `.pem` 之外的格式上（Caddy 直接读 PEM）；② `~/ca-106/` 与 `$(mkcert -CAROOT)` 都**不要**提交进仓库（`.gitignore` 已挡住 `*.pem`，但根 CA 目录在仓库外更稳妥）。
+
+**上机（在开发机上执行）。** 证书与私钥放到 Caddy 的固定目录，权限只给 Caddy 那个用户：
+
+```bash
+scp 106.12.12.6.pem 106.12.12.6-key.pem root@106.12.12.6:/etc/caddy/certs/
+ssh root@106.12.12.6 'chown -R root:root /etc/caddy/certs && chmod 600 /etc/caddy/certs/106.12.12.6-key.pem && chmod 644 /etc/caddy/certs/106.12.12.6.pem'
+```
+
+**106 上的 Caddy（装一次，之后只管 reload）。**
+
+```bash
+# 装 Caddy（官方源；也可用各发行版仓库里的包）
+apt-get install -y debian-keyring debian-archive-keyring apt-transport-https curl
+curl -1sLf 'https://dl.cloudsmith.io/public/caddy/stable/gpg.key' | gpg --dearmor -o /usr/share/keyrings/caddy-stable-archive-keyring.gpg
+curl -1sLf 'https://dl.cloudsmith.io/public/caddy/stable/debian.deb.txt' > /etc/apt/sources.list.d/caddy-stable.list
+apt-get update && apt-get install -y caddy
+
+cat >/etc/caddy/Caddyfile <<'EOF'
+{
+	# 自签/静态证书：关掉自动 HTTPS 与 ACME（裸 IP 申请不了公共证书）
+	auto_https off
+}
+
+https://106.12.12.6 {
+	tls /etc/caddy/certs/106.12.12.6.pem /etc/caddy/certs/106.12.12.6-key.pem
+
+	# ← 出路 ①：先在这里加一层 basic_auth（caddy hash-password 生成的哈希）
+	# basic_auth {
+	#     me <哈希>
+	# }
+
+	# SSE（/tasks/{id}/stream、/foreman/stream）必须关掉缓冲，否则事件被攒住不下发
+	reverse_proxy 127.0.0.1:3333 {
+		flush_interval -1
+	}
+}
+
+# 443 之外不留明文旁路：用 80 直接回 404（不重定向，避免误把明文流量送到应用上）
+http://106.12.12.6 {
+	respond 404
+}
+EOF
+
+systemctl enable --now caddy     # 开机自启
+caddy validate --config /etc/caddy/Caddyfile
+systemctl reload caddy           # 改完配置只 reload
+```
+
+**后端改绑回环（顺序很重要）。** 先让 443 通、再关明文，中间任何一步失败都还能退回去：
+
+```bash
+# ① 先确认 443 可用（此时明文入口还在，随时可退）
+curl -sS -o /dev/null -w '%{http_code}\n' --cacert ~/ca-106/rootCA.pem https://106.12.12.6/
+
+# ② 把绑定交还给 config.toml（若「手机访问」页按过「绑定全网卡」，那一级住 DB、压过 config）
+#    界面上点「改回 config.toml」，或直接删那一行设置；
+#    随后在 config.toml 里写：
+#      [server]
+#      host = "127.0.0.1"
+#    并以 systemd 单元的 ExecStart 参数固定住（`--host 127.0.0.1` 是启动期那一级，压过界面与 config）：
+systemctl edit agent-pipeline    # 在 ExecStart 里补 --host 127.0.0.1
+systemctl restart agent-pipeline
+
+# ③ 验证：回环上可读，公网只剩 443
+ss -ltnp | grep 3333                              # 应只见 127.0.0.1:3333
+curl -sS -o /dev/null -w '%{http_code}\n' --max-time 5 http://106.12.12.6:3333/ || echo '明文入口已关'
+```
+
+**手机与设备侧。** 每台要用推送的设备装一次根 CA 描述文件并显式信任：iPhone 用 **Safari**（不是微信/QQ 内置浏览器）打开 `$(mkcert -CAROOT)/rootCA.pem`（先把 `rootCA.pem` 拷到一台能访问的机器上，或用 AirDrop / 邮件发过去）→ 设置 → 已下载描述文件 → 安装 → 通用 → 关于本机 → 证书信任设置 → **打开**「mkcert …」那一项（少这一步 Safari 仍报不受信任）。**只有根证书上机，根 CA 私钥不上机**——这也是为什么描述文件可以从开发机分发而不是让 106 自己签。
+
+**到期重签（三五年后想起来一次）。** 根 CA 不变、设备不用重装描述文件：
+
+```bash
+cd ~/ca-106
+mkcert -cert-file 106.12.12.6.pem -key-file 106.12.12.6-key.pem 106.12.12.6   # 同一条命令重签
+scp 106.12.12.6.pem 106.12.12.6-key.pem root@106.12.12.6:/etc/caddy/certs/
+ssh root@106.12.12.6 'systemctl reload caddy'
+```
+
+**已知变数，如实记。** ① Apple 对「用户自装 CA」在 Safari 里的信任姿态是政策面的事，未来若收紧，退路是补一个真域名走标准证书（CA 那一套换掉，其余不动）；② 证书到期是**手动**动作，没有自动续期——`openssl x509 -enddate` 是唯一的提醒，记在运维日历里；③ 106 的 `443` 对外开放这件事本身**不增加暴露面**（`3333` 今天就在公网上），增加暴露面的是「拆掉明文入口之后令牌失效」那一条（见上面的警告框）。
+
+**现状（2026-09-29，落地到哪一步）。** 本仓库这一侧已就位：本节（签发 / 上机 / 重签 / 验证命令）、部署 skill 的 HTTPS 化（装 Caddy、改绑定、验证命令改 `https://`）、CI 的外部可达性检查改 `https://`（并保留明文回退一支，拆明文那一票落地时删掉）、应用侧不需要任何改动。**106 上尚未切换**：Caddy 未装、证书未上机、后端仍绑全网卡——因为切换会让配对令牌失去牙齿（见上面的警告框），这一步**等出路 ①/② 选一条之后再做**，且真机验收（装 CA → 加主屏 → 订阅 → 锁屏收推送）本来就只有人能走。
+
