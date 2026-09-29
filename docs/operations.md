@@ -1531,5 +1531,7 @@ curl -sS -o /dev/null -w '%{http_code}\n' --cacert ~/ca-106/rootCA.pem -u 'me:<�
   'https://106.12.12.6:3389/server-info/qr.svg?url=https%3A%2F%2F106.12.12.6%3A3389%2F%3Fpair%3Dtest'   # → 200
 ```
 
+**已落地（2026-09-29，本段命令逐条执行）**：unit 的 `ExecStart` 带上了 `--public-base-url https://106.12.12.6:3389` 并重启；外网实测 `/server-info` 经代理返回 `loopback_only=true` + `public_base_url="https://106.12.12.6:3389"` + 地址表只剩 `[{interface:"公网入口", url:"https://106.12.12.6:3389", preferred:true}]`；二维码端点带令牌的配对 URL **200**、缺省目标 **200**、白名单外 origin **400**；本机 chromium 打开 `https://106.12.12.6:3389/#/share`（Basic 凭据 + 忽略证书）时页面画出的正是指向该入口的码（`.picked` = `https://106.12.12.6:3389/?pair=…`），`.gate` 与「绑定全网卡 / 改回只绑本机」两颗钮**都为 0**，service worker 在信任根 CA 的浏览器里照常注册（scope `https://106.12.12.6:3389/`）。
+
 改完这一页应当：画出**指向 `https://106.12.12.6:3389/?pair=…` 的二维码**、不再出现「手机现在连不上这台机器」与两颗改绑钮、底部改为说清入口来自哪里。**注意这一页仍要在能读到令牌的入口打开**（106 上经反代进来的请求算本机，故从任何设备进站都读得到；见下面的警告框）。另外：`~/.zcode/skills/agentpipeline-deploy-106/SKILL.md` 已同步（入口、验证命令、3389 这个事实、这一条参数）。
 
