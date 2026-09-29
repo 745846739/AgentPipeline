@@ -470,8 +470,15 @@ export function turnLanded(rows: LedgerRow[], before: number): boolean {
 export type FollowOutcome =
   /** 继续跟：它还在跑。 */
   | { kind: 'keep' }
-  /** 落了地：台账那一行接管（它会带着完整回话进来），本地那一段该收掉了。 */
-  | { kind: 'settled' }
+  /**
+   * 落了地：台账那一行接管（它会带着完整回话进来），本地那一段该收掉了。
+   *
+   * `interrupted` = 收在**中断行**上（重启后启动恢复标的终态，talk-replay 票 03）——
+   * 正常收口是「回话来了」，中断是「它不会来了」。判据要分开：发送队列只在前者自动
+   * 出队，后者扣住等确认（票 04「死轮/中断扣住等确认」——两者的可见性都是「上一轮
+   * 没有正常回来」，不许静默照发）。
+   */
+  | { kind: 'settled'; interrupted: boolean }
   /**
    * **没落地、服务端也不再报在跑、台账里也没有那条行的终态**——只剩「半截行还没建出来 /
    * 还没轮到标」的竞态窗口。进程被杀**又重启**的那一类不走这里：启动恢复把悬挂行标成
@@ -508,14 +515,18 @@ export function resolveFollowOutcome(
   anchor: number,
   turnInFlight: boolean,
 ): FollowOutcome {
-  if (turnLanded(rows, anchor)) return { kind: 'settled' };
+  // **锚那条行自己的终态先判**（先于「尾部多了一行」）：锚行标成 `interrupted` 之后，
+  // 台账里可能又多出别的一行（重启后值守轮 / 用户又开了新一轮）——按「多一行」判会把
+  // 「这一轮被中断、回话没来」误判成正常落地，发送队列会据此静默照发（票 04 的红线）。
+  //
   // **就地收口那一条支路**（票 01 修订了「多一行才算落地」）：半截行收口时写的是
   // **同一行**（`status` 从 `in_flight` 落成 `null`），尾部不会多出任何一行——判不出
   // 落地就会把正常收口误判成死轮（`lost`），半截字于是顶着「不会再来」的说明。
   //
   // **中断行同支**（talk-replay 票 03）：`status` 落成 `interrupted` 同样是终态——判据
   // 只看「离开 in_flight」，时间线由台账那条行重算（决策 260 裁决③的本地合成对这一类
-  // 退役：不再拼一条失败轮与台账那条行并排成两套真相）。
+  // 退役：不再拼一条失败轮与台账那条行并排成两套真相）；但 `interrupted` 作为判据
+  // 一路带到 {@link FollowOutcome} 的 `settled.interrupted`，坞里据此扣住队列。
   //
   // 只认**助理侧的行**（`fm` / `ask`）：接手时锚点可能是**用户行**（半截行还没建出来的
   // 那个竞态窗口）——用户行从没在过途、收口也与它无关，按它判会把「还没落」误判成
@@ -526,8 +537,9 @@ export function resolveFollowOutcome(
     anchored.status !== 'in_flight' &&
     (anchored.kind === 'fm' || anchored.kind === 'ask')
   ) {
-    return { kind: 'settled' };
+    return { kind: 'settled', interrupted: anchored.status === 'interrupted' };
   }
+  if (turnLanded(rows, anchor)) return { kind: 'settled', interrupted: false };
   return turnInFlight ? { kind: 'keep' } : { kind: 'lost' };
 }
 

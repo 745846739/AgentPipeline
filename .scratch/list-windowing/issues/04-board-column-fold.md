@@ -6,7 +6,7 @@
 
 **Blocked by:** 01
 
-**Status:** ready-for-agent
+**Status:** done（2026-09-29 实现，决策 319）
 
 - [x] 列内上限 + 加载更多；换过滤档时页游标重置
 - [x] 卡内 PendingActions 加高不在本票范围（既有形态不动）

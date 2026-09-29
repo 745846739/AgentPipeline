@@ -9,7 +9,7 @@ resume.rs` 的既有机制）：自动续接最多 2 次 → 降级回空白重�
 
 **Blocked by:** None
 
-**Status:** ready-for-agent
+**Status:** done（2026-09-29 实现，决策 320）
 
 - [x] 超时判定的重试支（`scheduler/mod.rs::handle_timeout` → advance 重试流转）带
       `continued_from_run_id`，续接计数记在游标 / run 链上

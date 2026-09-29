@@ -327,8 +327,15 @@ describe('中断标记只有一个来源（票 03：台账字段 → 回合构�
 
   it('store 与判据模块都不合成「已中断」——标记的来路只有台账字段那一条', () => {
     // 改回就地合成（在 store / foreman 里自己拼一条中断轮或标记）即红。
-    expect(store, 'store 不该自己合成标记').not.toContain('interrupted');
+    //
+    // **读纯函数判好的布尔不算合成**（2026-09-29，票 04 中断扣队列）：`outcome.interrupted`
+    // 在 `resolveFollowOutcome` 里从 `anchored.status`（台账字段）算出，判定点仍只有那一处；
+    // store 这一侧的红线是**再算一遍**（摸 raw status）与**带界面文案**——原断言
+    // `not.toContain('interrupted')` 连字段名一起禁，把「接线读判据」误伤成「就地合成」。
+    expect(store, 'store 不该自己重判行状态').not.toContain("status === 'interrupted'");
+    expect(store, 'store 不该摸原始字段').not.toContain('interrupted_at');
     expect(store, 'store 不该出现界面文案').not.toContain('已中断');
+    expect(store, '中断扣队列该读纯函数判好的布尔').toContain('outcome.interrupted');
     expect(foreman, '三支判据只认 status 字段，不带界面文案').not.toContain('已中断');
     // 中断行落进哪一支由纯函数判（就地收口那条：status 离开 in_flight 就是落地），
     // 单测 foreman.test.ts 钉着 interrupted → settled 的实际取值。

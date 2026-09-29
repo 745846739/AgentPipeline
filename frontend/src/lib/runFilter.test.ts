@@ -16,6 +16,7 @@ function run(overrides: Partial<ConversationSummary> = {}): ConversationSummary 
     parent_run_id: null,
     prompt_tokens: 100,
     completion_tokens: 50,
+    status: 'success',
     ...overrides,
   };
 }
@@ -37,6 +38,16 @@ describe('filterRuns：run 药丸过滤（票 03）', () => {
 
   it('尝试次数也搜得到（药丸上看得见的「尝试 N」）', () => {
     expect(filterRuns(rows, '2').map((r) => r.run_id)).toEqual([23]);
+  });
+
+  it('状态维也搜得到（票 03 点名：捞出 timeout / failed 的那几轮）', () => {
+    const withStatus = [
+      run({ run_id: 3, status: 'timeout' }),
+      run({ run_id: 4, status: 'failed' }),
+      run({ run_id: 5, status: 'success' }),
+    ];
+    expect(filterRuns(withStatus, 'timeout').map((r) => r.run_id)).toEqual([3]);
+    expect(filterRuns(withStatus, 'FAILED').map((r) => r.run_id)).toEqual([4]);
   });
 
   it('空查询：不过滤', () => {

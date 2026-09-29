@@ -367,4 +367,30 @@ describe('排队发送（票 04 of talk-live-identity）', () => {
     talk.setQueueHeld(SESSION, false);
     expect(talk.queueHeld[SESSION]).toBe(false);
   });
+
+  it('中断行：队列**同样**扣住（回话不会来了），确认后放行', () => {
+    // 票 04 原文「死轮 / 中断时队列扣住等确认」：中断与死轮同罪——评审实错的回归，
+    // 初版只在 `lost` 支扣，中断走 `settled` 支被静默放行照发。
+    reset(SESSION);
+    talk.enqueue(SESSION, '排在后面的话');
+    talk.followingSince = 2;
+    talk.syncFollowing(
+      payload({
+        messages: [row(1), row(2, { status: 'interrupted' })],
+        turn_in_flight: false,
+      }),
+    );
+    expect(talk.queueHeld[SESSION], '中断行也不许自动照发').toBe(true);
+
+    talk.setQueueHeld(SESSION, false);
+    expect(talk.queueHeld[SESSION]).toBe(false);
+  });
+
+  it('正常收口：队列**不**扣住（出队效果据此自动发下一条）', () => {
+    reset(SESSION);
+    talk.enqueue(SESSION, '排在后面的话');
+    talk.followingSince = 2;
+    talk.syncFollowing(payload({ messages: [row(1), row(2)], turn_in_flight: false }));
+    expect(talk.queueHeld[SESSION], '回话来了就该自动发——扣住会把队列卡死').toBeFalsy();
+  });
 });

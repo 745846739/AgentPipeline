@@ -542,7 +542,11 @@ impl Store {
     /// **从未 pending 过**（判超时的一方只写重试流转、不挂 pending，决策 226），那边
     /// 「只在 pending→active 时置位」的门够不着这里——这是同一个列的第二把合法钥匙。
     /// 取走即清零的语义不变（[`Self::take_cursor_resume_cause`] 是唯一读者）。
-    pub async fn mark_cursor_continuation(&self, cursor_id: &str, cause: ResumeCause) -> Result<()> {
+    pub async fn mark_cursor_continuation(
+        &self,
+        cursor_id: &str,
+        cause: ResumeCause,
+    ) -> Result<()> {
         sqlx::query(
             "UPDATE kanban_node_cursors SET resumed_from_pending_kind = ?, updated_at = ?
              WHERE cursor_id = ?",

@@ -840,6 +840,16 @@ pub async fn conversations(
         .list_conversations(&id, query.include_archived)
         .await
         .map_err(map_core_error)?;
+    // run 状态不在会话行里（状态住台账），而药丸过滤要「状态」这一维（票 03）——
+    // 按 run_id 从台账取一份贴进摘要。本机单用户量级，整表拉一次即可，不值得新端点。
+    let statuses: std::collections::HashMap<i64, String> = state
+        .store
+        .list_runs(&id)
+        .await
+        .map_err(map_core_error)?
+        .into_iter()
+        .map(|r| (r.id, r.status.as_str().to_string()))
+        .collect();
     // 列表只给摘要（§12.4.3）
     let summaries: Vec<serde_json::Value> = conversations
         .into_iter()
@@ -854,6 +864,7 @@ pub async fn conversations(
                 "prompt_tokens": c.prompt_tokens,
                 "completion_tokens": c.completion_tokens,
                 "archived_at": c.archived_at,
+                "status": statuses.get(&c.run_id).map(String::as_str).unwrap_or("unknown"),
             })
         })
         .collect();

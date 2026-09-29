@@ -1109,9 +1109,8 @@ impl ToolExecutor {
         let value: serde_json::Value = serde_json::from_str(&call.arguments).or_else(|e| {
             // 被 max_tokens 掐断的参数（EOF 型）先救援再判死：补齐尾部引号与括号后
             // 照旧走下游 schema 校验；救不回来按原样报错（非截断型坏 JSON 不救）。
-            crate::agent::metadata::rescue_truncated_json(&call.arguments).ok_or_else(|| {
-                Error::Validation(format!("submit_metadata 参数解析失败：{e}"))
-            })
+            crate::agent::metadata::rescue_truncated_json(&call.arguments)
+                .ok_or_else(|| Error::Validation(format!("submit_metadata 参数解析失败：{e}")))
         })?;
         Ok(ToolOutcome {
             content: "{\"success\":true}".to_string(),

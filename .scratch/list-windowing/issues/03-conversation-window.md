@@ -6,7 +6,7 @@ run 药丸行（:70）加关键词过滤（run id / 节点 / 状态）；选中 
 
 **Blocked by:** 01
 
-**Status:** ready-for-agent
+**Status:** done（2026-09-29 实现，决策 319）
 
 - [x] 药丸过滤框（placeholder 讲清它滤的是 run 行）
 - [x] 消息列表切片显尾部 + 展开提示；MessageBubble / ToolCallCard 渲染不变

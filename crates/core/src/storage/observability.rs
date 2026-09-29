@@ -461,7 +461,12 @@ impl Store {
     /// - 从最新往回走、撞到第一条**非 timeout** 终态就停：任何一次非超时的收场
     ///   （成功 / 失败 / 人按停）都把连续计数清零，人对该节点的新一轮介入重新起算；
     /// - `running` 也算撞墙（还没收场的 run 不属于任何一段连续超时）。
-    pub async fn trailing_timeout_streak(&self, task_id: &str, stage: Stage, node: Node) -> Result<u32> {
+    pub async fn trailing_timeout_streak(
+        &self,
+        task_id: &str,
+        stage: Stage,
+        node: Node,
+    ) -> Result<u32> {
         let rows: Vec<(String,)> = sqlx::query_as(&format!(
             "SELECT status FROM kanban_node_runs
              WHERE task_id = ? AND stage = ? AND node = ? AND agent_type IN ({})

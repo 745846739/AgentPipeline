@@ -388,6 +388,57 @@ async fn timeout_kills_process_group_and_retries_per_ladder() {
     assert_eq!(h.sse.count_of(SseEventType::Pending), 1);
 }
 
+/// 纯代码节点也走满三段梯子（决策 320）：没有转录可续，前两档退化为空白重跑、
+/// 不置续接标记，第 4 次才挂起——**不是第一次超时就交回人工**。
+///
+/// 评审实错的回归：初版把「置位」的 agent 门控写进了分支条件本身，纯代码节点
+/// `streak <= 2` 两档全落进 else、首次超时即 pending，比旧口径
+/// （`run.attempt < agent_retry_max` 耗尽才挂）还倒退。
+#[tokio::test]
+async fn non_agent_node_ladders_blank_retries_then_pends() {
+    let h = Harness::new().await;
+    h.seed_task("t-code").await;
+    h.mark_running("t-code").await;
+    let cursor = h.store.load_live_cursors("t-code").await.unwrap()[0].clone();
+    // develop.validate_output 不在 agent 节点表里（`AgentNodeKind::of` → None）
+    h.store
+        .set_cursor_stage(&cursor.cursor_id, Stage::Develop, Node::ValidateOutput)
+        .await
+        .unwrap();
+
+    for round in 1..=4u32 {
+        h.running_run("t-code", &cursor.cursor_id, round, 400, 400, None)
+            .await;
+        let report = h.scheduler(Settings::default()).tick().await.unwrap();
+        assert_eq!(report.timed_out_runs.len(), 1, "第 {round} 轮应判超时");
+        if round < 4 {
+            assert!(
+                report.timeout_pending_cursors.is_empty(),
+                "第 {round} 次超时不得挂起：纯代码节点也走梯子"
+            );
+            assert_eq!(
+                h.resumes.load(Ordering::SeqCst),
+                round as usize,
+                "第 {round} 次超时应当重跑"
+            );
+            assert_eq!(
+                h.store
+                    .take_cursor_resume_cause(&cursor.cursor_id)
+                    .await
+                    .unwrap(),
+                None,
+                "纯代码节点没有转录可续，不置标记"
+            );
+        } else {
+            assert_eq!(
+                report.timeout_pending_cursors,
+                vec![cursor.cursor_id.clone()],
+                "连续第 4 次超时才挂起"
+            );
+        }
+    }
+}
+
 /// 判超时要照实记**跑了多久**（决策 226）。
 ///
 /// 此前这条路径不带 `duration_ms`，于是「跑了 8 小时 51 分」「5 分 10 秒」这种判读只能由
@@ -769,9 +820,28 @@ async fn a_timed_out_system_run_names_the_step_it_was_on() {
     h.seed_task("t1").await;
     h.mark_running("t1").await;
     let cursor = h.store.load_live_cursors("t1").await.unwrap()[0].clone();
-    // attempt 3 = agent_retry_max → 耗尽，直接落 pending（信息量最完整的那个出口）
+    // 梯子（决策 320）：挂起在**连续第 4 次**超时——垫三条已终态的超时 run，让这一轮
+    // 落在挂起支上（信息量最完整的那个出口）。attempt 不再参与判断：旧口径
+    // 「attempt 3 = agent_retry_max → 耗尽即挂」由 320 的连续超时计数取代。
+    for attempt in 1..=3 {
+        let seeded = h
+            .running_run("t1", &cursor.cursor_id, attempt, 400, 400, None)
+            .await;
+        h.store
+            .finish_run(
+                seeded,
+                &RunOutcome {
+                    status: Some(NodeStatus::Timeout),
+                    duration_ms: 400_000,
+                    error: Some("垫：连续超时".into()),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+    }
     let run_id = h
-        .running_run("t1", &cursor.cursor_id, 3, 400, 400, Some(4242))
+        .running_run("t1", &cursor.cursor_id, 4, 400, 400, Some(4242))
         .await;
     h.store
         .set_run_step(run_id, "检查项目工作区是否脏")

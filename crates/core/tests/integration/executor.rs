@@ -5893,7 +5893,9 @@ async fn wait_for_running_validate_input(ctx: &Ctx, task_id: &str) -> i64 {
 #[tokio::test]
 async fn timeout_retry_ladder_continues_twice_then_blank_then_pending() {
     let ctx = setup("true", Settings::default()).await;
-    testkit::seed_task(&ctx.store, "t-ladder", "p1").await.unwrap();
+    testkit::seed_task(&ctx.store, "t-ladder", "p1")
+        .await
+        .unwrap();
     admit(&ctx, "t-ladder").await;
     let scheduler = KanbanScheduler::new(
         ctx.store.clone(),
@@ -5956,13 +5958,9 @@ async fn timeout_retry_ladder_continues_twice_then_blank_then_pending() {
             .unwrap()
             .expect("这条 run 应当在台账里");
         match round {
-            1 => assert_eq!(
-                row.continued_from_run_id, None,
-                "第一轮是干净起跑"
-            ),
+            1 => assert_eq!(row.continued_from_run_id, None, "第一轮是干净起跑"),
             2 | 3 => assert_eq!(
-                row.continued_from_run_id,
-                prev_run,
+                row.continued_from_run_id, prev_run,
                 "第 {round} 轮应当自动续接上一轮（continued_from_run_id 指向被续接的历史 run）"
             ),
             4 => assert_eq!(

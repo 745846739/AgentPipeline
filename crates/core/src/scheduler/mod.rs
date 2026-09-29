@@ -375,6 +375,7 @@ impl KanbanScheduler {
         // 重试起的 run 经 `take_continuation`（决策 180 / 205 的既有机制，与手动
         // 「继续」同路）带上一轮转录，run 链上落 `continued_from_run_id`。上一轮的
         // 转录已经落库（失败 attempt 照记会话行，含被中止的那一轮），续接的是真实进度。
+        // 纯代码节点没有转录，这两档退化为**空白重跑**（不置标记），梯子计数照走。
         // 连续第 3 次：降级**空白重跑**一次——续接救了两轮都没救回来，多半不是
         // 「丢了上下文」，续第四遍只是继续烧钱。
         // 连续第 4 次起：挂起 pending(timeout) 交回人工。
@@ -386,24 +387,42 @@ impl KanbanScheduler {
             .await?;
         // 续接标记只对 **agent 节点**有意义：`take_continuation` 只在 agent 节点入口读
         // （纯代码节点没有转录可言）。对纯代码节点置位会让标记永远无人取走、悬在列上。
+        // **但梯子本身对纯代码节点照样走**（决策 320 按「该节点连续超时的轮数」计数，
+        // 不分节点种类）：没有转录可续时前两档退化为空白重跑，第 4 次才挂起——
+        // 第一次超时就交回人工，比旧口径 `run.attempt < agent_retry_max` 耗尽才挂还倒退。
         let is_agent_node =
             crate::pipeline::model_invoke::AgentNodeKind::of(run.stage, run.node).is_some();
-        if is_agent_node && streak <= TIMEOUT_AUTO_CONTINUES_MAX {
-            self.store
-                .mark_cursor_continuation(cursor_id, ResumeCause::Timeout)
-                .await?;
-            self.store
-                .insert_transition(
-                    task_id,
-                    &branch_of(cursor_id, &self.store).await?,
-                    Some((run.stage, run.node)),
-                    (run.stage, run.node),
-                    crate::types::TransitionTrigger::Timeout,
-                    Some(&format!(
-                        "节点超时，自动续接上一轮转录（连续第 {streak} 次超时）"
-                    )),
-                )
-                .await?;
+        if streak <= TIMEOUT_AUTO_CONTINUES_MAX {
+            if is_agent_node {
+                self.store
+                    .mark_cursor_continuation(cursor_id, ResumeCause::Timeout)
+                    .await?;
+                self.store
+                    .insert_transition(
+                        task_id,
+                        &branch_of(cursor_id, &self.store).await?,
+                        Some((run.stage, run.node)),
+                        (run.stage, run.node),
+                        crate::types::TransitionTrigger::Timeout,
+                        Some(&format!(
+                            "节点超时，自动续接上一轮转录（连续第 {streak} 次超时）"
+                        )),
+                    )
+                    .await?;
+            } else {
+                self.store
+                    .insert_transition(
+                        task_id,
+                        &branch_of(cursor_id, &self.store).await?,
+                        Some((run.stage, run.node)),
+                        (run.stage, run.node),
+                        crate::types::TransitionTrigger::Timeout,
+                        Some(&format!(
+                            "节点超时，自动重跑（纯代码节点无转录可续，连续第 {streak} 次超时）"
+                        )),
+                    )
+                    .await?;
+            }
             (self.resume)(task_id);
         } else if streak == TIMEOUT_AUTO_CONTINUES_MAX + 1 {
             // 空白重跑档：不带转录重起一段对话（决策 33 的原语义），给节点最后一次

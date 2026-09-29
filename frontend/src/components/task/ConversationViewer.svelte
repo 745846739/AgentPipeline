@@ -2,6 +2,7 @@
   import type { ChatMessage, ConversationSummary, NodeConversation } from '../../api/types';
   import type { LiveDelta, LiveTool } from '../../realtime/reduce';
   import { formatTokens } from '../../lib/format';
+  import { messageMatches } from '../../lib/messageFilter';
   import { filterRuns } from '../../lib/runFilter';
   import { DEFAULT_PAGE, windowSlice } from '../../lib/windowSlice';
   import MessageBubble from '../render/MessageBubble.svelte';
@@ -64,28 +65,34 @@
   /**
    * 长列表窗口化（spec list-windowing 票 03）：run 药丸墙加关键词过滤，选中 run 的
    * 消息列表接切片原语（默认显尾部 50 条——收尾的元数据卡与流式尾巴都在最底下，
-   * 窗口化了才看得见「现在」）。过滤态不进 URL，与折叠态同一口径（决策 217 类比）。
+   * 窗口化了才看得见「现在」）。消息另有一个**内容 / 角色**过滤框（spec 那句
+   * 「会话页签（消息内容 / 角色过滤）」的落点）。过滤态不进 URL，与折叠态同一口径
+   * （决策 217 类比）。
    */
   let runQuery = $state('');
+  let msgQuery = $state('');
   let shownMsg = $state(DEFAULT_PAGE);
 
   const shownRuns = $derived(filterRuns(sorted, runQuery));
 
-  // 换 run：窗口游标回缺省——省略计数是按选中 run 的名单算的，旧游标只会有害
+  // 换 run / 换消息过滤词：窗口游标回缺省——省略计数是按当前名单算的，旧游标只会有害
   $effect(() => {
     selectedRunId;
+    msgQuery;
     shownMsg = DEFAULT_PAGE;
   });
 
   /**
    * tool 消息中空 content 的行不渲染（既有判据）；键用**原数组下标**——窗口化之后
    * `each` 的局部 i 不再等于消息在会话里的位置，拿它当键会随窗口滑动而错位。
+   * 消息过滤（内容 / 角色）叠在这条链上：**先下标、后过滤、再切片**——键不随窗口
+   * 漂移，省略计数按过滤后的名单算（先过滤后切，决策 319）。
    */
   const displayed = $derived.by(() => {
     if (!conversation) return [];
     return conversation.messages_json
       .map((message, idx) => ({ message, idx }))
-      .filter(({ message }) => message.role !== 'tool' || message.content);
+      .filter(({ message }) => (message.role !== 'tool' || message.content) && messageMatches(message, msgQuery));
   });
   const msgSlice = $derived(windowSlice(displayed, shownMsg, 'tail'));
 </script>
@@ -101,8 +108,8 @@
     <input
       class="rinput"
       type="search"
-      placeholder="滤上面的 run 行：阶段 · 节点 · 子代理 · run id"
-      aria-label="按阶段、节点、子代理或 run id 过滤 run 行"
+      placeholder="滤上面的 run 行：阶段 · 节点 · 子代理 · 状态 · run id"
+      aria-label="按阶段、节点、子代理、状态或 run id 过滤 run 行"
       bind:value={runQuery}
     />
   </div>
@@ -143,6 +150,18 @@
       <div class="empty">正在加载会话…</div>
     {:else}
       {#if conversation}
+        <div class="runfilter">
+          <input
+            class="rinput"
+            type="search"
+            placeholder="滤这轮消息：内容 / 角色（user、assistant、tool）"
+            aria-label="按内容或角色过滤这一轮消息"
+            bind:value={msgQuery}
+          />
+        </div>
+        {#if msgQuery.trim() !== '' && displayed.length === 0}
+          <div class="empty">没有匹配的消息。</div>
+        {/if}
         {#if msgSlice.omittedBefore > 0}
           <MoreRow
             label={`已省略前 ${msgSlice.omittedBefore} 条，点此展开`}
@@ -175,7 +194,7 @@
 {/if}
 
 <style>
-  /* run 行的过滤框（票 03）：2px 描边、12px 字号是全站像素纪律 */
+  /* run 行 / 消息的过滤框（票 03，两处共用一形）：2px 描边、12px 字号是全站像素纪律 */
   .runfilter {
     margin-bottom: 8px;
   }

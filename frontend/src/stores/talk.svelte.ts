@@ -370,6 +370,10 @@ class TalkStore {
       this.recalibrate?.();
       return;
     }
+    // **中断行同扣**（票 04「死轮/中断扣住等确认」）：这一轮收在启动恢复标的
+    // `interrupted` 终态上——回话不会来了，与死轮同罪：排在后面的话**不自动照发**，
+    // 等坞里「确认 / 清空」两个出口。正常收口（`interrupted: false`）照旧自动出队。
+    if (outcome.interrupted && this.sessionId) this.setQueueHeld(this.sessionId, true);
     // 落地：台账那一行接管（它带着完整回话与段序进来），在飞那一段退场。
     // **先放手再交棒**：`syncFollowing` 在收到 `turn_in_flight` 为真时会重新立锚点，
     // 那一格是「回话落了库、而同一班紧接着又起了一轮」（值守轮插进来）——此时该跟的是

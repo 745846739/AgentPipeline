@@ -619,6 +619,7 @@ describe('跟的那一轮怎么收场：keep / settled / lost（决策 260 裁�
   it('台账尾部多了一行：落地（台账那一行接管回话）', () => {
     expect(resolveFollowOutcome([row(1), inflight(2), row(3)], 2, true)).toEqual({
       kind: 'settled',
+      interrupted: false,
     });
     // 落了地而同一班紧接着又起一轮（下一轮已在跑）：**落地优先**——这一轮的回话确实落库了
     expect(resolveFollowOutcome([row(1), inflight(2), row(3)], 2, true).kind).toBe('settled');
@@ -627,8 +628,14 @@ describe('跟的那一轮怎么收场：keep / settled / lost（决策 260 裁�
   it('**就地收口**（票 01）：半截行 status 落成 null 就是落地——尾部不多一行也判得出', () => {
     // 收口写的是同一行：只有「多一行」那条老判据的话这里会一直 keep，
     // 最终把正常收口误判成死轮（半截字顶着「不会再来」的说明）。
-    expect(resolveFollowOutcome([row(1), row(2)], 2, true)).toEqual({ kind: 'settled' });
-    expect(resolveFollowOutcome([row(1), row(2)], 2, false)).toEqual({ kind: 'settled' });
+    expect(resolveFollowOutcome([row(1), row(2)], 2, true)).toEqual({
+      kind: 'settled',
+      interrupted: false,
+    });
+    expect(resolveFollowOutcome([row(1), row(2)], 2, false)).toEqual({
+      kind: 'settled',
+      interrupted: false,
+    });
   });
 
   it('**台账中断行**接手（票 03）：锚那条半截行标成 interrupted → 落地，由台账重算时间线', () => {
@@ -636,12 +643,25 @@ describe('跟的那一轮怎么收场：keep / settled / lost（决策 260 裁�
     // 终态。按台账渲染「已中断」，而不是把它当死轮就地合成一条失败轮（决策 260 裁决③
     // 的 settled 支从此含中断行：**两套真相**由此只剩台账一套）。
     const interrupted = row(2, 'fm', 'interrupted');
-    expect(resolveFollowOutcome([row(1), interrupted], 2, false)).toEqual({ kind: 'settled' });
+    expect(resolveFollowOutcome([row(1), interrupted], 2, false)).toEqual({
+      kind: 'settled',
+      interrupted: true,
+    });
     // 同一班紧接着又在跑（重启后 turn_in_flight 又为真）：中断是终态，照样落地
-    expect(resolveFollowOutcome([row(1), interrupted], 2, true)).toEqual({ kind: 'settled' });
+    expect(resolveFollowOutcome([row(1), interrupted], 2, true)).toEqual({
+      kind: 'settled',
+      interrupted: true,
+    });
     // ask 行同口径：结构化提问那一轮被杀，也是由台账那条中断行收场
     expect(resolveFollowOutcome([row(1), row(2, 'ask', 'interrupted')], 2, false)).toEqual({
       kind: 'settled',
+      interrupted: true,
+    });
+    // **锚行先于「尾部多一行」判**：中断之后别班又落了一行，也得认出「这一轮没回来」
+    // ——按多一行判会把中断误判成正常落地，队列据此静默照发（票 04 的红线）。
+    expect(resolveFollowOutcome([row(1), interrupted, row(3)], 2, true)).toEqual({
+      kind: 'settled',
+      interrupted: true,
     });
   });
 

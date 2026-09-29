@@ -217,6 +217,8 @@ export interface ConversationSummary {
   parent_run_id: number | null;
   prompt_tokens: number;
   completion_tokens: number;
+  /** run 的台账状态（success / timeout / failed / …）——药丸过滤的「状态」维（票 03）。 */
+  status: string;
 }
 
 export interface ToolCallWire {

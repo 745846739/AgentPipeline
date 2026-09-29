@@ -19,6 +19,7 @@ function run(overrides: Partial<ConversationSummary> = {}): ConversationSummary 
     parent_run_id: null,
     prompt_tokens: 100,
     completion_tokens: 50,
+    status: 'success',
     ...overrides,
   };
 }
@@ -68,7 +69,7 @@ describe('会话页签：run 药丸过滤（票 03）', () => {
     });
 
     expect(document.querySelectorAll('.runchip').length).toBe(2);
-    const input = screen.getByLabelText('按阶段、节点、子代理或 run id 过滤 run 行');
+    const input = screen.getByLabelText('按阶段、节点、子代理、状态或 run id 过滤 run 行');
     await fireEvent.input(input, { target: { value: 'review' } });
     expect(document.querySelectorAll('.runchip').length).toBe(1);
 
@@ -124,5 +125,44 @@ describe('会话页签：消息列表切片显尾部（票 03）', () => {
 
     expect(bubbles().length).toBe(30);
     expect(screen.queryByRole('button', { name: /已省略前/ })).toBeNull();
+  });
+});
+
+describe('会话页签：消息内容 / 角色过滤（spec list-windowing 的另一处搜索）', () => {
+  function selected(): ReturnType<typeof render> {
+    return render(ConversationViewer, {
+      props: {
+        conversations: [run()],
+        selectedRunId: 1,
+        onselect: () => {},
+        getConversation: () =>
+          conv([
+            { role: 'user', content: '把超时改成续接' },
+            { role: 'assistant', content: '好的，先读 scheduler' },
+            { role: 'assistant', content: '读完了，开始改' },
+          ]),
+      },
+    });
+  }
+
+  it('按内容收窄；按角色收窄；没命中时说一句而不是空屏', async () => {
+    selected();
+    expect(bubbles().length).toBe(3);
+
+    const input = screen.getByLabelText('按内容或角色过滤这一轮消息');
+    await fireEvent.input(input, { target: { value: 'scheduler' } });
+    expect(bubbles().length).toBe(1);
+    expect(screen.queryByText('把超时改成续接')).toBeNull();
+
+    await fireEvent.input(input, { target: { value: 'user' } });
+    expect(bubbles().length).toBe(1);
+    expect(screen.getByText('把超时改成续接')).toBeTruthy();
+
+    await fireEvent.input(input, { target: { value: '没有这种词' } });
+    expect(bubbles().length).toBe(0);
+    expect(screen.getByText('没有匹配的消息。')).toBeTruthy();
+
+    await fireEvent.input(input, { target: { value: '' } });
+    expect(bubbles().length, '清空查询恢复全量').toBe(3);
   });
 });
