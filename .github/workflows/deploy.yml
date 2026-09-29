@@ -55,12 +55,30 @@ jobs:
             "${{ secrets.DEPLOY_USER }}@${{ secrets.DEPLOY_HOST }}" 'echo CONN_OK'
 
       - name: Upload binary
+        # 跨境链路对 SSH 大流量会掐断：二进制 gzip 后传（31MB→9MB），服务端回传
+        # sha256 做完整性校验，超时/校验不过自动重试（最多 5 次）。
         run: |
-          timeout 300 sh -c 'cat target/release/agent-pipeline | ssh -i ~/.ssh/deploy_key \
-            -o BatchMode=yes -o ConnectTimeout=15 -o ServerAliveInterval=15 \
-            -o ServerAliveCountMax=4 -o IPQoS=cs0 \
-            "${{ secrets.DEPLOY_USER }}@${{ secrets.DEPLOY_HOST }}" \
-            "sudo -n /opt/deploy.sh upload"'
+          LOCAL_SHA=$(sha256sum target/release/agent-pipeline | cut -d' ' -f1)
+          for i in 1 2 3 4 5; do
+            echo "upload attempt $i"
+            if OUT=$(timeout 300 sh -c 'gzip -9 -c target/release/agent-pipeline | ssh -i ~/.ssh/deploy_key \
+                -o BatchMode=yes -o ConnectTimeout=15 -o ServerAliveInterval=15 \
+                -o ServerAliveCountMax=4 -o IPQoS=cs0 \
+                "${{ secrets.DEPLOY_USER }}@${{ secrets.DEPLOY_HOST }}" \
+                "sudo -n /opt/deploy.sh upload"' 2>&1); then
+              REMOTE_SHA=$(printf '%s\n' "$OUT" | grep -E '^[0-9a-f]{64}$' | tail -1 || true)
+              if [ -n "$REMOTE_SHA" ] && [ "$REMOTE_SHA" = "$LOCAL_SHA" ]; then
+                echo "upload verified: $REMOTE_SHA"
+                exit 0
+              fi
+              echo "sha mismatch (remote=${REMOTE_SHA:-none})"
+            else
+              printf '%s\n' "$OUT" | tail -3
+              echo "attempt $i timed out or errored"
+            fi
+            sleep 5
+          done
+          exit 1
 
       - name: Deploy and verify
         run: |
