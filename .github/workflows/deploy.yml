@@ -1,9 +1,12 @@
 # push 到 main 即部署到 106（也支持 Actions 页手动 workflow_dispatch）。
-# 流水线：构建前端 dist → cargo release 构建（dist 被 build.rs 内嵌进单二进制）
-#         → ssh 上传二进制（服务器预检版本可执行，glibc 不兼容当场失败、不碰现役服务）
-#         → 服务器端安装、重启 systemd、健康检查。
+#
+# 拓扑：CI 不在 runner 上构建、也不传二进制过境——跨境大流量双向实测都被掐
+#   （runner→106 推 9.4MB gzip 五次重试全挂；106→GitHub 直接拉大文件仅 14–31KB/s；
+#    而 106 git fetch 源码小增量 7 秒完成、SSH 小指令一直稳定）。
+# 所以 CI 只发一条 SSH 小指令，106 自己 git pull + 本地重建（源码增量不过境）
+# + 重启 systemd + 健康检查，CI 轮询 /opt/deploy.sh status 到终态。
 # 密钥与主机信息全部走 repo secrets（SSH_PRIVATE_KEY / SSH_KNOWN_HOSTS / DEPLOY_HOST /
-# DEPLOY_USER）；服务器端 sudoers 仅放行 /opt/deploy.sh 的 upload|deploy 两个子命令，
+# DEPLOY_USER）；服务器端 sudoers 仅放行 /opt/deploy.sh 的 start|status 两个子命令，
 # CI 专用密钥不能登 shell 做别的——见 deploy 用户与 /etc/sudoers.d/deploy-pipeline。
 name: deploy-106
 
@@ -17,72 +20,73 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
-  build-and-deploy:
+  deploy:
     runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
-      - uses: actions/checkout@v4
-
-      - uses: actions/setup-node@v4
-        with:
-          node-version: 22
-
-      - name: Build frontend
-        run: cd frontend && npm ci --no-audit --no-fund && npm run build
-
-      # 工具链取 rust-toolchain.toml 钉死的 1.98.0，带构建缓存
-      - uses: actions-rust-lang/setup-rust-toolchain@v1
-        with:
-          cache: true
-
-      - name: Build backend
-        run: cargo build --release
-
+      # 跨境 SSH（Azure 出口 → 大陆云主机）对默认 QoS 标记的包会丢：
+      # IPQoS=cs0 规避；ConnectTimeout/ServerAlive + timeout 包裹，快速失败不挂死。
+      # 配置集中写进 ~/.ssh/config，下面的步骤都用 Host deploy106。
       - name: Set up SSH
         run: |
           mkdir -p ~/.ssh
+          chmod 700 ~/.ssh
           printf '%s\n' "${{ secrets.SSH_PRIVATE_KEY }}" > ~/.ssh/deploy_key
+          chmod 600 ~/.ssh/deploy_key
           printf '%s\n' "${{ secrets.SSH_KNOWN_HOSTS }}" > ~/.ssh/known_hosts
-          chmod 600 ~/.ssh/deploy_key ~/.ssh/known_hosts
+          {
+            echo "Host deploy106"
+            echo "  HostName ${{ secrets.DEPLOY_HOST }}"
+            echo "  User ${{ secrets.DEPLOY_USER }}"
+            echo "  IdentityFile ~/.ssh/deploy_key"
+            echo "  IdentitiesOnly yes"
+            echo "  BatchMode yes"
+            echo "  ConnectTimeout 15"
+            echo "  ServerAliveInterval 15"
+            echo "  ServerAliveCountMax 4"
+            echo "  IPQoS cs0"
+          } >> ~/.ssh/config
 
-      # 跨境 SSH（Azure 出口 → 大陆云主机）会在握手阶段静默挂死：
-      # OpenSSH 默认 IPQoS 标记的包会被部分跨境链路丢弃，IPQoS=cs0 规避；
-      # 全部 ssh 命令配 ConnectTimeout/ServerAlive + timeout 包裹，快速失败不挂 25 分钟。
       - name: SSH smoke test
-        run: |
-          timeout 30 ssh -i ~/.ssh/deploy_key -o BatchMode=yes -o ConnectTimeout=15 \
-            -o ServerAliveInterval=15 -o ServerAliveCountMax=4 -o IPQoS=cs0 \
-            "${{ secrets.DEPLOY_USER }}@${{ secrets.DEPLOY_HOST }}" 'echo CONN_OK'
+        run: timeout 30 ssh deploy106 'echo CONN_OK'
 
-      - name: Upload binary
-        # 跨境链路对 SSH 大流量会掐断：二进制 gzip 后传（31MB→9MB），服务端回传
-        # sha256 做完整性校验，超时/校验不过自动重试（最多 5 次）。
+      - name: Trigger rebuild on 106
+        run: timeout 30 ssh deploy106 'sudo -n /opt/deploy.sh start'
+
+      # 106 上本地重建约 8–12 分钟（前端 dist + cargo release，CARGO_BUILD_JOBS=2 防 OOM）。
+      # 状态文件是唯一真相；单次轮询若 ssh 抖动只记警告继续，不因瞬时网络失败误判。
+      - name: Poll rebuild status
         run: |
-          LOCAL_SHA=$(sha256sum target/release/agent-pipeline | cut -d' ' -f1)
-          for i in 1 2 3 4 5; do
-            echo "upload attempt $i"
-            if OUT=$(timeout 300 sh -c 'gzip -9 -c target/release/agent-pipeline | ssh -i ~/.ssh/deploy_key \
-                -o BatchMode=yes -o ConnectTimeout=15 -o ServerAliveInterval=15 \
-                -o ServerAliveCountMax=4 -o IPQoS=cs0 \
-                "${{ secrets.DEPLOY_USER }}@${{ secrets.DEPLOY_HOST }}" \
-                "sudo -n /opt/deploy.sh upload"' 2>&1); then
-              REMOTE_SHA=$(printf '%s\n' "$OUT" | grep -E '^[0-9a-f]{64}$' | tail -1 || true)
-              if [ -n "$REMOTE_SHA" ] && [ "$REMOTE_SHA" = "$LOCAL_SHA" ]; then
-                echo "upload verified: $REMOTE_SHA"
-                exit 0
-              fi
-              echo "sha mismatch (remote=${REMOTE_SHA:-none})"
+          for i in $(seq 1 100); do
+            if OUT=$(timeout 30 ssh deploy106 'sudo -n /opt/deploy.sh status' 2>&1); then
+              STATE=$(printf '%s\n' "$OUT" | grep -m1 '^state=' | cut -d= -f2 || true)
+              echo "poll $i: state=${STATE:-unknown}"
+              case "$STATE" in
+                success)
+                  echo "rebuild verified on 106"
+                  exit 0
+                  ;;
+                failed)
+                  printf '%s\n' "$OUT"
+                  exit 1
+                  ;;
+              esac
             else
+              echo "poll $i: ssh transient failure"
               printf '%s\n' "$OUT" | tail -3
-              echo "attempt $i timed out or errored"
             fi
-            sleep 5
+            sleep 15
           done
+          echo "rebuild did not reach terminal state in time"
           exit 1
 
-      - name: Deploy and verify
+      - name: External HTTP check
         run: |
-          timeout 120 ssh -i ~/.ssh/deploy_key -o BatchMode=yes -o ConnectTimeout=15 \
-            -o ServerAliveInterval=15 -o ServerAliveCountMax=4 -o IPQoS=cs0 \
-            "${{ secrets.DEPLOY_USER }}@${{ secrets.DEPLOY_HOST }}" \
-            "sudo -n /opt/deploy.sh deploy"
+          for i in 1 2 3 4 5; do
+            CODE=$(curl -sS -o /dev/null -w '%{http_code}' --max-time 15 \
+              "http://${{ secrets.DEPLOY_HOST }}:3333/" || true)
+            echo "attempt $i: $CODE"
+            [ "$CODE" = "200" ] && exit 0
+            sleep 10
+          done
+          exit 1
