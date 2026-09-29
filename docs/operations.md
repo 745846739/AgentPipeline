@@ -1417,11 +1417,14 @@ cat >/etc/caddy/Caddyfile <<'CADDY'
 	auto_https off
 }
 
-# **站点块写成 `:443` 兜底，不要写 `https://106.12.12.6`**——裸 IP 访问时客户端按
+# **站点块写成 `:443, :3389` 兜底，不要写 `https://106.12.12.6`**。
+# 两个端口都听是有意的：443 与 80 在云安全组里**没放行**，而 **3389 恰好放行**（探测
+# 得 `Connection refused` 而非超时即可判定放行）——现在入口是 https://106.12.12.6:3389/，
+# 将来放行了 443 不用改配置，只把 URL 里的端口去掉。——裸 IP 访问时客户端按
 # RFC 6066 **不发 SNI**（curl 与浏览器都一样），按域名索引的站点块拿不到证书，握手当场
 # `tlsv1 alert internal error`（2026-09-29 实测踩到）。`:443` 让这张静态证书成为无 SNI
 # 连接的默认证书；这台机器 443 上只服务这一个应用，兜底不扩大暴露面。
-:443 {
+:443, :3389 {
 	tls /etc/caddy/certs/106.12.12.6.pem /etc/caddy/certs/106.12.12.6-key.pem
 
 	# 出路 ①（决策 332）：全站一层 HTTP Basic。Caddy 与后端同机，转发源地址必然是
@@ -1455,29 +1458,27 @@ curl -sS -o /dev/null -w '%{http_code} %{http_version}\n' -k -u 'me:<口令>' ht
 curl -sS -N -k --max-time 26 -u 'me:<口令>' https://127.0.0.1/foreman/stream | head -c 1           # → ':'（心跳帧，证明没有被缓冲）
 ```
 
-**这一步的前置条件（2026-09-29 卡在这）。** 先确认 443 **从外网**真的通——服务器上自测通不算：
-出口那一道**云安全组**可能根本没放行（106 眼下就是这种状态：Caddy 已在 443 上服务、回环自测全绿，
-而外面连 443/80 都是超时；服务器侧 firewalld 未启用、iptables 只有一条 22 的防护链，能挡的只有安全组）。
-**在放行之前不要执行本节**：先绑回环再发现 443 不通，等于把唯一的入口关掉。
-
-**后端改绑回环（顺序很重要）。** 先让 443 通、再关明文，中间任何一步失败都还能退回去：
+**后端改绑回环（2026-09-29 已执行）。** 顺序是「先让外面真进得来，再关明文」——中间任何一步失败都还能退回去：
 
 ```bash
-# ① 先确认 443 可用（此时明文入口还在，随时可退）
-curl -sS -o /dev/null -w '%{http_code}\n' --cacert ~/ca-106/rootCA.pem https://106.12.12.6/
+# ① 外网确认 https 入口可用（这一步过了才动手；明文此刻还在，随时可退）
+curl -sS -o /dev/null -w '%{http_code}\n' --cacert ~/ca-106/rootCA.pem https://106.12.12.6:3389/   # → 401 = 通
 
-# ② 把绑定交还给 config.toml（若「手机访问」页按过「绑定全网卡」，那一级住 DB、压过 config）
-#    界面上点「改回 config.toml」，或直接删那一行设置；
-#    随后在 config.toml 里写：
-#      [server]
-#      host = "127.0.0.1"
-#    并以 systemd 单元的 ExecStart 参数固定住（`--host 127.0.0.1` 是启动期那一级，压过界面与 config）：
-systemctl edit agent-pipeline    # 在 ExecStart 里补 --host 127.0.0.1
-systemctl restart agent-pipeline
+# ② 清理「界面那一级」的绑定覆盖（决策 186 的 DB 覆盖压过 config）：回环发一次 clear 即可。
+#    106 上实测 bind_source 一直是 `startup`，本来就没人按过「绑定全网卡」，这条是空操作。
+ssh -i ~/.ssh/106.key -o IdentitiesOnly=yes root@106.12.12.6 'curl -sX DELETE http://127.0.0.1:3333/server/lan'
 
-# ③ 验证：回环上可读，公网只剩 443
-ss -ltnp | grep 3333                              # 应只见 127.0.0.1:3333
-curl -sS -o /dev/null -w '%{http_code}\n' --max-time 5 http://106.12.12.6:3333/ || echo '明文入口已关'
+# ③ 改 unit 的启动参数（绑定优先级最高的一级）并重启。**那台机器上没有 config.toml**——
+#    绑定就是 unit 定的，所以不需要写 config（写了也只是声明式默认，flag 压过它）。
+ssh -i ~/.ssh/106.key -o IdentitiesOnly=yes root@106.12.12.6 '
+  cp /etc/systemd/system/agent-pipeline.service /root/agent-pipeline.service.bak-$(date +%Y%m%d-%H%M)
+  sed -i "s|--host 0.0.0.0 --port 3333|--host 127.0.0.1 --port 3333|" /etc/systemd/system/agent-pipeline.service
+  systemctl daemon-reload && systemctl restart agent-pipeline'
+
+# ④ 验证（三条都要）
+ssh -i ~/.ssh/106.key -o IdentitiesOnly=yes root@106.12.12.6 'ss -ltnp | grep 3333'   # → 只剩 127.0.0.1:3333
+curl -m 8 -sS -o /dev/null -w '%{http_code}\n' http://106.12.12.6:3333/ || echo '明文入口已关（connection refused）'
+curl -sS -o /dev/null -w '%{http_code}\n' --cacert ~/ca-106/rootCA.pem -u 'me:<口令>' https://106.12.12.6:3389/   # → 200
 ```
 
 **手机与设备侧。** 每台要用推送的设备装一次根 CA 描述文件并显式信任：iPhone 用 **Safari**（不是微信/QQ 内置浏览器）打开 `$(mkcert -CAROOT)/rootCA.pem`（先把 `rootCA.pem` 拷到一台能访问的机器上，或用 AirDrop / 邮件发过去）→ 设置 → 已下载描述文件 → 安装 → 通用 → 关于本机 → 证书信任设置 → **打开**「mkcert …」那一项（少这一步 Safari 仍报不受信任）。**只有根证书上机，根 CA 私钥不上机**——这也是为什么描述文件可以从开发机分发而不是让 106 自己签。
@@ -1506,13 +1507,7 @@ printf '用户名 me\n口令 %s\n' "$PW" > ~/ca-106/basic-auth.txt && chmod 600 
 
 **已知变数，如实记。** ① Apple 对「用户自装 CA」在 Safari 里的信任姿态是政策面的事，未来若收紧，退路是补一个真域名走标准证书（CA 那一套换掉，其余不动）；② 证书到期是**手动**动作，没有自动续期——`openssl x509 -enddate` 是唯一的提醒，记在运维日历里；③ 106 的 `443` 对外开放这件事本身**不增加暴露面**（`3333` 今天就在公网上），增加暴露面的是「拆掉明文入口之后令牌失效」那一条（见上面的警告框）。
 
-**现状（2026-09-29 晚，落地到哪一步）。** 已落地：本节（签发 / 上机 / 装 Caddy / 重签 / 验证命令）、
-**106 上的 Caddy**（EPEL 2.6.4 + mkcert 叶子证书 `IP SAN: 106.12.12.6`（2028-12-29 到期，根 CA 私钥仍只在开发机）
-+ 全站 `basicauth` + `:443` 兜底站点块 + 80 回 404）、部署 skill 的 HTTPS 化、CI 的外部可达性检查改 `https://`
-（**保留**明文回退一支——它随拆明文一起删）、应用侧零改动。**回环自测已通过**：无凭据 401 / 带凭据 200
-（HTTP/2，返回的是应用本体 HTML）/ `/server-info`、`/tasks`、`/notify/settings` 均 200 / `/foreman/stream`
-26 秒窗口内见到心跳帧（未被缓冲）/ 80 是 404。**没做完的只有「等云安全组放行 443」以及它后面那两步**：
-后端改绑回环 + 拆明文（放行前不动，理由见上一节）、CI 删掉明文回退那一支，以及只有人能走的手机装 CA 与真机验收。
-**已知取舍一条（如实记）**：经代理进来的请求源地址恒为 `127.0.0.1`，于是 `/pairing/token` 对过了 Basic 的人可读、
-配对令牌在 **https 入口**上不再有牙齿——外面那层 Basic 就是 106 上唯一的门（直连 3333 的明文入口在拆掉之前，令牌照旧有效）。
+**现状（2026-09-29 晚，切换已完成）。** 106 上的入口现在**只有一条**：**`https://106.12.12.6:3389/`**（Caddy 全站 Basic；443 与 80 也都在听，但被云安全组挡着，放行之后把 URL 里的端口去掉即可）。落地清单：Caddy 2.6.4（EPEL 直装）+ mkcert 叶子证书（IP SAN，2028-12-29 到期，根 CA 私钥只在开发机）+ 全站 `basicauth` + 后端改绑回环（unit 的 `--host 127.0.0.1`）+ 明文入口关闭。**外网实测**：无凭据 401 / 带凭据 200（HTTP/2，返回应用本体）/ 经代理 `/server-info`、`/tasks`、`/notify/settings` 均 200 / `/foreman/stream` 26 秒内见心跳帧 / `http://106.12.12.6:3333/` 已是 `connection refused`。**为什么是 3389**：443 与 80 在云安全组里没放行（服务器侧没有防火墙挡着；外网探测 443/80/8443/8080/8888/8000 一律超时），3389 恰好放行（探测得 `Connection refused` 而非超时，即包能到、只是当时没服务在听）——Caddyfile 写成 `:443, :3389`，将来放行 443 无需改配置。
+
+**一个已知缺口（切换带出来的，如实记）。** 「手机访问」页的**配对二维码**仍按后端自己的绑定地址拼 URL（`server_info.rs::allowed_qr_urls` = 局域网候选 + 回环，形如 `http://192.168.16.2:3333/?pair=…`）：那台机器的 eth0 是私网地址、3333 现在也只在回环上听——**这个二维码已经指向不可达的地址**。推送深链不受影响（那是相对路由 `#/task/…`，由 service worker 按自己的 origin 解析），手机进站直接开 `https://106.12.12.6:3389/` 输一次 Basic 口令即可。真要修得让二维码知道公网 origin（加一个 `public_base_url` 配置键进白名单 + 决策 + 测试），单独立票。另：`~/.zcode/skills/agentpipeline-deploy-106/SKILL.md` 已同步（入口、验证命令、3389 这个事实）。
 

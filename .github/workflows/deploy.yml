@@ -80,11 +80,14 @@ jobs:
           echo "rebuild did not reach terminal state in time"
           exit 1
 
-      # 外部可达性检查（pwa-webpush 票 01 / 决策 327）：先试 https，明文那一支是**过渡期的回退**。
+      # 外部可达性检查（pwa-webpush 票 01 / 决策 327 / 332 / 333 的收尾）：**只有 https 这一条路了**。
       #
-      # 为什么两态并存：106 正在从「明文 3333」迁到「Caddy 443 + 后端只绑回环」，两态都会出现
-      # （切换那一票落地前是明文，之后是 https）。这里问的是「服务活着吗」而不是「走的哪条路」，
-      # 故任一条 200 即通过——**切换那一票落地时删掉明文那一支**，那时它就是「明文入口复活」的检测器。
+      # 2026-09-29 切换已完成（决策 333）：后端改绑回环，明文 3333 从外网是 connection refused。
+      # 于是这里问的是「HTTPS 入口活着吗」——200 与 **401 都算活**（401 = Caddy 的 HTTP Basic 在挡）。
+      # 明文那一支已删：它若再 200，说明有人把明文入口装回来了。
+      #
+      # **端口**：443 与 80 被云安全组挡着（未放行），实际入口是 **3389**（安全组恰好放行的那个）。
+      # 放行 443 之后把 URL 换成不带端口的形态即可（Caddyfile 两个端口都在听）。
       #
       # 证书是开发机 mkcert 自签的，runner 没有信任链：有 DEPLOY_CA_PEM（仓库 secret，放**根证书**
       # 而不是私钥）就用它验链，没有就退到 -k——信任链由设备那一侧验（手机装 CA 描述文件）。
@@ -100,7 +103,7 @@ jobs:
           fi
           for i in 1 2 3 4 5; do
             CODE=$(curl -sS -o /dev/null -w '%{http_code}' --max-time 15 \
-              "${VERIFY[@]}" "https://${{ secrets.DEPLOY_HOST }}/" || true)
+              "${VERIFY[@]}" "https://${{ secrets.DEPLOY_HOST }}:3389/" || true)
             echo "attempt $i: https $CODE"
             # 200 = 应用在答；401 = Caddy 的 HTTP Basic 在挡（出路 ①，决策 332）。
             # 两个都算「HTTPS 入口活着」——401 反而证明门外那道门真的在（且 106 上
@@ -109,14 +112,4 @@ jobs:
             sleep 10
           done
 
-          # 过渡期回退：明文入口还在的形态。**它现在还有一个理由**——443/80 被云安全组
-          # 挡着（见 docs/operations.md §12.17 现状），外面暂时只有明文这条能验。
-          # 放行 443、改绑回环、拆明文之后，连同本段一起删。
-          for i in 1 2 3 4 5; do
-            CODE=$(curl -sS -o /dev/null -w '%{http_code}' --max-time 15 \
-              "http://${{ secrets.DEPLOY_HOST }}:3333/" || true)
-            echo "attempt $i: http(过渡期) $CODE"
-            [ "$CODE" = "200" ] && exit 0
-            sleep 10
-          done
           exit 1
