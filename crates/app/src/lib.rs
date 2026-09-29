@@ -6,15 +6,16 @@
 //! - 跨源防护中间件（决策 128）：只拦写请求；SSE 是纯 GET，不受影响；
 //! - 对端地址层（决策 182 / 票 06）：把连接信息归一成 [`peer::PeerAddr`]，排在跨源防护
 //!   之前，供票 07 判定「仅回环可读」；
-//! - 配对令牌层（决策 182㉖㉗㉘ / 票 07）：只在局域网形态拦写请求与 `/foreman/*`，
-//!   排在最后（内层），回环来源豁免；
-//! - 前端 dist 由 build.rs 内嵌并同源托管（决策 155）；dist 缺失时退化为构建提示页；
+//! - 配对令牌层（决策 182㉖㉗㉘ / 票 07；**决策 336 扩到全站**）：非回环形态下未配对的
+//!   设备什么页面都拿不到，只有一张自带样式的配对页（[`pairing_page`]）；回环来源豁免；
+//! - 前端 dist 由 build.rs 内嵌并同源托管（决策 155），**注册在配对层之前**（决策 336）；
 //! - `/server-info` 暴露局域网访问地址与二维码（决策 167），供手机扫码接入；
 //! - `api_key` 读接口只回显 `***`（决策 112）。
 
 pub mod assets;
 pub mod io_budget;
 pub mod lan;
+pub mod pairing_page;
 pub mod peer;
 pub mod routes;
 pub mod runtime;
@@ -213,10 +214,9 @@ pub fn build_router(state: AppState) -> Router {
         )
         .route("/notify/test", post(routes::notify::test_channel))
         // ── 浏览器推送的订阅（spec `.scratch/pwa-webpush/` 票 02）──
-        // **读也过配对守卫**（`stream::PUSH_SUBSCRIPTIONS_PREFIX` 那一族）：清单里每条
-        // 都是往那台设备推报文的能力的一半，而订阅是持续的外泄管道（决策 167 的定点加强）。
-        // 地址由那个常量拼出来而不是各写一遍字面量——两处对齐靠手写注释是迟早会漂的东西，
-        // 而守卫的白名单与这里的注册一旦不一致，症状是「接口在，守卫不认」。
+        // **读也过配对守卫**（决策 336 之后全站都过）：清单里每条都是往那台设备推报文的
+        // 能力的一半，而订阅是持续的外泄管道（决策 167 的定点加强）。
+        // 地址由那个常量拼出来而不是各写一遍字面量——两处对齐靠手写注释是迟早会漂的东西。
         .route(
             &format!("{PUSH_SUBSCRIPTIONS_PREFIX}subscriptions"),
             get(routes::notify::list_subscriptions)
@@ -227,9 +227,15 @@ pub fn build_router(state: AppState) -> Router {
             &format!("{PUSH_SUBSCRIPTIONS_PREFIX}subscriptions/{{id}}"),
             axum::routing::delete(routes::notify::delete_subscription),
         )
-        // 配对令牌层（决策 182㉖㉗㉘，票 07）：**必须最后执行**（最内层）——它要读
-        // peer_address 归一后的来源地址，且排在跨源防护之后，只处理已过跨源判定的请求。
-        // axum 的 `Router::layer` 后挂者在外、先执行，故它登记在 cross_origin_guard 之前。
+        // 前端静态资源同源托管（决策 155）。**注册在防护层之前**（决策 336 修订了它原来的
+        // 位置）：`Router::layer` 只包住**登记在它之前**的路由，而全站闸门必须把入口页与
+        // 资产一起罩住——否则未配对的人拿到的是一个能加载、每个数据请求都 403 的空看板
+        // （决策 336 就是冲这个来的）。静态路由全是 GET/HEAD，故它过跨源防护时走的是
+        // 那条「安全方法直接放行」的早退，不进跨源矩阵。
+        .merge(assets::static_routes())
+        // 配对令牌层（决策 182㉖㉗㉘，票 07；决策 336 扩到全站）：它要读 peer_address
+        // 归一后的来源地址，故必须排在跨源防护**之后**（更内层）。axum 的 `Router::layer`
+        // 后挂者在外、先执行，故它登记在 cross_origin_guard 之前、static_routes 之后。
         .layer(axum::middleware::from_fn_with_state(
             state.clone(),
             stream::pairing_guard,
@@ -238,14 +244,10 @@ pub fn build_router(state: AppState) -> Router {
             state.clone(),
             stream::cross_origin_guard,
         ))
-        // 对端地址层（决策 182 / 票 06）：必须在跨源防护**之前**运行——票 07 的配对
-        // 令牌与「仅回环可读」的读取端点都要按来源地址判定（决策 167）。axum 的
-        // `Router::layer` 逐个包裹已登记的路由，后挂的层在外、先于先挂的执行，故它只能
-        // 写在 cross_origin_guard **之后**（写在之前会被后者包在里面、后于它执行）。
-        // 与防护层同样登记在 `merge(assets::static_routes())` 之前 → 覆盖面一致。
+        // 对端地址层（决策 182 / 票 06）：必须在跨源防护**之前**运行——配对令牌与
+        // 「仅回环可读」的读取端点都要按来源地址判定（决策 167）。axum 的 `Router::layer`
+        // 逐个包裹已登记的路由，后挂的层在外、先于先挂的执行，故它只能写在
+        // cross_origin_guard **之后**（写在之前会被后者包在里面、后于它执行）。
         .layer(axum::middleware::from_fn(peer::peer_address))
-        // 前端静态资源同源托管（决策 155）：放在防护层之后注册——全 GET/HEAD，
-        // 防护只拦写请求，静态路由不进跨源矩阵。
-        .merge(assets::static_routes())
         .with_state(state)
 }

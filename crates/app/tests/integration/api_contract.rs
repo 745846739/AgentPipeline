@@ -1506,6 +1506,32 @@ fn loopback_write(uri: &str) -> Request<Body> {
     req
 }
 
+/// 局域网来源的**浏览器导航**（决策 336）：`Accept: text/html` 是那个分岔的判据，
+/// 与真浏览器一致（Chrome/Safari 都带这一串）。
+fn lan_navigate(uri: &str) -> Request<Body> {
+    lan_navigate_with_cookie_raw(uri, "")
+}
+
+/// 带一份 cookie 的局域网导航（已配对设备的第二次访问）。
+fn lan_navigate_with_cookie(uri: &str, token: &str) -> Request<Body> {
+    lan_navigate_with_cookie_raw(uri, &format!("agentpipeline_pairing={token}"))
+}
+
+/// cookie 原文交给调用方拼（好构造「多个 cookie 里找对那个键」这类用例）。
+fn lan_navigate_with_cookie_raw(uri: &str, cookie: &str) -> Request<Body> {
+    let mut builder = request("GET", uri).header(
+        header::ACCEPT,
+        "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+    );
+    if !cookie.is_empty() {
+        builder = builder.header(header::COOKIE, cookie);
+    }
+    let mut req = builder.body(Body::empty()).unwrap();
+    req.extensions_mut()
+        .insert(ConnectInfo(SocketAddr::from(([192, 168, 1, 50], 40000))));
+    req
+}
+
 /// 从本机读取当前令牌（读取口仅回环可读）。
 async fn loopback_token(api: &Api) -> String {
     let (status, body) = get(api, "/pairing/token").await;
@@ -1630,30 +1656,218 @@ async fn pairing_lan_peer_with_token_passes() {
     );
 }
 
+/// **读也要令牌**（决策 336 修订决策 167 的「看的随便看」）。
+///
+/// 原口径是给可信局域网写的；服务直接挂公网时（裸 IP + 自己终止 TLS），任务标题、会话、
+/// 命令输出、指标全都是可读数据，而自签证书只拦浏览器、拦不住扫描器。故非回环形态下
+/// 读与写一起护——**连入口页与资产也在闸门后面**（下一组用例）。
 #[tokio::test]
-async fn pairing_lan_read_only_get_is_not_guarded() {
+async fn pairing_lan_read_requires_token_now() {
     let api = api_lan().await;
     seed(&api, "t1").await;
 
+    for uri in ["/tasks", "/server-info", "/metrics", "/notify/settings"] {
+        let response = api
+            .router
+            .clone()
+            .oneshot(lan_get(uri, None))
+            .await
+            .unwrap();
+        let (status, body) = json_body(response).await;
+        assert_eq!(
+            status,
+            StatusCode::FORBIDDEN,
+            "局域网来源读 {uri} 也要令牌（决策 335）：{body}"
+        );
+        assert!(
+            body["error"].as_str().unwrap_or("").contains("配对"),
+            "报文要指去配对：{body}"
+        );
+    }
+
+    // 带令牌 → 放行（这才证明上一段拦的是「缺凭据」，不是「这个端点坏了」）
+    let token = loopback_token(&api).await;
     let response = api
         .router
         .clone()
-        .oneshot(lan_get("/tasks", None))
+        .oneshot(lan_get("/tasks", Some(&token)))
         .await
         .unwrap();
     assert_eq!(
         response.status(),
         StatusCode::OK,
-        "只读页照旧可直接分享（看的随便看）"
+        "带令牌的读应放行（决策 335）"
+    );
+}
+
+/// **未配对的设备什么页面都拿不到**（决策 336）：导航维度给出那张自带样式的配对页，
+/// 其余请求保持既有的 403 + `kind`。
+///
+/// 三个断言各自钉一件事：
+/// ① 导航（`Accept: text/html`）拿到 401 与配对页——**不是**外壳，也不是空白；
+/// ② 同一条 `/` 用非导航的 `Accept` 请求时，回到 403 JSON 的既有形状（界面按 `kind` 分支）；
+/// ③ 资产与 service worker 也在闸门后面（`/assets/*`、`/sw.js`、`/manifest.webmanifest`）——
+///    这是从「外壳公开」改过来的那一步，退回去等于退回空看板。
+#[tokio::test]
+async fn pairing_lan_unpaired_gets_only_the_pairing_page() {
+    let api = api_lan().await;
+
+    let response = api.router.clone().oneshot(lan_navigate("/")).await.unwrap();
+    let status = response.status();
+    let content_type = response
+        .headers()
+        .get(header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or_default()
+        .to_string();
+    let body = String::from_utf8_lossy(
+        &axum::body::to_bytes(response.into_body(), 1024 * 1024)
+            .await
+            .unwrap(),
+    )
+    .to_string();
+    assert_eq!(status, StatusCode::UNAUTHORIZED, "未认证就该是 401");
+    assert!(content_type.starts_with("text/html"), "{content_type}");
+    assert!(body.contains("还没配对"), "给的是配对页：{body}");
+
+    // ② 同一路径、非导航请求 → 既有 403 形状
+    let (status, body) = json_body(
+        api.router
+            .clone()
+            .oneshot(lan_get("/", None))
+            .await
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
+    assert_eq!(body["kind"], "pairing_required", "{body}");
+
+    // ③ 静态外壳整族都在闸门后面
+    for uri in [
+        "/assets/deadbeef-not-here.js",
+        "/sw.js",
+        "/index.html",
+        "/manifest.webmanifest",
+        "/icons/icon-192.png",
+    ] {
+        let (status, body) = json_body(
+            api.router
+                .clone()
+                .oneshot(lan_get(uri, None))
+                .await
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::FORBIDDEN, "{uri} 也该要凭据：{body}");
+    }
+}
+
+/// 配对链接（`/?pair=<token>`）是**唯一能把令牌带进一次导航**的通道：对上即放行，
+/// 并在响应上种下 cookie（决策 336）。
+///
+/// 断言不跳转（`?pair=` 留在地址上，决策 191 的主屏图标要靠它）与 cookie 的四条属性。
+#[tokio::test]
+async fn pairing_lan_pair_param_enrolls_this_device() {
+    let api = api_lan().await;
+    let token = loopback_token(&api).await;
+
+    let response = api
+        .router
+        .clone()
+        .oneshot(lan_navigate(&format!("/?pair={token}")))
+        .await
+        .unwrap();
+    assert_eq!(
+        response.status(),
+        StatusCode::OK,
+        "配对链接必须放行（否则第一次扫码进不来）"
+    );
+
+    let cookie = response
+        .headers()
+        .get(header::SET_COOKIE)
+        .and_then(|v| v.to_str().ok())
+        .expect("配对成功要种 cookie")
+        .to_string();
+    assert!(
+        cookie.contains(&format!("agentpipeline_pairing={token}")),
+        "{cookie}"
+    );
+    for attribute in ["Path=/", "Secure", "HttpOnly", "SameSite=Lax"] {
+        assert!(
+            cookie.contains(attribute),
+            "cookie 少了 {attribute}：{cookie}"
+        );
+    }
+}
+
+/// 令牌不对时**不放行**，且落点仍是配对页（页面自己会说「这条地址里的令牌不认」）。
+#[tokio::test]
+async fn pairing_lan_wrong_pair_param_does_not_enroll() {
+    let api = api_lan().await;
+
+    let response = api
+        .router
+        .clone()
+        .oneshot(lan_navigate("/?pair=not-the-token"))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    assert!(
+        response.headers().get(header::SET_COOKIE).is_none(),
+        "没对上就一个 cookie 都不该种"
+    );
+}
+
+/// cookie 是**导航**那条路的凭据（决策 336）：浏览器自己会带，故「第二次访问」不必再挂
+/// `?pair=`（用户直接输地址、点书签、刷新）。
+///
+/// 两条腿都要钉：带对的 cookie 放行、带错的照旧不给页面——只测「放行」的话，
+/// 把判据写成「有 cookie 就放行」也能过。
+#[tokio::test]
+async fn pairing_lan_cookie_is_the_navigation_credential() {
+    let api = api_lan().await;
+    let token = loopback_token(&api).await;
+
+    let response = api
+        .router
+        .clone()
+        .oneshot(lan_navigate_with_cookie("/", &token))
+        .await
+        .unwrap();
+    assert_eq!(
+        response.status(),
+        StatusCode::OK,
+        "带对 cookie 的导航应放行（决策 336）"
     );
 
     let response = api
         .router
         .clone()
-        .oneshot(lan_get("/server-info", None))
+        .oneshot(lan_navigate_with_cookie("/", "stale-token"))
         .await
         .unwrap();
-    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(
+        response.status(),
+        StatusCode::UNAUTHORIZED,
+        "旧 cookie（令牌重置过）必须回到配对页"
+    );
+
+    // 其它 cookie 在场不影响判定（浏览器会把这一族的都带上）
+    let response = api
+        .router
+        .clone()
+        .oneshot(lan_navigate_with_cookie_raw(
+            "/",
+            &format!("theme=dark; agentpipeline_pairing={token}; lang=zh"),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(
+        response.status(),
+        StatusCode::OK,
+        "得在多个 cookie 里找对那个键"
+    );
 }
 
 #[tokio::test]
@@ -8451,15 +8665,17 @@ async fn the_push_subscription_family_is_behind_the_pairing_guard_on_lan() {
     assert_eq!(status, StatusCode::OK, "回环豁免：{body}");
 }
 
-/// 通知设置页的读数照旧不护（它是只读的机器事实，秘密一律掩码）——订阅那两族才是
-/// 例外（上一用例）。这条守的是「定点加强没有把整个 /notify/ 都拖下水」。
+/// 通知设置页的读数**现在也要令牌**（决策 335 之后读与写一起护），但秘密仍旧一律掩码：
+/// 这两件事各管各的——守卫管「谁能读到这些字段」，掩码管「读到的那一份里有没有原始密钥」。
+/// 这条守的是「扩面没有顺手把掩码拆掉」。
 #[tokio::test]
-async fn the_notify_settings_read_stays_open_while_the_subscription_family_is_guarded() {
+async fn the_notify_settings_read_needs_the_token_and_still_masks_secrets() {
     let api = api_lan().await;
+    let token = loopback_token(&api).await;
     let (status, body) = json_body(
         api.router
             .clone()
-            .oneshot(lan_get("/notify/settings", None))
+            .oneshot(lan_get("/notify/settings", Some(&token)))
             .await
             .unwrap(),
     )

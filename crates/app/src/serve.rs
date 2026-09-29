@@ -17,6 +17,7 @@ use agentpipeline_core::pipeline::ForemanRunner;
 use agentpipeline_core::sse::SseBus;
 use agentpipeline_core::storage::Store;
 use anyhow::Context;
+use axum::serve::ListenerExt;
 
 use crate::build_router;
 use crate::runtime::Runtime;
@@ -150,29 +151,194 @@ struct Listener {
     task: tokio::task::JoinHandle<()>,
 }
 
+/// 监听这一层的传输形态（决策 335）。
+///
+/// 明文与 TLS **只在这里分叉**：上层的改绑主管、优雅停机、对端地址判定一个字不用改
+/// （`accept` 的实现换一个，`axum::serve` 那一层是泛型的）。要与不要 TLS 是部署事实，
+/// 故它在启动时定死、改绑不动它——改绑改的是「听哪个地址」。
+#[derive(Clone)]
+pub enum Transport {
+    /// 明文 HTTP：本机开发、局域网直连、**前面已有反向代理**三种形态照旧。
+    Plain,
+    /// 本进程自己终止 TLS（106 的形态：应用直接对外，没有代理层）。
+    Tls(tokio_rustls::TlsAcceptor),
+}
+
+/// 手写 `Debug` 而**不是** `derive`：变体名足够定位形态，而证书链与私钥都不该有
+/// 任何一条通往日志的路径（`rustls::ServerConfig` 自己会打码，但这条约束不该依赖
+/// 别人的实现细节——`Transport` 会出现在 `tracing` 的字段里）。
+impl std::fmt::Debug for Transport {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Transport::Plain => f.write_str("Plain"),
+            Transport::Tls(_) => f.write_str("Tls"),
+        }
+    }
+}
+
+impl Transport {
+    /// 从两个 PEM 路径建传输层；两个都 `None` = 明文。
+    ///
+    /// 读盘与解析都在这里（`Config::validate` 是纯函数、不碰文件系统），**启动期 fail fast**：
+    /// 文件不存在 / PEM 坏掉 / 私钥与证书不配对，一律当场报出来，报文点名是哪个文件。
+    /// 这三种错若放过去，现象都是「服务起来了但外面连不上」，那是最费时间的一类排查。
+    pub fn from_pem(cert: Option<&str>, key: Option<&str>) -> anyhow::Result<Self> {
+        let (cert_path, key_path) = match (cert, key) {
+            (Some(c), Some(k)) => (c, k),
+            // 只给一个的情况在配置解析期已被拦下（`ServerConfig::missing_tls_half`）；
+            // 这里对 CLI 那一级补同一道判定（`--tls-cert` 只给一半同样是配错了）。
+            (Some(_), None) => anyhow::bail!("给了 --tls-cert / tls_cert 就必须同时给 tls_key"),
+            (None, Some(_)) => anyhow::bail!("给了 --tls-key / tls_key 就必须同时给 tls_cert"),
+            (None, None) => return Ok(Transport::Plain),
+        };
+        use rustls::pki_types::pem::PemObject;
+        use rustls::pki_types::{CertificateDer, PrivateKeyDer};
+
+        let certs: Vec<CertificateDer<'static>> = CertificateDer::pem_file_iter(cert_path)
+            .with_context(|| format!("读不到或解析不了证书：{cert_path}"))?
+            .collect::<Result<Vec<_>, _>>()
+            .with_context(|| format!("证书 PEM 解析失败：{cert_path}"))?;
+        if certs.is_empty() {
+            anyhow::bail!("证书文件里没有证书：{cert_path}");
+        }
+        let key = PrivateKeyDer::from_pem_file(key_path)
+            .with_context(|| format!("读不到或解析不了私钥：{key_path}"))?;
+        // 第三道：证书与私钥**配不配对**只有这一步才知道（换证书忘了换私钥的典型）
+        let mut config = rustls::ServerConfig::builder()
+            .with_no_client_auth()
+            .with_single_cert(certs, key)
+            .with_context(|| {
+                format!("证书与私钥不配对（或证书链有误）：{cert_path} / {key_path}")
+            })?;
+        // ALPN：浏览器在 TLS 上谈 h2 才拿得到 HTTP/2（本机 chrome 与 iOS Safari 都会谈）。
+        // 只列这两个是**故意的**——`http/1.1` 兜底，把 SSE 的长连接留给已经验过的 h1 也行。
+        config.alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec()];
+        tracing::info!(cert = cert_path, key = key_path, "TLS 终止在本进程内");
+        Ok(Transport::Tls(tokio_rustls::TlsAcceptor::from(Arc::new(
+            config,
+        ))))
+    }
+}
+
+/// 带 TLS 的监听器。
+///
+/// `accept` 的契约要求**自己重试**（axum 的 `Listener` 收不到错误：它拿到的就是
+/// `(Io, Addr)`）：握手失败在公网上是家常便饭——扫描器、没装 CA 的浏览器、协议不匹配——
+/// 一次失败绝不能把整个监听带下去，故只记一行然后接着听。
+struct TlsListener {
+    inner: tokio::net::TcpListener,
+    acceptor: tokio_rustls::TlsAcceptor,
+}
+
+impl axum::serve::Listener for TlsListener {
+    type Io = tokio_rustls::server::TlsStream<tokio::net::TcpStream>;
+    type Addr = std::net::SocketAddr;
+
+    async fn accept(&mut self) -> (Self::Io, Self::Addr) {
+        loop {
+            let (stream, addr) = match self.inner.accept().await {
+                Ok(pair) => pair,
+                Err(e) => {
+                    // 与 std 那个 `Listener` 同一姿态：accept 的错误（fd 耗尽、对端瞬断）
+                    // 是暂态，睡一下再来；忙等会把 CPU 打满。
+                    tracing::warn!(error = %e, "accept 失败，继续监听");
+                    tokio::time::sleep(Duration::from_millis(50)).await;
+                    continue;
+                }
+            };
+            match self.acceptor.accept(stream).await {
+                Ok(tls) => return (tls, addr),
+                Err(e) => tracing::debug!(error = %e, %addr, "TLS 握手失败（已忽略）"),
+            }
+        }
+    }
+
+    fn local_addr(&self) -> std::io::Result<Self::Addr> {
+        self.inner.local_addr()
+    }
+}
+
+/// 交给 axum 的监听器：明文或 TLS 二选一。
+enum AppListener {
+    Plain(tokio::net::TcpListener),
+    Tls {
+        inner: tokio::net::TcpListener,
+        acceptor: tokio_rustls::TlsAcceptor,
+    },
+}
+
+impl AppListener {
+    fn new(inner: tokio::net::TcpListener, transport: &Transport) -> Self {
+        match transport {
+            Transport::Plain => AppListener::Plain(inner),
+            Transport::Tls(acceptor) => AppListener::Tls {
+                inner,
+                acceptor: acceptor.clone(),
+            },
+        }
+    }
+}
+
+/// 起一个监听任务——**两处调用共用**（首次启动与改绑各起一个）。
+fn serve_task(listener: AppListener, router: axum::Router) -> Listener {
+    let (stop_tx, stop_rx) = tokio::sync::watch::channel(false);
+    let task = tokio::spawn(async move {
+        let outcome = match listener {
+            AppListener::Plain(inner) => serve_io(inner, router, stop_rx).await,
+            // 裹一层空 `tap_io` 只为满足 `serve_io` 的对端地址约束（理由见那里）；
+            // 它不碰 IO，也不改任何行为。
+            AppListener::Tls { inner, acceptor } => {
+                let listener = TlsListener { inner, acceptor }.tap_io(|_: &mut _| {});
+                serve_io(listener, router, stop_rx).await
+            }
+        };
+        if let Err(e) = outcome {
+            tracing::error!(error = %e, "监听任务退出");
+        }
+    });
+    Listener {
+        stop: stop_tx,
+        task,
+    }
+}
+
+/// 真正调 axum 的那一层：**泛型**，明文与 TLS 各编译一份，IO 不用装箱。
+///
+/// 那个看着多余的 where 子句是承重的：`into_serving_service` 用的是
+/// `into_make_service_with_connect_info::<SocketAddr>`，而 axum 的 `serve` 要求
+/// `SocketAddr: Connected<IncomingStream<'_, L>>`——**它只给两种监听器实现了这条**
+/// （裸 `tokio::net::TcpListener`，与被 `tap_io` 包过的任意监听器）。我们自己写的
+/// TLS 监听器两个都不是，少了这一条就编译不过；而若绕过它（换成 `into_make_service`），
+/// `ConnectInfo` 不会进请求扩展，`peer_is_loopback` 的缺省是「视为回环」——配对守卫
+/// 会**整体静默失效**。这是 fail open，故宁可把约束写在类型上。
+async fn serve_io<L>(
+    listener: L,
+    router: axum::Router,
+    mut stop_rx: tokio::sync::watch::Receiver<bool>,
+) -> anyhow::Result<()>
+where
+    L: axum::serve::Listener<Addr = std::net::SocketAddr>,
+    for<'a> std::net::SocketAddr:
+        axum::extract::connect_info::Connected<axum::serve::IncomingStream<'a, L>>,
+{
+    axum::serve(listener, into_serving_service(router))
+        .with_graceful_shutdown(async move {
+            let _ = stop_rx.changed().await;
+        })
+        .await
+        .context("axum 服务异常退出")
+}
+
 /// 绑定并开始接受连接。返回错误时**没有**任何副作用（调用方据此回滚）。
 async fn spawn_listener(
     router: axum::Router,
     host: &str,
     port: u16,
+    transport: &Transport,
 ) -> anyhow::Result<(Listener, u16)> {
     let (listener, bound) = bind_listener(host, port).await?;
-    let (stop_tx, mut stop_rx) = tokio::sync::watch::channel(false);
-    let task = tokio::spawn(async move {
-        axum::serve(listener, into_serving_service(router))
-            .with_graceful_shutdown(async move {
-                let _ = stop_rx.changed().await;
-            })
-            .await
-            .context("axum 服务异常退出")
-            .map_err(|e| tracing::error!(error = %e, "监听任务退出"))
-            .ok();
-    });
     Ok((
-        Listener {
-            stop: stop_tx,
-            task,
-        },
+        serve_task(AppListener::new(listener, transport), router),
         bound.port(),
     ))
 }
@@ -203,6 +369,8 @@ struct ListenerSupervisor {
     /// 启动期覆盖（`--host` / `AGENTPIPELINE_LAN`）。有它时界面设置改得动**这一次**，
     /// 但重启后仍由它说了算，故界面要能说出这件事（`/server-info` 的 `bind_source`）。
     startup_override: Option<String>,
+    /// 传输形态（决策 335）。改绑**不动它**：TLS 是与否由部署形态定，改绑改的是听哪个地址。
+    transport: Transport,
 }
 
 impl ListenerSupervisor {
@@ -227,7 +395,7 @@ impl ListenerSupervisor {
         }
 
         let router = crate::build_router(self.state.clone());
-        match spawn_listener(router, host, self.port).await {
+        match spawn_listener(router, host, self.port, &self.transport).await {
             Ok((listener, port)) => {
                 self.current = Some(listener);
                 self.state.set_bind_host(host, source);
@@ -237,7 +405,7 @@ impl ListenerSupervisor {
             Err(bind_error) => {
                 tracing::error!(error = %bind_error, host, "改绑失败，回滚到原地址");
                 let router = crate::build_router(self.state.clone());
-                match spawn_listener(router, &previous_host, self.port).await {
+                match spawn_listener(router, &previous_host, self.port, &self.transport).await {
                     Ok((listener, _)) => {
                         self.current = Some(listener);
                         self.state.set_bind_host(&previous_host, previous_source);
@@ -327,6 +495,10 @@ pub struct ServeOptions {
     /// CLI `--public-base-url`（决策 334）；缺省回落 `[server] public_base_url`。
     /// 反向代理 / 公网入口后面部署时给「手机访问」页指一条真能走通的地址。
     pub public_base_url_override: Option<String>,
+    /// CLI `--tls-cert` / `--tls-key`（决策 335）；缺省回落 `[server] tls_cert` / `tls_key`。
+    /// 两个都给 = 本进程自己终止 TLS；都不给 = 明文。
+    pub tls_cert_override: Option<String>,
+    pub tls_key_override: Option<String>,
 }
 
 /// 以给定配置启动服务，返回可读回真实端口的句柄。
@@ -527,6 +699,19 @@ pub async fn serve(options: ServeOptions) -> anyhow::Result<ServerHandle> {
         None => None,
     };
 
+    // TLS 终止在不在本进程内（决策 335）：CLI 压配置文件，两处都「成对给」（只给一半
+    // 在 `Transport::from_pem` 里当场报错）。读 PEM 就在这里做——启动期 fail fast。
+    let transport = Transport::from_pem(
+        options
+            .tls_cert_override
+            .as_deref()
+            .or(server.tls_cert.as_deref()),
+        options
+            .tls_key_override
+            .as_deref()
+            .or(server.tls_key.as_deref()),
+    )?;
+
     // 停机信号（决策 54）：一处广播，三处消费——监听器主管、tick 循环、维护循环。
     // 不再有第 4 个接收者直接挂在 axum 上：监听器的停机由主管转达（决策 186），
     // 否则改绑与停机两条路径会各停一次、且停机要等一个已经换掉的句柄。
@@ -617,20 +802,7 @@ pub async fn serve(options: ServeOptions) -> anyhow::Result<ServerHandle> {
 
     // 首个监听器直接把已经绑好的 listener 交出去（不再二次 bind：那会在
     // 「先 bind 再交给 serve」之间留一个端口被别的进程抢走的窗口）。
-    let (stop_tx, mut stop_rx) = tokio::sync::watch::channel(false);
-    let current = Listener {
-        stop: stop_tx,
-        task: tokio::spawn(async move {
-            axum::serve(listener, into_serving_service(router))
-                .with_graceful_shutdown(async move {
-                    let _ = stop_rx.changed().await;
-                })
-                .await
-                .context("axum 服务异常退出")
-                .map_err(|e| tracing::error!(error = %e, "监听任务退出"))
-                .ok();
-        }),
-    };
+    let current = serve_task(AppListener::new(listener, &transport), router);
 
     // 监听器主管（决策 186）：串行处理改绑请求，停机时随全局 shutdown 一起收摊。
     let supervisor = tokio::spawn(run_listener_supervisor(
@@ -640,6 +812,7 @@ pub async fn serve(options: ServeOptions) -> anyhow::Result<ServerHandle> {
             port: actual_port,
             config_host: server.host.clone(),
             startup_override: options.host_override.clone(),
+            transport,
         },
         rebind_rx,
         shutdown_tx.subscribe(),
@@ -886,6 +1059,45 @@ fn prepare_prompts_dir(dir: &std::path::Path) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 传输层的构造只做两件事：都没给 → 明文；给了就读盘解析、**失败即报**（决策 335）。
+    ///
+    /// 真握手（客户端认证书、HTTP/2、SSE 不被缓冲）在 106 上按 `docs/operations.md` §12.17
+    /// 手验 + 每次部署由 `deploy.yml` 的外部检查打一发 https——**本仓不为它引证书生成依赖**
+    /// （rcgen 会带进 4 个新 crate，而这里要钉的是「配置错得响不响」，那几条用不着真证书）。
+    #[test]
+    fn transport_loads_pem_or_fails_loudly() {
+        assert!(matches!(
+            Transport::from_pem(None, None).unwrap(),
+            Transport::Plain
+        ));
+
+        // 只给一半：CLI 那一级同样当场报错（配置文件那一半在 `ServerConfig::missing_tls_half`）
+        for (cert, key, missing) in [
+            (Some("/tmp/whatever.pem"), None, "tls_key"),
+            (None, Some("/tmp/whatever.key"), "tls_cert"),
+        ] {
+            let err = Transport::from_pem(cert, key).unwrap_err().to_string();
+            assert!(err.contains(missing), "报文要点名缺哪个：{err}");
+        }
+
+        // 文件不存在：报文里要带上路径（配置写错路径是最常见的一种）
+        let missing = "/tmp/definitely-not-here-agentpipeline.pem";
+        let err = Transport::from_pem(Some(missing), Some(missing))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains(missing), "报文要点名是哪个文件：{err}");
+
+        // 有文件但不是 PEM：解析失败也要点名文件
+        let dir = tempfile::tempdir().unwrap();
+        let bogus = dir.path().join("bogus.pem");
+        std::fs::write(&bogus, b"not a pem at all").unwrap();
+        let path = bogus.to_str().unwrap();
+        let err = Transport::from_pem(Some(path), Some(path))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("bogus.pem"), "报文要点名是哪个文件：{err}");
+    }
 
     #[tokio::test]
     async fn binding_port_zero_reads_back_kernel_assigned_port() {

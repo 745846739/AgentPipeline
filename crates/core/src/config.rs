@@ -250,6 +250,17 @@ pub struct ServerConfig {
     /// 设了它，「手机访问」页的配对二维码就指向它；不设时照旧按网卡枚举拼地址。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub public_base_url: Option<String>,
+    /// TLS 终止在**本进程内**（决策 335）：证书链与私钥的 PEM 路径。
+    ///
+    /// 两个键**一起给**——只给一个在解析期就报错（错了半个配置的表现是「服务起得来但
+    /// 外面连不上」，那是最费时间的一类排查）。都不给 = 明文：本机开发、局域网直连、
+    /// 「反向代理已经终止了 TLS」三种形态照旧。文件存不存在、PEM 能不能解析由启动期
+    /// 兜（那要读盘，不放在纯函数式的 `validate` 里），启动期失败即 fail fast。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tls_cert: Option<String>,
+    /// 私钥 PEM 路径（见 [`ServerConfig::tls_cert`]）。权限应当只给跑服务那个用户。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tls_key: Option<String>,
     /// 额外放行的跨源写 origin 白名单（决策 157）。缺省恒含
     /// `http://127.0.0.1:{port}` / `http://localhost:{port}`（决策 128），本键
     /// 用于局域网等**显式扩权**；值须为 `scheme://host[:port]`，尾部斜杠在
@@ -264,8 +275,26 @@ impl Default for ServerConfig {
             port: 8788,
             host: "127.0.0.1".to_string(),
             public_base_url: None,
+            tls_cert: None,
+            tls_key: None,
             allowed_origins: Vec::new(),
         }
+    }
+}
+
+impl ServerConfig {
+    /// TLS 两个键里缺的那一半；`None` = 成对（都给了或都没给）。见决策 335。
+    pub fn missing_tls_half(&self) -> Option<&'static str> {
+        match (self.tls_cert.is_some(), self.tls_key.is_some()) {
+            (true, false) => Some("tls_key"),
+            (false, true) => Some("tls_cert"),
+            _ => None,
+        }
+    }
+
+    /// 本进程是否自己终止 TLS（两个键都给齐了才算）。
+    pub fn tls_enabled(&self) -> bool {
+        self.tls_cert.is_some() && self.tls_key.is_some()
     }
 }
 
@@ -652,6 +681,15 @@ impl Config {
         if let Some(raw) = self.server.public_base_url.as_ref() {
             normalize_origin(raw)
                 .map_err(|e| Error::Config(format!("[server] public_base_url 校验失败：{e}")))?;
+        }
+        // TLS 的两个键是**成对**的（决策 335）：只给一个不是「少配了一半」，而是配错了——
+        // 报出缺的那一个，别让它在启动期以「文件读不到」的面目出现。
+        if let Some(missing) = self.server.missing_tls_half() {
+            return Err(Error::Config(format!(
+                "[server] 的 tls_cert 与 tls_key 必须一起给（缺 {missing}）：\
+                 只给一个时服务能起来但没有 TLS，而外面看到的是「连不上」——\
+                 要么两个都给（服务自己终止 TLS），要么两个都不给（明文，或前面已有反向代理）"
+            )));
         }
         // 已退场的旧键：`[market] allowed_sources`（决策 194 之前那份 registry 的 origin 白名单）。
         // **拦在这里而不是靠 `deny_unknown_fields`**：那条会报「unknown field `allowed_sources`」，
@@ -1851,6 +1889,49 @@ mod tests {
     // ── 决策 334：[server] public_base_url（公网入口）──
 
     /// 键认得出来、缺省是「没有」，且形态校验与 `allowed_origins` 同一套。
+    // ── 决策 335：[server] tls_cert / tls_key（应用自己终止 TLS）──
+
+    /// 两个都不给 = 明文（缺省形态）；两个都给 = 启用 TLS。
+    #[test]
+    fn tls_pair_defaults_to_plain_and_turns_on_when_both_are_given() {
+        let plain = Config::from_toml("[server]\nport = 8788\n").unwrap();
+        assert!(!plain.server.tls_enabled(), "不配 = 明文，不是「配了一半」");
+        assert!(plain.server.missing_tls_half().is_none());
+
+        let tls = Config::from_toml(
+            r#"
+            [server]
+            tls_cert = "/etc/agentpipeline/tls/c.pem"
+            tls_key = "/etc/agentpipeline/tls/k.pem"
+            "#,
+        )
+        .unwrap();
+        assert!(tls.server.tls_enabled());
+        assert_eq!(
+            tls.server.tls_cert.as_deref(),
+            Some("/etc/agentpipeline/tls/c.pem")
+        );
+    }
+
+    /// 只给一半是**配错了**，不是「先试试明文」：启动期报错并点名缺哪个。
+    ///
+    /// 这条判据放过去的现象最难查——服务起得来、日志也正常，只是外面连不上（少了证书那一半）
+    /// 或压根没启 TLS（少了私钥那一半却被当成配好了）。
+    #[test]
+    fn tls_half_a_pair_fails_fast_and_names_the_missing_one() {
+        for (toml, missing) in [
+            ("[server]\ntls_cert = \"/tmp/c.pem\"\n", "tls_key"),
+            ("[server]\ntls_key = \"/tmp/k.pem\"\n", "tls_cert"),
+        ] {
+            let err = Config::from_toml(toml).unwrap_err().to_string();
+            assert!(err.contains(missing), "报错要点名缺的是哪一个：{err}");
+            assert!(
+                err.contains("tls_cert") && err.contains("tls_key"),
+                "两个键名都要出现（否则读的人不知道另一半叫什么）：{err}"
+            );
+        }
+    }
+
     #[test]
     fn public_base_url_parses_and_rejects_non_origin_forms() {
         let cfg = Config::from_toml(

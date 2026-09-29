@@ -55,6 +55,15 @@ ulid = "1"
 # 存储水位读数用（决策 321）：statvfs 拿磁盘剩余空间。libc 已在依赖树里
 # （sqlite / tokio 的传递依赖），提为直接依赖不加编译成本。
 libc = "0.2"
+# 应用内 TLS 终止（决策 335）：106 上不再要 Caddy，服务自己收 https。
+# rustls / tokio-rustls 同样**已在依赖树里**（reqwest 的 rustls-tls 传递依赖），
+# 提为直接依赖不引新下载；PEM 解析走 rustls 自带的 pki-types，不另引 rustls-pemfile。
+#
+# **必须关掉默认特性**：两者的默认都选 aws-lc-rs 这一套加密后端，而树里那份是用
+# `ring` 编的（reqwest 的 `__rustls-ring`）。不关默认 = 凭空拉进 aws-lc-rs（还带 C
+# 工具链构建），锁文件里现在没有它，本机与 106 都要多付一次全量编译。
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
+tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12"] }
 # 技能包（zip）解码（票 09）：**只用它读，不用它写**，故关掉默认特性集
 # （aes-crypto / bzip2 / zstd / lzma / ppmd / time 全是为压缩与加密准备的，本票用不到）。
 # 保留 deflate——`zip -r` 的默认压缩方法，用户上传的包几乎都是它；

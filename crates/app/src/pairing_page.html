@@ -1,0 +1,91 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="robots" content="noindex">
+<title>这台设备还没配对</title>
+<!--
+  未配对设备看到的**唯一一张页**（决策 336）。它由应用自己托管，且**必须自带全部样式与
+  脚本**：`/assets/*` 也在配对闸门后面，外链一个字节都取不到——页面会在没有任何 CSS 的
+  状态下渲染。这条约束由 `pairing_page.rs` 的单测钉住（不许出现 src/href 外链）。
+-->
+<style>
+  :root { color-scheme: dark }
+  * { box-sizing: border-box }
+  body {
+    margin: 0; min-height: 100vh; display: grid; place-items: center;
+    background: #14161a; color: #e6e8eb; padding: 1.5rem;
+    font: 16px/1.6 -apple-system, BlinkMacSystemFont, "Segoe UI", "PingFang SC",
+      "Hiragino Sans GB", "Microsoft YaHei", sans-serif;
+  }
+  main { width: 100%; max-width: 26rem }
+  h1 { margin: 0 0 .5rem; font-size: 1.25rem; letter-spacing: .01em }
+  p { margin: .5rem 0; color: #b6bcc6 }
+  #note { color: #e6e8eb }
+  ol { margin: .75rem 0 0; padding-left: 1.25rem; color: #b6bcc6 }
+  li { margin: .25rem 0 }
+  form { margin: 1.25rem 0 0; display: flex; gap: .5rem; flex-wrap: wrap }
+  input {
+    flex: 1 1 12rem; min-width: 0; padding: .6rem .7rem; border-radius: .5rem;
+    border: 1px solid #34394a; background: #1c1f26; color: inherit; font: inherit;
+  }
+  button {
+    padding: .6rem 1rem; border-radius: .5rem; border: 1px solid #3d63d8;
+    background: #2f56cc; color: #fff; font: inherit; cursor: pointer;
+  }
+  code { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; word-break: break-all }
+  .addr { margin-top: 1.25rem; font-size: .8125rem; color: #7c8394 }
+</style>
+</head>
+<body>
+<main>
+  <h1>这台设备还没配对</h1>
+  <p id="note"></p>
+  <ol>
+    <li>在跑服务的电脑本机打开「手机访问」页；</li>
+    <li>用这台设备的相机扫那张二维码（它会把你带回这里，并带上配对令牌）；</li>
+    <li>扫不了就把那条配对链接整个复制过来，粘在下面。</li>
+  </ol>
+  <form id="f" hidden>
+    <input id="t" name="pair" autocomplete="off" autocapitalize="off" spellcheck="false"
+           aria-label="配对令牌" placeholder="配对令牌">
+    <button type="submit">配对</button>
+  </form>
+  <p class="addr">本次打开的地址：<code id="url"></code></p>
+</main>
+<script>
+(function () {
+  var note = document.getElementById('note');
+  var form = document.getElementById('f');
+  var fromUrl = '';
+  try { fromUrl = (new URLSearchParams(location.search).get('pair') || '').trim(); } catch (e) {}
+
+  if (fromUrl) {
+    // 令牌已经从地址递进来了，服务端仍然不认——**不能再自动重试**，否则这条地址
+    // 与服务端会来回打转（跳转 → 还是这一页）。信息给够，让使用者去重扫。
+    note.textContent = '这条地址里的配对令牌服务端不认：多半是令牌重置过，或这条地址是旧的。';
+  } else {
+    var stored = null;
+    try { stored = localStorage.getItem('agentpipeline.pairing'); } catch (e) {}
+    if (stored) {
+      // 本机存过令牌（升级前配好的设备）：把它交给地址，走服务器那条种 cookie 的路。
+      // 键名与 `frontend/src/api/config.ts` 的 PAIRING_STORAGE_KEY 是同一个约定。
+      location.replace('/?pair=' + encodeURIComponent(stored));
+      return;
+    }
+    note.textContent = '这条地址里没有配对令牌。';
+  }
+
+  form.hidden = false;
+  document.getElementById('url').textContent =
+    location.href.replace(/([?&]pair=)[^&#]*/i, '$1\u2022\u2022\u2022');
+  form.addEventListener('submit', function (event) {
+    event.preventDefault();
+    var value = document.getElementById('t').value.trim();
+    if (value) location.href = '/?pair=' + encodeURIComponent(value);
+  });
+})();
+</script>
+</body>
+</html>

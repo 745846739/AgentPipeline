@@ -33,14 +33,20 @@ async fn main() -> anyhow::Result<()> {
 
 fn print_help() {
     println!(
-        "用法：agent-pipeline [serve] [--port <PORT>] [--host <IP>] \
-         [--public-base-url <ORIGIN>] [--allowed-origin <ORIGIN>]"
+        "用法：agent-pipeline [serve] [--port <PORT>] [--host <IP>] [--public-base-url <ORIGIN>] \
+         [--tls-cert <PEM> --tls-key <PEM>] [--allowed-origin <ORIGIN>]"
     );
     println!("  --port <PORT>              覆盖 [server] port（0 = 内核随机分配）");
     println!("  --host <IP>                覆盖 [server] host（局域网访问用 0.0.0.0）");
     println!("  --public-base-url <ORIGIN> 覆盖 [server] public_base_url（决策 334）：");
     println!("                             反向代理 / 公网入口后面部署时，手机访问页的二维码");
     println!("                             指向它，如 --public-base-url https://example.com:3389");
+    println!(
+        "  --tls-cert / --tls-key     覆盖 [server] tls_cert / tls_key（决策 335）：两个一起给"
+    );
+    println!(
+        "                             即由本进程终止 TLS（没有反向代理的部署形态），都不给 = 明文"
+    );
     println!("  --allowed-origin <ORIGIN>  额外放行的跨源写 origin，可重复（决策 157）：");
     println!("                             局域网浏览器要操作写接口，需放行其页面 origin，");
     println!("                             如 --allowed-origin http://192.168.1.10:8788");
@@ -75,6 +81,8 @@ fn parse_serve_args(args: &[String]) -> anyhow::Result<ServeOptions> {
                     .map_err(|e| anyhow::anyhow!("--public-base-url 无效：{e}"))?;
                 options.public_base_url_override = Some(url);
             }
+            "--tls-cert" => options.tls_cert_override = Some(take_value()?),
+            "--tls-key" => options.tls_key_override = Some(take_value()?),
             "--allowed-origin" => {
                 let raw = take_value()?;
                 for part in raw.split(',').map(str::trim).filter(|p| !p.is_empty()) {
@@ -197,5 +205,47 @@ mod tests {
         assert!(parse_serve_args(&missing).is_err());
         let not_a_number: Vec<String> = vec!["--port".into(), "abc".into()];
         assert!(parse_serve_args(&not_a_number).is_err());
+    }
+
+    /// TLS 两个旗标（决策 335）：两种写法都认、缺取值报错。
+    ///
+    /// **这里只断言「参数搬到了 `ServeOptions` 上」**：路径对不对、PEM 坏没坏由
+    /// `serve::Transport::from_pem` 在启动期判（那条链有自己的用例）——CLI 这一层
+    /// 不该去碰文件系统，它只负责把两个字符串原样递下去。
+    #[test]
+    fn serve_args_carry_the_tls_pair() {
+        let split: Vec<String> = [
+            "--tls-cert",
+            "/etc/agentpipeline/tls/c.pem",
+            "--tls-key",
+            "/etc/agentpipeline/tls/k.pem",
+        ]
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
+        let options = parse_serve_args(&split).unwrap();
+        assert_eq!(
+            options.tls_cert_override.as_deref(),
+            Some("/etc/agentpipeline/tls/c.pem")
+        );
+        assert_eq!(
+            options.tls_key_override.as_deref(),
+            Some("/etc/agentpipeline/tls/k.pem")
+        );
+
+        let inline: Vec<String> = vec!["--tls-cert=/tmp/only-cert.pem".into()];
+        assert_eq!(
+            parse_serve_args(&inline)
+                .unwrap()
+                .tls_cert_override
+                .as_deref(),
+            Some("/tmp/only-cert.pem"),
+            "只给一个旗标在**这一层**是合法的：配不配对由启动期那道门判（决策 335）"
+        );
+
+        for flag in ["--tls-cert", "--tls-key"] {
+            let missing: Vec<String> = vec![flag.into()];
+            assert!(parse_serve_args(&missing).is_err(), "{flag} 缺取值该报错");
+        }
     }
 }
