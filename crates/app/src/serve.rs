@@ -210,14 +210,29 @@ impl Transport {
             .with_context(|| {
                 format!("证书与私钥不配对（或证书链有误）：{cert_path} / {key_path}")
             })?;
-        // ALPN：浏览器在 TLS 上谈 h2 才拿得到 HTTP/2（本机 chrome 与 iOS Safari 都会谈）。
-        // 只列这两个是**故意的**——`http/1.1` 兜底，把 SSE 的长连接留给已经验过的 h1 也行。
-        config.alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec()];
+        // ALPN：**只宣告 http/1.1**（理由见 `alpn_protocols`）。
+        config.alpn_protocols = alpn_protocols();
         tracing::info!(cert = cert_path, key = key_path, "TLS 终止在本进程内");
         Ok(Transport::Tls(tokio_rustls::TlsAcceptor::from(Arc::new(
             config,
         ))))
     }
+}
+
+/// TLS 上宣告的 ALPN 名单（决策 335）：**只有 `http/1.1`**。
+///
+/// **为什么不能带 `h2`——实测的（2026-09-30）**：一开始两个都宣告了，理由是「浏览器谈 h2
+/// 才拿得到 HTTP/2」。可这个工作区的 axum 是 `features = ["macros"]`（默认特性里**没有
+/// `http2`**），hyper 的 auto builder 于是不会讲 h2：客户端见 ALPN 谈成 h2 便按 h2 发
+/// preface，服务端按 h1 解析——**连接当场被重置**。症状是 TLS 形态下**什么都打不开**
+/// （`curl` 报 `unexpected eof while reading` / `Connection reset by peer`），而
+/// `curl --http1.1` 一切正常：正因为错在「宣告了做不到的事」，不在 TLS 本身。
+///
+/// 只宣告 h1 之后，TLS 形态与明文形态**行为一致**（都是 h1，SSE 的长连接照旧是已经验过
+/// 的那条路）。要上 h2 得先给 axum 开 `http2` 特性再验一轮握手与 SSE——那是另一笔账，
+/// 且这笔账**必须由真握手来结**（配置层的单测只能钉住「名单里没有 h2」这件事）。
+fn alpn_protocols() -> Vec<Vec<u8>> {
+    vec![b"http/1.1".to_vec()]
 }
 
 /// 带 TLS 的监听器。
@@ -1065,6 +1080,19 @@ mod tests {
     /// 真握手（客户端认证书、HTTP/2、SSE 不被缓冲）在 106 上按 `docs/operations.md` §12.17
     /// 手验 + 每次部署由 `deploy.yml` 的外部检查打一发 https——**本仓不为它引证书生成依赖**
     /// （rcgen 会带进 4 个新 crate，而这里要钉的是「配置错得响不响」，那几条用不着真证书）。
+    /// **`h2` 不许回到 ALPN 名单里**，除非 axum 那一侧真的开了 `http2` 特性（见 `alpn_protocols`
+    /// 的注释：宣告做不到的协议会让 TLS 形态整条打不开，而 `curl --http1.1` 却是好的——
+    /// 那是最容易误判成「证书有问题」的一种失败）。
+    #[test]
+    fn alpn_advertises_http11_only() {
+        let protocols = super::alpn_protocols();
+        assert_eq!(protocols, vec![b"http/1.1".to_vec()]);
+        assert!(
+            !protocols.iter().any(|p| p == b"h2"),
+            "h2 必须先给 axum 开 http2 特性再宣告"
+        );
+    }
+
     #[test]
     fn transport_loads_pem_or_fails_loudly() {
         assert!(matches!(
