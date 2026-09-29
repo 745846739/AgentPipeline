@@ -102,11 +102,16 @@ jobs:
             CODE=$(curl -sS -o /dev/null -w '%{http_code}' --max-time 15 \
               "${VERIFY[@]}" "https://${{ secrets.DEPLOY_HOST }}/" || true)
             echo "attempt $i: https $CODE"
-            [ "$CODE" = "200" ] && exit 0
+            # 200 = 应用在答；401 = Caddy 的 HTTP Basic 在挡（出路 ①，决策 332）。
+            # 两个都算「HTTPS 入口活着」——401 反而证明门外那道门真的在（且 106 上
+            # 的 https 入口**必然**是 401 或缺凭据，因为没有匿名可读的路径）。
+            if [ "$CODE" = "200" ] || [ "$CODE" = "401" ]; then exit 0; fi
             sleep 10
           done
 
-          # 过渡期回退：明文入口还在的形态。切换落地后删掉这一段。
+          # 过渡期回退：明文入口还在的形态。**它现在还有一个理由**——443/80 被云安全组
+          # 挡着（见 docs/operations.md §12.17 现状），外面暂时只有明文这条能验。
+          # 放行 443、改绑回环、拆明文之后，连同本段一起删。
           for i in 1 2 3 4 5; do
             CODE=$(curl -sS -o /dev/null -w '%{http_code}' --max-time 15 \
               "http://${{ secrets.DEPLOY_HOST }}:3333/" || true)

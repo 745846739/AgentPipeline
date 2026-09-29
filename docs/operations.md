@@ -1371,6 +1371,8 @@ CONTEXT_ALERTS = {
 >
 > 换句话说：**HTTPS 与「谁动手要凭据」是两件事，别让前者把后者顺手关掉。**
 
+**已选出路 ①（2026-09-29，决策 332），下面是实际落地的版本。** Caddy 走 106 自带的 EPEL 包（2.6.4，指令名是 `basicauth`——`basic_auth` 是 2.8 之后的改名）、443 用**兜底站点块**、80 回 404；口令明文只在开发机（`~/ca-106/basic-auth.txt`，600），服务器上只有 bcrypt 哈希。**切换尚未走完**：443/80 被**云安全组**挡着（服务器侧没挡），放行之前**不改绑**——先绑回环再发现 443 不通，等于把唯一的入口关掉。
+
 **一次性签发（在开发机上）。** mkcert 是本地 CA 工具，只在开发机装：
 
 ```bash
@@ -1394,32 +1396,42 @@ openssl x509 -in 106.12.12.6.pem -noout -enddate      # 有效期（mkcert 缺�
 **上机（在开发机上执行）。** 证书与私钥放到 Caddy 的固定目录，权限只给 Caddy 那个用户：
 
 ```bash
-scp 106.12.12.6.pem 106.12.12.6-key.pem root@106.12.12.6:/etc/caddy/certs/
-ssh root@106.12.12.6 'chown -R root:root /etc/caddy/certs && chmod 600 /etc/caddy/certs/106.12.12.6-key.pem && chmod 644 /etc/caddy/certs/106.12.12.6.pem'
+scp 106.12.12.6.pem 106.12.12.6-key.pem root@106.12.12.6:/tmp/
+ssh root@106.12.12.6 'install -d -m 755 /etc/caddy/certs && install -m 644 /tmp/106.12.12.6.pem /etc/caddy/certs/106.12.12.6.pem && install -m 600 /tmp/106.12.12.6-key.pem /etc/caddy/certs/106.12.12.6-key.pem && rm -f /tmp/106.12.12.6*.pem'
+# 服务以 `caddy` 用户跑（EPEL 包固定），私钥必须让那个组读得到——`0600 root:root`
+# 会让它起不来并报 `open …-key.pem: permission denied`（2026-09-29 实测踩到）：
+ssh root@106.12.12.6 'chown root:caddy /etc/caddy/certs/106.12.12.6-key.pem && chmod 640 /etc/caddy/certs/106.12.12.6-key.pem && chown root:caddy /etc/caddy/certs && chmod 750 /etc/caddy/certs'
 ```
 
 **106 上的 Caddy（装一次，之后只管 reload）。**
 
 ```bash
-# 装 Caddy（官方源；也可用各发行版仓库里的包）
-apt-get install -y debian-keyring debian-archive-keyring apt-transport-https curl
-curl -1sLf 'https://dl.cloudsmith.io/public/caddy/stable/gpg.key' | gpg --dearmor -o /usr/share/keyrings/caddy-stable-archive-keyring.gpg
-curl -1sLf 'https://dl.cloudsmith.io/public/caddy/stable/debian.deb.txt' > /etc/apt/sources.list.d/caddy-stable.list
-apt-get update && apt-get install -y caddy
+# 装 Caddy：106 是 BaiduLinux（RHEL 9 系），直接用 EPEL 里的包——实测可装 2.6.4。
+# **不要**照抄 Debian 那套 apt / cloudsmith 源：这台机器上没有 apt，且它到 GitHub 与
+# cloudsmith 都是跨境慢线（实测 GitHub 直接超时，64KB 要 15s 以上）。
+dnf install -y caddy
 
-cat >/etc/caddy/Caddyfile <<'EOF'
+cat >/etc/caddy/Caddyfile <<'CADDY'
 {
-	# 自签/静态证书：关掉自动 HTTPS 与 ACME（裸 IP 申请不了公共证书）
+	# 静态证书 + 裸 IP：关掉自动 HTTPS 与 ACME（裸 IP 申请不了公共证书）
 	auto_https off
 }
 
-https://106.12.12.6 {
+# **站点块写成 `:443` 兜底，不要写 `https://106.12.12.6`**——裸 IP 访问时客户端按
+# RFC 6066 **不发 SNI**（curl 与浏览器都一样），按域名索引的站点块拿不到证书，握手当场
+# `tlsv1 alert internal error`（2026-09-29 实测踩到）。`:443` 让这张静态证书成为无 SNI
+# 连接的默认证书；这台机器 443 上只服务这一个应用，兜底不扩大暴露面。
+:443 {
 	tls /etc/caddy/certs/106.12.12.6.pem /etc/caddy/certs/106.12.12.6-key.pem
 
-	# ← 出路 ①：先在这里加一层 basic_auth（caddy hash-password 生成的哈希）
-	# basic_auth {
-	#     me <哈希>
-	# }
+	# 出路 ①（决策 332）：全站一层 HTTP Basic。Caddy 与后端同机，转发源地址必然是
+	# 127.0.0.1，后端改绑之后 lan_mode() 也变假——守卫的两条豁免同时命中，外面这一层
+	# 就是 106 上唯一的门。口令明文不落任何地方，这里只有 bcrypt 哈希：
+	#   HASH=$(caddy hash-password --plaintext '<口令>')    # 2.6.x 的指令名是 basicauth
+	#   （`basic_auth` 是 Caddy 2.8 之后的改名，106 上这版不认那个名字）
+	basicauth {
+		me <60 字符的 bcrypt 哈希>
+	}
 
 	# SSE（/tasks/{id}/stream、/foreman/stream）必须关掉缓冲，否则事件被攒住不下发
 	reverse_proxy 127.0.0.1:3333 {
@@ -1431,12 +1443,22 @@ https://106.12.12.6 {
 http://106.12.12.6 {
 	respond 404
 }
-EOF
+CADDY
 
 systemctl enable --now caddy     # 开机自启
 caddy validate --config /etc/caddy/Caddyfile
 systemctl reload caddy           # 改完配置只 reload
+
+# 自测（**不带 SNI**，即浏览器访问裸 IP 的真实形态）：
+curl -sS -o /dev/null -w '%{http_code}\n' -k https://127.0.0.1/                                   # → 401
+curl -sS -o /dev/null -w '%{http_code} %{http_version}\n' -k -u 'me:<口令>' https://127.0.0.1/     # → 200 2
+curl -sS -N -k --max-time 26 -u 'me:<口令>' https://127.0.0.1/foreman/stream | head -c 1           # → ':'（心跳帧，证明没有被缓冲）
 ```
+
+**这一步的前置条件（2026-09-29 卡在这）。** 先确认 443 **从外网**真的通——服务器上自测通不算：
+出口那一道**云安全组**可能根本没放行（106 眼下就是这种状态：Caddy 已在 443 上服务、回环自测全绿，
+而外面连 443/80 都是超时；服务器侧 firewalld 未启用、iptables 只有一条 22 的防护链，能挡的只有安全组）。
+**在放行之前不要执行本节**：先绑回环再发现 443 不通，等于把唯一的入口关掉。
 
 **后端改绑回环（顺序很重要）。** 先让 443 通、再关明文，中间任何一步失败都还能退回去：
 
@@ -1469,7 +1491,28 @@ scp 106.12.12.6.pem 106.12.12.6-key.pem root@106.12.12.6:/etc/caddy/certs/
 ssh root@106.12.12.6 'systemctl reload caddy'
 ```
 
+**Basic 口令的轮换（出路 ① 的要付的那一次维护）。** 口令明文**只在开发机** `~/ca-106/basic-auth.txt`（600，2026-09-29 生成）；服务器上只有 Caddyfile 里那串 bcrypt 哈希，反推不出口令——忘了就直接换一串（各设备下次访问重新弹一次）：
+
+```bash
+PW=$(LC_ALL=C tr -dc 'A-Za-z0-9' </dev/urandom | head -c 24)
+# 注意：106 上是 Caddy 2.6.4，`caddy hash-password` **只认 --plaintext**（走 stdin 会报
+# `Error: EOF`，实测）；这一步口令会短暂出现在服务器进程表里，换完即散。
+HASH=$(ssh -i ~/.ssh/106.key -o IdentitiesOnly=yes root@106.12.12.6 "caddy hash-password --plaintext '$PW'")
+# 改 Caddyfile 的 basicauth 块（把 me 那一行换成新哈希），然后：
+ssh -i ~/.ssh/106.key -o IdentitiesOnly=yes root@106.12.12.6 'caddy validate --config /etc/caddy/Caddyfile && systemctl reload caddy'
+printf '用户名 me\n口令 %s\n' "$PW" > ~/ca-106/basic-auth.txt && chmod 600 ~/ca-106/basic-auth.txt
+```
+
+
 **已知变数，如实记。** ① Apple 对「用户自装 CA」在 Safari 里的信任姿态是政策面的事，未来若收紧，退路是补一个真域名走标准证书（CA 那一套换掉，其余不动）；② 证书到期是**手动**动作，没有自动续期——`openssl x509 -enddate` 是唯一的提醒，记在运维日历里；③ 106 的 `443` 对外开放这件事本身**不增加暴露面**（`3333` 今天就在公网上），增加暴露面的是「拆掉明文入口之后令牌失效」那一条（见上面的警告框）。
 
-**现状（2026-09-29，落地到哪一步）。** 本仓库这一侧已就位：本节（签发 / 上机 / 重签 / 验证命令）、部署 skill 的 HTTPS 化（装 Caddy、改绑定、验证命令改 `https://`）、CI 的外部可达性检查改 `https://`（并保留明文回退一支，拆明文那一票落地时删掉）、应用侧不需要任何改动。**106 上尚未切换**：Caddy 未装、证书未上机、后端仍绑全网卡——因为切换会让配对令牌失去牙齿（见上面的警告框），这一步**等出路 ①/② 选一条之后再做**，且真机验收（装 CA → 加主屏 → 订阅 → 锁屏收推送）本来就只有人能走。
+**现状（2026-09-29 晚，落地到哪一步）。** 已落地：本节（签发 / 上机 / 装 Caddy / 重签 / 验证命令）、
+**106 上的 Caddy**（EPEL 2.6.4 + mkcert 叶子证书 `IP SAN: 106.12.12.6`（2028-12-29 到期，根 CA 私钥仍只在开发机）
++ 全站 `basicauth` + `:443` 兜底站点块 + 80 回 404）、部署 skill 的 HTTPS 化、CI 的外部可达性检查改 `https://`
+（**保留**明文回退一支——它随拆明文一起删）、应用侧零改动。**回环自测已通过**：无凭据 401 / 带凭据 200
+（HTTP/2，返回的是应用本体 HTML）/ `/server-info`、`/tasks`、`/notify/settings` 均 200 / `/foreman/stream`
+26 秒窗口内见到心跳帧（未被缓冲）/ 80 是 404。**没做完的只有「等云安全组放行 443」以及它后面那两步**：
+后端改绑回环 + 拆明文（放行前不动，理由见上一节）、CI 删掉明文回退那一支，以及只有人能走的手机装 CA 与真机验收。
+**已知取舍一条（如实记）**：经代理进来的请求源地址恒为 `127.0.0.1`，于是 `/pairing/token` 对过了 Basic 的人可读、
+配对令牌在 **https 入口**上不再有牙齿——外面那层 Basic 就是 106 上唯一的门（直连 3333 的明文入口在拆掉之前，令牌照旧有效）。
 
