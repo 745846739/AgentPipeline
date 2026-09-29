@@ -32,6 +32,7 @@ mod pause;
 mod process_group;
 mod production_llm;
 mod project_analysis_observation;
+mod project_delete;
 mod readonly;
 mod repair;
 mod repo_live;

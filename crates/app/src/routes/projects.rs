@@ -118,17 +118,51 @@ pub async fn patch(
     Ok(Json(json!({ "project": project })))
 }
 
-/// `DELETE /projects/{id}`：有活跃任务时拒绝（决策 101）。
+/// `DELETE /projects/{id}`：级联删除项目与其全部历史（决策 328）；
+/// 有活跃任务时拒绝（决策 101）——那道闸是级联删除的联锁。
 pub async fn delete(
     State(state): State<AppState>,
     Path(id): Path<String>,
 ) -> ApiResult<impl IntoResponse> {
-    state
+    // 先读出仓库路径：行删掉之后就查不到了，而 worktree / 分支的回收要用它。
+    let project = state.store.get_project(&id).await.map_err(map_core_error)?;
+    let task_ids = state
         .store
         .delete_project(&id)
         .await
         .map_err(map_core_error)?;
+    // 库已经落定，磁盘产物是**尽力而为**：失败只告警，不回滚已删的项目（§12.1 同一口径）。
+    if let Some(project) = project {
+        recycle_task_artifacts(&state, &project.local_path, &task_ids).await;
+    }
     Ok(Json(json!({ "ok": true })))
+}
+
+/// 回收被删任务留在磁盘上的产物：worktree（含 git 登记）、分支、任务目录（§12.1）。
+///
+/// 幂等：路径不存在就跳过。任务行此刻已经删了，故这里按**约定路径**定位
+/// （`Home::worktree_path` / `Home::task_dir`，与执行器建它们时用的是同一条约定），
+/// 而不是回头读任务行。
+async fn recycle_task_artifacts(state: &AppState, repo_path: &str, task_ids: &[String]) {
+    let repo = std::path::Path::new(repo_path);
+    for task_id in task_ids {
+        let worktree = state.home.worktree_path(task_id);
+        if worktree.exists() {
+            if let Err(e) = Git.remove_worktree(repo, &worktree, true).await {
+                tracing::warn!(task = %task_id, error = %e, "worktree 清理失败");
+            }
+        }
+        let branch = agentpipeline_core::git::branch_name(task_id);
+        if let Err(e) = Git.delete_branch(repo, &branch).await {
+            tracing::warn!(task = %task_id, error = %e, "分支清理失败");
+        }
+        let task_dir = state.home.task_dir(task_id);
+        if task_dir.exists() {
+            if let Err(e) = std::fs::remove_dir_all(&task_dir) {
+                tracing::warn!(task = %task_id, error = %e, "任务目录清理失败");
+            }
+        }
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -197,7 +231,9 @@ pub async fn analyze(
         let result = match executor {
             Some(ex) => {
                 let started = std::time::Instant::now();
-                match ex.project_analysis(&project, facts.clone()).await {
+                // run id 透下去：这次分析的请求台账要挂在上面（决策 329），否则那几行
+                // 三个归属键全空——读不出是哪一次调用，删项目时也带不走。
+                match ex.project_analysis(&project, facts.clone(), run_id).await {
                     Ok(merged) => {
                         // 会话行：摘要属于观测面，metadata 存完整合并结果（含 summary）
                         if let Some(run_id) = run_id {

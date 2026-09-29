@@ -214,30 +214,145 @@ impl Store {
         Ok(())
     }
 
-    /// 有活跃任务时拒绝删除（决策 101）。
-    pub async fn project_has_active_tasks(&self, project_id: &str) -> Result<bool> {
-        let count: i64 = sqlx::query_scalar(
+    /// 删除项目，并级联带走它的全部历史（决策 328）。
+    ///
+    /// 裸删父行会撞三张 `NO ACTION` 外键子表（`kanban_project_analyses` /
+    /// `kanban_node_runs` / `kanban_node_conversations`），SQLite 报 code 787；
+    /// 而 `kanban_tasks.project_id` **没有**外键，父行删掉之后任务会变成孤儿继续留在
+    /// 看板上（列表是单表取的，[`Store::list_tasks`] 不 join 项目）。故删除必须自己把整棵
+    /// 子树带走，全部在一个事务里——中途失败不留半删状态。
+    ///
+    /// 顺序由外键方向决定：先子后父。两处需要额外一步：`kanban_node_runs.parent_run_id`
+    /// 是自引用（同一批里先删父再删子会当场报错）故先置空断链；`kanban_node_runs.cursor_id`
+    /// 指向 `kanban_node_cursors`，故 runs 必须在 cursors 之前走完。
+    ///
+    /// 返回被一并删除的任务 id：磁盘产物（worktree / 分支 / 任务目录）不在库里，
+    /// 由调用方按这份名单回收——storage 层不碰文件系统。
+    ///
+    /// 有活跃任务时仍然拒绝（决策 101）。**那道闸在事务里**（`BEGIN IMMEDIATE` 已经拿住写锁）：
+    /// 放在事务外的话，「检查通过」与「开始删」之间能挤进一次任务准入，结果是删完的项目
+    /// 底下挂着一条正在跑的任务——联锁能绕就不算联锁。
+    pub async fn delete_project(&self, project_id: &str) -> Result<Vec<String>> {
+        // 写事务一律 `BEGIN IMMEDIATE`（决策 163①）——这里更是必须：十几条删除语句要
+        // 同生同死，中途失败不能留下「子表清了、父行还在」的半删状态。
+        let mut tx = self.begin_write().await?;
+
+        let active: i64 = sqlx::query_scalar(
             "SELECT COUNT(*) FROM kanban_tasks
              WHERE project_id = ? AND archived_at IS NULL
                AND status IN ('queued','waiting','running','pending')",
         )
         .bind(project_id)
-        .fetch_one(self.pool())
+        .fetch_one(&mut *tx)
         .await?;
-        Ok(count > 0)
-    }
-
-    pub async fn delete_project(&self, project_id: &str) -> Result<()> {
-        if self.project_has_active_tasks(project_id).await? {
+        if active > 0 {
+            // 还没写过任何一行，drop 事务即回滚。
             return Err(Error::Conflict(
                 "项目仍有活跃任务，拒绝删除（决策 101）".into(),
             ));
         }
-        sqlx::query("DELETE FROM kanban_projects WHERE id = ?")
+
+        let task_ids: Vec<String> =
+            sqlx::query_scalar("SELECT id FROM kanban_tasks WHERE project_id = ?")
+                .bind(project_id)
+                .fetch_all(&mut *tx)
+                .await?;
+
+        // 「本项目任务」这半个谓词在下面反复出现；kanban_tasks 的行要到倒数第二步才删，
+        // 故子查询在整个过程里始终有效。
+        const TASK: &str = "task_id IN (SELECT id FROM kanban_tasks WHERE project_id = ?)";
+        // 本项目相关的 run：项目级伪阶段（project_id 归属）与本项目任务名下的 run。
+        const RUN: &str = "run_id IN (SELECT id FROM kanban_node_runs \
+                            WHERE project_id = ? \
+                               OR task_id IN (SELECT id FROM kanban_tasks WHERE project_id = ?))";
+
+        // ① runs / tasks 的共用子表：两边都要先清，否则删 run、删 task 那两步都会撞。
+        sqlx::query(&format!(
+            "DELETE FROM kanban_node_commands WHERE {TASK} OR {RUN}"
+        ))
+        .bind(project_id) // TASK
+        .bind(project_id) // RUN：项目级 run
+        .bind(project_id) // RUN：任务级 run
+        .execute(&mut *tx)
+        .await?;
+
+        sqlx::query(&format!(
+            "DELETE FROM kanban_node_conversations WHERE project_id = ? OR {TASK}"
+        ))
+        .bind(project_id) // 项目级会话
+        .bind(project_id) // TASK
+        .execute(&mut *tx)
+        .await?;
+
+        sqlx::query(&format!(
+            "DELETE FROM kanban_model_requests WHERE {TASK} OR {RUN}"
+        ))
+        .bind(project_id) // TASK（该列无外键，只能按值清）
+        .bind(project_id) // RUN：项目级 run
+        .bind(project_id) // RUN：任务级 run
+        .execute(&mut *tx)
+        .await?;
+
+        sqlx::query(&format!(
+            "DELETE FROM kanban_foreman_attention WHERE {TASK}"
+        ))
+        .bind(project_id)
+        .execute(&mut *tx)
+        .await?;
+
+        sqlx::query(&format!("DELETE FROM kanban_stage_outputs WHERE {TASK}"))
             .bind(project_id)
-            .execute(self.pool())
+            .execute(&mut *tx)
             .await?;
-        Ok(())
+
+        sqlx::query(&format!("DELETE FROM kanban_transitions WHERE {TASK}"))
+            .bind(project_id)
+            .execute(&mut *tx)
+            .await?;
+
+        // 依赖边有两个方向；跨项目指向本项目的那些边也要清——被依赖的任务没了，边就是死边。
+        sqlx::query(&format!(
+            "DELETE FROM kanban_task_deps WHERE {TASK} \
+             OR depends_on_id IN (SELECT id FROM kanban_tasks WHERE project_id = ?)"
+        ))
+        .bind(project_id) // TASK
+        .bind(project_id) // depends_on_id 一侧
+        .execute(&mut *tx)
+        .await?;
+
+        // ② 断开 run 的自引用：同一批删除里父行可能先走，留着就当场报外键错。
+        sqlx::query(
+            "UPDATE kanban_node_runs SET parent_run_id = NULL
+             WHERE project_id = ? OR task_id IN (SELECT id FROM kanban_tasks WHERE project_id = ?)",
+        )
+        .bind(project_id)
+        .bind(project_id)
+        .execute(&mut *tx)
+        .await?;
+
+        // ③ runs 必须在 cursors 之前清完（`runs.cursor_id` → `kanban_node_cursors`）。
+        sqlx::query(
+            "DELETE FROM kanban_node_runs
+             WHERE project_id = ? OR task_id IN (SELECT id FROM kanban_tasks WHERE project_id = ?)",
+        )
+        .bind(project_id)
+        .bind(project_id)
+        .execute(&mut *tx)
+        .await?;
+
+        // ④ 收尾：游标 → 项目分析 → 任务 → 项目行。tasks 的行活到这一步，上面的子查询才有对象。
+        for sql in [
+            "DELETE FROM kanban_node_cursors WHERE task_id IN \
+             (SELECT id FROM kanban_tasks WHERE project_id = ?)",
+            "DELETE FROM kanban_project_analyses WHERE project_id = ?",
+            "DELETE FROM kanban_tasks WHERE project_id = ?",
+            "DELETE FROM kanban_projects WHERE id = ?",
+        ] {
+            sqlx::query(sql).bind(project_id).execute(&mut *tx).await?;
+        }
+
+        tx.commit().await?;
+        Ok(task_ids)
     }
 
     // ── 项目分析（决策 130 ⑦：202 + 轮询）──

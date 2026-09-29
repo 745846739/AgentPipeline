@@ -14,6 +14,7 @@ use agentpipeline_core::scheduler::KanbanScheduler;
 use agentpipeline_core::sse::{SseEvent, SseEventType};
 use agentpipeline_core::storage::decisions::MergeDecision;
 use agentpipeline_core::storage::decisions::ResumeAction;
+use agentpipeline_core::storage::observability::NewProjectRun;
 use agentpipeline_core::storage::Store;
 use agentpipeline_core::types::{
     AcceptanceCriterion, Approval, ArchitectExecuteMetadata, CodeChanges, CursorStatus,
@@ -3545,14 +3546,74 @@ async fn project_analysis_merges_llm_summary_into_facts() {
         "test_framework": "cargo",
         "suspicious": []
     });
+    // 项目级 run（决策 100 / 迁移 0004）：app 路由在调之前先落它，再把 id 透进来。
+    let run_id = ctx
+        .store
+        .insert_project_run(&NewProjectRun {
+            project_id: "p1".into(),
+            stage: Stage::Init,
+            node: Node::Execute,
+            attempt: 1,
+            agent_type: "pseudo:project_analysis".into(),
+        })
+        .await
+        .unwrap();
     let merged = ctx
         .executor
-        .project_analysis(&project, facts)
+        .project_analysis(&project, facts, Some(run_id))
         .await
         .unwrap();
     assert_eq!(merged["summary"], "这是一个 Rust 项目");
     assert_eq!(merged["suspicious"][0], "检测到多套测试框架");
     assert_eq!(merged["language"], "rust", "确定性探测事实必须保留");
+
+    // 决策 329：这次调用的请求台账挂在**它自己的**项目级 run 上。
+    // 修改前这里是空的——`RunContext.run_id` 填死 0，归一成 NULL，那几行三个归属键全空：
+    // 读不出是哪一次分析的调用，删项目时也带不走。
+    let rows = ctx.store.model_requests_for_run(run_id, 10).await.unwrap();
+    assert_eq!(
+        rows.len(),
+        1,
+        "这次分析的请求该按项目级 run 读得到：{rows:?}"
+    );
+    assert_eq!(rows[0].agent_type, "pseudo:project_analysis");
+    assert!(rows[0].task_id.is_none(), "项目级调用没有任务归属");
+}
+
+/// 决策 329 的反向面：调用方没能落 run 行（`insert_project_run` 失败）时传 `None`，
+/// 请求照落账、**不撞外键**（哨兵 0 归一成 NULL），只是没有归属可指。
+#[tokio::test]
+async fn project_analysis_without_a_run_row_still_logs_an_unowned_request() {
+    use agentpipeline_core::pipeline::pseudo::ProjectAnalysisResult;
+
+    let ctx = setup("true", Settings::default()).await;
+    let mut script = Script::new();
+    script
+        .for_pseudo("pseudo:project_analysis")
+        .submit(&ProjectAnalysisResult {
+            summary: "摘要".into(),
+            suspicious: vec![],
+        });
+    ctx.agent.set_script(script);
+
+    let project = ctx.store.get_project("p1").await.unwrap().unwrap();
+    let merged = ctx
+        .executor
+        .project_analysis(&project, serde_json::json!({"language": "rust"}), None)
+        .await
+        .unwrap();
+    assert_eq!(merged["summary"], "摘要");
+
+    let rows: Vec<(Option<i64>, Option<String>, String)> = sqlx::query_as(
+        "SELECT run_id, task_id, agent_type FROM kanban_model_requests
+         WHERE agent_type = 'pseudo:project_analysis'",
+    )
+    .fetch_all(ctx.store.pool())
+    .await
+    .unwrap();
+    assert_eq!(rows.len(), 1, "无 run 行时请求也要落账：{rows:?}");
+    assert_eq!(rows[0].0, None, "没有 run 行可指时 run_id 为 NULL，不是 0");
+    assert_eq!(rows[0].1, None);
 }
 
 // ──────────────────── §6 执行器循环：单游标失败隔离 / join 恰一次（决策 89 / 107）────────────────────

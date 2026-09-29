@@ -428,9 +428,14 @@ async fn the_foreman_request_lands_under_its_session_not_a_placeholder_stage() {
 
 #[tokio::test]
 async fn a_project_analysis_request_without_any_owner_still_lands() {
-    // 项目分析那一次调用 `RunContext { run_id: 0, task_id: "" }`、也没有班次——两样归属都
-    // 没有，但它仍旧落账：没有归属不等于没有发生。这条也钉住「归一成 NULL 之后外键放行」
-    // （真写 0 会被外键拒掉，而拒掉时这条留痕只会打一条 warn 悄悄消失）。
+    // 项目分析的调用**在调用方没能落 run 行时**长这样：`RunContext { run_id: 0, task_id: "" }`、
+    // 也没有班次——两样归属都没有，但它仍旧落账：没有归属不等于没有发生。这条也钉住
+    // 「归一成 NULL 之后外键放行」（真写 0 会被外键拒掉，而拒掉时这条留痕只会打一条 warn
+    // 悄悄消失）。
+    //
+    // 决策 329 之后这是**兜底支**、不是常态：有 run 行时调用方把真 id 透下来，那几行挂得上
+    // run（见 `executor::project_analysis_merges_llm_summary_into_facts`）；哨兵归一这条规则
+    // 本身不变——正是它让这条兜底支不撞外键。
     let h = Harness::new().await;
     let llm = agentpipeline_core::agent::RecordingLlm::new(
         Arc::new(StubClient {

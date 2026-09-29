@@ -1105,6 +1105,24 @@ async fn project_creation_rejects_non_git_and_delete_refuses_active_tasks() {
 
     // 任务的写端点（cancel）后仍不活跃 → 可删
     post(&api, "/tasks/t1/cancel", serde_json::json!({})).await;
+    // 先留下一条项目分析行：它挂 `kanban_project_analyses.project_id`，是线上那次
+    // `FOREIGN KEY constraint failed`（code 787）的最后一道拦路者（决策 328）。
+    api.state.store.create_analysis(&project_id).await.unwrap();
+    // 磁盘产物的现场：一条真 worktree（`git worktree add` 建的，`.git` 是文件——
+    // 兜底删除只认这个标记）+ 一个任务目录（决策 328 的回收面）。
+    let worktree = api._home.home().worktree_path("t1");
+    let task_dir = api._home.home().task_dir("t1");
+    std::fs::create_dir_all(&task_dir).unwrap();
+    std::fs::write(task_dir.join("design.md"), "# 设计\n").unwrap();
+    api._repo.git(&[
+        "worktree",
+        "add",
+        "-b",
+        &agentpipeline_core::git::branch_name("t1"),
+        worktree.to_str().unwrap(),
+    ]);
+    assert!(worktree.join(".git").is_file(), "worktree 应真建起来");
+
     let (status, _) = call(
         &api,
         request("DELETE", &format!("/projects/{project_id}"))
@@ -1113,6 +1131,24 @@ async fn project_creation_rejects_non_git_and_delete_refuses_active_tasks() {
     )
     .await;
     assert_eq!(status, StatusCode::OK);
+    // 删完就查不到——级联把项目连同它的历史一起带走了（决策 328）
+    let (_, body) = get(&api, "/projects").await;
+    assert!(
+        body["projects"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|p| p["id"] != project_id.as_str()),
+        "已删项目不该还在列表里：{body}"
+    );
+    // 磁盘上也回收干净：worktree、它的分支、任务目录（决策 328 / §12.1）
+    assert!(!worktree.exists(), "worktree 目录该被回收");
+    assert!(
+        !api._repo
+            .branch_exists(&agentpipeline_core::git::branch_name("t1")),
+        "任务分支该被回收"
+    );
+    assert!(!task_dir.exists(), "任务目录该被回收");
 }
 
 #[tokio::test]
@@ -2916,6 +2952,24 @@ async fn analyze_merges_project_analysis_llm_summary_into_result() {
     // 决策 130 ②：项目级伪阶段计入全局 total_calls（非 system）
     let all = api.state.store.all_runs().await.unwrap();
     assert_eq!(agentpipeline_core::metrics::total_calls(&all), 1);
+
+    // 决策 329：这次分析的**请求台账**也挂在该项目级 run 上（路由把 run id 透了下去）。
+    // 修改前这三行请求的 run_id / session_id / task_id 全空——读不出是哪一次分析的调用，
+    // 删项目时也带不走。
+    let requests = api
+        .state
+        .store
+        .model_requests_for_run(runs[0].id, 10)
+        .await
+        .unwrap();
+    assert_eq!(
+        requests.len(),
+        1,
+        "这次分析的请求该按项目级 run 读得到：{requests:?}"
+    );
+    assert_eq!(requests[0].agent_type, "pseudo:project_analysis");
+    assert!(requests[0].task_id.is_none(), "项目级调用没有任务归属");
+    assert!(requests[0].session_id.is_none(), "也没有班次");
 }
 
 #[tokio::test]

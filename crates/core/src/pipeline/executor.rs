@@ -911,14 +911,18 @@ impl Executor {
         }
     }
 
-    /// 伪阶段·项目摘要（**外部 6 触点之一，冻结**）：签名与语义不动（app 路由在调），
-    /// 内部转发到模型调用编排片（决策 249 · 票 03）。
+    /// 伪阶段·项目摘要（**外部 6 触点之一**）：内部转发到模型调用编排片（决策 249 · 票 03）。
+    ///
+    /// **签名在决策 329 动过一次**（加了 `run_id`）——决策 249 冻结它的原话是「要改语义
+    /// **单开票**，不顺手改」，这次正是照那句话办的：单开了
+    /// `.scratch/project-delete-cascade/issues/02`，app 侧同一批改完，不是为了顺手。
     pub async fn project_analysis(
         &self,
         project: &Project,
         facts: serde_json::Value,
+        run_id: Option<i64>,
     ) -> Result<serde_json::Value> {
-        self.invoke().project_analysis(project, facts).await
+        self.invoke().project_analysis(project, facts, run_id).await
     }
 
     // ─────────────────────── join（决策 83 / 107 / G5）───────────────────────────────

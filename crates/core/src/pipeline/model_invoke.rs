@@ -1160,11 +1160,16 @@ impl ModelInvoke {
     /// project_analysis 伪阶段（decision 48 / 78 / 130）：确定性探测事实由调用方给出，
     /// 伪阶段只负责写人读摘要并标注可疑项，**合并**进分析结果。
     ///
-    /// 项目级调用没有 task / 游标，故不落 run 行（v1 的 app 接线由票 17/20 完成）。
+    /// `run_id` 是**调用方手里那条项目级 run**（决策 100 / 迁移 0004 之后它是一行真台账），
+    /// 透下去只为让这次调用在 `kanban_model_requests` 里归得了位（决策 329）：没有它，
+    /// 那几行请求的 `run_id` / `session_id` / `task_id` 全是空，读不出「哪一次分析的调用」，
+    /// 删项目时也够不着。`None` = 调用方没能落 run 行，那几行就保持无归属——没有对象可指，
+    /// 这是对的，不是漏。
     pub async fn project_analysis(
         &self,
         project: &Project,
         mut facts: serde_json::Value,
+        run_id: Option<i64>,
     ) -> Result<serde_json::Value> {
         let stage_cfg = self
             .store
@@ -1228,7 +1233,9 @@ impl ModelInvoke {
             run: Some(crate::agent::client::RunContext {
                 task_id: String::new(),
                 branch: String::new(),
-                run_id: 0,
+                // `0` 是既有的「没有 run 行」哨兵（`recording.rs` 归一成 NULL）；有真 run 时
+                // 落真 id，台账才归得了位（决策 329）。
+                run_id: run_id.unwrap_or(0),
                 agent_type: PseudoStage::ProjectAnalysis.agent_type().to_string(),
                 session_id: String::new(),
             }),
