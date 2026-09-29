@@ -679,6 +679,13 @@ fn build_subscriber(config: &Config, home: &Home) -> Box<dyn tracing::Subscriber
         None => None,
     };
 
+    // 决策 321：慢语句的存储水位伴随层（WAL / 磁盘剩余），三种格式共用一份观察。
+    let io_budget_layer =
+        crate::io_budget::SlowStatementLayer::new(home.db_path(), home.data_dir());
+
+    // 决策 321：观察层**最后注册**——分发按注册顺序，慢语句的现场伴随行必须排在
+    // 它所依附的那行 sqlx 告警**之后**（先输出、后观察，才不会把现场排到引用它的
+    // 那行前面）。
     match format {
         LogFormat::Json => Box::new(
             tracing_subscriber::registry()
@@ -695,7 +702,8 @@ fn build_subscriber(config: &Config, home: &Home) -> Box<dyn tracing::Subscriber
                         .with_ansi(false)
                         .event_format(JsonEvent)
                         .with_filter(filter())
-                })),
+                }))
+                .with(io_budget_layer),
         ),
         LogFormat::Compact => Box::new(
             tracing_subscriber::registry()
@@ -712,7 +720,8 @@ fn build_subscriber(config: &Config, home: &Home) -> Box<dyn tracing::Subscriber
                         .with_ansi(false)
                         .compact()
                         .with_filter(filter())
-                })),
+                }))
+                .with(io_budget_layer),
         ),
         LogFormat::Pretty => Box::new(
             tracing_subscriber::registry()
@@ -727,7 +736,8 @@ fn build_subscriber(config: &Config, home: &Home) -> Box<dyn tracing::Subscriber
                         .with_writer(f)
                         .with_ansi(false)
                         .with_filter(filter())
-                })),
+                }))
+                .with(io_budget_layer),
         ),
     }
 }

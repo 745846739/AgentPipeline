@@ -17,6 +17,7 @@ pub mod conflict;
 pub mod cursors;
 pub mod decisions;
 pub mod foreman;
+pub mod io_budget;
 pub mod market_repos;
 pub mod model_requests;
 pub mod notify_channel;
@@ -39,8 +40,8 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use chrono::{DateTime, Utc};
-use sqlx::sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions};
-use sqlx::SqlitePool;
+use sqlx::sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions, SqliteSynchronous};
+use sqlx::{Connection as _, Row as _, SqliteConnection, SqlitePool};
 
 use crate::clock::Clock;
 use crate::home::Home;
@@ -76,17 +77,17 @@ impl Store {
     /// 打开（必要时创建）家目录下的数据库并跑全量迁移。
     ///
     /// 真实行为优先：WAL + busy_timeout 都可测（决策 145）。
+    /// `synchronous = NORMAL`（决策 321）：WAL 模式下 FULL 的每一次 commit 都是一次
+    /// F_FULLFSYNC，而本库的常态写入是 250ms 节拍的在途行整行重写 + 心跳 + 台账
+    /// （决策 312① / 100 / 231），多 agent 并发时等于每秒多次全量刷盘——重负载日
+    /// 实测在慢语句日志里叠出 1–9s 的竞争带。NORMAL 只在 checkpoint 时 fsync，
+    /// 代价是掉电最多丢最近几笔已确认事务（应用不崩、库不损坏，重跑一个 tick 补回），
+    /// 对本机单用户开发管线可接受。判 `PRAGMA synchronous` = 1（L2）。
     pub async fn open(home: Home, clock: Arc<dyn Clock>) -> Result<Self> {
         home.ensure_dirs()?;
-        let options = SqliteConnectOptions::new()
-            .filename(home.db_path())
-            .create_if_missing(true)
-            .journal_mode(SqliteJournalMode::Wal)
-            .busy_timeout(Duration::from_secs(5))
-            .foreign_keys(true);
         let pool = SqlitePoolOptions::new()
             .max_connections(5)
-            .connect_with(options)
+            .connect_with(Self::connect_options(&home))
             .await?;
         Self::migrate(&pool).await?;
         // §12.14：db 与 WAL 伴生文件（可能含明文密钥）一律 0600；目录 0700。
@@ -124,8 +125,66 @@ impl Store {
         Ok(())
     }
 
+    /// 连接选项的唯一出处：主池（`open`）与维护连接（[`Self::maintenance_connection`]）
+    /// 必须同参——journal / synchronous / busy_timeout 两边不一致就是在制造两类连接。
+    fn connect_options(home: &Home) -> SqliteConnectOptions {
+        SqliteConnectOptions::new()
+            .filename(home.db_path())
+            .create_if_missing(true)
+            .journal_mode(SqliteJournalMode::Wal)
+            // 决策 321：NORMAL（含义与代价见 `open` 的文档）。
+            .synchronous(SqliteSynchronous::Normal)
+            .busy_timeout(Duration::from_secs(5))
+            .foreign_keys(true)
+    }
+
     pub fn pool(&self) -> &SqlitePool {
         &self.pool
+    }
+
+    /// 维护专用连接（决策 321）：每次开一条**不进主池**的独立连接。
+    ///
+    /// 为什么不借用主池：小时级维护的保留期 DELETE 在重负载日实测把主池（5 连接，
+    /// 上限就是并发写路径的总闸）整池拖进慢语句——326s 的 DELETE 期间慢 acquire
+    /// 叠到 24s。独立连接让「维护占线」与「主流程在写」两件事各自排队，互不借道。
+    /// 同参由 [`Self::connect_options`] 保证。
+    pub async fn maintenance_connection(&self) -> Result<SqliteConnection> {
+        Ok(SqliteConnection::connect_with(&Self::connect_options(&self.home)).await?)
+    }
+
+    /// WAL checkpoint（TRUNCATE，决策 321）：把 WAL 收缩回零，并把本次存储水位
+    /// （WAL / 库文件 / 磁盘剩余）打一行到 `storage::io_budget`。
+    ///
+    /// TRUNCATE 遇到还持着旧快照的读者时会以 `busy = 1` 放弃收缩——这是**如实上报**
+    /// 不是失败：WAL 无界增长（重负载 + 长读的实测形态）本身就是要被看见的信号，
+    /// 收缩不成功时水位行照样出，下一趟维护再试。
+    pub async fn checkpoint_wal(&self) -> Result<io_budget::CheckpointOutcome> {
+        let mut conn = self.maintenance_connection().await?;
+        let wal_before = io_budget::wal_bytes(&self.home.db_path());
+        let row = sqlx::query("PRAGMA wal_checkpoint(TRUNCATE)")
+            .fetch_one(&mut conn)
+            .await?;
+        let outcome = io_budget::CheckpointOutcome {
+            busy: row.try_get::<i64, _>(0).unwrap_or(1) != 0,
+            log_pages: row.try_get::<i64, _>(1).unwrap_or(0),
+            checkpointed_pages: row.try_get::<i64, _>(2).unwrap_or(0),
+            wal_bytes_before: wal_before,
+            wal_bytes_after: io_budget::wal_bytes(&self.home.db_path()),
+            db_bytes: io_budget::file_bytes(&self.home.db_path()),
+            disk_free_bytes: io_budget::disk_free_bytes(&self.home.data_dir()),
+        };
+        tracing::info!(
+            target: "storage::io_budget",
+            busy = outcome.busy,
+            log_pages = outcome.log_pages,
+            checkpointed_pages = outcome.checkpointed_pages,
+            wal_bytes_before = outcome.wal_bytes_before,
+            wal_bytes_after = outcome.wal_bytes_after,
+            db_bytes = outcome.db_bytes,
+            disk_free_bytes = outcome.disk_free_bytes,
+            "WAL checkpoint（TRUNCATE）+ 存储水位"
+        );
+        Ok(outcome)
     }
 
     /// 开启一个**写事务**（`BEGIN IMMEDIATE`）。

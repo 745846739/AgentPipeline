@@ -13,6 +13,7 @@
 //! - `api_key` 读接口只回显 `***`（决策 112）。
 
 pub mod assets;
+pub mod io_budget;
 pub mod lan;
 pub mod peer;
 pub mod routes;

@@ -11,6 +11,8 @@ anyhow.workspace = true
 chrono.workspace = true
 futures.workspace = true
 git2.workspace = true
+# 存储水位读数（决策 321）：statvfs 读磁盘剩余空间。
+libc.workspace = true
 regex.workspace = true
 reqwest.workspace = true
 schemars.workspace = true

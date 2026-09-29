@@ -38,4 +38,5 @@ mod repo_live;
 mod scheduler_tick;
 mod search;
 mod server_bind;
+mod storage_io_budget;
 mod web_fetch;

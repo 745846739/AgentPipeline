@@ -17,7 +17,9 @@ use crate::storage::attention::AttentionKind;
 use crate::storage::observability::is_timed_out;
 use crate::storage::tasks::DependencyState;
 use crate::storage::Store;
-use crate::types::{NodeRun, NodeStatus, PendingContext, PendingKind, PendingReason, ResumeCause, TaskStatus};
+use crate::types::{
+    NodeRun, NodeStatus, PendingContext, PendingKind, PendingReason, ResumeCause, TaskStatus,
+};
 use crate::Result;
 
 /// 超时自动续接的次数上限（决策 320，**写死不配**）：该节点连续超时 1–2 次时，
@@ -168,6 +170,17 @@ impl KanbanScheduler {
         // 待办表与其余各表**同一口径**的年龄清理（票 05）：同一个 cutoff，不做第二把尺。
         let purged_attention = self.store.purge_attention(cutoff).await?;
         let aggregated = self.aggregate_node_metrics().await?;
+        // 决策 321：清理走完即收缩 WAL 并打存储水位——WAL 无界增长与磁盘逼近满
+        // 都是慢写的上游信号，维护作业是它们的自然观测点。
+        let checkpoint = self.store.checkpoint_wal().await?;
+        tracing::info!(
+            purged_conversations = purged,
+            wal_busy = checkpoint.busy,
+            wal_bytes_before = checkpoint.wal_bytes_before,
+            wal_bytes_after = checkpoint.wal_bytes_after,
+            disk_free_bytes = checkpoint.disk_free_bytes,
+            "小时级维护收口：保留期清理 + WAL checkpoint + 水位"
+        );
         Ok(MaintenanceReport {
             purged_conversations: purged,
             expired_foreman_proposals: expired_proposals,
@@ -934,6 +947,9 @@ impl KanbanScheduler {
     // ─────────────────────── 小时级维护 ───────────────────────
 
     async fn purge_expired_conversations(&self) -> Result<usize> {
+        // 决策 321：保留期 DELETE 走**维护专用连接**，不占主池——重负载日实测这条
+        // DELETE 在主池里把整池拖进慢语句（326s 期间慢 acquire 叠到 24s）。
+        let mut conn = self.store.maintenance_connection().await?;
         let cutoff =
             self.clock.now() - Duration::days(self.settings.conversation_retention_days as i64);
         let purged = sqlx::query(
@@ -942,7 +958,7 @@ impl KanbanScheduler {
                AND created_at < ?",
         )
         .bind(crate::storage::ts(cutoff))
-        .execute(self.store.pool())
+        .execute(&mut conn)
         .await?
         .rows_affected();
         Ok(purged as usize)

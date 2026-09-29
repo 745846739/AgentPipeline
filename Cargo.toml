@@ -46,6 +46,9 @@ tower = { version = "0.5", features = ["util"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 ulid = "1"
+# 存储水位读数用（决策 321）：statvfs 拿磁盘剩余空间。libc 已在依赖树里
+# （sqlite / tokio 的传递依赖），提为直接依赖不加编译成本。
+libc = "0.2"
 # 技能包（zip）解码（票 09）：**只用它读，不用它写**，故关掉默认特性集
 # （aes-crypto / bzip2 / zstd / lzma / ppmd / time 全是为压缩与加密准备的，本票用不到）。
 # 保留 deflate——`zip -r` 的默认压缩方法，用户上传的包几乎都是它；
