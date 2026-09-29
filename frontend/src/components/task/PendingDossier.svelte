@@ -4,6 +4,7 @@
   import { pendingLabel } from '../../lib/pipeline';
   import PendingActions from '../board/PendingActions.svelte';
   import Sprite from '../render/Sprite.svelte';
+  import MarkdownView from '../render/MarkdownView.svelte';
   import DiffReviewPanel from './DiffReviewPanel.svelte';
   import ReviewForm from './ReviewForm.svelte';
   interface Props {
@@ -82,7 +83,9 @@
 </script>
 
 {#snippet infoBlock()}
-  <div class="msg">{reason.message}</div>
+  <!-- 阻塞原因照对讲台的回话待遇渲染（票 05 of talk-live-identity）：作者是模型 /
+       后端生成，markdown 符号会出现，纯文本插值只会把 `**` 原样吐给人。 -->
+  <div class="msg"><MarkdownView source={reason.message} /></div>
 
   {#if conflicts.length > 0}
     <div class="ctx">
@@ -292,8 +295,9 @@
     overflow: auto;
     padding-bottom: 4px; /* 不压住右下角的 ▼ */
   }
+  /* 阻塞原因的容器（票 05 of talk-live-identity）：正文交给 MarkdownView 的 `md` 排版，
+     这里只留间距与折行——纯文本时代的字色档随 `.msg` 插值一起退场。 */
   .msg {
-    color: var(--text-hi);
     margin-bottom: 9px;
     overflow-wrap: anywhere;
   }
@@ -346,7 +350,6 @@
     overflow: auto;
   }
   .dock .msg {
-    color: var(--text-hi);
     line-height: 1.7;
     margin-bottom: 7px;
     overflow-wrap: anywhere;

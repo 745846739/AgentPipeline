@@ -713,10 +713,11 @@ describe('值守台账（ledgerKind = watch）：名牌与占位句按账本类�
 });
 
 /**
- * 快照与直播的**拼接**（票 02）：在途半截行是基准，直播只摆 `seq > seq0` 的尾巴。
+ * 快照与直播的**拼接**（票 02）：在途半截行是基准，直播只接 `seq > seq0` 的尾巴。
  *
- * 「中途刷新」那条用户诉求的下半边：上半边（前半段完整可见）由半截行自己渲染，
- * 这一组钉的是两半**拼起来不重不漏**——判据在 `realtime/foreman.test.ts::spliceAccepts`
+ * 「中途刷新」那条用户诉求的下半边（票 02 of talk-live-identity 起改判）：半截行**不再
+ * 单独成轮**——它从台账位置摘出，与尾巴**拼成一条 live 轮**（渲染键就是行 id），
+ * 「回来接上」的形态与「本机在发」不可区分。判据在 `realtime/foreman.test.ts::spliceAccepts`
  * （三支各有单测），这里钉它们接到时间线上的样子。
  */
 describe('快照与直播的拼接：在途半截行是基准（票 02）', () => {
@@ -729,7 +730,7 @@ describe('快照与直播的拼接：在途半截行是基准（票 02）', () =
       created_at: '2026-09-23T10:02:00Z',
     });
 
-  it('半截行摆前半段、直播只摆 seq > seq0 的尾巴：不重不漏', () => {
+  it('半截行与尾巴拼成一条 live 轮（键 = 行 id）：seq0 之前的字不重复', () => {
     const stream = streamOf({
       // 到达时**不筛**（筛在渲染时按基准做）——两件事都攒着，正是这条判据的输入
       events: [
@@ -747,21 +748,16 @@ describe('快照与直播的拼接：在途半截行是基准（票 02）', () =
       }),
     );
 
-    const landed = turns.find((t) => t.key === 'm5');
-    expect(landed?.content, '前半段在快照那一行里').toBe('快照里已有的半句');
-
-    const live = turns.find((t) => t.key === 'live');
-    expect(live, '尾巴非空：另起一轮接着说').toBeTruthy();
-    expect(live?.content, 'seq0 之前的字不许在尾巴里再出现一遍').toBe('之后才说的字');
-    expect(live?.steps, '尾巴里也没有快照已有的步骤').toEqual([]);
-
-    // 合起来：两半各说各的，全文不丢字
-    const joined = turns.map((t) => t.content).join('\n');
-    expect(joined).toContain('快照里已有的半句');
-    expect(joined).toContain('之后才说的字');
+    // 半截行从台账位置摘出：不再有落地式的 m5，只有一条拼好的轮，键沿用行 id
+    expect(turns.filter((t) => t.kind !== 'mine').map((t) => t.key)).toEqual(['m5']);
+    const live = turns.find((t) => t.key === 'm5');
+    expect(live?.kind).toBe('fm');
+    expect(live?.streaming).toBe(true);
+    // content = 已落库的正文 + 快照之后的增量，全文不丢字、不重复
+    expect(live?.content).toBe('快照里已有的半句之后才说的字');
   });
 
-  it('尾巴为空：不摆占位句那一轮——半截行自己就是此刻的状态', () => {
+  it('尾巴为空且流没亮：半截行照落地式渲染，不摆占位句那一轮', () => {
     const stream = streamOf({
       events: [{ kind: 'delta', channel: 'content', text: '快照里已有的半句', ledger_id: 5, seq: 12 }],
       steps: [textStep('快照里已有的半句')],
@@ -782,6 +778,80 @@ describe('快照与直播的拼接：在途半截行是基准（票 02）', () =
     const turns = buildTurns(inputOf({ session: sessionOf([message()]), following: true, stream }));
     const live = turns.find((t) => t.key === 'live');
     expect(live?.content).toBe('整条流');
+  });
+
+  it('尾巴里有工具：已落库的正文定格成「中途说的话」，回话位让给工具后的新话', () => {
+    // 刷库形状（foreman.rs::LiveState）：content 列是**这一次调用**正在冒的正文；
+    // 工具收场后它挪进段序、下一次调用的正文从空处长出来——拼接据此分岔。
+    const stream = streamOf({
+      events: [
+        { kind: 'tool', tool: 'read_task', args_summary: 't-1', phase: 'end', ledger_id: 5, seq: 13 },
+        { kind: 'delta', channel: 'content', text: '查到了，结论是…', ledger_id: 5, seq: 14 },
+      ],
+      streaming: true,
+    });
+    const turns = buildTurns(
+      inputOf({ session: sessionOf([half()]), following: true, stream }),
+    );
+
+    const live = turns.find((t) => t.key === 'm5');
+    expect(live?.content, '回话位是工具之后的新话').toBe('查到了，结论是…');
+    expect(
+      live?.steps.map((s) => s.kind),
+      '已落库的半句在中途话的位置，工具照排',
+    ).toEqual(['text', 'tool']);
+  });
+
+  it('快照里已收场的段序进前缀：拼接轮的步骤序 = 落地段序 + 尾巴', () => {
+    const stream = streamOf({
+      events: [{ kind: 'delta', channel: 'content', text: '接着冒的字', ledger_id: 5, seq: 13 }],
+      streaming: true,
+    });
+    const turns = buildTurns(
+      inputOf({
+        session: sessionOf([
+          message({
+            id: 5,
+            status: 'in_flight',
+            content: '已落库的半句',
+            seq: 12,
+            segments: [{ kind: 'thinking', text: '想过什么' }],
+          }),
+        ]),
+        following: true,
+        stream,
+      }),
+    );
+
+    const live = turns.find((t) => t.key === 'm5');
+    expect(live?.steps.map((s) => s.kind)).toEqual(['thinking']);
+    expect(live?.steps[0]?.text).toBe('想过什么');
+    expect(live?.content).toBe('已落库的半句接着冒的字');
+  });
+});
+
+/**
+ * 乐观轮去重（票 02 of talk-live-identity）：POST 在途时返回的快照里**已经有 user 行**，
+ * 乐观轮再摆一遍就是同一句话说两遍——台账里已有同文一句时让位。
+ */
+describe('乐观轮与台账 user 行的去重（票 02 of talk-live-identity）', () => {
+  it('台账里已有同文的一句：乐观轮退场', () => {
+    const turns = buildTurns(
+      inputOf({
+        session: sessionOf([message({ id: 4, role: 'user', kind: 'mine', content: '同一句' })]),
+        pendingText: '同一句',
+        sending: true,
+      }),
+    );
+    expect(turns.filter((t) => t.kind === 'mine')).toHaveLength(1);
+    expect(turns.some((t) => t.key === 'pending')).toBe(false);
+  });
+
+  it('台账里没有这句（正常发送途中的快照）：乐观轮照旧在', () => {
+    const turns = buildTurns(
+      inputOf({ pendingText: '新的一句', sending: true }),
+    );
+    expect(turns.some((t) => t.key === 'pending' && t.content === '新的一句')).toBe(true);
   });
 });
 

@@ -84,6 +84,8 @@ function reset(id: string | null = null): void {
   talk.sending = false;
   talk.resetLive();
   talk.foreign = { bySession: {} };
+  talk.queue = {};
+  talk.queueHeld = {};
   talk.sessionId = id;
 }
 
@@ -284,5 +286,85 @@ describe('增量闸门与收口（决策 260 的三支）', () => {
     talk.sending = true;
     talk.syncFollowing(payload({ messages: [row(1)], turn_in_flight: true }));
     expect(talk.followingSince, '本机这一趟的收尾归 send() 管').toBeNull();
+  });
+});
+
+/**
+ * 接上路径点亮流式 + 排队发送（票 02 / 04 of talk-live-identity，2026-09-29 决议）。
+ *
+ * 前者钉「接上的一轮形态与发送中不可区分」的引擎那一半（`streaming` 只有 `send()`
+ * 一个点火点，是「假流断」的根因）；后者钉队列的三条纪律：按班次分列、死轮扣住、
+ * 值守轮不触发出队（出队效果在组件里，store 只管账）。
+ */
+describe('接上点亮流式（票 02 of talk-live-identity）', () => {
+  it('刷新后接上：syncFollowing 立锚那一刻 streaming 点亮', () => {
+    reset(SESSION);
+    expect(talk.stream.streaming).toBe(false);
+    talk.syncFollowing(payload({ messages: [row(1), inflight(2)], turn_in_flight: true }));
+    expect(talk.followingSince).toBe(2);
+    expect(talk.stream.streaming, '光标 / ticker / 贴底跟随全挂在这枚旗上').toBe(true);
+  });
+
+  it('落地收口：现场退场（streaming 归假）；紧跟着又起一轮则重新点亮', () => {
+    reset(SESSION);
+    talk.followingSince = 2;
+    talk.stream = { ...beginForemanStream(), streaming: true };
+    talk.syncFollowing(payload({ messages: [row(1), row(2)], turn_in_flight: false }));
+    expect(talk.stream.streaming).toBe(false);
+
+    talk.syncFollowing(payload({ messages: [row(1), row(2), inflight(3)], turn_in_flight: true }));
+    expect(talk.followingSince, '新那一轮重新立锚').toBe(3);
+    expect(talk.stream.streaming, '新那一轮照旧点亮').toBe(true);
+  });
+
+  it('本地放弃后的无条件接手同样点亮（followAfterGiveUp）', () => {
+    reset(SESSION);
+    talk.followAfterGiveUp(7);
+    expect(talk.followingSince).toBe(7);
+    expect(talk.stream.streaming).toBe(true);
+  });
+});
+
+describe('排队发送（票 04 of talk-live-identity）', () => {
+  it('入队 / 出队：先进先出，取完回 null', () => {
+    reset(SESSION);
+    talk.enqueue(SESSION, '第一句');
+    talk.enqueue(SESSION, '第二句');
+    expect(talk.takeQueued(SESSION)).toBe('第一句');
+    expect(talk.takeQueued(SESSION)).toBe('第二句');
+    expect(talk.takeQueued(SESSION)).toBeNull();
+  });
+
+  it('队列**按班次分列**：排进甲班的话不许被乙班取走（决策 204⑥ 的队列版）', () => {
+    reset(SESSION);
+    talk.enqueue(SESSION, '甲班的话');
+    talk.enqueue('sess-2', '乙班的话');
+    expect(talk.takeQueued('sess-2')).toBe('乙班的话');
+    expect(talk.takeQueued(SESSION)).toBe('甲班的话');
+  });
+
+  it('就地编辑与撤回', () => {
+    reset(SESSION);
+    talk.enqueue(SESSION, '原话');
+    talk.enqueue(SESSION, '另一句');
+    talk.editQueued(SESSION, 0, '改过的话');
+    expect(talk.queue[SESSION]).toEqual(['改过的话', '另一句']);
+    talk.removeQueued(SESSION, 0);
+    expect(talk.queue[SESSION]).toEqual(['另一句']);
+    // 越界 / 空文本编辑不动账
+    talk.editQueued(SESSION, 5, 'x');
+    expect(talk.queue[SESSION]).toEqual(['另一句']);
+  });
+
+  it('死轮：队列扣住（不自动照发），确认 / 清空两个出口', () => {
+    reset(SESSION);
+    talk.enqueue(SESSION, '排在后面的话');
+    talk.followingSince = 2;
+    talk.syncFollowing(payload({ messages: [row(1), inflight(2)], turn_in_flight: false }));
+    expect(talk.stream.error, '死轮照旧收成失败轮').toBe(FOREMAN_LOST_TURN_SUFFIX);
+    expect(talk.queueHeld[SESSION], '队列不许照发——「它不会再来」要人看见').toBe(true);
+
+    talk.setQueueHeld(SESSION, false);
+    expect(talk.queueHeld[SESSION]).toBe(false);
   });
 });

@@ -245,10 +245,20 @@ function liveStepsFrom(
   steps: ForemanLiveStep[],
   streaming: boolean,
 ): { steps: StepDraft[]; reply: string } {
-  const all = steps.map(stepFromLive);
-  const last = all[all.length - 1];
+  return trailReply(steps.map(stepFromLive), streaming);
+}
+
+/**
+ * 「末尾正文 = 回话」的判据本体（{@link liveStepsFrom} 与 {@link mergeInFlightSteps} 共用）：
+ * 最后一步是正文就把它提为回话，其余各步照排；流还亮着时给末尾那一步打上**正在攒**。
+ */
+function trailReply(
+  drafts: StepDraft[],
+  streaming: boolean,
+): { steps: StepDraft[]; reply: string } {
+  const last = drafts[drafts.length - 1];
   const reply = last && last.kind === 'text' ? last.text : '';
-  const rest = reply ? all.slice(0, -1) : all;
+  const rest = reply ? drafts.slice(0, -1) : drafts;
   // 末尾那一步是**正在攒**的那一步（流还在动）：推理的摘要因此说「正在想…」。
   const tail = rest[rest.length - 1];
   if (streaming && tail) rest[rest.length - 1] = { ...tail, live: true };
@@ -266,6 +276,52 @@ function inFlightBase(
 ): { id: number; seq: number } | null {
   const row = messages.find((m) => m.status === 'in_flight');
   return row ? { id: row.id, seq: row.seq ?? 0 } : null;
+}
+
+/** {@link buildTurns} 里拼半截行要的那几列（与 {@link inFlightBase} 的行同一行）。 */
+type InFlightRow = Parameters<typeof landedSteps>[0] & {
+  id: number;
+  status?: string | null;
+  content: string;
+};
+
+/**
+ * 在途半截行与直播尾巴**拼成一条轮**（票 02 of talk-live-identity）。
+ *
+ * 此前半截行按落地式渲染（思考收起、正文走半截 markdown）、尾巴单独成一条 live 轮，
+ * 「回来接上」的形态于是与「本机在发」对不上。拼法（判据来自后端
+ * `foreman.rs::LiveState` 的刷库形状）：
+ *
+ * - 半截行的 `segments` / `thinking` / `traces` 是**已收场**的步骤 → 前缀；
+ * - 半截行的 `content` 列是**正在冒的那一次调用的正文**（收场时挪进段序或被权威值
+ *   换掉，不是累计值）→ 它接在前缀之后、作为「正在说的那一句」的开头；
+ * - 尾巴里排在**第一条工具 / 推理之前**的正文增量，是同一句话的继续 → 并进 content；
+ *   一旦遇到工具或新调用的推理，那段正文就定格成「中途说过的话」，此后各步照排。
+ *
+ * 末尾正文 = 回话的判据与 {@link liveStepsFrom} 同一套，直接复用。
+ */
+function mergeInFlightSteps(
+  baseRow: InFlightRow,
+  tailDrafts: StepDraft[],
+  streaming: boolean,
+): { steps: StepDraft[]; reply: string } {
+  const drafts: StepDraft[] = [...landedSteps(baseRow)];
+  let utterance = baseRow.content ?? '';
+  let i = 0;
+  while (i < tailDrafts.length && tailDrafts[i].kind === 'text') {
+    utterance += tailDrafts[i].text;
+    i += 1;
+  }
+  if (i < tailDrafts.length) {
+    // 后面还有工具 / 推理接上来：已落库的那段正文此刻定格成「中途说过的话」
+    if (utterance.trim()) {
+      drafts.push({ kind: 'text', text: utterance, tool: null, live: false });
+    }
+    drafts.push(...tailDrafts.slice(i));
+    return trailReply(drafts, streaming);
+  }
+  // 没有工具 / 推理接上来：这段正文（可能只有尾巴、可能只有已落库部分）就是回话位
+  return { steps: drafts, reply: utterance };
 }
 
 /** {@link buildTurns} 的四个响应式输入加一个回调——全都是平凡值，组件原样传入。 */
@@ -313,9 +369,22 @@ export function buildTurns(input: TalkTurnsInput): TurnView[] {
   const { session, pendingText, sending, following, stream, pairingNeeded } = input;
   const watchLedger = input.ledgerKind === 'watch';
   const messages = session?.messages ?? [];
+  // 拼接基准先算（票 02）：半截行要从台账行里**摘出来**、与尾巴拼成一条 live 轮，
+  // 不能既在台账位置落地式渲染一遍、又在末尾以 live 形态再来一遍。
+  const base = inFlightBase(messages);
+  const baseRow: InFlightRow | null =
+    base != null ? (messages.find((m) => m.id === base.id) ?? null) : null;
+  const tailSteps = base
+    ? foldForemanEvents(stream.events.filter((e) => spliceAccepts(e, base)))
+    : stream.steps;
+  // 只有「这一轮还活着」（有尾巴增量 / 流还亮着）才拼：死轮收口前的半截行没有直播可拼，
+  // 照落地式渲染（失败轮的说明随后由 stream.error 那条支补上）。
+  const mergeLive = baseRow != null && (tailSteps.length > 0 || stream.streaming);
   // 「提问之后人又开过口」的判据（决策 265③，纯派生）：最大 mine 行 id 大于该行 id。
   const maxMineId = messages.reduce((mx, m) => (m.kind === 'mine' && m.id > mx ? m.id : mx), 0);
-  const stamped: { view: TurnView; rank: number }[] = messages.map((m) => ({
+  const stamped: { view: TurnView; rank: number }[] = messages
+    .filter((m) => !(mergeLive && base != null && m.id === base.id))
+    .map((m) => ({
     // 排序与分类**同一处判定**（决策 252）：`kind` 是后端给的，界面不再各判一遍。
     // 提问轮与回话同为值班长那一轮的产物，同刻兜底与 `fm` 同档。
     rank: m.kind === 'mine' ? 0 : m.kind === 'fm' || m.kind === 'ask' ? 2 : 1,
@@ -368,7 +437,10 @@ export function buildTurns(input: TalkTurnsInput): TurnView[] {
   }
   stamped.sort((a, b) => (a.view.at === b.view.at ? a.rank - b.rank : a.view.at < b.view.at ? -1 : 1));
   const out: TurnView[] = stamped.map((s) => s.view);
-  if (pendingText) {
+  // 乐观轮去重（票 02 of talk-live-identity）：POST 在途时返回的快照里**已经有 user 行了**
+  // （后端先落 user 行再叫模型），此刻再摆乐观轮就是同一句话说两遍。台账里那句就是真相，
+  // 乐观轮退场——判据按内容比对，只在台账已有同文的一句时让位。
+  if (pendingText && !messages.some((m) => m.kind === 'mine' && m.content === pendingText)) {
     out.push({
       key: 'pending',
       kind: 'mine',
@@ -387,20 +459,20 @@ export function buildTurns(input: TalkTurnsInput): TurnView[] {
       interruptedAt: null,
     });
   }
-  // 在途半截行 = **拼接基准**（票 02）：直播那一段只渲染快照之后的尾巴（`seq > seq0`），
-  // 快照已经把 `seq <= seq0` 的字摆在上面那条在途行里了——再接一遍就是重复字。
-  // 没有在途行时基准为 `null`，判据整段放行，流怎么攒就怎么渲染（既有路径）。
-  const base = inFlightBase(messages);
-  const tailSteps = base
-    ? foldForemanEvents(stream.events.filter((e) => spliceAccepts(e, base)))
-    : stream.steps;
-  // 有在途行时**不摆占位句**：半截行本身就是「此刻说到哪了」，占位句会与它并排各说
-  // 一遍；尾巴长出来之前不另起一轮。没有在途行时条件与从前逐字一致。
-  const showLive = base ? tailSteps.length > 0 : sending || following || tailSteps.length > 0;
+  // 在途半截行**不再单独成轮**（票 02 of talk-live-identity）：它要么已拼进 live 轮
+  // （`mergeLive`，渲染键直接用行 id——收口后台账那一行同键接管，折叠态因此不用搬），
+  // 要么仍按落地式渲染在台账位置（死轮收口前）——后一种情形**不另摆占位句那一轮**
+  // （旧判据「有在途行时只看尾巴」的原口径）。没有在途行时条件与从前逐字一致。
+  const showLive =
+    mergeLive || (base == null && (sending || following || tailSteps.length > 0));
   if (showLive) {
-    const live = liveStepsFrom(tailSteps, stream.streaming);
+    const liveTurnKey = mergeLive && base != null ? `m${base.id}` : 'live';
+    const live =
+      mergeLive && baseRow != null
+        ? mergeInFlightSteps(baseRow, tailSteps.map(stepFromLive), stream.streaming)
+        : liveStepsFrom(tailSteps, stream.streaming);
     out.push({
-      key: 'live',
+      key: liveTurnKey,
       kind: 'fm',
       // 还没收到第一个增量时不摆空白：给一句"对面在动"的实情，光标说明还在流。
       // 值守账上的对面是**值守轮**（票 04）：没有人的那句话可接，占位句说的「正在跑」
@@ -409,7 +481,7 @@ export function buildTurns(input: TalkTurnsInput): TurnView[] {
       at: '',
       streaming: stream.streaming,
       partial: !stream.streaming && live.reply.length > 0,
-      steps: keyed(live.steps, 'live'),
+      steps: keyed(live.steps, liveTurnKey),
       briefing: null,
       needsPairing: false,
       proposal: null,

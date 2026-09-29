@@ -72,6 +72,72 @@ class TalkStore {
   pairingNeeded = $state(false);
 
   /**
+   * 排队发送的账（票 04 of talk-live-identity，2026-09-29 决议）：**按班次**各一列。
+   *
+   * 一轮在飞时输入坞解锁，发出即入队，当前轮收口后由在屏的那一页自动出队发送——
+   * 队列因此必须住 store（跨页面存活，与决策 275 同一判据），且**必须按班次分列**：
+   * 排在甲班的话不许在切到乙班收口时发进乙班（决策 204⑥ 的队列版）。
+   */
+  queue = $state<Record<string, string[]>>({});
+
+  /**
+   * 「上一轮没回来，排队的话扣住了」——按班次一记号（票 04）。
+   *
+   * 死轮 / 中断时队列**不自动照发**：把「它不会再来」的可见性留在人手里，
+   * 确认（清记号、恢复出队）或清空队列两个出口都在坞里。
+   */
+  queueHeld = $state<Record<string, boolean>>({});
+
+  /** 排队：入队（在飞时发出的话先住这里，不直接发）。 */
+  enqueue(sessionId: string, text: string): void {
+    this.queue = { ...this.queue, [sessionId]: [...(this.queue[sessionId] ?? []), text] };
+  }
+
+  /** 就地改一条排队的话（票 04：可见可编辑）。 */
+  editQueued(sessionId: string, index: number, text: string): void {
+    const list = this.queue[sessionId] ?? [];
+    if (index < 0 || index >= list.length) return;
+    const next = list.slice();
+    next[index] = text;
+    this.queue = { ...this.queue, [sessionId]: next };
+  }
+
+  /** 撤回一条排队的话（票 04：可见可撤回）。 */
+  removeQueued(sessionId: string, index: number): void {
+    const list = this.queue[sessionId] ?? [];
+    this.queue = {
+      ...this.queue,
+      [sessionId]: list.filter((_, i) => i !== index),
+    };
+  }
+
+  /** 出队：拿走最前面那条（收口后由在屏的那一页发出去）。 */
+  takeQueued(sessionId: string): string | null {
+    const list = this.queue[sessionId] ?? [];
+    if (list.length === 0) return null;
+    this.queue = { ...this.queue, [sessionId]: list.slice(1) };
+    return list[0];
+  }
+
+  /** 扣住 / 放行这一班的队列（死轮扣住，人确认后放行）。 */
+  setQueueHeld(sessionId: string, held: boolean): void {
+    this.queueHeld = { ...this.queueHeld, [sessionId]: held };
+  }
+
+  /**
+   * 折叠三表（票 03 of talk-live-identity）：工位回执 / 思考 / 工具详情的展开态。
+   *
+   * 自决策 301 的组件作用域搬进 store——它们描述的是**那一轮**，不是这一屏，页面来去
+   * 不该把它们重置（「本机发送中」与「回来接上」的形态差有一半就差在这）。键随轮稳定
+   * （台账轮锚 `m<id>`、在飞轮拼到半截行时直接用行 id），收口不再需要搬键；
+   * `live` 键只剩本机发送那一趟在用，收口接力照旧（`carryLive*Open`）。
+   * 不进 localStorage：跨页面存活、**不跨刷新**（决策 217 的边界一字不动）。
+   */
+  receiptOpen = $state<Record<string, boolean>>({});
+  thinkingOpen = $state<Record<string, boolean>>({});
+  toolOpen = $state<Record<string, boolean>>({});
+
+  /**
    * 「别的班次正在回话」（决策 220③）。住在 store 里而不是页面里：它说的是**此刻**，
    * 而此刻不因为你去看了一眼看板就不作数（断流/落地两条收口仍在，见 `onStatus` 与
    * `pruneForeign`）。
@@ -281,6 +347,7 @@ class TalkStore {
     if (anchor === null) {
       if (payload.turn_in_flight) {
         this.followingSince = maxLedgerId(payload.messages ?? []);
+        this.lightStreaming();
         this.startSentinel();
       } else if (this.stream.events.length > 0 || this.stream.steps.length > 0) {
         // 没在跟、服务端也没在跑：手里攒的直播是**上一轮的残渣**（收场发生在这一屏
@@ -297,6 +364,9 @@ class TalkStore {
     if (outcome.kind === 'lost') {
       this.stream = failForemanStream(this.stream, FOREMAN_LOST_TURN_SUFFIX);
       this.ledgerEpoch += 1;
+      // 队列扣住（票 04 of talk-live-identity）：上一轮没回来，排在后面的话**不自动照发**
+      // ——把「它不会再来」留在人手里，确认或清空两个出口都在坞里。
+      if (this.sessionId) this.setQueueHeld(this.sessionId, true);
       this.recalibrate?.();
       return;
     }
@@ -311,6 +381,7 @@ class TalkStore {
     // 锚点按它落库后的台账重记。
     if (payload.turn_in_flight) {
       this.followingSince = maxLedgerId(payload.messages ?? []);
+      this.lightStreaming();
       this.startSentinel();
     }
     // 请**在屏的那一页**重读一次台账：落地那一刻那一行才会进这一屏。页面不在就不喊
@@ -330,7 +401,22 @@ class TalkStore {
    */
   followAfterGiveUp(anchor: number): void {
     this.followingSince = anchor;
+    this.lightStreaming();
     this.startSentinel();
+  }
+
+  /**
+   * 把 `stream.streaming` 点亮（票 02 of talk-live-identity）。
+   *
+   * 「接上的一轮」此前永远点不亮它——全仓唯一写 `streaming: true` 的是
+   * `beginForemanStream()`，只有 `send()` 那条路会走。而一切挂在 `streaming` 上的形态
+   * （光标、「正在想」ticker、贴底跟随、`partial` 不误报「流断了」）接上之后全部退化。
+   * 接手即点亮：**接上路径的形态要与「本机在发」不可区分**。已点亮时返回同一个对象，
+   * 不白触发依赖它的效果。
+   */
+  private lightStreaming(): void {
+    if (this.stream.streaming) return;
+    this.stream = { ...this.stream, streaming: true };
   }
 }
 

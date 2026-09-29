@@ -174,7 +174,7 @@
    * 决策 217①）。
    *
    * **回话中允许换班次**（决策 220②）：那把 `sending || busy` 的 UI 锁撤掉了——它只是第三层
-   * 自保（前两层是 `appendForemanEvent` 的班次守卫与 `send()` 里的 `generation` 比对）。
+   * 自保（前两层是 `appendForemanEvent` 的班次守卫与 `send()` 里的 `talk.sessionId` 比对，票 01）。
    * 「那一轮回话去哪了」改由班次列表里的两枚标记说：**正在回话**与**有新动静**
    * （判据在 `lib/talkSessions.ts` 与 `realtime/foreman.ts`）。
    *
@@ -251,11 +251,12 @@
    */
   const currentId = $derived(talk.sessionId);
   /**
-   * 世代记号：**每次「屏幕上换了班次」就 +1**（切换 / 新建 / 重读时发现服务端换了班）。
-   * 在途的 send 结果比对这个记号，不符即丢弃（决策 204⑥）——手机与电脑同时连着时，
-   * 别班的回话不得落进这一班的活动轮。
+   * 「在途回包是谁的」不再有组件本地记号（票 01 of talk-live-identity，显式修订决策
+   * 204⑥ 的实现载体的那一半，语义不变）：原先的 `generation` 随组件销毁重建，而**在飞的
+   * `send()` 活得过换页**——回来后 generation 归零，回包被误判成「切走了」，现场整段
+   * 倒掉、已发的话永远留在输入框里。现在裁判只有一位：store 的 `sessionId`。每个 await
+   * 之后比对「发起时认下的目标 ≠ `talk.sessionId` 即丢弃」，`reload()` 与 `send()` 同一条纪律。
    */
-  let generation = $state(0);
   /** 班次操作（改名 / 归档）对话框；`null` = 关着。 */
   let dialog = $state<'rename' | 'archive' | null>(null);
   /** 改名输入框的草稿。 */
@@ -335,49 +336,28 @@
    * 使用者手动展开的那一轮会被打回收起——这正是决策 218② 这条最容易写坏的地方。
    * 没记过的 key 走默认：折行档收起、桌面照旧展开（决策 182 的纪律只在折行档反转）。
    * 跨刷新不记忆（与决策 217 的折叠态口径一致：折叠态不进 URL / localStorage）。
+   *
+   * **三张表自票 03 of talk-live-identity 起住在 store**（`talk.receiptOpen` 等）：
+   * 展开态描述的是**那一轮**、不是这一屏——组件作用域的话，切页回来全被重置成默认态
+   * （「回来方式就不对」的另一半）。键随轮稳定：台账轮锚 `m<id>`；在飞轮拼到半截行时
+   * 渲染键就是行 id，收口后台账那一行同键接管，不再需要搬键。跨页面存活、不跨刷新。
    */
-  let receiptOpen = $state<Record<string, boolean>>({});
   /** 工具回执标签（`GET /foreman/tools`，取数一次缓存，决策 247⑤）。空表 = 还没回来，原样显示工具名。 */
   let toolLabels = $state<Record<string, string>>({});
-  const receiptIsOpen = (key: string) => receiptOpen[key] ?? !folded;
-
-  /**
-   * 「它想了什么」折叠块的展开态，按 `turn.key` 记（决策 244）。
-   *
-   * **与工位回执分开一份、且两边默认值相反**：回执是这一轮结论的出处（桌面默认展开），
-   * 而思考是**过程的草稿**——长会话里它往往比回话本身长一个量级，默认展开会把时间线
-   * 冲垮。故它**两档都默认收起**，人想看再点开。
-   *
-   * 受控的理由与 `receiptOpen` 逐字相同：`<details open>` 交给浏览器管的话，
-   * 流式增量反复重渲染同一轮时会把使用者手动展开的那一块打回收起。
-   */
-  let thinkingOpen = $state<Record<string, boolean>>({});
-  const thinkingIsOpen = (key: string) => thinkingOpen[key] ?? false;
+  const receiptIsOpen = (key: string) => talk.receiptOpen[key] ?? !folded;
+  const thinkingIsOpen = (key: string) => talk.thinkingOpen[key] ?? false;
+  const toolIsOpen = (key: string) => talk.toolOpen[key] ?? false;
 
   function toggleThinking(e: MouseEvent, key: string) {
     // 阻止默认的 `open` 翻转，改由状态说了算（与 `toggleReceipt` 同一手法）。
     e.preventDefault();
-    thinkingOpen = { ...thinkingOpen, [key]: !thinkingIsOpen(key) };
+    talk.thinkingOpen = { ...talk.thinkingOpen, [key]: !thinkingIsOpen(key) };
   }
-
-  /**
-   * 工具那一步的展开态，按 `step.key` 记（决策 301）。
-   *
-   * **两档都默认收起**（ZCode 的口径）：收起行已经把「谁、查什么、成没成」说全了，完整参数
-   * 与结果是排查时才要的深度——默认摊开会让一次长查读把时间线撑成终端日志。受控的理由与
-   * `receiptOpen` / `thinkingOpen` 逐字相同：流式增量反复重渲染同一轮时，人手动展开的那一步
-   * 不该被打回收起。
-   *
-   * 展开体的正文只有**展开时**才进 DOM（模板里那道 `{#if}`）：收起行因此与从前逐字一致，
-   * 参数原串也不会在每一轮收起状态下白占 DOM。
-   */
-  let toolOpen = $state<Record<string, boolean>>({});
-  const toolIsOpen = (key: string) => toolOpen[key] ?? false;
 
   function toggleTool(e: MouseEvent, key: string) {
     // 与 `toggleThinking` / `toggleReceipt` 同一手法：默认的 `open` 翻转由状态接管。
     e.preventDefault();
-    toolOpen = { ...toolOpen, [key]: !toolIsOpen(key) };
+    talk.toolOpen = { ...talk.toolOpen, [key]: !toolIsOpen(key) };
   }
 
   /** 每个 pending 任务的详情（allowed_actions 只在详情里下发，决策 101）。 */
@@ -557,15 +537,12 @@
   const timelineEmpty = $derived(!(loading && !session) && turns.length === 0);
 
   /**
-   * 重读班次列表与某个班次的台账。
+   * 重读班次列表与某个班次的台账（守卫与落点语义的完整说明在函数本体上——
+   * 两块注释被 `loadAttention` 隔开是既有排版）。
    *
    * `want` 三态：不给 = 接着看当前这一班；给 id = 切过去；给 `null` = 回到服务端默认
    * （最近活动的未归档班次）。指定的班次不在了（别的设备归档了它、或这个 id 本来就不存在）
    * 时**回落到默认**而不是报错——切班次的地方没有出错这一说，只有「去最近有人说话的那一班」。
-   *
-   * 落点与原先不同时 `generation + 1`：在途的 send 结果就此作废（决策 204⑥）。
-   * 这一条同时覆盖了「另一台设备把当前班次归档了」那条被动路径——它不在「发送中禁止切换」
-   * 那把 UI 锁的覆盖范围内。
    */
   /**
    * 读未消费待办（决策 307，票 06）。
@@ -584,13 +561,36 @@
     }
   }
 
+  /**
+   * 重读班次列表与某个班次的台账。
+   *
+   * `want` 三态：不给 = 接着看当前这一班；给 id = 切过去；给 `null` = 回到服务端默认
+   * （最近活动的未归档班次）。指定的班次不在了（别的设备归档了它、或这个 id 本来就不存在）
+   * 时**回落到默认**而不是报错——切班次的地方没有出错这一说，只有「去最近有人说话的那一班」。
+   *
+   * **过期回包守卫**（票 01 of talk-live-identity，决策 204⑥ 的 reload 版）：给过显式
+   * `want` 的那一趟，进门前先把落点认下来（`talk.watch`——守卫的锚与落点同一格），
+   * 此后**每个 await 之后**比对「目标 ≠ `talk.sessionId` 即整包丢弃」：不写 `session`、
+   * 不 watch、不改地址、不收口。没有这道比对，切班次之前发出的那一趟回来会把整屏
+   * 拖回旧班次——这正是「对讲台出现非本次会话的内容」的根因（并发 reload 是常态：
+   * 挂载装载、代次重读、重连校准、可见性恢复都走这里）。不带 `want` 的续读以当下的
+   * `talk.sessionId` 为锚，同一纪律。
+   *
+   * 落点与发起时不同（指定的班次不在了、回落默认）：`talk.watch(landed)` 那一步自会把
+   * 身份换过去，在途的 send 结果由它自己的比对作废——决策 204⑥ 的语义不变。
+   */
   async function reload(want?: string | null): Promise<boolean> {
+    const wanted = want === undefined ? talk.sessionId : want;
+    if (want !== undefined) talk.watch(wanted ?? null);
     try {
       // 两本账各读各的（票 04 / 决策 286）：`?kind=` 缺省只回人的班次，值守账要显式要。
       // 「指定的 id 不在这一班的列表里」因此按账本各自判——把 talk 的 id 递到值守账
       // （或反过来，刷新后的 localStorage 兜底就是这条路径）回落到本账的默认落点。
       const list = await getForemanSessions(undefined, ledgerKind, showArchived);
-      const target = want === undefined ? currentId : want;
+      // 过期回包守卫第一道（票 01）：这一趟之间换班了（`talk.watch` 已被别的路径改口），
+      // 后面的整包作废——不写 session、不改地址。
+      if (talk.sessionId !== wanted) return false;
+      const target = wanted;
       // 「找得到」多认一种（票 06）：**已经在读的那一班**——归档开关关着时它不在
       // 列表里，但人正看着它，把人弹去默认班才是错。只宽这一种：地址 / 兜底文件指到
       // 一班**没加载的**归档班，照旧回落默认（决策 204⑥：指定的不在列表里 → 去最近
@@ -600,6 +600,9 @@
         (list.sessions.some((s) => s.id === target) ||
           target === (session?.session?.id ?? null));
       const payload = await getForemanSession(known ? target : null, undefined, ledgerKind);
+      // 守卫第二道（票 01）：`talk.sessionId` 已经不是进门前认下的那一班——这一包是
+      // 旧目标的台账，整包丢弃。
+      if (talk.sessionId !== wanted) return false;
       sessionList = list.sessions;
       const landed = payload.session?.id ?? null;
       // 同一班的重读（台账代次那一声，一轮落地后常见）：**已在屏的更早段留着**——
@@ -614,7 +617,6 @@
       session = payload;
       // 首屏读满才有「更上一层」可言；同一班重读也按这一拍重算（台账可能长过了 500）。
       hasMoreEarlier = fresh.length >= SESSION_PAGE_LIMIT;
-      if (landed !== currentId) generation += 1;
       talk.watch(landed);
       rememberLanding(landed, payload.session);
       // 重新接上一轮（决策 260 / 275）：服务端说这一班此刻有一轮在跑，而本机没在等它
@@ -651,7 +653,7 @@
       hasMoreEarlier = false;
       return;
     }
-    const gen = generation;
+    const gen = talk.sessionId;
     const el = timelineEl;
     const prevHeight = el?.scrollHeight ?? 0;
     const prevTop = el?.scrollTop ?? 0;
@@ -659,8 +661,8 @@
     try {
       const page = await getForemanSession(currentId, undefined, ledgerKind, oldest);
       // 这一趟之间换班 / 重读了：这一段是对着旧台账取的，接上去就是串台（决策 204⑥
-      // 同一条纪律——await 之后比对记号，不符即丢）。
-      if (gen !== generation) return;
+      // 同一条纪律——await 之后比对记号，不符即丢；记号自票 01 起是 store 的 `sessionId`）。
+      if (gen !== talk.sessionId) return;
       const older = page.messages ?? [];
       if (older.length === 0) {
         hasMoreEarlier = false;
@@ -754,10 +756,11 @@
    *
    * **回话中也可以切**（决策 220②）：那把 `sending || busy` 的锁撤掉了。它只是「别让你把
    * 正在等的那句回话弄丢」的**第三层**自保——前两层是 `appendForemanEvent` 的班次守卫
-   * （增量串台）与 `send()` 里每个 await 之后的 `generation` 比对（回包串台），那两层一步没动。
+   * （增量串台）与 `send()` 里每个 await 之后的 `talk.sessionId` 比对（回包串台，票 01），
+   * 那两层一步没动。
    * 切走之后「那一轮回话去哪了」改由班次列表里的两枚标记说清楚（决策 220③）。
    *
-   * 切走时那一轮从视野里撤下（`resetSessionState` + `send()` 的 `gen !== generation` 分支），
+   * 切走时那一轮从视野里撤下（`resetSessionState` + `send()` 的 sessionId 不符分支），
    * 但**回话照旧落台账**，回来就能看到完整的（决策 220⑤；切进一条正在回话的班次会先看到
    * 回话的后半截，落地后 `reload()` 补齐——这一条也别当 bug 修）。
    *
@@ -766,8 +769,8 @@
    */
   async function switchTo(id: string, opts: { write?: boolean } = {}) {
     if (id === currentId) return;
-    generation += 1;
-    // 先认下这件事再写地址：地址一变，下面那个 `$effect` 会拿新值来比——认下了才不重复装载
+    // 先认下这件事再写地址：地址一变，下面那个 `$effect` 会拿新值来比——认下了才不重复装载。
+    // 认下这一步同时就是在途回包的作废记号（票 01）：此后每个 await 的比对都以它为准。
     talk.watch(id);
     if (opts.write) writeQuery({ session: id });
     resetSessionState();
@@ -778,11 +781,18 @@
    * 台账代次（决策 275）：store 说「这一份台账可能已经变了」就重读一次。
    *
    * 要它，是因为一轮的收尾**可能发生在页面之外**（切走之后那一趟 POST 才回来），而那时
-   * 在屏的这一页读的仍是旧台账——代次是那一趟收尾留给这一屏的那一声。首屏不接（代次为 0，
-   * 第一次装载归 onMount，别装载两遍）。
+   * 在屏的这一页读的仍是旧台账——代次是那一趟收尾留给这一屏的那一声。
+   *
+   * **基线是「本页见过的代次」而不是 0**（票 01 of talk-live-identity）：代次住在 store、
+   * 只增不清零（决策 275 让它跨页面存活），旧判据 `epoch === 0` 在跑完过一轮收口之后
+   * 永不成立——于是每次挂载都会与 onMount 的装载并发发一枪，两趟 reload 各写各的，
+   * 正是串台的温床。挂载那一刻的当下值就是基线：本页没见过的增量才重读，挂载首读
+   * 只归 onMount 那一趟。
    */
+  let seenEpoch = talk.ledgerEpoch;
   $effect(() => {
-    if (talk.ledgerEpoch === 0) return;
+    if (talk.ledgerEpoch === seenEpoch) return;
+    seenEpoch = talk.ledgerEpoch;
     void reload();
   });
 
@@ -809,7 +819,6 @@
   async function openFreshSession(opts: { push?: boolean } = {}) {
     const created = await createForemanSession();
     sessionList = [created.session, ...sessionList];
-    generation += 1;
     resetSessionState();
     // 同 `switchTo`：先把落点认下来，再写地址（用户按的那一颗 push，归档后的自动开新班不写——
     // 地址的落点由随后的 `reload` 用 replaceState 规范化）
@@ -871,7 +880,6 @@
     try {
       await archiveForemanSession(id);
       dialog = null;
-      generation += 1;
       resetSessionState();
       const list = await getForemanSessions(undefined, ledgerKind, showArchived);
       sessionList = list.sessions;
@@ -993,14 +1001,19 @@
       talk.watchDraft = null;
       void tick().then(() => typerField?.focus());
     }
-    // 地址权威、localStorage 兜底（决策 217④）：「我一直在看这一班」不该因为从看板点回来而重置
+    // 地址权威、localStorage 兜底（决策 217④）：「我一直在看这一班」不该因为从看板点回来而重置。
+    // 装载目标在发请求**之前**就认进 store（票 01）：reload 的过期回包守卫拿它当锚，
+    // 而 store 里的 `sessionId` 可能还是上一页留下的旧值——不先认下，首读就会被守卫误杀。
+    // 值守账的落点（没有 ?session= 时）由 reload 落地后认下，这里只认地址/兜底给的那个。
     seen = loadSeen();
+    const initialWant = urlSession ?? loadSessionId() ?? undefined;
+    if (initialWant !== undefined || talk.sessionId === null) talk.watch(initialWant ?? null);
     // 回执标签取一次（模块级缓存，之后别的页签再挂载不再发第二跳）。失败**不打断对话**：
     // 缓存不记失败（下一次挂载会重试），期间回执原样显示工具名——英文原名好过一个错词。
     void loadToolLabels()
       .then((l) => (toolLabels = l))
       .catch(() => {});
-    void reload(urlSession ?? loadSessionId() ?? undefined);
+    void reload(initialWant);
     // 流归 store（决策 275）：那条 `/foreman/stream` 连接与在飞一轮的现场都活在页面之外，
     // 切页面再回来时「本轮已经收到的输出」还在。这里只**登记**「重连成功后补一次全量」
     // 的入口（票 03，stream-self-heal：SSE 无回放，不补就得切走再切回来才对齐）——
@@ -1172,18 +1185,19 @@
    * `autoCollapseKey` + `userInteracted` 是同一件事的两面。判据全在 `lib/talkTurns.ts`。
    */
   let liveSeen = false;
-  let liveGen = -1;
+  /** 在飞轮在屏时认下的那一班（票 01：换班判据从 `generation` 换成 store 的 `sessionId`）。 */
+  let liveSid: string | null = null;
 
   $effect(() => {
     const list = turns;
     if (list.some((t) => t.key === 'live')) {
       liveSeen = true;
-      liveGen = untrack(() => generation);
+      liveSid = untrack(() => talk.sessionId);
       return;
     }
     if (!liveSeen) return;
     // 换班了：这点折叠态属于已经不显示的那一班（与决策 204⑥ 同一条纪律），就地作废。
-    if (liveGen !== untrack(() => generation)) {
+    if (liveSid !== untrack(() => talk.sessionId)) {
       liveSeen = false;
       return;
     }
@@ -1192,9 +1206,11 @@
     const landed = settlingTurn(list);
     if (!landed) return;
     liveSeen = false;
-    thinkingOpen = carryLiveStepOpen(thinkingOpen, landed.key);
-    toolOpen = carryLiveStepOpen(toolOpen, landed.key);
-    receiptOpen = carryLiveTurnOpen(receiptOpen, landed.key);
+    // 拼到半截行上的在飞轮（渲染键 = 行 id）**不需要搬**：收口后台账那一行同键接管；
+    // 只有本机发送那条路（键 `'live'`）才要这一跳（票 03 of talk-live-identity）。
+    talk.thinkingOpen = carryLiveStepOpen(talk.thinkingOpen, landed.key);
+    talk.toolOpen = carryLiveStepOpen(talk.toolOpen, landed.key);
+    talk.receiptOpen = carryLiveTurnOpen(talk.receiptOpen, landed.key);
   });
 
   /**
@@ -1251,7 +1267,7 @@
    */
   function toggleReceipt(event: MouseEvent, key: string) {
     event.preventDefault();
-    receiptOpen = { ...receiptOpen, [key]: !receiptIsOpen(key) };
+    talk.receiptOpen = { ...talk.receiptOpen, [key]: !receiptIsOpen(key) };
   }
 
   /**
@@ -1270,24 +1286,36 @@
   }
 
   /**
-   * 说一句话。
+   * 说一句话（坞的入口）。
    *
-   * **先确定班次，再发话**：这台机器上一个班次都没有时（首启空 home 的第一次说话），
-   * 客户端自己先开一个——若让它落到服务端的缺省逻辑上，回话的流式增量带的班次 id
-   * 是回来之后才知道的，而此刻增量已经在路上了，会被班次守卫挡掉（字还在，只是白流一场）。
-   *
-   * 每个 await 之后都比对 `generation`：这一班的回包不落到另一班的屏幕上（决策 204⑥）。
-   * 比对不通过时**连乐观轮一起撤**——它属于已经不显示的那一班。
+   * **在飞时不再拦第二句——排队**（票 04 of talk-live-identity，2026-09-29 决议，
+   * 显式修订决策 182㉓「一轮没落地就发不出第二句」）：一轮在飞时发出的句子进**发送
+   * 队列**（按班次分列、住 store），当前轮收口后由下面的出队效果自动发出；
+   * 死轮 / 中断时队列扣住（store 的 `queueHeld`），等坞里的两个出口。
    */
+  function send() {
+    const text = input.trim();
+    if (!text) return;
+    const sid = currentId;
+    const running = talk.sending || Boolean(session?.turn_in_flight) || talk.followingSince !== null;
+    if (running && sid) {
+      talk.enqueue(sid, text);
+      input = '';
+      return;
+    }
+    input = '';
+    void sendNow(text);
+  }
+
   /**
    * 选项点选 = 把选项文本当作下一条 user 消息发回（决策 265⑤：既有写口、零新端点）。
    * 乐观轮、配对闸、落地哨全部走 `send()` 既有那套——这里只负责把 `input` 填上。
    * 已答 / 发送在途时按钮本身是禁用的，这里再拦一道（防连点）。
    */
   function answerAsk(option: string) {
-    if (sending) return;
+    if (talk.sending) return;
     input = option;
-    void send();
+    send();
   }
 
   /**
@@ -1320,9 +1348,65 @@
     }
   }
 
-  async function send() {
-    const text = input.trim();
-    if (!text || sending) return;
+  /**
+   * 队列的出队口（票 04）：空闲 + 台账说没有在跑的轮 + 队列没扣住时，把最前面那条
+   * 交给 {@link sendNow}。住在**在屏的这一页**而不是 store：发送要开乐观轮、要写
+   * 这一屏的输入框状态，页面不在屏时队列等着——回来那一次装载本就会把出队效果点燃。
+   *
+   * 值守轮到达**不触发出队**：这条效果只由「发送态归零」点亮，值守轮的增量走
+   * `noteForeignDelta` 那一条账，两不相干。
+   */
+  $effect(() => {
+    const sid = talk.sessionId;
+    if (!sid || watchMode || archivedOpen) return;
+    if (talk.sending || session?.turn_in_flight || talk.followingSince !== null) return;
+    if (talk.queueHeld[sid]) return;
+    const next = talk.queue[sid]?.[0];
+    if (!next) return;
+    talk.takeQueued(sid);
+    void sendNow(next);
+  });
+
+  /** 「上一轮没回来」之后人按了确认：放行队列（下面的出队效果自会接手）。 */
+  function resumeQueue() {
+    if (currentId) talk.setQueueHeld(currentId, false);
+  }
+
+  /** 人放弃整条队列：清空 + 撤扣住记号。 */
+  function clearQueue() {
+    const sid = currentId;
+    if (!sid) return;
+    talk.queue = { ...talk.queue, [sid]: [] };
+    talk.setQueueHeld(sid, false);
+  }
+
+  /** 排队条的就地编辑态（票 04）：正在改第几条 + 草稿。 */
+  let qedit = $state<number | null>(null);
+  let qdraft = $state('');
+
+  /** 提交一条排队话的编辑：空文本视作撤回原样保留（真要删用「撤回」）。 */
+  function commitQueueEdit(index: number) {
+    const sid = currentId;
+    if (sid && qedit === index) {
+      const text = qdraft.trim();
+      if (text) talk.editQueued(sid, index, text);
+    }
+    qedit = null;
+  }
+
+  /**
+   * 真正发一句话（`send()` 与出队效果共用；`text` 已是调用方拿定的一句话）。
+   *
+   * **先确定班次，再发话**：这台机器上一个班次都没有时（首启空 home 的第一次说话），
+   * 客户端自己先开一个——若让它落到服务端的缺省逻辑上，回话的流式增量带的班次 id
+   * 是回来之后才知道的，而此刻增量已经在路上了，会被班次守卫挡掉（字还在，只是白流一场）。
+   *
+   * 每个 await 之后都比对 `talk.sessionId`（票 01，决策 204⑥）：这一班的回包不落到
+   * 另一班的屏幕上。比对不通过时**连乐观轮一起撤**——它属于已经不显示的那一班。
+   * 失败时把那句话送回输入框（框还空着的话）：决策 182㉓ 的「失败不改输入框」
+   * 在队列化之后的形态。
+   */
+  async function sendNow(text: string) {
     // **发话就是一次回底**（决策 301）：人自己按下的那一句必须看得见——他可能正往上翻
     // 历史，若把这一轮也交给「贴在底上才跟」那条判据，他发完话屏幕上什么都没动，
     // 只会以为没发出去。故这一档与「回底钮」同级：无条件恢复跟随，再由下面那条效果滚过去。
@@ -1340,22 +1424,22 @@
     // 「这一次是本地等不到回包」那一类（决策 223）——在 catch 里趁 `ApiError` 还在手判好，
     // `finally` 里要用（它决定那条本地失败轮退不退场，见下）。缺省假：成功那一趟用不到它。
     let timedOut = false;
-    let gen = generation;
-    let sid = currentId;
+    const originSid = talk.sessionId;
+    let sid = originSid;
     try {
       if (!sid) {
         const created = await createForemanSession();
-        if (gen !== generation) return;
+        // 这一趟之间换班了（票 01）：开出来的空班作废——它的 id 没进台账、没有回话，
+        // 静默丢弃即可（乐观轮由 catch 的统一收尾撤掉）。
+        if (talk.sessionId !== originSid) return;
         sid = created.session.id;
         talk.watch(sid);
         sessionList = [created.session, ...sessionList];
-        // 这是**我们自己**开的班，不算「换班」：重取记号，免得下面每一步都判成过期。
-        gen = generation;
       }
       // 「本机发出且未落地」（决策 220③）：切走之后这枚标记要落在**它**那一行上
       sendingSid = sid;
       const res = await sendForemanMessage(text, sid);
-      if (gen !== generation) {
+      if (talk.sessionId !== sid) {
         // 切走了：这一轮从这一屏撤下（决策 220⑤），但回话已经落地——列表要跟上，
         // 否则「原班次有新动静」永远等不到（这一支在放开切换之后是**常态路径**）。
         // 「落地即熄灭」在这里同样要办：这一班的增量此前被记进了「别的班次在回话」那张映射
@@ -1368,15 +1452,16 @@
       }
       // 回话是权威值：先收敛流式文本（重取台账期间不闪空），再以台账覆盖
       talk.stream = settleForemanStream(talk.stream, res.reply);
-      input = '';
       // 重取之后**无条件收掉这两样本地状态**：它们是「这一轮」的东西，而重取可能发现
       // 服务端已经把我们换到了另一班（另一台设备归档了它）。那种情况下留着乐观轮，
       // 它就会挂在**另一班的**时间线上——正是决策 204⑥ 要挡的串台。
       if (await reload(sid)) talk.settleTurn();
     } catch (err) {
-      // 失败不改输入框内容：后端在叫模型之前已把 user 行落库，人改几个字就能重发
-      // （决策 182㉓）。失败以时间线里的一轮呈现——不弹窗、不 toast。
-      if (gen !== generation) {
+      // 失败把那句话送回输入框（框空着时）：后端在叫模型之前已把 user 行落库的话，
+      // 台账那一行会与回框的话并存——重读后乐观轮按同文去重退场（票 02）。
+      // 失败以时间线里的一轮呈现——不弹窗、不 toast。
+      if (!input.trim()) input = text;
+      if (talk.sessionId !== (sid ?? originSid)) {
         talk.settleTurn();
         void refreshSessionList();
         return;
@@ -1980,8 +2065,11 @@
             ⏸ 急停{first ? '（等你拍板的阻塞）' : ''} · {pendingLabel(task.pending_reason)}
           </div>
           <p>
-            「{task.title}」走到 {task.current_stage}，{task.pending_reason?.message ?? '需要你决定'}。
+            「{task.title}」走到 {task.current_stage}：
           </p>
+          <!-- 阻塞原因照回话待遇渲染（票 05 of talk-live-identity）——diagnose 类原因里
+               带 run id / 反引号路径是常态。 -->
+          <MarkdownView source={task.pending_reason?.message ?? '需要你决定。'} />
           <div class="ctx">
             状态：<b>{task.status}</b> ▪ 已跑 {formatDuration(taskDuration(task))} ▪
             <Gauge tokens={task.total_tokens} tone="warn" /> {formatTokens(task.total_tokens)} tok
@@ -2135,7 +2223,9 @@
             {proposalShortLabel(p, now)} · {proposalToolLabel(p, toolLabels)}
             {#if st === 'pending'}· <span class="pleft">{proposalRemainingLabel(p, now)}</span>{/if}
           </div>
-          <p>{p.summary}</p>
+          <!-- 摘要与提问同值班长回话的待遇（票 05 of talk-live-identity）：作者是模型，
+               「它不写 markdown」是无法执行的纪律——原样插值只会把 `**` 与反引号吐给人。 -->
+          <MarkdownView source={p.summary} />
           {#if p.stopped_round}
             <!-- 来路（决策 294 / 票 09）：这一条提在一轮**被按停**的话里——那一轮的结论是
                  半截的，按之前值得多看一眼。与「过期只让按钮变灰」同一条口径：不改它能不能按，
@@ -2226,9 +2316,10 @@
           <!-- 模型的收口话照常显示（工具指示叫它别复述问题，但短收口是它的自由）；
                问题本身以**结构化字段**为准——两处不互相解析。 -->
           {#if turn.content.trim()}
-            <p>{turn.content}</p>
+            <MarkdownView source={turn.content} />
           {/if}
-          <p class="ask-q">{turn.ask.question}</p>
+          <!-- 问题本体照回话待遇渲染（票 05 of talk-live-identity，同一条纪律）。 -->
+          <div class="ask-q"><MarkdownView source={turn.ask.question} /></div>
           {#if !watchMode}
             <div class="aopts">
               {#each turn.ask.options as option}
@@ -2382,9 +2473,12 @@
             <p class="streaming">{turn.content}</p>
           {:else if turn.kind === 'fm'}
             <MarkdownView source={turn.content} class="reply" />
+          {:else if turn.kind === 'console' && turn.content}
+            <!-- 操作台记的账照值班长的待遇渲染（票 05 of talk-live-identity）：它是
+                 后端生成给人读的话，反引号 / 列表同样会出现。传输层的失败报文**不渲染**
+                 ——那是协议原文，符号拿去做强调会把一句实话画歪（决策 274 的边界保留）。 -->
+            <MarkdownView source={turn.content} />
           {:else if turn.content}
-            <!-- 操作台记的账与传输层的失败报文**不渲染 md**：它们不是模型的排版输出
-                 （「发送失败：…」里的符号拿去做标题/强调会把一句实话画歪），原文照旧。 -->
             <p>{turn.content}</p>
           {/if}
 
@@ -2460,17 +2554,75 @@
       }}
     >
       <div class="dname">值班经理</div>
+      <!-- 排队发送（票 04 of talk-live-identity，显式修订决策 182㉓「一轮没落地就发不出
+           第二句」）：一轮在飞时输入框**解锁**，回车 / 按钮把话送进队列——队列条在下面，
+           可编辑可撤回；当前轮收口后自动发出。 -->
       <textarea
         class="input"
         rows="2"
         {placeholder}
         bind:value={input}
         bind:this={typerField}
-        disabled={sending}
         onkeydown={onKeydown}
         oncompositionstart={() => composing.start()}
         oncompositionend={() => composing.end()}
       ></textarea>
+      {#if currentId && ((talk.queue[currentId]?.length ?? 0) > 0 || talk.queueHeld[currentId])}
+        <!-- 排队条：按入队顺序，就地编辑、逐条撤回。扣住（上一轮没回来）时给两个出口，
+             不自动照发——「它不会再来」要人看见（票 04 的决议）。 -->
+        <ul class="qsend" data-queue={currentId}>
+          {#if talk.queueHeld[currentId]}
+            <li class="qrow held">
+              <span class="dim">
+                上一轮没有回来——排队的话等你确认再发（也可以清掉）。
+              </span>
+              <span class="qacts">
+                <button type="button" class="btn solid" onclick={resumeQueue}>继续发送</button>
+                <button type="button" class="btn quiet" onclick={clearQueue}>清空队列</button>
+              </span>
+            </li>
+          {/if}
+          {#each talk.queue[currentId] ?? [] as qtext, qi (qi)}
+            <li class="qrow">
+              {#if qedit === qi}
+                <input
+                  class="input qedit"
+                  bind:value={qdraft}
+                  maxlength={8000}
+                  onkeydown={(e) => {
+                    if (e.key === 'Enter' && !e.isComposing) {
+                      e.preventDefault();
+                      commitQueueEdit(qi);
+                    } else if (e.key === 'Escape') {
+                      qedit = null;
+                    }
+                  }}
+                  onblur={() => commitQueueEdit(qi)}
+                />
+              {:else}
+                <button
+                  type="button"
+                  class="qtext"
+                  title="点击编辑这条排队的话"
+                  onclick={() => {
+                    qedit = qi;
+                    qdraft = qtext;
+                  }}
+                >{qtext}</button>
+              {/if}
+              <span class="qacts">
+                <span class="dim">{qi === 0 ? '下一句' : `第 ${qi + 1} 句`}</span>
+                <button
+                  type="button"
+                  class="btn quiet"
+                  aria-label={`撤回第 ${qi + 1} 句`}
+                  onclick={() => currentId && talk.removeQueued(currentId, qi)}
+                >撤回</button>
+              </span>
+            </li>
+          {/each}
+        </ul>
+      {/if}
       <div class="typer-foot">
         <!-- 这一行**只剩传输层断线**这一件事（决策 218 修订 ⑤ / 220④）：
              - 「值班长正在回话…」**删掉**——流式尾随光标本就在说这件事（`.turn p.streaming`），
@@ -2489,9 +2641,8 @@
           <span class="dim hint ferr">按停没送到：{stopError}</span>
         {/if}
         {#if stopState !== 'hidden'}
-          <!-- 停钮（决策 294 / 票 09）：这一轮在飞时，**发送那颗钮的位置就是它**。
-               两颗钮从不同时可用——一轮没落地就发不出第二句（决策 182㉓），故这是换位
-               不是抢位；而同一格、同一尺寸让它对版面零影响（决策 282 实测的坞高不动）。
+          <!-- 停钮（决策 294 / 票 09）：这一轮在飞时它占发送钮的位置。排队发送（票 04）
+               之后两颗钮**可以同时在场**——框里有字时旁边多一颗「排队发送」；
                次级样式（`.quiet`）：按停不是破坏性动作——部分结论、它提的提议、
                已经烧掉的 token 都留着（决策 294），故刻意**不吃** `.danger`
                （决策 195 那一档留给删除/覆盖这类真会丢东西的动作）。 -->
@@ -2502,8 +2653,11 @@
             disabled={stopState === 'stopping'}
             onclick={() => void stopTurn()}
           >{stopButtonLabel(stopState)}</button>
+          {#if input.trim()}
+            <button type="submit" class="btn solid" data-send="queue">排队发送</button>
+          {/if}
         {:else}
-          <button type="submit" class="btn solid" disabled={sending || !input.trim()}>发送</button>
+          <button type="submit" class="btn solid" disabled={!input.trim()}>发送</button>
         {/if}
       </div>
       <!-- 回底钮**必须是坞的子元素**（决策 301）：它靠 `bottom: calc(100% + 8px)` 钉在坞的上沿，
@@ -3335,6 +3489,52 @@
   .typer-foot .hint {
     flex: 1;
     min-width: 0;
+  }
+  /* ── 排队条（票 04 of talk-live-identity）：ZCode 式排队发送的可见部分 ──
+     入队顺序自上而下，最前面那条是收口后下一句。占位形态贴 `.turn` 的对话框语汇：
+     细边框行、次级灰元信息，不新造颜色档（决策 169 / 200 的纪律）。 */
+  .qsend {
+    list-style: none;
+    margin: 6px 0 0;
+    padding: 0;
+    display: grid;
+    gap: 4px;
+  }
+  .qrow {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    padding: 4px 8px;
+    border: 2px solid var(--pane);
+    font-size: 12px;
+  }
+  .qrow.held {
+    border-color: var(--warn, var(--text-3));
+  }
+  .qrow .qtext {
+    flex: 1;
+    min-width: 0;
+    overflow: hidden;
+    text-align: left;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    color: var(--text-2);
+    cursor: text;
+  }
+  .qrow .qedit {
+    flex: 1;
+    min-width: 0;
+    font-size: 12px;
+  }
+  .qrow .qacts {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    flex-shrink: 0;
+  }
+  .qrow .qacts .btn {
+    padding: 2px 8px;
+    font-size: 12px;
   }
 
   /* ── 值班板（复用 .reg 台账盒语汇） ── */
