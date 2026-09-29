@@ -785,36 +785,42 @@ mod tests {
 
     #[test]
     fn pinning_keeps_the_same_target_without_rebuilding() {
-        use std::os::unix::fs::MetadataExt;
-
         let tmp = tempfile::tempdir().unwrap();
         let home = Home::new(tmp.path().join("home"));
         home.ensure_dirs().unwrap();
         let first = PathBuf::from("/bin/sh");
         let dir = pin(&home, &first).unwrap();
-        let inode = || {
-            std::fs::symlink_metadata(dir.join(SHIM_NAME))
-                .unwrap()
-                .ino()
-        };
-        let before = inode();
+        assert!(
+            shim_is_current(&dir, &resolved_path(&first)),
+            "同一目标应当就位（这条捷径就是「不重建」本身）"
+        );
         for _ in 0..3 {
             pin(&home, &first).unwrap();
         }
-        assert_eq!(before, inode(), "同一目标不该重建（重建会开一个空窗）");
+        // 三次重复钉之后仍是同一份（没被清掉重建）
+        assert!(
+            shim_is_current(&dir, &resolved_path(&first)),
+            "同一目标不该重建（重建会开一个空窗）"
+        );
 
         // 目标变了：该重建
         let second = PathBuf::from("/bin/ls");
         if second.exists() {
+            assert!(
+                !shim_is_current(&dir, &resolved_path(&second)),
+                "换了目标就不再是「已就位」——这正是重建的触发条件"
+            );
             pin(&home, &second).unwrap();
-            assert_ne!(before, inode(), "换了目标就得重建");
+            // 断链接指向（**不拿 inode 当代理**）：Linux 上「删掉旧链接再建一个」常复用
+            // 刚释放的 inode 号，`assert_ne!(inode)` 于是假红（2026-09-30 CI 实测），
+            // 而 `assert_eq!(inode)` 又会把「其实重建了」放过去——两边都不可信。
             // 比的是**解析后**的目标（`pin` 先 `canonicalize`）：`/bin/sh` 在 Linux 上是
-            // 指向 `/usr/bin/dash` 的符号链接、`/bin/ls` 同理——写死原路径的断言在
-            // macOS 上过、在 CI 的 Linux 上必红（2026-09-30 实测：CI 首跑红在这里）。
+            // 指向 `/usr/bin/dash` 的符号链接、`/bin/ls` 同理，写死原路径的断言在 macOS
+            // 上过、在 CI 的 Linux 上必红。
             assert_eq!(
                 std::fs::read_link(dir.join(SHIM_NAME)).unwrap(),
                 resolved_path(&second),
-                "链接必须指向解析后的目标"
+                "换了目标就得重建：链接必须指向解析后的新目标"
             );
         }
 
