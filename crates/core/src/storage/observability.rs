@@ -451,6 +451,38 @@ impl Store {
         Ok(count as u32)
     }
 
+    /// 该节点**从最新一条 run 往回连续是 timeout** 的条数（决策 320）。
+    ///
+    /// 超时自动续接的计数口：连续超时 1–2 次续接上一轮转录、第 3 次降级空白重跑、
+    /// 第 4 次起挂起交回人工。口径三处要注意：
+    /// - 只数**节点自身**的 run（`NODE_OWNING_AGENT_TYPES_SQL`，与
+    ///   [`Self::count_node_owning_runs`] 同一白名单）——子代理 / 伪阶段的 run
+    ///   复用父节点的 stage/node，混进来会把一次超时数成三次；
+    /// - 从最新往回走、撞到第一条**非 timeout** 终态就停：任何一次非超时的收场
+    ///   （成功 / 失败 / 人按停）都把连续计数清零，人对该节点的新一轮介入重新起算；
+    /// - `running` 也算撞墙（还没收场的 run 不属于任何一段连续超时）。
+    pub async fn trailing_timeout_streak(&self, task_id: &str, stage: Stage, node: Node) -> Result<u32> {
+        let rows: Vec<(String,)> = sqlx::query_as(&format!(
+            "SELECT status FROM kanban_node_runs
+             WHERE task_id = ? AND stage = ? AND node = ? AND agent_type IN ({})
+             ORDER BY id DESC LIMIT 64",
+            metrics::NODE_OWNING_AGENT_TYPES_SQL
+        ))
+        .bind(task_id)
+        .bind(stage.as_str())
+        .bind(node.as_str())
+        .fetch_all(self.pool())
+        .await?;
+        let mut streak: u32 = 0;
+        for (status,) in rows {
+            if status != NodeStatus::Timeout.as_str() {
+                break;
+            }
+            streak += 1;
+        }
+        Ok(streak)
+    }
+
     /// 全量 run 行：全局指标用。口径由 [`crate::metrics`] 的纯函数定义，
     /// 这里只取数、不在 SQL 里重算，避免「口径契约」在 SQL 与 Rust 之间漂移（决策 137）。
     pub async fn all_runs(&self) -> Result<Vec<NodeRun>> {

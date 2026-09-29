@@ -5805,3 +5805,189 @@ async fn unsticking_the_pending_cursor_shape_frees_the_owner_and_resume_runs() {
         "resume 之后真的重跑了"
     );
 }
+
+// ─────────────────── 超时重试的三段梯子（决策 320，票 timeout-continuation 01）───────────────────
+
+/// 奇数次调用正常回一个 tool_call，偶数次（每一轮 run 的第二次）永不返回。
+///
+/// 直接用 `PendingAgent`（第一次调用就挂）会让超时 run 的转录为空——初始 prompt 不在
+/// `trace.messages` 里，空转录的续接被 `take_continuation` 的「空转录不续」正确回退。
+/// 生产里被判超时的节点几乎总是已经干了活（工具轮、正文轮），这里的形状与之对齐：
+/// 每一轮都先真实执行一次工具、再停在一次不返回的调用上。
+struct ToolThenStall {
+    calls: Arc<AtomicUsize>,
+}
+
+impl LlmClient for ToolThenStall {
+    fn complete(
+        &self,
+        _request: LlmRequest,
+    ) -> BoxFuture<'static, agentpipeline_core::Result<AgentResponse>> {
+        let calls = self.calls.clone();
+        Box::pin(async move {
+            let n = calls.fetch_add(1, Ordering::SeqCst);
+            if n % 2 == 1 {
+                std::future::pending::<()>().await;
+                unreachable!();
+            }
+            Ok(AgentResponse {
+                content: None,
+                tool_calls: vec![agentpipeline_core::agent::client::ToolCall {
+                    id: format!("c{n}"),
+                    name: "read_file".into(),
+                    arguments: r#"{"path":"."}"#.into(),
+                }],
+                prompt_tokens: 7,
+                completion_tokens: 3,
+                ..Default::default()
+            })
+        })
+    }
+}
+
+/// 等执行体真的跑到 `architect-design.validate_input`（首个 agent 节点）并在跑。
+///
+/// [`wait_for_a_held_running_run`] 抓任务的第一条 active run——`init.execute`（纯代码
+/// 节点）完成得快但**不是零耗时**，起跑的一瞬可能先抓到它；超时续接的梯子只对 agent
+/// 节点成立（`take_continuation` 只在 agent 节点入口读），等待必须钉在同一个节点上。
+async fn wait_for_running_validate_input(ctx: &Ctx, task_id: &str) -> i64 {
+    tokio::time::timeout(Duration::from_secs(30), async {
+        loop {
+            let owned = ctx
+                .store
+                .get_task(task_id)
+                .await
+                .unwrap()
+                .executor_owner
+                .is_some();
+            let run = ctx
+                .store
+                .list_runs_at(task_id, Stage::ArchitectDesign, Node::ValidateInput)
+                .await
+                .unwrap()
+                .into_iter()
+                .find(|r| r.status == NodeStatus::Running);
+            if owned {
+                if let Some(run) = run {
+                    return run.id;
+                }
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .expect("执行体应当进行到 architect-design.validate_input")
+}
+
+/// 超时重试不再一律空白重跑（**显式修订决策 298 的超时支**）：形态由该节点**连续超时
+/// 的轮数**决定（写死不配）——连续 1–2 次自动续接上一轮转录（`continued_from_run_id`
+/// 落链，与手动「继续」同路）→ 第 3 次降级空白重跑 → 第 4 次起挂起 pending(timeout)
+/// 交回人工。
+///
+/// 全程用真执行体 + `PendingAgent`（每次模型调用都永不返回）：每一轮 run 都停在一次
+/// 不返回的调用上、被看门狗判超时、按中止请求收口（转录随之落库）——这正是 2026-09-19
+/// 那类现场。断言链：
+/// 1. run2 / run3 带 `continued_from_run_id`（指向前一条超时 run）——续接是真的；
+/// 2. run4 **不**带链接——空白重跑是真的；
+/// 3. run4 超时后游标 pending、原因 kind = timeout——止损交回人工是真的。
+#[tokio::test]
+async fn timeout_retry_ladder_continues_twice_then_blank_then_pending() {
+    let ctx = setup("true", Settings::default()).await;
+    testkit::seed_task(&ctx.store, "t-ladder", "p1").await.unwrap();
+    admit(&ctx, "t-ladder").await;
+    let scheduler = KanbanScheduler::new(
+        ctx.store.clone(),
+        Settings::default(),
+        Arc::new(ctx.clock.clone()),
+        Arc::new(ctx.killer.clone()),
+        Arc::new(ctx.sse.clone()),
+        Arc::new(|_| {}),
+    );
+
+    let llm_calls = Arc::new(AtomicUsize::new(0));
+    let mut prev_run: Option<i64> = None;
+    for round in 1..=4 {
+        let ex = Arc::new(Executor::new(
+            ctx.store.clone(),
+            Settings::default(),
+            Arc::new(ctx.sse.clone()),
+            Arc::new(ToolThenStall {
+                calls: llm_calls.clone(),
+            }),
+            Arc::new(ctx.killer.clone()),
+        ));
+        let jh = {
+            let ex = ex.clone();
+            tokio::spawn(async move { ex.run("t-ladder").await })
+        };
+        let run_id = wait_for_running_validate_input(&ctx, "t-ladder").await;
+        // 等这一轮**真的先干了活**再判超时：中止请求若抢在第一次工具轮写完转录之前落地，
+        // 这一轮的转录就是空的，下一轮按「空转录不续」回退成空白起跑——梯子形状就测不真了
+        // （实测约 1/3 概率的竞态）。ToolThenStall 每轮 call A 真跑工具、call B 停在不返回
+        // 的调用上；计数到 `2 * round` = call B 已进场，此刻转录必然非空、执行体必然停在
+        // 可被打断的 await 上。
+        tokio::time::timeout(Duration::from_secs(30), async {
+            while llm_calls.load(Ordering::SeqCst) < round as usize * 2 {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("每轮应当先真实跑完一次工具轮、停在第二次调用上");
+        // 心跳一次都没刷过 → 空闲超时判它终态（ManualClock 手动推进）
+        ctx.clock.advance_secs(400);
+        let report = scheduler.tick().await.unwrap();
+        assert!(
+            report.timed_out_runs.contains(&run_id),
+            "第 {round} 轮的 run 要被看门狗判超时：{:?}",
+            report.timed_out_runs
+        );
+        // 等执行体按中止请求收口——转录的落库（失败 attempt 照记会话行）在收口之前完成，
+        // 下一轮的续接才读得到它。
+        tokio::time::timeout(Duration::from_secs(30), jh)
+            .await
+            .expect("收口的执行体应当在有界时间内退出")
+            .unwrap()
+            .unwrap();
+
+        let row = ctx
+            .store
+            .get_run(run_id)
+            .await
+            .unwrap()
+            .expect("这条 run 应当在台账里");
+        match round {
+            1 => assert_eq!(
+                row.continued_from_run_id, None,
+                "第一轮是干净起跑"
+            ),
+            2 | 3 => assert_eq!(
+                row.continued_from_run_id,
+                prev_run,
+                "第 {round} 轮应当自动续接上一轮（continued_from_run_id 指向被续接的历史 run）"
+            ),
+            4 => assert_eq!(
+                row.continued_from_run_id, None,
+                "连续第 3 次超时降级空白重跑：run4 不得带续接链接"
+            ),
+            _ => unreachable!(),
+        }
+        prev_run = Some(run_id);
+    }
+
+    // run4 超时后（连续第 4 次）：挂起交回人工，不再起任何 run。
+    let cursor = ctx.store.load_live_cursors("t-ladder").await.unwrap()[0].clone();
+    let after = ctx.store.get_cursor(&cursor.cursor_id).await.unwrap();
+    assert_eq!(after.status, CursorStatus::Pending);
+    assert_eq!(
+        after.pending_reason.as_ref().unwrap().kind,
+        PendingKind::Timeout
+    );
+    let runs = ctx.store.list_runs("t-ladder").await.unwrap();
+    assert_eq!(
+        runs.iter()
+            .filter(|r| r.stage == Stage::ArchitectDesign && r.node == Node::ValidateInput)
+            .count(),
+        4,
+        "止损之后不得再自动起 run（init 的 system run 不算）：{runs:?}"
+    );
+}

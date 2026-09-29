@@ -150,6 +150,12 @@ static REGISTRY_GENERATION: AtomicU64 = AtomicU64::new(0);
 struct ExecutorGuard {
     task_id: String,
     generation: u64,
+    /// 自己这一格的取消信号（决策 320 修订）：执行体**持有**它而不是在每轮按名字重取。
+    /// `force_release` 摘走登记之后（决策 303），按名字取就取不到自己的观察点——
+    /// 旧执行体若正走在两轮之间，中止请求就此丢失，它停在下一个不返回的调用里
+    /// 再也出不来（转录不落库、会话行缺失）。持有之后，摘登记只影响「新执行体能不能
+    /// 进来」，不再影响「旧执行体还能不能被叫停」。
+    cancel: CancelSignal,
 }
 
 impl Drop for ExecutorGuard {
@@ -219,6 +225,29 @@ pub async fn release_ownership(store: &Store, task_id: &str) -> Result<bool> {
     Ok(had_executor)
 }
 
+/// **有界等在飞执行体自然退出**（决策 320 的顺序保证），界满即返回。
+///
+/// 判超时那一处在「发中止请求」与「摘登记交出执行权」之间调它：转录落库
+/// （`record_failed_attempt`）排在执行体退出**之前**，而超时续接的读
+/// （`take_continuation`）排在新执行体起来**之后**——中间不隔这一等，读就可能抢在写
+/// 前面，那一轮续接静默退化成空白起跑（原因列读-清一次，被白白消费掉）。
+///
+/// 只等得到**协作式收口**的那一类：停在不返回的同步调用里的执行体（决策 303 的现场）
+/// 到点也退不出来，界满返回，调用方照旧走 [`release_ownership`] 兜底——那份代价原样
+/// 保留，这里只是把「等得到」的常见情形排成确定的先后。
+pub async fn await_teardown(task_id: &str, bound: std::time::Duration) {
+    let deadline = tokio::time::Instant::now() + bound;
+    loop {
+        if !EXECUTOR_REGISTRY.lock().unwrap().contains_key(task_id) {
+            return; // 登记随 guard 落下：转录与 owner 都在此之前写完 / 清完
+        }
+        if tokio::time::Instant::now() >= deadline {
+            return;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+}
+
 /// 请求中止 `task_id` 正在跑的执行体（决策 226），返回「当时确实有一个在跑」。
 ///
 /// 存在的理由是一条实测：2026-09-19 任务 `01M2QH0DHKGSGNVHC0WT2Q4CG0` 的
@@ -262,24 +291,26 @@ fn request_cancel_with(task_id: &str, origin: CancelOrigin) -> bool {
 
 /// 人按停的请求已经发出吗（决策 276）——是的话，本轮结论**一个字都不许写台账**。
 ///
-/// 判据收在这一处（`run_inner` 只调它）：两个发出方共用一条通道，而**执行体只对
-/// `Hold` 让路**——判超时那一方（决策 226）自己已经处置过台账（重试流转 / 挂起），
-/// 让路反而会把另一条并行分支已完成的工作一起丢掉。
-pub(crate) fn held_by_human(task_id: &str) -> bool {
-    cancel_signal(task_id).is_some_and(|s| s.is_requested() && s.origin() == CancelOrigin::Hold)
+/// 判据收在这一处：两个发出方共用一条通道，而**执行体只对 `Hold` 让路**——判超时
+/// 那一方（决策 226）自己已经处置过台账（重试流转 / 挂起），让路反而会把另一条并行
+/// 分支已完成的工作一起丢掉。观察点是**执行体自己持有**的那份信号（决策 320 修订：
+/// 不再按名字重取，`force_release` 摘登记后按名字取会落空）。
+pub(crate) fn held_by_human_signal(cancel: &CancelSignal) -> bool {
+    cancel.is_requested() && cancel.origin() == CancelOrigin::Hold
 }
 
-/// 执行体侧取自己的观察点。取不到 = 进程内没有这一号登记（跨进程，或已被 `unstick` 摘走）
-/// ——此时没有中止通道可观察，照旧跑完。
-///
-/// **这一处是「按名字取」而不是「按代次取」**（代次只用在寄存那一格，见
-/// [`RegistryEntry`]），代价如实记：`force_release` 摘走登记之后，那个旧执行体若**正走在
-/// 两轮之间**，再取就取不到自己的观察点了——它那一次中止请求只对「当时已经停在 await 上」
-/// 的那一半有效（`notify_one` 已经把等待者唤醒）。两轮之间的那一半回到决策 210⑧ 记的老
-/// 样子（旧执行体可能继续跑到自己结束）。
-/// **判超时那条路自决策 303 起也摘登记**（原来只发请求）：它多担了上面这条代价，换来的是
-/// 「执行权不再依赖 `run_inner` 返回」——否则那个卡住的执行体永远锁着去重登记，任务只能靠
-/// 重启或 `unstick`，正是 2026-09-27 那次的形状（决策 226 原文的「只发请求」一句由 303 修订）。
+/// [`held_by_human_signal`] 的按名字形态：单元测试断言「登记里那一格被请求过」用。
+#[cfg(test)]
+pub(crate) fn held_by_human(task_id: &str) -> bool {
+    cancel_signal(task_id).is_some_and(|s| held_by_human_signal(&s))
+}
+
+/// 按名字取登记里的观察点。**只在测试里用**：决策 320 起，执行体的观察点是它
+/// `try_run` 时持有（guard 携带）的那份信号，生产路径不再按名字重取——按名字取在
+/// `force_release` 摘走登记之后会落空（跨进程 / 已被摘），旧执行体的中止请求就此丢失
+/// （它停在下一个不返回的调用里再也出不来，转录也不落库）。这曾经的「两轮之间丢失」
+/// 代价（决策 210⑧ 记的老样子）由持有制收掉；登记本身只剩「请求中止」与「去重」两职。
+#[cfg(test)]
 pub(crate) fn cancel_signal(task_id: &str) -> Option<CancelSignal> {
     EXECUTOR_REGISTRY
         .lock()
@@ -295,16 +326,18 @@ fn try_acquire(task_id: &str) -> Option<ExecutorGuard> {
         return None;
     }
     let generation = REGISTRY_GENERATION.fetch_add(1, Ordering::Relaxed);
+    let cancel = CancelSignal::default();
     registry.insert(
         task_id.to_string(),
         RegistryEntry {
             generation,
-            cancel: CancelSignal::default(),
+            cancel: cancel.clone(),
         },
     );
     Some(ExecutorGuard {
         task_id: task_id.to_string(),
         generation,
+        cancel,
     })
 }
 
@@ -395,14 +428,14 @@ impl Executor {
         if !self.store.try_claim_executor(task_id, &owner).await? {
             return Ok(false); // DB 乐观锁被占（跨进程场景），跳过
         }
-        let result = self.run_inner(task_id).await;
+        let result = self.run_inner(task_id, &_guard.cancel).await;
         self.store.release_executor(task_id).await?;
         result?;
         Ok(true)
     }
 
     /// 核心循环（§11.2 伪码）。
-    async fn run_inner(&self, task_id: &str) -> Result<()> {
+    async fn run_inner(&self, task_id: &str, cancel: &CancelSignal) -> Result<()> {
         loop {
             let task = self.store.get_task(task_id).await?;
             if task.status.is_terminal() {
@@ -444,7 +477,7 @@ impl Executor {
                 .map(move |c| {
                     let cursor = c.clone();
                     async move {
-                        let out = this.execute_node(task_ref, &cursor).await;
+                        let out = this.execute_node(task_ref, &cursor, cancel).await;
                         (cursor, out)
                     }
                 })
@@ -461,7 +494,7 @@ impl Executor {
             // 只认 `Hold`：判超时那条路（决策 226）**行为不变**——它自己已经处置过台账
             // （重试流转或挂起），而另一条并行分支若恰好在这一瞬跑完，那个结果照旧推进，
             // 不该被这一轮的中止连坐。
-            let held = held_by_human(task_id);
+            let held = held_by_human_signal(cancel);
             // 本轮的某个游标是否被「中止请求」收了口（决策 226）。
             let mut cancelled = false;
             for (cursor, outcome) in results {
@@ -615,7 +648,12 @@ impl Executor {
     // ─────────────────────── 节点分发 ───────────────────────
 
     /// 执行一个节点的"工作"部分，返回交给路由的结论。
-    async fn execute_node(&self, task: &Task, cursor: &NodeCursor) -> Result<NodeOutput> {
+    async fn execute_node(
+        &self,
+        task: &Task,
+        cursor: &NodeCursor,
+        cancel: &CancelSignal,
+    ) -> Result<NodeOutput> {
         let (stage, node) = (cursor.stage, cursor.node);
         match (stage, node) {
             // ── 纯代码节点（G7；决策 99/114：同样落 run 行，agent_type = system）──
@@ -635,7 +673,7 @@ impl Executor {
             (Stage::Review, Node::ValidateOutput) => self.review_verdict(task, cursor).await,
 
             // ── agent 节点 ──
-            _ => self.invoke().agent_node(task, cursor).await,
+            _ => self.invoke().agent_node(task, cursor, Some(cancel)).await,
         }
     }
 

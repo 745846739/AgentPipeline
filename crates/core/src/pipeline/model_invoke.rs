@@ -39,7 +39,7 @@ use crate::types::{
 use crate::{Error, Result};
 
 use super::executor::{
-    cancel_signal, emit_node_started, emit_tool_event, finish_run_with_sse, project_or_err,
+    emit_node_started, emit_tool_event, finish_run_with_sse, project_or_err,
     CancelSignal, NodeOutput, OUTPUT_CODE_CHANGES, OUTPUT_DESIGN_DOC, OUTPUT_DEV_DOC,
     OUTPUT_REVIEW_REPORT, OUTPUT_TEST_REPORT, OUTPUT_TEST_SCENARIOS, PIPELINE_AGENT_TYPE,
 };
@@ -156,7 +156,12 @@ impl ModelInvoke {
     /// `agent_retry_max` 重试（决策 33 / G13 分层计数；决策 278 起重试轮续接转录＋错误 turn，
     /// 不再是「干净对话重试」——显式修订决策 205 裁决②；决策 298 按错误类别分流收窄 278 的
     /// 适用边界：配置类不进下一轮、传输类不追加错误 turn）。
-    pub(crate) async fn agent_node(&self, task: &Task, cursor: &NodeCursor) -> Result<NodeOutput> {
+    pub(crate) async fn agent_node(
+        &self,
+        task: &Task,
+        cursor: &NodeCursor,
+        cancel: Option<&CancelSignal>,
+    ) -> Result<NodeOutput> {
         let kind = AgentNodeKind::of(cursor.stage, cursor.node).ok_or_else(|| {
             Error::Validation(format!("{}.{} 不是 agent 节点", cursor.stage, cursor.node))
         })?;
@@ -219,6 +224,7 @@ impl ModelInvoke {
                     attempt,
                     &carried,
                     supplement_as_turn,
+                    cancel,
                 )
                 .await
             {
@@ -362,6 +368,7 @@ impl ModelInvoke {
         attempt: u32,
         carried: &[Message],
         supplement_as_turn: bool,
+        cancel: Option<&CancelSignal>,
     ) -> std::result::Result<(NodeOutput, RunTokens), AttemptFailure> {
         let mut trace = AttemptTrace {
             messages: carried.to_vec(),
@@ -377,6 +384,7 @@ impl ModelInvoke {
                 attempt,
                 &mut trace,
                 supplement_as_turn,
+                cancel,
             )
             .await
         {
@@ -530,6 +538,7 @@ impl ModelInvoke {
         attempt: u32,
         trace: &mut AttemptTrace,
         supplement_as_turn: bool,
+        cancel: Option<&CancelSignal>,
     ) -> Result<(NodeOutput, RunTokens)> {
         let home = self.store.home().clone();
         home.ensure_task_dirs(&task.id)?;
@@ -666,8 +675,11 @@ impl ModelInvoke {
             // 中止请求（决策 226 / 276）：每一轮开头先看一眼。被叫醒的那一轮由下面模型调用处
             // 的 `select!` 打断；这里拦的是另外两种情形——信号在两轮之间到达、以及已经请求过
             // 中止却又进了一轮（重试循环会走到这里）。
-            let cancel = cancel_signal(&task.id);
-            if let Some(signal) = &cancel {
+            //
+            // 信号由执行体**持有**、一路传进来（决策 320 修订）：不再按名字重取——
+            // `force_release` 摘走登记之后按名字取会落空，旧执行体的中止请求就此丢失
+            // （它停在下一个不返回的调用里再也出不来，转录也不落库）。
+            if let Some(signal) = cancel {
                 if signal.is_requested() {
                     return Err(Error::Cancelled(format!(
                         "{}.{} 的本次执行已按{}中止",
@@ -711,7 +723,7 @@ impl ModelInvoke {
             // 于是它既正是调度器判超时的对象，也是执行体身上唯一能观察中止请求的 await 点
             // （决策 226）——判超时那边不需要「有进程组可杀」，从这里就能把执行体叫停。
             // 取不到观察点（进程内没有这一号登记）时照旧直连，行为与加这条通道之前一致。
-            let response = match self.complete_once(req, cancel.as_ref(), cursor).await {
+            let response = match self.complete_once(req, cancel, cursor).await {
                 Ok(response) => response,
                 // 超窗（决策 295 / 票 10）：provider 说这一份放不下它的窗口——**压缩一次
                 // 再重试这一次调用**（与值班长 06(c) 同一处置、同一个判据）。压缩是**无条件**的：
@@ -751,7 +763,7 @@ impl ModelInvoke {
                         "provider 报上下文超窗：压缩本轮转录后重试这一次调用（票 10）"
                     );
                     let req = plan.request(&trace.messages, run_ctx);
-                    self.complete_once(req, cancel.as_ref(), cursor).await?
+                    self.complete_once(req, cancel, cursor).await?
                 }
                 Err(e) => return Err(e),
             };
@@ -1418,7 +1430,7 @@ pub(crate) enum AgentNodeKind {
 }
 
 impl AgentNodeKind {
-    fn of(stage: Stage, node: Node) -> Option<Self> {
+    pub(crate) fn of(stage: Stage, node: Node) -> Option<Self> {
         use AgentNodeKind::*;
         Some(match (stage, node) {
             (

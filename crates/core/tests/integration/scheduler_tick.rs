@@ -13,8 +13,8 @@ use agentpipeline_core::storage::observability::{NewRun, RunOutcome};
 use agentpipeline_core::storage::tasks::TaskFilter;
 use agentpipeline_core::storage::Store;
 use agentpipeline_core::types::{
-    CursorStatus, Node, NodeStatus, PendingContext, PendingKind, PendingReason, Stage, TaskStatus,
-    TransitionTrigger,
+    CursorStatus, Node, NodeStatus, PendingContext, PendingKind, PendingReason, ResumeCause, Stage,
+    TaskStatus, TransitionTrigger,
 };
 use testkit::{ManualClock, RecordingKiller, SseRecorder, TestHome};
 
@@ -306,13 +306,16 @@ async fn a_slow_run_is_noted_exactly_once_per_run() {
 // ─────────────────────── ① 超时（决策 33 / 64 / 66 / 100 / 122）───────────────────────
 
 #[tokio::test]
-async fn timeout_kills_process_group_and_retries_until_exhausted() {
+async fn timeout_kills_process_group_and_retries_per_ladder() {
     let h = Harness::new().await;
-    let task = h.seed_task("t1").await;
+    h.seed_task("t1").await;
     h.mark_running("t1").await;
     let cursor = h.store.load_live_cursors("t1").await.unwrap()[0].clone();
+    // 游标推到 develop.execute：续接标记只对 agent 节点置位（`take_continuation`
+    // 只在 agent 节点入口读，纯代码节点没有转录可言）。
+    h.advance_to_develop(&cursor.cursor_id).await;
 
-    // attempt 1 < agent_retry_max(3)：杀进程组 + 干净对话重试
+    // 连续超时第 1 次：杀进程组 + 自动续接（不再看 agent_retry_max）
     h.running_run("t1", &cursor.cursor_id, 1, 400, 400, Some(4242))
         .await;
     let report = h.scheduler(Settings::default()).tick().await.unwrap();
@@ -320,19 +323,53 @@ async fn timeout_kills_process_group_and_retries_until_exhausted() {
     assert_eq!(h.killer.killed_groups(), vec![4242], "必须杀整个进程组");
     assert!(
         report.timeout_pending_cursors.is_empty(),
-        "未耗尽不得 pending"
+        "未到梯子末端不得 pending"
     );
     assert_eq!(
         h.resumes.load(Ordering::SeqCst),
         1,
-        "应拉起 executor 干净重试"
+        "应拉起 executor 自动续接"
     );
-    // run 落库为 timeout
-    let runs = h.store.list_runs("t1").await.unwrap();
-    assert_eq!(runs[0].status, NodeStatus::Timeout);
+    assert_eq!(
+        h.store
+            .take_cursor_resume_cause(&cursor.cursor_id)
+            .await
+            .unwrap(),
+        Some(ResumeCause::Timeout),
+        "续接标记要落在游标上：重试起的那条 run 带上一轮转录"
+    );
 
-    // attempt 3 = agent_retry_max：耗尽 → pending(timeout) 挂在该游标上
-    h.running_run("t1", &cursor.cursor_id, 3, 400, 400, Some(4243))
+    // 连续超时第 2 次：仍续接（attempt 数字不再参与判断，决策 320 写死 2 次）
+    h.running_run("t1", &cursor.cursor_id, 2, 400, 400, Some(4243))
+        .await;
+    let report = h.scheduler(Settings::default()).tick().await.unwrap();
+    assert_eq!(report.timed_out_runs.len(), 1);
+    assert_eq!(h.resumes.load(Ordering::SeqCst), 2);
+    assert_eq!(
+        h.store
+            .take_cursor_resume_cause(&cursor.cursor_id)
+            .await
+            .unwrap(),
+        Some(ResumeCause::Timeout)
+    );
+
+    // 连续超时第 3 次：降级空白重跑——resume 但**不**置续接标记
+    h.running_run("t1", &cursor.cursor_id, 3, 400, 400, Some(4244))
+        .await;
+    let report = h.scheduler(Settings::default()).tick().await.unwrap();
+    assert_eq!(report.timed_out_runs.len(), 1);
+    assert_eq!(h.resumes.load(Ordering::SeqCst), 3);
+    assert_eq!(
+        h.store
+            .take_cursor_resume_cause(&cursor.cursor_id)
+            .await
+            .unwrap(),
+        None,
+        "空白重跑不带上一轮转录"
+    );
+
+    // 连续超时第 4 次：挂起 pending(timeout) 交回人工
+    h.running_run("t1", &cursor.cursor_id, 4, 400, 400, Some(4245))
         .await;
     let report = h.scheduler(Settings::default()).tick().await.unwrap();
     assert_eq!(
@@ -349,7 +386,6 @@ async fn timeout_kills_process_group_and_retries_until_exhausted() {
     let projected = h.store.get_task("t1").await.unwrap();
     assert_eq!(projected.status, TaskStatus::Pending);
     assert_eq!(h.sse.count_of(SseEventType::Pending), 1);
-    let _ = task;
 }
 
 /// 判超时要照实记**跑了多久**（决策 226）。
@@ -864,7 +900,26 @@ async fn timeout_on_one_branch_does_not_touch_the_other() {
         .unwrap()
         .clone();
 
-    h.running_run("t1", &dev.cursor_id, 3, 400, 400, Some(9))
+    // 梯子（决策 320）：连续超时第 4 次才挂起——垫三条已终态的超时 run，让这一轮
+    // 的 run 落在挂起支上（这条用例验的是「挂起只作用于该分支」，不是梯子本身）。
+    for attempt in 1..=3 {
+        let id = h
+            .running_run("t1", &dev.cursor_id, attempt, 400, 400, None)
+            .await;
+        h.store
+            .finish_run(
+                id,
+                &RunOutcome {
+                    status: Some(NodeStatus::Timeout),
+                    duration_ms: 400_000,
+                    error: Some("垫：连续超时".into()),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+    }
+    h.running_run("t1", &dev.cursor_id, 4, 400, 400, Some(9))
         .await;
     let report = h.scheduler(Settings::default()).tick().await.unwrap();
     assert_eq!(report.timeout_pending_cursors, vec![dev.cursor_id.clone()]);

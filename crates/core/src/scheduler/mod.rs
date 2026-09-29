@@ -17,8 +17,17 @@ use crate::storage::attention::AttentionKind;
 use crate::storage::observability::is_timed_out;
 use crate::storage::tasks::DependencyState;
 use crate::storage::Store;
-use crate::types::{NodeRun, NodeStatus, PendingContext, PendingKind, PendingReason, TaskStatus};
+use crate::types::{NodeRun, NodeStatus, PendingContext, PendingKind, PendingReason, ResumeCause, TaskStatus};
 use crate::Result;
+
+/// 超时自动续接的次数上限（决策 320，**写死不配**）：该节点连续超时 1–2 次时，
+/// 重试带上一轮转录自动续接；连续第 3 次降级空白重跑一次；第 4 次起挂起交回人工。
+/// 与托管止损「满 2 次即停」（决策 210）同一量级；数字进决策日志，不做配置项。
+const TIMEOUT_AUTO_CONTINUES_MAX: u32 = 2;
+
+/// 判超时后等旧执行体自然退出的上限（决策 320，**写死不配**）：正常收口是毫秒级的
+/// 几笔库写，界给足；卡在不返回的同步调用里的到点即走 303 的兜底（代价不新增）。
+const EXECUTOR_TEARDOWN_WAIT: std::time::Duration = std::time::Duration::from_secs(2);
 
 /// resume 钩子：scheduler 通过它拉起 executor，不直接依赖 executor 实现。
 pub type ResumeFn = Arc<dyn Fn(&str) + Send + Sync>;
@@ -281,7 +290,8 @@ impl KanbanScheduler {
         Ok(())
     }
 
-    /// 超时处理：杀进程组 / 通知执行体收口 → 未耗尽则干净对话重试 → 耗尽才 pending(timeout)。
+    /// 超时处理：杀进程组 / 通知执行体收口 → 按连续超时轮数分流（决策 320）：
+    /// 1–2 次自动续接上一轮转录 → 第 3 次空白重跑一次 → 第 4 次起 pending(timeout) 交回人工。
     async fn handle_timeout(&self, run: &NodeRun, report: &mut TickReport) -> Result<()> {
         // 调用方已跳过项目级 run；这里再兜一层，避免无任务 / 游标时误用空值。
         let (Some(task_id), Some(cursor_id)) = (run.task_id.as_deref(), run.cursor_id.as_deref())
@@ -325,9 +335,15 @@ impl KanbanScheduler {
         // 一次不返回的同步文件读里（`open()` 挂在完全磁盘访问的授权弹窗上），既到不了 await
         // 点也返回不了，于是进程内去重与 `executor_owner` 双双占死，紧随其后的 resume 被逐次
         // 拒掉 30 秒后放弃、任务僵死 2.5 小时，只能靠重启——正是这条要停掉的那件事。
-        let had_executor =
-            crate::pipeline::executor::release_ownership(&self.store, task_id).await?;
-        if !had_executor {
+        // **先只发中止请求、不摘登记，有界等旧执行体自然退出**（决策 320 的顺序保证）：
+        // 转录落库（`record_failed_attempt`）排在它退出之前，而超时续接的读
+        // （`take_continuation`）排在新执行体起来之后——中间不隔这一等，读就可能抢在写
+        // 前面，那一轮续接静默退化成空白起跑（原因列读-清一次，被白白消费掉）。
+        // 等不到的（卡在不返回的同步调用里，303 的现场）到点为止，下面照旧兜底。
+        let had_executor = crate::pipeline::executor::request_cancel(task_id);
+        if had_executor {
+            crate::pipeline::executor::await_teardown(task_id, EXECUTOR_TEARDOWN_WAIT).await;
+        } else {
             // 取不到登记：进程内没有这一号执行体（例如本进程刚重启，台账里留着上一进程的
             // running run）。此时既没有通道可通知，也没有人要等——照旧往下走。
             tracing::debug!(
@@ -336,9 +352,33 @@ impl KanbanScheduler {
                 "超时处置：进程内没有在跑的执行体可通知"
             );
         }
+        // 摘登记 + 清 `executor_owner`（幂等：自然退出的场合两样都已空；真卡住的场合
+        // 这里就是 303 的兜底）。
+        crate::pipeline::executor::release_ownership(&self.store, task_id).await?;
 
-        if run.attempt < self.settings.agent_retry_max {
-            // 未耗尽：干净对话重试当前节点（决策 33），不计 validate_attempts
+        // 决策 320（显式修订决策 298 的超时支：重跑 → 续接；决策 33 的「干净对话重试」
+        // 在这一支退居降级档）：超时重试的形态由该节点**连续超时的轮数**决定——
+        // 连续 1–2 次：**自动续接**。游标记上续接原因（`mark_cursor_continuation`），
+        // 重试起的 run 经 `take_continuation`（决策 180 / 205 的既有机制，与手动
+        // 「继续」同路）带上一轮转录，run 链上落 `continued_from_run_id`。上一轮的
+        // 转录已经落库（失败 attempt 照记会话行，含被中止的那一轮），续接的是真实进度。
+        // 连续第 3 次：降级**空白重跑**一次——续接救了两轮都没救回来，多半不是
+        // 「丢了上下文」，续第四遍只是继续烧钱。
+        // 连续第 4 次起：挂起 pending(timeout) 交回人工。
+        // 非超时类的失败重试（决策 278 / 298）在 `model_invoke` 的轮内循环里，形态不变。
+        // 计数在 `finish_run` 之后取：刚判超时的这一条已经落库，算进连续序列里。
+        let streak = self
+            .store
+            .trailing_timeout_streak(task_id, run.stage, run.node)
+            .await?;
+        // 续接标记只对 **agent 节点**有意义：`take_continuation` 只在 agent 节点入口读
+        // （纯代码节点没有转录可言）。对纯代码节点置位会让标记永远无人取走、悬在列上。
+        let is_agent_node =
+            crate::pipeline::model_invoke::AgentNodeKind::of(run.stage, run.node).is_some();
+        if is_agent_node && streak <= TIMEOUT_AUTO_CONTINUES_MAX {
+            self.store
+                .mark_cursor_continuation(cursor_id, ResumeCause::Timeout)
+                .await?;
             self.store
                 .insert_transition(
                     task_id,
@@ -346,7 +386,23 @@ impl KanbanScheduler {
                     Some((run.stage, run.node)),
                     (run.stage, run.node),
                     crate::types::TransitionTrigger::Timeout,
-                    Some("节点超时，干净对话重试"),
+                    Some(&format!(
+                        "节点超时，自动续接上一轮转录（连续第 {streak} 次超时）"
+                    )),
+                )
+                .await?;
+            (self.resume)(task_id);
+        } else if streak == TIMEOUT_AUTO_CONTINUES_MAX + 1 {
+            // 空白重跑档：不带转录重起一段对话（决策 33 的原语义），给节点最后一次
+            // 自己走完的机会。transition 文案明说降级，复盘时不必倒推为什么没续接。
+            self.store
+                .insert_transition(
+                    task_id,
+                    &branch_of(cursor_id, &self.store).await?,
+                    Some((run.stage, run.node)),
+                    (run.stage, run.node),
+                    crate::types::TransitionTrigger::Timeout,
+                    Some("节点超时，续接两轮未恢复，空白重跑一次"),
                 )
                 .await?;
             (self.resume)(task_id);
