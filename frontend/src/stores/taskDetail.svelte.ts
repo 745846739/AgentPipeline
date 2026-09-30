@@ -233,6 +233,25 @@ class TaskDetailStore {
     }
   }
 
+  /**
+   * 「现场」页签的批量装载（决策 349）：把每一轮的完整会话读齐，时间线才摆得开——
+   * 旧「会话页签」是选中哪轮读哪轮，合并版没有选中态可搭。缓存挡住重复：已装载的
+   * 轮不发第二跳，进页签几次都只补缺的。并行发（本机服务，轮数有界）。
+   */
+  async loadAllConversations(): Promise<void> {
+    if (!this.id) return;
+    const pending = this.state.conversations
+      .map((c) => c.run_id)
+      .filter((runId) => !this.conversationsFull[runId]);
+    if (pending.length === 0) return;
+    this.conversationsLoading = true;
+    try {
+      await Promise.all(pending.map((runId) => this.loadConversation(runId)));
+    } finally {
+      this.conversationsLoading = false;
+    }
+  }
+
   async loadCommandOutput(commandId: number): Promise<void> {
     if (!this.id) return;
     try {

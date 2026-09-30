@@ -2,8 +2,8 @@
  * E2E-⑦ 日志/对话内容可信 + 刷新恢复（主流程票 07）。
  *
  * 「看任务跑」的两件高频事此前只验到「页签能点」：
- *   ① 命令与输出页签里要有**可识别的命令内容**（mock 脚本里的 git commit 串）；
- *   ② 会话页签要有**可断言的模型文本**（脚本 text 步骤），不是空面板；
+ *   ① 现场页签里要有**可识别的命令内容**（mock 脚本里的 git commit 串）；
+ *   ② 现场页签要有**可断言的模型文本**（脚本 text 步骤），不是空面板（决策 349：两半并成一枚页签）；
  *   ③ 页面开着时任务**继续推进**（命令计数增长）——实时流真的到达界面，
  *      而不是「打开时的一次性快照」；
  *   ④ pending 时刷新：状态与 pending 面板正确恢复；网络断开→恢复后界面收敛到真值，
@@ -36,8 +36,8 @@ test.describe('前端 E2E ⑦：日志对话可信 + 刷新恢复', () => {
       await page.goto(`${app.webBase}/#/task/${app.taskId}`);
       await settleBundle(page, bundle);
 
-      // ── 实时流：页面不刷新，命令与输出计数从 0（或少量）涨到出现 git commit ──
-      const tabButton = page.getByRole('tab', { name: /命令与输出/ });
+      // ── 实时流：页面不刷新，现场计数从 0（或少量）涨到出现 git commit ──
+      const tabButton = page.getByRole('tab', { name: /现场/ });
       await expect(tabButton).toBeVisible();
       await waitForTask(
         app,
@@ -47,22 +47,19 @@ test.describe('前端 E2E ⑦：日志对话可信 + 刷新恢复', () => {
       );
       // 全程未刷新：计数徽章应已反映落库的命令（SSE live 路径）。
       // 像素主题（票 06 / 决策 169）：页签 = 工位标签盒，计数是页签内的 `.c` 徽章，
-      // 定位按可访问名「命令与输出」（无方括号）；断言徽章非 0，不删原断言语义。
+      // 定位按可访问名「现场」（无方括号）；断言徽章非 0，不删原断言语义。
       await expect(tabButton.locator('.c')).not.toHaveText('0');
 
-      // ── 命令与输出内容：展开第一条 git 命令，内容可识别 ──
+      // ── 命令回执：展开那条 git 命令，输出可识别（决策 349：命令是现场轮里的回执）──
       await tabButton.click();
-      const commandRow = page.locator('.cmd, li, .row', { hasText: 'git add -A' }).first();
-      await expect(commandRow).toBeVisible();
-      await commandRow.click();
-      await expect(page.locator('.cmd, li, .row', { hasText: "commit -m 'feat: task" })).toBeVisible();
+      const commandRow = page.locator('.rcpt.cmd', { hasText: 'git add -A' }).first();
+      await expect(commandRow).toBeVisible({ timeout: 30_000 });
+      await commandRow.locator('summary').click();
+      await expect(commandRow).toContainText("commit -m 'feat: task", { timeout: 30_000 });
 
-      // ── 会话内容：review.execute 的对话含脚本 text 步骤的原文 ──
-      await page.getByRole('tab', { name: /会话/ }).click();
-      const reviewChip = page.locator('.runchip', { hasText: 'review' }).first();
-      await reviewChip.click();
+      // ── 会话轮：review.execute 的名牌下有脚本 text 步骤的原文 ──
       await expect(
-        page.locator('.msg', { hasText: '评审要点标记-obs7' }).first(),
+        page.locator('article.turn', { hasText: '评审要点标记-obs7' }).first(),
       ).toBeVisible({ timeout: 30_000 });
 
       expectBundleHealthy(bundle);

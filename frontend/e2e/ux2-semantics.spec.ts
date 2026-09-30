@@ -109,7 +109,7 @@ test.describe('UX2 ⑤ 全站语义与待处理下拉（票 04 / 06）', () => {
     // 方向键：焦点跟着选中的页签走
     await timeline.focus();
     await page.keyboard.press('ArrowRight');
-    await expect(page.getByRole('tab', { name: '会话' })).toHaveAttribute('aria-selected', 'true');
+    await expect(page.getByRole('tab', { name: /现场/ })).toHaveAttribute('aria-selected', 'true');
     await page.keyboard.press('End');
     await expect(page.getByRole('tab', { name: /^Diff$/ })).toHaveAttribute(
       'aria-selected',

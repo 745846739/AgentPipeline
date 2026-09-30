@@ -234,8 +234,7 @@ test.describe('① 有数据的库：看板 / 详情 / 对讲台 / 台账', () =
 
     for (const [slug, label] of [
       ['timeline', '时间线'],
-      ['conversation', '会话'],
-      ['commands', '命令与输出'],
+      ['scene', '现场'],
       ['files', '产出文件'],
       ['diff', 'Diff'],
     ] as const) {

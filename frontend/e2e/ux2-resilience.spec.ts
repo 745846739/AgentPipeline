@@ -89,17 +89,17 @@ test.describe('UX2 ⑨ 超时 / 断线 / 长值（票 12 / 13 / 17）', () => {
 
     await page.goto(`${app.webBase}/#/task/${app.taskIds[0]}`);
     await settleBundle(page, bundle);
-    // 命令与输出页签（真 tablist）
-    await page.getByRole('tab', { name: /命令与输出/ }).click();
+    // 现场页签（真 tablist；决策 349：命令回执住在现场时间线里）
+    await page.getByRole('tab', { name: /现场/ }).click();
 
-    const firstCmd = page.locator('.cmd').first();
+    const firstCmd = page.locator('.rcpt.cmd').first();
     await expect(firstCmd).toBeVisible({ timeout: 30_000 });
-    await firstCmd.click();
+    await firstCmd.locator('summary').click();
 
-    const alert = page.locator('.cmdout.failed');
+    const alert = page.locator('.rcpt-more.ferr');
     await expect(alert).toBeVisible({ timeout: 30_000 });
     await expect(alert).toContainText('完整输出没读回来');
-    expect(await page.locator('.cmdout', { hasText: '正在加载完整输出' }).count()).toBe(0);
+    expect(await page.locator('.rcpt-more', { hasText: '正在加载完整输出' }).count()).toBe(0);
     expectBundleHealthy(bundle);
   });
 
@@ -110,10 +110,10 @@ test.describe('UX2 ⑨ 超时 / 断线 / 长值（票 12 / 13 / 17）', () => {
     await page.goto(`${app.webBase}/#/task/${app.taskIds[0]}`);
     await settleBundle(page, bundle);
 
-    await page.getByRole('tab', { name: '会话' }).click();
-    const chip = page.locator('.runchip', { hasText: 'validate_input' }).first();
-    await expect(chip).toBeVisible({ timeout: 30_000 });
-    await chip.click();
+    await page.getByRole('tab', { name: /现场/ }).click();
+    // 现场没有「选中 run」：进页签即批量装载完整会话（决策 349），等那一轮的名牌出现
+    const turn = page.locator('article.turn', { hasText: 'validate_input' }).first();
+    await expect(turn).toBeVisible({ timeout: 30_000 });
 
     // 元数据卡里那条长路径整条在 DOM 里（没被截断成省略号）
     await expect(page.getByText(LONG_PATH, { exact: false }).first()).toBeVisible({

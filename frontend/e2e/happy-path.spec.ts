@@ -58,10 +58,10 @@ test.describe('前端 E2E ①：happy path（看板 → 详情 → 页签 → di
     await expect(page).toHaveURL(new RegExp(`#/task/${app.taskId}`));
     await expect(page.locator('h1.d-title')).toHaveText(title);
 
-    // ── 页签切换：时间线 → 会话 → 命令与输出 → 产出文件 ──
+    // ── 页签切换：时间线 → 现场 → 产出文件 ──
     // 像素主题（票 06 / 决策 169）：页签 = 工位标签盒，方括号装饰退役；
     // 按可访问名（去掉方括号后的标签文本）定位，不断言装饰字符。
-    for (const label of ['会话', '命令与输出', '产出文件']) {
+    for (const label of ['现场', '产出文件']) {
       const tab = page.locator('.tabs button.tab', { hasText: label });
       await tab.click();
       await expect(tab).toHaveClass(/on/);

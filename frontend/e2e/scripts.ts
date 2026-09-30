@@ -386,7 +386,7 @@ export function mergeReturnRounds(taskId: string): NodeScript {
 
 /**
  * 可观测性脚本（主流程票 07）：在 fullPass 之上给 review.execute 的报告轮
- * 加一条 `text` 步骤——会话页签要有**可断言的模型文本**，而不是只有工具调用。
+ * 加一条 `text` 步骤——现场页签要有**可断言的模型文本**，而不是只有工具调用。
  */
 export function observabilityRounds(taskId: string): NodeScript {
   const impl = implementationRounds(taskId);

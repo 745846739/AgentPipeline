@@ -39,6 +39,7 @@ const mocks = vi.hoisted(() => ({
     loadDiff: vi.fn(),
     loadFile: vi.fn(),
     loadConversation: vi.fn(),
+    loadAllConversations: vi.fn(async () => undefined),
     loadCommandOutput: vi.fn(),
     outputFor: vi.fn(() => null),
     getFile: vi.fn(() => undefined),
@@ -242,8 +243,7 @@ describe('任务详情 · 页签语义与标题层级（票 06 / R2-19 / R2-20�
     const tabs = within(tablist).getAllByRole('tab');
     expect(tabs.map((t) => t.textContent?.trim())).toEqual([
       '时间线',
-      '会话',
-      '命令与输出0',
+      '现场0',
       '产出文件',
       'Diff',
     ]);
@@ -267,7 +267,7 @@ describe('任务详情 · 页签语义与标题层级（票 06 / R2-19 / R2-20�
     const tablist = screen.getByRole('tablist', { name: '任务详情页签' });
 
     await fireEvent.keyDown(tablist, { key: 'ArrowRight' });
-    expect(screen.getByRole('tab', { name: '会话' }).getAttribute('aria-selected')).toBe('true');
+    expect(screen.getByRole('tab', { name: /现场/ }).getAttribute('aria-selected')).toBe('true');
 
     await fireEvent.keyDown(tablist, { key: 'End' });
     expect(screen.getByRole('tab', { name: 'Diff' }).getAttribute('aria-selected')).toBe('true');
@@ -357,7 +357,7 @@ describe('任务详情 · 加载失败有出口（票 01 / R2-01）', () => {
 });
 
 describe('任务详情 · 通知深链 `?run=`（pwa-webpush 票 02/03）', () => {
-  /** 一个 run 的会话摘要（`ConversationViewer` 的 run 行要有一条才摆得开）。 */
+  /** 一个 run 的会话摘要（现场时间线的那一轮要有一条才摆得开）。 */
   function summary(runId: number) {
     return {
       run_id: runId,
@@ -398,16 +398,14 @@ describe('任务详情 · 通知深链 `?run=`（pwa-webpush 票 02/03）', () =
     window.location.hash = '';
   });
 
-  it('落在那一轮对话上：切到会话页签、选中该 run 并拉着它取数', () => {
+  it('落在那一轮对话上：切到现场页签、把该轮带到眼前并拉着它取数（决策 349）', () => {
     armDeepLink('#/task/task-1?run=42');
     render(TaskDetail, { props: { id: 'task-1' } });
 
-    expect(screen.getByRole('tab', { name: '会话' }).getAttribute('aria-selected')).toBe('true');
+    expect(screen.getByRole('tab', { name: /现场/ }).getAttribute('aria-selected')).toBe('true');
     expect(mocks.detail.loadConversation).toHaveBeenCalledWith(42);
-    // 「选中」是看得见的那件事：run 行的药丸被按下
-    expect(screen.getByRole('button', { name: /develop · execute/ }).getAttribute('aria-pressed')).toBe(
-      'true',
-    );
+    // 「带到眼前」是看得见的那件事：现场时间线里那一轮的名牌在屏上
+    expect(screen.getByText(/develop · execute/)).toBeTruthy();
   });
 
   it('消费一次就抹掉参数（replace 不进历史）：地址不再挂着 `run`', () => {

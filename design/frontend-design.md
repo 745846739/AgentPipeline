@@ -434,7 +434,7 @@ pending 琥珀呼吸（2.4s 周期）、流式输出尾随光标。`prefers-redu
 │ ← 实现用户登录        running · 12m34s · 45.2k tok · kanban/t-0042        │
 │ ┌──────────────── 轨道 hero（全 DAG，节点级 ✓/●/○/⏸/✗/↩）───────────────┐ │
 │ └──────────────────────────────────────────────────────────────────────┘ │
-│ [时间线] [会话] [命令与输出] [产出文件] [Diff]                             │
+│ [时间线] [现场] [产出文件] [Diff]                                         │
 │                                                                          │
 │  （当前 tab 内容）                                                        │  │ 待办
 │                                                                          │  │ dossier
@@ -469,13 +469,12 @@ pending 琥珀呼吸（2.4s 周期）、流式输出尾随光标。`prefers-redu
   内容区回到全宽。动作按钮的**确认步与三档量级**见 §9.3（决策 216）——不可逆动作
   就地走内联两步确认，跳过质量闸的动作是琥珀描边而不是实心主按钮。
 
-### 6.2 五个页签
+### 6.2 四个页签
 
 | 页签 | 内容 | 数据源 |
 |---|---|---|
 | 时间线 | `kanban_transitions` 渲染的流转记录，并行区间两条交错记录以 `∥` 分支徽标区分；trigger 用词表（normal/retry/kickback/user_resume…）原样展示；sync-check 的 join run 记录不进入时间线（决策 107），backtrack 呈现为进入 architect-design 的自动流转行 | `GET /tasks/{id}/flow` + SSE |
-| 会话 | 按 stage/node/attempt 分组的会话列表 → 会话查看器（§12.4.3 ASCII 的实现体）：System Prompt 折叠块、消息气泡、tool 调用卡（工具名 + 参数摘要 + 结果行数）、submit_metadata 元数据卡；子代理（`agent_type` ≠ main）以缩进子会话呈现；失败 attempt 以红色分隔条标注原因；**进行中的 run 实时流式渲染** | `/conversations` + SSE 流 |
-| 命令与输出 | 命令行表（`✓/✗ 时刻 source 命令 耗时 exit`），行展开见首尾预览与完整输出（卸载文件走 `/commands/{id}/output`）；`source = agent | system` 用徽标区分但共用一表（§12.4.4） | `/commands` + SSE |
+| 现场 | 会话与命令输出合并成的**一条时间线**，版式取对讲台那套（决策 349）：一叠轮（`.turn` 对话框 + 名牌 `stage · node`），轮内按发生顺序排消息步骤（user / assistant 正文、tool 调用回执）与命令回执（灯 · 时刻 · source · 命令 · 耗时 · exit，在跑的那条流式输出常显，收口的展开见完整输出，卸载文件走 `/commands/{id}/output`）；最后一条 assistant 正文是收口话（markdown）；**只有命令没有会话的节点**按 stage · node 分组成合成轮、同一形状；进行中的 run 实时流式渲染（`liveDeltas` / `liveTools` / 命令输出增量）；submit_metadata 元数据卡在轮尾 | `/conversations` + `/commands` + SSE 流 |
 | 产出文件 | design.md / dev-plan.md / test-scenarios.md / review-report.md / review-diff.diff / test-report.md，Markdown 渲染 | `GET /tasks/{id}/files/{path}` |
 | Diff | merge proposal：DiffStats 摘要（文件数 / 增删行 / 逐文件明细）+ unified diff 渲染 + 审批动作（合入 / 返回修改，决策 23：无"拒绝"）；`base_commit` 过期时后端会重置 approval，前端在 diff 顶部提示「基准已前移，diff 重新生成中」 | stage_outputs + `/files/merge-proposal.diff` |
 
@@ -524,9 +523,9 @@ frontend/
 │       ├── ui/            # 公共非业务件：EmptyState（票 13）、Modal（三个对话框共用的键盘/语义底座）
 │       ├── pipeline/      # PipelineRail（轨道，3 种变奏：脊线 / 卡片迷你轨 / hero）、CursorDot、BranchPill
 │       ├── board/         # BoardColumn、TaskCard、PendingActions、StalledBadge、NewTaskDialog
-│       ├── task/          # TimelineView、ConversationViewer、CommandLog、FileViewer、DiffReviewPanel、ReviewForm
-│       ├── render/        # ★ 公共渲染件（§12.11 复用表）：MarkdownView、MessageBubble、
-│       │                  #   ToolCallCard、MetadataCard、CodeHighlight、DiffView、TokenMeter
+│       ├── task/          # TimelineView、SceneTimeline、FileViewer、DiffReviewPanel、ReviewForm
+│       ├── render/        # ★ 公共渲染件（§12.11 复用表）：MarkdownView、
+│       │                  #   MetadataCard、CodeHighlight、DiffView、TokenMeter
 │       └── settings/      # ProjectForm（含 analyze 清单）、ProviderForm、StageConfigForm（阶段配置页用）
 ```
 
@@ -606,11 +605,11 @@ GET /tasks/{id}               → 详情页装载 + 断线重连后的全量校�
 
 | 状态 | URL | localStorage | 谁写地址 |
 |---|---|---|---|
-| 详情页签 | `#/task/{id}?tab=timeline\|conversation\|commands\|files\|diff`（缺省 `timeline` **不写**） | — | 用户点页签 = `pushState` |
+| 详情页签 | `#/task/{id}?tab=timeline\|scene\|files\|diff`（缺省 `timeline` **不写**） | — | 用户点页签 = `pushState` |
 | 看板过滤 | `#/?filter=all\|running\|pending\|…`（缺省 `all` 不写） | `agentpipeline.board_filter`（URL 里没有时兜底） | 用户切过滤 = `pushState` |
 | 对讲台班次 | `#/talk?session=42` | `agentpipeline.talk_session`（URL 里没有时兜底） | 用户换班次 = `pushState` |
 | 对讲台输入草稿 | **不进** | `agentpipeline.talk_draft`（`{sessionId, text, at}`） | — |
-| 会话页签里选中的 run | **只读一次**：`?run=<id>` 由通知深链带进来，消费后**立刻抹掉**（决策 323） | **不进** | 用户点 run 行**不写地址**；深链那一次是 `replaceState` 抹参数 |
+| 现场页签里深链指向的 run | **只读一次**：`?run=<id>` 由通知深链带进来，消费后**立刻抹掉**（决策 323）；落点 = 把那一轮滚进视野并亮一下边框（决策 349：现场没有「选中 run」态） | **不进** | 档案盒的「去看对话」同样只滚不写地址；深链那一次是 `replaceState` 抹参数 |
 
 - **「我在哪」进 URL，「我平常怎么用」与没写完的草稿进 localStorage。** 草稿不是位置：
   把半句话塞进地址，分享出去的是一个别人看不懂的 URL，而地址栏还会在打字时被反复改写。
@@ -618,7 +617,7 @@ GET /tasks/{id}               → 详情页装载 + 断线重连后的全量校�
   `?project=&analyze=1` 自动触发）——否则自动联动会把历史灌满，后退不再是「回到上一页」。
 - **`?run=` 是一次性的落点，不是位置**（决策 323）：推送把「那一次对话」送进来，页面消费完就把它
   从地址里抹掉（`replaceState`，不进历史）——留着它，用户切到时间线后地址栏还在说旧话，刷新又
-  把人拽回会话页签。抹掉之后地址始终描述屏幕上那一屏；**同一条推送点第二次照样有效**（地址真的变了，
+  把人拽回现场页签。抹掉之后地址始终描述屏幕上那一屏；**同一条推送点第二次照样有效**（地址真的变了，
   那次改址会把 run 重新交给消费点；挂着不动时第二次点开是同一地址，浏览器根本不发 `hashchange`）。
 - **刷新恢复**：地址里有就照地址；没有就用缺省，**不拿 localStorage 去覆盖**——过滤与班次
   是两个例外（跨页面的工作语境：从看板点进任务再点「← 看板」回来时地址会丢参数，
@@ -794,14 +793,14 @@ GET /tasks/{id}               → 详情页装载 + 断线重连后的全量校�
 | 页面导航行四项（对讲台 / 看板 / 指标 / 设置），其余入口从落地页进；**看板只从这一行进**（窄档这一行钉在屏幕底缘，桌面档是顶栏第二行——同一个 `nav` 元素） | `frontend/src/components/layout/TopBar.svelte`、`frontend/src/router.svelte.ts` | 决策 240（修订 198 / 169）；位置由 243 定（窄档在底部） |
 | 首屏默认落对讲台：地址栏没写 hash 就 `replaceState` 归一到 `#/talk`（带 hash 的开屏与显式 `#/` 都不动） | `frontend/src/router.svelte.ts` | 决策 241（不修订 240）；`router.test.ts` 的「开屏默认落点」用例 |
 | 设置落地页按用途三分（谁能进来 / 怎么找到你 / 怎么跑），各项仍是独立路由 | `frontend/src/routes/SettingsLanding.svelte` | 决策 198（三分由 272⑧ 落地） |
-| 命令台账的折叠行显示**原串**（`original_command ?? command`）：改写过的行带一枚「改写」小标，展开时原串与实际执行的那条**都摆出来** | `frontend/src/components/task/CommandLog.svelte` | 决策 297；两条从「有哪些命令要跑」排障的人先要看到的是**模型想干什么**，而 `cat X` 与 `rtk read X` 的输出不一样、只记一份会看错；判据由 `frontend/src/components/task/CommandLog.test.ts` 钉住（改写过的行两条都在、没改写的不带标） |
+| 命令回执的折叠行显示**原串**（`original_command ?? command`）：改写过的行带一枚「改写」小标，展开时原串与实际执行的那条**都摆出来** | `frontend/src/lib/taskScene.ts`、`frontend/src/components/task/SceneTimeline.svelte` | 决策 297（实现位置由决策 349 搬家：命令台账并入现场时间线）；两条从「有哪些命令要跑」排障的人先要看到的是**模型想干什么**，而 `cat X` 与 `rtk read X` 的输出不一样、只记一份会看错；判据由 `frontend/src/lib/taskScene.test.ts` 与 `frontend/src/components/task/SceneTimeline.test.ts` 钉住（改写过的行两条都在、没改写的不带标） |
 | 命令执行页：开关 + **每次读都现做一次**的活体探测（路径 / 版本 / 可用 / 原因）；探测失败仍然保存并把失败原样说出来（不静默成功、不静默失败）；本机用不了时就地给「手填绝对路径」的出路 | `frontend/src/routes/SettingsTools.svelte`、`frontend/src/lib/rtkToggle.ts` | 决策 297；三态分界与那两句话由 `frontend/src/lib/rtkToggle.test.ts` 钉住，接线（每次打开都重读、保存失败不静默）由 `frontend/src/routes/SettingsTools.test.ts` 钉住，后端契约在 `crates/app/src/routes/rtk.rs` |
 | 离线通知页：一颗总开关 + **通道四件**与**礼貌两件**两组单元各自整体覆盖 `config.toml`（组内不许混，两组互不牵动、各交各的），秘密只回显 `***` 且掩码或留空 = 不改，BlueBubbles 开启/保存先探活、够不着不当成功；礼貌管的是出机器那条线（浏览器 toast 另有自己一份固定表） | `frontend/src/routes/SettingsNotify.svelte`、`frontend/src/lib/notifyChannel.ts`、`frontend/src/lib/notifyPoliteness.ts` | 决策 272⑥⑦⑧；礼貌小节与两级解析由 284②③⑤ 定；判据与掩码纪律由 `notifyChannel.test.ts` / `notifyPoliteness.test.ts` 钉住，后端契约在 `crates/app/src/routes/notify.rs` |
 | 第四个互斥通道「浏览器推送」：这一格**没有必填件**（VAPID 密钥对与订阅行都在服务端库里），保存那一次就把密钥对生成出来；公钥可读、私钥只回掩码 | `frontend/src/routes/SettingsNotify.svelte`、`frontend/src/lib/notifyChannel.ts`、`crates/app/src/routes/notify.rs` | 决策 323（突破 65 的第四次通道扩面；沿用 272 的互斥格局，多出口并存仍另立票）；判据 `notifyChannel.test.ts`，契约 `api_contract.rs::the_webpush_channel_*` |
 | 订阅此设备：权限弹窗**只在点击手势里**弹（进页面一次也不弹，模型一、失败即永久拒绝）；四态各有各的文案与按钮形状——未申请（可点）/ 已授权（可订阅或可退订）/ 已拒绝（摆去系统设置的指引）/ iOS 非主屏（按钮位换成「请先添加到主屏幕」） | `frontend/src/routes/SettingsNotify.svelte`、`frontend/src/lib/pushSubscribe.ts` | 决策 323；四态判据是纯函数 `pushFace`（`pushSubscribe.test.ts`），接线由 `SettingsNotify.test.ts` 与 e2e `push-subscribe.spec.ts` 钉住 |
 | 已订阅设备清单：每行给 endpoint **摘要**（`…前6…后6`，完整值是一枚能力 URL 不回显）+ 创建时间 + UA，单个撤销、全部清空；空清单摆订阅引导而不是空白 | `frontend/src/routes/SettingsNotify.svelte`、`crates/core/src/storage/push.rs` | 决策 323；掩码口径对齐 providers `api_key`（决策 112）；撤销走配对守卫端点，回环与局域网行为与订阅一致（决策 323 对 167 的定点加强） |
 | service worker 只做两件事（`push` → 显示通知、`notificationclick` → 开窗 / 聚焦并导航），**零离线缓存**；地址固定为 `/sw.js`（作用域 = 根），故这一份走 `no-cache` 复验 | `frontend/src/sw.ts`、`frontend/src/lib/pushPayload.ts`、`crates/app/src/assets.rs` | 决策 323（缓存纪律沿 285：地址固定、内容会变的那一类必须每次复验）；两个处理器抽成纯函数由 `pushPayload.test.ts` 钉住，注册与作用域由 e2e `push-subscribe.spec.ts` 钉住 |
-| 通知深链由服务端拼好放进 push payload（前端不猜）：卡片级 `#/task/<id>`、流水线级 `#/task/<id>?run=<n>`（落那一次运行的会话页签）、回话类 `#/talk?session=<id>`；payload 里的 `url` 拼不出可用地址（绝对地址 / `#//` / 空）时降级看板首页 `#/`；`?run=` **消费一次就抹掉**（不进历史，免得切页签后地址栏还说旧话） | `crates/core/src/notify.rs`、`frontend/src/lib/pushPayload.ts`、`frontend/src/routes/TaskDetail.svelte` | 决策 326；拼装规则在 `notify.rs::attention_deep_link` / `talk_deep_link`，消费由 `TaskDetail.test.ts` 的「通知深链」一组钉住；**两处与 spec 票面措辞的差异显式记**：① 票面写「流水线级 → 该任务看板视图」，而本应用没有按任务收窄的看板路由（看板是 `#/` 全量），故流水线级也落在**那张卡**上、多带一段 `?run=` 指向停在哪一次运行；② 票面写「深链不可达时（对象已归档等）降级到看板首页」，实现里 **payload 层**的降级是语法面的（拼不出可用地址才回 `#/`），而**对象层**的不可达（任务已归档 / 不存在）落在任务详情页的空态——状态 + 下一步 + 顶栏看板入口（决策 240 的出口就在那一行），**不做静默重定向**（把人从他在的地方悄悄挪走，比说清「这个任务不在了」更差） |
+| 通知深链由服务端拼好放进 push payload（前端不猜）：卡片级 `#/task/<id>`、流水线级 `#/task/<id>?run=<n>`（落那一次运行的现场页签）、回话类 `#/talk?session=<id>`；payload 里的 `url` 拼不出可用地址（绝对地址 / `#//` / 空）时降级看板首页 `#/`；`?run=` **消费一次就抹掉**（不进历史，免得切页签后地址栏还说旧话） | `crates/core/src/notify.rs`、`frontend/src/lib/pushPayload.ts`、`frontend/src/routes/TaskDetail.svelte` | 决策 326；拼装规则在 `notify.rs::attention_deep_link` / `talk_deep_link`，消费由 `TaskDetail.test.ts` 的「通知深链」一组钉住；**两处与 spec 票面措辞的差异显式记**：① 票面写「流水线级 → 该任务看板视图」，而本应用没有按任务收窄的看板路由（看板是 `#/` 全量），故流水线级也落在**那张卡**上、多带一段 `?run=` 指向停在哪一次运行；② 票面写「深链不可达时（对象已归档等）降级到看板首页」，实现里 **payload 层**的降级是语法面的（拼不出可用地址才回 `#/`），而**对象层**的不可达（任务已归档 / 不存在）落在任务详情页的空态——状态 + 下一步 + 顶栏看板入口（决策 240 的出口就在那一行），**不做静默重定向**（把人从他在的地方悄悄挪走，比说清「这个任务不在了」更差） |
 | 「手机访问」入口只在本机（来源回环）渲染，非本机不给入口 | `frontend/src/lib/localPage.ts`、`frontend/src/routes/SettingsLanding.svelte` | 决策 190（位子由 198 挪到落地页，行为不变） |
 | 阶段配置独立成页，从「模型与密钥」页搬出 | `frontend/src/routes/SettingsStages.svelte`、`frontend/src/components/settings/StageConfigForm.svelte` | 决策 198 / 111 / 170 |
 | 不支持的 provider 行降级灰显 + 琥珀标（**标里不带内部编号**） | `frontend/src/routes/SettingsProviders.svelte:297` | 决策 103；决策 199（编号退到 `title`） |
@@ -884,7 +883,7 @@ GET /tasks/{id}               → 详情页装载 + 断线重连后的全量校�
 | 新建任务按服务端返回的 id 跳转（不靠列表里的第一个去猜） | `frontend/src/stores/board.svelte.ts`、`frontend/src/components/board/NewTaskDialog.svelte` | 票 10（R2-12） |
 | 提交前拦下明显非法的值：`base_url` 形状、拆分里空标题的行**指出第几行**、文本域全空给提示而不是静默 no-op | `frontend/src/lib/providers.ts`、`frontend/src/components/task/SplitDialog.svelte` | 票 11（R2-13） |
 | 请求有统一超时（值只有一处出处），超时给可读错误而不是内部字眼；值班长发话单独放宽（5 分钟——那一轮不随本地放弃而死，故这只是本地等多久） | `frontend/src/api/client.ts` | 票 12（R2-14）＋ 决策 223；`REQUEST_TIMEOUT_MS` 与 `mapRequestError` |
-| 命令输出读不回来就说失败（不再永远「正在加载完整输出…」） | `frontend/src/components/task/CommandLog.svelte`、`frontend/src/stores/taskDetail.svelte.ts` | 票 12（R2-16）；`commandOutputError` 此前无人读 |
+| 命令输出读不回来就说失败（不再永远「正在加载完整输出…」） | `frontend/src/components/task/SceneTimeline.svelte`、`frontend/src/stores/taskDetail.svelte.ts` | 票 12（R2-16；实现位置由决策 349 搬家）；`commandOutputError` 此前无人读 |
 | 详情页也有实时断线指示（与看板同一句话）；流未连通时动手要说「回执要等重连」而不是静默等 30 秒 | `frontend/src/stores/taskDetail.svelte.ts`、`frontend/src/routes/TaskDetail.svelte` | 票 13（R2-15） |
 | 时间与日期的格式只有一处出处（`lib/format.ts` 之外不许再出现 locale 调用） | `frontend/src/lib/format.ts`、`frontend/src/lib/format.test.ts` | 票 15（R2-18）；静态扫描是这道门的一部分 |
 | 同一个 `bind_source` 值只有一个说法（定义收在纯函数里，模板只调它） | `frontend/src/lib/sharePairing.ts`、`frontend/src/routes/Share.svelte` | 票 15（R2-18） |
@@ -913,4 +912,4 @@ GET /tasks/{id}               → 详情页装载 + 断线重连后的全量校�
 | 折叠三表（回执 / 思考 / 工具）**住 store**：展开态描述的是**那一轮**而不是这一屏——切页回来不重置、键随轮稳定（台账轮锚 `m<id>`、在飞轮锚行 id），刷新仍回缺省折叠（决策 217 边界不动） | `frontend/src/stores/talk.svelte.ts`、`frontend/src/routes/Talk.svelte` | 决策 315；键稳定与「不被打回」的单测、切页实测留待（票 03） |
 | **排队发送**：一轮在飞时输入解锁，发出即入队（多条、按班次分列、住 store、可就地编辑 / 逐条撤回），当前轮收口后由在屏页面的出队效果自动发出；**死轮与中断都扣住**（`queueHeld`：`lost` 支管死轮、`settled` 支的 `interrupted` 管中断行）不自动照发，坞里「继续发送 / 清空队列」两个出口；值守轮不触发出队；停钮与「排队发送」钮可同时在场 | `frontend/src/stores/talk.svelte.ts`、`frontend/src/routes/Talk.svelte`、`frontend/src/realtime/foreman.ts` | 决策 316（显式修订 182㉓「一轮没落地就发不出第二句」）；队列账与扣住判据钉在 `frontend/src/stores/talk.test.ts`，`settled.interrupted` 判据钉在 `frontend/src/realtime/foreman.test.ts`；收口自动出队的出队效果与连发实测留待（票 04） |
 | 操作台轮型文本过 `MarkdownView`（提议 summary / 提问 question / 急停 message / console 记账）；传输层失败报文照旧纯文本（决策 274 边界不动） | `frontend/src/routes/Talk.svelte`、`frontend/src/components/task/PendingDossier.svelte` | 决策 317；**无自动化见证**——视觉回归核对与快照断言更新留待（票 05） |
-| 长列表**前端切片**（50/页 + 「加载更多」按钮 + 头/尾锚定，滚动自动加载不做）接线三处：命令页签（尾锚 + 关键词 / 退出码过滤，**先过滤后切**）、会话页签（run 药丸过滤含**状态维**、消息**内容 / 角色**过滤、选中 run 消息尾部切片）、看板列（头锚 50 张，换 `filterKey` 回缺省）；过滤态不进 URL | `frontend/src/lib/windowSlice.ts`、`frontend/src/lib/commandFilter.ts`、`frontend/src/lib/runFilter.ts`、`frontend/src/lib/messageFilter.ts`、`frontend/src/components/ui/MoreRow.svelte`、`frontend/src/components/task/CommandLog.svelte`、`frontend/src/components/task/ConversationViewer.svelte`、`frontend/src/components/board/BoardColumn.svelte`、`frontend/src/routes/Board.svelte` | 决策 319（全站零分页零虚拟化：切片是唯一做法）；原语与三个过滤纯函数、三处接线的组件测试钉在对应的 `*.test.ts` |
+| 长列表**前端切片**（50/页 + 「加载更多」按钮 + 头/尾锚定，滚动自动加载不做）接线两处：现场页签（轮尾锚 + 轮内步骤尾锚，轮级关键词过滤 `sceneTurnMatches`，**先过滤后切**——决策 349 把原命令页签与会话页签两处接线并成一处，退出码 / run 药丸 / 消息角色三只旧过滤随之退场）、看板列（头锚 50 张，换 `filterKey` 回缺省）；过滤态不进 URL | `frontend/src/lib/windowSlice.ts`、`frontend/src/lib/taskScene.ts`、`frontend/src/components/ui/MoreRow.svelte`、`frontend/src/components/task/SceneTimeline.svelte`、`frontend/src/components/board/BoardColumn.svelte`、`frontend/src/routes/Board.svelte` | 决策 319（全站零分页零虚拟化：切片是唯一做法；接线数由决策 349 修订）；原语与过滤纯函数、两处接线的组件测试钉在对应的 `*.test.ts` |

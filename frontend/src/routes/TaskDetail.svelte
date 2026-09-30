@@ -3,12 +3,11 @@
   import { archiveTask, getForemanSessions, listProviders, pauseTask, rerunTask, retryTask, setStewardship } from '../api/client';
   import type { AllowedAction, Provider } from '../api/types';
   import PipelineRail from '../components/pipeline/PipelineRail.svelte';
-  import CommandLog from '../components/task/CommandLog.svelte';
-  import ConversationViewer from '../components/task/ConversationViewer.svelte';
   import DiffReviewPanel from '../components/task/DiffReviewPanel.svelte';
   import FileViewer from '../components/task/FileViewer.svelte';
   import ModelOverrideDialog from '../components/task/ModelOverrideDialog.svelte';
   import PendingDossier from '../components/task/PendingDossier.svelte';
+  import SceneTimeline from '../components/task/SceneTimeline.svelte';
   import SplitDialog from '../components/task/SplitDialog.svelte';
   import TimelineView from '../components/task/TimelineView.svelte';
   import DiffView from '../components/render/DiffView.svelte';
@@ -23,18 +22,28 @@
   }
   let { id }: Props = $props();
 
-  type Tab = 'timeline' | 'conversation' | 'commands' | 'files' | 'diff';
+  /**
+   * 「现场」页签（决策 349）：会话与命令输出合并成的一条时间线，版式取对讲台那套
+   * （一叠轮、名牌、过程步骤、命令回执）。旧「会话」「命令与输出」两个页签由此退场——
+   * 两套版面说的是同一件事的两半，合在一处之后「只有命令没有会话的节点」也有了
+   * 同一个形状（`lib/taskScene.ts` 把孤儿命令按 stage · node 分组成合成轮）。
+   */
+  type Tab = 'timeline' | 'scene' | 'files' | 'diff';
   /** 页签顺序（方向键与 Home/End 按它走）与各自的词（面板标题用它）。 */
-  const TAB_ORDER: Tab[] = ['timeline', 'conversation', 'commands', 'files', 'diff'];
+  const TAB_ORDER: Tab[] = ['timeline', 'scene', 'files', 'diff'];
   const TAB_LABELS: Record<Tab, string> = {
     timeline: '时间线',
-    conversation: '会话',
-    commands: '命令与输出',
+    scene: '现场',
     files: '产出文件',
     diff: 'Diff',
   };
   let tab = $state<Tab>('timeline');
-  let selectedRunId = $state<number | null>(null);
+  /**
+   * 深链 / 跳转要带到眼前的那个 run（`?run=` 消费一次、档案盒的「去看对话」各写一次）；
+   * `null` = 没有落点。旧「会话页签的选中 run」的变体：现场时间线不搞选中态，
+   * 只把那一轮滚进视野并亮一下边框。
+   */
+  let highlightRun = $state<number | null>(null);
   let splitOpen = $state(false);
   let modelOpen = $state(false);
   let providers = $state<Provider[]>([]);
@@ -175,18 +184,17 @@
     void tick().then(() => document.getElementById(`tab-${next}`)?.focus());
   }
 
+  /**
+   * 档案盒的「去看对话」落点（决策 349）：跳到现场页签，把那一轮滚进视野。
+   * 完整会话顺手装上（`loadConversation` 有缓存，重复点不重复发）。
+   */
   function gotoconversation(stage: string, node: string) {
     const match = detail.conversations.find((c) => c.stage === stage && c.node === node);
-    tab = 'conversation';
+    tab = 'scene';
     if (match) {
-      selectedRunId = match.run_id;
+      highlightRun = match.run_id;
       void taskDetail.loadConversation(match.run_id);
     }
-  }
-
-  function selectRun(runId: number) {
-    selectedRunId = runId;
-    void taskDetail.loadConversation(runId);
   }
 
   /**
@@ -223,9 +231,18 @@
     }
     if (consumedRun === runId) return;
     consumedRun = runId;
-    selectRun(runId);
-    tab = 'conversation';
+    highlightRun = runId;
+    void taskDetail.loadConversation(runId);
+    tab = 'scene';
     writeQuery({ run: null }, { replace: true });
+  });
+
+  /**
+   * 现场页签的批量装载（决策 349）：进页签就把每一轮的完整会话读齐（缓存挡住重复），
+   * 时间线才摆得开——旧「会话页签」是选中哪轮读哪轮，合并版没有选中态可搭。
+   */
+  $effect(() => {
+    if (tab === 'scene') void taskDetail.loadAllConversations();
   });
 
   function handleDockHeight(h: number) {
@@ -514,7 +531,7 @@
               tabindex={tab === t ? 0 : -1}
               onclick={() => (tab = t)}
             >
-              {TAB_LABELS[t]}{#if t === 'commands'}<span class="c">{detail.commands.length}</span>{/if}
+              {TAB_LABELS[t]}{#if t === 'scene'}<span class="c">{detail.conversations.length + detail.commands.length}</span>{/if}
             </button>
           {/if}
         {/each}
@@ -531,24 +548,17 @@
             currentStage={focalCursor?.stage}
             currentNode={focalCursor?.node}
           />
-        {:else if tab === 'conversation'}
-          <ConversationViewer
+        {:else if tab === 'scene'}
+          <SceneTimeline
             conversations={detail.conversations}
-            {selectedRunId}
-            onselect={selectRun}
-            getConversation={(runId) => taskDetail.conversationsFull[runId]}
-            loading={taskDetail.conversationsLoading}
+            conversationFor={(runId) => taskDetail.conversationsFull[runId]}
+            commands={detail.commands}
             liveDeltas={detail.liveDeltas}
             liveTools={detail.liveTools}
-            streamTokens={detail.streamTokens}
-          />
-        {:else if tab === 'commands'}
-          <CommandLog
-            commands={detail.commands}
-            outputFor={(c) => taskDetail.outputFor(c)}
-            streamedFor={(c) => detail.commandOutput[c.id] ?? null}
-            errorFor={(c) => taskDetail.commandOutputError[c.id] ?? null}
-            onload={(cmdId) => taskDetail.loadCommandOutput(cmdId)}
+            commandOutputFor={(c) => taskDetail.outputFor(c)}
+            commandErrorFor={(c) => taskDetail.commandOutputError[c.id] ?? null}
+            onloadCommand={(cmdId) => taskDetail.loadCommandOutput(cmdId)}
+            highlightRunId={highlightRun}
           />
         {:else if tab === 'files'}
           <FileViewer loaded={taskDetail.files} onload={(path) => void taskDetail.loadFile(path)} />
