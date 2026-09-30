@@ -134,6 +134,18 @@ test.describe('UX2 ⑥ 几何：坞 / 状态行 / 档案盒（票 05 / 08 / 09�
     expectBundleHealthy(bundle);
   });
 
+  /**
+   * ③ 档案盒吸顶：铭牌不被顶栏盖住（票 09 / R2-11）。
+   *
+   * **取样要取在「吸顶」那一段**（2026-09-30，决策 337）：这一页总共只能滚 156px，原先写的
+   * `scrollTo(0, 500)` 被夹到 156——那是**行程末端**。档案盒的 sticky 行程受它包含块
+   * （网格行）的下沿所限，滚到头之后它随页往上走：实测 dossierTop 从钉位的 94 掉到 86，
+   * 铭牌跟着上移 8px，于是与顶栏相交 6px。那不是让位算错，是它在**离场**——顶栏那条
+   * `top: calc(var(--topbar-h) + 16px)` 一个字都没错（探针曲线：滚 22–140 恒为 94/80）。
+   *
+   * 所以这里把位置算在**钉住之后、离场之前**，并且先断言「确实吸顶了」：用例的名字叫
+   * 「吸顶时……」，此前却没有一条断言真的验证它吸顶（只查了不相交）。
+   */
   test('档案盒吸顶时「等你拍板」铭牌不被顶栏盖住', async ({ page }) => {
     const bundle = watchBundle(page);
     await page.setViewportSize({ width: 1280, height: 900 });
@@ -141,7 +153,15 @@ test.describe('UX2 ⑥ 几何：坞 / 状态行 / 档案盒（票 05 / 08 / 09�
     await settleBundle(page, bundle);
     await expect(page.locator('aside.dossier')).toBeVisible({ timeout: 60_000 });
 
-    await page.evaluate(() => window.scrollTo(0, 500));
+    // 钉位读**实测**的 CSS（`--topbar-h` 一档一变，写死就是又一个对不上的魔数）；
+    // +90px 是钉住之后的余量——离场那一段在页尾（这一页实测：滚 140px 仍钉住、156px 已离场，
+    // 而 500 会被夹到 156）。
+    await page.evaluate(() => {
+      const dossier = document.querySelector('.dossier') as HTMLElement;
+      const pin = parseFloat(getComputedStyle(dossier).top);
+      const natural = dossier.getBoundingClientRect().top + window.scrollY;
+      window.scrollTo(0, natural - pin + 90);
+    });
     await page.waitForTimeout(400);
 
     const m = await page.evaluate(() => {
@@ -151,18 +171,25 @@ test.describe('UX2 ⑥ 几何：坞 / 状态行 / 档案盒（票 05 / 08 / 09�
       if (!header || !tag || !dossier) return null;
       const h = header.getBoundingClientRect();
       const t = tag.getBoundingClientRect();
+      const d = dossier.getBoundingClientRect();
+      const pin = parseFloat(getComputedStyle(dossier).top);
       const overlapY = Math.max(0, Math.min(h.bottom, t.bottom) - Math.max(h.top, t.top));
       const overlapX = Math.max(0, Math.min(h.right, t.right) - Math.max(h.left, t.left));
       return {
         headerBottom: Math.round(h.bottom),
         tagTop: Math.round(t.top),
         tagBottom: Math.round(t.bottom),
+        dossierTop: Math.round(d.top),
+        pin: Math.round(pin),
         overlap: Math.round(Math.min(overlapX, overlapY)),
-        stickyTop: getComputedStyle(dossier).top,
         inViewport: t.top >= 0 && t.bottom <= window.innerHeight,
       };
     });
     expect(m, '待拍板任务应当有档案盒与铭牌').not.toBeNull();
+    expect(
+      Math.abs(m!.dossierTop - m!.pin),
+      `这一档应当已经吸顶：dossierTop=${m!.dossierTop} 钉位=${m!.pin}（页不够长就够不着钉位，那是取样点的问题）`,
+    ).toBeLessThanOrEqual(1);
     expect(m!.overlap, `铭牌与顶栏相交（tagTop=${m!.tagTop} headerBottom=${m!.headerBottom}）`).toBe(
       0,
     );

@@ -529,15 +529,47 @@ mod tests {
     use super::*;
 
     /// 一个假 rtk：按 `hook claude` 的协议回话，内容由环境变量决定。
+    ///
+    /// **写这一步交给子进程做**，不是洁癖——Linux 上 exec 一个还开着写 fd 的文件回
+    /// `ETXTBSY`（`Text file busy (os error 26)`），而这个 crate 的用例是**几百条并排跑**
+    /// 的：别的用例随时在 fork（git fixture、起进程那些），fork 出来的子进程会把那时开着的
+    /// 写 fd 一起继承走。于是「刚写完就 exec」在这里有一扇真实的窗——CI 首跑就红在
+    /// [`probe_attributes_each_failure`]，原因串正是那句 `Text file busy`。
+    ///
+    /// 把写交给 `sh`，写 fd 就只活在它自己肚子里（`cat` 不再 fork 别人），父进程以及父进程
+    /// fork 出来的任何东西都拿不到它——那扇窗是**从形状上关掉**的，不是靠重试等它过去。
     fn fake_rtk(dir: &Path, name: &str, body: &str) -> PathBuf {
         let path = dir.join(name);
-        std::fs::write(&path, body).unwrap();
+        write_shim(&path, body);
+        path
+    }
+
+    /// 见 [`fake_rtk`]：脚本内容经 stdin 递给一个 `sh`，由它写到目标路径并给可执行位。
+    fn write_shim(path: &Path, body: &str) {
         #[cfg(unix)]
         {
-            use std::os::unix::fs::PermissionsExt;
-            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+            use std::io::Write;
+            let mut child = std::process::Command::new("/bin/sh")
+                .arg("-c")
+                .arg("cat > \"$1\" && chmod 755 \"$1\"")
+                .arg("sh")
+                .arg(path)
+                .stdin(std::process::Stdio::piped())
+                .spawn()
+                .expect("写假 rtk 的助手进程起不来");
+            // `take()` 出来的那个值在这里落地：它的 Drop 关掉 stdin——不关，`cat` 会一直
+            // 等下一块，`wait()` 就等成死锁。
+            child
+                .stdin
+                .take()
+                .expect("助手进程的 stdin 应当是可写的管道")
+                .write_all(body.as_bytes())
+                .expect("把脚本内容递给助手进程失败");
+            let status = child.wait().expect("等写假 rtk 的助手进程失败");
+            assert!(status.success(), "写假 rtk 失败：{status}");
         }
-        path
+        #[cfg(not(unix))]
+        std::fs::write(path, body).expect("写假 rtk 失败");
     }
 
     /// 下面这几条「起真进程」的断言用的宽松预算，**不是**生产里那两档

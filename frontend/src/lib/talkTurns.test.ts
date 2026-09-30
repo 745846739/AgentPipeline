@@ -465,6 +465,32 @@ describe('在飞三态：乐观轮 / 流式轮 / 失败轮（票 02 搬入，恒
     expect(paired[0].needsPairing).toBe(true);
   });
 
+  /**
+   * 同一个失败不许在时间线里摆两轮（决策 337）：后端在失败当场就把原因落成台账行
+   * （决策 211④），本地那条传输层报文与它说的是一件事——台账那一行在场时本地那条
+   * **一帧都不出现**（判在渲染上；只在收尾那一刻判一次会留下共存窗，e2e 20 次红 2 次）。
+   */
+  it('台账已接管这次失败时，本地那条失败轮不上时间线；没接管时它是唯一信号', () => {
+    const ledgerFailed = sessionOf([
+      message({ id: 1, kind: 'mine', content: '这句话要能改几个字再发' }),
+      message({ id: 2, kind: 'failed', content: '【没跑起来】这一轮没跑起来（llm_auth）：…' }),
+    ]);
+    const stream = streamOf({ error: 'provider 鉴权失败' });
+
+    const owned = buildTurns(
+      inputOf({ session: ledgerFailed, stream, ledgerOwnsFailure: true }),
+    );
+    expect(owned.map((t) => t.key)).toEqual(['m1', 'm2']);
+    expect(owned.some((t) => t.key === 'send-error')).toBe(false);
+
+    // 请求根本没到后端（断网 / 代理 502 / 配对 403 在进 handler 之前）：台账不会多出新行，
+    // 本地这条就是**唯一**的信号——它必须还在（这条是上一条的反面，防「一律不摆」）。
+    const notOwned = buildTurns(
+      inputOf({ session: ledgerFailed, stream, ledgerOwnsFailure: false }),
+    );
+    expect(notOwned.map((t) => t.key)).toEqual(['m1', 'm2', 'send-error']);
+  });
+
   it('partial 的边界：在流（streaming）就不是断流；流停了但有字才是', () => {
     const streaming = buildTurns(
       inputOf({ sending: true, stream: streamOf({ steps: [textStep('一半')], streaming: true }) }),

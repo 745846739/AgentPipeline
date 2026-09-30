@@ -354,6 +354,19 @@ export interface TalkTurnsInput {
    * （人的班次里的存量播报行照旧靠它，裁决 12：不回填）。
    */
   ledgerKind?: string;
+  /**
+   * 这次失败**已经由台账那一行接管**了吗（决策 337）——判据住在
+   * `realtime/foreman.ts::ledgerOwnsTheFailure`（「重取回来的台账里出现了发送之前没有的失败行」）；
+   * 组件按「发送前已有的失败行 id」判好，把这枚布尔传进来，与 `pairingNeeded` 同一姿态。
+   *
+   * **为什么判据必须在渲染这一层**：本地那条「发送失败」轮是**传输层**的报文（请求根本没到
+   * 后端时它是唯一信号），而后端在失败当场就把原因落成了台账行——两条说的是一件事，谁都可能
+   * 先到。只判在收尾那一刻（重取成功之后）会给出一条真实的共存窗：重取回包一落地，时间线上
+   * 同时摆着两轮「发送失败」，等下一次判据跑过才收掉。那个窗人眼未必看得见，断言看得见
+   * （2026-09-30 实测：「对讲台 · 发不出去时不清空输入框」20 次里红 2 次，正是撞上它）。
+   * 判在渲染上，这个窗从形状上不存在——台账那一行在场，本地那条就一帧都不出现。
+   */
+  ledgerOwnsFailure?: boolean;
 }
 
 /**
@@ -492,7 +505,10 @@ export function buildTurns(input: TalkTurnsInput): TurnView[] {
       interruptedAt: null,
     });
   }
-  if (stream.error) {
+  // 本地那条传输层失败轮（决策 337）：台账已经用自己那一行记下这次失败时**不摆它**——
+  // 同一个失败在时间线里摆成两轮是这张表挡下的形状；请求根本没到后端（断网 / 代理 502 /
+  // 配对 403 发生在进 handler 之前）时台账不会有新行，它才是唯一信号。
+  if (stream.error && !input.ledgerOwnsFailure) {
     out.push({
       key: 'send-error',
       kind: 'failed',

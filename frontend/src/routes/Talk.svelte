@@ -276,6 +276,26 @@
   const sendPairingNeeded = $derived(talk.pairingNeeded);
   const streamStatus = $derived(talk.status);
   /**
+   * **这一趟发送之前**台账里已有的失败行 id（决策 337）。
+   *
+   * 判「这次失败是不是已经由台账那一行接管了」要的正是这个差集：不带它的话，一次早先的失败
+   * 会让此后每一次真实断网（请求根本没到后端、台账不会多出任何行）都静默下来——而那种情况
+   * 恰恰是本地那条失败轮存在的理由（判据在 `realtime/foreman.ts`；这里只记现场，在 `sendNow`
+   * 开头按当时的台账落一次）。
+   */
+  let failuresBefore = $state<ReadonlySet<number>>(new Set());
+  /**
+   * 这次失败已被台账那一行接管（决策 337）——**判在渲染上**，不是收尾那一刻判一次。
+   *
+   * 两条来源（后端当场落的台账行、本地那条传输层报文）说的是一件事，谁先到都合理；只在收尾时
+   * 判一次会给出一条真实的共存窗：重取回包一落地，时间线上同时摆着两轮「发送失败」，等下一次
+   * 判据跑过才收掉（2026-09-30 实测：e2e 20 次里红 2 次撞的就是这个窗）。判据挂在渲染的输入上，
+   * 窗从形状上不存在。
+   */
+  const ledgerOwnsFailure = $derived(
+    ledgerOwnsTheFailure(session?.messages ?? [], failuresBefore),
+  );
+  /**
    * 本机刚发出去、还没落地的那一班（决策 220③ 的「正在回话」前半支）。
    *
    * 记 id 而不是一个布尔：切走之后那一轮照旧在路上，标记要落在**它**那一行上，
@@ -530,6 +550,7 @@
       stream,
       pairingNeeded: sendPairingNeeded,
       ledgerKind,
+      ledgerOwnsFailure,
     }),
   );
 
@@ -1419,8 +1440,9 @@
     // 下面这一趟 POST 管——两条路各收各的口，混起来会把这一轮提前判成「落地了」。
     talk.followingSince = null;
     // 这一趟之前台账里已有的失败轮 id：失败回来后靠它分辨「这次新出现的那一条」
-    // （判据在 realtime/foreman.ts；不记的话，早先的失败会让真正的断网静默下来）
-    const failuresBefore = failedLedgerRowIds(session?.messages ?? []);
+    // （判据在 realtime/foreman.ts；不记的话，早先的失败会让真正的断网静默下来）。
+    // 消费它的地方是上面那条 `ledgerOwnsFailure` —— 判在渲染上（决策 337）。
+    failuresBefore = failedLedgerRowIds(session?.messages ?? []);
     // 「这一次是本地等不到回包」那一类（决策 223）——在 catch 里趁 `ApiError` 还在手判好，
     // `finally` 里要用（它决定那条本地失败轮退不退场，见下）。缺省假：成功那一趟用不到它。
     let timedOut = false;
@@ -1489,13 +1511,10 @@
         talk.pendingText = null;
         // 这一趟收尾也可能发生在页面之外（切走之后 POST 才失败回来）：提醒在屏的那一页重读
         talk.markLedgerStale();
-        // 后端**已经**把这一轮为什么没跑起来落了账（决策 211④ / 票 04）：那一行就是这次的
-        // 失败轮，而且比本地这条传输报文更全（带归因、刷新后还在）。此时撤掉本地的 error，
-        // 免得同一个失败在时间线里摆成两轮。台账里没有新失败行时才用它兜底——请求根本没
-        // 到后端（网络断了、代理 502、配对 403 发生在进 handler 之前）时，本地是唯一信号。
-        if (ledgerOwnsTheFailure(session?.messages ?? [], failuresBefore)) {
-          talk.stream = { ...talk.stream, error: null };
-        }
+        // **本地那条失败轮的退场不在这里办**（决策 337）：后端已经把这一轮为什么没跑起来
+        // 落成了台账行（决策 211④ / 票 04），而本地这条承载传输层报文与配对入口——两者
+        // 谁的先到都可能，判一次（此刻）会留下共存窗。判据挂在 `ledgerOwnsFailure` 上，
+        // 由时间线的归约逐帧消费：台账那一行在场，本地那条一帧都不出现。
       }
     } finally {
       talk.sending = false;
