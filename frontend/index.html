@@ -31,7 +31,10 @@
     <meta name="apple-mobile-web-app-capable" content="yes" />
     <meta name="apple-mobile-web-app-status-bar-style" content="black" />
     <meta name="apple-mobile-web-app-title" content="AgentPipeline" />
-    <link rel="apple-touch-icon" href="/icons/icon-maskable-192.png" />
+    <!-- `?v=2`（决策 347）：决策 336 那段日子里 iOS 抓图标吃到的是 401，失败的抓取被按 URL
+         记住——同一条地址再添加还是灰方块。换查询串就是换一条地址，逼它重新抓；
+         icons/* 的响应是一年期 immutable，靠重取救不回来。与 285 给 manifest 的 ?v=2 同一招。 -->
+    <link rel="apple-touch-icon" href="/icons/icon-maskable-192.png?v=2" />
     <title>AgentPipeline · 像素机房</title>
     <script>
       // 深浅两套像素主题：本地记忆，避免首屏闪回深色（决策 169，键名沿用既有约定）

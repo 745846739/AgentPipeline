@@ -14,7 +14,9 @@
   取的是**当时那一页**上的 `apple-touch-icon`——这一页没有它，主屏上就落一张系统占位的
   字母块（2026-09-30 实测）。样式与脚本仍然一个外链都不许有。
 -->
-<link rel="apple-touch-icon" href="/icons/icon-maskable-192.png" />
+<!-- `?v=2`（决策 347）：与 index.html 的同名参数同批——iOS 把 401 那次失败的图标抓取
+     按 URL 记住了，换地址才肯重抓；icons/* 是一年期 immutable，等缓存过期等于没有。 -->
+<link rel="apple-touch-icon" href="/icons/icon-maskable-192.png?v=2" />
 <style>
   :root { color-scheme: dark }
   * { box-sizing: border-box }
