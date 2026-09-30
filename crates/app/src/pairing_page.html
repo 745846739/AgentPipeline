@@ -9,7 +9,12 @@
   未配对设备看到的**唯一一张页**（决策 336）。它由应用自己托管，且**必须自带全部样式与
   脚本**：`/assets/*` 也在配对闸门后面，外链一个字节都取不到——页面会在没有任何 CSS 的
   状态下渲染。这条约束由 `pairing_page.rs` 的单测钉住（不许出现 src/href 外链）。
+
+  **唯一的例外是下面那枚图标（决策 340）**：`/icons/*` 在闸门外面，而 iOS「添加到主屏幕」
+  取的是**当时那一页**上的 `apple-touch-icon`——这一页没有它，主屏上就落一张系统占位的
+  字母块（2026-09-30 实测）。样式与脚本仍然一个外链都不许有。
 -->
+<link rel="apple-touch-icon" href="/icons/icon-maskable-192.png" />
 <style>
   :root { color-scheme: dark }
   * { box-sizing: border-box }

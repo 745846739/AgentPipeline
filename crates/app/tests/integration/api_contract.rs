@@ -1706,8 +1706,8 @@ async fn pairing_lan_read_requires_token_now() {
 /// 三个断言各自钉一件事：
 /// ① 导航（`Accept: text/html`）拿到 401 与配对页——**不是**外壳，也不是空白；
 /// ② 同一条 `/` 用非导航的 `Accept` 请求时，回到 403 JSON 的既有形状（界面按 `kind` 分支）；
-/// ③ 资产与 service worker 也在闸门后面（`/assets/*`、`/sw.js`、`/manifest.webmanifest`）——
-///    这是从「外壳公开」改过来的那一步，退回去等于退回空看板。
+/// ③ 外壳本身（入口页与产物）也在闸门后面——这是从「外壳公开」改过来的那一步，
+///    退回去等于退回空看板。**安装链路那三族不在此列**（决策 340，见下一条用例）。
 #[tokio::test]
 async fn pairing_lan_unpaired_gets_only_the_pairing_page() {
     let api = api_lan().await;
@@ -1742,14 +1742,8 @@ async fn pairing_lan_unpaired_gets_only_the_pairing_page() {
     assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
     assert_eq!(body["kind"], "pairing_required", "{body}");
 
-    // ③ 静态外壳整族都在闸门后面
-    for uri in [
-        "/assets/deadbeef-not-here.js",
-        "/sw.js",
-        "/index.html",
-        "/manifest.webmanifest",
-        "/icons/icon-192.png",
-    ] {
+    // ③ 外壳本身（入口页与产物）都在闸门后面
+    for uri in ["/assets/deadbeef-not-here.js", "/index.html"] {
         let (status, body) = json_body(
             api.router
                 .clone()
@@ -1759,6 +1753,54 @@ async fn pairing_lan_unpaired_gets_only_the_pairing_page() {
         )
         .await;
         assert_eq!(status, StatusCode::FORBIDDEN, "{uri} 也该要凭据：{body}");
+    }
+}
+
+/// **安装链路的资产不凭据**（决策 340，修订上一条用例的 ③）。
+///
+/// 起因是 2026-09-30 的实测：iPhone 上「添加到主屏幕」之后主屏图标落成一张系统占位的
+/// 字母块——iOS 抓 `apple-touch-icon` 时手上不一定有那枚配对 cookie，而闸门当时把
+/// 图标 / manifest / service worker 一起罩住了。这几枚文件里没有一个字节的业务数据。
+///
+/// 两组断言钉住这条边界**开在哪里**：这三族（四条路径）放行、入口页与产物照旧 403——把 `/` 也放行
+/// 就退回决策 336 修的那个「能加载、每个数据请求都 403 的空看板」。
+#[tokio::test]
+async fn pairing_lan_unpaired_can_still_fetch_install_assets() {
+    let api = api_lan().await;
+
+    for uri in [
+        "/icons/icon-192.png",
+        "/icons/icon-maskable-192.png",
+        "/manifest.webmanifest",
+        "/sw.js",
+    ] {
+        let response = api
+            .router
+            .clone()
+            .oneshot(lan_get(uri, None))
+            .await
+            .unwrap();
+        let status = response.status();
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "安装链路的资产不该要凭据（决策 340）：{uri} → {status}"
+        );
+    }
+
+    // 对照：外壳与数据照旧挡着（缺了这一段，上一段可能只是「闸门没生效」而绿）
+    for uri in ["/", "/index.html", "/tasks"] {
+        let response = api
+            .router
+            .clone()
+            .oneshot(lan_get(uri, None))
+            .await
+            .unwrap();
+        assert_eq!(
+            response.status(),
+            StatusCode::FORBIDDEN,
+            "外壳与数据照旧要凭据：{uri}"
+        );
     }
 }
 

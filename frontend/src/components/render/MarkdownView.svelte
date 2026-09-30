@@ -17,6 +17,13 @@
     font-size: 12px;
     line-height: 1.65;
     max-width: 80ch;
+    /* 长到一行放不下的**单个词**（JSON 正文、URL、commit hash、base64、命令输出）也得折，
+       否则它把版面顶宽——iOS 在 `width=device-width` 下会因此把**整页**缩到塞得下为止
+       （2026-09-30 实测：对讲台布局视口 390 → 1560，字号掉到四分之一）。决策 341。
+       `anywhere` 而不是 `break-word`：前者参与 min-content 计算，flex/grid 祖先才会真的
+       收得下来；后者只是「视觉上断行」，盒子的固有宽度照旧是那个长词的宽度。
+       `pre` 不受这条管——它自己有 `overflow-x: auto`，是**有意**的横滚。 */
+    overflow-wrap: anywhere;
   }
   /* 像素字体无字重轴：层级靠字号倍数与亮度阶；标题 24px 起步（§2.2） */
   .md :global(h1),

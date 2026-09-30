@@ -134,6 +134,11 @@ pub async fn cross_origin_guard(
 /// 就挡得能被理解：未配对设备只得到一张自带样式的配对页（[`crate::pairing_page`]）。
 /// 代价是那张页不能引用任何同源资源，故它全内联。
 ///
+/// **一处例外（决策 340）**：图标 / manifest / `sw.js` 这三族**在闸门外面**
+/// （[`is_install_asset`]）。它们是浏览器自己发起的、不带 `?pair=` 也不带自定义头的请求，
+/// 而它们不放行的代价不是「看得见数据」而是「装不上」——iOS 抓不到 `apple-touch-icon` 就在
+/// 主屏上落一张系统占位的字母块。配对页自己因此也能引那一枚图标（见 `pairing_page.rs`）。
+///
 /// 保留的两处历史理由（现在被上面那条总规则盖住，但各自的账仍然成立）：
 /// `/foreman/` 读对话会触发真实 LLM 调用（决策 182㉘：花钱要凭据）；
 /// `/notify/push/` 的读接口本身是一条外泄管道——设备清单里每一条都是「往这台设备推任意
@@ -149,6 +154,17 @@ pub async fn pairing_guard(
         return next.run(request).await;
     }
     if peer_is_loopback(request.extensions()) {
+        return next.run(request).await;
+    }
+
+    // 安装链路的那几枚资产不凭据（决策 340）。它们是**浏览器自己发起**的请求：图标与
+    // manifest 的地址由 HTML 决定，地址里带不了 `?pair=`（令牌不进 HTML，决策 189），
+    // 也不发自定义头，能不能 200 只取决于那枚 cookie 在不在——而 iOS 抓 `apple-touch-icon`
+    // 的时机与「文档响应刚把 cookie 种下」之间没有先后保证（实测 2026-09-30：主屏图标落成
+    // 一张系统占位的字母块）。**挡数据那条初衷一点不动**：入口页 `/` 与 `/index.html`、
+    // 产物 `/assets/*`、字体、以及一切数据接口照旧在闸门后面，未配对拿到的照旧只有那张
+    // 配对页；这几枚文件里没有一个字节的业务数据。
+    if is_install_asset(request.uri().path()) {
         return next.run(request).await;
     }
 
@@ -183,6 +199,21 @@ pub async fn pairing_guard(
         return crate::pairing_page::response();
     }
     pairing_rejected().into_response()
+}
+
+/// 这次请求是不是**安装链路的资产**（决策 340）：在闸门外面。
+///
+/// 三族，逐个点名而不是按扩展名猜——按扩展名会把
+/// `/assets/*.png`（产物，仍在闸门后）一起放走：
+/// - `/icons/*`：`apple-touch-icon` 与 manifest 里的那几枚，iOS「添加到主屏幕」取的就是它；
+/// - `/manifest.webmanifest`：安装判定要读它（决策 285 钉过它的缓存语义，与本条无关）；
+/// - `/sw.js`：service worker 脚本。注册发生在**主屏容器**里，那是与 Safari 分开的存储
+///   （决策 191），不保证带着本站的 cookie——403 会让 Web Push 静默失效，而它没有数据。
+///
+/// **不在名单里**的静态外壳照旧要凭据：`/`、`/index.html`、`/assets/*`、`/fonts/*`。
+/// （`/favicon.ico` 不在名单上：这份构建里根本没有这个文件，放行也只是把 403 换成 404。）
+fn is_install_asset(path: &str) -> bool {
+    path.starts_with("/icons/") || matches!(path, "/manifest.webmanifest" | "/sw.js")
 }
 
 /// 地址里的配对参数（与 `server_info::pairing_url` 是同一个约定：`{base}/?pair={token}`）。
