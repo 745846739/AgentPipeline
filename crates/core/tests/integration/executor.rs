@@ -777,6 +777,14 @@ impl LlmClient for PendingAgent {
 }
 
 /// 等执行体真的起来：任务被持有执行权 + 落了一条 running run（票 02 的用例都要这个起点）。
+/// 抓任务**第一条** active run + 执行权，两样都在场才返回 run id。
+///
+/// ⚠️ 它抓的是**第一条**：`init.execute`（纯代码节点）的 run 完成得快但**不是零耗时**，
+/// 起跑的一瞬可能先抓到**它**——如果随后才拨时钟，真正挂起的 agent run 起在**拨后**
+/// （started_at 是新时刻），看门狗看它是新鲜的，「判超时」的断言就落空
+/// （2026-09-30 runner 实测，决策 343）。要看门狗判「这个 run 超时」的用例，
+/// 用 [`wait_for_running_validate_input`] 把等待钉在真正会挂起的那个 agent 节点上；
+/// 只等「跑起来了」、且断言与拨时钟无关的（如 t-ok 那条）才用它。
 async fn wait_for_a_held_running_run(ctx: &Ctx, task_id: &str) -> i64 {
     tokio::time::timeout(Duration::from_secs(30), async {
         loop {
@@ -835,7 +843,9 @@ async fn a_terminal_run_frees_its_ownership_even_when_the_future_never_returns()
         let e = stuck.clone();
         tokio::spawn(async move { e.run("t-stuck").await })
     };
-    let run_id = wait_for_a_held_running_run(&ctx, "t-stuck").await;
+    // 不能抓「第一条 active run」（可能是 init 的短命 run，见该助手的警示）——
+    // 钉在会挂起的 agent 节点上，拨时钟之后它才必然是陈旧的（决策 343）。
+    let run_id = wait_for_running_validate_input(&ctx, "t-stuck").await;
     assert!(
         ctx.store
             .get_task("t-stuck")
@@ -927,7 +937,9 @@ async fn the_stuck_to_self_healed_chain_needs_no_restart() {
         let e = stuck.clone();
         tokio::spawn(async move { e.run("t-chain").await })
     };
-    let run_id = wait_for_a_held_running_run(&ctx, "t-chain").await;
+    // 不能抓「第一条 active run」（可能是 init 的短命 run，见该助手的警示）——
+    // 钉在会挂起的 agent 节点上，拨时钟之后它才必然是陈旧的（决策 343）。
+    let run_id = wait_for_running_validate_input(&ctx, "t-chain").await;
 
     // 心跳一次都没刷过 → 看门狗判它终态。
     ctx.clock.advance_secs(400);
