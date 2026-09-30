@@ -706,8 +706,8 @@ fn tool_defs(
     // 问题，两处各写一份谓词的后果是「一侧摘掉了、另一侧还广告着」这种只能靠现象定位的漂移。
     let denied = |name: &str| crate::agent::tools::denied_by_tier(name, env_mode);
     for name in effective_tools(declared) {
-        if name == "submit_metadata" {
-            continue; // 最后以 schema 形式追加
+        if name == crate::agent::catalog::SUBMIT_METADATA {
+            continue; // 最后以 schema 形式追加（决策 38：与校验同源，不走目录表）
         }
         if denied(&name) {
             continue;
@@ -737,15 +737,25 @@ fn tool_defs(
                 ),
             ));
         }
-        defs.push(ToolDef {
-            name,
-            description: String::new(),
-            parameters: serde_json::json!({"type": "object"}),
-        });
+        // 决策 353：广告从目录表取（name + description + 参数 schema 一张表）——
+        // 空壳广告（`description: String::new()` + `{"type":"object"}`）已退场，
+        // `edit_file` 的 old_text/new_text 契约从此在广告出的接口里。
+        // 走到这里的名字 ⊆ 目录表（上面的已知集检查 + submit_metadata 已 continue），
+        // 这条 else 是与上一条分支同姿态的不可达兜底。
+        let Some(def) = crate::agent::catalog::def_for(&name) else {
+            return Err(crate::Error::Config(format!(
+                "阶段 {stage} 节点 {node}：工具 {name} 没有目录行（agent::catalog）"
+            )));
+        };
+        defs.push(def);
     }
-    // 有名字态 / 目录态技能 → 自动带上 `Skill`（渐进披露的按需拉取入口）
+    // 有名字态 / 目录态技能 → 自动带上 `Skill`（渐进披露的按需拉取入口）。
+    // 定义从目录表取（决策 353）。
     if needs_skill_tool && !denied(SKILL_TOOL) && !defs.iter().any(|d| d.name == SKILL_TOOL) {
-        defs.push(skill_tool_def());
+        defs.push(
+            crate::agent::catalog::def_for(SKILL_TOOL)
+                .expect("Skill 的目录行必须存在（agent::catalog 冻结断言钉住）"),
+        );
     }
     let schema_tool: ToolDef = match kind {
         AgentNodeKind::ValidateInput => {
@@ -777,34 +787,12 @@ fn tool_defs(
     Ok(defs)
 }
 
-/// `Skill` 工具的 tool 定义（决策 172③，票 06）。
-///
-/// 描述里点明「用技能目录里列出的名字」——渐进披露的闭环：模型从目录态看到可用技能，
-/// 再凭名字来这里取正文。
-fn skill_tool_def() -> ToolDef {
-    ToolDef {
-        name: SKILL_TOOL.to_string(),
-        description: "按名字加载一个技能的正文（技能目录里列出的名字）。\
-                      上游技能正文里的 `Call the Skill tool` 说的就是这个工具。"
-            .to_string(),
-        parameters: serde_json::json!({
-            "type": "object",
-            "properties": {
-                "name": {
-                    "type": "string",
-                    "description": "技能名（见 system prompt 的技能目录）"
-                }
-            },
-            "required": ["name"]
-        }),
-    }
-}
-
 /// `spawn_sub_agent` 工具的 tool 定义（决策 172③，票 08）。
 ///
 /// 描述里明说**只读**：让模型知道子代理能做什么，才不会派它去写文件或跑命令而白等一轮。
 /// 子代理只能 read_file / list_dir，不能写文件或执行命令，也不再派子代理。
 /// 适合「读很多文件、只要结论」的场景——原文留在子代理上下文，父上下文只收摘要。
+/// 它**不在**目录表（决策 353 收的是 8 个内置工具；这是要显式声明的扩展工具）。
 fn spawn_sub_agent_tool_def() -> ToolDef {
     ToolDef {
         name: crate::agent::SPAWN_SUB_AGENT_TOOL.to_string(),
@@ -1114,6 +1102,41 @@ mod tests {
         assert!(out.is_char_boundary(out.len()));
         assert!(out.chars().all(|c| c == '中'
             || ".\n[闸门日志超长：已省略中间 400 字符；完整日志见上方 stdout_path]".contains(c)));
+    }
+
+    /// 决策 353：广告集从目录表取——描述非空、schema 带真实参数形状；`submit_metadata`
+    /// 的 schema 仍由 Rust 结构体派生（决策 38 同源），目录占位不得泄漏进广告。
+    #[test]
+    fn tool_defs_serves_catalog_specs_and_keeps_metadata_schema_derived() {
+        let (stage, node) = (crate::types::Stage::Develop, crate::types::Node::Execute);
+        let defs = tool_defs(
+            AgentNodeKind::DevelopExecute,
+            &[],
+            &[],
+            crate::types::EnvMode::Auto,
+            stage,
+            node,
+        )
+        .unwrap();
+        let read_file = defs
+            .iter()
+            .find(|d| d.name == crate::agent::catalog::READ_FILE)
+            .unwrap();
+        assert!(!read_file.description.trim().is_empty(), "空壳广告已退场");
+        assert!(
+            read_file.parameters.get("properties").is_some(),
+            "广告出的 schema 须带参数形状：{:?}",
+            read_file.parameters
+        );
+        let md = defs
+            .iter()
+            .find(|d| d.name == crate::agent::catalog::SUBMIT_METADATA)
+            .unwrap();
+        assert_eq!(
+            md,
+            &crate::agent::submit_metadata_tool::<crate::types::CodeChanges>("提交代码变更元数据"),
+            "submit_metadata 的 schema 只能来自结构体派生（决策 38）"
+        );
     }
 
     /// 决策 154 的后续票：`tool_defs` 对未知工具名**报错**，不再「静默丢弃 + 一条 warn」。

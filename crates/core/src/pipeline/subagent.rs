@@ -42,8 +42,11 @@ pub const SUB_AGENT_TYPE: &str = "subagent";
 /// 子代理**固定**的只读工具集（决策 172③，票 08）。
 ///
 /// 这是安全边界本身，不是配置项：故意写成常量，任何「按阶段扩权」的改动都必须先改
-/// 这里，从而在 diff 里显式可见。
-pub const SUB_AGENT_TOOLS: [&str; 2] = ["read_file", "list_dir"];
+/// 这里，从而在 diff 里显式可见。名字引用目录表常量（决策 353）——字面量只此一份。
+pub const SUB_AGENT_TOOLS: [&str; 2] = [
+    crate::agent::catalog::READ_FILE,
+    crate::agent::catalog::LIST_DIR,
+];
 
 /// 子代理的收尾前言：要求它只回摘要（父上下文要的是摘要，不是原文）。
 const SUB_AGENT_PERSONA: &str = "你是一个只读检索子代理。你的唯一任务是按父代理给出的描述\
@@ -141,14 +144,15 @@ impl StoreSubAgentRunner {
     /// 子代理**固定只读**的工具定义。
     ///
     /// 注意它不经 `effective_tools`——那条路会并入基线强制工具（含 `run_command` /
-    /// `write_file`），正是本票要挡掉的东西。
+    /// `write_file`），正是本票要挡掉的东西。定义从目录表取（决策 353）——
+    /// 子代理同样是「看得见一个调用就被拒的工具」的受害者候选，空壳广告一并退场。
     fn tool_defs() -> Vec<ToolDef> {
         SUB_AGENT_TOOLS
             .iter()
-            .map(|name| ToolDef {
-                name: (*name).to_string(),
-                description: String::new(),
-                parameters: serde_json::json!({"type": "object"}),
+            .map(|name| {
+                crate::agent::catalog::def_for(name).unwrap_or_else(|| {
+                    panic!("SUB_AGENT_TOOLS 里的 {name} 必须有目录行（agent::catalog）")
+                })
             })
             .collect()
     }

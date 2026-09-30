@@ -2,6 +2,7 @@
 
 pub mod baseline;
 pub mod bounded_read;
+pub mod catalog;
 pub mod client;
 pub mod context;
 pub mod degeneration;

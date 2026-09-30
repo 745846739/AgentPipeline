@@ -671,17 +671,18 @@ impl ToolExecutor {
             return Ok(proposed);
         }
         let outcome = match call.name.as_str() {
-            "write_file" => self.write_file(call, ctx).await?,
-            "edit_file" => self.edit_file(call, ctx).await?,
-            "read_file" => self.read_file(call, ctx).await?,
-            "delete_file" => self.delete_file(call, ctx).await?,
-            "list_dir" => self.list_dir(call, ctx).await?,
-            "run_command" => self.run_command(call, ctx).await?,
+            // 内置 8 工具的名字引用目录表常量（决策 353）——名字的字面量只此一份。
+            super::catalog::WRITE_FILE => self.write_file(call, ctx).await?,
+            super::catalog::EDIT_FILE => self.edit_file(call, ctx).await?,
+            super::catalog::READ_FILE => self.read_file(call, ctx).await?,
+            super::catalog::DELETE_FILE => self.delete_file(call, ctx).await?,
+            super::catalog::LIST_DIR => self.list_dir(call, ctx).await?,
+            super::catalog::RUN_COMMAND => self.run_command(call, ctx).await?,
             // 修复轮（决策 210③④ / 票 10–12）：start 给一个可写的 worktree，finish 跑闸门
             // → commit → 落提议，discard 回收。三件事的**序列**都在 `pipeline::repair` 里。
             "repair" => self.repair(call, ctx).await?,
-            "submit_metadata" => self.submit_metadata(call)?,
-            "Skill" => self.skill(call)?,
+            super::catalog::SUBMIT_METADATA => self.submit_metadata(call)?,
+            super::catalog::SKILL => self.skill(call)?,
             "spawn_sub_agent" => self.spawn_sub_agent(call, ctx).await?,
             // 台账只读工具（决策 182⑭，票 02）。它们在白名单里的位置与其余工具相同：
             // 越权调用在函数开头的白名单检查处就被拒，这里不再重复判定「谁可以调」。
