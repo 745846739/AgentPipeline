@@ -31,10 +31,11 @@
 //!
 //! **显式差异**（决策 268 允许「写清差异」而非强求同一实现）：前端还有 `notifyOn`
 //! 每类开关（用户偏好面，缺省 `cancelled: false` = 永不弹）；后端没有偏好面——
-//! `cancelled` 按通用类规则走 cooldown + 免打扰。**决策 272 又添一条反方向的**：
-//! `foreman_reply` 是后端独有的类（前端没有回话完成的 SSE 事件，toast 面根本见不到它），
-//! 同样不进共享表。两条都记在 fixture 的 `$comment` 与两侧守卫里。共享表因此只收
-//! 两边共有的语义子集（`pending` / `done` / `failed` × 免打扰 × 节流）。
+//! **`cancelled` 从决策 350 起整个不出机器**（`notification_class` 不给它类，连
+//! cooldown 槽都没有），偏好开关因此只对前端那条线有意义。**决策 272 又添一条
+//! 反方向的**：`foreman_reply` 是后端独有的类（前端没有回话完成的 SSE 事件，toast
+//! 面根本见不到它），同样不进共享表。两条都记在 fixture 的 `$comment` 与两侧守卫里。
+//! 共享表因此只收两边共有的语义子集（`pending` / `done` / `failed` × 免打扰 × 节流）。
 //!
 //! **第五支：浏览器推送（spec `.scratch/pwa-webpush/` 票 02）**。它是**第四个互斥通道**
 //! （与 generic / feishu / bluebubbles 四选一，沿 272 的单行三选一形状；「多出口并存」
@@ -50,7 +51,8 @@
 //!    service worker 只消费。规则见 [`attention_deep_link`] / [`talk_deep_link`]。
 //!
 //! 触发事件集与 iMessage 通道**完全一致**（票面 29：将来同批增减）——`SlowRun` 照旧
-//! 一个字节不出站。
+//! 一个字节不出站；决策 350 起与它同批不出站的还有 `TaskCancelled`（取消是用户自己
+//! 按的，推送里没有他能动手的事）。
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
@@ -108,7 +110,9 @@ impl NotifyFormat {
     }
 }
 
-/// 通知分类——与前端 `notificationPolicy.ts::NotificationClass` 同名同义。
+/// 通知分类——与前端 `notificationPolicy.ts::NotificationClass` 同名同义，但**只收
+/// 后端真的会出的类**（决策 350：`cancelled` 在出机器线上没有生产者——取消几乎总是
+/// 用户自己按的，前端那条线对它早已缺省静音——于是这个臂只活在前端，这里不设）。
 ///
 /// `ForemanReply` 是**后端独有**的一类（决策 272③④）：值班长回话完成那条线的类，
 /// 有**自己的 cooldown 槽**（绝不复用 `done`——复用会让回话吃掉 `done` 的配额、把真的
@@ -120,7 +124,6 @@ pub enum NotifyClass {
     Pending,
     Done,
     Failed,
-    Cancelled,
     ForemanReply,
 }
 
@@ -130,7 +133,6 @@ impl NotifyClass {
             NotifyClass::Pending => "pending",
             NotifyClass::Done => "done",
             NotifyClass::Failed => "failed",
-            NotifyClass::Cancelled => "cancelled",
             NotifyClass::ForemanReply => "foreman_reply",
         }
     }
@@ -140,7 +142,6 @@ impl NotifyClass {
             "pending" => Some(NotifyClass::Pending),
             "done" => Some(NotifyClass::Done),
             "failed" => Some(NotifyClass::Failed),
-            "cancelled" => Some(NotifyClass::Cancelled),
             "foreman_reply" => Some(NotifyClass::ForemanReply),
             _ => None,
         }
@@ -150,21 +151,31 @@ impl NotifyClass {
 /// attention kind → 通知分类。
 ///
 /// 这张表是**后端独有**的一张小表（前端映射的是 SSE 事件，两边的「类」同名同义、进表的
-/// 成员各自钉）：`SlowRun` 不给类——它是 `wakes()` 唯一为 false 的那个，双重挡死；
+/// 成员各自钉）。`wakes()` 是**值守轮**的判据，出机器在这道闸之后还要过自己的第二道：
+/// 「这个人拿到这条通知能动手吗」（决策 350）。两个 `None`：
+///
+/// - `SlowRun`：`wakes()` 唯一为 false 的那个，双重挡死（只播报、无动作）。
+/// - **`TaskCancelled`**（决策 350）：取消这个动作几乎总是用户本人在界面上按的——
+///   「已取消」的推送里没有一件是收件人能做的；决策 234 补这一类为的是**值守长**
+///   （「是谁下的手，我没有证据」），那份理由完整保留在 attention 表与 `wakes()` 里，
+///   停的只是出机器这一跳。前端对它的表态更早（`notifyOn.cancelled` 缺省 false、
+///   「cancelled 永不弹」）。
+///
 /// 卡住等人的七个（pending / repeated / owner / scheduler / stale / **resume blocked** /
 /// **blocked read**）归 `pending`——免打扰豁免正是为「等人处理」那一类设的
 /// （`resume_blocked` 是「系统试过、放弃了，该有人接手」，`blocked_read` 是「这台机器上
-/// 有读挂在系统调用里，得有人去看授权」——两件都是要人动手的）；失败族四个归 `failed`（恒发）。
-/// 由 `tests/integration/notify.rs::kind_to_class_mapping_is_pinned` 逐个钉住。
+/// 有读挂在系统调用里，得有人去看授权」——两件都是要人动手的）；失败族四个归 `failed`
+/// （恒发）；`done` 是用户自己任务的结果，照发。由
+/// `tests/integration/notify.rs::kind_to_class_mapping_is_pinned` 逐个钉住。
 pub fn notification_class(kind: AttentionKind) -> Option<NotifyClass> {
     use AttentionKind::*;
     Some(match kind {
         SlowRun => return None,
+        TaskCancelled => return None,
         TaskPending | RepeatedPending | OwnerStuck | SchedulerNoEffect | TaskStale
         | ResumeBlocked | BlockedRead => NotifyClass::Pending,
         RetryExhausted | ContextOverflow | GateFailure | RunFailed => NotifyClass::Failed,
         TaskDone => NotifyClass::Done,
-        TaskCancelled => NotifyClass::Cancelled,
     })
 }
 

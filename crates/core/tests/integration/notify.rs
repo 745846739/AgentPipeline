@@ -365,7 +365,8 @@ async fn without_a_notifier_the_accounting_stays_quiet() {
 fn kind_to_class_mapping_is_pinned() {
     use AttentionKind::*;
     let table: Vec<(AttentionKind, Option<NotifyClass>)> = vec![
-        (SlowRun, None), // wakes() 唯一为 false 的那个：类都不给
+        (SlowRun, None),       // wakes() 唯一为 false 的那个：类都不给
+        (TaskCancelled, None), // 决策 350：取消是用户自己按的，出机器线上没有他能动手的事
         (TaskPending, Some(NotifyClass::Pending)),
         (RepeatedPending, Some(NotifyClass::Pending)),
         (OwnerStuck, Some(NotifyClass::Pending)),
@@ -376,7 +377,6 @@ fn kind_to_class_mapping_is_pinned() {
         (GateFailure, Some(NotifyClass::Failed)),
         (RunFailed, Some(NotifyClass::Failed)),
         (TaskDone, Some(NotifyClass::Done)),
-        (TaskCancelled, Some(NotifyClass::Cancelled)),
         (ResumeBlocked, Some(NotifyClass::Pending)),
         (BlockedRead, Some(NotifyClass::Pending)),
     ];
