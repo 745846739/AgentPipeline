@@ -190,6 +190,10 @@ impl TinyHttp {
                         let _ = sock.set_read_timeout(Some(Duration::from_millis(500)));
                         let mut raw: Vec<u8> = Vec::new();
                         let mut buf = [0u8; 8192];
+                        // **读超时不等于「对端停手」**：满载时从连上到客户端把头部写出来
+                        // 可能不止一拍。超时只当「再等一拍」，收工判据是「头齐了 / 对端关了 /
+                        // 下面这个总时限到」。
+                        let started = std::time::Instant::now();
                         let body_start = loop {
                             match sock.read(&mut buf) {
                                 Ok(0) => break None,
@@ -204,24 +208,39 @@ impl TinyHttp {
                                         }
                                     }
                                 }
+                                Err(e)
+                                    if matches!(
+                                        e.kind(),
+                                        std::io::ErrorKind::WouldBlock
+                                            | std::io::ErrorKind::TimedOut
+                                    ) =>
+                                {
+                                    // 一个字节都没收到的那次连接（连上就沉默）：等够总时限
+                                    // 就走，别把服务线程占住。
+                                    if started.elapsed() >= Duration::from_secs(3) {
+                                        break None;
+                                    }
+                                }
                                 Err(_) => break None,
                             }
                         };
-                        if let Some(line) = String::from_utf8_lossy(&raw).lines().next() {
-                            if !line.is_empty() {
-                                *f2.lock().unwrap() = line.to_string();
-                            }
-                        }
+                        // **命中计数 = 「这一条请求已经收全、可读了」**：`wait_hits` 的调用方
+                        // 一律是「等它到了 → 读 `first_request_line` / `request_head` / `body`」，
+                        // 故只在**真的解析出头部**时计一次，且三样都写在这之前。没收到东西的
+                        // 那次连接**不计**——旧写法把计数放在无条件那一层，于是调用方会「等到
+                        // 一个空读数」（决策 342：2026-09-30 整套并跑时 `notify::…` 两条各自
+                        // 踩到过一次——`first_request_line` / `request_head` 是空串而 `hits`
+                        // 已经是 1；同一条道理，前一次修的是「先计数后写报文」那个窗口）。
                         if let Some(h) = body_start {
+                            if let Some(line) = String::from_utf8_lossy(&raw).lines().next() {
+                                if !line.is_empty() {
+                                    *f2.lock().unwrap() = line.to_string();
+                                }
+                            }
                             *hd2.lock().unwrap() = String::from_utf8_lossy(&raw[..h]).to_string();
                             *b2.lock().unwrap() = raw[h..].to_vec();
+                            h2.fetch_add(1, Ordering::SeqCst);
                         }
-                        // **命中计数放在这里，不是 accept 那一刻**：`wait_hits` 的调用方
-                        // 一律是「等它到了 → 读 `body()` / `request_head()`」，而先计数后读
-                        // 报文之间有一个窗口——实测在机器同时跑别的构建时踩到过（body 还是空
-                        // 的，`serde_json::from_str` 报 `EOF while parsing a value`）。
-                        // 计数的语义因此是「这一条请求已经收全、可读了」。
-                        h2.fetch_add(1, Ordering::SeqCst);
                         if !delay.is_zero() {
                             std::thread::sleep(delay);
                         }

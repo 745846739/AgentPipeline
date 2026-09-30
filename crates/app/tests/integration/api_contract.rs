@@ -6334,16 +6334,29 @@ async fn proposals_endpoint_lists_only_the_pending_ones_of_that_session() {
 
     let (status, body) = get(&api, &format!("/foreman/proposals?session={a}")).await;
     assert_eq!(status, StatusCode::OK, "{body}");
+    // **比 id 不比位置**：这个读端口管的是「这一班**未决**的那几条」，顺序由 `ORDER BY id ASC`
+    // 给（ULID 序）——而**同毫秒内两条的先后由 ULID 的随机尾段定**，创建先后并不等价于 id 先后。
+    // 原来这里写的是 `vec![p1, p2]`（创建顺序）：本地十次里红三次，CI 上也是同一个 commit
+    // 一绿一红（2026-09-30 实测）。同样的坑在班次列表那条里已经踩过并留了注释
+    // （那一条的 `advance_secs` 拨的是排序键 `last_active_at`，这条的排序键是 id，拨不动）。
+    let mut expected = vec![p1.as_str(), p2.as_str()];
+    expected.sort_unstable();
     let ids: Vec<&str> = body["proposals"]
         .as_array()
         .unwrap()
         .iter()
         .map(|p| p["id"].as_str().unwrap())
         .collect();
-    assert_eq!(ids, vec![p1.as_str(), p2.as_str()], "只给这一班的未决提议");
-    assert_eq!(body["proposals"][0]["status"], "pending");
-    assert_eq!(body["proposals"][0]["tool"], "write_file");
-    assert_eq!(body["proposals"][0]["args"]["path"], "notes.md");
+    assert_eq!(ids, expected, "只给这一班的未决提议");
+    // 逐条的读数按 id 找回来断言——位置会翻面，内容不会。
+    let proposals = body["proposals"].as_array().unwrap();
+    let p1_row = proposals
+        .iter()
+        .find(|p| p["id"] == p1.as_str())
+        .unwrap_or_else(|| panic!("p1 应当在未决清单里：{body}"));
+    assert_eq!(p1_row["status"], "pending");
+    assert_eq!(p1_row["tool"], "write_file");
+    assert_eq!(p1_row["args"]["path"], "notes.md");
 
     // 拒绝一条之后它就不再是「未决」（读端点只列未决，时间线那份由 GET /foreman/session 给）。
     let (status, _) = post(&api, &format!("/foreman/proposals/{p1}/reject"), json!({})).await;
