@@ -1764,6 +1764,9 @@ async fn pairing_lan_unpaired_gets_only_the_pairing_page() {
 ///
 /// 两组断言钉住这条边界**开在哪里**：这三族（四条路径）放行、入口页与产物照旧 403——把 `/` 也放行
 /// 就退回决策 336 修的那个「能加载、每个数据请求都 403 的空看板」。
+/// 有 dist 时「放行」的证据是 **200**；CI 的 test 杆没有 dist（决策 330，空资产表），
+/// 此时是 **404**——闸门拦的是 403，两层不冒充（决策 345，双态先例见
+/// `root_serves_embedded_frontend_or_build_hint`）。
 #[tokio::test]
 async fn pairing_lan_unpaired_can_still_fetch_install_assets() {
     let api = api_lan().await;
@@ -1781,11 +1784,23 @@ async fn pairing_lan_unpaired_can_still_fetch_install_assets() {
             .await
             .unwrap();
         let status = response.status();
-        assert_eq!(
-            status,
-            StatusCode::OK,
-            "安装链路的资产不该要凭据（决策 340）：{uri} → {status}"
-        );
+        if app::assets::EMBEDDED_ASSETS.is_empty() {
+            // CI 的 test 杆不装 Node（决策 330）：`frontend/dist` 缺失 → 空资产表，
+            // 资产层只能回 404。这不是「放行失效」：闸门拦的形状是 403 + `pairing_required`，
+            // 而对照组（下面三条 403）证明闸门此刻在岗——404 与 403 分属资产层与闸门
+            // 两层，不冒充（决策 345）。
+            assert_eq!(
+                status,
+                StatusCode::NOT_FOUND,
+                "空表下放行的证据是 404（不是闸门的 403）：{uri} → {status}"
+            );
+        } else {
+            assert_eq!(
+                status,
+                StatusCode::OK,
+                "安装链路的资产不该要凭据（决策 340）：{uri} → {status}"
+            );
+        }
     }
 
     // 对照：外壳与数据照旧挡着（缺了这一段，上一段可能只是「闸门没生效」而绿）

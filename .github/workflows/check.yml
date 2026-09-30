@@ -71,9 +71,11 @@ jobs:
 
   # ── Rust 全量测试：L1 单元 + L2 集成 + L3 API + L4 场景 + 冒烟 ───────────────
   # **不装 Node**：`crates/app/build.rs` 对缺失的 `frontend/dist` 生成空资产表，首页退化
-  # 为「前端未构建」提示页，而两条资产契约用例明确接受这一态
+  # 为「前端未构建」提示页，而三条资产契约用例明确接受这一态
   # （`root_serves_embedded_frontend_or_build_hint` 的 else 支 /
-  # `embedded_assets_are_served_verbatim_with_mime` 的 None 支），故本 job 不需要前端产物。
+  # `embedded_assets_are_served_verbatim_with_mime` 的 None 支 /
+  # `pairing_lan_unpaired_can_still_fetch_install_assets` 的 404 支——闸门放行的证据
+  # 在无产物时是「不是 403」，决策 345），故本 job 不需要前端产物。
   test:
     name: test（cargo test --workspace）
     runs-on: ubuntu-latest
