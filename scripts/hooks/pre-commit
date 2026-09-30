@@ -1,0 +1,46 @@
+#!/usr/bin/env bash
+#
+# pre-commit 闸门（决策 348）：把「提交前必跑 lint 层」从纪律变成机制。
+#
+# 为什么有它：2026-09-30 一天之内两个会话（决策 344 的通知文案、347 的 PWA 图标）
+# 都漏跑了决策 331 的本地必跑档，两次红在 CI 的 `cargo fmt --check` 上——同一处
+# 摔两次，说明纯靠会话自觉的纪律不可靠。决策 331 的分工不变，本钩子只是把其中
+# 「必跑」那一档钉死在 git 里。
+#
+# 范围（**只有 lint 层**，刻意不放大）：
+#   · Rust 沾边 → `make check-lint`（fmt --check + clippy，暖树实测 18 秒）
+#   · 前端沾边 → `npm run check`（svelte-check 类型层，实测约 10 秒）
+#   · 只动了 docs / 设计稿 → 什么都不跑，零开销
+# vitest（实测 86 秒）、cargo test、e2e **不进来**——决策 331 把「完整的四项聚合」
+# 明确交给 CI，hook 塞进分钟级的东西只会被 `--no-verify` 绕掉；改动所在层的
+# 功能性窄跑（`make unit` / `make integration TESTS=…`）选层需要人/agent 判断，
+# 钩子替不了，仍按 331 自觉执行。
+#
+# 命令定义全部在 Makefile（决策 168：闸门的唯一权威），本文件只负责挑目标。
+# 诚实出口：`git commit --no-verify` 可跳过——留给真有特殊情况的时刻，别养成习惯。
+
+set -uo pipefail
+
+cd "$(git rev-parse --show-toplevel)"
+status=0
+
+# 有没有暂存文件落在给定 pathspec 里（新建/拷贝/改名/修改都算）。
+staged() {
+  git diff --cached --name-only --diff-filter=ACMR -- "$@" 2>/dev/null | grep -q .
+}
+
+if staged crates Cargo.toml Cargo.lock rust-toolchain.toml .cargo Makefile; then
+  echo "── pre-commit：Rust 有改动 → make check-lint"
+  make check-lint || status=1
+fi
+
+if staged frontend/src frontend/package.json frontend/package-lock.json \
+          frontend/svelte.config.js frontend/tsconfig.json frontend/vite.config.ts; then
+  echo "── pre-commit：前端有改动 → npm run check（svelte-check）"
+  (cd frontend && npm run check) || status=1
+fi
+
+if [ "$status" -ne 0 ]; then
+  echo "✗ pre-commit 闸门拦截：见上方输出。修好再提交；确需跳过用 --no-verify（慎用）。" >&2
+fi
+exit "$status"

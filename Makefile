@@ -17,6 +17,7 @@
 #   make check-test     cargo test --workspace
 #   make check-frontend 前端单元 + 类型检查 + 构建
 #   make check-e2e      前端 E2E（含产物新鲜度守卫，决策 166）
+#   make hooks          安装 pre-commit 闸门（决策 348，core.hooksPath → scripts/hooks）
 #
 # ── 谁在哪儿跑（决策 331）：别再按「一律本机跑全量」的老口径办 ──────────────
 # 闸门跑两处（决策 330），分工是定好的：
@@ -47,7 +48,7 @@
 
 .PHONY: build frontend backend run desktop desktop-run clean sweep icon \
         check check-lint check-test check-frontend check-e2e \
-        unit integration api e2e smoke fmt
+        unit integration api e2e smoke fmt hooks
 
 # 工具链归一（决策 175）：本机 PATH 里 /opt/local/bin（MacPorts 自带 rust）排在
 # ~/.cargo/bin（rustup）**之前**，裸 `cargo` 会落到另一套 rustc 上；两套 rustc 的
@@ -183,6 +184,13 @@ smoke:
 # 格式化（写回）
 fmt:
 	cargo fmt --all
+
+# 安装 pre-commit 闸门（决策 348）：core.hooksPath 指向仓库内的 scripts/hooks。
+# 克隆 / 换机后跑一次 `make hooks` 即接管；脚本内容见 scripts/hooks/pre-commit
+# （只跑 lint 层：Rust → check-lint，前端 → svelte-check；理由与范围写在那儿）。
+hooks:
+	git config core.hooksPath scripts/hooks
+	@echo "pre-commit 闸门已接管（scripts/hooks/pre-commit，决策 348）"
 
 clean:
 	cargo clean
