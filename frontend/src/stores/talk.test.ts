@@ -7,6 +7,7 @@ import type {
   TaskListItem,
 } from '../api/types';
 import { beginForemanStream, FOREMAN_LOST_TURN_SUFFIX } from '../realtime/foreman';
+import { ApiError, KIND_REQUEST_TIMEOUT } from '../api/client';
 import { saveSeen, saveSessionId } from '../lib/talkSessions';
 
 const mocks = vi.hoisted(() => ({
@@ -15,6 +16,7 @@ const mocks = vi.hoisted(() => ({
   getForemanAttention: vi.fn(),
   createForemanSession: vi.fn(),
   archiveForemanSession: vi.fn(),
+  sendForemanMessage: vi.fn(),
   getTask: vi.fn(),
 }));
 
@@ -104,8 +106,14 @@ function payload(over: Partial<ForemanSession> = {}): ForemanSession {
 
 /** 把 store 拨回「刚进这一页、还没在读一轮」的干净态（单例，用例之间必须互不残留）。 */
 function reset(id: string | null = null): void {
+  // 排水环（票 02）先收掉：它是唯一会自己往外发请求的东西，留着会让**别的用例**的
+  // 队列状态在事后偷偷发一跳（`sendForemanMessage` 是 mock，但调用计数会脏）。
+  talk.stopQueueDrain();
   talk.sessionId = null;
   talk.sending = false;
+  talk.sendingSid = null;
+  talk.unsentText = null;
+  talk.failureBaseline = new Set();
   talk.resetLive();
   talk.foreign = { bySession: {} };
   talk.queue = {};
@@ -627,5 +635,191 @@ describe('台账生命周期（决策 354①）', () => {
 
     expect(talk.seen[SESSION], '落点记它此刻的 last_active_at').toBe('2026-09-25T02:00:00Z');
     expect(talk.seen['sess-2'], '没落到的班不记看过——它的新动静要亮').toBeUndefined();
+  });
+});
+
+// ═══════════ 发送编排（决策 354②，票 talk-store-ledger 02）═══════════
+//
+// sendTurn / claim / 排水环自 Talk.svelte 搬进 store。钉的是搬完之后**新的**承重判据：
+// 排水不再以「页面在屏」为前提（决策 354② 接受的唯一行为修正）、串台守卫收成一处的
+// `claim()`、失败那句话交回页面回填的载体（`unsent`）。
+
+/** 一发一收的常规桩：列表、台账、待办读数三层都备好。 */
+function stubSend(): void {
+  mocks.sendForemanMessage.mockResolvedValue({ reply: null });
+  mocks.getForemanSessions.mockResolvedValue({ sessions: [meta(SESSION)] });
+  mocks.getForemanSession.mockResolvedValue(payloadFor(SESSION, { messages: [row(1)] }));
+  mocks.getForemanAttention.mockResolvedValue(ATTENTION);
+}
+
+describe('发送编排（决策 354②）', () => {
+  it('claim：认下当下这一班；换了班这一趟的回包即作废', () => {
+    reset(SESSION);
+    const mine = talk.claim();
+    expect(mine()).toBe(true);
+
+    talk.watch('sess-2');
+
+    expect(mine(), '换班之后这一趟不再属于这一屏（决策 204⑥）').toBe(false);
+    expect(talk.claim()(), '重新认下就是新那一班').toBe(true);
+  });
+
+  it('sendTurn：发出去就亮乐观轮，POST 回来以台账收口', async () => {
+    reset(SESSION);
+    stubSend();
+
+    const pending = talk.sendTurn('看板里有哪些重试？');
+
+    // 服务端登记之前也先亮一轮（免得人以为没按上）
+    expect(talk.sending).toBe(true);
+    expect(talk.pendingText).toBe('看板里有哪些重试？');
+    expect(talk.stream.streaming).toBe(true);
+    expect(talk.sendingSid, '「正在回话」那枚标记要落在**它**那一行上').toBe(SESSION);
+    expect(talk.followingSince, '本机这一趟接手之后就不再跟别人').toBeNull();
+
+    await pending;
+
+    expect(mocks.sendForemanMessage).toHaveBeenCalledWith('看板里有哪些重试？', SESSION);
+    expect(talk.sending).toBe(false);
+    expect(talk.sendingSid).toBeNull();
+    expect(talk.pendingText, '收口：乐观轮交给台账那一行').toBeNull();
+    expect(talk.unsentText, '送到了就没有要回填的话').toBeNull();
+  });
+
+  it('没有班次的第一句话：本机先开一班再发（不肯让它落到服务端缺省上）', async () => {
+    reset(null);
+    stubSend();
+    mocks.createForemanSession.mockResolvedValue({ session: meta('sess-new') });
+    // 回话落地后重读：这一班已经在列表里，服务端也认它
+    mocks.getForemanSessions.mockResolvedValue({ sessions: [meta('sess-new')] });
+    mocks.getForemanSession.mockResolvedValue(payloadFor('sess-new'));
+
+    await talk.sendTurn('第一句话');
+
+    expect(mocks.sendForemanMessage).toHaveBeenCalledWith('第一句话', 'sess-new');
+    expect(talk.sessionId).toBe('sess-new');
+  });
+
+  it('传输失败：那句话交回页面回填，现场收成失败轮（措辞说它是**这次**的）', async () => {
+    reset(SESSION);
+    stubSend();
+    mocks.sendForemanMessage.mockRejectedValue(new Error('断网了'));
+
+    await talk.sendTurn('这句话没送出去');
+
+    expect(talk.unsentText, '页面据此把它送回输入框（框空着时）——「失败不清空输入框」').toBe(
+      '这句话没送出去',
+    );
+    expect(talk.stream.error).toContain('断网了');
+    expect(talk.sending).toBe(false);
+  });
+
+  it('本地放弃（超时）那一类：同样把话交回框里，但**不落失败轮**、无条件接手', async () => {
+    // 决策 223 / 288：本地等不到回包**不等于**那一轮失败——服务端那一轮不随这次请求死。
+    // 故这一支与真失败（上面那条）恰好相反：现场收成安静态、交棒给落地哨，而那句话照旧
+    // 回到框里（人得看见自己那句还在手上）。判据趁 `ApiError` 还在手按 `kind` 判。
+    reset(SESSION);
+    stubSend();
+    mocks.sendForemanMessage.mockRejectedValue(
+      new ApiError(0, '请求超时（120 秒没有回应）。', KIND_REQUEST_TIMEOUT),
+    );
+
+    await talk.sendTurn('这句话也许还在跑');
+
+    expect(talk.unsentText).toBe('这句话也许还在跑');
+    expect(talk.stream.error, '安静态：不落失败轮').toBeNull();
+    expect(talk.pairingNeeded).toBe(false);
+    expect(talk.followingSince, '无条件接手（不等 stale 读数）').toBe(1);
+  });
+
+  it('串台：POST 期间换了班，回包整包丢弃、也不去重读**那一班**的台账', async () => {
+    reset(SESSION);
+    stubSend();
+    let release!: (v: { reply: string | null }) => void;
+    mocks.sendForemanMessage.mockReturnValue(
+      new Promise<{ reply: string | null }>((resolve) => (release = resolve)),
+    );
+
+    const pending = talk.sendTurn('甲班的话');
+    // 人切去了乙班（回话照旧落甲班的台账，但不许落在这一屏上）
+    talk.watch('sess-2');
+    release({ reply: '甲班的回话' });
+    await pending;
+
+    expect(talk.pendingText, '乐观轮属于已经不显示的那一班：连它一起撤').toBeNull();
+    expect(talk.stream.steps, '回包不接进乙班的现场').toEqual([]);
+    expect(
+      mocks.getForemanSession,
+      '更不去重读甲班的台账（回话落库这件事不由这一趟说话）',
+    ).not.toHaveBeenCalledWith(SESSION, undefined, 'talk');
+  });
+
+  it('失败也没送出去的那一类不清台账基线：`failureBaseline` 记的是**发之前**的失败行', async () => {
+    // 决策 337 的判据要有差集才成立（`ledgerOwnsTheFailure`）——基线跟着这一趟走，
+    // 而它现在由 store 在发出去的那一刻自己记。
+    reset(SESSION);
+    stubSend();
+    talk.session = payloadFor(SESSION, { messages: [row(1), row(2, { kind: 'failed' })] });
+
+    await talk.sendTurn('再问一句');
+
+    expect(talk.failureBaseline.has(2), '发之前台账里那条失败行算「早先的」').toBe(true);
+  });
+
+  it('排水环：**页面不在场**也照排照发（决策 354② 接受的唯一行为修正）', async () => {
+    reset(SESSION);
+    stubSend();
+    talk.startQueueDrain();
+
+    talk.enqueue(SESSION, '排队的话');
+
+    await vi.waitFor(() =>
+      expect(mocks.sendForemanMessage).toHaveBeenCalledWith('排队的话', SESSION),
+    );
+    expect(talk.queue[SESSION], '出队即取走').toEqual([]);
+    await flush();
+  });
+
+  it('排水环：还在跑 / 队列扣住时都不发（节奏照旧，一个条件都不放松）', async () => {
+    reset(SESSION);
+    stubSend();
+    talk.startQueueDrain();
+
+    talk.sending = true;
+    talk.enqueue(SESSION, '排在后面的话');
+    await flush();
+    expect(mocks.sendForemanMessage, '本机在发：等着').not.toHaveBeenCalled();
+
+    talk.sending = false;
+    talk.setQueueHeld(SESSION, true);
+    await flush();
+    expect(mocks.sendForemanMessage, '扣住了：等人确认或清空').not.toHaveBeenCalled();
+
+    talk.setQueueHeld(SESSION, false);
+    await vi.waitFor(() => expect(mocks.sendForemanMessage).toHaveBeenCalledTimes(1));
+    await flush();
+  });
+
+  it('submit：在飞就入队、空着就直接发（「在飞」的判据只有 store 这一处）', async () => {
+    reset(SESSION);
+    stubSend();
+
+    talk.submit('第一句');
+    await vi.waitFor(() => expect(talk.sending, '第一趟收口').toBe(false));
+    expect(mocks.sendForemanMessage).toHaveBeenCalledWith('第一句', SESSION);
+
+    // 一轮在飞：这一句进队列，不发
+    talk.sending = true;
+    talk.submit('第二句');
+    expect(talk.queue[SESSION]).toEqual(['第二句']);
+    expect(mocks.sendForemanMessage).toHaveBeenCalledTimes(1);
+
+    // 本机那一趟收口：队列由排水环送出去（页面这一侧一个字都不用做）
+    talk.sending = false;
+    talk.startQueueDrain();
+    await vi.waitFor(() =>
+      expect(mocks.sendForemanMessage).toHaveBeenCalledWith('第二句', SESSION),
+    );
+    await flush();
   });
 });

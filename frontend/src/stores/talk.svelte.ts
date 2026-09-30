@@ -5,6 +5,7 @@ import {
   getForemanSession,
   getForemanSessions,
   getTask,
+  sendForemanMessage,
 } from '../api/client';
 import type {
   AllowedAction,
@@ -18,14 +19,20 @@ import type {
 import { TaskStream, type StreamStatus } from '../realtime/connection';
 import {
   appendForemanEvent,
+  beginForemanStream,
   emptyForemanStream,
   emptyForeignActive,
+  failedLedgerRowIds,
   failForemanStream,
+  failureNotice,
   FOREMAN_LOST_TURN_SUFFIX,
   forgetForeignActive,
+  isRequestTimeout,
   maxLedgerId,
   noteForeignDelta,
+  quietAfterLocalGiveUp,
   resolveFollowOutcome,
+  settleForemanStream,
   type ForemanStreamState,
   type ForeignActive,
 } from '../realtime/foreman';
@@ -66,6 +73,11 @@ const SESSION_PAGE_LIMIT = 500;
  * （`ledgerEpoch` + `bindRecalibrate`）两端都没了：收尾自己 `reload()`，不再朝在屏的
  * 那一页喊话。
  *
+ * **发送编排同样住在这里**（决策 354②）：`submit()` / `sendTurn()` 与那条排水环
+ * （`startQueueDrain`）——乐观轮、串台守卫（`claim()`）、队列排水与「刚发出去的是哪一班」
+ * 全在 store。行为上唯一被接受的修正：**页面关着队列也照排照发**（原先排水效果住在页面里，
+ * 页面不在屏，队列就等着）。
+ *
  * 与看板 store 同一姿态（`stores/board.svelte.ts`）：连接也归 store，`init()` 由
  * `App.svelte` 起一次、`dispose()` 收一次；页面只 `watch()` 认下「我在看哪一班」。
  *
@@ -93,6 +105,40 @@ class TalkStore {
   pendingText = $state<string | null>(null);
 
   /**
+   * 本机刚发出去、还没落地的那一班（决策 220③ 的「正在回话」前半支）。
+   *
+   * 记 id 而不是一个布尔：切走之后那一轮照旧在路上，标记要落在**它**那一行上，而不是
+   * 「你现在看的这一班」。自决策 354② 起住在 store：发送编排搬进来之后，「刚发出去的是
+   * 哪一班」这件事活得过页面——队列在关着页的时候也会排出去，那一句同样有一班要说。
+   */
+  sendingSid = $state<string | null>(null);
+
+  /**
+   * 这一趟发送**之前**台账里已有的失败行 id（决策 337）。
+   *
+   * 判「这次失败是不是已经由台账那一行接管了」要的正是这个差集：不带它的话，一次早先的
+   * 失败会让此后每一次真实断网（请求根本没到后端、台账不会多出任何行）都静默下来——而
+   * 那种情况恰恰是本地那条失败轮存在的理由（判据在 `realtime/foreman.ts`）。
+   *
+   * 在 `sendTurn` 开头按当时的台账落一次。它自决策 354② 起住 store 而不是页面：记的地方
+   * 必须跟着发送走——队列在页面关着的时候排出去，那一趟的基线没人在页面上记。
+   */
+  failureBaseline = $state<ReadonlySet<number>>(new Set());
+
+  /**
+   * **没送出去**的那句话，等人回填进输入框（决策 182㉓「失败不清空输入框」的载体）。
+   *
+   * 失败那一刻只有 store 在场（页面可能关着、也可能是排水环自己发的那一趟），故这句话
+   * 先住在这里；页面把它回填进框（框空着时）后清掉。它说的是「一次没送到的发送」，
+   * **不是草稿**——人自己改了框里的字，这一格就该原样作废，故消费即清。
+   *
+   * **回填不看班次**：失败那一刻人正看着哪一班的坞，这句话就回哪一班的框里。这不是新加的
+   * 取舍——改之前那一版也是在 catch 里无条件回填（**早于**串台比对，见 `sendTurn` 里那一段
+   * 的次序），切走之后回话失败该怎么算仍怎么算。
+   */
+  unsentText = $state<string | null>(null);
+
+  /**
    * **重新接上的一轮**的锚点（决策 260）：非空 = 此刻在跟一轮，值是接手那一刻台账里
    * 最大的行 id——那之后多一行就是这一轮落了地。
    */
@@ -110,7 +156,8 @@ class TalkStore {
   /**
    * 排队发送的账（票 04 of talk-live-identity，2026-09-29 决议）：**按班次**各一列。
    *
-   * 一轮在飞时输入坞解锁，发出即入队，当前轮收口后由在屏的那一页自动出队发送——
+   * 一轮在飞时输入坞解锁，发出即入队，当前轮收口后由**排水环**自动出队发送
+   * （自决策 354② 起是 store 的 `startQueueDrain`，页面在不在屏都照排照发）——
    * 队列因此必须住 store（跨页面存活，与决策 275 同一判据），且**必须按班次分列**：
    * 排在甲班的话不许在切到乙班收口时发进乙班（决策 204⑥ 的队列版）。
    */
@@ -147,7 +194,7 @@ class TalkStore {
     };
   }
 
-  /** 出队：拿走最前面那条（收口后由在屏的那一页发出去）。 */
+  /** 出队：拿走最前面那条（收口后由排水环发出去，见 `startQueueDrain`）。 */
   takeQueued(sessionId: string): string | null {
     const list = this.queue[sessionId] ?? [];
     if (list.length === 0) return null;
@@ -256,8 +303,12 @@ class TalkStore {
 
   private conn: TaskStream | null = null;
 
+  /** 排水环（票 02）的 effect root 收手：`init()` 起、`dispose()` 收。 */
+  private drainRoot: (() => void) | null = null;
+
   /** 起连接。幂等（App 装载时叫一次；之后页面来去都不再碰它）。 */
   init(): void {
+    this.startQueueDrain();
     if (this.conn) return;
     this.conn = new TaskStream(
       '',
@@ -287,6 +338,7 @@ class TalkStore {
       document.removeEventListener('visibilitychange', this.onVisible);
     }
     this.stopSentinel();
+    this.stopQueueDrain();
     this.conn?.stop();
     this.conn = null;
     this.status = 'closed';
@@ -310,6 +362,29 @@ class TalkStore {
     const switchingAway = this.sessionId !== null;
     this.sessionId = id;
     if (switchingAway) this.resetLive();
+  }
+
+  /**
+   * **串台守卫**（决策 354②）：把「这一趟回包属于哪一班」在门口认下来，返回一个比对闭包。
+   *
+   * 用法只有一条纪律：**在第一个 `await` 之前认下**，此后每个 `await` 之后调一次——
+   * 不符即整包丢弃（不写台账、不改地址、不动现场）。决策 204⑥ 的语义一个字没变，
+   * 变的是它从「五种手写比对、三种锚点拼法」收成**一处判据**：漏掉一处就是历史根因
+   * 「对讲台出现非本次会话的内容」。
+   *
+   * 锚点就是当下的 `sessionId`，**没有第二个记号**——决策 354② 写的是「捕获 sessionId +
+   * 台账代际」，那后半句**不成立**（此处显式修订 354② 的这一处措辞）：台账代际在票 01
+   * （决策 354①）就已随 `ledgerEpoch` 退场，而在途回包的裁判在更早的决策 313 就统一到了
+   * store 这一格 `sessionId` 上——同一班的重读不换班次，按定义也就不该作废这一趟。
+   * 故闭包只认这一格，`claim()` 也不接收参数。
+   *
+   * 重新认下（比如「没有班次→刚开出来一班」那一拍换了目标）就是**再调一次**：闭包认的是
+   * 调用那一刻的那一班。刻意不接收参数：能传 id 就等于允许「认一个不是当前这一班的锚」，
+   * 而那正是这道守卫要挡的形状。
+   */
+  claim(): () => boolean {
+    const mine = this.sessionId;
+    return () => this.sessionId === mine;
   }
 
   /**
@@ -490,6 +565,203 @@ class TalkStore {
     this.stream = { ...this.stream, streaming: true };
   }
 
+  // ─────────────── 发送编排（决策 354②，票 talk-store-ledger 02）───────────────
+
+  /**
+   * 说一句话（坞的入口）：**在飞就入队，空着就直接发**。
+   *
+   * 入队那条路不碰输入框——草稿是页面的，store 不动别人的字。
+   */
+  submit(text: string): void {
+    const sid = this.sessionId;
+    if (this.inFlight && sid) {
+      this.enqueue(sid, text);
+      return;
+    }
+    void this.sendTurn(text);
+  }
+
+  /**
+   * **这一班此刻有一轮在飞吗**——发送编排问的**只有这一个问题**（决策 182㉓ 的排队修订）。
+   *
+   * 三个来源，缺一个都会漏：本机这一趟（`sending` 管服务端登记之前那段空隙）、台账说
+   * 服务端在跑（`turn_in_flight` 管刷新 / 换设备之后仍在跑）、本机正接着**别人**那一轮
+   * （`followingSince`，决策 260）。入队（`submit`）与出队（`drainQueue`）问的就是它
+   * ——两处各写一遍三元，改一处忘一处，排队与出队的口径就会分叉。
+   */
+  private get inFlight(): boolean {
+    return this.sending || Boolean(this.session?.turn_in_flight) || this.followingSince !== null;
+  }
+
+  /**
+   * 真正发一句话（{@link submit} 与排水环共用；`text` 已是调用方拿定的一句话）。
+   *
+   * 整个过程自决策 354② 起住在 store：乐观轮、`sending` 的起落、POST 之后跟不跟下一轮
+   * 全在这里；页面只剩输入框、失败时回填与渲染。
+   *
+   * **先确定班次，再发话**：这台机器上一个班次都没有时（首启空 home 的第一次说话），
+   * 客户端自己先开一个——若让它落到服务端的缺省逻辑上，回话的流式增量带的班次 id
+   * 是回来之后才知道的，而此刻增量已经在路上了，会被班次守卫挡掉（字还在，只是白流一场）。
+   *
+   * 每个 await 之后都过一遍 {@link claim}（决策 204⑥）：这一班的回包不落到另一班的屏幕上。
+   * 比对不通过时**连乐观轮一起撤**——它属于已经不显示的那一班。
+   * 失败时把那句话放进 {@link unsentText}（页面据此回填输入框，框空着的话）：
+   * 决策 182㉓ 的「失败不改输入框」在队列化之后的形态。
+   */
+  async sendTurn(text: string): Promise<void> {
+    this.sending = true;
+    this.pendingText = text;
+    this.stream = beginForemanStream();
+    // 本机这一趟接手之后就不再「跟」别人（决策 260）：两条来源说的是同一件事的不同主人，
+    // 留着锚点会让落地哨拿旧锚点判本机这一趟，而它的收尾归本函数管——两条路各收各的口，
+    // 混起来会把这一轮提前判成「落地了」。
+    this.followingSince = null;
+    // 这一趟之前台账里已有的失败轮 id：失败回来后靠它分辨「这次新出现的那一条」
+    // （判据在 realtime/foreman.ts；不记的话，早先的失败会让真正的断网静默下来）。
+    // 消费它的地方是时间线的 `ledgerOwnsFailure`——判在渲染上（决策 337）。
+    this.failureBaseline = failedLedgerRowIds(this.session?.messages ?? []);
+    // 「这一次是本地等不到回包」那一类（决策 223）——在 catch 里趁 `ApiError` 还在手判好，
+    // `finally` 里要用（它决定那条本地失败轮退不退场，见下）。缺省假：成功那一趟用不到它。
+    let timedOut = false;
+    let sid = this.sessionId;
+    let mine = this.claim();
+    try {
+      if (!sid) {
+        const created = await createForemanSession();
+        // 这一趟之间换班了：开出来的空班作废——它的 id 没进台账、没有回话，
+        // 静默丢弃即可（乐观轮由 catch 的统一收尾撤掉）。
+        if (!mine()) return;
+        sid = created.session.id;
+        this.watch(sid);
+        // 目标换了（从「没有班次」换到刚开出来的这一班）：守卫跟着换。
+        mine = this.claim();
+        this.sessionList = [created.session, ...this.sessionList];
+      }
+      // 「本机发出且未落地」（决策 220③）：切走之后这枚标记要落在**它**那一行上
+      this.sendingSid = sid;
+      const res = await sendForemanMessage(text, sid);
+      if (!mine()) {
+        // 切走了：这一轮从这一屏撤下（决策 220⑤），但回话已经落地——列表要跟上，
+        // 否则「原班次有新动静」永远等不到（这一支在放开切换之后是**常态路径**）。
+        // 「落地即熄灭」在这里同样要办：这一班的增量此前被记进了「别的班次在回话」那张
+        // 映射（切走之后它的 `session_id` 就不再是「当前这一班」了），不清掉那枚
+        // 「正在回话」会一直亮到静默超时——而它说的已经不是实话。
+        this.settleTurn();
+        this.foreign = forgetForeignActive(this.foreign, sid);
+        void this.refreshSessionList();
+        return;
+      }
+      // 回话是权威值：先收敛流式文本（重取台账期间不闪空），再以台账覆盖
+      this.stream = settleForemanStream(this.stream, res.reply);
+      // 重取之后**无条件收掉这两样本地状态**：它们是「这一轮」的东西，而重取可能发现
+      // 服务端已经把我们换到了另一班（另一台设备归档了它）。那种情况下留着乐观轮，
+      // 它就会挂在**另一班的**时间线上——正是决策 204⑥ 要挡的串台。
+      if (await this.reload(sid)) this.settleTurn();
+    } catch (err) {
+      // 失败把那句话交回输入框（页面那一侧的回填效果，框空着时才填）：后端在叫模型之前
+      // 已把 user 行落库的话，台账那一行会与回框的话并存——重读后乐观轮按同文去重退场。
+      // 失败以时间线里的一轮呈现——不弹窗、不 toast。
+      this.unsentText = text;
+      if (!mine()) {
+        this.settleTurn();
+        void this.refreshSessionList();
+        return;
+      }
+      // 本地超时**不等于**这一轮失败：服务端那一轮不随这次请求一起死（决策 223），
+      // 故超时那一类由 `failureNotice` 补上「它仍在继续」的实情——否则人会重发一句，
+      // 而那一轮很可能正在把话答完。
+      // 配对与超时两枚判据（决策 259）：趁 `ApiError` 还在手按 `kind` 判掉——错误降级成
+      // 流里的字符串之后 `kind` 就丢了。与 `stream.error` 同一处设置，两者恒同步。
+      this.pairingNeeded = isPairingRequired(err);
+      timedOut = isRequestTimeout(err);
+      if (timedOut) {
+        // 本地放弃 = 安静态（决策 288 / 票 05）：**不落失败轮**。那一轮在服务端不随请求死
+        // （决策 223），而且整轮墙钟已撤——它跑多久由逐调用空闲判死管，本地等多久只决定
+        // 这一屏。光标继续走；收场交给 finally 的落地哨。
+        this.stream = quietAfterLocalGiveUp(this.stream);
+      } else {
+        this.stream = failForemanStream(
+          this.stream,
+          failureNotice((err as Error).message, false),
+        );
+      }
+      // 重取成功才撤乐观轮：撤了之后这话由台账那一行承担，不靠重取失败时凭空消失。
+      if (await this.reload(sid)) {
+        this.pendingText = null;
+        // **本地那条失败轮的退场不在这里办**（决策 337）：后端已经把这一轮为什么没跑起来
+        // 落成了台账行（决策 211④ / 票 04），而本地这条承载传输层报文与配对入口——两者
+        // 谁的先到都可能，判一次（此刻）会留下共存窗。判据挂在 `ledgerOwnsFailure` 上，
+        // 由时间线的归约逐帧消费：台账那一行在场，本地那条一帧都不出现。
+      }
+    } finally {
+      this.sending = false;
+      this.sendingSid = null;
+      // **本地放弃、服务端还在跑**那一类（决策 223 的超时）交棒给「跟」这一支（决策 260）：
+      // 这一趟的回包等不到了，但那一轮不随请求一起死——上面那一趟 `reload` 已经把
+      // `turn_in_flight` 读回来，这里据此接力，增量才继续往时间线上走。
+      // 成功那一趟是**空操作**：那一刻 `turn_in_flight` 已经翻假（回话落了库）。
+      // 必须放在 `sending = false` **之后**——`syncFollowing` 在本机还在发时不接手。
+      const session = this.session;
+      if (session) this.syncFollowing(session);
+      // 本地放弃（决策 288 / 票 05）：安静态**不落失败轮**，接手是**无条件**的——
+      // 上一行 syncFollowing 只认「服务端此刻说在跑」，而本地超时那一刻的读数很可能
+      // 已经过期（重读失败 / 正好落地）。落地哨的下一趟轮询按 fresh 读数收场：
+      // 落地 → 台账接管；还在跑 → 继续跟（增量照旧走时间线）；不再跑也没落地 →
+      // 按「跟的那一轮」的既有形状收成死轮失败。锚点取重读之后那本台账的尾部——
+      // 用户那一句已在其中，此后多出的行才是这一轮的收场。
+      if (timedOut && session) {
+        this.pairingNeeded = false;
+        this.followAfterGiveUp(maxLedgerId(session.messages ?? []));
+      }
+    }
+  }
+
+  /**
+   * 起**排水环**（票 04 of talk-live-identity 的队列 × 决策 354② 的搬家）——队列的出队环，
+   * 也就是页面那个出队 effect 的 store 版。
+   *
+   * 自决策 354② 起住在 store，由 `init()` 起、`dispose()` 收——与那条连接同寿。
+   * **页面在屏不再是前提**：队列因此「排了就一定会发出去」，页面关着也照排照发
+   * （决策 354② 明确接受的唯一行为修正；排水节奏一个字没改）。
+   *
+   * 幂等。生产上的两端是 `init()` / `dispose()`；单测也自己叫它——`init()` 会去连真流，
+   * 那是另一件事。
+   */
+  startQueueDrain(): void {
+    if (this.drainRoot) return;
+    this.drainRoot = $effect.root(() => {
+      $effect(() => this.drainQueue());
+    });
+  }
+
+  /** 收排水环（`dispose`，以及单测之间的复位）。 */
+  stopQueueDrain(): void {
+    this.drainRoot?.();
+    this.drainRoot = null;
+  }
+
+  /**
+   * 出队口：空闲 + 台账说没有在跑的轮 + 队列没扣住 + 这一档能说话时，把最前面那条交给
+   * {@link sendTurn}。
+   *
+   * 判据与页面那个 effect 逐字同源，只是**换成 store 自己的读数**：`watchMode` 是
+   * `kind === 'watch'`（值守账整块没有坞）、`archivedOpen` 是这一班归档了（只读时间线）。
+   *
+   * 值守轮到达**不触发出队**：这条效果只由「发送态归零」点亮，值守轮的增量走
+   * `noteForeignDelta` 那一条账，两不相干。
+   */
+  private drainQueue(): void {
+    const sid = this.sessionId;
+    if (!sid || this.kind === 'watch') return;
+    if (this.session?.session?.archived_at != null) return;
+    if (this.inFlight) return;
+    if (this.queueHeld[sid]) return;
+    const next = this.queue[sid]?.[0];
+    if (!next) return;
+    this.takeQueued(sid);
+    void this.sendTurn(next);
+  }
+
   // ─────────────── 台账生命周期（决策 354①，票 talk-store-ledger 01）───────────────
 
   /**
@@ -499,11 +771,11 @@ class TalkStore {
    * （最近活动的未归档班次）。指定的班次不在了（别的设备归档了它、或这个 id 本来就不存在）
    * 时**回落到默认**而不是报错——切班次的地方没有出错这一说，只有「去最近有人说话的那一班」。
    *
-   * **过期回包守卫**（票 01 of talk-live-identity，决策 204⑥ 的 reload 版）：给过显式
-   * `want` 的那一趟，进门前先把落点认下来（`watch`——守卫的锚与落点同一格），
-   * 此后**每个 await 之后**比对「目标 ≠ `sessionId` 即整包丢弃」：不写 `session`、
-   * 不 watch、不改地址、不收口。没有这道比对，切班次之前发出的那一趟回来会把整屏
-   * 拖回旧班次——这正是「对讲台出现非本次会话的内容」的根因（并发 reload 是常态：
+   * **过期回包守卫**（票 01 of talk-live-identity，决策 204⑥ 的 reload 版；自决策 354② 起
+   * 收成 {@link claim} 一处）：给过显式 `want` 的那一趟，进门前先把落点认下来（`watch`
+   * ——守卫的锚与落点同一格），此后**每个 await 之后**比对「目标 ≠ `sessionId` 即整包丢弃」：
+   * 不写 `session`、不 watch、不改地址、不收口。没有这道比对，切班次之前发出的那一趟回来
+   * 会把整屏拖回旧班次——这正是「对讲台出现非本次会话的内容」的根因（并发 reload 是常态：
    * 挂载装载、地址回退、重连校准、可见性恢复都走这里）。不带 `want` 的续读以当下的
    * `sessionId` 为锚，同一纪律。
    *
@@ -513,6 +785,9 @@ class TalkStore {
   async reload(want?: string | null): Promise<boolean> {
     const wanted = want === undefined ? this.sessionId : want;
     if (want !== undefined) this.watch(wanted ?? null);
+    // 串台守卫在这一刻认下（`watch` 之后它与 `this.sessionId` 是同一件事——故守卫不再
+    // 自己留一份目标，`wanted` 只用来挑取数的那个 id）。
+    const mine = this.claim();
     try {
       // 两本账各读各的（票 04 / 决策 286）：`?kind=` 缺省只回人的班次，值守账要显式要。
       // 「指定的 id 不在这一班的列表里」因此按账本各自判——把 talk 的 id 递到值守账
@@ -520,7 +795,7 @@ class TalkStore {
       const list = await getForemanSessions(undefined, this.kind, this.showArchived);
       // 过期回包守卫第一道（票 01）：这一趟之间换班了（`watch` 已被别的路径改口），
       // 后面的整包作废——不写 session、不改地址。
-      if (this.sessionId !== wanted) return false;
+      if (!mine()) return false;
       const target = wanted;
       // 「找得到」多认一种（票 06）：**已经在读的那一班**——归档开关关着时它不在
       // 列表里，但人正看着它，把人弹去默认班才是错。只宽这一种：地址 / 兜底文件指到
@@ -533,7 +808,7 @@ class TalkStore {
       const payload = await getForemanSession(known ? target : null, undefined, this.kind);
       // 守卫第二道（票 01）：`sessionId` 已经不是进门前认下的那一班——这一包是
       // 旧目标的台账，整包丢弃。
-      if (this.sessionId !== wanted) return false;
+      if (!mine()) return false;
       this.sessionList = list.sessions;
       const landed = payload.session?.id ?? null;
       // 同一班的重读（一轮落地后常见）：**已在屏的更早段留着**——重读只回最近 500 条，
@@ -585,13 +860,13 @@ class TalkStore {
       this.hasMoreEarlier = false;
       return false;
     }
-    const gen = this.sessionId;
+    const mine = this.claim();
     this.loadingEarlier = true;
     try {
       const page = await getForemanSession(this.sessionId, undefined, this.kind, oldest);
       // 这一趟之间换班 / 重读了：这一段是对着旧台账取的，接上去就是串台（决策 204⑥
-      // 同一条纪律——await 之后比对记号，不符即丢）。
-      if (gen !== this.sessionId) return false;
+      // 同一条纪律——await 之后比对记号，不符即丢；记号就是 {@link claim} 认下的那一格）。
+      if (!mine()) return false;
       const older = page.messages ?? [];
       if (older.length === 0) {
         this.hasMoreEarlier = false;

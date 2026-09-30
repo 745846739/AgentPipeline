@@ -132,6 +132,26 @@ async function makeSession(app: App, title: string): Promise<string> {
   return payload.session.id;
 }
 
+/** 最近活动的那个班次（列表按最近活动倒序）——本机刚说的那一班就是它。 */
+async function newestSession(app: App): Promise<string> {
+  const list = (await (await fetch(`${app.apiBase}/foreman/sessions`)).json()) as {
+    sessions: Array<{ id: string }>;
+  };
+  return list.sessions[0]?.id ?? '';
+}
+
+/**
+ * 后端台账里有没有这一句用户消息——**在页面之外取证**用（决策 354② 那条 e2e 的判据）。
+ *
+ * 回到页面上再断言「那句话说出去没有」是分不出新旧行为的：排水环原先住在页面的 effect 里，
+ * 人回到这一页时它会补发。故那条用例人还在看板上时就来这里问台账。
+ */
+async function ledgerHasUserLine(app: App, sid: string, said: string): Promise<boolean> {
+  const res = await fetch(`${app.apiBase}/foreman/session?session=${encodeURIComponent(sid)}`);
+  const payload = (await res.json()) as { messages: Array<{ role: string; content: string }> };
+  return (payload.messages ?? []).some((m) => m.role === 'user' && m.content === said);
+}
+
 /** 整页横向溢出的像素数。 */
 async function horizontalOverflow(page: Page): Promise<number> {
   return page.evaluate(
@@ -2285,6 +2305,91 @@ test.describe('对讲台 · 切走再回来，本轮已经收到的输出还在�
     await expect(page.locator('.timeline .turn.fm')).toHaveCount(1);
     await expect(back).toContainText(A);
     await expect(back).toContainText(B);
+
+    bundle.problems.length = 0;
+    expectBundleHealthy(bundle);
+  });
+});
+
+/**
+ * 对讲台 · **关着页排上队的话照发**（决策 354②）。
+ *
+ * 排水环原先住在页面那个 `$effect` 里：页面一切走，出队就停——排队的那句话**等着**，等人
+ * 回到这一页才发。队列住 store（决策 275 的判据）之后排水环跟着搬进 store
+ * （`startQueueDrain`，随 App 起收）：页面关着照样排、照样发——决策 354② 明确接受的唯一
+ * 行为修正，而排水节奏一个字没改。
+ *
+ * **判据必须落在页面之外**：回来之后再断言「那句话发出去了」分不出新旧行为（旧行为回到
+ * 这一页也会补发）。故本用例人还在看板上时直接问后端台账要那一行——它出现在人回到对讲台
+ * **之前**，才证明排水发生在页面之外。
+ *
+ * 装置与「切走再回来」同款（`drip` 三截、中间留空档）：第一轮在飞的那段时间里排上队，然后切走。
+ */
+test.describe('对讲台 · 关着页排队的话照发（决策 354②）', () => {
+  let app: App;
+
+  const A = '第一截：我开始想了';
+  const B = '；第二截：这两句之间我切去了看板';
+  const C = '；第三截：想完了。';
+  const FIRST = '第一句：慢慢答';
+  const SECOND = '第二句：等你答完再发';
+
+  test.beforeAll(async () => {
+    app = await startApp({
+      script: foremanScript([[drip([A, B, C], 6_000)], [text('第二句的回话。')]]),
+      providerOnly: true,
+    });
+  });
+
+  test.afterAll(async () => {
+    await app?.stop();
+  });
+
+  test('排上队就切走：那句话在页面之外发出去，回来已经见到它', async ({ page }) => {
+    const bundle = watchBundle(page);
+    await page.goto(`${app.webBase}/#/talk`);
+    await settleBundle(page, bundle);
+
+    await page.locator('.typer textarea').fill(FIRST);
+    await page.locator('.typer button[type=submit]').click();
+
+    // 第一轮真的开始了（第一截落屏）
+    const live = page.locator('.timeline .turn.fm').first();
+    await expect(live).toContainText(A, { timeout: 30_000 });
+
+    // 一轮在飞：第二句排上队（票 04 那颗「排队发送」），此刻它还**没**发出去
+    await page.locator('.typer textarea').fill(SECOND);
+    await page.locator('.typer button[data-send="queue"]').click();
+    await expect(page.locator('.qsend'), '排上了队，等着这一轮收口').toContainText(SECOND);
+
+    const sid = await newestSession(app);
+
+    // **切走**：第一轮还在答，队列挂在这一班名下
+    await page
+      .getByRole('navigation', { name: '页面导航' })
+      .getByRole('link', { name: '看板' })
+      .click();
+    await expect(page.locator('.talk-head')).toHaveCount(0);
+
+    // 人还在看板上（对讲台这一页已经卸载）：那一句该**已经被发出去**。旧行为下这一行要等
+    // 人回到对讲台才出现——故这里等不到就是旧行为，等到了就是「排水不再以页面在屏为前提」。
+    await expect
+      .poll(() => ledgerHasUserLine(app, sid, SECOND), {
+        timeout: 45_000,
+        message: '关着页也要照排照发（决策 354②）：这句话该在看板那段时间里发出去',
+      })
+      .toBe(true);
+
+    // **切回来**：那一句已经在时间线上（发过了），回话也在，队列空了
+    await page
+      .getByRole('navigation', { name: '页面导航' })
+      .getByRole('link', { name: '对讲台' })
+      .click();
+    await expect(page.locator('.timeline .turn.mine', { hasText: SECOND })).toHaveCount(1, {
+      timeout: 30_000,
+    });
+    await expect(page.locator('.timeline')).toContainText('第二句的回话。', { timeout: 30_000 });
+    await expect(page.locator('.qsend'), '发过就出队了').toHaveCount(0);
 
     bundle.problems.length = 0;
     expectBundleHealthy(bundle);

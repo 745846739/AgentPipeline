@@ -221,7 +221,11 @@ describe('动作身份只有一把尺子（lib/actions actionKey，票 05）', (
 
 describe('超时判据按 kind、不摸正文（票 06，决策 259 的延伸）', () => {
   const foreman = read('realtime/foreman.ts');
-  const talk = read('routes/Talk.svelte');
+  // 发送编排自决策 354② 起住在 store：超时判据的接线点（趁 `ApiError` 还在手判好）随发送
+  // 搬走——扫描面跟着判据走（**换文件不等于放松**，与决策 275 / 354① 同一手法），
+  // 并反过来钉住页面里不再有第二处。
+  const store = read('stores/talk.svelte.ts');
+  const talk = mask(read('routes/Talk.svelte'), true);
   const client = read('api/client.ts');
 
   it('realtime/foreman.ts 不再有 startsWith(\'请求超时\')，判据钉在 kind 上', () => {
@@ -235,39 +239,47 @@ describe('超时判据按 kind、不摸正文（票 06，决策 259 的延伸）
     expect(client, '超时那条构造该把 kind 作为第三参传进去').toContain(', KIND_REQUEST_TIMEOUT)');
   });
 
-  it('Talk 趁 ApiError 还在手把判好的布尔交给 failureNotice（判上移、拼接留下游）', () => {
-    expect(talk, 'Talk 该调 isRequestTimeout').toContain('isRequestTimeout(err)');
+  it('发送编排趁 ApiError 还在手把判好的布尔交给 failureNotice（判上移、拼接留下游）', () => {
+    expect(store, '该调 isRequestTimeout').toContain('isRequestTimeout(err)');
     // 判好的布尔**存进一个具名变量**再交给下面的分支（决策 260）：`finally` 里还要
     // 用它决定接不接那一轮，故不能在实参位置上判一次完事。
-    expect(talk, '该把判好的布尔存下来').toContain('timedOut = isRequestTimeout(err)');
+    expect(store, '该把判好的布尔存下来').toContain('timedOut = isRequestTimeout(err)');
     expect(
-      talk.match(/import \{[^}]*isRequestTimeout[^}]*\} from '\.\..*\/realtime\/foreman'/)?.[0],
+      store.match(/import \{[^}]*isRequestTimeout[^}]*\} from '\.\..*\/realtime\/foreman'/)?.[0],
       'isRequestTimeout 不是从 realtime/foreman 来的',
     ).toBeTruthy();
+    expect(talk, '页面里不该再自己判一次超时（判据只有一处）').not.toContain('isRequestTimeout');
   });
 
   it('本地放弃走安静态：超时不落失败轮、接手无条件（决策 288 / 票 05）', () => {
-    expect(talk, '超时该走安静态（不清字、不落失败轮）').toContain(
-      'talk.stream = quietAfterLocalGiveUp(talk.stream)',
+    expect(store, '超时该走安静态（不落失败轮）').toContain(
+      'this.stream = quietAfterLocalGiveUp(this.stream)',
     );
-    expect(talk, '接手该走 followAfterGiveUp（无条件，不等 stale 读数）').toContain(
-      'talk.followAfterGiveUp(maxLedgerId(session.messages ?? []))',
+    expect(store, '接手该走 followAfterGiveUp（无条件，不等 stale 读数）').toContain(
+      'this.followAfterGiveUp(maxLedgerId(session.messages ?? []))',
     );
     expect(
-      talk.match(/import \{[^}]*quietAfterLocalGiveUp[^}]*\} from '\.\..*\/realtime\/foreman'/)?.[0],
+      store.match(
+        /import \{[^}]*quietAfterLocalGiveUp[^}]*\} from '\.\..*\/realtime\/foreman'/,
+      )?.[0],
       'quietAfterLocalGiveUp 不是从 realtime/foreman 来的',
     ).toBeTruthy();
     // 非超时的失败仍走失败轮（网络不通 / 配对 403 是真失败，一个字都不动）。
-    expect(talk, '非超时失败照旧落失败轮').toContain('failForemanStream(');
+    expect(store, '非超时失败照旧落失败轮').toContain('failForemanStream(');
+    expect(talk, '页面里不该再有那两样（接线跟着发送走了）').not.toContain(
+      'quietAfterLocalGiveUp',
+    );
   });
 });
 
 describe('跟的那一轮的收场分三支（决策 260 裁决③，票 in-flight-turn 01；收口自决策 275 起在 store）', () => {
   const talk = read('routes/Talk.svelte');
+  const talkCode = mask(talk, true);
   const foreman = read('realtime/foreman.ts');
   // 三支的收口自决策 275 起住在 store（在飞现场随页面来去，收口自然也跟着它走）；
-  // 页面只把新台账接进这一屏。扫描面因此跟着判据走——**换文件不等于放松**：
-  // 下面每条断言一字不改地要求同一个形状。
+  // 决策 354① 之后 reload 与 syncFollowing 同住 store，决策 354② 之后**发送的收尾**
+  // 也搬了进来——页面这一侧一处都不剩。扫描面因此整段跟着判据走——**换文件不等于放松**：
+  // 下面每条断言一字不改地要求同一个形状，并反过来钉住页面里没有第二处。
   const store = read('stores/talk.svelte.ts');
 
   it('落地哨把收场交给纯函数，不再就地「一把梭清字」', () => {
@@ -291,11 +303,13 @@ describe('跟的那一轮的收场分三支（决策 260 裁决③，票 in-flig
       'turnLanded(payload.messages ?? [], anchor) || !payload.turn_in_flight',
     );
     // 页面只**接线**：收口这件事走 store 的同一个入口（页面里不许再自己判一遍三支）。
-    // 决策 354① 之后 reload 与 syncFollowing 同住 store（落地后的重读不再经过页面），
-    // 页面剩下的只有发送收尾那一处接手。
-    expect(talk, '页面该把收口交给 store').toContain('talk.syncFollowing(');
+    // 决策 354① 之后 reload 与 syncFollowing 同住 store（落地后的重读不再经过页面）；
+    // 决策 354② 之后发送的收尾也搬了进来——原先留在页面上的那一处 `talk.syncFollowing(`
+    // 随之退场，故两条正向断言一并锚在 store。
+    expect(store, '发送收尾该把收口交给同一入口').toContain('this.syncFollowing(session)');
     expect(store, 'reload 之后的收口也走同一入口').toContain('this.syncFollowing(payload)');
-    expect(talk, '页面里不该再自己算三支').not.toContain("outcome.kind === 'lost'");
+    expect(talkCode, '页面里不该再自己算三支').not.toContain("outcome.kind === 'lost'");
+    expect(talkCode, '页面里不该再接那一轮（收口只有 store 一处）').not.toContain('syncFollowing');
   });
 
   it('三支的判据与文案住在纯函数模块里（可单测、不触 DOM）', () => {
@@ -304,6 +318,41 @@ describe('跟的那一轮的收场分三支（决策 260 裁决③，票 in-flig
     // 「任何一支都不许清掉已出现的文字」这条纪律的落点：死轮走 failForemanStream（留字），
     // 不是 emptyForemanStream（清字）
     expect(foreman, '死轮该按「保留」的姿态收').toContain('failForemanStream');
+  });
+});
+
+describe('发送编排只有一处（决策 354②：串台守卫收成 claim，排水环住 store）', () => {
+  const talk = mask(read('routes/Talk.svelte'), true);
+  const store = read('stores/talk.svelte.ts');
+
+  it('串台守卫是一条判据、一个出口：`claim()` 的闭包；页面里不许再有手写比对', () => {
+    // 收口之前是五种手写、三种锚点拼法（wanted / originSid / gen）——漏一处就是
+    // 「对讲台出现非本次会话的内容」那个历史根因。判据现在只有这一处。
+    expect(store, '守卫该有唯一定义').toContain('claim(): () => boolean');
+    expect(store, '发送那条路该认下守卫').toContain('let mine = this.claim();');
+    expect(store, '两处取数各认一次（reload / loadEarlier）').toContain('const mine = this.claim();');
+    expect(talk, '页面里不该再有手写的在途比对').not.toContain('talk.sessionId !==');
+    // 旧拼法一并退场（换文件不等于放松，反向也要钉）：
+    expect(store, 'reload 里那两处旧的 `wanted` 比对该没了').not.toContain('sessionId !== wanted');
+    expect(store, 'loadEarlier 里那个 `gen` 记号该没了').not.toContain('gen !== this.sessionId');
+  });
+
+  it('「在飞」的判据也只有一处（`inFlight`）：入队与出队问的是同一个问题', () => {
+    // 页面原先自己判一遍（send 里那段三元）、那条出队 effect 再判一遍——两处迟早分叉。
+    expect(store, '该有唯一定义').toContain('private get inFlight(): boolean');
+    expect(store, '入队读它').toContain('if (this.inFlight && sid) {');
+    expect(store, '出队读它').toContain('if (this.inFlight) return;');
+  });
+
+  it('排水环住 store：由 App 起收，判据读 store 自己的读数；页面里没有出队这一回事', () => {
+    expect(store, '排水环该有起收两端').toContain('startQueueDrain()');
+    expect(store, '随 App 起').toContain('this.startQueueDrain();');
+    expect(store, '随 App 收').toContain('this.stopQueueDrain();');
+    // 页面那个 effect 的两个额外读数在 store 里的等价物：watchMode / archivedOpen
+    expect(store, '值守账不排水').toContain("this.kind === 'watch'");
+    expect(store, '归档班次不排水').toContain('archived_at != null');
+    expect(talk, '页面里不该再自己出队').not.toContain('takeQueued(');
+    expect(talk, '页面里不该再有那条出队 effect 的判据').not.toContain('queueHeld[sid]');
   });
 });
 

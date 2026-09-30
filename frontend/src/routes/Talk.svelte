@@ -12,11 +12,9 @@
   import { chipRow } from '../lib/sessionChips';
   import {
     cancelForemanTurn,
-    createForemanSession,
     executeForemanProposal,
     rejectForemanProposal,
     renameForemanSession,
-    sendForemanMessage,
   } from '../api/client';
   import { board } from '../stores/board.svelte';
   import {
@@ -81,18 +79,9 @@
   import { getPairingToken } from '../api/config';
   import { actionKey } from '../lib/actions';
   import {
-    beginForemanStream,
-    failForemanStream,
-    failedLedgerRowIds,
-    failureNotice,
     foreignIsReplying,
-    forgetForeignActive,
-    isRequestTimeout,
     ledgerOwnsTheFailure,
-    maxLedgerId,
     pruneForeignActive,
-    quietAfterLocalGiveUp,
-    settleForemanStream,
   } from '../realtime/foreman';
   import { talk } from '../stores/talk.svelte';
   import Sprite from '../components/render/Sprite.svelte';
@@ -260,10 +249,10 @@
    *
    * 判「这次失败是不是已经由台账那一行接管了」要的正是这个差集：不带它的话，一次早先的失败
    * 会让此后每一次真实断网（请求根本没到后端、台账不会多出任何行）都静默下来——而那种情况
-   * 恰恰是本地那条失败轮存在的理由（判据在 `realtime/foreman.ts`；这里只记现场，在 `sendNow`
-   * 开头按当时的台账落一次）。
+   * 恰恰是本地那条失败轮存在的理由。自决策 354② 起由 store 在**发出去的那一刻**记
+   * （`sendTurn` 开头）：记的地方得跟着发送走，而发送已经搬进了 store。这里只是读别名。
    */
-  let failuresBefore = $state<ReadonlySet<number>>(new Set());
+  const failuresBefore = $derived(talk.failureBaseline);
   /**
    * 这次失败已被台账那一行接管（决策 337）——**判在渲染上**，不是收尾那一刻判一次。
    *
@@ -276,13 +265,11 @@
     ledgerOwnsTheFailure(session?.messages ?? [], failuresBefore),
   );
   /**
-   * 本机刚发出去、还没落地的那一班（决策 220③ 的「正在回话」前半支）。
-   *
-   * 记 id 而不是一个布尔：切走之后那一轮照旧在路上，标记要落在**它**那一行上，
-   * 而不是「你现在看的这一班」。它只喂本页那两枚标记（切页面时这一屏本就不在），
-   * 故留在组件里——与决策 275 搬走的那几样不同，它没有「页面不在时也要成立」的语义。
+   * 本机刚发出去、还没落地的那一班（决策 220③ 的「正在回话」前半支）——住在 store
+   * （决策 354②）：发送编排搬走之后，「刚发出去的是哪一班」活得过页面（队列在关着页的
+   * 时候也会发出去）。这里只是读别名。
    */
-  let sendingSid = $state<string | null>(null);
+  const sendingSid = $derived(talk.sendingSid);
 
   /**
    * 本机已经按过停、那一轮还没收口（决策 294 / 票 09）。
@@ -1050,25 +1037,18 @@
   }
 
   /**
-   * 说一句话（坞的入口）。
+   * 说一句话（坞的入口）。**在飞就入队、空着就直接发**——那个判据自决策 354② 起住在
+   * store（`talk.submit`）：页面只拿捏输入框里那句文本（trim、清空），发与排的取舍
+   * 与「什么算在飞」由 store 一处说。
    *
-   * **在飞时不再拦第二句——排队**（票 04 of talk-live-identity，2026-09-29 决议，
-   * 显式修订决策 182㉓「一轮没落地就发不出第二句」）：一轮在飞时发出的句子进**发送
-   * 队列**（按班次分列、住 store），当前轮收口后由下面的出队效果自动发出；
-   * 死轮 / 中断时队列扣住（store 的 `queueHeld`），等坞里的两个出口。
+   * 排队那条路见 `stores/talk.svelte.ts` 的 `queue`（按班次分列、住 store）；
+   * 死轮 / 中断时扣住（`queueHeld`），等坞里的两个出口。
    */
   function send() {
     const text = input.trim();
     if (!text) return;
-    const sid = currentId;
-    const running = talk.sending || Boolean(session?.turn_in_flight) || talk.followingSince !== null;
-    if (running && sid) {
-      talk.enqueue(sid, text);
-      input = '';
-      return;
-    }
     input = '';
-    void sendNow(text);
+    talk.submit(text);
   }
 
   /**
@@ -1112,26 +1092,12 @@
     }
   }
 
-  /**
-   * 队列的出队口（票 04）：空闲 + 台账说没有在跑的轮 + 队列没扣住时，把最前面那条
-   * 交给 {@link sendNow}。住在**在屏的这一页**而不是 store：发送要开乐观轮、要写
-   * 这一屏的输入框状态，页面不在屏时队列等着——回来那一次装载本就会把出队效果点燃。
-   *
-   * 值守轮到达**不触发出队**：这条效果只由「发送态归零」点亮，值守轮的增量走
-   * `noteForeignDelta` 那一条账，两不相干。
-   */
-  $effect(() => {
-    const sid = talk.sessionId;
-    if (!sid || watchMode || archivedOpen) return;
-    if (talk.sending || session?.turn_in_flight || talk.followingSince !== null) return;
-    if (talk.queueHeld[sid]) return;
-    const next = talk.queue[sid]?.[0];
-    if (!next) return;
-    talk.takeQueued(sid);
-    void sendNow(next);
-  });
+  /* 队列的出队口自决策 354② 起住在 store（`talk.startQueueDrain`，由 `App.svelte` 的
+   * `talk.init()` 起）：队列进 store 之后**页面挂载不再是排水的前提**——关着页排出去的
+   * 话照发（决策 354② 明确接受的唯一行为修正，排水节奏照旧）。判据（在飞 / 扣住 /
+   * 归档 / 值守账）随之下移到 store，那里有它要的每一格读数。 */
 
-  /** 「上一轮没回来」之后人按了确认：放行队列（下面的出队效果自会接手）。 */
+  /** 「上一轮没回来」之后人按了确认：放行队列（store 的排水环自会接手）。 */
   function resumeQueue() {
     if (currentId) talk.setQueueHeld(currentId, false);
   }
@@ -1159,127 +1125,32 @@
   }
 
   /**
-   * 真正发一句话（`send()` 与出队效果共用；`text` 已是调用方拿定的一句话）。
+   * **发话就是一次回底**（决策 301）：人自己按下的那一句必须看得见——他可能正往上翻
+   * 历史，若把这一轮也交给「贴在底上才跟」那条判据，他发完话屏幕上什么都没动，
+   * 只会以为没发出去。故这一档与「回底钮」同级：无条件恢复跟随，再由上面那条效果滚过去。
    *
-   * **先确定班次，再发话**：这台机器上一个班次都没有时（首启空 home 的第一次说话），
-   * 客户端自己先开一个——若让它落到服务端的缺省逻辑上，回话的流式增量带的班次 id
-   * 是回来之后才知道的，而此刻增量已经在路上了，会被班次守卫挡掉（字还在，只是白流一场）。
-   *
-   * 每个 await 之后都比对 `talk.sessionId`（票 01，决策 204⑥）：这一班的回包不落到
-   * 另一班的屏幕上。比对不通过时**连乐观轮一起撤**——它属于已经不显示的那一班。
-   * 失败时把那句话送回输入框（框还空着的话）：决策 182㉓ 的「失败不改输入框」
-   * 在队列化之后的形态。
+   * 判据挂在 `talk.sending` 的**上升沿**而不是写在 `send()` 里（决策 354②）：发送编排
+   * 住进了 store，队列里的那一句是**排水环自己**发出去的（页面关着也发）——它同样是人打的
+   * 话、同样该看得见。而「上升沿」也正是这条判据要的形状：真写成「在发就一直跟」的话，
+   * 人在流式期间上滑读历史会被每一段增量拽回底部。
    */
-  async function sendNow(text: string) {
-    // **发话就是一次回底**（决策 301）：人自己按下的那一句必须看得见——他可能正往上翻
-    // 历史，若把这一轮也交给「贴在底上才跟」那条判据，他发完话屏幕上什么都没动，
-    // 只会以为没发出去。故这一档与「回底钮」同级：无条件恢复跟随，再由下面那条效果滚过去。
-    following = true;
-    talk.sending = true;
-    talk.pendingText = text;
-    talk.stream = beginForemanStream();
-    // 本机这一趟接手之后就不再「跟」别人（决策 260）：两条来源说的是同一件事的不同主人，
-    // 留着锚点会让落地哨（那个 3s 的 `$effect`）拿旧锚点判本机这一趟，而它的收尾归
-    // 下面这一趟 POST 管——两条路各收各的口，混起来会把这一轮提前判成「落地了」。
-    talk.followingSince = null;
-    // 这一趟之前台账里已有的失败轮 id：失败回来后靠它分辨「这次新出现的那一条」
-    // （判据在 realtime/foreman.ts；不记的话，早先的失败会让真正的断网静默下来）。
-    // 消费它的地方是上面那条 `ledgerOwnsFailure` —— 判在渲染上（决策 337）。
-    failuresBefore = failedLedgerRowIds(session?.messages ?? []);
-    // 「这一次是本地等不到回包」那一类（决策 223）——在 catch 里趁 `ApiError` 还在手判好，
-    // `finally` 里要用（它决定那条本地失败轮退不退场，见下）。缺省假：成功那一趟用不到它。
-    let timedOut = false;
-    const originSid = talk.sessionId;
-    let sid = originSid;
-    try {
-      if (!sid) {
-        const created = await createForemanSession();
-        // 这一趟之间换班了（票 01）：开出来的空班作废——它的 id 没进台账、没有回话，
-        // 静默丢弃即可（乐观轮由 catch 的统一收尾撤掉）。
-        if (talk.sessionId !== originSid) return;
-        sid = created.session.id;
-        talk.watch(sid);
-        talk.sessionList = [created.session, ...talk.sessionList];
-      }
-      // 「本机发出且未落地」（决策 220③）：切走之后这枚标记要落在**它**那一行上
-      sendingSid = sid;
-      const res = await sendForemanMessage(text, sid);
-      if (talk.sessionId !== sid) {
-        // 切走了：这一轮从这一屏撤下（决策 220⑤），但回话已经落地——列表要跟上，
-        // 否则「原班次有新动静」永远等不到（这一支在放开切换之后是**常态路径**）。
-        // 「落地即熄灭」在这里同样要办：这一班的增量此前被记进了「别的班次在回话」那张映射
-        // （切走之后它的 `session_id` 就不再是「当前这一班」了），不清掉那枚
-        // 「正在回话」会一直亮到静默超时——而它说的已经不是实话。
-        talk.settleTurn();
-        talk.foreign = forgetForeignActive(talk.foreign, sid);
-        void talk.refreshSessionList();
-        return;
-      }
-      // 回话是权威值：先收敛流式文本（重取台账期间不闪空），再以台账覆盖
-      talk.stream = settleForemanStream(talk.stream, res.reply);
-      // 重取之后**无条件收掉这两样本地状态**：它们是「这一轮」的东西，而重取可能发现
-      // 服务端已经把我们换到了另一班（另一台设备归档了它）。那种情况下留着乐观轮，
-      // 它就会挂在**另一班的**时间线上——正是决策 204⑥ 要挡的串台。
-      if (await talk.reload(sid)) talk.settleTurn();
-    } catch (err) {
-      // 失败把那句话送回输入框（框空着时）：后端在叫模型之前已把 user 行落库的话，
-      // 台账那一行会与回框的话并存——重读后乐观轮按同文去重退场（票 02）。
-      // 失败以时间线里的一轮呈现——不弹窗、不 toast。
-      if (!input.trim()) input = text;
-      if (talk.sessionId !== (sid ?? originSid)) {
-        talk.settleTurn();
-        void talk.refreshSessionList();
-        return;
-      }
-      // 本地超时**不等于**这一轮失败：服务端那一轮不随这次请求一起死（决策 223），
-      // 故超时那一类由 `failureNotice` 补上「它仍在继续」的实情——否则人会重发一句，
-      // 而那一轮很可能正在把话答完。
-      // 配对与超时两枚判据（票 04 / 06，决策 259）：趁 `ApiError` 还在手按 `kind` 判掉——
-      // 错误降级成流里的字符串之后 `kind` 就丢了。与 `stream.error` 同一处设置，两者恒同步。
-      talk.pairingNeeded = isPairingRequired(err);
-      timedOut = isRequestTimeout(err);
-      if (timedOut) {
-        // 本地放弃 = 安静态（决策 288 / 票 05）：**不落失败轮**。那一轮在服务端不随请求死
-        // （决策 223），而且整轮墙钟已撤——它跑多久由逐调用空闲判死管，本地等多久只决定
-        // 这一屏。光标继续走；收场交给 finally 的落地哨。
-        talk.stream = quietAfterLocalGiveUp(talk.stream);
-      } else {
-        talk.stream = failForemanStream(
-          talk.stream,
-          failureNotice((err as Error).message, false),
-        );
-      }
-      // 重取成功才撤乐观轮：撤了之后这话由台账那一行承担，不靠重取失败时凭空消失。
-      // （决策 354①：原先这里还有一声 `markLedgerStale` 朝在屏的那一页喊「再读一次」——
-      // 台账住进 store 之后那声没了：这趟 `reload` 刚读完，没有新东西可读。）
-      if (await talk.reload(sid)) {
-        talk.pendingText = null;
-        // **本地那条失败轮的退场不在这里办**（决策 337）：后端已经把这一轮为什么没跑起来
-        // 落成了台账行（决策 211④ / 票 04），而本地这条承载传输层报文与配对入口——两者
-        // 谁的先到都可能，判一次（此刻）会留下共存窗。判据挂在 `ledgerOwnsFailure` 上，
-        // 由时间线的归约逐帧消费：台账那一行在场，本地那条一帧都不出现。
-      }
-    } finally {
-      talk.sending = false;
-      sendingSid = null;
-      // **本地放弃、服务端还在跑**那一类（决策 223 的超时）交棒给「跟」这一支（决策 260）：
-      // 这一趟的回包等不到了，但那一轮不随请求一起死——上面那一趟 `reload` 已经把
-      // `turn_in_flight` 读回来，这里据此接力，增量才继续往时间线上走。
-      // 成功那一趟是**空操作**：那一刻 `turn_in_flight` 已经翻假（回话落了库）。
-      // 必须放在 `sending = false` **之后**——`syncFollowing` 在本机还在发时不接手。
-      if (session) talk.syncFollowing(session);
-      // 本地放弃（决策 288 / 票 05）：安静态**不落失败轮**，接手是**无条件**的——
-      // 上一行 syncFollowing 只认「服务端此刻说在跑」，而本地超时那一刻的读数很可能
-      // 已经过期（重读失败 / 正好落地）。落地哨的下一趟轮询按 fresh 读数收场：
-      // 落地 → 台账接管；还在跑 → 继续跟（增量照旧走时间线）；不再跑也没落地 →
-      // 按「跟的那一轮」的既有形状收成死轮失败。锚点取重读之后那本台账的尾部——
-      // 用户那一句已在其中，此后多出的行才是这一轮的收场。
-      if (timedOut && session) {
-        talk.pairingNeeded = false;
-        talk.followAfterGiveUp(maxLedgerId(session.messages ?? []));
-      }
-    }
-  }
+  $effect(() => {
+    if (talk.sending) following = true;
+  });
+
+  /**
+   * **这次没送出去的那句话回填进输入框**（决策 182㉓「失败不改输入框」）。
+   *
+   * 框空着才填：人自己又打了字的话，他打的那句才是最新的。填不填都把这格清掉——它说的是
+   * **某一次没送到的发送**，不是草稿。发送编排在 store（决策 354②），那句话先落在
+   * `talk.unsentText` 上由这里消费：页面关着那一刻发出去的失败，回来这一拍照样回框里。
+   */
+  $effect(() => {
+    const text = talk.unsentText;
+    if (text === null) return;
+    talk.unsentText = null;
+    if (!input.trim()) input = text;
+  });
 
   /* 只重读班次列表（不碰这一屏的台账）的 `refreshSessionList` 自决策 354① 起住在 store：
    * 已经落地的回话（含切走之后落地的那些）更新的是 `last_active_at`——「有新动静」那枚
