@@ -125,6 +125,19 @@ pub fn spawn_in_own_process_group(
 }
 
 /// 生产实现：真正的进程组终止（决策 66）。
+///
+/// **走 `kill(2)` 系统调用，不经外部的 `kill` 命令**（2026-09-30，决策 337⑤）。
+/// 旧写法 `Command::new("kill").arg("-TERM").arg("-<pgid>")` 把「负号」交给了一个**外部
+/// 程序的命令行解析**，而各家实现并不一致：BSD 的 `kill`（macOS）与 util-linux 的
+/// `kill`（Ubuntu 22.04，也就是 106）都按「负 pid = 进程组」办，**procps-ng 的 `kill`
+/// （Ubuntu 24.04，也就是 GitHub runner）不办**——它把 `-<pgid>` 当成信号名那一族来解析
+/// （见其 `kill.c` 里 `case '?'` 的 "Special case for signal digit negative PIDs" 分支），
+/// 结果**退出码 0、进程组一个都没杀**。这台机器上没有任何东西看起来是坏的，直到
+/// `command_funnel::a_timed_out_command_takes_its_descendants_with_it` 在 CI 上红：
+/// 超时之后子孙进程还活着——正是决策 66 要消掉的那个形状，只是换了个藏身处
+/// （开发机与生产机都恰好是「能办」的那两种实现，故本地怎么跑都绿）。
+///
+/// `libc` 本来就在依赖树里（`statvfs`，决策 321），故这一改**不新增依赖**。
 #[derive(Debug, Clone, Copy, Default)]
 pub struct RealProcessKiller;
 
@@ -133,18 +146,13 @@ impl ProcessKiller for RealProcessKiller {
         if pgid <= 0 {
             return Ok(());
         }
-        // 负 pid 表示整个进程组。用 /bin/kill 避免引入 libc 依赖。
-        let status = std::process::Command::new("kill")
-            .arg("-TERM")
-            .arg(format!("-{pgid}"))
-            .status()?;
-        if !status.success() {
+        // 负 pid = 整个进程组（`kill(2)` 的原生语义，不经任何解释层）。
+        let rc = unsafe { libc::kill(-pgid, libc::SIGTERM) };
+        if rc != 0 {
             // 进程可能已退出——不是错误。
-            tracing::debug!(pgid, "进程组已不存在或 TERM 失败，尝试 KILL");
-            let _ = std::process::Command::new("kill")
-                .arg("-KILL")
-                .arg(format!("-{pgid}"))
-                .status();
+            let err = std::io::Error::last_os_error();
+            tracing::debug!(pgid, error = %err, "进程组已不存在或 TERM 失败，尝试 KILL");
+            unsafe { libc::kill(-pgid, libc::SIGKILL) };
         }
         Ok(())
     }
