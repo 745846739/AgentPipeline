@@ -59,7 +59,11 @@ jobs:
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
+      # cache-on-failure（决策 346）：失败轮也落缓存。红→绿循环里（337–345 九处红几乎
+      # 全走这个形态）失败轮的编译进度不作废，紧接着的修复 push 不用重付。
       - uses: Swatinem/rust-cache@v2
+        with:
+          cache-on-failure: true
       - name: 工具链自证
         # 决策 175 折腾过「到底哪套 rustc 在编」；CI 里也该一眼看得到，别猜。
         run: rustc -vV && cargo -V
@@ -82,7 +86,10 @@ jobs:
     timeout-minutes: 45
     steps:
       - uses: actions/checkout@v4
+      # cache-on-failure：同 lint 处的理由（决策 346）。
       - uses: Swatinem/rust-cache@v2
+        with:
+          cache-on-failure: true
       - name: 工具链自证
         run: rustc -vV
       - run: make check-test
@@ -108,22 +115,34 @@ jobs:
       - run: make check-frontend
 
   # ── 前端 E2E：真二进制 + Chromium ───────────────────────────────────────────
-  # 单独一个 job：33 个 spec 串行（`playwright.config.ts` 的 `workers: 1`——每条用例自己
-  # spawn 后端与 Vite，串行避免端口/资源互扰），大概率是最长的一杆，别拖住 lint 的反馈。
+  # 单独一个 job：最长的一杆，别拖住 lint 的反馈。33 个 spec 按**测试文件**分给
+  # 4 个 worker 并行（决策 346：CI 态 `workers: 4`，端口/资源互扰的旧理由已不成立
+  # ——后端 `--port 0` 随机端口、临时 home、不起 Vite dev server）；文件内仍串行。
   # `make check-e2e` 内置产物新鲜度守卫（决策 166）：dist 缺失或落后于前端源码就先
-  # `npm run build`，随后 cargo 按 `build.rs` 的 rerun-if-changed 重编内嵌资产表。
+  # `npm run build`（实测约 8 秒，不值得为此做 artifact 跨 job 搬运），随后 cargo 按
+  # `build.rs` 的 rerun-if-changed 重编内嵌资产表。
   e2e:
     name: e2e（playwright chromium）
     runs-on: ubuntu-latest
     timeout-minutes: 60
     steps:
       - uses: actions/checkout@v4
+      # cache-on-failure：同 lint 处的理由（决策 346）。
       - uses: Swatinem/rust-cache@v2
+        with:
+          cache-on-failure: true
       - uses: actions/setup-node@v4
         with:
           node-version: "24"
           cache: npm
           cache-dependency-path: frontend/package-lock.json
+      # 浏览器缓存（决策 346）：`playwright install` 每轮约 22 秒，大头是 Chromium
+      # 下载。key 钉 package-lock——playwright 版本变了缓存自然失效。缓存命中时
+      # 下一步的 install 只做存在性校验与系统库，秒级。
+      - uses: actions/cache@v4
+        with:
+          path: ~/.cache/ms-playwright
+          key: ms-playwright-${{ runner.os }}-${{ hashFiles('frontend/package-lock.json') }}
       - name: 装前端依赖
         run: npm ci --no-audit --no-fund
         working-directory: frontend
