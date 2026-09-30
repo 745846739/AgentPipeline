@@ -2,7 +2,7 @@ use std::sync::{Arc, Mutex};
 
 use serde::{Deserialize, Serialize};
 
-use crate::agent::client::{LlmClient, LlmRequest, Message, ToolDef};
+use crate::agent::client::{LlmClient, LlmRequest, Message};
 use crate::agent::providers::is_context_window;
 use crate::agent::tools::{ToolCallContext, ToolExecutor};
 use crate::config::Settings;
@@ -204,7 +204,7 @@ pub const FOREMAN_PERSONA: &str = "你是夜班车间的值班长，向值班经
 /// read_file 读取」）与 `FORMAT_RULES`（「产出文件一律通过 write_file 写入」「结构化流转
 /// 信息一律通过 submit_metadata 提交」）——三段指令都在让模型使用它**没有**的工具。
 /// 指示一个模型去调不存在的工具，正是它开始编造文件内容的起点。
-const FOREMAN_BASELINE: &str = "你在一个本机工具内运行，面对的是这台机器上的流水线台账\
+pub(super) const FOREMAN_BASELINE: &str = "你在一个本机工具内运行，面对的是这台机器上的流水线台账\
      与这个工具自己的家目录。你能读到什么、能不能动手，由下面「工具纪律」那一段说清。";
 
 /// 该轮调用过的只读工具痕迹（票 05：进审计，与快照一起回答「依据什么」）。
@@ -320,6 +320,9 @@ struct WatchFailureState {
 impl WatchFailureState {
     /// 退了多久之后再试（秒）。取值是常量不是配置项——照决策 224 的姿态：没有第二种诉求
     /// 之前不扩契约。
+    ///
+    /// 时长算术住 [`crate::interrupt::backoff_secs`]（决策 355）：这里只负责**选档**
+    /// （「等一等不会自己好」的类别换一组 base / max），翻倍与封顶不在这里。
     fn delay_secs(kind: &str, consecutive: u32) -> i64 {
         let (base, max) = if Self::waits_pointlessly(kind) {
             (
@@ -329,8 +332,7 @@ impl WatchFailureState {
         } else {
             (FOREMAN_WATCH_RETRY_BASE_SECS, FOREMAN_WATCH_RETRY_MAX_SECS)
         };
-        let double = 1i64 << (consecutive.saturating_sub(1)).min(6);
-        base.saturating_mul(double).min(max)
+        crate::interrupt::backoff_secs(consecutive, base, max)
     }
 
     /// 「等一等不会自己好」的类别：账单 / 鉴权 / 模型名 / 上下文超窗 / 配置。
@@ -378,8 +380,12 @@ impl WatchFailureState {
     }
 
     /// 现在还在退避里吗。
+    ///
+    /// 「到点了吗」这条判据住 [`crate::interrupt::waiting`]（决策 355）——它与去抖、
+    /// 任务冷却、notify 的每类节流是同一条。
     fn waiting(&self, now: chrono::DateTime<chrono::Utc>) -> bool {
-        self.next_attempt_at.is_some_and(|at| now < at)
+        self.next_attempt_at
+            .is_some_and(|at| crate::interrupt::waiting(now, at))
     }
 }
 
@@ -468,101 +474,22 @@ impl ForemanRunner {
         self.human_turns.begin()
     }
 
-    /// 轮内压缩的触发线（决策 291 / 票 06(b)）：**窗口的 80%**。
+    /// 这一轮的窗口（决策 291 / 票 06(b)）：provider 行的 `context_window`。
     ///
-    /// 复用流水线那套容量算术（[`crate::agent::context::estimate_context_capacity`] 的
-    /// 系统/用户预留与 `OUTPUT_RESERVE`），只把触发线从软限 60% 抬到 80%——理由见票面：
-    /// 压缩会打断 provider 的 prefix 缓存（2026-09-26 实测 94% 命中，是这套东西唯一便宜的
-    /// 地方），压一次之后下一次调用几乎全量重算，故触发要**迟钝**（到窗口 ~80% 才压）。
-    const FOREMAN_INLOOP_COMPACT_RATIO: f64 = 0.8;
-
-    /// 这一轮的窗口容量（决策 291 / 票 06(b)）：provider 行的 `context_window` + 上面那份
-    /// 算术。查不到（无可用 provider / 未登记窗口 / 读库失败）→ `None` = 跳过分档。
+    /// **只取数，不算术**：容量算术（系统/用户两段预留、软硬限、80% 的触发线）要
+    /// `system_prompt`，而那要到组装时才成立——故它随组装裁定走
+    /// （[`TurnPlan`]，`model_window` 是喂进去的事实之一）。
     ///
+    /// 查不到（无可用 provider / 未登记窗口 / 读库失败）→ `None` = 跳过分档。
     /// **不因为查不到窗口就让这一轮失败**：流水线侧的显式失败（决策 110）守的是「超硬限
     /// 时挂 pending」那条路——对讲台没有那条路，而「窗口没登记」不该让一次对话说不了话。
     /// 真撞墙还有 (c) 那条恢复路兜着（靠 provider 自己的报错，不靠我们猜的窗口）。
-    async fn turn_capacity(
-        &self,
-        cfg: Option<&crate::types::StageConfig>,
-        system_prompt: &str,
-        user_prompt: &str,
-    ) -> Option<crate::agent::context::ContextCapacity> {
+    async fn turn_window(&self, cfg: Option<&crate::types::StageConfig>) -> Option<usize> {
         let providers = self.store.load_providers().await.ok()?;
         let fallback = providers.iter().find(|p| p.enabled).map(|p| p.id.as_str());
         let provider_id = crate::storage::catalog::resolve_provider_id(None, None, cfg, fallback)?;
         let provider = providers.into_iter().find(|p| p.id == provider_id)?;
-        if provider.context_window == 0 {
-            return None;
-        }
-        let mut capacity = crate::agent::context::estimate_context_capacity(
-            provider.context_window as usize,
-            system_prompt,
-            user_prompt,
-            &self.settings,
-        );
-        capacity.soft_limit = (capacity.total as f64 * Self::FOREMAN_INLOOP_COMPACT_RATIO) as usize;
-        Some(capacity)
-    }
-
-    /// 本轮起点的下标（决策 291 / 票 06(b)）：`transcript` 里承载「这一轮要处理的那句话」
-    /// 的那条消息。压缩拿它当锚点（[`crate::agent::context::compact_messages_from`] 的
-    /// `current_start`）——载入的历史不得顶替它，否则真正的起点会被压成摘要。
-    ///
-    /// 按内容倒着找而不是记住一个下标：压缩会重排下标，而这句话本身不变。
-    fn round_start_of(transcript: &[Message], question: &str) -> usize {
-        transcript
-            .iter()
-            .rposition(|m| {
-                m.role == crate::agent::client::Role::User && m.content.as_deref() == Some(question)
-            })
-            .unwrap_or(0)
-    }
-
-    /// 轮内预算门（票 06(b)）：过线就按轮压缩，返回压掉的段数（0 = 没触发 / 压不动）。
-    ///
-    /// 判据与流水线逐字同源（[`crate::agent::context::should_compact`] 对
-    /// [`crate::agent::context::estimate_messages_tokens`] 的全文读数）——差别只有那条
-    /// 触发线（80% 而不是软限 60%，理由见 [`Self::FOREMAN_INLOOP_COMPACT_RATIO`]）。
-    fn compact_inline_if_over_budget(
-        &self,
-        transcript: &mut Vec<Message>,
-        question: &str,
-        system_prompt: &str,
-        user_prompt: &str,
-        capacity: Option<crate::agent::context::ContextCapacity>,
-    ) -> usize {
-        let Some(capacity) = capacity else {
-            return 0;
-        };
-        let estimate =
-            crate::agent::context::estimate_messages_tokens(system_prompt, user_prompt, transcript);
-        if !crate::agent::context::should_compact(estimate, capacity) {
-            return 0;
-        }
-        self.compact_inline_forced(transcript, question)
-    }
-
-    /// 无条件压一轮（票 06(b) 的触发与 (c) 的撞墙恢复共用）。
-    fn compact_inline_forced(&self, transcript: &mut Vec<Message>, question: &str) -> usize {
-        let before = transcript.len();
-        let start = Self::round_start_of(transcript, question);
-        let outcome = crate::agent::context::compact_messages_from(
-            transcript,
-            self.settings.keep_recent_rounds,
-            start,
-        );
-        if outcome.compacted_messages == 0 {
-            return 0;
-        }
-        tracing::info!(
-            before,
-            after = outcome.messages.len(),
-            compacted = outcome.compacted_messages,
-            "值班长轮内上下文超线，已按轮压缩（票 06(b)）"
-        );
-        *transcript = outcome.messages;
-        outcome.compacted_messages
+        (provider.context_window > 0).then_some(provider.context_window as usize)
     }
 
     /// 回一句话，落进指定的会话。
@@ -693,42 +620,43 @@ impl ForemanRunner {
         }
     }
 
-    /// 跨时间线互喂（决策 289 / 票 03）：把**对方那条时间线**的摘要填进 `out`。
+    /// 跨时间线互喂（决策 289 / 票 03）：把**对方那条时间线**的摘要取出来（`None` = 不注入）。
     ///
-    /// - 人的那一轮 → 值守台账的摘要（[`FOREMAN_WATCH_DIGEST_MARK`]）：值守轮醒过几次、
-    ///   看到了什么、怎么收的场——人指着播报说「处理一下」时模型才知道说的是哪件。
-    ///   值守台账还不存在（值守轮一次都没醒过）就不注入，也不**顺手建**它——
-    ///   那本台账归值守轮所有。
-    /// - 值守轮 → 最近活动的人的班次的摘要（[`FOREMAN_TALK_DIGEST_MARK`]）：裁决 2 的
-    ///   「它仍读得到人说的话」，以摘要形态（不是整本原文）。
+    /// - 人的那一轮 → 值守台账的摘要：值守轮醒过几次、看到了什么、怎么收的场——人指着
+    ///   播报说「处理一下」时模型才知道说的是哪件。值守台账还不存在（值守轮一次都没醒过）
+    ///   就不取，也不**顺手建**它——那本台账归值守轮所有。
+    /// - 值守轮 → 最近活动的人的班次的摘要：裁决 2 的「它仍读得到人说的话」，以摘要形态
+    ///   （不是整本原文）。
+    ///
+    /// **只取正文**：往转录里插哪一条、加哪个标记、插在什么位置，是组装裁定的事
+    /// （[`TurnPlan::assemble`]）——这里只有读库与摘要（决策 356 的取数 / 裁定分工）。
     ///
     /// 摘要机器复用 [`Self::compact_history`] 那一套（[`CompactionCache`] 增量缓存 +
     /// [`Self::summarize_interval`]）：每条轮次一生只被压一次，边界没动零 token；
     /// 摘要失败 → 不注入、不报错（轮次绝不因摘要挂掉而挂掉，269④ 同一姿态）。
-    async fn inject_cross_digest(
+    async fn cross_digest_text(
         &self,
-        out: &mut Vec<Message>,
         input: &TurnInput,
         provider_id: Option<String>,
-    ) {
+    ) -> Option<String> {
         enum Source {
             Talk,
             Watch,
         }
-        let (source, mark) = if input.is_watch() {
-            (Source::Talk, FOREMAN_TALK_DIGEST_MARK)
+        let source = if input.is_watch() {
+            Source::Talk
         } else {
-            (Source::Watch, FOREMAN_WATCH_DIGEST_MARK)
+            Source::Watch
         };
         // 两条来源各取各的「最近」，读不到就跳过（都不**顺手建**行：值守台账归值守轮所有，
         // 人还没说过话时也没有可摘要的东西）。
         let source_session = match source {
             Source::Talk => match self.store.latest_foreman_session().await {
                 Ok(Some(session)) => session,
-                Ok(None) => return,
+                Ok(None) => return None,
                 Err(e) => {
                     tracing::warn!("互喂摘要读不到人的班次：{e}");
-                    return;
+                    return None;
                 }
             },
             Source::Watch => {
@@ -738,10 +666,10 @@ impl ForemanRunner {
                     .await
                 {
                     Ok(Some(session)) => session,
-                    Ok(None) => return,
+                    Ok(None) => return None,
                     Err(e) => {
                         tracing::warn!("互喂摘要读不到值守台账：{e}");
-                        return;
+                        return None;
                     }
                 }
             }
@@ -754,7 +682,7 @@ impl ForemanRunner {
             Ok(h) => h,
             Err(e) => {
                 tracing::warn!(session = %source_session.id, "互喂摘要读不到台账：{e}");
-                return;
+                return None;
             }
         };
         // 对方时间线上的在途半截行同样不进摘要（票 01，与本会话历史同一条口径）：
@@ -764,15 +692,8 @@ impl ForemanRunner {
             .filter(|m| m.status.as_deref() != Some(FOREMAN_MESSAGE_IN_FLIGHT))
             .collect();
         let cache_key = format!("cross:{}", source_session.id);
-        let Some(summary) = self
-            .cross_digest(&cache_key, &source_session.id, &history, provider_id)
+        self.cross_digest(&cache_key, &source_session.id, &history, provider_id)
             .await
-        else {
-            return;
-        };
-        out.push(Message::user(format!(
-            "{mark}（以下是对方时间线的摘要，不是原文；原始轮次在它自己的台账里）\n{summary}"
-        )));
     }
 
     /// 摘要的本体：增量缓存 + 一次无工具小补全（[`Self::summarize_interval`]）。
@@ -955,46 +876,31 @@ impl ForemanRunner {
     ) -> Result<ForemanTurn> {
         let briefing = build_briefing(&self.store).await?;
         // 阶段配置由外框读了一次传进来（人格 + provider / 采样参数共用那一份）。
-        // 环境层档位（决策 206）：广告集、执行点白名单与人格里的工具纪律段**同源**——
-        // 由下面的 `available` 筛**一次**，三处消费者各取所需（决策 247 兑现了这句注释）。
-        // 缺省 `ask`（值班长的输入是人可以随便打的任意文本）。
-        let env_mode = crate::types::effective_env_mode(
-            self.settings.env_mode,
-            FOREMAN_STAGE_KEY,
-            cfg.as_ref(),
-        );
-        // 分级诊断（票 07）：自动那一轮摘掉贵的两件（会话原文 / 跑命令）。**先算它**——
-        // 紧接着 `available` 算**一次**，三处消费者（广告集 / 执行点白名单 / 工具纪律段）
-        // 吃同一份（决策 247）。顺序是这条承诺的全部：从前 `deny` 晚于 `system_prompt`
-        // 才算，纪律段于是广告着一个这一轮已被摘掉的工具——模型被告知去调一个必被拒的
-        // 名字，而这种错从现象上与「闸门坏了」分不开（架构评审候选 7 抓到的顺序 bug）。
-        let deny: &[&str] = if input.is_watch() {
-            &FOREMAN_WATCH_TOOL_DENY
-        } else {
-            &[]
+        // provider 解析只有一处（[`TurnPlan::provider_id`]）：组装要它来登记身份，下面两次
+        // 摘要（历史锚点 / 跨线互喂）要它来选摘要器。
+        let provider_id = TurnPlan::provider_id(cfg.as_ref());
+        // 人格正文的读盘留在编排侧（组装是纯计算，不做 I/O）：`persona_path` 不可读就是
+        // 配置错，报文照旧带上完整路径。**读在摘要之前**——坏人格配置要在花掉一次摘要调用
+        // 之前就失败（与从前的顺序一致）。
+        let persona = match cfg.as_ref().and_then(|c| c.persona_path.as_deref()) {
+            Some(path) => {
+                let full = self.home.root().join(path);
+                Some(std::fs::read_to_string(&full).map_err(|e| {
+                    Error::Config(format!(
+                        "foreman persona_path 不可读（{}）：{e}",
+                        full.display()
+                    ))
+                })?)
+            }
+            None => None,
         };
-        let available = foreman_available_tools_except(env_mode, deny);
-        // 有没有任务在被托管（决策 210① / 票 08）：只在真有时才在人格里说那一段——
-        // 一段笼统的「你可以直接动手」会立刻变成一句假话（别的任务上它照样只能提）。
-        let stewarded = self
-            .store
-            .list_tasks(&crate::storage::tasks::TaskFilter {
-                include_archived: false,
-                ..Default::default()
-            })
-            .await?
-            .iter()
-            .any(|t| t.stewardship.as_ref().is_some_and(|s| s.enabled));
-        let system_prompt = self.system_prompt(cfg.as_ref(), env_mode, stewarded, &available)?;
-        let provider_id =
-            crate::storage::catalog::resolve_provider_id(None, None, cfg.as_ref(), None);
 
+        // 取史：本会话的历史窗口（决策 204②：会话隔离的是上下文），滤掉在途半截行
+        // （票 01——喂给模型等于让它读到自己正在说的半句话，历史要的是**收口了**的话）。
         let mut history = self
             .store
             .list_foreman_messages(&session.id, FOREMAN_HISTORY_FETCH_LIMIT, None)
             .await?;
-        // 在途半截行**不进上下文**（票 01）：它是这一轮（或没跑完的残留）给人看的现场，
-        // 喂给模型等于让它读到自己正在说的半句话——历史要的是**收口了**的话。
         history.retain(|m| m.status.as_deref() != Some(FOREMAN_MESSAGE_IN_FLIGHT));
         // 「这一轮」从哪一刻算起（决策 311，票 03）：**本轮那条 user 消息的时刻**。
         // 与作废 / 标注那两条路（`created_at >= since`）同一把尺，收场文案数的是同一批东西。
@@ -1015,18 +921,51 @@ impl ForemanRunner {
                 provider_id.clone(),
             )
             .await;
-        // `user_prompt` 槽位**留空**（spec .scratch/prompt-cache）。适配器组装的 body 是
-        // `[system][user(user_prompt)] + messages`——user_prompt 占的是**全部历史之前**的
-        // 位置，而快照每轮必变，放这儿等于每轮把整段历史的前缀缓存打穿（决策 182⑤
-        // 「快照夹在历史之后」要防的正是这件事；原文的「之后」指稳定前缀之后）。
-        // 快照改并进本轮最后一条 user 轮（见下），历史窗口从此逐轮稳定；
-        // 空槽由两个适配器跳过——wire 头不塞空 user 消息。
-        let user_prompt = String::new();
+        // 有没有任务在被托管（决策 210① / 票 08）：只在真有时才在人格里说那一段——
+        // 一段笼统的「你可以直接动手」会立刻变成一句假话（别的任务上它照样只能提）。
+        let stewarded = self
+            .store
+            .list_tasks(&crate::storage::tasks::TaskFilter {
+                include_archived: false,
+                ..Default::default()
+            })
+            .await?
+            .iter()
+            .any(|t| t.stewardship.as_ref().is_some_and(|s| s.enabled));
+        // 这一轮的窗口（决策 291 / 票 06(b)）：provider 行的 `context_window`。查不到
+        // （无可用 provider / 未登记窗口 / 读库失败）→ `None` = 跳过分档，容量算术在
+        // [`TurnPlan::assemble`] 里——它要 system_prompt，而那要到组装时才有。
+        let model_window = self.turn_window(cfg.as_ref()).await;
+
+        // 跨时间线互喂（决策 289 / 票 03）：摘要机器要读库 + 调模型，故在组装之前取好，
+        // 只把正文交给计划——往转录里怎么插（标记、位置、方向）是组装裁定的事。
+        let cross_digest = self.cross_digest_text(&input, provider_id.clone()).await;
+
+        // ── 组装裁定（决策 356 / 票 01）：档位 → 可用工具 → 系统提示词 → 转录
+        // （历史 → 尾部注入 → 本轮合并轮）→ 窗口容量 → 每轮的两道门。纯计算，
+        // 全部输入都是上面取好的事实。
         let briefing_text = briefing.render();
+        let question = input.transcript_text();
+        let mut plan = TurnPlan::assemble(TurnFacts {
+            settings: &self.settings,
+            session_id: &session.id,
+            is_watch: input.is_watch(),
+            cfg: cfg.as_ref(),
+            window: &window,
+            anchor: anchor.as_deref(),
+            cross_digest: cross_digest.as_deref(),
+            briefing_text: &briefing_text,
+            question: &question,
+            stewarded,
+            persona: persona.as_deref(),
+            model_window,
+        });
+        // 转录从此由编排侧推进（循环里 push 助手 / 工具结果），plan 只提供裁定与请求字段。
+        let mut transcript = plan.take_transcript();
 
         // 分级诊断摘在**源头上**（决策 247）：`deny` 早于三处消费者算好，广告集、
-        // 执行点白名单与纪律段都吃 `available`，故「模型看得见一个调用就被拒的工具」
-        // 这件事在自动轮里同样不会发生。
+        // 执行点白名单与纪律段都吃 `plan.available`（组装里同源），故「模型看得见一个
+        // 调用就被拒的工具」这件事在自动轮里同样不会发生。
         // 问话载荷槽（决策 265）：每轮新建一个——工具写、本轮收口时取走挂到 assistant 行。
         let ask_slot: Arc<tokio::sync::Mutex<Option<serde_json::Value>>> =
             Arc::new(tokio::sync::Mutex::new(None));
@@ -1036,78 +975,15 @@ impl ForemanRunner {
             &self.home,
             self.sse.clone(),
             &session.id,
-            env_mode,
+            plan.env_mode,
             ForemanMoment::Conversation,
-            &available,
+            &plan.available,
             self.steward_actions.clone(),
             // 人的那一轮放开台账读数（票 06(a)）：值守轮按摘要形态读（分级纪律）。
             !input.is_watch(),
         );
         let tools = tools.with_ask_slot(ask_slot.clone());
 
-        // 三种角色 → 两种说话的立场（决策 204 / 207）。**操作台记的那几轮（`system`）必须与
-        // 值班长自己的话分开**：写成助理轮，它下一轮读历史时会把「提议已执行：写文件 notes.md」
-        // 当成自己说过的话——那正是人格第一条纪律（不得声称自己动了手）要挡的东西。
-        //
-        // 转写成 `user` 而不是丢掉：丢掉它，模型就不知道人按了什么键，会以为提议还挂着
-        // （于是重提一遍）。剩下的问题是「user 这一侧还有值班经理」——故加一句与前缀一起
-        // 说明发言者是谁，而不是靠角色去暗示。
-        let mut transcript: Vec<Message> = window
-            .iter()
-            .map(|m| {
-                if m.role == crate::storage::foreman::FOREMAN_ROLE_USER {
-                    Message::user(m.content.clone())
-                } else if m.role == crate::storage::foreman::FOREMAN_ROLE_SYSTEM {
-                    Message::user(format!(
-                        "{}（操作台记的一轮）\n{}",
-                        OPERATION_LOG_MARK, m.content
-                    ))
-                } else {
-                    Message::assistant(Some(m.content.clone()), Vec::new())
-                }
-            })
-            .collect();
-        // ── 尾部注入（spec .scratch/prompt-cache）：锚点与互喂摘要**追加在历史之后、
-        // 本轮问题之前**，不再 splice 在转录头部。头部注入每变一次，其后全部历史的前缀
-        // 缓存就整体打穿；尾部注入让稳定前缀 = system + 历史窗口，逐轮命中。这是对决策
-        // 269 / 289 注入位置的显式修订——标记、不落库、失败不注入不报错（269④）一概不变。
-        let mut tail_inserts: Vec<Message> = Vec::new();
-        if let Some(anchor) = anchor {
-            // 锚点以**标记 user 轮**注入（system 行重注入走 user 的先例）。
-            tail_inserts.push(Message::user(format!("{COMPACTION_MARK}\n{anchor}")));
-        }
-        // 跨时间线互喂（决策 289 / 票 03）：两条时间线各喂对方一份**摘要**，都以
-        // 带标记的 user 轮注入——进上下文才拦得住，且两边都不是整本原文（预算不吃
-        // 第二份）。位置随之从「锚点之后、正文之前」改为「正文之后、本轮问题之前」。
-        self.inject_cross_digest(&mut tail_inserts, &input, provider_id.clone())
-            .await;
-        // ── 本轮的末尾合并轮：快照并进最后一条 user 轮，问题仍是这一轮的最后一句。
-        // 人格那句「问题由 transcript 的最后一条承担」由它兑现；快照每轮必变，放末尾
-        // 只重算这一条，历史前缀不受伤（落实决策 182⑤「快照夹在历史之后」）。
-        //
-        // 历史最后一条就是刚落库的这句 user 消息；但若它被 `trim_history` 之外的原因
-        // 漏掉（例如库被外部清空），仍要保证本轮的问题在场。
-        // 值守简报**总是**追加成最后一条：它带署名（`TurnInput::transcript_text`），
-        // 而历史里最后一条也是 user（刚落的用户行）时不能靠「已经有了」跳过它——
-        // 那会让这一轮真正要处理的东西消失。人的话反过来：历史里最后一条就是它。
-        let base_question = input.transcript_text();
-        let final_text = match (&input, transcript.last()) {
-            (TurnInput::Human(_), Some(m)) if m.role == crate::agent::client::Role::User => {
-                // 人的轮：问题已在历史里（刚落库的那条 user 行）。取出来与快照合并，
-                // 锚点 / 摘要隔着正文插进它之前——「正文之后、本轮问题之前」对它同样成立。
-                let last = transcript.pop().expect("上一行刚判过 Some");
-                let base = last.content.unwrap_or_else(|| base_question.clone());
-                format!("{briefing_text}\n{base}")
-            }
-            _ => format!("{briefing_text}\n{base_question}"),
-        };
-        transcript.extend(tail_inserts);
-        transcript.push(Message::user(final_text.clone()));
-        // 轮内压缩的锚点（本轮起点，票 06(b)）就是末尾合并轮的**全文**——按内容倒着找
-        // 必须逐字命中，下面两处调用直接吃 `final_text`（别名成「question」会名不副实：
-        // 它带的是快照 + 问题，不是裸问题）。
-
-        let tool_defs = Self::tool_defs(&available);
         let mut tokens = (0u32, 0u32);
         let mut traces: Vec<ForemanTrace> = Vec::new();
         // 这一轮**按发生顺序**的步骤（决策 273）。
@@ -1142,21 +1018,9 @@ impl ForemanRunner {
         // 提醒注入点的**下一位**：`Some(n)` = 已经提醒过，从此只判 `loop_log[n..]`
         // （「提醒过了再犯」与「第一次犯」用同一个函数、同一把尺子，只是换了窗口）。
         let mut loop_reminded_at: Option<usize> = None;
-        // 逐调用空闲界（决策 288 / 票 05）：foreman 行的 `idle_timeout_sec` > 全局
-        // `node_idle_timeout_sec`（缺省 300s，与节点同一个数）。每一次模型调用各带一份
-        // ——「N 秒没有新字节」判的是单次调用，不是整轮。
-        let idle_timeout_secs = crate::config::effective_idle_timeout(
-            self.settings.node_idle_timeout_sec,
-            cfg.as_ref().and_then(|c| c.idle_timeout_sec),
-            crate::config::NodeTimeouts::default(),
-        );
-        // 轮内窗口预算（决策 291 / 票 06(b)）：**把已经造好的那套机器接上**——流水线的
-        // 容量算术（系统/用户两段预留 + `OUTPUT_RESERVE` + 软硬限）对讲台此前一次都没读过。
-        // 窗口来自 provider 行（`context_window`）；查不到（无可用 provider / 未登记）→
-        // `None` = 跳过分档，不臆造窗口（决策 110 的姿态）——撞墙那条路（c）还在。
-        let capacity = self
-            .turn_capacity(cfg.as_ref(), &system_prompt, &user_prompt)
-            .await;
+        // 逐调用空闲界（决策 288 / 票 05）与轮内窗口容量（决策 291 / 票 06(b)）都随组装
+        // 裁定走（[`TurnPlan`]）：前者要 `system_prompt` 之外的一切，后者要它本身——
+        // 而它到组装时才成立，故容量算术只能在计划里算。
 
         // ── 在途半截行（票 01，spec 决策 1）：一轮开工即建，收口时写成完整行。
         // 建在**历史读完、请求组装完之后**：这一轮喂给模型的历史因此一个字都不变
@@ -1177,50 +1041,20 @@ impl ForemanRunner {
             }
             // 每次调用前查一次预算（票 06(b)）：到线就按轮压缩（规则化、不调 LLM）。
             // **查在组装请求之前**，故这一轮发出去的已经是压过的那一份。
-            self.compact_inline_if_over_budget(
-                &mut transcript,
-                &final_text,
-                &system_prompt,
-                &user_prompt,
-                capacity,
-            );
+            plan.check_window_budget(&mut transcript);
             // 成本门（决策 292 / 票 07）：每次调用前查一次——与上面那条窗口门同一位置，
             // 故「已经不划算的下一轮」根本不会发出去。**分档**：值守轮触顶即停（出循环走
             // 收口路径，部分结论 + 【未收口】）；人的那一轮无硬界（终点由人决定），
             // 只把这条线记下来，收口时落一条软告警（只落账不拦）。
-            if tokens.1 >= token_line {
-                if input.is_watch() {
+            match cost_verdict(input.is_watch(), tokens.1, token_line) {
+                CostVerdict::KeepGoing => {}
+                CostVerdict::WarnHuman => cost_warned = true,
+                CostVerdict::StopWatch => {
                     stop = Some(StopReason::Budget(tokens.1));
                     break;
                 }
-                cost_warned = true;
             }
-            let mut request = LlmRequest {
-                // 占位阶段：让既有的 provider 解析链跑通。真正生效的 provider 从
-                // `provider_id` 进来（决策 182②，与 project_analysis 同一路子）。
-                stage: Stage::Init,
-                node: Node::Execute,
-                attempt: 1,
-                system_prompt: system_prompt.clone(),
-                user_prompt: user_prompt.clone(),
-                messages: transcript.clone(),
-                tools: tool_defs.clone(),
-                temperature: cfg.as_ref().and_then(|c| c.temperature),
-                max_tokens: cfg.as_ref().and_then(|c| c.max_tokens),
-                provider_id: provider_id.clone(),
-                run: Some(crate::agent::client::RunContext {
-                    // 空 task id / 空分支 / 占位 run_id：既有任务级 SSE 路由按 task id
-                    // 精确匹配，空串永不等于真实任务 id，故零干扰（决策 182⑥）。
-                    task_id: String::new(),
-                    branch: String::new(),
-                    run_id: 0,
-                    agent_type: FOREMAN_AGENT_TYPE.to_string(),
-                    // 会话身份（决策 204⑥）：手机与电脑同时连着时，前端靠它把增量
-                    // 归到正确的会话，而不是把两台设备的回话混成一段。
-                    session_id: session.id.clone(),
-                }),
-                idle_timeout_sec: Some(idle_timeout_secs),
-            };
+            let mut request = plan.request(transcript.clone());
             let response = match self.complete_cancellable(request.clone(), cancel).await {
                 // 人按停（决策 294 / 票 09）：这一次调用被放弃，整轮走收口路径
                 // （部分结论 + 【已停】）。**不是失败**——不落失败账、不发失败通知。
@@ -1234,7 +1068,7 @@ impl ForemanRunner {
                 // 那时报错才是诚实的）。压缩是**无条件**的：这个错误说明算术低估了
                 // （真 tokenizer 与 4 字符≈1 的估算、工具定义都占窗口），不按触发线走。
                 CallOutcome::Done(Err(e)) if is_context_window(&e) => {
-                    let compacted = self.compact_inline_forced(&mut transcript, &final_text);
+                    let compacted = plan.compact_forced(&mut transcript);
                     if compacted == 0 {
                         stop = Some(StopReason::Failed(e));
                         break;
@@ -1779,21 +1613,29 @@ impl ForemanRunner {
         }
         // 去抖：从**最早那件**算窗口。攒批的代价是响得慢一点，收益是不为一件事吵两次；
         // 窗口过后的第一趟就把窗口内所有件一起带上（不许丢事件）。
+        // 判据在 [`crate::interrupt::debounce_elapsed`]（决策 355）。
         let debounce = chrono::Duration::seconds(self.settings.watch_debounce_sec as i64);
         if let Some(oldest) = candidates.iter().map(|i| i.created_at).min() {
-            if self.store.now() - oldest < debounce {
+            if !crate::interrupt::debounce_elapsed(self.store.now(), oldest, debounce) {
                 return Ok(None);
             }
         }
         // 同任务冷却（决策 209⑤ / 票 07）：刚被处理过的任务，新事件**不单独唤醒**——
         // 留在表里不消费，冷却到期后与那时的事件合并播报。判据是「这个任务最近有没有
         // 被消费过的待办」：那一行就是「刚有人看过它」的账。
+        // 窗口的左沿由 [`crate::interrupt::window_start`] 算（查库那一侧含左沿，
+        // 与 `waiting` 同一个窗口的两种读数，口径写在那个模块的头注里）。
+        // **每件各读一次钟**——与从前逐字一致：左沿随之往前挪一点，正好把这一趟扫过前面
+        // 几件花掉的时间算进去，而不是用一趟开始时那个更早的读数。
         let cooldown = chrono::Duration::minutes(self.settings.watch_task_cooldown_minutes as i64);
         let mut waking = Vec::new();
         for item in candidates {
             let recently_handled = self
                 .store
-                .count_consumed_attention_since(&item.task_id, self.store.now() - cooldown)
+                .count_consumed_attention_since(
+                    &item.task_id,
+                    crate::interrupt::window_start(self.store.now(), cooldown),
+                )
                 .await?
                 > 0;
             if !recently_handled {
@@ -1809,9 +1651,11 @@ impl ForemanRunner {
         // 全局唤醒上限（决策 209⑤）：触顶时**不静默丢弃**——留一行「本小时已达上限，
         // N 条待办未播报」给值班经理，且同一小时只留一行（否则触顶本身变成刷屏源）。
         // 待办**不消费**：下一小时继续，一条不丢。
+        // 上限判据与「触顶通知只发一次」住 [`crate::interrupt`]（决策 355）：
+        // `over_hourly_cap` / `cap_notice_due`——决策 350 那一类口径调整此后只碰那个文件。
         let hour_ago = self.store.now() - chrono::Duration::hours(1);
         let wakes = self.store.count_watch_wakes_since(hour_ago).await?;
-        if wakes >= self.settings.watch_max_wakes_per_hour as usize {
+        if crate::interrupt::over_hourly_cap(wakes, self.settings.watch_max_wakes_per_hour) {
             let noted = self
                 .store
                 .count_watch_wakes_with(
@@ -1819,7 +1663,7 @@ impl ForemanRunner {
                     hour_ago,
                 )
                 .await?;
-            if noted == 0 {
+            if crate::interrupt::cap_notice_due(noted) {
                 let content = format!(
                     "【值守】本小时唤醒已达上限（{} 次），{} 条待办未播报；下一小时继续，不会丢。",
                     self.settings.watch_max_wakes_per_hour,
@@ -2163,27 +2007,9 @@ impl ForemanRunner {
         }
     }
 
-    /// 工具定义：**从清单生成**（票 01）。
-    ///
-    /// 与 [`crate::pipeline::subagent::StoreSubAgentRunner::tool_defs`] 同样的立场：
-    /// **不经 `effective_tools`**——那条路会并入基线强制工具（含 `run_command` /
-    /// `write_file`），正是本模块要挡掉的东西。
-    ///
-    /// 手写这两个 `ToolDef` 的时候，广告集与执行点白名单是两份独立的名单，而
-    /// 「同源」是票 01 的硬要求：两处各写一份名字，迟早出现「模型看得见一个调用就被拒
-    /// 的工具」这种不好定位的错。
-    fn tool_defs(available: &[&'static str]) -> Vec<ToolDef> {
-        FOREMAN_TOOL_SPECS
-            .iter()
-            .filter(|spec| available.contains(&spec.name))
-            .map(|spec| ToolDef {
-                name: spec.name.to_string(),
-                description: spec.description.to_string(),
-                parameters: serde_json::from_str(spec.parameters)
-                    .expect("清单里的参数 schema 必须是合法 JSON（单测钉住）"),
-            })
-            .collect()
-    }
+    // 工具定义（从清单生成）与系统提示词的三段，随组装裁定搬进 [`TurnPlan`]
+    // （决策 356 / 票 01）：它们是「这一轮给模型看什么」的纯计算，与广告集 / 执行点
+    // 白名单同源（决策 247），放在计划里才能被独立断言。
 
     async fn run_tool(
         &self,
@@ -2277,48 +2103,6 @@ impl ForemanRunner {
         });
     }
 
-    /// 「你能动手到什么程度」那一段（决策 206 / 188）。
-    ///
-    /// **按档位写，不写一句笼统的「你没有权限」**：模型是照着这段描述自己汇报的，
-    /// 描述与事实不符时它会说出与事实不符的话（「我已经写好了」/「我读不到文件」）。
-    /// 这一段与 `ToolExecutor` 那道闸是同一件事的两种说法——一处给模型看，一处真的执行。
-    ///
-    /// **托管那一段是条件说的**（决策 210① / 票 08）：只有真开着托管的方案才说明它的存在，
-    /// 否则模型会以为自己对任何任务都能免按键动手——而它实际只对**被托管的那几个**能。
-    fn power_discipline(&self, env_mode: crate::types::EnvMode, stewarded: bool) -> String {
-        let mut discipline = match env_mode {
-            crate::types::EnvMode::Ask => "\
-                 - 文件与命令这类**会改动东西**的动作：你调用之后**不会立即发生**，\
-                 而是生成为一条待确认的提议，等值班经理在界面上按下确认钮才真正执行。\
-                 `read_file` / `list_dir` / `Skill` 是只读的，直接执行。\
-                 - 因此**绝不要说你已经做了那件事**：你可以说「我提了一条建议，等你按键」。\
-                 - 本服务自己的写接口（建任务、拍板、合入、改配置……）一律走提议，\
-                 这件事不随档位变。\n"
-                .to_string(),
-            crate::types::EnvMode::Auto => "\
-                 - 文件与命令这类动作**会立即执行**（这个阶段被配成 auto 档）。执行结果\
-                 会以工具回执的形式回来，写进时间线；你汇报时以回执为准，不要凭印象说。\
-                 - 本服务自己的写接口（建任务、拍板、合入、改配置……）**仍然**要人按键，\
-                 不随档位变——那类动作会改变流水线的事实。\n"
-                .to_string(),
-            crate::types::EnvMode::Deny => "\
-                 - 这个阶段的环境层被关掉了：文件读写、命令执行、技能拉取都不可用，\
-                 连工具都看不到。台账读数照常可用。**不要提议这类动作**——它无处可去。\n"
-                .to_string(),
-        };
-        if stewarded {
-            // 只对**开着托管的任务**这么说（票 08）：一段笼统的「你可以直接动手」会立刻
-            // 变成一句假话——别的任务上它照样只能提。
-            discipline.push_str(
-                "- 有任务被值班经理**托管**（态势快照里标出「托管中」的那几个）：对它们你可以\
-                 直接 `task` + `resume` + `resume_action=continue`，**不用等他按键**——\
-                 这一条是例外，只对它、只对这个动作。其余动作（retry / merge / review /\
-                 cancel / create）与其余任务照旧要按键。动手之后说明你做了什么、依据是什么。\n",
-            );
-        }
-        discipline
-    }
-
     /// `stage_configs["foreman"]` 的覆盖行（可能不存在——「不配置也能用」）。
     ///
     /// provider 解析（决策 182②）沿用 `project_analysis` 的路子：按**自己的 key** 读阶段配置，
@@ -2327,77 +2111,6 @@ impl ForemanRunner {
     /// 值班长不挂任务，没有任务级可覆盖。
     async fn stage_config(&self) -> Result<Option<crate::types::StageConfig>> {
         self.store.get_stage_config(FOREMAN_STAGE_KEY).await
-    }
-
-    /// 系统提示词：`[须知][人格][工具纪律]`，人格可被 `persona_path` / `persona_append` 覆盖。
-    ///
-    /// 不注入技能（与只读子代理同一立场）：值班长是面向人的对话者，不是技能执行者；
-    /// 把项目技能正文灌进来只会挤占历史窗口。
-    fn system_prompt(
-        &self,
-        cfg: Option<&crate::types::StageConfig>,
-        env_mode: crate::types::EnvMode,
-        stewarded: bool,
-        // 这一轮真正拿得到的工具名（决策 247）：纪律段的两组从**它**派生，不再读全量清单
-        // ——否则值守轮与 `deny` 档的纪律段会广告一个这一轮已被摘掉的工具。
-        available: &[&'static str],
-    ) -> Result<String> {
-        let persona = match cfg.and_then(|c| c.persona_path.as_deref()) {
-            Some(path) => {
-                let full = self.home.root().join(path);
-                std::fs::read_to_string(&full).map_err(|e| {
-                    Error::Config(format!(
-                        "foreman persona_path 不可读（{}）：{e}",
-                        full.display()
-                    ))
-                })?
-            }
-            None => FOREMAN_PERSONA.to_string(),
-        };
-        let mut out = format!("{FOREMAN_BASELINE}\n\n{persona}\n");
-        if let Some(append) = cfg.and_then(|c| c.persona_append.as_deref()) {
-            if !append.trim().is_empty() {
-                out.push_str(&format!("\n{}\n", append.trim()));
-            }
-        }
-        // 工具纪律：**按清单生成**（票 01）。手写一份工具名清单的下场是它与
-        // `FOREMAN_TOOL_SPECS` 各自漂移——模型于是要么看不见某个能调的工具，
-        // 要么被告知去调一个不存在的工具（后者正是它开始编造读数的起点）。
-        //
-        // 档位（决策 206）也要在这里说：模型对「它做了什么」的描述**必须与事实一致**。
-        // 上一版这段写的是「读不到文件系统，也不能执行命令」——那在 B 层落地之后是假的，
-        // 而一段假的能力说明会直接变成一句假话（「我读过那个文件」）。
-        // 两组从 `available` 按档位谓词分家（决策 247）：并 = 这一轮拿得到的、交为空，
-        // 「会改动东西」由 `ENV_WRITE_TOOLS` / `SERVICE_WRITE_TOOLS` 判——与 `gate_decision`
-        // 同一份事实源，不再另标一份层枚举与它对账。
-        let mut direct: Vec<&str> = Vec::new();
-        let mut mutating: Vec<&str> = Vec::new();
-        for name in available {
-            if mutates_something(name) {
-                mutating.push(name);
-            } else {
-                direct.push(name);
-            }
-        }
-        out.push_str(&format!(
-            "\n## 工具纪律\n\
-             - 你能直接用的工具是：{}。\n",
-            direct.join(" / ")
-        ));
-        out.push_str(&format!("{}\n", self.power_discipline(env_mode, stewarded)));
-        if !mutating.is_empty() {
-            out.push_str(&format!(
-                "- 会改动东西的工具是：{}。\n",
-                mutating.join(" / ")
-            ));
-        }
-        out.push_str(&attribution_discipline());
-        out.push_str(
-            "- 快照里已经有的（待拍板原因、在跑、失败、项目清单）不要再查一遍。\n\
-             - 引用工位结论时必须标出它来自哪个工位、哪次运行。\n\
-             - 你不知道的事就说不知道。",
-        );
-        Ok(out)
     }
 }
 

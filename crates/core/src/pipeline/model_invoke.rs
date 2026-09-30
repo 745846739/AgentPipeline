@@ -24,7 +24,7 @@ use std::sync::Arc;
 use crate::agent::client::{AgentResponse, LlmClient, LlmRequest, Message};
 use crate::agent::metadata::parse_metadata;
 use crate::agent::prompts::{build_system_prompt, load_agents_context};
-use crate::agent::providers::{is_context_window, is_transport, is_wait_useless};
+use crate::agent::providers::is_context_window;
 use crate::agent::tools::{ToolCallContext, ToolExecutor};
 use crate::clock::Clock;
 use crate::config::Settings;
@@ -291,40 +291,48 @@ impl ModelInvoke {
                     // 出来的，不刷新它，库里那份读数会比 run 行汇总出来的小——决策 226 把失败轮的
                     // token 记真之后这个差第一次看得见（此前失败一律记 0，两者恰好相等）。
                     self.store.refresh_task_totals(&task.id).await?;
-                    // **「等一等也没用」的那一类不进下一轮**（决策 295 的超窗 + 决策 298 的
-                    // 配置类，共用 `is_wait_useless` 一条判据）：同一份转录再发一遍救不回
-                    // 「压不动的超窗」——超窗这一支已在调用点上压过一次并重试过那一次调用
-                    // （见 `agent_attempt_inner`），到这儿说明压不动了；也救不回「密钥错 /
-                    // 模型名不对 / 额度没了」——重试烧的是同一份坏配置的 N 倍 token，而该做
-                    // 的事（换模型、改配置、续费）一个字都不会在重试里发生。指引由分类自带
-                    // 的人话走（`LlmErrorKind::advice()`），原始诊断仍在 `raw` 里进
-                    // pending.context.diagnostic。上面那一笔 run 行与任务投影已落完。
-                    if is_wait_useless(&error) {
-                        tracing::warn!(
-                            task = %task.id,
-                            stage = %cursor.stage,
-                            node = %cursor.node,
-                            kind = %error.llm_classified().map(|(k, _)| k).unwrap_or("?"),
-                            "等一等没用的失败：不再进下一轮（agent_retry_max 救不了这一件事）"
-                        );
-                        return Err(error);
-                    }
-                    // 决策 278（显式修订决策 205 裁决②）：整体失败的自动重试不再空对话起步——
-                    // 下一轮从「这一轮的转录原样保留 + 一条错误 turn」接着跑。错误 turn 由
-                    // retry_prompt（决策 33 的「错误回填」）按原始诊断生成；转录不折叠、不省略
-                    // （决策 278 明确不做有损处理），体量交给既有的 L3/L4 预算门。
+                    // **下一轮怎么走**：判定收在 [`crate::pipeline::retry::after_attempt_failure`]
+                    // （决策 356 · 票 02）——三条出路（不进下一轮 / 原样续接 / 续接加错误 turn）
+                    // 的判据全在那一处，这里只执行。
                     //
-                    // **传输类不追加那条 turn**（决策 298，划出 278 的适用边界）：请求根本没
-                    // 送到模型，转录末尾是上一次成功的完好回合，「已判废」是假话；括号里那句
-                    // 还是写给人看的运维指引，模型既改不了也无从核对。转录照旧原样续接——
-                    // 278 省下的探索钱一分不丢，丢掉的只是那句假话。
-                    let mut next = messages;
-                    if !is_transport(&error) {
-                        next.push(Message::user(crate::agent::metadata::retry_prompt(
-                            &last_error,
-                        )));
+                    // 「等一等也没用」的那一类不进下一轮（决策 295 的超窗 + 决策 298 的配置类，
+                    // 共用 `is_wait_useless` 一条判据）：同一份转录再发一遍救不回「压不动的超窗」
+                    // ——超窗这一支已在调用点上压过一次并重试过那一次调用
+                    // （见 `agent_attempt_inner`），到这儿说明压不动了；也救不回「密钥错 /
+                    // 模型名不对 / 额度没了」——重试烧的是同一份坏配置的 N 倍 token。指引由分类
+                    // 自带的人话走（`LlmErrorKind::advice()`），原始诊断仍在 `raw` 里进
+                    // pending.context.diagnostic。上面那一笔 run 行与任务投影已落完。
+                    match crate::pipeline::retry::after_attempt_failure(&error) {
+                        crate::pipeline::retry::AttemptRetry::GiveUp => {
+                            tracing::warn!(
+                                task = %task.id,
+                                stage = %cursor.stage,
+                                node = %cursor.node,
+                                kind = %error.llm_classified().map(|(k, _)| k).unwrap_or("?"),
+                                "等一等没用的失败：不再进下一轮（agent_retry_max 救不了这一件事）"
+                            );
+                            return Err(error);
+                        }
+                        // 决策 278（显式修订决策 205 裁决②）：整体失败的自动重试不再空对话起步
+                        // ——下一轮从「这一轮的转录原样保留 + 一条错误 turn」接着跑。错误 turn 由
+                        // retry_prompt（决策 33 的「错误回填」）按原始诊断生成；转录不折叠、不省略
+                        // （决策 278 明确不做有损处理），体量交给既有的 L3/L4 预算门。
+                        //
+                        // **传输类不追加那条 turn**（决策 298，划出 278 的适用边界）：请求根本没
+                        // 送到模型，转录末尾是上一次成功的完好回合，「已判废」是假话；括号里那句
+                        // 还是写给人看的运维指引，模型既改不了也无从核对。转录照旧原样续接——
+                        // 278 省下的探索钱一分不丢，丢掉的只是那句假话。
+                        crate::pipeline::retry::AttemptRetry::ContinueAsIs => {
+                            carried = messages;
+                        }
+                        crate::pipeline::retry::AttemptRetry::ContinueWithErrorTurn => {
+                            let mut next = messages;
+                            next.push(Message::user(crate::agent::metadata::retry_prompt(
+                                &last_error,
+                            )));
+                            carried = next;
+                        }
                     }
-                    carried = next;
                 }
             }
         }

@@ -15,6 +15,10 @@ pub mod proposals;
 pub mod pseudo;
 pub mod repair;
 pub mod resume;
+/// 重试裁定（决策 356 · 票 02）：一次 attempt 失败之后怎么走、节点连续超时之后怎么走
+/// 两张表收成纯函数——`model_invoke` 与 `scheduler` 的调用点只留与库 / 进程 / 游标
+/// 打交道的那一半。
+pub mod retry;
 pub mod routes;
 pub(crate) mod run_ledger;
 pub mod subagent;

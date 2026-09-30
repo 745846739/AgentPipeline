@@ -22,10 +22,8 @@ use crate::types::{
 };
 use crate::Result;
 
-/// 超时自动续接的次数上限（决策 320，**写死不配**）：该节点连续超时 1–2 次时，
-/// 重试带上一轮转录自动续接；连续第 3 次降级空白重跑一次；第 4 次起挂起交回人工。
-/// 与托管止损「满 2 次即停」（决策 210）同一量级；数字进决策日志，不做配置项。
-const TIMEOUT_AUTO_CONTINUES_MAX: u32 = 2;
+// 超时自动续接的次数上限（决策 320）随分档一起搬进 `pipeline::retry`（决策 356 · 票 02）：
+// 梯子是纯函数 [`crate::pipeline::retry::timeout_retry`]，这里只做动作。
 
 /// 判超时后等旧执行体自然退出的上限（决策 320，**写死不配**）：正常收口是毫秒级的
 /// 几笔库写，界给足；卡在不返回的同步调用里的到点即走 303 的兜底（代价不新增）。
@@ -390,84 +388,92 @@ impl KanbanScheduler {
         // **但梯子本身对纯代码节点照样走**（决策 320 按「该节点连续超时的轮数」计数，
         // 不分节点种类）：没有转录可续时前两档退化为空白重跑，第 4 次才挂起——
         // 第一次超时就交回人工，比旧口径 `run.attempt < agent_retry_max` 耗尽才挂还倒退。
+        //
+        // **分档本身是纯函数**（决策 356 · 票 02）：
+        // [`crate::pipeline::retry::timeout_retry`] 给出这一档的动作，这里只做动作
+        // （标续接 / 写流转 / 挂起）。
         let is_agent_node =
             crate::pipeline::model_invoke::AgentNodeKind::of(run.stage, run.node).is_some();
-        if streak <= TIMEOUT_AUTO_CONTINUES_MAX {
-            if is_agent_node {
-                self.store
-                    .mark_cursor_continuation(cursor_id, ResumeCause::Timeout)
-                    .await?;
-                self.store
-                    .insert_transition(
-                        task_id,
-                        &branch_of(cursor_id, &self.store).await?,
-                        Some((run.stage, run.node)),
-                        (run.stage, run.node),
-                        crate::types::TransitionTrigger::Timeout,
-                        Some(&format!(
-                            "节点超时，自动续接上一轮转录（连续第 {streak} 次超时）"
-                        )),
-                    )
-                    .await?;
-            } else {
-                self.store
-                    .insert_transition(
-                        task_id,
-                        &branch_of(cursor_id, &self.store).await?,
-                        Some((run.stage, run.node)),
-                        (run.stage, run.node),
-                        crate::types::TransitionTrigger::Timeout,
-                        Some(&format!(
+        match crate::pipeline::retry::timeout_retry(streak) {
+            crate::pipeline::retry::TimeoutRetry::AutoContinue => {
+                if is_agent_node {
+                    self.store
+                        .mark_cursor_continuation(cursor_id, ResumeCause::Timeout)
+                        .await?;
+                    self.store
+                        .insert_transition(
+                            task_id,
+                            &branch_of(cursor_id, &self.store).await?,
+                            Some((run.stage, run.node)),
+                            (run.stage, run.node),
+                            crate::types::TransitionTrigger::Timeout,
+                            Some(&format!(
+                                "节点超时，自动续接上一轮转录（连续第 {streak} 次超时）"
+                            )),
+                        )
+                        .await?;
+                } else {
+                    self.store
+                        .insert_transition(
+                            task_id,
+                            &branch_of(cursor_id, &self.store).await?,
+                            Some((run.stage, run.node)),
+                            (run.stage, run.node),
+                            crate::types::TransitionTrigger::Timeout,
+                            Some(&format!(
                             "节点超时，自动重跑（纯代码节点无转录可续，连续第 {streak} 次超时）"
                         )),
+                        )
+                        .await?;
+                }
+                (self.resume)(task_id);
+            }
+            crate::pipeline::retry::TimeoutRetry::BlankRestart => {
+                // 空白重跑档：不带转录重起一段对话（决策 33 的原语义），给节点最后一次
+                // 自己走完的机会。transition 文案明说降级，复盘时不必倒推为什么没续接。
+                self.store
+                    .insert_transition(
+                        task_id,
+                        &branch_of(cursor_id, &self.store).await?,
+                        Some((run.stage, run.node)),
+                        (run.stage, run.node),
+                        crate::types::TransitionTrigger::Timeout,
+                        Some("节点超时，续接两轮未恢复，空白重跑一次"),
                     )
                     .await?;
+                (self.resume)(task_id);
             }
-            (self.resume)(task_id);
-        } else if streak == TIMEOUT_AUTO_CONTINUES_MAX + 1 {
-            // 空白重跑档：不带转录重起一段对话（决策 33 的原语义），给节点最后一次
-            // 自己走完的机会。transition 文案明说降级，复盘时不必倒推为什么没续接。
-            self.store
-                .insert_transition(
+            crate::pipeline::retry::TimeoutRetry::Pending => {
+                // 耗尽：pending 挂在该 run 所属的**游标**上（决策 82）。
+                // 落库走 `advance` 那扇门（决策 245）；同步投影与事件留在门外——门不发 SSE。
+                // 注意 reason 里的 stage/node 取自**run**而不是游标，所以 `Landing::Pause`
+                // 整条带走 `PendingReason`，不按游标重算。
+                let cursor = self.store.get_cursor(cursor_id).await?;
+                crate::pipeline::advance(
+                    &self.store,
                     task_id,
-                    &branch_of(cursor_id, &self.store).await?,
-                    Some((run.stage, run.node)),
-                    (run.stage, run.node),
+                    &cursor,
+                    crate::pipeline::Landing::Pause {
+                        reason: PendingReason::new(
+                            PendingKind::Timeout,
+                            run.stage,
+                            run.node,
+                            format!(
+                                "{}（attempt {}）",
+                                timeout_detail(run, "执行超时"),
+                                run.attempt
+                            ),
+                        ),
+                    },
+                    // 挂起不写流转行，这个 trigger 不会被读到（门的签名对各落点是同一个）。
                     crate::types::TransitionTrigger::Timeout,
-                    Some("节点超时，续接两轮未恢复，空白重跑一次"),
+                    None,
                 )
                 .await?;
-            (self.resume)(task_id);
-        } else {
-            // 耗尽：pending 挂在该 run 所属的**游标**上（决策 82）。
-            // 落库走 `advance` 那扇门（决策 245）；同步投影与事件留在门外——门不发 SSE。
-            // 注意 reason 里的 stage/node 取自**run**而不是游标，所以 `Landing::Pause`
-            // 整条带走 `PendingReason`，不按游标重算。
-            let cursor = self.store.get_cursor(cursor_id).await?;
-            crate::pipeline::advance(
-                &self.store,
-                task_id,
-                &cursor,
-                crate::pipeline::Landing::Pause {
-                    reason: PendingReason::new(
-                        PendingKind::Timeout,
-                        run.stage,
-                        run.node,
-                        format!(
-                            "{}（attempt {}）",
-                            timeout_detail(run, "执行超时"),
-                            run.attempt
-                        ),
-                    ),
-                },
-                // 挂起不写流转行，这个 trigger 不会被读到（门的签名对各落点是同一个）。
-                crate::types::TransitionTrigger::Timeout,
-                None,
-            )
-            .await?;
-            self.store.sync_task_projection(task_id).await?;
-            report.timeout_pending_cursors.push(cursor_id.to_string());
-            self.emit_pending(task_id, cursor_id).await?;
+                self.store.sync_task_projection(task_id).await?;
+                report.timeout_pending_cursors.push(cursor_id.to_string());
+                self.emit_pending(task_id, cursor_id).await?;
+            }
         }
         Ok(())
     }

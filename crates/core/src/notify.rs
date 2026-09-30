@@ -199,6 +199,10 @@ pub fn is_quiet_hours(hour: u32, quiet: [u8; 2]) -> bool {
 /// 先例）→ 免打扰静音（`pending` 豁免）→ **每类** cooldown（严格小于：age == cooldown
 /// 放行、age < cooldown 拦下）。`last_age_sec = None` = 这一类还没发过。
 /// `ForemanReply` 不在任何豁免列里——它走标准路径（受免打扰、受 cooldown，272④）。
+///
+/// **节流那一格是共享原语**（决策 355）：判据住
+/// [`crate::interrupt::cooling_by_age`]，与值守轮那条线的冷却同源。免打扰与
+/// `notification_class` 留在这里——那是 notify 自己的词汇。
 pub fn should_notify(
     cls: NotifyClass,
     hour: u32,
@@ -212,7 +216,7 @@ pub fn should_notify(
     if is_quiet_hours(hour, quiet) && cls != NotifyClass::Pending {
         return false;
     }
-    !matches!(last_age_sec, Some(age) if age < cooldown_sec)
+    !crate::interrupt::cooling_by_age(last_age_sec, cooldown_sec)
 }
 
 /// webhook 投递超时：通知是 best-effort，挂住不能拖着 `note_attention` 的调用方

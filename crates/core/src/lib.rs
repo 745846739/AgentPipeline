@@ -18,6 +18,10 @@ pub mod exec;
 pub mod git;
 pub mod home;
 pub mod host_policy;
+/// 打断策略原语（决策 355）：「一个事件只打扰人一次」的三件原语——
+/// 去抖窗口、按主体冷却、小时上限 + 上限通知去重（另加指数退避）。
+/// 纯函数、无 I/O，watch 与 notify 各当一个适配器。
+pub mod interrupt;
 pub mod metrics;
 pub mod notify;
 pub mod pipeline;

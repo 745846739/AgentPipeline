@@ -47,6 +47,7 @@ mod catalog;
 mod conversation;
 mod registry;
 mod runner;
+mod turn_plan;
 
 pub use attribution::*;
 pub use briefing::*;
@@ -54,3 +55,4 @@ pub use catalog::*;
 pub use conversation::*;
 pub use registry::*;
 pub use runner::*;
+pub use turn_plan::*;
