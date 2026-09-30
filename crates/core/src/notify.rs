@@ -1098,7 +1098,10 @@ mod tests {
         assert_eq!(p["task_id"], "t1", "{p}");
         assert!(p["occurred_at"].is_string(), "{p}");
         assert!(
-            p["title"].as_str().unwrap().contains("[AgentPipeline] 运行失败 t1"),
+            p["title"]
+                .as_str()
+                .unwrap()
+                .contains("[AgentPipeline] 运行失败 t1"),
             "{p}"
         );
         let body = p["body"].as_str().unwrap();
@@ -1248,7 +1251,10 @@ mod tests {
             None,
         );
         assert_eq!(p.as_object().unwrap().len(), 3, "{p}");
-        assert!(p["title"].as_str().unwrap().contains("[AgentPipeline] 待拍板 t1"));
+        assert!(p["title"]
+            .as_str()
+            .unwrap()
+            .contains("[AgentPipeline] 待拍板 t1"));
         assert!(p["body"].as_str().unwrap().contains("pending_kind=gate"));
         assert!(
             !p["body"].as_str().unwrap().contains("task_pending"),

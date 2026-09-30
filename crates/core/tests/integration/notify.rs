@@ -766,10 +766,7 @@ async fn slow_run_never_pushes() {
     tokio::time::sleep(Duration::from_millis(200)).await;
     assert_eq!(phone.server.hits(), 1, "SlowRun 不该出站");
     assert!(
-        phone.decrypt()["title"]
-            .as_str()
-            .unwrap()
-            .contains("完成"),
+        phone.decrypt()["title"].as_str().unwrap().contains("完成"),
         "到的那一条是金丝雀"
     );
 }
