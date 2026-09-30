@@ -25,6 +25,7 @@
 | **Context** | agent 的对话上下文（messages 列表）。有四级压缩机制控制长度 |
 | **ContextManager** | 管理 agent 对话上下文的组件，负责 token 计数、摘要压缩、硬限制截断 |
 | **validator_cross_check** | 异族复判伪阶段（决策 134）：`cross_family_judge = true` 时，agent 型 validate_output 首判不合格即由它用不同 vendor 的强档模型复判一次；复判合格 → 分歧上交（决策 135），复判不合格 → 维持原路径打回。独立 run/会话行（决策 100 模式） |
+| **打断策略（interrupt policy）** | 「一个事件只打扰人一次」的共享原语集合：去抖窗口、按主体冷却、小时上限 + 上限通知去重（决策 355）。它只有一份实现、两个适配器——**值守轮唤醒**（watch 闸门）与**离线通知**（notify 礼貌）各当一个；两套既有词汇（attention / cooldown / wake-cap 与 class / quiet-hours / politeness）各叫各的、不统一。改触发面口径（如决策 350 那类）只碰策略原语一处 |
 
 ### 对讲台（与值班长对话，决策 176 / 182 / 204）
 
