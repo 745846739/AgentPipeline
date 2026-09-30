@@ -132,7 +132,9 @@ async fn wait_hits(server: &TinyHttp, want: usize, ms: u64) -> bool {
 }
 
 async fn note(f: &Fixture, kind: AttentionKind, occurred_at: DateTime<Utc>) {
-    let detail = serde_json::json!({ "error": "boom" });
+    // 归因白名单里给一个（stage），正文断言才有东西可钉；`error` 不在白名单，
+    // 「原文不出网」的断言照旧有效。
+    let detail = serde_json::json!({ "error": "boom", "stage": "execute" });
     f.store
         .note_attention("t1", kind, occurred_at, Some(&detail))
         .await
@@ -158,12 +160,19 @@ async fn an_attention_that_wakes_posts_generic_json_to_the_webhook() {
     assert_eq!(payload["task_id"], "t1", "{payload}");
     assert!(payload["occurred_at"].is_string(), "{payload}");
     assert!(
-        payload["title"].as_str().unwrap().contains("t1"),
+        payload["title"]
+            .as_str()
+            .unwrap()
+            .contains("[AgentPipeline] 运行失败 t1"),
+        "title 带中文标签（决策 344）：{payload}"
+    );
+    // body 只带归因字段（268 明确不做：detail 原文不出网；344 起不再复读 kind）
+    assert!(
+        payload["body"].as_str().unwrap().contains("stage=execute"),
         "{payload}"
     );
-    // body 只带归因字段（268 明确不做：detail 原文不出网）
     assert!(
-        payload["body"].as_str().unwrap().contains("run_failed"),
+        !payload["body"].as_str().unwrap().contains("run_failed"),
         "{payload}"
     );
     assert!(
@@ -195,8 +204,8 @@ async fn feishu_format_posts_a_text_message_instead_of_generic_json() {
     assert_eq!(payload["msg_type"], "text", "{payload}");
     let text = payload["content"]["text"].as_str().unwrap();
     assert!(
-        text.starts_with("[AgentPipeline] t1 run_failed"),
-        "自定义关键词前缀 + kind + task_id：{text}"
+        text.starts_with("[AgentPipeline] 运行失败 t1"),
+        "自定义关键词前缀 + 中文标签 + task_id（决策 344）：{text}"
     );
     // 归因纪律与格式无关：detail 原文一个字都不出网（270② 分流前共用）。
     assert!(!text.contains("boom"), "detail 原文不出网：{text}");
@@ -639,11 +648,14 @@ async fn a_push_notification_fans_out_to_every_live_subscription() {
 
         let payload = device.decrypt();
         assert!(
-            payload["title"].as_str().unwrap().contains("t1"),
-            "{payload}"
+            payload["title"]
+                .as_str()
+                .unwrap()
+                .contains("[AgentPipeline] 待拍板 t1"),
+            "title 带中文标签（决策 344）：{payload}"
         );
         assert!(
-            payload["body"].as_str().unwrap().contains("task_pending"),
+            payload["body"].as_str().unwrap().contains("stage=execute"),
             "正文只带归因白名单（268④）：{payload}"
         );
         assert_eq!(payload["url"], "#/task/t1", "深链落在那张卡上：{payload}");
@@ -713,8 +725,8 @@ async fn push_obeys_the_same_politeness_gate_as_the_other_channels() {
     tokio::time::sleep(Duration::from_millis(300)).await;
     assert_eq!(phone.server.hits(), 2, "done 被静音，总命中只能是 2");
     assert!(
-        !String::from_utf8_lossy(&phone.server.body()).contains("task_done"),
-        "done 不该出站（解不开的密文里也不该出现它的 kind——密文里本来就什么都没有）"
+        !String::from_utf8_lossy(&phone.server.body()).contains("完成"),
+        "done 不该出站（解不开的密文里也不该出现它的标签——密文里本来就什么都没有）"
     );
 
     // 节流：`pending` 的槽已被上面占掉，同一类 300 秒内的第二条不出站；
@@ -757,7 +769,7 @@ async fn slow_run_never_pushes() {
         phone.decrypt()["title"]
             .as_str()
             .unwrap()
-            .contains("task_done"),
+            .contains("完成"),
         "到的那一条是金丝雀"
     );
 }

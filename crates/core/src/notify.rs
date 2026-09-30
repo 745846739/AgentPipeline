@@ -210,12 +210,10 @@ const WEBHOOK_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// 归因文本（分流前**共用**，决策 270②）：只带白名单短标识键，`detail` 里的
 /// `output` / `diagnostic` / `error` / `message` 原文一个都不出网（268「不发正文/
-/// 日志原文」的纪律不因格式松动）；挑不到就退回 kind + task_id。
-fn attribution_body(
-    kind: AttentionKind,
-    task_id: &str,
-    detail: Option<&serde_json::Value>,
-) -> String {
+/// 日志原文」的纪律不因格式松动）。**body 不再复读 kind 与 task_id**（决策 344）：
+/// title 已带中文标签与 id，正文从归因属性开始；一个属性都挑不到时就是空串
+/// （锁屏上只显示 title，现场都在深链里）。
+fn attribution_body(detail: Option<&serde_json::Value>) -> String {
     const ATTRIBUTION_KEYS: [&str; 7] = [
         "stage",
         "node",
@@ -235,11 +233,7 @@ fn attribution_body(
             }
         }
     }
-    if attrs.is_empty() {
-        format!("{}（{task_id}）", kind.as_str())
-    } else {
-        format!("{}（{task_id}） {}", kind.as_str(), attrs.join(" "))
-    }
+    attrs.join(" ")
 }
 
 /// 按字符数截断（按 `char` 切，不打断多字节字符），截断时带省略号。
@@ -268,8 +262,9 @@ fn encode_query_component(s: &str) -> String {
 }
 
 /// 一条通知的**内容**（分流前的最后一层）：`title` 已带 `[AgentPipeline]` 前缀，
-/// `body` 在各自入口处就定型——attention 线只带归因白名单（268④），回话线带回话
-/// 正文（272⑤ 对本人通道的显式豁免，截断 200 字），失败线只带类别不带原文。
+/// `body` 在各自入口处就定型——attention 线只带归因白名单（268④；344 起正文不再
+/// 复读 kind / task_id），回话线带回话正文（272⑤ 对本人通道的显式豁免，截断
+/// 200 字），失败线只带类别不带原文。
 ///
 /// `url`（pwa-webpush 02）是**浏览器推送独有的字段**：深链由服务端拼好（前端那几条
 /// hash 路由的形状见 [`attention_deep_link`] / [`talk_deep_link`]），service worker
@@ -377,8 +372,10 @@ pub fn payload_for(
         kind: kind.as_str(),
         task_id: Some(task_id),
         occurred_at,
-        title: format!("[AgentPipeline] {task_id} {}", kind.as_str()),
-        body: attribution_body(kind, task_id, detail),
+        // 决策 344：标签前置（锁屏截断先掉 id 不掉词），机器词 kind 原样留在
+        // generic 报文的 `kind` 字段里；id 在深链里，一个字节不丢。
+        title: format!("[AgentPipeline] {} {task_id}", kind.label()),
+        body: attribution_body(detail),
         url: attention_deep_link(task_id, detail),
     };
     render(format, &notice, bb_address)
@@ -1101,11 +1098,15 @@ mod tests {
         assert_eq!(p["task_id"], "t1", "{p}");
         assert!(p["occurred_at"].is_string(), "{p}");
         assert!(
-            p["title"].as_str().unwrap().contains("[AgentPipeline]"),
+            p["title"].as_str().unwrap().contains("[AgentPipeline] 运行失败 t1"),
             "{p}"
         );
         let body = p["body"].as_str().unwrap();
         assert!(body.contains("stage=test"), "{p}");
+        assert!(
+            !body.contains("run_failed"),
+            "body 不再复读 kind（决策 344）：{p}"
+        );
         assert!(!body.contains("boom"), "detail 原文不出网：{p}");
     }
 
@@ -1124,8 +1125,8 @@ mod tests {
         assert_eq!(p["msg_type"], "text", "{p}");
         let text = p["content"]["text"].as_str().unwrap();
         assert!(
-            text.starts_with("[AgentPipeline] t9 task_pending"),
-            "自定义关键词靠这个前缀命中：{text}"
+            text.starts_with("[AgentPipeline] 待拍板 t9"),
+            "自定义关键词靠这个前缀命中（决策 344：kind 换中文标签、标签前置）：{text}"
         );
         assert!(text.contains("pending_kind=gate"), "{text}");
         assert!(!text.contains("boom"), "detail 原文不出网：{text}");
@@ -1153,7 +1154,7 @@ mod tests {
         );
         let message = p["message"].as_str().unwrap();
         assert!(
-            message.starts_with("[AgentPipeline] t7 task_pending"),
+            message.starts_with("[AgentPipeline] 待拍板 t7"),
             "关键词前缀照旧命中：{message}"
         );
         assert!(message.contains("pending_kind=gate"), "{message}");
@@ -1247,8 +1248,12 @@ mod tests {
             None,
         );
         assert_eq!(p.as_object().unwrap().len(), 3, "{p}");
-        assert!(p["title"].as_str().unwrap().contains("[AgentPipeline]"));
+        assert!(p["title"].as_str().unwrap().contains("[AgentPipeline] 待拍板 t1"));
         assert!(p["body"].as_str().unwrap().contains("pending_kind=gate"));
+        assert!(
+            !p["body"].as_str().unwrap().contains("task_pending"),
+            "body 不再复读 kind（决策 344）：{p}"
+        );
         assert!(!p["body"].as_str().unwrap().contains("boom"), "{p}");
         assert_eq!(p["url"], "#/task/t1", "{p}");
     }

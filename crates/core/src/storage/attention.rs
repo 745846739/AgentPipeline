@@ -78,6 +78,28 @@ pub enum AttentionKind {
 }
 
 impl AttentionKind {
+    /// 面向人的中文短标签（决策 344）：通知的 `title` 用它，`as_str()` 的机器词继续
+    /// 供 payload 的 `kind` 字段与台账消费。新增类别时两边一起加（同 [`Self::parse`]
+    /// 的记账纪律：以决策为单位，不许悄悄多一类）。
+    pub fn label(self) -> &'static str {
+        match self {
+            AttentionKind::TaskPending => "待拍板",
+            AttentionKind::RetryExhausted => "重试耗尽",
+            AttentionKind::ContextOverflow => "上下文溢出",
+            AttentionKind::GateFailure => "闸门失败",
+            AttentionKind::RepeatedPending => "反复待拍板",
+            AttentionKind::SchedulerNoEffect => "调度未生效",
+            AttentionKind::OwnerStuck => "执行体超时",
+            AttentionKind::TaskStale => "停滞提醒",
+            AttentionKind::TaskDone => "完成",
+            AttentionKind::SlowRun => "慢跑",
+            AttentionKind::RunFailed => "运行失败",
+            AttentionKind::TaskCancelled => "已取消",
+            AttentionKind::ResumeBlocked => "续跑被挡",
+            AttentionKind::BlockedRead => "文件读卡住",
+        }
+    }
+
     pub fn as_str(self) -> &'static str {
         match self {
             AttentionKind::TaskPending => "task_pending",
