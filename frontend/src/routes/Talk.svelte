@@ -2,27 +2,18 @@
   import { onMount, tick, untrack } from 'svelte';
   import type {
     AllowedAction,
-    BranchCursor,
-    ForemanAttention,
     ForemanBriefing,
     ForemanProposal,
-    ForemanSession,
     ForemanSessionMeta,
     Stage,
-    TaskListItem,
   } from '../api/types';
   import type { SpriteName } from '../theme/contract';
   import { createMenuTrap } from '../lib/menuTrap';
   import { chipRow } from '../lib/sessionChips';
   import {
-    archiveForemanSession,
     cancelForemanTurn,
     createForemanSession,
     executeForemanProposal,
-    getForemanAttention,
-    getForemanSession,
-    getForemanSessions,
-    getTask,
     rejectForemanProposal,
     renameForemanSession,
     sendForemanMessage,
@@ -69,15 +60,8 @@
     TALK_MOBILE_QUERY,
   } from '../lib/talkLayout';
   import {
-    loadSeen,
     loadSessionId,
-    markSeen,
-    pruneSeen,
-    saveSeen,
-    saveSessionId,
-    seedBaselineIfFirstRun,
     sessionMark,
-    type SeenAt,
     type SessionMark,
   } from '../lib/talkSessions';
   import {
@@ -118,7 +102,7 @@
   import DiffReviewPanel from '../components/task/DiffReviewPanel.svelte';
   import EmptyState from '../components/ui/EmptyState.svelte';
   import Modal from '../components/ui/Modal.svelte';
-  import { router, writeQuery } from '../router.svelte';
+  import { router } from '../router.svelte';
 
   /**
    * 值守台账档（票 04 / 决策 286）：`<Talk watch />` 渲染**只读的一本账**——同一套
@@ -192,10 +176,16 @@
    * 名牌 tab = 发言者），故不另加 who 行，也不做左右交替气泡。
    */
 
-  let loading = $state(true);
-  let loadError = $state<string | null>(null);
+  /**
+   * 台账生命周期（决策 354①）：`session` / `sessionList` / `loading` / `loadError` /
+   * `hasMoreEarlier` 与 reload / loadEarlier / switchTo / 归档坠落 / seen 标记全住在
+   * `stores/talk.svelte.ts`——「某一班的事发生在页面之外」（收尾、归档、切走之后落地的
+   * 回话）正是 store 存在的理由。这里只是**读别名**：写走 store 的方法。
+   */
+  const loading = $derived(talk.loading);
+  const loadError = $derived(talk.loadError);
   /** `loadError` 是不是**配对缺失**（按后端给的 `kind` 判，决策 259）——挂不挂配对入口读它，不读报文字样。 */
-  let loadErrorPairing = $state(false);
+  const loadErrorPairing = $derived(talk.loadErrorPairing);
   /**
    * 这个组件**装载那一刻**的地址（决策 285）。standalone 窗口没有地址栏，而主屏图标的
    * 启动地址决定令牌能不能递进来（191）——「图标没带上参数」这句话在界面上本该有处可读。
@@ -203,28 +193,18 @@
    */
   const launchHref = typeof window === 'undefined' ? '' : window.location.href;
   /** 会话台账（时间线的权威内容；每次回话后重取，不自攒一份账）。 */
-  let session = $state<ForemanSession | null>(null);
-  /**
-   * 上面还有更早的消息没加载（票 05：向上游标）。**首屏读满 `SESSION_PAGE_LIMIT`
-   * 条才置真**——500 条内的班次这条路径一次都不会走到，加载与从前逐字一致、零额外
-   * 请求；到头（游标回空段）置假，不再有向上的动作。
-   */
-  let hasMoreEarlier = $state(false);
-  /** 向上加载在途：滚到顶会连着 fire 一串 scroll 事件，靠它去重。 */
-  let loadingEarlier = $state(false);
-  /** 与后端 `routes/foreman.rs::SESSION_PAGE_LIMIT` 同一个数——判「首屏读满」的尺。 */
-  const SESSION_PAGE_LIMIT = 500;
-
+  const session = $derived(talk.session);
   /** 未归档的班次（chip 行的数据源），按最近活动倒序。 */
-  let sessionList = $state<ForemanSessionMeta[]>([]);
+  const sessionList = $derived(talk.sessionList);
   /**
    * 未消费待办的**只读**读数（决策 307，票 executor-never-returns 06）。
    *
    * `null` = 还没读到 / 读不到——那时**不渲染**页头那枚读数（未接线、离线都走这一支）。
    * 它与 `session.turn_in_flight` 无关，这正是它存在的一半理由：值守轮排队时（决策 289）
    * 那条「值守台账 · 正在跑」的 crumb 根本不出现，而系统此刻正在报警。
+   * 与班次同一次重读刷一遍（`reload` 尾部，决策 354① 起在 store）。
    */
-  let attention = $state<ForemanAttention | null>(null);
+  const attention = $derived(talk.attention);
   /**
    * 页头那枚读数的渲染条件：**有未消费待办才渲染**（0 条不占窄档空间——这是一条决策，
    * 不是顺手写的缺省值）。判据本体在 `visibleAttention` 里，由 `attentionKind.test.ts` 钉住。
@@ -240,9 +220,9 @@
   /**
    * 「显示已归档」开关（票 06）：关 = 现状（chip 行只见活跃班次）。只换**列表给谁看**，
    * 不动当前在读的那一班；不持久化——它是一次浏览动作，不是身份（与「地址记住落点」
-   * 那套不是一回事），下次进本页回到关。
+   * 那套不是一回事），下次进本页回到关（onMount 拨回，store 寿命比页面长）。
    */
-  let showArchived = $state(false);
+  const showArchived = $derived(talk.showArchived);
   /**
    * 当前班次 id。**住在 `stores/talk.svelte.ts` 里**（决策 275）：在飞一轮的现场与那条
    * `/foreman/stream` 连接都挂在它上面，而它们必须活得比这个组件长——否则切一下界面再回来，
@@ -334,10 +314,8 @@
     }
   });
 
-  /** 「哪一条我看过」的时刻表（决策 220③ 的「有新动静」判据）。 */
-  let seen = $state<SeenAt>({});
-  /** 这份表建过基线没有：本机第一次读到列表时把当下当基线（否则第一屏每条都带「有新动静」）。 */
-  let seenSeeded = $state(false);
+  /** 「哪一条我看过」的时刻表（决策 220③ 的「有新动静」判据）——住在 store（决策 354①）。 */
+  const seen = $derived(talk.seen);
   /** 「别的班次正在回话」（store 持有，决策 275——它说的是「此刻」，与页面在不在无关）。 */
   const foreignActive = $derived(talk.foreign);
   /** 标记的时钟：只在真有「别的班次在回话」时走（静默超时熄灭用）。 */
@@ -380,8 +358,8 @@
     talk.toolOpen = { ...talk.toolOpen, [key]: !toolIsOpen(key) };
   }
 
-  /** 每个 pending 任务的详情（allowed_actions 只在详情里下发，决策 101）。 */
-  let details = $state<Record<string, { actions: AllowedAction[]; cursors: BranchCursor[] }>>({});
+  /** 每个 pending 任务的详情（allowed_actions 只在详情里下发，决策 101）——住在 store（决策 354①）。 */
+  const details = $derived(talk.details);
 
   /**
    * 折行档（≤899，决策 218 修订 ⑥）：`.talk` 折成一列、页头收成一行 + ⋯、班次行与值班板
@@ -557,148 +535,27 @@
   /** 对话时间线是空的（且不是「还没读到」）：空态要居中，见 CSS 的 `.timeline.empty`。 */
   const timelineEmpty = $derived(!(loading && !session) && turns.length === 0);
 
-  /**
-   * 重读班次列表与某个班次的台账（守卫与落点语义的完整说明在函数本体上——
-   * 两块注释被 `loadAttention` 隔开是既有排版）。
-   *
-   * `want` 三态：不给 = 接着看当前这一班；给 id = 切过去；给 `null` = 回到服务端默认
-   * （最近活动的未归档班次）。指定的班次不在了（别的设备归档了它、或这个 id 本来就不存在）
-   * 时**回落到默认**而不是报错——切班次的地方没有出错这一说，只有「去最近有人说话的那一班」。
-   */
-  /**
-   * 读未消费待办（决策 307，票 06）。
-   *
-   * **不进 `session` 载荷**：那一条的契约是「这一班的台账」，而待办是**跨班次的任务侧**
-   * 事件（值守轮在那里排队时，人正看着人的班次，两条读数来自两处）。另起一个只读端点，
-   * 也就让它能在值守轮排队期间独立刷新——那正是它存在的理由。
-   *
-   * 读失败只是**不显示**：未接线 / 离线时它不该把「读台账」也弄红（本页的主责是对话）。
-   */
-  async function loadAttention(): Promise<void> {
-    try {
-      attention = await getForemanAttention();
-    } catch {
-      attention = null;
-    }
-  }
-
-  /**
-   * 重读班次列表与某个班次的台账。
-   *
-   * `want` 三态：不给 = 接着看当前这一班；给 id = 切过去；给 `null` = 回到服务端默认
-   * （最近活动的未归档班次）。指定的班次不在了（别的设备归档了它、或这个 id 本来就不存在）
-   * 时**回落到默认**而不是报错——切班次的地方没有出错这一说，只有「去最近有人说话的那一班」。
-   *
-   * **过期回包守卫**（票 01 of talk-live-identity，决策 204⑥ 的 reload 版）：给过显式
-   * `want` 的那一趟，进门前先把落点认下来（`talk.watch`——守卫的锚与落点同一格），
-   * 此后**每个 await 之后**比对「目标 ≠ `talk.sessionId` 即整包丢弃」：不写 `session`、
-   * 不 watch、不改地址、不收口。没有这道比对，切班次之前发出的那一趟回来会把整屏
-   * 拖回旧班次——这正是「对讲台出现非本次会话的内容」的根因（并发 reload 是常态：
-   * 挂载装载、代次重读、重连校准、可见性恢复都走这里）。不带 `want` 的续读以当下的
-   * `talk.sessionId` 为锚，同一纪律。
-   *
-   * 落点与发起时不同（指定的班次不在了、回落默认）：`talk.watch(landed)` 那一步自会把
-   * 身份换过去，在途的 send 结果由它自己的比对作废——决策 204⑥ 的语义不变。
-   */
-  async function reload(want?: string | null): Promise<boolean> {
-    const wanted = want === undefined ? talk.sessionId : want;
-    if (want !== undefined) talk.watch(wanted ?? null);
-    try {
-      // 两本账各读各的（票 04 / 决策 286）：`?kind=` 缺省只回人的班次，值守账要显式要。
-      // 「指定的 id 不在这一班的列表里」因此按账本各自判——把 talk 的 id 递到值守账
-      // （或反过来，刷新后的 localStorage 兜底就是这条路径）回落到本账的默认落点。
-      const list = await getForemanSessions(undefined, ledgerKind, showArchived);
-      // 过期回包守卫第一道（票 01）：这一趟之间换班了（`talk.watch` 已被别的路径改口），
-      // 后面的整包作废——不写 session、不改地址。
-      if (talk.sessionId !== wanted) return false;
-      const target = wanted;
-      // 「找得到」多认一种（票 06）：**已经在读的那一班**——归档开关关着时它不在
-      // 列表里，但人正看着它，把人弹去默认班才是错。只宽这一种：地址 / 兜底文件指到
-      // 一班**没加载的**归档班，照旧回落默认（决策 204⑥：指定的不在列表里 → 去最近
-      // 有人说话的那一班）。
-      const known =
-        !!target &&
-        (list.sessions.some((s) => s.id === target) ||
-          target === (session?.session?.id ?? null));
-      const payload = await getForemanSession(known ? target : null, undefined, ledgerKind);
-      // 守卫第二道（票 01）：`talk.sessionId` 已经不是进门前认下的那一班——这一包是
-      // 旧目标的台账，整包丢弃。
-      if (talk.sessionId !== wanted) return false;
-      sessionList = list.sessions;
-      const landed = payload.session?.id ?? null;
-      // 同一班的重读（台账代次那一声，一轮落地后常见）：**已在屏的更早段留着**——
-      // 重读只回最近 500 条，直接盖上去会把滚上去加载的那段历史变没（票 05：已加载的
-      // 消息不重不漏）。换班（`landed !== prevId`）不并：那是另一班的账。
-      const prevId = session?.session?.id ?? null;
-      const fresh = payload.messages ?? [];
-      if (landed !== null && landed === prevId && fresh.length > 0) {
-        const older = (session?.messages ?? []).filter((m) => m.id < fresh[0].id);
-        if (older.length > 0) payload.messages = [...older, ...fresh];
-      }
-      session = payload;
-      // 首屏读满才有「更上一层」可言；同一班重读也按这一拍重算（台账可能长过了 500）。
-      hasMoreEarlier = fresh.length >= SESSION_PAGE_LIMIT;
-      talk.watch(landed);
-      rememberLanding(landed, payload.session);
-      // 重新接上一轮（决策 260 / 275）：服务端说这一班此刻有一轮在跑，而本机没在等它
-      // （`sending` 的现场只属于本机发出的那一趟）。此时把「跟」这件事立起来，增量
-      // 才会照旧接进时间线——否则刷新之后实时回话整段看不见，只剩落地后重读台账；
-      // 而**切走再回来**那一趟靠 store 里没走的在飞现场接着（决策 275）。
-      talk.syncFollowing(payload);
-      // 未消费待办的读数与班次同一次重读刷一遍（决策 307，票 06）。
-      await loadAttention();
-      loadError = null;
-      loadErrorPairing = false;
-      return true;
-    } catch (err) {
-      loadError = (err as Error).message;
-      loadErrorPairing = isPairingRequired(err);
-      return false;
-    } finally {
-      loading = false;
-    }
-  }
+  /* reload（重读班次列表与某个班次的台账，含过期回包守卫与落点收口）自决策 354① 起住在
+   * `stores/talk.svelte.ts`：台账是 store 的，重读也是 store 的——本页与 store 内部的
+   * 收尾路径（落地哨、重连校准）调的是同一个 `talk.reload()`。 */
 
   /**
    * 滚到顶加载更早的消息（票 05：`before_id` 向上游标）。
    *
    * **阅读位置不跳**：接上去之前记下滚动高度与位置，段接到头部、`tick()` 等 DOM 长高
-   * 之后把 scrollTop 补上长高的那一截——眼睛看着的那一行 stays put。
-   * 到头的信号就是**空段**（后端不另给 `has_more`）；到头后 `hasMoreEarlier` 置假，
-   * 这条路不再走到。读失败只收手：位置不动、游标不废，下一次滚到顶自然重试。
+   * 之后把 scrollTop 补上长高的那一截——眼睛看着的那一行 stays put。账的判据
+   * （游标、守卫、到头即止）在 store 的 `talk.loadEarlier()`（决策 354①），它返回
+   * 「有没有接上新段」，这里只管这一屏的滚动几何——**能不能翻也只有 store 判**（它自己
+   * 那两道早退），页面在实参上再判一遍就是第二个判据点。
    */
   async function loadEarlier(): Promise<void> {
-    if (loadingEarlier || !hasMoreEarlier) return;
-    const oldest = session?.messages?.[0]?.id;
-    if (oldest == null) {
-      hasMoreEarlier = false;
-      return;
-    }
-    const gen = talk.sessionId;
     const el = timelineEl;
     const prevHeight = el?.scrollHeight ?? 0;
     const prevTop = el?.scrollTop ?? 0;
-    loadingEarlier = true;
-    try {
-      const page = await getForemanSession(currentId, undefined, ledgerKind, oldest);
-      // 这一趟之间换班 / 重读了：这一段是对着旧台账取的，接上去就是串台（决策 204⑥
-      // 同一条纪律——await 之后比对记号，不符即丢；记号自票 01 起是 store 的 `sessionId`）。
-      if (gen !== talk.sessionId) return;
-      const older = page.messages ?? [];
-      if (older.length === 0) {
-        hasMoreEarlier = false;
-        return;
-      }
-      if (session) session = { ...session, messages: [...older, ...session.messages] };
-      // 整段读满才可能还有更上一层（后端每段最多 500 条）。
-      hasMoreEarlier = older.length >= SESSION_PAGE_LIMIT;
-      await tick();
-      if (el) el.scrollTop = prevTop + (el.scrollHeight - prevHeight);
-    } catch {
-      // 读失败不碰现场：游标没变、位置没动，下次滚到顶重试。
-    } finally {
-      loadingEarlier = false;
-    }
+    const appended = await talk.loadEarlier();
+    if (!appended) return;
+    await tick();
+    if (el) el.scrollTop = prevTop + (el.scrollHeight - prevHeight);
   }
 
   /** 滚到顶触发向上加载（票 05）：留一小段余量，免得要滚得严丝合缝才触发。 */
@@ -707,115 +564,21 @@
     if (el && el.scrollTop < 160) void loadEarlier();
   }
 
-  /**
-   * 落点收口（决策 217①④ / 220③）：**看过表、兜底文件、地址**三处一起跟上这一班。
-   *
-   * 三件事各有各的理由，且都必须在这里做：
-   *   - 「我看过它了」记的是**它此刻的 `last_active_at`**（不是本机的当下）——两边同一座钟，
-   *     机器一慢一快才不会读出假标记；
-   *   - 兜底文件写**落点**而不是「请求的那一班」：指定的班次不在了（别的设备归档了它）时
-   *     落回默认，此时该记住的是默认那一班；
-   *   - 地址用 `replaceState`（决策 217③：程序改地址一律 replace），否则装载时的规范化
-   *     会在历史里多塞一条，后退就不再是「回到上一页」。
-   *
-   * **看过表只属于人的班次列表**（票 04）：两枚标记（「正在回话」/「有新动静」）挂在
-   * 班次列表的行上，而值守账只有**一本**（固定的一行，没有「哪一班有新动静」可说）；
-   * 它的动静在屏上有更直接的读法（在飞那一轮 + 「值守正在跑」）。基线与清理若在值守页上跑，
-   * 会把人的班次从表里剪掉——回来时每一班都亮假的「有新动静」。故整段跳过；
-   * 兜底文件同理不写（写进去只会把人对讲台的兜底落点冲掉）。
-   */
-  function rememberLanding(landed: string | null, meta: ForemanSessionMeta | null) {
-    if (!watchMode) {
-      let next = seen;
-      if (!seenSeeded) {
-        // 立基线只在**本机一条记录都没有**时做（判据在 `seedBaselineIfFirstRun`）：
-        // 少了它，第一屏每一条都带「有新动静」——而它们只是刚被列出来；写成「每次装载都
-        // 拿当下的列表立基线」则相反：**关机期间别处发生的动静会被记成「看过了」**，
-        // 而那正是这枚标记最该说话的场合（实测：手机在别处开了新班次、说了话，回到这台
-        // 电脑打开对讲台，菜单里那条不该是安静的）。
-        next = seedBaselineIfFirstRun(next, sessionList);
-        seenSeeded = true;
-      }
-      if (meta) next = markSeen(next, meta.id, meta.last_active_at);
-      next = pruneSeen(
-        next,
-        sessionList.map((s) => s.id),
-      );
-      if (next !== seen) {
-        seen = next;
-        saveSeen(next);
-      }
-      saveSessionId(landed);
-    }
-    // 落地即熄灭（决策 220③）：这一班的回话已经在台账里了，它不再是「此刻在说话」
-    if (landed) talk.foreign = forgetForeignActive(talk.foreign, landed);
-    writeQuery({ session: landed }, { replace: true });
-  }
+  /* 落点收口（seen 看过表 / 兜底文件 / 地址，决策 217①④ / 220③）自决策 354① 起随台账
+   * 住在 store 的 `reload` 尾部（`rememberLanding`）：它是「落地」那件事的一半，
+   * 而落地发生在页面之外是常态。 */
 
   /**
-   * 切换时要**重置**的会话级状态（决策 204③的那份清单，逐条）。
+   * 切到另一班（账在 store 的 `talk.switchTo`，决策 354①）。
    *
-   * 只有这些是「属于某一班」的：这一屏读到的台账、读的加载态与错误、正在发的那句乐观轮、
-   * 流式增量、以及还没发出去的输入。**不重置**的是 `details` / `chosenStop` / `crew` /
-   * `pending`——它们派生自全局看板，换会话不等于换看板（同一条决策的第②条裁决）。
-   *
-   * 其中「一轮的现场」（乐观轮 / 步骤 / 跟一轮的锚点）自决策 275 起住在 store 里，
-   * 由 `talk.watch(id)` 换班时一并倒空——它跟的是**某一班**那一轮，留着锚点会让新那一班的
-   * 增量继续往那一格里攒。
-   */
-  function resetSessionState() {
-    session = null;
-    loading = true;
-    loadError = null;
-    loadErrorPairing = false;
-    talk.resetLive();
-    input = '';
-  }
-
-  /**
-   * 切到另一班。
-   *
-   * **回话中也可以切**（决策 220②）：那把 `sending || busy` 的锁撤掉了。它只是「别让你把
-   * 正在等的那句回话弄丢」的**第三层**自保——前两层是 `appendForemanEvent` 的班次守卫
-   * （增量串台）与 `send()` 里每个 await 之后的 `talk.sessionId` 比对（回包串台，票 01），
-   * 那两层一步没动。
-   * 切走之后「那一轮回话去哪了」改由班次列表里的两枚标记说清楚（决策 220③）。
-   *
-   * 切走时那一轮从视野里撤下（`resetSessionState` + `send()` 的 sessionId 不符分支），
-   * 但**回话照旧落台账**，回来就能看到完整的（决策 220⑤；切进一条正在回话的班次会先看到
-   * 回话的后半截，落地后 `reload()` 补齐——这一条也别当 bug 修）。
-   *
-   * `write`：用户点的切换把班次写进地址（`pushState`——后退回到上一班是想要的，决策 217③）；
-   * 从地址来的切换（后退 / 前进）不写，否则自己触发的装载会再写一次地址。
+   * 页面只剩两样接线：**草稿的清空时机**（输入框是页面私有——重置成功才清，store 在
+   * `resetLedger` 那一拍回调 `onReset`）与同一班的早退（chip 点了自己：草稿不动）。
    */
   async function switchTo(id: string, opts: { write?: boolean } = {}) {
     if (id === currentId) return;
-    // 先认下这件事再写地址：地址一变，下面那个 `$effect` 会拿新值来比——认下了才不重复装载。
-    // 认下这一步同时就是在途回包的作废记号（票 01）：此后每个 await 的比对都以它为准。
-    talk.watch(id);
-    if (opts.write) writeQuery({ session: id });
-    resetSessionState();
-    await reload(id);
+    input = '';
+    await talk.switchTo(id, opts);
   }
-
-  /**
-   * 台账代次（决策 275）：store 说「这一份台账可能已经变了」就重读一次。
-   *
-   * 要它，是因为一轮的收尾**可能发生在页面之外**（切走之后那一趟 POST 才回来），而那时
-   * 在屏的这一页读的仍是旧台账——代次是那一趟收尾留给这一屏的那一声。
-   *
-   * **基线是「本页见过的代次」而不是 0**（票 01 of talk-live-identity）：代次住在 store、
-   * 只增不清零（决策 275 让它跨页面存活），旧判据 `epoch === 0` 在跑完过一轮收口之后
-   * 永不成立——于是每次挂载都会与 onMount 的装载并发发一枪，两趟 reload 各写各的，
-   * 正是串台的温床。挂载那一刻的当下值就是基线：本页没见过的增量才重读，挂载首读
-   * 只归 onMount 那一趟。
-   */
-  let seenEpoch = talk.ledgerEpoch;
-  $effect(() => {
-    if (talk.ledgerEpoch === seenEpoch) return;
-    seenEpoch = talk.ledgerEpoch;
-    void reload();
-  });
 
   /**
    * 地址里的班次变了就跟着走（后退 / 前进，决策 217④ 的恢复语义）。
@@ -830,33 +593,19 @@
     void switchTo(want, { write: false });
   });
 
-  /**
-   * 开一个新班次并切过去（空班是合法状态：第一句话说出来时它才得名）。
-   *
-   * **不带 busy 守卫**：调用方已经持有它。归档最后一个班次那条路就是这样调的
-   * ——那时的 busy 必然是 true，若这里再守一次，归档完最后一个班次会静默什么都不做，
-   * 页面停在一片空白上（「一个班次都没有」且没有当前班次）。
-   */
-  async function openFreshSession(opts: { push?: boolean } = {}) {
-    const created = await createForemanSession();
-    sessionList = [created.session, ...sessionList];
-    resetSessionState();
-    // 同 `switchTo`：先把落点认下来，再写地址（用户按的那一颗 push，归档后的自动开新班不写——
-    // 地址的落点由随后的 `reload` 用 replaceState 规范化）
-    talk.watch(created.session.id);
-    if (opts.push) writeQuery({ session: created.session.id });
-    await reload(created.session.id);
-  }
+  /* 开新班次（`openFreshSession`）与归档坠落（`archiveAndFall`）自决策 354① 起住在 store：
+   * 建班 / 归档之后「落点在哪、台账怎么落」都是账的事。页面只递 `onReset`（清输入框草稿）
+   * 与 `onArchived`（关对话框）两个回调，时点与改前逐拍一致。 */
 
   /** 从界面按下「+ 新班次」（⋯ 菜单的第一项）。用户按的 = 一次换班，故 push 进地址。 */
   async function newSession() {
     if (sending || busy) return;
     busy = true;
     try {
-      await openFreshSession({ push: true });
+      await talk.openFreshSession({ push: true, onReset: () => (input = '') });
     } catch (err) {
-      loadError = (err as Error).message;
-      loadErrorPairing = isPairingRequired(err);
+      talk.loadError = (err as Error).message;
+      talk.loadErrorPairing = isPairingRequired(err);
     } finally {
       busy = false;
     }
@@ -877,8 +626,8 @@
     busy = true;
     try {
       const updated = await renameForemanSession(id, title);
-      sessionList = sessionList.map((s) => (s.id === id ? updated.session : s));
-      if (session?.session) session = { ...session, session: updated.session };
+      talk.sessionList = talk.sessionList.map((s) => (s.id === id ? updated.session : s));
+      if (talk.session?.session) talk.session = { ...talk.session, session: updated.session };
       dialog = null;
     } catch (err) {
       dialogError = (err as Error).message;
@@ -899,20 +648,10 @@
     if (!id || busy) return;
     busy = true;
     try {
-      await archiveForemanSession(id);
-      dialog = null;
-      resetSessionState();
-      const list = await getForemanSessions(undefined, ledgerKind, showArchived);
-      sessionList = list.sessions;
-      // 切去**最近活动的未归档班**（决策 204）：开关开着时列表含归档，而刚归档的那班
-      // `last_active_at` 最新会排第一——照 `sessions[0]` 切就是「归档完原地不动」。
-      const next = list.sessions.find((s) => !s.archived_at);
-      if (next) {
-        await reload(next.id);
-      } else {
-        // 一个不剩：新开一班（走不带守卫的那条，见 `openFreshSession`）
-        await openFreshSession();
-      }
+      await talk.archiveAndFall(id, {
+        onArchived: () => (dialog = null),
+        onReset: () => (input = ''),
+      });
     } catch (err) {
       dialogError = (err as Error).message;
     } finally {
@@ -957,8 +696,8 @@
   /* 「跟一轮」的**落地哨**自决策 275 起住在 store（`stores/talk.svelte.ts::pollFollow`）：
    * 它与「这一轮此刻在跑」这件事实同寿，而页面来去不该影响收口——页面切走之后那一趟
    * POST 才回来的情形，本页早已销毁，收口在那里发生的话只会写进一个死组件里
-   * （实测：切去看板再回来，落地那一刻时间线空了一格）。本页只提供**交棒的那一跳**——
-   * `talk.bindRecalibrate(() => void reload())`（见 onMount）。 */
+   * （实测：切去看板再回来，落地那一刻时间线空了一格）。收口之后的台账重读也归 store
+   * （决策 354①）：`bindRecalibrate` 交棒那一跳随 epoch 喊话协议一并退场。 */
 
   /** 提议对应的那个任务的 `allowed_actions`（不指路时用不到，判据在 `lib/proposals.ts`）。 */
   function actionsFor(p: ForemanProposal): AllowedAction[] | undefined {
@@ -991,12 +730,12 @@
     try {
       if (act === 'execute') await executeForemanProposal(id);
       else await rejectForemanProposal(id);
-      await reload();
+      await talk.reload();
     } catch (e) {
       proposalError = { id, text: e instanceof Error ? e.message : String(e) };
       // 失败也要重读：过期 / 态势变化这两种失败**改了库里的状态**（标 expired / 保持 pending
       // 并落一条说明），不重读的话界面显示的仍是按键之前那一份。
-      await reload();
+      await talk.reload();
     } finally {
       proposalBusy = null;
     }
@@ -1010,10 +749,18 @@
    */
   function onVisible() {
     if (document.visibilityState !== 'visible') return;
-    void reload();
+    void talk.reload();
   }
 
   onMount(() => {
+    // 两本账共用一个 store（决策 286 / 354①）：挂载时认下「这本账是谁的」——
+    // reload 的 `?kind=` 与 seen 记账（只属于人的班次列表）都按它走。读的是上面那枚
+    // `ledgerKind`（模板渲染的那一个）而不是就地再写一遍三元：这本账是谁的只有一个判据，
+    // store 这一格只是它在**页面之外**（落地哨、重连校准）还记得的那份副本。
+    talk.kind = ledgerKind;
+    // 「显示已归档」是一次浏览动作，不是身份（票 06 的口径）——store 寿命比页面长，
+    // 故挂载时拨回关，与「下次进本页回到关」逐字一致。
+    talk.showArchived = false;
     // 「转去对话」的交接（票 04）：值守账把摘录放进 store，这里消费——预填是**草稿**
     // （人可以改、可以扔），故填进输入框即清，不做任何「未发送」的持久账。
     // 在人的对讲台上才消费：值守账自己没有坞。
@@ -1026,7 +773,6 @@
     // 装载目标在发请求**之前**就认进 store（票 01）：reload 的过期回包守卫拿它当锚，
     // 而 store 里的 `sessionId` 可能还是上一页留下的旧值——不先认下，首读就会被守卫误杀。
     // 值守账的落点（没有 ?session= 时）由 reload 落地后认下，这里只认地址/兜底给的那个。
-    seen = loadSeen();
     const initialWant = urlSession ?? loadSessionId() ?? undefined;
     if (initialWant !== undefined || talk.sessionId === null) talk.watch(initialWant ?? null);
     // 回执标签取一次（模块级缓存，之后别的页签再挂载不再发第二跳）。失败**不打断对话**：
@@ -1034,12 +780,10 @@
     void loadToolLabels()
       .then((l) => (toolLabels = l))
       .catch(() => {});
-    void reload(initialWant);
-    // 流归 store（决策 275）：那条 `/foreman/stream` 连接与在飞一轮的现场都活在页面之外，
-    // 切页面再回来时「本轮已经收到的输出」还在。这里只**登记**「重连成功后补一次全量」
-    // 的入口（票 03，stream-self-heal：SSE 无回放，不补就得切走再切回来才对齐）——
-    // 页面不在屏上时不登记，那一跳由回来那一次的装载负责。
-    talk.bindRecalibrate(() => void reload());
+    void talk.reload(initialWant);
+    // 流归 store（决策 275）：那条 `/foreman/stream` 连接与在飞一轮的现场都活在页面之外。
+    // 重连成功后的全量校准（票 03，stream-self-heal）也归 store 自己 reload——台账住 store
+    // （决策 354①）之后，`bindRecalibrate` 那一跳没有存在的理由了。
     // 两档断点都是 `lib/talkLayout.ts` 的常量（票 07：899 一处定义；479 只剩占位语用它）
     foldedMq = window.matchMedia(TALK_FOLD_QUERY);
     folded = foldedMq.matches;
@@ -1054,7 +798,6 @@
       document.removeEventListener('visibilitychange', onVisible);
       if (foldedMq && onFoldChange) foldedMq.removeEventListener('change', onFoldChange);
       if (narrowMq && onNarrowChange) narrowMq.removeEventListener('change', onNarrowChange);
-      talk.bindRecalibrate(null);
     };
   });
 
@@ -1112,7 +855,7 @@
     // 依赖：贴底容差用到的容器（换档时重判一次，免得旧容器的读数留着）
     void folded;
     if (n === 0) return;
-    if (untrack(() => loadingEarlier)) return;
+    if (untrack(() => talk.loadingEarlier)) return;
     void tick().then(() => {
       if (untrack(() => following)) scrollToNewest();
     });
@@ -1456,7 +1199,7 @@
         if (talk.sessionId !== originSid) return;
         sid = created.session.id;
         talk.watch(sid);
-        sessionList = [created.session, ...sessionList];
+        talk.sessionList = [created.session, ...talk.sessionList];
       }
       // 「本机发出且未落地」（决策 220③）：切走之后这枚标记要落在**它**那一行上
       sendingSid = sid;
@@ -1469,7 +1212,7 @@
         // 「正在回话」会一直亮到静默超时——而它说的已经不是实话。
         talk.settleTurn();
         talk.foreign = forgetForeignActive(talk.foreign, sid);
-        void refreshSessionList();
+        void talk.refreshSessionList();
         return;
       }
       // 回话是权威值：先收敛流式文本（重取台账期间不闪空），再以台账覆盖
@@ -1477,7 +1220,7 @@
       // 重取之后**无条件收掉这两样本地状态**：它们是「这一轮」的东西，而重取可能发现
       // 服务端已经把我们换到了另一班（另一台设备归档了它）。那种情况下留着乐观轮，
       // 它就会挂在**另一班的**时间线上——正是决策 204⑥ 要挡的串台。
-      if (await reload(sid)) talk.settleTurn();
+      if (await talk.reload(sid)) talk.settleTurn();
     } catch (err) {
       // 失败把那句话送回输入框（框空着时）：后端在叫模型之前已把 user 行落库的话，
       // 台账那一行会与回框的话并存——重读后乐观轮按同文去重退场（票 02）。
@@ -1485,7 +1228,7 @@
       if (!input.trim()) input = text;
       if (talk.sessionId !== (sid ?? originSid)) {
         talk.settleTurn();
-        void refreshSessionList();
+        void talk.refreshSessionList();
         return;
       }
       // 本地超时**不等于**这一轮失败：服务端那一轮不随这次请求一起死（决策 223），
@@ -1506,11 +1249,11 @@
           failureNotice((err as Error).message, false),
         );
       }
-      // 重取成功才撤乐观轮：撤了之后这话由台账那一行承担，不靠重取失败时凭空消失
-      if (await reload(sid)) {
+      // 重取成功才撤乐观轮：撤了之后这话由台账那一行承担，不靠重取失败时凭空消失。
+      // （决策 354①：原先这里还有一声 `markLedgerStale` 朝在屏的那一页喊「再读一次」——
+      // 台账住进 store 之后那声没了：这趟 `reload` 刚读完，没有新东西可读。）
+      if (await talk.reload(sid)) {
         talk.pendingText = null;
-        // 这一趟收尾也可能发生在页面之外（切走之后 POST 才失败回来）：提醒在屏的那一页重读
-        talk.markLedgerStale();
         // **本地那条失败轮的退场不在这里办**（决策 337）：后端已经把这一轮为什么没跑起来
         // 落成了台账行（决策 211④ / 票 04），而本地这条承载传输层报文与配对入口——两者
         // 谁的先到都可能，判一次（此刻）会留下共存窗。判据挂在 `ledgerOwnsFailure` 上，
@@ -1538,28 +1281,9 @@
     }
   }
 
-  /**
-   * 只重读班次列表（不碰这一屏的台账）。
-   *
+  /* 只重读班次列表（不碰这一屏的台账）的 `refreshSessionList` 自决策 354① 起住在 store：
    * 已经落地的回话（含切走之后落地的那些）更新的是 `last_active_at`——「有新动静」那枚
-   * 标记的判据。这一屏读的是哪一班由 `reload` 管，本函数只管那一列元信息。
-   */
-  async function refreshSessionList() {
-    try {
-      const list = await getForemanSessions(undefined, ledgerKind, showArchived);
-      sessionList = list.sessions;
-      const next = pruneSeen(
-        seen,
-        list.sessions.map((s) => s.id),
-      );
-      if (next !== seen) {
-        seen = next;
-        saveSeen(next);
-      }
-    } catch {
-      // 列表读不到不影响这一屏：标记晚一步出现而已，台账是权威
-    }
-  }
+   * 标记的判据。哪一班在屏由 `reload` 管，它只管那一列元信息。 */
 
   /**
    * 「显示已归档」开关（票 06）。只换**列表给谁看**，不动当前在读的那一班——
@@ -1567,8 +1291,8 @@
    * 就是在说谎），正在读这件事由时间线与只读提示自己说，选中错不到活跃班头上。
    */
   async function toggleShowArchived() {
-    showArchived = !showArchived;
-    await refreshSessionList();
+    talk.showArchived = !talk.showArchived;
+    await talk.refreshSessionList();
   }
 
   /**
@@ -1677,53 +1401,16 @@
   }
 
   /**
-   * 拉取每个 pending 任务的详情（`allowed_actions` 只在详情下发，决策 101）。
+   * pending 详情的**指纹去重**拉取（决策 354① 起归 store 管：判据在
+   * `talk.syncPendingDetails`，这里只把输入接上）。
    *
    * **必须随 pending 集合变化重拉，不能只在 onMount 拉一次**：`board.init()` 是异步的
    * （App.svelte 的 onMount 发起），本页 onMount 时 `board.tasks` 往往还是空的——
    * 只拉一次的话 `pending` 为空、`details` 永远为空，页面会安静地退化成「打开任务详情」
    * 按钮，把后端下发的恢复动作整片吞掉（e2e ⑩ 打红即此）。
    */
-  async function loadDetails(tasks: TaskListItem[]) {
-    const next: Record<string, { actions: AllowedAction[]; cursors: BranchCursor[] }> = {};
-    await Promise.all(
-      tasks.map(async (t) => {
-        try {
-          const detail = await getTask(t.id);
-          next[t.id] = { actions: detail.allowed_actions, cursors: detail.cursors };
-        } catch {
-          // 单个任务失败不影响整页（与看板补详情同一姿态）
-        }
-      }),
-    );
-    details = next;
-  }
-
-  /**
-   * 待办集合的指纹：只含 id 与 pending 类型。用它驱动重拉——
-   * 集合不变时不重拉（避免 $effect 自激），集合一变（board 装载完成 / resume 后状态翻转）
-   * 才重取。类型也进来是因为 `pending_updated` 会换理由而 id 不变。
-   */
-  const pendingKey = $derived(
-    pending
-      .map((t) => `${t.id}:${t.pending_reason?.type ?? ''}:${t.current_stage}`)
-      .sort()
-      .join('|'),
-  );
-
-  let lastKey = $state<string | null>(null);
   $effect(() => {
-    // 值守账不渲染急停轮（只读的一本账，动作在对讲台），不拉那批详情（票 04）
-    if (watchMode) return;
-    const key = pendingKey;
-    if (key === lastKey) return;
-    lastKey = key;
-    // 空集合无需拉取：直接清空上一次的读数
-    if (!key) {
-      details = {};
-      return;
-    }
-    void loadDetails(pending);
+    talk.syncPendingDetails(board.pendingTasks, watchMode);
   });
 
   async function handleAction(
@@ -1731,10 +1418,10 @@
     action: AllowedAction,
     opts: { cursorId?: string; input?: string },
   ) {
-    // board 重载后 pending 集合会变，$effect 里的指纹驱动重拉详情；
+    // board 重载后 pending 集合会变，指纹驱动重拉详情；
     // 这里显式再拉一次是为了动作回执后立刻反映（不等下次轮询）。
     await board.handleTaskAction(taskId, action, opts);
-    await loadDetails(board.pendingTasks);
+    await talk.loadDetails(board.pendingTasks);
   }
 
   /**

@@ -290,8 +290,11 @@ describe('跟的那一轮的收场分三支（决策 260 裁决③，票 in-flig
     expect(store, '落地判据不该就地进行').not.toContain(
       'turnLanded(payload.messages ?? [], anchor) || !payload.turn_in_flight',
     );
-    // 页面只**接线**：收口这件事走 store 的同一个入口（页面里不许再自己判一遍三支）
-    expect(talk, '页面该把收口交给 store').toContain('talk.syncFollowing(payload)');
+    // 页面只**接线**：收口这件事走 store 的同一个入口（页面里不许再自己判一遍三支）。
+    // 决策 354① 之后 reload 与 syncFollowing 同住 store（落地后的重读不再经过页面），
+    // 页面剩下的只有发送收尾那一处接手。
+    expect(talk, '页面该把收口交给 store').toContain('talk.syncFollowing(');
+    expect(store, 'reload 之后的收口也走同一入口').toContain('this.syncFollowing(payload)');
     expect(talk, '页面里不该再自己算三支').not.toContain("outcome.kind === 'lost'");
   });
 
@@ -368,12 +371,22 @@ describe('值守台账与对讲台同源受益（票 07：同组件同 store，�
   });
 
   it('回看的三处都不按账本分叉（loadEarlier / 中断标记 / 归档开关——分支是分叉的起点）', () => {
-    // 向上加载：两本账走同一条路径，唯一差异是 `ledgerKind`（`?kind=`，同源判据里
-    // 明写的那「一个参数」）——所以正向认它、反向拒 watchMode。
+    // 向上加载：两本账走同一条路径，唯一差异是 `kind`（`?kind=`，同源判据里明写的那
+    // 「一个参数」）。决策 354① 之后取数在 store（两本账同一份实现，比「同一组件里
+    // 不分支」更强）；页面只剩滚动几何的包装——所以正向认 store 里的 kind、反向拒
+    // 页面里的 watchMode。
+    const store = read('stores/talk.svelte.ts');
     const earlier = region(talk, 'async function loadEarlier', 'function onTimelineScroll');
-    expect(earlier, 'loadEarlier 锚点该在 Talk.svelte 里').not.toBeNull();
-    expect(earlier, '取数差异只许走 ledgerKind（?kind=）').toContain('ledgerKind');
+    expect(earlier, 'loadEarlier 包装锚点该在 Talk.svelte 里').not.toBeNull();
+    const storeEarlier = region(store, 'async loadEarlier', 'async switchTo');
+    expect(storeEarlier, 'loadEarlier 取数锚点该在 store 里').not.toBeNull();
+    expect(storeEarlier, '取数差异只许走 kind（?kind=）').toContain('this.kind');
+    expect(storeEarlier, '向上加载不许按账本分叉').not.toContain('watchMode');
     expect(earlier, '向上加载不许按账本分叉').not.toContain('watchMode');
+    // 「能不能翻」与「滚动几何」两半各在哪（决策 354①）：一半落进 store 就是把手伸进
+    // DOM（它够不着），另一半落进页面就是第二个判据点——store 那两道早退已经在判了。
+    expect(earlier, '滚动几何该留在页面（store 够不着 DOM）').toContain('scrollTop');
+    expect(storeEarlier, '向上加载不摸滚动——那一格是页面的').not.toContain('scrollTop');
 
     // 中断标记：同一行渲染、同一句文案，值守账里长得一模一样。
     const cut = region(talk, '{#if turn.interruptedAt}', '{/if}');

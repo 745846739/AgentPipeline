@@ -1,7 +1,31 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
-import type { ConversationDeltaEvent, ForemanMessage, ForemanSession } from '../api/types';
+import type {
+  ConversationDeltaEvent,
+  ForemanMessage,
+  ForemanSession,
+  ForemanSessionMeta,
+  TaskListItem,
+} from '../api/types';
 import { beginForemanStream, FOREMAN_LOST_TURN_SUFFIX } from '../realtime/foreman';
-import { talk } from './talk.svelte';
+import { saveSeen, saveSessionId } from '../lib/talkSessions';
+
+const mocks = vi.hoisted(() => ({
+  getForemanSession: vi.fn(),
+  getForemanSessions: vi.fn(),
+  getForemanAttention: vi.fn(),
+  createForemanSession: vi.fn(),
+  archiveForemanSession: vi.fn(),
+  getTask: vi.fn(),
+}));
+
+// 只换掉取数口；`ApiError` 等原样保留——`isPairingRequired`（sharePairing）趁 `ApiError`
+// 还在手判配对缺失，整模块换掉它就没了。
+vi.mock('../api/client', async (importOriginal) => ({
+  ...(await importOriginal<typeof import('../api/client')>()),
+  ...mocks,
+}));
+
+const { talk } = await import('./talk.svelte');
 
 /**
  * 对讲台的在飞现场（决策 275）——用户报的「切换界面后再回来，本轮之前的输出不见了」。
@@ -86,7 +110,23 @@ function reset(id: string | null = null): void {
   talk.foreign = { bySession: {} };
   talk.queue = {};
   talk.queueHeld = {};
+  // 台账生命周期（决策 354①）搬进 store 之后同住一个单例，一并清
+  talk.session = null;
+  talk.sessionList = [];
+  talk.loading = true;
+  talk.loadError = null;
+  talk.loadErrorPairing = false;
+  talk.hasMoreEarlier = false;
+  talk.loadingEarlier = false;
+  talk.showArchived = false;
+  talk.kind = 'talk';
+  talk.seen = {};
+  talk.details = {};
+  talk.attention = null;
   talk.sessionId = id;
+  // localStorage 侧同样归零：store 只在构造时读一次，残留会从「记忆」里漏进来
+  saveSeen({});
+  saveSessionId(null);
 }
 
 afterEach(() => {
@@ -236,12 +276,11 @@ describe('增量闸门与收口（决策 260 的三支）', () => {
   it('**台账中断行接手**（票 03）：重启后半截行标成 interrupted → 落地，由台账接管', () => {
     // 进程被杀、重启后启动恢复把悬挂行标成 interrupted（显式修订决策 223）——那一行
     // 就是这一轮的终态。若这里走 lost，界面会**本地合成**一条失败轮，与台账那条中断行
-    // 并排成两套真相（决策 260 裁决③从此以台账为准：清本地、信台账、代次 +1 重读）。
+    // 并排成两套真相（决策 260 裁决③从此以台账为准：清本地、信台账、重读）。
     reset(SESSION);
     talk.followingSince = 2;
     talk.stream = beginForemanStream();
     talk.note(delta('说了一半就断'));
-    const epochBefore = talk.ledgerEpoch;
 
     talk.syncFollowing(
       payload({
@@ -260,25 +299,22 @@ describe('增量闸门与收口（决策 260 的三支）', () => {
     expect(talk.stream.steps, '台账那一行接管，本地那一段退场').toEqual([]);
     expect(talk.stream.error, '中断不是失败轮：标记由台账那条行自己渲染').toBeNull();
     expect(talk.followingSince).toBeNull();
-    expect(talk.ledgerEpoch, '重读台账，按中断行重算时间线').toBe(epochBefore + 1);
   });
 
-  it('收尾的两声：`settleTurn` 清现场并给台账代次 +1；`markLedgerStale` 只加代次', () => {
+  it('收尾：`settleTurn` 清现场并自己重读台账（决策 354①：epoch 喊话的两端都没了）', async () => {
     reset(SESSION);
     talk.stream = beginForemanStream();
     talk.pendingText = '问句';
-    const before = talk.ledgerEpoch;
+    mocks.getForemanSessions.mockResolvedValue({ sessions: [meta(SESSION)] });
+    mocks.getForemanSession.mockResolvedValue(payload({ messages: [row(1)] }));
+    mocks.getForemanAttention.mockResolvedValue({ open: 0, by_kind: {}, blocked_reads: { stuck_now: 0, stuck_total: 0, longest_wait_ms: 0 } });
 
-    // 失败那一支：本地那条失败轮（在 `stream` 里）要留着，故只提醒重读
-    talk.markLedgerStale();
-    expect(talk.ledgerEpoch).toBe(before + 1);
-    expect(talk.pendingText, '失败那一支不许顺手清现场').toBe('问句');
-
-    // 成功 / 作废那一支：现场退场 + 提醒重读（在屏的那一页据此重读一次台账）
     talk.settleTurn();
-    expect(talk.ledgerEpoch).toBe(before + 2);
-    expect(talk.pendingText).toBeNull();
+    expect(talk.pendingText, '现场退场').toBeNull();
     expect(talk.stream.steps).toEqual([]);
+
+    // 收尾自己把台账重读一遍——不再靠 ledgerEpoch 朝在屏的那一页喊话
+    await vi.waitFor(() => expect(mocks.getForemanSession).toHaveBeenCalled());
   });
 
   it('本机在发时不接手（两条来源各收各的口）', () => {
@@ -392,5 +428,204 @@ describe('排队发送（票 04 of talk-live-identity）', () => {
     talk.followingSince = 2;
     talk.syncFollowing(payload({ messages: [row(1), row(2)], turn_in_flight: false }));
     expect(talk.queueHeld[SESSION], '回话来了就该自动发——扣住会把队列卡死').toBeFalsy();
+  });
+});
+
+// ═══════════ 台账生命周期（决策 354①，票 talk-store-ledger 01）═══════════
+//
+// reload / loadEarlier / switchTo / 归档坠落 / seen 标记自 Talk.svelte 搬进 store。
+// 钉的是搬完之后仍然承重的四条判据：重读合并已分页的旧消息（票 05 的不重不漏）、
+// 过期回包守卫（票 01 of talk-live-identity 的纪律跟着数据走）、向上游标翻页、
+// 归档坠落（决策 204：归档完自动切到最近有说话的班次）。
+
+function meta(id: string, over: Partial<ForemanSessionMeta> = {}): ForemanSessionMeta {
+  return {
+    id,
+    title: `班次 ${id}`,
+    kind: 'talk',
+    created_at: '2026-09-25T00:00:00Z',
+    last_active_at: '2026-09-25T00:10:00Z',
+    archived_at: null,
+    ...over,
+  };
+}
+
+const ATTENTION = {
+  open: 0,
+  by_kind: {},
+  blocked_reads: { stuck_now: 0, stuck_total: 0, longest_wait_ms: 0 },
+};
+
+/** 拿 payload() 的默认 session 形状换一个 id（归档坠落要用多班的载荷）。 */
+function payloadFor(id: string, over: Partial<ForemanSession> = {}): ForemanSession {
+  return payload({ session: meta(id), ...over });
+}
+
+function taskItem(id: string): TaskListItem {
+  return {
+    id,
+    project_id: 'p1',
+    title: `任务 ${id}`,
+    description: '',
+    status: 'pending',
+    current_stage: 'develop',
+    current_node: 'execute',
+    validate_attempts: 0,
+    pending_reason: null,
+    worktree_path: null,
+    branch_name: null,
+    stewardship: null,
+    total_tokens: 0,
+    total_calls: 0,
+    review_mode: 'agent',
+  } as TaskListItem;
+}
+
+function flush(): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, 0));
+}
+
+describe('台账生命周期（决策 354①）', () => {
+  it('reload：同一班重读时，已分页加载的更早消息并回头部（票 05 的不重不漏）', async () => {
+    reset(SESSION);
+    // 已通过「滚到顶加载」拿到更早的 1–3 行；重读只回最近的 4、5 两行——
+    // 直接盖上会把滚上去加载的那段历史变没
+    talk.session = payloadFor(SESSION, { messages: [row(1), row(2), row(3)] });
+    mocks.getForemanSessions.mockResolvedValue({ sessions: [meta(SESSION)] });
+    mocks.getForemanSession.mockResolvedValue(payloadFor(SESSION, { messages: [row(4), row(5)] }));
+    mocks.getForemanAttention.mockResolvedValue(ATTENTION);
+
+    const ok = await talk.reload();
+
+    expect(ok).toBe(true);
+    expect(talk.session?.messages.map((m) => m.id)).toEqual([1, 2, 3, 4, 5]);
+  });
+
+  it('reload：换班不并——另一班的账整包落屏，不掺上一班的残页', async () => {
+    reset(SESSION);
+    talk.session = payloadFor(SESSION, { messages: [row(1), row(2), row(3)] });
+    mocks.getForemanSessions.mockResolvedValue({ sessions: [meta('sess-2')] });
+    mocks.getForemanSession.mockResolvedValue(payloadFor('sess-2', { messages: [row(9)] }));
+    mocks.getForemanAttention.mockResolvedValue(ATTENTION);
+
+    await talk.reload('sess-2');
+
+    expect(talk.sessionId).toBe('sess-2');
+    expect(talk.session?.messages.map((m) => m.id)).toEqual([9]);
+  });
+
+  it('reload：切班后过期的回包整包丢弃（守卫跟着数据走，纪律不搬家）', async () => {
+    reset(SESSION);
+    talk.session = payloadFor(SESSION);
+    mocks.getForemanSessions.mockResolvedValue({ sessions: [meta('sess-2')] });
+    // 第一趟挂着不落地；在它回来之前人已经切去了 sess-2
+    let release!: (v: ForemanSession) => void;
+    mocks.getForemanSession.mockReturnValue(
+      new Promise<ForemanSession>((resolve) => (release = resolve)),
+    );
+    const pending = talk.reload('sess-2');
+    talk.watch('sess-3');
+    release(payloadFor('sess-2', { messages: [row(9)] }));
+    const ok = await pending;
+
+    expect(ok, '旧目标的台账整包作废').toBe(false);
+    expect(talk.sessionId).toBe('sess-3');
+    expect(talk.session?.session?.id, '在屏的台账不被旧回包拖回去').toBe(SESSION);
+  });
+
+  it('loadEarlier：更早一段接进头部，游标用当时的最老行；空段即到头', async () => {
+    reset(SESSION);
+    talk.session = payloadFor(SESSION, { messages: [row(5), row(6)] });
+    talk.hasMoreEarlier = true;
+    mocks.getForemanSession.mockResolvedValue({ messages: [row(3), row(4)] });
+
+    await talk.loadEarlier();
+
+    // 游标取的是请求那一刻的最老行（before_id=5）；段接在头部，顺序不乱
+    expect(mocks.getForemanSession).toHaveBeenCalledWith(SESSION, undefined, 'talk', 5);
+    expect(talk.session?.messages.map((m) => m.id)).toEqual([3, 4, 5, 6]);
+    // 没读满一段（500）就到头了：hasMoreEarlier 置假，这条路不再走到
+    expect(talk.hasMoreEarlier).toBe(false);
+    // 「不滚动」在 store 这一侧的落点：翻页只往头部接行，**不重排本屏**——上面钉住的是
+    // 只发了一跳取数，这里再钉住那一跳不是 `reload`（reload 会先重读列表、并动 loading /
+    // attention 那一排读数）。滚动几何是页面的活儿（`delegation-scan.test.ts` 钉着它留那边）。
+    expect(mocks.getForemanSessions, '向上翻页不重读列表').not.toHaveBeenCalled();
+
+    await talk.loadEarlier();
+    expect(mocks.getForemanSession, '到头后不再发第二跳').toHaveBeenCalledTimes(1);
+  });
+
+  it('归档坠落：切到最近活动的未归档班（刚归档的那班排在第一也不许「原地不动」）', async () => {
+    reset(SESSION);
+    mocks.archiveForemanSession.mockResolvedValue({ session: meta(SESSION) });
+    mocks.getForemanSessions.mockResolvedValue({
+      sessions: [meta(SESSION, { archived_at: '2026-09-25T01:00:00Z' }), meta('sess-2')],
+    });
+    mocks.getForemanSession.mockResolvedValue(payloadFor('sess-2', { messages: [row(1)] }));
+    mocks.getForemanAttention.mockResolvedValue(ATTENTION);
+
+    await talk.archiveAndFall(SESSION, { onArchived: () => {} });
+
+    expect(talk.sessionId, '落点是列表里第一个未归档班').toBe('sess-2');
+    expect(talk.session?.session?.id).toBe('sess-2');
+  });
+
+  it('归档坠落：一个不剩就新开一班（空班是合法状态）', async () => {
+    reset(SESSION);
+    mocks.archiveForemanSession.mockResolvedValue({ session: meta(SESSION) });
+    mocks.getForemanSessions.mockResolvedValue({ sessions: [] });
+    mocks.createForemanSession.mockResolvedValue({ session: meta('sess-new') });
+    mocks.getForemanSession.mockResolvedValue(payloadFor('sess-new'));
+    // openFreshSession 落点后的重读会带回**服务端已建好**的那一班——列表里自然有它
+    mocks.getForemanSessions.mockResolvedValue({ sessions: [meta('sess-new')] });
+    mocks.getForemanAttention.mockResolvedValue(ATTENTION);
+
+    await talk.archiveAndFall(SESSION, { onArchived: () => {} });
+
+    expect(talk.sessionId).toBe('sess-new');
+    expect(talk.sessionList.map((s) => s.id), '新开的班进列表').toEqual(['sess-new']);
+  });
+
+  it('pending 详情指纹去重（归 store 管）：集合不变不重拉，值守账不拉', async () => {
+    reset(null);
+    mocks.getTask.mockResolvedValue({ allowed_actions: [], cursors: [] });
+
+    talk.syncPendingDetails([taskItem('t1')], false);
+    await flush();
+    expect(mocks.getTask).toHaveBeenCalledTimes(1);
+
+    talk.syncPendingDetails([taskItem('t1')], false);
+    await flush();
+    expect(mocks.getTask, '指纹没变：不重拉').toHaveBeenCalledTimes(1);
+
+    // 类型变（pending_updated 换理由而 id 不变）要重拉
+    const changed = taskItem('t1');
+    changed.pending_reason = { type: 'info_insufficient' } as TaskListItem['pending_reason'];
+    talk.syncPendingDetails([changed], false);
+    await flush();
+    expect(mocks.getTask, '指纹变了：重拉').toHaveBeenCalledTimes(2);
+
+    talk.syncPendingDetails([taskItem('t1')], true);
+    await flush();
+    expect(mocks.getTask, '值守账只读：不拉那批详情').toHaveBeenCalledTimes(2);
+  });
+
+  it('seen 标记随 reload 收口：落点记进看过表，先有基线才不假亮（决策 220③）', async () => {
+    reset(SESSION);
+    talk.sessionList = [meta(SESSION), meta('sess-2')];
+    mocks.getForemanSessions.mockResolvedValue({
+      sessions: [meta(SESSION), meta('sess-2')],
+    });
+    mocks.getForemanSession.mockResolvedValue(
+      payloadFor(SESSION, {
+        session: meta(SESSION, { last_active_at: '2026-09-25T02:00:00Z' }),
+      }),
+    );
+    mocks.getForemanAttention.mockResolvedValue(ATTENTION);
+
+    await talk.reload();
+
+    expect(talk.seen[SESSION], '落点记它此刻的 last_active_at').toBe('2026-09-25T02:00:00Z');
+    expect(talk.seen['sess-2'], '没落到的班不记看过——它的新动静要亮').toBeUndefined();
   });
 });
