@@ -2,17 +2,12 @@ import type { ForemanMessage, ForemanProposal, ForemanSession } from '../api/typ
 import type { ForemanStreamState } from '../realtime/foreman';
 import {
   buildTurns,
-  carryLiveStepOpen,
-  carryLiveTurnOpen,
   prettyArgs,
-  settlingTurn,
   thinkTicker,
   turnName,
   watchDraftExcerpt,
   WATCH_DRAFT_MAX,
   type TalkTurnsInput,
-  type TurnStep,
-  type TurnView,
 } from './talkTurns';
 
 /**
@@ -78,6 +73,8 @@ function sessionOf(messages: ForemanMessage[], proposals: ForemanProposal[] = []
     total_tokens: 0,
     total_calls: 0,
     turn_in_flight: false,
+    // 这一段自己的分页尺（决策 354④）：回合构造不读它，形状要与真载荷一致
+    page_limit: 500,
     foreman: { agent_type: 'foreman', stage_key: 'architect-design', wired: true },
   };
 }
@@ -795,14 +792,16 @@ describe('快照与直播的拼接：在途半截行是基准（票 02）', () =
     expect(turns.map((t) => t.key)).toEqual(['m5']);
   });
 
-  it('没有在途行（快照里还没有半截行）：直播照旧摆整条流——既有路径一个字不动', () => {
+  it('没有在途行（快照里还没有半截行）：直播照旧摆整条流，键取事件上的行 id', () => {
     const stream = streamOf({
       events: [{ kind: 'delta', channel: 'content', text: '整条流', ledger_id: 5, seq: 3 }],
       steps: [textStep('整条流')],
       streaming: true,
     });
     const turns = buildTurns(inputOf({ session: sessionOf([message()]), following: true, stream }));
-    const live = turns.find((t) => t.key === 'live');
+    // 内容照旧是整条流；键由决策 354③ 定——首条带 `ledger_id` 的事件已到，故是 `m5`
+    // （快照里那条半截行随后读回来时用的也是同一个键，折叠态因此跨过这一拍）。
+    const live = turns.find((t) => t.key === 'm5');
     expect(live?.content).toBe('整条流');
   });
 
@@ -882,37 +881,12 @@ describe('乐观轮与台账 user 行的去重（票 02 of talk-live-identity）
 });
 
 /**
- * 展开详情的三件文案 / 行为规格（决策 301）。
+ * 展开详情的两件文案 / 行为规格（决策 301）。
  *
- * 它们都住在模块里而不是组件的回调里：取哪一行、折成什么形状、收口时谁接住——都是
- * **规格**（换一个实现就该红），不是排版细节。
+ * 它们都住在模块里而不是组件的回调里：取哪一行、折成什么形状——都是**规格**（换一个实现
+ * 就该红），不是排版细节。
  */
 describe('展开详情的规格（决策 301）', () => {
-  function stepOf(over: Partial<TurnStep> = {}): TurnStep {
-    return { key: 'm1-s0', kind: 'thinking', text: '', tool: null, live: false, ...over };
-  }
-
-  function viewOf(over: Partial<TurnView> = {}): TurnView {
-    return {
-      key: 'm1',
-      kind: 'fm',
-      content: '',
-      at: '',
-      streaming: false,
-      partial: false,
-      steps: [],
-      briefing: null,
-      needsPairing: false,
-      proposal: null,
-      ask: null,
-      askAnswered: false,
-      proactive: false,
-      attribution: null,
-      interruptedAt: null,
-      ...over,
-    };
-  }
-
   describe('thinkTicker：收起行里那一行「它想到哪了」', () => {
     it('取最后一行非空文本——推理是逐行往外写的，最后一行就是它此刻停在哪', () => {
       expect(thinkTicker('先看一遍\n再查台账\n正在核对第 3 条')).toBe('正在核对第 3 条');
@@ -958,68 +932,162 @@ describe('展开详情的规格（决策 301）', () => {
     });
   });
 
-  describe('settlingTurn：收口后谁接住在飞轮那一步的折叠态', () => {
-    it('取最后一条**带步骤**的落地轮', () => {
-      const older = viewOf({ key: 'm1', steps: [stepOf({ key: 'm1-s0' })] });
-      const newer = viewOf({ key: 'm2', steps: [stepOf({ key: 'm2-s0' })] });
-      expect(settlingTurn([older, newer])?.key).toBe('m2');
-    });
+});
 
-    it('在飞轮自己不算——它正是要被接住的那一个', () => {
-      const live = viewOf({ key: 'live', steps: [stepOf({ key: 'live-s0' })] });
-      const landed = viewOf({ key: 'm2', steps: [stepOf({ key: 'm2-s0' })] });
-      expect(settlingTurn([landed, live])?.key).toBe('m2');
-    });
+/**
+ * 在飞轮的渲染键（决策 354③）：**首条带 `ledger_id` 的事件到达即改用 `m<ledger_id>`**。
+ *
+ * 这一条键的存在性取代了整台「折叠态搬运机」（`settlingTurn` + `carryLiveStepOpen` +
+ * `carryLiveTurnOpen` + 组件 effect 的两段提交）。钉三件：
+ *   ① 乐观段（无事件）仍是 `live`，首事件一到就换键；
+ *   ② **换键瞬间没有任何可折叠内容**——乐观段零步骤，故 `live-s<i>` 从来没被写进折叠表；
+ *   ③ **收口后键不变**：在飞轮与落地轮的步骤键逐字相同（决策 301 的「手动展开不被自动打回」）。
+ */
+describe('在飞轮的渲染键（决策 354③）', () => {
+  /** 一条带位置戳的正文增量（`ledger_id` = 台账里那条在途半截行的 id）。 */
+  function stampedDelta(text: string, ledgerId: number, seq = 1) {
+    return { kind: 'delta' as const, channel: 'content' as const, text, ledger_id: ledgerId, seq };
+  }
 
-    it('失败轮 / 乐观轮 / 提议轮都不接（没有步骤，接住等于把人的展开态扔进画不出步骤的地方）', () => {
-      const landed = viewOf({ key: 'm7', steps: [stepOf({ key: 'm7-s0' })] });
-      const failed = viewOf({ key: 'send-error', kind: 'failed' });
-      expect(settlingTurn([landed, failed])?.key).toBe('m7');
-    });
+  it('乐观段是 `live`；首条带 `ledger_id` 的事件一到就换成 `m<id>`', () => {
+    // 还没收到任何事件：只剩那句「对面在动」的占位实情
+    const optimistic = buildTurns(inputOf({ sending: true }));
+    expect(optimistic.map((t) => t.key)).toEqual(['live']);
 
-    it('一轮带步骤的都没有时回 null——调用方据此不动任何折叠态', () => {
-      expect(settlingTurn([])).toBeNull();
-      expect(settlingTurn([viewOf({ key: 'm1' })])).toBeNull();
-    });
+    const firstEvent = buildTurns(
+      inputOf({
+        sending: true,
+        stream: streamOf({
+          events: [stampedDelta('第一段', 9)],
+          steps: [textStep('第一段')],
+          streaming: true,
+        }),
+      }),
+    );
+    expect(firstEvent.map((t) => t.key)).toEqual(['m9']);
   });
 
-  describe('carryLiveStepOpen：把在飞键上的人为展开态改成落地键', () => {
-    it('`live-s<i>` 按序号搬到落地轮的键上', () => {
-      expect(carryLiveStepOpen({ 'live-s0': true, 'live-s2': false }, 'm9')).toEqual({
-        'm9-s0': true,
-        'm9-s2': false,
-      });
-    });
+  it('换键瞬间没有可折叠内容：乐观段零步骤，故 `live-s<i>` 从来没进过折叠表', () => {
+    // 乐观段一个步骤都没有——「过程」那一组画不出东西，推理 / 工具行也不存在，
+    // 于是切换点上折叠表里不可能有 `live` / `live-s<i>` 的条目（换键不丢人的操作）。
+    expect(buildTurns(inputOf({ sending: true }))[0].steps).toEqual([]);
 
-    it('别轮的条目原样留着（只搬这一轮那一份）', () => {
-      expect(carryLiveStepOpen({ 'm3-s1': true, 'live-s0': true }, 'm9')).toEqual({
-        'm3-s1': true,
-        'm9-s0': true,
-      });
-    });
-
-    it('「过程」那一组的键（就是 `live`）不在这里搬——它走 carryLiveTurnOpen', () => {
-      expect(carryLiveStepOpen({ live: true }, 'm9')).toEqual({});
-      expect(carryLiveStepOpen({ live: true, 'live-s0': true }, 'm9')).toEqual({ 'm9-s0': true });
-    });
-
-    it('这一份里没有在飞键时**原样返回同一个对象**：不写一次同值的新对象去白触发效果', () => {
-      const map = { 'm3-s1': true };
-      expect(carryLiveStepOpen(map, 'm9')).toBe(map);
-    });
+    const firstEvent = buildTurns(
+      inputOf({
+        sending: true,
+        stream: streamOf({
+          events: [{ kind: 'delta', channel: 'reasoning', text: '先想', ledger_id: 9, seq: 1 }],
+          steps: [thinkStep('先想')],
+          streaming: true,
+        }),
+      }),
+    );
+    // 首事件渲染出来的步骤键**从一开始就是** `m9-s0`
+    expect(firstEvent[0].steps.map((s) => s.key)).toEqual(['m9-s0']);
   });
 
-  describe('carryLiveTurnOpen：「过程」那一组按整条轮键搬', () => {
-    it('`live` 那一份落到落地轮的键上，旧键随之消失', () => {
-      expect(carryLiveTurnOpen({ live: false, 'm1': true }, 'm9')).toEqual({
-        'm1': true,
-        'm9': false,
-      });
-    });
+  it('收口后键不变：在飞轮与落地轮的步骤键逐字相同', () => {
+    const live = buildTurns(
+      inputOf({
+        sending: true,
+        stream: streamOf({
+          events: [{ kind: 'delta', channel: 'reasoning', text: '想过什么', ledger_id: 9, seq: 1 }],
+          steps: [thinkStep('想过什么')],
+          streaming: true,
+        }),
+      }),
+    );
+    expect(live.map((t) => t.key)).toEqual(['m9']);
 
-    it('没有 `live` 条目时原样返回同一个对象', () => {
-      const map = { 'm1': true };
-      expect(carryLiveTurnOpen(map, 'm9')).toBe(map);
+    // 收口：流倒空、台账里**同一个 id** 的那一行接管（`settleTurn` → `reload`）。
+    const landed = buildTurns(
+      inputOf({
+        session: sessionOf([
+          message({ id: 9, kind: 'fm', segments: [{ kind: 'thinking', text: '想过什么' }] }),
+        ]),
+      }),
+    );
+    expect(landed.map((t) => t.key)).toEqual(['m9']);
+    expect(landed[0].steps.map((s) => s.key)).toEqual(live[0].steps.map((s) => s.key));
+  });
+
+  it('快照里那条在途半截行优先于事件：拼进去的那一路仍用行 id（既有路径）', () => {
+    // 事件上的 `ledger_id` 与快照那条半截行是**同一条行**；base 在手时以它为准
+    // （事件可能一条都还没到，而快照已经说了这一轮在半途）。
+    const turns = buildTurns(
+      inputOf({
+        session: sessionOf([message({ id: 5, status: 'in_flight', content: '半句', seq: 3 })]),
+        following: true,
+        stream: streamOf({ steps: [textStep('半句')], streaming: true }),
+      }),
+    );
+    expect(turns.map((t) => t.key)).toEqual(['m5']);
+  });
+
+  it('事件不带 `ledger_id`（老后端 / 流水线事件）：键仍是 `live`，与从前逐字一致', () => {
+    const turns = buildTurns(
+      inputOf({
+        sending: true,
+        stream: streamOf({ steps: [textStep('老后端只说这些')], streaming: true }),
+      }),
+    );
+    expect(turns.map((t) => t.key)).toEqual(['live']);
+  });
+
+  /**
+   * 收口那一拍的**同键共存**：`reload` 已经把落地那一行写进 `session`，而 store 还
+   * 没倒空现场（`settleTurn` 在 `reload` 返回之后）——这一拍里在飞轮与落地轮本是同一条行。
+   *
+   * 两条都摆出来会是同一轮说两遍，而且**同一个渲染键出现两次**（`Talk.svelte` 是
+   * `{#each turns as turn (turn.key)}`，同键是坏形状）。故在飞轮在那一拍整条退场：
+   * 台账那一行是权威（带完整回话与段序），在飞轮只是上一个时态的残影。
+   */
+  it('落地行在场时在飞轮整条退场：同一轮不许摆两遍、同一个渲染键不许出现两次', () => {
+    const settled = message({
+      id: 9,
+      kind: 'fm',
+      content: '权威回话',
+      segments: [{ kind: 'thinking', text: '想过什么' }],
     });
+    const turns = buildTurns(
+      inputOf({
+        session: sessionOf([settled]),
+        sending: true,
+        // 现场还没倒空：事件仍攥着这一轮的位置戳（`settleForemanStream` 保住的最后一份）
+        stream: streamOf({
+          events: [
+            { kind: 'delta', channel: 'reasoning', text: '想过什么', ledger_id: 9, seq: 1 },
+            { kind: 'delta', channel: 'content', text: '权威回话', ledger_id: 9, seq: 2 },
+          ],
+          steps: [thinkStep('想过什么'), textStep('权威回话')],
+          streaming: false,
+        }),
+      }),
+    );
+
+    expect(turns.map((t) => t.key)).toEqual(['m9']);
+    expect(new Set(turns.map((t) => t.key)).size).toBe(turns.length);
+    expect(turns[0].content).toBe('权威回话');
+    // 步骤键仍是那一套（折叠态在切换前后是同一份）
+    expect(turns[0].steps.map((s) => s.key)).toEqual(['m9-s0']);
+  });
+
+  it('中断行（重启恢复标的终态）同样让在飞轮退场：那一条行才是这一轮的终点', () => {
+    const turns = buildTurns(
+      inputOf({
+        session: sessionOf([
+          message({ id: 9, kind: 'fm', status: 'interrupted', interrupted_at: '2026-09-23T10:05:00Z' }),
+        ]),
+        following: true,
+        stream: streamOf({
+          events: [{ kind: 'delta', channel: 'content', text: '断之前说的', ledger_id: 9, seq: 1 }],
+          steps: [textStep('断之前说的')],
+          streaming: false,
+        }),
+      }),
+    );
+
+    expect(turns.map((t) => t.key)).toEqual(['m9']);
+    expect(turns[0].interruptedAt).toBe('2026-09-23T10:05:00Z');
   });
 });

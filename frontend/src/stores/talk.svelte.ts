@@ -49,12 +49,6 @@ import { isPairingRequired } from '../lib/sharePairing';
 import { router, writeQuery } from '../router.svelte';
 
 /**
- * 与后端 `routes/foreman.rs::SESSION_PAGE_LIMIT` 同一个数——判「首屏读满」的尺。
- * （决策 354 附注，票 04：将由 `GET /foreman/session` 应答回显的 `page_limit` 取代。）
- */
-const SESSION_PAGE_LIMIT = 500;
-
-/**
  * 对讲台的**在飞现场**（决策 275）：这一轮正在产的步骤、正在等的那一趟回话，
  * 以及那条 `/foreman/stream` 连接，全住在这里——**页面来去，它不动**。
  *
@@ -212,8 +206,8 @@ class TalkStore {
    *
    * 自决策 301 的组件作用域搬进 store——它们描述的是**那一轮**，不是这一屏，页面来去
    * 不该把它们重置（「本机发送中」与「回来接上」的形态差有一半就差在这）。键随轮稳定
-   * （台账轮锚 `m<id>`、在飞轮拼到半截行时直接用行 id），收口不再需要搬键；
-   * `live` 键只剩本机发送那一趟在用，收口接力照旧（`carryLive*Open`）。
+   * （台账轮锚 `m<id>`；在飞轮自决策 354③ 起在首条带 `ledger_id` 的事件到达后同样是行 id），
+   * 收口后台账那一行**同键接管**——搬运机（`carryLive*Open` / `settlingTurn`）已整段删除。
    * 不进 localStorage：跨页面存活、**不跨刷新**（决策 217 的边界一字不动）。
    */
   receiptOpen = $state<Record<string, boolean>>({});
@@ -255,9 +249,12 @@ class TalkStore {
   loadErrorPairing = $state(false);
 
   /**
-   * 上面还有更早的消息没加载（票 05：向上游标）。**首屏读满 `SESSION_PAGE_LIMIT`
-   * 条才置真**——500 条内的班次这条路径一次都不会走到，加载与从前逐字一致、零额外
+   * 上面还有更早的消息没加载（票 05：向上游标）。**这一段读满后端回显的 `page_limit`
+   * 条才置真**——这个数以内的班次这条路径一次都不会走到，加载与从前逐字一致、零额外
    * 请求；到头（游标回空段）置假，不再有向上的动作。
+   *
+   * 判据只有一处（{@link markHasMore}）：读数来自载荷自己的 `page_limit`（决策 354④），
+   * 前端不再留一个「与后端同一个数」的常量——跨线的数值只有一个主人。
    */
   hasMoreEarlier = $state(false);
 
@@ -811,7 +808,7 @@ class TalkStore {
       if (!mine()) return false;
       this.sessionList = list.sessions;
       const landed = payload.session?.id ?? null;
-      // 同一班的重读（一轮落地后常见）：**已在屏的更早段留着**——重读只回最近 500 条，
+      // 同一班的重读（一轮落地后常见）：**已在屏的更早段留着**——重读只回最近一页，
       // 直接盖上去会把滚上去加载的那段历史变没（票 05：已加载的消息不重不漏）。
       // 换班（`landed !== prevId`）不并：那是另一班的账。
       const prevId = this.session?.session?.id ?? null;
@@ -821,8 +818,8 @@ class TalkStore {
         if (older.length > 0) payload.messages = [...older, ...fresh];
       }
       this.session = payload;
-      // 首屏读满才有「更上一层」可言；同一班重读也按这一拍重算（台账可能长过了 500）。
-      this.hasMoreEarlier = fresh.length >= SESSION_PAGE_LIMIT;
+      // 首屏读满才有「更上一层」可言；同一班重读也按这一拍重算（台账可能长过了这一页）。
+      this.markHasMore(fresh.length, payload);
       this.watch(landed);
       this.rememberLanding(landed, payload.session);
       // 重新接上一轮（决策 260 / 275）：服务端说这一班此刻有一轮在跑，而本机没在等它
@@ -842,6 +839,19 @@ class TalkStore {
     } finally {
       this.loading = false;
     }
+  }
+
+  /**
+   * 这一段读到的条数**读满了没有**——分页语义的全部判据（决策 354④）。
+   *
+   * 读尺来自载荷自己的 `page_limit`（后端回显的那个常量，加性字段）：读满才可能还有更早
+   * 的一段；空段即到底（0 < `page_limit`，同一判据自然给出假，调用方那处早退还负责
+   * 「没接上新段」这个返回值的语义）。两个取数口（{@link reload} 最近一段、
+   * {@link loadEarlier} 更早一段）都走它——此前那两处各写一遍比较，而比较里的那个数
+   * 还靠一条注释与后端隔线对齐。
+   */
+  private markHasMore(got: number, payload: ForemanSession): void {
+    this.hasMoreEarlier = got >= payload.page_limit;
   }
 
   /**
@@ -875,8 +885,8 @@ class TalkStore {
       if (this.session) {
         this.session = { ...this.session, messages: [...older, ...this.session.messages] };
       }
-      // 整段读满才可能还有更上一层（后端每段最多 500 条）。
-      this.hasMoreEarlier = older.length >= SESSION_PAGE_LIMIT;
+      // 整段读满才可能还有更上一层（后端每段最多 `page_limit` 条）。
+      this.markHasMore(older.length, page);
       return true;
     } catch {
       // 读失败不碰现场：游标没变、位置没动，下次滚到顶重试。

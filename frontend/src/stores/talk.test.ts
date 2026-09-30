@@ -99,6 +99,8 @@ function payload(over: Partial<ForemanSession> = {}): ForemanSession {
     total_tokens: 0,
     total_calls: 0,
     turn_in_flight: false,
+    // 这一段自己的分页尺（决策 354④）：`hasMoreEarlier` 只认它
+    page_limit: 500,
     foreman: { agent_type: 'foreman', stage_key: 'foreman', wired: true },
     ...over,
   };
@@ -545,14 +547,15 @@ describe('台账生命周期（决策 354①）', () => {
     reset(SESSION);
     talk.session = payloadFor(SESSION, { messages: [row(5), row(6)] });
     talk.hasMoreEarlier = true;
-    mocks.getForemanSession.mockResolvedValue({ messages: [row(3), row(4)] });
+    // 更早一段只回了 2 条（远没读满一页）：到头即止由 `page_limit` 那条判据给出
+    mocks.getForemanSession.mockResolvedValue(payloadFor(SESSION, { messages: [row(3), row(4)] }));
 
     await talk.loadEarlier();
 
     // 游标取的是请求那一刻的最老行（before_id=5）；段接在头部，顺序不乱
     expect(mocks.getForemanSession).toHaveBeenCalledWith(SESSION, undefined, 'talk', 5);
     expect(talk.session?.messages.map((m) => m.id)).toEqual([3, 4, 5, 6]);
-    // 没读满一段（500）就到头了：hasMoreEarlier 置假，这条路不再走到
+    // 没读满一页（2 < 500）就到头了：hasMoreEarlier 置假，这条路不再走到
     expect(talk.hasMoreEarlier).toBe(false);
     // 「不滚动」在 store 这一侧的落点：翻页只往头部接行，**不重排本屏**——上面钉住的是
     // 只发了一跳取数，这里再钉住那一跳不是 `reload`（reload 会先重读列表、并动 loading /
@@ -561,6 +564,33 @@ describe('台账生命周期（决策 354①）', () => {
 
     await talk.loadEarlier();
     expect(mocks.getForemanSession, '到头后不再发第二跳').toHaveBeenCalledTimes(1);
+  });
+
+  it('分页尺从载荷取（决策 354④）：`page_limit` 说了算，前端不留那个数', async () => {
+    reset(SESSION);
+    // 后端这一段回显的尺是 2（不是 500）：读满 2 条即「可能还有更早」。
+    // 判据若还挂着前端那个 500 的常量，下面第一处断言就会红——这正是本票要钉的形状。
+    mocks.getForemanSessions.mockResolvedValue({ sessions: [meta(SESSION)] });
+    mocks.getForemanSession.mockResolvedValue(
+      payloadFor(SESSION, { messages: [row(4), row(5)], page_limit: 2 }),
+    );
+    mocks.getForemanAttention.mockResolvedValue(ATTENTION);
+
+    await talk.reload();
+    expect(talk.hasMoreEarlier, '读满一页（2/2）').toBe(true);
+
+    // 同一把尺在向上翻页那一侧同样生效：回满一段仍可能还有、回不满即到头
+    mocks.getForemanSession.mockResolvedValue(
+      payloadFor(SESSION, { messages: [row(2), row(3)], page_limit: 2 }),
+    );
+    await talk.loadEarlier();
+    expect(talk.hasMoreEarlier, '更早一段也读满（2/2）').toBe(true);
+
+    mocks.getForemanSession.mockResolvedValue(
+      payloadFor(SESSION, { messages: [row(1)], page_limit: 2 }),
+    );
+    await talk.loadEarlier();
+    expect(talk.hasMoreEarlier, '只回 1 条（1/2）即到底').toBe(false);
   });
 
   it('归档坠落：切到最近活动的未归档班（刚归档的那班排在第一也不许「原地不动」）', async () => {

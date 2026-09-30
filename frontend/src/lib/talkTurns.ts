@@ -6,7 +6,7 @@ import type {
   ForemanSession,
   ForemanTrace,
 } from '../api/types';
-import type { ForemanLiveStep, ForemanStreamState } from '../realtime/foreman';
+import type { ForemanLiveEvent, ForemanLiveStep, ForemanStreamState } from '../realtime/foreman';
 import { foldForemanEvents, spliceAccepts } from '../realtime/foreman';
 
 /**
@@ -324,6 +324,31 @@ function mergeInFlightSteps(
   return { steps: drafts, reply: utterance };
 }
 
+/**
+ * 在飞轮的**渲染键**（决策 354③）。
+ *
+ * **首条带 `ledger_id` 的事件到达即改用 `m<ledger_id>`，此后恒定到收口**。那个 id 就是
+ * 台账里正在跑的那条半截行（后端收口时写的是**同一行**，`registry.rs::LiveTurn::close`
+ * 把它从 `in_flight` 落成正常行），故「在飞」与「落地」两态共用同一个渲染键——人在这期间
+ * 点开的推理 / 工具详情**不需要任何搬运**就跟着走到落地轮上。决策 301 的「收口接力」因此
+ * 从一件机制（`carryLiveStepOpen` / `carryLiveTurnOpen` / `settlingTurn` + 组件 effect 的
+ * 两段提交）退化成一条键的存在性。
+ *
+ * 乐观段（还没收到任何事件）保留 `live`：那时思考体尚未渲染、一个可折叠的块都没有，
+ * 切换点因此在「首条事件」——彼时折叠态本来就是空的，换键不会丢任何人的操作。
+ * 事件不带 `ledger_id`（老后端只发增量 / 流水线事件）时也只有 `live` 可用，与从前逐字一致。
+ *
+ * `base`（快照里那条在途半截行）优先：它与事件上的 `ledger_id` 是同一条行，
+ * 而快照在手时它更权威（事件可能一条都还没到，见 `mergeLive`）。
+ */
+function liveTurnKey(base: { id: number } | null, events: readonly ForemanLiveEvent[]): string {
+  if (base != null) return `m${base.id}`;
+  for (const ev of events) {
+    if (ev.ledger_id != null) return `m${ev.ledger_id}`;
+  }
+  return 'live';
+}
+
 /** {@link buildTurns} 的四个响应式输入加一个回调——全都是平凡值，组件原样传入。 */
 export interface TalkTurnsInput {
   /** 会话台账（`messages` 归落地轮、`proposals` 归提议轮）。`null` = 这台机器还没有班次。 */
@@ -473,37 +498,49 @@ export function buildTurns(input: TalkTurnsInput): TurnView[] {
     });
   }
   // 在途半截行**不再单独成轮**（票 02 of talk-live-identity）：它要么已拼进 live 轮
-  // （`mergeLive`，渲染键直接用行 id——收口后台账那一行同键接管，折叠态因此不用搬），
-  // 要么仍按落地式渲染在台账位置（死轮收口前）——后一种情形**不另摆占位句那一轮**
-  // （旧判据「有在途行时只看尾巴」的原口径）。没有在途行时条件与从前逐字一致。
+  // （`mergeLive`），要么仍按落地式渲染在台账位置（死轮收口前）——后一种情形**不另摆
+  // 占位句那一轮**（旧判据「有在途行时只看尾巴」的原口径）。没有在途行时条件与从前逐字一致。
+  // 两条路的渲染键都由 {@link liveTurnKey} 给：拼进去那一路是行 id，本机发送那一路在
+  // 首条带 `ledger_id` 的事件到达后同样是行 id——收口后台账那一行**同键接管**。
   const showLive =
     mergeLive || (base == null && (sending || following || tailSteps.length > 0));
   if (showLive) {
-    const liveTurnKey = mergeLive && base != null ? `m${base.id}` : 'live';
-    const live =
-      mergeLive && baseRow != null
-        ? mergeInFlightSteps(baseRow, tailSteps.map(stepFromLive), stream.streaming)
-        : liveStepsFrom(tailSteps, stream.streaming);
-    out.push({
-      key: liveTurnKey,
-      kind: 'fm',
-      // 还没收到第一个增量时不摆空白：给一句"对面在动"的实情，光标说明还在流。
-      // 值守账上的对面是**值守轮**（票 04）：没有人的那句话可接，占位句说的「正在跑」
-      // ——`turn_in_flight` 在这本账上的全部用途就是这一句（票面原话）。
-      content: live.reply || (watchLedger ? '值守正在跑…' : '值班长正在查台账…'),
-      at: '',
-      streaming: stream.streaming,
-      partial: !stream.streaming && live.reply.length > 0,
-      steps: keyed(live.steps, liveTurnKey),
-      briefing: null,
-      needsPairing: false,
-      proposal: null,
-      ask: null,
-      askAnswered: false,
-      proactive: false,
-      attribution: null,
-      interruptedAt: null,
-    });
+    // 键在首条带 `ledger_id` 的事件到达时就从 `live` 换成 `m<ledger_id>`，此后不变
+    // （决策 354③）——折叠态因此天然跟着走，没有搬运这一步。
+    const key = liveTurnKey(base, stream.events);
+    // **那一行已经落地摆出来了**（键相同 ⇒ 台账里那条行在 `out` 里）时在飞轮整条退场：
+    // 两条都是同一轮、同一个渲染键——keyed each 里同键出现两次是坏形状，而人也会看见
+    // 这一轮说两遍。这**不是** `mergeLive` 那条路（那条路上半截行被摘出去了，`out` 里没有
+    // 它），而是它收口之后、store 倒空现场之前那一拍：`sendTurn` 里「重读落地 → settleTurn」
+    // 之间、以及重启恢复把悬挂行标成 `interrupted` 之后，都会走到这里。此刻台账那一行是
+    // 权威（带着完整回话与段序），在飞轮只是上一个时态的残影——判据与 `syncFollowing`
+    // 那条「尾巴是上一轮的残渣，台账那一行会把它接住」同一条纪律，只是判在渲染上、早一拍。
+    if (!out.some((t) => t.key === key)) {
+      const live =
+        mergeLive && baseRow != null
+          ? mergeInFlightSteps(baseRow, tailSteps.map(stepFromLive), stream.streaming)
+          : liveStepsFrom(tailSteps, stream.streaming);
+      out.push({
+        key,
+        kind: 'fm',
+        // 还没收到第一个增量时不摆空白：给一句"对面在动"的实情，光标说明还在流。
+        // 值守账上的对面是**值守轮**（票 04）：没有人的那句话可接，占位句说的「正在跑」
+        // ——`turn_in_flight` 在这本账上的全部用途就是这一句（票面原话）。
+        content: live.reply || (watchLedger ? '值守正在跑…' : '值班长正在查台账…'),
+        at: '',
+        streaming: stream.streaming,
+        partial: !stream.streaming && live.reply.length > 0,
+        steps: keyed(live.steps, key),
+        briefing: null,
+        needsPairing: false,
+        proposal: null,
+        ask: null,
+        askAnswered: false,
+        proactive: false,
+        attribution: null,
+        interruptedAt: null,
+      });
+    }
   }
   // 本地那条传输层失败轮（决策 337）：台账已经用自己那一行记下这次失败时**不摆它**——
   // 同一个失败在时间线里摆成两轮是这张表挡下的形状；请求根本没到后端（断网 / 代理 502 /
@@ -628,61 +665,3 @@ export function prettyArgs(args: string): string {
   }
 }
 
-/**
- * 收口时接住在飞轮那一步折叠态的**是哪一轮**（决策 301）：最后一条**带步骤**的落地轮。
- *
- * 「带步骤」这一条是判据的全部：失败轮、乐观轮、提议轮与提问轮都没有步骤，落到它们身上
- * 等于把人的展开态扔进一个画不出步骤的地方（而那一轮本身也不是在飞轮的接任者）。
- *
- * 判据抽出来与 `watchDraftExcerpt` 同一理由：它是**行为规格**（谁接住），该有机器门。
- */
-export function settlingTurn(list: TurnView[]): TurnView | null {
-  for (let i = list.length - 1; i >= 0; i -= 1) {
-    const t = list[i];
-    if (t.key !== 'live' && t.steps.length > 0) return t;
-  }
-  return null;
-}
-
-/**
- * 把记在在飞键（`live-s<i>`）上的人为折叠态搬到落地轮的键上（决策 301）。
- *
- * 在飞轮的渲染键是常量 `'live'`，落地那一轮是 `m<id>`——键一换，人在流式期间点开的
- * 推理 / 工具详情就会全部失联、在收口那一刻自己合上。只搬**有条目的**（= 人碰过的）：
- * 没碰过的块在两个 map 里根本没有条目，落地后照默认态收起，这正是「收口自动折叠」
- * 要的那一半，而它是白拿的。
- *
- * 步号对齐：落地段序与流上段序由同一份数据归出来（本模块），`-s<i>` 的序号在两侧一致；
- * 步数不一时按序号取交集，多出来的落地步用默认态。
- */
-export function carryLiveStepOpen(
-  map: Record<string, boolean>,
-  landedKey: string,
-): Record<string, boolean> {
-  // 这一份里根本没有在飞键（`live` / `live-s<i>`）时**原样返回同一个对象**：
-  // 不写一次同值的新对象去白触发依赖它的那些效果。
-  const keys = Object.keys(map);
-  if (!keys.some((k) => k === 'live' || /^live-s\d+$/.test(k))) return map;
-  const next: Record<string, boolean> = {};
-  for (const [key, open] of Object.entries(map)) {
-    const m = /^live-s(\d+)$/.exec(key);
-    if (m) next[`${landedKey}-s${m[1]}`] = open;
-    // `live`（整条轮键那一份）在这里就此丢掉——它归 `carryLiveTurnOpen` 搬。
-    else if (key !== 'live') next[key] = open;
-  }
-  return next;
-}
-
-/**
- * 「过程」那一组的键**就是轮键**，故搬法是整条改键（决策 301）。
- * 同样只在确有条目时动手。
- */
-export function carryLiveTurnOpen(
-  map: Record<string, boolean>,
-  landedKey: string,
-): Record<string, boolean> {
-  if (!('live' in map)) return map;
-  const next = { ...map, [landedKey]: map['live'] };
-  delete next['live'];
-  return next;
-}

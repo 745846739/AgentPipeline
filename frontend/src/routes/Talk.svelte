@@ -64,10 +64,7 @@
   } from '../lib/talkSessions';
   import {
     buildTurns,
-    carryLiveStepOpen,
-    carryLiveTurnOpen,
     prettyArgs,
-    settlingTurn,
     thinkTicker,
     turnName,
     watchDraftExcerpt,
@@ -325,7 +322,8 @@
    * **三张表自票 03 of talk-live-identity 起住在 store**（`talk.receiptOpen` 等）：
    * 展开态描述的是**那一轮**、不是这一屏——组件作用域的话，切页回来全被重置成默认态
    * （「回来方式就不对」的另一半）。键随轮稳定：台账轮锚 `m<id>`；在飞轮拼到半截行时
-   * 渲染键就是行 id，收口后台账那一行同键接管，不再需要搬键。跨页面存活、不跨刷新。
+   * 渲染键就是行 id，而本机发送那一趟自决策 354③ 起在首条带 `ledger_id` 的事件到达后
+   * 同样换成行 id——收口后台账那一行同键接管，不需要搬运。跨页面存活、不跨刷新。
    */
   /** 工具回执标签（`GET /foreman/tools`，取数一次缓存，决策 247⑤）。空表 = 还没回来，原样显示工具名。 */
   let toolLabels = $state<Record<string, string>>({});
@@ -924,44 +922,6 @@
       if (!live.has(key) || thinkPeeked.has(key)) continue;
       el.scrollTop = el.scrollHeight;
     }
-  });
-
-  /**
-   * 收口时把人碰过的折叠态交给落地那一轮（决策 301）——**这就是「什么时候自动折叠」
-   * 在这套受控折叠里的真身**。在飞轮的渲染键是常量 `'live'`，落地那一轮是 `m<id>`；
-   * 键一换，人在流式期间点开的推理 / 工具详情就会失联、在收口那一刻自己合上。
-   *
-   * 另一半是白拿的：**没碰过的块本来就默认收起**（map 里没有它们的条目），故「收口时把
-   * 没碰过的收起」不需要任何动作——要做的只有一件事，把人碰过的带过去。这与 ZCode 的
-   * `autoCollapseKey` + `userInteracted` 是同一件事的两面。判据全在 `lib/talkTurns.ts`。
-   */
-  let liveSeen = false;
-  /** 在飞轮在屏时认下的那一班（票 01：换班判据从 `generation` 换成 store 的 `sessionId`）。 */
-  let liveSid: string | null = null;
-
-  $effect(() => {
-    const list = turns;
-    if (list.some((t) => t.key === 'live')) {
-      liveSeen = true;
-      liveSid = untrack(() => talk.sessionId);
-      return;
-    }
-    if (!liveSeen) return;
-    // 换班了：这点折叠态属于已经不显示的那一班（与决策 204⑥ 同一条纪律），就地作废。
-    if (liveSid !== untrack(() => talk.sessionId)) {
-      liveSeen = false;
-      return;
-    }
-    // **在飞轮先退场、台账那一行后到**那一拍（两条状态各写各的时刻）：留着等下一拍，
-    // 别把记下的态丢了——丢了就退回「人点开的块自己合上」那个现象。
-    const landed = settlingTurn(list);
-    if (!landed) return;
-    liveSeen = false;
-    // 拼到半截行上的在飞轮（渲染键 = 行 id）**不需要搬**：收口后台账那一行同键接管；
-    // 只有本机发送那条路（键 `'live'`）才要这一跳（票 03 of talk-live-identity）。
-    talk.thinkingOpen = carryLiveStepOpen(talk.thinkingOpen, landed.key);
-    talk.toolOpen = carryLiveStepOpen(talk.toolOpen, landed.key);
-    talk.receiptOpen = carryLiveTurnOpen(talk.receiptOpen, landed.key);
   });
 
   /**

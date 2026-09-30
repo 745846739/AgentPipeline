@@ -64,6 +64,10 @@ use crate::stream::SSE_KEEPALIVE_INTERVAL;
 /// 根本读不到）。立场改为「**500 缺省 + 向上游标**」：缺省一次读最近 500 条（500 条内
 /// 的班次与从前逐字相同、零额外请求），更早的由 `?before_id=` 游标往上滚着补——
 /// 「滚上去接着看」仍旧不需要人写代码，只是从「不支持」变成了滚轮本身。
+///
+/// **它随应答回显**（决策 354④）：前端判「这一段读满了没有」要用它——此前那份判据
+/// 靠一条注释与一个前端常量隔线对齐（「与后端同一个数」），改一边忘一边就是静默的
+/// 分页错位。回显之后这个数只有**一个主人**（本常量），前端从载荷取值。
 const SESSION_PAGE_LIMIT: usize = 500;
 
 /// `GET /foreman/tools`：清单的**回执标签**（决策 247⑤）。
@@ -1171,6 +1175,10 @@ fn session_not_found(id: &str) -> ApiError {
 /// `turn_in_flight` 是**第五个位置**（决策 260）：这一班此刻有没有一轮在跑。它不是台账里
 /// 的一行（回话落库才算数），而是进程内登记的直接读数（`foreman_turn_in_flight`），
 /// 界面刷新之后靠它重新接上「正在说话」那一轮——详见该函数的说明。
+///
+/// `page_limit` 是**第六个位置**（决策 354④，加性字段）：这一段 `messages` 至多回这么多条。
+/// 前端拿它判「读满了没有」——空班次那一支照样给（既保持载荷形状恒定，也让前端那条判据
+/// 不必为「还没有班次」分岔）。
 async fn session_payload(
     state: &AppState,
     store: &Store,
@@ -1185,6 +1193,7 @@ async fn session_payload(
             "total_tokens": 0,
             "total_calls": 0,
             "turn_in_flight": false,
+            "page_limit": SESSION_PAGE_LIMIT,
             "foreman": foreman_identity(state),
         }));
     };
@@ -1213,6 +1222,9 @@ async fn session_payload(
         "total_tokens": total_tokens,
         "total_calls": total_calls,
         "turn_in_flight": agentpipeline_core::pipeline::foreman_turn_in_flight(&session.id),
+        // 这一段自己的分页尺（决策 354④）：`messages` 每一次至多这么多条，前端据此判
+        // 「读满了没有」（`hasMoreEarlier`）——跨线的数值只有这一个主人。
+        "page_limit": SESSION_PAGE_LIMIT,
         "foreman": foreman_identity(state),
     }))
 }

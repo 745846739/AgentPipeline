@@ -1143,6 +1143,10 @@ export interface ForemanMessage {
  * （回话落库才算数），故刷新页面会把它重新问一遍——界面据它决定要不要接着把增量
  * 接进时间线（判据：接手锚点 `realtime/foreman.ts::maxLedgerId`、落地 `turnLanded`、
  * 接线在 `Talk.svelte` 的 `followingSince`）。
+ *
+ * `page_limit` 是**这一段自己的分页尺**（决策 354④，加性字段）：`messages` 至多这么多条。
+ * 前端判「这一段读满了没有」（`stores/talk.svelte.ts` 的 `hasMoreEarlier`）只认它——
+ * 此前那份判据靠一条注释与一个前端常量隔线对齐，改一边忘一边就是静默的分页错位。
  */
 export interface ForemanSession {
   session: ForemanSessionMeta | null;
@@ -1151,6 +1155,7 @@ export interface ForemanSession {
   total_tokens: number;
   total_calls: number;
   turn_in_flight: boolean;
+  page_limit: number;
   foreman: { agent_type: string; stage_key: string; wired: boolean };
 }
 

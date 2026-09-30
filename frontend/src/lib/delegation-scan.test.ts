@@ -356,6 +356,55 @@ describe('发送编排只有一处（决策 354②：串台守卫收成 claim，
   });
 });
 
+/**
+ * 在飞轮的渲染键（决策 354③）：首条带 `ledger_id` 的事件到达即改用 `m<ledger_id>`，
+ * 于是「在飞」与「落地」两态**共用同一个键**——折叠态搬运机（`settlingTurn` +
+ * `carryLiveStepOpen` + `carryLiveTurnOpen` + 组件 effect）整段退场。
+ *
+ * 反面牙齿（换文件不等于放松）：这四件在页面、store、模块三处都不许再出现；页面里
+ * 连更宽的 `sessionId !==` 拼法也不许有——票 02 那条已知边界（`liveSid` 会误伤更宽的
+ * 反向扫描）随本票一起消失，故这里把扫描面放宽到它能放宽的全部。
+ */
+describe('在飞轮键只有一处（决策 354③：搬运机整段退场）', () => {
+  const talk = mask(read('routes/Talk.svelte'), true);
+  const store = mask(read('stores/talk.svelte.ts'), false);
+  const turns = mask(read('lib/talkTurns.ts'), false);
+
+  it('键的判据只有一处：回合构造里那一个派生（`liveTurnKey`）', () => {
+    expect(turns, '该有唯一定义').toContain('function liveTurnKey(');
+    expect(turns, '在飞轮那一支读它').toContain('const key = liveTurnKey(base, stream.events);');
+    expect(turns, '`ledger_id` 是那条判据的输入').toContain('if (ev.ledger_id != null) return');
+  });
+
+  it('同一轮只摆一遍：落地行在场时在飞轮整条退场（同键不许出现两次）', () => {
+    // 两态同键带来的一条新守卫（票 03 注记 ⑤，e2e 闸门逼出来的）：收口那一拍
+    // （`reload` 已写落地行、`settleTurn` 还没倒空现场）两条本会同时出现，
+    // 而 `Talk.svelte` 的 keyed each 对同键抛错（`svelte.dev/e/each_key_duplicate`）。
+    expect(turns, '在飞轮入栈前要查同键那一行在不在').toContain(
+      'if (!out.some((t) => t.key === key)) {',
+    );
+  });
+
+  it('搬运机三处都不在了（页面 / store / 模块）', () => {
+    for (const [name, src] of [
+      ['routes/Talk.svelte', talk],
+      ['stores/talk.svelte.ts', store],
+      ['lib/talkTurns.ts', turns],
+    ] as const) {
+      for (const gone of ['carryLiveStepOpen', 'carryLiveTurnOpen', 'settlingTurn']) {
+        expect(src.includes(gone), `${name} 里又出现了 ${gone}——搬运机回来了`).toBe(false);
+      }
+    }
+    // 页面那一对暂存（`liveSeen` / `liveSid`）与它那段 effect 一并退场
+    expect(talk, '页面里不该再有收口搬运的暂存').not.toContain('liveSeen');
+    expect(talk, '页面里不该再有那一班记号').not.toContain('liveSid');
+  });
+
+  it('页面里连更宽的 `sessionId !==` 拼法也没有了（票 02 的已知边界随本票消失）', () => {
+    expect(talk, '页面里不该再有手写的在途比对').not.toMatch(/sessionId\s*!==/);
+  });
+});
+
 describe('中断标记只有一个来源（票 03：台账字段 → 回合构造 → 界面）', () => {
   const talk = mask(read('routes/Talk.svelte'), true);
   const turns = mask(read('lib/talkTurns.ts'), false);

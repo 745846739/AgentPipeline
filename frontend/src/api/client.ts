@@ -785,7 +785,8 @@ export function pairedUrl(base: string, token: string): string {
  * 工头未接线时后端回 503，由 `request` 抛出 `ApiError`。
  *
  * `beforeId`（票 05，向上游标）：只取**更早的一段**（`id < beforeId`，段内升序，
- * 到头回空）。不给 = 缺省最近 500 条，与从前逐字一致。
+ * 到头回空）。不给 = 缺省最近一页（多少条由应答里的 `page_limit` 回显，决策 354④），
+ * 与从前逐字一致。
  */
 export function getForemanSession(
   sessionId?: string | null,

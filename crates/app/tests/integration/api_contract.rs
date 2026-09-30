@@ -5338,6 +5338,11 @@ async fn foreman_session_is_available_on_an_empty_home() {
     // 一个班次都没有时是 `null`，不是一个凭空造出来的空班次：读端点不建行
     // （建行是写端点的事），前端据此走空态并提议新开一个。
     assert!(body["session"].is_null());
+    // 分页尺随应答回显（决策 354④，加性字段）：空班次那一支照样给，载荷形状恒定——
+    // 前端 `hasMoreEarlier` 那条判据不必为「还没有班次」分岔。牙齿：把它从
+    // `session_payload` 摘掉，本断言与 `foreman_session_messages_page_up_with_before_id`
+    // 一起红。
+    assert_eq!(body["page_limit"], 500);
     // 身份回执：前端据此确认「对面是谁」，也让人一眼看出这一版有没有接线。
     assert_eq!(body["foreman"]["agent_type"], "foreman");
     assert_eq!(body["foreman"]["stage_key"], "foreman");
@@ -5370,6 +5375,9 @@ async fn foreman_session_messages_page_up_with_before_id() {
     assert_eq!(status, StatusCode::OK, "{body}");
     let latest = body["messages"].as_array().unwrap();
     assert_eq!(latest.len(), 500, "缺省仍是最近 500 条");
+    // 前端判「读满了没有」用的就是这一格（决策 354④）：它必须与这一段实际的取数上限
+    // 同一个出处——两处各写一遍就是静默的分页错位（本仓要挡的形状）。
+    assert_eq!(body["page_limit"], 500, "分页尺随应答回显：{body}");
     assert_eq!(latest[0]["content"], "第 3 句", "掐头掐的是最老的两条");
     assert_eq!(latest[499]["content"], "第 502 句", "尾部到最新那条");
 
