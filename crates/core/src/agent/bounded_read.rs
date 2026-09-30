@@ -368,8 +368,14 @@ mod tests {
         for _ in 0..STUCK_READ_ATTENTION_THRESHOLD {
             tx.send(()).unwrap();
         }
-        for _ in 0..500 {
-            tokio::task::yield_now().await;
+        // **等那个减法落地，而不是数 yield**（2026-09-30，决策 337 的 CI 复跑实测：这条在
+        // CI 上偶发红在 `left: 1, right: 0`）。减法在**阻塞池线程**里做（`StuckFlag::finish`
+        // 之后那一段），而 `yield_now` 只让出当前运行时的任务队列——两个线程之间没有先后
+        // 关系，机器一忙就还没轮到它们收尾。判据一个字不改（返回之后必须归零），只是给它一个
+        // 有上限的真实时间窗：到点还不归零，红的就是真东西。
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while stats().stuck_now != 0 && std::time::Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(2));
         }
         assert_eq!(stats().stuck_now, 0, "返回之后不再算「卡着」");
         assert_eq!(stats().stuck_total, STUCK_READ_ATTENTION_THRESHOLD);
