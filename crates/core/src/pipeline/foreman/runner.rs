@@ -2489,7 +2489,7 @@ fn truncate(text: &str) -> String {
 ///
 /// 与 [`truncate`] 同一份上限：会话循环里的回灌截断与工具自己产出的截断必须是同一个数，
 /// 两处各写一份会让「工具说它截到 12000、循环又按 8000 截一次」这种无声缩水出现。
-/// 流水线出口 `executor::emit_tool_event` 的 `args` / `result` 详情（决策 301）也走这份。
+/// 流水线出口 `pipeline::events::emit_tool_event` 的 `args` / `result` 详情（决策 301）也走这份。
 pub(crate) fn truncate_tool_result(text: &str) -> String {
     truncate(text)
 }

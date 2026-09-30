@@ -51,7 +51,7 @@ use crate::storage::{AttentionKind, Store};
 use crate::types::{Node, NodeCursor, Project, Stage, StageConfig, Task};
 use crate::{Error, Result};
 
-use super::executor::{
+use super::events::{
     OUTPUT_CODE_CHANGES, OUTPUT_DESIGN_DOC, OUTPUT_DEV_DOC, OUTPUT_REVIEW_REPORT,
     OUTPUT_TEST_REPORT, OUTPUT_TEST_SCENARIOS,
 };

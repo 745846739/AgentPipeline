@@ -13,8 +13,9 @@
 //! - **02 run 台账**：`begin / mark_step / finish / finish_cancelled / link / take` 全经
 //!   [`RunLedger`]，承重顺序四条在本片的调用侧兑现（见 `run_ledger` 模块 doc）。
 //!
-//! **SSE 发射留守**：事件形状的唯一出口在 `executor`（`emit_tool_event` /
-//! `emit_node_started` / `finish_run_with_sse`）——本片经既有 emit 函数调用，不自建事件面。
+//! **SSE 发射单点**：事件形状的唯一出口在 `events`（决策 352 修订宿主名；决策 249 的
+//! 「唯一出口」语义不变：`emit_tool_event` / `emit_node_started` / `finish_run_with_sse`）
+//! ——本片经既有 emit 函数调用，不自建事件面。
 //! 外部 6 触点里的 `try_run` / `run` 编排外壳与 `project_analysis`（内部转发）都留守核。
 
 use std::path::{Path, PathBuf};
@@ -38,11 +39,14 @@ use crate::types::{
 };
 use crate::{Error, Result};
 
-use super::executor::{
-    emit_node_started, emit_tool_event, finish_run_with_sse, project_or_err, CancelSignal,
-    NodeOutput, OUTPUT_CODE_CHANGES, OUTPUT_DESIGN_DOC, OUTPUT_DEV_DOC, OUTPUT_REVIEW_REPORT,
-    OUTPUT_TEST_REPORT, OUTPUT_TEST_SCENARIOS, PIPELINE_AGENT_TYPE,
+use super::events::{
+    emit_node_started, emit_tool_event, finish_run_with_sse, OUTPUT_CODE_CHANGES,
+    OUTPUT_DESIGN_DOC, OUTPUT_DEV_DOC, OUTPUT_REVIEW_REPORT, OUTPUT_TEST_REPORT,
+    OUTPUT_TEST_SCENARIOS, PIPELINE_AGENT_TYPE,
 };
+// 留守核与本片的接线契约（取消信号 / 路由结论 / 项目行收口）——不是事件形状，主人仍是
+// executor（决策 249 的接线；352 只搬事件面）。
+use super::executor::{project_or_err, CancelSignal, NodeOutput};
 use super::model_request::{
     json_string_list, workdirs_line, AttemptCtx, BudgetCheck, OverflowFacts, Prepared, RequestPlan,
 };
