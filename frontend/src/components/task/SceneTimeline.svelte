@@ -22,10 +22,10 @@
    * 名牌 = 发言者），过程按发生顺序排在轮里，命令是一枚带退出码的回执。
    *
    * 归约判断全部住在 `lib/taskScene.ts`（命令归哪一轮、消息怎么折步骤、流式增量接到
-   * 哪一头上、直播流怎么交织折步、多次尝试谁主谁次——决策 359）；这里只接线：关键词
-   * 过滤、窗口化（决策 319 的口径原样——先过滤后切）、展开态受控（与 Talk 同一手法：
-   * `preventDefault` 掉默认翻转，状态说了算）、思考步与旧一代尝试的折叠、
-   * 流式期间的贴底跟随（只在人本就在底上时跟）。
+   * 哪一头上、直播流怎么交织折步、多次尝试谁主谁次、轮首的 prompt 与落地思考——决策
+   * 359 / 360）；这里只接线：关键词过滤、窗口化（决策 319 的口径原样——先过滤后切）、
+   * 展开态受控（与 Talk 同一手法：`preventDefault` 掉默认翻转，状态说了算）、思考步 /
+   * 阶段 prompt / 旧一代尝试的折叠、流式期间的贴底跟随（只在人本就在底上时跟）。
    */
   interface Props {
     conversations: ConversationSummary[];
@@ -78,11 +78,12 @@
     shownTurns = DEFAULT_PAGE;
   });
 
-  /** 展开态（受控）：命令回执按命令 id、工具回执与思考步按步骤键，各自一张表。 */
+  /** 展开态（受控）：命令回执按命令 id、工具回执 / 思考 / prompt 按步骤键，各自一张表。 */
   let expandedCmd = $state<number | null>(null);
   let loadingCmd = $state<number | null>(null);
   let toolOpen = $state<Record<string, boolean>>({});
   let thinkOpen = $state<Record<string, boolean>>({});
+  let promptOpen = $state<Record<string, boolean>>({});
   /** 每轮步骤切片的窗口游标（换 run 不重置：键随轮稳定，旧游标无有害 side effect）。 */
   let turnPages = $state<Record<string, number>>({});
   /** 台账命令按 id 的索引：回执展开时要拿**原命令**去问输出账与发加载（归约只留了显示字段）。 */
@@ -119,6 +120,20 @@
     e.preventDefault();
     thinkOpen = { ...thinkOpen, [key]: !thinkOpen[key] };
   }
+
+  function togglePrompt(e: MouseEvent, key: string) {
+    e.preventDefault();
+    promptOpen = { ...promptOpen, [key]: !promptOpen[key] };
+  }
+
+  /** 阶段 prompt 折叠行的读数：两段各报字数，缺的那段不报（步没带 prompt 时空串）。 */
+  const promptSummary = (p: { system: string | null; user: string | null } | null) => {
+    if (!p) return '';
+    const parts: string[] = [];
+    if (p.system) parts.push(`系统 ${p.system.length} 字`);
+    if (p.user) parts.push(`用户 ${p.user.length} 字`);
+    return parts.join(' · ');
+  };
 
   /** 命令是不是还在跑（退出码没落）：在跑的那条流式输出常显，不进折叠。 */
   const isRunning = (exitCode: number | null) => exitCode === null;
@@ -204,7 +219,29 @@
         />
       {/if}
       {#each slice.visible as step (step.key)}
-        {#if step.kind === 'text'}
+        {#if step.kind === 'prompt'}
+          <!-- 阶段 prompt（决策 360）：组装后的两段原文快照，默认收起（系统段常以万字计），
+               展开体里两段分开摆——「这是 prompt 问题」要能当场核对。 -->
+          <details class="rcpt sprompt" open={promptOpen[step.key] ?? false}>
+            <summary class="rcpt-head" onclick={(e) => togglePrompt(e, step.key)}>
+              <span class="nm">阶段 PROMPT</span>
+              <span class="dim args">{promptSummary(step.prompt)}</span>
+              <span class="chev" aria-hidden="true">▸</span>
+            </summary>
+            {#if promptOpen[step.key]}
+              <div class="rcpt-more">
+                {#if step.prompt?.system}
+                  <div class="rm-label dim">系统段</div>
+                  <pre class="rm-body mono">{step.prompt.system}</pre>
+                {/if}
+                {#if step.prompt?.user}
+                  <div class="rm-label dim">用户段</div>
+                  <pre class="rm-body mono">{step.prompt.user}</pre>
+                {/if}
+              </div>
+            {/if}
+          </details>
+        {:else if step.kind === 'text'}
           {#if step.role === 'system'}
             <details class="sys">
               <summary class="sys-sum">SYS · 折叠正文 ▸</summary>

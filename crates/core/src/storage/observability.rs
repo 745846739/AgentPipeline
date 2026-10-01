@@ -809,16 +809,20 @@ impl Store {
         metadata: Option<&serde_json::Value>,
         prompt_tokens: u32,
         completion_tokens: u32,
+        reasoning: Option<&str>,
     ) -> Result<i64> {
         // conversation_max_chars：超出截断（§12.4.3 / 票 02）。三段（系统段 / 用户段 /
         // messages）共吃**同一本账**：原文先占（它是诊断的根据），余量给 messages。
         let truncated = truncate_conversation(messages, prompts, self.conversation_max_chars);
+        // reasoning 的字符账**独立成册**（决策 360）：它是展示留痕，不挤占上面三段的
+        // 诊断账；截断沿用同一条「留标记」纪律。
+        let reasoning = reasoning.filter(|r| !r.is_empty());
         let id: i64 = sqlx::query_scalar(
             "INSERT INTO kanban_node_conversations
              (task_id, project_id, run_id, stage, node, attempt, agent_type, parent_run_id,
               messages_json, system_prompt, user_prompt, metadata_json, prompt_tokens,
-              completion_tokens, created_at)
-             VALUES (?, NULL, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) RETURNING id",
+              completion_tokens, created_at, reasoning)
+             VALUES (?, NULL, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) RETURNING id",
         )
         .bind(task_id)
         .bind(run_id)
@@ -834,6 +838,7 @@ impl Store {
         .bind(prompt_tokens as i64)
         .bind(completion_tokens as i64)
         .bind(ts(self.now()))
+        .bind(reasoning.map(|r| truncate_text(r, self.conversation_max_chars)))
         .fetch_one(self.pool())
         .await?;
         Ok(id)
@@ -902,14 +907,16 @@ impl Store {
         metadata: Option<&serde_json::Value>,
         prompt_tokens: u32,
         completion_tokens: u32,
+        reasoning: Option<&str>,
     ) -> Result<i64> {
         let truncated = truncate_conversation(messages, prompts, self.conversation_max_chars);
+        let reasoning = reasoning.filter(|r| !r.is_empty());
         let id: i64 = sqlx::query_scalar(
             "INSERT INTO kanban_node_conversations
              (task_id, project_id, run_id, stage, node, attempt, agent_type, parent_run_id,
               messages_json, system_prompt, user_prompt, metadata_json, prompt_tokens,
-              completion_tokens, created_at)
-             VALUES (NULL, ?, ?, ?, ?, ?, ?, NULL, ?, ?, ?, ?, ?, ?, ?) RETURNING id",
+              completion_tokens, created_at, reasoning)
+             VALUES (NULL, ?, ?, ?, ?, ?, ?, NULL, ?, ?, ?, ?, ?, ?, ?, ?) RETURNING id",
         )
         .bind(project_id)
         .bind(run_id)
@@ -924,6 +931,7 @@ impl Store {
         .bind(prompt_tokens as i64)
         .bind(completion_tokens as i64)
         .bind(ts(self.now()))
+        .bind(reasoning.map(|r| truncate_text(r, self.conversation_max_chars)))
         .fetch_one(self.pool())
         .await?;
         Ok(id)
@@ -937,7 +945,7 @@ impl Store {
         let row: Option<ConversationRow> = sqlx::query_as(
             "SELECT id, task_id, project_id, run_id, stage, node, attempt, agent_type, parent_run_id,
                     messages_json, system_prompt, user_prompt, metadata_json, prompt_tokens,
-                    completion_tokens, created_at,
+                    completion_tokens, created_at, reasoning,
                     archived_at
              FROM kanban_node_conversations WHERE task_id = ? AND run_id = ?",
         )
@@ -957,7 +965,7 @@ impl Store {
         let row: Option<ConversationRow> = sqlx::query_as(
             "SELECT id, task_id, project_id, run_id, stage, node, attempt, agent_type, parent_run_id,
                     messages_json, system_prompt, user_prompt, metadata_json, prompt_tokens,
-                    completion_tokens, created_at,
+                    completion_tokens, created_at, reasoning,
                     archived_at
              FROM kanban_node_conversations WHERE project_id = ? AND run_id = ?",
         )
@@ -998,7 +1006,7 @@ impl Store {
         let mut sql = String::from(
             "SELECT id, task_id, project_id, run_id, stage, node, attempt, agent_type, parent_run_id,
                     messages_json, system_prompt, user_prompt, metadata_json, prompt_tokens,
-                    completion_tokens, created_at,
+                    completion_tokens, created_at, reasoning,
                     archived_at
              FROM kanban_node_conversations WHERE task_id = ?",
         );
@@ -1031,7 +1039,7 @@ impl Store {
         let row: Option<ConversationRow> = sqlx::query_as(
             "SELECT id, task_id, project_id, run_id, stage, node, attempt, agent_type, parent_run_id,
                     messages_json, system_prompt, user_prompt, metadata_json, prompt_tokens,
-                    completion_tokens, created_at,
+                    completion_tokens, created_at, reasoning,
                     archived_at
              FROM kanban_node_conversations
              WHERE task_id = ? AND stage = ? AND node = ? AND agent_type = 'main'
@@ -1067,7 +1075,7 @@ impl Store {
         let rows: Vec<ConversationRow> = sqlx::query_as(
             "SELECT id, task_id, project_id, run_id, stage, node, attempt, agent_type, parent_run_id,
                     messages_json, system_prompt, user_prompt, metadata_json, prompt_tokens,
-                    completion_tokens, created_at,
+                    completion_tokens, created_at, reasoning,
                     archived_at
              FROM kanban_node_conversations WHERE project_id = ? ORDER BY id",
         )
@@ -1159,6 +1167,7 @@ struct ConversationRow {
     metadata_json: Option<String>,
     prompt_tokens: i64,
     completion_tokens: i64,
+    reasoning: Option<String>,
     created_at: String,
     archived_at: Option<String>,
 }
@@ -1184,6 +1193,7 @@ impl ConversationRow {
                 .transpose()?,
             prompt_tokens: self.prompt_tokens as u32,
             completion_tokens: self.completion_tokens as u32,
+            reasoning: self.reasoning,
             created_at: parse_ts(&self.created_at)?,
             archived_at: self.archived_at.map(|s| parse_ts(&s)).transpose()?,
         })

@@ -2809,6 +2809,7 @@ async fn seed_failed_task(h: &Harness, task_id: &str) -> i64 {
             Some(&serde_json::json!({"failed": true, "error": "闸门失败：测试命令退出码 1"})),
             900,
             120,
+            None,
         )
         .await
         .unwrap();
@@ -3415,6 +3416,7 @@ async fn read_conversation_tool_returns_the_workshop_receipt() {
             None,
             120,
             45,
+            None,
         )
         .await
         .unwrap();
@@ -4105,6 +4107,7 @@ async fn maintenance_keeps_foreman_messages_forever_and_still_purges_the_rest() 
             None,
             0,
             0,
+            None,
         )
         .await
         .unwrap();

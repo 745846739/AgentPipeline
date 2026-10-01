@@ -1424,6 +1424,7 @@ async fn maintenance_refreshes_totals_and_purges_expired_conversations() {
             None,
             200,
             100,
+            None,
         )
         .await
         .unwrap();

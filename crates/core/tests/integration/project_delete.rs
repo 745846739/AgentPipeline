@@ -108,6 +108,7 @@ async fn seed_used_task(store: &Store, task_id: &str, project_id: &str) -> i64 {
             None,
             3,
             5,
+            None,
         )
         .await
         .unwrap();
@@ -185,6 +186,7 @@ async fn seed_project_analysis(store: &Store, project_id: &str) -> i64 {
             None,
             10,
             5,
+            None,
         )
         .await
         .unwrap();

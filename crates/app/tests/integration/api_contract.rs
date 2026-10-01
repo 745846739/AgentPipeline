@@ -855,6 +855,7 @@ async fn retry_archives_old_conversations_and_default_list_excludes_them() {
             None,
             10,
             5,
+            None,
         )
         .await
         .unwrap();
@@ -921,10 +922,14 @@ async fn conversation_messages_endpoint_returns_messages_and_is_task_scoped() {
                 {"role": "user", "content": "实现登录"},
                 {"role": "assistant", "content": "好的"}
             ]),
-            None,
+            Some(agentpipeline_core::storage::observability::PromptSnapshot {
+                system: "sys 原文",
+                user: "user 原文",
+            }),
             None,
             10,
             5,
+            Some("先想转录，再回话"),
         )
         .await
         .unwrap();
@@ -936,6 +941,15 @@ async fn conversation_messages_endpoint_returns_messages_and_is_task_scoped() {
     assert_eq!(messages.len(), 2);
     assert_eq!(messages[0]["role"], "user");
     assert_eq!(messages[0]["content"], "实现登录");
+
+    // 完整会话端点把 prompt 快照与思考留痕一并透传（决策 360；前端现场页签的两类折叠
+    // 块就吃这两个字段）——messages 端点不掺这些，仍只给转录
+    let (status, body) = get(&api, &format!("/tasks/t1/conversations/{run}")).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let conv = &body["conversation"];
+    assert_eq!(conv["reasoning"], "先想转录，再回话");
+    assert_eq!(conv["system_prompt"], "sys 原文");
+    assert_eq!(conv["user_prompt"], "user 原文");
 
     // 任务隔离：run 属于 t1，从 t2 取一律 404，不泄露其他任务数据
     let (status, body) = get(&api, &format!("/tasks/t2/conversations/{run}/messages")).await;
@@ -2285,6 +2299,7 @@ async fn flow_metrics_and_conversations_endpoints() {
             Some(&serde_json::json!({"readiness": true})),
             100,
             50,
+            None,
         )
         .await
         .unwrap();

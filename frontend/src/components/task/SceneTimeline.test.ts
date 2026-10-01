@@ -38,6 +38,9 @@ function conv(messages: ChatMessage[], runId = 1): NodeConversation {
     metadata_json: null,
     prompt_tokens: 100,
     completion_tokens: 50,
+    system_prompt: null,
+    user_prompt: null,
+    reasoning: null,
     created_at: '2026-09-29T10:00:00Z',
   };
 }
@@ -304,5 +307,109 @@ describe('现场时间线 · 过滤与窗口化（决策 319）', () => {
     expect(document.body.textContent).toContain('消息 120');
     expect(document.querySelectorAll('.who').length).toBe(25);
     expect(document.body.textContent).toContain('已省略前 69 条');
+  });
+});
+
+describe('现场时间线 · 阶段 prompt 与落地思考（决策 360）', () => {
+  it('阶段 prompt 默认收起，摘要行带两段字数；展开后两段原文分开摆', async () => {
+    render(SceneTimeline, {
+      props: {
+        conversations: [run()],
+        conversationFor: () => ({
+          ...conv([{ role: 'assistant', content: '结论。' }]),
+          system_prompt: '你是夜班流水线的开发工。',
+          user_prompt: '把折步修好。',
+        }),
+        commands: [],
+        commandOutputFor: () => null,
+      },
+    });
+
+    const block = document.querySelector('details.rcpt.sprompt') as HTMLDetailsElement;
+    expect(block).toBeTruthy();
+    expect(block.open).toBe(false);
+    expect(block.textContent).toContain('阶段 PROMPT');
+    expect(block.textContent).toContain('系统 12 字');
+    expect(block.textContent).toContain('用户 6 字');
+    // 收起时正文不在摘要行上摊开（快照原文只住在展开体里）
+    expect(block.textContent).not.toContain('你是夜班流水线的开发工。');
+
+    await fireEvent.click(block.querySelector('summary') as HTMLElement);
+    expect(block.open).toBe(true);
+    const body = block.querySelector('.rcpt-more') as HTMLElement;
+    expect(body.textContent).toContain('系统段');
+    expect(body.textContent).toContain('你是夜班流水线的开发工。');
+    expect(body.textContent).toContain('用户段');
+    expect(body.textContent).toContain('把折步修好。');
+  });
+
+  it('落地的思考默认收起、摘要带字数；展开见全文；排在 prompt 之后、转录之前', async () => {
+    render(SceneTimeline, {
+      props: {
+        conversations: [run()],
+        conversationFor: () => ({
+          ...conv([{ role: 'assistant', content: '写完了。' }]),
+          system_prompt: '系统段',
+          user_prompt: '用户段',
+          reasoning: '先想结构\n再想元数据',
+        }),
+        commands: [],
+        commandOutputFor: () => null,
+      },
+    });
+
+    const kinds = [...document.querySelectorAll('article.turn details.rcpt')].map(
+      (d) => d.className,
+    );
+    // 轮首两步的顺序：prompt 在前、思考在后
+    expect(
+      kinds.findIndex((c) => c.includes('sprompt')),
+    ).toBeLessThan(kinds.findIndex((c) => c.includes('think')));
+
+    const think = document.querySelector('details.rcpt.think') as HTMLDetailsElement;
+    expect(think.open).toBe(false);
+    expect(think.textContent).toContain('思考过程');
+    expect(think.textContent).toContain('10 字');
+
+    await fireEvent.click(think.querySelector('summary') as HTMLElement);
+    expect(think.open).toBe(true);
+    expect(think.textContent).toContain('先想结构');
+  });
+
+  it('prompt 与思考都缺的轮不画空折叠块；工具回执照旧默认收起', () => {
+    render(SceneTimeline, {
+      props: {
+        conversations: [run()],
+        conversationFor: () =>
+          conv([
+            {
+              role: 'assistant',
+              content: null,
+              tool_calls: [
+                {
+                  id: 'call-1',
+                  type: 'function',
+                  function: { name: 'read_file', arguments: '{"path":"foo.ts"}' },
+                },
+              ],
+            },
+            { role: 'tool', tool_call_id: 'call-1', name: 'read_file', content: '文件内容' },
+          ]),
+        commands: [],
+        commandOutputFor: () => null,
+      },
+    });
+
+    expect(document.querySelector('details.rcpt.sprompt')).toBeNull();
+    // 历史行没有思考：没有思考步，也不画「0 字」的空块
+    expect(document.querySelector('details.rcpt.think')).toBeNull();
+
+    // 工具回执默认收起（折叠行带名与参数摘要，参数原文只在展开体）
+    const tool = document.querySelector('details.rcpt:not(.cmd)') as HTMLDetailsElement;
+    expect(tool).toBeTruthy();
+    expect(tool.open).toBe(false);
+    expect(tool.textContent).toContain('read_file');
+    expect(tool.textContent).toContain('path="foo.ts"');
+    expect(tool.textContent).not.toContain('文件内容');
   });
 });

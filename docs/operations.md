@@ -260,9 +260,12 @@ CREATE TABLE IF NOT EXISTS kanban_node_conversations (
     agent_type TEXT NOT NULL DEFAULT 'main',  -- main | code_searcher | test_runner | doc_writer（子代理，决策 77）
     parent_run_id INTEGER,              -- 子代理关联父 run（决策 77）
     messages_json TEXT NOT NULL,        -- 完整对话：system / user / assistant / tool
+    system_prompt TEXT,                 -- 组装后系统段原文（决策 211② / 迁移 0017）；原文是权威，hash 只是索引
+    user_prompt TEXT,                   -- 组装后用户段原文（同上）；两段只在适配器组装 HTTP body 时前置，从不回写进 messages
     metadata_json TEXT,                 -- submit_metadata 提交的内容
     prompt_tokens INTEGER NOT NULL DEFAULT 0,
     completion_tokens INTEGER NOT NULL DEFAULT 0,
+    reasoning TEXT,                     -- 这次 run 全部调用的思考留痕（决策 360 / 迁移 0038）：按到达序空行相连，只展示、绝不回灌
     created_at TEXT NOT NULL,
     archived_at TEXT,                   -- 重试归档标记（决策 113 同构）：非 NULL = 历史 attempt，列表默认过滤
     FOREIGN KEY (task_id) REFERENCES kanban_tasks(id),
@@ -326,6 +329,8 @@ CREATE TABLE IF NOT EXISTS kanban_node_conversations (
 ```
 
 **注意：** 重试采用节点级独立对话（§10.4），所以每次 attempt 是**一条独立记录**，不包含上一次重试的历史。一个节点尝试内的多轮 LLM 调用（assistant + tool 往返）累积进同一个 `messages_json`，因此能清晰看到每次尝试的完整上下文。子代理的会话是**独立的行**（自己的 `run_id`，`agent_type` 非 `main`，`parent_run_id` 指向父 run），不与父会话混在同一个 `messages_json` 里（决策 77）。
+
+> **prompt 快照与思考留痕（决策 211② / 360）：** `messages_json` 里**没有**本轮的系统段与用户段——它们只在适配器组装 HTTP body 时才被前置，故另有 `system_prompt` / `user_prompt` 两列快照（0017，三段共吃 `conversation_max_chars` 一本账、原文先占）。`reasoning` 列（0038）收这次 run 全部调用的思考原文：与 244 的红线一致**绝不回灌**（不进 `messages_json`、不进下一轮上下文），字符账独立成册（单独按同一上限截断留标记）；它是纯展示留痕，现场时间线的默认收起思考步与阶段 prompt 折叠块就吃这两组列（经 `GET /tasks/{id}/conversations/{run_id}` 整行透传）。
 
 **前端展示 —— 会话查看器：**
 

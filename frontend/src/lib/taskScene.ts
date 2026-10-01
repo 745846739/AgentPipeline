@@ -44,23 +44,36 @@ import { summarizeArgs } from './format';
  *
  * **⑥ 多次尝试分主次（决策 359③）**：同一 `stage · node · agent` 里 attempt 是后端
  * 计的重试序，比最新一代小的整轮折起（`primary = false`），内容一个字不删。
+ *
+ * **⑦ 轮首的 prompt 与落地思考（决策 360）**：完整会话读齐后，阶段 prompt（组装后的
+ * 两段原文快照，决策 211② 落的那两列）与落库的 `reasoning`（决策 360 起新列）插在
+ * 轮首、转录之前——prompt 是这一轮的输入，思考是动笔前的草稿。直播里的 reasoning
+ * 声道在落地思考在场时不再折步：同一份思考只摆一遍。
  */
 
-/** 轮里的一步：四类（话 / 思考 / 工具回执 / 命令回执）归成一个渲染形状。 */
+/** 轮里的一步：五类（阶段 prompt / 话 / 思考 / 工具回执 / 命令回执）归成一个渲染形状。 */
 export interface SceneStep {
   /** 渲染键，由本模块按来源与序号编好，模板不自己数。 */
   key: string;
-  kind: 'text' | 'thinking' | 'tool' | 'command';
-  /** text 步的角色（user / assistant / system / tool）。thinking / tool / command 步为 null。 */
+  kind: 'prompt' | 'text' | 'thinking' | 'tool' | 'command';
+  /** text 步的角色（user / assistant / system / tool）。其余步为 null。 */
   role: ChatMessage['role'] | null;
   /** text / thinking 步的正文；其余步为空串。 */
   text: string;
   /** 这一步**正在冒**（流式增量）：只有 run 在飞时末尾才可能为真。 */
   streaming: boolean;
+  /** 阶段 prompt（决策 360：组装后的两段原文快照）；其余步为 null。 */
+  prompt: ScenePrompt | null;
   /** 工具回执（模型发起的调用；模型侧的账）。 */
   tool: SceneTool | null;
   /** 命令回执（执行器侧的账，带退出码与输出）。 */
   command: SceneCommand | null;
+}
+
+/** 阶段 prompt 的两段原文（决策 211② 的快照列，决策 360 起上现场时间线）。 */
+export interface ScenePrompt {
+  system: string | null;
+  user: string | null;
 }
 
 /** 工具回执：摘要行走名牌那一行，参数与结果收在展开体里。 */
@@ -155,12 +168,37 @@ export interface TaskSceneInput {
 type StepDraft = Omit<SceneStep, 'key'>;
 
 function textStep(role: ChatMessage['role'], text: string, streaming = false): StepDraft {
-  return { kind: 'text', role, text, streaming, tool: null, command: null };
+  return { kind: 'text', role, text, streaming, prompt: null, tool: null, command: null };
 }
 
-/** 思考步（决策 244 的 reasoning 声道）：只活在直播里，落地会话没有它（不落库）。 */
+/**
+ * 思考步：直播里来自 `reasoning` 声道（决策 244），落地后来自会话行的 `reasoning` 列
+ * （决策 360——此前推理只活在直播里，刷新即整段消失；落库的这份让历史轮也有得展开）。
+ */
 function thinkingStep(text: string): StepDraft {
-  return { kind: 'thinking', role: null, text, streaming: false, tool: null, command: null };
+  return {
+    kind: 'thinking',
+    role: null,
+    text,
+    streaming: false,
+    prompt: null,
+    tool: null,
+    command: null,
+  };
+}
+
+/** 阶段 prompt 步（决策 360）：两段原文都在才不空；默认收起，展开看全文。 */
+function promptStep(system: string | null, user: string | null): StepDraft | null {
+  if (!system && !user) return null;
+  return {
+    kind: 'prompt',
+    role: null,
+    text: '',
+    streaming: false,
+    prompt: { system, user },
+    tool: null,
+    command: null,
+  };
 }
 
 function toolStep(name: string, args: string, result: string, phase: SceneTool['phase']): StepDraft {
@@ -169,6 +207,7 @@ function toolStep(name: string, args: string, result: string, phase: SceneTool['
     role: null,
     text: '',
     streaming: false,
+    prompt: null,
     tool: { name, argsSummary: summarizeArgs(args), args, result, phase },
     command: null,
   };
@@ -181,6 +220,7 @@ function commandStep(c: NodeCommand, input: TaskSceneInput): StepDraft {
     role: null,
     text: '',
     streaming: false,
+    prompt: null,
     tool: null,
     command: {
       id: c.id,
@@ -230,6 +270,7 @@ function foldLiveStream(deltas: LiveDelta[], tools: LiveTool[]): StepDraft[] {
         role: null,
         text: '',
         streaming: false,
+        prompt: null,
         tool: {
           name: t.tool,
           // 有原文就在本地派摘要（与落地回执同一来源）；老后端只有服务端摘要时用它。
@@ -361,7 +402,6 @@ export function buildTaskScene(input: TaskSceneInput): SceneTurn[] {
     const runId = summary.run_id;
     const full = input.conversationFor(runId);
     const runCommands = commandsByRun.get(runId) ?? [];
-    const deltas = deltasByRun.get(runId) ?? [];
     const key = `r${runId}`;
     const { steps: msgSteps, closing: landedClosing } = full
       ? stepsFromMessages(full.messages_json)
@@ -369,10 +409,16 @@ export function buildTaskScene(input: TaskSceneInput): SceneTurn[] {
     // 直播流（决策 359①）：增量与工具回执按到达序交织折步。落地会话先排（历史），
     // 命令账最后排（两本账，不假装能精确交织）——收口话与流式光标在折步里落位，
     // 再拼上命令，免得命令顶走「正在说的那一句」。
-    const stream = foldLiveStream(deltas, toolsByRun.get(runId) ?? []);
+    // 落地思考接管（决策 360）：会话行的 `reasoning` 就是同一批直播增量的最终去向，
+    // 它在场时直播的 reasoning 声道不再折步——同一份思考只摆一遍。
+    const reasoningLanded = !!full?.reasoning;
+    const liveReasoning = reasoningLanded
+      ? (deltasByRun.get(runId) ?? []).filter((d) => d.channel !== 'reasoning')
+      : (deltasByRun.get(runId) ?? []);
+    const stream = foldLiveStream(liveReasoning, toolsByRun.get(runId) ?? []);
     // run 的台账状态把关流式（决策 359①）：增量只进不出，run 落地后台账不再报
     // running——光标与「在冒」随之下线，否则跑完的轮永远亮着「正在说」。
-    const live = deltas.length > 0 && summary.status === 'running';
+    const live = liveReasoning.length > 0 && summary.status === 'running';
     let closing = landedClosing;
     let closingStreaming = false;
     if (!closing) {
@@ -391,7 +437,14 @@ export function buildTaskScene(input: TaskSceneInput): SceneTurn[] {
         stream[stream.length - 1] = { ...last, streaming: true };
       }
     }
+    // 轮首的两步（决策 360）：阶段 prompt（两段原文快照）在前，落地的思考在后——
+    // prompt 是这一轮的输入，思考是模型动笔前的草稿，都排在转录（正文 / 工具回执）之前。
+    const leading: StepDraft[] = [];
+    const prompt = promptStep(full?.system_prompt ?? null, full?.user_prompt ?? null);
+    if (prompt) leading.push(prompt);
+    if (full?.reasoning) leading.push(thinkingStep(full.reasoning));
     const drafts: StepDraft[] = [
+      ...leading,
       ...msgSteps,
       ...stream,
       ...[...runCommands].sort(byStartedAt).map((c) => commandStep(c, input)),
@@ -532,6 +585,8 @@ export function sceneTurnMatches(turn: SceneTurn, rawQuery: string): boolean {
   const haystacks: string[] = [turn.name, turn.sub, turn.status ?? '', turn.closing];
   for (const s of turn.steps) {
     haystacks.push(s.text);
+    // 阶段 prompt 的两段原文也在滤网里（决策 360：它是现场的一部分，找得到才点得开）
+    if (s.prompt) haystacks.push(s.prompt.system ?? '', s.prompt.user ?? '');
     if (s.tool) haystacks.push(s.tool.name, s.tool.argsSummary, s.tool.result);
     if (s.command)
       haystacks.push(s.command.command, s.command.actualCommand, s.command.output ?? '');

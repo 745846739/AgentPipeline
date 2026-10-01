@@ -44,11 +44,18 @@ pub enum Step {
 #[derive(Debug, Default, Clone)]
 pub struct Script {
     steps: HashMap<(Stage, Node), VecDeque<Step>>,
+    /// 各节点排队响应所带的**思考**留痕（决策 360）：与 `steps` 同队弹出，一对一贴到
+    /// 该节点的下一次响应上（`AgentResponse.reasoning`）；没排思考的调用给 `None`。
+    /// 它是「推理不落库」时代之后验证落库链路的脚本位，与生产语义同形：只随响应走，
+    /// 不进转录。
+    thinking: HashMap<(Stage, Node), VecDeque<String>>,
     pseudo_steps: HashMap<String, VecDeque<Step>>,
     /// 子代理的脚步（票 08）：子代理复用父节点的 `(stage, node)`，若与父节点共用队列，
     /// 父节点的一步会被子代理悄悄吃掉，测试就无法表达「父派子代理 → 子代理干活 →
     /// 摘要回灌父」这个序列。故单独排队。
     subagent_steps: VecDeque<Step>,
+    /// 子代理排队响应所带的思考（决策 360）：与 `subagent_steps` 同队弹出。
+    subagent_thinking: VecDeque<String>,
     /// 值班长的脚步（决策 182，票 01）：它既不是阶段、也不是既有伪阶段之一，
     /// 却同样走 `(Stage::Init, Node::Execute)` 这个占位坐标——共用队列会被
     /// Init/Execute 的脚本悄悄吃掉。单独排队，理由与子代理那一路完全相同。
@@ -84,6 +91,12 @@ impl Script {
     /// 这也让「父派子代理 → 子代理跑 N 步 → 摘要回灌父」可以被写成线性脚本。
     pub fn push_subagent(&mut self, step: Step) -> &mut Self {
         self.subagent_steps.push_back(step);
+        self
+    }
+
+    /// 为子代理的下一次响应排队思考（决策 360）。
+    pub fn push_subagent_thinking(&mut self, text: &str) -> &mut Self {
+        self.subagent_thinking.push_back(text.to_string());
         self
     }
 
@@ -156,8 +169,10 @@ impl Script {
 
     pub fn is_empty(&self) -> bool {
         self.steps.values().all(VecDeque::is_empty)
+            && self.thinking.values().all(VecDeque::is_empty)
             && self.pseudo_steps.values().all(VecDeque::is_empty)
             && self.subagent_steps.is_empty()
+            && self.subagent_thinking.is_empty()
             && self.foreman_steps.is_empty()
     }
 
@@ -182,6 +197,17 @@ impl Script {
 
     fn pop_subagent(&mut self) -> Option<Step> {
         self.subagent_steps.pop_front()
+    }
+
+    /// 弹出下一次响应所带的思考（决策 360；与 `pop` / `pop_subagent` 同队一一对应）。
+    fn pop_thinking(&mut self, stage: Stage, node: Node) -> Option<String> {
+        self.thinking
+            .get_mut(&(stage, node))
+            .and_then(|q| q.pop_front())
+    }
+
+    fn pop_subagent_thinking(&mut self) -> Option<String> {
+        self.subagent_thinking.pop_front()
     }
 
     fn pop_foreman(&mut self) -> Option<Step> {
@@ -282,6 +308,18 @@ impl NodeScript<'_> {
     /// 文本回复（文本 JSON 块 / 缺字段 / 坏 JSON 的降级验证）。
     pub fn text(self, text: &str) -> Self {
         self.push(Step::Text(text.to_string()))
+    }
+
+    /// 给本节点的**下一次**响应排队思考（决策 360）：贴在 `AgentResponse.reasoning`
+    /// 上，供会话落库链路验证「思考随会话行落地、不进转录」。多次声明即多次调用
+    /// 各带各的，与生产里工具环的多轮调用同形。
+    pub fn thinking(self, text: &str) -> Self {
+        self.script
+            .thinking
+            .entry((self.stage, self.node))
+            .or_default()
+            .push_back(text.to_string());
+        self
     }
 
     /// 不返回（超时路径）。
@@ -495,7 +533,7 @@ impl LlmClient for FakeAgent {
             let is_foreman = request.run.as_ref().is_some_and(|r| {
                 r.agent_type == agentpipeline_core::pipeline::foreman::FOREMAN_AGENT_TYPE
             });
-            let step = {
+            let (step, thinking) = {
                 let mut inner = agent.inner.lock().unwrap();
                 inner.calls.push((stage, node));
                 inner.requests.push(request);
@@ -507,7 +545,16 @@ impl LlmClient for FakeAgent {
                     (None, false, true) => inner.script.pop_foreman(),
                     (None, false, false) => inner.script.pop(stage, node),
                 };
-                match popped {
+                // 思考与步骤同队弹出（决策 360）：值班长与伪阶段不排思考——前者有自己的
+                // thinking 留痕（迁移 0025），后者没有会话外的脚本位需求。
+                let thinking = if is_subagent && pseudo_type.is_none() {
+                    inner.script.pop_subagent_thinking()
+                } else if pseudo_type.is_none() && !is_foreman {
+                    inner.script.pop_thinking(stage, node)
+                } else {
+                    None
+                };
+                let step = match popped {
                     // fail_tool_n：把该工具第 n 次调用换成必然失败的参数（其余真实执行）
                     Some(Step::Tool { name, arguments })
                         if pseudo_type.is_none() && !is_subagent && !is_foreman =>
@@ -524,12 +571,14 @@ impl LlmClient for FakeAgent {
                         Some(Step::Tool { name, arguments })
                     }
                     other => other,
-                }
+                };
+                (step, thinking)
             };
 
             match step {
                 Some(Step::Tool { name, arguments }) => Ok(AgentResponse {
                     content: None,
+                    reasoning: thinking,
                     tool_calls: vec![tool_call(name, arguments)],
                     prompt_tokens: 10,
                     completion_tokens: 5,
@@ -537,6 +586,7 @@ impl LlmClient for FakeAgent {
                 }),
                 Some(Step::Submit(value)) => Ok(AgentResponse {
                     content: None,
+                    reasoning: thinking,
                     tool_calls: vec![tool_call("submit_metadata".into(), value)],
                     prompt_tokens: 10,
                     completion_tokens: 5,
@@ -544,6 +594,7 @@ impl LlmClient for FakeAgent {
                 }),
                 Some(Step::Text(text)) => Ok(AgentResponse {
                     content: Some(text),
+                    reasoning: thinking,
                     tool_calls: Vec::new(),
                     prompt_tokens: 10,
                     completion_tokens: 5,

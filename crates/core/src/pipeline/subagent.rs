@@ -249,6 +249,7 @@ impl SubAgentRunner for StoreSubAgentRunner {
                 ctx,
                 tokens: std::sync::Mutex::new(RunTokens::default()),
                 transcript: Vec::new(),
+                reasoning: String::new(),
             };
 
             let outcome = tokio::time::timeout(
@@ -310,6 +311,9 @@ struct SubAgentSession {
     /// 对话累积。放在 session 里（而非循环的局部变量）是为了让**超时也留痕**：
     /// 外层 future 被 drop 后，这段对话仍可写进会话行。
     transcript: Vec<Message>,
+    /// 全部调用的思考留痕（决策 360）：按到达序以空行相连，随会话行落地、只作展示
+    /// （现场时间线的思考步），不进 `transcript`、不回灌——与决策 244 同一条红线。
+    reasoning: String,
 }
 
 impl StoreSubAgentRunner {
@@ -357,6 +361,12 @@ impl StoreSubAgentRunner {
             };
             let response = self.cfg.llm.complete(req).await?;
             session.tokens.lock().unwrap().add(&response);
+            if let Some(text) = response.reasoning.as_deref().filter(|t| !t.is_empty()) {
+                if !session.reasoning.is_empty() {
+                    session.reasoning.push_str("\n\n");
+                }
+                session.reasoning.push_str(text);
+            }
             // 每轮响应后再打一次：心跳任务本身有周期，这里补一次使活动记录更及时。
             let _ = self
                 .cfg
@@ -465,6 +475,7 @@ async fn write_conversation(
             None,
             tokens.prompt,
             tokens.completion,
+            Some(session.reasoning.as_str()).filter(|r| !r.is_empty()),
         )
         .await?;
     cfg.store.refresh_task_totals(&cfg.task_id).await?;

@@ -248,6 +248,15 @@ export interface NodeConversation {
   metadata_json: unknown;
   prompt_tokens: number;
   completion_tokens: number;
+  /** 组装后的**系统段**原文（决策 211②）；历史行 / 不调 LLM 的 run 为 null。 */
+  system_prompt: string | null;
+  /** 组装后**用户段**的原文（同上）。落库的 messages 里没有这两段。 */
+  user_prompt: string | null;
+  /**
+   * 这次 run 全部调用的思考留痕（决策 360）：多次调用按到达序以空行相连。
+   * 它不进 `messages_json`（决策 244：绝不回灌），只供现场时间线的思考步展示。
+   */
+  reasoning: string | null;
   created_at: string;
 }
 

@@ -2117,6 +2117,81 @@ async fn the_assembled_prompt_is_kept_verbatim_beside_the_conversation() {
     );
 }
 
+// ─────────────────── 思考留痕落库（决策 360 / 迁移 0038）───────────────────
+
+#[tokio::test]
+async fn reasoning_from_every_call_is_kept_beside_the_conversation() {
+    // 决策 244 只给了流水线思考一条去处（实时增量）——run 落地或刷新的那一刻整段
+    // 消失，现场时间线始终没有「折叠的思考过程」可摆（用户 2026-10-01 实机报障）。
+    // 决策 360 补上第二条去处：随会话行落库。多次调用的思考按到达序以空行相连，
+    // 且**绝不进转录**（不回灌是决策 244 的红线）。
+    let ctx = setup("true", Settings::default()).await;
+    let mut script = Script::new();
+    script
+        .for_node(Stage::ArchitectDesign, Node::ValidateInput)
+        .thinking("先读输入，信息是齐的")
+        .submit(&ValidateInputMetadata {
+            readiness: true,
+            blockers: vec![],
+        });
+    script
+        .for_node(Stage::ArchitectDesign, Node::Execute)
+        .thinking("先想 design.md 的结构")
+        .write_file("design.md", "# 设计\n## 验收标准\n- AC-1 能登录\n")
+        .thinking("再想元数据怎么交")
+        .submit(&ArchitectExecuteMetadata {
+            readiness: true,
+            ..Default::default()
+        });
+    ctx.agent.set_script(script);
+
+    testkit::seed_task(&ctx.store, "t-think", "p1")
+        .await
+        .unwrap();
+    admit(&ctx, "t-think").await;
+    ctx.executor.run("t-think").await.unwrap();
+
+    let run = ctx
+        .store
+        .list_runs_at("t-think", Stage::ArchitectDesign, Node::Execute)
+        .await
+        .unwrap()
+        .remove(0);
+    let conv = ctx
+        .store
+        .get_conversation("t-think", run.id)
+        .await
+        .unwrap()
+        .expect("execute 节点应有会话行");
+    let reasoning = conv.reasoning.expect("思考要随会话行落地（决策 360）");
+    assert_eq!(
+        reasoning, "先想 design.md 的结构\n\n再想元数据怎么交",
+        "两次调用的思考按到达序以空行相连"
+    );
+    assert!(
+        !conv.messages_json.to_string().contains("先想 design.md"),
+        "思考绝不进转录：messages_json 是下一轮的上下文（决策 244 红线）"
+    );
+    // 另一个节点的会话行各带各的（不串台）
+    let validate_run = ctx
+        .store
+        .list_runs_at("t-think", Stage::ArchitectDesign, Node::ValidateInput)
+        .await
+        .unwrap()
+        .remove(0);
+    let validate_conv = ctx
+        .store
+        .get_conversation("t-think", validate_run.id)
+        .await
+        .unwrap()
+        .expect("validate_input 节点应有会话行");
+    assert_eq!(
+        validate_conv.reasoning.as_deref(),
+        Some("先读输入，信息是齐的"),
+        "各 run 的会话行带各自的思考"
+    );
+}
+
 #[tokio::test]
 async fn prompt_snapshot_shares_the_conversation_char_account() {
     // 票 02：三段共吃 conversation_max_chars 一本账——原文先占，余量给 messages；
@@ -4410,6 +4485,8 @@ async fn subagent_run_row_carries_parent_and_agent_type() {
             gate_recheck: false,
         });
     script.push_subagent(testkit::Step::Text("摘要".into()));
+    // 思考留痕（决策 360）：子代理的思考同样随它自己的会话行落地
+    script.push_subagent_thinking("先翻 NOTES.md，再看入口");
 
     ctx.agent.set_script(script);
     testkit::seed_task(&ctx.store, "t-prow", "p1")
@@ -4441,6 +4518,19 @@ async fn subagent_run_row_carries_parent_and_agent_type() {
         .expect("子代理应有独立会话行");
     assert_eq!(sub_conv.parent_run_id, sub.parent_run_id);
     assert_eq!(sub_conv.run_id, sub.id);
+    // 思考随子代理自己的会话行落地（决策 360），不混进父会话
+    assert_eq!(
+        sub_conv.reasoning.as_deref(),
+        Some("先翻 NOTES.md，再看入口"),
+        "子代理的思考随它自己的会话行落地"
+    );
+    assert!(
+        !convs
+            .iter()
+            .filter(|c| c.agent_type != "subagent")
+            .any(|c| c.reasoning.as_deref() == Some("先翻 NOTES.md，再看入口")),
+        "子代理的思考不串进父会话"
+    );
 }
 
 /// 验收（票 08）：子代理 token 记在自己 run 行，父 run **不重复累加**。

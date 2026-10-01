@@ -41,6 +41,9 @@ function conv(
     metadata_json: null,
     prompt_tokens: 100,
     completion_tokens: 50,
+    system_prompt: null,
+    user_prompt: null,
+    reasoning: null,
     created_at: '2026-09-29T10:00:00Z',
     ...overrides,
   };
@@ -483,5 +486,83 @@ describe('现场时间线 · 轮级过滤（sceneTurnMatches）', () => {
     expect(sceneTurnMatches(turn, '找不到的词')).toBe(false);
     expect(sceneTurnMatches(turn, '')).toBe(true);
     expect(sceneTurnMatches(turn, '   ')).toBe(true);
+  });
+});
+
+describe('现场时间线 · 轮首的 prompt 与落地思考（决策 360）', () => {
+  const delta = (
+    text: string,
+    runId = 1,
+    role = 'assistant',
+    channel: 'content' | 'reasoning' = 'content',
+  ): LiveDelta => ({ run_id: runId, agent_type: 'main', role, channel, text, seq: 0 });
+
+  it('完整会话带 prompt 快照与 reasoning 时，轮首依次是 prompt 步与思考步，转录跟在其后', () => {
+    const turns = build({
+      conversations: [run()],
+      conversationFor: () =>
+        conv([{ role: 'assistant', content: '写完了，结论如下。' }], {
+          system_prompt: '你是架构师。',
+          user_prompt: '请设计登录。',
+          reasoning: '先想结构，再想元数据。',
+        }),
+    });
+
+    expect(turns[0].steps.map((s) => s.kind)).toEqual(['prompt', 'thinking']);
+    expect(turns[0].steps[0].prompt).toEqual({ system: '你是架构师。', user: '请设计登录。' });
+    expect(turns[0].steps[1].text).toBe('先想结构，再想元数据。');
+    // 收口话照旧从转录里摘，不受轮首两步影响
+    expect(turns[0].closing).toBe('写完了，结论如下。');
+  });
+
+  it('prompt 两段都空、reasoning 为 null 的轮不加空步（历史行 / 不产推理的模型）', () => {
+    const turns = build({
+      conversations: [run()],
+      conversationFor: () => conv([{ role: 'assistant', content: '结论。' }]),
+    });
+
+    expect(turns[0].steps.map((s) => s.kind)).toEqual([]);
+  });
+
+  it('落地思考在场时，直播的 reasoning 声道不再折步——同一份思考只摆一遍', () => {
+    const turns = build({
+      conversations: [run({ status: 'success' })],
+      conversationFor: () =>
+        conv([{ role: 'assistant', content: '写完了。' }], { reasoning: '先想结构。' }),
+      liveDeltas: [
+        delta('先想结构。', 1, 'assistant', 'reasoning'),
+        delta('写完了。', 1, 'assistant', 'content'),
+      ],
+    });
+
+    const thinking = turns[0].steps.filter((s) => s.kind === 'thinking');
+    expect(thinking).toHaveLength(1);
+    expect(thinking[0].text).toBe('先想结构。');
+  });
+
+  it('没落地的轮（直播中）reasoning 增量照旧折成思考步（决策 244 的直播口径不动）', () => {
+    const turns = build({
+      conversations: [run({ status: 'running' })],
+      conversationFor: () => undefined,
+      liveDeltas: [delta('正在想。', 1, 'assistant', 'reasoning')],
+    });
+
+    expect(turns[0].steps.map((s) => s.kind)).toEqual(['thinking']);
+  });
+
+  it('轮级过滤命中 prompt 两段原文即留下', () => {
+    const turns = build({
+      conversations: [run()],
+      conversationFor: () =>
+        conv([{ role: 'assistant', content: '结论。' }], {
+          system_prompt: '夜班流水线的守则',
+          user_prompt: '实现分段折步',
+        }),
+    });
+    const turn = turns[0];
+
+    expect(sceneTurnMatches(turn, '守则')).toBe(true);
+    expect(sceneTurnMatches(turn, '分段折步')).toBe(true);
+    expect(sceneTurnMatches(turn, '找不到的词')).toBe(false);
   });
 });

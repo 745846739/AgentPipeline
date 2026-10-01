@@ -95,7 +95,28 @@ struct AttemptTrace {
     /// 组装后的两段原文（票 02）：**成功与失败都要写**——「这是 prompt 问题」这句判断
     /// 在失败的那一轮才最需要证据。
     prompts: Option<(String, String)>,
+    /// 这次尝试全部调用的思考留痕（决策 360）：按到达序以空行相连，随会话行落地。
+    /// 只作展示（现场时间线的思考步），不进 `messages` 的转录、不回灌。
+    reasoning: String,
     persisted: bool,
+}
+
+impl AttemptTrace {
+    /// 收下一次响应的思考（决策 360）：多轮调用按到达序相连；没有思考的响应不动账。
+    fn take_reasoning(&mut self, response: &crate::agent::client::AgentResponse) {
+        let Some(text) = response.reasoning.as_deref().filter(|t| !t.is_empty()) else {
+            return;
+        };
+        if !self.reasoning.is_empty() {
+            self.reasoning.push_str("\n\n");
+        }
+        self.reasoning.push_str(text);
+    }
+
+    /// 落库用的 `Some`：没攒到思考就给 `None`（NULL = 没有思考留痕，界面不画空块）。
+    fn reasoning_row(&self) -> Option<&str> {
+        Some(self.reasoning.as_str()).filter(|r| !r.is_empty())
+    }
 }
 
 /// 失败会话写在 `metadata_json` 里的上下文（票 01）：读会话的人先看到它，才知道这条
@@ -456,6 +477,7 @@ impl ModelInvoke {
                     Some(&metadata),
                     trace.tokens.prompt,
                     trace.tokens.completion,
+                    trace.reasoning_row(),
                 )
                 .await
                 .map(|_| ())
@@ -780,6 +802,8 @@ impl ModelInvoke {
                 Err(e) => return Err(e),
             };
             trace.tokens.add(&response);
+            // 思考留痕（决策 360）：与 tokens 同一刻收账——成功与失败路径都从这里带上。
+            trace.take_reasoning(&response);
             trace.messages.push(Message::assistant(
                 response.content.clone(),
                 response.tool_calls.clone(),
@@ -981,6 +1005,7 @@ impl ModelInvoke {
                 Some(&value),
                 trace.tokens.prompt,
                 trace.tokens.completion,
+                trace.reasoning_row(),
             )
             .await?;
         // 这一条 run 的会话行已经写过：后面若在 `post_process` 上失败，外框只把错误
@@ -1163,6 +1188,7 @@ impl ModelInvoke {
                 Some(&value),
                 tokens.prompt,
                 tokens.completion,
+                response.reasoning.as_deref(),
             )
             .await?;
         self.store.refresh_task_totals(&task.id).await?;
@@ -1418,6 +1444,7 @@ impl ModelInvoke {
                 None,
                 trace.tokens.prompt,
                 trace.tokens.completion,
+                trace.reasoning_row(),
             )
             .await?;
         // 这一条 run 的会话行已经写过（外框的失败收尾只补上下文，不再插行）

@@ -1307,6 +1307,11 @@ pub struct NodeConversation {
     pub metadata_json: Option<serde_json::Value>,
     pub prompt_tokens: u32,
     pub completion_tokens: u32,
+    /// 这次 run 全部调用的**推理 / 思考**留痕（决策 360，迁移 0038）。工具环多轮调用
+    /// 的思考按到达序以空行相连。它与 `messages_json` 最要紧的区别同决策 244：**绝不
+    /// 回灌**——只被读出来展示（现场时间线默认收起的思考步），不进模型上下文。
+    /// `None` = 模型不产推理，或这一行落在该列之前。
+    pub reasoning: Option<String>,
     pub created_at: DateTime<Utc>,
     /// 重试时旧会话被标记的时间（§12.2 / 决策 113 的同构：归档不物理删除）。
     /// `None` = 未归档，参与新执行；`Some` = 历史 attempt，仍可查。

@@ -66,6 +66,7 @@ async fn insert_conv(
             None,
             10,
             5,
+            None,
         )
         .await
         .unwrap()
@@ -182,6 +183,7 @@ async fn archive_is_scoped_to_task() {
             None,
             1,
             1,
+            None,
         )
         .await
         .unwrap();

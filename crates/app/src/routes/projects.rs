@@ -266,6 +266,9 @@ pub async fn analyze(
                                     Some(&merged),
                                     0,
                                     0,
+                                    // 这一行是**拼出来的摘要行**（正文是合并结果里摘的
+                                    // summary），不是真转录：没有思考留痕可带，NULL 即实情。
+                                    None,
                                 )
                                 .await;
                         }
