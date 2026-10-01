@@ -76,6 +76,7 @@ test.describe('UX2 ⑧ 新建任务 / 表单校验 / 文案（票 10 / 11 / 15�
     await page.getByRole('button', { name: '新建任务' }).click();
     let dialog = page.locator('form.dialog');
     await dialog.locator('.field', { hasText: '标题' }).locator('input').fill('甲里的任务');
+    await dialog.locator('.field', { hasText: '描述' }).locator('textarea').fill('甲里的任务：说明');
     await dialog.getByRole('button', { name: '创建并启动' }).click();
     await expect(page).toHaveURL(/#\/task\//);
     const taskInA = page.url().split('/task/')[1] ?? '';
@@ -88,6 +89,7 @@ test.describe('UX2 ⑧ 新建任务 / 表单校验 / 文案（票 10 / 11 / 15�
     dialog = page.locator('form.dialog');
     await dialog.locator('.field', { hasText: '项目' }).locator('select').selectOption(projectB);
     await dialog.locator('.field', { hasText: '标题' }).locator('input').fill('乙里的任务');
+    await dialog.locator('.field', { hasText: '描述' }).locator('textarea').fill('乙里的任务：说明');
     await dialog.getByRole('button', { name: '创建并启动' }).click();
 
     await expect(page).toHaveURL(/#\/task\//);

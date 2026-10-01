@@ -763,6 +763,8 @@ export async function startApp(opts: StartOptions): Promise<App> {
       const task = await postJson<{ task: { id: string } }>(apiBase, '/tasks', {
         project_id: project.project.id,
         title,
+        // 票 05 之后描述是必填（决策 371）：夹具给一句与标题同源的话，够真实又不抢戏
+        description: `${title}：e2e 夹具的任务说明`,
         ...(opts.reviewMode ? { review_mode: opts.reviewMode } : {}),
       });
       taskId = task.task.id;
@@ -773,6 +775,7 @@ export async function startApp(opts: StartOptions): Promise<App> {
         const t = await postJson<{ task: { id: string } }>(apiBase, '/tasks', {
           project_id: project.project.id,
           title: extra.title,
+          description: `${extra.title}：e2e 夹具的任务说明`,
         });
         taskIds.push(t.task.id);
         mock.bindTask(t.task.id, extra.title);

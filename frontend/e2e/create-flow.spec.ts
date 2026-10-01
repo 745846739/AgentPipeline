@@ -165,6 +165,10 @@ test.describe('前端 E2E ⑤：三步创建走 UI', () => {
     const dialog = page.locator('form.dialog');
     await dialog.locator('.field', { hasText: '标题' }).locator('input').fill('E2E 依赖任务');
     await dialog
+      .locator('.field', { hasText: '描述' })
+      .locator('textarea')
+      .fill('E2E 依赖任务：验证依赖任务 ID 字段');
+    await dialog
       .locator('.field', { hasText: '依赖任务 ID' })
       .locator('input')
       .fill(` ${firstTaskId} ,`);

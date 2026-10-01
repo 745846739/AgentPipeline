@@ -86,6 +86,7 @@ test.describe('前端 E2E：模态框的键盘与语义（票 02 / 05）', () =>
     const task = await post<{ task: { id: string } }>(app.apiBase, '/tasks', {
       project_id: project.project.id,
       title: overflowTitle,
+      description: `${overflowTitle}：候选项夹具`,
     });
     overflowTaskId = task.task.id;
     await waitForTaskById(
@@ -177,6 +178,7 @@ test.describe('前端 E2E：模态框的键盘与语义（票 02 / 05）', () =>
 
     // 从候选里选中它（= 填好该任务的 ID）→ 提交 → 后端建出依赖关系
     await dialog.locator('input').first().fill('E2E 依赖候选任务');
+    await dialog.locator('.field', { hasText: '描述' }).locator('textarea').fill('E2E 依赖候选任务：说明');
     await input.fill(overflowTaskId);
     await dialog.getByRole('button', { name: '创建并启动' }).click();
     await expect(page).toHaveURL(/#\/task\//);
