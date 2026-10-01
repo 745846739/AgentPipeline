@@ -47,9 +47,9 @@ Rust criterion / iai-callgrind（store 层已证明不是瓶颈，见 spec「排
 ## 落地
 
 - **Playwright 闸门**：`frontend/e2e/first-paint-budget.spec.ts`，两条真后端用例——
-  ① 挂住 `/commands` → 时间线仍渲染（票 02 的判据）+ 首屏数据面响应总字节 < **32,000**
-  （实测基线 **11,163**：详情 2,564 + 看板 1,045 + `merge-proposal.diff` 505 + `/flow` 4,753 +
-  会话摘要 2,296；预算取基线两倍出头，远小于任何一次「把 commands 塞回来」的 1.33 MB 起）；
+  ① 挂住 `/commands` → 时间线仍渲染（票 02 的判据）+ 首屏数据面响应（白名单全族：`/tasks` `/projects` `/providers` `/foreman` …）总字节 < **32,000**
+  （实测基线 **11,658**：`/flow` 4,753 + 详情 2,564 + 会话摘要 2,296 + 看板 1,045 + `merge-proposal.diff` 505 +
+  项目 307 + provider 173 + 值班长会话 15；预算取基线两倍出头，远小于任何一次「把 commands 塞回来」的 1.33 MB 起）；
   ② 挂住 `?include_messages=true` → 现场页签轮名牌先出、正文占位在场。
 - **vitest bench**：`frontend/src/lib/taskScene.bench.ts`、`frontend/src/realtime/reduce.bench.ts`
   （`bench` API；`vite.config.ts` 加 `test.benchmark.include`，`package.json` 加 `"bench": "vitest bench --run"`）。

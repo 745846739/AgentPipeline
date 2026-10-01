@@ -1204,7 +1204,7 @@ impl Executor {
                 original_command: None,
             })
             .await?;
-        let preview = crate::agent::tools::head_tail(output, 50, 100);
+        let preview = crate::agent::tools::command_preview(output, 50, 100);
         self.store
             .record_finish(
                 command_id,
@@ -1630,8 +1630,16 @@ async fn run_system_command(
                     CommandFinish {
                         exit_code: Some(out.exit_code.unwrap_or(-1)),
                         stdout_path: Some(full_path.display().to_string()),
-                        stdout_preview: Some(crate::agent::tools::head_tail(&out.stdout, 50, 100)),
-                        stderr_preview: Some(crate::agent::tools::head_tail(&out.stderr, 50, 100)),
+                        stdout_preview: Some(crate::agent::tools::command_preview(
+                            &out.stdout,
+                            50,
+                            100,
+                        )),
+                        stderr_preview: Some(crate::agent::tools::command_preview(
+                            &out.stderr,
+                            50,
+                            100,
+                        )),
                         duration_ms: out.duration_ms,
                     },
                     (),
@@ -1648,8 +1656,8 @@ async fn run_system_command(
         return Ok((-1, format!("命令超时（{timeout_sec}s）")));
     }
 
-    let stdout_preview = crate::agent::tools::head_tail(&out.stdout, 50, 100);
-    let stderr_preview = crate::agent::tools::head_tail(&out.stderr, 50, 100);
+    let stdout_preview = crate::agent::tools::command_preview(&out.stdout, 50, 100);
+    let stderr_preview = crate::agent::tools::command_preview(&out.stderr, 50, 100);
     // merge metadata 里的 `gate_failure_output` 保持原有的命令摘要 + 首尾预览（体积有界，
     // UI / 观测面消费）；**完整日志**已落上方 `full_path`，复检段按确定路径读全文
     // （决策 109 / 票 09）。

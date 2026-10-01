@@ -55,12 +55,30 @@ taskDetail.svelte.ts:126-135`），于是时间线要的 `transitions`（来自�
   **只在非静默装载里发**（静默 refetch 不重拉，也不清已到的那一份——SSE 的 `command_started` /
   `command_finished` 与 `liveTools` 已承担在飞与增量，决策 359）；换过任务就丢掉回写（`this.id !== taskId`）。
   不新增计数端点，页签徽标沿用补拉结果。
-- preview 字节兜底（`crates/core/src/agent/tools.rs`）：新增 `COMMAND_PREVIEW_MAX_BYTES = 4 * 1024`、
-  `preview_text()` / `truncate_bytes()` / `take_bytes()`；`finish_command_output` 的 stdout / stderr
-  两处改用它。行数与字节**两级并存**（只看字节会把「看头看尾」压成「只看头」，只看行数挡不住单行巨物）；
-  截断在**写入前**（`CommandFinish` 就是落库的输入）。
+- preview 字节兜底：新增 `COMMAND_PREVIEW_MAX_BYTES = 4 * 1024` 与 `pub fn command_preview()` /
+  `truncate_bytes()` / `take_bytes()`（`crates/core/src/agent/tools.rs`）。行数与字节**两级并存**
+  （只看字节会把「看头看尾」压成「只看头」，只看行数挡不住单行巨物）；截断在**写入前**
+  （`CommandFinish` 就是落库的输入）。
+- **全部 7 处落库点都走这一个入口**（两轴评审抓出来的硬伤）：第一版只改了
+  `finish_command_output`，而 `pipeline/` 下还有 `executor.rs` 5 处（系统清理命令、闸门命令）
+  与 `repair.rs` 2 处（修复闸门）直接调 `head_tail` 写同一个字段——**一处也没罩住**，而那几处
+  恰恰是输出最大的。现在两个文件的**生产段里一个 `head_tail(` 都不剩**，并由源码级接线守卫
+  `ledger_previews_are_built_only_by_the_byte_capped_helper` 钉住（行为断言要跑真命令 + 真落库
+  才碰得到，而这条不变式在**调用点**上就能证伪）。
 - 测试：`tools.rs::preview_caps_bytes_but_keeps_the_head_tail_shape`；
   `frontend/src/stores/taskDetail.test.ts` 三条（commands 挂住不返回时 `transitions` 照样就位 /
   补拉失败挂错误位但不翻掉首屏 / 静默 refetch 不重拉不清空）；
   `frontend/e2e/first-paint-budget.spec.ts` 两条（真后端）。
 - **牙齿检查**：把 `getCommands` 挪回 `Promise.all` → e2e 红（实测 31.9 s 超时失败），恢复后绿。
+
+## 两轴评审（2026-10-01，implement 收口）
+
+Standards / Spec 两轴各跑一遍，本票的处置：
+
+- **[硬伤·已修]** 上面的「7 处落库点」——第一版只罩住 agent 工具那一条。
+- **[已修]** 路由把 `list_runs`（一次全表读）挂在分支**之前**，现场页签走的批量那条路白付一次。
+  已挪进摘要分支。
+- **[已修]** `list_conversation_summaries` 与 `list_conversations` 的 WHERE 片段各写一份 →
+  抽出 `conversation_filter()` 共用（口径漂移的表现是「列表里有的轮，正文读不到」，最难反推）。
+- **[不修·记下]** 票 03 列的投影里有 `id` / `created_at`，实现里没取——路由从不发这两格，
+  取回来是纯负重。刻意偏离。

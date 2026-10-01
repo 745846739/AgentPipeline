@@ -2302,8 +2302,8 @@ impl ToolExecutor {
             CommandFinish {
                 exit_code: out.exit_code,
                 stdout_path: offload_path,
-                stdout_preview: Some(preview_text(&out.stdout, 50, 100)),
-                stderr_preview: Some(preview_text(&out.stderr, 50, 100)),
+                stdout_preview: Some(command_preview(&out.stdout, 50, 100)),
+                stderr_preview: Some(command_preview(&out.stderr, 50, 100)),
                 duration_ms: out.duration_ms,
             },
             ToolOutcome::ok(in_context),
@@ -3109,7 +3109,7 @@ pub fn head_tail(text: &str, head: usize, tail: usize) -> String {
     out.join("\n")
 }
 
-/// 命令台账里 preview 的**字节**上限（决策 361，票 02）。
+/// 台账 preview 的**字节**上限（决策 361，票 02）。
 ///
 /// 行数口径（首 50 / 尾 100 行）保留的是「看头看尾」的原意，但它对**单行超长**的输
 /// 出完全失控：本机库实测单条 `stdout_preview` 到 183,241 字符，一个任务的 preview
@@ -3118,10 +3118,16 @@ pub fn head_tail(text: &str, head: usize, tail: usize) -> String {
 /// 约 2–3 KB），再长的内容本来就有卸载文件与 `GET /commands/{id}/output` 那条路。
 pub const COMMAND_PREVIEW_MAX_BYTES: usize = 4 * 1024;
 
-/// 台账 preview：**行数口径 + 字节兜底**（决策 361，票 02）。
+/// 台账 preview：**行数口径 + 字节兜底**（决策 361，票 02）——**落库前**唯一的那道门。
 ///
 /// 两级都要：只看字节会把「看头看尾」压成「只看头」，只看行数则挡不住单行巨物。
-fn preview_text(text: &str, head: usize, tail: usize) -> String {
+///
+/// **所有写 `kanban_node_commands.stdout_preview` / `stderr_preview` 的地方都必须走它**
+/// （`tools.rs` 的 `finish_command_output`、`executor.rs` 的收尾 / 闸门命令、`repair.rs`
+/// 的修复闸门——本票第一版只改了第一处，于是系统命令与闸门命令那几处一处也没罩住）。
+/// 源码级守卫见 `ledger_previews_are_built_only_by_the_byte_capped_helper`：它是**接线**
+/// 层的不变式，行为断言要跑真命令 + 真落库才碰得到。
+pub fn command_preview(text: &str, head: usize, tail: usize) -> String {
     truncate_bytes(&head_tail(text, head, tail), COMMAND_PREVIEW_MAX_BYTES)
 }
 
@@ -4453,7 +4459,7 @@ mod tests {
     fn preview_caps_bytes_but_keeps_the_head_tail_shape() {
         // 单行 3 万字节：行数口径放行（就一行），字节口径必须收住
         let one_long_line = "字".repeat(10_000);
-        let out = preview_text(&one_long_line, 50, 100);
+        let out = command_preview(&one_long_line, 50, 100);
         assert!(
             out.len() <= COMMAND_PREVIEW_MAX_BYTES,
             "超限了：{} 字节",
@@ -4471,12 +4477,49 @@ mod tests {
             .map(|i| format!("l{i}"))
             .collect::<Vec<_>>()
             .join("\n");
-        let out = preview_text(&many_lines, 2, 2);
+        let out = command_preview(&many_lines, 2, 2);
         assert!(out.contains("l0") && out.contains("l499") && out.contains("省略 496 行"));
         assert!(out.len() <= COMMAND_PREVIEW_MAX_BYTES);
 
         // 短输出原样过（不引入任何标记）
-        assert_eq!(preview_text("ok\n", 50, 100), "ok\n");
+        assert_eq!(command_preview("ok\n", 50, 100), "ok\n");
+    }
+
+    /// **接线守卫**（决策 361，票 02）：台账 preview 只能经 [`command_preview`] 落库。
+    ///
+    /// 本票第一版只改了 `finish_command_output` 一处，而 `crates/core/src/pipeline/` 下
+    /// 还有 6 处直接调 `head_tail` 写同一个字段（系统清理命令、闸门命令、修复闸门）——
+    /// 字节兜底一处也没罩住，而那几处恰恰是输出最大的（闸门跑的是 `npm test` 这类）。
+    /// 这个形态靠读代码很难发现（每处都「看起来对」），故钉在**接线**层：源码扫描。
+    ///
+    /// 为什么是源码扫描而不是行为断言：行为断言要跑真命令 + 真落库才碰得到，而这条不变式
+    /// 在调用点上就能证伪。把 `head_tail` 从这两个文件的**生产段**里赶出去之后，任何新加的
+    /// 落库点想绕开兜底都得先绕开守卫。
+    #[test]
+    fn ledger_previews_are_built_only_by_the_byte_capped_helper() {
+        let tools = include_str!("tools.rs")
+            .split("#[cfg(test)]")
+            .next()
+            .expect("tools.rs 含测试段");
+        assert!(
+            tools.contains("pub fn command_preview("),
+            "兜底入口必须在（它是本守卫的前提）"
+        );
+        for (name, source) in [
+            (
+                "pipeline/executor.rs",
+                include_str!("../pipeline/executor.rs"),
+            ),
+            ("pipeline/repair.rs", include_str!("../pipeline/repair.rs")),
+        ] {
+            let production = source.split("#[cfg(test)]").next().unwrap_or(source);
+            for line in production.lines() {
+                assert!(
+                    !line.contains("head_tail("),
+                    "{name} 里有直接调 head_tail 的落库点，绕开了字节兜底：{line}"
+                );
+            }
+        }
     }
 
     #[tokio::test]

@@ -7,7 +7,9 @@
  *
  * 边界（199 裁决 ① / ②，照抄）：
  * - **代码注释、开发文档、测试文件里的编号照旧**——所以扫描先把注释剥掉（长度与行号
- *   不变），并且不扫测试文件（`*.test.ts` / `*.spec.ts` 与 `e2e/`）。
+ *   不变），并且不扫测试文件（`*.test.ts` / `*.spec.ts` 与 `e2e/`）与 **bench 文件
+ *   （`*.bench.ts`）**——后者与测试同类：它是跑给自己看的工具，`describe` 的标签从不渲染
+ *   给用户（决策 361 票 04 引进第一份 bench 时暴露的漏网）。
  * - 编号的界面外归宿是 `design/frontend-design.md` §12.3「行为 / 规则 → 实现位置」表的
  *   **备注列**与代码注释（另有 DEC-IA 的悬空引用检查守那张表）。定稿文案里 `title` 悬停
  *   提示放的是**理由**（如 `title="有活跃任务的项目不能删除"`），**不夹编号**——故本门对
@@ -62,7 +64,7 @@ function findDecisionRefs(text: string, html: boolean): DecisionRef[] {
   return out;
 }
 
-/** 收集扫描面：src 下的 `.svelte` 与 `.ts`，**测试文件除外**（199：测试里的编号照旧）。 */
+/** 收集扫描面：src 下的 `.svelte` 与 `.ts`，**测试与 bench 文件除外**（199：那里的编号照旧）。 */
 function collectCopyFiles(dir: string): string[] {
   const out: string[] = [];
   for (const name of readdirSync(dir)) {
@@ -70,7 +72,7 @@ function collectCopyFiles(dir: string): string[] {
     if (statSync(p).isDirectory()) {
       if (name === 'node_modules') continue;
       out.push(...collectCopyFiles(p));
-    } else if (/\.(svelte|ts)$/.test(name) && !/\.(test|spec)\.ts$/.test(name)) {
+    } else if (/\.(svelte|ts)$/.test(name) && !/\.(test|spec|bench)\.ts$/.test(name)) {
       out.push(p);
     }
   }
@@ -82,7 +84,7 @@ const files = collectCopyFiles(srcRoot);
 describe('文案纪律 · 面向用户的文案里不出现内部编号（决策 199 / 票 23）', () => {
   it('扫描面是 src 下的 .svelte 与 .ts（测试文件与各自的注释不在内）', () => {
     expect(files.length).toBeGreaterThan(50);
-    expect(files.some((f) => /\.(test|spec)\.ts$/.test(f))).toBe(false);
+    expect(files.some((f) => /\.(test|spec|bench)\.ts$/.test(f))).toBe(false);
     expect(files.every((f) => /\.(svelte|ts)$/.test(f))).toBe(true);
   });
 

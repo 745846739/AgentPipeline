@@ -845,17 +845,6 @@ pub async fn conversations(
     Path(id): Path<String>,
     Query(query): Query<ConversationListQuery>,
 ) -> ApiResult<impl IntoResponse> {
-    // run 状态不在会话行里（状态住台账），而药丸过滤要「状态」这一维（票 03）——
-    // 按 run_id 从台账取一份贴进摘要。本机单用户量级，整表拉一次即可，不值得新端点。
-    let statuses: std::collections::HashMap<i64, String> = state
-        .store
-        .list_runs(&id)
-        .await
-        .map_err(map_core_error)?
-        .into_iter()
-        .map(|r| (r.id, r.status.as_str().to_string()))
-        .collect();
-
     if query.include_messages {
         // 批量取正文：与单条读法共用 `list_conversations`，故「同一 run_id 两种读法给出
         // 相同会话」是**同一份实现**的直接结果，不是两条路要各自维护的约定。
@@ -866,6 +855,19 @@ pub async fn conversations(
             .map_err(map_core_error)?;
         return Ok(Json(json!({ "conversations": conversations })));
     }
+
+    // run 状态不在会话行里（状态住台账），而药丸过滤要「状态」这一维（票 03）——
+    // 按 run_id 从台账取一份贴进摘要。本机单用户量级，整表拉一次即可，不值得新端点。
+    // **只在摘要分支取**：批量那条路（现场页签走的正是它）一个字节都用不上它，
+    // 而它是一次全表读——别把它挂在本批要修的那条路上。
+    let statuses: std::collections::HashMap<i64, String> = state
+        .store
+        .list_runs(&id)
+        .await
+        .map_err(map_core_error)?
+        .into_iter()
+        .map(|r| (r.id, r.status.as_str().to_string()))
+        .collect();
 
     // 缺省（摘要态）：走**只取摘要列**的读法（决策 361，票 03）——此前它读回全文列
     // 并对每行做一次 `serde_json::from_str`，随即在这里丢掉。列表只要轮名与读数。

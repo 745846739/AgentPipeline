@@ -24,22 +24,47 @@ import { pendingTypeOf, startApp, waitForTask, type App } from './harness';
 import { fullPassScript } from './scripts';
 
 /**
- * 首屏数据面的字节预算。
+ * 首屏**数据面**的字节预算。
  *
  * **来由**：`E2E_FIRST_PAINT_MEASURED` 是这条用例在实施时实测到的读数，预算取它的
  * 两倍出头——留够 fixture 微调（多一个文件、多两轮会话）的余量，又远小于任何一条
  * 「把 commands 塞回来」的量级（那条是 1.33 MB 起）。这个数字**不是调出来的**：
  * 越过它就说明首屏多了一类载荷，人该来看一眼。
  */
-const E2E_FIRST_PAINT_MEASURED = 11_163; // 实施时实测：2,564（详情）+ 1,045（看板）+ 505（diff）+ 4,753（flow）+ 2,296（会话摘要）
+const E2E_FIRST_PAINT_MEASURED = 11_658; // 实施时实测（数据面全部族）：4,753（flow）+ 2,564（详情）+ 2,296（会话摘要）+ 1,045（看板）+ 505（diff）+ 307（项目）+ 173（provider）+ 15（值班长会话）
 const FIRST_PAINT_BYTE_BUDGET = 32_000;
 
-/** 同一 origin 的「数据面」响应才算载荷：静态资源（bundle / 字体）不是本闸门的对象。 */
+/**
+ * 数据面的**路由族**（全站 API 那一层）。
+ *
+ * 用白名单而不是「排除静态资源」：本闸门的对象是**服务端下发的载荷**，而静态资源
+ * （`/assets/*`、字体、`sw.js`、入口页）是另一笔账（它们不随任务数据长）。白名单也
+ * 让「换个族塞大载荷」同样踩线——只盯 `/tasks` 的话，`/projects` 或 `/foreman` 上的
+ * 大载荷可以整条溜过去。
+ */
+const DATA_PREFIXES = [
+  '/tasks',
+  '/projects',
+  '/providers',
+  '/stage-configs',
+  '/metrics',
+  '/foreman',
+  '/foreman-watch',
+  '/notify',
+  '/rtk',
+  '/skills',
+  '/market',
+  '/server-info',
+];
+
+/** 同一 origin 的数据面响应才算载荷。 */
 function isDataResponse(page: Page, url: URL): boolean {
   if (url.origin !== new URL(page.url() || 'http://127.0.0.1').origin) return false;
   // 事件流永不完结，读它的 body 会挂住；它也不是载荷。
   if (url.pathname.endsWith('/stream')) return false;
-  return url.pathname.startsWith('/tasks');
+  return DATA_PREFIXES.some(
+    (p) => url.pathname === p || url.pathname.startsWith(`${p}/`),
+  );
 }
 
 interface Watched {

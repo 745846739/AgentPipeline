@@ -1003,17 +1003,14 @@ impl Store {
         task_id: &str,
         include_archived: bool,
     ) -> Result<Vec<NodeConversation>> {
-        let mut sql = String::from(
+        let sql = format!(
             "SELECT id, task_id, project_id, run_id, stage, node, attempt, agent_type, parent_run_id,
                     messages_json, system_prompt, user_prompt, metadata_json, prompt_tokens,
                     completion_tokens, created_at, reasoning,
                     archived_at
-             FROM kanban_node_conversations WHERE task_id = ?",
+             FROM kanban_node_conversations WHERE {}",
+            conversation_filter(include_archived)
         );
-        if !include_archived {
-            sql.push_str(" AND archived_at IS NULL");
-        }
-        sql.push_str(" ORDER BY id");
         let rows: Vec<ConversationRow> = sqlx::query_as(&sql)
             .bind(task_id)
             .fetch_all(self.pool())
@@ -1037,15 +1034,12 @@ impl Store {
         task_id: &str,
         include_archived: bool,
     ) -> Result<Vec<ConversationSummary>> {
-        let mut sql = String::from(
+        let sql = format!(
             "SELECT run_id, stage, node, attempt, agent_type, parent_run_id, prompt_tokens,
                     completion_tokens, archived_at
-             FROM kanban_node_conversations WHERE task_id = ?",
+             FROM kanban_node_conversations WHERE {}",
+            conversation_filter(include_archived)
         );
-        if !include_archived {
-            sql.push_str(" AND archived_at IS NULL");
-        }
-        sql.push_str(" ORDER BY id");
         let rows: Vec<ConversationSummaryRow> = sqlx::query_as(&sql)
             .bind(task_id)
             .fetch_all(self.pool())
@@ -1229,6 +1223,18 @@ impl ConversationRow {
             created_at: parse_ts(&self.created_at)?,
             archived_at: self.archived_at.map(|s| parse_ts(&s)).transpose()?,
         })
+    }
+}
+
+/// 会话列表的 WHERE 片段：**摘要读法与全文读法共用同一份**（决策 361，票 03）。
+///
+/// 两条读法是对**同一批行**的两种投影——口径分头写就会漂移，而漂移的表现是「列表里有的轮，
+/// 正文读不到」（或反过来），那是最难从现象反推的一类错。
+fn conversation_filter(include_archived: bool) -> &'static str {
+    if include_archived {
+        "task_id = ? ORDER BY id"
+    } else {
+        "task_id = ? AND archived_at IS NULL ORDER BY id"
     }
 }
 

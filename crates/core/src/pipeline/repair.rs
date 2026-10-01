@@ -406,7 +406,7 @@ async fn run_gate_command(
             |out| {
                 let full_log = format!("[stdout]\n{}\n[stderr]\n{}", out.stdout, out.stderr);
                 let _ = std::fs::write(&full_path, &full_log);
-                let preview = crate::agent::tools::head_tail(&full_log, 10, 20);
+                let preview = crate::agent::tools::command_preview(&full_log, 10, 20);
                 Ok((
                     CommandFinish {
                         exit_code: Some(out.exit_code.unwrap_or(-1)),
@@ -424,7 +424,7 @@ async fn run_gate_command(
     // 闸门判据是 **exit code**（逐字不变）：超时收成 -1（闸门失败），启动失败也收成 -1
     // ——收口之前这两条路一个记 `-1`、一个记「命令无法执行」后继续，都**不是** Err。
     let full_log = format!("[stdout]\n{}\n[stderr]\n{}", out.stdout, out.stderr);
-    let preview = crate::agent::tools::head_tail(&full_log, 10, 20);
+    let preview = crate::agent::tools::command_preview(&full_log, 10, 20);
 
     Ok(GateReading {
         kind: kind.to_string(),
