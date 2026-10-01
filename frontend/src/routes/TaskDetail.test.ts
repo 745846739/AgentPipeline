@@ -40,6 +40,7 @@ const mocks = vi.hoisted(() => ({
     loadFile: vi.fn(),
     loadConversation: vi.fn(),
     loadAllConversations: vi.fn(async () => undefined),
+    setSceneVisible: vi.fn(),
     loadCommandOutput: vi.fn(),
     outputFor: vi.fn(() => null),
     getFile: vi.fn(() => undefined),
@@ -286,6 +287,20 @@ describe('任务详情 · 页签语义与标题层级（票 06 / R2-19 / R2-20�
     await fireEvent.click(screen.getByRole('tab', { name: 'Diff' }));
     expect(screen.getAllByRole('heading', { level: 3, name: /lib\.js/ }).length).toBeGreaterThan(0);
     expect(screen.queryAllByRole('heading', { level: 4 })).toHaveLength(0);
+  });
+
+  it('现场页签在屏与否报给 store（决策 365）：默认离屏，切进报在屏，切走收回', async () => {
+    armPendingMerge();
+    render(TaskDetail, { props: { id: 'task-1' } });
+
+    // 默认落时间线：commands 不需要保鲜
+    expect(mocks.detail.setSceneVisible).toHaveBeenLastCalledWith(false);
+
+    await fireEvent.click(screen.getByRole('tab', { name: /现场/ }));
+    expect(mocks.detail.setSceneVisible).toHaveBeenLastCalledWith(true);
+
+    await fireEvent.click(screen.getByRole('tab', { name: '时间线' }));
+    expect(mocks.detail.setSceneVisible).toHaveBeenLastCalledWith(false);
   });
 });
 

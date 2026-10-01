@@ -122,6 +122,9 @@ beforeEach(() => {
   mocks.modelOverrideTask.mockReset();
   mocks.sync.mockReset();
   armLoadedA();
+  // 单例 store 的普通字段不随用例重置：上一条用例若把现场页签报成在屏（决策 365），
+  // 后续用例的静默 refetch 会平白多拉一次 commands。显式收回离屏态。
+  taskDetail.setSceneVisible(false);
 });
 
 afterEach(() => {
@@ -343,7 +346,7 @@ describe('commands 移出首屏关键路径（决策 361，票 02）', () => {
     expect(taskDetail.state.cursors).toEqual([]);
   });
 
-  it('静默 refetch 不再拉 commands，也不清已经到的那一份', async () => {
+  it('静默 refetch 不再拉 commands，也不清已经到的那一份（现场页签不在屏时）', async () => {
     mocks.getTask.mockResolvedValue({
       task: task('A', 'A'),
       cursors: [],
@@ -361,6 +364,61 @@ describe('commands 移出首屏关键路径（决策 361，票 02）', () => {
 
     expect(mocks.getCommands).toHaveBeenCalledTimes(1);
     expect(taskDetail.state.commands).toHaveLength(1);
+  });
+
+  /**
+   * 决策 365：361 把 commands 的保鲜托付给「SSE 的 `command_started` / `command_finished`」，
+   * 而服务端从不发这两类事件——于是开屏后跑的命令再也到不了界面（E2E-⑦ 用例① 实测红）。
+   * 改法是**现场页签在屏时**重拉：进场当场一次，在屏期间静默 refetch 也跟着一次。
+   */
+  it('现场页签在屏：进场当场补拉一次，此后静默 refetch 也重拉（决策 365）', async () => {
+    mocks.getTask.mockResolvedValue({
+      task: task('A', 'A'),
+      cursors: [],
+      allowed_actions: [],
+    });
+    mocks.getFlow.mockResolvedValue({ transitions: [] });
+    mocks.getCommands.mockResolvedValue([command(7)]);
+
+    await taskDetail.load('A');
+    await settle();
+    expect(mocks.getCommands).toHaveBeenCalledTimes(1);
+
+    // 进场：当场补拉（不能等下一次 refetch——任务可能已经没有后续事件了）
+    taskDetail.setSceneVisible(true);
+    await settle();
+    expect(mocks.getCommands).toHaveBeenCalledTimes(2);
+
+    // 在屏期间：静默 refetch 重拉（保鲜）
+    await taskDetail.load('A', true);
+    await settle();
+    expect(mocks.getCommands).toHaveBeenCalledTimes(3);
+
+    // 离屏之后回到旧口径：静默 refetch 不再拉
+    taskDetail.setSceneVisible(false);
+    await taskDetail.load('A', true);
+    await settle();
+    expect(mocks.getCommands).toHaveBeenCalledTimes(3);
+  });
+
+  it('重复报同一个可见性不重复拉（页面 effect 会重复跑，必须是空操作）（决策 365）', async () => {
+    mocks.getTask.mockResolvedValue({
+      task: task('A', 'A'),
+      cursors: [],
+      allowed_actions: [],
+    });
+    mocks.getFlow.mockResolvedValue({ transitions: [] });
+    mocks.getCommands.mockResolvedValue([command(7)]);
+
+    await taskDetail.load('A');
+    await settle();
+    expect(mocks.getCommands).toHaveBeenCalledTimes(1);
+
+    taskDetail.setSceneVisible(true);
+    await settle();
+    taskDetail.setSceneVisible(true);
+    await settle();
+    expect(mocks.getCommands).toHaveBeenCalledTimes(2);
   });
 });
 

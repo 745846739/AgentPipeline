@@ -240,8 +240,13 @@
   /**
    * 现场页签的批量装载（决策 349）：进页签就把每一轮的完整会话读齐（缓存挡住重复），
    * 时间线才摆得开——旧「会话页签」是选中哪轮读哪轮，合并版没有选中态可搭。
+   *
+   * 同时把「页签在屏」告诉 store（决策 365）：commands 只在它要的地方保鲜——进场当场
+   * 补拉一次，在屏期间静默 refetch 也重拉（361 以为 SSE 会承担增量，服务端其实从不发
+   * 那两类事件，于是开屏后跑的命令一直看不见）。
    */
   $effect(() => {
+    taskDetail.setSceneVisible(tab === 'scene');
     if (tab === 'scene') void taskDetail.loadAllConversations();
   });
 

@@ -79,6 +79,8 @@ class TaskDetailStore {
   private busyTimer: ReturnType<typeof setTimeout> | null = null;
   /** 正在飞的对话框动作（重入时把同一个 promise 交回，见 `submitDialogAction`）。 */
   private dialogInFlight: Promise<void> | null = null;
+  /** 现场页签是否在屏（决策 365）。非 `$state`：它只由页面 effect 写，界面从不读它。 */
+  private sceneVisible = false;
 
   constructor() {
     this.streamManager = new StreamManager({
@@ -133,7 +135,11 @@ class TaskDetailStore {
       // commands 走**后台补拉**（决策 361，票 02）：它在首屏的 `Promise.all` 里时，时间线
       // 要的 `transitions`（上面那 7 KB 的 `/flow`）被 1.33 MB 的 commands 一起扣住——
       // 106 实测那一条要在公网链路上搬 8.5–10.9 秒，而它与此页签的默认视图毫无关系。
-      if (!silent) void this.loadCommands(taskId);
+      //
+      // 静默 refetch 也补拉**仅当现场页签在屏**（决策 365）：361 给它留的保鲜机制是
+      // 「SSE 的 `command_started` / `command_finished` 承担增量」，而服务端从不发这两类
+      // 事件（见 `setSceneVisible` 的说明）——不补这一趟，开屏之后跑的命令再也到不了界面。
+      if (!silent || this.sceneVisible) void this.loadCommands(taskId);
     } catch (err) {
       this.error = (err as Error).message;
       this.errorStatus = err instanceof ApiError ? err.status : 0;
@@ -167,15 +173,38 @@ class TaskDetailStore {
   }
 
   /**
-   * commands 的**后台补拉**（决策 361，票 02）。
+   * 现场页签在屏 / 离屏（决策 365，修订决策 361② 的一条错误前提）。
+   *
+   * 361 把 commands 移出首屏时，给它留的保鲜机制写的是「SSE 的 `command_started` /
+   * `command_finished` 与 `liveTools` 已承担在飞与增量」——**前半句不成立**：服务端从不发
+   * 这两类事件（`crates/core/src/sse.rs` 里只有枚举与往返测试，`crates/core/src/exec.rs`
+   * 只发 `CommandOutput`），客户端 reduce 里那两个分支是只有单测喂得到的死代码。于是首屏
+   * 那一次补拉之后，命令**再也不刷新**：页签徽标停在旧数，现场时间线看不到新跑的命令
+   * （E2E-⑦ 用例① 实测红，2026-10-01）。
+   *
+   * 改法不是把 commands 塞回首屏，而是**只在现场页签在屏时保鲜**：页签进场当场补拉一次，
+   * 在屏期间静默 refetch 也重拉（`load()` 里的判据）。页签不在屏时不重拉——那是 361 认下
+   * 的账，且此刻没人看这条数据。
+   *
+   * 落点在 store 而不是页面的 `$effect` 里直拉：effect 里拉一次就把 `state` 写成了自己的
+   * 依赖，下一次 `state` 变化又触发一次，转成自触发。这里只在**翻转**时动作，重复调用是空操作。
+   */
+  setSceneVisible(visible: boolean): void {
+    if (visible === this.sceneVisible) return;
+    this.sceneVisible = visible;
+    if (visible && this.id) void this.loadCommands(this.id);
+  }
+
+  /**
+   * commands 的**后台补拉**（决策 361，票 02；保鲜口径见 `setSceneVisible`）。
    *
    * 载荷最大的一条路，故它自己走：首屏不等它（页签徽标初始短暂显示 0，随补拉更新），
    * 到货后并入 `state.commands`。
    *
-   * **只在用户可见的那次装载里发**：SSE 驱动的静默 refetch（`scheduleRefetch` 的 300ms
-   * 去抖）每转一次都重拉 1.33 MB 是不划算的，而它在飞的那部分另有承担者——`liveTools`
-   * 与 `command_started` / `command_finished` 的增量（决策 359，reducer 直接并进
-   * `state.commands`），所以静默那一趟什么都不缺。**也不清已到的那一份**：清掉是纯倒退。
+   * **非静默装载必发、静默 refetch 只在现场页签在屏时发**（决策 365）：SSE 驱动的静默
+   * refetch（`scheduleRefetch` 的 300ms 去抖）每转一次都重拉 1.33 MB 是不划算的，故页签
+   * 不在屏时不拉；在屏时拉是因为**没有别的承担者**（361 原以为有，见 `setSceneVisible`）。
+   * **也不清已到的那一份**：清掉是纯倒退。
    *
    * 失败挂到页面的错误位（与静默 refetch 同一条口径：报错不静默），但**只在这一份仍然
    * 属于当前任务时**——换过任务/已被收走就别把上一份的失败挂到新 id 上。

@@ -18,7 +18,7 @@ taskDetail.svelte.ts:126-135`），于是时间线要的 `transitions`（来自�
 
 **Blocked by:** 04（**已满足**：闸门已落地并做过牙齿检查——见本票「落地」）
 
-**Status:** done（2026-10-01，决策 361；106 验收待部署后补做）
+**Status:** done（2026-10-01，决策 361；2026-10-01 由决策 365 订正「静默 refetch 不重拉」那半句——见「复盘」；106 验收待部署后补做）
 
 ## 落点
 
@@ -52,8 +52,9 @@ taskDetail.svelte.ts:126-135`），于是时间线要的 `transitions`（来自�
 
 - `frontend/src/stores/taskDetail.svelte.ts`：`load()` 的 `Promise.all` 只留 `getFlow` +
   `getConversations`；commands 由新的 `loadCommands()` **后台补拉**后并入 `state.commands`。
-  **只在非静默装载里发**（静默 refetch 不重拉，也不清已到的那一份——SSE 的 `command_started` /
-  `command_finished` 与 `liveTools` 已承担在飞与增量，决策 359）；换过任务就丢掉回写（`this.id !== taskId`）。
+  **非静默装载里必发、静默 refetch 只在现场页签在屏时发**（决策 365 订正——原口径「静默 refetch 不重拉」
+  的旁注「SSE 的 `command_started` / `command_finished` 与 `liveTools` 已承担在飞与增量」**前提不成立**，
+  见「复盘」）；**也不清已到的那一份**；换过任务就丢掉回写（`this.id !== taskId`）。
   不新增计数端点，页签徽标沿用补拉结果。
 - preview 字节兜底：新增 `COMMAND_PREVIEW_MAX_BYTES = 4 * 1024` 与 `pub fn command_preview()` /
   `truncate_bytes()` / `take_bytes()`（`crates/core/src/agent/tools.rs`）。行数与字节**两级并存**
@@ -82,3 +83,33 @@ Standards / Spec 两轴各跑一遍，本票的处置：
   抽出 `conversation_filter()` 共用（口径漂移的表现是「列表里有的轮，正文读不到」，最难反推）。
 - **[不修·记下]** 票 03 列的投影里有 `id` / `created_at`，实现里没取——路由从不发这两格，
   取回来是纯负重。刻意偏离。
+
+## 复盘（2026-10-01，决策 365）
+
+**触因**：361 批收口后的全量 e2e 里 `logs-reload.spec.ts` ① 红——「现场页签里要有可识别的命令内容」
+（`.rcpt.cmd` 等到 30 s 超时仍找不到，页面还挂着「实时流已断开，正在重连」）。
+
+**取证**（临时 playwright 脚本 dump 状态）：同一时刻 `GET /tasks/{id}/commands` 返回 3 条（含
+`git add -A && git -c user.name=e2e …`），而 `state.commands` 为空、`.rcpt.cmd` 计数 0；全程只对
+`/commands` 发过**一次**请求（首屏那次背景补拉），而那一刻任务刚起、库里还没有命令。
+
+**根因**：本票给 commands 留的保鲜机制写的是「SSE 的 `command_started` / `command_finished` 与
+`liveTools` 已承担在飞与增量」。**前半句不成立**：`CommandStarted` / `CommandFinished` 在
+`crates/core/src/sse.rs` 里只有枚举与往返测试，**全仓没有任何生产段 emit 它们**（`crates/core/src/exec.rs`
+只 emit `CommandOutput`），前端 reduce 里那两个 case 是只有单测喂得到的死代码；`liveTools` 是 agent
+工具调用，与 shell 命令无关。于是「非静默装载补拉一次」成了 commands 唯一的进路，**开屏之后跑的命令
+再也到不了界面**。
+
+**处置**（决策 365）：commands 只在**它要看的那个地方**保鲜——现场页签在屏时进场当场补拉一次 +
+在屏期间静默 refetch 也重拉；离屏维持本票原口径（不重拉），**首屏仍不等它**（本票①的结论与首屏字节
+闸门一个字未动）。落点在 store（`setSceneVisible(visible)`，只在**翻转**时动作），页面 `$effect` 只报
+「页签在不在屏」——effect 里直拉会把 `state` 写成自己的依赖、拉一次就自触发。
+
+**没有采纳的另一条路**：让服务端补发 `command_started` / `command_finished`。客户端那两个分支把
+`run_id` 记成 `null`，命令会被摆成孤儿组而不是摊在自己那一轮里，还要连带改转录口径；本条的病灶是
+「谁负责刷新」，不是「事件缺不缺」。
+
+**验收（本票②的补做）**：`frontend/src/stores/taskDetail.test.ts`（页签在屏：进场当场拉一次 +
+静默 refetch 也拉 + 离屏恢复不拉 + 重复报同一可见性是空操作）、`frontend/src/routes/TaskDetail.test.ts`
+（默认离屏 / 切进在屏 / 切走收回）；e2e `logs-reload.spec.ts` ① 由红转绿（修前 36.8 s 超时，修后 4.8 s），
+`first-paint-budget.spec.ts` 两条仍绿。
