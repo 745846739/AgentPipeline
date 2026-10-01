@@ -36,16 +36,24 @@ import { summarizeArgs } from './format';
  *
  * **④ 流式增量（`liveDeltas` / `liveTools`）按 `run_id` 接到各自的轮尾**；摘要列表里
  * 还没有那个 run 时合成一条 live 轮兜在末尾——刷新的空窗期里流式输出不落地、也不能丢。
+ *
+ * **⑤ 直播流按到达序交织折步（决策 359①）**：增量与工具回执靠归约发的同一只到达序
+ * （`seq`）归并，连续同类并步、换类另起——「先想 → 查 → 再想 → 说」保真，工具回执
+ * 不再整体堆在正文上方；`reasoning` 声道自成思考步（决策 244）。**流式与否由 run 的
+ * 台账状态把关**（增量只进不出，落地后台账不再报 running）：跑完的轮不再亮光标。
+ *
+ * **⑥ 多次尝试分主次（决策 359③）**：同一 `stage · node · agent` 里 attempt 是后端
+ * 计的重试序，比最新一代小的整轮折起（`primary = false`），内容一个字不删。
  */
 
-/** 轮里的一步：三类（话 / 工具回执 / 命令回执）归成一个渲染形状。 */
+/** 轮里的一步：四类（话 / 思考 / 工具回执 / 命令回执）归成一个渲染形状。 */
 export interface SceneStep {
   /** 渲染键，由本模块按来源与序号编好，模板不自己数。 */
   key: string;
-  kind: 'text' | 'tool' | 'command';
-  /** text 步的角色（user / assistant / system / tool）。tool / command 步为 null。 */
+  kind: 'text' | 'thinking' | 'tool' | 'command';
+  /** text 步的角色（user / assistant / system / tool）。thinking / tool / command 步为 null。 */
   role: ChatMessage['role'] | null;
-  /** text 步的正文；其余步为空串。 */
+  /** text / thinking 步的正文；其余步为空串。 */
   text: string;
   /** 这一步**正在冒**（流式增量）：只有 run 在飞时末尾才可能为真。 */
   streaming: boolean;
@@ -104,6 +112,16 @@ export interface SceneTurn {
   streaming: boolean;
   /** 会话轮的 run_id；合成轮（命令分组 / live 兜底）为 null。 */
   runId: number | null;
+  /**
+   * 会话轮的尝试号（后端按 (task, stage, node) 计的重试序；子代理挂父节点的号）。
+   * 合成轮 / live 轮为 1。名牌上 attempt > 1 才亮「第 N 次」。
+   */
+  attempt: number;
+  /**
+   * 同一 `stage · node · agent` 里是不是**最新一代**（决策 359③）：旧一代整轮折起、
+   * 最新一代全幅展示——多次重试的主次就靠它分。同代并行的子代理（同 attempt）都是主。
+   */
+  primary: boolean;
   /** run 的台账状态（success / timeout / failed / …）；非 success 名牌旁亮一枚。 */
   status: string | null;
   /** 完整会话读到了没有（没读到时轮里显示「正在读取会话…」）。 */
@@ -138,6 +156,11 @@ type StepDraft = Omit<SceneStep, 'key'>;
 
 function textStep(role: ChatMessage['role'], text: string, streaming = false): StepDraft {
   return { kind: 'text', role, text, streaming, tool: null, command: null };
+}
+
+/** 思考步（决策 244 的 reasoning 声道）：只活在直播里，落地会话没有它（不落库）。 */
+function thinkingStep(text: string): StepDraft {
+  return { kind: 'thinking', role: null, text, streaming: false, tool: null, command: null };
 }
 
 function toolStep(name: string, args: string, result: string, phase: SceneTool['phase']): StepDraft {
@@ -180,15 +203,59 @@ function byStartedAt(a: NodeCommand, b: NodeCommand): number {
   return a.id - b.id;
 }
 
-/** 同一 run 的连续同角色增量并成一条（与旧会话页签的 `mergedDeltas` 同一判据）。 */
-function mergeDeltas(deltas: LiveDelta[]): { role: string; agent: string; text: string }[] {
-  const out: { role: string; agent: string; text: string }[] = [];
-  for (const d of deltas) {
-    const last = out[out.length - 1];
-    if (last && last.role === d.role && last.agent === d.agent_type) last.text += d.text;
-    else out.push({ role: d.role, agent: d.agent_type, text: d.text });
+/**
+ * 直播流折步（决策 359①）：增量与工具回执**按到达序**交织成一步一步，再按对讲台的
+ * 同一条规则归并（决策 273）——连续同类并进末步，换了种类另起一步。
+ *
+ * 替换掉的是「三只桶各攒各的」：工具一摞、命令一摞、正文一摊，拼出来工具永远整体堆在
+ * 正文上方、思考与回话黏成一条——用户报的「工具执行一直在最上方、思考没分段」就是那个
+ * 形状。`seq` 是归约时**同一只计数器**发的到达序（`LiveDelta.seq` / `LiveTool.seq`），
+ * 两份数组的交织序只有它答得出来。
+ *
+ * 正文按**角色**分开并步（assistant 的话与 tool 角色的中途读数不是同一种发言）；
+ * 思考步自成一类（决策 244：reasoning 是草稿，不是回话），同样连续并步。
+ */
+function foldLiveStream(deltas: LiveDelta[], tools: LiveTool[]): StepDraft[] {
+  const items: { ord: number; d?: LiveDelta; t?: LiveTool }[] = [
+    ...deltas.map((d) => ({ ord: d.seq, d })),
+    ...tools.map((t) => ({ ord: t.seq, t })),
+  ].sort((a, b) => a.ord - b.ord);
+
+  const steps: StepDraft[] = [];
+  for (const item of items) {
+    if (item.t) {
+      const t = item.t;
+      steps.push({
+        kind: 'tool',
+        role: null,
+        text: '',
+        streaming: false,
+        tool: {
+          name: t.tool,
+          // 有原文就在本地派摘要（与落地回执同一来源）；老后端只有服务端摘要时用它。
+          argsSummary: t.args ? summarizeArgs(t.args) : t.args_summary,
+          args: t.args,
+          result: t.result,
+          phase: t.phase === 'start' ? 'running' : t.phase === 'error' ? 'bad' : 'ok',
+        },
+        command: null,
+      });
+      continue;
+    }
+    const d = item.d;
+    if (!d) continue;
+    const draft =
+      d.channel === 'reasoning'
+        ? thinkingStep(d.text)
+        : textStep(d.role as ChatMessage['role'], d.text);
+    const last = steps[steps.length - 1];
+    if (last && last.kind === draft.kind && last.role === draft.role) {
+      last.text += draft.text;
+      continue;
+    }
+    steps.push(draft);
   }
-  return out;
+  return steps;
 }
 
 /**
@@ -275,6 +342,15 @@ export function buildTaskScene(input: TaskSceneInput): SceneTurn[] {
     }
   }
 
+  // 同一 stage · node · agent 的**最新一代**（决策 359③）：attempt 是后端按
+  // (task, stage, node) 计的重试序（子代理挂父节点的号），比最大值小的都是旧一代。
+  // 同代并行的子代理（同 attempt，如一次父执行里的两次 spawn）都是主——它们不是重试。
+  const newestAttempt = new Map<string, number>();
+  for (const s of conversations) {
+    const gk = `${s.stage}|${s.node}|${s.agent_type}`;
+    newestAttempt.set(gk, Math.max(newestAttempt.get(gk) ?? 1, s.attempt));
+  }
+
   interface Episode {
     turn: SceneTurn;
     rank: number;
@@ -290,42 +366,42 @@ export function buildTaskScene(input: TaskSceneInput): SceneTurn[] {
     const { steps: msgSteps, closing: landedClosing } = full
       ? stepsFromMessages(full.messages_json)
       : { steps: [] as StepDraft[], closing: '' };
-    const drafts: StepDraft[] = [...msgSteps];
-    for (const t of toolsByRun.get(runId) ?? []) {
-      drafts.push(
-        toolStep(
-          t.tool,
-          t.args_summary,
-          '',
-          t.phase === 'start' ? 'running' : t.phase === 'error' ? 'bad' : 'ok',
-        ),
-      );
-    }
-    drafts.push(...[...runCommands].sort(byStartedAt).map((c) => commandStep(c, input)));
-    // 收口话：落地的那一份优先；没有落地会话（或它没有收尾正文）时，末条 assistant
-    // 增量顶到回话位——它此刻多半正在冒。
+    // 直播流（决策 359①）：增量与工具回执按到达序交织折步。落地会话先排（历史），
+    // 命令账最后排（两本账，不假装能精确交织）——收口话与流式光标在折步里落位，
+    // 再拼上命令，免得命令顶走「正在说的那一句」。
+    const stream = foldLiveStream(deltas, toolsByRun.get(runId) ?? []);
+    // run 的台账状态把关流式（决策 359①）：增量只进不出，run 落地后台账不再报
+    // running——光标与「在冒」随之下线，否则跑完的轮永远亮着「正在说」。
+    const live = deltas.length > 0 && summary.status === 'running';
     let closing = landedClosing;
     let closingStreaming = false;
-    const merged = mergeDeltas(deltas);
-    if (!closing && merged.length > 0 && merged[merged.length - 1].role === 'assistant') {
-      closing = merged[merged.length - 1].text;
-      closingStreaming = deltas.length > 0;
-      merged.pop();
-    }
-    for (const d of merged) drafts.push(textStep(d.role as ChatMessage['role'], d.text));
-    // 流式光标只有一处：收口位在冒时挂收口话；否则挂最后一条正文步（最新的输出在哪，
-    // 光标就在哪——工具回执自己带「运行中…」，不需要光标）。
-    if (!closingStreaming && deltas.length > 0 && drafts.length > 0) {
-      const lastDraft = drafts[drafts.length - 1];
-      if (lastDraft.kind === 'text') {
-        drafts[drafts.length - 1] = { ...lastDraft, streaming: true };
+    if (!closing) {
+      const last = stream[stream.length - 1];
+      if (last && last.kind === 'text' && last.role === 'assistant') {
+        stream.pop();
+        closing = last.text;
+        closingStreaming = live;
       }
     }
+    // 流式光标只有一处：收口位在冒挂收口话；否则挂折步末尾的正文 / 思考（最新的输出
+    // 在哪，光标就在哪——工具回执自己带「运行中…」，不需要光标）。
+    if (!closingStreaming && live && stream.length > 0) {
+      const last = stream[stream.length - 1];
+      if (last.kind === 'text' || last.kind === 'thinking') {
+        stream[stream.length - 1] = { ...last, streaming: true };
+      }
+    }
+    const drafts: StepDraft[] = [
+      ...msgSteps,
+      ...stream,
+      ...[...runCommands].sort(byStartedAt).map((c) => commandStep(c, input)),
+    ];
     // 排序时刻：完整会话的 created_at → 该轮命令的最早 started_at → 空（排末尾）。
     const at =
       full?.created_at ??
       [...runCommands].sort(byStartedAt)[0]?.started_at ??
       '';
+    const gk = `${summary.stage}|${summary.node}|${summary.agent_type}`;
     episodes.push({
       rank: 0,
       turn: {
@@ -333,8 +409,10 @@ export function buildTaskScene(input: TaskSceneInput): SceneTurn[] {
         name: `${summary.stage} · ${summary.node}`,
         sub: summary.agent_type !== 'main' ? summary.agent_type : '',
         at,
-        streaming: deltas.length > 0,
+        streaming: live,
         runId,
+        attempt: summary.attempt,
+        primary: summary.attempt >= (newestAttempt.get(gk) ?? 1),
         status: summary.status,
         loaded: full !== undefined,
         steps: keyedSteps(drafts, key),
@@ -372,6 +450,8 @@ export function buildTaskScene(input: TaskSceneInput): SceneTurn[] {
         at: group.at,
         streaming: false,
         runId: null,
+        attempt: 1,
+        primary: true,
         status: null,
         loaded: true,
         steps: keyedSteps(steps, group.key),
@@ -387,29 +467,21 @@ export function buildTaskScene(input: TaskSceneInput): SceneTurn[] {
   for (const [runId, deltas] of deltasByRun) {
     if (knownRuns.has(runId)) continue;
     const key = `live${runId}`;
-    const merged = mergeDeltas(deltas);
-    const drafts: StepDraft[] = [];
-    for (const t of toolsByRun.get(runId) ?? []) {
-      drafts.push(
-        toolStep(
-          t.tool,
-          t.args_summary,
-          '',
-          t.phase === 'start' ? 'running' : t.phase === 'error' ? 'bad' : 'ok',
-        ),
-      );
-    }
-    drafts.push(
-      ...[...(commandsByRun.get(runId) ?? [])].sort(byStartedAt).map((c) => commandStep(c, input)),
-    );
+    const stream = foldLiveStream(deltas, toolsByRun.get(runId) ?? []);
     let closing = '';
     let closingStreaming = false;
-    if (merged.length > 0 && merged[merged.length - 1].role === 'assistant') {
-      closing = merged[merged.length - 1].text;
+    const last = stream[stream.length - 1];
+    if (last && last.kind === 'text' && last.role === 'assistant') {
+      stream.pop();
+      closing = last.text;
       closingStreaming = true;
-      merged.pop();
+    } else if (last && (last.kind === 'text' || last.kind === 'thinking')) {
+      stream[stream.length - 1] = { ...last, streaming: true };
     }
-    for (const d of merged) drafts.push(textStep(d.role as ChatMessage['role'], d.text));
+    const drafts: StepDraft[] = [
+      ...stream,
+      ...[...(commandsByRun.get(runId) ?? [])].sort(byStartedAt).map((c) => commandStep(c, input)),
+    ];
     episodes.push({
       rank: 2,
       turn: {
@@ -419,6 +491,8 @@ export function buildTaskScene(input: TaskSceneInput): SceneTurn[] {
         at: '',
         streaming: true,
         runId,
+        attempt: 1,
+        primary: true,
         status: null,
         loaded: false,
         steps: keyedSteps(drafts, key),

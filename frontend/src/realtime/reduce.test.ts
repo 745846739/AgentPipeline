@@ -364,7 +364,7 @@ describe('reduceTaskDetail — §9.1 归约表右列逐事件', () => {
     expect(state.streamTokens).toEqual({ prompt: 100, completion: 50 });
   });
 
-  it('tool_event：工具卡增 / 收', () => {
+  it('tool_event：工具卡增 / 收（决策 359① 的字段与到达序）', () => {
     const event: SseEvent = {
       type: 'tool_event',
       task_id: taskId,
@@ -376,7 +376,166 @@ describe('reduceTaskDetail — §9.1 归约表右列逐事件', () => {
     };
     const next = reduceTaskDetail(base(), event);
     expect(next.liveTools).toEqual([
-      { run_id: 7, tool: 'write_file', phase: 'end', args_summary: 'src/auth/mod.rs' },
+      {
+        run_id: 7,
+        tool: 'write_file',
+        phase: 'end',
+        args_summary: 'src/auth/mod.rs',
+        args: '',
+        result: '',
+        seq: 0,
+      },
+    ]);
+    expect(next.liveSeq).toBe(1);
+  });
+
+  it('conversation_delta：channel 缺省落 content、reasoning 原样带上；seq 按到达序发（决策 244 / 359①）', () => {
+    const delta = (overrides: Partial<Extract<SseEvent, { type: 'conversation_delta' }>>) =>
+      reduceTaskDetail(base(), {
+        type: 'conversation_delta',
+        task_id: taskId,
+        branch: 'main',
+        run_id: 7,
+        agent_type: 'main',
+        role: 'assistant',
+        text: 'x',
+        prompt_tokens: 0,
+        completion_tokens: 0,
+        ...overrides,
+      });
+    const plain = delta({});
+    expect(plain.liveDeltas[0].channel).toBe('content');
+    const reasoning = delta({ channel: 'reasoning' });
+    expect(reasoning.liveDeltas[0].channel).toBe('reasoning');
+    // 到达序跨事件单调（增量与工具回执共用一只计数器）
+    let state = base();
+    state = reduceTaskDetail(state, {
+      type: 'conversation_delta',
+      task_id: taskId,
+      branch: 'main',
+      run_id: 7,
+      agent_type: 'main',
+      role: 'assistant',
+      text: 'a',
+      prompt_tokens: 0,
+      completion_tokens: 0,
+    });
+    state = reduceTaskDetail(state, {
+      type: 'tool_event',
+      task_id: taskId,
+      branch: 'main',
+      run_id: 7,
+      tool: 'read_file',
+      phase: 'start',
+      args_summary: 'a',
+    });
+    state = reduceTaskDetail(state, {
+      type: 'conversation_delta',
+      task_id: taskId,
+      branch: 'main',
+      run_id: 7,
+      agent_type: 'main',
+      role: 'assistant',
+      text: 'b',
+      prompt_tokens: 0,
+      completion_tokens: 0,
+    });
+    expect(state.liveDeltas.map((d) => d.seq)).toEqual([0, 2]);
+    expect(state.liveTools.map((t) => t.seq)).toEqual([1]);
+    expect(state.liveSeq).toBe(3);
+  });
+
+  it('tool_event：start 与随后的 end / error 合成一条，参数与结果归并，到达序沿用 start（决策 359①）', () => {
+    let state = base();
+    state = reduceTaskDetail(state, {
+      type: 'tool_event',
+      task_id: taskId,
+      branch: 'main',
+      run_id: 7,
+      tool: 'read_file',
+      phase: 'start',
+      args_summary: 'src/auth/mod.rs',
+      args: '{"path":"src/auth/mod.rs"}',
+    });
+    state = reduceTaskDetail(state, {
+      type: 'tool_event',
+      task_id: taskId,
+      branch: 'main',
+      run_id: 7,
+      tool: 'read_file',
+      phase: 'end',
+      args_summary: 'src/auth/mod.rs',
+      args: '{"path":"src/auth/mod.rs"}',
+      result: '文件内容',
+    });
+    expect(state.liveTools).toEqual([
+      {
+        run_id: 7,
+        tool: 'read_file',
+        phase: 'end',
+        args_summary: 'src/auth/mod.rs',
+        args: '{"path":"src/auth/mod.rs"}',
+        result: '文件内容',
+        seq: 0,
+      },
+    ]);
+    // error 相位同样合成；结果取错误文本
+    state = reduceTaskDetail(state, {
+      type: 'tool_event',
+      task_id: taskId,
+      branch: 'main',
+      run_id: 7,
+      tool: 'grep',
+      phase: 'start',
+      args_summary: 'todo',
+      args: '{"pattern":"todo"}',
+    });
+    state = reduceTaskDetail(state, {
+      type: 'tool_event',
+      task_id: taskId,
+      branch: 'main',
+      run_id: 7,
+      tool: 'grep',
+      phase: 'error',
+      args_summary: 'todo',
+      result: '工具执行失败：炸了',
+    });
+    expect(state.liveTools).toHaveLength(2);
+    expect(state.liveTools[1]).toMatchObject({ tool: 'grep', phase: 'error', result: '工具执行失败：炸了', seq: 2 });
+  });
+
+  it('tool_event：合并按 run 分辨——并行 run 的 start 不串台', () => {
+    let state = base();
+    state = reduceTaskDetail(state, {
+      type: 'tool_event',
+      task_id: taskId,
+      branch: 'main',
+      run_id: 7,
+      tool: 'read_file',
+      phase: 'start',
+      args_summary: 'a',
+    });
+    state = reduceTaskDetail(state, {
+      type: 'tool_event',
+      task_id: taskId,
+      branch: 'b',
+      run_id: 8,
+      tool: 'grep',
+      phase: 'start',
+      args_summary: 'b',
+    });
+    state = reduceTaskDetail(state, {
+      type: 'tool_event',
+      task_id: taskId,
+      branch: 'main',
+      run_id: 7,
+      tool: 'read_file',
+      phase: 'end',
+      args_summary: 'a',
+    });
+    expect(state.liveTools.map((t) => [t.run_id, t.tool, t.phase])).toEqual([
+      [7, 'read_file', 'end'],
+      [8, 'grep', 'start'],
     ]);
   });
 

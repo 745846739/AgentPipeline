@@ -5,7 +5,8 @@ import SceneTimeline from './SceneTimeline.svelte';
 
 /**
  * 「现场」页签的接线（决策 349）：归约判据在 `lib/taskScene.test.ts` 钉住，
- * 这里钉组件层的四件事——轮怎么画、命令回执怎么展开、流式输出常显、窗口化与过滤。
+ * 这里钉组件层的事——轮怎么画、命令回执怎么展开、流式输出常显、窗口化与过滤，
+ * 以及决策 359 的两件：思考步的折叠块、旧一代尝试的整轮收起。
  */
 
 function run(overrides: Partial<ConversationSummary> = {}): ConversationSummary {
@@ -164,6 +165,103 @@ describe('现场时间线 · 命令回执', () => {
     await fireEvent.click(details.querySelector('summary') as HTMLElement);
     expect(onloadCommand).not.toHaveBeenCalled();
     expect(details.textContent).toContain('完整输出全文');
+  });
+});
+
+describe('现场时间线 · 思考步的折叠块（决策 244 / 359①）', () => {
+  const flying = run({ status: 'running' });
+  const think = (text: string, seq: number) => ({
+    run_id: 1,
+    agent_type: 'main',
+    role: 'assistant',
+    channel: 'reasoning' as const,
+    text,
+    seq,
+  });
+
+  it('正在想的思考默认收起，摘要带 ticker（最新一行原文）；展开见全文', async () => {
+    render(SceneTimeline, {
+      props: {
+        conversations: [flying],
+        conversationFor: () => undefined,
+        commands: [],
+        liveDeltas: [think('先看看板\n再查一遍台账', 0)],
+        commandOutputFor: () => null,
+      },
+    });
+
+    const block = document.querySelector('details.rcpt.think') as HTMLDetailsElement;
+    expect(block).toBeTruthy();
+    expect(block.open).toBe(false);
+    expect(block.textContent).toContain('正在想…');
+    expect(block.textContent).toContain('再查一遍台账');
+
+    await fireEvent.click(block.querySelector('summary') as HTMLElement);
+    expect(block.open).toBe(true);
+    expect(block.textContent).toContain('先看看板');
+  });
+
+  it('思考之后来了正文：思考定格成「思考过程 N 字」，正文顶进收口位', () => {
+    render(SceneTimeline, {
+      props: {
+        conversations: [flying],
+        conversationFor: () => undefined,
+        commands: [],
+        liveDeltas: [
+          think('先看看板', 0),
+          {
+            run_id: 1,
+            agent_type: 'main',
+            role: 'assistant',
+            channel: 'content' as const,
+            text: '结论来了',
+            seq: 1,
+          },
+        ],
+        commandOutputFor: () => null,
+      },
+    });
+
+    const block = document.querySelector('details.rcpt.think') as HTMLDetailsElement;
+    expect(block.textContent).toContain('思考过程');
+    expect(block.textContent).toContain('4 字');
+    // 正文在收口位（不再是一般步骤）
+    expect(document.querySelector('.streaming.closing')?.textContent).toContain('结论来了');
+  });
+});
+
+describe('现场时间线 · 旧一代尝试整轮折起（决策 359③）', () => {
+  it('旧尝试默认收起、内容还在；最新一代全幅；名牌带次数', async () => {
+    render(SceneTimeline, {
+      props: {
+        conversations: [
+          run({ run_id: 1, attempt: 1, status: 'failed' }),
+          run({ run_id: 2, attempt: 2, status: 'running' }),
+        ],
+        conversationFor: (rid: number) =>
+          conv([{ role: 'user', content: `第 ${rid} 次的过程正文` }], rid),
+        commands: [],
+        commandOutputFor: () => null,
+      },
+    });
+
+    const folds = document.querySelectorAll('details.retryfold');
+    expect(folds.length).toBe(1);
+    const fold = folds[0] as HTMLDetailsElement;
+    expect(fold.open).toBe(false);
+    expect(fold.textContent).toContain('第 1 次尝试');
+    // 折起不删内容：收起的 body 里正文仍在 DOM
+    expect(fold.textContent).toContain('第 1 次的过程正文');
+
+    await fireEvent.click(fold.querySelector('summary') as HTMLElement);
+    expect(fold.open).toBe(true);
+
+    // 最新一代（第 2 次）不在折叠里：直接是轮体
+    expect(document.body.textContent).toContain('第 2 次的过程正文');
+    expect(document.body.textContent).not.toContain('第 2 次尝试 ·');
+    // 名牌上的次数章：attempt > 1 才亮
+    expect(document.body.textContent).toContain('第 2 次');
+    expect(document.body.textContent).toContain('第 1 次尝试');
   });
 });
 

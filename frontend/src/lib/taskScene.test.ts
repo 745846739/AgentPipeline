@@ -1,4 +1,4 @@
-import { describe, expect, it } from 'vitest';
+import { beforeEach, describe, expect, it } from 'vitest';
 import type { ChatMessage, ConversationSummary, NodeCommand, NodeConversation } from '../api/types';
 import type { LiveDelta, LiveTool } from '../realtime/reduce';
 import { buildTaskScene, sceneTurnMatches, type SceneTurn } from './taskScene';
@@ -221,16 +221,38 @@ describe('现场时间线 · 命令归轮与孤儿分组', () => {
 });
 
 describe('现场时间线 · 流式增量', () => {
-  const delta = (text: string, runId = 1, role = 'assistant'): LiveDelta => ({
+  /** 在飞的 run（status=running）才有流式（决策 359①：光标由 run 的台账状态把关）。 */
+  const flying = (overrides: Partial<ConversationSummary> = {}): ConversationSummary =>
+    run({ status: 'running', ...overrides });
+  let seq = 0;
+  const delta = (
+    text: string,
+    runId = 1,
+    role = 'assistant',
+    channel: 'content' | 'reasoning' = 'content',
+  ): LiveDelta => ({ run_id: runId, agent_type: 'main', role, channel, text, seq: seq++ });
+  const tool = (
+    name: string,
+    phase: LiveTool['phase'],
+    runId = 1,
+  ): LiveTool => ({
     run_id: runId,
-    agent_type: 'main',
-    role,
-    text,
+    tool: name,
+    phase,
+    args_summary: `${name} 的参数`,
+    args: '',
+    result: phase === 'start' ? '' : '结果',
+    seq: seq++,
   });
+  const resetSeq = () => {
+    seq = 0;
+  };
+
+  beforeEach(() => resetSeq());
 
   it('增量接到所属轮尾：连续同角色并成一条；末步是正文时流式光标挂在那一步', () => {
     const turns = build({
-      conversations: [run()],
+      conversations: [flying()],
       liveDeltas: [delta('正在写 '), delta('实现'), delta('（中途读数）', 1, 'tool')],
     });
 
@@ -248,7 +270,7 @@ describe('现场时间线 · 流式增量', () => {
 
   it('落地会话已有收口话时增量照常作步骤排（不顶掉落地的收尾）', () => {
     const turns = build({
-      conversations: [run()],
+      conversations: [flying()],
       conversationFor: () => conv([{ role: 'user', content: '开始' }], {
         messages_json: [
           { role: 'user', content: '开始' },
@@ -263,15 +285,80 @@ describe('现场时间线 · 流式增量', () => {
     expect(turns[0].steps.some((s) => s.text === '新一轮正在跑')).toBe(true);
   });
 
-  it('liveTools 按相位折成工具回执（start=running / error=bad / end=ok）', () => {
+  it('思考自成一步（决策 244 / 359①）：reasoning 与正文分开折，连续思考并一条、换类另起', () => {
+    const turns = build({
+      conversations: [flying()],
+      liveDeltas: [
+        delta('先看看板。', 1, 'assistant', 'reasoning'),
+        delta('再查台账。', 1, 'assistant', 'reasoning'),
+        delta('结论是……', 1, 'assistant', 'content'),
+      ],
+    });
+
+    expect(turns[0].closing).toBe('结论是……');
+    // 正文摘成收口话后，步骤里只剩思考那一大步
+    const kinds = turns[0].steps.map((s) => `${s.kind}:${s.text}`);
+    expect(kinds).toEqual(['thinking:先看看板。再查台账。']);
+  });
+
+  it('直播流按到达序交织（决策 359①）：思考 → 工具 → 思考 → 正文，工具不再整体堆顶', () => {
+    const turns = build({
+      conversations: [flying()],
+      liveDeltas: [
+        { ...delta('想读一下文件', 1, 'assistant', 'reasoning'), seq: 0 },
+        { ...delta('文件说完了', 1, 'assistant', 'reasoning'), seq: 2 },
+        { ...delta('读到了：内容如下', 1, 'assistant', 'content'), seq: 3 },
+      ],
+      liveTools: [{ ...tool('read_file', 'end'), seq: 1 }],
+    });
+    // 正文（seq 3，最后到达）摘成收口话：步骤序保真「思考 → 工具 → 再思考」
+    expect(turns[0].steps.map((s) => s.kind)).toEqual([
+      'thinking',
+      'tool',
+      'thinking',
+    ]);
+    expect(turns[0].closing).toBe('读到了：内容如下');
+  });
+
+  it('reasoning 收尾不摘收口话（思考不是回话），流式光标挂到思考步上', () => {
+    const turns = build({
+      conversations: [flying()],
+      liveDeltas: [
+        delta('先说结论。', 1, 'assistant', 'content'),
+        delta('等等，再想想。', 1, 'assistant', 'reasoning'),
+      ],
+    });
+
+    expect(turns[0].closing).toBe('');
+    const last = turns[0].steps[turns[0].steps.length - 1];
+    expect(last.kind).toBe('thinking');
+    expect(last.streaming).toBe(true);
+  });
+
+  it('run 落地（台账不再报 running）后增量还在，也不再亮流式（决策 359①）', () => {
+    const turns = build({
+      conversations: [run({ status: 'success' })],
+      liveDeltas: [delta('写完了。')],
+    });
+
+    expect(turns[0].streaming).toBe(false);
+    expect(turns[0].closingStreaming).toBe(false);
+    expect(turns[0].steps.some((s) => s.streaming)).toBe(false);
+    // 收口话照常摘出（最后一次到达仍是 assistant 正文）
+    expect(turns[0].closing).toBe('写完了。');
+  });
+
+  it('liveTools 折成工具回执（start=running / error=bad / end=ok），原文参数与结果进展开体', () => {
     const tools: LiveTool[] = [
-      { run_id: 1, tool: 'run_command', phase: 'start', args_summary: 'ls' },
-      { run_id: 1, tool: 'read_file', phase: 'error', args_summary: 'x.ts' },
-      { run_id: 1, tool: 'grep', phase: 'end', args_summary: 'todo' },
+      { run_id: 1, tool: 'run_command', phase: 'start', args_summary: 'ls', args: '{"cmd":"ls"}', result: '', seq: 0 },
+      { run_id: 1, tool: 'read_file', phase: 'error', args_summary: 'x.ts', args: '', result: '炸了', seq: 1 },
+      { run_id: 1, tool: 'grep', phase: 'end', args_summary: 'todo', args: '', result: '命中', seq: 2 },
     ];
-    const turns = build({ conversations: [run()], liveTools: tools });
-    const phases = turns[0].steps.filter((s) => s.kind === 'tool').map((s) => s.tool?.phase);
-    expect(phases).toEqual(['running', 'bad', 'ok']);
+    const turns = build({ conversations: [flying()], liveTools: tools });
+    const receipts = turns[0].steps.filter((s) => s.kind === 'tool');
+    expect(receipts.map((s) => s.tool?.phase)).toEqual(['running', 'bad', 'ok']);
+    expect(receipts[0].tool?.args).toBe('{"cmd":"ls"}');
+    expect(receipts[1].tool?.result).toBe('炸了');
   });
 
   it('摘要列表还没有那个 run 时合成 live 轮兜在末尾（刷新空窗期不丢输出）', () => {
@@ -280,6 +367,72 @@ describe('现场时间线 · 流式增量', () => {
     expect(turns[0].key).toBe('live77');
     expect(turns[0].streaming).toBe(true);
     expect(turns[0].closing).toBe('现场冒出的增量');
+  });
+
+  it('live 轮末步是思考时同样兜得住：不摘收口、思考步亮光标', () => {
+    const turns = build({
+      liveDeltas: [{ ...delta('正在想。', 77, 'assistant', 'reasoning'), seq: 9 }],
+    });
+    expect(turns[0].closing).toBe('');
+    const last = turns[0].steps[turns[0].steps.length - 1];
+    expect(last.kind).toBe('thinking');
+    expect(last.streaming).toBe(true);
+  });
+});
+
+describe('现场时间线 · 多次尝试分主次（决策 359③）', () => {
+  it('同一 stage · node · agent 的旧一代 primary=false，最新一代 primary=true', () => {
+    const turns = build({
+      conversations: [
+        run({ run_id: 1, attempt: 1, status: 'failed' }),
+        run({ run_id: 2, attempt: 2, status: 'failed' }),
+        run({ run_id: 3, attempt: 3, status: 'running' }),
+      ],
+    });
+
+    expect(turns.map((t) => [t.attempt, t.primary])).toEqual([
+      [1, false],
+      [2, false],
+      [3, true],
+    ]);
+  });
+
+  it('同代并行的子代理（同 attempt）都是主——它们不是重试', () => {
+    const turns = build({
+      conversations: [
+        run({ run_id: 1, attempt: 2, agent_type: 'coder' }),
+        run({ run_id: 2, attempt: 2, agent_type: 'coder' }),
+      ],
+    });
+
+    expect(turns.map((t) => t.primary)).toEqual([true, true]);
+  });
+
+  it('不同节点的尝试互不影响', () => {
+    const turns = build({
+      conversations: [
+        run({ run_id: 1, node: 'validate_input', attempt: 1 }),
+        run({ run_id: 2, node: 'validate_output', attempt: 1 }),
+      ],
+    });
+
+    expect(turns.map((t) => t.primary)).toEqual([true, true]);
+  });
+
+  it('attempt 带到轮上；合成轮 / live 轮恒为第 1 次且是主', () => {
+    const turns = build({
+      conversations: [run({ run_id: 1, attempt: 2 })],
+      commands: [cmd({ run_id: null })],
+      liveDeltas: [{ run_id: 77, agent_type: 'main', role: 'assistant', channel: 'content', text: 'x', seq: 0 }],
+    });
+    const conv = turns.find((t) => t.runId === 1);
+    const orphan = turns.find((t) => t.runId === null && t.key.startsWith('g'));
+    const live = turns.find((t) => t.key === 'live77');
+    expect(conv?.attempt).toBe(2);
+    expect(orphan?.attempt).toBe(1);
+    expect(orphan?.primary).toBe(true);
+    expect(live?.attempt).toBe(1);
+    expect(live?.primary).toBe(true);
   });
 });
 
@@ -299,7 +452,9 @@ describe('现场时间线 · 全局排序', () => {
   it('两边都没时刻的轮排末尾（按 run_id 定序）；live 轮永远在最后', () => {
     const turns = build({
       conversations: [run({ run_id: 5 }), run({ run_id: 3 })],
-      liveDeltas: [{ run_id: 77, agent_type: 'main', role: 'assistant', text: 'x' }],
+      liveDeltas: [
+        { run_id: 77, agent_type: 'main', role: 'assistant', channel: 'content', text: 'x', seq: 0 },
+      ],
     });
     expect(turns.map((t) => t.key)).toEqual(['r3', 'r5', 'live77']);
   });

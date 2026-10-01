@@ -161,7 +161,17 @@ export interface LiveDelta {
   run_id: number;
   agent_type: string;
   role: string;
+  /**
+   * 这一段是回话还是思考（决策 244）。后端缺省按 `content` 发（`serde(default)`），
+   * 归约在这里把缺省补齐——下游（现场归约）不再各自猜缺省值。
+   */
+  channel: 'content' | 'reasoning';
   text: string;
+  /**
+   * 到达序（决策 359①）：与 `LiveTool.seq` 共用 `TaskDetailState.liveSeq` 一只计数器。
+   * 增量与工具回执是两份数组，「先想了什么、再查了什么」的交织序只有这对戳答得出来。
+   */
+  seq: number;
 }
 
 export interface LiveTool {
@@ -169,6 +179,12 @@ export interface LiveTool {
   tool: string;
   phase: 'start' | 'end' | 'error';
   args_summary: string;
+  /** 完整参数原文（决策 301，老后端缺省 → 空串）。 */
+  args: string;
+  /** 工具结果（只在 end / error 相位带；老后端缺省 → 空串）。 */
+  result: string;
+  /** 到达序：与 {@link LiveDelta.seq} 同一只计数器；合并进 start 那条时沿用 start 的戳。 */
+  seq: number;
 }
 
 export interface TaskDetailState {
@@ -184,6 +200,11 @@ export interface TaskDetailState {
   liveTools: LiveTool[];
   /** 流式 token 增量累加（决策 123 差距⑤）。 */
   streamTokens: { prompt: number; completion: number };
+  /**
+   * 直播事件的**到达序**计数器（决策 359①）：每条 conversation_delta / tool_event 领一个号。
+   * 增量与工具回执两份数组靠这对戳在渲染层归并出真实的发生顺序。
+   */
+  liveSeq: number;
   pendingReason: PendingReason | null;
   terminal: 'done' | 'failed' | 'cancelled' | null;
   /** 后端权威动作集可能已变，需 refetch `GET /tasks/{id}`。 */
@@ -205,6 +226,7 @@ export function emptyTaskDetailState(partial: Partial<TaskDetailState> = {}): Ta
     liveDeltas: [],
     liveTools: [],
     streamTokens: { prompt: 0, completion: 0 },
+    liveSeq: 0,
     pendingReason: null,
     terminal: null,
     refetchRequested: false,
@@ -365,29 +387,58 @@ export function reduceTaskDetail(state: TaskDetailState, event: SseEvent): TaskD
             run_id: event.run_id,
             agent_type: event.agent_type,
             role: event.role,
+            // 老后端不发 channel（`serde(default)`）→ 缺省 content：那正是它此前
+            // 唯一见过的形状（决策 244 的加性口径）。
+            channel: event.channel === 'reasoning' ? 'reasoning' : 'content',
             text: event.text,
+            seq: state.liveSeq,
           },
         ],
         streamTokens: {
           prompt: state.streamTokens.prompt + event.prompt_tokens,
           completion: state.streamTokens.completion + event.completion_tokens,
         },
+        liveSeq: state.liveSeq + 1,
       };
 
-    case 'tool_event':
+    case 'tool_event': {
+      // 一次调用一条记录（决策 244 同款判据）：start 与随后的 end / error 合成一条，
+      // 不合并的话一次 read_file 会在现场留两条回执（一条「运行中」一条「完成」）。
+      // 调用按序执行，故「该 run 最后一条仍是 start」就是「这一次调用在等结果」；
+      // 用工具名配对不够——同一 run 连查两次同名工具是常态。
+      const tools = [...state.liveTools];
+      let last = tools.length - 1;
+      while (last >= 0 && tools[last].run_id !== event.run_id) last--;
+      if (last >= 0 && tools[last].phase === 'start' && event.phase !== 'start') {
+        // 收尾整条换掉开调那条：相位与结果取新到的，参数原文新到的不带（老后端）就保住
+        // start 那份。**到达序沿用 start 的戳**——回执在时间线上的位置是这次调用开始的
+        // 地方（先想 → 查 → 再想），不是它收尾的地方。
+        tools[last] = {
+          ...tools[last],
+          phase: event.phase,
+          args: event.args || tools[last].args,
+          result: event.result ?? tools[last].result,
+        };
+        return { ...base, ...taskPatch, liveTools: tools, liveSeq: state.liveSeq + 1 };
+      }
       return {
         ...base,
         ...taskPatch,
         liveTools: [
-          ...state.liveTools,
+          ...tools,
           {
             run_id: event.run_id,
             tool: event.tool,
             phase: event.phase,
             args_summary: event.args_summary,
+            args: event.args ?? '',
+            result: event.result ?? '',
+            seq: state.liveSeq,
           },
         ],
+        liveSeq: state.liveSeq + 1,
       };
+    }
 
     default:
       return base;
