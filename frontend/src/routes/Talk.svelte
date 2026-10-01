@@ -87,6 +87,7 @@
   import PendingActions from '../components/board/PendingActions.svelte';
   import DiffReviewPanel from '../components/task/DiffReviewPanel.svelte';
   import EmptyState from '../components/ui/EmptyState.svelte';
+  import Fold from '../components/ui/Fold.svelte';
   import Modal from '../components/ui/Modal.svelte';
   import { router } from '../router.svelte';
 
@@ -341,6 +342,19 @@
     // 与 `toggleThinking` / `toggleReceipt` 同一手法：默认的 `open` 翻转由状态接管。
     e.preventDefault();
     talk.toolOpen = { ...talk.toolOpen, [key]: !toolIsOpen(key) };
+  }
+
+  /**
+   * 修复提议那块补丁（票 12）的展开态：**默认收起**，故不走 `receiptIsOpen` 那张表
+   * （它的缺省是「桌面展开、折行档收起」，那是工位回执的规矩）。受控的理由与其余折叠
+   * 逐字相同（决策 218② / 301）：提议轮会随流式反复重渲染，人不该被自己点开的那一块
+   * 打回。键是提议 id——它在这一屏里唯一。
+   */
+  let patchOpen = $state<Record<string, boolean>>({});
+
+  function togglePatch(e: MouseEvent, id: string) {
+    e.preventDefault();
+    patchOpen = { ...patchOpen, [id]: !(patchOpen[id] ?? false) };
   }
 
   /** 每个 pending 任务的详情（allowed_actions 只在详情里下发，决策 101）——住在 store（决策 354①）。 */
@@ -1778,12 +1792,17 @@
               <p class="dim note" class:ferr={!p.payload?.gate_passed}>{gateLabel}</p>
             {/if}
             {#if p.payload?.diff}
-              <details class="rcpts">
-                <summary class="rcpts-sum">
-                  补丁 <span class="dim">{p.payload.diff_stat ?? ''}▸</span>
-                </summary>
-                <pre class="diff-body" data-repair-diff={p.id}>{p.payload.diff}</pre>
-              </details>
+              {@const diff = p.payload.diff}
+              <Fold
+                chrome="bare"
+                row="inline"
+                class="rcpts"
+                open={patchOpen[p.id] ?? false}
+                ontoggle={(e) => togglePatch(e, p.id)}
+              >
+                {#snippet summary()}补丁 <span class="dim">{p.payload?.diff_stat ?? ''}</span>{/snippet}
+                <pre class="diff-body" data-repair-diff={p.id}>{diff}</pre>
+              </Fold>
             {/if}
           {:else}
             <!-- 参数原样可见：按键之前要看得出它到底要什么（后端生成的那句话是摘要，不是全部） -->
@@ -1909,32 +1928,45 @@
                出处按一下就在，摘要行永远带条数。展开态受控的理由与工位回执逐字相同
                （见 `receiptOpen`）：流式增量反复重渲染同一轮时，人手动展开的那一组不该被打回。 -->
           {#if turn.steps.length > 0}
-            <details class="rcpts process" data-steps={turn.steps.length} open={receiptIsOpen(turn.key)}>
-              <summary class="rcpts-sum" onclick={(e) => toggleReceipt(e, turn.key)}>
-                过程 <span class="dim">{stepsSummary(turn.steps)} ▸</span>
-              </summary>
+            <Fold
+              chrome="bare"
+              row="inline"
+              class="rcpts process"
+              open={receiptIsOpen(turn.key)}
+              ontoggle={(e) => toggleReceipt(e, turn.key)}
+              data-steps={turn.steps.length}
+            >
+              {#snippet summary()}过程 <span class="dim">{stepsSummary(turn.steps)}</span>{/snippet}
               {#each turn.steps as step (step.key)}
                 {#if step.kind === 'thinking'}
                   <!-- 推理（决策 244）：**默认收起**，两档都是——它常常比回话本身长一个量级，
                        展开着摆在时间线上会把对话冲垮。摘要在流式期间就说「正在想…」并带出
                        **最新一行原文**（ticker，决策 301：人不用点开就知道它想到哪了），
                        收口后带字数。 -->
-                  <details class="rcpts think" data-step="thinking" open={thinkingIsOpen(step.key)}>
-                    <summary class="rcpts-sum" onclick={(e) => toggleThinking(e, step.key)}>
+                  <Fold
+                    chrome="bare"
+                    row="inline"
+                    class="rcpts think"
+                    space={4}
+                    open={thinkingIsOpen(step.key)}
+                    ontoggle={(e) => toggleThinking(e, step.key)}
+                    data-step="thinking"
+                  >
+                    {#snippet summary()}
                       {#if step.live}
                         正在想… <span class="tick" data-think-tick>{thinkTicker(step.text)}</span>
                       {:else}
                         思考过程 {step.text.length} 字
                       {/if}
-                      ▸
-                    </summary>
+                    {/snippet}
                     <pre
                       class="think-body"
                       use:trackThinkBody={step.key}
                       onscroll={(e) => onThinkScroll(e, step.key)}>{step.text}</pre>
-                  </details>
+                  </Fold>
                 {:else if step.tool}
                   {@const r = receipt(step.tool.name, step.tool.argsSummary, turn.briefing)}
+                  {@const tool = step.tool}
                   <!-- 工具调用：与「正在发生的工具调用」同一形状（左缘亮度阶 + 无框 = 转述
                        不是发言），只是这里它是**已经发生**的那一步——左缘跟它成没成走：
                        正在查是静的 --pane，查完点亮 --go，没读到（含被拒的越权工具）用 --stop。
@@ -1944,36 +1976,32 @@
                        **收起行就是上面那一行**（决策 301 加展开）：摘要把「谁、查什么、成没成」
                        说全了，完整参数与结果是排查时才要的深度。默认收起（ZCode 的口径）——
                        一次长查读摊开参数会直接盖住半屏对话。 -->
-                  <details
+                  <Fold
+                    chrome="box"
+                    row="flex"
                     class="rcpt live"
-                    data-step="tool"
-                    data-tool={step.tool.name}
-                    class:pending={step.tool.state === 'running'}
-                    class:done={step.tool.state === 'ok'}
-                    class:bad={step.tool.state === 'bad'}
+                    tone={tool.state === 'running' ? 'pending' : tool.state === 'bad' ? 'bad' : 'go'}
+                    space={4}
                     open={toolIsOpen(step.key)}
+                    ontoggle={(e) => toggleTool(e, step.key)}
+                    title={toolIsOpen(step.key) ? '收起工具详情' : '展开工具详情'}
+                    data-step="tool"
+                    data-tool={tool.name}
                   >
-                    <!-- `title` 只说**动作**，不夹编号（文案纪律）；不给 `summary` 挂
+                    <!-- `title` 只说**动作**，不夹编号（文案纪律）；不给收起行挂
                          `aria-label` 是有意的——那会把「读到了什么、成没成」这句可读名整个换掉，
                          而展开态 `details` 自己就报给辅助技术了。 -->
-                    <summary
-                      class="rcpt-head"
-                      onclick={(e) => toggleTool(e, step.key)}
-                      title={toolIsOpen(step.key) ? '收起工具详情' : '展开工具详情'}
-                    >
-                      <Sprite name={r.sprite} size={10} />
-                      <span class="nm">{r.workshop}</span>
-                      <span class="dim">{r.label}</span>
-                      <span class="dim args">{step.tool.argsSummary}</span>
-                      <span class="rs" class:bad={step.tool.state === 'bad'}>
-                        {step.tool.state === 'running'
-                          ? '正在查…'
-                          : step.tool.state === 'bad'
-                            ? '未读到'
-                            : '已读'}
+                    {#snippet summary()}
+                      <span class="rcpt-head">
+                        <Sprite name={r.sprite} size={10} />
+                        <span class="nm">{r.workshop}</span>
+                        <span class="dim">{r.label}</span>
+                        <span class="dim args">{tool.argsSummary}</span>
+                        <span class="rs" class:bad={tool.state === 'bad'}>
+                          {tool.state === 'running' ? '正在查…' : tool.state === 'bad' ? '未读到' : '已读'}
+                        </span>
                       </span>
-                      <span class="chev" aria-hidden="true">▸</span>
-                    </summary>
+                    {/snippet}
                     {#if toolIsOpen(step.key)}
                       <!-- 展开体：参数与结果各一份，纯文本（决策 274：留痕不渲染 markdown——
                            它是模型的排版输出之外的东西，符号拿去做标题/强调会把一句实话画歪）。
@@ -1991,14 +2019,14 @@
                         {/if}
                       </div>
                     {/if}
-                  </details>
+                  </Fold>
                 {:else}
                   <!-- 中途说出口的话（决策 273）：它在段序里有自己的位置，故不并进收口那一句。
                        按 markdown 渲染，与回话同一套（它也是值班长的话，只是没在那句上收口）。 -->
                   <div class="narr" data-step="text"><MarkdownView source={step.text} /></div>
                 {/if}
               {/each}
-            </details>
+            </Fold>
           {/if}
 
           <!-- ── 回话（收口那一句）──
@@ -2821,36 +2849,16 @@
     font-size: 12px;
   }
 
-  /* ── 工位回执：转述不是发言（左缘 4px 亮度阶 + 无框，与命令输出同一手法） ── */
-  .rcpts {
-    margin-top: 8px;
-  }
-  .rcpts-sum {
-    color: var(--text-3);
-    cursor: pointer;
-    list-style: none;
-  }
-  .rcpts-sum::-webkit-details-marker {
-    display: none;
-  }
-  .rcpt {
-    border-left: 4px solid var(--pane);
-    background: var(--panel);
-    padding: 6px 10px;
-    margin-top: 6px;
-  }
+  /* ── 工位回执的收起行（左缘 4px 亮度阶 = 转述不是发言，与命令输出同一手法）──
+     折叠壳（框沿 / 左缘档位 / 底板 / chevron / 清单符）归 `components/ui/Fold.svelte`
+     （决策 366），这里只管字段本身。**这层包裹是调用方写的**：Svelte 的作用域够不到
+     `Fold` 内部，包一层自己的元素正是让 `nm` / `args` / `rs` 那些子规则照旧可锚的那道缝。 */
   .rcpt-head {
     display: flex;
     align-items: center;
     gap: 7px;
-    color: var(--text-3);
-    cursor: pointer;
-    /* 收起行同时是那一段的 `summary`（决策 301）：默认那个三角标与列表符都撤掉，
-       chevron 由下面的 `.chev` 自己画（`▸` 是全站既有语汇，与 `.rcpts-sum` 一致）。 */
-    list-style: none;
-  }
-  .rcpt-head::-webkit-details-marker {
-    display: none;
+    flex: 1;
+    min-width: 0;
   }
   .rcpt-head .nm {
     color: var(--text-2);
@@ -2862,15 +2870,6 @@
     overflow: hidden;
     text-overflow: ellipsis;
     white-space: nowrap;
-  }
-  /* 展开提示（决策 301）：常驻但走装饰档（--text-4）——触屏没有 hover，
-     藏到 hover 才出现等于这一档的人看不到它。旋转换向不用缓动（全站零缓动）。 */
-  .rcpt-head .chev {
-    flex: none;
-    color: var(--text-4);
-  }
-  .rcpt[open] > .rcpt-head .chev {
-    transform: rotate(90deg);
   }
   /* ── 工具展开详情（决策 301）：完整参数与结果各一份 ──
      上限 320px 与 `.think-body` / `.diff-body` 同一个数：展开的是**深度**，不是版面。
@@ -2906,28 +2905,9 @@
     color: var(--stop);
   }
 
-  /* ── 工具调用那一步（决策 244 / 273）：与发言同一形状，靠左缘的档位说状态 ──
-     正在查是静的 --pane（还没结果可看），查完点亮 --go，没查到走 --stop。
-     不用动画位：全站零新增动画位这条纪律不因「实时」破例（转的那一刻就说明在查）。 */
-  .rcpt.live {
-    margin-top: 4px;
-  }
-  .rcpt.live.pending {
-    border-left-color: var(--pane);
-  }
-  .rcpt.live.done {
-    border-left-color: var(--go);
-  }
-  .rcpt.live.bad {
-    border-left-color: var(--stop);
-  }
-
   /* ── 过程那一组（决策 273）：这一轮按发生顺序的每一步都排在里面 ──
      工具那一步与思考那一步各自带着自己的样式，这里只管组内的间距；推理是嵌套的一层
      折叠块（形状照旧），中途说出口的话是一小段正文。 */
-  .rcpts.process > .rcpts {
-    margin-top: 4px;
-  }
   .narr {
     margin-top: 6px;
     color: var(--text);

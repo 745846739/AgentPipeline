@@ -990,3 +990,24 @@ export async function settleBundle(page: Page, guard: BundleGuard): Promise<void
   await page.waitForTimeout(300);
   expectBundleHealthy(guard);
 }
+
+/**
+ * 展开现场页签里所有还收着的轮（决策 366：轮默认收起，正文要点一下才进视口）。
+ *
+ * **为什么读 `details.open` 属性而不是用 `:not([open])` 选择器**：展开态是 Svelte 写的
+ * DOM 属性，选择器那一路要赌它同时反射成属性——赌输的表现是「点过的又被点到」，而这里
+ * 一次点错只是白点一下，不会静默漏掉一个轮。节点不因翻转而重建（Svelte 只改 `open`），
+ * 所以先取总数再按下标点，下标不会漂。
+ *
+ * **`summary` 取 `.first()`**：轮里还嵌着 prompt / 思考 / 工具三层折叠，它们各自也有
+ * `summary`——文档序里轮自己那一条在最前（它是折叠块的第一个孩子），取首个即它。
+ */
+export async function expandSceneTurns(page: Page): Promise<void> {
+  const folds = page.locator('article.turn details.turnfold');
+  const total = await folds.count();
+  for (let i = 0; i < total; i += 1) {
+    const fold = folds.nth(i);
+    if (await fold.evaluate((el) => (el as HTMLDetailsElement).open)) continue;
+    await fold.locator('summary').first().click();
+  }
+}

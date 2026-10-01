@@ -1,5 +1,5 @@
 <script lang="ts">
-  import { tick } from 'svelte';
+  import { tick, untrack } from 'svelte';
   import type { ConversationSummary, NodeCommand, NodeConversation } from '../../api/types';
   import type { LiveDelta, LiveTool } from '../../realtime/reduce';
   import { formatClock, formatTokens } from '../../lib/format';
@@ -14,6 +14,7 @@
   import MarkdownView from '../render/MarkdownView.svelte';
   import MetadataCard from '../render/MetadataCard.svelte';
   import EmptyState from '../ui/EmptyState.svelte';
+  import Fold from '../ui/Fold.svelte';
   import MoreRow from '../ui/MoreRow.svelte';
 
   /**
@@ -21,11 +22,15 @@
    * 版式取对讲台的那一套——一叠操作台对话框（`.turn` 即对话框本体，压在框沿上的
    * 名牌 = 发言者），过程按发生顺序排在轮里，命令是一枚带退出码的回执。
    *
+   * **轮默认收起**（决策 366）：名牌照旧压在框沿上（那是这一轮的发言者，扫读用的），
+   * 正文收在一条受控折叠行下面——「点开看全过程」的观感与对讲台逐字同源（同一个
+   * `Fold`，左缘档位与收起行排版只有一份定义）。
+   *
    * 归约判断全部住在 `lib/taskScene.ts`（命令归哪一轮、消息怎么折步骤、流式增量接到
    * 哪一头上、直播流怎么交织折步、多次尝试谁主谁次、轮首的 prompt 与落地思考——决策
    * 359 / 360）；这里只接线：关键词过滤、窗口化（决策 319 的口径原样——先过滤后切）、
-   * 展开态受控（与 Talk 同一手法：`preventDefault` 掉默认翻转，状态说了算）、思考步 /
-   * 阶段 prompt / 旧一代尝试的折叠、流式期间的贴底跟随（只在人本就在底上时跟）。
+   * 展开态受控（与 Talk 同一手法：`preventDefault` 掉默认翻转，状态说了算）、流式期间
+   * 的贴底跟随（只在人本就在底上时跟）。
    */
   interface Props {
     conversations: ConversationSummary[];
@@ -88,6 +93,8 @@
   let toolOpen = $state<Record<string, boolean>>({});
   let thinkOpen = $state<Record<string, boolean>>({});
   let promptOpen = $state<Record<string, boolean>>({});
+  /** 轮的展开态：缺省收起（决策 366）。键随轮稳定（`r<runId>` / `g<n>` / `live<runId>`）。 */
+  let turnOpen = $state<Record<string, boolean>>({});
   /** 每轮步骤切片的窗口游标（换 run 不重置：键随轮稳定，旧游标无有害 side effect）。 */
   let turnPages = $state<Record<string, number>>({});
   /** 台账命令按 id 的索引：回执展开时要拿**原命令**去问输出账与发加载（归约只留了显示字段）。 */
@@ -130,6 +137,11 @@
     promptOpen = { ...promptOpen, [key]: !promptOpen[key] };
   }
 
+  function toggleTurn(e: MouseEvent, key: string) {
+    e.preventDefault();
+    turnOpen = { ...turnOpen, [key]: !(turnOpen[key] ?? false) };
+  }
+
   /** 阶段 prompt 折叠行的读数：两段各报字数，缺的那段不报（步没带 prompt 时空串）。 */
   const promptSummary = (p: { system: string | null; user: string | null } | null) => {
     if (!p) return '';
@@ -141,6 +153,24 @@
 
   /** 命令是不是还在跑（退出码没落）：在跑的那条流式输出常显，不进折叠。 */
   const isRunning = (exitCode: number | null) => exitCode === null;
+
+  /**
+   * 收起行上的活体提示（决策 366）：一律折叠不等于一律静止——这一轮此刻在冒什么，
+   * 收着也要看得见（对讲台收起的思考块早在决策 301 就是这么办的：摘要是活的）。
+   * 从尾往前找第一件正在发生的事：跑着的命令 > 正在想 > 正在说 > 正在回话。
+   */
+  function turnLive(t: SceneTurn): string | null {
+    if (!t.streaming) return null;
+    for (let i = t.steps.length - 1; i >= 0; i -= 1) {
+      const s = t.steps[i];
+      if (s.command && isRunning(s.command.exitCode)) return `正在跑 ${s.command.command}`;
+      if (!s.streaming) continue;
+      if (s.kind === 'thinking') return `正在想… ${thinkTicker(s.text)}`;
+      if (s.kind === 'text') return `正在说… ${thinkTicker(s.text)}`;
+    }
+    if (t.closingStreaming) return `正在回话… ${thinkTicker(t.closing)}`;
+    return '正在跑…';
+  }
 
   /** 每轮的步骤切片（显尾部：最新的一步与流式尾巴在最底下，窗口化了才看得见「现在」）。 */
   function stepSlice(turn: SceneTurn) {
@@ -168,12 +198,17 @@
     void tick().then(() => window.scrollTo({ top: doc.scrollHeight }));
   });
 
-  /* ── 深链 / 跳转落点：把那一轮带到眼前并亮一下边框 ── */
+  /* ── 深链 / 跳转落点：把那一轮**展开**（收起着滚过去等于没到，决策 366）、
+     带到眼前并亮一下边框 ── */
   let flashRun = $state<number | null>(null);
   $effect(() => {
     const rid = highlightRunId;
     if (rid === null) return;
     void tick().then(() => {
+      // 整段用 `untrack` 读轮表与折叠表：这一跳只认 `highlightRunId`，否则流式每长一次
+      // 都会把它重跑一遍，等于每次增量都把视口拽回那一轮。
+      const target = untrack(() => turns.find((t) => t.runId === rid));
+      if (target) turnOpen = { ...untrack(() => turnOpen), [target.key]: true };
       const el = document.querySelector(`article[data-run="${rid}"]`);
       if (!el) return;
       // jsdom 没有 scrollIntoView 实现（测试环境）：亮边框那一段照走。
@@ -230,12 +265,19 @@
         {#if step.kind === 'prompt'}
           <!-- 阶段 prompt（决策 360）：组装后的两段原文快照，默认收起（系统段常以万字计），
                展开体里两段分开摆——「这是 prompt 问题」要能当场核对。 -->
-          <details class="rcpt sprompt" open={promptOpen[step.key] ?? false}>
-            <summary class="rcpt-head" onclick={(e) => togglePrompt(e, step.key)}>
-              <span class="nm">阶段 PROMPT</span>
-              <span class="dim args">{promptSummary(step.prompt)}</span>
-              <span class="chev" aria-hidden="true">▸</span>
-            </summary>
+          <Fold
+            chrome="box"
+            row="flex"
+            class="rcpt sprompt"
+            open={promptOpen[step.key] ?? false}
+            ontoggle={(e) => togglePrompt(e, step.key)}
+          >
+            {#snippet summary()}
+              <span class="rcpt-head">
+                <span class="nm">阶段 PROMPT</span>
+                <span class="dim args">{promptSummary(step.prompt)}</span>
+              </span>
+            {/snippet}
             {#if promptOpen[step.key]}
               <div class="rcpt-more">
                 {#if step.prompt?.system}
@@ -248,7 +290,7 @@
                 {/if}
               </div>
             {/if}
-          </details>
+          </Fold>
         {:else if step.kind === 'text'}
           {#if step.role === 'system'}
             <details class="sys">
@@ -268,31 +310,42 @@
         {:else if step.kind === 'thinking'}
           <!-- 思考步（决策 244 / 359①）：默认收起（它常比回话长一个量级），摘要在流式
                期间带出最新一行原文（ticker，对讲台同款），落地后带字数。 -->
-          <details class="rcpt think" open={thinkOpen[step.key] ?? false}>
-            <summary class="rcpt-head" onclick={(e) => toggleThink(e, step.key)}>
-              <span class="nm">{step.streaming ? '正在想…' : '思考过程'}</span>
-              <span class="dim args">{step.streaming ? thinkTicker(step.text) : `${step.text.length} 字`}</span>
-              <span class="chev" aria-hidden="true">▸</span>
-            </summary>
-            <pre class="rm-body mono">{step.text}</pre>
-          </details>
+          <Fold
+            chrome="box"
+            row="flex"
+            class="rcpt think"
+            open={thinkOpen[step.key] ?? false}
+            ontoggle={(e) => toggleThink(e, step.key)}
+          >
+            {#snippet summary()}
+              <span class="rcpt-head">
+                <span class="nm">{step.streaming ? '正在想…' : '思考过程'}</span>
+                <span class="dim args"
+                  >{step.streaming ? thinkTicker(step.text) : `${step.text.length} 字`}</span
+                >
+              </span>
+            {/snippet}
+            <pre class="rm-body mono draft">{step.text}</pre>
+          </Fold>
         {:else if step.tool}
           {@const tool = step.tool}
-          <details
+          <Fold
+            chrome="box"
+            row="flex"
             class="rcpt"
-            class:pending={tool.phase === 'running'}
-            class:done={tool.phase === 'ok'}
-            class:bad={tool.phase === 'bad'}
+            tone={tool.phase === 'running' ? 'pending' : tool.phase === 'bad' ? 'bad' : 'go'}
             open={toolOpen[step.key] ?? false}
+            ontoggle={(e) => toggleTool(e, step.key)}
           >
-            <summary class="rcpt-head" onclick={(e) => toggleTool(e, step.key)}>
-              <span class="nm">{tool.name}</span>
-              <span class="dim args">{tool.argsSummary}</span>
-              <span class="rs" class:bad={tool.phase === 'bad'}>
-                {tool.phase === 'running' ? '运行中…' : tool.phase === 'bad' ? '失败' : '完成'}
+            {#snippet summary()}
+              <span class="rcpt-head">
+                <span class="nm">{tool.name}</span>
+                <span class="dim args">{tool.argsSummary}</span>
+                <span class="rs" class:bad={tool.phase === 'bad'}>
+                  {tool.phase === 'running' ? '运行中…' : tool.phase === 'bad' ? '失败' : '完成'}
+                </span>
               </span>
-              <span class="chev" aria-hidden="true">▸</span>
-            </summary>
+            {/snippet}
             {#if toolOpen[step.key]}
               <div class="rcpt-more">
                 {#if tool.args}
@@ -303,11 +356,13 @@
                 <pre class="rm-body mono">{tool.result || '（没有输出）'}</pre>
               </div>
             {/if}
-          </details>
+          </Fold>
         {:else if step.command}
           {@const cmd = step.command}
           {#if isRunning(cmd.exitCode)}
-            <!-- 在跑的那条：流式输出常显（正是「用户查看时也流式输出」的那一格） -->
+            <!-- 在跑的那条：流式输出常显（正是「用户查看时也流式输出」的那一格）。
+                 它是这一页唯一**不做折叠**的回执——所以那层框沿得自己带（折叠壳的
+                 观感归 `Fold`，见 `Fold.svelte` 顶上的注释）。 -->
             <div class="rcpt cmd running" data-command={cmd.id}>
               <div class="rcpt-head">
                 <i class="lamp"></i>
@@ -321,20 +376,25 @@
               {/if}
             </div>
           {:else}
-            <details class="rcpt cmd" class:bad={cmd.exitCode !== 0} open={expandedCmd === cmd.id}>
-              <summary
-                class="rcpt-head"
-                onclick={(e) => toggleCmd(e, cmd.id)}
-              >
-                <i class="lamp" class:bad={cmd.exitCode !== 0}></i>
-                <span class="tm">{formatClock(cmd.startedAt)}</span>
-                <span class="src">{cmd.source === 'system' ? 'sys' : 'agent'}</span>
-                <span class="c mono" title={cmd.command}>{cmd.command}</span>
-                {#if cmd.rewritten}<span class="rw">改写</span>{/if}
-                <span class="ms">{cmd.durationMs !== null ? formatDuration(cmd.durationMs) : '—'}</span>
-                <span class="rs ex" class:bad={cmd.exitCode !== 0}>exit {cmd.exitCode}</span>
-                <span class="chev" aria-hidden="true">▸</span>
-              </summary>
+            <Fold
+              chrome="box"
+              row="flex"
+              class="rcpt cmd"
+              tone={cmd.exitCode !== 0 ? 'bad' : 'go'}
+              open={expandedCmd === cmd.id}
+              ontoggle={(e) => toggleCmd(e, cmd.id)}
+            >
+              {#snippet summary()}
+                <span class="rcpt-head">
+                  <i class="lamp" class:bad={cmd.exitCode !== 0}></i>
+                  <span class="tm">{formatClock(cmd.startedAt)}</span>
+                  <span class="src">{cmd.source === 'system' ? 'sys' : 'agent'}</span>
+                  <span class="c mono" title={cmd.command}>{cmd.command}</span>
+                  {#if cmd.rewritten}<span class="rw">改写</span>{/if}
+                  <span class="ms">{cmd.durationMs !== null ? formatDuration(cmd.durationMs) : '—'}</span>
+                  <span class="rs ex" class:bad={cmd.exitCode !== 0}>exit {cmd.exitCode}</span>
+                </span>
+              {/snippet}
               {#if expandedCmd === cmd.id}
                 {#if loadingCmd === cmd.id && cmd.output === null}
                   <div class="rcpt-more">正在加载完整输出…</div>
@@ -351,7 +411,7 @@
                   </div>
                 {/if}
               {/if}
-            </details>
+            </Fold>
           {/if}
         {/if}
       {/each}
@@ -377,6 +437,8 @@
       class:flash={flashRun !== null && flashRun === turn.runId}
       data-run={turn.runId ?? undefined}
     >
+      <!-- 名牌常显：它是这一轮的发言者，也是「一叠对话框」那副版式的骨架（决策 174 / 349），
+           收起折叠的只是正文。 -->
       <div class="dname">
         {turn.name}{#if turn.sub}
           <span class="sub">∟ {turn.sub}</span>{/if}
@@ -385,19 +447,28 @@
         {#if turn.tokens}<span class="dim">{formatTokens(turn.tokens.prompt + turn.tokens.completion)} tok</span>{/if}
       </div>
 
-      {#if turn.primary}
+      <!-- 正文默认收起（决策 366）。旧代尝试走同一个形状（决策 359③ 的「整轮折起」在这里
+           落成了所有轮的统一待遇：内容一个字不删，只是都要点一下）。 -->
+      <Fold
+        chrome="bare"
+        row="flex"
+        space={2}
+        class={turn.primary ? 'turnfold' : 'turnfold retryfold'}
+        open={turnOpen[turn.key] ?? false}
+        ontoggle={(e) => toggleTurn(e, turn.key)}
+        data-turn={turn.key}
+      >
+        {#snippet summary()}
+          {@const live = turnLive(turn)}
+          {@const unfolded = turnOpen[turn.key] ?? false}
+          <span class="turn-sum">
+            <span class="dim steps">{turn.steps.length} 步</span>
+            {#if live}<span class="live-tick" data-turn-tick>{live}</span>{/if}
+            {#if !unfolded}<span class="dim hint">点开看全过程</span>{/if}
+          </span>
+        {/snippet}
         {@render turnBody(turn)}
-      {:else}
-        <!-- 旧一代的尝试（决策 359③）：整轮折起、内容一个字不删——多次重试的主次
-             就在这：最新一代全幅展示，历史按一下就在。 -->
-        <details class="retryfold">
-          <summary class="retry-sum">
-            第 {turn.attempt} 次尝试 · {turn.steps.length} 步 · 点开看全过程
-            <span class="chev" aria-hidden="true">▸</span>
-          </summary>
-          {@render turnBody(turn)}
-        </details>
-      {/if}
+      </Fold>
     </article>
   {/each}
 {/if}
@@ -480,27 +551,30 @@
     color: var(--text-3);
     font-size: 12px;
   }
-  /* ── 旧一代尝试的整轮折叠（决策 359③）：摘要行一抬手就到，内容一个字不删 ── */
-  .retryfold {
-    margin: 2px 0 0;
-  }
-  .retry-sum {
+  /* ── 轮的收起行（决策 366）：字段一行排开，占满整行把 chevron 顶到尾部 ── */
+  .turn-sum {
     display: flex;
     align-items: center;
     gap: 7px;
-    color: var(--text-3);
-    cursor: pointer;
-    list-style: none;
+    flex: 1;
+    min-width: 0;
     font-size: 12px;
   }
-  .retry-sum::-webkit-details-marker {
-    display: none;
+  .turn-sum .steps,
+  .turn-sum .hint {
+    flex: none;
   }
-  .retry-sum .chev {
-    color: var(--text-4);
+  .turn-sum .hint {
+    margin-left: auto;
   }
-  .retryfold[open] > .retry-sum .chev {
-    transform: rotate(90deg);
+  /* 活体提示（决策 366）：收着也要看得见这一轮在冒什么——长了就截尾，别撑破一行 */
+  .turn-sum .live-tick {
+    flex: 1;
+    min-width: 0;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    color: var(--text-3);
   }
   .who {
     font-family: var(--font-cond);
@@ -568,30 +642,15 @@
     overflow: auto;
   }
 
-  /* ── 回执（工具 / 命令同一形状）：左缘档位说状态，展开体收参数与结果 ── */
-  .rcpt {
-    border-left: 4px solid var(--pane);
-    background: var(--panel);
-    padding: 6px 10px;
-    margin-top: 6px;
-  }
-  .rcpt.done {
-    border-left-color: var(--go);
-  }
-  .rcpt.bad {
-    border-left-color: var(--stop);
-  }
+  /* ── 回执的收起行（工具 / 命令 / prompt / 思考同一形）：折叠壳的框沿与 chevron 归
+     `Fold`，这里只管字段本身——这一层包裹是调用方的，子规则照旧锚在它上面。 ── */
   .rcpt-head {
     display: flex;
     align-items: center;
     gap: 7px;
-    color: var(--text-3);
-    cursor: pointer;
-    list-style: none;
+    flex: 1;
+    min-width: 0;
     font-size: 12px;
-  }
-  .rcpt-head::-webkit-details-marker {
-    display: none;
   }
   .rcpt-head .nm {
     color: var(--text-2);
@@ -612,19 +671,19 @@
   .rcpt-head .rs.bad {
     color: var(--stop);
   }
-  .rcpt-head .chev {
-    flex: none;
-    color: var(--text-4);
-  }
-  .rcpt[open] > .rcpt-head .chev {
-    transform: rotate(90deg);
+  /* 在跑的那条不走折叠（它要一直看得见），框沿自己带——取值与 `Fold` 的 `box` 档一致 */
+  .rcpt.running {
+    border-left: 4px solid var(--pending);
+    background: var(--panel);
+    padding: 6px 10px;
+    margin-top: 6px;
   }
   .rcpt-more {
     margin-top: 4px;
     font-size: 12px;
   }
   /* 思考步（决策 244）：草稿的视觉——正文比回话淡一档 */
-  .rcpt.think .rm-body {
+  .rm-body.draft {
     color: var(--text-3);
   }
   .rm-label {
@@ -654,7 +713,7 @@
   }
 
   /* ── 命令回执的摘要行：灯 · 时刻 · 来源 · 命令 · 耗时 · 退出码（旧命令表同列序） ── */
-  .rcpt.cmd .c {
+  .rcpt-head .c {
     flex: 1;
     min-width: 0;
     overflow: hidden;
@@ -662,21 +721,18 @@
     white-space: nowrap;
     color: var(--text-2);
   }
-  .rcpt.cmd .tm {
+  .rcpt-head .tm,
+  .rcpt-head .ms {
     flex: none;
     color: var(--text-3);
   }
-  .rcpt.cmd .src {
+  .rcpt-head .src {
     flex: none;
     padding: 0 4px;
     border: 2px solid var(--pane);
     color: var(--text-3);
   }
-  .rcpt.cmd .ms {
-    flex: none;
-    color: var(--text-3);
-  }
-  .rcpt.cmd .ex {
+  .rcpt-head .ex {
     margin-left: auto;
   }
   .rw {
@@ -695,7 +751,7 @@
   .lamp.bad {
     background: var(--stop);
   }
-  .rcpt.cmd.running .lamp {
+  .rcpt.running .lamp {
     background: var(--pending);
   }
   /* 在跑那条的流式输出：等宽、可横滚、限高（它每毫秒都在长） */
@@ -727,7 +783,7 @@
       flex-wrap: wrap;
       gap: 2px 7px;
     }
-    .rcpt.cmd .c {
+    .rcpt-head .c {
       flex: 1 0 100%;
       order: 9;
       white-space: pre-wrap;

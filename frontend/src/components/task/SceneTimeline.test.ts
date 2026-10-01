@@ -72,6 +72,11 @@ afterEach(() => {
   document.body.innerHTML = '';
 });
 
+/** 一轮的折叠块（决策 366）：正文默认收在它下面。 */
+function turnFold(selector = 'article.turn details.turnfold'): HTMLDetailsElement {
+  return document.querySelector(selector) as HTMLDetailsElement;
+}
+
 describe('现场时间线 · 轮与收口话', () => {
   it('名牌按 stage · node 写；收口话与消息步骤都在那一轮里', () => {
     render(SceneTimeline, {
@@ -94,6 +99,11 @@ describe('现场时间线 · 轮与收口话', () => {
     expect(turn.textContent).toContain('开始');
     // 收口话经 markdown 渲染
     expect(turn.textContent).toContain('结论写在这里。');
+    // 名牌留在折叠之外（扫读用），正文在折叠之内且默认收起（决策 366）
+    const fold = turnFold();
+    expect(fold.open).toBe(false);
+    expect(turn.querySelector('.dname')?.closest('details')).toBeNull();
+    expect(turn.querySelector('.userbox')?.closest('details')).toBe(fold);
   });
 
   it('完整会话没装载的轮显示「正在读取会话…」，空任务给空态', () => {
@@ -111,7 +121,7 @@ describe('现场时间线 · 轮与收口话', () => {
 });
 
 describe('现场时间线 · 命令回执', () => {
-  it('在跑的那条流式输出常显，不用点开', () => {
+  it('在跑的那条回执自身不折叠：展开那一轮后，流式输出常显', async () => {
     render(SceneTimeline, {
       props: {
         conversations: [],
@@ -121,9 +131,14 @@ describe('现场时间线 · 命令回执', () => {
       },
     });
 
+    // 轮壳收起（决策 366），但那条回执自己不是可折叠的 details——它要一直看得见
+    expect(turnFold().open).toBe(false);
+    await fireEvent.click(turnFold().querySelector('summary') as HTMLElement);
+
     const live = document.querySelector('.cmd-live');
     expect(live?.textContent).toContain('正在跑的第 1 个用例…');
-    expect(document.querySelector('.rcpt.cmd.running')).toBeTruthy();
+    expect(document.querySelector('.rcpt.cmd.running')?.tagName).toBe('DIV');
+    expect(document.querySelector('details.rcpt.cmd')).toBeNull();
   });
 
   it('收口的命令折叠；点开才拉完整输出，退出码与「改写」两条都摆（决策 297）', async () => {
@@ -234,8 +249,81 @@ describe('现场时间线 · 思考步的折叠块（决策 244 / 359①）', ()
   });
 });
 
-describe('现场时间线 · 旧一代尝试整轮折起（决策 359③）', () => {
-  it('旧尝试默认收起、内容还在；最新一代全幅；名牌带次数', async () => {
+describe('现场时间线 · 轮的默认收起（决策 366）', () => {
+  it('收起行报步数与「点开看全过程」，正文一个字不删', async () => {
+    render(SceneTimeline, {
+      props: {
+        conversations: [run()],
+        conversationFor: () => conv([{ role: 'user', content: '开始' }]),
+        commands: [],
+        commandOutputFor: () => null,
+      },
+    });
+
+    const fold = turnFold();
+    expect(fold.open).toBe(false);
+    const summary = fold.querySelector('summary') as HTMLElement;
+    expect(summary.textContent).toContain('1 步');
+    expect(summary.textContent).toContain('点开看全过程');
+    // 正文不上收起行（那是「点开」才给的），但仍在 DOM 里
+    expect(summary.textContent).not.toContain('开始');
+    expect(fold.textContent).toContain('开始');
+
+    await fireEvent.click(summary);
+    expect(fold.open).toBe(true);
+    // 展开之后不再说「点开看全过程」——它已经开着，那句话就成了假话
+    expect(summary.textContent).not.toContain('点开看全过程');
+  });
+
+  it('运行中的轮收着也看得见它在冒什么（活体提示）', () => {
+    render(SceneTimeline, {
+      props: {
+        conversations: [run({ status: 'running' })],
+        conversationFor: () => undefined,
+        commands: [],
+        liveDeltas: [
+          {
+            run_id: 1,
+            agent_type: 'main',
+            role: 'assistant',
+            channel: 'reasoning' as const,
+            text: '先看看板',
+            seq: 0,
+          },
+        ],
+        commandOutputFor: () => null,
+      },
+    });
+
+    const fold = turnFold();
+    expect(fold.open).toBe(false);
+    expect(fold.querySelector('[data-turn-tick]')?.textContent).toContain('先看看板');
+  });
+
+  it('深链要带到眼前的那一轮进场就展开；别的轮照旧收着', async () => {
+    render(SceneTimeline, {
+      props: {
+        conversations: [
+          run({ run_id: 1 }),
+          run({ run_id: 2, stage: 'review', node: 'validate_output' }),
+        ],
+        conversationFor: (rid: number) => conv([{ role: 'user', content: `第 ${rid} 轮` }], rid),
+        commands: [],
+        commandOutputFor: () => null,
+        highlightRunId: 2,
+      },
+    });
+
+    // 落点是 `tick().then(...)` 里定的：等这一跳落地再断言（jsdom 里没有真滚动）
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    const folds = document.querySelectorAll('article.turn details.turnfold');
+    expect((folds[0] as HTMLDetailsElement).open).toBe(false);
+    expect((folds[1] as HTMLDetailsElement).open).toBe(true);
+  });
+});
+
+describe('现场时间线 · 旧一代尝试（决策 359③ / 366）', () => {
+  it('新旧两代都默认收起、内容都还在；旧代带 retryfold 记号，名牌带次数', async () => {
     render(SceneTimeline, {
       props: {
         conversations: [
@@ -249,23 +337,26 @@ describe('现场时间线 · 旧一代尝试整轮折起（决策 359③）', ()
       },
     });
 
-    const folds = document.querySelectorAll('details.retryfold');
-    expect(folds.length).toBe(1);
-    const fold = folds[0] as HTMLDetailsElement;
-    expect(fold.open).toBe(false);
-    expect(fold.textContent).toContain('第 1 次尝试');
+    // 每一轮各有一条折叠行；旧代那一条多一枚 `retryfold` 记号
+    expect(document.querySelectorAll('article.turn details.turnfold').length).toBe(2);
+    expect(document.querySelectorAll('details.retryfold').length).toBe(1);
+
+    const oldOne = document.querySelector('details.retryfold') as HTMLDetailsElement;
+    expect(oldOne.open).toBe(false);
     // 折起不删内容：收起的 body 里正文仍在 DOM
-    expect(fold.textContent).toContain('第 1 次的过程正文');
+    expect(oldOne.textContent).toContain('第 1 次的过程正文');
 
-    await fireEvent.click(fold.querySelector('summary') as HTMLElement);
-    expect(fold.open).toBe(true);
+    const fresh = document.querySelectorAll('article.turn details.turnfold')[1] as HTMLDetailsElement;
+    expect(fresh.open).toBe(false);
+    expect(fresh.textContent).toContain('第 2 次的过程正文');
 
-    // 最新一代（第 2 次）不在折叠里：直接是轮体
-    expect(document.body.textContent).toContain('第 2 次的过程正文');
-    expect(document.body.textContent).not.toContain('第 2 次尝试 ·');
     // 名牌上的次数章：attempt > 1 才亮
     expect(document.body.textContent).toContain('第 2 次');
-    expect(document.body.textContent).toContain('第 1 次尝试');
+
+    await fireEvent.click(oldOne.querySelector('summary') as HTMLElement);
+    expect(oldOne.open).toBe(true);
+    // 展开只动这一轮，另一轮照旧收着
+    expect(fresh.open).toBe(false);
   });
 });
 
@@ -442,8 +533,9 @@ describe('上限截断的省略行（决策 362①）', () => {
     expect(row.tagName).toBe('DIV');
     expect(row.closest('button')).toBeNull();
     expect(row.closest('a')).toBeNull();
-    // 不是 details/summary 那一类可点开的东西
-    expect(row.closest('details')).toBeNull();
+    // 它自己不是可点开的那一类（决策 366 起轮壳本身是折叠，故只问自己这一层）
+    expect(row.closest('summary')).toBeNull();
+    expect(row.querySelector('button, a')).toBeNull();
   });
 
   it('没被丢弃过就不摆这一行', () => {

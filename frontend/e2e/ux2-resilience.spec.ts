@@ -13,6 +13,7 @@ import { expect, test } from '@playwright/test';
 
 import {
   expectBundleHealthy,
+  expandSceneTurns,
   pendingTypeOf,
   settleBundle,
   startApp,
@@ -91,6 +92,11 @@ test.describe('UX2 ⑨ 超时 / 断线 / 长值（票 12 / 13 / 17）', () => {
     await settleBundle(page, bundle);
     // 现场页签（真 tablist；决策 349：命令回执住在现场时间线里）
     await page.getByRole('tab', { name: /现场/ }).click();
+    // 轮默认收起（决策 366）：正文在轮里，先展开才进视口
+    await expect(page.locator('article.turn details.turnfold').first()).toBeVisible({
+      timeout: 30_000,
+    });
+    await expandSceneTurns(page);
 
     const firstCmd = page.locator('.rcpt.cmd').first();
     await expect(firstCmd).toBeVisible({ timeout: 30_000 });
@@ -114,6 +120,8 @@ test.describe('UX2 ⑨ 超时 / 断线 / 长值（票 12 / 13 / 17）', () => {
     // 现场没有「选中 run」：进页签即批量装载完整会话（决策 349），等那一轮的名牌出现
     const turn = page.locator('article.turn', { hasText: 'validate_input' }).first();
     await expect(turn).toBeVisible({ timeout: 30_000 });
+    // 名牌（`stage · node`）落在折叠之外、元数据卡在折叠之内（决策 366）：长值要看得见才测得出
+    await expandSceneTurns(page);
 
     // 元数据卡里那条长路径整条在 DOM 里（没被截断成省略号）
     await expect(page.getByText(LONG_PATH, { exact: false }).first()).toBeVisible({

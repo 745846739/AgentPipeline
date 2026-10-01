@@ -14,6 +14,7 @@ import { expect, test } from '@playwright/test';
 
 import {
   expectBundleHealthy,
+  expandSceneTurns,
   fetchTask,
   pendingTypeOf,
   settleBundle,
@@ -52,6 +53,11 @@ test.describe('前端 E2E ⑦：日志对话可信 + 刷新恢复', () => {
 
       // ── 命令回执：展开那条 git 命令，输出可识别（决策 349：命令是现场轮里的回执）──
       await tabButton.click();
+      // 轮默认收起（决策 366）：名牌先到、正文要点一下——先展开再找那条回执
+      await expect(page.locator('article.turn details.turnfold').first()).toBeVisible({
+        timeout: 30_000,
+      });
+      await expandSceneTurns(page);
       const commandRow = page.locator('.rcpt.cmd', { hasText: 'git add -A' }).first();
       await expect(commandRow).toBeVisible({ timeout: 30_000 });
       await commandRow.locator('summary').click();
