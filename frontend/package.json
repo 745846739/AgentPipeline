@@ -10,6 +10,7 @@
     "test": "vitest run",
     "test:watch": "vitest",
     "test:e2e": "playwright test --project=chromium",
+    "bench": "vitest bench --run",
     "check": "svelte-check --tsconfig ./tsconfig.json"
   },
   "devDependencies": {

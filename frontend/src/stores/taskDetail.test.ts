@@ -7,7 +7,7 @@
  */
 
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
-import type { Task } from '../api/types';
+import type { ConversationSummary, NodeCommand, NodeConversation, Task } from '../api/types';
 import { emptyTaskDetailState } from '../realtime/reduce';
 import { taskDetail } from './taskDetail.svelte';
 
@@ -25,6 +25,7 @@ const mocks = vi.hoisted(() => {
     getTask: vi.fn(),
     getFlow: vi.fn(),
     getConversations: vi.fn(),
+    getConversation: vi.fn(),
     getCommands: vi.fn(),
     splitTask: vi.fn(),
     modelOverrideTask: vi.fn(),
@@ -42,7 +43,7 @@ vi.mock('../api/client', () => ({
   modelOverrideTask: mocks.modelOverrideTask,
   // 本用例走不到，但被测模块要能 import
   getCommandOutput: vi.fn(),
-  getConversation: vi.fn(),
+  getConversation: mocks.getConversation,
   getTaskFile: vi.fn(),
   reviewTask: vi.fn(),
 }));
@@ -115,6 +116,7 @@ beforeEach(() => {
   mocks.getTask.mockReset();
   mocks.getFlow.mockReset().mockResolvedValue({ transitions: [] });
   mocks.getConversations.mockReset().mockResolvedValue([]);
+  mocks.getConversation.mockReset().mockResolvedValue(null);
   mocks.getCommands.mockReset().mockResolvedValue([]);
   mocks.splitTask.mockReset();
   mocks.modelOverrideTask.mockReset();
@@ -188,6 +190,177 @@ describe('详情页装载失败不留上一个任务（票 01 / R2-01）', () =>
     expect(taskDetail.state.task?.id).toBe('B');
     expect(taskDetail.error).toBeNull();
     expect(mocks.sync).toHaveBeenCalledWith(['B']);
+  });
+});
+
+describe('现场页签的批量装载（决策 361，票 03）', () => {
+  /** 摘要态的那一份（`/conversations` 缺省分支）。 */
+  const summary = (runId: number): ConversationSummary => ({
+    run_id: runId,
+    stage: 'develop',
+    node: 'execute',
+    attempt: 1,
+    agent_type: 'main',
+    parent_run_id: null,
+    prompt_tokens: 1,
+    completion_tokens: 1,
+    status: 'success',
+    archived_at: null,
+  });
+  /** 完整会话（`?include_messages=true` 的元素，与单条读法同形）。 */
+  const conversation = (runId: number): NodeConversation => ({
+    id: runId,
+    task_id: 'A',
+    run_id: runId,
+    stage: 'develop',
+    node: 'execute',
+    attempt: 1,
+    agent_type: 'main',
+    parent_run_id: null,
+    messages_json: [{ role: 'user', content: `第 ${runId} 轮` }],
+    metadata_json: null,
+    prompt_tokens: 1,
+    completion_tokens: 1,
+    system_prompt: null,
+    user_prompt: null,
+    reasoning: null,
+    created_at: '2026-09-16T00:00:00Z',
+  });
+  const armConversations = (summaries: ConversationSummary[]): void => {
+    taskDetail.id = 'A';
+    taskDetail.state = emptyTaskDetailState({ conversations: summaries });
+    taskDetail.conversationsFull = {};
+  };
+
+  it('一次请求取回全部轮（不再是 N+1），并按 run_id 归位', async () => {
+    armConversations([summary(1), summary(2), summary(3)]);
+    mocks.getConversations.mockResolvedValue([conversation(1), conversation(2), conversation(3)]);
+
+    await taskDetail.loadAllConversations();
+
+    expect(mocks.getConversations).toHaveBeenCalledTimes(1);
+    expect(mocks.getConversations).toHaveBeenCalledWith('A', { includeMessages: true });
+    expect(mocks.getConversation).not.toHaveBeenCalled();
+    expect(Object.keys(taskDetail.conversationsFull).sort()).toEqual(['1', '2', '3']);
+    expect(taskDetail.conversationsFull[2].messages_json[0].content).toBe('第 2 轮');
+  });
+
+  it('已经装载过的轮不再进这次请求的待办', async () => {
+    armConversations([summary(1)]);
+    taskDetail.conversationsFull = { 1: conversation(1) };
+
+    await taskDetail.loadAllConversations();
+
+    expect(mocks.getConversations).not.toHaveBeenCalled();
+  });
+
+  it('批量读法不可用（老后端 / 中间层剥了 query）→ 降级逐条，功能不被关死', async () => {
+    armConversations([summary(1), summary(2)]);
+    mocks.getConversations.mockRejectedValue(new mocks.ApiError(400, '未知参数'));
+    mocks.getConversation.mockImplementation(async (_id: string, runId: number) =>
+      conversation(runId),
+    );
+
+    await taskDetail.loadAllConversations();
+
+    expect(mocks.getConversation).toHaveBeenCalledTimes(2);
+    expect(Object.keys(taskDetail.conversationsFull).sort()).toEqual(['1', '2']);
+  });
+});
+
+describe('commands 移出首屏关键路径（决策 361，票 02）', () => {
+  const command = (id: number): NodeCommand => ({
+    id,
+    task_id: 'A',
+    run_id: null,
+    stage: 'develop',
+    node: 'execute',
+    source: 'agent',
+    command: 'npm test',
+    original_command: null,
+    cwd: '/tmp',
+    exit_code: 0,
+    stdout_path: null,
+    stdout_preview: 'PASS',
+    stderr_preview: null,
+    duration_ms: 12,
+    started_at: '2026-09-16T00:00:00Z',
+    finished_at: '2026-09-16T00:00:01Z',
+  });
+
+  /** 让后台补拉那一条链跑完（它是 fire-and-forget，不在 `load()` 的 await 链上）。 */
+  const settle = async (): Promise<void> => {
+    for (let i = 0; i < 4; i++) await Promise.resolve();
+  };
+
+  /** 悬挂的 commands：resolve 由用例自己放行。 */
+  function hangingCommands(): { release: () => void } {
+    let release = (): void => undefined;
+    mocks.getCommands.mockImplementation(
+      () => new Promise<NodeCommand[]>((resolve) => (release = () => resolve([command(1)]))),
+    );
+    return { release: () => release() };
+  }
+
+  it('首屏不等 commands：它挂住不返回，时间线要的数据照样就位', async () => {
+    const { release } = hangingCommands();
+    mocks.getTask.mockResolvedValue({
+      task: task('A', 'A'),
+      cursors: [],
+      allowed_actions: [],
+    });
+    mocks.getFlow.mockResolvedValue({
+      transitions: [{ id: 1, to_stage: 'develop', to_node: 'execute' }],
+    });
+
+    await taskDetail.load('A');
+
+    // `/flow` 那份已经落位（时间线据此渲染），而 commands 那条路还挂着
+    expect(taskDetail.state.transitions).toHaveLength(1);
+    expect(taskDetail.state.commands).toEqual([]);
+    expect(taskDetail.loading).toBe(false);
+
+    // 放行之后照样并进来（补拉不是「发出去就不管」）
+    release();
+    await settle();
+    expect(taskDetail.state.commands).toHaveLength(1);
+  });
+
+  it('后台补拉失败挂到错误位（报错不静默），但不翻掉已经就位的首屏内容', async () => {
+    mocks.getTask.mockResolvedValue({
+      task: task('A', 'A'),
+      cursors: [],
+      allowed_actions: [],
+    });
+    mocks.getFlow.mockResolvedValue({ transitions: [] });
+    mocks.getCommands.mockRejectedValue(new mocks.ApiError(500, 'commands 读不到'));
+
+    await taskDetail.load('A');
+    await settle();
+
+    expect(taskDetail.error).toBe('commands 读不到');
+    expect(taskDetail.state.task?.id).toBe('A');
+    expect(taskDetail.state.cursors).toEqual([]);
+  });
+
+  it('静默 refetch 不再拉 commands，也不清已经到的那一份', async () => {
+    mocks.getTask.mockResolvedValue({
+      task: task('A', 'A'),
+      cursors: [],
+      allowed_actions: [],
+    });
+    mocks.getFlow.mockResolvedValue({ transitions: [] });
+    mocks.getCommands.mockResolvedValue([command(7)]);
+
+    await taskDetail.load('A');
+    expect(mocks.getCommands).toHaveBeenCalledTimes(1);
+    await settle();
+    expect(taskDetail.state.commands).toHaveLength(1);
+
+    await taskDetail.load('A', true);
+
+    expect(mocks.getCommands).toHaveBeenCalledTimes(1);
+    expect(taskDetail.state.commands).toHaveLength(1);
   });
 });
 

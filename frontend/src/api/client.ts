@@ -221,9 +221,42 @@ export function getFlow(id: string, signal?: AbortSignal): Promise<FlowResponse>
   return request<FlowResponse>(`/tasks/${encodeURIComponent(id)}/flow`, { signal });
 }
 
-export function getConversations(id: string, signal?: AbortSignal): Promise<ConversationSummary[]> {
-  return request<{ conversations: ConversationSummary[] }>(
-    `/tasks/${encodeURIComponent(id)}/conversations`,
+export interface ConversationListParams {
+  /** 取回被重试归档的旧 attempt（§12.2）；缺省只看未归档。 */
+  includeArchived?: boolean;
+  /**
+   * **批量取正文**（决策 361，票 03）：命中时服务端一次返回该任务全部轮的完整会话。
+   *
+   * 返回的元素形状随之变成 `NodeConversation`（与 `GET /conversations/{run_id}`
+   * 的单条读法同形）——它带 `messages_json`，但没有 `status`（台账那一列只贴给摘要态）。
+   * 调用方要状态时读摘要那一份。
+   */
+  includeMessages?: boolean;
+}
+
+/** 摘要态（缺省，`includeMessages` 未开）的返回类型。 */
+export function getConversations(
+  id: string,
+  params?: ConversationListParams & { includeMessages?: false },
+  signal?: AbortSignal,
+): Promise<ConversationSummary[]>;
+/** 批量正文态：一次拿回该任务全部轮的完整会话。 */
+export function getConversations(
+  id: string,
+  params: ConversationListParams & { includeMessages: true },
+  signal?: AbortSignal,
+): Promise<NodeConversation[]>;
+export function getConversations(
+  id: string,
+  params: ConversationListParams = {},
+  signal?: AbortSignal,
+): Promise<ConversationSummary[] | NodeConversation[]> {
+  const q = new URLSearchParams();
+  if (params.includeArchived) q.set('include_archived', 'true');
+  if (params.includeMessages) q.set('include_messages', 'true');
+  const suffix = q.toString() ? `?${q.toString()}` : '';
+  return request<{ conversations: ConversationSummary[] | NodeConversation[] }>(
+    `/tasks/${encodeURIComponent(id)}/conversations${suffix}`,
     { signal },
   ).then((d) => d.conversations);
 }

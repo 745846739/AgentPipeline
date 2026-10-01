@@ -26,6 +26,7 @@ serde.workspace = true
 serde_json.workspace = true
 tokio.workspace = true
 tower.workspace = true
+tower-http.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
 qrcode = { version = "0.14.1", default-features = false, features = ["svg"] }
@@ -36,6 +37,11 @@ rustls.workspace = true
 tokio-rustls.workspace = true
 
 [dev-dependencies]
+# 压缩契约测试要**解回来核对内容**（决策 361，票 01）：只断言 `content-encoding`
+# 会漏掉「编出来是垃圾」这一类（浏览器会直接报错，L3 却照样绿）。两个都在依赖树里
+# （tower-http 的 compression-br / -gzip 正是用它们编的），提为直接依赖不引新下载。
+brotli = "9"
+flate2 = "1"
 # 契约测试要造形状正确的推送订阅（pwa-webpush 02）：p256dh / auth 是 base64url ——
 # 与 core 同一条理由（0.22 已在依赖树里，提为直接依赖不引新下载）。
 base64.workspace = true

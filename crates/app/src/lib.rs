@@ -10,7 +10,8 @@
 //!   设备什么页面都拿不到，只有一张自带样式的配对页（[`pairing_page`]）；回环来源豁免；
 //! - 前端 dist 由 build.rs 内嵌并同源托管（决策 155），**注册在配对层之前**（决策 336）；
 //! - `/server-info` 暴露局域网访问地址与二维码（决策 167），供手机扫码接入；
-//! - `api_key` 读接口只回显 `***`（决策 112）。
+//! - `api_key` 读接口只回显 `***`（决策 112）；
+//! - 响应压缩（决策 361）：`tower-http` 的 br / gzip，按响应 content-type 放过事件流。
 
 pub mod assets;
 pub mod io_budget;
@@ -249,5 +250,36 @@ pub fn build_router(state: AppState) -> Router {
         // 逐个包裹已登记的路由，后挂的层在外、先于先挂的执行，故它只能写在
         // cross_origin_guard **之后**（写在之前会被后者包在里面、后于它执行）。
         .layer(axum::middleware::from_fn(peer::peer_address))
+        // 响应压缩（决策 361，票 01）：最外层——静态资源、错误报文与全部 JSON 端点
+        // 一起受益，且与传输形态（明文 / TLS）无关（两者都走这个 router）。
+        .layer(compression_layer())
         .with_state(state)
+}
+
+/// 压缩判定用的谓词（决策 361）。
+type CompressionPredicate = tower_http::compression::predicate::And<
+    tower_http::compression::predicate::DefaultPredicate,
+    tower_http::compression::predicate::NotForContentType,
+>;
+
+/// 响应压缩层：`Accept-Encoding` 协商，**br 优先、gzip 回退**（决策 361，票 01）。
+///
+/// 这是本批性价比最高的一刀：一处改动、全局受益。106 实测 `/tasks/{id}/commands` 的
+/// 1,330,415 字节此前原样过网（响应头只有 `content-type` + `content-length`），
+/// 而它在公网链路上要走 8.5–10.9 秒。
+///
+/// **事件流必须原样过网**：压缩层在编码器里攒字节，压在缓冲里的 SSE 看起来就是
+/// 「直播卡住」。排除**按响应 content-type 判**（`text/event-stream`），不按路由名单：
+/// 名单只认当下这两个端点（`/tasks/{id}/stream`、`/foreman/stream`），而「事件流不压缩」
+/// 这条不变式属于响应本身——将来任何新加的流会自动落在正确的一侧。axum 的 `Sse`
+/// 必然带上这个 content-type（`response/sse.rs`），故这一条在响应头面上可判、可断言
+/// （见 `tests/integration/api_contract.rs` 的 `sse_is_never_compressed`）。
+///
+/// 为什么把 `NotForContentType::SSE` 显式写出来（`DefaultPredicate` 当前也含它）：
+/// **承重行为不寄托在第三方默认值上**（与 `skill_import` 不把路径穿越判定外包给 zip
+/// 同一条理由）——上游一次 minor 调整不该让直播静默卡住。
+fn compression_layer() -> tower_http::compression::CompressionLayer<CompressionPredicate> {
+    use tower_http::compression::predicate::{DefaultPredicate, NotForContentType, Predicate as _};
+    tower_http::compression::CompressionLayer::new()
+        .compress_when(DefaultPredicate::new().and(NotForContentType::SSE))
 }

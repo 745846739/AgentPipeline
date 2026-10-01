@@ -2288,8 +2288,9 @@ impl ToolExecutor {
     /// 命令收尾：**L1 裁剪 + L2 卸载**（唯一阈值，决策 110）+ 台账那一行要的四格。
     ///
     /// `run_command` 与 `run_readonly` 逐字共用这一份（`stdout_path` 记的是卸载落点，预览
-    /// 取首尾 50/100 行）——它是收口留给调用点的唯一一格，两条路在这一格上恰好一致，故不给
-    /// 它们各写一遍（写两遍已经漂移过一次，见 `exec.rs` 的模块说明）。
+    /// 取首尾 50/100 行、再过 4 KB 字节兜底——决策 361 票 02）——它是收口留给调用点的唯一
+    /// 一格，两条路在这一格上恰好一致，故不给它们各写一遍（写两遍已经漂移过一次，见
+    /// `exec.rs` 的模块说明）。
     fn finish_command_output(
         &self,
         ctx: &ToolCallContext,
@@ -2301,8 +2302,8 @@ impl ToolExecutor {
             CommandFinish {
                 exit_code: out.exit_code,
                 stdout_path: offload_path,
-                stdout_preview: Some(head_tail(&out.stdout, 50, 100)),
-                stderr_preview: Some(head_tail(&out.stderr, 50, 100)),
+                stdout_preview: Some(preview_text(&out.stdout, 50, 100)),
+                stderr_preview: Some(preview_text(&out.stderr, 50, 100)),
                 duration_ms: out.duration_ms,
             },
             ToolOutcome::ok(in_context),
@@ -3106,6 +3107,56 @@ pub fn head_tail(text: &str, head: usize, tail: usize) -> String {
     out.push(format!("... 省略 {} 行 ...", lines.len() - head - tail));
     out.extend(lines[lines.len() - tail..].iter().map(|l| l.to_string()));
     out.join("\n")
+}
+
+/// 命令台账里 preview 的**字节**上限（决策 361，票 02）。
+///
+/// 行数口径（首 50 / 尾 100 行）保留的是「看头看尾」的原意，但它对**单行超长**的输
+/// 出完全失控：本机库实测单条 `stdout_preview` 到 183,241 字符，一个任务的 preview
+/// 合计 2.4 MB——那正是 `GET /tasks/{id}/commands` 载荷的主体（106 上该端点 1.33 MB，
+/// 公网链路要走 8.5–10.9 秒）。4 KB 是「够看清这条命令在干什么」的量级（一屏终端
+/// 约 2–3 KB），再长的内容本来就有卸载文件与 `GET /commands/{id}/output` 那条路。
+pub const COMMAND_PREVIEW_MAX_BYTES: usize = 4 * 1024;
+
+/// 台账 preview：**行数口径 + 字节兜底**（决策 361，票 02）。
+///
+/// 两级都要：只看字节会把「看头看尾」压成「只看头」，只看行数则挡不住单行巨物。
+fn preview_text(text: &str, head: usize, tail: usize) -> String {
+    truncate_bytes(&head_tail(text, head, tail), COMMAND_PREVIEW_MAX_BYTES)
+}
+
+/// 按**字节**截断并留标记。
+///
+/// 与 `storage::observability::truncate_text` 是**两个口径**，不是两份实现：那个数的是
+/// 字符（prompt 原文的账按字符论，读者关心的是「几个字」），这里数的是字节——
+/// 「preview 的体积上限」说的正是过网的字节数。`take_bytes` 不劈开 UTF-8 码点。
+fn truncate_bytes(text: &str, budget: usize) -> String {
+    if text.len() <= budget {
+        return text.to_string();
+    }
+    let marker = format!(
+        "…[preview 在此截断：原文 {} 字节，本段预算 {budget} 字节；完整输出见卸载文件或展开读取]",
+        text.len()
+    );
+    if budget <= marker.len() {
+        // 预算连标记都装不下：只留前缀——仍是「这里被截过」的可见证据，且绝不 panic。
+        return take_bytes(text, budget);
+    }
+    let mut out = take_bytes(text, budget - marker.len());
+    out.push_str(&marker);
+    out
+}
+
+/// 取不超过 `budget` 字节的前缀（在码点边界上收住）。
+fn take_bytes(text: &str, budget: usize) -> String {
+    if text.len() <= budget {
+        return text.to_string();
+    }
+    let mut end = budget;
+    while end > 0 && !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    text[..end].to_string()
 }
 
 // ─────────────────────────── 诊断包的装配（票 03）───────────────────────────
@@ -4391,6 +4442,41 @@ mod tests {
         assert!(out.contains("l499"));
         assert!(out.contains("省略 496 行"));
         assert!(!out.contains("l100"));
+    }
+
+    /// preview 的**字节兜底**（决策 361，票 02）。
+    ///
+    /// 行数口径对单行巨物是失控的：本机库实测单条 preview 183,241 字符，而它随
+    /// `GET /tasks/{id}/commands` 原样过网。两级判定都要在——只看字节会把「看头看尾」
+    /// 压成「只看头」，只看行数则挡不住一条长日志行。
+    #[test]
+    fn preview_caps_bytes_but_keeps_the_head_tail_shape() {
+        // 单行 3 万字节：行数口径放行（就一行），字节口径必须收住
+        let one_long_line = "字".repeat(10_000);
+        let out = preview_text(&one_long_line, 50, 100);
+        assert!(
+            out.len() <= COMMAND_PREVIEW_MAX_BYTES,
+            "超限了：{} 字节",
+            out.len()
+        );
+        assert!(out.contains("preview 在此截断"), "要留截断标记：{out}");
+        assert!(out.starts_with('字'), "前缀应保留（那正是「看头」）");
+        assert!(
+            std::str::from_utf8(out.as_bytes()).is_ok(),
+            "截断不得劈开 UTF-8 码点"
+        );
+
+        // 多行、行数超口径：两级判定同时生效，头尾都还在
+        let many_lines = (0..500)
+            .map(|i| format!("l{i}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let out = preview_text(&many_lines, 2, 2);
+        assert!(out.contains("l0") && out.contains("l499") && out.contains("省略 496 行"));
+        assert!(out.len() <= COMMAND_PREVIEW_MAX_BYTES);
+
+        // 短输出原样过（不引入任何标记）
+        assert_eq!(preview_text("ok\n", 50, 100), "ok\n");
     }
 
     #[tokio::test]

@@ -2199,12 +2199,23 @@ async fn quiet_foreman_stream_receives_keepalive_comment_frame() {
         .clone()
         .oneshot(
             request("GET", "/foreman/stream")
+                // 与 `sse_is_never_compressed` 同一条钉法（决策 361，票 01）：值班长流
+                // 也是事件流，**不得**被压缩层攒在编码器里。
+                .header(header::ACCEPT_ENCODING, "gzip, deflate, br")
                 .body(Body::empty())
                 .unwrap(),
         )
         .await
         .unwrap();
     assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(
+        response
+            .headers()
+            .get(header::CONTENT_ENCODING)
+            .and_then(|v| v.to_str().ok()),
+        None,
+        "值班长事件流被压了"
+    );
     let content_type = response
         .headers()
         .get(header::CONTENT_TYPE)
@@ -2220,6 +2231,192 @@ async fn quiet_foreman_stream_receives_keepalive_comment_frame() {
     let frame =
         first_sse_frame_within(response.into_body(), std::time::Duration::from_secs(20)).await;
     assert!(!frame.contains("data:"), "心跳必须不携带 data：{frame:?}");
+}
+
+// ───────────────────── 响应压缩（决策 361，票 01）─────────────────────
+//
+// 压缩层是**全局一刀**（所有非流式响应），故契约测试钉三件事：
+// ① 内容等价——只断言 `content-encoding` 会漏掉「编出来是垃圾」这一类，浏览器会直接
+//    报错而 L3 照样绿，故每个编码都要**解回来逐字节比**；② 没协商时行为一字不变
+//    （既有客户端与既有断言不受影响）；③ 事件流**从不**被压——压在编码缓冲里的 SSE
+//    看起来就是「直播卡住」（§验收）。
+
+/// 发一个请求并把响应原样交回（**不**碰 body——压缩契约要看头与原始字节）。
+async fn send_raw(api: &Api, req: Request<Body>) -> axum::response::Response {
+    api.router.clone().oneshot(req).await.unwrap()
+}
+
+async fn raw_bytes(response: axum::response::Response) -> Vec<u8> {
+    axum::body::to_bytes(response.into_body(), 8 * 1024 * 1024)
+        .await
+        .unwrap()
+        .to_vec()
+}
+
+fn content_encoding(response: &axum::response::Response) -> Option<String> {
+    response
+        .headers()
+        .get(header::CONTENT_ENCODING)
+        .and_then(|v| v.to_str().ok())
+        .map(str::to_string)
+}
+
+fn brotli_decode(bytes: &[u8]) -> Vec<u8> {
+    use std::io::Read as _;
+    let mut out = Vec::new();
+    brotli::Decompressor::new(bytes, 4096)
+        .read_to_end(&mut out)
+        .expect("br 解压失败——编出来的不是合法 brotli");
+    out
+}
+
+fn gzip_decode(bytes: &[u8]) -> Vec<u8> {
+    use std::io::Read as _;
+    let mut out = Vec::new();
+    flate2::read::GzDecoder::new(bytes)
+        .read_to_end(&mut out)
+        .expect("gzip 解压失败——编出来的不是合法 gzip");
+    out
+}
+
+/// 播一条**够大**的命令：压缩谓词里有 32 字节下限（`SizeAbove`），而 JSON 里重复字段多、
+/// 压得动——一条带长 preview 的命令就足以让「压了没有」这件事可判。
+async fn seed_long_command(api: &Api, task_id: &str) -> i64 {
+    use agentpipeline_core::agent::tools::{CommandFinish, CommandStart};
+    let store = &api.state.store;
+    let id = store
+        .record_start(CommandStart {
+            task_id: Some(task_id.into()),
+            session_id: None,
+            run_id: None,
+            stage: Stage::Test,
+            node: agentpipeline_core::types::Node::Execute,
+            source: agentpipeline_core::types::CommandSource::System,
+            command: "cargo test --all".into(),
+            cwd: "/tmp".into(),
+            original_command: None,
+        })
+        .await
+        .unwrap();
+    store
+        .record_finish(
+            id,
+            CommandFinish {
+                exit_code: Some(0),
+                stdout_preview: Some("测试输出行 · ".repeat(80)),
+                duration_ms: 12,
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+    id
+}
+
+async fn commands_with_encoding(api: &Api, accept: Option<&str>) -> axum::response::Response {
+    let mut req = request("GET", "/tasks/t1/commands");
+    if let Some(value) = accept {
+        req = req.header(header::ACCEPT_ENCODING, value);
+    }
+    send_raw(api, req.body(Body::empty()).unwrap()).await
+}
+
+#[tokio::test]
+async fn json_endpoint_negotiates_br_then_gzip_and_stays_plain_without_accept_encoding() {
+    let api = api().await;
+    seed(&api, "t1").await;
+    seed_long_command(&api, "t1").await;
+
+    // ① 不带头（既有客户端与既有断言走的就是这条）→ 不压，且响应体逐字节可得
+    let plain = commands_with_encoding(&api, None).await;
+    assert_eq!(plain.status(), StatusCode::OK);
+    assert_eq!(content_encoding(&plain), None, "没协商就不该压");
+    let plain_bytes = raw_bytes(plain).await;
+    let plain_json: Value = serde_json::from_slice(&plain_bytes).unwrap();
+    assert_eq!(plain_json["commands"].as_array().unwrap().len(), 1);
+
+    // ② br：头是 br，且**解回来与原文逐字节等价**
+    let br = commands_with_encoding(&api, Some("br")).await;
+    assert_eq!(content_encoding(&br).as_deref(), Some("br"));
+    let br_bytes = raw_bytes(br).await;
+    assert!(
+        br_bytes.len() < plain_bytes.len(),
+        "br 应确实变小：{} vs {}",
+        br_bytes.len(),
+        plain_bytes.len()
+    );
+    assert_eq!(
+        brotli_decode(&br_bytes),
+        plain_bytes,
+        "解回来必须与原文等价"
+    );
+
+    // ③ gzip 回退：只收 gzip 的客户端（老浏览器）拿得到同一份内容
+    let gz = commands_with_encoding(&api, Some("gzip")).await;
+    assert_eq!(content_encoding(&gz).as_deref(), Some("gzip"));
+    assert_eq!(gzip_decode(&raw_bytes(gz).await), plain_bytes);
+
+    // ④ 两样都收 → **br 优先**（同 q 值时 tower-http 取更偏好的一档）。浏览器实际发的就是
+    //    这一条。
+    let both = commands_with_encoding(&api, Some("gzip, deflate, br")).await;
+    assert_eq!(
+        content_encoding(&both).as_deref(),
+        Some("br"),
+        "br 应优先于 gzip"
+    );
+
+    // ⑤ 只收本仓没开的编码（deflate）→ 原样返回：不是 500、也不是空体
+    let deflate = commands_with_encoding(&api, Some("deflate")).await;
+    assert_eq!(content_encoding(&deflate), None);
+    assert_eq!(raw_bytes(deflate).await, plain_bytes);
+
+    // ⑥ 客户端显式拒绝（q=0）→ 原样返回（`identity` 那一档）
+    let refused = commands_with_encoding(&api, Some("br;q=0, gzip;q=0")).await;
+    assert_eq!(content_encoding(&refused), None);
+}
+
+/// 事件流**从不**被压（票 01 §验收）。
+///
+/// 判据是两层的：头面上 `content-encoding` 必须缺席（这正是「直播卡住」的成因——压缩层
+/// 在编码器里攒字节），行为上心跳帧仍按时到达（流没被整段缓冲在压缩器里）。
+/// 值班长流同赌注，钉在 `quiet_foreman_stream_receives_keepalive_comment_frame` 里
+/// ——那一条不摆弄时钟，故不与这里共用夹具。
+#[tokio::test]
+async fn sse_is_never_compressed() {
+    let api = api().await;
+    seed(&api, "t1").await;
+
+    let response = send_raw(
+        &api,
+        request("GET", "/tasks/t1/stream")
+            .header(header::ACCEPT_ENCODING, "gzip, deflate, br")
+            .body(Body::empty())
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let content_type = response
+        .headers()
+        .get(header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or_default()
+        .to_string();
+    assert!(
+        content_type.starts_with("text/event-stream"),
+        "{content_type}"
+    );
+    assert_eq!(
+        content_encoding(&response),
+        None,
+        "任务事件流被压了——压缩缓冲会让直播看起来卡住"
+    );
+
+    // 时钟在 setup 之后才暂停（与上面那条心跳用例同一条理由）：静默流靠 keep-alive 出帧，
+    // 而这一帧若能到，就说明流没有被整段攒在编码器里。
+    tokio::time::pause();
+    let frame =
+        first_sse_frame_within(response.into_body(), std::time::Duration::from_secs(20)).await;
+    assert!(!frame.contains("data:"), "第一帧应是心跳注释帧：{frame:?}");
 }
 
 // ─────────────────────────── 只读视图（决策 63 / 99 / 114 / 76）───────────────────────────
@@ -2366,6 +2563,172 @@ async fn flow_metrics_and_conversations_endpoints() {
     assert_eq!(body["total_tokens"], 150, "{body}");
     assert_eq!(body["total_calls"], 3, "{body}");
     assert_eq!(body["validate_first_pass_rate"], 0.5, "{body}");
+}
+
+/// 会话列表的**批量读法**（决策 361，票 03）。
+///
+/// 三件事一起钉：① 缺省分支是**真摘要**（不含 `messages_json` 这些大列）；②
+/// `include_messages=true` 一次取回全部轮的完整会话；③ 它与逐条读法**内容等价**
+/// ——同一份 `list_conversations`/序列化，不是两条要各自维护的路。
+#[tokio::test]
+async fn conversations_include_messages_batches_full_payloads() {
+    use agentpipeline_core::storage::observability::{NewRun, PromptSnapshot, RunOutcome};
+    use agentpipeline_core::types::NodeStatus;
+
+    let api = api().await;
+    seed(&api, "t1").await;
+    let store = &api.state.store;
+    let cursor = store.load_live_cursors("t1").await.unwrap()[0].clone();
+
+    // 两轮：一轮未归档、一轮归档（`include_archived` 两个分支都要走到）
+    let mut run_ids = Vec::new();
+    for stage in [Stage::ArchitectDesign, Stage::Init] {
+        let run_id = store
+            .insert_run(&NewRun {
+                task_id: "t1".into(),
+                cursor_id: cursor.cursor_id.clone(),
+                stage,
+                node: agentpipeline_core::types::Node::Execute,
+                attempt: 1,
+                agent_type: "main".into(),
+                parent_run_id: None,
+                prompt_template_hash: None,
+                process_group_id: None,
+            })
+            .await
+            .unwrap();
+        store
+            .finish_run(
+                run_id,
+                &RunOutcome {
+                    status: Some(NodeStatus::Success),
+                    prompt_tokens: 10,
+                    completion_tokens: 5,
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        store
+            .insert_conversation(
+                "t1",
+                run_id,
+                stage,
+                agentpipeline_core::types::Node::Execute,
+                1,
+                "main",
+                None,
+                &serde_json::json!([{"role": "user", "content": "正文"}]),
+                Some(PromptSnapshot {
+                    system: "系统段原文",
+                    user: "用户段原文",
+                }),
+                None,
+                10,
+                5,
+                Some("思考留痕"),
+            )
+            .await
+            .unwrap();
+        run_ids.push(run_id);
+    }
+    store.archive_conversations("t1").await.unwrap(); // 两轮都归档
+    let live_run = {
+        // 再插一轮未归档的，缺省分支才有东西可回
+        let run_id = store
+            .insert_run(&NewRun {
+                task_id: "t1".into(),
+                cursor_id: cursor.cursor_id.clone(),
+                stage: Stage::Develop,
+                node: agentpipeline_core::types::Node::Execute,
+                attempt: 2,
+                agent_type: "main".into(),
+                parent_run_id: None,
+                prompt_template_hash: None,
+                process_group_id: None,
+            })
+            .await
+            .unwrap();
+        store
+            .finish_run(
+                run_id,
+                &RunOutcome {
+                    status: Some(NodeStatus::Success),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        store
+            .insert_conversation(
+                "t1",
+                run_id,
+                Stage::Develop,
+                agentpipeline_core::types::Node::Execute,
+                2,
+                "main",
+                None,
+                &serde_json::json!([{"role": "user", "content": "新正文"}]),
+                None,
+                None,
+                1,
+                1,
+                None,
+            )
+            .await
+            .unwrap();
+        run_id
+    };
+
+    // ① 缺省（摘要态）：只给摘要——大列一个都不在
+    let (status, body) = get(&api, "/tasks/t1/conversations").await;
+    assert_eq!(status, StatusCode::OK);
+    let summaries = body["conversations"].as_array().unwrap();
+    assert_eq!(summaries.len(), 1, "缺省只看未归档：{body}");
+    assert_eq!(summaries[0]["run_id"], live_run);
+    assert_eq!(summaries[0]["status"], "success");
+    for heavy in ["messages_json", "system_prompt", "user_prompt", "reasoning"] {
+        assert!(
+            summaries[0].get(heavy).is_none(),
+            "摘要态不该带 {heavy}：{body}"
+        );
+    }
+
+    // ② 批量取正文：一次拿回全部轮的完整会话
+    let (status, body) = get(&api, "/tasks/t1/conversations?include_messages=true").await;
+    assert_eq!(status, StatusCode::OK);
+    let batched = body["conversations"].as_array().unwrap();
+    assert_eq!(batched.len(), 1, "缺省仍只取未归档：{body}");
+    assert_eq!(batched[0]["messages_json"][0]["content"], "新正文");
+
+    // ③ 与逐条读法**内容等价**：同一 run_id，批量里的那一项 == 单条读法的 conversation
+    let (status, single) = get(&api, &format!("/tasks/t1/conversations/{live_run}")).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        batched[0], single["conversation"],
+        "批量项与单条读法必须同形同内容"
+    );
+
+    // ④ include_archived 两个分支在两种读法下都成立
+    let (status, body) = get(
+        &api,
+        "/tasks/t1/conversations?include_messages=true&include_archived=true",
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let all = body["conversations"].as_array().unwrap();
+    assert_eq!(all.len(), 3, "带历史时应取回全部 attempt：{body}");
+    for run_id in &run_ids {
+        let (_, single) = get(&api, &format!("/tasks/t1/conversations/{run_id}")).await;
+        let item = all
+            .iter()
+            .find(|c| c["run_id"] == *run_id)
+            .unwrap_or_else(|| panic!("批量里应含 run {run_id}：{body}"));
+        assert_eq!(item, &single["conversation"]);
+        assert!(item["archived_at"].is_string(), "归档标记要带上");
+        assert_eq!(item["system_prompt"], "系统段原文");
+        assert_eq!(item["reasoning"], "思考留痕");
+    }
 }
 
 #[tokio::test]

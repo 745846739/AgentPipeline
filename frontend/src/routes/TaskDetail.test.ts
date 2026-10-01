@@ -369,6 +369,7 @@ describe('任务详情 · 通知深链 `?run=`（pwa-webpush 票 02/03）', () =
       prompt_tokens: 10,
       completion_tokens: 20,
       status: 'failed',
+      archived_at: null,
     };
   }
 

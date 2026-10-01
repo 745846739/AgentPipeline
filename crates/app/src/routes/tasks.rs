@@ -828,6 +828,16 @@ pub struct ConversationListQuery {
     /// 取回历史 attempt（含被重试归档的旧会话，§12.2）；默认只返回未归档。
     #[serde(default)]
     pub include_archived: bool,
+    /// **批量取正文**（决策 361，票 03）：命中时一次返回该任务全部轮的完整会话
+    /// （含 `messages_json`），元素与 `GET /conversations/{run_id}` 的单条读法**同形**
+    /// ——同一份序列化，故两种读法内容等价。
+    ///
+    /// 加性参数：不改会话**列表**的既有分页立场（决策 312 给 messages 定的
+    /// 「500 缺省 + `before_id` 向上游标」一个字没动），也不引入通用分页（决策 319 的
+    /// 边界）。现场页签此前是 N+1——每轮一跳，浏览器 HTTP/1.1 单源约 6 并发，48 轮要排
+    /// 八波；这里让「一个任务的全部轮」一次取回。
+    #[serde(default)]
+    pub include_messages: bool,
 }
 
 pub async fn conversations(
@@ -835,11 +845,6 @@ pub async fn conversations(
     Path(id): Path<String>,
     Query(query): Query<ConversationListQuery>,
 ) -> ApiResult<impl IntoResponse> {
-    let conversations = state
-        .store
-        .list_conversations(&id, query.include_archived)
-        .await
-        .map_err(map_core_error)?;
     // run 状态不在会话行里（状态住台账），而药丸过滤要「状态」这一维（票 03）——
     // 按 run_id 从台账取一份贴进摘要。本机单用户量级，整表拉一次即可，不值得新端点。
     let statuses: std::collections::HashMap<i64, String> = state
@@ -850,8 +855,27 @@ pub async fn conversations(
         .into_iter()
         .map(|r| (r.id, r.status.as_str().to_string()))
         .collect();
+
+    if query.include_messages {
+        // 批量取正文：与单条读法共用 `list_conversations`，故「同一 run_id 两种读法给出
+        // 相同会话」是**同一份实现**的直接结果，不是两条路要各自维护的约定。
+        let conversations = state
+            .store
+            .list_conversations(&id, query.include_archived)
+            .await
+            .map_err(map_core_error)?;
+        return Ok(Json(json!({ "conversations": conversations })));
+    }
+
+    // 缺省（摘要态）：走**只取摘要列**的读法（决策 361，票 03）——此前它读回全文列
+    // 并对每行做一次 `serde_json::from_str`，随即在这里丢掉。列表只要轮名与读数。
+    let summaries = state
+        .store
+        .list_conversation_summaries(&id, query.include_archived)
+        .await
+        .map_err(map_core_error)?;
     // 列表只给摘要（§12.4.3）
-    let summaries: Vec<serde_json::Value> = conversations
+    let items: Vec<serde_json::Value> = summaries
         .into_iter()
         .map(|c| {
             json!({
@@ -868,7 +892,7 @@ pub async fn conversations(
             })
         })
         .collect();
-    Ok(Json(json!({ "conversations": summaries })))
+    Ok(Json(json!({ "conversations": items })))
 }
 
 /// `GET /tasks/{id}/conversations/{run_id}`

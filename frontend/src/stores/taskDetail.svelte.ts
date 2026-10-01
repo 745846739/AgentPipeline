@@ -123,18 +123,17 @@ class TaskDetailStore {
       // 完成横幅触发源：详情页 SSE 之外的对齐 refetch（票 08）。
       // 首次装载即已是 done → 无迁移，不弹（刷新不重弹）。
       completion.observeAll([{ id: taskId, status: detail.task.status, title: detail.task.title }]);
-      const [flow, conversations, commands] = await Promise.all([
-        getFlow(taskId),
-        getConversations(taskId),
-        getCommands(taskId),
-      ]);
+      const [flow, conversations] = await Promise.all([getFlow(taskId), getConversations(taskId)]);
       this.state = {
         ...this.state,
         transitions: flow.transitions,
         conversations,
-        commands,
       };
       this.streamManager.sync([taskId]);
+      // commands 走**后台补拉**（决策 361，票 02）：它在首屏的 `Promise.all` 里时，时间线
+      // 要的 `transitions`（上面那 7 KB 的 `/flow`）被 1.33 MB 的 commands 一起扣住——
+      // 106 实测那一条要在公网链路上搬 8.5–10.9 秒，而它与此页签的默认视图毫无关系。
+      if (!silent) void this.loadCommands(taskId);
     } catch (err) {
       this.error = (err as Error).message;
       this.errorStatus = err instanceof ApiError ? err.status : 0;
@@ -165,6 +164,31 @@ class TaskDetailStore {
     this.diffError = null;
     this.diffStale = false;
     this.actionError = null;
+  }
+
+  /**
+   * commands 的**后台补拉**（决策 361，票 02）。
+   *
+   * 载荷最大的一条路，故它自己走：首屏不等它（页签徽标初始短暂显示 0，随补拉更新），
+   * 到货后并入 `state.commands`。
+   *
+   * **只在用户可见的那次装载里发**：SSE 驱动的静默 refetch（`scheduleRefetch` 的 300ms
+   * 去抖）每转一次都重拉 1.33 MB 是不划算的，而它在飞的那部分另有承担者——`liveTools`
+   * 与 `command_started` / `command_finished` 的增量（决策 359，reducer 直接并进
+   * `state.commands`），所以静默那一趟什么都不缺。**也不清已到的那一份**：清掉是纯倒退。
+   *
+   * 失败挂到页面的错误位（与静默 refetch 同一条口径：报错不静默），但**只在这一份仍然
+   * 属于当前任务时**——换过任务/已被收走就别把上一份的失败挂到新 id 上。
+   */
+  private async loadCommands(taskId: string): Promise<void> {
+    try {
+      const commands = await getCommands(taskId);
+      if (this.id !== taskId) return;
+      this.state = { ...this.state, commands };
+    } catch (err) {
+      if (this.id !== taskId) return;
+      this.error = (err as Error).message;
+    }
   }
 
   dispose(): void {
@@ -234,9 +258,17 @@ class TaskDetailStore {
   }
 
   /**
-   * 「现场」页签的批量装载（决策 349）：把每一轮的完整会话读齐，时间线才摆得开——
-   * 旧「会话页签」是选中哪轮读哪轮，合并版没有选中态可搭。缓存挡住重复：已装载的
-   * 轮不发第二跳，进页签几次都只补缺的。并行发（本机服务，轮数有界）。
+   * 「现场」页签的批量装载（决策 349；决策 361 票 03 改为**一次请求**）。
+   *
+   * 把每一轮的完整会话读齐，时间线才摆得开——旧「会话页签」是选中哪轮读哪轮，合并版
+   * 没有选中态可搭。此前它是 N+1：每轮一条 `GET /conversations/{run_id}`，而浏览器在
+   * HTTP/1.1 单源上约 6 并发，48 轮要排八波；现在一条 `?include_messages=true` 拿回
+   * 整个任务的全部轮。
+   *
+   * 缓存仍按 `run_id` 挡重复（`conversationsFull` 与单条读法共用同一张表，深链走
+   * `loadConversation` 时不会打架）：已装载的轮不进这个请求的待办。
+   *
+   * 失败**降级到逐条**：批量读法是加性参数，客户端不把「一次拿全」变成唯一的活路。
    */
   async loadAllConversations(): Promise<void> {
     if (!this.id) return;
@@ -246,6 +278,14 @@ class TaskDetailStore {
     if (pending.length === 0) return;
     this.conversationsLoading = true;
     try {
+      const all = await getConversations(this.id, { includeMessages: true });
+      const fresh: Record<number, NodeConversation> = { ...this.conversationsFull };
+      for (const conv of all) {
+        if (pending.includes(conv.run_id)) fresh[conv.run_id] = conv;
+      }
+      this.conversationsFull = fresh;
+    } catch {
+      // 老后端（无 `include_messages`）或中间层剥了 query → 回到逐条
       await Promise.all(pending.map((runId) => this.loadConversation(runId)));
     } finally {
       this.conversationsLoading = false;

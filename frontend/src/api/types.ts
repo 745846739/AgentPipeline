@@ -219,6 +219,11 @@ export interface ConversationSummary {
   completion_tokens: number;
   /** run 的台账状态（success / timeout / failed / …）——药丸过滤的「状态」维（票 03）。 */
   status: string;
+  /**
+   * 归档时刻（重试标记的旧 attempt，§12.2）。服务端一直在发这一格，类型此前漏了它
+   * ——票 03 顺手对齐（列表与「带历史」两个分支都带着它）。
+   */
+  archived_at: string | null;
 }
 
 export interface ToolCallWire {

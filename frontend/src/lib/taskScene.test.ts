@@ -20,6 +20,7 @@ function run(overrides: Partial<ConversationSummary> = {}): ConversationSummary 
     prompt_tokens: 100,
     completion_tokens: 50,
     status: 'success',
+    archived_at: null,
     ...overrides,
   };
 }

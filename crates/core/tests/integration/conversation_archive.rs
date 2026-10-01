@@ -136,6 +136,69 @@ async fn default_list_excludes_archived_and_param_includes_them() {
     );
 }
 
+/// 摘要读法**根本不碰全文列**（决策 361，票 03）。
+///
+/// 判据是「把 `messages_json` 改成一段**不是 JSON** 的字节」：全文读法必须当场失败
+/// （它要做 `serde_json::from_str`），而摘要读法照样成功。这是行为级的证据——比
+/// 「grep SQL 里没有那几个列名」结实得多，后者只是把实现重抄一遍（实现一改就假绿）。
+///
+/// 归档过滤口径也必须与全文读法一致：两条读法是对**同一批行**的两种投影，
+/// 不收窄成一样的集合会让列表与正文对不上号。
+#[tokio::test]
+async fn summary_read_never_parses_the_message_payload() {
+    let (_home, store) = setup().await;
+    let cursor = store.load_live_cursors("t1").await.unwrap()[0].clone();
+    let conv_id = insert_conv(
+        &store,
+        &cursor.cursor_id,
+        Stage::ArchitectDesign,
+        serde_json::json!([{"role": "user", "content": "正文"}]),
+    )
+    .await;
+
+    // 绕过 `insert_conversation`（它收的是 `serde_json::Value`，写不出非法 JSON），
+    // 直接把那一列改成一段不是 JSON 的字节。
+    sqlx::query("UPDATE kanban_node_conversations SET messages_json = ? WHERE id = ?")
+        .bind("这不是 JSON")
+        .bind(conv_id)
+        .execute(store.pool())
+        .await
+        .unwrap();
+
+    // 摘要读法照常——它不解析这一列
+    let summaries = store
+        .list_conversation_summaries("t1", false)
+        .await
+        .expect("摘要读法不该碰 messages_json");
+    assert_eq!(summaries.len(), 1);
+    assert_eq!(summaries[0].stage, Stage::ArchitectDesign);
+    assert_eq!(summaries[0].prompt_tokens, 10);
+    assert_eq!(summaries[0].completion_tokens, 5);
+    assert!(summaries[0].archived_at.is_none());
+
+    // 全文读法必须**失败**——否则这条用例证明不了「摘要读法真的绕开了那一列」
+    assert!(
+        store.list_conversations("t1", false).await.is_err(),
+        "全文读法要解析 messages_json，非法 JSON 下不该成功"
+    );
+
+    // 归档过滤：两条读法对同一批行的取舍一致
+    store.archive_conversations("t1").await.unwrap();
+    assert!(store
+        .list_conversation_summaries("t1", false)
+        .await
+        .unwrap()
+        .is_empty());
+    assert_eq!(
+        store
+            .list_conversation_summaries("t1", true)
+            .await
+            .unwrap()
+            .len(),
+        1
+    );
+}
+
 #[tokio::test]
 async fn archive_is_scoped_to_task() {
     // 按 task 隔离：归档 t1 不得影响 t2 的会话

@@ -1023,6 +1023,38 @@ impl Store {
             .collect()
     }
 
+    /// 会话**摘要**列表（决策 361，票 03）：只取摘要列。
+    ///
+    /// 与 [`Store::list_conversations`] 的唯一区别是**根本不去 SELECT 那四个大列**
+    /// （`messages_json` / `system_prompt` / `user_prompt` / `reasoning`），因此也不做
+    /// 逐行的 `serde_json::from_str`。列表页只要轮名与读数，而此前它把全文读回来又当场
+    /// 丢弃——106 上那个中等任务（23 轮）就已经是可测的差额。
+    ///
+    /// 返回类型里**没有**那几个字段：这是编译期保证，不是约定——`include_messages=false`
+    /// 那条路上不存在「不小心又把全文读回来」这种写法。
+    pub async fn list_conversation_summaries(
+        &self,
+        task_id: &str,
+        include_archived: bool,
+    ) -> Result<Vec<ConversationSummary>> {
+        let mut sql = String::from(
+            "SELECT run_id, stage, node, attempt, agent_type, parent_run_id, prompt_tokens,
+                    completion_tokens, archived_at
+             FROM kanban_node_conversations WHERE task_id = ?",
+        );
+        if !include_archived {
+            sql.push_str(" AND archived_at IS NULL");
+        }
+        sql.push_str(" ORDER BY id");
+        let rows: Vec<ConversationSummaryRow> = sqlx::query_as(&sql)
+            .bind(task_id)
+            .fetch_all(self.pool())
+            .await?;
+        rows.into_iter()
+            .map(ConversationSummaryRow::into_summary)
+            .collect()
+    }
+
     /// 某 `(task, stage, node)` 上**主 agent 自己**最近一次的会话行（决策 180，票 13）。
     ///
     /// 「自己」由 `agent_type = 'main'` 界定：伪阶段与子代理的 run 复用父节点的 stage/node
@@ -1195,6 +1227,54 @@ impl ConversationRow {
             completion_tokens: self.completion_tokens as u32,
             reasoning: self.reasoning,
             created_at: parse_ts(&self.created_at)?,
+            archived_at: self.archived_at.map(|s| parse_ts(&s)).transpose()?,
+        })
+    }
+}
+
+/// 一行会话**摘要**（决策 361，票 03）：`GET /tasks/{id}/conversations` 缺省分支读的就是它。
+///
+/// 刻意**不含** `messages_json` / `system_prompt` / `user_prompt` / `reasoning`：这四个
+/// 是载荷主体（本机库实测单条 preview 到 18 万字符，一个任务合计 2.4 MB 量级），
+/// 而列表页一个字节都用不上。`status` 也不在这里——它住台账（`kanban_node_runs`），
+/// 由调用点按 `run_id` 贴上来（决策 349 的口径）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ConversationSummary {
+    pub run_id: i64,
+    pub stage: Stage,
+    pub node: Node,
+    pub attempt: u32,
+    pub agent_type: String,
+    pub parent_run_id: Option<i64>,
+    pub prompt_tokens: u32,
+    pub completion_tokens: u32,
+    pub archived_at: Option<DateTime<Utc>>,
+}
+
+#[derive(Debug, FromRow)]
+struct ConversationSummaryRow {
+    run_id: i64,
+    stage: String,
+    node: String,
+    attempt: i64,
+    agent_type: String,
+    parent_run_id: Option<i64>,
+    prompt_tokens: i64,
+    completion_tokens: i64,
+    archived_at: Option<String>,
+}
+
+impl ConversationSummaryRow {
+    fn into_summary(self) -> Result<ConversationSummary> {
+        Ok(ConversationSummary {
+            run_id: self.run_id,
+            stage: decode_stage(&self.stage)?,
+            node: decode_node(&self.node)?,
+            attempt: self.attempt as u32,
+            agent_type: self.agent_type,
+            parent_run_id: self.parent_run_id,
+            prompt_tokens: self.prompt_tokens as u32,
+            completion_tokens: self.completion_tokens as u32,
             archived_at: self.archived_at.map(|s| parse_ts(&s)).transpose()?,
         })
     }

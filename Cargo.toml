@@ -49,6 +49,11 @@ tokio = { version = "1", features = ["full"] }
 tokio-stream = { version = "0.1", features = ["sync"] }
 toml = "0.8"
 tower = { version = "0.5", features = ["util"] }
+# 响应压缩（决策 361，票 01）：本仓此前**完全没有压缩**——106 上 `/tasks/{id}/commands`
+# 的 1,330,415 字节是原样过网的（实测响应头只有 content-type + content-length）。
+# 只开 br / gzip 两个 feature：deflate 与 zstd 在浏览器端的收益与 br 重叠，
+# 多一份编解码依赖换不到载荷上的差别。
+tower-http = { version = "0.6", features = ["compression-br", "compression-gzip"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 ulid = "1"

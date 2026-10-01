@@ -47,5 +47,11 @@ export default defineConfig({
     environment: 'jsdom',
     include: ['src/**/*.test.ts'],
     globals: true,
+    // 纯函数 bench（决策 361，票 04）：与 `test.include` 分开点名——它**不进**
+    // `npm test` 的断言集合（秒数类指标在 CI 上必然 flaky），只在 `npm run bench`
+    // 里被显式收集。默认 include 会去捞 node_modules，故这里写死本仓的路径。
+    benchmark: {
+      include: ['src/**/*.bench.ts'],
+    },
   },
 });
