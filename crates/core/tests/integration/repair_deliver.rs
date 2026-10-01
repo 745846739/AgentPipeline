@@ -109,10 +109,15 @@ impl StewardActionRunner for RecordingSteward {
 }
 
 /// 在某个目录里跑 git（任务 worktree 的提交不经过 [testkit::Repo]，它锚在项目仓上）。
+///
+/// 逐次 `-c` 带上身份：CI runner 没有全局 git 身份（「Author identity unknown」，
+/// check 36805021562 实测），本仓 fixture 的惯例是逐次 `-c` 补齐（executor.rs /
+/// git_chain.rs 同款），不依赖跑测试那台机器的配置。
 fn git_in(dir: &Path, args: &[&str]) -> String {
     let out = std::process::Command::new("git")
         .arg("-C")
         .arg(dir)
+        .args(["-c", "user.name=fixture", "-c", "user.email=fixture@local"])
         .args(args)
         .output()
         .expect("git 应当可执行");
