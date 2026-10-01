@@ -22,7 +22,7 @@ Kanban 式流水线驱动的本地多 agent 开发管线：init → architect-de
 ## 引用约定
 
 - **章节编号**：`§4.2` 这类引用按上表"原章节"列定位到对应文件（如 §4.2 → data-model.md）。
-- **决策编号**：`决策 85` 一律指 [decisions.md](decisions.md) 的 #85，编号只增不改、被修订时在行内标注。
+- **决策编号**：`决策 85` 一律指 [decisions.md](decisions.md) 的 #85，编号只增不改、被修订时在条目内标注。
 - **前端规格**：交互骨架与页面元素定稿在 [design/frontend-design.md](../design/frontend-design.md)（§4–§7）；视觉方向以**主题六「像素机房 · 夜班流水线」**为准（[theme-6-pixel.md](../design/theme-6-pixel.md)，决策 169）。operations.md §12.11 是前端与流水线之间的契约侧（流式、组件复用）。
 - **主题方案**：选型已定为主题六「像素机房 · 夜班流水线」——深色「夜班靛」/ 浅色「掌机背光」× 桌面/移动四款原型（[theme-6-pixel.md](../design/theme-6-pixel.md)、[prototype-pixel.html](../design/prototype-pixel.html)、[prototype-pixel-light.html](../design/prototype-pixel-light.html)、[prototype-pixel-mobile.html](../design/prototype-pixel-mobile.html)、[prototype-pixel-mobile-light.html](../design/prototype-pixel-mobile-light.html)）；主题三「终端 · 调度电报」与其余四款候选（夜间调度台 / 日间时刻表 / 蓝图「晒图房」/ 车间「工单板」）均已归档至 [design/deprecated/](../design/deprecated/README.md)。
 - **公开范围（票 11）**：上面引用的两份设计规格（[frontend-design.md](../design/frontend-design.md)、[theme-6-pixel.md](../design/theme-6-pixel.md)）、四款主题六原型（`design/prototype-pixel*.html`）与决策日志 [decisions.md](decisions.md) 都**随仓库公开**——界面文案里的规格 / 决策引用对公开读者可达。（历史方案 `design/deprecated/` 同样公开；`.scratch/` 是工作区，其下截图不入库。）
