@@ -1,0 +1,7 @@
+PASS  基线解析出 364 条决策（预期 364）
+PASS  表格前的前缀逐字节一致
+PASS  新版共 364 节（预期 364）
+PASS  编号集合 = 1–365 去 318
+SKIP   decisions-cells.json 不在（中间产物不入库；convert.py 可重建）
+PASS  逐条 heading / 正文 / 来源比对
+PASS  新版无残留表格行（命中 0）
