@@ -144,6 +144,47 @@ grilling 第二轮曾同意「用 `goto` 从 `architect-design.validate_output` 
 顺流重跑 architect execute → validate_output → dev/test 双分支 → sync-check → develop…。
 这是唯一能在真实数据上端到端验证修复的受支持路径。
 
+#### 现场验收（2026-10-02 00:33–03:01 CST，部署 631b202 之后，真实数据库）
+
+按上面的决议执行了，结果如下（时间 UTC，run id 取 106 库 `kanban_node_runs`）：
+
+| 时刻 | run | 阶段/节点 | 结果 |
+| --- | --- | --- | --- |
+| 16:35:24 | 134 | architect-design.execute（attempt 13） | success，37.7 分钟 |
+| 17:13:04 | 135 | architect-design.validate_output | success |
+| 17:14:31 | 136 / 137 | develop-design / test-design .validate_input | success（双分支分裂） |
+| 17:16:41 / 17:16:42 | 138 / 139 | develop-design / test-design .execute | success |
+| 17:20:54 | 140 / 141 | test-design / develop-design .validate_output | success |
+| 17:24:15 | 142 | **sync-check.execute** | success，`{"decision":"proceed","dev_blockers":[],"test_blockers":[],…}` |
+| 17:24:15 起 | 143 / 144 / 145 | develop.execute | 143、144 **failed**（见下），145 在跑 |
+
+**三条修复都在真实数据上拿到了正向证据**：
+
+① **截断不再被当「缺字段」**（票 01）：run 135 的日志里有
+`WARN submit_metadata 参数不是合法 JSON，已按截断救援（被截字段不会自己回来）raw_len=29`
+——同一个上游截断，事故时被静默读成「字段不在」，现在**明着报、按救援走**，节点照样成功。
+
+② **闸门不再真空通过**（票 04）：142 的判决是 `proceed` 且**没有 `metadata_gaps` 字段**
+（空 Vec 不序列化）——三行元数据齐全时它放行，缺项时它会拦（由集成用例钉住）。
+三行产出的元数据由重跑**自己写全**了（architect 2124 B 含 `acceptance_criteria`、
+develop-design 1111 B、test-design 6130 B），回填的三行被逐一覆盖——回填在这里的作用是
+**让 test-design 那一行在 run 139 落库之前不至于空着**，而不是终点。
+
+③ **梯子**（票 02）没有被现场打到：本段两次失败都是**上游断流**
+（`LLM 调用失败：流在没有 [DONE] / finish_reason 的情况下结束（收到 32327 / 2247803 字节后断开）`），
+不是节点超时；重试按 attempt 递增（143→2→3）走下去，没有出现事故里那条「超时 → 自动续接 →
+被自己的中止行清零」的循环。这一条的现场证据**仍然欠缺**，如实记在这里。
+
+**结论**：事故任务那段 35 小时的墙（architect-design 反复超时 / 回溯）**已经翻过去了**——
+续跑后 49 分钟走到 sync-check 并 `proceed`，进入 develop。
+剩下的是**另一个**问题，且不在本批范围内：`api.commandcode.ai` 这个 provider 会在
+**长流**上把连接掐断（run 144 收到 2.2 MB 后断开），而 develop 阶段正是「让模型一次写很多」
+的那一步——于是它反复失败重试（每次 40–50 分钟）。这是上游可靠性问题，不是本批修的静默降级。
+
+**未收口、留给用户的一处**：这条任务的 `description` 长度是 0（它建于 2026-09-30，
+早于票 05 的闸门，闸门只管新任务）。它靠标题「修复前端闪屏问题」跑完了整条设计阶段——
+设计内容是「逐帧闪屏探针 + 四场景 e2e」。要不要给它补一句描述、或就此作废重建，是用户的决定。
+
 ## 批次与阻塞
 
 | 批次 | 票 | 主题 |

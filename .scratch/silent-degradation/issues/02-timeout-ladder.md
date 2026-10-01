@@ -114,3 +114,15 @@ run 104/106/107/108/109/110/111、`journalctl` 2026-09-30 的 13 次重启。
 `the_ladder_still_climbs_across_a_timeout_originated_cancel`（含"第 4 次走到 Pending"）、
 `a_human_cancel_still_resets_the_ladder`、`a_stale_timeout_only_closes_the_row_and_leaves_the_live_attempt_alone`、
 `a_restart_closes_leftover_task_runs_without_impersonating_a_timeout`。
+
+### 现场验收（2026-10-02，106 真实数据）——**这一条没被打到，如实记**
+
+事故任务续跑后到 03:01 CST 为止，**一次节点超时都没发生**：develop 阶段的两次失败都是上游断流
+（`LLM 调用失败：流在没有 [DONE] / finish_reason 的情况下结束`，收到 32327 / 2247803 字节后断开），
+重试按 attempt 递增（143 → 2 → 3）继续走，没有出现事故里那条
+「超时 → 自动续接 → 被自己的中止行清零」的循环。
+
+也就是说：**梯子的现场证据仍然欠缺**。本票现有的正面证据只有
+`crates/core/tests/integration/scheduler_tick.rs` 那四条集成用例，106 上只拿到「没有再犯」的旁证
+——旁证不是证成：没被打到等于没有反例，不等于有正例。将来手上有超时场景的真实数据时，
+这是第一个该复看的地方。详见 `.scratch/silent-degradation/spec.md` 的「现场验收」。
