@@ -112,3 +112,21 @@ dev readiness 取自 `(DevelopDesign, dev_doc)`、test readiness 与 `test_scena
 python3 .scratch/silent-degradation/tools/backfill_metadata.py \
     --db ~/.agentpipeline/data/agentpipeline.db --task-id <事故任务 id>          # dry-run 先看
 ```
+
+### 落地记录：106 上的实跑（2026-10-02 00:34，部署 631b202 之后）
+
+dry-run 命中四条，落在**三个会话**里（architect-design conv 84 / 98，test-design conv 88）——
+事故任务在 09-30 到 10-01 之间被重跑了多轮，每轮各留一份可捞的 XML。写库按会话 id 升序，
+**最后一份 architect-design（conv 98）覆盖 conv 84**，符合「取最新一轮产出」的直觉。
+
+落库前先做了一件票面没写的事：**比对捞回的 `design_doc_path` / `test_scenarios_path` 与
+`stage_outputs.file_path`**，确认不是「把另一份文档的元数据贴到这一行上」——
+两者逐字相同（`…/design.md`、`…/test-scenarios.md`），回填是诚实的。
+
+- 备份：`sqlite3 <db> ".backup /root/agentpipeline-db-bak-<ts>.db"`（在线备份，29M）。
+- 结果：`architect-design/design_doc` 从 `{"readiness":true}`（18 字节）→ 2317 字节，
+  含 `acceptance_criteria` 5 条；`test-design/test_scenarios` → 6455 字节，含 13 条场景。
+- **捞不回来的那一行**：`develop-design/dev_doc` 仍是 `{"readiness":true}`——会话里只有散文、
+  没有 `<function=submit_metadata>` 的 XML。脚本对它只会报告「没找到」，这是已知边界，
+  不是这次漏做。它不影响本票的闸门（闸门只消费 architect 的 `acceptance_criteria` 与
+  test 的 `test_scenarios` 两个键）。

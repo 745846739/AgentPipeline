@@ -111,3 +111,16 @@ architect-design.execute 收到的 user prompt 是
 改法：`supplement_input` 在正文里认 `## 用户答复` 小节，**有就只取它**，没有（旧格式文件）
 就整段当答复；补一条单测钉住。留痕里两节都留着（可追溯 + execute 侧重入段照旧渲染全文），
 只有 user turn 恢复成"用户说过的那句话"。
+
+### 落地后补记：波及面还扩散到 e2e（提交 631b202）
+上面那七处夹具是 `cargo test` 能抓到的，**抓不到的在后一层**——e2e 自己经 `POST /tasks`
+播种（`frontend/e2e/harness.ts` 两处），也给新建对话框填表。空白描述闸门一上，CI 的 e2e
+作业 38 条全红、`deploy-106` 被跳过（决策 330 的形状：check 红就没有部署）。
+补齐四处：`harness.ts` 两个播种口、`create-flow.spec.ts` 的 ⑤、
+`ux2-flows-and-copy.spec.ts` 的 ②（两个对话框）、`modal-keyboard.spec.ts` 的 ① 与它那条
+候选任务夹具。教训与票面同源：**「必填」这类入口收窄，播种路径与填表路径要一起数**——
+`cargo test` 与 vitest 都看不见 e2e 的播种口。
+
+**未收口的一处（如实记）**：这条闸门只管**新**任务。事故任务
+`01M3QW8CKS07R3MWG9XM4FNYER` 的 `description` 长度是 0（建于 2026-09-30，早于本票），
+它照旧能续跑——要不要给它补一句描述、或就此作废重建，是用户的决定，不是本票能替的。
