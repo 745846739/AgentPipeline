@@ -35,6 +35,7 @@ mod project_analysis_observation;
 mod project_delete;
 mod readonly;
 mod repair;
+mod repair_deliver;
 mod repo_live;
 mod scheduler_tick;
 mod search;

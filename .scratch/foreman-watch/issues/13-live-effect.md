@@ -35,13 +35,29 @@
 
 ## 验收
 
-- [ ] 清后再落：带未提交半成品的任务 worktree，修复落地后 `[repair]` commit 不含半成品
+- [x] 清后再落：带未提交半成品的任务 worktree，修复落地后 `[repair]` commit 不含半成品
       （半成品被清，diff 只含修复）——反向：去掉先清那步，用例红
-- [ ] 已提交进度保留：分支上有 commit 的任务，清后那些 commit 原样在
-- [ ] 清的动作落 system 命令台账（含清前脏态读数）
-- [ ] 托管开且次数未满 → 修复收口后任务自动 resume，`auto_resumes` +1、指纹更新
-- [ ] 次数满（=2）→ 不自动、回落「等合入」+ 播报原因
-- [ ] 同一态势指纹 → 不重复动手
-- [ ] 托管未开 → 不自动、回落「等合入」
-- [ ] 闸门不过 → 不落补丁、不 resume、播报失败原因（票 11 既有用例不红）
-- [ ] 本仓修复路径行为不变（票 11 的「不含重启调用、不改工作区」反向断言照旧绿）
+- [x] 已提交进度保留：分支上有 commit 的任务，清后那些 commit 原样在
+- [x] 清的动作落 system 命令台账（含清前脏态读数）
+- [x] 托管开且次数未满 → 修复收口后任务自动 resume，`auto_resumes` +1、指纹更新
+- [x] 次数满（=2）→ 不自动、回落「等合入」+ 播报原因
+- [x] 同一态势指纹 → 不重复动手
+- [x] 托管未开 → 不自动、回落「等合入」
+- [x] 闸门不过 → 不落补丁、不 resume、播报失败原因（票 11 既有用例不红）
+- [x] 本仓修复路径行为不变（票 11 的「不含重启调用、不改工作区」反向断言照旧绿）
+
+## 实施收尾（2026-10-01）
+
+- **落点**：`repair(action=deliver)`（`agent/tools.rs`）＝ conclude（闸门 + 修复分支
+  `[repair]` commit，与 finish 共用 `conclude_repair_round`）→ 当场生效尝试 → 回落。
+  git 原语两枚进 `git.rs`（`dirty_summary` / `apply_patch`）；commit 落点显式化收
+  `commit_repair_in`（两条路同一份 message 与 git2 出口）；「等合入」提议 + 两处留痕
+  收 `propose_and_note_awaiting`（回落路一字不少）。
+- **第三成员**：`is_stewardable_repair_resume`（`task resume goto + after_repair`）进
+  `is_stewardable_action`；落点钉死在 `steward_grant`——goto 只许落回卡住阶段的入口；
+  记账抽出 `note_steward_auto`（与既有两个成员同一条止损线、同一份【托管】留账）。
+- **resume 合成**：目标由待办原因推导（`reason.stage` 的 `entry_node`），模型不经手；
+  闸门（分钟级）之后授权**再取一次**——不许可时补丁已落，回执明说「去按重试执行」。
+- **测试**：`tests/integration/repair_deliver.rs` 7 条（幸福路 / 托管没开 / 次数满 /
+  人按住 / 任务闸门失败回滚 / 补丁冲突回落 / 修复闸门失败什么都不落）。
+  执行者用替身（票 08 同姿态）。

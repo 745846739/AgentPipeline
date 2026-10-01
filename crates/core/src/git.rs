@@ -374,6 +374,50 @@ impl Git {
         .await
     }
 
+    /// 脏态的一句话读数（决策 358②：清存量前先记「清掉了什么」）。
+    ///
+    /// 只数不改：`N 处未提交（其中 M 个未跟踪）`——落进清理命令的台账里，
+    /// 让「先清后落」在审计面上看得到代价。空工作区返回 `Ok(None)`。
+    pub async fn dirty_summary(&self, path: &Path) -> Result<Option<String>> {
+        let p = path.to_path_buf();
+        blocking(move || {
+            let repo = open(&p)?;
+            let mut opts = git2::StatusOptions::new();
+            opts.include_untracked(true);
+            let statuses = repo.statuses(Some(&mut opts)).map_err(gerr)?;
+            if statuses.is_empty() {
+                return Ok(None);
+            }
+            let untracked = statuses
+                .iter()
+                .filter(|e| e.status() == git2::Status::WT_NEW)
+                .count();
+            Ok(Some(format!(
+                "{} 处未提交（其中 {untracked} 个未跟踪）",
+                statuses.len()
+            )))
+        })
+        .await
+    }
+
+    /// 把一段 patch 文本应用进工作区（票 13「落补丁」：修复 commit 的 diff 落到任务
+    /// worktree，**不提交**——提交与否由闸门之后的 `[repair]` commit 决定）。
+    ///
+    /// 用 libgit2 的 `apply`（WorkDir 位）而不是 shell `git apply`：与本文件其余原语
+    /// 同一姿态。补丁与目标树对不上（任务分支碰过同一批行）时返回 `Err`——调用方
+    /// 据此走「等合入」回落，绝不留半份补丁在工作区。
+    pub async fn apply_patch(&self, worktree: &Path, patch: &str) -> Result<()> {
+        let wt = worktree.to_path_buf();
+        let patch = patch.to_string();
+        blocking(move || {
+            let repo = open(&wt)?;
+            let diff = git2::Diff::from_buffer(patch.as_bytes()).map_err(gerr)?;
+            repo.apply(&diff, git2::ApplyLocation::WorkDir, None)
+                .map_err(|e| Error::Git(format!("补丁落不进任务工作区（多半与任务改动冲突）：{e}")))
+        })
+        .await
+    }
+
     /// 基准 ref（决策 41）：有 **origin** remote 用 `origin/{default_branch}`，否则本地分支。
     ///
     /// 只认 `origin`：仓库只配了别的 remote 名时，`origin/{branch}` 并不存在，

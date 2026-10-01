@@ -216,23 +216,27 @@ pub const FOREMAN_TOOL_SPECS: [ForemanToolSpec; 24] = [
                       这条动作会不会立即执行由权限档位决定（`ask` 档要值班经理按键确认）。",
         parameters: r#"{"type":"object","properties":{"command":{"type":"string","description":"要执行的命令原文"},"cwd":{"type":"string","description":"工作目录（默认家目录根）"},"timeout_sec":{"type":"integer","description":"超时秒数"}},"required":["command"]}"#,
     },
-    // ── 修复轮（决策 210③④ / 票 10–12）：**它的载体是环境**——在项目仓上拉一个 worktree、
-    //    跑闸门、落一个带标记的 commit，故它归 C 层由档位管（`ask` 下每步要按键、`auto`
-    //    下整轮自己跑完），而**合入永远人按**。它没有进托管自动集，也没有进 D 层：
-    //    `finish` 的产物本身就是一条提议，放 D 层会变成两层按不完的钮。
+    // ── 修复轮（决策 210③④ / 票 10–12；当场生效一路是决策 358 / 票 13）：**它的载体是
+    //    环境**——在项目仓上拉一个 worktree、跑闸门、落一个带标记的 commit，故它归 C 层
+    //    由档位管（`ask` 下每步要按键、`auto` 下整轮自己跑完），而**合入永远人按**。
+    //    `deliver` 的自动 resume 在托管自动集里（决策 358 的第三成员），止损照 210⑨。
     ForemanToolSpec {
         name: "repair",
         label: "修复",
-        description:
-            "起草一份补丁（三步走，**改动在你按下合入之前不进主干**）。\
+        description: "起草一份补丁并决定它的交付方式。\
                       `start`：给某个项目拉一个独立的修复 worktree，回执里有可写目录与 \
                       repair_id——**补丁只能写在那个目录里**（项目工作区在文件域之外）；\
                       `finish`：跑闸门（lint + 测试）→ 过了才单独成一个带标记的 commit → \
                       出 diff → 落一条等你按合入的提议（没过就什么都不出，回执里说得清是哪一步）；\
+                      `deliver`：闸门与 commit 同 finish，然后**当场生效**——必填 task_id，\
+                      把补丁落进那条停着的任务的 worktree、在任务工作区再过一遍闸门、\
+                      过了就托管自动重试（托管没开或次数用完会自动退回「等合入」的提议，\
+                      回执里说清走的哪条）；\
                       `discard`：不修了，回收 worktree（分支留着当证据）。\
-                      顺序是用法的一部分：先 start、写完再 finish，finish 时给一句 conclusion\
-                      （它进 commit message）。绝不说「我已经修好了」——你只是提了一条等人按的提议。",
-        parameters: r#"{"type":"object","properties":{"action":{"type":"string","enum":["start","finish","discard"],"description":"要做的动作"},"project_id":{"type":"string","description":"修哪个项目（read_projects 里有 id）"},"repair_id":{"type":"string","description":"finish / discard：start 回执里那个 id"},"conclusion":{"type":"string","description":"finish：一句话诊断结论（进 commit message）"},"task_id":{"type":"string","description":"finish：若这次修复是为某个任务做的，填它的 id——那条任务上会留下「等修复合入」"}},"required":["action","project_id"]}"#,
+                      顺序是用法的一部分：先 start、写完再 finish 或 deliver，给一句 \
+                      conclusion（它进 commit message）。绝不说「我已经修好了」——\
+                      finish 是提议，deliver 的自动重试也受托管止损约束（满 2 次即停）。",
+        parameters: r#"{"type":"object","properties":{"action":{"type":"string","enum":["start","finish","deliver","discard"],"description":"要做的动作"},"project_id":{"type":"string","description":"修哪个项目（read_projects 里有 id）"},"repair_id":{"type":"string","description":"finish / deliver / discard：start 回执里那个 id"},"conclusion":{"type":"string","description":"finish / deliver：一句话诊断结论（进 commit message）"},"task_id":{"type":"string","description":"finish：若这次修复是为某个任务做的，填它的 id——那条任务上会留下「等修复合入」。deliver：必填，当场生效的目标任务"}},"required":["action","project_id"]}"#,
     },
     // ── D 层：本服务的写接口（决策 206 / 207）。**一族一个工具 + 动作参数**：粒度对着
     //    `allowed_actions` 的类型走。这一层**不读档位**——「本服务自己的写接口需要人按

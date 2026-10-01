@@ -213,9 +213,39 @@ pub fn is_stewardable_unstick(name: &str, args: &serde_json::Value) -> bool {
     crate::pipeline::unstick::is_unstick_action(name, args)
 }
 
+/// 托管可自动集的**第三个成员**（决策 358 / 票 13）：修复落补丁后的自动 resume。
+///
+/// 形状是 `task` + `resume` + `goto` + `after_repair` 标记——这个调用**不由模型手写**：
+/// 它由 `repair(action=deliver)` 在补丁落进任务 worktree、闸门过了、commit 落好之后
+/// 合成，`after_repair` 带的是 repair_id。210② 当初把 `goto` 排除在自动集外的理由
+/// （「替人重排流水线」）在这里保住的方式是**落点钉死**：[`ToolExecutor::steward_grant`]
+/// 对这个成员额外核「目标 = 卡住阶段的入口」，goto 只能是「重试执行」，改不了流转目标。
+pub fn is_stewardable_repair_resume(name: &str, args: &serde_json::Value) -> bool {
+    name == "task"
+        && args.get("action").and_then(|v| v.as_str()) == Some("resume")
+        && args.get("resume_action").and_then(|v| v.as_str()) == Some("goto")
+        && args
+            .get("after_repair")
+            .and_then(|v| v.as_str())
+            .is_some_and(|s| !s.trim().is_empty())
+}
+
 /// 这一次调用在整个托管自动集里吗（形状判据的**唯一入口**）。
 pub fn is_stewardable_action(name: &str, args: &serde_json::Value) -> bool {
-    is_stewardable_resume(name, args) || is_stewardable_unstick(name, args)
+    is_stewardable_resume(name, args)
+        || is_stewardable_unstick(name, args)
+        || is_stewardable_repair_resume(name, args)
+}
+
+/// `repair(action=deliver)` 的三种结局（决策 358 / 票 13）。
+enum DeliverAttempt {
+    /// 补丁已落、commit 已成；自动 resume 走没走成都算交付（answer 里说清下一步）。
+    Delivered { answer: String },
+    /// 任务工作区里的**组合**闸门没过（修复本身在修复 worktree 过了闸门）：补丁已撤、
+    /// 没 resume、没提议——照票 11.1「没过就播报失败、不出 diff」。
+    GateFailedInTaskWorktree { note: String },
+    /// 授权或前提不满足：工作区一个字没动，原样回落「等合入」（提议照落）。
+    Fallback { reason: String },
 }
 
 /// 托管放行的自动动作怎么**执行**（决策 210② / 票 08）。
@@ -783,6 +813,30 @@ impl ToolExecutor {
         if crate::pipeline::cursor::all_pending_are_human_holds(&live) {
             return Ok(None);
         }
+        // 托管第三成员（决策 358）的**落点钉死**：goto 只许落回卡住那个阶段的入口——
+        // 「重试执行」，不是改流转目标。跳阶段 / 回设计那些 goto 哪怕形状再像也不进
+        // 自动集：210② 当初排除 goto 的理由在这里保住。
+        if is_stewardable_repair_resume(&call.name, &args) {
+            let permitted = live
+                .first()
+                .and_then(|c| c.pending_reason.as_ref())
+                .is_some_and(|reason| {
+                    match (
+                        args.get("target_stage").and_then(|v| v.as_str()),
+                        args.get("target_node").and_then(|v| v.as_str()),
+                    ) {
+                        (Some(stage), Some(node)) => {
+                            stage == reason.stage.as_str()
+                                && node
+                                    == crate::pipeline::landing::entry_node(reason.stage).as_str()
+                        }
+                        _ => false,
+                    }
+                });
+            if !permitted {
+                return Ok(None);
+            }
+        }
         let Some(stewardship) = task.stewardship.as_ref() else {
             return Ok(None);
         };
@@ -807,54 +861,72 @@ impl ToolExecutor {
             .steward_actions
             .as_ref()
             .ok_or_else(|| Error::Validation("托管动作没有执行者（不注入不放行）".into()))?;
-        let args = Self::args(call)?;
-        let task_id = args
-            .get("task_id")
-            .and_then(|v| v.as_str())
-            .unwrap_or("")
-            .to_string();
         // 授权在**执行前**再取一次：上一步的检查与这一步之间没有任何 await 之外的东西，
         // 但账要记在动手之后（记「动了几次」而不是「打算动几次」）。
         let grant = self.steward_grant(call).await?;
         let outcome = runner.run(call.clone(), ctx.clone()).await?;
-        if let (Some(store), Some(fingerprint)) = (&self.ledger, grant) {
-            if let Ok(task) = store.get_task(&task_id).await {
-                // 记账用的是**实际做的那个动作**（`resume(continue)` / `unstick`）：
-                // 这一行是值班经理第二天早上唯一能读到的「它自己动过几次手」，写错动作名
-                // 等于把一次 `unstick` 说成一次 resume。次数止损线两种动作**共用**一条
-                // （决策 210⑨ 的 N=2）——这是更保守的那一侧：同一条线不必记两遍，
-                // 而托管放开的范围本来就该窄到可审计。
-                let action = match args.get("action").and_then(|v| v.as_str()) {
-                    Some("unstick") => "unstick".to_string(),
-                    _ => format!(
-                        "resume({})",
-                        args.get("resume_action")
-                            .and_then(|v| v.as_str())
-                            .unwrap_or("continue")
-                    ),
-                };
-                let mut stewardship = task.stewardship.clone().unwrap_or_default();
-                stewardship.note_auto_resume(&fingerprint, store.now());
-                let nth = stewardship.auto_resumes;
-                store.set_stewardship(&task_id, Some(&stewardship)).await?;
-                if let Some(session_id) = ctx.session_id.as_deref() {
-                    let content = format!(
-                        "【托管】自动 {action}：任务 {task_id}（第 {nth}/{} 次自动动作）。\
-                         依据指纹 {fingerprint}。超出次数或指纹相同即停手，等你按键。",
-                        crate::types::STEWARDSHIP_MAX_AUTO_RESUMES
-                    );
-                    if let Err(e) = store
-                        .append_foreman_message(crate::storage::NewForemanMessage::system(
-                            session_id, content,
-                        ))
-                        .await
-                    {
-                        tracing::error!(task = %task_id, "托管动作的留痕写不进去：{e}");
-                    }
+        if grant.is_some() && self.ledger.is_some() {
+            self.note_steward_auto(call, grant.as_deref().expect("grant 刚刚判过 Some"), ctx)
+                .await?;
+        }
+        Ok(outcome)
+    }
+
+    /// 托管自动动作的**当场留账**（决策 210② 的硬要求；票 13 的第三个成员共用这一份）。
+    ///
+    /// 账分两处，各自回答不同的问题：
+    /// - 会话里一条 `system` 行（操作台记的）——「它什么时候、对哪个任务、第几次动的手」，
+    ///   人第二天早上在时间线上读得到；
+    /// - 任务行上的 `auto_resumes` / `last_fingerprint`——止损线要落库，重启后仍算数。
+    async fn note_steward_auto(
+        &self,
+        call: &ToolCall,
+        fingerprint: &str,
+        ctx: &ToolCallContext,
+    ) -> Result<()> {
+        let Some(store) = &self.ledger else {
+            return Ok(());
+        };
+        let args = Self::args(call)?;
+        let Some(task_id) = args.get("task_id").and_then(|v| v.as_str()) else {
+            return Ok(());
+        };
+        if let Ok(task) = store.get_task(task_id).await {
+            // 记账用的是**实际做的那个动作**（`resume(continue)` / `unstick` /
+            // 修复后的 `resume(goto)`）：这一行是值班经理第二天早上唯一能读到的
+            // 「它自己动过几次手」，写错动作名等于把一次 `unstick` 说成一次 resume。
+            // 次数止损线所有成员**共用**一条（决策 210⑨ 的 N=2）——这是更保守的那一侧：
+            // 同一条线不必记两遍，而托管放开的范围本来就该窄到可审计。
+            let action = match args.get("action").and_then(|v| v.as_str()) {
+                Some("unstick") => "unstick".to_string(),
+                _ => format!(
+                    "resume({})",
+                    args.get("resume_action")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("continue")
+                ),
+            };
+            let mut stewardship = task.stewardship.clone().unwrap_or_default();
+            stewardship.note_auto_resume(fingerprint, store.now());
+            let nth = stewardship.auto_resumes;
+            store.set_stewardship(task_id, Some(&stewardship)).await?;
+            if let Some(session_id) = ctx.session_id.as_deref() {
+                let content = format!(
+                    "【托管】自动 {action}：任务 {task_id}（第 {nth}/{} 次自动动作）。\
+                     依据指纹 {fingerprint}。超出次数或指纹相同即停手，等你按键。",
+                    crate::types::STEWARDSHIP_MAX_AUTO_RESUMES
+                );
+                if let Err(e) = store
+                    .append_foreman_message(crate::storage::NewForemanMessage::system(
+                        session_id, content,
+                    ))
+                    .await
+                {
+                    tracing::error!(task = %task_id, "托管动作的留痕写不进去：{e}");
                 }
             }
         }
-        Ok(outcome)
+        Ok(())
     }
 
     /// 把一次调用落成提议（决策 188 / 207），返回回灌进对话的那句话。
@@ -1608,6 +1680,111 @@ impl ToolExecutor {
                     }
                 }
             }
+            "deliver" => {
+                // ── 当场生效（决策 358 / 票 13）：补丁直接落进**任务 worktree**，任务
+                //    工作区的闸门过了单独成 commit，再经托管自动 resume——任务带着修复
+                //    继续跑。授权/前提任何一条不满足，都原样回落「等合入」（提议照落）。
+                let Some(repair_id) = args.get("repair_id").and_then(|v| v.as_str()) else {
+                    return Ok(ToolOutcome::ok(
+                        "repair(action=deliver) 需要一个 repair_id——start 的回执里有它。",
+                    ));
+                };
+                let Some(task_id) = args
+                    .get("task_id")
+                    .and_then(|v| v.as_str())
+                    .map(str::to_string)
+                    .filter(|s| !s.trim().is_empty())
+                else {
+                    return Ok(ToolOutcome::ok(
+                        "repair(action=deliver) 需要一个 task_id：当场生效是把补丁落进那条\
+                         停着的任务的 worktree 再托管自动 resume。没有具体任务就走 finish\
+                         （等合入）。",
+                    ));
+                };
+                let conclusion = args
+                    .get("conclusion")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .trim()
+                    .to_string();
+                if conclusion.is_empty() {
+                    return Ok(ToolOutcome::ok(
+                        "repair(action=deliver) 需要一句 conclusion：这次改了什么、为什么\
+                         （它会进 commit message，三个月后靠它认账）。",
+                    ));
+                }
+                let session = repair::repair_session_for(
+                    &self.home,
+                    std::path::Path::new(&project.local_path),
+                    &project.default_branch,
+                    repair_id,
+                    &session_id,
+                )
+                .await?;
+                if !session.worktree.exists() {
+                    return Ok(ToolOutcome::ok(format!(
+                        "修复 worktree 不在（{}）。它可能已经被回收——重新 start 一次。",
+                        session.worktree.display()
+                    )));
+                }
+                // 闸门 + 修复分支上的 [repair] commit：与 finish 同一份（conclude）。
+                let outcome = match repair::conclude_repair_round(
+                    &store,
+                    &self.home,
+                    &self.settings,
+                    &self.killer,
+                    &project,
+                    &session,
+                    &conclusion,
+                    store.now(),
+                )
+                .await?
+                {
+                    repair::RepairConclusion::GateFailed { note, gate } => {
+                        return Ok(ToolOutcome::ok(format!(
+                            "闸门没过，**没有落补丁、没有 resume、也没有提提议**：{note}\n\
+                             读数：{}。改完再调一次 deliver。",
+                            gate.iter()
+                                .map(|r| format!("{} 退出码 {}", r.kind, r.exit_code))
+                                .collect::<Vec<_>>()
+                                .join("、")
+                        )));
+                    }
+                    repair::RepairConclusion::Done(outcome) => outcome,
+                };
+                match self
+                    .deliver_live_effect(&store, &project, &task_id, &outcome, &conclusion, ctx)
+                    .await?
+                {
+                    DeliverAttempt::Delivered { answer } => Ok(ToolOutcome::ok(answer)),
+                    DeliverAttempt::GateFailedInTaskWorktree { note } => {
+                        Ok(ToolOutcome::ok(format!(
+                            "补丁与任务工作区合起来的闸门没过——补丁已撤、任务 worktree 回到\
+                             原状，**没有 resume、也没有提提议**：{note}\n\
+                             修复分支 {} 还在：可以改一版再 deliver，或改走 finish 落\
+                             「等合入」的提议。",
+                            outcome.branch
+                        )))
+                    }
+                    DeliverAttempt::Fallback { reason } => {
+                        let proposal = repair::propose_and_note_awaiting(
+                            &store,
+                            &session_id,
+                            &project,
+                            &outcome,
+                            Some(&task_id),
+                        )
+                        .await?;
+                        Ok(ToolOutcome::ok(format!(
+                            "当场生效没走成（{reason}）——修复已照常交付为**待你按合入**的\
+                             提议：{}\n\
+                             diff 全文：{}/worktrees/repair-{repair_id}.diff。",
+                            proposal.summary,
+                            self.home.root().display()
+                        )))
+                    }
+                }
+            }
             "discard" => {
                 let Some(repair_id) = args.get("repair_id").and_then(|v| v.as_str()) else {
                     return Ok(ToolOutcome::ok(
@@ -1639,9 +1816,222 @@ impl ToolExecutor {
                 )))
             }
             other => Ok(ToolOutcome::ok(format!(
-                "repair 的动作只有 start / finish / discard，收到的是「{other}」。"
+                "repair 的动作只有 start / finish / deliver / discard，收到的是「{other}」。"
             ))),
         }
+    }
+
+    /// 当场生效的尝试（决策 358 / 票 13）：清存量 → 落补丁 → 任务工作区闸门 →
+    /// `[repair]` commit → 托管自动 resume。
+    ///
+    /// 授权判据只吃 [`Self::steward_grant`] 这一份：合成的 resume 调用带 `after_repair`
+    /// 标记（[`is_stewardable_repair_resume`] 的形状），落点由待办原因推导并经
+    /// `steward_grant` 钉死在「卡住阶段的入口」——模型不经手这个 resume。四条止损
+    /// （托管没开 / 次数满 / 指纹同 / 人按住）任何一条不满足都返回
+    /// [`DeliverAttempt::Fallback`]，工作区一个字不动——回落是**显式**的，调用方把原因
+    /// 说给班次听。
+    async fn deliver_live_effect(
+        &self,
+        store: &crate::storage::Store,
+        project: &crate::types::Project,
+        task_id: &str,
+        outcome: &crate::pipeline::repair::RepairOutcome,
+        conclusion: &str,
+        ctx: &ToolCallContext,
+    ) -> Result<DeliverAttempt> {
+        fn fallback(reason: impl Into<String>) -> DeliverAttempt {
+            DeliverAttempt::Fallback {
+                reason: reason.into(),
+            }
+        }
+        let Ok(task) = store.get_task(task_id).await else {
+            return Ok(fallback(format!("台账里没有任务 {task_id}")));
+        };
+        if task.project_id != project.id {
+            return Ok(fallback(format!(
+                "任务 {task_id} 属于项目 {}，不是这次修复的 {}",
+                task.project_id, project.id
+            )));
+        }
+        if task.status.is_terminal() {
+            return Ok(fallback("任务已是终态，补丁没有可落的在跑现场"));
+        }
+        let Some(worktree) = task
+            .worktree_path
+            .clone()
+            .filter(|p| !p.is_empty() && std::path::Path::new(p).exists())
+        else {
+            return Ok(fallback("任务的 worktree 不在，补丁没有可落的目录"));
+        };
+        let live = store.load_live_cursors(task_id).await?;
+        let Some(cursor) = live.first() else {
+            return Ok(fallback("任务没有活跃游标，不需要修复后的 resume"));
+        };
+        if live.len() > 1 {
+            return Ok(fallback("任务有多条活跃游标，落点不唯一——等人按"));
+        }
+        if crate::pipeline::cursor::all_pending_are_human_holds(&live) {
+            return Ok(fallback("任务是人按住的暂停（user_paused），托管不代劳"));
+        }
+        let Some(reason) = cursor.pending_reason.clone() else {
+            return Ok(fallback("任务没有停在 pending 上，不需要修复后的 resume"));
+        };
+        if !crate::actions::is_action_allowed(&reason, "goto") {
+            return Ok(fallback(format!(
+                "当前 pending（{}）不允许 goto，没有可自动的 resume",
+                reason.kind.as_str()
+            )));
+        }
+        let stage = reason.stage;
+        let node = crate::pipeline::landing::entry_node(stage);
+        let resume_call = ToolCall {
+            id: format!("repair-deliver-{}", outcome.repair_id),
+            name: "task".into(),
+            arguments: serde_json::json!({
+                "action": "resume",
+                "resume_action": "goto",
+                "target_stage": stage.as_str(),
+                "target_node": node.as_str(),
+                "task_id": task_id,
+                "after_repair": outcome.repair_id,
+            })
+            .to_string(),
+        };
+        // 授权预检：不许可就回落，工作区一个字不动。
+        if self.steward_grant(&resume_call).await?.is_none() {
+            return Ok(fallback(
+                "托管不许可（没开 / 次数满 / 同一态势动过手）".to_string(),
+            ));
+        }
+        let Some(runner) = self.steward_actions.clone() else {
+            return Ok(fallback("托管动作没有执行者（不注入不放行）".to_string()));
+        };
+
+        // ── 先清后落（决策 358②）：存量是上一轮失败尝试的**未提交**半成品，清前记账——
+        //    「清掉了什么」要落在命令台账里，清的动作照 tasks.rs 重试重置的先例（system 源）。
+        let wt = std::path::Path::new(&worktree);
+        if let Some(dirty) = crate::git::Git.dirty_summary(wt).await? {
+            let head = crate::git::Git.rev_parse(wt, "HEAD").await?;
+            let cmd_id = store
+                .record_start(crate::agent::tools::CommandStart {
+                    task_id: Some(task_id.to_string()),
+                    session_id: None,
+                    run_id: None,
+                    stage: Stage::Merge,
+                    node: Node::Execute,
+                    source: CommandSource::System,
+                    command: format!(
+                        "git reset --hard {head} && git clean -fdx（repair {} 先清后落）",
+                        outcome.repair_id
+                    ),
+                    cwd: worktree.clone(),
+                    original_command: None,
+                })
+                .await?;
+            let cleaned = crate::git::Git.reset_hard_clean(wt, "HEAD").await;
+            let finish = match &cleaned {
+                Ok(()) => CommandFinish {
+                    exit_code: Some(0),
+                    stdout_preview: Some(format!("清前脏态：{dirty}")),
+                    ..Default::default()
+                },
+                Err(e) => CommandFinish {
+                    exit_code: Some(1),
+                    stderr_preview: Some(e.to_string()),
+                    ..Default::default()
+                },
+            };
+            store.record_finish(cmd_id, finish).await?;
+            if let Err(e) = cleaned {
+                return Ok(fallback(format!("清存量失败：{e}")));
+            }
+        }
+
+        // ── 落补丁（不提交）：修复 commit 的 diff 应用进任务工作区。落失败不留半份——
+        //    回滚到 HEAD 再回落，半份补丁比没有补丁更糟。
+        let repo_path = std::path::Path::new(&project.local_path);
+        let patch = crate::git::Git
+            .diff_range(
+                repo_path,
+                &format!("{}..{}", outcome.base_ref, outcome.branch),
+            )
+            .await?;
+        if let Err(e) = crate::git::Git.apply_patch(wt, &patch).await {
+            let _ = crate::git::Git.reset_hard_clean(wt, "HEAD").await;
+            return Ok(fallback(format!("补丁落不进任务工作区：{e}")));
+        }
+
+        // ── 任务工作区里的闸门（票 11.1 对这条路的重申）：修复单独过闸门不算数，
+        //    「修复 + 任务已有工作」合成的那棵树也要过。没过就撤补丁、不 resume、不提议。
+        let gate_session = crate::pipeline::repair::RepairSession {
+            repair_id: outcome.repair_id.clone(),
+            session_id: ctx.session_id.clone().unwrap_or_default(),
+            worktree: wt.to_path_buf(),
+            branch: outcome.branch.clone(),
+            base_ref: String::new(),
+        };
+        let gate = crate::pipeline::repair::run_repair_gate(
+            store,
+            &self.home,
+            &self.settings,
+            &self.killer,
+            &gate_session,
+            project.lint_command.as_deref(),
+            project.test_framework.as_deref(),
+        )
+        .await?;
+        if gate.iter().any(|r| r.exit_code != 0) {
+            let _ = crate::git::Git.reset_hard_clean(wt, "HEAD").await;
+            return Ok(DeliverAttempt::GateFailedInTaskWorktree {
+                note: crate::pipeline::repair::gate_failure_note(&gate),
+            });
+        }
+
+        // ── 落 commit（任务分支上，同一个 [repair] 标记——审计线不断）──
+        let commit = crate::pipeline::repair::commit_repair_in(
+            wt,
+            &outcome.repair_id,
+            conclusion,
+            store.now(),
+        )
+        .await?;
+
+        // ── 托管自动 resume。授权在动手前**再取一次**：闸门以分钟计，现场可能变了
+        //    （人按了暂停 / 次数被同任务的另一路用掉 / 态势指纹变了）。
+        let Some(fingerprint) = self.steward_grant(&resume_call).await? else {
+            return Ok(DeliverAttempt::Delivered {
+                answer: format!(
+                    "补丁已落进任务 {task_id} 的工作区并单独成 commit（{commit}，带 `{}` 标记），\
+                     任务工作区的闸门已过。但托管此刻不许可自动 resume（没开 / 次数满 / \
+                     同一态势动过手 / 人按住了）——去任务页按「重试执行」，任务会带着修复继续跑。",
+                    crate::pipeline::repair::REPAIR_COMMIT_MARK
+                ),
+            });
+        };
+        let resumed = match runner.run(resume_call.clone(), ctx.clone()).await {
+            Ok(o) => o.content,
+            Err(e) => {
+                return Ok(DeliverAttempt::Delivered {
+                    answer: format!(
+                        "补丁已落进任务 {task_id} 的工作区并单独成 commit（{commit}），\
+                         任务工作区的闸门已过。但自动 resume 没走成：{e}——\
+                         去任务页按「重试执行」。",
+                    ),
+                });
+            }
+        };
+        self.note_steward_auto(&resume_call, &fingerprint, ctx)
+            .await?;
+        Ok(DeliverAttempt::Delivered {
+            answer: format!(
+                "当场生效完成：补丁已单独成 commit（{commit}，带 `{}` 标记）落进任务 \
+                 {task_id} 的工作区，两道闸门（修复 worktree + 任务工作区）都已通过，\
+                 任务已自动重试卡住的阶段（{} 的 {}）。\n{resumed}",
+                crate::pipeline::repair::REPAIR_COMMIT_MARK,
+                stage.as_str(),
+                node.as_str()
+            ),
+        })
     }
 
     /// `read_metrics`（票 01）：全局指标，**复用 `metrics::*` 纯函数口径**（决策 130② / 137）。

@@ -178,11 +178,10 @@ pub enum RepairRound {
 ///
 /// 整条序列写在**一个**函数里，而不是散在工具分派那几行：每一步都有「不做会怎样」的后果
 /// （不过闸门就不许出 diff、commit 必须带标记、提议必须带载荷与不设 TTL），散开写迟早漂成
-/// 「某条路少了一步」。工具层因此只剩「按动作分派」。
+/// 「某条路少了一步」。工具层因此只剩「按动作分派」。闸门与 commit 的公共前半在
+/// [`conclude_repair_round`]；deliver（票 13）只复用前半，不走本函数的提议半。
 ///
-/// `task_id` 是这条修复为之而做的任务（可选）：给了就留两处痕——班次里一条
-/// 「等修复合入」（人读对话时知道它在等什么），**任务上**也一句（人在看板上看那条任务时
-/// 知道它在等什么）。两处都要，因为它们回答的是两个场景的问题（票 11 / 决策 210⑨）。
+/// `task_id` 的语义见 [`propose_and_note_awaiting`]。
 #[allow(clippy::too_many_arguments)] // 依赖显式化那一族（决策 249 的姿态）：settings / killer 是闸门收口要的
 pub async fn finish_repair_round(
     store: &Store,
@@ -195,6 +194,48 @@ pub async fn finish_repair_round(
     task_id: Option<&str>,
     now: DateTime<Utc>,
 ) -> Result<RepairRound> {
+    match conclude_repair_round(
+        store, home, settings, killer, project, session, conclusion, now,
+    )
+    .await?
+    {
+        RepairConclusion::GateFailed { gate, note } => Ok(RepairRound::GateFailed { gate, note }),
+        RepairConclusion::Done(outcome) => {
+            let proposal =
+                propose_and_note_awaiting(store, &session.session_id, project, &outcome, task_id)
+                    .await?;
+            Ok(RepairRound::Proposed {
+                summary: proposal.summary.clone(),
+                proposal_id: proposal.id,
+                outcome,
+            })
+        }
+    }
+}
+/// 一轮修复的**闸门 + 落 commit + 出 diff**（票 11 的全部件）。
+///
+/// finish（等合入）与 deliver（当场生效，票 13）的**公共前半**：闸门过了就把修复落成
+/// 带标记的 commit 并出 diff；没过返回失败读数——「改完」这句话还不成立，两条路都一样。
+#[derive(Debug, Clone, PartialEq)]
+pub enum RepairConclusion {
+    GateFailed {
+        gate: Vec<GateReading>,
+        note: String,
+    },
+    Done(Box<RepairOutcome>),
+}
+
+#[allow(clippy::too_many_arguments)] // 依赖显式化那一族（决策 249 的姿态）：settings / killer 是闸门收口要的
+pub async fn conclude_repair_round(
+    store: &Store,
+    home: &Home,
+    settings: &Settings,
+    killer: &Arc<dyn ProcessKiller>,
+    project: &crate::types::Project,
+    session: &RepairSession,
+    conclusion: &str,
+    now: DateTime<Utc>,
+) -> Result<RepairConclusion> {
     let gate = run_repair_gate(
         store,
         home,
@@ -207,7 +248,7 @@ pub async fn finish_repair_round(
     .await?;
     let failed = gate.iter().any(|r| r.exit_code != 0);
     if failed {
-        return Ok(RepairRound::GateFailed {
+        return Ok(RepairConclusion::GateFailed {
             note: gate_failure_note(&gate),
             gate,
         });
@@ -230,18 +271,34 @@ pub async fn finish_repair_round(
         diff: Some(diff),
         diff_stat: Some(diff_stat),
     };
-    let proposal = propose_repair(store, &session.session_id, project, &outcome).await?;
+    Ok(RepairConclusion::Done(Box::new(outcome)))
+}
+
+/// 落「等合入」提议 + 两处留痕（票 12；票 13 的回落路**共用这一份**——当场生效走不通时，
+/// 修复的交付必须原样退回今天的形状，一句不少）。
+///
+/// `task_id` 是这条修复为之而做的任务（可选）：给了就留两处痕——班次里一条
+/// 「等修复合入」（人读对话时知道它在等什么），**任务上**也一句（人在看板上看那条任务时
+/// 知道它在等什么）。两处都要，因为它们回答的是两个场景的问题（票 11 / 决策 210⑨）。
+pub async fn propose_and_note_awaiting(
+    store: &Store,
+    session_id: &str,
+    project: &crate::types::Project,
+    outcome: &RepairOutcome,
+    task_id: Option<&str>,
+) -> Result<crate::storage::proposals::ForemanProposal> {
+    let proposal = propose_repair(store, session_id, project, outcome).await?;
     if let Some(task_id) = task_id {
         // 两处留痕都是**善后**：写不进去不该让「这次修复已经就绪」这件事变成一次失败——
         // 提议已经落库了，那才是人按键的地方。故各留一条 warn。
-        let note = format!("等修复合入（修复 {} 已过闸门）", session.repair_id);
+        let note = format!("等修复合入（修复 {} 已过闸门）", outcome.repair_id);
         if let Err(e) = store
             .append_foreman_message(crate::storage::NewForemanMessage::system(
-                &session.session_id,
+                session_id,
                 format!(
                     "【等修复合入】任务 {task_id} 的修复已就绪（{}）：{}——合入之前那条任务不会\
                      自己往前走。",
-                    session.repair_id, proposal.summary
+                    outcome.repair_id, proposal.summary
                 ),
             ))
             .await
@@ -258,11 +315,7 @@ pub async fn finish_repair_round(
             Err(e) => tracing::warn!(%task_id, "「等修复合入」的任务留痕写不进去：{e}"),
         }
     }
-    Ok(RepairRound::Proposed {
-        summary: proposal.summary.clone(),
-        proposal_id: proposal.id,
-        outcome: Box::new(outcome),
-    })
+    Ok(proposal)
 }
 
 /// 跑闸门（决策 210④ / 票 11）：lint（如配置）+ 测试，**全过才算改完**。
@@ -393,8 +446,20 @@ pub async fn commit_repair(
     headline: &str,
     now: DateTime<Utc>,
 ) -> Result<String> {
-    let worktree = session.worktree.clone();
-    let repair_id = session.repair_id.clone();
+    commit_repair_in(&session.worktree, &session.repair_id, headline, now).await
+}
+
+/// [`commit_repair`] 的落点显式形态（票 13）：修复 commit 的**落点**是参数——
+/// 修复 worktree（等合入路）与任务 worktree（当场生效路）走的是同一份 message
+/// 与同一个 git2 出口，差别只在目录。
+pub async fn commit_repair_in(
+    worktree: &Path,
+    repair_id: &str,
+    headline: &str,
+    now: DateTime<Utc>,
+) -> Result<String> {
+    let worktree = worktree.to_path_buf();
+    let repair_id = repair_id.to_string();
     let headline = headline.to_string();
     crate::git::blocking(move || {
         let repo = git2::Repository::open(&worktree).map_err(crate::git::gerr)?;
