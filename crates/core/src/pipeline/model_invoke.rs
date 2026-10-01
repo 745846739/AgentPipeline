@@ -39,6 +39,13 @@ use crate::types::{
 };
 use crate::{Error, Result};
 
+/// 一次模型调用遇到**传输类**失败时，同一份请求最多再发几次（不含首次）。
+///
+/// 取 2 不是理论值：现场那一轮 28 次请求里断了 1 次（≈3.6%），两次重发后仍全断的概率
+/// 已到千分之一量级；而每次重发的代价只是**这一轮请求**的 prompt，比翻掉整个 attempt
+/// （那要重来 19–45 个回合）小一个数量级——所以这里的预算宁可给宽一点。
+pub const LLM_TRANSPORT_RESEND_MAX: usize = 2;
+
 use super::events::{
     emit_node_started, emit_tool_event, finish_run_with_sse, OUTPUT_CODE_CHANGES,
     OUTPUT_DESIGN_DOC, OUTPUT_DEV_DOC, OUTPUT_REVIEW_REPORT, OUTPUT_TEST_REPORT,
@@ -575,6 +582,52 @@ impl ModelInvoke {
         }
     }
 
+    /// 一次模型调用，**传输类失败就地重发**（有界），别的类别原样上报。
+    ///
+    /// 为什么要有这一层（2026-10-02 现场）：事故任务续跑后的 develop 节点
+    /// **连续三次都死在同一件小事上**——上游在流中途断开，
+    /// `流在没有 [DONE] / finish_reason 的情况下结束`。一次断流本该只丢**这一轮请求**，
+    /// 实际却把整个 attempt 判死（`Err(e) => return Err(e)`），于是前面 19–45 个
+    /// 已经成功的回合连同它们的探索一起作废，重试轮还带着更大的转录从头再来
+    /// （三轮平均 prompt 69k → 296k → 515k token，每轮 40–50 分钟）。
+    ///
+    /// 判据复用 [`crate::agent::providers::is_transport`]（决策 298 那一处）：
+    /// 「请求根本没送到模型」与「模型名/密钥/额度错」的区别，是**重发有没有意义**。
+    /// 传输类是典型的瞬时失败（provider 抖一下、网关掐一条长流），同一份请求原样再发
+    /// 是既有先例——值班长的 `complete_with_retry`（决策 288）就只重试这一类。
+    ///
+    /// **转录一个字节都不动**：重发的是同一份 `req`（决策 278 的「续接」在这里
+    /// 甚至连新 turn 都不需要——不是「接着上次跑」，是「上次那一下没跑成」）。
+    /// 被中止（`Error::Cancelled`）不走重发：`is_transport` 判它 false，且那正是人按停。
+    async fn complete_once_retrying_transport(
+        &self,
+        req: LlmRequest,
+        cancel: Option<&CancelSignal>,
+        cursor: &NodeCursor,
+    ) -> Result<AgentResponse> {
+        let mut resent = 0usize;
+        loop {
+            match self.complete_once(req.clone(), cancel, cursor).await {
+                Ok(response) => return Ok(response),
+                Err(e)
+                    if resent < LLM_TRANSPORT_RESEND_MAX
+                        && crate::agent::providers::is_transport(&e) =>
+                {
+                    resent += 1;
+                    tracing::warn!(
+                        task_stage = %cursor.stage,
+                        task_node = %cursor.node,
+                        resent,
+                        budget = LLM_TRANSPORT_RESEND_MAX,
+                        error = %e,
+                        "模型调用传输类失败：同一份请求就地重发（不判死这一轮）"
+                    );
+                }
+                Err(e) => return Err(e),
+            }
+        }
+    }
+
     /// 一次尝试的**内里**：与外框同签名，外加现场。它专管「跑」，
     /// 出口的记账（成功写一行、失败补上下文）归 [`Self::agent_attempt`]。
     #[allow(clippy::too_many_arguments)]
@@ -773,7 +826,10 @@ impl ModelInvoke {
             // 于是它既正是调度器判超时的对象，也是执行体身上唯一能观察中止请求的 await 点
             // （决策 226）——判超时那边不需要「有进程组可杀」，从这里就能把执行体叫停。
             // 取不到观察点（进程内没有这一号登记）时照旧直连，行为与加这条通道之前一致。
-            let response = match self.complete_once(req, cancel, cursor).await {
+            let response = match self
+                .complete_once_retrying_transport(req, cancel, cursor)
+                .await
+            {
                 Ok(response) => response,
                 // 超窗（决策 295 / 票 10）：provider 说这一份放不下它的窗口——**压缩一次
                 // 再重试这一次调用**（与值班长 06(c) 同一处置、同一个判据）。压缩是**无条件**的：
@@ -813,7 +869,8 @@ impl ModelInvoke {
                         "provider 报上下文超窗：压缩本轮转录后重试这一次调用（票 10）"
                     );
                     let req = plan.request(&trace.messages, run_ctx);
-                    self.complete_once(req, cancel, cursor).await?
+                    self.complete_once_retrying_transport(req, cancel, cursor)
+                        .await?
                 }
                 Err(e) => return Err(e),
             };
@@ -1810,6 +1867,13 @@ mod tests {
 
     /// 临时库 + 播种的项目/任务/游标 + 只拿票面点名依赖的编排片（**不建 Executor**）。
     async fn base() -> (tempfile::TempDir, Store, Task, NodeCursor, ModelInvoke) {
+        base_with(Arc::new(StubLlm)).await
+    }
+
+    /// 与 [`base`] 同，但换一个 LLM 桩——「上游怎么失败」正是要测的那件事。
+    async fn base_with(
+        llm: Arc<dyn LlmClient>,
+    ) -> (tempfile::TempDir, Store, Task, NodeCursor, ModelInvoke) {
         let tmp = tempfile::TempDir::new().unwrap();
         let home = Home::new(tmp.path().join("home"));
         let store = Store::open(home, Arc::new(SystemClock)).await.unwrap();
@@ -1835,7 +1899,7 @@ mod tests {
         let inv = ModelInvoke {
             store: store.clone(),
             settings: Settings::default(),
-            llm: Arc::new(StubLlm),
+            llm,
             killer: Arc::new(NoopKiller),
             sse: Arc::new(NoopSse),
             clock: Arc::new(SystemClock),
@@ -1991,6 +2055,134 @@ mod tests {
         assert_eq!(
             supplement_input(&home, "t1").as_deref(),
             Some("部署在 k8s，单机即可")
+        );
+    }
+
+    /// 现场原文（run 143 / 144 / 145 的 error 列）：上游在流中途把连接掐了。
+    fn cut_stream() -> Error {
+        Error::Llm(
+            "流在没有 [DONE] / finish_reason 的情况下结束（收到 32327 字节后断开，响应不完整）"
+                .into(),
+        )
+    }
+
+    /// 桩 LLM：前 `fail_times` 次按 `error()` 失败，之后成功——用来钉「哪些失败该重发」。
+    struct FlakyLlm {
+        calls: Arc<std::sync::atomic::AtomicUsize>,
+        fail_times: usize,
+        error: fn() -> Error,
+    }
+
+    impl LlmClient for FlakyLlm {
+        fn complete(
+            &self,
+            _request: LlmRequest,
+        ) -> futures::future::BoxFuture<'static, Result<AgentResponse>> {
+            let should_fail =
+                self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst) < self.fail_times;
+            let make = self.error;
+            Box::pin(async move {
+                if should_fail {
+                    return Err(make());
+                }
+                Ok(AgentResponse {
+                    content: Some("ok".into()),
+                    ..Default::default()
+                })
+            })
+        }
+    }
+
+    /// 一次请求的最小形状（这一层测的是「失败怎么处置」，请求内容不参与判据）。
+    fn request_for(cursor: &NodeCursor) -> LlmRequest {
+        LlmRequest {
+            stage: cursor.stage,
+            node: cursor.node,
+            attempt: 1,
+            system_prompt: "system".into(),
+            user_prompt: "user".into(),
+            messages: Vec::new(),
+            tools: Vec::new(),
+            temperature: None,
+            max_tokens: None,
+            provider_id: None,
+            run: None,
+            idle_timeout_sec: None,
+        }
+    }
+
+    /// 2026-10-02 现场：一次断流把整个 attempt 判死，前面 19–45 个**已经成功的**回合
+    /// 连同它们的探索一起作废，重试轮还带着更大的转录从头再来（三轮平均 prompt
+    /// 69k → 296k → 515k token，每轮 40–50 分钟）。传输类失败必须**就地重发同一份请求**。
+    #[tokio::test]
+    async fn a_cut_stream_is_resent_in_place_instead_of_killing_the_round() {
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let llm = Arc::new(FlakyLlm {
+            calls: calls.clone(),
+            fail_times: 2,
+            error: cut_stream,
+        });
+        let (_tmp, _store, _task, cursor, inv) = base_with(llm).await;
+
+        let response = inv
+            .complete_once_retrying_transport(request_for(&cursor), None, &cursor)
+            .await
+            .expect("两次断流之后第三次应当拿到响应");
+
+        assert_eq!(response.content.as_deref(), Some("ok"));
+        assert_eq!(
+            calls.load(std::sync::atomic::Ordering::SeqCst),
+            3,
+            "首呼 + 两次重发"
+        );
+    }
+
+    /// 重发**有上限**：上游真挂了的时候，它必须退化成原来的失败，而不是变成死循环。
+    #[tokio::test]
+    async fn the_transport_resend_budget_is_finite() {
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let llm = Arc::new(FlakyLlm {
+            calls: calls.clone(),
+            fail_times: usize::MAX,
+            error: cut_stream,
+        });
+        let (_tmp, _store, _task, cursor, inv) = base_with(llm).await;
+
+        let err = inv
+            .complete_once_retrying_transport(request_for(&cursor), None, &cursor)
+            .await
+            .expect_err("断到底就该报错");
+
+        assert!(err.to_string().contains("finish_reason"), "{err}");
+        assert_eq!(
+            calls.load(std::sync::atomic::Ordering::SeqCst),
+            LLM_TRANSPORT_RESEND_MAX + 1,
+            "首呼 + 预算内的重发，一次不多"
+        );
+    }
+
+    /// 反面：等一等没用的失败**一次都不重发**——重发只是把同一份坏输出再问一遍
+    /// （判据复用决策 298 的 `is_transport`，这里钉住这一层真的用了它）。
+    #[tokio::test]
+    async fn a_non_transport_failure_is_not_resent() {
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let llm = Arc::new(FlakyLlm {
+            calls: calls.clone(),
+            fail_times: usize::MAX,
+            error: || Error::Validation("输出没按契约来".into()),
+        });
+        let (_tmp, _store, _task, cursor, inv) = base_with(llm).await;
+
+        let err = inv
+            .complete_once_retrying_transport(request_for(&cursor), None, &cursor)
+            .await
+            .expect_err("校验类失败照旧上报");
+
+        assert!(err.to_string().contains("输出没按契约来"), "{err}");
+        assert_eq!(
+            calls.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "非传输类不重发"
         );
     }
 }

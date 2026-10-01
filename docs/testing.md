@@ -134,6 +134,7 @@ workspace 成员 `crates/testkit`，供 L2 / L4 复用：
 | 模板 ↔ schema 一致性（决策 369） | `submit_metadata_templates_match_their_json_schema`：12 个 agent 节点逐个断言「模板列的字段 ∈ schema `properties`」且「schema `required` 被模板提到」，口径取自 `model_request::submit_metadata_tool_for`（不另建表）；`the_consistency_checker_rejects_both_drift_directions`：拿 2026-10-01 的真实错法（多写 `readiness` / 漏提 `passed`）构坏模板，证明判据有牙齿 | 369 / 38 |
 | 工具参数形态（决策 372） | `arg_u64` / `arg_bool` 两个口径唯一的助手：数字字符串强转（`"90"` → 90）、错型报错（`"abc"` → 报文含"非负整数"，不静默整份读）；`read_file` 的 `offset`/`limit`/`tail`、`list_dir` 的 `recursive`、`read_board` 的 `runs`、`read_conversation` 的 `run_id`、`run_command`/`run_command_argv`/`web_fetch` 的 `timeout_sec` 全走这一处 | 372 |
 | 补充输入的取法（决策 371） | `supplement_input`：剥标题行取正文；**有 `## 用户答复` 小节时只取它**——决策 279 的"turn 就是用户那句话"不许被决策 371 的留痕富化打穿 | 279 / 371 |
+| 传输类失败的就地重发（决策 373） | `complete_once_retrying_transport` 三条：断流两次后第三次拿到响应且调用计数 = 3（`a_cut_stream_is_resent_in_place_instead_of_killing_the_round`）；断到底仍报错且计数 = 预算 + 1，不是死循环（`the_transport_resend_budget_is_finite`）；**非传输类一次都不重发**（`a_non_transport_failure_is_not_resent`）。判据复用决策 298 的 `is_transport`；自建桩 `FlakyLlm`（按次数失败 + 可换错误构造器）与 `base_with(llm)` 供后来者复用 | 373 / 298 / 288 |
 
 ## 6. 集成测试目录（L2）
 

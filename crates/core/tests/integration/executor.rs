@@ -10,6 +10,7 @@ use agentpipeline_core::agent::client::{AgentResponse, LlmClient, LlmRequest};
 use agentpipeline_core::agent::providers::LlmErrorKind;
 use agentpipeline_core::config::Settings;
 use agentpipeline_core::pipeline::Executor;
+use agentpipeline_core::pipeline::LLM_TRANSPORT_RESEND_MAX;
 use agentpipeline_core::scheduler::KanbanScheduler;
 use agentpipeline_core::sse::{SseEvent, SseEventType};
 use agentpipeline_core::storage::decisions::MergeDecision;
@@ -1356,11 +1357,20 @@ async fn a_failed_round_records_the_tokens_it_burned() {
     };
     let ctx = setup("true", settings).await;
     let mut script = Script::new();
-    script
-        .for_node(Stage::ArchitectDesign, Node::ValidateInput)
-        // 先一次成功的调用（FakeAgent 每步报 10 prompt / 5 completion），再让调用当场失败
-        .list_dir(".")
-        .fail_llm("llm_network", "模型服务不可达", "connect timed out");
+    {
+        // 先一次成功的调用（FakeAgent 每步报 10 prompt / 5 completion），再让调用当场失败。
+        //
+        // 失败要**连着三次**：传输类失败先在**轮内**就地重发（决策 373，上限
+        // `LLM_TRANSPORT_RESEND_MAX`），预算耗尽这一轮才真的失败。只给一次的话，
+        // 重发会去取脚本的下一步（耗尽 → 收尾纯文本），这一轮反倒成功了——
+        // 那测的就不是「失败轮怎么记账」了。
+        let mut b = script
+            .for_node(Stage::ArchitectDesign, Node::ValidateInput)
+            .list_dir(".");
+        for _ in 0..=LLM_TRANSPORT_RESEND_MAX {
+            b = b.fail_llm("llm_network", "模型服务不可达", "connect timed out");
+        }
+    }
     ctx.agent.set_script(script);
 
     testkit::seed_task(&ctx.store, "t9", "p1").await.unwrap();
@@ -1638,15 +1648,22 @@ async fn a_transport_failure_retries_without_an_error_turn() {
     };
     let ctx = setup("true", settings).await;
     let mut script = Script::new();
-    script
-        .for_node(Stage::ArchitectDesign, Node::ValidateInput)
-        // 第 1 轮先走一次真实工具往返（失败时转录非空，「不追加」的断言才有牙齿），再连不上
-        .list_dir(".")
-        .fail_llm(
-            "llm_network",
-            LlmErrorKind::Network.advice(),
-            "HTTP 请求失败：connect: connection refused",
-        );
+    {
+        // 第 1 轮先走一次真实工具往返（失败时转录非空，「不追加」的断言才有牙齿），再连不上。
+        //
+        // 连不上要**连着三次**：轮内的就地重发（决策 373）会先把预算花掉，之后这一轮
+        // 才带着传输类的死因退场——这正是本用例要观察的那条路。
+        let mut b = script
+            .for_node(Stage::ArchitectDesign, Node::ValidateInput)
+            .list_dir(".");
+        for _ in 0..=LLM_TRANSPORT_RESEND_MAX {
+            b = b.fail_llm(
+                "llm_network",
+                LlmErrorKind::Network.advice(),
+                "HTTP 请求失败：connect: connection refused",
+            );
+        }
+    }
     // 第 2/3 轮走「脚本耗尽」→ 收尾纯文本 → 元数据抽不出 → 输出契约类失败（对照组）
     ctx.agent.set_script(script);
 
@@ -2059,13 +2076,18 @@ async fn llm_failure_writes_a_conversation_row_with_the_reason() {
             readiness: true,
             blockers: vec![],
         });
-    script
-        .for_node(Stage::ArchitectDesign, Node::Execute)
-        .fail_llm(
-            "llm_network",
-            "LLM 服务不可达，请检查网络或 base_url",
-            "connect: connection refused",
-        );
+    {
+        // 连着三次：传输类失败先在轮内就地重发（决策 373），预算耗尽这一轮才真的失败，
+        // 那条「为什么没跑起来」的会话行才落得下来。
+        let mut b = script.for_node(Stage::ArchitectDesign, Node::Execute);
+        for _ in 0..=LLM_TRANSPORT_RESEND_MAX {
+            b = b.fail_llm(
+                "llm_network",
+                "LLM 服务不可达，请检查网络或 base_url",
+                "connect: connection refused",
+            );
+        }
+    }
     ctx.agent.set_script(script);
 
     testkit::seed_task(&ctx.store, "t-llmfail", "p1")

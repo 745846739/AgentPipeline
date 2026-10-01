@@ -27,6 +27,10 @@ pub mod window_calibration;
 
 pub use advance::{advance, Advanced, Landing};
 
+/// 传输类失败的就地重发预算（决策 373）：它是**可观测的行为参数**，集成用例要照着它
+/// 把「重发用完 → 这一轮才真的失败」这条路径打出来，故从 `pub(crate)` 的模块里放出来。
+pub use model_invoke::LLM_TRANSPORT_RESEND_MAX;
+
 pub use cursor::{
     focus_cursor, has_pending_cursor, has_runnable_cursor, is_join_ready, live_cursors,
     pending_cursors, project_pending_reason, project_task_status, runnable_cursors,
