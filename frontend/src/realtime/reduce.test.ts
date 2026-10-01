@@ -6,6 +6,7 @@ import type {
   TaskListItem,
 } from '../api/types';
 import {
+  LIVE_WINDOW_LIMIT,
   emptyBoardState,
   emptyTaskDetailState,
   reduceBoard,
@@ -547,6 +548,131 @@ describe('reduceTaskDetail — §9.1 归约表右列逐事件', () => {
     const next = reduceTaskDetail(base(), { type, task_id: taskId, branch: 'main' } as SseEvent);
     expect(next.terminal).toBe(expected);
     expect(next.refetchRequested).toBe(true);
+  });
+});
+
+describe('直播增量的条数上限（决策 362①：环形缓冲丢最早）', () => {
+  const base = () => emptyTaskDetailState({ task: task(), cursors: [cursor()] });
+
+  const deltaEvent = (
+    runId: number,
+    text: string,
+  ): Extract<SseEvent, { type: 'conversation_delta' }> => ({
+    type: 'conversation_delta',
+    task_id: taskId,
+    branch: 'main',
+    run_id: runId,
+    agent_type: 'main',
+    role: 'assistant',
+    text,
+    prompt_tokens: 0,
+    completion_tokens: 1,
+  });
+
+  /** 直接把窗口铺满（免得 1 万次归约），seq 与数组位置一致。 */
+  const filled = (runId: number) =>
+    emptyTaskDetailState({
+      task: task(),
+      cursors: [cursor()],
+      liveDeltas: Array.from({ length: LIVE_WINDOW_LIMIT }, (_, i) => ({
+        run_id: runId,
+        agent_type: 'main',
+        role: 'assistant',
+        channel: 'content' as const,
+        text: `第 ${i} 块`,
+        seq: i,
+      })),
+      liveSeq: LIVE_WINDOW_LIMIT,
+    });
+
+  it('超上限丢最早：尾部保留、seq 留洞不重编号、该 run 被标记', () => {
+    let state = filled(7);
+    for (let i = 0; i < 3; i++) {
+      state = reduceTaskDetail(state, deltaEvent(7, `第 ${LIVE_WINDOW_LIMIT + i} 块`));
+    }
+    expect(state.liveDeltas).toHaveLength(LIVE_WINDOW_LIMIT);
+    // 丢的是最早的 3 条：留下的头是「第 3 块」
+    expect(state.liveDeltas[0].text).toBe('第 3 块');
+    expect(state.liveDeltas[state.liveDeltas.length - 1].text).toBe(
+      `第 ${LIVE_WINDOW_LIMIT + 2} 块`,
+    );
+    // seq 保留原值（前面留洞）且单调，不重编号
+    expect(state.liveDeltas[0].seq).toBe(3);
+    expect(state.liveDeltas[state.liveDeltas.length - 1].seq).toBe(LIVE_WINDOW_LIMIT + 2);
+    // 计数器照旧前进（不因截断回退）
+    expect(state.liveSeq).toBe(LIVE_WINDOW_LIMIT + 3);
+    expect(state.liveDroppedRuns).toEqual({ 7: true });
+  });
+
+  it('只标被丢的那条 run——另一条 run 不受牵连', () => {
+    let state = filled(8);
+    state = reduceTaskDetail(state, deltaEvent(9, '乙轮的增量'));
+    expect(state.liveDeltas).toHaveLength(LIVE_WINDOW_LIMIT);
+    expect(state.liveDeltas[0].run_id).toBe(8);
+    expect(state.liveDeltas[state.liveDeltas.length - 1].run_id).toBe(9);
+    expect(state.liveDroppedRuns).toEqual({ 8: true });
+  });
+
+  it('liveTools 是另一只上限，各算各的', () => {
+    let state = emptyTaskDetailState({
+      task: task(),
+      cursors: [cursor()],
+      liveTools: Array.from({ length: LIVE_WINDOW_LIMIT }, (_, i) => ({
+        run_id: 7,
+        tool: 'read_file',
+        phase: 'start' as const,
+        args_summary: `第 ${i} 次`,
+        args: '',
+        result: '',
+        seq: i,
+      })),
+      liveSeq: LIVE_WINDOW_LIMIT,
+    });
+    state = reduceTaskDetail(state, {
+      type: 'tool_event',
+      task_id: taskId,
+      branch: 'main',
+      run_id: 7,
+      tool: 'read_file',
+      phase: 'start',
+      args_summary: '新的那次',
+    });
+    expect(state.liveTools).toHaveLength(LIVE_WINDOW_LIMIT);
+    expect(state.liveTools[0].args_summary).toBe('第 1 次');
+    expect(state.liveTools[state.liveTools.length - 1].args_summary).toBe('新的那次');
+    expect(state.liveDeltas).toHaveLength(0);
+  });
+
+  it('没到上限就不标记（界面不摆省略行）', () => {
+    let state = base();
+    state = reduceTaskDetail(state, deltaEvent(7, 'a'));
+    state = reduceTaskDetail(state, deltaEvent(7, 'b'));
+    expect(state.liveDeltas).toHaveLength(2);
+    expect(state.liveDroppedRuns).toEqual({});
+  });
+
+  it('start 与 end 合成一条时不触上限（数组没长）', () => {
+    let state = filled(7);
+    state = reduceTaskDetail(state, {
+      type: 'tool_event',
+      task_id: taskId,
+      branch: 'main',
+      run_id: 7,
+      tool: 'read_file',
+      phase: 'start',
+      args_summary: 'x',
+    });
+    const merged = reduceTaskDetail(state, {
+      type: 'tool_event',
+      task_id: taskId,
+      branch: 'main',
+      run_id: 7,
+      tool: 'read_file',
+      phase: 'end',
+      args_summary: 'x',
+    });
+    expect(merged.liveTools).toHaveLength(1);
+    expect(merged.liveDroppedRuns).toEqual({});
   });
 });
 

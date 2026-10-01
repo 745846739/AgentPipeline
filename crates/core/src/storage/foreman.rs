@@ -785,11 +785,17 @@ impl Store {
     ///
     /// `total_calls` 数的是**值班长的回话次数**（assistant 行），不是工具往返次数
     /// ——对讲台要报的是「聊了几轮」，与全局指标的 `total_calls`（run 行数）不是同一个量。
+    ///
+    /// `status IS NULL` 是「**只算已收口的正常行**」（决策 363③，恢复决策 204⑤「口径不动」）：
+    /// 在途行也是 assistant 且带中途刷写的 token 读数，不过滤的话页头「本次会话 N tok」会在
+    /// 一轮进行中途跟着涨、失败轮丢弃后再回落——那正是「口径不动」要挡的读数。`status` 的
+    /// 取值见 [`FOREMAN_MESSAGE_IN_FLIGHT`] / [`FOREMAN_MESSAGE_INTERRUPTED`]；用户行与收口后
+    /// 的 assistant 行都是 `NULL`（收口 SQL 写 `status = NULL`，见 [`Self::close_foreman_inflight`]）。
     pub async fn foreman_session_totals(&self, session_id: &str) -> Result<(u64, u64)> {
         let (tokens, calls): (i64, i64) = sqlx::query_as(
             "SELECT COALESCE(SUM(prompt_tokens + completion_tokens), 0),
                     COALESCE(SUM(CASE WHEN role = ? THEN 1 ELSE 0 END), 0)
-             FROM kanban_foreman_messages WHERE session_id = ?",
+             FROM kanban_foreman_messages WHERE session_id = ? AND status IS NULL",
         )
         .bind(FOREMAN_ROLE_ASSISTANT)
         .bind(session_id)

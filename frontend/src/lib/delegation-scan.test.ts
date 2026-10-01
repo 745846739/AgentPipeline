@@ -372,7 +372,7 @@ describe('在飞轮键只有一处（决策 354③：搬运机整段退场）', 
 
   it('键的判据只有一处：回合构造里那一个派生（`liveTurnKey`）', () => {
     expect(turns, '该有唯一定义').toContain('function liveTurnKey(');
-    expect(turns, '在飞轮那一支读它').toContain('const key = liveTurnKey(base, stream.events);');
+    expect(turns, '在飞轮那一支读它').toContain('const key = liveTurnKey(stream.events);');
     expect(turns, '`ledger_id` 是那条判据的输入').toContain('if (ev.ledger_id != null) return');
   });
 
@@ -383,6 +383,13 @@ describe('在飞轮键只有一处（决策 354③：搬运机整段退场）', 
     expect(turns, '在飞轮入栈前要查同键那一行在不在').toContain(
       'if (!out.some((t) => t.key === key)) {',
     );
+  });
+
+  it('在飞轮按行出键（决策 363④）：逐行拼出来的轮用**行 id**当键，不再有单基准', () => {
+    // 同一班可并行两轮（决策 260），故拼接是**逐行**的：一条行一个基准、一条行一个键
+    // ——键从行 id 直接来（不再有「第一条在途行优先」那一支）。
+    expect(turns, '键就是行 id').toContain('key: `m${id}`,');
+    expect(turns, '旧的单基准不再有').not.toContain('inFlightBase(');
   });
 
   it('搬运机三处都不在了（页面 / store / 模块）', () => {

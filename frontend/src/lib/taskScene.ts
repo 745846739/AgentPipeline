@@ -139,6 +139,12 @@ export interface SceneTurn {
   status: string | null;
   /** 完整会话读到了没有（没读到时轮里显示「正在读取会话…」）。 */
   loaded: boolean;
+  /**
+   * 这个 run 的直播增量被上限丢弃过（决策 362①）：折叠步序最前摆一行非交互的
+   * 「更早的增量已省略」。丢掉的没落库、取不回来，故**不可交互**——不能复用 `MoreRow`
+   * 的「加载更多」（那会撒谎）。
+   */
+  droppedLive: boolean;
   steps: SceneStep[];
   /**
    * 收口话：最后一条 assistant 正文（对讲台的「回话位」）。还在冒增量时它就是
@@ -159,6 +165,11 @@ export interface TaskSceneInput {
   commands: NodeCommand[];
   liveDeltas: LiveDelta[];
   liveTools: LiveTool[];
+  /**
+   * 被条数上限丢弃过增量的 run（决策 362①）。归约只据此决定**哪几轮**摆省略行——
+   * 丢掉的条数与正文本就不在手里。
+   */
+  liveDroppedRuns?: Record<number, true>;
   /** 命令输出解析（完整 > 流式；账在组件 / store 手里，归约只问）。 */
   commandOutputFor: (c: NodeCommand) => string | null;
   commandErrorFor?: (c: NodeCommand) => string | null;
@@ -355,7 +366,7 @@ function keyedSteps(drafts: StepDraft[], turnKey: string): SceneStep[] {
 
 /** 现场时间线归约本体（边界见模块注释）。 */
 export function buildTaskScene(input: TaskSceneInput): SceneTurn[] {
-  const { conversations, commands, liveDeltas, liveTools } = input;
+  const { conversations, commands, liveDeltas, liveTools, liveDroppedRuns = {} } = input;
   const deltasByRun = new Map<number, LiveDelta[]>();
   for (const d of liveDeltas) {
     const list = deltasByRun.get(d.run_id) ?? [];
@@ -468,6 +479,7 @@ export function buildTaskScene(input: TaskSceneInput): SceneTurn[] {
         primary: summary.attempt >= (newestAttempt.get(gk) ?? 1),
         status: summary.status,
         loaded: full !== undefined,
+        droppedLive: liveDroppedRuns[runId] === true,
         steps: keyedSteps(drafts, key),
         closing,
         closingStreaming,
@@ -507,6 +519,7 @@ export function buildTaskScene(input: TaskSceneInput): SceneTurn[] {
         primary: true,
         status: null,
         loaded: true,
+        droppedLive: false,
         steps: keyedSteps(steps, group.key),
         closing: '',
         closingStreaming: false,
@@ -548,6 +561,7 @@ export function buildTaskScene(input: TaskSceneInput): SceneTurn[] {
         primary: true,
         status: null,
         loaded: false,
+        droppedLive: liveDroppedRuns[runId] === true,
         steps: keyedSteps(drafts, key),
         closing,
         closingStreaming,

@@ -187,6 +187,16 @@ export interface LiveTool {
   seq: number;
 }
 
+/**
+ * 直播增量的**条数上限**（决策 362①）：`liveDeltas` 与 `liveTools` **各**一只上限，
+ * 方向是**环形缓冲丢最早**——直播只关心尾部，「到顶拒收」会让流停在半截。
+ *
+ * 归约成本由「原始增量条数」驱动（`buildTaskScene` 每个到达的 delta 都从零重跑一遍
+ * 全量 `sort`，O(N log N)），与折出多少步无关；事件以约 50/s 到达，长 run 跑到后段
+ * 前端追不上。**当前正在长的那一步不豁免**——一豁免，超长单步那次就绕过上限。
+ */
+export const LIVE_WINDOW_LIMIT = 10_000;
+
 export interface TaskDetailState {
   task: Task | null;
   cursors: BranchCursor[];
@@ -198,6 +208,14 @@ export interface TaskDetailState {
   /** 进行中 run 的流式增量（按 run_id 分组）。 */
   liveDeltas: LiveDelta[];
   liveTools: LiveTool[];
+  /**
+   * 被上限丢弃过增量的 run（决策 362①④）：这些轮的折叠步序最前要摆一行非交互的
+   * 「更早的增量已省略」。**只有标记，不含条数**——省略行不可交互、不承诺可数。
+   *
+   * 丢弃后 `seq` 保留原值（前面留洞）不重编号：`seq` 只用于排序，留洞无害；重编号
+   * 要给每次截断加一趟 O(N) 减法，还把「`seq` 单调」偷换成「窗口内单调」。
+   */
+  liveDroppedRuns: Record<number, true>;
   /** 流式 token 增量累加（决策 123 差距⑤）。 */
   streamTokens: { prompt: number; completion: number };
   /**
@@ -225,6 +243,7 @@ export function emptyTaskDetailState(partial: Partial<TaskDetailState> = {}): Ta
     conversations: [],
     liveDeltas: [],
     liveTools: [],
+    liveDroppedRuns: {},
     streamTokens: { prompt: 0, completion: 0 },
     liveSeq: 0,
     pendingReason: null,
@@ -290,6 +309,29 @@ function commandFromEvent(
     started_at: new Date().toISOString(),
     finished_at: null,
   };
+}
+
+/**
+ * 环形缓冲丢最早（决策 362①）：超过 {@link LIVE_WINDOW_LIMIT} 的条数从**头部**丢掉，
+ * 返回尾部那份与被丢掉的那些增量所属的 run。
+ *
+ * 入参是调用方刚拼出的新数组（尚未写回 state），故这里可以安全地切片。
+ */
+function trimOldest<T extends { run_id: number }>(list: T[]): { kept: T[]; dropped: number[] } {
+  if (list.length <= LIVE_WINDOW_LIMIT) return { kept: list, dropped: [] };
+  const cut = list.length - LIVE_WINDOW_LIMIT;
+  return { kept: list.slice(cut), dropped: list.slice(0, cut).map((x) => x.run_id) };
+}
+
+/** 把被丢弃增量的 run 并进标记表（决策 362①）；没丢东西时原样返回，免得白白换新对象。 */
+function markDropped(
+  prev: Record<number, true>,
+  dropped: number[],
+): Record<number, true> {
+  if (dropped.length === 0) return prev;
+  const next = { ...prev };
+  for (const runId of dropped) next[runId] = true;
+  return next;
 }
 
 /** 详情归约（§9.1 右列）。 */
@@ -377,29 +419,30 @@ export function reduceTaskDetail(state: TaskDetailState, event: SseEvent): TaskD
         ),
       };
 
-    case 'conversation_delta':
+    case 'conversation_delta': {
+      const delta: LiveDelta = {
+        run_id: event.run_id,
+        agent_type: event.agent_type,
+        role: event.role,
+        // 老后端不发 channel（`serde(default)`）→ 缺省 content：那正是它此前
+        // 唯一见过的形状（决策 244 的加性口径）。
+        channel: event.channel === 'reasoning' ? 'reasoning' : 'content',
+        text: event.text,
+        seq: state.liveSeq,
+      };
+      const trimmed = trimOldest([...state.liveDeltas, delta]);
       return {
         ...base,
         ...taskPatch,
-        liveDeltas: [
-          ...state.liveDeltas,
-          {
-            run_id: event.run_id,
-            agent_type: event.agent_type,
-            role: event.role,
-            // 老后端不发 channel（`serde(default)`）→ 缺省 content：那正是它此前
-            // 唯一见过的形状（决策 244 的加性口径）。
-            channel: event.channel === 'reasoning' ? 'reasoning' : 'content',
-            text: event.text,
-            seq: state.liveSeq,
-          },
-        ],
+        liveDeltas: trimmed.kept,
+        liveDroppedRuns: markDropped(base.liveDroppedRuns, trimmed.dropped),
         streamTokens: {
           prompt: state.streamTokens.prompt + event.prompt_tokens,
           completion: state.streamTokens.completion + event.completion_tokens,
         },
         liveSeq: state.liveSeq + 1,
       };
+    }
 
     case 'tool_event': {
       // 一次调用一条记录（决策 244 同款判据）：start 与随后的 end / error 合成一条，
@@ -421,21 +464,21 @@ export function reduceTaskDetail(state: TaskDetailState, event: SseEvent): TaskD
         };
         return { ...base, ...taskPatch, liveTools: tools, liveSeq: state.liveSeq + 1 };
       }
+      const tool: LiveTool = {
+        run_id: event.run_id,
+        tool: event.tool,
+        phase: event.phase,
+        args_summary: event.args_summary,
+        args: event.args ?? '',
+        result: event.result ?? '',
+        seq: state.liveSeq,
+      };
+      const trimmed = trimOldest([...tools, tool]);
       return {
         ...base,
         ...taskPatch,
-        liveTools: [
-          ...tools,
-          {
-            run_id: event.run_id,
-            tool: event.tool,
-            phase: event.phase,
-            args_summary: event.args_summary,
-            args: event.args ?? '',
-            result: event.result ?? '',
-            seq: state.liveSeq,
-          },
-        ],
+        liveTools: trimmed.kept,
+        liveDroppedRuns: markDropped(base.liveDroppedRuns, trimmed.dropped),
         liveSeq: state.liveSeq + 1,
       };
     }

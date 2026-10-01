@@ -414,3 +414,160 @@ describe('对话框动作的提交中态与重入护栏（票 03 / R2-03）', ()
     expect(mocks.modelOverrideTask).toHaveBeenCalledTimes(1);
   });
 });
+
+describe('落地即清（决策 362②）：正文到手后收走该 run 的直播增量', () => {
+  const conversation = (runId: number): NodeConversation => ({
+    id: runId,
+    task_id: 'A',
+    run_id: runId,
+    stage: 'develop',
+    node: 'execute',
+    attempt: 1,
+    agent_type: 'main',
+    parent_run_id: null,
+    messages_json: [{ role: 'assistant', content: `第 ${runId} 轮` }],
+    metadata_json: null,
+    prompt_tokens: 1,
+    completion_tokens: 1,
+    system_prompt: null,
+    user_prompt: null,
+    reasoning: null,
+    created_at: '2026-09-16T00:00:00Z',
+  });
+  const summary = (runId: number): ConversationSummary => ({
+    run_id: runId,
+    stage: 'develop',
+    node: 'execute',
+    attempt: 1,
+    agent_type: 'main',
+    parent_run_id: null,
+    prompt_tokens: 1,
+    completion_tokens: 1,
+    status: 'running',
+    archived_at: null,
+  });
+  const liveDelta = (runId: number, text: string, seq: number) => ({
+    run_id: runId,
+    agent_type: 'main',
+    role: 'assistant',
+    channel: 'content' as const,
+    text,
+    seq,
+  });
+  const liveTool = (runId: number, seq: number) => ({
+    run_id: runId,
+    tool: 'read_file',
+    phase: 'end' as const,
+    args_summary: 'a',
+    args: '',
+    result: 'r',
+    seq,
+  });
+  /** 两条 run 都在冒，其中 run 1 被上限丢弃过（标记与增量一起受落地清理管）。 */
+  const armLive = (): void => {
+    taskDetail.id = 'A';
+    taskDetail.state = emptyTaskDetailState({
+      conversations: [summary(1), summary(2)],
+      liveDeltas: [liveDelta(1, '甲在冒', 0), liveDelta(2, '乙在冒', 1)],
+      liveTools: [liveTool(1, 2)],
+      liveDroppedRuns: { 1: true },
+    });
+    taskDetail.conversationsFull = {};
+  };
+
+  it('某 run 落地：它的增量消失，在飞的另一 run 不受影响', async () => {
+    armLive();
+    mocks.getConversation.mockResolvedValue(conversation(1));
+
+    await taskDetail.loadConversation(1);
+
+    expect(taskDetail.state.liveDeltas.map((d) => d.run_id)).toEqual([2]);
+    expect(taskDetail.state.liveTools).toEqual([]);
+  });
+
+  it('批量装载落地同样清（一次拿回的那条路）', async () => {
+    armLive();
+    mocks.getConversations.mockResolvedValue([conversation(1), conversation(2)]);
+
+    await taskDetail.loadAllConversations();
+
+    expect(taskDetail.state.liveDeltas).toEqual([]);
+    expect(taskDetail.state.liveTools).toEqual([]);
+  });
+
+  it('只清已落地的 run：正文还没到的那一轮照旧在冒', async () => {
+    armLive();
+    // 只回 run 2 的正文（run 1 的正文没到）
+    mocks.getConversations.mockResolvedValue([conversation(2)]);
+
+    await taskDetail.loadAllConversations();
+
+    expect(taskDetail.state.liveDeltas.map((d) => d.run_id)).toEqual([1]);
+    expect(taskDetail.state.liveTools.map((t) => t.run_id)).toEqual([1]);
+    expect(taskDetail.state.liveDroppedRuns).toEqual({ 1: true });
+  });
+
+  it('增量全被上限丢光、只剩标记的 run 落地后：标记也随之收走', async () => {
+    // 两个数组里一条它的增量都不剩（全被环形缓冲丢光），只剩截断标记——只看数组会提前
+    // 返回，标记留在库里，等它落地后那一轮会永久摆一行不该有的「更早的增量已省略」。
+    taskDetail.id = 'A';
+    taskDetail.state = emptyTaskDetailState({
+      conversations: [summary(1)],
+      liveDroppedRuns: { 1: true },
+    });
+    taskDetail.conversationsFull = {};
+    mocks.getConversation.mockResolvedValue(conversation(1));
+
+    await taskDetail.loadConversation(1);
+
+    expect(taskDetail.state.liveDroppedRuns).toEqual({});
+  });
+
+  it('丢弃标记随落地一起收走（已落地的轮不再摆省略行）', async () => {
+    armLive();
+    mocks.getConversation.mockResolvedValue(conversation(1));
+
+    await taskDetail.loadConversation(1);
+
+    expect(taskDetail.state.liveDroppedRuns).toEqual({});
+  });
+
+  it('正文已到手却又晚到一条增量（竞态）→ 当场收走', () => {
+    armLive();
+    taskDetail.conversationsFull = { 2: conversation(2) };
+
+    taskDetail.handleEvent({
+      type: 'conversation_delta',
+      task_id: 'A',
+      branch: 'main',
+      run_id: 2,
+      agent_type: 'main',
+      role: 'assistant',
+      text: '晚到的',
+      prompt_tokens: 0,
+      completion_tokens: 1,
+    });
+
+    expect(taskDetail.state.liveDeltas.map((d) => d.run_id)).toEqual([1]);
+    expect(taskDetail.state.liveDroppedRuns).toEqual({ 1: true });
+  });
+
+  it('没有任何正文落地时不扫也不动（在飞的轮照旧）', () => {
+    armLive();
+
+    taskDetail.handleEvent({
+      type: 'conversation_delta',
+      task_id: 'A',
+      branch: 'main',
+      run_id: 2,
+      agent_type: 'main',
+      role: 'assistant',
+      text: '继续在冒',
+      prompt_tokens: 0,
+      completion_tokens: 1,
+    });
+
+    expect(taskDetail.state.liveDeltas.map((d) => d.run_id)).toEqual([1, 2, 2]);
+    expect(taskDetail.state.liveDroppedRuns).toEqual({ 1: true });
+  });
+});

@@ -33,6 +33,8 @@
     commands: NodeCommand[];
     liveDeltas?: LiveDelta[];
     liveTools?: LiveTool[];
+    /** 被条数上限丢弃过增量的 run（决策 362①）：这些轮最前摆一行非交互省略说明。 */
+    liveDroppedRuns?: Record<number, true>;
     /** 完整 / 流式输出解析（完整 > 流式；preview 由归约兜底）。 */
     commandOutputFor: (c: NodeCommand) => string | null;
     commandErrorFor?: (c: NodeCommand) => string | null;
@@ -48,6 +50,7 @@
     commands,
     liveDeltas = [],
     liveTools = [],
+    liveDroppedRuns = {},
     commandOutputFor,
     commandErrorFor,
     onloadCommand,
@@ -65,6 +68,7 @@
       commands,
       liveDeltas,
       liveTools,
+      liveDroppedRuns,
       commandOutputFor,
       commandErrorFor,
     }),
@@ -212,6 +216,10 @@
       <div class="quiet">正在读取会话…</div>
     {:else}
       {@const slice = stepSlice(t)}
+      {#if t.droppedLive}
+        <!-- 上限截断（决策 362①）：非交互——丢掉的没落库、取不回来，不能做成 MoreRow -->
+        <div class="omitted">更早的增量已省略</div>
+      {/if}
       {#if slice.omittedBefore > 0}
         <MoreRow
           label={`已省略前 ${slice.omittedBefore} 条，点此展开`}
@@ -461,6 +469,14 @@
     border-color: var(--go);
   }
   .quiet {
+    color: var(--text-3);
+    font-size: 12px;
+  }
+  /* 上限截断的省略说明（决策 362①）：非交互（虚框、无指针），丢掉的取不回来 */
+  .omitted {
+    margin: 2px 0 6px;
+    padding: 2px 8px;
+    border: 2px dashed var(--pane);
     color: var(--text-3);
     font-size: 12px;
   }

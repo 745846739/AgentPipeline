@@ -197,9 +197,54 @@ class TaskDetailStore {
     if (this.busyTimer) clearTimeout(this.busyTimer);
   }
 
+  /**
+   * **落地即清**（决策 362②）：某个 run 的会话正文一到手（`conversationsFull[runId]`），
+   * 它的直播增量就没有消费价值了——不清的话，时间线会把已落地的 `msgSteps` 与直播折步
+   * **同时摆上屏**（双渲染），而且它已停跑（`streaming` 为假），此后任何别的 delta 触发的
+   * 全量重归约都会对**全量文本**重跑 `renderMarkdown`（热路径上的 markdown 缝）。
+   *
+   * 判据是**严格信号** `conversationsFull[runId] !== undefined`，**不是**「摘要里出现了
+   * `run_id`」：票 03 的批量填充会先到摘要、后到正文，只看摘要会在正文到手前把流式文本清掉。
+   *
+   * 只清**已落地**的 run：在飞的另一轮（决策 260 的双轮）不受影响。落点在 store 而非
+   * reducer——`TaskDetailState` 没有消息正文字段，正文住在 `conversationsFull` 里，
+   * reducer 看不到它。这条也不走 `emptyTaskDetailState()`（那是换任务 / 首次加载的路径）。
+   */
+  private clearLandedLive(): void {
+    const landed = this.conversationsFull;
+    if (Object.keys(landed).length === 0) return;
+    const isLanded = (runId: number) => landed[runId] !== undefined;
+    // 截断标记也要一起核对：某个 run 的增量可能**全被上限丢光**（数组里一条都不剩），
+    // 只剩标记——那种情况下只看两个数组会提前返回，标记留在库里，等它落地后
+    // 那一轮会永久摆一行不该有的「更早的增量已省略」。
+    const hasLanded =
+      this.state.liveDeltas.some((d) => isLanded(d.run_id)) ||
+      this.state.liveTools.some((t) => isLanded(t.run_id)) ||
+      Object.keys(this.state.liveDroppedRuns).some((key) => isLanded(Number(key)));
+    if (!hasLanded) return;
+    const keptDeltas = this.state.liveDeltas.filter((d) => !isLanded(d.run_id));
+    const keptTools = this.state.liveTools.filter((t) => !isLanded(t.run_id));
+    const droppedRuns = { ...this.state.liveDroppedRuns };
+    for (const key of Object.keys(landed)) delete droppedRuns[Number(key)];
+    this.state = {
+      ...this.state,
+      liveDeltas: keptDeltas,
+      liveTools: keptTools,
+      liveDroppedRuns: droppedRuns,
+    };
+  }
+
   handleEvent(event: Parameters<typeof reduceTaskDetail>[1]): void {
     const previousPending = this.state.pendingReason?.type;
     this.state = reduceTaskDetail(this.state, event);
+    // 落地即清（决策 362②）：正文已到手的 run 又来了一条增量（落地那一刻前后到达序上的
+    // 竞态），当场收走——否则它会一直挂在时间线上直到下一次正文装载。
+    if (
+      (event.type === 'conversation_delta' || event.type === 'tool_event') &&
+      this.conversationsFull[event.run_id] !== undefined
+    ) {
+      this.clearLandedLive();
+    }
     // 完成横幅触发源：详情页 SSE 终态事件（不等 refetch）。failed / cancelled 不弹。
     if (event.type === 'task_done') {
       completion.note(event.task_id, 'done', this.state.task?.title);
@@ -248,6 +293,7 @@ class TaskDetailStore {
     try {
       const conv = await getConversation(this.id, runId);
       this.conversationsFull = { ...this.conversationsFull, [runId]: conv };
+      this.clearLandedLive();
       return conv;
     } catch (err) {
       this.error = (err as Error).message;
@@ -284,6 +330,7 @@ class TaskDetailStore {
         if (pending.includes(conv.run_id)) fresh[conv.run_id] = conv;
       }
       this.conversationsFull = fresh;
+      this.clearLandedLive();
     } catch {
       // 老后端（无 `include_messages`）或中间层剥了 query → 回到逐条
       await Promise.all(pending.map((runId) => this.loadConversation(runId)));

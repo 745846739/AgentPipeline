@@ -382,6 +382,51 @@ describe('现场时间线 · 流式增量', () => {
     expect(last.kind).toBe('thinking');
     expect(last.streaming).toBe(true);
   });
+
+  it('被上限丢弃过增量的轮带 droppedLive（决策 362①）——合成 live 轮同样', () => {
+    const landed = build({
+      conversations: [flying()],
+      liveDeltas: [delta('窗口尾部', 1)],
+      liveDroppedRuns: { 1: true },
+    });
+    expect(landed[0].droppedLive).toBe(true);
+
+    const live = build({
+      liveDeltas: [delta('现场冒出的增量', 77)],
+      liveDroppedRuns: { 77: true },
+    });
+    expect(live[0].droppedLive).toBe(true);
+  });
+
+  it('没被丢弃的轮不带标记：同一份输入里另一条 run 不受牵连（决策 362①）', () => {
+    const turns = build({
+      conversations: [run({ run_id: 1, status: 'running' }), run({ run_id: 2, status: 'running' })],
+      liveDeltas: [delta('甲', 1), delta('乙', 2)],
+      liveDroppedRuns: { 2: true },
+    });
+    const byRun = new Map(turns.map((t) => [t.runId, t.droppedLive]));
+    expect(byRun.get(1)).toBe(false);
+    expect(byRun.get(2)).toBe(true);
+  });
+
+  it('截断之后窗口内的步序仍按 `seq` 交织（决策 362 验收线④）', () => {
+    // 前面 5000 条已被上限丢掉，留下的 `seq` 从 5000 起（留洞、不重编号）；窗口内
+    // 「先想 → 查 → 再想 → 说」的序必须保真——`seq` 留洞无害，正是因为它只用于排序。
+    const turns = build({
+      conversations: [flying()],
+      liveDeltas: [
+        { ...delta('先想', 1, 'assistant', 'reasoning'), seq: 5000 },
+        { ...delta('再想', 1, 'assistant', 'reasoning'), seq: 5002 },
+        { ...delta('结论如下', 1, 'assistant', 'content'), seq: 5003 },
+      ],
+      liveTools: [{ ...tool('read_task', 'end'), seq: 5001 }],
+      liveDroppedRuns: { 1: true },
+    });
+
+    expect(turns[0].droppedLive).toBe(true);
+    expect(turns[0].steps.map((s) => s.kind)).toEqual(['thinking', 'tool', 'thinking']);
+    expect(turns[0].closing).toBe('结论如下');
+  });
 });
 
 describe('现场时间线 · 多次尝试分主次（决策 359③）', () => {

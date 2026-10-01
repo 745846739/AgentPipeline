@@ -2312,6 +2312,87 @@ test.describe('对讲台 · 切走再回来，本轮已经收到的输出还在�
 });
 
 /**
+ * 对讲台 · **在飞时切走再切回**：按 `ledger_id` / `seq` 重新拼接，接缝两侧不重不漏
+ * （票 10，决策 363②；那是票 02 checklist 的唯一未勾项）。
+ *
+ * 与上一条（决策 275 本机跨页不丢）**不是**同一件事：那条只证「字还在屏上」——而字可能
+ * 来自 store 里留着的现场、也可能来自切回来时重取的那条半截行，两个来源在屏幕上分不开。
+ * 本条断言**接缝两侧各恰好一次**：重复正是「快照里已有的增量又被接了一遍」的形状，即
+ * `spliceAccepts` 的 `seq ≤ seq0` 那一支失效；缺字则是 `seq > seq0` 那一支失效。
+ *
+ * 装置同款（`drip` 三截、中间 6s 空档）：切回来时台账那条半截行已带 A + B（节流批写），
+ * 快照因此覆盖到 B，C 是唯一该由流接上的增量。
+ */
+test.describe('对讲台 · 在飞时切走再切回：接缝两侧不重不漏（票 10）', () => {
+  let app: App;
+
+  const A = '第一截：我开始想了';
+  const B = '；第二截：这两句之间我切去了看板';
+  const C = '；第三截：想完了。';
+
+  /** 子串出现次数：接缝「不重」的机器读数（重复字一定长这样）。 */
+  const occurrences = (hay: string, needle: string): number => hay.split(needle).length - 1;
+
+  test.beforeAll(async () => {
+    app = await startApp({
+      script: foremanScript([[drip([A, B, C], 6_000)], [text('第二轮的收尾。')]]),
+      providerOnly: true,
+    });
+  });
+
+  test.afterAll(async () => {
+    await app?.stop();
+  });
+
+  test('切走时 A 已到、B 在页面之外到达；切回来接缝两侧各恰好一次', async ({ page }) => {
+    const bundle = watchBundle(page);
+    await page.goto(`${app.webBase}/#/talk`);
+    await settleBundle(page, bundle);
+
+    await page.locator('.typer textarea').fill('这一句要分三截答');
+    await page.locator('.typer button[type=submit]').click();
+
+    const live = page.locator('.timeline .turn.fm').first();
+    await expect(live).toContainText(A, { timeout: 30_000 });
+
+    // 切走（同一份 SPA 里的路由切换，不刷新）
+    await page
+      .getByRole('navigation', { name: '页面导航' })
+      .getByRole('link', { name: '看板' })
+      .click();
+    await expect(page.locator('.talk-head')).toHaveCount(0);
+
+    // B 在页面之外到达；这段时间里台账那条半截行被节流批写到 B
+    await page.waitForTimeout(7_000);
+
+    // 切回来：A + B 齐全，且**各恰好一次**——快照已带上它们，流不该再接一遍
+    await page
+      .getByRole('navigation', { name: '页面导航' })
+      .getByRole('link', { name: '对讲台' })
+      .click();
+    const back = page.locator('.timeline .turn.fm').first();
+    await expect(back).toContainText(B, { timeout: 30_000 });
+    const seam = (await back.textContent()) ?? '';
+    expect(occurrences(seam, A), '接缝左侧的第一截不许重').toBe(1);
+    expect(occurrences(seam, B), '接缝右侧的第二截不许重').toBe(1);
+    expect(seam.indexOf(A), '顺序保真：A 在 B 之前').toBeLessThan(seam.indexOf(B));
+
+    // 收口：C 由流接上；落地后三截仍各恰好一次，且只有这一轮
+    await expect(back).toContainText(C, { timeout: 30_000 });
+    const final = (await back.textContent()) ?? '';
+    expect(occurrences(final, A)).toBe(1);
+    expect(occurrences(final, B)).toBe(1);
+    expect(occurrences(final, C)).toBe(1);
+    expect(final.indexOf(A)).toBeLessThan(final.indexOf(B));
+    expect(final.indexOf(B)).toBeLessThan(final.indexOf(C));
+    await expect(page.locator('.timeline .turn.fm')).toHaveCount(1);
+
+    bundle.problems.length = 0;
+    expectBundleHealthy(bundle);
+  });
+});
+
+/**
  * 对讲台 · **关着页排上队的话照发**（决策 354②）。
  *
  * 排水环原先住在页面那个 `$effect` 里：页面一切走，出队就停——排队的那句话**等着**，等人

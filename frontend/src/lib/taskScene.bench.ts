@@ -19,6 +19,7 @@ import type {
   NodeCommand,
   NodeConversation,
 } from '../api/types';
+import type { LiveDelta } from '../realtime/reduce';
 import { buildTaskScene } from './taskScene';
 
 interface Fixture {
@@ -134,5 +135,56 @@ describe('buildTaskScene · 落地数据全量归约', () => {
       liveTools: [],
       commandOutputFor: () => null,
     });
+  });
+});
+
+/**
+ * 决策 362① 的**计数判据**（`.scratch/live-delta-retention/spec.md`「验收线」）：
+ * 「累积到 N 条（含 N 以上）后单次 `buildTaskScene` 本机 < 10 ms，且不再随累积上升」。
+ *
+ * 上限定在 10000 条，故「N 以上」这一半**由构造保证**（进不了归约），这里量的是另一端——
+ * **N 整档**在飞增量的一次全量归约：那正是这条病此前可以无限增长的形态（归约成本由原始
+ * 增量条数驱动，与折出多少步无关）。照本文件的口径**只记录、不设闸**。
+ */
+describe('buildTaskScene · 在飞增量到窗口上限（计数判据）', () => {
+  const liveScene = (n: number) => {
+    const conversations: ConversationSummary[] = [
+      {
+        run_id: 1,
+        stage: 'develop',
+        node: 'execute',
+        attempt: 1,
+        agent_type: 'main',
+        parent_run_id: null,
+        prompt_tokens: 0,
+        completion_tokens: 0,
+        status: 'running',
+        archived_at: null,
+      },
+    ];
+    const liveDeltas: LiveDelta[] = Array.from({ length: n }, (_, i) => ({
+      run_id: 1,
+      agent_type: 'main',
+      role: 'assistant',
+      channel: 'content' as const,
+      text: `第 ${i} 块：一次 provider chunk 的中位长度，约几十个字符的正文。`,
+      seq: i,
+    }));
+    return {
+      conversations,
+      conversationFor: () => undefined,
+      commands: [] as NodeCommand[],
+      liveDeltas,
+      liveTools: [],
+      commandOutputFor: () => null,
+    };
+  };
+
+  bench('2000 条在飞增量（上限之内）', () => {
+    buildTaskScene(liveScene(2_000));
+  });
+
+  bench('10000 条在飞增量（上限整档）', () => {
+    buildTaskScene(liveScene(10_000));
   });
 });

@@ -811,8 +811,11 @@ describe('拼接判据 spliceAccepts（票 02）', () => {
     expect(spliceAccepts({ ledger_id: 7, seq: 99 }, null)).toBe(true);
   });
 
-  it('ledger_id 对不上（另一条在途行）→ 按既有路径接：别人的基准丢它才是丢字', () => {
-    expect(spliceAccepts({ ledger_id: 9, seq: 1 }, base)).toBe(true);
+  it('ledger_id 对不上（另一条在途行）→ 拒（决策 363④：基准已是逐行的，别人的字接进来就是重字）', () => {
+    expect(spliceAccepts({ ledger_id: 9, seq: 1 }, base)).toBe(false);
+    expect(spliceAccepts({ ledger_id: 9, seq: 99 }, base)).toBe(false);
+    // 不带 seq 也照拒：`ledger_id` 已明说它是另一条行的，「不认识就不改变行为」不适用
+    expect(spliceAccepts({ ledger_id: 9, seq: null }, base)).toBe(false);
   });
 });
 

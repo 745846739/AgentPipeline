@@ -414,3 +414,49 @@ describe('现场时间线 · 阶段 prompt 与落地思考（决策 360）', () 
     expect(tool.textContent).not.toContain('文件内容');
   });
 });
+
+describe('上限截断的省略行（决策 362①）', () => {
+  const flyingRun = (): ConversationSummary => run({ run_id: 1, status: 'running' });
+  const liveDelta = (text: string) => ({
+    run_id: 1,
+    agent_type: 'main',
+    role: 'assistant',
+    channel: 'content' as const,
+    text,
+    seq: 0,
+  });
+
+  it('被丢弃过增量的轮最前摆一行；它是纯文字，不可交互（不带按钮 / 链接）', () => {
+    render(SceneTimeline, {
+      props: {
+        conversations: [flyingRun()],
+        conversationFor: () => undefined,
+        commands: [],
+        liveDeltas: [liveDelta('窗口尾部')],
+        liveDroppedRuns: { 1: true },
+        commandOutputFor: () => null,
+      },
+    });
+
+    const row = screen.getByText('更早的增量已省略');
+    expect(row.tagName).toBe('DIV');
+    expect(row.closest('button')).toBeNull();
+    expect(row.closest('a')).toBeNull();
+    // 不是 details/summary 那一类可点开的东西
+    expect(row.closest('details')).toBeNull();
+  });
+
+  it('没被丢弃过就不摆这一行', () => {
+    render(SceneTimeline, {
+      props: {
+        conversations: [flyingRun()],
+        conversationFor: () => undefined,
+        commands: [],
+        liveDeltas: [liveDelta('窗口尾部')],
+        commandOutputFor: () => null,
+      },
+    });
+
+    expect(screen.queryByText('更早的增量已省略')).toBeNull();
+  });
+});

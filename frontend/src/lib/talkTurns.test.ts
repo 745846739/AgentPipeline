@@ -1091,3 +1091,138 @@ describe('在飞轮的渲染键（决策 354③）', () => {
     expect(turns[0].interruptedAt).toBe('2026-09-23T10:05:00Z');
   });
 });
+
+/**
+ * 两条并行在途行（决策 260：值守轮 + 人的轮）的呈现（决策 363④，票 12）。
+ *
+ * 旧判据只认**第一条**在途行当基准，且把 `ledger_id` 对不上的增量一并放行——另一条行的
+ * 字于是被折进基准行渲染一遍，而它在自己那一轮里已经渲染过（两条并发时重字）。现判据
+ * **按 `ledger_id` 逐行分流**：每条在途行各自一个基准、各自折进自己那一轮、按行的位置
+ * 排在时间线里；不带 `ledger_id` 的事件归第一条（老后端 / 流水线事件）。
+ */
+describe('两条并行在途行各自成轮（决策 363④）', () => {
+  const inFlight = (id: number, over: Partial<ForemanMessage> = {}): ForemanMessage =>
+    message({
+      id,
+      status: 'in_flight',
+      seq: 5,
+      created_at: `2026-09-23T10:0${id}:00Z`,
+      ...over,
+    });
+
+  /** 值守那条（proactive=true，先开）与人的那条（后开），两条都在飞。 */
+  const twoLines = (): ForemanMessage[] => [
+    inFlight(5, { content: '甲半句', proactive: true, created_at: '2026-09-23T10:01:00Z' }),
+    inFlight(6, { content: '乙半句', created_at: '2026-09-23T10:02:00Z' }),
+  ];
+
+  it('两条行各占一轮：各自的增量只折进自己那一轮，不串台、不重字', () => {
+    const stream = streamOf({
+      events: [
+        { kind: 'delta', channel: 'content', text: '甲后说', ledger_id: 5, seq: 6 },
+        { kind: 'delta', channel: 'content', text: '乙后说', ledger_id: 6, seq: 6 },
+      ],
+      streaming: true,
+    });
+    const turns = buildTurns(
+      inputOf({
+        session: sessionOf([
+          message({ id: 4, kind: 'mine', content: '问' }),
+          ...twoLines(),
+        ]),
+        following: true,
+        stream,
+      }),
+    );
+
+    // 各占一轮，按行的位置（时刻）排：m4 → m5 → m6
+    expect(turns.map((t) => t.key)).toEqual(['m4', 'm5', 'm6']);
+    const five = turns.find((t) => t.key === 'm5');
+    const six = turns.find((t) => t.key === 'm6');
+    expect(five?.content).toBe('甲半句甲后说');
+    expect(six?.content).toBe('乙半句乙后说');
+    // 互不串台：谁也不含对方那半句
+    expect(five?.content).not.toContain('乙');
+    expect(six?.content).not.toContain('甲');
+    // 逐行读那一行自己的字段：值守那条与人的那条名牌分得开
+    expect(five?.proactive).toBe(true);
+    expect(six?.proactive).toBe(false);
+  });
+
+  it('没有 ledger_id 的事件归第一条在途行（老后端 / 流水线事件）', () => {
+    const stream = streamOf({
+      events: [{ kind: 'delta', channel: 'content', text: '无归属的字' }],
+      streaming: true,
+    });
+    const turns = buildTurns(
+      inputOf({ session: sessionOf(twoLines()), following: true, stream }),
+    );
+
+    expect(turns.find((t) => t.key === 'm5')?.content).toBe('甲半句无归属的字');
+    expect(turns.find((t) => t.key === 'm6')?.content).toBe('乙半句');
+  });
+
+  it('一条行已经落地时，它的字不渗进还在飞的那一轮', () => {
+    const stream = streamOf({
+      events: [{ kind: 'delta', channel: 'content', text: '乙在冒', ledger_id: 6, seq: 6 }],
+      streaming: true,
+    });
+    const turns = buildTurns(
+      inputOf({
+        session: sessionOf([
+          message({ id: 5, kind: 'fm', content: '甲已落地' }),
+          inFlight(6, { content: '乙半句', created_at: '2026-09-23T10:02:00Z' }),
+        ]),
+        following: true,
+        stream,
+      }),
+    );
+
+    expect(turns.find((t) => t.key === 'm5')?.content).toBe('甲已落地');
+    expect(turns.find((t) => t.key === 'm6')?.content).toBe('乙半句乙在冒');
+    expect(turns.filter((t) => t.key === 'm6')).toHaveLength(1);
+  });
+
+  it('两条行都死（流没亮、尾巴为空）时不摆占位轮：各自按落地式渲染', () => {
+    const turns = buildTurns(
+      inputOf({ session: sessionOf(twoLines()) }),
+    );
+    expect(turns.map((t) => t.key)).toEqual(['m5', 'm6']);
+    expect(turns.map((t) => t.streaming)).toEqual([false, false]);
+  });
+
+  it('行还没进快照的新轮：它的字不丢（暂时归基准行），等下一份快照把它接走', () => {
+    // `ledger_id` 认不出（不在快照里）= 新轮的第一批增量比快照先到。**不能丢**——
+    // 丢在这儿会让那一段直播静默消失；旧口径的「宁可多收」正是为这个窗口留的。
+    const stream = streamOf({
+      events: [
+        { kind: 'delta', channel: 'content', text: '新轮的第一批字', ledger_id: 9, seq: 1 },
+      ],
+      streaming: true,
+    });
+    const turns = buildTurns(
+      inputOf({ session: sessionOf(twoLines()), following: true, stream }),
+    );
+
+    expect(turns.find((t) => t.key === 'm5')?.content).toBe('甲半句新轮的第一批字');
+    expect(turns.find((t) => t.key === 'm6')?.content).toBe('乙半句');
+  });
+
+  it('已落地行的迟到增量不渗进在飞轮（那一行本身就是权威）', () => {
+    const stream = streamOf({
+      events: [{ kind: 'delta', channel: 'content', text: '迟到的一条', ledger_id: 4, seq: 99 }],
+      streaming: true,
+    });
+    const turns = buildTurns(
+      inputOf({
+        session: sessionOf([message({ id: 4, kind: 'fm', content: '甲已落地' }), ...twoLines()]),
+        following: true,
+        stream,
+      }),
+    );
+
+    expect(turns.find((t) => t.key === 'm4')?.content).toBe('甲已落地');
+    expect(turns.find((t) => t.key === 'm5')?.content).toBe('甲半句');
+    expect(turns.find((t) => t.key === 'm6')?.content).toBe('乙半句');
+  });
+});

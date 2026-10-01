@@ -1,6 +1,6 @@
 # 对讲台信息流回看（talk-replay）
 
-**Status:** done（决策 312，票 01–07 同批落地；票 08 评审残留发现仍 needs-triage）
+**Status:** done（决策 312，票 01–07 同批落地；票 08 评审残留发现已裁（决策 363）并拆为票 09–12）
 
 > 来源：用户诉求「重新进入对讲台只能看到此后的信息流，之前的信息流看不见，能否优化」，
 > 经 grilling 19 轮（Q1–Q19）逐项裁决定形。两轮代码探查的事实依据与全部裁决记录见对话
@@ -97,8 +97,12 @@
 2. **中断标记**：进程被杀时在途行留在库里；启动恢复序列（既有三步之后）新增一步，
    把没有活跃轮对应的在途行标成**已中断**并记中断时刻——与 `orphan_inflight_model_requests`
    的孤儿收口同姿势。中断是行上的状态，不是新表。
-3. **保真范围 = 全保**：thinking、工具调用步骤、逐字正文三者都随广播落库，重进后的
-   前半段与当时直播所见同构。收口时的最终落库内容仍以整轮产物为准（既有路径不变）。
+3. **保真范围：thinking 与逐字正文随广播落库，工具步骤随批落库**（决策 363① 订正措辞）：
+   thinking 与逐字正文全保真；**工具步骤在批边界保真**——一批工具跑完才进现场，批中快照
+   看不到那一步。重进后的前半段与当时直播所见**同构到批边界**。收口时的最终落库内容仍以
+   整轮产物为准（既有路径不变）。**不逐步刷写工具步骤**（明确不做）：那要拿决策 293 的转录
+   契约去付账——工具结果必须紧跟发起它的 assistant 消息，为一个快照可见性切开一批，是
+   拿转录契约换取证；一个工具批通常很短，批中丢失的取证损失有限。
 4. **契约改写**：`.scratch/foreman-talk/CONTRACT.md` 的「写 user 行 → 循环 → 写 assistant 行」
    改写为「写 user 行 + 建在途 assistant 行 → 循环（每步边广播边落库）→ 收口」。
 5. **快照与直播的衔接**：`GET /foreman/session` 的 payload 天然带出在途行（messages 里
@@ -146,7 +150,7 @@ payload + `/foreman/stream` 事件）——前后端唯一交汇点，在这里�
 | L2 core 集成 | 在途行随轮推进而增长且节流生效；启动恢复把悬挂行标已中断（spawn+SIGKILL 形态）；保留期假时钟推过 30 天后消息仍在、proposals/attention 仍被清；收口后台账恰两行 | FakeAgent `Script::for_foreman()` 脚本槽（决策 182⑧）、testkit 临时 home、`Clock` 接缝、`restart_recovery.rs` 的真重启形态（票 08） |
 | L3 契约 | 在飞时 messages 含半截 assistant 行且 `turn_in_flight` 照旧翻转；`include_archived` 列表含归档且按 id 仍可读；`before_id` 游标分段正确；SSE 在途事件带 `ledger_id` / `seq` | tower oneshot in-process；`api_contract.rs` 的 foreman 既有用例（改写钉旧语义那几条） |
 | 前端 vitest | 快照+seq 拼接的防重防漏（纯函数：seq ≤ seq0 丢弃 / > 接受 / 无 seq 按老路径）；中断轮渲染判据（接替 `resolveFollowOutcome` 的 lost 支）；归档 chip 开关状态；滚顶加载不重不漏 | `realtime/foreman.test.ts` 归约表、`lib/talkTurns.test.ts`、`lib/delegation-scan.test.ts` 静态扫描守卫（落地哨改动必须过它） |
-| L4 playwright | 重进看得到前半段；刷新后快照与直播接缝不重不漏；重启后中断轮带标记出现在时间线；归档开关翻得回、灰 chip、只读；滚到顶加载更早且视口不跳 | 既有 `talk.spec.ts`（决策 260 刷新用例在此，续写不新开 spec） |
+| L4 playwright | 重进看得到前半段；刷新后快照与直播接缝不重不漏；**在飞时切走再切回**按 `ledger_id` / `seq` 重拼、接缝两侧各恰好一次（票 10）；归档开关翻得回、灰 chip、只读；滚到顶加载更早且视口不跳。**「重启后中断轮带标记出现在时间线」一格记为已接受的 L4 缺口**（票 10，决策 363②）：playwright 的 harness 每用例独占一套临时 home + 子进程（`harness.ts::startApp`），**没有「同一 home 上的真重启」形态**，为它把整套 harness 改成可复用 home 不划算；真重启那半边由 **L2/L3 承担**（`crates/app/tests/integration/restart_recovery.rs::kill_9_mid_foreman_turn_marks_the_hanging_row_interrupted_on_restart`，真二进制 + 真 SIGKILL + 同 home 重启，经 HTTP 观测），渲染这半边另有**两点覆盖**：`lib/delegation-scan.test.ts`（中断标记单一来源的静态守卫）+ `realtime/foreman.test.ts`（中断行落 settled 支、在飞轮退场） | 既有 `talk.spec.ts`（决策 260 刷新用例在此，续写不新开 spec） |
 
 **牙齿要求**（每条修订对应一颗）：改回「整轮结束才落」→ 契约测试红；启动不标中断 →
 L2 红；清理函数又被接回消息表 → 保留期反向断言红；拼接判据退化 → vitest 红；
@@ -178,10 +182,15 @@ L2 红；清理函数又被接回消息表 → 保留期反向断言红；拼接
   [`.scratch/task-conversation-replay/issues/01-in-flight-visibility.md`](../task-conversation-replay/issues/01-in-flight-visibility.md)
   （通道与表结构不同：`messages_json` 整行重写 vs 消息逐行追加；先决是本 spec 收口后
   拿到真实痛点证据，票 07 挂上）；若真实使用中发现 500 缺省不够用，
-  再议调参。
-- **两轴评审的残留发现**（收口那一轮读出，四条都待议、不夹带进收口提交）：票面
+  再议调参。**处置（决策 364，2026-10-01）**：先决未满足（穷举检索后全仓无痛点证据），
+  转 `needs-info` 挂起、reopen 触发条件写进票面；「落地接管与去重」已由决策 362 迁至
+  `.scratch/live-delta-retention/`。
+- **两轴评审的残留发现**（收口那一轮读出；**已裁**（决策 363，2026-10-01）并**拆为票
+  [09](issues/09-step-landing-batch.md)–[12](issues/12-parallel-lines.md)**，四条均已
+  `done`）：票面
   [`.scratch/talk-replay/issues/08-two-axis-review-findings.md`](issues/08-two-axis-review-findings.md)
-  ——①工具步骤只在工具批跑完时落库（与决策 3「三者都随广播落库」有细缝）；②缺「切走再切回」
+  ——①工具步骤只在工具批跑完时落库（与决策 3 的措辞有细缝，**已由票 09 订正口径**：
+  「thinking 与逐字正文随广播落库，工具步骤随批落库」）；②缺「切走再切回」
   与「重启后中断轮带标记」两条 e2e；③页头合计把在途行也算了进去（与决策 4「合计口径不动」
   有细缝）；④`spliceAccepts` 对「另一条在途行」的增量放行，两条并发时可能重字。收口轮**只
   修了文档**：`design/frontend-design.md` §12.3 补了四条新行为的实现位置、`.scratch/foreman-talk/CONTRACT.md`

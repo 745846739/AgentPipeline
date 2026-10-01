@@ -71,16 +71,20 @@ export type ForemanLiveEvent =
     };
 
 /**
- * 快照与直播的**拼接判据**（票 02）：到达的这一条增量要不要接进时间线。
+ * 快照与直播的**拼接判据**（票 02；决策 363④ 把「对不上」那一支改成**拒**）。
  *
- * 三支，各对一种事实：
+ * 三支，各对一种事实（**归属先判、位置后判**）：
+ * - `ledger_id` 对不上（这条事件属于**另一条**在途行）→ **拒**（决策 363④）：基准自那时起
+ *   是**逐行**的（同一班可并行两轮，决策 260），别人的字接进这一轮就是重字——它在自己那一轮
+ *   里已经渲染过。旧口径（对不上也放行）是「基准只有一条、认不出归属时宁可多收」时代的取舍，
+ *   逐行基准之后它只会制造重复。这一判在 `seq` 之前：带 `ledger_id` 就已经说明归属了。
  * - `seq <= seq0` → **丢**：它已经在快照那一行里了（快照是行的当前全量），再接就是重复字；
  * - `seq > seq0` → **接**：快照之后才广播的，快照里没有它，不接就丢字；
- * - **不带 seq**（老后端 / 流水线事件 / 手里没有基准）→ 按**既有路径**接——加性字段的
+ * - **不带 seq**（老后端 / 流水线事件）→ 按**既有路径**接——加性字段的
  *   老规矩：不认识就不改变行为。
  *
- * `ledger_id` 对不上（这条事件属于另一条在途行）同样按既有路径接：那一行的内容不归
- * 这一屏的基准管，拿别人的基准丢它才是丢字。
+ * **不带 `ledger_id` 的事件归基准行**（决策 363④ 的例外，由调用方按「第一条在途行」路由，
+ * 见 `lib/talkTurns.ts::acceptsForLine`）。
  *
  * **seq 只做去重，不做回放**（决策 275 原样）：本判据只决定「到达的这条接不接」，
  * 从不触发任何补取——没到过的字靠**下一次快照**（`GET /foreman/session`）读回，
@@ -90,8 +94,9 @@ export function spliceAccepts(
   event: Pick<ForemanLiveEvent, 'ledger_id' | 'seq'>,
   base: { id: number; seq: number } | null,
 ): boolean {
-  if (!base || event.seq == null) return true;
-  if (event.ledger_id != null && event.ledger_id !== base.id) return true;
+  if (!base) return true;
+  if (event.ledger_id != null && event.ledger_id !== base.id) return false;
+  if (event.seq == null) return true;
   return event.seq > base.seq;
 }
 

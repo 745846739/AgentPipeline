@@ -555,6 +555,7 @@
             commands={detail.commands}
             liveDeltas={detail.liveDeltas}
             liveTools={detail.liveTools}
+            liveDroppedRuns={detail.liveDroppedRuns}
             commandOutputFor={(c) => taskDetail.outputFor(c)}
             commandErrorFor={(c) => taskDetail.commandOutputError[c.id] ?? null}
             onloadCommand={(cmdId) => taskDetail.loadCommandOutput(cmdId)}

@@ -266,23 +266,53 @@ function trailReply(
 }
 
 /**
- * 台账里的**在途半截行** = 快照与直播的拼接基准（票 02）。
+ * 台账里的**在途半截行们** = 快照与直播的拼接基准（票 02；决策 363④ 起**逐行**）。
  *
- * 没有在途行时是 `null`：判据（{@link spliceAccepts}）于是走「没有基准」那一支，
- * 流怎么攒就怎么渲染——与快照进来之前逐字一致。
+ * 同一班可并行两轮（决策 260：值守轮 + 人的轮），故基准是一**组**而不是一条。没有在途行时
+ * 是空数组：判据于是走「没有基准」那一支，流怎么攒就怎么渲染——与快照进来之前逐字一致。
  */
-function inFlightBase(
+function inFlightBases(
   messages: readonly { id: number; status?: string | null; seq?: number }[],
-): { id: number; seq: number } | null {
-  const row = messages.find((m) => m.status === 'in_flight');
-  return row ? { id: row.id, seq: row.seq ?? 0 } : null;
+): { id: number; seq: number }[] {
+  return messages
+    .filter((m) => m.status === 'in_flight')
+    .map((m) => ({ id: m.id, seq: m.seq ?? 0 }));
 }
 
-/** {@link buildTurns} 里拼半截行要的那几列（与 {@link inFlightBase} 的行同一行）。 */
+/**
+ * 这一条原始事件接进**哪一条**在途轮（决策 363④）：按 `ledger_id` 分流。
+ *
+ * 三种归属，各对一件事实：
+ * - `ledger_id` 就是这一条行（或压根没带，老后端 / 流水线事件）→ 交给
+ *   {@link spliceAccepts} 按这一行自己的 `seq0` 去重；
+ * - `ledger_id` 是**快照里另一条行**（另一条在途行 / 已落地的行）→ **拒**：那是别人的字，
+ *   接进来就是重字（它在自己那一轮里已经渲染过）；
+ * - `ledger_id` **不在快照里**（新轮的第一批增量比快照先到）→ 暂时归**第一条**在途行
+ *   （「不认识就不改变行为」）。**不能顺手丢掉**：丢在这儿会让那一段直播静默消失，
+ *   直到下一份快照把那条行接进来——旧口径的「宁可多收」正是为这个窗口留的。
+ */
+function acceptsForLine(
+  event: ForemanLiveEvent,
+  base: { id: number; seq: number },
+  primary: { id: number } | null,
+  knownRows: ReadonlySet<number>,
+): boolean {
+  if (event.ledger_id == null) {
+    return primary != null && primary.id === base.id && spliceAccepts(event, base);
+  }
+  if (event.ledger_id === base.id) return spliceAccepts(event, base);
+  return !knownRows.has(event.ledger_id) && primary != null && primary.id === base.id;
+}
+
+/** {@link buildTurns} 里拼半截行要的那几列（与 {@link inFlightBases} 的行同一行）。 */
 type InFlightRow = Parameters<typeof landedSteps>[0] & {
   id: number;
   status?: string | null;
   content: string;
+  /** 行的时刻：拼出来的在飞轮沿用它在时间线上的位置（决策 363④）。 */
+  created_at: string;
+  /** 值守播报（决策 209④）：逐行拼出来的在飞轮名牌与它同源（值守轮与人的轮要分得开）。 */
+  proactive?: boolean;
 };
 
 /**
@@ -338,11 +368,11 @@ function mergeInFlightSteps(
  * 切换点因此在「首条事件」——彼时折叠态本来就是空的，换键不会丢任何人的操作。
  * 事件不带 `ledger_id`（老后端只发增量 / 流水线事件）时也只有 `live` 可用，与从前逐字一致。
  *
- * `base`（快照里那条在途半截行）优先：它与事件上的 `ledger_id` 是同一条行，
- * 而快照在手时它更权威（事件可能一条都还没到，见 `mergeLive`）。
+ * **它只管「手上没有在途行」那一路**（快照还没读到半截行，或本机刚发出去）。快照里已有
+ * 在途行时由 {@link buildTurns} 的逐行拼接那一段直接以 `m<行 id>` 出键——行 id 就是键，
+ * 不必从事件里反推（决策 363④）。
  */
-function liveTurnKey(base: { id: number } | null, events: readonly ForemanLiveEvent[]): string {
-  if (base != null) return `m${base.id}`;
+function liveTurnKey(events: readonly ForemanLiveEvent[]): string {
   for (const ev of events) {
     if (ev.ledger_id != null) return `m${ev.ledger_id}`;
   }
@@ -396,7 +426,11 @@ export interface TalkTurnsInput {
 
 /**
  * 时间线归约：台账行与提议**按时刻合并排序**（不是把提议另起一段——提议是那一轮里发生
- * 的事，先后次序本身是信息），再把三种在飞轮追加在末尾，最后返回。
+ * 的事，先后次序本身是信息），再接上在飞轮，最后返回。
+ *
+ * **在飞轮有两条路**（决策 363④）：台账里已有在途半截行时，**逐行**把它与自己的尾巴拼成
+ * 一轮、放在**它自己那一行的位置**上（同一班可并行两轮，决策 260）；手上没有在途行时
+ * （快照还没读到，或本机刚发出去）才把整条流追加在末尾。
  *
  * 同刻的兜底次序按 `kind`：人的话 → 提议 / 操作台 / 失败 → 值班长的话。时钟是同一台机器的，
  * 同刻基本只出现在 `ManualClock` 的用例里，但**排序必须是确定的**（否则每次渲染都可能换位）。
@@ -407,21 +441,34 @@ export function buildTurns(input: TalkTurnsInput): TurnView[] {
   const { session, pendingText, sending, following, stream, pairingNeeded } = input;
   const watchLedger = input.ledgerKind === 'watch';
   const messages = session?.messages ?? [];
-  // 拼接基准先算（票 02）：半截行要从台账行里**摘出来**、与尾巴拼成一条 live 轮，
-  // 不能既在台账位置落地式渲染一遍、又在末尾以 live 形态再来一遍。
-  const base = inFlightBase(messages);
-  const baseRow: InFlightRow | null =
-    base != null ? (messages.find((m) => m.id === base.id) ?? null) : null;
-  const tailSteps = base
-    ? foldForemanEvents(stream.events.filter((e) => spliceAccepts(e, base)))
-    : stream.steps;
-  // 只有「这一轮还活着」（有尾巴增量 / 流还亮着）才拼：死轮收口前的半截行没有直播可拼，
-  // 照落地式渲染（失败轮的说明随后由 stream.error 那条支补上）。
-  const mergeLive = baseRow != null && (tailSteps.length > 0 || stream.streaming);
+  // 拼接基准先算（票 02 / 决策 363④）：**每一条在途行各自一个基准**。旧判据取「第一条」
+  // 并把 `ledger_id` 对不上的增量一并放行——另一条行的字于是被折进基准行渲染一遍，
+  // 而它在自己那一轮里已经渲染过（两条并发时重字）。
+  const bases = inFlightBases(messages);
+  /** 无 `ledger_id` 的事件（老后端 / 流水线事件）归**第一条**在途行（旧口径原样）。 */
+  const primaryBase = bases[0] ?? null;
+  const rowById = new Map(messages.map((m) => [m.id, m]));
+  /** 快照里认得的行（在途的与已落地的都算）：分流时用来分开「别人那条行」与「一行都不认得」。 */
+  const knownRows = new Set(messages.map((m) => m.id));
+  /** 逐行拼出来的在飞轮：行 id → 那一条行 + 它接得到的尾巴。 */
+  const mergedLines = new Map<number, { row: InFlightRow; tailSteps: ForemanLiveStep[] }>();
+  for (const b of bases) {
+    const row = rowById.get(b.id) as InFlightRow | undefined;
+    if (!row) continue;
+    const tail = foldForemanEvents(
+      stream.events.filter((e) => acceptsForLine(e, b, primaryBase, knownRows)),
+    );
+    // 只有「这一轮还活着」（有尾巴增量 / 流还亮着）才拼：死轮收口前的半截行没有直播可拼，
+    // 照落地式渲染（失败轮的说明随后由 stream.error 那条支补上）。判据**逐行**做——
+    // 一条行死了不影响另一条行还在飞。
+    if (tail.length > 0 || stream.streaming) mergedLines.set(b.id, { row, tailSteps: tail });
+  }
+  // 手上没有在途行那一路（快照还没读到半截行，或本机刚发出去）：整条流照旧渲染。
+  const looseTail = stream.steps;
   // 「提问之后人又开过口」的判据（决策 265③，纯派生）：最大 mine 行 id 大于该行 id。
   const maxMineId = messages.reduce((mx, m) => (m.kind === 'mine' && m.id > mx ? m.id : mx), 0);
   const stamped: { view: TurnView; rank: number }[] = messages
-    .filter((m) => !(mergeLive && base != null && m.id === base.id))
+    .filter((m) => !mergedLines.has(m.id))
     .map((m) => ({
     // 排序与分类**同一处判定**（决策 252）：`kind` 是后端给的，界面不再各判一遍。
     // 提问轮与回话同为值班长那一轮的产物，同刻兜底与 `fm` 同档。
@@ -473,6 +520,38 @@ export function buildTurns(input: TalkTurnsInput): TurnView[] {
       },
     });
   }
+  // 逐行拼出来的在飞轮（票 02 / 决策 363④）：**与台账行同一个渲染键、同一个时刻**——
+  // 它因此排在自己那一行的位置上，两条并行的在途行各自成轮、互不串台（各自只收
+  // `ledger_id` 对自己的事件，见 {@link acceptsForLine}）。
+  for (const [id, line] of mergedLines) {
+    const live = mergeInFlightSteps(line.row, line.tailSteps.map(stepFromLive), stream.streaming);
+    stamped.push({
+      // 与 `fm` 同档（同刻兜底：人的话 → 提议 / 操作台 / 失败 → 值班长的话）。
+      rank: 2,
+      view: {
+        key: `m${id}`,
+        kind: 'fm',
+        // 还没收到第一个增量时不摆空白：给一句"对面在动"的实情，光标说明还在流。
+        // 值守账上的对面是**值守轮**（票 04）：没有人的那句话可接，占位句说的「正在跑」
+        // ——`turn_in_flight` 在这本账上的全部用途就是这一句（票面原话）。
+        content: live.reply || (watchLedger ? '值守正在跑…' : '值班长正在查台账…'),
+        at: line.row.created_at,
+        streaming: stream.streaming,
+        partial: !stream.streaming && live.reply.length > 0,
+        steps: keyed(live.steps, `m${id}`),
+        briefing: null,
+        needsPairing: false,
+        proposal: null,
+        ask: null,
+        askAnswered: false,
+        // 逐行读那一行自己的字段（决策 363④）：两条并行时一条是值守轮、一条是人的轮，
+        // 名牌要分得开——不许两条都顶着「值班长」。
+        proactive: line.row.proactive === true,
+        attribution: null,
+        interruptedAt: null,
+      },
+    });
+  }
   stamped.sort((a, b) => (a.view.at === b.view.at ? a.rank - b.rank : a.view.at < b.view.at ? -1 : 1));
   const out: TurnView[] = stamped.map((s) => s.view);
   // 乐观轮去重（票 02 of talk-live-identity）：POST 在途时返回的快照里**已经有 user 行了**
@@ -497,29 +576,27 @@ export function buildTurns(input: TalkTurnsInput): TurnView[] {
       interruptedAt: null,
     });
   }
-  // 在途半截行**不再单独成轮**（票 02 of talk-live-identity）：它要么已拼进 live 轮
-  // （`mergeLive`），要么仍按落地式渲染在台账位置（死轮收口前）——后一种情形**不另摆
-  // 占位句那一轮**（旧判据「有在途行时只看尾巴」的原口径）。没有在途行时条件与从前逐字一致。
+  // 在途半截行**不再单独成轮**（票 02 of talk-live-identity）：它要么已逐行拼进在飞轮
+  // （上面 `mergedLines` 那一段），要么仍按落地式渲染在台账位置（死轮收口前）——后一种
+  // 情形**不另摆占位句那一轮**（旧判据「有在途行时只看尾巴」的原口径）。**手上没有在途行**
+  // 时（快照还没读到半截行，或本机刚发出去）才走下面这一路，条件与从前逐字一致。
   // 两条路的渲染键都由 {@link liveTurnKey} 给：拼进去那一路是行 id，本机发送那一路在
   // 首条带 `ledger_id` 的事件到达后同样是行 id——收口后台账那一行**同键接管**。
-  const showLive =
-    mergeLive || (base == null && (sending || following || tailSteps.length > 0));
-  if (showLive) {
+  const showLocalLive =
+    primaryBase == null && (sending || following || looseTail.length > 0);
+  if (showLocalLive) {
     // 键在首条带 `ledger_id` 的事件到达时就从 `live` 换成 `m<ledger_id>`，此后不变
     // （决策 354③）——折叠态因此天然跟着走，没有搬运这一步。
-    const key = liveTurnKey(base, stream.events);
+    const key = liveTurnKey(stream.events);
     // **那一行已经落地摆出来了**（键相同 ⇒ 台账里那条行在 `out` 里）时在飞轮整条退场：
     // 两条都是同一轮、同一个渲染键——keyed each 里同键出现两次是坏形状，而人也会看见
-    // 这一轮说两遍。这**不是** `mergeLive` 那条路（那条路上半截行被摘出去了，`out` 里没有
+    // 这一轮说两遍。这**不是**拼接那一路（那条路上半截行被摘出去了，`out` 里没有
     // 它），而是它收口之后、store 倒空现场之前那一拍：`sendTurn` 里「重读落地 → settleTurn」
     // 之间、以及重启恢复把悬挂行标成 `interrupted` 之后，都会走到这里。此刻台账那一行是
     // 权威（带着完整回话与段序），在飞轮只是上一个时态的残影——判据与 `syncFollowing`
     // 那条「尾巴是上一轮的残渣，台账那一行会把它接住」同一条纪律，只是判在渲染上、早一拍。
     if (!out.some((t) => t.key === key)) {
-      const live =
-        mergeLive && baseRow != null
-          ? mergeInFlightSteps(baseRow, tailSteps.map(stepFromLive), stream.streaming)
-          : liveStepsFrom(tailSteps, stream.streaming);
+      const live = liveStepsFrom(looseTail, stream.streaming);
       out.push({
         key,
         kind: 'fm',

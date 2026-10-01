@@ -4026,6 +4026,92 @@ async fn session_totals_sum_the_persisted_columns() {
     assert_eq!(calls, 2);
 }
 
+/// 在途行**不计入**会话合计（决策 363③）：页头「本次会话 N tok」不许一轮进行中途跟着涨。
+///
+/// 四条读数各对一件事实：在途行不计（收口前）、收口写回同一行后计入（权威值）、
+/// 没跑起来的那一轮中途刷的读数不残留、丢弃之后也不残留——「口径不动」恢复成
+/// 「只算已收口的正常行」。
+#[tokio::test]
+async fn session_totals_ignore_in_flight_rows() {
+    let h = Harness::empty().await;
+    let sid = h.session().await;
+    h.store
+        .append_foreman_user_message(&sid, "一")
+        .await
+        .unwrap();
+
+    // 一轮开工：在途半截行中途刷写成「已经花掉」的读数——页头不许动。
+    let row = h.store.begin_foreman_inflight(&sid, None).await.unwrap();
+    h.store
+        .update_foreman_inflight(
+            row,
+            &InFlightPatch {
+                content: "正在说".into(),
+                thinking: None,
+                segments_json: None,
+                traces_json: None,
+                prompt_tokens: 100,
+                completion_tokens: 20,
+                seq: 3,
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(h.store.foreman_session_totals(&sid).await.unwrap(), (0, 0));
+
+    // 收口：同一行写成完整行（`status` → NULL），权威读数这时才计入。
+    h.store
+        .close_foreman_inflight(
+            row,
+            NewForemanMessage {
+                session_id: sid.clone(),
+                role: "assistant".into(),
+                content: "说完了".into(),
+                prompt_tokens: 100,
+                completion_tokens: 20,
+                briefing_json: None,
+                traces_json: None,
+                segments_json: None,
+                thinking: None,
+                ask_json: None,
+            },
+            3,
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        h.store.foreman_session_totals(&sid).await.unwrap(),
+        (120, 1)
+    );
+
+    // 新的一轮开工后没跑起来：它在途时的读数不进合计，丢弃之后也不残留。
+    let orphan = h.store.begin_foreman_inflight(&sid, None).await.unwrap();
+    h.store
+        .update_foreman_inflight(
+            orphan,
+            &InFlightPatch {
+                content: "半句".into(),
+                thinking: None,
+                segments_json: None,
+                traces_json: None,
+                prompt_tokens: 500,
+                completion_tokens: 500,
+                seq: 1,
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        h.store.foreman_session_totals(&sid).await.unwrap(),
+        (120, 1)
+    );
+    h.store.discard_foreman_inflight(orphan).await.unwrap();
+    assert_eq!(
+        h.store.foreman_session_totals(&sid).await.unwrap(),
+        (120, 1)
+    );
+}
+
 /// 保留期**只摘消息表**（票 04，显式修订决策 182④「对讲台与全仓同一把保留期尺」与
 /// 决策 204⑦「归档不保护消息」——豁免之后，归档与否、超龄与否都不再删对话消息）。
 ///
