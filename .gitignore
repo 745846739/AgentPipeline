@@ -30,3 +30,5 @@ crates/desktop/gen/schemas/
 # 本机工具产物，与本项目无关：cargo-sweep 的时间戳文件、ZCode 客户端的会话目录
 sweep.timestamp
 .zcode/
+
+__pycache__/

@@ -17,7 +17,7 @@ If the concept you need isn't in the glossary yet, that's a signal: either you'r
 
 ## Flag decision conflicts
 
-If your output contradicts an entry in `docs/decisions.md`, surface it explicitly rather than silently overriding (决策编号只增不改，被修订时在行内标注)：
+If your output contradicts an entry in `docs/decisions.md`, surface it explicitly rather than silently overriding (决策编号只增不改，被修订时在条目内标注)：
 
 > _Contradicts 决策 85 (gate 失败跳回 test.execute)，但值得重开，因为…_
 
