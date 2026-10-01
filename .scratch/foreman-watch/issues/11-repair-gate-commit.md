@@ -30,7 +30,7 @@ cargo / pytest / npm 映射好；本仓的 lint 是 `cargo clippy --all-targets 
 
 **Blocked by:** 10
 
-**Status:** partial（闸门与交付全在；差**「当场生效」那一路**，理由见文末）
+**Status:** partial（授权两裁决已落（决策 358，2026-10-01）：余「当场生效」实现归票 13）
 
 - [x] 修复完成的前置条件是闸门通过；未通过 → 播报失败原因（lint 还是 test、哪个用例），**不出 diff**
 - [x] 闸门命令与读数落库（复用 `kanban_node_commands` 的 system 源与 `gate-output-{stage}.log` 同款
@@ -106,3 +106,7 @@ worktree）。
 
 在这两条裁清之前，目标项目的修复走的是「等合入」那一条（合进默认分支 + 人按）——
 它不比当场生效差，只是多一次按键。
+
+## Comments
+
+- **2026-10-01**：收口节里的两个未决点已由用户裁决、随决策 358 落定（自动 resume = 托管第三成员吃既有止损；存量半成品先清后落、复用决策 125 原语）。最后一格的实现开在[票 13](13-live-effect.md)。

@@ -8,7 +8,7 @@ ledgerEpoch effect 的「首屏为 0 才跳过」假设一并修正（epoch 只�
 
 **Blocked by:** None
 
-**Status:** ready-for-agent
+**Status:** done（已实现，决策 313）
 
 - [x] `reload()` 两个 await 之后各一道身份比对，过期回包整包丢弃（不写 session、
       不 watch、不改 URL、不 syncFollowing）

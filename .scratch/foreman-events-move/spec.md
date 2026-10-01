@@ -1,6 +1,6 @@
 # 事件发射搬家（foreman-events-move）
 
-**Status:** ready-for-agent
+**Status:** done（决策 352，票 01 已落地）
 
 > **来源**：2026-09-30 架构体检 ⑥ 号卡。决策落 `docs/decisions.md` 352（显式修订决策 249 的宿主名）。
 > 全盘点最便宜的一张卡：纯文件搬家、半天量级，适合当热身。

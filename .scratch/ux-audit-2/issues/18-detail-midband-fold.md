@@ -15,7 +15,7 @@ heroScrollW 812 恒定 vs heroClientW 390(w=768) / 102(w=480)
 
 **Blocked by:** 07（阈值与档位由它定，实现照抄，不再另定）
 
-**Status:** open
+**Status:** wontfix（2026-10-01 用户裁决收掉：详情页中间档折行不再做；如真实使用在 480–819px 再疼，按决策 215 的断点表另立票）
 
 - [ ] `.detail.split` 改成 `≥1100px: minmax(0,1fr) 320px` / `820–1099px: minmax(0,1fr) 280px`
       / `<820px: 单列`（`display:block`，左栏下限 `minmax(480px,1fr)`）

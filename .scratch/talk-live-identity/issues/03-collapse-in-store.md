@@ -8,7 +8,7 @@
 
 **Blocked by:** 02（键稳定依赖半截行与尾巴拼成一条轮）
 
-**Status:** ready-for-agent
+**Status:** done（已实现，决策 315）
 
 - [x] 三表进 `stores/talk.svelte.ts`，读写 API 与组件里现有 `toggle*` 一一对应
 - [x] 键随轮稳定：台账轮锚定行 id，在飞 live 轮用稳定序；收口（live→台账）**接力不丢态**

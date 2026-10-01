@@ -1,6 +1,6 @@
 # Spec: prompt cache 前缀稳定性（值班长注入位置 + Anthropic 断点）
 
-Status: ready-for-agent
+**Status:** done（决策 299 已落地）
 
 来源：2026-09-27 对「本项目是否有破坏 LLM 缓存的逻辑」的全面排查（两条 provider 适配路径、值班长与流水线两条组装链、决策 249/269/279/289/291 与 docs/agents.md「LLM Cache 策略」逐项核对）。
 

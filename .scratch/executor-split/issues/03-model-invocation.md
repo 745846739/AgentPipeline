@@ -7,7 +7,7 @@
 
 **Blocked by:** 01, 02
 
-**Status: ready-for-agent**
+**Status:** done（已实现，决策 249：五片同批落地并过闸门）
 
 ## 一、搬什么
 

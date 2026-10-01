@@ -1,6 +1,6 @@
 # v2 技能运行时与技能市场（agentpipeline-v2-skills）
 
-**Status:** ready-for-agent
+**Status:** done（票 01–03 全部落地）
 
 > 来源：2026-09-14 用户诉求「给架构设计阶段配置一个 grill-me 和 to-spec 的 skill」经决策 170
 > 落地后，暴露真实目标不是「配两个技能」，而是「把 Agent Skills 生态（ZCode / Claude Code

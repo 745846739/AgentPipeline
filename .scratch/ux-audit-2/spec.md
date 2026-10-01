@@ -1,6 +1,6 @@
 # 界面在「一切正常」之外的第二副面孔
 
-**Status:** ready-for-agent
+**Status:** done（批内 22 张票全部收口：18 张 done、票 19 superseded（被 talk-mobile-space 票 07 吸收）、票 18/21/22 经用户裁决于 2026-10-01 以 wontfix 关闭）
 
 **Slug:** `ux-audit-2`
 

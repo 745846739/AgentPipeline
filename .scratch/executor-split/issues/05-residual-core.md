@@ -6,7 +6,7 @@
 
 **Blocked by:** 01, 02, 03, 04
 
-**Status: ready-for-agent**
+**Status:** done（已实现，决策 249：五片同批落地并过闸门）
 
 ## 一、清点（决策 249 蓝图 vs 终态）
 

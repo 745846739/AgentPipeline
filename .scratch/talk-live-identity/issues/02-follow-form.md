@@ -7,7 +7,7 @@
 
 **Blocked by:** None
 
-**Status:** ready-for-agent
+**Status:** done（已实现，决策 314）
 
 - [x] `syncFollowing` 立锚那两支（刷新接上 / 落地后又起一轮）把 `stream.streaming` 置真；
       收口路径（settled / lost）照旧熄灭

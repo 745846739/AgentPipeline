@@ -6,7 +6,7 @@
 
 **Blocked by:** 01（ledger_id 要有行才存在）
 
-**Status:** ready-for-agent
+**Status:** done（已实现，决策 312，票 01–07 同批落地）
 
 - [x] 在途相关 SSE 事件带 `ledger_id`（所属台账行）与 `seq`（行内位置序号）
 - [x] 前端拼接判据是纯函数：`seq <= 快照 seq0` 的增量丢弃、`> seq0` 的接受、不带 seq 的

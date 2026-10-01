@@ -6,7 +6,7 @@
 
 **Blocked by:** None (can start immediately)
 
-**Status:** ready-for-agent
+**Status:** done（已实现，决策 312，票 01–07 同批落地）
 
 - [x] 会话消息读接口保留「最近 500 条」缺省语义，新增 `before_id` 游标：按行 id
       返回更早的一段，段内升序

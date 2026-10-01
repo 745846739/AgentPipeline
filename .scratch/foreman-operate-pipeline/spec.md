@@ -1,6 +1,6 @@
 # 对讲台内置操作流水线的出厂技能（foreman-operate-pipeline）
 
-**Status:** ready-for-agent
+**Status:** done（决策 261，票 01–04 已落地）
 
 > 来源：用户诉求「为对讲台内置一个操作 AgentPipeline 的 skill」，经 grilling 13 轮拷问
 > （Q1–Q13）逐项裁决定形，全部事实由三轮代码库勘察钉住（对讲台本体 / 技能系统与流水线

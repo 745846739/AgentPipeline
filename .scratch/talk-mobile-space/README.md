@@ -1,6 +1,6 @@
 # 对讲台的空间预算重排
 
-**Status:** ready-for-agent
+**Status:** done（票 01–07 全部落地；票 07 吸收 ux-audit-2 票 19）
 
 **Slug:** `talk-mobile-space`
 

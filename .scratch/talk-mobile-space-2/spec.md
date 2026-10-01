@@ -1,6 +1,6 @@
 # 对讲台手机端对话区二次扩容（壳层让位 + 坞瘦身）
 
-**Status:** ready-for-agent
+**Status:** done（票 01–04 全部落地）
 
 **Slug:** `talk-mobile-space-2`
 

@@ -1,6 +1,6 @@
 # PWA 浏览器推送通知（pwa-webpush）
 
-**Status:** ready-for-agent
+**Status:** done（票 01–04 全部收口；HTTPS 入口最终走决策 335 的应用内 TLS + 决策 336 全站配对闸门，原 Caddy 方案随决策 335 撤除）
 
 > **来源**：2026-09-29 用户经 grilling 十余问拷问定形——「新增 PWA 的 APNs 通知」。
 > 两轮勘察钉住事实（PWA 无 service worker；106 裸 IP + http 无证书；通知出口单漏斗

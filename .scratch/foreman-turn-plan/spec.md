@@ -1,6 +1,6 @@
 # 值班长 TurnPlan：组装裁定抽成纯计算（foreman-turn-plan）
 
-**Status:** ready-for-agent
+**Status:** done（决策 355/356，票 01–02 已收口）
 
 > **来源**：2026-09-30 架构体检 ⑦ 号卡 + 拷问定案。决策落 `docs/decisions.md` 356。
 > **依赖 foreman-split（决策 351）**：拆目录后有 foreman/ 才有自然的切分线。

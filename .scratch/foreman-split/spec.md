@@ -1,6 +1,6 @@
 # 值班长 foreman.rs 拆目录（foreman-split）
 
-**Status:** ready-for-agent
+**Status:** done（决策 351，票 01 已落地）
 
 > **来源**：2026-09-30 架构体检 ① 号卡 + 拷问定案。决策落 `docs/decisions.md` 351。
 > 全盘点首刀：最热文件（300 提交内改 46 次、4148 行）的最便宜深化——纯文件搬家，行为零变化。

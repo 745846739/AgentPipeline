@@ -1,6 +1,6 @@
 # UX 审计后的界面可读性与信息架构整备
 
-**Status:** ready-for-agent
+**Status:** done（27 张票全部落地）
 
 **Slug:** `ux-audit`
 

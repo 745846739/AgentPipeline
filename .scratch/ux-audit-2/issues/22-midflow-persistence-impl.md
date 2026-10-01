@@ -11,7 +11,7 @@
 
 **Blocked by:** 16（哪一项去哪儿、谁写地址、刷新与后退的语义由它定，实现照抄）
 
-**Status:** open
+**Status:** wontfix（余三件——详情页 ?tab= / 看板 ?filter= / 输入草稿 talk_draft——经 2026-10-01 复核后由用户裁决收掉；已落地的 router 底座与班次两件（决策 217①⑤）照旧，复核记录见文末）
 
 - [ ] 路由层支持读取 query（现只有 `?task=` / `?project=&analyze=1` 两个就地读取的点）：
       统一一个 `readQuery()` / `writeQuery(patch, {replace})` 口子，避免四页各写一遍
@@ -30,3 +30,7 @@
 
 **边界.** 地址里只允许决策 217 列的短枚举参数（连同既有 `task=` / `project=` / `analyze=`）；
 参数总数 ≥5 或出现自由文本时停下来重新裁决，不自行扩张。不新增「清空本地状态」界面。
+
+## Comments
+
+- **2026-10-01 复核**：本票不是全开。已落地：router 底座（pushState/replaceState 语义，`frontend/src/router.svelte.ts`，注释即按决策 217 写的）与对讲台班次两件（`lib/talkSessions.ts`：`?session=` 进地址 + `agentpipeline.talk_session` 兜底、`agentpipeline.talk_seen` 看过时刻表——决策 217①⑤）。仍未落地三件：① 详情页签 `?tab=`（`tab` 仍是 `TaskDetail.svelte` 组件局部 `$state`）；② 看板过滤 `?filter=` + localStorage 兜底（`Board.svelte` 只有 `board.filter` 本地态）；③ 对讲台输入草稿 `agentpipeline.talk_draft`（`qdraft` 仍是局部态、发送后无清零键）。Status 相应 open → partial。

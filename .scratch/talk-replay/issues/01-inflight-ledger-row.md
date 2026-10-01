@@ -7,7 +7,7 @@ thinking、工具步骤、逐字正文随广播节流写进库里，「这一轮
 
 **Blocked by:** None (can start immediately)
 
-**Status:** ready-for-agent
+**Status:** done（已实现，决策 312，票 01–07 同批落地）
 
 - [x] 对话进行中调 `GET /foreman/session`，messages 含 assistant 半截行（在飞时至少两行），
       且其内容随轮推进增长（节流批写，不是逐字一写）

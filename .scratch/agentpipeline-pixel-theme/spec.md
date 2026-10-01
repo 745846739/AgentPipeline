@@ -1,6 +1,6 @@
 # 前端像素主题替换（agentpipeline-pixel-theme）
 
-**Status:** ready-for-agent
+**Status:** done（票 01–09 全部落地）
 
 > 来源：2026-09-13 用户诉求「把本项目前端替换成像素主题」。素材已在仓库中：
 > 规格 [design/theme-6-pixel.md](../../design/theme-6-pixel.md)（提案）与四份原型

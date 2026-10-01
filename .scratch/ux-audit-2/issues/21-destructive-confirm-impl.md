@@ -11,7 +11,7 @@
 
 **Blocked by:** 14（判据、形态、文案、键盘行为由它定，实现照抄）
 
-**Status:** open
+**Status:** wontfix（2026-10-01 用户裁决收掉：不可逆动作的确认步与三档量级不做；决策 216 保留为「怎么定」的记录）
 
 - [ ] 加一条**纯函数**认档判据（建议落 `lib/actions.ts`，可单测）：
       `actionTier(action)` = `advance` / `gate-skip` / `destructive` / `quiet`，

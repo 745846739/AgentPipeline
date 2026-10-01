@@ -6,7 +6,7 @@
 
 **Blocked by:** None (can start immediately)
 
-**Status:** ready-for-agent
+**Status:** done（已实现，决策 312，票 01–07 同批落地）
 
 - [x] 会话列表支持 `include_archived`：缺省仍只列未归档（现状不变），开启后含归档
 - [x] chip 行「显示已归档」开关；归档班次渲染为灰 chip，与活跃班次一眼可辨

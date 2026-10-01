@@ -7,7 +7,7 @@
 **Blocked by:** 01（⑤ 的编排要经 01 的 interface 拼请求、经本片的 interface 记账——
 先立两翼再合中路；且 01 是叶子，顺序已定 ①→③）。
 
-**Status: ready-for-agent**
+**Status:** done（已实现，决策 249：五片同批落地并过闸门）
 
 ## 一、搬什么
 

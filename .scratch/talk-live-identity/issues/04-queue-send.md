@@ -8,7 +8,7 @@
 
 **Blocked by:** 01（收口判据复用身份统一的守卫语义）
 
-**Status:** ready-for-agent
+**Status:** done（已实现，决策 316）
 
 - [x] `stores/talk.svelte.ts` 增发送队列：多条有序、push / 编辑 / 撤回三个动作，住 store
 - [x] 输入坞解锁：`disabled={sending}` 改为只在配对缺失等真阻塞时锁；发送守卫放行在飞

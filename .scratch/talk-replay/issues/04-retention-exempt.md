@@ -5,7 +5,7 @@
 
 **Blocked by:** None (can start immediately)
 
-**Status:** ready-for-agent
+**Status:** done（已实现，决策 312，票 01–07 同批落地）
 
 - [x] 保留期维护作业不再删除对话消息（只摘这一张表，其余三张表与 worktree 回收照旧吃
       同一 cutoff）

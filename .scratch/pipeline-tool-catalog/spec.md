@@ -1,6 +1,6 @@
 # 管线工具规格表（pipeline-tool-catalog）
 
-**Status:** ready-for-agent
+**Status:** done（决策 353，票 01 已收口）
 
 > **来源**：2026-09-30 架构体检 ③ 号卡 + 拷问定案。决策落 `docs/decisions.md` 353。
 > 值班长 `ForemanToolSpec`（全仓最好的深模块）的模式推广到管线 8 个内置工具。

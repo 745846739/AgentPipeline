@@ -1,6 +1,6 @@
 # AgentPipeline 前端 UI/UX 审计（第二轮 · 深度）
 
-**Status:** ready-for-agent
+**Status:** done（批内 22 张票全部收口：18 张 done、票 19 superseded、票 18/21/22 于 2026-10-01 以 wontfix 关闭）
 
 **日期:** 2026-09-18　**被测:** `target/debug/agent-pipeline` @ `dc72141`（内嵌 `frontend/dist/assets/index-B-YuEhTB.js`，13:38 构建）
 **复现:** `bash scripts/e2e-artifacts.sh && cd frontend && UX_AUDIT2=1 npx playwright test --project=chromium e2e/ux-audit-2.spec.ts`

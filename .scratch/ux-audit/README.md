@@ -1,6 +1,6 @@
 # AgentPipeline 前端 UI/UX 审计（2026-09-16）
 
-**Status:** ready-for-agent
+**Status:** done（27 张票全部落地）
 
 **规格:** [spec.md](spec.md)（本 effort 的规格）
 

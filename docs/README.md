@@ -15,7 +15,7 @@ Kanban 式流水线驱动的本地多 agent 开发管线：init → architect-de
 | [implementation.md](implementation.md) | 流水线拓扑（落点表与条件边）、executor、KanbanScheduler、数据库表、进程中断恢复、关键接口 | §11 | 写实现代码 |
 | [operations.md](operations.md) | worktree 隔离、成本、取消、可观测性、人机协作、依赖、通知、锁、上下文管理、**工具层出口控制与残余风险**、**配对令牌与局域网态势**、**106 的 HTTPS 入口（mkcert + Caddy）**等 17 项横切设计 | §12 | 处理横切关注点 |
 | [testing.md](testing.md) | 测试设计（t1 新增，决策 140–152）：风险优先级、可测试性接缝、FakeAgent/testkit 基建、单元/集成/API/E2E 用例目录、质量闸门与决策↔测试映射 | — | 写实现代码前定接缝、写测试时查用例 |
-| [decisions.md](decisions.md) | 已确认设计决策 #1–#357（只追加，修订关系显式标注） | §13 | 查"为什么这样定" |
+| [decisions.md](decisions.md) | 已确认设计决策 #1–#358（只追加，修订关系显式标注） | §13 | 查"为什么这样定" |
 | [glossary.md](glossary.md) | 领域术语表 | 附录 A | 遇到不认识的术语 |
 | [backlog-v2.md](backlog-v2.md) | v2 预留（MCP 等；对话 agent 已由决策 262⑤ 认定实现、离线通知已由 262① 提前）+ §B.8 界面整备的待改进项（隐喻词表落地缺口、依赖任务 ID 完整选择器、共享基元缺失等） | 附录 B | 规划 v2 |
 

@@ -8,7 +8,7 @@
 
 **Blocked by:** None（可与 01 并行，改的都是模板插值行）
 
-**Status:** ready-for-agent
+**Status:** done（已实现，决策 317）
 
 - [x] 提议轮 / 提问轮 / 急停轮 / `PendingDossier` 的四处插值改 `MarkdownView`
 - [ ] 视觉回归核对：`MarkdownView` 的 80ch 宽度与段距在提议轮的紧凑版式里不破格

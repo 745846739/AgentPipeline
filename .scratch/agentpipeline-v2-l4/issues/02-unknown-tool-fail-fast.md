@@ -7,7 +7,7 @@
 
 **Blocked by:** None (can start immediately)
 
-**Status:** ready-for-agent
+**Status:** superseded（重复票：同一工作由 02-unknown-tool-name-fail-fast.md 承担，2026-09-17 已收口）
 
 **背景：** `executor.rs:3072-3075` 对任何不在 `BUILTIN_TOOLS` 中的名字打 warn 后 `continue`。
 决策 154 收口后，`spawn_sub_agent` 不再是一个特例——本票处理的是通用姿态。姿态理由与

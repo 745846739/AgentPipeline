@@ -1,6 +1,6 @@
 # 实时流断线自愈:锁屏解锁、网络闪断都要自己接回来
 
-**Status:** ready-for-agent
+**Status:** done（票 01–04 全部落地）
 
 **Slug:** `stream-self-heal`
 

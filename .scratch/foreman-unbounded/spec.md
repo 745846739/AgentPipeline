@@ -1,6 +1,6 @@
 # 对讲台不再有自造的上限；值守轮另起一条时间线
 
-**Status:** ready-for-agent
+**Status:** done（票 10 随决策 295 落地；票 11 按决策 296 以 wontfix 收掉）
 
 **Slug:** `foreman-unbounded`
 

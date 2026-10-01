@@ -1,6 +1,6 @@
 # 对讲台瘦身：台账进 store + 折叠态搬运机退场（talk-store-ledger）
 
-**Status:** ready-for-agent
+**Status:** done（决策 354①–④，票 01–04 已收口）
 
 > **来源**：2026-09-30 架构体检 ②+④ 号卡 + 拷问定案。决策落 `docs/decisions.md` 354。
 > 「判据在 lib/*、组件只接线」的纪律真执行了——本批处理的是纪律跑完剩下的：

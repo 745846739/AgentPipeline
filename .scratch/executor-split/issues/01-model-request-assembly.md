@@ -7,7 +7,7 @@
 **Blocked by:** 无（本批第一片）。**实现前置**：决策 248（候选 3，工作树上 `graph.rs`
 删除等）收口提交后，从干净 HEAD 起实现——决策 249 的 Q6 裁定。
 
-**Status: ready-for-agent**
+**Status:** done（已实现，决策 249：五片同批落地并过闸门）
 
 ## 一、搬什么（行段以 4223 行的 `executor.rs` 计）
 

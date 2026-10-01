@@ -1,6 +1,6 @@
 # 打断策略原语上提（interrupt-policy）
 
-**Status:** ready-for-agent
+**Status:** done（决策 355/356，票 01 已收口）
 
 > **来源**：2026-09-30 架构体检 ⑤ 号卡 + 拷问定案。决策落 `docs/decisions.md` 355。
 > 领域词条「打断策略（interrupt policy）」已补进 `docs/glossary.md`。
