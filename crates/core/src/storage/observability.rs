@@ -54,7 +54,26 @@ pub struct RunOutcome {
     pub duration_ms: u64,
     pub error: Option<String>,
     pub process_group_id: Option<i32>,
+    /// 中止来路（票 02①，只在 `status = cancelled` 时有值）。
+    ///
+    /// 取值见 [`CANCEL_ORIGIN_TIMEOUT`] / [`CANCEL_ORIGIN_HOLD`] / [`CANCEL_ORIGIN_RESTART`]。
+    /// `None` = 不是中止行（或这一行来自迁移之前的历史）。
+    pub cancel_origin: Option<&'static str>,
 }
+
+// ── `cancel_origin` 的取值（票 02①）──
+//
+// 一枚列、三个取值，写入方与判据方**同源**：写入在 `RunOutcome`，判据在
+// [`Store::trailing_timeout_streak`]。它存在的理由是「人按停」与「被判超时顺手中止」
+// **必须分得开**——前者是人对该节点的新一轮介入（超时梯子清零），后者是超时自己造出来的
+// 副产品（梯子跳过、不清零）。按报文字样分流是决策 259 明确不要走的路。
+
+/// 调度器判超时后中止的执行体（`pipeline::executor::CancelOrigin::Timeout`）。
+pub const CANCEL_ORIGIN_TIMEOUT: &str = "timeout";
+/// 人按停：手动暂停 / 重跑本阶段（`pipeline::executor::CancelOrigin::Hold`）。
+pub const CANCEL_ORIGIN_HOLD: &str = "hold";
+/// 启动恢复收尾的遗留 run：进程退出时它还在跑，**不是**节点超时（票 02②）。
+pub const CANCEL_ORIGIN_RESTART: &str = "restart";
 
 #[derive(Debug, FromRow)]
 struct RunRow {
@@ -219,7 +238,8 @@ impl Store {
              SET status = COALESCE(?, status), prompt_tokens = ?, completion_tokens = ?,
                  cache_read_tokens = ?, cache_write_tokens = ?, duration_ms = ?, error = ?,
                  process_group_id = COALESCE(?, process_group_id), finished_at = ?,
-                 last_activity_at = ?
+                 last_activity_at = ?,
+                 cancel_origin = COALESCE(?, cancel_origin)
              WHERE id = ?",
         )
         .bind(outcome.status.map(|s| s.as_str()))
@@ -232,6 +252,7 @@ impl Store {
         .bind(outcome.process_group_id)
         .bind(ts(now))
         .bind(ts(now))
+        .bind(outcome.cancel_origin)
         .bind(run_id)
         .execute(self.pool())
         .await?;
@@ -408,6 +429,48 @@ impl Store {
         Ok(ids)
     }
 
+    /// 启动时一次性收掉**中断的任务级 run**（票 02②）。
+    ///
+    /// 与 [`Self::abandon_stale_project_runs`] 是同一件事的两半，判据互补：那条管
+    /// `task_id IS NULL` 的项目级 run，这条管**属于任务**的遗留 run。此前任务自己的遗留
+    /// `running` run 没人收——`requeue_running_tasks` 只翻任务行，`abandon_stale_project_runs`
+    /// 显式限定 `task_id IS NULL`——于是它们要等 idle 超时（默认 5 分钟）被判死，
+    /// `duration_ms` 记成「从起跑到判死」（决策 226 **照实记**），读起来像「跑了这么久才
+    /// 超时」，实为尸检；每判死一条又制造一个中止行，把超时梯子的计数搅乱（2026-09-30
+    /// 服务被干净重启 13 次，每次都留下这么一批）。
+    ///
+    /// **状态用 `cancelled` 而不是 `timeout`**：它们的语义是「进程退出时还在跑」，不是节点
+    /// 超时。冒充超时会让梯子把它数成一次真超时；记 [`CANCEL_ORIGIN_RESTART`] 则让它**跳过**
+    /// （见 [`Self::trailing_timeout_streak`]）——一次重启既不是节点恢复的证据，也不是人介入。
+    ///
+    /// **时长照实记**（决策 226③ 的同一姿态）：从 `started_at` 到此刻，0 会把「跑了 40 分钟
+    /// 被重启打断」读成「刚起来就没了」。
+    pub async fn abandon_stale_task_runs(&self) -> Result<Vec<i64>> {
+        let now = self.now();
+        let stale: Vec<NodeRun> = self
+            .active_runs()
+            .await?
+            .into_iter()
+            .filter(|r| r.task_id.is_some())
+            .collect();
+        let mut ids = Vec::with_capacity(stale.len());
+        for run in &stale {
+            self.finish_run(
+                run.id,
+                &RunOutcome {
+                    status: Some(NodeStatus::Cancelled),
+                    duration_ms: (now - run.started_at).num_milliseconds().max(0) as u64,
+                    error: Some("进程重启：这一轮在上一进程退出时还在跑，标终态（票 02②）".into()),
+                    cancel_origin: Some(CANCEL_ORIGIN_RESTART),
+                    ..Default::default()
+                },
+            )
+            .await?;
+            ids.push(run.id);
+        }
+        Ok(ids)
+    }
+
     pub async fn list_runs_at(
         &self,
         task_id: &str,
@@ -454,21 +517,25 @@ impl Store {
     /// 该节点**从最新一条 run 往回连续是 timeout** 的条数（决策 320）。
     ///
     /// 超时自动续接的计数口：连续超时 1–2 次续接上一轮转录、第 3 次降级空白重跑、
-    /// 第 4 次起挂起交回人工。口径三处要注意：
+    /// 第 4 次起挂起交回人工。口径四处要注意：
     /// - 只数**节点自身**的 run（`NODE_OWNING_AGENT_TYPES_SQL`，与
     ///   [`Self::count_node_owning_runs`] 同一白名单）——子代理 / 伪阶段的 run
     ///   复用父节点的 stage/node，混进来会把一次超时数成三次；
     /// - 从最新往回走、撞到第一条**非 timeout** 终态就停：任何一次非超时的收场
     ///   （成功 / 失败 / 人按停）都把连续计数清零，人对该节点的新一轮介入重新起算；
-    /// - `running` 也算撞墙（还没收场的 run 不属于任何一段连续超时）。
+    /// - `running` 也算撞墙（还没收场的 run 不属于任何一段连续超时）；
+    /// - **中止行分两档**（票 02①）：`cancel_origin = 'hold'`（人按停）是**真介入**，
+    ///   照旧清零；`'timeout'`（判超时顺手中止的那一轮）与 `'restart'`（启动收尾的遗留 run）
+    ///   都不是「这个节点这次没超时」的证据，**跳过不清零**。缺了这一条，判超时自己造出来的
+    ///   中止行会把刚记上的超时清零——2026-09-30 那条链上梯子连续 7 次停在第一档，就是这么来的。
     pub async fn trailing_timeout_streak(
         &self,
         task_id: &str,
         stage: Stage,
         node: Node,
     ) -> Result<u32> {
-        let rows: Vec<(String,)> = sqlx::query_as(&format!(
-            "SELECT status FROM kanban_node_runs
+        let rows: Vec<(String, Option<String>)> = sqlx::query_as(&format!(
+            "SELECT status, cancel_origin FROM kanban_node_runs
              WHERE task_id = ? AND stage = ? AND node = ? AND agent_type IN ({})
              ORDER BY id DESC LIMIT 64",
             metrics::NODE_OWNING_AGENT_TYPES_SQL
@@ -479,11 +546,21 @@ impl Store {
         .fetch_all(self.pool())
         .await?;
         let mut streak: u32 = 0;
-        for (status,) in rows {
-            if status != NodeStatus::Timeout.as_str() {
-                break;
+        for (status, cancel_origin) in rows {
+            if status == NodeStatus::Timeout.as_str() {
+                streak += 1;
+                continue;
             }
-            streak += 1;
+            if status == NodeStatus::Cancelled.as_str()
+                && matches!(
+                    cancel_origin.as_deref(),
+                    Some(CANCEL_ORIGIN_TIMEOUT) | Some(CANCEL_ORIGIN_RESTART)
+                )
+            {
+                // 超时自己的副产品 / 重启收尾：既不计数也不清零
+                continue;
+            }
+            break;
         }
         Ok(streak)
     }

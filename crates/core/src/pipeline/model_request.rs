@@ -757,7 +757,17 @@ fn tool_defs(
                 .expect("Skill 的目录行必须存在（agent::catalog 冻结断言钉住）"),
         );
     }
-    let schema_tool: ToolDef = match kind {
+    defs.push(submit_metadata_tool_for(kind));
+    Ok(defs)
+}
+
+/// 每个 agent 节点的 `submit_metadata` 工具定义——schema 由 `schemars` 从元数据类型生成
+/// （决策 38：与校验同源，不会漂移）。
+///
+/// 抽成函数是为了让**模板 ↔ schema 一致性测试**（票 03）复用这**同一张映射**：测试若另写
+/// 一份 `kind → 类型` 的表，就等于把"唯一口径"又拆成两份，漂移只是从模板挪到了测试里。
+pub(crate) fn submit_metadata_tool_for(kind: AgentNodeKind) -> ToolDef {
+    match kind {
         AgentNodeKind::ValidateInput => {
             submit_metadata_tool::<crate::types::ValidateInputMetadata>("提交输入充分性判定")
         }
@@ -782,9 +792,7 @@ fn tool_defs(
         AgentNodeKind::TestExecute => {
             submit_metadata_tool::<crate::types::TestResult>("提交测试结果元数据")
         }
-    };
-    defs.push(schema_tool);
-    Ok(defs)
+    }
 }
 
 /// `spawn_sub_agent` 工具的 tool 定义（决策 172③，票 08）。

@@ -1,6 +1,7 @@
 import { fireEvent, render } from '@testing-library/svelte';
-import { describe, expect, it, vi } from 'vitest';
+import { beforeEach, describe, expect, it, vi } from 'vitest';
 import NewTaskDialog from './NewTaskDialog.svelte';
+import { board } from '../../stores/board.svelte';
 
 /**
  * 「依赖任务 ID」的候选（票 05）。
@@ -80,5 +81,30 @@ describe('新建任务 · 依赖任务 ID 的候选项列表（票 05）', () =>
     (document.activeElement as HTMLElement | null)?.blur();
     await fireEvent.keyDown(window, { key: 'Escape' });
     expect(onclose).toHaveBeenCalledTimes(1);
+  });
+});
+
+/**
+ * 描述必填（票 05①）：与后端 `POST /tasks` 同一关——空描述的任务会让 architect 靠翻仓库
+ * 猜范围。前端先拦一道，用户不必撞到 400 才知道。
+ */
+describe('新建任务 · 描述必填（票 05①）', () => {
+  beforeEach(() => vi.clearAllMocks());
+
+  it('描述为空时不提交，错落在描述那一格；填上就放行', async () => {
+    const { container } = render(NewTaskDialog, { props: { open: true, onclose: () => {} } });
+    const title = container.querySelector<HTMLInputElement>('input:not([list])');
+    const description = container.querySelector<HTMLTextAreaElement>('textarea');
+    if (!title || !description) throw new Error('新建任务对话框少了标题或描述控件');
+
+    await fireEvent.input(title, { target: { value: '有标题' } });
+    await fireEvent.submit(container.querySelector('form')!);
+    expect(board.createTask).not.toHaveBeenCalled();
+    expect(container.querySelector('#new-task-error')?.textContent).toContain('描述');
+    expect(description.getAttribute('aria-invalid')).toBe('true');
+
+    await fireEvent.input(description, { target: { value: '要实现的东西' } });
+    await fireEvent.submit(container.querySelector('form')!);
+    expect(board.createTask).toHaveBeenCalledTimes(1);
   });
 });

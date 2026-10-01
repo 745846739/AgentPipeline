@@ -184,7 +184,7 @@ async fn binary_starts_serves_and_exits_gracefully_on_sigint() {
         port,
         "/tasks",
         Some(&format!(
-            r#"{{"project_id":"{project_id}","title":"冒烟任务"}}"#
+            r#"{{"project_id":"{project_id}","title":"冒烟任务","description":"冒烟：跑通主流程"}}"#
         )),
     )
     .unwrap();

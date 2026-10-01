@@ -182,6 +182,14 @@ pub struct AgentResponse {
     /// 卡在流上；两者都往前走，说明它只是慢。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_byte_at: Option<chrono::DateTime<chrono::Utc>>,
+    /// 上游给的收尾原因（OpenAI `finish_reason` / Anthropic `stop_reason`；票 01③）。
+    ///
+    /// **要它是因为它分得开两种「流结束了」**：`stop` / `tool_calls` 是模型说完了，
+    /// `length` 是上游把输出切断了——后者正是 2026-09-30 那条链上 `submit_metadata`
+    /// 参数只剩半截的原因（`.scratch/silent-degradation/spec.md` 缺陷 1）。
+    /// `None` = 流里没给（上游只发终止标记，或流本身被掐断）。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub finish_reason: Option<String>,
 }
 
 /// 工具定义（`submit_metadata` 的 parameters 由各阶段 serde 结构体派生，决策 38）。

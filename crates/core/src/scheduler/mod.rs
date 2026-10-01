@@ -37,6 +37,11 @@ pub type ResumeFn = Arc<dyn Fn(&str) + Send + Sync>;
 pub struct TickReport {
     /// 判定超时并处理的 run id。
     pub timed_out_runs: Vec<i64>,
+    /// 判定超时但**只收终态**的陈旧 run id（票 02①）。
+    ///
+    /// 这些行的尸检结论（`timeout`）照记，但它们不是「当前这一轮」——同一个游标上已经有
+    /// 更新的一轮在跑。不碰执行权、不推动游标、不算梯子。
+    pub stale_timeout_runs: Vec<i64>,
     /// 因超时被置 pending 的游标 id。
     pub timeout_pending_cursors: Vec<String>,
     /// 冲突恢复后放行的任务 id。
@@ -201,7 +206,22 @@ impl KanbanScheduler {
             None
         };
 
-        for run in self.store.active_runs().await? {
+        // 在飞的 run 取一次：判「谁才是当前这一轮」要拿同一份快照比对（票 02①），
+        // 逐个重查会让同一次 tick 里的两次读数来自不同时刻。
+        let active = self.store.active_runs().await?;
+        // 每个**游标**上最新的那一条在飞 run——游标就是「节点某一轮」的身份（重试沿用同一个
+        // cursor_id），故同一个游标上 id 更大的一定是更新的那一轮。
+        let mut newest_per_cursor: std::collections::HashMap<String, i64> =
+            std::collections::HashMap::new();
+        for r in &active {
+            if let Some(cid) = r.cursor_id.as_deref() {
+                let entry = newest_per_cursor.entry(cid.to_string()).or_insert(r.id);
+                if r.id > *entry {
+                    *entry = r.id;
+                }
+            }
+        }
+        for run in active {
             // 项目级伪阶段 run（票 10）无任务 / 游标，不属于节点超时语义，跳过
             // （其生命周期由 analyze 端点收尾，不以 executor 超时处置）。
             if run.task_id.is_none() || run.cursor_id.is_none() {
@@ -235,6 +255,42 @@ impl KanbanScheduler {
             }
 
             if is_timed_out(&run, now, idle, max_duration).is_none() {
+                continue;
+            }
+            // 票 02①：**陈旧的 run 只收终态**。一个游标上已经有更新的一轮在跑，说明这一条
+            // 是上一进程（或上一次重启）留下的尸检对象——它的心跳确实停了，结论照记，
+            // 但它**不是当前这一轮**：`request_cancel` 是按任务键发的，掐掉的是那个活着
+            // 的执行体；紧随其后的 `release_ownership` 还会把它的执行权一并摘掉。
+            // 2026-09-30 那条链上 attempt 2 比 attempt 1 的判死**早 10 秒起跑**，正是这样
+            // 被掐死的（run 105 落一条 cancelled，再把刚记上的超时清零——梯子因此从未升档）。
+            let is_current = run
+                .cursor_id
+                .as_deref()
+                .and_then(|cid| newest_per_cursor.get(cid))
+                .is_some_and(|newest| *newest == run.id);
+            if !is_current {
+                report.stale_timeout_runs.push(run.id);
+                tracing::warn!(
+                    task = ?run.task_id,
+                    run = run.id,
+                    stage = %run.stage,
+                    node = %run.node,
+                    "陈旧 run 判超时：只收终态，不碰当前在跑的那一轮"
+                );
+                self.store
+                    .finish_run(
+                        run.id,
+                        &crate::storage::observability::RunOutcome {
+                            status: Some(NodeStatus::Timeout),
+                            duration_ms: elapsed_ms(&run, now),
+                            error: Some(format!(
+                                "陈旧 run：{}（进程退出时留下的这一轮，判超时只收终态，不碰当前在跑的那一轮）",
+                                timeout_detail(&run, "超时")
+                            )),
+                            ..Default::default()
+                        },
+                    )
+                    .await?;
                 continue;
             }
             report.timed_out_runs.push(run.id);

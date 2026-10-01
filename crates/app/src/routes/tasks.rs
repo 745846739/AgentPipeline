@@ -59,6 +59,18 @@ pub async fn create(
     State(state): State<AppState>,
     Json(body): Json<CreateTaskBody>,
 ) -> ApiResult<impl IntoResponse> {
+    // 入口拒绝空白标题 / 描述（票 05①）。描述为空的任务，下游 architect-design 只能靠翻
+    // 仓库猜范围——2026-10-01 事故现场：`description = ''` 且 `user-input.md` 只有「同意」，
+    // 结果是 60 分钟、89 次只读调用、一个字没写。挡在入口，比在 60 分钟后拦下便宜得多。
+    if body.title.trim().is_empty() {
+        return Err(ApiError::bad_request("任务标题必填：不能为空或纯空白"));
+    }
+    if body.description.trim().is_empty() {
+        return Err(ApiError::bad_request(
+            "任务描述必填：不能为空或纯空白（下游 agent 靠它判断要实现什么）",
+        ));
+    }
+
     if state
         .store
         .get_project(&body.project_id)
@@ -580,6 +592,12 @@ pub async fn split(
     }
     let mut created = Vec::new();
     for spec in body.tasks {
+        // 重提路径与 `POST /tasks` 同一关（票 05①）：拆分出来的子任务同样是任务，同样不许空描述
+        if spec.title.trim().is_empty() || spec.description.trim().is_empty() {
+            return Err(ApiError::bad_request(
+                "拆分子任务的标题与描述都必填：不能为空或纯空白",
+            ));
+        }
         let new_id = ulid::Ulid::new().to_string();
         if state
             .store

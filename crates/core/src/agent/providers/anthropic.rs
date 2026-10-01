@@ -188,8 +188,17 @@ impl Adapter for Anthropic {
             }
             "message_delta" => {
                 let usage = value.get("usage").cloned().unwrap_or_default();
+                let mut chunks = Vec::new();
+                // 收尾原因（票 01③）：`max_tokens` 与 OpenAI 的 `length` 同义——输出被上限切断。
+                if let Some(reason) = value
+                    .get("delta")
+                    .and_then(|d| d.get("stop_reason"))
+                    .and_then(|v| v.as_str())
+                {
+                    chunks.push(StreamChunk::FinishReason(reason.to_string()));
+                }
                 // 新版协议会在 message_delta 补 cache 计量；present 才覆盖
-                vec![StreamChunk::Usage {
+                chunks.push(StreamChunk::Usage {
                     prompt_tokens: None,
                     completion_tokens: usage
                         .get("output_tokens")
@@ -203,7 +212,8 @@ impl Adapter for Anthropic {
                         .get("cache_creation_input_tokens")
                         .and_then(|v| v.as_u64())
                         .map(|v| v as u32),
-                }]
+                });
+                chunks
             }
             "message_stop" => vec![StreamChunk::Done],
             _ => Vec::new(),
@@ -477,16 +487,19 @@ mod tests {
             .unwrap();
         assert!(matches!(text.as_slice(), [StreamChunk::Text(t)] if t == "正在分析"));
 
-        // message_delta（output tokens）+ message_stop
+        // message_delta（收尾原因 + output tokens）+ message_stop
         let out = Anthropic
             .parse_chunk(r#"{"type":"message_delta","delta":{"stop_reason":"tool_use"},"usage":{"output_tokens":42}}"#)
             .unwrap();
         assert!(matches!(
             out.as_slice(),
-            [StreamChunk::Usage {
-                completion_tokens: Some(42),
-                ..
-            }]
+            [
+                StreamChunk::FinishReason(r),
+                StreamChunk::Usage {
+                    completion_tokens: Some(42),
+                    ..
+                }
+            ] if r == "tool_use"
         ));
         // 新版协议在 message_delta 补 cache 计量
         let out_cached = Anthropic

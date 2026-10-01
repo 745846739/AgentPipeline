@@ -1940,8 +1940,110 @@ async fn agent_metadata_failure_retries_then_pends() {
     }
 }
 
-// ─────────────────── 失败路径的会话落库（决策 211① / 票 01）───────────────────
+// ─────────────────── 工具参数被截断（票 01②）───────────────────
 
+/// 上游把 `submit_metadata` 的参数腰斩 → 诊断必须说「被截断」，不许说「缺字段」；
+/// 回灌给模型的错误 turn 也要换成「精简正文」的说法。
+///
+/// 为什么这条值得一个端到端用例：那句误导性的 `missing field` 会把模型引向
+/// 「换个字段名再发一次」，而它真正该做的是把正文缩短——2026-09-30 那条链上
+/// `validate_output` 连挂三次就是这么来的（`.scratch/silent-degradation/spec.md` 缺陷 1）。
+#[tokio::test]
+async fn truncated_submit_metadata_arguments_are_diagnosed_as_truncation() {
+    let settings = Settings {
+        agent_retry_max: 2,
+        ..Default::default()
+    };
+    let ctx = setup("true", settings).await;
+    let mut script = Script::new();
+    script
+        .for_node(Stage::ArchitectDesign, Node::ValidateInput)
+        .submit(&ValidateInputMetadata {
+            readiness: true,
+            blockers: vec![],
+        });
+    // 现场实测残片（conv 99）：救得回来但**丢掉了必填的 `readiness`**
+    script
+        .for_node(Stage::ArchitectDesign, Node::Execute)
+        .submit_metadata_raw(r#"{"blockers": [], "feedback": "#);
+    ctx.agent.set_script(script);
+
+    testkit::seed_task(&ctx.store, "trunc", "p1").await.unwrap();
+    admit(&ctx, "trunc").await;
+    ctx.executor.run("trunc").await.unwrap();
+
+    let runs = ctx
+        .store
+        .list_runs_at("trunc", Stage::ArchitectDesign, Node::Execute)
+        .await
+        .unwrap();
+    let first = runs.first().expect("至少一条 run");
+    assert_eq!(first.status, NodeStatus::Failed);
+    let err = first.error.as_deref().unwrap_or("");
+    assert!(
+        err.contains("工具参数被截断"),
+        "截断型失败要说「被截断」：{err}"
+    );
+    assert!(
+        !err.contains("missing field"),
+        "截断的假象不许当成诊断（它会把模型引向改字段名）：{err}"
+    );
+
+    // 下一轮的第一条请求末尾是错误 turn：文案换成「精简正文」而不是「换个字段发」
+    let requests = ctx.agent.request_log();
+    let last_request = requests
+        .iter()
+        .rfind(|r| r.stage == Stage::ArchitectDesign && r.node == Node::Execute)
+        .expect("重试也发过请求");
+    let turn = last_request
+        .messages
+        .last()
+        .and_then(|m| m.content.as_deref())
+        .unwrap_or("");
+    assert!(
+        turn.contains("上游截断") && turn.contains("精简"),
+        "错误 turn 要给出「精简正文」的可行指引：{turn}"
+    );
+}
+
+/// 另一半：救援成功且**必填齐全** → 判成功（`{"readiness": true}` 够 architect.execute）。
+/// 残片仍是残片，标记由工具层那行 warn 留下——这里钉的是「别把可救的当成失败」。
+#[tokio::test]
+async fn a_rescued_truncation_with_all_required_fields_still_succeeds() {
+    let ctx = setup("true", Settings::default()).await;
+    let mut script = Script::new();
+    script
+        .for_node(Stage::ArchitectDesign, Node::ValidateInput)
+        .submit(&ValidateInputMetadata {
+            readiness: true,
+            blockers: vec![],
+        });
+    // conv 88 形态：`readiness` 是 architect.execute 唯一的必填，救回它就够了
+    script
+        .for_node(Stage::ArchitectDesign, Node::Execute)
+        .submit_metadata_raw(r#"{"readiness": true, "test_scenarios_path": "#);
+    ctx.agent.set_script(script);
+
+    testkit::seed_task(&ctx.store, "rescued", "p1")
+        .await
+        .unwrap();
+    admit(&ctx, "rescued").await;
+    ctx.executor.run("rescued").await.unwrap();
+
+    let runs = ctx
+        .store
+        .list_runs_at("rescued", Stage::ArchitectDesign, Node::Execute)
+        .await
+        .unwrap();
+    assert_eq!(
+        runs.first().map(|r| r.status),
+        Some(NodeStatus::Success),
+        "必填齐全的救援结果算成功：{:?}",
+        runs.first().and_then(|r| r.error.clone())
+    );
+}
+
+// ─────────────────── 失败路径的会话落库（决策 211① / 票 01）───────────────────
 #[tokio::test]
 async fn llm_failure_writes_a_conversation_row_with_the_reason() {
     // 可归因的适配器失败：这一轮以前什么都不留，连「为什么没跑起来」都查不到
@@ -4877,6 +4979,91 @@ async fn info_insufficient_pending_message_carries_blockers_summary() {
     );
 }
 
+/// 票 05②：答复 `info_insufficient` 时，落盘的 `user-input.md` 要把**问题 + 推荐答案**
+/// 和**用户答复**放在一起，下游才看得见「同意」同意的是什么。
+///
+/// 现场正是这两样各走各的：文件里只有孤零零一个「同意」（问题清单只活在 pending 消息
+/// 和会话转录里），architect-design 于是在 60 分钟里翻了 89 次仓库猜范围。问了两个问题
+/// （症状 / 验收）是照事故的问答形状取的。
+#[tokio::test]
+async fn an_info_insufficient_answer_is_recorded_together_with_its_questions() {
+    let ctx = setup("true", Settings::default()).await;
+    let mut script = Script::new();
+    script
+        .for_node(Stage::ArchitectDesign, Node::ValidateInput)
+        .submit(&ValidateInputMetadata {
+            readiness: false,
+            blockers: vec![
+                "闪屏出现在哪个页面？推荐：三次登录页".into(),
+                "验收标准按什么算？推荐：首屏 1 秒内无白屏".into(),
+            ],
+        });
+    ctx.agent.set_script(script);
+    testkit::seed_task(&ctx.store, "cont-qa", "p1")
+        .await
+        .unwrap();
+    admit(&ctx, "cont-qa").await;
+    ctx.executor.run("cont-qa").await.unwrap();
+
+    let cursor = ctx
+        .store
+        .load_live_cursors("cont-qa")
+        .await
+        .unwrap()
+        .into_iter()
+        .next()
+        .unwrap();
+    // 用户答复就是事故现场的原话
+    agentpipeline_core::pipeline::resume::apply_action(
+        &ctx.store,
+        &cursor,
+        ResumeAction::Continue,
+        None,
+        Some("同意"),
+    )
+    .await
+    .unwrap();
+
+    let recorded =
+        std::fs::read_to_string(ctx._home.home().task_file("cont-qa", "user-input.md")).unwrap();
+    for expected in [
+        "闪屏出现在哪个页面",
+        "推荐：三次登录页",
+        "验收标准按什么算",
+        "推荐：首屏 1 秒内无白屏",
+        "## 用户答复",
+        "同意",
+    ] {
+        assert!(recorded.contains(expected), "缺 `{expected}`：\n{recorded}");
+    }
+
+    // 三样都要能进下游 prompt：让重入的 validate_input 通过，读 architect-design.execute
+    // 那条请求的 user prompt（重入段渲染在那里，决策 79）。
+    let mut rerun = Script::new();
+    rerun
+        .for_node(Stage::ArchitectDesign, Node::ValidateInput)
+        .submit(&ValidateInputMetadata {
+            readiness: true,
+            blockers: vec![],
+        });
+    ctx.agent.set_script(rerun);
+    let _ = ctx.executor.run("cont-qa").await;
+
+    let execute = ctx
+        .agent
+        .request_log()
+        .into_iter()
+        .find(|r| r.stage == Stage::ArchitectDesign && r.node == Node::Execute)
+        .expect("重入后应走到 architect-design.execute");
+    for expected in ["闪屏出现在哪个页面", "推荐：三次登录页", "同意"] {
+        assert!(
+            execute.user_prompt.contains(expected),
+            "execute 的 user prompt 缺 `{expected}`：\n{}",
+            execute.user_prompt
+        );
+    }
+}
+
 /// 判定表说 **false** 的原因：重入同一节点，起点仍是空的（决策 205）。
 ///
 /// 现场用 `context_overflow` 转「更换长上下文模型」：它是表里 false 的一档
@@ -6150,5 +6337,172 @@ async fn timeout_retry_ladder_continues_twice_then_blank_then_pending() {
             .count(),
         4,
         "止损之后不得再自动起 run（init 的 system run 不算）：{runs:?}"
+    );
+}
+
+// ─────────────────────────── 票 04：sync-check fail-closed ───────────────────────────
+
+/// 设计阶段的最小脚本：三处 execute 的元数据由调用方以**原始参数串**给出。
+///
+/// 走 `submit_metadata_raw` 而不是类型化 `submit`，是因为本票要造的是**键不在**的形状
+/// （`{"readiness": true}`）——类型化序列化永远会把 `acceptance_criteria: []` 发出去，
+/// 表达不了"被掏空"；而现场（`kanban_stage_outputs.metadata_json`）正是缺键的那个样子。
+fn design_scripts_with_raw_execute(script: &mut Script, arch_execute: &str, test_execute: &str) {
+    for (stage, node) in [
+        (Stage::ArchitectDesign, Node::ValidateInput),
+        (Stage::DevelopDesign, Node::ValidateInput),
+        (Stage::TestDesign, Node::ValidateInput),
+    ] {
+        script.for_node(stage, node).submit(&ValidateInputMetadata {
+            readiness: true,
+            blockers: vec![],
+        });
+    }
+    for (stage, node) in [
+        (Stage::ArchitectDesign, Node::ValidateOutput),
+        (Stage::DevelopDesign, Node::ValidateOutput),
+        (Stage::TestDesign, Node::ValidateOutput),
+    ] {
+        script
+            .for_node(stage, node)
+            .submit(&ValidateOutputMetadata {
+                passed: true,
+                ..Default::default()
+            });
+    }
+    script
+        .for_node(Stage::ArchitectDesign, Node::Execute)
+        .write_file("design.md", "# 设计\n")
+        .submit_metadata_raw(arch_execute);
+    // develop-design 的字段闸门不消费，与事故同形即可
+    script
+        .for_node(Stage::DevelopDesign, Node::Execute)
+        .write_file("dev-plan.md", "# 开发计划\n")
+        .submit_metadata_raw(r#"{"readiness": true}"#);
+    script
+        .for_node(Stage::TestDesign, Node::Execute)
+        .write_file("test-scenarios.md", "# 测试场景\n")
+        .submit_metadata_raw(test_execute);
+}
+
+/// 2026-10-01 事故的等价 fixture：设计元数据被掏空到 `{"readiness": true}`，闸门必须拦下。
+///
+/// 现场那一轮 `sync-check` 判的是 `Proceed`——`test_scenarios` / `acceptance_criteria`
+/// 两个键不在，引用完整性校验（决策 136）整段进不去，而 `readiness` 又恰好都在，
+/// 于是残缺被当成合法。真库副本在 106 上（本地没有这条任务），这里用等价 fixture；
+/// 判据本身是纯函数（`sync_metadata_gaps`），fixture 与现场差在数据来源、不在形状。
+#[tokio::test]
+async fn degraded_stage_metadata_blocks_the_sync_gate() {
+    let ctx = setup("true", Settings::default()).await;
+    let mut script = Script::new();
+    design_scripts_with_raw_execute(
+        &mut script,
+        r#"{"readiness": true}"#,
+        r#"{"readiness": true}"#,
+    );
+    ctx.agent.set_script(script);
+
+    testkit::seed_task(&ctx.store, "t-gap", "p1").await.unwrap();
+    admit(&ctx, "t-gap").await;
+
+    // 回溯后脚本耗尽、流水线会停住——本用例只关心闸门那一刻，不要求这一趟跑成功
+    let _ = ctx.executor.run("t-gap").await;
+
+    let decision = ctx
+        .store
+        .stage_output_metadata("t-gap", Stage::SyncCheck, "sync_decision")
+        .await
+        .unwrap()
+        .expect("闸门应当落了 sync-decision");
+    assert_eq!(decision["decision"], "backtrack", "{decision}");
+    let gaps: Vec<String> = decision["metadata_gaps"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|g| g.as_str().map(String::from))
+        .collect();
+    assert!(
+        gaps.iter().any(|g| g.contains("acceptance_criteria")),
+        "缺项要点名 acceptance_criteria：{gaps:?}"
+    );
+    assert!(
+        gaps.iter().any(|g| g.contains("test_scenarios")),
+        "缺项要点名 test_scenarios：{gaps:?}"
+    );
+
+    // 缺项随 backtrack-feedback.md 一起回到设计阶段（决策 126 的同一通道）
+    let feedback =
+        std::fs::read_to_string(ctx._home.home().task_file("t-gap", "backtrack-feedback.md"))
+            .unwrap();
+    assert!(feedback.contains("元数据缺项"), "{feedback}");
+    assert!(feedback.contains("test_scenarios"), "{feedback}");
+}
+
+/// 元数据齐全、但 high 场景的 `design_refs` 指向不存在的 AC → 照旧拦下（决策 136 不回归）。
+///
+/// 这条钉的是本票的**反面**：fail-closed 只添一道"键在不在"的判定，
+/// 不许把既有的引用完整性校验挤掉、也不许因为加了缺项判据就漏判悬空引用。
+#[tokio::test]
+async fn intact_metadata_with_a_dangling_ref_still_blocks() {
+    let ctx = setup("true", Settings::default()).await;
+    let arch = serde_json::to_string(&ArchitectExecuteMetadata {
+        readiness: true,
+        acceptance_criteria: vec![AcceptanceCriterion {
+            id: "AC-1".into(),
+            description: "能登录".into(),
+        }],
+        ..Default::default()
+    })
+    .unwrap();
+    // high 场景引用 AC-9：AC-1 是唯一存在的验收标准
+    let test = serde_json::to_string(&TestDesignMetadata {
+        readiness: true,
+        test_scenarios: vec![TestScenario {
+            id: "S-1".into(),
+            name: "登录成功".into(),
+            description: "登录".into(),
+            preconditions: vec![],
+            steps: vec![],
+            expected_result: "成功".into(),
+            priority: agentpipeline_core::types::ScenarioPriority::High,
+            design_refs: vec!["AC-9".into()],
+        }],
+        ..Default::default()
+    })
+    .unwrap();
+
+    let mut script = Script::new();
+    design_scripts_with_raw_execute(&mut script, &arch, &test);
+    ctx.agent.set_script(script);
+
+    testkit::seed_task(&ctx.store, "t-ref", "p1").await.unwrap();
+    admit(&ctx, "t-ref").await;
+    let _ = ctx.executor.run("t-ref").await;
+
+    let decision = ctx
+        .store
+        .stage_output_metadata("t-ref", Stage::SyncCheck, "sync_decision")
+        .await
+        .unwrap()
+        .expect("闸门应当落了 sync-decision");
+    assert_eq!(decision["decision"], "backtrack", "{decision}");
+    // 空清单会被 `skip_serializing_if` 省掉——键不在与空数组都算「没有缺项」
+    assert!(
+        decision["metadata_gaps"]
+            .as_array()
+            .is_none_or(|gaps| gaps.is_empty()),
+        "元数据齐全，缺项清单必须为空：{decision}"
+    );
+    let blockers: Vec<&str> = decision["test_blockers"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|b| b.as_str())
+        .collect();
+    assert!(
+        blockers
+            .iter()
+            .any(|b| b.contains("悬空") || b.contains("缺失")),
+        "悬空引用要走 test_blockers：{blockers:?}"
     );
 }

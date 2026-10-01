@@ -388,6 +388,206 @@ async fn timeout_kills_process_group_and_retries_per_ladder() {
     assert_eq!(h.sse.count_of(SseEventType::Pending), 1);
 }
 
+// ─────────────────── 票 02①：梯子的计数口径与陈旧 run ───────────────────
+
+/// 该节点尾部连续超时的轮数（梯子的计数口）。
+async fn streak(h: &Harness, task_id: &str, cursor_id: &str) -> u32 {
+    let cursor = h.store.get_cursor(cursor_id).await.unwrap();
+    h.store
+        .trailing_timeout_streak(task_id, cursor.stage, cursor.node)
+        .await
+        .unwrap()
+}
+
+/// 造一条「被中止」的 run：来路由调用方指定。
+async fn cancelled_run(
+    h: &Harness,
+    task_id: &str,
+    cursor_id: &str,
+    attempt: u32,
+    origin: &'static str,
+) {
+    let run = h.running_run(task_id, cursor_id, attempt, 5, 5, None).await;
+    h.store
+        .finish_run(
+            run,
+            &RunOutcome {
+                status: Some(NodeStatus::Cancelled),
+                error: Some(format!("{task_id} 的这一轮已按中止请求收口")),
+                cancel_origin: Some(origin),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+}
+
+/// 判超时**自己造出来的**中止行不许把梯子清零（票 02①）。
+///
+/// 现场形状（2026-09-30）：陈旧 run 的尸检判了超时 → 按任务键中止**活着的那一轮** →
+/// 那一轮落一条 `cancelled`，而它 id 更大，尾部连续超时就此归零——梯子连续 7 次停在
+/// 第一档，`BlankRestart` 与 `Pending` 两档从未到达。
+#[tokio::test]
+async fn the_ladder_still_climbs_across_a_timeout_originated_cancel() {
+    let h = Harness::new().await;
+    h.seed_task("t-skip").await;
+    h.mark_running("t-skip").await;
+    let cursor = h.store.load_live_cursors("t-skip").await.unwrap()[0].clone();
+    h.advance_to_develop(&cursor.cursor_id).await;
+
+    // 第 1 次真超时 → 续接
+    h.running_run("t-skip", &cursor.cursor_id, 1, 400, 400, None)
+        .await;
+    h.scheduler(Settings::default()).tick().await.unwrap();
+    assert_eq!(streak(&h, "t-skip", &cursor.cursor_id).await, 1);
+
+    // 判超时顺手掐掉的那一轮：中止行，来路 = 节点超时
+    cancelled_run(
+        &h,
+        "t-skip",
+        &cursor.cursor_id,
+        2,
+        agentpipeline_core::storage::observability::CANCEL_ORIGIN_TIMEOUT,
+    )
+    .await;
+    assert_eq!(
+        streak(&h, "t-skip", &cursor.cursor_id).await,
+        1,
+        "超时自己造出来的中止行既不计数也不清零"
+    );
+
+    // 第 2、3、4 次：梯子必须接着往上爬（旧口径被那条 cancelled 清零，永远停在 1）
+    for round in 3..=5u32 {
+        h.running_run("t-skip", &cursor.cursor_id, round, 400, 400, None)
+            .await;
+        let report = h.scheduler(Settings::default()).tick().await.unwrap();
+        assert_eq!(report.timed_out_runs.len(), 1, "第 {round} 轮应判超时");
+        let expected = round - 1;
+        assert_eq!(
+            streak(&h, "t-skip", &cursor.cursor_id).await,
+            expected,
+            "第 {round} 轮之后应数到连续 {expected} 次"
+        );
+        if expected < 4 {
+            assert!(
+                report.timeout_pending_cursors.is_empty(),
+                "连续第 {expected} 次不该挂起"
+            );
+        }
+    }
+    // 第 4 档真的到了（旧口径下这一档永远到不了）
+    assert_eq!(
+        h.store.get_cursor(&cursor.cursor_id).await.unwrap().status,
+        CursorStatus::Pending,
+        "连续第 4 次超时要挂起交回人工"
+    );
+    assert_eq!(
+        h.store
+            .get_cursor(&cursor.cursor_id)
+            .await
+            .unwrap()
+            .pending_reason
+            .as_ref()
+            .unwrap()
+            .kind,
+        PendingKind::Timeout
+    );
+}
+
+/// **人按停**照旧清零（票 02①）：那条语义不许被顺手改掉——人是对该节点的新一轮介入，
+/// 梯子重新起算。
+#[tokio::test]
+async fn a_human_cancel_still_resets_the_ladder() {
+    let h = Harness::new().await;
+    h.seed_task("t-hold").await;
+    h.mark_running("t-hold").await;
+    let cursor = h.store.load_live_cursors("t-hold").await.unwrap()[0].clone();
+    h.advance_to_develop(&cursor.cursor_id).await;
+
+    h.running_run("t-hold", &cursor.cursor_id, 1, 400, 400, None)
+        .await;
+    h.scheduler(Settings::default()).tick().await.unwrap();
+    assert_eq!(streak(&h, "t-hold", &cursor.cursor_id).await, 1);
+
+    cancelled_run(
+        &h,
+        "t-hold",
+        &cursor.cursor_id,
+        2,
+        agentpipeline_core::storage::observability::CANCEL_ORIGIN_HOLD,
+    )
+    .await;
+
+    // 再超时一次：从人的介入之后重新起算 → 1
+    h.running_run("t-hold", &cursor.cursor_id, 3, 400, 400, None)
+        .await;
+    h.scheduler(Settings::default()).tick().await.unwrap();
+    assert_eq!(
+        streak(&h, "t-hold", &cursor.cursor_id).await,
+        1,
+        "人按停是真介入，梯子清零重算"
+    );
+    assert_eq!(h.resumes.load(Ordering::SeqCst), 2, "第一档仍是自动续接");
+}
+
+/// **陈旧的 run**（同一个游标上已经有更新的一轮在跑）判超时**只收终态**：
+/// 不掐当前在跑的那一轮、不摘执行权、不拉起新 attempt（票 02①）。
+///
+/// 这是 2026-09-30 那条链的直接形状：attempt 2 比 attempt 1 的判死**早 10 秒起跑**，
+/// 而调度器对陈旧的 attempt 1 判超时后按任务键中止，把活的 attempt 2 掐死了。
+#[tokio::test]
+async fn a_stale_timeout_only_closes_the_row_and_leaves_the_live_attempt_alone() {
+    let h = Harness::new().await;
+    h.seed_task("t-stale").await;
+    h.mark_running("t-stale").await;
+    let cursor = h.store.load_live_cursors("t-stale").await.unwrap()[0].clone();
+    h.advance_to_develop(&cursor.cursor_id).await;
+    // 抢占执行器：陈旧 run 的处置若不越权，这一格就得原样留着
+    assert!(h
+        .store
+        .try_claim_executor("t-stale", "owner-live")
+        .await
+        .unwrap());
+
+    let stale = h
+        .running_run("t-stale", &cursor.cursor_id, 1, 400, 400, None)
+        .await;
+    let live = h
+        .running_run("t-stale", &cursor.cursor_id, 2, 1, 0, None)
+        .await;
+
+    let report = h.scheduler(Settings::default()).tick().await.unwrap();
+    assert_eq!(
+        report.timed_out_runs,
+        Vec::<i64>::new(),
+        "陈旧的那条不走处置路径"
+    );
+    assert_eq!(report.stale_timeout_runs, vec![stale]);
+
+    assert_eq!(
+        h.store.get_run(stale).await.unwrap().unwrap().status,
+        NodeStatus::Timeout,
+        "尸检结论照记"
+    );
+    assert_eq!(
+        h.store.get_run(live).await.unwrap().unwrap().status,
+        NodeStatus::Running,
+        "当前在跑的那一轮一个字都不许动"
+    );
+    assert_eq!(h.resumes.load(Ordering::SeqCst), 0, "不许拉起新 attempt");
+    assert_eq!(h.killer.killed_groups(), Vec::<i32>::new());
+    assert_eq!(
+        h.store
+            .get_task("t-stale")
+            .await
+            .unwrap()
+            .executor_owner
+            .as_deref(),
+        Some("owner-live"),
+        "不许摘掉当前执行体的执行权"
+    );
+}
+
 /// 纯代码节点也走满三段梯子（决策 320）：没有转录可续，前两档退化为空白重跑、
 /// 不置续接标记，第 4 次才挂起——**不是第一次超时就交回人工**。
 ///
@@ -1797,6 +1997,46 @@ async fn a_restart_leaves_no_running_project_run() {
         .unwrap()
         .iter()
         .all(|r| r.status == NodeStatus::Timeout));
+}
+
+/// 重启后不存在 running 的**任务级** run（票 02②）：与项目级那条是同一件事的两半。
+///
+/// 此前任务自己的遗留 run 谁都不管（归队只翻任务行，`abandon_stale_project_runs` 限定
+/// `task_id IS NULL`），它们要等 idle 超时（默认 300s）被判死——`duration_ms` 记成
+/// 「从起跑到判死」，读起来像「跑了这么久才超时」，而每判死一条又制造一个中止行，
+/// 把超时梯子的计数搅乱（2026-09-30 的 13 次重启每次都留一批）。
+#[tokio::test]
+async fn a_restart_closes_leftover_task_runs_without_impersonating_a_timeout() {
+    let h = Harness::new().await;
+    h.seed_task("t-boot").await;
+    h.mark_running("t-boot").await;
+    let cursor = h.store.load_live_cursors("t-boot").await.unwrap()[0].clone();
+    let run_id = h
+        .running_run("t-boot", &cursor.cursor_id, 1, 40, 40, None)
+        .await;
+
+    let readings = agentpipeline_core::pipeline::foreman_actions::run_recovery_sequence(&h.store)
+        .await
+        .unwrap();
+    assert_eq!(readings.abandoned_task_runs, vec![run_id]);
+    assert!(
+        readings.requeued.contains(&"t-boot".to_string()),
+        "同一次恢复也把任务归队：{:?}",
+        readings.requeued
+    );
+
+    let run = h.store.get_run(run_id).await.unwrap().unwrap();
+    assert_eq!(run.status, NodeStatus::Cancelled, "不是节点超时，别冒充");
+    let error = run.error.as_deref().unwrap_or("");
+    assert!(error.contains("进程重启"), "文案要如实写：{error}");
+    assert!(!error.contains("超时"), "不许冒充节点超时：{error}");
+    assert_eq!(
+        run.duration_ms, 40_000,
+        "时长照实记（决策 226）：从起跑到重启，不是 0"
+    );
+
+    // 它不进超时梯子的计数（来路是 restart 而非 timeout）
+    assert_eq!(streak(&h, "t-boot", &cursor.cursor_id).await, 0);
 }
 
 // ───────────────── 待办补两类（决策 234，票 05）─────────────────

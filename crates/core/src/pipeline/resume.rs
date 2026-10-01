@@ -227,12 +227,28 @@ pub async fn apply_action(
             } else if is_info_insufficient {
                 // 决策 79 / 票 08：补充输入不只是流转原因——落任务目录 `user-input.md`，
                 // architect-design 重入时注入 prompt。空输入不落文件（重入 prompt 该段不渲染）。
+                //
+                // 票 05②：落的**不只是用户那两句话**。`info_insufficient` 的 pending 消息里带着
+                // 问题清单 + 推荐答案（决策 277④），一起写进去，下游才看得到「同意」同意的是什么。
+                // 2026-10-01 事故里 `user-input.md` 只有孤零零一个「同意」，architect-design 只能
+                // 靠翻仓库猜范围（60 分钟 / 89 次只读调用 / 一个字没写）。
                 if let Some(input) = input.map(str::trim).filter(|s| !s.is_empty()) {
+                    let questions = cursor
+                        .pending_reason
+                        .as_ref()
+                        .map(|r| r.message.trim())
+                        .filter(|m| !m.is_empty());
+                    let mut body = String::from("# 用户补充输入\n\n");
+                    if let Some(questions) = questions {
+                        body.push_str("## 当时提交的问题（含推荐答案，来自 validate_input）\n\n");
+                        body.push_str(questions);
+                        body.push_str("\n\n");
+                    }
+                    body.push_str("## 用户答复\n\n");
+                    body.push_str(input);
+                    body.push('\n');
                     store.home().ensure_task_dirs(task_id)?;
-                    std::fs::write(
-                        store.home().task_file(task_id, "user-input.md"),
-                        format!("# 用户补充输入\n\n{input}\n"),
-                    )?;
+                    std::fs::write(store.home().task_file(task_id, "user-input.md"), body)?;
                 }
                 advance_one(store, cursor, Landing::Stay, &reason).await?
             } else {

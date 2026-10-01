@@ -17,10 +17,12 @@
   let submitting = $state(false);
   let error = $state<string | null>(null);
   /**
-   * 字段级校验（票 02 / R2-06）：空项目与空标题是两件事，说清是哪一格才有落点
+   * 字段级校验（票 02 / R2-06）：空项目、空标题、空描述是三件事，说清是哪一格才有落点
    * （`aria-invalid` + `aria-describedby` 指得到它）。
    */
-  let fieldError = $state<{ field: 'project' | 'title'; message: string } | null>(null);
+  let fieldError = $state<{ field: 'project' | 'title' | 'description'; message: string } | null>(
+    null
+  );
 
   /**
    * 依赖候选（票 05）：当前项目**已有的任务**，用标题区分。
@@ -50,6 +52,11 @@
     }
     if (!title.trim()) {
       fieldError = { field: 'title', message: '请填写标题。' };
+      return;
+    }
+    // 描述与后端同一关（票 05①）：空描述的任务会让 architect 靠翻仓库猜范围
+    if (!description.trim()) {
+      fieldError = { field: 'description', message: '请填写描述：下游 agent 靠它判断要实现什么。' };
       return;
     }
     submitting = true;
@@ -118,8 +125,15 @@
   </label>
 
   <label class="field">
-    <span>描述</span>
-    <textarea class="input" rows="3" bind:value={description} placeholder="补充上下文…"></textarea>
+    <span>描述（必填）</span>
+    <textarea
+      class="input"
+      rows="3"
+      bind:value={description}
+      placeholder="要实现什么、验收标准是什么…"
+      aria-invalid={fieldError?.field === 'description' ? 'true' : undefined}
+      aria-describedby={fieldError?.field === 'description' ? 'new-task-error' : undefined}
+    ></textarea>
   </label>
 
   <label class="field">

@@ -214,6 +214,109 @@ async fn deepseek_dispatches_to_openai_compatible_path() {
     mock.shutdown().await;
 }
 
+// ─────────────────────────── 流完整性（票 01③） ───────────────────────────
+
+/// 流没有 `[DONE]`、也没有 `finish_reason` 就断掉 → **必须报错**，不许当成正常收尾。
+///
+/// 此前这条路上直接 `break`，半截响应（比如 `submit_metadata` 的参数只到一半）会被
+/// 当成完整响应往下走——2026-09-30 那条链上 33 轮请求全是 `ok`，截断因此隐身。
+#[tokio::test]
+async fn a_stream_that_never_says_done_is_an_error() {
+    let home = TestHome::new().unwrap();
+    let (store, _clock) = home.setup().await.unwrap();
+    // 只有一段正文，既无收尾原因也无 [DONE]，连接就此关闭
+    let mock = MockLlm::start(vec![MockRoute::sse(
+        "/chat/completions",
+        "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"说到一半\"}}]}\n\n",
+    )])
+    .await;
+    store
+        .upsert_provider(&provider("openai", "gpt-x", &mock.url, "p1"))
+        .await
+        .unwrap();
+    let run_id = seed_run(&store, "t1").await;
+
+    let client = ProductionLlm::new(store.clone(), Arc::new(SseRecorder::new()));
+    let err = client
+        .complete(request(run_id, vec![]))
+        .await
+        .expect_err("没有终止标记的流必须报错");
+    assert!(
+        err.to_string().contains("[DONE]") || err.to_string().contains("不完整"),
+        "报错要说清是流不完整：{err}"
+    );
+    mock.shutdown().await;
+}
+
+/// 尾行没有终止换行（`data: [DONE]` 后直接断连是常见形状）→ 仍要读到它，判正常收尾。
+#[tokio::test]
+async fn a_final_line_without_a_trailing_newline_is_still_parsed() {
+    let home = TestHome::new().unwrap();
+    let (store, _clock) = home.setup().await.unwrap();
+    // 注意结尾：没有 `\n\n`——原先残留 buffer 被整个丢掉，`[DONE]` 从未被看见
+    let mock = MockLlm::start(vec![MockRoute::sse(
+        "/chat/completions",
+        "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"完整\"},\"finish_reason\":\"stop\"}]}\n\ndata: [DONE]",
+    )])
+    .await;
+    store
+        .upsert_provider(&provider("openai", "gpt-x", &mock.url, "p1"))
+        .await
+        .unwrap();
+    let run_id = seed_run(&store, "t1").await;
+
+    let client = ProductionLlm::new(store.clone(), Arc::new(SseRecorder::new()));
+    let response = client.complete(request(run_id, vec![])).await.unwrap();
+    assert_eq!(response.content.as_deref(), Some("完整"));
+    assert_eq!(response.finish_reason.as_deref(), Some("stop"));
+    mock.shutdown().await;
+}
+
+/// 参数不是合法 JSON（上游按 `length` 切断输出）→ `complete` 照旧成功返回
+/// （残片还要交给 `rescue_truncated_json` 去救），但**模型请求台账不许记 `ok`**。
+#[tokio::test]
+async fn truncated_tool_arguments_are_recorded_as_not_ok() {
+    use agentpipeline_core::agent::recording::RecordingLlm;
+    use agentpipeline_core::storage::ModelRequestStatus;
+
+    let home = TestHome::new().unwrap();
+    let (store, _clock) = home.setup().await.unwrap();
+    // 现场实测残片（conv 88）：`{"readiness": true, "test_scenarios_path": ` 被腰斩
+    let mock = MockLlm::start(vec![MockRoute::sse(
+        "/chat/completions",
+        "data: {\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"c1\",\"type\":\"function\",\"function\":{\"name\":\"submit_metadata\",\"arguments\":\"{\\\"readiness\\\": true, \\\"test_scenarios_path\\\": \"}}]},\"finish_reason\":\"length\"}]}\n\ndata: [DONE]\n\n",
+    )])
+    .await;
+    store
+        .upsert_provider(&provider("openai", "gpt-x", &mock.url, "p1"))
+        .await
+        .unwrap();
+    let run_id = seed_run(&store, "t1").await;
+
+    let inner = Arc::new(ProductionLlm::new(
+        store.clone(),
+        Arc::new(SseRecorder::new()),
+    ));
+    let client = RecordingLlm::new(inner, store.clone());
+    let response = client
+        .complete(request(run_id, vec![]))
+        .await
+        .expect("残片仍要交回调用方（救援在下一步）");
+    assert_eq!(response.finish_reason.as_deref(), Some("length"));
+    assert!(serde_json::from_str::<serde_json::Value>(&response.tool_calls[0].arguments).is_err());
+
+    let rows = store.model_requests_for_run(run_id, 10).await.unwrap();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(
+        rows[0].status,
+        ModelRequestStatus::Error,
+        "参数被截断的响应不许记成 ok"
+    );
+    let note = rows[0].error.as_deref().unwrap_or_default();
+    assert!(note.contains("length"), "收场说明要带上游收尾原因：{note}");
+    mock.shutdown().await;
+}
+
 // ─────────────────────────── Anthropic 族 ───────────────────────────
 
 const ANTHROPIC_STREAM: &str = r#"event: message_start

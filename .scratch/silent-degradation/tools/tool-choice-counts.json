@@ -1,0 +1,25 @@
+{
+  "measured_at": "2026-10-01T15:28:17.998555+00:00",
+  "model": "xiaomi/mimo-v2.6-flash",
+  "base_url": "https://api.commandcode.ai/provider/v1/",
+  "counts": {
+    "baseline": {
+      "n": 20,
+      "text_form": 0,
+      "native_call_responses": 18,
+      "failed": 0
+    },
+    "auto": {
+      "n": 20,
+      "text_form": 0,
+      "native_call_responses": 19,
+      "failed": 0
+    },
+    "required": {
+      "n": 20,
+      "text_form": 0,
+      "native_call_responses": 16,
+      "failed": 0
+    }
+  }
+}

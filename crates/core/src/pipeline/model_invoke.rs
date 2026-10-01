@@ -46,7 +46,7 @@ use super::events::{
 };
 // 留守核与本片的接线契约（取消信号 / 路由结论 / 项目行收口）——不是事件形状，主人仍是
 // executor（决策 249 的接线；352 只搬事件面）。
-use super::executor::{project_or_err, CancelSignal, NodeOutput};
+use super::executor::{project_or_err, CancelOrigin, CancelSignal, NodeOutput};
 use super::model_request::{
     json_string_list, workdirs_line, AttemptCtx, BudgetCheck, OverflowFacts, Prepared, RequestPlan,
 };
@@ -154,10 +154,18 @@ fn humanize_agent_failure(raw: &str) -> String {
 /// 读「用户补充输入」的正文（决策 279）：`user-input.md` 是决策 79 落盘的留痕
 /// （带 `# 用户补充输入` 标题行），user turn 要的是用户说过的话——剥掉标题行取正文。
 /// 文件不存在 / 正文为空 → `None`（落盘纪律不动，读不到就当没有补充）。
+///
+/// 决策 371（票 05②）之后这份留痕里多了「当时提交的问题」一节，而 user turn 的内容仍必须
+/// **逐字是用户的话**（决策 279 的转录语义与"同文不重放"的去重都依赖这一点）——
+/// 故有 `## 用户答复` 小节时只取它，没有（旧格式文件）就整段当答复。
 fn supplement_input(home: &crate::home::Home, task_id: &str) -> Option<String> {
     let raw = std::fs::read_to_string(home.task_file(task_id, "user-input.md")).ok()?;
     let body = raw.strip_prefix("# 用户补充输入").unwrap_or(&raw).trim();
-    (!body.is_empty()).then(|| body.to_string())
+    let reply = body
+        .split_once("## 用户答复")
+        .map(|(_, reply)| reply.trim())
+        .unwrap_or(body);
+    (!reply.is_empty()).then(|| reply.to_string())
 }
 
 /// 模型调用编排片的依赖面（决策 249 · 票 03）：只拿票面点名的那几个，字段全可廉价克隆
@@ -282,8 +290,16 @@ impl ModelInvoke {
                     // 永远留在 `running` 上：台账里那句「还在跑」是假的，而 `check_timeouts`
                     // 日后还会把它判一次超时，把人的处置覆盖掉。
                     if error.is_cancelled() {
+                        // 来路（票 02①）：这一轮是谁按停的——判超时（超时梯子跳过这条中止行）
+                        // 还是人按停（真介入，梯子清零）。`cancel` 一定在（被中止只可能来自它）。
                         self.ledger()
-                            .finish_cancelled(run_id, started, error.to_string(), &tokens)
+                            .finish_cancelled(
+                                run_id,
+                                started,
+                                error.to_string(),
+                                cancel.map(|s| s.origin()).unwrap_or(CancelOrigin::Timeout),
+                                &tokens,
+                            )
                             .await?;
                         // 用量变了，任务投影就得跟着走（`total_tokens` 是从 run 行**重算**的）
                         self.store.refresh_task_totals(&task.id).await?;
@@ -892,7 +908,7 @@ impl ModelInvoke {
         }
 
         // 元数据抽取（决策 33：解析/校验失败计入节点重试）
-        let value = match submitted {
+        let mut value = match submitted {
             Some(v) => v,
             None => {
                 // 只扫**助手**消息的正文：倒序第一条带 content 的可能是 tool_result
@@ -935,7 +951,46 @@ impl ModelInvoke {
                 })?
             }
         };
-        kind.validate(&value)?;
+        // 票 01：类型化校验失败时，先试**从助手正文的文本形态工具调用**把完整元数据拿回来。
+        //
+        // 为什么需要这一步：`submitted` 可能来自 `rescue_truncated_json` 过的**残值**——
+        // 上游网关会把结构化 `tool_calls` 的 arguments 腰斩（现场实测只剩 29–1136 字符，
+        // 切点正好落在第一个多行参数值处），而模型**同一轮**写进正文的
+        // `<tool_call><function=submit_metadata><parameter=…>` 那份往往是完整的。
+        // 没有这一步，一次截断就会被读成「模型漏了必填字段」，回灌给它、再发一次、再截断
+        // ——2026-09-30 那条链上 validate_output 连挂三次、architect-design.execute
+        // 原地超时七次，就是这个循环（`.scratch/silent-degradation/spec.md` 缺陷 1）。
+        if let Err(err) = kind.validate(&value) {
+            let recovered = trace
+                .messages
+                .iter()
+                .rev()
+                .filter(|m| matches!(m.role, crate::agent::client::Role::Assistant))
+                .filter_map(|m| m.content.as_deref())
+                .find_map(|c| crate::agent::metadata::find_xml_tool_call(c, "submit_metadata"));
+            match recovered {
+                Some(recovered) if kind.validate(&recovered).is_ok() => value = recovered,
+                _ => {
+                    // 报错要如实：参数被腰斩时不许说成「缺字段」——那句话会把模型引向
+                    // "换个字段名再发一次"，而真正该做的是精简正文或先交必填。
+                    let truncated = crate::agent::metadata::has_broken_submit_metadata_arguments(
+                        &trace.messages,
+                    );
+                    if truncated {
+                        tracing::warn!(
+                            task = %task.id,
+                            stage = %cursor.stage,
+                            node = %cursor.node,
+                            error = %err,
+                            "submit_metadata 参数被上游截断：按截断报错，原始 schema 诊断只进日志"
+                        );
+                    }
+                    return Err(crate::agent::metadata::validation_failure_error(
+                        err, truncated,
+                    ));
+                }
+            }
+        }
 
         // decision 134 / 135：agent 型 validate_output 首判不合格 → 同步调用异族复判。
         // 复判合格（与首判分歧）→ 节点内直接 pending(user_decision, judge_disagreement)，
@@ -1914,5 +1969,28 @@ mod tests {
         // 只有标题（空输入不落正文）→ None
         std::fs::write(home.task_file("t1", "user-input.md"), "# 用户补充输入\n\n").unwrap();
         assert_eq!(supplement_input(&home, "t1"), None);
+    }
+
+    /// 决策 371（票 05②）之后留痕里多了「当时提交的问题」一节，**user turn 仍只取答复**。
+    ///
+    /// 这条钉的是决策 279 的转录语义：turn 的内容是"用户说过的话"。若把问题清单一并塞进
+    /// turn，`already_carried` 的同文比对与"首条消息逐字不变"两条都会跟着漂。
+    #[test]
+    fn supplement_input_takes_only_the_reply_when_questions_are_recorded_too() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let home = crate::home::Home::new(tmp.path());
+        std::fs::create_dir_all(home.task_dir("t1")).unwrap();
+        std::fs::write(
+            home.task_file("t1", "user-input.md"),
+            "# 用户补充输入\n\n\
+             ## 当时提交的问题（含推荐答案，来自 validate_input）\n\n\
+             设计输入信息不足，请补充。要问的问题：\n1. 部署在哪？推荐：本地 Docker\n\n\
+             ## 用户答复\n\n部署在 k8s，单机即可\n",
+        )
+        .unwrap();
+        assert_eq!(
+            supplement_input(&home, "t1").as_deref(),
+            Some("部署在 k8s，单机即可")
+        );
     }
 }

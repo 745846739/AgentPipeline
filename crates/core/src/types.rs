@@ -849,6 +849,14 @@ pub struct SyncDecision {
     /// design_refs 完整性校验的 warning（决策 136：仅 warning 不进 backtrack）。
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub warnings: Vec<String>,
+    /// 上游元数据的**缺项清单**（票 04，fail-closed）：同步闸门依赖的字段一旦缺失，
+    /// 下游校验会静默跳过——2026-10-01 事故里三行元数据都只剩 `{"readiness":true}`，
+    /// 闸门因此真空放行。任一缺项都让本闸门判 Backtrack。
+    ///
+    /// 单列一条通道而不是塞进 `dev_blockers` / `test_blockers`：缺项是**某一行产出**的
+    /// 残缺，不是某一支的 blocker，混进 blockers 会让回溯的读号者去找错分支。
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub metadata_gaps: Vec<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]

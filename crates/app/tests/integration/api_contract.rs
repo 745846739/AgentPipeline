@@ -259,7 +259,7 @@ async fn create_task_lands_queued_and_with_dependency_waiting() {
     let (status, body) = post(
         &api,
         "/tasks",
-        serde_json::json!({"project_id": project_id, "title": "无依赖"}),
+        serde_json::json!({"project_id": project_id, "title": "无依赖", "description": "列表页筛选秒开"}),
     )
     .await;
     assert_eq!(status, StatusCode::CREATED);
@@ -271,6 +271,7 @@ async fn create_task_lands_queued_and_with_dependency_waiting() {
         serde_json::json!({
             "project_id": project_id,
             "title": "有依赖",
+            "description": "依赖 t0 完成后执行",
             "depends_on": ["t0"]
         }),
     )
@@ -291,7 +292,7 @@ async fn create_task_rejects_missing_project_and_unknown_dependency() {
     let (status, body) = post(
         &api,
         "/tasks",
-        serde_json::json!({"project_id": project_id, "title": "b", "depends_on": ["a"]}),
+        serde_json::json!({"project_id": project_id, "title": "b", "description": "依赖 a", "depends_on": ["a"]}),
     )
     .await;
     assert_eq!(status, StatusCode::CREATED, "{body}");
@@ -300,7 +301,7 @@ async fn create_task_rejects_missing_project_and_unknown_dependency() {
     let (status, body) = post(
         &api,
         "/tasks",
-        serde_json::json!({"project_id": project_id, "title": "d", "depends_on": ["不存在"]}),
+        serde_json::json!({"project_id": project_id, "title": "d", "description": "依赖不存在", "depends_on": ["不存在"]}),
     )
     .await;
     assert_eq!(status, StatusCode::BAD_REQUEST);
@@ -310,7 +311,7 @@ async fn create_task_rejects_missing_project_and_unknown_dependency() {
     let (status, body) = post(
         &api,
         "/tasks",
-        serde_json::json!({"project_id": "不存在", "title": "x"}),
+        serde_json::json!({"project_id": "不存在", "title": "x", "description": "项目不存在"}),
     )
     .await;
     assert_eq!(status, StatusCode::BAD_REQUEST);
@@ -318,6 +319,88 @@ async fn create_task_rejects_missing_project_and_unknown_dependency() {
 
     // 注：id 由服务端生成，API 层无法构造环——决策 27 的环检测在
     // cursor_lifecycle.rs 的 `dependency_states_and_cycle_detection` 覆盖（store 级）。
+}
+
+/// 票 05①：入口拒绝空白标题 / 描述。
+///
+/// 2026-10-01 事故现场 `description = ''`，下游 architect-design 只能靠翻仓库猜范围
+/// （60 分钟、89 次只读调用、一个字没写）。挡在入口比 60 分钟后拦下便宜得多。
+#[tokio::test]
+async fn create_task_rejects_blank_title_or_description() {
+    let api = api().await;
+    let project_id = seed(&api, "t0").await;
+
+    let (status, body) = post(
+        &api,
+        "/tasks",
+        serde_json::json!({"project_id": project_id, "title": "只有标题", "description": "   \n\t "}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    assert!(
+        body["error"].as_str().unwrap().contains("任务描述必填"),
+        "{body}"
+    );
+
+    let (status, body) = post(
+        &api,
+        "/tasks",
+        serde_json::json!({"project_id": project_id, "title": "  ", "description": "有描述没标题"}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    assert!(
+        body["error"].as_str().unwrap().contains("任务标题必填"),
+        "{body}"
+    );
+
+    // 正常创建不受影响
+    let (status, body) = post(
+        &api,
+        "/tasks",
+        serde_json::json!({
+            "project_id": project_id,
+            "title": "正常的任务",
+            "description": "把要说的事写清楚"
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+}
+
+/// 重提（split）路径与入口同一关（票 05①）：拆出来的子任务同样是任务。
+#[tokio::test]
+async fn split_rejects_a_child_with_a_blank_description() {
+    let api = api().await;
+    let project_id = seed(&api, "t0").await;
+    let (status, body) = post(
+        &api,
+        "/tasks",
+        serde_json::json!({
+            "project_id": project_id,
+            "title": "要拆的",
+            "description": "它太大了"
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+    let id = body["task"]["id"].as_str().unwrap().to_string();
+
+    let (status, body) = post(
+        &api,
+        &format!("/tasks/{id}/split"),
+        serde_json::json!({"tasks": [{"title": "子任务", "description": "  "}]}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    assert!(
+        body["error"].as_str().unwrap().contains("标题与描述都必填"),
+        "{body}"
+    );
+
+    // 校验在任何写操作之前：原任务不许被顺手置成 cancelled
+    let (_, after) = get(&api, &format!("/tasks/{id}")).await;
+    assert_ne!(after["task"]["status"], "cancelled", "{after}");
 }
 
 #[tokio::test]
@@ -330,7 +413,7 @@ async fn create_task_fails_fast_without_configured_provider() {
     let (status, body) = post(
         &api,
         "/tasks",
-        serde_json::json!({"project_id": project_id, "title": "x"}),
+        serde_json::json!({"project_id": project_id, "title": "x", "description": "没有 provider"}),
     )
     .await;
     assert_eq!(status, StatusCode::BAD_REQUEST);
@@ -1021,7 +1104,7 @@ async fn archive_requires_terminal_and_splits_into_new_tasks() {
     let (status, body) = post(
         &api,
         "/tasks/t9/split",
-        serde_json::json!({"tasks": [{"title": "子 1"}, {"title": "子 2"}]}),
+        serde_json::json!({"tasks": [{"title": "子 1", "description": "拆出来的第一半"}, {"title": "子 2", "description": "拆出来的第二半"}]}),
     )
     .await;
     assert_eq!(status, StatusCode::OK, "{body}");
@@ -7377,7 +7460,7 @@ async fn the_task_family_creates_a_real_task() {
         &api,
         &sid,
         "task",
-        json!({"action": "create", "project_id": project_id, "title": "确认钮建的任务"}),
+        json!({"action": "create", "project_id": project_id, "title": "确认钮建的任务", "description": "由提议创建的任务"}),
     )
     .await;
 
@@ -7410,7 +7493,7 @@ async fn a_proposal_that_fails_the_endpoint_validation_stays_pending() {
         &api,
         &sid,
         "task",
-        json!({"action": "create", "project_id": "没有这个项目", "title": "x"}),
+        json!({"action": "create", "project_id": "没有这个项目", "title": "x", "description": "项目不存在，必被拒"}),
     )
     .await;
 

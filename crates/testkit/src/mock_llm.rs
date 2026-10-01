@@ -289,6 +289,8 @@ fn render_step(step: Option<Step>) -> MockRoute {
         Some(Step::Submit(value)) => {
             MockRoute::sse("/", sse_tool("submit_metadata", &value.to_string()))
         }
+        // 原始参数串（票 01②）：模拟上游把 arguments 腰斩
+        Some(Step::ToolRaw { name, arguments }) => MockRoute::sse("/", sse_tool(&name, &arguments)),
         Some(Step::Text(text)) => MockRoute::sse("/", sse_text(&text)),
         // Stall：不写 [DONE]，连接关闭即流结束（与 FakeAgent 的「永不返回」近似）
         Some(Step::Stall) => MockRoute::sse("/", String::new()),

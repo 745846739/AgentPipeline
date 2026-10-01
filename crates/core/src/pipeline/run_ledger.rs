@@ -181,6 +181,7 @@ impl<'a> RunLedger<'a> {
         run_id: i64,
         started: DateTime<Utc>,
         error: String,
+        origin: super::executor::CancelOrigin,
         tokens: &RunTokens,
     ) -> Result<()> {
         let duration_ms = since_ms(self.clock.now(), started);
@@ -198,6 +199,10 @@ impl<'a> RunLedger<'a> {
                     status: Some(NodeStatus::Cancelled),
                     duration_ms,
                     error: Some(error),
+                    // 票 02①：来路落一列（判据不按报文字样——决策 259）。超时梯子据此
+                    // 决定这条中止行「跳过还是清零」：人按停是真介入（清零），判超时顺手
+                    // 中止的那一轮是超时自己的副产品（跳过）。
+                    cancel_origin: Some(origin.as_slug()),
                     prompt_tokens: tokens.prompt,
                     completion_tokens: tokens.completion,
                     cache_read_tokens: tokens.cache_read,
@@ -426,6 +431,7 @@ mod tests {
                 run_id,
                 clock.now(),
                 "已按人工暂停 / 重跑中止".into(),
+                crate::pipeline::executor::CancelOrigin::Hold,
                 &tokens,
             )
             .await
@@ -457,7 +463,13 @@ mod tests {
             .await
             .unwrap();
         ledger
-            .finish_cancelled(run2, clock.now(), "不该写进去".into(), &tokens)
+            .finish_cancelled(
+                run2,
+                clock.now(),
+                "不该写进去".into(),
+                crate::pipeline::executor::CancelOrigin::Timeout,
+                &tokens,
+            )
             .await
             .unwrap();
         let run = store.get_run(run2).await.unwrap().unwrap();

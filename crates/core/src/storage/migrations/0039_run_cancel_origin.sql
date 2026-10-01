@@ -1,0 +1,17 @@
+-- 决策 368（票 02 ①）：`cancelled` 这条终态**分两档**——人按停是真介入（超时梯子清零），
+-- 判超时自己造出来的中止行与重启收尾的中止行都不是「这个节点这次没超时」的证据（跳过不清零）。
+--
+-- 为什么必须落成一列：梯子（`trailing_timeout_streak`）要从最新往回数「连续超时」的轮数，
+-- 而 2026-09-30 的实测里它从未升过档——判超时那条路会顺手中止**当前活着的那一轮**（陈旧
+-- run 的尸检掐掉了活的 attempt，同一张票的另一半），那一轮落一条 `cancelled`，把刚记上的超时清零。
+-- 分档信息当时只存在于 `error` 的措辞里（「已按节点超时中止」/「已按人工暂停 / 重跑中止」），
+-- 而按报文字样做判据是决策 259 明确不要走的路，故记成一列。
+--
+-- 取值（三格，见 `storage/observability.rs` 的 `CANCEL_ORIGIN_*`）：
+--   'timeout' —— `CancelOrigin::Timeout`：调度器判超时后中止的执行体；
+--   'hold'    —— `CancelOrigin::Hold`：人按停（手动暂停 / 重跑本阶段）；
+--   'restart' —— 启动恢复收尾的遗留 run（进程退出时还在跑，不是节点超时）。
+--
+-- 可空：这一列只对 `cancelled` 有意义，其余终态（success / failed / timeout）与在飞的行
+-- 都是 NULL——「没有来路」与「来路是某一档」是两件事，与决策 226③ 的 NULL≠0 同一条口径。
+ALTER TABLE kanban_node_runs ADD COLUMN cancel_origin TEXT;

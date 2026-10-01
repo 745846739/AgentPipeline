@@ -100,6 +100,7 @@ const ARCH_EX_SYSTEM: &str = r#"你是架构设计 agent。根据用户需求生
 ## 风险点
 
 ## submit_metadata 字段（architect-design.execute）
+- readiness: boolean（设计是否已就绪、可供下游开发与测试；false 时在 blockers 里说明）
 - affected_files: 涉及的源码文件路径列表
 - new_symbols: 本次新增的公开符号列表 [{name, kind, module_path, file_path}]
 - conflict_warnings: 文件/符号重叠警告
@@ -117,8 +118,9 @@ const ARCH_VO_SYSTEM: &str = r#"你是架构设计的产出质量检查 agent。
 ## 输出
 1. 读取 design.md（通过 read_file）
 2. 调用 submit_metadata 返回检查结果
-- readiness: boolean
-- blockers: string[]（不合格时列出不足之处）"#;
+- passed: boolean（设计文档是否达到产出质量：合格 true、不合格 false）
+- blockers: string[]（**不合格时**列出不足之处；合格时留空）
+- feedback: string（可选；给架构设计 agent 的返工说明，合格时可省略）"#;
 
 const DEV_DESIGN_VI_SYSTEM: &str = r#"你是开发方案的输入充分性检查 agent。判断设计文档是否足以支撑开发。
 
@@ -151,6 +153,7 @@ const DEV_DESIGN_EX_SYSTEM: &str = r#"你是开发方案 agent。根据设计文
 ## 单元测试计划
 
 ## submit_metadata 字段
+- readiness: boolean（开发方案是否已就绪、可供开发 agent 执行；false 时在 blockers 里说明）
 - file_changes: 预期文件变更列表"#;
 
 const DEV_DESIGN_VO_SYSTEM: &str = r#"你是开发方案的产出质量检查 agent。验证开发方案是否可执行。
@@ -161,8 +164,11 @@ const DEV_DESIGN_VO_SYSTEM: &str = r#"你是开发方案的产出质量检查 ag
 - 单元测试计划覆盖关键路径
 
 ## 输出
-1. 读取 dev-plan.md
-2. 调用 submit_metadata"#;
+1. 读取 dev-plan.md（通过 read_file）
+2. 调用 submit_metadata 返回检查结果
+- passed: boolean（开发方案是否达到产出质量：合格 true、不合格 false）
+- blockers: string[]（**不合格时**列出不足之处；合格时留空）
+- feedback: string（可选；给开发方案 agent 的返工说明，合格时可省略）"#;
 
 const TEST_DESIGN_VI_SYSTEM: &str = r#"你是测试设计的输入充分性检查 agent。判断设计文档是否足以支撑测试场景设计。
 
@@ -208,6 +214,7 @@ const TEST_DESIGN_EX_SYSTEM: &str = r#"你是业务测试用例设计 agent。�
 - high 优先级场景必须引用 design.md 验收标准编号（design_refs，决策 136）
 
 ## submit_metadata 字段
+- readiness: boolean（测试场景是否已就绪、可供测试 agent 使用；false 时在 blockers 里说明）
 - test_scenarios: TestScenario[]（场景清单；每项含 design_refs: 引用的验收标准 id 列表，决策 136）"#;
 
 const TEST_DESIGN_VO_SYSTEM: &str = r#"你是测试设计的产出质量检查 agent。验证测试场景文档的完整性。
@@ -219,8 +226,11 @@ const TEST_DESIGN_VO_SYSTEM: &str = r#"你是测试设计的产出质量检查 a
 - high 场景的 design_refs 引用的验收标准编号真实存在（决策 136；引用悬空会被 sync-check 机械校验拦下）
 
 ## 输出
-1. 读取 test-scenarios.md
-2. 调用 submit_metadata"#;
+1. 读取 test-scenarios.md（通过 read_file）
+2. 调用 submit_metadata 返回检查结果
+- passed: boolean（测试场景文档是否达到产出质量：合格 true、不合格 false）
+- blockers: string[]（**不合格时**列出不足之处；合格时留空）
+- feedback: string（可选；给测试场景 agent 的返工说明，合格时可省略）"#;
 
 const DEV_EX_SYSTEM: &str = r#"你是开发 agent。根据开发方案编写业务代码和单元测试。
 
@@ -234,7 +244,12 @@ const DEV_EX_SYSTEM: &str = r#"你是开发 agent。根据开发方案编写业�
 ## 要求
 - 文件写入采用"先清后写"策略
 - 单元测试覆盖方案中列出的关键路径
-- 若 dev-plan.md 不存在（用户跳过了开发方案阶段，决策 115），直接基于 design.md 完成开发"#;
+- 若 dev-plan.md 不存在（用户跳过了开发方案阶段，决策 115），直接基于 design.md 完成开发
+
+## submit_metadata 字段
+- branch_name: 本次变更所在的任务分支名（`kanban/` 前缀 + 任务 id）
+- changed_files: 变更的业务代码文件列表
+- unit_test_files: 变更 / 新增的单元测试文件列表"#;
 
 const REVIEW_EX_SYSTEM: &str = r#"你是代码评审 agent。评审变更代码和单元测试，并对照设计文档检查实现是否符合设计。
 
@@ -429,5 +444,109 @@ mod tests {
         for name in ["read_file", "write_file", "run_command", "submit_metadata"] {
             assert!(BUILTIN_TOOLS.contains(&name));
         }
+    }
+
+    /// 从模板正文里抽出"字段清单"形态的行：`- <name>: ...`。
+    ///
+    /// 只认 ASCII 小写标识符打头的行——`- AC-1: ...`（大写 + 连字符）、
+    /// `- {测试文件}: ...`（占位符）、`- 问题：...`（全角冒号）都不算字段声明。
+    fn declared_metadata_fields(tpl: &str) -> Vec<String> {
+        tpl.lines()
+            .filter_map(|line| {
+                let rest = line.trim_start().strip_prefix("- ")?;
+                let (name, _) = rest.split_once(':')?;
+                let name = name.trim();
+                let ok = !name.is_empty()
+                    && name
+                        .chars()
+                        .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_')
+                    && name.chars().next().is_some_and(|c| c.is_ascii_lowercase());
+                ok.then(|| name.to_string())
+            })
+            .collect()
+    }
+
+    /// 模板 ↔ schema 的一致性判据（票 03）：返回第一条违规的说明。
+    ///
+    /// 单独抽出来，是为了能对**构造的坏模板**断言它真的会拦——只测"现在的模板都合规"，
+    /// 证明不了这道闸门有牙齿。
+    fn check_metadata_template(
+        stage: Stage,
+        node: Node,
+        body: &str,
+        schema: &serde_json::Value,
+    ) -> Result<(), String> {
+        let properties = schema["properties"]
+            .as_object()
+            .ok_or_else(|| format!("{stage}.{node} 的 submit_metadata schema 没有 properties"))?;
+        let required: Vec<&str> = schema["required"]
+            .as_array()
+            .map(|a| a.iter().filter_map(|v| v.as_str()).collect())
+            .unwrap_or_default();
+        let declared = declared_metadata_fields(body);
+
+        for field in &declared {
+            if !properties.contains_key(field.as_str()) {
+                return Err(format!(
+                    "{stage}.{node} 模板列了 schema 里没有的字段 `{field}`（schema 有：{:?}）",
+                    properties.keys().collect::<Vec<_>>()
+                ));
+            }
+        }
+        for field in &required {
+            if !declared.iter().any(|d| d == field) {
+                return Err(format!(
+                    "{stage}.{node} 模板没提必填字段 `{field}`（模板列了：{declared:?}）"
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    /// 每个 agent 节点的模板字段清单都必须与它的 `submit_metadata` schema 对得上。
+    ///
+    /// 口径只有一处：[`crate::pipeline::model_request::submit_metadata_tool_for`]（与校验
+    /// 同源，决策 38）。2026-10-01 的现场正是 `ARCH_VO_SYSTEM` 写着 schema 里根本不存在的
+    /// `readiness`，而必填的 `passed` 一个字没提：模型照模板写，票 01 的截断再把参数掏空，
+    /// 闸门于是真空放行。
+    #[test]
+    fn submit_metadata_templates_match_their_json_schema() {
+        for (stage, node) in agent_nodes() {
+            let kind = crate::pipeline::model_invoke::AgentNodeKind::of(stage, node)
+                .unwrap_or_else(|| panic!("{stage}.{node} 不在 agent 节点表里"));
+            let schema = crate::pipeline::model_request::submit_metadata_tool_for(kind).parameters;
+            if let Err(problem) =
+                check_metadata_template(stage, node, system_template(stage, node), &schema)
+            {
+                panic!("{problem}");
+            }
+        }
+    }
+
+    /// 反向证据：判据对"多写"与"漏提"两类漂移都能抓。
+    ///
+    /// 两段坏模板都取自 2026-10-01 的真实错法——`readiness` 是当时的原文，
+    /// 漏掉 `passed` 是同一份模板的另一半毛病。
+    #[test]
+    fn the_consistency_checker_rejects_both_drift_directions() {
+        let vo_kind = crate::pipeline::model_invoke::AgentNodeKind::of(
+            Stage::ArchitectDesign,
+            Node::ValidateOutput,
+        )
+        .unwrap();
+        let vo_schema =
+            crate::pipeline::model_request::submit_metadata_tool_for(vo_kind).parameters;
+        let stage = Stage::ArchitectDesign;
+        let node = Node::ValidateOutput;
+
+        // 多写：schema 里没有 `readiness`
+        let extra = "## 输出\n- passed: boolean\n- readiness: boolean\n";
+        let err = check_metadata_template(stage, node, extra, &vo_schema).unwrap_err();
+        assert!(err.contains("readiness"), "{err}");
+
+        // 漏提：必填的 `passed` 一个字没有
+        let missing = "## 输出\n- blockers: string[]\n";
+        let err = check_metadata_template(stage, node, missing, &vo_schema).unwrap_err();
+        assert!(err.contains("passed"), "{err}");
     }
 }

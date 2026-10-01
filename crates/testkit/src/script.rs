@@ -22,6 +22,12 @@ pub enum Step {
     },
     /// `submit_metadata`（类型化参数，编译期与校验同源）。
     Submit(serde_json::Value),
+    /// **原始参数串**的工具调用（票 01②）：arguments 原样发，不经 `serde_json` 序列化。
+    ///
+    /// 只为「上游把参数腰斩」这一种现场而存在——[`Step::Tool`] 的参数是
+    /// `serde_json::Value`，序列化出来永远是合法 JSON，表达不了「注定解析失败」的形状。
+    /// 现场的实测残片见 `.scratch/silent-degradation/issues/01-tool-arg-truncation.md`。
+    ToolRaw { name: String, arguments: String },
     /// 纯文本回复（元数据劣化注入：文本 JSON / 缺字段 / 坏 JSON）。
     Text(String),
     /// 不返回（心跳停跳 / 卡死），配合假时钟验证空闲 / 绝对超时。
@@ -273,6 +279,17 @@ impl NodeScript<'_> {
         self.push(Step::Tool {
             name: name.into(),
             arguments,
+        })
+    }
+
+    /// `submit_metadata` 的**原始参数串**（票 01②）：模拟上游把 arguments 腰斩。
+    ///
+    /// 用现场实测的残片，别自己编——`{"readiness": true, "test_scenarios_path": ` 这种
+    /// 「合法前缀 + 半截值」的形状，是网关注出来的，不是构造出来的。
+    pub fn submit_metadata_raw(self, arguments: &str) -> Self {
+        self.push(Step::ToolRaw {
+            name: "submit_metadata".into(),
+            arguments: arguments.to_string(),
         })
     }
 
@@ -588,6 +605,19 @@ impl LlmClient for FakeAgent {
                     content: None,
                     reasoning: thinking,
                     tool_calls: vec![tool_call("submit_metadata".into(), value)],
+                    prompt_tokens: 10,
+                    completion_tokens: 5,
+                    ..Default::default()
+                }),
+                // 原始参数串（票 01②）：arguments 原样发，工具层注定解析失败
+                Some(Step::ToolRaw { name, arguments }) => Ok(AgentResponse {
+                    content: None,
+                    reasoning: thinking,
+                    tool_calls: vec![ToolCall {
+                        id: ulid::Ulid::new().to_string(),
+                        name,
+                        arguments,
+                    }],
                     prompt_tokens: 10,
                     completion_tokens: 5,
                     ..Default::default()

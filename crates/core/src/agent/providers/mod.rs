@@ -277,6 +277,12 @@ pub(crate) enum StreamChunk {
     },
     /// 流终止标记（OpenAI `data: [DONE]`；Anthropic `message_stop`）。
     Done,
+    /// 上游给的收尾原因（OpenAI `finish_reason`；Anthropic `stop_reason`；票 01③）。
+    ///
+    /// 与 [`StreamChunk::Done`] **不是一回事**，两条都要收：`Done` 是「流到这里结束了」，
+    /// 这个字符串是「为什么结束」（`stop` / `tool_calls` / `length`）。`length` 意味着
+    /// 输出被上游切断——工具参数可能就是半截。
+    FinishReason(String),
 }
 
 pub(crate) trait Adapter: Send + Sync {
@@ -428,6 +434,9 @@ impl ProductionLlm {
         let mut tools: BTreeMap<usize, ToolAccum> = BTreeMap::new();
         let mut usage = UsageAccum::default();
         let mut done = false;
+        // 上游给的收尾原因（票 01③）：`[DONE]` 与 `finish_reason` 见过任一个都算
+        // 「这条流有始有终」——只有两者都没见过的 EOF 才是被掐断的。
+        let mut finish_reason: Option<String> = None;
         let mut last_heartbeat = Instant::now();
         // 量速读数（决策 231）：字节总量 + 最后一次收字节的时刻。它们在**这一层**才量得到
         // ——再往外一层只看得到最终响应，分不清「流快但 prompt 大」与「流被压到极慢」。
@@ -437,34 +446,48 @@ impl ProductionLlm {
         // 见 [`advance_idle_deadline`]。
         let mut idle_deadline = idle_timeout.map(|idle| tokio::time::Instant::now() + idle);
 
+        // 取下一块 / 逐行消费，两者用 `read_more` 串起来：流到头时把**残留尾行**补上换行
+        // 再走**同一套**逐行逻辑（票 01③）——原先流读完就 `break`，最后一行没有终止换行
+        // 时（`data: [DONE]` 后直接断连是常见形状）它被整个丢掉，于是整条流被当成「正常结束」。
+        let mut read_more = true;
         while !done {
-            let next = match (idle_deadline, idle_timeout) {
-                (Some(deadline), Some(idle)) => {
-                    match tokio::time::timeout_at(deadline, stream.next()).await {
-                        Ok(next) => next,
-                        Err(_) => return Err(idle_error(idle, bytes_received)),
+            if read_more {
+                let next = match (idle_deadline, idle_timeout) {
+                    (Some(deadline), Some(idle)) => {
+                        match tokio::time::timeout_at(deadline, stream.next()).await {
+                            Ok(next) => next,
+                            Err(_) => return Err(idle_error(idle, bytes_received)),
+                        }
+                    }
+                    _ => stream.next().await,
+                };
+                match next {
+                    Some(chunk) => {
+                        let bytes = chunk.map_err(|e| Error::Llm(format!("读取流失败：{e}")))?;
+                        bytes_received += bytes.len() as u64;
+                        // 字节 ⇄ 时刻同源：`last_byte_at` 是**读数**（决策 231 的量速），这里同时是
+                        // 判死那条界的推进点——空块不进这两个读数（判据是字节，见上）。
+                        idle_deadline = advance_idle_deadline(
+                            idle_deadline,
+                            idle_timeout,
+                            tokio::time::Instant::now(),
+                            bytes.len(),
+                        );
+                        if bytes.is_empty() {
+                            continue;
+                        }
+                        last_byte_at = Some(self.store.now());
+                        buffer.push_str(&String::from_utf8_lossy(&bytes));
+                    }
+                    None => {
+                        // 流到头：残留尾行补一个换行，让它在下面走完
+                        read_more = false;
+                        if !buffer.is_empty() {
+                            buffer.push('\n');
+                        }
                     }
                 }
-                _ => stream.next().await,
-            };
-            let Some(chunk) = next else {
-                break;
-            };
-            let bytes = chunk.map_err(|e| Error::Llm(format!("读取流失败：{e}")))?;
-            bytes_received += bytes.len() as u64;
-            // 字节 ⇄ 时刻同源：`last_byte_at` 是**读数**（决策 231 的量速），这里同时是
-            // 判死那条界的推进点——空块不进这两个读数（判据是字节，见上）。
-            idle_deadline = advance_idle_deadline(
-                idle_deadline,
-                idle_timeout,
-                tokio::time::Instant::now(),
-                bytes.len(),
-            );
-            if bytes.is_empty() {
-                continue;
             }
-            last_byte_at = Some(self.store.now());
-            buffer.push_str(&String::from_utf8_lossy(&bytes));
             while let Some(pos) = buffer.find('\n') {
                 let line: String = buffer.drain(..=pos).collect();
                 let line = line.trim_end_matches(['\n', '\r']);
@@ -525,6 +548,12 @@ impl ProductionLlm {
                             cache_read,
                             cache_write,
                         } => usage.merge(prompt_tokens, completion_tokens, cache_read, cache_write),
+                        StreamChunk::FinishReason(reason) => {
+                            // 首见为准：部分网关在收尾 chunk 与 usage chunk 里各带一次
+                            if finish_reason.is_none() {
+                                finish_reason = Some(reason);
+                            }
+                        }
                         StreamChunk::Done => {
                             done = true;
                             break;
@@ -545,6 +574,18 @@ impl ProductionLlm {
                     crate::pipeline::foreman::flush_foreman_live_turn(&run.session_id).await;
                 }
             }
+            if !read_more {
+                break;
+            }
+        }
+
+        // 票 01③：`[DONE]` 与 `finish_reason` 都没见过的 EOF 是**被掐断的流**，不是正常收尾。
+        // 此前这条路上什么都不报，半截响应被当成完整响应往下走（本次事故里 `submit_metadata`
+        // 的参数就是这样只剩半段的）。宁可真报错，也不让下游去猜。
+        if !done && finish_reason.is_none() {
+            return Err(Error::Llm(format!(
+                "流在没有 [DONE] / finish_reason 的情况下结束（收到 {bytes_received} 字节后断开，响应不完整）"
+            )));
         }
 
         if let Some(run) = run {
@@ -584,6 +625,7 @@ impl ProductionLlm {
             cache_write_tokens: usage.cache_write.unwrap_or(0),
             bytes_received: Some(bytes_received),
             last_byte_at,
+            finish_reason,
         })
     }
 

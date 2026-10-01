@@ -620,6 +620,17 @@ pub async fn serve(options: ServeOptions) -> anyhow::Result<ServerHandle> {
             "已把中断的项目级 run 标成终态"
         );
     }
+    // 第三步之二（票 02②）：**任务自己的**遗留 running run 也要收终态——它们此前谁都不管
+    //（归队只翻任务行、上面那条限定 `task_id IS NULL`），要等 idle 超时（默认 5 分钟）被判死，
+    // 读起来像「跑了这么久才超时」，还顺手把超时梯子的计数搅乱。语义是「进程退出时还在跑」，
+    // 故记 `cancelled` + `cancel_origin='restart'`，不冒充节点超时。
+    if !readings.abandoned_task_runs.is_empty() {
+        tracing::info!(
+            count = readings.abandoned_task_runs.len(),
+            runs = ?readings.abandoned_task_runs,
+            "已把中断的任务级 run 标成终态（进程退出时还在跑，不是节点超时）"
+        );
+    }
 
     // 恢复流程第四步（决策 231）：把上一进程遗留的「在飞」模型请求收成终态。
     //

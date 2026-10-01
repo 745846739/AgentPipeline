@@ -87,14 +87,11 @@ impl Adapter for OpenAiCompatible {
             });
         }
 
-        let Some(delta) = value
-            .get("choices")
-            .and_then(|c| c.get(0))
-            .and_then(|c| c.get("delta"))
-        else {
+        let Some(choice) = value.get("choices").and_then(|c| c.get(0)) else {
             return Ok(chunks);
         };
         // content 与 tool_calls 也可并存于同一 delta，都收
+        let delta = choice.get("delta").cloned().unwrap_or_default();
         if let Some(text) = delta.get("content").and_then(|v| v.as_str()) {
             chunks.push(StreamChunk::Text(text.to_string()));
         }
@@ -130,6 +127,12 @@ impl Adapter for OpenAiCompatible {
                         .map(String::from),
                 }
             }));
+        }
+        // 收尾原因（票 01③）：`length` 意味着上游把输出切断了——工具参数可能就是半截。
+        // 它单独成一块，与 [`StreamChunk::Done`]（`data: [DONE]`）不是一回事；放在末尾，
+        // 于是同一载荷里正文/工具分片先入 `content` / `tools`，再落收尾原因。
+        if let Some(reason) = choice.get("finish_reason").and_then(|v| v.as_str()) {
+            chunks.push(StreamChunk::FinishReason(reason.to_string()));
         }
         Ok(chunks)
     }
@@ -545,9 +548,14 @@ mod tests {
                 r#"{"choices":[{"index":0,"delta":{"content":"完成"},"finish_reason":"stop"}],"usage":{"prompt_tokens":9,"completion_tokens":3}}"#,
             )
             .unwrap();
-        assert_eq!(mixed.len(), 2, "{mixed:?}");
+        assert_eq!(mixed.len(), 3, "{mixed:?}");
         assert!(matches!(mixed[0], StreamChunk::Usage { .. }));
         assert!(matches!(&mixed[1], StreamChunk::Text(t) if t == "完成"));
+        // 票 01③：`finish_reason` 要单独成块上报（`length` 是「上游切断输出」的判据）
+        assert!(
+            matches!(&mixed[2], StreamChunk::FinishReason(r) if r == "stop"),
+            "{mixed:?}"
+        );
 
         // 同一 delta 里 content 与 tool_calls 并存也都不丢
         let both = OpenAiCompatible

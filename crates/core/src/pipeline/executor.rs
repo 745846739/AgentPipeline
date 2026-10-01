@@ -120,6 +120,18 @@ impl CancelOrigin {
             CancelOrigin::Hold => "人工暂停 / 重跑",
         }
     }
+
+    /// **落库取值**（票 02①）：`kanban_node_runs.cancel_origin` 那一列写什么。
+    ///
+    /// 与 [`Self::as_str`] 是两件事，别合并：`as_str` 是给人读的句子（进 `error` 列），
+    /// 这个值给判据读（超时梯子据此决定「跳过还是清零」）。判据按报文字样分流是决策 259
+    /// 明确不要走的路——改一次措辞就把梯子悄悄改坏，而这种坏法没有任何测试会报警。
+    pub fn as_slug(self) -> &'static str {
+        match self {
+            CancelOrigin::Timeout => crate::storage::observability::CANCEL_ORIGIN_TIMEOUT,
+            CancelOrigin::Hold => crate::storage::observability::CANCEL_ORIGIN_HOLD,
+        }
+    }
 }
 
 impl CancelSignal {
@@ -926,8 +938,8 @@ impl Executor {
             //（决策 83，pipeline-spec §6）；双方 blockers 写任务目录 backtrack-feedback.md（决策 126）
             let main = self.store.backtrack_cursors(&task.id).await?;
             let feedback = format!(
-                "# backtrack 反馈\n\ndev blockers：{:?}\ntest blockers：{:?}\n",
-                decision.dev_blockers, decision.test_blockers
+                "# backtrack 反馈\n\ndev blockers：{:?}\ntest blockers：{:?}\n元数据缺项：{:?}\n",
+                decision.dev_blockers, decision.test_blockers, decision.metadata_gaps
             );
             self.store.home().ensure_task_dirs(&task.id)?;
             std::fs::write(
@@ -1022,12 +1034,27 @@ impl Executor {
         let mut test_blockers = meta_str_list(test_meta.as_ref(), "blockers");
         let mut warnings = Vec::new();
 
+        let test_skipped = skipped(NodeCursor::BRANCH_TEST_DESIGN);
+        let arch_meta = self
+            .store
+            .stage_output_metadata(&task.id, Stage::ArchitectDesign, OUTPUT_DESIGN_DOC)
+            .await?;
+
+        // ── 票 04：闸门先看元数据是否**齐全**（fail-closed）──────────────────────────
+        // 要这一道是因为 sync-check 依赖的两处字段一旦缺失，下游校验**静默跳过**而不是报错：
+        //   · architect-design 的 `acceptance_criteria` 没了 → high 场景的 design_refs 无从比对；
+        //   · test-design 的 `test_scenarios` 没了 → 整段引用完整性校验（决策 136）进不去。
+        // 2026-10-01 事故里三行 `metadata_json` 全是 `{"readiness":true}`（票 01 的截断把字段
+        // 掏空了），闸门因此真空 `Proceed`。判据只看**这两个被消费的字段在不在**，不套
+        // `schemars::required`——那三张结构体除 `readiness` 外全带 `#[serde(default)]`
+        //（为兼容历史产出），`required` 拦不住"只剩 readiness"这种残缺。
+        let metadata_gaps =
+            sync_metadata_gaps(test_skipped, arch_meta.as_ref(), test_meta.as_ref());
+
         // 决策 136：high 优先级场景的 design_refs 缺失/悬空 → blocker
-        if !skipped(NodeCursor::BRANCH_TEST_DESIGN) {
-            let criteria = self
-                .store
-                .stage_output_metadata(&task.id, Stage::ArchitectDesign, OUTPUT_DESIGN_DOC)
-                .await?
+        if !test_skipped {
+            let criteria = arch_meta
+                .as_ref()
                 .map(|m| {
                     m.get("acceptance_criteria")
                         .and_then(|v| v.as_array())
@@ -1088,8 +1115,12 @@ impl Executor {
             }
         }
 
-        let proceed =
-            dev_readiness && test_readiness && dev_blockers.is_empty() && test_blockers.is_empty();
+        // 元数据缺项也算不过闸门（票 04，fail-closed）
+        let proceed = dev_readiness
+            && test_readiness
+            && dev_blockers.is_empty()
+            && test_blockers.is_empty()
+            && metadata_gaps.is_empty();
         Ok(SyncDecision {
             decision: if proceed {
                 SyncDecisionKind::Proceed
@@ -1101,6 +1132,7 @@ impl Executor {
             dev_blockers,
             test_blockers,
             warnings,
+            metadata_gaps,
         })
     }
 
@@ -1883,6 +1915,41 @@ fn meta_flag(meta: Option<&serde_json::Value>, key: &str) -> bool {
         .unwrap_or(false)
 }
 
+/// 票 04：同步闸门依赖的字段**缺项清单**（纯函数，好单测）。
+///
+/// 只在 test-design 没被跳过时检查——那一支跳过了就没有 `test_scenarios`，也就没有引用校验。
+/// 缺项的文案直说"哪一行缺哪个字段"，回溯时它会随 `backtrack-feedback.md` 一起回到设计阶段。
+fn sync_metadata_gaps(
+    test_skipped: bool,
+    arch_meta: Option<&serde_json::Value>,
+    test_meta: Option<&serde_json::Value>,
+) -> Vec<String> {
+    if test_skipped {
+        return Vec::new();
+    }
+    let mut gaps = Vec::new();
+    if !meta_has_key(arch_meta, "acceptance_criteria") {
+        gaps.push(
+            "architect-design 元数据缺 acceptance_criteria：high 场景的 design_refs 无处比对"
+                .into(),
+        );
+    }
+    if !meta_has_key(test_meta, "test_scenarios") {
+        gaps.push(
+            "test-design 元数据缺 test_scenarios：引用完整性校验（决策 136）被整段跳过".into(),
+        );
+    }
+    gaps
+}
+
+/// 该字段**在不在**（票 04 的 fail-closed 判据）。
+///
+/// 与 [`meta_flag`] 的区别：后者把"缺字段"和"值就是 false"都读成 false，闸门看不出
+/// 元数据是被掏空了还是模型真的判不合格；这里只问键在不在，好把"残缺"单独点出来。
+fn meta_has_key(meta: Option<&serde_json::Value>, key: &str) -> bool {
+    meta.and_then(|m| m.get(key)).is_some()
+}
+
 fn meta_str_list(meta: Option<&serde_json::Value>, key: &str) -> Vec<String> {
     meta.and_then(|m| m.get(key))
         .and_then(|v| v.as_array())
@@ -1977,5 +2044,46 @@ mod tests {
             !held_by_human(timeout_id),
             "判超时那条路**不让路**：它自己处置过台账，另一条分支的工作不该连坐"
         );
+    }
+
+    /// 票 04：只剩 `readiness` 的元数据（2026-10-01 事故的形状）必须被点出缺项。
+    ///
+    /// 这三行在事故里全是 `{"readiness":true}`——`readiness` 在，闸门本来就会放行，
+    /// 缺的正是引用校验赖以比对的两个字段。所以判据刻意**不看 `schemars::required`**
+    ///（那三张结构体除 `readiness` 外全是 `#[serde(default)]`），只看这两个键在不在。
+    #[test]
+    fn sync_gaps_name_the_fields_the_gate_consumes() {
+        let only_readiness = serde_json::json!({"readiness": true});
+        let gaps = sync_metadata_gaps(false, Some(&only_readiness), Some(&only_readiness));
+        assert_eq!(gaps.len(), 2, "{gaps:?}");
+        assert!(
+            gaps.iter().any(|g| g.contains("acceptance_criteria")),
+            "{gaps:?}"
+        );
+        assert!(
+            gaps.iter().any(|g| g.contains("test_scenarios")),
+            "{gaps:?}"
+        );
+    }
+
+    /// 齐全时一个缺项都不报——不许把正常路径判死。
+    #[test]
+    fn sync_gaps_are_empty_when_the_gate_inputs_are_intact() {
+        let arch = serde_json::json!({"readiness": true, "acceptance_criteria": []});
+        let test = serde_json::json!({"readiness": true, "test_scenarios": []});
+        assert!(sync_metadata_gaps(false, Some(&arch), Some(&test)).is_empty());
+    }
+
+    /// test-design 被跳过（skip_to_join）时没有 test_scenarios 可言，不该判缺项。
+    #[test]
+    fn sync_gaps_ignore_a_skipped_test_branch() {
+        assert!(sync_metadata_gaps(true, None, None).is_empty());
+    }
+
+    /// 整行产出都没落库（None）同样算缺项——那是元数据被掏空的最彻底形态。
+    #[test]
+    fn sync_gaps_treat_a_missing_row_as_a_gap() {
+        let gaps = sync_metadata_gaps(false, None, None);
+        assert_eq!(gaps.len(), 2, "{gaps:?}");
     }
 }

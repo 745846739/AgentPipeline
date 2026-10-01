@@ -28,13 +28,13 @@ describe('拆分任务对话框', () => {
     render(SplitDialog, { props: { open: true, onclose: () => {}, onsubmit } });
 
     await fireEvent.input(screen.getByRole('textbox'), {
-      target: { value: '实现 A 部分 | 说明 A\n实现 B 部分' },
+      target: { value: '实现 A 部分 | 说明 A\n实现 B 部分 | 说明 B' },
     });
     await fireEvent.click(screen.getByRole('button', { name: '确认拆分' }));
 
     expect(onsubmit).toHaveBeenCalledWith([
       { title: '实现 A 部分', description: '说明 A' },
-      { title: '实现 B 部分', description: '' },
+      { title: '实现 B 部分', description: '说明 B' },
     ]);
   });
 
@@ -80,7 +80,7 @@ describe('拆分任务对话框 · 校验缺口（票 11 / R2-13）', () => {
     render(SplitDialog, { props: { open: true, onclose: () => {}, onsubmit } });
 
     await fireEvent.input(screen.getByRole('textbox'), {
-      target: { value: '实现 A 部分\n\n| 只有描述' },
+      target: { value: '实现 A 部分 | 说明 A\n\n| 只有描述' },
     });
     await fireEvent.click(screen.getByRole('button', { name: '确认拆分' }));
 
@@ -97,8 +97,23 @@ describe('拆分任务对话框 · 校验缺口（票 11 / R2-13）', () => {
     await fireEvent.click(screen.getByRole('button', { name: '确认拆分' }));
     expect(onsubmit).not.toHaveBeenCalled();
 
-    await fireEvent.input(screen.getByRole('textbox'), { target: { value: '实现 C 部分' } });
+    await fireEvent.input(screen.getByRole('textbox'), { target: { value: '实现 C 部分 | 说明 C' } });
     await fireEvent.click(screen.getByRole('button', { name: '确认拆分' }));
-    expect(onsubmit).toHaveBeenCalledWith([{ title: '实现 C 部分', description: '' }]);
+    expect(onsubmit).toHaveBeenCalledWith([{ title: '实现 C 部分', description: '说明 C' }]);
+  });
+
+  it('只有标题、没有描述的行被拦下（票 05①：子任务描述同样必填）', async () => {
+    const onsubmit = vi.fn();
+    render(SplitDialog, { props: { open: true, onclose: () => {}, onsubmit } });
+
+    await fireEvent.input(screen.getByRole('textbox'), {
+      target: { value: '实现 A 部分 | 说明 A\n实现 B 部分' },
+    });
+    await fireEvent.click(screen.getByRole('button', { name: '确认拆分' }));
+
+    expect(onsubmit).not.toHaveBeenCalled();
+    const alert = screen.getByRole('alert').textContent ?? '';
+    expect(alert).toContain('第 2 行');
+    expect(alert).toContain('描述');
   });
 });

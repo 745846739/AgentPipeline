@@ -207,7 +207,7 @@ pub fn owner_stuck_window(settings: &Settings) -> Duration {
     Duration::minutes(settings.watch_owner_stuck_minutes as i64)
 }
 
-/// 恢复序列三步的读数（`service` 与启动时共用）。
+/// 恢复序列四步的读数（`service` 与启动时共用）。
 #[derive(Debug, Clone, PartialEq)]
 pub struct RecoveryReadings {
     /// 清掉的残留执行者个数。
@@ -216,29 +216,39 @@ pub struct RecoveryReadings {
     pub requeued: Vec<String>,
     /// 标成终态的项目级 run。
     pub abandoned: Vec<i64>,
+    /// 标成终态的**任务级**遗留 run（票 02②）。
+    pub abandoned_task_runs: Vec<i64>,
 }
 
-/// **恢复序列**（决策 127 / 212）：把上一轮遗留的占用与在飞的活儿收干净。
+/// **恢复序列**（决策 127 / 212 / 367）：把上一轮遗留的占用与在飞的活儿收干净。
 ///
-/// 三步、顺序有意义，两条调用路径共用**这一份实现**：
+/// 四步、顺序有意义，两条调用路径共用**这一份实现**：
 /// 1. 清 `executor_owner`（kill -9 残留）；
 /// 2. 中断的 `running` 任务归队（否则调度器不接管——准入只认 `queued`）；
 /// 3. 项目级 run 标终态（它既不在归队范围内、也不在 `check_timeouts` 的扫描范围内，
-///    不收则跨重启永生）。
+///    不收则跨重启永生）；
+/// 4. **任务级**遗留 run 标终态（票 02②）：同样是「上个进程退出时还在跑」，此前没人收
+///    ——它们要等 idle 超时被判死，读起来像「跑了这么久才超时」，还顺手把超时梯子的
+///    计数搅乱（2026-09-30 的 13 次重启每次都留一批）。
 ///
-/// **这里只有三步，`orphan_inflight_model_requests` 不在其中**（决策 255④）：那一步是
+/// **第 4 步必须在第 2 步之后**：归队只翻任务行，判终态要认「哪些 run 属于这些任务」——
+/// 顺序反过来也能跑，但读数会自相矛盾（任务已归队、它的 run 还在飞）。
+///
+/// **这里只有四步，`orphan_inflight_model_requests` 不在其中**（决策 255④）：那一步是
 /// **启动特有**的——它自己的 doc 就是「启动时把**上一个实例留下的**在飞请求收成终态」，
 /// 判据 `finished_at IS NULL` 没有进程限定。而**运行中**被丢弃的请求另有承担者：
 /// `crate::agent::recording::Settle` 的 `Drop` 以 `ABANDONED_NOTE` 收成 `Timeout`。
-/// 故序列是 **3+1**：本函数三步，启动时那一步留在调用点。
+/// 故序列是 **4+1**：本函数四步，启动时那一步留在调用点。
 pub async fn run_recovery_sequence(store: &Store) -> Result<RecoveryReadings> {
     let cleared = store.clear_executor_owners().await?;
     let requeued = store.requeue_running_tasks().await?;
     let abandoned = store.abandon_stale_project_runs().await?;
+    let abandoned_task_runs = store.abandon_stale_task_runs().await?;
     Ok(RecoveryReadings {
         cleared,
         requeued,
         abandoned,
+        abandoned_task_runs,
     })
 }
 

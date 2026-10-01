@@ -112,31 +112,38 @@ impl LlmClient for RecordingLlm {
                 settled: false,
             };
             let outcome = inner.complete(request).await;
-            match &outcome {
+            // 票 01③：**参数完整性不达标时收场不许记 `ok`**。`complete` 仍然成功返回——
+            // 被腰斩的参数串还要交给 `rescue_truncated_json` 去救（那是既有能力，不动），
+            // 但台账上这一行必须与一次干净调用分得开：否则「这一轮到底拿到了什么」在事后
+            // 永远看不出来——本次事故里 33 轮请求全是 `ok`，截断这件事因此一直隐身。
+            let (status, usage, note) = match &outcome {
                 Ok(response) => {
-                    settle
-                        .settle(ModelRequestStatus::Ok, Self::usage_of(response), None)
-                        .await;
+                    let broken = crate::agent::metadata::broken_arguments_note(response);
+                    (
+                        if broken.is_some() {
+                            ModelRequestStatus::Error
+                        } else {
+                            ModelRequestStatus::Ok
+                        },
+                        Self::usage_of(response),
+                        broken,
+                    )
                 }
-                Err(error) => {
-                    let status = request_status(error);
+                Err(error) => (
+                    request_status(error),
                     // 失败时用量留 NULL 而不是 0：流半途断掉时 usage 事件根本没到过，
                     // 0 会把「没有读数」说成「一个 token 都没烧」（决策 226③ 的同一件事）。
-                    settle
-                        .settle(
-                            status,
-                            ModelRequestUsage::default(),
-                            Some(error.to_string()),
-                        )
-                        .await;
-                }
-            }
+                    ModelRequestUsage::default(),
+                    Some(error.to_string()),
+                ),
+            };
+            settle.settle(status, usage, note).await;
             tracing::info!(
                 request = request_id,
                 run = described.run_id,
                 stage = %described.stage,
                 node = %described.node,
-                ok = outcome.is_ok(),
+                status = status.as_str(),
                 "模型请求收场"
             );
             outcome

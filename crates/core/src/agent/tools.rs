@@ -711,7 +711,7 @@ impl ToolExecutor {
             // 修复轮（决策 210③④ / 票 10–12）：start 给一个可写的 worktree，finish 跑闸门
             // → commit → 落提议，discard 回收。三件事的**序列**都在 `pipeline::repair` 里。
             "repair" => self.repair(call, ctx).await?,
-            super::catalog::SUBMIT_METADATA => self.submit_metadata(call)?,
+            super::catalog::SUBMIT_METADATA => self.submit_metadata(call, ctx)?,
             super::catalog::SKILL => self.skill(call)?,
             "spawn_sub_agent" => self.spawn_sub_agent(call, ctx).await?,
             // 台账只读工具（决策 182⑭，票 02）。它们在白名单里的位置与其余工具相同：
@@ -977,6 +977,12 @@ impl ToolExecutor {
         if ledger_skipped || matches!(call.name.as_str(), "run_command" | "submit_metadata") {
             return Ok(outcome);
         }
+        // 票 01④：把卸载产物**读回来**的那一次不再卸载——否则卸载提示语（`offload_replacement`
+        // 教模型 `read_file("{path}")` 取全文）会把同一个大文件一次次写成新的 `.context`，
+        // 无限退套（本次事故实测 84 个 / 1.6MB）。
+        if self.reads_offload_artifact(call, ctx) {
+            return Ok(outcome);
+        }
         if !needs_offload(&outcome.content, &self.settings) {
             return Ok(outcome);
         }
@@ -990,6 +996,43 @@ impl ToolExecutor {
             content: offload_replacement(&call.name, &path.display().to_string(), tokens, &preview),
             metadata: outcome.metadata,
         })
+    }
+
+    /// 这次调用是不是在**回读 L2 卸载产物**（票 01④）。
+    ///
+    /// 判据落在**归属目录**（任务的 `.context/` 与值班长的会话 context 目录），不看路径串里
+    /// 有没有 `.context`——后者会把工作区里一个恰好同名的目录也一并豁免。
+    fn reads_offload_artifact(&self, call: &ToolCall, ctx: &ToolCallContext) -> bool {
+        if call.name != "read_file" {
+            return false;
+        }
+        let Ok(args) = Self::args(call) else {
+            return false;
+        };
+        let Some(rel) = args
+            .get("path")
+            .and_then(|v| v.as_str())
+            .filter(|s| !s.is_empty())
+        else {
+            return false;
+        };
+        let mut roots: Vec<std::path::PathBuf> = Vec::new();
+        if !ctx.task_id.is_empty() {
+            roots.push(self.home.context_dir(&ctx.task_id));
+        }
+        if let Some(session) = ctx.session_id.as_deref().filter(|s| !s.is_empty()) {
+            roots.push(self.home.foreman_context_dir(session));
+        }
+        if roots.is_empty() {
+            return false;
+        }
+        // `read_file` 的落点由 `read_candidates` 决定（工作区优先、任务目录兜底）；
+        // 绝对路径的 `rel` 也直接算一个候选（PathBuf::join 遇绝对路径会替换）。
+        let mut reads = ctx.read_candidates(rel);
+        reads.push(std::path::PathBuf::from(rel));
+        reads
+            .iter()
+            .any(|p| roots.iter().any(|root| p.starts_with(root)))
     }
 
     /// L2 卸载落在哪个目录——**按归属选维度**（决策 204④ / 206）。
@@ -1018,7 +1061,63 @@ impl ToolExecutor {
         serde_json::from_str(&call.arguments)
             .map_err(|e| Error::Validation(format!("工具 {} 参数解析失败：{e}", call.name)))
     }
+}
 
+/// 取一个**非负整数字段**（票 06）：接受数字，也接受数字字符串（`"90"` → 90）。
+///
+/// 为什么非要这两条：
+/// - **强转**：模型把数字写成字符串是常态，现场实测的调用就是
+///   `{"path": "…", "offset": "1", "limit": "90"}`。此前 `Value::as_u64()` 对 `"1"` 返回
+///   `None`，于是 offset 读成 0、limit 读成 None——**分页意图整份落空**，读回来的整份
+///   内容又超过卸载阈值，进「读 → 卸载 → 再读 → 再卸载」的环（84 个 `.context` 文件就是这么来的）。
+/// - **报错而不兜底**：给了别的形态（`"abc"` / 对象 / 负数）时**不**悄悄取默认值。
+///   静默兜底是最坏的选择：它既不满足调用意图，也不让调用方从结果里看出参数被忽略了。
+fn arg_u64(args: &serde_json::Value, key: &str) -> Result<Option<u64>> {
+    let Some(value) = args.get(key) else {
+        return Ok(None);
+    };
+    if value.is_null() {
+        return Ok(None);
+    }
+    if let Some(n) = value.as_u64() {
+        return Ok(Some(n));
+    }
+    if let Some(s) = value.as_str() {
+        if let Ok(n) = s.trim().parse::<u64>() {
+            return Ok(Some(n));
+        }
+    }
+    Err(Error::Validation(format!(
+        "参数 {key} 期望一个非负整数（可以写成数字或数字字符串），收到的是 {value}。请改正后重试。"
+    )))
+}
+
+/// 取一个**布尔字段**（票 06）：接受 `true` / `false`，也接受字符串 `"true"` / `"false"`。
+///
+/// 与 [`arg_u64`] 同一姿态：只认这两种形态，其余的**报错**，不静默当成 `false`。
+fn arg_bool(args: &serde_json::Value, key: &str) -> Result<Option<bool>> {
+    let Some(value) = args.get(key) else {
+        return Ok(None);
+    };
+    if value.is_null() {
+        return Ok(None);
+    }
+    if let Some(b) = value.as_bool() {
+        return Ok(Some(b));
+    }
+    if let Some(s) = value.as_str() {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "true" => return Ok(Some(true)),
+            "false" => return Ok(Some(false)),
+            _ => {}
+        }
+    }
+    Err(Error::Validation(format!(
+        "参数 {key} 期望布尔值（true / false），收到的是 {value}。请改正后重试。"
+    )))
+}
+
+impl ToolExecutor {
     async fn write_file(&self, call: &ToolCall, ctx: &ToolCallContext) -> Result<ToolOutcome> {
         let args = Self::args(call)?;
         let rel = args
@@ -1115,14 +1214,13 @@ impl ToolExecutor {
     async fn read_file(&self, call: &ToolCall, ctx: &ToolCallContext) -> Result<ToolOutcome> {
         let args = Self::args(call)?;
         let rel = args.get("path").and_then(|v| v.as_str()).unwrap_or("");
-        let offset = args.get("offset").and_then(|v| v.as_u64()).unwrap_or(0) as usize;
-        let limit = args
-            .get("limit")
-            .and_then(|v| v.as_u64())
-            .map(|v| v as usize);
+        // 票 06：数字字符串强转 + 错型报错。静默兜底成「读整份」是这里最坏的选择——
+        // 它既没满足分页意图，又正好把结果推过卸载阈值，还让模型看不出参数被忽略了。
+        let offset = arg_u64(&args, "offset")?.unwrap_or(0) as usize;
+        let limit = arg_u64(&args, "limit")?.map(|v| v as usize);
         // 决策 226：要**尾部**而不是头部。追加写的文件（日志、运行记录）要看的都是尾巴，
         // 而默认的头部读法在这种文件上给的恰好是最没用的那一段。
-        let tail = args.get("tail").and_then(|v| v.as_bool()).unwrap_or(false);
+        let tail = arg_bool(&args, "tail")?.unwrap_or(false);
 
         let mut found: Option<PathBuf> = None;
         for candidate in ctx.read_candidates(rel) {
@@ -1162,10 +1260,7 @@ impl ToolExecutor {
     async fn list_dir(&self, call: &ToolCall, ctx: &ToolCallContext) -> Result<ToolOutcome> {
         let args = Self::args(call)?;
         let rel = args.get("path").and_then(|v| v.as_str()).unwrap_or(".");
-        let recursive = args
-            .get("recursive")
-            .and_then(|v| v.as_bool())
-            .unwrap_or(false);
+        let recursive = arg_bool(&args, "recursive")?.unwrap_or(false);
         let root = if Path::new(rel).is_absolute() {
             PathBuf::from(rel)
         } else {
@@ -1178,13 +1273,38 @@ impl ToolExecutor {
         Ok(ToolOutcome::ok(trim_list_dir(&entries)))
     }
 
-    fn submit_metadata(&self, call: &ToolCall) -> Result<ToolOutcome> {
-        let value: serde_json::Value = serde_json::from_str(&call.arguments).or_else(|e| {
-            // 被 max_tokens 掐断的参数（EOF 型）先救援再判死：补齐尾部引号与括号后
-            // 照旧走下游 schema 校验；救不回来按原样报错（非截断型坏 JSON 不救）。
-            crate::agent::metadata::rescue_truncated_json(&call.arguments)
-                .ok_or_else(|| Error::Validation(format!("submit_metadata 参数解析失败：{e}")))
-        })?;
+    fn submit_metadata(&self, call: &ToolCall, ctx: &ToolCallContext) -> Result<ToolOutcome> {
+        let value: serde_json::Value = match serde_json::from_str(&call.arguments) {
+            Ok(v) => v,
+            Err(e) => {
+                // 被 max_tokens 掐断的参数（EOF 型）先救援再判死：补齐尾部引号与括号后
+                // 照旧走下游 schema 校验；救不回来按原样报错（非截断型坏 JSON 不救）。
+                match crate::agent::metadata::rescue_truncated_json(&call.arguments) {
+                    Some(rescued) => {
+                        // 票 01②：救援是**有损**的——被截掉的字段不会自己回来，下游多半
+                        // 按「缺必填」判死。这里留一行可查的现场：进程没了只剩日志时，
+                        // 这行是唯一能证明「这一轮是截断，不是模型漏填」的东西（决策 231
+                        // 三行日志的同一姿态）。必填齐不齐由 `model_invoke` 按阶段类型判
+                        // ——那个 `T` 只在它那里知道。
+                        tracing::warn!(
+                            task = %ctx.task_id,
+                            stage = %ctx.stage.as_str(),
+                            node = %ctx.node.as_str(),
+                            run = ctx.run_id,
+                            raw_len = call.arguments.len(),
+                            error = %e,
+                            "submit_metadata 参数不是合法 JSON，已按截断救援（被截字段不会自己回来）"
+                        );
+                        rescued
+                    }
+                    None => {
+                        return Err(Error::Validation(format!(
+                            "submit_metadata 参数解析失败：{e}"
+                        )))
+                    }
+                }
+            }
+        };
         Ok(ToolOutcome {
             content: "{\"success\":true}".to_string(),
             metadata: Some(value),
@@ -1348,11 +1468,7 @@ impl ToolExecutor {
             }
             Err(e) => return Err(e),
         };
-        let runs_limit = args
-            .get("runs")
-            .and_then(|v| v.as_u64())
-            .unwrap_or(30)
-            .clamp(1, 200) as usize;
+        let runs_limit = arg_u64(&args, "runs")?.unwrap_or(30).clamp(1, 200) as usize;
 
         let runs = store.list_runs(&task_id).await?;
         let commands = store.list_commands(&task_id, None, None).await?;
@@ -2177,7 +2293,7 @@ impl ToolExecutor {
                 "read_conversation 需要一个 task_id 参数（可再加 run_id）。",
             ));
         }
-        let requested_run = args.get("run_id").and_then(|v| v.as_i64());
+        let requested_run = arg_u64(&args, "run_id")?.map(|v| v as i64);
         let run_id = match requested_run {
             Some(id) => id,
             None => match store.list_conversations(&task_id, false).await?.last() {
@@ -2231,7 +2347,7 @@ impl ToolExecutor {
             .and_then(|v| v.as_str())
             .ok_or_else(|| Error::Validation("run_command 缺少 command".into()))?
             .to_string();
-        let explicit_timeout = args.get("timeout_sec").and_then(|v| v.as_u64());
+        let explicit_timeout = arg_u64(&args, "timeout_sec")?;
         let cwd = args
             .get("cwd")
             .and_then(|v| v.as_str())
@@ -2443,7 +2559,7 @@ impl ToolExecutor {
 
         // 台账那一行由收口函数落（它与 `run_command` 同一条口径：argv 拼回一行、过脱敏、
         // 归属走会话（值班长）或任务（决策 204④））——审计面要看得见每一次取证。
-        let explicit_timeout = args.get("timeout_sec").and_then(|v| v.as_u64());
+        let explicit_timeout = arg_u64(&args, "timeout_sec")?;
         // 启动之后的一切与 `run_command` **同一条管道**（心跳 / 进程组 / 超时收口 / 脱敏 /
         // 裁剪卸载 / 台账回填）：唯一不同的只有启动那一句——argv 直出、不经 shell。
         //
@@ -2700,9 +2816,7 @@ impl ToolExecutor {
     /// 退出码），取数失败记 1。报错一律可归因 + 说清怎么放行。
     async fn web_fetch(&self, call: &ToolCall, ctx: &ToolCallContext) -> Result<ToolOutcome> {
         let args = Self::args(call)?;
-        let timeout_sec = args
-            .get("timeout_sec")
-            .and_then(|v| v.as_u64())
+        let timeout_sec = arg_u64(&args, "timeout_sec")?
             .unwrap_or(WEB_FETCH_TIMEOUT_SECS)
             .clamp(1, 120);
         let raw = args
@@ -3923,6 +4037,126 @@ mod tests {
         assert_eq!(out.content, "l1\nl2");
     }
 
+    /// 票 06：模型把数字写成字符串（现场实测 `{"offset": "1", "limit": "90"}`）时必须
+    /// **真的分页**。此前 `as_u64` 对 `"1"` 返回 `None`，于是静默整份读——既没满足分页
+    /// 意图，又正好把结果推过卸载阈值，进「读 → 卸载 → 再读 → 再卸载」的环。
+    #[tokio::test]
+    async fn read_file_coerces_numeric_strings_instead_of_reading_everything() {
+        let s = setup(Stage::Develop);
+        let lines: Vec<String> = (0..200).map(|i| format!("line-{i}")).collect();
+        std::fs::write(s.worktree.join("a.txt"), lines.join("\n")).unwrap();
+
+        let from_strings = s
+            .executor
+            .execute(
+                &call(
+                    "read_file",
+                    serde_json::json!({"path": "a.txt", "offset": "1", "limit": "90"}),
+                ),
+                &s.ctx,
+            )
+            .await
+            .unwrap();
+        let from_numbers = s
+            .executor
+            .execute(
+                &call(
+                    "read_file",
+                    serde_json::json!({"path": "a.txt", "offset": 1, "limit": 90}),
+                ),
+                &s.ctx,
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(
+            from_strings.content, from_numbers.content,
+            "两种写法逐字节相同"
+        );
+        assert_eq!(from_strings.content.lines().count(), 90, "恰好 90 行");
+        assert!(
+            from_strings.content.starts_with("line-1\n"),
+            "{}",
+            from_strings.content
+        );
+        assert!(
+            from_strings.content.ends_with("line-90"),
+            "{}",
+            from_strings.content
+        );
+    }
+
+    /// 票 06②：错型参数**报错**并说明期望什么，不静默兜底成「读整份」。
+    #[tokio::test]
+    async fn read_file_rejects_a_limit_that_is_not_a_number() {
+        let s = setup(Stage::Develop);
+        std::fs::write(s.worktree.join("a.txt"), "l0\nl1").unwrap();
+
+        let err = s
+            .executor
+            .execute(
+                &call(
+                    "read_file",
+                    serde_json::json!({"path": "a.txt", "limit": "abc"}),
+                ),
+                &s.ctx,
+            )
+            .await
+            .unwrap_err();
+        let message = err.to_string();
+        assert!(message.contains("limit"), "{message}");
+        assert!(message.contains("非负整数"), "{message}");
+    }
+
+    /// 票 06③：同族的宽松读取一次改齐——`list_dir` 的 `recursive` 也认字符串布尔值，
+    /// 给了别的形态照样报错。
+    #[tokio::test]
+    async fn list_dir_coerces_string_booleans_and_rejects_other_shapes() {
+        let s = setup(Stage::Develop);
+        std::fs::create_dir_all(s.worktree.join("sub/deep")).unwrap();
+        std::fs::write(s.worktree.join("sub/deep/x.txt"), "x").unwrap();
+
+        let flat = s
+            .executor
+            .execute(
+                &call(
+                    "list_dir",
+                    serde_json::json!({"path": ".", "recursive": false}),
+                ),
+                &s.ctx,
+            )
+            .await
+            .unwrap();
+        assert!(!flat.content.contains("x.txt"), "{}", flat.content);
+
+        let recursive = s
+            .executor
+            .execute(
+                &call(
+                    "list_dir",
+                    serde_json::json!({"path": ".", "recursive": "true"}),
+                ),
+                &s.ctx,
+            )
+            .await
+            .unwrap();
+        assert!(recursive.content.contains("deep/"), "{}", recursive.content);
+        assert!(recursive.content.contains("x.txt"), "{}", recursive.content);
+
+        let err = s
+            .executor
+            .execute(
+                &call(
+                    "list_dir",
+                    serde_json::json!({"path": ".", "recursive": "maybe"}),
+                ),
+                &s.ctx,
+            )
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("recursive"), "{err}");
+    }
+
     #[tokio::test]
     async fn edit_file_replaces_once_and_errors_when_missing() {
         let s = setup(Stage::Develop);
@@ -4562,6 +4796,42 @@ mod tests {
                 .map(|c| c.contains("line 19999"))
                 .unwrap_or(false)),
             "卸载文件应含完整内容"
+        );
+    }
+
+    #[tokio::test]
+    async fn reading_back_an_offload_artifact_is_not_offloaded_again() {
+        // 票 01④：卸载产物**读回来**的那一次不再卸载——否则卸载提示语教的
+        // `read_file("{path}")` 会把同一个大文件一次次写成新的 `.context`（本次事故 84 个 / 1.6MB）。
+        let s = setup(Stage::Develop);
+        let long = (0..20_000)
+            .map(|i| format!("line {i} of a very long offloaded artifact"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let ctx_dir = s.home.context_dir("t1");
+        std::fs::create_dir_all(&ctx_dir).unwrap();
+        std::fs::write(ctx_dir.join("artifact.txt"), &long).unwrap();
+
+        let out = s
+            .executor
+            .execute(
+                &call(
+                    "read_file",
+                    serde_json::json!({"path": ".context/artifact.txt", "limit": 20_000}),
+                ),
+                &s.ctx,
+            )
+            .await
+            .unwrap();
+        assert!(
+            !out.content.contains("已卸载"),
+            "回读卸载产物不应再卸载：{}",
+            &out.content[..out.content.len().min(200)]
+        );
+        assert_eq!(
+            std::fs::read_dir(&ctx_dir).unwrap().count(),
+            1,
+            "回读不得生成新的 .context 文件"
         );
     }
 

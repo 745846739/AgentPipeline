@@ -39,7 +39,13 @@
           message: `第 ${row.line} 行没有标题——「| 描述」这种写法会造出一个没有名字的子任务。`,
         };
       }
-      tasks.push({ title, description: description ?? '' });
+      // 描述与后端同一关（票 05①）：空描述的子任务照样会让 architect 靠翻仓库猜范围
+      if (!description) {
+        return {
+          message: `第 ${row.line} 行没有描述——描述必填（下游 agent 靠它判断要实现什么）。`,
+        };
+      }
+      tasks.push({ title, description });
     }
     return { tasks };
   }
@@ -67,9 +73,14 @@
 >
   <!-- 正文只说动作与后果：拆分后原任务会怎样，而不是内部编号（决策 199）。 -->
   <div class="hint">
-    每行一个子任务，格式 <span class="mono">标题 | 描述</span>。拆分后原任务会被取消。
+    每行一个子任务，格式 <span class="mono">标题 | 描述</span>（两者都必填）。拆分后原任务会被取消。
   </div>
-  <textarea class="input mono" rows="6" bind:value={text} placeholder="实现 A 部分 | 说明…&#10;实现 B 部分"></textarea>
+  <textarea
+    class="input mono"
+    rows="6"
+    bind:value={text}
+    placeholder="实现 A 部分 | 说明…&#10;实现 B 部分 | 说明…"
+  ></textarea>
   {#if shownError}<div class="error" role="alert">{shownError}</div>{/if}
 </Modal>
 

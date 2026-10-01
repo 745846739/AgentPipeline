@@ -130,6 +130,11 @@ workspace 成员 `crates/testkit`，供 L2 / L4 复用：
 | Web Push 加密（决策 323，pwa-webpush 票 02） | 新模块 `webpush.rs` **10 条**：**RFC 8291 §5 与附录 A 的 known-answer 三条**——`rfc8291_key_derivation_known_answer`（把 RFC 给的 ua/as 公钥、auth、salt 喂进去，断言 ECDH 秘密 → IKM → `cek` / `nonce` 逐字节等于 RFC 的真值）、`rfc8291_record_sealing_known_answer`（同一份 plaintext 用真值 `cek`/`nonce` 封出来与 RFC 的密文逐字节相同）、`the_header_layout_matches_the_rfc`（`salt ‖ rs ‖ idlen ‖ keyid` 的 21 字节头 + 记录末尾的 `0x02` 分隔），外加**独立写的解密往返**（测试自带一条解密路径，不调生产代码，证明加密侧真的产出能被标准实现解开的东西）、每次加密换临时密钥（同一明文两次密文不同）、畸形订阅（p256dh 不是 65 字节 / auth 不是 16 字节 / endpoint 不是 http(s)）逐条拒、VAPID JWT 自验（拿自己签的 `ES256` 与公钥核 `aud` = endpoint origin / `exp` / `sub` = 占位 mailto）。**为什么自实现而不是引库**：`ring` 的 ECDH / ECDSA / AES-GCM / HKDF 都在，而 RFC 有现成 KAT——能钉住整条链的库就是更好的库；ring 不能导入裸私钥，故 KAT 钉的是 KDF 与记录封装，ECDH 本身用它的审计实现 | 323 |
 | 订阅行与 VAPID 密钥（决策 323） | `storage/push.rs` **7 条**：按 `endpoint` upsert（同 endpoint 两次订阅**落一行**、`created_at` 只在首插时写、`id` 稳定）、`p256dh`/`auth`/UA 被后一次订阅刷新、清单按时间升序、删行只删指定 id、清空返回删掉的行数、`push_vapid_keys` 遇半行（只手改过库）按「没有」处理、`ensure_push_vapid_keys` **幂等且不覆盖已存的那一对**（并发写入者的值不会被后来者清掉，写完重读一次给调用方真值） | 323 |
 
+| 元数据提取与截断（决策 367） | `extract_metadata` 四级：tool_calls → **正文 XML 形态**（`MetadataSource::XmlToolCall`）→ ```json 围栏 → 平衡 JSON；`validation_failure_error` 对截断型失败换文案（含 `TRUNCATED_ARGUMENTS_MARKER`、不含 "missing field"）；`retry_prompt` 换成"精简正文后再提交"；`broken_arguments_note` 带上游 `finish_reason`。**四段真实残片 + 两段完整 XML 正文固化为 fixture**（现场实测，构造不出来） | 367 / 33 |
+| 模板 ↔ schema 一致性（决策 369） | `submit_metadata_templates_match_their_json_schema`：12 个 agent 节点逐个断言「模板列的字段 ∈ schema `properties`」且「schema `required` 被模板提到」，口径取自 `model_request::submit_metadata_tool_for`（不另建表）；`the_consistency_checker_rejects_both_drift_directions`：拿 2026-10-01 的真实错法（多写 `readiness` / 漏提 `passed`）构坏模板，证明判据有牙齿 | 369 / 38 |
+| 工具参数形态（决策 372） | `arg_u64` / `arg_bool` 两个口径唯一的助手：数字字符串强转（`"90"` → 90）、错型报错（`"abc"` → 报文含"非负整数"，不静默整份读）；`read_file` 的 `offset`/`limit`/`tail`、`list_dir` 的 `recursive`、`read_board` 的 `runs`、`read_conversation` 的 `run_id`、`run_command`/`run_command_argv`/`web_fetch` 的 `timeout_sec` 全走这一处 | 372 |
+| 补充输入的取法（决策 371） | `supplement_input`：剥标题行取正文；**有 `## 用户答复` 小节时只取它**——决策 279 的"turn 就是用户那句话"不许被决策 371 的留痕富化打穿 | 279 / 371 |
+
 ## 6. 集成测试目录（L2）
 
 | 关注点 | 用例 | 决策锚点 |
@@ -245,13 +250,17 @@ workspace 成员 `crates/testkit`，供 L2 / L4 复用：
   `many_discoveries_note_rows_once_each`——同一个终态失败现在同时是 `scheduler_no_effect` 与
   `run_failed` 两个事实，断言随之改成**按类别**取证（宽限期内不报处置未生效，**而失败本身当场可见**）。
 
+| sync-check 缺项 fail-closed（决策 370） | `degraded_stage_metadata_blocks_the_sync_gate`：三行元数据都是 `{"readiness":true}` → **不 Proceed**，`metadata_gaps` 点名 `acceptance_criteria` / `test_scenarios`，且缺项进 `backtrack-feedback.md`；`intact_metadata_with_a_dangling_ref_still_blocks`：反面——缺项判据不许挤掉既有的 design_refs 引用校验 | 370 / 136 |
+| 超时梯子与陈旧 run（决策 368） | `the_ladder_still_climbs_across_a_timeout_originated_cancel`（跨"超时自己造的中止行"继续爬、第 4 档真的走到 `pending(timeout)`）、`a_human_cancel_still_resets_the_ladder`（人按停照旧清零）、`a_stale_timeout_only_closes_the_row_and_leaves_the_live_attempt_alone`（陈旧 run 的尸检不发 `request_cancel`）、`a_restart_closes_leftover_task_runs_without_impersonating_a_timeout`（重启收尾不冒充"节点超时"） | 368 / 320 / 226 |
+| 补充输入的落盘与注入（决策 371） | `an_info_insufficient_answer_is_recorded_together_with_its_questions`：答复后 `user-input.md` 同时含问题原文、推荐答案与用户答复，且 architect-design.execute 的 user prompt 里三样都在（重入段渲染）；`supplement_input_rides_the_transcript_tail_and_leaves_the_first_message_verbatim` 钉住 user turn 仍是用户那句话、首条消息逐字不变 | 371 / 279 / 79 / 277 |
+
 ## 7. API 契约测试（L3）
 
 in-process axum router（tower oneshot），不 spawn 二进制：
 
 | 端点组 | 关键断言 | 决策 |
 |---|---|---|
-| POST /tasks | 一律 queued（有依赖 waiting）；循环依赖 400；未配置 provider 明确报错 | 98 / 27 / 56 |
+| POST /tasks | 一律 queued（有依赖 waiting）；循环依赖 400；未配置 provider 明确报错；**标题 / 描述空白 → 400**（重提 split 逐个子任务同一关） | 98 / 27 / 56 / 371 |
 | POST /projects | 非 git 仓库拒绝；DELETE 有活跃任务拒绝 | 61 / 29 / 101 |
 | GET /tasks | `project_id` / `status` / `include_archived` 过滤；分支级摘要 | 101 |
 | GET /tasks/{id} | `allowed_actions` 按 `(type, context.kind)` 下发 | 49 / 130 |
