@@ -598,14 +598,6 @@ export function setForemanWatch(enabled: boolean): Promise<{ enabled: boolean; o
 }
 
 
-/* 命令执行（决策 297）：开关 + 活体探测；保存时探测失败也照存。 */
-
-/**
- * 读**命令执行**设置（票 05）：存的状态 + **每次现做一次**的活体探测。
- *
- * 「现做」不是实现细节而是契约的一部分：这台机器上 rtk 装没装、还灵不灵，只有在读的
- * 那一刻问一遍才算数（决策 257 的「重读目标态」）。
- */
 /* 重活外发（票 runner-offload/05）：开关 + 活体探测；保存时探测失败也照存。 */
 
 /** 读**重活外发**设置：存的状态 + 每次现做一次的活体探测（gh 登录态/工作流在场）。 */
@@ -618,6 +610,14 @@ export function setOffload(payload: { enabled: boolean }): Promise<OffloadSettin
   return request<OffloadSettings>('/offload', { method: 'PUT', body: payload });
 }
 
+/* 命令执行（决策 297）：开关 + 活体探测；保存时探测失败也照存。 */
+
+/**
+ * 读**命令执行**设置（票 05）：存的状态 + **每次现做一次**的活体探测。
+ *
+ * 「现做」不是实现细节而是契约的一部分：这台机器上 rtk 装没装、还灵不灵，只有在读的
+ * 那一刻问一遍才算数（决策 257 的「重读目标态」）。
+ */
 export function getRtk(): Promise<RtkSettings> {
   return request<RtkSettings>('/rtk');
 }

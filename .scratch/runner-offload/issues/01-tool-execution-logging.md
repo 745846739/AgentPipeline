@@ -22,4 +22,9 @@
       无日志间隔」三段分布(脚本或临时查询即可,不要求界面)
 - [ ] 部署到 106 后,新任务不因新增日志产生明显 IO 压力
       (storage-io-budget 的约束仍成立)
-- [ ] 不改 attempt 语义(B8 另案),不动 recording 落库口径
+- [x] 不改 attempt 语义(B8 另案),不动 recording 落库口径
+      —— **行上无 attempt 字段**(code review 指出):ToolCallContext 没有它,补齐要翻
+      调度层;B8 已把 attempt 计数器本身定为混义,等 B8 釐清了语义再补字段,不抢跑。
+- [x] **时长口径已核**(code review):日志收场行的 duration_ms 覆盖「分发→L2 卸载」
+      全程,kanban_node_commands.duration_ms 只量 runner.run 一段——**近似相等、
+      不严格相等**,对账以「同一次执行、同一量级」判,不逐毫秒比。

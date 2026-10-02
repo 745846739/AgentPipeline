@@ -171,4 +171,29 @@ describe('命令执行页（决策 297 / 票 05）', () => {
       '#/settings/market',
     );
   });
+  it('外发卡（票 runner-offload/05）按探测读数渲染:开着且探测齐全=外发', async () => {
+    // rtk 置于开启态:页上只剩外发卡一颗「打开」钮,断言不撞歧义。
+    mocks.getRtk.mockResolvedValue(ON_READY);
+    mocks.getOffload.mockResolvedValue(OFFLOAD_ON_OK);
+    render(SettingsTools);
+    expect(await screen.findByText('开启：重活外发')).toBeTruthy();
+    expect(
+      screen.getByText(/agent 可把全量测试 \/ clippy \/ 构建外发到 GitHub runner/),
+    ).toBeTruthy();
+  });
+
+  it('外发卡:探测有缺口时保存**不拦**,提示回退本机执行并留痕', async () => {
+    mocks.getRtk.mockResolvedValue(ON_READY);
+    mocks.getOffload.mockResolvedValue(OFFLOAD_OFF);
+    // 保存读数:开着,但 gh 未登录(先开开关、后登录是共识里写明的顺序)
+    mocks.setOffload.mockResolvedValue({
+      enabled: true,
+      origin: 'settings',
+      probe: { gh_authed: false, gh_reason: 'gh 不在场', workflow_present: false },
+    });
+    render(SettingsTools);
+    await fireEvent.click(await screen.findByRole('button', { name: '打开' }));
+    expect(await screen.findByText(/回退本机执行并留痕/)).toBeTruthy();
+  });
+
 });

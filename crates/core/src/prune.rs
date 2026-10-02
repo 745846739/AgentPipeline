@@ -17,6 +17,8 @@
 
 use crate::home::Home;
 use serde::Serialize;
+#[cfg(unix)]
+use std::os::fd::AsRawFd;
 
 /// 共享缓存的总量上限：10 GiB。40G 盘上给构建缓存留这个量级有历史依据——
 /// 单任务全量 target 实测 1.4GB，十个并发深度也到不了这个帽。
@@ -38,23 +40,60 @@ pub async fn prune_build_cache(home: &Home) -> PruneStats {
     prune_with_cap(home, SHARED_TARGET_CAP_BYTES).await
 }
 
+/// 共享目录的**占锁哨兵**：回收前先试拿非阻塞排它锁。拿不到 = 还有任务在构建
+/// （票据的硬要求：清理不得影响在跑任务），本次跳过、留给下一个终态事件。
+/// 锁文件常驻不删——删了会出现「持锁 inode 与后来者打开的 inode 不是同一个」的竞态。
+#[cfg(unix)]
+fn try_lock_guard(root: &std::path::Path) -> Option<std::fs::File> {
+    let file = std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .open(root.join(".prune-lock"))
+        .ok()?;
+    // flock(LOCK_EX|LOCK_NB):拿不到立刻走人——这是哨兵,不是闸门。
+    // std 的 File::try_lock 要 1.89,仓库 MSRV 声明 1.80,故走 libc
+    // (io_budget 的 statvfs 同款先例)。
+    let rc = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
+    if rc == 0 {
+        Some(file)
+    } else {
+        None
+    }
+}
+
+/// 非 unix 没有这套哨兵:宁可不收,也不冒「删掉在跑构建」的险。
+#[cfg(not(unix))]
+fn try_lock_guard(_root: &std::path::Path) -> Option<std::fs::File> {
+    None
+}
+
 /// cap 注入的内部形态：测试用它把「总量兜底」逼出来。
 async fn prune_with_cap(home: &Home, cap_bytes: u64) -> PruneStats {
     let root = home.shared_target_path();
     let stats = tokio::task::spawn_blocking(move || {
+        // 有别的任务正持锁构建 → 本次不收（WARN 留痕，机会留给下一个终态事件）。
+        // 票据的硬要求：清理不得影响在跑任务——拿不到锁就整段让路。
+        let Some(_guard) = try_lock_guard(&root) else {
+            tracing::warn!("共享构建缓存正被在跑的构建占用，本次回收跳过");
+            return PruneStats::default();
+        };
         let incremental_bytes = remove_incremental_trees(&root);
         let total_after_incremental = dir_size(&root);
-        let full_reset = if total_after_incremental > cap_bytes {
-            let _ = std::fs::remove_dir_all(&root);
-            true
-        } else {
-            false
-        };
-        let remaining_bytes = if full_reset {
-            0
-        } else {
-            total_after_incremental
-        };
+        let mut full_reset = false;
+        let mut remaining_bytes = total_after_incremental;
+        if total_after_incremental > cap_bytes {
+            full_reset = true;
+            match std::fs::remove_dir_all(&root) {
+                Ok(()) => remaining_bytes = 0,
+                Err(e) => {
+                    // 清空失败如实记：full_reset 仍为真（意图已发生），读数按实重测——
+                    // 不许把「没删掉」报成「已归零」。
+                    tracing::warn!(error = %e, "共享构建缓存整体清空失败");
+                    remaining_bytes = dir_size(&root);
+                }
+            }
+        }
         if incremental_bytes > 0 || full_reset {
             tracing::info!(
                 incremental_mb = incremental_bytes / (1024 * 1024),

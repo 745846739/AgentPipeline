@@ -22,15 +22,24 @@ use crate::state::{map_core_error, ApiResult, AppState};
 /// 每个已登记项目的 `.github/workflows/offload.yml`——与 deploy 闸门用的
 /// 「仓库里有没有这份文件」同一口径，不做网络往返。
 async fn probe(state: &AppState) -> serde_json::Value {
-    let gh = tokio::process::Command::new("gh")
-        .arg("auth")
-        .arg("status")
-        .stdin(std::process::Stdio::null())
-        .output()
-        .await;
+    // `gh auth status` 会做**真网络校验**（token 有效性、SSH 探测）——出口被黑洞的机器
+    // （106 恰是这种形态）上能挂几分钟。探测是设置页的读数，不是任务收口的闸门：
+    // 10 秒拿不到答案就按「未登录」上报，超时本身写进 reason 原样摆出来。
+    let gh = tokio::time::timeout(
+        std::time::Duration::from_secs(10),
+        tokio::process::Command::new("gh")
+            .arg("auth")
+            .arg("status")
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .kill_on_drop(true)
+            .output(),
+    )
+    .await;
     let (gh_authed, gh_reason) = match gh {
-        Ok(out) if out.status.success() => (true, None),
-        Ok(out) => (
+        Ok(Ok(out)) if out.status.success() => (true, None),
+        Ok(Ok(out)) => (
             false,
             Some(
                 String::from_utf8_lossy(&out.stderr)
@@ -40,7 +49,8 @@ async fn probe(state: &AppState) -> serde_json::Value {
                     .to_string(),
             ),
         ),
-        Err(e) => (false, Some(format!("gh 不在场：{e}"))),
+        Ok(Err(e)) => (false, Some(format!("gh 不在场：{e}"))),
+        Err(_) => (false, Some("探测超时（10s）——出口可能不通".to_string())),
     };
     let workflow_present = workflow_present_in_any_project(state).await;
     json!({

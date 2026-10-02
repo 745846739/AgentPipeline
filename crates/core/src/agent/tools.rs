@@ -2484,10 +2484,16 @@ impl ToolExecutor {
     }
 
     /// 任务上下文里的命令附加**共享构建缓存**（票 runner-offload/03）：`CARGO_TARGET_DIR`
-    /// 指向 `{home}/shared-target`。只挂任务命令（`session_id = None`）——值班长/闸门的
-    /// 命令没有 worktree 语义，不该被这个变量改写行为。变量对非 cargo 命令无害。
-    /// 多任务并发构建会在共享目录的 cargo 文件锁上排队：2 核机器上本来也要排队，
-    /// 换来的是 registry 依赖跨任务免重编（全量 ~20 分钟 → 增量分钟级）。
+    /// 指向 `{home}/shared-target`。只挂任务命令（`session_id = None`）——值班长的命令
+    /// 没有 worktree 语义。闸门/修复轮的命令**同样指向共享目录**（它们的 runner 在
+    /// `pipeline::run_system_command` / `pipeline::repair` 各自接线），本函数只管
+    /// agent 手跑的这一条。变量对非 cargo 命令无害。
+    ///
+    /// **并发语义**：多任务并发构建会在共享目录的 cargo 文件锁上**零进度排队**
+    /// （区别于 CPU 争抢的慢速推进）。任务命令缺省超时 60s（`tool_timeout_sec`），
+    /// 排队可能吃光它——构建类命令（cargo build/test 全量）本就该显式传
+    /// `timeout_sec`（走查跑 e2e 传 7.5 分钟是既有实践）；闸门侧的
+    /// `test_command_timeout_sec`（600s）覆盖排队绰绰有余。
     fn runner_for(&self, ctx: &ToolCallContext) -> crate::exec::CommandRunner {
         let mut runner = self.runner();
         if ctx.session_id.is_none() {
@@ -5110,11 +5116,6 @@ mod tests {
             )
             .await
             .unwrap();
-        assert!(
-            out.content.contains("v=\n") || out.content.contains("v="),
-            "值班长命令不该被改写 CARGO_TARGET_DIR: {}",
-            out.content
-        );
         assert!(
             !out.content.contains("shared-target"),
             "值班长命令不得拿到共享路径: {}",
