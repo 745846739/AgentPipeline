@@ -34,4 +34,10 @@ ClientHello(半开连接),一次握手永久挂住 → accept 停摆 → backlog
 
 落点:`crates/app/src/serve.rs`(`TlsListener` 重写,`TLS_HANDSHAKE_TIMEOUT` 常量,
 fixture `crates/app/tests/fixtures/tls-test-{cert,key}.pem`)。回归测试在旧代码上
-会卡死在第 ⑤ 步——修复后 0.51s 跑绿。106 公网实测见票尾补记。
+会卡死在第 ⑤ 步——修复后 0.51s 跑绿。
+
+**106 公网实测(2026-10-02,commit 90fb0a2 部署后)**:从本机对
+`106.12.12.6:3389` 建半开连接(TCP 握手后不发 ClientHello)挂 15 秒,期间
+三次公网 HTTPS 请求分别 0.17s / 0.14s / 0.18s 得到应答(403 + `pairing_required`,
+未配对设备的正确应答,闸门照常工作);挂起结束后服务健康不变。验收通过。
+注意旧代码上同样的探测会让这三次请求全部超时——三次生产挂死的复现形态。

@@ -267,6 +267,18 @@
   在 tokio worker 上秒级不可分片,B9 修掉后仍是饿死隐患;
   `git.rs:105-115` blocking 池超时后线程不回收。
 - 详细定位过程与全部 file:line 见本次探查结论(已在本节浓缩)。
+
+## 落地实录(2026-10-02)
+
+- **已实现并部署**(commit 90aec20 / 09959cf / 49abe63 / 90fb0a2,CI check 绿后
+  deploy-106 部上 106):票 01(B9,serve.rs 并发握手 + 10s 超时 + slowloris 回归)、
+  票 02(B3/B6,真实账语义 + 30s 滚动入账)。本地四组测试套件全绿
+  (core lib 713 / integration 486 / app lib 85 / app integration 229)。
+- **B9 公网验收通过**:部署后从本机建半开连接挂 15 秒,期间三次公网 HTTPS 请求
+  0.14~0.18s 正常应答(403 + pairing_required,闸门照常);旧代码上这个探测
+  就是三次生产挂死的复现形态。
+- 待办:票 03–08(压缩硬底、续接简报化、prompt cache、截断显性化、
+  worktree 回收、ux-audit-3 重建)——见 `.scratch/106-stability/README.md`。
 - **06:00(本地 14:00)第十二次巡检**:无变化。05:39 重启后 HTTP 保持健康
   (详情接口 14ms),run=164(attempt=6)在 develop 干活(request 到 3094,均 ok),
   零 WARN/ERROR,磁盘稳定 19G,交付物未落盘。develop 已六次重入,任务整体已跑
