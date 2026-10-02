@@ -1,0 +1,114 @@
+# 重活外发(票 runner-offload/04):把确定性重活(cargo test / clippy / 构建)从
+# 106(2核/1GB/40G)搬到 GitHub hosted runner(4 核 16GB,公仓标准档免费)。
+#
+# 形态由共识钉死:
+#   · 输入 = 分支名 + commit SHA——**只外发已提交状态**,未提交改动不外发;
+#   · 结果只回**文本**(退出码 + 日志),不回传任何产物——106→GitHub 实测约 197KB/s,
+#     73MB 二进制要 6 分钟以上,「只取结果」是共识决策;
+#   · 不碰 secrets(与 check.yml 同一姿态:默认门不打真网络,决策 142/194)。
+#
+# 触发者是 106 上的 agent(offload_run 工具,票 06):`gh workflow run` + `gh run view`
+# 轮询读结果。触发者没有 GH_TOKEN 时在工具层回退本机执行并留痕(票 06),本文件不管。
+name: offload
+
+on:
+  workflow_dispatch:
+    inputs:
+      branch:
+        description: '已推送的分支名(kanban/<task> 或 main)'
+        required: true
+      sha:
+        description: '要验证的 commit SHA(可空 = 分支尖端)'
+        required: false
+
+# 同一分支只留最新一轮外发:agent 侧是串行循环,过期的验证没有意义。
+concurrency:
+  group: offload-${{ inputs.branch || github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  # 与 check.yml 同一套环境钉法(决策 175 / 330 的理由全文见那边的注释,不复制)。
+  RUSTUP_TOOLCHAIN: "1.98.0"
+  CARGO_BUILD_JOBS: "4"
+  CARGO_INCREMENTAL: "0"
+
+jobs:
+  # ── 静态检查:fmt --check + clippy -D warnings ──────────────────────────────
+  lint:
+    name: offload lint(fmt + clippy)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.sha || inputs.branch }}
+      # cache-on-failure(决策 346):外发失败轮的编译进度不作废——外发的对象恰恰
+      # 是「可能红」的中间态,这条比在 check.yml 里更关键。
+      - uses: Swatinem/rust-cache@v2
+        with:
+          cache-on-failure: true
+          # 缓存按分支隔离:kanban 分支各自的增量互不污染。
+          prefix-key: offload-${{ inputs.branch || 'main' }}
+      - run: rustup component add clippy rustfmt
+      - id: lint
+        run: make check-lint
+      - if: always()
+        name: 结果落 summary(文本回传的载体)
+        run: |
+          {
+            echo "## offload lint"
+            echo "- ref: \`${{ inputs.sha || inputs.branch }}\`"
+            echo "- 结论: ${{ steps.lint.outcome == 'success' && '✅ 通过' || '❌ 失败' }}"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  # ── 全量测试:cargo test --workspace(与 make check-test 同一权威) ──────────
+  test:
+    name: offload test(cargo test --workspace)
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.sha || inputs.branch }}
+      - uses: Swatinem/rust-cache@v2
+        with:
+          cache-on-failure: true
+          prefix-key: offload-${{ inputs.branch || 'main' }}
+      - id: test
+        run: make check-test
+      - if: always()
+        name: 结果落 summary
+        run: |
+          {
+            echo "## offload test"
+            echo "- ref: \`${{ inputs.sha || inputs.branch }}\`"
+            echo "- 结论: ${{ steps.test.outcome == 'success' && '✅ 通过' || '❌ 失败' }}"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  # ── 构建证明:release 二进制可出(产物留在 runner,不回传) ─────────────────
+  build:
+    name: offload build(cargo build --release)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.sha || inputs.branch }}
+      - uses: Swatinem/rust-cache@v2
+        with:
+          cache-on-failure: true
+          prefix-key: offload-${{ inputs.branch || 'main' }}
+      - id: build
+        run: cargo build --release
+      - if: always()
+        name: 结果落 summary
+        run: |
+          {
+            echo "## offload build"
+            echo "- ref: \`${{ inputs.sha || inputs.branch }}\`"
+            echo "- 结论: ${{ steps.build.outcome == 'success' && '✅ 通过' || '❌ 失败' }}"
+          } >> "$GITHUB_STEP_SUMMARY"
