@@ -32,6 +32,8 @@ pub const RUN_COMMAND: &str = "run_command";
 pub const SUBMIT_METADATA: &str = "submit_metadata";
 /// `Skill` 与上游同名是**功能性决定**（决策 172③），字面量的主人仍是 [`super::client::SKILL_TOOL`]。
 pub const SKILL: &str = super::client::SKILL_TOOL;
+/// 重活外发（票 runner-offload/06）：agent 把一条白名单 cargo 命令交给 GitHub Actions。
+pub const OFFLOAD_RUN: &str = "offload_run";
 
 /// 一个内置工具的规格：名字 + 广告语 + 参数 JSON-Schema。
 pub struct ToolSpec {
@@ -43,8 +45,9 @@ pub struct ToolSpec {
     pub parameters: &'static str,
 }
 
-/// 8 个内置工具（决策 353）。顺序与 [`super::client::BUILTIN_TOOLS`] 一致（冻结断言逐位钉住）。
-pub const TOOL_SPECS: [ToolSpec; 8] = [
+/// 9 个内置工具（决策 353；9 = 8 + `offload_run`，票 runner-offload/06）。
+/// 顺序与 [`super::client::BUILTIN_TOOLS`] 一致（冻结断言逐位钉住）。
+pub const TOOL_SPECS: [ToolSpec; 9] = [
     ToolSpec {
         name: WRITE_FILE,
         description: "把整份内容写入任务工作区里的一个文件（整份覆盖，路径相对工作区根）。\
@@ -96,6 +99,15 @@ pub const TOOL_SPECS: [ToolSpec; 8] = [
                       上游技能正文里的 `Call the Skill tool` 说的就是这个工具。",
         parameters: r#"{"type":"object","properties":{"name":{"type":"string","description":"技能名（见 system prompt 的技能目录）"}},"required":["name"]}"#,
     },
+    ToolSpec {
+        name: OFFLOAD_RUN,
+        description: "把一条重活命令外发给 GitHub Actions 跑（设置里「重活外发」开着才可用）。\
+                      只收 cargo test / cargo clippy / cargo build 前缀的命令，且只外发\
+                      **已提交**状态：当前分支会推到远端，工作区必须干净。适合等得起几分钟的\
+                      全量测试 / lint；快命令用 run_command。外发链路本身出问题会自动回退\
+                      本机执行并说明；远端命令失败会带回退出码与日志尾部。",
+        parameters: r#"{"type":"object","properties":{"command":{"type":"string","description":"要外发的命令（仅 cargo test / cargo clippy / cargo build 前缀；不含 ; & | ` 换行 重定向 等组合符）"}},"required":["command"]}"#,
+    },
 ];
 
 /// 按名字查规格（广告集与 dispatch 共用的判据入口）。
@@ -137,7 +149,9 @@ mod tests {
     }
 
     /// 冻结断言（决策 353）：目录名字集与三份层名单的**分层对应**——
-    /// 内置 8 个里除 `submit_metadata`（本服务读结构化结论，不碰档位）外全在
+    /// 内置 9 个里除 `submit_metadata`（本服务读结构化结论，不碰档位）与 `offload_run`
+    /// （票 runner-offload/06：它推的是远端白名单命令，不走环境写层；可用性由设置里的
+    /// 外发开关管，广告侧跟着开关走——见 `model_request` 的广告点）外全在
     /// [`is_env_tool`] 层；动手的那四个恰是 `ENV_WRITE_TOOLS` 与内置集的交；
     /// 没有任何一个内置工具是本服务写接口。层字段不进目录表（决策 247），
     /// 这份对应就是「表 × 名单」之间唯一的对账单。
@@ -145,7 +159,7 @@ mod tests {
     fn frozen_layering_between_catalog_and_tier_lists() {
         let names: Vec<&str> = TOOL_SPECS.iter().map(|s| s.name).collect();
         for name in &names {
-            if *name == SUBMIT_METADATA {
+            if *name == SUBMIT_METADATA || *name == OFFLOAD_RUN {
                 assert!(!is_env_tool(name), "{name} 不该在环境层");
                 continue;
             }
@@ -179,7 +193,7 @@ mod tests {
     /// 期望值，对着 [`ToolExecutor::execute`] 各分支的 `args.get(...)` 读数。
     #[test]
     fn advertised_schemas_match_execute_parsing_field_by_field() {
-        let expected: [(&str, &[&str], &[&str]); 7] = [
+        let expected: [(&str, &[&str], &[&str]); 8] = [
             (WRITE_FILE, &["path", "content"], &["path", "content"]),
             (
                 EDIT_FILE,
@@ -195,6 +209,7 @@ mod tests {
                 &["command"],
             ),
             (SKILL, &["name"], &["name"]),
+            (OFFLOAD_RUN, &["command"], &["command"]),
         ];
         for (name, props, required) in &expected {
             let def = def_for(name).unwrap_or_else(|| panic!("{name} 应有目录行"));

@@ -186,6 +186,10 @@ pub struct CommandRunner {
     /// 语义由调用点声明（如任务命令的 `CARGO_TARGET_DIR` → 共享构建缓存），
     /// 本层不解释、只在 [`Self::apply_rewrite`] 装配 [`ChildEnv`] 时透传。
     extra_env: Vec<(String, String)>,
+    /// `PATH` 前置目录（票 runner-offload/06 的测试缝）：让 `gh` / `git` 这类名字解析到
+    /// 调用点指定的那一份（测试放假脚本）。与 rtk 的 shim 前置**同一机制**——rtk 在场时
+    /// 它让位（一条命令只有一个前置口），缺省 `None` = 原样。
+    path_prefix: Option<std::path::PathBuf>,
 }
 
 impl CommandRunner {
@@ -203,7 +207,14 @@ impl CommandRunner {
             heartbeat_interval: COMMAND_HEARTBEAT_INTERVAL,
             rtk: RtkSource::Off,
             extra_env: Vec::new(),
+            path_prefix: None,
         }
+    }
+
+    /// `PATH` 前置目录（票 runner-offload/06 的测试缝）：调用点声明语义，本层只透传。
+    pub fn with_path_prefix(mut self, dir: std::path::PathBuf) -> Self {
+        self.path_prefix = Some(dir);
+        self
     }
 
     /// 附加子进程环境变量（票 runner-offload/03）。调用点声明语义，本层透传。
@@ -308,7 +319,7 @@ impl CommandRunner {
             original: None,
         };
         let base_env = ChildEnv {
-            path_prefix: None,
+            path_prefix: self.path_prefix.clone(),
             extra_vars: self.extra_env.clone(),
         };
         if req.rewrite != Rewrite::Rtk {
@@ -322,6 +333,8 @@ impl CommandRunner {
             return (untouched(), base_env);
         };
         let env = ChildEnv {
+            // rtk 在场时它接管前置口（一条命令只有一个前置）；`with_path_prefix` 的调用点
+            // 前置的是测试假脚本，与 rtk shim 不会同时要。
             path_prefix: Some(rtk.shim_dir.clone()),
             extra_vars: self.extra_env.clone(),
         };

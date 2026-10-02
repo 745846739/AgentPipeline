@@ -200,14 +200,18 @@ pub struct ToolDef {
     pub parameters: serde_json::Value,
 }
 
-/// 8 个内置工具（决策 45 / 172③）。
+/// 9 个内置工具（决策 45 / 172③ / 353；9 = 8 + `offload_run`，票 runner-offload/06）。
 ///
 /// `Skill`（决策 172③，票 06）与上游同名是**功能性决定而非命名偏好**：上游技能的正文里
 /// 写着 `Call the Skill tool with "grilling"`，工具同名使这些正文**无需改写即可执行**。
 ///
+/// `offload_run`（票 runner-offload/06）在内置集但在**基线之外**（不在
+/// [`MANDATORY_TOOLS`]）：可用性由设置里的「重活外发」开关管，广告侧跟着开关走
+/// （`model_request` 的广告点现读开关），基线常驻反而让关着的开关也白占每个节点的窗口。
+///
 /// `spawn_sub_agent` **不在**此列——它是需要阶段显式声明的扩展工具（见
 /// [`SPAWN_SUB_AGENT_TOOL`]）。
-pub const BUILTIN_TOOLS: [&str; 8] = [
+pub const BUILTIN_TOOLS: [&str; 9] = [
     "write_file",
     "edit_file",
     "read_file",
@@ -216,13 +220,15 @@ pub const BUILTIN_TOOLS: [&str; 8] = [
     "run_command",
     "submit_metadata",
     "Skill",
+    "offload_run",
 ];
 
 /// 系统最小基线里不可移除的工具（§10.6.2）。
 ///
-/// 就是 [`BUILTIN_TOOLS`] 去掉 `Skill`：`Skill` 是**能力增量**，由阶段声明启用
+/// 就是 [`BUILTIN_TOOLS`] 去掉 `Skill` 与 `offload_run`：前者是**能力增量**，由阶段声明启用
 /// （决策 172③ 明确它不进 `MANDATORY_TOOLS`）——渐进披露下大量技能在池子里，
-/// 不该无条件把「按名拉取技能」这个动作塞给每个节点。
+/// 不该无条件把「按名拉取技能」这个动作塞给每个节点；后者的可用性由「重活外发」
+/// 开关管（见 [`BUILTIN_TOOLS`] 的说明）。
 pub const MANDATORY_TOOLS: [&str; 7] = [
     "write_file",
     "edit_file",
@@ -400,9 +406,14 @@ mod tests {
 
     #[test]
     fn builtin_tool_set_matches_decision_45_and_172() {
-        assert_eq!(BUILTIN_TOOLS.len(), 8, "决策 172③：7 → 8（+ Skill）");
+        assert_eq!(
+            BUILTIN_TOOLS.len(),
+            9,
+            "决策 172③：7 → 8（+ Skill）；票 runner-offload/06：8 → 9（+ offload_run）"
+        );
         assert!(BUILTIN_TOOLS.contains(&"submit_metadata"));
         assert!(BUILTIN_TOOLS.contains(&SKILL_TOOL));
+        assert!(BUILTIN_TOOLS.contains(&"offload_run"));
         assert!(!BUILTIN_TOOLS.contains(&"spawn_sub_agent"));
     }
 
@@ -431,5 +442,9 @@ mod tests {
             "Skill 不得进入基线强制工具"
         );
         assert!(MANDATORY_TOOLS.contains(&"submit_metadata"));
+        assert!(
+            !MANDATORY_TOOLS.contains(&"offload_run"),
+            "offload_run 的可用性由「重活外发」开关管，不进基线强制工具"
+        );
     }
 }

@@ -274,6 +274,27 @@ impl RequestPlan {
             ctx.stage_cfg,
         );
         let declared_tools = json_string_list(ctx.stage_cfg.and_then(|c| c.tools_json.as_ref()));
+        // 外发开关开 → 广告集追加 `offload_run`（票 runner-offload/06）。**现读**（与 rtk
+        // 开关同一姿态，决策 297）：保存即活。关着 = 广告里根本没有它（基线不含它，
+        // 见 `client::BUILTIN_TOOLS` 的说明），模型的窗口一个字节不多花。`deny` 档下
+        // 不追加——环境层整层都不在，单独留一个能跑远端命令的口子是漏。
+        let declared_tools = match ctx.store.offload_switch().await {
+            Ok(s) if s.enabled && env_mode != crate::types::EnvMode::Deny => {
+                let mut with_offload = declared_tools;
+                if !with_offload
+                    .iter()
+                    .any(|t| t == crate::agent::catalog::OFFLOAD_RUN)
+                {
+                    with_offload.push(crate::agent::catalog::OFFLOAD_RUN.to_string());
+                }
+                with_offload
+            }
+            Ok(_) => declared_tools,
+            Err(e) => {
+                tracing::warn!(error = %e, "读外发开关失败，按关处理（广告侧）");
+                declared_tools
+            }
+        };
         let tools = tool_defs(
             ctx.kind,
             &declared_tools,
