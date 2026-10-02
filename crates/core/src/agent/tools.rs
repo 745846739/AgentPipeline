@@ -700,48 +700,84 @@ impl ToolExecutor {
         if let Some(proposed) = self.confirm_gate(call, ctx).await? {
             return Ok(proposed);
         }
-        let outcome = match call.name.as_str() {
-            // 内置 8 工具的名字引用目录表常量（决策 353）——名字的字面量只此一份。
-            super::catalog::WRITE_FILE => self.write_file(call, ctx).await?,
-            super::catalog::EDIT_FILE => self.edit_file(call, ctx).await?,
-            super::catalog::READ_FILE => self.read_file(call, ctx).await?,
-            super::catalog::DELETE_FILE => self.delete_file(call, ctx).await?,
-            super::catalog::LIST_DIR => self.list_dir(call, ctx).await?,
-            super::catalog::RUN_COMMAND => self.run_command(call, ctx).await?,
-            // 修复轮（决策 210③④ / 票 10–12）：start 给一个可写的 worktree，finish 跑闸门
-            // → commit → 落提议，discard 回收。三件事的**序列**都在 `pipeline::repair` 里。
-            "repair" => self.repair(call, ctx).await?,
-            super::catalog::SUBMIT_METADATA => self.submit_metadata(call, ctx)?,
-            super::catalog::SKILL => self.skill(call)?,
-            "spawn_sub_agent" => self.spawn_sub_agent(call, ctx).await?,
-            // 台账只读工具（决策 182⑭，票 02）。它们在白名单里的位置与其余工具相同：
-            // 越权调用在函数开头的白名单检查处就被拒，这里不再重复判定「谁可以调」。
-            "read_task" => self.read_task(call).await?,
-            "read_conversation" => self.read_conversation(call).await?,
-            // 诊断包（决策 211③，票 03）：一次调用给出定因所需的全部证据。
-            "read_diagnosis" => self.read_diagnosis(call, ctx).await?,
-            // 只读取证（决策 232 / 237）：白名单命令、argv 直出。它**不在**环境层里，
-            // 故档位与值守轮的 deny 清单都管不到它——这正是「自主轮能取证」的落点。
-            "run_readonly" => self.run_readonly(call, ctx).await?,
-            // 内容搜索（决策 267）：纯 Rust 正则找内容。同属只读层——档位与值守轮的
-            // deny 清单都管不到它（run_readonly 同款判据）。
-            "search_content" => self.search_content(call, ctx).await?,
-            // 受治理的网口（决策 266）：GET-only、同一张出口白名单、落命令台账。
-            // 同属只读层故档位管不到它，但值守轮的 deny 清单收它（夜间外发无人盯）。
-            "web_fetch" => self.web_fetch(call, ctx).await?,
-            // 结构化选项提问（决策 265）：不在两段写清单里（恒 Execute——问话不是打算
-            // 执行的动作），载荷走每轮一个的槽。
-            "ask" => self.ask(call).await?,
-            // A 层环境读数（决策 188 / 207，票 01）：全部只读，全部走后端既有口径。
-            "read_board" => self.read_board().await?,
-            "read_metrics" => self.read_metrics().await?,
-            "read_projects" => self.read_projects().await?,
-            "read_stage_configs" => self.read_stage_configs().await?,
-            "read_skills" => self.read_skills().await?,
-            "read_providers" => self.read_providers().await?,
-            other => return Err(Error::Validation(format!("未知工具：{other}"))),
-        };
-        self.apply_l2_offload(call, ctx, outcome)
+        // 工具级执行日志（票 runner-offload/01）：与「模型请求派发/收场」同构——同一件
+        // 事实不能只在命令台账里活一份，翻日志流巡检的人（B3 的教训）不必知道还要另查 DB。
+        // 计时覆盖分发到 apply_l2_offload 的全程；start 行放在三道闸**之后**——被闸挡下的
+        // 调用没有「执行」可言，不当耗时记。
+        let started = std::time::Instant::now();
+        tracing::info!(
+            tool = %call.name,
+            run = ctx.run_id,
+            stage = %ctx.stage,
+            node = %ctx.node,
+            "工具调用开始"
+        );
+        let result: Result<ToolOutcome> = async {
+            let outcome = match call.name.as_str() {
+                // 内置 8 工具的名字引用目录表常量（决策 353）——名字的字面量只此一份。
+                super::catalog::WRITE_FILE => self.write_file(call, ctx).await?,
+                super::catalog::EDIT_FILE => self.edit_file(call, ctx).await?,
+                super::catalog::READ_FILE => self.read_file(call, ctx).await?,
+                super::catalog::DELETE_FILE => self.delete_file(call, ctx).await?,
+                super::catalog::LIST_DIR => self.list_dir(call, ctx).await?,
+                super::catalog::RUN_COMMAND => self.run_command(call, ctx).await?,
+                // 修复轮（决策 210③④ / 票 10–12）：start 给一个可写的 worktree，finish 跑闸门
+                // → commit → 落提议，discard 回收。三件事的**序列**都在 `pipeline::repair` 里。
+                "repair" => self.repair(call, ctx).await?,
+                super::catalog::SUBMIT_METADATA => self.submit_metadata(call, ctx)?,
+                super::catalog::SKILL => self.skill(call)?,
+                "spawn_sub_agent" => self.spawn_sub_agent(call, ctx).await?,
+                // 台账只读工具（决策 182⑭，票 02）。它们在白名单里的位置与其余工具相同：
+                // 越权调用在函数开头的白名单检查处就被拒，这里不再重复判定「谁可以调」。
+                "read_task" => self.read_task(call).await?,
+                "read_conversation" => self.read_conversation(call).await?,
+                // 诊断包（决策 211③，票 03）：一次调用给出定因所需的全部证据。
+                "read_diagnosis" => self.read_diagnosis(call, ctx).await?,
+                // 只读取证（决策 232 / 237）：白名单命令、argv 直出。它**不在**环境层里，
+                // 故档位与值守轮的 deny 清单都管不到它——这正是「自主轮能取证」的落点。
+                "run_readonly" => self.run_readonly(call, ctx).await?,
+                // 内容搜索（决策 267）：纯 Rust 正则找内容。同属只读层——档位与值守轮的
+                // deny 清单都管不到它（run_readonly 同款判据）。
+                "search_content" => self.search_content(call, ctx).await?,
+                // 受治理的网口（决策 266）：GET-only、同一张出口白名单、落命令台账。
+                // 同属只读层故档位管不到它，但值守轮的 deny 清单收它（夜间外发无人盯）。
+                "web_fetch" => self.web_fetch(call, ctx).await?,
+                // 结构化选项提问（决策 265）：不在两段写清单里（恒 Execute——问话不是打算
+                // 执行的动作），载荷走每轮一个的槽。
+                "ask" => self.ask(call).await?,
+                // A 层环境读数（决策 188 / 207，票 01）：全部只读，全部走后端既有口径。
+                "read_board" => self.read_board().await?,
+                "read_metrics" => self.read_metrics().await?,
+                "read_projects" => self.read_projects().await?,
+                "read_stage_configs" => self.read_stage_configs().await?,
+                "read_skills" => self.read_skills().await?,
+                "read_providers" => self.read_providers().await?,
+                other => return Err(Error::Validation(format!("未知工具：{other}"))),
+            };
+            self.apply_l2_offload(call, ctx, outcome)
+        }
+        .await;
+        let duration_ms = started.elapsed().as_millis() as u64;
+        match &result {
+            Ok(_) => tracing::info!(
+                tool = %call.name,
+                run = ctx.run_id,
+                stage = %ctx.stage,
+                node = %ctx.node,
+                duration_ms,
+                "工具调用收场"
+            ),
+            Err(error) => tracing::warn!(
+                tool = %call.name,
+                run = ctx.run_id,
+                stage = %ctx.stage,
+                node = %ctx.node,
+                duration_ms,
+                error = %error,
+                "工具调用收场"
+            ),
+        }
+        result
     }
 
     /// 需要确认钮的动作（决策 206 / 207）：`ask` 档下的环境层、以及**任何档位下**的
@@ -4957,5 +4993,94 @@ mod tests {
             .await
             .unwrap();
         assert!(out.content.contains("hello"));
+    }
+
+    // ── 工具级执行日志（票 runner-offload/01）：工具调用在日志流里留 start/end/耗时 ──
+
+    /// 捕获 tracing 输出用的共享缓冲。`#[tokio::test]` 是 current-thread 运行时，
+    /// `set_default` 的线程局部默认订阅者对 await 期间的 event 同样生效。
+    #[derive(Clone, Default)]
+    struct LogBuf(Arc<Mutex<Vec<u8>>>);
+
+    impl std::io::Write for LogBuf {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(buf);
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn every_tool_call_leaves_start_and_end_lines_in_the_log_stream() {
+        let s = setup(Stage::Develop);
+        let buf = LogBuf::default();
+        let writer_buf = buf.clone();
+        let subscriber = tracing_subscriber::fmt()
+            .with_max_level(tracing::Level::INFO)
+            .with_ansi(false)
+            .with_writer(move || writer_buf.clone())
+            .finish();
+        let _guard = tracing::subscriber::set_default(subscriber);
+
+        // 一条命令类 + 一条非命令类：两条路径都必须留痕。
+        s.executor
+            .execute(
+                &call("run_command", serde_json::json!({"command": "echo hi"})),
+                &s.ctx,
+            )
+            .await
+            .unwrap();
+        s.executor
+            .execute(
+                &call(
+                    "write_file",
+                    serde_json::json!({"path": "a.md", "content": "x"}),
+                ),
+                &s.ctx,
+            )
+            .await
+            .unwrap();
+
+        let logs = String::from_utf8(buf.0.lock().unwrap().clone()).unwrap();
+        // 消息本身 + 工具名各出现两次（开始/收场各一次），收场带耗时字段。
+        assert_eq!(logs.matches("工具调用开始").count(), 2, "logs: {logs}");
+        assert_eq!(logs.matches("工具调用收场").count(), 2, "logs: {logs}");
+        assert!(logs.matches("run_command").count() >= 2, "logs: {logs}");
+        assert!(logs.matches("write_file").count() >= 2, "logs: {logs}");
+        assert!(logs.contains("duration_ms"), "收场行应带耗时字段: {logs}");
+        // 与模型请求日志同构：run / stage / node 归属字段在行上。
+        assert!(
+            logs.contains("stage=\"develop\"") || logs.contains("stage=develop"),
+            "logs: {logs}"
+        );
+    }
+
+    #[tokio::test]
+    async fn failing_tool_still_leaves_an_end_line_with_the_error() {
+        let s = setup(Stage::Develop);
+        let buf = LogBuf::default();
+        let writer_buf = buf.clone();
+        let subscriber = tracing_subscriber::fmt()
+            .with_max_level(tracing::Level::INFO)
+            .with_ansi(false)
+            .with_writer(move || writer_buf.clone())
+            .finish();
+        let _guard = tracing::subscriber::set_default(subscriber);
+
+        let err = s
+            .executor
+            .execute(
+                &call("read_task", serde_json::json!({"task_id": "missing"})),
+                &s.ctx,
+            )
+            .await
+            .unwrap_err();
+
+        let logs = String::from_utf8(buf.0.lock().unwrap().clone()).unwrap();
+        assert!(!err.to_string().is_empty());
+        assert!(logs.contains("工具调用开始"), "logs: {logs}");
+        assert!(logs.contains("工具调用收场"), "失败也要有收场行: {logs}");
     }
 }
