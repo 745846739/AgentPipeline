@@ -6828,3 +6828,166 @@ async fn intact_metadata_with_a_dangling_ref_still_blocks() {
         "悬空引用要走 test_blockers：{blockers:?}"
     );
 }
+
+// ─────────────────────────── 票 05：prompt cache 的记账链路 ───────────────────────────
+
+/// 「第二轮起命中」的每轮命中量（取一个一眼能认出来的数）。
+const CACHE_READ_PER_HIT: u32 = 4096;
+
+/// 模拟 provider 前缀缓存的替身：同一 `(stage, node)` 的第 1 次调用冷启动（未命中），
+/// 此后每次报同一份命中读数。
+///
+/// 为什么是**模拟**而非测量：真实命中率由 provider 决定（106 的历史账单里整站命中
+/// 95.7%，见 `.scratch/106-stability/cache-findings.md`），替身这一侧的活是把
+/// 「响应里的缓存读数一路落到运行台账」这条记账链路钉住。
+///
+/// 三步走完一个节点：跑一次工具（建立非空转录）→ 交卷 → 一段**不带 tool_call** 的正文
+/// （轮循环只在「这一轮没有任何工具调用」时收口，见 `model_invoke`）。
+/// 只参与 architect-design.validate_input；其余节点一律给抽不出元数据的文本。
+struct PrefixCachingClient {
+    calls: Arc<AtomicUsize>,
+}
+
+/// 走完一个节点需要的模型调用次数（冷启动 + 交卷 + 收口）。
+const CALLS_ONE_NODE: u32 = 3;
+
+impl LlmClient for PrefixCachingClient {
+    fn complete(
+        &self,
+        request: LlmRequest,
+    ) -> BoxFuture<'static, agentpipeline_core::Result<AgentResponse>> {
+        if request.stage != Stage::ArchitectDesign || request.node != Node::ValidateInput {
+            return Box::pin(async move {
+                Ok(AgentResponse {
+                    content: Some("（替身只参与 validate_input）".into()),
+                    ..Default::default()
+                })
+            });
+        }
+        let calls = self.calls.clone();
+        Box::pin(async move {
+            let n = calls.fetch_add(1, Ordering::SeqCst);
+            // 第 1 次冷启动（未命中），此后每次命中。
+            let hit = if n == 0 { 0 } else { CACHE_READ_PER_HIT };
+            let call = |id: String, name: &str, arguments: String| {
+                agentpipeline_core::agent::client::ToolCall {
+                    id,
+                    name: name.into(),
+                    arguments,
+                }
+            };
+            let tool_calls = match n {
+                0 => vec![call("c0".into(), "list_dir", r#"{"path":"."}"#.into())],
+                1 => vec![call(
+                    "c1".into(),
+                    "submit_metadata",
+                    serde_json::to_string(&ValidateInputMetadata {
+                        readiness: true,
+                        blockers: vec![],
+                    })
+                    .unwrap(),
+                )],
+                // 收口那一轮：没有工具调用，轮循环到此为止（元数据已在上一轮交过）。
+                _ => Vec::new(),
+            };
+            Ok(AgentResponse {
+                content: (n >= 2).then(|| "交卷完事".to_string()),
+                tool_calls,
+                prompt_tokens: 100,
+                completion_tokens: 5,
+                cache_read_tokens: hit,
+                cache_write_tokens: 0,
+                ..Default::default()
+            })
+        })
+    }
+}
+
+#[tokio::test]
+async fn provider_cache_readings_land_on_the_run_row() {
+    // 票 05：缓存命中不只是 provider 的账——它必须一路落到运行台账（响应 → RunTokens →
+    // run 行）。详情页与滚动投影（决策 375）读的都是这一份，断了就没人看得见命中。
+    //
+    // 只等这一条 run 收口就中止执行体（本仓「只看一个节点」的既有形状）：替身不参与别的
+    // 节点，让它把整条流水线跑完没有意义——architect-design.execute 拿不到元数据会触发
+    // 回溯，那是另一件事的现场。
+    let settings = Settings {
+        agent_retry_max: 1,
+        ..Default::default()
+    };
+    let ctx = setup("true", settings.clone()).await;
+    testkit::seed_task(&ctx.store, "t-cache", "p1")
+        .await
+        .unwrap();
+    admit(&ctx, "t-cache").await;
+
+    let calls = Arc::new(AtomicUsize::new(0));
+    let client: Arc<dyn LlmClient> = Arc::new(PrefixCachingClient {
+        calls: calls.clone(),
+    });
+    let (store, sse, killer) = (
+        ctx.store.clone(),
+        Arc::new(ctx.sse.clone()),
+        Arc::new(ctx.killer.clone()),
+    );
+    let jh = tokio::spawn(async move {
+        Executor::new(store, settings, sse, client, killer)
+            .run("t-cache")
+            .await
+    });
+
+    let settled = tokio::time::timeout(Duration::from_secs(30), async {
+        loop {
+            let settled = ctx
+                .store
+                .list_runs_at("t-cache", Stage::ArchitectDesign, Node::ValidateInput)
+                .await
+                .unwrap()
+                .into_iter()
+                .find(|r| r.status != NodeStatus::Running);
+            if let Some(run) = settled {
+                return run;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await;
+    let run = match settled {
+        Ok(run) => run,
+        Err(_) => {
+            let runs = ctx
+                .store
+                .list_runs_at("t-cache", Stage::ArchitectDesign, Node::ValidateInput)
+                .await
+                .unwrap();
+            let task = ctx.store.get_task("t-cache").await.unwrap();
+            panic!(
+                "30s 内未收口：runs={:?} task_status={:?} owner={:?} llm_calls={}",
+                runs.iter()
+                    .map(|r| (r.id, r.attempt, r.status, r.error.clone()))
+                    .collect::<Vec<_>>(),
+                task.status,
+                task.executor_owner,
+                calls.load(Ordering::SeqCst),
+            );
+        }
+    };
+    jh.abort();
+
+    assert_eq!(run.status, NodeStatus::Success, "交卷即收口");
+    assert_eq!(
+        calls.load(Ordering::SeqCst),
+        CALLS_ONE_NODE as usize,
+        "冷启动 + 交卷 + 收口三轮"
+    );
+    assert_eq!(
+        run.cache_read_tokens,
+        CACHE_READ_PER_HIT * (CALLS_ONE_NODE - 1),
+        "第二轮起报的命中读数要原样落 run 行（冷启动那轮不算，也不能丢）"
+    );
+    assert_eq!(
+        run.prompt_tokens,
+        100 * CALLS_ONE_NODE,
+        "每轮各 100 prompt token"
+    );
+}

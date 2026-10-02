@@ -1437,6 +1437,67 @@ mod tests {
         );
     }
 
+    /// 票 05：组装是**缓存友好的稳定前缀**——同一份输入两次组装逐字节相同，工具顺序固定。
+    ///
+    /// provider 的前缀缓存只认「前缀逐字节相同」（106 的实测命中率与计费见
+    /// `.scratch/106-stability/cache-findings.md`）。这里任何一处轻微抖动都会让整段已缓存
+    /// 前缀作废，而它在功能用例里完全看不出来——换个 `HashMap` 收集顺序就够了。故本用例
+    /// 盯的是**确定性**本身：同一输入必须给出同一串字节、同一个 hash、同一份工具序列
+    /// （基线序 + 声明序 + schema 工具收尾，决策 38）。
+    #[tokio::test]
+    async fn assemble_freezes_a_byte_stable_head_and_a_fixed_tool_order() {
+        let (_tmp, _home, store, task, project, settings, cursor) = base().await;
+        let cfg = empty_stage_cfg(Stage::ArchitectDesign);
+        let build = || {
+            ctx(
+                &store,
+                &settings,
+                &task,
+                &project,
+                &cursor,
+                Some(&cfg),
+                AgentNodeKind::ValidateInput,
+            )
+        };
+        let first = assemble_ok(build()).await;
+        let second = assemble_ok(build()).await;
+
+        assert_eq!(
+            first.system, second.system,
+            "system 逐字节稳定（缓存前缀的第一段）"
+        );
+        assert_eq!(first.user, second.user, "user 逐字节稳定");
+        assert_eq!(first.hash, second.hash, "hash 是 system 的索引，同样稳定");
+
+        let names = |plan: &RequestPlan| -> Vec<String> {
+            plan.tools.iter().map(|t| t.name.clone()).collect()
+        };
+        let first_names = names(&first);
+        assert_eq!(first_names, names(&second), "工具定义的顺序固定");
+
+        // 基线工具的**顺序就是常量里的顺序**（决策 45）：任何收集方式的抖动
+        // （`HashMap` / 并行 gather）都会在这里露出来。
+        let mandated: Vec<&str> = crate::agent::client::MANDATORY_TOOLS
+            .iter()
+            .copied()
+            .filter(|n| *n != crate::agent::catalog::SUBMIT_METADATA)
+            .collect();
+        let split = first_names
+            .len()
+            .checked_sub(1)
+            .unwrap_or_else(|| panic!("工具定义不该为空"));
+        assert_eq!(
+            first_names[..split],
+            mandated[..],
+            "基线工具按常量序在前：{first_names:?}"
+        );
+        assert_eq!(
+            first_names.last().map(String::as_str),
+            Some(crate::agent::catalog::SUBMIT_METADATA),
+            "schema 工具收尾（决策 38）：{first_names:?}"
+        );
+    }
+
     #[tokio::test]
     async fn full_text_skill_body_changes_the_hash_but_name_only_does_not() {
         // 决策 170 / 211②：hash 对全文态技能正文敏感、名字态钝感——原文是权威，

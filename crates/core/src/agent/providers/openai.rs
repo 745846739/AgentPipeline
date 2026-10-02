@@ -242,6 +242,45 @@ mod tests {
     }
 
     #[test]
+    fn the_next_round_is_a_prefix_extension_of_the_previous_wire_messages() {
+        // 票 05 的缓存契约：provider 的前缀缓存只认「消息前缀逐字节相同」——
+        // 转录只追加，头（system + user + 已有各轮）一个字都不动。任何「每轮往
+        // 头部插一条提醒 / 把轮次序号拼进首条消息」的改动都会让已缓存的那一段
+        // 整段作废，而它在功能用例里完全看不出来。故把契约钉在适配器出口上。
+        let call = ToolCall {
+            id: "call_1".into(),
+            name: "read_file".into(),
+            arguments: r#"{"path":"a.md"}"#.into(),
+        };
+        let round1 = vec![Message::user("第一句")];
+        let mut round2 = round1.clone();
+        round2.push(Message::assistant(None, vec![call.clone()]));
+        round2.push(Message::tool_result(&call, "结果"));
+        let provider = fixture_provider("openai", "gpt-test", Some("http://127.0.0.1:1"));
+        let body = |messages: Vec<Message>| {
+            OpenAiCompatible
+                .build_body(&provider, &request(messages))
+                .unwrap()
+        };
+        let wire1 = body(round1).clone();
+        let wire2 = body(round2).clone();
+        let msgs1 = wire1["messages"].as_array().unwrap();
+        let msgs2 = wire2["messages"].as_array().unwrap();
+        assert!(
+            msgs2.len() > msgs1.len(),
+            "第 2 轮多出 assistant + tool 两条"
+        );
+        assert_eq!(
+            &msgs2[..msgs1.len()],
+            &msgs1[..],
+            "第 2 轮的消息头必须是第 1 轮的整段原样（缓存前缀延长的形状）"
+        );
+        // 采样参数与工具定义也不随轮次漂移（同一次 attempt 里 `RequestPlan` 冻结）。
+        assert_eq!(wire1["temperature"], wire2["temperature"]);
+        assert_eq!(wire1["tools"], wire2["tools"]);
+    }
+
+    #[test]
     fn an_empty_user_prompt_leaves_no_empty_wire_head_message() {
         // 值班长主轮的 user_prompt 是空的（快照并进末尾轮之后）——
         // 空槽不得变成一条空 user 消息占住 wire 头。
