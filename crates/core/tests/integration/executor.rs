@@ -5689,7 +5689,7 @@ async fn a_degenerated_round_is_marked_and_retried_with_the_transcript() {
 
 /// 必要条件二：续接的 run 打上 `continued_from_run_id`，任务 token 总量不双算。
 #[tokio::test]
-async fn continued_run_links_back_so_tokens_are_not_double_counted() {
+async fn continued_run_links_back_and_its_tokens_count_as_real_cost() {
     use agentpipeline_core::metrics::total_tokens;
 
     let ctx = info_insufficient_ctx("cont-tokens").await;
@@ -5741,15 +5741,16 @@ async fn continued_run_links_back_so_tokens_are_not_double_counted() {
         "链接须指向被续接的那条历史 run"
     );
 
-    // 汇总口径排除被续接的历史（FakeAgent 每轮 token 相同，故排除前后差一条的量）
+    // 真实账语义（决策 375）：汇总不再排除被续接的历史 run——那些 token 是模型
+    // 真实烧掉的（重喂的转录 provider 照单收费），盲求和就是全量。
     let naive: u64 = runs
         .iter()
         .map(agentpipeline_core::metrics::run_tokens)
         .sum();
     let counted = total_tokens(&runs);
-    assert!(
-        counted < naive,
-        "被续接的历史须从汇总里排除：counted={counted} naive={naive}"
+    assert_eq!(
+        counted, naive,
+        "排除规则已删：counted={counted} naive={naive}"
     );
     // 落库的任务总量与函数口径同源
     let task = ctx.store.get_task("cont-tokens").await.unwrap();

@@ -46,6 +46,15 @@ use crate::{Error, Result};
 /// （那要重来 19–45 个回合）小一个数量级——所以这里的预算宁可给宽一点。
 pub const LLM_TRANSPORT_RESEND_MAX: usize = 2;
 
+/// 任务投影（`kanban_tasks.total_tokens` / `updated_at`）滚动刷新的最小间隔（决策 375）。
+///
+/// 2026-10-02 的观测（106 上的 ux-audit-3 任务）：长节点执行期间详情页的计数与
+/// `updated_at` 完全冻结（静止 45 分钟、节点收口瞬间一次性入账 +1400 万 token），
+/// 监控方差点把它误判成卡死。根因是 `refresh_task_totals` 只在 attempt/节点边界被调。
+/// 修法：在 agent 轮循环里搭心跳的便车节流刷新——30s 一次，对 SQLite 写侧无感
+/// （当时同库还有 1.4s 的慢语句前科，不能每次请求都写）。
+const USAGE_PROJECTION_REFRESH: std::time::Duration = std::time::Duration::from_secs(30);
+
 use super::events::{
     emit_node_started, emit_tool_event, finish_run_with_sse, OUTPUT_CODE_CHANGES,
     OUTPUT_DESIGN_DOC, OUTPUT_DEV_DOC, OUTPUT_REVIEW_REPORT, OUTPUT_TEST_REPORT,
@@ -773,6 +782,8 @@ impl ModelInvoke {
         let carried_len = trace.messages.len();
         let mut tool_failures = 0u32;
         let mut submitted: Option<serde_json::Value> = None;
+        // 决策 375：滚动入账的节流戳——`None` 表示本 attempt 还没刷过投影。
+        let mut totals_refreshed_at: Option<std::time::Instant> = None;
 
         loop {
             // 中止请求（决策 226 / 276）：每一轮开头先看一眼。被叫醒的那一轮由下面模型调用处
@@ -882,6 +893,14 @@ impl ModelInvoke {
                 response.tool_calls.clone(),
             ));
             self.store.touch_run_heartbeat(run_id).await?;
+            // 决策 375：投影滚动刷新（节流 [`USAGE_PROJECTION_REFRESH`]）——长节点执行
+            // 期间详情页的 token 计数与 `updated_at` 不再冻结，监控不再把活跃任务误判
+            // 成卡死。失败不拖累这一轮：刷新是观测便利，不是记账的真相源（真相在
+            // `trace.tokens` 与 run 台账，收口时照旧精确落库）。
+            if totals_refreshed_at.map_or(true, |t| t.elapsed() >= USAGE_PROJECTION_REFRESH) {
+                let _ = self.store.refresh_task_totals(&task.id).await;
+                totals_refreshed_at = Some(std::time::Instant::now());
+            }
 
             if response.tool_calls.is_empty() {
                 // 收口即退出，交给下面的元数据抽取（含助手正文三级降级）判定；

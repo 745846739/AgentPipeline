@@ -40,8 +40,9 @@ use super::subagent::RunTokens;
 
 /// 一次 pending → resume 边界的续接素材（决策 180，票 13）。
 ///
-/// `from_run_id` 是**被续接的那条历史 run**，写进新 run 的 `continued_from_run_id`，
-/// 供指标汇总排除被重复计入的输入 token（票 13 必要条件二）。
+/// `from_run_id` 是**被续接的那条历史 run**，写进新 run 的 `continued_from_run_id`。
+/// 这个链接如今只做**谱系**（排障时顺着链往上爬）；指标汇总已不再据它排除——
+/// 排除规则随决策 375 删除（真实账语义：重喂的输入是真实成本）。
 pub(crate) struct Continuation {
     pub messages: Vec<Message>,
     pub from_run_id: i64,

@@ -21,23 +21,17 @@ pub fn run_tokens(run: &NodeRun) -> u64 {
     run.prompt_tokens as u64 + run.completion_tokens as u64
 }
 
-/// 任务累计 token = Σ 所有 run 行（含 system / 子代理 / 伪阶段，决策 100），
-/// **但排除被续接的历史 run**（决策 180，票 13）。
+/// 任务累计 token = Σ 所有 run 行（含 system / 子代理 / 伪阶段，决策 100）。
 ///
-/// 续接（`resume_continuation`）会把上一 attempt 的对话重新发一遍，于是历史 run 报过的输入
-/// token 在新 run 里再报一次。上面那条盲求和的规则在续接出现之前是对的；有了续接就要把
-/// 「被后继 run 指为续接来源」的那些排除掉，否则同一个 token 算两遍。
-///
-/// 排除的是**历史那一侧**而不是新 run：新 run 的 `prompt_tokens` 才是当前真实的上下文成本。
+/// **真实账语义（决策 375，2026-10-02）**：不排除任何 run——包括被续接的历史 run。
+/// 决策 180 曾按「被后继指为续接来源」排除历史 run，理由是「同一个 token 算两遍」；
+/// 但 106 的实测推翻了它：被续接的历史 run 上躺着的 token 是**模型真实烧掉的钱**
+/// （那次观测里一条超时 run 独占 1400 万 prompt），排除它账面就撒谎——
+/// 且排除按「被指认」判断，续接多轮时读数会随梯子逐档下跌，与新落库的
+/// `stored_total_tokens` 打架（同一时刻两个端点报两个数）。
+/// 续接重喂的成本是真实的：新 run 的 prompt 里确实包含了重发的转录，provider 照单收费。
 pub fn total_tokens(runs: &[NodeRun]) -> u64 {
-    let superseded: std::collections::HashSet<i64> = runs
-        .iter()
-        .filter_map(|r| r.continued_from_run_id)
-        .collect();
-    runs.iter()
-        .filter(|r| !superseded.contains(&r.id))
-        .map(run_tokens)
-        .sum()
+    runs.iter().map(run_tokens).sum()
 }
 
 /// 任务累计 LLM 调用次数 = 调 LLM 的 run 行数（排除 `agent_type = "system"`，决策 130 ②）。
@@ -344,6 +338,24 @@ mod tests {
             run(Stage::Init, Node::Execute, "system", 1, 1, (0, 0)),
         ];
         assert_eq!(total_tokens(&runs), 180);
+    }
+
+    /// 真实账语义（决策 375）：被续接的历史 run **不**被排除。
+    ///
+    /// 决策 180 的旧口径在这里断言「历史被排除」；106 实测（2026-10-02）推翻了它——
+    /// 超时 run 独占 1400 万 prompt 的真实成本被排除后账面撒谎，且随续接梯子逐档下跌。
+    #[test]
+    fn total_tokens_keeps_continued_from_runs() {
+        let mut history = run(Stage::Develop, Node::Execute, "main", 1, 10, (1000, 50));
+        history.id = 7;
+        let mut next = run(Stage::Develop, Node::Execute, "main", 2, 10, (1200, 60));
+        next.id = 8;
+        next.continued_from_run_id = Some(history.id);
+        assert_eq!(
+            total_tokens(&[history, next]),
+            2310,
+            "重喂的历史输入是真实成本，照旧入账"
+        );
     }
 
     #[test]

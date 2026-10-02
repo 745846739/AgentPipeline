@@ -1164,7 +1164,8 @@ pub struct NodeRun {
     pub prompt_template_hash: Option<String>,
     /// 本 run 续接了哪一条历史 run（决策 180，票 13）。`None` = 干净起跑。
     ///
-    /// 指标汇总据此排除被续接的历史——否则历史报过的输入 token 会在新 run 里再报一遍。
+    /// 只做续接谱系（排障爬链用）；指标汇总不再据它排除——排除规则随决策 375
+    /// 删除（真实账语义：重喂的输入是真实成本）。
     pub continued_from_run_id: Option<i64>,
     pub started_at: DateTime<Utc>,
     pub finished_at: Option<DateTime<Utc>>,
