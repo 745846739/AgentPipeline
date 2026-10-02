@@ -235,14 +235,54 @@ fn alpn_protocols() -> Vec<Vec<u8>> {
     vec![b"http/1.1".to_vec()]
 }
 
+/// 一次 TLS 握手愿意等的上限（决策 374）。
+///
+/// 2026-10-02 的生产事故：公网扫描器建了 TCP 却不发 ClientHello，而握手在
+/// **唯一的 accept 任务里逐个 `await` 且无超时**——一次挂住 = 整个监听停摆，
+/// backlog 积压、全站超时（执行体在别的 task 里不受影响，所以死得悄无声息，
+/// 两次挂死分别发生在暴露公网后 3~15 分钟与 26~43 分钟）。10 秒对最慢的真客户端
+/// （弱网移动端）也足够宽裕，对半开连接是利落的一刀。
+const TLS_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// 握手收成的类型别名。
+type Accepted = (
+    tokio_rustls::server::TlsStream<tokio::net::TcpStream>,
+    std::net::SocketAddr,
+);
+
 /// 带 TLS 的监听器。
 ///
 /// `accept` 的契约要求**自己重试**（axum 的 `Listener` 收不到错误：它拿到的就是
 /// `(Io, Addr)`）：握手失败在公网上是家常便饭——扫描器、没装 CA 的浏览器、协议不匹配——
 /// 一次失败绝不能把整个监听带下去，故只记一行然后接着听。
+///
+/// **握手不在 accept 路径上 await**（决策 374）：每收一条 TCP 就把握手连着
+/// [`TLS_HANDSHAKE_TIMEOUT`] 丢进独立任务，`accept` 自己只做两件事——收 TCP、
+/// 从完成队列里取已经握好的连接（`select!` 两者谁就绪走谁）。半开连接只会烧掉
+/// 它自己那个 10 秒后到点的任务，**永远不再阻塞别的连接**。
 struct TlsListener {
     inner: tokio::net::TcpListener,
     acceptor: tokio_rustls::TlsAcceptor,
+    /// 后台握手任务的成果队列。
+    done: tokio::sync::mpsc::UnboundedReceiver<Accepted>,
+    /// 队列的发送端：留一份在结构体里，`done.recv()` 就永远不会返回 `None`
+    /// （select 的那个分支不需要处理通道关闭）。
+    done_tx: tokio::sync::mpsc::UnboundedSender<Accepted>,
+    /// 单次握手的超时；生产用 [`TLS_HANDSHAKE_TIMEOUT`]，测试收短。
+    handshake_timeout: Duration,
+}
+
+impl TlsListener {
+    fn new(inner: tokio::net::TcpListener, acceptor: tokio_rustls::TlsAcceptor) -> Self {
+        let (done_tx, done) = tokio::sync::mpsc::unbounded_channel();
+        Self {
+            inner,
+            acceptor,
+            done,
+            done_tx,
+            handshake_timeout: TLS_HANDSHAKE_TIMEOUT,
+        }
+    }
 }
 
 impl axum::serve::Listener for TlsListener {
@@ -251,19 +291,46 @@ impl axum::serve::Listener for TlsListener {
 
     async fn accept(&mut self) -> (Self::Io, Self::Addr) {
         loop {
-            let (stream, addr) = match self.inner.accept().await {
-                Ok(pair) => pair,
-                Err(e) => {
-                    // 与 std 那个 `Listener` 同一姿态：accept 的错误（fd 耗尽、对端瞬断）
-                    // 是暂态，睡一下再来；忙等会把 CPU 打满。
-                    tracing::warn!(error = %e, "accept 失败，继续监听");
-                    tokio::time::sleep(Duration::from_millis(50)).await;
-                    continue;
+            tokio::select! {
+                // biased：先交付已握好的连接，再收新 TCP——两条都就绪时不让
+                // 等着的客户端给新扫描器让路。
+                biased;
+
+                pair = self.done.recv() => match pair {
+                    Some(pair) => return pair,
+                    // `done_tx` 活在结构体里，这条不可达；真发生也不该忙等。
+                    None => tokio::time::sleep(Duration::from_millis(50)).await,
+                },
+                tcp = self.inner.accept() => match tcp {
+                    Ok((stream, addr)) => {
+                        let acceptor = self.acceptor.clone();
+                        let done_tx = self.done_tx.clone();
+                        let timeout = self.handshake_timeout;
+                        tokio::spawn(async move {
+                            match tokio::time::timeout(timeout, acceptor.accept(stream)).await {
+                                Ok(Ok(tls)) => {
+                                    let _ = done_tx.send((tls, addr));
+                                }
+                                Ok(Err(e)) => {
+                                    tracing::debug!(error = %e, %addr, "TLS 握手失败（已忽略）");
+                                }
+                                Err(_) => {
+                                    // 半开连接：TCP 握了手却不发 ClientHello。
+                                    tracing::debug!(
+                                        %addr, timeout_secs = timeout.as_secs(),
+                                        "TLS 握手超时（半开连接，已丢弃）"
+                                    );
+                                }
+                            }
+                        });
+                    }
+                    Err(e) => {
+                        // 与 std 那个 `Listener` 同一姿态：accept 的错误（fd 耗尽、对端瞬断）
+                        // 是暂态，睡一下再来；忙等会把 CPU 打满。
+                        tracing::warn!(error = %e, "accept 失败，继续监听");
+                        tokio::time::sleep(Duration::from_millis(50)).await;
+                    }
                 }
-            };
-            match self.acceptor.accept(stream).await {
-                Ok(tls) => return (tls, addr),
-                Err(e) => tracing::debug!(error = %e, %addr, "TLS 握手失败（已忽略）"),
             }
         }
     }
@@ -303,7 +370,7 @@ fn serve_task(listener: AppListener, router: axum::Router) -> Listener {
             // 裹一层空 `tap_io` 只为满足 `serve_io` 的对端地址约束（理由见那里）；
             // 它不碰 IO，也不改任何行为。
             AppListener::Tls { inner, acceptor } => {
-                let listener = TlsListener { inner, acceptor }.tap_io(|_: &mut _| {});
+                let listener = TlsListener::new(inner, acceptor).tap_io(|_: &mut _| {});
                 serve_io(listener, router, stop_rx).await
             }
         };
@@ -1593,5 +1660,121 @@ mod tests {
             let mode = std::fs::metadata(&dir).unwrap().permissions().mode() & 0o777;
             assert_eq!(mode, 0o700, "新建覆盖目录应为 0700（§12.14）");
         }
+    }
+
+    // ── 决策 374：TLS accept 不再被半开连接挂死 ──
+    //
+    // 证书/私钥是自签的测试对（CN=agentpipeline-test，SAN 含 127.0.0.1 与
+    // localhost，有效期到 2126 年）。不为此引 rcgen——模块开头 `alpn_advertises_http11_only`
+    // 的注释里那条口径不变：不为 TLS 测试引证书生成依赖，用 embed 的静态对。
+
+    /// 不验证服务端证书的客户端（测试自签证书用的）。
+    #[derive(Debug)]
+    struct NoVerify {
+        schemes: Vec<rustls::SignatureScheme>,
+    }
+    impl rustls::client::danger::ServerCertVerifier for NoVerify {
+        fn verify_server_cert(
+            &self,
+            _end_entity: &rustls::pki_types::CertificateDer<'_>,
+            _intermediates: &[rustls::pki_types::CertificateDer<'_>],
+            _server_name: &rustls::pki_types::ServerName<'_>,
+            _ocsp_response: &[u8],
+            _now: rustls::pki_types::UnixTime,
+        ) -> Result<rustls::client::danger::ServerCertVerified, rustls::Error> {
+            Ok(rustls::client::danger::ServerCertVerified::assertion())
+        }
+        fn verify_tls12_signature(
+            &self,
+            _message: &[u8],
+            _cert: &rustls::pki_types::CertificateDer<'_>,
+            _dss: &rustls::DigitallySignedStruct,
+        ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+            Ok(rustls::client::danger::HandshakeSignatureValid::assertion())
+        }
+        fn verify_tls13_signature(
+            &self,
+            _message: &[u8],
+            _cert: &rustls::pki_types::CertificateDer<'_>,
+            _dss: &rustls::DigitallySignedStruct,
+        ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+            Ok(rustls::client::danger::HandshakeSignatureValid::assertion())
+        }
+        fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {
+            self.schemes.clone()
+        }
+    }
+
+    /// slowloris 回归：一条「握了 TCP 却不发 ClientHello」的连接**不得**阻塞别的客户端。
+    ///
+    /// 旧实现把握手 await 在唯一的 accept 任务里且无超时——本测试在旧代码上会卡死在
+    /// 第 ⑤ 步（真客户端永远等不到服务端 accept）。106 的两次生产挂死就是这个形态。
+    #[tokio::test]
+    async fn a_silent_tcp_peer_cannot_stall_tls_accept() {
+        use axum::serve::Listener as _;
+        // ① 服务端：测试证书走与生产**同一**解析路径（Transport::from_pem）。
+        let dir = tempfile::tempdir().unwrap();
+        let cert = dir.path().join("cert.pem");
+        let key = dir.path().join("key.pem");
+        std::fs::write(&cert, include_str!("../tests/fixtures/tls-test-cert.pem")).unwrap();
+        std::fs::write(&key, include_str!("../tests/fixtures/tls-test-key.pem")).unwrap();
+        let Transport::Tls(acceptor) =
+            Transport::from_pem(Some(cert.to_str().unwrap()), Some(key.to_str().unwrap()))
+                .expect("测试证书应能解析")
+        else {
+            panic!("给了证书就必须是 TLS");
+        };
+
+        let (inner, bound) = bind_listener("127.0.0.1", 0).await.unwrap();
+        let mut listener = TlsListener::new(inner, acceptor);
+        listener.handshake_timeout = Duration::from_millis(500);
+
+        // ② 半开连接先到：只握 TCP，不发 ClientHello。
+        let mut silent = tokio::net::TcpStream::connect(bound).await.unwrap();
+
+        // ③ accept 任务起跑：它会先吃掉 silent 的 TCP，把（注定超时的）握手丢去后台。
+        let accept_task = tokio::spawn(async move { listener.accept().await.0 });
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        // ④ 真客户端随后到：握手必须照常完成。
+        let provider = Arc::new(rustls::crypto::ring::default_provider());
+        let schemes = provider
+            .signature_verification_algorithms
+            .supported_schemes();
+        let mut client_cfg = rustls::ClientConfig::builder_with_provider(provider)
+            .with_safe_default_protocol_versions()
+            .expect("默认协议版本应可用")
+            .dangerous()
+            .with_custom_certificate_verifier(Arc::new(NoVerify { schemes }))
+            .with_no_client_auth();
+        client_cfg.alpn_protocols = alpn_protocols();
+        let connector = tokio_rustls::TlsConnector::from(Arc::new(client_cfg));
+        let tcp = tokio::net::TcpStream::connect(bound).await.unwrap();
+        let name = rustls::pki_types::ServerName::try_from("127.0.0.1".to_string())
+            .expect("IP 形态的 ServerName");
+        let tls_client = tokio::time::timeout(Duration::from_secs(5), connector.connect(name, tcp))
+            .await
+            .expect("真客户端的握手必须在 5s 内完成（半开连接不得阻塞）")
+            .expect("握手应成功（证书不校验）");
+        assert!(
+            tls_client.get_ref().1.alpn_protocol().is_some(),
+            "ALPN 座谈成 http/1.1"
+        );
+
+        // ⑤ accept 交出的必须是真客户端那条，而不是被 ② 挂死。
+        let server_stream = tokio::time::timeout(Duration::from_secs(5), accept_task)
+            .await
+            .expect("accept 不能被半开连接挂死")
+            .expect("accept 任务不应 panic");
+        drop(server_stream);
+
+        // ⑥ 半开连接由超时收尸：500ms 到点服务端关流，silent 侧读到 EOF（而非永远挂着）。
+        use tokio::io::AsyncReadExt;
+        let mut eof_buf = [0u8; 1];
+        let eof = tokio::time::timeout(Duration::from_secs(3), silent.read(&mut eof_buf))
+            .await
+            .expect("3s 内应等到服务端的收尸")
+            .expect("read 不应报错");
+        assert_eq!(eof, 0, "半开连接应被服务端主动关闭（读到 EOF）");
     }
 }
