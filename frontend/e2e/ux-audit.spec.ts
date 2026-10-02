@@ -330,8 +330,10 @@ test.describe('① 有数据的库：看板 / 详情 / 对讲台 / 台账', () =
       await probeColor(page, `${theme} ①对照·耗时轨道标记 .mdot`, dur.locator('.mdot'));
     }
 
-    // ② 模型与密钥页推荐技能的「未安装」标签
-    await open(page, app, '#/settings/providers');
+    // ② 推荐技能的「未安装」标签（决策 198 起推荐面板随阶段配置在 #/settings/stages——
+    // 第一轮取证时它还在模型与密钥页，路由已迁、选择器跟着改；截图文件名保持原样，
+    // 第一轮 README 引的就是它）
+    await open(page, app, '#/settings/stages');
     for (const theme of ['dark', 'light'] as const) {
       await setTheme(page, theme);
       const rec = page.locator('.rec');
@@ -339,12 +341,13 @@ test.describe('① 有数据的库：看板 / 详情 / 对讲台 / 台账', () =
       await probeColor(page, `${theme} ②推荐技能·未安装 .state`, rec.locator('.state'));
     }
 
-    // ③ 阶段配置区标题（以及展开表单后那块「整条替换」题注——两者不是同一处）
+    // ③ 阶段配置区标题（以及展开表单后那块「整条替换」题注——两者不是同一处）。
+    // 同页（决策 198）：区标题是 `.stage-head`（第一轮时是 providers 页的 `.sub-head`）
     for (const theme of ['dark', 'light'] as const) {
       await setTheme(page, theme);
-      const head = page.locator('.sub-head');
+      const head = page.locator('.stage-head');
       await clip(page, `amber-stageconfig-title-${theme}`, head);
-      await probeColor(page, `${theme} ③阶段配置区标题 .sub-head h2`, head.locator('h2'));
+      await probeColor(page, `${theme} ③阶段配置区标题 .stage-head h2`, head.locator('h2'));
       await page.getByRole('button', { name: /新增阶段配置/ }).click();
       await page.waitForTimeout(400);
       const note = page.locator('.replace-note');
@@ -357,6 +360,7 @@ test.describe('① 有数据的库：看板 / 详情 / 对讲台 / 台账', () =
     }
 
     // ④ 告警注记 `.warnnote`：只在「不受支持厂商」那一行（beforeAll 播的 gemini）
+    await open(page, app, '#/settings/providers');
     for (const theme of ['dark', 'light'] as const) {
       await setTheme(page, theme);
       const row = page.locator('.reg-row.dead').first();
@@ -368,13 +372,19 @@ test.describe('① 有数据的库：看板 / 详情 / 对讲台 / 台账', () =
       }
     }
 
-    // ⑤ 手机访问页的入口闸标题（回环态默认就是闸；外加同页的风险提示作对照）
+    // ⑤ 手机访问页的入口闸标题（回环态默认就是闸；外加同页的风险提示作对照）。
+    // 票 13 之后闸标题在多数分支换成 EmptyState 的 `.es`（`.gate-head` 只剩「读不到令牌」
+    // 那一分支还在）——回环态走到的是 EmptyState，故两个选择器并取、取到哪个算哪个。
     await open(page, app, '#/share');
     for (const theme of ['dark', 'light'] as const) {
       await setTheme(page, theme);
       const gate = page.locator('.gate');
       await clip(page, `amber-share-gate-${theme}`, gate);
-      await probeColor(page, `${theme} ⑤手机访问·入口闸标题 .gate-head`, page.locator('.gate-head'));
+      await probeColor(
+        page,
+        `${theme} ⑤手机访问·入口闸标题（.gate-head / .es）`,
+        page.locator('.gate .gate-head, .gate .es').first(),
+      );
       await probeColor(page, `${theme} ⑤b手机访问·风险提示 .warn`, page.locator('.gate .warn'));
     }
   });
@@ -502,7 +512,11 @@ test.describe('② 空库：首启空态', () => {
     await page.keyboard.press('Escape');
     await page.waitForTimeout(400);
     const afterEsc = await page.locator('.dialog').count();
-    // 焦点在弹窗内时 Escape 才有人接
+    // 票 02 之后：打开即焦点进第一个可填控件、Escape 挂在 window 上——**第一下就关**。
+    // 第一轮取证时这里依赖「焦点在框外 Escape 接不到」的旧行为，故先按新契约取数。
+    // 重开一颗，把焦点显式放进输入框再 Escape：焦点在框内时同样关得掉（两条路都取证）
+    await page.locator('.btn-new').click();
+    await page.waitForTimeout(400);
     await page.locator('.dialog input').first().focus();
     await page.keyboard.press('Escape');
     await page.waitForTimeout(400);
