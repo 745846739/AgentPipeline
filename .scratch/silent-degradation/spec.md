@@ -198,6 +198,34 @@ develop 至此 **三次全败**、游标落回 `pending`。三次的死因都是
 不再让一次掐流判死整轮。**现场验收到此为止**——下一步是部署后重新 continue，
 让它自己把剩下的段跑完。
 
+#### 部署票 08 之后的第四次尝试（2026-10-02 07:23–08:10 CST）：换了个死因，卡在**额度**上
+
+`retry_exhausted` 的允许动作里没有 `continue`，对应的是 `goto` 回 develop.execute
+（「重试执行」）。跑起来的是 run 146（attempt 4）：
+
+- **掐流一次都没发生**：67 次请求、19.3 MB 响应、46 分钟，`同一份请求就地重发` 的 warn
+  计数是 0。前三次分别在第 45 / 19 / 28 次请求上被掐死，这一次活过了全部 67 次
+  ——修复是保险，这一轮没用上它，但**前三轮死掉的那件事没有再发生**。
+- 死在**正事之外**：`provider 额度不足（余额 / 配额）`，
+  上游原文 `You have insufficient credits to make this request.`（HTTP 400）。
+  它被判成 `Quota` → `is_wait_useless` → **GiveUp，一次都不重试**（重发计数 0 就是这条判据
+  在起作用：额度类重发只是把同一份没钱的请求再问一遍）。分类与决策 298 的口径一致。
+- **develop 是真的在干活**：任务 worktree
+  （`/root/.agentpipeline/worktrees/01M3QW8CKS07R3MWG9XM4FNYER`）里有 4 个改动文件
+  （`router.svelte.ts` / `Board.svelte` / `TaskDetail.svelte` / 两个 store）与 2 个新文件
+  （`lib/hashLink.ts` + 它的测试）——它在改哈希链接那条路，即闪屏那一类问题的所在。
+  改动还没提交，但留在 worktree 里。
+
+**所以当前卡点不是代码，是账户余额**：106 上只有一个 provider
+（`xiaomi/mimo-v2.6-flash` @ `api.commandcode.ai`），它没钱了。要么充值，要么挂第二个
+provider 再 `goto` 重试执行。
+
+**顺带一个成本读数**（记下来备查，本轮**不改**）：run 146 的 67 次请求烧掉
+**6.97M prompt token**（每次请求都重发一份 27 万–50 万 token 的转录），46 分钟。
+L3 压缩的触发线是窗口的 80% = 800k，而 provider 行声明的窗口是 1,000,000，
+所以 500k 的转录**永远不会被压缩**。这是「一次节点烧掉几百万 token」的结构性来源，
+与票 08 的掐流是两件事；要不要给节点加成本门 / 把声明的窗口调回真实值，另立议题。
+
 ## 批次与阻塞
 
 | 批次 | 票 | 主题 |
