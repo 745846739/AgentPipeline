@@ -782,6 +782,8 @@ impl Executor {
                 Git.delete_branch(Path::new(&project.local_path), branch)
                     .await?;
             }
+            // 构建缓存回收（票 runner-offload/03 / B5）：任务构建活动结束的确定性时刻。
+            crate::prune::prune_build_cache(self.store.home()).await;
         }
         self.mark_step(run_id, "置任务终态").await;
         self.store
@@ -1610,8 +1612,14 @@ async fn run_system_command(
     store.home().ensure_task_dirs(&task.id)?;
     let timeout_sec = settings.test_command_timeout_sec;
 
-    let runner =
-        crate::exec::CommandRunner::new(killer.clone()).with_recorder(Arc::new(store.clone()));
+    let runner = crate::exec::CommandRunner::new(killer.clone())
+        .with_recorder(Arc::new(store.clone()))
+        // 共享构建缓存（票 runner-offload/03）：闸门/修复的 cargo 也指到
+        // {home}/shared-target,worktree 里不再养出第二份 target/。
+        .with_extra_env(vec![(
+            "CARGO_TARGET_DIR".to_string(),
+            store.home().shared_target_path().display().to_string(),
+        )]);
     let (out, ()) = runner
         .run(
             crate::exec::CommandRequest {

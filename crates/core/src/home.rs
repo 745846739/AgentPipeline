@@ -147,6 +147,13 @@ impl Home {
         self.worktrees_dir().join(task_id)
     }
 
+    /// **共享构建缓存**目录（票 runner-offload/03）：任务 worktree 里的 cargo 构建把
+    /// `CARGO_TARGET_DIR` 指到这里。worktree 自身不再各养一份 1.4GB 的 `target/`，
+    /// registry 依赖的编译产物跨任务复用；回收（[`crate::prune`]）也只对这个目录说话。
+    pub fn shared_target_path(&self) -> PathBuf {
+        self.root.join("shared-target")
+    }
+
     /// **修复 worktree** 的路径（决策 210③ / 票 10）：`{home}/worktrees/repair-{id}`。
     ///
     /// 落在家目录下是这一票的**硬约束**，不是审美：值班长的写域是 `home.root()`，

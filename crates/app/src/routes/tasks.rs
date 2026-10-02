@@ -497,6 +497,8 @@ async fn cleanup_worktree_and_branch(state: &AppState, task_id: &str) {
             tracing::warn!(task = task_id, error = %e, "worktree 清理失败");
         }
     }
+    // 构建缓存回收（票 runner-offload/03 / B5）。
+    agentpipeline_core::prune::prune_build_cache(&state.home).await;
     let branch = agentpipeline_core::git::branch_name(task_id);
     if let Err(e) = Git.delete_branch(repo, &branch).await {
         tracing::warn!(task = task_id, error = %e, "分支清理失败");

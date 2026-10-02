@@ -2421,7 +2421,7 @@ impl ToolExecutor {
         let timeout_sec =
             effective_run_command_timeout(&self.settings, ctx.stage, explicit_timeout);
         let (_, outcome) = self
-            .runner()
+            .runner_for(ctx)
             .run(
                 crate::exec::CommandRequest {
                     owner: crate::exec::CommandOwner::from_ctx(ctx),
@@ -2479,6 +2479,22 @@ impl ToolExecutor {
         // 只有 `run_command` 会挂改写；接线本身在收口里（`Rewrite::None` 时它不去解析）。
         if let Some(store) = &self.rtk_store {
             runner = runner.with_rtk_store(store.clone());
+        }
+        runner
+    }
+
+    /// 任务上下文里的命令附加**共享构建缓存**（票 runner-offload/03）：`CARGO_TARGET_DIR`
+    /// 指向 `{home}/shared-target`。只挂任务命令（`session_id = None`）——值班长/闸门的
+    /// 命令没有 worktree 语义，不该被这个变量改写行为。变量对非 cargo 命令无害。
+    /// 多任务并发构建会在共享目录的 cargo 文件锁上排队：2 核机器上本来也要排队，
+    /// 换来的是 registry 依赖跨任务免重编（全量 ~20 分钟 → 增量分钟级）。
+    fn runner_for(&self, ctx: &ToolCallContext) -> crate::exec::CommandRunner {
+        let mut runner = self.runner();
+        if ctx.session_id.is_none() {
+            runner = runner.with_extra_env(vec![(
+                "CARGO_TARGET_DIR".to_string(),
+                self.home.shared_target_path().display().to_string(),
+            )]);
         }
         runner
     }
@@ -5054,6 +5070,55 @@ mod tests {
         assert!(
             logs.contains("stage=\"develop\"") || logs.contains("stage=develop"),
             "logs: {logs}"
+        );
+    }
+
+    #[tokio::test]
+    async fn task_commands_point_cargo_at_the_shared_target() {
+        let s = setup(Stage::Develop);
+        let out = s
+            .executor
+            .execute(
+                &call(
+                    "run_command",
+                    serde_json::json!({"command": "echo $CARGO_TARGET_DIR"}),
+                ),
+                &s.ctx,
+            )
+            .await
+            .unwrap();
+        assert!(
+            out.content.contains("shared-target"),
+            "任务命令应拿到共享构建缓存路径: {}",
+            out.content
+        );
+    }
+
+    #[tokio::test]
+    async fn session_commands_do_not_get_the_shared_target_var() {
+        let s = setup(Stage::Develop);
+        let mut ctx = s.ctx.clone();
+        ctx.session_id = Some("sess1".into());
+        let out = s
+            .executor
+            .execute(
+                &call(
+                    "run_command",
+                    serde_json::json!({"command": "echo v=$CARGO_TARGET_DIR"}),
+                ),
+                &ctx,
+            )
+            .await
+            .unwrap();
+        assert!(
+            out.content.contains("v=\n") || out.content.contains("v="),
+            "值班长命令不该被改写 CARGO_TARGET_DIR: {}",
+            out.content
+        );
+        assert!(
+            !out.content.contains("shared-target"),
+            "值班长命令不得拿到共享路径: {}",
+            out.content
         );
     }
 

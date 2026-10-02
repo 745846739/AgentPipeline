@@ -182,6 +182,10 @@ pub struct CommandRunner {
     /// 运行期间的心跳周期（决策 100）；默认 5s，测试可调短。
     heartbeat_interval: Duration,
     rtk: RtkSource,
+    /// 附加进每条命令子进程环境的环境变量（票 runner-offload/03）：
+    /// 语义由调用点声明（如任务命令的 `CARGO_TARGET_DIR` → 共享构建缓存），
+    /// 本层不解释、只在 [`Self::apply_rewrite`] 装配 [`ChildEnv`] 时透传。
+    extra_env: Vec<(String, String)>,
 }
 
 impl CommandRunner {
@@ -198,7 +202,14 @@ impl CommandRunner {
             sse: None,
             heartbeat_interval: COMMAND_HEARTBEAT_INTERVAL,
             rtk: RtkSource::Off,
+            extra_env: Vec::new(),
         }
+    }
+
+    /// 附加子进程环境变量（票 runner-offload/03）。调用点声明语义，本层透传。
+    pub fn with_extra_env(mut self, extra: Vec<(String, String)>) -> Self {
+        self.extra_env = extra;
+        self
     }
 
     pub fn with_recorder(mut self, recorder: Arc<dyn CommandRecorder>) -> Self {
@@ -296,19 +307,23 @@ impl CommandRunner {
             exec: req.command.to_string(),
             original: None,
         };
-        let no_env = ChildEnv::default();
+        let base_env = ChildEnv {
+            path_prefix: None,
+            extra_vars: self.extra_env.clone(),
+        };
         if req.rewrite != Rewrite::Rtk {
-            return (untouched(), no_env);
+            return (untouched(), base_env);
         }
         // argv 直出那一支永不改写（决策 232 的安全面）：这里再挡一次，而不是靠调用点自觉。
         if matches!(req.spawn, SpawnForm::Argv { .. }) {
-            return (untouched(), no_env);
+            return (untouched(), base_env);
         }
         let Some(rtk) = self.rtk_runtime().await else {
-            return (untouched(), no_env);
+            return (untouched(), base_env);
         };
         let env = ChildEnv {
             path_prefix: Some(rtk.shim_dir.clone()),
+            extra_vars: self.extra_env.clone(),
         };
         match crate::rtk::rewrite(&rtk.binary, req.command).await {
             Some(rewritten) => (

@@ -24,6 +24,9 @@ pub trait ProcessKiller: Send + Sync + 'static {
 pub struct ChildEnv {
     /// 前置进 `PATH` 的目录（`None` = 不动 `PATH`）。
     pub path_prefix: Option<PathBuf>,
+    /// 附加环境变量（票 runner-offload/03）：共享构建缓存（`CARGO_TARGET_DIR`）走这里。
+    /// 有序键值对，同名时后写覆盖前写；调用点算好语义，本层只透传。
+    pub extra_vars: Vec<(String, String)>,
 }
 
 /// 在**独立进程组**里启动 `sh -c <command>`（决策 66 / 票 17）。
@@ -85,6 +88,9 @@ fn spawn_with_stdio_and_group(
 /// 一个坏掉的 `PATH` 交给子进程——那会让本来能跑的命令全挂掉，而这一步的收益只是优化。
 #[cfg(unix)]
 fn apply_child_env(cmd: &mut tokio::process::Command, env: &ChildEnv) {
+    for (key, value) in &env.extra_vars {
+        cmd.env(key, value);
+    }
     let Some(dir) = &env.path_prefix else {
         return;
     };

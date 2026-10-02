@@ -26,6 +26,7 @@ pub mod metrics;
 pub mod notify;
 pub mod pipeline;
 pub mod process;
+pub mod prune;
 /// rtk（Rust Token Killer）的改写与可用性（决策 297）。
 pub mod rtk;
 pub mod scheduler;

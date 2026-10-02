@@ -163,6 +163,8 @@ async fn recycle_task_artifacts(state: &AppState, repo_path: &str, task_ids: &[S
             }
         }
     }
+    // 构建缓存回收（票 runner-offload/03 / B5）：项目删除时全部任务的构建活动都已结束。
+    agentpipeline_core::prune::prune_build_cache(&state.home).await;
 }
 
 #[derive(Debug, Deserialize)]

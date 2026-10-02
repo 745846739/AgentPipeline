@@ -384,8 +384,14 @@ async fn run_gate_command(
     ));
     let timeout_sec = settings.test_command_timeout_sec;
 
-    let runner =
-        crate::exec::CommandRunner::new(killer.clone()).with_recorder(Arc::new(store.clone()));
+    let runner = crate::exec::CommandRunner::new(killer.clone())
+        .with_recorder(Arc::new(store.clone()))
+        // 共享构建缓存（票 runner-offload/03）：修复闸门的 cargo 也指到
+        // {home}/shared-target,修复 worktree 里不再养出第二份 target/。
+        .with_extra_env(vec![(
+            "CARGO_TARGET_DIR".to_string(),
+            store.home().shared_target_path().display().to_string(),
+        )]);
     let (out, ()) = runner
         .run(
             crate::exec::CommandRequest {
