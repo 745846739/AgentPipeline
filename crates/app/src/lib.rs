@@ -174,6 +174,12 @@ pub fn build_router(state: AppState) -> Router {
             "/rtk",
             get(routes::rtk::settings).put(routes::rtk::set_enabled),
         )
+        // ── 重活外发 GitHub 的开关（票 runner-offload/05）──
+        // 与 `/rtk` 同族：GET 带一次活体探测；PUT 探测失败也 200（先开开关、后登录 gh）。
+        .route(
+            "/offload",
+            get(routes::offload::settings).put(routes::offload::set_enabled),
+        )
         // ── 技能市场（决策 172⑤，票 09）：本地导入 / 目录扫描 / 卸载。全程离线 ──
         // 子 router 自带 state（import 路由要单独放宽请求体上限），故先 merge 再进防护层。
         .merge(routes::skills::routes(state.clone()))

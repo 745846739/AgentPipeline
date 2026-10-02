@@ -1355,6 +1355,25 @@ export interface RtkProbe {
  *
  * 探测**每次读都重做**（不缓存上次结果）：重读目标态才算数。
  */
+/** `GET/PUT /offload` 的探测读数（票 runner-offload/05）。两项独立报告。 */
+export interface OffloadProbe {
+  /** gh 已登录（`gh auth status` 真跑一遍的结果）。 */
+  gh_authed: boolean;
+  /** gh 不在场/未登录时的一句原因，原样摆出来。 */
+  gh_reason: string | null;
+  /** 任一已登记项目里有 `.github/workflows/offload.yml`。 */
+  workflow_present: boolean;
+}
+
+/** `GET/PUT /offload` 的读数：重活外发 GitHub 的全局开关。 */
+export interface OffloadSettings {
+  /** 全局开关：关 = 全部本机运行（逐字等于这个功能出现之前）。 */
+  enabled: boolean;
+  /** 这一份是谁定的：`default` = 从没碰过设置（缺省关）；`settings` = 界面保存过。 */
+  origin: 'default' | 'settings';
+  probe: OffloadProbe;
+}
+
 export interface RtkSettings {
   /** 全局开关：关掉 = 命令按原样跑（逐字等于这个功能出现之前）。 */
   enabled: boolean;

@@ -1,7 +1,7 @@
 <script lang="ts">
   import { onMount } from 'svelte';
-  import { getRtk, setRtk } from '../api/client';
-  import type { RtkSettings } from '../api/types';
+  import { getOffload, getRtk, setOffload, setRtk } from '../api/client';
+  import type { OffloadSettings, RtkSettings } from '../api/types';
   import {
     manualPathVisible,
     normalizeManualPath,
@@ -32,16 +32,45 @@
   /** 手填框里的草稿（保存时归一：空白 = 回到自动解析）。 */
   let manualDraft = $state('');
 
+  /** 重活外发（票 runner-offload/05）：同一页的第二颗钮，姿态与 rtk 完全同构。 */
+  let offload = $state<OffloadSettings | null>(null);
+  let offloadBusy = $state(false);
+  let offloadNote = $state<{ kind: 'ok' | 'bad'; message: string } | null>(null);
+
   async function load() {
     loading = true;
     error = null;
     try {
       settings = await getRtk();
       manualDraft = settings.path ?? '';
+      offload = await getOffload();
     } catch (err) {
       error = (err as Error).message;
     } finally {
       loading = false;
+    }
+  }
+
+  /** 拨外发开关：保存即活，探测失败不拦（照 /rtk 的纪律）。 */
+  async function saveOffload(enabled: boolean) {
+    offloadBusy = true;
+    offloadNote = null;
+    try {
+      const saved = await setOffload({ enabled });
+      offload = saved;
+      const probe = saved.probe;
+      if (enabled && (!probe.gh_authed || !probe.workflow_present)) {
+        offloadNote = {
+          kind: 'ok',
+          message: '已开启。探测有一项没过（见下方读数）——先开开关、后补条件是常见顺序，但开启期间的命令会回退本机执行。',
+        };
+      } else {
+        offloadNote = { kind: 'ok', message: enabled ? '已开启：agent 可把重活外发 GitHub。' : '已关闭：全部命令本机运行。' };
+      }
+    } catch (err) {
+      offloadNote = { kind: 'bad', message: (err as Error).message };
+    } finally {
+      offloadBusy = false;
     }
   }
 
@@ -167,6 +196,49 @@
           填了就<b>以它为准</b>（自动找的那一份不再参与）；填错时如实报错、不会偷偷回落到自动解析。
           留空 = 回到自动找。
         </p>
+      {/if}
+    </section>
+
+    <section class="block" aria-labelledby="offload-head">
+      <h2 class="sec-title" id="offload-head">重活外发 GitHub</h2>
+      {#if offload}
+        <div class="row">
+          <span class="st" class:run={offload.enabled} class:dim={!offload.enabled}>
+            {offload.enabled ? '开启：重活外发' : '关闭：全部本机'}
+          </span>
+          <span class="sec-note inline">
+            {#if !offload.enabled}
+              {offload.origin === 'settings' ? '界面关掉的' : '缺省关'}——构建、测试、lint 都在本机跑。
+            {:else if offload.probe.gh_authed && offload.probe.workflow_present}
+              agent 可把全量测试 / clippy / 构建外发到 GitHub runner（只回文本结果）。
+            {:else}
+              已开启，但探测有缺口：开启期间的命令会<b>回退本机执行并留痕</b>。
+            {/if}
+          </span>
+          {#if offload.enabled}
+            <button type="button" class="btn" disabled={offloadBusy} onclick={() => void saveOffload(false)}>
+              {#if offloadBusy}<span class="spin"></span>{/if}关掉
+            </button>
+          {:else}
+            <button type="button" class="btn solid" disabled={offloadBusy} onclick={() => void saveOffload(true)}>
+              {#if offloadBusy}<span class="spin"></span>{/if}打开
+            </button>
+          {/if}
+        </div>
+        <p class="sec-note">
+          这一格同样是<b>每次打开现问一次</b>：gh 登录态（{offload.probe.gh_authed ? '✅ 已登录' : `❌ ${offload.probe.gh_reason ?? '未登录'}`}）、
+          外发工作流在场（{offload.probe.workflow_present ? '✅ 在场' : '❌ 未见 offload.yml'}）。探测失败<b>不拦保存</b>。
+          交互式走查（起服务、看页面）永远在本机——它等不起 runner 的排队。
+        </p>
+        {#if offloadNote}
+          {#if offloadNote.kind === 'ok'}
+            <div class="banner ok" role="status">{offloadNote.message}</div>
+          {:else}
+            <div class="banner error" role="alert">{offloadNote.message}</div>
+          {/if}
+        {/if}
+      {:else}
+        <div class="banner">正在加载外发设置…</div>
       {/if}
     </section>
 

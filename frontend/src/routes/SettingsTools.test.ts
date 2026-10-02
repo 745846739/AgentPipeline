@@ -1,6 +1,6 @@
 import { fireEvent, render, screen, waitFor } from '@testing-library/svelte';
 import { afterEach, describe, expect, it, vi } from 'vitest';
-import type { RtkSettings } from '../api/types';
+import type { OffloadSettings, RtkSettings } from '../api/types';
 import SettingsTools from './SettingsTools.svelte';
 
 /**
@@ -14,12 +14,32 @@ import SettingsTools from './SettingsTools.svelte';
 const mocks = vi.hoisted(() => ({
   getRtk: vi.fn(),
   setRtk: vi.fn(),
+  getOffload: vi.fn(),
+  setOffload: vi.fn(),
 }));
 
 vi.mock('../api/client', () => ({
   getRtk: mocks.getRtk,
   setRtk: mocks.setRtk,
+  getOffload: mocks.getOffload,
+  setOffload: mocks.setOffload,
 }));
+
+/** 外发开关的缺省读数（票 runner-offload/05）：同一页的第二颗钮。 */
+const OFFLOAD_OFF: OffloadSettings = {
+  enabled: false,
+  origin: 'default',
+  probe: { gh_authed: false, gh_reason: null, workflow_present: false },
+};
+
+const OFFLOAD_ON_OK: OffloadSettings = {
+  enabled: true,
+  origin: 'settings',
+  probe: { gh_authed: true, gh_reason: null, workflow_present: true },
+};
+
+mocks.getOffload.mockResolvedValue(OFFLOAD_OFF);
+mocks.setOffload.mockResolvedValue(OFFLOAD_ON_OK);
 
 const OFF: RtkSettings = {
   enabled: false,

@@ -22,6 +22,7 @@ import type {
   PushSubscriptionList,
   PushSubscriptionPayload,
   ForemanWatchSettings,
+  OffloadSettings,
   RtkSettings,
   NotifySettings,
   Project,
@@ -605,6 +606,18 @@ export function setForemanWatch(enabled: boolean): Promise<{ enabled: boolean; o
  * 「现做」不是实现细节而是契约的一部分：这台机器上 rtk 装没装、还灵不灵，只有在读的
  * 那一刻问一遍才算数（决策 257 的「重读目标态」）。
  */
+/* 重活外发（票 runner-offload/05）：开关 + 活体探测；保存时探测失败也照存。 */
+
+/** 读**重活外发**设置：存的状态 + 每次现做一次的活体探测（gh 登录态/工作流在场）。 */
+export function getOffload(): Promise<OffloadSettings> {
+  return request<OffloadSettings>('/offload');
+}
+
+/** 拨**重活外发开关**：保存即活——外发工具每条命令现读这一行，下一条就按新值走。 */
+export function setOffload(payload: { enabled: boolean }): Promise<OffloadSettings> {
+  return request<OffloadSettings>('/offload', { method: 'PUT', body: payload });
+}
+
 export function getRtk(): Promise<RtkSettings> {
   return request<RtkSettings>('/rtk');
 }
