@@ -74,21 +74,21 @@ pub fn trigger_line_in_real_tokens(window: usize, underestimate: f64) -> f64 {
     COMPACT_TRIGGER_RATIO * window as f64 * underestimate
 }
 
-/// 撞墙自校准后的窗口值：**只上调**，且不低于 [`PROVIDER_WINDOW_LOWER_BOUND`]。
+/// 撞墙自校准后的窗口值（决策 309；**票 03 修订：双向都认**）。
 ///
-/// 撞墙（provider 报上下文超长）给出的信息是「这一次请求对真实窗口来说太大了」。
-/// 结合已知的实测事实（配置值 128,000 远低于真实值），此时**上调**该行是正确的方向：
-/// 配置值偏低会让触发线偏低（每轮都压、缓存全废），而偏高的代价由决策 295 的
-/// 「撞墙就地压缩一次再重试」兜住。
+/// 一次撞墙唯一可证的事实是「这个规模的请求，provider 收不下」。登记值就该贴着这个
+/// 证据走：之前登记得比它低（低估）就上调到它，之前登记得比它高（虚高）就下调到它。
+/// 「跟谁比」是调用方的事（拿登记值与返回值比较，相同就不写库）。
 ///
-/// 取的三个数里最大的那个：
-/// - `current`：绝不下调（下调会立刻把已经压好的线拉低）；
-/// - `observed_estimate`：这一次请求的估算规模（估算已校准 ⇒ ≈ 真实规模）；
-/// - [`PROVIDER_WINDOW_LOWER_BOUND`]：这台机器上**已被证明能装下**的规模。
-pub fn calibrated_window(current: usize, observed_estimate: usize) -> usize {
-    current
-        .max(observed_estimate)
-        .max(PROVIDER_WINDOW_LOWER_BOUND)
+/// 旧口径「只上调、不低于 [`PROVIDER_WINDOW_LOWER_BOUND`]」废除了。那条下界是事故
+/// 那台机器的实测证据（561,210 的输入被接受过），不是每台机器都成立的常量——对一个
+/// 真 32k 窗口的 provider，守着它会让登记值永远虚高、软限永远摸不到、压缩永不触发，
+/// 而那正是票 03 要治的病（ux-audit-3 的 1490 万 prompt_tokens）。
+///
+/// 偏差的代价是**有界**的：登记偏低 → 触发线偏低 → 压得比必要早一点（prefix 缓存吃亏）；
+/// 登记偏高 → 软限摸不到 → 撞墙 → 下一次校准用新证据再调。两个方向都收敛于真实窗口。
+pub fn calibrated_window(observed: usize) -> usize {
+    observed
 }
 
 #[cfg(test)]
@@ -196,17 +196,15 @@ mod tests {
         assert!(worst_low >= 0.5, "{worst_low}");
     }
 
-    /// 撞墙自校准：**只上调**，且不吃低于实测下界。
+    /// 撞墙自校准（票 03 修订）：登记值贴着撞墙证据走，**双向都认**。
     #[test]
-    fn the_wall_calibration_only_raises() {
-        // 事故当时的行 + 一次撞墙 ⇒ 抬到实测下界（那台机器上已被证明装得下的规模）
+    fn the_wall_calibration_follows_the_evidence_in_both_directions() {
+        // 校准函数本身只回答「登记值该是多少」：撞墙请求的估算规模。
+        // 「上调还是下调、要不要写库」由调用方拿登记值与它比较后决定。
         assert_eq!(
-            calibrated_window(MISCONFIGURED_WINDOW, 400_000),
-            PROVIDER_WINDOW_LOWER_BOUND
+            calibrated_window(400_000),
+            400_000,
+            "撞墙证据 400k → 登记值贴着它走（对登记 128k 的行是上调，对 2M 的虚高行是下调）"
         );
-        // 观察值更大就取观察值
-        assert_eq!(calibrated_window(MISCONFIGURED_WINDOW, 900_000), 900_000);
-        // 绝不下调：本来就更宽的行保持原样
-        assert_eq!(calibrated_window(2_000_000, 100_000), 2_000_000);
     }
 }

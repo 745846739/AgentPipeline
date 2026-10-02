@@ -36,7 +36,7 @@ use crate::agent::bounded_read::{self, Offloaded};
 use crate::agent::client::{LlmRequest, Message, RunContext, ToolDef};
 use crate::agent::context::{
     compact_messages_from, count_tokens, estimate_context_capacity, over_hard_limit,
-    should_compact, ContextCapacity,
+    should_compact_with_floor, transcript_chars, ContextCapacity,
 };
 use crate::agent::prompts::{
     build_system_prompt, build_user_prompt, load_agents_context, prompt_template_hash,
@@ -143,6 +143,11 @@ pub struct RequestPlan {
     pub node: Node,
     pub attempt: u32,
     pub keep_recent_rounds: usize,
+    /// L3 硬底（票 03）：转录字符量超过它就强制压缩，与软限判据取「或」。
+    /// 与会话落库截断共用 `Settings.conversation_max_chars` 这一个数——落库侧
+    /// 截的是「一条会话行留多少痕」，这里管的是「一轮请求最多驮多少转录」，
+    /// 同一个 20 万字符的量纲，语义见各自文档。
+    pub conversation_max_chars: usize,
 }
 
 impl RequestPlan {
@@ -297,6 +302,7 @@ impl RequestPlan {
             node: cursor.node,
             attempt: ctx.attempt,
             keep_recent_rounds: ctx.settings.keep_recent_rounds,
+            conversation_max_chars: ctx.settings.conversation_max_chars,
         };
 
         // 组装期唯一能判的超限：静态两段已超硬限——messages 压到 0 也还在限之上，
@@ -324,63 +330,85 @@ impl RequestPlan {
         }
     }
 
-    /// 每轮一扇（同步）：超软限 → L3 按轮就地压缩；压缩后仍超硬限 → `Overflow`。
+    /// 每轮一扇（同步）：超软限**或**超硬底 → L3 按轮就地压缩；压缩后仍超硬限 → `Overflow`。
     ///
     /// `carried_len` = 续接锚点（决策 180：下标之前是载入历史，不得充当本轮锚点）。
-    /// `capacity = None` 恒 `Ok`（决策 110）。越界是**值**，翻译（会话行 +
-    /// `Pending(context_overflow)`）在编排侧——决策 245「门吃落点不吃原因」。
-    pub fn check_budget(&self, messages: &mut Vec<Message>, carried_len: usize) -> BudgetCheck {
-        let Some(capacity) = self.capacity else {
-            return BudgetCheck::Ok { compacted: None };
-        };
+    /// **入参是 `&mut`**：压缩会把载入历史压成摘要，旧下标随之作废——本函数把压缩后的
+    /// 本轮起点写回去（票 03），调用方下一轮拿到的仍是指着锚点的下标。
+    /// `capacity = None` 时软限不判（决策 110），硬底照判（票 03：不看 provider 脸色）。
+    /// 越界是**值**，翻译（会话行 + `Pending(context_overflow)`）在编排侧——决策 245
+    /// 「门吃落点不吃原因」。
+    pub fn check_budget(
+        &self,
+        messages: &mut Vec<Message>,
+        carried_len: &mut usize,
+    ) -> BudgetCheck {
+        // 算术在 `agent::context`（决策 291 / 票 foreman-unbounded 06）：值班长的轮内
+        // 压缩与这里必须是同一份——两处各写一份就会各到各的线。
         let estimate = |msgs: &[Message]| {
-            // 算术在 `agent::context`（决策 291 / 票 foreman-unbounded 06）：值班长的轮内
-            // 压缩与这里必须是同一份——两处各写一份就会各到各的线。
             crate::agent::context::estimate_messages_tokens(&self.system, &self.user, msgs)
         };
-
-        if !should_compact(estimate(messages), capacity) {
+        let chars = transcript_chars(messages);
+        if !should_compact_with_floor(
+            estimate(messages),
+            self.capacity,
+            chars,
+            self.conversation_max_chars,
+        ) {
             return BudgetCheck::Ok { compacted: None };
         }
         // L3：规则化按轮压缩（不调 LLM，§12.13.3 规则表）
         let before = messages.len();
-        let outcome = compact_messages_from(messages, self.keep_recent_rounds, carried_len);
+        let outcome = compact_messages_from(messages, self.keep_recent_rounds, *carried_len);
         let after = outcome.messages.len();
         *messages = outcome.messages;
-        // 压缩发生时有可观测记录（票面要求）
+        *carried_len = outcome.current_start;
+        // 压缩发生时有可观测记录（票面要求）；触发源记下来——硬底触发说明软限那条线
+        // 没拦住（登记虚高 / 无 provider），正是票 03 要观测的现场。
+        let trigger = if chars > self.conversation_max_chars {
+            "char_floor"
+        } else {
+            "soft_limit"
+        };
         tracing::info!(
             task = %self.task_id,
             stage = %self.stage,
             node = %self.node,
+            trigger,
+            chars,
+            floor = self.conversation_max_chars,
             before,
             after,
             compacted = outcome.compacted_messages,
-            "上下文超过软限，已按轮压缩（§12.13 L3）"
+            "上下文超线（软限或硬底），已按轮压缩（§12.13 L3 / 票 03）"
         );
 
-        if !over_hard_limit(estimate(messages), capacity) {
-            return BudgetCheck::Ok {
-                compacted: Some(outcome.compacted_messages),
-            };
+        if let Some(capacity) = self.capacity {
+            if over_hard_limit(estimate(messages), capacity) {
+                // L4 判定（决策 105 / 148⑦ / 154）：压缩后仍超硬限。**绝不能放行继续跑**——
+                // 那会让超硬限的节点无限循环。「挂 pending」的 warn 与构造在翻译侧（落点归构造者）。
+                return BudgetCheck::Overflow {
+                    estimate: estimate(messages),
+                    hard_limit: capacity.hard_limit,
+                };
+            }
         }
-        // L4 判定（决策 105 / 148⑦ / 154）：压缩后仍超硬限。**绝不能放行继续跑**——
-        // 那会让超硬限的节点无限循环。「挂 pending」的 warn 与构造在翻译侧（落点归构造者）。
-        BudgetCheck::Overflow {
-            estimate: estimate(messages),
-            hard_limit: capacity.hard_limit,
+        BudgetCheck::Ok {
+            compacted: Some(outcome.compacted_messages),
         }
     }
 
     /// **无条件**按轮压缩（决策 295 / 票 10）：provider 报超窗时用。
     ///
-    /// 与 [`Self::check_budget`] 的差别只有一处：**不问软限那条线**。理由与值班长那侧
-    /// 一字不差（票 06(c)）——那次报错本身就是「算术低估了」的证据（真 tokenizer 与
-    /// 4 字符 ≈ 1 token 的估算、工具定义也占窗口），按同一条线再判一次只会得出「还没到线」
-    /// 然后原样再发一遍。返回压掉的条数，**0 = 没有可压的**（都在 keep 窗口里，回执就是极限）
-    /// ——调用方据此判「压不动了，报错才是诚实的」。
-    pub fn force_compact(&self, messages: &mut Vec<Message>, carried_len: usize) -> usize {
-        let outcome = compact_messages_from(messages, self.keep_recent_rounds, carried_len);
+    /// 与 [`Self::check_budget`] 的差别只有一处：**不问软限那条线**（也不问硬底）。
+    /// 理由与值班长那侧一字不差（票 06(c)）——那次报错本身就是「算术低估了」的证据，
+    /// 按同一条线再判一次只会得出「还没到线」然后原样再发一遍。返回压掉的条数，
+    /// **0 = 没有可压的**（都在 keep 窗口里，回执就是极限）——调用方据此判
+    /// 「压不动了，报错才是诚实的」。`carried_len` 同 [`Self::check_budget`]：就地写回。
+    pub fn force_compact(&self, messages: &mut Vec<Message>, carried_len: &mut usize) -> usize {
+        let outcome = compact_messages_from(messages, self.keep_recent_rounds, *carried_len);
         *messages = outcome.messages;
+        *carried_len = outcome.current_start;
         outcome.compacted_messages
     }
 
@@ -1765,7 +1793,7 @@ mod tests {
         assert_eq!(cap.reserved_user, count_tokens(&plan.user));
         let mut messages = conversation(1, 10);
         let len_before = messages.len();
-        match plan.check_budget(&mut messages, 0) {
+        match plan.check_budget(&mut messages, &mut 0) {
             BudgetCheck::Ok { compacted } => assert_eq!(compacted, None, "未触发压缩"),
             other => panic!("软限之下应 Ok：{other:?}"),
         }
@@ -1779,7 +1807,7 @@ mod tests {
         let plan = budget_plan(2_000, 60_000).await;
         let mut messages = conversation(12, 1_000);
         let len_before = messages.len();
-        match plan.check_budget(&mut messages, 0) {
+        match plan.check_budget(&mut messages, &mut 0) {
             BudgetCheck::Ok { compacted } => {
                 let n = compacted.expect("超软限必触发压缩");
                 assert!(n > 0, "compacted 应为压掉的条数，得到 {n}");
@@ -1806,17 +1834,17 @@ mod tests {
         let len_before = messages.len();
         assert!(
             matches!(
-                plan.check_budget(&mut messages.clone(), 0),
+                plan.check_budget(&mut messages.clone(), &mut 0),
                 BudgetCheck::Ok { compacted: None }
             ),
             "前提：这份对话在软限之下，预算门不会动它"
         );
-        let compacted = plan.force_compact(&mut messages, 0);
+        let compacted = plan.force_compact(&mut messages, &mut 0);
         assert!(compacted > 0, "无条件压缩要压得动：得到 {compacted}");
         assert!(messages.len() < len_before, "L3 就地压缩");
         // 压不动时如实回 0：调用方据此判「报错才是诚实的」（超窗那一次调用的处置）。
         let mut tiny = conversation(1, 10);
-        assert_eq!(plan.force_compact(&mut tiny, 0), 0, "没有旧轮可压 → 0");
+        assert_eq!(plan.force_compact(&mut tiny, &mut 0), 0, "没有旧轮可压 → 0");
     }
 
     #[tokio::test]
@@ -1827,7 +1855,7 @@ mod tests {
         let cap = plan.capacity.unwrap();
         let s = cap.reserved_system + cap.reserved_user;
         let mut messages = conversation(12, 1_000);
-        match plan.check_budget(&mut messages, 0) {
+        match plan.check_budget(&mut messages, &mut 0) {
             BudgetCheck::Overflow {
                 estimate,
                 hard_limit,
@@ -1847,9 +1875,10 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn check_budget_always_passes_without_capacity() {
-        // 决策 110：无 provider → capacity=None → 恒 Ok（FakeAgent 路径），
-        // 再长的 messages 也不动——不臆造窗口。
+    async fn check_budget_without_capacity_skips_the_soft_line_but_not_the_floor() {
+        // 决策 110：无 provider → capacity=None → 软限不判（不臆造窗口）。
+        // 票 03 修订：硬底照判——压缩是本地规则算术，不需要窗口数字背书。
+        // 这份对话 8 万字符，在 20 万字符的硬底之下 → 不动。
         let (_tmp, _home, store, task, project, settings, cursor) = base().await;
         let plan = assemble_ok(ctx(
             &store,
@@ -1862,13 +1891,72 @@ mod tests {
         ))
         .await;
         assert!(plan.capacity.is_none());
-        let mut messages = conversation(10, 10_000);
+        let mut messages = conversation(10, 2_000);
         let len_before = messages.len();
-        match plan.check_budget(&mut messages, 0) {
+        let mut carried_len = 0;
+        match plan.check_budget(&mut messages, &mut carried_len) {
             BudgetCheck::Ok { compacted } => assert_eq!(compacted, None),
-            other => panic!("capacity=None 应恒 Ok：{other:?}"),
+            other => panic!("硬底之下应恒 Ok：{other:?}"),
         }
-        assert_eq!(messages.len(), len_before, "没容量就没门，messages 不动");
+        assert_eq!(messages.len(), len_before, "没到线就不该动 messages");
+    }
+
+    #[tokio::test]
+    async fn check_budget_compacts_without_capacity_when_chars_exceed_the_floor() {
+        // 票 03：无 provider（FakeAgent / 纯代码场景）也拦——12 轮 × 2.4 万字符 = 28.8 万
+        // 字符，超过 20 万字符的硬底 → 就地压缩，锚点下标跟着搬到 1（锚点 user 紧跟 system）。
+        let (_tmp, _home, store, task, project, settings, cursor) = base().await;
+        let plan = assemble_ok(ctx(
+            &store,
+            &settings,
+            &task,
+            &project,
+            &cursor,
+            None,
+            AgentNodeKind::ValidateInput,
+        ))
+        .await;
+        assert!(plan.capacity.is_none(), "前提：无 provider");
+        let mut messages = conversation(12, 6_000);
+        let len_before = messages.len();
+        let mut carried_len = 0;
+        match plan.check_budget(&mut messages, &mut carried_len) {
+            BudgetCheck::Ok { compacted } => {
+                let n = compacted.expect("超硬底必触发压缩");
+                assert!(n > 0, "compacted 应为压掉的条数，得到 {n}");
+            }
+            other => panic!("超硬底应压缩后 Ok：{other:?}"),
+        }
+        assert!(messages.len() < len_before, "L3 就地压缩");
+        assert_eq!(carried_len, 1, "锚点下标随压缩搬迁");
+    }
+
+    #[tokio::test]
+    async fn char_floor_triggers_even_when_the_registered_window_is_inflated() {
+        // ux-audit-3 的形状（票 03）：登记窗口虚高 → 软限跟着虚高 → 按软限那条线压缩
+        // 永不触发。硬底不看登记的脸色：估算（≈7.2 万 token）远在软限（静态 + 100 万）
+        // 之下，但转录 28.8 万字符过了硬底 → 照压。
+        let plan = budget_plan(1_000_000, 2_000_000).await;
+        let cap = plan.capacity.unwrap();
+        let mut messages = conversation(12, 6_000);
+        let estimate =
+            crate::agent::context::estimate_messages_tokens(&plan.system, &plan.user, &messages);
+        assert!(
+            estimate < cap.soft_limit,
+            "前提自检：软限拦不住这份对话（{estimate} < {}）",
+            cap.soft_limit
+        );
+        assert!(
+            crate::agent::context::transcript_chars(&messages) > plan.conversation_max_chars,
+            "前提自检：字符读数才是触发源"
+        );
+        let mut carried_len = 0;
+        match plan.check_budget(&mut messages, &mut carried_len) {
+            BudgetCheck::Ok { compacted } => {
+                assert!(compacted.expect("超硬底必触发压缩") > 0);
+            }
+            other => panic!("登记虚高时硬底必须兜住：{other:?}"),
+        }
     }
 
     #[tokio::test]
@@ -1892,9 +1980,9 @@ mod tests {
                 vec![],
             ));
         }
-        let carried_len = 3;
+        let mut carried_len = 3;
         let len_before = messages.len();
-        match plan.check_budget(&mut messages, carried_len) {
+        match plan.check_budget(&mut messages, &mut carried_len) {
             BudgetCheck::Ok { compacted } => {
                 assert!(compacted.unwrap_or(0) > 0, "仍应触发压缩");
             }
@@ -1914,6 +2002,71 @@ mod tests {
                 .unwrap()
                 .starts_with("[摘要]"),
             "历史上那条被压成摘要，紧跟锚点之后"
+        );
+    }
+
+    #[tokio::test]
+    async fn repeated_compaction_relocates_the_anchor_and_does_not_spin() {
+        // 票 03：硬底生效后，同一 attempt 里连续多轮压缩成为常态。压缩把载入历史压成
+        // 摘要后旧下标作废——若调用方不把新下标拿回去，下一次压缩会拿旧下标找锚点，
+        // 把本轮真正的提问当成旧历史压掉（决策 180 锚点规则被击穿）。
+        //
+        // 形状即「下一 attempt 续接一份已压缩过的转录」：载入历史里带着上一轮压缩
+        // 留下的 [摘要]，本轮提问在其后，12 轮 × 5 万字符的大轮次两次撞硬底。
+        let plan = budget_plan(1_000_000, 2_000_000).await;
+        let mut messages = vec![
+            Message::system("sys"),
+            // 载入的历史（carried_len = 4 之前）：上一轮的问答 + 它压缩留下的摘要
+            Message::user("上一轮的提问"),
+            Message::assistant(Some("上一轮的回答".into()), vec![]),
+            Message::user("[摘要] 已完成的操作：\n- 已写入 notes-0.md"),
+            // 本轮起点
+            Message::user("本轮提问"),
+        ];
+        for i in 0..12 {
+            messages.push(Message::assistant(
+                Some(format!("r{i} {}", "x".repeat(50_000))),
+                vec![],
+            ));
+        }
+        let mut carried_len = 4;
+        match plan.check_budget(&mut messages, &mut carried_len) {
+            BudgetCheck::Ok { compacted } => assert!(compacted.unwrap_or(0) > 0, "第一次压缩"),
+            other => panic!("第一次应压缩后 Ok：{other:?}"),
+        }
+        assert_eq!(carried_len, 1, "锚点下标随压缩搬迁");
+        assert_eq!(
+            messages[1].content.as_deref(),
+            Some("本轮提问"),
+            "锚点 user 原样保留"
+        );
+        let len_after_first = messages.len();
+        let summaries_after_first = messages
+            .iter()
+            .filter(|m| m.content.as_deref().unwrap_or("").starts_with("[摘要]"))
+            .count();
+        assert_eq!(summaries_after_first, 1, "只应有一条摘要");
+
+        // 第二次（模拟下一轮仍超硬底）：锚点不能被压掉，摘要不翻倍、转录不增长。
+        match plan.check_budget(&mut messages, &mut carried_len) {
+            BudgetCheck::Ok { compacted } => assert!(compacted.unwrap_or(0) > 0, "第二次仍压得动"),
+            other => panic!("第二次应压缩后 Ok：{other:?}"),
+        }
+        assert_eq!(carried_len, 1, "锚点下标稳定");
+        assert_eq!(
+            messages[1].content.as_deref(),
+            Some("本轮提问"),
+            "连续压缩后锚点仍在本位——旧下标会把这一条压掉（票 03 修的正是这个）"
+        );
+        let summaries_after_second = messages
+            .iter()
+            .filter(|m| m.content.as_deref().unwrap_or("").starts_with("[摘要]"))
+            .count();
+        assert_eq!(summaries_after_second, 1, "摘要收敛为一条，不空转翻倍");
+        assert!(
+            messages.len() <= len_after_first,
+            "转录不因反复压缩而增长：{} vs {len_after_first}",
+            messages.len()
         );
     }
 

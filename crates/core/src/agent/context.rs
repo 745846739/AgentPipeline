@@ -137,9 +137,41 @@ fn message_tokens(message: &Message) -> usize {
     text + args
 }
 
-/// 是否触发 L3 压缩（超过 soft limit）。
-pub fn should_compact(current_tokens: usize, capacity: ContextCapacity) -> bool {
-    current_tokens > capacity.soft_limit
+/// 单条消息的字符读数：正文 + 模型自己发出的 tool_calls 参数（与 [`message_tokens`]
+/// 同一形状——那边漏算会低估 token，这边漏算会低估转录体量）。
+fn message_chars(message: &Message) -> usize {
+    let text = message.content.as_deref().unwrap_or("").chars().count();
+    let args: usize = message
+        .tool_calls
+        .iter()
+        .map(|c| c.name.chars().count() + c.arguments.chars().count())
+        .sum();
+    text + args
+}
+
+/// 转录的字符读数（票 03 硬底的计账口径）。
+///
+/// 只数 messages，不含静态两段（system / user）：硬底触发的是 L3 按轮压缩，
+/// 而压缩吃不到那两段——把它们计进来只会让触发线凭空偏移一个常量。
+pub fn transcript_chars(messages: &[Message]) -> usize {
+    messages.iter().map(message_chars).sum()
+}
+
+/// L3 触发判据全量（票 03）：软限（token 估算 vs 容量）**或**硬底（转录字符量 vs
+/// `conversation_max_chars`）。
+///
+/// 硬底不看 provider 窗口登记的脸色：登记虚高会让软限跟着虚高、压缩永不触发
+/// （ux-audit-3 烧掉 1490 万 prompt_tokens 的形状），而转录字符量是本地可测的事实。
+/// `capacity = None`（无 provider，决策 110 不臆造窗口）时硬底**照样生效**——压缩是
+/// 规则化的本地算术，不需要窗口数字背书。两端同源（决策 291）：流水线与值班长吃这一份。
+pub fn should_compact_with_floor(
+    current_tokens: usize,
+    capacity: Option<ContextCapacity>,
+    transcript_chars: usize,
+    conversation_max_chars: usize,
+) -> bool {
+    let over_soft = capacity.is_some_and(|c| current_tokens > c.soft_limit);
+    over_soft || transcript_chars > conversation_max_chars
 }
 
 /// 是否触发 L4 兜底（超过 hard limit）。
@@ -298,6 +330,11 @@ pub fn offload_replacement(tool: &str, path: &str, tokens: usize, preview: &str)
 
 // ─────────────────────────────── L3 对话压缩 ───────────────────────────────
 
+/// 压缩摘要消息的前缀。锚点规则靠它区分**真回合**与**压缩产物**（票 03）：
+/// 摘要本身是 User 角色的消息，若不排除，下一次压缩会把它当成「本轮第一条 user」
+/// 保留下来——旧摘要永不回收、新摘要每次压缩追加一条，长会话里空转累积。
+pub const SUMMARY_PREFIX: &str = "[摘要]";
+
 /// 压缩结果。
 #[derive(Debug, Clone, PartialEq)]
 pub struct CompactionOutcome {
@@ -306,6 +343,12 @@ pub struct CompactionOutcome {
     pub summary: String,
     /// 被压缩掉的轮次数。
     pub compacted_messages: usize,
+    /// 压缩后转录里「本轮起点」的下标（票 03）。
+    ///
+    /// 载入的历史被压成摘要后，压缩前的 `current_start` 下标就失效了——它指的可能是
+    /// 本轮的中段。调用方必须拿这个值更新自己的 `carried_len`，否则下一次压缩会拿
+    /// 旧下标找锚点，把本轮真正的提问当成旧历史压掉（决策 180 锚点规则的存活条件）。
+    pub current_start: usize,
 }
 
 /// L3：规则化压缩（§12.13.3 压缩规则表）。
@@ -334,6 +377,7 @@ pub fn compact_messages_from(
             messages: messages.to_vec(),
             summary: String::new(),
             compacted_messages: 0,
+            current_start,
         };
     }
 
@@ -368,8 +412,16 @@ pub fn compact_messages_from(
 
     for (i, msg) in messages.iter().enumerate() {
         // 锚点候选：本轮（`i >= current_start`）的第一条 user 消息。载入的历史不算——
-        // 那条是上一轮的提问
-        let is_anchor = msg.role == Role::User && i >= current_start && anchor.is_none();
+        // 那条是上一轮的提问；压缩摘要也不算（[`SUMMARY_PREFIX`]，票 03）——它是
+        // 压缩的产物，不是回合的起点，留下来只会让摘要一条条累积。
+        let is_anchor = msg.role == Role::User
+            && i >= current_start
+            && anchor.is_none()
+            && !msg
+                .content
+                .as_deref()
+                .unwrap_or("")
+                .starts_with(SUMMARY_PREFIX);
         let must_keep = msg.role == Role::System || is_anchor || i >= keep_from;
         if must_keep {
             kept.push(msg.clone());
@@ -387,7 +439,10 @@ pub fn compact_messages_from(
     let summary = if summary_lines.is_empty() {
         String::new()
     } else {
-        format!("[摘要] 已完成的操作：\n{}", summary_lines.join("\n"))
+        format!(
+            "{SUMMARY_PREFIX} 已完成的操作：\n{}",
+            summary_lines.join("\n")
+        )
     };
 
     // 摘要在本轮首条 user 之后、最近轮次之前插入
@@ -396,10 +451,19 @@ pub fn compact_messages_from(
         kept.insert(insert_at, Message::user(summary.clone()));
     }
 
+    // 压缩后的本轮起点：锚点 user 在 kept 里的下标（`anchor` 记的是 push 之后的
+    // `kept.len()`，即下标 + 1）。载入历史已全部压成摘要，旧下标随之作废（票 03）。
+    // 锚点为 `None` 时旧下标也未必还指着同一个位置（转录变短了）——收敛到输出长度，
+    // 保证下标永远有效；之后的压缩再从那里往后找。
+    let new_start = anchor
+        .map(|a| a - 1)
+        .unwrap_or(current_start.min(kept.len()));
+
     CompactionOutcome {
         messages: kept,
         summary,
         compacted_messages: compacted,
+        current_start: new_start,
     }
 }
 
@@ -834,24 +898,56 @@ mod tests {
             .starts_with("[摘要]"));
     }
 
+    /// 压缩摘要**不是**锚点候选（票 03）：摘要本身是 User 角色的消息，若不排除，
+    /// 下一次压缩会把它当成「本轮第一条 user」保留下来——旧摘要永不回收、新摘要
+    /// 每次压缩追加一条，长会话里空转累积。这里钉住：带着旧摘要的转录再压一次，
+    /// 摘要收敛为一条（旧的被回收重写，不是并存）。
+    #[test]
+    fn l3_anchor_ignores_synthetic_summaries() {
+        let old_summary = format!("{SUMMARY_PREFIX} 已完成的操作：\n- 已写入 notes-0.md");
+        let mut messages = vec![
+            Message::assistant(Some("a0".into()), vec![]),
+            Message::user(old_summary),
+            Message::assistant(Some("a1".into()), vec![]),
+        ];
+        for i in 0..8 {
+            messages.push(Message::assistant(Some(format!("r{i}")), vec![]));
+        }
+        // 第一遍：产生新摘要（旧的此时还在 keep 窗口内，原样保留）
+        let out = compact_messages_from(&messages, 2, 0);
+        assert_eq!(out.current_start, 0, "没有真 user 回合，起点不动");
+        // 第二遍：新转录再压——旧摘要必须被回收重写，而不是作为「锚点」永久保留
+        let out2 = compact_messages_from(&out.messages, 2, 0);
+        let summaries = out2
+            .messages
+            .iter()
+            .filter(|m| {
+                m.content
+                    .as_deref()
+                    .unwrap_or("")
+                    .starts_with(SUMMARY_PREFIX)
+            })
+            .count();
+        assert_eq!(summaries, 1, "摘要收敛为一条，得到 {summaries}");
+    }
+
     // ── L4 兜底 ──
     //
     // 「压缩后仍超硬限 → `pending(context_overflow)`」这条行为的等价断言在 L2：
     // `crates/core/tests/integration/executor.rs::context_overflow_ctx` 造成真超限现场（窗口 1000 /
     // 硬限 900 + 一次大块元数据），两条用例分别钉住 pending 的 kind 与「退出路径补写会话行」。
     // 它落在执行器而非本模块——构造 pending 的是 `executor::enforce_context_budget`，
-    // 本模块只提供 `should_compact` / `over_hard_limit` 两个谓词（`compact_and_hard_limit_predicates`）。
+    // 本模块提供 `over_hard_limit` 谓词（软限一侧已并入
+    // [`should_compact_with_floor`]，票 03；独立的 `should_compact` 随之删除）。
     //
     // 原先此处还有三条针对已删除的 `plan_l4` / `L4Action` 的断言；它们钉的是
     // 「哪个变体被选中」，而那两个非 pending 变体从未实现也从不可达（决策 154①），
     // 故随该组一并删除。
 
     #[test]
-    fn compact_and_hard_limit_predicates() {
+    fn hard_limit_predicate() {
         let s = settings();
         let cap = estimate_context_capacity(10_000, "", "", &s);
-        assert!(!should_compact(cap.soft_limit, cap));
-        assert!(should_compact(cap.soft_limit + 1, cap));
         assert!(!over_hard_limit(cap.hard_limit, cap));
         assert!(over_hard_limit(cap.hard_limit + 1, cap));
     }

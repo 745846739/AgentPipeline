@@ -465,24 +465,24 @@ impl Store {
         rows.into_iter().map(ProviderRow::into_provider).collect()
     }
 
-    /// 撞墙自校准：把这一行的窗口**只上调**（决策 309，票 foreman-burns 01）。
+    /// 撞墙自校准：把这一行的窗口按撞墙证据**重登记**（决策 309；票 03 修订为双向）。
     ///
-    /// `WHERE context_window < ?` 是这条 SQL 的全部要点：**绝不下调**。下调会立刻把已经
-    /// 算准的触发线拉低（每轮都压、prefix 缓存全废），而那正是决策 291 特意把线从 60%
-    /// 抬到 80% 要避免的事。返回是否真的改动了（`false` = 本来就不更低，不是错误）。
-    pub async fn raise_provider_context_window(
+    /// 一次撞墙唯一可证的事实是「这个规模的请求，provider 收不下」——登记值贴着证据走，
+    /// 上调与下调都认（旧口径「只上调」的 `WHERE context_window < ?` 守卫废除）：
+    /// 登记虚高会让软限跟着虚高、压缩永不触发，那正是 ux-audit-3 烧掉 1490 万
+    /// prompt_tokens 的根源。返回是否真的改动了（`false` = 值没变，不是错误）。
+    pub async fn set_provider_context_window(
         &self,
         provider_id: &str,
         window: usize,
     ) -> Result<bool> {
         let affected = sqlx::query(
             "UPDATE providers SET context_window = ?, updated_at = ?
-             WHERE id = ? AND context_window < ?",
+             WHERE id = ?",
         )
         .bind(window as i64)
         .bind(ts(self.now()))
         .bind(provider_id)
-        .bind(window as i64)
         .execute(self.pool())
         .await?
         .rows_affected();

@@ -1530,12 +1530,125 @@ async fn a_context_window_failure_compacts_and_retries_that_one_call() {
     );
 }
 
+/// 票 03 验收：只跑工具往返的长节点（ux-audit-3 的形状——纯只读走查在 develop 节点
+/// 烧了 90 分钟、单 run prompt_tokens 1490 万）必须被字符硬底拦住，**即使在无 provider
+/// 的机器上**（FakeAgent 路径，capacity=None：不看窗口登记的脸色）。
+///
+/// 60 轮 × 8 千字符的写文件往返 = 转录 49 万字符，两度撞上 20 万字符的硬底。
+/// 断言：节点照常收口；压缩真实发生（转录里出现 `[摘要]`）；每个请求都压在
+/// 「硬底 + 可解释余量」内；请求总量压在「无压缩理想值」（Σ 每轮累积重发，O(n²)）之下。
+#[tokio::test]
+async fn a_long_tool_round_trip_node_is_capped_by_the_char_floor() {
+    use agentpipeline_core::agent::context::transcript_chars;
+
+    let ctx = setup("true", Settings::default()).await;
+    let mut script = Script::new();
+    script
+        .for_node(Stage::ArchitectDesign, Node::ValidateInput)
+        .submit(&ValidateInputMetadata {
+            readiness: true,
+            blockers: vec![],
+        });
+    let mut exec = script.for_node(Stage::ArchitectDesign, Node::Execute);
+    for i in 0..60 {
+        let body = "x".repeat(8_000);
+        exec = exec.write_file(&format!("notes-{i}.md"), &body);
+    }
+    exec.submit(&ArchitectExecuteMetadata {
+        readiness: true,
+        ..Default::default()
+    });
+    ctx.agent.set_script(script);
+    testkit::seed_task(&ctx.store, "t-charfloor", "p1")
+        .await
+        .unwrap();
+    admit(&ctx, "t-charfloor").await;
+    ctx.executor.run("t-charfloor").await.unwrap();
+
+    let runs = ctx
+        .store
+        .list_runs_at("t-charfloor", Stage::ArchitectDesign, Node::Execute)
+        .await
+        .unwrap();
+    assert_eq!(runs.len(), 1);
+    assert_eq!(
+        runs[0].status,
+        NodeStatus::Success,
+        "硬底拦的是体量，不是产出：节点照常收口"
+    );
+
+    let requests: Vec<_> = ctx
+        .agent
+        .request_log()
+        .into_iter()
+        .filter(|r| r.stage == Stage::ArchitectDesign && r.node == Node::Execute)
+        .collect();
+    assert_eq!(
+        requests.len(),
+        62,
+        "60 次工具往返 + 1 次提交 + 1 次收尾，一次不少"
+    );
+
+    // 压缩真实发生：硬底触发后，后续请求的转录里出现了 `[摘要]`
+    assert!(
+        requests.iter().any(|r| r.messages.iter().any(|m| m
+            .content
+            .as_deref()
+            .unwrap_or("")
+            .starts_with("[摘要]"))),
+        "硬底触发后转录里应出现压缩摘要"
+    );
+    // 锚点/摘要不空转：任一请求里 [摘要] 至多一条（反复压缩只会重写它，不会翻倍）
+    for r in &requests {
+        let summaries = r
+            .messages
+            .iter()
+            .filter(|m| m.content.as_deref().unwrap_or("").starts_with("[摘要]"))
+            .count();
+        assert!(summaries <= 1, "摘要至多一条，得到 {summaries}");
+    }
+
+    // 体量上界：每个请求压在「硬底 + 可解释余量」内（一轮的参数 ~8 千字符，
+    // 余量放宽到 6 轮以容纳 keep 窗口与摘要的形状差）。
+    let per_round = 8_200usize;
+    for r in &requests {
+        let chars = transcript_chars(&r.messages);
+        assert!(
+            chars <= 200_000 + per_round * 6,
+            "请求转录 {chars} 字符，超过硬底的可解释余量"
+        );
+    }
+    // 总量：无压缩理想值 = 每轮都整卷重发（O(n²)）；压缩后必须明显低于它。
+    let ideal: usize = (1..=60).map(|i| i * per_round).sum();
+    let total: usize = requests.iter().map(|r| transcript_chars(&r.messages)).sum();
+    assert!(
+        total * 2 < ideal,
+        "压缩后的请求总量 {total} 应压在无压缩理想值 {ideal} 的一半之下"
+    );
+
+    // 票面验收的**token 口径**（FakeAgent 的 prompt_tokens 是固定假数，取同一请求快照
+    // 按 `estimate_messages_tokens` 的生产算术折算）：静态两段 + 消息，与理想值同形对比。
+    use agentpipeline_core::agent::context::estimate_messages_tokens;
+    let statics =
+        estimate_messages_tokens(&requests[0].system_prompt, &requests[0].user_prompt, &[]);
+    let per_round_tokens = per_round / 4; // ASCII 4 字符 ≈ 1 token（count_tokens 的老规则）
+    let ideal_tokens: usize = (1..=60).map(|i| statics + i * per_round_tokens).sum();
+    let total_tokens: usize = requests
+        .iter()
+        .map(|r| estimate_messages_tokens(&r.system_prompt, &r.user_prompt, &r.messages))
+        .sum();
+    assert!(
+        total_tokens * 2 < ideal_tokens,
+        "压缩后的 prompt 估算总量 {total_tokens} 应压在无压缩理想值 {ideal_tokens} 的一半之下"
+    );
+}
+
 // ─────────── 失败重试按错误类别分流（决策 298，收窄决策 278 的适用边界）───────────
 
 /// 造一个「provider 行写着 128,000」的现场——**事故当时那一行的值**（决策 309 的实测底稿：
 /// 561,210 的输入照样 `ok`，而那一行写着 128,000）。
 ///
-/// 后面两条用例共用它：一条钉「撞墙把它抬起来」，一条钉「别的错误动不了它」。
+/// 后面两条用例共用它：一条钉「撞墙按证据重登记（双向，决策 378）」，一条钉「别的错误动不了它」。
 async fn setup_with_misconfigured_window() -> Ctx {
     use agentpipeline_core::types::{Provider, StageConfig};
 
@@ -1568,12 +1681,14 @@ async fn setup_with_misconfigured_window() -> Ctx {
     ctx
 }
 
-/// 撞墙自校准（决策 309 / 票 01）：上下文超长那一类**会把 provider 行的窗口上调**——
-/// 那次报错就是「这一行的窗口值低估了」的书面证据。
+/// 撞墙自校准（决策 309；票 03 修订为**双向**，决策 378）：上下文超长那一类会把
+/// provider 行的窗口**按撞墙那次请求的规模重登记**——那次报错就是「这一份放不下」的
+/// 书面证据，登记值该贴着它走。这里的撞墙发生在 ValidateInput 的第一次调用上，转录
+/// 还很小（observed = 静态两段的估算）→ 登记值从 128,000 **下调**到那个小读数：正是
+/// ux-audit-3 的病（登记虚高 → 软限虚高 → 压缩永不触发）的反向演练。上调方向由
+/// `window_calibration` 的单测钉住（`the_wall_calibration_follows_the_evidence_in_both_directions`）。
 #[tokio::test]
-async fn a_context_window_failure_raises_the_provider_row() {
-    use agentpipeline_core::pipeline::window_calibration::PROVIDER_WINDOW_LOWER_BOUND;
-
+async fn a_context_window_failure_moves_the_provider_row_to_the_observed_size() {
     let ctx = setup_with_misconfigured_window().await;
     let mut script = Script::new();
     script
@@ -1596,9 +1711,14 @@ async fn a_context_window_failure_raises_the_provider_row() {
         .await
         .unwrap()
         .expect("provider 行还在");
-    assert_eq!(
-        row.context_window as usize, PROVIDER_WINDOW_LOWER_BOUND,
-        "撞墙之后抬到**实测下界**（本机已被证明装得下的规模），不再是那行偏低的配置值"
+    assert!(
+        row.context_window < 128_000,
+        "撞墙的请求很小（转录还是空的）→ 登记值按证据**下调**，不再守着虚高的配置值：{}",
+        row.context_window
+    );
+    assert!(
+        row.context_window > 0,
+        "下调到 observed 的真实读数，不是清零"
     );
 }
 

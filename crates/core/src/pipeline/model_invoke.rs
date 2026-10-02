@@ -524,7 +524,8 @@ impl ModelInvoke {
     /// 两个调用点（本次调用与超窗后的那一次重试）走同一条 select：超窗重试也必须能被打断
     /// ——人按停时不该因为「它正在重试」而多等一轮。取不到观察点（进程内没有这一号登记）
     /// 时照旧直连，与加这条通道之前一致。
-    /// 撞墙就是「这一行的窗口低估了」的证据：把该行**只上调**（决策 309，票 01）。
+    /// 撞墙就是「这一行的窗口登记值与真实窗口不符」的证据：按撞墙那次请求的规模重登记，
+    /// **双向都认**（决策 309；票 03 修订）。
     ///
     /// 解析顺序与 `model_context_window` **同源**（决策 129 四级：节点级 > 任务覆盖 >
     /// 阶段配置 > 首个 enabled）——因为「改哪一行」必须与「哪一行算出了这次的触发线」
@@ -553,19 +554,19 @@ impl ModelInvoke {
             .find(|p| p.id == id)
             .map(|p| p.context_window as usize)
             .unwrap_or(0);
-        let raised = crate::pipeline::window_calibration::calibrated_window(current, observed);
-        if raised > current
+        let calibrated = crate::pipeline::window_calibration::calibrated_window(observed);
+        if calibrated != current
             && self
                 .store
-                .raise_provider_context_window(&id, raised)
+                .set_provider_context_window(&id, calibrated)
                 .await?
         {
             tracing::warn!(
                 provider = %id,
                 from = current,
-                to = raised,
+                to = calibrated,
                 observed,
-                "撞墙自校准：provider 行的上下文窗口上调并落账（决策 309）"
+                "撞墙自校准：provider 行的上下文窗口按撞墙证据重登记（决策 309，票 03 修订为双向）"
             );
         }
         Ok(())
@@ -778,8 +779,9 @@ impl ModelInvoke {
 
         // 压缩锚点的边界（决策 180，票 13 必要条件三）：`carried` 是**上一轮**的对话，
         // 它里面的 user 消息不得充当「本轮第一条 user 消息」这个锚点——否则载入历史后，
-        // keep 预算会被上一轮的提问占掉。
-        let carried_len = trace.messages.len();
+        // keep 预算会被上一轮的提问占掉。**可变**（票 03）：压缩会把载入历史压成摘要、
+        // 锚点下标随之搬迁，预算门每压一次就把新下标写回这里。
+        let mut carried_len = trace.messages.len();
         let mut tool_failures = 0u32;
         let mut submitted: Option<serde_json::Value> = None;
         // 决策 375：滚动入账的节流戳——`None` 表示本 attempt 还没刷过投影。
@@ -807,7 +809,7 @@ impl ModelInvoke {
             // 组装期超限优先（还没进过轮、压缩无从谈起），否则每轮同步查一次。
             // 任一超限 → 先补会话行再收口为 pending，**永不继续循环**（票 13 必要条件一）。
             let overflow = assemble_overflow.take().or_else(|| {
-                match plan.check_budget(&mut trace.messages, carried_len) {
+                match plan.check_budget(&mut trace.messages, &mut carried_len) {
                     BudgetCheck::Ok { .. } => None,
                     BudgetCheck::Overflow {
                         estimate,
@@ -846,10 +848,11 @@ impl ModelInvoke {
                 // 再重试这一次调用**（与值班长 06(c) 同一处置、同一个判据）。压缩是**无条件**的：
                 // 那次报错就是「算术低估了」的证据，按软限再判一次只会得出「还没到线」。
                 Err(e) if is_context_window(&e) => {
-                    // **撞墙自校准**（决策 309，票 foreman-burns 01）：provider 报上下文超长
-                    // 同时告诉我们「这一行的窗口值低估了」。只上调、且不低于实测下界
-                    // （576,210 = 561,210 实测输入 + 输出预留）；登记的方向由
-                    // `raise_provider_context_window` 的 `WHERE context_window < ?` 保证。
+                    // **撞墙自校准**（决策 309；票 03 修订为**双向**）：provider 报上下文超长
+                    // 给出的唯一可证事实是「这一份放不下」。登记值就该贴着这个证据走——
+                    // 之前登记得比它低（低估）就上调到它，登记得比它高（虚高，正是
+                    // ux-audit-3 软限失真的根源）就下调到它。旧口径「只上调、不低于实测
+                    // 下界」废除了：那个下界（576,210）是事故那台机器的证据，不是这台的。
                     //
                     // **反向**：传输 / 鉴权 / 配额那几类**一个字节都不改**——它们到不了
                     // 这个分支（判据就是 `is_context_window`），走下面那条 `Err(e) => return`。
@@ -866,7 +869,7 @@ impl ModelInvoke {
                     {
                         tracing::debug!(error = %cal, "窗口撞墙自校准未完成（不拖累这一轮）");
                     }
-                    let compacted = plan.force_compact(&mut trace.messages, carried_len);
+                    let compacted = plan.force_compact(&mut trace.messages, &mut carried_len);
                     if compacted == 0 {
                         // 压不动了（都在 keep 窗口里 / 回执就是极限）：报错才是诚实的，
                         // 原文与指引由上面的分类带着走。
