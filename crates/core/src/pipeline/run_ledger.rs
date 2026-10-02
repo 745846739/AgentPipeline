@@ -38,14 +38,28 @@ use crate::Result;
 
 use super::subagent::RunTokens;
 
+/// 续接的**形态**（决策 376 裁决② · 票 04）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ContinuationMode {
+    /// 全卷转录：带的上一轮对话原样续接（决策 180 / 205 的既有形态，梯子第 1–2 档与人按 resume）。
+    Transcript,
+    /// 简报：**不带转录**，改由 `continuation_brief` 段交代「任务描述 + 产物清单 +
+    /// 未提交改动 + 最近收口摘要」（梯子第 3 档的空白重跑，决策 320 / 376）。
+    Brief,
+}
+
 /// 一次 pending → resume 边界的续接素材（决策 180，票 13）。
 ///
 /// `from_run_id` 是**被续接的那条历史 run**，写进新 run 的 `continued_from_run_id`。
 /// 这个链接如今只做**谱系**（排障时顺着链往上爬）；指标汇总已不再据它排除——
 /// 排除规则随决策 375 删除（真实账语义：重喂的输入是真实成本）。
+///
+/// **简报形态不带链接**（`from_run_id = None`，票 04）：空白重跑在台账语义上仍是
+/// 「新的一段对话」，它只是拿到了上一轮现场的**文本投影**，不是续接那段对话。
 pub(crate) struct Continuation {
+    pub mode: ContinuationMode,
     pub messages: Vec<Message>,
-    pub from_run_id: i64,
+    pub from_run_id: Option<i64>,
 }
 
 /// 自 `started` 起经过的毫秒（墙钟、经 [`Clock`] 接缝——决策 143；负值按 0 记）。
@@ -226,9 +240,11 @@ impl<'a> RunLedger<'a> {
             return Ok(());
         }
         if let Some(c) = continuation {
-            self.store
-                .link_run_continuation(run_id, c.from_run_id)
-                .await?;
+            if let Some(from_run_id) = c.from_run_id {
+                self.store
+                    .link_run_continuation(run_id, from_run_id)
+                    .await?;
+            }
         }
         Ok(())
     }
@@ -247,6 +263,11 @@ impl<'a> RunLedger<'a> {
     /// 第 ② 条在「该续接却读不到」时**静默干净起跑**而不报错：这是票 13 必要条件一
     /// （`context_overflow` 退出路径补写会话行）修掉的那条路——修复之后它不该再发生，
     /// 但真发生时让节点继续跑仍优于让整条流水线停在一个诊断性错误上。
+    ///
+    /// **形态由原因定**（票 04）：`timeout_blank_restart` 返回
+    /// [`ContinuationMode::Brief`]——不给转录、不落链，只把「这是空白重跑」这个事实
+    /// 交给编排侧去渲染简报段；其余原因照旧给全卷转录。简报**不要求会话行可读**：
+    /// 它本就是为了「上一轮死得连转录都不该再喂一遍」而存在的。
     pub(crate) async fn take_continuation(
         &self,
         cursor: &NodeCursor,
@@ -261,6 +282,13 @@ impl<'a> RunLedger<'a> {
         if !crate::types::resume_continues(cause) {
             return Ok(None);
         }
+        if cause == crate::types::ResumeCause::TimeoutBlankRestart {
+            return Ok(Some(Continuation {
+                mode: ContinuationMode::Brief,
+                messages: Vec::new(),
+                from_run_id: None,
+            }));
+        }
         let Some(conv) = self
             .store
             .latest_own_conversation(&cursor.task_id, cursor.stage, cursor.node)
@@ -274,8 +302,9 @@ impl<'a> RunLedger<'a> {
             return Ok(None);
         }
         Ok(Some(Continuation {
+            mode: ContinuationMode::Transcript,
             messages,
-            from_run_id: conv.run_id,
+            from_run_id: Some(conv.run_id),
         }))
     }
 }
@@ -287,7 +316,7 @@ mod tests {
 
     use crate::home::Home;
     use crate::storage::tasks::NewTask;
-    use crate::types::{PendingKind, PendingReason, Project};
+    use crate::types::{PendingKind, PendingReason, Project, ResumeCause};
 
     /// 假时钟：本片的核心杠杆——duration 读数从此可以确定性驱动（决策 143 接缝①）。
     #[derive(Clone)]
@@ -508,8 +537,9 @@ mod tests {
         let (fresh, _) = begin("main").await;
         let (retried, _) = begin("main").await;
         let continuation = Continuation {
+            mode: ContinuationMode::Transcript,
             messages: vec![Message::user("上一轮")],
-            from_run_id: history,
+            from_run_id: Some(history),
         };
 
         ledger
@@ -590,10 +620,48 @@ mod tests {
 
         let first = ledger.take_continuation(&cursor).await.unwrap();
         let first = first.expect("resume 原因说「续接」且会话行可读 → 给素材");
-        assert_eq!(first.from_run_id, run_id);
+        assert_eq!(first.mode, ContinuationMode::Transcript);
+        assert_eq!(first.from_run_id, Some(run_id));
         assert_eq!(first.messages.len(), 2);
 
         let second = ledger.take_continuation(&cursor).await.unwrap();
         assert!(second.is_none(), "原因读走即清：第二次必须干净起跑");
+    }
+
+    /// 票 04：空白重跑那一档给的是**简报形态**——不带转录、不落谱系链接，且**不要求**
+    /// 会话行可读（它本就是为了「上一轮死得连转录都不该再喂一遍」而存在）。
+    #[tokio::test]
+    async fn a_blank_restart_continuation_is_brief_and_unlinked() {
+        let (_tmp, store, task, cursor, clock) = base().await;
+        let ledger = RunLedger::new(&store, &clock);
+        let (run_id, _) = ledger
+            .begin(&task, &cursor.cursor_id, cursor.stage, cursor.node, "main")
+            .await
+            .unwrap();
+        // 置位口与生产同路：超时梯子第 3 档直接写原因列（游标从未 pending 过）。
+        store
+            .mark_cursor_continuation(&cursor.cursor_id, ResumeCause::TimeoutBlankRestart)
+            .await
+            .unwrap();
+
+        let got = ledger
+            .take_continuation(&cursor)
+            .await
+            .unwrap()
+            .expect("空白重跑也是一条续接边界，要给（空的）素材");
+        assert_eq!(got.mode, ContinuationMode::Brief);
+        assert!(got.messages.is_empty(), "简报不带全卷转录");
+        assert_eq!(got.from_run_id, None, "空白重跑不落续接链接");
+
+        // 读-清语义不变：第二次干净起跑。
+        assert!(ledger.take_continuation(&cursor).await.unwrap().is_none());
+
+        // 不落链：round 0 拿到这份素材也不写 continued_from_run_id。
+        ledger
+            .link_continuation(run_id, 0, Some(&got))
+            .await
+            .unwrap();
+        let row = store.get_run(run_id).await.unwrap().unwrap();
+        assert_eq!(row.continued_from_run_id, None);
     }
 }

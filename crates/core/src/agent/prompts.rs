@@ -206,6 +206,10 @@ pub struct PromptSegments {
     pub review_required_changes: Option<String>,
     /// develop / test 重试耗尽的失败摘要（决策 138）。
     pub retry_feedback: Option<String>,
+    /// 超时梯子第 3 档（空白重跑）的起跑简报（决策 376 裁决② · 票 04）：任务描述 +
+    /// 阶段产物文件清单 + 未提交改动清单 + 最近收口摘要。**只有这一档非空**——它替代
+    /// 全卷转录，让「上一轮的侦察」不必每次重置都重新买一遍。
+    pub continuation_brief: Option<String>,
 }
 
 /// 组装 user prompt：主模板 + 非空追加段。
@@ -223,6 +227,10 @@ pub fn build_user_prompt(main: &str, segments: &PromptSegments) -> String {
             segments.review_required_changes.as_deref(),
         ),
         ("## 重试历史摘要", segments.retry_feedback.as_deref()),
+        (
+            "## 续接简报（超时空白重跑，不带全卷转录）",
+            segments.continuation_brief.as_deref(),
+        ),
     ] {
         if let Some(body) = body {
             if !body.trim().is_empty() {
@@ -711,6 +719,7 @@ mod tests {
             review_required_changes: Some("D".into()),
             user_input: Some("E".into()),
             retry_feedback: Some("C".into()),
+            continuation_brief: Some("F".into()),
         };
         let out = build_user_prompt("主", &seg);
         let a = out.find("## 合入闸门失败复检上下文").unwrap();
@@ -718,7 +727,22 @@ mod tests {
         let e = out.find("## 用户补充输入").unwrap();
         let d = out.find("## 评审必须修改项").unwrap();
         let c = out.find("## 重试历史摘要").unwrap();
-        assert!(a < b && b < e && e < d && d < c);
+        let f = out
+            .find("## 续接简报（超时空白重跑，不带全卷转录）")
+            .unwrap();
+        assert!(a < b && b < e && e < d && d < c && c < f);
+    }
+
+    /// 票 04：空白重跑的简报段被渲染，且是**独立一段**（不是塞进别的段里）。
+    #[test]
+    fn continuation_brief_segment_rendered() {
+        let seg = PromptSegments {
+            continuation_brief: Some("## 任务描述\n### 走查\n把清单落盘".into()),
+            ..Default::default()
+        };
+        let out = build_user_prompt("主 prompt", &seg);
+        assert!(out.contains("## 续接简报（超时空白重跑，不带全卷转录）"));
+        assert!(out.contains("把清单落盘"));
     }
 
     #[test]

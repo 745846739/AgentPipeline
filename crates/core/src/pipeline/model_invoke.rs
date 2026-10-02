@@ -225,6 +225,11 @@ impl ModelInvoke {
         // 一次」见 `run_ledger` 模块 doc；resume 边界每轮只有一个，循环内的重试续接
         // 走决策 278 的转录保留，不经这里）。
         let continuation = self.ledger().take_continuation(cursor).await?;
+        // 续接**形态**（票 04）：空白重跑那一档给的是简报（不带转录），起跑那一轮据此把
+        // 「任务描述 + 产物清单 + 未提交改动 + 最近收口摘要」渲染进首条 user prompt。
+        let brief_continuation = continuation
+            .as_ref()
+            .is_some_and(|c| c.mode == crate::pipeline::run_ledger::ContinuationMode::Brief);
         // 决策 279：info_insufficient 续接时，补充输入作为 user turn 追加到**转录末尾**
         // （不再经 segment 重渲染进首条消息——那会把 prompt 前缀全变、缓存打穿，
         // 且转录里查无此人）。只在真追加了 turn 时才停用 segment：
@@ -273,6 +278,7 @@ impl ModelInvoke {
                     attempt,
                     &carried,
                     supplement_as_turn,
+                    brief_continuation,
                     cancel,
                 )
                 .await
@@ -433,6 +439,7 @@ impl ModelInvoke {
         attempt: u32,
         carried: &[Message],
         supplement_as_turn: bool,
+        brief_continuation: bool,
         cancel: Option<&CancelSignal>,
     ) -> std::result::Result<(NodeOutput, RunTokens), AttemptFailure> {
         let mut trace = AttemptTrace {
@@ -449,6 +456,7 @@ impl ModelInvoke {
                 attempt,
                 &mut trace,
                 supplement_as_turn,
+                brief_continuation,
                 cancel,
             )
             .await
@@ -651,6 +659,7 @@ impl ModelInvoke {
         attempt: u32,
         trace: &mut AttemptTrace,
         supplement_as_turn: bool,
+        brief_continuation: bool,
         cancel: Option<&CancelSignal>,
     ) -> Result<(NodeOutput, RunTokens)> {
         let home = self.store.home().clone();
@@ -764,6 +773,22 @@ impl ModelInvoke {
             // 决策 279：补充输入已作为 user turn 进转录（validate_input 续接），
             // segment 不再重渲染——见 `model_request::load_segments`。
             user_input_as_turn: supplement_as_turn,
+            // 票 04：空白重跑那一档不带转录，改把现场投影成一份简报（见
+            // `continuation_brief` 模块 doc）。**只在简报形态下才拼**——它是唯一一条
+            // 需要动用 git / 目录读的组装路径，正常续接/全新起跑一个字节都不多读。
+            continuation_brief: if brief_continuation {
+                Some(
+                    crate::pipeline::continuation_brief::build(
+                        &self.store,
+                        task,
+                        cursor.stage,
+                        cursor.node,
+                    )
+                    .await,
+                )
+            } else {
+                None
+            },
             // 启动探测的授权快照（决策 306）：值在这里贴上组装层，缺授权时组装**立刻**失败。
             disk_access: crate::agent::disk_access::state(),
         })

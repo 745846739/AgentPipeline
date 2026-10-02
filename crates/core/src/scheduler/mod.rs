@@ -358,7 +358,8 @@ impl KanbanScheduler {
     }
 
     /// 超时处理：杀进程组 / 通知执行体收口 → 按连续超时轮数分流（决策 320）：
-    /// 1–2 次自动续接上一轮转录 → 第 3 次空白重跑一次 → 第 4 次起 pending(timeout) 交回人工。
+    /// 1–2 次自动续接上一轮转录 → 第 3 次空白重跑一次（票 04 起改带简报，不带全卷转录）
+    /// → 第 4 次起 pending(timeout) 交回人工。
     async fn handle_timeout(&self, run: &NodeRun, report: &mut TickReport) -> Result<()> {
         // 调用方已跳过项目级 run；这里再兜一层，避免无任务 / 游标时误用空值。
         let (Some(task_id), Some(cursor_id)) = (run.task_id.as_deref(), run.cursor_id.as_deref())
@@ -487,6 +488,16 @@ impl KanbanScheduler {
             crate::pipeline::retry::TimeoutRetry::BlankRestart => {
                 // 空白重跑档：不带转录重起一段对话（决策 33 的原语义），给节点最后一次
                 // 自己走完的机会。transition 文案明说降级，复盘时不必倒推为什么没续接。
+                //
+                // 票 04（决策 376 裁决②）：**空白**不再等于「从零开始」——续接原因列置
+                // `TimeoutBlankRestart`，起跑那一轮据此渲染一份简报（任务描述 + 阶段产物
+                // 文件清单 + 未提交改动清单 + 最近收口摘要），替掉全卷转录。置位只对
+                // agent 节点有效（纯代码节点不读续接素材，标记会悬在列上；梯子计数照走）。
+                if is_agent_node {
+                    self.store
+                        .mark_cursor_continuation(cursor_id, ResumeCause::TimeoutBlankRestart)
+                        .await?;
+                }
                 self.store
                     .insert_transition(
                         task_id,
@@ -494,7 +505,9 @@ impl KanbanScheduler {
                         Some((run.stage, run.node)),
                         (run.stage, run.node),
                         crate::types::TransitionTrigger::Timeout,
-                        Some("节点超时，续接两轮未恢复，空白重跑一次"),
+                        Some(
+                            "节点超时，续接两轮未恢复，空白重跑一次（改带简报起跑，不带全卷转录）",
+                        ),
                     )
                     .await?;
                 (self.resume)(task_id);

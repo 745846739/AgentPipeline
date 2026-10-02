@@ -76,6 +76,10 @@ pub struct AttemptCtx<'a> {
     /// ——「用户补充输入」segment 停止渲染，否则同一段话出现两遍、首条消息还变了
     /// （prompt cache 整段打穿的实测根源）。execute 等其余场景恒 false，segment 照旧。
     pub user_input_as_turn: bool,
+    /// 票 04：超时梯子第 3 档（空白重跑）的起跑简报——**已组装好的文本**，本模块只负责
+    /// 渲染进首条 user prompt。文本由 `pipeline::continuation_brief` 拼（那一步要读盘 /
+    /// 读 git / 读库），本模块因此仍守着「无 git」的边界（见模块 doc 的依赖四分类）。
+    pub continuation_brief: Option<String>,
     /// 启动时探到的完全磁盘访问授权（决策 306）。
     ///
     /// **值注入，不是缝**：进程级快照由启动探测写入（`agent::disk_access::record`），
@@ -472,6 +476,10 @@ async fn load_segments(ctx: &AttemptCtx<'_>) -> Result<PromptSegments> {
             "retry-feedback.md",
         )
         .await,
+        // 票 04：简报文本已由编排侧组好（`AttemptCtx.continuation_brief`），本函数只把它
+        // 搬进段表（渲染在 `build_user_prompt`）。放在段表末尾：它是「这一轮从哪起跑」的
+        // 交代，读在其余反馈段之后更顺。
+        continuation_brief: ctx.continuation_brief.clone(),
     })
 }
 
@@ -1313,6 +1321,7 @@ mod tests {
             attempt: 1,
             kind,
             user_input_as_turn: false,
+            continuation_brief: None,
             // 组装层大部分用例与授权无关：这一份是「还没探过」（判不出来就不拦人）。
             // 缺授权那条路自己在 `a_denied_disk_access_snapshot_fails_fast` 里置值。
             disk_access: crate::agent::disk_access::DiskAccessState::NotProbed,
@@ -2200,6 +2209,7 @@ mod tests {
                 attempt: 1,
                 kind: AgentNodeKind::ValidateInput,
                 user_input_as_turn: false,
+                continuation_brief: None,
                 disk_access: crate::agent::disk_access::DiskAccessState::NotProbed,
             };
             RequestPlan::assemble(c).await
@@ -2306,6 +2316,7 @@ mod tests {
             attempt: 1,
             kind: AgentNodeKind::ArchitectExecute,
             user_input_as_turn: false,
+            continuation_brief: None,
             disk_access: state,
         };
 
@@ -2349,6 +2360,7 @@ mod tests {
             attempt: 1,
             kind: AgentNodeKind::ArchitectExecute,
             user_input_as_turn: false,
+            continuation_brief: None,
             disk_access: DiskAccessState::Denied,
         };
         assert!(

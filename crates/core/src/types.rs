@@ -356,6 +356,12 @@ pub enum ResumeCause {
     RetryExhausted,
     ContextOverflow,
     Timeout,
+    /// 超时梯子第 3 档：**空白重跑**（决策 320 / 376 裁决②）。与 [`ResumeCause::Timeout`]
+    /// 分开是因为去向的**形态**不同——`Timeout` 带全卷转录续接，本档改带一份简报
+    /// （任务描述 + 产物清单 + 未提交改动 + 最近收口摘要，票 04）。它不由 pending 原因
+    /// 分类出来（`classify` 不返回它）：超时路径的游标从未 pending 过，由
+    /// `scheduler::handle_timeout` 的降级档用 `mark_cursor_continuation` 直接置位。
+    TimeoutBlankRestart,
     DependencyFailed,
     DependencyCancelled,
     /// `user_decision` 且没有 `context.kind`（通用那一行：跳过 / 取消）。
@@ -391,12 +397,13 @@ pub enum ResumeCause {
 /// 新增一个变体时**先改这里**，再回答 `resume_continues` 那个穷尽 `match`——
 /// 编译器会在后者报「未覆盖的模式」，这是本表的牙齿（决策 205：兜底 false 是安全网，
 /// 不是让人忘记回答的借口）。
-pub const ALL_RESUME_CAUSES: [ResumeCause; 23] = [
+pub const ALL_RESUME_CAUSES: [ResumeCause; 24] = [
     ResumeCause::InfoInsufficient,
     ResumeCause::ConflictWait,
     ResumeCause::RetryExhausted,
     ResumeCause::ContextOverflow,
     ResumeCause::Timeout,
+    ResumeCause::TimeoutBlankRestart,
     ResumeCause::DependencyFailed,
     ResumeCause::DependencyCancelled,
     ResumeCause::UserDecision,
@@ -426,6 +433,7 @@ impl ResumeCause {
             ResumeCause::RetryExhausted => "retry_exhausted",
             ResumeCause::ContextOverflow => "context_overflow",
             ResumeCause::Timeout => "timeout",
+            ResumeCause::TimeoutBlankRestart => "timeout_blank_restart",
             ResumeCause::DependencyFailed => "dependency_failed",
             ResumeCause::DependencyCancelled => "dependency_cancelled",
             ResumeCause::UserDecision => "user_decision",
@@ -505,11 +513,17 @@ impl ResumeCause {
 /// **硬编码、改它要发版**（与 [`crate::config::SUPPORTED_ADAPTERS`] 同姿态，决策 103 的先例）：
 /// 这张表是产品判断，不是配置项——「不展示在设置里、在代码中定义好」正是本决策的原话。
 ///
-/// 这张表只管 **resume 边界**（人按了键）：分界原来是「模型的自动失败重试不给续接，
+/// 这张表管 **resume / 续接边界**：分界原来是「模型的自动失败重试不给续接，
 /// 人的介入才给」（决策 33 / 205 裁决②）；**决策 278 显式修订后半句**——`agent_retry_max`
 /// 的自动重试如今也续接转录＋错误 turn，但那条路在编排侧（`model_invoke`）直接保留，
 /// 不走本表。故 `validate_attempts` 的原地重试、未耗尽的超时仍不出现在这张表里
 /// ——它们根本走不到 resume 边界（`clear_cursor_pending` 才是落点）。
+///
+/// **一个例外（票 04）**：`timeout_blank_restart` 由超时梯子的降级档**自动**置位
+/// （`scheduler::handle_timeout` 经 `mark_cursor_continuation`——那条路与
+/// `clear_cursor_pending` 是同一个列的第二把合法钥匙，见 `storage::cursors` 的文档），
+/// 它不是「人按了键」。它进表是因为下游要拿这个原因判断**形态**（简报而非转录）——
+/// 本表回答的是「这是不是一条续接边界」，答案仍是 true。
 ///
 /// **穷尽 `match`**：新增一个原因时不写进这个 match 就编译不过。这比「兜底 false 然后忘掉」
 /// 强——兜底仍保留（`Unknown` 那一档），但它只服务于「库里的历史值」，不服务于新代码。
@@ -520,9 +534,14 @@ pub fn resume_continues(cause: ResumeCause) -> bool {
         // 信息不足被打回（补充输入后重入同一节点）、校验耗尽（格式不是 json）、
         // 代码有问题被打回（评审驳回 / 闸门 / test code_issue）、超时耗尽后人工「重试执行」、
         // 判分歧、脏工作区、重复风险、冲突等待**自动**放行、依赖失败**自动**恢复。
+        //
+        // `timeout_blank_restart`（票 04）：本档**也**算一次续接边界（下游要据此把简报
+        // 段渲染进首条消息），只是 `take_continuation` 认出它之后**不给转录**——换一份
+        // 简报。判定表回答的是「这是不是一个续接边界」，形态由 `ContinuationMode` 定。
         ResumeCause::InfoInsufficient
         | ResumeCause::RetryExhausted
         | ResumeCause::Timeout
+        | ResumeCause::TimeoutBlankRestart
         | ResumeCause::ConflictWait
         | ResumeCause::DependencyFailed
         | ResumeCause::DuplicateRisk
@@ -1656,11 +1675,13 @@ mod tests {
     #[test]
     fn resume_cause_table_is_the_spec() {
         use ResumeCause::*;
-        let cases: [(ResumeCause, bool); 23] = [
+        let cases: [(ResumeCause, bool); 24] = [
             // ── true ──
             (InfoInsufficient, true),
             (RetryExhausted, true),
             (Timeout, true),
+            // 空白重跑是一条续接边界（下游据它渲染简报段），只是不带转录（票 04）
+            (TimeoutBlankRestart, true),
             (ConflictWait, true),
             (DependencyFailed, true),
             (DuplicateRisk, true),

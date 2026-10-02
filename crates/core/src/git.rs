@@ -86,6 +86,9 @@ const GIT_OP_TIMEOUT_SEC: u64 = 180;
 /// 检查把 `init.execute` 挂死了——**best-effort 的检查不允许有能力挂住关键路径**。
 const IS_DIRTY_TIMEOUT_SEC: u64 = 10;
 
+/// 未提交改动清单的条数上限（票 04 的简报用）：只给「有哪些文件」，不做全量导出。
+const DIRTY_FILES_MAX: usize = 50;
+
 /// 在阻塞线程池里执行一段同步 git2 逻辑（决策 12），带 [`GIT_OP_TIMEOUT_SEC`] 兜底。
 pub(crate) async fn blocking<T, F>(f: F) -> Result<T>
 where
@@ -111,6 +114,39 @@ where
 
 fn open(path: &Path) -> Result<git2::Repository> {
     git2::Repository::open(path).map_err(gerr)
+}
+
+/// 索引态那一字符（`git status --short` 的 X 位）；无索引态改动时是空格。
+/// 未跟踪文件两列都是 `?`（与 porcelain 一致）——git2 只置 `WT_NEW`，这里补上前一列。
+fn index_state(s: git2::Status) -> char {
+    if s.contains(git2::Status::WT_NEW) {
+        '?'
+    } else if s.contains(git2::Status::INDEX_NEW) {
+        'A'
+    } else if s.contains(git2::Status::INDEX_MODIFIED) {
+        'M'
+    } else if s.contains(git2::Status::INDEX_DELETED) {
+        'D'
+    } else if s.contains(git2::Status::INDEX_RENAMED) {
+        'R'
+    } else {
+        ' '
+    }
+}
+
+/// 工作区态那一字符（`git status --short` 的 Y 位）；未跟踪按 `?`。
+fn worktree_state(s: git2::Status) -> char {
+    if s.contains(git2::Status::WT_NEW) {
+        '?'
+    } else if s.contains(git2::Status::WT_MODIFIED) {
+        'M'
+    } else if s.contains(git2::Status::WT_DELETED) {
+        'D'
+    } else if s.contains(git2::Status::WT_RENAMED) {
+        'R'
+    } else {
+        ' '
+    }
 }
 
 /// 建 worktree 的跨任务互斥锁（按仓库路径分桶）。
@@ -396,6 +432,47 @@ impl Git {
                 "{} 处未提交（其中 {untracked} 个未跟踪）",
                 statuses.len()
             )))
+        })
+        .await
+    }
+
+    /// 未提交改动的**逐条清单**（`XY path`，上限 [`DIRTY_FILES_MAX`] 条），空工作区/非仓库
+    /// 返回空表。与 [`Self::dirty_summary`] 同源（同一种 `StatusOptions`），只是要的是
+    /// 「哪几个文件」而不是「几处」——票 04 的续接简报要把它交到**新起的一段对话**手里
+    /// （事故的直接教训：改过的 `ux-audit.spec.ts` 只活在 worktree 里，差点随重跑被无视）。
+    ///
+    /// 与 [`Self::is_dirty`] 同一个短上限（[`IS_DIRTY_TIMEOUT_SEC`]）：它换来的也只是
+    /// 简报里的一段文本，**不允许有能力挂住关键路径**（决策 209 的教训）。读不出来时
+    /// 调用方按「读不到」降级，不因这一条拖垮整轮组装。
+    ///
+    /// **先排序再截断**：截断取的是「名字靠前的那 [`DIRTY_FILES_MAX`] 条」，不是 git2
+    /// 枚举顺序里的前若干条——否则超过上限时被丢掉的恰好可能是那条最该被保护的文件。
+    ///
+    /// `XY` 两字符与 `git status --short` 同序（X = 索引态，Y = 工作区态）：
+    /// `A`（新增）/`M`（已跟踪改动）/`D`（删除）/`R`（改名）/`?`（未跟踪）。忽略文件
+    /// （`!`）不在表内——`include_untracked` 不含 ignored，那些行不该进简报。
+    pub async fn dirty_files(&self, path: &Path) -> Result<Vec<String>> {
+        let p = path.to_path_buf();
+        blocking_within(IS_DIRTY_TIMEOUT_SEC, move || {
+            let repo = open(&p)?;
+            let mut opts = git2::StatusOptions::new();
+            opts.include_untracked(true);
+            let statuses = repo.statuses(Some(&mut opts)).map_err(gerr)?;
+            let mut out: Vec<String> = statuses
+                .iter()
+                .map(|entry| {
+                    let code = entry.status();
+                    format!(
+                        "{}{} {}",
+                        index_state(code),
+                        worktree_state(code),
+                        entry.path().unwrap_or("(非 UTF-8 路径)")
+                    )
+                })
+                .collect();
+            out.sort();
+            out.truncate(DIRTY_FILES_MAX);
+            Ok(out)
         })
         .await
     }
@@ -1201,6 +1278,45 @@ mod tests {
     fn branch_name_convention() {
         assert_eq!(branch_name("01H"), "kanban/01H");
         assert_eq!(Git::branch_for("t1"), "kanban/t1");
+    }
+
+    /// 票 04：未提交改动要**点得出文件名**（简报据此提醒「改好了，别重做」），且非仓库
+    /// 时降级为 `Err`（调用方按「读不到」显示），不是一个 panic。
+    #[tokio::test]
+    async fn dirty_files_names_each_change_and_degrades_on_a_non_repo() {
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = git2::Repository::init(tmp.path()).unwrap();
+        std::fs::write(tmp.path().join("tracked.txt"), "v1").unwrap();
+        {
+            let mut index = repo.index().unwrap();
+            index.add_path(Path::new("tracked.txt")).unwrap();
+            index.write().unwrap();
+            let tree = repo.find_tree(index.write_tree().unwrap()).unwrap();
+            let sig = git2::Signature::now("t", "t@example.com").unwrap();
+            repo.commit(Some("HEAD"), &sig, &sig, "init", &tree, &[])
+                .unwrap();
+        }
+        // 一处已跟踪文件的改动 + 一处未跟踪文件
+        std::fs::write(tmp.path().join("tracked.txt"), "v2").unwrap();
+        std::fs::write(tmp.path().join("new.txt"), "n").unwrap();
+
+        let files = Git.dirty_files(tmp.path()).await.unwrap();
+        assert!(
+            files
+                .iter()
+                .any(|f| f.starts_with(" M") && f.ends_with("tracked.txt")),
+            "已跟踪改动按 ` M` 记：{files:?}"
+        );
+        assert!(
+            files
+                .iter()
+                .any(|f| f.starts_with("??") && f.ends_with("new.txt")),
+            "未跟踪按 `??` 记：{files:?}"
+        );
+
+        // 非仓库 → Err（上层降级成一句「读不到」，不拖垮组装）
+        let outside = tempfile::tempdir().unwrap();
+        assert!(Git.dirty_files(outside.path()).await.is_err());
     }
 
     #[test]

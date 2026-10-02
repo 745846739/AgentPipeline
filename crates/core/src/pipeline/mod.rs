@@ -1,6 +1,7 @@
 //! 流水线：图拓扑、条件边路由、落点表、游标谓词。
 
 pub mod advance;
+pub(crate) mod continuation_brief;
 pub mod cursor;
 pub(crate) mod events;
 pub mod executor;

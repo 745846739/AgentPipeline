@@ -353,7 +353,8 @@ async fn timeout_kills_process_group_and_retries_per_ladder() {
         Some(ResumeCause::Timeout)
     );
 
-    // 连续超时第 3 次：降级空白重跑——resume 但**不**置续接标记
+    // 连续超时第 3 次：降级空白重跑——resume，且原因列置成「空白重跑」（票 04）。
+    // 该档**不带**全卷转录：起跑那一轮按这个原因改成渲染一份简报。
     h.running_run("t1", &cursor.cursor_id, 3, 400, 400, Some(4244))
         .await;
     let report = h.scheduler(Settings::default()).tick().await.unwrap();
@@ -364,8 +365,8 @@ async fn timeout_kills_process_group_and_retries_per_ladder() {
             .take_cursor_resume_cause(&cursor.cursor_id)
             .await
             .unwrap(),
-        None,
-        "空白重跑不带上一轮转录"
+        Some(ResumeCause::TimeoutBlankRestart),
+        "空白重跑不带上一轮转录，改带简报（票 04）"
     );
 
     // 连续超时第 4 次：挂起 pending(timeout) 交回人工

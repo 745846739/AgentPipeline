@@ -3,7 +3,7 @@
 //! FakeAgent 只替换 LLM 响应流，工具层 / git / 命令记录全部真实执行（决策 148）。
 
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use agentpipeline_core::agent::client::{AgentResponse, LlmClient, LlmRequest};
@@ -6338,6 +6338,96 @@ impl LlmClient for ToolThenStall {
     }
 }
 
+/// 同 [`ToolThenStall`]，但把每一次请求抄一份留给调用方——票 04 要断言第 3 档
+/// （空白重跑）那一轮的 prompt 形状，这是唯一的取证口。
+struct RecordingToolThenStall {
+    calls: Arc<AtomicUsize>,
+    requests: Arc<Mutex<Vec<LlmRequest>>>,
+}
+
+impl LlmClient for RecordingToolThenStall {
+    fn complete(
+        &self,
+        request: LlmRequest,
+    ) -> BoxFuture<'static, agentpipeline_core::Result<AgentResponse>> {
+        let calls = self.calls.clone();
+        let requests = self.requests.clone();
+        Box::pin(async move {
+            requests.lock().unwrap().push(request);
+            let n = calls.fetch_add(1, Ordering::SeqCst);
+            if n % 2 == 1 {
+                std::future::pending::<()>().await;
+                unreachable!();
+            }
+            Ok(AgentResponse {
+                content: None,
+                tool_calls: vec![agentpipeline_core::agent::client::ToolCall {
+                    id: format!("c{n}"),
+                    name: "read_file".into(),
+                    arguments: r#"{"path":"."}"#.into(),
+                }],
+                prompt_tokens: 7,
+                completion_tokens: 3,
+                ..Default::default()
+            })
+        })
+    }
+}
+
+/// 起一轮执行体、等它先真实跑完一次工具轮、推时钟判超时、等它按中止请求收口——返回该轮 run_id。
+///
+/// 两条梯子用例共用这一段；`llm_calls` 是跨轮同一个计数（`2 * round` = 该轮 call B 已进场）。
+async fn drive_one_timed_out_round(
+    ctx: &Ctx,
+    scheduler: &KanbanScheduler,
+    task_id: &str,
+    llm: Arc<dyn LlmClient>,
+    llm_calls: &Arc<AtomicUsize>,
+    round: usize,
+) -> i64 {
+    let ex = Arc::new(Executor::new(
+        ctx.store.clone(),
+        Settings::default(),
+        Arc::new(ctx.sse.clone()),
+        llm,
+        Arc::new(ctx.killer.clone()),
+    ));
+    let jh = {
+        let ex = ex.clone();
+        let task_id = task_id.to_string();
+        tokio::spawn(async move { ex.run(&task_id).await })
+    };
+    let run_id = wait_for_running_validate_input(ctx, task_id).await;
+    // 等这一轮**真的先干了活**再判超时：中止请求若抢在第一次工具轮写完转录之前落地，
+    // 这一轮的转录就是空的，下一轮按「空转录不续」回退成空白起跑——梯子形状就测不真了
+    // （实测约 1/3 概率的竞态）。ToolThenStall 每轮 call A 真跑工具、call B 停在不返回
+    // 的调用上；计数到 `2 * round` = call B 已进场，此刻转录必然非空、执行体必然停在
+    // 可被打断的 await 上。
+    tokio::time::timeout(Duration::from_secs(30), async {
+        while llm_calls.load(Ordering::SeqCst) < round * 2 {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .expect("每轮应当先真实跑完一次工具轮、停在第二次调用上");
+    // 心跳一次都没刷过 → 空闲超时判它终态（ManualClock 手动推进）
+    ctx.clock.advance_secs(400);
+    let report = scheduler.tick().await.unwrap();
+    assert!(
+        report.timed_out_runs.contains(&run_id),
+        "第 {round} 轮的 run 要被看门狗判超时：{:?}",
+        report.timed_out_runs
+    );
+    // 等执行体按中止请求收口——转录的落库（失败 attempt 照记会话行）在收口之前完成，
+    // 下一轮的续接才读得到它。
+    tokio::time::timeout(Duration::from_secs(30), jh)
+        .await
+        .expect("收口的执行体应当在有界时间内退出")
+        .unwrap()
+        .unwrap();
+    run_id
+}
+
 /// 等执行体真的跑到 `architect-design.validate_input`（首个 agent 节点）并在跑。
 ///
 /// [`wait_for_a_held_running_run`] 抓任务的第一条 active run——`init.execute`（纯代码
@@ -6402,47 +6492,17 @@ async fn timeout_retry_ladder_continues_twice_then_blank_then_pending() {
     let llm_calls = Arc::new(AtomicUsize::new(0));
     let mut prev_run: Option<i64> = None;
     for round in 1..=4 {
-        let ex = Arc::new(Executor::new(
-            ctx.store.clone(),
-            Settings::default(),
-            Arc::new(ctx.sse.clone()),
+        let run_id = drive_one_timed_out_round(
+            &ctx,
+            &scheduler,
+            "t-ladder",
             Arc::new(ToolThenStall {
                 calls: llm_calls.clone(),
             }),
-            Arc::new(ctx.killer.clone()),
-        ));
-        let jh = {
-            let ex = ex.clone();
-            tokio::spawn(async move { ex.run("t-ladder").await })
-        };
-        let run_id = wait_for_running_validate_input(&ctx, "t-ladder").await;
-        // 等这一轮**真的先干了活**再判超时：中止请求若抢在第一次工具轮写完转录之前落地，
-        // 这一轮的转录就是空的，下一轮按「空转录不续」回退成空白起跑——梯子形状就测不真了
-        // （实测约 1/3 概率的竞态）。ToolThenStall 每轮 call A 真跑工具、call B 停在不返回
-        // 的调用上；计数到 `2 * round` = call B 已进场，此刻转录必然非空、执行体必然停在
-        // 可被打断的 await 上。
-        tokio::time::timeout(Duration::from_secs(30), async {
-            while llm_calls.load(Ordering::SeqCst) < round as usize * 2 {
-                tokio::time::sleep(Duration::from_millis(5)).await;
-            }
-        })
-        .await
-        .expect("每轮应当先真实跑完一次工具轮、停在第二次调用上");
-        // 心跳一次都没刷过 → 空闲超时判它终态（ManualClock 手动推进）
-        ctx.clock.advance_secs(400);
-        let report = scheduler.tick().await.unwrap();
-        assert!(
-            report.timed_out_runs.contains(&run_id),
-            "第 {round} 轮的 run 要被看门狗判超时：{:?}",
-            report.timed_out_runs
-        );
-        // 等执行体按中止请求收口——转录的落库（失败 attempt 照记会话行）在收口之前完成，
-        // 下一轮的续接才读得到它。
-        tokio::time::timeout(Duration::from_secs(30), jh)
-            .await
-            .expect("收口的执行体应当在有界时间内退出")
-            .unwrap()
-            .unwrap();
+            &llm_calls,
+            round,
+        )
+        .await;
 
         let row = ctx
             .store
@@ -6480,6 +6540,125 @@ async fn timeout_retry_ladder_continues_twice_then_blank_then_pending() {
             .count(),
         4,
         "止损之后不得再自动起 run（init 的 system run 不算）：{runs:?}"
+    );
+}
+
+// ─────────────── 106-stability 票 04：超时第 3 档改带简报起跑（决策 376 裁决②）───────────────
+
+/// 超时梯子第 3 档的空白重跑**不再带全卷转录**，改带一份简报——任务描述 + 阶段产物
+/// 文件清单 + 未提交改动清单 + 最近收口摘要（决策 376 裁决②）。
+///
+/// 造法同上面那条梯子用例（真执行体 + 每轮先干一次工具轮再停在第二次调用上），
+/// 第 4 轮起跑前在 worktree 里留一处「已改好、未提交」的改动——事故里那份
+/// `ux-audit.spec.ts` 修复正是这个形状（只活在 worktree 里，差点随重跑被无视）。
+/// 断言：
+/// 1. 第 4 轮**首个**请求不带任何转录消息（`messages` 为空）——空白重跑真的不带全卷；
+/// 2. 它的 user prompt 里简报四要素齐备，未提交改动点得出文件名；
+/// 3. 对照：前面几档仍是全卷转录续接——只有第 3 档换了形态（决策 376 的边界）。
+#[tokio::test]
+async fn the_blank_restart_round_starts_from_a_brief_not_the_transcript() {
+    const BRIEF_TITLE: &str = "## 续接简报（超时空白重跑，不带全卷转录）";
+    let ctx = setup("true", Settings::default()).await;
+    // 描述非空（票 05 的空白描述闸门拦得住；这里要的是「简报把描述带上了」）。
+    let mut new_task =
+        agentpipeline_core::storage::tasks::NewTask::new("t-brief", "任务 t-brief", "p1");
+    new_task.description = "把走查清单落到任务目录，逐条补实，别攒在转录里。".into();
+    ctx.store.create_task(&new_task).await.unwrap();
+    admit(&ctx, "t-brief").await;
+    let scheduler = KanbanScheduler::new(
+        ctx.store.clone(),
+        Settings::default(),
+        Arc::new(ctx.clock.clone()),
+        Arc::new(ctx.killer.clone()),
+        Arc::new(ctx.sse.clone()),
+        Arc::new(|_| {}),
+    );
+
+    let worktree = ctx.store.home().worktree_path("t-brief");
+    let requests: Arc<Mutex<Vec<LlmRequest>>> = Arc::new(Mutex::new(Vec::new()));
+    let llm_calls = Arc::new(AtomicUsize::new(0));
+    for round in 1..=4 {
+        if round == 4 {
+            // 第 3 档起跑前，worktree 里留两处「上一轮的进度」：一处已改好未提交的改动、
+            // 一处任务自身产物目录（事故里 `.scratch/ux-audit-3/` 与那份 e2e 修复的形状）。
+            std::fs::create_dir_all(worktree.join(".scratch/brief-fixture")).unwrap();
+            std::fs::write(
+                worktree.join(".scratch/brief-fixture/notes.md"),
+                "走查清单（上一轮已落盘）\n",
+            )
+            .unwrap();
+            std::fs::write(worktree.join("STALE_FIX.txt"), "已改好，未提交\n").unwrap();
+        }
+        drive_one_timed_out_round(
+            &ctx,
+            &scheduler,
+            "t-brief",
+            Arc::new(RecordingToolThenStall {
+                calls: llm_calls.clone(),
+                requests: requests.clone(),
+            }),
+            &llm_calls,
+            round,
+        )
+        .await;
+    }
+
+    let reqs = requests.lock().unwrap();
+    // 第 4 轮首个请求：user prompt 的段在 plan 里冻着，故该轮两个请求都带简报标题；
+    // `find` 取到的是**先落下的那个**——它才是这次 attempt 的起跑请求。
+    let brief = reqs
+        .iter()
+        .find(|r| r.user_prompt.contains(BRIEF_TITLE))
+        .expect("第 3 档（空白重跑）起跑那一轮应当带简报");
+    assert!(
+        brief.messages.is_empty(),
+        "空白重跑的首个请求不带全卷转录，得到 {} 条：{:?}",
+        brief.messages.len(),
+        brief.messages
+    );
+    assert!(brief.user_prompt.contains("## 任务描述"), "简报含任务描述");
+    assert!(brief.user_prompt.contains("任务 t-brief"));
+    assert!(
+        brief.user_prompt.contains("把走查清单落到任务目录"),
+        "简报带上任务描述正文：{}",
+        brief.user_prompt
+    );
+    assert!(
+        brief.user_prompt.contains("## 阶段产物文件清单"),
+        "简报含阶段产物文件清单"
+    );
+    assert!(
+        brief
+            .user_prompt
+            .contains(".scratch/brief-fixture/notes.md"),
+        "产物清单看得出工作区 `.scratch/` 的现状（票面点名的位置）：{}",
+        brief.user_prompt
+    );
+    assert!(
+        brief.user_prompt.contains("## 未提交改动清单"),
+        "简报含未提交改动清单"
+    );
+    assert!(
+        brief.user_prompt.contains("STALE_FIX.txt"),
+        "未提交改动点得出文件名（事故的直接教训）：{}",
+        brief.user_prompt
+    );
+    assert!(
+        brief.user_prompt.contains("## 最近收口摘要"),
+        "简报含最近收口摘要"
+    );
+    // 摘要说的是**上一轮已收口**的 run（attempt 3 超时），不是起跑这一轮自己
+    // （attempt 4 此刻还是 running）——「running，耗时 0 秒」是当下，不是历史。
+    assert!(
+        brief.user_prompt.contains("上一轮 attempt 3") && brief.user_prompt.contains("timeout"),
+        "收口摘要须取最后一条**非 running** 的 run：{}",
+        brief.user_prompt
+    );
+    // 对照：第 1–2 档仍带全卷转录——存在「没有简报标题、但 messages 非空」的请求。
+    assert!(
+        reqs.iter()
+            .any(|r| !r.user_prompt.contains(BRIEF_TITLE) && !r.messages.is_empty()),
+        "第 1–2 档仍是全卷转录续接（决策 320 / 376 的边界）"
     );
 }
 
