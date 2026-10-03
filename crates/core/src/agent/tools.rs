@@ -2574,6 +2574,14 @@ impl ToolExecutor {
                 "外发未开启（设置里的「重活外发」是关的）：本机跑请用 run_command".into(),
             ));
         }
+        // `deny` 档在**执行点**也拦（评审 P2-1）：广告侧摘除（`model_request`）只挡「模型
+        // 看见」，挡不住模型无视定义硬发（决策 172③ 的原话）。它不在环境层故
+        // `gate_decision` 恒 Execute，这一条就是 deny 档的执行点闸。
+        if self.env_mode == crate::types::EnvMode::Deny {
+            return Err(Error::Validation(
+                "offload_run 被 deny 档挡下：这个阶段的环境层权限已收到底，外发一并拒绝".into(),
+            ));
+        }
 
         // ② 工作区必须干净：外发的对象是已提交状态，静默快照一个脏工作区等于
         //    「验证的不是你以为的那份代码」。
@@ -2587,6 +2595,7 @@ impl ToolExecutor {
             .current_branch(&ctx.worktree_path)
             .await?
             .ok_or_else(|| Error::Validation("当前处于游离 HEAD，没有分支名可外发".into()))?;
+        offload_branch_allowed(&branch)?;
         let sha = crate::git::Git
             .rev_parse(&ctx.worktree_path, "HEAD")
             .await?;
@@ -2627,7 +2636,9 @@ impl ToolExecutor {
 
     /// 外发链路的第 ③ 步本体：推分支 → dispatch → 轮询 → 拉日志尾部。
     ///
-    /// 轮询按 `headSha` 对账（dispatch 与轮询之间分支又动了的话，对不上就是不收）；
+    /// 轮询按 `headSha` 前缀 + `createdAt` 双重对账：**只认 dispatch 之后创建的 run**——
+    /// 同一 commit 重复外发（重试 flaky、链路抖动后再试）是完全合法的 agent 行为，
+    /// 只按 sha 对账会命中上一轮的收场记录，报出假的结论（评审 P1-2）。
     /// 间隔与总上限见 [`OFFLOAD_POLL_INTERVAL`] / [`OFFLOAD_POLL_CAP`]，超时按链路失败
     /// 处理（回退本机，票面「排队超时」那条）。
     async fn offload_dispatch_and_collect(
@@ -2638,6 +2649,8 @@ impl ToolExecutor {
         command: &str,
     ) -> Result<String> {
         let started = std::time::Instant::now();
+        // dispatch 之前记下的墙钟（RFC3339 UTC）：轮询的 createdAt 过滤线。
+        let started_iso = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
         self.offload_shell(
             ctx,
             &format!("git push origin {branch}"),
@@ -2660,6 +2673,7 @@ impl ToolExecutor {
         // 正则，且前缀对账的碰撞面可忽略。
         let deadline = std::time::Instant::now() + self.offload_poll_cap;
         let sha_prefix = &sha[..sha.len().min(12)];
+        let mut ever_saw_row = false;
         let mut found;
         loop {
             let out = self
@@ -2667,9 +2681,9 @@ impl ToolExecutor {
                     ctx,
                     &format!(
                         "gh run list --workflow=offload.yml --branch {branch} --limit 10 \
-                         --json databaseId,status,conclusion,headSha \
+                         --json databaseId,status,conclusion,headSha,createdAt \
                          --jq '.[] | {{id: .databaseId, s: .status, c: (.conclusion // \"-\"), \
-                         short: .headSha[0:12]}}'"
+                         short: .headSha[0:12], at: .createdAt}}'"
                     ),
                     OFFLOAD_STEP_TIMEOUT_SEC,
                 )
@@ -2679,9 +2693,10 @@ impl ToolExecutor {
                 .lines()
                 .filter_map(|line| serde_json::from_str(line).ok())
                 .collect();
+            ever_saw_row |= !rows.is_empty();
             found = rows
                 .iter()
-                .find(|r| r.short == sha_prefix && r.s == "completed")
+                .find(|r| r.at >= started_iso && r.short == sha_prefix && r.s == "completed")
                 .map(|r| (r.id, r.c.clone()));
             if found.is_some() || std::time::Instant::now() >= deadline {
                 break;
@@ -2689,8 +2704,15 @@ impl ToolExecutor {
             tokio::time::sleep(self.offload_poll_interval).await;
         }
         let Some((run_id, conclusion)) = found else {
+            let hint = if ever_saw_row {
+                String::new()
+            } else {
+                "（整轮没有解析到任何 run 行：gh 版本过老不支持 --jq，或输出形状变了？）"
+                    .to_string()
+            };
             return Err(Error::Validation(format!(
-                "外发轮询超时（上限 {} 分钟）：GitHub 上一直没出现 sha 前缀={sha_prefix} 的收场记录",
+                "外发轮询超时（上限 {} 分钟）：GitHub 上一直没出现 sha 前缀={sha_prefix} \
+                 且 dispatch 之后创建的收场记录{hint}",
                 self.offload_poll_cap.as_secs() / 60
             )));
         };
@@ -3526,12 +3548,12 @@ const OFFLOAD_FALLBACK_TIMEOUT_SEC: u64 = 1800;
 const OFFLOAD_LOG_TAIL_LINES: usize = 200;
 
 /// 外发命令白名单（票 runner-offload/06 的**防注入面**）：只放行三类前缀的单条 cargo
-/// 命令。组合符 / 命令替换 / 重定向 / 引号一概拒——前缀白名单拦不住「后半段藏着的东西」，
-/// 这些字符在 cargo 命令里也没有正当用途；工作流的 `command` 输入因此可以不重复校验
-/// （能走到 dispatch 的串已经过了这道闸）。
-pub fn offload_command_allowed(command: &str) -> Result<()> {
+/// 命令。组合符 / 命令替换 / 重定向 / 引号 / `$` 一概拒——前缀白名单拦不住「后半段
+/// 藏着的东西」，这些字符在 cargo 命令里也没有正当用途；工作流的 `command` 输入
+/// 因此可以不重复校验（能走到 dispatch 的串已经过了这道闸）。
+pub(crate) fn offload_command_allowed(command: &str) -> Result<()> {
     let c = command.trim();
-    const FORBIDDEN: [&str; 8] = [";", "&", "|", "`", "$(", "\n", ">", "<"];
+    const FORBIDDEN: [&str; 9] = [";", "&", "|", "`", "$(", "$", "\n", ">", "<"];
     if let Some(hit) = FORBIDDEN.iter().find(|f| c.contains(*f)) {
         return Err(Error::Validation(format!(
             "外发命令不含组合符 / 命令替换 / 重定向（命中 {hit:?}）：白名单只放行单条 cargo 命令"
@@ -3554,18 +3576,40 @@ pub fn offload_command_allowed(command: &str) -> Result<()> {
     Ok(())
 }
 
+/// 分支名形状（票 runner-offload/06 评审 P1-1）：分支名要被裸拼进 shell 串
+/// （`git push` / `gh -f branch=`），而 git refname 本身允许 shell 特殊字符——
+/// 不卡形状，`run_command` 造一个带分号的分支就能让链路在 egress 闸外执行注入命令。
+/// 判据从宽（字母数字 `._-/`）但覆盖本仓全部实际分支（`main` / `kanban/<task>` /
+/// `repair/<id>`）。
+pub(crate) fn offload_branch_allowed(branch: &str) -> Result<()> {
+    let ok = !branch.is_empty()
+        && !branch.starts_with('-')
+        && branch
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-' | '/'));
+    if ok {
+        Ok(())
+    } else {
+        Err(Error::Validation(format!(
+            "分支名 {branch:?} 含外发链路不允许的字符（只收字母数字与 . _ - /）"
+        )))
+    }
+}
+
 /// 白名单前缀（与 [`offload_command_allowed`] 同源；`cargo build` 之后的 flag 由 GitHub
 /// 侧的 1.98 工具链吃）。
 const OFFLOAD_COMMAND_PREFIXES: [&str; 3] = ["cargo test", "cargo clippy", "cargo build"];
 
 /// `gh run list --jq` 的一行（外发轮询的解析口径）：`short` 是 jq 侧截短的 headSha
-/// 前缀——40 位 hex 全量会被输出脱敏打码（见轮询处的注释），不能过 Rust 的手。
+/// 前缀——40 位 hex 全量会被输出脱敏打码（见轮询处的注释），不能过 Rust 的手；
+/// `at` 是 run 的 createdAt（RFC3339 UTC，字典序可比），轮询只认 dispatch 之后创建的 run。
 #[derive(Debug, serde::Deserialize)]
 struct GhRunRow {
     id: u64,
     s: String,
     c: String,
     short: String,
+    at: String,
 }
 
 /// 日志尾部：取最后 `take` 行（与 [`last_lines`] 的口径一致，这里吃原始文本）。
@@ -3577,7 +3621,9 @@ fn log_tail(text: &str, take: usize) -> String {
 /// 秒数 → 人读的时长（外发回执用）。
 fn format_duration(d: Duration) -> String {
     let secs = d.as_secs();
-    if secs >= 60 {
+    if secs >= 3600 {
+        format!("{}h{}m{}s", secs / 3600, (secs % 3600) / 60, secs % 60)
+    } else if secs >= 60 {
         format!("{}m{}s", secs / 60, secs % 60)
     } else {
         format!("{secs}s")
@@ -5495,6 +5541,7 @@ mod tests {
             "cargo test | tee x",
             "cargo test `boom`",
             "cargo test $(boom)",
+            "cargo test $HOME/x",
             "cargo test\nboom",
             "cargo test > /tmp/x",
             "cargo test < /tmp/x",
@@ -5539,7 +5586,10 @@ mod tests {
         sha
     }
 
-    async fn offload_fixture(gh_for: impl Fn(&str) -> String, dirty_extra: bool) -> OffloadFixture {
+    async fn offload_fixture(
+        gh_for: impl Fn(&str, &Path) -> String,
+        dirty_extra: bool,
+    ) -> OffloadFixture {
         let tmp = tempfile::tempdir().unwrap();
         let home = Home::new(tmp.path().join("home"));
         home.ensure_dirs().unwrap();
@@ -5558,7 +5608,7 @@ mod tests {
             "git",
             "if [ \"$1\" = \"push\" ]; then echo 'To origin'; exit 0; fi\nexit 0",
         );
-        write_script(&bin, "gh", &gh_for(&sha));
+        write_script(&bin, "gh", &gh_for(&sha, tmp.path()));
         let store = Store::open(home.clone(), Arc::new(crate::clock::SystemClock))
             .await
             .unwrap();
@@ -5593,42 +5643,75 @@ mod tests {
         }
     }
 
-    /// 假 gh：dispatch 收下、首轮即 completed/success、日志两行——happy path 秒级。
-    /// `run list` 的输出模仿生产 `--jq` 的行形（short = sha 前 12 位，见轮询处注释）。
-    fn gh_happy(sha: &str) -> String {
-        gh_list_row(sha, 42, "completed", "success")
-    }
-
-    /// 假 gh：远端命令跑红（conclusion=failure）——链路本身是通的。
-    fn gh_remote_failure(sha: &str) -> String {
-        gh_list_row(sha, 7, "completed", "failure")
-    }
-
-    /// 假 gh：一直 in_progress——轮询顶到上限。
-    fn gh_pending_forever(sha: &str) -> String {
-        gh_list_row(sha, 7, "in_progress", "-")
-    }
-
-    /// 三种假 gh 共用的骨架：`run list` 出一行 jq 行形，`run view` 出两行日志。
-    fn gh_list_row(sha: &str, id: u64, status: &str, conclusion: &str) -> String {
+    /// 假 gh 的共用骨架（评审 P3-2）：
+    /// · `workflow run` 把 argv 逐词落 argv 日志——dispatch 串的引号/分词若回归，断言抓得住
+    ///   （`$*` 重拼会掩盖分词，故用 `[词]` 每词一行）；
+    /// · `run list` **首轮空、次轮起**出指定的 jq 行形——生产 gh 有传播延迟，首轮即收场
+    ///   的形状覆盖不到；
+    /// · `run view` 出日志两行（failure 行形给远端跑红用例）。
+    fn fake_gh(tmp: &Path, row: Option<&str>, view: &str) -> String {
+        let ctr = tmp.join("poll-count").display().to_string();
+        let argvlog = tmp.join("gh-argv.log").display().to_string();
+        let row_line = match row {
+            Some(r) => r.to_string(),
+            None => "true".into(),
+        };
         format!(
-            "if [ \"$1\" = \"workflow\" ]; then exit 0; fi\n\
+            "if [ \"$1\" = \"workflow\" ]; then for a in \"$@\"; do echo \"[$a]\" >> {argvlog}; done; exit 0; fi\n\
              if [ \"$1\" = \"run\" ] && [ \"$2\" = \"list\" ]; then\n\
-             \x20 printf '{{\"id\":{id},\"s\":\"{status}\",\"c\":\"{conclusion}\",\"short\":\"{}\"}}\\n'\n\
+             \x20 n=$(cat {ctr} 2>/dev/null || echo 0); n=$((n+1)); echo \"$n\" > {ctr}\n\
+             \x20 [ \"$n\" -le 1 ] && exit 0\n\
+             \x20 {row_line}\n\
              \x20 exit 0\n\
              fi\n\
              if [ \"$1\" = \"run\" ] && [ \"$2\" = \"view\" ]; then\n\
-             \x20 printf '{}\\n'\n\
+             \x20 printf '{view}\\n'\n\
              \x20 exit 0\n\
              fi\n\
-             exit 3",
-            &sha[..12],
-            if conclusion == "failure" {
-                "test result: FAILED. 3 passed"
-            } else {
-                "step1 ok\nstep2 done"
-            },
+             exit 3"
         )
+    }
+
+    /// `run list` 出的**一行 echo 命令**（`at` 由假 gh 在轮询时现取——若在夹具创建时
+    /// 就写死，会被自己人 createdAt 过滤线挡掉：at 早于 dispatch）。
+    fn gh_row(sha: &str, id: u64, status: &str, conclusion: &str) -> String {
+        format!(
+            "echo '{{\"id\":{id},\"s\":\"{status}\",\"c\":\"{conclusion}\",\"short\":\"{}\",\"at\":\"'$(date -u +%Y-%m-%dT%H:%M:%SZ)'\"}}'",
+            &sha[..12]
+        )
+    }
+
+    /// 假 gh：dispatch 收下（首轮 list 空、次轮 completed/success）——happy path 秒级。
+    fn gh_happy(sha: &str, tmp: &Path) -> String {
+        fake_gh(
+            tmp,
+            Some(&gh_row(sha, 42, "completed", "success")),
+            "step1 ok\\nstep2 done",
+        )
+    }
+
+    /// 假 gh：远端命令跑红（conclusion=failure）——链路本身是通的。
+    fn gh_remote_failure(sha: &str, tmp: &Path) -> String {
+        fake_gh(
+            tmp,
+            Some(&gh_row(sha, 7, "completed", "failure")),
+            "test result: FAILED. 3 passed",
+        )
+    }
+
+    /// 假 gh：一直 in_progress——轮询顶到上限。
+    fn gh_pending_forever(sha: &str, tmp: &Path) -> String {
+        fake_gh(tmp, Some(&gh_row(sha, 7, "in_progress", "-")), "unused")
+    }
+
+    /// 假 gh：只有**上一轮**的 completed 记录（createdAt 远早于本次 dispatch）——
+    /// 按 sha 对账会误收它，评审 P1-2 的回归测试形状。
+    fn gh_stale_run(sha: &str, tmp: &Path) -> String {
+        let row = format!(
+            "echo '{{\"id\":9,\"s\":\"completed\",\"c\":\"success\",\"short\":\"{}\",\"at\":\"2020-01-01T00:00:00Z\"}}'",
+            &sha[..12]
+        );
+        fake_gh(tmp, Some(&row), "unused")
     }
 
     #[tokio::test]
@@ -5721,11 +5804,19 @@ mod tests {
         assert!(starts
             .iter()
             .any(|s| s.command.contains("gh workflow run offload.yml")));
+        drop(starts);
+        // dispatch 串的参数分词逐字对（评审 P3-2：假 gh 收 argv 落盘，引号回归抓得住）。
+        let argv = std::fs::read_to_string(f._tmp.path().join("gh-argv.log")).unwrap();
+        assert!(
+            argv.contains("[command=cargo test --workspace]"),
+            "argv: {argv}"
+        );
+        assert!(argv.contains("[sha="));
     }
 
     #[tokio::test]
     async fn offload_run_falls_back_to_local_when_the_dispatch_fails() {
-        let f = offload_fixture(|_| "exit 1".to_string(), false).await;
+        let f = offload_fixture(|_, _| "exit 1".to_string(), false).await;
         let out = f
             .executor
             .execute(
@@ -5790,5 +5881,86 @@ mod tests {
             "排队超时按链路失败回退: {}",
             out.content
         );
+    }
+
+    /// 同一 commit 重复外发时，上一轮的 completed 记录（createdAt 早于本次 dispatch）
+    /// 不得被误认成本轮收场（评审 P1-2）——按 sha 单独对账就会报出假的 success。
+    #[tokio::test]
+    async fn offload_run_never_accepts_a_stale_run_from_a_previous_dispatch() {
+        let f = offload_fixture(gh_stale_run, false).await;
+        let out = f
+            .executor
+            .execute(
+                &call("offload_run", serde_json::json!({"command": "cargo test"})),
+                &f.ctx,
+            )
+            .await
+            .unwrap();
+        assert!(
+            out.content.contains("轮询超时") && out.content.contains("已回退**本机**执行"),
+            "旧 run 不得顶替本轮: {}",
+            out.content
+        );
+        assert!(
+            !out.content.contains("conclusion=success"),
+            "不得报上一轮的结论: {}",
+            out.content
+        );
+    }
+
+    /// `deny` 档在**执行点**也拦（评审 P2-1）：开关开着、广告侧被绕过，直呼工具仍被拒。
+    #[tokio::test]
+    async fn offload_run_is_refused_in_deny_mode_even_with_the_switch_on() {
+        let tmp = tempfile::tempdir().unwrap();
+        let home = Home::new(tmp.path().join("home"));
+        home.ensure_dirs().unwrap();
+        let worktree = home.worktree_path("t1");
+        home.ensure_task_dirs("t1").unwrap();
+        let store = Store::open(home.clone(), Arc::new(crate::clock::SystemClock))
+            .await
+            .unwrap();
+        store.set_offload_switch(true).await.unwrap();
+        let executor = ToolExecutor::new(
+            home.clone(),
+            FileToolPolicy::new(vec![worktree.clone()]),
+            Settings::default(),
+            Arc::new(NoKiller),
+        )
+        .with_rtk_store(store)
+        .with_env_mode(crate::types::EnvMode::Deny);
+        let ctx = ToolCallContext {
+            task_id: "t1".into(),
+            session_id: None,
+            stage: Stage::Develop,
+            node: Node::Execute,
+            worktree_path: worktree.clone(),
+            task_dir: home.task_dir("t1"),
+            run_id: Some(1),
+            command_source: CommandSource::Agent,
+            default_cwd: Some(worktree.clone()),
+        };
+        let err = executor
+            .execute(
+                &call("offload_run", serde_json::json!({"command": "cargo test"})),
+                &ctx,
+            )
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("deny"), "{err}");
+    }
+
+    #[test]
+    fn offload_branch_whitelist_admits_kanban_branches_and_rejects_shell_metachars() {
+        for ok in [
+            "main",
+            "kanban/01M3X472FJF8NW9082K6BFZPKC",
+            "repair/r-1",
+            "feat.a_b-c",
+        ] {
+            assert!(offload_branch_allowed(ok).is_ok(), "应放行: {ok}");
+        }
+        for bad in ["", "x;rm", "a b", "x&y", "$(boom)", "a|b", "-flag", "a'b"] {
+            assert!(offload_branch_allowed(bad).is_err(), "应拒绝: {bad:?}");
+        }
     }
 }

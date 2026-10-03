@@ -150,11 +150,11 @@ mod tests {
 
     /// 冻结断言（决策 353）：目录名字集与三份层名单的**分层对应**——
     /// 内置 9 个里除 `submit_metadata`（本服务读结构化结论，不碰档位）与 `offload_run`
-    /// （票 runner-offload/06：它推的是远端白名单命令，不走环境写层；可用性由设置里的
-    /// 外发开关管，广告侧跟着开关走——见 `model_request` 的广告点）外全在
-    /// [`is_env_tool`] 层；动手的那四个恰是 `ENV_WRITE_TOOLS` 与内置集的交；
-    /// 没有任何一个内置工具是本服务写接口。层字段不进目录表（决策 247），
-    /// 这份对应就是「表 × 名单」之间唯一的对账单。
+    /// （决策 381：它推的是远端白名单命令，不走环境写层；可用性由设置里的
+    /// 外发开关管，广告侧跟着开关走——见 `model_request` 的广告点；deny 档在
+    /// 执行点另拦）外全在 [`is_env_tool`] 层；动手的那四个恰是 `ENV_WRITE_TOOLS`
+    /// 与内置集的交；没有任何一个内置工具是本服务写接口。层字段不进目录表
+    /// （决策 247），这份对应就是「表 × 名单」之间唯一的对账单。
     #[test]
     fn frozen_layering_between_catalog_and_tier_lists() {
         let names: Vec<&str> = TOOL_SPECS.iter().map(|s| s.name).collect();

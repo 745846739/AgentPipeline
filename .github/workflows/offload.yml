@@ -46,32 +46,37 @@ jobs:
     name: offload(${{ inputs.command }})
     runs-on: ubuntu-latest
     timeout-minutes: 60
+    env:
+      OFFLOAD_SHA: ${{ inputs.sha }}
+      OFFLOAD_COMMAND: ${{ inputs.command }}
     steps:
       - uses: actions/checkout@v4
         with:
           ref: ${{ inputs.branch }}
-      # 只验证已提交状态:分支尖端必须就是工具交来的那个 commit——push 与 dispatch
-      # 之间分支又动了的话,这里替工具层把它拦下(工具层轮询也按 sha 对账,双保险)。
+      # 只验证已提交状态：分支尖端必须就是工具交来的那个 commit——push 与 dispatch
+      # 之间分支又动了的话，这里替工具层把它拦下（工具层轮询也按 sha 对账，双保险）。
+      # inputs 经 env 间写（评审 P2-3）：workflow_dispatch 可人手触发，直插 run: 的
+      # inputs 是 GH 官方点名的注入写法。
       - name: 核对 SHA
         run: |
           got="$(git rev-parse HEAD)"
-          echo "expected=${{ inputs.sha }} got=$got"
-          [ "$got" = "${{ inputs.sha }}" ] || { echo "SHA 不一致:外发对象已漂移" >&2; exit 1; }
+          echo "expected=$OFFLOAD_SHA got=$got"
+          [ "$got" = "$OFFLOAD_SHA" ] || { echo "SHA 不一致:外发对象已漂移" >&2; exit 1; }
       # cache-on-failure(决策 346):外发失败轮的编译进度不作废——外发的对象恰恰
       # 是「可能红」的中间态,这条比在 check.yml 里更关键。
       - uses: Swatinem/rust-cache@v2
         with:
           cache-on-failure: true
           # 缓存按分支隔离:kanban 分支各自的增量互不污染。
-          prefix-key: offload-${{ inputs.branch || 'main' }}
+          prefix-key: offload-${{ inputs.branch }}
       - run: rustup component add clippy rustfmt
       - id: command
-        run: ${{ inputs.command }}
+        run: ${{ env.OFFLOAD_COMMAND }}
       - if: always()
         name: 结果落 summary(文本回传的载体)
         run: |
           {
-            echo "## offload(${{ inputs.command }})"
-            echo "- ref: \`${{ inputs.sha }}\`(@ ${{ inputs.branch }})"
+            echo "## offload($OFFLOAD_COMMAND)"
+            echo "- ref: \`$OFFLOAD_SHA\`(@ ${{ inputs.branch }})"
             echo "- 结论: ${{ steps.command.outcome == 'success' && '✅ 通过' || '❌ 失败' }}"
           } >> "$GITHUB_STEP_SUMMARY"

@@ -32,3 +32,4 @@ sweep.timestamp
 .zcode/
 
 __pycache__/
+/.target/
