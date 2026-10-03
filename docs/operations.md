@@ -1623,4 +1623,6 @@ curl -sk -o /dev/null --max-time 10 -w "%{http_code}" https://127.0.0.1:3389/ | 
 
 **已知变数，如实记。** ① 证书到期仍是**手动**重签（`mkcert` 同一条命令 + 重新 `install` 到 `/etc/agentpipeline/tls/` + `systemctl restart agent-pipeline`），没有自动续期；② 配对 cookie **不带 `Secure`**（理由见 §12.16 那张表）：带上它在 106 这种 TLS 形态下同样有效，但明文形态（局域网直连）会**整页空白**——同一个二进制要服务两种形态，故取「明文也不空白」那一档；③ **将来若再放一个反代在前面，闸门会整体失效**（源地址变成回环）——这是 §12.17 那个警告框的同一条算术，不是新问题，但别再踩一次：要代理，就得让后端认「可信代理的转发地址」（决策 332 的出路 ②），或维持「应用直接对外」这条形态。
 
+**服务进程环境缺 `HOME`（2026-10-03，重活外发上线当天被活体探测当场抓出来）。** systemd 的系统级 unit **不给服务进程注入 `HOME` / `USER`**（这套 unit 没有 `User=` 之外的用户语义，也不走 PAM）——而 `gh` 靠 `$HOME` 找 `~/.config/gh/hosts.yml`。后果：ssh 里 `gh auth status` 一切正常（票 02 的验收就是这么做的，**看不见这个坑**），服务进程里 spawn 的 gh 却报「not logged into any GitHub hosts」——设置页的 gh 登录探测、以及外发工具的 `gh workflow run` / `git push`（https 凭据同样住 HOME 底下）全部扑空。这不是探测坏了，是**探测第一次替服务进程问了它自己的环境**——此前没有任何一条路径从服务进程内部碰过 gh。修法（unit 手管，照 ops 惯例备份后改）：`Environment=HOME=/root` + `Environment=USER=root` 两行加进 `agent-pipeline.service`，`daemon-reload` + `restart`；改前备份在 `/root/agent-pipeline.service.bak-20261003-*`，改后 `GET /offload` 探测三绿（gh_authed / workflow / 无失败记录）。**同类坑照这条查**：任何「ssh 里好使、服务里不好使」的子进程读数，先 `tr '\0' '\n' < /proc/<MainPID>/environ` 对一遍环境，再怀疑凭据本身。
+
 
