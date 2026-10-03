@@ -6477,6 +6477,37 @@ async fn rtk_put_requires_the_enabled_field() {
     assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
 }
 
+/// `GET/PUT /offload` 的链路失败读数（票 runner-offload/08）：
+/// 从没失败过是 `null`（界面读「无」，不是「0」）；落一笔后 GET/PUT 同形带出；
+/// 清口之后回 `null`。探测部分不断言——这台机器装没装 gh 不影响契约。
+#[tokio::test]
+async fn offload_readout_carries_the_last_link_failure() {
+    let api = api().await;
+
+    let (_, body) = get(&api, "/offload").await;
+    assert!(body["last_failure_at"].is_null(), "{body}");
+
+    api.state.store.set_offload_switch(true).await.unwrap();
+    api.state.store.record_offload_link_failure().await.unwrap();
+    let (_, body) = get(&api, "/offload").await;
+    let stamped = body["last_failure_at"]
+        .as_str()
+        .expect("链路失败后 GET 要带出时间戳");
+    assert!(!stamped.is_empty(), "{body}");
+
+    let (status, body) = put(&api, "/offload", json!({"enabled": false})).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(
+        body["last_failure_at"].as_str(),
+        Some(stamped),
+        "PUT 与 GET 同形"
+    );
+
+    api.state.store.clear_offload_link_failure().await.unwrap();
+    let (_, body) = get(&api, "/offload").await;
+    assert!(body["last_failure_at"].is_null(), "{body}");
+}
+
 /// 两个班次各说各的：消息与页头合计都按班次读，互不污染（决策 204②⑤）。
 #[tokio::test]
 async fn foreman_sessions_isolate_their_own_messages_and_totals() {

@@ -30,12 +30,14 @@ const OFFLOAD_OFF: OffloadSettings = {
   enabled: false,
   origin: 'default',
   probe: { gh_authed: false, gh_reason: null, workflow_present: false },
+  last_failure_at: null,
 };
 
 const OFFLOAD_ON_OK: OffloadSettings = {
   enabled: true,
   origin: 'settings',
   probe: { gh_authed: true, gh_reason: null, workflow_present: true },
+  last_failure_at: null,
 };
 
 mocks.getOffload.mockResolvedValue(OFFLOAD_OFF);
@@ -190,10 +192,31 @@ describe('命令执行页（决策 297 / 票 05）', () => {
       enabled: true,
       origin: 'settings',
       probe: { gh_authed: false, gh_reason: 'gh 不在场', workflow_present: false },
+      last_failure_at: null,
     });
     render(SettingsTools);
     await fireEvent.click(await screen.findByRole('button', { name: '打开' }));
     expect(await screen.findByText(/回退本机执行并留痕/)).toBeTruthy();
+  });
+
+  it('外发卡:最近一次链路失败带出时间戳,没失败过的机器读「无」(票 runner-offload/08)', async () => {
+    // 落过一笔链路失败:时间戳原样摆出来,并说清外发正在静默降级。
+    mocks.getRtk.mockResolvedValue(ON_READY);
+    mocks.getOffload.mockResolvedValue({
+      ...OFFLOAD_ON_OK,
+      last_failure_at: '2026-10-03T02:03:04+00:00',
+    });
+    render(SettingsTools);
+    const alert = await screen.findByRole('alert');
+    expect(alert.textContent).toContain('2026-10-03T02:03:04');
+    expect(screen.getByText(/外发在静默降级/)).toBeTruthy();
+
+    // 从没失败过的机器:读数是「无」,不是「0」(诚实口径,决策 257)。
+    document.body.innerHTML = '';
+    mocks.getOffload.mockResolvedValue(OFFLOAD_ON_OK);
+    render(SettingsTools);
+    await screen.findByText('开启：重活外发');
+    expect(screen.getByText('无')).toBeTruthy();
   });
 
 });

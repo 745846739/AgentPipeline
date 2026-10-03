@@ -2,7 +2,7 @@
 //!
 //! | 方法 | 路径 | 说明 |
 //! |---|---|---|
-//! | GET | `/offload` | 存的状态 + **活体探测**（gh 登录态 / 外发工作流在场性） |
+//! | GET | `/offload` | 存的状态 + **活体探测**（gh 登录态 / 外发工作流在场性）+ 最近一次链路失败读数 |
 //! | PUT | `/offload` | 保存开关（`{enabled}`），回同样的读数（含一次新探测） |
 //!
 //! 与 `/rtk` 同族（决策 297）：**每次读都真探测一次**，不缓存上次结果；
@@ -80,12 +80,20 @@ pub async fn settings(State(state): State<AppState>) -> ApiResult<Json<serde_jso
         .offload_switch_has_override()
         .await
         .map_err(map_core_error)?;
+    let last_failure = state
+        .store
+        .offload_last_failure()
+        .await
+        .map_err(map_core_error)?;
     let probe = probe(&state).await;
     Ok(Json(json!({
         "enabled": stored.enabled,
         // 诚实口径（决策 257）：这份状态是谁定的
         "origin": if overridden { "settings" } else { "default" },
         "probe": probe,
+        // 最近一次**链路**失败（票 08）：null = 从没失败过（读数「无」）。
+        // 远端命令跑红不写这列，外发成功一轮即清。
+        "last_failure_at": last_failure,
     })))
 }
 
@@ -106,10 +114,16 @@ pub async fn set_enabled(
         .set_offload_switch(body.enabled)
         .await
         .map_err(map_core_error)?;
+    let last_failure = state
+        .store
+        .offload_last_failure()
+        .await
+        .map_err(map_core_error)?;
     let probe = probe(&state).await;
     Ok(Json(json!({
         "enabled": body.enabled,
         "origin": "settings",
         "probe": probe,
+        "last_failure_at": last_failure,
     })))
 }

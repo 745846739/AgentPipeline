@@ -230,6 +230,14 @@
           外发工作流在场（{offload.probe.workflow_present ? '✅ 在场' : '❌ 未见 offload.yml'}）。探测失败<b>不拦保存</b>。
           交互式走查（起服务、看页面）永远在本机——它等不起 runner 的排队。
         </p>
+        <p class="sec-note">
+          {#if offload.last_failure_at}
+            <span class="st warn" role="alert">最近一次链路失败：{offload.last_failure_at}</span>——外发在静默降级，命令实际都在本机跑。
+          {:else}
+            最近一次链路失败：<span class="st dim">无</span>
+          {/if}
+          （远端命令跑红不算链路失败；外发成功跑通一轮即清。）
+        </p>
         {#if offloadNote}
           {#if offloadNote.kind === 'ok'}
             <div class="banner ok" role="status">{offloadNote.message}</div>

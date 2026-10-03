@@ -2600,13 +2600,18 @@ impl ToolExecutor {
             .rev_parse(&ctx.worktree_path, "HEAD")
             .await?;
 
-        // ③ 外发链路；任何一步失败 → 回退本机 + 三处留痕（WARN / 回执文本 / 命令台账）。
+        // ③ 外发链路；任何一步失败 → 回退本机 + 三处留痕（WARN / 回执文本 / 命令台账），
+        //    第四处是设置页的失败读数（票 08）——「外发在静默降级」要在界面上看得见。
         match self
             .offload_dispatch_and_collect(ctx, &branch, &sha, &command)
             .await
         {
-            Ok(text) => Ok(ToolOutcome::ok(text)),
+            Ok(text) => {
+                self.offload_mark_link_failure(false).await;
+                Ok(ToolOutcome::ok(text))
+            }
             Err(e) => {
+                self.offload_mark_link_failure(true).await;
                 tracing::warn!(
                     tool = super::catalog::OFFLOAD_RUN,
                     run = ctx.run_id,
@@ -2631,6 +2636,29 @@ impl ToolExecutor {
                 );
                 Ok(out)
             }
+        }
+    }
+
+    /// 设置页的链路失败读数（票 08）：`true` = 落一笔（回退本机那一刻），
+    /// `false` = 清掉（外发整轮走通，链路刚被证明是通的——远端命令跑红也走
+    /// 这条路，见决策 381 的语义边界）。**尽力而为**：读数没落上不改写回退
+    /// 语义本身，只在 WARN 里留一句。
+    async fn offload_mark_link_failure(&self, failed: bool) {
+        let Some(store) = &self.rtk_store else {
+            return;
+        };
+        let res = if failed {
+            store.record_offload_link_failure().await
+        } else {
+            store.clear_offload_link_failure().await
+        };
+        if let Err(e) = res {
+            tracing::warn!(
+                tool = super::catalog::OFFLOAD_RUN,
+                failed,
+                error = %e,
+                "外发链路失败读数没落上（设置页可能仍显示旧读数）"
+            );
         }
     }
 
@@ -5558,6 +5586,8 @@ mod tests {
         executor: ToolExecutor,
         ctx: ToolCallContext,
         recorder: Arc<RecordingRecorder>,
+        /// 与执行器同一个 Store（票 08：链路失败读数落在它身上，测试对着它断言）。
+        store: Store,
     }
 
     fn write_script(dir: &Path, name: &str, body: &str) {
@@ -5621,7 +5651,7 @@ mod tests {
             Arc::new(NoKiller),
         )
         .with_recorder(recorder.clone())
-        .with_rtk_store(store)
+        .with_rtk_store(store.clone())
         .with_command_path_prefix(bin.clone())
         .with_offload_polling(Duration::from_millis(10), Duration::from_millis(500));
         let ctx = ToolCallContext {
@@ -5640,6 +5670,7 @@ mod tests {
             executor,
             ctx,
             recorder,
+            store,
         }
     }
 
@@ -5702,6 +5733,12 @@ mod tests {
     /// 假 gh：一直 in_progress——轮询顶到上限。
     fn gh_pending_forever(sha: &str, tmp: &Path) -> String {
         fake_gh(tmp, Some(&gh_row(sha, 7, "in_progress", "-")), "unused")
+    }
+
+    /// 先垫一笔链路失败读数（验「成功/远端跑红即清」时用）。
+    async fn seed_stale_failure(f: &OffloadFixture) {
+        f.store.record_offload_link_failure().await.unwrap();
+        assert!(f.store.offload_last_failure().await.unwrap().is_some());
     }
 
     /// 假 gh：只有**上一轮**的 completed 记录（createdAt 远早于本次 dispatch）——
@@ -5769,6 +5806,8 @@ mod tests {
     #[tokio::test]
     async fn offload_run_happy_path_returns_conclusion_and_log_tail() {
         let f = offload_fixture(gh_happy, false).await;
+        // 先垫一笔旧失败：外发成功跑完一轮即清（票 08 验收第二条）。
+        seed_stale_failure(&f).await;
         let out = f
             .executor
             .execute(
@@ -5790,6 +5829,12 @@ mod tests {
             out.content.contains("step2 done"),
             "日志尾部应回读: {}",
             out.content
+        );
+        // 成功一轮即清失败读数（票 08 验收第二条）。（放在台账锁之前——
+        // clippy 的 await_holding_lock 看不见显式 drop，隔着锁 await 会误报。）
+        assert!(
+            f.store.offload_last_failure().await.unwrap().is_none(),
+            "外发成功后设置页读数应清回「无」"
         );
         // 外发链路的每一步都在命令台账里（push / dispatch / 轮询 / 拉日志）。
         let starts = f.recorder.starts.lock().unwrap();
@@ -5835,11 +5880,20 @@ mod tests {
             "{}",
             out.content
         );
+        // 第四处留痕（票 08）：设置页的失败读数落上时间戳。
+        assert!(
+            f.store.offload_last_failure().await.unwrap().is_some(),
+            "链路失败要在设置页读数上留痕"
+        );
     }
 
     #[tokio::test]
     async fn offload_run_reports_remote_failure_without_falling_back() {
         let f = offload_fixture(gh_remote_failure, false).await;
+        // 先落一笔旧失败：远端命令跑红说明链路整轮走通了（push/dispatch/轮询/
+        // 拉日志都通），旧读数应被清掉、且**不该**被记成新的链路失败（票 08 验收
+        // 第三条：conclusion=failure 不是链路失败）。
+        seed_stale_failure(&f).await;
         let out = f
             .executor
             .execute(
@@ -5863,6 +5917,10 @@ mod tests {
             "远端命令失败不是链路故障，不该回退: {}",
             out.content
         );
+        assert!(
+            f.store.offload_last_failure().await.unwrap().is_none(),
+            "远端跑红不计链路失败：旧读数清掉，也不落新读数"
+        );
     }
 
     #[tokio::test]
@@ -5880,6 +5938,11 @@ mod tests {
             out.content.contains("轮询超时") && out.content.contains("已回退**本机**执行"),
             "排队超时按链路失败回退: {}",
             out.content
+        );
+        // 排队超时也是链路失败（票 08）：设置页读数要落上。
+        assert!(
+            f.store.offload_last_failure().await.unwrap().is_some(),
+            "轮询顶到上限要留下链路失败读数"
         );
     }
 

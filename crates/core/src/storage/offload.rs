@@ -66,6 +66,43 @@ impl Store {
         tx.commit().await?;
         Ok(())
     }
+
+    /// 最近一次**链路**失败的时间戳（票 08）。`None` = 从没失败过（读数是
+    /// 「无」，不是「0」——诚实口径，决策 257）。
+    pub async fn offload_last_failure(&self) -> Result<Option<String>> {
+        let row: Option<(Option<String>,)> =
+            sqlx::query_as("SELECT last_failure_at FROM kanban_offload WHERE id = 1")
+                .fetch_optional(self.pool())
+                .await?;
+        Ok(row.and_then(|(t,)| t))
+    }
+
+    /// 落一笔链路失败（外发回退本机的 WARN 点顺带调用，票 08）。
+    ///
+    /// **UPDATE-only**：行不存在就什么都不写。能跑到外发这一步的前提是开关开着
+    /// （开关打开即建行），行不在 = 有人刚清了设置，那种竞态不值得为它造行——
+    /// 造行会把「界面保存过」的口径（[`Self::offload_switch_has_override`]）搅浑。
+    pub async fn record_offload_link_failure(&self) -> Result<()> {
+        let mut tx = self.begin_write().await?;
+        sqlx::query("UPDATE kanban_offload SET last_failure_at = ?, updated_at = ? WHERE id = 1")
+            .bind(ts(self.now()))
+            .bind(ts(self.now()))
+            .execute(&mut *tx)
+            .await?;
+        tx.commit().await?;
+        Ok(())
+    }
+
+    /// 清链路失败读数：外发**成功**跑完一轮即清（链路刚被证明是通的，包括远端
+    /// 命令跑红那一路——push/dispatch/轮询/拉日志都走通了，票 08 验收第三条）。
+    pub async fn clear_offload_link_failure(&self) -> Result<()> {
+        let mut tx = self.begin_write().await?;
+        sqlx::query("UPDATE kanban_offload SET last_failure_at = NULL WHERE id = 1")
+            .execute(&mut *tx)
+            .await?;
+        tx.commit().await?;
+        Ok(())
+    }
 }
 
 #[cfg(test)]
@@ -105,5 +142,41 @@ mod tests {
         store.set_offload_switch(false).await.unwrap();
         assert!(!store.offload_switch().await.unwrap().enabled);
         assert!(store.offload_switch_has_override().await.unwrap());
+    }
+
+    /// 链路失败读数（票 08）：从没失败过是「无」（None）；落一笔带时间戳；
+    /// 成功一轮清回 None。
+    #[tokio::test]
+    async fn link_failure_readout_round_trips() {
+        let (_tmp, store) = store().await;
+        assert!(
+            store.offload_last_failure().await.unwrap().is_none(),
+            "从没失败过的机器读「无」"
+        );
+
+        store.set_offload_switch(true).await.unwrap();
+        store.record_offload_link_failure().await.unwrap();
+        let stamped = store.offload_last_failure().await.unwrap();
+        assert!(stamped.is_some(), "链路失败要带出时间戳");
+        crate::storage::parse_ts(stamped.as_deref().unwrap()).unwrap();
+
+        store.clear_offload_link_failure().await.unwrap();
+        assert!(store.offload_last_failure().await.unwrap().is_none());
+        assert!(
+            store.offload_switch().await.unwrap().enabled,
+            "清读数不动开关"
+        );
+    }
+
+    /// 行不在时落失败是**无操作**：不偷偷造行（造行会搅浑「界面保存过」的口径）。
+    #[tokio::test]
+    async fn link_failure_record_on_absent_row_is_a_no_op() {
+        let (_tmp, store) = store().await;
+        store.record_offload_link_failure().await.unwrap();
+        assert!(store.offload_last_failure().await.unwrap().is_none());
+        assert!(
+            !store.offload_switch_has_override().await.unwrap(),
+            "不该替人建行"
+        );
     }
 }

@@ -1372,6 +1372,11 @@ export interface OffloadSettings {
   /** 这一份是谁定的：`default` = 从没碰过设置（缺省关）；`settings` = 界面保存过。 */
   origin: 'default' | 'settings';
   probe: OffloadProbe;
+  /**
+   * 最近一次**链路**失败（推分支/dispatch/轮询超时/拉日志失败）的时间戳。
+   * `null` = 从没失败过（界面读「无」，不是「0」）；远端命令跑红不算，成功跑通一轮即清。
+   */
+  last_failure_at: string | null;
 }
 
 export interface RtkSettings {
