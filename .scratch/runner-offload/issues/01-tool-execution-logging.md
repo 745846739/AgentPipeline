@@ -14,14 +14,20 @@
 
 **Blocked by:** None(可立即开始)
 
-**Status:** ready-for-agent
+**Status:** done(实现 07c6389;2026-10-03 收口——部署侧验收一条延后,随 106 真实链路验收同车)
 
-- [ ] 每次工具调用(含命令类与非命令类)有 start 行与 end 行,含工具名、run、attempt、
+- [x] 每次工具调用(含命令类与非命令类)有 start 行与 end 行,含工具名、run、attempt、
       耗时;命令类的 end 行与 kanban_node_commands 台账可对上(同一次执行、同一时长)
-- [ ] 日志可离线聚合:给定一个 task,能从日志流算出各阶段「模型时间 / 工具时间 /
+      —— `tools.rs` 的「工具调用开始 / 收场」行(07c6389):tool / run / stage / node /
+      duration_ms;attempt 不在行上(下一条的裁定)。对账口径见末条已核注记。
+- [x] 日志可离线聚合:给定一个 task,能从日志流算出各阶段「模型时间 / 工具时间 /
       无日志间隔」三段分布(脚本或临时查询即可,不要求界面)
+      —— `scripts/phase-time-distribution.py`(JSON 日志流进,三段汇总出;模型时间按
+      request id 配对派发/收场,工具时间合计 duration_ms,间隔 >120s 计段)。
+      合成样本验证过:90s 模型 / 45s+3.2s 工具 / 一段 450s 静默,读数全对。
 - [ ] 部署到 106 后,新任务不因新增日志产生明显 IO 压力
       (storage-io-budget 的约束仍成立)
+      —— **延后**:依赖部署 + 真任务,与票 06/08 的 106 真实链路验收同车执行。
 - [x] 不改 attempt 语义(B8 另案),不动 recording 落库口径
       —— **行上无 attempt 字段**(code review 指出):ToolCallContext 没有它,补齐要翻
       调度层;B8 已把 attempt 计数器本身定为混义,等 B8 釐清了语义再补字段,不抢跑。
