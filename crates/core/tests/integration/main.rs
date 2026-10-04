@@ -37,6 +37,7 @@ mod readonly;
 mod repair;
 mod repair_deliver;
 mod repo_live;
+mod runner_for_doc;
 mod scheduler_tick;
 mod search;
 mod server_bind;
