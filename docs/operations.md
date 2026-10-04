@@ -716,10 +716,12 @@ async fn recover_dependency_failed(&self) -> Result<()> {
 `[notify].webhook_url` 配置在场即出站：attention 落库且 `wakes()` 时 POST 一条通用 JSON
 （`{title, body, kind, task_id, occurred_at, source}`，`body` 只带归因白名单字段、
 不带正文/日志原文），URL 缺席 = 整段关死、URL 含 token 只进 config.toml 不进日志。`[notify].format`（决策 270，缺省 `generic`）可切 `feishu`——同一份事件按目标选序列化、报文变成飞书文本消息（`msg_type=text`，text = `title\nbody`），政策语义与格式无关；飞书端安全设置用**自定义关键词 `AgentPipeline`**（`title` 固定前缀命中），不做签名校验。
-礼貌语义（每类 cooldown、免打扰 `[22, 8)` 跨零点按本地整点、`failed` 恒发、`pending`
-免打扰豁免）在 Rust（`crates/core/src/notify.rs`）与前端
+礼貌语义（每类 cooldown、免打扰 `[22, 8)` 跨零点按本地整点、`failed` 白天恒发免节流、
+`pending` 免打扰豁免；**决策 383 起出机器那条线的 `failed` 夜间静音 + 只累计、段结束补一条摘要**，
+前端 toast 照旧恒发——两侧显式分叉）在 Rust（`crates/core/src/notify.rs`）与前端
 （`frontend/src/lib/notificationPolicy.ts`，只管浏览器 toast）各有一份，由
-`tests/fixtures/notification_policy.json` 双端同表钉住（决策 246 先例）；前端还有一层
+`tests/fixtures/notification_policy.json` 双端同表钉住（决策 246 先例；383 起共享表
+只收 failed 的白天行）；前端还有一层
 `notifyOn` 用户偏好开关（`cancelled` 缺省关），后端没有偏好面——差异记在决策 268 与
 fixture `$comment`。飞书机器人已可 `format = "feishu"` 直连（决策 270），iMessage 自决策 272 起也有直连通道（见下一段）；其余 IM / 邮件仍可由通用 webhook 转发，独立 SMTP / 专用卡片有证据再议。
 **职责划分（决策 130，不动）：SSE 全量推送、不做 cooldown 合并**——它是状态同步通道，
@@ -735,7 +737,8 @@ iMessage——`format = "bluebubbles"` 时投递目标换成 `POST {端点}/api/
 系统设置 → 隐私与安全性 → 自动化**里有没有被拒的授权。这一档多出两条通知线（272②③）：
 值班长**回话完成**与**失败收口**——回话线是新类 `foreman_reply`（自有 cooldown 槽、
 受免打扰不豁免；`say` 轮要过「这一轮至少 3 次工具调用」的门，快问快答不进手机，
-值守播报恒通知、静默轮恒不通知），失败线走 `failed`（恒发，与台账同批同拍）。回话正文
+值守播报恒通知、静默轮恒不通知），失败线走 `failed`（自决策 383 起免打扰段内静音累计、
+段结束随摘要补出，白天恒发免节流；与台账同批同拍）。回话正文
 **出网**（截断 200 字 + 会话名在标题里）——这是对 268④「不发正文」的一次显式修订：
 收件人是本人的 Apple ID，出机器不出账户；豁免只覆盖回话正文，失败通知仍只带类别、
 不带 `raw` 原文。**设置入口**在 `#/settings/notify`（272⑥⑦⑧）：一颗总开关 + 通道四件

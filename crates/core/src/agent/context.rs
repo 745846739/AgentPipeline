@@ -403,7 +403,17 @@ pub fn compact_messages_from(
         }
     }
 
-    let keep_from = messages.len().saturating_sub(keep_recent_rounds);
+    let mut keep_from = messages.len().saturating_sub(keep_recent_rounds);
+    // 切点对齐到**轮边界**（票 106-stability/09）：`keep_from` 是按条数算的，而工具往返
+    // 一轮至少两条（assistant 载体 + tool 结果）——切点落在 tool 结果上时，kept 转录会以
+    // **孤儿 tool 消息**开头（它的 assistant 载体已被压成摘要）。OpenAI 兼容上游要求
+    // tool 消息紧跟在带对应 tool_call_id 的 assistant 之后，孤儿序列整个请求被拒
+    // （HTTP 400 invalid_request_error；2026-10-04 事故的根因：毒转录落库后被后续
+    // attempt 原样重载，该节点此后每个请求恒 400）。工具结果在转录里紧跟其载体，
+    // 回退到第一条非 tool 的消息即是 owner。
+    while keep_from > 0 && messages[keep_from].role == Role::Tool {
+        keep_from -= 1;
+    }
     let mut kept: Vec<Message> = Vec::new();
     let mut summary_lines: Vec<String> = Vec::new();
     let mut compacted = 0usize;

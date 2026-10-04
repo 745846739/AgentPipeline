@@ -88,9 +88,13 @@ describe('notifyPoliteness（决策 284）', () => {
     expect(parseNotifyPolitenessDraft(draft({ quietEnd: '8.5' })).ok).toBe(false);
   });
 
-  it('两句描述文案：起止相同 = 全天，跨零点说「次日」，节流 0 说不节流', () => {
-    expect(describeQuietHours([22, 8])).toBe('22 点–次日 8 点之间除待办与失败外不出站');
-    expect(describeQuietHours([8, 18])).toBe('8–18 点之间除待办与失败外不出站');
+  it('两句描述文案：起止相同 = 全天，跨零点说「次日」，失败改累计（决策 383）', () => {
+    expect(describeQuietHours([22, 8])).toBe(
+      '22 点–次日 8 点之间除待办外出站；失败改累计，次日 8 点补一条摘要',
+    );
+    expect(describeQuietHours([8, 18])).toBe(
+      '8–18 点之间除待办外出站；失败改累计，18 点补一条摘要',
+    );
     expect(describeQuietHours([8, 8])).toBe('免打扰关着（全天都送）');
     expect(describeCooldown(300)).toBe('同类 300 秒内只出站一条');
     expect(describeCooldown(0)).toBe('不节流（同类有多少发多少）');

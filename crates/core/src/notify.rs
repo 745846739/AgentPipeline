@@ -16,12 +16,18 @@
 //!    消费 `consumed_at`；回话是播报，写进去会污染唤醒判据），由 `foreman.rs` 在
 //!    `respond()` 收口之后直接调用。入口有两个，**礼貌只有一个**：回话线的新类
 //!    `foreman_reply` 有自己的 cooldown 槽、受免打扰（不豁免）；失败收口走 `failed`
-//!    （恒发）。
+//!    （自决策 383 起：免打扰段内静音累计、段结束随摘要补出，白天仍恒发免节流）。
 //!
-//! 两份实现、**一张表**：礼貌语义镜像前端 `lib/notificationPolicy.ts`——`failed` 恒发
-//! （免打扰与节流都不拦）、免打扰 `[22, 8)` 跨零点含头不含尾按整点、`pending` 免打扰
-//! 豁免（节流照走）、每类 cooldown 严格小于——由 `tests/fixtures/notification_policy.json`
-//! 把 Rust 表测试与前端 fixture 测试钉在同一份、同一断言方向（决策 246 回环表的先例）。
+//! 两份实现、**一张表**：礼貌语义镜像前端 `lib/notificationPolicy.ts`——免打扰
+//! `[22, 8)` 跨零点含头不含尾按整点、`pending` 免打扰豁免（节流照走）、每类 cooldown
+//! 严格小于——由 `tests/fixtures/notification_policy.json` 把 Rust 表测试与前端
+//! fixture 测试钉在同一份、同一断言方向（决策 246 回环表的先例）。
+//!
+//! **决策 383 起这张表的适用范围又窄了一格**：`failed` 的夜间行为两侧分叉——前端
+//! toast 照旧恒发（浏览器开着，failed 的 toast 是它唯一的常驻位），出机器这条线改为
+//! **免打扰段内静音 + 只累计，段结束后的第一个整点补一条摘要**（2026-10-03 实测：
+//! 夜里连环失败把免打扰洞穿了 40 多次）。共享表因此只收 `failed` 的**白天**行；
+//! 分叉记在 fixture `$comment` 与两侧守卫里（照 `cancelled` / `foreman_reply` 先例）。
 //!
 //! 决策 284 把「同一张表」的**适用范围**写窄了：那张表钉的是**语义**（怎么算静音、
 //! 哪些类豁免），**数值**由这一侧的 `NotifyPoliteness` 说了算——它可以来自
@@ -165,7 +171,8 @@ impl NotifyClass {
 /// **blocked read**）归 `pending`——免打扰豁免正是为「等人处理」那一类设的
 /// （`resume_blocked` 是「系统试过、放弃了，该有人接手」，`blocked_read` 是「这台机器上
 /// 有读挂在系统调用里，得有人去看授权」——两件都是要人动手的）；失败族四个归 `failed`
-/// （恒发）；`done` 是用户自己任务的结果，照发。由
+/// （自决策 383 起免打扰段内静音累计、段结束补摘要，白天恒发免节流）；`done` 是
+/// 用户自己任务的结果，照发。由
 /// `tests/integration/notify.rs::kind_to_class_mapping_is_pinned` 逐个钉住。
 pub fn notification_class(kind: AttentionKind) -> Option<NotifyClass> {
     use AttentionKind::*;
@@ -193,12 +200,14 @@ pub fn is_quiet_hours(hour: u32, quiet: [u8; 2]) -> bool {
     }
 }
 
-/// 礼貌门（镜像前端 `shouldNotify` 的语义子集——`notifyOn` 开关不在后端，见头注）。
+/// 礼貌门（镜像前端 `shouldNotify` 的语义子集——`notifyOn` 开关不在后端，见头注；
+/// `failed` 的夜间行为自决策 383 起是**显式分叉**，前端照旧恒发）。
 ///
-/// 判定顺序与前端逐行同构：`failed` 恒发（免打扰与节流都不拦，`ALWAYS_ANNOUNCED`
-/// 先例）→ 免打扰静音（`pending` 豁免）→ **每类** cooldown（严格小于：age == cooldown
-/// 放行、age < cooldown 拦下）。`last_age_sec = None` = 这一类还没发过。
-/// `ForemanReply` 不在任何豁免列里——它走标准路径（受免打扰、受 cooldown，272④）。
+/// 判定顺序：免打扰静音（`pending` 豁免照旧）→ `failed` 白天恒发免节流
+/// （`ALWAYS_ANNOUNCED` 先例；夜间已在上一格静音，改由出口累计、段结束补摘要，
+/// 决策 383）→ **每类** cooldown（严格小于：age == cooldown 放行、age < cooldown
+/// 拦下）。`last_age_sec = None` = 这一类还没发过。`ForemanReply` 不在任何豁免列里
+/// ——它走标准路径（受免打扰、受 cooldown，272④）。
 ///
 /// **节流那一格是共享原语**（决策 355）：判据住
 /// [`crate::interrupt::cooling_by_age`]，与值守轮那条线的冷却同源。免打扰与
@@ -210,11 +219,11 @@ pub fn should_notify(
     cooldown_sec: u64,
     quiet: [u8; 2],
 ) -> bool {
-    if cls == NotifyClass::Failed {
-        return true;
-    }
     if is_quiet_hours(hour, quiet) && cls != NotifyClass::Pending {
         return false;
+    }
+    if cls == NotifyClass::Failed {
+        return true;
     }
     !crate::interrupt::cooling_by_age(last_age_sec, cooldown_sec)
 }
@@ -295,10 +304,47 @@ struct Notice<'a> {
 }
 
 // 看板首页 `#/` 这个兜底落点**只在前端存在**（`lib/pushPayload.ts` 的 `BOARD_HOME_HASH`：
-// payload 里的 `url` 不可用时的降级）。服务端这一侧不发 `#/`：每一条出站通知都挂在一个具体
-// 的任务或班次上，拼不出落点的情形不存在（票面「不可达时降级到看板首页而不是白屏」）。
-// 原先这里有一个 `BOARD_HOME` 常量，没有任何消费者，落地时删掉（决策 323 的记录口径：
-// 不留只为「以后可能用」的钩子）。
+// payload 里的 `url` 不可用时的降级）。原先服务端不发 `#/`——每一条出站通知都挂在一个
+// 具体的任务或班次上。决策 383 的夜间摘要打破了这条前提：它聚合的是免打扰段内**所有**
+// 失败，没有单一落点，`url` 就给 `#/`（看板首页），落点规则回到票面原意。
+const BOARD_HOME_FALLBACK: &str = "#/";
+
+/// 夜间失败摘要的 kind 串（决策 383；generic 报文的 `kind` 字段用它）。
+const QUIET_DIGEST_KIND: &str = "quiet_failure_digest";
+
+/// 免打扰时段的一句话窗口（摘要正文用；镜像前端 `describeQuietHours` 的窗口半句）。
+fn quiet_window_label(quiet: [u8; 2]) -> String {
+    let (start, end) = (quiet[0], quiet[1]);
+    if start < end {
+        format!("{start}–{end} 点")
+    } else {
+        format!("{start} 点–次日 {end} 点")
+    }
+}
+
+/// 夜间失败摘要的报文（决策 383）：免打扰段内被压下的失败，段结束后并成**一条**
+/// 出站。正文只带压下条数与时段——逐条的现场在各自的台账/看板里，摘要不是台账。
+/// 深链落到看板首页（它不挂任何单一任务，见 `BOARD_HOME_FALLBACK`）。
+pub fn quiet_digest_payload_for(
+    format: NotifyFormat,
+    count: u64,
+    quiet: [u8; 2],
+    occurred_at: DateTime<Utc>,
+    bb_address: Option<&str>,
+) -> serde_json::Value {
+    let notice = Notice {
+        kind: QUIET_DIGEST_KIND,
+        task_id: None,
+        occurred_at,
+        title: "[AgentPipeline] 夜间摘要".to_string(),
+        body: format!(
+            "免打扰时段（{}）压下了 {count} 条失败通知——详情见看板。",
+            quiet_window_label(quiet)
+        ),
+        url: BOARD_HOME_FALLBACK.to_string(),
+    };
+    render(format, &notice, bb_address)
+}
 
 /// attention 线的深链落点（票面「深链规则」的后半句）。
 ///
@@ -740,6 +786,10 @@ pub struct WebhookNotifier {
     /// 每类最近一次**尝试**时刻（镜像前端 `lastNotifiedAt` 的 per-class 语义）。
     /// 「尝试」而非「成功」：best-effort 不重试，重试循环会把通知变成新的噪音源。
     last_sent: Mutex<HashMap<NotifyClass, DateTime<Utc>>>,
+    /// 免打扰段内被压下的失败条数（决策 383）。只在内存里——出口重建（改设置）
+    /// 与服务重启都会清零，摘要少报夜里前半段的那几条：可接受，摘要是「早上知道
+    /// 昨晚出过事」的提醒，不是台账本身。
+    suppressed_failures: Mutex<u64>,
 }
 
 /// 一次投递的形态（pwa-webpush 02 添第二支）：固定地址一条 POST，还是扇出到所有活订阅。
@@ -771,6 +821,7 @@ impl WebhookNotifier {
             clock,
             store,
             last_sent: Mutex::new(HashMap::new()),
+            suppressed_failures: Mutex::new(0),
         }
     }
 
@@ -829,8 +880,8 @@ impl WebhookNotifier {
         self.dispatch(NotifyClass::ForemanReply, payload);
     }
 
-    /// 值班长**失败收口**（决策 272③）：类 = `failed`（恒发——免打扰与节流都不拦，
-    /// 「这一轮没跑起来」与任务失败同一档）。调用点 = `record_failed_turn` /
+    /// 值班长**失败收口**（决策 272③）：类 = `failed`（自决策 383 起：免打扰段内
+    /// 静音累计、段结束随摘要补出，白天恒发免节流）。调用点 = `record_failed_turn` /
     /// `record_interrupted_turn`，与台账同拍（同批同类只落一行的那一格才叫人）。
     pub fn notify_foreman_failure(
         &self,
@@ -854,10 +905,28 @@ impl WebhookNotifier {
     ///
     /// 通过礼貌门就**先占坑再后台投**：cooldown 记的是上次尝试；投递失败只记日志
     /// （reqwest 的错误 Display 会带 URL，走 `without_url()`——秘密不进日志）。
+    ///
+    /// 决策 383 添两件：漏斗口先过一遍**摘要补发**（出了免打扰后的第一条任何通知，
+    /// 先把夜里压下的失败摘要带出去）；`failed` 撞上免打扰段不再出站，**只累计**
+    /// （不推送、不占 cooldown 槽），段结束由 [`Self::flush_quiet_failures_digest`]
+    /// 补发摘要。
     fn dispatch(&self, cls: NotifyClass, payload: serde_json::Value) {
         let now = self.clock.now();
         // 免打扰按**服务器本地**整点（镜像前端「浏览器本地」的语义——各自服务各自的人）。
         let hour = now.with_timezone(&Local).hour();
+        self.flush_quiet_failures_digest();
+        if cls == NotifyClass::Failed && is_quiet_hours(hour, self.politeness.quiet_hours) {
+            let mut count = match self.suppressed_failures.lock() {
+                Ok(g) => g,
+                Err(_) => return, // 锁中毒：这一跳不发比 panic 强
+            };
+            *count += 1;
+            tracing::info!(
+                suppressed = *count,
+                "免打扰时段失败通知只累计不出站（决策 383）"
+            );
+            return;
+        }
         let mut guard = match self.last_sent.lock() {
             Ok(g) => g,
             Err(_) => return, // 锁中毒：这一跳不发比 panic 强
@@ -877,6 +946,43 @@ impl WebhookNotifier {
         guard.insert(cls, now);
         drop(guard);
 
+        self.deliver(payload, now);
+    }
+
+    /// 夜间失败摘要的补发口（决策 383）。两个调用时机共享**同一个 take**，只会补一次：
+    ///
+    /// ① 每小时维护循环（`runtime.rs::spawn_maintenance_loop`）——保证免打扰段结束后
+    ///    的第一个整点附近一定补，哪怕之后再没有一条通知触发 ②；
+    /// ② `dispatch` 的漏斗口——出免打扰后的第一条任何通知，先把摘要带出去。
+    ///
+    /// 还在免打扰段内、或一条都没压下时是不操作。摘要**不进礼貌门、不占 cooldown 槽**
+    /// （它不是事件，是段落的收尾——占槽会吃掉天亮后第一条真失败的名额）。
+    pub fn flush_quiet_failures_digest(&self) {
+        let now = self.clock.now();
+        let hour = now.with_timezone(&Local).hour();
+        if is_quiet_hours(hour, self.politeness.quiet_hours) {
+            return;
+        }
+        let count = match self.suppressed_failures.lock() {
+            Ok(mut g) => std::mem::take(&mut *g),
+            Err(_) => return,
+        };
+        if count == 0 {
+            return;
+        }
+        let payload = quiet_digest_payload_for(
+            self.target.format(),
+            count,
+            self.politeness.quiet_hours,
+            now,
+            self.target.bb_address(),
+        );
+        tracing::info!(count, "免打扰时段结束，补发夜间失败摘要（决策 383）");
+        self.deliver(payload, now);
+    }
+
+    /// 投递那一跳（礼貌门**之后**的唯一出口）：固定地址一条 POST，或扇出到所有活订阅。
+    fn deliver(&self, payload: serde_json::Value, now: DateTime<Utc>) {
         match self.target.delivery() {
             Delivery::Http(url) => {
                 let client = self.client.clone();
@@ -1055,7 +1161,7 @@ mod tests {
         );
         // 必需行**按名**钉住（与 vitest 同一把尺）。
         for required in [
-            "failed-quiet-bypass",
+            "failed-noon-fresh",
             "pending-quiet-exempt",
             "cooldown-strict-300",
             "cooldown-299-blocks",
@@ -1082,6 +1188,17 @@ mod tests {
         assert!(
             fixture.cases.iter().all(|c| c.cls != "foreman_reply"),
             "foreman_reply 是决策 272 的后端独有类，不该进共享表"
+        );
+        // `failed` 的**夜间**行不进共享表（决策 383 的显式分叉：免打扰段内前端 toast
+        // 照旧恒发、出机器这条线静音累计补摘要）——共享表只收 failed 的白天行，谁把
+        // 夜间行加回来谁变红。
+        let in_quiet = |hour: u32| crate::notify::is_quiet_hours(hour, fixture.policy.quiet_hours);
+        assert!(
+            fixture
+                .cases
+                .iter()
+                .all(|c| c.cls != "failed" || !in_quiet(c.hour)),
+            "failed 的免打扰段内行是决策 383 的两侧分叉，不该进共享表"
         );
         for case in &fixture.cases {
             let cls = NotifyClass::parse(&case.cls)
@@ -1577,6 +1694,69 @@ mod tests {
         assert!(is_quiet_hours(0, [22, 8]), "跨零点的凌晨段");
         assert!(!is_quiet_hours(8, [22, 8]), "跨零点的尾点不静音");
         assert!(!is_quiet_hours(12, [22, 8]), "白天不静音");
+    }
+
+    // ── 决策 383：failed 的夜间分叉与夜间摘要 ──
+
+    /// `failed` 夜间不再恒发：免打扰段内静音（改由出口累计），白天照旧恒发免节流。
+    /// 前端 toast 两侧分叉——那边照旧恒发，钉在前端自己的测试里，不进共享表。
+    #[test]
+    fn failed_goes_quiet_at_night_but_stays_loud_by_day() {
+        // 免打扰 [22, 8)：夜里 23 点 / 3 点静音；白天 12 点与尾点 8 点恒发免节流。
+        assert!(!should_notify(NotifyClass::Failed, 23, None, 300, [22, 8]));
+        assert!(!should_notify(NotifyClass::Failed, 3, None, 300, [22, 8]));
+        assert!(should_notify(
+            NotifyClass::Failed,
+            12,
+            Some(5),
+            300,
+            [22, 8]
+        ));
+        assert!(should_notify(NotifyClass::Failed, 8, None, 300, [22, 8]));
+        // 起止相同 = 全天不静默：failed 全天恒发免节流。
+        assert!(should_notify(NotifyClass::Failed, 23, Some(1), 300, [8, 8]));
+        // 其余类的语义一格未动：pending 豁免、done 静音、foreman_reply 受免打扰。
+        assert!(should_notify(NotifyClass::Pending, 23, None, 300, [22, 8]));
+        assert!(!should_notify(NotifyClass::Done, 23, None, 300, [22, 8]));
+        assert!(!should_notify(
+            NotifyClass::ForemanReply,
+            23,
+            None,
+            300,
+            [22, 8]
+        ));
+    }
+
+    /// 摘要报文：三格式各归各位，正文只带条数与时段、不带任何任务的原文。
+    #[test]
+    fn the_quiet_digest_payload_carries_count_and_window_only() {
+        let generic = quiet_digest_payload_for(NotifyFormat::Generic, 7, [23, 6], Utc::now(), None);
+        assert_eq!(generic["source"], "agentpipeline", "{generic}");
+        assert_eq!(generic["kind"], "quiet_failure_digest", "{generic}");
+        assert!(generic.get("task_id").is_none(), "摘要不挂任务：{generic}");
+        assert_eq!(generic["title"], "[AgentPipeline] 夜间摘要", "{generic}");
+        let body = generic["body"].as_str().unwrap();
+        assert!(
+            body.contains("免打扰时段（23 点–次日 6 点）压下了 7 条失败通知"),
+            "{body}"
+        );
+
+        let push = quiet_digest_payload_for(NotifyFormat::WebPush, 7, [22, 8], Utc::now(), None);
+        assert_eq!(push.as_object().unwrap().len(), 3, "{push}");
+        assert_eq!(push["url"], "#/", "摘要不挂单一任务，落到看板首页：{push}");
+        assert!(
+            push["body"].as_str().unwrap().contains("22 点–次日 8 点"),
+            "跨零点窗口的措辞与 [23,6] 一致：{push}"
+        );
+
+        let feishu = quiet_digest_payload_for(NotifyFormat::Feishu, 7, [23, 6], Utc::now(), None);
+        assert!(
+            feishu["content"]["text"]
+                .as_str()
+                .unwrap()
+                .starts_with("[AgentPipeline] 夜间摘要"),
+            "飞书关键词前缀照旧命中：{feishu}"
+        );
     }
 
     // ── 决策 284②：礼貌两件的两级解析与范围闸 ──

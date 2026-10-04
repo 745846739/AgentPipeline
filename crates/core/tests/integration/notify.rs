@@ -4,10 +4,14 @@
 //!
 //! 1. `wakes()` 的 attention 落库 → webhook 收到一条通用 JSON（字段按 268④，含 task_id）；
 //! 2. 同类 300 秒 cooldown 内第二条被挡，`advance_secs(301)` 之后放行（边界严格小于）；
-//! 3. 免打扰时段（本地 22–8）`done` 静音、`pending` 与 `failed` 照发（268③ 镜像前端同一张表）；
+//! 3. 免打扰时段（本地 22–8）`done` 静音、`pending` 豁免照发（268③ 镜像前端同一张表）；
 //! 4. `SlowRun`（`wakes()` 唯一为 false 的那个）永不通知；
 //! 5. 没挂出口（URL 缺席 = 整段关死）时记账照常、无人惊动；
 //! 6. kind → class 的映射表钉住（后端独有的一张小表，前端映射的是 SSE 事件）。
+//!
+//! 决策 383 起 `failed` 的夜间行为是**两侧分叉**：免打扰段内出机器这条线静音 +
+//! 只累计，段结束补一条摘要（`flush_quiet_failures_digest`）——前端 toast 照旧恒发。
+//! 摘要的补发时机有两处（维护循环的整点车 + 漏斗口的机会车），共用同一个 take。
 //!
 //! 时钟用 `ManualClock`（通知的免打扰小时按**本地时区**算，测试先构造出「本地恰为某整点」
 //! 的瞬间再把时钟拨过去——任何时区下判据都确定）。HTTP 侧复用 `web_fetch` 的 `TinyHttp`。
@@ -253,7 +257,7 @@ async fn cooldown_suppresses_the_same_class_until_the_window_passes() {
 }
 
 #[tokio::test]
-async fn quiet_hours_silence_done_but_pending_and_failed_stay() {
+async fn quiet_hours_silence_done_and_failed_but_pending_stays() {
     // 本地 23 点 = 免打扰 [22, 8) 之内。
     let f = fixture(23).await;
     let server = TinyHttp::spawn("200", "application/json", b"{}".to_vec(), Duration::ZERO);
@@ -262,17 +266,163 @@ async fn quiet_hours_silence_done_but_pending_and_failed_stay() {
 
     note(&f, AttentionKind::TaskDone, t0).await; // done：静音
     note(&f, AttentionKind::TaskPending, t0).await; // pending：免打扰豁免
-    note(&f, AttentionKind::RunFailed, t0).await; // failed：恒发
+    note(&f, AttentionKind::RunFailed, t0).await; // failed：静音 + 累计（决策 383）
 
     assert!(
-        wait_hits(&server, 2, 3_000).await,
-        "pending 与 failed 在免打扰时段照发：hits={}",
+        wait_hits(&server, 1, 3_000).await,
+        "pending 在免打扰时段照发：hits={}",
         server.hits()
     );
     tokio::time::sleep(Duration::from_millis(300)).await;
-    assert_eq!(server.hits(), 2, "done 要被静音，总命中只能是 2");
+    assert_eq!(
+        server.hits(),
+        1,
+        "done 与 failed 都要被静音（failed 自决策 383 起夜间不恒发），总命中只能是 1"
+    );
     let raw = String::from_utf8_lossy(&server.body()).to_string();
     assert!(!raw.contains("\"task_done\""), "done 不该出站：{raw}");
+    assert!(!raw.contains("\"run_failed\""), "failed 不该出站：{raw}");
+}
+
+/// 决策 383 的主干：夜里压下的失败不出站，段结束后的摘要**并成一条**补出来。
+/// 两个补发时机共用同一个 take——补过一次就没了，重复调不重复发。
+#[tokio::test]
+async fn suppressed_failures_land_as_one_digest_after_quiet() {
+    let f = fixture(23).await; // 本地 23 点 = 免打扰 [22, 8) 之内
+    let server = TinyHttp::spawn("200", "application/json", b"{}".to_vec(), Duration::ZERO);
+    let notifier = f.attach_target(NotifyTarget::Webhook {
+        url: server.url("/hook"),
+        format: NotifyFormat::Generic,
+    });
+    let t0 = f.clock.now();
+
+    // 两条失败 + 一条 done，夜里全部静音（done 本来就静，failed 改累计）。
+    note(&f, AttentionKind::RunFailed, t0).await;
+    note(
+        &f,
+        AttentionKind::RetryExhausted,
+        t0 + chrono::Duration::seconds(1),
+    )
+    .await;
+    note(
+        &f,
+        AttentionKind::TaskDone,
+        t0 + chrono::Duration::seconds(2),
+    )
+    .await;
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert_eq!(server.hits(), 0, "免打扰段内一个字节都不出站");
+
+    // 拨到本地 12 点（出段），手动补发——这是维护循环那一车会做的事。
+    f.clock.advance_secs((13 * 3600) as i64); // 23:00 → 次日 12:00（本地）
+    notifier.flush_quiet_failures_digest();
+    assert!(
+        wait_hits(&server, 1, 8_000).await,
+        "出段后的摘要应当补出来：hits={}",
+        server.hits()
+    );
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert_eq!(server.hits(), 1, "摘要只有一条（done 与失败都不逐条补发）");
+    let payload: serde_json::Value =
+        serde_json::from_str(&String::from_utf8_lossy(&server.body())).unwrap();
+    assert_eq!(payload["kind"], "quiet_failure_digest", "{payload}");
+    assert_eq!(payload["title"], "[AgentPipeline] 夜间摘要", "{payload}");
+    let body = payload["body"].as_str().unwrap();
+    assert!(
+        body.contains("压下了 2 条失败通知"),
+        "两条都记进摘要：{body}"
+    );
+    assert!(!body.contains("boom"), "detail 原文不出网：{body}");
+
+    // 第二次补发是不操作（计数已被取走）。
+    notifier.flush_quiet_failures_digest();
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert_eq!(server.hits(), 1, "计数取走后重复补发不再出站");
+}
+
+/// 摘要不占任何 cooldown 槽、不占失败的名额：摘要补出后，紧跟着的第一条真失败照常出站。
+#[tokio::test]
+async fn the_digest_leaves_the_politeness_slots_untouched() {
+    let f = fixture(23).await;
+    let server = TinyHttp::spawn("200", "application/json", b"{}".to_vec(), Duration::ZERO);
+    let notifier = f.attach_target(NotifyTarget::Webhook {
+        url: server.url("/hook"),
+        format: NotifyFormat::Generic,
+    });
+    let t0 = f.clock.now();
+
+    note(&f, AttentionKind::RunFailed, t0).await;
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert_eq!(server.hits(), 0, "夜里这条失败被压下");
+
+    f.clock.advance_secs((13 * 3600) as i64); // → 次日 12:00（本地）
+    notifier.flush_quiet_failures_digest();
+    assert!(wait_hits(&server, 1, 8_000).await, "摘要先补出来");
+
+    // 出段后的第一条真失败（occurred_at 不同、过 attention 去重）：照常出站。
+    note(
+        &f,
+        AttentionKind::RunFailed,
+        t0 + chrono::Duration::seconds(10),
+    )
+    .await;
+    assert!(
+        wait_hits(&server, 2, 8_000).await,
+        "摘要不该吃掉真失败的名额：hits={}",
+        server.hits()
+    );
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert_eq!(server.hits(), 2);
+    let raw = String::from_utf8_lossy(&server.body()).to_string();
+    assert!(raw.contains("\"run_failed\""), "{raw}");
+}
+
+/// 什么都没压下时，补发口是不操作——白天不会凭空冒出摘要。
+#[tokio::test]
+async fn the_digest_stays_silent_when_nothing_was_suppressed() {
+    let f = fixture(12).await; // 白天，从未进过免打扰段
+    let server = TinyHttp::spawn("200", "application/json", b"{}".to_vec(), Duration::ZERO);
+    let notifier = f.attach_target(NotifyTarget::Webhook {
+        url: server.url("/hook"),
+        format: NotifyFormat::Generic,
+    });
+    note(&f, AttentionKind::TaskDone, f.clock.now()).await;
+    assert!(wait_hits(&server, 1, 3_000).await, "done 正常出站");
+    notifier.flush_quiet_failures_digest();
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert_eq!(server.hits(), 1, "没有压下就没有摘要");
+}
+
+/// 摘要在**浏览器推送**这条线上同样落得进手机：`url` 是看板首页 `#/`
+/// （摘要不挂单一任务，落点规则见 `BOARD_HOME_FALLBACK`）。
+#[tokio::test]
+async fn the_quiet_digest_pushes_the_board_home_deep_link() {
+    let f = fixture(23).await;
+    let mut phone = FakeDevice::subscribe(&f, "200 OK", "iPhone Safari").await;
+    f.store.ensure_push_vapid_keys().await.unwrap();
+    let notifier = f.attach_target(NotifyTarget::WebPush);
+    let t0 = f.clock.now();
+
+    note(&f, AttentionKind::RunFailed, t0).await;
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert_eq!(phone.server.hits(), 0, "夜里这条失败被压下");
+
+    f.clock.advance_secs((13 * 3600) as i64); // → 次日 12:00（本地）
+    notifier.flush_quiet_failures_digest();
+    assert!(wait_hits(&phone.server, 1, 8_000).await, "摘要应当到手机");
+    let payload = phone.decrypt();
+    assert_eq!(payload["url"], "#/", "{payload}");
+    assert!(
+        payload["title"].as_str().unwrap().contains("夜间摘要"),
+        "{payload}"
+    );
+    assert!(
+        payload["body"]
+            .as_str()
+            .unwrap()
+            .contains("压下了 1 条失败通知"),
+        "{payload}"
+    );
 }
 
 /// 决策 284③：出口按**它被造出来时那份**礼貌说话。同一时刻同一类通知，配置级那套
@@ -422,7 +572,7 @@ async fn bluebubbles_target_posts_a_send_text_body_with_the_password_in_the_quer
 }
 
 #[tokio::test]
-async fn foreman_reply_respects_quiet_hours_while_failure_stays_loud() {
+async fn foreman_reply_respects_quiet_hours_and_failure_accumulates() {
     // 本地 23 点 = 免打扰 [22, 8) 之内。
     let f = fixture(23).await;
     let server = TinyHttp::spawn("200", "application/json", b"{}".to_vec(), Duration::ZERO);
@@ -433,23 +583,29 @@ async fn foreman_reply_respects_quiet_hours_while_failure_stays_loud() {
 
     // 回话线：受免打扰、不豁免（272④——回话是摘要不是警报）。
     notifier.notify_foreman_reply("s1", "晚上的重构", "还在查。", f.clock.now());
-    // 失败线：类 = failed，恒发（272③）。
+    // 失败线：类 = failed，决策 383 起夜里静音 + 累计。
     notifier.notify_foreman_failure("s1", "晚上的重构", "llm_network", f.clock.now());
-    assert!(
-        wait_hits(&server, 1, 8_000).await,
-        "免打扰段内只有失败线照发：hits={}",
-        server.hits()
-    );
     tokio::time::sleep(Duration::from_millis(300)).await;
-    assert_eq!(server.hits(), 1, "回话线被免打扰静音");
-    let payload: serde_json::Value =
-        serde_json::from_str(&String::from_utf8_lossy(&server.body())).unwrap();
-    assert_eq!(payload["kind"], "foreman_reply_failed", "{payload}");
+    assert_eq!(
+        server.hits(),
+        0,
+        "免打扰段内回话静音、失败只累计，一个字节都不出站"
+    );
 
-    // 拨出免打扰段（本地 8 点）：回话线放行。
+    // 拨出免打扰段（本地 8 点）：回话线放行——且它的漏斗口先把夜里压下的失败
+    // 摘要带出去（机会车），所以是两条：摘要在前、回话在后。
     f.clock.advance_secs((9 * 3600) as i64); // 23:00 → 次日 08:00（本地）
     notifier.notify_foreman_reply("s1", "晚上的重构", "查完了。", f.clock.now());
-    assert!(wait_hits(&server, 2, 8_000).await, "出免打扰段后回话线放行");
+    assert!(
+        wait_hits(&server, 2, 8_000).await,
+        "摘要 + 回话都该出站（回话只调了一次，第二条只能是摘要）：hits={}",
+        server.hits()
+    );
+    // body() 是**最后一次**请求的报文体——回话在后，最后一条是回话。
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert_eq!(server.hits(), 2);
+    let raw = String::from_utf8_lossy(&server.body()).to_string();
+    assert!(raw.contains("查完了。"), "最后一次是回话：{raw}");
 }
 
 #[tokio::test]
@@ -702,9 +858,9 @@ async fn a_foreman_reply_pushes_the_talk_session_deep_link() {
     );
 }
 
-/// 礼貌门零新增：**同一道门**。免打扰时段里 `done` 静音而 `pending` / `failed` 照发
-/// （268③ 那张表原样），节流窗口内的第二条被挡、出窗口放行——判据与 iMessage 通道
-/// 一字不差（票面：将来同批增减事件）。
+/// 礼貌门零新增：**同一道门**。免打扰时段里 `done` 与 `failed` 静音（后者自决策 383
+/// 起改静音累计）而 `pending` 照发（268③ 那张表 + 383 的分叉），节流窗口内的第二条
+/// 被挡、出窗口放行——判据与 webhook 通道一字不差（票面：将来同批增减事件）。
 #[tokio::test]
 async fn push_obeys_the_same_politeness_gate_as_the_other_channels() {
     // 本地 23 点 = 免打扰 [22, 8) 之内。
@@ -716,14 +872,18 @@ async fn push_obeys_the_same_politeness_gate_as_the_other_channels() {
 
     note(&f, AttentionKind::TaskDone, t0).await; // done：静音
     note(&f, AttentionKind::TaskPending, t0).await; // pending：免打扰豁免
-    note(&f, AttentionKind::RunFailed, t0).await; // failed：恒发
+    note(&f, AttentionKind::RunFailed, t0).await; // failed：静音 + 累计（决策 383）
     assert!(
-        wait_hits(&phone.server, 2, 8_000).await,
-        "pending 与 failed 在免打扰时段照发：hits={}",
+        wait_hits(&phone.server, 1, 8_000).await,
+        "pending 在免打扰时段照发：hits={}",
         phone.server.hits()
     );
     tokio::time::sleep(Duration::from_millis(300)).await;
-    assert_eq!(phone.server.hits(), 2, "done 被静音，总命中只能是 2");
+    assert_eq!(
+        phone.server.hits(),
+        1,
+        "done 与 failed 都被静音（failed 自决策 383 起夜间不恒发），总命中只能是 1"
+    );
     assert!(
         !String::from_utf8_lossy(&phone.server.body()).contains("完成"),
         "done 不该出站（解不开的密文里也不该出现它的标签——密文里本来就什么都没有）"
@@ -739,7 +899,7 @@ async fn push_obeys_the_same_politeness_gate_as_the_other_channels() {
     )
     .await;
     assert!(
-        wait_hits(&phone.server, 3, 8_000).await,
+        wait_hits(&phone.server, 2, 8_000).await,
         "出节流窗口后放行：hits={}",
         phone.server.hits()
     );

@@ -3,7 +3,7 @@
  *
  * 跨语言共享表的 **Node 侧那一半**（票 foreman-within-boundary 02，决策 268③）。
  *
- * 问题：礼貌语义（`failed` 恒发、免打扰跨零点、每类 cooldown 严格小于）在
+ * 问题：礼貌语义（免打扰跨零点、每类 cooldown 严格小于、`failed` 白天恒发免节流）在
  * Rust（`crates/core/src/notify.rs`，离线 webhook）与本文件
  * （`notificationPolicy.ts`，浏览器 toast）各有一份实现——两侧服务的是同一个
  * 「什么时候该吵人」的规范，规范漂移时其中一侧会静默给出另一个答案。
@@ -53,7 +53,7 @@ describe('通知礼貌共享表（决策 268，与 Rust notify 同源）', () =>
     // 必需行按名钉住（与 Rust 表测试同一把尺）：只数行数时，
     // 随便补几行同侧断言也能过 ≥20
     for (const required of [
-      'failed-quiet-bypass',
+      'failed-noon-fresh',
       'pending-quiet-exempt',
       'cooldown-strict-300',
       'cooldown-299-blocks',
@@ -76,6 +76,18 @@ describe('通知礼貌共享表（决策 268，与 Rust notify 同源）', () =>
     expect(
       fixture.cases.every((c) => (c.cls as string) !== 'foreman_reply'),
       'foreman_reply 是决策 272 的后端独有类，不该进共享表',
+    ).toBe(true);
+    // failed 的**夜间**行也不进表（决策 383 的显式分叉）：免打扰段内前端 toast 照旧
+    // 恒发、出机器那条线静音累计补摘要——两侧答案不同，放进表必有一侧永远红。
+    // 照 cancelled / foreman_reply 先例，两侧守卫谁悄悄加了谁变红。
+    const quiet = fixture.policy.quiet_hours;
+    const inQuiet = (hour: number) =>
+      quiet[0] < quiet[1]
+        ? hour >= quiet[0] && hour < quiet[1]
+        : hour >= quiet[0] || hour < quiet[1];
+    expect(
+      fixture.cases.every((c) => c.cls !== 'failed' || !inQuiet(c.hour)),
+      'failed 的免打扰段内行是决策 383 的两侧分叉，不该进共享表',
     ).toBe(true);
   });
 

@@ -74,7 +74,7 @@ describe('离线通知设置页 · 礼貌小节的接线（决策 284）', () =>
     expect(screen.getAllByText('配置文件定的').length).toBe(2);
     // 描述按生效值算：节流 + 免打扰两句都在
     expect(screen.getByText(/同类 300 秒内只出站一条/)).toBeTruthy();
-    expect(screen.getByText(/22 点–次日 8 点之间除待办与失败外不出站/)).toBeTruthy();
+    expect(screen.getByText(/22 点–次日 8 点之间除待办外出站/)).toBeTruthy();
     // 礼貌来自配置文件 → 这一节没有「交还」钮（通道那一节也没有：它同样是配置级）
     expect(screen.queryByRole('button', { name: '交还配置文件' })).toBeNull();
   });

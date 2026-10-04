@@ -69,12 +69,17 @@ export function parseNotifyPolitenessDraft(d: NotifyPolitenessDraft): Politeness
   return { ok: true, payload: { cooldown_sec: cooldown, quiet_hours: [start, end] } };
 }
 
-/** 免打扰时段的一句话（页面上按草稿实时显示，判据纯函数化以便单测）。 */
+/** 免打扰时段的一句话（页面上按草稿实时显示，判据纯函数化以便单测）。
+ *
+ * 决策 383 起的口径：免打扰段内待办照常出站、失败不再出站——改**只累计**，
+ * 段结束（`end` 那个整点之后）补一条摘要。
+ */
 export function describeQuietHours(quiet: [number, number]): string {
   const [start, end] = quiet;
   if (start === end) return '免打扰关着（全天都送）';
-  if (start < end) return `${start}–${end} 点之间除待办与失败外不出站`;
-  return `${start} 点–次日 ${end} 点之间除待办与失败外不出站`;
+  if (start < end)
+    return `${start}–${end} 点之间除待办外出站；失败改累计，${end} 点补一条摘要`;
+  return `${start} 点–次日 ${end} 点之间除待办外出站；失败改累计，次日 ${end} 点补一条摘要`;
 }
 
 /** 节流窗口的一句话。 */

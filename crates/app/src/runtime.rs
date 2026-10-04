@@ -344,6 +344,9 @@ impl Runtime {
         settings: Settings,
         mut shutdown: tokio::sync::watch::Receiver<bool>,
     ) {
+        // 循环里要摸出口（决策 383 的摘要定时车）：给 scheduler 一份克隆，
+        // 这份留给维护循环自己。
+        let notifier_store = store.clone();
         let scheduler = KanbanScheduler::new(
             store,
             settings,
@@ -362,6 +365,12 @@ impl Runtime {
                     _ = interval.tick() => {
                         if let Err(e) = scheduler.maintenance().await {
                             tracing::error!(error = %e, "scheduler 维护任务失败");
+                        }
+                        // 夜间失败摘要的**定时车**（决策 383）：免打扰段结束后的第一个
+                        // 整点附近一定补——哪怕之后再没有一条通知去踩漏斗口的机会车。
+                        // 没压下东西 / 还在段内时它自己是不操作。
+                        if let Some(notifier) = notifier_store.notifier() {
+                            notifier.flush_quiet_failures_digest();
                         }
                     }
                     _ = shutdown.changed() => {

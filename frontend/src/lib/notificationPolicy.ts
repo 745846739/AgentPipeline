@@ -14,6 +14,11 @@ import type { SseEvent } from '../api/types';
  * 完成横幅只报 done）。所以：`failed` 既免免打扰也免 cooldown（**唯一**这样的类），
  * `pending` 免免打扰（照旧，§2 原则 3）、cooldown 保留（计数芯片与档案盒是它的常驻通道），
  * `done` 两者都保留（完成横幅不受任何节流，它另有通道，丢掉的不算丢）。
+ *
+ * **决策 383 的显式分叉**：上面这套只管**浏览器 toast**。出机器那条线（webhook /
+ * 浏览器推送，core `notify.rs`）对 `failed` 的夜间行为不同——免打扰段内静音 + 只累计，
+ * 段结束补一条摘要（夜里连环失败把免打扰洞穿 40 多次是它的起因）。本文件的 failed
+ * 豁免不受影响：浏览器开着时，failed 的 toast 仍是它唯一的常驻位。
  */
 
 export type NotificationClass = 'pending' | 'done' | 'failed' | 'cancelled';
