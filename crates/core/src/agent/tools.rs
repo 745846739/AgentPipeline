@@ -2688,12 +2688,18 @@ impl ToolExecutor {
         self.offload_shell(
             ctx,
             &format!(
-                "gh workflow run offload.yml -f branch={branch} -f sha={sha} \
-                 -f command='{command}'"
+                "gh workflow run offload.yml --ref {branch} -f branch={branch} \
+                 -f sha={sha} -f command='{command}'"
             ),
             OFFLOAD_STEP_TIMEOUT_SEC,
         )
         .await?;
+        // **--ref 必须带**（106 真实链路验收抓的 bug，票 06）：不带时 dispatch 落在
+        // 默认分支（main）头上，run 的 headBranch/headSha 都与我们无关——
+        // `gh run list --branch {branch}` 永远查空、sha 前缀也对不上，轮询顶到上限
+        // 后按链路失败白回退本机。带 --ref 后 run 记在任务分支名下（headSha =
+        // 分支 tip = 刚推的 sha），分支过滤与 sha 对账同时成立；工作流文件随分支
+        // 走，本仓任务分支都自 main 分出、必含 offload.yml。
 
         // 轮询：`gh run list` 出 JSON，解析在 Rust 侧（不在 shell 里拼 jq——引号是注入面）。
         // **headSha 必须在 jq 里截短到 12 位再出来**：40 位 hex 会被输出脱敏的长 base64
@@ -5861,6 +5867,9 @@ mod tests {
             "argv: {argv}"
         );
         assert!(argv.contains("[sha="));
+        // dispatch 必须带 --ref（106 真实链路验收抓的 bug）：不带则 run 记在默认
+        // 分支头上，轮询的分支过滤永远查空。
+        assert!(argv.contains("[--ref]"), "argv: {argv}");
     }
 
     #[tokio::test]
