@@ -2521,6 +2521,13 @@ impl ToolExecutor {
     /// `pipeline::run_system_command` / `pipeline::repair` 各自接线），本函数只管
     /// agent 手跑的这一条。变量对非 cargo 命令无害。
     ///
+    /// **测试隔离教训**（2026-10-03 闸门实测）：闸门侧同一条接线也注入这个变量，
+    /// 而 `CARGO_TARGET_DIR` 会顺着环境传进测试二进制——测试里断言「执行器注入了共享
+    /// 目录」必须对**执行器自己 home 的 `shared_target_path()` 具体路径**断言
+    /// （hermetic），别用可被外层环境变量误伤的 `"shared-target"` 子串断言：它会把
+    /// 继承来的环境变量当成执行器注入，闸门下无端变红（见
+    /// `session_commands_do_not_get_the_shared_target_var`）。
+    ///
     /// **并发语义**：多任务并发构建会在共享目录的 cargo 文件锁上**零进度排队**
     /// （区别于 CPU 争抢的慢速推进）。任务命令缺省超时 60s（`tool_timeout_sec`），
     /// 排队可能吃光它——构建类命令（cargo build/test 全量）本就该显式传
