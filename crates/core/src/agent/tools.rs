@@ -5510,9 +5510,13 @@ mod tests {
             )
             .await
             .unwrap();
+        // 对**执行器自己 home 的共享路径**断言（hermetic）：外层进程若自带
+        // CARGO_TARGET_DIR（106 的闸门按票 03 接线就是这么跑测试的），子命令会
+        // 原样继承——那是环境不是执行器注入，对 "shared-target" 子串断言会误伤。
+        let injected = s.home.shared_target_path().display().to_string();
         assert!(
-            !out.content.contains("shared-target"),
-            "值班长命令不得拿到共享路径: {}",
+            !out.content.contains(&injected),
+            "值班长命令不得拿到执行器的共享路径: {}",
             out.content
         );
     }

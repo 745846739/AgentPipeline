@@ -8,6 +8,10 @@
 //! 与 `/rtk` 同族（决策 297）：**每次读都真探测一次**，不缓存上次结果；
 //! **探测失败不拦保存**——「先开开关、后在 106 登录 gh」是共识里写明的顺序，
 //! 探测读数原样摆出来，不静默成功也不静默失败。
+//!
+//! 读数外壳（`enabled` / `origin` / `probe` / `last_failure_at`）由模块内私有的
+//! `readout` 帮手两端点共用，GET 与 PUT 的读数同形因此是**结构保证**而不是纪律。
+//! `probe` 的活体探测语义（10s 超时、失败不拦保存）仍在 `probe` 里，本帮手只是按次序调用它。
 
 use axum::extract::State;
 use axum::Json;
@@ -72,6 +76,33 @@ async fn workflow_present_in_any_project(state: &AppState) -> bool {
     })
 }
 
+/// 两个端点共用的读数外壳（GET/PUT 同形的唯一来源）。
+///
+/// `enabled` 与 `origin` 由调用方给——那是两端点**唯一**不同的两个事实：
+/// GET 报库里已存的值与它的来路（保存过 = settings，否则 default），
+/// PUT 报本次请求的值与 settings。其余两格（`probe` 的活体探测、
+/// `last_failure_at` 的链路失败读数）在这里拼一次，两端点天然同形。
+///
+/// 本帮手收的是**读数外壳**；`probe` 的活体探测语义（10s 超时、失败不拦保存）
+/// 仍在 `probe` 里，本帮手只是按次序调用它。
+async fn readout(state: &AppState, enabled: bool, origin: &str) -> ApiResult<serde_json::Value> {
+    let last_failure = state
+        .store
+        .offload_last_failure()
+        .await
+        .map_err(map_core_error)?;
+    let probe = probe(state).await;
+    Ok(json!({
+        "enabled": enabled,
+        // 诚实口径（决策 257）：这份状态是谁定的
+        "origin": origin,
+        "probe": probe,
+        // 最近一次**链路**失败（票 08）：null = 从没失败过（读数「无」）。
+        // 远端命令跑红不写这列，外发成功一轮即清。
+        "last_failure_at": last_failure,
+    }))
+}
+
 /// `GET /offload`：设置页的读数。
 pub async fn settings(State(state): State<AppState>) -> ApiResult<Json<serde_json::Value>> {
     let stored = state.store.offload_switch().await.map_err(map_core_error)?;
@@ -80,21 +111,13 @@ pub async fn settings(State(state): State<AppState>) -> ApiResult<Json<serde_jso
         .offload_switch_has_override()
         .await
         .map_err(map_core_error)?;
-    let last_failure = state
-        .store
-        .offload_last_failure()
-        .await
-        .map_err(map_core_error)?;
-    let probe = probe(&state).await;
-    Ok(Json(json!({
-        "enabled": stored.enabled,
-        // 诚实口径（决策 257）：这份状态是谁定的
-        "origin": if overridden { "settings" } else { "default" },
-        "probe": probe,
-        // 最近一次**链路**失败（票 08）：null = 从没失败过（读数「无」）。
-        // 远端命令跑红不写这列，外发成功一轮即清。
-        "last_failure_at": last_failure,
-    })))
+    let readout = readout(
+        &state,
+        stored.enabled,
+        if overridden { "settings" } else { "default" },
+    )
+    .await?;
+    Ok(Json(readout))
 }
 
 #[derive(Debug, Deserialize)]
@@ -114,16 +137,6 @@ pub async fn set_enabled(
         .set_offload_switch(body.enabled)
         .await
         .map_err(map_core_error)?;
-    let last_failure = state
-        .store
-        .offload_last_failure()
-        .await
-        .map_err(map_core_error)?;
-    let probe = probe(&state).await;
-    Ok(Json(json!({
-        "enabled": body.enabled,
-        "origin": "settings",
-        "probe": probe,
-        "last_failure_at": last_failure,
-    })))
+    let readout = readout(&state, body.enabled, "settings").await?;
+    Ok(Json(readout))
 }

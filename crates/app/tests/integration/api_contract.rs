@@ -6508,6 +6508,297 @@ async fn offload_readout_carries_the_last_link_failure() {
     assert!(body["last_failure_at"].is_null(), "{body}");
 }
 
+/// `GET/PUT /offload` 的读数**形状**是结构保证，不是纪律（票 runner-offload/09）：
+/// 两端点响应体的键集逐项相同、`probe` 子键集逐项相同。**只比键集与类型、不断言探测取值**
+/// ——这台机器装没装 gh 不影响契约（与既有 rtk 契约用例同一取舍）。
+#[tokio::test]
+async fn offload_get_and_put_readouts_share_one_shape() {
+    let api = api().await;
+
+    let (_, got) = get(&api, "/offload").await;
+    let (status, put_body) = put(&api, "/offload", json!({"enabled": true})).await;
+    assert_eq!(status, StatusCode::OK, "{put_body}");
+
+    let sorted = |v: &Value| -> Vec<String> {
+        let mut keys: Vec<String> = v
+            .as_object()
+            .expect("读数必须是对象")
+            .keys()
+            .cloned()
+            .collect();
+        keys.sort();
+        keys
+    };
+
+    let expected = vec![
+        "enabled".to_string(),
+        "last_failure_at".to_string(),
+        "origin".to_string(),
+        "probe".to_string(),
+    ];
+    assert_eq!(sorted(&got), expected, "GET 键集变了：{got}");
+    assert_eq!(sorted(&put_body), expected, "PUT 键集变了：{put_body}");
+    assert_eq!(sorted(&got), sorted(&put_body), "GET/PUT 读数不同形");
+
+    // 类型（不断言取值）：enabled 布尔、origin 字符串、probe 对象、last_failure_at 字符串或 null
+    assert!(got["enabled"].is_boolean());
+    assert!(put_body["enabled"].is_boolean());
+    assert!(got["origin"].is_string());
+    assert!(put_body["origin"].is_string());
+    assert!(got["probe"].is_object());
+    assert!(got["last_failure_at"].is_string() || got["last_failure_at"].is_null());
+
+    // probe 子键集两端点逐项相同
+    assert_eq!(
+        sorted(&got["probe"]),
+        sorted(&put_body["probe"]),
+        "probe 子键集不同形"
+    );
+    let probe_keys = sorted(&got["probe"]);
+    assert_eq!(
+        probe_keys,
+        vec![
+            "gh_authed".to_string(),
+            "gh_reason".to_string(),
+            "workflow_present".to_string()
+        ],
+        "probe 子键集变了：{got}"
+    );
+}
+
+/// `GET /offload` 的取值规则不变（票 runner-offload/09，场景 4）：
+/// `enabled` 取库里已存的值、`origin` 按「保存过 = settings / 从没碰过 = default」
+/// （决策 257 的诚实口径）——**「保存过、结果是关」与「从没碰过」分得开**。
+#[tokio::test]
+async fn offload_get_readout_reports_the_stored_value_and_its_provenance() {
+    let api = api().await;
+
+    let (_, body) = get(&api, "/offload").await;
+    assert_eq!(body["enabled"], false, "从没碰过设置 = 缺省关：{body}");
+    assert_eq!(body["origin"], "default", "从没碰过 = default：{body}");
+
+    let (status, _) = put(&api, "/offload", json!({"enabled": true})).await;
+    assert_eq!(status, StatusCode::OK);
+    let (_, body) = get(&api, "/offload").await;
+    assert_eq!(body["enabled"], true, "GET 报库里已存的值：{body}");
+    assert_eq!(body["origin"], "settings", "保存过 = settings：{body}");
+
+    let (status, _) = put(&api, "/offload", json!({"enabled": false})).await;
+    assert_eq!(status, StatusCode::OK);
+    let (_, body) = get(&api, "/offload").await;
+    assert_eq!(body["enabled"], false);
+    assert_eq!(
+        body["origin"], "settings",
+        "保存过、结果是关 ≠ 从没碰过（诚实口径，决策 257）：{body}"
+    );
+}
+
+/// `PUT /offload` 的取值规则不变（票 runner-offload/09，场景 5）：
+/// 返回体的 `enabled` 逐字等于**本次请求的值**、`origin` 恒 `"settings"`；保存即活（库值同请求值）。
+#[tokio::test]
+async fn offload_put_readout_reports_this_request_and_lands_it() {
+    let api = api().await;
+
+    let (status, body) = put(&api, "/offload", json!({"enabled": true})).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["enabled"], true, "{body}");
+    assert_eq!(body["origin"], "settings", "{body}");
+    assert!(
+        api.state.store.offload_switch().await.unwrap().enabled,
+        "保存即活：库中开关随请求落为 true"
+    );
+
+    let (status, body) = put(&api, "/offload", json!({"enabled": false})).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["enabled"], false, "{body}");
+    assert_eq!(body["origin"], "settings", "{body}");
+    assert!(
+        !api.state.store.offload_switch().await.unwrap().enabled,
+        "库中开关随请求落为 false"
+    );
+    assert!(
+        api.state.store.offload_switch_has_override().await.unwrap(),
+        "保存过就是保存过（哪怕值与缺省相同）"
+    );
+}
+
+/// `last_failure_at` 缺省是 JSON `null`（票 runner-offload/09，场景 6）——
+/// 不是 `"0"`、不是 `""`、不是缺键；落一笔后是非空时间戳（照 `parse_ts` 口径）；清口后回 `null`。
+#[tokio::test]
+async fn offload_last_failure_at_defaults_to_json_null() {
+    let api = api().await;
+
+    let (_, body) = get(&api, "/offload").await;
+    assert!(body["last_failure_at"].is_null(), "缺省是 null：{body}");
+    assert!(
+        body.get("last_failure_at").is_some(),
+        "不是缺键，是显式 null：{body}"
+    );
+
+    let (_, body) = put(&api, "/offload", json!({"enabled": true})).await;
+    assert!(
+        body["last_failure_at"].is_null(),
+        "PUT 侧缺省同样是 null：{body}"
+    );
+
+    api.state.store.record_offload_link_failure().await.unwrap();
+    let (_, body) = get(&api, "/offload").await;
+    let stamped = body["last_failure_at"]
+        .as_str()
+        .expect("落一笔后要带出时间戳字符串");
+    assert!(!stamped.is_empty(), "{body}");
+    agentpipeline_core::storage::parse_ts(stamped).expect("照 parse_ts 口径的时间戳");
+
+    api.state.store.clear_offload_link_failure().await.unwrap();
+    let (_, body) = get(&api, "/offload").await;
+    assert!(body["last_failure_at"].is_null(), "清口后回 null：{body}");
+}
+
+/// 探测有缺口时 PUT 仍 200、不拦保存（票 runner-offload/09，场景 7）：
+/// 探测读数原样摆出来（三子键齐备），不静默成功也不静默失败。
+#[tokio::test]
+async fn offload_put_is_not_blocked_by_probe_gaps() {
+    let api = api().await;
+
+    let (status, body) = put(&api, "/offload", json!({"enabled": true})).await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "探测失败不拦保存（不是 4xx/5xx）：{body}"
+    );
+    assert_eq!(body["enabled"], true, "{body}");
+    assert_eq!(body["origin"], "settings", "{body}");
+
+    let probe = body["probe"].as_object().expect("probe 是对象");
+    for key in ["gh_authed", "gh_reason", "workflow_present"] {
+        assert!(
+            probe.contains_key(key),
+            "probe 缺 {key}（读数要原样摆出来）：{body}"
+        );
+    }
+    assert!(
+        body["probe"]["gh_authed"].is_boolean(),
+        "gh_authed 是布尔（不断言取值）：{body}"
+    );
+}
+
+/// 缺 `enabled` 字段是 422（票 runner-offload/09，场景 8）——不是 500、不是静默 200，
+/// 且这次请求不改动开关（缺体不入库）。
+#[tokio::test]
+async fn offload_put_requires_the_enabled_field() {
+    let api = api().await;
+
+    let (status, _) = put(&api, "/offload", json!({})).await;
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
+
+    let (_, body) = get(&api, "/offload").await;
+    assert_eq!(body["enabled"], false, "缺体不该改动开关：{body}");
+    assert_eq!(body["origin"], "default", "缺体不该造行：{body}");
+}
+
+/// 去重的**静态口径**（票 runner-offload/09，场景 3 / AC-4）：`last_failure_at` 的取数只经
+/// 帮手内**唯一一处** `offload_last_failure()`，读数外壳（四个键）也只拼一次；帮手是**模块内私有**。
+/// 黑盒断言看不见调用点数量，这条只能读源码钉住——只有它成立，同形才是结构保证而非纪律。
+#[test]
+fn offload_readout_has_one_source_and_one_shell() {
+    let source = include_str!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/src/routes/offload.rs"
+    ));
+    // 只扫生产段：本断言的字面量都在测试段，切掉才不会自证式通过（同 serve.rs / runtime.rs 的手法）。
+    let live = source.split("#[cfg(test)]").next().expect("源文件总在");
+
+    assert_eq!(
+        live.matches("offload_last_failure()").count(),
+        1,
+        "取数该只有一处调用点（帮手内），从 2 降到 1：\n{live}"
+    );
+
+    // 四个键的读数外壳只出现一次（`probe` 内那条探测 JSON 不含这四个键，不算）。
+    for key in [
+        "\"enabled\":",
+        "\"origin\":",
+        "\"probe\":",
+        "\"last_failure_at\":",
+    ] {
+        assert_eq!(
+            live.matches(key).count(),
+            1,
+            "读数外壳的键 {key} 只该拼一处：\n{live}"
+        );
+    }
+
+    // 帮手私有（与 `probe` / `rtk.rs::probe_json` 同级），对外面（settings / set_enabled / OffloadSwitchBody）不变。
+    assert!(live.contains("async fn readout("), "帮手在场：\n{live}");
+    assert!(
+        !live.contains("pub async fn readout") && !live.contains("pub fn readout"),
+        "帮手该是模块内私有，不带 pub：\n{live}"
+    );
+    assert!(live.contains("pub async fn settings("), "{live}");
+    assert!(live.contains("pub async fn set_enabled("), "{live}");
+    assert!(live.contains("pub struct OffloadSwitchBody"), "{live}");
+}
+
+/// 库调用次序与失败映射不变（票 runner-offload/09，场景 9 / 风险 1、2）：
+/// `last_failure` 在 `probe` **之前**且带 `.map_err(map_core_error)`；GET 读序仍是
+/// `switch → has_override`；PUT 仍是「写在前、读在后」。黑盒难分辨（探测设备在场与否不定），故读源码钉住。
+#[test]
+fn offload_readout_keeps_the_call_order_and_the_error_mapping() {
+    let source = include_str!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/src/routes/offload.rs"
+    ));
+    let live = source.split("#[cfg(test)]").next().expect("源文件总在");
+
+    // 帮手内：last_failure 在 probe 之前，且失败映射在场。
+    let lf_at = live
+        .find(".offload_last_failure()")
+        .expect("帮手内要取链路失败读数");
+    let probe_at = live.find("probe(state)").expect("帮手内要做活体探测");
+    assert!(lf_at < probe_at, "last_failure 必须在 probe 之前：\n{live}");
+    let window: String = live[lf_at..].chars().take(120).collect();
+    assert!(
+        window.contains("map_err(map_core_error)"),
+        "last_failure 那一步要带失败映射：\n{window}"
+    );
+
+    // 帮手从调用方收 enabled / origin，内部不回读库（PUT 报的是本次请求的值，不是回显落库结果）。
+    let sig: String = live[live.find("async fn readout(").expect("帮手在场")..]
+        .chars()
+        .take(120)
+        .collect();
+    assert!(
+        sig.contains("enabled: bool") && sig.contains("origin: &str"),
+        "帮手签名要从调用方收 enabled / origin：\n{sig}"
+    );
+    assert_eq!(
+        live.matches("offload_switch()").count(),
+        1,
+        "开关只在 GET 侧读一处（帮手内不回读库）：\n{live}"
+    );
+    assert_eq!(
+        live.matches("offload_switch_has_override()").count(),
+        1,
+        "{live}"
+    );
+
+    // GET：读序仍是先 switch 再 has_override。
+    let sw_at = live.find("offload_switch()").expect("GET 读开关");
+    let ov_at = live
+        .find("offload_switch_has_override()")
+        .expect("GET 读来路");
+    assert!(sw_at < ov_at, "GET 读序 switch → has_override：\n{live}");
+
+    // PUT：写在前、读在后。
+    let set_at = live
+        .find("set_offload_switch(body.enabled)")
+        .expect("PUT 先写开关");
+    let put_readout_at = live
+        .find("readout(&state, body.enabled")
+        .expect("PUT 再拼读数");
+    assert!(set_at < put_readout_at, "PUT 写在前读在后：\n{live}");
+}
+
 /// 两个班次各说各的：消息与页头合计都按班次读，互不污染（决策 204②⑤）。
 #[tokio::test]
 async fn foreman_sessions_isolate_their_own_messages_and_totals() {
