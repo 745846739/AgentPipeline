@@ -732,8 +732,8 @@
           {/if}
           <p class="sec-note">
             免打扰期间除<b>待办</b>之外不出站；失败静音、只累计，时段结束后补一条摘要
-            （等人那条豁免；决策 383 起 <span class="mono">failed</span> 夜间不再恒发，
-            前端 toast 那份表不受影响）；起止填同一个数 = 全天都送，跨零点直接写
+            （等人那条豁免；<span class="mono">failed</span> 夜间不再恒发，前端 toast
+            那份表不受影响）；起止填同一个数 = 全天都送，跨零点直接写
             <span class="mono">22 → 8</span>。按<b>服务器本地时间</b>算。
           </p>
           <div class="acts">
