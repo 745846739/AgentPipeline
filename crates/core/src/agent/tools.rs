@@ -5441,8 +5441,36 @@ mod tests {
         }
     }
 
+    /// 给 tracing 的 callsite interest cache 一个**全局兜底**（票 106-stability/10）。
+    ///
+    /// tracing 的每个日志调用点（callsite）在**进程内第一次发射**时按「当时的派发器
+    /// 状态」缓存一次 interest；本测试二进制没有全局订阅者，scoped（线程局部）订阅者
+    /// 又只在**持有它的那个线程**上可见——满载并行跑 752 个测试时，某个 callsite 的
+    /// 首次发射恰好落在没有 scoped 订阅者的线程/时刻，interest 被缓存成 `never`，
+    /// 此后**全进程**在该调用点上的事件在宏层被静默丢弃，直到下次重建。实测签名：
+    /// 两条「工具调用开始」在缓冲里、「收场」零条（2026-10-04 106 merge 闸门实红 +
+    /// 本机 40 轮 15 红；同窗口的另一个订阅者测试却绿——各 callsite 的注册时刻互不相干）。
+    ///
+    /// 这里一次性装一个 writer 为 sink（事件全丢）的全局订阅者：全局注册者一旦存在，
+    /// 所有 callsite 的注册与重建都只会算出 `always`，注册竞态从此不可达；而派发侧
+    /// scoped 订阅者仍然优先（`get_default` 先看线程局部），本组测试的捕获语义不变。
+    /// 全局兜底只付「事件格式化后丢进 sink」的格式化成本，无行为影响。
+    fn warm_interest_cache() {
+        static ONCE: std::sync::Once = std::sync::Once::new();
+        ONCE.call_once(|| {
+            let _ = tracing::subscriber::set_global_default(
+                tracing_subscriber::fmt()
+                    .with_max_level(tracing::Level::INFO)
+                    .with_ansi(false)
+                    .with_writer(std::io::sink)
+                    .finish(),
+            );
+        });
+    }
+
     #[tokio::test]
     async fn every_tool_call_leaves_start_and_end_lines_in_the_log_stream() {
+        warm_interest_cache();
         let s = setup(Stage::Develop);
         let buf = LogBuf::default();
         let writer_buf = buf.clone();
@@ -5536,6 +5564,7 @@ mod tests {
 
     #[tokio::test]
     async fn failing_tool_still_leaves_an_end_line_with_the_error() {
+        warm_interest_cache();
         let s = setup(Stage::Develop);
         let buf = LogBuf::default();
         let writer_buf = buf.clone();

@@ -477,6 +477,86 @@ pub fn compact_messages_from(
     }
 }
 
+/// 出口消毒的读数：两类配对残缺各记一笔（降级要被说出来）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct SanitizeStats {
+    /// 被摘除的孤儿 tool 结果（其 assistant 载体已不在转录里）。
+    pub orphan_results: usize,
+    /// 被摘掉的未回执 tool_call（回执没跟上，挂在 assistant 上同样非法）。
+    pub unanswered_calls: usize,
+}
+
+/// 转录出口的**工具配对消毒**（票 106-stability/09 的兜底层）。
+///
+/// OpenAI 兼容上游对消息序列有一条硬性结构要求：`tool` 消息必须紧跟在带对应
+/// `tool_call_id` 的 assistant 之后，assistant 声明的每个 `tool_call` 都要收到回执。
+/// 违反即整个请求 `HTTP 400 invalid_request_error`——2026-10-04 事故里一次压缩产出
+/// 孤儿 tool 消息，毒转录落库后被后续 attempt 原样重载，该节点此后**每个**请求恒 400。
+///
+/// 压缩器已在切点上对齐轮边界（[`compact_messages_from`]），这里兜的是**一切别的
+/// 生产路径**（续接重载历史毒转录、未来的组装改动）。健康转录零改动（逐条克隆
+/// 等价于原样），因此不影响决策 380 的前缀缓存。
+pub fn sanitize_tool_sequence(messages: &[Message]) -> (Vec<Message>, SanitizeStats) {
+    let mut out: Vec<Message> = Vec::with_capacity(messages.len());
+    let mut stats = SanitizeStats::default();
+    // 上一条 assistant 声明、还没等到回执的 tool_call_id；以及已经回执过的——
+    // 同一 id 的**重复**回执不掐（Anthropic 适配器的合并语义吃的就是这个形状，
+    // 消毒只管「主人是谁」，不管几份回执）。
+    let mut pending: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut answered: std::collections::HashSet<String> = std::collections::HashSet::new();
+
+    // 把 `pending` 里悬空的 call 从 `out` 末尾那条 assistant 上摘掉（它们之间只隔
+    // tool 消息，末尾第一条 assistant 就是 owner）。
+    fn strip_unanswered(
+        out: &mut [Message],
+        pending: &mut std::collections::HashSet<String>,
+        stats: &mut SanitizeStats,
+    ) {
+        if pending.is_empty() {
+            return;
+        }
+        if let Some(owner) = out.iter_mut().rev().find(|m| m.role == Role::Assistant) {
+            let before = owner.tool_calls.len();
+            owner.tool_calls.retain(|c| !pending.contains(&c.id));
+            stats.unanswered_calls += before - owner.tool_calls.len();
+        }
+        pending.clear();
+    }
+
+    for msg in messages {
+        match msg.role {
+            Role::Tool => {
+                let known = msg
+                    .tool_call_id
+                    .as_ref()
+                    .is_some_and(|id| pending.contains(id) || answered.contains(id));
+                if known {
+                    if let Some(id) = &msg.tool_call_id {
+                        if pending.remove(id) {
+                            answered.insert(id.clone());
+                        }
+                    }
+                    out.push(msg.clone());
+                } else {
+                    stats.orphan_results += 1;
+                }
+            }
+            Role::Assistant => {
+                strip_unanswered(&mut out, &mut pending, &mut stats);
+                pending.extend(msg.tool_calls.iter().map(|c| c.id.clone()));
+                out.push(msg.clone());
+            }
+            // user / system 打断配对 run：悬空的 call 不可能再有回执了。
+            _ => {
+                strip_unanswered(&mut out, &mut pending, &mut stats);
+                out.push(msg.clone());
+            }
+        }
+    }
+    strip_unanswered(&mut out, &mut pending, &mut stats);
+    (out, stats)
+}
+
 /// 单条消息的规则化摘要（压缩规则表逐行实现）。
 fn summarize_message(
     msg: &Message,
@@ -839,6 +919,131 @@ mod tests {
             .messages
             .iter()
             .any(|m| m.content.as_deref() == Some("round 0")));
+    }
+
+    /// 切点必须对齐到**轮边界**（票 106-stability/09 的根因用例）：`keep_recent_rounds`
+    /// 按条数算出的切点落在 tool 结果上时，kept 转录会以孤儿 tool 消息开头——主人
+    /// assistant 已被压成摘要，OpenAI 兼容上游对这种序列整请求拒收（HTTP 400
+    /// invalid_request_error，2026-10-04 事故：毒转录落库后被后续 attempt 重载，
+    /// 节点此后每个请求恒 400、重试耗尽）。钉住：切点回退到 owning assistant，
+    /// 压缩器的产出**生来干净**（出口消毒对它是零操作）。
+    #[test]
+    fn l3_keep_cut_snaps_back_to_the_tool_call_owner() {
+        let mut messages = vec![Message::system("sys"), Message::user("task")];
+        for i in 0..6 {
+            let call = ToolCall {
+                id: format!("call{i}"),
+                name: "write_file".into(),
+                arguments: format!(r#"{{"path":"notes-{i}.md","content":"x"}}"#),
+            };
+            messages.extend(round(call, &format!("result-{i}")));
+        }
+        // len=14，keep=5 → 裸切点 9 正落在第 3 轮的 tool 结果上（事故的骰子面）。
+        assert_eq!(messages.len() - 5, 9);
+        assert_eq!(messages[9].role, Role::Tool);
+
+        let out = compact_messages(&messages, 5);
+        let first_body = out
+            .messages
+            .iter()
+            .position(|m| !matches!(m.role, Role::System | Role::User))
+            .unwrap();
+        assert_eq!(
+            out.messages[first_body].role,
+            Role::Assistant,
+            "kept 不得以孤儿 tool 消息开头：{:?}",
+            out.messages
+        );
+        // 回退到的是 owner：它的 call 与回执同在转录里
+        assert!(out
+            .messages
+            .iter()
+            .any(|m| m.tool_calls.iter().any(|c| c.id == "call3")));
+        assert!(out
+            .messages
+            .iter()
+            .any(|m| m.tool_call_id.as_deref() == Some("call3")));
+        // 更早的轮次照旧被压缩
+        assert!(!out
+            .messages
+            .iter()
+            .any(|m| m.tool_call_id.as_deref() == Some("call0")));
+        // 产出生来干净：出口消毒对它是零操作
+        let (clean, stats) = sanitize_tool_sequence(&out.messages);
+        assert_eq!(stats, SanitizeStats::default());
+        assert_eq!(clean, out.messages);
+    }
+
+    /// 出口消毒三面：孤儿 tool 结果摘除、未回执的 tool_call 摘除、健康转录零改动。
+    #[test]
+    fn sanitize_drops_orphans_and_strips_unanswered_calls() {
+        let c1 = ToolCall {
+            id: "c1".into(),
+            name: "read_file".into(),
+            arguments: "{}".into(),
+        };
+        let c2 = ToolCall {
+            id: "c2".into(),
+            name: "run_command".into(),
+            arguments: "{}".into(),
+        };
+        let stray = ToolCall {
+            id: "stray".into(),
+            name: "read_file".into(),
+            arguments: "{}".into(),
+        };
+        // 孤儿结果（头尾各一）+ c2 的回执缺席（user 打断了配对 run）
+        let messages = vec![
+            Message::tool_result(&stray, "孤儿"),
+            Message::assistant(None, vec![c1.clone(), c2.clone()]),
+            Message::tool_result(&c1, "c1 的回执"),
+            Message::user("打断"),
+            Message::tool_result(&stray, "另一条孤儿"),
+        ];
+        let (out, stats) = sanitize_tool_sequence(&messages);
+        assert_eq!(
+            stats,
+            SanitizeStats {
+                orphan_results: 2,
+                unanswered_calls: 1,
+            }
+        );
+        assert_eq!(out.len(), 3, "assistant + c1 回执 + user");
+        let owner = &out[0];
+        assert_eq!(owner.tool_calls.len(), 1, "悬空的 c2 被摘掉");
+        assert_eq!(owner.tool_calls[0].id, "c1");
+        // 转录末尾悬空的 call 同样摘（崩在半轮的形状）
+        let tail = vec![Message::assistant(None, vec![stray.clone()])];
+        let (out, stats) = sanitize_tool_sequence(&tail);
+        assert_eq!(stats.unanswered_calls, 1);
+        assert!(out[0].tool_calls.is_empty());
+    }
+
+    #[test]
+    fn sanitize_leaves_healthy_transcripts_untouched() {
+        let c1 = ToolCall {
+            id: "c1".into(),
+            name: "write_file".into(),
+            arguments: "{}".into(),
+        };
+        let messages = vec![
+            Message::user("task"),
+            Message::assistant(Some("想一下".into()), vec![c1.clone()]),
+            Message::tool_result(&c1, "写好了"),
+            Message::assistant(Some("收口".into()), vec![]),
+        ];
+        let (out, stats) = sanitize_tool_sequence(&messages);
+        assert_eq!(stats, SanitizeStats::default());
+        assert_eq!(out, messages, "健康转录零改动（前缀缓存的前提）");
+        // 同一 id 的重复回执不掐（Anthropic 适配器的合并语义吃这个形状）
+        let duplicated = vec![
+            Message::assistant(None, vec![c1.clone()]),
+            Message::tool_result(&c1, "第一份"),
+            Message::tool_result(&c1, "第二份"),
+        ];
+        let (out, stats) = sanitize_tool_sequence(&duplicated);
+        assert_eq!(stats, SanitizeStats::default());
+        assert_eq!(out, duplicated);
     }
 
     #[test]

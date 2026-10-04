@@ -33,9 +33,21 @@ impl Adapter for Anthropic {
     }
 
     fn build_body(&self, provider: &Provider, request: &LlmRequest) -> Result<serde_json::Value> {
+        // 出口消毒（票 106-stability/09）：与 openai 适配器同一条纪律——孤儿 tool 消息
+        // 的序列到不了 wire。健康转录零改动，不碰前缀缓存。
+        let (messages, stats) = crate::agent::context::sanitize_tool_sequence(&request.messages);
+        if stats.orphan_results > 0 || stats.unanswered_calls > 0 {
+            tracing::warn!(
+                orphan_results = stats.orphan_results,
+                unanswered_calls = stats.unanswered_calls,
+                stage = %request.stage,
+                node = %request.node,
+                "转录里有配对不完整的工具消息，已在出口摘除（孤儿 tool 消息会被 provider 拒收）"
+            );
+        }
         // 会话内的 system 消息并入顶层 system（协议不允许 messages 里出现 system）
         let mut system_parts = vec![request.system_prompt.clone()];
-        for m in &request.messages {
+        for m in &messages {
             if m.role == Role::System {
                 if let Some(c) = &m.content {
                     system_parts.push(c.clone());
@@ -54,7 +66,7 @@ impl Adapter for Anthropic {
         }
         let system = serde_json::Value::Array(system);
 
-        let mut wire = wire_messages(&request.messages)?;
+        let mut wire = wire_messages(&messages)?;
         // 空 user_prompt 不占 wire 头（值班长主轮的快照并进末尾轮之后就是这个形状）：
         // 空 user 消息是无效报文（Anthropic 拒收空文本块），也白吃一段前缀。
         if !request.user_prompt.is_empty() {

@@ -35,7 +35,20 @@ impl Adapter for OpenAiCompatible {
         if !request.user_prompt.is_empty() {
             messages.push(serde_json::json!({"role": "user", "content": request.user_prompt}));
         }
-        for m in &request.messages {
+        // 出口消毒（票 106-stability/09）：孤儿 tool 消息会被 OpenAI 兼容上游整请求拒收
+        // （HTTP 400 invalid_request_error）。压缩器已在切点上对齐轮边界，这里兜一切别的
+        // 生产路径（续接重载的毒转录等）；健康转录零改动，不碰前缀缓存。
+        let (sanitized, stats) = crate::agent::context::sanitize_tool_sequence(&request.messages);
+        if stats.orphan_results > 0 || stats.unanswered_calls > 0 {
+            tracing::warn!(
+                orphan_results = stats.orphan_results,
+                unanswered_calls = stats.unanswered_calls,
+                stage = %request.stage,
+                node = %request.node,
+                "转录里有配对不完整的工具消息，已在出口摘除（孤儿 tool 结果会被 provider 拒收）"
+            );
+        }
+        for m in &sanitized {
             messages.push(wire_message(m)?);
         }
 
@@ -206,6 +219,72 @@ mod tests {
             provider_id: None,
             run: None,
             idle_timeout_sec: None,
+        }
+    }
+
+    /// 票 106-stability/09：孤儿 tool 消息到不了 wire——OpenAI 兼容上游对
+    /// 「tool 消息找不到带对应 tool_call_id 的前置 assistant」的序列整请求拒收
+    /// （HTTP 400 invalid_request_error，2026-10-04 事故的形状：一次压缩产出毒转录，
+    /// 落库后被后续 attempt 原样重载，该节点此后每个请求恒 400）。压缩器在切点上
+    /// 对齐轮边界之后，这里兜住一切别的生产路径（续接重载的毒转录等）。
+    #[test]
+    fn orphan_tool_results_never_reach_the_wire() {
+        let owned = ToolCall {
+            id: "call_1".into(),
+            name: "read_file".into(),
+            arguments: r#"{"path":"a.md"}"#.into(),
+        };
+        let stray = ToolCall {
+            id: "call_X".into(),
+            name: "read_file".into(),
+            arguments: "{}".into(),
+        };
+        let messages = vec![
+            // 主人已被压成摘要的孤儿 tool 结果（事故落库转录的形状，转录以 tool 开头）
+            Message::tool_result(&stray, "孤儿结果"),
+            Message::assistant(None, vec![owned.clone()]),
+            Message::tool_result(&owned, "{\"success\":true}"),
+            // user 打断之后跟来的 tool 结果同样是孤儿
+            Message::user("下一轮"),
+            Message::tool_result(&stray, "另一条孤儿"),
+        ];
+        let body = OpenAiCompatible
+            .build_body(
+                &fixture_provider("openai", "gpt-test", Some("http://127.0.0.1:1")),
+                &request(messages),
+            )
+            .unwrap();
+        let msgs = body["messages"].as_array().unwrap();
+        assert_eq!(
+            msgs.len(),
+            5,
+            "system+user 头 + assistant+tool+user：两条孤儿被摘，健康的往返原样"
+        );
+        // wire 合法性即上游的结构契约：每条 tool 消息都能在前置 assistant 的
+        // tool_calls 里找到自己的 id，且不被 user / system 打断。
+        let mut pending: Vec<String> = Vec::new();
+        for m in msgs {
+            match m["role"].as_str().unwrap() {
+                "assistant" => {
+                    pending = m["tool_calls"]
+                        .as_array()
+                        .map(|a| {
+                            a.iter()
+                                .filter_map(|c| c["id"].as_str().map(String::from))
+                                .collect()
+                        })
+                        .unwrap_or_default();
+                }
+                "tool" => {
+                    let id = m["tool_call_id"].as_str().unwrap();
+                    assert!(
+                        pending.iter().any(|p| p == id),
+                        "孤儿 tool 消息到了 wire：tool_call_id={id}"
+                    );
+                    pending.retain(|p| p != id);
+                }
+                _ => pending.clear(),
+            }
         }
     }
 

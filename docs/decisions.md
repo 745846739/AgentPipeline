@@ -2320,3 +2320,31 @@ playwright 冒烟跑**真 axum 后端 + FakeAgent**（`AGENTPIPELINE_HOME` 指�
 **验证**：core 单测（`failed_goes_quiet_at_night_but_stays_loud_by_day`、摘要报文三格式）+ 集成测试（webhook：压下→摘要一条→重复补发不重发、摘要不占槽、无压下不补发；webpush：摘要落手机、url = `#/`；foreman 线：机会车随回话出站）；共享表两侧守卫互钉。
 
 **来源**：用户（2026-10-04 报 bug 后在「夜间失败静音、早 6 点补摘要」等三个方向里选定本方案）；证据 `kanban_foreman_attention` 台账（10-03 夜 43 条免打扰段内事件）、库 `kanban_notify_channel` 落库值与 106 journal。
+
+### 决策 384 · 压缩切点对齐轮边界 + 转录出口消毒：孤儿 tool 消息不再撞穿 provider（票 106-stability/09）
+
+**起因**：2026-10-04 任务 01M40NEDA0… 的 review/test 与 01M428HPK… 的 test 连环 `HTTP 400 invalid_request_error`、重试耗尽、人工 skip 三次（决策 382 在案）。票面四个候选（判据没走到 / 缺省偏宽 / 压缩回撑 / 软限未触发）经 106 库逐请求核对**全不成立**：决策 378 的硬底走到了也压了——成功请求全程被压在 80–90k tokens。真根因在压缩的**产出**：`compact_messages_from` 的 keep 窗口按**消息条数**切（`len - keep_recent_rounds`，注释说的是「轮」），而工具往返一轮至少两条（assistant 载体 + tool 结果）——切点落在 tool 结果上时，kept 转录以**孤儿 tool 消息**开头（主人 assistant 已被压成摘要）。OpenAI 兼容上游对消息序列有硬性结构要求（tool 消息必须紧跟带对应 `tool_call_id` 的 assistant），违反即整请求 400；网关回文无任何 context/length 字样，`is_context_window` 认不出也无妨——这不是体量问题。**证据链**：run 209 seq 38（ok，85k tokens）→ 27 秒后 seq 39–41 恒 400（其间恰有一次压缩）；attempt 3/4 的 seq 1–3 **第一发就 400**（毒转录落库后原样重载，决策 278 的续接把毒一起接走）；run 220 落库转录 6 条消息、第 1 条 role=tool（直接铁证）。决策 378 的集成用例看不见这个洞，因为 FakeAgent 不校验序列合法性——**替身不替的部分要用断言补上**。
+
+**裁决 ①（压缩器切点对齐轮边界）**：`keep_from` 落在 tool 结果上时回退到 owning assistant（工具结果在转录里紧跟其载体，回退到第一条非 tool 消息即是它）——压缩产出**生来干净**，单轮不可分割是诚实的极限（一轮再大也只能整轮保留）。
+
+**裁决 ②（出口消毒兜底）**：新 `sanitize_tool_sequence`（`agent/context.rs`）——孤儿 tool 结果摘除、未回执的 tool_call 摘除（配对 run 被 user/system 打断或转录止于半轮）、**健康转录零改动**（逐条等价，决策 380 的前缀缓存不受影响）；接在 provider 适配器出口（`openai.rs` / `anthropic.rs` 两个 `build_body`）——**一切调用方的执行点**（决策 172③「边界落在执行点」的外延），流水线 / 值班长 / 子代理一并覆盖，摘除时 WARN 留痕。它的真正价值在**已中毒的历史库**：续接重载的毒转录到不了 provider，节点自愈，不需要人清库。
+
+**明确不做**：不给 `is_context_window` 扩词表去猜网关的 400（猜错会把真配置错误静默掉；体量路径本来就有撞窗自校准管着）；不改 `keep_recent_rounds` 语义与 `conversation_max_chars` 缺省（它们无罪）；不在 FakeAgent 里做序列校验（校验钉在集成用例的断言里，替身保持哑）。
+
+**验证**：单测四条（`l3_keep_cut_snaps_back_to_the_tool_call_owner`——裸切点 9 正落 tool 结果的事故骰子面；`sanitize_drops_orphans_and_strips_unanswered_calls`；`sanitize_leaves_healthy_transcripts_untouched`；`orphan_tool_results_never_reach_the_wire`——毒转录到不了 wire）；集成用例 `a_long_tool_round_trip_node_is_capped_by_the_char_floor` 增加逐请求 wire 合法性断言（60 轮工具往返 = 事故负载形状；撤掉修复即红，「孤儿 tool 消息进了请求」）；全仓 `cargo test --workspace` 绿。
+
+**来源**：用户（2026-10-04 `$implement` 开工票 09）；决策 378（硬底与锚点）、278（续接转录）、380（前缀缓存约束）、295/309/378④（撞窗自校准——本票证明它管不住非体量 400）；证据 106 库 `kanban_model_requests` 逐请求读数 + `kanban_node_conversations` 落库转录；落地票 `.scratch/106-stability/issues/09-provider-400-context-overflow.md`
+
+### 决策 385 · 日志收场行 flake 根因：tracing callsite interest 缓存的注册竞态，捕获层装全局兜底（票 106-stability/10）
+
+**起因**：2026-10-04 merge 闸门实红（01M428HPK…，746 条里唯一红）——`every_tool_call_leaves_start_and_end_lines_in_the_log_stream` 缓冲里两条「工具调用开始」、零条「收场」，而两次 `execute` 都已 await 返回。票面两个候选方向（改等待形状 / 改发射路径）经实证**都不成立**：发射路径无罪——开始/收场都在 `execute` 内同一 await 上下文同步发射（`agent/tools.rs` 的 execute 尾部，无 spawn、无 select、无早退）；「等待收场行到场」也无效——事件是**被丢弃，不是迟到**。真凶在捕获层：tracing 的每个 callsite 在**进程内第一次发射**时按当时的派发器状态缓存一次 interest（`tracing-core` 的 `DefaultCallsite::register` → `get_default`），本测试二进制从未设全局订阅者，`set_default` 的 scoped 订阅者只在持有它的线程可见——752 个测试并行满载时，收场行的 callsite 首次发射恰好落在无 scoped 订阅者的线程/时刻，interest 被缓存成 `never`，此后**全进程**该调用点的事件在宏层（`!interest.is_never()`）被静默丢弃。
+
+**证据**：本地满载复现——`cargo test --lib -- --test-threads=2` 全量 40 轮 **15 红（37%）**，全部红在同一条断言、缓冲恰是「2 开始 0 收场」；同窗口另一个订阅者测试（`failing_tool_still_leaves…`）却全绿——每个 callsite 的注册时刻互不相干，逐 callsite 翻面，与「收场比开始晚到」的时序解释判然有别。106 孤立复现 25 轮全绿（3.9s 快跑、2 线程装载不满），红跑那次恰逢 clippy 指纹重建后的整树重编（8 分钟 vs 绿跑 1.8 分钟）——满载是触发条件不是根因。与决策 342⑦ 同族不同机制：那次是连接层「迟到被当失败」，这次是宏层「丢弃」。
+
+**裁决（捕获层装全局兜底）**：测试模块加 `warm_interest_cache()`——Once 一次性 `set_global_default` 一个 writer 为 **sink**（事件全丢）的 fmt 订阅者。全局注册者一旦存在，所有 callsite 的注册与重建都只会算出 `always`（`register_dispatch` 之后走 `LOCKED_DISPATCHERS`，不再经线程局部的 `get_default`），注册竞态从此**不可达**；而派发侧 scoped 订阅者仍优先（`get_default` 先看线程局部，`SCOPED_COUNT > 0` 即走线程局部），两个订阅者测试的捕获语义一字不变。**不**放宽成对断言本身（票据红线）；**不**改用轮询等待（丢弃等不来）；**不**在发射路径加代码（发射无罪）。
+
+**明确不做**：不修 tracing（上游的 interest 缓存设计如此，scoped 订阅者与并行测试的组合是它的已知暗角，测试侧一个 sink 兜底是诚实且最小的收口）；不给等待加时窗（把丢弃误当迟到会掩盖下一次真回归）；不在生产代码路径动一行（这只在测试二进制里存在）。
+
+**验证**：修复后同口径满载循环 40 轮 **0 红**（修复前同口径 15/40）；`every_tool` / `failing_tool` 两条订阅者测试单跑仍绿；全仓测试绿（sink 只付格式化成本，单轮耗时在波动内持平）。
+
+**来源**：用户（2026-10-04 `$implement` 开工票 10）；决策 342⑦（同族对照）、302（阻塞池嫌疑排除的对照）；证据 106 `kanban_node_commands`（4809：`cargo test --quiet` 8 分钟红跑紧接 clippy 整树重编）+ 本地 40 轮复现记录；落地票 `.scratch/106-stability/issues/10-tool-log-end-line-flake.md`

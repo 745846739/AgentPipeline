@@ -1608,6 +1608,45 @@ async fn a_long_tool_round_trip_node_is_capped_by_the_char_floor() {
         assert!(summaries <= 1, "摘要至多一条，得到 {summaries}");
     }
 
+    // 票 106-stability/09：每个请求的转录必须 **wire 合法**——tool 消息的
+    // tool_call_id 必须能在前置 assistant 的 tool_calls 里找到，assistant 声明的
+    // call 必须在下一个非 tool 消息之前收到回执。违反即 OpenAI 兼容上游整请求
+    // 400（2026-10-04 事故：压缩切点落在 tool 结果上→孤儿 tool 消息→毒转录
+    // 落库重载→该节点此后每个请求恒 400、重试耗尽）。FakeAgent 不做这个校验，
+    // 这里替它做——本用例的 60 轮工具往返正是当时的负载形状。
+    for r in &requests {
+        let mut pending: std::collections::HashSet<&str> = std::collections::HashSet::new();
+        for m in &r.messages {
+            match m.role {
+                agentpipeline_core::agent::client::Role::Assistant => {
+                    pending = m.tool_calls.iter().map(|c| c.id.as_str()).collect();
+                }
+                agentpipeline_core::agent::client::Role::Tool => {
+                    assert!(
+                        m.tool_call_id
+                            .as_deref()
+                            .is_some_and(|id| pending.contains(id)),
+                        "孤儿 tool 消息进了请求（tool_call_id={:?}）：{}.{}/attempt {}",
+                        m.tool_call_id,
+                        r.stage,
+                        r.node,
+                        r.attempt
+                    );
+                    if let Some(id) = m.tool_call_id.as_deref() {
+                        pending.remove(id);
+                    }
+                }
+                _ => assert!(
+                    pending.is_empty(),
+                    "assistant 的 tool_call 没等到回执就被打断：{}.{}/attempt {}",
+                    r.stage,
+                    r.node,
+                    r.attempt
+                ),
+            }
+        }
+    }
+
     // 体量上界：每个请求压在「硬底 + 可解释余量」内（一轮的参数 ~8 千字符，
     // 余量放宽到 6 轮以容纳 keep 窗口与摘要的形状差）。
     let per_round = 8_200usize;
