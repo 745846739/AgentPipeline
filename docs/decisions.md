@@ -2290,3 +2290,19 @@ playwright 冒烟跑**真 axum 后端 + FakeAgent**（`AGENTPIPELINE_HOME` 指�
 **起因**：runner-offload 线的收口票（决策之外的背景：106 耗时迁移共识见 `.scratch/runner-offload/`，工作流/开关/共享缓存分别落在票 03/04/05）。决策 353 把内置工具钉在 8 个并冻结三处断言，加 `offload_run` 必须显式修订。**裁决 ①（目录与名单）**：`TOOL_SPECS`/`BUILTIN_TOOLS` 8→9（末位追加，逐位冻结断言照旧）；`offload_run` **不进** `ENV_TOOLS`/`ENV_WRITE_TOOLS`（它推的是远端白名单命令，不走环境写层，档位三态不适用于它）；**不进** `MANDATORY_TOOLS`——可用性由设置里的「重活外发」开关管（决策 185 的单行表），广告侧现读开关（`model_request` 组装时追加进声明集），关着 = 广告里根本没有它，模型窗口一个字节不多花。**裁决 ②（deny 档执行点拦截）**：`gate_decision` 对非环境层工具恒 `Execute`，故 `offload_run` 开头自判 `env_mode == Deny` 即拒——「只改广告是纸糊的一半，边界必须落在执行点」（决策 172③ 原话的外延）。**裁决 ③（防注入面与 egress 的关系）**：命令白名单只放行 `cargo test/clippy/build` 前缀的单条命令，组合符/命令替换/重定向/引号/`$` 一概拒；分支名另设形状白名单（字母数字 `._-/`）——分支名要裸拼进 shell 串，git refname 本身允许 shell 特殊字符，不卡形状等于让 `run_command` 造一个带分号的分支绕过出口策略。链路四步（推分支/dispatch/轮询/拉日志）**有意不挂 rtk 改写、不走 egress.check**：外发本身就是这次 push 的出口授权，授权在开关里（开着 + 用户登录过 gh），不在命令字符串匹配里；台账照落（四步全进 `kanban_node_commands`），审计面与本机命令同级。**裁决 ④（对账防脱敏）**：轮询按 `headSha` 前缀 + `createdAt > dispatch` 双重对账——40 位 hex 会被决策 118 的长 base64 正则打码（实测发生过：轮询输出里的 `headSha` 变 `***`，对账永远不中），故在 jq 里截短到 12 位再出输出层；只认 dispatch 之后创建的 run，同一 commit 重复外发（重试 flaky）不得误收上一轮的收场记录。**裁决 ⑤（降级语义）**：外发**链路**失败（凭据/排队超时/拉取失败）→ WARN + 本机重跑（显式 1800s）+ 回执写明「已回退本机」；**远端命令本身失败**（conclusion=failure）只回退出码与日志尾部、不回退——本地重跑一次注定同红的测试是白烧 1800 秒。留痕三处是 WARN、回执文本（进转录，任务可见）、命令台账；设置页探测显红（最近一次链路失败读数）**未做**，立票 runner-offload/08 承接。**明确不做**：不做结果产物回传（共识：只取文本）；不做并发外发（agent 循环串行，工作流 concurrency 按分支 cancel-in-progress 兜底）；白名单不做成配置（是防注入面不是偏好，配置面上多一个旋钮就多一处漂移）。**验证**：17 个用例——白名单正反例、分支名白名单、开关关拒绝、deny 档拒绝（开关开着）、脏工作区拒绝、happy path（含 dispatch argv 逐词落盘断言与台账四步断言）、dispatch 失败回退、远端跑红不回退、排队超时回退、陈旧 run 不误收（假 gh 只给上一轮 completed 记录）；全仓 `cargo test --workspace` 绿。
 
 **来源**：用户（2026-10-03 `$implement` 开工票 runner-offload/06）；决策 353（目录表原状）、185/297（开关与降级纪律）、118（脱敏误伤的规避依据）、179（egress 闸的对照）；落地票 `.scratch/runner-offload/issues/06-offload-run-tool.md`
+
+### 决策 382 · 外发范围修订：e2e 纳入外发（第二期）；agent 自发外发的现实解是描述点名、中期出路是闸门级外发（票 runner-offload/07）
+
+**起因**：票 runner-offload/07 的决策点——「e2e 是否纳入外发」与「agent 自发外发为何没发生」。证据三份：(a) 2026-10-02 任务 01M3X…：e2e 走查 ≈1.3h，是 106 最大的可外发确定性负载；(b) 2026-10-04 基线 `.scratch/runner-offload/baseline-01M40NEDA0.md`：任务 01M40NEDA0… 的 develop 工具时间 **54 分钟**，几乎全为本机 cargo test/clippy 重跑；(c) 真实链路验收（任务 01M428HPK…）：offload 全链路 **52.5 秒** round-trip（push → dispatch → runner 上 clippy 1m46s 跑绿 → 对账 → 日志尾部回读），混合模式一期成立——且验收本身抓出 dispatch 缺 `--ref` 的真 bug（e153e75）。**采纳性发现**：任务 01M40NEDA0… 全程零调用——develop 轮内工作区恒带未提交改动（本流水线的提交发生在 merge 阶段），offload_run 的 dirty 闸门（设计如此）结构性挡住唯一的高价值时刻，「树干净 + 还要跑重活」的自然窗口在现有流程里不存在；而操作员在任务描述里点名后，architect 轮第一轮就走通全链路——描述通道的采纳率可靠。
+
+**裁决 ①（e2e 纳入，第二期）**：e2e（playwright + 真服务 + 真浏览器）纳入外发范围——它是最大的确定性负载、runner 上能跑、一期链路已验。两条前置：命令白名单扩展（`UX_AUDIT=1 … playwright test`、`bash scripts/e2e-artifacts.sh` 前缀 + 各自的防注入面审查，决策 381③ 的纪律照走）；产物改走 GitHub artifact 留存 + 摘要/URL 文本回读（「截图产物不回传」的共识不变，runner → 106 实测 ~197KB/s 是这条共识的事实依据）。立票 runner-offload/09 承接。
+
+**裁决 ②（agent 自发外发的现实解）**：短期——操作员在任务描述里点名（采纳证据如上），并把「有全量重活先提交再外发」写进任务描述作为推荐实践；中期——**闸门级外发**：develop/test 的 `validate_output` 闸门是确定性代码、工作树已提交、跑的恰是分钟级全量，是外发的天然窗口，把闸门的 cargo 命令改走 offload 链路（链路失败回退本机闸门，语义与决策 381⑤ 同构），另立票承接。**不**改 develop 阶段提示词教 agent 中途提交——提交时机会波及 repair/diff/review 的语义面，行为改动过宽，不为采纳率 drive-by。
+
+**裁决 ③（dirty 闸门不动）**：「只外发已提交状态」的前提不放宽（决策 381①）——静默快照脏工作区等于「验证的不是你以为的那份代码」。
+
+**明确不做**：不为采纳率把 offload_run 提进 MANDATORY_TOOLS（可用性归开关的裁决不动）；不做任务描述的自动注入（描述是操作员的通道，不是系统的）。
+
+**验证**：票 06 补记二、`.scratch/runner-offload/baseline-01M40NEDA0.md`、GitHub run 37170070983 / 37168358026；`--ref` 修复随 e153e75 部署并复跑通过。
+
+**来源**：用户（2026-10-04「已打开开关」+ `$implement` 执行真实链路验收）；决策 381（一期边界）；证据 `baseline-01M40NEDA0.md`；落地票 `.scratch/runner-offload/issues/07-attribution-and-scope-revision.md`、立票 `09-e2e-offload.md`
