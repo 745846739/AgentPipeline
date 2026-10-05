@@ -4,7 +4,7 @@
 
 **来源:** A/ux-audit-2 票 [18](../ux-audit-2/issues/18-detail-midband-fold.md)（2026-10-01 以 **wontfix** 关闭）
 
-**出处:** `frontend/src/routes/TaskDetail.svelte:662-666,948`；`[r3] ①.1`；截图 `r3-detail-768.png` / `r3-detail-480.png`
+**出处:** `frontend/src/routes/TaskDetail.svelte:662-666`；`frontend/src/components/pipeline/PipelineRail.svelte:340-344`；`[r3] ①.1`；截图 `r3-detail-768.png` / `r3-detail-480.png`
 
 **严重度:** 中（480–819px 整页横向滚动，用户可见的版面破相；不丢数据）
 
@@ -23,9 +23,10 @@
 
 源码（本次实地读到）：`frontend/src/routes/TaskDetail.svelte:662-666` 的 `.detail.split`
 只有一条 `grid-template-columns: minmax(0, 1fr) 320px`，**没有 820–1099 的 280px 档、
-也没有 <820 的单列档**——票 18 要的就是这两档。`hero` 的 `overflow-x: auto`
-只写在 `:948`，且处 `@media (max-width: 479px)` 内，故 **480–819 区间 hero 一直是
-`overflow-x: visible`**（`[r3]` 逐档读出），把整页撑出横向滚动。
+也没有 <820 的单列档**——票 18 要的就是这两档。hero 轨（`frontend/src/components/pipeline/PipelineRail.svelte:340-344` 的 `.rail.hero`）
+**没有任何 `overflow-x` 规则**——所有视口下都是默认 `visible`（初稿把 `TaskDetail.svelte:948`
+的 `.tabs` 页签横滚误记成 hero 的 `auto`，已按评审订正），故 **480–819 区间整页被 hero
+撑出横向滚动**（`[r3]` 逐档读出）。
 
 结论：**有意不做（wontfix：2026-10-01 用户裁决收掉，本轮只记现状核实，未重开；无回归）**。与第二轮 `[r2] ①.4` 逐格同值
 （820→12、768→64、600→232、520→312、480→352），说明第二轮收口后这一档没被动过。
@@ -33,7 +34,7 @@ wontfix 的复开口径（票面：「如真实使用在 480–819px 再疼，�
 ——本轮**不**满足「更坏」，故按「现状核实」记，不重开。
 
 **证据等级:** 实测（`[r3] ①.1` 数字 + 截图 `r3-detail-768.png` / `r3-detail-480.png`）
-+ 代码（`TaskDetail.svelte:662-666,948`）
++ 代码（`TaskDetail.svelte:662-666`；`frontend/src/components/pipeline/PipelineRail.svelte:340-344`）
 
 **与前轮关联:** 现状核实（=前轮 18，wontfix；第二轮的取证点原样复现，未回归）
 

@@ -146,10 +146,8 @@ test.describe('① 复核：中间档折行（票 18 详情 / 票 19 对讲台�
       const m = await page.evaluate(() => {
         const talk = document.querySelector('.talk') as HTMLElement | null;
         const side = document.querySelector('.talk-side') as HTMLElement | null;
-        const main = document.querySelector('.talk-main') as HTMLElement | null;
         return {
           cols: talk ? getComputedStyle(talk).gridTemplateColumns : null,
-          mainW: main ? Math.round(main.getBoundingClientRect().width) : null,
           sideW: side ? Math.round(side.getBoundingClientRect().width) : null,
           pageOverflow: document.documentElement.scrollWidth - document.documentElement.clientWidth,
         };
@@ -302,6 +300,7 @@ test.describe('③ 复核：中流状态持久化（票 22 余三件）', () => 
 
   /** ② 看板过滤 ?filter=：设过滤 → 刷新后是否还是该过滤（票 22 余项二）。 */
   test('③.2 看板过滤刷新留存', async ({ page }) => {
+    const guard = watchBundle(page);
     await go(page, 1440, 1100);
     await open(page, app, '#/');
     await setTheme(page, 'dark');
@@ -329,10 +328,12 @@ test.describe('③ 复核：中流状态持久化（票 22 余三件）', () => 
     }));
     log('③.2 看板过滤刷新', { before, after });
     await shot(page, 'r3-board-filter-after-reload');
+    expectBundleHealthy(guard);
   });
 
   /** ③ 对讲台输入草稿 talk_draft：输入半句 → 刷新 → 是否还在（票 22 余项三）。 */
   test('③.3 对讲台草稿刷新留存', async ({ page }) => {
+    const guard = watchBundle(page);
     await go(page, 1440, 1100);
     await open(page, app, '#/talk');
     await setTheme(page, 'dark');
@@ -363,6 +364,7 @@ test.describe('③ 复核：中流状态持久化（票 22 余三件）', () => 
       after,
     });
     await shot(page, 'r3-talk-draft-after-reload');
+    expectBundleHealthy(guard);
   });
 });
 
@@ -561,9 +563,12 @@ test.describe('⑤ 复核：toast 键盘关闭与字面星号', () => {
       await setTheme(page, 'dark');
       const found = await page.evaluate(() => {
         const t = document.body.innerText;
+        // 字面 Markdown 粗体 `**x**` 才算缺陷；`***`（通知 token 的掩码）是有意设计，
+        // `\*\*[^*]+\*\*` 对它不命中（评审订正：初稿 includes('**') 把掩码误报成缺陷）
+        const mdBold = /\*\*[^*]+\*\*/;
         const hits = t
           .split('\n')
-          .filter((l) => l.includes('**'))
+          .filter((l) => mdBold.test(l))
           .map((l) => l.trim().slice(0, 80));
         return { count: hits.length, hits };
       });

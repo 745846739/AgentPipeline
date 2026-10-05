@@ -1,7 +1,7 @@
 # AgentPipeline 前端 UI/UX 审计（第三轮 · 复核 + 漂移面）
 
 **Status:** done（骨架 13 条候选全部核实并回填；C 组现场追加 0 条——走查当场发现的新问题
-（设置页字面星号）并入票 [08](issues/08-settings-notify-page.md) 记「回归」，未另立编号）
+（设置页字面星号）并入票 [08](issues/08-settings-notify-page.md) 记「新开（同型）」，未另立编号）
 
 **日期:** 2026-10-04　**被测:** 本工作树代码 commit `1f3db53`
 （二进制 `/root/.agentpipeline/shared-target/debug/agent-pipeline`，2026-10-05 11:25 构建；
@@ -69,7 +69,7 @@
 | [05](issues/05-toast-keyboard-close-status.md) | toast 的键盘关闭路径（票 17 明写「没做」的子项） | 现状核实（=17 子项） | 代码（运行时未验证） | **部分已修**（有关闭钮、缺 Escape） |
 | [06](issues/06-round1-bstack-status.md) | 第一轮 B 叠实现票是否真落（决策 201 类历史坑） | 现状核实（=第一轮 B 叠） | 代码 | **已修**（无悬空） |
 | [07](issues/07-settings-tools-page.md) | 命令执行设置页（漂移面）可达性与语义 | 新开 | 实测 + 代码 | **新开（无缺陷）** |
-| [08](issues/08-settings-notify-page.md) | 离线通知设置页（漂移面）——兼字面星号回归 | 回归（票 15 ③ 同型）+ 新开 | 实测 + 代码 | **回归** |
+| [08](issues/08-settings-notify-page.md) | 离线通知设置页（漂移面）——兼字面星号同型新开 | 新开（票 15 ③ 同型，Talk 侧已修） | 实测 + 代码 | **新开（同型）** |
 | [09](issues/09-settings-foreman-page.md) | 值守轮设置页（漂移面）可达性与语义 | 新开 | 实测 + 代码 | **新开（无缺陷）** |
 | [10](issues/10-board-props-bar.md) | 看板顶部道具栏（过滤槽 / 待处理 / 新建）语义与计数 | 新开 | 实测 + 代码 | **新开（无缺陷）** |
 | [11](issues/11-wordmark-and-entry-consolidation.md) | 决策 240 入口归一：wordmark 去链、看板回根路由 | 新开 | 实测 + 代码 | **已修** |
@@ -77,7 +77,7 @@
 | [13](issues/13-fold-band-215-218.md) | 决策 215/218 折行档版面（详情页 820–1099 / 对讲台 900–1099） | 新开 | 实测 + 代码 | **对讲台侧已修 / 详情页侧未落** |
 
 > C 组（`14` 起）**本轮 0 条**：走查当场看到的唯一新问题（设置页字面 `**` 星号）与票
-> [08](issues/08-settings-notify-page.md) 同源，已并入该票记「回归」，不另立编号（R1：只证实/证伪，不扩挖）。
+> [08](issues/08-settings-notify-page.md) 同源，已并入该票记「新开（同型）」，不另立编号（R1：只证实/证伪，不扩挖）。
 
 ---
 
@@ -85,7 +85,7 @@
 
 | 前轮票 | 本轮结论 | 落点 |
 |---|---|---|
-| 18 详情页中间档折行 | **有意不做**（2026-10-01 用户裁决收掉，与 wontfix 一致，无回归） | `[r3] ①.1` 与 `[r2] ①.4` 逐格同值（820→12、768→64、600→232、520→312、480→352）；`TaskDetail.svelte:662-666,948` |
+| 18 详情页中间档折行 | **有意不做**（2026-10-01 用户裁决收掉，与 wontfix 一致，无回归） | `[r3] ①.1` 与 `[r2] ①.4` 逐格同值（820→12、768→64、600→232、520→312、480→352）；`TaskDetail.svelte:662-666`；`PipelineRail.svelte:340-344`（hero 无 `overflow-x`） |
 | 19 对讲台中间档折行 | **已修**（superseded 后确实落地） | `[r3] ①.2`：900→`562px 280px`、820 起单列；`Talk.svelte:2353,3149-3153,3166` |
 | 21 破坏性动作确认步 | **有意不做**（2026-10-01 用户裁决收掉，与 wontfix 一致，无回归） | `[r3] ②.1`：第一次点「合入」直接提交（按钮区整块消失），无确认步 |
 | 22 中流状态持久化 | **有意不做**（wontfix 余三件维持，已落两处底座未回退） | `[r3] ③.1–③.3`：页签 `/` 过滤 `/` 草稿刷新后均不存活；`TaskDetail.svelte:40`、`board.svelte.ts:37,168`、`Talk.svelte:1089` |
@@ -159,7 +159,7 @@ cd frontend && UX_AUDIT3=1 npx playwright test --project=chromium e2e/ux-audit-3
 | [05](issues/05-toast-keyboard-close-status.md) | toast 键盘关闭路径现状核实 | A | 部分已修 |
 | [06](issues/06-round1-bstack-status.md) | 第一轮 B 叠实现票是否真落 | A | 已修（无悬空） |
 | [07](issues/07-settings-tools-page.md) | 命令执行设置页（漂移面） | A | 新开（无缺陷） |
-| [08](issues/08-settings-notify-page.md) | 离线通知设置页（漂移面）+ 字面星号回归 | A | 回归 |
+| [08](issues/08-settings-notify-page.md) | 离线通知设置页（漂移面）+ 字面星号同型新开 | A | 新开（同型） |
 | [09](issues/09-settings-foreman-page.md) | 值守轮设置页（漂移面） | A | 新开（无缺陷） |
 | [10](issues/10-board-props-bar.md) | 看板顶部道具栏语义与计数 | A | 新开（无缺陷） |
 | [11](issues/11-wordmark-and-entry-consolidation.md) | 决策 240 入口归一 | A | 已修 |

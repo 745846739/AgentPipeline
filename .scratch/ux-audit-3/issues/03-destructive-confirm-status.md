@@ -5,7 +5,7 @@
 **来源:** A/ux-audit-2 票 [21](../ux-audit-2/issues/21-destructive-confirm-impl.md)
 （2026-10-01 以 **wontfix** 关闭；决策 216 保留为「怎么定」的记录）
 
-**出处:** `crates/core/src/actions.rs:229,243,252,272,278`；`frontend/src/components/board/PendingActions.svelte:122-131,163-172`；`[r3] ②.1`；截图 `r3-merge-first-click.png`
+**出处:** `crates/core/src/actions.rs:229,243,252,272,278`；`frontend/src/components/board/PendingActions.svelte:115,131,143`；`[r3] ②.1`；截图 `r3-merge-first-click.png`
 
 **严重度:** 高（不可逆动作单击即发、无确认步——误触即不可撤销）
 
@@ -35,7 +35,7 @@
 `quiet`（旁路/等待）两档，没有 `gate-skip` 的琥珀描边、也没有 `destructive` 的红描边。
 
 **证据等级:** 实测（`[r3] ②.1` + 截图 `r3-merge-first-click.png`）+ 代码
-（`crates/core/src/actions.rs:229,243…` 的 `终止任务` label；`PendingActions.svelte:122-131,163-172`）
+（`crates/core/src/actions.rs:229,243…` 的 `终止任务` label；`PendingActions.svelte:115,131,143`）
 —— `终止任务` 按钮量级一处标 **未验证**（harness 该态下无此动作）。
 
 **与前轮关联:** 现状核实（=前轮 21，wontfix；无一键即发形态变化，未回归）
