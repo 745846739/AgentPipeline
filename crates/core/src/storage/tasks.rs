@@ -404,17 +404,40 @@ impl Store {
     }
 
     /// 从 runs 重算 `total_tokens` / `total_calls`（口径见 metrics，决策 130 ②）。
+    ///
+    /// **读数没变就不写——但正在跑的任务除外。**
+    ///
+    /// `updated_at` 在 done 任务上是「刚完成」的新鲜度判据（`scheduler::note_discoveries`
+    /// ④ 的「新鲜事」窗口，决策 209③），无条件 `updated_at = now` 会让小时级维护
+    /// （`aggregate_node_metrics`）每小时把每个 done 任务的完成时刻洗成现在——
+    /// `TaskDone` 待办的去重键含 `occurred_at`，新时刻必插新行，PWA「任务完成」推送
+    /// 跟着每小时一条。指标聚合是**读数**，不是**事件**；读数没变（run 没多、用量没补记）
+    /// 就不该刷新 `updated_at`。
+    ///
+    /// **为什么在跑的任务不走这条判据**：run 行的 token 要到收口才落库（轮内只走
+    /// `touch_run_heartbeat`，只写 `last_activity_at`），故一个长节点在**库面上**的读数
+    /// 不会变——这里若也跳过，详情页的 `updated_at` / `total_tokens` 会再次冻结成
+    /// 45 分钟不动，正是决策 375 修掉的那个「活跃任务被误判卡死」。
+    ///
+    /// 判据收在**一条条件 `UPDATE`** 里（不是「先 SELECT 再判断」）：读与写之间不留竞态
+    /// 窗口，`WHERE` 不成立时一行都不动、`updated_at` 也就不被改写。
     pub async fn refresh_task_totals(&self, task_id: &str) -> Result<()> {
         let runs = self.list_runs(task_id).await?;
-        let tokens = crate::metrics::total_tokens(&runs);
-        let calls = crate::metrics::total_calls(&runs);
-        sqlx::query("UPDATE kanban_tasks SET total_tokens = ?, total_calls = ?, updated_at = ? WHERE id = ?")
-            .bind(tokens as i64)
-            .bind(calls as i64)
-            .bind(ts(self.now()))
-            .bind(task_id)
-            .execute(self.pool())
-            .await?;
+        let tokens = crate::metrics::total_tokens(&runs) as i64;
+        let calls = crate::metrics::total_calls(&runs) as i64;
+        sqlx::query(
+            "UPDATE kanban_tasks SET total_tokens = ?, total_calls = ?, updated_at = ?
+             WHERE id = ? AND (total_tokens <> ? OR total_calls <> ? OR status = ?)",
+        )
+        .bind(tokens)
+        .bind(calls)
+        .bind(ts(self.now()))
+        .bind(task_id)
+        .bind(tokens)
+        .bind(calls)
+        .bind(TaskStatus::Running.as_str())
+        .execute(self.pool())
+        .await?;
         Ok(())
     }
 

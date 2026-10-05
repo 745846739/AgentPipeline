@@ -15,3 +15,7 @@
 | 06 | B1:截断救援显性化 + UTF-8 分块修复 | 377 | todo |
 | 07 | B5:worktree 构建产物回收 | 377 | todo |
 | 08 | 重建 ux-audit-3 任务 | 376 | todo(blocked by 03,03 已 done 可开工) |
+| 09 | provider-400:压缩切点对齐轮边界 + 转录出口消毒 | 384 | done(2026-10-04) |
+| 10 | 日志收场行 flake:tracing callsite interest 缓存竞态 | 385 | done(2026-10-04) |
+| 11 | 106 运维清理 + 顺延观察清单收口 | — | ready-for-agent(清理已做,观察项待自然任务) |
+| 12 | done 任务的「刚完成」不再被小时级维护洗掉 | 386 | done(2026-10-04) |

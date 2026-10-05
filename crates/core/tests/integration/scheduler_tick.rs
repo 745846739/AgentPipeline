@@ -1657,6 +1657,160 @@ async fn maintenance_refreshes_totals_and_purges_expired_conversations() {
         .is_empty());
 }
 
+/// 指标聚合不许把 done 任务的「刚完成」洗掉（2026-10-04 实测事故）。
+///
+/// 链条：小时级维护 `aggregate_node_metrics` → `refresh_task_totals` 无条件
+/// `updated_at = now` → 下一拍 `note_discoveries` ④ 把它读成「新鲜事」再插一条
+/// `TaskDone` 待办（去重键含 `occurred_at`，新时刻必插新行）→ PWA「任务完成」
+/// 推送跟着维护循环每小时一条，永不收场。**牙齿**：把 `refresh_task_totals`
+/// 的「读数没变就不写」条件拿掉（回到无条件写），`updated_at` 不得被维护洗成现在
+/// 那条断言先红（实测 left=00:00 right=01:00）；再往后才是待办去重键被新时刻顶开、
+/// TaskDone 由一插二。
+#[tokio::test]
+async fn maintenance_with_unchanged_totals_does_not_reannounce_done_tasks() {
+    let h = Harness::new().await;
+    h.seed_task("t1").await;
+    let cursor = h.store.load_live_cursors("t1").await.unwrap()[0].clone();
+    let run_id = h
+        .store
+        .insert_run(&NewRun {
+            task_id: "t1".into(),
+            cursor_id: cursor.cursor_id.clone(),
+            stage: Stage::Develop,
+            node: Node::Execute,
+            attempt: 1,
+            agent_type: "main".into(),
+            parent_run_id: None,
+            prompt_template_hash: None,
+            process_group_id: None,
+        })
+        .await
+        .unwrap();
+    h.store
+        .finish_run(
+            run_id,
+            &RunOutcome {
+                status: Some(NodeStatus::Success),
+                prompt_tokens: 200,
+                completion_tokens: 100,
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+    h.store.mark_terminal("t1", TaskStatus::Done).await.unwrap();
+
+    let scheduler = h.scheduler(Settings::default());
+    // 第一次维护：totals 从 0 变 300，是真事件，写。
+    scheduler.maintenance().await.unwrap();
+    // 完成的新鲜事：插一条 TaskDone（这是合法的那一条）。
+    h.scheduler(Settings::default()).tick().await.unwrap();
+    let since = h.clock.now() - chrono::Duration::hours(2);
+    assert_eq!(
+        h.store
+            .count_attention_since(
+                "t1",
+                agentpipeline_core::storage::AttentionKind::TaskDone,
+                since
+            )
+            .await
+            .unwrap(),
+        1
+    );
+
+    // 一小时后第二次维护：runs 没多，totals 没变——updated_at 不许动。
+    h.clock.advance_secs(3600);
+    let before = h.store.get_task("t1").await.unwrap().updated_at;
+    scheduler.maintenance().await.unwrap();
+    let after = h.store.get_task("t1").await.unwrap().updated_at;
+    assert_eq!(before, after, "读数没变，updated_at 不得被维护洗成现在");
+
+    // 于是完成播报不再重发：待办还是那一条，tick 没记新发现。
+    let report = h.scheduler(Settings::default()).tick().await.unwrap();
+    assert_eq!(report.attention_noted, 0);
+    assert_eq!(
+        h.store
+            .count_attention_since(
+                "t1",
+                agentpipeline_core::storage::AttentionKind::TaskDone,
+                since
+            )
+            .await
+            .unwrap(),
+        1,
+        "TaskDone 待办不得因维护重插"
+    );
+    // 而读数变了仍然要写：新 run 真的多烧了 token，updated_at 刷新是应该的。
+    let run_id2 = h
+        .store
+        .insert_run(&NewRun {
+            task_id: "t1".into(),
+            cursor_id: cursor.cursor_id.clone(),
+            stage: Stage::Develop,
+            node: Node::Execute,
+            attempt: 2,
+            agent_type: "main".into(),
+            parent_run_id: None,
+            prompt_template_hash: None,
+            process_group_id: None,
+        })
+        .await
+        .unwrap();
+    h.store
+        .finish_run(
+            run_id2,
+            &RunOutcome {
+                status: Some(NodeStatus::Success),
+                prompt_tokens: 50,
+                completion_tokens: 25,
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+    scheduler.maintenance().await.unwrap();
+    let task = h.store.get_task("t1").await.unwrap();
+    assert_eq!(task.total_tokens, 375);
+    assert_ne!(task.updated_at, after, "读数变了就是事件，updated_at 要刷");
+}
+
+/// 「读数没变就不写」**不得**波及正在跑的任务（决策 375 的另一面）。
+///
+/// run 行的 token 到收口才落库（轮内只走 `touch_run_heartbeat`），故长节点的读数在
+/// 库面上本就一动不动——若维护/滚动的刷新也早退，详情页的 `updated_at` 会再次冻结，
+/// 监控又把活跃任务误判成卡死（决策 375 的原始事故）。**牙齿**：把 `refresh_task_totals`
+/// 的早退判据从「读数没变 **且** 不在跑」收成「读数没变」，本用例先红。
+#[tokio::test]
+async fn running_task_totals_refresh_still_unfreezes_updated_at() {
+    let h = Harness::new().await;
+    h.seed_task("t1").await;
+    assert!(h.store.try_admit("t1", 1).await.unwrap(), "任务转 running");
+    // 断言前提：在跑、且没有任何 token 入账（run 行要收口才写用量）。
+    let before = h.store.get_task("t1").await.unwrap();
+    assert_eq!(before.status, TaskStatus::Running);
+    assert_eq!((before.total_tokens, before.total_calls), (0, 0));
+
+    h.clock.advance_secs(1800);
+    h.store.refresh_task_totals("t1").await.unwrap();
+    let after = h.store.get_task("t1").await.unwrap();
+    assert_eq!((after.total_tokens, after.total_calls), (0, 0));
+    assert_ne!(
+        after.updated_at, before.updated_at,
+        "在跑的任务：读数没变，updated_at 也必须往前走（决策 375）"
+    );
+
+    // 对照：同一份「没变」的读数，任务一旦收口就不再刷新时间戳。
+    h.store.mark_terminal("t1", TaskStatus::Done).await.unwrap();
+    let done_at = h.store.get_task("t1").await.unwrap().updated_at;
+    h.clock.advance_secs(3600);
+    h.store.refresh_task_totals("t1").await.unwrap();
+    assert_eq!(
+        h.store.get_task("t1").await.unwrap().updated_at,
+        done_at,
+        "已收口：读数没变就不写"
+    );
+}
+
 // ─────────────────────── 第一层冲突判定（决策 71 / 102）───────────────────────
 
 #[tokio::test]

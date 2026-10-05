@@ -2348,3 +2348,19 @@ playwright 冒烟跑**真 axum 后端 + FakeAgent**（`AGENTPIPELINE_HOME` 指�
 **验证**：修复后同口径满载循环 40 轮 **0 红**（修复前同口径 15/40）；`every_tool` / `failing_tool` 两条订阅者测试单跑仍绿；全仓测试绿（sink 只付格式化成本，单轮耗时在波动内持平）。
 
 **来源**：用户（2026-10-04 `$implement` 开工票 10）；决策 342⑦（同族对照）、302（阻塞池嫌疑排除的对照）；证据 106 `kanban_node_commands`（4809：`cargo test --quiet` 8 分钟红跑紧接 clippy 整树重编）+ 本地 40 轮复现记录；落地票 `.scratch/106-stability/issues/10-tool-log-end-line-flake.md`
+
+### 决策 386 · 指标聚合不写事件：读数没变就不刷 `updated_at`，done 任务的完成播报不再每小时重发（票 106-stability/12）
+
+**起因**：2026-10-04 报的 PWA 现象——同一个 done 任务的「任务完成」推送每小时一条、永不收场。链子在源码里可逐行复核：小时级 `maintenance` 的 `aggregate_node_metrics`（`scheduler/mod.rs:1061`，对每一张任务卡含归档逐个调）→ `refresh_task_totals`（`storage/tasks.rs:414`）原先**无条件** `UPDATE … SET total_tokens=?, total_calls=?, updated_at=now`。而 done 任务的 `updated_at` 正是 `note_discoveries` ④（`scheduler/mod.rs:943`）的「新鲜事」判据（`now - task.updated_at <= watch_event_window_minutes`，缺省 30 分钟）**且**是 `occurred_at` 的取值——`kanban_foreman_attention` 去重键为 `(task_id, kind, occurred_at)`（`storage/attention.rs:270` `ON CONFLICT … DO NOTHING`），时间戳被维护洗成新的整点即换了一把键、必插新行；新行 `kind.wakes()` 为真便经 `notifier.notify` 走出推送（`note_attention` 内联出口，决策 268②）。**指标聚合是「读数」，却写了一个被下游当「事件」读的字段**——维护每小时一趟，于是完成播报每小时一条。
+
+**裁决（读数没变就不写，但正在跑的任务除外）**：`refresh_task_totals` 的写入收成**一条条件 `UPDATE`**——`WHERE id = ? AND (total_tokens <> ? OR total_calls <> ? OR status = 'running')`。读数没变**且**任务不在跑时 `WHERE` 不成立，一行都不动（`updated_at` 不被改写）；在跑的任务照刷（见下）。读与写之间因此不留竞态窗口。`updated_at` 的语义由此定死为**事件时刻**（终态 / 待办任务）。
+
+**与决策 375 的关系（本票必须单独处理的第二面）**：375 修的是「长节点期间 `updated_at` / `total_tokens` 冻结、监控把活跃任务误判卡死」。**一个决定性事实**：run 行的 token 到节点**收口**才落库——轮内 `trace.tokens.add(&response)`（`model_invoke.rs:916`）只累在内存的 `RunTokens`，`touch_run_heartbeat`（`:923` → `observability.rs:291`）只写 `last_activity_at`，`record_run_usage` 仅在中止/收口路径被调（`run_ledger.rs:148,207`）。所以一个长节点在**库面上**的读数本就一动不动——375 的滚动刷新（`:928`）真正在做的，是把 `updated_at` 推走。若判据只管「读数没变」，滚动刷新会退化成 no-op、`updated_at` 再次冻结，**静默回退 375**（无既有用例会红，故必须新加牙齿）。故 `WHERE` 末尾带上 `OR status = 'running'`。
+
+**边界核对**：九处调用方（`model_invoke` 六处、`scheduler` 维护、`subagent`、`executor` 终态）里，凡用量发生变化的路径 run 行必已变更、读数必变，写入不受影响；读 `task.updated_at` 的只有闸门失败 ③ 与完成播报 ④ 两条「新鲜事」判据，卡住/停滞判据读的是 `cursor.updated_at`（`remind_pending_tasks`）与 run 心跳（`stuck_evidence`），不被本票牵动。
+
+**明确不做**：不改维护的调度粒度（小时级维护照跑——清会话、清待办、收缩 WAL 都靠它）；不给 `TaskDone` 换去重键（`occurred_at` = 事件时刻这条语义在别处也成立，问题在**写入方**不在键）；不动 `watch_event_window_minutes` 缺省（它是「多久算新鲜」的独立旋钮）。
+
+**验证**：集成用例两条。①`scheduler_tick::maintenance_with_unchanged_totals_does_not_reannounce_done_tasks`——两次维护之间推进一小时：读数没变则 `updated_at` 一字不动；`tick` 的 `attention_noted == 0` 且 `TaskDone` 仍只有一条；补一条新 run 后读数变、写入恢复（`total_tokens == 375`、`updated_at` 刷新）。**牙齿已验**：撤掉条件、回到无条件 `UPDATE` 后第一条断言先红（实测 `left=00:00 right=01:00`）。②`scheduler_tick::running_task_totals_refresh_still_unfreezes_updated_at`——在跑的任务读数没变时 `updated_at` 照刷（钉住 375 不被回退）；收口后同口径不再刷；**牙齿**：把 `OR status = 'running'` 拿掉该用例先红。全仓 `cargo test --workspace` 绿。
+
+**来源**：用户（2026-10-04 `$implement` 续做未提交的在飞改动）；决策 209③（票 foreman-watch/05：`occurred_at` 取事件时刻、只报新鲜事）、375（滚动入账，本票的正交面）、268②（`wakes()` → `notify` 出口）、234（待办类别与 `wakes()`）；落地票 `.scratch/106-stability/issues/12-taskdone-hourly-reannounce.md`（**证据分级**：代码链可自证、撤修复即红；现场「每小时一条」读数由开工会话记录，无随仓脱敏样本）
