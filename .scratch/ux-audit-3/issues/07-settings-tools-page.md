@@ -4,6 +4,10 @@
 
 **来源:** B/第二轮收口（2026-09-18）之后的代码漂移面（`SettingsTools` 页新增）
 
+**出处:** `frontend/src/routes/SettingsTools.svelte:106,124,165,203,254,136-153`；`[r3] ④.1`
+
+**严重度:** 低（漂移面这一格干净，无缺陷）
+
 **What to see:**
 真页面走查 `#/settings/tools`（`[r3] ④.1`）：
 

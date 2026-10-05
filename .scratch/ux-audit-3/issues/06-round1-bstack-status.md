@@ -5,6 +5,10 @@
 **来源:** A/第一轮 `.scratch/ux-audit/DELIVERY.md` 逐票对账表 + `README.md` §一；
 历史坑见决策 201（票 26 只出决策、实现留给票 17/19）
 
+**出处:** `frontend/src/theme/contrast.test.ts`、`frontend/src/lib/pipeline.geometry.test.ts`、`frontend/src/lib/copy-discipline.test.ts`、`frontend/src/lib/behavior-map.test.ts`（实存）；`frontend/src/components/layout/TopBar.svelte:164-176`；`[r3] ④.3`
+
+**严重度:** 低（复核兜底项，结论无悬空）
+
 **What to see:**
 第一轮 B 叠（先决策票、再实现票）的实现票，逐张核「落地物是否存在」——**读当前源码/文件**，
 不以旧报告描述为准（R6）：

@@ -6,6 +6,10 @@
 （**wontfix**：余三件经 2026-10-01 复核由用户裁决收掉；已落的 router 底座与
 班次两件照旧，决策 217①⑤）
 
+**出处:** `frontend/src/routes/TaskDetail.svelte:40`、`frontend/src/stores/board.svelte.ts:37,168`、`frontend/src/routes/Talk.svelte:1089`；底座 `frontend/src/router.svelte.ts:177,193`、`frontend/src/lib/talkSessions.ts:21`；`[r3] ③.1–③.3`；截图 `r3-tab-after-reload.png` / `r3-board-filter-after-reload.png` / `r3-talk-draft-after-reload.png`
+
+**严重度:** 中（刷新/后退丢中流状态——页签回默认、过滤回「全部」、草稿丢失；不丢数据，重做即可）
+
 **What to see:**
 三处「刷新是否恢复」在真页面上逐条实测（`[r3] ③.1–③.3`）：
 
@@ -27,7 +31,7 @@
   `frontend/src/lib/talkSessions.ts:21 TALK_SESSION_KEY`（班次进地址 + 兜底）——与票 22
   文末复核记载的 `partial` 状态完全对得上。
 
-结论：**未修（wontfix 余三件维持，已落两处底座未回退，无回归）**。
+结论：**有意不做（wontfix：2026-10-01 用户裁决收掉余三件，本轮只记现状核实，未重开；已落两处底座未回退，无回归）**。
 
 **证据等级:** 实测（`[r3] ③.1–③.3` + 截图 `r3-tab-after-reload.png` /
 `r3-board-filter-after-reload.png` / `r3-talk-draft-after-reload.png`）+ 代码

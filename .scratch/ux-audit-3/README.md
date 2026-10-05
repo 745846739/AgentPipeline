@@ -46,7 +46,8 @@
 ### 2. `wontfix` 条目的特别规则
 
 票 **18 / 21 / 22 余项**是 2026-10-01 经用户**裁决收掉**的（`wontfix`），票 **19** 是 `superseded`。
-本轮对这些条目**只记「现状核实」**，不重开（R3）；**只有现状比 wontfix 时更坏**才按「回归」新开。
+本轮对这些条目**只记「现状核实」**，不重开（R3）；结论档一律落 **`有意不做`**（设计 §4 特别规则：
+「wontfix 收掉的按『有意不做』另记，**不算未修**」），**只有现状比 wontfix 时更坏**才按「回归」新开。
 判据：第二轮取证点（`[r2]` 数字）与本轮（`[r3]` 数字）逐格对比——同值即「未回归」。
 
 ### 3. 票号不一致按并集处理（一处需正面处理）
@@ -61,10 +62,10 @@
 
 | 编号 | 标题 | 与前轮关联 | 证据等级 | 状态 |
 |---|---|---|---|---|
-| [01](issues/01-detail-midband-fold-status.md) | 详情页 480–819px 中间档主栏折行与 hero 横向溢出 | 现状核实（=18，wontfix） | 实测 + 代码 | **未修**（无回归） |
+| [01](issues/01-detail-midband-fold-status.md) | 详情页 480–819px 中间档主栏折行与 hero 横向溢出 | 现状核实（=18，wontfix） | 实测 + 代码 | **有意不做**（wontfix 维持，无回归） |
 | [02](issues/02-talk-midband-fold-status.md) | 对讲台 480–899px 中间档对话列折行 | 现状核实（=19，superseded） | 实测 + 代码 | **已修** |
-| [03](issues/03-destructive-confirm-status.md) | 不可逆动作单击即发、无确认步、量级反着来 | 现状核实（=21，wontfix） | 实测 + 代码（一处未验证） | **未修**（无回归） |
-| [04](issues/04-midflow-persistence-status.md) | 中流状态持久化余三件（`?tab=` / `?filter=` / `talk_draft`） | 现状核实（=22，wontfix 余项） | 实测 + 代码 | **未修**（余三件原样） |
+| [03](issues/03-destructive-confirm-status.md) | 不可逆动作单击即发、无确认步、量级反着来 | 现状核实（=21，wontfix） | 实测 + 代码（一处未验证） | **有意不做**（wontfix 维持，无回归） |
+| [04](issues/04-midflow-persistence-status.md) | 中流状态持久化余三件（`?tab=` / `?filter=` / `talk_draft`） | 现状核实（=22，wontfix 余项） | 实测 + 代码 | **有意不做**（wontfix 余三件维持） |
 | [05](issues/05-toast-keyboard-close-status.md) | toast 的键盘关闭路径（票 17 明写「没做」的子项） | 现状核实（=17 子项） | 代码（运行时未验证） | **部分已修**（有关闭钮、缺 Escape） |
 | [06](issues/06-round1-bstack-status.md) | 第一轮 B 叠实现票是否真落（决策 201 类历史坑） | 现状核实（=第一轮 B 叠） | 代码 | **已修**（无悬空） |
 | [07](issues/07-settings-tools-page.md) | 命令执行设置页（漂移面）可达性与语义 | 新开 | 实测 + 代码 | **新开（无缺陷）** |
@@ -84,10 +85,10 @@
 
 | 前轮票 | 本轮结论 | 落点 |
 |---|---|---|
-| 18 详情页中间档折行 | **未修**（与 wontfix 一致，无回归） | `[r3] ①.1` 与 `[r2] ①.4` 逐格同值（820→12、768→64、600→232、520→312、480→352）；`TaskDetail.svelte:662-666,948` |
+| 18 详情页中间档折行 | **有意不做**（2026-10-01 用户裁决收掉，与 wontfix 一致，无回归） | `[r3] ①.1` 与 `[r2] ①.4` 逐格同值（820→12、768→64、600→232、520→312、480→352）；`TaskDetail.svelte:662-666,948` |
 | 19 对讲台中间档折行 | **已修**（superseded 后确实落地） | `[r3] ①.2`：900→`562px 280px`、820 起单列；`Talk.svelte:2353,3149-3153,3166` |
-| 21 破坏性动作确认步 | **未修**（与 wontfix 一致，无回归） | `[r3] ②.1`：第一次点「合入」直接提交（按钮区整块消失），无确认步 |
-| 22 中流状态持久化 | **未修**（余三件原样，已落两处底座未回退） | `[r3] ③.1–③.3`：页签 `/` 过滤 `/` 草稿刷新后均不存活；`TaskDetail.svelte:40`、`board.svelte.ts:37,168`、`Talk.svelte:1089` |
+| 21 破坏性动作确认步 | **有意不做**（2026-10-01 用户裁决收掉，与 wontfix 一致，无回归） | `[r3] ②.1`：第一次点「合入」直接提交（按钮区整块消失），无确认步 |
+| 22 中流状态持久化 | **有意不做**（wontfix 余三件维持，已落两处底座未回退） | `[r3] ③.1–③.3`：页签 `/` 过滤 `/` 草稿刷新后均不存活；`TaskDetail.svelte:40`、`board.svelte.ts:37,168`、`Talk.svelte:1089` |
 
 ---
 
@@ -151,10 +152,10 @@ cd frontend && UX_AUDIT3=1 npx playwright test --project=chromium e2e/ux-audit-3
 
 | # | 票 | 叠 | 结论 |
 |---|---|---|---|
-| [01](issues/01-detail-midband-fold-status.md) | 详情页中间档折行现状核实 | A | 未修（wontfix 维持） |
+| [01](issues/01-detail-midband-fold-status.md) | 详情页中间档折行现状核实 | A | 有意不做（wontfix 维持） |
 | [02](issues/02-talk-midband-fold-status.md) | 对讲台中间档折行现状核实 | A | 已修 |
-| [03](issues/03-destructive-confirm-status.md) | 不可逆动作确认步现状核实 | A | 未修（wontfix 维持） |
-| [04](issues/04-midflow-persistence-status.md) | 中流状态持久化余三件现状核实 | A | 未修（余项维持） |
+| [03](issues/03-destructive-confirm-status.md) | 不可逆动作确认步现状核实 | A | 有意不做（wontfix 维持） |
+| [04](issues/04-midflow-persistence-status.md) | 中流状态持久化余三件现状核实 | A | 有意不做（余项维持） |
 | [05](issues/05-toast-keyboard-close-status.md) | toast 键盘关闭路径现状核实 | A | 部分已修 |
 | [06](issues/06-round1-bstack-status.md) | 第一轮 B 叠实现票是否真落 | A | 已修（无悬空） |
 | [07](issues/07-settings-tools-page.md) | 命令执行设置页（漂移面） | A | 新开（无缺陷） |

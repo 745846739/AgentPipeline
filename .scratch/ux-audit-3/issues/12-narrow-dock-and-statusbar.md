@@ -4,6 +4,10 @@
 
 **来源:** B 漂移面（决策 243 底部页签栏 + 决策 300 状态条整条退场）
 
+**出处:** `frontend/src/components/layout/StatusLine.svelte:156-166`、`frontend/src/components/layout/TopBar.svelte:604` 起、`frontend/src/app.css:22-28,651-672`；`[r3] ④.5`；截图 `r3-narrow-bottom-430.png`
+
+**严重度:** 低（决策 243/300 已落，无缺陷）
+
 **What to see:**
 真页面 430 视口走查看板路由 `#/`（`[r3] ④.5`）：
 

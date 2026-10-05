@@ -6,6 +6,10 @@
 （该票 Status: done，但清单末条 `- [ ] toast：关闭的键盘路径——这一条没做`；
 实施记录末条写「本轮没有加关闭钮……留待票 21 一并裁决」）
 
+**出处:** `frontend/src/components/layout/ToastStack.svelte:32-36`（关闭钮）；`frontend/src/stores/notifications.svelte.ts:87`（`dismiss`）；Escape 缺失为全文件 0 命中的负向证据；`[r3] ⑤.1`
+
+**严重度:** 低（toast 已可点关闭钮关闭，缺的是 Escape 快捷路径）
+
 **What to see:**
 源码（本次实地读到）——**关闭钮现在存在了**（票 17 当轮没有，之后某次改动补上了）：
 

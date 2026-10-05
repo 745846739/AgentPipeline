@@ -5,6 +5,10 @@
 **来源:** A/ux-audit-2 票 [21](../ux-audit-2/issues/21-destructive-confirm-impl.md)
 （2026-10-01 以 **wontfix** 关闭；决策 216 保留为「怎么定」的记录）
 
+**出处:** `crates/core/src/actions.rs:229,243,252,272,278`；`frontend/src/components/board/PendingActions.svelte:122-131,163-172`；`[r3] ②.1`；截图 `r3-merge-first-click.png`
+
+**严重度:** 高（不可逆动作单击即发、无确认步——误触即不可撤销）
+
 **What to see:**
 在真页面（pending = `merge_approval` 的详情页）点第一档动作，量点击前后的 DOM 与按钮量级
 （`[r3] ②.1`）：
@@ -25,7 +29,7 @@
 /`dependency_failed` 态才有的旁路动作，见 `crates/core/src/actions.rs:229,243,252,272,278`），
 故本轮**未**在真页面量到 `终止任务` 的描边色，标「未验证」。
 
-结论：**未修（与 wontfix 裁决一致，无回归）**。决策 216 定的「三档量级 + 内联两步确认」
+结论：**有意不做（wontfix：2026-10-01 用户裁决收掉，本轮只记现状核实，未重开；无回归）**。决策 216 定的「三档量级 + 内联两步确认」
 在生产代码里查无实现：`lib/actions.ts` 无 `actionTier`，`PendingDossier.svelte` /
 `PendingActions.svelte` / `DiffReviewPanel.svelte` 的动作钮只有 `solid`（恢复动作）与
 `quiet`（旁路/等待）两档，没有 `gate-skip` 的琥珀描边、也没有 `destructive` 的红描边。

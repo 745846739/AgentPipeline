@@ -5,6 +5,10 @@
 **来源:** A/ux-audit-2 票 [19](../ux-audit-2/issues/19-talk-midband-fold.md)
 （**superseded**：被 `talk-mobile-space` 票 07 吸收并落地，决策 218①②⑤）
 
+**出处:** `frontend/src/routes/Talk.svelte:2353,3149-3153,3166`；`[r3] ①.2`；截图 `r3-talk-768.png` / `r3-talk-480.png`
+
+**严重度:** 低（前轮票 19 已由决策 218 落地，现状无缺陷）
+
 **What to see:**
 第三轮重测对讲台宽度扫描（`[r3] ①.2`）：
 

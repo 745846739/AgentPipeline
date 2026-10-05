@@ -4,6 +4,10 @@
 
 **来源:** B/第二轮收口之后的代码漂移面（`SettingsForeman` 页新增）
 
+**出处:** `frontend/src/routes/SettingsForeman.svelte:82,99,106-122,132`；`[r3] ④.1`
+
+**严重度:** 低（漂移面这一格干净，无缺陷）
+
 **What to see:**
 真页面走查 `#/settings/foreman`（`[r3] ④.1`）：
 

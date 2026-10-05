@@ -4,6 +4,10 @@
 
 **来源:** B 漂移面（决策 201 过滤槽 + 决策 92 待办入口；第二轮收口后仍在，作独立候选复核）
 
+**出处:** `frontend/src/components/layout/TopBar.svelte:163-183,190-211,223`、`frontend/src/stores/board.svelte.ts:19,256-260`；`[r3] ④.3`；截图 `r3-board-props-bar.png`
+
+**严重度:** 低（语义与计数齐、决策 201 形态仍在，无缺陷）
+
 **What to see:**
 真页面走查 `#/`（看板路由）的道具栏（`[r3] ④.3`）：
 

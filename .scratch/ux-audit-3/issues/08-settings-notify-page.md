@@ -5,6 +5,10 @@
 **来源:** B/第二轮收口之后的代码漂移面（`SettingsNotify` 页新增）；
 附带复核第二轮票 [15](../ux-audit-2/issues/15-copy-and-format.md) ③ 的「字面 Markdown 星号」
 
+**出处:** `frontend/src/routes/SettingsNotify.svelte:408,433,458,490,492,498,499,577`；`frontend/src/routes/SettingsTools.svelte:160`；`[r3] ④.1/④.2/⑤.2`；截图 `r3-settings-notify.png` / `r3-literal-asterisks.png`
+
+**严重度:** 中（面向用户的字面 `**` 星号原样渲染，文案破相且与「强调」意图相悖）
+
 **What to see:**
 真页面走查 `#/settings/notify`（`[r3] ④.1` / `④.2`）：
 
