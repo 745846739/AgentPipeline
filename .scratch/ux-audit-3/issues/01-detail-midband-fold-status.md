@@ -1,10 +1,39 @@
-# 01: 详情页 480–819px 中间档主栏折行与 hero 横向溢出，现状如何
+# 01: 详情页 480–819px 中间档主栏折行与 hero 横向溢出（现状核实）
 
-**出处:** 待填：`frontend/src/routes/TaskDetail.svelte` 的 `.detail.split` 断点与 hero 溢出规则行号 + 宽度扫描实测数字
-**严重度:** 待填
-**与前轮关联:** 待填（前轮票 [ux-audit-2/18](../../ux-audit-2/issues/18-detail-midband-fold.md)，wontfix）
-**证据等级:** 待填
+**叠:** A（不动规格）
 
-**证据占位:** 待填：480 / 600 / 768 三档读 `.detail` 的 `grid-template-columns`、主栏宽、
-`document.documentElement.scrollWidth - clientWidth`、`hero.scrollWidth vs clientWidth` 与
-`overflow-x` 计算值（截图落 `.scratch/ux-audit-3/*.png`）。
+**来源:** A/ux-audit-2 票 [18](../ux-audit-2/issues/18-detail-midband-fold.md)（2026-10-01 以 **wontfix** 关闭）
+
+**What to see:**
+沿用第二轮 `①.4` 的宽度扫描，第三轮在本工作树上重测（`[r3] ①.1`）：
+
+| 视口 | `grid-template-columns` | 主栏宽 | `hero.scrollWidth / clientWidth` | 页面横向溢出 |
+|---|---|---|---|---|
+| 1100 | `722px 320px` | 722 | 812 / 722 | 0 |
+| 900 | `522px 320px` | 522 | 812 / 522 | 0 |
+| 820 | `442px 320px` | 442 | 812 / 442 | **12** |
+| 768 | `390px 320px` | 390 | 812 / 390 | **64** |
+| 600 | `222px 320px` | 222 | 812 / 222 | **232** |
+| 520 | `142px 320px` | 142 | 812 / 142 | **312** |
+| 480 | `102px 320px` | 102 | 812 / 102 | **352** |
+
+源码（本次实地读到）：`frontend/src/routes/TaskDetail.svelte:662-666` 的 `.detail.split`
+只有一条 `grid-template-columns: minmax(0, 1fr) 320px`，**没有 820–1099 的 280px 档、
+也没有 <820 的单列档**——票 18 要的就是这两档。`hero` 的 `overflow-x: auto`
+只写在 `:948`，且处 `@media (max-width: 479px)` 内，故 **480–819 区间 hero 一直是
+`overflow-x: visible`**（`[r3]` 逐档读出），把整页撑出横向滚动。
+
+结论：**未修（与 wontfix 裁决一致，无回归）**。与第二轮 `[r2] ①.4` 逐格同值
+（820→12、768→64、600→232、520→312、480→352），说明第二轮收口后这一档没被动过。
+wontfix 的复开口径（票面：「如真实使用在 480–819px 再疼，按决策 215 的断点表另立票」）
+——本轮**不**满足「更坏」，故按「现状核实」记，不重开。
+
+**证据等级:** 实测（`[r3] ①.1` 数字 + 截图 `r3-detail-768.png` / `r3-detail-480.png`）
++ 代码（`TaskDetail.svelte:662-666,948`）
+
+**与前轮关联:** 现状核实（=前轮 18，wontfix；第二轮的取证点原样复现，未回归）
+
+**建议:** 维持 wontfix。若将来重开，判据照票 18 原列的四条（三档断点、hero 容器内横滚、
+档案盒落主栏下时 sticky 与动作行照旧、e2e 宽度扫描）。本轮**只记现状**。
+
+**边界:** 审计票，不实现；不碰移动款（≤479px）那一档。
