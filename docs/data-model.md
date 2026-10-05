@@ -148,7 +148,8 @@ interface StageIO {
   review_result: {
     approved: boolean;
     review_report_path: string;
-    required_changes?: FileChangeSpec[];
+    required_changes?: ReviewRequiredChange[];  // 决策 387：每项带 finding 发现摘要；
+                                                // 旧格式输出（无 finding）向后兼容
   };
 
   // ── test ──
@@ -233,6 +234,13 @@ interface FileChangeSpec {
   path: string;
   action: "create" | "modify" | "delete";
   content_hash?: string;
+}
+
+// review 专用的变更规格（决策 387）：不复用 FileChangeSpec——那是 develop 侧产出契约。
+interface ReviewRequiredChange {
+  path: string;
+  action: "create" | "modify" | "delete";
+  finding?: string;                // 发现摘要（错在哪、该改成什么）；旧格式输出无此字段
 }
 
 interface NewSymbol {

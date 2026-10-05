@@ -470,7 +470,7 @@ system = """
 
 ## submit_metadata 字段
 - approved: boolean
-- required_changes: FileChangeSpec[]（approved=false 时；允许包含设计符合性与测试质量问题）
+- required_changes: ReviewRequiredChange[]（approved=false 时；允许包含设计符合性与测试质量问题；每项 finding 必填发现摘要——错在哪、该改成什么，一两句话）
 """
 
 user = """

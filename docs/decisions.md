@@ -2364,3 +2364,63 @@ playwright 冒烟跑**真 axum 后端 + FakeAgent**（`AGENTPIPELINE_HOME` 指�
 **验证**：集成用例两条。①`scheduler_tick::maintenance_with_unchanged_totals_does_not_reannounce_done_tasks`——两次维护之间推进一小时：读数没变则 `updated_at` 一字不动；`tick` 的 `attention_noted == 0` 且 `TaskDone` 仍只有一条；补一条新 run 后读数变、写入恢复（`total_tokens == 375`、`updated_at` 刷新）。**牙齿已验**：撤掉条件、回到无条件 `UPDATE` 后第一条断言先红（实测 `left=00:00 right=01:00`）。②`scheduler_tick::running_task_totals_refresh_still_unfreezes_updated_at`——在跑的任务读数没变时 `updated_at` 照刷（钉住 375 不被回退）；收口后同口径不再刷；**牙齿**：把 `OR status = 'running'` 拿掉该用例先红。全仓 `cargo test --workspace` 绿。
 
 **来源**：用户（2026-10-04 `$implement` 续做未提交的在飞改动）；决策 209③（票 foreman-watch/05：`occurred_at` 取事件时刻、只报新鲜事）、375（滚动入账，本票的正交面）、268②（`wakes()` → `notify` 出口）、234（待办类别与 `wakes()`）；落地票 `.scratch/106-stability/issues/12-taskdone-hourly-reannounce.md`（**证据分级**：代码链可自证、撤修复即红；现场「每小时一条」读数由开工会话记录，无随仓脱敏样本）
+
+### 决策 387 · 评审打回反馈注入位置：续接转录末尾的 user turn（修订决策 133 的渲染落点；扩展 279 的形态与 371 的纪律）
+
+**起因**：任务 01M450DK2GKZP4PJ4FVRAFAGXZ（第三轮 UX 审计）的实录——review 两次
+`approved: false`，第一次打回后 develop 重入仅 32 秒、约 1500 completion token 就重新
+交卷，5 个 `required_changes` 一项未动，`review-report.md` 在相关三个 run 的落库转录中
+出现 0 次。而打回简报**确实注入了**：106 库 `kanban_node_conversations` 里 run 279/280
+的 `user_prompt` 列实存决策 133 渲染的「## 评审必须修改项」五条。失效是形态性的：
+① 反馈渲染在 90+ 条、约 24 万 token 续接转录的**首条消息**，转录末尾是模型自己上一轮
+的「完成」总结——重入模型的注意力沿自己的完成叙事惯性滑行，段反馈被淹没；②
+`required_changes` 只有文件路径，评审的实质发现在任务目录的 `review-report.md`（worktree
+之外），简报只给裸文件名——agent 没找也没读。
+
+**裁决 ①（落点：反馈 turn 化）**：评审打回 develop.execute 重入时，反馈不再渲染进
+首条消息段，改为**续接转录末尾追加一条 user turn**（装配形态对齐决策 279 的
+`carried.push`；首条消息逐字不变）。覆盖两条打回路径：`ResumeCause::Review`（agent
+评审 + 用户按「打回开发修复」）与 `HumanReviewRejected`（human 评审端点）——两者
+`resume_continues` 同为 true，反馈落点一致。
+
+**裁决 ②（内容：内联 finding + 绝对路径）**：`ReviewResult.required_changes` 每项扩
+`finding: Option<String>`（新类型 `ReviewRequiredChange`，不复用 develop 侧的
+`FileChangeSpec`）——评审 execute 产出时逐项填写发现摘要（数据流最短路：发现本就在
+评审 agent 手里）；打回 turn 内联全部 finding 并附 `review-report.md` 绝对路径。旧格式
+输出降级为「只列路径 + 报告路径」。不解析报告 markdown（无 schema，脆弱）。
+
+**裁决 ③（纪律：user turn 的两类来源可区分）**：决策 371 的「user turn 的内容仍必须
+逐字是用户的话」修订为分档——用户原话 turn 逐字不加前缀；**系统注入的 turn 必须带
+结构化前缀**（`【评审打回反馈·系统注入】`），两类 turn 在转录里可机器区分、模型可
+辨识。纪律的意图（转录保真、可审计）不变，能力边界从「谁说的」精确到「谁说的 +
+谁注入的」。
+
+**与决策 380 的关系（划界，不修订）**：380 拒绝的是「为了让前缀更稳而**重排既有稳定
+段**」——cache 动机、无行为收益证据，故不做。本决策定的是 **reentry 反馈的初始落点**：
+反馈第一次注入就该落在模型下一个 token 的注意力点上，动机是行为有效性、有失败实录
+为证；首条消息里的其余段（环境路径、模板变量等稳定段）一律不动。380 原文与适用范围
+不变。
+
+**对决策 279 的事实修正**：279 括注「execute 节点（节点间无转录可续）仍走 segment」
+——该前提在它验收的场景（validate_input）成立，但 review / merge 打回 develop.execute
+**带全卷转录续接**（`resume_continues` 表）。user turn 机制的能力边界按**续接判定表**
+（`types.rs` 的 `resume_continues`）划，不按节点名划；279 原文的适用结论（validate_input
+用 turn）不变，错误前提由本决策更正。
+
+**明确不做**：不动其余 reentry 段（gate_recheck / backtrack / retry——无淹没实录，
+观察票 `.scratch/review-rework-feedback/issues/02`）；不把评审报告搬进 worktree（绝对
+路径 + 内联已覆盖）；不动 review 阶段的 30 分钟超时配置（另一个问题，本决策减少无效
+重入即是缓解）；不改 `review_mode=human` 的端点契约。**降级通道**：无转录可续的重入
+（如 `user_rerun` 全新起跑）没有「末尾」可落，「评审必须修改项」段照旧渲染（与决策 279
+「只在真追加了 turn 时才停用 segment」同款）。
+
+**验证**：core 单测一条——`model_invoke::tests::review_rework_turn_renders_only_for_a_failing_review`（无产出 / `approved=true` 不渲染；`approved=false` 出带前缀 turn、finding 内联、报告绝对路径）。core 集成两条——`executor::review_rework_feedback_is_a_prefixed_turn_at_the_end_of_the_carried_transcript`（重入转录以首轮转录为逐字前缀、末尾是带前缀 user turn 且 finding 内联 + 报告绝对路径、user prompt 不再渲染该段、首轮无 review 产出两者都不出现）、`executor::review_rework_turn_degrades_when_required_changes_carry_no_finding`（旧格式降级：只列路径 + 报告路径）。e2e 两条——`reviews::e2e_03`（断言随迁到 turn 形态）、`reviews::e2e_04_human_reject_of_a_failing_review_also_lands_the_rework_turn`（human 评审端点路径同落点）。**牙齿已验**：撤掉 `agent_node` 的 `carried.push` 后两条 core 集成用例先红。全仓 `cargo test --workspace` 绿。
+
+**来源**：用户（2026-10-05 会话拷问逐条定案：落点 turn 化 / 内容内联 / 纪律分档 /
+380 划界）；证据 106 库 `kanban_node_conversations`（run 279/280 的 user_prompt 与转录、
+run 283 评审结论）；决策 133（被修订的渲染落点）、279（形态先例与被更正的前提）、
+371（被分档的纪律）、380（被划界的不做裁决）；落地票
+`.scratch/review-rework-feedback/issues/01-rework-feedback-as-user-turn.md`；落地
+`pipeline/model_invoke.rs`（`review_rework_turn` + `agent_node` 追加）、
+`pipeline/model_request.rs`（`AttemptCtx.review_rework_as_turn` + `load_segments` 停用段）、
+`types.rs`（`ReviewRequiredChange`）、`agent/templates.rs`（评审 prompt 的 finding 要求）

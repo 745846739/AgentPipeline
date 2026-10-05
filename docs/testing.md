@@ -294,8 +294,8 @@ harness = FakeAgent（§3.2）+ testkit fixture（§3.3）+ 临时 home + 手动
 |---|---|---|---|---|
 | E2E-01 | happy path 全流程 | 80 / 90 / 97 / 99 | 游标分裂→合并→归档序列；`default_branch` 前进（update-ref）；worktree + 分支清理；system run 行落库；token 汇总 | P0 |
 | E2E-02 | sync-check backtrack | 83 / 126 | 双游标归档 → main 指 architect.validate_input；两文档标过期；`backtrack-feedback.md` 写入；重入 prompt 含反馈段；attempts 归零 | P0 |
-| E2E-03 | review 打回循环 | 43 / 133 | rejected → pending(user_decision) → goto develop.execute；required_changes 进 prompt；re-review 通过 | P0 |
-| E2E-04 | human review | 2 / 124 | pending(human_review)；`review-diff.diff` 生成；approve → test / reject → develop | P0 |
+| E2E-03 | review 打回循环 | 43 / 133 / 387 | rejected → pending(user_decision) → goto develop.execute；required_changes 以带前缀 user turn 落转录末尾（finding 内联），user prompt 不再渲染该段；re-review 通过 | P0 |
+| E2E-04 | human review | 2 / 124 / 387 | pending(human_review)；`review-diff.diff` 生成；approve → test / reject → develop；驳回失败预审的打回 turn 与 agent 评审打回同落点 | P0 |
 | E2E-05 | merge 冲突打回 | 74 | 自动合并失败 → `rebase --abort` → develop.execute prompt 含冲突文件；attempts=0 | P0 |
 | E2E-06a | 闸门测试失败 → 全 test_issue | 85 / 108 / 109 | gate=fail、gate_failures=1；跳 test.execute、`gate_recheck=true`、prompt 含闸门输出；修用例后重跑闸门 pass | P0 |
 | E2E-06b | 闸门失败 → code_issue | 85 | 存在 code_issue → pending(user_decision) → goto develop.execute | P0 |

@@ -743,6 +743,21 @@ pub enum FileAction {
     Delete,
 }
 
+impl FileAction {
+    /// 中文动词。打回反馈有两处渲染（决策 133 的段 + 决策 387 的 turn），共用这一份。
+    pub fn label(self) -> &'static str {
+        match self {
+            FileAction::Create => "新增",
+            FileAction::Modify => "修改",
+            FileAction::Delete => "删除",
+        }
+    }
+}
+
+/// 决策 387 裁决③：系统注入的 user turn 必须带的结构化前缀——两类 turn
+/// （用户原话逐字 / 系统注入带前缀）在转录里可机器区分、模型可辨识。
+pub const REVIEW_REWORK_TURN_PREFIX: &str = "【评审打回反馈·系统注入】";
+
 /// 业务测试场景（test-design 产出，决策 136）。
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
 pub struct TestScenario {
@@ -895,6 +910,22 @@ pub struct CodeChanges {
     pub unit_test_files: Vec<FileChangeSpec>,
 }
 
+/// review.execute 的 required_changes 单项（决策 387）。
+///
+/// 不复用 [`FileChangeSpec`]：那是 develop 侧产出契约，塞进 `finding` 等于把评审字段
+/// 派生进开发提交的 schema。旧格式输出（无 finding）向后兼容——`serde(default)` 兜底，
+/// 打回反馈降级为「只列路径 + 报告绝对路径」。
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
+pub struct ReviewRequiredChange {
+    pub path: String,
+    pub action: FileAction,
+    /// 发现摘要：错在哪、该改成什么。评审 execute 产出时逐项填写（决策 387——
+    /// 数据流最短路：发现本就在评审 agent 手里，不解析报告 markdown）。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(description = "发现摘要：错在哪、该改成什么（一两句话，内联进打回反馈）")]
+    pub finding: Option<String>,
+}
+
 /// review.execute 的 submit_metadata。
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize, JsonSchema)]
 pub struct ReviewResult {
@@ -902,7 +933,7 @@ pub struct ReviewResult {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub review_report_path: Option<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub required_changes: Vec<FileChangeSpec>,
+    pub required_changes: Vec<ReviewRequiredChange>,
 }
 
 /// test.execute 的 submit_metadata。

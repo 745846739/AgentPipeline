@@ -46,10 +46,10 @@ async fn e2e_03_review_rejection_pends_then_goto_develop_and_re_review_passes() 
         ReviewResult {
             approved: false,
             review_report_path: Some("review-report.md".into()),
-            required_changes: vec![agentpipeline_core::types::FileChangeSpec {
+            required_changes: vec![agentpipeline_core::types::ReviewRequiredChange {
                 path: "src/lib.rs".into(),
                 action: agentpipeline_core::types::FileAction::Modify,
-                content_hash: None,
+                finding: Some("add 未按设计处理负数入参：按 design.md AC-1 改为 saturating".into()),
             }],
         },
     );
@@ -152,24 +152,49 @@ async fn e2e_03_review_rejection_pends_then_goto_develop_and_re_review_passes() 
     f.agent.set_script(rework);
     f.executor.run("t3").await.unwrap();
 
-    // 决策 133 / 票 07：develop 重入的 user prompt 含本轮必须修改项；首轮不渲染该段。
-    let dev_prompts: Vec<String> = f
+    // 决策 387：develop 重入的打回反馈是续接转录末尾的带前缀 user turn（finding 内联），
+    // 不再渲染进 user prompt；首轮无 review 产出，两者都不出现。
+    let dev_runs: Vec<_> = f
         .requests_for(Stage::Develop, Node::Execute)
         .into_iter()
-        .map(|r| r.user_prompt)
         .collect();
+    let first_run = dev_runs[0].run.as_ref().unwrap().run_id;
     assert!(
-        !dev_prompts[0].contains("评审必须修改项"),
-        "首轮 develop 不渲染必须修改项段（无上游打回）：{}",
-        dev_prompts[0]
-    );
-    assert!(
-        dev_prompts
+        dev_runs
             .iter()
-            .skip(1)
-            .any(|p| p.contains("评审必须修改项") && p.contains("src/lib.rs")),
-        "review 打回后 develop 重入 prompt 应含必须修改项：{dev_prompts:?}"
+            .all(|r| !r.user_prompt.contains("评审必须修改项")),
+        "打回反馈已 turn 化，任何一轮的 user prompt 都不应渲染该段"
     );
+    let reentry = dev_runs
+        .iter()
+        .find(|r| r.run.as_ref().unwrap().run_id != first_run)
+        .expect("打回后 develop.execute 应重入");
+    let last = reentry.messages.last().expect("重入转录不应为空");
+    assert_eq!(
+        last.role,
+        agentpipeline_core::agent::Role::User,
+        "打回反馈应是转录末尾的 user turn"
+    );
+    let body = last.content.as_deref().unwrap_or("");
+    for expected in [
+        agentpipeline_core::types::REVIEW_REWORK_TURN_PREFIX,
+        "src/lib.rs",
+        "add 未按设计处理负数入参",
+    ] {
+        assert!(
+            body.contains(expected),
+            "打回 turn 缺 `{expected}`：\n{body}"
+        );
+    }
+    // 首轮（无 review 产出）转录里不出现该反馈。
+    let first_requests: Vec<_> = dev_runs
+        .iter()
+        .filter(|r| r.run.as_ref().unwrap().run_id == first_run)
+        .collect();
+    assert!(first_requests.iter().all(|r| r.messages.iter().all(|m| !m
+        .content
+        .as_deref()
+        .is_some_and(|c| c.contains(agentpipeline_core::types::REVIEW_REWORK_TURN_PREFIX)))));
 
     assert_eq!(
         f.store
@@ -287,6 +312,80 @@ async fn e2e_04_human_review_pends_then_reject_goes_to_develop() {
                 && t.reason.as_deref().unwrap_or("").contains("实现与设计不符")),
         "comments 应写进流转原因：{transitions:?}"
     );
+}
+
+/// 决策 387：human 评审端点的打回（`HumanReviewRejected`）与 agent 评审打回的
+/// 反馈落点一致——预审 `approved: false` 时，驳回后 develop 重入的转录末尾
+/// 同样追加带前缀的 user turn（finding 内联）。
+#[tokio::test]
+async fn e2e_04_human_reject_of_a_failing_review_also_lands_the_rework_turn() {
+    let f = Flow::new().await;
+    let mut script = Script::new();
+    to_review(
+        &mut script,
+        "t4r2",
+        ReviewResult {
+            approved: false,
+            review_report_path: Some("review-report.md".into()),
+            required_changes: vec![agentpipeline_core::types::ReviewRequiredChange {
+                path: "src/lib.rs".into(),
+                action: agentpipeline_core::types::FileAction::Modify,
+                finding: Some("断言恒真：改为断言具体返回值".into()),
+            }],
+        },
+    );
+    f.agent.set_script(script);
+    testkit::seed_task_full(&f.store, "t4r2", "p1", ReviewMode::Human, &[])
+        .await
+        .unwrap();
+    f.admit("t4r2").await;
+    f.executor.run("t4r2").await.unwrap();
+
+    // 人按「驳回」→ 打回 develop.execute（`resume_continues` 同为 true 的一档）
+    f.store
+        .apply_human_review("t4r2", false, Some("实现与设计不符"))
+        .await
+        .unwrap();
+
+    let mut rework = Script::new();
+    to_review(
+        &mut rework,
+        "t4r2",
+        ReviewResult {
+            approved: true,
+            review_report_path: Some("review-report.md".into()),
+            required_changes: vec![],
+        },
+    );
+    rework
+        .for_node(Stage::Test, Node::Execute)
+        .submit(&TestResult {
+            passed: true,
+            test_report_path: Some("test-report.md".into()),
+            failures: vec![],
+            gate_recheck: false,
+        });
+    f.agent.set_script(rework);
+    f.executor.run("t4r2").await.unwrap();
+
+    let dev_runs = f.requests_for(Stage::Develop, Node::Execute);
+    let first_run = dev_runs[0].run.as_ref().unwrap().run_id;
+    let reentry = dev_runs
+        .iter()
+        .find(|r| r.run.as_ref().unwrap().run_id != first_run)
+        .expect("驳回后 develop.execute 应重入");
+    let last = reentry.messages.last().expect("重入转录不应为空");
+    assert_eq!(last.role, agentpipeline_core::agent::Role::User);
+    let body = last.content.as_deref().unwrap_or("");
+    for expected in [
+        agentpipeline_core::types::REVIEW_REWORK_TURN_PREFIX,
+        "断言恒真：改为断言具体返回值",
+    ] {
+        assert!(
+            body.contains(expected),
+            "打回 turn 缺 `{expected}`：\n{body}"
+        );
+    }
 }
 
 #[tokio::test]

@@ -15,22 +15,22 @@
 （`model_request.rs::review_required_changes_segment`，决策 133 / pipeline-spec §6），
 改为**续接转录末尾追加一条 user turn**（装配形态对齐决策 279 的 `carried.push`）：
 
-- [ ] `ReviewResult.required_changes` 每项扩 `finding: Option<String>` 字段——
+- [x] `ReviewResult.required_changes` 每项扩 `finding: Option<String>` 字段——
       评审 execute 产出时逐项填写发现摘要（错在哪、该改成什么）；
       旧格式输出（无 finding）向后兼容，降级为「只列路径 + 报告绝对路径」
-- [ ] 打回 turn 的内容：系统前缀 `【评审打回反馈·系统注入】` + 每条修改项的
+- [x] 打回 turn 的内容：系统前缀 `【评审打回反馈·系统注入】` + 每条修改项的
       finding 内联 + `review-report.md` 的**绝对路径**（任务目录）
-- [ ] 覆盖两条打回路径：`ResumeCause::Review`（agent 评审 + 用户按「打回开发修复」）
+- [x] 覆盖两条打回路径：`ResumeCause::Review`（agent 评审 + 用户按「打回开发修复」）
       与 `ResumeCause::HumanReviewRejected`（human 评审端点）——两者的续接判定同为
       true（`types.rs:551`），反馈落点应一致
-- [ ] 装配点：续接转录之后追加（对齐决策 279），**首条消息逐字不变**——prompt
+- [x] 装配点：续接转录之后追加（对齐决策 279），**首条消息逐字不变**——prompt
       cache 前缀承诺从 run 内延伸到 resume（与决策 380 的划界见决策草稿）
-- [ ] 集成测试：打回重入后转录末尾含带前缀 turn + finding 内联；`approved=true`
+- [x] 集成测试：打回重入后转录末尾含带前缀 turn + finding 内联；`approved=true`
       或无 review 产出时不渲染；旧格式输出走降级路径；撤掉追加后用例先红
 
 **Blocked by:** None (can start immediately)
 
-**Status:** todo
+**Status:** done
 
 **边界.** 只动 review 打回这一条反馈的落点与内容；其余 reentry 段
 （gate_recheck / backtrack_feedback / retry_feedback）不动（见票 02）；不解析

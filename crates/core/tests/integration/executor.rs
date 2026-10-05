@@ -19,9 +19,9 @@ use agentpipeline_core::storage::observability::NewProjectRun;
 use agentpipeline_core::storage::Store;
 use agentpipeline_core::types::{
     AcceptanceCriterion, Approval, ArchitectExecuteMetadata, CodeChanges, CursorStatus,
-    DevelopDesignMetadata, Gate, Node, NodeCursor, NodeStatus, PendingKind, Project, ReviewResult,
-    Stage, TaskStatus, TestDesignMetadata, TestResult, TestScenario, TransitionTrigger,
-    ValidateInputMetadata, ValidateOutputMetadata,
+    DevelopDesignMetadata, Gate, Node, NodeCursor, NodeStatus, PendingKind, Project,
+    ReviewRequiredChange, ReviewResult, Stage, TaskStatus, TestDesignMetadata, TestResult,
+    TestScenario, TransitionTrigger, ValidateInputMetadata, ValidateOutputMetadata,
 };
 use futures::future::BoxFuture;
 use testkit::{FakeAgent, ManualClock, RecordingKiller, Repo, Script, SseRecorder, TestHome};
@@ -5241,6 +5241,240 @@ async fn an_info_insufficient_answer_is_recorded_together_with_its_questions() {
             execute.user_prompt.contains(expected),
             "execute 的 user prompt 缺 `{expected}`：\n{}",
             execute.user_prompt
+        );
+    }
+}
+
+// ── 决策 387 · 评审打回反馈改「转录末尾 user turn」──
+
+/// 首轮跑到 review 判定不通过、人按「打回开发修复」把游标放回 develop.execute。
+async fn run_to_review_reject(ctx: &Ctx, task_id: &str, review: &ReviewResult) {
+    let mut script = Script::new();
+    design_scripts(&mut script);
+    script
+        .for_node(Stage::Develop, Node::Execute)
+        .write_file(
+            "src/lib.rs",
+            "pub fn add(a: i32, b: i32) -> i32 { a + b }\n#[test]\nfn adds() { assert_eq!(add(1, 2), 3); }\n",
+        )
+        .write_file("tests/acceptance.rs", "#[test]\nfn ok() {}\n")
+        .run_command(&format!(
+            "git add -A && git -c user.name=f -c user.email=f@l commit -m 'feat: task {task_id}'"
+        ))
+        .submit(&CodeChanges {
+            branch_name: format!("kanban/{task_id}"),
+            changed_files: vec![],
+            unit_test_files: vec![],
+        });
+    script.for_node(Stage::Review, Node::Execute).submit(review);
+    ctx.agent.set_script(script);
+    testkit::seed_task(&ctx.store, task_id, "p1").await.unwrap();
+    admit(ctx, task_id).await;
+    ctx.executor.run(task_id).await.unwrap();
+
+    let cursor = ctx
+        .store
+        .load_live_cursors(task_id)
+        .await
+        .unwrap()
+        .into_iter()
+        .next()
+        .unwrap();
+    assert_eq!(
+        cursor.pending_reason.as_ref().unwrap().kind,
+        PendingKind::UserDecision,
+        "review 不通过应 pend 等人裁决"
+    );
+    agentpipeline_core::pipeline::resume::apply_action(
+        &ctx.store,
+        &cursor,
+        ResumeAction::Goto,
+        Some((Stage::Develop, Node::Execute)),
+        None,
+    )
+    .await
+    .unwrap();
+}
+
+/// 打回重入的 develop.execute 脚本（真写代码真提交）+ 复审通过 + test 通过。
+fn rework_scripts(script: &mut Script, task_id: &str) {
+    script
+        .for_node(Stage::Develop, Node::Execute)
+        .write_file("src/lib.rs", "pub fn add(a: i32, b: i32) -> i32 { a.saturating_add(b) }\n#[test]\nfn adds() { assert_eq!(add(1, 2), 3); }\n")
+        .run_command(&format!(
+            "git add -A && git -c user.name=f -c user.email=f@l commit -m 'fix: task {task_id}'"
+        ))
+        .submit(&CodeChanges {
+            branch_name: format!("kanban/{task_id}"),
+            changed_files: vec![],
+            unit_test_files: vec![],
+        });
+    script
+        .for_node(Stage::Review, Node::Execute)
+        .submit(&ReviewResult {
+            approved: true,
+            review_report_path: Some("review-report.md".into()),
+            required_changes: vec![],
+        });
+    script
+        .for_node(Stage::Test, Node::Execute)
+        .submit(&TestResult {
+            passed: true,
+            test_report_path: Some("test-report.md".into()),
+            failures: vec![],
+            gate_recheck: false,
+        });
+}
+
+/// 决策 387：评审打回 develop 重入时，反馈是**续接转录末尾**的一条带前缀 user turn
+/// （finding 内联 + 评审报告绝对路径），首条消息逐字不变、段不再渲染进 user prompt。
+#[tokio::test]
+async fn review_rework_feedback_is_a_prefixed_turn_at_the_end_of_the_carried_transcript() {
+    let ctx = setup("true", Settings::default()).await;
+    run_to_review_reject(
+        &ctx,
+        "t-rework",
+        &ReviewResult {
+            approved: false,
+            review_report_path: Some("review-report.md".into()),
+            required_changes: vec![ReviewRequiredChange {
+                path: "src/lib.rs".into(),
+                action: agentpipeline_core::types::FileAction::Modify,
+                finding: Some("add 未按设计处理负数入参：按 AC-1 改为 saturating".into()),
+            }],
+        },
+    )
+    .await;
+
+    let mut rework = Script::new();
+    rework_scripts(&mut rework, "t-rework");
+    ctx.agent.set_script(rework);
+    ctx.executor.run("t-rework").await.unwrap();
+
+    let requests = ctx.agent.request_log();
+    let mut develop = requests
+        .iter()
+        .filter(|r| r.stage == Stage::Develop && r.node == Node::Execute)
+        .peekable();
+    assert!(develop.peek().is_some(), "develop.execute 应有请求");
+    let first_run = develop.peek().unwrap().run.as_ref().unwrap().run_id;
+    let develop: Vec<_> = develop.collect();
+    let first_round_last = develop
+        .iter()
+        .rev()
+        .find(|r| r.run.as_ref().unwrap().run_id == first_run)
+        .expect("首轮 develop.execute 应有请求");
+    let reentry = develop
+        .iter()
+        .find(|r| r.run.as_ref().unwrap().run_id != first_run)
+        .expect("打回后 develop.execute 应重入");
+    let reentry = *reentry;
+    assert!(
+        reentry.messages.len() > first_round_last.messages.len(),
+        "重入转录应比首轮长（续接 + 追加 turn）"
+    );
+    assert_eq!(
+        reentry.messages[..first_round_last.messages.len()],
+        first_round_last.messages[..],
+        "重入转录的前缀必须与首轮转录逐字相同（prompt cache 承诺）"
+    );
+
+    // ② 转录末尾是带结构化前缀的 user turn，finding 内联 + 报告绝对路径。
+    let last = reentry.messages.last().unwrap();
+    assert_eq!(
+        last.role,
+        agentpipeline_core::agent::Role::User,
+        "打回反馈应是转录末尾的 user turn"
+    );
+    let report = ctx
+        ._home
+        .home()
+        .task_file("t-rework", "review-report.md")
+        .display()
+        .to_string();
+    let body = last.content.as_deref().unwrap_or("");
+    for expected in [
+        agentpipeline_core::types::REVIEW_REWORK_TURN_PREFIX,
+        "src/lib.rs",
+        "add 未按设计处理负数入参：按 AC-1 改为 saturating",
+        &report,
+    ] {
+        assert!(
+            body.contains(expected),
+            "打回 turn 缺 `{expected}`：\n{body}"
+        );
+    }
+
+    // ③ 段不再渲染进首条消息：重入的 user prompt 无「评审必须修改项」标题。
+    assert!(
+        !reentry.user_prompt.contains("评审必须修改项"),
+        "打回反馈已 turn 化，user prompt 不应再渲染该段：\n{}",
+        reentry.user_prompt
+    );
+    // 首轮（无 review 产出）user prompt 与转录里都不应出现该反馈。
+    assert!(!first_round_last.user_prompt.contains("评审必须修改项"));
+    assert!(first_round_last.messages.iter().all(|m| !m
+        .content
+        .as_deref()
+        .is_some_and(|c| c.contains(agentpipeline_core::types::REVIEW_REWORK_TURN_PREFIX))));
+}
+
+/// 旧格式评审产出（required_changes 无 finding）向后兼容：turn 降级为
+/// 「只列路径 + 报告绝对路径」，不空转、不静默。
+#[tokio::test]
+async fn review_rework_turn_degrades_when_required_changes_carry_no_finding() {
+    let ctx = setup("true", Settings::default()).await;
+    run_to_review_reject(
+        &ctx,
+        "t-legacy",
+        &ReviewResult {
+            approved: false,
+            review_report_path: Some("review-report.md".into()),
+            required_changes: vec![ReviewRequiredChange {
+                path: "src/lib.rs".into(),
+                action: agentpipeline_core::types::FileAction::Modify,
+                finding: None,
+            }],
+        },
+    )
+    .await;
+
+    let mut rework = Script::new();
+    rework_scripts(&mut rework, "t-legacy");
+    ctx.agent.set_script(rework);
+    ctx.executor.run("t-legacy").await.unwrap();
+
+    let requests = ctx.agent.request_log();
+    let mut develop = requests
+        .iter()
+        .filter(|r| r.stage == Stage::Develop && r.node == Node::Execute)
+        .peekable();
+    assert!(develop.peek().is_some(), "develop.execute 应有请求");
+    let first_run = develop.peek().unwrap().run.as_ref().unwrap().run_id;
+    let reentry = requests
+        .iter()
+        .find(|r| {
+            r.stage == Stage::Develop
+                && r.node == Node::Execute
+                && r.run.as_ref().unwrap().run_id != first_run
+        })
+        .expect("打回后 develop.execute 应重入");
+    let report = ctx
+        ._home
+        .home()
+        .task_file("t-legacy", "review-report.md")
+        .display()
+        .to_string();
+    let last = reentry.messages.last().unwrap();
+    let body = last.content.as_deref().unwrap_or("");
+    for expected in [
+        agentpipeline_core::types::REVIEW_REWORK_TURN_PREFIX,
+        "src/lib.rs",
+        &report,
+    ] {
+        assert!(
+            body.contains(expected),
+            "降级 turn 缺 `{expected}`：\n{body}"
         );
     }
 }

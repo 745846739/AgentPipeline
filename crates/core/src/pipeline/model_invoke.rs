@@ -184,6 +184,59 @@ fn supplement_input(home: &crate::home::Home, task_id: &str) -> Option<String> {
     (!reply.is_empty()).then(|| reply.to_string())
 }
 
+/// review 打回反馈的 turn 文本（决策 387）：带结构化前缀的 user turn，finding 内联 +
+/// 评审报告**绝对路径**。评审通过 / 无 review 产出 / 产出解析不出 → `None`（不渲染）。
+/// 旧格式产出（无 finding）降级为「只列路径 + 报告路径」；`required_changes` 为空 →
+/// 显式说明，不让模型误以为「没有要求」。
+async fn review_rework_turn(store: &Store, task: &Task) -> Result<Option<String>> {
+    let Some(meta) = store
+        .stage_output_metadata(&task.id, Stage::Review, OUTPUT_REVIEW_REPORT)
+        .await?
+    else {
+        return Ok(None);
+    };
+    let Ok(review) = serde_json::from_value::<crate::types::ReviewResult>(meta) else {
+        return Ok(None);
+    };
+    if review.approved {
+        return Ok(None); // 评审通过 → 不是打回
+    }
+    let report = review
+        .review_report_path
+        .as_deref()
+        .unwrap_or("review-report.md");
+    let report_abs = store
+        .home()
+        .task_file(&task.id, report)
+        .display()
+        .to_string();
+    let mut out = format!(
+        "{}\n上一轮提交被评审判定不通过，本轮必须修改：\n",
+        crate::types::REVIEW_REWORK_TURN_PREFIX
+    );
+    if review.required_changes.is_empty() {
+        out.push_str("（无结构化修改项）请阅读评审报告，按其文字结论修改。\n");
+    } else {
+        for change in &review.required_changes {
+            match change.finding.as_deref() {
+                Some(finding) => {
+                    out.push_str(&format!(
+                        "- {} `{}`：{}\n",
+                        change.action.label(),
+                        change.path,
+                        finding
+                    ));
+                }
+                None => {
+                    out.push_str(&format!("- {} `{}`\n", change.action.label(), change.path));
+                }
+            }
+        }
+    }
+    out.push_str(&format!("评审报告全文：{report_abs}\n"));
+    Ok(Some(out))
+}
+
 /// 模型调用编排片的依赖面（决策 249 · 票 03）：只拿票面点名的那几个，字段全可廉价克隆
 /// （连接池 / Arc / 配置）——留守核每次派发 `clone` 一份，不借 `&Executor`。
 pub(crate) struct ModelInvoke {
@@ -255,6 +308,24 @@ impl ModelInvoke {
                 }
             }
         }
+        // 决策 387：review 打回（`ResumeCause::Review` / `HumanReviewRejected`——两者的
+        // `resume_continues` 同为 true）的反馈不再渲染进首条消息段，改为**续接转录末尾
+        // 追加一条带结构化前缀的 user turn**（装配形态对齐决策 279 的 `carried.push`）。
+        // 只在真续接了转录时追加——无转录的重入没有「末尾」可落，反馈仍走 segment 通道；
+        // 真追加了（或转录里已有同文）才停用 segment（`AttemptCtx.review_rework_as_turn`）。
+        let mut review_rework_as_turn = false;
+        if cursor.stage == Stage::Develop && cursor.node == Node::Execute && !carried.is_empty() {
+            if let Some(text) = review_rework_turn(&self.store, task).await? {
+                let already_carried = carried.iter().any(|m| {
+                    m.role == crate::agent::client::Role::User
+                        && m.content.as_deref() == Some(text.as_str())
+                });
+                if !already_carried {
+                    carried.push(Message::user(text));
+                }
+                review_rework_as_turn = true;
+            }
+        }
         for round in 0..self.settings.agent_retry_max {
             let (run_id, attempt) = self
                 .ledger()
@@ -278,6 +349,7 @@ impl ModelInvoke {
                     attempt,
                     &carried,
                     supplement_as_turn,
+                    review_rework_as_turn,
                     brief_continuation,
                     cancel,
                 )
@@ -439,6 +511,7 @@ impl ModelInvoke {
         attempt: u32,
         carried: &[Message],
         supplement_as_turn: bool,
+        review_rework_as_turn: bool,
         brief_continuation: bool,
         cancel: Option<&CancelSignal>,
     ) -> std::result::Result<(NodeOutput, RunTokens), AttemptFailure> {
@@ -456,6 +529,7 @@ impl ModelInvoke {
                 attempt,
                 &mut trace,
                 supplement_as_turn,
+                review_rework_as_turn,
                 brief_continuation,
                 cancel,
             )
@@ -659,6 +733,7 @@ impl ModelInvoke {
         attempt: u32,
         trace: &mut AttemptTrace,
         supplement_as_turn: bool,
+        review_rework_as_turn: bool,
         brief_continuation: bool,
         cancel: Option<&CancelSignal>,
     ) -> Result<(NodeOutput, RunTokens)> {
@@ -773,6 +848,9 @@ impl ModelInvoke {
             // 决策 279：补充输入已作为 user turn 进转录（validate_input 续接），
             // segment 不再重渲染——见 `model_request::load_segments`。
             user_input_as_turn: supplement_as_turn,
+            // 决策 387：review 打回反馈已作为 user turn 进转录（develop.execute 续接），
+            // segment 同步停用——见 `model_request::load_segments`。
+            review_rework_as_turn,
             // 票 04：空白重跑那一档不带转录，改把现场投影成一份简报（见
             // `continuation_brief` 模块 doc）。**只在简报形态下才拼**——它是唯一一条
             // 需要动用 git / 目录读的组装路径，正常续接/全新起跑一个字节都不多读。
@@ -2103,6 +2181,71 @@ mod tests {
             supplement_input(&home, "t1").as_deref(),
             Some("部署在 k8s，单机即可")
         );
+    }
+
+    /// 决策 387：打回反馈 turn 的渲染门——无 review 产出 / 评审通过都不渲染；
+    /// `approved: false` 才出 turn（带前缀、finding 内联、报告绝对路径）。
+    #[tokio::test]
+    async fn review_rework_turn_renders_only_for_a_failing_review() {
+        let (_tmp, store, task, _cursor, _inv) = base().await;
+        let stage_output =
+            |review: crate::types::ReviewResult| serde_json::to_value(review).unwrap();
+
+        // 无 review 产出（首轮）→ None
+        assert!(review_rework_turn(&store, &task).await.unwrap().is_none());
+
+        // approved=true → 不是打回，不渲染
+        store
+            .upsert_stage_output(
+                &task.id,
+                Stage::Review,
+                OUTPUT_REVIEW_REPORT,
+                "review-report.md",
+                Some(&stage_output(crate::types::ReviewResult {
+                    approved: true,
+                    review_report_path: Some("review-report.md".into()),
+                    required_changes: vec![],
+                })),
+            )
+            .await
+            .unwrap();
+        assert!(review_rework_turn(&store, &task).await.unwrap().is_none());
+
+        // approved=false → turn 带：结构化前缀 / finding 内联 / 报告绝对路径
+        store
+            .upsert_stage_output(
+                &task.id,
+                Stage::Review,
+                OUTPUT_REVIEW_REPORT,
+                "review-report.md",
+                Some(&stage_output(crate::types::ReviewResult {
+                    approved: false,
+                    review_report_path: Some("review-report.md".into()),
+                    required_changes: vec![crate::types::ReviewRequiredChange {
+                        path: "src/lib.rs".into(),
+                        action: crate::types::FileAction::Modify,
+                        finding: Some("断言恒真".into()),
+                    }],
+                })),
+            )
+            .await
+            .unwrap();
+        let turn = review_rework_turn(&store, &task)
+            .await
+            .unwrap()
+            .expect("打回应渲染 turn");
+        let report_abs = store
+            .home()
+            .task_file(&task.id, "review-report.md")
+            .display()
+            .to_string();
+        for expected in [
+            crate::types::REVIEW_REWORK_TURN_PREFIX,
+            "修改 `src/lib.rs`：断言恒真",
+            &report_abs,
+        ] {
+            assert!(turn.contains(expected), "turn 缺 `{expected}`：\n{turn}");
+        }
     }
 
     /// 现场原文（run 143 / 144 / 145 的 error 列）：上游在流中途把连接掐了。

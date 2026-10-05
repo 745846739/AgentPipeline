@@ -76,6 +76,10 @@ pub struct AttemptCtx<'a> {
     /// ——「用户补充输入」segment 停止渲染，否则同一段话出现两遍、首条消息还变了
     /// （prompt cache 整段打穿的实测根源）。execute 等其余场景恒 false，segment 照旧。
     pub user_input_as_turn: bool,
+    /// 决策 387：review 打回反馈已作为 user turn 追加进续接转录（develop.execute 的
+    /// 打回续接场景）——「评审必须修改项」segment 停止渲染，否则同一段话出现两遍、
+    /// 首条消息还变了。只在真续接了转录时为 true；无转录的重入段照旧（降级通道）。
+    pub review_rework_as_turn: bool,
     /// 票 04：超时梯子第 3 档（空白重跑）的起跑简报——**已组装好的文本**，本模块只负责
     /// 渲染进首条 user prompt。文本由 `pipeline::continuation_brief` 拼（那一步要读盘 /
     /// 读 git / 读库），本模块因此仍守着「无 git」的边界（见模块 doc 的依赖四分类）。
@@ -487,8 +491,13 @@ async fn load_segments(ctx: &AttemptCtx<'_>) -> Result<PromptSegments> {
             )
             .await
         },
-        review_required_changes: review_required_changes_segment(ctx.store, ctx.task, ctx.cursor)
-            .await?,
+        review_required_changes: if ctx.review_rework_as_turn {
+            // 决策 387：打回反馈已作为 user turn 在转录末尾，不再渲染进首条消息——
+            // 首条消息逐字不变，prompt cache 的前缀承诺从「run 内」延伸到「resume」。
+            None
+        } else {
+            review_required_changes_segment(ctx.store, ctx.task, ctx.cursor).await?
+        },
         retry_feedback: architect_reentry_segment(
             home,
             &ctx.task.id,
@@ -671,12 +680,7 @@ async fn review_required_changes_segment(
     } else {
         out.push_str("本轮必须修改：\n");
         for change in &review.required_changes {
-            let action = match change.action {
-                crate::types::FileAction::Create => "新增",
-                crate::types::FileAction::Modify => "修改",
-                crate::types::FileAction::Delete => "删除",
-            };
-            out.push_str(&format!("- {action} `{}`\n", change.path));
+            out.push_str(&format!("- {} `{}`\n", change.action.label(), change.path));
         }
     }
     Ok(Some(out))
@@ -1342,6 +1346,7 @@ mod tests {
             attempt: 1,
             kind,
             user_input_as_turn: false,
+            review_rework_as_turn: false,
             continuation_brief: None,
             // 组装层大部分用例与授权无关：这一份是「还没探过」（判不出来就不拦人）。
             // 缺授权那条路自己在 `a_denied_disk_access_snapshot_fails_fast` 里置值。
@@ -1644,6 +1649,7 @@ mod tests {
 
         let suppressed = assemble_ok(AttemptCtx {
             user_input_as_turn: true,
+            review_rework_as_turn: false,
             ..ctx(
                 &store,
                 &settings,
@@ -2291,6 +2297,7 @@ mod tests {
                 attempt: 1,
                 kind: AgentNodeKind::ValidateInput,
                 user_input_as_turn: false,
+                review_rework_as_turn: false,
                 continuation_brief: None,
                 disk_access: crate::agent::disk_access::DiskAccessState::NotProbed,
             };
@@ -2398,6 +2405,7 @@ mod tests {
             attempt: 1,
             kind: AgentNodeKind::ArchitectExecute,
             user_input_as_turn: false,
+            review_rework_as_turn: false,
             continuation_brief: None,
             disk_access: state,
         };
@@ -2442,6 +2450,7 @@ mod tests {
             attempt: 1,
             kind: AgentNodeKind::ArchitectExecute,
             user_input_as_turn: false,
+            review_rework_as_turn: false,
             continuation_brief: None,
             disk_access: DiskAccessState::Denied,
         };
