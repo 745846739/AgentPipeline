@@ -52,7 +52,7 @@ fn git_out(root: &Path, args: &[&str]) -> String {
     git(root, args).unwrap_or_else(|| panic!("git {args:?} 返回非零"))
 }
 
-/// 变更面：`git status --porcelain`（含未跟踪）∪ `git diff --name-only HEAD`。
+/// 变更面：`git status --porcelain`（含未跟踪）∪ `git diff --name-only HEAD` ∪ 分支相对 origin/main 的 diff（提交后时序）。
 fn changed_paths(root: &Path) -> Vec<String> {
     let mut set = BTreeSet::new();
     if let Some(st) = git(root, &["status", "--porcelain"]) {
@@ -76,12 +76,25 @@ fn changed_paths(root: &Path) -> Vec<String> {
             }
         }
     }
+    // 提交落进任务分支后工作区变干净——改动面并上分支相对基准的 diff（场景 17 ① 的提交后时序）
+    if let Some(d) = git(root, &["diff", "--name-only", "origin/main..HEAD"]) {
+        for l in d.lines() {
+            let l = l.trim();
+            if !l.is_empty() {
+                set.insert(l.to_string());
+            }
+        }
+    }
     set.into_iter().collect()
 }
 
 /// `(新增行, 删除行)`；无 diff 时 (0, 0)。
 fn numstat(root: &Path, rel: &str) -> (usize, usize) {
-    let out = git_out(root, &["diff", "--numstat", "HEAD", "--", rel]);
+    let mut out = git_out(root, &["diff", "--numstat", "HEAD", "--", rel]);
+    if out.trim().is_empty() {
+        // 变更落进任务分支后 `diff HEAD` 变空——回退到分支相对基准的读数（场景 17 ④ 的提交后时序）
+        out = git_out(root, &["diff", "--numstat", "origin/main..HEAD", "--", rel]);
+    }
     let first = out.lines().next().unwrap_or("0\t0\tpath");
     let mut it = first.split('\t');
     let add = it.next().unwrap_or("0").parse().unwrap_or(0);
@@ -705,7 +718,11 @@ fn scene_11_detail_other_rules_untouched() {
         (13, 0),
         "场景 11：本票只许增 13 行（决策 215 注释 + 媒体查询），0 删除"
     );
-    let diff = git_out(&root, &["diff", "HEAD", "--", rel]);
+    let mut diff = git_out(&root, &["diff", "HEAD", "--", rel]);
+    if diff.trim().is_empty() {
+        // 提交后时序：正文取分支相对基准的 diff
+        diff = git_out(&root, &["diff", "origin/main..HEAD", "--", rel]);
+    }
     let added: Vec<&str> = diff
         .lines()
         .filter(|l| l.starts_with('+') && !l.starts_with("+++"))
