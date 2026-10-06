@@ -2,22 +2,43 @@
   import { notifications } from '../../stores/notifications.svelte';
   import { router } from '../../router.svelte';
 
+  /** 容器引用：Escape 的**归属判据**（焦点在不在本组件里），不靠 class 名猜。 */
+  let stack: HTMLDivElement | undefined = $state();
+
   function openTask(taskId: string | undefined, id: number) {
     notifications.dismiss(id);
     if (taskId) router.navigate(`/task/${taskId}`);
   }
+
+  /**
+   * 票 05（ux-audit-3）：toast 的 Escape 关闭路径。
+   * 口径：**只关焦点所在的那一条**；焦点不在 `.toasts` 内 → 这条 Escape 不归 toast 管，
+   * 一个字节都不动（对话框 / 菜单 / 决策 216④ 确认态各自有自己的 Escape）。
+   */
+  function handleKey(e: KeyboardEvent): void {
+    if (e.key !== 'Escape' || notifications.toasts.length === 0) return;
+    const active = document.activeElement;
+    if (!stack || !active || !stack.contains(active)) return;
+    const raw = active.closest('[data-toast-id]')?.getAttribute('data-toast-id') ?? null;
+    if (raw === null || !Number.isInteger(Number(raw))) return;
+    e.preventDefault();
+    notifications.dismiss(Number(raw));
+  }
 </script>
+
+<svelte:window onkeydown={handleKey} />
 
 <!-- 每条 toast 自己是一个 polite live region（`role=status` + `aria-atomic`）：
      新节点入 DOM 即播报，且**整条一起念**（标题 + 消息分成两个 span，不 atomic 就只念
      变化的那一小段）。容器不再是 live region——否则每条新增都会让读屏重念整列。
      悬停 / 聚焦暂停计时（票 17）：正在读的那一条不该在手指底下消失。 -->
-<div class="toasts">
+<div class="toasts" bind:this={stack}>
   {#each notifications.toasts as toast (toast.id)}
     <div
       class="toast {toast.cls}"
       role="status"
       aria-atomic="true"
+      data-toast-id={toast.id}
       onmouseenter={() => notifications.pause(toast.id)}
       onmouseleave={() => notifications.resume(toast.id)}
       onfocusin={() => notifications.pause(toast.id)}

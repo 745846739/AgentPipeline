@@ -267,6 +267,17 @@ test.describe('UX2 ⑨ 超时 / 断线 / 长值（票 12 / 13 / 17）', () => {
 
     // 截断的那条消息能悬停看全（`title` 与可见文字同值）
     expect(await toast.locator('.title').getAttribute('title')).toBeTruthy();
+
+    // 票 05（ux-audit-3）：真页面上的 Escape 关闭路径——审计 [r3] ⑤.1 因 harness 那一刻
+    // 没弹出 toast 而标「运行时未验证」，这条把缺口闭合：焦点在关闭钮（toast 归属域内）
+    // → 按 Escape → 这一条从 DOM 消失（归属守卫的另一半「焦点在外不动」由组件级
+    // ToastStack.test.ts 钉住）。
+    const toastId = await toast.getAttribute('data-toast-id');
+    expect(toastId, 'toast 应当带 data-toast-id（稳定定位器）').not.toBeNull();
+    await toast.locator('button.close').focus();
+    await page.keyboard.press('Escape');
+    await expect(page.locator(`.toast[data-toast-id="${toastId}"]`)).toHaveCount(0);
+
     expectBundleHealthy(bundle);
   });
 });
