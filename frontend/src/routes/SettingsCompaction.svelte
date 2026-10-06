@@ -198,7 +198,7 @@
     background: var(--bg);
     color: var(--text-hi);
     padding: 6px 10px;
-    font-size: 13px;
+    font-size: 12px;
   }
   .input:focus {
     outline: none;
