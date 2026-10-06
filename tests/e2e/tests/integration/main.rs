@@ -19,3 +19,4 @@ mod pending;
 mod reviews;
 mod timeouts;
 mod ux_audit3_artifacts;
+mod ux_audit3_landing;
