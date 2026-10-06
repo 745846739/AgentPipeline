@@ -93,6 +93,7 @@
   let toolOpen = $state<Record<string, boolean>>({});
   let thinkOpen = $state<Record<string, boolean>>({});
   let promptOpen = $state<Record<string, boolean>>({});
+  let sysOpen = $state<Record<string, boolean>>({});
   /** 轮的展开态：缺省收起（决策 366）。键随轮稳定（`r<runId>` / `g<n>` / `live<runId>`）。 */
   let turnOpen = $state<Record<string, boolean>>({});
   /** 每轮步骤切片的窗口游标（换 run 不重置：键随轮稳定，旧游标无有害 side effect）。 */
@@ -135,6 +136,11 @@
   function togglePrompt(e: MouseEvent, key: string) {
     e.preventDefault();
     promptOpen = { ...promptOpen, [key]: !promptOpen[key] };
+  }
+
+  function toggleSys(e: MouseEvent, key: string) {
+    e.preventDefault();
+    sysOpen = { ...sysOpen, [key]: !sysOpen[key] };
   }
 
   function toggleTurn(e: MouseEvent, key: string) {
@@ -293,9 +299,15 @@
           </Fold>
         {:else if step.kind === 'text'}
           {#if step.role === 'system'}
-            <details class="sys">
-              <summary class="sys-sum">SYS · 折叠正文 ▸</summary>
-              <pre class="sysbox">{step.text}</pre>
+            <!-- 渲染守卫（决策 361⑥）：正文常以万字计，收起时不进 DOM——与
+                 prompt / tool / command 三处的 `{#if}` 同一手法。 -->
+            <details class="sys" open={sysOpen[step.key] ?? false}>
+              <summary class="sys-sum" onclick={(e) => toggleSys(e, step.key)}
+                >SYS · 折叠正文 ▸</summary
+              >
+              {#if sysOpen[step.key]}
+                <pre class="sysbox">{step.text}</pre>
+              {/if}
             </details>
           {:else if step.role === 'user'}
             <div class="who">YOU</div>
@@ -325,7 +337,9 @@
                 >
               </span>
             {/snippet}
-            <pre class="rm-body mono draft">{step.text}</pre>
+            {#if thinkOpen[step.key]}
+              <pre class="rm-body mono draft">{step.text}</pre>
+            {/if}
           </Fold>
         {:else if step.tool}
           {@const tool = step.tool}

@@ -213,7 +213,9 @@ describe('现场时间线 · 思考步的折叠块（决策 244 / 359①）', ()
     expect(block).toBeTruthy();
     expect(block.open).toBe(false);
     expect(block.textContent).toContain('正在想…');
+    // 收起行只带 ticker 的最后一行；正文（第一行）不进 DOM（决策 361⑥ / 票 06）
     expect(block.textContent).toContain('再查一遍台账');
+    expect(block.textContent).not.toContain('先看看板');
 
     await fireEvent.click(block.querySelector('summary') as HTMLElement);
     expect(block.open).toBe(true);
@@ -462,6 +464,8 @@ describe('现场时间线 · 阶段 prompt 与落地思考（决策 360）', () 
     expect(think.open).toBe(false);
     expect(think.textContent).toContain('思考过程');
     expect(think.textContent).toContain('10 字');
+    // 折叠态正文不进 DOM（决策 361⑥ / 票 06）
+    expect(think.textContent).not.toContain('先想结构');
 
     await fireEvent.click(think.querySelector('summary') as HTMLElement);
     expect(think.open).toBe(true);
@@ -550,5 +554,34 @@ describe('上限截断的省略行（决策 362①）', () => {
     });
 
     expect(screen.queryByText('更早的增量已省略')).toBeNull();
+  });
+});
+
+describe('现场时间线 · 渲染守卫（决策 361⑥ / 票 06）', () => {
+  it('收起的系统消息正文不进 DOM；点开才到、可见', async () => {
+    render(SceneTimeline, {
+      props: {
+        conversations: [run()],
+        conversationFor: () =>
+          conv([
+            { role: 'system', content: '系统段常以万字计的提醒正文。' },
+            { role: 'user', content: '开始' },
+          ]),
+        commands: [],
+        commandOutputFor: () => null,
+      },
+    });
+
+    // 轮默认收起（决策 366）——先展开轮，再看系统步自身
+    await fireEvent.click(turnFold().querySelector('summary') as HTMLElement);
+    const sys = document.querySelector('details.sys') as HTMLDetailsElement;
+    expect(sys).toBeTruthy();
+    expect(sys.open).toBe(false);
+    expect(sys.querySelector('summary')?.textContent).toContain('SYS');
+    expect(sys.textContent).not.toContain('系统段常以万字计的提醒正文');
+
+    await fireEvent.click(sys.querySelector('summary') as HTMLElement);
+    expect(sys.open).toBe(true);
+    expect(sys.textContent).toContain('系统段常以万字计的提醒正文');
   });
 });

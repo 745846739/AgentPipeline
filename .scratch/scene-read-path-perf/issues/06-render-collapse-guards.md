@@ -20,7 +20,7 @@ assistant 正文无条件过 `MarkdownView`（`:246`），手机上就是实打�
 
 **Blocked by:** 01, 02, 03, 04（批一验收通过后动工；见 spec 决议 5）
 
-**Status:** ready-for-agent
+**Status:** done（2026-10-06，决策 361⑥）
 
 ## 落点
 
@@ -31,13 +31,25 @@ assistant 正文无条件过 `MarkdownView`（`:246`），手机上就是实打�
 
 ## 验收
 
-- [ ] 折叠态下系统消息与思考步的正文**不在 DOM**（`container.textContent` 不含该段文本）；
+- [x] 折叠态下系统消息与思考步的正文**不在 DOM**（`container.textContent` 不含该段文本）；
       展开后到达并可见
-- [ ] 直播期间的思考步仍带 ticker 摘要（`thinkTicker`）——摘要行不受守卫影响
-- [ ] 既有 `SceneTimeline.test.ts` / `taskScene.test.ts` 全绿（**注意**：若有断言依赖
+- [x] 直播期间的思考步仍带 ticker 摘要（`thinkTicker`）——摘要行不受守卫影响
+- [x] 既有 `SceneTimeline.test.ts` / `taskScene.test.ts` 全绿（**注意**：若有断言依赖
       「折叠态正文也在 DOM」，按本票的新口径订正，而不是保留旧行为）
-- [ ] 深链落点（`highlightRunId` 找 `article[data-run]`）与流式贴底跟随不受影响
-- [ ] `npm test` / `npm run check` / `npm run build` 全绿
+- [x] 深链落点（`highlightRunId` 找 `article[data-run]`）与流式贴底跟随不受影响
+- [x] `npm test` / `npm run check` / `npm run build` 全绿
+
+## 实施收尾（2026-10-06）
+
+- **守卫两处**：system 的 `<details class="sys">` 补 `open={sysOpen[key] ?? false}` +
+  `onclick` 受控切换（照 Fold 的手法，summary 上 `preventDefault`），展开体套
+  `{#if sysOpen[key]}`；思考步的 `<pre class="rm-body mono draft">` 套
+  `{#if thinkOpen[key]}`（Fold 的受控 `open` 本来就在，只缺守卫）。
+- **红测先行的三处断言**：新 describe「渲染守卫」钉系统消息（收起不含正文 → 点开可见）；
+  既有 359① 直播思考用例补「收起时正文第一行不在 DOM」（ticker 只带最后一行，摘要不受影响）；
+  既有 360 落地思考用例补「收起时正文不在 DOM」。去掉守卫三处全红。
+- **测试**：`SceneTimeline.test.ts` 19/19；`npm test` 1160 全绿、`svelte-check` 0 错误、
+  `npm run build` 过。
 
 **明确不做**：场景时间线的虚拟滚动；把 `DEFAULT_PAGE = 50` 降到更小（决策 349 / 359 的
 「整条时间线摆得开、直播贴底、深链落点」边界；且 106 只有 23 轮、本机最坏 48 轮，窗口

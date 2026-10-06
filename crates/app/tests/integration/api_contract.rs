@@ -201,6 +201,30 @@ async fn get(api: &Api, uri: &str) -> (StatusCode, Value) {
     call(api, request("GET", uri).body(Body::empty()).unwrap()).await
 }
 
+/// 带条件请求头的 GET，回传状态、响应头与**原始字节**（ETag/304 的判据要摸到头与空体）。
+async fn get_conditional(
+    api: &Api,
+    uri: &str,
+    if_none_match: Option<&str>,
+) -> (StatusCode, axum::http::HeaderMap, axum::body::Bytes) {
+    let mut req = request("GET", uri);
+    if let Some(inm) = if_none_match {
+        req = req.header(header::IF_NONE_MATCH, inm);
+    }
+    let response = api
+        .router
+        .clone()
+        .oneshot(req.body(Body::empty()).unwrap())
+        .await
+        .unwrap();
+    let status = response.status();
+    let headers = response.headers().clone();
+    let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    (status, headers, bytes)
+}
+
 async fn put(api: &Api, uri: &str, body: Value) -> (StatusCode, Value) {
     call(
         api,
@@ -968,6 +992,185 @@ async fn retry_archives_old_conversations_and_default_list_excludes_them() {
     let (status, body) = get(&api, &format!("/tasks/t1/conversations/{run}")).await;
     assert_eq!(status, StatusCode::OK);
     assert!(body["conversation"]["archived_at"].is_string());
+}
+
+// ──────────────────────────── ETag / 304（决策 361⑦ / 票 07）────────────────────────────
+
+/// 从响应头里取 ETag（三个用例共用一把读法）。
+fn etag_of(headers: &axum::http::HeaderMap) -> String {
+    headers
+        .get(header::ETAG)
+        .expect("必须带 ETag 头")
+        .to_str()
+        .unwrap()
+        .to_string()
+}
+
+/// 造一个带一条会话的任务；run 留在台账里（默认 running），是否收尾由调用方定。
+async fn seed_run_with_conversation(api: &Api) -> i64 {
+    let cursor = api.state.store.load_live_cursors("t1").await.unwrap()[0].clone();
+    let store = &api.state.store;
+    let run = store
+        .insert_run(&agentpipeline_core::storage::observability::NewRun {
+            task_id: "t1".into(),
+            cursor_id: cursor.cursor_id.clone(),
+            stage: Stage::ArchitectDesign,
+            node: agentpipeline_core::types::Node::Execute,
+            attempt: 1,
+            agent_type: "main".into(),
+            parent_run_id: None,
+            prompt_template_hash: None,
+            process_group_id: None,
+        })
+        .await
+        .unwrap();
+    store
+        .insert_conversation(
+            "t1",
+            run,
+            Stage::ArchitectDesign,
+            agentpipeline_core::types::Node::Execute,
+            1,
+            "main",
+            None,
+            &serde_json::json!([{"role": "user", "content": "正文"}]),
+            None,
+            None,
+            10,
+            5,
+            None,
+        )
+        .await
+        .unwrap();
+    run
+}
+
+#[tokio::test]
+async fn etag_304_on_second_read_of_a_completed_task() {
+    let api = api().await;
+    seed(&api, "t1").await;
+    seed_run_with_conversation(&api).await;
+    api.state
+        .store
+        .mark_terminal("t1", TaskStatus::Done)
+        .await
+        .unwrap();
+
+    // 三个读法各拿一次 ETag，第二次带 If-None-Match 都必须命中 304：零字节、ETag 仍在
+    for uri in [
+        "/tasks/t1/conversations",
+        "/tasks/t1/conversations?include_messages=true",
+        "/tasks/t1",
+    ] {
+        let (status, headers, _) = get_conditional(&api, uri, None).await;
+        assert_eq!(status, StatusCode::OK, "{uri}");
+        let etag = etag_of(&headers);
+
+        let (status, headers, body) = get_conditional(&api, uri, Some(&etag)).await;
+        assert_eq!(status, StatusCode::NOT_MODIFIED, "{uri}");
+        assert!(body.is_empty(), "{uri} 的 304 不该有 body");
+        assert_eq!(
+            headers.get(header::ETAG).map(|v| v.to_str().unwrap()),
+            Some(etag.as_str()),
+            "{uri} 的 304 必须保留 ETag"
+        );
+    }
+}
+
+#[tokio::test]
+async fn etag_changes_when_a_run_goes_from_running_to_done() {
+    // 本票最容易写错的判据：会话摘要的 status 是从台账贴进来的，run 收尾时
+    // 行数与 MAX(id) 都没动——版本键只锚会话行的话，同一 If-None-Match 会拿到过期 304。
+    let api = api().await;
+    seed(&api, "t1").await;
+    let run = seed_run_with_conversation(&api).await;
+
+    let (status, headers, _) = get_conditional(&api, "/tasks/t1/conversations", None).await;
+    assert_eq!(status, StatusCode::OK);
+    let etag = etag_of(&headers);
+
+    api.state
+        .store
+        .finish_run(
+            run,
+            &agentpipeline_core::storage::observability::RunOutcome {
+                status: Some(agentpipeline_core::types::NodeStatus::Success),
+                duration_ms: 42,
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+
+    let (status, _, body) = get_conditional(&api, "/tasks/t1/conversations", Some(&etag)).await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "run 收尾后同一 If-None-Match 必须 200"
+    );
+    let value: Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(
+        value["conversations"][0]["status"], "success",
+        "新内容必须带上收尾后的 run 状态"
+    );
+}
+
+#[tokio::test]
+async fn query_combinations_get_distinct_etags() {
+    let api = api().await;
+    seed(&api, "t1").await;
+    seed_run_with_conversation(&api).await;
+
+    let (_, h1, _) = get_conditional(&api, "/tasks/t1/conversations", None).await;
+    let (_, h2, _) =
+        get_conditional(&api, "/tasks/t1/conversations?include_archived=true", None).await;
+    let (_, h3, _) =
+        get_conditional(&api, "/tasks/t1/conversations?include_messages=true", None).await;
+
+    let e1 = etag_of(&h1);
+    let e2 = etag_of(&h2);
+    let e3 = etag_of(&h3);
+    assert_ne!(e1, e2, "include_archived 参数要参与版本键");
+    assert_ne!(e1, e3, "include_messages 参数要参与版本键");
+    assert_ne!(e2, e3);
+
+    // 参数不匹配的 If-None-Match 不能命中：拿 A 的 ETag 去 B 视图必须 200
+    let (status, _, _) = get_conditional(
+        &api,
+        "/tasks/t1/conversations?include_archived=true",
+        Some(&e1),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+}
+
+#[tokio::test]
+async fn sse_stream_route_carries_no_etag() {
+    // 票 07 的边界：ETag 只进两个读端点，事件流不协商（直播行为照旧）。
+    // 只摸响应头不读体——SSE 的体是无限流，读了就回不来。
+    let api = api().await;
+    seed(&api, "t1").await;
+
+    let response = api
+        .router
+        .clone()
+        .oneshot(
+            request("GET", "/tasks/t1/stream")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(
+        response
+            .headers()
+            .get(header::CONTENT_TYPE)
+            .and_then(|v| v.to_str().ok()),
+        Some("text/event-stream"),
+        "摸的必须是事件流那条路"
+    );
+    assert!(response.headers().get(header::ETAG).is_none());
 }
 
 #[tokio::test]

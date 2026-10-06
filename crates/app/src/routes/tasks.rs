@@ -9,9 +9,10 @@ use agentpipeline_core::types::{
     CommandSource, Node, NodeCursor, ReviewMode, Stage, Stewardship, TaskStatus,
 };
 use axum::extract::{Path, Query, State};
+use axum::http::header::{self, HeaderMap};
 use axum::http::StatusCode;
 use axum::response::sse::{Event, KeepAlive, Sse};
-use axum::response::IntoResponse;
+use axum::response::{IntoResponse, Response};
 use axum::Json;
 use futures::StreamExt;
 use serde::Deserialize;
@@ -177,10 +178,51 @@ pub async fn list(
     Ok(Json(json!({ "tasks": out })))
 }
 
+/// ETag / 304（决策 361⑦ / 票 07）：回看**已完成**任务时不再重搬——内容没变就回零字节。
+///
+/// 版本键 = 「端点 + 参数 + 响应体」整体哈希。票面警告过的坑：会话摘要的 `status`
+/// 是从台账 `list_runs` 贴进来的，run 收尾时行数与 MAX(id) 都没动——只锚会话行的
+/// 版本键会漏掉这次变化，让跑着的任务拿到过期 304。对响应体取哈希则什么都躲不掉：
+/// 台账一变，贴进来的字段就变，哈希跟着变。参数（`include_archived` /
+/// `include_messages`）显式进键：不同视图各有各的 ETag，一张视图的 ETag 不替另一张背书。
+///
+/// `Cache-Control: no-cache` 是 304 生效的前提：它让浏览器**每次都来对账**，命中才免搬运。
+/// 304 只撤 body，`ETag` 与缓存指令照旧带头。流式响应（SSE）不走这里。
+fn etag_response(key: &str, headers: &HeaderMap, body: serde_json::Value) -> Response {
+    use sha2::{Digest, Sha256};
+    let digest = Sha256::digest(format!("{key}|{body}").as_bytes());
+    let hex: String = digest.iter().map(|b| format!("{b:02x}")).collect();
+    let etag = format!("\"v-{hex}\"");
+
+    let matches = headers
+        .get(header::IF_NONE_MATCH)
+        .and_then(|v| v.to_str().ok())
+        .map(|v| {
+            // If-None-Match 按 RFC 7232 用弱比较：`*` 匹配任何现存表示，
+            // `W/` 前缀（至多一个）照接
+            v == "*"
+                || v.split(',').any(|c| {
+                    let candidate = c.trim();
+                    candidate.strip_prefix("W/").unwrap_or(candidate).trim() == etag
+                })
+        })
+        .unwrap_or(false);
+
+    let cache = [
+        (header::ETAG, etag),
+        (header::CACHE_CONTROL, "no-cache".to_string()),
+    ];
+    if matches {
+        return (StatusCode::NOT_MODIFIED, cache).into_response();
+    }
+    (cache, Json(body)).into_response()
+}
+
 /// `GET /tasks/{id}`：状态 + 游标 + `allowed_actions`（决策 49 / 76）。
 pub async fn detail(
     State(state): State<AppState>,
     Path(id): Path<String>,
+    headers: HeaderMap,
 ) -> ApiResult<impl IntoResponse> {
     let task = state.store.get_task(&id).await.map_err(map_core_error)?;
     let cursors = state
@@ -205,13 +247,17 @@ pub async fn detail(
         .await
         .map_err(map_core_error)?;
 
-    Ok(Json(json!({
-        "task": task,
-        "cursors": cursors_json(&cursors),
-        "allowed_actions": actions,
-        "depends_on": depends_on,
-        "blocks": blocks,
-    })))
+    Ok(etag_response(
+        &format!("task-detail|{id}"),
+        &headers,
+        json!({
+            "task": task,
+            "cursors": cursors_json(&cursors),
+            "allowed_actions": actions,
+            "depends_on": depends_on,
+            "blocks": blocks,
+        }),
+    ))
 }
 
 // ─────────────────────── 任务级托管（决策 210① / 票 08）───────────────────────
@@ -864,7 +910,13 @@ pub async fn conversations(
     State(state): State<AppState>,
     Path(id): Path<String>,
     Query(query): Query<ConversationListQuery>,
+    headers: HeaderMap,
 ) -> ApiResult<impl IntoResponse> {
+    // 版本键把两个参数都带上：批量与摘要、含归档与不含归档，各是各的 ETag
+    let etag_key = format!(
+        "task-conversations|{id}|{}|{}",
+        query.include_archived, query.include_messages
+    );
     if query.include_messages {
         // 批量取正文：与单条读法共用 `list_conversations`，故「同一 run_id 两种读法给出
         // 相同会话」是**同一份实现**的直接结果，不是两条路要各自维护的约定。
@@ -873,7 +925,11 @@ pub async fn conversations(
             .list_conversations(&id, query.include_archived)
             .await
             .map_err(map_core_error)?;
-        return Ok(Json(json!({ "conversations": conversations })));
+        return Ok(etag_response(
+            &etag_key,
+            &headers,
+            json!({ "conversations": conversations }),
+        ));
     }
 
     // run 状态不在会话行里（状态住台账），而药丸过滤要「状态」这一维（票 03）——
@@ -914,7 +970,11 @@ pub async fn conversations(
             })
         })
         .collect();
-    Ok(Json(json!({ "conversations": items })))
+    Ok(etag_response(
+        &etag_key,
+        &headers,
+        json!({ "conversations": items }),
+    ))
 }
 
 /// `GET /tasks/{id}/conversations/{run_id}`
