@@ -2424,3 +2424,48 @@ run 283 评审结论）；决策 133（被修订的渲染落点）、279（形�
 `pipeline/model_invoke.rs`（`review_rework_turn` + `agent_node` 追加）、
 `pipeline/model_request.rs`（`AttemptCtx.review_rework_as_turn` + `load_segments` 停用段）、
 `types.rs`（`ReviewRequiredChange`）、`agent/templates.rs`（评审 prompt 的 finding 要求）
+
+### 决策 388 · 闸门失败以事件记行：`occurred_at` 取失败落定时刻，复检期间不重记（修订调度器 ③ 的键源，不动 234 / 287 / 85）
+
+**起因**：任务 01M450DK2GKZP4PJ4FVRAFAGXZ 的 merge 测试闸门失败（`cargo test --quiet`
+600s 超时，按决策 85 踢回 test 复检）本该只打扰人一次，实际 **11 分钟推了 12+ 条内容
+全同的 PWA 通知**。病根在源头记账：调度器值守轮的 `note_discoveries` ③ 把
+`merge_result.gate == Fail` 这份**状态**当**事件**轮询，且拿 `task.updated_at` 充当待办
+的 `occurred_at`——复检中的任务每次工具调用都刷新 `updated_at`，去重键
+`(task_id, kind, occurred_at)` 永不重复，于是每轮巡扫（10s 一次）都是一条「新」待办，
+出机线只剩 60s 推送冷却在顶（决策 287 失败族照推 + 礼貌配置），正好一分钟一条。
+决定性证据：待办表里的 `occurred_at` 与任务详情的 `updated_at` 精确到纳秒一致。这同时
+违反术语表「待办」词条的语义——`occurred_at` 是事件**发生**的时刻，不是写入时刻。
+
+**裁决**：`gate_failure` 的记行以**事件**为准。`occurred_at` 改取 merge_result 行
+（`kanban_stage_outputs` 的 merge 行）最后一次写入的时刻——即闸门失败落定（gate=Fail
+写入 / kickback 过渡）的那一刻，复检期间该行不动、键不变，同一份 gate=Fail 再次被巡到
+时落不进第二行（既有唯一索引天然兜底）。**闸门重新评估再次失败 = 新事件**：失败出口
+重写 merge 行、落定时刻换新，照记一行照唤醒照推送——判据是「新的一次闸门评估失败」，
+不是「gate=Fail 还在」，真失败不被吞。复检成功、gate 被 Pass 覆盖后巡扫不再记。
+
+**与既有决策的关系（全部一字不动）**：决策 234 的三重节流管**值守轮唤醒**、决策 287
+管**出机线推送**——修的是「一个事件变成十二条」，不是「这条不该响」；决策 85 的
+kickback 分流不动，复检该踢还是踢；决策 271（watch-failure-quiet）的「一个事件只打扰
+人一次」原则本就在源头保证，本决策是它在闸门失败这条线上的补全（与决策 209③
+「`occurred_at` 取事件发生的时刻」同法，只是 ③ 此前没照做）。
+
+**明确不做**：推送侧不加同内容退避（病根在源头重复记行，给症状打补丁）；merge 闸门
+`cargo test` 600s 超时本身另行按证据裁（执行体当时在自主排查，非本仓缺陷）。
+
+**验证**：集成用例三条（`scheduler_tick` 模块）。①
+`gate_failure_is_recorded_once_while_task_rechecks`——失败落定后 `updated_at` 刷新三轮、
+巡扫三轮：待办只有一行、`occurred_at` 等于 merge 行落定时刻；**牙齿已验**：改动前该
+用例红（每轮各记一行）。②`a_reevaluated_gate_failure_is_a_new_event`——第二次真失败
+新增一行，`occurred_at` 是第二次落定时刻、`detail` 带第二次输出。③
+`a_passed_gate_stops_recording_gate_failure`——Pass 覆盖后巡扫不再记、存量行保留。
+唤醒面与推送映射回归：既有 `notify` / foreman 用例不改锚即过。
+
+**来源**：用户（2026-10-06「频繁给我发 test 失败的 pwa 通知，大约一分钟一次」）；
+实证 106 任务 01M450DK2GKZP4PJ4FVRAFAGXZ（`.scratch/monitor-01M450DK2GKZP4PJ4FVRAFAGXZ.md`
+监控记录：12+ 条 `gate_failure` 待办 `detail_json` 全同、`occurred_at` ≡ `updated_at`）；
+决策 209③（被违反的 `occurred_at` 语义）、85（kickback，不动）、234 / 287（唤醒与推送
+口径，不动）、271（源头保证原则）；落地票
+`.scratch/gate-failure-respam/issues/01-gate-failure-once.md`；落地
+`storage/observability.rs`（`merge_stage_row`：metadata 连同行落定时刻，行损坏照旧
+fail-fast）、`scheduler/mod.rs`（发现 ③ 的键源改换）。

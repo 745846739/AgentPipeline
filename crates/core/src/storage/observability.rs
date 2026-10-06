@@ -730,6 +730,34 @@ impl Store {
             .transpose()?)
     }
 
+    /// merge metadata 连同行本身的落定时刻。
+    ///
+    /// 调度器发现闸门失败时，`occurred_at` 要的是**事件发生**的时刻——即 merge_result
+    /// 行最后一次写入（闸门评估落定 / kickback 过渡）的那一刻，不是任务的 `updated_at`：
+    /// 复检中的任务每次工具调用都刷新它，拿它当去重键等于把一次失败记成十几行
+    /// （票 gate-failure-respam，决策 388）。merge 行在复检期间不动，同一份 gate=Fail
+    /// 再次被巡到时键不变；闸门重新评估再次失败时行被重写，键自然换新。行缺失返回
+    /// `None`、行损坏报错（与 [`Self::merge_metadata`] 同款）；仅有的差别是行存在而
+    /// `metadata_json` 为 NULL 时这里报错——现状没有这样的写入方，真出现即库被手改。
+    pub async fn merge_stage_row(
+        &self,
+        task_id: &str,
+    ) -> Result<Option<(MergeResult, DateTime<Utc>)>> {
+        match self
+            .get_stage_output(task_id, Stage::Merge, crate::types::MERGE_OUTPUT_TYPE)
+            .await?
+        {
+            None => Ok(None),
+            Some(row) => {
+                let metadata = row.metadata_json.clone().ok_or_else(|| {
+                    Error::Cursor(format!("任务 {task_id} 的 merge_result 行缺 metadata_json"))
+                })?;
+                let merge = serde_json::from_value::<MergeResult>(metadata)?;
+                Ok(Some((merge, row.updated_at)))
+            }
+        }
+    }
+
     /// merge metadata 的 upsert：**显式跳过 `gate_failures`**（决策 108）——
     /// 该计数跨阶段跳转不重置，否则 merge ↔ test 循环不终止。
     pub async fn upsert_merge_result(

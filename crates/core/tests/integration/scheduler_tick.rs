@@ -13,8 +13,9 @@ use agentpipeline_core::storage::observability::{NewRun, RunOutcome};
 use agentpipeline_core::storage::tasks::TaskFilter;
 use agentpipeline_core::storage::Store;
 use agentpipeline_core::types::{
-    CursorStatus, Node, NodeStatus, PendingContext, PendingKind, PendingReason, ResumeCause, Stage,
-    TaskStatus, TransitionTrigger,
+    Approval, CursorStatus, DiffStats, Gate, GateFailureKind, MergeResult, MergeStatus, Node,
+    NodeStatus, PendingContext, PendingKind, PendingReason, ResumeCause, Stage, TaskStatus,
+    TransitionTrigger, MERGE_OUTPUT_TYPE,
 };
 use testkit::{ManualClock, RecordingKiller, SseRecorder, TestHome};
 
@@ -2317,4 +2318,208 @@ async fn cancelling_a_task_leaves_a_waking_attention_row() {
     );
     assert!(open[0].kind.wakes(), "两类都唤醒（决策 234）");
     assert_eq!(open[0].task_id, "t1");
+}
+
+// ───────────── 闸门失败复检期的重复上报（票 gate-failure-respam / 决策 388）─────────────
+//
+// 病灶：note_discoveries ③ 拿 `task.updated_at` 充当 `gate_failure` 的 `occurred_at`，
+// 而复检中的任务每次工具调用都刷新 `updated_at`——去重键永不重复，一次失败被记成
+// 十几行、逐条推送（106 实测 11 分钟 12+ 条内容全同的 PWA 通知）。
+
+fn failed_merge_result(output: &str) -> MergeResult {
+    MergeResult {
+        diff_path: "merge-proposal.diff".into(),
+        diff_stats: DiffStats {
+            files_changed: 1,
+            insertions: 10,
+            deletions: 2,
+            file_details: Vec::new(),
+        },
+        base_commit: "basesha".into(),
+        gate: Some(Gate::Fail),
+        gate_failure_kind: Some(GateFailureKind::Test),
+        gate_failures: 0,
+        gate_failure_output: Some(output.into()),
+        conflict_files: Vec::new(),
+        approval: Approval::None,
+        status: MergeStatus::PendingApproval,
+    }
+}
+
+fn passed_merge_result() -> MergeResult {
+    MergeResult {
+        gate: Some(Gate::Pass),
+        gate_failure_kind: None,
+        gate_failure_output: None,
+        approval: Approval::Pending,
+        ..failed_merge_result("")
+    }
+}
+
+impl Harness {
+    /// 模拟复检期间的任务活动：updated_at 刷新到「现在」。
+    async fn touch_task(&self, task_id: &str) {
+        sqlx::query("UPDATE kanban_tasks SET updated_at = ? WHERE id = ?")
+            .bind(agentpipeline_core::storage::ts(self.clock.now()))
+            .bind(task_id)
+            .execute(self.store.pool())
+            .await
+            .unwrap();
+    }
+
+    /// merge_result 行的落定时刻（= 闸门评估写行那一刻，事件发生的时刻）。
+    async fn merge_settled_at(&self, task_id: &str) -> chrono::DateTime<chrono::Utc> {
+        self.store
+            .get_stage_output(task_id, Stage::Merge, MERGE_OUTPUT_TYPE)
+            .await
+            .unwrap()
+            .expect("merge_result 行应已存在")
+            .updated_at
+    }
+
+    async fn gate_failure_rows(
+        &self,
+        task_id: &str,
+    ) -> Vec<agentpipeline_core::storage::AttentionItem> {
+        self.store
+            .open_attention(100)
+            .await
+            .unwrap()
+            .into_iter()
+            .filter(|i| {
+                i.task_id == task_id
+                    && i.kind == agentpipeline_core::storage::AttentionKind::GateFailure
+            })
+            .collect()
+    }
+}
+
+/// 钉原缺陷：闸门失败 → 任务回 test 复检 → 期间 `updated_at` 刷新 N 次、值守轮巡扫
+/// N 轮 → `gate_failure` 待办**只有一行**，`occurred_at` 是失败落定（merge_result 行
+/// 写入）的时刻，不是任何一次 `updated_at` 刷新值。
+#[tokio::test]
+async fn gate_failure_is_recorded_once_while_task_rechecks() {
+    let h = Harness::new().await;
+    h.seed_task("t1").await;
+    h.mark_running("t1").await;
+
+    // 闸门失败落定：merge_result 写入 gate=Fail（merge.execute 的失败出口同款两连写）
+    h.store
+        .upsert_merge_result(
+            "t1",
+            "merge-proposal.diff",
+            &failed_merge_result("测试命令 cargo test --quiet 退出码 -1 命令超时（600s）"),
+        )
+        .await
+        .unwrap();
+    h.store.increment_gate_failures("t1").await.unwrap();
+    let settled_at = h.merge_settled_at("t1").await;
+
+    // 复检期间：任务一直在动（updated_at 每轮刷新），值守轮每轮都巡到同一份 gate=Fail
+    let mut first = None;
+    for round in 0..3 {
+        h.clock.advance_secs(20);
+        h.touch_task("t1").await;
+        let noted = h
+            .scheduler(Settings::default())
+            .tick()
+            .await
+            .unwrap()
+            .attention_noted;
+        if round == 0 {
+            first = Some(noted);
+        } else {
+            assert_eq!(noted, 0, "第 {round} 轮巡扫不得再记新行");
+        }
+    }
+    assert_eq!(first, Some(1), "第一轮记一行");
+
+    let rows = h.gate_failure_rows("t1").await;
+    assert_eq!(rows.len(), 1, "一次闸门失败只许一行待办");
+    assert_eq!(
+        rows[0].occurred_at, settled_at,
+        "occurred_at 是失败落定时刻，不是复检期间的某个 updated_at"
+    );
+    assert_eq!(
+        rows[0].detail_json.as_ref().unwrap()["gate_failure_kind"],
+        "test"
+    );
+}
+
+/// 不吞真失败：第一次失败复检完成后闸门再次评估、再次失败 → **新增一行**，
+/// `occurred_at` 是第二次失败落定的时刻，`detail` 带第二次的失败输出。
+#[tokio::test]
+async fn a_reevaluated_gate_failure_is_a_new_event() {
+    let h = Harness::new().await;
+    h.seed_task("t1").await;
+    h.mark_running("t1").await;
+
+    h.store
+        .upsert_merge_result(
+            "t1",
+            "merge-proposal.diff",
+            &failed_merge_result("第一次失败"),
+        )
+        .await
+        .unwrap();
+    h.store.increment_gate_failures("t1").await.unwrap();
+    let first_settled = h.merge_settled_at("t1").await;
+    h.scheduler(Settings::default()).tick().await.unwrap();
+    assert_eq!(h.gate_failure_rows("t1").await.len(), 1);
+
+    // 复检完成，任务重新跑到 merge：闸门重新评估、再次失败（行被重写，落定时刻换新）
+    h.clock.advance_secs(120);
+    h.touch_task("t1").await;
+    h.store
+        .upsert_merge_result(
+            "t1",
+            "merge-proposal.diff",
+            &failed_merge_result("第二次失败"),
+        )
+        .await
+        .unwrap();
+    h.store.increment_gate_failures("t1").await.unwrap();
+    let second_settled = h.merge_settled_at("t1").await;
+    assert_ne!(first_settled, second_settled);
+
+    h.scheduler(Settings::default()).tick().await.unwrap();
+    let rows = h.gate_failure_rows("t1").await;
+    assert_eq!(rows.len(), 2, "第二次真失败必须有自己的新行");
+    assert_eq!(rows[1].occurred_at, second_settled);
+    assert_eq!(
+        rows[1].detail_json.as_ref().unwrap()["output"],
+        "第二次失败"
+    );
+}
+
+/// 状态清除后不再报：复检成功、闸门通过（gate 被 Pass 覆盖）→ 巡扫不再记
+/// `gate_failure`，存量那一行也不受影响。
+#[tokio::test]
+async fn a_passed_gate_stops_recording_gate_failure() {
+    let h = Harness::new().await;
+    h.seed_task("t1").await;
+    h.mark_running("t1").await;
+
+    h.store
+        .upsert_merge_result("t1", "merge-proposal.diff", &failed_merge_result("失败"))
+        .await
+        .unwrap();
+    h.store.increment_gate_failures("t1").await.unwrap();
+    h.scheduler(Settings::default()).tick().await.unwrap();
+    assert_eq!(h.gate_failure_rows("t1").await.len(), 1);
+
+    // 复检通过：gate=Pass 覆盖同一行
+    h.clock.advance_secs(120);
+    h.touch_task("t1").await;
+    h.store
+        .upsert_merge_result("t1", "merge-proposal.diff", &passed_merge_result())
+        .await
+        .unwrap();
+    for _ in 0..2 {
+        h.clock.advance_secs(20);
+        h.touch_task("t1").await;
+        let report = h.scheduler(Settings::default()).tick().await.unwrap();
+        assert_eq!(report.attention_noted, 0, "闸门已通过，巡扫不得再记失败");
+    }
+    assert_eq!(h.gate_failure_rows("t1").await.len(), 1, "存量那一行保留");
 }

@@ -915,15 +915,23 @@ impl KanbanScheduler {
 
             // ③ 闸门失败（票面点名 develop 闸门与 merge 的 gate_failure_kind，读的是同一处
             //    merge_result：develop 闸门失败也会落到那条记录上）
+            //
+            //    票 gate-failure-respam（决策 388）：`occurred_at` 取**事件发生**的时刻——
+            //    merge_result 行写入 gate=Fail 那一刻（闸门评估落定 / kickback 过渡），
+            //    不是 `task.updated_at`。复检中的任务每次工具调用都刷新 `updated_at`，
+            //    拿它当去重键等于把同一份 gate=Fail 每轮巡扫都记成一条「新」失败
+            //    （106 实测 11 分钟推 12+ 条内容全同的 PWA 通知）。merge 行在复检期间
+            //    不动：再次巡到时键不变，唯一索引落不进第二行；闸门重新评估再次失败
+            //    时行被重写、键自然换新——真失败照记照响（唤醒面 234 / 出机线 287 一字不动）。
             if now - task.updated_at <= window {
-                if let Some(merge) = self.store.merge_metadata(&task.id).await? {
+                if let Some((merge, settled_at)) = self.store.merge_stage_row(&task.id).await? {
                     if merge.gate == Some(crate::types::Gate::Fail)
                         && self
                             .store
                             .note_attention(
                                 &task.id,
                                 AttentionKind::GateFailure,
-                                task.updated_at,
+                                settled_at,
                                 Some(&serde_json::json!({
                                     "gate_failure_kind": merge.gate_failure_kind.map(|k| match k {
                                         crate::types::GateFailureKind::Lint => "lint",
