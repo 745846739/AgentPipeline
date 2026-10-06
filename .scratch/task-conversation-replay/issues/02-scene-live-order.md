@@ -11,7 +11,7 @@
 
 **Blocked by:** None
 
-**Status:** ready-for-agent
+**Status:** done（0e7e4a9，决策 359；2026-10-06 复核状态行订正）
 
 ## 落点
 

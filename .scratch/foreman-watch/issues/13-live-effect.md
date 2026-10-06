@@ -7,7 +7,7 @@
 
 **Blocked by:** None（两个授权裁决已随决策 358 落定，2026-10-01）
 
-**Status:** ready-for-agent
+**Status:** done（2026-10-01，dff9f9a 交付、ae595a3 补 CI 夹具；2026-10-06 复核状态行订正——repair_deliver 8 例实测全绿）
 
 ## 设计要点（裁决已定，不再开放）
 
