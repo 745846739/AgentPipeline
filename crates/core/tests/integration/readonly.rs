@@ -377,7 +377,10 @@ impl<T> WrapErr<T> for Result<T> {
 #[tokio::test]
 async fn a_timed_out_readonly_command_kills_its_process_group() {
     let f = fixture().await;
-    let killer = Arc::new(RecordingKiller::new());
+    // 真收口，不是替身：这条用例起的 `tail -f` 会一直挂着，只有超时路径真去杀它才收得掉。
+    // 用只记账的 `RecordingKiller::new()` 时它没人收，测试进程一退就被 init 收养，
+    // 成了 PPID=1 的孤儿（本机一次攒下 87 个 tail，全在跟一个已删除的 quiet.log）。
+    let killer = Arc::new(RecordingKiller::with_real_kill());
     let executor = f.executor_with_killer(EnvMode::Auto, killer.clone());
     let mut ctx = f.ctx();
     // 一条会一直挂着的白名单命令（`tail -f` 一个没人写的文件），超时给 1 秒。
@@ -418,8 +421,32 @@ async fn a_timed_out_readonly_command_kills_its_process_group() {
         killed.iter().all(|pgid| *pgid > 0),
         "杀的是真 pgid，不是 0（kill(0) 是 no-op）：{killed:?}"
     );
+    // 「叫到了终止器」还不够，得**真的收掉**——旧版只查前者，于是把终止器换成只记账的替身时
+    // 用例照样绿，真 `tail` 一直挂着（本机攒到 87 个 PPID=1 的孤儿，都在跟已删除的 quiet.log）。
+    // 超时杀的是整个进程组，故这里探整组：组内一个都不剩才算收口。
+    let pgid = killed[0];
+    assert!(
+        wait_until_group_gone(pgid).await,
+        "超时后进程组 {pgid} 必须真的消失，而不是只被记了一笔：{killed:?}"
+    );
     // 台账要留下那一行（超时的命令也跑过）
     let last = last_command(&f).await;
     assert!(last.command.contains("tail"), "{}", last.command);
     assert!(last.exit_code.is_none(), "超时的命令没有退出码可填");
+}
+
+/// 轮询到进程组消失（`kill(-pgid, 0)` 回 `ESRCH`）为止，最多等 3 秒。
+///
+/// 用信号 0 探存在性：不投递任何信号，只问内核「这个组还在不在」。子进程退出后由 tokio
+/// 的孤儿回收器 `wait` 掉，中间有极短的僵尸窗口，轮询跨过它。
+async fn wait_until_group_gone(pgid: i32) -> bool {
+    for _ in 0..30 {
+        // SAFETY: 信号 0 不投递，只做存在性与权限检查。
+        let rc = unsafe { libc::kill(-pgid, 0) };
+        if rc != 0 && std::io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH) {
+            return true;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
+    false
 }

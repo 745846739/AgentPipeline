@@ -3,7 +3,7 @@
 //! - [`TestHome`]：`AGENTPIPELINE_HOME` 指向每测试独占临时目录 + 全量迁移的临时文件库
 //!   （决策 143 / 145）；
 //! - [`ManualClock`]：假时钟，手动推进（决策 143 接缝①）；
-//! - [`RecordingKiller`]：进程组终止器替身，只记录不真杀（接缝③）；
+//! - [`RecordingKiller`]：进程组终止器替身，默认只记录不真杀，`with_real_kill` 可记账 + 真收口（接缝③）；
 //! - [`git_fixture::Repo`]：系统 git CLI 搭建的场景仓库（决策 146）；
 //! - [`FakeAgent`]：脚本化 LLM 替身，**只替换 LLM 响应流，工具层真实执行**（决策 148）；
 //! - [`repo_fixture`]：技能来源仓的离线 fixture（真 libgit2 打本地裸仓 / 离线 smart HTTP，
