@@ -28,9 +28,10 @@
 //!
 //! **三处口径说明（详见 test-report.md 的命令台账）**：
 //!
-//! 1. **git 历史断言带可用性守卫**：`rev-list --count HEAD < 5` 或
+//! 1. **git 历史断言带可用性守卫**：`rev-list --count HEAD < 5`、
 //!    `merge-base HEAD origin/main` 失败（CI 的 depth=1 checkout，见 `docs/testing.md` §6
-//!    与 `runner_for_doc.rs` 文件头的同源口径）时，相应子断言跳过并打 stdout 说明——
+//!    与 `runner_for_doc.rs` 文件头的同源口径），或 merge-base 与 HEAD 同点
+//!    （审计已合入 main，`mb...HEAD` 退化为空集）时，相应子断言跳过并打 stdout 说明——
 //!    完整历史下才跑实断言，depth=1 下不假红。
 //! 2. **场景 1 的「严格早于」是更紧读法**：骨架提交 `53a9eb9` 一次落
 //!    `00-INDEX.md` + 13 个 `待填` 空壳（同秒入库），`d6b9311` 起逐条回填——
@@ -896,6 +897,15 @@ fn scene_06_product_code_zero_diff_and_sole_allowed_changes() {
         );
         return;
     };
+    if git(&root, &["rev-parse", "HEAD"]).is_some_and(|h| h.trim() == mb) {
+        // 合入 main 后 origin/main 与 HEAD 同点，`mb...HEAD` 恒为空集——
+        // 「零 diff」「白名单外无变更」会碰巧虚过，「spec 在变更里」则假红。
+        eprintln!(
+            "场景 6：HEAD 与 origin/main 同点（审计已合入 main）——\
+             diff 断言跳过；合入前证据见 test-report.md 命令台账"
+        );
+        return;
+    }
     let range = format!("{mb}...HEAD");
 
     // AC-7 点名口径：frontend/src 与 crates 字面零 diff。
