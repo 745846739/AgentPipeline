@@ -617,12 +617,12 @@ fn scene_03_three_named_rechecks_have_conclusions_and_criteria() {
     let router = read(&root, "frontend/src/router.svelte.ts");
     let router_lines: Vec<&str> = router.lines().collect();
     assert!(
-        router_lines[176].contains("readQuery"),
-        "router.svelte.ts:177 应是 readQuery 底座"
+        router_lines[179].contains("readQuery"),
+        "router.svelte.ts:180 应是 readQuery 底座"
     );
     assert!(
-        router_lines[192].contains("writeQuery"),
-        "router.svelte.ts:193 应是 writeQuery 底座"
+        router_lines[195].contains("writeQuery"),
+        "router.svelte.ts:196 应是 writeQuery 底座"
     );
     assert!(
         read(&root, "frontend/src/router.test.ts").contains("readQuery"),
@@ -709,7 +709,7 @@ fn scene_04_evidence_levels_are_traceable_with_source_spot_checks() {
         ("TaskDetail.svelte", 40, "let tab = $state"),
         ("PipelineRail.svelte", 340, ".rail.hero"),
         ("board.svelte.ts", 37, "filter = $state<StatusFilter>"),
-        ("router.svelte.ts", 177, "readQuery"),
+        ("router.svelte.ts", 180, "readQuery"),
         ("talkSessions.ts", 21, "TALK_SESSION_KEY"),
         ("PendingActions.svelte", 115, "btn solid"),
     ];
