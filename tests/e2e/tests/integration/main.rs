@@ -18,3 +18,4 @@ mod join_and_skip;
 mod pending;
 mod reviews;
 mod timeouts;
+mod ux_audit3_artifacts;
