@@ -242,7 +242,10 @@ describe('现场页签的批量装载（决策 361，票 03）', () => {
     await taskDetail.loadAllConversations();
 
     expect(mocks.getConversations).toHaveBeenCalledTimes(1);
-    expect(mocks.getConversations).toHaveBeenCalledWith('A', { includeMessages: true });
+    expect(mocks.getConversations).toHaveBeenCalledWith('A', {
+      includeMessages: true,
+      runIds: [1, 2, 3],
+    });
     expect(mocks.getConversation).not.toHaveBeenCalled();
     expect(Object.keys(taskDetail.conversationsFull).sort()).toEqual(['1', '2', '3']);
     expect(taskDetail.conversationsFull[2].messages_json[0].content).toBe('第 2 轮');
