@@ -14,6 +14,7 @@
 
 pub mod attention;
 pub mod catalog;
+pub mod compaction;
 pub mod conflict;
 pub mod cursors;
 pub mod decisions;
@@ -33,6 +34,7 @@ pub mod skill_sources;
 pub mod tasks;
 
 pub use attention::{AttentionItem, AttentionKind, AttentionSummary, WatchWakeOutcome};
+pub use compaction::CompactionOverrides;
 pub use foreman::{ForemanMessage, NewForemanMessage};
 pub use model_requests::{ModelRequest, ModelRequestStatus, ModelRequestUsage, NewModelRequest};
 pub use offload::OffloadSwitch;

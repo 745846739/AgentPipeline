@@ -105,7 +105,8 @@ graph TD
 | `pending_reminder_hours` | 24 | pending 超过此小时数未处理，重复提醒一次 |
 | `pending_timeout_hours` | 72 | pending 超过此小时数自动标记 stalled，看板高亮 |
 | `tick_interval_sec` | 10 | KanbanScheduler tick 周期（秒） |
-| `conversation_max_chars` | 200000 | 单次会话 messages 落库的最大字符数，超出截断 |
+| `conversation_max_chars` | 200000 | 单次会话 messages 落库的最大字符数，超出截断。**只管落库截断**——压缩触发线已改 token（决策 390） |
+| `conversation_max_tokens` | 300000 | L3 压缩的 token 硬底：转录 token 估算超线即强制按轮压缩，不看 provider 窗口登记（决策 390）。设置界面「管线压缩」卡可改（`kanban_compaction` 覆盖层） |
 | `conversation_retention_days` | 30 | 终态任务会话保留天数 |
 | `offload_threshold_tokens` | 4000 | 工具结果超过此值卸载到文件，context 只留预览 + 路径。**与 `tool_result_max_tokens` 已合并为同一项**（决策 110）：不存在"被截断但从未卸载"的中间区间 |
 | `context_soft_limit_ratio` | 0.6 | 触发压缩的阈值（占模型 context 窗口比例） |

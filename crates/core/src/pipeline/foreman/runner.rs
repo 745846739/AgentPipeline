@@ -879,6 +879,18 @@ impl ForemanRunner {
         cancel: Option<&TurnCancel>,
     ) -> Result<ForemanTurn> {
         let briefing = build_briefing(&self.store).await?;
+        // 有效设置（long-run-budget 票 02）：启动冻结的 settings 之上叠 DB 覆盖层
+        // （`kanban_compaction`，NULL 列 = 读 config 值）——与流水线侧
+        // `ModelInvoke::effective_settings` 同源（决策 291），懒读、保存即对下一轮生效。
+        let mut settings = self.settings.clone();
+        let overrides = self.store.compaction_overrides().await?;
+        if let Some(tokens) = overrides.conversation_max_tokens {
+            settings.conversation_max_tokens = tokens;
+        }
+        if let Some(rounds) = overrides.keep_recent_rounds {
+            settings.keep_recent_rounds = rounds;
+        }
+        let settings = &settings;
         // 阶段配置由外框读了一次传进来（人格 + provider / 采样参数共用那一份）。
         // provider 解析只有一处（[`TurnPlan::provider_id`]）：组装要它来登记身份，下面两次
         // 摘要（历史锚点 / 跨线互喂）要它来选摘要器。
@@ -951,7 +963,7 @@ impl ForemanRunner {
         let briefing_text = briefing.render();
         let question = input.transcript_text();
         let mut plan = TurnPlan::assemble(TurnFacts {
-            settings: &self.settings,
+            settings,
             session_id: &session.id,
             is_watch: input.is_watch(),
             cfg: cfg.as_ref(),

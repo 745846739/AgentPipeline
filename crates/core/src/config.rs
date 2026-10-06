@@ -32,6 +32,10 @@ pub struct Settings {
     pub pending_timeout_hours: u64,
     pub tick_interval_sec: u64,
     pub conversation_max_chars: usize,
+    /// L3 压缩的 token 硬底（long-run-budget 票 02）：转录 token 估算超线即强制触发
+    /// 按轮压缩，不看 provider 窗口登记的脸色。与 [`Settings::conversation_max_chars`]
+    /// 分家——token 线管压缩触发、字符线管落库截断（0017 三段共账），单位不同必然两本账。
+    pub conversation_max_tokens: usize,
     pub conversation_retention_days: u64,
     /// 唯一的工具结果阈值（决策 110）。
     pub offload_threshold_tokens: usize,
@@ -116,6 +120,7 @@ impl Default for Settings {
             pending_timeout_hours: 72,
             tick_interval_sec: 10,
             conversation_max_chars: 200_000,
+            conversation_max_tokens: 300_000,
             conversation_retention_days: 30,
             offload_threshold_tokens: 4000,
             context_soft_limit_ratio: 0.6,
@@ -156,6 +161,7 @@ pub struct PipelineOverrides {
     pub pending_timeout_hours: Option<u64>,
     pub tick_interval_sec: Option<u64>,
     pub conversation_max_chars: Option<usize>,
+    pub conversation_max_tokens: Option<usize>,
     pub conversation_retention_days: Option<u64>,
     pub offload_threshold_tokens: Option<usize>,
     pub context_soft_limit_ratio: Option<f64>,
@@ -203,6 +209,7 @@ impl PipelineOverrides {
             pending_timeout_hours,
             tick_interval_sec,
             conversation_max_chars,
+            conversation_max_tokens,
             conversation_retention_days,
             offload_threshold_tokens,
             context_soft_limit_ratio,
@@ -771,6 +778,19 @@ pub fn effective_idle_timeout(global: u64, stage_override: Option<u64>, node: No
 /// 有效绝对超时 = 节点级 > 阶段级 > 全局（决策 66）。
 pub fn effective_max_duration(global: u64, stage_override: Option<u64>, node: NodeTimeouts) -> u64 {
     node.max_duration_sec.or(stage_override).unwrap_or(global)
+}
+
+/// 出厂阶段默认（long-run-budget 票 01）：`develop` / `review` / `test` 是做实事的
+/// 重读型阶段，30 分钟对「通读源码、走查页面、跑 e2e」不够一段（ux-audit-3 七小时
+/// 浪费全是「流式心跳正常却跑满被杀」的循环）。出厂即给 90 分钟。
+///
+/// 只在 DB 阶段覆盖缺位时生效——`stage_configs` 里显式配过的值永远压过它，三级
+/// 优先序（节点 > 阶段 > 全局，决策 66）不变，这里不是第四层。
+pub fn factory_stage_max_duration(stage: &str) -> Option<u64> {
+    match stage {
+        "develop" | "review" | "test" => Some(5400),
+        _ => None,
+    }
 }
 
 /// 从阶段配置读节点级覆盖（`node_overrides_json`）。
@@ -1395,6 +1415,7 @@ mod tests {
         assert_eq!(s.pending_timeout_hours, 72);
         assert_eq!(s.tick_interval_sec, 10);
         assert_eq!(s.conversation_max_chars, 200_000);
+        assert_eq!(s.conversation_max_tokens, 300_000);
         assert_eq!(s.conversation_retention_days, 30);
         assert_eq!(s.offload_threshold_tokens, 4000);
         assert_eq!(s.context_soft_limit_ratio, 0.6);
@@ -1996,6 +2017,61 @@ mod tests {
             effective_max_duration(
                 1800,
                 Some(900),
+                NodeTimeouts {
+                    idle_timeout_sec: None,
+                    max_duration_sec: Some(60)
+                }
+            ),
+            60
+        );
+    }
+
+    /// 出厂阶段默认（long-run-budget 票 01）：三个重读型阶段给 5400，其余阶段一概
+    /// 不出厂值——遍历 [`crate::types::ALL_STAGES`] 全表，新增阶段默认安全（回落全局）。
+    #[test]
+    fn factory_stage_default_gives_heavy_stages_5400() {
+        use crate::types::{Stage, ALL_STAGES};
+        for stage in ALL_STAGES {
+            let expected = match stage {
+                Stage::Develop | Stage::Review | Stage::Test => Some(5400),
+                _ => None,
+            };
+            assert_eq!(
+                factory_stage_max_duration(stage.as_str()),
+                expected,
+                "{} 的出厂默认漂了",
+                stage.as_str()
+            );
+        }
+    }
+
+    /// 出厂默认不是第四层：DB 阶段覆盖压过它、节点级压过一切（决策 66 三级优先序回归）。
+    #[test]
+    fn factory_default_yields_to_db_stage_override_and_to_node() {
+        // stage_configs 里显式配过的值压过出厂默认：配了 1800 就用 1800
+        let stage_override = Some(1800u64).or_else(|| factory_stage_max_duration("develop"));
+        assert_eq!(
+            effective_max_duration(1800, stage_override, NodeTimeouts::default()),
+            1800
+        );
+        // 未配时回落出厂默认（而不是全局 1800）
+        let stage_override = None::<u64>.or_else(|| factory_stage_max_duration("develop"));
+        assert_eq!(
+            effective_max_duration(1800, stage_override, NodeTimeouts::default()),
+            5400
+        );
+        // 无出厂值的阶段回落全局
+        let stage_override = None::<u64>.or_else(|| factory_stage_max_duration("merge"));
+        assert_eq!(
+            effective_max_duration(1800, stage_override, NodeTimeouts::default()),
+            1800
+        );
+        // 节点级仍压过一切
+        let stage_override = None::<u64>.or_else(|| factory_stage_max_duration("develop"));
+        assert_eq!(
+            effective_max_duration(
+                1800,
+                stage_override,
                 NodeTimeouts {
                     idle_timeout_sec: None,
                     max_duration_sec: Some(60)

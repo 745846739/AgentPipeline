@@ -1446,3 +1446,17 @@ export interface PushSubscriptionRow {
 export interface PushSubscriptionList {
   subscriptions: PushSubscriptionRow[];
 }
+
+/** 「管线压缩」设置卡的读数（long-run-budget 票 02）：两个旋钮 + 逐字段 provenance。 */
+export interface CompactionSettings {
+  /** L3 压缩的 token 硬底：转录 token 估算超线即强制按轮压缩。 */
+  conversation_max_tokens: number;
+  /** 这格是谁定的：`default` = 没保存过（读 config 值）；`settings` = 界面保存过。 */
+  conversation_max_tokens_origin: 'default' | 'settings';
+  /** 压缩保留的最近轮数。 */
+  keep_recent_rounds: number;
+  keep_recent_rounds_origin: 'default' | 'settings';
+  /** config 层的值（origin=default 时与上面同值）——让「谁覆盖了谁」可见。 */
+  config_conversation_max_tokens: number;
+  config_keep_recent_rounds: number;
+}

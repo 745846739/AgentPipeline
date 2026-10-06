@@ -1,5 +1,6 @@
 //! 路由模块。
 
+pub mod compaction;
 pub mod foreman;
 pub mod foreman_watch;
 pub mod market;

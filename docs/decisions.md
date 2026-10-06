@@ -2469,3 +2469,89 @@ kickback 分流不动，复检该踢还是踢；决策 271（watch-failure-quiet
 `.scratch/gate-failure-respam/issues/01-gate-failure-once.md`；落地
 `storage/observability.rs`（`merge_stage_row`：metadata 连同行落定时刻，行损坏照旧
 fail-fast）、`scheduler/mod.rs`（发现 ③ 的键源改换）。
+
+### 决策 389 · 重读型阶段（develop / review / test）的出厂 `max_duration_sec` 提到 5400（不新增层级，DB 覆盖照旧压过它）
+
+**起因**：任务 01M450DK2GKZP4PJ4FVRAFAGXZ（ux-audit-3，纯只读走查）墙钟 24 小时 47 分，
+拆账发现约 7 小时是「模型一直在干活却被 max_duration 硬墙整段作废」的循环——review.execute
+超时 4 次、test.execute 6 次、develop 1 次，每次跑满 30 分钟被杀再续接（`.scratch/long-run-budget/`
+README 有完整实证账）。决策 66 的双闸语义本身没错（idle 闸管挂死、max_duration 闸管 runaway，
+流式心跳正常说明执行体在干活），错的是**预算档位与阶段形态不匹配**：全局缺省 1800 秒对
+「通读源码、走查页面、跑 e2e」的重读型阶段不够一段。106 上已手动把三阶段调到 5400 并验证
+（调大后 test.execute 第 9 次一口气 76 分钟跑通），但那是运行时配置，换机部署即回 1800。
+
+**裁决**：`config.rs` 新增**出厂阶段默认** `factory_stage_max_duration`——`develop` /
+`review` / `test` 缺省 5400 秒，其余阶段不出厂值（回落全局 1800）。接线在调度器超时判定
+的有效值计算处：**DB 阶段覆盖 or 出厂默认 or 全局**——出厂默认插在「DB 阶段覆盖」与
+「全局」之间，不新增层级、不改 `effective_max_duration` 签名，决策 66 的三级优先序
+（节点 > 阶段 > 全局）一字不动：`stage_configs` 里显式配过的值永远压过出厂默认。
+
+**与既有决策的关系**：不推翻决策 66（双闸与三级覆盖原样）；与决策 320 的梯子无涉
+（梯子次数写死不配的口径不变，见决策 205）；idle 闸（缺省 300 秒）不动。
+
+**明确不做**：自适应预算（决策 66 的 P50/P90 从「仅告警」升格为「参与判定」）本轮不做，
+想做时单独走决策；任务级 override 不做（阶段级就够）；部署避让不做。
+
+**验证**：单测两条（`config` 模块）。①
+`factory_stage_default_gives_heavy_stages_5400`——遍历 `ALL_STAGES` 全表，三阶段 5400、
+其余 None（新增阶段默认安全）；② `factory_default_yields_to_db_stage_override_and_to_node`
+——DB 覆盖压过出厂值、未配回落出厂值（而非全局）、无出厂值阶段回落全局、节点级压过一切。
+**来源**：106 实证（同上）；grilling 六轮收敛（2026-10-06）；落地票
+`.scratch/long-run-budget/issues/01-stage-timeout-budget.md`；落地 `config.rs`
+（`factory_stage_max_duration`）、`scheduler/mod.rs`（有效值计算处归并）。
+
+### 决策 390 · 压缩硬底 token 化：触发改 `conversation_max_tokens`（缺省 30 万），字符账退回落库截断（显式修订票 03 的字符硬底）
+
+**起因**：同一任务的第二笔账——L3 压缩的字符硬底（决策 376 票 03）**51 次触发**
+（develop 22 / test 15 / review 12 / 设计 2），每次作废提示词缓存前缀并压掉一部分工作
+上下文。20 万**字符** ≈ 5–10 万 token，对 100 万 token 的模型窗口保守过头；而该任务
+512 次请求单次最大仅 8.9 万 token（中位数 5.3 万）——硬底放到 30 万 **token** 后这类
+审计任务一次压缩都不会发生，上下文连续性拉满。票 03 选字符是因为当时 token 侧只有
+**容量判据**（估算 vs provider 窗口登记）且登记被虚高架空；token 硬底是**绝对数**、
+不消费登记值，估算器复用软限同款（`estimate_messages_tokens`，误差有界）——票 03 教义
+的「不看 provider 脸色」在 token 口径下照样成立。
+
+**裁决**：①**触发判据**（决策 291 两端同源，流水线与值班长同批改）：
+`should_compact_with_floor(current_tokens, capacity, conversation_max_tokens)` = 软限
+（不变）**或** `current_tokens > conversation_max_tokens`；`transcript_chars` 退出触发、
+保留在压缩日志里作对照（`trigger` 取值 `char_floor` → `token_floor`）。`capacity = None`
+时软限不判、token 硬底照判（票 03 姿态原样）。②**配置**：`Settings` /
+`PipelineOverrides` / `set!` 宏新增 `conversation_max_tokens`（缺省 300_000）；
+`conversation_max_chars` 缺省 200_000 不动，职责收缩为「会话落库截断」（0017 三段共账 +
+0038 reasoning 截断的既有路径一字不动）——**token 线管触发、字符线管落库，两本账分家**
+（单位不同无法共账；推翻译决 376 票 03 的字符硬底判据与其后「不改 conversation_max_chars
+缺省」的口径，那时的「无罪」判的是治虚高登记的功，不是永远不改的封印）。③**运行时可改**：
+应用从不写 config.toml（settings-honesty 的边界），新增单行覆盖表 `kanban_compaction`
+（迁移 0042，`CHECK (id = 1)`，两列可空：NULL = 没保存过回落 config 值，server_bind /
+offload 同构）；消费点**懒读**（foreman_watch 先例）——流水线在 `agent_attempt_inner`
+组装前（`ModelInvoke::effective_settings`）、值班长在 `respond_inner` 组装前，各自把
+覆盖叠到 settings 克隆的两个字段上，保存即对下一个 attempt / 下一轮生效，不经重启。
+④**API 与界面**：`GET/PUT /compaction`（GET/PUT 同一份 readout 是结构保证，provenance
+逐字段 `default` / `settings`——保存值等于缺省也是 `settings`，诚实口径照决策 257）；
+前端新增「管线压缩」设置卡（独立路由 + SettingsLanding「怎么跑」门牌），暴露
+`conversation_max_tokens` 与 `keep_recent_rounds`（后者决策 376 时已是配置项但从未进
+UI）；`conversation_max_chars` 不进卡片。
+
+**与既有决策的关系**：决策 376 票 03 的字符硬底判据被本决策**显式修订**（教义保留：
+无 capacity 硬底照判、不看登记脸色）；决策 291 两端同源照守（同批改、同一份算术）；
+决策 257 诚实口径照守；决策 258 配置清单同一性——新字段自动被定值探针覆盖。
+决策 205 / 320（梯子）无涉不动。
+
+**明确不做**：不动 `estimate_messages_tokens` 算术与 L1/L2 裁剪口径；不动软限/硬限
+比例；不做 `conversation_max_chars` 的 UI 写口；不做自适应硬底。
+
+**验证**：单测——`token_floor_predicates`（线上边界 / 无 capacity / 登记虚高 / 软限
+真超线四象限）、`compaction_overrides_default_to_none_and_persist`（DB 往返）、
+定值探针与 `defaults_match_design_table` 随新字段转绿；L2——
+`a_long_tool_round_trip_node_is_capped_by_the_token_floor`（60 轮工具往返、注入 4 万
+token 小硬底，节点照常收口、压缩真实发生、每请求压在硬底余量内、总量低于 O(n²) 理想值
+一半）与两条落库截断回归（字符账语义不变）；L3——
+`compaction_settings_round_trip_with_provenance`（缺省 default / 保存后 settings /
+值同缺省仍 settings / 零值 400 / 缺体 422）。
+**来源**：106 实证（同决策 389，51 次压缩与 512 次请求的 token 分布）；
+grilling 收敛时用户拍板「30 万应该是 token 不是字符数」（2026-10-06）；落地票
+`.scratch/long-run-budget/issues/02-token-floor-and-settings.md`；落地 `agent/context.rs`
+（谓词）、`pipeline/model_request.rs` / `pipeline/foreman/turn_plan.rs`（两端消费）、
+`pipeline/model_invoke.rs` / `pipeline/foreman/runner.rs`（懒读叠加）、`config.rs`、
+`storage/compaction.rs` + 迁移 0042、`app` 路由 `/compaction`、
+`frontend`（SettingsCompaction + 五处注册）。

@@ -254,6 +254,22 @@ impl ModelInvoke {
         RunLedger::new(&self.store, self.clock.as_ref())
     }
 
+    /// 有效设置（long-run-budget 票 02）：启动冻结的 [`Settings`] 之上叠 DB 覆盖层
+    /// （`kanban_compaction`，NULL 列 = 没保存过 = 读 config 值，server_bind 同构语义）。
+    /// 懒读、每 attempt 一次——设置卡保存后下一个 attempt 即生效，不经重启。
+    /// 值班长侧在 TurnFacts 组装处做同一件事（决策 291 两端同源）。
+    async fn effective_settings(&self) -> Result<Settings> {
+        let mut settings = self.settings.clone();
+        let overrides = self.store.compaction_overrides().await?;
+        if let Some(tokens) = overrides.conversation_max_tokens {
+            settings.conversation_max_tokens = tokens;
+        }
+        if let Some(rounds) = overrides.keep_recent_rounds {
+            settings.keep_recent_rounds = rounds;
+        }
+        Ok(settings)
+    }
+
     /// agent 节点：独立对话（决策 33）+ 工具真实执行（决策 148）+
     /// `agent_retry_max` 重试（决策 33 / G13 分层计数；决策 278 起重试轮续接转录＋错误 turn，
     /// 不再是「干净对话重试」——显式修订决策 205 裁决②；决策 298 按错误类别分流收窄 278 的
@@ -739,6 +755,11 @@ impl ModelInvoke {
     ) -> Result<(NodeOutput, RunTokens)> {
         let home = self.store.home().clone();
         home.ensure_task_dirs(&task.id)?;
+        // 有效设置（long-run-budget 票 02）：启动冻结的 settings 之上叠 DB 覆盖层
+        // （`kanban_compaction`，NULL 列 = 读 config 值）。懒读——设置卡保存后
+        // **下一个 attempt 即生效**，不经重启（foreman_watch 懒读开关的既有先例）。
+        // 只覆盖压缩两个旋钮；超时等其余字段照吃启动值。
+        let settings = self.effective_settings().await?;
         let worktree = task
             .worktree_path
             .clone()
@@ -805,7 +826,7 @@ impl ModelInvoke {
                 Arc::new(crate::pipeline::subagent::StoreSubAgentRunner::new(
                     crate::pipeline::subagent::SubAgentRunnerConfig {
                         store: self.store.clone(),
-                        settings: self.settings.clone(),
+                        settings: settings.clone(),
                         llm: self.llm.clone(),
                         killer: self.killer.clone(),
                         home: home.clone(),
@@ -838,7 +859,7 @@ impl ModelInvoke {
         // pending）不在门里，在进轮循环处统一做（决策 245「门吃落点不吃原因」）。
         let prepared = RequestPlan::assemble(AttemptCtx {
             store: &self.store,
-            settings: &self.settings,
+            settings: &settings,
             task,
             project,
             cursor,

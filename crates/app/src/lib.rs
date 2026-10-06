@@ -180,6 +180,13 @@ pub fn build_router(state: AppState) -> Router {
             "/offload",
             get(routes::offload::settings).put(routes::offload::set_enabled),
         )
+        // ── 管线压缩设置（long-run-budget 票 02）──
+        // 全局设置端点：GET/PUT 同一份 readout，provenance 逐字段（default / settings）。
+        // 保存即活：流水线每 attempt、值班长每轮懒读 `kanban_compaction` 覆盖层。
+        .route(
+            "/compaction",
+            get(routes::compaction::settings).put(routes::compaction::set),
+        )
         // ── 技能市场（决策 172⑤，票 09）：本地导入 / 目录扫描 / 卸载。全程离线 ──
         // 子 router 自带 state（import 路由要单独放宽请求体上限），故先 merge 再进防护层。
         .merge(routes::skills::routes(state.clone()))

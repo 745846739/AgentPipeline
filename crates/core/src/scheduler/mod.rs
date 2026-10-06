@@ -10,7 +10,10 @@ use std::sync::Arc;
 use chrono::Duration;
 
 use crate::clock::Clock;
-use crate::config::{effective_idle_timeout, effective_max_duration, node_timeouts, Settings};
+use crate::config::{
+    effective_idle_timeout, effective_max_duration, factory_stage_max_duration, node_timeouts,
+    Settings,
+};
 use crate::process::ProcessKiller;
 use crate::sse::{SseEvent, SseSink};
 use crate::storage::attention::AttentionKind;
@@ -241,9 +244,14 @@ impl KanbanScheduler {
                 stage_cfg.and_then(|c| c.idle_timeout_sec),
                 node_override,
             );
+            // 出厂阶段默认插在「DB 阶段覆盖」与「全局」之间（long-run-budget 票 01）：
+            // stage_configs 里显式配过的值压过它，三级优先序（决策 66）不变。
+            let stage_max = stage_cfg
+                .and_then(|c| c.max_duration_sec)
+                .or_else(|| factory_stage_max_duration(run.stage.as_str()));
             let max_duration = effective_max_duration(
                 self.settings.node_max_duration_sec,
-                stage_cfg.and_then(|c| c.max_duration_sec),
+                stage_max,
                 node_override,
             );
 

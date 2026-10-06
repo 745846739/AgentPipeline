@@ -151,11 +151,10 @@ pub struct RequestPlan {
     pub node: Node,
     pub attempt: u32,
     pub keep_recent_rounds: usize,
-    /// L3 硬底（票 03）：转录字符量超过它就强制压缩，与软限判据取「或」。
-    /// 与会话落库截断共用 `Settings.conversation_max_chars` 这一个数——落库侧
-    /// 截的是「一条会话行留多少痕」，这里管的是「一轮请求最多驮多少转录」，
-    /// 同一个 20 万字符的量纲，语义见各自文档。
-    pub conversation_max_chars: usize,
+    /// L3 硬底（long-run-budget 票 02，修订票 03）：转录 token 估算超过它就强制压缩，
+    /// 与软限判据取「或」。绝对数、不看 provider 窗口登记的脸色。
+    /// （字符线 `Settings.conversation_max_chars` 只管会话落库截断，不再参与这里的触发。）
+    pub conversation_max_tokens: usize,
 }
 
 impl RequestPlan {
@@ -331,7 +330,7 @@ impl RequestPlan {
             node: cursor.node,
             attempt: ctx.attempt,
             keep_recent_rounds: ctx.settings.keep_recent_rounds,
-            conversation_max_chars: ctx.settings.conversation_max_chars,
+            conversation_max_tokens: ctx.settings.conversation_max_tokens,
         };
 
         // 组装期唯一能判的超限：静态两段已超硬限——messages 压到 0 也还在限之上，
@@ -377,13 +376,9 @@ impl RequestPlan {
         let estimate = |msgs: &[Message]| {
             crate::agent::context::estimate_messages_tokens(&self.system, &self.user, msgs)
         };
+        let tokens = estimate(messages);
         let chars = transcript_chars(messages);
-        if !should_compact_with_floor(
-            estimate(messages),
-            self.capacity,
-            chars,
-            self.conversation_max_chars,
-        ) {
+        if !should_compact_with_floor(tokens, self.capacity, self.conversation_max_tokens) {
             return BudgetCheck::Ok { compacted: None };
         }
         // L3：规则化按轮压缩（不调 LLM，§12.13.3 规则表）
@@ -393,9 +388,10 @@ impl RequestPlan {
         *messages = outcome.messages;
         *carried_len = outcome.current_start;
         // 压缩发生时有可观测记录（票面要求）；触发源记下来——硬底触发说明软限那条线
-        // 没拦住（登记虚高 / 无 provider），正是票 03 要观测的现场。
-        let trigger = if chars > self.conversation_max_chars {
-            "char_floor"
+        // 没拦住（登记虚高 / 无 provider），正是票 03 要观测的现场。字符读数保留作对照
+        // （long-run-budget 票 02：触发已改 token 口径，chars 不再参与判定）。
+        let trigger = if tokens > self.conversation_max_tokens {
+            "token_floor"
         } else {
             "soft_limit"
         };
@@ -404,8 +400,9 @@ impl RequestPlan {
             stage = %self.stage,
             node = %self.node,
             trigger,
+            tokens,
             chars,
-            floor = self.conversation_max_chars,
+            floor = self.conversation_max_tokens,
             before,
             after,
             compacted = outcome.compacted_messages,
@@ -1975,7 +1972,8 @@ mod tests {
     async fn check_budget_without_capacity_skips_the_soft_line_but_not_the_floor() {
         // 决策 110：无 provider → capacity=None → 软限不判（不臆造窗口）。
         // 票 03 修订：硬底照判——压缩是本地规则算术，不需要窗口数字背书。
-        // 这份对话 8 万字符，在 20 万字符的硬底之下 → 不动。
+        // long-run-budget 票 02：硬底改 token 口径。这份对话 2 万 token，
+        // 在 30 万 token 的硬底之下 → 不动。
         let (_tmp, _home, store, task, project, settings, cursor) = base().await;
         let plan = assemble_ok(ctx(
             &store,
@@ -1999,9 +1997,10 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn check_budget_compacts_without_capacity_when_chars_exceed_the_floor() {
-        // 票 03：无 provider（FakeAgent / 纯代码场景）也拦——12 轮 × 2.4 万字符 = 28.8 万
-        // 字符，超过 20 万字符的硬底 → 就地压缩，锚点下标跟着搬到 1（锚点 user 紧跟 system）。
+    async fn check_budget_compacts_without_capacity_when_tokens_exceed_the_floor() {
+        // 票 03（long-run-budget 票 02 改 token 口径）：无 provider（FakeAgent / 纯代码
+        // 场景）也拦——12 轮 × 10 万 token = 120 万 token，超过 30 万 token 的硬底
+        // → 就地压缩，锚点下标跟着搬到 1（锚点 user 紧跟 system）。
         let (_tmp, _home, store, task, project, settings, cursor) = base().await;
         let plan = assemble_ok(ctx(
             &store,
@@ -2014,7 +2013,7 @@ mod tests {
         ))
         .await;
         assert!(plan.capacity.is_none(), "前提：无 provider");
-        let mut messages = conversation(12, 6_000);
+        let mut messages = conversation(12, 100_000);
         let len_before = messages.len();
         let mut carried_len = 0;
         match plan.check_budget(&mut messages, &mut carried_len) {
@@ -2029,13 +2028,14 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn char_floor_triggers_even_when_the_registered_window_is_inflated() {
-        // ux-audit-3 的形状（票 03）：登记窗口虚高 → 软限跟着虚高 → 按软限那条线压缩
-        // 永不触发。硬底不看登记的脸色：估算（≈7.2 万 token）远在软限（静态 + 100 万）
-        // 之下，但转录 28.8 万字符过了硬底 → 照压。
+    async fn token_floor_triggers_even_when_the_registered_window_is_inflated() {
+        // ux-audit-3 的形状（票 03；long-run-budget 票 02 改 token 口径）：登记窗口虚高
+        // → 软限跟着虚高 → 按软限那条线压缩永不触发。token 硬底是绝对数、不看登记的脸色：
+        // 估算（≈60 万 token）远在软限（静态 + 100 万）之下，但过了硬底（缺省 30 万）
+        // → 照压。
         let plan = budget_plan(1_000_000, 2_000_000).await;
         let cap = plan.capacity.unwrap();
-        let mut messages = conversation(12, 6_000);
+        let mut messages = conversation(12, 50_000);
         let estimate =
             crate::agent::context::estimate_messages_tokens(&plan.system, &plan.user, &messages);
         assert!(
@@ -2044,8 +2044,9 @@ mod tests {
             cap.soft_limit
         );
         assert!(
-            crate::agent::context::transcript_chars(&messages) > plan.conversation_max_chars,
-            "前提自检：字符读数才是触发源"
+            estimate > plan.conversation_max_tokens,
+            "前提自检：token 估算才是触发源（{estimate} > {}）",
+            plan.conversation_max_tokens
         );
         let mut carried_len = 0;
         match plan.check_budget(&mut messages, &mut carried_len) {
@@ -2109,7 +2110,8 @@ mod tests {
         // 把本轮真正的提问当成旧历史压掉（决策 180 锚点规则被击穿）。
         //
         // 形状即「下一 attempt 续接一份已压缩过的转录」：载入历史里带着上一轮压缩
-        // 留下的 [摘要]，本轮提问在其后，12 轮 × 5 万字符的大轮次两次撞硬底。
+        // 留下的 [摘要]，本轮提问在其后，12 轮 × 15 万字符（≈3.75 万 token）的大轮次
+        // 两次撞 30 万 token 的硬底（long-run-budget 票 02 改 token 口径）。
         let plan = budget_plan(1_000_000, 2_000_000).await;
         let mut messages = vec![
             Message::system("sys"),
@@ -2122,7 +2124,7 @@ mod tests {
         ];
         for i in 0..12 {
             messages.push(Message::assistant(
-                Some(format!("r{i} {}", "x".repeat(50_000))),
+                Some(format!("r{i} {}", "x".repeat(150_000))),
                 vec![],
             ));
         }

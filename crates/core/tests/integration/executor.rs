@@ -1530,18 +1530,27 @@ async fn a_context_window_failure_compacts_and_retries_that_one_call() {
     );
 }
 
-/// 票 03 验收：只跑工具往返的长节点（ux-audit-3 的形状——纯只读走查在 develop 节点
-/// 烧了 90 分钟、单 run prompt_tokens 1490 万）必须被字符硬底拦住，**即使在无 provider
-/// 的机器上**（FakeAgent 路径，capacity=None：不看窗口登记的脸色）。
+/// 票 03 验收（long-run-budget 票 02 改 token 口径）：只跑工具往返的长节点（ux-audit-3
+/// 的形状——纯只读走查在 develop 节点烧了 90 分钟、单 run prompt_tokens 1490 万）必须被
+/// token 硬底拦住，**即使在无 provider 的机器上**（FakeAgent 路径，capacity=None：不看
+/// 窗口登记的脸色）。
 ///
-/// 60 轮 × 8 千字符的写文件往返 = 转录 49 万字符，两度撞上 20 万字符的硬底。
-/// 断言：节点照常收口；压缩真实发生（转录里出现 `[摘要]`）；每个请求都压在
-/// 「硬底 + 可解释余量」内；请求总量压在「无压缩理想值」（Σ 每轮累积重发，O(n²)）之下。
+/// 60 轮 × 8 千字符的写文件往返 ≈ 转录 12 万 token（ASCII 4 字符 ≈ 1 token），两度撞上
+/// 4 万 token 的硬底（注入的小值；生产缺省 30 万）。断言：节点照常收口；压缩真实发生
+/// （转录里出现 `[摘要]`）；每个请求都压在「硬底 + 可解释余量」内；请求总量压在
+/// 「无压缩理想值」（Σ 每轮累积重发，O(n²)）之下。
 #[tokio::test]
-async fn a_long_tool_round_trip_node_is_capped_by_the_char_floor() {
+async fn a_long_tool_round_trip_node_is_capped_by_the_token_floor() {
     use agentpipeline_core::agent::context::transcript_chars;
 
-    let ctx = setup("true", Settings::default()).await;
+    let ctx = setup(
+        "true",
+        Settings {
+            conversation_max_tokens: 40_000,
+            ..Default::default()
+        },
+    )
+    .await;
     let mut script = Script::new();
     script
         .for_node(Stage::ArchitectDesign, Node::ValidateInput)
@@ -1647,14 +1656,17 @@ async fn a_long_tool_round_trip_node_is_capped_by_the_char_floor() {
         }
     }
 
-    // 体量上界：每个请求压在「硬底 + 可解释余量」内（一轮的参数 ~8 千字符，
-    // 余量放宽到 6 轮以容纳 keep 窗口与摘要的形状差）。
+    // 体量上界：每个请求压在「硬底 + 可解释余量」内（token 口径，票 02）——一轮的
+    // 参数 ~8 千字符 ≈ 2 千 token，余量放宽到 6 轮以容纳 keep 窗口与摘要的形状差。
+    // 字符读数只作对照（4:1 折算），不再是触发口径。
     let per_round = 8_200usize;
+    let per_round_tokens = per_round / 4; // ASCII 4 字符 ≈ 1 token（count_tokens 的老规则）
+    let floor_tokens = 40_000usize;
     for r in &requests {
-        let chars = transcript_chars(&r.messages);
+        let tokens = estimate_messages_tokens(&r.system_prompt, &r.user_prompt, &r.messages);
         assert!(
-            chars <= 200_000 + per_round * 6,
-            "请求转录 {chars} 字符，超过硬底的可解释余量"
+            tokens <= floor_tokens + per_round_tokens * 6,
+            "请求转录 {tokens} token，超过硬底的可解释余量"
         );
     }
     // 总量：无压缩理想值 = 每轮都整卷重发（O(n²)）；压缩后必须明显低于它。
@@ -1670,7 +1682,6 @@ async fn a_long_tool_round_trip_node_is_capped_by_the_char_floor() {
     use agentpipeline_core::agent::context::estimate_messages_tokens;
     let statics =
         estimate_messages_tokens(&requests[0].system_prompt, &requests[0].user_prompt, &[]);
-    let per_round_tokens = per_round / 4; // ASCII 4 字符 ≈ 1 token（count_tokens 的老规则）
     let ideal_tokens: usize = (1..=60).map(|i| statics + i * per_round_tokens).sum();
     let total_tokens: usize = requests
         .iter()

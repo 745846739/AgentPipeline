@@ -9860,3 +9860,61 @@ async fn qr_svg_accepts_the_public_entry_and_still_rejects_strangers() {
         "白名单之外照旧拒绝：{body}"
     );
 }
+
+/// long-run-budget 票 02：「管线压缩」设置的读写——缺省 provenance 是 `default`
+/// （值来自 config 层）、保存后变 `settings`（哪怕值与缺省相同）、缺体 422、
+/// 非正值 400。
+#[tokio::test]
+async fn compaction_settings_round_trip_with_provenance() {
+    let api = api().await;
+
+    // 缺省：两格都是 config 层的值（Settings::default：300_000 / 5），provenance 是 default。
+    let (_, body) = get(&api, "/compaction").await;
+    assert_eq!(body["conversation_max_tokens"], 300_000);
+    assert_eq!(body["conversation_max_tokens_origin"], "default");
+    assert_eq!(body["keep_recent_rounds"], 5);
+    assert_eq!(body["keep_recent_rounds_origin"], "default");
+    assert_eq!(body["config_conversation_max_tokens"], 300_000);
+    assert_eq!(body["config_keep_recent_rounds"], 5);
+
+    // 保存：读数原样回来，provenance 变「界面定的」。
+    let (status, body) = put(
+        &api,
+        "/compaction",
+        json!({"conversation_max_tokens": 400_000, "keep_recent_rounds": 8}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["conversation_max_tokens"], 400_000);
+    assert_eq!(body["conversation_max_tokens_origin"], "settings");
+    assert_eq!(body["keep_recent_rounds"], 8);
+    assert_eq!(body["keep_recent_rounds_origin"], "settings");
+    let (_, body) = get(&api, "/compaction").await;
+    assert_eq!(body["conversation_max_tokens"], 400_000);
+    assert_eq!(body["conversation_max_tokens_origin"], "settings");
+    assert_eq!(body["keep_recent_rounds"], 8);
+    assert_eq!(body["keep_recent_rounds_origin"], "settings");
+
+    // 保存值与缺省相同：provenance 仍是「界面保存的」——保存过就是保存过（诚实口径，决策 257）。
+    let (status, body) = put(
+        &api,
+        "/compaction",
+        json!({"conversation_max_tokens": 300_000, "keep_recent_rounds": 5}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["conversation_max_tokens_origin"], "settings");
+
+    // 零值是 400（不是 500、不是静默成功）。
+    let (status, _) = put(
+        &api,
+        "/compaction",
+        json!({"conversation_max_tokens": 0, "keep_recent_rounds": 5}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+
+    // 缺体是 4xx。
+    let (status, _) = put(&api, "/compaction", json!({})).await;
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
+}

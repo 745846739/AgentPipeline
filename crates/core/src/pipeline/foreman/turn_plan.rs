@@ -52,7 +52,7 @@
 use crate::agent::client::{LlmRequest, Message, Role, RunContext, ToolDef};
 use crate::agent::context::{
     compact_messages_from, estimate_context_capacity, estimate_messages_tokens,
-    should_compact_with_floor, transcript_chars, ContextCapacity,
+    should_compact_with_floor, ContextCapacity,
 };
 use crate::config::Settings;
 use crate::storage::foreman::{ForemanMessage, FOREMAN_ROLE_SYSTEM, FOREMAN_ROLE_USER};
@@ -118,8 +118,9 @@ pub struct TurnPlan {
     pub capacity: Option<ContextCapacity>,
     pub keep_recent_rounds: usize,
     /// L3 硬底（票 03）：转录字符量超过它就强制压缩，与 80% 那条线取「或」。
-    /// 与流水线同源（决策 291）——同一个 `Settings.conversation_max_chars`。
-    pub conversation_max_chars: usize,
+    /// 与流水线同源（决策 291）——同一个 `Settings.conversation_max_tokens`
+    /// （long-run-budget 票 02：触发判据从字符硬底改为 token 硬底）。
+    pub conversation_max_tokens: usize,
     /// 本轮**合并轮的全文**（快照 + 问题，不是裸问题——叫 `question` 会名不副实）：
     /// 轮内压缩按内容倒着找它当锚点（不变量 1）。
     pub merged_round: String,
@@ -276,7 +277,7 @@ impl TurnPlan {
             provider_id: Self::provider_id(facts.cfg),
             capacity,
             keep_recent_rounds: facts.settings.keep_recent_rounds,
-            conversation_max_chars: facts.settings.conversation_max_chars,
+            conversation_max_tokens: facts.settings.conversation_max_tokens,
             merged_round: final_text,
             idle_timeout_sec,
             transcript,
@@ -320,18 +321,13 @@ impl TurnPlan {
 
     /// 轮内预算门（票 06(b)）：过线就按轮压缩，返回压掉的段数（0 = 没触发 / 压不动）。
     ///
-    /// 判据与流水线逐字同源（[`should_compact_with_floor`]，票 03）：80% 那条线
-    /// （[`FOREMAN_INLOOP_COMPACT_RATIO`] 经 capacity 进来）**或**转录字符量超
-    /// `conversation_max_chars`——硬底不看 provider 窗口登记的脸色，`capacity = None`
-    /// 时硬底照判。
+    /// 判据与流水线逐字同源（[`should_compact_with_floor`]，long-run-budget 票 02）：
+    /// 80% 那条线（[`FOREMAN_INLOOP_COMPACT_RATIO`] 经 capacity 进来）**或** token 估算
+    /// 超 `conversation_max_tokens`——硬底是绝对数，不看 provider 窗口登记的脸色，
+    /// `capacity = None` 时硬底照判。
     pub fn check_window_budget(&self, messages: &mut Vec<Message>) -> usize {
         let estimate = estimate_messages_tokens(&self.system_prompt, &self.user_prompt, messages);
-        if !should_compact_with_floor(
-            estimate,
-            self.capacity,
-            transcript_chars(messages),
-            self.conversation_max_chars,
-        ) {
+        if !should_compact_with_floor(estimate, self.capacity, self.conversation_max_tokens) {
             return 0;
         }
         self.compact_forced(messages)

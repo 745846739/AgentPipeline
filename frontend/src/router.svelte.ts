@@ -38,6 +38,7 @@ export type Route =
   | { name: 'settings-stages'; query: RouteQuery }
   | { name: 'settings-market'; query: RouteQuery }
   | { name: 'settings-foreman'; query: RouteQuery }
+  | { name: 'settings-compaction'; query: RouteQuery }
   | { name: 'settings-tools'; query: RouteQuery }
   | { name: 'settings-notify'; query: RouteQuery }
   | { name: 'metrics'; query: RouteQuery }
@@ -88,6 +89,8 @@ export function parseRoute(hash: string): Route {
   // 离线通知（决策 272）：总开关 / 通道四件 / 探针。
   // 值守轮（决策 287 / 票 02）：全局开关 + 只读的节奏五个数。
   if (path === '/settings/foreman') return { name: 'settings-foreman', query };
+  // 管线压缩（long-run-budget 票 02）：token 硬底 + 压缩保留轮数。
+  if (path === '/settings/compaction') return { name: 'settings-compaction', query };
   // 命令执行（决策 297 / 票 05）：rtk 改写开关 + 活体探测。
   if (path === '/settings/tools') return { name: 'settings-tools', query };
   if (path === '/settings/notify') return { name: 'settings-notify', query };

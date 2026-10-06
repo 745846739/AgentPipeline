@@ -149,29 +149,31 @@ fn message_chars(message: &Message) -> usize {
     text + args
 }
 
-/// 转录的字符读数（票 03 硬底的计账口径）。
+/// 转录的字符读数（long-run-budget 票 02 起只作观测口径——触发判据已改 token 硬底）。
 ///
-/// 只数 messages，不含静态两段（system / user）：硬底触发的是 L3 按轮压缩，
-/// 而压缩吃不到那两段——把它们计进来只会让触发线凭空偏移一个常量。
+/// 只数 messages，不含静态两段（system / user）：与 [`message_tokens`] 同一形状的账，
+/// 压缩观测日志里保留 `chars` 供与 token 读数对照。
 pub fn transcript_chars(messages: &[Message]) -> usize {
     messages.iter().map(message_chars).sum()
 }
 
-/// L3 触发判据全量（票 03）：软限（token 估算 vs 容量）**或**硬底（转录字符量 vs
-/// `conversation_max_chars`）。
+/// L3 触发判据全量（long-run-budget 票 02，修订票 03 的字符硬底）：软限（token 估算
+/// vs 容量）**或** token 硬底（token 估算 vs `conversation_max_tokens`）。
 ///
-/// 硬底不看 provider 窗口登记的脸色：登记虚高会让软限跟着虚高、压缩永不触发
-/// （ux-audit-3 烧掉 1490 万 prompt_tokens 的形状），而转录字符量是本地可测的事实。
-/// `capacity = None`（无 provider，决策 110 不臆造窗口）时硬底**照样生效**——压缩是
-/// 规则化的本地算术，不需要窗口数字背书。两端同源（决策 291）：流水线与值班长吃这一份。
+/// token 硬底是**绝对数**，不看 provider 窗口登记的脸色——登记虚高会让软限跟着虚高、
+/// 压缩永不触发（ux-audit-3 烧掉 1490 万 prompt_tokens 的形状），但硬底那条线不消费
+/// 登记值。票 03 时代选字符硬底是因为当时只有字符是本地可测的事实；现在触发与软限
+/// 共用同一个估算器（[`estimate_messages_tokens`]，误差有界、偏高的代价只是压得早一点），
+/// 而字符线对窗口大的模型压得过早（20 万字符 ≈ 5–10 万 token，ux-audit-3 一次任务
+/// 触发 51 次）——故改 token。`capacity = None`（无 provider，决策 110 不臆造窗口）时
+/// 软限不判、硬底**照样生效**。两端同源（决策 291）：流水线与值班长吃这一份。
 pub fn should_compact_with_floor(
     current_tokens: usize,
     capacity: Option<ContextCapacity>,
-    transcript_chars: usize,
-    conversation_max_chars: usize,
+    conversation_max_tokens: usize,
 ) -> bool {
     let over_soft = capacity.is_some_and(|c| current_tokens > c.soft_limit);
-    over_soft || transcript_chars > conversation_max_chars
+    over_soft || current_tokens > conversation_max_tokens
 }
 
 /// 是否触发 L4 兜底（超过 hard limit）。
@@ -1165,5 +1167,24 @@ mod tests {
         let cap = estimate_context_capacity(10_000, "", "", &s);
         assert!(!over_hard_limit(cap.hard_limit, cap));
         assert!(over_hard_limit(cap.hard_limit + 1, cap));
+    }
+
+    /// token 硬底谓词的边界（long-run-budget 票 02；票 03 教义的 token 口径）：
+    /// 恰在线上不触发；`capacity = None` 时软限不判（决策 110）、硬底照判；
+    /// 登记虚高让软限拦不住的，硬底兜住；软限真超线时硬底之下也触发。
+    #[test]
+    fn token_floor_predicates() {
+        assert!(!should_compact_with_floor(300_000, None, 300_000));
+        assert!(should_compact_with_floor(300_001, None, 300_000));
+        assert!(should_compact_with_floor(5_000, None, 3_000));
+        let s = settings();
+        let inflated = estimate_context_capacity(100_000_000, "", "", &s);
+        assert!(
+            should_compact_with_floor(400_000, Some(inflated), 300_000),
+            "软限（虚高）拦不住，token 硬底兜住"
+        );
+        assert!(!should_compact_with_floor(400_000, Some(inflated), 500_000));
+        let tight = estimate_context_capacity(1_000, "", "", &s);
+        assert!(should_compact_with_floor(900, Some(tight), 300_000));
     }
 }

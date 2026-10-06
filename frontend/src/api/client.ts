@@ -1,6 +1,7 @@
 import { CLIENT_HEADER, PAIRING_HEADER, PAIRING_QUERY, apiUrl, getPairingToken } from './config';
 import type {
   AnalyzeResponse,
+  CompactionSettings,
   MarketRepoConfig,
   MarketSkillList,
   CreateTaskPayload,
@@ -981,4 +982,25 @@ export function getForemanCommands(
     `/foreman/commands${q}`,
     { signal },
   );
+}
+
+/* 「管线压缩」设置（long-run-budget 票 02）：硬底线 + 压缩保留轮数。 */
+
+/** 读数：两个旋钮的有效值 + 逐字段 provenance（default / settings）。 */
+export function getCompaction(): Promise<CompactionSettings> {
+  return request<CompactionSettings>('/compaction');
+}
+
+/**
+ * 保存两个旋钮：保存即活——流水线每 attempt、值班长每轮懒读 DB 覆盖层，
+ * 下一轮就按新值走，不必重启。
+ */
+export function setCompaction(
+  conversation_max_tokens: number,
+  keep_recent_rounds: number,
+): Promise<CompactionSettings> {
+  return request<CompactionSettings>('/compaction', {
+    method: 'PUT',
+    body: { conversation_max_tokens, keep_recent_rounds },
+  });
 }
