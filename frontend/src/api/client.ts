@@ -234,6 +234,11 @@ export interface ConversationListParams {
    * 调用方要状态时读摘要那一份。
    */
   includeMessages?: boolean;
+  /**
+   * **限定轮**（现场页签增量拉取）：只取这些 run_id 的会话，缺省 = 全部轮。
+   * 配合批量正文态用——缓存里已有的轮不重发，载荷从「全任务 MB 级」降到缺失的增量。
+   */
+  runIds?: number[];
 }
 
 /** 摘要态（缺省，`includeMessages` 未开）的返回类型。 */
@@ -242,7 +247,7 @@ export function getConversations(
   params?: ConversationListParams & { includeMessages?: false },
   signal?: AbortSignal,
 ): Promise<ConversationSummary[]>;
-/** 批量正文态：一次拿回该任务全部轮的完整会话。 */
+/** 批量正文态：一次拿回（或按 `runIds` 限定）任务会话的完整正文。 */
 export function getConversations(
   id: string,
   params: ConversationListParams & { includeMessages: true },
@@ -256,6 +261,7 @@ export function getConversations(
   const q = new URLSearchParams();
   if (params.includeArchived) q.set('include_archived', 'true');
   if (params.includeMessages) q.set('include_messages', 'true');
+  if (params.runIds?.length) q.set('run_ids', params.runIds.join(','));
   const suffix = q.toString() ? `?${q.toString()}` : '';
   return request<{ conversations: ConversationSummary[] | NodeConversation[] }>(
     `/tasks/${encodeURIComponent(id)}/conversations${suffix}`,

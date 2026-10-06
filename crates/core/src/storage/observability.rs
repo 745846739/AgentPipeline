@@ -1108,7 +1108,25 @@ impl Store {
         task_id: &str,
         include_archived: bool,
     ) -> Result<Vec<NodeConversation>> {
-        let sql = format!(
+        self.list_conversations_for_runs(task_id, include_archived, &[])
+            .await
+    }
+
+    /// 会话列表的**限定轮读法**（现场页签增量拉取）：只取 `run_ids` 里列出的那些轮，
+    /// 其余口径（归档过滤、排序、行投影）与 [`Self::list_conversations`] 完全同一份。
+    ///
+    /// 为什么单独一个方法而不给 `list_conversations` 加参数：后者有近二十个调用方
+    /// （工具层与集成测试），全部都要的是「全部轮」；给它们的签名塞一个永远 `&[]`
+    /// 的参数是纯噪声。`list_conversations` 就是 `run_ids = &[]` 的委托，口径没有第二份。
+    ///
+    /// `run_ids` 为空切片时等价于 [`Self::list_conversations`]（不加 IN 子句）。
+    pub async fn list_conversations_for_runs(
+        &self,
+        task_id: &str,
+        include_archived: bool,
+        run_ids: &[i64],
+    ) -> Result<Vec<NodeConversation>> {
+        let mut sql = format!(
             "SELECT id, task_id, project_id, run_id, stage, node, attempt, agent_type, parent_run_id,
                     messages_json, system_prompt, user_prompt, metadata_json, prompt_tokens,
                     completion_tokens, created_at, reasoning,
@@ -1116,10 +1134,18 @@ impl Store {
              FROM kanban_node_conversations WHERE {}",
             conversation_filter(include_archived)
         );
-        let rows: Vec<ConversationRow> = sqlx::query_as(&sql)
-            .bind(task_id)
-            .fetch_all(self.pool())
-            .await?;
+        if !run_ids.is_empty() {
+            let placeholders = vec!["?"; run_ids.len()].join(", ");
+            sql = sql.replace(
+                " ORDER BY id",
+                &format!(" AND run_id IN ({placeholders}) ORDER BY id"),
+            );
+        }
+        let mut query = sqlx::query_as::<_, ConversationRow>(&sql).bind(task_id);
+        for run_id in run_ids {
+            query = query.bind(run_id);
+        }
+        let rows = query.fetch_all(self.pool()).await?;
         rows.into_iter()
             .map(ConversationRow::into_conversation)
             .collect()

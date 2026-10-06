@@ -904,6 +904,12 @@ pub struct ConversationListQuery {
     /// 八波；这里让「一个任务的全部轮」一次取回。
     #[serde(default)]
     pub include_messages: bool,
+    /// **限定轮**（现场页签增量拉取）：逗号分隔的 run_id 列表，批量读法只取这些轮。
+    ///
+    /// 只在 `include_messages=true` 分支生效——增量拉取的动机是载荷（messages_json 是
+    /// MB 级主体），摘要态本来就没有大列。缺省（不带参数）= 全部轮，老客户端不受影响。
+    #[serde(default)]
+    pub run_ids: Option<String>,
 }
 
 pub async fn conversations(
@@ -912,17 +918,36 @@ pub async fn conversations(
     Query(query): Query<ConversationListQuery>,
     headers: HeaderMap,
 ) -> ApiResult<impl IntoResponse> {
-    // 版本键把两个参数都带上：批量与摘要、含归档与不含归档，各是各的 ETag
+    // 版本键把两个参数都带上：批量与摘要、含归档与不含归档，各是各的 ETag——
+    // 限定轮（增量拉取）请求的响应体是全集的真子集，版本键里不带它就会把子集 304 成全集。
     let etag_key = format!(
-        "task-conversations|{id}|{}|{}",
-        query.include_archived, query.include_messages
+        "task-conversations|{id}|{}|{}|{}",
+        query.include_archived,
+        query.include_messages,
+        query.run_ids.as_deref().unwrap_or("")
     );
     if query.include_messages {
         // 批量取正文：与单条读法共用 `list_conversations`，故「同一 run_id 两种读法给出
         // 相同会话」是**同一份实现**的直接结果，不是两条路要各自维护的约定。
+        let run_ids = match query.run_ids.as_deref() {
+            None => Vec::new(),
+            Some(raw) => {
+                let mut parsed = Vec::new();
+                for part in raw.split(',') {
+                    let part = part.trim();
+                    if part.is_empty() {
+                        continue;
+                    }
+                    parsed.push(part.parse::<i64>().map_err(|_| {
+                        ApiError::bad_request(format!("run_ids 里的「{part}」不是 run id"))
+                    })?);
+                }
+                parsed
+            }
+        };
         let conversations = state
             .store
-            .list_conversations(&id, query.include_archived)
+            .list_conversations_for_runs(&id, query.include_archived, &run_ids)
             .await
             .map_err(map_core_error)?;
         return Ok(etag_response(

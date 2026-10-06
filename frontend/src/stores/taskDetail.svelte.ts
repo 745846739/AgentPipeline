@@ -340,10 +340,16 @@ class TaskDetailStore {
    * HTTP/1.1 单源上约 6 并发，48 轮要排八波；现在一条 `?include_messages=true` 拿回
    * 整个任务的全部轮。
    *
+   * **增量拉取**：批量请求带 `run_ids` 只取 `conversationsFull` 里还没有的轮——106 实测
+   * 全量载荷 1.76 MB、公网链路上要搬 8.5–10.9 秒（决策 361 票 02 的注释），而重进页签 /
+   * 静默 refetch 时大头早已在缓存里，重发的只有新落的轮。
+   *
    * 缓存仍按 `run_id` 挡重复（`conversationsFull` 与单条读法共用同一张表，深链走
    * `loadConversation` 时不会打架）：已装载的轮不进这个请求的待办。
    *
-   * 失败**降级到逐条**：批量读法是加性参数，客户端不把「一次拿全」变成唯一的活路。
+   * 失败**重试一次再降级到逐条**：批量读法是加性参数，客户端不把「一次拿全」变成唯一的
+   * 活路；而 30s 超时后直接掉进逐条会让本已拥塞的链路雪上加霜，一次整段重试是更便宜的
+   * 第二发。
    */
   async loadAllConversations(): Promise<void> {
     if (!this.id) return;
@@ -353,7 +359,15 @@ class TaskDetailStore {
     if (pending.length === 0) return;
     this.conversationsLoading = true;
     try {
-      const all = await getConversations(this.id, { includeMessages: true });
+      let all: NodeConversation[];
+      try {
+        all = await getConversations(this.id, { includeMessages: true, runIds: pending });
+      } catch (first) {
+        // 只对「再试一次可能就好」的那类失败付重试（`mapRequestError` 的口径：
+        // 超时 / 网络不通都是 status 0）；4xx/5xx 是确定性答案，重发只是浪费一发。
+        if (!(first instanceof ApiError) || first.status !== 0) throw first;
+        all = await getConversations(this.id, { includeMessages: true, runIds: pending });
+      }
       const fresh: Record<number, NodeConversation> = { ...this.conversationsFull };
       for (const conv of all) {
         if (pending.includes(conv.run_id)) fresh[conv.run_id] = conv;

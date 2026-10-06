@@ -3017,6 +3017,73 @@ async fn conversations_include_messages_batches_full_payloads() {
     }
 }
 
+/// 限定轮读法（现场页签**增量拉取**）：`run_ids` 让批量正文只回请求的那些轮——106 上
+/// 全量载荷 1.76 MB、公网链路 8.5–10.9 秒，重进页签时缓存已有的轮不该重发。同时钉
+/// ETag 版本键：子集与全集、两个子集之间，谁也不能把谁 304 成对方。
+#[tokio::test]
+async fn conversations_run_ids_returns_only_requested_runs() {
+    let api = api().await;
+    seed(&api, "t1").await;
+    let run_a = seed_run_with_conversation(&api).await;
+    let run_b = seed_run_with_conversation(&api).await;
+    let run_c = seed_run_with_conversation(&api).await;
+
+    // 全集照旧：不带 run_ids = 全部轮，老客户端的请求形状不受影响
+    let (status, body) = get(&api, "/tasks/t1/conversations?include_messages=true").await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        body["conversations"].as_array().unwrap().len(),
+        3,
+        "缺省仍是全部轮：{body}"
+    );
+
+    // 子集：只回请求的轮，且与单条读法同形同内容
+    let subset_url =
+        format!("/tasks/t1/conversations?include_messages=true&run_ids={run_a},{run_c}");
+    let (status, body) = get(&api, &subset_url).await;
+    assert_eq!(status, StatusCode::OK);
+    let subset = body["conversations"].as_array().unwrap();
+    let got: Vec<i64> = subset
+        .iter()
+        .map(|c| c["run_id"].as_i64().unwrap())
+        .collect();
+    assert_eq!(got, vec![run_a, run_c], "只回请求的两轮：{body}");
+    let (_, single) = get(&api, &format!("/tasks/t1/conversations/{run_a}")).await;
+    assert_eq!(
+        subset[0], single["conversation"],
+        "子集项与单条读法同形同内容"
+    );
+
+    // ETag 版本键必须带上 run_ids：子集的 If-None-Match 不能 304 成全集，
+    // 不同子集之间也不能互撞
+    let full_url = "/tasks/t1/conversations?include_messages=true";
+    let other_url = format!("/tasks/t1/conversations?include_messages=true&run_ids={run_b}");
+    let (_, h_full, _) = get_conditional(&api, full_url, None).await;
+    let (_, h_sub, _) = get_conditional(&api, &subset_url, None).await;
+    let (_, h_other, _) = get_conditional(&api, &other_url, None).await;
+    let e_full = etag_of(&h_full);
+    let e_sub = etag_of(&h_sub);
+    let e_other = etag_of(&h_other);
+    assert_ne!(e_full, e_sub, "子集与全集要各是各的 ETag");
+    assert_ne!(e_sub, e_other, "两个子集要各是各的 ETag");
+    let (status, _, _) = get_conditional(&api, full_url, Some(&e_sub)).await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "子集的 ETag 打到全集上必须 200，不能 304"
+    );
+    let (status, _, _) = get_conditional(&api, &subset_url, Some(&e_sub)).await;
+    assert_eq!(status, StatusCode::NOT_MODIFIED, "同版本键的子集要 304");
+
+    // 坏参数当场 400：非数字的 run id 不静默吞
+    let (status, _) = get(
+        &api,
+        "/tasks/t1/conversations?include_messages=true&run_ids=abc",
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+}
+
 #[tokio::test]
 async fn command_log_endpoints_expose_卸载_output() {
     let api = api().await;
