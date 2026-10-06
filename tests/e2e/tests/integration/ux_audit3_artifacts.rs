@@ -245,6 +245,25 @@ fn is_exported(src: &str, name: &str) -> bool {
     })
 }
 
+/// spec 的 `test('…')` 题面集合（场景 8 第 6 步的同题比对用）。
+fn test_titles(spec: &str) -> BTreeSet<String> {
+    let mut set = BTreeSet::new();
+    for line in spec.lines() {
+        let t = line.trim_start();
+        let Some((rest, quote)) = t
+            .strip_prefix("test('")
+            .map(|r| (r, '\''))
+            .or_else(|| t.strip_prefix("test(\"").map(|r| (r, '"')))
+        else {
+            continue;
+        };
+        if let Some(end) = rest.find(quote) {
+            set.insert(rest[..end].to_string());
+        }
+    }
+    set
+}
+
 /// INDEX 候选表的一行（6 列：编号 | 标题 | 预计证据类型 | 与前轮关联 | 证据等级 | 状态）。
 struct IndexRow {
     nn: String,
@@ -1027,6 +1046,22 @@ fn scene_08_readings_and_screenshots_are_citable() {
         spec.contains("ux-audit-3") && spec.contains(".png"),
         "spec 应把截图落到 .scratch/ux-audit-3/"
     );
+
+    // 场景 8 第 6 步（静态面）：取证范围是「复核 + 漂移面」——用例题面与前两轮
+    // 不同题（题面全名不撞）。live 跑出的用例名清单见报告台账。
+    let own = test_titles(&spec);
+    assert_eq!(own.len(), 14, "题面抽取应得 14 条");
+    for prior in [
+        "frontend/e2e/ux-audit.spec.ts",
+        "frontend/e2e/ux-audit-2.spec.ts",
+    ] {
+        let prior_titles = test_titles(&read(&root, prior));
+        let dup: Vec<&String> = own.intersection(&prior_titles).collect();
+        assert!(
+            dup.is_empty(),
+            "与 {prior} 同题重复取证（场景 8 第 6 步）：{dup:?}"
+        );
+    }
 
     // 引用的截图名 ⊆ 真实落盘（有 PNG 才断言——PNG 是 gitignore 的运行产物，
     // CI checkout 里不存在；本机跑过 UX_AUDIT3=1 后由场景 8 台账佐证）。
