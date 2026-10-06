@@ -52,7 +52,12 @@ fn git_out(root: &Path, args: &[&str]) -> String {
     git(root, args).unwrap_or_else(|| panic!("git {args:?} 返回非零"))
 }
 
-/// 变更面：`git status --porcelain`（含未跟踪）∪ `git diff --name-only HEAD` ∪ 分支相对 origin/main 的 diff（提交后时序）。
+/// 变更面：`git status --porcelain`（含未跟踪）∪ `git diff --name-only HEAD` ∪ 分支相对基准的 diff（提交后时序）。
+///
+/// 「分支相对基准」用**三点** `origin/main...HEAD`（= `merge-base(origin/main, HEAD)..HEAD`）。
+/// **不能用两点**：任务分支提交落盘后，分支与 `origin/main` 各自向前走，两点 `origin/main..HEAD`
+/// 退化成「两棵树的直接差」，会把 **main 侧**（long-run-budget / 读路径批二等邻接任务）的改动
+/// 一起算进来，凭空造出「越出本票范围」的假红。
 fn changed_paths(root: &Path) -> Vec<String> {
     let mut set = BTreeSet::new();
     if let Some(st) = git(root, &["status", "--porcelain"]) {
@@ -76,8 +81,9 @@ fn changed_paths(root: &Path) -> Vec<String> {
             }
         }
     }
-    // 提交落进任务分支后工作区变干净——改动面并上分支相对基准的 diff（场景 17 ① 的提交后时序）
-    if let Some(d) = git(root, &["diff", "--name-only", "origin/main..HEAD"]) {
+    // 提交落进任务分支后工作区变干净——改动面并上**分支相对基准**的 diff（场景 17 ① 的提交后时序）
+    // 三点（merge-base..HEAD）：两点会把 main 侧邻接任务的改动也算成「本分支改动」。
+    if let Some(d) = git(root, &["diff", "--name-only", "origin/main...HEAD"]) {
         for l in d.lines() {
             let l = l.trim();
             if !l.is_empty() {
@@ -93,7 +99,11 @@ fn numstat(root: &Path, rel: &str) -> (usize, usize) {
     let mut out = git_out(root, &["diff", "--numstat", "HEAD", "--", rel]);
     if out.trim().is_empty() {
         // 变更落进任务分支后 `diff HEAD` 变空——回退到分支相对基准的读数（场景 17 ④ 的提交后时序）
-        out = git_out(root, &["diff", "--numstat", "origin/main..HEAD", "--", rel]);
+        // 三点：两点会把 main 侧邻接任务的同路径改动也算进来，读数虚高。
+        out = git_out(
+            root,
+            &["diff", "--numstat", "origin/main...HEAD", "--", rel],
+        );
     }
     let first = out.lines().next().unwrap_or("0\t0\tpath");
     let mut it = first.split('\t');
@@ -720,8 +730,8 @@ fn scene_11_detail_other_rules_untouched() {
     );
     let mut diff = git_out(&root, &["diff", "HEAD", "--", rel]);
     if diff.trim().is_empty() {
-        // 提交后时序：正文取分支相对基准的 diff
-        diff = git_out(&root, &["diff", "origin/main..HEAD", "--", rel]);
+        // 提交后时序：正文取分支相对基准的 diff（三点，避开 main 侧邻接任务的改动）
+        diff = git_out(&root, &["diff", "origin/main...HEAD", "--", rel]);
     }
     let added: Vec<&str> = diff
         .lines()
