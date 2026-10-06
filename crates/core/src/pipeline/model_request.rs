@@ -503,6 +503,7 @@ async fn load_segments(ctx: &AttemptCtx<'_>) -> Result<PromptSegments> {
             "retry-feedback.md",
         )
         .await,
+        zero_commit: zero_commit_facts_segment(home, &ctx.task.id, ctx.cursor).await,
         // 票 04：简报文本已由编排侧组好（`AttemptCtx.continuation_brief`），本函数只把它
         // 搬进段表（渲染在 `build_user_prompt`）。放在段表末尾：它是「这一轮从哪起跑」的
         // 交代，读在其余反馈段之后更顺。
@@ -637,6 +638,25 @@ async fn gate_recheck_segment(
         "\n请基于以上闸门输出，为每个失败用例重新标注 failure_cause（test_issue / code_issue）。",
     );
     Ok(Some(out))
+}
+
+/// 决策 391：`develop_code_gate` 的零提交守卫判定分支自有提交数为 0 时，把事实与落提交
+/// 指令落成任务目录下的 `zero-commit-facts.md`；develop.execute 重入时读回注入。放行或
+/// 申报 `no_changes` 时该文件被守卫清除，于是段自然为空——「首轮为空不渲染」与「已落提交
+/// 不渲染」是同一支。读不到 / 读超界（决策 302）一律不渲染。
+async fn zero_commit_facts_segment(
+    home: &Home,
+    task_id: &str,
+    cursor: &NodeCursor,
+) -> Option<String> {
+    if cursor.stage != Stage::Develop || cursor.node != Node::Execute {
+        return None;
+    }
+    let path = home.task_file(task_id, super::executor::ZERO_COMMIT_FACTS_FILE);
+    match bounded_read::read_to_string("zero_commit_facts", &path).await {
+        Offloaded::Done(Ok(content)) if !content.trim().is_empty() => Some(content),
+        _ => None,
+    }
 }
 
 /// 决策 133 / pipeline-spec §6：review 打回循环中，develop.execute 重入的 user prompt

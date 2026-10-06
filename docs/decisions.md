@@ -2555,3 +2555,106 @@ grilling 收敛时用户拍板「30 万应该是 token 不是字符数」（2026
 `pipeline/model_invoke.rs` / `pipeline/foreman/runner.rs`（懒读叠加）、`config.rs`、
 `storage/compaction.rs` + 迁移 0042、`app` 路由 `/compaction`、
 `frontend`（SettingsCompaction + 五处注册）。
+
+### 决策 391 · 提交契约归位：模板要求 + develop 零提交守卫 + merge 空分支改道（显式修订决策 85 的适用面、扩展决策 139 的判据）
+
+**起因**：106 任务 `01M47RQG4M9533F5TMF1AGJXC8`（落地 ux-audit-3 的 13 条 UI 票）
+**两次**卡在同一处、每次耗时一整轮 test 复检加一次人工裁决。四层取证（
+`.scratch/commit-contract/README.md`）：①**模板不要求**——`DEV_EX_SYSTEM` 的输出步骤里
+根本没有「把变更落成 git 提交」这一步，写文件即算收口；②**闸门不校验**——`develop_code_gate`
+只看 lint + 单元测试，「全绿但零提交」是最容易通过的形态；③**merge 归错类**——
+`diff_stat` 为 0 文件时被当成 `GateFailureKind::Test`，走决策 85 的 test 复检；
+④**复检注定空转**——test 改的是用例，造不出分支提交，于是「diff 为空」原样复发、
+`gate_failures` 白烧，最后交用户。核心是**提交契约在系统里没有归属**：只要产出「全绿」，
+没有任何一层问过「这些变更进分支了吗」。
+
+**裁决**：把归属钉进四处——模板（要求）、develop 闸门（校验）、merge（改道）、重入 prompt
+（自愈）。
+
+①**模板根修**（`agent/templates.rs`）：`DEV_EX_SYSTEM` 输出步骤新增落提交步——先 `cd`
+到系统注入的 worktree **绝对路径**（相对 cwd 会解析到别的 checkout，事故实证），逐块
+`git add` + `git commit`，**message 遵循目标仓提交惯例**（格式属项目域，**不进核心代码**）；
+收口前自查 `rev-list --count <基准>..HEAD` > 0 且 `git status --porcelain` 干净、读数写进正文。
+三个 execute 模板（develop / review / test）补**契约锚点句**「每一轮的最终动作必须是调用
+submit_metadata；在正文里声称已提交/已评审/已交报告**不等于**已调用工具」——决策 277① 的扩展，
+对症 develop attempt 3 的「声称已交元数据却没调工具」。
+
+②**申报制 schema**：`CodeChanges` 加 `no_changes: boolean`（`#[serde(default)]`，缺省
+false）。语义是**显式申报**：「本任务确无任何变更」，不得为凑提交造假变更。模板字段清单
+同步（决策 369 的 `submit_metadata_templates_match_their_json_schema` 会拦漂移）。
+
+③**develop 侧守卫**（`executor.rs::develop_code_gate`）：lint + 单测之外加**零分支检查**
+——`Git.ahead_count(repo, base_ref, branch)`（libgit2 revwalk：push 分支 tip、hide 基准，
+同点恰为 0）读数为 0 **且**未申报 `no_changes` 时确定性 fail，打回 execute（计入
+`validate_attempts`），事实（自有提交数 0 + `git status` 脏清单）落 `zero-commit-facts.md`。
+`base_ref` 取法与 merge 阶段 A 同源（决策 41：有 `origin` 用 `origin/{default_branch}`，
+否则本地分支）。**比票面形状 3 有意放宽一档**：票面写「…**且工作区有变更**」，本决策不设
+这一项——「全绿但分支等于基准」无论工作区脏否都没有可合入的东西，晚一步发现就又要多穿
+review / test 两个阶段（票面「What to build」的原话就是「在 develop.validate_output 就被
+打回」）；工作区干净的形态由事实段里「或申报 no_changes」那一句兜住（用例
+`develop_gate_kicks_back_even_when_the_tree_is_clean_and_nothing_declared` 钉住）。
+**git 读数不可用**（无 branch_name / 解析失败 / 读超时）按 `Unavailable`
+**降级放行**——决策 209 姿态：不因一条读数把任务卡死，也不冒充「有提交」。
+
+④**零变更提前收尾**：申报 `no_changes` → develop.validate_output 置
+`pending(user_decision, kind=zero_changes)`（**优先于闸门判定**：申报是诚实结论，不该被
+闸门失败覆盖成 Retry）；动作集两条——`goto develop.execute`（继续修改，落提交或做实际变更）
+与 `cancel`（确认零变更收尾）。取消走 `cancelled` **终态**，**不经 `done`**：`do_done` 的
+`merge_result.status = merged` 硬校验对零变更无语义（没有要合入的东西）。
+申报读法（缺省 false、非布尔值当未申报）是**口径单点** `executor::declared_no_changes`——
+develop 守卫与 merge 改道共用，两条路径不会各自漂移。
+
+⑤**merge 空分支改道**（`merge.rs` / `types.rs::GateFailureKind`）：枚举加 **`EmptyBranch`**
+（存量 DB 只有 Lint / Test，加变体向后兼容）。`diff_stats.files_changed == 0` 时先看
+develop 是否申报 `no_changes`——申报成立 → `pending(user_decision, kind=zero_changes)`，
+**不写闸门失败、不烧 `gate_failures`**（诚实结论不是缺陷）；挂 pending 时**必须带
+`context.kind`**（决策 130 ①）——缺了它 `allowed_actions` 会落到
+`(user_decision, _)` 通用兜底行（{skip, cancel}），下发不出本分支语义的
+{goto develop, cancel}；未申报 → 照写 `gate=Fail` 但 kind 改
+`EmptyBranch`，路由侧**直接打回 develop.execute**，**不进 test 复检**。
+*与既有决策的关系*：**显式修订决策 85**——它的适用范围收窄为**真正的测试类失败**
+（`Test` 与缺省 `None`），空分支排除出 test 复检；**扩展决策 139**——「确定性失败不绕 test」
+这条原则从 lint 落到空分支（修用例造不出分支提交，复检必然空转）。决策 108 的统一累加
+口径一字不动。
+
+⑥**重入注入段**（`model_request.rs` 五追加段机制 → 第六段）：新增「零提交事实段」，照既有
+「先落文件、再由重入渲染」（决策 126）形状。事实读数（提交数 / 净差异 / 脏清单）+ 落提交
+指令（cd 绝对路径 → add + commit → 自查 rev-list；或申报 `no_changes`），**不带 message 格式**。
+**两条改道路径共用**（`zero_commit_facts` / `write_zero_commit_facts` / `clear_zero_commit_facts`
+三个自由函数是落点单点）：develop 守卫写「自有提交数 0」，merge 改道写「净差异 0 文件」——
+事实不同，指令同一。放行 / 申报 / merge 申报三条路都清掉该文件，段自然为空（「首轮为空不渲染」
+与「已落提交不渲染」是同一支）。
+
+⑦**跨语言规格**：`ResumeCause::ZeroChanges`（`resume_continues = false`——打回落提交时
+零提交事实段带着要点，重开一段更干净）；`tests/fixtures/frontend_spec_tables.json` 的
+`user_decision_context_kinds` 补 `zero_changes`（该表的定义就是「actions.rs 里在
+user_decision 行上出现过的 kind」），前端 `pendingLabel` 补「零变更确认」格子。
+
+**明确不做**：**不让系统替 agent 自动提交**（提交 message 与粒度是项目域的判断，系统代写
+等于把「commit 什么」也揽过来）；message 格式不进核心代码；不做「零提交时自动 reset 工作区」；
+不动 `do_done` 的 merged 校验（`cancelled` 绕开它即可，不动那条不变量本身）。
+
+**止血与撤退**：事故当天在 106 上给 `stage_configs.develop.persona_append` 加了提交契约文本
+并重启服务（hemostasis）。**实证：persona 不足**——run 334 的 system_prompt 里该文本确实在
+（`prompt_template_hash` 变化为证），但该 run 的 git 命令数为 **0**，模型照样没提交。
+故本决策是**模板根修**而非 persona 补丁；本决策**部署后**删除 106 的 `persona_append`
+（同批撤退，见票 01 形状 ⑦）。
+
+**验证**：L1——`route_merge_gate_fail_empty_branch_kicks_back_develop_not_test`、
+`develop_validate_output_declared_zero_changes_pends_for_user`、
+`zero_changes_decision_offers_rework_or_cancel`、`execute_templates_carry_the_submit_metadata_anchor`、
+`develop_execute_template_requires_committing_changes`、
+`develop_gate_kicks_back_when_changes_are_never_committed`、模板↔schema 一致性转绿；
+L2——`develop_gate_kicks_back_when_changes_are_never_committed`（钉原缺陷：全绿零提交 →
+`NodeRetry` 打回、不穿越 review/merge、事实段落盘 + 重入注入而首轮不渲染）、
+`develop_declared_no_changes_pends_then_cancelled_terminal`；
+L4——`e2e_merge_empty_branch_kicks_back_to_develop_without_test`（空提交 → 净差异 0 →
+`EmptyBranch` 直接打回 develop、不经 test、gate_failures 累计）、
+`e2e_merge_declared_no_changes_pends_for_user`。
+**来源**：106 实测（
+`.scratch/commit-contract/README.md` 四层取证 + 止血与 persona 不足实证）；
+grilling 两轮收敛（2026-10-06，用户拍板「一张大票」「本地直改」「部署后再 dogfood」）；
+落地票 `.scratch/commit-contract/issues/01-commit-contract-and-empty-branch.md`；
+落地 `agent/templates.rs`、`pipeline/executor.rs`、`pipeline/merge.rs`、`pipeline/routes.rs`、
+`pipeline/model_request.rs`、`actions.rs`、`types.rs`、`git.rs`（`ahead_count`）、
+`frontend/src/lib/pipeline.ts`。

@@ -239,17 +239,22 @@ const DEV_EX_SYSTEM: &str = r#"你是开发 agent。根据开发方案编写业�
 2. 按方案编写业务代码
 3. 编写单元测试
 4. 调用 write_file 写入变更文件
-5. 调用 submit_metadata 返回元数据
+5. 把全部变更落成任务分支上的 git 提交：先 cd 到系统注入的 worktree 绝对路径（相对 cwd 会解析到别的 checkout），再 git add + git commit，提交 message 遵循本仓提交惯例；禁止把变更留在工作区就收口
+6. 调用 submit_metadata 返回元数据
 
 ## 要求
 - 文件写入采用"先清后写"策略
 - 单元测试覆盖方案中列出的关键路径
 - 若 dev-plan.md 不存在（用户跳过了开发方案阶段，决策 115），直接基于 design.md 完成开发
+- 收口前自查并把读数写进正文：`git rev-list --count <基准分支>..HEAD` 必须 > 0、`git status --porcelain` 必须干净（有意不提交的文件逐条说明）
+- 确无任何变更时不得为凑提交而造假变更：在正文中说明依据，并在元数据申报 no_changes = true
+- 每一轮的最终动作必须是调用 submit_metadata；在正文里声称已提交/已交元数据不等于已调用工具
 
 ## submit_metadata 字段
 - branch_name: 本次变更所在的任务分支名（`kanban/` 前缀 + 任务 id）
 - changed_files: 变更的业务代码文件列表
-- unit_test_files: 变更 / 新增的单元测试文件列表"#;
+- unit_test_files: 变更 / 新增的单元测试文件列表
+- no_changes: boolean（本任务确无任何变更时申报 true；缺省 false）"#;
 
 const REVIEW_EX_SYSTEM: &str = r#"你是代码评审 agent。评审变更代码和单元测试，并对照设计文档检查实现是否符合设计。
 
@@ -259,6 +264,9 @@ const REVIEW_EX_SYSTEM: &str = r#"你是代码评审 agent。评审变更代码�
 3. 执行代码评审：逐条对照设计文档的需求概述与验收标准检查实现符合性；逐个检查单元测试断言是否真实覆盖行为（防"自写自测"的弱测试，决策 133）
 4. 调用 write_file 将评审报告写入 review-report.md
 5. 调用 submit_metadata 返回元数据
+
+## 输出契约（决策 391）
+- 每一轮的最终动作必须是调用 submit_metadata；在正文里声称已评审不等于已调用工具
 
 ## 评审报告格式（review-report.md）
 # 代码评审报告
@@ -287,6 +295,9 @@ const TEST_EX_SYSTEM: &str = r#"你是测试 agent。根据测试场景文档编
 4. 执行集成测试（通过 run_command，命令：{test_command}）
 5. 调用 write_file 将测试报告写入 test-report.md
 6. 调用 submit_metadata 返回元数据
+
+## 输出契约（决策 391）
+- 每一轮的最终动作必须是调用 submit_metadata；在正文里声称已交报告/元数据不等于已调用工具
 
 ## 集成测试要求
 - 每个测试场景对应至少一个测试用例
@@ -378,6 +389,47 @@ mod tests {
             assert!(
                 system.contains("默认值"),
                 "{stage}.{node} 缺少「能自答的不问」条款"
+            );
+        }
+    }
+
+    #[test]
+    fn execute_templates_carry_the_submit_metadata_anchor() {
+        // 决策 391（扩展决策 277①）：三个 execute 模板都要钉住「最终动作是调用工具、
+        // 声称不等于调用」——事故现场（develop run 324/334）模型在正文里声称已交元数据
+        // 却没调工具，靠救援重试兜住；锚点句把这条契约前移到模板。
+        for (stage, node) in [
+            (Stage::Develop, Node::Execute),
+            (Stage::Review, Node::Execute),
+            (Stage::Test, Node::Execute),
+        ] {
+            let system = system_template(stage, node);
+            assert!(
+                system.contains("每一轮的最终动作必须是调用 submit_metadata"),
+                "{stage}.{node} 缺少「每轮必交元数据」契约句"
+            );
+            assert!(
+                system.contains("不等于已调用工具"),
+                "{stage}.{node} 缺少「声称不等于调用」契约句"
+            );
+        }
+    }
+
+    /// 决策 391：DEV_EX_SYSTEM 的收口步骤里必须有落提交步，且写明三件必需信息——
+    /// 提交（`git commit`）、message 遵循目标仓提交惯例（格式属项目域，不进核心代码）、
+    /// **绝对路径的 cd**（事故实证：相对 cwd 解析到别的 checkout）与 `rev-list` 自查读数。
+    #[test]
+    fn develop_execute_template_requires_committing_changes() {
+        let system = system_template(Stage::Develop, Node::Execute);
+        for needle in [
+            "git commit",
+            "提交惯例",
+            "cd 到系统注入的 worktree 绝对路径",
+            "git rev-list --count",
+        ] {
+            assert!(
+                system.contains(needle),
+                "DEV_EX 落提交步缺少必需信息 `{needle}`：{system}"
             );
         }
     }

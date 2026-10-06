@@ -415,6 +415,7 @@ pub fn implementation_ok(script: &mut Script, task_id: &str) {
             branch_name: format!("kanban/{task_id}"),
             changed_files: vec![],
             unit_test_files: vec![],
+            no_changes: false,
         });
     script
         .for_node(Stage::Review, Node::Execute)

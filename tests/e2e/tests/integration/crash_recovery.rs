@@ -135,6 +135,7 @@ fn pipeline_script(task_id: &str, stall_at: &[(Stage, Node)]) -> Script {
             branch_name: format!("kanban/{task_id}"),
             changed_files: vec![],
             unit_test_files: vec![],
+            no_changes: false,
         });
     staged(&mut s, Stage::Review, Node::Execute, stall_at)
         .write_file(

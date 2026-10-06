@@ -495,6 +495,43 @@ impl Git {
         .await
     }
 
+    /// 分支相对基准的**自有提交数**（决策 391：develop 零提交硬检查的读数）。
+    ///
+    /// libgit2 revwalk：从分支 tip 走、藏掉基准点——分支与基准同点时恰为 0。
+    /// 短超时（与 is_dirty 同档）：这是闸门里的一条读数，读不出时调用方按
+    /// 「读不到」降级，不允许它挂住 validate_output。
+    pub async fn ahead_count(
+        &self,
+        repo_path: &Path,
+        base_ref: &str,
+        branch: &str,
+    ) -> Result<usize> {
+        let p = repo_path.to_path_buf();
+        let base = base_ref.to_string();
+        let branch = branch.to_string();
+        blocking_within(IS_DIRTY_TIMEOUT_SEC, move || {
+            let repo = open(&p)?;
+            let base_commit = repo
+                .revparse_single(&base)
+                .map_err(gerr)?
+                .peel_to_commit()
+                .map_err(gerr)?;
+            let branch_commit = repo
+                .revparse_single(&branch)
+                .map_err(gerr)?
+                .peel_to_commit()
+                .map_err(gerr)?;
+            if branch_commit.id() == base_commit.id() {
+                return Ok(0);
+            }
+            let mut walk = repo.revwalk().map_err(gerr)?;
+            walk.push(branch_commit.id()).map_err(gerr)?;
+            walk.hide(base_commit.id()).map_err(gerr)?;
+            Ok(walk.count())
+        })
+        .await
+    }
+
     /// 基准 ref（决策 41）：有 **origin** remote 用 `origin/{default_branch}`，否则本地分支。
     ///
     /// 只认 `origin`：仓库只配了别的 remote 名时，`origin/{branch}` 并不存在，

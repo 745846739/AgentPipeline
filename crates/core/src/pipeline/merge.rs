@@ -28,7 +28,10 @@ use crate::types::{
 use crate::{Error, Result};
 
 use super::events::finish_run_with_sse;
-use super::executor::{begin_run_with_sse, pend_reason, project_or_err, run_code_gate, NodeOutput};
+use super::executor::{
+    begin_run_with_sse, clear_zero_commit_facts, declared_no_changes, pend_reason, project_or_err,
+    run_code_gate, write_zero_commit_facts, zero_commit_facts, NodeOutput,
+};
 use super::run_ledger::RunLedger;
 
 /// merge 状态机的依赖面（决策 249 · 票 04）：五件全是借用——留守核每次派发借一遍。
@@ -53,7 +56,20 @@ impl MergeFlow<'_> {
         kind: PendingKind,
         message: impl Into<String>,
     ) -> Result<()> {
-        let reason = PendingReason::new(kind, cursor.stage, cursor.node, message);
+        self.pend_with_kind(cursor, kind, message, None).await
+    }
+
+    /// 同上，带 `context.kind`（决策 130 ①）：专用动作集靠它才下发得出来，缺失会落到
+    /// `(user_decision, _)` 通用兜底行——申报零变更那条路必须带 `zero_changes`。
+    async fn pend_with_kind(
+        &self,
+        cursor: &NodeCursor,
+        kind: PendingKind,
+        message: impl Into<String>,
+        kind_str: Option<&str>,
+    ) -> Result<()> {
+        let mut reason = PendingReason::new(kind, cursor.stage, cursor.node, message);
+        reason.context = kind_str.map(PendingContext::with_kind);
         pend_reason(self.store, self.sse, cursor, reason).await
     }
 
@@ -113,7 +129,9 @@ impl MergeFlow<'_> {
                     return match outcome {
                         // 阶段 A 末尾已挂 pending(merge_approval)；闸门失败已写 metadata。
                         // 两者都交给 route_merge 确认（NoOp / GotoTest / KickbackDevelop / 耗尽）。
-                        PhaseA::Proposal | PhaseA::GateRan => {
+                        // PendingDecision（决策 391）：零变更申报的 pending 已挂上，
+                        // merge metadata 无闸门结果 → route_merge NoOp，等用户动作。
+                        PhaseA::Proposal | PhaseA::GateRan | PhaseA::PendingDecision => {
                             Ok(NodeOutput::Route(crate::pipeline::MetadataView::default()))
                         }
                         PhaseA::Conflict(files) => Ok(NodeOutput::Edge(
@@ -164,7 +182,11 @@ impl MergeFlow<'_> {
         let result = self
             .phase_a_inner(task, project, cursor, worktree, run_id)
             .await;
-        let failed = !matches!(result, Ok(PhaseA::Proposal) | Ok(PhaseA::GateRan));
+        // PendingDecision（决策 391）挂的是等用户的 pending，不是节点失败。
+        let failed = !matches!(
+            result,
+            Ok(PhaseA::Proposal) | Ok(PhaseA::GateRan) | Ok(PhaseA::PendingDecision)
+        );
         finish_run_with_sse(
             self.sse,
             &self.ledger(),
@@ -228,7 +250,38 @@ impl MergeFlow<'_> {
         let diff_path = "merge-proposal.diff";
         let diff_stats = parse_diff_stats(&Git.diff_stat(repo, &range).await?);
         if diff_stats.files_changed == 0 {
-            // 空差异 = 没有可合入的变更；按闸门失败分流处理，不静默合入
+            // 决策 391：先看 develop 是否显式申报了「本任务零变更」。
+            // 申报成立 → 空分支不是缺陷而是诚实结论：交用户确认（cancel 收尾或回
+            // develop 继续改），不写闸门失败、不烧 gate_failures。
+            if declared_no_changes(self.store, &task.id).await? {
+                clear_zero_commit_facts(self.store.home(), &task.id);
+                // 必须带 `context.kind`：否则 `allowed_actions` 落到
+                // `(user_decision, _)` 通用兜底行（{skip, cancel}），而下发不出本分支
+                // 语义的 {goto develop, cancel}（决策 130 ①）。
+                self.pend_with_kind(
+                    cursor,
+                    PendingKind::UserDecision,
+                    "develop 申报本任务零变更：确认零变更收尾取消，或回 develop 继续修改",
+                    Some(crate::actions::kinds::ZERO_CHANGES),
+                )
+                .await?;
+                return Ok(PhaseA::PendingDecision);
+            }
+            // 未申报的空差异 = 没有可合入的变更；按闸门失败分流处理，不静默合入。
+            // 类型是 EmptyBranch（决策 391）：确定性失败直接打回 develop（routes 决策
+            // 139 先例），不进 test 复检——修用例造不出分支提交，复检必然空转。
+            // 事实段与 develop 守卫同源落盘：重入 develop.execute 时 prompt 带同样指令。
+            let dirty = Git.dirty_files(wt).await.unwrap_or_default();
+            let headline = format!(
+                "- 任务分支 `{branch}` 相对基准 `{base_ref}` 的净差异：**0 个文件**\n\
+                 - 工作区未提交改动：{} 处\n",
+                dirty.len(),
+            );
+            write_zero_commit_facts(
+                self.store.home(),
+                &task.id,
+                &zero_commit_facts(&headline, &dirty),
+            )?;
             self.store
                 .upsert_merge_result(
                     &task.id,
@@ -238,7 +291,7 @@ impl MergeFlow<'_> {
                         diff_stats,
                         base_commit,
                         gate: Some(Gate::Fail),
-                        gate_failure_kind: Some(GateFailureKind::Test),
+                        gate_failure_kind: Some(GateFailureKind::EmptyBranch),
                         gate_failures: 0,
                         gate_failure_output: Some("diff 为空：任务分支相对基准没有任何变更".into()),
                         conflict_files: Vec::new(),
@@ -412,6 +465,9 @@ enum PhaseA {
     Proposal,
     /// 闸门已跑且失败，结果在 merge metadata 里，交 route_merge 分流。
     GateRan,
+    /// 决策 391：develop 申报零变更成立，已挂 pending(user_decision)——
+    /// merge metadata 无闸门结果，route_merge 按 `gate == None` NoOp 退出循环。
+    PendingDecision,
     /// rebase 冲突（已 abort），打回 develop。
     Conflict(Vec<String>),
 }

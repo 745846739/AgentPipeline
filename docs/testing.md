@@ -135,6 +135,7 @@ workspace 成员 `crates/testkit`，供 L2 / L4 复用：
 | 工具参数形态（决策 372） | `arg_u64` / `arg_bool` 两个口径唯一的助手：数字字符串强转（`"90"` → 90）、错型报错（`"abc"` → 报文含"非负整数"，不静默整份读）；`read_file` 的 `offset`/`limit`/`tail`、`list_dir` 的 `recursive`、`read_board` 的 `runs`、`read_conversation` 的 `run_id`、`run_command`/`run_command_argv`/`web_fetch` 的 `timeout_sec` 全走这一处 | 372 |
 | 补充输入的取法（决策 371） | `supplement_input`：剥标题行取正文；**有 `## 用户答复` 小节时只取它**——决策 279 的"turn 就是用户那句话"不许被决策 371 的留痕富化打穿 | 279 / 371 |
 | 传输类失败的就地重发（决策 373） | `complete_once_retrying_transport` 三条：断流两次后第三次拿到响应且调用计数 = 3（`a_cut_stream_is_resent_in_place_instead_of_killing_the_round`）；断到底仍报错且计数 = 预算 + 1，不是死循环（`the_transport_resend_budget_is_finite`）；**非传输类一次都不重发**（`a_non_transport_failure_is_not_resent`）。判据复用决策 298 的 `is_transport`；自建桩 `FlakyLlm`（按次数失败 + 可换错误构造器）与 `base_with(llm)` 供后来者复用 | 373 / 298 / 288 |
+| 提交契约（决策 391，票 commit-contract 01） | `route_merge` 空分支 → `KickbackDevelop`（与 lint 同款，**不进** test 复检）；develop `MetadataView.zero_changes` → `Pending(UserDecision)`（申报优先于闸门失败）；模板三条 `execute_templates_carry_the_submit_metadata_anchor`（develop / review / test 都含「最终动作是调用 submit_metadata、声称不等于调用」）与 `develop_execute_template_requires_committing_changes`（落提交步 + 「提交惯例」）；`allowed_actions` 的 `zero_changes` 行 {goto develop, cancel}；`ResumeCause::zero_changes` 往返 + `resume_continues=false`；`submit_metadata` 模板字段 `no_changes` 与 schema 对齐（决策 369 的判据接住） | 391 |
 
 ## 6. 集成测试目录（L2）
 
@@ -257,6 +258,7 @@ workspace 成员 `crates/testkit`，供 L2 / L4 复用：
 | prompt cache 的稳定前缀与记账（决策 380，票 05） | `model_request.rs::assemble_freezes_a_byte_stable_head_and_a_fixed_tool_order`——同一输入两次组装 `system` / `user` / `hash` **逐字节相同**，工具名序列 = 基线常量序 + `submit_metadata` 收尾（`HashMap` 式抖动会当场露出来）；`providers/openai.rs::the_next_round_is_a_prefix_extension_of_the_previous_wire_messages`——第 2 轮的 wire 消息头**是第 1 轮的整段原样**，采样参数与工具定义不随轮次漂移（缓存只认「前缀逐字节相同」）；`executor.rs::provider_cache_readings_land_on_the_run_row`——替身模拟「第 1 次冷启动、此后每次命中」，命中的读数（含冷启动那轮的 0）**原样落运行台账**。真机读数与命中率基线见 `.scratch/106-stability/cache-findings.md`（整站 95.7%、事故任务 97.3%、跨 attempt 间隔 25–90 分钟仍命中） | 380 / 375 / 211 |
 | 补充输入的落盘与注入（决策 371） | `an_info_insufficient_answer_is_recorded_together_with_its_questions`：答复后 `user-input.md` 同时含问题原文、推荐答案与用户答复，且 architect-design.execute 的 user prompt 里三样都在（重入段渲染）；`supplement_input_rides_the_transcript_tail_and_leaves_the_first_message_verbatim` 钉住 user turn 仍是用户那句话、首条消息逐字不变 | 371 / 279 / 79 / 277 |
 | 闸门失败以事件记行（决策 388，票 gate-failure-respam） | `scheduler_tick.rs` **3 条**——`gate_failure_is_recorded_once_while_task_rechecks`（失败落定后 `updated_at` 刷新三轮、巡扫三轮：`gate_failure` 只有一行，`occurred_at` = merge_result 行落定时刻；**牙齿已验**：改回 `task.updated_at` 该用例红——每轮各记一行）、`a_reevaluated_gate_failure_is_a_new_event`（闸门重新评估再次失败新增一行，`occurred_at` 是第二次落定时刻、`detail` 带第二次输出——真失败不被吞）、`a_passed_gate_stops_recording_gate_failure`（gate=Pass 覆盖后巡扫不再记、存量行保留） | 388 / 209③ / 234 / 287 |
+| **提交契约：零提交守卫与零变更申报（决策 391）** | `executor.rs` **3 条**——`develop_gate_kicks_back_when_changes_are_never_committed`（develop 全绿但分支零自有提交：`NodeRetry` 打回 develop.execute、`validate_attempts=1`、**不穿越 review/merge**；`zero-commit-facts.md` 落盘含 rev-list 读数与未提交清单；重入 prompt 注入「## 零提交事实与落提交指令」而首轮不渲染）+ `develop_gate_kicks_back_even_when_the_tree_is_clean_and_nothing_declared`（工作区**干净**、也没申报同样在 develop 拦下——比票面三项条件宽一档，有意为之）+ `develop_declared_no_changes_pends_then_cancelled_terminal`（申报 `no_changes` → `pending(user_decision, zero_changes)`、动作集 {goto, cancel}，取消 → `cancelled` 终态，不经 `done`） | 391 |
 
 ## 7. API 契约测试（L3）
 
@@ -300,6 +302,7 @@ harness = FakeAgent（§3.2）+ testkit fixture（§3.3）+ 临时 home + 手动
 | E2E-05 | merge 冲突打回 | 74 | 自动合并失败 → `rebase --abort` → develop.execute prompt 含冲突文件；attempts=0 | P0 |
 | E2E-06a | 闸门测试失败 → 全 test_issue | 85 / 108 / 109 | gate=fail、gate_failures=1；跳 test.execute、`gate_recheck=true`、prompt 含闸门输出；修用例后重跑闸门 pass | P0 |
 | E2E-06b | 闸门失败 → code_issue | 85 | 存在 code_issue → pending(user_decision) → goto develop.execute | P0 |
+| E2E-06c | 空分支改道 | 391 | 分支有自有提交（空提交）但净差异 0 文件 → `gate_failure_kind=EmptyBranch`、**直接打回 develop.execute**（不经 test 复检）、gate_failures 统一累加；`zero-commit-facts.md` 与 develop 守卫同源落盘；已申报 `no_changes` 时挂 `pending(user_decision, **context.kind=zero_changes**)`——动作集恰为 {goto develop.execute, cancel}（通用兜底行会给 skip，故这一条能抓住「没带 context.kind」的缺陷）、且**不写 merge_result**（不记闸门失败、不烧 gate_failures） | P0 |
 | E2E-07 | 闸门 lint 失败 | 139 | 直接打回 develop.execute（**不经** test.execute）；`gate_failure_kind=lint`；attempts=0；gate_failures 统一累加 | P0 |
 | E2E-08 | gate_failures 耗尽 → failed → retry | 86 / 108 / 125 / 117 | 耗尽 → pending(retry_exhausted) **无 skip**；终止 → failed；retry → 旧游标归档 + 新 main、worktree `reset --hard` + `clean`、置 queued 重新准入 | P0 |
 | E2E-09 | 基准前移 | 96 / 108 | 阶段 A 后推进 base → approve → 校验不一致 → approval 重置 none → 重走阶段 A；gate_failures 保留 | P0 |

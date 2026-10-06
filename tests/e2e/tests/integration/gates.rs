@@ -7,8 +7,8 @@ use super::common::{design_ok, full_pass_script, Flow};
 use agentpipeline_core::git::Git;
 use agentpipeline_core::storage::decisions::ResumeAction;
 use agentpipeline_core::types::{
-    Approval, FailureCause, Gate, GateFailureKind, Node, PendingKind, Stage, TaskStatus,
-    TestFailure, TestResult, TransitionTrigger,
+    Approval, CodeChanges, FailureCause, Gate, GateFailureKind, Node, PendingKind, ReviewResult,
+    Stage, TaskStatus, TestFailure, TestResult, TransitionTrigger,
 };
 use testkit::Script;
 
@@ -570,4 +570,139 @@ async fn e2e_08_exhausts_gate_failures_then_retry_resets_worktree_and_readmits()
         f.store.get_task("t8").await.unwrap().status,
         TaskStatus::Running
     );
+}
+
+// ────────────── 空分支改道与零变更申报确认（决策 391 / 票 commit-contract 01）──────────────
+//
+// 原缺陷：develop 全绿但分支相对基准零差异，merge 把「diff 为空」误分类成 Test，
+// 打回 test 复检造不出分支提交，空转一轮再交用户。决策 391 把空分支改道回 develop。
+
+/// 决策 391：分支有自有提交（空提交）但相对基准**净差异 0 文件** → merge 判 EmptyBranch，
+/// 直接打回 develop.execute，**不进 test 复检**；gate_failures 照决策 108 累计。
+#[tokio::test]
+async fn e2e_merge_empty_branch_kicks_back_to_develop_without_test() {
+    let f = Flow::new().await;
+    let mut script = Script::new();
+    design_ok(&mut script);
+    // develop.execute：造一个**空提交**——`rev-list` 自有提交数 > 0（过 develop 守卫），
+    // 但相对基准的净差异是 0 文件（正是 merge 撞上的空分支现场）。
+    script
+        .for_node(Stage::Develop, Node::Execute)
+        .run_command(
+            "git -c user.name=f -c user.email=f@l commit --allow-empty -m 'chore: noop commit'",
+        )
+        .submit(&CodeChanges {
+            branch_name: "kanban/t-eb".into(),
+            changed_files: vec![],
+            unit_test_files: vec![],
+            no_changes: false,
+        });
+    script
+        .for_node(Stage::Review, Node::Execute)
+        .write_file("review-report.md", "# 评审报告\n通过\n")
+        .submit(&ReviewResult {
+            approved: true,
+            review_report_path: Some("review-report.md".into()),
+            required_changes: vec![],
+        });
+    script
+        .for_node(Stage::Test, Node::Execute)
+        .write_file("test-report.md", "# 测试报告\n通过\n")
+        .submit(&TestResult {
+            passed: true,
+            test_report_path: Some("test-report.md".into()),
+            failures: vec![],
+            gate_recheck: false,
+        });
+    f.agent.set_script(script);
+    testkit::seed_task(&f.store, "t-eb", "p1").await.unwrap();
+    f.admit("t-eb").await;
+
+    f.executor.run("t-eb").await.unwrap();
+
+    let merge = f.store.merge_metadata("t-eb").await.unwrap().unwrap();
+    assert_eq!(merge.gate, Some(Gate::Fail));
+    assert_eq!(
+        merge.gate_failure_kind,
+        Some(GateFailureKind::EmptyBranch),
+        "空分支必须归 EmptyBranch，不得冒充 Test"
+    );
+    assert_eq!(merge.gate_failures, 1, "统一累加（决策 108）");
+
+    let transitions = f.store.list_transitions("t-eb").await.unwrap();
+    assert!(
+        transitions.iter().any(|t| t.to_stage == Stage::Develop
+            && t.to_node == Node::Execute
+            && t.trigger == TransitionTrigger::Kickback),
+        "空分支应直接打回 develop.execute：{transitions:?}"
+    );
+    assert!(
+        !transitions.iter().any(|t| t.to_stage == Stage::Test
+            && t.to_node == Node::Execute
+            && t.trigger == TransitionTrigger::Kickback),
+        "空分支不得经 test 复检（修用例造不出分支提交）：{transitions:?}"
+    );
+
+    // 事实段与 develop 守卫同源落盘（重入 develop.execute 时注入）
+    let facts = std::fs::read_to_string(f.home.home().task_file("t-eb", "zero-commit-facts.md"))
+        .expect("merge 空分支应落零提交事实段");
+    assert!(facts.contains("净差异"), "{facts}");
+    assert!(facts.contains("git commit"), "{facts}");
+}
+
+/// 决策 391：空分支且 develop 已申报 `no_changes` → merge 挂 pending(user_decision)
+/// 交用户确认（不写闸门失败、不烧 gate_failures）。
+///
+/// 正常流水线在 develop 就被守卫截住（挂同样的 pending），本支是**防御性**路径：
+/// 直接从 merge 阶段入口构造，验证即使走到 merge，申报也仍被尊重。
+#[tokio::test]
+async fn e2e_merge_declared_no_changes_pends_for_user() {
+    let f = Flow::new().await;
+    let mut script = Script::new();
+    design_ok(&mut script);
+    script
+        .for_node(Stage::Develop, Node::Execute)
+        .submit(&CodeChanges {
+            branch_name: "kanban/t-dc".into(),
+            changed_files: vec![],
+            unit_test_files: vec![],
+            no_changes: true,
+        });
+    f.agent.set_script(script);
+    testkit::seed_task(&f.store, "t-dc", "p1").await.unwrap();
+    f.admit("t-dc").await;
+    f.executor.run("t-dc").await.unwrap();
+
+    // develop 已申报零变更（挂 pending）；把游标前移到 merge 阶段入口
+    let cursor = f.sole_cursor("t-dc").await;
+    f.store
+        .clear_cursor_pending(&cursor.cursor_id)
+        .await
+        .unwrap();
+    f.store
+        .set_cursor_stage(&cursor.cursor_id, Stage::Merge, Node::Execute)
+        .await
+        .unwrap();
+    f.executor.run("t-dc").await.unwrap();
+
+    let live = f.store.load_live_cursors("t-dc").await.unwrap();
+    let reason = live[0].pending_reason.as_ref().expect("应挂 pending");
+    assert_eq!(reason.kind, PendingKind::UserDecision);
+    // pending 必须带 `context.kind`：否则 `allowed_actions` 落到通用兜底行 {skip, cancel}
+    assert_eq!(
+        reason.context.as_ref().and_then(|c| c.kind.as_deref()),
+        Some("zero_changes")
+    );
+    // 申报是诚实结论：**不写 merge_result**（也就没有闸门失败行、不烧 gate_failures）
+    assert!(
+        f.store.merge_metadata("t-dc").await.unwrap().is_none(),
+        "申报零变更不得写闸门失败行"
+    );
+    // 动作集恰为 {goto develop.execute, cancel}——通用兜底行会给 skip，故这一条能抓住
+    // 「没带 context.kind」这个缺陷
+    let actions = f.store.allowed_actions_for_task("t-dc").await.unwrap();
+    let names: Vec<&str> = actions.iter().map(|a| a.action.as_str()).collect();
+    assert_eq!(names, vec!["goto", "cancel"], "{actions:?}");
+    let target = actions[0].target.as_ref().expect("goto 应有落点");
+    assert_eq!((target.stage, target.node), (Stage::Develop, Node::Execute));
 }

@@ -116,6 +116,7 @@ pub mod kinds {
     pub const TEST_CODE_ISSUE: &str = "test_code_issue";
     pub const GATE_RECHECK: &str = "gate_recheck";
     pub const DIRTY_WORKTREE: &str = "dirty_worktree";
+    pub const ZERO_CHANGES: &str = "zero_changes";
     pub const DEPENDENCY_FAILED: &str = "dependency_failed";
     pub const DEPENDENCY_CANCELLED: &str = "dependency_cancelled";
 }
@@ -202,6 +203,17 @@ pub fn allowed_actions(reason: &PendingReason, cursor_id: Option<&str>) -> Vec<A
             // 决策 132：「放弃合入」已移出动作集（无端点）
             AllowedAction::resume("continue", "我已手动处理，继续合入"),
             AllowedAction::side_effect("cancel", "取消任务"),
+        ],
+        (PendingKind::UserDecision, Some(kinds::ZERO_CHANGES)) => vec![
+            // 决策 391：develop 申报零变更后的两条出口——「确认收尾」走 cancel 终态
+            // （零变更没有合入语义，不经 done），「继续改」回 develop.execute 落提交
+            // 或做实际变更。
+            AllowedAction::goto(
+                "继续修改（落提交或做实际变更）",
+                Stage::Develop,
+                Node::Execute,
+            ),
+            AllowedAction::side_effect("cancel", "确认零变更，收尾取消"),
         ],
         (PendingKind::UserDecision, _) => vec![
             AllowedAction::resume("skip", "跳过当前阶段"),
@@ -375,6 +387,25 @@ mod tests {
             let r = reason(PendingKind::UserDecision, Stage::DevelopDesign, Some(k));
             assert_eq!(actions_of(&r), vec!["goto", "skip"]);
         }
+    }
+
+    #[test]
+    fn zero_changes_decision_offers_rework_or_cancel() {
+        // 决策 391：develop 申报零变更 → 要么回 develop 落提交/做实际变更，要么确认取消收尾。
+        let r = reason(
+            PendingKind::UserDecision,
+            Stage::Develop,
+            Some(kinds::ZERO_CHANGES),
+        );
+        let acts = allowed_actions(&r, None);
+        assert_eq!(
+            acts.iter().map(|a| a.action.as_str()).collect::<Vec<_>>(),
+            vec!["goto", "cancel"]
+        );
+        assert_eq!(acts[0].kind, ActionKind::Resume);
+        let target = acts[0].target.as_ref().unwrap();
+        assert_eq!((target.stage, target.node), (Stage::Develop, Node::Execute));
+        assert_eq!(acts[1].kind, ActionKind::SideEffect);
     }
 
     #[test]

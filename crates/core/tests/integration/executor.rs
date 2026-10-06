@@ -199,6 +199,7 @@ fn implementation_scripts(script: &mut Script, task_id: &str) {
             branch_name: format!("kanban/{task_id}"),
             changed_files: vec![],
             unit_test_files: vec![],
+            no_changes: false,
         });
     script
         .for_node(Stage::Review, Node::Execute)
@@ -3397,6 +3398,182 @@ async fn skill_tool_injects_body_into_next_round_messages() {
     );
 }
 
+// ───────────── 提交契约：零提交守卫与零变更申报（决策 391 / 票 commit-contract 01）─────────────
+//
+// 原缺陷（106 任务 01M47RQG4M9533F5TMF1AGJXC8）：develop.execute 全绿但变更从未落进任务
+// 分支，闸门只看 lint + 单测就放行，一路穿越 review/test 在 merge 才撞「diff 为空」。
+
+/// 决策 391：develop.execute 交了元数据、闸门全绿，但任务分支**零自有提交**
+/// → validate_output 确定性打回 develop.execute（不前进），重入 prompt 带零提交事实段。
+#[tokio::test]
+async fn develop_gate_kicks_back_when_changes_are_never_committed() {
+    let ctx = setup("true", Settings::default()).await;
+    let mut script = Script::new();
+    design_scripts(&mut script);
+    // 现场复刻：写了文件却**不提交**——git status 脏、分支相对基准零提交。
+    script
+        .for_node(Stage::Develop, Node::Execute)
+        .write_file(
+            "src/lib.rs",
+            "pub fn add(a: i32, b: i32) -> i32 { a + b }\n#[test]\nfn adds() { assert_eq!(add(1, 2), 3); }\n",
+        )
+        .write_file("tests/acceptance.rs", "#[test]\nfn ok() {}\n")
+        .submit(&CodeChanges {
+            branch_name: "kanban/t-zero".into(),
+            changed_files: vec![],
+            unit_test_files: vec![],
+            no_changes: false,
+        });
+    ctx.agent.set_script(script);
+    testkit::seed_task(&ctx.store, "t-zero", "p1")
+        .await
+        .unwrap();
+    admit(&ctx, "t-zero").await;
+
+    ctx.executor.run("t-zero").await.unwrap();
+
+    // ① 打回 develop.execute：任务不得越过 develop（这是事故的洞——此前这里放行）
+    let transitions = ctx.store.list_transitions("t-zero").await.unwrap();
+    assert!(
+        transitions.iter().any(|t| t.to_stage == Stage::Develop
+            && t.to_node == Node::Execute
+            && t.trigger == TransitionTrigger::NodeRetry),
+        "零提交必须打回 develop.execute：{transitions:?}"
+    );
+    assert!(
+        !transitions
+            .iter()
+            .any(|t| t.to_stage == Stage::Review || t.to_stage == Stage::Merge),
+        "零提交不得穿越到 review / merge：{transitions:?}"
+    );
+    let live = ctx.store.load_live_cursors("t-zero").await.unwrap();
+    assert_eq!(
+        (live[0].stage, live[0].node),
+        (Stage::Develop, Node::Execute)
+    );
+    assert_eq!(
+        live[0].validate_attempts, 1,
+        "守卫失败计入 validate_attempts"
+    );
+
+    // ② 事实段已落盘（重入渲染的取数源）
+    let facts_path = ctx.store.home().task_file("t-zero", "zero-commit-facts.md");
+    let facts = std::fs::read_to_string(&facts_path).expect("零提交事实段应已落盘");
+    assert!(facts.contains("自有提交数：**0**"), "{facts}");
+    assert!(facts.contains("src/lib.rs"), "应列出未提交清单：{facts}");
+
+    // ③ 重入 develop.execute 的 prompt 注入事实段；首轮不渲染
+    let requests = ctx.agent.request_log();
+    let devex: Vec<_> = requests
+        .iter()
+        .filter(|r| r.stage == Stage::Develop && r.node == Node::Execute)
+        .collect();
+    assert!(
+        devex.len() >= 2,
+        "至少应有两轮 develop.execute：{}",
+        devex.len()
+    );
+    assert!(
+        !devex[0].user_prompt.contains("## 零提交事实与落提交指令"),
+        "首轮不渲染事实段"
+    );
+    let reentry = devex.last().expect("重入请求");
+    assert!(
+        reentry.user_prompt.contains("## 零提交事实与落提交指令"),
+        "打回后的重入必须带事实段：{}",
+        reentry.user_prompt
+    );
+    assert!(
+        reentry.user_prompt.contains("git commit"),
+        "事实段要带落提交指令"
+    );
+}
+
+/// 决策 391：**工作区干净、也没申报**（agent 什么都没做）时，零自有提交同样在 develop
+/// 处被拦——「全绿但分支等于基准」无论工作区脏否都不该穿越 review / test。
+///
+/// 这条比票面形状 3 的三项条件（「…**且工作区有变更**」）宽一档，有意为之：票面
+/// 「What to build」写的目标就是「在 develop.validate_output 就被打回」，晚了就又要多穿
+/// 两个阶段；而事实段里的「或申报 no_changes」一句对干净工作区同样成立（见决策 391）。
+#[tokio::test]
+async fn develop_gate_kicks_back_even_when_the_tree_is_clean_and_nothing_declared() {
+    let ctx = setup("true", Settings::default()).await;
+    let mut script = Script::new();
+    design_scripts(&mut script);
+    script
+        .for_node(Stage::Develop, Node::Execute)
+        .submit(&CodeChanges {
+            branch_name: "kanban/t-nc".into(),
+            changed_files: vec![],
+            unit_test_files: vec![],
+            no_changes: false,
+        });
+    ctx.agent.set_script(script);
+    testkit::seed_task(&ctx.store, "t-nc", "p1").await.unwrap();
+    admit(&ctx, "t-nc").await;
+
+    ctx.executor.run("t-nc").await.unwrap();
+
+    let transitions = ctx.store.list_transitions("t-nc").await.unwrap();
+    assert!(
+        transitions.iter().any(|t| t.to_stage == Stage::Develop
+            && t.to_node == Node::Execute
+            && t.trigger == TransitionTrigger::NodeRetry),
+        "干净工作区 + 零提交也不得放行：{transitions:?}"
+    );
+    assert!(
+        !transitions
+            .iter()
+            .any(|t| t.to_stage == Stage::Review || t.to_stage == Stage::Merge),
+        "不得穿越到 review / merge：{transitions:?}"
+    );
+    let facts = std::fs::read_to_string(ctx.store.home().task_file("t-nc", "zero-commit-facts.md"))
+        .expect("零提交事实段应已落盘");
+    assert!(facts.contains("工作区未提交改动：0 处"), "{facts}");
+}
+
+/// 决策 391：申报 `no_changes` → develop.validate_output 挂 pending(user_decision)，
+/// 用户确认（cancel）→ 任务以 cancelled 终态收口（不经 done，`do_done` 的 merged 硬校验
+/// 对零变更无语义）。动作集是「继续修改 / 确认取消」两条。
+#[tokio::test]
+async fn develop_declared_no_changes_pends_then_cancelled_terminal() {
+    let ctx = setup("true", Settings::default()).await;
+    let mut script = Script::new();
+    design_scripts(&mut script);
+    script
+        .for_node(Stage::Develop, Node::Execute)
+        .submit(&CodeChanges {
+            branch_name: "kanban/t-zc".into(),
+            changed_files: vec![],
+            unit_test_files: vec![],
+            no_changes: true,
+        });
+    ctx.agent.set_script(script);
+    testkit::seed_task(&ctx.store, "t-zc", "p1").await.unwrap();
+    admit(&ctx, "t-zc").await;
+
+    ctx.executor.run("t-zc").await.unwrap();
+
+    // 挂在 develop 等用户确认
+    let live = ctx.store.load_live_cursors("t-zc").await.unwrap();
+    let reason = live[0].pending_reason.as_ref().expect("应挂 pending");
+    assert_eq!(reason.kind, PendingKind::UserDecision);
+    assert_eq!(
+        reason.context.as_ref().and_then(|c| c.kind.as_deref()),
+        Some("zero_changes")
+    );
+    let actions = ctx.store.allowed_actions_for_task("t-zc").await.unwrap();
+    let names: Vec<&str> = actions.iter().map(|a| a.action.as_str()).collect();
+    assert_eq!(names, vec!["goto", "cancel"]);
+
+    // 用户确认零变更 → cancelled 终态（不经过 done / 不需要 merge 结果）
+    ctx.store.cancel_task("t-zc").await.unwrap();
+    assert_eq!(
+        ctx.store.get_task("t-zc").await.unwrap().status,
+        TaskStatus::Cancelled
+    );
+}
+
 // ──────────────────── 闸门失败 → test 复检 → 重跑闸门（票 15 / 决策 85 / 109）────────────────────
 
 #[tokio::test]
@@ -4603,6 +4780,7 @@ async fn parent_spawns_readonly_subagent_and_gets_summary_back() {
             branch_name: "kanban/t-sub".into(),
             changed_files: vec![],
             unit_test_files: vec![],
+            no_changes: false,
         });
     script
         .for_node(Stage::Review, Node::Execute)
@@ -4683,6 +4861,7 @@ async fn subagent_tool_set_is_read_only() {
             branch_name: "kanban/t-ro".into(),
             changed_files: vec![],
             unit_test_files: vec![],
+            no_changes: false,
         });
     script
         .for_node(Stage::Review, Node::Execute)
@@ -4762,6 +4941,7 @@ async fn subagent_run_row_carries_parent_and_agent_type() {
             branch_name: "kanban/t-prow".into(),
             changed_files: vec![],
             unit_test_files: vec![],
+            no_changes: false,
         });
     script
         .for_node(Stage::Review, Node::Execute)
@@ -4853,6 +5033,7 @@ async fn subagent_tokens_are_counted_once_on_its_own_run() {
             branch_name: "kanban/t-tok".into(),
             changed_files: vec![],
             unit_test_files: vec![],
+            no_changes: false,
         });
     script
         .for_node(Stage::Review, Node::Execute)
@@ -4939,6 +5120,7 @@ async fn subagent_does_not_inherit_declared_tools() {
             branch_name: "kanban/t-noninh".into(),
             changed_files: vec![],
             unit_test_files: vec![],
+            no_changes: false,
         });
     script
         .for_node(Stage::Review, Node::Execute)
@@ -5036,6 +5218,7 @@ async fn subagent_cannot_execute_tools_outside_its_readonly_set() {
             branch_name: "kanban/t-enforce".into(),
             changed_files: vec![],
             unit_test_files: vec![],
+            no_changes: false,
         });
     script
         .for_node(Stage::Review, Node::Execute)
@@ -5276,6 +5459,7 @@ async fn run_to_review_reject(ctx: &Ctx, task_id: &str, review: &ReviewResult) {
             branch_name: format!("kanban/{task_id}"),
             changed_files: vec![],
             unit_test_files: vec![],
+            no_changes: false,
         });
     script.for_node(Stage::Review, Node::Execute).submit(review);
     ctx.agent.set_script(script);
@@ -5319,6 +5503,7 @@ fn rework_scripts(script: &mut Script, task_id: &str) {
             branch_name: format!("kanban/{task_id}"),
             changed_files: vec![],
             unit_test_files: vec![],
+            no_changes: false,
         });
     script
         .for_node(Stage::Review, Node::Execute)

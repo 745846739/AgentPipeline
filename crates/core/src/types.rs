@@ -375,6 +375,9 @@ pub enum ResumeCause {
     TestCodeIssue,
     GateRecheck,
     DirtyWorktree,
+    /// `user_decision` 且 `context.kind = zero_changes`（决策 391）：develop 显式申报
+    /// 「本任务零变更」，人确认收尾（cancel 终态）或打回继续修改。
+    ZeroChanges,
     /// 人松开一次手动暂停（`user_paused` 的 `continue`）：从按住的那一处接着跑。
     UserPaused,
     /// 人按下「重跑本阶段」：**不带**上一段对话，重开一段。
@@ -397,7 +400,7 @@ pub enum ResumeCause {
 /// 新增一个变体时**先改这里**，再回答 `resume_continues` 那个穷尽 `match`——
 /// 编译器会在后者报「未覆盖的模式」，这是本表的牙齿（决策 205：兜底 false 是安全网，
 /// 不是让人忘记回答的借口）。
-pub const ALL_RESUME_CAUSES: [ResumeCause; 24] = [
+pub const ALL_RESUME_CAUSES: [ResumeCause; 25] = [
     ResumeCause::InfoInsufficient,
     ResumeCause::ConflictWait,
     ResumeCause::RetryExhausted,
@@ -415,6 +418,7 @@ pub const ALL_RESUME_CAUSES: [ResumeCause; 24] = [
     ResumeCause::TestCodeIssue,
     ResumeCause::GateRecheck,
     ResumeCause::DirtyWorktree,
+    ResumeCause::ZeroChanges,
     ResumeCause::UserPaused,
     ResumeCause::UserRerun,
     ResumeCause::MergeApproved,
@@ -445,6 +449,7 @@ impl ResumeCause {
             ResumeCause::TestCodeIssue => "test_code_issue",
             ResumeCause::GateRecheck => "gate_recheck",
             ResumeCause::DirtyWorktree => "dirty_worktree",
+            ResumeCause::ZeroChanges => "zero_changes",
             ResumeCause::UserPaused => "user_paused",
             ResumeCause::UserRerun => "user_rerun",
             ResumeCause::MergeApproved => "merge_approved",
@@ -498,6 +503,7 @@ impl ResumeCause {
                 "test_code_issue" => ResumeCause::TestCodeIssue,
                 "gate_recheck" => ResumeCause::GateRecheck,
                 "dirty_worktree" => ResumeCause::DirtyWorktree,
+                "zero_changes" => ResumeCause::ZeroChanges,
                 // 认不出的 context.kind：按**通用那一行**（skip / cancel）处置。
                 _ => ResumeCause::UserDecision,
             },
@@ -565,6 +571,7 @@ pub fn resume_continues(cause: ResumeCause) -> bool {
         //   （决策 205 未列 → 兜底 false；票 04 复用这一档）。
         // `dependency_cancelled`：依赖被取消，人按「忽略失败依赖继续」——那是换一条路走。
         // `user_decision`（通用那一行）：既非打回也非补充，没有可续的上下文。
+        // `zero_changes`（决策 391）：打回去落提交，零提交事实段带着要点，重开一段更干净。
         // `user_rerun`：**重跑 = 这一轮不算，重来**——带着上一轮的对话重来正是「重来」的
         //   反面（模型会接着自己刚写的那半句往下写）。故它落在 false：重开一段。
         ResumeCause::MergeApproved
@@ -573,6 +580,7 @@ pub fn resume_continues(cause: ResumeCause) -> bool {
         | ResumeCause::DependencyCancelled
         | ResumeCause::UserRerun
         | ResumeCause::UserDecision
+        | ResumeCause::ZeroChanges
         | ResumeCause::Unknown => false,
     }
 }
@@ -908,6 +916,14 @@ pub struct CodeChanges {
     pub changed_files: Vec<FileChangeSpec>,
     #[serde(default)]
     pub unit_test_files: Vec<FileChangeSpec>,
+    /// 显式申报「本任务零变更」（决策 391）：缺省 false——不申报即「有变更」，
+    /// 有变更就必须落进任务分支提交（develop_code_gate 的零提交硬检查以此为准）。
+    /// 申报了则 develop.validate_output 挂 pending(user_decision) 交用户确认收尾。
+    #[serde(default)]
+    #[schemars(
+        description = "本任务确无任何变更时申报 true（不得为凑提交而造假变更）；缺省 false"
+    )]
+    pub no_changes: bool,
 }
 
 /// review.execute 的 required_changes 单项（决策 387）。
@@ -997,12 +1013,16 @@ pub enum Gate {
     Fail,
 }
 
-/// 闸门失败类型（决策 139）。
+/// 闸门失败类型（决策 139；`empty_branch` 由决策 391 补充）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum GateFailureKind {
     Lint,
     Test,
+    /// 任务分支相对基准没有任何提交（merge 阶段 A 的 `files_changed == 0`）。
+    /// 确定性失败，**不进 test 复检**（决策 85 的适用范围就此收窄）——直接打回
+    /// develop.execute，与 lint 同一条「确定性错误不绕 test」的先例。
+    EmptyBranch,
 }
 
 /// merge 阶段在 `kanban_stage_outputs` 里的 `output_type` 定名（§4.2）。
@@ -1706,7 +1726,7 @@ mod tests {
     #[test]
     fn resume_cause_table_is_the_spec() {
         use ResumeCause::*;
-        let cases: [(ResumeCause, bool); 24] = [
+        let cases: [(ResumeCause, bool); 25] = [
             // ── true ──
             (InfoInsufficient, true),
             (RetryExhausted, true),
@@ -1735,8 +1755,14 @@ mod tests {
             (UserDecision, false),
             // 重跑 = 这一轮不算：重开一段（决策 276）
             (UserRerun, false),
+            // 申报零变更打回落提交：零提交事实段带着要点，重开一段更干净（决策 391）
+            (ZeroChanges, false),
             (Unknown, false),
         ];
+        // 逐行抄写得**逐行对得上**：加了新的 `ResumeCause` 却忘了往这里补一行时，
+        // 定长数组仍编译得过（上面那条循环是「表里有的逐条断言」，不是「枚举逐条都在表里」），
+        // 故这里显式钉住条数——否则新变体的 `resume_continues` 取值会静默没人测。
+        assert_eq!(cases.len(), ALL_RESUME_CAUSES.len());
         for (cause, expected) in cases {
             assert_eq!(
                 resume_continues(cause),
@@ -2076,7 +2102,7 @@ mod tests {
     /// 而 `actions::kinds` 里新增一个常量时，配对的守卫在 `types::tests::` 的
     /// `every_actions_kind_is_covered_here`（同一模块末尾）会红：它比对 `actions.rs` 源文本里
     /// 出现的 `pub const X: &str = "..."` 与这张清单，故「加了常量忘了加进来」不会静默。
-    const BACKEND_CONTEXT_KINDS: [&str; 10] = [
+    const BACKEND_CONTEXT_KINDS: [&str; 11] = [
         crate::actions::kinds::DUPLICATE_RISK,
         crate::actions::kinds::DEVELOP_DESIGN_INPUT_INSUFFICIENT,
         crate::actions::kinds::TEST_DESIGN_INPUT_INSUFFICIENT,
@@ -2085,6 +2111,7 @@ mod tests {
         crate::actions::kinds::TEST_CODE_ISSUE,
         crate::actions::kinds::GATE_RECHECK,
         crate::actions::kinds::DIRTY_WORKTREE,
+        crate::actions::kinds::ZERO_CHANGES,
         crate::actions::kinds::DEPENDENCY_FAILED,
         crate::actions::kinds::DEPENDENCY_CANCELLED,
     ];

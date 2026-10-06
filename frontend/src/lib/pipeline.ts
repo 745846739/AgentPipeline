@@ -587,6 +587,8 @@ export function pendingLabel(reason: { type: string; context?: { kind?: string }
           return '语义重复风险';
         case 'dirty_worktree':
           return '脏工作区';
+        case 'zero_changes':
+          return '零变更确认';
         case 'test_code_issue':
           return '测试用例问题';
         case 'gate_recheck':

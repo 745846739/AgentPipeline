@@ -35,6 +35,7 @@ async fn e2e_05_merge_rebase_conflict_kicks_back_develop_with_conflict_files() {
             branch_name: "kanban/t5".into(),
             changed_files: vec![],
             unit_test_files: vec![],
+            no_changes: false,
         });
     script.for_node(Stage::Review, Node::Execute).submit(
         &agentpipeline_core::types::ReviewResult {

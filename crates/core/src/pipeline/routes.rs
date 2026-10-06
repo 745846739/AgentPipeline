@@ -20,6 +20,9 @@ pub struct MetadataView {
     pub passed: bool,
     /// test.validate_output 的根因分类（决策 62 / 85）。
     pub failures: Vec<TestFailure>,
+    /// develop.execute 显式申报了「本任务零变更」（决策 391）：develop.validate_output
+    /// 据此挂 pending(user_decision) 交用户确认收尾，不再走常规放行/重试。
+    pub zero_changes: bool,
 }
 
 impl MetadataView {
@@ -122,9 +125,16 @@ pub fn resolve_validate_output(
 pub fn route(cursor: &NodeCursor, ctx: &RouteContext) -> EdgeKind {
     match (cursor.stage, cursor.node) {
         // develop / test 的 validate_output 是纯代码闸门（决策 62）
-        (Stage::Develop, Node::ValidateOutput) | (Stage::Test, Node::ValidateOutput) => {
-            route_code_gate(cursor, ctx)
+        (Stage::Develop, Node::ValidateOutput) => {
+            // 决策 391：execute 显式申报了零变更 → 不走常规放行/重试，
+            // 挂 pending(user_decision) 交用户确认（确认收尾 / 打回继续）。
+            if ctx.metadata.zero_changes {
+                EdgeKind::Pending(PendingKind::UserDecision)
+            } else {
+                route_code_gate(cursor, ctx)
+            }
         }
+        (Stage::Test, Node::ValidateOutput) => route_code_gate(cursor, ctx),
         (Stage::Merge, Node::Execute) => route_merge(ctx),
         // sync-check 不占游标行（决策 107）：execute_node 直接报错拦截，
         // 汇聚与回溯由 advance_join 经 SyncDecisionKind 落库，永远到不了这里。
@@ -219,10 +229,14 @@ pub fn route_merge(ctx: &RouteContext) -> EdgeKind {
     }
 
     // ④ 闸门失败分流（决策 139）：lint 失败确定性，直接打回 develop；
+    //    空分支同样是确定性失败（决策 391：修用例造不出提交，test 复检必然空转），
+    //    直接打回 develop——决策 85 的 test 复检只留给真正的用例争议；
     //    测试失败需要 agent 分辨 test_issue / code_issue，跳回 test.execute（决策 85）
     if gate == Gate::Fail {
         return match merge.gate_failure_kind {
-            Some(GateFailureKind::Lint) => EdgeKind::KickbackDevelop,
+            Some(GateFailureKind::Lint) | Some(GateFailureKind::EmptyBranch) => {
+                EdgeKind::KickbackDevelop
+            }
             Some(GateFailureKind::Test) | None => EdgeKind::GotoTest,
         };
     }
@@ -331,6 +345,18 @@ mod tests {
             Approval::Approved,
             Some(Gate::Fail),
             Some(GateFailureKind::Lint),
+        ));
+        assert_eq!(route_merge(&ctx), EdgeKind::KickbackDevelop);
+    }
+
+    #[test]
+    fn route_merge_gate_fail_empty_branch_kicks_back_develop_not_test() {
+        // 决策 391：空分支是确定性失败（修用例造不出分支提交），直接回 develop.execute，
+        // 与决策 139 的 lint 同款——不走决策 85 的 test 复检。
+        let ctx = ctx_with(merge(
+            Approval::None,
+            Some(Gate::Fail),
+            Some(GateFailureKind::EmptyBranch),
         ));
         assert_eq!(route_merge(&ctx), EdgeKind::KickbackDevelop);
     }
@@ -596,6 +622,29 @@ mod tests {
         // lint / 单元测试失败 → 重试 execute（无 user_decision 分支）
         ctx.metadata = MetadataView::passed(false);
         assert_eq!(route_code_gate(&c, &ctx), EdgeKind::Retry);
+    }
+
+    #[test]
+    fn develop_validate_output_declared_zero_changes_pends_for_user() {
+        // 决策 391：execute 申报零变更 → 不走常规放行/重试，挂 user_decision 交用户确认。
+        let c = cursor(Stage::Develop, Node::ValidateOutput, 0);
+        let mut ctx = RouteContext {
+            validate_retry_max: 3,
+            metadata: MetadataView::passed(true),
+            merge: plain_merge(),
+        };
+        ctx.metadata.zero_changes = true;
+        assert_eq!(
+            route(&c, &ctx),
+            EdgeKind::Pending(PendingKind::UserDecision),
+            "申报零变更即便闸门放行也交用户确认，不直接 Next"
+        );
+        // 零变更申报优先于闸门失败：即便 passed=false 也不进 Retry（交用户裁量）
+        ctx.metadata.passed = false;
+        assert_eq!(
+            route(&c, &ctx),
+            EdgeKind::Pending(PendingKind::UserDecision)
+        );
     }
 
     #[test]

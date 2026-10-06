@@ -44,8 +44,9 @@ use crate::types::{
 use crate::{Error, Result};
 
 use super::events::{
-    emit_node_started, finish_run_with_sse, OUTPUT_DESIGN_DOC, OUTPUT_DEV_DOC, OUTPUT_REVIEW_DIFF,
-    OUTPUT_REVIEW_REPORT, OUTPUT_SYNC_DECISION, OUTPUT_TEST_REPORT, OUTPUT_TEST_SCENARIOS,
+    emit_node_started, finish_run_with_sse, OUTPUT_CODE_CHANGES, OUTPUT_DESIGN_DOC, OUTPUT_DEV_DOC,
+    OUTPUT_REVIEW_DIFF, OUTPUT_REVIEW_REPORT, OUTPUT_SYNC_DECISION, OUTPUT_TEST_REPORT,
+    OUTPUT_TEST_SCENARIOS,
 };
 use super::merge::test_command_for;
 use super::model_invoke::ModelInvoke;
@@ -56,6 +57,69 @@ pub(crate) struct GateOutcome {
     pub(crate) passed: bool,
     pub(crate) failure_kind: GateFailureKind,
     pub(crate) output: String,
+}
+
+/// 零提交事实段文件（决策 391）：develop_code_gate 守卫失败时落盘、重入段渲染、
+/// 放行 / 申报零变更时清除——「先落文件、再由重入渲染」的决策 126 形状。
+pub(crate) const ZERO_COMMIT_FACTS_FILE: &str = "zero-commit-facts.md";
+
+/// [`Executor::zero_commit_check`] 的三态（决策 391）：读数不可用不冒充任何一端
+/// （决策 209 姿态——守卫读数失败既不冒充「有提交」，也不冒充「空分支」）。
+enum ZeroCommitCheck {
+    HasCommits,
+    Empty { facts: String },
+    Unavailable,
+}
+
+/// develop.execute 是否显式申报了「本任务零变更」（决策 391）：develop 守卫与 merge
+/// 空分支改道**共用同一读法**——申报语义（缺省 false、非布尔值当未申报）只在这一处定义，
+/// 两条路径不会各自漂移。
+pub(crate) async fn declared_no_changes(store: &Store, task_id: &str) -> Result<bool> {
+    Ok(store
+        .stage_output_metadata(task_id, Stage::Develop, OUTPUT_CODE_CHANGES)
+        .await?
+        .and_then(|m| m.get("no_changes").and_then(|v| v.as_bool()))
+        .unwrap_or(false))
+}
+
+/// 零提交事实段正文（决策 391）：事实读数 + 落提交指令，**两条改道路径共用**——
+/// develop 守卫（自有提交数 0）与 merge 空分支（净差异 0 文件）事实不同、指令同一。
+/// `headline` 是第一条事实（调用方各自组读数的措辞），`dirty` 是 worktree 的
+/// `git status --porcelain` 清单。**指令里不带 message 格式**——提交 message 属项目域。
+pub(crate) fn zero_commit_facts(headline: &str, dirty: &[String]) -> String {
+    let mut facts = format!("# 零提交事实（确定性检查，决策 391）\n\n{headline}");
+    if !dirty.is_empty() {
+        facts.push_str("- 未提交清单：\n");
+        for f in dirty {
+            facts.push_str(&format!("  - `{f}`\n"));
+        }
+    }
+    facts.push_str(
+        "\n## 指令\n\
+         本轮变更必须落成任务分支上的 git 提交后再交 submit_metadata：\n\
+         1. 先 cd 到系统注入的 worktree 绝对路径（相对 cwd 会解析到别的 checkout）\n\
+         2. git add + git commit（message 遵循本仓提交惯例）\n\
+         3. 重交 submit_metadata 前自查 `git rev-list --count <基准>..HEAD` > 0\n\n\
+         确无任何变更时不得为凑提交而造假变更：在正文中说明依据并申报 no_changes = true。\n\
+         禁止不落提交也不申报零变更就直接重交元数据。",
+    );
+    facts
+}
+
+/// 落盘零提交事实段（决策 391 的落点单点）：守卫与 merge 改道都经它，重入段据此渲染。
+pub(crate) fn write_zero_commit_facts(
+    home: &crate::home::Home,
+    task_id: &str,
+    facts: &str,
+) -> Result<()> {
+    home.ensure_task_dirs(task_id)?;
+    std::fs::write(home.task_file(task_id, ZERO_COMMIT_FACTS_FILE), facts)?;
+    Ok(())
+}
+
+/// 清掉零提交事实段（放行 / 申报零变更 / 守卫已恢复时调用）——不存在的文件不是错误。
+pub(crate) fn clear_zero_commit_facts(home: &crate::home::Home, task_id: &str) {
+    let _ = std::fs::remove_file(home.task_file(task_id, ZERO_COMMIT_FACTS_FILE));
 }
 
 // ─────────────────────────────── 单执行者注册表（决策 36 / 226）───────────────────────────────
@@ -624,6 +688,13 @@ impl Executor {
             (Stage::Review, Node::ValidateOutput) => Ok(Some(PendingContext::with_kind(
                 crate::actions::kinds::REVIEW,
             ))),
+            (Stage::Develop, Node::ValidateOutput) => {
+                // 决策 391：develop.validate_output 的 UserDecision 唯一来源是
+                // 零变更申报确认（常规 lint/单测失败走 Retry，不经 pending）。
+                Ok(Some(PendingContext::with_kind(
+                    crate::actions::kinds::ZERO_CHANGES,
+                )))
+            }
             (Stage::Test, Node::ValidateOutput) => {
                 // 复检标记取自本轮 test 产出（executor 在 test.execute 落库时置位，决策 109）
                 let gate_recheck = self
@@ -794,7 +865,15 @@ impl Executor {
 
     // ─────────────────────── 纯代码 validate_output（决策 62）───────────────────────
 
-    /// develop.validate_output：lint（如配置）+ 单元测试，全过才放行（§6 / 决策 139）。
+    /// develop.validate_output：lint（如配置）+ 单元测试 + 零提交检查，全过才放行
+    /// （§6 / 决策 139 / 决策 391）。
+    ///
+    /// 零提交检查（决策 391）：execute 交了元数据但任务分支相对基准**没有任何自有
+    /// 提交**时，lint/单测再绿也是空放行——2026-10-06 的 01M47RQG4M9533F5TMF1AGJXC8
+    /// 正是带着全绿闸门穿越 review/test，在 merge 才撞上「diff 为空」。这里在最早能
+    /// 发现的点位确定性拦截：事实落 `zero-commit-facts.md`，重入段注入给 execute。
+    /// execute 显式申报 `no_changes` 时不拦——改挂 pending(user_decision) 交用户确认
+    /// 收尾（路由侧据 `MetadataView.zero_changes` 分流）。
     async fn develop_code_gate(&self, task: &Task, cursor: &NodeCursor) -> Result<NodeOutput> {
         let project = project_or_err(&self.store, &task.project_id).await?;
         let (run_id, attempt) = self.begin_run(task, cursor, "system").await?;
@@ -826,9 +905,79 @@ impl Executor {
         )
         .await?;
         let gate = gate?;
-        Ok(NodeOutput::Route(crate::pipeline::MetadataView::passed(
-            gate.passed,
-        )))
+
+        // 申报零变更 → 用户确认收尾（决策 391）。顺手清掉上一轮守卫失败留下的
+        // 事实段文件——申报成立后它就是过期证据，留着会在后续重入里误注入。
+        if declared_no_changes(&self.store, &task.id).await? {
+            clear_zero_commit_facts(self.store.home(), &task.id);
+            return Ok(NodeOutput::Route(crate::pipeline::MetadataView {
+                zero_changes: true,
+                ..Default::default()
+            }));
+        }
+
+        if gate.passed {
+            match self.zero_commit_check(task, &project, &worktree).await {
+                ZeroCommitCheck::HasCommits => {
+                    // 分支非空：放行；同样清掉上一轮守卫失败留下的事实段文件
+                    clear_zero_commit_facts(self.store.home(), &task.id);
+                    Ok(NodeOutput::Route(crate::pipeline::MetadataView::passed(
+                        true,
+                    )))
+                }
+                ZeroCommitCheck::Empty { facts } => {
+                    write_zero_commit_facts(self.store.home(), &task.id, &facts)?;
+                    Ok(NodeOutput::Route(crate::pipeline::MetadataView::passed(
+                        false,
+                    )))
+                }
+                // git 读数不可用：按「读不到」降级，不因这一条卡死放行（决策 209 姿态）
+                ZeroCommitCheck::Unavailable => Ok(NodeOutput::Route(
+                    crate::pipeline::MetadataView::passed(true),
+                )),
+            }
+        } else {
+            Ok(NodeOutput::Route(crate::pipeline::MetadataView::passed(
+                false,
+            )))
+        }
+    }
+
+    /// 决策 391 的读数：分支自有提交数 > 0？为 0 时把事实（提交数 + 工作区脏清单）
+    /// 组成重入注入文本。git 侧出错一律 [`ZeroCommitCheck::Unavailable`]——
+    /// 守卫读数失败不冒充「有提交」，也不冒充「空分支」。
+    async fn zero_commit_check(
+        &self,
+        task: &Task,
+        project: &Project,
+        worktree: &str,
+    ) -> ZeroCommitCheck {
+        let Some(branch) = task.branch_name.clone() else {
+            return ZeroCommitCheck::Unavailable;
+        };
+        let repo = Path::new(&project.local_path);
+        let Ok(base_ref) = Git.base_ref(repo, &project.default_branch).await else {
+            return ZeroCommitCheck::Unavailable;
+        };
+        let count = match Git.ahead_count(repo, &base_ref, &branch).await {
+            Ok(n) => n,
+            Err(_) => return ZeroCommitCheck::Unavailable,
+        };
+        if count > 0 {
+            return ZeroCommitCheck::HasCommits;
+        }
+        let dirty = Git
+            .dirty_files(Path::new(worktree))
+            .await
+            .unwrap_or_default();
+        let headline = format!(
+            "- 任务分支 `{branch}` 相对基准 `{base_ref}` 的自有提交数：**0**\n\
+             - 工作区未提交改动：{} 处\n",
+            dirty.len(),
+        );
+        ZeroCommitCheck::Empty {
+            facts: zero_commit_facts(&headline, &dirty),
+        }
     }
 
     /// test.validate_output：读 execute 提交的 test_result 路由（决策 62 / 85）。
