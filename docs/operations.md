@@ -1628,4 +1628,32 @@ curl -sk -o /dev/null --max-time 10 -w "%{http_code}" https://127.0.0.1:3389/ | 
 
 **服务进程环境缺 `HOME`（2026-10-03，重活外发上线当天被活体探测当场抓出来）。** systemd 的系统级 unit **不给服务进程注入 `HOME` / `USER`**（这套 unit 没有 `User=` 之外的用户语义，也不走 PAM）——而 `gh` 靠 `$HOME` 找 `~/.config/gh/hosts.yml`。后果：ssh 里 `gh auth status` 一切正常（票 02 的验收就是这么做的，**看不见这个坑**），服务进程里 spawn 的 gh 却报「not logged into any GitHub hosts」——设置页的 gh 登录探测、以及外发工具的 `gh workflow run` / `git push`（https 凭据同样住 HOME 底下）全部扑空。这不是探测坏了，是**探测第一次替服务进程问了它自己的环境**——此前没有任何一条路径从服务进程内部碰过 gh。修法（unit 手管，照 ops 惯例备份后改）：`Environment=HOME=/root` + `Environment=USER=root` 两行加进 `agent-pipeline.service`，`daemon-reload` + `restart`；改前备份在 `/root/agent-pipeline.service.bak-20261003-*`，改后 `GET /offload` 探测三绿（gh_authed / workflow / 无失败记录）。**同类坑照这条查**：任何「ssh 里好使、服务里不好使」的子进程读数，先 `tr '\0' '\n' < /proc/<MainPID>/environ` 对一遍环境，再怀疑凭据本身。
 
+**服务进程环境缺 `PATH`（2026-10-07，任务 `01M47RQG4M9533F5TMF1AGJXC8` 卡死在 merge 时查出）——上一条的同源坑，这次咬的是闸门。** 同一条 systemd 缺省：服务进程的 `PATH` 是 `/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin`，**没有 `/root/.cargo/bin`**。而 merge 阶段 A 的闸门（lint + `cargo test`，经 `crates/core/src/pipeline/executor.rs::run_system_command` 起子进程，只额外注入 `CARGO_TARGET_DIR`）继承的就是这条 PATH，于是 `cargo` 解析到 **`/usr/bin/cargo` = Red Hat rustc 1.92.0**；共享构建缓存 `{home}/shared-target` 里的产物却是 rustup **1.98.0** 编的（`Makefile:58/67` 用 PATH 前置 + `RUSTUP_TOOLCHAIN` 钉的那套）。两套 rustc 往同一个 target 目录写 → 链接期 `.llvm.<hash>` 符号对不上：闸门日志里是 `linking with cc failed` / `final link failed: bad value` / 数百条 `undefined reference to …llvm.…`，报错帧直接带 `/builddir/build/BUILD/rustc-1.92.0-src/…` 的 1.92 std 路径——闸门当时用的是 1.92 的**直接证据**。失败被 `run_code_gate` 按退出码归成 `GateFailureKind::Test`，于是 merge↔test 空转三轮：决策 85 的复检对**环境性**失败毫无作用（test 的 validate_output 只读 agent 自报的 `test_result`，而 agent 用 `make` 跑——工具链钉对——自然是绿的），第三轮撞上 `validate_retry_max` 收口挂 `retry_exhausted`，且**挂起消息是写死的「重试耗尽，需要用户介入」，界面上看不到任何原因**（成因出口缺口的正式收口见 `.scratch/gate-failure-attribution`；本条是它的止血）。
+
+修法照上一条的惯例（unit 手管，先备份后改）：
+
+```bash
+ssh -i ~/.ssh/106.key -o IdentitiesOnly=yes root@106.12.12.6 '
+  cp -a /etc/systemd/system/agent-pipeline.service /root/agent-pipeline.service.bak-20261007-toolchain
+  # 在 Environment=USER=root 之后补两行：
+  #   Environment=PATH=/root/.cargo/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin
+  #   Environment=RUSTUP_TOOLCHAIN=1.98.0
+  systemctl daemon-reload && systemctl restart agent-pipeline'
+```
+
+**两行都要，只前置 `PATH` 不够**：rustup 的 shim 按**当前目录**找 `rust-toolchain.toml`，而 cargo 编 `~/.cargo/registry/src/…` 里自带 toolchain 文件的依赖 crate（决策 175 实证：atoi 钉 1.57）会当场切走；`RUSTUP_TOOLCHAIN` 优先级高于目录文件，是决策 175 认定的唯一真钉法。
+
+改后读数（用「按闸门原样环境」的脚本在任务 worktree 里跑，`PATH` / `RUSTUP_TOOLCHAIN` / `CARGO_TARGET_DIR` 与闸门逐字相同）：
+
+| 读数 | 改前 | 改后 |
+|---|---|---|
+| 服务进程 `PATH` | 无 `/root/.cargo/bin` | `/root/.cargo/bin:…` |
+| 该 PATH 下 `cargo --version` | 1.92.0（Red Hat） | 1.98.0 |
+| 闸门 lint（`cargo clippy --all-targets -- -D warnings`） | 未到（测试先炸） | `LINT_EXIT=0`，3m25s（冷缓存） |
+| 闸门 test（`cargo test --quiet`） | 链接失败，退出 101 | `TEST_EXIT=0`；复跑 **1m17s**（暖，远低于 `test_command_timeout_sec=600`） |
+| merge 结果 | `gate=fail / kind=test / gate_failures=3` | `gate=pass`（757 条用例全绿，`final link failed` 命中 0 次） |
+| 游标 pending | `retry_exhausted` | `merge_approval` |
+
+**同一次查出的机制性隐患：任务卡住 → 缓存不回收 → 盘满。** `{home}/shared-target` 当时 **13G**（40G 盘用量 **97%**），而 `crates/core/src/prune.rs` 的设计上限是 **10 GiB**、回收只在**任务进入终态**时触发——这个任务从 10-06 起一直 pending 没到终态，回收一次都没跑，增量树 `debug/incremental` 独自长到 **7.4G**（该模块自己的设计就是「终态必删」）。按 ops 惯例清了安全项（`journalctl --vacuum-size=100M`、`/root/.npm/_cacache`、`dnf clean all`、`/opt/AgentPipeline/target/release/incremental`）再加共享缓存的增量树，盘回到 **73%（11G 空闲）**。**这条的判据**：`du -sh {home}/shared-target` 越过 10 GiB 而任务又长期 pending 时就是它——上限是「任务终态触发」的，任务本身卡住时上限**不会**生效。
+
 
