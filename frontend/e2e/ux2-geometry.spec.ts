@@ -199,4 +199,54 @@ test.describe('UX2 ⑥ 几何：坞 / 状态行 / 档案盒（票 05 / 08 / 09�
     expect(m!.inViewport, '铭牌整块都在视口里').toBe(true);
     expectBundleHealthy(bundle);
   });
+
+  /**
+   * 票 13（ux-audit-3）：详情页 820–1099 折行档（决策 215 三档表的中间档）。
+   *
+   * `min-width: 820` 是显式钉下去的下界：票 01 的 wontfix 面是 480–819（320px 档 +
+   * hero 溢出），本档只动 820–1099——所以 819 必须仍读出 320px（「只动本档」的牙齿），
+   * 1100 桌面档也必须仍是 320px。820 处**不断言**页面横向溢出 = 0：hero 轨道 812px
+   * 恒溢出 12px 属票 01 wontfix，断它等于逼重开；溢出无回归由审计复跑 ①.1 的溢出列证明。
+   */
+  test('详情页 820–1099 右栏收 280 且主栏 ≥480，1100 / 819 仍是 320（票 13）', async ({
+    page,
+  }) => {
+    const bundle = watchBundle(page);
+    await page.setViewportSize({ width: 1280, height: 900 });
+    await page.goto(`${app.webBase}/#/task/${app.taskId}`);
+    await settleBundle(page, bundle);
+    // `.split` 只在 pending 态在场（merge_approval，beforeAll 已停在这一态）
+    await expect(page.locator('aside.dossier')).toBeVisible({ timeout: 60_000 });
+
+    const colsAt = async (w: number) => {
+      await page.setViewportSize({ width: w, height: 900 });
+      await page.waitForTimeout(150);
+      return page.evaluate(() => {
+        const detail = document.querySelector('.detail.split') as HTMLElement | null;
+        const main = document.querySelector('.detail .main') as HTMLElement | null;
+        if (!detail || !main) return null;
+        const cols = getComputedStyle(detail).gridTemplateColumns.trim().split(/\s+/);
+        return {
+          last: cols[cols.length - 1] ?? '',
+          main: Math.round(main.getBoundingClientRect().width),
+        };
+      });
+    };
+
+    // 折行档：右栏 280，主栏实宽兜得住 480 下限（经典滚动条在场时 minmax 的 min 生效）
+    for (const w of [1099, 1024, 900, 820]) {
+      const m = await colsAt(w);
+      expect(m, `w=${w}：pending 态的 .detail.split 应当在`).not.toBeNull();
+      expect(m!.last, `w=${w}：折行档右栏应为 280px`).toBe('280px');
+      expect(m!.main, `w=${w}：主栏实宽应 ≥ 480`).toBeGreaterThanOrEqual(480);
+    }
+
+    // 只动本档：1100 是桌面档、819 是票 01 的 wontfix 面——两处都必须仍是 320px
+    for (const w of [1100, 819]) {
+      const m = await colsAt(w);
+      expect(m, `w=${w}：.detail.split 应当在`).not.toBeNull();
+      expect(m!.last, `w=${w}：这一档不该被折行档波及（票 01 面一格不动）`).toBe('320px');
+    }
+    expectBundleHealthy(bundle);
+  });
 });

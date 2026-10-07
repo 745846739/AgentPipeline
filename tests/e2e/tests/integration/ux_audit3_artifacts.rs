@@ -30,9 +30,11 @@
 //!
 //! 1. **git 历史断言带可用性守卫**：`rev-list --count HEAD < 5`、
 //!    `merge-base HEAD origin/main` 失败（CI 的 depth=1 checkout，见 `docs/testing.md` §6
-//!    与 `runner_for_doc.rs` 文件头的同源口径），或 merge-base 与 HEAD 同点
-//!    （审计已合入 main，`mb...HEAD` 退化为空集）时，相应子断言跳过并打 stdout 说明——
-//!    完整历史下才跑实断言，depth=1 下不假红。
+//!    与 `runner_for_doc.rs` 文件头的同源口径），merge-base 与 HEAD 同点
+//!    （审计已合入 main，`mb...HEAD` 退化为空集），或**审计产物已在 `origin/main`**
+//!    （审计轮已收口，当前分支是后续按设计要改产品的任务分支——把审计当轮的
+//!    「产品零 diff + 白名单 + .gitignore +2 行」点断言套上去必然假红）时，
+//!    相应子断言跳过并打 stdout 说明——完整历史 + 审计轮当轮才跑实断言。
 //! 2. **场景 1 的「严格早于」是更紧读法**：骨架提交 `53a9eb9` 一次落
 //!    `00-INDEX.md` + 13 个 `待填` 空壳（同秒入库），`d6b9311` 起逐条回填——
 //!    design AC-1 的原话是「在某条正文**补齐**之前已 commit/可见」，占位→回填链可证；
@@ -903,6 +905,30 @@ fn scene_06_product_code_zero_diff_and_sole_allowed_changes() {
         eprintln!(
             "场景 6：HEAD 与 origin/main 同点（审计已合入 main）——\
              diff 断言跳过；合入前证据见 test-report.md 命令台账"
+        );
+        return;
+    }
+    // 第三个守卫：审计轮已收口、当前分支**不是审计轮**时，本用例的
+    // 「分支 diff 只落白名单 + 产品零 diff + .gitignore 恰 +2 行」是**审计那一轮**的
+    // 点断言（判据原样来自审计 design §2 / AC-7）。把它套到后续任何**按设计就要改产品**
+    // 的任务分支上必然假红——那一轮确实动 frontend/src，且 `.gitignore` 的 +2 行是审计
+    // 提交自己的改动，后续分支上取不到。判据：审计产物已在基准树里 = 审计轮已进 main。
+    // 审计轮当轮的证据由 test-report.md 命令台账承载（本文件 scene_07/13 与
+    // ux_audit3_landing 继续管产物质检，不受此守卫影响）。
+    let audit_in_base = git(
+        &root,
+        &["cat-file", "-e", &format!("origin/main:{AUDIT_README_REL}")],
+    )
+    .is_some()
+        && git(
+            &root,
+            &["cat-file", "-e", &format!("origin/main:{SPEC_REL}")],
+        )
+        .is_some();
+    if audit_in_base {
+        eprintln!(
+            "场景 6：审计产物已在 origin/main（审计轮已收口，本分支非审计轮）——\
+             分支 diff 作用域断言跳过；审计轮当轮证据见 test-report.md 命令台账"
         );
         return;
     }
