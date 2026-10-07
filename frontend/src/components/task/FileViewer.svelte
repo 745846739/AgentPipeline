@@ -169,6 +169,14 @@
     .fileview {
       flex-direction: column;
       gap: 0;
+      /* 列向布局下 `align-items` 管的是**横向**：基类的 `flex-start` 会让内容面板按
+         自身 max-content 定宽，而 diff 的 `.dl { min-width: max-content }` 把最长行
+         一路顶上来——`.content` 于是比栏宽还宽（实测 390 视口下 430），文档被顶到
+         442，iOS 据此把整页缩小（决策 341 的同一根因，只是病灶在产物面板的定宽上）。
+         `stretch` 把面板钉回栏宽，横滚留在面板内部（`.diff-scroll` / `.dbody` 的
+         `overflow-x: auto` 照旧生效）——这是决策 341「窄版面无横向溢出」闸门在
+         产物面板上的补齐。 */
+      align-items: stretch;
     }
     .list {
       width: 100%;

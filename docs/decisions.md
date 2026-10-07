@@ -2942,3 +2942,44 @@ e2e `stage_boundary.rs::e2e_undeclared_changes_kick_back_at_develop_without_cros
 落地 `crates/core/src/{agent/{file_policy.rs, tools.rs, templates.rs, prompts.rs},
 pipeline/{executor.rs, model_invoke.rs, model_request.rs, continuation_brief.rs}, git.rs,
 config.rs}`、`tests/e2e/tests/integration/stage_boundary.rs`、`docs/testing.md` §5。
+
+### 决策 398 · 重活外发·白名单模式：run_command 命中正则自动改道，offload_run（skill 模式）原样保留
+
+**问题**：外发的采纳现实（决策 382）是「agent 自己拿不准、操作员点名才发生」。agent 显式调 `offload_run` 的路子（skill 模式，决策 381）依赖模型自己判断什么该外发；用户要的是一条确定性路由——给一个正则，命中 `run_command` 的命令**自动**改道外发，不再指望模型的自觉。
+
+**裁决**：
+
+1. **拦截点在 `run_command` 执行层**（`run_command_inner` 的改道点，位于 egress 判定**之后**、spawn 之前）：主开关与白名单模式都开、正则命中、cwd 是工作区根，四条全占才改道走外发链路。顺序不变量（决策 297）不动——出口策略先判原话；链路本身的出口授权在主开关里（决策 381③）。改道不新开通道：档位（ask 转提议 / deny 拒）、阶段禁用（决策 396）全部照旧生效——白名单模式不是任何闸的旁路，它只换「这条命令在哪台机器跑」。
+2. **`offload_run`（skill 模式）原样保留**，两层路由并存不是二选一：模型显式点的走那边，正则命中的走这边。工具目录表（决策 381）不加不动。
+3. **命中之后的出路分两族**：合资格且链路成功 → 回执带一行「已自动改道」；其余全部落本机执行、原因前置进回执（降级可以，静默不行）——结构防注入面不过、工作区脏（决策 382③ 不放宽）、游离 HEAD、分支名不收、外发**链路**失败（这条与 `offload_run` 同一条回退路：WARN + 失败读数 + ⚠️ 回执）。**与 `offload_run` 的关键差异在前置失败的处理**：那边硬拒绝（agent 显式点了外发，必须看见错误），这边落本机（agent 对改道不知情，硬拒绝会让本可跑的命令平白失败）。本机重跑用模型的**原始参数**不抬超时：模型以为在跑本机命令，参数就是它为本机选的。
+4. **防注入面的分层**（修订决策 381③ 的「白名单不做成配置」，只修订这一处）：决策 381 的固定前缀白名单**原样保留**在 `offload_run` 上；白名单模式的正则是用户口味的**路由**规则，管「哪些命令想上远端」；结构检查（组合符 / 命令替换 / 重定向 / 引号 / `$`）从 `offload_command_allowed` 里拆成独立的 `offload_command_shape_allowed`，两条路共用一份——什么形状的串准上远端跟口味无关，谁都不能放宽。正则本身在保存侧 fail fast（`PUT /offload/whitelist` 编不过 400 不落库），执行层读到编不出的正则按不合资格停摆并留 WARN，两层各拦一道。
+5. **配置与读数**：`kanban_offload` 加两列（迁移 0043，`whitelist_enabled` 缺省 0 / `whitelist_pattern`），与主开关同一行、同一 upsert 形状；白名单有自己的一对端点 `GET/PUT /offload/whitelist`——主开关的读数键集（票 runner-offload/09 钉过）**不加键**，新旋钮不往旧壳里塞。保存即建行（`has_override` 随之变 true）。主开关关着时白名单设置存而**不生效**（白名单是外发的一层，不是独立通道）。
+6. **递归护栏**：改道内部的本机重跑与 `offload_run` 的本机回退一律走 `run_command_inner(auto_route=false)`——回退的路不能绕回外发，否则链路一坏就是 dispatch↔本机的死循环（台账断言 dispatch 恰一次钉住）。
+
+**明确不做**：不做闸门级外发（决策 382 的中期出路，另票）；不为采纳率把命中结果静默化（命中后的每一条本机回退都写原因）；正则不做 per-project / per-stage 维度（机器级一行，与 rtk / 主开关同口径）。
+
+**验证**：核心层 6 例——正则命中自动改道（dispatch 命令逐字断言）、四类不合资格照常本机（主开关关 / 模式关 / 正则不命中）、脏区本机 + 写明原因、组合符不外发、链路失败回退恰好一次（死循环护栏）、正则校验；存储层回环（动白名单不碰主开关）；契约 4 例（缺省读数 / 保存回环 / 坏正则 400 不落库 / 主读数不加白名单键，静态断言收窄到主开关半边）；前端 4 例（缺省渲染 / 开启态带出已存正则 / 保存交草稿 / 400 原样播报）。
+
+**来源**：用户（2026-10-07「给 github_runner 加一个白名单模式（保留现有的 skill 模式），打开后满足正则要求的都走那条路」，`AskUserQuestion` 三选一裁定拦在 run_command 层）；决策 381 / 382（外发一期边界与采纳现实）、297（顺序不变量）、396（阶段禁用不旁路）；落地 `crates/core/src/{agent/tools.rs, storage/offload.rs, storage/migrations/0043_offload_whitelist.sql}`、`crates/app/src/{routes/offload.rs, lib.rs}`、`crates/app/tests/integration/api_contract.rs`、`frontend/src/{routes/SettingsTools.svelte, routes/SettingsTools.test.ts, api/{client.ts, types.ts}}`
+
+### 决策 399 · 窄档「整页大小会变」的两处收口：产物面板按栏宽定宽 + 移动档表单控件字号 ≥16px 的兜底（补决策 341 的两处漏网）
+
+**起因**：用户 2026-10-07 报「手机端部分界面文本太长不换行（如产物查看），部分界面点击输入框自动放大整个页面（如礼貌通知的输入框），目标是整个页面保持大小不变」。两条都是**页面大小会变**的同一个后果：前者把文档顶宽、iOS 据此把整页缩小；后者是 iOS 的聚焦缩放（控件 <16px 时点中即 zoom 进去，且不会自己退回）。
+
+**现场（实测，非推测）**：
+
+1. **产物查看**：`#/task/<id>` 的「产出文件」页签里选一个真 `.diff` 产物时，面板按**内容**定宽而不是按栏宽——`FileViewer` 窄档是列向 flex，`align-items` 仍继承基类的 `flex-start`，内容面板于是取自身 max-content；`DiffView` 的 `.dl { min-width: max-content }` 把最长行一路顶上来。390 视口实测 `.content` 宽 430、`document.scrollWidth` **442**（> 390）。markdown 产物**不**触发（`.md` 自带 `overflow-wrap: anywhere`，决策 341 已修），所以上一轮闸门扫不到它——只在 markdown 上量会假绿。
+2. **礼貌通知输入框**：移动档把控件抬到 16px 的规则只挂在 `.input` 一类上。设置页的通道 / 礼貌 / 手填路径用的是 `class="mono"`（没有 `.input`），顶栏的项目选择器与压实设置页的 `.input` 走**作用域样式**（Svelte 编译成 `select.svelte-*` / `.input.svelte-*`，权重一律高于 `app.css` 的元素 / 单类选择器）——实测一律 12px。
+
+**裁决**：
+
+1. `FileViewer` 窄档的 `.fileview` 加 `align-items: stretch`：内容面板钉回栏宽，横滚留在面板内部（`.diff-scroll` / `.dbody` 的 `overflow-x: auto` 照旧生效）。桌面档的 `flex-start` 不动（非滑动条语境下它是有意的）。
+2. `app.css` 移动档把防缩放规则从 `.input` 一类改成 `input, textarea, select, .input { font-size: 16px !important }`。**`!important` 是刻意的**：作用域组件样式的权重总是更高，不加就总有下一个漏网的框（这次一次就抓到四处），而这一档没有「哪个输入框该小于 16px」这种正当例外。与 `prefers-reduced-motion` 那条全站兜底同一手法——全仓只有这两处用 `!important`。**不**逐个组件补 16px：兜底放一处，避免四处各写一份再漂移。
+
+**闸门**（`frontend/e2e/mobile-overflow.spec.ts`，在决策 341 那三支上加两支）：④ 每条路由量**所有** `input / textarea / select` 的计算字号 ≥16px（量渲染值而不是 CSS 源码措辞——作用域样式正是从源码看不出来的那一层；扫到 0 个控件即判失败，防假绿）；⑤ 新 describe「窄档产物面板」：一条真 diff 产物 + 一条长 token 的 markdown 产物，两档视口（390×844 竖 / 844×390 横），先断言 diff **真的渲染出行来**再量 `scrollWidth ≤ clientWidth` 与 `innerWidth ≤ screen.width`。路由表补上漏掉的 `#/settings/compaction`。
+
+**牙齿检查**：把两处修法退回旧行为 → ④ 报出 12px 的控件清单、⑤ 报 `442 > 390`（横档两支不红，因为 844 宽下走的是桌面档的 `flex: 1; min-width: 0`）；恢复后 6/6 绿，修前修后各跑一遍。
+
+**明确不做**：不改 diff / 代码块的横滚（那是有意的，决策 341 也这么裁——窄档要的是「面板不被内容顶宽」，不是「diff 折行」）；不动 `align-items: flex-start` 的桌面档；不给这条闸门加重试。
+
+**来源**：用户（2026-10-07 报障）；补决策 341（窄版面无横向溢出的 e2e 闸门）在**产物面板**与**输入面**上的两处漏网；落地 `frontend/src/components/task/FileViewer.svelte`、`frontend/src/app.css`、`frontend/e2e/mobile-overflow.spec.ts`

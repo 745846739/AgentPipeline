@@ -1,5 +1,5 @@
 /**
- * 前端 E2E：窄版面**不许横向溢出**（决策 341）。
+ * 前端 E2E：窄版面**不许横向溢出**（决策 341）+ 窄档**控件字号 ≥16px**（决策 399）。
  *
  * 钉的是 2026-09-30 的那条用户报障——「很多页面未对文字做换行导致整体被缩小」。
  * 「缩小」不是修辞：iOS 在 `width=device-width` 下遇到比视口宽的版面会把**布局视口**撑开
@@ -13,14 +13,37 @@
  * 一段没有空格的 JSON，它就是报障现场那一段的等价物。用例先断言这段真的渲染出来了，
  * 再量几何。
  *
- * 断言口径沿用本仓既有约定：只测外部行为（视口几何），不测 CSS 源码措辞、不测 class 名。
- * 只 Chromium（决策 144）；后端与产物走 `harness`（回环绑定，故配对闸门不参与——闸门那半
- * 由 `crates/app/tests/integration/api_contract.rs` 钉）。
+ * 2026-10-07 用户报障补了第二类「整页大小会变」——**点中输入框 iOS 会把整页放大**
+ * （控件字号 <16px 即触发，且不自退）。同一份文件里另立两支（决策 399）：每条路由量
+ * 所有表单控件的**计算字号**（作用域组件样式会改权重、只读源码量不出来），以及
+ * 「产出文件」页签的**真 diff 产物**不顶宽（markdown 产物自带 `overflow-wrap: anywhere`，
+ * 只在它上面量会假绿——顶宽的是 diff 的 `.dl { min-width: max-content }`）。
+ *
+ * 断言口径沿用本仓既有约定：只测外部行为（视口几何、渲染出来的计算字号），不测 CSS 源码
+ * 措辞、不测 class 名。只 Chromium（决策 144）；后端与产物走 `harness`（回环绑定，故配对
+ * 闸门不参与——闸门那半由 `crates/app/tests/integration/api_contract.rs` 钉）。
  */
 
 import { expect, test, type Page } from '@playwright/test';
-import { expectBundleHealthy, settleBundle, startApp, watchBundle, type App } from './harness';
-import { foremanScript, text } from './scripts';
+import {
+  expectBundleHealthy,
+  pendingTypeOf,
+  settleBundle,
+  startApp,
+  waitForTask,
+  watchBundle,
+  type App,
+} from './harness';
+import {
+  ArchitectExecute,
+  NODE,
+  foremanScript,
+  fullPassScript,
+  submit,
+  text,
+  writeFile,
+  type NodeScript,
+} from './scripts';
 
 /** 报障现场那一段的等价物：**一个没有空格的长词**，markdown 正文里最常见的一类。 */
 const LONG_TOKEN = `{"archived_at":null,"branch_name":null,"note":"${'A'.repeat(700)}"}`;
@@ -102,6 +125,7 @@ test.describe('窄版面横向溢出（决策 341）', () => {
     '#/',
     '#/metrics',
     '#/settings',
+    '#/settings/compaction',
     '#/settings/foreman',
     '#/settings/market',
     '#/settings/notify',
@@ -131,4 +155,123 @@ test.describe('窄版面横向溢出（决策 341）', () => {
     }
     expect(offenders, `这些路由在 390px 下版面超宽：\n${offenders.join('\n')}`).toEqual([]);
   });
+
+  /**
+   * 焦点缩放闸门（决策 341 在**输入面**上的补齐）：iOS 只在控件字号 ≥16px 时才不放大，
+   * 低一档点中输入的瞬间整页被 zoom 进去，且不会自己退回（= 用户说的「点了输入框整个
+   * 页面就变了大小」）。这条钉的是**计算值**而不是 CSS 源码措辞：组件里的作用域样式会把
+   * `select` 编译成 `select.svelte-*`、把 `.input` 加到两三个类，权重都高于 `app.css` 的
+   * 元素 / 单类选择器——只看源码会漏，只有量渲染出来的字号才拦得住。
+   *
+   * 扫到的控件数为 0 时**必须失败**：那样这条闸门是假绿（一条控件都没测到却说自己过了）。
+   */
+  test('每条路由上表单控件字号 ≥16px（iOS 聚焦不放大）', async ({ page }) => {
+    await page.setViewportSize({ width: 390, height: 844 });
+    const offenders: string[] = [];
+    let seen = 0;
+    for (const route of ROUTES) {
+      const bundle = watchBundle(page);
+      await page.goto(`${app.webBase}/${route}`);
+      await settleBundle(page, bundle);
+      await page.waitForTimeout(600);
+      const bad = await page.evaluate(() => {
+        const out: string[] = [];
+        document.querySelectorAll('input, textarea, select').forEach((el) => {
+          const fs = Number.parseFloat(getComputedStyle(el).fontSize);
+          if (!Number.isFinite(fs) || fs < 16) {
+            const type = (el as HTMLInputElement).getAttribute('type') ?? '';
+            out.push(`${el.tagName.toLowerCase()}${type ? `[${type}]` : ''}=${fs}px`);
+          }
+        });
+        return out;
+      });
+      seen += await page.locator('input, textarea, select').count();
+      if (bad.length) offenders.push(`${route}: ${bad.join(', ')}`);
+      expectBundleHealthy(bundle);
+    }
+    expect(seen, '一条控件都没扫到——这条闸门会在假绿里过').toBeGreaterThan(0);
+    expect(
+      offenders,
+      `这些控件的计算字号 <16px，iOS 点中会把整页放大：\n${offenders.join('\n')}`,
+    ).toEqual([]);
+  });
+});
+
+/**
+ * 窄档**产物面板**（决策 341 在「产出文件」页签上的补齐，用户 2026-10-07 报障）。
+ *
+ * 现场：在 `#/task/<id>` 的「产出文件」页签里查看 `.diff` 产物时，面板按**内容**定宽
+ * 而不是按栏宽——`FileViewer` 窄档是列向 flex，基类的 `align-items: flex-start` 让内容
+ * 面板取自身 max-content，而 diff 的 `.dl { min-width: max-content }` 把最长行一路顶上来：
+ * 390 视口下面板 430、文档 442，iOS 据此把整页缩小（与决策 341 同一条根因，只是那轮
+ * `.md` 的 `overflow-wrap` 管不到这里）。markdown 产物顶不宽是因为 `.md` 自带
+ * `overflow-wrap: anywhere`，所以**必须拿真 diff 立据**——只在 markdown 上量会假绿。
+ */
+test.describe('窄档产物面板（决策 341 补齐）', () => {
+  let app: App;
+
+  /** 全通过脚本 + 把 `design.md` 换成带长 token 的那一段：两条产物路径一次都覆盖到。 */
+  function longArtifactScript(taskId: string): NodeScript {
+    const base = fullPassScript(taskId);
+    return {
+      ...base,
+      [NODE.archEx]: [
+        [
+          writeFile('design.md', `# 设计\n## 验收标准\n- AC-1 ${LONG_TOKEN}\n`),
+          submit(
+            ArchitectExecute({
+              affectedFiles: ['src/lib.rs'],
+              acceptanceCriteria: [{ id: 'AC-1', description: '能登录' }],
+              designDocPath: 'design.md',
+            }),
+          ),
+        ],
+      ],
+    };
+  }
+
+  test.beforeAll(async () => {
+    app = await startApp({ script: longArtifactScript('窄档产物'), title: '窄档产物' });
+  });
+
+  test.afterAll(async () => {
+    await app?.stop();
+  });
+
+  /** 两档都量：竖屏是报障那台机器的常态，横屏那一档 `@media (max-width: 479px)` 不生效。 */
+  for (const [width, height] of [
+    [390, 844],
+    [844, 390],
+  ] as const) {
+    test(`产出文件里的长 token 与 diff 都不顶穿版面（${width}×${height}）`, async ({ page }) => {
+      await page.setViewportSize({ width, height });
+      const bundle = watchBundle(page);
+      await waitForTask(app, (t) => pendingTypeOf(t) === 'merge_approval', 'merge_approval');
+      await page.goto(`${app.webBase}/#/task/${app.taskId}`);
+      await settleBundle(page, bundle);
+
+      await page.locator('.tabs button.tab', { hasText: '产出文件' }).click();
+
+      // ① markdown 产物里的长 token（决策 341 修的那条路径，在产物面板里再钉一遍）
+      await page.locator('.list button.cmd', { hasText: 'design.md' }).click();
+      const md = page.locator('.content .md');
+      await expect(md).toContainText('A'.repeat(50), { timeout: 30_000 });
+
+      // ② 真 diff 产物——顶宽的那条。先断言它真的渲染出来了，否则几何断言会因为面板空着而假绿
+      await page.locator('.list button.cmd', { hasText: 'merge-proposal.diff' }).click();
+      const diffLines = page.locator('.content .dbody .dl');
+      await expect(diffLines.first()).toBeVisible({ timeout: 30_000 });
+      expect(await diffLines.count(), 'diff 没渲染出行来，几何断言会假绿').toBeGreaterThan(0);
+
+      await page.waitForTimeout(500);
+      const m = await viewport(page);
+      expect(m.doc, `产物面板顶宽了版面（${m.doc} > ${m.client}）`).toBeLessThanOrEqual(m.client + 1);
+      expect(
+        m.layout,
+        `布局视口被撑到 ${m.layout}（设备只有 ${m.screen}）——iOS 会据此把整页缩小`,
+      ).toBeLessThanOrEqual(m.screen + 1);
+
+      expectBundleHealthy(bundle);
+    });
+  }
 });

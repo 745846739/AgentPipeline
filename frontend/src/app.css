@@ -675,8 +675,21 @@ textarea.input {
     padding: 4px 10px;
     font-size: 12px;
   }
+  /* 焦点缩放护栏（§5）：iOS 只在**控件字号 ≥16px** 时才不放大——低一档，点中输入的
+     瞬间整页就被 zoom 进去，且放大后不会自己退回（用户得双指缩回，观感就是「页面大小
+     变了」）。此前这条只挂在 `.input` 一类上，等于只护住了带那个类的控件：设置页的
+     通道 / 礼貌 / 手填路径那些 `.mono` 输入框、顶栏的项目选择器 `select`，以及把字号
+     写死在组件里的几个框（`.qinput` / `.qedit` / 压缩设置页的 `.input`）都漏在外面，实测
+     都是 12px、照旧触发。
+     `!important` 是**刻意的**：作用域组件样式会把 `select` 编译成 `select.svelte-*`、
+     把 `.input` 加到两三个类，权重一律高于这里的元素 / 单类选择器——不加就总有下一个
+     漏网的框，而这档没有「哪个输入框该小于 16px」这种正当例外。与 `prefers-reduced-motion`
+     那条全站兜底同一手法（全仓只有这两处用 `!important`）。 */
+  input,
+  textarea,
+  select,
   .input {
-    font-size: 16px;
+    font-size: 16px !important;
   }
 
   /* 纵向脊线：站段三态（6px 纵向链节；完整转写见票 11） */
