@@ -2759,3 +2759,66 @@ main 领先 `origin/main` 一个提交且该提交动了 `docs/decisions.md`，�
 `tests/e2e/tests/integration/ux_audit3_{landing,artifacts}.rs`、`docs/testing.md` §8、
 `Makefile`、`scripts/gate-suite-branch-independence.sh`、
 `.scratch/ux-audit-3/IMPLEMENTATION.md`、`.scratch/commit-contract/README.md`。
+
+### 决策 392 · 闸门环境预检 + 环境类失败归因 + pending 携带成因（编号在 391 批次预留，落地晚于 393 / 394）
+
+**问题（2026-10-06 任务 `01M47RQG4M9533F5TMF1AGJXC8`，106）**：merge 闸门的 `cargo test`
+以 `final link failed: bad value` + 数百条 `undefined reference to …llvm.<hash>` 收场。根因
+是**环境漂移**：systemd unit 没设 `PATH`，闸门解析到系统那套 rustc **1.92.0**，而共享构建
+缓存（`{home}/shared-target`）是 rustup **1.98.0** 编的。但「失败是什么」在系统里被压成了
+一个退出码——环境失败与用例失败同形（都是 101、同归 `GateFailureKind::Test`、同烧一个
+`validate_retry_max` 预算），**成因从头到尾没有任何字段承载**，于是既修不了也看不见：
+merge 打回 test 复检（test 侧只读 agent 自报、永远报绿）→ merge↔test 确定性空转，游标最后
+挂在 `retry_exhausted` 上，界面上只有一句写死的「重试耗尽，需要用户介入」。
+
+**决策**（四处各钉一块）：
+
+1. **部署侧钉工具链**（部署物，非仓内文件）：106 `agent-pipeline.service` 补
+   `Environment=PATH=/root/.cargo/bin:…` 与 `Environment=RUSTUP_TOOLCHAIN=1.98.0`，与
+   `Makefile` 的 `export PATH` / `export RUSTUP_TOOLCHAIN` 同源同优先级（决策 175：只前置
+   `PATH` 不够——rustup shim 按当前目录找 `rust-toolchain.toml`，编 registry 里自带该文件的
+   crate 时会当场切走；`RUSTUP_TOOLCHAIN` 优先于目录文件，是唯一真钉法）。读数记
+   `docs/operations.md` §12.18。
+2. **闸门环境预检**（`executor.rs::toolchain_preflight`，`run_code_gate` 起跑前）：读项目根
+   `rust-toolchain.toml` 的 `[toolchain].channel`，与**经同一环境路径**（`run_system_command`）
+   取到的 `rustc --version` 比对；不一致 → `GateFailureKind::Environment`、**不跑测试命令**，
+   读数（声明版本 / 实际版本 / `command -v cargo` / `CARGO_TARGET_DIR`）进失败输出。声明不是
+   可机械比对的版本号（`stable` / `nightly`）或读不到声明文件时**不判**（决策 209 姿态：
+   信息不足不猜）。
+3. **`GateFailureKind::Environment` 与改道**（`types.rs` 加变体，向后兼容：存量 DB 只有
+   Lint / Test；顺带把「变体 → 落库字符串」收成 `as_str` / `from_str_opt` 单点，消掉
+   scheduler 里那份手写映射）：`route_merge` ④ 把它并入「确定性失败直接打回 develop」那一支
+   （与 lint / 空分支同款）——**不进 test 复检**（用例侧造不出工具链）。**再次收窄决策 85 的
+   适用面**（继决策 391 之后），把决策 139「确定性失败不绕 test」的判据从空分支再扩到环境类。
+   `route_code_gate` 的 develop 分支本就 `Retry`（develop 没有 test 复检这一步），只对齐注释。
+4. **pending 携带成因**（可见性的根修）：`PendingContext` 加 `gate_failure_kind` /
+   `gate_failures` / `gate_log_path` 三个读数，`pending_context_for` 的 `RetryExhausted` 分支
+   按阶段现取（merge 读 `merge_result` 行；develop / test 读闸门落盘的小 JSON
+   `gate-failure-develop.json`），人读的那句话进 `context.diagnostic`——前端**无需改动**
+   （`PendingDossier` 已有 `context.diagnostic` 渲染路径）。摘要超界**显式标注**截断量
+   （与 `truncate_gate_log` 同纪律）。**不设 `context.kind`**：门失败类动作集按
+   `(PendingKind, _)` 匹配，凭空加键只会让决策 205 的续接判定表多一个认不出的值。
+5. **计数语义**：环境类失败**不烧** `gate_failures`（那个计数是「代码改不动」的信号，
+   环境问题冒充它会把信号污染掉；同决策 391 对空分支申报的处置）。
+
+**与既有决策的关系**：显式修订决策 85（适用范围再收窄一次，至此只有**真正的用例争议**才走
+test 复检）；扩展决策 139 到环境类；决策 108 的单调保留不动（环境类不进那条路径）；决策 175
+的钉法在部署侧照用；`runner-offload` 的共享构建缓存（票 03）正是本次链接失败的放大器（缓存由
+另一套 rustc 编），本决策在闸门侧加了预检这一道。
+
+**明确不做**：① 不给 `MergeResult` 加「环境失败次数」列——票面形状 5 的「报出分类构成」暂由
+pending 载体的 `gate_failure_kind`（最近一次分类）承载；② 不在核心代码里改 message 格式或
+「怎么起服务」（那是部署物）；③ 不动 `test_command_for` 的映射；④ 不给常驻用例留本门的例外口子。
+
+**验证**：单测 `toolchain_preflight_readings_parse`（三段读数解析：带引号 / 注释 / `stable` /
+带后缀版本）、`gate_failure_summary_truncates_loudly`（截断显式标注）、
+`route_merge_gate_fail_environment_kicks_back_develop_not_test`（**不进 test**）、
+`gate_failure_kind_round_trips_through_as_str`；e2e
+`e2e_gate_environment_mismatch_is_classified_not_test`（工作树里声明对不上号 → 预检判
+Environment、成因落盘、回 develop 重试且无 test 复检）、
+`e2e_merge_gate_environment_does_not_burn_gate_failures`（develop 通过**之后**环境才漂移 →
+merge 判 Environment、`gate_failures` 仍为 0、Kickback 回 develop）；既有 merge 耗尽用例补
+pending 载体断言（分类 `test` / 计数 3 / 日志路径 / 摘要含失败原文）。
+**来源**：2026-10-06 106 现场（见 `.scratch/gate-failure-attribution/README.md` 读数表）；
+落地 `crates/core/src/{types.rs, scheduler/mod.rs, pipeline/{executor.rs, routes.rs, merge.rs}}`、
+`tests/e2e/tests/integration/gates.rs`、`docs/operations.md` §12.18。

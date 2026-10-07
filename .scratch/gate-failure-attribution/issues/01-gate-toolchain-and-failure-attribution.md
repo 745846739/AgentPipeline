@@ -71,3 +71,31 @@ pending（携带成因）。
 - `route_merge` / `route_code_gate` 的单测补 Environment 分支（含「不进 test 复检」断言）；
   `resume_cause_table_is_the_spec` 与规格表若受影响同批补行（决策 277① 的条数断言）。
 - 106 上任务 `01M47RQG4M9533F5TMF1AGJXC8` 解出后走完 merge（**本票的止血部分**已要求做完）。
+
+**Status:** ready-for-human（本地落地完成，2026-10-07：形状 2–5 进代码 + 单测 / e2e；形状 1 是部署物，已在 106 生效）
+
+**落地记录（2026-10-07）**：
+
+- **形状 1**（部署物）：106 `agent-pipeline.service` 补
+  `Environment=PATH=/root/.cargo/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin` 与
+  `Environment=RUSTUP_TOOLCHAIN=1.98.0`（备份 `/root/agent-pipeline.service.bak-20261007-toolchain`），
+  取证见 [README](../README.md) 的「止血实证」。
+- **形状 2–5**（代码）：`types.rs`（`GateFailureKind::Environment` + `as_str` / `from_str_opt`
+  单点 + `PendingContext` 三个成因字段与 `with_gate_failure`）、`executor.rs`
+  （`toolchain_preflight` + `declared_toolchain_channel` / `version_like` / `parse_rustc_version` +
+  `write_gate_failure_facts` / `clear_gate_failure_facts` + `retry_exhausted_context` +
+  `gate_failure_summary` / `truncate_for_context`）、`routes.rs`（`route_merge` ④ 并
+  `Environment`）、`merge.rs`（环境类失败不烧 `gate_failures`）、`scheduler/mod.rs`（改走 `as_str`）。
+- **用例**：单测 `toolchain_preflight_readings_parse`、`gate_failure_summary_truncates_loudly`、
+  `route_merge_gate_fail_environment_kicks_back_develop_not_test`、
+  `gate_failure_kind_round_trips_through_as_str`；e2e
+  `e2e_gate_environment_mismatch_is_classified_not_test`、
+  `e2e_merge_gate_environment_does_not_burn_gate_failures`，并在既有 merge 耗尽用例
+  （`gates.rs` 的 t8）里补 pending 载体断言（分类 / 计数 / 日志路径 / 摘要含失败原文）。
+- 决策 **392** 已续写；`docs/testing.md` 已补表行。
+- **两处未做**（记在决策 392 的「明确不做」）：① 形状 5 的「分类构成」（几次数用例失败、
+  几次环境失败）需给 `MergeResult` 再加一列，本次只落「环境类不烧计数」这条硬要求，构成
+  读数暂由 pending 载体的 `gate_failure_kind` 承载；② 票面的**反向检查**（在 106 上抽掉
+  `PATH` / `RUSTUP_TOOLCHAIN` 复现 `final link failed`，装回再转绿）——那套配置漂移已被形状 1
+  消除，重放要人工改 unit，留待下一次部署变更时顺带做；预检本身由 e2e 用例（声明版本对不上
+  即拦下、且不跑测试命令）在 CI 里常驻把关。

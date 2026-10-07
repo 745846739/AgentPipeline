@@ -201,7 +201,8 @@ pub fn route_code_gate(cursor: &NodeCursor, ctx: &RouteContext) -> EdgeKind {
         Stage::Test if !ctx.metadata.all_failures_are_test_issues() => {
             EdgeKind::Pending(PendingKind::UserDecision)
         }
-        // develop：lint / 单元测试失败 → 直接打回 execute
+        // develop：lint / 单元测试 / 环境类失败 → 直接打回 execute（同属「确定性失败
+        // 不绕 test」那一族，决策 139 / 391 / 392；develop 本就没有 test 复检这一步）
         _ => EdgeKind::Retry,
     }
 }
@@ -229,14 +230,15 @@ pub fn route_merge(ctx: &RouteContext) -> EdgeKind {
     }
 
     // ④ 闸门失败分流（决策 139）：lint 失败确定性，直接打回 develop；
-    //    空分支同样是确定性失败（决策 391：修用例造不出提交，test 复检必然空转），
-    //    直接打回 develop——决策 85 的 test 复检只留给真正的用例争议；
-    //    测试失败需要 agent 分辨 test_issue / code_issue，跳回 test.execute（决策 85）
+    //    空分支同样是确定性失败（决策 391：修用例造不出提交，test 复检必然空转）；
+    //    环境类失败同理（决策 392：用例侧造不出工具链）——三者都直接打回 develop，
+    //    决策 85 的 test 复检只留给真正的用例争议。
+    //    测试失败需要 agent 分辨 test_issue / code_issue，跳回 test.execute（决策 85）。
     if gate == Gate::Fail {
         return match merge.gate_failure_kind {
-            Some(GateFailureKind::Lint) | Some(GateFailureKind::EmptyBranch) => {
-                EdgeKind::KickbackDevelop
-            }
+            Some(GateFailureKind::Lint)
+            | Some(GateFailureKind::EmptyBranch)
+            | Some(GateFailureKind::Environment) => EdgeKind::KickbackDevelop,
             Some(GateFailureKind::Test) | None => EdgeKind::GotoTest,
         };
     }
@@ -370,6 +372,32 @@ mod tests {
             Some(GateFailureKind::Test),
         ));
         assert_eq!(route_merge(&ctx), EdgeKind::GotoTest);
+    }
+
+    #[test]
+    fn route_merge_gate_fail_environment_kicks_back_develop_not_test() {
+        // 决策 392：环境类失败是确定性失败（用例侧造不出工具链），直接回 develop.execute——
+        // 与 lint / 空分支同款，不走决策 85 的 test 复检（那会让 test 侧永远报绿空转）。
+        let ctx = ctx_with(merge(
+            Approval::None,
+            Some(Gate::Fail),
+            Some(GateFailureKind::Environment),
+        ));
+        assert_eq!(route_merge(&ctx), EdgeKind::KickbackDevelop);
+    }
+
+    #[test]
+    fn gate_failure_kind_round_trips_through_as_str() {
+        // 落库键与读回同一个单点（决策 392：别各写一份拼法）
+        for kind in [
+            GateFailureKind::Lint,
+            GateFailureKind::Test,
+            GateFailureKind::EmptyBranch,
+            GateFailureKind::Environment,
+        ] {
+            assert_eq!(GateFailureKind::from_str_opt(kind.as_str()), Some(kind));
+        }
+        assert_eq!(GateFailureKind::from_str_opt("who_knows"), None);
     }
 
     #[test]

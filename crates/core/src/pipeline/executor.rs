@@ -122,6 +122,70 @@ pub(crate) fn clear_zero_commit_facts(home: &crate::home::Home, task_id: &str) {
     let _ = std::fs::remove_file(home.task_file(task_id, ZERO_COMMIT_FACTS_FILE));
 }
 
+/// develop 闸门最近一次失败的**成因读数**（决策 392 ④）。
+///
+/// develop 没有 `merge_result` 那样的产出行可给 pending 侧读，故按「先落盘、后读」的
+/// 既有形状（决策 126 / 391 同款）落一个小 JSON；闸门通过 / 申报零变更时删除——留着
+/// 会在下一轮的 pending 载体里报**过期**成因。
+pub(crate) const GATE_FAILURE_FACTS_FILE: &str = "gate-failure-develop.json";
+
+pub(crate) fn write_gate_failure_facts(
+    home: &crate::home::Home,
+    task_id: &str,
+    kind: crate::types::GateFailureKind,
+) -> Result<()> {
+    home.ensure_task_dirs(task_id)?;
+    let value = serde_json::json!({
+        "kind": kind.as_str(),
+        "log": format!("gate-output-{}.log", Stage::Develop.as_str()),
+    });
+    std::fs::write(
+        home.task_file(task_id, GATE_FAILURE_FACTS_FILE),
+        value.to_string(),
+    )?;
+    Ok(())
+}
+
+pub(crate) fn clear_gate_failure_facts(home: &crate::home::Home, task_id: &str) {
+    let _ = std::fs::remove_file(home.task_file(task_id, GATE_FAILURE_FACTS_FILE));
+}
+
+/// 门失败类 pending 的诊断摘要上限（决策 392 ④）：超界**显式标注**截断量，不静默丢内容
+/// （与 `truncate_gate_log` 同一条纪律）。
+const GATE_FAILURE_SUMMARY_LIMIT: usize = 2000;
+
+fn truncate_for_context(text: &str, limit: usize) -> String {
+    let count = text.chars().count();
+    if count <= limit {
+        return text.to_string();
+    }
+    let head: String = text.chars().take(limit).collect();
+    format!(
+        "{head}\n…（其余 {} 字符已截断，全文见闸门日志）",
+        count - limit
+    )
+}
+
+/// 门失败类 pending 的成因摘要（决策 392 ④）：**读数**，不是建议。
+fn gate_failure_summary(kind: &str, stage: Stage, failures: u32, output: Option<&str>) -> String {
+    let label = match kind {
+        "lint" => "lint（确定性）",
+        "test" => "测试用例",
+        "empty_branch" => "空分支（分支相对基准零变化）",
+        "environment" => "环境（工具链 / 构建环境）",
+        other => other,
+    };
+    let mut s = format!(
+        "闸门在 `{}` 阶段累计失败 {failures} 次（最近分类：{label}）。",
+        stage.as_str()
+    );
+    if let Some(out) = output.map(str::trim).filter(|s| !s.is_empty()) {
+        s.push_str("\n\n");
+        s.push_str(&truncate_for_context(out, GATE_FAILURE_SUMMARY_LIMIT));
+    }
+    s
+}
+
 // ─────────────────────────────── 单执行者注册表（决策 36 / 226）───────────────────────────────
 
 /// 一次执行体登记：代次 + 它的取消观察点。
@@ -681,6 +745,12 @@ impl Executor {
         cursor: &NodeCursor,
         kind: PendingKind,
     ) -> Result<Option<PendingContext>> {
+        // 决策 392 ④：门失败类待办（重试耗尽）随 pending 带上**成因读数**。此前这里
+        // 只有 `reason_override` 一条成因通路，`route_merge` / `route_code_gate` 的耗尽
+        // 分支落到静态文案上——界面上只看到「重试耗尽，需要用户介入」，成因得 ssh 去挖。
+        if kind == PendingKind::RetryExhausted {
+            return self.retry_exhausted_context(task, cursor).await;
+        }
         if kind != PendingKind::UserDecision {
             return Ok(None);
         }
@@ -712,6 +782,80 @@ impl Executor {
             }
             _ => Ok(None),
         }
+    }
+
+    /// 重试耗尽的成因载体（决策 392 ④）。
+    ///
+    /// 两处来源：merge 读 `merge_result` 行（分类 + 计数 + 失败全文）；develop / test
+    /// 读 develop 闸门落盘的成因文件（`GATE_FAILURE_FACTS_FILE`，可能没有——那不是错，
+    /// 返回 `None` 落回静态文案）。**不设 `context.kind`**：耗尽类动作集按
+    /// `(PendingKind, _)` 匹配，加一个键只会让续接判定表多一个认不出的值。
+    async fn retry_exhausted_context(
+        &self,
+        task: &Task,
+        cursor: &NodeCursor,
+    ) -> Result<Option<PendingContext>> {
+        if cursor.stage == Stage::Merge {
+            let Some(merge) = self.store.merge_metadata(&task.id).await? else {
+                return Ok(None);
+            };
+            let kind = merge
+                .gate_failure_kind
+                .map(|k| k.as_str().to_string())
+                .unwrap_or_else(|| "unknown".into());
+            let log_path = self
+                .store
+                .home()
+                .task_file(
+                    &task.id,
+                    &format!("gate-output-{}.log", Stage::Merge.as_str()),
+                )
+                .display()
+                .to_string();
+            let summary = gate_failure_summary(
+                &kind,
+                cursor.stage,
+                merge.gate_failures,
+                merge.gate_failure_output.as_deref(),
+            );
+            return Ok(Some(PendingContext::with_gate_failure(
+                &kind,
+                merge.gate_failures,
+                log_path,
+                summary,
+            )));
+        }
+        let path = self
+            .store
+            .home()
+            .task_file(&task.id, GATE_FAILURE_FACTS_FILE);
+        let Ok(text) = std::fs::read_to_string(&path) else {
+            return Ok(None);
+        };
+        let Ok(value) = serde_json::from_str::<serde_json::Value>(&text) else {
+            return Ok(None);
+        };
+        let kind = value
+            .get("kind")
+            .and_then(|v| v.as_str())
+            .unwrap_or("unknown")
+            .to_string();
+        let log_rel = value
+            .get("log")
+            .and_then(|v| v.as_str())
+            .unwrap_or("gate-output-develop.log");
+        let log_path = self
+            .store
+            .home()
+            .task_file(&task.id, log_rel)
+            .display()
+            .to_string();
+        // develop / test 的耗尽计数在游标上（merge 的在 merge_result 行上，决策 108）
+        let failures = cursor.validate_attempts;
+        let summary = gate_failure_summary(&kind, cursor.stage, failures, None);
+        Ok(Some(PendingContext::with_gate_failure(
+            &kind, failures, log_path, summary,
+        )))
     }
 
     // ─────────────────────── 节点分发 ───────────────────────
@@ -910,6 +1054,7 @@ impl Executor {
         // 事实段文件——申报成立后它就是过期证据，留着会在后续重入里误注入。
         if declared_no_changes(&self.store, &task.id).await? {
             clear_zero_commit_facts(self.store.home(), &task.id);
+            clear_gate_failure_facts(self.store.home(), &task.id);
             return Ok(NodeOutput::Route(crate::pipeline::MetadataView {
                 zero_changes: true,
                 ..Default::default()
@@ -921,22 +1066,31 @@ impl Executor {
                 ZeroCommitCheck::HasCommits => {
                     // 分支非空：放行；同样清掉上一轮守卫失败留下的事实段文件
                     clear_zero_commit_facts(self.store.home(), &task.id);
+                    clear_gate_failure_facts(self.store.home(), &task.id);
                     Ok(NodeOutput::Route(crate::pipeline::MetadataView::passed(
                         true,
                     )))
                 }
                 ZeroCommitCheck::Empty { facts } => {
                     write_zero_commit_facts(self.store.home(), &task.id, &facts)?;
+                    // 闸门本身过了，失败成因换成「零提交」这一条（决策 392 ④）
+                    clear_gate_failure_facts(self.store.home(), &task.id);
                     Ok(NodeOutput::Route(crate::pipeline::MetadataView::passed(
                         false,
                     )))
                 }
                 // git 读数不可用：按「读不到」降级，不因这一条卡死放行（决策 209 姿态）
-                ZeroCommitCheck::Unavailable => Ok(NodeOutput::Route(
-                    crate::pipeline::MetadataView::passed(true),
-                )),
+                ZeroCommitCheck::Unavailable => {
+                    clear_gate_failure_facts(self.store.home(), &task.id);
+                    Ok(NodeOutput::Route(crate::pipeline::MetadataView::passed(
+                        true,
+                    )))
+                }
             }
         } else {
+            // 决策 392 ④：develop 侧没有 merge_result 那样的产出行，闸门失败的**成因**
+            // 落盘——耗尽转 pending 时 `pending_context_for` 按它填载体（此前只剩静态文案）。
+            write_gate_failure_facts(self.store.home(), &task.id, gate.failure_kind)?;
             Ok(NodeOutput::Route(crate::pipeline::MetadataView::passed(
                 false,
             )))
@@ -1877,6 +2031,14 @@ pub(crate) async fn run_code_gate(
     cwd: &Path,
     include_lint: bool,
 ) -> Result<GateOutcome> {
+    // 决策 392 ②：环境预检**先于**一切命令。闸门用错工具链时，lint / 测试的输出会是
+    // 一堆看不懂的链接错误，归因也会落到 `Test` 上（2026-10-06 的 01M47RQG4M9533F5TMF1AGJXC8
+    // 就是这么空转的）——预检把它变成一句说得清的话，且**不跑测试命令**。
+    if let Some(failed) =
+        toolchain_preflight(store, settings, killer, task, run_id, stage, node, cwd).await?
+    {
+        return Ok(failed);
+    }
     if include_lint {
         if let Some(lint) = &project.lint_command {
             RunLedger::new(store, clock)
@@ -1915,6 +2077,123 @@ pub(crate) async fn run_code_gate(
         failure_kind: GateFailureKind::Test,
         output: String::new(),
     })
+}
+
+/// 环境预检（决策 392 ②）：仓库声明的工具链 vs 闸门**实际**会用到的那套。
+///
+/// 读 `<cwd>/rust-toolchain.toml` 的 `[toolchain].channel`，与经**同一环境路径**
+/// （`run_system_command`，即闸门跑 lint / 测试时那份 `PATH` + `CARGO_TARGET_DIR`）
+/// 取到的 `rustc --version` 比对；不一致即 `GateFailureKind::Environment`，**不跑测试**。
+///
+/// **不猜**：没有声明文件、或声明不是可机械比对的版本号（`stable` / `nightly` /
+/// `1.98.0-2024-…` 这类带后缀的照取版本前缀）时不判——预检是为了把「静默用错 rustc」
+/// 变成一句说得清的话，不是为了在信息不足时拦路（决策 209 姿态）。
+///
+/// 为什么值得每次跑：106 那次是**配置漂移**（systemd unit 少了 PATH），下次可能是换机、
+/// 换 drop-in、换镜像——那时候没人会记得回来看这条。
+#[allow(clippy::too_many_arguments)] // 与 run_code_gate 同一条显式依赖（store/settings/killer）
+async fn toolchain_preflight(
+    store: &Store,
+    settings: &Settings,
+    killer: &Arc<dyn ProcessKiller>,
+    task: &Task,
+    run_id: i64,
+    stage: Stage,
+    node: Node,
+    cwd: &Path,
+) -> Result<Option<GateOutcome>> {
+    let Ok(text) = std::fs::read_to_string(cwd.join("rust-toolchain.toml")) else {
+        return Ok(None);
+    };
+    let Some(declared) = declared_toolchain_channel(&text).and_then(|c| version_like(&c)) else {
+        return Ok(None);
+    };
+    let (code, out) = run_system_command(
+        store,
+        settings,
+        killer,
+        task,
+        run_id,
+        stage,
+        node,
+        "rustc --version",
+        cwd,
+    )
+    .await?;
+    let actual = parse_rustc_version(&out);
+    if code == 0 && actual.as_deref() == Some(declared.as_str()) {
+        return Ok(None);
+    }
+    let (_, which) = run_system_command(
+        store,
+        settings,
+        killer,
+        task,
+        run_id,
+        stage,
+        node,
+        "command -v cargo",
+        cwd,
+    )
+    .await?;
+    let target_dir = store.home().shared_target_path().display().to_string();
+    let actual_show = actual.unwrap_or_else(|| "（`rustc --version` 读不到）".into());
+    let output = format!(
+        "工具链预检：仓库声明 `{declared}`（rust-toolchain.toml），闸门实际用的是 `{actual_show}`\n\
+         - `rustc --version`（退出码 {code}）→ {}\n\
+         - `command -v cargo` → {}\n\
+         - `CARGO_TARGET_DIR` → {target_dir}\n\
+         修法：让闸门进程的 `PATH` / `RUSTUP_TOOLCHAIN` 指向与仓库声明一致的那套\
+         （决策 175 的钉法、决策 392 ① 的部署物）。",
+        out.trim(),
+        which.trim(),
+    );
+    Ok(Some(GateOutcome {
+        passed: false,
+        failure_kind: GateFailureKind::Environment,
+        output,
+    }))
+}
+
+/// `rust-toolchain.toml` 的 `[toolchain].channel`（`#` 后是注释）。认不出 → `None`。
+fn declared_toolchain_channel(text: &str) -> Option<String> {
+    text.lines().find_map(|raw| {
+        let line = raw.split('#').next().unwrap_or("").trim();
+        let rest = line.strip_prefix("channel")?.trim_start();
+        let value = rest
+            .strip_prefix('=')?
+            .trim()
+            .trim_matches(['"', '\''])
+            .trim();
+        (!value.is_empty()).then(|| value.to_string())
+    })
+}
+
+/// 可机械比对的版本号（`1.98.0` / `1.98`；`1.98.0-x86_64-…` 取版本前缀）。
+/// `stable` / `nightly` 这类**不是版本** → `None`（预检不猜）。
+fn version_like(channel: &str) -> Option<String> {
+    let core = channel
+        .split('-')
+        .next()
+        .unwrap_or(channel)
+        .trim()
+        .to_string();
+    let mut parts = core.split('.');
+    let major = parts.next().unwrap_or_default();
+    let minor = parts.next().unwrap_or_default();
+    let ok = |s: &str| !s.is_empty() && s.chars().all(|c| c.is_ascii_digit());
+    (ok(major) && ok(minor)).then_some(core)
+}
+
+/// `rustc --version` 输出里的版本号（`rustc 1.98.0 (…)` → `1.98.0`）。
+fn parse_rustc_version(out: &str) -> Option<String> {
+    let line = out.lines().find(|l| l.trim_start().starts_with("rustc "))?;
+    let v = line
+        .trim_start()
+        .strip_prefix("rustc ")?
+        .split_whitespace()
+        .next()?;
+    (!v.is_empty()).then(|| v.to_string())
 }
 
 // ─────────────────────────────── 节点输出 ───────────────────────────────
@@ -2132,6 +2411,65 @@ mod tests {
         let with_log = gate_output("测试", "cargo test", 1, "FAILED: test_login\n");
         assert!(with_log.contains("退出码 1"));
         assert!(with_log.contains("FAILED: test_login"));
+    }
+
+    /// 决策 392 ②：预检的三段读数解析（声明版本 / 可比对性 / 实际版本）。
+    #[test]
+    fn toolchain_preflight_readings_parse() {
+        // 声明通道：带注释、带引号、单引号、缺引号都认
+        assert_eq!(
+            declared_toolchain_channel("[toolchain]\nchannel = \"1.98.0\" # 与 Makefile 同源\n"),
+            Some("1.98.0".to_string())
+        );
+        assert_eq!(
+            declared_toolchain_channel("channel='1.98.0'\n"),
+            Some("1.98.0".to_string())
+        );
+        assert_eq!(
+            declared_toolchain_channel("[toolchain]\nchannel = \"stable\"\n"),
+            Some("stable".to_string())
+        );
+        // 没有 channel 行 → 认不出（预检不猜）
+        assert_eq!(
+            declared_toolchain_channel("[toolchain]\nprofile = \"minimal\"\n"),
+            None
+        );
+        assert_eq!(declared_toolchain_channel("channel =\n"), None);
+
+        // 可机械比对的版本：`1.98.0` / `1.98`；`stable` / `nightly` / 空 → 不判
+        assert_eq!(version_like("1.98.0"), Some("1.98.0".to_string()));
+        assert_eq!(version_like("1.98"), Some("1.98".to_string()));
+        assert_eq!(
+            version_like("1.98.0-x86_64-unknown-linux-gnu"),
+            Some("1.98.0".to_string())
+        );
+        assert_eq!(version_like("stable"), None);
+        assert_eq!(version_like("nightly"), None);
+        assert_eq!(version_like("1"), None);
+        assert_eq!(version_like("1.x"), None);
+
+        // 实际版本从 `rustc --version` 里取
+        assert_eq!(
+            parse_rustc_version("rustc 1.98.0 (b4b3f0a1c 2025-01-15)\n"),
+            Some("1.98.0".to_string())
+        );
+        assert_eq!(parse_rustc_version("cargo 1.98.0\n"), None);
+        assert_eq!(parse_rustc_version(""), None);
+    }
+
+    /// 决策 392 ④：诊断摘要超界时**显式标注**截断量（不静默丢内容）。
+    #[test]
+    fn gate_failure_summary_truncates_loudly() {
+        let short = gate_failure_summary("lint", Stage::Develop, 2, Some("一小段"));
+        assert!(short.contains("lint（确定性）"));
+        assert!(short.contains("累计失败 2 次"));
+        assert!(short.contains("一小段"));
+        assert!(!short.contains("已截断"));
+
+        let long = "x".repeat(GATE_FAILURE_SUMMARY_LIMIT + 10);
+        let out = gate_failure_summary("environment", Stage::Merge, 1, Some(&long));
+        assert!(out.contains("环境（工具链 / 构建环境）"));
+        assert!(out.contains("其余 10 字符已截断"));
     }
 
     #[test]

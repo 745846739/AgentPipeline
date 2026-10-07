@@ -585,6 +585,20 @@ pub fn resume_continues(cause: ResumeCause) -> bool {
     }
 }
 
+/// 门失败类待办的**成因读数**（决策 392 ④）：把「失败到底是什么」从退出码里救出来。
+///
+/// 这是**读数**不是建议：落进 pending 载体供看板与排查读，不进模型 prompt。
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize, JsonSchema)]
+pub struct GateFailureReadings {
+    /// `lint` / `test` / `empty_branch` / `environment`（[`GateFailureKind::as_str`]）。
+    pub kind: String,
+    /// 累计闸门失败次数（决策 108 的计数；环境类失败**不烧**它，决策 392 ⑤）。
+    pub failures: u32,
+    /// 闸门日志的可读路径（`gate-output-<stage>.log`）：要看全文的人按它去读，
+    /// 不必再 ssh 翻任务目录。
+    pub log_path: String,
+}
+
 /// pending 的结构化上下文。`kind` 是 `(type, context.kind)` 动作表的第二个 key（决策 130）。
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize, JsonSchema)]
 pub struct PendingContext {
@@ -597,6 +611,15 @@ pub struct PendingContext {
     /// 闸门失败详情，传给 test.execute 复检（决策 85）。
     #[serde(skip_serializing_if = "Option::is_none")]
     pub gate_failure_output: Option<String>,
+    /// 门失败类待办的**成因读数**（决策 392 ④）：闸门失败的分类、计数与日志路径。
+    /// 与 `gate_failure_output`（给 test 复检用的失败**全文**）分开——这里是**读数**，
+    /// 供 pending 载体与看板显示；它不进模型 prompt（模型看到的仍是闸门日志段）。
+    ///
+    /// **`Box` 一层**：`PendingReason` 会被 `Landing` / `PhaseB` 这两个枚举**按值**携带，
+    /// 三个字段平铺进去会把它们顶到 `clippy::large_enum_variant`（实测 232 字节）；
+    /// 而这份读数在绝大多数 pending 上都是 `None`。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub gate_failure: Option<Box<GateFailureReadings>>,
     /// 原始诊断（主流程票 03）：provider 配置类失败时保留原始错误串。
     /// 与 `message` 分离——message 是中文可操作提示，raw 供排查，不拼进 message。
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -618,6 +641,30 @@ impl PendingContext {
     pub fn with_diagnostic(raw: impl Into<String>) -> Self {
         PendingContext {
             diagnostic: Some(raw.into()),
+            ..Default::default()
+        }
+    }
+
+    /// 门失败类待办（决策 392 ④）：把「失败到底是什么」的读数随 pending 一起下发。
+    ///
+    /// `summary` 落 `diagnostic`——前端 `PendingDossier` 已有 `context.diagnostic` 的
+    /// 渲染路径，故**不需要新控件**（票面 ④ 的「前端无需改动」）；分类与计数落各自
+    /// 字段，供看板 / 排查读取。**不设 `kind`**：门失败类待办的动作集按
+    /// `(PendingKind, _)` 匹配，凭空加一个 `context.kind` 只会让续接判定表多一个认不出
+    /// 的键（决策 205 的 `ResumeCause::classify`）。
+    pub fn with_gate_failure(
+        kind: &str,
+        failures: u32,
+        log_path: impl Into<String>,
+        summary: impl Into<String>,
+    ) -> Self {
+        PendingContext {
+            diagnostic: Some(summary.into()),
+            gate_failure: Some(Box::new(GateFailureReadings {
+                kind: kind.to_string(),
+                failures,
+                log_path: log_path.into(),
+            })),
             ..Default::default()
         }
     }
@@ -1013,7 +1060,7 @@ pub enum Gate {
     Fail,
 }
 
-/// 闸门失败类型（决策 139；`empty_branch` 由决策 391 补充）。
+/// 闸门失败类型（决策 139；`empty_branch` 由决策 391 补充；`environment` 由决策 392 补充）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum GateFailureKind {
@@ -1023,6 +1070,36 @@ pub enum GateFailureKind {
     /// 确定性失败，**不进 test 复检**（决策 85 的适用范围就此收窄）——直接打回
     /// develop.execute，与 lint 同一条「确定性错误不绕 test」的先例。
     EmptyBranch,
+    /// **环境**类失败（决策 392）：闸门要跑的那套工具链与仓库声明的不一致（预检拦下），
+    /// 或闸门命令以「环境不可用」形态收场。确定性失败，**不进 test 复检**——用例侧
+    /// 造不出工具链；**也不烧 `gate_failures` 预算**（决策 392 ⑤：那个计数是「代码改不动」
+    /// 的信号，环境问题冒充它会把信号污染掉）。读数是「声明版本 vs 实际版本」。
+    Environment,
+}
+
+impl GateFailureKind {
+    /// 落库 / 上报 / pending 载体里的稳定字符串（`gate_failure_kind` 的那个键）。
+    /// **单点**：与 `serde(rename_all = "snake_case")` 同一份拼法，别再各写一遍
+    /// （遗漏一个变体不会有编译错，只会静默少一个口径）。
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            GateFailureKind::Lint => "lint",
+            GateFailureKind::Test => "test",
+            GateFailureKind::EmptyBranch => "empty_branch",
+            GateFailureKind::Environment => "environment",
+        }
+    }
+
+    /// 从库里的字符串读回（认不出的旧值 → `None`，不猜）。
+    pub fn from_str_opt(raw: &str) -> Option<Self> {
+        match raw {
+            "lint" => Some(GateFailureKind::Lint),
+            "test" => Some(GateFailureKind::Test),
+            "empty_branch" => Some(GateFailureKind::EmptyBranch),
+            "environment" => Some(GateFailureKind::Environment),
+            _ => None,
+        }
+    }
 }
 
 /// merge 阶段在 `kanban_stage_outputs` 里的 `output_type` 定名（§4.2）。

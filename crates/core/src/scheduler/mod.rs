@@ -941,11 +941,9 @@ impl KanbanScheduler {
                                 AttentionKind::GateFailure,
                                 settled_at,
                                 Some(&serde_json::json!({
-                                    "gate_failure_kind": merge.gate_failure_kind.map(|k| match k {
-                                        crate::types::GateFailureKind::Lint => "lint",
-                                        crate::types::GateFailureKind::Test => "test",
-                                        crate::types::GateFailureKind::EmptyBranch => "empty_branch",
-                                    }),
+                                    "gate_failure_kind": merge
+                                        .gate_failure_kind
+                                        .map(|k| k.as_str()),
                                     "gate_failures": merge.gate_failures,
                                     "output": merge.gate_failure_output,
                                 })),
