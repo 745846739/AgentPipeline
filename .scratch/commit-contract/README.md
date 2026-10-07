@@ -59,10 +59,18 @@ submit_metadata」契约锚点只有三个 validate_input 模板有（决策 277
 ### 落地状态（2026-10-06，本地直改完成）
 
 形状 1–6 已落地并通过 lint / 全量测试，决策 391 已续写、testing.md 已补表行。
-**待办（部署批次）**：推送 → CI 全绿 → 等 106 上任务 `01M47RQG4M9533F5TMF1AGJXC8` 到终态 →
-部署 106（全量重建）**同批**删除 `stage_configs.develop.persona_append`（形状 7）→
-用一个真实小任务做部署后验收 dogfood（用它的 develop 轮验证「提交契约生效 + 零提交守卫
-不误伤」两条）。
+
+**部署批次已执行（2026-10-07）**：推送 → CI 全绿 → 任务 `01M47RQG4M9533F5TMF1AGJXC8`
+经 106 闸门转绿后到终态（`done`）→ 部署 106（全量重建，`deploy-106` run 37558331087
+成功，106 落 `00bafec`）→ **同批删除 `stage_configs.develop.persona_append`（形状 7）**：
+`PUT /stage-configs/develop` 置空（原值备份 `/root/stage_configs.develop.persona_append.bak-20261007.*`，
+含 `.restore.sql`），`skills_json` 与 `max_duration_sec` 原样保留。**不需要重启**——
+阶段配置在每次模型调用时读库（`model_invoke.rs:777` 的 `get_stage_config`），
+且两处 persona 追加都带 `trim().is_empty()` 守卫（`model_request.rs:988`、
+`model_invoke.rs:1323`），空串等价于没有追加。
+
+**仅剩一步**：用一个真实小任务做部署后验收 dogfood（用它的 develop 轮验证「提交契约生效 +
+零提交守卫不误伤」两条）。
 
 共识裁决记录（2026-10-06 grill 会话）：解卡走 develop（不手工代提交，保场景 17 判据）；
 契约归模板（message 语义属目标项目域，系统不接管）；merge 空分支直接打回 develop
