@@ -130,9 +130,14 @@ export const TestDesign = (readiness = true) => ({
   test_scenarios_path: 'test-scenarios.md',
 });
 
-export const CodeChanges = (taskId: string) => ({
+/** 文件变更申报（决策 397）：申报单向比对 fail-closed——worktree diff 面写了文件
+ * 却不在 `changed_files ∪ unit_test_files` 里，validate_output 当轮打回。故每处
+ * submit 都必须**如实**带上该轮真实写入的文件（预存文件 modify、新文件 create）。 */
+export type DeclaredFile = { path: string; action: 'create' | 'modify' | 'delete' };
+
+export const CodeChanges = (taskId: string, changed: DeclaredFile[] = []) => ({
   branch_name: `kanban/${taskId}`,
-  changed_files: [],
+  changed_files: changed,
   unit_test_files: [],
 });
 
@@ -217,7 +222,12 @@ export function implementationRounds(taskId: string): NodeScript {
         runCommand(
           `git add -A && git -c user.name=e2e -c user.email=e2e@localhost commit -m 'feat: task ${taskId}'`,
         ),
-        submit(CodeChanges(taskId)),
+        submit(
+          CodeChanges(taskId, [
+            { path: 'src/lib.js', action: 'modify' },
+            { path: 'tests/acceptance.js', action: 'create' },
+          ]),
+        ),
       ],
     ],
     [NODE.reviewEx]: [
@@ -254,7 +264,7 @@ export function failingGateRounds(taskId: string): NodeScript {
         runCommand(
           `git add -A && git -c user.name=e2e -c user.email=e2e@localhost commit -m 'feat(wip): task ${taskId}'`,
         ),
-        submit(CodeChanges(taskId)),
+        submit(CodeChanges(taskId, [{ path: 'src/lib.js', action: 'modify' }])),
       ],
       // 第 2 轮：修好 → 闸门通过
       [
@@ -265,7 +275,7 @@ export function failingGateRounds(taskId: string): NodeScript {
         runCommand(
           `git add -A && git -c user.name=e2e -c user.email=e2e@localhost commit -m 'fix: task ${taskId}'`,
         ),
-        submit(CodeChanges(taskId)),
+        submit(CodeChanges(taskId, [{ path: 'src/lib.js', action: 'modify' }])),
       ],
     ],
   };
@@ -348,7 +358,13 @@ export function siblingImplementationRounds(taskId: string): NodeScript {
         runCommand(
           `git add -A && git -c user.name=e2e -c user.email=e2e@localhost commit -m 'feat: task ${taskId}'`,
         ),
-        submit(CodeChanges(taskId)),
+        submit(
+          CodeChanges(taskId, [
+            { path: 'src/lib.js', action: 'modify' },
+            { path: 'src/extra.js', action: 'create' },
+            { path: 'tests/acceptance.js', action: 'create' },
+          ]),
+        ),
       ],
     ],
     [NODE.reviewEx]: [
