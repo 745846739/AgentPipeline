@@ -2409,6 +2409,18 @@ impl ToolExecutor {
     }
 
     async fn run_command(&self, call: &ToolCall, ctx: &ToolCallContext) -> Result<ToolOutcome> {
+        self.run_command_inner(call, ctx, true).await
+    }
+
+    /// `run_command` 的本体。`auto_route` = 允许白名单模式改道（决策 398）：只有
+    /// agent 的原始调用是 `true`；改道内部的本机重跑与 `offload_run` 的本机回退
+    /// 一律 `false`——回退的路不能再绕回外发，否则链路一坏就是 dispatch↔本机的死循环。
+    async fn run_command_inner(
+        &self,
+        call: &ToolCall,
+        ctx: &ToolCallContext,
+        auto_route: bool,
+    ) -> Result<ToolOutcome> {
         let args = Self::args(call)?;
         let command = args
             .get("command")
@@ -2472,6 +2484,19 @@ impl ToolExecutor {
                 .await?;
             }
             return Err(denied);
+        }
+
+        // 重活外发·白名单模式（决策 398）：主开关与白名单都开、正则命中 → 自动改道
+        // 外发链路。改道点在 egress 判定**之后**：出口策略的对象是模型想访问网络这件事，
+        // 先判原话（顺序不变量，决策 297）；链路本身的出口授权在主开关里（决策 381③）。
+        // 只挂任务命令（`session_id = None`，与共享构建缓存同一判据）——值班长的命令
+        // 没有 worktree 语义，外发的「推任务分支」对它不成立。`auto_route` 为假
+        // （offload_run 的本机回退、改道内部的本机重跑）不再进来——回退的路不能绕回外发。
+        let cwd_is_root = cwd == ctx.worktree_path;
+        if auto_route && ctx.session_id.is_none() && cwd_is_root {
+            if let Some(outcome) = self.offload_auto_route(call, &command, ctx).await? {
+                return Ok(outcome);
+            }
         }
 
         // 启动之后的一切走**唯一收口**（决策 297 / 票 01）：进程组 / 心跳 / 超时杀干净 /
@@ -2667,7 +2692,8 @@ impl ToolExecutor {
                     })
                     .to_string(),
                 };
-                let mut out = self.run_command(&fallback, ctx).await?;
+                // auto_route = false：回退不能绕回白名单改道（决策 398 的死循环护栏）。
+                let mut out = self.run_command_inner(&fallback, ctx, false).await?;
                 out.content = format!(
                     "⚠️ 外发链路失败（{e}），已回退**本机**执行同一条命令：\n\n{}",
                     out.content
@@ -2700,8 +2726,161 @@ impl ToolExecutor {
         }
     }
 
-    /// 外发链路的第 ③ 步本体：推分支 → dispatch → 轮询 → 拉日志尾部。
+    /// 白名单模式的改道判定与执行（决策 398）。
     ///
+    /// 返回 `Ok(None)` = **不合资格**，照常本机跑：没接 Store、主开关或白名单关着、
+    /// 正则编译失败（保存时已验过，理论上不该发生，留 WARN）、正则不命中、cwd 不是
+    /// 工作区根（外发只在仓根跑，cwd 指到子目录的命令改道是静默换语义）。不合资格
+    /// 是路由判定不是降级，无声是设计行为。
+    ///
+    /// 返回 `Ok(Some(outcome))` = 本函数已完整处理这一条。命中之后的出路分两族：
+    /// · **合资格且链路成功** → 回执带一行「已自动改道」+ 外发结果；
+    /// · 其余全部落本机执行、原因前置进回执（降级可以，静默不行）——结构防注入面
+    ///   不过（与 `offload_run` 同一份 [`offload_command_shape_allowed`]）、工作区脏
+    ///   （决策 382③ 不放宽）、游离 HEAD、分支名不收、外发**链路**失败（最后这条与
+    ///   `offload_run` 同一条回退路：WARN + 失败读数 + ⚠️ 回执）。
+    ///
+    /// 与 `offload_run` 的关键差异在**前置失败的处理**：那边是硬拒绝（agent 显式点了
+    /// 外发，必须看见错误）；这边命中是系统的判定、agent 对改道不知情，硬拒绝会让一条
+    /// 本可本机跑的命令平白失败——所以落本机，把「为什么没上远端」写进回执。本机重跑
+    /// 一律用模型的原始参数（不强行抬超时）：模型以为在跑本机命令，参数就是它为本机
+    /// 选的。远端命令本身跑红不回退（`offload_dispatch_and_collect` 正常返回 conclusion，
+    /// 与 `offload_run` 同一语义边界）。
+    async fn offload_auto_route(
+        &self,
+        call: &ToolCall,
+        command: &str,
+        ctx: &ToolCallContext,
+    ) -> Result<Option<ToolOutcome>> {
+        let Some(store) = &self.rtk_store else {
+            return Ok(None);
+        };
+        let switch = store.offload_switch().await?;
+        if !switch.enabled || !switch.whitelist_enabled {
+            return Ok(None);
+        }
+        let Some(pattern) = switch.whitelist_pattern.as_deref() else {
+            return Ok(None);
+        };
+        let Ok(re) = regex::Regex::new(pattern) else {
+            tracing::warn!(
+                run = ctx.run_id,
+                pattern = %pattern,
+                "外发白名单正则编译失败（设置页应重新保存），白名单模式停摆"
+            );
+            return Ok(None);
+        };
+        let trimmed = command.trim();
+        if !re.is_match(trimmed) {
+            return Ok(None);
+        }
+
+        if let Err(e) = offload_command_shape_allowed(trimmed) {
+            return Ok(Some(
+                self.run_command_locally_noted(
+                    call,
+                    ctx,
+                    format!("（命中外发白名单，但{e}——未外发，本机执行）"),
+                )
+                .await?,
+            ));
+        }
+        if let Some(dirty) = crate::git::Git.dirty_summary(&ctx.worktree_path).await? {
+            return Ok(Some(
+                self.run_command_locally_noted(
+                    call,
+                    ctx,
+                    format!(
+                        "（命中外发白名单，但工作区有未提交改动（{dirty}）——\
+                         外发只收已提交状态，本机执行）"
+                    ),
+                )
+                .await?,
+            ));
+        }
+        let branch = match crate::git::Git.current_branch(&ctx.worktree_path).await {
+            Ok(Some(branch)) => branch,
+            _ => {
+                return Ok(Some(
+                    self.run_command_locally_noted(
+                        call,
+                        ctx,
+                        "（命中外发白名单，但当前处于游离 HEAD，没有分支名可外发——本机执行）"
+                            .into(),
+                    )
+                    .await?,
+                ))
+            }
+        };
+        if let Err(e) = offload_branch_allowed(&branch) {
+            return Ok(Some(
+                self.run_command_locally_noted(
+                    call,
+                    ctx,
+                    format!("（命中外发白名单，但{e}——未外发，本机执行）"),
+                )
+                .await?,
+            ));
+        }
+        let Ok(sha) = crate::git::Git.rev_parse(&ctx.worktree_path, "HEAD").await else {
+            return Ok(Some(
+                self.run_command_locally_noted(
+                    call,
+                    ctx,
+                    "（命中外发白名单，但读不到 HEAD commit——本机执行）".into(),
+                )
+                .await?,
+            ));
+        };
+
+        match self
+            .offload_dispatch_and_collect(ctx, &branch, &sha, trimmed)
+            .await
+        {
+            Ok(text) => {
+                self.offload_mark_link_failure(false).await;
+                Ok(Some(ToolOutcome::ok(format!(
+                    "（命中外发白名单，已自动改道 GitHub runner）\n\n{text}"
+                ))))
+            }
+            Err(e) => {
+                self.offload_mark_link_failure(true).await;
+                tracing::warn!(
+                    tool = super::catalog::RUN_COMMAND,
+                    run = ctx.run_id,
+                    stage = %ctx.stage,
+                    node = %ctx.node,
+                    error = %e,
+                    "命中外发白名单，外发失败，回退本机执行"
+                );
+                Ok(Some(
+                    self.run_command_locally_noted(
+                        call,
+                        ctx,
+                        format!("⚠️ 命中外发白名单但外发链路失败（{e}），已回退**本机**执行："),
+                    )
+                    .await?,
+                ))
+            }
+        }
+    }
+
+    /// 白名单模式的本机重跑（决策 398）：原参数原样跑，原因前置进回执。
+    /// `auto_route = false`——回退的路不能绕回外发（死循环）。
+    /// `Box::pin` 是给编译器的：run_command_inner → 本方法 → run_command_inner 在
+    /// 类型层面成环（运行时有 `auto_route` 旗标拦着，不是真循环）。
+    async fn run_command_locally_noted(
+        &self,
+        call: &ToolCall,
+        ctx: &ToolCallContext,
+        note: String,
+    ) -> Result<ToolOutcome> {
+        let mut out = Box::pin(self.run_command_inner(call, ctx, false)).await?;
+        out.content = format!("{note}\n\n{}", out.content);
+        Ok(out)
+    }
+
+    /// 外发链路的第 ③ 步本体：推分支 → dispatch → 轮询 → 拉日志尾部。    ///
     /// 轮询按 `headSha` 前缀 + `createdAt` 双重对账：**只认 dispatch 之后创建的 run**——
     /// 同一 commit 重复外发（重试 flaky、链路抖动后再试）是完全合法的 agent 行为，
     /// 只按 sha 对账会命中上一轮的收场记录，报出假的结论（评审 P1-2）。
@@ -3624,18 +3803,8 @@ const OFFLOAD_LOG_TAIL_LINES: usize = 200;
 /// 藏着的东西」，这些字符在 cargo 命令里也没有正当用途；工作流的 `command` 输入
 /// 因此可以不重复校验（能走到 dispatch 的串已经过了这道闸）。
 pub(crate) fn offload_command_allowed(command: &str) -> Result<()> {
+    offload_command_shape_allowed(command)?;
     let c = command.trim();
-    const FORBIDDEN: [&str; 9] = [";", "&", "|", "`", "$(", "$", "\n", ">", "<"];
-    if let Some(hit) = FORBIDDEN.iter().find(|f| c.contains(*f)) {
-        return Err(Error::Validation(format!(
-            "外发命令不含组合符 / 命令替换 / 重定向（命中 {hit:?}）：白名单只放行单条 cargo 命令"
-        )));
-    }
-    if c.contains('\'') || c.contains('"') || c.contains('\\') {
-        return Err(Error::Validation(
-            "外发命令不含引号与反斜杠：dispatch 的参数按裸词拼装，cargo 命令不需要它们".into(),
-        ));
-    }
     if !OFFLOAD_COMMAND_PREFIXES
         .iter()
         .any(|p| c == *p || c.starts_with(&format!("{p} ")))
@@ -3646,6 +3815,38 @@ pub(crate) fn offload_command_allowed(command: &str) -> Result<()> {
         )));
     }
     Ok(())
+}
+
+/// 外发命令的**结构**防注入面（决策 398）：组合符 / 命令替换 / 重定向 / 引号 / `$`
+/// 一概拒，前缀判据除外。`offload_run` 的白名单与白名单模式的正则共用这一份——
+/// 正则是用户口味的**路由**规则，管「哪些命令想上远端」；这一份管「什么形状的串
+/// 才准上远端」，跟口味无关，谁都不能放宽。
+pub(crate) fn offload_command_shape_allowed(command: &str) -> Result<()> {
+    let c = command.trim();
+    const FORBIDDEN: [&str; 9] = [";", "&", "|", "`", "$(", "$", "\n", ">", "<"];
+    if let Some(hit) = FORBIDDEN.iter().find(|f| c.contains(*f)) {
+        return Err(Error::Validation(format!(
+            "外发命令不含组合符 / 命令替换 / 重定向（命中 {hit:?}）：只放行单条命令"
+        )));
+    }
+    if c.contains('\'') || c.contains('"') || c.contains('\\') {
+        return Err(Error::Validation(
+            "外发命令不含引号与反斜杠：dispatch 的参数按裸词拼装，不需要它们".into(),
+        ));
+    }
+    Ok(())
+}
+
+/// 白名单模式的正则校验（决策 398）：合法返回 `None`，不合法返回给人看的错误句。
+/// 长度卡一个宽松上限——正则写在设置里，不是攻击面，但一兆的正则也没道理。
+pub fn offload_whitelist_pattern_error(pattern: &str) -> Option<String> {
+    if pattern.chars().count() > 256 {
+        return Some("白名单正则最长 256 字符".into());
+    }
+    match regex::Regex::new(pattern) {
+        Ok(_) => None,
+        Err(e) => Some(format!("白名单正则编译失败：{e}")),
+    }
 }
 
 /// 分支名形状（票 runner-offload/06 评审 P1-1）：分支名要被裸拼进 shell 串
@@ -6180,6 +6381,222 @@ mod tests {
             "不得报上一轮的结论: {}",
             out.content
         );
+    }
+
+    // ── 白名单模式（决策 398）：run_command 命中正则自动改道，offload_run（skill 模式）不动 ──
+
+    /// 命中正则的 run_command 自动走外发链路：回执带「已自动改道」，dispatch 的
+    /// 命令逐字就是模型发的那条。
+    #[tokio::test]
+    async fn run_command_auto_routes_a_regex_hit_to_the_offload_link() {
+        let f = offload_fixture(gh_happy, false).await;
+        f.store
+            .set_offload_whitelist(true, Some(r"^cargo (test|clippy)"))
+            .await
+            .unwrap();
+        let out = f
+            .executor
+            .execute(
+                &call(
+                    "run_command",
+                    serde_json::json!({"command": "cargo test --workspace"}),
+                ),
+                &f.ctx,
+            )
+            .await
+            .unwrap();
+        assert!(
+            out.content.contains("已自动改道") && out.content.contains("外发完成"),
+            "{}",
+            out.content
+        );
+        assert!(
+            out.content.contains("step2 done"),
+            "外发的日志尾部要回读: {}",
+            out.content
+        );
+        let argv = std::fs::read_to_string(f._tmp.path().join("gh-argv.log")).unwrap();
+        assert!(
+            argv.contains("[command=cargo test --workspace]"),
+            "dispatch 的就是那条命令: {argv}"
+        );
+    }
+
+    /// 不合资格 = 照常本机跑，且不碰外发链路：没接开关层、主开关关、模式关、
+    /// 正则不命中，四条路都不改道。本命令的输出不带任何改道说明。
+    #[tokio::test]
+    async fn run_command_leaves_ineligible_commands_on_the_local_path() {
+        struct Case {
+            name: &'static str,
+            main: bool,
+            whitelist: bool,
+            pattern: &'static str,
+            command: &'static str,
+        }
+        let cases = [
+            Case {
+                name: "主开关关",
+                main: false,
+                whitelist: true,
+                pattern: "cargo",
+                command: "echo hi",
+            },
+            Case {
+                name: "白名单模式关",
+                main: true,
+                whitelist: false,
+                pattern: "cargo",
+                command: "echo hi",
+            },
+            Case {
+                name: "正则不命中",
+                main: true,
+                whitelist: true,
+                pattern: "^cargo",
+                command: "echo hi",
+            },
+        ];
+        for c in cases {
+            let f = offload_fixture(gh_happy, false).await;
+            f.store.set_offload_switch(c.main).await.unwrap();
+            f.store
+                .set_offload_whitelist(c.whitelist, Some(c.pattern))
+                .await
+                .unwrap();
+            let out = f
+                .executor
+                .execute(
+                    &call("run_command", serde_json::json!({"command": c.command})),
+                    &f.ctx,
+                )
+                .await
+                .unwrap();
+            assert!(
+                !out.content.contains("外发") && !out.content.contains("本机执行"),
+                "{}：不该有改道痕迹: {}",
+                c.name,
+                out.content
+            );
+            assert_eq!(out.content.trim(), "hi", "{}：本机输出要原样回执", c.name);
+            assert!(
+                !f._tmp.path().join("gh-argv.log").exists(),
+                "{}：不该碰外发链路",
+                c.name
+            );
+        }
+    }
+
+    /// 命中但工作区脏 → 本机执行，回执写明为什么没上远端（决策 382③ 不放宽），
+    /// 且不碰链路（脏检查在 push 之前）。
+    #[tokio::test]
+    async fn run_command_auto_route_runs_locally_when_the_worktree_is_dirty() {
+        let f = offload_fixture(gh_happy, true).await;
+        f.store
+            .set_offload_whitelist(true, Some("echo"))
+            .await
+            .unwrap();
+        let out = f
+            .executor
+            .execute(
+                &call("run_command", serde_json::json!({"command": "echo hi"})),
+                &f.ctx,
+            )
+            .await
+            .unwrap();
+        assert!(
+            out.content.contains("未提交改动") && out.content.contains("hi"),
+            "脏区要走本机且写明原因: {}",
+            out.content
+        );
+        assert!(
+            !f._tmp.path().join("gh-argv.log").exists(),
+            "脏区判定在 push 之前，不该碰链路"
+        );
+    }
+
+    /// 命中但含组合符 → 结构防注入面拦下，本机照跑（模型对改道不知情，不能硬拒绝），
+    /// 回执写明未外发的原因。
+    #[tokio::test]
+    async fn run_command_auto_route_never_sends_shell_combinators_off_box() {
+        let f = offload_fixture(gh_happy, false).await;
+        f.store
+            .set_offload_whitelist(true, Some("echo"))
+            .await
+            .unwrap();
+        let out = f
+            .executor
+            .execute(
+                &call(
+                    "run_command",
+                    serde_json::json!({"command": "echo a; echo b"}),
+                ),
+                &f.ctx,
+            )
+            .await
+            .unwrap();
+        assert!(
+            out.content.contains("组合符")
+                && out.content.contains("a")
+                && out.content.contains("b"),
+            "形状不过要本机执行并写明: {}",
+            out.content
+        );
+        assert!(
+            !f._tmp.path().join("gh-argv.log").exists(),
+            "形状检查在 push 之前，不该碰链路"
+        );
+    }
+
+    /// 链路失败 → 与 offload_run 同一条回退路（WARN / 失败读数 / ⚠️ 回执），且
+    /// **只 dispatch 一次**：回退的本机重跑不得绕回白名单改道（死循环护栏）。
+    #[tokio::test]
+    async fn run_command_auto_route_falls_back_to_local_exactly_once() {
+        let f = offload_fixture(|_, _| "exit 1".to_string(), false).await;
+        f.store
+            .set_offload_whitelist(true, Some("cargo"))
+            .await
+            .unwrap();
+        let out = f
+            .executor
+            .execute(
+                &call("run_command", serde_json::json!({"command": "cargo test"})),
+                &f.ctx,
+            )
+            .await
+            .unwrap();
+        assert!(
+            out.content.contains("外发链路失败") && out.content.contains("已回退**本机**执行"),
+            "{}",
+            out.content
+        );
+        assert!(
+            f.store.offload_last_failure().await.unwrap().is_some(),
+            "链路失败要落设置页读数"
+        );
+        // 回退后不得再次 dispatch（死循环护栏）：台账里 `gh workflow run` 恰一次。
+        let starts = f.recorder.starts.lock().unwrap();
+        assert_eq!(
+            starts
+                .iter()
+                .filter(|s| s.command.contains("gh workflow run"))
+                .count(),
+            1,
+            "dispatch 恰一次: {:?}",
+            starts.iter().map(|s| s.command.clone()).collect::<Vec<_>>()
+        );
+    }
+
+    /// 白名单正则的保存侧校验（决策 398）：合法的过、编译不出的报「编译失败」、
+    /// 超长的报上限。
+    #[test]
+    fn offload_whitelist_pattern_error_reports_bad_regexes() {
+        assert!(offload_whitelist_pattern_error("^cargo (test|clippy)$").is_none());
+        assert!(offload_whitelist_pattern_error("(unclosed")
+            .unwrap()
+            .contains("编译失败"));
+        assert!(offload_whitelist_pattern_error(&"a".repeat(257))
+            .unwrap()
+            .contains("256"));
     }
 
     /// `deny` 档在**执行点**也拦（评审 P2-1）：开关开着、广告侧被绕过，直呼工具仍被拒。

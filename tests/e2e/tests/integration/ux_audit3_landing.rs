@@ -524,8 +524,10 @@ fn scene_07_four_literal_stars_become_b_elements() {
         "场景 7：SettingsNotify:676 应为 <b> 形态"
     );
     assert!(
-        line_n(&root, tools, 160).contains("<b>不改写</b>"),
-        "场景 7：SettingsTools:160 应为 <b> 形态"
+        // 行号随决策 398 的白名单模式段（script 加了 ~40 行）下移；行号钉住的是
+        // 「这一页的字面加粗都在 <b> 形态」的当下事实，文件再加段要跟着挪。
+        line_n(&root, tools, 202).contains("<b>不改写</b>"),
+        "场景 7：SettingsTools:202 应为 <b> 形态"
     );
     // 字面星号形态彻底退场（注释里的 ** 照旧，故只查这四处旧文案本身）
     let n = read(&root, notify);

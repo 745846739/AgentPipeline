@@ -24,6 +24,7 @@ import type {
   PushSubscriptionPayload,
   ForemanWatchSettings,
   OffloadSettings,
+  OffloadWhitelist,
   RtkSettings,
   NotifySettings,
   Project,
@@ -620,6 +621,24 @@ export function getOffload(): Promise<OffloadSettings> {
 /** 拨**重活外发开关**：保存即活——外发工具每条命令现读这一行，下一条就按新值走。 */
 export function setOffload(payload: { enabled: boolean }): Promise<OffloadSettings> {
   return request<OffloadSettings>('/offload', { method: 'PUT', body: payload });
+}
+
+/* 外发白名单模式（决策 398）：run_command 命中正则自动改道；正则保存侧 fail fast。 */
+
+/** 读**外发白名单模式**的读数：开关 + 正则原文 + 来路。 */
+export function getOffloadWhitelist(): Promise<OffloadWhitelist> {
+  return request<OffloadWhitelist>('/offload/whitelist');
+}
+
+/**
+ * 保存**外发白名单模式**。`pattern` 给空串 = 清掉已存的；省略 = 不动
+ * （后端同一条规则）。开模式下正则编不过返回 400，不落半成品。
+ */
+export function setOffloadWhitelist(payload: {
+  enabled: boolean;
+  pattern?: string;
+}): Promise<OffloadWhitelist> {
+  return request<OffloadWhitelist>('/offload/whitelist', { method: 'PUT', body: payload });
 }
 
 /* 命令执行（决策 297）：开关 + 活体探测；保存时探测失败也照存。 */

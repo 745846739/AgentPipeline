@@ -180,6 +180,12 @@ pub fn build_router(state: AppState) -> Router {
             "/offload",
             get(routes::offload::settings).put(routes::offload::set_enabled),
         )
+        // ── 重活外发·白名单模式（决策 398）：run_command 命中正则自动改道 ──
+        // 独立一对端点：主开关的读数键集（票 runner-offload/09 钉过）不动。
+        .route(
+            "/offload/whitelist",
+            get(routes::offload::whitelist_settings).put(routes::offload::set_whitelist),
+        )
         // ── 管线压缩设置（long-run-budget 票 02）──
         // 全局设置端点：GET/PUT 同一份 readout，provenance 逐字段（default / settings）。
         // 保存即活：流水线每 attempt、值班长每轮懒读 `kanban_compaction` 覆盖层。

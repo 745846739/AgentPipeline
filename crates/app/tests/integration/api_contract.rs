@@ -6992,7 +6992,17 @@ fn offload_readout_has_one_source_and_one_shell() {
         "/src/routes/offload.rs"
     ));
     // 只扫生产段：本断言的字面量都在测试段，切掉才不会自证式通过（同 serve.rs / runtime.rs 的手法）。
-    let live = source.split("#[cfg(test)]").next().expect("源文件总在");
+    // 白名单模式（决策 398）有自己的一对端点与读数壳，本断言只钉**主开关**这半边——
+    // 在分节注释处切开，被计数的字面量（"enabled": / offload_switch() 等）在两个
+    // 半边各有一份是结构使然，不是主开关读数壳破了单源。
+    let live = source
+        .split("#[cfg(test)]")
+        .next()
+        .expect("源文件总在")
+        .split("── 白名单模式")
+        .next()
+        .expect("主开关分节总在")
+        .to_string();
 
     assert_eq!(
         live.matches("offload_last_failure()").count(),
@@ -7034,7 +7044,15 @@ fn offload_readout_keeps_the_call_order_and_the_error_mapping() {
         env!("CARGO_MANIFEST_DIR"),
         "/src/routes/offload.rs"
     ));
-    let live = source.split("#[cfg(test)]").next().expect("源文件总在");
+    // 同上：只钉主开关这半边（白名单模式那对端点在分节注释之后，各自有自己的读法）。
+    let live = source
+        .split("#[cfg(test)]")
+        .next()
+        .expect("源文件总在")
+        .split("── 白名单模式")
+        .next()
+        .expect("主开关分节总在")
+        .to_string();
 
     // 帮手内：last_failure 在 probe 之前，且失败映射在场。
     let lf_at = live
@@ -7083,6 +7101,103 @@ fn offload_readout_keeps_the_call_order_and_the_error_mapping() {
         .find("readout(&state, body.enabled")
         .expect("PUT 再拼读数");
     assert!(set_at < put_readout_at, "PUT 写在前读在后：\n{live}");
+}
+
+// ── 白名单模式（决策 398）：GET/PUT /offload/whitelist ──────────────────────────
+
+/// 白名单模式缺省读数：关、无正则、`origin=default`（从没碰过）。
+#[tokio::test]
+async fn offload_whitelist_defaults_to_off_without_a_pattern() {
+    let api = api().await;
+
+    let (_, body) = get(&api, "/offload/whitelist").await;
+    assert_eq!(body["enabled"], false, "{body}");
+    assert!(body["pattern"].is_null(), "缺省无正则：{body}");
+    assert_eq!(body["origin"], "default", "{body}");
+}
+
+/// 白名单模式保存回环：落值、`origin=settings`、库值同请求；正则可省略
+/// （不动已存的），关模式可清空正则；主开关的读数不受影响（独立旋钮）。
+#[tokio::test]
+async fn offload_whitelist_round_trips_through_the_api() {
+    let api = api().await;
+
+    let (status, body) = put(
+        &api,
+        "/offload/whitelist",
+        json!({"enabled": true, "pattern": "^cargo (test|clippy)"}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["enabled"], true, "{body}");
+    assert_eq!(body["pattern"], "^cargo (test|clippy)", "{body}");
+    assert_eq!(body["origin"], "settings", "{body}");
+    assert!(
+        api.state
+            .store
+            .offload_switch()
+            .await
+            .unwrap()
+            .whitelist_enabled,
+        "保存即活"
+    );
+
+    // pattern 省略 = 不动已存的。
+    let (status, body) = put(&api, "/offload/whitelist", json!({"enabled": true})).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["pattern"], "^cargo (test|clippy)", "{body}");
+
+    // 关模式 + 空串 = 清掉正则。
+    let (status, body) = put(
+        &api,
+        "/offload/whitelist",
+        json!({"enabled": false, "pattern": "  "}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["enabled"], false, "{body}");
+    assert!(body["pattern"].is_null(), "{body}");
+    let sw = api.state.store.offload_switch().await.unwrap();
+    assert!(
+        !sw.whitelist_enabled && sw.whitelist_pattern.is_none(),
+        "{sw:?}"
+    );
+}
+
+/// 开白名单模式却不给正则 → 400；正则编不过 → 400（保存侧 fail fast），
+/// 且库里不落半成品。
+#[tokio::test]
+async fn offload_whitelist_rejects_an_empty_or_uncompilable_pattern() {
+    let api = api().await;
+
+    let (status, body) = put(&api, "/offload/whitelist", json!({"enabled": true})).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+
+    let (status, body) = put(
+        &api,
+        "/offload/whitelist",
+        json!({"enabled": true, "pattern": "(unclosed"}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    assert!(body.to_string().contains("编译失败"), "{body}");
+
+    let (_, body) = get(&api, "/offload/whitelist").await;
+    assert_eq!(body["enabled"], false, "坏正则不得落库：{body}");
+    assert!(body["pattern"].is_null(), "{body}");
+}
+
+/// `GET /offload` 的主开关读数键集**不含**白名单键——新旋钮不往旧壳里塞键
+/// （旧契约是既有消费方的依赖面）。
+#[tokio::test]
+async fn offload_main_readout_does_not_gain_whitelist_keys() {
+    let api = api().await;
+
+    let (_, body) = get(&api, "/offload").await;
+    assert!(
+        body.get("whitelist").is_none(),
+        "主读数不该冒白名单键：{body}"
+    );
 }
 
 /// 两个班次各说各的：消息与页头合计都按班次读，互不污染（决策 204②⑤）。

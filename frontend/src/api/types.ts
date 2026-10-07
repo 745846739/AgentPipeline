@@ -1365,6 +1365,19 @@ export interface OffloadProbe {
   workflow_present: boolean;
 }
 
+/**
+ * `GET/PUT /offload/whitelist` 的读数（决策 398）：外发白名单模式——
+ * `run_command` 里命中正则的命令自动改道外发链路；`offload_run`（skill 模式）原样保留。
+ */
+export interface OffloadWhitelist {
+  /** 模式开关；外发主开关关着时不生效（白名单是外发的一层，不是独立通道）。 */
+  enabled: boolean;
+  /** 正则原文；`null` = 从没填过。保存侧已验过可编译。 */
+  pattern: string | null;
+  /** 这一份是谁定的：`default` = 从没碰过；`settings` = 界面保存过。 */
+  origin: 'default' | 'settings';
+}
+
 /** `GET/PUT /offload` 的读数：重活外发 GitHub 的全局开关。 */
 export interface OffloadSettings {
   /** 全局开关：关 = 全部本机运行（逐字等于这个功能出现之前）。 */

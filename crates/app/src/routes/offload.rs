@@ -1,9 +1,11 @@
-//! 重活外发 GitHub 的开关（票 runner-offload/05）。
+//! 重活外发 GitHub 的开关（票 runner-offload/05）+ 白名单模式（决策 398）。
 //!
 //! | 方法 | 路径 | 说明 |
 //! |---|---|---|
 //! | GET | `/offload` | 存的状态 + **活体探测**（gh 登录态 / 外发工作流在场性）+ 最近一次链路失败读数 |
 //! | PUT | `/offload` | 保存开关（`{enabled}`），回同样的读数（含一次新探测） |
+//! | GET | `/offload/whitelist` | 白名单模式的读数（开关 + 正则原文 + 来路） |
+//! | PUT | `/offload/whitelist` | 保存白名单模式（`{enabled, pattern?}`），正则在保存时 fail fast |
 //!
 //! 与 `/rtk` 同族（决策 297）：**每次读都真探测一次**，不缓存上次结果；
 //! **探测失败不拦保存**——「先开开关、后在 106 登录 gh」是共识里写明的顺序，
@@ -12,6 +14,8 @@
 //! 读数外壳（`enabled` / `origin` / `probe` / `last_failure_at`）由模块内私有的
 //! `readout` 帮手两端点共用，GET 与 PUT 的读数同形因此是**结构保证**而不是纪律。
 //! `probe` 的活体探测语义（10s 超时、失败不拦保存）仍在 `probe` 里，本帮手只是按次序调用它。
+//! 白名单模式是独立的一对端点：主开关的读数形状（票 runner-offload/09 钉过键集）不动，
+//! 新旋钮不往旧壳里塞键。
 
 use axum::extract::State;
 use axum::Json;
@@ -139,4 +143,78 @@ pub async fn set_enabled(
         .map_err(map_core_error)?;
     let readout = readout(&state, body.enabled, "settings").await?;
     Ok(Json(readout))
+}
+
+// ── 白名单模式（决策 398）：run_command 命中正则自动改道外发 ───────────────────
+
+/// 白名单读数：`enabled` / `pattern` / `origin` 三格，GET 与 PUT 共用（同形是结构保证）。
+/// `origin` 是诚实口径（决策 257）：保存过 = settings，从没碰过 = default。
+async fn whitelist_readout(
+    state: &AppState,
+    enabled: bool,
+    pattern: Option<String>,
+) -> Json<serde_json::Value> {
+    let overridden = state
+        .store
+        .offload_switch_has_override()
+        .await
+        .unwrap_or(false);
+    Json(json!({
+        "enabled": enabled,
+        "pattern": pattern,
+        "origin": if overridden { "settings" } else { "default" },
+    }))
+}
+
+/// `GET /offload/whitelist`：白名单模式的读数。
+pub async fn whitelist_settings(
+    State(state): State<AppState>,
+) -> ApiResult<Json<serde_json::Value>> {
+    let stored = state.store.offload_switch().await.map_err(map_core_error)?;
+    Ok(whitelist_readout(&state, stored.whitelist_enabled, stored.whitelist_pattern).await)
+}
+
+#[derive(Debug, Deserialize)]
+pub struct OffloadWhitelistBody {
+    pub enabled: bool,
+    /// 正则原文。`None` = 不动已存的；空串 = 清掉。开模式下必须有非空正则
+    /// （新给的或已存的），否则 400——开着却空转是假的可用。
+    #[serde(default)]
+    pub pattern: Option<String>,
+}
+
+/// `PUT /offload/whitelist`：保存白名单模式。
+///
+/// 校验在**保存时** fail fast（与 `[market] github_repos` 同姿态）：正则给得出来
+/// 就必须编得过，坏正则不让落库；执行层读到编不出的正则按「不合资格」停摆并留
+/// WARN——两层各拦一道，落库的永远是自己声明合法的。
+pub async fn set_whitelist(
+    State(state): State<AppState>,
+    Json(body): Json<OffloadWhitelistBody>,
+) -> ApiResult<Json<serde_json::Value>> {
+    let stored = state.store.offload_switch().await.map_err(map_core_error)?;
+    let pattern = match body.pattern.as_deref() {
+        None => stored.whitelist_pattern,
+        Some(raw) if raw.trim().is_empty() => None,
+        Some(raw) => {
+            let trimmed = raw.trim();
+            if let Some(msg) =
+                agentpipeline_core::agent::tools::offload_whitelist_pattern_error(trimmed)
+            {
+                return Err(map_core_error(agentpipeline_core::Error::Validation(msg)));
+            }
+            Some(trimmed.to_string())
+        }
+    };
+    if body.enabled && pattern.as_deref().map(str::is_empty).unwrap_or(true) {
+        return Err(map_core_error(agentpipeline_core::Error::Validation(
+            "开启白名单模式要先给正则：空正则不命中任何命令".into(),
+        )));
+    }
+    state
+        .store
+        .set_offload_whitelist(body.enabled, pattern.as_deref())
+        .await
+        .map_err(map_core_error)?;
+    Ok(whitelist_readout(&state, body.enabled, pattern).await)
 }

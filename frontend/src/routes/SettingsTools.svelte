@@ -1,7 +1,14 @@
 <script lang="ts">
   import { onMount } from 'svelte';
-  import { getOffload, getRtk, setOffload, setRtk } from '../api/client';
-  import type { OffloadSettings, RtkSettings } from '../api/types';
+  import {
+    getOffload,
+    getOffloadWhitelist,
+    getRtk,
+    setOffload,
+    setOffloadWhitelist,
+    setRtk,
+  } from '../api/client';
+  import type { OffloadSettings, OffloadWhitelist, RtkSettings } from '../api/types';
   import {
     manualPathVisible,
     normalizeManualPath,
@@ -37,6 +44,15 @@
   let offloadBusy = $state(false);
   let offloadNote = $state<{ kind: 'ok' | 'bad'; message: string } | null>(null);
 
+  /**
+   * 外发白名单模式（决策 398）：正则草稿单独一份（保存时原样交出去——
+   * 清空草稿再保存 = 清掉已存的正则，不是「不动」）。
+   */
+  let whitelist = $state<OffloadWhitelist | null>(null);
+  let whitelistBusy = $state(false);
+  let whitelistNote = $state<{ kind: 'ok' | 'bad'; message: string } | null>(null);
+  let whitelistPatternDraft = $state('');
+
   async function load() {
     loading = true;
     error = null;
@@ -44,6 +60,8 @@
       settings = await getRtk();
       manualDraft = settings.path ?? '';
       offload = await getOffload();
+      whitelist = await getOffloadWhitelist();
+      whitelistPatternDraft = whitelist.pattern ?? '';
     } catch (err) {
       error = (err as Error).message;
     } finally {
@@ -71,6 +89,30 @@
       offloadNote = { kind: 'bad', message: (err as Error).message };
     } finally {
       offloadBusy = false;
+    }
+  }
+
+  /**
+   * 保存白名单模式（决策 398）：正则草稿原样交出去，保存侧 fail fast——
+   * 编不过的正则后端 400，错误原样摆出来不静默。成功后以**重读到的读数**为准。
+   */
+  async function saveWhitelist(enabled: boolean) {
+    whitelistBusy = true;
+    whitelistNote = null;
+    try {
+      const saved = await setOffloadWhitelist({ enabled, pattern: whitelistPatternDraft.trim() });
+      whitelist = saved;
+      whitelistPatternDraft = saved.pattern ?? '';
+      whitelistNote = {
+        kind: 'ok',
+        message: saved.enabled
+          ? '已开启：run_command 命中正则的命令将自动外发（外发主开关关着时不生效）。'
+          : '已关闭：外发只认 agent 显式点 offload_run。',
+      };
+    } catch (err) {
+      whitelistNote = { kind: 'bad', message: (err as Error).message };
+    } finally {
+      whitelistBusy = false;
     }
   }
 
@@ -247,6 +289,69 @@
         {/if}
       {:else}
         <div class="banner">正在加载外发设置…</div>
+      {/if}
+    </section>
+
+    <section class="block" aria-labelledby="whitelist-head">
+      <h2 class="sec-title" id="whitelist-head">外发白名单模式</h2>
+      {#if whitelist}
+        <div class="row">
+          <span class="st" class:run={whitelist.enabled} class:dim={!whitelist.enabled}>
+            {whitelist.enabled ? '开启：命中正则自动外发' : '关闭：只认显式点外发'}
+          </span>
+          <span class="sec-note inline">
+            {#if whitelist.enabled}
+              run_command 里命中正则的命令自动走外发链路；前置不满足或链路失败照旧回本机，回执里写明。
+            {:else}
+              外发只认 agent 显式调 offload_run（skill 模式）。
+            {/if}
+          </span>
+          {#if whitelist.enabled}
+            <button type="button" class="btn" disabled={whitelistBusy} onclick={() => void saveWhitelist(false)}>
+              {#if whitelistBusy}<span class="spin"></span>{/if}关闭白名单
+            </button>
+          {:else}
+            <button type="button" class="btn solid" disabled={whitelistBusy} onclick={() => void saveWhitelist(true)}>
+              {#if whitelistBusy}<span class="spin"></span>{/if}开启白名单
+            </button>
+          {/if}
+        </div>
+        <label class="field" for="offload-whitelist-pattern">
+          <span class="field-label">外发白名单正则</span>
+          <input
+            id="offload-whitelist-pattern"
+            class="mono"
+            type="text"
+            bind:value={whitelistPatternDraft}
+            placeholder="^cargo (test|clippy)"
+            spellcheck="false"
+            autocomplete="off"
+          />
+        </label>
+        <div class="row">
+          <button
+            type="button"
+            class="btn solid"
+            disabled={whitelistBusy}
+            onclick={() => whitelist && void saveWhitelist(whitelist.enabled)}
+          >
+            {#if whitelistBusy}<span class="spin"></span>{/if}保存白名单
+          </button>
+        </div>
+        <p class="sec-note">
+          正则在保存时校验，编不过的不落库。命中只是「想上远端」：组合符、脏工作区这些
+          前置照旧拦，拦下走本机并在回执里写明。白名单模式在
+          <b>外发主开关关着时不生效</b>。
+        </p>
+        {#if whitelistNote}
+          {#if whitelistNote.kind === 'ok'}
+            <div class="banner ok" role="status">{whitelistNote.message}</div>
+          {:else}
+            <div class="banner error" role="alert">{whitelistNote.message}</div>
+          {/if}
+        {/if}
+      {:else}
+        <div class="banner">正在加载白名单设置…</div>
       {/if}
     </section>
 

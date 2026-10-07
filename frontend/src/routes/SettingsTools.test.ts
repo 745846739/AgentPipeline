@@ -1,6 +1,6 @@
 import { fireEvent, render, screen, waitFor } from '@testing-library/svelte';
 import { afterEach, describe, expect, it, vi } from 'vitest';
-import type { OffloadSettings, RtkSettings } from '../api/types';
+import type { OffloadSettings, OffloadWhitelist, RtkSettings } from '../api/types';
 import SettingsTools from './SettingsTools.svelte';
 
 /**
@@ -16,6 +16,8 @@ const mocks = vi.hoisted(() => ({
   setRtk: vi.fn(),
   getOffload: vi.fn(),
   setOffload: vi.fn(),
+  getOffloadWhitelist: vi.fn(),
+  setOffloadWhitelist: vi.fn(),
 }));
 
 vi.mock('../api/client', () => ({
@@ -23,6 +25,8 @@ vi.mock('../api/client', () => ({
   setRtk: mocks.setRtk,
   getOffload: mocks.getOffload,
   setOffload: mocks.setOffload,
+  getOffloadWhitelist: mocks.getOffloadWhitelist,
+  setOffloadWhitelist: mocks.setOffloadWhitelist,
 }));
 
 /** 外发开关的缺省读数（票 runner-offload/05）：同一页的第二颗钮。 */
@@ -40,8 +44,23 @@ const OFFLOAD_ON_OK: OffloadSettings = {
   last_failure_at: null,
 };
 
+/** 外发白名单模式（决策 398）的读数：缺省关、无正则。 */
+const WHITELIST_OFF: OffloadWhitelist = {
+  enabled: false,
+  pattern: null,
+  origin: 'default',
+};
+
+const WHITELIST_ON: OffloadWhitelist = {
+  enabled: true,
+  pattern: '^cargo (test|clippy)',
+  origin: 'settings',
+};
+
 mocks.getOffload.mockResolvedValue(OFFLOAD_OFF);
 mocks.setOffload.mockResolvedValue(OFFLOAD_ON_OK);
+mocks.getOffloadWhitelist.mockResolvedValue(WHITELIST_OFF);
+mocks.setOffloadWhitelist.mockResolvedValue(WHITELIST_ON);
 
 const OFF: RtkSettings = {
   enabled: false,
@@ -85,6 +104,10 @@ const ON_UNAVAILABLE: RtkSettings = {
 afterEach(() => {
   vi.resetAllMocks();
   document.body.innerHTML = '';
+  // 只重挂白名单读数（决策 398 的新钮没有与旧断言撞名的字）。**不**重挂
+  // getOffload——外发卡的「打开」钮会跟着读数一起回来，把 rtk 用例里
+  // 「页上只剩一颗打开钮」的既定无歧义打破。
+  mocks.getOffloadWhitelist.mockResolvedValue(WHITELIST_OFF);
 });
 
 async function rendered(settings: RtkSettings) {
@@ -217,6 +240,52 @@ describe('命令执行页（决策 297 / 票 05）', () => {
     render(SettingsTools);
     await screen.findByText('开启：重活外发');
     expect(screen.getByText('无')).toBeTruthy();
+  });
+
+  it('白名单卡(决策 398)缺省渲染:关、正则框空,说明「只认显式点外发」', async () => {
+    await rendered(OFF);
+    expect(screen.getByText('关闭：只认显式点外发')).toBeTruthy();
+    expect(screen.getByText(/skill 模式/)).toBeTruthy();
+    const input = screen.getByLabelText('外发白名单正则') as HTMLInputElement;
+    expect(input.value).toBe('');
+    expect(screen.queryByRole('button', { name: '关闭白名单' })).toBeNull();
+  });
+
+  it('白名单卡:开启态带出已存正则,状态与按钮跟着换', async () => {
+    mocks.getOffloadWhitelist.mockResolvedValue(WHITELIST_ON);
+    await rendered(OFF);
+    expect(screen.getByText('开启：命中正则自动外发')).toBeTruthy();
+    const input = screen.getByLabelText('外发白名单正则') as HTMLInputElement;
+    expect(input.value).toBe('^cargo (test|clippy)');
+    expect(screen.queryByRole('button', { name: '开启白名单' })).toBeNull();
+  });
+
+  it('白名单卡:开启保存把草稿原样交出去,成功后以重读到的读数为准', async () => {
+    await rendered(OFF);
+    mocks.setOffloadWhitelist.mockResolvedValue(WHITELIST_ON);
+    const input = screen.getByLabelText('外发白名单正则') as HTMLInputElement;
+    await fireEvent.input(input, { target: { value: '^cargo test' } });
+    await fireEvent.click(screen.getByRole('button', { name: '开启白名单' }));
+    await waitFor(() =>
+      expect(mocks.setOffloadWhitelist).toHaveBeenCalledWith({
+        enabled: true,
+        pattern: '^cargo test',
+      }),
+    );
+    const note = await screen.findByRole('status');
+    expect(note.textContent).toContain('已开启');
+  });
+
+  it('白名单卡:编不过的正则后端 400,错误原样摆出来不静默', async () => {
+    await rendered(OFF);
+    const input = screen.getByLabelText('外发白名单正则') as HTMLInputElement;
+    await fireEvent.input(input, { target: { value: '(unclosed' } });
+    mocks.setOffloadWhitelist.mockRejectedValue(
+      new Error('白名单正则编译失败：missing )'),
+    );
+    await fireEvent.click(screen.getByRole('button', { name: '开启白名单' }));
+    const alert = await screen.findByRole('alert');
+    expect(alert.textContent).toContain('编译失败');
   });
 
 });
