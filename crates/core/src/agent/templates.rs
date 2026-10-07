@@ -88,6 +88,8 @@ const ARCH_EX_SYSTEM: &str = r#"你是架构设计 agent。根据用户需求生
 2. 调用 write_file 将文档写入 design.md
 3. 调用 submit_metadata 返回元数据
 
+写入面已被文件策略收紧为 design.md（决策 395）；越界写入会被拒绝并回灌。
+
 ## 设计文档格式（design.md）
 # {task_title}
 ## 需求概述
@@ -143,6 +145,8 @@ const DEV_DESIGN_EX_SYSTEM: &str = r#"你是开发方案 agent。根据设计文
 3. 调用 write_file 将方案写入 dev-plan.md
 4. 调用 submit_metadata 返回元数据
 
+写入面已被文件策略收紧为 dev-plan.md（决策 395）；越界写入会被拒绝并回灌。
+
 ## 开发方案格式（dev-plan.md）
 # 开发方案
 ## 设计概要
@@ -188,6 +192,7 @@ const TEST_DESIGN_EX_SYSTEM: &str = r#"你是业务测试用例设计 agent。�
 ## 你只负责设计，不写代码。
 产出是测试场景文档（test-scenarios.md），描述测什么、怎么测、预期结果。
 集成测试代码由后续的 test 阶段编写。
+本阶段的写入面已被文件策略收紧为 test-scenarios.md（决策 395）；越界写入会被拒绝并回灌。
 
 ## 输出步骤
 1. 读取 design.md（通过 read_file）
@@ -244,6 +249,7 @@ const DEV_EX_SYSTEM: &str = r#"你是开发 agent。根据开发方案编写业�
 
 ## 要求
 - 文件写入采用"先清后写"策略
+- 写入面已被文件策略收紧为 worktree（决策 395）：任务目录（设计文档所在处）不接受本阶段的写入，越界会被拒绝并回灌
 - 单元测试覆盖方案中列出的关键路径
 - 若 dev-plan.md 不存在（用户跳过了开发方案阶段，决策 115），直接基于 design.md 完成开发
 - 收口前自查并把读数写进正文：`git rev-list --count <基准分支>..HEAD` 必须 > 0、`git status --porcelain` 必须干净（有意不提交的文件逐条说明）
@@ -264,6 +270,8 @@ const REVIEW_EX_SYSTEM: &str = r#"你是代码评审 agent。评审变更代码�
 3. 执行代码评审：逐条对照设计文档的需求概述与验收标准检查实现符合性；逐个检查单元测试断言是否真实覆盖行为（防"自写自测"的弱测试，决策 133）
 4. 调用 write_file 将评审报告写入 review-report.md
 5. 调用 submit_metadata 返回元数据
+
+写入面已被文件策略收紧为 review-report.md（决策 395）：review 只读代码、只写报告，越界写入会被拒绝并回灌。
 
 ## 输出契约（决策 391）
 - 每一轮的最终动作必须是调用 submit_metadata；在正文里声称已评审不等于已调用工具
@@ -298,6 +306,8 @@ const TEST_EX_SYSTEM: &str = r#"你是测试 agent。根据测试场景文档编
 
 ## 输出契约（决策 391）
 - 每一轮的最终动作必须是调用 submit_metadata；在正文里声称已交报告/元数据不等于已调用工具
+
+写入面已被文件策略收紧（决策 395）：集成测试代码写 worktree、测试报告写任务目录的 test-report.md，其余任务目录路径会被拒绝并回灌。
 
 ## 集成测试要求
 - 每个测试场景对应至少一个测试用例

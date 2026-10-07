@@ -766,10 +766,20 @@ impl ModelInvoke {
             .unwrap_or_else(|| home.worktree_path(&task.id).display().to_string());
         let task_dir = home.task_dir(&task.id).display().to_string();
 
-        let policy = crate::agent::file_policy::pipeline_file_policy(
+        let mut policy = crate::agent::file_policy::pipeline_file_policy(
             Path::new(&worktree),
             Path::new(&task_dir),
             self.settings.file_access_unrestricted,
+        );
+        // 阶段写入面白名单（决策 395）：任务目录写入白名单到本节点的 ProductTarget，
+        // worktree 仅 develop / test 放开。**不随 `file_access_unrestricted` 放开**——
+        // 那个开关管的是操作范围（决策 283），这里管的是阶段内容边界（review 不因
+        // 部署侧放宽而获得改代码的授权）。
+        policy.allow_writes = super::continuation_brief::stage_write_scope(
+            Path::new(&worktree),
+            Path::new(&task_dir),
+            cursor.stage,
+            cursor.node,
         );
         // 阶段配置消费（§10.6.3 / 决策 22 / 46 / 111）：persona、采样参数、工具与技能增量。
         // **在构造执行器之前读**：环境层档位要喂给执行点那道闸（决策 206），而它来自

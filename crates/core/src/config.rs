@@ -61,6 +61,14 @@ pub struct Settings {
     /// 是两件事；② 命令那条路本来就不受文件策略管（决策 104 / 19 修订），所以打开它
     /// 只是让**文件工具**与命令落在同一个域上，并不改变「本仓无 OS 级沙箱」这个事实。
     pub file_access_unrestricted: bool,
+    /// develop 申报比对的**噪音过滤**（决策 397）：diff 里存在、申报里没有、但文件名
+    /// 命中这些模式的条目**不算漏报**（不拦 develop、只落 facts 留痕）。
+    ///
+    /// 为什么默认就该有：lockfile 与格式化副产物几乎每个任务都会漂移，无过滤的单向
+    /// 比对会立刻被假红打脸（106 实证：假红空转的代价是跨阶段两小时）。模式按
+    /// [`crate::agent::file_policy::matches_pattern`] 的轻量 glob 语义匹配——
+    /// 不含 `/` 的模式按文件名匹配。
+    pub declare_ignore_globs: Vec<String>,
     /// 环境层权限档位的**全局默认**（决策 206）。
     ///
     /// 缺省 `auto` = **等于现状**：环境层工具（文件 / 命令 / 技能拉取 / 子代理）直接执行，
@@ -104,6 +112,19 @@ pub struct Settings {
     pub project_run_idle_timeout_sec: u64,
 }
 
+/// `declare_ignore_globs` 的缺省清单（决策 397）：lockfile 家族 + 格式化副产物。
+/// 取「几乎每个任务都会漂移、且永远不该由 develop 申报」的那一小撮——宁可清单短
+/// （漏进来的噪音由用户追加配置），不可默认放宽（配置成白名单的语义是「不拦」）。
+pub fn default_declare_ignore_globs() -> Vec<String> {
+    vec![
+        "*.lock".to_string(),
+        "package-lock.json".to_string(),
+        "pnpm-lock.yaml".to_string(),
+        "*.sum".to_string(),
+        ".DS_Store".to_string(),
+    ]
+}
+
 impl Default for Settings {
     fn default() -> Self {
         Settings {
@@ -133,6 +154,7 @@ impl Default for Settings {
             egress_allow_hosts: Vec::new(),
             egress_allow_all: false,
             file_access_unrestricted: false,
+            declare_ignore_globs: default_declare_ignore_globs(),
             env_mode: crate::types::EnvMode::Auto,
             watch_event_window_minutes: 30,
             watch_owner_stuck_minutes: 10,
@@ -174,6 +196,7 @@ pub struct PipelineOverrides {
     pub egress_allow_hosts: Option<Vec<String>>,
     pub egress_allow_all: Option<bool>,
     pub file_access_unrestricted: Option<bool>,
+    pub declare_ignore_globs: Option<Vec<String>>,
     /// 环境层档位（决策 206）。**用字符串接**：`deny_unknown_fields` +
     /// 枚举反序列化会把 `env_mode = "Auto"` 报成一句难读的 serde 错误，而这里要的是一句
     /// 「只能是 auto / ask / deny」——解析与校验在 [`PipelineOverrides::apply`] 里做。
@@ -222,6 +245,7 @@ impl PipelineOverrides {
             egress_allow_hosts,
             egress_allow_all,
             file_access_unrestricted,
+            declare_ignore_globs,
             watch_event_window_minutes,
             watch_owner_stuck_minutes,
             watch_debounce_sec,

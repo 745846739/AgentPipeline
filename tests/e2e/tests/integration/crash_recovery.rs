@@ -15,8 +15,8 @@ use super::common::Flow;
 use agentpipeline_core::storage::decisions::MergeDecision;
 use agentpipeline_core::types::{
     AcceptanceCriterion, ArchitectExecuteMetadata, CodeChanges, CursorStatus,
-    DevelopDesignMetadata, Node, ReviewResult, Stage, TaskStatus, TestDesignMetadata, TestResult,
-    TestScenario, ValidateInputMetadata, ValidateOutputMetadata,
+    DevelopDesignMetadata, FileAction, FileChangeSpec, Node, ReviewResult, Stage, TaskStatus,
+    TestDesignMetadata, TestResult, TestScenario, ValidateInputMetadata, ValidateOutputMetadata,
 };
 use testkit::script::NodeScript;
 use testkit::Script;
@@ -133,7 +133,18 @@ fn pipeline_script(task_id: &str, stall_at: &[(Stage, Node)]) -> Script {
         ))
         .submit(&CodeChanges {
             branch_name: format!("kanban/{task_id}"),
-            changed_files: vec![],
+                        changed_files: vec![
+                FileChangeSpec {
+                    path: "src/lib.rs".into(),
+                    action: FileAction::Create,
+                    content_hash: None,
+                },
+                FileChangeSpec {
+                    path: "tests/acceptance.rs".into(),
+                    action: FileAction::Create,
+                    content_hash: None,
+                },
+            ],
             unit_test_files: vec![],
             no_changes: false,
         });

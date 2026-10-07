@@ -33,7 +33,11 @@ async fn e2e_05_merge_rebase_conflict_kicks_back_develop_with_conflict_files() {
         )
         .submit(&agentpipeline_core::types::CodeChanges {
             branch_name: "kanban/t5".into(),
-            changed_files: vec![],
+            changed_files: vec![agentpipeline_core::types::FileChangeSpec {
+                path: "shared.txt".into(),
+                action: agentpipeline_core::types::FileAction::Modify,
+                content_hash: None,
+            }],
             unit_test_files: vec![],
             no_changes: false,
         });

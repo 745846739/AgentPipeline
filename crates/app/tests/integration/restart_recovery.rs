@@ -14,9 +14,9 @@ use std::time::{Duration, Instant};
 
 use agentpipeline_core::clock::SystemClock;
 use agentpipeline_core::types::{
-    AcceptanceCriterion, ArchitectExecuteMetadata, CodeChanges, DevelopDesignMetadata, Node,
-    Project, Provider, ReviewResult, Stage, TestDesignMetadata, TestResult, TestScenario,
-    ValidateInputMetadata, ValidateOutputMetadata,
+    AcceptanceCriterion, ArchitectExecuteMetadata, CodeChanges, DevelopDesignMetadata, FileAction,
+    FileChangeSpec, Node, Project, Provider, ReviewResult, Stage, TestDesignMetadata, TestResult,
+    TestScenario, ValidateInputMetadata, ValidateOutputMetadata,
 };
 use testkit::{MockLlm, Repo, Script, TestHome};
 use tokio::process::{Child, Command};
@@ -183,7 +183,11 @@ fn pipeline_script(script: &mut Script, task_id: &str) {
         ))
         .submit(&CodeChanges {
             branch_name: format!("kanban/{task_id}"),
-            changed_files: vec![],
+            changed_files: vec![FileChangeSpec {
+                path: "src/lib.rs".into(),
+                action: FileAction::Create,
+                content_hash: None,
+            }],
             unit_test_files: vec![],
             no_changes: false,
         });

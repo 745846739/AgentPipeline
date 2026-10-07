@@ -2759,3 +2759,186 @@ main 领先 `origin/main` 一个提交且该提交动了 `docs/decisions.md`，�
 `tests/e2e/tests/integration/ux_audit3_{landing,artifacts}.rs`、`docs/testing.md` §8、
 `Makefile`、`scripts/gate-suite-branch-independence.sh`、
 `.scratch/ux-audit-3/IMPLEMENTATION.md`、`.scratch/commit-contract/README.md`。
+
+### 决策 392 · 闸门环境预检 + 环境类失败归因 + pending 携带成因（编号在 391 批次预留，落地晚于 393 / 394）
+
+**问题（2026-10-06 任务 `01M47RQG4M9533F5TMF1AGJXC8`，106）**：merge 闸门的 `cargo test`
+以 `final link failed: bad value` + 数百条 `undefined reference to …llvm.<hash>` 收场。根因
+是**环境漂移**：systemd unit 没设 `PATH`，闸门解析到系统那套 rustc **1.92.0**，而共享构建
+缓存（`{home}/shared-target`）是 rustup **1.98.0** 编的。但「失败是什么」在系统里被压成了
+一个退出码——环境失败与用例失败同形（都是 101、同归 `GateFailureKind::Test`、同烧一个
+`validate_retry_max` 预算），**成因从头到尾没有任何字段承载**，于是既修不了也看不见：
+merge 打回 test 复检（test 侧只读 agent 自报、永远报绿）→ merge↔test 确定性空转，游标最后
+挂在 `retry_exhausted` 上，界面上只有一句写死的「重试耗尽，需要用户介入」。
+
+**决策**（四处各钉一块）：
+
+1. **部署侧钉工具链**（部署物，非仓内文件）：106 `agent-pipeline.service` 补
+   `Environment=PATH=/root/.cargo/bin:…` 与 `Environment=RUSTUP_TOOLCHAIN=1.98.0`，与
+   `Makefile` 的 `export PATH` / `export RUSTUP_TOOLCHAIN` 同源同优先级（决策 175：只前置
+   `PATH` 不够——rustup shim 按当前目录找 `rust-toolchain.toml`，编 registry 里自带该文件的
+   crate 时会当场切走；`RUSTUP_TOOLCHAIN` 优先于目录文件，是唯一真钉法）。读数记
+   `docs/operations.md` §12.18。
+2. **闸门环境预检**（`executor.rs::toolchain_preflight`，`run_code_gate` 起跑前）：读项目根
+   `rust-toolchain.toml` 的 `[toolchain].channel`，与**经同一环境路径**（`run_system_command`）
+   取到的 `rustc --version` 比对；不一致 → `GateFailureKind::Environment`、**不跑测试命令**，
+   读数（声明版本 / 实际版本 / `command -v cargo` / `CARGO_TARGET_DIR`）进失败输出。声明不是
+   可机械比对的版本号（`stable` / `nightly`）或读不到声明文件时**不判**（决策 209 姿态：
+   信息不足不猜）。
+3. **`GateFailureKind::Environment` 与改道**（`types.rs` 加变体，向后兼容：存量 DB 只有
+   Lint / Test；顺带把「变体 → 落库字符串」收成 `as_str` / `from_str_opt` 单点，消掉
+   scheduler 里那份手写映射）：`route_merge` ④ 把它并入「确定性失败直接打回 develop」那一支
+   （与 lint / 空分支同款）——**不进 test 复检**（用例侧造不出工具链）。**再次收窄决策 85 的
+   适用面**（继决策 391 之后），把决策 139「确定性失败不绕 test」的判据从空分支再扩到环境类。
+   `route_code_gate` 的 develop 分支本就 `Retry`（develop 没有 test 复检这一步），只对齐注释。
+4. **pending 携带成因**（可见性的根修）：`PendingContext` 加 `gate_failure_kind` /
+   `gate_failures` / `gate_log_path` 三个读数，`pending_context_for` 的 `RetryExhausted` 分支
+   按阶段现取（merge 读 `merge_result` 行；develop / test 读闸门落盘的小 JSON
+   `gate-failure-develop.json`），人读的那句话进 `context.diagnostic`——前端**无需改动**
+   （`PendingDossier` 已有 `context.diagnostic` 渲染路径）。摘要超界**显式标注**截断量
+   （与 `truncate_gate_log` 同纪律）。**不设 `context.kind`**：门失败类动作集按
+   `(PendingKind, _)` 匹配，凭空加键只会让决策 205 的续接判定表多一个认不出的值。
+5. **计数语义**：环境类失败**不烧** `gate_failures`（那个计数是「代码改不动」的信号，
+   环境问题冒充它会把信号污染掉；同决策 391 对空分支申报的处置）。
+
+**与既有决策的关系**：显式修订决策 85（适用范围再收窄一次，至此只有**真正的用例争议**才走
+test 复检）；扩展决策 139 到环境类；决策 108 的单调保留不动（环境类不进那条路径）；决策 175
+的钉法在部署侧照用；`runner-offload` 的共享构建缓存（票 03）正是本次链接失败的放大器（缓存由
+另一套 rustc 编），本决策在闸门侧加了预检这一道。
+
+**明确不做**：① 不给 `MergeResult` 加「环境失败次数」列——票面形状 5 的「报出分类构成」暂由
+pending 载体的 `gate_failure_kind`（最近一次分类）承载；② 不在核心代码里改 message 格式或
+「怎么起服务」（那是部署物）；③ 不动 `test_command_for` 的映射；④ 不给常驻用例留本门的例外口子。
+
+**验证**：单测 `toolchain_preflight_readings_parse`（三段读数解析：带引号 / 注释 / `stable` /
+带后缀版本）、`gate_failure_summary_truncates_loudly`（截断显式标注）、
+`route_merge_gate_fail_environment_kicks_back_develop_not_test`（**不进 test**）、
+`gate_failure_kind_round_trips_through_as_str`；e2e
+`e2e_gate_environment_mismatch_is_classified_not_test`（工作树里声明对不上号 → 预检判
+Environment、成因落盘、回 develop 重试且无 test 复检）、
+`e2e_merge_gate_environment_does_not_burn_gate_failures`（develop 通过**之后**环境才漂移 →
+merge 判 Environment、`gate_failures` 仍为 0、Kickback 回 develop）；既有 merge 耗尽用例补
+pending 载体断言（分类 `test` / 计数 3 / 日志路径 / 摘要含失败原文）。
+**来源**：2026-10-06 106 现场（见 `.scratch/gate-failure-attribution/README.md` 读数表）；
+落地 `crates/core/src/{types.rs, scheduler/mod.rs, pipeline/{executor.rs, routes.rs, merge.rs}}`、
+`tests/e2e/tests/integration/gates.rs`、`docs/operations.md` §12.18。
+
+### 决策 395 · 阶段写入面白名单：任务目录写入白名单到 ProductTarget，worktree 仅 develop / test 放开
+
+**问题（106 三个 dogfood 任务的元教训，本票无单次现场）**：各阶段 agent「做什么」的边界
+只有 prompt 约定（决策 283：prompt 范围纪律管「阶段越权」），代码侧没有任何强制——所有
+agent 共享同一套全量工具（`client.rs` 的 BUILTIN 集合）与同一个 worktree+任务目录文件域
+（`pipeline_file_policy` 的两根），review 理论上可以改代码、develop 可以往任务目录乱写。
+历史 dogfood 里 develop 靠「模型自觉」越出字面契约自行提交（决策 391 的动机）——同一形状
+的另一个面是：**越界的写入也没有任何东西拦**，只有下游纯代码闸门事后兜底，而 review 阶段
+的产出（报告）与 test 的评审面根本不在下游闸门的覆盖范围内。
+
+**决策**（grilling 会话 Q5–Q8 落定，2026-10-07）：
+
+1. **`FileToolPolicy` 增正向白名单** `allow_writes: Vec<WriteAllow>`（`root` + `pattern`，
+   复用 `matches_pattern` 的轻量 glob 语义）：非空时**写操作**必须命中其中一条才放行，
+   空 = 不限制（值班长 / 子代理 / 旧形状全部向后兼容）。判定序保持「deny 优先」：拒绝名单 →
+   符号链接 → 允许根 → 白名单。**只管写**——读不受它约束（review 要读 worktree 的代码）。
+2. **统一规则**：任务目录的 agent 写入一律白名单到该节点 `ProductTarget`
+   （`continuation_brief.rs` 的权威表，`stage_write_scope` 直接调它取值，不另立第四处
+   文件名清单）；worktree 写入仅 develop 与 test 放开。校验类节点（validate_input /
+   validate_output）`ProductTarget::None` → 空白名单 = 拒一切写（模板本就无写入动作）。
+3. **不随 `file_access_unrestricted`（决策 283）放开**：那个开关管「这台机器上文件工具够得着
+   哪」（操作范围），白名单管「这个阶段的 agent 允许改动什么」（内容边界）——部署侧放宽
+   操作范围，不等于 review 获得了改代码的授权。
+4. **模板交叉引用**：六个 execute 模板各补一句白名单告知（照 test-design VO 模板
+   「引用悬空会被 sync-check 机械校验拦下」的既有写法）。
+
+**与既有决策的关系**：扩展决策 283（prompt 纪律 → 代码策略，方向与决策 391 把提交契约
+沉进闸门一致）；扩展决策 104（文件工具路径策略多一层阶段维度）；`write_root_for` 的
+既有落点映射不动，白名单判定在其解析**之后**（相对路径拼 A 根、绝对路径写 B 根的绕法
+一并堵住）。
+
+**明确不做**：① 不按阶段做 shell 命令白名单（那是决策 396 的双层禁用 + 决策 179 egress
+的既有域）；② 不收窄值班长与子代理（子代理工具集本就只读）；③ architect / develop-design
+的 `run_command` 依赖未核实，留观（见 396 的留观项）。
+
+**验证**：单测 `file_policy.rs` 5 条（单文件白名单 / worktree-only / deny 优先 /
+符号链接逃逸 / 向后兼容）+ `stage_write_scope_follows_the_product_target_table`
+（六阶段装配矩阵逐行）+ `tools.rs::stage_allowlist_confines_review_writes_to_the_report`
+（工具层行为：绝对路径绕 `write_root_for` 也拒）；e2e
+`stage_boundary.rs::e2e_review_out_of_scope_write_is_denied_and_flow_continues`
+（越界不落盘、报告照常落、任务照常推进）。**来源**：106 三个 dogfood 任务的元教训
+（`.scratch/stage-content-boundary/README.md` 事实基线）。
+
+### 决策 396 · review / test-design 阶段双层禁用 run_command
+
+**问题**：工具面按阶段收窄的最后一个洞是命令——`file_policy` 自认「`run_command` 的 shell
+不受文件策略管」（决策 104 / 19），而 review 与 test-design 的模板全链路**零依赖**
+`run_command`（探查核实：review 只授 read_file / write_file / submit_metadata 三个动作，
+变更清单来自 develop 元数据申报而非自己跑 git diff；test-design 三个节点零出现）。工具
+定义层不给就能堵住的口子，留着就是决策 283 那句「prompt 范围纪律」在管——而 106 的教训
+是「靠模型自觉」会被实证打破。
+
+**决策**（双层，Q8=C）：
+
+1. **def 层**（`model_request::tool_defs`）：`Stage::Review` / `Stage::TestDesign` 的
+   agent 请求不含 `run_command` 的定义——去诱惑，让「模板三个动作」的叙事与 agent 实际
+   可见的工具一致，避免反复试错浪费 attempts。
+2. **执行层**（`tools::run_command`，所有 agent 命令的唯一执行点）：这两阶段硬发
+   `run_command` → `Error::PolicyDenied`，**拒绝也落台账**（照决策 179 egress denied 的
+   形状：`record_command_start` + 专用退出码 `STAGE_TOOL_DENIED_EXIT_CODE`，与 egress
+   的 1 区分），报错文本带本阶段工具面清单供回灌自纠。闸门 / 系统命令走
+   `run_system_command`，不经此路，不受影响。
+
+**与既有决策的关系**：扩展决策 206 的档位体系（档位管环境层的「怎么放行」，本决策管
+「哪个阶段根本没有这一层」）；与决策 353 的目录表、决策 154 的准入判据同域不冲突
+（过滤发生在已知集检查之后）。**留观**：architect / develop-design 的模板 run_command
+依赖未核实；若确认零依赖，禁用与否另走决策（机制已就绪，纯配置）。
+
+**验证**：`model_request.rs::run_command_is_not_advertised_for_review_and_test_design`
+（def 层三节点不广告 + submit_metadata 仍在 + develop 照旧）、
+`tools.rs::run_command_is_stage_denied_for_review_and_test_design`（执行层拒绝 + 台账 +
+退出码区分）、`run_command_still_runs_for_develop`（决策 391 的提交契约不受影响）；e2e
+`stage_boundary.rs::e2e_review_run_command_is_stage_denied_without_side_effects`
+（硬发命令无副作用文件、节点照常收口）。**来源**：同决策 395。
+
+### 决策 397 · develop 申报单向比对：changed_files 申报 vs worktree 实际 diff
+
+**问题**：review 的变更视图**完全信任 develop 申报**——`{changed_files}` 模板变量取自
+develop 元数据（`model_request.rs` 的 `code_changes_lists`），不是 git 实况。develop 漏报
+文件，review 就逐字漏审（「逐文件评审」面缺角），且漏报没有任何东西拦——106 案例 A 里
+「全绿穿越四阶段」的空放行之所以两年才被发现一次，正是因为各阶段看的是**申报**不是实况。
+
+**决策**（grilling Q9–Q11 落定；`develop_code_gate` 第四项检查）：
+
+1. **比对口径**：diff 面（merge-base…分支的 committed 差异 + worktree 的**已跟踪**未提交
+   改动）里存在、申报面（`changed_files ∪ unit_test_files`）里没有、且不命中噪音过滤的
+   文件 = 漏报。**单向**——申报面多报的条目容忍（多报无害，双向严格会被「申报了但最终
+   没改」的正常漂移打脸）。dirty 面**排除 untracked**：untracked 不进任务分支 diff、
+   不进 review 评审面与 merge 合并面，算漏报只会制造无法通过补申报消除的假红。
+2. **噪音过滤**：`Settings.declare_ignore_globs`（缺省 lockfile 家族 + `.DS_Store`，
+   `matches_pattern` 语义），命中的未申报文件不拦、**落 facts 留痕**——lockfile 漂移几乎
+   每个任务都有，无过滤的单向比对会立刻假红（106 实证：假红空转的代价是跨阶段两小时）。
+3. **失败路由**：走既有 Retry 回灌（`MetadataView::passed(false)`），**不新增
+   `GateFailureKind`、不加路由分支**——比对失败时 develop 自己有能力当轮修复（补一行
+   申报），与零提交不同（零提交 391 之所以新增类型，是因为它穿越四阶段才被发现，需要
+   改道）。attempts 耗尽自然落既有 `pending(retry_exhausted)` 收口。
+4. **fail-closed**：申报元数据缺失 / 不可解析 → 全部视为漏报（对齐决策 370 的
+   `metadata_gaps` 语义）；git / 库读数不可用 → 按决策 209 姿态降级放行（不冒充任何一端）。
+5. **事实段**：漏报清单 + 补申报指令落 `undeclared-changes-facts.md`，develop.execute
+   重入时读回注入（决策 126 / 391 的「先落文件、再由重入渲染」同款）；放行 / 补申报通过 /
+   降级 / 申报零变更时清除。
+
+**与既有决策的关系**：扩展决策 391 的 develop 闸门判据（形状同零提交守卫）；**不触**
+决策 85 的失败分类与路由；决策 133 的 review 输入扩展（按申报清单评审）由本决策补上
+「申报 ≈ 实况」的机械前提。
+
+**明确不做**：① 双向严格相等（Q11 已裁）；② 语义比对（申报内容与 diff 内容是否相符是
+review 的活，对齐决策 370 对纯代码节点的划界）；③ `no_changes=true` 的语义不动
+（零提交守卫先于本检查短路）。
+
+**验证**：单测 `declared_paths_are_normalized_before_comparison` /
+`undeclared_changes_is_one_sided_with_noise_filter` / `undeclared_facts_list_the_files_and_both_remedies`；
+e2e `stage_boundary.rs::e2e_undeclared_changes_kick_back_at_develop_without_crossing_review`
+（漏报当轮打回、事实段落盘、不穿越 review / test）+
+`e2e_lockfile_drift_without_declaration_does_not_trip_the_gate`（噪音不假红）。
+**来源**：2026-10-07 grilling 会话（`.scratch/stage-content-boundary/README.md`）；
+落地 `crates/core/src/{agent/{file_policy.rs, tools.rs, templates.rs, prompts.rs},
+pipeline/{executor.rs, model_invoke.rs, model_request.rs, continuation_brief.rs}, git.rs,
+config.rs}`、`tests/e2e/tests/integration/stage_boundary.rs`、`docs/testing.md` §5。

@@ -63,6 +63,111 @@ pub(crate) struct GateOutcome {
 /// 放行 / 申报零变更时清除——「先落文件、再由重入渲染」的决策 126 形状。
 pub(crate) const ZERO_COMMIT_FACTS_FILE: &str = "zero-commit-facts.md";
 
+/// 申报比对事实段文件（决策 397）：develop_code_gate 的申报比对判定有漏报时落盘、
+/// develop.execute 重入时读回注入——与 [`ZERO_COMMIT_FACTS_FILE`] 同一形状。
+pub(crate) const UNDECLARED_CHANGES_FACTS_FILE: &str = "undeclared-changes-facts.md";
+
+/// 申报路径归一化（决策 397）：剥 `./` 前缀、统一分隔符、去首尾空白——
+/// 申报面与 diff 面的书写差异不参与判定（`./src/lib.rs` 与 `src/lib.rs` 是同一个）。
+fn normalize_declared_path(raw: &str) -> String {
+    raw.trim().trim_start_matches("./").replace('\\', "/")
+}
+
+/// 申报单向比对（决策 397 · grilling Q11）：diff 面里有、申报面里没有、且不命中
+/// 噪音过滤的文件 = 漏报。**单向**——申报面多报的条目容忍（多报无害；双向严格
+/// 会被「申报了但最终没改」的正常漂移打脸）。
+///
+/// 噪音过滤按 [`crate::agent::file_policy::matches_pattern`] 的轻量 glob 语义
+/// （`settings.declare_ignore_globs`，缺省 lockfile 家族）：lockfile 漂移几乎每个
+/// 任务都有，无过滤的单向比对会立刻假红——106 实证假红空转的代价是跨阶段两小时。
+fn undeclared_changes(
+    actual: &[String],
+    declared: &[String],
+    ignore_globs: &[String],
+) -> Vec<String> {
+    let declared: std::collections::HashSet<String> = declared
+        .iter()
+        .map(|s| normalize_declared_path(s))
+        .collect();
+    actual
+        .iter()
+        .filter(|f| {
+            let f = normalize_declared_path(f);
+            !declared.contains(&f)
+                && !ignore_globs
+                    .iter()
+                    .any(|g| crate::agent::file_policy::matches_pattern(g, Path::new(&f)))
+        })
+        .cloned()
+        .collect()
+}
+
+/// 命中噪音过滤的未申报条目（决策 397 · 票 03 改动二）：**不拦但留痕**——它们不进
+/// 漏报清单（不拦 develop），但落进事实段的「已忽略」小节，审计面上「干净通过」与
+/// 「有噪音被滤」是两回事。
+fn ignored_noise(
+    actual: &[String],
+    declared: &std::collections::HashSet<String>,
+    ignore_globs: &[String],
+) -> Vec<String> {
+    actual
+        .iter()
+        .filter(|f| {
+            let f = normalize_declared_path(f);
+            !declared.contains(&f)
+                && ignore_globs
+                    .iter()
+                    .any(|g| crate::agent::file_policy::matches_pattern(g, Path::new(&f)))
+        })
+        .cloned()
+        .collect()
+}
+
+/// 申报比对事实段正文（决策 397）：事实读数 + 补申报指令，与 [`zero_commit_facts`]
+/// 同一形状。`headline` 是差异来源的交代（申报缺失 / 不可解析 / 正常漏报各自一句），
+/// `undeclared` 是漏报清单；`ignored` 是命中噪音过滤的未申报条目——**不拦但留痕**，
+/// 审计要能区分「干净漏报零」与「有噪音被滤」，否则过滤清单就是个静默丢弃的口袋。
+pub(crate) fn undeclared_changes_facts(
+    undeclared: &[String],
+    ignored: &[String],
+    headline: &str,
+) -> String {
+    let mut facts = format!("# 未申报变更事实（确定性检查，决策 397）\n\n{headline}");
+    facts.push_str(&format!(
+        "- diff 中存在但申报清单里没有的文件：**{}** 个\n",
+        undeclared.len()
+    ));
+    for f in undeclared {
+        facts.push_str(&format!("  - `{f}`\n"));
+    }
+    if !ignored.is_empty() {
+        facts.push_str(&format!(
+            "- 另有 {} 个未申报文件命中 declare_ignore_globs（不拦，留痕）：\n",
+            ignored.len()
+        ));
+        for f in ignored {
+            facts.push_str(&format!("  - `{f}`\n"));
+        }
+    }
+    facts.push_str(
+        "\n## 指令\n\
+         review 按你申报的 changed_files / unit_test_files 逐文件评审——漏报的文件就是 review 的盲区：\n\
+         1. 变更属于本任务：把该文件 git add + commit（先 cd 到系统注入的 worktree 绝对路径），\n\
+            再重交 submit_metadata，把漏掉的文件补进 changed_files / unit_test_files\n\
+         2. 变更属于误改 / 副产物：撤销这些变更后重交元数据\n\n\
+         禁止不补申报也不撤销就直接重交元数据。",
+    );
+    facts
+}
+
+/// [`Executor::declaration_check`] 的三态（决策 397）：读数不可用不冒充任何一端
+/// （决策 209 姿态，与 [`ZeroCommitCheck`] 同款）。
+enum DeclarationCheck {
+    Ok,
+    Undeclared { facts: String },
+    Unavailable,
+}
+
 /// [`Executor::zero_commit_check`] 的三态（决策 391）：读数不可用不冒充任何一端
 /// （决策 209 姿态——守卫读数失败既不冒充「有提交」，也不冒充「空分支」）。
 enum ZeroCommitCheck {
@@ -120,6 +225,90 @@ pub(crate) fn write_zero_commit_facts(
 /// 清掉零提交事实段（放行 / 申报零变更 / 守卫已恢复时调用）——不存在的文件不是错误。
 pub(crate) fn clear_zero_commit_facts(home: &crate::home::Home, task_id: &str) {
     let _ = std::fs::remove_file(home.task_file(task_id, ZERO_COMMIT_FACTS_FILE));
+}
+
+/// 落盘申报比对事实段（决策 397 的落点单点）：守卫判定有漏报时经它，重入段据此渲染。
+pub(crate) fn write_undeclared_changes_facts(
+    home: &crate::home::Home,
+    task_id: &str,
+    facts: &str,
+) -> Result<()> {
+    home.ensure_task_dirs(task_id)?;
+    std::fs::write(
+        home.task_file(task_id, UNDECLARED_CHANGES_FACTS_FILE),
+        facts,
+    )?;
+    Ok(())
+}
+
+/// 清掉申报比对事实段（放行 / 补申报通过 / 读数降级 / 申报零变更时调用）——
+/// 留着会在下一轮重入里注入**过期**的漏报清单。
+pub(crate) fn clear_undeclared_changes_facts(home: &crate::home::Home, task_id: &str) {
+    let _ = std::fs::remove_file(home.task_file(task_id, UNDECLARED_CHANGES_FACTS_FILE));
+}
+
+/// develop 闸门最近一次失败的**成因读数**（决策 392 ④）。
+///
+/// develop 没有 `merge_result` 那样的产出行可给 pending 侧读，故按「先落盘、后读」的
+/// 既有形状（决策 126 / 391 同款）落一个小 JSON；闸门通过 / 申报零变更时删除——留着
+/// 会在下一轮的 pending 载体里报**过期**成因。
+pub(crate) const GATE_FAILURE_FACTS_FILE: &str = "gate-failure-develop.json";
+
+pub(crate) fn write_gate_failure_facts(
+    home: &crate::home::Home,
+    task_id: &str,
+    kind: crate::types::GateFailureKind,
+) -> Result<()> {
+    home.ensure_task_dirs(task_id)?;
+    let value = serde_json::json!({
+        "kind": kind.as_str(),
+        "log": format!("gate-output-{}.log", Stage::Develop.as_str()),
+    });
+    std::fs::write(
+        home.task_file(task_id, GATE_FAILURE_FACTS_FILE),
+        value.to_string(),
+    )?;
+    Ok(())
+}
+
+pub(crate) fn clear_gate_failure_facts(home: &crate::home::Home, task_id: &str) {
+    let _ = std::fs::remove_file(home.task_file(task_id, GATE_FAILURE_FACTS_FILE));
+}
+
+/// 门失败类 pending 的诊断摘要上限（决策 392 ④）：超界**显式标注**截断量，不静默丢内容
+/// （与 `truncate_gate_log` 同一条纪律）。
+const GATE_FAILURE_SUMMARY_LIMIT: usize = 2000;
+
+fn truncate_for_context(text: &str, limit: usize) -> String {
+    let count = text.chars().count();
+    if count <= limit {
+        return text.to_string();
+    }
+    let head: String = text.chars().take(limit).collect();
+    format!(
+        "{head}\n…（其余 {} 字符已截断，全文见闸门日志）",
+        count - limit
+    )
+}
+
+/// 门失败类 pending 的成因摘要（决策 392 ④）：**读数**，不是建议。
+fn gate_failure_summary(kind: &str, stage: Stage, failures: u32, output: Option<&str>) -> String {
+    let label = match kind {
+        "lint" => "lint（确定性）",
+        "test" => "测试用例",
+        "empty_branch" => "空分支（分支相对基准零变化）",
+        "environment" => "环境（工具链 / 构建环境）",
+        other => other,
+    };
+    let mut s = format!(
+        "闸门在 `{}` 阶段累计失败 {failures} 次（最近分类：{label}）。",
+        stage.as_str()
+    );
+    if let Some(out) = output.map(str::trim).filter(|s| !s.is_empty()) {
+        s.push_str("\n\n");
+        s.push_str(&truncate_for_context(out, GATE_FAILURE_SUMMARY_LIMIT));
+    }
+    s
 }
 
 // ─────────────────────────────── 单执行者注册表（决策 36 / 226）───────────────────────────────
@@ -681,6 +870,12 @@ impl Executor {
         cursor: &NodeCursor,
         kind: PendingKind,
     ) -> Result<Option<PendingContext>> {
+        // 决策 392 ④：门失败类待办（重试耗尽）随 pending 带上**成因读数**。此前这里
+        // 只有 `reason_override` 一条成因通路，`route_merge` / `route_code_gate` 的耗尽
+        // 分支落到静态文案上——界面上只看到「重试耗尽，需要用户介入」，成因得 ssh 去挖。
+        if kind == PendingKind::RetryExhausted {
+            return self.retry_exhausted_context(task, cursor).await;
+        }
         if kind != PendingKind::UserDecision {
             return Ok(None);
         }
@@ -712,6 +907,80 @@ impl Executor {
             }
             _ => Ok(None),
         }
+    }
+
+    /// 重试耗尽的成因载体（决策 392 ④）。
+    ///
+    /// 两处来源：merge 读 `merge_result` 行（分类 + 计数 + 失败全文）；develop / test
+    /// 读 develop 闸门落盘的成因文件（`GATE_FAILURE_FACTS_FILE`，可能没有——那不是错，
+    /// 返回 `None` 落回静态文案）。**不设 `context.kind`**：耗尽类动作集按
+    /// `(PendingKind, _)` 匹配，加一个键只会让续接判定表多一个认不出的值。
+    async fn retry_exhausted_context(
+        &self,
+        task: &Task,
+        cursor: &NodeCursor,
+    ) -> Result<Option<PendingContext>> {
+        if cursor.stage == Stage::Merge {
+            let Some(merge) = self.store.merge_metadata(&task.id).await? else {
+                return Ok(None);
+            };
+            let kind = merge
+                .gate_failure_kind
+                .map(|k| k.as_str().to_string())
+                .unwrap_or_else(|| "unknown".into());
+            let log_path = self
+                .store
+                .home()
+                .task_file(
+                    &task.id,
+                    &format!("gate-output-{}.log", Stage::Merge.as_str()),
+                )
+                .display()
+                .to_string();
+            let summary = gate_failure_summary(
+                &kind,
+                cursor.stage,
+                merge.gate_failures,
+                merge.gate_failure_output.as_deref(),
+            );
+            return Ok(Some(PendingContext::with_gate_failure(
+                &kind,
+                merge.gate_failures,
+                log_path,
+                summary,
+            )));
+        }
+        let path = self
+            .store
+            .home()
+            .task_file(&task.id, GATE_FAILURE_FACTS_FILE);
+        let Ok(text) = std::fs::read_to_string(&path) else {
+            return Ok(None);
+        };
+        let Ok(value) = serde_json::from_str::<serde_json::Value>(&text) else {
+            return Ok(None);
+        };
+        let kind = value
+            .get("kind")
+            .and_then(|v| v.as_str())
+            .unwrap_or("unknown")
+            .to_string();
+        let log_rel = value
+            .get("log")
+            .and_then(|v| v.as_str())
+            .unwrap_or("gate-output-develop.log");
+        let log_path = self
+            .store
+            .home()
+            .task_file(&task.id, log_rel)
+            .display()
+            .to_string();
+        // develop / test 的耗尽计数在游标上（merge 的在 merge_result 行上，决策 108）
+        let failures = cursor.validate_attempts;
+        let summary = gate_failure_summary(&kind, cursor.stage, failures, None);
+        Ok(Some(PendingContext::with_gate_failure(
+            &kind, failures, log_path, summary,
+        )))
     }
 
     // ─────────────────────── 节点分发 ───────────────────────
@@ -910,6 +1179,8 @@ impl Executor {
         // 事实段文件——申报成立后它就是过期证据，留着会在后续重入里误注入。
         if declared_no_changes(&self.store, &task.id).await? {
             clear_zero_commit_facts(self.store.home(), &task.id);
+            clear_gate_failure_facts(self.store.home(), &task.id);
+            clear_undeclared_changes_facts(self.store.home(), &task.id);
             return Ok(NodeOutput::Route(crate::pipeline::MetadataView {
                 zero_changes: true,
                 ..Default::default()
@@ -919,24 +1190,56 @@ impl Executor {
         if gate.passed {
             match self.zero_commit_check(task, &project, &worktree).await {
                 ZeroCommitCheck::HasCommits => {
-                    // 分支非空：放行；同样清掉上一轮守卫失败留下的事实段文件
+                    // 分支非空：先过申报比对（决策 397），再谈放行；同样清掉上一轮
+                    // 守卫失败留下的事实段文件
                     clear_zero_commit_facts(self.store.home(), &task.id);
-                    Ok(NodeOutput::Route(crate::pipeline::MetadataView::passed(
-                        true,
-                    )))
+                    clear_gate_failure_facts(self.store.home(), &task.id);
+                    match self.declaration_check(task, &project, &worktree).await {
+                        DeclarationCheck::Ok => {
+                            clear_undeclared_changes_facts(self.store.home(), &task.id);
+                            Ok(NodeOutput::Route(crate::pipeline::MetadataView::passed(
+                                true,
+                            )))
+                        }
+                        DeclarationCheck::Undeclared { facts } => {
+                            write_undeclared_changes_facts(self.store.home(), &task.id, &facts)?;
+                            Ok(NodeOutput::Route(crate::pipeline::MetadataView::passed(
+                                false,
+                            )))
+                        }
+                        // git / 库读数不可用：按「读不到」降级放行，不因这一条卡死
+                        // （决策 209 姿态，与零提交守卫的 Unavailable 同款）
+                        DeclarationCheck::Unavailable => {
+                            clear_undeclared_changes_facts(self.store.home(), &task.id);
+                            Ok(NodeOutput::Route(crate::pipeline::MetadataView::passed(
+                                true,
+                            )))
+                        }
+                    }
                 }
                 ZeroCommitCheck::Empty { facts } => {
                     write_zero_commit_facts(self.store.home(), &task.id, &facts)?;
+                    // 闸门本身过了，失败成因换成「零提交」这一条（决策 392 ④）
+                    clear_gate_failure_facts(self.store.home(), &task.id);
+                    clear_undeclared_changes_facts(self.store.home(), &task.id);
                     Ok(NodeOutput::Route(crate::pipeline::MetadataView::passed(
                         false,
                     )))
                 }
                 // git 读数不可用：按「读不到」降级，不因这一条卡死放行（决策 209 姿态）
-                ZeroCommitCheck::Unavailable => Ok(NodeOutput::Route(
-                    crate::pipeline::MetadataView::passed(true),
-                )),
+                ZeroCommitCheck::Unavailable => {
+                    clear_gate_failure_facts(self.store.home(), &task.id);
+                    clear_undeclared_changes_facts(self.store.home(), &task.id);
+                    Ok(NodeOutput::Route(crate::pipeline::MetadataView::passed(
+                        true,
+                    )))
+                }
             }
         } else {
+            // 决策 392 ④：develop 侧没有 merge_result 那样的产出行，闸门失败的**成因**
+            // 落盘——耗尽转 pending 时 `pending_context_for` 按它填载体（此前只剩静态文案）。
+            write_gate_failure_facts(self.store.home(), &task.id, gate.failure_kind)?;
+            clear_undeclared_changes_facts(self.store.home(), &task.id);
             Ok(NodeOutput::Route(crate::pipeline::MetadataView::passed(
                 false,
             )))
@@ -977,6 +1280,99 @@ impl Executor {
         );
         ZeroCommitCheck::Empty {
             facts: zero_commit_facts(&headline, &dirty),
+        }
+    }
+
+    /// 决策 397 的读数：diff 面（基准…分支的 committed 差异 + worktree 的**已跟踪**
+    /// 未提交改动）里有没有申报清单（`changed_files ∪ unit_test_files`）之外的文件。
+    ///
+    /// 申报面缺失 / 不可解析按 fail-closed 处置——全部视为漏报（对齐决策 370 的
+    /// `metadata_gaps` 语义：元数据残缺时不再「静默跳过校验」）。git / 库读数出错
+    /// 一律 [`DeclarationCheck::Unavailable`]，不冒充「无漏报」。
+    ///
+    /// dirty 面**只取已跟踪改动**（排除 untracked）：untracked 文件不会进任务分支
+    /// 的 diff、也就不会进 review 的评审面与 merge 的合并面——把它们算成漏报只会
+    /// 制造「无法通过补申报消除」的假红（agent 没有义务为垃圾文件补申报）。
+    async fn declaration_check(
+        &self,
+        task: &Task,
+        project: &Project,
+        worktree: &str,
+    ) -> DeclarationCheck {
+        let (declared, declared_headline) = match self
+            .store
+            .stage_output_metadata(&task.id, Stage::Develop, OUTPUT_CODE_CHANGES)
+            .await
+        {
+            Ok(Some(m)) => match serde_json::from_value::<crate::types::CodeChanges>(m) {
+                Ok(c) => (
+                    Some(
+                        c.changed_files
+                            .iter()
+                            .chain(c.unit_test_files.iter())
+                            .map(|f| f.path.clone())
+                            .collect::<Vec<_>>(),
+                    ),
+                    String::new(),
+                ),
+                Err(_) => (
+                    None,
+                    "- 申报元数据不可解析（不是合法的 CodeChanges），按全漏处置\n".to_string(),
+                ),
+            },
+            Ok(None) => (
+                None,
+                "- submit_metadata 未提交 changed_files / unit_test_files 申报，按全漏处置\n"
+                    .to_string(),
+            ),
+            // 库读数失败：不冒充任何一端（决策 209 姿态）
+            Err(_) => return DeclarationCheck::Unavailable,
+        };
+
+        let Some(branch) = task.branch_name.clone() else {
+            return DeclarationCheck::Unavailable;
+        };
+        let repo = Path::new(&project.local_path);
+        let Ok(base_ref) = Git.base_ref(repo, &project.default_branch).await else {
+            return DeclarationCheck::Unavailable;
+        };
+        let mut actual = match Git.changed_files_vs_base(repo, &base_ref, &branch).await {
+            Ok(v) => v,
+            Err(_) => return DeclarationCheck::Unavailable,
+        };
+        match Git.changed_worktree_paths(Path::new(worktree)).await {
+            Ok(dirty) => actual.extend(dirty),
+            Err(_) => return DeclarationCheck::Unavailable,
+        }
+        actual.sort();
+        actual.dedup();
+
+        // fail-closed（申报面缺失）与正常比对共用同一套判定与噪音过滤——
+        // 「按全漏处置」不豁免 declare_ignore_globs，否则 lockfile 漂移会借
+        // 元数据残缺的壳把假红带回来。
+        let (undeclared, ignored) = match &declared {
+            Some(paths) => {
+                let declared: std::collections::HashSet<String> =
+                    paths.iter().map(|p| normalize_declared_path(p)).collect();
+                (
+                    undeclared_changes(&actual, paths, &self.settings.declare_ignore_globs),
+                    ignored_noise(&actual, &declared, &self.settings.declare_ignore_globs),
+                )
+            }
+            None => (
+                undeclared_changes(&actual, &[], &self.settings.declare_ignore_globs),
+                ignored_noise(
+                    &actual,
+                    &std::collections::HashSet::new(),
+                    &self.settings.declare_ignore_globs,
+                ),
+            ),
+        };
+        if undeclared.is_empty() {
+            return DeclarationCheck::Ok;
+        }
+        DeclarationCheck::Undeclared {
+            facts: undeclared_changes_facts(&undeclared, &ignored, &declared_headline),
         }
     }
 
@@ -1877,6 +2273,14 @@ pub(crate) async fn run_code_gate(
     cwd: &Path,
     include_lint: bool,
 ) -> Result<GateOutcome> {
+    // 决策 392 ②：环境预检**先于**一切命令。闸门用错工具链时，lint / 测试的输出会是
+    // 一堆看不懂的链接错误，归因也会落到 `Test` 上（2026-10-06 的 01M47RQG4M9533F5TMF1AGJXC8
+    // 就是这么空转的）——预检把它变成一句说得清的话，且**不跑测试命令**。
+    if let Some(failed) =
+        toolchain_preflight(store, settings, killer, task, run_id, stage, node, cwd).await?
+    {
+        return Ok(failed);
+    }
     if include_lint {
         if let Some(lint) = &project.lint_command {
             RunLedger::new(store, clock)
@@ -1915,6 +2319,123 @@ pub(crate) async fn run_code_gate(
         failure_kind: GateFailureKind::Test,
         output: String::new(),
     })
+}
+
+/// 环境预检（决策 392 ②）：仓库声明的工具链 vs 闸门**实际**会用到的那套。
+///
+/// 读 `<cwd>/rust-toolchain.toml` 的 `[toolchain].channel`，与经**同一环境路径**
+/// （`run_system_command`，即闸门跑 lint / 测试时那份 `PATH` + `CARGO_TARGET_DIR`）
+/// 取到的 `rustc --version` 比对；不一致即 `GateFailureKind::Environment`，**不跑测试**。
+///
+/// **不猜**：没有声明文件、或声明不是可机械比对的版本号（`stable` / `nightly` /
+/// `1.98.0-2024-…` 这类带后缀的照取版本前缀）时不判——预检是为了把「静默用错 rustc」
+/// 变成一句说得清的话，不是为了在信息不足时拦路（决策 209 姿态）。
+///
+/// 为什么值得每次跑：106 那次是**配置漂移**（systemd unit 少了 PATH），下次可能是换机、
+/// 换 drop-in、换镜像——那时候没人会记得回来看这条。
+#[allow(clippy::too_many_arguments)]
+async fn toolchain_preflight(
+    store: &Store,
+    settings: &Settings,
+    killer: &Arc<dyn ProcessKiller>,
+    task: &Task,
+    run_id: i64,
+    stage: Stage,
+    node: Node,
+    cwd: &Path,
+) -> Result<Option<GateOutcome>> {
+    let Ok(text) = std::fs::read_to_string(cwd.join("rust-toolchain.toml")) else {
+        return Ok(None);
+    };
+    let Some(declared) = declared_toolchain_channel(&text).and_then(|c| version_like(&c)) else {
+        return Ok(None);
+    };
+    let (code, out) = run_system_command(
+        store,
+        settings,
+        killer,
+        task,
+        run_id,
+        stage,
+        node,
+        "rustc --version",
+        cwd,
+    )
+    .await?;
+    let actual = parse_rustc_version(&out);
+    if code == 0 && actual.as_deref() == Some(declared.as_str()) {
+        return Ok(None);
+    }
+    let (_, which) = run_system_command(
+        store,
+        settings,
+        killer,
+        task,
+        run_id,
+        stage,
+        node,
+        "command -v cargo",
+        cwd,
+    )
+    .await?;
+    let target_dir = store.home().shared_target_path().display().to_string();
+    let actual_show = actual.unwrap_or_else(|| "（`rustc --version` 读不到）".into());
+    let output = format!(
+        "工具链预检：仓库声明 `{declared}`（rust-toolchain.toml），闸门实际用的是 `{actual_show}`\n\
+         - `rustc --version`（退出码 {code}）→ {}\n\
+         - `command -v cargo` → {}\n\
+         - `CARGO_TARGET_DIR` → {target_dir}\n\
+         修法：让闸门进程的 `PATH` / `RUSTUP_TOOLCHAIN` 指向与仓库声明一致的那套\
+         （决策 175 的钉法、决策 392 ① 的部署物）。",
+        out.trim(),
+        which.trim(),
+    );
+    Ok(Some(GateOutcome {
+        passed: false,
+        failure_kind: GateFailureKind::Environment,
+        output,
+    }))
+}
+
+/// `rust-toolchain.toml` 的 `[toolchain].channel`（`#` 后是注释）。认不出 → `None`。
+fn declared_toolchain_channel(text: &str) -> Option<String> {
+    text.lines().find_map(|raw| {
+        let line = raw.split('#').next().unwrap_or("").trim();
+        let rest = line.strip_prefix("channel")?.trim_start();
+        let value = rest
+            .strip_prefix('=')?
+            .trim()
+            .trim_matches(['"', '\''])
+            .trim();
+        (!value.is_empty()).then(|| value.to_string())
+    })
+}
+
+/// 可机械比对的版本号（`1.98.0` / `1.98`；`1.98.0-x86_64-…` 取版本前缀）。
+/// `stable` / `nightly` 这类**不是版本** → `None`（预检不猜）。
+fn version_like(channel: &str) -> Option<String> {
+    let core = channel
+        .split('-')
+        .next()
+        .unwrap_or(channel)
+        .trim()
+        .to_string();
+    let mut parts = core.split('.');
+    let major = parts.next().unwrap_or_default();
+    let minor = parts.next().unwrap_or_default();
+    let ok = |s: &str| !s.is_empty() && s.chars().all(|c| c.is_ascii_digit());
+    (ok(major) && ok(minor)).then_some(core)
+}
+
+/// `rustc --version` 输出里的版本号（`rustc 1.98.0 (…)` → `1.98.0`）。
+fn parse_rustc_version(out: &str) -> Option<String> {
+    let line = out.lines().find(|l| l.trim_start().starts_with("rustc "))?;
+    let v = line
+        .trim_start()
+        .strip_prefix("rustc ")?
+        .split_whitespace()
+        .next()?;
+    (!v.is_empty()).then(|| v.to_string())
 }
 
 // ─────────────────────────────── 节点输出 ───────────────────────────────
@@ -2132,6 +2653,127 @@ mod tests {
         let with_log = gate_output("测试", "cargo test", 1, "FAILED: test_login\n");
         assert!(with_log.contains("退出码 1"));
         assert!(with_log.contains("FAILED: test_login"));
+    }
+
+    /// 决策 392 ②：预检的三段读数解析（声明版本 / 可比对性 / 实际版本）。
+    #[test]
+    fn toolchain_preflight_readings_parse() {
+        // 声明通道：带注释、带引号、单引号、缺引号都认
+        assert_eq!(
+            declared_toolchain_channel("[toolchain]\nchannel = \"1.98.0\" # 与 Makefile 同源\n"),
+            Some("1.98.0".to_string())
+        );
+        assert_eq!(
+            declared_toolchain_channel("channel='1.98.0'\n"),
+            Some("1.98.0".to_string())
+        );
+        assert_eq!(
+            declared_toolchain_channel("[toolchain]\nchannel = \"stable\"\n"),
+            Some("stable".to_string())
+        );
+        // 没有 channel 行 → 认不出（预检不猜）
+        assert_eq!(
+            declared_toolchain_channel("[toolchain]\nprofile = \"minimal\"\n"),
+            None
+        );
+        assert_eq!(declared_toolchain_channel("channel =\n"), None);
+
+        // 可机械比对的版本：`1.98.0` / `1.98`；`stable` / `nightly` / 空 → 不判
+        assert_eq!(version_like("1.98.0"), Some("1.98.0".to_string()));
+        assert_eq!(version_like("1.98"), Some("1.98".to_string()));
+        assert_eq!(
+            version_like("1.98.0-x86_64-unknown-linux-gnu"),
+            Some("1.98.0".to_string())
+        );
+        assert_eq!(version_like("stable"), None);
+        assert_eq!(version_like("nightly"), None);
+        assert_eq!(version_like("1"), None);
+        assert_eq!(version_like("1.x"), None);
+
+        // 实际版本从 `rustc --version` 里取
+        assert_eq!(
+            parse_rustc_version("rustc 1.98.0 (b4b3f0a1c 2025-01-15)\n"),
+            Some("1.98.0".to_string())
+        );
+        assert_eq!(parse_rustc_version("cargo 1.98.0\n"), None);
+        assert_eq!(parse_rustc_version(""), None);
+    }
+
+    // ── 决策 397：申报单向比对的纯函数部分 ──
+
+    /// 申报路径归一化：`./` 前缀、反斜杠、首尾空白不参与判定。
+    #[test]
+    fn declared_paths_are_normalized_before_comparison() {
+        assert_eq!(normalize_declared_path("src/lib.rs"), "src/lib.rs");
+        assert_eq!(normalize_declared_path("./src/lib.rs"), "src/lib.rs");
+        assert_eq!(normalize_declared_path(" src\\lib.rs "), "src/lib.rs");
+        assert_eq!(normalize_declared_path("  "), "");
+    }
+
+    /// 单向比对的四条判据：漏报必现、多报容忍、噪音过滤、路径归一化。
+    #[test]
+    fn undeclared_changes_is_one_sided_with_noise_filter() {
+        let actual = vec![
+            "src/lib.rs".to_string(),
+            "src/new.rs".to_string(),
+            "Cargo.lock".to_string(),
+            "tests/e2e/main.rs".to_string(),
+        ];
+        let declared = vec!["./src/lib.rs".to_string(), "Cargo.lock".to_string()];
+
+        // 无过滤：new.rs 与 tests/e2e/main.rs 是漏报；Cargo.lock 已申报不算
+        let out = undeclared_changes(&actual, &declared, &[]);
+        assert_eq!(out, vec!["src/new.rs", "tests/e2e/main.rs"]);
+
+        // 噪音过滤（glob 按文件名匹配）：Cargo.lock 即便未申报也不算漏报
+        let actual2 = vec!["src/lib.rs".to_string(), "Cargo.lock".to_string()];
+        assert_eq!(
+            undeclared_changes(
+                &actual2,
+                &["src/lib.rs".to_string()],
+                &["*.lock".to_string()]
+            ),
+            Vec::<String>::new()
+        );
+
+        // 多报容忍：申报了但 diff 里没有 → 不是失败
+        let over_declared = vec!["src/lib.rs".to_string(), "src/ghost.rs".to_string()];
+        assert_eq!(
+            undeclared_changes(&["src/lib.rs".to_string()], &over_declared, &[]),
+            Vec::<String>::new()
+        );
+    }
+
+    /// 事实段正文带漏报清单与两条出路（补申报 / 撤销），不出现「静默」措辞。
+    #[test]
+    fn undeclared_facts_list_the_files_and_both_remedies() {
+        let facts = undeclared_changes_facts(
+            &["src/missed.rs".to_string()],
+            &["Cargo.lock".to_string()],
+            "- 正常漏报\n",
+        );
+        assert!(facts.contains("src/missed.rs"), "{facts}");
+        assert!(facts.contains("changed_files"), "{facts}");
+        assert!(facts.contains("撤销"), "{facts}");
+        assert!(facts.contains("git add + commit"), "{facts}");
+        // 噪音留痕：审计能区分「干净通过」与「有噪音被滤」（票 03 改动二）
+        assert!(facts.contains("Cargo.lock"), "{facts}");
+        assert!(facts.contains("declare_ignore_globs"), "{facts}");
+    }
+
+    /// 决策 392 ④：诊断摘要超界时**显式标注**截断量（不静默丢内容）。
+    #[test]
+    fn gate_failure_summary_truncates_loudly() {
+        let short = gate_failure_summary("lint", Stage::Develop, 2, Some("一小段"));
+        assert!(short.contains("lint（确定性）"));
+        assert!(short.contains("累计失败 2 次"));
+        assert!(short.contains("一小段"));
+        assert!(!short.contains("已截断"));
+
+        let long = "x".repeat(GATE_FAILURE_SUMMARY_LIMIT + 10);
+        let out = gate_failure_summary("environment", Stage::Merge, 1, Some(&long));
+        assert!(out.contains("环境（工具链 / 构建环境）"));
+        assert!(out.contains("其余 10 字符已截断"));
     }
 
     #[test]

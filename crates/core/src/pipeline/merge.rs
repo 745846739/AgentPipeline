@@ -366,7 +366,12 @@ impl MergeFlow<'_> {
         self.store
             .upsert_merge_result(&task.id, diff_path, &failure)
             .await?;
-        self.store.increment_gate_failures(&task.id).await?;
+        // 决策 392 ⑤：**环境类失败不烧 `gate_failures`**。那个计数是「代码改不动」的
+        // 信号（决策 108 的单调保留就是为它服务的），环境问题冒充它会把信号污染掉。
+        // 与决策 391 对空分支申报「不写闸门失败、不烧 gate_failures」同一款处置。
+        if gate.failure_kind != GateFailureKind::Environment {
+            self.store.increment_gate_failures(&task.id).await?;
+        }
         Ok(PhaseA::GateRan)
     }
 

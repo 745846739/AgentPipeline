@@ -75,7 +75,24 @@
 
 ### 落地状态
 
-**未落地**（2026-10-07 开票）。决策号预留 **392**，落地时续写 `docs/decisions.md`。
+**已落地**（2026-10-07），决策 **392** 已续写 `docs/decisions.md`。形状 1 是**部署物**
+（106 systemd unit，止血当时即落地，取证见下）；形状 2–5 进代码：
+
+| 形状 | 落地 | 覆盖 |
+|---|---|---|
+| ① 部署侧钉工具链 | 106 unit 补 `PATH` + `RUSTUP_TOOLCHAIN`（见下「止血实证」） | 106 实测：闸门命令转绿 |
+| ② 闸门环境预检 | `executor.rs::toolchain_preflight`（`run_code_gate` 起跑前）：读 `rust-toolchain.toml` 的 channel 与**经同一环境路径**取的 `rustc --version` 比对，不一致即 `Environment` 且**不跑测试**；声明不是版本号（`stable` / `nightly`）时不判 | 单测 `toolchain_preflight_readings_parse`；e2e `e2e_gate_environment_mismatch_is_classified_not_test` |
+| ③ `GateFailureKind::Environment` + 改道 | `types.rs` 加变体（并收 `as_str` / `from_str_opt` 单点，消掉 scheduler 里那份手写映射）；`route_merge` ④ 并入确定性打回（**不进 test 复检**）；`route_code_gate` 的 develop 分支本就 `Retry`，注释对齐 | 单测 `route_merge_gate_fail_environment_kicks_back_develop_not_test`、`gate_failure_kind_round_trips_through_as_str` |
+| ④ pending 携带成因 | `PendingContext` 加 `gate_failure_kind` / `gate_failures` / `gate_log_path`；`pending_context_for` 的 `RetryExhausted` 分支按阶段取成因（merge 读 `merge_result` 行；develop / test 读落盘的小 JSON `gate-failure-develop.json`）；摘要进 `context.diagnostic`——前端**无需改动**（`PendingDossier` 已有渲染路径） | e2e 扩充既有 merge 耗尽用例（断言分类 / 计数 / 日志路径 / 摘要含失败原文）；单测 `gate_failure_summary_truncates_loudly` |
+| ⑤ 计数语义 | 环境类失败**不烧** `gate_failures`（`merge.rs` Phase A 的 `increment_gate_failures` 加条件） | e2e `e2e_merge_gate_environment_does_not_burn_gate_failures`（断言 `gate_failures == 0` + 打回 develop） |
+
+两处**有意收窄**（都记在决策 392 的「明确不做」里）：
+
+- **形状 5 的「分类构成」半句未做**：「几次数用例失败、几次环境失败」需要给 `MergeResult`
+  再加一个计数列；本票落了「环境类不烧计数」这条硬要求，构成读数暂由 pending 载体的
+  `gate_failure_kind`（最近一次分类）承载。
+- **不设 `context.kind`**：门失败类动作集按 `(PendingKind, _)` 匹配，凭空加一个 `kind` 只会
+  让决策 205 的续接判定表多一个认不出的键（`ResumeCause::classify` 落到通用行）。
 
 ### 止血实证（2026-10-07 执行）
 

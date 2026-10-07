@@ -211,10 +211,18 @@ impl SubAgentRunner for StoreSubAgentRunner {
             //
             // `with_allowed_tools` 是安全边界的真正落点：只把 tool 定义少给几个是不够的，
             // 模型无视定义硬发 `run_command` 时必须在**执行点**被拒。
-            let policy = crate::agent::file_policy::pipeline_file_policy(
+            let mut policy = crate::agent::file_policy::pipeline_file_policy(
                 &cfg.worktree_path,
                 &cfg.task_dir,
                 cfg.settings.file_access_unrestricted,
+            );
+            // 阶段写入面白名单与父节点同源（决策 395）：子代理复用父节点的
+            // `(stage, node)` 坐标。子代理工具集本就只读，这一层是纵深而不是边界。
+            policy.allow_writes = super::continuation_brief::stage_write_scope(
+                &cfg.worktree_path,
+                &cfg.task_dir,
+                cfg.stage,
+                cfg.node,
             );
             let tools = ToolExecutor::new(
                 cfg.home.clone(),

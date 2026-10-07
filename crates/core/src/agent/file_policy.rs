@@ -17,6 +17,17 @@ pub enum FileOp {
     Write,
 }
 
+/// 阶段写入面白名单的一条（决策 395）：`root` 之下、文件名（或相对路径）命中
+/// `pattern` 的写入才放行。**只管写**——读不受它约束（review 要读 worktree 里的代码）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WriteAllow {
+    /// 允许写入的根（任务目录或 worktree 的绝对路径）。
+    pub root: PathBuf,
+    /// 相对该根的模式（复用 [`matches_pattern`] 的轻量 glob 语义：不含 `/` 的模式按
+    /// 文件名匹配；`*` = 该根下任意文件）。
+    pub pattern: String,
+}
+
 /// 文件工具路径策略（`SystemBaseline.file_tool_policy`）。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FileToolPolicy {
@@ -24,6 +35,14 @@ pub struct FileToolPolicy {
     pub workdir_bound: Vec<PathBuf>,
     /// 禁止访问的路径模式。
     pub deny_paths: Vec<String>,
+    /// **写入面正向白名单**（决策 395）：非空时，写操作必须命中其中一条才放行；
+    /// 空 = 不限制（值班长 / 子代理 / 决策 395 之前的形状）。
+    ///
+    /// 它与 `workdir_bound` 管的不是同一件事：允许根管「这台机器上文件工具够得着哪」
+    /// （决策 104），白名单管「**这个阶段**的 agent 允许改动什么」（决策 395 的内容
+    /// 边界）——后者是阶段纪律，不随 `file_access_unrestricted`（决策 283）放开：
+    /// 部署侧放宽操作范围，不等于 review 获得了改代码的授权。
+    pub allow_writes: Vec<WriteAllow>,
     /// 判定前对目标路径做 realpath 解析（macOS /etc → /private/etc、/tmp → /private/tmp）。
     pub resolve_realpath: bool,
     /// 拒绝写符号链接。
@@ -35,6 +54,7 @@ impl Default for FileToolPolicy {
         FileToolPolicy {
             workdir_bound: Vec::new(),
             deny_paths: default_deny_paths(),
+            allow_writes: Vec::new(),
             resolve_realpath: true,
             refuse_symlink_write: true,
         }
@@ -164,6 +184,32 @@ impl FileToolPolicy {
             if !roots.iter().any(|root| resolved.starts_with(root)) {
                 return Err(Error::PolicyDenied(format!(
                     "路径超出文件工具允许范围：{}",
+                    resolved.display()
+                )));
+            }
+        }
+
+        // ④ 写入面正向白名单（决策 395）：非空时写 op 必须命中其中一条。
+        // 排在允许根之后——「够得着」（允许根）与「允许改」（白名单）是两道门，
+        // 报错时把允许面一并说清，让 agent 当轮自纠（回灌自愈的既有姿态）。
+        if op == FileOp::Write && !self.allow_writes.is_empty() {
+            let hit = self.allow_writes.iter().any(|a| {
+                let root = if self.resolve_realpath {
+                    resolve(&a.root)
+                } else {
+                    absolutize(&a.root)
+                };
+                resolved.starts_with(&root) && matches_pattern(&a.pattern, &resolved)
+            });
+            if !hit {
+                let allowed = self
+                    .allow_writes
+                    .iter()
+                    .map(|a| format!("{} 下的 {}", a.root.display(), a.pattern))
+                    .collect::<Vec<_>>()
+                    .join("；");
+                return Err(Error::PolicyDenied(format!(
+                    "路径不在本节点的写入面白名单内（决策 395）：{}。本节点允许写入：{allowed}",
                     resolved.display()
                 )));
             }
@@ -551,5 +597,105 @@ mod tests {
         assert!(policy
             .check_read(std::path::Path::new("/somewhere/else.txt"))
             .is_ok());
+    }
+
+    // ── 决策 395：写入面正向白名单 ──
+
+    /// 白名单为空的旧形状行为不变：允许根内写放行。
+    #[test]
+    fn empty_allow_writes_keeps_the_old_shape() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().canonicalize().unwrap();
+        let policy = policy_for(&root);
+        assert!(policy.check_write(&root.join("any/thing.txt")).is_ok());
+    }
+
+    /// review 的形状：任务目录只许写 `review-report.md`，其余任务目录文件与
+    /// worktree 全部拒。
+    #[test]
+    fn single_file_allowlist_denies_everything_else() {
+        let tmp = tempfile::tempdir().unwrap();
+        let task_dir = tmp.path().canonicalize().unwrap();
+        let wt_tmp = tempfile::tempdir().unwrap();
+        let worktree = wt_tmp.path().canonicalize().unwrap();
+        let policy = FileToolPolicy {
+            workdir_bound: vec![worktree.clone(), task_dir.clone()],
+            allow_writes: vec![WriteAllow {
+                root: task_dir.clone(),
+                pattern: "review-report.md".into(),
+            }],
+            ..Default::default()
+        };
+        // 命中白名单 → 放行
+        assert!(policy
+            .check_write(&task_dir.join("review-report.md"))
+            .is_ok());
+        // 任务目录其他文件 → 拒（报错里带允许面，agent 可自纠）
+        let err = policy.check_write(&task_dir.join("notes.md")).unwrap_err();
+        assert!(matches!(err, Error::PolicyDenied(ref m) if m.contains("review-report.md")));
+        // worktree 里的文件（绝对路径构造，模拟 `write_root_for` 之外的落点）→ 拒
+        assert!(policy.check_write(&worktree.join("src/lib.rs")).is_err());
+        // 读不受白名单管：review 要读 worktree 代码
+        assert!(policy.check_read(&worktree.join("src/lib.rs")).is_ok());
+    }
+
+    /// develop 的形状：只许写 worktree；任务目录零条目 = 拒（绝对路径也绕不过）。
+    #[test]
+    fn worktree_only_allowlist_blocks_the_task_dir() {
+        let tmp = tempfile::tempdir().unwrap();
+        let task_dir = tmp.path().canonicalize().unwrap();
+        let wt_tmp = tempfile::tempdir().unwrap();
+        let worktree = wt_tmp.path().canonicalize().unwrap();
+        let policy = FileToolPolicy {
+            workdir_bound: vec![worktree.clone(), task_dir.clone()],
+            allow_writes: vec![WriteAllow {
+                root: worktree.clone(),
+                pattern: "*".into(),
+            }],
+            ..Default::default()
+        };
+        assert!(policy.check_write(&worktree.join("src/main.rs")).is_ok());
+        assert!(policy
+            .check_write(&worktree.join("tests/deep/nested_test.rs"))
+            .is_ok());
+        assert!(policy.check_write(&task_dir.join("scratch.md")).is_err());
+    }
+
+    /// deny 名单优先于白名单：`.env` 即使命中白名单根也必须拒（顺序不变量）。
+    #[test]
+    fn deny_paths_beat_the_write_allowlist() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().canonicalize().unwrap();
+        let policy = FileToolPolicy {
+            workdir_bound: vec![root.clone()],
+            allow_writes: vec![WriteAllow {
+                root: root.clone(),
+                pattern: "*".into(),
+            }],
+            ..Default::default()
+        };
+        assert!(policy.check_write(&root.join(".env")).is_err());
+        assert!(policy.check_write(&root.join("src/lib.rs")).is_ok());
+    }
+
+    /// 符号链接逃逸在白名单下同样不成立：realpath 解析后不在允许根内即拒。
+    #[test]
+    fn symlink_escape_beats_the_write_allowlist() {
+        let root = tempfile::tempdir().unwrap();
+        let root = root.path().canonicalize().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        std::fs::write(outside.path().join("secret.txt"), "s").unwrap();
+        let escape = root.join("escape.md");
+        std::os::unix::fs::symlink(outside.path().join("secret.txt"), &escape).unwrap();
+        let policy = FileToolPolicy {
+            workdir_bound: vec![root.clone()],
+            allow_writes: vec![WriteAllow {
+                root: root.clone(),
+                pattern: "escape.md".into(),
+            }],
+            ..Default::default()
+        };
+        // 白名单按文件名会命中，但 realpath 解析后目标在根外 → 允许根先拒
+        assert!(policy.check_write(&escape).is_err());
     }
 }

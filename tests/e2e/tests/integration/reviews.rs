@@ -6,8 +6,8 @@
 use super::common::{design_ok, Flow};
 use agentpipeline_core::storage::decisions::ResumeAction;
 use agentpipeline_core::types::{
-    Approval, Node, PendingKind, ReviewMode, ReviewResult, Stage, TaskStatus, TestResult,
-    TransitionTrigger,
+    Approval, FileAction, FileChangeSpec, Node, PendingKind, ReviewMode, ReviewResult, Stage,
+    TaskStatus, TestResult, TransitionTrigger,
 };
 use testkit::Script;
 
@@ -26,7 +26,18 @@ fn to_review(script: &mut Script, task_id: &str, review: ReviewResult) {
         ))
         .submit(&agentpipeline_core::types::CodeChanges {
             branch_name: format!("kanban/{task_id}"),
-            changed_files: vec![],
+                        changed_files: vec![
+                FileChangeSpec {
+                    path: "src/lib.rs".into(),
+                    action: FileAction::Create,
+                    content_hash: None,
+                },
+                FileChangeSpec {
+                    path: "tests/acceptance.rs".into(),
+                    action: FileAction::Create,
+                    content_hash: None,
+                },
+            ],
             unit_test_files: vec![],
             no_changes: false,
         });

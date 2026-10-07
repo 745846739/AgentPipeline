@@ -17,6 +17,7 @@ mod happy_path;
 mod join_and_skip;
 mod pending;
 mod reviews;
+mod stage_boundary;
 mod timeouts;
 mod ux_audit3_artifacts;
 mod ux_audit3_landing;

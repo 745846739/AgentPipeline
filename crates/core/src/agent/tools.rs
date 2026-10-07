@@ -97,6 +97,10 @@ pub const ENV_TOOLS: [&str; 9] = [
     "spawn_sub_agent",
 ];
 
+/// 阶段工具禁用的台账退出码（决策 396）：与 [`crate::agent::egress::EGRESS_DENIED_EXIT_CODE`]
+/// 分开取值，翻台账时「阶段禁用」与「出口拒绝」不会混成一回事。
+pub const STAGE_TOOL_DENIED_EXIT_CODE: i32 = 2;
+
 /// **本服务写接口**工具（决策 206）：恒为提议 + 确认钮，**不读档位**。
 ///
 /// 三个名字**一族一个工具 + 动作参数**（决策 207④）：粒度对着 `allowed_actions` 的类型走，
@@ -2419,6 +2423,33 @@ impl ToolExecutor {
             .or_else(|| ctx.default_cwd.clone())
             .unwrap_or_else(|| ctx.worktree_path.clone());
 
+        // 阶段工具禁用（决策 396）：review / test-design 的模板全链路零依赖
+        // run_command（探查核实：review 只授 read_file / write_file / submit_metadata，
+        // test-design 三个节点零出现），故整段禁用。这是**执行层兜底**——def 层
+        // （`model_request::tool_defs`）已不给广告，但「只靠 tool 定义约束是纸糊的」
+        // （本文件 [`Self::execute`] 的注释），模型可以无视定义硬发。拒绝也落台账：
+        // 与 egress denied 同一形状（审计面必须看得见有过一次被拒的调用）。
+        if matches!(ctx.stage, Stage::Review | Stage::TestDesign) {
+            let sanitized = super::sanitize::sanitize_command_line(&command);
+            let id = self.record_command_start(ctx, &sanitized, &cwd).await?;
+            if let (Some(rec), Some(id)) = (self.recorder.as_ref(), id) {
+                rec.record_finish(
+                    id,
+                    CommandFinish {
+                        exit_code: Some(STAGE_TOOL_DENIED_EXIT_CODE),
+                        stderr_preview: Some("run_command 在本阶段被禁用（决策 396）".into()),
+                        ..Default::default()
+                    },
+                )
+                .await?;
+            }
+            return Err(Error::PolicyDenied(format!(
+                "run_command 在 {} 阶段被禁用（决策 396）：本阶段的工作不需要执行命令，\
+                 请用 read_file / write_file / submit_metadata 完成收口。",
+                ctx.stage
+            )));
+        }
+
         // 出口策略（决策 179，票 12）在**启动进程之前**判定：被拒的命令根本不执行。
         // 拒绝也要落 `kanban_node_commands`（与放行的命令同表）——审计面必须看得见
         // 「有过一次被拒的出口尝试」，否则策略只是一次静默失败。
@@ -4345,6 +4376,137 @@ mod tests {
             .await
             .unwrap();
         assert!(s.worktree.join("src/main.rs").exists());
+    }
+
+    // ── 决策 395：阶段写入面白名单（装配后的行为形状）──
+
+    /// review 的白名单形状：唯一合法产出放行且落任务目录；任务目录其他文件与
+    /// worktree（绝对路径绕 `write_root_for` 的那条路）一律拒。
+    #[tokio::test]
+    async fn stage_allowlist_confines_review_writes_to_the_report() {
+        let tmp = tempfile::tempdir().unwrap();
+        let home = Home::new(tmp.path().join("home"));
+        home.ensure_dirs().unwrap();
+        let worktree = home.worktree_path("t1");
+        let task_dir = home.task_dir("t1");
+        home.ensure_task_dirs("t1").unwrap();
+        let policy = FileToolPolicy {
+            workdir_bound: vec![worktree.clone(), task_dir.clone()],
+            allow_writes: vec![crate::agent::file_policy::WriteAllow {
+                root: task_dir.clone(),
+                pattern: "review-report.md".into(),
+            }],
+            ..Default::default()
+        };
+        let executor = ToolExecutor::new(
+            home.clone(),
+            policy,
+            Settings::default(),
+            Arc::new(NoKiller),
+        );
+        let ctx = ToolCallContext {
+            task_id: "t1".into(),
+            session_id: None,
+            stage: Stage::Review,
+            node: Node::Execute,
+            worktree_path: worktree.clone(),
+            task_dir: task_dir.clone(),
+            run_id: Some(1),
+            command_source: CommandSource::Agent,
+            default_cwd: Some(worktree.clone()),
+        };
+        // 唯一合法产出 → 放行且落在任务目录
+        executor
+            .execute(
+                &call(
+                    "write_file",
+                    serde_json::json!({"path": "review-report.md", "content": "# 评审"}),
+                ),
+                &ctx,
+            )
+            .await
+            .unwrap();
+        assert!(task_dir.join("review-report.md").exists());
+        // 任务目录其他文件 → 拒
+        let err = executor
+            .execute(
+                &call(
+                    "write_file",
+                    serde_json::json!({"path": "notes.md", "content": "x"}),
+                ),
+                &ctx,
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(err, Error::PolicyDenied(_)), "{err:?}");
+        // worktree（绝对路径，绕开 `write_root_for` 的落点映射）→ 拒
+        let err = executor
+            .execute(
+                &call(
+                    "write_file",
+                    serde_json::json!({
+                        "path": worktree.join("src/lib.rs").display().to_string(),
+                        "content": "x"
+                    }),
+                ),
+                &ctx,
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(err, Error::PolicyDenied(_)), "{err:?}");
+    }
+
+    // ── 决策 396：review / test-design 阶段禁用 run_command（执行层兜底）──
+
+    /// def 层不给广告之外，模型硬发 `run_command` 也必须在执行点被拒——且拒绝落台账
+    /// （egress denied 同一形状），审计面看得见这次尝试。
+    #[tokio::test]
+    async fn run_command_is_stage_denied_for_review_and_test_design() {
+        for stage in [Stage::Review, Stage::TestDesign] {
+            let s = setup(stage);
+            let recorder = Arc::new(RecordingRecorder::default());
+            let executor = ToolExecutor::new(
+                s.home.clone(),
+                FileToolPolicy::new(vec![s.worktree.clone(), s.task_dir.clone()]),
+                Settings::default(),
+                Arc::new(NoKiller),
+            )
+            .with_recorder(recorder.clone());
+            let err = executor
+                .execute(
+                    &call("run_command", serde_json::json!({"command": "echo hi"})),
+                    &s.ctx,
+                )
+                .await
+                .unwrap_err();
+            assert!(
+                matches!(err, Error::PolicyDenied(_)),
+                "{stage}：期望 PolicyDenied，实际 {err:?}"
+            );
+            assert_eq!(recorder.starts.lock().unwrap().len(), 1, "{stage}");
+            let finishes = recorder.finishes.lock().unwrap();
+            assert_eq!(finishes.len(), 1, "{stage}");
+            assert_eq!(
+                finishes[0].1.exit_code,
+                Some(STAGE_TOOL_DENIED_EXIT_CODE),
+                "{stage}：台账退出码须与 egress denied 区分"
+            );
+        }
+    }
+
+    /// 其余阶段不受影响：develop 的提交契约（决策 391）依赖 run_command。
+    #[tokio::test]
+    async fn run_command_still_runs_for_develop() {
+        let s = setup(Stage::Develop);
+        let out = s
+            .executor
+            .execute(
+                &call("run_command", serde_json::json!({"command": "echo ok"})),
+                &s.ctx,
+            )
+            .await
+            .unwrap();
+        assert!(out.content.contains("ok"), "{}", out.content);
     }
 
     #[tokio::test]

@@ -548,6 +548,85 @@ impl Git {
         .await
     }
 
+    /// 分支相对基准的**改动文件名**（决策 397：develop 申报比对的 committed 面）。
+    ///
+    /// merge-base 三方口径（`git diff --name-only <base>...<branch>` 的 libgit2 等价）：
+    /// 从 merge base 到分支 tip 的树差异——基准自身的漂移不计入。改名取新路径
+    /// （申报语义是「我改了哪些文件」，新名才是 review 要读的那个）。
+    /// 短超时与 [`Self::ahead_count`] 同档：闸门读数，出错由调用方按「读不到」降级。
+    pub async fn changed_files_vs_base(
+        &self,
+        repo_path: &Path,
+        base_ref: &str,
+        branch: &str,
+    ) -> Result<Vec<String>> {
+        let p = repo_path.to_path_buf();
+        let base = base_ref.to_string();
+        let branch = branch.to_string();
+        blocking_within(IS_DIRTY_TIMEOUT_SEC, move || {
+            let repo = open(&p)?;
+            let base_commit = repo
+                .revparse_single(&base)
+                .map_err(gerr)?
+                .peel_to_commit()
+                .map_err(gerr)?;
+            let branch_commit = repo
+                .revparse_single(&branch)
+                .map_err(gerr)?
+                .peel_to_commit()
+                .map_err(gerr)?;
+            let merge_base = repo
+                .merge_base(base_commit.id(), branch_commit.id())
+                .map_err(gerr)?;
+            let base_tree = repo
+                .find_commit(merge_base)
+                .map_err(gerr)?
+                .tree()
+                .map_err(gerr)?;
+            let branch_tree = branch_commit.tree().map_err(gerr)?;
+            let diff = repo
+                .diff_tree_to_tree(Some(&base_tree), Some(&branch_tree), None)
+                .map_err(gerr)?;
+            let mut out: Vec<String> = diff
+                .deltas()
+                .filter_map(|d| {
+                    d.new_file()
+                        .path()
+                        .or_else(|| d.old_file().path())
+                        .map(|p| p.display().to_string())
+                })
+                .collect();
+            out.sort();
+            out.dedup();
+            Ok(out)
+        })
+        .await
+    }
+
+    /// worktree 未提交改动的**裸路径**（决策 397：申报比对的 dirty 面）。
+    ///
+    /// 与 [`Self::dirty_files`] 的差别：不带 `XY` 状态前缀；**不截断**——比对漏报时
+    /// 截断会把「没报的那条」藏掉，检查语义下宁可贵一点也不许静默丢行；**不含
+    /// untracked**（理由见函数体内注释）。
+    pub async fn changed_worktree_paths(&self, path: &Path) -> Result<Vec<String>> {
+        let p = path.to_path_buf();
+        blocking_within(IS_DIRTY_TIMEOUT_SEC, move || {
+            let repo = open(&p)?;
+            // git2 缺省即**不含** untracked / ignored——这里刻意不开 `include_untracked`：
+            // 未跟踪文件不进任务分支 diff、也就不进 review 评审面与 merge 合并面，把它算
+            // 漏报只会制造无法通过补申报消除的假红（决策 397 §1）。
+            let statuses = repo.statuses(None).map_err(gerr)?;
+            let mut out: Vec<String> = statuses
+                .iter()
+                .filter_map(|entry| entry.path().map(|p| p.to_string()))
+                .collect();
+            out.sort();
+            out.dedup();
+            Ok(out)
+        })
+        .await
+    }
+
     /// 基准 ref（决策 41）：有 **origin** remote 用 `origin/{default_branch}`，否则本地分支。
     ///
     /// 只认 `origin`：仓库只配了别的 remote 名时，`origin/{branch}` 并不存在，

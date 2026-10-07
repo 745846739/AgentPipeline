@@ -19,9 +19,10 @@ use agentpipeline_core::storage::observability::NewProjectRun;
 use agentpipeline_core::storage::Store;
 use agentpipeline_core::types::{
     AcceptanceCriterion, Approval, ArchitectExecuteMetadata, CodeChanges, CursorStatus,
-    DevelopDesignMetadata, Gate, Node, NodeCursor, NodeStatus, PendingKind, Project,
-    ReviewRequiredChange, ReviewResult, Stage, TaskStatus, TestDesignMetadata, TestResult,
-    TestScenario, TransitionTrigger, ValidateInputMetadata, ValidateOutputMetadata,
+    DevelopDesignMetadata, FileAction, FileChangeSpec, Gate, Node, NodeCursor, NodeStatus,
+    PendingKind, Project, ReviewRequiredChange, ReviewResult, Stage, TaskStatus,
+    TestDesignMetadata, TestResult, TestScenario, TransitionTrigger, ValidateInputMetadata,
+    ValidateOutputMetadata,
 };
 use futures::future::BoxFuture;
 use testkit::{FakeAgent, ManualClock, RecordingKiller, Repo, Script, SseRecorder, TestHome};
@@ -208,7 +209,18 @@ fn implementation_scripts(script: &mut Script, task_id: &str) {
         ))
         .submit(&CodeChanges {
             branch_name: format!("kanban/{task_id}"),
-            changed_files: vec![],
+                        changed_files: vec![
+                FileChangeSpec {
+                    path: "src/lib.rs".into(),
+                    action: FileAction::Create,
+                    content_hash: None,
+                },
+                FileChangeSpec {
+                    path: "tests/acceptance.rs".into(),
+                    action: FileAction::Create,
+                    content_hash: None,
+                },
+            ],
             unit_test_files: vec![],
             no_changes: false,
         });
@@ -1570,7 +1582,8 @@ async fn a_context_window_failure_compacts_and_retries_that_one_call() {
     // 先攒够**可压的**轮次（`keep_recent_rounds` 缺省 5，每轮两条消息 = assistant + tool_result；
     // 压缩要 `len > keep + 2` 才动得了）：5 轮工具往返之后，前面的轮次才成了「旧轮」。
     for i in 0..5 {
-        exec = exec.write_file(&format!("notes-{i}.md"), "记录一条");
+        // 决策 395：architect 的写入面只有 design.md——往返轮次重复写它（内容带序号）
+        exec = exec.write_file("design.md", &format!("# 设计 v{i}"));
     }
     exec.fail_llm(
         "llm_context_window",
@@ -1637,9 +1650,10 @@ async fn a_long_tool_round_trip_node_is_capped_by_the_token_floor() {
             blockers: vec![],
         });
     let mut exec = script.for_node(Stage::ArchitectDesign, Node::Execute);
-    for i in 0..60 {
+    for _i in 0..60 {
         let body = "x".repeat(8_000);
-        exec = exec.write_file(&format!("notes-{i}.md"), &body);
+        // 决策 395：architect 的写入面只有 design.md——往返轮次重复写它
+        exec = exec.write_file("design.md", &body);
     }
     exec.submit(&ArchitectExecuteMetadata {
         readiness: true,
@@ -2920,8 +2934,9 @@ async fn prompt_assembly_consumes_templates_stage_configs_and_agents_md() {
     assert!(te
         .user_prompt
         .contains(&format!("{task_dir}/test-scenarios.md")));
-    // 共享脚本的 CodeChanges 未列文件 → 决策 115 降级说明而非空白
-    assert!(te.user_prompt.contains("按决策 115 降级处理"));
+    // 共享脚本的 CodeChanges 已诚实申报（决策 397 后空申报会打回）→ prompt 列出文件清单
+    assert!(te.user_prompt.contains("src/lib.rs"), "{}", te.user_prompt);
+    assert!(te.user_prompt.contains("tests/acceptance.rs"));
 
     // prompt_template_hash 反映最终组装内容（决策 137）
     let runs = ctx.store.list_runs("t6").await.unwrap();
@@ -5534,7 +5549,18 @@ async fn run_to_review_reject(ctx: &Ctx, task_id: &str, review: &ReviewResult) {
         ))
         .submit(&CodeChanges {
             branch_name: format!("kanban/{task_id}"),
-            changed_files: vec![],
+            changed_files: vec![
+                FileChangeSpec {
+                    path: "src/lib.rs".into(),
+                    action: FileAction::Create,
+                    content_hash: None,
+                },
+                FileChangeSpec {
+                    path: "tests/acceptance.rs".into(),
+                    action: FileAction::Create,
+                    content_hash: None,
+                },
+            ],
             unit_test_files: vec![],
             no_changes: false,
         });

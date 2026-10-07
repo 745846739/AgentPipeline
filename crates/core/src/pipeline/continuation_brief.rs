@@ -64,7 +64,7 @@ pub(crate) async fn build(store: &Store, task: &Task, stage: Stage, node: Node) 
 
 /// 本节点的**目标**（「未落盘目标」那一条要交代的东西）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum ProductTarget {
+pub(crate) enum ProductTarget {
     /// 统一落在任务目录下的一个规范文件（决策 115 的缺省名）。
     File(&'static str),
     /// 产出是 worktree 里的代码改动——目标不是一个文件，点名「看未提交改动清单」。
@@ -73,10 +73,12 @@ enum ProductTarget {
     None,
 }
 
-/// 节点 → 目标产物。**这几个缺省文件名有三处同源**：这里的表、`model_request::template_vars`
-/// 的 `stored_path` 缺省、`model_invoke` 落 `upsert_stage_output` 时的 `unwrap_or_else`——
-/// 改一处就得三处一起改，否则简报点名的文件名会与真正落盘的那个不是同一个。
-fn product_target(stage: Stage, node: Node) -> ProductTarget {
+/// 节点 → 目标产物。**这几个缺省文件名有多处同源**：这里的表（权威口径）、
+/// `model_request::template_vars` 的 `stored_path` 缺省、`model_invoke` 落
+/// `upsert_stage_output` 时的 `unwrap_or_else`、以及 [`stage_write_scope`]
+/// （决策 395 的写入面白名单，直接调本表取值）——改一处就得四处一起改，否则
+/// 白名单放行的文件名会与真正落盘的那个不是同一个。
+pub(crate) fn product_target(stage: Stage, node: Node) -> ProductTarget {
     match (stage, node) {
         (Stage::ArchitectDesign, Node::Execute) => ProductTarget::File("design.md"),
         (Stage::DevelopDesign, Node::Execute) => ProductTarget::File("dev-plan.md"),
@@ -85,6 +87,53 @@ fn product_target(stage: Stage, node: Node) -> ProductTarget {
         (Stage::Test, Node::Execute) => ProductTarget::File("test-report.md"),
         (Stage::Develop, Node::Execute) => ProductTarget::WorktreeChanges,
         _ => ProductTarget::None,
+    }
+}
+
+/// 阶段写入面白名单（决策 395）：**任务目录的 agent 写入一律白名单到该节点
+/// `ProductTarget` 声明的产出文件；worktree 写入仅 develop 与 test 放开。**
+///
+/// 装配点在 `model_invoke::agent_attempt_inner`（每次 attempt 构造 policy 处）。
+/// 统一规则的阶段展开：
+///
+/// * develop / test：worktree 全域（`*`）；test 另放行任务目录的 `test-report.md`
+///   （`write_root_for` 的既有特例同源）。
+/// * 四个单文件产出阶段（architect-design / develop-design / test-design / review）：
+///   任务目录只许写各自的产出文件；worktree 不给条目 = 拒。
+/// * 校验类节点（validate_input / validate_output）与无产物节点：`ProductTarget::None`
+///   → 空白名单 = 拒一切写（这些节点的模板本就没有写入动作）。
+///
+/// 白名单取值**只**经 [`product_target`] 这张表——不在此处再写一份文件名清单，
+/// 否则「白名单放行的文件名」与「真正落盘的文件名」会成为两本账。
+pub(crate) fn stage_write_scope(
+    worktree: &Path,
+    task_dir: &Path,
+    stage: Stage,
+    node: Node,
+) -> Vec<crate::agent::file_policy::WriteAllow> {
+    use crate::agent::file_policy::WriteAllow;
+    match (stage, node) {
+        (Stage::Develop, _) => vec![WriteAllow {
+            root: worktree.to_path_buf(),
+            pattern: "*".to_string(),
+        }],
+        (Stage::Test, _) => vec![
+            WriteAllow {
+                root: worktree.to_path_buf(),
+                pattern: "*".to_string(),
+            },
+            WriteAllow {
+                root: task_dir.to_path_buf(),
+                pattern: "test-report.md".to_string(),
+            },
+        ],
+        (stage, node) => match product_target(stage, node) {
+            ProductTarget::File(name) => vec![WriteAllow {
+                root: task_dir.to_path_buf(),
+                pattern: name.to_string(),
+            }],
+            ProductTarget::WorktreeChanges | ProductTarget::None => Vec::new(),
+        },
     }
 }
 
@@ -320,5 +369,64 @@ mod tests {
             MAX_FILES
         )
         .is_empty());
+    }
+
+    /// 决策 395：阶段写入面白名单的装配矩阵——**值必须来自 `product_target` 这张表**
+    /// （改表自动联动，防「白名单放行的文件名」与「真正落盘的文件名」两本账）。
+    #[test]
+    fn stage_write_scope_follows_the_product_target_table() {
+        let wt = Path::new("/wt");
+        let td = Path::new("/td");
+        use crate::agent::file_policy::WriteAllow;
+        let file = |root: &Path, name: &str| {
+            vec![WriteAllow {
+                root: root.to_path_buf(),
+                pattern: name.to_string(),
+            }]
+        };
+
+        // 四个单文件产出阶段：任务目录只放行各自的产出文件
+        assert_eq!(
+            stage_write_scope(wt, td, Stage::Review, Node::Execute),
+            file(td, "review-report.md")
+        );
+        assert_eq!(
+            stage_write_scope(wt, td, Stage::TestDesign, Node::Execute),
+            file(td, "test-scenarios.md")
+        );
+        assert_eq!(
+            stage_write_scope(wt, td, Stage::ArchitectDesign, Node::Execute),
+            file(td, "design.md")
+        );
+        assert_eq!(
+            stage_write_scope(wt, td, Stage::DevelopDesign, Node::Execute),
+            file(td, "dev-plan.md")
+        );
+
+        // develop：worktree 全域；test：worktree 全域 + 任务目录的 test-report.md
+        assert_eq!(
+            stage_write_scope(wt, td, Stage::Develop, Node::Execute),
+            vec![WriteAllow {
+                root: wt.to_path_buf(),
+                pattern: "*".to_string()
+            }]
+        );
+        assert_eq!(
+            stage_write_scope(wt, td, Stage::Test, Node::Execute),
+            vec![
+                WriteAllow {
+                    root: wt.to_path_buf(),
+                    pattern: "*".to_string()
+                },
+                WriteAllow {
+                    root: td.to_path_buf(),
+                    pattern: "test-report.md".to_string()
+                },
+            ]
+        );
+
+        // 校验类节点：无产物目标 → 空白名单 = 拒一切写
+        assert!(stage_write_scope(wt, td, Stage::TestDesign, Node::ValidateInput).is_empty());
+        assert!(stage_write_scope(wt, td, Stage::ArchitectDesign, Node::ValidateOutput).is_empty());
     }
 }

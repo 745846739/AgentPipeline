@@ -19,9 +19,9 @@ use agentpipeline_core::scheduler::KanbanScheduler;
 use agentpipeline_core::storage::Store;
 use agentpipeline_core::types::{
     AcceptanceCriterion, Approval, ArchitectExecuteMetadata, CodeChanges, CursorStatus,
-    DevelopDesignMetadata, DiffStats, MergeResult, MergeStatus, Node, NodeCursor, PendingReason,
-    Project, ReviewResult, ScenarioPriority, Stage, TaskStatus, TestDesignMetadata, TestResult,
-    TestScenario, ValidateInputMetadata, ValidateOutputMetadata,
+    DevelopDesignMetadata, DiffStats, FileAction, FileChangeSpec, MergeResult, MergeStatus, Node,
+    NodeCursor, PendingReason, Project, ReviewResult, ScenarioPriority, Stage, TaskStatus,
+    TestDesignMetadata, TestResult, TestScenario, ValidateInputMetadata, ValidateOutputMetadata,
 };
 use testkit::{FakeAgent, ManualClock, RecordingKiller, Repo, Script, SseRecorder, TestHome};
 
@@ -414,7 +414,18 @@ pub fn implementation_ok(script: &mut Script, task_id: &str) {
         ))
         .submit(&CodeChanges {
             branch_name: format!("kanban/{task_id}"),
-            changed_files: vec![],
+                        changed_files: vec![
+                FileChangeSpec {
+                    path: "src/lib.rs".into(),
+                    action: FileAction::Create,
+                    content_hash: None,
+                },
+                FileChangeSpec {
+                    path: "tests/acceptance.rs".into(),
+                    action: FileAction::Create,
+                    content_hash: None,
+                },
+            ],
             unit_test_files: vec![],
             no_changes: false,
         });

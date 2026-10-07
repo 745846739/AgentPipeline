@@ -7,8 +7,8 @@ use super::common::{design_ok, full_pass_script, Flow};
 use agentpipeline_core::git::Git;
 use agentpipeline_core::storage::decisions::ResumeAction;
 use agentpipeline_core::types::{
-    Approval, CodeChanges, FailureCause, Gate, GateFailureKind, Node, PendingKind, ReviewResult,
-    Stage, TaskStatus, TestFailure, TestResult, TransitionTrigger,
+    Approval, CodeChanges, FailureCause, FileAction, FileChangeSpec, Gate, GateFailureKind, Node,
+    PendingKind, ReviewResult, Stage, TaskStatus, TestFailure, TestResult, TransitionTrigger,
 };
 use testkit::Script;
 
@@ -524,6 +524,30 @@ async fn e2e_08_exhausts_gate_failures_then_retry_resets_worktree_and_readmits()
     assert_eq!((cursor.stage, cursor.node), (Stage::Merge, Node::Execute));
     let reason = cursor.pending_reason.as_ref().unwrap();
     assert_eq!(reason.kind, PendingKind::RetryExhausted);
+    // 决策 392 ④：合并闸门耗尽转 pending 时，载体带**成因读数**（此前只有静态文案）
+    let ctx = reason
+        .context
+        .as_ref()
+        .expect("门失败类待办必须带成因载体（决策 392 ④）");
+    let gf = ctx
+        .gate_failure
+        .as_deref()
+        .expect("载体应含成因读数（决策 392 ④）");
+    assert_eq!(gf.kind, "test");
+    assert_eq!(gf.failures, 3);
+    assert!(
+        gf.log_path.contains("gate-output-merge"),
+        "日志路径应指向可读文件：{}",
+        gf.log_path
+    );
+    let diag = ctx.diagnostic.as_deref().unwrap_or_default();
+    assert!(diag.contains("测试用例"), "摘要应带分类读数：{diag}");
+    assert!(
+        diag.contains("GATE_FAIL_OUTPUT"),
+        "摘要应带失败原文：{diag}"
+    );
+    // 动作集按 (PendingKind, _) 匹配——不设 context.kind，免得污染续接判定表
+    assert_eq!(ctx.kind, None);
     let actions = f.store.allowed_actions_for_task("t8").await.unwrap();
     let names: Vec<&str> = actions.iter().map(|a| a.action.as_str()).collect();
     assert!(names.contains(&"goto") && names.contains(&"cancel"));
@@ -705,4 +729,137 @@ async fn e2e_merge_declared_no_changes_pends_for_user() {
     assert_eq!(names, vec!["goto", "cancel"], "{actions:?}");
     let target = actions[0].target.as_ref().expect("goto 应有落点");
     assert_eq!((target.stage, target.node), (Stage::Develop, Node::Execute));
+}
+
+// ─────────── 环境类闸门失败：预检 + 归因 + 改道 + 成因随 pending（决策 392 / 票 01）───────────
+//
+// 现场（2026-10-06 任务 01M47RQG4M9533F5TMF1AGJXC8）：闸门的 `cargo` 落到系统那套 1.92，
+// 而共享构建缓存是 rustup 1.98 编的 → `final link failed: bad value` 被归成 `Test` →
+// 打回 test 复检（test 侧只读 agent 自报、永远报绿）→ merge↔test 空转一整轮加一次人工裁决。
+// 决策 392 把「失败到底是什么」钉进四处：预检、归因、改道、pending 携带成因。
+
+/// 决策 392 ②③④：工作树声明的工具链与闸门实际那套不一致 → 预检在**跑任何命令之前**判
+/// `Environment`（不冒充 `Test`）、直接回 develop.execute 重试（**不进 test 复检**），
+/// 成因落盘供 pending 侧填载体。
+#[tokio::test]
+async fn e2e_gate_environment_mismatch_is_classified_not_test() {
+    let f = Flow::new().await;
+    let mut script = Script::new();
+    design_ok(&mut script);
+    // develop.execute：落一个对不上号的 rust-toolchain.toml（声明 0.0.1 ≠ 实际那套）。
+    // 声明要「像版本号」——`version_like` 只对可机械比对的声明下判（预检不猜）。
+    script
+        .for_node(Stage::Develop, Node::Execute)
+        .write_file("rust-toolchain.toml", "[toolchain]\nchannel = \"0.0.1\"\n")
+        .submit(&CodeChanges {
+            branch_name: "kanban/t-env".into(),
+            changed_files: vec![FileChangeSpec {
+                path: "rust-toolchain.toml".into(),
+                action: FileAction::Create,
+                content_hash: None,
+            }],
+            unit_test_files: vec![],
+            no_changes: false,
+        });
+    f.agent.set_script(script);
+    testkit::seed_task(&f.store, "t-env", "p1").await.unwrap();
+    f.admit("t-env").await;
+    f.executor.run("t-env").await.unwrap();
+
+    // 成因读数落盘（决策 392 ④ 的 develop 侧来源）：分类 environment
+    let facts = std::fs::read_to_string(
+        f.home
+            .home()
+            .task_file("t-env", "gate-failure-develop.json"),
+    )
+    .expect("环境类闸门失败应落成因文件");
+    assert!(facts.contains("environment"), "{facts}");
+
+    let transitions = f.store.list_transitions("t-env").await.unwrap();
+    assert!(
+        transitions.iter().any(|t| t.to_stage == Stage::Develop
+            && t.to_node == Node::Execute
+            && t.trigger == TransitionTrigger::NodeRetry),
+        "环境类失败应回 develop.execute 重试：{transitions:?}"
+    );
+    assert!(
+        !transitions
+            .iter()
+            .any(|t| t.to_stage == Stage::Test && t.trigger != TransitionTrigger::Start),
+        "环境类失败不得经 test 复检（用例侧造不出工具链）：{transitions:?}"
+    );
+}
+
+/// 决策 392 ③⑤：环境类失败在 merge 闸门处**不烧 `gate_failures`**（那个计数是「代码改不动」
+/// 的信号，环境问题冒充它会把信号污染掉），并直接打回 develop.execute（不进 test 复检）。
+///
+/// 构造：develop 闸门通过**之后**环境才漂移——review 阶段落一个声明不符的
+/// `rust-toolchain.toml`（106 的现实里这一步是部署 / 重启换掉了服务 env）。
+#[tokio::test]
+async fn e2e_merge_gate_environment_does_not_burn_gate_failures() {
+    let f = Flow::new().await;
+    let mut script = Script::new();
+    design_ok(&mut script);
+    script
+        .for_node(Stage::Develop, Node::Execute)
+        .write_file("impl.txt", "done\n")
+        .run_command("git add -A && git -c user.name=f -c user.email=f@l commit -m 'feat: impl'")
+        .submit(&CodeChanges {
+            branch_name: "kanban/t-env3".into(),
+            changed_files: vec![FileChangeSpec {
+                path: "impl.txt".into(),
+                action: FileAction::Create,
+                content_hash: None,
+            }],
+            unit_test_files: vec![],
+            no_changes: false,
+        });
+    script
+        .for_node(Stage::Review, Node::Execute)
+        .write_file("review-report.md", "# 评审报告\n通过\n")
+        .submit(&ReviewResult {
+            approved: true,
+            review_report_path: Some("review-report.md".into()),
+            required_changes: vec![],
+        });
+    // develop 闸门**之后**才漂移：test 落一个声明不符的工具链文件并提交进任务分支
+    // （106 的现实里这一步是部署 / 重启换掉了服务 env；这里必须提交——未跟踪的文件
+    // 过不了 merge 阶段的 rebase）。
+    script
+        .for_node(Stage::Test, Node::Execute)
+        .write_file("rust-toolchain.toml", "[toolchain]\nchannel = \"0.0.1\"\n")
+        .run_command(
+            "git add -A && git -c user.name=f -c user.email=f@l commit -m 'chore: toolchain'",
+        )
+        .write_file("test-report.md", "# 测试报告\n通过\n")
+        .submit(&TestResult {
+            passed: true,
+            test_report_path: Some("test-report.md".into()),
+            failures: vec![],
+            gate_recheck: false,
+        });
+    f.agent.set_script(script);
+    testkit::seed_task(&f.store, "t-env3", "p1").await.unwrap();
+    f.admit("t-env3").await;
+    f.executor.run("t-env3").await.unwrap();
+
+    let merge = f.store.merge_metadata("t-env3").await.unwrap().unwrap();
+    assert_eq!(merge.gate, Some(Gate::Fail));
+    assert_eq!(
+        merge.gate_failure_kind,
+        Some(GateFailureKind::Environment),
+        "环境类失败不得冒充 Test"
+    );
+    assert_eq!(
+        merge.gate_failures, 0,
+        "环境类失败不烧 gate_failures（决策 392 ⑤）"
+    );
+
+    let transitions = f.store.list_transitions("t-env3").await.unwrap();
+    assert!(
+        transitions.iter().any(|t| t.to_stage == Stage::Develop
+            && t.to_node == Node::Execute
+            && t.trigger == TransitionTrigger::Kickback),
+        "环境类失败应直接打回 develop.execute：{transitions:?}"
+    );
 }

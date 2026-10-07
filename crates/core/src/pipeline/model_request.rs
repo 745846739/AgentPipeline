@@ -504,6 +504,7 @@ async fn load_segments(ctx: &AttemptCtx<'_>) -> Result<PromptSegments> {
         )
         .await,
         zero_commit: zero_commit_facts_segment(home, &ctx.task.id, ctx.cursor).await,
+        undeclared_changes: undeclared_changes_facts_segment(home, &ctx.task.id, ctx.cursor).await,
         // 票 04：简报文本已由编排侧组好（`AttemptCtx.continuation_brief`），本函数只把它
         // 搬进段表（渲染在 `build_user_prompt`）。放在段表末尾：它是「这一轮从哪起跑」的
         // 交代，读在其余反馈段之后更顺。
@@ -659,6 +660,26 @@ async fn zero_commit_facts_segment(
     }
 }
 
+/// 决策 397：`develop_code_gate` 的申报比对判定有漏报时，把事实与补申报指令落成
+/// 任务目录下的 `undeclared-changes-facts.md`；develop.execute 重入时读回注入。
+/// 放行 / 补申报通过 / 读数降级 / 申报 `no_changes` 时该文件被守卫清除，于是段自然
+/// 为空——「首轮为空不渲染」与「已补申报不渲染」是同一支。读不到 / 读超界
+/// （决策 302）一律不渲染。
+async fn undeclared_changes_facts_segment(
+    home: &Home,
+    task_id: &str,
+    cursor: &NodeCursor,
+) -> Option<String> {
+    if cursor.stage != Stage::Develop || cursor.node != Node::Execute {
+        return None;
+    }
+    let path = home.task_file(task_id, super::executor::UNDECLARED_CHANGES_FACTS_FILE);
+    match bounded_read::read_to_string("undeclared_changes_facts", &path).await {
+        Offloaded::Done(Ok(content)) if !content.trim().is_empty() => Some(content),
+        _ => None,
+    }
+}
+
 /// 决策 133 / pipeline-spec §6：review 打回循环中，develop.execute 重入的 user prompt
 /// 追加 review 的必须修改项。
 ///
@@ -777,9 +798,10 @@ fn tool_defs(
     // 两道都留是因为它们挡的不是同一种东西：这里挡「模型看见了一个不该给的选项」，
     // 那里挡「模型无视定义硬发」。
     //
-    // 这是全仓**唯一**一处系统级设置压过强制基线的地方（[`crate::agent::baseline::BASELINE_MANDATORY_TOOLS`]
+    // 这是全仓压过强制基线的地方之一（[`crate::agent::baseline::BASELINE_MANDATORY_TOOLS`]
     // 里含 `write_file` / `run_command`）——压的方向只有收紧一种，故它是安全的：阶段配置
-    // 动不了它，只有全机档位可以。
+    // 动不了它，只有全机档位可以。另一处在下面决策 396 的阶段过滤（review / test-design
+    // 摘 `run_command`）：那不是系统级设置，而是按阶段的固定契约，两处判据独立。
     // 判据只有一处（`agent::tools::denied_by_tier`）：值班长那一侧的广告集与这里问的是同一个
     // 问题，两处各写一份谓词的后果是「一侧摘掉了、另一侧还广告着」这种只能靠现象定位的漂移。
     let denied = |name: &str| crate::agent::tools::denied_by_tier(name, env_mode);
@@ -788,6 +810,18 @@ fn tool_defs(
             continue; // 最后以 schema 形式追加（决策 38：与校验同源，不走目录表）
         }
         if denied(&name) {
+            continue;
+        }
+        // 阶段工具禁用（决策 396）：review / test-design 的模板全链路零依赖
+        // `run_command`（探查核实），def 层不给——去诱惑。执行层兜底仍在
+        // （`tools::run_command` 的阶段禁用闸），两道都留的理由与上面 `denied`
+        // 相同：这里挡「模型看见了一个不该给的选项」，那里挡「模型无视定义硬发」。
+        if name == crate::agent::catalog::RUN_COMMAND
+            && matches!(
+                stage,
+                crate::types::Stage::Review | crate::types::Stage::TestDesign
+            )
+        {
             continue;
         }
         // 扩展工具（决策 172③，票 08）：不是内置工具，但**已实现**且由阶段声明启用。
@@ -1223,6 +1257,117 @@ mod tests {
             &crate::agent::submit_metadata_tool::<crate::types::CodeChanges>("提交代码变更元数据"),
             "submit_metadata 的 schema 只能来自结构体派生（决策 38）"
         );
+    }
+
+    /// 决策 396：review / test-design 的 def 层不给 `run_command`——模板全链路零依赖
+    /// （探查核实），广告出去就是诱惑。执行层兜底在 `tools::run_command`（两层挡的不是
+    /// 同一种东西，理由见 tool_defs 内注释）。其余阶段不动：develop 靠它落提交（391）。
+    #[test]
+    fn run_command_is_not_advertised_for_review_and_test_design() {
+        use crate::types::{Node as N, Stage as S};
+        let denied_cases = [
+            (AgentNodeKind::ReviewExecute, S::Review, N::Execute),
+            (
+                AgentNodeKind::ValidateInput,
+                S::TestDesign,
+                N::ValidateInput,
+            ),
+            (AgentNodeKind::TestDesignExecute, S::TestDesign, N::Execute),
+            (
+                AgentNodeKind::DesignValidateOutput,
+                S::TestDesign,
+                N::ValidateOutput,
+            ),
+        ];
+        for (kind, stage, node) in denied_cases {
+            let defs = tool_defs(kind, &[], &[], EnvMode::Auto, stage, node).unwrap();
+            assert!(
+                !defs
+                    .iter()
+                    .any(|d| d.name == crate::agent::catalog::RUN_COMMAND),
+                "{stage}/{node} 不得广告 run_command"
+            );
+            assert!(
+                defs.iter()
+                    .any(|d| d.name == crate::agent::catalog::SUBMIT_METADATA),
+                "{stage}/{node} 的 submit_metadata schema 必须仍在"
+            );
+        }
+        // 其余阶段照旧：develop 的提交契约依赖 run_command（决策 391）
+        let defs = tool_defs(
+            AgentNodeKind::DevelopExecute,
+            &[],
+            &[],
+            EnvMode::Auto,
+            S::Develop,
+            N::Execute,
+        )
+        .unwrap();
+        assert!(
+            defs.iter()
+                .any(|d| d.name == crate::agent::catalog::RUN_COMMAND),
+            "develop 必须仍能拿到 run_command（决策 391 的提交契约）"
+        );
+        // 双层一致性（票 02 断言 3）：对全部 12 个 agent 节点，`run_command` 的
+        // 「def 层广告 ⇔ 非（review / test-design）」——两层状态必须互为镜像，
+        // 否则会出现「广告了但必拒」（浪费 attempts）或「没广告却能跑」。
+        let stage_denied = |s: S| matches!(s, S::Review | S::TestDesign);
+        for (stage, node, kind) in [
+            (
+                S::ArchitectDesign,
+                N::ValidateInput,
+                AgentNodeKind::ValidateInput,
+            ),
+            (
+                S::DevelopDesign,
+                N::ValidateInput,
+                AgentNodeKind::ValidateInput,
+            ),
+            (
+                S::TestDesign,
+                N::ValidateInput,
+                AgentNodeKind::ValidateInput,
+            ),
+            (
+                S::ArchitectDesign,
+                N::Execute,
+                AgentNodeKind::ArchitectExecute,
+            ),
+            (
+                S::DevelopDesign,
+                N::Execute,
+                AgentNodeKind::DevelopDesignExecute,
+            ),
+            (S::TestDesign, N::Execute, AgentNodeKind::TestDesignExecute),
+            (
+                S::ArchitectDesign,
+                N::ValidateOutput,
+                AgentNodeKind::DesignValidateOutput,
+            ),
+            (
+                S::DevelopDesign,
+                N::ValidateOutput,
+                AgentNodeKind::DesignValidateOutput,
+            ),
+            (
+                S::TestDesign,
+                N::ValidateOutput,
+                AgentNodeKind::DesignValidateOutput,
+            ),
+            (S::Develop, N::Execute, AgentNodeKind::DevelopExecute),
+            (S::Review, N::Execute, AgentNodeKind::ReviewExecute),
+            (S::Test, N::Execute, AgentNodeKind::TestExecute),
+        ] {
+            let advertised = tool_defs(kind, &[], &[], EnvMode::Auto, stage, node)
+                .unwrap()
+                .iter()
+                .any(|d| d.name == crate::agent::catalog::RUN_COMMAND);
+            assert_eq!(
+                advertised,
+                !stage_denied(stage),
+                "{stage}/{node}：def 层广告与执行层禁用必须互为镜像"
+            );
+        }
     }
 
     /// 决策 154 的后续票：`tool_defs` 对未知工具名**报错**，不再「静默丢弃 + 一条 warn」。
