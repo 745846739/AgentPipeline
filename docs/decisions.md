@@ -2983,3 +2983,19 @@ config.rs}`、`tests/e2e/tests/integration/stage_boundary.rs`、`docs/testing.md
 **明确不做**：不改 diff / 代码块的横滚（那是有意的，决策 341 也这么裁——窄档要的是「面板不被内容顶宽」，不是「diff 折行」）；不动 `align-items: flex-start` 的桌面档；不给这条闸门加重试。
 
 **来源**：用户（2026-10-07 报障）；补决策 341（窄版面无横向溢出的 e2e 闸门）在**产物面板**与**输入面**上的两处漏网；落地 `frontend/src/components/task/FileViewer.svelte`、`frontend/src/app.css`、`frontend/e2e/mobile-overflow.spec.ts`
+
+### 决策 400 · `spawn_sub_agent` 对三个设计阶段默认开启——「没配过」吃默认，显式配置原样生效
+
+**起因**：用户 2026-10-07 问「106 的 subagent 被调用过吗」。查证：生产库 `kanban_node_runs` 269 行只有 `main` / `system` 两种 `agent_type`，零 `subagent` 行；`stage_configs` 七行 `tools_json` 全为 `NULL`——决策 172③ 落地以来，这个只读子代理在生产上一次机会都没有过（值班长侧是有意不给，`foreman/catalog.rs` 注释写明）。功能定位（把「读 20 个文件」挡在父上下文外）天然属于检索密集的设计阶段，而「逐阶段显式声明」的门槛让它实际使用率为零。
+
+**裁决**：
+
+1. **默认面收窄为三个设计阶段**：`architect-design` / `develop-design` / `test-design` 在**未配置** `tools_json` 时默认带一条 `spawn_sub_agent` 声明——它们的工作本身就是「读一堆文件做检索再提炼结论」，正是决策 172③ 给子代理的定位场景。develop / review / test 维持显式声明（它们的读集中在 diff 与目标文件，要开走一句话配置），值班长维持有意排除（清单语义见决策 247）。
+2. **两种状态分开，不发明「负向声明」语法**：`tools_json` 显式配置（含 `[]`）**原样生效**——设计阶段给 `[]` 就是显式关闭；只有**没配过**（`NULL`）才吃默认。实现为单一助手 `effective_declared_tools(stage, tools_json)`（`model_request.rs`，常量 `SUBAGENT_DEFAULT_STAGES`）：广告侧（`RequestPlan::assemble`）与注入侧（`model_invoke` 的运行器）都从它取值，延续票 01「广告集与白名单同源」的立场——两处各算一份，迟早漂成「模型看得见一个调了就被拒的工具」。
+3. **不动安全边界**：只读三约束（工具集固定 `read_file` / `list_dir`、不继承阶段声明、不再派子代理）与 L4 边界（决策 154：子代理不作为上下文超限兜底）原样；`known_tool_names` 判据不变（显式配置里的未知名字照旧 fail fast，决策 154 后续票）；执行点「未启用」的拒答报文不改——对显式关闭的设计阶段它仍然可操作（把名字写回 `tools_json` 即启用）。
+
+**明确不做**：不给 develop / review / test 默认开启；不做 `-spawn_sub_agent` 这类负向语法（`[]` 已能表达关闭）；不动前端表单（留空 = 不下发 = 没配过 = 吃默认，语义自洽，`parseOptionalJson` 的既有行为正好是这两种状态的界）。
+
+**验证**：L1 `model_request.rs::effective_declared_tools_defaults_subagent_for_design_stages`（四象限）+ 冻结用例 `assemble_freezes_a_byte_stable_head_and_a_fixed_tool_order` 扩写为「基线序 + 默认声明序 + schema 收尾」（顺带把「声明序跟在基线序后」钉进断言）；L3 `executor.rs::spawn_sub_agent_default_on_for_design_stages_only`（全流水线：设计阶段请求全带、develop / review / test 全不带）、`spawn_sub_agent_absent_when_design_stages_opted_out`（显式 `[]` 后全流水线零出现）、`parent_spawns_subagent_on_architect_design_by_default`（端到端：零声明即派生，摘要经 tool_result 回灌）。原 `spawn_sub_agent_absent_unless_declared`（票 08）的「未声明即无」断言与默认开启冲突，其语义由上面三条接住（testing.md §对账表已注）。
+
+**来源**：用户（2026-10-07「106 的 subagent 被调用过吗」→「为什么没有调用」→「给这类默认开启」，指 architect-design / develop-design 这类检索密集的设计阶段，test-design 按同性质并入）；决策 26 / 45（默认关闭的起点）、154（v1 punt 与只读重开）、172③（票 08 实现）、247（值班长清单）；落地 `crates/core/src/pipeline/{model_request.rs, model_invoke.rs}`、`crates/core/tests/integration/executor.rs`

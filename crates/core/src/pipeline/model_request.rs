@@ -276,7 +276,10 @@ impl RequestPlan {
             cursor.stage.as_str(),
             ctx.stage_cfg,
         );
-        let declared_tools = json_string_list(ctx.stage_cfg.and_then(|c| c.tools_json.as_ref()));
+        let declared_tools = effective_declared_tools(
+            cursor.stage,
+            ctx.stage_cfg.and_then(|c| c.tools_json.as_ref()),
+        );
         // 外发开关开 → 广告集追加 `offload_run`（票 runner-offload/06）。**现读**（与 rtk
         // 开关同一姿态，决策 297）：保存即活。关着 = 广告里根本没有它（基线不含它，
         // 见 `client::BUILTIN_TOOLS` 的说明），模型的窗口一个字节不多花。`deny` 档下
@@ -824,7 +827,8 @@ fn tool_defs(
         {
             continue;
         }
-        // 扩展工具（决策 172③，票 08）：不是内置工具，但**已实现**且由阶段声明启用。
+        // 扩展工具（决策 172③，票 08）：不是内置工具，但**已实现**且由阶段声明启用
+        // （设计阶段未配置时，`effective_declared_tools` 已默认给一条声明——决策 400）。
         // 不认这一条的话，声明了 `spawn_sub_agent` 会在下面被当作「未实现」丢弃 + warn，
         // 于是声明与生效之间静默断开。
         //
@@ -912,7 +916,8 @@ pub(crate) fn submit_metadata_tool_for(kind: AgentNodeKind) -> ToolDef {
 /// 描述里明说**只读**：让模型知道子代理能做什么，才不会派它去写文件或跑命令而白等一轮。
 /// 子代理只能 read_file / list_dir，不能写文件或执行命令，也不再派子代理。
 /// 适合「读很多文件、只要结论」的场景——原文留在子代理上下文，父上下文只收摘要。
-/// 它**不在**目录表（决策 353 收的是 8 个内置工具；这是要显式声明的扩展工具）。
+/// 它**不在**目录表（决策 353 收的是 8 个内置工具；这是扩展工具——设计阶段未配置时
+/// 默认声明、其余阶段显式声明，决策 400 / 172③）。
 fn spawn_sub_agent_tool_def() -> ToolDef {
     ToolDef {
         name: crate::agent::SPAWN_SUB_AGENT_TOOL.to_string(),
@@ -1037,6 +1042,36 @@ pub(super) fn json_string_list(value: Option<&serde_json::Value>) -> Vec<String>
                 .collect()
         })
         .unwrap_or_default()
+}
+
+/// `spawn_sub_agent` 默认开启的阶段（决策 400）：三个设计阶段——它们的工作本身就是
+/// 「读一堆文件做检索再提炼结论」，正是只读子代理的定位场景（决策 172③）。其余阶段
+/// 维持「显式声明才启用」的原样；值班长侧不在此列（foreman 的工具清单有意不给它
+/// 子代理运行器，见 `pipeline/foreman/catalog.rs`）。
+pub(super) const SUBAGENT_DEFAULT_STAGES: [crate::types::Stage; 3] = [
+    crate::types::Stage::ArchitectDesign,
+    crate::types::Stage::DevelopDesign,
+    crate::types::Stage::TestDesign,
+];
+
+/// 阶段工具声明的**生效值**：`tools_json` 显式配置的原样生效（含 `[]` = 显式关闭）；
+/// **没配过**（`None`）时，设计阶段默认带一条 `spawn_sub_agent` 声明，其余阶段为空
+/// （决策 400）。
+///
+/// 广告侧（[`RequestPlan::assemble`]）与注入侧（`model_invoke` 的子代理运行器）都从
+/// 这里取值——两处若各算一份，迟早漂成「模型看得见一个调了就被拒的工具」（票 01 的
+/// 「广告集与白名单同源」在同一件事上的延续）。
+pub(super) fn effective_declared_tools(
+    stage: crate::types::Stage,
+    tools_json: Option<&serde_json::Value>,
+) -> Vec<String> {
+    match tools_json {
+        Some(value) => json_string_list(Some(value)),
+        None if SUBAGENT_DEFAULT_STAGES.contains(&stage) => {
+            vec![crate::agent::SPAWN_SUB_AGENT_TOOL.to_string()]
+        }
+        None => Vec::new(),
+    }
 }
 
 /// 从 code_changes stage output 提取变更文件 / 单元测试文件列表（每行一个路径）。
@@ -1409,6 +1444,42 @@ mod tests {
         assert!(defs.iter().any(|d| d.name == "submit_metadata"));
     }
 
+    /// 决策 400：生效声明清单——显式配置原样（`[]` = 显式关闭），没配过时设计阶段
+    /// 默认带 `spawn_sub_agent`，其余阶段为空。广告与注入两侧共用这一份。
+    #[test]
+    fn effective_declared_tools_defaults_subagent_for_design_stages() {
+        use crate::types::Stage;
+        let explicit = serde_json::json!(["read_file"]);
+        assert_eq!(
+            effective_declared_tools(Stage::ArchitectDesign, Some(&explicit)),
+            vec!["read_file".to_string()],
+            "显式配置原样生效"
+        );
+        assert_eq!(
+            effective_declared_tools(Stage::ArchitectDesign, Some(&serde_json::json!([]))),
+            Vec::<String>::new(),
+            "显式 [] = 显式关闭"
+        );
+        for stage in [
+            Stage::ArchitectDesign,
+            Stage::DevelopDesign,
+            Stage::TestDesign,
+        ] {
+            assert_eq!(
+                effective_declared_tools(stage, None),
+                vec![crate::agent::SPAWN_SUB_AGENT_TOOL.to_string()],
+                "{stage:?} 未配置时默认带 spawn_sub_agent"
+            );
+        }
+        for stage in [Stage::Develop, Stage::Review, Stage::Test, Stage::Init] {
+            assert_eq!(
+                effective_declared_tools(stage, None),
+                Vec::<String>::new(),
+                "{stage:?} 未配置时没有默认扩展工具"
+            );
+        }
+    }
+
     // ───────────────── 新增窄测试：D 桶（组装）+ E 桶（预算），只做加法 ─────────────────
 
     /// 共同基座：临时 home + 全量迁移的临时库 + 播种的项目/任务。不经 `Executor`、
@@ -1643,25 +1714,30 @@ mod tests {
         assert_eq!(first_names, names(&second), "工具定义的顺序固定");
 
         // 基线工具的**顺序就是常量里的顺序**（决策 45）：任何收集方式的抖动
-        // （`HashMap` / 并行 gather）都会在这里露出来。
+        // （`HashMap` / 并行 gather）都会在这里露出来。architect-design 未配置
+        // `tools_json`，按决策 400 默认多一条 `spawn_sub_agent` 声明——恰好把
+        // 「声明序跟在基线序之后」这一半也钉住。
         let mandated: Vec<&str> = crate::agent::client::MANDATORY_TOOLS
             .iter()
             .copied()
             .filter(|n| *n != crate::agent::catalog::SUBMIT_METADATA)
             .collect();
-        let split = first_names
-            .len()
-            .checked_sub(1)
-            .unwrap_or_else(|| panic!("工具定义不该为空"));
-        assert_eq!(
-            first_names[..split],
-            mandated[..],
-            "基线工具按常量序在前：{first_names:?}"
-        );
         assert_eq!(
             first_names.last().map(String::as_str),
             Some(crate::agent::catalog::SUBMIT_METADATA),
             "schema 工具收尾（决策 38）：{first_names:?}"
+        );
+        let body = &first_names[..first_names.len() - 1];
+        let (baseline, declared) = body.split_at(mandated.len());
+        assert_eq!(
+            baseline.iter().map(String::as_str).collect::<Vec<_>>(),
+            mandated,
+            "基线工具按常量序在前：{first_names:?}"
+        );
+        assert_eq!(
+            declared.iter().map(String::as_str).collect::<Vec<_>>(),
+            ["spawn_sub_agent"],
+            "architect-design 未配置时默认声明 spawn_sub_agent（决策 400）：{first_names:?}"
         );
     }
 

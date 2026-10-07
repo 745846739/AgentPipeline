@@ -64,7 +64,8 @@ use super::events::{
 // executor（决策 249 的接线；352 只搬事件面）。
 use super::executor::{project_or_err, CancelOrigin, CancelSignal, NodeOutput};
 use super::model_request::{
-    json_string_list, workdirs_line, AttemptCtx, BudgetCheck, OverflowFacts, Prepared, RequestPlan,
+    effective_declared_tools, workdirs_line, AttemptCtx, BudgetCheck, OverflowFacts, Prepared,
+    RequestPlan,
 };
 use super::run_ledger::{since_ms, RunLedger};
 use crate::pipeline::subagent::RunTokens;
@@ -816,12 +817,15 @@ impl ModelInvoke {
                 "阶段被配成 ask 档：环境层工具会因没有提议通道而被拒（值班长的确认钮不服务流水线节点）"
             );
         }
-        let declared_tools =
-            json_string_list(stage_cfg.as_ref().and_then(|c| c.tools_json.as_ref()));
+        let declared_tools = effective_declared_tools(
+            cursor.stage,
+            stage_cfg.as_ref().and_then(|c| c.tools_json.as_ref()),
+        );
 
-        // 子代理（决策 172③，票 08）：**只有阶段显式声明才注入运行器**。不声明时
-        // `spawn_sub_agent` 调用会拿到一句「未启用」的说明文本（工具层没有运行器），
-        // 这就是「扩展工具、默认关闭」的落点。节点级超时作为该次调用的上限（票 08）。
+        // 子代理（决策 172③，票 08）：声明了才注入运行器——显式配置原样生效，设计阶段
+        // 未配置时 `effective_declared_tools` 默认给一条（决策 400）。不声明时
+        // `spawn_sub_agent` 调用会拿到一句「未启用」的说明文本（工具层没有运行器）。
+        // 节点级超时作为该次调用的上限（票 08）。
         let sub_agent: Option<Arc<dyn crate::agent::SubAgentRunner>> = declared_tools
             .iter()
             .any(|t| t == crate::agent::SPAWN_SUB_AGENT_TOOL)
