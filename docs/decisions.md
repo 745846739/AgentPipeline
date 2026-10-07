@@ -2708,3 +2708,54 @@ run 台账与日志承载）。
 落地 `git.rs`（`push_default_branch` / `PushOutcome`）、`pipeline/merge.rs`、
 `storage/decisions.rs`、`types.rs`、`app/routes/tasks.rs`、`app/routes/foreman.rs`、
 `frontend`（DiffReviewPanel + actionSubmit + client + 两 store）。
+
+### 决策 394 · 闸门套件分支无关：一次性落地验收摘出常驻套件 + 不变量 + 机器门（收口 82dfdf1 / 00bafec 两次逐案补丁）
+
+**问题（2026-10-07 dogfood 实证）**：任务 `01M4A35GGJ53YDJRZ0R3GZTM06` 的 develop 代码闸门
+连红 4 轮。`cargo clippy` 通过，`cargo test` 红在 `-p e2e --test integration` 的 3 条
+（72 passed / 3 failed）——`ux_audit3_landing` 的 scene_07/11/17。它们判的是「ux-audit-3
+审计落地**那次**的分支 diff 形状」：改动面白名单、逐文件增删行数、四段 message 反查，取数
+一律走 `origin/main...HEAD`（三点）。任务分支上 HEAD 是本任务自己的提交，读数于是变成**那个
+任务**的 diff：`SettingsNotify` / `TaskDetail` 从没被碰过 → `numstat` 恒 (0,0)；
+`docs/glossary.md` 不在审计白名单里 → 「改动越出本票范围」。**即 develop 与 merge 的闸门对
+普通任务是死结**（连零改动的任务也过不了 scene_17 的「改动面不应为空」）。此前未暴露，是因为
+审计落地之后跑过的唯一任务是那次审计自己（分支里正是审计 diff），而 CI 在 main 上 checkout、
+守卫恰好命中。
+
+**根因**：判据锚在**瞬时状态**（「当前 HEAD 恰是某次落地」），却运行在一条要求**分支无关**的
+常驻闸门里。`82dfdf1`（scene_06 同点守卫）与 `00bafec`（scene_07/11/17 同点守卫）都是
+「CI 红一次 → 补一个跳过守卫」；第二版守卫 `head_equals_origin_main` 判的是 **HEAD 的身份**，
+覆盖不到「HEAD 是**别的**任务分支」——逐案打补丁必然漏。
+
+**决策**：
+
+1. **立不变量**：`cargo test --workspace`（develop / merge 的代码闸门，也是 CI 判据）必须在
+   **main 上绿、在任何任务分支上绿、在空分支上绿**。推论：**任何要求「HEAD 恰是某个提交 /
+   分支 diff 恰是某形状」的断言都不是闸门判据。** 写入 `docs/testing.md` §8。
+2. **归位而非换锚**：一次性**落地验收**摘出常驻套件为 `#[ignore]` 用例
+   （`ux_audit3_landing.rs::landing_shape_readings_once`、
+   `ux_audit3_artifacts.rs::artifact_shape_readings_once`，姿态同 `repo_live.rs`），
+   落地读数留档 `.scratch/ux-audit-3/IMPLEMENTATION.md`「落地形状读数」。**换锚不可行**是
+   实测结论：审计落地那几段提交在 main 上**不连续**（其间夹着 `a6cfd06` 等别的票），没有任何
+   commit range 的 diff 等于那张白名单（`a6cfd06..af241ff` 把 `crates/**` 也算进来）。
+   删 `head_equals_origin_main`（3 处调用 + 定义）与 scene_06 的三道守卫；
+   `assert_frozen_untouched` 那类读**工作区**未提交改动的判据属分支无关，照留。
+3. **机器门**：`scripts/gate-suite-branch-independence.sh`（挂 `make check-lint`）——常驻用例
+   出现 `..HEAD` 区间、或与 `diff` 同行的 `"HEAD"`，即红（注释行不算）。牙齿检查：注入违规
+   → 红；同一行放进 `#[ignore]` 用例 → 绿。
+
+**与既有决策的关系**：不动决策 147 / 166 / 331 的闸门口径；`#[ignore]` 只用一把锁
+（`#[ignore]` + reason），不像 `repo_live.rs` 那样需要环境变量第二把——这里不碰外部资源。
+
+**明确不做**：不把 develop / merge 的闸门从「全量 `cargo test`」改成「只跑相关测试」——
+「任何一个测试坏了都该拦」是正确性质，问题在套件里混进了一次性判据，不在跑全量。不给常驻
+用例留「豁免标记」的口子（真要做一次性验收就写成 `#[ignore]`）。
+
+**验证**：`make check-lint` 全绿（含本门）；`cargo test --workspace` 全绿——`-p e2e
+--test integration` 由 **72 passed / 3 failed** 转 **74 passed / 3 ignored**。反证：本机
+main 领先 `origin/main` 一个提交且该提交动了 `docs/decisions.md`，按旧判据
+`mr...HEAD -- docs/decisions.md` 实读 **+50 行**（必红），新判据不红。
+**来源**：2026-10-07 dogfood（任务 `01M4A35GGJ53YDJRZ0R3GZTM06`）；落地
+`tests/e2e/tests/integration/ux_audit3_{landing,artifacts}.rs`、`docs/testing.md` §8、
+`Makefile`、`scripts/gate-suite-branch-independence.sh`、
+`.scratch/ux-audit-3/IMPLEMENTATION.md`、`.scratch/commit-contract/README.md`。

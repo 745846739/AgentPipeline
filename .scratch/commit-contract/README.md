@@ -69,8 +69,23 @@ submit_metadata」契约锚点只有三个 validate_input 模板有（决策 277
 且两处 persona 追加都带 `trim().is_empty()` 守卫（`model_request.rs:988`、
 `model_invoke.rs:1323`），空串等价于没有追加。
 
-**仅剩一步**：用一个真实小任务做部署后验收 dogfood（用它的 develop 轮验证「提交契约生效 +
-零提交守卫不误伤」两条）。
+**dogfood 已执行（2026-10-07）**：真实小任务 `01M4A35GGJ53YDJRZ0R3GZTM06`（补术语表三条
+词条，仅改 `docs/glossary.md`）。**两条验收目标都达成**：
+
+- **提交契约生效 ✓**：develop execute 把改动落成提交 `c488d85`（message 合本仓惯例），
+  分支 `kanban/01M4A35GGJ53YDJRZ0R3GZTM06` 相对基准 `rev-list --count` = 1、工作区干净。
+- **零提交守卫不误伤 ✓**：任务目录里没有 `zero-commit-facts.md`，守卫一次都没响。
+
+**但这轮 dogfood 顺带挖出并根治了一个更严重的隐患**：develop 代码闸门连红 4 轮
+（`cargo clippy` 过，`cargo test` 红在 `-p e2e --test integration` 的 3 条、72 passed /
+3 failed），红的是 ux-audit-3「落地验收」场景 scene_07/11/17——它们按 `origin/main...HEAD`
+判「审计落地那次的分支 diff 形状」，在任何**别的**任务分支上必红。也就是：**develop 与
+merge 的闸门对普通任务走不通**，任何任务都过不了。任务因此被人工取消。
+
+根因与处置记为闸门套件的**分支无关性**不变量：判据必须持久、不能锚在瞬时状态
+（`docs/testing.md` §8）；一次性落地验收摘成 `#[ignore]` 用例，读数留档于
+`.scratch/ux-audit-3/IMPLEMENTATION.md`；并由 `scripts/gate-suite-branch-independence.sh`
+（挂 `make check-lint`）机器强制。
 
 共识裁决记录（2026-10-06 grill 会话）：解卡走 develop（不手工代提交，保场景 17 判据）；
 契约归模板（message 语义属目标项目域，系统不接管）；merge 空分支直接打回 develop

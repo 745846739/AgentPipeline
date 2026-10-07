@@ -217,3 +217,28 @@ cd frontend && UX_AUDIT3=1 AGENTPIPELINE_E2E_BIN=/root/.agentpipeline/shared-tar
 - 本地闸门（lint / vitest / svelte-check / build / 目标 e2e 窄跑）全绿，见文首汇总表。
 - 全量 `make check` / `check-e2e` 按决策 331 交 CI。
 - 提交按票切四段：票 05 / 票 08 / 票 13 / 本记录文件，message 带「票 NN（ux-audit-3）」。
+
+## 落地形状读数（一次性验收，锚在「落地那次的分支 diff」）
+
+这组读数判的是**审计那一轮的分支 diff 形状**。审计合入 main 之后已不存在任何检出能重现
+它，故从常驻闸门套件摘出为 `#[ignore]`，读数留档于此（判据定位见 `docs/testing.md` §8）：
+
+- `tests/e2e/tests/integration/ux_audit3_landing.rs::landing_shape_readings_once`
+- `tests/e2e/tests/integration/ux_audit3_artifacts.rs::artifact_shape_readings_once`
+
+| 判据 | 读数 | 出处 |
+|---|---|---|
+| 场景 7：SettingsNotify 恰改 3 行 | `(3, 3)` | 落地提交 `d7bfcc9`（票 08） |
+| 场景 7：SettingsTools 恰改 1 行 | `(1, 1)` | 落地提交 `d7bfcc9`（票 08） |
+| 场景 11：TaskDetail 只增 13 行、0 删除 | `(13, 0)` | 落地提交 `116745b`（票 13） |
+| 场景 17①：改动面白名单 | `frontend/src/` ∪ `frontend/e2e/` ∪ `.scratch/ux-audit-3/IMPLEMENTATION.md` ∪ `tests/e2e/tests/integration/` | 落地那一段 |
+| 场景 17④：四段 message 反查 | 含「票 05 / 08 / 13（ux-audit-3）」 | 落地那一段 |
+| 场景 6：产品代码（`frontend/src` + `crates`）零 diff | 空 | 审计轮 |
+| 场景 5：`docs/decisions.md` 本轮未动 | 空 | 审计轮 |
+| 场景 9：前两轮 spec 本轮未动 | 空 | 审计轮 |
+
+**为什么不能改成「锚在提交区间」**：审计落地的那几段提交（票 05 `a9562d5`、票 08 `d7bfcc9`、
+票 13 `116745b`、用例与记录 `af241ff`）在 main 上**不连续**——其间夹着别的票的提交
+（如 `a6cfd06`），没有任何 commit range 的 diff 等于上面这张白名单（实测 `a6cfd06..af241ff`
+把 `crates/**` 也算进来）。按分支取数的判据描述的是**任务分支**的那一次 diff，不是持久事实，
+故只能归位到台账。

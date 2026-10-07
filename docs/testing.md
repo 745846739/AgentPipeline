@@ -322,6 +322,12 @@ harness = FakeAgent（§3.2）+ testkit fixture（§3.3）+ 临时 home + 手动
 | E2E-23 | 取消传播 | §12.3 | cancel → worktree 强制清理、分支删除、依赖任务 pending(dependency_failed)、SSE `task_cancelled` | P2 |
 | E2E-24 | resume 防连点 | 36 / §3 | cooldown 内第二次 resume 不重复 spawn（单执行者守卫） | P2 |
 
+**闸门套件的分支无关性（不变量）。** `cargo test --workspace`（`make check-test`）既是 develop / merge 阶段的**代码闸门**，也是 CI 的判据——它必须在 **main 上绿、在任何任务分支上绿、在空分支上绿**。推论一句话就够判：**任何要求「当前 HEAD 恰好是某个特定提交、或某个分支 diff 恰好长成某形状」的断言，都不是闸门判据。**
+
+这类判据（审计落地那一轮的 `{merge-base}...HEAD` 形状、逐文件增删行数与白名单、四段 message 反查）描述的是**任务分支的那一次 diff**，一合入 main 就再无检出能重现它——审计落地的那几段提交在 main 上还不连续，连「锚到某个 commit range」都做不到。留在常驻套件里就会在**每一个**任务分支上假红，把 develop / merge 整体卡死。2026-10-07 dogfood 实证：任务 `01M4A35GGJ53YDJRZ0R3GZTM06` 的 develop 闸门连红 4 轮（`ux_audit3_landing` 的 scene_07/11/17 三条假红），任务最终只能人工取消。处置按 `repo_live.rs` 同款 `#[ignore]` 把一次性**落地验收**摘出常驻套件（`ux_audit3_landing.rs::landing_shape_readings_once`、`ux_audit3_artifacts.rs::artifact_shape_readings_once`），落地读数留档在 `.scratch/ux-audit-3/IMPLEMENTATION.md` 的「落地形状读数」一节。
+
+这条不变量由 `scripts/gate-suite-branch-independence.sh` 机器强制（挂在 `make check-lint`）：常驻用例里出现按 HEAD 取数的 git 调用（`..HEAD` 区间、`diff HEAD`）即红——它自己就是一条「把一类错误做成机器门」的判据（与 §9 的静态扫描守卫同一姿态：不靠人 review 撞上，靠门拦下）。
+
 ## 9. 前端测试（决策 150 / 151）
 
 | 层 | 工具 | 用例 |

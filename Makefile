@@ -71,6 +71,9 @@ check: check-lint check-test check-frontend check-e2e
 check-lint:
 	cargo fmt --all -- --check
 	cargo clippy --workspace --all-targets -- -D warnings
+# 闸门套件的分支无关性（docs/testing.md §8 的不变量）：常驻用例不得按 HEAD 取数。
+# 纯静态扫描，秒级；与「把一类错误做成机器门」的既有姿态一致。
+	bash scripts/gate-suite-branch-independence.sh
 
 # 全量测试是**冷启动最贵的一步**：它为每个集成测试文件各链接一个独立二进制。
 # 决策 218 把 33 个集成文件按 crate 合成 3 个二进制（测试二进制 37 → 7），实测

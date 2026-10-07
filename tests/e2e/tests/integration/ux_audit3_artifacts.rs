@@ -834,29 +834,13 @@ fn scene_05_prior_round_links_resolve_and_wontfix_stays_closed() {
         }
     }
 
-    // 决策 215/216/217 是既成裁决：正文存在 + 本轮一字未动（历史守卫见文件头）。
+    // 决策 215/216/217 是既成裁决：正文存在（分支无关判据，照跑）。
+    // 「本轮一字未动」那半句按 `{merge-base}...HEAD` 取数——那是**审计那一轮**的分支 diff，
+    // 已摘到 `#[ignore]` 的 `artifact_shape_readings_once`（按分支取数不是闸门判据，见
+    // `docs/testing.md` §8）。
     let decisions = read(&root, "docs/decisions.md");
     for dn in ["决策 215", "决策 216", "决策 217"] {
         assert!(decisions.contains(dn), "decisions.md 应有 {dn}");
-    }
-    if let Some(mb) = merge_base(&root) {
-        let diff = git(
-            &root,
-            &[
-                "diff",
-                "--stat",
-                &format!("{mb}...HEAD"),
-                "--",
-                "docs/decisions.md",
-            ],
-        )
-        .expect("diff decisions");
-        assert!(
-            diff.trim().is_empty(),
-            "本轮改了 docs/decisions.md——wontfix 裁决不得就地翻案：\n{diff}"
-        );
-    } else {
-        eprintln!("场景 5：merge-base 不可得——决策 215/216/217 未动的 diff 断言跳过（台账见证据）");
     }
 
     // 漂移面来源核对（design §1-B 点名的新开面逐条在册）。
@@ -889,49 +873,16 @@ fn scene_05_prior_round_links_resolve_and_wontfix_stays_closed() {
 // ─────────────────────────── 场景 6（AC-7） ───────────────────────────
 
 /// 产品代码零 diff；分支变更只落白名单（+ 本阶段测试文件）；.gitignore 恰 +注释+一行 glob。
+///
+/// **`#[ignore]`（一次性落地形状验收）**：判据是「审计那一轮的**分支 diff**」——一落 main
+/// 就再也取不到（`origin/main` 上已不存在任何区间能重现它，见 `docs/testing.md` §8）。原先
+/// 靠三道守卫（shallow / 同点 / 审计产物已在基准树）把它挡在自动门外，仍会在**别的**任务
+/// 分支上假红。重跑：`cargo test -p e2e --test integration scene_06_ -- --ignored`。
 #[test]
+#[ignore = "一次性落地形状验收：锚在审计那一轮的分支 diff 上，不是分支无关的回归判据"]
 fn scene_06_product_code_zero_diff_and_sole_allowed_changes() {
     let root = root();
-    let Some(mb) = merge_base(&root) else {
-        eprintln!(
-            "场景 6：merge-base HEAD origin/main 不可得（depth=1 checkout）——\
-             diff 断言跳过；本机完整证据见 test-report.md 命令台账"
-        );
-        return;
-    };
-    if git(&root, &["rev-parse", "HEAD"]).is_some_and(|h| h.trim() == mb) {
-        // 合入 main 后 origin/main 与 HEAD 同点，`mb...HEAD` 恒为空集——
-        // 「零 diff」「白名单外无变更」会碰巧虚过，「spec 在变更里」则假红。
-        eprintln!(
-            "场景 6：HEAD 与 origin/main 同点（审计已合入 main）——\
-             diff 断言跳过；合入前证据见 test-report.md 命令台账"
-        );
-        return;
-    }
-    // 第三个守卫：审计轮已收口、当前分支**不是审计轮**时，本用例的
-    // 「分支 diff 只落白名单 + 产品零 diff + .gitignore 恰 +2 行」是**审计那一轮**的
-    // 点断言（判据原样来自审计 design §2 / AC-7）。把它套到后续任何**按设计就要改产品**
-    // 的任务分支上必然假红——那一轮确实动 frontend/src，且 `.gitignore` 的 +2 行是审计
-    // 提交自己的改动，后续分支上取不到。判据：审计产物已在基准树里 = 审计轮已进 main。
-    // 审计轮当轮的证据由 test-report.md 命令台账承载（本文件 scene_07/13 与
-    // ux_audit3_landing 继续管产物质检，不受此守卫影响）。
-    let audit_in_base = git(
-        &root,
-        &["cat-file", "-e", &format!("origin/main:{AUDIT_README_REL}")],
-    )
-    .is_some()
-        && git(
-            &root,
-            &["cat-file", "-e", &format!("origin/main:{SPEC_REL}")],
-        )
-        .is_some();
-    if audit_in_base {
-        eprintln!(
-            "场景 6：审计产物已在 origin/main（审计轮已收口，本分支非审计轮）——\
-             分支 diff 作用域断言跳过；审计轮当轮证据见 test-report.md 命令台账"
-        );
-        return;
-    }
+    let mb = merge_base(&root).expect("merge-base HEAD origin/main 应可得（本用例需完整历史）");
     let range = format!("{mb}...HEAD");
 
     // AC-7 点名口径：frontend/src 与 crates 字面零 diff。
@@ -1156,26 +1107,8 @@ fn scene_09_prior_audit_specs_untouched() {
     ] {
         assert!(root.join(spec).exists(), "{spec} 应在位");
     }
-    let Some(mb) = merge_base(&root) else {
-        eprintln!("场景 9：merge-base 不可得——spec 零 diff 断言跳过（台账见证据）");
-        return;
-    };
-    let diff = git(
-        &root,
-        &[
-            "diff",
-            "--stat",
-            &format!("{mb}...HEAD"),
-            "--",
-            "frontend/e2e/ux-audit.spec.ts",
-            "frontend/e2e/ux-audit-2.spec.ts",
-        ],
-    )
-    .expect("diff 既有 spec");
-    assert!(
-        diff.trim().is_empty(),
-        "本轮改了前两轮 spec（抢救性修复已由决策 377① 于此前直推）：\n{diff}"
-    );
+    // 「前两轮 spec 本轮零 diff」是**审计那一轮**的分支 diff 判据，已摘到 `#[ignore]` 的
+    // `artifact_shape_readings_once`（按分支取数不是闸门判据，见 `docs/testing.md` §8）。
 }
 
 // ─────────────────────────── 场景 10（AC-8） ───────────────────────────
@@ -1459,4 +1392,51 @@ fn scene_15_interruptible_selfcontained_checklist() {
             &commit[..7.min(commit.len())]
         );
     }
+}
+
+/// 一次性**落地形状**验收（`#[ignore]`，不进任何自动门）。
+///
+/// 收集本文件里按 `{merge-base}...HEAD`（**审计那一轮的分支 diff**）取数的两条读数：
+/// 场景 5「决策 215/216/217 本轮一字未动」、场景 9「前两轮 spec 本轮零 diff」。这两条在
+/// 审计合入 main 之后已经没有能重现它们的检出——留在常驻套件里就会在**每一个**任务分支上
+/// 假红（2026-10-07 dogfood 实证同类：任务 01M4A35GGJ53YDJRZ0R3GZTM06 的 develop 闸门
+/// 连红 4 轮）。故按「闸门套件必须分支无关」的不变量（`docs/testing.md` §8）摘出。
+///
+/// 重跑：`cargo test -p e2e --test integration artifact_shape_readings_once -- --ignored`
+/// ——只在「分支 diff 恰为审计那一轮」的检出上会通过；别的分支上失败是**预期**。
+#[test]
+#[ignore = "一次性落地形状验收：锚在审计那一轮的分支 diff 上，不是分支无关的回归判据"]
+fn artifact_shape_readings_once() {
+    let root = root();
+    let mb = merge_base(&root).expect("merge-base HEAD origin/main 应可得（本用例需完整历史）");
+    let range = format!("{mb}...HEAD");
+
+    // 场景 5：决策 215/216/217 本轮一字未动。
+    let diff = git(
+        &root,
+        &["diff", "--stat", &range, "--", "docs/decisions.md"],
+    )
+    .expect("diff decisions");
+    assert!(
+        diff.trim().is_empty(),
+        "本轮改了 docs/decisions.md——wontfix 裁决不得就地翻案：\n{diff}"
+    );
+
+    // 场景 9：前两轮 spec 本轮零 diff。
+    let diff = git(
+        &root,
+        &[
+            "diff",
+            "--stat",
+            &range,
+            "--",
+            "frontend/e2e/ux-audit.spec.ts",
+            "frontend/e2e/ux-audit-2.spec.ts",
+        ],
+    )
+    .expect("diff 既有 spec");
+    assert!(
+        diff.trim().is_empty(),
+        "本轮改了前两轮 spec（抢救性修复已由决策 377① 于此前直推）：\n{diff}"
+    );
 }

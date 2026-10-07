@@ -52,12 +52,14 @@ fn git_out(root: &Path, args: &[&str]) -> String {
     git(root, args).unwrap_or_else(|| panic!("git {args:?} 返回非零"))
 }
 
-/// 变更面：`git status --porcelain`（含未跟踪）∪ `git diff --name-only HEAD` ∪ 分支相对基准的 diff（提交后时序）。
+/// 变更面：`git status --porcelain`（含未跟踪）∪ `git diff --name-only HEAD` ∪ 分支相对基准的 diff。
 ///
-/// 「分支相对基准」用**三点** `origin/main...HEAD`（= `merge-base(origin/main, HEAD)..HEAD`）。
-/// **不能用两点**：任务分支提交落盘后，分支与 `origin/main` 各自向前走，两点 `origin/main..HEAD`
-/// 退化成「两棵树的直接差」，会把 **main 侧**（long-run-budget / 读路径批二等邻接任务）的改动
-/// 一起算进来，凭空造出「越出本票范围」的假红。
+/// **只服务 `#[ignore]` 的 [`landing_shape_readings_once`]**：它读的是「审计落地**那时**的分支
+/// diff」这个**瞬时**状态——在别的分支上读到的就是**那个分支**的 diff。故它不属闸门套件
+/// （闸门套件必须分支无关，见 `docs/testing.md` §8）。**常驻场景一律不得调用它。**
+///
+/// 「分支相对基准」用**三点** `origin/main...HEAD`（= `merge-base(origin/main, HEAD)..HEAD`）；
+/// 两点 `origin/main..HEAD` 会把 main 侧邻接任务的改动一起算进来。
 fn changed_paths(root: &Path) -> Vec<String> {
     let mut set = BTreeSet::new();
     if let Some(st) = git(root, &["status", "--porcelain"]) {
@@ -95,6 +97,9 @@ fn changed_paths(root: &Path) -> Vec<String> {
 }
 
 /// `(新增行, 删除行)`；无 diff 时 (0, 0)。
+///
+/// **只服务 `#[ignore]` 的 [`landing_shape_readings_once`]**，理由同 [`changed_paths`]——
+/// 按分支取数，不是分支无关判据。**常驻场景一律不得调用它。**
 fn numstat(root: &Path, rel: &str) -> (usize, usize) {
     let mut out = git_out(root, &["diff", "--numstat", "HEAD", "--", rel]);
     if out.trim().is_empty() {
@@ -110,21 +115,6 @@ fn numstat(root: &Path, rel: &str) -> (usize, usize) {
     let add = it.next().unwrap_or("0").parse().unwrap_or(0);
     let del = it.next().unwrap_or("0").parse().unwrap_or(0);
     (add, del)
-}
-
-/// HEAD 与 `origin/main` 是否**同点**（= 审计已合入 main，CI 就是在这一点上 checkout 的）。
-///
-/// 同点时三点式 `origin/main...HEAD` 退化为空集，于是 `changed_paths` 与 `numstat` 恒为
-/// 空集 / (0,0)——「改动面白名单」「恰改 N 行」这类**按分支取数**的断言会假红。先例是
-/// `ux_audit3_artifacts.rs::scene_06`（82dfdf1，CI check 37411293557 实证）：那处的做法是
-/// 同点时跳过该部分实断言并打 stdout 说明，这里照办。
-///
-/// `merge-base` 取不到（CI 的 depth=1 checkout）时返回 false，走各场景原有的降级路径。
-fn head_equals_origin_main(root: &Path) -> bool {
-    let Some(mb) = git(root, &["merge-base", "HEAD", "origin/main"]) else {
-        return false;
-    };
-    git(root, &["rev-parse", "HEAD"]).is_some_and(|h| h.trim() == mb.trim())
 }
 
 /// 断言 `needles` 按顺序全部出现在 `hay` 里（段间次序不可调换）。
@@ -550,23 +540,10 @@ fn scene_07_four_literal_stars_become_b_elements() {
         !read(&root, tools).contains("**不改写**"),
         "场景 7：旧字面形态残留 → **不改写**"
     );
-    // 只修这四处：删除量恰好 3 + 1
-    // 同点时三点式 diff 为空集、numstat 恒 (0,0)——跳过这组读数，理由见
-    // `head_equals_origin_main`；合入前的读数在 test-report.md 的命令台账里。
-    if head_equals_origin_main(&root) {
-        eprintln!("场景 7：HEAD 与 origin/main 同点（审计已合入 main）——numstat 断言跳过");
-    } else {
-        assert_eq!(
-            numstat(&root, notify),
-            (3, 3),
-            "场景 7：SettingsNotify 应恰改 3 行"
-        );
-        assert_eq!(
-            numstat(&root, tools),
-            (1, 1),
-            "场景 7：SettingsTools 应恰改 1 行"
-        );
-    }
+    // 「只修这四处：删除量恰好 3 + 1」是**落地那时**的分支 diff 读数，已摘到
+    // `#[ignore]` 的 `landing_shape_readings_once`（按分支取数不是闸门判据，见该用例）。
+    // 实测读数（SettingsNotify (3,3) / SettingsTools (1,1)，落地提交 d7bfcc9）留档于
+    // `.scratch/ux-audit-3/IMPLEMENTATION.md`；本场景按**文件内容**的判据照旧全跑。
 }
 
 /// 场景 8（AC-3 / 票 08）：copy-discipline 机器门——四用例 + 全站扫描 hits === []（Rust 独立复算）。
@@ -744,49 +721,10 @@ fn scene_10_band_boundaries_1100_and_819() {
 fn scene_11_detail_other_rules_untouched() {
     let root = root();
     let rel = "frontend/src/routes/TaskDetail.svelte";
-    // 同点时两点/三点 diff 全为空，numstat 恒 (0,0)、`added` 为空——按分支取数的那组
-    // 断言跳过（理由见 `head_equals_origin_main`）；下面按**文件内容**的行号/内容双钉
-    // 照旧跑，本场景的实断言面不减。
-    if head_equals_origin_main(&root) {
-        eprintln!("场景 11：HEAD 与 origin/main 同点（审计已合入 main）——diff / numstat 断言跳过");
-    } else {
-        assert_eq!(
-            numstat(&root, rel),
-            (13, 0),
-            "场景 11：本票只许增 13 行（决策 215 注释 + 媒体查询），0 删除"
-        );
-        let mut diff = git_out(&root, &["diff", "HEAD", "--", rel]);
-        if diff.trim().is_empty() {
-            // 提交后时序：正文取分支相对基准的 diff（三点，避开 main 侧邻接任务的改动）
-            diff = git_out(&root, &["diff", "origin/main...HEAD", "--", rel]);
-        }
-        let added: Vec<&str> = diff
-            .lines()
-            .filter(|l| l.starts_with('+') && !l.starts_with("+++"))
-            .collect();
-        assert!(
-            added
-                .iter()
-                .any(|l| l.contains("@media (min-width: 820px) and (max-width: 1099px)")),
-            "场景 11：新增行应含媒体查询"
-        );
-        assert!(
-            added.iter().any(|l| l.contains("minmax(480px, 1fr) 280px")),
-            "场景 11：新增行应含折行档列串"
-        );
-        assert!(
-            added.iter().all(|l| !l.contains("overflow-x")),
-            "场景 11：新增行不许引 overflow-x"
-        );
-        assert!(
-            added.iter().all(|l| !l.contains("minmax(0, 1fr) 320px")),
-            "场景 11：桌面档列串不许出现在改动行"
-        );
-        assert!(
-            !diff.contains("overflow"),
-            "场景 11：本票 diff 不许触碰 overflow（hero 溢出属票 01 wontfix 面）"
-        );
-    }
+    // 「本票只许增 13 行、新增行含媒体查询/折行档列串、不引 overflow」是**落地那时**的分支
+    // diff 读数，已摘到 `#[ignore]` 的 `landing_shape_readings_once`（按分支取数不是闸门
+    // 判据）。实测读数（(13,0)，落地提交 116745b）留档于
+    // `.scratch/ux-audit-3/IMPLEMENTATION.md`；下面按**文件内容**的行号/内容双钉照旧全跑。
     // 既有的 `overflow-x: auto`（决策 393 前在 961 行的预存在规则）必须落在本票改动块（现 672–684）之外
     let td = read(&root, rel);
     let overflow_lines: Vec<usize> = td
@@ -820,11 +758,7 @@ fn scene_11_detail_other_rules_untouched() {
         "align-items: start;",
         "场景 11：align-items 被动"
     );
-    let changed = changed_paths(&root);
-    assert!(
-        !changed.iter().any(|p| p.contains("PipelineRail")),
-        "场景 11：hero 轨道 PipelineRail 不在改动面"
-    );
+    // 「hero 轨道 PipelineRail 不在改动面」同样按分支取数，已摘到 `landing_shape_readings_once`。
 }
 
 /// 场景 12（AC-4 / 票 13）：geometry 新用例不测横向溢出（裁量写进注释，断言只管列串）。
@@ -974,36 +908,11 @@ fn scene_16_gate_summary_documented() {
 fn scene_17_change_scope_and_evidence_freeze() {
     let root = root();
     let impl_md = read(&root, ".scratch/ux-audit-3/IMPLEMENTATION.md");
-    // ① 改动面白名单（tests/ 一份是本测试阶段自身的硬产出，非产品改动）
-    let allowed: &[&str] = &[
-        "frontend/src/",
-        "frontend/e2e/",
-        ".scratch/ux-audit-3/IMPLEMENTATION.md",
-        "tests/e2e/tests/integration/",
-    ];
-    let changed = changed_paths(&root);
-    // 同点时改动面读不到（`changed` 恒为空集）：`!is_empty` 会假红，白名单循环则以
-    // 「空集不越界」虚过。跳过并打说明（先例见 `head_equals_origin_main`）；合入前的
-    // 读数在 test-report.md 的命令台账里。
-    if head_equals_origin_main(&root) {
-        eprintln!("场景 17：HEAD 与 origin/main 同点（审计已合入 main）——改动面白名单断言跳过");
-    } else {
-        assert!(!changed.is_empty(), "场景 17：改动面不应为空");
-        for p in &changed {
-            assert!(
-                allowed.iter().any(|a| p.starts_with(a)),
-                "场景 17：改动越出本票范围 → {p}"
-            );
-        }
-    }
-    // ② 审计冻结文件零 diff（README / 13 张票 / 复跑 spec）
+    // ① 改动面白名单 + ②「冻结文件不在改动面」：两条都按**落地那次的分支 diff** 取数，
+    //    已摘到 `#[ignore]` 的 `landing_shape_readings_once`（按分支取数不是闸门判据——
+    //    在任何任务分支上读到的都是**那个任务**的 diff，见 `docs/testing.md` §8）。
+    // ②′ 冻结面仍留一道**分支无关**的实断言：工作区里不许有冻结文件的未提交改动。
     assert_frozen_untouched(&root);
-    for f in FROZEN {
-        assert!(
-            !changed.iter().any(|p| p.starts_with(f)),
-            "场景 17：冻结文件混进改动面 → {f}"
-        );
-    }
     // ③ 证据文件在位：实施记录 + 两张截图——**两张都可能缺**。`.gitignore:30` 明写
     //    `.scratch/ux-audit-3/*.png` 不入库（`UX_AUDIT3=1` 跑 e2e/ux-audit-3.spec.ts 可重生成），
     //    故全新 checkout（CI 就是）里两张都不会在——把「截图没入库」当缺陷红是判据错位。
@@ -1027,30 +936,134 @@ fn scene_17_change_scope_and_evidence_freeze() {
             );
         }
     }
-    // ④ 四段提交 message 反查票面——提交发生在 merge 阶段（决策 2296），
-    //    本阶段 {merge-base}..HEAD 为空属正常时序；有提交则逐段核 message。
+    // ④ 四段提交 message 反查票面——同样按 `{merge-base}..HEAD` 取数，已摘到
+    //    `landing_shape_readings_once`（落地那次的四段 message：票 05 / 08 / 13 + ux-audit-3）。
+}
+
+/// 一次性**落地形状**验收（`#[ignore]`，不进任何自动门）。
+///
+/// 这里收集的是「ux-audit-3 那次落地**当时**的分支 diff 形状」判据：改动面白名单、逐文件
+/// 增删行数、新增行内容、hero 轨道是否被碰、四段 message 反查。它们的锚点是**落地那一次
+/// 的分支 diff**，不是任何持久状态——审计合入 main 之后（且 main 上还夹着别的提交），
+/// 已不存在任何提交区间能让它们成立。
+///
+/// 留在常驻套件里就会在**每一个**任务分支上假红，把 develop / merge 的 `cargo test` 闸门
+/// 整体卡死：2026-10-07 dogfood（任务 01M4A35GGJ53YDJRZ0R3GZTM06）连红 4 轮实证。
+/// 故按「闸门套件必须分支无关」的不变量（`docs/testing.md` §8）摘出为 `#[ignore]`。
+///
+/// 落地时的实测读数留档于 `.scratch/ux-audit-3/IMPLEMENTATION.md`（「落地形状读数」一节）：
+/// SettingsNotify (3,3) / SettingsTools (1,1)（提交 `d7bfcc9`）、TaskDetail (13,0)（`116745b`）。
+///
+/// 重跑：`cargo test -p e2e --test integration landing_shape_readings_once -- --ignored`
+/// ——只在「分支 diff 恰为那次审计落地」的检出上会通过（例如把审计那几段 cherry-pick 到
+/// 一个干净基准上）；在任何别的分支上失败是**预期**，不是回归。
+#[test]
+#[ignore = "一次性落地形状验收：锚在审计落地那次的分支 diff 上，不是分支无关的回归判据"]
+fn landing_shape_readings_once() {
+    let root = root();
+    let notify = "frontend/src/routes/SettingsNotify.svelte";
+    let tools = "frontend/src/routes/SettingsTools.svelte";
+    let td = "frontend/src/routes/TaskDetail.svelte";
+
+    // 场景 7：只修这四处——删除量恰好 3 + 1
+    assert_eq!(
+        numstat(&root, notify),
+        (3, 3),
+        "场景 7：SettingsNotify 应恰改 3 行"
+    );
+    assert_eq!(
+        numstat(&root, tools),
+        (1, 1),
+        "场景 7：SettingsTools 应恰改 1 行"
+    );
+
+    // 场景 11：TaskDetail 纯 13 行新增；新增行内容与「不碰 overflow」
+    assert_eq!(
+        numstat(&root, td),
+        (13, 0),
+        "场景 11：本票只许增 13 行（决策 215 注释 + 媒体查询），0 删除"
+    );
+    let mut diff = git_out(&root, &["diff", "HEAD", "--", td]);
+    if diff.trim().is_empty() {
+        // 提交后时序：正文取分支相对基准的 diff（三点，避开 main 侧邻接任务的改动）
+        diff = git_out(&root, &["diff", "origin/main...HEAD", "--", td]);
+    }
+    let added: Vec<&str> = diff
+        .lines()
+        .filter(|l| l.starts_with('+') && !l.starts_with("+++"))
+        .collect();
+    assert!(
+        added
+            .iter()
+            .any(|l| l.contains("@media (min-width: 820px) and (max-width: 1099px)")),
+        "场景 11：新增行应含媒体查询"
+    );
+    assert!(
+        added.iter().any(|l| l.contains("minmax(480px, 1fr) 280px")),
+        "场景 11：新增行应含折行档列串"
+    );
+    assert!(
+        added.iter().all(|l| !l.contains("overflow-x")),
+        "场景 11：新增行不许引 overflow-x"
+    );
+    assert!(
+        added.iter().all(|l| !l.contains("minmax(0, 1fr) 320px")),
+        "场景 11：桌面档列串不许出现在改动行"
+    );
+    assert!(
+        !diff.contains("overflow"),
+        "场景 11：本票 diff 不许触碰 overflow（hero 溢出属票 01 wontfix 面）"
+    );
+
+    let changed = changed_paths(&root);
+    assert!(
+        !changed.iter().any(|p| p.contains("PipelineRail")),
+        "场景 11：hero 轨道 PipelineRail 不在改动面"
+    );
+
+    // 场景 17 ①：改动面白名单（tests/ 一份是本测试阶段自身的硬产出，非产品改动）
+    let allowed: &[&str] = &[
+        "frontend/src/",
+        "frontend/e2e/",
+        ".scratch/ux-audit-3/IMPLEMENTATION.md",
+        "tests/e2e/tests/integration/",
+    ];
+    assert!(!changed.is_empty(), "场景 17：改动面不应为空");
+    for p in &changed {
+        assert!(
+            allowed.iter().any(|a| p.starts_with(a)),
+            "场景 17：改动越出本票范围 → {p}"
+        );
+    }
+    // 场景 17 ②：冻结文件不在改动面
+    for f in FROZEN {
+        assert!(
+            !changed.iter().any(|p| p.starts_with(f)),
+            "场景 17：冻结文件混进改动面 → {f}"
+        );
+    }
+
+    // 场景 17 ④：四段提交 message 反查票面
     let mb = git_out(&root, &["merge-base", "HEAD", "origin/main"])
         .trim()
         .to_string();
     let log = git(&root, &["log", "--format=%s", &format!("{mb}..HEAD")]).unwrap_or_default();
-    if log.trim().is_empty() {
-        eprintln!(
-            "场景 17：{mb}..HEAD 尚无提交（本流水线提交在 merge 阶段发生），四段 message 断言移交合并闸门"
-        );
-    } else {
-        for seg in [
-            "票 05（ux-audit-3）",
-            "票 08（ux-audit-3）",
-            "票 13（ux-audit-3）",
-        ] {
-            assert!(
-                log.contains(seg),
-                "场景 17：四段 message 缺段 → {seg}\n{log}"
-            );
-        }
+    assert!(
+        !log.trim().is_empty(),
+        "场景 17：{mb}..HEAD 无提交——本用例要求当前检出落在审计落地那一段提交上"
+    );
+    for seg in [
+        "票 05（ux-audit-3）",
+        "票 08（ux-audit-3）",
+        "票 13（ux-audit-3）",
+    ] {
         assert!(
-            log.contains("ux-audit-3"),
-            "场景 17：message 无法反查票面\n{log}"
+            log.contains(seg),
+            "场景 17：四段 message 缺段 → {seg}\n{log}"
         );
     }
+    assert!(
+        log.contains("ux-audit-3"),
+        "场景 17：message 无法反查票面\n{log}"
+    );
 }
