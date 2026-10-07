@@ -8,6 +8,8 @@ export interface SubmitOptions {
   input?: string;
   /** 该动作所属 pending 的类型（用于 endpoint 行内解析，决策 130）。 */
   pendingType?: PendingKind;
+  /** merge approve 的「合入后 push」开关（决策 393）。 */
+  push?: boolean;
 }
 
 /**
@@ -58,7 +60,7 @@ export async function submitAllowedAction(
       return;
     }
     case '/merge/decision': {
-      await mergeDecision(taskId, action.action === 'approve' ? 'approve' : 'return');
+      await mergeDecision(taskId, action.action === 'approve' ? 'approve' : 'return', options.push === true);
       return;
     }
     default:

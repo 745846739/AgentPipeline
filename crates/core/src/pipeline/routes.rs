@@ -299,6 +299,7 @@ mod tests {
             conflict_files: Vec::new(),
             approval: Approval::None,
             status: MergeStatus::PendingApproval,
+            push_after_merge: false,
         }
     }
 

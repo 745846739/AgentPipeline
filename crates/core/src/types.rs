@@ -1056,6 +1056,10 @@ pub struct MergeResult {
     pub approval: Approval,
     #[serde(default)]
     pub status: MergeStatus,
+    /// 合入后是否 push 到远端（决策 393）：approve 时由用户勾选，随 merge_result 落库；
+    /// 仓没有 remote 时跳过、不算失败。
+    #[serde(default)]
+    pub push_after_merge: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize, JsonSchema)]

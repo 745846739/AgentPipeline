@@ -696,19 +696,20 @@ async fn merge_decision_approve_and_return_move_the_cursor() {
         .await
         .unwrap();
 
-    // approve → 重入 merge.execute 走阶段 B
+    // approve（勾 push，决策 393）→ 重入 merge.execute 走阶段 B
     let (status, body) = post(
         &api,
         "/tasks/t1/merge/decision",
-        serde_json::json!({"decision": "approve"}),
+        serde_json::json!({"decision": "approve", "push": true}),
     )
     .await;
     assert_eq!(status, StatusCode::OK, "{body}");
     let after = body["cursor"].clone();
     assert_eq!(after["stage"], "merge");
     assert_eq!(after["node"], "execute");
+    assert_eq!(body["push"], true, "回执应回显开关");
 
-    // approval 落库为 approved
+    // approval 落库为 approved；push 开关一并落库（决策 393）
     let meta = api
         .state
         .store
@@ -721,6 +722,7 @@ async fn merge_decision_approve_and_return_move_the_cursor() {
         .unwrap()
         .unwrap();
     assert_eq!(meta["approval"], "approved");
+    assert_eq!(meta["push_after_merge"], true);
 
     // return → develop.execute，attempts 重置
     api.state
@@ -747,6 +749,20 @@ async fn merge_decision_approve_and_return_move_the_cursor() {
     assert_eq!(status, StatusCode::OK, "{body}");
     assert_eq!(body["cursor"]["stage"], "develop");
     assert_eq!(body["cursor"]["node"], "execute");
+
+    // 打回时开关清零（决策 393）：不带陈旧意图过河，下次审批重新勾
+    let meta = api
+        .state
+        .store
+        .stage_output_metadata(
+            "t1",
+            Stage::Merge,
+            agentpipeline_core::types::MERGE_OUTPUT_TYPE,
+        )
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(meta["push_after_merge"], false);
 }
 
 // ─────────────────────────── 人工评审（决策 2 / 124）───────────────────────────

@@ -71,7 +71,7 @@ describe('PendingDossier · 移动版动作坞的收展（决策 281）', () => 
     });
     await fireEvent.click(screen.getByRole('button', { name: /等你拍板/ }));
     await fireEvent.click(screen.getByRole('button', { name: '合入' }));
-    expect(onaction).toHaveBeenCalledWith(mergeActions[0], { cursorId: 'c-merge' });
+    expect(onaction).toHaveBeenCalledWith(mergeActions[0], { cursorId: 'c-merge', push: false });
   });
 
   it('桌面档案盒（dock=false）不受折叠影响：动作直接可见', () => {

@@ -302,6 +302,7 @@ pub fn merge_row(diff_path: &str, base_commit: &str) -> MergeResult {
         conflict_files: Vec::new(),
         approval: Approval::None,
         status: MergeStatus::PendingApproval,
+        push_after_merge: false,
     }
 }
 

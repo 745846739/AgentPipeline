@@ -1261,7 +1261,7 @@
   async function handleAction(
     taskId: string,
     action: AllowedAction,
-    opts: { cursorId?: string; input?: string },
+    opts: { cursorId?: string; input?: string; push?: boolean },
   ) {
     // board 重载后 pending 集合会变，指纹驱动重拉详情；
     // 这里显式再拉一次是为了动作回执后立刻反映（不等下次轮询）。

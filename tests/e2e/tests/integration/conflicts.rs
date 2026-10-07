@@ -132,7 +132,7 @@ async fn e2e_10_dirty_worktree_pends_for_user_and_blocks_merge() {
         "fixture 工作区应为脏"
     );
     f.store
-        .apply_merge_decision("t10", MergeDecision::Approve)
+        .apply_merge_decision("t10", MergeDecision::Approve, false)
         .await
         .unwrap();
     f.executor.run("t10").await.unwrap();

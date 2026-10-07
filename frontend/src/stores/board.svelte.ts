@@ -106,7 +106,7 @@ class BoardStore {
   async handleTaskAction(
     taskId: string,
     action: AllowedAction,
-    opts: { cursorId?: string; input?: string } = {},
+    opts: { cursorId?: string; input?: string; push?: boolean } = {},
   ): Promise<void> {
     const cursors = this.pendingCursors[taskId] ?? [];
     const cursor = action.cursor_id
@@ -124,6 +124,7 @@ class BoardStore {
       await submitAllowedAction(taskId, action, {
         cursorId: opts.cursorId,
         input: opts.input,
+        push: opts.push,
         pendingType: cursor?.pending_reason?.type,
       });
       await this.loadTasks();

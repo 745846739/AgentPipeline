@@ -2343,6 +2343,7 @@ fn failed_merge_result(output: &str) -> MergeResult {
         conflict_files: Vec::new(),
         approval: Approval::None,
         status: MergeStatus::PendingApproval,
+        push_after_merge: false,
     }
 }
 

@@ -39,7 +39,12 @@ struct Ctx {
 
 /// 建项目（test_framework 用原始命令 `true`，让系统闸门零噪声通过）。
 async fn setup(framework: &str, settings: Settings) -> Ctx {
-    setup_impl(framework, settings, None).await
+    setup_with_repo(framework, settings, Repo::clean().unwrap()).await
+}
+
+/// 同 [`setup`]，但仓由调用方提供（决策 393 的 push 测试要用带 remote 的仓）。
+async fn setup_with_repo(framework: &str, settings: Settings, repo: Repo) -> Ctx {
+    setup_impl(framework, settings, None, repo).await
 }
 
 /// 同 [`setup`]，但技能根被 `[skills] dir` 覆盖到外部目录（决策 172）。
@@ -48,13 +53,20 @@ async fn setup_with_skills_dir(
     settings: Settings,
     skills_dir: &std::path::Path,
 ) -> Ctx {
-    setup_impl(framework, settings, Some(skills_dir.to_path_buf())).await
+    setup_impl(
+        framework,
+        settings,
+        Some(skills_dir.to_path_buf()),
+        Repo::clean().unwrap(),
+    )
+    .await
 }
 
 async fn setup_impl(
     framework: &str,
     settings: Settings,
     skills_dir: Option<std::path::PathBuf>,
+    repo: Repo,
 ) -> Ctx {
     let home = TestHome::new().unwrap();
     let clock = ManualClock::fixed();
@@ -66,7 +78,6 @@ async fn setup_impl(
     let store = Store::open(home_handle, Arc::new(clock.clone()))
         .await
         .unwrap();
-    let repo = Repo::clean().unwrap();
     let project = Project {
         id: "p1".into(),
         name: "示例".into(),
@@ -266,7 +277,7 @@ async fn executor_drives_full_happy_path_to_done() {
 
     // 审批 → 阶段 B 合入 → done
     ctx.store
-        .apply_merge_decision("t1", MergeDecision::Approve)
+        .apply_merge_decision("t1", MergeDecision::Approve, false)
         .await
         .unwrap();
     ctx.executor.run("t1").await.unwrap();
@@ -369,6 +380,72 @@ async fn executor_drives_full_happy_path_to_done() {
         .any(|t| t.trigger == TransitionTrigger::UserResume));
 }
 
+/// 把任务一路推到 merge 阶段 A 末尾（等审批）——决策 393 两条 push 测试的公共前缀。
+/// task_id 必须全进程唯一：executor 的执行权注册表（决策 36）按 task_id 去重，
+/// 两条测试并行跑同名任务会让后到的那次 `run` 直接让权、任务原地不动。
+async fn drive_to_merge_approval(ctx: &Ctx, task_id: &str) {
+    let mut script = Script::new();
+    design_scripts(&mut script);
+    implementation_scripts(&mut script, task_id);
+    ctx.agent.set_script(script);
+    testkit::seed_task(&ctx.store, task_id, "p1").await.unwrap();
+    admit(ctx, task_id).await;
+    ctx.executor.run(task_id).await.unwrap();
+    let task = ctx.store.get_task(task_id).await.unwrap();
+    assert_eq!(task.status, TaskStatus::Pending, "应停在等审批");
+}
+
+// ─────────────────────────── 合入后 push（决策 393）───────────────────────────
+
+/// 勾了 push 但仓没有 remote：跳过、不算失败，合入照常收尾到 done。
+#[tokio::test]
+async fn merge_push_flag_with_no_remote_skips_and_still_lands_done() {
+    let ctx = setup("true", Settings::default()).await; // 默认仓没有配置任何 remote
+    drive_to_merge_approval(&ctx, "t-push-noremote").await;
+
+    ctx.store
+        .apply_merge_decision("t-push-noremote", MergeDecision::Approve, true)
+        .await
+        .unwrap();
+    ctx.executor.run("t-push-noremote").await.unwrap();
+
+    let task = ctx.store.get_task("t-push-noremote").await.unwrap();
+    assert_eq!(
+        task.status,
+        TaskStatus::Done,
+        "无 remote 只跳过 push，不拦收尾"
+    );
+    let merge = ctx
+        .store
+        .merge_metadata("t-push-noremote")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(merge.status, agentpipeline_core::types::MergeStatus::Merged);
+    assert!(merge.push_after_merge, "开关随决策落库");
+}
+
+/// 勾了 push 且有 remote：合入后默认分支真的推到了远端。
+#[tokio::test]
+async fn merge_push_flag_pushes_default_branch_to_the_remote() {
+    let (repo, remote) = Repo::with_remote().unwrap();
+    let ctx = setup_with_repo("true", Settings::default(), repo).await;
+    let local_main = ctx.repo.head("main");
+    drive_to_merge_approval(&ctx, "t-push-remote").await;
+
+    ctx.store
+        .apply_merge_decision("t-push-remote", MergeDecision::Approve, true)
+        .await
+        .unwrap();
+    ctx.executor.run("t-push-remote").await.unwrap();
+
+    let task = ctx.store.get_task("t-push-remote").await.unwrap();
+    assert_eq!(task.status, TaskStatus::Done);
+    // 远端 main 与本地合入后的 main 指到同一个 commit（推的就是合入结果）
+    assert_eq!(remote.head("main"), ctx.repo.head("main"));
+    assert_ne!(remote.head("main"), local_main, "远端应前进");
+}
+
 // ─────────────────────────── merge「返回修改」的投影同步（主流程票 06）───────────────────────────
 
 #[tokio::test]
@@ -391,7 +468,7 @@ async fn merge_return_updates_task_projection_immediately() {
     assert_eq!(task.current_stage, Stage::Merge);
 
     ctx.store
-        .apply_merge_decision(task_id, MergeDecision::Return)
+        .apply_merge_decision(task_id, MergeDecision::Return, false)
         .await
         .unwrap();
 

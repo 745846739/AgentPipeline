@@ -37,13 +37,30 @@ describe('DiffReviewPanel（决策 23 / 119）', () => {
     expect(screen.queryByText(/拒绝/)).toBeNull();
   });
 
-  it('点击「合入」提交 approve 动作并带所属游标', async () => {
+  it('点击「合入」提交 approve 动作并带所属游标（未勾 push 默认 false，决策 393）', async () => {
     const onaction = vi.fn();
     render(DiffReviewPanel, {
       props: { diff: null, raw: null, actions: mergeActions, cursors, onaction },
     });
     await fireEvent.click(screen.getByRole('button', { name: '合入' }));
-    expect(onaction).toHaveBeenCalledWith(mergeActions[0], { cursorId: 'c-merge' });
+    expect(onaction).toHaveBeenCalledWith(mergeActions[0], { cursorId: 'c-merge', push: false });
+  });
+
+  it('勾选「合入后 push 到远端」后合入，approve 带 push: true（决策 393）', async () => {
+    const onaction = vi.fn();
+    render(DiffReviewPanel, {
+      props: { diff: null, raw: null, actions: mergeActions, cursors, onaction },
+    });
+    await fireEvent.click(screen.getByLabelText('合入后 push 到远端'));
+    await fireEvent.click(screen.getByRole('button', { name: '合入' }));
+    expect(onaction).toHaveBeenCalledWith(mergeActions[0], { cursorId: 'c-merge', push: true });
+  });
+
+  it('没有 approve 动作时不渲染 push 开关（决策 393）', () => {
+    render(DiffReviewPanel, {
+      props: { diff: null, raw: null, actions: [mergeActions[1]], cursors },
+    });
+    expect(screen.queryByLabelText('合入后 push 到远端')).toBeNull();
   });
 
   it('base_commit 过期（stale）时显示「基准已前移」提示', () => {

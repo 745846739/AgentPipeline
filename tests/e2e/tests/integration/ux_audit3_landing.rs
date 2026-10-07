@@ -676,9 +676,9 @@ fn scene_09_detail_fold_band_820_1099() {
         ],
     );
     assert_eq!(
-        line_n(&root, "frontend/src/routes/TaskDetail.svelte", 677).trim(),
+        line_n(&root, "frontend/src/routes/TaskDetail.svelte", 680).trim(),
         "@media (min-width: 820px) and (max-width: 1099px) {",
-        "场景 9：媒体查询落在 677 行（块内 669–681，13 行纯新增）"
+        "场景 9：媒体查询落在 680 行（决策 393 之前 677；决策 215 的块体 669–681 随迁到 672–684）"
     );
     let geo = read(&root, "frontend/e2e/ux2-geometry.spec.ts");
     assert!(
@@ -718,12 +718,12 @@ fn scene_10_band_boundaries_1100_and_819() {
     );
     // <479 档的 display:block 双保险仍在原位（票 01 面一格不动的源码侧牙齿）
     assert_eq!(
-        line_n(&root, rel, 891).trim(),
+        line_n(&root, rel, 894).trim(),
         ".detail.split {",
         "场景 10：<479 档 .detail.split 规则位移"
     );
     assert_eq!(
-        line_n(&root, rel, 892).trim(),
+        line_n(&root, rel, 895).trim(),
         "display: block;",
         "场景 10：<479 档 display:block 被动"
     );
@@ -787,7 +787,7 @@ fn scene_11_detail_other_rules_untouched() {
             "场景 11：本票 diff 不许触碰 overflow（hero 溢出属票 01 wontfix 面）"
         );
     }
-    // 既有的 `overflow-x: auto`（961 行的预存在规则）必须落在本票 669–681 改动块之外
+    // 既有的 `overflow-x: auto`（决策 393 前在 961 行的预存在规则）必须落在本票改动块（现 672–684）之外
     let td = read(&root, rel);
     let overflow_lines: Vec<usize> = td
         .lines()
@@ -796,27 +796,27 @@ fn scene_11_detail_other_rules_untouched() {
         .map(|(i, _)| i + 1)
         .collect();
     assert!(
-        overflow_lines.iter().all(|n| !(669..=681).contains(n)),
-        "场景 11：overflow-x 渗进本票改动块 → 行 {overflow_lines:?}"
+        overflow_lines.iter().all(|n| !(672..=684).contains(n)),
+        "场景 11：overflow-x 渗进本票改动块（行号随决策 393 的 +3 行迁移）→ 行 {overflow_lines:?}"
     );
     // 桌面 / 窄档既有规则逐条在原位（行号 + 内容双钉）
     assert_eq!(
-        line_n(&root, rel, 663).trim(),
+        line_n(&root, rel, 666).trim(),
         "max-width: 1240px;",
         "场景 11：桌面档 max-width 被动"
     );
     assert_eq!(
-        line_n(&root, rel, 665).trim(),
+        line_n(&root, rel, 668).trim(),
         "grid-template-columns: minmax(0, 1fr) 320px;",
         "场景 11：桌面档列串被动"
     );
     assert_eq!(
-        line_n(&root, rel, 666).trim(),
+        line_n(&root, rel, 669).trim(),
         "gap: 18px;",
         "场景 11：gap 被动"
     );
     assert_eq!(
-        line_n(&root, rel, 667).trim(),
+        line_n(&root, rel, 670).trim(),
         "align-items: start;",
         "场景 11：align-items 被动"
     );

@@ -2658,3 +2658,53 @@ grilling 两轮收敛（2026-10-06，用户拍板「一张大票」「本地直�
 落地 `agent/templates.rs`、`pipeline/executor.rs`、`pipeline/merge.rs`、`pipeline/routes.rs`、
 `pipeline/model_request.rs`、`actions.rs`、`types.rs`、`git.rs`（`ahead_count`）、
 `frontend/src/lib/pipeline.ts`。
+
+### 决策 393 · merge 审批加「合入后 push」开关：随决策落库、Phase B 合入后推默认分支、无 remote 跳过（例外于决策 12 的 CLI push）
+
+**起因**：合入目前只落在本地默认分支（决策 73 / 97），推远端要用户手动 `git push`——
+对「合入即发布」的仓是一段纯手工尾巴。开关该长在**人拍板的审批面板**上而不是全局
+配置：推不推远端是每次合入都可能变的意图，不是项目属性。
+
+**裁决**：①**开关随决策走**：`POST /tasks/{id}/merge/decision` 的 body 加可选
+`push: bool`（缺省 false）；`apply_merge_decision` 单事务里把它写进 merge_result
+（`MergeResult.push_after_merge`，`#[serde(default)]` 向后兼容存量行）。approve 落
+请求值；**return 一律清零**——下次审批重新勾，不带陈旧意图过河。工头工具通道
+（`routes/foreman.rs` 的 `merge` 分支）不透传该开关：那颗钮只长在人的审批面板上，
+agent 不替人决定推远端。②**Phase B 收尾**：合入完成、`status=merged` 落库**之前**
+push（勾了才推）；推的是项目仓的默认分支（合入刚写回的那支）。放落库前是因为 push
+失败要让这次 run 以错误收场——元数据仍是 `approval=approved`，「重试合并」会再走一遍
+Phase B：合入幂等（Already up to date 语义）、push 重试，不会出现「状态已 merged 但
+远端没推上」的静默漂移。③**无 remote 兼容**（本票主诉求）：remote 清单读 git2（同仓
+同一读法），一个都没有 → 返回 `PushOutcome::NoRemote`、日志记一条、**不算失败**，
+合入照常收尾到 done——纯本地仓是常态。remote 名 origin 优先，否则配置里的第一个。
+④**push 走系统 git CLI**（决策 12「统一 git2」的唯一显式例外）：推送要复用用户仓自己
+的凭据链（credential.helper / ssh-agent / ssh config），libgit2 不代跑凭据助手，
+自拼凭据回调两头不讨好。`GIT_TERMINAL_PROMPT=0` + stdin 关死：无人值守的服务里
+对着 TTY 等凭据 = 挂死；凭据不在就让它**快速失败**（失败走 ②的重试路径）。上限
+120s（`kill_on_drop` 兜底），超时同样是可重试错误。⑤**前端**：审批面板
+（`DiffReviewPanel`）approve 钮旁加「合入后 push 到远端」checkbox，随 approve 动作
+经 `onaction` opts（`push`）→ `submitAllowedAction` → `mergeDecision` 透传；
+TaskDetail / Talk / PendingDossier / board / taskDetail 五处 opts 类型同步扩字段。
+无 remote 时勾了也无害（③）。
+
+**与既有决策的关系**：决策 12 的适用面被本决策开**唯一例外**（push 走 CLI，其余
+git 操作照旧 git2）；决策 119 的决策事务形状照守（开关与 approval 同事务落库）；
+决策 95 / 96 / 97 / 132（审批流与合入语义）一字不动；决策 61 脏工作区检查照旧在
+push 之前。
+
+**明确不做**：不做全局/项目级「自动 push」配置（意图挂在每次审批上）；不推任务分支
+（任务分支合入即删，推它无意义）；不做 push 失败的自动重试循环（走既有「重试合并」
+动作面）；git2 凭据回调不实现；不把 push 状态单独建模进 MergeResult（成功与否由
+run 台账与日志承载）。
+
+**验证**：L2——`merge_push_flag_with_no_remote_skips_and_still_lands_done`
+（无 remote 勾了 push：跳过、照常 done）、
+`merge_push_flag_pushes_default_branch_to_the_remote`（bare remote：远端 main 与本地
+合入后同 commit）；L3——`merge_decision_approve_and_return_move_the_cursor` 扩展
+（body `push: true` → 回执回显 + metadata 落库；return 后清零）；前端——
+`DiffReviewPanel` 三条（缺省 false / 勾选 true / 无 approve 不渲染开关）与
+`actionSubmit` 两条（透传与缺省）。
+**来源**：用户诉求「合入后要不要 push 每次可能不一样，勾一下最顺手」（2026-10-07）；
+落地 `git.rs`（`push_default_branch` / `PushOutcome`）、`pipeline/merge.rs`、
+`storage/decisions.rs`、`types.rs`、`app/routes/tasks.rs`、`app/routes/foreman.rs`、
+`frontend`（DiffReviewPanel + actionSubmit + client + 两 store）。

@@ -32,6 +32,8 @@ export interface RunActionOptions {
   cursorId?: string;
   /** `requires_input` 的输入；review reject 时作为 comments。 */
   input?: string;
+  /** merge approve 的「合入后 push」开关（决策 393）。 */
+  push?: boolean;
 }
 
 export interface LoadedFile {
@@ -472,6 +474,7 @@ class TaskDetailStore {
       await submitAllowedAction(this.id, action, {
         cursorId,
         input: options.input,
+        push: options.push,
         pendingType,
       });
       // 成功不立即复位：等 SSE 回执（safety timeout 兜底）。

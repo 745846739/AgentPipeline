@@ -406,11 +406,16 @@ export function reviewTask(id: string, approved: boolean, comments?: string): Pr
   });
 }
 
-/** merge 审批（决策 23 / 119）：approve = 合入，return = 返回修改。**无"拒绝"**。 */
-export function mergeDecision(id: string, decision: 'approve' | 'return'): Promise<unknown> {
+/** merge 审批（决策 23 / 119）：approve = 合入，return = 返回修改。**无"拒绝"**。
+ *  `push`（决策 393）：approve 时合入后是否推远端（缺省 false；无 remote 服务端自动跳过）。 */
+export function mergeDecision(
+  id: string,
+  decision: 'approve' | 'return',
+  push = false,
+): Promise<unknown> {
   return request(`/tasks/${encodeURIComponent(id)}/merge/decision`, {
     method: 'POST',
-    body: { decision },
+    body: { decision, push },
   });
 }
 

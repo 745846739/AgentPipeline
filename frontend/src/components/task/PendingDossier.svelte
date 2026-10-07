@@ -16,7 +16,7 @@
     dock?: boolean;
     /** dock 实际高度回传：详情内容据此留出底边距，避免被固定坞遮住。 */
     ondockheight?: (height: number) => void;
-    onaction?: (action: AllowedAction, opts: { cursorId?: string; input?: string }) => void;
+    onaction?: (action: AllowedAction, opts: { cursorId?: string; input?: string; push?: boolean }) => void;
     /** 触发 pending 的节点会话直达（§12.4.3 联动）。 */
     ongotoconversation?: (stage: string, node: string) => void;
     onopenfiles?: () => void;

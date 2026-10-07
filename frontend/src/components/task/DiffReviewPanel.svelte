@@ -24,7 +24,7 @@
      * `actionsOnly` 优先于本开关（移动款底部动作坞本来就没有 diff 正文）。
      */
     diffInPane?: boolean;
-    onaction?: (action: AllowedAction, opts: { cursorId?: string; input?: string }) => void;
+    onaction?: (action: AllowedAction, opts: { cursorId?: string; input?: string; push?: boolean }) => void;
     onreload?: () => void;
   }
 
@@ -49,8 +49,15 @@
   const approve = $derived(mergeActions.filter((a) => a.action === 'approve'));
   const stats = $derived(diff?.stats ?? null);
 
+  // 「合入后 push」开关（决策 393）：只挂在 approve 上，随决策一起提交。
+  let pushAfterMerge = $state(false);
+
   function cursorIdFor(action: AllowedAction): string | undefined {
     return action.cursor_id ?? cursors[0]?.cursor_id;
+  }
+
+  function approveAction(action: AllowedAction) {
+    onaction?.(action, { cursorId: cursorIdFor(action), push: pushAfterMerge });
   }
 </script>
 
@@ -117,12 +124,23 @@
         {action.label}
       </button>
     {/each}
+    {#if approve.length > 0}
+      <!-- 决策 393：合入后是否推远端——纯本地仓没有 remote 也能勾，服务端会跳过 -->
+      <label class="pushopt">
+        <input
+          type="checkbox"
+          bind:checked={pushAfterMerge}
+          disabled={busy}
+        />
+        合入后 push 到远端
+      </label>
+    {/if}
     {#each approve as action (actionKey(action, cursorIdFor(action)))}
       <button
         type="button"
         class="btn solid"
         disabled={busy}
-        onclick={() => onaction?.(action, { cursorId: cursorIdFor(action) })}
+        onclick={() => approveAction(action)}
       >
         {#if busy}<span class="spin"></span>{/if}
         {action.label}
@@ -196,6 +214,15 @@
     display: flex;
     gap: 8px;
     margin-top: 14px;
+  }
+  .pushopt {
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+    font-size: 12px;
+    color: var(--text-2);
+    user-select: none;
+    cursor: pointer;
   }
   .hint {
     color: var(--text-3);

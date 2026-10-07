@@ -88,7 +88,7 @@ async fn happy_path_full_flow() {
     // ── merge 阶段 B：approve → 基准校验 → 合入 → update-ref 写回（决策 96 / 97）──
     let merge_cursor = f
         .store
-        .apply_merge_decision("t1", MergeDecision::Approve)
+        .apply_merge_decision("t1", MergeDecision::Approve, false)
         .await
         .unwrap();
     assert_eq!(

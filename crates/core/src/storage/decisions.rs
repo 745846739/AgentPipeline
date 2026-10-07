@@ -66,10 +66,15 @@ impl ResumeAction {
 
 impl Store {
     /// 单事务应用 merge 决策（决策 119）。
+    ///
+    /// `push_after_merge`（决策 393）：approve 时把「合入后 push」开关随 merge_result
+    /// 落库，阶段 B 据此决定要不要推远端；打回（return）一律清零——下次审批重新勾，
+    /// 不带陈旧意图过河。
     pub async fn apply_merge_decision(
         &self,
         task_id: &str,
         decision: MergeDecision,
+        push_after_merge: bool,
     ) -> Result<NodeCursor> {
         let now = self.now();
         let live = self.load_live_cursors(task_id).await?;
@@ -90,6 +95,10 @@ impl Store {
             }
         };
         merge.approval = decision.approval();
+        merge.push_after_merge = match decision {
+            MergeDecision::Approve => push_after_merge,
+            MergeDecision::Return => false,
+        };
 
         let (target_stage, target_node) = match decision {
             // approve → 重入 merge.execute 走阶段 B

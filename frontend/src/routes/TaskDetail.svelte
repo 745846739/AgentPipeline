@@ -147,7 +147,10 @@
     }
   });
 
-  function handleAction(action: AllowedAction, opts: { cursorId?: string; input?: string }) {
+  function handleAction(
+    action: AllowedAction,
+    opts: { cursorId?: string; input?: string; push?: boolean },
+  ) {
     if (action.action === 'split_task') {
       dialogError = null;
       splitOpen = true;

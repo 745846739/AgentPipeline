@@ -297,6 +297,7 @@ impl MergeFlow<'_> {
                         conflict_files: Vec::new(),
                         approval: Approval::None,
                         status: MergeStatus::PendingApproval,
+                        push_after_merge: false,
                     },
                 )
                 .await?;
@@ -338,6 +339,7 @@ impl MergeFlow<'_> {
                 conflict_files: auto_resolved.clone(),
                 approval: Approval::Pending,
                 status: MergeStatus::PendingApproval,
+                push_after_merge: false,
             };
             self.store
                 .upsert_merge_result(&task.id, diff_path, &proposal)
@@ -359,6 +361,7 @@ impl MergeFlow<'_> {
             conflict_files: Vec::new(),
             approval: Approval::None,
             status: MergeStatus::PendingApproval,
+            push_after_merge: false,
         };
         self.store
             .upsert_merge_result(&task.id, diff_path, &failure)
@@ -449,6 +452,30 @@ impl MergeFlow<'_> {
             commit = %outcome.commit,
             "合入完成"
         );
+
+        // (2.5) push（决策 393）：审批时勾选了才推；无 remote 跳过、不算失败。
+        // 放在 status=merged 落库**之前**：push 失败让这次 run 以错误收场（元数据
+        // 仍是 approval=approved，重试合并会再走一遍 Phase B——合入幂等（Already up
+        // to date）、push 重试），不会出现「状态已 merged 但远端没推上」的静默漂移。
+        if stored.push_after_merge {
+            self.ledger().mark_step(run_id, "推送默认分支到远端").await;
+            match Git
+                .push_default_branch(repo, &project.default_branch)
+                .await?
+            {
+                crate::git::PushOutcome::NoRemote => {
+                    tracing::info!(task = %task.id, "仓未配置 remote，跳过 push（决策 393）");
+                }
+                crate::git::PushOutcome::Pushed { remote } => {
+                    tracing::info!(
+                        task = %task.id,
+                        remote = %remote,
+                        branch = %project.default_branch,
+                        "默认分支已 push 到远端"
+                    );
+                }
+            }
+        }
 
         // (3) status = merged
         stored.approval = Approval::Approved;
@@ -578,6 +605,7 @@ mod tests {
             conflict_files: Vec::new(),
             approval,
             status: MergeStatus::PendingApproval,
+            push_after_merge: false,
         }
     }
 

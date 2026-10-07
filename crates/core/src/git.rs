@@ -55,6 +55,18 @@ pub struct MergeOutcome {
     pub commit: String,
 }
 
+/// push 结果（决策 393）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PushOutcome {
+    /// 已推送到该 remote。
+    Pushed {
+        /// 实际使用的 remote 名（origin 优先，否则配置里的第一个）。
+        remote: String,
+    },
+    /// 仓没有配置任何 remote：跳过，不算失败（纯本地仓兼容）。
+    NoRemote,
+}
+
 pub(crate) fn gerr(e: git2::Error) -> Error {
     Error::Git(e.to_string())
 }
@@ -85,6 +97,10 @@ const GIT_OP_TIMEOUT_SEC: u64 = 180;
 /// 因为它换来的只是一条 `warn!`。同一个 2026-09-17 的实例里，正是这条只值一条警告的
 /// 检查把 `init.execute` 挂死了——**best-effort 的检查不允许有能力挂住关键路径**。
 const IS_DIRTY_TIMEOUT_SEC: u64 = 10;
+
+/// push 的上限（秒）。网络往返 + 大对象上传的量级；凭据提示已被
+/// `GIT_TERMINAL_PROMPT=0` 关掉，真挂住只可能是远端无响应。
+const GIT_PUSH_TIMEOUT_SEC: u64 = 120;
 
 /// 未提交改动清单的条数上限（票 04 的简报用）：只给「有哪些文件」，不做全量导出。
 const DIRTY_FILES_MAX: usize = 50;
@@ -1004,6 +1020,77 @@ impl Git {
             })
         })
         .await
+    }
+
+    /// merge 阶段 B 的可选收尾：把默认分支 push 到远端（决策 393）。
+    ///
+    /// remote 清单读 git2（同仓同一读法）；**推送本体走系统 git CLI**——这是决策 12
+    /// （统一 git2）的唯一例外：push 要复用用户仓自己的凭据链（credential.helper /
+    /// ssh-agent / ssh config），libgit2 不代跑助手，自拼凭据回调两头不讨好。
+    /// 仓没有配置任何 remote → 返回 [`PushOutcome::NoRemote`]，调用方照常收尾，
+    /// **不算失败**（纯本地仓是常态，决策 393）。
+    pub async fn push_default_branch(
+        &self,
+        project_path: &Path,
+        default_branch: &str,
+    ) -> Result<PushOutcome> {
+        let project = project_path.to_path_buf();
+        let remote = blocking(move || {
+            let repo = open(&project)?;
+            let remotes = repo.remotes().map_err(gerr)?;
+            if remotes.is_empty() {
+                return Ok(None);
+            }
+            // 优先 origin；没有就用配置里的第一个。
+            let origin = (0..remotes.len())
+                .find_map(|i| remotes.get(i))
+                .filter(|name| *name == "origin");
+            let name = match origin {
+                Some(n) => n.to_string(),
+                None => remotes
+                    .get(0)
+                    .expect("remotes 非空时 get(0) 必有值")
+                    .to_string(),
+            };
+            Ok(Some(name))
+        })
+        .await?;
+        let Some(remote) = remote else {
+            return Ok(PushOutcome::NoRemote);
+        };
+        let mut cmd = tokio::process::Command::new("git");
+        cmd.current_dir(project_path)
+            .args(["push", &remote, default_branch])
+            // 凭据问询改为直接失败：无人值守的服务里对着 TTY 等输入 = 挂死。
+            .env("GIT_TERMINAL_PROMPT", "0")
+            .stdin(std::process::Stdio::null())
+            .kill_on_drop(true);
+        let child = cmd
+            .spawn()
+            .map_err(|e| Error::Git(format!("git push 启动失败：{e}")))?;
+        let output = match tokio::time::timeout(
+            std::time::Duration::from_secs(GIT_PUSH_TIMEOUT_SEC),
+            child.wait_with_output(),
+        )
+        .await
+        {
+            Ok(Ok(out)) => out,
+            Ok(Err(e)) => return Err(Error::Git(format!("git push 执行失败：{e}"))),
+            Err(_) => {
+                return Err(Error::Git(format!(
+                    "git push 超时（{GIT_PUSH_TIMEOUT_SEC}s）：远端 {remote} 无响应"
+                )))
+            }
+        };
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            return Err(Error::Git(format!(
+                "git push 失败（{remote} {}）：{}",
+                default_branch,
+                stderr.trim()
+            )));
+        }
+        Ok(PushOutcome::Pushed { remote })
     }
 
     pub async fn update_ref(&self, repo_path: &Path, refname: &str, commit: &str) -> Result<()> {

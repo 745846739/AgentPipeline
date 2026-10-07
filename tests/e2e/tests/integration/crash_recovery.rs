@@ -212,7 +212,7 @@ async fn interrupted_node_resumes_after_restart_and_owner_cleanup() {
     let task = f.store.get_task("t1").await.unwrap();
     assert_eq!(task.status, TaskStatus::Pending);
     f.store
-        .apply_merge_decision("t1", MergeDecision::Approve)
+        .apply_merge_decision("t1", MergeDecision::Approve, false)
         .await
         .unwrap();
     f.fresh_executor().run("t1").await.unwrap();
@@ -308,7 +308,7 @@ async fn parallel_branches_recover_independently_and_join_survives_restart() {
     assert_eq!(task.status, TaskStatus::Pending, "进入 merge 阶段 A");
 
     f.store
-        .apply_merge_decision("t2", MergeDecision::Approve)
+        .apply_merge_decision("t2", MergeDecision::Approve, false)
         .await
         .unwrap();
     f.fresh_executor().run("t2").await.unwrap();

@@ -826,6 +826,7 @@ GET /tasks/{id}               → 详情页装载 + 断线重连后的全量校�
 | 项目分析入口 `#/settings/projects?project=<id>&analyze=1` | `frontend/src/routes/SettingsProjects.svelte`、`frontend/src/lib/analysis.ts` | 决策 78；票 07 |
 | 空态 = 状态 → 下一步 → 可选入口；提到另一个页面必须可点 | `frontend/src/components/ui/EmptyState.svelte` | 票 13 |
 | pending dossier 不重复渲染 diff；动作行保留（多处 e2e 依赖它） | `frontend/src/routes/TaskDetail.svelte`、`frontend/src/components/task/DiffReviewPanel.svelte` | 决策 23（无「拒绝」）；票 08 |
+| 「合入后 push 到远端」开关只挂在 approve 旁，随 approve 动作经 opts 透传；没勾即 false，无 remote 时勾了也无害 | `frontend/src/components/task/DiffReviewPanel.svelte`、`frontend/src/lib/actionSubmit.ts`、`frontend/src/api/client.ts` | 决策 393 |
 | 输入法护栏：回车提交要挡「用回车确认候选词」的那一次 | `frontend/src/lib/enterToSend.ts` | 决策 184 |
 | 工头（值班长）的回复里永远没有按钮；时间线上的钮两处、都不在回复里——操作台在提议轮里的确认钮与提问轮里的选项钮 | `frontend/src/routes/Talk.svelte`（回复零按钮、时间线两处钮位都在它里面）、`frontend/src/components/task/PendingDossier.svelte`（工头内容的另一渲染点，钮只在动作行） | 决策 176 / 182 / 207③ / 265 |
 | 提议轮的渲染判据：过期按 `expires_at` 自己算、过期只变灰而轮仍在、同一个动作已在下发的动作集里就只指路 | `frontend/src/lib/proposals.ts` | 决策 188 / 207；`proposals.test.ts` 逐条钉住 |

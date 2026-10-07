@@ -681,6 +681,8 @@ async fn run_task_tool(
                 Path(task_id),
                 Json(tasks::MergeDecisionBody {
                     decision: str_arg(args, "decision")?,
+                    // 决策 393：工头通道不勾 push（那颗开关只长在人拍板的审批面板上）。
+                    push: None,
                 }),
             )
             .await;

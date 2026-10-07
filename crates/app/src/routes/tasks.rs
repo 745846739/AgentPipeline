@@ -751,6 +751,8 @@ pub async fn review(
 #[derive(Debug, Deserialize)]
 pub struct MergeDecisionBody {
     pub decision: String,
+    /// 决策 393：approve 时合入后是否 push 到远端（缺省 false；无 remote 自动跳过）。
+    pub push: Option<bool>,
 }
 
 /// `POST /tasks/{id}/merge/decision`（决策 119）：单事务写 approval + 清 pending + 置游标。
@@ -760,15 +762,17 @@ pub async fn merge_decision(
     Json(body): Json<MergeDecisionBody>,
 ) -> ApiResult<impl IntoResponse> {
     let decision = MergeDecision::parse(&body.decision).map_err(map_core_error)?;
+    let push = body.push.unwrap_or(false);
     let cursor = state
         .store
-        .apply_merge_decision(&id, decision)
+        .apply_merge_decision(&id, decision, push)
         .await
         .map_err(map_core_error)?;
     (state.resume_hook)(&id);
     Ok(Json(json!({
         "ok": true,
         "decision": body.decision,
+        "push": push,
         "cursor": {
             "cursor_id": cursor.cursor_id,
             "stage": cursor.stage,
