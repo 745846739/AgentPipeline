@@ -112,6 +112,21 @@ fn numstat(root: &Path, rel: &str) -> (usize, usize) {
     (add, del)
 }
 
+/// HEAD 与 `origin/main` 是否**同点**（= 审计已合入 main，CI 就是在这一点上 checkout 的）。
+///
+/// 同点时三点式 `origin/main...HEAD` 退化为空集，于是 `changed_paths` 与 `numstat` 恒为
+/// 空集 / (0,0)——「改动面白名单」「恰改 N 行」这类**按分支取数**的断言会假红。先例是
+/// `ux_audit3_artifacts.rs::scene_06`（82dfdf1，CI check 37411293557 实证）：那处的做法是
+/// 同点时跳过该部分实断言并打 stdout 说明，这里照办。
+///
+/// `merge-base` 取不到（CI 的 depth=1 checkout）时返回 false，走各场景原有的降级路径。
+fn head_equals_origin_main(root: &Path) -> bool {
+    let Some(mb) = git(root, &["merge-base", "HEAD", "origin/main"]) else {
+        return false;
+    };
+    git(root, &["rev-parse", "HEAD"]).is_some_and(|h| h.trim() == mb.trim())
+}
+
 /// 断言 `needles` 按顺序全部出现在 `hay` 里（段间次序不可调换）。
 fn assert_chain(what: &str, hay: &str, needles: &[&str]) {
     let mut pos = 0usize;
@@ -536,16 +551,22 @@ fn scene_07_four_literal_stars_become_b_elements() {
         "场景 7：旧字面形态残留 → **不改写**"
     );
     // 只修这四处：删除量恰好 3 + 1
-    assert_eq!(
-        numstat(&root, notify),
-        (3, 3),
-        "场景 7：SettingsNotify 应恰改 3 行"
-    );
-    assert_eq!(
-        numstat(&root, tools),
-        (1, 1),
-        "场景 7：SettingsTools 应恰改 1 行"
-    );
+    // 同点时三点式 diff 为空集、numstat 恒 (0,0)——跳过这组读数，理由见
+    // `head_equals_origin_main`；合入前的读数在 test-report.md 的命令台账里。
+    if head_equals_origin_main(&root) {
+        eprintln!("场景 7：HEAD 与 origin/main 同点（审计已合入 main）——numstat 断言跳过");
+    } else {
+        assert_eq!(
+            numstat(&root, notify),
+            (3, 3),
+            "场景 7：SettingsNotify 应恰改 3 行"
+        );
+        assert_eq!(
+            numstat(&root, tools),
+            (1, 1),
+            "场景 7：SettingsTools 应恰改 1 行"
+        );
+    }
 }
 
 /// 场景 8（AC-3 / 票 08）：copy-discipline 机器门——四用例 + 全站扫描 hits === []（Rust 独立复算）。
@@ -723,42 +744,49 @@ fn scene_10_band_boundaries_1100_and_819() {
 fn scene_11_detail_other_rules_untouched() {
     let root = root();
     let rel = "frontend/src/routes/TaskDetail.svelte";
-    assert_eq!(
-        numstat(&root, rel),
-        (13, 0),
-        "场景 11：本票只许增 13 行（决策 215 注释 + 媒体查询），0 删除"
-    );
-    let mut diff = git_out(&root, &["diff", "HEAD", "--", rel]);
-    if diff.trim().is_empty() {
-        // 提交后时序：正文取分支相对基准的 diff（三点，避开 main 侧邻接任务的改动）
-        diff = git_out(&root, &["diff", "origin/main...HEAD", "--", rel]);
+    // 同点时两点/三点 diff 全为空，numstat 恒 (0,0)、`added` 为空——按分支取数的那组
+    // 断言跳过（理由见 `head_equals_origin_main`）；下面按**文件内容**的行号/内容双钉
+    // 照旧跑，本场景的实断言面不减。
+    if head_equals_origin_main(&root) {
+        eprintln!("场景 11：HEAD 与 origin/main 同点（审计已合入 main）——diff / numstat 断言跳过");
+    } else {
+        assert_eq!(
+            numstat(&root, rel),
+            (13, 0),
+            "场景 11：本票只许增 13 行（决策 215 注释 + 媒体查询），0 删除"
+        );
+        let mut diff = git_out(&root, &["diff", "HEAD", "--", rel]);
+        if diff.trim().is_empty() {
+            // 提交后时序：正文取分支相对基准的 diff（三点，避开 main 侧邻接任务的改动）
+            diff = git_out(&root, &["diff", "origin/main...HEAD", "--", rel]);
+        }
+        let added: Vec<&str> = diff
+            .lines()
+            .filter(|l| l.starts_with('+') && !l.starts_with("+++"))
+            .collect();
+        assert!(
+            added
+                .iter()
+                .any(|l| l.contains("@media (min-width: 820px) and (max-width: 1099px)")),
+            "场景 11：新增行应含媒体查询"
+        );
+        assert!(
+            added.iter().any(|l| l.contains("minmax(480px, 1fr) 280px")),
+            "场景 11：新增行应含折行档列串"
+        );
+        assert!(
+            added.iter().all(|l| !l.contains("overflow-x")),
+            "场景 11：新增行不许引 overflow-x"
+        );
+        assert!(
+            added.iter().all(|l| !l.contains("minmax(0, 1fr) 320px")),
+            "场景 11：桌面档列串不许出现在改动行"
+        );
+        assert!(
+            !diff.contains("overflow"),
+            "场景 11：本票 diff 不许触碰 overflow（hero 溢出属票 01 wontfix 面）"
+        );
     }
-    let added: Vec<&str> = diff
-        .lines()
-        .filter(|l| l.starts_with('+') && !l.starts_with("+++"))
-        .collect();
-    assert!(
-        added
-            .iter()
-            .any(|l| l.contains("@media (min-width: 820px) and (max-width: 1099px)")),
-        "场景 11：新增行应含媒体查询"
-    );
-    assert!(
-        added.iter().any(|l| l.contains("minmax(480px, 1fr) 280px")),
-        "场景 11：新增行应含折行档列串"
-    );
-    assert!(
-        added.iter().all(|l| !l.contains("overflow-x")),
-        "场景 11：新增行不许引 overflow-x"
-    );
-    assert!(
-        added.iter().all(|l| !l.contains("minmax(0, 1fr) 320px")),
-        "场景 11：桌面档列串不许出现在改动行"
-    );
-    assert!(
-        !diff.contains("overflow"),
-        "场景 11：本票 diff 不许触碰 overflow（hero 溢出属票 01 wontfix 面）"
-    );
     // 既有的 `overflow-x: auto`（961 行的预存在规则）必须落在本票 669–681 改动块之外
     let td = read(&root, rel);
     let overflow_lines: Vec<usize> = td
@@ -954,12 +982,19 @@ fn scene_17_change_scope_and_evidence_freeze() {
         "tests/e2e/tests/integration/",
     ];
     let changed = changed_paths(&root);
-    assert!(!changed.is_empty(), "场景 17：改动面不应为空");
-    for p in &changed {
-        assert!(
-            allowed.iter().any(|a| p.starts_with(a)),
-            "场景 17：改动越出本票范围 → {p}"
-        );
+    // 同点时改动面读不到（`changed` 恒为空集）：`!is_empty` 会假红，白名单循环则以
+    // 「空集不越界」虚过。跳过并打说明（先例见 `head_equals_origin_main`）；合入前的
+    // 读数在 test-report.md 的命令台账里。
+    if head_equals_origin_main(&root) {
+        eprintln!("场景 17：HEAD 与 origin/main 同点（审计已合入 main）——改动面白名单断言跳过");
+    } else {
+        assert!(!changed.is_empty(), "场景 17：改动面不应为空");
+        for p in &changed {
+            assert!(
+                allowed.iter().any(|a| p.starts_with(a)),
+                "场景 17：改动越出本票范围 → {p}"
+            );
+        }
     }
     // ② 审计冻结文件零 diff（README / 13 张票 / 复跑 spec）
     assert_frozen_untouched(&root);
@@ -969,23 +1004,29 @@ fn scene_17_change_scope_and_evidence_freeze() {
             "场景 17：冻结文件混进改动面 → {f}"
         );
     }
-    // ③ 证据文件在位：实施记录 + 修后复跑截图；修前备份缺则须带评审认可的环境差异记录
+    // ③ 证据文件在位：实施记录 + 两张截图——**两张都可能缺**。`.gitignore:30` 明写
+    //    `.scratch/ux-audit-3/*.png` 不入库（`UX_AUDIT3=1` 跑 e2e/ux-audit-3.spec.ts 可重生成），
+    //    故全新 checkout（CI 就是）里两张都不会在——把「截图没入库」当缺陷红是判据错位。
+    //    缺哪张就要求 IMPLEMENTATION.md 里有环境差异记录（措辞沿用票面 08 既有那一处），
+    //    于是「既没证据、也没说明」仍然拦得住。
     assert!(
         root.join(".scratch/ux-audit-3/IMPLEMENTATION.md").is_file(),
         "场景 17：IMPLEMENTATION.md 应在"
     );
-    let pre_fix = ".scratch/ux-audit-3/r3-literal-asterisks.pre-fix.png";
-    if !root.join(pre_fix).is_file() {
-        assert!(
-            impl_md.contains("修前截图备份无源文件") && impl_md.contains("无源可备"),
-            "场景 17：{pre_fix} 不存在，必须有环境差异记录（审计原跑截图未随库）"
-        );
+    let env_difference_recorded =
+        impl_md.contains("修前截图备份无源文件") && impl_md.contains("无源可备");
+    for rel in [
+        "r3-literal-asterisks.pre-fix.png",
+        "r3-literal-asterisks.png",
+    ] {
+        let path = format!(".scratch/ux-audit-3/{rel}");
+        if !root.join(&path).is_file() {
+            assert!(
+                env_difference_recorded,
+                "场景 17：{path} 不存在，必须有环境差异记录（审计截图不入库，见 .gitignore:30）"
+            );
+        }
     }
-    assert!(
-        root.join(".scratch/ux-audit-3/r3-literal-asterisks.png")
-            .is_file(),
-        "场景 17：修后复跑截图 r3-literal-asterisks.png 应在"
-    );
     // ④ 四段提交 message 反查票面——提交发生在 merge 阶段（决策 2296），
     //    本阶段 {merge-base}..HEAD 为空属正常时序；有提交则逐段核 message。
     let mb = git_out(&root, &["merge-base", "HEAD", "origin/main"])
