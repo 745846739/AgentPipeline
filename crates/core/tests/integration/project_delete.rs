@@ -113,6 +113,22 @@ async fn seed_used_task(store: &Store, task_id: &str, project_id: &str) -> i64 {
         .await
         .unwrap();
 
+    // 节点内消息日志（迁移 0044，`.scratch/node-message-resume` 票 01）：它挂在 **run** 上
+    // （外键 NO ACTION），故必须排在删 run 之前——漏了这一步就是那句 787。
+    store
+        .insert_node_message(
+            task_id,
+            child,
+            Stage::Init,
+            Node::Execute,
+            "main",
+            0,
+            &agentpipeline_core::agent::client::Message::assistant(Some("开工".into()), Vec::new()),
+            false,
+        )
+        .await
+        .unwrap();
+
     store
         .insert_transition(
             task_id,
@@ -256,6 +272,11 @@ const TASK_SCOPED: &[(&str, &str)] = &[
     (
         "kanban_node_conversations",
         "SELECT COUNT(*) FROM kanban_node_conversations WHERE task_id = ?",
+    ),
+    (
+        // 节点内消息日志（迁移 0044）：挂在 run 上，故删除顺序必须排在删 run 之前。
+        "kanban_node_messages",
+        "SELECT COUNT(*) FROM kanban_node_messages WHERE task_id = ?",
     ),
     (
         "kanban_model_requests",

@@ -1630,6 +1630,20 @@ async fn maintenance_refreshes_totals_and_purges_expired_conversations() {
         )
         .await
         .unwrap();
+    // 节点内消息日志（票 01）与任务会话**同一把尺子**：同一个 cutoff、同一个判据。
+    h.store
+        .append_node_messages(
+            "t1",
+            run_id,
+            Stage::Develop,
+            Node::Execute,
+            agentpipeline_core::storage::AGENT_TYPE_MAIN,
+            0,
+            &[agentpipeline_core::agent::client::Message::user("x")],
+            None,
+        )
+        .await
+        .unwrap();
     h.store.mark_terminal("t1", TaskStatus::Done).await.unwrap();
 
     let scheduler = h.scheduler(Settings::default());
@@ -1641,21 +1655,28 @@ async fn maintenance_refreshes_totals_and_purges_expired_conversations() {
 
     // 会话保留期内不清理
     assert_eq!(report.purged_conversations, 0);
+    assert_eq!(report.purged_node_messages, 0);
     assert_eq!(
         h.store.list_conversations("t1", false).await.unwrap().len(),
         1
     );
+    assert_eq!(h.store.count_node_messages(run_id).await.unwrap(), 1);
 
-    // 超过 conversation_retention_days(30) → 终态任务的会话被清理
+    // 超过 conversation_retention_days(30) → 终态任务的会话与消息日志一起被清理
     h.clock.advance_secs(31 * 24 * 3600);
     let report = scheduler.maintenance().await.unwrap();
     assert_eq!(report.purged_conversations, 1);
+    assert_eq!(
+        report.purged_node_messages, 1,
+        "消息日志吃同一个 cutoff，不另设第二把尺"
+    );
     assert!(h
         .store
         .list_conversations("t1", false)
         .await
         .unwrap()
         .is_empty());
+    assert_eq!(h.store.count_node_messages(run_id).await.unwrap(), 0);
 }
 
 /// 指标聚合不许把 done 任务的「刚完成」洗掉（2026-10-04 实测事故）。
@@ -2193,6 +2214,69 @@ async fn a_restart_closes_leftover_task_runs_without_impersonating_a_timeout() {
 
     // 它不进超时梯子的计数（来路是 restart 而非 timeout）
     assert_eq!(streak(&h, "t-boot", &cursor.cursor_id).await, 0);
+}
+
+/// 重启连击计数**独立成一条**（`.scratch/node-message-resume` 票 04）：数「尾部连续被
+/// 进程重启收尾」的 run 数，撞到**任何别的收场**就停——于是「一次人工介入之后计数重新
+/// 起算」是这条计数的自然性质，不需要额外的清零动作。
+///
+/// 同时钉住与超时梯子的分工：**重启本身让超时梯子既不升档也不清零**（决策 368 票 02①
+/// 的口径一个字没改）——两条梯子各管一类「续不回来」，判据不同、计数不同。
+#[tokio::test]
+async fn the_restart_streak_is_counted_apart_from_the_timeout_ladder() {
+    let h = Harness::new().await;
+    h.seed_task("t-restart").await;
+    h.mark_running("t-restart").await;
+    let cursor = h.store.load_live_cursors("t-restart").await.unwrap()[0].clone();
+    h.advance_to_develop(&cursor.cursor_id).await;
+    // 三次「进程退出时还在跑」的收尾——正是启动恢复写下的那一形态。
+    for i in 1..=3 {
+        cancelled_run(
+            &h,
+            "t-restart",
+            &cursor.cursor_id,
+            i,
+            agentpipeline_core::storage::observability::CANCEL_ORIGIN_RESTART,
+        )
+        .await;
+    }
+    let c = h.store.get_cursor(&cursor.cursor_id).await.unwrap();
+    assert_eq!(
+        h.store
+            .trailing_restart_streak("t-restart", c.stage, c.node)
+            .await
+            .unwrap(),
+        3,
+        "尾部连续三条都是被重启收尾的"
+    );
+    assert_eq!(
+        streak(&h, "t-restart", &cursor.cursor_id).await,
+        0,
+        "超时梯子既不把重启算成超时，也不被它清零"
+    );
+
+    // 一次别的收场（成功 / 失败 / 超时 / 人按停）→ 重启连击重新起算。
+    let run = h
+        .running_run("t-restart", &cursor.cursor_id, 4, 5, 5, None)
+        .await;
+    h.store
+        .finish_run(
+            run,
+            &RunOutcome {
+                status: Some(NodeStatus::Success),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        h.store
+            .trailing_restart_streak("t-restart", c.stage, c.node)
+            .await
+            .unwrap(),
+        0,
+        "人介入之后的新一轮重新起算"
+    );
 }
 
 // ───────────────── 待办补两类（决策 234，票 05）─────────────────

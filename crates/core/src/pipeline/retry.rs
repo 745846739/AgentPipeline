@@ -70,6 +70,46 @@ pub fn after_attempt_failure(error: &Error) -> AttemptRetry {
 /// 与托管止损「满 2 次即停」（决策 210）同一量级；数字进决策日志，不做配置项。
 pub const TIMEOUT_AUTO_CONTINUES_MAX: u32 = 2;
 
+/// 连续**进程重启**到第几次仍然带转录接着跑（`.scratch/node-message-resume` 票 04，**写死不配**）。
+///
+/// 与 `TIMEOUT_AUTO_CONTINUES_MAX` 取同一个数不是巧合：两个计数回答的是同一类问题
+/// （「续接救不回来」），只是判据不同——超时看「节点自己跑不动了」，重启看「服务在同一个
+/// 节点上反复死」。用户可见的承诺因此一致：连续两轮自动续接、第三轮交回人工。
+pub const RESTART_AUTO_CONTINUES_MAX: u32 = 2;
+
+/// 节点连续因**进程重启**而中止 `streak` 次之后怎么办（票 04）。
+///
+/// 与 [`TimeoutRetry`] 是**两条独立的梯子**：判据不同（`trailing_timeout_streak` 数的是
+/// 节点超时的轮数、`trailing_restart_streak` 数的是被重启收尾的轮数），计数也不同——一次
+/// 重启既不是「这个节点超时了」的证据、也不是人介入，它在超时梯子里**既不计数也不清零**
+/// 的既有口径一个字没改（决策 368 票 02①）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RestartRetry {
+    /// 1–2 次：带着节点内消息日志里的转录接着跑（进程被杀时日志里就是真实进度，
+    /// 已完成的工具副作用不再重做——这正是整件事的用户可见目标）。
+    AutoContinue,
+    /// 第 3 次起：**转 pending 交回人工**。
+    ///
+    /// **为什么不是「降成空白重跑 + 简报」**（票 04 的二选一）：空白档能救的是「转录本身
+    /// 是崩溃的诱因」（例如上下文大到装配期就 OOM）；救不了「这个节点跑什么都会把服务搞死」
+    /// （`run_command` 起的进程把机器打爆）。而重启连击的代价不只是 token——**服务本身在
+    /// 反复死**，每一轮都是一次全站不可用。降成空白档并没有把循环的圈数封顶（下一轮仍然
+    /// 会跑同一个节点），只有交回人工才真的停住。故止损取「停」不取「换一种重放」。
+    Pending,
+}
+
+/// 连续重启第 `streak` 次之后的动作（票 04）。
+///
+/// `streak` 由台账算（`trailing_restart_streak`：该节点尾部连续被重启收尾的 run 数）。
+/// 与超时梯子一样只做分档——调用点负责取数与落地。
+pub fn restart_retry(streak: u32) -> RestartRetry {
+    if streak <= RESTART_AUTO_CONTINUES_MAX {
+        RestartRetry::AutoContinue
+    } else {
+        RestartRetry::Pending
+    }
+}
+
 /// 节点连续超时 `streak` 次之后怎么办（决策 320）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TimeoutRetry {
@@ -195,6 +235,30 @@ mod tests {
             timeout_retry(0),
             TimeoutRetry::AutoContinue,
             "0 次不该出现，按续接兜底"
+        );
+    }
+
+    /// 重启连击止损（`.scratch/node-message-resume` 票 04）：与超时梯子**两条梯子**——
+    /// 判据不同、计数不同、动作也不同（重启那一档到上限直接转 pending，不设空白档，
+    /// 理由见 [`RestartRetry::Pending`] 的文档）。
+    #[test]
+    fn the_restart_ladder_stops_at_three_without_a_blank_rung() {
+        assert_eq!(
+            restart_retry(1),
+            RestartRetry::AutoContinue,
+            "第 1 次：续接"
+        );
+        assert_eq!(
+            restart_retry(2),
+            RestartRetry::AutoContinue,
+            "第 2 次：仍续接"
+        );
+        assert_eq!(restart_retry(3), RestartRetry::Pending, "第 3 次：交回人工");
+        assert_eq!(restart_retry(9), RestartRetry::Pending, "再往后照旧挂起");
+        assert_eq!(
+            restart_retry(0),
+            RestartRetry::AutoContinue,
+            "0 次（节点没被重启打断过）不该被止损拦下"
         );
     }
 }

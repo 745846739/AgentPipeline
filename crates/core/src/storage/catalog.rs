@@ -284,6 +284,20 @@ impl Store {
         .execute(&mut *tx)
         .await?;
 
+        // 节点内消息日志（票 01）挂在 run 上（外键 NO ACTION），故它必须与上面那批**同批**
+        // 清完——留到删 run 那一步会被外键拦住（787）。按 `TASK` **与** `RUN` 两个方向清：
+        // `run_id` 才是外键那一侧（`task_id` 只是同值的冗余列，没有外键保证两者一致），
+        // 只按 `task_id` 清是在赌那一列永不与 run 的归属漂开——外键方向上的谓词才是权威的
+        //（与 `kanban_node_commands` / `kanban_model_requests` 同一形状）。
+        sqlx::query(&format!(
+            "DELETE FROM kanban_node_messages WHERE {TASK} OR {RUN}"
+        ))
+        .bind(project_id) // TASK
+        .bind(project_id) // RUN：项目级 run
+        .bind(project_id) // RUN：任务级 run
+        .execute(&mut *tx)
+        .await?;
+
         sqlx::query(&format!(
             "DELETE FROM kanban_model_requests WHERE {TASK} OR {RUN}"
         ))

@@ -679,3 +679,191 @@ async fn settings_saved_market_repos_survive_a_real_restart() {
     third.kill().await.unwrap();
     third.wait().await.unwrap();
 }
+
+// ────── 节点内消息级恢复（`.scratch/node-message-resume` 票 03：整件事的用户可见目标）──────
+
+/// **kill -9 落在工具调用中途** → 同一个 home 重启 → 节点从日志里最后一条已记录的消息
+/// 接着跑，且**已经做完的工具副作用不再重做**。
+///
+/// 造法与断言各钉一颗牙：
+/// 1. 脚本在 `architect-design.execute` 上先跑一条 **append 型命令**（往任务目录里的
+///    `MARKER.txt` 追加一行），再跑一条**睡得够久的命令**——杀点就落在后者的执行中途
+///    （assistant 行已经落库、它的工具结果还没落库，正是「半轮」的形状）；
+/// 2. **重启后**新 run 带 `continued_from_run_id` 指向被杀的那条，且它的日志前缀里
+///    **含被杀前已完成的那些消息**（第一条 append 命令的 assistant 行 + 工具结果）；
+/// 3. 未配齐的那条调用收到**合成回执**（`synthetic` 标记 + 文案），因为不补的话这半轮
+///    重放给下一轮必然是一次 400；
+/// 4. `MARKER.txt` **只有一行**——第一条 append 命令没有被重放。这是本功能的验收点：
+///    没有它，「已完成的副作用不再重做」就只是说法。
+#[tokio::test]
+async fn kill_9_mid_tool_call_resumes_from_the_log_without_replaying_completed_tools() {
+    let home = TestHome::new().unwrap();
+    write_pipeline_config(&home, 1);
+    let repo = Repo::clean().unwrap();
+    let marker = home.home().task_dir("t1").join("MARKER.txt");
+
+    let mut script = Script::new();
+    script
+        .for_node(Stage::ArchitectDesign, Node::ValidateInput)
+        .submit(&ValidateInputMetadata {
+            readiness: true,
+            blockers: vec![],
+        });
+    script
+        .for_node(Stage::ArchitectDesign, Node::Execute)
+        // 第一步：append 型命令——它跑过一次之后就不该再有第二次痕迹。
+        .run_command(&format!("printf 'once\\n' >> {}", marker.display()))
+        // 第二步：睡得够久，杀点落在这条命令的执行中途。
+        .run_command("sleep 60")
+        // 第三步（**重启之后**才被消费）：交卷，于是恢复后的节点能干净收口。
+        .submit(&ArchitectExecuteMetadata {
+            readiness: true,
+            affected_files: vec!["src/lib.rs".into()],
+            new_symbols: vec![],
+            acceptance_criteria: vec![AcceptanceCriterion {
+                id: "AC-1".into(),
+                description: "能登录".into(),
+            }],
+            ..Default::default()
+        });
+    let mock = MockLlm::from_script(script).await;
+
+    let store = home.store(Arc::new(SystemClock)).await.unwrap();
+    let now = store.now();
+    store
+        .upsert_provider(&Provider {
+            id: "prov".into(),
+            vendor: "openai".into(),
+            model: "mock".into(),
+            context_window: 8000,
+            base_url: Some(mock.url.clone()),
+            api_key: Some("sk-test".into()),
+            enabled: true,
+            created_at: now,
+            updated_at: now,
+        })
+        .await
+        .unwrap();
+    store
+        .create_project(&Project {
+            id: "p1".into(),
+            name: "resume-log".into(),
+            local_path: repo.path().display().to_string(),
+            default_branch: "main".into(),
+            language: None,
+            test_framework: Some("true".into()),
+            lint_command: None,
+            agents_md_path: None,
+            created_at: now,
+        })
+        .await
+        .unwrap();
+    testkit::seed_task(&store, "t1", "p1").await.unwrap();
+
+    // ── 第一次启动：等日志里出现那条 `sleep` 的 assistant 行（= 工具正在跑）→ SIGKILL ──
+    let (mut child, port) = spawn_server(&home).await;
+    wait_until_ready(port).await;
+    let deadline = Instant::now() + Duration::from_secs(60);
+    let (killed_run_id, half) = loop {
+        assert!(
+            Instant::now() < deadline,
+            "60s 内没等到「assistant 行已落库、它的工具还在跑」那个窗口"
+        );
+        if let Ok(Some(transcript)) = store
+            .latest_own_transcript("t1", Stage::ArchitectDesign, Node::Execute)
+            .await
+        {
+            let sleeping = transcript.messages.iter().any(|m| {
+                m.tool_calls
+                    .iter()
+                    .any(|c| c.name == "run_command" && c.arguments.contains("sleep 60"))
+            });
+            // 那一刻 assistant 行在、对应的工具结果**不在**——半轮正是被杀点在工具中途的形状。
+            let receipts = transcript
+                .messages
+                .iter()
+                .filter(|m| m.role == agentpipeline_core::agent::client::Role::Tool)
+                .count();
+            let calls: usize = transcript.messages.iter().map(|m| m.tool_calls.len()).sum();
+            if sleeping && receipts < calls {
+                break (transcript.run_id, transcript);
+            }
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    };
+    assert!(
+        half.messages
+            .iter()
+            .any(|m| m.role == agentpipeline_core::agent::client::Role::Tool),
+        "被杀前那条 append 命令的结果应当已经在日志里"
+    );
+    child.start_kill().expect("kill -9");
+    let _ = tokio::time::timeout(Duration::from_secs(5), child.wait()).await;
+
+    // ── 重启：同一个 home，启动恢复把中断的游标记上「进程重启」续接原因 ──
+    let (_child2, port2) = spawn_server(&home).await;
+    wait_until_ready(port2).await;
+
+    // 新 run 出现且带继续链接（`continued_from_run_id` 指向被杀的那条）。
+    let deadline = Instant::now() + Duration::from_secs(60);
+    let resumed = loop {
+        assert!(Instant::now() < deadline, "重启后没有续接出新的一条 run");
+        if let Ok(runs) = store
+            .list_runs_at("t1", Stage::ArchitectDesign, Node::Execute)
+            .await
+        {
+            if let Some(run) = runs
+                .iter()
+                .find(|r| r.id > killed_run_id && r.continued_from_run_id == Some(killed_run_id))
+            {
+                break run.clone();
+            }
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    };
+
+    // 日志前缀含被杀前已完成的那些消息 + 半轮的合成回执。
+    let log = store
+        .latest_own_transcript("t1", Stage::ArchitectDesign, Node::Execute)
+        .await
+        .unwrap()
+        .expect("恢复后的 run 有日志");
+    assert_eq!(log.run_id, resumed.id, "读到的是恢复后那条 run 的日志");
+    assert!(
+        log.messages.len() >= half.messages.len(),
+        "承接的前缀至少包含被杀前那半轮（{} 条），实际 {} 条",
+        half.messages.len(),
+        log.messages.len()
+    );
+    let synthetic_receipts: Vec<&agentpipeline_core::agent::client::Message> = log
+        .messages
+        .iter()
+        .filter(|m| {
+            m.role == agentpipeline_core::agent::client::Role::Tool
+                && m.content.as_deref()
+                    == Some(agentpipeline_core::agent::context::RESTART_INTERRUPTED_NOTE)
+        })
+        .collect();
+    assert_eq!(
+        synthetic_receipts.len(),
+        1,
+        "未配齐的那条调用收到一条合成回执（不补的话这半轮重放出去就是一次必然的 400）：{:?}",
+        log.messages
+    );
+    assert!(
+        store
+            .count_synthetic_node_messages(resumed.id)
+            .await
+            .unwrap()
+            >= 1,
+        "合成回执落库时带 synthetic 标记——假读数要能被人一眼认出来"
+    );
+
+    // **已完成的工具没有被重放**：那条 append 命令在任务目录里只留下一次痕迹。
+    let marks = std::fs::read_to_string(&marker).unwrap_or_default();
+    assert_eq!(
+        marks.lines().count(),
+        1,
+        "append 型命令只该跑一次（跑两次说明续接没生效、节点整段重跑了）：{marks:?}"
+    );
+}

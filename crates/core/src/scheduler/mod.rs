@@ -161,6 +161,24 @@ impl KanbanScheduler {
         // 一张表都不豁免——维护作业只摘了消息这一张表。
         let cutoff =
             self.clock.now() - Duration::days(self.settings.conversation_retention_days as i64);
+        // 节点内消息日志与任务会话**同一把尺子**（票 01）：同一个 cutoff、同一个「任务终态 +
+        // 超龄」判据，不造第二把尺（决策 182④ / 204⑦ 已经吃过两把尺的亏）。**判据不许换成
+        // 「run 判终态」**——启动恢复第一件事就是把被 kill 的 run 标终态，那正是最需要日志的
+        // 时刻。走维护连接（决策 321：与上面那条 DELETE 同类，重负载日会把主池拖进慢语句）。
+        let purged_node_messages = {
+            let mut conn = self.store.maintenance_connection().await?;
+            let n = sqlx::query(
+                "DELETE FROM kanban_node_messages
+                 WHERE task_id IN (SELECT id FROM kanban_tasks
+                                   WHERE status IN ('done','failed','cancelled'))
+                   AND created_at < ?",
+            )
+            .bind(crate::storage::ts(cutoff))
+            .execute(&mut conn)
+            .await?
+            .rows_affected();
+            n as usize
+        };
         // 提议两件事分开做（决策 207）：**过期清扫**改状态、留行；**年龄清理**删行。
         // 合成一步就会让「过期只让按钮变灰、那一轮留在时间线」这条规则在维护作业里失效。
         let expired_proposals = self
@@ -181,6 +199,7 @@ impl KanbanScheduler {
         let checkpoint = self.store.checkpoint_wal().await?;
         tracing::info!(
             purged_conversations = purged,
+            purged_node_messages,
             wal_busy = checkpoint.busy,
             wal_bytes_before = checkpoint.wal_bytes_before,
             wal_bytes_after = checkpoint.wal_bytes_after,
@@ -189,6 +208,7 @@ impl KanbanScheduler {
         );
         Ok(MaintenanceReport {
             purged_conversations: purged,
+            purged_node_messages,
             expired_foreman_proposals: expired_proposals,
             purged_foreman_proposals: purged_proposals,
             recycled_repair_worktrees: recycled_repairs,
@@ -1105,6 +1125,11 @@ impl KanbanScheduler {
 pub struct MaintenanceReport {
     /// 被保留期清掉的**终态任务**会话行（与值班长消息无关——那张表已豁免，票 04）。
     pub purged_conversations: usize,
+    /// 被保留期清掉的**节点内消息日志**行（票 01：与任务会话同一把尺子，同一个 cutoff）。
+    ///
+    /// 单列一个读数而不是并进上面那项：两张表的量级完全不同（日志一行一条消息、会话一行一整块
+    /// 会话），合起来读会让人以为「会话涨了一个数量级」。
+    pub purged_node_messages: usize,
     /// 被过期清扫标成 `expired` 的提议（决策 207）。**清的是状态不是行**——那一轮留在
     /// 时间线里，故它与上面两项的「清掉了多少行」不是同一个量。
     pub expired_foreman_proposals: usize,

@@ -10,6 +10,7 @@
 //! `attention`（值班长待办——调度器发现的落点，决策 209③）、
 //! `model_requests`（模型请求台账——「现在在飞什么」与「这一次烧了多少字节」，决策 231）、
 //! `rtk`（命令执行走 rtk 的全局开关，决策 297）、
+//! `node_messages`（节点内消息日志——「最后一条已记录的消息」，`.scratch/node-message-resume` 票 01）、
 //! `push`（浏览器推送的订阅行与 VAPID 密钥对，spec `.scratch/pwa-webpush/` 票 02）。
 
 pub mod attention;
@@ -22,6 +23,7 @@ pub mod foreman;
 pub mod io_budget;
 pub mod market_repos;
 pub mod model_requests;
+pub mod node_messages;
 pub mod notify_channel;
 pub mod observability;
 pub mod offload;
@@ -37,6 +39,7 @@ pub use attention::{AttentionItem, AttentionKind, AttentionSummary, WatchWakeOut
 pub use compaction::CompactionOverrides;
 pub use foreman::{ForemanMessage, NewForemanMessage};
 pub use model_requests::{ModelRequest, ModelRequestStatus, ModelRequestUsage, NewModelRequest};
+pub use node_messages::{NodeTranscript, AGENT_TYPE_MAIN};
 pub use offload::OffloadSwitch;
 pub use push::{PushSubscription, VapidKeys};
 pub use rtk::RtkSwitch;

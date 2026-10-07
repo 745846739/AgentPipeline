@@ -35,7 +35,7 @@ use crate::storage::observability::{NewRun, PromptSnapshot, RunOutcome};
 use crate::storage::Store;
 use crate::types::{
     CommandSource, DuplicateRisk, Gate, GateFailureKind, Node, NodeCursor, NodeStatus,
-    PendingContext, PendingKind, PendingReason, Project, Stage, StageConfig, Task,
+    PendingContext, PendingKind, PendingReason, Project, ResumeCause, Stage, StageConfig, Task,
 };
 use crate::{Error, Result};
 
@@ -133,6 +133,80 @@ impl AttemptTrace {
     /// 落库用的 `Some`：没攒到思考就给 `None`（NULL = 没有思考留痕，界面不画空块）。
     fn reasoning_row(&self) -> Option<&str> {
         Some(self.reasoning.as_str()).filter(|r| !r.is_empty())
+    }
+}
+
+/// 节点内消息日志的写入器（`.scratch/node-message-resume` 票 01）。
+///
+/// **承重顺序**：assistant 行必须在**这一批工具的第一个执行之前**落库并提交——崩溃时
+/// 最多丢一条还没落库的模型响应，而绝不会出现「工具跑了、日志里没有那条要回执的
+/// assistant」。故每次写都是一条独立的 INSERT（自动提交），不做延迟批写、不攒批。
+///
+/// `next_seq` 由本结构自己维护，**不跟 `trace.messages.len()` 走**：压缩会改写内存里那份
+/// 转录（丢消息 / 换成摘要），而日志是**只追加**的原始转录——两者从压缩那一刻起就不等长。
+/// 这份不等长正是本表存在的理由：续接拿到的必须是完整的那一份。
+///
+/// **每个 run 自包含**：起跑时把承接的转录前缀整批写进本 run 名下（`seq` 从 0 起），
+/// 于是「某 run 的全部行」就是那次尝试的完整转录。重试轮（`agent_retry_max`）会把上一轮
+/// 的转录再写一遍——那是决策 99「一条 run 至多一条会话行」的同一形状（每次尝试自成一段）。
+struct NodeMessageLog {
+    store: Store,
+    task_id: String,
+    run_id: i64,
+    stage: Stage,
+    node: Node,
+    next_seq: i64,
+}
+
+impl NodeMessageLog {
+    /// 起跑：承接前缀落库（`synthetic_from` 见 [`Store::append_node_messages`] 的文档）。
+    async fn start(
+        store: &Store,
+        task_id: &str,
+        run_id: i64,
+        stage: Stage,
+        node: Node,
+        carried: &[Message],
+        synthetic_from: Option<usize>,
+    ) -> Result<Self> {
+        store
+            .append_node_messages(
+                task_id,
+                run_id,
+                stage,
+                node,
+                crate::storage::AGENT_TYPE_MAIN,
+                0,
+                carried,
+                synthetic_from,
+            )
+            .await?;
+        Ok(Self {
+            store: store.clone(),
+            task_id: task_id.to_string(),
+            run_id,
+            stage,
+            node,
+            next_seq: carried.len() as i64,
+        })
+    }
+
+    /// 追加一条并**当场提交**（顺序保证见结构 doc）。
+    async fn append(&mut self, message: &Message) -> Result<()> {
+        self.store
+            .insert_node_message(
+                &self.task_id,
+                self.run_id,
+                self.stage,
+                self.node,
+                crate::storage::AGENT_TYPE_MAIN,
+                self.next_seq,
+                message,
+                false,
+            )
+            .await?;
+        self.next_seq += 1;
+        Ok(())
     }
 }
 
@@ -300,16 +374,70 @@ impl ModelInvoke {
         let brief_continuation = continuation
             .as_ref()
             .is_some_and(|c| c.mode == crate::pipeline::run_ledger::ContinuationMode::Brief);
+        // 这一次是不是**进程重启**的续接（票 03）：止损与「不许凭空注入 turn」两处都要问它。
+        let restarting = continuation
+            .as_ref()
+            .is_some_and(|c| c.cause == ResumeCause::ProcessRestart);
+        // 重启连击止损（`.scratch/node-message-resume` 票 04）：同一个节点被服务重启连续打断
+        // N 次时，不再无限重放同一份转录——转 pending 交回人工。计数**独立**（与超时梯子
+        // 两条梯子、各自的读数），故一次重启在超时梯子里照旧「既不计数也不清零」。
+        //
+        // **在 `begin` 之前**：止损的意思是「这一轮不要跑」，那一轮就不该有 run 行。挂在
+        // 游标上的 pending 由执行体统一落（`NodeOutput::Pending` 的既有路径）。
+        if restarting {
+            let streak = self
+                .store
+                .trailing_restart_streak(&task.id, cursor.stage, cursor.node)
+                .await?;
+            if crate::pipeline::retry::restart_retry(streak)
+                == crate::pipeline::retry::RestartRetry::Pending
+            {
+                tracing::warn!(
+                    task = %task.id,
+                    stage = %cursor.stage,
+                    node = %cursor.node,
+                    streak,
+                    "连续多次进程重启续接仍未取得进展：停止自动续接，交回人工（票 04 止损）"
+                );
+                return Ok(NodeOutput::Pending(PendingReason::new(
+                    PendingKind::RetryExhausted,
+                    cursor.stage,
+                    cursor.node,
+                    format!(
+                        "{}.{} 连续 {streak} 次因进程重启而中断，已停止自动续接——请检查这个节点为什么会让服务反复退出后人工处置",
+                        cursor.stage, cursor.node
+                    ),
+                )));
+            }
+        }
         // 决策 279：info_insufficient 续接时，补充输入作为 user turn 追加到**转录末尾**
         // （不再经 segment 重渲染进首条消息——那会把 prompt 前缀全变、缓存打穿，
         // 且转录里查无此人）。只在真追加了 turn 时才停用 segment：
         // `AttemptCtx.user_input_as_turn`。
+        //
+        // **判据是续接原因，不是「承接的转录非空」**（`.scratch/node-message-resume` 票 02）：
+        // 日志源接通之后**任何**一次恢复都会让承接转录非空，按非空判会在一次普通崩溃上
+        // 凭空往 develop 节点插一条「补充输入」turn——而人根本没输入过任何东西。
         let mut carried: Vec<Message> = continuation
             .as_ref()
             .map(|c| c.messages.clone())
             .unwrap_or_default();
+        // 承接转录末尾那几条是**合成回执**（票 02）：落进本 run 的日志时带 `synthetic` 标记，
+        // 之后重放读到它的人认得出「这不是模型说的、也不是工具回的」。
+        //
+        // **在这里（下面两个 `carried.push` 之前）就换算成下标**：那两处会往末尾追加补充输入 /
+        // 打回反馈的 user turn，它们是**真消息**——用「末尾几条」那种尾部计数会把标记打错人
+        // （把真 turn 标成合成的、把合成回执标成真的）。回执永远是承接转录的**尾段**，
+        // 故下标在后续追加下保持有效。
+        let synthetic_from = continuation
+            .as_ref()
+            .and_then(|c| (c.synthetic_tail > 0).then(|| c.messages.len() - c.synthetic_tail));
         let mut supplement_as_turn = false;
-        if matches!(cursor.node, Node::ValidateInput) && !carried.is_empty() {
+        if matches!(cursor.node, Node::ValidateInput)
+            && continuation
+                .as_ref()
+                .is_some_and(|c| c.cause == ResumeCause::InfoInsufficient)
+        {
             if let Some(text) = supplement_input(self.store.home(), &task.id) {
                 // 决策 79 的落盘纪律是「空输入不落文件」但**也不清旧档**——同一
                 // info_insufficient 第二次「继续」且不带新输入时，文件里还是上一次
@@ -330,8 +458,19 @@ impl ModelInvoke {
         // 追加一条带结构化前缀的 user turn**（装配形态对齐决策 279 的 `carried.push`）。
         // 只在真续接了转录时追加——无转录的重入没有「末尾」可落，反馈仍走 segment 通道；
         // 真追加了（或转录里已有同文）才停用 segment（`AttemptCtx.review_rework_as_turn`）。
+        //
+        // **判据同样是续接原因**（票 02）：按「承接转录非空」判会让一次普通崩溃在
+        // develop.execute 上凭空插一条评审打回反馈——把没发生过的评审当作事实喂给模型。
         let mut review_rework_as_turn = false;
-        if cursor.stage == Stage::Develop && cursor.node == Node::Execute && !carried.is_empty() {
+        if cursor.stage == Stage::Develop
+            && cursor.node == Node::Execute
+            && continuation.as_ref().is_some_and(|c| {
+                matches!(
+                    c.cause,
+                    ResumeCause::Review | ResumeCause::HumanReviewRejected
+                )
+            })
+        {
             if let Some(text) = review_rework_turn(&self.store, task).await? {
                 let already_carried = carried.iter().any(|m| {
                     m.role == crate::agent::client::Role::User
@@ -343,6 +482,8 @@ impl ModelInvoke {
                 review_rework_as_turn = true;
             }
         }
+        // 承接转录末尾有几条是**合成回执**（票 02）：落进本 run 的日志时带 `synthetic` 标记，
+        // 之后重放读到它的人认得出「这不是模型说的、也不是工具回的」。
         for round in 0..self.settings.agent_retry_max {
             let (run_id, attempt) = self
                 .ledger()
@@ -365,6 +506,7 @@ impl ModelInvoke {
                     run_id,
                     attempt,
                     &carried,
+                    synthetic_from,
                     supplement_as_turn,
                     review_rework_as_turn,
                     brief_continuation,
@@ -527,6 +669,7 @@ impl ModelInvoke {
         run_id: i64,
         attempt: u32,
         carried: &[Message],
+        synthetic_from: Option<usize>,
         supplement_as_turn: bool,
         review_rework_as_turn: bool,
         brief_continuation: bool,
@@ -535,6 +678,30 @@ impl ModelInvoke {
         let mut trace = AttemptTrace {
             messages: carried.to_vec(),
             ..Default::default()
+        };
+        // 节点内消息日志（票 01）：承接前缀先落库，之后每产生一条消息就追加一条。
+        // **落库失败挂关键路径**（不吞）：日志是恢复的唯一素材，写不进去还继续跑等于给
+        // 一个假的「能恢复」承诺——与 `touch_run_heartbeat` 同姿态（观测类的 `mark_step`
+        // 才是 best-effort）。失败时把已承接的转录一起交回（决策 278 的形状）。
+        let mut log = match NodeMessageLog::start(
+            &self.store,
+            &task.id,
+            run_id,
+            cursor.stage,
+            cursor.node,
+            carried,
+            synthetic_from,
+        )
+        .await
+        {
+            Ok(log) => log,
+            Err(error) => {
+                return Err(AttemptFailure {
+                    error,
+                    tokens: RunTokens::default(),
+                    messages: carried.to_vec(),
+                })
+            }
         };
         match self
             .agent_attempt_inner(
@@ -545,6 +712,7 @@ impl ModelInvoke {
                 run_id,
                 attempt,
                 &mut trace,
+                &mut log,
                 supplement_as_turn,
                 review_rework_as_turn,
                 brief_continuation,
@@ -749,6 +917,7 @@ impl ModelInvoke {
         run_id: i64,
         attempt: u32,
         trace: &mut AttemptTrace,
+        log: &mut NodeMessageLog,
         supplement_as_turn: bool,
         review_rework_as_turn: bool,
         brief_continuation: bool,
@@ -1033,6 +1202,12 @@ impl ModelInvoke {
                 response.content.clone(),
                 response.tool_calls.clone(),
             ));
+            // **承重顺序（票 01）**：这一条 assistant 行必须在**下面那一批工具的第一个执行
+            // 之前**落库并提交。模型刚说的话是这一批工具存在的依据——它没落库就开跑，崩溃
+            // 之后日志里只剩半截工具结果、没有任何东西说要它们干什么，那一轮只能整段作废。
+            // 单条 INSERT 自动提交，故这一行在下一个 await 之前就已经在盘上了。
+            log.append(&trace.messages[trace.messages.len() - 1])
+                .await?;
             self.store.touch_run_heartbeat(run_id).await?;
             // 决策 375：投影滚动刷新（节流 [`USAGE_PROJECTION_REFRESH`]）——长节点执行
             // 期间详情页的 token 计数与 `updated_at` 不再冻结，监控不再把活跃任务误判
@@ -1094,6 +1269,10 @@ impl ModelInvoke {
                         trace
                             .messages
                             .push(Message::tool_result(call, outcome.content));
+                        // 每个工具结果**返回后立即落行**（票 01）：这一条真发生了，它是
+                        // 「已完成的副作用不再重做」在日志里的凭据。
+                        log.append(&trace.messages[trace.messages.len() - 1])
+                            .await?;
                     }
                     Err(e) => {
                         // error 阶段的 args_summary 仍是参数摘要（决策 123）；
@@ -1114,6 +1293,10 @@ impl ModelInvoke {
                         trace
                             .messages
                             .push(Message::tool_result(call, format!("工具执行失败：{e}")));
+                        // 工具失败**也落行**（票 01）：内容是失败文本，与转录里那份逐字一致
+                        // ——「这个调用跑过、以失败收场」与「它根本没跑」是两件事，续接时同理。
+                        log.append(&trace.messages[trace.messages.len() - 1])
+                            .await?;
                         if tool_failures > self.settings.tool_retry_max {
                             return Err(Error::Validation(format!(
                                 "工具失败超过 tool_retry_max：{e}"

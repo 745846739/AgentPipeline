@@ -4,9 +4,9 @@
 
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
-use agentpipeline_core::agent::client::{AgentResponse, LlmClient, LlmRequest};
+use agentpipeline_core::agent::client::{AgentResponse, LlmClient, LlmRequest, Role};
 use agentpipeline_core::agent::providers::LlmErrorKind;
 use agentpipeline_core::config::Settings;
 use agentpipeline_core::pipeline::Executor;
@@ -5251,10 +5251,10 @@ async fn subagent_does_not_inherit_declared_tools() {
     );
 }
 
-/// 验收（票 08）：**未声明** `spawn_sub_agent` 时，工具定义里根本没有它
-/// （默认关闭），父代理不会拿到一个假的指针。
+/// 验收（决策 400）：设计阶段**未配置** `tools_json` 时，`spawn_sub_agent` 默认进广告集
+/// （与运行器注入同一来源取值）；develop / review / test 维持默认关闭——请求里没有它。
 #[tokio::test]
-async fn spawn_sub_agent_absent_unless_declared() {
+async fn spawn_sub_agent_default_on_for_design_stages_only() {
     let ctx = setup("true", Settings::default()).await;
 
     let mut script = Script::new();
@@ -5268,13 +5268,121 @@ async fn spawn_sub_agent_absent_unless_declared() {
     ctx.executor.run("t-nosub").await.unwrap();
 
     let requests = ctx.agent.request_log();
+    for stage in [
+        Stage::ArchitectDesign,
+        Stage::DevelopDesign,
+        Stage::TestDesign,
+    ] {
+        let stage_reqs: Vec<_> = requests.iter().filter(|r| r.stage == stage).collect();
+        assert!(!stage_reqs.is_empty(), "{stage:?} 应有请求");
+        assert!(
+            stage_reqs
+                .iter()
+                .all(|r| r.tools.iter().any(|t| t.name == "spawn_sub_agent")),
+            "设计阶段 {stage:?} 未配置时应默认广告 spawn_sub_agent"
+        );
+    }
+    for stage in [Stage::Develop, Stage::Review, Stage::Test] {
+        assert!(
+            requests
+                .iter()
+                .filter(|r| r.stage == stage)
+                .all(|r| !r.tools.iter().any(|t| t.name == "spawn_sub_agent")),
+            "非默认阶段 {stage:?} 不得出现 spawn_sub_agent"
+        );
+    }
+}
+
+/// 验收（决策 400）：显式配置**原样生效**——设计阶段给 `[]` 就是显式关闭，全流水线的
+/// 请求里都不再出现。「没配过」的默认与「配了」的原样是两种状态，后者说了算。
+#[tokio::test]
+async fn spawn_sub_agent_absent_when_design_stages_opted_out() {
+    let ctx = setup("true", Settings::default()).await;
+    for stage in ["architect-design", "develop-design", "test-design"] {
+        ctx.store
+            .upsert_stage_config(&agentpipeline_core::types::StageConfig {
+                stage: stage.into(),
+                tools_json: Some(serde_json::json!([])),
+                updated_at: ctx.store.now(),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+    }
+
+    let mut script = Script::new();
+    design_scripts(&mut script);
+    implementation_scripts(&mut script, "t-optout");
+    ctx.agent.set_script(script);
+    testkit::seed_task(&ctx.store, "t-optout", "p1")
+        .await
+        .unwrap();
+    admit(&ctx, "t-optout").await;
+    ctx.executor.run("t-optout").await.unwrap();
+
+    let requests = ctx.agent.request_log();
     for req in &requests {
         assert!(
             !req.tools.iter().any(|t| t.name == "spawn_sub_agent"),
-            "未声明时不得出现 spawn_sub_agent：{:?}",
+            "显式 [] 后不得出现 spawn_sub_agent（stage={:?}）：{:?}",
+            req.stage,
             req.tools.iter().map(|t| &t.name).collect::<Vec<_>>()
         );
     }
+}
+
+/// 验收（决策 400）：设计阶段的默认开启不只是「广告里有」——运行器按同一份生效值注入，
+/// 父在 architect-design 派子代理，摘要照常经 tool_result 回灌（无需任何显式声明）。
+#[tokio::test]
+async fn parent_spawns_subagent_on_architect_design_by_default() {
+    let ctx = setup("true", Settings::default()).await;
+
+    // 子代理要读的文件：真实存在于 worktree（工具层全真执行，决策 148）
+    let worktree = ctx.store.home().worktree_path("t-archsub");
+    std::fs::create_dir_all(&worktree).unwrap();
+    std::fs::write(worktree.join("NOTES.md"), "关键结论：入口在 main()\n").unwrap();
+
+    let mut script = Script::new();
+    // architect-design.execute 队列最前插一步派子代理，design_scripts 再追加 write/submit
+    script
+        .for_node(Stage::ArchitectDesign, Node::Execute)
+        .push(testkit::Step::Tool {
+            name: "spawn_sub_agent".into(),
+            arguments: serde_json::json!({"task": "读 NOTES.md 并总结入口"}),
+        });
+    design_scripts(&mut script);
+    implementation_scripts(&mut script, "t-archsub");
+    // 子代理自己的脚本：先 read_file（真实读），再给摘要收口
+    script.push_subagent(testkit::Step::Tool {
+        name: "read_file".into(),
+        arguments: serde_json::json!({"path": "NOTES.md"}),
+    });
+    script.push_subagent(testkit::Step::Text("入口在 main()（源：NOTES.md）".into()));
+
+    ctx.agent.set_script(script);
+    testkit::seed_task(&ctx.store, "t-archsub", "p1")
+        .await
+        .unwrap();
+    admit(&ctx, "t-archsub").await;
+    ctx.executor.run("t-archsub").await.unwrap();
+
+    // 摘要进入了父 architect-design 的下一轮 messages（tool_result 通道，决策 172③）
+    let requests = ctx.agent.request_log();
+    let arch: Vec<_> = requests
+        .iter()
+        .filter(|r| r.stage == Stage::ArchitectDesign && r.node == Node::Execute)
+        .collect();
+    assert!(
+        arch.iter().any(|r| {
+            r.messages.iter().any(|m| {
+                m.role == agentpipeline_core::agent::Role::Tool
+                    && m.content
+                        .as_deref()
+                        .is_some_and(|c| c.contains("入口在 main()"))
+            })
+        }),
+        "父 architect-design 的后续轮 messages 应含子代理摘要"
+    );
 }
 
 /// 票 08（安全，回归）：子代理的工具集是**强制**的，不只是「广告里没写」。
@@ -7562,4 +7670,549 @@ async fn provider_cache_readings_land_on_the_run_row() {
         100 * CALLS_ONE_NODE,
         "每轮各 100 prompt token"
     );
+}
+
+// ────────── 节点内消息日志（`.scratch/node-message-resume` 票 01）──────────
+
+/// 回一个会**挂住的工具**：`run_command` 跑一条睡得够久的命令，于是「工具在跑、结果还没
+/// 回来」这个窗口有几十秒宽——足够读库取证。第二次调用永不返回（测试结束即 abort）。
+#[derive(Default)]
+struct HangOnACommandTool {
+    calls: AtomicUsize,
+}
+
+impl LlmClient for HangOnACommandTool {
+    fn complete(
+        &self,
+        _request: LlmRequest,
+    ) -> BoxFuture<'static, agentpipeline_core::Result<AgentResponse>> {
+        let n = self.calls.fetch_add(1, Ordering::SeqCst);
+        Box::pin(async move {
+            if n == 0 {
+                return Ok(AgentResponse {
+                    content: None,
+                    tool_calls: vec![agentpipeline_core::agent::client::ToolCall {
+                        id: "c-sleep".into(),
+                        name: "run_command".into(),
+                        arguments: r#"{"command":"sleep 20"}"#.into(),
+                    }],
+                    prompt_tokens: 7,
+                    completion_tokens: 3,
+                    ..Default::default()
+                });
+            }
+            std::future::pending::<()>().await;
+            unreachable!()
+        })
+    }
+}
+
+/// 票 01 的**承重顺序**：assistant 响应在**这一批工具的第一个执行之前**已经提交入库。
+///
+/// 缺了这条顺序，崩溃会连模型刚说的话一起丢——日志里只剩半截工具结果，没有任何东西说
+/// 它们是为了什么而跑的，那一轮只能整段作废（而这正是本功能要修的「节点内没有任何
+/// checkpoint」）。断言直接用「工具挂住的那一刻读库」取证：assistant 行在，tool 行不在。
+#[tokio::test]
+async fn the_assistant_row_is_committed_before_its_first_tool_runs() {
+    let ctx = setup("true", Settings::default()).await;
+    testkit::seed_task(&ctx.store, "t-log", "p1").await.unwrap();
+    admit(&ctx, "t-log").await;
+
+    let ex = Arc::new(Executor::new(
+        ctx.store.clone(),
+        Settings::default(),
+        Arc::new(ctx.sse.clone()),
+        Arc::new(HangOnACommandTool::default()),
+        Arc::new(ctx.killer.clone()),
+    ));
+    let jh = {
+        let ex = ex.clone();
+        tokio::spawn(async move { ex.run("t-log").await })
+    };
+
+    let run_id = wait_for_running_validate_input(&ctx, "t-log").await;
+    let deadline = Instant::now() + Duration::from_secs(30);
+    while ctx.store.count_node_messages(run_id).await.unwrap() == 0 {
+        assert!(
+            Instant::now() < deadline,
+            "assistant 行没在 30s 内落库——工具开跑之前就该落"
+        );
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    // 工具还挂在 `sleep` 里：这一刻库里**只该有**那条 assistant。
+    assert_eq!(
+        ctx.store.count_node_messages(run_id).await.unwrap(),
+        1,
+        "工具结果还没回来，它那一行不该存在"
+    );
+    let got = ctx
+        .store
+        .latest_own_transcript("t-log", Stage::ArchitectDesign, Node::ValidateInput)
+        .await
+        .unwrap()
+        .expect("日志里有行");
+    assert_eq!(got.run_id, run_id);
+    assert_eq!(got.messages.len(), 1);
+    let Role::Assistant = got.messages[0].role else {
+        panic!("第一条应当是 assistant 响应：{:?}", got.messages[0]);
+    };
+    assert_eq!(got.messages[0].tool_calls.len(), 1);
+    assert_eq!(got.messages[0].tool_calls[0].name, "run_command");
+    assert_eq!(
+        got.messages[0].tool_calls[0].arguments, r#"{"command":"sleep 20"}"#,
+        "工具调用的参数是**原始串**，不做二次序列化"
+    );
+
+    jh.abort();
+}
+
+/// 票 01：日志记的是**原始转录**——压缩改写内存里那一份（丢最旧的消息、换成摘要）之后，
+/// 日志行**仍含**被压掉的那些消息（它只追加，没有压缩事件可记）。
+#[tokio::test]
+async fn the_log_keeps_messages_that_compaction_rewrites_away() {
+    let ctx = setup("true", Settings::default()).await;
+    testkit::seed_task(&ctx.store, "t-raw", "p1").await.unwrap();
+    let cursor = ctx.store.load_live_cursors("t-raw").await.unwrap()[0].clone();
+    ctx.store
+        .set_cursor_stage(
+            &cursor.cursor_id,
+            Stage::ArchitectDesign,
+            Node::ValidateInput,
+        )
+        .await
+        .unwrap();
+    let run_id = ctx
+        .store
+        .insert_run(&agentpipeline_core::storage::observability::NewRun {
+            task_id: "t-raw".into(),
+            cursor_id: cursor.cursor_id.clone(),
+            stage: Stage::ArchitectDesign,
+            node: Node::ValidateInput,
+            attempt: 1,
+            agent_type: "main".into(),
+            parent_run_id: None,
+            prompt_template_hash: None,
+            process_group_id: None,
+        })
+        .await
+        .unwrap();
+
+    // 起跑时承接一份足够长的前缀（模拟「跑了很久的节点」）。
+    let prefix: Vec<agentpipeline_core::agent::client::Message> = (0..40)
+        .map(|i| {
+            if i % 2 == 0 {
+                agentpipeline_core::agent::client::Message::user(format!("第 {i} 问"))
+            } else {
+                agentpipeline_core::agent::client::Message::assistant(
+                    Some(format!("第 {i} 答")),
+                    Vec::new(),
+                )
+            }
+        })
+        .collect();
+    ctx.store
+        .append_node_messages(
+            "t-raw",
+            run_id,
+            Stage::ArchitectDesign,
+            Node::ValidateInput,
+            agentpipeline_core::storage::AGENT_TYPE_MAIN,
+            0,
+            &prefix,
+            None,
+        )
+        .await
+        .unwrap();
+
+    // 压缩改写的是内存里那一份（这里直接调压缩器，等价于 `check_budget` 触发的那一次）。
+    let settings = Settings::default();
+    let outcome = agentpipeline_core::agent::context::compact_messages_from(
+        &prefix,
+        settings.keep_recent_rounds,
+        0,
+    );
+    let in_memory = outcome.messages.clone();
+    assert!(
+        outcome.compacted_messages > 0,
+        "这份前缀应当真被压掉一些（否则本用例证明不了任何事）"
+    );
+    assert!(
+        in_memory.len() < prefix.len(),
+        "内存里那一份变短了：压缩真的改写了它"
+    );
+
+    // 日志一行不动：读出来还是原来那 40 条。
+    let got = ctx
+        .store
+        .latest_own_transcript("t-raw", Stage::ArchitectDesign, Node::ValidateInput)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(got.messages, prefix, "日志是原始转录：压缩一个字都不许碰它");
+}
+
+// ────── 重启连击止损（`.scratch/node-message-resume` 票 04）──────
+
+/// 同一个节点被进程重启连续打断到上限之后，**不再重放同一份转录**，转 pending 交回人工。
+///
+/// 不这样做的后果是死循环：节点每次跑到同一处就把服务搞崩（OOM / 不返回的调用），
+/// 重启恢复重放同一份转录 → 再崩。超时梯子是为同一类「续接救不回来」造的（决策 320），
+/// 但它够不着这一种——服务在判超时之前就已经死了。
+///
+/// 断言三件：① 不再起新的 run；② 游标挂 `retry_exhausted` 交回人工；③ 超时梯子的口径
+/// 一点没被搅动（重启对它照旧既不计数也不清零）。
+#[tokio::test]
+async fn three_restarts_stop_the_replay_loop_and_hand_back_to_a_human() {
+    use agentpipeline_core::storage::observability::{NewRun, RunOutcome, CANCEL_ORIGIN_RESTART};
+    const STAGE: Stage = Stage::ArchitectDesign;
+    const NODE: Node = Node::ValidateInput;
+
+    let ctx = setup("true", Settings::default()).await;
+    testkit::seed_task(&ctx.store, "t-stop", "p1")
+        .await
+        .unwrap();
+    let cursor = ctx.store.load_live_cursors("t-stop").await.unwrap()[0].clone();
+    ctx.store
+        .set_cursor_stage(&cursor.cursor_id, STAGE, NODE)
+        .await
+        .unwrap();
+
+    // 三条「进程退出时还在跑」的收尾——启动恢复写下的正是这一形态（票 02② 的语义）。
+    for attempt in 1..=3 {
+        let run_id = ctx
+            .store
+            .insert_run(&NewRun {
+                task_id: "t-stop".into(),
+                cursor_id: cursor.cursor_id.clone(),
+                stage: STAGE,
+                node: NODE,
+                attempt,
+                agent_type: "main".into(),
+                parent_run_id: None,
+                prompt_template_hash: None,
+                process_group_id: None,
+            })
+            .await
+            .unwrap();
+        ctx.store
+            .finish_run(
+                run_id,
+                &RunOutcome {
+                    status: Some(NodeStatus::Cancelled),
+                    error: Some("进程重启：这一轮在上一进程退出时还在跑，标终态".into()),
+                    cancel_origin: Some(CANCEL_ORIGIN_RESTART),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+    }
+    // 启动恢复给中断的游标置的续接原因（票 03）。
+    ctx.store
+        .mark_cursor_continuation(
+            &cursor.cursor_id,
+            agentpipeline_core::types::ResumeCause::ProcessRestart,
+        )
+        .await
+        .unwrap();
+
+    admit(&ctx, "t-stop").await;
+    ctx.executor.run("t-stop").await.unwrap();
+
+    let after = ctx.store.get_cursor(&cursor.cursor_id).await.unwrap();
+    assert_eq!(
+        after.status,
+        CursorStatus::Pending,
+        "止损的意思是「这一轮不要跑」：转 pending 交回人工"
+    );
+    assert_eq!(
+        after.pending_reason.as_ref().unwrap().kind,
+        PendingKind::RetryExhausted
+    );
+    assert!(
+        after
+            .pending_reason
+            .as_ref()
+            .unwrap()
+            .message
+            .contains("进程重启"),
+        "报文要说清是哪一类反复：{:?}",
+        after.pending_reason
+    );
+    assert_eq!(
+        ctx.store
+            .list_runs_at("t-stop", STAGE, NODE)
+            .await
+            .unwrap()
+            .len(),
+        3,
+        "止损之后不得再起 run（起了就是把同一份转录又重放一遍）"
+    );
+    assert_eq!(
+        ctx.store
+            .trailing_timeout_streak("t-stop", STAGE, NODE)
+            .await
+            .unwrap(),
+        0,
+        "超时梯子的口径不变：重启既不升档也不清零"
+    );
+}
+
+// ── 票 02：一次**普通恢复**不许凭空注入 turn（判据从「承接转录非空」换成按续接原因）──
+
+/// 记录每一次请求、回一段无可解析元数据的正文（节点会失败重试，但请求已经留下）。
+#[derive(Default)]
+struct RecordingProse {
+    requests: Arc<Mutex<Vec<LlmRequest>>>,
+}
+
+impl LlmClient for RecordingProse {
+    fn complete(
+        &self,
+        request: LlmRequest,
+    ) -> BoxFuture<'static, agentpipeline_core::Result<AgentResponse>> {
+        let requests = self.requests.clone();
+        Box::pin(async move {
+            requests.lock().unwrap().push(request);
+            Ok(AgentResponse {
+                content: Some("这一轮没交卷。".into()),
+                prompt_tokens: 3,
+                completion_tokens: 2,
+                ..Default::default()
+            })
+        })
+    }
+}
+
+/// 起一个节点、把日志与续接原因备好、跑一轮执行体，返回它发出去的全部请求。
+async fn requests_for_a_resumed_node(
+    task_id: &str,
+    stage: Stage,
+    node: Node,
+    seed: impl FnOnce(&Ctx, &str) -> BoxFuture<'static, ()>,
+    with_sleep: impl FnOnce(&Ctx, &str) -> BoxFuture<'static, ()>,
+) -> Vec<LlmRequest> {
+    let ctx = setup("true", Settings::default()).await;
+    testkit::seed_task(&ctx.store, task_id, "p1").await.unwrap();
+    let cursor = ctx.store.load_live_cursors(task_id).await.unwrap()[0].clone();
+    ctx.store
+        .set_cursor_stage(&cursor.cursor_id, stage, node)
+        .await
+        .unwrap();
+    // 一条 run + 一条消息行（续接素材），再置上「进程重启」。
+    let run_id = ctx
+        .store
+        .insert_run(&agentpipeline_core::storage::observability::NewRun {
+            task_id: task_id.into(),
+            cursor_id: cursor.cursor_id.clone(),
+            stage,
+            node,
+            attempt: 1,
+            agent_type: "main".into(),
+            parent_run_id: None,
+            prompt_template_hash: None,
+            process_group_id: None,
+        })
+        .await
+        .unwrap();
+    ctx.store
+        .append_node_messages(
+            task_id,
+            run_id,
+            stage,
+            node,
+            agentpipeline_core::storage::AGENT_TYPE_MAIN,
+            0,
+            &[
+                agentpipeline_core::agent::client::Message::user("上一轮的提问"),
+                agentpipeline_core::agent::client::Message::assistant(
+                    Some("上一轮的回答".into()),
+                    Vec::new(),
+                ),
+            ],
+            None,
+        )
+        .await
+        .unwrap();
+    seed(&ctx, task_id).await;
+    ctx.store
+        .mark_cursor_continuation(
+            &cursor.cursor_id,
+            agentpipeline_core::types::ResumeCause::ProcessRestart,
+        )
+        .await
+        .unwrap();
+    with_sleep(&ctx, task_id).await;
+
+    let requests = Arc::new(Mutex::new(Vec::new()));
+    let ex = Executor::new(
+        ctx.store.clone(),
+        Settings::default(),
+        Arc::new(ctx.sse.clone()),
+        Arc::new(RecordingProse {
+            requests: requests.clone(),
+        }),
+        Arc::new(ctx.killer.clone()),
+    );
+    admit(&ctx, task_id).await;
+    // 节点本身会失败（正文没有元数据），但请求已经留下——本用例只读请求。
+    let _ = ex.run(task_id).await;
+    let out = requests.lock().unwrap().clone();
+    assert!(!out.is_empty(), "执行体应当至少发过一次请求");
+    out
+}
+
+/// 决策 387 的 turn 注入**按续接原因判**（票 02）：一次普通的进程重启恢复**不许**在
+/// develop.execute 上凭空插一条「评审打回反馈」——人根本没打回过任何东西。
+///
+/// 判据原来挂在「承接的转录非空」上，那在会话表当源时够用（没有 recover 就没有非空转录）；
+/// 日志源接通之后**任何**一次恢复都会让转录非空，不换判据就会把没发生过的评审当作事实
+/// 喂给模型。
+#[tokio::test]
+async fn an_ordinary_restart_does_not_inject_the_review_rework_turn() {
+    use agentpipeline_core::types::{ReviewRequiredChange, ReviewResult};
+    let requests = requests_for_a_resumed_node(
+        "t-rework",
+        Stage::Develop,
+        Node::Execute,
+        |ctx, task_id| {
+            let task_id = task_id.to_string();
+            let store = ctx.store.clone();
+            Box::pin(async move {
+                store
+                    .upsert_stage_output(
+                        &task_id,
+                        Stage::Review,
+                        "review_report",
+                        "review-report.md",
+                        Some(
+                            &serde_json::to_value(ReviewResult {
+                                approved: false,
+                                review_report_path: Some("review-report.md".into()),
+                                required_changes: vec![ReviewRequiredChange {
+                                    path: "src/lib.rs".into(),
+                                    action: FileAction::Modify,
+                                    finding: Some("边界没处理".into()),
+                                }],
+                            })
+                            .unwrap(),
+                        ),
+                    )
+                    .await
+                    .unwrap();
+            })
+        },
+        |_ctx, _task_id| Box::pin(async {}),
+    )
+    .await;
+    let last = requests.last().unwrap();
+    assert!(
+        !last
+            .messages
+            .iter()
+            .any(|m| m.content.as_deref().is_some_and(
+                |c| c.starts_with(agentpipeline_core::types::REVIEW_REWORK_TURN_PREFIX)
+            )),
+        "普通重启不是评审打回：不许注入那条 turn（这正是「按原因判而非按非空判」要防的）"
+    );
+    assert!(
+        last.messages
+            .iter()
+            .any(|m| m.content.as_deref() == Some("上一轮的回答")),
+        "承接的转录本身照旧带上"
+    );
+}
+
+/// 决策 279 的补充输入 turn 注入**按续接原因判**（票 02）：一次普通的进程重启恢复不许把
+/// `user-input.md` 当作「人刚补充的输入」塞进转录——那是另一次信息不足打回留下的旧档。
+#[tokio::test]
+async fn an_ordinary_restart_does_not_inject_the_supplement_input_turn() {
+    let requests = requests_for_a_resumed_node(
+        "t-supp",
+        Stage::ArchitectDesign,
+        Node::ValidateInput,
+        |ctx, task_id| {
+            let task_id = task_id.to_string();
+            let home = ctx.store.home().clone();
+            Box::pin(async move {
+                home.ensure_task_dirs(&task_id).unwrap();
+                std::fs::write(
+                    home.task_file(&task_id, "user-input.md"),
+                    "# 用户补充输入\n\n请把登录也覆盖上。\n",
+                )
+                .unwrap();
+            })
+        },
+        |_ctx, _task_id| Box::pin(async {}),
+    )
+    .await;
+    let last = requests.last().unwrap();
+    assert!(
+        !last
+            .messages
+            .iter()
+            .any(|m| m.content.as_deref() == Some("请把登录也覆盖上。")),
+        "普通重启不是「信息不足被打回」：不许把旧档当作人刚补充的输入塞进转录"
+    );
+}
+
+/// 票 01：工具**失败也落行**——「这个调用跑过、以失败收场」与「它根本没跑」是两件事，
+/// 续接时同理（模型看到的应当是那条失败回执，而不是调用凭空消失）。
+#[tokio::test]
+async fn a_failed_tool_is_logged_too() {
+    let ctx = setup("true", Settings::default()).await;
+    testkit::seed_task(&ctx.store, "t-fail", "p1")
+        .await
+        .unwrap();
+    let cursor = ctx.store.load_live_cursors("t-fail").await.unwrap()[0].clone();
+    ctx.store
+        .set_cursor_stage(
+            &cursor.cursor_id,
+            Stage::ArchitectDesign,
+            Node::ValidateInput,
+        )
+        .await
+        .unwrap();
+
+    let mut script = Script::new();
+    script
+        .for_node(Stage::ArchitectDesign, Node::ValidateInput)
+        .failing_tool("no_such_tool", serde_json::json!({}))
+        .submit(&ValidateInputMetadata {
+            readiness: true,
+            blockers: vec![],
+        });
+    ctx.agent.set_script(script);
+    admit(&ctx, "t-fail").await;
+    // 节点本身跑成什么样不是本用例的事（失败回执会被回灌、模型的下一步是交卷）。
+    let _ = ctx.executor.run("t-fail").await;
+
+    let got = ctx
+        .store
+        .latest_own_transcript("t-fail", Stage::ArchitectDesign, Node::ValidateInput)
+        .await
+        .unwrap()
+        .expect("日志里有行");
+    let failure = got
+        .messages
+        .iter()
+        .find(|m| {
+            m.role == Role::Tool
+                && m.content
+                    .as_deref()
+                    .is_some_and(|c| c.starts_with("工具执行失败："))
+        })
+        .unwrap_or_else(|| panic!("工具失败也要落一行（内容是失败文本）：{:?}", got.messages));
+    let declared = got
+        .messages
+        .iter()
+        .flat_map(|m| m.tool_calls.iter())
+        .find(|c| c.name == "no_such_tool")
+        .expect("assistant 声明过这次调用");
+    assert_eq!(
+        failure.tool_call_id.as_deref(),
+        Some(declared.id.as_str()),
+        "回执要指回它回应的是哪一次调用"
+    );
+    assert_eq!(failure.name.as_deref(), Some("no_such_tool"));
 }

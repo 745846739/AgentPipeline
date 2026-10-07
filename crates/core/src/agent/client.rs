@@ -29,6 +29,18 @@ impl Role {
             Role::Tool => "tool",
         }
     }
+
+    /// DB 列 → 角色（节点消息日志的还原口，票 01）。认不出的取值 → `None`：
+    /// 调用方报错而不是兜底——角色是**执行语义**字段，猜错会让整份转录的配对判据失真。
+    pub fn parse(raw: &str) -> Option<Self> {
+        match raw {
+            "system" => Some(Role::System),
+            "user" => Some(Role::User),
+            "assistant" => Some(Role::Assistant),
+            "tool" => Some(Role::Tool),
+            _ => None,
+        }
+    }
 }
 
 /// 一次 LLM 调用里的工具调用请求。

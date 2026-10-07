@@ -698,6 +698,16 @@ pub async fn serve(options: ServeOptions) -> anyhow::Result<ServerHandle> {
             "已把中断的任务级 run 标成终态（进程退出时还在跑，不是节点超时）"
         );
     }
+    // 第四步的下半截（.scratch/node-message-resume 票 03）：给被收尾的 agent 游标置「进程
+    // 重启」续接原因。收尾与置位是同一件事的两半——只说「这一轮没了」不说「从哪接着跑」，
+    // 节点就会拿一份空转录从头重跑、把做过的工具副作用再做一遍。
+    if !readings.restart_continuation_cursors.is_empty() {
+        tracing::info!(
+            count = readings.restart_continuation_cursors.len(),
+            cursors = ?readings.restart_continuation_cursors,
+            "已给中断的 agent 游标置「进程重启」续接原因（下轮从节点内消息日志续接）"
+        );
+    }
 
     // 恢复流程第四步（决策 231）：把上一进程遗留的「在飞」模型请求收成终态。
     //

@@ -2999,3 +2999,84 @@ config.rs}`、`tests/e2e/tests/integration/stage_boundary.rs`、`docs/testing.md
 **验证**：L1 `model_request.rs::effective_declared_tools_defaults_subagent_for_design_stages`（四象限）+ 冻结用例 `assemble_freezes_a_byte_stable_head_and_a_fixed_tool_order` 扩写为「基线序 + 默认声明序 + schema 收尾」（顺带把「声明序跟在基线序后」钉进断言）；L3 `executor.rs::spawn_sub_agent_default_on_for_design_stages_only`（全流水线：设计阶段请求全带、develop / review / test 全不带）、`spawn_sub_agent_absent_when_design_stages_opted_out`（显式 `[]` 后全流水线零出现）、`parent_spawns_subagent_on_architect_design_by_default`（端到端：零声明即派生，摘要经 tool_result 回灌）。原 `spawn_sub_agent_absent_unless_declared`（票 08）的「未声明即无」断言与默认开启冲突，其语义由上面三条接住（testing.md §对账表已注）。
 
 **来源**：用户（2026-10-07「106 的 subagent 被调用过吗」→「为什么没有调用」→「给这类默认开启」，指 architect-design / develop-design 这类检索密集的设计阶段，test-design 按同性质并入）；决策 26 / 45（默认关闭的起点）、154（v1 punt 与只读重开）、172③（票 08 实现）、247（值班长清单）；落地 `crates/core/src/pipeline/{model_request.rs, model_invoke.rs}`、`crates/core/tests/integration/executor.rs`
+
+### 决策 401 · 节点内消息日志 `kanban_node_messages`：一行一条消息的**只追加**转录，与会话表分工不合并（迁移 0044）
+
+**起因**：服务在节点执行中途被杀之后，agent 节点拿一份**空转录**从头重跑——它做过的全部工具副作用会重做一遍。根因是库里的会话**根本没有那一段**：`kanban_node_conversations.messages_json` 是循环**退出之后**一次性写成的（成功路径与 `record_failed_attempt` 失败路径各一处），`kanban_node_runs.step` 也明说「LLM 节点没有步边界」（迁移 0018）。被 kill -9 那一刻，这个节点烧掉的全部对话一个字都不在库里。
+
+**裁决**：
+
+1. **另起一张表而不是给会话表加列**（迁移 `0044_node_messages.sql`）：`kanban_node_messages` 一行一条消息——`run_id`（外键指向 run，NO ACTION）、`task_id` / `stage` / `node` / `agent_type`、行内 `seq`、`role`、`content`、`tool_calls_json`（`ToolCallWire` 的 JSON 数组，`function.arguments` 是**原始串**，不做二次序列化）、`tool_call_id` / `tool_name`、`synthetic` 标记。两张表是**两件事**，不是一个东西的两种写法：会话表是循环退出后的**观测归档**（写入前经 `truncate_messages_json` 从最旧一端整条丢消息，切口还可能落在轮中间），本表是**节点内 checkpoint**（只追加、压缩一个字不碰）。索引按 `(run_id, seq)`（还原转录）与 `(task_id, stage, node, agent_type, run_id)`（续接查找）。
+2. **每个 run 自包含**：一次 attempt 起跑时把承接的转录前缀**批量**写进本 run 名下（`seq` 从 0 起），之后每产生一条消息追加一条。于是「某 run 的全部行」= 那次尝试的完整转录（含它起始时承接的上下文）。与决策 99「一条 run 至多一条会话行」同形；重试轮会把上一轮转录再写一遍，代价换的是一份不需要拼装就能读的日志。
+3. **写入顺序是承重的**：assistant 响应必须在**这一批工具的第一个执行之前**落库并提交（`NodeMessageLog::append` 是单条 INSERT、自动提交，不批、不延迟）。缺了这条顺序，崩溃会连模型刚说的话一起丢——日志里只剩半截工具结果，没有任何东西说它们是为了什么而跑的。每个工具结果返回后立即落行，**失败也落行**（内容是失败文本，与转录里那份逐字一致）。
+4. **落库失败挂关键路径**（不 best-effort）：日志是恢复的唯一素材，写不进去还继续跑等于给一个假的「能恢复」承诺——与 `touch_run_heartbeat` / `set_run_template_hash` 同姿态（观测类的 `mark_step` 才是 best-effort）。
+5. **生命周期与任务会话同一把尺子**：小时级维护用同一个 `conversation_retention_days` cutoff、同一个「**任务终态** + 超龄」判据（走维护专用连接，决策 321）。判据**不许换成「run 判终态」**：启动恢复第一件事就是把被 kill 的 run 标终态，那正是最需要日志的时刻。删项目时本表随其余子表同批清（挂在 run 上、外键 NO ACTION，漏了就是那句 787），位于删 run 之前。
+6. **观测面零变化**：任务详情那三个会话路由、前端类型、会话表的截断行为一个字不改——本表不进观测面，它是恢复素材。
+
+**验证**：L1 `context.rs::completing_a_half_round_makes_the_transcript_legal` 等三条（补齐语义的纯函数面）；L2 `run_ledger.rs::take_continuation_patches_a_half_round_from_the_log`、`the_log_is_immune_to_conversation_truncation`；L2 `executor.rs::the_assistant_row_is_committed_before_its_first_tool_runs`（工具挂住的那一刻读库：assistant 行在、tool 行不在）、`the_log_keeps_messages_that_compaction_rewrites_away`（压缩改写内存那一份，日志一行不动）；L2 `project_delete.rs`（级联表清单加一行）、`scheduler_tick.rs::maintenance_refreshes_totals_and_purges_expired_conversations`（保留期两表同尺）。
+
+**来源**：用户（2026-10-07「任务运行过程中，服务重启，任务从哪里续上？」→「改成消息级重试需要做哪些？」），grilling 收敛成 spec `.scratch/node-message-resume/spec.md`，票 01；落地 `crates/core/src/storage/{migrations/0044_node_messages.sql, node_messages.rs, mod.rs, catalog.rs}`、`crates/core/src/scheduler/mod.rs`、`crates/core/src/pipeline/{model_invoke.rs, run_ledger.rs}`、`crates/core/src/agent/{client.rs, context.rs}`
+
+### 决策 402 · 续接源从会话表换成节点内消息日志：半轮补合成回执 + 新增 `process_restart` 续接原因（显式修订决策 205 裁决⑤的前半）
+
+**起因**：超时梯子（决策 320）与人按 resume 的续接素材此前读 `kanban_node_conversations.messages_json`。那份转录有两个缺陷：它是**循环退出之后**才写的（崩溃时一个字都没有），且写入前经 `truncate_messages_json` **从最旧一端整条丢消息**——切口落在轮中间时留下的孤儿 tool 消息会被上游净化**静默吃掉工具输出**（`context.rs` 的 `sanitize_tool_sequence` 记的就是这类事故）。
+
+**裁决**：
+
+1. **源换成日志，查找键保持**：`take_continuation` 改读 `latest_own_transcript`（`(task_id, stage, node, agent_type='main')` 取 run_id 最大的那一组行）。键与 `latest_own_conversation` **同源**——**不能按游标找**：`goto` 是在**同一条游标行**上改 `(stage, node)`，按 `cursor_id` 会把上一个节点的对话喂给这个节点。
+2. **半轮补合成回执**：日志停在「assistant 已落、这一批工具的结果没配齐」时，由 `agent::context::complete_incomplete_round` 补齐——工具是**顺序执行**的，故只有第一个未配齐的调用真歧义：它写「进程重启，这次调用被中断，可能已部分生效」，其余写「进程重启，这次调用没有执行」。不补的话这半轮重放给下一轮就是一次必然的 400（assistant 声明的调用没有回执）。补齐的回执**拼在转录末尾**、落新 run 的日志时带 `synthetic` 标记——假读数要能被人一眼认出来（决策 226③ 的同一姿态）。只认**尾部那半轮**：带 `tool_calls` 的最后一条 assistant 之后若出现过非 tool 消息，说明那一轮在别处已收尾，交给 `sanitize_tool_sequence` 处置，这里一个字不动。
+3. **新增续接原因 `process_restart`**（`ResumeCause::ProcessRestart`，`as_str = "process_restart"`）：它与 `timeout_blank_restart` 一样**不由 pending 原因分类出来**（游标从未 pending 过），由启动恢复经 `mark_cursor_continuation`（同一列的第二把钥匙）直接置位；判定表里答案为 **true**（形态是全卷转录）。**原因随素材一起交出**：`Continuation` 新增 `cause` 字段，**读不到日志时也交原因**（只是转录为空）——编排侧要拿它区分「这是一次恢复」与「人按了补充输入」。
+4. **两条 turn 注入的判据从「承接的转录非空」换成按续接原因**：补充输入（决策 279，`cause == InfoInsufficient`）与 review 打回反馈（决策 387，`cause ∈ {Review, HumanReviewRejected}`）。旧判据在会话表当源时够用（没有恢复就没有非空转录）；日志源接通之后**任何**一次恢复都会让转录非空，不换判据就会在一次普通崩溃上凭空往 develop.execute 插一条「评审打回反馈」——把没发生过的评审当作事实喂给模型。
+5. **会话表退回纯观测归档**：`latest_own_conversation` 留在原地服务时间线（「这个节点的上一轮说了什么」），不再做续接素材。
+
+**与既有决策的关系**：**这是对决策 205 裁决⑤「重启不另立『重启』这个原因」的显式修订**——重启仍然**不是人的介入**（那一点不变，`trailing_timeout_streak` 照旧跳过它、既不计数也不清零，决策 368 票 02①），但它**是**一条续接边界。裁决②（自动重试不续接）不受影响：`agent_retry_max` 的续接仍在编排侧直接保留转录（决策 278）。超时梯子（决策 320）的形态与档位一个字不改，只是读到的转录从「可能被截断的」换成「完整的」。
+
+**验证**：L1 `context.rs::completing_a_half_round_makes_the_transcript_legal`（0 / k / 全部结果三种形状，补完必过消毒层）、`completing_ignores_a_round_that_already_moved_on`、`completing_a_transcript_without_pending_calls_is_a_noop`；L1 `types.rs::resume_cause_table_is_the_spec`（26 行逐条，`ProcessRestart → true`）；L2 `run_ledger.rs::take_continuation_patches_a_half_round_from_the_log`（补一条、`synthetic_tail == 1`、参数是原始串）、`the_log_is_immune_to_conversation_truncation`（构造截断过的会话行 + 完整日志，断言拿到完整的那份）；L2 `executor.rs::an_ordinary_restart_does_not_inject_the_review_rework_turn` / `..._the_supplement_input_turn`（普通恢复不许凭空注入）。既有超时梯子用例（`executor.rs::timeout_retry_ladder_...`、`scheduler_tick.rs::the_ladder_still_climbs_...`）**一个字没改**仍是绿的。
+
+**来源**：同决策 401 的 spec / 票 02；落地 `crates/core/src/pipeline/run_ledger.rs`、`crates/core/src/agent/context.rs`、`crates/core/src/types.rs`、`crates/core/src/pipeline/model_invoke.rs`
+
+### 决策 403 · 启动恢复多一步「给中断的 agent 游标置进程重启续接原因」——**推翻**钉住相反结论的那条测试
+
+**起因**：恢复序列（决策 127 / 212 / 367）此前只做「把遗留的 run 收终态」：它说清了「这一轮没了」，没说「从哪接着跑」。于是被强杀的那个 agent 节点在重启后拿一份空转录从头重跑，做过的工具副作用再做一遍——正是决策 401 / 402 要根除的那件事。
+
+**裁决**：
+
+1. **四步的下半截**：`run_recovery_sequence` 在把任务级遗留 run 标终态之后，对每条被收尾的 run，若它的 `(stage, node)` 是 agent 节点，就给 `run.cursor_id` 置上 `ResumeCause::ProcessRestart`——经**既有的第二把钥匙** `mark_cursor_continuation`（超时梯子用的同一条路，决策 320 的先例），不新开置位口。**只对 agent 节点置位**（`AgentNodeKind::of` 判）：纯代码节点没有转录可续，置上去标记会永远无人取走——与超时梯子的同一道闸。读数新增 `RecoveryReadings.restart_continuation_cursors`，`serve.rs` 照四步的其余读数一样记一行日志。
+2. **推翻一条钉住的测试，并写清理由**：`crates/core/tests/integration/cursor_lifecycle.rs` 的 `restarting_does_not_record_a_resume_cause`（断言文案「重启不是人的介入，不该留下续接原因」）当初是**故意**钉住「重启不置位、不另立『重启』这个原因」的（决策 205 裁决⑤，`.scratch/resume-semantics/issues/01-cause-driven.md` 的 ④）。**改之前先取证**：确认它今天钉的确实是「不置位」这件事（README 级的理由就是那句断言文案本身；它在 `requeue_running_tasks` 之后断言原因列为空），不是别的副作用。本票把它换成 `restarting_records_a_continuation_cause_for_agent_cursors`，断言**相反**的事实（置原因、且该原因在判定表里判为续接），并补一条 `restarting_leaves_code_node_cursors_unmarked` 钉住「纯代码节点不置位」那道闸。**推翻的是那个结论，不是「写实它」这个做法**——原用例的注释就写着「写实它，是为了让那次重构在这里现形」，现在要实的是相反的事实，理由同样写在断言里。
+3. **重启不重置工作区**：人按重试才做 `git reset --hard` + `git clean`（决策 125），重启恢复**不是**重试——那些未提交的改动是上一轮的真实进度，抹掉它们等于把「恢复」做成「重来」。
+4. **不加新的可测试性接缝**：五条接缝的条数被决策钉死（决策 143 / 194）。杀点靠真二进制 + 脚本化模型 + 让某一步挂住（决策 152 的进程边界用例模式）。
+
+**验证**：L2 `cursor_lifecycle.rs::restarting_records_a_continuation_cause_for_agent_cursors` / `restarting_leaves_code_node_cursors_unmarked`；L4 真二进制 `crates/app/tests/integration/restart_recovery.rs::kill_9_mid_tool_call_resumes_from_the_log_without_replaying_completed_tools`（kill -9 落在工具调用中途 → 同 home 重启 → 新 run 带 `continued_from_run_id`、日志前缀含被杀前已完成的消息 + 一条合成回执、任务目录里的 append 型命令**只留下一次痕迹**）。
+
+**来源**：同决策 401 的 spec / 票 03；落地 `crates/core/src/pipeline/foreman_actions.rs`、`crates/core/src/storage/observability.rs`、`crates/app/src/serve.rs`、`crates/core/tests/integration/cursor_lifecycle.rs`、`crates/app/tests/integration/restart_recovery.rs`
+
+### 决策 404 · 重启连击止损：**独立**计数，到第 3 次转 pending 交回人工（与决策 320 梯子两条独立的梯子）
+
+**起因**：如果某个节点每次跑到同一处就把服务搞崩（OOM、不返回的调用），重启恢复会无限重放同一份转录——既不升档、也不交回人工。超时梯子（决策 320）是为同一类「续接救不回来」造的，但它够不着这一种：**服务在判超时之前就已经死了**。
+
+**裁决**：
+
+1. **计数独立成一条** `Store::trailing_restart_streak`：数该节点**从最新一条 run 往回连续是 `status='cancelled' AND cancel_origin='restart'`** 的条数，撞到任何别的收场就停。判据按列不按报文字样（决策 259）；白名单与 `trailing_timeout_streak` 同源（只数**节点自身**的 run）。**不并入、也不搅动** `trailing_timeout_streak`——一次重启既不是「这个节点超时了」的证据、也不是人介入，它在超时梯子里照旧「既不计数也不清零」（决策 368 票 02① 的口径一字未改）。
+2. **分档是纯函数** `retry::restart_retry(streak)`：1–2 次 → `AutoContinue`（带日志里的转录接着跑），**第 3 次起 → `Pending`**（转 pending 交回人工）。`RESTART_AUTO_CONTINUES_MAX = 2` 写死不配，与 `TIMEOUT_AUTO_CONTINUES_MAX` 取同一个数不是巧合：两个计数回答同一类问题，用户可见的承诺一致（连续两轮自动续接、第三轮交回人工）。
+3. **为什么到上限取「停」而不取「换一种重放」（票 04 的二选一）**：空白档（带现场简报）能救的是「转录本身是崩溃的诱因」（例如上下文大到装配期就 OOM）；救不了「这个节点跑什么都会把服务搞死」（`run_command` 起的进程把机器打爆）。而重启连击的代价不只是 token——**服务本身在反复死**，每一轮都是一次全站不可用。降成空白档并没有把循环的圈数封顶（下一轮仍然会跑同一个节点），只有交回人工才真的停住。故止损取「停」不取「换一种重放」。
+4. **落地位置**：`agent_node` 在取完续接素材之后、`begin` 之前判——「止损」的意思是「这一轮不要跑」，那一轮就不该有 run 行。挂起走 `NodeOutput::Pending`（执行体的既有路径，`pend_reason` 统一落库 + 发事件），原因 kind 取 `retry_exhausted`（它的 `allowed_actions` 表给的正是「重试 / 跳过 / 取消」这一组人工处置）。**只在这次的续接原因是 `process_restart` 时判**：人按 resume 之后的新一轮不该被上一轮的重启连击拦下（那也是「一次人工介入之后计数重新起算」在编排侧的兑现）。
+
+**验证**：L1 `retry.rs::the_restart_ladder_stops_at_three_without_a_blank_rung`；L2 `scheduler_tick.rs::the_restart_streak_is_counted_apart_from_the_timeout_ladder`（三条重启收尾 → streak 3、超时梯子为 0；一次成功收场 → streak 归零）；L2 `executor.rs::three_restarts_stop_the_replay_loop_and_hand_back_to_a_human`（三条重启收尾 + `process_restart` 置位 → 不再起 run、游标挂 `retry_exhausted`、超时梯子仍为 0）。既有 `scheduler_tick.rs::a_restart_closes_leftover_task_runs_without_impersonating_a_timeout` 一字未改仍是绿的。
+
+**来源**：同决策 401 的 spec / 票 04；落地 `crates/core/src/pipeline/{retry.rs, model_invoke.rs}`、`crates/core/src/storage/observability.rs`
+
+### 决策 405 · 措辞面收口：决策 80 修订为「游标 = 节点级、消息日志 = 节点内」，G8/G9 加注，决策 125 的分水岭
+
+**起因**：本批改动把「恢复粒度」从节点级推到**节点内**，而多份文档与一条全局目标还写着旧口径（`docs/implementation.md` §11.6「**恢复粒度：节点级**」、`docs/overview.md` G8「进程中断后恢复到中断节点入口（checkpoint 粒度为节点级）」）。不修的话，后续读的人会以为「节点内没有 checkpoint」还成立。
+
+**裁决**：
+
+1. **决策 80 显式修订**（按仓规在条目内标编号、不改历史条目）：**游标 = 节点级 checkpoint**（已完成的节点不重跑，这一半不变），**节点内消息日志 = 节点内 checkpoint**（中断的节点不再整节点重跑，改的是这一半）。
+2. **§11.6 改写成消息级**，并把两条分界写清：**已完成的节点不重跑**（不变）；**中断的节点从日志里最后一条已记录的消息接着跑**（改的是这一条）——进程被杀时不再「从该节点入口重新执行」，只丢最后一条还没落库的模型响应。
+3. **G8 / G9 加注**：消息级恢复之后，「节点内操作幂等」**不再是恢复的正确性依赖**（恢复是重放式：已完成的工具副作用不再重做），但仍**保留为节点内重跑的安全网**——它今天撑的是「整节点重跑不出错」这个前提，而那个前提在自动重试（决策 278 的续接）、人为重试（决策 125 的重置）、以及本功能**未覆盖**的路径（子代理、伪阶段、项目分析 run）上仍然成立。
+4. **决策 125 补一句语义分界**：**重启恢复不重置工作区，人按重试才重置**（`git reset --hard` + `git clean`）。两条路的分水岭是「未提交的那点东西算不算进度」：对重启恢复，它是上一轮的真实进度（抹掉等于把恢复做成重来）；对人为重试，它是被判定不合用的残留。
+5. **数据模型与实现文档补新表、新续接原因与新的恢复流程**：`docs/data-model.md` §4 补 `kanban_node_messages` 的语义（与 §12.4.3 会话表的分工）、§5 的「任何节点」一行补 `process_restart`；`docs/implementation.md` §11.5 表清单补一行、§11.6 改写见 ②。
+
+**明确不做**：删改任何**已应用过**的迁移文件（决策 13 / 193：sqlx 记校验和，改了就报版本不符）；改历史决策条目（一律追加 + 条目内标注修订）。
+
+**来源**：同决策 401 的 spec / 票 05；落地 `docs/{decisions.md, implementation.md, overview.md, data-model.md}`

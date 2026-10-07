@@ -218,6 +218,11 @@ pub struct RecoveryReadings {
     pub abandoned: Vec<i64>,
     /// 标成终态的**任务级**遗留 run（票 02②）。
     pub abandoned_task_runs: Vec<i64>,
+    /// 被置上「进程重启」续接原因的 agent 游标（`.scratch/node-message-resume` 票 03）。
+    ///
+    /// 与上面那项的关系：**每个被收尾的 agent run 对应一条游标**，纯代码节点的 run 不在
+    /// 其中（它们没有转录可续，置位会让标记永远无人取走）。
+    pub restart_continuation_cursors: Vec<String>,
 }
 
 /// **恢复序列**（决策 127 / 212 / 367）：把上一轮遗留的占用与在飞的活儿收干净。
@@ -234,6 +239,16 @@ pub struct RecoveryReadings {
 /// **第 4 步必须在第 2 步之后**：归队只翻任务行，判终态要认「哪些 run 属于这些任务」——
 /// 顺序反过来也能跑，但读数会自相矛盾（任务已归队、它的 run 还在飞）。
 ///
+/// **第 4 步还有下半截**（`.scratch/node-message-resume` 票 03）：给被收尾的 **agent
+/// 节点**游标置上「进程重启」续接原因——经既有的第二把钥匙
+/// （[`crate::storage::Store::mark_cursor_continuation`]，超时梯子用的同一条路，决策 320
+/// 的先例），不新开置位口。于是重启后这个节点从**节点内消息日志**里最后一条已记录的消息
+/// 接着跑，而不是拿一份空转录从头重跑、把已完成的工具副作用再做一遍。
+///
+/// 只对 agent 节点置位（`AgentNodeKind::of` 判）：纯代码节点没有转录可续，置上去标记会
+/// 永远无人取走——与超时梯子的同一道闸。**这是对决策 205 裁决⑤ 的显式修订**：重启仍然
+/// **不是人的介入**（超时梯子照旧跳过它、既不计数也不清零），但它**是**一条续接边界。
+///
 /// **这里只有四步，`orphan_inflight_model_requests` 不在其中**（决策 255④）：那一步是
 /// **启动特有**的——它自己的 doc 就是「启动时把**上一个实例留下的**在飞请求收成终态」，
 /// 判据 `finished_at IS NULL` 没有进程限定。而**运行中**被丢弃的请求另有承担者：
@@ -243,12 +258,27 @@ pub async fn run_recovery_sequence(store: &Store) -> Result<RecoveryReadings> {
     let cleared = store.clear_executor_owners().await?;
     let requeued = store.requeue_running_tasks().await?;
     let abandoned = store.abandon_stale_project_runs().await?;
-    let abandoned_task_runs = store.abandon_stale_task_runs().await?;
+    let abandoned_runs = store.abandon_stale_task_runs().await?;
+    // 第 4 步的下半截：中断的 agent 游标记「进程重启」——下一轮 attempt 据此从日志续接。
+    let mut restart_continuation_cursors = Vec::new();
+    for run in &abandoned_runs {
+        if crate::pipeline::model_invoke::AgentNodeKind::of(run.stage, run.node).is_none() {
+            continue;
+        }
+        let Some(cursor_id) = run.cursor_id.as_deref() else {
+            continue;
+        };
+        store
+            .mark_cursor_continuation(cursor_id, crate::types::ResumeCause::ProcessRestart)
+            .await?;
+        restart_continuation_cursors.push(cursor_id.to_string());
+    }
     Ok(RecoveryReadings {
         cleared,
         requeued,
         abandoned,
-        abandoned_task_runs,
+        abandoned_task_runs: abandoned_runs.iter().map(|r| r.id).collect(),
+        restart_continuation_cursors,
     })
 }
 

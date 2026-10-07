@@ -362,6 +362,19 @@ pub enum ResumeCause {
     /// 分类出来（`classify` 不返回它）：超时路径的游标从未 pending 过，由
     /// `scheduler::handle_timeout` 的降级档用 `mark_cursor_continuation` 直接置位。
     TimeoutBlankRestart,
+    /// 进程重启：上一轮 run 在进程退出（或被强杀）时还在跑，启动恢复把它标了终态。
+    /// 与 [`ResumeCause::TimeoutBlankRestart`] 一样**不由 pending 原因分类出来**
+    /// （`classify` 不返回它）：中断的游标从未 pending 过，由启动恢复经
+    /// `mark_cursor_continuation`（同一个列的第二把钥匙）直接置位。
+    ///
+    /// **这是对决策 205 裁决⑤ 的显式修订**（`.scratch/node-message-resume` 票 03）：
+    /// 原裁决说「重启根本不成其为 resume，不另立「重启」这个原因」。本方案把两件事拆开——
+    /// 重启**仍然不是人的介入**（那一点不变，`trailing_timeout_streak` 照旧跳过它、
+    /// 既不计数也不清零），但它**是**一条续接边界：节点从日志里最后一条已记录的消息接着跑，
+    /// 而不是拿一份空转录从头重跑、把已完成的工具副作用再做一遍。
+    ///
+    /// 去向的形态是**全卷转录**（进程被杀时日志里就是真实进度，没有「不该再喂一遍」的理由）。
+    ProcessRestart,
     DependencyFailed,
     DependencyCancelled,
     /// `user_decision` 且没有 `context.kind`（通用那一行：跳过 / 取消）。
@@ -400,13 +413,14 @@ pub enum ResumeCause {
 /// 新增一个变体时**先改这里**，再回答 `resume_continues` 那个穷尽 `match`——
 /// 编译器会在后者报「未覆盖的模式」，这是本表的牙齿（决策 205：兜底 false 是安全网，
 /// 不是让人忘记回答的借口）。
-pub const ALL_RESUME_CAUSES: [ResumeCause; 25] = [
+pub const ALL_RESUME_CAUSES: [ResumeCause; 26] = [
     ResumeCause::InfoInsufficient,
     ResumeCause::ConflictWait,
     ResumeCause::RetryExhausted,
     ResumeCause::ContextOverflow,
     ResumeCause::Timeout,
     ResumeCause::TimeoutBlankRestart,
+    ResumeCause::ProcessRestart,
     ResumeCause::DependencyFailed,
     ResumeCause::DependencyCancelled,
     ResumeCause::UserDecision,
@@ -438,6 +452,7 @@ impl ResumeCause {
             ResumeCause::ContextOverflow => "context_overflow",
             ResumeCause::Timeout => "timeout",
             ResumeCause::TimeoutBlankRestart => "timeout_blank_restart",
+            ResumeCause::ProcessRestart => "process_restart",
             ResumeCause::DependencyFailed => "dependency_failed",
             ResumeCause::DependencyCancelled => "dependency_cancelled",
             ResumeCause::UserDecision => "user_decision",
@@ -531,6 +546,11 @@ impl ResumeCause {
 /// 它不是「人按了键」。它进表是因为下游要拿这个原因判断**形态**（简报而非转录）——
 /// 本表回答的是「这是不是一条续接边界」，答案仍是 true。
 ///
+/// **第二个例外（`.scratch/node-message-resume` 票 02）**：`process_restart` 同样由
+/// **自动**路径置位（启动恢复经同一把第二钥匙），也**不是**「人按了键」。它进表是
+/// 决策 205 裁决⑤ 的显式修订：重启不是人的介入，但**是**一条续接边界（理由见
+/// [`ResumeCause::ProcessRestart`] 的文档）。
+///
 /// **穷尽 `match`**：新增一个原因时不写进这个 match 就编译不过。这比「兜底 false 然后忘掉」
 /// 强——兜底仍保留（`Unknown` 那一档），但它只服务于「库里的历史值」，不服务于新代码。
 pub fn resume_continues(cause: ResumeCause) -> bool {
@@ -548,6 +568,7 @@ pub fn resume_continues(cause: ResumeCause) -> bool {
         | ResumeCause::RetryExhausted
         | ResumeCause::Timeout
         | ResumeCause::TimeoutBlankRestart
+        | ResumeCause::ProcessRestart
         | ResumeCause::ConflictWait
         | ResumeCause::DependencyFailed
         | ResumeCause::DuplicateRisk
@@ -1807,7 +1828,7 @@ mod tests {
     #[test]
     fn resume_cause_table_is_the_spec() {
         use ResumeCause::*;
-        let cases: [(ResumeCause, bool); 25] = [
+        let cases: [(ResumeCause, bool); 26] = [
             // ── true ──
             (InfoInsufficient, true),
             (RetryExhausted, true),
@@ -1828,6 +1849,10 @@ mod tests {
             (HumanReviewRejected, true),
             // 人松开自己按下的暂停：接着上一段干（决策 276）
             (UserPaused, true),
+            // 进程重启（`.scratch/node-message-resume` 票 02）：**显式修订决策 205 裁决⑤**——
+            // 重启仍然不是人的介入（`trailing_timeout_streak` 照旧跳过它），但**是**一条
+            // 续接边界：节点从日志里最后一条已记录的消息接着跑。
+            (ProcessRestart, true),
             // ── false ──
             (MergeApproved, false),
             (HumanReviewApproved, false),

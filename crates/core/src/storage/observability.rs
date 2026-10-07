@@ -445,7 +445,11 @@ impl Store {
     ///
     /// **时长照实记**（决策 226③ 的同一姿态）：从 `started_at` 到此刻，0 会把「跑了 40 分钟
     /// 被重启打断」读成「刚起来就没了」。
-    pub async fn abandon_stale_task_runs(&self) -> Result<Vec<i64>> {
+    ///
+    /// **返回 run 行本身而不是 id 列表**（`.scratch/node-message-resume` 票 03）：启动恢复
+    /// 还要按 `stage` / `node` / `cursor_id` 给中断的 agent 游标置续接原因——那是 pipeline
+    /// 层的判断（「这个节点是不是 agent 节点」由 `AgentNodeKind` 回答），不该由存储层代劳。
+    pub async fn abandon_stale_task_runs(&self) -> Result<Vec<NodeRun>> {
         let now = self.now();
         let stale: Vec<NodeRun> = self
             .active_runs()
@@ -453,7 +457,7 @@ impl Store {
             .into_iter()
             .filter(|r| r.task_id.is_some())
             .collect();
-        let mut ids = Vec::with_capacity(stale.len());
+        let mut abandoned = Vec::with_capacity(stale.len());
         for run in &stale {
             self.finish_run(
                 run.id,
@@ -466,9 +470,9 @@ impl Store {
                 },
             )
             .await?;
-            ids.push(run.id);
+            abandoned.push(run.clone());
         }
-        Ok(ids)
+        Ok(abandoned)
     }
 
     pub async fn list_runs_at(
@@ -558,6 +562,50 @@ impl Store {
                 )
             {
                 // 超时自己的副产品 / 重启收尾：既不计数也不清零
+                continue;
+            }
+            break;
+        }
+        Ok(streak)
+    }
+
+    /// 该节点**从最新一条 run 往回连续是被进程重启收尾**的条数（`.scratch/node-message-resume`
+    /// 票 04）：重启续接的止损计数口。
+    ///
+    /// 与 [`Self::trailing_timeout_streak`] 是**两条独立的梯子**（判据不同、计数不同）：
+    /// - 白名单同源（只数**节点自身**的 run）——子代理 / 伪阶段的 run 复用父节点的 stage/node，
+    ///   混进来会把一次重启数成三次；
+    /// - 从最新往回走、撞到第一条**不是**「被重启收尾」的 run 就停：任何一次别的收场（成功 /
+    ///   失败 / 超时 / 人按停）都把连续计数清零。**人按重试 / 继续之后的新一轮因此重新起算**
+    ///   ——那正是票 04 要的「一次人工介入之后计数重新起算」；
+    /// - 「被重启收尾」的唯一判据是 `status = 'cancelled' AND cancel_origin = 'restart'`，
+    ///   即启动恢复写下的形态（[`CANCEL_ORIGIN_RESTART`]）——**不按 error 报文字样判**
+    ///   （决策 259）；
+    /// - **不并入 `trailing_timeout_streak`**：一次重启既不是「这个节点超时了」的证据、也不是
+    ///   人介入，它在超时梯子里照旧「既不计数也不清零」（决策 368 票 02① 的口径一字未改）。
+    pub async fn trailing_restart_streak(
+        &self,
+        task_id: &str,
+        stage: Stage,
+        node: Node,
+    ) -> Result<u32> {
+        let rows: Vec<(String, Option<String>)> = sqlx::query_as(&format!(
+            "SELECT status, cancel_origin FROM kanban_node_runs
+             WHERE task_id = ? AND stage = ? AND node = ? AND agent_type IN ({})
+             ORDER BY id DESC LIMIT 64",
+            metrics::NODE_OWNING_AGENT_TYPES_SQL
+        ))
+        .bind(task_id)
+        .bind(stage.as_str())
+        .bind(node.as_str())
+        .fetch_all(self.pool())
+        .await?;
+        let mut streak: u32 = 0;
+        for (status, cancel_origin) in rows {
+            if status == NodeStatus::Cancelled.as_str()
+                && cancel_origin.as_deref() == Some(CANCEL_ORIGIN_RESTART)
+            {
+                streak += 1;
                 continue;
             }
             break;
@@ -1187,6 +1235,12 @@ impl Store {
     ///
     /// **只看已归档与否不影响取数**：续接要的是「上一 attempt 的 messages」，无论它是否
     /// 被 `archive_conversations` 标记过（归档是重试路径对**旧尝试**的标记，不是删除）。
+    ///
+    /// **续接已不再读这里**（`.scratch/node-message-resume` 票 02）：读的是
+    /// [`Store::latest_own_transcript`]（节点内消息日志）——会话表是循环退出之后才写的、
+    /// 且写入前会被截断（从最旧一端整条丢，切口可能落在轮中间），做不了恢复素材。
+    /// 本方法留在原地服务**观测**（时间线上「这个节点的上一轮说了什么」），查找键与日志那份
+    /// 同源，故两处读出来的是同一个节点。
     pub async fn latest_own_conversation(
         &self,
         task_id: &str,

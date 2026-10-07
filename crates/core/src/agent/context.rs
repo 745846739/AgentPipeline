@@ -559,6 +559,59 @@ pub fn sanitize_tool_sequence(messages: &[Message]) -> (Vec<Message>, SanitizeSt
     (out, stats)
 }
 
+/// 半轮被进程打断时，第一条没有回执的调用的合成回执文案（票 02）。
+///
+/// 工具是**顺序执行**的（`model_invoke` 的轮循环按 `response.tool_calls` 的顺序逐个
+/// `execute`），故一条 assistant 声明 N 个调用、崩溃发生在第 k 个上时：前 k−1 个有真回执，
+/// 第 k 个**可能已经部分生效**（它正是当时在跑的那一个），第 k+1..N 个一定没跑。
+pub const RESTART_INTERRUPTED_NOTE: &str = "进程重启，这次调用被中断，可能已部分生效";
+
+/// 同一轮里**排在后面**（确定没轮到）的调用收到的合成回执文案（票 02）。
+pub const RESTART_NOT_RUN_NOTE: &str = "进程重启，这次调用没有执行";
+
+/// 把**半轮**的转录补成一份合法的转录（票 02）：进程在工具调用中途被杀时，日志停在
+/// 「assistant 已落、这一批工具的结果没配齐」。补齐后返回**补了几条**（都拼在末尾）。
+///
+/// **为什么需要它**：OpenAI 兼容上游对消息序列有硬性结构要求——assistant 声明的每个
+/// `tool_call` 都要收到回执（[`sanitize_tool_sequence`] 的文档记着违反的后果：恒 400）。
+/// 直接把这半轮重放给下一轮 attempt 就是一次必然的 400。补一条**如实说明**的回执则两全：
+/// 转录合法，且模型知道那次调用处在什么状态（与决策 226③「照实记」同一姿态——
+/// 回执落库时带 `synthetic` 标记，读的人认得出它不是模型说的）。
+///
+/// **只认尾部那半轮**：带 `tool_calls` 的最后一条 assistant 之后若出现过非 tool 消息，
+/// 说明这一轮在别处**已经收过尾**（那是另一条生产路径留下的毒转录，交给
+/// [`sanitize_tool_sequence`] 处置），这里不动——凑上去补一条会凭空发明一个从未发生的调用。
+pub fn complete_incomplete_round(messages: &mut Vec<Message>) -> usize {
+    let Some(owner) = messages
+        .iter()
+        .rposition(|m| m.role == Role::Assistant && !m.tool_calls.is_empty())
+    else {
+        return 0;
+    };
+    if messages[owner + 1..].iter().any(|m| m.role != Role::Tool) {
+        return 0;
+    }
+    let answered: std::collections::HashSet<String> = messages[owner + 1..]
+        .iter()
+        .filter_map(|m| m.tool_call_id.clone())
+        .collect();
+    let calls = messages[owner].tool_calls.clone();
+    let mut filled = 0usize;
+    for call in &calls {
+        if answered.contains(call.id.as_str()) {
+            continue;
+        }
+        let note = if filled == 0 {
+            RESTART_INTERRUPTED_NOTE
+        } else {
+            RESTART_NOT_RUN_NOTE
+        };
+        messages.push(Message::tool_result(call, note));
+        filled += 1;
+    }
+    filled
+}
+
 /// 单条消息的规则化摘要（压缩规则表逐行实现）。
 fn summarize_message(
     msg: &Message,
@@ -1186,5 +1239,77 @@ mod tests {
         assert!(!should_compact_with_floor(400_000, Some(inflated), 500_000));
         let tight = estimate_context_capacity(1_000, "", "", &s);
         assert!(should_compact_with_floor(900, Some(tight), 300_000));
+    }
+
+    // ─── 半轮补齐（`.scratch/node-message-resume` 票 02）───
+
+    fn call(id: &str) -> ToolCall {
+        ToolCall {
+            id: id.into(),
+            name: "run_command".into(),
+            arguments: r#"{"command":"echo hi"}"#.into(),
+        }
+    }
+
+    /// 三种截断形状（0 / k / 全部结果）都能补齐，且**补齐之后转录合法**
+    /// （带工具调用的 assistant 后面每个调用都有回执）——不合法就是一次必然的 400。
+    #[test]
+    fn completing_a_half_round_makes_the_transcript_legal() {
+        let calls = vec![call("c1"), call("c2"), call("c3")];
+        for done in 0..=3usize {
+            let mut messages = vec![
+                Message::user("干活"),
+                Message::assistant(None, calls.clone()),
+            ];
+            for c in calls.iter().take(done) {
+                messages.push(Message::tool_result(c, format!("{} 的真回执", c.id)));
+            }
+            let filled = complete_incomplete_round(&mut messages);
+            assert_eq!(filled, 3 - done, "缺几张补几张（done={done}）");
+            let (clean, stats) = sanitize_tool_sequence(&messages);
+            assert_eq!(stats, SanitizeStats::default(), "补完就不该再有残缺");
+            assert_eq!(clean, messages, "补完的转录原样通过消毒");
+            let receipts: Vec<_> = messages.iter().filter(|m| m.role == Role::Tool).collect();
+            assert_eq!(receipts.len(), 3, "三个调用三条回执");
+            if done < 3 {
+                assert_eq!(
+                    receipts[done].content.as_deref(),
+                    Some(RESTART_INTERRUPTED_NOTE),
+                    "第一个未配齐的调用说「可能已部分生效」——它正是当时在跑的那一个"
+                );
+                for r in receipts.iter().skip(done + 1) {
+                    assert_eq!(r.content.as_deref(), Some(RESTART_NOT_RUN_NOTE));
+                }
+            }
+        }
+    }
+
+    /// 已经收过尾的一轮**不碰**：那条路是别的生产路径留下毒转录，交给消毒层处置——
+    /// 凑上去补一条回执等于凭空发明一个从未发生的调用。
+    #[test]
+    fn completing_ignores_a_round_that_already_moved_on() {
+        let mut messages = vec![
+            Message::assistant(None, vec![call("c1")]),
+            Message::tool_result(&call("c1"), "真回执"),
+            Message::user("接着说"),
+            Message::assistant(Some("好".into()), vec![call("c2")]),
+            Message::tool_result(&call("c2"), "真回执"),
+        ];
+        let before = messages.clone();
+        assert_eq!(complete_incomplete_round(&mut messages), 0);
+        assert_eq!(messages, before, "没有半轮可补：一个字都不许动");
+    }
+
+    /// 空转录 / 纯正文转录（没有工具调用）都不是半轮。
+    #[test]
+    fn completing_a_transcript_without_pending_calls_is_a_noop() {
+        let mut empty: Vec<Message> = Vec::new();
+        assert_eq!(complete_incomplete_round(&mut empty), 0);
+        let mut prose = vec![
+            Message::user("问"),
+            Message::assistant(Some("答".into()), Vec::new()),
+        ];
+        assert_eq!(complete_incomplete_round(&mut prose), 0);
+        assert_eq!(prose.len(), 2);
     }
 }

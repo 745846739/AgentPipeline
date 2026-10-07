@@ -57,9 +57,20 @@ pub(crate) enum ContinuationMode {
 /// **简报形态不带链接**（`from_run_id = None`，票 04）：空白重跑在台账语义上仍是
 /// 「新的一段对话」，它只是拿到了上一轮现场的**文本投影**，不是续接那段对话。
 pub(crate) struct Continuation {
+    /// 这一次续接的原因（票 02）。**用途有两个**：编排侧据此判「这是不是一次进程重启」
+    /// （票 04 的止损）与两条 turn 注入的判据（补充输入 / 评审打回反馈）——不再按「承接的
+    /// 转录非空」猜：日志源接通之后**任何**一次恢复都会让承接转录非空，那个判据会把普通
+    /// 崩溃误读成「人按了补充输入 / 打回了评审」。**形态不由它推**，仍看 [`Self::mode`]。
+    pub cause: crate::types::ResumeCause,
     pub mode: ContinuationMode,
     pub messages: Vec<Message>,
     pub from_run_id: Option<i64>,
+    /// 承接转录**末尾**有几条是**合成回执**（票 02）：日志断在半轮时补齐的那几条。
+    ///
+    /// 调用方要把这个**尾部计数**换算成下标再交给写日志那侧（见 `model_invoke` 的
+    /// `synthetic_from`）：它在写前缀之前还会往末尾追加补充输入 / 打回反馈的 turn，
+    /// 那些是**真消息**——按尾部计数会把标记打错人。
+    pub synthetic_tail: usize,
 }
 
 /// 自 `started` 起经过的毫秒（墙钟、经 [`Clock`] 接缝——决策 143；负值按 0 记）。
@@ -251,23 +262,34 @@ impl<'a> RunLedger<'a> {
 
     /// 取本节点的续接素材（红线④；决策 180 / 205，票 13 / 01）。
     ///
-    /// **两道条件**（决策 205 把原来的三道砍掉一道：那个「谁来决定开不开」的配置层整层退场）：
+    /// **闸只有一道**（决策 205 把原来的三道砍掉一道：那个「谁来决定开不开」的配置层整层退场）：
+    /// 游标**刚从 pending 被 resume**（或由自动路径置了原因），且**原因表说该续接**
+    /// （[`crate::types::resume_continues`]）。取数是一次性的（取走即清零）。
+    /// **注意（决策 278）**：`agent_retry_max` 的自动重试如今也续接，但那是在编排侧直接
+    /// 保留上一轮转录（显式修订决策 205 裁决②），**不经本闸**——本闸仍然只管 resume 边界。
     ///
-    /// ① 游标**刚从 pending 被 resume**，且**原因表说该续接**（[`crate::types::resume_continues`]）。
-    ///    取数是一次性的（取走即清零），且只有人能按出这个边界——`validate_attempts` 的
-    ///    原地重试与未耗尽的超时都不会置位。**注意（决策 278）**：`agent_retry_max` 的
-    ///    自动重试如今也续接，但那是在编排侧直接保留上一轮转录（显式修订决策 205 裁决②），
-    ///    **不经本闸**——本闸仍然只管 resume 边界。
-    /// ② 真有一条上一 attempt 的主 agent 会话行可读。
+    /// **转录那份源是日志不是会话表**（`.scratch/node-message-resume` 票 02）：会话表
+    /// 那条路是循环退出之后才写的（崩溃时一个字都没有），且写入前经 `truncate_messages_json`
+    /// 从最旧一端整条丢消息——切口落在轮中间时留下的孤儿 tool 消息会被上游净化**静默吃掉
+    /// 工具输出**。日志只追加、压缩不碰它，于是续接拿到的是完整转录。查找键与
+    /// [`Store::latest_own_conversation`] 同源（`(task, stage, node, agent_type='main')`
+    /// 取 id 最大的 run）——**不能按游标找**：`goto` 在同一条游标行上改 `(stage, node)`。
     ///
-    /// 第 ② 条在「该续接却读不到」时**静默干净起跑**而不报错：这是票 13 必要条件一
-    /// （`context_overflow` 退出路径补写会话行）修掉的那条路——修复之后它不该再发生，
-    /// 但真发生时让节点继续跑仍优于让整条流水线停在一个诊断性错误上。
+    /// **「读不到转录」不是第二道闸，只是转录为空**：这种时候**照样交出一份带原因的素材**
+    /// （`messages` 为空）——这是票 13 必要条件一（`context_overflow` 退出路径补写会话行）
+    /// 修掉的那条路的延续：升级前建的库、或这一轮一条消息都没写完就被杀，都走这一支
+    /// （干净起跑，与加日志之前一致），而**原因不能跟着一起丢**——编排侧靠它区分「恢复」与
+    /// 「人按了补充输入」，重启连击的止损（票 04）也靠它。只有「没有原因」与「原因说别续接」
+    /// 两种情况才给 `None`。
     ///
     /// **形态由原因定**（票 04）：`timeout_blank_restart` 返回
     /// [`ContinuationMode::Brief`]——不给转录、不落链，只把「这是空白重跑」这个事实
-    /// 交给编排侧去渲染简报段；其余原因照旧给全卷转录。简报**不要求会话行可读**：
+    /// 交给编排侧去渲染简报段；其余原因照旧给全卷转录。简报**不要求日志可读**：
     /// 它本就是为了「上一轮死得连转录都不该再喂一遍」而存在的。
+    ///
+    /// **半轮补齐**（票 02）：日志停在「assistant 已落、这一批工具的结果没配齐」时，
+    /// 由 [`crate::agent::context::complete_incomplete_round`] 补上合成回执——不补的话
+    /// 这半轮重放给下一轮必然是一次 400（assistant 声明的调用没有回执）。
     pub(crate) async fn take_continuation(
         &self,
         cursor: &NodeCursor,
@@ -284,27 +306,39 @@ impl<'a> RunLedger<'a> {
         }
         if cause == crate::types::ResumeCause::TimeoutBlankRestart {
             return Ok(Some(Continuation {
+                cause,
                 mode: ContinuationMode::Brief,
                 messages: Vec::new(),
                 from_run_id: None,
+                synthetic_tail: 0,
             }));
         }
-        let Some(conv) = self
+        let Some(transcript) = self
             .store
-            .latest_own_conversation(&cursor.task_id, cursor.stage, cursor.node)
+            .latest_own_transcript(&cursor.task_id, cursor.stage, cursor.node)
             .await?
         else {
-            return Ok(None);
+            // 读不到日志（升级前建的库 / 这一轮一条消息都没写完就被杀）→ 干净起跑。
+            // **仍然交出原因**：编排侧要拿它区分「这是一次恢复」与「人按了补充输入」——
+            // 返回 `None` 会把这件事一起丢掉，而重启连击的止损（票 04）正靠它。
+            return Ok(Some(Continuation {
+                cause,
+                mode: ContinuationMode::Transcript,
+                messages: Vec::new(),
+                from_run_id: None,
+                synthetic_tail: 0,
+            }));
         };
-        let messages: Vec<Message> =
-            serde_json::from_value(conv.messages_json.clone()).unwrap_or_default();
-        if messages.is_empty() {
-            return Ok(None);
-        }
+        let mut messages = transcript.messages;
+        let synthetic_tail = crate::agent::context::complete_incomplete_round(&mut messages);
+        // 空转录不落链（台账里那是一条指向「没有可续内容」的假谱系），与读不到日志同一处置。
+        let from_run_id = (!messages.is_empty()).then_some(transcript.run_id);
         Ok(Some(Continuation {
+            cause,
             mode: ContinuationMode::Transcript,
             messages,
-            from_run_id: Some(conv.run_id),
+            from_run_id,
+            synthetic_tail,
         }))
     }
 }
@@ -537,9 +571,11 @@ mod tests {
         let (fresh, _) = begin("main").await;
         let (retried, _) = begin("main").await;
         let continuation = Continuation {
+            cause: ResumeCause::InfoInsufficient,
             mode: ContinuationMode::Transcript,
             messages: vec![Message::user("上一轮")],
             from_run_id: Some(history),
+            synthetic_tail: 0,
         };
 
         ledger
@@ -577,7 +613,7 @@ mod tests {
         // 红线④：读-清恰好一次；第二次进来拿不到素材（干净起跑），不会重复续接。
         let (_tmp, store, task, cursor, clock) = base().await;
         let ledger = RunLedger::new(&store, &clock);
-        let (run_id, attempt) = ledger
+        let (run_id, _attempt) = ledger
             .begin(&task, &cursor.cursor_id, cursor.stage, cursor.node, "main")
             .await
             .unwrap();
@@ -585,20 +621,16 @@ mod tests {
             Message::user("上一轮的提问"),
             Message::assistant(Some("上一轮的回答".into()), vec![]),
         ];
+        // 源是**节点内消息日志**（票 02），不再是会话表：一条 run 的消息行合起来就是转录。
         store
-            .insert_conversation(
+            .append_node_messages(
                 &task.id,
                 run_id,
                 cursor.stage,
                 cursor.node,
-                attempt,
-                "main",
-                None,
-                &serde_json::to_value(&messages).unwrap(),
-                None,
-                None,
+                crate::storage::AGENT_TYPE_MAIN,
                 0,
-                0,
+                &messages,
                 None,
             )
             .await
@@ -663,5 +695,230 @@ mod tests {
             .unwrap();
         let row = store.get_run(run_id).await.unwrap().unwrap();
         assert_eq!(row.continued_from_run_id, None);
+    }
+
+    /// 票 02：续接的源是**节点内消息日志**，且日志断在半轮时补齐合成回执——
+    /// 交出去的必须是一份**合法**转录（每个声明的调用都有回执）。
+    #[tokio::test]
+    async fn take_continuation_patches_a_half_round_from_the_log() {
+        let (_tmp, store, task, cursor, clock) = base().await;
+        let ledger = RunLedger::new(&store, &clock);
+        let (run_id, _) = ledger
+            .begin(&task, &cursor.cursor_id, cursor.stage, cursor.node, "main")
+            .await
+            .unwrap();
+        let calls = vec![
+            crate::agent::client::ToolCall {
+                id: "c1".into(),
+                name: "read_file".into(),
+                arguments: r#"{"path":"a"}"#.into(),
+            },
+            crate::agent::client::ToolCall {
+                id: "c2".into(),
+                name: "list_dir".into(),
+                arguments: r#"{"path":"."}"#.into(),
+            },
+        ];
+        // 半轮：assistant 已落、第一条工具结果已落、第二条没了——进程就是在这里被杀的。
+        let half = vec![
+            Message::user("干活"),
+            Message::assistant(None, calls.clone()),
+            Message::tool_result(&calls[0], "第一条的真回执"),
+        ];
+        store
+            .append_node_messages(
+                &task.id,
+                run_id,
+                cursor.stage,
+                cursor.node,
+                crate::storage::AGENT_TYPE_MAIN,
+                0,
+                &half,
+                None,
+            )
+            .await
+            .unwrap();
+
+        store
+            .set_cursor_pending(
+                &cursor.cursor_id,
+                &PendingReason::new(
+                    PendingKind::InfoInsufficient,
+                    cursor.stage,
+                    cursor.node,
+                    "信息不足",
+                ),
+            )
+            .await
+            .unwrap();
+        store.clear_cursor_pending(&cursor.cursor_id).await.unwrap();
+
+        let got = ledger.take_continuation(&cursor).await.unwrap().unwrap();
+        assert_eq!(got.mode, ContinuationMode::Transcript);
+        assert_eq!(
+            got.cause,
+            ResumeCause::InfoInsufficient,
+            "原因随素材一起交出"
+        );
+        assert_eq!(got.from_run_id, Some(run_id));
+        assert_eq!(got.messages.len(), half.len() + 1, "缺的那一条补上了");
+        assert_eq!(got.synthetic_tail, 1, "补的那一条算合成回执");
+        assert_eq!(
+            got.messages.last().unwrap().content.as_deref(),
+            Some(crate::agent::context::RESTART_INTERRUPTED_NOTE),
+            "未配齐的第一个调用说「可能已部分生效」"
+        );
+        // 合法：直接过消毒层，零改动、零残缺。
+        let (clean, stats) = crate::agent::context::sanitize_tool_sequence(&got.messages);
+        assert_eq!(stats, crate::agent::context::SanitizeStats::default());
+        assert_eq!(clean, got.messages);
+        // 工具调用的参数是**原始串**：还原之后逐字段一致。
+        match &got.messages[1].tool_calls[..] {
+            [first, second] => {
+                assert_eq!(first.arguments, r#"{"path":"a"}"#);
+                assert_eq!(second.arguments, r#"{"path":"."}"#);
+            }
+            other => panic!("工具调用条数不对：{other:?}"),
+        }
+        // 已完成的第一次调用**不在**补齐之列（它有真回执）。
+        assert_eq!(
+            got.messages[2].content.as_deref(),
+            Some("第一条的真回执"),
+            "已完成的那条保持原样"
+        );
+    }
+
+    /// 票 02：梯子的转录**不再可能被截断**。构造「一条被截断过的会话行 + 一份完整日志」，
+    /// 断言续接拿到的是**完整的**那一份——今天的截断从最旧一端整条丢消息、切口还可能落在
+    /// 轮中间，留下的孤儿 tool 消息会被上游净化静默吃掉工具输出。
+    #[tokio::test]
+    async fn the_log_is_immune_to_conversation_truncation() {
+        let (_tmp, store, task, cursor, clock) = base().await;
+        let ledger = RunLedger::new(&store, &clock);
+        let (run_id, attempt) = ledger
+            .begin(&task, &cursor.cursor_id, cursor.stage, cursor.node, "main")
+            .await
+            .unwrap();
+        let full = vec![
+            Message::user("第一问"),
+            Message::assistant(Some("第一答".into()), Vec::new()),
+            Message::user("第二问"),
+            Message::assistant(Some("第二答".into()), Vec::new()),
+        ];
+        store
+            .append_node_messages(
+                &task.id,
+                run_id,
+                cursor.stage,
+                cursor.node,
+                crate::storage::AGENT_TYPE_MAIN,
+                0,
+                &full,
+                None,
+            )
+            .await
+            .unwrap();
+        // 观测面那份只剩最后一轮（截断的真实形态：从最旧一端整条丢）。
+        store
+            .insert_conversation(
+                &task.id,
+                run_id,
+                cursor.stage,
+                cursor.node,
+                attempt,
+                "main",
+                None,
+                &serde_json::to_value(&full[2..]).unwrap(),
+                None,
+                None,
+                0,
+                0,
+                None,
+            )
+            .await
+            .unwrap();
+
+        store
+            .set_cursor_pending(
+                &cursor.cursor_id,
+                &PendingReason::new(
+                    PendingKind::InfoInsufficient,
+                    cursor.stage,
+                    cursor.node,
+                    "信息不足",
+                ),
+            )
+            .await
+            .unwrap();
+        store.clear_cursor_pending(&cursor.cursor_id).await.unwrap();
+
+        let got = ledger.take_continuation(&cursor).await.unwrap().unwrap();
+        assert_eq!(
+            got.messages, full,
+            "续接读日志不读会话表：被截断的那一份不再有机会成为续接素材"
+        );
+        assert_eq!(
+            got.synthetic_tail, 0,
+            "一整轮齐了（没有半截的工具调用）→ 一条合成回执都不补"
+        );
+    }
+
+    /// 票 02：查找键是 `(task, stage, node)` **不是游标**——`goto` 是在**同一条游标行**上改
+    /// `(stage, node)`，按游标找会把**上一个节点**的对话喂给这个节点。
+    #[tokio::test]
+    async fn the_lookup_key_does_not_follow_a_goto_across_nodes() {
+        let (_tmp, store, task, mut cursor, clock) = base().await;
+        let ledger = RunLedger::new(&store, &clock);
+        // 上游节点（validate_input）先跑过一轮，留下它自己的日志。
+        store
+            .set_cursor_stage(
+                &cursor.cursor_id,
+                Stage::ArchitectDesign,
+                Node::ValidateInput,
+            )
+            .await
+            .unwrap();
+        cursor = store.get_cursor(&cursor.cursor_id).await.unwrap();
+        let (upstream_run, _) = ledger
+            .begin(&task, &cursor.cursor_id, cursor.stage, cursor.node, "main")
+            .await
+            .unwrap();
+        let upstream = vec![
+            Message::user("上游节点的提问"),
+            Message::assistant(Some("上游节点的回答".into()), Vec::new()),
+        ];
+        store
+            .append_node_messages(
+                &task.id,
+                upstream_run,
+                Stage::ArchitectDesign,
+                Node::ValidateInput,
+                crate::storage::AGENT_TYPE_MAIN,
+                0,
+                &upstream,
+                None,
+            )
+            .await
+            .unwrap();
+
+        // `goto`：同一条游标行改到下游节点（execute），它自己还没有任何日志。
+        store
+            .set_cursor_stage(&cursor.cursor_id, Stage::ArchitectDesign, Node::Execute)
+            .await
+            .unwrap();
+        let cursor = store.get_cursor(&cursor.cursor_id).await.unwrap();
+        store
+            .mark_cursor_continuation(&cursor.cursor_id, ResumeCause::GateRecheck)
+            .await
+            .unwrap();
+
+        let got = ledger.take_continuation(&cursor).await.unwrap().unwrap();
+        assert_eq!(got.cause, ResumeCause::GateRecheck, "原因照旧交出");
+        assert!(
+            got.messages.is_empty(),
+            "下游节点没有自己的日志 → 干净起跑；**不能**把上游节点的对话喂给它：{:?}",
+            got.messages
+        );
+        assert_eq!(got.from_run_id, None, "没有可续内容就不落谱系链接");
     }
 }

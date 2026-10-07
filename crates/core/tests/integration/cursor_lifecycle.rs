@@ -4,6 +4,7 @@
 
 use std::sync::Arc;
 
+use agentpipeline_core::storage::observability::NewRun;
 use agentpipeline_core::storage::Store;
 use agentpipeline_core::types::{
     CursorStatus, Node, NodeCursor, PendingContext, PendingKind, PendingReason, ResumeCause,
@@ -1050,34 +1051,125 @@ async fn resume_cause_is_recorded_once_and_only_for_real_pending_exits() {
     );
 }
 
-/// 服务重启**根本不成其为 resume**：`requeue_running_tasks` 只翻任务状态，游标一行不动，
-/// 于是原因列也不会被置上（决策 205 裁决⑤）。
+/// 服务重启**是**一条续接边界（`.scratch/node-message-resume` 票 03，**显式修订决策 205
+/// 裁决⑤**）：中断的 agent 游标要被置上「进程重启」续接原因，且这个原因在判定表里判为续接。
 ///
-/// 这条以前靠「flag 没被置」隐式成立——而隐式成立的东西会在某次重构里悄悄变成「没有被置」
-/// 的反面（例如把清 pending 顺手加进重启路径）。写实它，是为了让那次重构在这里现形。
+/// **这条用例此前叫 `restarting_does_not_record_a_resume_cause`，钉的是相反的事**——
+/// 「重启不置位、不另立『重启』这个原因」。原裁决的理由是「重启不是人的介入」，推出结论
+/// 「所以不该留续接原因」；本票把这两件事拆开：重启**仍然不是人的介入**（这一点不变，
+/// `trailing_timeout_streak` 照旧跳过它、既不计数也不清零——决策 368 票 02①），
+/// 但它**是**一条续接边界。不置位的话，被强杀的那个 agent 节点会拿一份空转录从头重跑，
+/// 把已经做过的工具副作用**再做一遍**——那是整件事要修掉的东西。
+///
+/// 推翻的是那个结论，不是「写实它」这个做法（原用例注释：「写实它，是为了让那次重构在这里
+/// 现形」）——现在要实的是相反的事实，理由同样写在断言里。
 #[tokio::test]
-async fn restarting_does_not_record_a_resume_cause() {
+async fn restarting_records_a_continuation_cause_for_agent_cursors() {
     let (_home, store, task) = with_task().await;
     let cursor = store.load_live_cursors(&task.id).await.unwrap()[0].clone();
-    // 跑到一半被打断：任务 running，游标 active（没有 pending）
+    // 跑到一半被打断：任务 running，游标 active（没有 pending），且**停在 agent 节点上**
     store
         .set_task_status(&task.id, TaskStatus::Running)
         .await
         .unwrap();
+    store
+        .set_cursor_stage(&cursor.cursor_id, Stage::ArchitectDesign, Node::Execute)
+        .await
+        .unwrap();
+    store
+        .insert_run(&NewRun {
+            task_id: task.id.clone(),
+            cursor_id: cursor.cursor_id.clone(),
+            stage: Stage::ArchitectDesign,
+            node: Node::Execute,
+            attempt: 1,
+            agent_type: "main".into(),
+            parent_run_id: None,
+            prompt_template_hash: None,
+            process_group_id: None,
+        })
+        .await
+        .unwrap();
 
-    let requeued = store.requeue_running_tasks().await.unwrap();
+    let readings = agentpipeline_core::pipeline::foreman_actions::run_recovery_sequence(&store)
+        .await
+        .unwrap();
     assert_eq!(
-        requeued,
+        readings.requeued,
         vec![task.id.clone()],
         "重启恢复应把 running 翻回 queued"
+    );
+    assert_eq!(
+        readings.restart_continuation_cursors,
+        vec![cursor.cursor_id.clone()],
+        "中断的 agent 游标要被置位（票 03 的第五步）"
     );
     assert_eq!(
         store
             .take_cursor_resume_cause(&cursor.cursor_id)
             .await
             .unwrap(),
-        None,
-        "重启不是人的介入，不该留下续接原因"
+        Some(ResumeCause::ProcessRestart),
+        "重启是一条续接边界：原因要真被置上"
+    );
+    assert!(
+        agentpipeline_core::types::resume_continues(ResumeCause::ProcessRestart),
+        "且该原因在判定表里判为续接——不然置了位也没人会用它去读日志"
+    );
+    // 取走即清零（登记语义不变）：下一轮 attempt 读得到，再下一轮读不到。
+    assert_eq!(
+        store
+            .take_cursor_resume_cause(&cursor.cursor_id)
+            .await
+            .unwrap(),
+        None
+    );
+}
+
+/// 纯代码节点**不**置位（与超时梯子的同一道闸）：它没有转录可续，置上去标记会永远
+/// 无人取走、悬在列上——之后谁读到那一列都会以为「这个节点欠着一份续接」。
+#[tokio::test]
+async fn restarting_leaves_code_node_cursors_unmarked() {
+    let (_home, store, task) = with_task().await;
+    let cursor = store.load_live_cursors(&task.id).await.unwrap()[0].clone();
+    assert_eq!(cursor.stage, Stage::Init, "初始游标停在 init");
+    store
+        .set_task_status(&task.id, TaskStatus::Running)
+        .await
+        .unwrap();
+    store
+        .insert_run(&NewRun {
+            task_id: task.id.clone(),
+            cursor_id: cursor.cursor_id.clone(),
+            stage: Stage::Init,
+            node: Node::Execute,
+            attempt: 1,
+            agent_type: "system".into(),
+            parent_run_id: None,
+            prompt_template_hash: None,
+            process_group_id: None,
+        })
+        .await
+        .unwrap();
+
+    let readings = agentpipeline_core::pipeline::foreman_actions::run_recovery_sequence(&store)
+        .await
+        .unwrap();
+    assert_eq!(
+        readings.abandoned_task_runs.len(),
+        1,
+        "纯代码节点的遗留 run 照旧收终态"
+    );
+    assert!(
+        readings.restart_continuation_cursors.is_empty(),
+        "但不置续接原因（没有转录可续）"
+    );
+    assert_eq!(
+        store
+            .take_cursor_resume_cause(&cursor.cursor_id)
+            .await
+            .unwrap(),
+        None
     );
 }
 

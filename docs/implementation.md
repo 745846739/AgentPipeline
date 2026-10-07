@@ -720,6 +720,8 @@ CREATE TABLE IF NOT EXISTS stage_configs (
 
 > **其余表的位置：** `kanban_transitions`（§12.4.2）、`kanban_node_conversations`（§12.4.3）、`kanban_node_commands`（§12.4.4）分列在可观测性各节，此处不重复。`kanban_project_analyses`（决策 130⑦）：`analysis_id TEXT PRIMARY KEY`、`project_id TEXT NOT NULL REFERENCES kanban_projects(id)`、`status TEXT NOT NULL`、`result_json`、`error`、`created_at`、`updated_at`——配套 `POST /projects/analyze` 异步 202 + `GET /projects/{id}/analysis` 轮询。全部表由 sqlx migrations 统一管理（决策 13）。
 
+> **节点内消息日志（决策 401）：** `kanban_node_messages`（迁移 **`0044_node_messages.sql`**）——agent 节点主循环的**逐条**转录，一行一条消息：`run_id`（外键 → `kanban_node_runs`，NO ACTION）、`task_id` / `stage` / `node` / `agent_type`、行内 `seq`、`role`、`content`、`tool_calls_json`（`ToolCallWire` 的 JSON 数组，`function.arguments` 是**原始串**）、`tool_call_id` / `tool_name`、`synthetic`（合成回执标记）、`created_at`。与 `kanban_node_conversations`（§12.4.3，循环退出后一次性写出的**观测归档**）是两件事：本表**只追加**、压缩不碰它，是**节点内 checkpoint**（进程中断后从这里续接，§11.6）。索引按 `(run_id, seq)`（还原一个 run 的转录）与 `(task_id, stage, node, agent_type, run_id)`（续接查找——**不能按游标找**：`goto` 在同一条游标行上改 `(stage, node)`）。保留期与任务会话**同一把尺子**（同一个 `conversation_retention_days`、同一个「任务终态 + 超龄」判据；判据不许换成「run 判终态」，理由见决策 401⑤）。
+
 > **命令改写开关的表（决策 297）：**`kanban_rtk`（迁移 **`0035_rtk_switch.sql`**：单行表 + `CHECK (id = 1)`，与 0008 / 0009 / 0010 那几张单行表同族）——`enabled` + 可选的手填 `path`；**行缺席 = 缺省关**（一个会改写命令串的优化器要人显式打开）。同批的迁移 **`0034_run_command_original_command.sql`** 给 `kanban_node_commands` 加一列 `original_command`（改写前的原串，**只有真的发生过改写才写**；语义见 §12.4.4）。
 > **技能来源相关的表（决策 194）：** 仓名单住 `kanban_market_repos`（迁移 **`0010_market_repos.sql`**：机器级**单行表 + `CHECK (id = 1)`**，与迁移 0008 / 0009 那两张单行表同族）——「显式清空」与「没保存过」必须分得开；装下来的技能来源住 `skill_sources`（迁移 **`0011_skill_sources.sql`**：`name TEXT PRIMARY KEY` + `owner` / `repo` / `commit_sha` / `subpath` / `installed_at`，**一行一技能**，卸载时一并删）。
 > **迁移 `0009_market_sources.sql` 的文件保留、读写它的代码退场**——`sqlx::migrate!` 对每个**已应用过**的迁移文件记校验和，**改动或删除已应用的迁移都会让既有库在启动时报版本不符**（与决策 193 记的是同一条性质）；要连表一起清掉得是一条**新迁移**（`DROP TABLE`）加一次显式的数据处置决定，不是删文件。
@@ -735,11 +737,30 @@ executor checkpoint 机制天然支持：
     ——kill -9 后乐观锁持有者不会释放，不清理则该任务永远无法被重新 claim
   → 从 SQLite 加载全部活跃游标（kanban_node_cursors 各行的 stage + node，决策 80）
   → executor 逐游标恢复到中断节点（并行任务恢复到两条游标各自的位置）
+  → 被收尾的 **agent** 游标记上「进程重启」续接原因（决策 403，第四步的下半截）
+    ——下一轮 attempt 据此从节点内消息日志续接；**不重置工作区**（决策 405 / 125）
   → scheduler.tick() 检查是否有 pending 需要处理
   → 一切继续
 ```
 
-**恢复粒度：节点级。** 如果 execute 节点中途崩溃，恢复后从该节点入口重新执行（幂等保证）。不会丢失已完成的节点结果。并行场景下两个游标独立恢复，互不影响——某条游标停在 `waiting_join` 时也照样保留，等另一条就位后由 join 节点推进。
+**恢复粒度：消息级**（决策 405，**修订**原「节点级」的口径）。两条分界要分开读：
+
+- **已完成的节点不重跑**（不变）：游标停在哪儿就从哪儿起——checkpoint 粒度为**节点级**，
+  `kanban_node_cursors` 各行的 `(stage, node)` 就是它的载体（决策 80 的前半）。
+- **中断的节点不再整节点重跑**（改的是这一条）：`execute` 节点中途崩溃时，节点从**节点内
+  消息日志**（`kanban_node_messages`，迁移 0044；决策 401）里最后一条已记录的消息接着跑
+  ——只丢最后一条还没落库的模型响应，已完成的工具副作用不再重做。日志只追加、压缩不碰它，
+  与 `kanban_node_conversations`（循环退出后一次性写出、写入前会被截断）是两件事。
+
+并行场景下两条游标独立恢复，互不影响——某条游标停在 `waiting_join` 时也照样保留，等另一条
+就位后由 join 节点推进（这一条与恢复粒度无关，两种口径下都成立）。
+
+消息级恢复之后，「节点内操作幂等」（G9）**不再是恢复的正确性依赖**，但仍保留为**节点内
+重跑的安全网**：自动重试（决策 278 的续接）、人为重试（决策 125 的 `git reset --hard` +
+`git clean`）以及本功能未覆盖的路径（子代理 / 伪阶段 / 项目分析 run）仍靠它。
+
+**重启恢复不重置工作区**（决策 405 给决策 125 补的分界）：未提交的改动对重启恢复是上一轮
+的**真实进度**（抹掉等于把恢复做成重来），对人为重试才是被判定不合用的残留。
 
 **ctrl+c 优雅关闭（决策 54）：**
 

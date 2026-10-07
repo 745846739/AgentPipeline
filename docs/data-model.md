@@ -359,6 +359,31 @@ LLM（`agent_type = pseudo:project_analysis` ≠ `system`），因此**计入**�
 `summary_error`；run 行仍落库并收尾为 `failed`（含 `error`），不落会话行
 （与 task 级伪阶段失败路径一致），整个分析仍为 `done`。
 
+### 4.4 节点内消息日志：**节点内 checkpoint**（决策 401 / 405）
+
+`kanban_node_messages`（迁移 0044）是 agent 节点主循环的**逐条**转录：一行一条消息，
+`seq` 定序，**只追加**（压缩不碰它），**每个 run 自包含**（attempt 起跑时把承接的转录
+前缀整批写进本 run 名下，于是「某 run 的全部行」就是那次尝试的完整转录）。
+
+| | `kanban_node_conversations`（§12.4.3） | `kanban_node_messages`（本表） |
+|---|---|---|
+| 写入时机 | 循环**退出之后**一次性写成一整块 | 每产生一条消息就落一行（**边跑边写**） |
+| 压缩 | 写入前经 `truncate_messages_json` 从最旧一端整条丢 | 一个字不碰 |
+| 读者 | 任务详情页 / 诊断包（**观测归档**） | `take_continuation`（**续接素材**） |
+| 粒度 | 一条 run 一行（决策 99） | 一条消息一行 |
+
+**checkpoint 的两级**（决策 405 修订决策 80 的措辞面）：`kanban_node_cursors` 各行是
+**节点级** checkpoint（已完成的节点不重跑），本表是**节点内** checkpoint（中断的节点从
+最后一条已记录的消息接着跑；进程被杀时只丢最后一条还没落库的模型响应）。
+
+**续接查找键**：`(task_id, stage, node, agent_type='main')` 取 `run_id` 最大的那一组行
+——与 `latest_own_conversation` 同源。**不能按游标找**：`goto` 是在同一条游标行上改
+`(stage, node)`，按 `cursor_id` 会把上一个节点的对话喂给这个节点。
+
+**合成回执**：日志断在半轮（assistant 已落、这一批工具的结果没配齐）时，读取侧补齐回执
+并给它们打 `synthetic = 1`；不补的话这半轮重放给下一轮就是一次必然的 400。文案两种
+（第一个未配齐的调用说「可能已部分生效」，其余说「没有执行」），理由见决策 402②。
+
 ---
 
 ## 5. Pending → Resume 映射
@@ -384,6 +409,7 @@ LLM（`agent_type = pseudo:project_analysis` ≠ `system`），因此**计入**�
 | merge / execute | merge_approval | 用户在 GUI 审核 diff 后点击"合入"或"返回修改"（`POST /tasks/{id}/merge/decision`，决策 119） | diff 文件 + 变更统计 |
 | merge / execute | user_decision（脏工作区） | 用户选择：我已处理，继续合入 / 取消任务（决策 132："放弃合入"移除，无端点） | 目标分支未提交改动清单 |
 | 任何节点 | timeout | 自动按 `agent_retry_max` 重试；耗尽后用户选择：goto execute 或 skip（**merge 除外**：动作集同决策 86，重试 / 终止任务，无 skip——决策 122） | 超时的节点和已耗时 |
+| 任何节点（**agent 节点**） | — （不是 pending 原因） | **进程重启**：服务在节点执行中途退出，启动恢复给中断的游标置 `process_restart` 续接原因（决策 403），节点从节点内消息日志（§4.4）里最后一条已记录的消息接着跑；**不重置工作区**（决策 405 / 125）。连续第 3 次仍未取得进展 → 转 `pending(retry_exhausted)` 交回人工（决策 404 的止损） | 无需人介入（自动续接）；止损那一档才呈现「这个节点为什么会让服务反复退出」 |
 | 任何节点 | context_overflow | 用户选择：拆分任务 / 更换长上下文模型 / 取消 | 峰值 token、压缩次数 |
 | init（未启动） | dependency_failed | "继续执行"= 忽略失败依赖置回 queued（决策 116）/ 取消任务 / 等待依赖重试（仅依赖 failed 时提供） | 失败的依赖任务清单 |
 
