@@ -44,6 +44,34 @@ pub enum Step {
     /// 流式护栏判废本轮。生产里护栏在 `ProductionLlm` 的流中途触发；脚本替身
     /// 在同一接缝（`complete` 的返回值）给出同型错误，供 agent loop 整环验证。
     Degenerate { message: String },
+    /// **同一条 assistant 消息里的多个工具调用**（决策 410 的同批刹车用例）。
+    ///
+    /// 真实上游把「一次想并行做的几件事」放进同一条消息（2026-10-08 的实证里就是
+    /// 一条消息三个 `spawn_sub_agent`），而 [`Step::Tool`] 一条消息只发一个调用——
+    /// 后者表达不了「同批」，`fail_tool_n` 那类注入也就无从谈起。内层只接受
+    /// [`Step::Tool`] / [`Step::ToolRaw`] / [`Step::Submit`]（别的形态没有 tool_call 可言，
+    /// 遇到即 panic）。**内层的 `Step::Tool` 不过 `fail_tool_n` 的注入**：那条规则按
+    /// 「本节点该工具第 n 次调用」计数，与一条消息里的批内序不是一回事，混起来会互相污染。
+    Batch(Vec<Step>),
+}
+
+impl Step {
+    /// 这一步作为**一个 tool_call** 的样子（[`Step::Batch`] 内层用）。
+    ///
+    /// `None` = 这一步发不出 tool_call（`Text` / `Stall` / `Fail` / `Degenerate` / 嵌套
+    /// `Batch`）——批内遇到它请当场 panic，别静默丢弃：脚本写错了要立刻看得见。
+    fn into_tool_call(self) -> Option<ToolCall> {
+        match self {
+            Step::Tool { name, arguments } => Some(tool_call(name, arguments)),
+            Step::ToolRaw { name, arguments } => Some(ToolCall {
+                id: ulid::Ulid::new().to_string(),
+                name,
+                arguments,
+            }),
+            Step::Submit(value) => Some(tool_call("submit_metadata".into(), value)),
+            _ => None,
+        }
+    }
 }
 
 /// 按 `(stage, node)` 组织的脚本；伪阶段按 `agent_type`（`pseudo:*`）单独排队（testing.md §3.2 ⑥）。
@@ -80,6 +108,15 @@ impl Script {
     pub fn push(&mut self, stage: Stage, node: Node, step: Step) -> &mut Self {
         self.steps.entry((stage, node)).or_default().push_back(step);
         self
+    }
+
+    /// 为某个 `(stage, node)` 追加一步**同批多调用**（决策 410）：内层按序合并成一条
+    /// assistant 消息的 `tool_calls`。
+    ///
+    /// 与逐条 [`Script::push`] 的区别就是「同一条消息」与「先后两条消息」——同批刹车
+    /// （决策 410）只看得出前者。便捷写法，内层规则见 [`Step::Batch`]。
+    pub fn push_batch(&mut self, stage: Stage, node: Node, steps: Vec<Step>) -> &mut Self {
+        self.push(stage, node, Step::Batch(steps))
     }
 
     /// 为某个伪阶段（`agent_type`，如 `pseudo:conflict_check`）追加步骤。
@@ -630,6 +667,23 @@ impl LlmClient for FakeAgent {
                     completion_tokens: 5,
                     ..Default::default()
                 }),
+                // 一条消息里的多个调用（决策 410 的同批刹车）：批内**顺序**执行，
+                // 与执行体的工具批循环同形。
+                Some(Step::Batch(steps)) => Ok(AgentResponse {
+                    content: None,
+                    reasoning: thinking,
+                    tool_calls: steps
+                        .into_iter()
+                        .map(|step| {
+                            step.into_tool_call().expect(
+                                "Step::Batch 里只接受 Tool / ToolRaw / Submit（别的形态没有 tool_call）",
+                            )
+                        })
+                        .collect(),
+                    prompt_tokens: 10,
+                    completion_tokens: 5,
+                    ..Default::default()
+                }),
                 // 不返回：由节点级超时包装终止（决策 64 / 148 ④）
                 Some(Step::Stall) => {
                     std::future::pending::<agentpipeline_core::Result<AgentResponse>>().await
@@ -854,6 +908,41 @@ mod tests {
         assert_eq!(resp.tool_calls[0].name, "run_command");
         let args: serde_json::Value = serde_json::from_str(&resp.tool_calls[0].arguments).unwrap();
         assert_eq!(args["command"], "seq 1 300");
+    }
+
+    #[tokio::test]
+    async fn batch_step_emits_one_message_with_several_calls() {
+        // 决策 410 的同批刹车只看得出「一条消息里的多个调用」——`Step::Tool` 一条消息
+        // 只发一个，表达不了这个形状（2026-10-08 的实证就是一条消息三个 spawn）。
+        let mut script = Script::new();
+        script.push_batch(
+            Stage::Develop,
+            Node::Execute,
+            vec![
+                Step::Tool {
+                    name: "spawn_sub_agent".into(),
+                    arguments: serde_json::json!({"task": "扫 A"}),
+                },
+                Step::ToolRaw {
+                    name: "read_file".into(),
+                    arguments: "{\"path\":\"NOTES.md\"}".into(),
+                },
+                Step::Submit(serde_json::json!({"ok": true})),
+            ],
+        );
+        let agent = FakeAgent::new(script);
+        let resp = agent
+            .complete(request(Stage::Develop, Node::Execute))
+            .await
+            .unwrap();
+        assert_eq!(resp.tool_calls.len(), 3, "三个调用在**同一条**消息里");
+        assert_eq!(resp.tool_calls[0].name, "spawn_sub_agent");
+        assert_eq!(resp.tool_calls[1].name, "read_file");
+        assert_eq!(resp.tool_calls[2].name, "submit_metadata");
+        // 三个 tool_call_id 互不相同：同一条消息里的调用各自成对（净化规则按 id 配对）
+        let ids: std::collections::HashSet<_> =
+            resp.tool_calls.iter().map(|c| c.id.clone()).collect();
+        assert_eq!(ids.len(), 3);
     }
 
     #[test]

@@ -5275,6 +5275,315 @@ async fn a_timeout_cancel_stops_a_stalled_subagent_with_its_own_origin() {
     stalled_subagent_stops_with("t-stop-t", false).await;
 }
 
+// ─────────────── 同批刹车（决策 410，票 03）───────────────
+
+/// 父节点在**批之后**照常收口（三个同批刹车用例共用）：写两个文件、提交、申报。
+///
+/// 申报面要盖住 diff 面（决策 397 的单向比对）：漏报会把 develop 打回，多出一条 run 行，
+/// 三个用例数的「子代理 run 行有几条」就跟着多噪声。review / test 也一并脚本化，让这一趟
+/// 跑到 done——刹车只该影响那一条工具批，不该影响别处。
+fn develop_finishes_cleanly(script: &mut Script, task_id: &str) {
+    script
+        .for_node(Stage::Develop, Node::Execute)
+        .write_file(
+            "src/lib.rs",
+            "pub fn add(a: i32, b: i32) -> i32 { a + b }\n#[test]\nfn adds() { assert_eq!(add(1, 2), 3); }\n",
+        )
+        .write_file("tests/acceptance.rs", "#[test]\nfn ok() {}\n")
+        .run_command(&format!(
+            "git add -A && git -c user.name=f -c user.email=f@l commit -m 'feat: task {task_id}'"
+        ))
+        .submit(&CodeChanges {
+            branch_name: format!("kanban/{task_id}"),
+            changed_files: vec![FileChangeSpec {
+                path: "src/lib.rs".into(),
+                action: FileAction::Create,
+                content_hash: None,
+            }],
+            unit_test_files: vec![FileChangeSpec {
+                path: "tests/acceptance.rs".into(),
+                action: FileAction::Create,
+                content_hash: None,
+            }],
+            no_changes: false,
+        });
+    script
+        .for_node(Stage::Review, Node::Execute)
+        .submit(&ReviewResult {
+            approved: true,
+            review_report_path: Some("review-report.md".into()),
+            required_changes: vec![],
+        });
+    script
+        .for_node(Stage::Test, Node::Execute)
+        .submit(&TestResult {
+            passed: true,
+            test_report_path: Some("test-report.md".into()),
+            failures: vec![],
+            gate_recheck: false,
+        });
+}
+
+/// 决策 410：**同批刹车**——一条消息里前一个 `spawn_sub_agent` 以「未收口」收场之后，
+/// 同批**同名**的后续调用不再执行，只补一条合成回执；同批的 `read_file`（非同类）照常执行。
+///
+/// 2026-10-08 的实证（任务 `01M4CD59`）：同一条消息三个 spawn，工具顺序执行、一个失败
+/// 不取消其余——「失败一个、又起一个」，三个全以同一句收场，共烧 51.5 万 prompt token。
+#[tokio::test]
+async fn a_not_converged_spawn_brakes_the_rest_of_its_batch() {
+    // 轮数上限压到 2：子代理 #1 两轮就打满（决策 407 的配置让这种用例好写）。
+    let settings = Settings {
+        sub_agent_max_rounds: 2,
+        ..Settings::default()
+    };
+    let ctx = setup("true", settings).await;
+    declare_sub_agent(&ctx).await;
+
+    let worktree = ctx.store.home().worktree_path("t-brake");
+    std::fs::create_dir_all(&worktree).unwrap();
+    std::fs::write(worktree.join("NOTES.md"), "关键结论：入口在 main()\n").unwrap();
+
+    let mut script = Script::new();
+    design_scripts(&mut script);
+    // 父的第一条消息：三个调用**同批**——两个 spawn + 一个 read_file（非同类）。
+    script.push_batch(
+        Stage::Develop,
+        Node::Execute,
+        vec![
+            testkit::Step::Tool {
+                name: "spawn_sub_agent".into(),
+                arguments: serde_json::json!({"task": "扫一遍 A"}),
+            },
+            testkit::Step::Tool {
+                name: "spawn_sub_agent".into(),
+                arguments: serde_json::json!({"task": "扫一遍 B"}),
+            },
+            testkit::Step::Tool {
+                name: "read_file".into(),
+                arguments: serde_json::json!({"path": "NOTES.md"}),
+            },
+        ],
+    );
+    // 子代理 #1：读两轮、打满上限 → 未收口。子代理 #2 **一步都不排**——它要是真跑了，
+    // 就会以「（脚本已结束）」收口并留下自己的 run 行（那正是这条用例要拦下的）。
+    for _ in 0..2 {
+        script.push_subagent(testkit::Step::Tool {
+            name: "read_file".into(),
+            arguments: serde_json::json!({"path": "NOTES.md"}),
+        });
+    }
+    develop_finishes_cleanly(&mut script, "t-brake");
+
+    ctx.agent.set_script(script);
+    testkit::seed_task(&ctx.store, "t-brake", "p1")
+        .await
+        .unwrap();
+    admit(&ctx, "t-brake").await;
+    ctx.executor.run("t-brake").await.unwrap();
+
+    // ① 只有一个子代理 run 行：第二个 spawn **没有执行**。
+    let sub_runs: Vec<_> = ctx
+        .store
+        .list_runs("t-brake")
+        .await
+        .unwrap()
+        .into_iter()
+        .filter(|r| r.agent_type == "subagent")
+        .collect();
+    assert_eq!(sub_runs.len(), 1, "第二个 spawn 不该起第二个子代理");
+    assert_eq!(sub_runs[0].status, NodeStatus::Failed, "第一个：打满轮数");
+
+    // ② 父转录里：合成回执写明「未执行」与原因；同批的 read_file 结果是真读到的。
+    let transcript = ctx
+        .store
+        .latest_own_transcript("t-brake", Stage::Develop, Node::Execute)
+        .await
+        .unwrap()
+        .expect("父节点的消息日志应当有行");
+    let texts: Vec<&str> = transcript
+        .messages
+        .iter()
+        .filter_map(|m| m.content.as_deref())
+        .collect();
+    assert!(
+        texts
+            .iter()
+            .any(|t| t.contains("同批前一个 spawn_sub_agent 未完成") && t.contains("本次未执行")),
+        "合成回执要写明「未执行」与原因：{texts:?}"
+    );
+    assert!(
+        texts.iter().any(|t| t.contains("入口在 main()")),
+        "非同类工具（read_file）不受刹车影响：{texts:?}"
+    );
+
+    // ③ 那条被跳过的回执在日志里是**合成件**（读的人认得出它不是真跑出来的）——
+    // 数在发生那一次批的 run 上：子代理 run 行记得自己的父 run。
+    let parent_run_id = sub_runs[0].parent_run_id.expect("子代理 run 行带父 run");
+    assert_eq!(
+        ctx.store
+            .count_synthetic_node_messages(parent_run_id)
+            .await
+            .unwrap(),
+        1,
+        "被跳过的那一条是合成件"
+    );
+
+    // ④ 子代理只被调了两轮（#1 的两轮）——#2 一次模型调用都没发。
+    let sub_requests = ctx
+        .agent
+        .request_log()
+        .iter()
+        .filter(|r| r.run.as_ref().is_some_and(|c| c.agent_type == "subagent"))
+        .count();
+    assert_eq!(sub_requests, 2, "第二个 spawn 不该发出任何子代理请求");
+}
+
+/// 决策 410 的反面：第一个 spawn **成功**时不刹车——两个都真跑（同批的并行探查是正当用法，
+/// 刹车的覆盖面故意窄）。
+#[tokio::test]
+async fn a_successful_spawn_does_not_brake_its_batch() {
+    let ctx = setup("true", Settings::default()).await;
+    declare_sub_agent(&ctx).await;
+
+    let worktree = ctx.store.home().worktree_path("t-nobr");
+    std::fs::create_dir_all(&worktree).unwrap();
+    std::fs::write(worktree.join("NOTES.md"), "关键结论：入口在 main()\n").unwrap();
+
+    let mut script = Script::new();
+    design_scripts(&mut script);
+    script.push_batch(
+        Stage::Develop,
+        Node::Execute,
+        vec![
+            testkit::Step::Tool {
+                name: "spawn_sub_agent".into(),
+                arguments: serde_json::json!({"task": "扫一遍 A"}),
+            },
+            testkit::Step::Tool {
+                name: "spawn_sub_agent".into(),
+                arguments: serde_json::json!({"task": "扫一遍 B"}),
+            },
+        ],
+    );
+    script.push_subagent(testkit::Step::Text("摘要 A".into()));
+    script.push_subagent(testkit::Step::Text("摘要 B".into()));
+    develop_finishes_cleanly(&mut script, "t-nobr");
+
+    ctx.agent.set_script(script);
+    testkit::seed_task(&ctx.store, "t-nobr", "p1")
+        .await
+        .unwrap();
+    admit(&ctx, "t-nobr").await;
+    ctx.executor.run("t-nobr").await.unwrap();
+
+    let sub_runs: Vec<_> = ctx
+        .store
+        .list_runs("t-nobr")
+        .await
+        .unwrap()
+        .into_iter()
+        .filter(|r| r.agent_type == "subagent")
+        .collect();
+    assert_eq!(sub_runs.len(), 2, "两条都真跑");
+    assert!(
+        sub_runs.iter().all(|r| r.status == NodeStatus::Success),
+        "两条都成功：{sub_runs:?}"
+    );
+
+    let transcript = ctx
+        .store
+        .latest_own_transcript("t-nobr", Stage::Develop, Node::Execute)
+        .await
+        .unwrap()
+        .unwrap();
+    let texts: Vec<&str> = transcript
+        .messages
+        .iter()
+        .filter_map(|m| m.content.as_deref())
+        .collect();
+    assert!(texts.iter().any(|t| t.contains("摘要 A")), "{texts:?}");
+    assert!(texts.iter().any(|t| t.contains("摘要 B")), "{texts:?}");
+    assert!(
+        !texts.iter().any(|t| t.contains("本次未执行")),
+        "一条都不该被跳过：{texts:?}"
+    );
+}
+
+/// 决策 410 的边界：**偶发失败不刹车**（子代理运行失败 / 传输类）——同一批派出的探查仍
+/// 值得各自跑完，误杀正当的并行探查比多跑一次贵。只有「这一类活当前做不成」的两档
+/// （未收口 / 超时）才挂判据。
+#[tokio::test]
+async fn an_ordinary_subagent_failure_does_not_brake_its_batch() {
+    let ctx = setup("true", Settings::default()).await;
+    declare_sub_agent(&ctx).await;
+
+    let worktree = ctx.store.home().worktree_path("t-soft");
+    std::fs::create_dir_all(&worktree).unwrap();
+    std::fs::write(worktree.join("NOTES.md"), "关键结论：入口在 main()\n").unwrap();
+
+    let mut script = Script::new();
+    design_scripts(&mut script);
+    script.push_batch(
+        Stage::Develop,
+        Node::Execute,
+        vec![
+            testkit::Step::Tool {
+                name: "spawn_sub_agent".into(),
+                arguments: serde_json::json!({"task": "扫一遍 A"}),
+            },
+            testkit::Step::Tool {
+                name: "spawn_sub_agent".into(),
+                arguments: serde_json::json!({"task": "扫一遍 B"}),
+            },
+        ],
+    );
+    // 子代理 #1 当场报错（传输类，决策 298 的稳定类别标识）→ `SubAgentEnd::Failed`；
+    // 它**不**进刹车判据，故 #2 照跑。
+    script.push_subagent(testkit::Step::Fail {
+        kind: "llm_network".into(),
+        message: "连接被重置".into(),
+        raw: "connection reset by peer".into(),
+    });
+    script.push_subagent(testkit::Step::Text("摘要 B".into()));
+    develop_finishes_cleanly(&mut script, "t-soft");
+
+    ctx.agent.set_script(script);
+    testkit::seed_task(&ctx.store, "t-soft", "p1")
+        .await
+        .unwrap();
+    admit(&ctx, "t-soft").await;
+    ctx.executor.run("t-soft").await.unwrap();
+
+    let sub_runs: Vec<_> = ctx
+        .store
+        .list_runs("t-soft")
+        .await
+        .unwrap()
+        .into_iter()
+        .filter(|r| r.agent_type == "subagent")
+        .collect();
+    assert_eq!(sub_runs.len(), 2, "偶发失败不刹车：两条都跑");
+    assert_eq!(sub_runs[0].status, NodeStatus::Failed, "第一条运行失败");
+    assert_eq!(sub_runs[1].status, NodeStatus::Success, "第二条照跑");
+
+    let transcript = ctx
+        .store
+        .latest_own_transcript("t-soft", Stage::Develop, Node::Execute)
+        .await
+        .unwrap()
+        .unwrap();
+    let texts: Vec<&str> = transcript
+        .messages
+        .iter()
+        .filter_map(|m| m.content.as_deref())
+        .collect();
+    assert!(
+        !texts.iter().any(|t| t.contains("本次未执行")),
+        "偶发失败不该让同批的探查白丢：{texts:?}"
+    );
+    assert!(texts.iter().any(|t| t.contains("摘要 B")), "{texts:?}");
+}
+
 /// 验收（票 08 安全断言）：子代理的工具集**只有** `read_file` / `list_dir`。
 ///
 /// 这条是本票的安全边界：不是「子代理不调 run_command」，而是**它的工具定义里

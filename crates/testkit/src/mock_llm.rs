@@ -291,6 +291,22 @@ fn render_step(step: Option<Step>) -> MockRoute {
         }
         // 原始参数串（票 01②）：模拟上游把 arguments 腰斩
         Some(Step::ToolRaw { name, arguments }) => MockRoute::sse("/", sse_tool(&name, &arguments)),
+        // 一条消息里的多个调用（决策 410）：一串 tool_call delta 摆在同一条流里，与生产
+        // 适配器聚合「同一条消息的多个调用」那条路同形。内层规则与 `Step::Batch` 的文档同。
+        Some(Step::Batch(steps)) => {
+            let calls: Vec<(String, String)> = steps
+                .into_iter()
+                .map(|step| match step {
+                    Step::Tool { name, arguments } => (name, arguments.to_string()),
+                    Step::ToolRaw { name, arguments } => (name, arguments),
+                    Step::Submit(value) => ("submit_metadata".to_string(), value.to_string()),
+                    _ => panic!(
+                        "Step::Batch 里只接受 Tool / ToolRaw / Submit（别的形态没有 tool_call）"
+                    ),
+                })
+                .collect();
+            MockRoute::sse("/", sse_tools(&calls))
+        }
         Some(Step::Text(text)) => MockRoute::sse("/", sse_text(&text)),
         // Stall：不写 [DONE]，连接关闭即流结束（与 FakeAgent 的「永不返回」近似）
         Some(Step::Stall) => MockRoute::sse("/", String::new()),
@@ -323,18 +339,27 @@ fn sse_degenerate_loop(unit: &str, times: usize) -> String {
 }
 
 fn sse_tool(name: &str, arguments: &str) -> String {
+    sse_tools(&[(name.to_string(), arguments.to_string())])
+}
+
+/// 一条消息里的多个 tool_call（决策 410）：各带各的 `index` 与 id，摆在同一条流里。
+fn sse_tools(calls: &[(String, String)]) -> String {
+    let tool_calls: Vec<serde_json::Value> = calls
+        .iter()
+        .enumerate()
+        .map(|(index, (name, arguments))| {
+            serde_json::json!({
+                "index": index,
+                "id": format!("call_{}", ulid::Ulid::new()),
+                "type": "function",
+                "function": {"name": name, "arguments": arguments}
+            })
+        })
+        .collect();
     let chunk = serde_json::json!({
         "choices": [{
             "index": 0,
-            "delta": {
-                "role": "assistant",
-                "tool_calls": [{
-                    "index": 0,
-                    "id": format!("call_{}", ulid::Ulid::new()),
-                    "type": "function",
-                    "function": {"name": name, "arguments": arguments}
-                }]
-            },
+            "delta": {"role": "assistant", "tool_calls": tool_calls},
             "finish_reason": "tool_calls"
         }]
     });

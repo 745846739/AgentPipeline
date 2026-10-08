@@ -3144,3 +3144,20 @@ config.rs}`、`tests/e2e/tests/integration/stage_boundary.rs`、`docs/testing.md
 **验证**：L2 `executor.rs::a_hold_stops_a_stalled_subagent_at_the_model_call`（子代理第 1 轮真读、第 2 轮模型调用挂住 → `request_hold` → 子代理 run 行 `cancelled` + `cancel_origin='hold'` + error 报「第 2 轮」与「人工暂停」；父转录里的回执标「第 2 轮，未完成」；父 run 行 `cancelled` 让路、无 pending）与 `a_timeout_cancel_stops_a_stalled_subagent_with_its_own_origin`（`request_cancel` 走同一条通道 → `cancel_origin='timeout'`）；L1 `tools.rs::sub_agent_end_renders_each_ending_distinctly`（四终局文本逐句钉住）；既有七条子代理 L2 用例一字未改仍绿（正常摘要 / 未收口 / 超时 / 只读集 / 不继承 / 单次记账 / 父子归属）。
 
 **来源**：`.scratch/subagent-governance/issues/01`；落地 `crates/core/src/pipeline/{subagent.rs, model_invoke.rs}`、`crates/core/src/agent/tools.rs`、`crates/core/tests/integration/executor.rs`
+
+### 决策 410 · 同批刹车：前一个 `spawn_sub_agent` 未收口/超时之后，同批同名的调用不再执行（补合成回执）
+
+**起因**：2026-10-08 的实证（任务 `01M4CD59`）——三个 `spawn_sub_agent` 是**同一条 assistant 消息里的并行调用**，工具批**顺序执行**、且批内一个失败不取消其余。于是「失败一个、又起一个」：三个子代理全打满轮数、同一句「未收口」，共烧 51.5 万 prompt token（373 = 18.0 万 / 374 = 17.8 万 / 375 = 15.7 万 prompt）。同一批派出的子任务形态相近，第一个打满就已经说明**这一类活当前做不成**。
+
+**裁决**：
+
+1. **判据是类型，不是字样**（决策 259）：`ToolOutcome` 长一个 `batch_abort: Option<BatchAbort>`（工具名 + 理由），由 `SubAgentEnd::batch_abort_reason()` 分类、`spawn_sub_agent` 挂上。覆盖面**故意窄**，只有两档——**未收口**（轮数打满）与**超时**（墙钟打满）。
+2. **另外三个终局不挂**，各自的理由写进注释与 L1 用例：**「被中止」**是父节点自己的事（人按停 / 判超时，决策 409），同批剩下的没有理由跟着挨一刀；**「运行失败」**多为偶发（传输抖动一类），误杀正当的并行探查比多跑一次贵；**「完成」**当然不刹车。
+3. **消费点在编排侧的工具批循环**（`model_invoke`）：本批里名字相同的后续调用**跳过执行**，补一条合成回执（写明「未执行」与原因）、照 `Message::tool_result` 进转录、照 `log.append_synthetic` 落行。**别的工具不受影响**——同批的 `read_file` 照常执行（这条单独立了断言）。
+4. **合成回执带 `synthetic` 标记**（迁移 0044 那一列）：它不是真跑出来的结果，而是替一次被跳过的调用立此存照——与崩溃续接补的那一段同一种标记，读的人认得出。
+5. **回执形状与真回执同形**（同一条 `log.append` 通道、同一种 message），因为续接读的是同一种行：形状不同会让「已完成的副作用不再重做」在日志里失真。**不发 error 事件**（`ToolPhase::End` 带合成文本）：它不是失败——没跑，不是跑了出事。
+6. **测试基建加一步 `Step::Batch`**：同批刹车只看得出「**一条** assistant 消息里的多个调用」，而 `Step::Tool` 一条消息只发一个（真实上游把并行调用放进同一条消息，正是事故的形状）。`Script::push_batch` 是它的便捷写法；mock_llm 侧同形支持（`sse_tools` 把多个 tool_call delta 摆进同一条流）。**内层不过 `fail_tool_n`**：那条规则按「本节点该工具第 n 次调用」计数，与批内序不是一回事，混起来会互相污染。
+
+**验证**：L2 `executor.rs` **三条**——`a_not_converged_spawn_brakes_the_rest_of_its_batch`（一条消息三个调用：spawn 未收口 → 第二个 spawn **零 run 行、零请求**，父转录里的合成回执写明「未执行」与原因，同批的 `read_file` 结果照常进转录，那一条在日志里 `synthetic=1`）、`a_successful_spawn_does_not_brake_its_batch`（两个都真跑、都是 `Success`、转录里两条摘要、无「未执行」）、`an_ordinary_subagent_failure_does_not_brake_its_batch`（子代理 #1 传输类失败 → #2 照跑）；L1 `tools.rs::sub_agent_end_renders_each_ending_distinctly` 扩写（五档的 `batch_abort_reason` 逐条）；L1 `testkit::script.rs::batch_step_emits_one_message_with_several_calls`（三个调用在同一条消息里、id 互不相同）。既有七条子代理 L2 用例与全部 testkit 用例一字未改仍绿。
+
+**来源**：`.scratch/subagent-governance/issues/03`；落地 `crates/core/src/agent/tools.rs`、`crates/core/src/pipeline/model_invoke.rs`、`crates/testkit/src/{script.rs, mock_llm.rs}`、`crates/core/tests/integration/executor.rs`

@@ -428,6 +428,23 @@ impl SubAgentEnd {
             )),
         }
     }
+
+    /// 「**同批同类调用不必再跑**」的理由（决策 410）：只有「未收口」与「超时」两档。
+    ///
+    /// 两档共有的性质是**这一类活当前做不成**——同一批派出的子任务形态相近，第一个打满
+    /// 说明剩下的几乎必然同样打满（2026-10-08 实证：三个全打满，共烧 51.5 万 prompt
+    /// token）。另外三个终局**故意不在此列**：「被中止」是父节点自己的事（人按停 / 判超时），
+    /// 同批剩下的没有理由跟着挨一刀；「运行失败」多为偶发（传输抖动一类），误杀正当的并行
+    /// 探查比多跑一次贵；「完成」当然不刹车。
+    pub fn batch_abort_reason(&self) -> Option<String> {
+        match self {
+            SubAgentEnd::NotConverged { max_rounds } => Some(format!("在 {max_rounds} 轮内未收口")),
+            SubAgentEnd::TimedOut { secs } => Some(format!("超时（{secs}s）")),
+            SubAgentEnd::Completed(_)
+            | SubAgentEnd::Aborted { .. }
+            | SubAgentEnd::Failed { .. } => None,
+        }
+    }
 }
 
 /// 子代理执行接缝（决策 172③，票 08）。
@@ -497,6 +514,26 @@ pub struct ToolOutcome {
     pub content: String,
     /// `submit_metadata` 提交的结构化元数据。
     pub metadata: Option<serde_json::Value>,
+    /// 「**同批同类调用不必再跑**」的判据（决策 410）。`None` = 照常跑完这一批。
+    pub batch_abort: Option<BatchAbort>,
+}
+
+/// 同批刹车的判据载体（决策 410）。
+///
+/// 由**工具自己分类**给出（今天只有 [`ToolOutcome::ok_then_skip_the_same_tool`] 的调用方
+/// `spawn_sub_agent` 会挂），消费点在编排侧的工具批循环：名字相同的后续调用直接跳过、
+/// 补一条合成回执。
+///
+/// **为什么是类型不是字样**：判据要是写成「回执里含『未收口』」，改一次文案就悄悄失效——
+/// 那正是决策 259 明确不要走的路（同一课在 `cancel_origin` 上已经上过一次，决策 276）。
+/// 覆盖面**故意窄**：只有「这一类活当前做不成」的两档（未收口 / 超时）会挂它；偶发失败
+/// 不挂——误杀正当的并行探查比多跑一次贵。
+#[derive(Debug, Clone, PartialEq)]
+pub struct BatchAbort {
+    /// 哪一类调用不必再跑（工具名）。
+    pub tool: String,
+    /// 为什么不必再跑（人话，进合成回执）。
+    pub reason: String,
 }
 
 impl ToolOutcome {
@@ -506,6 +543,23 @@ impl ToolOutcome {
         ToolOutcome {
             content: content.into(),
             metadata: None,
+            batch_abort: None,
+        }
+    }
+
+    /// 同 [`Self::ok`]，并声明「**这一批里同名的后续调用不必再跑**」（决策 410）。
+    pub fn ok_then_skip_the_same_tool(
+        content: impl Into<String>,
+        tool: impl Into<String>,
+        reason: impl Into<String>,
+    ) -> Self {
+        ToolOutcome {
+            content: content.into(),
+            metadata: None,
+            batch_abort: Some(BatchAbort {
+                tool: tool.into(),
+                reason: reason.into(),
+            }),
         }
     }
 }
@@ -1131,6 +1185,8 @@ impl ToolExecutor {
         Ok(ToolOutcome {
             content: offload_replacement(&call.name, &path.display().to_string(), tokens, &preview),
             metadata: outcome.metadata,
+            // 卸载只换正文，判据照旧跟着走（决策 410）。
+            batch_abort: outcome.batch_abort,
         })
     }
 
@@ -1340,13 +1396,21 @@ impl ToolExecutor {
             ));
         }
         // 收场是**类型**（决策 409）：四个终局各有各的文本，回执由它自己渲染——
-        // 工具层据此还能分出「未收口 / 超时」这一类（同批刹车要用，票 03）。
+        // 工具层据此还能分出「未收口 / 超时」这一类（同批刹车要用，票 03 / 决策 410）。
         let end = runner
             .run(SubAgentRequest {
                 task: task.to_string(),
             })
             .await?;
-        Ok(ToolOutcome::ok(end.receipt()))
+        let receipt = end.receipt();
+        Ok(match end.batch_abort_reason() {
+            Some(reason) => ToolOutcome::ok_then_skip_the_same_tool(
+                receipt,
+                super::SPAWN_SUB_AGENT_TOOL,
+                reason,
+            ),
+            None => ToolOutcome::ok(receipt),
+        })
     }
 
     async fn read_file(&self, call: &ToolCall, ctx: &ToolCallContext) -> Result<ToolOutcome> {
@@ -1446,6 +1510,7 @@ impl ToolExecutor {
         Ok(ToolOutcome {
             content: "{\"success\":true}".to_string(),
             metadata: Some(value),
+            batch_abort: None,
         })
     }
 
@@ -5618,6 +5683,22 @@ mod tests {
         };
         assert_eq!(failed.receipt(), "子代理运行失败：连接被重置");
         assert_eq!(failed.ledger_error().as_deref(), Some("连接被重置"));
+
+        // 同批刹车的判据（决策 410）：只有「这一类活当前做不成」的两档挂它。
+        assert!(done.batch_abort_reason().is_none(), "完成不刹车");
+        assert!(
+            aborted.batch_abort_reason().is_none(),
+            "被中止不刹车——那是父节点自己的事，同批剩下的没理由跟着挨一刀"
+        );
+        assert_eq!(
+            capped.batch_abort_reason().as_deref(),
+            Some("在 7 轮内未收口")
+        );
+        assert_eq!(timed.batch_abort_reason().as_deref(), Some("超时（600s）"));
+        assert!(
+            failed.batch_abort_reason().is_none(),
+            "偶发失败不刹车（误杀正当的并行探查比多跑一次贵）"
+        );
     }
 
     #[test]

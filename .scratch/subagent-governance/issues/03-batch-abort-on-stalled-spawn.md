@@ -21,10 +21,15 @@
 
 **Blocked by:** 01（消费它引入的类型化收场）
 
-**Status:** ready-for-agent
+**Status:** done
 
-- [ ] 用例：一条消息两个 spawn → 第一个未收口 → 第二个**未执行**且拿到合成回执，
+- [x] 用例：一条消息两个 spawn → 第一个未收口 → 第二个**未执行**且拿到合成回执，
       run 行只有一条子代理 run
-- [ ] 用例：第一个**成功**时不刹车，两个都真跑
-- [ ] 用例：`read_file` 等非同类工具不受刹车影响（同批里照常执行）
-- [ ] 用例：传输类失败不触发刹车（不误杀并行探查）
+      （`executor.rs::a_not_converged_spawn_brakes_the_rest_of_its_batch`）
+- [x] 用例：第一个**成功**时不刹车，两个都真跑
+      （`executor.rs::a_successful_spawn_does_not_brake_its_batch`）
+- [x] 用例：`read_file` 等非同类工具不受刹车影响（同批里照常执行；同第一条例用）
+- [x] 用例：传输类失败不触发刹车（不误杀并行探查；
+      `executor.rs::an_ordinary_subagent_failure_does_not_brake_its_batch`）
+- [x] 顺带：测试基建加 `Step::Batch` / `Script::push_batch`（一条消息的多个调用——
+      `Step::Tool` 一条只发一个，表达不了「同批」）+ mock_llm 同形支持

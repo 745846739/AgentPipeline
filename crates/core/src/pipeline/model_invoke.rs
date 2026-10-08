@@ -25,7 +25,7 @@ use crate::agent::client::{AgentResponse, LlmClient, LlmRequest, Message};
 use crate::agent::metadata::parse_metadata;
 use crate::agent::prompts::{build_system_prompt, load_agents_context};
 use crate::agent::providers::is_context_window;
-use crate::agent::tools::{ToolCallContext, ToolExecutor};
+use crate::agent::tools::{BatchAbort, ToolCallContext, ToolExecutor, ToolOutcome};
 use crate::clock::Clock;
 use crate::config::Settings;
 use crate::pipeline::pseudo::{ConflictCheckResult, CrossCheckResult, PseudoStage};
@@ -193,6 +193,16 @@ impl NodeMessageLog {
 
     /// 追加一条并**当场提交**（顺序保证见结构 doc）。
     async fn append(&mut self, message: &Message) -> Result<()> {
+        self.append_marked(message, false).await
+    }
+
+    /// 追加一条**合成**回执（决策 410）：它不是真跑出来的结果，而是替一次被跳过的调用
+    /// 立此存照——`synthetic` 标记让读的人认得出（与崩溃续接补的那一段同一种标记）。
+    async fn append_synthetic(&mut self, message: &Message) -> Result<()> {
+        self.append_marked(message, true).await
+    }
+
+    async fn append_marked(&mut self, message: &Message, synthetic: bool) -> Result<()> {
         self.store
             .insert_node_message(
                 &self.task_id,
@@ -202,7 +212,7 @@ impl NodeMessageLog {
                 crate::storage::AGENT_TYPE_MAIN,
                 self.next_seq,
                 message,
-                false,
+                synthetic,
             )
             .await?;
         self.next_seq += 1;
@@ -1228,6 +1238,14 @@ impl ModelInvoke {
                 // turn，那是 attempt 级的语义（决策 298 按错误类别分流）。
                 break;
             }
+            // 同批刹车（决策 410）：同一条 assistant 消息里**同类**的后续调用，在前一个
+            // 以「未收口 / 超时」收场之后不再执行。2026-10-08 的实证：三个同批 spawn 全
+            // 打满轮数、同一句失败，共烧 51.5 万 prompt token——同一批派出的子任务形态相近，
+            // 第一个打满说明这一类活当前做不成。
+            //
+            // 覆盖面**故意窄**：只跳同名的调用（`read_file` 这类照常执行），判据由工具自己
+            // 按**类**给出（`ToolOutcome.batch_abort`，决策 259：不按报文字样分流）。
+            let mut braked: Option<BatchAbort> = None;
             for call in &response.tool_calls {
                 let summary = args_summary(&call.arguments);
                 emit_tool_event(
@@ -1241,6 +1259,32 @@ impl ModelInvoke {
                     &call.arguments,
                     None,
                 );
+                if let Some(brake) = braked.as_ref().filter(|b| b.tool == call.name) {
+                    // 合成回执（决策 410）：与真回执**同形**进转录、同一条路落行——续接读的
+                    // 是同一种行，形状不同会让「已完成的副作用不再重做」在日志里失真。
+                    // 它不是失败（没跑，不是跑了出事），故走 `End` 不发 error 事件；
+                    // 落库时带 `synthetic` 标记，读的人认得出它不是真跑出来的。
+                    let note = format!(
+                        "同批前一个 {} 未完成（{}），本次未执行。同一批派出的子任务形态相近，\
+                         重复派同类活只会再打满一次——请把它拆得更小，或自己用只读工具完成。",
+                        call.name, brake.reason
+                    );
+                    emit_tool_event(
+                        &*self.sse,
+                        task,
+                        cursor,
+                        run_id,
+                        &call.name,
+                        ToolPhase::End,
+                        &summary,
+                        &call.arguments,
+                        Some(&note),
+                    );
+                    trace.messages.push(Message::tool_result(call, note));
+                    log.append_synthetic(&trace.messages[trace.messages.len() - 1])
+                        .await?;
+                    continue;
+                }
                 let ctx = ToolCallContext {
                     task_id: task.id.clone(),
                     session_id: None,
@@ -1254,9 +1298,16 @@ impl ModelInvoke {
                 };
                 match tools.execute(call, &ctx).await {
                     Ok(outcome) => {
-                        if let Some(m) = outcome.metadata {
+                        let ToolOutcome {
+                            content,
+                            metadata,
+                            batch_abort,
+                        } = outcome;
+                        if let Some(m) = metadata {
                             submitted = Some(m);
                         }
+                        // 刹车判据跟着这一条走：本批里同名的后续调用不再执行。
+                        braked = batch_abort;
                         // 结果详情（决策 301）在 `content` 被移进转录**之前**递出去——
                         // 事件是它的第一读者，转录是第二份。
                         emit_tool_event(
@@ -1268,11 +1319,9 @@ impl ModelInvoke {
                             ToolPhase::End,
                             &summary,
                             &call.arguments,
-                            Some(&outcome.content),
+                            Some(&content),
                         );
-                        trace
-                            .messages
-                            .push(Message::tool_result(call, outcome.content));
+                        trace.messages.push(Message::tool_result(call, content));
                         // 每个工具结果**返回后立即落行**（票 01）：这一条真发生了，它是
                         // 「已完成的副作用不再重做」在日志里的凭据。
                         log.append(&trace.messages[trace.messages.len() - 1])
