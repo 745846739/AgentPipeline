@@ -5111,6 +5111,170 @@ async fn subagent_can_search_the_worktree_with_search_content() {
     assert_eq!(sub.status, NodeStatus::Success);
 }
 
+/// 决策 409 的公共形状：父节点派出子代理 → 子代理停在第 2 轮的模型调用上 → 请求中止
+/// → 收口 / 台账 / 回执三处按同一条规则落。`hold` 选来路（人按停 / 判超时）。
+///
+/// 任务 id 由调用方给：执行体的进程内登记是**全局**的（同 id 并发跑两个执行体会被
+/// 去重逐个拒掉），两条来路的用例必须各用各的 id。
+async fn stalled_subagent_stops_with(task_id: &str, hold: bool) {
+    let ctx = setup("true", Settings::default()).await;
+    declare_sub_agent(&ctx).await;
+
+    let worktree = ctx.store.home().worktree_path(task_id);
+    std::fs::create_dir_all(&worktree).unwrap();
+    std::fs::write(worktree.join("NOTES.md"), "关键结论：入口在 main()\n").unwrap();
+
+    let mut script = Script::new();
+    design_scripts(&mut script);
+    script
+        .for_node(Stage::Develop, Node::Execute)
+        .push(testkit::Step::Tool {
+            name: "spawn_sub_agent".into(),
+            arguments: serde_json::json!({"task": "读 NOTES.md 并总结入口"}),
+        });
+    // 子代理第 1 轮真实读一次，第 2 轮的模型调用**停住**——中止正打在这一轮上。
+    // 「停在第 2 轮」是个可辨读数：它证明叫停的是模型调用那个观察点，而不是别处。
+    script.push_subagent(testkit::Step::Tool {
+        name: "read_file".into(),
+        arguments: serde_json::json!({"path": "NOTES.md"}),
+    });
+    script.push_subagent(testkit::Step::Stall);
+
+    ctx.agent.set_script(script);
+    testkit::seed_task(&ctx.store, task_id, "p1").await.unwrap();
+    admit(&ctx, task_id).await;
+
+    // 执行体挪进后台任务（中止要打在它跑着的时候）。**部分移动**：`admit` 那类
+    // 整结构借用必须在这之前调完，之后只按字段用 `ctx`。
+    let executor = Arc::new(ctx.executor);
+    let jh = {
+        let e = executor.clone();
+        let id = task_id.to_string();
+        tokio::spawn(async move { e.run(&id).await })
+    };
+    // 等到子代理的第 2 轮请求已经发出（它此刻正停在 `Stall` 上，永不返回）。
+    tokio::time::timeout(Duration::from_secs(30), async {
+        loop {
+            let subs = ctx
+                .agent
+                .request_log()
+                .iter()
+                .filter(|r| r.run.as_ref().is_some_and(|c| c.agent_type == "subagent"))
+                .count();
+            if subs >= 2 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .expect("子代理应走到第 2 轮（就是停住的那次模型调用）");
+
+    let requested = if hold {
+        agentpipeline_core::pipeline::executor::request_hold(task_id)
+    } else {
+        agentpipeline_core::pipeline::executor::request_cancel(task_id)
+    };
+    assert!(requested, "在跑的执行体应当找得到，才谈得上通知它收口");
+    tokio::time::timeout(Duration::from_secs(30), jh)
+        .await
+        .expect("收到中止请求的执行体应当在有界时间内收口（子代理不得再跑满自己的预算）")
+        .unwrap()
+        .unwrap();
+
+    // ① 子代理自己的 run 行：中止**不是失败**（决策 226 的同一姿态），来路与轮号可读。
+    let sub = ctx
+        .store
+        .list_runs(task_id)
+        .await
+        .unwrap()
+        .into_iter()
+        .find(|r| r.agent_type == "subagent")
+        .expect("子代理应有自己的 run 行");
+    assert_eq!(
+        sub.status,
+        NodeStatus::Cancelled,
+        "被中止的子代理记 cancelled，不记 failed"
+    );
+    // 来路落 `cancel_origin` 列（判据读它，不读报文字样——决策 259/276 的同一口径）。
+    // 读模型（`NodeRun`）不暴露这一列，故直接问库。
+    let origin: Option<String> =
+        sqlx::query_scalar("SELECT cancel_origin FROM kanban_node_runs WHERE id = ?")
+            .bind(sub.id)
+            .fetch_one(ctx.store.pool())
+            .await
+            .unwrap();
+    let expected_origin = if hold {
+        agentpipeline_core::storage::observability::CANCEL_ORIGIN_HOLD
+    } else {
+        agentpipeline_core::storage::observability::CANCEL_ORIGIN_TIMEOUT
+    };
+    assert_eq!(
+        origin.as_deref(),
+        Some(expected_origin),
+        "来路落在 cancel_origin 列上"
+    );
+    let error = sub.error.clone().unwrap_or_default();
+    assert!(error.contains("第 2 轮"), "台账要读得出停在哪一轮：{error}");
+    let expected_word = if hold { "人工暂停" } else { "节点超时" };
+    assert!(error.contains(expected_word), "来路也写进 error：{error}");
+
+    // ② 回给父代理的回执标「未完成」——父转录里那一行就是它。
+    let transcript = ctx
+        .store
+        .latest_own_transcript(task_id, Stage::Develop, Node::Execute)
+        .await
+        .unwrap()
+        .expect("父节点的消息日志应当有行");
+    let receipt = transcript
+        .messages
+        .iter()
+        .filter_map(|m| m.content.as_deref())
+        .find(|c| c.contains("子代理被中止"))
+        .unwrap_or_else(|| panic!("父转录里应有子代理的中止回执"));
+    assert!(
+        receipt.contains("第 2 轮，未完成"),
+        "回执标「未完成」：{receipt}"
+    );
+
+    // ③ 父节点让路而不是失败：中止的落点归发出请求的那一方（决策 276）。
+    let parent = ctx
+        .store
+        .list_runs_at(task_id, Stage::Develop, Node::Execute)
+        .await
+        .unwrap()
+        .into_iter()
+        .find(|r| r.agent_type == "main")
+        .expect("父节点的 run 行");
+    assert_eq!(parent.status, NodeStatus::Cancelled, "父节点让路而非失败");
+    let cursors = ctx.store.load_live_cursors(task_id).await.unwrap();
+    assert!(
+        cursors.iter().all(|c| !c.is_pending()),
+        "中止不得把节点挂成 pending（那是失败才有的落点）"
+    );
+}
+
+/// 决策 409：**人按停要按得住子代理**。
+///
+/// 2026-10-08 的实证（任务 `01M4CD59`）：暂停请求 08:18:47 写下，子代理又跑了 80 秒
+/// ——它手里根本没有中止观察点，父节点那条轮边界检查管不到别人 await 着的工具调用。
+/// 这一条把三处一起钉住：**模型调用**上的观察点（`select!` 把它叫醒，不需要动
+/// `max_duration`）、子代理 run 行的记法（`cancelled` + 来路 `hold` + 停在第几轮）、
+/// 回给父代理的回执（标「未完成」）。
+#[tokio::test]
+async fn a_hold_stops_a_stalled_subagent_at_the_model_call() {
+    stalled_subagent_stops_with("t-stop", true).await;
+}
+
+/// 决策 409：**判超时**走同一条通道（`request_cancel` → `CancelOrigin::Timeout`）。
+///
+/// 来路不同、收口相同——只有 `cancel_origin` 那一列与 error 上的人话不同（决策 276
+/// 把两种来路分开记的理由：人按停是介入，判超时的中止是超时自己的副产品）。
+#[tokio::test]
+async fn a_timeout_cancel_stops_a_stalled_subagent_with_its_own_origin() {
+    stalled_subagent_stops_with("t-stop-t", false).await;
+}
+
 /// 验收（票 08 安全断言）：子代理的工具集**只有** `read_file` / `list_dir`。
 ///
 /// 这条是本票的安全边界：不是「子代理不调 run_command」，而是**它的工具定义里

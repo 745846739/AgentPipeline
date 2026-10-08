@@ -363,6 +363,73 @@ pub struct SubAgentRequest {
     pub task: String,
 }
 
+/// 子代理一次调用的**收场**（决策 409）。
+///
+/// 四个终局各有各的记法，不再挤成一个 `String`：挤成字符串的代价在 2026-10-08 的实证里
+/// （任务 `01M4CD59`）现过形——工具层分不出「未收口」与偶发失败，而同批刹车需要的正是
+/// 这个**类**（按报文字样分流是决策 259 明确不要走的路）。「被中止」单成一条的理由更硬：
+/// 它是「父节点按停，子代理不再跑满自己的预算」的落点，**不是失败**（决策 226 的同一姿态）。
+#[derive(Debug, Clone)]
+pub enum SubAgentEnd {
+    /// 正常收口：模型不再发起工具调用，回摘要。
+    Completed(String),
+    /// 轮数打满仍未收口（防御性上限：`[pipeline] sub_agent_max_rounds`）。
+    NotConverged { max_rounds: usize },
+    /// 墙钟超时（那次调用的 `max_duration` 就是节点级的 `node_max_duration_sec`）。
+    TimedOut { secs: u64 },
+    /// **被中止**：父节点收到人按停 / 判超时，子代理在下一个观察点收口，未完成。
+    Aborted {
+        origin: crate::pipeline::executor::CancelOrigin,
+        /// 收口时在第几轮（1 起）——台账里要读得出它停在哪。
+        round: usize,
+    },
+    /// 运行失败（LLM 报错一类**非**上两者）：台账记失败，回执点明「运行失败」。
+    Failed {
+        /// 原始错误串（进 run 行 `error`）。
+        detail: String,
+    },
+}
+
+impl SubAgentEnd {
+    /// 回给父代理的文本（工具回执口径）。四个终局各自要说的话只写一遍。
+    pub fn receipt(&self) -> String {
+        match self {
+            SubAgentEnd::Completed(summary) => summary.clone(),
+            SubAgentEnd::NotConverged { .. }
+            | SubAgentEnd::TimedOut { .. }
+            | SubAgentEnd::Failed { .. } => {
+                format!(
+                    "子代理运行失败：{}",
+                    self.ledger_error().unwrap_or_default()
+                )
+            }
+            SubAgentEnd::Aborted { origin, round } => format!(
+                "子代理被中止（第 {round} 轮，未完成）：父节点收到{}。这次子任务没有结论——\
+                 要接着做，请重新派一条更小的子任务。",
+                origin.as_str()
+            ),
+        }
+    }
+
+    /// 进 run 行 `error` 的一句（台账口径）。`Completed` 没有 error。
+    pub fn ledger_error(&self) -> Option<String> {
+        match self {
+            SubAgentEnd::Completed(_) => None,
+            SubAgentEnd::Failed { detail } => Some(detail.clone()),
+            SubAgentEnd::NotConverged { max_rounds } => Some(format!(
+                "校验错误：子代理在 {max_rounds} 轮内未收口（只有 read_file / list_dir / \
+                 search_content 三件只读工具）：请把子任务拆得更具体，或检索型子任务改由\
+                 你自己完成"
+            )),
+            SubAgentEnd::TimedOut { secs } => Some(format!("子代理超时（{secs}s）")),
+            SubAgentEnd::Aborted { origin, round } => Some(format!(
+                "子代理被中止（第 {round} 轮）：{}",
+                origin.as_str()
+            )),
+        }
+    }
+}
+
 /// 子代理执行接缝（决策 172③，票 08）。
 ///
 /// 与 [`CommandRecorder`] 同一种做法：工具层只声明「我需要一个能跑子代理的东西」，
@@ -372,7 +439,7 @@ pub struct SubAgentRequest {
 /// 没有注入实现时 `spawn_sub_agent` 不可用——这正是「默认关闭」的落点：能力由阶段
 /// 声明与 executor 接线共同决定，而不是由工具层假装支持。
 pub trait SubAgentRunner: Send + Sync + 'static {
-    fn run(&self, request: SubAgentRequest) -> BoxFuture<'static, Result<String>>;
+    fn run(&self, request: SubAgentRequest) -> BoxFuture<'static, Result<SubAgentEnd>>;
 }
 
 /// 工具调用上下文。
@@ -1272,12 +1339,14 @@ impl ToolExecutor {
                 "spawn_sub_agent 需要所属 run 上下文（当前调用没有 run_id），无法派生。",
             ));
         }
-        let summary = runner
+        // 收场是**类型**（决策 409）：四个终局各有各的文本，回执由它自己渲染——
+        // 工具层据此还能分出「未收口 / 超时」这一类（同批刹车要用，票 03）。
+        let end = runner
             .run(SubAgentRequest {
                 task: task.to_string(),
             })
             .await?;
-        Ok(ToolOutcome::ok(summary))
+        Ok(ToolOutcome::ok(end.receipt()))
     }
 
     async fn read_file(&self, call: &ToolCall, ctx: &ToolCallContext) -> Result<ToolOutcome> {
@@ -5495,9 +5564,60 @@ mod tests {
         fn run(
             &self,
             _request: SubAgentRequest,
-        ) -> futures::future::BoxFuture<'static, Result<String>> {
-            Box::pin(async { Ok("子代理摘要".to_string()) })
+        ) -> futures::future::BoxFuture<'static, Result<SubAgentEnd>> {
+            Box::pin(async { Ok(SubAgentEnd::Completed("子代理摘要".to_string())) })
         }
+    }
+
+    /// 决策 409：四个终局各有各的文本，措辞在这里钉死——「被中止」读起来**不是失败**
+    /// （回执点明第几轮、谁按的停），「未收口」指路「拆小重派」，「超时」指路「改道」。
+    ///
+    /// 它是父代理的读物、也是同批刹车（票 03）与人排查的读数：改措辞会同时改掉这三方
+    /// 看到的东西，故按句钉而不是按「含某个词」钉。
+    #[test]
+    fn sub_agent_end_renders_each_ending_distinctly() {
+        use crate::pipeline::executor::CancelOrigin;
+
+        let done = SubAgentEnd::Completed("摘要正文".into());
+        assert_eq!(done.receipt(), "摘要正文");
+        assert!(done.ledger_error().is_none(), "正常收口在台账里没有 error");
+
+        let aborted = SubAgentEnd::Aborted {
+            origin: CancelOrigin::Hold,
+            round: 3,
+        };
+        assert_eq!(
+            aborted.receipt(),
+            "子代理被中止（第 3 轮，未完成）：父节点收到人工暂停 / 重跑。这次子任务没有\
+             结论——要接着做，请重新派一条更小的子任务。"
+        );
+        assert_eq!(
+            aborted.ledger_error().as_deref(),
+            Some("子代理被中止（第 3 轮）：人工暂停 / 重跑"),
+            "台账那句只留轮号与来路（回执才带给父代理的话）"
+        );
+
+        let capped = SubAgentEnd::NotConverged { max_rounds: 7 };
+        assert_eq!(
+            capped.receipt(),
+            "子代理运行失败：校验错误：子代理在 7 轮内未收口（只有 read_file / list_dir / \
+             search_content 三件只读工具）：请把子任务拆得更具体，或检索型子任务改由你自己完成",
+            "报数跟着配置走（决策 407），不再写死 12"
+        );
+
+        let timed = SubAgentEnd::TimedOut { secs: 600 };
+        assert_eq!(
+            timed.receipt(),
+            "子代理运行失败：子代理超时（600s）",
+            "超时也走「失败」那条文本通道（决策 172③：不烧 tool_retry_max）"
+        );
+        assert_eq!(timed.ledger_error().as_deref(), Some("子代理超时（600s）"));
+
+        let failed = SubAgentEnd::Failed {
+            detail: "连接被重置".into(),
+        };
+        assert_eq!(failed.receipt(), "子代理运行失败：连接被重置");
+        assert_eq!(failed.ledger_error().as_deref(), Some("连接被重置"));
     }
 
     #[test]

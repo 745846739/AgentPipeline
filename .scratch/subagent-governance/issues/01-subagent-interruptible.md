@@ -27,10 +27,15 @@
 
 **Blocked by:** None
 
-**Status:** ready-for-agent
+**Status:** done
 
-- [ ] 用例：按停 → 在飞的子代理在**下一个观察点**收口（不跑满轮数），run 行
+- [x] 用例：按停 → 在飞的子代理在**下一个观察点**收口（不跑满轮数），run 行
   `cancelled` + `cancel_origin=hold`，父代理拿到「未完成」回执
-- [ ] 用例：判超时（`CancelOrigin::Timeout`）同一条通道，`cancel_origin=timeout`
-- [ ] 用例：子代理的模型调用挂住时，按停能在**不动 max_duration** 的前提下把它叫停
-- [ ] 用例：无事发生时子代理行为逐字不变（正常摘要 / 未收口 / 超时三条既有语义不漂）
+  （`executor.rs::a_hold_stops_a_stalled_subagent_at_the_model_call`）
+- [x] 用例：判超时（`CancelOrigin::Timeout`）同一条通道，`cancel_origin=timeout`
+  （`executor.rs::a_timeout_cancel_stops_a_stalled_subagent_with_its_own_origin`）
+- [x] 用例：子代理的模型调用挂住时，按停能在**不动 max_duration** 的前提下把它叫停
+  （同上两条：`Step::Stall` 停在第 2 轮，`max_duration` 吃缺省 1800s）
+- [x] 用例：无事发生时子代理行为逐字不变（正常摘要 / 未收口 / 超时三条既有语义不漂
+  ——既有七条 L2 用例一字未改仍绿；四终局的回执 / 台账文本另由
+  `tools.rs::sub_agent_end_renders_each_ending_distinctly` 逐句钉住）

@@ -3127,3 +3127,20 @@ config.rs}`、`tests/e2e/tests/integration/stage_boundary.rs`、`docs/testing.md
 **验证**：L1 `subagent.rs::deny_mode_takes_the_search_tool_away_from_the_subagent`（Auto / Ask 三件全在；`deny` 下检索同收）；L2 `executor.rs::subagent_tool_set_is_read_only`（工具集恰为三件 + 检索广告非空壳、schema 要求 `pattern`）、`subagent_can_search_the_worktree_with_search_content`（**真执行**：命中带「相对路径 + 行文本」进转录、子代理 run 行成功）、`subagent_does_not_inherit_declared_tools`（阶段声明扩不了权，跟着改成三件）；既有 `search.rs` 九条与子代理六条一字未改仍绿（值班长那条链的域规则、限幅、档位豁免全部不变）。
 
 **来源**：`.scratch/subagent-governance/issues/02`；落地 `crates/core/src/agent/{catalog.rs, tools.rs}`、`crates/core/src/pipeline/{subagent.rs, foreman/catalog.rs}`
+
+### 决策 409 · 子代理可被中止：三个观察点 + 类型化收场 `SubAgentEnd`（中止记 `cancelled` + 来路，不是失败）
+
+**起因**：2026-10-08 监控任务 `01M4CD59Y977ZQ0GMY9MPSFFMX` 的实证——**按停按不住子代理**。08:18:47 暂停请求写下，在飞的子代理 #2 照跑完；**按停之后又整整跑完一个子代理 #3**（08:19:10→08:20:30，80 秒），执行体直到 08:20:30.220 才在轮边界收口让出执行权——**按停延迟 1 分 43 秒**。机制上不难看清：`pause` 只置信号，执行体在**轮边界**看一眼（`held_by_human_signal`），模型调用处还有一个 `select!` 观察点（决策 226）；而子代理这一侧**完全不看**——`SubAgentRunnerConfig` 里没有任何中止句柄，`run_rounds` 里没有打断点，它的模型调用是裸的 `llm.complete()`（连决策 226 那个观察点都不走）。那 80 秒全花在「一遍遍读文件、每轮之间只隔一次模型调用」上。
+
+**裁决**：
+
+1. **中止句柄随 cfg 走**：`SubAgentRunnerConfig.cancel: Option<CancelSignal>`——与父节点手里的是**同一份**（`CancelSignal` 是 `Arc` 三件套，克隆进 cfg 即可），`model_invoke.rs` 的构造点传 `cancel.cloned()`。`None` 只在没有执行体上下文的构造里出现（测试替身）。
+2. **三个观察点**：① `run_rounds` 每轮开头（同 `model_invoke` 的姿势，拦「信号在两轮之间到达」与「已请求中止却又进了一轮」）；② 子代理的**模型调用**用 `select!` 等信号（同决策 226 的姿势）——那次实测里最长的一段就停在这儿（`idle_timeout_sec: None` + 持续给父 run 打心跳，只有 `max_duration`（缺省 1800s）收得住）；③ 一轮内部**每个工具调用之间**。批内打断**安全的前提写进注释**：子代理的工具集全是只读（`SUB_AGENT_TOOLS`），批内收口不留半写状态——将来若有人往这里加写工具，这条得先重新论证。父节点那一侧**不动**：它的工具批保持原子（决策 226 的姿态），轮边界照旧让位。
+3. **终局类型化**：新增 `SubAgentEnd`（完成 / 未收口 / 超时 / 被中止），`SubAgentRunner::run` 返回它，`spawn_sub_agent` 渲染 `end.receipt()`。这不是风格问题——四个终局此前挤在一个 `String` 里、**类别丢失**，而同批刹车（票 03）要判的正是这个类（按报文字样分流是决策 259 明确不要走的路）；而且 `Err` 通道承担不起这四个：进了 `Err` 就等于「父代理的工具失败」，要烧 `tool_retry_max`（决策 172③ 的既有口径）——「未收口」要的是拆小，「被中止」要的是别再消耗。
+4. **中止的记法**（与主节点同口径，决策 276）：子代理 run 行 `status = cancelled` + `cancel_origin`（`hold` / `timeout`），error 写「子代理被中止（第 N 轮）：<来路>」；回给父代理的回执标「未完成」（「子代理被中止（第 N 轮，未完成）：父节点收到…。这次子任务没有结论——要接着做，请重新派一条更小的子任务」）。**轮号进台账**：读得出它停在哪一轮。
+5. **收口顺序不变**：会话行与 run 行照落（票 02 的既有口径），token 记在子代理自己的 run 行上（决策 100）——中止只改终态与文案，不改记账路径。
+6. **不做硬中止**（边界如实记，与决策 226 同一条）：信号只在 await 点生效——子代理停在不返回的**阻塞**调用里时，仍要等它的 `max_duration`。本决策修的是「按停之后还跑了 80 秒」这一种，不是「一切都能立刻停」。
+
+**验证**：L2 `executor.rs::a_hold_stops_a_stalled_subagent_at_the_model_call`（子代理第 1 轮真读、第 2 轮模型调用挂住 → `request_hold` → 子代理 run 行 `cancelled` + `cancel_origin='hold'` + error 报「第 2 轮」与「人工暂停」；父转录里的回执标「第 2 轮，未完成」；父 run 行 `cancelled` 让路、无 pending）与 `a_timeout_cancel_stops_a_stalled_subagent_with_its_own_origin`（`request_cancel` 走同一条通道 → `cancel_origin='timeout'`）；L1 `tools.rs::sub_agent_end_renders_each_ending_distinctly`（四终局文本逐句钉住）；既有七条子代理 L2 用例一字未改仍绿（正常摘要 / 未收口 / 超时 / 只读集 / 不继承 / 单次记账 / 父子归属）。
+
+**来源**：`.scratch/subagent-governance/issues/01`；落地 `crates/core/src/pipeline/{subagent.rs, model_invoke.rs}`、`crates/core/src/agent/tools.rs`、`crates/core/tests/integration/executor.rs`

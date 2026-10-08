@@ -1029,6 +1029,10 @@ impl ModelInvoke {
                         max_tokens: stage_cfg.as_ref().and_then(|c| c.max_tokens),
                         env_mode,
                         max_duration: std::time::Duration::from_secs(max_duration),
+                        // 父节点那一份中止观察点（决策 409）：人按停 / 判超时不再只作用在
+                        // 父轮边界上——子代理自己也能在下一个观察点收口（2026-10-08 实证：
+                        // 按停后子代理又跑了 80 秒，任务 01M4CD59）。
+                        cancel: cancel.cloned(),
                     },
                 )) as Arc<dyn crate::agent::SubAgentRunner>
             });

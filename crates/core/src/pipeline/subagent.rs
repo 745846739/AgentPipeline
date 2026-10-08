@@ -5,7 +5,7 @@
 //! 这批以子代理为前提的技能真正跑起来。
 //!
 //! **安全边界在本模块**（不是工具层）：子代理的工具集**硬编码为只读**——
-//! [`SUB_AGENT_TOOLS`] 只有 `read_file` / `list_dir`。三条硬约束：
+//! [`SUB_AGENT_TOOLS`] 那三件（`read_file` / `list_dir` / `search_content`）。三条硬约束：
 //!
 //! 1. **不继承阶段声明的工具**：父节点声明了 `run_command` 也不会传给子代理，
 //!    阶段配置因此无法给子代理扩权。工具集不从父节点**推导**，而是常量。
@@ -27,7 +27,9 @@ use futures::future::BoxFuture;
 
 use crate::agent::client::{AgentResponse, LlmClient, LlmRequest, Message, ToolDef};
 use crate::agent::prompts::{build_system_prompt, load_agents_context};
-use crate::agent::tools::{SubAgentRequest, SubAgentRunner, ToolCallContext, ToolExecutor};
+use crate::agent::tools::{
+    SubAgentEnd, SubAgentRequest, SubAgentRunner, ToolCallContext, ToolExecutor,
+};
 use crate::config::Settings;
 use crate::home::Home;
 use crate::process::ProcessKiller;
@@ -151,6 +153,13 @@ pub struct SubAgentRunnerConfig {
     pub env_mode: crate::types::EnvMode,
     /// 本次调用的上限（票 08：沿用节点级 `node_max_duration_sec`）。
     pub max_duration: Duration,
+    /// **父节点那一份中止观察点**（决策 409）：与 `model_invoke` 手里的是同一个信号
+    /// （`CancelSignal` 是 Arc 三件套，克隆进 cfg 即可）。子代理在三个观察点各看一眼
+    /// ——每轮开头、模型调用、工具批之间——被请求中止就提前收口，不再跑满自己的预算。
+    ///
+    /// 这就是 2026-10-08 那次「按停按不住子代理」的补丁：按停后子代理又跑了 80 秒
+    /// （任务 01M4CD59）。`None` 只在没有执行体上下文的构造里出现（测试替身等）。
+    pub(crate) cancel: Option<crate::pipeline::executor::CancelSignal>,
 }
 
 /// 一次 agent 调用的 token 计量（决策 46：prompt / completion / cache 落 run 行）。
@@ -217,7 +226,7 @@ impl StoreSubAgentRunner {
 }
 
 impl SubAgentRunner for StoreSubAgentRunner {
-    fn run(&self, request: SubAgentRequest) -> BoxFuture<'static, Result<String>> {
+    fn run(&self, request: SubAgentRequest) -> BoxFuture<'static, Result<SubAgentEnd>> {
         // future 是 `'static` 的，只能**拥有**自己需要的一切，不能借用 `&self`。
         // 因此克隆一份运行器进 future；`run_loop` 借用的是这个局部所有权，合法。
         let runner = StoreSubAgentRunner {
@@ -327,41 +336,46 @@ impl SubAgentRunner for StoreSubAgentRunner {
             .await;
 
             let tokens_now = *session.tokens.lock().unwrap();
-            let (summary, status, error) = match outcome {
+            let end = match outcome {
                 // 外层超时（票 08：节点级 max_duration 就是该次调用的上限）。
                 // **不返回 `Err`**：`Err` 会被父代理算作工具失败并累计 `tool_retry_max`，
                 // 重试同一个慢检索没有意义——把「超时」当文本交回去，让模型拆小或改道。
-                Err(_) => (
-                    format!(
-                        "子代理超时（{}s）：这次检索没能在时限内完成。\
-                         请把子任务拆得更具体，或改用 read_file / list_dir 自己查。",
-                        cfg.max_duration.as_secs()
-                    ),
-                    NodeStatus::Timeout,
-                    Some(format!("子代理超时（{}s）", cfg.max_duration.as_secs())),
-                ),
-                Ok(Err(e)) => {
-                    let text = format!("子代理运行失败：{e}");
-                    // 即使失败也落会话行与 run 行：失败的子代理「读了什么」同样要可复盘，
-                    // 否则一次失败会留下一个无法解释的 token 空洞。
-                    finish_run(
-                        &cfg.store,
-                        run_id,
-                        started,
-                        NodeStatus::Failed,
-                        Some(e.to_string()),
-                        tokens_now,
-                    )
-                    .await?;
-                    write_conversation(cfg, &session, tokens_now).await?;
-                    return Ok(text);
-                }
-                Ok(Ok(summary)) => (summary, NodeStatus::Success, None),
+                Err(_) => SubAgentEnd::TimedOut {
+                    secs: cfg.max_duration.as_secs(),
+                },
+                // 真失败（LLM 报错等）：台账记失败，文本同样走「交回父代理」那条路。
+                Ok(Err(e)) => SubAgentEnd::Failed {
+                    detail: e.to_string(),
+                },
+                Ok(Ok(end)) => end,
             };
 
-            finish_run(&cfg.store, run_id, started, status, error, tokens_now).await?;
+            // 收场与台账**一一对应**（决策 409）：「被中止」记 `cancelled` + 来路，
+            // 与主节点同一口径（决策 276）——它是父节点按停的余波，**不是**子代理失败。
+            let status = match &end {
+                SubAgentEnd::Completed(_) => NodeStatus::Success,
+                SubAgentEnd::NotConverged { .. } | SubAgentEnd::Failed { .. } => NodeStatus::Failed,
+                SubAgentEnd::TimedOut { .. } => NodeStatus::Timeout,
+                SubAgentEnd::Aborted { .. } => NodeStatus::Cancelled,
+            };
+            let cancel_origin = match &end {
+                SubAgentEnd::Aborted { origin, .. } => Some(origin.as_slug()),
+                _ => None,
+            };
+            // 即使失败 / 被中止也落会话行与 run 行：子代理「读了什么」同样要可复盘，
+            // 否则一次失败会留下一个无法解释的 token 空洞（票 02 的既有口径）。
+            finish_run(
+                &cfg.store,
+                run_id,
+                started,
+                status,
+                end.ledger_error(),
+                cancel_origin,
+                tokens_now,
+            )
+            .await?;
             write_conversation(cfg, &session, tokens_now).await?;
-            Ok(summary)
+            Ok(end)
         })
     }
 }
@@ -387,9 +401,11 @@ struct SubAgentSession {
 impl StoreSubAgentRunner {
     /// 子代理的对话循环：LLM 调用 → 只读工具执行 → 累积，直到模型不再发起 tool_call。
     ///
-    /// 返回摘要文本。轮数耗尽时返回 `Err`——它会被上层转成给父代理看的文本，而不是
-    /// 烧掉 `tool_retry_max`。
-    async fn run_loop(&self, session: &mut SubAgentSession, task: &str) -> Result<String> {
+    /// 出口是 [`SubAgentEnd`]（决策 409）：正常收口 / 未收口 / 超时 / 被中止全都走
+    /// `Ok`——**只有真故障才 `Err`**。这不是风格问题：`Err` 会被父代理算作工具失败并
+    /// 累计 `tool_retry_max`，而「未收口」要的是「拆小重派」，「被中止」要的是「别再
+    /// 消耗」。上层把 `end.receipt()` 原样回给父代理。
+    async fn run_loop(&self, session: &mut SubAgentSession, task: &str) -> Result<SubAgentEnd> {
         session.transcript.push(Message::user(task.to_string()));
         // 运行期间持续给**父 run** 打心跳：单次 LLM 调用可能长过 node_idle_timeout_sec，
         // 只在每轮响应后打会在那段时间留下空窗，父节点被误判超时（票 08）。
@@ -402,9 +418,17 @@ impl StoreSubAgentRunner {
         result
     }
 
-    async fn run_rounds(&self, session: &mut SubAgentSession) -> Result<String> {
+    /// 轮循环本体。三个中止观察点（决策 409）都在这里——每轮开头、模型调用、工具批之内。
+    async fn run_rounds(&self, session: &mut SubAgentSession) -> Result<SubAgentEnd> {
         let max_rounds = effective_max_rounds(&self.cfg.settings);
-        for _ in 0..max_rounds {
+        let cancel = self.cfg.cancel.as_ref();
+        // 轮号 1 起（进 `Aborted.round` / run 行 error）：台账里要读得出它停在哪一轮。
+        for round in 1..=max_rounds {
+            // 观察点①（决策 409）：每轮开头，与 `model_invoke` 同一种姿势。拦的是
+            // 「信号在两轮之间到达」与「已请求中止却又进了一轮」两种情形。
+            if let Some(signal) = cancel.filter(|s| s.is_requested()) {
+                return Ok(aborted(signal, round));
+            }
             let req = LlmRequest {
                 stage: self.cfg.stage,
                 node: self.cfg.node,
@@ -428,7 +452,15 @@ impl StoreSubAgentRunner {
                 }),
                 idle_timeout_sec: None,
             };
-            let response = self.cfg.llm.complete(req).await?;
+            // 观察点②（决策 409）：模型调用用 `select!` 等信号（决策 226 的姿势）。
+            // 子代理一次检索型调用可能长过人的耐心，而它正是最容易无限期停住的地方。
+            let response = match cancel {
+                Some(signal) => tokio::select! {
+                    r = self.cfg.llm.complete(req) => r?,
+                    _ = signal.wait() => return Ok(aborted(signal, round)),
+                },
+                None => self.cfg.llm.complete(req).await?,
+            };
             session.tokens.lock().unwrap().add(&response);
             if let Some(text) = response.reasoning.as_deref().filter(|t| !t.is_empty()) {
                 if !session.reasoning.is_empty() {
@@ -448,12 +480,25 @@ impl StoreSubAgentRunner {
             ));
 
             if response.tool_calls.is_empty() {
-                return response
-                    .content
-                    .filter(|s| !s.trim().is_empty())
-                    .ok_or_else(|| Error::Validation("子代理返回了空摘要".into()));
+                return Ok(SubAgentEnd::Completed(
+                    response
+                        .content
+                        .filter(|s| !s.trim().is_empty())
+                        .ok_or_else(|| Error::Validation("子代理返回了空摘要".into()))?,
+                ));
             }
             for call in &response.tool_calls {
+                // 观察点③（决策 409）：批内每个工具调用之间。子代理的工具集**全是只读**
+                // （[`SUB_AGENT_TOOLS`]），批内收口不留半写状态——这正是「批内也能打断」
+                // 成立的前提，将来若有人往这里加写工具，这条就得先重新论证。
+                //
+                // 批内看一眼是必要的：2026-10-08 的实证里，一次 `spawn_sub_agent` 之后
+                // 子代理又跑了 80 秒（任务 01M4CD59），而那 80 秒全花在「一遍遍读文件、
+                // 每轮之间只隔一次模型调用」上。只有轮开头的检查时，「停」要等下一轮
+                // 模型调用返回才生效。
+                if let Some(signal) = cancel.filter(|s| s.is_requested()) {
+                    return Ok(aborted(signal, round));
+                }
                 match session.tools.execute(call, &session.ctx).await {
                     Ok(outcome) => session
                         .transcript
@@ -466,10 +511,15 @@ impl StoreSubAgentRunner {
                 }
             }
         }
-        Err(Error::Validation(format!(
-            "子代理在 {max_rounds} 轮内未收口（只有 read_file / list_dir / search_content \
-             三件只读工具）：请把子任务拆得更具体，或检索型子任务改由你自己完成"
-        )))
+        Ok(SubAgentEnd::NotConverged { max_rounds })
+    }
+}
+
+/// 中止收口（决策 409）：三个观察点共用这一处——来路从信号上读，绝不猜。
+fn aborted(signal: &crate::pipeline::executor::CancelSignal, round: usize) -> SubAgentEnd {
+    SubAgentEnd::Aborted {
+        origin: signal.origin(),
+        round,
     }
 }
 
@@ -499,6 +549,9 @@ async fn finish_run(
     started: Instant,
     status: NodeStatus,
     error: Option<String>,
+    // 中止来路（决策 409）：只在 `status = cancelled` 时有值——「人按停」与「判超时」
+    // 在这一列上分开记（与主节点同一口径，`observability::CANCEL_ORIGIN_*`）。
+    cancel_origin: Option<&'static str>,
     tokens: RunTokens,
 ) -> Result<()> {
     store
@@ -512,6 +565,7 @@ async fn finish_run(
                 cache_write_tokens: tokens.cache_write,
                 duration_ms: started.elapsed().as_millis() as u64,
                 error,
+                cancel_origin,
                 ..Default::default()
             },
         )
