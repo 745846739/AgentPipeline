@@ -342,6 +342,11 @@
     max-width: var(--detail-max);
     height: 168px;
     padding: 6px 0 0;
+    /* 票 18 / 决策 215（2026-10-01 起按用户指示落地「有意不做」项）：hero 轨道固定
+       812px，从约 830px 起把整页撑出横向滚动。改为**容器内横滚**——不裁切（站点坐标
+       写死在 lib/pipeline.ts，裁掉等于「后面的工位不存在」），滚动只发生在本容器，
+       不传给文档；`.rail.spine` 的裁切语义不动。 */
+    overflow-x: auto;
   }
   /* hero 站灯排在顶行、链节带在其下（冻结原型 #v-run .hrail 的层级） */
   .rail.hero .railline {

@@ -43,6 +43,10 @@ describe('DiffReviewPanel（决策 23 / 119）', () => {
       props: { diff: null, raw: null, actions: mergeActions, cursors, onaction },
     });
     await fireEvent.click(screen.getByRole('button', { name: '合入' }));
+    // 决策 216②：合入是 destructive —— 第一颗只亮后果句，第二颗才真提交
+    expect(onaction).not.toHaveBeenCalled();
+    expect(screen.getByText('确认合入？')).toBeTruthy();
+    await fireEvent.click(screen.getByRole('button', { name: '合入' }));
     expect(onaction).toHaveBeenCalledWith(mergeActions[0], { cursorId: 'c-merge', push: false });
   });
 
@@ -52,6 +56,7 @@ describe('DiffReviewPanel（决策 23 / 119）', () => {
       props: { diff: null, raw: null, actions: mergeActions, cursors, onaction },
     });
     await fireEvent.click(screen.getByLabelText('合入后 push 到远端'));
+    await fireEvent.click(screen.getByRole('button', { name: '合入' }));
     await fireEvent.click(screen.getByRole('button', { name: '合入' }));
     expect(onaction).toHaveBeenCalledWith(mergeActions[0], { cursorId: 'c-merge', push: true });
   });

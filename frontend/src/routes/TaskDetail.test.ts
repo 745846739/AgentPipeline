@@ -157,6 +157,15 @@ beforeAll(() => {
 afterEach(() => {
   vi.clearAllMocks();
   document.body.innerHTML = '';
+  // `?tab=` 落地后（决策 217）页签会写进地址，而 jsdom 的 URL 跨用例共享：不清就等于
+  // 把上一条用例的页签带进下一条（页签 / 档案盒断言全体跑偏）。这里连 `?run=` 一起抹平。
+  const base = window.location.hash.split('?')[0];
+  window.history.replaceState(
+    null,
+    '',
+    `${window.location.pathname}${window.location.search}${base}`,
+  );
+  router.hash = base;
 });
 
 describe('任务详情 · 档案盒与 Diff 页签不同时摆两份 diff（票 08）', () => {
@@ -428,8 +437,9 @@ describe('任务详情 · 通知深链 `?run=`（pwa-webpush 票 02/03）', () =
     armDeepLink('#/task/task-1?run=42');
     render(TaskDetail, { props: { id: 'task-1' } });
 
-    expect(window.location.hash).toBe('#/task/task-1');
-    expect(router.route).toEqual({ name: 'task', id: 'task-1', query: {} });
+    // `run` 没了；页签直达现场这一步按决策 217④ 留在地址里（刷新照地址恢复）
+    expect(window.location.hash).toBe('#/task/task-1?tab=scene');
+    expect(router.route).toEqual({ name: 'task', id: 'task-1', query: { tab: 'scene' } });
   });
 
   it('没有这个参数时一动不动：默认落时间线，也不去取哪一轮会话', () => {

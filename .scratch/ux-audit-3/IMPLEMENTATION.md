@@ -35,15 +35,23 @@ cd frontend && UX_AUDIT3=1 AGENTPIPELINE_E2E_BIN=/root/.agentpipeline/shared-tar
 
 ## 逐票记录（一票一节：结论 + 依据 + 差异）
 
-### 票 01 · 详情页 480–819 中间档折行与 hero 溢出 —— **维持 wontfix（有意不做），无回归**
+### 票 01 · 详情页 480–819 中间档折行与 hero 溢出 —— **已落地（2026-10-01 用户裁决推翻 wontfix）**
 
-- **依据（复跑 ①.1 逐格同值）:** 溢出列 `820→12、768→64、600→232、520→312、480→352`
+- **落码（2026-10-01 本轮）:**
+  - `frontend/src/components/pipeline/PipelineRail.svelte:340-350` — `.rail.hero` 加
+    `overflow-x: auto`：**容器内横滚**，不裁切（站点坐标写死在 `lib/pipeline.ts`，
+    裁掉等于「后面的工位不存在」）、不传给文档；`.rail.spine` 的裁切语义一字不动（决策 215③）。
+  - `frontend/src/routes/TaskDetail.svelte:725-728` — `@media (min-width: 480px) and
+    (max-width: 819px) { .detail.split { display: block } }`：主栏拿满容器宽（原
+    `minmax(0,1fr) 320px` 在 480px 只剩 102px 那个洞），档案盒按 DOM 顺序落到主栏下方，
+    sticky 与动作行照旧（决策 215①「`<820px` 折成一列」）；≤479 的移动款形态一字不动。
+- **审计当轮读数（原证保留）:** 溢出列 `820→12、768→64、600→232、520→312、480→352`
   与票面完全同值；hero 轨道 `scrollWidth=812 / overflowX=visible` 同值；480 档
-  `main=102`（票面记的 102px 洞）同值；`768/600/520/480` 列串仍 `…px 320px` 同值。
+  `main=102`（票面记的 102px 洞）同值。
 - **截图:** `r3-detail-768.png`、`r3-detail-480.png`（复跑现生成，与票面同探针）。
-- **差异:** 唯一有意变化是 `900 / 820` 两格的 grid 列串（归票 13，见文末差异清单）；
-  wontfix 面的每一格证据原样保住——`min-width: 820` 钉下界 + `ux2-geometry` 新用例
-  断言 `819 → 320px` 双保险。
+- **差异:** 票面（`.scratch/ux-audit-3/issues/01-*.md`）冻结在审计当轮的「有意不做」，
+  一字未改（`FROZEN` 守着），本节是落地记档；`ux2-geometry.spec.ts` 的
+  「819 仍是 320px」双保险随之改为断言 819 走单列档。
 
 ### 票 02 · 对讲台中间档折行（已修） —— **复核即关**
 
@@ -52,24 +60,53 @@ cd frontend && UX_AUDIT3=1 AGENTPIPELINE_E2E_BIN=/root/.agentpipeline/shared-tar
 - **截图:** `r3-talk-768.png`、`r3-talk-480.png`。
 - **差异:** 无（对讲台侧本轮零代码改动）。
 
-### 票 03 · 破坏性动作无确认步（wontfix） —— **维持 wontfix，不重开**
+### 票 03 · 破坏性动作无确认步 —— **已落地（2026-10-01 用户裁决推翻 wontfix）**
 
-- **依据（复跑 ②.1 / ②.2）:** 点击前 `bodyHasConfirm=false`（按钮 `返回修改 / 合入`）；
-  **第一次点击后** `bodyHasConfirm=false、confirmTexts=[]、buttons=[]`——仍直接提交、
-  无确认步，与票面同值；`②.2 终止任务按钮 found=false`（票面即为「量级一处未验证」，
-  现状未变，不据此重开）。
+- **落码（2026-10-01 本轮）:**
+  - `frontend/src/lib/actions.ts:117` — `actionTier(action, pendingType)` 四档纯函数
+    （`advance` / `gate-skip` / `destructive` / `quiet`，按判据不靠标签文字匹配）+
+    `confirmSentence()` 后果句逐条（决策 216①③：`确认合入到 …？` / `确认终止？…` /
+    `确认重置？…` / `确认跳过评审闸门？`）。判据张力按①与⑥末句互斥律收口：`merge` 归
+    `destructive`（不取⑥「推进=实心」的举例）。
+  - `frontend/src/components/board/PendingActions.svelte` — 三档量级类（`btn solid` /
+    `btn gate` / `btn danger` / `btn quiet`，量级样式全站 `app.css` 一处）+ 内联两步确认
+    （第一颗只亮后果句、同一颗再点才提交）、Escape 退回、焦点不移动、动作集换了清确认态
+    （决策 216②④⑥）。
+  - `frontend/src/components/task/DiffReviewPanel.svelte` — 合入 approve 走同口径两步确认
+    （`destructive` 红描边 + 后果句），`return` 落 `quiet`；「合入后 push」随第二颗提交。
+  - `frontend/src/components/task/ReviewForm.svelte` — 打回落 `quiet`，通过为 `advance`
+    实心无确认步。
+- **审计当轮读数（原证保留）:** 点击前 `bodyHasConfirm=false`；**第一次点击后**仍直接提交、
+  无确认步——与票面同值（当轮为「有意不做」）；`②.2 终止任务按钮 found=false` 同值。
 - **截图:** `r3-merge-first-click.png`。
-- **差异:** 无。
+- **差异:** 票面（`.scratch/ux-audit-3/issues/03-*.md`）冻结在审计当轮的「有意不做」，
+  一字未改（`FROZEN` 守着），本节是落地记档；`终止任务` 的红描边量级由 `.btn.danger` 给出
+  （原「量级一处未验证」随本轮补上）。
 
-### 票 04 · 中流状态持久化余三件（wontfix） —— **维持 wontfix，不重开**
+### 票 04 · 中流状态持久化余三件 —— **已落地（2026-10-01 用户裁决推翻 wontfix）**
 
-- **依据（复跑 ③.1–③.3 全部不存活，与票面同值）:**
-  ③.1 页签 `Diff → 时间线`（hash 同值）；③.2 过滤 `已完成 0 → 全部 1`（hash 同值）；
-  ③.3 草稿 `survived=false、afterValue=""`；三处 localStorage 键集合均同值
-  （`agentpipeline.theme` / `agentpipeline.talk_seen`，无 `talk_draft` 键出现）。
+- **落码（2026-10-01 本轮）:**
+  - **详情页签 `?tab=`** — `frontend/src/routes/TaskDetail.svelte:44-75`：`tabFromQuery()`
+    从地址读（枚举外回落 `timeline`）、`userTab()` 走 `pushState`（用户点页签 / 方向键）、
+    `programTab()` 走 `replaceState`（深链 `?run=` 直达现场、档案盒「去看对话」、打开产出文件）、
+    另有一个 `$effect` 让后退 / 前进照地址恢复并抹掉脏值；缺省 `timeline` 不写进地址（决策 217②③④）。
+  - **看板过滤 `?filter=` + `agentpipeline.board_filter`** — `frontend/src/stores/board.svelte.ts:34-80`
+    （`FILTER_KEY` / `isStatusFilter` / `storedFilter` / `saveFilter` / `initialFilter()`：
+    地址 → 本地 → 缺省，脏值就地删键）与 `:219-250`（`setFilter` 写地址 + 本地，
+    `syncFilterFromQuery` 供后退 / 前进照地址恢复且不回写地址）；接线在
+    `frontend/src/routes/Board.svelte` 的 `$effect`（决策 217①④⑤）。
+  - **输入草稿 `agentpipeline.talk_draft`** — 新文件 `frontend/src/lib/talkDraft.ts`
+    （JSON `{sessionId, text, at}`、7 天过期、形状不对 / JSON 坏就地删键，存储不可用不抛）
+    + 单测 `frontend/src/lib/talkDraft.test.ts`（恢复 / 清零 / 7 天过期 / 脏键 / 存储不可用七例）；
+    `frontend/src/routes/Talk.svelte` 装载回填（只认当前这班、框里有字不覆盖）、打字即存、
+    清空即删——`send()` 清空输入那一趟当场把键删掉，失败回填的那句跟着下一次敲击存回去（决策 217⑤）。
+- **审计当轮读数（原证保留）:** ③.1 页签 `Diff → 时间线`（hash 同值）；③.2 过滤
+  `已完成 0 → 全部 1`（hash 同值）；③.3 草稿 `survived=false、afterValue=""`；三处
+  localStorage 键集合均无 `talk_draft`。
 - **截图:** `r3-tab-after-reload.png`、`r3-board-filter-after-reload.png`、
   `r3-talk-draft-after-reload.png`。
-- **差异:** 无。
+- **差异:** 票面（`.scratch/ux-audit-3/issues/04-*.md`）冻结在审计当轮的「未落 / 有意不做」，
+  一字未改（`FROZEN` 守着），本节是落地记档。
 
 ### 票 05 · toast 的 Escape 键盘关闭路径 —— **关（动代码）**
 

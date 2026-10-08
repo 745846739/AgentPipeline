@@ -14,7 +14,7 @@
   import EmptyState from '../components/ui/EmptyState.svelte';
   import { buildHeroStations, formatDuration, formatTokens, pendingLabel, statusCode } from '../lib/pipeline';
   import { stewardshipFace, toggleStewardship } from '../lib/stewardship';
-  import { router, writeQuery } from '../router.svelte';
+  import { readQuery, router, writeQuery } from '../router.svelte';
   import { taskDetail } from '../stores/taskDetail.svelte';
 
   interface Props {
@@ -37,7 +37,43 @@
     files: '产出文件',
     diff: 'Diff',
   };
-  let tab = $state<Tab>('timeline');
+  /**
+   * 页签进地址（决策 217①②④；2026-10-01 用户指示落地原 wontfix 项「中流状态持久化」）。
+   * `?tab=` 是短枚举，缺省 `timeline` **不写进地址**（`#/task/{id}` 与 `?tab=timeline` 等价，
+   * 老地址照旧）；枚举外的脏值回落缺省，并由下面的同步效果顺手把参数抹掉。
+   */
+  function tabFromQuery(raw: string | undefined): Tab {
+    return TAB_ORDER.includes(raw as Tab) ? (raw as Tab) : 'timeline';
+  }
+  let tab = $state<Tab>(tabFromQuery(readQuery().tab));
+  /** 用户点页签 / 方向键翻页签 = `pushState`——后退回到上一个页签正是想要的（决策 217③）。 */
+  function userTab(next: Tab): void {
+    tab = next;
+    writeQuery({ tab: next === 'timeline' ? null : next });
+  }
+  /**
+   * 程序改页签（通知深链 `?run=` 直达现场、档案盒「去看对话」、打开产出文件）= `replaceState`：
+   * 自动联动不该往后退的历史里灌格子（决策 217③）。
+   */
+  function programTab(next: Tab): void {
+    tab = next;
+    writeQuery({ tab: next === 'timeline' ? null : next }, { replace: true });
+  }
+  /**
+   * 后退 / 前进把 `?tab=` 换了 → 页签跟着走（决策 217④「刷新与后退都照地址恢复」）。
+   * 用户点页签时 `userTab` 已把地址写在前面，这里读到的正是刚写的值，是空操作；
+   * 脏值就地抹掉（217④「取值非法回落缺省并顺手删键」）。
+   */
+  $effect(() => {
+    const r = router.route;
+    if (r.name !== 'task' || r.id !== id) return;
+    const raw = r.query.tab;
+    if (raw !== undefined && !TAB_ORDER.includes(raw as Tab)) {
+      writeQuery({ tab: null }, { replace: true });
+    }
+    const want = tabFromQuery(raw);
+    if (want !== tab) tab = want;
+  });
   /**
    * 深链 / 跳转要带到眼前的那个 run（`?run=` 消费一次、档案盒的「去看对话」各写一次）；
    * `null` = 没有落点。旧「会话页签的选中 run」的变体：现场时间线不搞选中态，
@@ -183,7 +219,7 @@
           : e.key === 'ArrowLeft'
             ? list[(i - 1 + list.length) % list.length]
             : list[(i + 1) % list.length];
-    tab = next;
+    userTab(next);
     void tick().then(() => document.getElementById(`tab-${next}`)?.focus());
   }
 
@@ -193,7 +229,7 @@
    */
   function gotoconversation(stage: string, node: string) {
     const match = detail.conversations.find((c) => c.stage === stage && c.node === node);
-    tab = 'scene';
+    programTab('scene');
     if (match) {
       highlightRun = match.run_id;
       void taskDetail.loadConversation(match.run_id);
@@ -236,7 +272,7 @@
     consumedRun = runId;
     highlightRun = runId;
     void taskDetail.loadConversation(runId);
-    tab = 'scene';
+    programTab('scene');
     writeQuery({ run: null }, { replace: true });
   });
 
@@ -537,7 +573,7 @@
               aria-selected={tab === t}
               aria-controls="detail-pane"
               tabindex={tab === t ? 0 : -1}
-              onclick={() => (tab = t)}
+              onclick={() => userTab(t)}
             >
               {TAB_LABELS[t]}{#if t === 'scene'}<span class="c">{detail.conversations.length + detail.commands.length}</span>{/if}
             </button>
@@ -625,7 +661,7 @@
       busy={taskDetail.busyKey !== null}
       onaction={handleAction}
       ongotoconversation={gotoconversation}
-      onopenfiles={() => (tab = 'files')}
+      onopenfiles={() => programTab('files')}
       diff={taskDetail.diff}
       rawDiff={taskDetail.diffRaw}
       diffStale={taskDetail.diffStale}
@@ -680,6 +716,15 @@
   @media (min-width: 820px) and (max-width: 1099px) {
     .detail.split {
       grid-template-columns: minmax(480px, 1fr) 280px;
+    }
+  }
+  /* 票 18 / 决策 215 的 <820 档（2026-10-01 用户裁决「有意不做也做掉」，原 wontfix 面）：
+     480–819 收成单列——主栏拿满容器宽（原 `minmax(0,1fr) 320px` 在 480px 只剩 102px），
+     档案盒按 DOM 顺序落到主栏下方，sticky 与动作行照旧。≤479 的移动款形态一字不动
+     （它本就是 display:block，此档不覆盖它）。 */
+  @media (min-width: 480px) and (max-width: 819px) {
+    .detail.split {
+      display: block;
     }
   }
   /* 左栏是**一个**网格项（不是 `display: contents` 把每个孩子各塞一行）。

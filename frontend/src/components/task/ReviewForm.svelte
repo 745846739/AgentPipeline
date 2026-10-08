@@ -91,10 +91,11 @@
   </label>
 
   <div class="actions" class:dock-acts={actionsOnly}>
+    <!-- 决策 216⑤ / §9.3：`return` 打回是弱化旁路 → quiet；`approve`@human_review 是推进
+         → 实心无确认步（advance 档，actionTier 判据见 lib/actions.ts）。 -->
     <button
       type="button"
-      class="btn"
-      class:quiet={actionsOnly}
+      class="btn quiet"
       disabled={busy}
       onclick={() => onsubmit?.(false, comments.trim() || undefined)}
     >

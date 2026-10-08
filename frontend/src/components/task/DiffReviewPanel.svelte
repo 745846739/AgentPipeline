@@ -1,6 +1,6 @@
 <script lang="ts">
   import type { AllowedAction, BranchCursor, PendingKind } from '../../api/types';
-  import { actionKey } from '../../lib/actions';
+  import { actionKey, actionTier, confirmSentence } from '../../lib/actions';
   import type { ParsedDiff } from '../../lib/diff';
   import DiffView from '../render/DiffView.svelte';
 
@@ -35,6 +35,7 @@
     error = null,
     actions,
     cursors = [],
+    pendingType = 'merge_approval',
     loading = false,
     busy = false,
     actionsOnly = false,
@@ -52,13 +53,62 @@
   // 「合入后 push」开关（决策 393）：只挂在 approve 上，随决策一起提交。
   let pushAfterMerge = $state(false);
 
+  /** 内联两步确认（票 03 / 决策 216②）：null = 没有任何钮在确认态。 */
+  let confirming = $state<string | null>(null);
+
   function cursorIdFor(action: AllowedAction): string | undefined {
     return action.cursor_id ?? cursors[0]?.cursor_id;
   }
 
-  function approveAction(action: AllowedAction) {
-    onaction?.(action, { cursorId: cursorIdFor(action), push: pushAfterMerge });
+  /** 三档量级（决策 216⑥）：合入 approve 在本面板恒为 destructive → 红描边 + 确认步。 */
+  function tierClass(action: AllowedAction): string {
+    switch (actionTier(action, pendingType)) {
+      case 'destructive':
+        return 'btn danger';
+      case 'gate-skip':
+        return 'btn gate';
+      case 'advance':
+        return 'btn solid';
+      default:
+        return 'btn quiet';
+    }
   }
+
+  /** 后果句（决策 216③；null = 点一下就发）。 */
+  function sentence(action: AllowedAction): string | null {
+    return confirmSentence(action, pendingType);
+  }
+
+  function armed(action: AllowedAction): boolean {
+    return confirming !== null && confirming === actionKey(action, cursorIdFor(action)) && sentence(action) !== null;
+  }
+
+  function submit(action: AllowedAction) {
+    const key = actionKey(action, cursorIdFor(action));
+    // 第一步只亮后果句；同一颗钮再点才真提交（与 PendingActions 同一口径）
+    if (sentence(action) !== null && confirming !== key) {
+      confirming = key;
+      return;
+    }
+    confirming = null;
+    const opts: { cursorId?: string; push?: boolean } = { cursorId: cursorIdFor(action) };
+    if (action.action === 'approve') opts.push = pushAfterMerge;
+    onaction?.(action, opts);
+  }
+
+  /** Escape 从确认态退回（决策 216④）；焦点不移动。 */
+  function onKeydown(event: KeyboardEvent) {
+    if (event.key === 'Escape' && confirming !== null) {
+      event.stopPropagation();
+      confirming = null;
+    }
+  }
+
+  // 动作集换了就退回普通态——不让上一轮的确认态挂到新一轮的钮上
+  $effect(() => {
+    void actions;
+    confirming = null;
+  });
 </script>
 
 <div class="diffpanel">
@@ -114,15 +164,21 @@
 
   <div class="actions" class:dock-acts={actionsOnly}>
     {#each returnChanges as action (actionKey(action, cursorIdFor(action)))}
+      {#if armed(action)}
+        <span class="confirm-q">{sentence(action)}</span>
+      {/if}
       <button
         type="button"
-        class="btn"
-        class:quiet={actionsOnly}
+        class="{tierClass(action)}{actionsOnly ? ' quiet' : ''}"
         disabled={busy}
-        onclick={() => onaction?.(action, { cursorId: cursorIdFor(action) })}
+        onclick={() => submit(action)}
+        onkeydown={onKeydown}
       >
         {action.label}
       </button>
+      {#if armed(action)}
+        <button type="button" class="btn quiet" onclick={() => (confirming = null)}>取消</button>
+      {/if}
     {/each}
     {#if approve.length > 0}
       <!-- 决策 393：合入后是否推远端——纯本地仓没有 remote 也能勾，服务端会跳过 -->
@@ -136,15 +192,23 @@
       </label>
     {/if}
     {#each approve as action (actionKey(action, cursorIdFor(action)))}
+      {#if armed(action)}
+        <!-- 决策 216②：就地换成后果句（12px --text-3）+ 同一颗钮 + 紧邻一颗取消 -->
+        <span class="confirm-q">{sentence(action)}</span>
+      {/if}
       <button
         type="button"
-        class="btn solid"
+        class={tierClass(action)}
         disabled={busy}
-        onclick={() => approveAction(action)}
+        onclick={() => submit(action)}
+        onkeydown={onKeydown}
       >
         {#if busy}<span class="spin"></span>{/if}
         {action.label}
       </button>
+      {#if armed(action)}
+        <button type="button" class="btn quiet" onclick={() => (confirming = null)}>取消</button>
+      {/if}
     {/each}
     {#if mergeActions.length === 0}
       <span class="hint">当前没有可用的审批动作。</span>
@@ -188,6 +252,13 @@
     color: var(--stop);
     font-size: 12px;
     margin-bottom: 8px;
+  }
+  /* 确认步后果句（决策 216②：12px --text-3，就地出现，常驻处不摆） */
+  .confirm-q {
+    display: block;
+    font-size: 12px;
+    color: var(--text-3);
+    margin: 2px 0 5px;
   }
   .breakdown {
     display: flex;

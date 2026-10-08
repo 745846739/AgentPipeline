@@ -312,6 +312,23 @@ select {
   transform: translate(3px, 3px);
   box-shadow: none;
 }
+/* gate = 跳过质量闸（决策 216⑥：琥珀描边 `--pending`，不再用实心）。
+   与 danger 同一档量级（2px 描边 + 3px 硬投影 + 实底），只换色相——
+   「我知道有风险」的动作必须是警告，而不是主旋律（实心）也不是弱化（quiet）。 */
+.btn.gate {
+  border-color: var(--pending);
+  background: var(--panel);
+  box-shadow: 3px 3px 0 var(--ink);
+  color: var(--pending);
+}
+.btn.gate:hover:not(:disabled) {
+  border-color: var(--pending);
+  color: var(--text-hi);
+}
+.btn.gate:active:not(:disabled) {
+  transform: translate(3px, 3px);
+  box-shadow: none;
+}
 .btn.block {
   width: 100%;
   text-align: center;

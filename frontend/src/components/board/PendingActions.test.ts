@@ -55,6 +55,10 @@ describe('PendingActions（决策 91 / 101 纯渲染）', () => {
     });
 
     await fireEvent.click(screen.getByRole('button', { name: /跳过本设计阶段/ }));
+    // 两步确认（决策 216②）：第一颗只亮后果句，还没提交
+    expect(onaction).not.toHaveBeenCalled();
+    expect(screen.getByText('确认跳过评审闸门？')).toBeTruthy();
+    await fireEvent.click(screen.getByRole('button', { name: /跳过本设计阶段/ }));
     expect(onaction.mock.calls[0][1].cursorId).toBe('c-only');
   });
 
@@ -69,7 +73,11 @@ describe('PendingActions（决策 91 / 101 纯渲染）', () => {
 
     const button = screen.getByRole('button', { name: '取消任务' });
     expect(button.hasAttribute('disabled')).toBe(false);
+    // 决策 216②：`cancel` 是 destructive —— 第一颗只亮后果句，不发请求
     await fireEvent.click(button);
+    expect(onaction).not.toHaveBeenCalled();
+    expect(screen.getByText('确认终止？任务会停在当前节点不再推进')).toBeTruthy();
+    await fireEvent.click(screen.getByRole('button', { name: '取消任务' }));
     expect(onaction).toHaveBeenCalledWith(actions[0], { cursorId: 'c-dev', input: undefined });
   });
 

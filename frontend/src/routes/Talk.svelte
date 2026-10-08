@@ -90,6 +90,7 @@
   import Fold from '../components/ui/Fold.svelte';
   import Modal from '../components/ui/Modal.svelte';
   import { router } from '../router.svelte';
+  import { clearTalkDraft, loadTalkDraft, loadTalkDraftText, writeTalkDraft } from '../lib/talkDraft';
 
   /**
    * 值守台账档（票 04 / 决策 286）：`<Talk watch />` 渲染**只读的一本账**——同一套
@@ -1124,6 +1125,43 @@
     if (text === null) return;
     talk.unsentText = null;
     if (!input.trim()) input = text;
+  });
+
+  /**
+   * 草稿回填（决策 217①⑤；2026-10-01 用户指示落地原 wontfix 余项「talk_draft」）。
+   *
+   * 只认**当前这班**的草稿：键里带着 `sessionId`，别的班次那半句既不搬也不删（等切回去
+   * 再说）。7 天过期与脏键由 `loadTalkDraft` 一并就地清掉（217⑤）。装载时刻晚于会话就位，
+   * 故挂在 `currentId` 上而不是组件首帧；框里已有字（失败回填先到一步）时不覆盖——
+   * 人自己打的那句更新，与决策 182㉓「失败不改输入框」同一口径。
+   */
+  let draftRestoredFor: string | null = null;
+  $effect(() => {
+    const sid = currentId;
+    if (!sid || draftRestoredFor === sid) return;
+    draftRestoredFor = sid;
+    const draft = loadTalkDraftText(sid);
+    if (draft !== null && draft.trim() && !input.trim()) input = draft;
+  });
+
+  /**
+   * 打字即存、清空即删。**发送成功后 `send()` 把 `input` 清空，这一条当场把键删掉**
+   * （决策 217⑤「发送成功立刻清零」）；没送到的那句由 `unsentText` 回填进框，跟着下一次
+   * 敲击又存回去——于是失败不丢稿。
+   *
+   * 没有班次 id 时一个字不动：会话还在装载，那时的空框**不代表「人清空了草稿」**，
+   * 动手就会把刷新回来的稿子在首帧抹掉。
+   */
+  $effect(() => {
+    const sid = currentId;
+    if (!sid) return;
+    const text = input;
+    if (text.trim()) {
+      writeTalkDraft({ sessionId: sid, text, at: Date.now() });
+      return;
+    }
+    const kept = loadTalkDraft();
+    if (!kept || kept.sessionId === sid) clearTalkDraft();
   });
 
   /* 只重读班次列表（不碰这一屏的台账）的 `refreshSessionList` 自决策 354① 起住在 store：

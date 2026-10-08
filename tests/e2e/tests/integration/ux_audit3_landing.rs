@@ -655,9 +655,9 @@ fn scene_09_detail_fold_band_820_1099() {
         ],
     );
     assert_eq!(
-        line_n(&root, "frontend/src/routes/TaskDetail.svelte", 680).trim(),
+        line_n(&root, "frontend/src/routes/TaskDetail.svelte", 716).trim(),
         "@media (min-width: 820px) and (max-width: 1099px) {",
-        "场景 9：媒体查询落在 680 行（决策 393 之前 677；决策 215 的块体 669–681 随迁到 672–684）"
+        "场景 9：媒体查询落在 716 行（决策 393 之前 677；决策 215 的块体 672–684；2026-10-01 票 01/04 落地后 +36 行随迁到 708–720）"
     );
     let geo = read(&root, "frontend/e2e/ux2-geometry.spec.ts");
     assert!(
@@ -689,20 +689,24 @@ fn scene_10_band_boundaries_1100_and_819() {
     );
     assert!(
         !td.contains("(min-width: 819px)"),
-        "场景 10：下界不许是 819——819 仍是票 01 的 wontfix 面"
+        "场景 10：单列档的下界写 480 不写 819（480–819 一档，票 01 已于 2026-10-01 落地）"
+    );
+    assert!(
+        td.contains("@media (min-width: 480px) and (max-width: 819px)"),
+        "场景 10：480–819 单列档（票 01 落地）应在源码里"
     );
     assert!(
         !td.contains("(max-width: 1100px)"),
         "场景 10：上界不许吃进 1100（桌面档）"
     );
-    // <479 档的 display:block 双保险仍在原位（票 01 面一格不动的源码侧牙齿）
+    // <479 档的 display:block 双保险仍在原位（移动款一格不动）——票 01/04 落地后整段随迁 +45 行
     assert_eq!(
-        line_n(&root, rel, 894).trim(),
+        line_n(&root, rel, 939).trim(),
         ".detail.split {",
-        "场景 10：<479 档 .detail.split 规则位移"
+        "场景 10：<479 档 .detail.split 规则位移（票 01/04 落地 +45 行）"
     );
     assert_eq!(
-        line_n(&root, rel, 895).trim(),
+        line_n(&root, rel, 940).trim(),
         "display: block;",
         "场景 10：<479 档 display:block 被动"
     );
@@ -710,10 +714,10 @@ fn scene_10_band_boundaries_1100_and_819() {
     assert_chain(
         "场景 10 边界档用例",
         &geo,
-        &["for (const w of [1100, 819]) {", "toBe('320px')"],
+        &["const at819 = await colsAt(819);", "toBe('none')"],
     );
     assert!(
-        geo.contains("票 01 面一格不动"),
+        geo.contains("票 01 落地"),
         "场景 10：边界档用例要把意图写进断言消息"
     );
 }
@@ -727,7 +731,8 @@ fn scene_11_detail_other_rules_untouched() {
     // diff 读数，已摘到 `#[ignore]` 的 `landing_shape_readings_once`（按分支取数不是闸门
     // 判据）。实测读数（(13,0)，落地提交 116745b）留档于
     // `.scratch/ux-audit-3/IMPLEMENTATION.md`；下面按**文件内容**的行号/内容双钉照旧全跑。
-    // 既有的 `overflow-x: auto`（决策 393 前在 961 行的预存在规则）必须落在本票改动块（现 672–684）之外
+    // 既有的 `overflow-x: auto`（决策 393 前在 961 行的预存在规则）必须落在本票改动块
+    // （票 13 的 708–720 + 2026-10-01 票 01/04 落地新增的 721–728）之外
     let td = read(&root, rel);
     let overflow_lines: Vec<usize> = td
         .lines()
@@ -736,27 +741,27 @@ fn scene_11_detail_other_rules_untouched() {
         .map(|(i, _)| i + 1)
         .collect();
     assert!(
-        overflow_lines.iter().all(|n| !(672..=684).contains(n)),
-        "场景 11：overflow-x 渗进本票改动块（行号随决策 393 的 +3 行迁移）→ 行 {overflow_lines:?}"
+        overflow_lines.iter().all(|n| !(708..=728).contains(n)),
+        "场景 11：overflow-x 渗进本票改动块（行号随票 01/04 落地的 +45 行迁移）→ 行 {overflow_lines:?}"
     );
-    // 桌面 / 窄档既有规则逐条在原位（行号 + 内容双钉）
+    // 桌面 / 窄档既有规则逐条在原位（行号 + 内容双钉；票 01/04 落地后整段 +36）
     assert_eq!(
-        line_n(&root, rel, 666).trim(),
+        line_n(&root, rel, 702).trim(),
         "max-width: 1240px;",
         "场景 11：桌面档 max-width 被动"
     );
     assert_eq!(
-        line_n(&root, rel, 668).trim(),
+        line_n(&root, rel, 704).trim(),
         "grid-template-columns: minmax(0, 1fr) 320px;",
         "场景 11：桌面档列串被动"
     );
     assert_eq!(
-        line_n(&root, rel, 669).trim(),
+        line_n(&root, rel, 705).trim(),
         "gap: 18px;",
         "场景 11：gap 被动"
     );
     assert_eq!(
-        line_n(&root, rel, 670).trim(),
+        line_n(&root, rel, 706).trim(),
         "align-items: start;",
         "场景 11：align-items 被动"
     );
@@ -861,15 +866,16 @@ fn scene_14_new_tickets_recorded_as_no_defect() {
     }
 }
 
-/// 场景 15（AC-6 / wontfix）：票 01/03/04 维持 wontfix——记档 + 无回归 + 溢出列证据。
+/// 场景 15（AC-6 / wontfix）：票 01/03/04 已被 2026-10-01 用户裁决推翻并落地——
+/// 记档（段头翻成「已落地」）+ 冻结面一字未改 + 审计当轮原证仍在档。
 #[test]
 fn scene_15_wontfix_tickets_kept_and_code_untouched() {
     let root = root();
     let impl_md = read(&root, ".scratch/ux-audit-3/IMPLEMENTATION.md");
     for sec in [
-        "### 票 01 · 详情页 480–819 中间档折行与 hero 溢出 —— **维持 wontfix（有意不做），无回归**",
-        "### 票 03 · 破坏性动作无确认步（wontfix） —— **维持 wontfix，不重开**",
-        "### 票 04 · 中流状态持久化余三件（wontfix） —— **维持 wontfix，不重开**",
+        "### 票 01 · 详情页 480–819 中间档折行与 hero 溢出 —— **已落地（2026-10-01 用户裁决推翻 wontfix）**",
+        "### 票 03 · 破坏性动作无确认步 —— **已落地（2026-10-01 用户裁决推翻 wontfix）**",
+        "### 票 04 · 中流状态持久化余三件 —— **已落地（2026-10-01 用户裁决推翻 wontfix）**",
     ] {
         assert!(impl_md.contains(sec), "场景 15：记录缺段 → {sec}");
     }

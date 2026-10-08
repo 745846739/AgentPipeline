@@ -10,6 +10,7 @@ import type {
 import { submitAllowedAction } from '../lib/actionSubmit';
 import { actionKey } from '../lib/actions';
 import { notificationClassForEvent } from '../lib/notificationPolicy';
+import { readQuery, router, writeQuery } from '../router.svelte';
 import { StreamManager } from '../realtime/connection';
 import { emptyBoardState, reduceBoard } from '../realtime/reduce';
 import { completion } from './completion.svelte';
@@ -30,11 +31,60 @@ export const FILTER_LABELS: Record<StatusFilter, string> = {
 
 const STORAGE_KEY = 'agentpipeline.project_id';
 
+/**
+ * 看板过滤的本地兜底键（决策 217①⑤）。地址是权威：`#/?filter=pending` 在就照地址，
+ * 不在才用这里记的值——「我一直在看 pending」不该被「点进任务再回来」那一步重置。
+ */
+const FILTER_KEY = 'agentpipeline.board_filter';
+const FILTER_VALUES = new Set<string>(Object.keys(FILTER_LABELS));
+
+/** 枚举外的值不是过滤器（决策 217④：非法回落缺省，并顺手删键）。 */
+export function isStatusFilter(v: string | undefined): v is StatusFilter {
+  return v !== undefined && FILTER_VALUES.has(v);
+}
+
+/** 读本地兜底；脏值就地删掉。存储不可用时回 `null`（没有兜底就是没有）。 */
+function storedFilter(): StatusFilter | null {
+  let saved: string | null;
+  try {
+    saved = localStorage.getItem(FILTER_KEY);
+  } catch {
+    return null;
+  }
+  if (saved === null) return null;
+  if (isStatusFilter(saved)) return saved;
+  try {
+    localStorage.removeItem(FILTER_KEY);
+  } catch {
+    /* 同上 */
+  }
+  return null;
+}
+
+/** 写本地兜底（`all` 即缺省，不留键）。 */
+function saveFilter(filter: StatusFilter): void {
+  try {
+    if (filter === 'all') localStorage.removeItem(FILTER_KEY);
+    else localStorage.setItem(FILTER_KEY, filter);
+  } catch {
+    /* 存储不可用：丢一条偏好好过抛错 */
+  }
+}
+
+/** 地址 → 本地 → 缺省（决策 217④）。脏地址在这里就地抹掉，不留到渲染时再猜一次。 */
+function initialFilter(): StatusFilter {
+  const raw = readQuery().filter;
+  if (isStatusFilter(raw)) return raw;
+  if (raw !== undefined) writeQuery({ filter: null }, { replace: true });
+  return storedFilter() ?? 'all';
+}
+
 class BoardStore {
   tasks = $state<TaskListItem[]>([]);
   projects = $state<Project[]>([]);
   projectId = $state<string | null>(null);
-  filter = $state<StatusFilter>('all');
+  /** 过滤值：地址 → 本地兜底 → 缺省（决策 217④，见 `initialFilter()`）。 */
+  filter = $state<StatusFilter>(initialFilter());
   includeArchived = $state(false);
   loading = $state(false);
   error = $state<string | null>(null);
@@ -168,6 +218,36 @@ class BoardStore {
 
   setFilter(filter: StatusFilter): void {
     this.filter = filter;
+    // 用户切过滤 = `pushState`（决策 217③）；缺省 `all` 不写进地址（217②）。
+    // 看板以外的路由不写——`?filter=` 只属于 `#/`，本地兜底照写不误（217④「跨页面的工作
+    // 语境」：地址丢了参数时靠它接住）。
+    if (router.route.name === 'board') {
+      writeQuery({ filter: filter === 'all' ? null : filter });
+    }
+    saveFilter(filter);
+  }
+
+  /**
+   * 后退 / 前进把 `?filter=` 换了：照地址恢复（决策 217④），**不再回写地址**——回写会再生成
+   * 一条历史，后退就退不动了。地址里没这一项时调用方应当直接 return（那时是本地兜底在管，
+   * store 初始化时已经读过），不拿缺省去覆盖它。
+   */
+  syncFilterFromQuery(raw: string): void {
+    if (isStatusFilter(raw)) {
+      if (raw !== this.filter) {
+        this.filter = raw;
+        saveFilter(raw);
+      }
+      return;
+    }
+    // 脏地址：回落缺省并删键（决策 217④）。
+    writeQuery({ filter: null }, { replace: true });
+    try {
+      localStorage.removeItem(FILTER_KEY);
+    } catch {
+      /* 存储不可用 */
+    }
+    this.filter = 'all';
   }
 
   /**

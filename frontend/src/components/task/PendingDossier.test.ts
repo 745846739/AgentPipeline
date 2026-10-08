@@ -70,6 +70,9 @@ describe('PendingDossier · 移动版动作坞的收展（决策 281）', () => 
       props: { reason, cursors, actions: mergeActions, dock: true, onaction },
     });
     await fireEvent.click(screen.getByRole('button', { name: /等你拍板/ }));
+    // 决策 216②：合入是 destructive —— 两步（亮后果句 → 确认）才提交
+    await fireEvent.click(screen.getByRole('button', { name: '合入' }));
+    expect(onaction).not.toHaveBeenCalled();
     await fireEvent.click(screen.getByRole('button', { name: '合入' }));
     expect(onaction).toHaveBeenCalledWith(mergeActions[0], { cursorId: 'c-merge', push: false });
   });

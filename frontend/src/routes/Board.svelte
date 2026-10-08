@@ -48,6 +48,19 @@
   const stations = $derived(buildSpineStations(board.visibleTasks));
 
   /**
+   * 后退 / 前进换 `?filter=` → 过滤跟着地址走（决策 217④「刷新与后退都照地址恢复」）。
+   * 地址里没有这一项时**不动**：那时是本地兜底在管（store 初始化时已读 `agentpipeline.board_filter`），
+   * 拿缺省去覆盖就把「我一直在看 pending」重置了。
+   */
+  $effect(() => {
+    const r = router.route;
+    if (r.name !== 'board') return;
+    const raw = r.query.filter;
+    if (raw === undefined) return;
+    board.syncFilterFromQuery(raw);
+  });
+
+  /**
    * 钉右档的媒体查询：值与契约 `GEOMETRY.boardPinBreakpoint` 同源（这里是同一个数；
    * 样式表里那条 `@media (min-width: 1400px)` 是字面量——CSS 不认自定义属性）。
    * 两者相等由 `lib/pipeline.geometry.test.ts` 静态扫描守卫。

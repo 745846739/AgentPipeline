@@ -587,35 +587,71 @@ fn scene_03_three_named_rechecks_have_conclusions_and_criteria() {
         }
     }
 
-    // ── 第 5 步：交叉核对源码现状（结论与现状矛盾 → 证据不实，失败）──
-    let task_detail = root.join("frontend/src/routes/TaskDetail.svelte");
+    // ── 第 5 步：交叉核对源码现状 ──
+    //
+    // 票面（`.scratch/ux-audit-3/issues/*`）是**冻结的审计当轮记录**，仍写「未落 / 有意不做」，
+    // 一字不改（见 landing::scene_15 的 FROZEN）。2026-10-01 用户裁决把原 wontfix 的票 01 /
+    // 票 04 落地之后，这里核的是**源码现状 = 已落**；落地事实另记 `.scratch/ux-audit-3/IMPLEMENTATION.md`
+    // 的票 01 / 票 04 两节。票 21（票 03 破坏性确认步）本轮**未落**，源码侧照旧是「没有」——
+    // 那一半的牙齿留在下面，等它落地时再翻。
+    let task_detail = read(&root, "frontend/src/routes/TaskDetail.svelte");
     assert!(
-        line_n(&task_detail, 40).contains("let tab = $state"),
-        "TaskDetail.svelte:40 应是组件局部 tab 态"
+        line_n(&root.join("frontend/src/routes/TaskDetail.svelte"), 48)
+            .contains("let tab = $state"),
+        "TaskDetail.svelte:48 应是 `let tab = $state<Tab>(tabFromQuery(…))`（?tab= 已接地址）"
     );
     assert!(
-        !read(&root, "frontend/src/routes/TaskDetail.svelte").contains("readQuery"),
-        "详情页仍未从 router 读 ?tab=（若出现 readQuery 则结论「未落」不实）"
+        task_detail.contains("readQuery") && task_detail.contains("writeQuery"),
+        "详情页应从 router 读写 ?tab=（决策 217①③，2026-10-01 落地）"
     );
     assert!(
-        line_n(&root.join("frontend/src/stores/board.svelte.ts"), 37)
+        line_n(&root.join("frontend/src/stores/board.svelte.ts"), 87)
             .contains("filter = $state<StatusFilter>"),
-        "board.svelte.ts:37 应是本地 filter 态"
+        "board.svelte.ts:87 应是按「地址 → 本地兜底 → 缺省」初始化的 filter 态"
     );
     let board_route = read(&root, "frontend/src/routes/Board.svelte");
     assert!(
-        !board_route.contains("writeQuery") && !board_route.contains("readQuery"),
-        "看板路由仍未用 router 查询串（若用了则结论「未落」不实）"
+        board_route.contains("syncFilterFromQuery") && board_route.contains("r.query.filter"),
+        "看板路由应把 ?filter= 交给 store 恢复（决策 217④，2026-10-01 落地）"
+    );
+    let board_store = read(&root, "frontend/src/stores/board.svelte.ts");
+    assert!(
+        board_store.contains("writeQuery({ filter:") && board_store.contains("readQuery().filter"),
+        "看板 store 应把 ?filter= 从地址读、往地址写（决策 217③④）"
     );
     assert!(
-        line_n(&root.join("frontend/src/routes/Talk.svelte"), 1089).contains("let qdraft = $state"),
-        "Talk.svelte:1089 应是局部草稿态"
+        line_n(&root.join("frontend/src/routes/Talk.svelte"), 1090).contains("let qdraft = $state"),
+        "Talk.svelte:1090 应是排队条编辑草稿态（主输入草稿另走 lib/talkDraft.ts）"
     );
     let talk_draft_hits: Vec<String> = walk_source_hits(&root, "talk_draft");
     assert!(
-        talk_draft_hits.is_empty(),
-        "全仓不应有 talk_draft（若存在则结论「未落」不实）：{talk_draft_hits:?}"
+        talk_draft_hits
+            .iter()
+            .any(|p| p.ends_with("lib/talkDraft.ts")),
+        "全仓应有 talkDraft 落点（agentpipeline.talk_draft，决策 217⑤）：{talk_draft_hits:?}"
     );
+    assert!(
+        read(&root, "frontend/src/lib/talkDraft.test.ts").contains("TALK_DRAFT_MAX_AGE_MS"),
+        "talkDraft.test.ts 应钉 7 天过期（决策 217⑤ 的单测那一格）"
+    );
+    // 2026-10-01 用户裁决推翻 wontfix 之后，票 21（票 03 破坏性确认步）随本轮落地：
+    // `actionTier` 三档量级在源码里，且审批两处（PendingActions / DiffReviewPanel）都接了
+    // 确认句——这一半的牙齿从「不该有」翻成「必须有」。
+    let tier_hits: Vec<String> = walk_source_hits(&root, "actionTier");
+    assert!(
+        tier_hits.iter().any(|p| p.ends_with("lib/actions.ts")),
+        "actionTier 应落在 lib/actions.ts（票 21 / 票 03，2026-10-01 落地）：{tier_hits:?}"
+    );
+    for wired in [
+        "frontend/src/components/board/PendingActions.svelte",
+        "frontend/src/components/task/DiffReviewPanel.svelte",
+    ] {
+        let src = read(&root, wired);
+        assert!(
+            src.contains("actionTier") && src.contains("confirmSentence"),
+            "{wired} 应接两步确认（量级 + 后果句）"
+        );
+    }
     let router = read(&root, "frontend/src/router.svelte.ts");
     let router_lines: Vec<&str> = router.lines().collect();
     assert!(
@@ -707,13 +743,15 @@ fn scene_04_evidence_levels_are_traceable_with_source_spot_checks() {
     }
 
     // 抽查 ≥3 条出处行号（覆盖 01/03/04 点名的行；行号内容与正文描述对得上）。
+    // 2026-10-01 票 01 / 票 04 落地后行号随迁：TaskDetail 的 `let tab` 40 → 48（tab 块 +8）、
+    // board 的 `filter = $state` 37 → 87（地址/本地兜底那组函数 +50）。
     let spot: [(&str, usize, &str); 6] = [
-        ("TaskDetail.svelte", 40, "let tab = $state"),
+        ("TaskDetail.svelte", 48, "let tab = $state"),
         ("PipelineRail.svelte", 340, ".rail.hero"),
-        ("board.svelte.ts", 37, "filter = $state<StatusFilter>"),
+        ("board.svelte.ts", 87, "filter = $state<StatusFilter>"),
         ("router.svelte.ts", 180, "readQuery"),
         ("talkSessions.ts", 21, "TALK_SESSION_KEY"),
-        ("PendingActions.svelte", 115, "btn solid"),
+        ("PendingActions.svelte", 86, "btn solid"),
     ];
     for (name, n, expect) in spot {
         let path = find_named(&root, name);
@@ -725,24 +763,25 @@ fn scene_04_evidence_levels_are_traceable_with_source_spot_checks() {
             line.trim()
         );
     }
-    // PipelineRail 340-344 的 hero 段没有 overflow-x 规则（票 01/13 订正后的论断）。
+    // PipelineRail 340-350 的 hero 段**有** overflow-x: auto（票 01 已于 2026-10-01 落地：
+    // 容器内横滚，不裁切、不传文档——原「hero 默认 visible」那句论断随 wontfix 推翻作废）。
     let rail = find_named(&root, "PipelineRail.svelte");
     let rail_txt = std::fs::read_to_string(&rail).expect("读 PipelineRail.svelte");
     let rail_lines: Vec<&str> = rail_txt.lines().collect();
-    let hero_band = rail_lines[339..344].join("\n");
+    let hero_band = rail_lines[339..350].join("\n");
     assert!(
-        !hero_band.contains("overflow-x"),
-        "PipelineRail.svelte:340-344 不应有 overflow-x 规则（正文论断：hero 默认 visible）"
+        hero_band.contains("overflow-x: auto"),
+        "PipelineRail.svelte:340-350 应含 overflow-x: auto（票 01 落地的容器内横滚）"
     );
-    // PendingActions 的量级两档支撑行（票 03 订正后的引用）。
+    // PendingActions 的量级两档支撑行（票 03 落地后随接线随迁：量级 88、确认态取消钮 197）。
     let pending = find_named(&root, "PendingActions.svelte");
     assert!(
-        line_n(&pending, 131).contains("btn quiet"),
-        ":131 应是 quiet 档"
+        line_n(&pending, 88).contains("btn quiet"),
+        ":88 应是 quiet 档"
     );
     assert!(
-        line_n(&pending, 143).contains("btn quiet"),
-        ":143 应是 quiet 档"
+        line_n(&pending, 197).contains("btn quiet"),
+        ":197 应是确认态取消钮（quiet）"
     );
 }
 

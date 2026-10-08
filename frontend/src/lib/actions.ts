@@ -91,6 +91,85 @@ export function sideEffectEnabled(action: AllowedAction, pendingType: PendingKin
   return endpointFor(pendingType, action.action) !== null;
 }
 
+/**
+ * 不可逆动作的档位判据（票 21 / 决策 216①⑥；2026-10-01 用户指示落地原 wontfix 票 03）。
+ *
+ * **不靠标签文字匹配**——只认 `action` 名与 `kind` / `requires_input` 结构字段：
+ * - `destructive`：物理上回不去的（终结任务 `cancel`；合入 `merge`——写进 `default_branch`
+ *   即终局，决策 6「无远程 PR」；让配对设备失效 `reset_pairing`）。红描边 `--stop` + 内联两步确认。
+ * - `gate-skip`：跳过质量闸（决策 216① 原文判据：`resume` 且（`skip` 或（`continue` 且非
+ *   `requires_input`）））。琥珀描边 `--pending`，不再用实心 + 同一条确认。
+ * - `advance`：流水线的自然下一步（`approve` / `return` 评审、带输入的 `continue`、`goto`、
+ *   `retry` 等）。实心，无确认步。
+ * - `quiet`：其余（`split_task` / `model_override` 等旁路）。`.btn.quiet`。
+ *
+ * 一处原文张力，按 ① 与末句收口：决策 216⑥ 的举例把 `合入` 列在「推进 = 实心」里，而 ①(a)
+ * 判它必须有确认步、⑥末句明写「同一个动作只有一档（不存在实心 + 确认步）」——两处冲突时
+ * 取 ①（判据正文）与末句（互斥律），故 `merge` 归 `destructive`，量级与确认步同档。
+ */
+export type ActionTier = 'advance' | 'gate-skip' | 'destructive' | 'quiet';
+
+/**
+ * `pendingType` 决定同名动作的落点：`approve`@`merge_approval` 是「写进项目仓库」
+ * （合入，决策 216①a → destructive），`approve`@`human_review` 是「通过评审」
+ * （推进 → advance）。缺省（拿不到 pendingType）按推进处理，宁可少一层确认也不误判终结。
+ */
+export function actionTier(action: AllowedAction, pendingType?: PendingKind): ActionTier {
+  switch (action.action) {
+    case 'merge':
+    case 'cancel':
+    case 'reset_pairing':
+      return 'destructive';
+    case 'approve':
+      return pendingType === 'merge_approval' ? 'destructive' : 'advance';
+    case 'return':
+      // §9.3 表：`返回修改` 列在弱化旁路 → `.btn.quiet`，不进确认步（决策 216⑤）
+      return 'quiet';
+    case 'skip':
+      return action.kind === 'resume' ? 'gate-skip' : 'quiet';
+    case 'continue':
+      return action.kind === 'resume' && action.requires_input !== true ? 'gate-skip' : 'advance';
+    case 'goto':
+      return 'advance';
+    default:
+      return action.kind === 'resume' ? 'advance' : 'quiet';
+  }
+}
+
+/** 后果句的运行时读数（票 21：取不到就不写数，不留半句 `…到 ？`）。 */
+export interface ConfirmContext {
+  /** 合入目标分支（`Project.default_branch`）。 */
+  defaultBranch?: string | null;
+  /** 已配对设备台数（`重置配对`）。 */
+  pairedCount?: number | null;
+}
+
+/**
+ * 确认步的后果句（决策 216③，逐条写死）：只在动手那一步出现，常驻处不摆。
+ * 返回 `null` = 这个动作没有确认步。
+ */
+export function confirmSentence(
+  action: AllowedAction,
+  pendingType?: PendingKind,
+  ctx: ConfirmContext = {},
+): string | null {
+  switch (actionTier(action, pendingType)) {
+    case 'destructive':
+      if (action.action === 'cancel') return '确认终止？任务会停在当前节点不再推进';
+      if (action.action === 'reset_pairing') {
+        const n = ctx.pairedCount;
+        return n == null || n <= 0
+          ? '确认重置？已配对的设备要重新扫码'
+          : `确认重置？${n} 台已配对的设备要重新扫码`;
+      }
+      return ctx.defaultBranch ? `确认合入到 ${ctx.defaultBranch}？` : '确认合入？';
+    case 'gate-skip':
+      return '确认跳过评审闸门？';
+    default:
+      return null;
+  }
+}
+
 /** 只有 info_insufficient 的 resume 动作有自由输入（决策 79）。 */
 export function allowsFreeInput(action: AllowedAction): boolean {
   return action.kind === 'resume' && action.requires_input === true;

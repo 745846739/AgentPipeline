@@ -9,9 +9,10 @@
     resetPairing,
     setServerLan,
   } from '../api/client';
-  import type { ServerAddress, ServerInfo } from '../api/types';
+  import type { AllowedAction, ServerAddress, ServerInfo } from '../api/types';
   import EmptyState from '../components/ui/EmptyState.svelte';
   import { changeLanMode } from '../lib/lanToggle';
+import { confirmSentence } from '../lib/actions';
   import {
     bindSourceLabel,
     phoneCanReach,
@@ -59,6 +60,34 @@
     | { kind: 'failed'; message: string }
   >({ kind: 'pending' });
   let reset = $state(false);
+/**
+ * 票 03（决策 216②③）：重置配对是 destructive —— 第一颗只亮后果句，同一颗再点才真重置。
+ * 后果句里的台数从页面既有读数取；这一页没有那个数就不写数（`confirmSentence` 的缺省句）。
+ */
+let confirmingReset = $state(false);
+const RESET_PAIRING: AllowedAction = {
+  action: 'reset_pairing',
+  kind: 'side_effect',
+  label: '重置配对',
+};
+const resetSentence = confirmSentence(RESET_PAIRING) ?? '确认重置？';
+
+function onResetClick(): void {
+  if (!confirmingReset) {
+    confirmingReset = true;
+    return;
+  }
+  confirmingReset = false;
+  void doReset();
+}
+
+/** Escape 从确认态退回（决策 216④）；焦点不移动。 */
+function onResetKeydown(event: KeyboardEvent): void {
+  if (event.key === 'Escape' && confirmingReset) {
+    event.stopPropagation();
+    confirmingReset = false;
+  }
+}
   /** 正在改绑（按钮转圈）；改绑的判定以重读为准（`lib/lanToggle.ts`）。 */
   let switching = $state(false);
   /** 改绑之后要说的话：成功也可能是「但启动参数说了算」，失败要带原因。 */
@@ -328,9 +357,24 @@ host = "0.0.0.0"</code></pre>
                      后面那处不再解释。 -->
                 二维码已带上配对令牌：扫这一次，这台手机就能改任务、也能跟值班长（跟我对话的 AI）说话。
               </span>
-              <button type="button" class="btn" disabled={reset} onclick={() => void doReset()}>
+              {#if confirmingReset}
+                <!-- 决策 216②：就地摆后果句（12px --text-3），常驻处不摆 -->
+                <span class="confirm-q">{resetSentence}</span>
+              {/if}
+              <button
+                type="button"
+                class="btn danger"
+                disabled={reset}
+                onclick={onResetClick}
+                onkeydown={onResetKeydown}
+              >
                 {reset ? '正在重置…' : '重置配对'}
               </button>
+              {#if confirmingReset}
+                <button type="button" class="btn quiet" onclick={() => (confirmingReset = false)}>
+                  取消
+                </button>
+              {/if}
             </div>
           </div>
         </div>
@@ -510,6 +554,14 @@ host = "0.0.0.0"</code></pre>
     color: var(--text-3);
     line-height: 1.8;
     max-width: 62ch;
+  }
+  /* 确认步后果句（决策 216②：12px --text-3，就地出现，常驻处不摆）——独占一行不挤按钮 */
+  .pair .confirm-q {
+    flex-basis: 100%;
+    display: block;
+    font-size: 12px;
+    color: var(--text-3);
+    margin: 2px 0 5px;
   }
   .alt {
     margin-top: 18px;

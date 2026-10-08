@@ -241,12 +241,14 @@ test.describe('UX2 ⑥ 几何：坞 / 状态行 / 档案盒（票 05 / 08 / 09�
       expect(m!.main, `w=${w}：主栏实宽应 ≥ 480`).toBeGreaterThanOrEqual(480);
     }
 
-    // 只动本档：1100 是桌面档、819 是票 01 的 wontfix 面——两处都必须仍是 320px
-    for (const w of [1100, 819]) {
-      const m = await colsAt(w);
-      expect(m, `w=${w}：.detail.split 应当在`).not.toBeNull();
-      expect(m!.last, `w=${w}：这一档不该被折行档波及（票 01 面一格不动）`).toBe('320px');
-    }
+    // 只动本档：1100 是桌面档照旧 320px；819 是票 01 单列档的上界（2026-10-01 落地）——
+    // `.detail.split` 这一档转 block，栅格列随之为 none
+    const at1100 = await colsAt(1100);
+    expect(at1100, 'w=1100：.detail.split 应当在').not.toBeNull();
+    expect(at1100!.last, 'w=1100：桌面档不该被折行档波及').toBe('320px');
+    const at819 = await colsAt(819);
+    expect(at819, 'w=819：.detail.split 应当在').not.toBeNull();
+    expect(at819!.last, 'w=819：480–819 单列档不再有栅格列（票 01 落地）').toBe('none');
     expectBundleHealthy(bundle);
   });
 });
