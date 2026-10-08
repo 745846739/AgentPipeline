@@ -44,6 +44,7 @@ pub const FOREMAN_AGENT_TYPE: &str = "foreman";
 mod attribution;
 mod briefing;
 mod catalog;
+mod changes;
 mod conversation;
 mod registry;
 mod runner;

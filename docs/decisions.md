@@ -3161,3 +3161,21 @@ config.rs}`、`tests/e2e/tests/integration/stage_boundary.rs`、`docs/testing.md
 **验证**：L2 `executor.rs` **三条**——`a_not_converged_spawn_brakes_the_rest_of_its_batch`（一条消息三个调用：spawn 未收口 → 第二个 spawn **零 run 行、零请求**，父转录里的合成回执写明「未执行」与原因，同批的 `read_file` 结果照常进转录，那一条在日志里 `synthetic=1`）、`a_successful_spawn_does_not_brake_its_batch`（两个都真跑、都是 `Success`、转录里两条摘要、无「未执行」）、`an_ordinary_subagent_failure_does_not_brake_its_batch`（子代理 #1 传输类失败 → #2 照跑）；L1 `tools.rs::sub_agent_end_renders_each_ending_distinctly` 扩写（五档的 `batch_abort_reason` 逐条）；L1 `testkit::script.rs::batch_step_emits_one_message_with_several_calls`（三个调用在同一条消息里、id 互不相同）。既有七条子代理 L2 用例与全部 testkit 用例一字未改仍绿。
 
 **来源**：`.scratch/subagent-governance/issues/03`；落地 `crates/core/src/agent/tools.rs`、`crates/core/src/pipeline/model_invoke.rs`、`crates/testkit/src/{script.rs, mock_llm.rs}`、`crates/core/tests/integration/executor.rs`
+
+### 决策 411 · 收口行带机器读出的改动清单：`changed_files_json` 列 + 正文里那一段（票 `foreman-work-record` 01）
+
+**起因**：2026-10-08 的对讲台班次 `01M4CDY9EC9M9FSSE236GJXYZC`——394 那一轮的工具流水里有二十余处 `edit_file` / `write_file`，而它自己的台账正文只有 **104 个字**；8 分钟后的下一轮（400）**如实**汇报「仍未动一行代码」，并把已经落的 `lib/talkDraft.ts` 当成「未落」。根因是进下一轮 prompt 的**只有 `content` 那段散文**（`conversation.rs::trim_history`，`FOREMAN_HISTORY_BUDGET_CHARS = 24_000`），工具痕迹从不回灌；而决策 311「收场文案按**实际**说话」这把尺当时只量了一件事（提议数），且只接在五条收场尾句的**第三条**上。
+
+**裁决**：
+
+1. **清单升成一等读数**：`kanban_foreman_messages.changed_files_json`（迁移 0045），路径**数组**（去重、保首次出现序）；`NULL` = 这一轮没动过文件（与 `briefing_json` / `traces_json` / `segments_json` 同一条口径：「没有」与「有但是空的」是两件事）。非 assistant 行恒 `NULL`。**判据留在后端、前端只渲染**——另两条候选出路（复用 `segments_json` 加段 kind / 前端自己从 `traces_json` 推）已否决并记在票里。
+2. **两份来源取并集**：① 本轮痕迹里 `edit_file` / `write_file` 参数中的 `path`（完整参数原串自决策 301 起就在留痕里）；② 本轮 repair 提议的权威 diff 文件（库里 `payload_json.diff`，**不读盘上那份 `.diff` 抄本**——库里那份才是权威，且读盘会在收口路径上引入一次阻塞 IO，决策 143 那条缝不为此而开）。**并集而不是替换**：痕迹只看得到两个编辑工具，diff 只看得到 repair worktree 里那一份提交，谁缺了谁并集都补得上；顺序上痕迹在前（那是这一轮的实际发生序）。
+3. **档位不是 `auto` 时整轮为空**——本决策里最容易漏的一条：值班长的**缺省档位就是 `ask`**（[`EnvMode::default_for`]），而那一档下 env 写工具**落成提议、文件一个字节都没动**（`gate_decision`），回执却是一句 `ok = true` 的「已生成一条待确认的提议……这件事**没有执行**」。把那种痕迹算成改动就是**伪造一份成果**，正是本格要停掉的那类谎。`deny` 档同理；`ok = false` 的调用同样不进清单（本轮实账里正好有一次失败的 `edit_file`）。
+4. **正文末尾那一段由后端加**：`【本轮改动】本轮改了 N 个文件：a、b、c（余 M 个见台账明细）。`——最多列 **3** 条（历史窗口是 24000 个**字符**，一段 21 行的清单会把它吃掉），明细在列里。**清单为空就不出现**。标记与 `【操作台】` / `【值守播报】` 同族：由后端加，不由模型自己说。
+5. **「零改动」声称被标注，不被改写**：清单非空而正文含「零改动 / 一行未改 / 仍未动一行代码」（三条都出自实账 386 / 388 / 400 的原文）时，换一个更正的开头（「上面那句说这一轮没改代码，与台账不符——」）。模型的话一字不动——与在打转 / 成本告警 / 归因三处「标注而非改写」同一条姿态。
+6. **线上同时接上**：`message_wire` 加**恒在场的加性字段** `changed_files`（`null` = 没动过）。界面这一批**不消费**（前端另立票），先把线接上——决策 252③ 那条「两个字段分开写，将来要显示时不必再改线」同姿态。
+7. **它是决策 311 的下一代**：311 留下的口子是「排查同一收口路径里是否还有别处默认『提议必然存在』……不代表只有这一句」。本决策兑现那一句，并把同一把尺从「提议数」扩到「改动文件」。**票 02**（五条收场尾句都按实际产出说话、判停那条路不再对修复轮说「换个线索」）是这条纪律的另一半，**尚未落地**（`Blocked by: 01`）。
+
+**验证**：L1 `changes.rs` **11 条**——只认编辑类工具 / 失败的编辑不算改动 / 去重保首次出现序 / 坏参数与空 `path` 跳过而不报错 / **`ask` 与 `deny` 档整轮为空而 `auto` 不空** / 并集两侧去重 / diff 只吃 `diff --git` 头不吃 hunk 行 / 那一段的三种形状（空清单不出、≤3 全列、>3 报计数）/ 更正开头。L2 `foreman.rs` **4 条**——`the_closeout_lists_the_files_the_round_changed`（同一个文件改两次只算一次、正文以清单收尾）、`a_round_that_changed_nothing_says_nothing_about_changes`（列是 `null` 而不是空数组、正文没有那一段）、`a_no_change_claim_is_annotated_not_rewritten`（模型原话保留在开头 + 更正句在后）、**`the_changes_line_reaches_the_next_rounds_prompt`（本票的全部意义：上一轮的清单进得去下一轮的请求）**。`cargo test --workspace` **1801 通过 / 0 失败**（7 ignored）、`clippy --workspace --all-targets -D warnings` 与 `cargo fmt --all -- --check` 全绿；既有 141 条 foreman L2 一字未改仍绿（含逐字钉收场文案的那几条）。
+
+**来源**：`.scratch/foreman-work-record/issues/01`（事故账 `incident-2026-10-08.md` 的问题一 / 二 / 四）；落地 `crates/core/src/storage/migrations/0045_foreman_changed_files.sql`、`crates/core/src/storage/{foreman.rs, proposals.rs}`、`crates/core/src/pipeline/foreman/{changes.rs, runner.rs, mod.rs, turn_plan.rs}`、`crates/app/src/routes/foreman.rs`、`crates/core/tests/integration/foreman.rs`

@@ -1526,7 +1526,33 @@ impl ForemanRunner {
         // 但「这一轮已经烧了这么多」该被看见。落在**这一轮自己的台账行**上（不另起一条
         // 系统消息：那会刷屏，还会挤占历史窗口），不进 `turn.reply`——通知出口发的是模型
         // 自己说过的话，账目跟着台账走。
-        let content = if input.is_watch() {
+        // **本轮改了哪些文件**（票 01）：痕迹里读出的 ∪ 本轮 repair 那份权威 diff。
+        // 两份来源覆盖的东西不同——痕迹只看得到 `write_file` / `edit_file`，diff 只看得到
+        // repair worktree 里那一份提交；`run_command` 里改的文件（`git apply` / `sed -i`）
+        // 只有后者看得见。**读库失败按「没有 diff」处置**（与决策 311 那条提议计数同一姿态：
+        // 读不出来就只说自己读得出来的那份，别复述一句可能不成立的保证）。
+        let diff_paths = {
+            let mut paths: Vec<String> = Vec::new();
+            for diff in self
+                .store
+                .round_repair_diffs(&session.id, round_since)
+                .await
+                .unwrap_or_default()
+            {
+                paths = changes::union(paths, changes::diff_paths(&diff));
+            }
+            paths
+        };
+        let changed_files =
+            changes::union(changes::changed_paths(&traces, plan.env_mode), diff_paths);
+        // 与 `traces_json` 同一口径：没有改动就不落这一列（不落一个空数组）。
+        let changed_files_json = if changed_files.is_empty() {
+            None
+        } else {
+            Some(serde_json::to_value(&changed_files)?)
+        };
+
+        let mut content = if input.is_watch() {
             format!("{FOREMAN_WATCH_MARK}{reply}")
         } else if cost_warned {
             format!(
@@ -1536,6 +1562,16 @@ impl ForemanRunner {
         } else {
             reply.clone()
         };
+        // 改动清单那一段：**清单为空就不出现**（「没有」与「有但是空的」是两件事，与
+        // `briefing_json` / `traces_json` / `segments_json` 同一条口径）。正文声称
+        // 「零改动 / 一行未改 / 仍未动一行代码」时换一个更正的开头——机器**不改写**模型的话，
+        // 只在它后面把事实摆出来（与在打转 / 成本告警 / 归因三处「标注而非改写」同一条姿态）。
+        if let Some(note) =
+            changes::changes_note(&changed_files, changes::claims_no_change(&content))
+        {
+            content.push_str("\n\n");
+            content.push_str(&note);
+        }
         // 问话载荷随行落地（决策 265②）：取走即清——一轮至多挂一行，坏轮 / 失败轮
         // 走不到这里（没有 assistant 行可挂，半截的问题不该比它所属的那一轮活得久）。
         let ask_json = ask_slot.lock().await.take();
@@ -1553,6 +1589,9 @@ impl ForemanRunner {
             // 顺序留痕（决策 273）：与上面两份聚合列并存——聚合各服务自己的消费者，
             // 段序给时间线（先想了什么、再查了什么、然后说了什么）。
             segments_json,
+            // 本轮机器读出的改动清单（票 01）：它进下一轮的历史（`content` 那一段）与界面，
+            // 也是行上的结构化读数。
+            changed_files_json,
             // 空串存 `None`（不存空文本）：与 `briefing_json` / `traces_json` 同一条
             // 口径——「没有」与「有但是空的」是两件事，前者该在下发时是 null。
             thinking: (!thinking.trim().is_empty()).then_some(thinking),

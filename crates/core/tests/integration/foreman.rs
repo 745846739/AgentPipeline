@@ -354,6 +354,7 @@ async fn history_is_trimmed_by_character_budget_but_stays_in_the_store() {
                 briefing_json: None,
                 traces_json: None,
                 segments_json: None,
+                changed_files_json: None,
                 thinking: None,
                 ask_json: None,
             })
@@ -3998,6 +3999,7 @@ async fn session_totals_sum_the_persisted_columns() {
             briefing_json: None,
             traces_json: None,
             segments_json: None,
+            changed_files_json: None,
             thinking: None,
             ask_json: None,
         })
@@ -4013,6 +4015,7 @@ async fn session_totals_sum_the_persisted_columns() {
             briefing_json: None,
             traces_json: None,
             segments_json: None,
+            changed_files_json: None,
             thinking: None,
             ask_json: None,
         })
@@ -4072,6 +4075,7 @@ async fn session_totals_ignore_in_flight_rows() {
                 briefing_json: None,
                 traces_json: None,
                 segments_json: None,
+                changed_files_json: None,
                 thinking: None,
                 ask_json: None,
             },
@@ -4500,6 +4504,7 @@ async fn two_sessions_do_not_pollute_each_others_messages_or_totals() {
             briefing_json: None,
             traces_json: None,
             segments_json: None,
+            changed_files_json: None,
             thinking: None,
             ask_json: None,
         })
@@ -7362,6 +7367,7 @@ async fn startup_marks_a_hanging_inflight_row_interrupted_without_touching_conte
             briefing_json: None,
             traces_json: None,
             segments_json: None,
+            changed_files_json: None,
             thinking: None,
             ask_json: None,
         })
@@ -8006,4 +8012,155 @@ async fn replaying_the_incident_ledger_turns_the_three_guards_on() {
     // `pressing_stop_before_it_says_anything_still_leaves_a_row`（0 条）与
     // `the_closeout_keeps_the_proposal_note_when_the_round_proposed_something`（1 条）里。
     let _ = stream.pop();
+}
+
+// ─────────────────── 收口行带机器读出的改动清单（票 01）───────────────────
+//
+// 决策 311（「收场文案按实际提议数说话」）的下一代：同一件事从「提议数」扩到「改动文件」。
+// 2026-10-08 那本账里缺的正是它——394 那一轮改了二十余处，8 分钟后的下一轮**如实**汇报
+// 「仍未动一行代码」，因为进下一轮 prompt 的只有上一轮的收口散文，而那段散文一个字都没提
+// 它改过什么。
+
+/// 一轮真的改过文件时，**台账行自己说出来**：结构化列 + 正文末尾那一行。
+#[tokio::test]
+async fn the_closeout_lists_the_files_the_round_changed() {
+    let h = Harness::seeded().await;
+    // `write_file` / `edit_file` 归环境层：值班长的**缺省档位是 `ask`**，而那一档下它们
+    // 只落成一条提议、文件一个字节都不动（`gate_decision`）——故本用例显式配 `auto`。
+    h.foreman_env(agentpipeline_core::types::EnvMode::Auto)
+        .await;
+    let sid = h.session().await;
+
+    let mut script = Script::new();
+    script.for_foreman().tool(
+        "write_file",
+        serde_json::json!({"path": "notes.md", "content": "x"}),
+    );
+    // 同一个文件改第二次：清单里只该出现一次（去重），且保首次出现序。
+    script.for_foreman().tool(
+        "edit_file",
+        serde_json::json!({"path": "notes.md", "old_text": "x", "new_text": "y"}),
+    );
+    script.for_foreman().tool(
+        "write_file",
+        serde_json::json!({"path": "other.md", "content": "z"}),
+    );
+    script.for_foreman().text("写完了。");
+    let runner = h.runner(FakeAgent::new(script));
+    runner.say(Some(&sid), "写两个文件").await.unwrap();
+
+    let rows = h.store.list_foreman_messages(&sid, 50, None).await.unwrap();
+    let said = rows
+        .iter()
+        .find(|m| m.role == "assistant")
+        .expect("一轮回话应当落一条 assistant 行");
+    assert_eq!(
+        said.changed_files_json,
+        Some(serde_json::json!(["notes.md", "other.md"])),
+        "结构化清单应当是这两个文件、且不重复"
+    );
+    assert!(
+        said.content
+            .ends_with("【本轮改动】本轮改了 2 个文件：notes.md、other.md。"),
+        "收口行应当以改动清单收尾：{}",
+        said.content
+    );
+}
+
+/// 一轮没动过文件：**那一段不出现**，结构化列是 `null` 而不是空数组
+/// （「没有」与「有但是空的」是两件事，与 `briefing_json` / `traces_json` 同一条口径）。
+#[tokio::test]
+async fn a_round_that_changed_nothing_says_nothing_about_changes() {
+    let h = Harness::seeded().await;
+    h.foreman_env(agentpipeline_core::types::EnvMode::Auto)
+        .await;
+    let sid = h.session().await;
+
+    let mut script = Script::new();
+    script.for_foreman().tool("list_dir", serde_json::json!({}));
+    script.for_foreman().text("看完了，什么都没动。");
+    let runner = h.runner(FakeAgent::new(script));
+    runner.say(Some(&sid), "看看").await.unwrap();
+
+    let rows = h.store.list_foreman_messages(&sid, 50, None).await.unwrap();
+    let said = rows
+        .iter()
+        .find(|m| m.role == "assistant")
+        .expect("一轮回话应当落一条 assistant 行");
+    assert!(
+        said.changed_files_json.is_none(),
+        "没动文件就不该有这一列：{:?}",
+        said.changed_files_json
+    );
+    assert!(
+        !said.content.contains("【本轮改动】"),
+        "没动文件就不该出现那一段：{}",
+        said.content
+    );
+}
+
+/// 正文声称「没改代码」而清单非空：机器**补一句更正**，模型的话**一字不动**
+/// （与在打转 / 成本告警 / 归因三处「标注而非改写」同一条姿态）。
+#[tokio::test]
+async fn a_no_change_claim_is_annotated_not_rewritten() {
+    let h = Harness::seeded().await;
+    h.foreman_env(agentpipeline_core::types::EnvMode::Auto)
+        .await;
+    let sid = h.session().await;
+
+    let mut script = Script::new();
+    script.for_foreman().tool(
+        "write_file",
+        serde_json::json!({"path": "notes.md", "content": "x"}),
+    );
+    script.for_foreman().text("收口。本轮零改动，闸门未跑。");
+    let runner = h.runner(FakeAgent::new(script));
+    runner.say(Some(&sid), "改吧").await.unwrap();
+
+    let rows = h.store.list_foreman_messages(&sid, 50, None).await.unwrap();
+    let said = rows
+        .iter()
+        .find(|m| m.role == "assistant")
+        .expect("一轮回话应当落一条 assistant 行");
+    assert!(
+        said.content.starts_with("收口。本轮零改动，闸门未跑。"),
+        "模型自己的话必须原样留在开头（标注而不是改写）：{}",
+        said.content
+    );
+    assert!(
+        said.content.contains(
+            "【本轮改动】上面那句说这一轮没改代码，与台账不符——本轮改了 1 个文件：notes.md。"
+        ),
+        "清单非空却称零改动时，机器该补一句更正：{}",
+        said.content
+    );
+}
+
+/// **本票的全部意义**：上一轮的改动清单进得去**下一轮的 prompt**——值班长认识「我做过什么」
+/// 只有历史这一个入口，而历史里此前只有散文。
+#[tokio::test]
+async fn the_changes_line_reaches_the_next_rounds_prompt() {
+    let h = Harness::seeded().await;
+    h.foreman_env(agentpipeline_core::types::EnvMode::Auto)
+        .await;
+    let sid = h.session().await;
+
+    let mut script = Script::new();
+    script.for_foreman().tool(
+        "write_file",
+        serde_json::json!({"path": "notes.md", "content": "x"}),
+    );
+    script.for_foreman().text("写完了。");
+    script.for_foreman().text("第二轮的收口。");
+    let agent = FakeAgent::new(script);
+    let runner = h.runner(agent.clone());
+    runner.say(Some(&sid), "写个文件").await.unwrap();
+    runner.say(Some(&sid), "再来一轮").await.unwrap();
+
+    let reqs = agent.request_log();
+    let last = serde_json::to_string(&reqs.last().expect("第二轮必须发过请求").messages).unwrap();
+    assert!(
+        last.contains("【本轮改动】本轮改了 1 个文件：notes.md。"),
+        "上一轮的改动清单必须进下一轮的历史：{last}"
+    );
 }

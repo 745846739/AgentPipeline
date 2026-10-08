@@ -518,6 +518,7 @@ mod tests {
             briefing_json: None,
             traces_json: None,
             segments_json: None,
+            changed_files_json: None,
             thinking: None,
             ask_json: None,
             status: None,

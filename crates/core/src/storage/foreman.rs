@@ -119,6 +119,13 @@ pub struct ForemanMessage {
     /// 东西（推理拼成一段、工具合成一张表、收口那句一段），**顺序丢了**；这一列保留
     /// 「先想 → 再查 → 然后说」的原样。无任何一步时为 `None`。
     pub segments_json: Option<Value>,
+    /// 本轮**机器读出的改动文件清单**（票 01）：`edit_file` / `write_file` 的路径参数
+    /// （去重、保首次出现序）；本轮若调过 `repair(finish)`，再并上那份权威 diff 的文件。
+    ///
+    /// 两个消费者：① 收口正文末尾那一行【本轮改动】由它渲染；② **下一轮**——这一轮的台账行
+    /// 是值班长认识「我做过什么」的唯一读物（`content` 进 prompt，本列随行一并带去）。
+    /// `None` = 这一轮没动过文件（与 `traces_json` 同一条口径：「没有」与「有但是空的」是两件事）。
+    pub changed_files_json: Option<Value>,
     /// 该轮的**推理 / 思考**原文（决策 244）。不产推理的模型为 `None`。
     ///
     /// **展示留痕，永不回灌**：它不是 assistant 消息的一部分，进 `transcript` 既会被
@@ -156,6 +163,9 @@ pub struct NewForemanMessage {
     /// 顺序留痕（决策 273，见 [`ForemanMessage::segments_json`]）。便捷路径都给 `None`——
     /// 只有值班长那一轮会填它，且由 [`crate::pipeline::foreman`] 直接赋值。
     pub segments_json: Option<Value>,
+    /// 本轮机器读出的改动文件清单（票 01，见 [`ForemanMessage::changed_files_json`]）。
+    /// 便捷路径都给 `None`——填它的只有值班长收口处与 repair 那一轮。
+    pub changed_files_json: Option<Value>,
     /// 该轮的推理原文（决策 244）。构造它的两条便捷路径都给 `None`——
     /// 只有值班长那一轮会填它，且由 [`crate::pipeline::foreman`] 直接赋值。
     pub thinking: Option<String>,
@@ -176,6 +186,8 @@ impl NewForemanMessage {
             briefing_json: None,
             traces_json: None,
             segments_json: None,
+            // 操作台的账不代表「一轮的产出」——它记的是别人按下之后的结果。
+            changed_files_json: None,
             thinking: None,
             ask_json: None,
         }
@@ -192,6 +204,8 @@ impl NewForemanMessage {
             briefing_json: None,
             traces_json: None,
             segments_json: None,
+            // 便捷路径不带痕迹，也就无从读出改动清单；填它的只有收口处。
+            changed_files_json: None,
             thinking: None,
             ask_json: None,
         }
@@ -256,6 +270,7 @@ struct ForemanMessageRow {
     briefing_json: Option<String>,
     traces_json: Option<String>,
     segments_json: Option<String>,
+    changed_files_json: Option<String>,
     thinking: Option<String>,
     ask_json: Option<String>,
     status: Option<String>,
@@ -279,6 +294,11 @@ impl ForemanMessageRow {
             briefing_json: self.briefing_json.as_deref().map(parse_json).transpose()?,
             traces_json: self.traces_json.as_deref().map(parse_json).transpose()?,
             segments_json: self.segments_json.as_deref().map(parse_json).transpose()?,
+            changed_files_json: self
+                .changed_files_json
+                .as_deref()
+                .map(parse_json)
+                .transpose()?,
             thinking: self.thinking,
             ask_json: self.ask_json.as_deref().map(parse_json).transpose()?,
             status: self.status,
@@ -297,8 +317,8 @@ fn parse_json(raw: &str) -> Result<Value> {
 
 const FOREMAN_MESSAGE_COLUMNS: &str = "id, session_id, role, content, prompt_tokens, \
                                        completion_tokens, briefing_json, traces_json, \
-                                       segments_json, thinking, ask_json, status, seq, \
-                                       interrupted_at, created_at";
+                                       segments_json, changed_files_json, thinking, ask_json, \
+                                       status, seq, interrupted_at, created_at";
 
 const FOREMAN_SESSION_COLUMNS: &str = "id, title, kind, created_at, last_active_at, archived_at";
 
@@ -527,8 +547,8 @@ impl Store {
         let id: i64 = sqlx::query_scalar(
             "INSERT INTO kanban_foreman_messages
              (session_id, role, content, prompt_tokens, completion_tokens, briefing_json,
-              traces_json, segments_json, thinking, ask_json, created_at)
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) RETURNING id",
+              traces_json, segments_json, changed_files_json, thinking, ask_json, created_at)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) RETURNING id",
         )
         .bind(&msg.session_id)
         .bind(&msg.role)
@@ -538,6 +558,7 @@ impl Store {
         .bind(msg.briefing_json.as_ref().map(Value::to_string))
         .bind(msg.traces_json.as_ref().map(Value::to_string))
         .bind(msg.segments_json.as_ref().map(Value::to_string))
+        .bind(msg.changed_files_json.as_ref().map(Value::to_string))
         .bind(msg.thinking.as_deref())
         .bind(msg.ask_json.as_ref().map(Value::to_string))
         .bind(ts(now))
@@ -625,8 +646,8 @@ impl Store {
         sqlx::query(
             "UPDATE kanban_foreman_messages
              SET content = ?, prompt_tokens = ?, completion_tokens = ?, briefing_json = ?,
-                 traces_json = ?, segments_json = ?, thinking = ?, ask_json = ?, seq = ?,
-                 status = NULL
+                 traces_json = ?, segments_json = ?, changed_files_json = ?, thinking = ?,
+                 ask_json = ?, seq = ?, status = NULL
              WHERE id = ?",
         )
         .bind(&msg.content)
@@ -635,6 +656,7 @@ impl Store {
         .bind(msg.briefing_json.as_ref().map(Value::to_string))
         .bind(msg.traces_json.as_ref().map(Value::to_string))
         .bind(msg.segments_json.as_ref().map(Value::to_string))
+        .bind(msg.changed_files_json.as_ref().map(Value::to_string))
         .bind(msg.thinking.as_deref())
         .bind(msg.ask_json.as_ref().map(Value::to_string))
         .bind(seq as i64)

@@ -533,6 +533,37 @@ impl Store {
         Ok(count as usize)
     }
 
+    /// 这一轮提的**修复提议**带出的 diff 全文（票 01：改动清单的第二份来源）。
+    ///
+    /// **为什么需要它**：工具痕迹只看得见 `write_file` / `edit_file`，而 `run_command`
+    /// 里也可能改文件（`git apply` / `sed -i`）——那一支只有 repair 那份权威 diff 看得见，
+    /// 而它从 `propose_repair` 那一刻就落在 `payload_json.diff` 里了。
+    ///
+    /// **不读磁盘上那份 `.diff`**：`{home}/worktrees/repair-{id}.diff` 是给人看的抄本，
+    /// 库里这一份才是权威；而且读它会在收口路径上引入一次阻塞 IO（决策 143 那条缝只留给
+    /// 真需要它的地方）。**不筛状态**——「这一轮产出过这份 diff」与它后来被按 / 过期无关
+    /// （与 [`Self::count_round_foreman_proposals`] 同一把尺、同一条理由）。
+    ///
+    /// 解析交给调用方（`pipeline::foreman::changes::diff_paths`）：存储层不解释 diff 的语法。
+    pub async fn round_repair_diffs(
+        &self,
+        session_id: &str,
+        since: DateTime<Utc>,
+    ) -> Result<Vec<String>> {
+        let rows: Vec<Option<String>> = sqlx::query_scalar(
+            "SELECT json_extract(payload_json, '$.diff') FROM kanban_foreman_proposals
+             WHERE session_id = ? AND created_at >= ? AND kind = ?",
+        )
+        .bind(session_id)
+        .bind(ts(since))
+        .bind(ForemanProposalKind::Repair.as_str())
+        .fetch_all(self.pool())
+        .await?;
+        // `json_extract` 对没有 `payload_json` 的行返回 NULL——闸门没过的那种提议就是
+        // （`diff` 与 `commit` 一起是 `None`）。那不是错误，只是「这一条没有 diff」。
+        Ok(rows.into_iter().flatten().collect())
+    }
+
     /// 超过保留期、**没人按过**的修复提议（决策 212③ / 票 12 的最后一格）。
     ///
     /// 为什么需要它：修复提议的 worktree 只被两条路回收——人按「合入」、人按「拒绝」。

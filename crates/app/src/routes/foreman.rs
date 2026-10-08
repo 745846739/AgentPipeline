@@ -1321,6 +1321,10 @@ fn message_wire(m: &ForemanMessage) -> serde_json::Value {
         // 这一轮的**步骤顺序**（决策 273）：与 `traces` / `thinking` 一样原样带出去，
         // 不在后端截断——界面按段序渲染「先想 → 再查 → 然后说」，要的就是落库那一份。
         "segments": m.segments_json,
+        // 本轮**机器读出的改动清单**（票 01）：路径数组，本轮没动文件就是 null。
+        // 与 `ask` / `status` 一样是**恒在场的加性字段**——界面这一批先不消费（另立票），
+        // 但先把线接上：决策 252③ 那条「两个字段分开写，将来要显示时不必再改线」同一条姿态。
+        "changed_files": m.changed_files_json,
         // 该轮的推理原文（决策 244）：**展示留痕**，界面把它收进一个折叠块。
         // 与 `traces` 一样原样带出去，不在后端截断——界面要显示的就是落库那一份。
         "thinking": m.thinking,

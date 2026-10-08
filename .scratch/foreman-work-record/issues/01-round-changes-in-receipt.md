@@ -1,6 +1,6 @@
 # 01: 收口行带机器读出的改动清单
 
-**Status:** ready-for-agent
+**Status:** done（已实现，决策 411；`cargo test --workspace` 1801 通过 / 0 失败、`clippy -D warnings` 与 `fmt --check` 全绿——落地记录见文末）
 **Blocked by:** None (can start immediately)
 
 **What to build:** 作为值班经理，我要**收口行自己说清这一轮动过哪些文件**——因为它是值班长
@@ -25,10 +25,16 @@
 1. **清单从哪来**（不引入新的 IO）：
    - 默认：从本轮 `traces` 里取 `edit_file` / `write_file` 的 `args` 路径，去重、保首次出现序
      （394 那轮二十余处全在里面）；
-   - 本轮若调过 `repair(finish)`：改用那份**权威 diff** 的文件清单（落点在 `repair.rs` 的
-     `propose_repair`），因为 `run_command` 里也可能改文件（`git apply`、`sed -i`）；
+   - 本轮若调用过 `repair`，**并上**那份权威 diff 的文件清单（库里 `payload_json.diff`，
+     不读盘上那份 `.diff` 抄本）——`run_command` 里也可能改文件（`git apply`、`sed -i`），
+     那一支只有 diff 看得见。**是并集不是替换**：痕迹只看得到两个编辑工具，diff 只看得到
+     repair worktree 里那一份提交，谁缺了谁并集都补得上；顺序上痕迹在前（那是这一轮的实际发生序）；
    - 两者都没有（本轮没动文件）：**不出现这一行**（「没有」与「有但是空的」是两件事，与
      `briefing_json` / `traces_json` 同一条口径）。
+   - **档位不是 `auto` 时整轮为空**（实现时定的第二处判据）：值班长的**缺省档位就是 `ask`**，
+     而那一档下 env 写工具**落成提议、文件根本没动**（回执还是一句 `ok = true` 的
+     「已生成一条待确认的提议……这件事没有执行」）。把那种痕迹算成改动就是伪造一份成果——
+     正是本票要停掉的那类谎。`deny` 档同理（连工具都没给）。`ok = false` 的调用也不进清单。
 2. **正文那一行**（机器生成，不由模型自己说——先例是 `FOREMAN_WATCH_MARK` / `OPERATION_LOG_MARK`
    两处后端追加，以及那句设计原话「播报的标记由后端加上，不由模型自己说」）：
 
@@ -55,3 +61,16 @@
 - [ ] L2 集成：**上一轮改过文件的收口行进得去下一轮的 prompt**（本票的全部意义，必须单独钉）
 - [ ] 手工面：拿事故账班次 `01M4CDY9EC9M9FSSE236GJXYZC` 的数据重演——394 那一行的收口句应当
       列出它改过的文件；400 那一行不应再出现「仍未动一行代码」
+
+---
+
+**落地记录（2026-10-08，决策 411）**：
+
+- 迁移 `0045_foreman_changed_files.sql`：`kanban_foreman_messages.changed_files_json`（路径数组，`NULL` = 没动过文件）。
+- 汇总与措辞收在 `crates/core/src/pipeline/foreman/changes.rs`（新模块）：`changed_paths` / `union` / `diff_paths` / `claims_no_change` / `changes_note`。**两条判据是实现时才定下来的**，都写进了票面「形状」：① 档位不是 `auto` 时整轮为空（`ask` 是值班长的缺省档，那一档下写工具只落提议、文件没动）；② `ok = false` 的调用不进清单。
+- 收口处接线 `runner.rs::respond_inner`：痕迹 ∪ 本轮 repair 的 `payload_json.diff`（库里读，不读盘上那份 `.diff`），正文末尾附那一段、声称零改动时换更正开头；行上落 `changed_files_json`。
+- 存储层两处写入补列（`append_foreman_message` / `close_foreman_inflight`）与 `FOREMAN_MESSAGE_COLUMNS`；`storage/proposals.rs` 加 `round_repair_diffs`。
+- 线上加恒在场的加性字段 `changed_files`（`crates/app/src/routes/foreman.rs::message_wire`）——界面这一批不消费，前端另立票。
+- 验收：L1 11 条（`changes.rs` 内联）+ L2 4 条（`tests/integration/foreman.rs` 末尾一组）；`cargo test --workspace` 1801 通过 / 0 失败（7 ignored）。
+- **与票面的两处偏差**（已回写进上面的「形状」）：diff 那份来源做成**并集**而不是替换；补上「档位不是 `auto` 就不算改动」这条判据。
+- **未做**：前端显示（另立票）；票 02（五条收场尾句都按实际产出说话）**Blocked by 本票**，尚未落地。
