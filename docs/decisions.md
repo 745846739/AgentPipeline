@@ -3080,3 +3080,18 @@ config.rs}`、`tests/e2e/tests/integration/stage_boundary.rs`、`docs/testing.md
 **明确不做**：删改任何**已应用过**的迁移文件（决策 13 / 193：sqlx 记校验和，改了就报版本不符）；改历史决策条目（一律追加 + 条目内标注修订）。
 
 **来源**：同决策 401 的 spec / 票 05；落地 `docs/{decisions.md, implementation.md, overview.md, data-model.md}`
+
+### 决策 406 · 中止请求留痕：`request_cancel` / `request_hold` 各落一条 INFO（task / 来路 / notified）
+
+**起因**：2026-10-08 监控任务 `01M4CD59Y977ZQ0GMY9MPSFFMX` 时的实证——**按停的时刻在日志里零痕迹**。执行体那一侧只在**看到**信号时留一句「本轮已有『人按停』的中止请求」，而那一刻可能在一分多钟之后（那次实测 **1 分 43 秒**：08:18:47 按停，08:20:30 执行体才收口）。监控只能靠 `kanban_node_cursors.updated_at` 反推按停时刻——排障不该靠翻库。
+
+**裁决**：
+
+1. 落点在**唯一的发出函数** `executor::request_cancel_with`（`request_cancel` / `request_hold` 两个来路共用它，决策 226 / 276 的通道不变），字段三枚：`task` / `origin`（`Timeout` / `Hold` 的人话）/ `notified`（登记里当时**确实有**在飞的执行体吗）。
+2. **两条分支都要留痕**：`notified=false`（登记里没有执行体——它早已退出，或正卡在不返回的阻塞调用里）正是「按了没反应」要排查的形态，静默是最坏的一种表现。措辞把这一层写出来（「但进程内没有在飞的执行体可通知」）。
+3. **级别 INFO**：它不是异常，是「有人按了钮 / 判超时出手了」——两种来路都记。
+4. **顺带一处形状**：日志捕获（缓冲 + `callsite` interest 的全局兜底）从 `agent/tools.rs` 的测试模块抽到 `testkit::log_capture`——原本只服务票 runner-offload/01 与 106-stability/10 那两条用例，本决策的执行体用例也要用；两处各留一份副本的下一步必然是漂移（那份兜底注释记的正是一次 CI 实红的教训）。
+
+**验证**：L1 `executor.rs::a_cancel_request_without_an_executor_is_still_logged`（`notified=false` + 来路 + task 三者都在）与 `a_cancel_request_reaching_an_executor_is_logged_with_its_origin`（`notified=true` + 判超时来路；借 `try_acquire` 真登记一格）；既有 `tools.rs` 两条日志用例改吃 `testkit::log_capture` 后一字未改仍绿（捕获语义不变）。
+
+**来源**：`.scratch/subagent-governance/issues/04`；落地 `crates/core/src/pipeline/executor.rs`、`crates/testkit/src/{lib.rs, log_capture.rs, Cargo.toml}`

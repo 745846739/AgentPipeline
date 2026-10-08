@@ -11,13 +11,16 @@
 //! - [`repo_fixture::RepoFixture`] / [`repo_fixture::SmartHttp`]：GitHub 来源的离线 fixture
 //!   ——临时裸仓 + 离线 smart HTTP（决策 194，票 01）；[`repo_fixture::RemoteBehaviour`] 另有两种
 //!   远端形态（私有仓 401 / 坏包），供八类失败里打不到的两类当可测输入（票 23）；
-//! - [`SseRecorder`] / 断言助手：事件序列与游标 / run 计数断言。
+//! - [`SseRecorder`] / 断言助手：事件序列与游标 / run 计数断言；
+//! - [`log_capture::LogCapture`]：tracing 输出收进内存缓冲（决策 406）——「这条日志必须
+//!   存在」类断言共用一处，`callsite` interest 的兜底见模块注释。
 
 pub mod assertions;
 pub mod clock;
 pub mod git_fixture;
 pub mod home;
 pub mod killer;
+pub mod log_capture;
 pub mod mock_llm;
 pub mod repo_fixture;
 pub mod script;

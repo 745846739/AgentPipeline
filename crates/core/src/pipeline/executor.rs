@@ -552,9 +552,29 @@ fn request_cancel_with(task_id: &str, origin: CancelOrigin) -> bool {
     match registry.get(task_id) {
         Some(entry) => {
             entry.cancel.request(origin);
+            // 决策 406：**请求发出**的时刻要能在日志流里查到。执行体那一侧只在**看到**
+            // 信号时留一句（`run_inner` 的 held 分支），而那一刻可能在一分多钟之后
+            // （2026-10-08 实测按停延迟 1m43s）——排障不该靠翻库反推按停时刻。
+            // 两条来路（人按停 / 判超时）共用这一个出口，故 `origin` 一并带上。
+            tracing::info!(
+                task = %task_id,
+                origin = origin.as_str(),
+                notified = true,
+                "中止请求已发出"
+            );
             true
         }
-        None => false,
+        None => {
+            // 同样是承重的一笔：`notified=false` 正是「按了没反应」要排查的形态
+            //（执行体早已退出，或正卡在不返回的阻塞调用里）。
+            tracing::info!(
+                task = %task_id,
+                origin = origin.as_str(),
+                notified = false,
+                "中止请求已发出，但进程内没有在飞的执行体可通知"
+            );
+            false
+        }
     }
 }
 
@@ -2885,5 +2905,38 @@ mod tests {
     fn sync_gaps_treat_a_missing_row_as_a_gap() {
         let gaps = sync_metadata_gaps(false, None, None);
         assert_eq!(gaps.len(), 2, "{gaps:?}");
+    }
+
+    // ── 中止请求留痕（决策 406）──
+    //
+    // 2026-10-08 的实证：按停的**时刻**在日志里零痕迹（执行体只在**看到**信号时留一句，
+    // 而那一刻可能在一分多钟之后），排障只能靠 `kanban_node_cursors.updated_at` 反推。
+    // 两个分支各钉一条：登记里有执行体（notified=true）与没有（notified=false）。
+
+    /// 登记里**没有**在飞的执行体：同样留痕——`notified=false` 正是「按了没反应」要查的形态。
+    #[tokio::test]
+    async fn a_cancel_request_without_an_executor_is_still_logged() {
+        let capture = testkit::log_capture::LogCapture::start();
+        // 任务 id 每个用例各给一个：执行体注册表是进程全局的（同 pause.rs 的约定）。
+        assert!(!request_hold("logged-without-executor"));
+        let logs = capture.text();
+        assert!(logs.contains("logged-without-executor"), "logs: {logs}");
+        assert!(logs.contains("中止请求已发出"), "logs: {logs}");
+        assert!(logs.contains("notified=false"), "logs: {logs}");
+        assert!(logs.contains("人工暂停"), "来路要带上: {logs}");
+    }
+
+    /// 登记里**有**执行体：notified=true，来路照记（判超时那条路也一样）。
+    #[tokio::test]
+    async fn a_cancel_request_reaching_an_executor_is_logged_with_its_origin() {
+        let guard = try_acquire("logged-with-executor").expect("空登记应当拿得到这一格");
+        let capture = testkit::log_capture::LogCapture::start();
+        assert!(request_cancel("logged-with-executor"));
+        let logs = capture.text();
+        assert!(logs.contains("logged-with-executor"), "logs: {logs}");
+        assert!(logs.contains("notified=true"), "logs: {logs}");
+        assert!(logs.contains("节点超时"), "来路要带上: {logs}");
+        assert!(guard.cancel.is_requested(), "信号确实置位了");
+        drop(guard);
     }
 }

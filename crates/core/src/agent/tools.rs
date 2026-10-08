@@ -5788,61 +5788,14 @@ mod tests {
     }
 
     // ── 工具级执行日志（票 runner-offload/01）：工具调用在日志流里留 start/end/耗时 ──
-
-    /// 捕获 tracing 输出用的共享缓冲。`#[tokio::test]` 是 current-thread 运行时，
-    /// `set_default` 的线程局部默认订阅者对 await 期间的 event 同样生效。
-    #[derive(Clone, Default)]
-    struct LogBuf(Arc<Mutex<Vec<u8>>>);
-
-    impl std::io::Write for LogBuf {
-        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-            self.0.lock().unwrap().extend_from_slice(buf);
-            Ok(buf.len())
-        }
-        fn flush(&mut self) -> std::io::Result<()> {
-            Ok(())
-        }
-    }
-
-    /// 给 tracing 的 callsite interest cache 一个**全局兜底**（票 106-stability/10）。
-    ///
-    /// tracing 的每个日志调用点（callsite）在**进程内第一次发射**时按「当时的派发器
-    /// 状态」缓存一次 interest；本测试二进制没有全局订阅者，scoped（线程局部）订阅者
-    /// 又只在**持有它的那个线程**上可见——满载并行跑 752 个测试时，某个 callsite 的
-    /// 首次发射恰好落在没有 scoped 订阅者的线程/时刻，interest 被缓存成 `never`，
-    /// 此后**全进程**在该调用点上的事件在宏层被静默丢弃，直到下次重建。实测签名：
-    /// 两条「工具调用开始」在缓冲里、「收场」零条（2026-10-04 106 merge 闸门实红 +
-    /// 本机 40 轮 15 红；同窗口的另一个订阅者测试却绿——各 callsite 的注册时刻互不相干）。
-    ///
-    /// 这里一次性装一个 writer 为 sink（事件全丢）的全局订阅者：全局注册者一旦存在，
-    /// 所有 callsite 的注册与重建都只会算出 `always`，注册竞态从此不可达；而派发侧
-    /// scoped 订阅者仍然优先（`get_default` 先看线程局部），本组测试的捕获语义不变。
-    /// 全局兜底只付「事件格式化后丢进 sink」的格式化成本，无行为影响。
-    fn warm_interest_cache() {
-        static ONCE: std::sync::Once = std::sync::Once::new();
-        ONCE.call_once(|| {
-            let _ = tracing::subscriber::set_global_default(
-                tracing_subscriber::fmt()
-                    .with_max_level(tracing::Level::INFO)
-                    .with_ansi(false)
-                    .with_writer(std::io::sink)
-                    .finish(),
-            );
-        });
-    }
+    //
+    // 捕获器与 callsite interest 的全局兜底都搬去了 `testkit::log_capture`（决策 406：
+    // 一份定义，执行体那边的「请求中止留痕」断言也用它）。
 
     #[tokio::test]
     async fn every_tool_call_leaves_start_and_end_lines_in_the_log_stream() {
-        warm_interest_cache();
+        let capture = testkit::log_capture::LogCapture::start();
         let s = setup(Stage::Develop);
-        let buf = LogBuf::default();
-        let writer_buf = buf.clone();
-        let subscriber = tracing_subscriber::fmt()
-            .with_max_level(tracing::Level::INFO)
-            .with_ansi(false)
-            .with_writer(move || writer_buf.clone())
-            .finish();
-        let _guard = tracing::subscriber::set_default(subscriber);
 
         // 一条命令类 + 一条非命令类：两条路径都必须留痕。
         s.executor
@@ -5863,7 +5816,7 @@ mod tests {
             .await
             .unwrap();
 
-        let logs = String::from_utf8(buf.0.lock().unwrap().clone()).unwrap();
+        let logs = capture.text();
         // 消息本身 + 工具名各出现两次（开始/收场各一次），收场带耗时字段。
         assert_eq!(logs.matches("工具调用开始").count(), 2, "logs: {logs}");
         assert_eq!(logs.matches("工具调用收场").count(), 2, "logs: {logs}");
@@ -5927,16 +5880,8 @@ mod tests {
 
     #[tokio::test]
     async fn failing_tool_still_leaves_an_end_line_with_the_error() {
-        warm_interest_cache();
+        let capture = testkit::log_capture::LogCapture::start();
         let s = setup(Stage::Develop);
-        let buf = LogBuf::default();
-        let writer_buf = buf.clone();
-        let subscriber = tracing_subscriber::fmt()
-            .with_max_level(tracing::Level::INFO)
-            .with_ansi(false)
-            .with_writer(move || writer_buf.clone())
-            .finish();
-        let _guard = tracing::subscriber::set_default(subscriber);
 
         let err = s
             .executor
@@ -5947,7 +5892,7 @@ mod tests {
             .await
             .unwrap_err();
 
-        let logs = String::from_utf8(buf.0.lock().unwrap().clone()).unwrap();
+        let logs = capture.text();
         assert!(!err.to_string().is_empty());
         assert!(logs.contains("工具调用开始"), "logs: {logs}");
         assert!(logs.contains("工具调用收场"), "失败也要有收场行: {logs}");

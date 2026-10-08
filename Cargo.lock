@@ -2375,6 +2375,8 @@ dependencies = [
  "sqlx",
  "tempfile",
  "tokio",
+ "tracing",
+ "tracing-subscriber",
  "ulid",
  "zip",
 ]
