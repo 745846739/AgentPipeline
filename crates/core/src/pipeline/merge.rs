@@ -149,9 +149,7 @@ impl MergeFlow<'_> {
                     let base_ref = Git.base_ref(repo, &project.default_branch).await?;
                     let current_base = Git.rev_parse(repo, &base_ref).await?;
                     let stored = self.store.merge_metadata(&task.id).await?.ok_or_else(|| {
-                        Error::Validation(
-                            "approval=approved 但没有 merge_result（决策 119 契约）".into(),
-                        )
+                        Error::Validation("approval=approved 但没有 merge_result".into())
                     })?;
                     // 基准校验（决策 96）：失配 → approval 重置回 none、回阶段 A（continue）。
                     // 判定与重置抽成独立一层：不跑全节点循环也能直测（票 04 窄测试）。

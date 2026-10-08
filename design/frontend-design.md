@@ -719,6 +719,35 @@ GET /tasks/{id}               → 详情页装载 + 断线重连后的全量校�
 - 之所以不是「修 bug」：那条要求是**决策 169 把主题六升格为现行视觉规格**时带进来的，
   故按本项目惯例**追加修订决策（199）并在被改写的原文处标注**，不静默改。
 
+**机器门的规则清单（`frontend/src/lib/copy-discipline.test.ts`，四条规则、两张扫描面）**
+
+门是编号退场的兜底（决策 199 裁决 ④）：索引与规则最大的失败形态不是没建，是建完悄悄烂掉。
+规则 1–3 扫**前端**（`frontend/src` 的 `.svelte` / `.ts`，注释剥掉、测试与 bench 文件除外）；
+规则 4 扫**后端直呈报文**——API 报文与落库 error 字段也是页面文案（toast / `.reg-err` /
+dossier / 现场页签读它们），既有门只扫前端时它是整条漏面。
+
+| 规则 | 判据 | 扫描面 |
+|---|---|---|
+| 1 | 面向用户的文案里不出现「决策 N」 | 前端：标签间文本、`title` / `placeholder` / `aria-label` 等属性值、字符串字面量 |
+| 2 | 不出现字面 Markdown 强调 `**…**`（掩码 `***` 是有意设计，天然放过） | 同上 |
+| 3 | **半中半英**：A-1「含汉字 + snake_case 内部符号」；A-2「含汉字 + 阶段 id（`architect-design` / `develop-design` / `test-design` / `sync-check` / `validate_output`）或独立词 `develop` / `review` / `test`」；产物文件名连写（`review-diff.diff` / `test-report.md`）负向放过（B5） | 同上（渲染近似：表达式只取其中的字符串字面量，用户看到的是值不是字段名） |
+| 4 | 后端**两类构造形态**的字符串字面量里不出现「决策 N / 票 N」——`ApiError::…("…")` / `Error::…("…")` / `error: Some("…")` 与 `test_blockers` 类载荷 push；`tracing::` 日志、`#[test]` 断言消息、system prompt、CLI `--help` 不在形态内（口径用例钉住，防规则烂成误报；**整库搜改是红线**，门与改法同源同口径） | `crates/**/*.rs`（`tests/` / `benches/` 目录除外） |
+
+**B 类边界登记表**（规则 3 的豁免，门内 `EXEMPTIONS` 常量）：B1 键名标签与键名校验 /
+B2 动作句键名引用 / B3 域词表词（词表收录的工具名等）/ B4 mono 读数徽章 / B5 产物文件名作对照。
+每条 = 位置 + 匹配 + B 类编号 + 一句理由；**登记表只收 B 类，不收「暂时不想改」**；
+条目数入断言（`expect(EXEMPTIONS.length).toBe(N)`），增删条目必须显式改断言——让「悄悄烂掉」可见。
+
+**判别问句**（登记表每条理由都是它的答案）：删掉这个符号，这句话还说清会发生什么、
+你该做什么吗？说得清 → 摘；说不清 → 留（B 类，进登记表）但同句要有人话。
+
+**移交清单（本次不改，避免丢账）**
+
+- **「台账」一词两指**（视觉语汇 / 领域词 / 对讲台用语）：消歧要同步动 `docs/glossary.md`
+  与 §12.2 两处同源词表、可能触及决策 200，且 `frontend/e2e/talk.spec.ts` 大量钉住——另票处理。
+- **CLI `--help` 文案里的编号**：命令行输出不是页面，规则 4 的形态天然不扫——另票处理。
+- **agent system prompt / transcript 注入块内文**：agent 读的不是页面——不动。
+
 ### 12.2 车间隐喻首现翻译（决策 200）
 
 **口径：隐喻保留（它是整个主题的投资）；每个词在「每个页面」内首次出现处给一次平实说法；
@@ -815,7 +844,7 @@ GET /tasks/{id}               → 详情页装载 + 断线重连后的全量校�
 | 不支持的 provider 行降级灰显 + 琥珀标（**标里不带内部编号**） | `frontend/src/routes/SettingsProviders.svelte:297` | 决策 103；决策 199（编号退到 `title`） |
 | 状态过滤槽 = 图标 + 词（词取 `FILTER_LABELS`），窄屏只给当前项带词 | `frontend/src/components/layout/TopBar.svelte`、`frontend/src/stores/board.svelte.ts` | 决策 201 |
 | pending 数的唯一显示位是「待处理 N」芯片（槽位不再重复这个数） | `frontend/src/components/layout/TopBar.svelte`、`frontend/src/components/layout/StatusLine.svelte` | 决策 92 / 201 |
-| 正文不出现内部决策编号（机器门扫面向用户的文案） | `frontend/src/lib/copy-discipline.test.ts` | 决策 199 |
+| 正文不出现内部决策编号与半中半英符号，后端直呈报文同步摘编号（机器门四条规则：规则 1/2/3 扫前端文案、规则 4 窄扫后端两类构造形态；B 类边界走豁免登记表，判别问句见 §12.1） | `frontend/src/lib/copy-discipline.test.ts` | 决策 199（规则 3/4 是其落地扩面，不新立决策）；移交清单（台账词表 / CLI `--help` / prompt 内文）见 §12.1 |
 | 对比度门：`--text-3` ≥ 4.5:1（次级必读）；`--text-4` 豁免且不得承载必读信息 | `frontend/src/theme/contrast.ts`、`frontend/src/theme/contract.ts` | 决策 195 |
 | token 值与全局样式表互为镜像，逐值双向比对，禁裸十六进制颜色 | `frontend/src/theme/css-parity.test.ts`、`frontend/src/app.css` | 决策 169 |
 | 三个模态框：Escape 一律可关、焦点进第一个输入框并关在框内、对话框可被播报 | `frontend/src/components/ui/Modal.svelte`、`frontend/src/components/board/NewTaskDialog.svelte`、`frontend/src/components/task/SplitDialog.svelte`、`frontend/src/components/task/ModelOverrideDialog.svelte` | 决策 169 的交互骨架；票 02 |

@@ -581,7 +581,7 @@ pub fn uninstall(skills_root: &Path, name: &str) -> Result<()> {
     // ——哪怕文件被人从磁盘上删了，DELETE 也该回「出厂技能不可删除」而不是 404。
     if crate::agent::factory::is_factory_skill(&name) {
         return Err(Error::Validation(format!(
-            "出厂技能不可删除：{name} 随产品携带（决策 261 的白名单）。要让它不生效，清空 foreman 阶段配置里的 persona_append 点名即可"
+            "出厂技能不可删除：{name} 随产品携带。要让它不生效，清空 foreman 阶段配置里的 persona_append 点名即可"
         )));
     }
     let target = skills_root.join(&name);

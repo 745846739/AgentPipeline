@@ -21,8 +21,26 @@
  * 第二条规则（ux-audit-3 票 08）：同一张扫描面、同一条边界，再钉「面向用户的文案里
  * 不出现字面 Markdown 强调星号 `**…**`」——设置两页走查当场的唯一新问题，剥注释后
  * 全站实测恰 4 处。判据天然放过掩码 `***`（`NOTIFY_SECRET_MASK`，有意设计）。
+ *
+ * 第三条规则（本票扩面，决策 199 的落地）：**半中半英**——A-1「含汉字 + snake_case 内部符号」、
+ * A-2「含汉字 + 阶段 id（`architect-design` / `develop-design` / `test-design` / `sync-check` /
+ * `validate_output`）或独立词 `develop|review|test`」。既有两条规则管不到这类（它们不含「决策 N」）；
+ * A-2 对产物文件名连写（`review-diff.diff` / `test-report.md`）负向放过（B5 边界）。
+ *
+ * 第四条规则（同一张扩面的后端半边）：**API 报文与落库 error 字段也是页面文案**（toast /
+ * `.reg-err` / dossier / 现场页签读它们），而既有门只扫 `frontend/src`。规则 4 只扫**两类构造形态**
+ * 的字符串字面量——`ApiError::…("…")` / `Error::…("…")` / `error: Some("…")` 与
+ * `test_blockers` 类载荷 push——`tracing::` 日志、`#[test]` 断言消息、system prompt、CLI `--help`
+ * 不在形态内（口径用例钉住，防规则烂成误报）。**整库搜改是红线**，门与改法同源同口径。
+ *
+ * **B 类边界登记表**（规则 3 的豁免，只收这五类、不收「暂时不想改」）：
+ * B1 键名标签与键名校验 / B2 动作句键名引用 / B3 域词表词（词表收录的工具名等）/
+ * B4 mono 读数徽章 / B5 产物文件名作对照。条目数入断言，让「悄悄烂掉」可见。
+ *
+ * **判别问句**（登记表每条理由都是它的答案）：删掉这个符号，这句话还说清会发生什么、
+ * 你该做什么吗？说得清 → 摘；说不清 → 留（B 类，进登记表）但同句要有人话。
  */
-import { readFileSync, readdirSync, statSync } from 'node:fs';
+import { existsSync, readFileSync, readdirSync, statSync } from 'node:fs';
 import { join, relative, resolve } from 'node:path';
 import { describe, expect, it } from 'vitest';
 
@@ -211,5 +229,428 @@ describe('文案纪律 · 面向用户的文案里不出现字面 Markdown 强�
     expect(hits[0].snippet).toContain('保存的是**整体覆盖**');
     // .ts 字符串字面量同样算（不是只有模板才报）
     expect(findLiteralStars("note('闸门**不改写**')", false)).toHaveLength(1);
+  });
+});
+
+/* ══════════════════════ 规则 3：前端半中半英（A-1 / A-2）══════════════════════ */
+
+/** 汉字判据：段内有汉字才可能是「人话句里夹符号」（纯英文键名标签天然放过）。 */
+const HAN = /\p{Script=Han}/u;
+/** A-1：snake_case 内部符号（小写字母开头、至少一段 `_`）。 */
+const SNAKE = /\b[a-z][a-z0-9]*(?:_[a-z0-9]+)+\b/;
+/** A-2：阶段 / 节点 id 全称。 */
+const STAGE_ID = /\b(?:architect-design|develop-design|test-design|sync-check|validate_output)\b/;
+/** A-2：独立词形态的阶段名。 */
+const STAGE_WORD = /\b(?:develop|review|test)\b/;
+/** A-2 负向排除：产物文件名与连字符 token（`review-diff.diff` / `test-report.md` / `stage-name` 连写）。 */
+const FILENAME_TOKEN =
+  /\b[\w-]+\.(?:diff|md|log|json|txt|ts|js|yaml|yml|toml|html|css|png|svg)\b|\b(?:review|test|develop|architect)-[\w-]+\b/g;
+
+interface CopySegment {
+  /** 段文本（注释已剥）。 */
+  readonly seg: string;
+  /** 段在原文中的字节偏移（maskComments 等长，行号可回对原文）。 */
+  readonly offset: number;
+}
+
+/**
+ * 渲染近似：用户看到的是**值**不是表达式——字面段照留，`{…}` / `${…}` 表达式只取其中的
+ * 字符串字面量（`base_url {x ?? '默认'}` 渲染出 `默认`，`评审：{task.review_mode}`
+ * 渲染出的是值、不带字段名）。这样 `评审：{task.review_mode}` 不误报、
+ * `base_url 默认` 这类徽章如实报。
+ */
+function renderedApprox(seg: string): string {
+  let out = '';
+  let depth = 0;
+  let cur = '';
+  for (let i = 0; i < seg.length; i++) {
+    const c = seg[i];
+    if (c === '{' || (c === '$' && seg[i + 1] === '{')) {
+      if (depth === 0) {
+        out += cur;
+        cur = '';
+      }
+      if (c === '$') i++;
+      depth++;
+      continue;
+    }
+    if (depth > 0 && c === '}') {
+      depth--;
+      if (depth === 0) {
+        for (const sm of cur.matchAll(/'([^']*)'|"([^"]*)"/g)) out += `${sm[1] ?? ''}${sm[2] ?? ''}`;
+        cur = '';
+      }
+      continue;
+    }
+    if (depth > 0) cur += c;
+    else out += c;
+  }
+  // 不平衡兜底：同样只取表达式里的字符串字面量（不把裸代码当文案）
+  if (depth > 0) for (const sm of cur.matchAll(/'([^']*)'|"([^"]*)"/g)) out += `${sm[1] ?? ''}${sm[2] ?? ''}`;
+  return out;
+}
+
+/**
+ * 从（已剥注释的）源码里提取字符串字面量段。
+ * 单/双引号遇到换行即判未闭合（防孤立 `'` 吞掉大段代码）；模板字面量允许跨行，
+ * 且按 `${…}` 深度配平——嵌套反引号（`… ${f ? 'a' : `b${x}`}`）整段算一个模板。
+ */
+function extractStringLiterals(masked: string, out: CopySegment[], base = 0): void {
+  let i = 0;
+  while (i < masked.length) {
+    const c = masked[i];
+    if (c === "'" || c === '"') {
+      const start = i;
+      let j = i + 1;
+      while (j < masked.length && masked[j] !== c && masked[j] !== '\n') {
+        if (masked[j] === '\\') j++;
+        j++;
+      }
+      if (j < masked.length && masked[j] === c) {
+        out.push({ seg: masked.slice(start + 1, j), offset: base + start + 1 });
+        i = j + 1;
+      } else {
+        i = start + 1; // 未闭合：跳过这枚引号，不当段
+      }
+      continue;
+    }
+    if (c === '`') {
+      const start = i;
+      let j = i + 1;
+      let depth = 0;
+      while (j < masked.length) {
+        if (masked[j] === '\\') {
+          j += 2;
+          continue;
+        }
+        if (masked[j] === '$' && masked[j + 1] === '{') {
+          depth++;
+          j += 2;
+          continue;
+        }
+        if (depth > 0 && masked[j] === '}') {
+          depth--;
+          j++;
+          continue;
+        }
+        if (depth === 0 && masked[j] === '`') break;
+        j++;
+      }
+      if (j < masked.length) {
+        out.push({ seg: masked.slice(start + 1, j), offset: base + start + 1 });
+        i = j + 1;
+      } else {
+        i = start + 1;
+      }
+      continue;
+    }
+    i++;
+  }
+}
+
+/**
+ * 提取一份源码里**面向用户的 copy 段**（注释已剥）：
+ * `.svelte` = 标签间文本 + `title` / `placeholder` / `aria-label` / `alt` 属性值 + script 内字符串
+ * （`<style>` 不进扫描面）；`.ts` = 字符串与模板字面量。
+ */
+function extractCopySegments(text: string, html: boolean): { masked: string; segments: CopySegment[] } {
+  const masked = maskComments(text, html);
+  const segments: CopySegment[] = [];
+  if (!html) {
+    extractStringLiterals(masked, segments);
+    return { masked, segments };
+  }
+  const blockRe = /(<script[^>]*>[\s\S]*?<\/script>)|(<style[^>]*>[\s\S]*?<\/style>)/g;
+  const blocks = [...masked.matchAll(blockRe)].map((m) => ({
+    start: m.index,
+    end: m.index + m[0].length,
+    script: !!m[1],
+  }));
+  const blockAt = (i: number) => blocks.find((b) => i >= b.start && i < b.end);
+  // 标签间文本（跳过 script / style 区间）
+  let inTag = false;
+  let buf = '';
+  let bufStart = 0;
+  let wasSkip = false;
+  for (let i = 0; i < masked.length; i++) {
+    const b = blockAt(i);
+    if (b) {
+      if (buf.trim()) segments.push({ seg: buf, offset: bufStart });
+      buf = '';
+      wasSkip = true;
+      continue;
+    }
+    if (wasSkip) {
+      wasSkip = false;
+      bufStart = i;
+    }
+    const c = masked[i];
+    if (c === '<') {
+      if (buf.trim()) segments.push({ seg: buf, offset: bufStart });
+      buf = '';
+      inTag = true;
+      continue;
+    }
+    if (c === '>' && inTag) {
+      inTag = false;
+      bufStart = i + 1;
+      continue;
+    }
+    if (!inTag) {
+      if (!buf) bufStart = i;
+      buf += c;
+    }
+  }
+  if (buf.trim()) segments.push({ seg: buf, offset: bufStart });
+  // 关心的属性值（引号值与 {...} 表达式值）
+  const attrRe =
+    /\b(?:title|placeholder|aria-label|alt|aria-description)\s*=\s*(?:"([^"]*)"|\{([^{}]*)\}|'([^']*)')/g;
+  for (const m of masked.matchAll(attrRe)) {
+    if (blockAt(m.index)) continue;
+    segments.push({ seg: m[1] ?? m[2] ?? m[3] ?? '', offset: m.index });
+  }
+  // script 内的字符串
+  for (const b of blocks) {
+    if (b.script) extractStringLiterals(masked.slice(b.start, b.end), segments, b.start);
+  }
+  return { masked, segments };
+}
+
+export interface HalfMixedHit {
+  /** 1 起的行号。 */
+  readonly line: number;
+  /** 命中哪条判据。 */
+  readonly rule: 'A-1' | 'A-2';
+  /** 命中的符号。 */
+  readonly token: string;
+  /** 渲染近似文本（截断，供登记表匹配与定位）。 */
+  readonly text: string;
+}
+
+/** 在一份源码里找「人话句里夹内部符号」（注释已剥）。 */
+export function findHalfMixed(text: string, html: boolean): HalfMixedHit[] {
+  const { masked, segments } = extractCopySegments(text, html);
+  const out: HalfMixedHit[] = [];
+  for (const { seg, offset } of segments) {
+    const rendered = renderedApprox(seg);
+    if (!HAN.test(rendered)) continue;
+    const snake = rendered.match(SNAKE);
+    if (snake) {
+      out.push({ ...lineOf(masked, offset), rule: 'A-1', token: snake[0], text: rendered.trim().slice(0, 110) });
+      continue;
+    }
+    const stageId = rendered.match(STAGE_ID);
+    if (stageId) {
+      out.push({ ...lineOf(masked, offset), rule: 'A-2', token: stageId[0], text: rendered.trim().slice(0, 110) });
+      continue;
+    }
+    const word = rendered.replace(FILENAME_TOKEN, ' ').match(STAGE_WORD);
+    if (word) {
+      out.push({ ...lineOf(masked, offset), rule: 'A-2', token: word[0], text: rendered.trim().slice(0, 110) });
+    }
+  }
+  return out;
+}
+
+function lineOf(masked: string, offset: number): { line: number } {
+  return { line: masked.slice(0, offset).split('\n').length };
+}
+
+/**
+ * B 类豁免登记表——**只收 B1–B5，不收「暂时不想改」**。
+ * 每条 = 位置（相对 `src/` 的文件）+ 匹配（渲染近似须含的子串）+ B 类编号 + 一句理由
+ * （理由即判别问句的答案）。条目数入断言（见规则 3 的用例），改了文案导致条目失效同样会红。
+ */
+interface CopyExemption {
+  readonly file: string;
+  readonly match: string;
+  readonly boundary: 'B1' | 'B2' | 'B3' | 'B4' | 'B5';
+  readonly reason: string;
+}
+
+const EXEMPTIONS: readonly CopyExemption[] = [
+  // B1 键名标签与键名校验：键名即「在填哪一项 / 哪个键不合格」，摘掉说不清
+  { file: 'components/settings/ProjectForm.svelte', match: 'local_path', boundary: 'B1', reason: '表单键名标签：标签主体就是配置键，键名即「在填哪一项」。' },
+  { file: 'components/settings/ProviderForm.svelte', match: 'context_window', boundary: 'B1', reason: '表单键名标签：键名与输入框一一对应，摘掉悬空。' },
+  { file: 'components/settings/ProviderForm.svelte', match: 'base_url', boundary: 'B1', reason: '表单键名标签：可选项说明挂在键名后，键名是主语。' },
+  { file: 'components/settings/StageConfigForm.svelte', match: 'provider_id', boundary: 'B1', reason: '表单键名标签：留空 / 填写规则直接挂在键名后。' },
+  { file: 'components/settings/StageConfigForm.svelte', match: 'persona_path', boundary: 'B1', reason: '表单键名标签：路径格式要求挂在键名后，摘键名不知指哪项。' },
+  { file: 'components/settings/StageConfigForm.svelte', match: 'persona_append', boundary: 'B1', reason: '表单键名标签：追加指令的可选项说明挂在键名后。' },
+  { file: 'lib/stageConfigs.ts', match: 'max_tokens', boundary: 'B1', reason: '键名校验：报错必须点名是哪个键不合格。' },
+  { file: 'lib/stageConfigs.ts', match: 'idle_timeout_sec', boundary: 'B1', reason: '键名校验：负值报错点名键，用户才知道改哪一格。' },
+  { file: 'lib/stageConfigs.ts', match: 'max_duration_sec', boundary: 'B1', reason: '键名校验：负值报错点名键。' },
+  { file: 'lib/stageConfigs.ts', match: 'max_rounds', boundary: 'B1', reason: '键名校验：正整数要求点名键。' },
+  { file: 'lib/stageConfigs.ts', match: 'watch_token_budget', boundary: 'B1', reason: '键名校验：正整数要求点名键。' },
+  { file: 'lib/stageConfigs.ts', match: 'skills_json', boundary: 'B1', reason: '键名校验：结构错误点名键并给改法。' },
+  { file: 'lib/stageConfigs.ts', match: 'node_overrides_json', boundary: 'B1', reason: '键名校验：JSON 结构错误点名键。' },
+  { file: 'lib/providers.ts', match: 'context_window', boundary: 'B1', reason: '键名校验：值域错误点名键，用户才知道改哪一格。' },
+  // B2 动作句键名引用：指令的宾语就是这个键
+  { file: 'lib/providers.ts', match: 'base_url 要留空', boundary: 'B2', reason: '动作句键名引用：「要留空 / 写成…」操作的对象就是这个键，摘掉不知道改什么。' },
+  // B3 域词表词：词表收录的工具名，句义依赖其名
+  { file: 'routes/SettingsTools.svelte', match: 'run_command', boundary: 'B3', reason: '域词表词：run_command 是词表收录的工具名（白名单模式条目），主语即它。' },
+  { file: 'routes/SettingsTools.svelte', match: 'offload_run', boundary: 'B3', reason: '域词表词：offload_run 是外发动作面的工具名，说清「只认显式调」靠它。' },
+  // B4 mono 读数徽章：键名 + 值的读数形制
+  { file: 'routes/SettingsProviders.svelte', match: 'base_url', boundary: 'B4', reason: 'mono 读数徽章：键名是徽章的固定前缀，值跟在其后。' },
+  { file: 'routes/SettingsStages.svelte', match: 'max_tokens', boundary: 'B4', reason: 'mono 读数徽章：temp / max_tokens 读数并排，键名即读数标签。' },
+  // B5 产物文件名作对照：文件名由 A-2 负向放过，同句给人话主语
+  { file: 'components/task/ReviewForm.svelte', match: 'review-diff.diff', boundary: 'B5', reason: '产物文件名作对照：文件名连写不进 A-2 命中面，同句已给「评审差异」人话主语。' },
+];
+
+describe('文案纪律 · 规则 3：人话句里不夹内部符号（半中半英 A-1 / A-2）', () => {
+  it('口径正例：A-1 snake_case 夹在汉字句里命中，A-2 阶段词命中', () => {
+    const a1 = findHalfMixed('<p>以下为 project_analysis 探测到的事实</p>', true);
+    expect(a1).toHaveLength(1);
+    expect(a1[0].rule).toBe('A-1');
+    expect(a1[0].token).toBe('project_analysis');
+    expect(a1[0].line).toBe(1);
+    const a2 = findHalfMixed('<div>单元测试结果尚未生成（review 在 test 之前）。</div>', true);
+    expect(a2).toHaveLength(1);
+    expect(a2[0].rule).toBe('A-2');
+    // 阶段 id 全称同样算（含汉字前提下）
+    expect(findHalfMixed('<p>同步检查 sync-check 不占游标行</p>', true)).toHaveLength(1);
+    // .ts 字符串字面量同样在扫描面
+    expect(findHalfMixed("throw new Error('split_task 需要提供拆分方案');", false)).toHaveLength(1);
+  });
+
+  it('口径负例：纯英文键名、文件名连写、徽章掩码不命中；注释不算', () => {
+    // B1 键名标签不含汉字 → 不是「人话句夹符号」
+    expect(findHalfMixed('<span>idle_timeout_sec</span>', true)).toEqual([]);
+    // A-2 负向排除：产物文件名连写
+    expect(findHalfMixed('<div>评审差异（review-diff.diff）尚未生成或不可读。</div>', true)).toEqual([]);
+    expect(findHalfMixed('<div>test-report.md 尚未生成。</div>', true)).toEqual([]);
+    // 掩码徽章（无汉字）
+    expect(findHalfMixed('<span class="mono">api_key ***</span>', true)).toEqual([]);
+    expect(findHalfMixed('const badge = `ctx ${n} · max_tokens ${t}`;', false)).toEqual([]);
+    // 注释与 HTML 注释剥掉后不算
+    expect(findHalfMixed('<!-- 下面会用 project_analysis -->\n<p>正文</p>', true)).toEqual([]);
+    expect(findHalfMixed('// stage_configs 的校验\nexport const x = 1;', false)).toEqual([]);
+    // 表达式里的字段名渲染出的是值，不算（渲染近似）
+    expect(findHalfMixed('<span>评审：{task.review_mode}</span>', true)).toEqual([]);
+  });
+
+  it('全站归零：命中全部落在 B 类登记表内（豁免仅经登记表）', () => {
+    const violations: string[] = [];
+    for (const file of files) {
+      const rel = relative(srcRoot, file).replaceAll('\\', '/');
+      for (const hit of findHalfMixed(readFileSync(file, 'utf8'), file.endsWith('.svelte'))) {
+        const exempt = EXEMPTIONS.some((e) => e.file === rel && hit.text.includes(e.match));
+        if (!exempt) violations.push(`${rel}:${hit.line}: [${hit.rule}:${hit.token}] ${hit.text}`);
+      }
+    }
+    expect(violations).toEqual([]);
+  });
+
+  it('登记表只收 B 类：条目数固定、每条理由非空、五类边界各至少一条', () => {
+    expect(EXEMPTIONS.length).toBe(20);
+    expect(EXEMPTIONS.every((e) => e.reason.trim().length > 0)).toBe(true);
+    for (const b of ['B1', 'B2', 'B3', 'B4', 'B5'] as const) {
+      expect(EXEMPTIONS.some((e) => e.boundary === b)).toBe(true);
+    }
+    // 登记的是「位置/匹配」——文件必须在扫描面里（防登记表烂成死条目）
+    const relFiles = files.map((f) => relative(srcRoot, f).replaceAll('\\', '/'));
+    expect(EXEMPTIONS.every((e) => relFiles.includes(e.file))).toBe(true);
+  });
+
+  it('扫描面与既有两门共用同一份清单（测试 / bench 文件不在内）', () => {
+    expect(files.some((f) => /\.(test|spec|bench)\.ts$/.test(f))).toBe(false);
+  });
+});
+
+/* ══════════════════════ 规则 4：后端直呈报文窄扫 ═══════════════════════ */
+
+/** 内部编号（含全角与「决策 130 / 137」连写）与票据号：规则 4 的两类编号形态。 */
+const BACKEND_REF = new RegExp(
+  String.raw`决策\s*[0-9０-９]{1,3}(?:\s*[/、]\s*[0-9０-９]{1,3})*|票\s*[0-9０-９]{1,3}[①②③④⑤⑥⑦⑧⑨⑩⑪⑫⑬⑭⑮]?(?:\s*[/、]\s*[0-9０-９]{1,3})*`,
+  'g',
+);
+
+/** 两类构造形态（**整库搜改是红线**，门只认这两类）：报文构造器 / error 字段 / 载荷 push。 */
+const BACKEND_CONSTRUCTORS: readonly RegExp[] = [
+  /ApiError::[a-z_]+\s*\(/g,
+  /\bError::[A-Za-z]+\s*\(/g,
+  /\berror:\s*Some\s*\(/g,
+  /\b(?:test_blockers|dev_blockers|metadata_gaps|gaps|warnings)\s*\.push\s*\(/g,
+];
+
+export interface BackendRef {
+  readonly line: number;
+  readonly match: string;
+  readonly snippet: string;
+}
+
+/** 在一段 Rust 源码里找**构造形态内**的编号（注释已剥；日志 / 断言 / prompt / CLI 不在形态内）。 */
+export function findBackendCopyRefs(text: string): BackendRef[] {
+  const masked = maskComments(text, false);
+  const out: BackendRef[] = [];
+  for (const re of BACKEND_CONSTRUCTORS) {
+    re.lastIndex = 0;
+    for (const m of masked.matchAll(re)) {
+      // 构造器 `(` 之后的第一个字符串字面量（允许空白 / 换行 / format!( 包一层）
+      const window = masked.slice(m.index + m[0].length, m.index + m[0].length + 400);
+      const lit = window.match(/^\s*(?:format!\s*\(\s*)?"([^"]*)"/s);
+      if (!lit) continue;
+      const bad = lit[1].match(BACKEND_REF);
+      if (!bad) continue;
+      // 行号对回**字面量**（报文本体）所在行，而非构造器行
+      const quoteAt = m.index + m[0].length + (lit.index ?? 0) + lit[0].indexOf('"');
+      const { line } = lineOf(masked, quoteAt);
+      out.push({ line, match: bad[0], snippet: lit[1].trim().slice(0, 110) });
+    }
+  }
+  return out;
+}
+
+/** 后端扫描面：`crates` 下的全部 `.rs`，`tests/` / `benches/` 目录除外（与前端同一边界）。 */
+function collectCratesFiles(dir: string): string[] {
+  const out: string[] = [];
+  for (const name of readdirSync(dir)) {
+    const p = join(dir, name);
+    if (statSync(p).isDirectory()) {
+      if (name === 'tests' || name === 'benches' || name === 'node_modules') continue;
+      out.push(...collectCratesFiles(p));
+    } else if (name.endsWith('.rs')) out.push(p);
+  }
+  return out;
+}
+
+/** vitest 从 `frontend/` 运行，仓根的 crates 在 `../crates`（兼容从仓根直跑）。 */
+const cratesRoot = [resolve(process.cwd(), '../crates'), resolve(process.cwd(), 'crates')].find(existsSync);
+
+describe('文案纪律 · 规则 4：后端直呈报文里不出现内部编号（两类构造形态窄扫）', () => {
+  it('口径正例：报文构造器、error 字段、载荷 push 的字面量命中（含多行 format!）', () => {
+    expect(findBackendCopyRefs('ApiError::bad_request("只有终态任务可以归档（决策 34）")')).toHaveLength(1);
+    expect(findBackendCopyRefs('error: Some("标终态（票 02②）".into()),')).toHaveLength(1);
+    expect(findBackendCopyRefs('test_blockers.push(format!("high 场景 design_refs 缺失（决策 136）"));')).toHaveLength(1);
+    const multiline = [
+      'return Err(Error::Validation(format!(',
+      '    "阶段 {} 无 skip（决策 86）",',
+      ')));',
+    ].join('\n');
+    expect(findBackendCopyRefs(multiline)).toHaveLength(1);
+    expect(findBackendCopyRefs(multiline)[0].line).toBe(2);
+  });
+
+  it('口径负例：日志、断言消息、注释、prompt 与 CLI 报文不在形态内（防误报烂门）', () => {
+    expect(findBackendCopyRefs('tracing::warn!(task = %id, "脏工作区（不阻塞，决策 61）")')).toEqual([]);
+    expect(findBackendCopyRefs('assert_eq!(offloaded, 1, "卸载文件应真实落盘（决策 148）");')).toEqual([]);
+    expect(findBackendCopyRefs('.expect("放弃分支必须真的落账（决策 304）");')).toEqual([]);
+    expect(findBackendCopyRefs('// 决策 3 的日志口径（照旧）')).toEqual([]);
+    expect(findBackendCopyRefs('println!("  --allowed-origin <ORIGIN>（决策 157）：");')).toEqual([]);
+    // 形态对但没有编号 → 不命中
+    expect(findBackendCopyRefs('Error::Task(format!("技能不存在：{name}"))')).toEqual([]);
+    // 非 error 字段的 Some(…) 载荷不在口径内
+    expect(findBackendCopyRefs('Some("游标分裂（决策 90）"),')).toEqual([]);
+  });
+
+  it('全站归零：crates 窄形态命中 0（tests / benches 目录不在扫描面）', () => {
+    expect(cratesRoot, 'crates 目录应存在').toBeDefined();
+    const hits: string[] = [];
+    for (const file of collectCratesFiles(cratesRoot!)) {
+      const rel = relative(resolve(cratesRoot!, '..'), file).replaceAll('\\', '/');
+      for (const ref of findBackendCopyRefs(readFileSync(file, 'utf8'))) {
+        hits.push(`${rel}:${ref.line}: 报文里出现「${ref.match}」｜ ${ref.snippet}`);
+      }
+    }
+    expect(hits).toEqual([]);
   });
 });

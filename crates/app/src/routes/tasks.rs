@@ -89,7 +89,7 @@ pub async fn create(
     let providers = state.store.load_providers().await.map_err(map_core_error)?;
     if !providers.iter().any(|p| p.enabled) {
         return Err(ApiError::bad_request(
-            "尚未配置任何可用的 provider，请先在设置中添加（决策 56）",
+            "尚未配置任何可用的 provider，请先在设置中添加",
         ));
     }
 
@@ -101,9 +101,7 @@ pub async fn create(
         .await
         .map_err(map_core_error)?
     {
-        return Err(ApiError::bad_request(
-            "依赖关系构成环路，拒绝创建（决策 27）",
-        ));
+        return Err(ApiError::bad_request("依赖关系构成环路，拒绝创建"));
     }
     for dep in &body.depends_on {
         if state.store.get_task(dep).await.is_err() {
@@ -429,9 +427,7 @@ pub async fn retry(
 ) -> ApiResult<impl IntoResponse> {
     let task = state.store.get_task(&id).await.map_err(map_core_error)?;
     if !task.status.is_terminal() {
-        return Err(ApiError::bad_request(
-            "只有终态任务可以重试（决策 70 / 125）",
-        ));
+        return Err(ApiError::bad_request("只有终态任务可以重试"));
     }
     // 决策 125：worktree 里留有半成品，而 init.execute 的幂等策略是"已存在则复用"，
     // 不会清场——retry 必须显式 `git reset --hard {base_ref}` + `git clean -fdx`
@@ -602,7 +598,7 @@ pub async fn archive(
 ) -> ApiResult<impl IntoResponse> {
     let task = state.store.get_task(&id).await.map_err(map_core_error)?;
     if !task.status.is_terminal() {
-        return Err(ApiError::bad_request("只有终态任务可以归档（决策 34）"));
+        return Err(ApiError::bad_request("只有终态任务可以归档"));
     }
     // git.rs 的回收策略（决策 3）：取消 / 归档同样清理 worktree 与分支
     cleanup_worktree_and_branch(&state, &id).await;

@@ -748,7 +748,7 @@ impl Config {
         // 因为这一页是唯一的安全控制——配错了却以为配上了是最坏的情形。
         if let Some(old) = self.market.allowed_sources.as_ref() {
             return Err(Error::Config(format!(
-                "[market] allowed_sources 已被 [market] github_repos 取代（决策 194）：\
+                "[market] allowed_sources 已被 [market] github_repos 取代：\
                  技能来源不再是自定的 registry 索引，而是一个 GitHub 仓。\
                  把那几个来源换算成 owner/repo 写进 github_repos\
                  （例如 github_repos = [\"obra/superpowers\"]）。旧值仍在配置里：{old:?}"
@@ -1077,7 +1077,7 @@ fn rewrite_decls(
         if !trusted && mode == SkillMode::Full.as_str() {
             return Err(Error::Config(format!(
                 "{where_} 的技能 {name} 正以 full 模式注入，改为未信任会让这份配置失效\
-                 （未信任不得全文注入，决策 172④）。请先把该处的 mode 改为 \"name\"\
+                 （未信任不得全文注入）。请先把该处的 mode 改为 \"name\"\
                  （正文改由 Skill 工具按需拉取），再撤销信任"
             )));
         }
@@ -1908,7 +1908,10 @@ mod tests {
         let msg = err.to_string();
         assert!(matches!(err, Error::Config(_)), "{msg}");
         assert!(msg.contains("github_repos"), "须给出替代键：{msg}");
-        assert!(msg.contains("194"), "须点明是哪条决策改的：{msg}");
+        // 对照（文案票同步改）：原断言钉的是报文里的「（决策 194）」——决策 199 起面向用户的
+        // 报文不再携带内部编号（编号归代码注释，见消息上方注释），断言随之改钉「说清怎么改」：
+        // 报文须点明旧键是被取代了（不是静默忽略、也不是泛泛的 unknown field）。
+        assert!(msg.contains("取代"), "须点明旧键已被取代：{msg}");
         assert!(msg.contains("skills.example.com"), "须回显旧值：{msg}");
     }
 

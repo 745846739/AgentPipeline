@@ -57,7 +57,7 @@
   type="button"
   class="pill {kind} {isPending ? 'pend' : ''} {selected ? 'selected' : ''}"
   onclick={handle}
-  title="cursor_id: {cursor.cursor_id} · {statusHint}"
+  title="{statusHint} · cursor_id {cursor.cursor_id}"
 >
   <b class="bl">{branchBadge}</b>
   <span class="mono">{cursor.branch} · {cursor.node}</span>

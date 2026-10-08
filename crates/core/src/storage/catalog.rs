@@ -247,9 +247,7 @@ impl Store {
         .await?;
         if active > 0 {
             // 还没写过任何一行，drop 事务即回滚。
-            return Err(Error::Conflict(
-                "项目仍有活跃任务，拒绝删除（决策 101）".into(),
-            ));
+            return Err(Error::Conflict("项目仍有活跃任务，拒绝删除".into()));
         }
 
         let task_ids: Vec<String> =
