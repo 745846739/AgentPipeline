@@ -24,6 +24,14 @@ pub struct Settings {
     pub tool_retry_max: u32,
     pub node_idle_timeout_sec: u64,
     pub node_max_duration_sec: u64,
+    /// 子代理一次调用的最大轮数（决策 407）：撞顶即收口为「未收口」失败。
+    ///
+    /// 原是编译期常量 12（防御「读一个文件 → 再读一个」的空转）。2026-10-08 的实证
+    /// （任务 01M4CD59）表明 12 在真实任务里先把**三个子代理全部**打死——那一刻起它
+    /// 该是运维面能调的数。**时间界另有 `node_max_duration_sec`**（子代理那次调用的
+    /// `max_duration` 就是节点级的它）：两个界各管一段，轮数不是唯一的刹车。
+    /// **0 不表示「无上限」**：解析期即拒（[`Config::validate`]），程序内构造按 1 兜底。
+    pub sub_agent_max_rounds: usize,
     pub tool_timeout_sec: u64,
     pub test_command_timeout_sec: u64,
     pub adaptive_timeout_enabled: bool,
@@ -133,6 +141,7 @@ impl Default for Settings {
             tool_retry_max: 3,
             node_idle_timeout_sec: 300,
             node_max_duration_sec: 1800,
+            sub_agent_max_rounds: 200,
             tool_timeout_sec: 60,
             test_command_timeout_sec: 600,
             adaptive_timeout_enabled: false,
@@ -175,6 +184,7 @@ pub struct PipelineOverrides {
     pub tool_retry_max: Option<u32>,
     pub node_idle_timeout_sec: Option<u64>,
     pub node_max_duration_sec: Option<u64>,
+    pub sub_agent_max_rounds: Option<usize>,
     pub tool_timeout_sec: Option<u64>,
     pub test_command_timeout_sec: Option<u64>,
     pub adaptive_timeout_enabled: Option<bool>,
@@ -224,6 +234,7 @@ impl PipelineOverrides {
             tool_retry_max,
             node_idle_timeout_sec,
             node_max_duration_sec,
+            sub_agent_max_rounds,
             tool_timeout_sec,
             test_command_timeout_sec,
             adaptive_timeout_enabled,
@@ -696,6 +707,15 @@ impl Config {
 
     /// 跨字段一致性校验（决策 47 / 103 / 134 的 fail fast 姿态）。
     pub fn validate(&self) -> Result<()> {
+        // 子代理轮数上限（决策 407）：**没有「无上限」这一档**——写 0 是配置错误，
+        // 不是「让它一直跑」。与 `watch_token_budget` 同一姿态（正整数，缺省给足）；
+        // 静默把它当「无限」的代价是子代理烧到 `max_duration` 才停，而那一刻没人看得懂
+        // 为什么。**这条只拦配置文件那一半**：程序内构造按 1 兜底（见 `subagent` 取用点）。
+        if self.pipeline.sub_agent_max_rounds == Some(0) {
+            return Err(Error::Config(
+                "[pipeline] sub_agent_max_rounds 必须是正整数（0 不是「无上限」这一档）".into(),
+            ));
+        }
         if self.logging.format.is_some() && self.logging.json_file.is_some() {
             return Err(Error::Config(
                 "[logging] 的 `format` 与已废弃的 `json_file` 不能同时配置；\
@@ -1511,6 +1531,22 @@ mod tests {
         // 其余保持默认
         assert_eq!(s.validate_retry_max, 3);
         assert_eq!(s.test_command_timeout_sec, 600);
+    }
+
+    /// 决策 407：子代理轮数上限缺省 **200**（钉住数字）、配置可覆盖、**0 被拒**
+    /// （没有「无上限」这一档——静默当无限会让子代理烧到 `max_duration` 才停，
+    /// 而那一刻没人看得懂为什么）。
+    #[test]
+    fn sub_agent_max_rounds_defaults_to_200_and_refuses_zero() {
+        assert_eq!(Settings::default().sub_agent_max_rounds, 200);
+
+        let cfg = Config::from_toml("[pipeline]\nsub_agent_max_rounds = 30\n").unwrap();
+        assert_eq!(cfg.settings().sub_agent_max_rounds, 30);
+        // 合并只认写了的键：邻近的时长界不受影响。
+        assert_eq!(cfg.settings().node_max_duration_sec, 1800);
+
+        let err = Config::from_toml("[pipeline]\nsub_agent_max_rounds = 0\n").unwrap_err();
+        assert!(err.to_string().contains("sub_agent_max_rounds"), "{err}");
     }
 
     /// 决策 283：操作环境的两个开关走通解析与合并，且**互不携带**。

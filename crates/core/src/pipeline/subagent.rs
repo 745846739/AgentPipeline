@@ -54,12 +54,18 @@ const SUB_AGENT_PERSONA: &str = "你是一个只读检索子代理。你的唯�
      不要把读到的文件原文整段复制回来——父代理只要摘要，这正是你存在的理由。\
      你没有写权限与命令执行权限，也不需要它们。";
 
-/// 单次子代理循环的最大轮数（工具往返）。
+/// 单次子代理调用允许的最大轮数（决策 407：由配置给，缺省 200）。
 ///
 /// 子代理没有 `submit_metadata` 收口，正常靠「模型不再发起 tool_call」自然结束；
-/// 这个上限是防御性的——模型若陷入「读一个文件 → 再读一个」的循环，必须有人喊停，
-/// 否则会持续烧 token 直到外层超时。
-pub const SUB_AGENT_MAX_ROUNDS: usize = 12;
+/// 这个上限是**防御性**的——模型若陷入「读一个文件 → 再读一个」的循环，必须有人喊停。
+/// 它曾是编译期常量 12：2026-10-08 的实证（任务 01M4CD59）里 12 把三个子代理全部
+/// 打死在同一句「未收口」上，那一刻起它该是运维面能调的数。
+///
+/// **0 按 1 兜底**：解析期已拒 `sub_agent_max_rounds = 0`（`Config::validate`），
+/// 这里兜的是程序内构造的 `Settings`——「跑 0 轮」与「无上限」一样不是人想要的语义。
+fn effective_max_rounds(settings: &Settings) -> usize {
+    settings.sub_agent_max_rounds.max(1)
+}
 
 /// 子代理**运行期间**的心跳周期（票 08）。
 ///
@@ -343,7 +349,8 @@ impl StoreSubAgentRunner {
     }
 
     async fn run_rounds(&self, session: &mut SubAgentSession) -> Result<String> {
-        for _ in 0..SUB_AGENT_MAX_ROUNDS {
+        let max_rounds = effective_max_rounds(&self.cfg.settings);
+        for _ in 0..max_rounds {
             let req = LlmRequest {
                 stage: self.cfg.stage,
                 node: self.cfg.node,
@@ -406,7 +413,7 @@ impl StoreSubAgentRunner {
             }
         }
         Err(Error::Validation(format!(
-            "子代理在 {SUB_AGENT_MAX_ROUNDS} 轮内未收口，请把子任务拆得更具体"
+            "子代理在 {max_rounds} 轮内未收口，请把子任务拆得更具体"
         )))
     }
 }
@@ -488,4 +495,26 @@ async fn write_conversation(
         .await?;
     cfg.store.refresh_task_totals(&cfg.task_id).await?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// 决策 407：轮数上限跟着配置走；**0 兜底成 1**（不是「无上限」——那会让一次
+    /// 子代理烧到 `max_duration` 才停，而那一刻没人看得懂为什么）。
+    ///
+    /// 缺省值 200 由 `config.rs::sub_agent_max_rounds_defaults_to_200_and_refuses_zero`
+    /// 钉住；这里钉的是**取用点**的读数。
+    #[test]
+    fn round_cap_follows_the_setting_and_floors_zero_to_one() {
+        let mut settings = Settings::default();
+        assert_eq!(effective_max_rounds(&settings), 200, "缺省跟着配置走");
+
+        settings.sub_agent_max_rounds = 7;
+        assert_eq!(effective_max_rounds(&settings), 7);
+
+        settings.sub_agent_max_rounds = 0;
+        assert_eq!(effective_max_rounds(&settings), 1, "0 兜底成 1，绝不无限");
+    }
 }

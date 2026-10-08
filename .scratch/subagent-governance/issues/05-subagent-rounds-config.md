@@ -19,8 +19,10 @@
 
 **Blocked by:** None
 
-**Status:** ready-for-agent
+**Status:** done
 
-- [ ] 用例：缺省 = 200（钉住数字）；配置成 N 时子代理最多跑 N 轮
-- [ ] 用例：0 / 非法值不产生「无上限」行为
-- [ ] 既有「打满即报错」用例跟着常量走，不写死 12（照决策 292 那条的姿势）
+- [x] 用例：缺省 = 200（钉住数字，`config.rs::sub_agent_max_rounds_defaults_to_200_and_refuses_zero`）；
+  配置成 N 时子代理最多跑 N 轮（`executor.rs::subagent_round_cap_follows_the_configured_number`，N=2）
+- [x] 用例：0 / 非法值不产生「无上限」行为（解析期拒 0；程序内构造按 1 兜底，
+  `subagent.rs::round_cap_follows_the_setting_and_floors_zero_to_one`）
+- [x] 既有「打满即报错」用例跟着配置走，不写死 12（新用例同时断言 `12 轮` 不再出现）

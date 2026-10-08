@@ -4924,6 +4924,100 @@ async fn parent_spawns_readonly_subagent_and_gets_summary_back() {
         .any(|m| m.role == agentpipeline_core::agent::Role::Tool));
 }
 
+/// 决策 407：子代理轮数上限是**配置**——配成 2 轮，子代理在第 2 轮就打满收场，
+/// 「未收口」的报数跟着配置走（不再写死 12），父代理拿到的回执里也是同一个数。
+#[tokio::test]
+async fn subagent_round_cap_follows_the_configured_number() {
+    let settings = Settings {
+        sub_agent_max_rounds: 2,
+        ..Settings::default()
+    };
+    let ctx = setup("true", settings).await;
+    declare_sub_agent(&ctx).await;
+
+    let worktree = ctx.store.home().worktree_path("t-cap");
+    std::fs::create_dir_all(&worktree).unwrap();
+    std::fs::write(worktree.join("NOTES.md"), "关键结论：入口在 main()\n").unwrap();
+
+    let mut script = Script::new();
+    design_scripts(&mut script);
+    script
+        .for_node(Stage::Develop, Node::Execute)
+        .push(testkit::Step::Tool {
+            name: "spawn_sub_agent".into(),
+            arguments: serde_json::json!({"task": "翻 NOTES.md"}),
+        })
+        .write_file(
+            "src/lib.rs",
+            "pub fn add(a: i32, b: i32) -> i32 { a + b }\n#[test]\nfn adds() { assert_eq!(add(1, 2), 3); }\n",
+        )
+        .write_file("tests/acceptance.rs", "#[test]\nfn ok() {}\n")
+        .run_command(
+            "git add -A && git -c user.name=f -c user.email=f@l commit -m 'feat: task t-cap'",
+        )
+        .submit(&CodeChanges {
+            branch_name: "kanban/t-cap".into(),
+            changed_files: vec![],
+            unit_test_files: vec![],
+            no_changes: false,
+        });
+    script
+        .for_node(Stage::Review, Node::Execute)
+        .submit(&ReviewResult {
+            approved: true,
+            review_report_path: Some("review-report.md".into()),
+            required_changes: vec![],
+        });
+    script
+        .for_node(Stage::Test, Node::Execute)
+        .submit(&TestResult {
+            passed: true,
+            test_report_path: Some("test-report.md".into()),
+            failures: vec![],
+            gate_recheck: false,
+        });
+    // 子代理**两轮都发工具调用**：永远走不到「不再发起 tool_call」的自然收口，
+    // 于是第 2 轮就是配置给的顶。
+    script.push_subagent(testkit::Step::Tool {
+        name: "read_file".into(),
+        arguments: serde_json::json!({"path": "NOTES.md"}),
+    });
+    script.push_subagent(testkit::Step::Tool {
+        name: "read_file".into(),
+        arguments: serde_json::json!({"path": "NOTES.md"}),
+    });
+
+    ctx.agent.set_script(script);
+    testkit::seed_task(&ctx.store, "t-cap", "p1").await.unwrap();
+    admit(&ctx, "t-cap").await;
+    ctx.executor.run("t-cap").await.unwrap();
+
+    // ① 子代理 run 行：失败，且报的是**配置的**轮数
+    let runs = ctx.store.list_runs("t-cap").await.unwrap();
+    let sub = runs
+        .iter()
+        .find(|r| r.agent_type == "subagent")
+        .expect("应有子代理 run 行");
+    assert_eq!(sub.status, NodeStatus::Failed);
+    let err = sub.error.clone().unwrap_or_default();
+    assert!(err.contains("2 轮内未收口"), "报数要跟着配置: {err}");
+    assert!(!err.contains("12 轮"), "旧常量 12 不该再出现: {err}");
+
+    // ② 父代理拿到的回执是同一句话（工具层文本通道，父的下一轮 messages 里能读到）
+    let requests = ctx.agent.request_log();
+    let carried = requests.iter().any(|r| {
+        r.stage == Stage::Develop
+            && r.node == Node::Execute
+            && r.messages.iter().any(|m| {
+                m.role == Role::Tool
+                    && m.content
+                        .as_deref()
+                        .is_some_and(|c| c.contains("2 轮内未收口"))
+            })
+    });
+    assert!(carried, "父的下一轮 messages 应含「2 轮内未收口」的回执");
+}
+
 /// 验收（票 08 安全断言）：子代理的工具集**只有** `read_file` / `list_dir`。
 ///
 /// 这条是本票的安全边界：不是「子代理不调 run_command」，而是**它的工具定义里

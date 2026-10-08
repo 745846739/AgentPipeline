@@ -3095,3 +3095,19 @@ config.rs}`、`tests/e2e/tests/integration/stage_boundary.rs`、`docs/testing.md
 **验证**：L1 `executor.rs::a_cancel_request_without_an_executor_is_still_logged`（`notified=false` + 来路 + task 三者都在）与 `a_cancel_request_reaching_an_executor_is_logged_with_its_origin`（`notified=true` + 判超时来路；借 `try_acquire` 真登记一格）；既有 `tools.rs` 两条日志用例改吃 `testkit::log_capture` 后一字未改仍绿（捕获语义不变）。
 
 **来源**：`.scratch/subagent-governance/issues/04`；落地 `crates/core/src/pipeline/executor.rs`、`crates/testkit/src/{lib.rs, log_capture.rs, Cargo.toml}`
+
+### 决策 407 · 子代理轮数上限改配置：`[pipeline] sub_agent_max_rounds`，缺省 **200**（删掉编译期常量 12）
+
+**起因**：`SUB_AGENT_MAX_ROUNDS = 12` 是照着「模型读一个文件 → 再读一个的空转」定的防御性上限。2026-10-08 的实证（任务 `01M4CD59`）里，**12 把三个子代理全部打死在同一句「未收口」上**（三次共烧 51.5 万 prompt token）。12 与其他任何数字一样是拍的——它该是运维面能调的数，不是编译期常量。
+
+**裁决**：
+
+1. **新配置 `Settings::sub_agent_max_rounds`（config.toml `[pipeline]`），缺省 200**。与 `node_max_duration_sec` / `agent_retry_max` 并列——全局数值界住 config.toml（本仓既有的那一层）。本轮**不做**每阶段覆盖：现在只有一个消费面（决策 400 的三个设计阶段默认开启），等真出现「某阶段要多、某阶段要少」再按「全局默认 + 阶段 `Option` 覆盖」的既有姿势加，那时才值一次迁移 + API 契约 + 前端。
+2. **常量退役**：`SUB_AGENT_MAX_ROUNDS` 删除；取用点在 `subagent::run_rounds`，从 `SubAgentRunnerConfig.settings` 读。失败文案里的数字跟着配置走（不再写死）。
+3. **0 不表示「无上限」**：解析期即拒（`Config::validate`，与 `watch_token_budget` 同一姿态——「0 / 负数会被拒，没有『无预算』这一档」）；程序内构造的 `Settings` 按 **1 兜底**（`effective_max_rounds`）。两个方向都说清：静默当无限会让子代理烧到 `max_duration` 才停，而那一刻没人看得懂为什么。
+4. **时间界另有一条**：子代理那次调用的 `max_duration` 就是节点级的 `node_max_duration_sec`（缺省 1800s）。轮数与墙钟各管一段，200 轮不是唯一的刹车——两条界并存是这一版的形状。
+5. **成本闸门（子代理 token 预算）本轮不做**：真到「200 轮也挡不住」时，该管成本的是 token 预算（照决策 292 治值班长那套），但那一票要定「到线怎么收口、带不带部分结论、标什么」，是独立分量。跑出真实用量后再补。
+
+**验证**：L1 `config.rs::sub_agent_max_rounds_defaults_to_200_and_refuses_zero`（缺省钉 200、覆盖生效且不误伤邻近键、`0` 被拒）+ `subagent.rs::round_cap_follows_the_setting_and_floors_zero_to_one`（取用点读数：缺省跟配置、0 兜底成 1）；L2 `executor.rs::subagent_round_cap_follows_the_configured_number`（配成 2 轮 → 子代理 run 行失败且 error 报「2 轮内未收口」、旧常量 12 不再出现、父代理回执同数）；既有六条子代理 L2 用例一字未改仍绿。
+
+**来源**：`.scratch/subagent-governance/issues/05`；落地 `crates/core/src/config.rs`、`crates/core/src/pipeline/subagent.rs`
