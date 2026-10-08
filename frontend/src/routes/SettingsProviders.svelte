@@ -151,7 +151,7 @@
     <div class="banner">
       <EmptyState
         state="还没有 provider。"
-        next="新增一行并填好 model 与 api_key，任务的阶段模型才会被解析。"
+        next="新增一行并填好模型与密钥两栏，任务的阶段模型才会被解析。"
         href="#/settings/projects"
         linkLabel="下一步：设置 · 项目"
       />

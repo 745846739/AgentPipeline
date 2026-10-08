@@ -665,7 +665,9 @@ GET /tasks/{id}               → 详情页装载 + 断线重连后的全量校�
 - **例外照旧**：代码注释、开发文档、测试文件里的编号**不动**——机器门只扫**面向用户的文案**。
   落到 `.svelte` 上有一条容易踩的判据：**`<!-- … -->` 是注释，不是文案**（`frontend/src/routes/Talk.svelte`
   里现有五处「决策 NN」全在 HTML 注释里，门若按纯文本搜就会把它们误判成文案）；**算文案的是**：
-  标签之间的文本、`title` / `aria-label` 这类属性值、以及喂给它们的 JS 字符串常量。
+  标签之间的文本、**任意属性值**（`title` / `placeholder` / `aria-label` 之外，组件文本型 props——
+  `state=` / `next=` / `linkLabel=` 这类渲染成屏上正文的 prop 同样算；按名字白名单堵不住新组件的
+  文本 prop，评审场景 6 实证）、以及喂给它们的 JS 字符串常量。
 
 **定稿例子（现文案 → 新文案，可直接抄）**
 
@@ -728,15 +730,20 @@ dossier / 现场页签读它们），既有门只扫前端时它是整条漏面�
 
 | 规则 | 判据 | 扫描面 |
 |---|---|---|
-| 1 | 面向用户的文案里不出现「决策 N」 | 前端：标签间文本、`title` / `placeholder` / `aria-label` 等属性值、字符串字面量 |
+| 1 | 面向用户的文案里不出现「决策 N」 | 前端：标签间文本、**任意属性值**（含组件文本型 props）、字符串字面量 |
 | 2 | 不出现字面 Markdown 强调 `**…**`（掩码 `***` 是有意设计，天然放过） | 同上 |
-| 3 | **半中半英**：A-1「含汉字 + snake_case 内部符号」；A-2「含汉字 + 阶段 id（`architect-design` / `develop-design` / `test-design` / `sync-check` / `validate_output`）或独立词 `develop` / `review` / `test`」；产物文件名连写（`review-diff.diff` / `test-report.md`）负向放过（B5） | 同上（渲染近似：表达式只取其中的字符串字面量，用户看到的是值不是字段名） |
-| 4 | 后端**两类构造形态**的字符串字面量里不出现「决策 N / 票 N」——`ApiError::…("…")` / `Error::…("…")` / `error: Some("…")` 与 `test_blockers` 类载荷 push；`tracing::` 日志、`#[test]` 断言消息、system prompt、CLI `--help` 不在形态内（口径用例钉住，防规则烂成误报；**整库搜改是红线**，门与改法同源同口径） | `crates/**/*.rs`（`tests/` / `benches/` 目录除外） |
+| 3 | **半中半英**：A-1「含汉字 + snake_case 内部符号」；A-2「含汉字 + 阶段 id（`architect-design` / `develop-design` / `test-design` / `sync-check` / `validate_output`）或独立词 `develop` / `review` / `test`」。**逐段逐 token 报告**（一段几枚符号报几条），**豁免按（文件, token）逐命中匹配**；产物文件名（`review-diff.diff` / `test-report.md` / `test_result.json`）在两判据上一致负向放过（B5 由排除承担，见下） | 同上（渲染近似：表达式连花括号进段、只取其中的字符串字面量——用户看到的是值，`source={task.pending_reason…}` 这类字段名不进文案面） |
+| 4 | 后端**三类构造形态**的字符串字面量里不出现「决策 N / 票 N」——① `ApiError::…("…")` / `Error::…("…")` / `error: Some("…")` ② `test_blockers` 类载荷 push ③ **流转原因载荷**（`reason = Some(…)` 赋值与 `insert_transition(…, Some("…"))` 实参，`kickback_reason(…)` 包一层按窗内首字面量提取）。**落库渲染字段（流转原因）的归口就是③**：reason 落 `kanban_transitions` 后由 `TimelineView.svelte` 原文渲染，是页面文案——评审场景 5 的漏网（`resume.rs` 的 `（决策 116）`）即由它拦。`tracing::` 日志、`#[test]` 断言消息、system prompt、CLI `--help` 不在形态内（口径用例钉住，防规则烂成误报；**整库搜改是红线**，门与改法同源同口径） | `crates/**/*.rs`（`tests/` / `benches/` 目录除外） |
 
 **B 类边界登记表**（规则 3 的豁免，门内 `EXEMPTIONS` 常量）：B1 键名标签与键名校验 /
-B2 动作句键名引用 / B3 域词表词（词表收录的工具名等）/ B4 mono 读数徽章 / B5 产物文件名作对照。
-每条 = 位置 + 匹配 + B 类编号 + 一句理由；**登记表只收 B 类，不收「暂时不想改」**；
-条目数入断言（`expect(EXEMPTIONS.length).toBe(N)`），增删条目必须显式改断言——让「悄悄烂掉」可见。
+B2 动作句键名引用 / B3 域词表词（词表收录的工具名等）/ B4 mono 读数徽章；
+**B5 产物文件名不进登记表**——`FILENAME_TOKEN` 在 A-1 / A-2 两条判据上一致剔除产物文件名，
+登记表不收行使不到的死条目（评审「B5 死条目」的归宿）。
+每条 = 位置 + **命中的 token** + B 类编号 + 一句理由；豁免按（文件, token）**逐命中匹配**
+（段级 `text.includes` 会让同段的豁免符号掩蔽真违例——评审实证的缺口）；
+**登记表只收 B 类，不收「暂时不想改」**；
+条目数入断言（`expect(EXEMPTIONS.length).toBe(19)`），且**每条带活性断言**（条目 token 必须在
+其实文件里真实命中）——增删条目、文案漂移都会显式变红，让「悄悄烂掉」可见。
 
 **判别问句**（登记表每条理由都是它的答案）：删掉这个符号，这句话还说清会发生什么、
 你该做什么吗？说得清 → 摘；说不清 → 留（B 类，进登记表）但同句要有人话。
@@ -747,6 +754,60 @@ B2 动作句键名引用 / B3 域词表词（词表收录的工具名等）/ B4 
   与 §12.2 两处同源词表、可能触及决策 200，且 `frontend/e2e/talk.spec.ts` 大量钉住——另票处理。
 - **CLI `--help` 文案里的编号**：命令行输出不是页面，规则 4 的形态天然不扫——另票处理。
 - **agent system prompt / transcript 注入块内文**：agent 读的不是页面——不动。
+- **命令台账载荷（`stderr_preview` 等）**：落 `kanban_node_commands`，当前**无任何组件渲染**
+  （`grep stderr_preview frontend/src/**/*.svelte` 零命中），不算页面文案、不进规则 4 形态
+  （门内口径负例钉住）；将来上屏时随形态扩面。
+- **`actionSubmit.ts` 兜底 throw 的动作 id**（`动作 ${action.action} 没有配对的操作端点`）：
+  属「UI 已禁用」的内部接线错误兜底，评审判为非阻塞建议——随动作表收口时改中文动作名，本次不动。
+
+**AC-1 改前 → 改后对照（本票前端必改清单，逐处留档；行号以文本锚为准）**
+
+| # | 位置 | 改前 | 改后 |
+|---|---|---|---|
+| 1 | `frontend/src/components/settings/AnalysisChecklist.svelte` 引导句 | `以下为 project_analysis 探测到的事实，确认无误后即可创建任务。` | `以下是探测到的事实，确认无误后即可创建任务。`（K2 摘字段名） |
+| 2 | `frontend/src/routes/SettingsProviders.svelte` 不受支持行 `title` | `厂商不在支持列表（supported_adapters）内` | `厂商不在支持列表内`（K2；e2e 锚 `支持列表` 原样） |
+| 3 | 同上，warnnote 正文 | `该厂商不在 supported_adapters 内：此行走降级灰显，被 stage_configs 引用时配置加载会拒绝启动。` | `该厂商已不在支持列表内：这一行会变灰停用，被阶段配置引用时配置加载会拒绝启动。`（K2+K3：摘字段名、「降级灰显」改说后果） |
+| 4 | 同上，页首说明 | `provider 行 =（vendor, model, context_window）。api_key 明文存储，读接口只回显 ***；` | `每行一个 provider，写明厂商、模型与上下文窗口。密钥明文存储，读接口只回显 ***；`（K2+K3） |
+| 5 | `frontend/src/components/task/ReviewForm.svelte` 标题 | `人工评审（review_mode = human）` | `人工评审`（K2；`frontend/e2e/review-branch.spec.ts` 断言随改，对照非静默） |
+| 6 | 同上，diff 提示 | `review-diff.diff 尚未生成或不可读。` | `评审差异（review-diff.diff）尚未生成或不可读。`（B5 文件名留、同句给人话主语） |
+| 7 | 同上，测试提示 | `单元测试结果尚未生成（review 在 test 之前）。` | `单元测试结果尚未生成（评审在测试之前）。`（K2 英文阶段名转中文） |
+| 8 | 同上，打回意见 placeholder | `打回时随流转原因带给 develop…` | `打回时随流转原因带给开发阶段…`（K2） |
+| 9 | `frontend/src/components/pipeline/BranchPill.svelte` `title` | `cursor_id: {cursor.cursor_id} · {statusHint}` | `{statusHint} · cursor_id {cursor.cursor_id}`（K2：人话理由开头，id 退对照位） |
+| 10 | `frontend/src/lib/actionSubmit.ts` 两处动作 id | `split_task 需要提供拆分方案（请用拆分对话框）` / `model_override 需要选择 provider（请用换模型对话框）` | `拆分任务需要提供拆分方案（请用拆分对话框）` / `切换模型需要选择 provider（请用换模型对话框）`（K2；`provider` 词表域词 B3 保留） |
+| 11 | `frontend/src/routes/SettingsProviders.svelte` 空态 `next=`（评审场景 6 补改） | `新增一行并填好 model 与 api_key，任务的阶段模型才会被解析。` | `新增一行并填好模型与密钥两栏，任务的阶段模型才会被解析。`（K2 摘 snake_case；e2e 锚 `阶段模型才会被解析`、`还没有 provider` 原样） |
+
+面 A 同判据顺手修的两处（非必改清单，一并留档）：`frontend/src/components/settings/ProviderForm.svelte`
+`不在 supported_adapters …降级灰显` → `不在支持列表 …变灰停用`（与 #2/#3 同句式）；
+`frontend/src/routes/SettingsProjects.svelte` `正在触发 project_analysis 伪阶段…` →
+`正在运行项目分析，稍候…`。后端摘编号的 13 个文件逐处去括注、人话照旧（提交
+`fix(文案纪律)` 的 diff 即对照；形态与归口见上表规则 4）。
+
+**AC-5 走查矩阵（14 路由 × 6 表面；共享组件并入其出现页面）**
+
+图例：`0` = 该表面文案在机器门覆盖内（前端规则 1–3 / 后端透传报文规则 4）且本轮实测归零
+（`copy-discipline` 22 用例、全前端 1197 用例绿）；`K→改` = 发现必改并已改（对照见上表）；
+`B` = 边界归宿（登记表条目或形制理由）。六表面 = 正文说明 / 标题与属性（`title`·`aria-label`·
+`placeholder`·组件文本 props）/ toast / 空态 / 错误横幅与透传报文 / 对话框·下拉确认。
+
+| 路由（含并入的共享组件） | 正文说明 | 标题与属性 | toast | 空态 | 错误横幅·透传 | 对话框·下拉 |
+|---|---|---|---|---|---|---|
+| Board（TaskCard / TopBar / StatusLine / ToastStack / CompletionBanner） | 0 | 0 | 0 | 0 | 0 | 0 |
+| TaskDetail（TimelineView / PendingDossier / FileViewer / DiffReviewPanel / ReviewForm / SplitDialog / ModelOverrideDialog / BranchPill） | **K→改**：流转原因三处摘编号（`resume.rs` `（决策 116）`、`executor.rs` `（决策 90）`/`（决策 85）`，规则 4③ 归零）；**B**：`dependency_overridden：` 前缀是 e2e `deps.rs` 钉住的观测面契约（决策 116 / 票 06）保留；时间线以 `to_stage.to_node` 读数形制渲染 id（有意设计，`sync-check 汇聚通过` 类 reason 与该形制一致） | K→改（#9） | 0 | 0 | 0（透传报文走规则 4①③） | K→改（#5–#8）；SplitDialog / ModelOverrideDialog 0 |
+| Talk | 0（对讲台文案由 `talk.spec.ts` 钉；「台账」词消歧另票——移交清单） | 0（`source={task.pending_reason…}` 表达式字段名由门的花括号归段剔除，是值不是文案） | 0 | 0（`next={…}` 表达式 props 在面内） | 0 | 0 |
+| Metrics | 0（首段整段重写归票 27——既有移交项） | 0 | 0 | 0 | 0 | 0 |
+| Share | 0 | 0 | 0 | 0 | 0 | 0 |
+| SettingsLanding | 0 | 0 | 0 | 0 | 0 | 0 |
+| Projects | K→改（`正在触发 project_analysis…`；`不能删除` / `先去处理那 N 个任务…` 锚原样） | 0 | 0 | 0 | 0（`.reg-err` 走规则 4①） | 0 |
+| Providers | K→改（#3/#4） | K→改（#2/#11） | 0 | **K→改**：空态 `next=` 组件文本 prop 面外文案（#11，评审场景 6） | 0（`.reg-err` ← `ApiError`，规则 4①） | 0；**B**：`base_url` mono 读数（登记表 B4） |
+| Stages | 0 | 0 | 0 | 0 | 0 | 0；**B**：`max_tokens` 读数徽章（B4） |
+| Market | 0 | 0 | 0 | 0 | 0 | 0 |
+| SettingsForeman | 0 | 0 | 0 | 0 | 0 | 0 |
+| SettingsCompaction | 0 | 0 | 0 | 0 | 0 | 0 |
+| SettingsTools | 0 | 0 | 0 | 0 | 0 | 0；**B**：`run_command` / `offload_run` 域词（B3） |
+| SettingsNotify | 0（字面 `**…**` 四处此前已归零——规则 2 既有面） | 0 | 0 | 0 | 0 | 0 |
+
+**待判项：无。** 出站通知正文、CLI `--help` 编号、agent prompt 内文、「台账」词表消歧、
+`stderr_preview` 命令台账载荷、`actionSubmit` 兜底动作 id——均在上文移交清单带理由归宿。
 
 ### 12.2 车间隐喻首现翻译（决策 200）
 
@@ -844,7 +905,7 @@ B2 动作句键名引用 / B3 域词表词（词表收录的工具名等）/ B4 
 | 不支持的 provider 行降级灰显 + 琥珀标（**标里不带内部编号**） | `frontend/src/routes/SettingsProviders.svelte:297` | 决策 103；决策 199（编号退到 `title`） |
 | 状态过滤槽 = 图标 + 词（词取 `FILTER_LABELS`），窄屏只给当前项带词 | `frontend/src/components/layout/TopBar.svelte`、`frontend/src/stores/board.svelte.ts` | 决策 201 |
 | pending 数的唯一显示位是「待处理 N」芯片（槽位不再重复这个数） | `frontend/src/components/layout/TopBar.svelte`、`frontend/src/components/layout/StatusLine.svelte` | 决策 92 / 201 |
-| 正文不出现内部决策编号与半中半英符号，后端直呈报文同步摘编号（机器门四条规则：规则 1/2/3 扫前端文案、规则 4 窄扫后端两类构造形态；B 类边界走豁免登记表，判别问句见 §12.1） | `frontend/src/lib/copy-discipline.test.ts` | 决策 199（规则 3/4 是其落地扩面，不新立决策）；移交清单（台账词表 / CLI `--help` / prompt 内文）见 §12.1 |
+| 正文不出现内部决策编号与半中半英符号，后端直呈报文同步摘编号（机器门四条规则：规则 1/2/3 扫前端文案——含组件文本 props、逐 token 豁免；规则 4 窄扫后端三类构造形态——含流转原因等落库渲染字段；B 类边界走豁免登记表，判别问句见 §12.1） | `frontend/src/lib/copy-discipline.test.ts` | 决策 199（规则 3/4 是其落地扩面，不新立决策）；AC-1 对照 / AC-5 走查矩阵与移交清单（台账词表 / CLI `--help` / prompt 内文 / `stderr_preview` / 兜底动作 id）见 §12.1 |
 | 对比度门：`--text-3` ≥ 4.5:1（次级必读）；`--text-4` 豁免且不得承载必读信息 | `frontend/src/theme/contrast.ts`、`frontend/src/theme/contract.ts` | 决策 195 |
 | token 值与全局样式表互为镜像，逐值双向比对，禁裸十六进制颜色 | `frontend/src/theme/css-parity.test.ts`、`frontend/src/app.css` | 决策 169 |
 | 三个模态框：Escape 一律可关、焦点进第一个输入框并关在框内、对话框可被播报 | `frontend/src/components/ui/Modal.svelte`、`frontend/src/components/board/NewTaskDialog.svelte`、`frontend/src/components/task/SplitDialog.svelte`、`frontend/src/components/task/ModelOverrideDialog.svelte` | 决策 169 的交互骨架；票 02 |

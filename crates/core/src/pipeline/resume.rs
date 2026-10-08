@@ -216,9 +216,7 @@ pub async fn apply_action(
                 } else {
                     ignored.join("、")
                 };
-                reason = Some(format!(
-                    "dependency_overridden：忽略失败依赖 {detail}（决策 116）"
-                ));
+                reason = Some(format!("dependency_overridden：忽略失败依赖 {detail}"));
                 let advanced = advance_one(store, cursor, Landing::Stay, &reason).await?;
                 store
                     .set_task_status(task_id, crate::types::TaskStatus::Queued)

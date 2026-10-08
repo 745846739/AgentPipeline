@@ -1955,7 +1955,7 @@ impl Executor {
                                     Some((cursor.stage, cursor.node)),
                                     (Stage::DevelopDesign, Node::ValidateInput),
                                     crate::types::TransitionTrigger::Normal,
-                                    Some("游标分裂（决策 90）"),
+                                    Some("游标分裂"),
                                 )
                                 .await?;
                             for branch in [
@@ -2051,10 +2051,7 @@ impl Executor {
                         (Stage::Test, Node::Execute),
                         crate::types::TransitionTrigger::Kickback,
                         Some(
-                            kickback_reason(
-                                "merge 测试闸门失败，跳回 test.execute 复检（决策 85）",
-                            )
-                            .as_str(),
+                            kickback_reason("merge 测试闸门失败，跳回 test.execute 复检").as_str(),
                         ),
                     )
                     .await?;
