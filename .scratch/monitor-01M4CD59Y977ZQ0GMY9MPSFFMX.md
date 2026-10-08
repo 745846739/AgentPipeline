@@ -143,3 +143,71 @@
   消息日志两 run 齐整：run=371 共 77 行（0–76）、run=372 共 20 行（0–19），`synthetic` 全 0。
   按上文巡检规则，暂停期间不再逐轮回写；恢复跑或有新事件后再续记。
 
+
+## 收尾（2026-10-08 11:20–11:55 CST）：五票修复上线、部署踩雷、一次误触 rerun
+
+### 一、任务其实早就醒了（本记录此前的「暂停中」已过期）
+
+用户按停之后，任务被**恢复**过，并已跑过整条设计段（时间均为 UTC）：
+
+| run | 节点 | 结果 | 时刻 |
+|---|---|---|---|
+| 375 / 374 / 373 | architect-design.execute·subagent | 全部 failed（12 轮未收口） | 00:17–00:19 |
+| 376 | architect-design.execute **attempt 2** | **success** | 03:09:21 |
+| 377 | architect-design.validate_output | success | 03:19:19 |
+| 378 / 379 | test-design / develop-design validate_input | success | 03:20:00 |
+| 380 / 381 | test-design / develop-design execute | success | 03:21–03:21 |
+| 382 / 383 | develop-design / test-design validate_output | success | 03:23:26 |
+| 384 | sync-check.execute（system） | success | 03:24:10 |
+| 385 | develop.execute attempt 1 | cancelled（**进程重启**：03:47:21 那次部署重启收的尾） | 03:24:10→03:47:21 |
+| 386 | develop.execute attempt 2 | cancelled（**人工重跑本阶段**的中止请求） | 03:47:31→03:49:37 |
+| 387 | develop.execute attempt 3 | running | 03:49:37 起 |
+
+- architect 那一轮（376）是在**旧二进制**上成功的（同一 attempt 里不再派子代理），
+  失败文案里没有「三件只读工具」那句 → 决策 408 之前的措辞。
+- 于是「重跑 architect-design」这件事**已经不需要做**：它早已成功，且下游 design / sync-check
+  全部跑完，重跑 architect 只会把后面这些一起作废。**没做。**
+- 387（正在跑的 develop）才是第一轮跑在**新二进制**上的节点；截至 11:50 它还没派过子代理
+  （子代理 run 表里最新的仍是 373–375），故新代码在本任务上的**实证使用**还没发生。
+
+### 二、部署踩雷：106 的 main 被值班长的修复提交占住（新问题，已落票）
+
+`deploy.sh` 走 `git pull --ff-only`，而 106 的检出 **diverged（ahead 1 / behind 6）**：
+
+- 本地那条 `ba77558`（author `agentpipeline-foreman`，2026-10-08 03:01:32Z）是**值班长修复
+  轮**的产物——`[repair] 值班长修复 01M4CEFYE8XBZ3R98TKDFY3ZCV…`（21 文件 / +897 −102，
+  前端 hero 横滚、`talkDraft` 中流持久化、`actionTier` 四档那批）。
+- 它**没有推到 origin、也没有构建进正在跑的二进制**（服务与二进制都是 07:55:10 CST 的
+  那一份，早于这条提交），却足以让每一次部署在 `git pull` 那一步失败。
+- 处置（非破坏）：`git branch repair/01M4CEFYE8XBZ3R98TKDFY3ZCV ba77558` 按住名分 →
+  `git bundle` 带回本机 → **push 到 origin 的同名分支**（祖先是 d4e11b9）→ 106 的 `main`
+  `reset --hard origin/main`（**任务 worktree 与 `kanban/01M4CD59…` 分支一字未动**）→
+  重跑 deploy → 成功（03:47:21Z 重启，二进制重建于 11:47 CST）。
+- 根因是**产品级的**（不是运维手滑）：值班长的修复轮把提交落在**部署检出本身**上
+  （该项目的 `local_path` 就是 `/opt/AgentPipeline`），于是「修复」与「部署」抢同一条分支。
+  已落票 `.scratch/deploy-divergence/issues/01-repair-commit-blocks-deploy.md`（needs-triage）。
+
+### 三、一次误触 rerun（如实记）
+
+按用户原有的指令（「部署完成后重跑那个暂停任务的 architect-design 阶段」），我在 03:49:37Z
+发了 `POST /tasks/01M4CD59…/rerun`。**前提是错的**——那条指令基于本记录 08:31 的「停在
+architect-design」，而任务那时早已跑到 develop。该端点的语义是「重跑**当前阶段**」，于是实际发生的是：
+
+- 在飞的 `develop.execute` attempt 2（run 386，已跑 2m06s）收到按停信号 → `cancelled`；
+- 游标仍在 `develop.execute`（位置没挪，`validate_attempts` 归 0），执行体重派 → run 387。
+
+**代价**：那一轮已烧的 token 与 2 分钟（无工作区重置、无提交丢失——`rerun` 不动 worktree，
+决策 125 的 `git reset --hard` 只属于「整条任务 retry」）。**教训**：动作类指令要**先读当下状态**
+再发，不能拿几小时前的巡检结论当输入。
+
+### 四、部署验证（四项绿 + 两条反向）
+
+- `systemctl is-active` = active；监听 `0.0.0.0:3389`；二进制重建于 11:47 CST，服务 11:47:21 重启；
+  HEAD = `a7f4785`（决策 406–410 全在）；二进制里能查到新文案（「子代理被中止」「同批前一个」
+  「三件只读工具」各命中）；
+- 外网**导航**请求 `https://106.12.12.6:3389/` → **401 + 配对页**；非导航 → **403 +
+  `kind: pairing_required`**（`/tasks` 实测）；
+- **反向**：明文入口 `http://106.12.12.6:3389/` → 连接不可用（TLS 端口对明文的拒绝）；
+- 一处与 skill 记载不符、以代码为准：**回环**请求（ssh 上去 `curl -sk https://127.0.0.1:3389/`）
+  实测 **200**，因为闸门对回环来源**豁免**（决策 336 的 `pairing_lan_loopback_peer_is_exempt`）；
+  skill 里「回环 TLS 401」那一行是旧口径。
