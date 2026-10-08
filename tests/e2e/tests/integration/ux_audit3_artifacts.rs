@@ -773,15 +773,16 @@ fn scene_04_evidence_levels_are_traceable_with_source_spot_checks() {
         hero_band.contains("overflow-x: auto"),
         "PipelineRail.svelte:340-350 应含 overflow-x: auto（票 01 落地的容器内横滚）"
     );
-    // PendingActions 的量级两档支撑行（票 03 落地后随接线随迁：量级 88、确认态取消钮 197）。
+    // PendingActions 的量级两档支撑行（票 03 落地后随接线随迁：量级 88、确认态取消钮 197；
+    // 2026-10-08 确认态判据由「数组身份」改为「动作身份串」时取消钮再 +9 → 206）。
     let pending = find_named(&root, "PendingActions.svelte");
     assert!(
         line_n(&pending, 88).contains("btn quiet"),
         ":88 应是 quiet 档"
     );
     assert!(
-        line_n(&pending, 197).contains("btn quiet"),
-        ":197 应是确认态取消钮（quiet）"
+        line_n(&pending, 206).contains("btn quiet"),
+        ":206 应是确认态取消钮（quiet）"
     );
 }
 

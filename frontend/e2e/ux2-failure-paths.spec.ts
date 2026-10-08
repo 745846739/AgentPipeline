@@ -22,6 +22,7 @@ import {
   watchBundle,
   type App,
 } from './harness';
+import { clickConfirmed } from './confirm';
 import { startGitRepo, type GitRepoFixture } from './gitRepo';
 import { foremanScript, fullPassScript, siblingPassScript, text } from './scripts';
 
@@ -128,8 +129,9 @@ test.describe('UX2 ① 详情失败态与终态动作（票 01 / 02）', () => {
     await page.goto(`${app.webBase}/#/task/${app.taskIds[1]}`);
     await settleBundle(page, bundle);
 
-    // 合入 → done（终态），旁路行（归档）才会出现
-    await page.locator('aside.dossier').getByRole('button', { name: '合入' }).click();
+    // 合入 → done（终态），旁路行（归档）才会出现。
+    // `合入` 是 destructive 档 → 内联两步确认（决策 216②）；`归档` 无确认步，不走这个助手。
+    await clickConfirmed(page.locator('aside.dossier').getByRole('button', { name: '合入' }));
     await waitForTaskById(app.taskIds[1], app, (t) => t.status === 'done', 'done', 90_000);
 
     // 完成横幅本身是一个可点的主体（可访问名是「<标题> · done」），子串匹配会同时命中它

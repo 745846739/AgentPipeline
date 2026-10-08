@@ -23,6 +23,7 @@ import {
   watchBundle,
   type App,
 } from './harness';
+import { clickConfirmed } from './confirm';
 import { humanReviewRounds, mergeReturnRounds } from './scripts';
 
 const REJECT_COMMENT = '打回标记-hr2：请补边界用例';
@@ -156,7 +157,7 @@ test.describe('前端 E2E ⑥：人工评审与返回修改', () => {
       const approveResp = page.waitForResponse(
         (r) => r.request().url().includes('/merge/decision') && r.request().method() === 'POST',
       );
-      await page.locator('aside.dossier').getByRole('button', { name: /合入/ }).click();
+      await clickConfirmed(page.locator('aside.dossier').getByRole('button', { name: /合入/ }));
       expect((await approveResp).status()).toBe(200);
       await waitForTask(
         app,

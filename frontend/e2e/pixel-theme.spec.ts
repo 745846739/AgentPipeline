@@ -23,6 +23,7 @@ import {
   expectBundleHealthy,
   type App,
 } from './harness';
+import { clickConfirmed } from './confirm';
 import { fullPassScript } from './scripts';
 
 /** 读根元素上的计算样式 token（`:root` 与 `html[data-theme]` 都落在此）。
@@ -324,7 +325,8 @@ test.describe('前端 E2E ⑨：像素主题（决策 169）', () => {
     await expect(approve).toBeVisible({ timeout: 60_000 });
 
     const banner = page.locator('[role="status"]').filter({ hasText: '任务完成' }).first();
-    await approve.click();
+    // `合入` 是 destructive 档 → 内联两步确认（决策 216②）：第一下只亮后果句，第二下才提交。
+    await clickConfirmed(approve);
 
     // 横幅是顶部居中的奖杯条；它不自动消失，由「收下」关闭
     await expect(banner).toBeVisible({ timeout: 120_000 });

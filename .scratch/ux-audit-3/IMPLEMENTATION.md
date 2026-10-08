@@ -211,6 +211,9 @@ cd frontend && UX_AUDIT3=1 AGENTPIPELINE_E2E_BIN=/root/.agentpipeline/shared-tar
   - e2e `frontend/e2e/ux2-geometry.spec.ts:204-251` 新用例：`1099/1024/900/820 →
     末列 280px 且 .main ≥ 480`；`1100 / 819 → 320px`（钉住「只动本档」），
     **PASS**；不断言 820 处横向溢出 = 0（hero 12px 属票 01 wontfix，断它等于逼重开）。
+    （819 那一格随后被票 01 落地（2026-10-01 裁决）改成「转单列」，见上方票 01 节；
+    2026-10-08 起该格量 `display: block` 而非栅格轨道——`display:block` 不会把
+    `grid-template-columns` 的 computed 值清成 `none`，量轨道是量错了仪器。）
 - **差异:** 就是文末那两格有意变化本身。
 
 ---

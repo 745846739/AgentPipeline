@@ -203,12 +203,13 @@ test.describe('UX2 ⑥ 几何：坞 / 状态行 / 档案盒（票 05 / 08 / 09�
   /**
    * 票 13（ux-audit-3）：详情页 820–1099 折行档（决策 215 三档表的中间档）。
    *
-   * `min-width: 820` 是显式钉下去的下界：票 01 的 wontfix 面是 480–819（320px 档 +
-   * hero 溢出），本档只动 820–1099——所以 819 必须仍读出 320px（「只动本档」的牙齿），
-   * 1100 桌面档也必须仍是 320px。820 处**不断言**页面横向溢出 = 0：hero 轨道 812px
-   * 恒溢出 12px 属票 01 wontfix，断它等于逼重开；溢出无回归由审计复跑 ①.1 的溢出列证明。
+   * `min-width: 820` 是显式钉下去的下界：本档只动 820–1099——1100 桌面档必须仍读出 320px。
+   * 480–819 原是与本档并列的 wontfix 面（320px 档），2026-10-01 用户裁决「有意不做也做掉」
+   * 后转成单列（`display: block`，票 01 落地）：故 819 挨着本档下界读到的**不是** 320px 轨道，
+   * 而是 block。820 处**不断言**页面横向溢出 = 0：hero 轨道 812px 恒溢出 12px 属票 01，
+   * 断它等于逼重开；溢出无回归由审计复跑 ①.1 的溢出列证明。
    */
-  test('详情页 820–1099 右栏收 280 且主栏 ≥480，1100 / 819 仍是 320（票 13）', async ({
+  test('详情页 820–1099 右栏收 280 且主栏 ≥480，1100 仍 320、819 转单列（票 13）', async ({
     page,
   }) => {
     const bundle = watchBundle(page);
@@ -225,8 +226,10 @@ test.describe('UX2 ⑥ 几何：坞 / 状态行 / 档案盒（票 05 / 08 / 09�
         const detail = document.querySelector('.detail.split') as HTMLElement | null;
         const main = document.querySelector('.detail .main') as HTMLElement | null;
         if (!detail || !main) return null;
-        const cols = getComputedStyle(detail).gridTemplateColumns.trim().split(/\s+/);
+        const cs = getComputedStyle(detail);
+        const cols = cs.gridTemplateColumns.trim().split(/\s+/);
         return {
+          display: cs.display,
           last: cols[cols.length - 1] ?? '',
           main: Math.round(main.getBoundingClientRect().width),
         };
@@ -242,13 +245,15 @@ test.describe('UX2 ⑥ 几何：坞 / 状态行 / 档案盒（票 05 / 08 / 09�
     }
 
     // 只动本档：1100 是桌面档照旧 320px；819 是票 01 单列档的上界（2026-10-01 落地）——
-    // `.detail.split` 这一档转 block，栅格列随之为 none
+    // 这一档转 `display: block`（栅格整个失效，右栏落到主栏下方），**不是**把
+    // `grid-template-columns` 清成 `none`：Chromium 里 block 元素照旧报出声明的轨道
+    // （实测 `minmax(0px, 1fr) 320px`），故这里量 `display` 才是这一档的真机制。
     const at1100 = await colsAt(1100);
     expect(at1100, 'w=1100：.detail.split 应当在').not.toBeNull();
     expect(at1100!.last, 'w=1100：桌面档不该被折行档波及').toBe('320px');
     const at819 = await colsAt(819);
     expect(at819, 'w=819：.detail.split 应当在').not.toBeNull();
-    expect(at819!.last, 'w=819：480–819 单列档不再有栅格列（票 01 落地）').toBe('none');
+    expect(at819!.display, 'w=819：480–819 单列档（票 01 落地）应转 block、栅格失效').toBe('block');
     expectBundleHealthy(bundle);
   });
 });

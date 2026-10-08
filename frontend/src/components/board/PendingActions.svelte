@@ -115,9 +115,18 @@
     return confirming !== null && confirming === keyOf(action, groupCursorId) && sentence(action) !== null;
   }
 
+  /**
+   * 动作身份串——判「是不是换了新一轮待办」用。
+   *
+   * **不能按 `actions` 的数组身份清零**：SSE / 轮询每次对齐都换一份新数组，同内容刷新也会
+   * 触发下面那支 `$effect`，把用户刚点亮的确认态在两次点击之间抹掉——两步确认（决策 216②）
+   * 于是成了「点两下也不提交」（合入 / 跳闸档实测如此）。动作身份没变就不该动它。
+   */
+  const actionIdentity = $derived(actions.map((a) => actionKey(a, a.cursor_id)).join('|'));
+
   // 动作集换了（上一个 pending 走了）就退回普通态——不让上一轮的确认态挂到新一轮的钮上
   $effect(() => {
-    void actions;
+    void actionIdentity;
     confirming = null;
   });
 

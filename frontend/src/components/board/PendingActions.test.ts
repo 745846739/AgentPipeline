@@ -62,6 +62,31 @@ describe('PendingActions（决策 91 / 101 纯渲染）', () => {
     expect(onaction.mock.calls[0][1].cursorId).toBe('c-only');
   });
 
+  it('动作集同内容刷新（SSE / 轮询换新数组）不清零确认态——第二下仍真提交', async () => {
+    const onaction = vi.fn();
+    const actions: AllowedAction[] = [
+      { action: 'cancel', kind: 'side_effect', label: '取消任务', cursor_id: 'c-dev' },
+    ];
+    const { rerender } = render(PendingActions, {
+      props: { actions, cursors: [cursor()], pendingType: 'info_insufficient', onaction },
+    });
+    await fireEvent.click(screen.getByRole('button', { name: '取消任务' }));
+    expect(screen.getByText('确认终止？任务会停在当前节点不再推进')).toBeTruthy();
+
+    // 同内容刷新：换一份新动作集 + 新游标数组（每次对齐都这样，见 store.load）。
+    // 判据若取数组身份，这次刷新就会抹掉确认态 → 第二下变成「又亮一次」，请求永不发出。
+    await rerender({
+      actions: actions.map((a) => ({ ...a })),
+      cursors: [cursor()],
+      pendingType: 'info_insufficient',
+      onaction,
+    });
+    expect(screen.getByText('确认终止？任务会停在当前节点不再推进'), '同内容刷新不该抹掉确认态').toBeTruthy();
+
+    await fireEvent.click(screen.getByRole('button', { name: '取消任务' }));
+    expect(onaction, '确认态还在，第二下就该真提交').toHaveBeenCalledTimes(1);
+  });
+
   it('side_effect 旁路动作有配对端点时点击提交', async () => {
     const onaction = vi.fn();
     const actions: AllowedAction[] = [

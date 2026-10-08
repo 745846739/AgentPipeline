@@ -23,6 +23,7 @@ import {
   watchBundle,
   type App,
 } from './harness';
+import { clickConfirmed } from './confirm';
 import { observabilityRounds } from './scripts';
 
 test.describe('前端 E2E ⑦：日志对话可信 + 刷新恢复', () => {
@@ -101,7 +102,7 @@ test.describe('前端 E2E ⑦：日志对话可信 + 刷新恢复', () => {
       });
 
       // ── 刷新后的动作照常生效：合入 → done（SSE 重连后新推进反映到界面）──
-      await page.locator('aside.dossier').getByRole('button', { name: /合入/ }).click();
+      await clickConfirmed(page.locator('aside.dossier').getByRole('button', { name: /合入/ }));
       await waitForTask(app, (t) => t.status === 'done', '合入到 done', 60_000);
       await expect(
         page.locator('body').getByText(/done|已完成/).first(),

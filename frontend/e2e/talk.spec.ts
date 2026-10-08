@@ -26,6 +26,7 @@ import {
   expectBundleHealthy,
   type App,
 } from './harness';
+import { clickConfirmed } from './confirm';
 import {
   archBlockerRounds,
   drip,
@@ -280,7 +281,8 @@ test.describe('对讲台 · 版面（票 04）', () => {
     // 恢复动作 = 后端下发的那一份（决策 101 纯渲染），且真的能下发
     const approve = turn.getByRole('button', { name: /合入/ });
     await expect(approve).toBeVisible({ timeout: 60_000 });
-    await approve.click();
+    // `合入` 是 destructive 档 → 内联两步确认（决策 216②）。
+    await clickConfirmed(approve);
 
     // 合入后回到非 pending：对讲台的急停轮消失（页面读的是同一份真实状态）
     await waitForTask(app, (t) => t.status !== 'pending', 'resumed', 180_000);

@@ -20,6 +20,7 @@ import {
   expectGateReallyRan,
   type App,
 } from './harness';
+import { clickConfirmed } from './confirm';
 import { fullPassScript } from './scripts';
 
 test.describe('前端 E2E ①：happy path（看板 → 详情 → 页签 → diff 审批合入）', () => {
@@ -82,10 +83,11 @@ test.describe('前端 E2E ①：happy path（看板 → 详情 → 页签 → di
     // diff 面板在页签区与 dossier 各有一处（同一组件两处渲染），限定页签容器内那个
     await expect(page.locator('.pane .diffpanel').first()).toBeVisible();
 
-    // 合入按钮（DiffReviewPanel 的 approve；决策 23：没有「拒绝」）
-    const approve = dossier.locator('button.btn.solid', { hasText: '合入' });
-    await expect(approve).toBeVisible();
-    await approve.click();
+    // 合入按钮（DiffReviewPanel 的 approve；决策 23：没有「拒绝」）。
+    // 按可访问名定位：票 03 起 `合入` 归 destructive 档 → `btn danger`（不再是 `btn solid`），
+    // 且带内联两步确认（决策 216②）——故点击走 clickConfirmed。
+    const approve = dossier.getByRole('button', { name: '合入' });
+    await clickConfirmed(approve);
 
     // ── 断言：任务到终态 done（合入真发生） ──
     await waitForTask(app, (t) => t.status === 'done', '任务 done', 120_000);

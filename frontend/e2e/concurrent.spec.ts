@@ -26,6 +26,7 @@ import {
   watchBundle,
   type App,
 } from './harness';
+import { clickConfirmed } from './confirm';
 import { archBlockerRounds, fullPassScript, parallelBlockerRounds, siblingPassScript } from './scripts';
 
 interface CursorView {
@@ -195,7 +196,9 @@ test.describe('前端 E2E ⑧：并发第二任务', () => {
       const resumeResp = page.waitForResponse(
         (r) => /\/tasks\/[^/]+\/resume$/.test(r.url()) && r.request().method() === 'POST',
       );
-      await devGroup.getByRole('button', { name: '跳过当前阶段' }).click();
+      // 「跳过当前阶段」= `skip`（resume）→ gate-skip 档：第一下只亮「确认跳过评审闸门？」，
+      // 第二下才发 POST /resume（决策 216②）。
+      await clickConfirmed(devGroup.getByRole('button', { name: '跳过当前阶段' }));
       const body = (await (await resumeResp).request().postDataJSON()) as { cursor_id?: string };
       expect(body.cursor_id, 'resume 应带被点那组分支的 cursor_id（决策 91）').toBe(
         devCursor.cursor_id,
@@ -246,7 +249,7 @@ test.describe('前端 E2E ⑧：并发第二任务', () => {
       await settleBundle(page, bundle);
       const yiDossier = page.locator('aside.dossier');
       await expect(yiDossier.locator('.dtag')).toContainText('合并提案', { timeout: 60_000 });
-      await yiDossier.getByRole('button', { name: /合入/ }).click();
+      await clickConfirmed(yiDossier.getByRole('button', { name: /合入/ }));
       await waitFor(app, yiId, (t) => t.status === 'done', '乙合入到 done');
 
       // ── 对甲点「合入」：基准已前移，approval 必须被重置并重走阶段 A（决策 96） ──
@@ -257,7 +260,7 @@ test.describe('前端 E2E ⑧：并发第二任务', () => {
       const approveResp = page.waitForResponse(
         (r) => r.url().endsWith('/merge/decision') && r.request().method() === 'POST',
       );
-      await jiaDossier.getByRole('button', { name: /合入/ }).click();
+      await clickConfirmed(jiaDossier.getByRole('button', { name: /合入/ }));
       expect((await approveResp).status()).toBe(200);
 
       // ── 收敛判定：done（缺陷）或「重走阶段 A 后再次等审批」（决策 96 的正确行为） ──
@@ -291,7 +294,7 @@ test.describe('前端 E2E ⑧：并发第二任务', () => {
       await settleBundle(page, bundle);
       const jiaDossier2 = page.locator('aside.dossier');
       await expect(jiaDossier2.locator('.dtag')).toContainText('合并提案', { timeout: 60_000 });
-      await jiaDossier2.getByRole('button', { name: /合入/ }).click();
+      await clickConfirmed(jiaDossier2.getByRole('button', { name: /合入/ }));
       await waitFor(app, jiaId, (t) => t.status === 'done', '甲合入到 done');
 
       // 两个任务的产物都在主干上（合入真发生，而非只改了状态字段）

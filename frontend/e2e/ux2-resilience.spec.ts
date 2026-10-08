@@ -21,6 +21,7 @@ import {
   watchBundle,
   type App,
 } from './harness';
+import { clickConfirmed } from './confirm';
 import {
   NODE,
   ValidateInput,
@@ -182,8 +183,9 @@ test.describe('UX2 ⑨ 超时 / 断线 / 长值（票 12 / 13 / 17）', () => {
     await expect(banner).toBeVisible({ timeout: 30_000 });
 
     // 流没连着时点「合入」：动作发出去了，但要**说出来**「回执要等重连」，
-    // 而不是静默等 30 秒（票 13 / R2-15）
-    await page.locator('aside.dossier').getByRole('button', { name: '合入' }).click();
+    // 而不是静默等 30 秒（票 13 / R2-15）。`合入` 是 destructive 档 → 两步确认
+    // （决策 216②）：第一下只亮后果句，第二下才发出请求。
+    await clickConfirmed(page.locator('aside.dossier').getByRole('button', { name: '合入' }));
     await expect(page.locator('.banner[role=status]', { hasText: '实时流未连通' })).toBeVisible({
       timeout: 30_000,
     });

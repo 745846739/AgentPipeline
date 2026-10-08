@@ -711,10 +711,17 @@ fn scene_10_band_boundaries_1100_and_819() {
         "场景 10：<479 档 display:block 被动"
     );
     let geo = read(&root, "frontend/e2e/ux2-geometry.spec.ts");
+    // 819 这一档量的是 `display`，不是 `grid-template-columns`：Chromium 里 block 元素
+    // 照旧报出声明的轨道（实测 `minmax(0px, 1fr) 320px`），`display: block` 不会把它清成
+    // `none`——原断言 `toBe('none')` 是量错了仪器（2026-10-08 修正，两处成对）。
     assert_chain(
         "场景 10 边界档用例",
         &geo,
-        &["const at819 = await colsAt(819);", "toBe('none')"],
+        &[
+            "const at819 = await colsAt(819);",
+            "at819!.display",
+            "toBe('block')",
+        ],
     );
     assert!(
         geo.contains("票 01 落地"),

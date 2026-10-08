@@ -75,6 +75,49 @@ describe('DiffReviewPanel（决策 23 / 119）', () => {
     expect(screen.getByText(/基准已前移/)).toBeTruthy();
   });
 
+  it('动作集同内容刷新（SSE / 轮询换新数组）不清零确认态——第二下仍真提交', async () => {
+    const onaction = vi.fn();
+    const { rerender } = render(DiffReviewPanel, {
+      props: { diff: null, raw: null, actions: mergeActions, cursors, onaction },
+    });
+    await fireEvent.click(screen.getByRole('button', { name: '合入' }));
+    expect(screen.getByText('确认合入？')).toBeTruthy();
+
+    // 同内容刷新：`actions` / `cursors` 都换一份新数组（每次对齐都这样，见 store.load）。
+    // 判据若取数组身份，这次刷新就会把确认态抹掉 → 第二下变成「又亮一次」，请求永不发出。
+    await rerender({
+      diff: null,
+      raw: null,
+      actions: mergeActions.map((a) => ({ ...a })),
+      cursors: cursors.map((c) => ({ ...c })),
+      onaction,
+    });
+    expect(screen.getByText('确认合入？'), '同内容刷新不该抹掉确认态').toBeTruthy();
+
+    await fireEvent.click(screen.getByRole('button', { name: '合入' }));
+    expect(onaction, '确认态还在，第二下就该真提交').toHaveBeenCalledTimes(1);
+  });
+
+  it('换了新一轮待办（动作身份变了）才退回普通态', async () => {
+    const onaction = vi.fn();
+    const { rerender } = render(DiffReviewPanel, {
+      props: { diff: null, raw: null, actions: mergeActions, cursors, onaction },
+    });
+    await fireEvent.click(screen.getByRole('button', { name: '合入' }));
+    expect(screen.getByText('确认合入？')).toBeTruthy();
+
+    // 上一个 pending 走了：换一条游标（动作身份随之改变）
+    const nextCursor = { ...cursors[0], cursor_id: 'c-merge-2' };
+    await rerender({
+      diff: null,
+      raw: null,
+      actions: [{ action: 'approve', kind: 'side_effect', label: '合入', cursor_id: 'c-merge-2' }],
+      cursors: [nextCursor],
+      onaction,
+    });
+    expect(screen.queryByText('确认合入？'), '新一轮不该继承上一轮的确认态').toBeNull();
+  });
+
   it('无审批动作时不渲染动作按钮', () => {
     render(DiffReviewPanel, { props: { diff: null, raw: null, actions: [], cursors } });
     expect(screen.getByText('当前没有可用的审批动作。')).toBeTruthy();
