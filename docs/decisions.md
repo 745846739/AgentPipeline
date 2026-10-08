@@ -3111,3 +3111,19 @@ config.rs}`、`tests/e2e/tests/integration/stage_boundary.rs`、`docs/testing.md
 **验证**：L1 `config.rs::sub_agent_max_rounds_defaults_to_200_and_refuses_zero`（缺省钉 200、覆盖生效且不误伤邻近键、`0` 被拒）+ `subagent.rs::round_cap_follows_the_setting_and_floors_zero_to_one`（取用点读数：缺省跟配置、0 兜底成 1）；L2 `executor.rs::subagent_round_cap_follows_the_configured_number`（配成 2 轮 → 子代理 run 行失败且 error 报「2 轮内未收口」、旧常量 12 不再出现、父代理回执同数）；既有六条子代理 L2 用例一字未改仍绿。
 
 **来源**：`.scratch/subagent-governance/issues/05`；落地 `crates/core/src/config.rs`、`crates/core/src/pipeline/subagent.rs`
+
+### 决策 408 · 只读子代理加检索之手 `search_content`：一份 schema 两处消费（显式修订决策 353），`deny` 档下同收
+
+**起因**：2026-10-08 的实证（任务 `01M4CD59`）——父代理在同一条消息里派了三个**检索型**子任务（「扫一遍 frontend/src 找出所有不适合的文案实例」这类），而只读子代理只有 `read_file` + `list_dir`、不能跑命令，只能一个目录一个目录地列、一个文件一个文件地读，三个全部打满轮数、同一句「未收口」，共烧 51.5 万 prompt token。子代理存在的理由（决策 172③）正是「把读 20 个文件的原文挡在父上下文之外」——把最省上下文的那只手（按正则找内容）关在门外，是把它的本职活干不成。
+
+**裁决**：
+
+1. **只读工具集从两件变三件**：`SUB_AGENT_TOOLS` 加 `search_content`（决策 267 那件，纯 Rust 正则、`check_read` 同一份域规则、200 匹配行 / 1MiB / 1 万文件 / 300 字符每行的限幅、不跟符号链接）。它只读，安全边界不动。
+2. **一份 schema、两处消费**（**显式修订决策 353 的「只此一份」**）：`search_content` 的参数 schema 提成 `agent::catalog` 里的常量（新增「扩展只读工具」一栏），值班长 spec 与子代理的广告**都从它取**；**广告语各自持有**——值班长那份讲他的域（「在你的文件域里」「data/ 读不到」），子代理那份讲任务工作区。参数描述改写成**域中立**的话（域的具体规则留在各自的广告语里）。**仍不进** `TOOL_SPECS` / `BUILTIN_TOOLS` / `ENV_TOOLS`——决策 267④ 的边界与那两条冻结断言一个字未动；管线阶段依旧不能声明它。
+3. **`deny` 档下同收**：档位管的是环境层（`ENV_TOOLS`），而 `search_content` 刻意不在其中（值班长的「自主轮取证」靠这一条，决策 232 / 237）；不额外过滤就会留下一个洞——**读不了文件、却能把文件内容搜出来**。判定收在 `subagent::effective_tools` 一处，**广告与执行点白名单都从它出**。**边界如实记**：`deny` 档下父节点根本派不出子代理（`spawn_sub_agent` 自己也是环境层工具，`deny` 下被拒），故本条是纵深防御而非今天可达的主路径；`read_file` / `list_dir` 在 `deny` 档下仍留在那一份里、由档位闸在执行点拒（形状与从前一致）。
+4. **失败文案点明工具集与出路**（原来只说「请把子任务拆得更具体」）：「子代理在 N 轮内未收口（只有 read_file / list_dir / search_content 三件只读工具）：请把子任务拆得更具体，或检索型子任务改由你自己完成」——把「为什么打满」写在回执里，父代理的下一步才有依据。
+5. **顺带一处形状**：`tools.rs` dispatch 里 `search_content` 的名字改用目录表常量（决策 353 的姿势：dispatch 名字引用目录表）。
+
+**验证**：L1 `subagent.rs::deny_mode_takes_the_search_tool_away_from_the_subagent`（Auto / Ask 三件全在；`deny` 下检索同收）；L2 `executor.rs::subagent_tool_set_is_read_only`（工具集恰为三件 + 检索广告非空壳、schema 要求 `pattern`）、`subagent_can_search_the_worktree_with_search_content`（**真执行**：命中带「相对路径 + 行文本」进转录、子代理 run 行成功）、`subagent_does_not_inherit_declared_tools`（阶段声明扩不了权，跟着改成三件）；既有 `search.rs` 九条与子代理六条一字未改仍绿（值班长那条链的域规则、限幅、档位豁免全部不变）。
+
+**来源**：`.scratch/subagent-governance/issues/02`；落地 `crates/core/src/agent/{catalog.rs, tools.rs}`、`crates/core/src/pipeline/{subagent.rs, foreman/catalog.rs}`

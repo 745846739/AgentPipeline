@@ -5018,6 +5018,99 @@ async fn subagent_round_cap_follows_the_configured_number() {
     assert!(carried, "父的下一轮 messages 应含「2 轮内未收口」的回执");
 }
 
+/// 决策 408：子代理手里真的多了一只检索的手——它在工作区里搜一把（`search_content`
+/// **真执行**），命中随回执行文本进它的转录，然后才给摘要收口。
+///
+/// 这是这次事故的正解：子任务常是「扫一遍某目录找出…」，没有检索工具的只读子代理只能
+/// 一个目录一个目录地翻，12 轮全用在翻文件上（2026-10-08，任务 01M4CD59）。
+#[tokio::test]
+async fn subagent_can_search_the_worktree_with_search_content() {
+    let ctx = setup("true", Settings::default()).await;
+    declare_sub_agent(&ctx).await;
+
+    let worktree = ctx.store.home().worktree_path("t-search");
+    std::fs::create_dir_all(&worktree).unwrap();
+    std::fs::write(
+        worktree.join("NOTES.md"),
+        "关键结论：入口在 main()\n与检索无关的一行\n",
+    )
+    .unwrap();
+
+    let mut script = Script::new();
+    design_scripts(&mut script);
+    script
+        .for_node(Stage::Develop, Node::Execute)
+        .push(testkit::Step::Tool {
+            name: "spawn_sub_agent".into(),
+            arguments: serde_json::json!({"task": "在工作区里搜「入口在」落在哪"}),
+        })
+        .write_file(
+            "src/lib.rs",
+            "pub fn add(a: i32, b: i32) -> i32 { a + b }\n#[test]\nfn adds() { assert_eq!(add(1, 2), 3); }\n",
+        )
+        .write_file("tests/acceptance.rs", "#[test]\nfn ok() {}\n")
+        .run_command(
+            "git add -A && git -c user.name=f -c user.email=f@l commit -m 'feat: task t-search'",
+        )
+        .submit(&CodeChanges {
+            branch_name: "kanban/t-search".into(),
+            changed_files: vec![],
+            unit_test_files: vec![],
+            no_changes: false,
+        });
+    script
+        .for_node(Stage::Review, Node::Execute)
+        .submit(&ReviewResult {
+            approved: true,
+            review_report_path: Some("review-report.md".into()),
+            required_changes: vec![],
+        });
+    script
+        .for_node(Stage::Test, Node::Execute)
+        .submit(&TestResult {
+            passed: true,
+            test_report_path: Some("test-report.md".into()),
+            failures: vec![],
+            gate_recheck: false,
+        });
+    // 子代理：真搜一把，再按摘要收口。
+    script.push_subagent(testkit::Step::Tool {
+        name: "search_content".into(),
+        arguments: serde_json::json!({"pattern": "入口在"}),
+    });
+    script.push_subagent(testkit::Step::Text(
+        "命中 NOTES.md：入口在 main()（源：search_content）".into(),
+    ));
+
+    ctx.agent.set_script(script);
+    testkit::seed_task(&ctx.store, "t-search", "p1")
+        .await
+        .unwrap();
+    admit(&ctx, "t-search").await;
+    ctx.executor.run("t-search").await.unwrap();
+
+    // ① 回执行文本带着命中（相对路径 + 行文本）——「真执行」的证据
+    let requests = ctx.agent.request_log();
+    let hits = requests
+        .iter()
+        .filter(|r| r.run.as_ref().is_some_and(|c| c.agent_type == "subagent"))
+        .flat_map(|r| r.messages.iter())
+        .filter(|m| m.role == Role::Tool)
+        .filter_map(|m| m.content.as_deref())
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(hits.contains("NOTES.md"), "命中要带相对路径：{hits}");
+    assert!(hits.contains("入口在"), "命中要带行文本：{hits}");
+
+    // ② 检索不是子代理的失败源：它照常按摘要收口。
+    let runs = ctx.store.list_runs("t-search").await.unwrap();
+    let sub = runs
+        .iter()
+        .find(|r| r.agent_type == "subagent")
+        .expect("应有子代理 run 行");
+    assert_eq!(sub.status, NodeStatus::Success);
+}
+
 /// 验收（票 08 安全断言）：子代理的工具集**只有** `read_file` / `list_dir`。
 ///
 /// 这条是本票的安全边界：不是「子代理不调 run_command」，而是**它的工具定义里
@@ -5071,7 +5164,8 @@ async fn subagent_tool_set_is_read_only() {
     admit(&ctx, "t-ro").await;
     ctx.executor.run("t-ro").await.unwrap();
 
-    // 子代理那一次请求的工具集：必须是固定只读的两个
+    // 子代理那一次请求的工具集：固定只读的三件（决策 408 加了检索——它只读，
+    // 且是「把读 20 个文件的原文挡在父上下文之外」这件本职最省上下文的那只手）
     let requests = ctx.agent.request_log();
     let sub_req = requests
         .iter()
@@ -5080,8 +5174,35 @@ async fn subagent_tool_set_is_read_only() {
     let names: Vec<&str> = sub_req.tools.iter().map(|t| t.name.as_str()).collect();
     assert_eq!(
         names,
-        vec!["read_file", "list_dir"],
+        vec!["read_file", "list_dir", "search_content"],
         "子代理工具集必须固定只读"
+    );
+    assert!(
+        !names.contains(&"run_command"),
+        "子代理不得拿到 run_command（无 OS 级沙箱，决策 19 修订 / 104）"
+    );
+    assert!(!names.contains(&"write_file"), "子代理不得写文件");
+    assert!(
+        !names.contains(&"spawn_sub_agent"),
+        "深度固定一层：子代理不再派子代理（决策 9）"
+    );
+    // 检索工具的广告**不是空壳**（决策 353 的姿态）：描述非空，schema 与值班长共用
+    // 同一份（`pattern` 是必填的那个字段），认下这条才谈得上「模型会用」。
+    let search = sub_req
+        .tools
+        .iter()
+        .find(|t| t.name == "search_content")
+        .expect("应有 search_content 定义");
+    assert!(
+        !search.description.trim().is_empty(),
+        "检索工具的广告语不得为空壳"
+    );
+    assert!(
+        search.parameters["required"]
+            .as_array()
+            .is_some_and(|req| req.iter().any(|v| v == "pattern")),
+        "参数 schema 应要求 pattern：{}",
+        search.parameters
     );
     assert!(
         !names.contains(&"run_command"),
@@ -5340,8 +5461,8 @@ async fn subagent_does_not_inherit_declared_tools() {
     let names: Vec<&str> = sub_req.tools.iter().map(|t| t.name.as_str()).collect();
     assert_eq!(
         names,
-        vec!["read_file", "list_dir"],
-        "阶段声明的工具不得传给子代理"
+        vec!["read_file", "list_dir", "search_content"],
+        "阶段声明的工具不得传给子代理（它拿到的是**固定**只读集，决策 172③ / 408）"
     );
 }
 

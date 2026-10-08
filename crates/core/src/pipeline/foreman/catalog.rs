@@ -171,7 +171,9 @@ pub const FOREMAN_TOOL_SPECS: [ForemanToolSpec; 24] = [
                      域根，也可指定域内子目录（data/ 读不到——与 read_file 同一条域规则）。\
                      不跟符号链接；二进制文件跳过；命中按「路径:行号:行文本」带回并有行数\
                      上限。列文件名用 list_dir、跑诊断命令用 run_readonly——找**内容**用它。",
-        parameters: r#"{"type":"object","properties":{"pattern":{"type":"string","description":"正则表达式（区分大小写）"},"path":{"type":"string","description":"从哪个目录开始找（相对域根，缺省整个域；data/ 被拒）"}},"required":["pattern"]}"#,
+        // schema 与只读子代理**共用一份**（决策 408）：域的具体规则写在上面那段广告语里，
+        // 参数描述保持域中立，两处才用得同一份。
+        parameters: crate::agent::catalog::SEARCH_CONTENT_PARAMETERS,
     },
     // 受治理的网口（决策 266 / 票 02）：GET-only、https 出环、白名单走 `NetworkPolicy`
     // **同一张**（决策 179，零第二版本）、每次取数与每次被拒都落命令台账。同属只读层故

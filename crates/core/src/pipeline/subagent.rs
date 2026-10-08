@@ -39,14 +39,54 @@ use crate::{Error, Result};
 /// 子代理的 run 行 / 会话行的 `agent_type`（决策 172③）。
 pub const SUB_AGENT_TYPE: &str = "subagent";
 
-/// 子代理**固定**的只读工具集（决策 172③，票 08）。
+/// 子代理**固定**的只读工具集（决策 172③，票 08；决策 408 加检索）。
 ///
 /// 这是安全边界本身，不是配置项：故意写成常量，任何「按阶段扩权」的改动都必须先改
 /// 这里，从而在 diff 里显式可见。名字引用目录表常量（决策 353）——字面量只此一份。
-pub const SUB_AGENT_TOOLS: [&str; 2] = [
+///
+/// `search_content`（决策 408）是**补上本职**而非扩权：子代理存在的理由就是「把读
+/// 20 个文件的原文挡在父上下文之外」，而它此前连找内容的手都没有——2026-10-08 的实证
+/// 里三个子代理全被「扫一遍 frontend/src」这类检索型子任务打满轮数（任务 01M4CD59）。
+/// 它只读、走同一份 `file_policy`、有命中行数与字节上限；`deny` 档下**同收**（见
+/// [`effective_tools`]）。
+pub const SUB_AGENT_TOOLS: [&str; 3] = [
     crate::agent::catalog::READ_FILE,
     crate::agent::catalog::LIST_DIR,
+    crate::agent::catalog::SEARCH_CONTENT,
 ];
+
+/// `search_content` 广告给子代理的那一版说明（决策 408）。
+///
+/// schema 与值班长**共用一份**（`catalog::SEARCH_CONTENT_PARAMETERS`），广告语各写各的：
+/// 值班长那份讲他的域（「在你的文件域里」「data/ 读不到」），子代理这份讲工作区。
+const SUB_AGENT_SEARCH_DESCRIPTION: &str = "在任务工作区里**按正则找内容**（报错串、\
+     函数名、某句文案落在哪几处）。pattern 是正则、区分大小写；path 可指定工作区内的\
+     子目录，缺省整个工作区。不跟符号链接、二进制文件跳过，命中按「路径:行号:行文本」\
+     带回并有行数上限。列文件名用 list_dir——找**内容**用它。";
+
+/// 这次调用实际拿到的只读工具集（决策 408）：`deny` 档下 `search_content` **同收**。
+///
+/// 档位管的是**环境层**（`ENV_TOOLS`），而 `search_content` 是只读层的扩展工具
+/// （决策 267④：刻意不进 `ENV_TOOLS`，值班长的「自主轮取证」靠的就是这一条，决策
+/// 232 / 237）。可子代理这一侧的档位语义是「环境层收到底」——不额外过滤就会留下一个
+/// 洞：**读不了文件，却能把文件内容搜出来**。
+///
+/// 广告（[`StoreSubAgentRunner::tool_defs`]）与执行点白名单（`with_allowed_tools`）
+/// **都从这里出**，一处判定、两处生效。
+///
+/// 边界如实记：`read_file` / `list_dir` 在 `deny` 档下仍留在这一份里，由档位闸在执行点
+/// 拒（它们本来就是 `ENV_TOOLS`），形状与从前一致；而且 `deny` 档下父节点**根本派不出
+/// 子代理**（`spawn_sub_agent` 自己也是环境层工具，`deny` 下被拒）——本条过滤是纵深
+/// 防御，不是今天可达的主路径。
+fn effective_tools(env_mode: crate::types::EnvMode) -> Vec<&'static str> {
+    SUB_AGENT_TOOLS
+        .into_iter()
+        .filter(|name| {
+            !(*name == crate::agent::catalog::SEARCH_CONTENT
+                && env_mode == crate::types::EnvMode::Deny)
+        })
+        .collect()
+}
 
 /// 子代理的收尾前言：要求它只回摘要（父上下文要的是摘要，不是原文）。
 const SUB_AGENT_PERSONA: &str = "你是一个只读检索子代理。你的唯一任务是按父代理给出的描述\
@@ -149,13 +189,25 @@ impl StoreSubAgentRunner {
 
     /// 子代理**固定只读**的工具定义。
     ///
-    /// 注意它不经 `effective_tools`——那条路会并入基线强制工具（含 `run_command` /
-    /// `write_file`），正是本票要挡掉的东西。定义从目录表取（决策 353）——
-    /// 子代理同样是「看得见一个调用就被拒的工具」的受害者候选，空壳广告一并退场。
-    fn tool_defs() -> Vec<ToolDef> {
-        SUB_AGENT_TOOLS
-            .iter()
+    /// 注意它不经父节点那条 `effective_declared_tools`——那条路会并入基线强制工具
+    ///（含 `run_command` / `write_file`），正是本票要挡掉的东西。定义从目录表取
+    ///（决策 353 / 408）——子代理同样是「看得见一个调用就被拒的工具」的受害者候选，
+    /// 空壳广告一并退场。`search_content` 是唯一的例外分支：它的 schema 与值班长共用
+    /// （`catalog::SEARCH_CONTENT_PARAMETERS`），广告语用子代理自己那一版。
+    fn tool_defs(env_mode: crate::types::EnvMode) -> Vec<ToolDef> {
+        effective_tools(env_mode)
+            .into_iter()
             .map(|name| {
+                if name == crate::agent::catalog::SEARCH_CONTENT {
+                    return ToolDef {
+                        name: name.to_string(),
+                        description: SUB_AGENT_SEARCH_DESCRIPTION.to_string(),
+                        parameters: serde_json::from_str(
+                            crate::agent::catalog::SEARCH_CONTENT_PARAMETERS,
+                        )
+                        .expect("共享的 search_content schema 必须是合法 JSON（目录表单测钉住）"),
+                    };
+                }
                 crate::agent::catalog::def_for(name).unwrap_or_else(|| {
                     panic!("SUB_AGENT_TOOLS 里的 {name} 必须有目录行（agent::catalog）")
                 })
@@ -237,10 +289,12 @@ impl SubAgentRunner for StoreSubAgentRunner {
                 cfg.killer.clone(),
             )
             // 子代理的只读工具同样受父阶段的档位管：`deny` 档下连只读文件也不给
-            //（决策 206 的 deny 是「环境层收到底」）。**不接提议通道**：与父节点同理
-            // ——流水线背后没有人盯着，落一条没人会按的提议等于静默丢弃。
+            //（决策 206 的 deny 是「环境层收到底」）——`search_content` 不在 `ENV_TOOLS`
+            // 里，档位管不到它，故由 [`effective_tools`] **显式同收**（决策 408）。
+            // **不接提议通道**：与父节点同理——流水线背后没有人盯着，落一条没人会按的
+            // 提议等于静默丢弃。
             .with_env_mode(cfg.env_mode)
-            .with_allowed_tools(SUB_AGENT_TOOLS.to_vec());
+            .with_allowed_tools(effective_tools(cfg.env_mode));
             let ctx = ToolCallContext {
                 task_id: cfg.task_id.clone(),
                 session_id: None,
@@ -360,7 +414,7 @@ impl StoreSubAgentRunner {
                 // 的适配器，后者给按 messages 组装的适配器，两条路都不落空。
                 user_prompt: session.user_prompt.clone(),
                 messages: session.transcript.clone(),
-                tools: Self::tool_defs(),
+                tools: Self::tool_defs(self.cfg.env_mode),
                 temperature: self.cfg.temperature,
                 max_tokens: self.cfg.max_tokens,
                 provider_id: None,
@@ -413,7 +467,8 @@ impl StoreSubAgentRunner {
             }
         }
         Err(Error::Validation(format!(
-            "子代理在 {max_rounds} 轮内未收口，请把子任务拆得更具体"
+            "子代理在 {max_rounds} 轮内未收口（只有 read_file / list_dir / search_content \
+             三件只读工具）：请把子任务拆得更具体，或检索型子任务改由你自己完成"
         )))
     }
 }
@@ -516,5 +571,26 @@ mod tests {
 
         settings.sub_agent_max_rounds = 0;
         assert_eq!(effective_max_rounds(&settings), 1, "0 兜底成 1，绝不无限");
+    }
+
+    /// 决策 408：只读集是三件，且 `deny` 档下 `search_content` **同收**——
+    /// 不同收会留下「读不了文件、却能把文件内容搜出来」的洞。
+    ///
+    /// 广告与执行点白名单都从 [`effective_tools`] 出，故这一条同时钉住两处。
+    #[test]
+    fn deny_mode_takes_the_search_tool_away_from_the_subagent() {
+        use crate::types::EnvMode;
+        for mode in [EnvMode::Auto, EnvMode::Ask] {
+            assert_eq!(
+                effective_tools(mode),
+                vec!["read_file", "list_dir", "search_content"],
+                "{mode:?} 档下三件都在"
+            );
+        }
+        assert_eq!(
+            effective_tools(EnvMode::Deny),
+            vec!["read_file", "list_dir"],
+            "deny 档下检索同收（读不了文件，就不该能把内容搜出来）"
+        );
     }
 }

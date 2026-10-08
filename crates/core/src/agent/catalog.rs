@@ -35,6 +35,23 @@ pub const SKILL: &str = super::client::SKILL_TOOL;
 /// 重活外发（票 runner-offload/06）：agent 把一条白名单 cargo 命令交给 GitHub Actions。
 pub const OFFLOAD_RUN: &str = "offload_run";
 
+// ── 扩展只读工具：不在内置集里，也**不进**环境层（决策 267④ / 408）──────────────
+//
+// 与 `TOOL_SPECS` 分家的理由：那张表的行与 `BUILTIN_TOOLS` 逐位冻结、且除两例外都必须
+// 在 `ENV_TOOLS` 里——扩展工具两条都不满足，也**不该**满足：`search_content` 服务值班长
+// 与只读子代理，进了 `ENV_TOOLS` 就会被 `deny` 档管住，「自主轮能取证」的设定随之失效
+//（决策 232 / 237 的判据：它改不了任何东西）。
+//
+// 这里只放**一份 schema**；广告语是「面向谁说话」的一部分，由各消费方自己持有。
+
+/// 内容搜索（决策 267；决策 408 起只读子代理也吃它）。名字的字面量只此一份。
+pub const SEARCH_CONTENT: &str = "search_content";
+
+/// `search_content` 的参数 schema：**一份定义、两处消费**（值班长 spec 与只读子代理的
+/// 广告）。决策 408 把决策 353 的「只此一份」显式修订为「一个定义、多处消费」——
+/// 参数描述写成**域中立**的话（域的具体规则在各自的广告语里讲），两处才用得同一份。
+pub const SEARCH_CONTENT_PARAMETERS: &str = r#"{"type":"object","properties":{"pattern":{"type":"string","description":"正则表达式（区分大小写）"},"path":{"type":"string","description":"从哪个目录开始找（相对域根，缺省整个域）"}},"required":["pattern"]}"#;
+
 /// 一个内置工具的规格：名字 + 广告语 + 参数 JSON-Schema。
 pub struct ToolSpec {
     pub name: &'static str,

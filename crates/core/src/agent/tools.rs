@@ -769,8 +769,9 @@ impl ToolExecutor {
                 // 故档位与值守轮的 deny 清单都管不到它——这正是「自主轮能取证」的落点。
                 "run_readonly" => self.run_readonly(call, ctx).await?,
                 // 内容搜索（决策 267）：纯 Rust 正则找内容。同属只读层——档位与值守轮的
-                // deny 清单都管不到它（run_readonly 同款判据）。
-                "search_content" => self.search_content(call, ctx).await?,
+                // deny 清单都管不到它（run_readonly 同款判据）。名字引用目录表常量
+                // （决策 353 / 408：值班长 spec 与子代理的白名单也吃同一份 schema）。
+                super::catalog::SEARCH_CONTENT => self.search_content(call, ctx).await?,
                 // 受治理的网口（决策 266）：GET-only、同一张出口白名单、落命令台账。
                 // 同属只读层故档位管不到它，但值守轮的 deny 清单收它（夜间外发无人盯）。
                 "web_fetch" => self.web_fetch(call, ctx).await?,

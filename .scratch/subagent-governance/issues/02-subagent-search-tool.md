@@ -23,9 +23,13 @@
 
 **Blocked by:** None
 
-**Status:** ready-for-agent
+**Status:** done
 
-- [ ] 用例：子代理工具集恰为 `read_file` / `list_dir` / `search_content`（改既有安全断言）
-- [ ] 用例：deny 档下子代理既拿不到广告、执行点也拒（`search_content` 同收）
-- [ ] 用例：子代理调 `search_content` 在工作区里命中（复用值班长那条的域与限幅断言口径）
-- [ ] 既有 `subagent_does_not_inherit_declared_tools` 照旧绿（阶段声明扩不了权）
+- [x] 用例：子代理工具集恰为 `read_file` / `list_dir` / `search_content`（改既有安全断言
+  `executor.rs::subagent_tool_set_is_read_only`，并加断言「广告非空壳、schema 要求 pattern」）
+- [x] 用例：deny 档下子代理既拿不到广告、执行点也拒（`subagent.rs::deny_mode_takes_the_search_tool_away_from_the_subagent`
+  ——判定收在 `effective_tools` 一处，广告与白名单都从它出；如实记：deny 下父节点本就派不出子代理，属纵深防御）
+- [x] 用例：子代理调 `search_content` 在工作区里命中（`executor.rs::subagent_can_search_the_worktree_with_search_content`
+  ——真执行，命中带「相对路径 + 行文本」进转录）
+- [x] 既有 `subagent_does_not_inherit_declared_tools` 照旧绿（阶段声明扩不了权；期望集跟着改成三件）
+- [x] 既有 `search.rs` 九条一字未改仍绿（值班长链的域规则 / 限幅 / 档位豁免不变）
