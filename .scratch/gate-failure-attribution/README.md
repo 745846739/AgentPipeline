@@ -72,6 +72,11 @@
 - [01-gate-toolchain-and-failure-attribution](issues/01-gate-toolchain-and-failure-attribution.md)
   ——单票收口：部署侧钉工具链 + 闸门环境预检 + 环境类失败改道 + pending 携带成因 +
   计数语义复核。
+- [02-gate-timeout-is-not-a-failure](issues/02-gate-timeout-is-not-a-failure.md)
+  ——**另一扇闸门**（repair `finish`，非本目录 01 的 `run_code_gate`）：它把「超时」与「失败」
+  报成同一个形状（`闸门没过（test）：… 退出码 -1，用时 600013ms`），于是冷编译被当成测试失败。
+  与 01 共用的只有「600s 这个数」与「失败形状会误导人」两件事。事故实证见
+  [../foreman-work-record/incident-2026-10-08.md](../foreman-work-record/incident-2026-10-08.md)。
 
 ### 落地状态
 
