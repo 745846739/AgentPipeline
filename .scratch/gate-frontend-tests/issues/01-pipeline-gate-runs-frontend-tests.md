@@ -23,7 +23,22 @@ raw 分支 / C Makefile `check-test` 扩面），再落地：
 **Blocked by:** None（可立即开工；但**建议在任务 `01M4CD59Y977ZQ0GMY9MPSFFMX` merge 之后**，
 避免与那单的评审面混在一起）
 
-**Status:** needs-triage
+**Status:** ready-for-agent
 
 **边界.** 只管单元测试面，不纳入 playwright e2e（决策 147）；不动 `test_command_for`
 的框架映射表（决策 392）除非选型要求；不改 review 节点的静态评审定位。
+
+## Comments
+
+### 2026-10-09 · triage 裁决 → ready-for-agent，选型 C
+
+**C · Makefile `check-test` 扩面（加 `cd frontend && npm test`）+ `test_framework = make check-test`。**
+落点核实：`check-test` 现为裸 `cargo test --workspace`（Makefile:91），命令走 `Some(raw)` 既有
+分支，零表结构。**排 B**：4 处 prompt 文案污染 + 动 prompt cache 前缀（380/381）+ `&&` 复合全仓
+零先例——省一次 30 文件，换来每次改 prompt 的持续代价。**排 A**：30 文件只为一个与
+`lint_command` 同构的列；C 同样零表结构且顺决策 168（Makefile 是闸门唯一权威，闸门跑「本仓
+自己的 check」），`make check` 作 raw 值已有先例。**代价（接受）**：本地与 CI check-test 各慢约
+70s、CI 中与 frontend job 重复跑 vitest。**红利**：闸门经 make 走工具链钉住（PATH /
+RUSTUP_TOOLCHAIN），多一层 gate-failure-attribution 类事故的防护。
+**开工约束**：`executor.rs` / `templates.rs` 与并行会话在飞改动重叠——独立 worktree 或等其
+收口后再动；三票建议序 03 → 01 → 02。

@@ -19,9 +19,18 @@
 
 **Blocked by:** None（可立即开工）
 
-**Status:** needs-triage
+**Status:** ready-for-agent
 
 **边界.** **不设自动放行、不设轮数上限**——review 不通过本来就走 `Pending(UserDecision)`
 （`routes.rs:143`，决策 2/131），停在人手里是对的，本票只做可见性、不改变谁拍板；
 不解析 `review-report.md` 正文（决策 387 边界照旧）；不改 review 的静态评审定位与
 `review_mode=human` 通路。
+
+## Comments
+
+### 2026-10-09 · triage 裁决 → ready-for-agent（无开放选型）
+
+三层结构与硬边界已在 spec 收口（不自动放行、不设轮数上限、不解析报告正文），按
+**L1 → L2 → L3** 分批交付：L1 独立可用，L2 是 L3 的前提，每层独立过闸。
+**开工约束**：`templates.rs` / `routes.rs` / `model_request.rs` 与并行会话在飞改动重叠——
+独立 worktree 或等其收口；三票建议序 03 → 01 → 02（本票不阻塞任何事，可最后）。
