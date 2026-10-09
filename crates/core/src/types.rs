@@ -834,6 +834,28 @@ impl FileAction {
 /// （用户原话逐字 / 系统注入带前缀）在转录里可机器区分、模型可辨识。
 pub const REVIEW_REWORK_TURN_PREFIX: &str = "【评审打回反馈·系统注入】";
 
+/// 决策 406：打回修复的最小改动红线。与 [`REVIEW_REWORK_TURN_PREFIX`] 同一条纪律、
+/// 同一形态——**打回反馈的两处渲染共用这一份**（决策 133 的降级段 + 决策 387 的 turn），
+/// 任一通道单独挂都会在另一条通道上丢掉这条红线。
+///
+/// 立项实证（2026-10-08，任务 01M4CD59Y977ZQ0GMY9MPSFFMX）：第一轮评审的三条
+/// required_changes 只要求「补一类构造形态 + 扩一个扫描面 + 归档证据」，修复提交却顺手
+/// 重写了 `findHalfMixed` 的扫描顺序、把 `FILENAME_TOKEN` 提到 `STAGE_ID` 之前——5 枚阶段
+/// id 只剩 `sync-check` 能命中，**第二轮评审打回的正是这次顺手重构引入的回归**。
+///
+/// 只约束**打回这一轮**，不进 system prompt：system 段是 prompt cache 前缀（决策 380/381
+/// 的关注面），且首轮 develop 不需要它。
+///
+/// **措辞刻意不提「候选集」**：那是 `docs/testing.md` 的测试规矩（判据型规则的用例必须
+/// 遍历判据的候选集），不是每次打回都适用的概念——红线管「改什么」，测试规矩管「怎么写
+/// 用例」，两处分开才不互相污染。
+pub const REVIEW_REWORK_DISCIPLINE: &str = "\
+## 打回修复纪律
+只做上面这份清单要求的改动，以及完成它们所必需的最小改动。若要重排、重写或重构清单**没有**要求动的既有判定逻辑（扫描顺序、正则判据、分支结构等），必须：
+① 先在提交信息里显式声明这次重构及其理由；
+② 为被重构的**既有**行为补上回归用例——覆盖重构前成立、重构后可能不再成立的那些情形，而不是只保留恰好仍然通过的几条。
+";
+
 /// 业务测试场景（test-design 产出，决策 136）。
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
 pub struct TestScenario {
@@ -1732,6 +1754,28 @@ pub fn stage_may_use_ask(stage: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 决策 406：红线的形状不可被悄悄削弱——**两条都得在**（声明 + 补回归用例），且不许
+    /// 把 `docs/testing.md` 的「候选集」规矩混进来：红线管「改什么」，测试规矩管「怎么写
+    /// 用例」，两处分开才不互相污染（措辞边界见 `REVIEW_REWORK_DISCIPLINE` 的文档注释）。
+    #[test]
+    fn review_rework_discipline_keeps_both_teeth() {
+        for must in [
+            "## 打回修复纪律",
+            "只做上面这份清单要求的改动",
+            "① 先在提交信息里显式声明这次重构及其理由",
+            "② 为被重构的**既有**行为补上回归用例",
+        ] {
+            assert!(
+                REVIEW_REWORK_DISCIPLINE.contains(must),
+                "红线缺 `{must}`：\n{REVIEW_REWORK_DISCIPLINE}"
+            );
+        }
+        assert!(
+            !REVIEW_REWORK_DISCIPLINE.contains("候选集"),
+            "「候选集」是 docs/testing.md 的测试规矩，不该进打回红线"
+        );
+    }
 
     /// 从 `schema_for!` 取一个枚举的**变体表**——宏路径，不经过任何手写清单。
     ///

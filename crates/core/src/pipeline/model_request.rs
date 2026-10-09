@@ -724,6 +724,9 @@ async fn review_required_changes_segment(
             out.push_str(&format!("- {} `{}`\n", change.action.label(), change.path));
         }
     }
+    // 决策 406：本段是**无转录时的降级通道**（决策 387 之后真打回走 turn），红线两处
+    // 共挂一份——只挂 turn 会在降级路径上丢掉这条纪律。
+    out.push_str(crate::types::REVIEW_REWORK_DISCIPLINE);
     Ok(Some(out))
 }
 

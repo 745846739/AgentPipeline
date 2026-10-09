@@ -3179,3 +3179,21 @@ config.rs}`、`tests/e2e/tests/integration/stage_boundary.rs`、`docs/testing.md
 **验证**：L1 `changes.rs` **11 条**——只认编辑类工具 / 失败的编辑不算改动 / 去重保首次出现序 / 坏参数与空 `path` 跳过而不报错 / **`ask` 与 `deny` 档整轮为空而 `auto` 不空** / 并集两侧去重 / diff 只吃 `diff --git` 头不吃 hunk 行 / 那一段的三种形状（空清单不出、≤3 全列、>3 报计数）/ 更正开头。L2 `foreman.rs` **4 条**——`the_closeout_lists_the_files_the_round_changed`（同一个文件改两次只算一次、正文以清单收尾）、`a_round_that_changed_nothing_says_nothing_about_changes`（列是 `null` 而不是空数组、正文没有那一段）、`a_no_change_claim_is_annotated_not_rewritten`（模型原话保留在开头 + 更正句在后）、**`the_changes_line_reaches_the_next_rounds_prompt`（本票的全部意义：上一轮的清单进得去下一轮的请求）**。`cargo test --workspace` **1801 通过 / 0 失败**（7 ignored）、`clippy --workspace --all-targets -D warnings` 与 `cargo fmt --all -- --check` 全绿；既有 141 条 foreman L2 一字未改仍绿（含逐字钉收场文案的那几条）。
 
 **来源**：`.scratch/foreman-work-record/issues/01`（事故账 `incident-2026-10-08.md` 的问题一 / 二 / 四）；落地 `crates/core/src/storage/migrations/0045_foreman_changed_files.sql`、`crates/core/src/storage/{foreman.rs, proposals.rs}`、`crates/core/src/pipeline/foreman/{changes.rs, runner.rs, mod.rs, turn_plan.rs}`、`crates/app/src/routes/foreman.rs`、`crates/core/tests/integration/foreman.rs`
+
+### 决策 412 · 打回修复的最小改动红线（随打回反馈走）+ 「判据型用例遍历候选集」入 testing.md
+
+**起因**：任务 `01M4CD59Y977ZQ0GMY9MPSFFMX`（文案纪律扩面）两轮评审失败的复盘——**第二轮打回的是第一轮修复引入的回归**。第一轮评审的三条 required_changes 只要求「补一类构造形态 + 扩一个扫描面 + 归档证据」，修复提交 `8bee901` 却顺手重写了 `findHalfMixed` 的扫描顺序，把 `FILENAME_TOKEN` 的剔除提到 `STAGE_ID` 之前：它的连写备选 `(?:review|test|develop|architect)-[\w-]+` 与阶段 id 集合**相交**，5 枚阶段 id 只剩 `sync-check` 能命中（实测：`把结果带给 develop-design 阶段` 修复前报、修复后漏）。而 A-2 的口径正例**恰好只测了 `sync-check`**——唯一幸存的那一枚，于是 1187 条前端用例全绿照样穿过，第二轮评审靠静态读码才抓到。两层病因：**修复的注意力不在清单上**（顺手重构）、**正例是按实现挑的**（挑出来的代表恰好总是幸存者）。
+
+**裁决**：
+
+1. **红线入打回反馈的两处载体，内容一份共用**：`types.rs::REVIEW_REWORK_DISCIPLINE`，与 `REVIEW_REWORK_TURN_PREFIX` 同一形态——打回反馈有两处渲染，任一通道单独挂都会在另一条上丢掉这条纪律。挂点：`model_invoke.rs::review_rework_turn`（决策 387 的 turn，**真打回走这条**）+ `model_request.rs::review_required_changes_segment`（决策 133 的段，**无转录时的降级通道**）。
+2. **不进 system prompt**：system 段是 prompt cache 前缀（决策 380/381 的关注面），且首轮 develop 根本不需要它——红线只随打回走，只约束打回这一轮。
+3. **强度 = 声明 + 补回归用例**：① 要重排 / 重写 / 重构清单**没有**要求动的既有判定逻辑，必须先在提交信息里声明及理由；② 声明了就得为被重构的**既有**行为补回归用例——覆盖重构前成立、重构后可能不再成立的那些情形，而不是只保留恰好仍然通过的几条。**明确不做**：写死具体禁令（「不许调扫描顺序」之类）——那会把一次事故写成永久禁令，下次真正需要重排的人被它挡住却不知道为什么。
+4. **措辞刻意不提「候选集」**：那是测试规矩（见 ⑤）。红线管「改什么」，测试规矩管「怎么写用例」，两处分开才不互相污染——这条边界本身有用例钉住。
+5. **`docs/testing.md` §5 补一条不变量**：判据型规则（一个正则 / 一张枚举表 / 一组候选值定义的规则）的正例**必须遍历判据的候选集**，不许挑代表；落地形态是**候选集做单一事实源、判据由它构造、正例遍历同一个数组**——判据改了用例自动跟着改。与 §5 已有的「配置清单同一性」那条「**判据遍历默认值对象、不手写字段数组**」是同一条姿态的一般化。
+
+**验证**：L1 `types.rs::review_rework_discipline_keeps_both_teeth`（标题 + 最小改动句 + ① + ② 四条都在，且**不含「候选集」**——把裁决 ④ 的边界钉成会变红的断言）；L1 `model_invoke.rs::review_rework_turn_renders_only_for_a_failing_review` 的期望清单加 `REVIEW_REWORK_DISCIPLINE`（撤掉那句 push 即红）。
+
+**范围**：本决策**不含**该任务自身的 ①② 修复（收窄 `FILENAME_TOKEN` + 候选集枚举正例）——那一半由打回后的 develop 在任务 worktree 里完成，走它自己的闸门与第三轮评审；本决策是从此对**所有**打回生效的那一条纪律。配套的两张票另立：`.scratch/gate-frontend-tests/`（闸门跑前端单测）、`.scratch/review-round-ledger/`（评审轮间台账）。
+
+**来源**：任务 `01M4CD59Y977ZQ0GMY9MPSFFMX` 两轮评审复盘 + 会话拷问（grilling 十条裁决）；落地 `crates/core/src/{types.rs, pipeline/model_invoke.rs, pipeline/model_request.rs}`、`docs/testing.md`

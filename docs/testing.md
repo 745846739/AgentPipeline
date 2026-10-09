@@ -139,6 +139,10 @@ workspace 成员 `crates/testkit`，供 L2 / L4 复用：
 | 闸门环境预检与归因（决策 392，票 gate-failure-attribution 01） | `toolchain_preflight_readings_parse`（`rust-toolchain.toml` 的 `channel` 解析：带引号 / 注释 / 单引号 / `stable` 这类非版本；`version_like` 取版本前缀；`parse_rustc_version` 认 `rustc X.Y.Z`）；`gate_failure_summary_truncates_loudly`（摘要超界**显式标注**截断量）；`route_merge_gate_fail_environment_kicks_back_develop_not_test`（`Environment` **不进** test 复检）；`gate_failure_kind_round_trips_through_as_str`（变体 ↔ 落库字符串单点往返） | 392 |
 | 阶段内容边界（决策 395 / 396 / 397，票 stage-content-boundary 01–03） | **395 写入面白名单**：`file_policy.rs` 5 条（单文件白名单只放行产出文件且报错带允许面 / worktree-only 白名单挡住任务目录绝对路径 / deny 名单优先于白名单 / 符号链接逃逸仍被允许根拦下 / 空白名单向后兼容）+ `continuation_brief.rs::stage_write_scope_follows_the_product_target_table`（六阶段装配矩阵逐行，值来自 `ProductTarget` 表，校验类节点空白名单 = 拒一切写）+ `tools.rs::stage_allowlist_confines_review_writes_to_the_report`（工具层行为：合法产出落任务目录、绝对路径绕 `write_root_for` 也拒）；**396 run_command 阶段禁用**：`model_request.rs::run_command_is_not_advertised_for_review_and_test_design`（def 层三个节点不广告 + develop 照旧）+ `tools.rs::run_command_is_stage_denied_for_review_and_test_design`（执行层兜底、拒绝落台账且退出码与 egress denied 区分）+ `run_command_still_runs_for_develop`（提交契约不受影响）；**397 申报单向比对**：`executor.rs` 3 条（`declared_paths_are_normalized_before_comparison` 归一化 / `undeclared_changes_is_one_sided_with_noise_filter` 漏报必现·多报容忍·噪音过滤 / `undeclared_facts_list_the_files_and_both_remedies` 事实段正文）+ `prompts.rs` 段序测试补 `undeclared_changes` 位次 | 395 / 396 / 397 |
 
+**判据型规则的用例必须遍历候选集（不变量，决策 412；自本决策起，适用于新增或改动判据型规则时——不追溯既有用例）。** 凡是「一个正则 / 一张枚举表 / 一组候选值」定义的规则，它的正例**不许只挑代表**——按候选集逐枚断言，负例同理按负向形态逐条钉。理由是一次真实回归（2026-10-08，任务 `01M4CD59Y977ZQ0GMY9MPSFFMX`）：文案门规则 3 的 A-2 判据有 5 枚阶段 id，正例只写了 `sync-check` 一枚，于是修复提交把 `FILENAME_TOKEN` 提到 `STAGE_ID` 之前、吃掉另外 3 枚时，**1187 条前端用例全绿照样穿过**，第二轮评审靠静态读码才抓到——挑出来的代表**恰好总是幸存的那一枚**，这类用例对「实现重排」天然免疫。
+
+落地形态：**候选集做单一事实源，判据由它构造，正例遍历同一个数组**——判据改了用例自动跟着改、加候选自动进覆盖。这条是本表「配置清单同一性」那行「**判据遍历默认值对象、不手写字段数组**（手写就又是抄一遍，而那正是本条要消灭的形状）」的一般化：**不许手抄一份判据的抄本当用例**。
+
 ## 6. 集成测试目录（L2）
 
 | 关注点 | 用例 | 决策锚点 |

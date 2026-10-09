@@ -318,6 +318,9 @@ async fn review_rework_turn(store: &Store, task: &Task) -> Result<Option<String>
             }
         }
     }
+    // 决策 406：红线贴着清单走（上面那份清单是它约束的对象）。降级段在
+    // `model_request.rs::review_required_changes_segment` 挂同一份。
+    out.push_str(crate::types::REVIEW_REWORK_DISCIPLINE);
     out.push_str(&format!("评审报告全文：{report_abs}\n"));
     Ok(Some(out))
 }
@@ -2513,6 +2516,8 @@ mod tests {
         for expected in [
             crate::types::REVIEW_REWORK_TURN_PREFIX,
             "修改 `src/lib.rs`：断言恒真",
+            // 决策 406：红线必须随 turn 走（撤掉 push 即红）
+            crate::types::REVIEW_REWORK_DISCIPLINE,
             &report_abs,
         ] {
             assert!(turn.contains(expected), "turn 缺 `{expected}`：\n{turn}");
