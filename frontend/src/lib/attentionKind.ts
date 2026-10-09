@@ -9,6 +9,7 @@
 export const ATTENTION_KIND_LABELS: Record<string, string> = {
   task_pending: '任务待处理',
   retry_exhausted: '重试耗尽',
+  environment_blocked: '环境受阻',
   context_overflow: '上下文溢出',
   gate_failure: '闸门失败',
   repeated_pending: '反复转待处理',

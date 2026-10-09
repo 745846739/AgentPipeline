@@ -508,6 +508,7 @@ async fn load_segments(ctx: &AttemptCtx<'_>) -> Result<PromptSegments> {
         .await,
         zero_commit: zero_commit_facts_segment(home, &ctx.task.id, ctx.cursor).await,
         undeclared_changes: undeclared_changes_facts_segment(home, &ctx.task.id, ctx.cursor).await,
+        worktree_dirty: worktree_dirty_facts_segment(home, &ctx.task.id, ctx.cursor).await,
         // 票 04：简报文本已由编排侧组好（`AttemptCtx.continuation_brief`），本函数只把它
         // 搬进段表（渲染在 `build_user_prompt`）。放在段表末尾：它是「这一轮从哪起跑」的
         // 交代，读在其余反馈段之后更顺。
@@ -678,6 +679,26 @@ async fn undeclared_changes_facts_segment(
     }
     let path = home.task_file(task_id, super::executor::UNDECLARED_CHANGES_FACTS_FILE);
     match bounded_read::read_to_string("undeclared_changes_facts", &path).await {
+        Offloaded::Done(Ok(content)) if !content.trim().is_empty() => Some(content),
+        _ => None,
+    }
+}
+
+/// 决策 416 A：`develop_code_gate` / `test_code_gate` 的**工作区守卫**判定工作区不干净时，
+/// 把事实与「提交 或 删除」两条出路落成 `worktree-dirty-facts.md`，对应 `execute` 重入时
+/// 读回注入。**develop 与 test 共用**（只有这两段写 worktree，决策 416 把两处守卫抽成
+/// 同一个，段也只此一个）。放行 / 守卫已恢复时文件被清除，段自然为空——「首轮为空不渲染」
+/// 与「已落提交不渲染」是同一支。读不到 / 读超界（决策 302）一律不渲染。
+async fn worktree_dirty_facts_segment(
+    home: &Home,
+    task_id: &str,
+    cursor: &NodeCursor,
+) -> Option<String> {
+    if cursor.node != Node::Execute || !matches!(cursor.stage, Stage::Develop | Stage::Test) {
+        return None;
+    }
+    let path = home.task_file(task_id, super::executor::WORKTREE_DIRTY_FACTS_FILE);
+    match bounded_read::read_to_string("worktree_dirty_facts", &path).await {
         Offloaded::Done(Ok(content)) if !content.trim().is_empty() => Some(content),
         _ => None,
     }

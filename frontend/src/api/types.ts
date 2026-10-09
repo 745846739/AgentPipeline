@@ -63,6 +63,9 @@ export const PENDING_KIND_MEMBERS = [
   'dependency_failed',
   'context_overflow',
   'timeout',
+  // 决策 416 C：确定性环境前置条件失败——**不是**「重试耗尽」，重试必失败，
+  // 动作集是「修复后重试执行」+「终止任务」。
+  'environment_blocked',
   // 人自己按下的暂停（决策 276）：暂停中的任务与其它待办同一格（都是 pending），
   // 区别在原因那一栏与「不需要别人来管」这条豁免。
   'user_paused',

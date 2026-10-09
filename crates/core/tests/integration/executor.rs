@@ -3666,6 +3666,266 @@ async fn develop_declared_no_changes_pends_then_cancelled_terminal() {
     );
 }
 
+// ───────────── 工作区守卫：产出没落提交就交了元数据（决策 416 A / 票 test-output-commit 01）─────────────
+//
+// 原缺陷（2026-10-09 106 任务 01M4CD59Y977ZQ0GMY9MPSFFMX）：分支有自有提交（零提交守卫
+// 放行）、工作区却还留着未提交改动 → 一路穿越到 merge，撞在阶段 A 的 rebase 上
+// （`unstaged changes exist in workdir`），再被误标成 retry_exhausted——重试必然再撞。
+
+/// 决策 416 A：develop.execute 落了提交、但工作区还留着未跟踪文件 → validate_output
+/// **确定性打回** develop.execute（不挂 user_decision、不穿越），重入 prompt 带未提交
+/// 改动事实段；agent 补提交后重交元数据 → 守卫放行、事实段清除，全链走到 merge 待审批。
+#[tokio::test]
+async fn develop_gate_kicks_back_dirty_worktree_then_recovers_after_commit() {
+    let ctx = setup("true", Settings::default()).await;
+    let mut script = Script::new();
+    design_scripts(&mut script);
+    // 第一轮：提交了两份产出，却把 stray.txt 留在工作区（未跟踪——事故原形）
+    script
+        .for_node(Stage::Develop, Node::Execute)
+        .write_file(
+            "src/lib.rs",
+            "pub fn add(a: i32, b: i32) -> i32 { a + b }\n#[test]\nfn adds() { assert_eq!(add(1, 2), 3); }\n",
+        )
+        .write_file("tests/acceptance.rs", "#[test]\nfn ok() {}\n")
+        .run_command("git add -A && git -c user.name=f -c user.email=f@l commit -m 'feat: task t-wd'")
+        .write_file("stray.txt", "忘提交的产出\n")
+        .submit(&CodeChanges {
+            branch_name: "kanban/t-wd".into(),
+            changed_files: vec![
+                FileChangeSpec {
+                    path: "src/lib.rs".into(),
+                    action: FileAction::Create,
+                    content_hash: None,
+                },
+                FileChangeSpec {
+                    path: "tests/acceptance.rs".into(),
+                    action: FileAction::Create,
+                    content_hash: None,
+                },
+            ],
+            unit_test_files: vec![],
+            no_changes: false,
+        })
+        // 首轮在此收口：agent loop 只在「响应无 tool_call」时 break（model_invoke.rs），
+        // submit_metadata 只是普通工具调用——不补这条纯文本响应，下面第二轮的步骤会被
+        // 同一次执行顺次吃掉（补提交在守卫读数之前就跑完，永远见不到脏工作区）。
+        .text("首轮收口");
+    // 第二轮（重入）：按事实段指令把遗漏文件也落提交，申报三个文件
+    script
+        .for_node(Stage::Develop, Node::Execute)
+        .run_command("git add -A && git -c user.name=f -c user.email=f@l commit -m 'chore: 补交遗漏的 stray.txt'")
+        .submit(&CodeChanges {
+            branch_name: "kanban/t-wd".into(),
+            changed_files: vec![
+                FileChangeSpec {
+                    path: "src/lib.rs".into(),
+                    action: FileAction::Create,
+                    content_hash: None,
+                },
+                FileChangeSpec {
+                    path: "tests/acceptance.rs".into(),
+                    action: FileAction::Create,
+                    content_hash: None,
+                },
+                FileChangeSpec {
+                    path: "stray.txt".into(),
+                    action: FileAction::Create,
+                    content_hash: None,
+                },
+            ],
+            unit_test_files: vec![],
+            no_changes: false,
+        });
+    script
+        .for_node(Stage::Review, Node::Execute)
+        .submit(&ReviewResult {
+            approved: true,
+            review_report_path: Some("review-report.md".into()),
+            required_changes: vec![],
+        });
+    script
+        .for_node(Stage::Test, Node::Execute)
+        .submit(&TestResult {
+            passed: true,
+            test_report_path: Some("test-report.md".into()),
+            failures: vec![],
+            gate_recheck: false,
+        });
+    ctx.agent.set_script(script);
+    testkit::seed_task(&ctx.store, "t-wd", "p1").await.unwrap();
+    admit(&ctx, "t-wd").await;
+
+    ctx.executor.run("t-wd").await.unwrap();
+
+    // ① 守卫打回：Develop→Execute 的 NodeRetry 流转存在（决策 416 A 的确定性打回）
+    let transitions = ctx.store.list_transitions("t-wd").await.unwrap();
+    assert!(
+        transitions.iter().any(|t| t.to_stage == Stage::Develop
+            && t.to_node == Node::Execute
+            && t.trigger == TransitionTrigger::NodeRetry),
+        "脏工作区必须打回 develop.execute：{transitions:?}"
+    );
+
+    // ② 事实段经重入 prompt 落到 agent 手上：首轮不渲染，重入带清单与指令
+    let requests = ctx.agent.request_log();
+    let devex: Vec<_> = requests
+        .iter()
+        .filter(|r| r.stage == Stage::Develop && r.node == Node::Execute)
+        .collect();
+    assert!(devex.len() >= 2, "应有首轮与重入两轮：{}", devex.len());
+    assert!(
+        !devex[0]
+            .user_prompt
+            .contains("## 未提交改动事实与落提交指令"),
+        "首轮不渲染事实段"
+    );
+    // 一次执行里有多条请求（每步一条 + 收口），重入是**最后**一条——不按下标取，
+    // 取到的会是首轮中途的某条请求。
+    let reentry = devex.last().expect("重入请求");
+    assert!(
+        reentry
+            .user_prompt
+            .contains("## 未提交改动事实与落提交指令"),
+        "重入必须带事实段：{}",
+        reentry.user_prompt
+    );
+    assert!(
+        reentry.user_prompt.contains("stray.txt"),
+        "事实段要逐条列出未提交文件：{}",
+        reentry.user_prompt
+    );
+
+    // ③ 补交后守卫放行 → 事实段清除（留着会在后续重入里误注入过期清单），全链走到 merge 待审批
+    let facts_path = ctx
+        .store
+        .home()
+        .task_file("t-wd", "worktree-dirty-facts.md");
+    assert!(
+        !facts_path.exists(),
+        "守卫放行后事实段文件必须清除，否则下一轮重入会拿到过期清单"
+    );
+    let task = ctx.store.get_task("t-wd").await.unwrap();
+    assert_eq!(task.status, TaskStatus::Pending);
+    let actions = ctx.store.allowed_actions_for_task("t-wd").await.unwrap();
+    let names: Vec<&str> = actions.iter().map(|a| a.action.as_str()).collect();
+    assert_eq!(names, vec!["approve", "return"], "应走到 merge 待审批");
+}
+
+/// 决策 416 A（事故原形，test 阶段）：test.execute 把集成测试写进工作区却从不落提交、
+/// 还交了 passed=true → test.validate_output 打回 test.execute，**不穿越到 merge**
+/// （01M4CD59 正是在 merge 的 rebase 上撞死的），事实段落盘可直读。
+#[tokio::test]
+async fn test_gate_kicks_back_uncommitted_test_output_before_merge() {
+    let ctx = setup("true", Settings::default()).await;
+    let mut script = Script::new();
+    design_scripts(&mut script);
+    // develop 正常落提交、review 放行（守卫只拦 test 这一段）
+    script
+        .for_node(Stage::Develop, Node::Execute)
+        .write_file(
+            "src/lib.rs",
+            "pub fn add(a: i32, b: i32) -> i32 { a + b }\n#[test]\nfn adds() { assert_eq!(add(1, 2), 3); }\n",
+        )
+        .write_file("tests/acceptance.rs", "#[test]\nfn ok() {}\n")
+        .run_command("git add -A && git -c user.name=f -c user.email=f@l commit -m 'feat: task t-tu'")
+        .submit(&CodeChanges {
+            branch_name: "kanban/t-tu".into(),
+            changed_files: vec![
+                FileChangeSpec {
+                    path: "src/lib.rs".into(),
+                    action: FileAction::Create,
+                    content_hash: None,
+                },
+                FileChangeSpec {
+                    path: "tests/acceptance.rs".into(),
+                    action: FileAction::Create,
+                    content_hash: None,
+                },
+            ],
+            unit_test_files: vec![],
+            no_changes: false,
+        });
+    script
+        .for_node(Stage::Review, Node::Execute)
+        .submit(&ReviewResult {
+            approved: true,
+            review_report_path: Some("review-report.md".into()),
+            required_changes: vec![],
+        });
+    // test 第一轮：集成测试写进工作区但不提交，然后交 passed=true（事故现场）
+    script
+        .for_node(Stage::Test, Node::Execute)
+        .write_file("tests/integration_extra.rs", "#[test]\nfn extra() {}\n")
+        .submit(&TestResult {
+            passed: true,
+            test_report_path: Some("test-report.md".into()),
+            failures: vec![],
+            gate_recheck: false,
+        });
+    ctx.agent.set_script(script);
+    testkit::seed_task(&ctx.store, "t-tu", "p1").await.unwrap();
+    admit(&ctx, "t-tu").await;
+
+    ctx.executor.run("t-tu").await.unwrap();
+
+    // ① 打回 test.execute（NodeRetry），一次都没到 merge——事故的洞就在这里
+    let transitions = ctx.store.list_transitions("t-tu").await.unwrap();
+    assert!(
+        transitions.iter().any(|t| t.to_stage == Stage::Test
+            && t.to_node == Node::Execute
+            && t.trigger == TransitionTrigger::NodeRetry),
+        "未提交的测试产出必须打回 test.execute：{transitions:?}"
+    );
+    assert!(
+        !transitions.iter().any(|t| t.to_stage == Stage::Merge),
+        "打回前不得穿越到 merge（01M4CD59 就是穿越后撞死在 rebase 上）：{transitions:?}"
+    );
+
+    // ② 事实段落盘可直读：点名未提交的集成测试文件 + 二选一指令
+    let facts = std::fs::read_to_string(
+        ctx.store
+            .home()
+            .task_file("t-tu", "worktree-dirty-facts.md"),
+    )
+    .expect("守卫打回时事实段必须落盘");
+    assert!(facts.contains("tests/integration_extra.rs"), "{facts}");
+    assert!(facts.contains("git status --porcelain"), "{facts}");
+
+    // ③ 重入 prompt 带事实段；首轮不渲染
+    let requests = ctx.agent.request_log();
+    let testex: Vec<_> = requests
+        .iter()
+        .filter(|r| r.stage == Stage::Test && r.node == Node::Execute)
+        .collect();
+    assert!(testex.len() >= 2, "应有首轮与重入两轮：{}", testex.len());
+    assert!(
+        !testex[0]
+            .user_prompt
+            .contains("## 未提交改动事实与落提交指令"),
+        "首轮不渲染事实段"
+    );
+    // 重入是最后一条请求（首轮内部每步一条，按下标取会取到首轮的 submit）
+    let reentry = testex.last().expect("重入请求");
+    assert!(
+        reentry
+            .user_prompt
+            .contains("## 未提交改动事实与落提交指令"),
+        "重入必须带事实段：{}",
+        reentry.user_prompt
+    );
+
+    // ④ 不是「让用户拍板」：守卫打回不产生 pending(user_decision, test_code_issue)
+    let live = ctx.store.load_live_cursors("t-tu").await.unwrap();
+    if let Some(reason) = live[0].pending_reason.as_ref() {
+        assert_ne!(
+            reason.kind,
+            PendingKind::UserDecision,
+            "脏工作区是确定性打回，不得挂 user_decision 交用户拍板"
+        );
+    }
+}
+
 // ──────────────────── 闸门失败 → test 复检 → 重跑闸门（票 15 / 决策 85 / 109）────────────────────
 
 #[tokio::test]

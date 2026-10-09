@@ -234,6 +234,21 @@ pub fn allowed_actions(reason: &PendingReason, cursor_id: Option<&str>) -> Vec<A
             AllowedAction::side_effect("cancel", "取消任务"),
         ],
 
+        // ── environment_blocked（决策 416 C）──
+        //
+        // 与 retry_exhausted 最要紧的差别就在**动作集本身**：这一类确定性失败重试必败，
+        // 「重试执行」四个字对用户是句谎话——2026-10-09 的 `01M4CD59` 点着「重试合并」
+        // 只会再撞一次同样的报错。钮的语义写成「修复后重试」：先修再点，修的人是人自己；
+        // 管线自己造成的脏工作区已由 merge 阶段 A 的自愈拦下，到不了这里。
+        //
+        // **无 skip**：前置条件没解决就强推，等于把坏工作区推进下一阶段——与 merge 的
+        // retry_exhausted 不给 skip 同一个理由（决策 122）。「具体修什么」由 pending 的
+        // message/context 负责，动作表只管按钮长什么样。
+        (PendingKind::EnvironmentBlocked, _) => vec![
+            AllowedAction::goto("修复后重试执行", reason.stage, entry_node(reason.stage)),
+            AllowedAction::side_effect("cancel", "终止任务"),
+        ],
+
         // ── retry_exhausted（merge / develop / test 三套动作集）──
         (PendingKind::RetryExhausted, _) if reason.stage == Stage::Merge => vec![
             // 决策 86 / 122：merge 无 skip
@@ -511,6 +526,40 @@ mod tests {
             vec!["goto", "cancel"]
         );
         assert!(!acts.iter().any(|a| a.action == "skip"));
+    }
+
+    #[test]
+    fn environment_blocked_has_repair_retry_goto_and_cancel_but_no_skip() {
+        // 决策 416 C：确定性前置条件失败——动作集 = 「修复后重试执行」+「终止任务」。
+        // 无 skip：前置条件没修好就强推，等于把坏状态推进下一阶段（与 merge 的
+        // retry_exhausted 不给 skip 同一个理由）；goto 落点走 entry_node（决策 69 同表）。
+        for stage in [
+            Stage::Init,
+            Stage::ArchitectDesign,
+            Stage::DevelopDesign,
+            Stage::TestDesign,
+            Stage::Develop,
+            Stage::Review,
+            Stage::Test,
+            Stage::Merge,
+        ] {
+            let r = reason(PendingKind::EnvironmentBlocked, stage, None);
+            let acts = allowed_actions(&r, None);
+            let names: Vec<&str> = acts.iter().map(|a| a.action.as_str()).collect();
+            assert_eq!(names, vec!["goto", "cancel"], "{stage}");
+            let goto = acts
+                .iter()
+                .find(|a| a.action == "goto")
+                .expect("environment_blocked 必须有 goto");
+            assert_eq!(goto.label, "修复后重试执行", "{stage}");
+            let target = goto.target.as_ref().unwrap();
+            assert_eq!(target.stage, stage, "{stage}: 重试应落回本阶段");
+            assert_eq!(
+                target.node,
+                entry_node(stage),
+                "{stage}: goto 落点必须是本阶段入口节点（决策 69）"
+            );
+        }
     }
 
     #[test]

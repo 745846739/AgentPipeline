@@ -823,11 +823,25 @@ async fn kill_9_mid_tool_call_resumes_from_the_log_without_replaying_completed_t
     };
 
     // 日志前缀含被杀前已完成的那些消息 + 半轮的合成回执。
-    let log = store
-        .latest_own_transcript("t1", Stage::ArchitectDesign, Node::Execute)
-        .await
-        .unwrap()
-        .expect("恢复后的 run 有日志");
+    // 等的是「恢复后那条 run 自己的消息行落库」——`latest_own_transcript` 按
+    // `run_id DESC` 取**已有消息行**的那条，刚等到 run 行就读会抓到被杀那条的旧账
+    // （判据断言一个字没改，改的是等谁；同决策 343 的取样点教训）。
+    let deadline = Instant::now() + Duration::from_secs(60);
+    let log = loop {
+        assert!(
+            Instant::now() < deadline,
+            "恢复后的 run 始终没落下自己的消息行"
+        );
+        if let Ok(Some(t)) = store
+            .latest_own_transcript("t1", Stage::ArchitectDesign, Node::Execute)
+            .await
+        {
+            if t.run_id == resumed.id {
+                break t;
+            }
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    };
     assert_eq!(log.run_id, resumed.id, "读到的是恢复后那条 run 的日志");
     assert!(
         log.messages.len() >= half.messages.len(),

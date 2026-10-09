@@ -181,7 +181,11 @@ pub fn notification_class(kind: AttentionKind) -> Option<NotifyClass> {
         TaskCancelled => return None,
         TaskPending | RepeatedPending | OwnerStuck | SchedulerNoEffect | TaskStale
         | ResumeBlocked | BlockedRead => NotifyClass::Pending,
-        RetryExhausted | ContextOverflow | GateFailure | RunFailed => NotifyClass::Failed,
+        // `EnvironmentBlocked`（决策 416 C）归 Failed 而不是 Pending：它是**确定性失败**、
+        // 需要人先动手才有可能好，与「再等等就会自己走完」的 Pending 语义不同。
+        RetryExhausted | ContextOverflow | GateFailure | RunFailed | EnvironmentBlocked => {
+            NotifyClass::Failed
+        }
         TaskDone => NotifyClass::Done,
     })
 }

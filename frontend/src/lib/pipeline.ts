@@ -567,6 +567,10 @@ export function pendingLabel(reason: { type: string; context?: { kind?: string }
       return '等待冲突任务';
     case 'retry_exhausted':
       return '重试耗尽';
+    // 决策 416 C：确定性环境前置条件，重试必失败——**不能与「重试耗尽」同格**，
+    // 那句话会让人以为系统已经替他试过了。
+    case 'environment_blocked':
+      return '环境受阻';
     case 'merge_approval':
       return '合并提案';
     case 'human_review':

@@ -16,6 +16,7 @@ import {
 const KINDS = [
   'task_pending',
   'retry_exhausted',
+  'environment_blocked',
   'context_overflow',
   'gate_failure',
   'repeated_pending',
@@ -31,9 +32,9 @@ const KINDS = [
 ];
 
 describe('待办类别的中文名', () => {
-  it('十四类齐全，且没有多出后端不认的键', () => {
+  it('十五类齐全，且没有多出后端不认的键', () => {
     expect(Object.keys(ATTENTION_KIND_LABELS).sort()).toEqual([...KINDS].sort());
-    expect(KINDS).toHaveLength(14);
+    expect(KINDS).toHaveLength(15);
   });
 
   it('每一类的名字都非空', () => {

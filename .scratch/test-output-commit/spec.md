@@ -45,9 +45,12 @@ merge 撞上 dirty workdir 时给**一句说得清的报文 + 对的可用动作
 
 **验收（任一形态落地时）**
 
-- [ ] 用例：test 阶段写出文件后直接进 merge，**不再**出现 `unstaged changes exist`
-- [ ] 反向用例：dirty workdir 场景下给出的报文 / 动作是可用的（不会指向一条必然失败的路）
+- [x] 用例：test 阶段写出文件后直接进 merge，**不再**出现 `unstaged changes exist`
+      （三层全落，决策 416：L2 两条守卫集成测试 + merge 自动留痕兜底）
+- [x] 反向用例：dirty workdir 场景下给出的报文 / 动作是可用的（不会指向一条必然失败的路）
+      （`environment_blocked`：修复后重试执行 + 终止任务，无 skip）
 - [ ] 106 上真跑一单「test 阶段有产出 → merge → 审批」，全程无人 ssh 上去手动 commit
+      （待部署：重启 `agent-pipeline.service` 会杀掉 01M4CD59 的 run 405，等它跑完）
 
 ## 边界
 

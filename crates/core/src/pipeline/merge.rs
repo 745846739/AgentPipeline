@@ -222,6 +222,18 @@ impl MergeFlow<'_> {
         self.ledger()
             .mark_step(run_id, "把任务分支 rebase 到基准")
             .await;
+        // 决策 416 B · 自愈：工作区里还剩没提交的已跟踪改动时，libgit2 的 rebase 会在
+        // 起步处就以 `unstaged changes exist in workdir` 拒绝——那是本任务自己的产出，
+        // 先落一个带标记的提交再 rebase。未跟踪文件不动（见原语文档）。
+        let autosaved = Git.commit_unstaged_tracked_changes(wt).await?;
+        if let Some((commit, files)) = &autosaved {
+            tracing::info!(
+                task = %task.id,
+                commit = %commit,
+                files = ?files,
+                "merge 阶段 A 自愈：工作区残留改动已自动落提交（决策 416 B）"
+            );
+        }
         let mut auto_resolved: Vec<String> = Vec::new();
         match Git.rebase_onto_with_auto_resolve(wt, &base_ref).await? {
             crate::git::AutoRebaseOutcome::Clean { .. } => {}
@@ -306,6 +318,12 @@ impl MergeFlow<'_> {
         }
         self.store.home().ensure_task_dirs(&task.id)?;
         let diff = Git.diff_range(repo, &range).await?;
+        // 决策 416 B：自动落提交的文件会一并进入这份 diff，说明块交代它们从哪来——
+        // 用户在审批面看到「没申报过的文件」时，这是唯一的出处。
+        let diff = match &autosaved {
+            Some((commit, files)) => format!("{}{diff}", autosave_note(commit, files)),
+            None => diff,
+        };
         std::fs::write(self.store.home().task_file(&task.id, diff_path), &diff)?;
 
         // (4) 合入前强制闸门：lint（如已配置）+ 测试（决策 139）
@@ -553,6 +571,30 @@ pub fn parse_diff_stats(stat: &str) -> DiffStats {
     stats
 }
 
+/// 决策 416 B：自动落提交的说明块，写在 `merge-proposal.diff` 的**头部**。
+///
+/// 放头部不是随手选的：`frontend/src/lib/diff.ts::parseUnifiedDiff` 在 `current == null`
+/// 时会跳过一切不以 `--- ` 开头的行（头部注记整块被忽略），而追加到**尾部**会被当成上一个
+/// 文件的上下文行，且以 `-` 开头的行会被计进 deletions——既污染渲染也污染统计。
+fn autosave_note(commit: &str, files: &[String]) -> String {
+    let mut out = format!(
+        "# {} 合入前自动落提交（决策 416 B）\n\n\
+         工作区里有 {} 处未提交的已跟踪改动；rebase 前管线把它们落成提交 `{}`（带 `{}` 标记）。\n\
+         它们本来就是本任务的产出，因此下面这份 diff 里也有它们——标记是它们与 agent 手写\n\
+         提交之间唯一的区别。\n\n\
+         未提交清单：\n",
+        crate::git::MERGE_AUTOSAVE_MARK,
+        files.len(),
+        commit,
+        crate::git::MERGE_AUTOSAVE_MARK,
+    );
+    for f in files {
+        out.push_str(&format!("  - `{f}`\n"));
+    }
+    out.push('\n');
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -671,5 +713,42 @@ mod tests {
         assert_eq!(stats.files_changed, 1);
         assert_eq!(stats.insertions, 2);
         assert_eq!(stats.deletions, 0);
+    }
+
+    /// 决策 416 B：自愈注记必须是 diff **头部**的一块「解析器看不见」的文本。
+    ///
+    /// 两个牙齿缺一个都会红：
+    /// - 注记行若以 `diff --git ` 或 `--- ` 开头，`frontend/src/lib/diff.ts::parseUnifiedDiff`
+    ///   会把注记误当文件头——`files_changed` 与渲染全部失真（这正是它必须写在头部、
+    ///   且行首不能长那样的原因）；
+    /// - 注记丢了 `[autosave]` 标记或提交 SHA，审批面上就没法把机器提交与 agent 手写提交
+    ///   分开（`git log --grep` 也认不出）。
+    #[test]
+    fn autosave_note_is_invisible_to_the_diff_parser_and_carries_the_marker() {
+        let note = autosave_note(
+            "abc1234",
+            &["src/lib.rs".into(), "tests/acceptance.rs".into()],
+        );
+        assert!(note.starts_with('#'), "注记应是头部 markdown 块");
+        assert!(
+            note.contains(crate::git::MERGE_AUTOSAVE_MARK),
+            "注记必须带 [autosave] 标记"
+        );
+        assert!(note.contains("abc1234"), "注记必须带自愈提交 SHA");
+        assert!(note.contains("`src/lib.rs`"), "注记必须列全自愈文件");
+        assert!(
+            note.contains("`tests/acceptance.rs`"),
+            "注记必须列全自愈文件"
+        );
+        for line in note.lines() {
+            assert!(
+                !line.starts_with("diff --git ") && !line.starts_with("--- "),
+                "注记行不得冒充 diff 文件头（parseUnifiedDiff 会当真）：{line}"
+            );
+        }
+        // 空文件清单也得是合法块（diff_stats.files_changed>0 才到这里，但函数本身不设前提）
+        let empty = autosave_note("deadbeef", &[]);
+        assert!(empty.contains(crate::git::MERGE_AUTOSAVE_MARK));
+        assert!(empty.starts_with('#'));
     }
 }

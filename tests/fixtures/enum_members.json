@@ -22,6 +22,7 @@
     "dependency_failed",
     "context_overflow",
     "timeout",
+    "environment_blocked",
     "user_paused"
   ]
 }

@@ -67,6 +67,11 @@ pub(crate) const ZERO_COMMIT_FACTS_FILE: &str = "zero-commit-facts.md";
 /// develop.execute 重入时读回注入——与 [`ZERO_COMMIT_FACTS_FILE`] 同一形状。
 pub(crate) const UNDECLARED_CHANGES_FACTS_FILE: &str = "undeclared-changes-facts.md";
 
+/// 未提交改动事实段文件（决策 416 A）：`develop` / `test` 两个代码门的**工作区守卫**
+/// 判定工作区不干净时落盘、对应 `execute` 重入时读回注入——与前两个事实段同一形状
+/// （决策 126：先落文件、再由重入渲染）。
+pub(crate) const WORKTREE_DIRTY_FACTS_FILE: &str = "worktree-dirty-facts.md";
+
 /// 申报路径归一化（决策 397）：剥 `./` 前缀、统一分隔符、去首尾空白——
 /// 申报面与 diff 面的书写差异不参与判定（`./src/lib.rs` 与 `src/lib.rs` 是同一个）。
 fn normalize_declared_path(raw: &str) -> String {
@@ -176,6 +181,14 @@ enum ZeroCommitCheck {
     Unavailable,
 }
 
+/// [`Executor::worktree_clean_check`] 的三态（决策 416 A）：与前两个守卫同一姿态——
+/// 读数不可用时既不冒充「干净」也不冒充「脏」（决策 209），按放行降级。
+enum WorktreeCheck {
+    Clean,
+    Dirty { facts: String },
+    Unavailable,
+}
+
 /// develop.execute 是否显式申报了「本任务零变更」（决策 391）：develop 守卫与 merge
 /// 空分支改道**共用同一读法**——申报语义（缺省 false、非布尔值当未申报）只在这一处定义，
 /// 两条路径不会各自漂移。
@@ -225,6 +238,51 @@ pub(crate) fn write_zero_commit_facts(
 /// 清掉零提交事实段（放行 / 申报零变更 / 守卫已恢复时调用）——不存在的文件不是错误。
 pub(crate) fn clear_zero_commit_facts(home: &crate::home::Home, task_id: &str) {
     let _ = std::fs::remove_file(home.task_file(task_id, ZERO_COMMIT_FACTS_FILE));
+}
+
+/// 未提交改动事实段正文（决策 416 A · Q5）：**两条出路写明**——要交付的落提交、不要的
+/// 删除。「干净」含未跟踪（`dirty_files` 口径），因为本次事故里卡住 rebase 的是已跟踪
+/// 改动，而漏交付的正是两个**未跟踪的新测试文件**：只放行已跟踪面等于没修。
+///
+/// 与 [`zero_commit_facts`] 分开写而不复用：那条的指令是「必须落提交 + 申报 no_changes
+/// 的退路」，这条是「提交 或 删除」两条等价出口，且**没有零变更申报**这一退路
+/// （工作区脏着就没有「零变更」可言）。
+pub(crate) fn worktree_dirty_facts(dirty: &[String]) -> String {
+    let mut facts = format!(
+        "# 未提交改动事实（确定性检查，决策 416 A）\n\n\
+         任务工作区有 {} 处未提交改动：\n",
+        dirty.len()
+    );
+    for f in dirty {
+        facts.push_str(&format!("  - `{f}`\n"));
+    }
+    facts.push_str(
+        "\n## 指令\n\
+         工作区必须干净才能收口——测试代码是本阶段的硬产出（决策 37），merge 阶段 A 的\n\
+         rebase 会因未提交改动直接失败。二选一，做完再交 submit_metadata：\n\
+         1. 要交付的变更：先 cd 到系统注入的 worktree 绝对路径（相对 cwd 会解析到别的\n\
+            checkout），提交前先跑 fmt 与 lint 自查（pre-commit 按 `-D warnings` 拦），\n\
+            再 git add + git commit（message 遵循本仓提交惯例）\n\
+         2. 误改 / 不是产出的副产物：直接删掉\n\n\
+         自查 `git status --porcelain` 必须为空。禁止把变更留在工作区就重交元数据。",
+    );
+    facts
+}
+
+/// 落盘未提交改动事实段（决策 416 A 的落点单点）：两个代码门守卫都经它。
+pub(crate) fn write_worktree_dirty_facts(
+    home: &crate::home::Home,
+    task_id: &str,
+    facts: &str,
+) -> Result<()> {
+    home.ensure_task_dirs(task_id)?;
+    std::fs::write(home.task_file(task_id, WORKTREE_DIRTY_FACTS_FILE), facts)?;
+    Ok(())
+}
+
+/// 清掉未提交改动事实段（放行 / 守卫读不到时调用）——不存在的文件不是错误。
+pub(crate) fn clear_worktree_dirty_facts(home: &crate::home::Home, task_id: &str) {
+    let _ = std::fs::remove_file(home.task_file(task_id, WORKTREE_DIRTY_FACTS_FILE));
 }
 
 /// 落盘申报比对事实段（决策 397 的落点单点）：守卫判定有漏报时经它，重入段据此渲染。
@@ -806,12 +864,23 @@ impl Executor {
                         // 单游标失败不传播（决策 89）。
                         // 可归因的 LLM 配置类失败（主流程票 03）：message 用中文可操作提示，
                         // 原始诊断进 pending.context.diagnostic（不拼进 message）。
-                        let context = node_error
-                            .llm_classified()
-                            .map(|(_kind, raw)| PendingContext::with_diagnostic(raw));
+                        //
+                        // 决策 416 C：先分出**确定性的 git / 仓库前置条件失败**。那一类
+                        // **一次都没重试过**，标成 `retry_exhausted` 是句谎话，且它下发的
+                        // 动作集会给一颗必然重败的钮；它也与 LLM 无关，故不吃诊断。
+                        let (kind, context) = if environment_precondition(&node_error) {
+                            (PendingKind::EnvironmentBlocked, None)
+                        } else {
+                            (
+                                PendingKind::RetryExhausted,
+                                node_error
+                                    .llm_classified()
+                                    .map(|(_kind, raw)| PendingContext::with_diagnostic(raw)),
+                            )
+                        };
                         self.pend_cursor_with_context(
                             &cursor,
-                            PendingKind::RetryExhausted,
+                            kind,
                             node_error.to_string(),
                             context,
                         )
@@ -1201,6 +1270,8 @@ impl Executor {
             clear_zero_commit_facts(self.store.home(), &task.id);
             clear_gate_failure_facts(self.store.home(), &task.id);
             clear_undeclared_changes_facts(self.store.home(), &task.id);
+            // 申报零变更即收尾语义：上一轮工作区守卫留下的事实段一并过期
+            clear_worktree_dirty_facts(self.store.home(), &task.id);
             return Ok(NodeOutput::Route(crate::pipeline::MetadataView {
                 zero_changes: true,
                 ..Default::default()
@@ -1210,32 +1281,51 @@ impl Executor {
         if gate.passed {
             match self.zero_commit_check(task, &project, &worktree).await {
                 ZeroCommitCheck::HasCommits => {
-                    // 分支非空：先过申报比对（决策 397），再谈放行；同样清掉上一轮
-                    // 守卫失败留下的事实段文件
+                    // 分支非空：先读**工作区守卫**（决策 416 A），再照常跑申报比对
+                    // （决策 397）；两条事实**并存**——「没提交」与「漏报」是两件事，
+                    // 守卫只定路由、**不吞申报读数**：守卫提前 return 而不跑申报比对，
+                    // 「脏着且漏报」的现场重入时就拿不到补申报指令（397 的 e2e
+                    // `e2e_undeclared_changes_kick_back_at_develop_without_crossing_review`
+                    // 钉住的正是这个形态）。同样清掉上一轮守卫失败留下的事实段文件。
                     clear_zero_commit_facts(self.store.home(), &task.id);
                     clear_gate_failure_facts(self.store.home(), &task.id);
-                    match self.declaration_check(task, &project, &worktree).await {
+                    let dirty = match self.worktree_clean_check(&worktree).await {
+                        WorktreeCheck::Dirty { facts } => {
+                            write_worktree_dirty_facts(self.store.home(), &task.id, &facts)?;
+                            true
+                        }
+                        WorktreeCheck::Clean | WorktreeCheck::Unavailable => {
+                            clear_worktree_dirty_facts(self.store.home(), &task.id);
+                            false
+                        }
+                    };
+                    let passed = match self.declaration_check(task, &project, &worktree).await {
                         DeclarationCheck::Ok => {
                             clear_undeclared_changes_facts(self.store.home(), &task.id);
-                            Ok(NodeOutput::Route(crate::pipeline::MetadataView::passed(
-                                true,
-                            )))
+                            true
                         }
                         DeclarationCheck::Undeclared { facts } => {
                             write_undeclared_changes_facts(self.store.home(), &task.id, &facts)?;
-                            Ok(NodeOutput::Route(crate::pipeline::MetadataView::passed(
-                                false,
-                            )))
+                            false
                         }
                         // git / 库读数不可用：按「读不到」降级放行，不因这一条卡死
                         // （决策 209 姿态，与零提交守卫的 Unavailable 同款）
                         DeclarationCheck::Unavailable => {
                             clear_undeclared_changes_facts(self.store.home(), &task.id);
-                            Ok(NodeOutput::Route(crate::pipeline::MetadataView::passed(
-                                true,
-                            )))
+                            true
                         }
+                    };
+                    // 脏工作区优先：`route()` 按 `worktree_dirty` 短路（决策 416 A），
+                    // `passed` 只在干净路径上当放行 / 打回读数。
+                    if dirty {
+                        return Ok(NodeOutput::Route(crate::pipeline::MetadataView {
+                            worktree_dirty: true,
+                            ..Default::default()
+                        }));
                     }
+                    Ok(NodeOutput::Route(crate::pipeline::MetadataView::passed(
+                        passed,
+                    )))
                 }
                 ZeroCommitCheck::Empty { facts } => {
                     write_zero_commit_facts(self.store.home(), &task.id, &facts)?;
@@ -1300,6 +1390,27 @@ impl Executor {
         );
         ZeroCommitCheck::Empty {
             facts: zero_commit_facts(&headline, &dirty),
+        }
+    }
+
+    /// 任务工作区干净读数（决策 416 A）：`git status --porcelain` 是否为空——**含未跟踪**。
+    ///
+    /// 与 [`Self::zero_commit_check`] 是两个**正交**事实（分支有没有自有提交 vs 工作区
+    /// 有没有留下没提交的改动），故不合并：分支上落了几笔、工作区里还剩着未提交改动，
+    /// 正是 2026-10-09 `01M4CD59Y977ZQ0GMY9MPSFFMX` 卡在 merge rebase 的形态——
+    /// 零提交守卫在那种情况下放行（`count > 0`），谁也没拦住。
+    ///
+    /// 读数不可用按放行降级（决策 209 姿态，与前两个守卫同款）。
+    async fn worktree_clean_check(&self, worktree: &str) -> WorktreeCheck {
+        if worktree.is_empty() {
+            return WorktreeCheck::Unavailable;
+        }
+        match Git.dirty_files(Path::new(worktree)).await {
+            Ok(dirty) if dirty.is_empty() => WorktreeCheck::Clean,
+            Ok(dirty) => WorktreeCheck::Dirty {
+                facts: worktree_dirty_facts(&dirty),
+            },
+            Err(_) => WorktreeCheck::Unavailable,
         }
     }
 
@@ -1407,6 +1518,39 @@ impl Executor {
                 Error::Validation("test.validate_output 缺少 test_result 元数据".into())
             })?;
         let result: TestResult = serde_json::from_value(meta)?;
+
+        // 工作区守卫（决策 416 A）：测试全绿、但本阶段的硬产出没落提交就交了元数据。
+        //
+        // 只在 **`result.passed`** 时短路：失败路径的 test_issue / code_issue 分流属
+        // 决策 62 / 85，不该被一条 git 前置条件抢走（抢走会把一次本该上交用户的
+        // code_issue 压成一次自修轮）。但事实段两种情况都落盘——下一轮重入读得到清单。
+        let worktree = task.worktree_path.clone().unwrap_or_default();
+        match self.worktree_clean_check(&worktree).await {
+            WorktreeCheck::Dirty { facts } => {
+                write_worktree_dirty_facts(self.store.home(), &task.id, &facts)?;
+                if result.passed {
+                    self.finish_run(
+                        run_id,
+                        task,
+                        cursor,
+                        attempt,
+                        false,
+                        self.clock.now(),
+                        None,
+                        &RunTokens::default(),
+                    )
+                    .await?;
+                    return Ok(NodeOutput::Route(crate::pipeline::MetadataView {
+                        worktree_dirty: true,
+                        ..Default::default()
+                    }));
+                }
+            }
+            WorktreeCheck::Clean | WorktreeCheck::Unavailable => {
+                clear_worktree_dirty_facts(self.store.home(), &task.id);
+            }
+        }
+
         self.finish_run(
             run_id,
             task,
@@ -2532,6 +2676,15 @@ pub(crate) enum NodeOutput {
     Pending(PendingReason),
 }
 
+/// 节点失败该挂哪个 pending（决策 416 C · Q12：**只在这一处生效**）。
+///
+/// 确定性的 git / 仓库前置条件失败 → `EnvironmentBlocked`；其余一律维持
+/// `RetryExhausted`。`advance_cursor` 失败（`:844`）与 `model_invoke` 的重启连败止损
+/// 都**不走这里**——前者是库/账本问题，后者语义本来就是「重试够了才停」，标签没错。
+fn environment_precondition(error: &Error) -> bool {
+    matches!(error, Error::Git(msg) if crate::git::is_environment_precondition(msg))
+}
+
 // ─────────────────────── prompt 组装辅助（票 12：§10.3 / G3 / G6 / G12）───────────────────────
 
 fn pending_message(kind: PendingKind) -> &'static str {
@@ -2539,6 +2692,8 @@ fn pending_message(kind: PendingKind) -> &'static str {
         PendingKind::InfoInsufficient => "设计输入信息不足，请补充",
         PendingKind::UserDecision => "需要用户决策",
         PendingKind::RetryExhausted => "重试耗尽，需要用户介入",
+        // 决策 416 C：这句会出现在重入段里，得把「重试前要先做什么」说出来
+        PendingKind::EnvironmentBlocked => "环境受阻：请先按提示修好前置条件，再重试",
         PendingKind::MergeApproval => "等待审批合入",
         PendingKind::HumanReview => "等待人工评审",
         _ => "任务被阻塞",

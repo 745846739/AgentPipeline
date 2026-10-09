@@ -1162,6 +1162,9 @@ fn pending_attention_kind(kind: PendingKind) -> AttentionKind {
     match kind {
         PendingKind::RetryExhausted => AttentionKind::RetryExhausted,
         PendingKind::ContextOverflow => AttentionKind::ContextOverflow,
+        // 决策 416 C：同上，单列因为它播报分级与处置都不同——它需要人**先动手**（修环境）
+        // 才谈得上重试，并进 `task_pending` 会被当成「再等等就会自己走完」。
+        PendingKind::EnvironmentBlocked => AttentionKind::EnvironmentBlocked,
         _ => AttentionKind::TaskPending,
     }
 }

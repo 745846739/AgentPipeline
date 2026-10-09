@@ -302,7 +302,8 @@ const TEST_EX_SYSTEM: &str = r#"你是测试 agent。根据测试场景文档编
 3. 根据测试场景编写集成测试代码，按项目测试框架惯例放置（路径约定：{test_file_convention}）
 4. 执行集成测试（通过 run_command，命令：{test_command}）
 5. 调用 write_file 将测试报告写入 test-report.md
-6. 调用 submit_metadata 返回元数据
+6. 把本次产出的集成测试代码落成任务分支上的 git 提交：先 cd 到系统注入的 worktree 绝对路径（相对 cwd 会解析到别的 checkout），提交前先跑 fmt 与 lint 自查（本仓 pre-commit 按 `-D warnings` 拦，不自查就会被钩子挡住），再 git add + git commit，提交 message 遵循本仓提交惯例；禁止把变更留在工作区就收口
+7. 调用 submit_metadata 返回元数据
 
 ## 输出契约（决策 391）
 - 每一轮的最终动作必须是调用 submit_metadata；在正文里声称已交报告/元数据不等于已调用工具
@@ -316,6 +317,7 @@ const TEST_EX_SYSTEM: &str = r#"你是测试 agent。根据测试场景文档编
 - 包含必要的 setup / fixture 和 mock
 - 用例本身有编译/格式问题时先修复再执行
 - 测试用例是硬产出，必须全部通过
+- 收口前自查并把读数写进正文：`git status --porcelain` 必须干净——要交付的测试文件已提交、不要的垃圾自己删掉（有意不提交的文件逐条说明）
 - 若 test-scenarios.md 不存在（用户跳过了测试设计阶段，决策 115），根据 design.md 自行设计场景后再编写测试
 
 ## 测试报告格式（test-report.md）
@@ -440,6 +442,28 @@ mod tests {
             assert!(
                 system.contains(needle),
                 "DEV_EX 落提交步缺少必需信息 `{needle}`：{system}"
+            );
+        }
+    }
+
+    /// 决策 416（A）：TEST_EX_SYSTEM 同样要有落提交步——测试代码是硬产出（决策 37），
+    /// 而 merge 阶段 A 的 rebase 要求干净工作区。除提交三要素（与 develop 同源）外，
+    /// 还钉两件本阶段特有的：**fmt/lint 先自查**（本仓 pre-commit 按 `-D warnings` 拦，
+    /// 2026-10-09 人工补提交时正是被未使用的 `Store` 导入拦下的）与
+    /// **`git status --porcelain` 收口自查**（含未跟踪——新测试文件漏提交正是本次根因）。
+    #[test]
+    fn test_execute_template_requires_committing_changes() {
+        let system = system_template(Stage::Test, Node::Execute);
+        for needle in [
+            "git commit",
+            "提交惯例",
+            "cd 到系统注入的 worktree 绝对路径",
+            "-D warnings",
+            "git status --porcelain",
+        ] {
+            assert!(
+                system.contains(needle),
+                "TEST_EX 落提交步缺少必需信息 `{needle}`：{system}"
             );
         }
     }

@@ -25,6 +25,12 @@ pub enum AttentionKind {
     TaskPending,
     /// 重试耗尽的 pending（`PendingKind::RetryExhausted` 的子集，单列便于播报分级）。
     RetryExhausted,
+    /// **确定性的 git / 仓库环境前置条件不满足，重试必失败**（决策 416 C，类别 15）。
+    ///
+    /// 单列而不并进 [`Self::RetryExhausted`]，理由与它的 pending 原因一模一样：那一类
+    /// 是「试了 N 次放弃了」，这一类**一次都没重试**。并进去会让值班长在待办列表上看到
+    /// 一句「重试耗尽」，然后照着那句话去叫人点一颗必然重败的钮——正是本条要消灭的误导。
+    EnvironmentBlocked,
     /// 上下文溢出的 pending。
     ContextOverflow,
     /// 闸门失败（develop 闸门 / `MergeResult.gate_failure_kind`）。
@@ -85,6 +91,7 @@ impl AttentionKind {
         match self {
             AttentionKind::TaskPending => "待拍板",
             AttentionKind::RetryExhausted => "重试耗尽",
+            AttentionKind::EnvironmentBlocked => "环境受阻",
             AttentionKind::ContextOverflow => "上下文溢出",
             AttentionKind::GateFailure => "闸门失败",
             AttentionKind::RepeatedPending => "反复待拍板",
@@ -104,6 +111,7 @@ impl AttentionKind {
         match self {
             AttentionKind::TaskPending => "task_pending",
             AttentionKind::RetryExhausted => "retry_exhausted",
+            AttentionKind::EnvironmentBlocked => "environment_blocked",
             AttentionKind::ContextOverflow => "context_overflow",
             AttentionKind::GateFailure => "gate_failure",
             AttentionKind::RepeatedPending => "repeated_pending",
@@ -134,6 +142,7 @@ impl AttentionKind {
         Ok(match raw {
             "task_pending" => AttentionKind::TaskPending,
             "retry_exhausted" => AttentionKind::RetryExhausted,
+            "environment_blocked" => AttentionKind::EnvironmentBlocked,
             "context_overflow" => AttentionKind::ContextOverflow,
             "gate_failure" => AttentionKind::GateFailure,
             "repeated_pending" => AttentionKind::RepeatedPending,

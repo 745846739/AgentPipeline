@@ -523,6 +523,9 @@ fn kind_to_class_mapping_is_pinned() {
         (SchedulerNoEffect, Some(NotifyClass::Pending)),
         (TaskStale, Some(NotifyClass::Pending)),
         (RetryExhausted, Some(NotifyClass::Failed)),
+        // 决策 416 C：确定性环境受阻归 Failed——它是「要人先动手」的确定性失败，
+        // 不是「再等等就自己走完」的 Pending。
+        (EnvironmentBlocked, Some(NotifyClass::Failed)),
         (ContextOverflow, Some(NotifyClass::Failed)),
         (GateFailure, Some(NotifyClass::Failed)),
         (RunFailed, Some(NotifyClass::Failed)),

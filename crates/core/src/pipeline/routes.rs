@@ -23,6 +23,11 @@ pub struct MetadataView {
     /// develop.execute 显式申报了「本任务零变更」（决策 391）：develop.validate_output
     /// 据此挂 pending(user_decision) 交用户确认收尾，不再走常规放行/重试。
     pub zero_changes: bool,
+    /// develop / test 的代码门判定**任务工作区不干净**（决策 416 A）：产出没落提交就
+    /// 交了元数据。它必须短路在 `route_code_gate` **之前**——脏工作区不是「用例 vs
+    /// 业务代码」的争议，落到那条分支会误挂 `pending(user_decision, test_code_issue)`，
+    /// 把一条本该打回 execute 自己提交的确定性问题推给用户拍板。
+    pub worktree_dirty: bool,
 }
 
 impl MetadataView {
@@ -128,13 +133,27 @@ pub fn route(cursor: &NodeCursor, ctx: &RouteContext) -> EdgeKind {
         (Stage::Develop, Node::ValidateOutput) => {
             // 决策 391：execute 显式申报了零变更 → 不走常规放行/重试，
             // 挂 pending(user_decision) 交用户确认（确认收尾 / 打回继续）。
+            // 这一条排在工作区守卫**之前**：申报零变更的收尾语义独立于工作区状态，
+            // 把它挪后只会给决策 391 已有的用例凭空多一条分支。
             if ctx.metadata.zero_changes {
                 EdgeKind::Pending(PendingKind::UserDecision)
+            // 决策 416 A：产出没落提交 → 打回 execute 自己提交，不进用户裁决。
+            } else if ctx.metadata.worktree_dirty {
+                route_after_validate_output(cursor.validate_attempts, ctx.validate_retry_max)
             } else {
                 route_code_gate(cursor, ctx)
             }
         }
-        (Stage::Test, Node::ValidateOutput) => route_code_gate(cursor, ctx),
+        (Stage::Test, Node::ValidateOutput) => {
+            // 决策 416 A：必须短路在 `route_code_gate` 之前——脏工作区不是「用例 vs
+            // 业务代码」的争议，落进那条分支会因 `all_failures_are_test_issues()` 对
+            // 空失败表恒假而误挂 `pending(user_decision, test_code_issue)`。
+            if ctx.metadata.worktree_dirty {
+                route_after_validate_output(cursor.validate_attempts, ctx.validate_retry_max)
+            } else {
+                route_code_gate(cursor, ctx)
+            }
+        }
         (Stage::Merge, Node::Execute) => route_merge(ctx),
         // sync-check 不占游标行（决策 107）：execute_node 直接报错拦截，
         // 汇聚与回溯由 advance_join 经 SyncDecisionKind 落库，永远到不了这里。
@@ -670,6 +689,55 @@ mod tests {
         );
         // 零变更申报优先于闸门失败：即便 passed=false 也不进 Retry（交用户裁量）
         ctx.metadata.passed = false;
+        assert_eq!(
+            route(&c, &ctx),
+            EdgeKind::Pending(PendingKind::UserDecision)
+        );
+    }
+
+    #[test]
+    fn worktree_dirty_kicks_back_to_execute_not_user_decision() {
+        // 决策 416 A：工作区守卫打回是**确定性 Retry**，两个代码门都不得落进
+        // user_decision——test 侧 failures 为空时 `all_failures_are_test_issues()` 恒假，
+        // 没有这条短路就会误挂 pending(user_decision, test_code_issue) 让用户拍板。
+        for stage in [Stage::Develop, Stage::Test] {
+            let c = cursor(stage, Node::ValidateOutput, 0);
+            let mut ctx = RouteContext {
+                validate_retry_max: 3,
+                metadata: MetadataView::passed(false),
+                merge: plain_merge(),
+            };
+            ctx.metadata.worktree_dirty = true;
+            assert_eq!(
+                route(&c, &ctx),
+                EdgeKind::Retry,
+                "{stage}: 脏工作区必须打回 execute，不得 pending"
+            );
+        }
+
+        // 打回同样吃 attempts 上限：耗尽后收口 retry_exhausted，不无限打回。
+        let c = cursor(Stage::Test, Node::ValidateOutput, 3);
+        let mut ctx = RouteContext {
+            validate_retry_max: 3,
+            metadata: MetadataView::passed(false),
+            merge: plain_merge(),
+        };
+        ctx.metadata.worktree_dirty = true;
+        assert_eq!(
+            route(&c, &ctx),
+            EdgeKind::Pending(PendingKind::RetryExhausted)
+        );
+
+        // 零变更申报优先于工作区守卫（决策 391 的用例不受 413 扰动）：申报成立时
+        // 收尾语义独立于工作区状态，仍交用户确认。
+        let c = cursor(Stage::Develop, Node::ValidateOutput, 0);
+        let mut ctx = RouteContext {
+            validate_retry_max: 3,
+            metadata: MetadataView::passed(false),
+            merge: plain_merge(),
+        };
+        ctx.metadata.worktree_dirty = true;
+        ctx.metadata.zero_changes = true;
         assert_eq!(
             route(&c, &ctx),
             EdgeKind::Pending(PendingKind::UserDecision)

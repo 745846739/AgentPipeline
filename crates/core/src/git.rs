@@ -234,6 +234,33 @@ fn with_worktree_lock_within<T>(
     f()
 }
 
+/// merge 阶段 A 自愈提交的标记（决策 416 B）：进 commit message 首行，供 `git log --grep` 认账。
+pub const MERGE_AUTOSAVE_MARK: &str = "[autosave]";
+
+/// 决策 416 C：这一条 git 错误是不是**确定性的前置条件失败**（重试必失败，要人先去修）？
+///
+/// 判的是「来自哪个 git 操作 + 字面可核的那句话」，**刻意不看 `ErrorClass`**——
+/// `agent/repo.rs` 有实测教训（`:1112`：协议层被拒报出来的 class 也是 `Net`，class 会把
+/// 不同因归一类）。宁可漏判（落回普通失败，至少 message 是原话），也不要把一条会自己
+/// 恢复的失败误判成「你得先去修环境」——那比现在的误标更贵。
+///
+/// 每一条都指向一句**人能修、且修完重试就会过**的事实：
+/// - `unstaged changes exist in workdir` / `uncommitted changes exist in index`：libgit2
+///   `rebase_ensure_not_dirty`（`src/libgit2/rebase.c`）的两处检查，即本次事故的原话；
+/// - `HEAD 无指向` / `尚无任何提交`：本仓自写的 unborn HEAD 判定（`rebase` 起点与
+///   `init` 建 worktree 那两处）；
+/// - `could not find repository`：仓 / worktree 不在了（`git2::Repository::open`）。
+pub fn is_environment_precondition(message: &str) -> bool {
+    const FINGERPRINTS: [&str; 5] = [
+        "unstaged changes exist in workdir",
+        "uncommitted changes exist in index",
+        "HEAD 无指向",
+        "尚无任何提交",
+        "could not find repository",
+    ];
+    FINGERPRINTS.iter().any(|f| message.contains(f))
+}
+
 /// 流水线提交者身份（与原 CLI `-c user.name/email` 一致）。
 fn committer() -> Result<git2::Signature<'static>> {
     git2::Signature::now("AgentPipeline", "agentpipeline@localhost").map_err(gerr)
@@ -758,6 +785,75 @@ impl Git {
     /// 哪些分支是修复产物。混用同一个前缀，三个月后没人分得出哪条是谁留的。
     pub fn repair_branch_for(repair_id: &str) -> String {
         format!("repair/{repair_id}")
+    }
+
+    /// merge 阶段 A 自愈的提交标记（决策 416 B）：与 `[repair]` 标记同一个目的——三个月后
+    /// `git log --grep` 出来时，一眼分出这一笔不是 agent 手写的。
+    ///
+    /// **为什么不能是 `add -A`**：把未跟踪文件一起提交会把垃圾送进任务分支、进而合入主干，
+    /// 而决策 397 恰恰认定「未跟踪不进任务 diff、agent 没有义务为垃圾文件补申报」。
+    pub async fn commit_unstaged_tracked_changes(
+        &self,
+        worktree: &Path,
+    ) -> Result<Option<(String, Vec<String>)>> {
+        let wt = worktree.to_path_buf();
+        blocking(move || {
+            let repo = open(&wt)?;
+            let mut opts = git2::StatusOptions::new();
+            opts.include_untracked(true);
+            let statuses = repo.statuses(Some(&mut opts)).map_err(gerr)?;
+
+            // 只挑**已跟踪**的脏条目：`WT_NEW` 是未跟踪（rebase 不看它，见
+            // `rebase_ensure_not_dirty` 走的 `git_diff_index_to_workdir` 默认不含未跟踪），
+            // `IGNORED` 更不进 diff。其余状态（已暂存 / 已改 / 已删）都要落成提交才算干净。
+            let mut paths: Vec<String> = Vec::new();
+            for e in statuses.iter() {
+                let s = e.status();
+                if s.contains(git2::Status::WT_NEW) || s.contains(git2::Status::IGNORED) {
+                    continue;
+                }
+                if let Some(p) = e.path() {
+                    let rel = p.to_string();
+                    if !paths.contains(&rel) {
+                        paths.push(rel);
+                    }
+                }
+            }
+            if paths.is_empty() {
+                return Ok(None);
+            }
+
+            let mut index = repo.index().map_err(gerr)?;
+            for rel in &paths {
+                // 工作区已删 → `add_path` 会报「文件不存在」，得从索引移除才算删除；
+                // 其余一律 `add_path` 把当前内容暂存（对已暂存的条目幂等）。
+                if wt.join(rel).exists() {
+                    index.add_path(Path::new(rel)).map_err(gerr)?;
+                } else {
+                    let _ = index.remove_path(Path::new(rel));
+                }
+            }
+            index.write().map_err(gerr)?;
+            let tree_id = index.write_tree().map_err(gerr)?;
+            let tree = repo.find_tree(tree_id).map_err(gerr)?;
+            let parent = repo
+                .head()
+                .and_then(|h| h.peel_to_commit())
+                .map_err(gerr)?;
+            let sig = committer()?;
+            let message = format!(
+                "{MERGE_AUTOSAVE_MARK} 合入前自动落提交：工作区未提交的已跟踪改动\n\n\
+                 来源：merge 阶段 A 的自愈（决策 416 B）。内容是本任务此前留在工作区没提交的改动，\n\
+                 不是新做的修改；提交只为让 rebase 有一个干净工作区。\n\n\
+                 与决策 61 / 132 的「目标分支工作区不自动 stash」分界：stash 把改动藏起来（评审与\n\
+                 审批都看不见），commit 留痕（diff、审批面板与 base_commit 都认它）。\n"
+            );
+            let oid = repo
+                .commit(Some("HEAD"), &sig, &sig, &message, &tree, &[&parent])
+                .map_err(gerr)?;
+            Ok(Some((oid.to_string(), paths)))
+        })
+        .await
     }
 
     /// merge 阶段 A：在 worktree 内 rebase 到基准（决策 74 / 96）。
@@ -1481,6 +1577,98 @@ mod tests {
     fn branch_name_convention() {
         assert_eq!(branch_name("01H"), "kanban/01H");
         assert_eq!(Git::branch_for("t1"), "kanban/t1");
+    }
+
+    /// 决策 416 C 的判据要**窄**：命中的是「人修一下、修完重试就会过」的那几句原话，
+    /// 普通命令失败（哪怕同样来自 git、同样带 `; class=` 尾巴）一个都不许命中——
+    /// 宁可漏判落回 retry_exhausted，也不要把会自己恢复的失败说成「你得先去修环境」。
+    #[test]
+    fn environment_precondition_fingerprint_is_narrow() {
+        // 命中：五条指纹各自的原话（含 libgit2 报文后缀的形态）
+        for hit in [
+            "rebase failed: unstaged changes exist in workdir; class=Reference (4)",
+            "cannot commit: uncommitted changes exist in index",
+            "rebase 起点 HEAD 无指向",
+            "尚无任何提交",
+            "could not find repository from '/tmp/missing/.git'",
+        ] {
+            assert!(is_environment_precondition(hit), "应命中：{hit}");
+        }
+        // 不命中：普通失败——exit code、冲突、鉴权、超时、空串
+        for miss in [
+            "",
+            "command `cargo test` exited with status 101",
+            "rebase 提交失败：conflict in src/lib.rs",
+            "authentication required for github.com",
+            "operation timed out after 30000ms",
+        ] {
+            assert!(!is_environment_precondition(miss), "不应命中：{miss}");
+        }
+    }
+
+    /// 决策 416 B 的原语：只把**已跟踪**的残留落成 `[autosave]` 提交，未跟踪的原样留着
+    /// （`add -A` 会把垃圾送进任务分支，决策 397 恰恰认定未跟踪不进任务 diff）。
+    /// 干净工作区 → `None`（不空转造提交）。
+    #[tokio::test]
+    async fn autosave_commits_tracked_residue_but_leaves_untracked_alone() {
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = git2::Repository::init(tmp.path()).unwrap();
+        std::fs::write(tmp.path().join("src.txt"), "v1").unwrap();
+        {
+            let mut index = repo.index().unwrap();
+            index.add_path(Path::new("src.txt")).unwrap();
+            index.write().unwrap();
+            let tree = repo.find_tree(index.write_tree().unwrap()).unwrap();
+            let sig = git2::Signature::now("t", "t@example.com").unwrap();
+            repo.commit(Some("HEAD"), &sig, &sig, "init", &tree, &[])
+                .unwrap();
+        }
+        drop(repo);
+
+        // 干净 → None
+        assert!(
+            Git.commit_unstaged_tracked_changes(tmp.path())
+                .await
+                .unwrap()
+                .is_none(),
+            "干净工作区不该造提交"
+        );
+
+        // 已跟踪改动 + 未跟踪文件：只提交前者
+        std::fs::write(tmp.path().join("src.txt"), "v2").unwrap();
+        std::fs::write(tmp.path().join("junk.txt"), "junk").unwrap();
+        let (commit, files) = Git
+            .commit_unstaged_tracked_changes(tmp.path())
+            .await
+            .unwrap()
+            .expect("已跟踪残留应落成提交");
+        assert_eq!(files, vec!["src.txt".to_string()]);
+        assert_eq!(commit.len(), 40, "返回的应是提交 SHA");
+
+        // 标记进 message（`git log --grep '[autosave]'` 可认账）
+        let reopened = git2::Repository::open(tmp.path()).unwrap();
+        let head_id = reopened.head().unwrap().peel_to_commit().unwrap().id();
+        let log = reopened.find_commit(head_id).unwrap();
+        assert!(
+            log.message().unwrap().contains(MERGE_AUTOSAVE_MARK),
+            "自愈提交必须带 [autosave] 标记：{}",
+            log.message().unwrap()
+        );
+        // 未跟踪文件没被卷进去：HEAD 树里没有它，工作区里它还在
+        let head_tree = log.tree().unwrap();
+        assert!(
+            head_tree.get_name("junk.txt").is_none(),
+            "未跟踪文件不得进自愈提交"
+        );
+        assert!(tmp.path().join("junk.txt").exists());
+        // 已跟踪改动已提交 → 工作区对已跟踪面干净（再次调用不重复造提交）
+        assert!(
+            Git.commit_unstaged_tracked_changes(tmp.path())
+                .await
+                .unwrap()
+                .is_none(),
+            "自愈后再次调用应为 None"
+        );
     }
 
     /// 票 04：未提交改动要**点得出文件名**（简报据此提醒「改好了，别重做」），且非仓库

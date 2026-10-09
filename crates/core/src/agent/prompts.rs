@@ -212,6 +212,10 @@ pub struct PromptSegments {
     /// develop 重入的未申报变更事实与补申报指令（决策 397）：申报比对判定有漏报时
     /// 落盘，重入 develop.execute 时注入。**只有这一态非空**。
     pub undeclared_changes: Option<String>,
+    /// develop / test 重入的未提交改动事实与落提交指令（决策 416 A）：两个代码门的
+    /// 工作区守卫判定工作区不干净时落盘，重入对应 `execute` 时注入。**只有这一态非空**
+    /// ——放行 / 守卫已恢复时文件被清除，段自然为空（与 `zero_commit` 同一支）。
+    pub worktree_dirty: Option<String>,
     /// 超时梯子第 3 档（空白重跑）的起跑简报（决策 376 裁决② · 票 04）：任务描述 +
     /// 阶段产物文件清单 + 未提交改动清单 + 最近收口摘要。**只有这一档非空**——它替代
     /// 全卷转录，让「上一轮的侦察」不必每次重置都重新买一遍。
@@ -237,6 +241,10 @@ pub fn build_user_prompt(main: &str, segments: &PromptSegments) -> String {
         (
             "## 未申报变更事实与补申报指令",
             segments.undeclared_changes.as_deref(),
+        ),
+        (
+            "## 未提交改动事实与落提交指令",
+            segments.worktree_dirty.as_deref(),
         ),
         (
             "## 续接简报（超时空白重跑，不带全卷转录）",
@@ -732,6 +740,7 @@ mod tests {
             retry_feedback: Some("C".into()),
             zero_commit: Some("G".into()),
             undeclared_changes: Some("H".into()),
+            worktree_dirty: Some("I".into()),
             continuation_brief: Some("F".into()),
         };
         let out = build_user_prompt("主", &seg);
@@ -742,10 +751,11 @@ mod tests {
         let c = out.find("## 重试历史摘要").unwrap();
         let g = out.find("## 零提交事实与落提交指令").unwrap();
         let h = out.find("## 未申报变更事实与补申报指令").unwrap();
+        let i = out.find("## 未提交改动事实与落提交指令").unwrap();
         let f = out
             .find("## 续接简报（超时空白重跑，不带全卷转录）")
             .unwrap();
-        assert!(a < b && b < e && e < d && d < c && c < g && g < h && h < f);
+        assert!(a < b && b < e && e < d && d < c && c < g && g < h && h < i && i < f);
     }
 
     /// 票 04：空白重跑的简报段被渲染，且是**独立一段**（不是塞进别的段里）。

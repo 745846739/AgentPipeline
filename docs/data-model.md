@@ -408,6 +408,7 @@ LLM（`agent_type = pseudo:project_analysis` ≠ `system`），因此**计入**�
 | merge / execute | retry_exhausted | 用户选择：重试 merge.execute / 终止任务（**无 skip**，决策 86） | 冲突文件或闸门失败详情 + 已尝试次数（`gate_failures`） |
 | merge / execute | merge_approval | 用户在 GUI 审核 diff 后点击"合入"或"返回修改"（`POST /tasks/{id}/merge/decision`，决策 119） | diff 文件 + 变更统计 |
 | merge / execute | user_decision（脏工作区） | 用户选择：我已处理，继续合入 / 取消任务（决策 132："放弃合入"移除，无端点） | 目标分支未提交改动清单 |
+| 任何节点（节点执行中撞上的**确定性 git / 环境前置失败**，决策 416） | environment_blocked | goto → **本阶段入口节点**（动作名「修复后重试执行」，环境修好后从本阶段入口重跑）/ 终止任务（**无 skip**——重试前必须先修环境，给 skip 只会通向必然失败） | 「环境受阻」+ 失败报文与修复指引（5 条指纹判据见 `git.rs::is_environment_precondition`；通知类 Failed） |
 | 任何节点 | timeout | 自动按 `agent_retry_max` 重试；耗尽后用户选择：goto execute 或 skip（**merge 除外**：动作集同决策 86，重试 / 终止任务，无 skip——决策 122） | 超时的节点和已耗时 |
 | 任何节点（**agent 节点**） | — （不是 pending 原因） | **进程重启**：服务在节点执行中途退出，启动恢复给中断的游标置 `process_restart` 续接原因（决策 403），节点从节点内消息日志（§4.4）里最后一条已记录的消息接着跑；**不重置工作区**（决策 405 / 125）。连续第 3 次仍未取得进展 → 转 `pending(retry_exhausted)` 交回人工（决策 404 的止损） | 无需人介入（自动续接）；止损那一档才呈现「这个节点为什么会让服务反复退出」 |
 | 任何节点 | context_overflow | 用户选择：拆分任务 / 更换长上下文模型 / 取消 | 峰值 token、压缩次数 |
@@ -435,5 +436,6 @@ LLM（`agent_type = pseudo:project_analysis` ≠ `system`），因此**计入**�
 | merge_approval | — | `approve` / `return`（side_effect → `POST /tasks/{id}/merge/decision`） | 决策 119 |
 | user_decision | dirty_worktree | `continue`（"我已处理，继续合入"）、`cancel 取消任务`（side_effect） | 决策 132：「放弃合入」移出动作集（无端点，与前端评审决议④对齐） |
 | timeout | — | `goto execute`、`skip`（均 resume） | merge 例外同 retry_exhausted（决策 122） |
+| environment_blocked | — | `goto`（「修复后重试执行」，落点本阶段入口节点，resume）、`cancel`（side_effect） | 决策 416：确定性 git / 环境前置失败（如工作区脏挡 rebase），修环境之前重试必然同样失败，故**无 skip** |
 | context_overflow | — | `split_task` / `model_override` / `cancel`（均 side_effect） | 决策 105 |
 | dependency_failed | 依赖 failed | `continue`（= 忽略失败依赖置回 queued，决策 116）、`cancel`（side_effect）、`等待依赖重试`（纯等待，无系统变更） | 依赖 cancelled 时无"等待依赖重试"（决策 116） |

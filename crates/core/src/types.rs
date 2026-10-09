@@ -278,6 +278,12 @@ pub enum PendingKind {
     InfoInsufficient,
     ConflictWait,
     RetryExhausted,
+    /// 确定性的 git / 仓库环境前置条件不满足，**重试必失败**（决策 416 C）。
+    ///
+    /// 与 `retry_exhausted` 分开不是为了分类好看——后者的语义是「试了 N 次放弃了」，而
+    /// 这一类**一次都没重试**；动作集也必须分开，否则用户点着一颗必然重败的钮再撞一次墙
+    /// （2026-10-09 `01M4CD59Y977ZQ0GMY9MPSFFMX` 的「重试合并」正是这样）。
+    EnvironmentBlocked,
     UserDecision,
     MergeApproval,
     HumanReview,
@@ -302,6 +308,7 @@ impl PendingKind {
             PendingKind::InfoInsufficient => "info_insufficient",
             PendingKind::ConflictWait => "conflict_wait",
             PendingKind::RetryExhausted => "retry_exhausted",
+            PendingKind::EnvironmentBlocked => "environment_blocked",
             PendingKind::UserDecision => "user_decision",
             PendingKind::MergeApproval => "merge_approval",
             PendingKind::HumanReview => "human_review",
@@ -321,6 +328,7 @@ impl FromStr for PendingKind {
             "info_insufficient" => PendingKind::InfoInsufficient,
             "conflict_wait" => PendingKind::ConflictWait,
             "retry_exhausted" => PendingKind::RetryExhausted,
+            "environment_blocked" => PendingKind::EnvironmentBlocked,
             "user_decision" => PendingKind::UserDecision,
             "merge_approval" => PendingKind::MergeApproval,
             "human_review" => PendingKind::HumanReview,
@@ -354,6 +362,10 @@ pub enum ResumeCause {
     InfoInsufficient,
     ConflictWait,
     RetryExhausted,
+    /// `environment_blocked` 被清掉：人把环境/仓库状态修好了，点「修复后重试」
+    /// （决策 416 C）。**不复用 `RetryExhausted`**——那一列是要读的诊断字段，
+    /// 写上 `retry_exhausted` 等于把「没重试过」这句谎继续往下带。
+    EnvironmentBlocked,
     ContextOverflow,
     Timeout,
     /// 超时梯子第 3 档：**空白重跑**（决策 320 / 376 裁决②）。与 [`ResumeCause::Timeout`]
@@ -413,10 +425,11 @@ pub enum ResumeCause {
 /// 新增一个变体时**先改这里**，再回答 `resume_continues` 那个穷尽 `match`——
 /// 编译器会在后者报「未覆盖的模式」，这是本表的牙齿（决策 205：兜底 false 是安全网，
 /// 不是让人忘记回答的借口）。
-pub const ALL_RESUME_CAUSES: [ResumeCause; 26] = [
+pub const ALL_RESUME_CAUSES: [ResumeCause; 27] = [
     ResumeCause::InfoInsufficient,
     ResumeCause::ConflictWait,
     ResumeCause::RetryExhausted,
+    ResumeCause::EnvironmentBlocked,
     ResumeCause::ContextOverflow,
     ResumeCause::Timeout,
     ResumeCause::TimeoutBlankRestart,
@@ -449,6 +462,7 @@ impl ResumeCause {
             ResumeCause::InfoInsufficient => "info_insufficient",
             ResumeCause::ConflictWait => "conflict_wait",
             ResumeCause::RetryExhausted => "retry_exhausted",
+            ResumeCause::EnvironmentBlocked => "environment_blocked",
             ResumeCause::ContextOverflow => "context_overflow",
             ResumeCause::Timeout => "timeout",
             ResumeCause::TimeoutBlankRestart => "timeout_blank_restart",
@@ -498,6 +512,7 @@ impl ResumeCause {
             PendingKind::InfoInsufficient => ResumeCause::InfoInsufficient,
             PendingKind::ConflictWait => ResumeCause::ConflictWait,
             PendingKind::RetryExhausted => ResumeCause::RetryExhausted,
+            PendingKind::EnvironmentBlocked => ResumeCause::EnvironmentBlocked,
             PendingKind::ContextOverflow => ResumeCause::ContextOverflow,
             PendingKind::Timeout => ResumeCause::Timeout,
             PendingKind::DependencyFailed if ctx == "dependency_cancelled" => {
@@ -566,6 +581,7 @@ pub fn resume_continues(cause: ResumeCause) -> bool {
         // 简报。判定表回答的是「这是不是一个续接边界」，形态由 `ContinuationMode` 定。
         ResumeCause::InfoInsufficient
         | ResumeCause::RetryExhausted
+        | ResumeCause::EnvironmentBlocked
         | ResumeCause::Timeout
         | ResumeCause::TimeoutBlankRestart
         | ResumeCause::ProcessRestart
@@ -1872,10 +1888,12 @@ mod tests {
     #[test]
     fn resume_cause_table_is_the_spec() {
         use ResumeCause::*;
-        let cases: [(ResumeCause, bool); 26] = [
+        let cases: [(ResumeCause, bool); 27] = [
             // ── true ──
             (InfoInsufficient, true),
             (RetryExhausted, true),
+            // 环境修好了点「修复后重试」：与 retry_exhausted 同一条续接口径（决策 416 C）
+            (EnvironmentBlocked, true),
             (Timeout, true),
             // 空白重跑是一条续接边界（下游据它渲染简报段），只是不带转录（票 04）
             (TimeoutBlankRestart, true),
