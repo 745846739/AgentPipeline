@@ -3197,3 +3197,18 @@ config.rs}`、`tests/e2e/tests/integration/stage_boundary.rs`、`docs/testing.md
 **范围**：本决策**不含**该任务自身的 ①② 修复（收窄 `FILENAME_TOKEN` + 候选集枚举正例）——那一半由打回后的 develop 在任务 worktree 里完成，走它自己的闸门与第三轮评审；本决策是从此对**所有**打回生效的那一条纪律。配套的两张票另立：`.scratch/gate-frontend-tests/`（闸门跑前端单测）、`.scratch/review-round-ledger/`（评审轮间台账）。
 
 **来源**：任务 `01M4CD59Y977ZQ0GMY9MPSFFMX` 两轮评审复盘 + 会话拷问（grilling 十条裁决）；落地 `crates/core/src/{types.rs, pipeline/model_invoke.rs, pipeline/model_request.rs}`、`docs/testing.md`
+
+### 决策 414 · 五条收场尾句都按实际产出说话：产出注记（提议数 ∪ 改动文件数）+ 在打转两态（票 `foreman-work-record` 02）
+
+**起因**：决策 311「收场文案按实际提议数说话」只接了五条收场尾句的**第三条**（人按停），其余四条连提议数都不提；而 2026-10-08 实账里最贵的两句谎（394 / 405 逐字相同的「要接着查可以让我再来一轮（换个线索）」）恰恰出自「在打转」那条——那两轮**改了二十余处文件**，用户在 394 之前刚说过「直接改完啊」。把修复轮说成研究轮，是收口句对「本轮干了什么」的断言缺了改动文件这一个来源（决策 411 补的正是它）。
+
+**裁决**：
+
+1. **产出注记**：`changes::output_note(提议数, 改动文件数)`——纯函数，四种组合各有措辞（0/0、>0/0、0/>0、>0/>0），**五条尾句全部接上它**（预算触顶 / 在打转 / 人按停 / 中途断流 / 轮数上限）。两种单来源措辞是决策 311 的原文逐字保留（既有两条 L2 逐字钉着）；并上另一来源的两种组合里，311 那句作为前半句嵌入（`；`连接），字未改但不再是独立句。新增的只是「并上改动文件数」那一半。改动文件数**共用票 01 的汇总器**（痕迹 ∪ repair diff，含「档位不是 auto 整轮为空」那条判据），不另写一份。
+2. **「在打转」两态**：`changes::loop_tail(动过文件吗)`——**动过** → 不再说「换个线索再查」，改说「已经改过的文件见文末清单，要接着改说一声」（清单恒在尾句之后，故说「文末」不说「见上」）；**没动过** → 决策 293 的原文逐字保留（对「确实查不下去」那一支，「换个线索」是对的）。
+3. **清单计算提到尾句组装之前**：`changed_files` 从 `content` 组装处上移到五条尾句 match 之前（尾句也要读它）；判据、来源、`changed_files_json` 列一个字不动。代价是静默值守轮与「一句没说就失败」的轮多问一次 `round_repair_diffs`（轻量 SELECT，可忽略）。
+4. **五种停法的标记与归属一字不动**：`【未收口】` / `【未收口·在打转】` / `【已停】` / `【没跑起来】`——裁决 9 的兑现点不在本决策范围内。值守轮那条（`FOREMAN_WATCH_FAILED_TURN_MARK`）不在本票内。
+
+**验证**：L1 `changes.rs` **4 条新**——`touched_any_is_exactly_the_non_empty_list` / `the_loop_tail_has_two_states`（动过文件的措辞不含「换个线索」且指向文末清单）/ `output_note_covers_all_four_combinations` / `the_output_note_never_promises_proposals_that_do_not_exist`（0 提议时绝不复述「照样可以按」，有提议时那句逐字出现）。L2 `foreman.rs` **6 处**——既有五种停法用例各加一条产出注记断言（预算触顶 `the_token_budget_stops…`、在打转 `a_repeating_tool_call…`、人按停两条、中途断流 `a_mid_turn_failure…`、轮数上限 `a_capped_turn…`）+ **新** `a_looping_round_that_changed_files_is_asked_to_fix_not_to_research`（改过文件的打转轮：尾句不含「换个线索」、含「要接着改说一声」与改动文件数、文末清单在）。在打转两态各自钉住。隔离 worktree `cargo test --workspace` 全绿、`clippy --all-targets -D warnings` 与 `fmt --check` 通过。
+
+**来源**：`.scratch/foreman-work-record/issues/02`（事故账 `incident-2026-10-08.md` 的问题三）；落地 `crates/core/src/pipeline/foreman/{changes.rs, runner.rs}`、`crates/core/tests/integration/foreman.rs`

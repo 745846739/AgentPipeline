@@ -20,8 +20,8 @@
 
 | 票 | 状态 | 关键接缝 |
 |---|---|---|
-| [01 收口行带机器读出的改动清单](issues/01-round-changes-in-receipt.md) | ready-for-agent | 收口前的 `content` 组装；`ForemanTrace.args`；改动文件的新列 |
-| [02 五条收场尾句都按实际产出说话](issues/02-stop-tails-speak-by-actual-output.md) | ready-for-agent（Blocked by 01） | 五条硬编码尾句；`proposal_note` 今天只接在第 3 条上 |
+| [01 收口行带机器读出的改动清单](issues/01-round-changes-in-receipt.md) | done（决策 411） | 收口前的 `content` 组装；`ForemanTrace.args`；改动文件的新列 |
+| [02 五条收场尾句都按实际产出说话](issues/02-stop-tails-speak-by-actual-output.md) | done（决策 414） | 五条硬编码尾句；`proposal_note` 今天只接在第 3 条上 |
 | [03 收口行的时刻是开工时刻](issues/03-receipt-timestamp-is-turn-start.md) | needs-triage | `begin_foreman_inflight` / `close_foreman_inflight` 的 `created_at` |
 | [04 多义指令先说读法](issues/04-ambiguous-instruction-ask-first.md) | needs-triage | 提议落库时的「理解成什么」；行为层的先问再动 |
 

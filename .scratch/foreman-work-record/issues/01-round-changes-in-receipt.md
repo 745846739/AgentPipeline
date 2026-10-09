@@ -73,4 +73,4 @@
 - 线上加恒在场的加性字段 `changed_files`（`crates/app/src/routes/foreman.rs::message_wire`）——界面这一批不消费，前端另立票。
 - 验收：L1 11 条（`changes.rs` 内联）+ L2 4 条（`tests/integration/foreman.rs` 末尾一组）；`cargo test --workspace` 1801 通过 / 0 失败（7 ignored）。
 - **与票面的两处偏差**（已回写进上面的「形状」）：diff 那份来源做成**并集**而不是替换；补上「档位不是 `auto` 就不算改动」这条判据。
-- **未做**：前端显示（另立票）；票 02（五条收场尾句都按实际产出说话）**Blocked by 本票**，尚未落地。
+- **未做**：前端显示（另立票）；票 02（五条收场尾句都按实际产出说话）**Blocked by 本票**，已于 2026-10-09 落地（决策 414）。

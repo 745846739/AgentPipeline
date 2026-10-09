@@ -1326,11 +1326,34 @@ impl ForemanRunner {
         // - **有提议**：原句**一字不改**——它是决策 294 / 修订 233③「被停在半路那轮提的
         //   提议保留」的兑现点，丢了它人就不会去看那批卡片了；
         // - **0 条**：明说 0 条，不再复述一句不成立的保证（2026-09-27 那次它就是这么说的谎）。
-        let proposal_note = if round_proposals > 0 {
-            "这一轮提的提议都还在，照样可以按。"
-        } else {
-            "本轮没有提任何提议。"
+        //
+        // **本轮改了哪些文件**（票 02）：清单计算从 `content` 组装处**提到尾句之前**——
+        // 五条停法的尾句从此都按「提议数 ∪ 改动文件数」说话（`output_note`），而「在打转」
+        // 那条还要按它换后半句（改过文件的轮不该被建议「换个线索再查」，那是 394 / 405
+        // 两轮的谎）。判据与来源一字不动（票 01 的并集：痕迹 ∪ 本轮 repair 那份权威 diff，
+        // 从库里读）。**读库失败按「没有 diff」处置**（与上面那条提议计数同一姿态：
+        // 读不出来就只说自己读得出来的那份，别复述一句可能不成立的保证）。代价是静默值守轮
+        // 与「一句没说就失败」的轮也多问一次这条索引查询——它是一次轻量 SELECT，可忽略。
+        let diff_paths = {
+            let mut paths: Vec<String> = Vec::new();
+            for diff in self
+                .store
+                .round_repair_diffs(&session.id, round_since)
+                .await
+                .unwrap_or_default()
+            {
+                paths = changes::union(paths, changes::diff_paths(&diff));
+            }
+            paths
         };
+        let changed_files =
+            changes::union(changes::changed_paths(&traces, plan.env_mode), diff_paths);
+        // 产出注记（票 02，显式续写决策 311）：提议数 ∪ 改动文件数，四种组合各有措辞——
+        // 五条尾句**全部**接上它，不再只有「人按停」那一条。
+        let output_note = changes::output_note(round_proposals, changed_files.len());
+        // 「在打转」那条的后半句两态（票 02）：改过文件 → 建议「接着改」；没动过 →
+        // 决策 293 的原文逐字保留（对「确实查不下去」那一支，「换个线索」是对的）。
+        let loop_tail = changes::loop_tail(changes::touched_any(&changed_files));
         let (reply, stopped, stop_error) = match (reply, stop) {
             // 模型自己收口了：正常那一句（预算门在它之后才可能踩线，故这里不看 `stop`）。
             (Some(reply), _) => (reply, false, None),
@@ -1353,11 +1376,14 @@ impl ForemanRunner {
                 // 分得开），其余共用它。
                 let was_stopped = matches!(stop, Some(StopReason::Stopped(_)));
                 let (mark, why, error) = match stop {
+                    // 五条尾句**全部**接产出注记（票 02）：停法各有各的「为什么」，但
+                    // 「这一轮产出了什么」只有一份账（提议 ∪ 改动文件），每种停法都该带上它。
                     Some(StopReason::Budget(used)) => (
                         FOREMAN_PARTIAL_TURN_MARK,
                         format!(
                             "这一轮的 token 预算到了（{token_line} 生成 token，已烧 {used}），\
-                             话没说完——以上是已经确定的部分。要接着查可以让我再来一轮（带上线索）。"
+                             话没说完——以上是已经确定的部分。要接着查可以让我再来一轮（带上线索）。\
+                             {output_note}"
                         ),
                         None,
                     ),
@@ -1365,7 +1391,7 @@ impl ForemanRunner {
                         FOREMAN_LOOP_TURN_MARK,
                         format!(
                             "{}——提醒过一次仍未改道，这一轮我就停了。\
-                             以上是已经确定的部分。要接着查可以让我再来一轮（换个线索）。",
+                             以上是已经确定的部分。{loop_tail}{output_note}",
                             hit.reason()
                         ),
                         None,
@@ -1376,7 +1402,7 @@ impl ForemanRunner {
                         FOREMAN_STOPPED_TURN_MARK,
                         format!(
                             "这一轮你按了停（停在第 {round} 轮），话没说完——以上是已经确定的部分。\
-                             要接着查可以让我再来一轮（带上线索）；{proposal_note}"
+                             要接着查可以让我再来一轮（带上线索）；{output_note}"
                         ),
                         None,
                     ),
@@ -1386,7 +1412,7 @@ impl ForemanRunner {
                             FOREMAN_PARTIAL_TURN_MARK,
                             format!(
                                 "这一轮中途断了（{reason}），话没说完——以上是已经确定的部分。\
-                                 要接着查可以让我再来一轮（带上线索）。"
+                                 要接着查可以让我再来一轮（带上线索）。{output_note}"
                             ),
                             Some(e),
                         )
@@ -1396,7 +1422,8 @@ impl ForemanRunner {
                         FOREMAN_PARTIAL_TURN_MARK,
                         format!(
                             "这一轮到了 {round_limit} 轮的收口上限，\
-                             话没说完——以上是已经确定的部分。要接着查可以让我再来一轮（带上线索）。"
+                             话没说完——以上是已经确定的部分。要接着查可以让我再来一轮（带上线索）。\
+                             {output_note}"
                         ),
                         None,
                     ),
@@ -1417,7 +1444,7 @@ impl ForemanRunner {
                 format!(
                     "{FOREMAN_STOPPED_TURN_MARK}这一轮你按了停（停在第 {round} 轮）——\
                      它还没说出什么，没有部分结论可留。要接着查可以让我再来一轮（带上线索）；\
-                     {proposal_note}"
+                     {output_note}"
                 ),
                 true,
                 None,
@@ -1526,25 +1553,8 @@ impl ForemanRunner {
         // 但「这一轮已经烧了这么多」该被看见。落在**这一轮自己的台账行**上（不另起一条
         // 系统消息：那会刷屏，还会挤占历史窗口），不进 `turn.reply`——通知出口发的是模型
         // 自己说过的话，账目跟着台账走。
-        // **本轮改了哪些文件**（票 01）：痕迹里读出的 ∪ 本轮 repair 那份权威 diff。
-        // 两份来源覆盖的东西不同——痕迹只看得到 `write_file` / `edit_file`，diff 只看得到
-        // repair worktree 里那一份提交；`run_command` 里改的文件（`git apply` / `sed -i`）
-        // 只有后者看得见。**读库失败按「没有 diff」处置**（与决策 311 那条提议计数同一姿态：
-        // 读不出来就只说自己读得出来的那份，别复述一句可能不成立的保证）。
-        let diff_paths = {
-            let mut paths: Vec<String> = Vec::new();
-            for diff in self
-                .store
-                .round_repair_diffs(&session.id, round_since)
-                .await
-                .unwrap_or_default()
-            {
-                paths = changes::union(paths, changes::diff_paths(&diff));
-            }
-            paths
-        };
-        let changed_files =
-            changes::union(changes::changed_paths(&traces, plan.env_mode), diff_paths);
+        // **本轮改了哪些文件**（票 01）：`changed_files` 已在五条尾句组装之前算好
+        // （票 02 把它提了上去——尾句也要按它说话），这里只落列。
         // 与 `traces_json` 同一口径：没有改动就不落这一列（不落一个空数组）。
         let changed_files_json = if changed_files.is_empty() {
             None

@@ -5840,6 +5840,12 @@ async fn a_capped_turn_keeps_what_it_already_established() {
         "标注里要给出实际生效的上限：{}",
         turn.reply
     );
+    // 票 02：**轮数上限**那条尾句也接产出注记。
+    assert!(
+        turn.reply.contains("本轮没有提任何提议，也没有改动文件。"),
+        "轮数上限的尾句要按实际产出说话：{}",
+        turn.reply
+    );
 
     // 落库的是同一段（「那 30 轮其实查到了东西、却整段扔掉」是实测里最贵的一次浪费）。
     let stored = h.store.list_foreman_messages(&sid, 10, None).await.unwrap();
@@ -5992,6 +5998,12 @@ async fn the_token_budget_stops_the_watch_round_but_never_the_human_one() {
         "触顶要标注、且说清是预算那条线：{}",
         turn.reply
     );
+    // 票 02：**预算触顶**那条尾句也接产出注记（此前只有「人按停」那一条有）。
+    assert!(
+        turn.reply.contains("本轮没有提任何提议，也没有改动文件。"),
+        "预算触顶的尾句要按实际产出说话：{}",
+        turn.reply
+    );
     let stored = h
         .store
         .list_foreman_messages(&turn.session.id, 10, None)
@@ -6093,6 +6105,14 @@ async fn a_mid_turn_failure_keeps_what_was_already_said() {
         "半份结论要带标注与原因：{}",
         partial.content
     );
+    // 票 02：**中途断流**那条尾句也接产出注记。
+    assert!(
+        partial
+            .content
+            .contains("本轮没有提任何提议，也没有改动文件。"),
+        "中途断流的尾句要按实际产出说话：{}",
+        partial.content
+    );
     // ③ 失败那一行也在（两条记载各说各的，一条也不丢）
     assert!(
         stored
@@ -6136,6 +6156,35 @@ impl LlmClient for LoopingForever {
                     id: format!("c{n}"),
                     name: "read_task".into(),
                     arguments: r#"{"task_id":"t1"}"#.into(),
+                }],
+                prompt_tokens: 10,
+                completion_tokens: 5,
+                ..Default::default()
+            })
+        })
+    }
+}
+
+/// 与 [`LoopingForever`] 同构，但重复的是**同一个 `write_file`**（票 02 的「改过文件的
+/// 打转轮」用例）。`write_file` 幂等（`write_file_is_idempotent`），同参重放的结果指纹
+/// 逐字相同，故循环判据照样命中；`auto` 档下它每次都真的动了 `notes.md`。
+struct LoopingWrite {
+    calls: Arc<std::sync::atomic::AtomicUsize>,
+}
+
+impl LlmClient for LoopingWrite {
+    fn complete(
+        &self,
+        _request: LlmRequest,
+    ) -> futures::future::BoxFuture<'static, agentpipeline_core::Result<AgentResponse>> {
+        let n = self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
+        Box::pin(async move {
+            Ok(AgentResponse {
+                content: Some(format!("（第 {n} 步）我改一下 notes.md。")),
+                tool_calls: vec![agentpipeline_core::agent::client::ToolCall {
+                    id: format!("c{n}"),
+                    name: "write_file".into(),
+                    arguments: r#"{"path":"notes.md","content":"x"}"#.into(),
                 }],
                 prompt_tokens: 10,
                 completion_tokens: 5,
@@ -6193,6 +6242,18 @@ async fn a_repeating_tool_call_is_reminded_once_then_closed_out() {
         "收口要带标记、原因与已确定的部分：{}",
         turn.reply
     );
+    // ③′ **没动过文件**的在打转轮（票 02 的两态之一）：尾句保留「换个线索」——对
+    // 「确实查不下去」那一支，再查一轮换个线索是对的；产出注记也按「两个都没有」说话。
+    assert!(
+        turn.reply.contains("换个线索"),
+        "没动过文件时保留「换个线索」（决策 293 的原文）：{}",
+        turn.reply
+    );
+    assert!(
+        turn.reply.contains("本轮没有提任何提议，也没有改动文件。"),
+        "产出注记按「0 提议 ∪ 0 改动」说话：{}",
+        turn.reply
+    );
     let stored = h.store.list_foreman_messages(&sid, 10, None).await.unwrap();
     let closed = stored
         .iter()
@@ -6209,6 +6270,57 @@ async fn a_repeating_tool_call_is_reminded_once_then_closed_out() {
             .iter()
             .any(|m| m.role == "system" && m.content.contains("没跑起来")),
         "打转收口不该落一条失败账：{stored:?}"
+    );
+}
+
+/// 票 02 的两态之二：**改过文件**的在打转轮，尾句不再说「换个线索再查」——一轮真改了
+/// 东西却被建议「换个线索」，是把修复轮说成研究轮（2026-10-08 实账 394 / 405 的谎）。
+#[tokio::test]
+async fn a_looping_round_that_changed_files_is_asked_to_fix_not_to_research() {
+    let h = Harness::seeded().await;
+    // 改动清单只在 `auto` 档读得出来（缺省 `ask` 档写工具只落提议、文件不动，决策 411）。
+    h.foreman_env(agentpipeline_core::types::EnvMode::Auto)
+        .await;
+    let sid = h.session().await;
+    let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let runner = h.runner_with_llm(Arc::new(LoopingWrite {
+        calls: calls.clone(),
+    }) as Arc<dyn LlmClient>);
+
+    let turn = runner.say(Some(&sid), "改那个文件").await.unwrap();
+
+    assert!(
+        turn.reply.contains(FOREMAN_LOOP_TURN_MARK),
+        "照样是打转收口：{}",
+        turn.reply
+    );
+    assert!(
+        !turn.reply.contains("换个线索"),
+        "改过文件的轮不许再被建议「换个线索再查」：{}",
+        turn.reply
+    );
+    assert!(
+        turn.reply.contains("要接着改说一声"),
+        "建议要指向「接着改」：{}",
+        turn.reply
+    );
+    assert!(
+        turn.reply.contains("本轮改了 1 个文件"),
+        "产出注记要带上改动文件数：{}",
+        turn.reply
+    );
+    // 文末那份清单也在（尾句说的「文末清单」指的就是它）。
+    let stored = h.store.list_foreman_messages(&sid, 10, None).await.unwrap();
+    let closed = stored
+        .iter()
+        .find(|m| m.role == "assistant")
+        .unwrap_or_else(|| panic!("收口那一行要落库：{stored:?}"));
+    assert!(
+        closed
+            .content
+            .contains("【本轮改动】本轮改了 1 个文件：notes.md。"),
+        "尾句指的文末清单要真的在：{}",
+        closed.content
     );
 }
 

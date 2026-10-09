@@ -6,8 +6,11 @@
 //! 2026-10-08 的班次 `01M4CDY9EC9M9FSSE236GJXYZC` 里，394 那一轮改了二十余处，台账正文只有
 //! 104 个字，8 分钟后的下一轮据此**如实**汇报「仍未动一行代码」。
 //!
-//! 这一格把清单升成机器读数，两个消费者：① 收口正文末尾那一段（[`changes_note`]，它进下一轮
-//! 的 prompt）；② 行上的 `changed_files_json` 列（随 `ForemanMessage` 带给下一轮与界面）。
+//! 这一格把清单升成机器读数，三个消费者：① 收口正文末尾那一段（[`changes_note`]，它进下一轮
+//! 的 prompt）；② 行上的 `changed_files_json` 列（随 `ForemanMessage` 带给下一轮与界面）；
+//! ③ 五条收场尾句末尾的**产出注记**（[`output_note`]，票 02）与「在打转」那条的两态措辞
+//! （[`loop_tail`]）——收场文案从此按「提议数 ∪ 改动文件数」说话，不再对改过东西的轮
+//! 建议「换个线索再查」。
 //!
 //! **判据是工具名 + 参数里的 `path`**（完整参数原串，决策 301 起就在留痕里），**外加**本轮
 //! 若调用过 `repair(finish)` 时那份权威 diff 的文件清单——`run_command` 里也可能改文件
@@ -153,6 +156,41 @@ pub(super) fn changes_note(paths: &[String], contradicts_reply: bool) -> Option<
         "。".to_string()
     };
     Some(format!("{head}{shown}{tail}"))
+}
+
+/// 「本轮动过文件吗」的判据（票 02）：清单非空。「在打转」那条收场尾句按它换措辞——
+/// 改过东西的轮不该被建议「换个线索再查」（把修复轮说成研究轮，正是 394 / 405 两轮的谎）。
+pub(super) fn touched_any(paths: &[String]) -> bool {
+    !paths.is_empty()
+}
+
+/// 「在打转」那条的后半句，两态（票 02）：
+/// - **动过文件**：建议从「再查一轮」换成「接着改」——清单在文末 [`changes_note`] 那一段
+///   （它恒在这一句之后，故说「文末」不说过期的「见上」）；
+/// - **没动过**：原文逐字保留——对「确实查不下去」那一支，「换个线索」是对的。
+pub(super) fn loop_tail(touched: bool) -> &'static str {
+    if touched {
+        "已经改过的文件见文末清单，要接着改说一声。"
+    } else {
+        "要接着查可以让我再来一轮（换个线索）。"
+    }
+}
+
+/// 收场尾句末尾的**产出注记**（票 02，显式续写决策 311）：内容 = 提议数 ∪ 改动文件数，
+/// 四种组合各有措辞——五条停法的尾句**全部**接上它，不再只有「人按停」那一条。
+///
+/// 两个计数都只说自己算得出来的事：提议数问库（读不出来按 0，决策 311），改动文件数用
+/// 本格的汇总器（同一份判据，两处共用）。措辞上「提议都还在，照样可以按」与「本轮没有提
+/// 任何提议」两句是决策 311 的原文——**单来源的两种组合里逐字保留**（既有两条 L2 逐字钉着
+/// 它们）；并上改动文件数的两种组合里，311 那句作为前半句嵌入（`；`连接、句号让给整句），
+/// 字未改但不再是独立句。
+pub(super) fn output_note(proposals: usize, changed: usize) -> String {
+    match (proposals > 0, changed > 0) {
+        (false, false) => "本轮没有提任何提议，也没有改动文件。".to_string(),
+        (true, false) => "这一轮提的提议都还在，照样可以按。".to_string(),
+        (false, true) => format!("本轮没有提任何提议；本轮改了 {changed} 个文件。"),
+        (true, true) => format!("这一轮提的提议都还在，照样可以按；本轮改了 {changed} 个文件。"),
+    }
 }
 
 #[cfg(test)]
@@ -309,5 +347,50 @@ mod tests {
             "状态如下——**仍未动一行代码**，但障碍已清零"
         ));
         assert!(!claims_no_change("本轮的改动都在 worktree 里，未进主干。"));
+    }
+
+    // ── 票 02：产出注记 + 在打转两态 ──────────────────────────────────────
+
+    #[test]
+    fn touched_any_is_exactly_the_non_empty_list() {
+        assert!(!touched_any(&[]));
+        assert!(touched_any(&["a.md".to_string()]));
+    }
+
+    /// 「在打转」那条的两态：动过文件就建议「接着改」，没动过保留决策 293 的原文
+    /// （「换个线索」对「确实查不下去」那一支是对的）。
+    #[test]
+    fn the_loop_tail_has_two_states() {
+        assert_eq!(loop_tail(false), "要接着查可以让我再来一轮（换个线索）。");
+        assert!(
+            !loop_tail(true).contains("换个线索"),
+            "改过东西的轮不该被建议换个线索再查：{}",
+            loop_tail(true)
+        );
+        assert!(loop_tail(true).contains("要接着改说一声"));
+        assert!(loop_tail(true).contains("文末清单"));
+    }
+
+    /// 产出注记的四种组合各一条。**两种单来源的措辞是决策 311 的原文**（既有两条 L2
+    /// 逐字钉着它们），新增的只是「并上改动文件数」那一半。
+    #[test]
+    fn output_note_covers_all_four_combinations() {
+        assert_eq!(output_note(0, 0), "本轮没有提任何提议，也没有改动文件。");
+        assert_eq!(output_note(3, 0), "这一轮提的提议都还在，照样可以按。");
+        assert_eq!(output_note(0, 2), "本轮没有提任何提议；本轮改了 2 个文件。");
+        assert_eq!(
+            output_note(1, 2),
+            "这一轮提的提议都还在，照样可以按；本轮改了 2 个文件。"
+        );
+    }
+
+    #[test]
+    fn the_output_note_never_promises_proposals_that_do_not_exist() {
+        // 0 提议时**不许**复述那句不成立的保证（2026-09-27 实测的谎，决策 311）。
+        assert!(!output_note(0, 0).contains("照样可以按"));
+        assert!(!output_note(0, 2).contains("照样可以按"));
+        // 有提议时那句一字不改（决策 294 / 修订 233③ 的兑现点）。
+        assert!(output_note(1, 0).contains("这一轮提的提议都还在，照样可以按。"));
+        assert!(output_note(1, 2).contains("这一轮提的提议都还在，照样可以按；"));
     }
 }
