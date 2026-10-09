@@ -44,8 +44,9 @@
  * **B 类边界登记表**（规则 3 的豁免，只收 B 类、不收「暂时不想改」）：
  * B1 键名标签与键名校验 / B2 动作句键名引用 / B3 域词表词（词表收录的工具名等）/
  * B4 mono 读数徽章 / B5 产物文件名作对照（**不由登记表承担**：`FILENAME_EXT` /
- * `HYPHEN_TOKEN` 两形态在 A-1 / A-2 两判据上一致剔除产物文件名——但连词剔除在 `STAGE_ID`
- * 扫描**之后**，否则会把 `develop-design` 这类阶段 id 一起吃掉，登记表不收行使不到的死条目）。
+ * `HYPHEN_TOKEN` 两形态在 A-1 / A-2 两判据上一致剔除产物文件名——五判据两两不相交
+ * （连词 token 显式让开阶段 id 候选集），剔与扫谁先谁后都不改变结果，登记表不收
+ * 行使不到的死条目）。
  * 条目数入断言，
  * 每条另有活性断言，让「悄悄烂掉」可见。
  *
@@ -248,21 +249,33 @@ describe('文案纪律 · 面向用户的文案里不出现字面 Markdown 强�
 
 /** 汉字判据：段内有汉字才可能是「人话句里夹符号」（纯英文键名标签天然放过）。 */
 const HAN = /\p{Script=Han}/u;
-/** A-1：snake_case 内部符号（小写字母开头、至少一段 `_`）。 */
-const SNAKE = /\b[a-z][a-z0-9]*(?:_[a-z0-9]+)+\b/;
-/** A-2：阶段 / 节点 id 全称。 */
-const STAGE_ID = /\b(?:architect-design|develop-design|test-design|sync-check|validate_output)\b/;
-/** A-2：独立词形态的阶段名。 */
-const STAGE_WORD = /\b(?:develop|review|test)\b/;
-/** A-2 负向排除（B5，形态一）：带扩展名的产物文件名——在**所有判据之前**剔：`sync-check.md` 这类
+
+/**
+ * A-2 阶段 / 节点 id **候选集**——判据正则与口径用例共用这一份（决策 412「判据型用例
+ * 遍历候选集」）：新增阶段 id 只改这里，`STAGE_ID` 与正 / 负例自动跟着走。
+ */
+const STAGE_IDS = ['architect-design', 'develop-design', 'test-design', 'sync-check', 'validate_output'] as const;
+const STAGE_ID_ALT = STAGE_IDS.join('|');
+
+/** 后接 `.扩展名` 就是产物文件名的一半（B5）——除 `FILENAME_EXT` 外的判据一律让开，
+ *  「扫谁」与「剔谁」才两两不相交、步骤先后不改变结果。 */
+const NOT_FILENAME = '(?!\\.[A-Za-z0-9])';
+
+/** A-1：snake_case 内部符号（小写字母开头、至少一段 `_`）——不接在 `-` 后（连词 token 的腹地，
+ *  让给 `HYPHEN_TOKEN`）、不与候选集相交（`validate_output` 归 A-2 阶段 id）、不贴扩展名。 */
+const SNAKE = new RegExp(`\\b(?<!-)(?!${STAGE_ID_ALT}\\b)[a-z][a-z0-9]*(?:_[a-z0-9]+)+\\b${NOT_FILENAME}`);
+/** A-2：阶段 / 节点 id 全称——候选集构造；不匹配 `sync-check.md` 这类文件名的前半（让给 `FILENAME_EXT`）。 */
+const STAGE_ID = new RegExp(`\\b(?:${STAGE_ID_ALT})\\b${NOT_FILENAME}`);
+/** A-2：独立词形态的阶段名——不接 `-`（`test-report` 的 `test` 是连词 token 的腹地）、不贴扩展名。 */
+const STAGE_WORD = new RegExp(`\\b(?:develop|review|test)\\b(?!-)${NOT_FILENAME}`);
+/** A-2 负向排除（B5，形态一）：带扩展名的产物文件名——`sync-check.md` 这类
  *  「阶段 id 形状的文件名」整体是文件名（B5 对照物），不是阶段 id。 */
 const FILENAME_EXT =
   /\b[\w-]+\.(?:diff|md|log|json|txt|ts|js|yaml|yml|toml|html|css|png|svg)\b/g;
-/** A-2 负向排除（B5，形态二）：连词 token（`review-diff` / `stage-name` 连写）——必须在 `STAGE_ID`
- *  扫描**之后**才剔：其备选 `(?:review|test|develop|architect)-[\w-]+` 会把 `architect-design` /
- *  `develop-design` / `test-design` 整体吃掉（评审实证的遮蔽缺口），先剔则这三枚阶段 id
- *  在含汉字句里永远报不出。 */
-const HYPHEN_TOKEN = /\b(?:review|test|develop|architect)-[\w-]+\b/g;
+/** A-2 负向排除（B5，形态二）：连词 token（`review-diff` / `stage-name` 连写）——连词备选
+ *  `(?:review|test|develop|architect)-[\w-]+` 与 `*-design` 形阶段 id 相交，**显式让开候选集**
+ *  （不相交则 `develop-design` 会被整体吃掉——评审实证的遮蔽缺口）。 */
+const HYPHEN_TOKEN = new RegExp(`\\b(?!${STAGE_ID_ALT})(?:review|test|develop|architect)-[\\w-]+\\b${NOT_FILENAME}`, 'g');
 
 interface CopySegment {
   /** 段文本（注释已剥）。 */
@@ -451,20 +464,37 @@ export interface HalfMixedHit {
   readonly text: string;
 }
 
+/** 扫描步骤：剔（等长挖空、不报）与扫（挖空并报一条）。判据两两不相交，**先后不改变结果**
+ * （对拍用例钉「原序 = 逆序」）——canonical 顺序只是「先剔明显不是文案的、再逐判据扫」的习惯。 */
+type ScanStep =
+  | { readonly kind: 'strip'; readonly re: RegExp }
+  | { readonly kind: 'sweep'; readonly re: RegExp; readonly rule: 'A-1' | 'A-2' };
+
+const SCAN_STEPS: readonly ScanStep[] = [
+  { kind: 'strip', re: FILENAME_EXT },
+  { kind: 'sweep', re: STAGE_ID, rule: 'A-2' },
+  { kind: 'strip', re: HYPHEN_TOKEN },
+  { kind: 'sweep', re: SNAKE, rule: 'A-1' },
+  { kind: 'sweep', re: STAGE_WORD, rule: 'A-2' },
+];
+
 /**
  * 在一份源码里找「人话句里夹内部符号」（注释已剥）——**逐段、逐 token** 报告：
  * 一段里有几枚符号就报几条（段级「只报首个命中」会让第二枚符号无人看，评审实证的缺口），
  * 豁免才能按 token 逐命中比对。
  *
- * **扫描顺序（评审实证的遮蔽缺口）**：① 先剔**带扩展名**的产物文件名（`FILENAME_EXT`，
- * 连 `sync-check.md` 这类阶段 id 形状的文件名一起放过，B5 不破）；② 对 rendered 扫 `STAGE_ID`
- * 挖空——`HYPHEN_TOKEN` 的连词备选 `(?:review|test|develop|architect)-[\w-]+` 会把
- * `architect-design` / `develop-design` / `test-design` 整体吃掉，若在阶段 id 之前剔它，
- * 这三枚 id 在含汉字句里永远报不出（`sync-check` 不带该前缀所以独存、`validate_output`
- * 由 snake 判据兼报）；③ 再剔连词 token（`HYPHEN_TOKEN`）；④ 最后扫 SNAKE 与独立词——
- * A-1 与独立词判据仍在文件名负向排除之后，`review-diff.diff` / `test-report.md` 照旧放过。
+ * **判据两两不相交，步骤顺序不改变结果**（对拍用例钉「原序 = 逆序」）：候选集（`STAGE_IDS`）
+ * 是单一事实源——连词 token 显式让开它（否则 `develop-design` 这类 id 会被连词备选整体吃掉，
+ * 评审实证的遮蔽缺口），除 `FILENAME_EXT` 外的判据都不贴扩展名（`sync-check.md` 整体归文件名），
+ * 独立词不接 `-`，snake 让开候选集与连词腹地。顺序从「有牙齿」变成「习惯」，正是这批 guard
+ * 换来的：谁先谁后结果一致（决策 413）。
  */
 export function findHalfMixed(text: string, html: boolean): HalfMixedHit[] {
+  return findMixedIn(text, html, SCAN_STEPS);
+}
+
+/** 按给定步骤表跑一遍——对拍用例以逆序调用，钉住「顺序不改变结果」这条不变量。 */
+function findMixedIn(text: string, html: boolean, steps: readonly ScanStep[]): HalfMixedHit[] {
   const { masked, segments } = extractCopySegments(text, html);
   const out: HalfMixedHit[] = [];
   for (const { seg, offset } of segments) {
@@ -473,18 +503,18 @@ export function findHalfMixed(text: string, html: boolean): HalfMixedHit[] {
     const loc = lineOf(masked, offset);
     const snippet = rendered.trim().slice(0, 110);
     // 命中即把该区间挖空（等长替换，偏移不漂）：同一符号不跨判据重复报
-    //（`validate_output` 兼是 snake 与阶段 id，归 A-2 阶段 id），也不被独立词判据二次命中。
-    let rest = rendered.replace(new RegExp(FILENAME_EXT.source, 'g'), ' ');
-    const sweep = (re: RegExp, rule: 'A-1' | 'A-2'): void => {
-      for (const m of rest.matchAll(new RegExp(re.source, 'g'))) {
-        out.push({ ...loc, rule, token: m[0], text: snippet });
+    //（`validate_output` 只归 A-2——snake 判据已让开候选集），也不被独立词判据二次命中。
+    let rest = rendered;
+    for (const step of steps) {
+      if (step.kind === 'strip') {
+        rest = rest.replace(new RegExp(step.re.source, 'g'), ' ');
+        continue;
+      }
+      for (const m of rest.matchAll(new RegExp(step.re.source, 'g'))) {
+        out.push({ ...loc, rule: step.rule, token: m[0], text: snippet });
         rest = rest.slice(0, m.index) + ' '.repeat(m[0].length) + rest.slice(m.index + m[0].length);
       }
-    };
-    sweep(STAGE_ID, 'A-2');
-    rest = rest.replace(new RegExp(HYPHEN_TOKEN.source, 'g'), ' ');
-    sweep(SNAKE, 'A-1');
-    sweep(STAGE_WORD, 'A-2');
+    }
   }
   return out;
 }
@@ -550,15 +580,16 @@ describe('文案纪律 · 规则 3：人话句里不夹内部符号（半中半�
     const a2 = findHalfMixed('<div>单元测试结果尚未生成（review 在 test 之前）。</div>', true);
     expect(a2.map((h) => h.token)).toEqual(['review', 'test']);
     expect(a2.every((h) => h.rule === 'A-2')).toBe(true);
-    // 阶段 id 全称同样算（含汉字前提下）
-    expect(findHalfMixed('<p>同步检查 sync-check 不占游标行</p>', true)).toHaveLength(1);
-    // 连词形的三枚阶段 id 在汉字句里必须报得出——HYPHEN_TOKEN 的连词备选
-    //（`(?:review|test|develop|architect)-[\w-]+`）曾把它们整体吃掉（评审实证的遮蔽缺口）
-    for (const id of ['architect-design', 'develop-design', 'test-design'] as const) {
+    // 阶段 / 节点 id 正例**遍历候选集**（决策 412：判据型用例不得只挑代表——上上轮评审
+    // 抓到的漏网正是「正例按实现挑、只剩幸存者」）：5 枚全过、全报 A-2
+    for (const id of STAGE_IDS) {
       const ids = findHalfMixed(`<p>说明：${id} 阶段的产物会落到任务目录。</p>`, true);
       expect(ids.map((h) => h.token), id).toEqual([id]);
       expect(ids[0].rule, id).toBe('A-2');
     }
+    // 连词形阶段 id 在汉字句里必须报得出——连词备选曾把它们整体吃掉（评审实证的遮蔽缺口），
+    // 现由 HYPHEN_TOKEN 显式让开候选集从构造上根治
+    expect(findHalfMixed('<p>同步检查 sync-check 不占游标行</p>', true)).toHaveLength(1);
     // .ts 字符串字面量同样在扫描面
     expect(findHalfMixed("throw new Error('split_task 需要提供拆分方案');", false)).toHaveLength(1);
     // 组件文本型 props 在扫描面：EmptyState 的 next= 与标准属性同类（评审场景 6）
@@ -577,10 +608,12 @@ describe('文案纪律 · 规则 3：人话句里不夹内部符号（半中半�
     expect(findHalfMixed('<div>test-report.md 尚未生成。</div>', true)).toEqual([]);
     // B5 负向排除同样盖住 A-1：带下划线的产物文件名不算 snake_case 内部符号
     expect(findHalfMixed('<div>任务的 test_result.json 还没生成。</div>', true)).toEqual([]);
-    // 阶段 id 形状的产物文件名仍是文件名（FILENAME_EXT 先剔），B5 不因扫描顺序调整而破
-    expect(findHalfMixed('<div>sync-check.md 还没生成。</div>', true)).toEqual([]);
-    expect(findHalfMixed('<div>这是 develop-design.md 的产物。</div>', true)).toEqual([]);
-    // 但裸阶段 id 仍要报——文件名先剔不等于连词备选可以继续吃掉它（遮蔽缺口的正向反面）
+    // 阶段 id 形状的产物文件名仍是文件名（除 FILENAME_EXT 外的判据一律不贴扩展名）——
+    // 负例同样**遍历候选集**，B5 不因步骤顺序调整而破
+    for (const id of STAGE_IDS) {
+      expect(findHalfMixed(`<div>${id}.md 还没生成。</div>`, true), id).toEqual([]);
+    }
+    // 但裸阶段 id 仍要报——文件名形让开不等于裸形也让开（遮蔽缺口的正向反面）
     expect(findHalfMixed('<div>这是 develop-design 的产物。</div>', true)).toHaveLength(1);
     // 掩码徽章（无汉字）
     expect(findHalfMixed('<span class="mono">api_key ***</span>', true)).toEqual([]);
@@ -592,6 +625,64 @@ describe('文案纪律 · 规则 3：人话句里不夹内部符号（半中半�
     expect(findHalfMixed('<span>评审：{task.review_mode}</span>', true)).toEqual([]);
     // 表达式型 prop 同理：字段名（pending_reason）不是文案，花括号连同进段才剥得掉
     expect(findHalfMixed("<MarkdownView source={task.pending_reason?.message ?? '需要你决定。'} />", true)).toEqual([]);
+  });
+
+  it('判据两两不相交：阶段 id 只归 STAGE_ID、文件名形只归 FILENAME_EXT、连词 token 只归 HYPHEN（决策 413）', () => {
+    // RegExp.prototype.test 在 /g 下会推进 lastIndex——一律去掉 flag 再问
+    const matches = (re: RegExp, s: string): boolean => new RegExp(re.source).test(s);
+    const others = (exclude: RegExp): readonly (readonly [string, RegExp])[] =>
+      (
+        [
+          ['STAGE_ID', STAGE_ID],
+          ['HYPHEN_TOKEN', HYPHEN_TOKEN],
+          ['SNAKE', SNAKE],
+          ['STAGE_WORD', STAGE_WORD],
+        ] as const
+      ).filter(([, re]) => re !== exclude);
+    for (const id of STAGE_IDS) {
+      expect(matches(STAGE_ID, id), `STAGE_ID 漏 ${id}`).toBe(true);
+      for (const [name, re] of others(STAGE_ID)) {
+        expect(matches(re, id), `${name} 吃掉候选 ${id}`).toBe(false);
+      }
+      const file = `${id}.md`;
+      expect(matches(FILENAME_EXT, file), `FILENAME_EXT 漏 ${file}`).toBe(true);
+      for (const [name, re] of others(FILENAME_EXT)) {
+        expect(matches(re, file), `${name} 命中文件名 ${file}`).toBe(false);
+      }
+    }
+    // 连词 token 是 HYPHEN 的腹地：独立词与阶段 id 判据不碰
+    expect(matches(HYPHEN_TOKEN, 'review-diff')).toBe(true);
+    expect(matches(STAGE_WORD, 'review-diff')).toBe(false);
+    expect(matches(STAGE_ID, 'review-diff')).toBe(false);
+    // 独立词是 STAGE_WORD 的腹地：其余判据都不碰
+    expect(matches(STAGE_WORD, 'review')).toBe(true);
+    for (const [name, re] of others(STAGE_WORD)) {
+      expect(matches(re, 'review'), `${name} 命中独立词 review`).toBe(false);
+    }
+  });
+
+  it('步骤顺序不改变结果：canonical 序与逆序在同一批探针上全等（顺序只是习惯，不是语义）', () => {
+    const probes: (readonly [string, boolean])[] = [
+      ['<p>以下为 project_analysis 探测到的事实</p>', true],
+      ['<div>单元测试结果尚未生成（review 在 test 之前）。</div>', true],
+      ['<div>这是 develop-design 的产物。</div>', true],
+      ['<div>评审差异（review-diff.diff）尚未生成或不可读。</div>', true],
+      ['<div>test-report.md 尚未生成。</div>', true],
+      ['<div>任务的 test_result.json 还没生成。</div>', true],
+      ["throw new Error('split_task 需要提供拆分方案');", false],
+      ['<EmptyState next="新增一行并填好 secret_token 才能用。" />', true],
+    ];
+    // 候选集逐枚入探针：id 正例形与文件名负例形（决策 412 的遍历在对拍里同样成立）
+    for (const id of STAGE_IDS) {
+      probes.push([`<p>说明：${id} 阶段的产物会落到任务目录。</p>`, true], [`<div>${id}.md 还没生成。</div>`, true]);
+    }
+    const key = (h: HalfMixedHit): string => `${h.rule}:${h.token}:${h.line}`;
+    const reversed: readonly ScanStep[] = [...SCAN_STEPS].reverse();
+    for (const [text, html] of probes) {
+      const base = findHalfMixed(text, html).map(key).sort();
+      const swapped = findMixedIn(text, html, reversed).map(key).sort();
+      expect(swapped, text).toEqual(base);
+    }
   });
 
   it('全站归零：命中全部落在 B 类登记表内（豁免仅经登记表、按 token 逐命中）', () => {

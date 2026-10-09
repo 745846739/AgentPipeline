@@ -732,13 +732,13 @@ dossier / 现场页签读它们），既有门只扫前端时它是整条漏面�
 |---|---|---|
 | 1 | 面向用户的文案里不出现「决策 N」 | 前端：标签间文本、**任意属性值**（含组件文本型 props）、字符串字面量 |
 | 2 | 不出现字面 Markdown 强调 `**…**`（掩码 `***` 是有意设计，天然放过） | 同上 |
-| 3 | **半中半英**：A-1「含汉字 + snake_case 内部符号」；A-2「含汉字 + 阶段 id（`architect-design` / `develop-design` / `test-design` / `sync-check` / `validate_output`）或独立词 `develop` / `review` / `test`」。**逐段逐 token 报告**（一段几枚符号报几条），**豁免按（文件, token）逐命中匹配**；产物文件名（`review-diff.diff` / `test-report.md` / `test_result.json`）在两判据上一致负向放过（B5 由排除承担，见下）。**扫描顺序有牙齿**：带扩展名的文件名先剔，`STAGE_ID` 先于连词剔除扫——连词备选 `(?:review\|test\|develop\|architect)-…` 会把 `develop-design` 这类阶段 id 整体吃掉，先剔则三枚连字符形阶段 id 在汉字句里永远报不出（评审实证的遮蔽缺口，正例钉住） | 同上（渲染近似：表达式连花括号进段、只取其中的字符串字面量——用户看到的是值，`source={task.pending_reason…}` 这类字段名不进文案面） |
+| 3 | **半中半英**：A-1「含汉字 + snake_case 内部符号」；A-2「含汉字 + 阶段 id（`architect-design` / `develop-design` / `test-design` / `sync-check` / `validate_output`）或独立词 `develop` / `review` / `test`」。**逐段逐 token 报告**（一段几枚符号报几条），**豁免按（文件, token）逐命中匹配**；产物文件名（`review-diff.diff` / `test-report.md` / `test_result.json`）在两判据上一致负向放过（B5 由排除承担，见下）。**判据两两不相交、步骤顺序不改变结果**（决策 413）：候选集 `STAGE_IDS` 单一事实源（正 / 负例遍历同一数组），连词 token 显式让开它（否则 `develop-design` 这类阶段 id 会被连词备选整体吃掉——评审实证的遮蔽缺口）、除文件名剔除外的判据一律不贴扩展名、独立词不接 `-`、snake 让开候选集；对拍用例钉「canonical 序 = 逆序」，顺序从「有牙齿」变成习惯 | 同上（渲染近似：表达式连花括号进段、只取其中的字符串字面量——用户看到的是值，`source={task.pending_reason…}` 这类字段名不进文案面） |
 | 4 | 后端**三类构造形态**的字符串字面量里不出现「决策 N / 票 N」——① `ApiError::…("…")` / `Error::…("…")` / `error: Some("…")` ② `test_blockers` 类载荷 push ③ **流转原因载荷**（`reason = Some(…)` 赋值与 `insert_transition(…, Some("…"))` 实参，`kickback_reason(…)` 包一层按窗内首字面量提取）。**落库渲染字段（流转原因）的归口就是③**：reason 落 `kanban_transitions` 后由 `TimelineView.svelte` 原文渲染，是页面文案——评审场景 5 的漏网（`resume.rs` 的 `（决策 116）`）即由它拦。`tracing::` 日志、`#[test]` 断言消息、system prompt、CLI `--help` 不在形态内（口径用例钉住，防规则烂成误报；**整库搜改是红线**，门与改法同源同口径） | `crates/**/*.rs`（`tests/` / `benches/` 目录除外） |
 
 **B 类边界登记表**（规则 3 的豁免，门内 `EXEMPTIONS` 常量）：B1 键名标签与键名校验 /
 B2 动作句键名引用 / B3 域词表词（词表收录的工具名等）/ B4 mono 读数徽章；
-**B5 产物文件名不进登记表**——`FILENAME_EXT`（带扩展名，先剔）与 `HYPHEN_TOKEN`（连词 token，
-在 `STAGE_ID` 扫描之后剔，否则吃掉阶段 id）在 A-1 / A-2 两条判据上一致剔除产物文件名，
+**B5 产物文件名不进登记表**——`FILENAME_EXT`（带扩展名）与 `HYPHEN_TOKEN`（连词 token，
+显式让开阶段 id 候选集）在 A-1 / A-2 两条判据上一致剔除产物文件名，
 登记表不收行使不到的死条目（评审「B5 死条目」的归宿）。
 每条 = 位置 + **命中的 token** + B 类编号 + 一句理由；豁免按（文件, token）**逐命中匹配**
 （段级 `text.includes` 会让同段的豁免符号掩蔽真违例——评审实证的缺口）；
