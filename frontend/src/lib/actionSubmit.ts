@@ -51,9 +51,9 @@ export async function submitAllowedAction(
       await cancelTask(taskId);
       return;
     case '/split':
-      throw new Error('split_task 需要提供拆分方案（请用拆分对话框）');
+      throw new Error('拆分任务需要提供拆分方案（请用拆分对话框）');
     case '/model-override':
-      throw new Error('model_override 需要选择 provider（请用换模型对话框）');
+      throw new Error('切换模型需要选择 provider（请用换模型对话框）');
     case '/review': {
       // human_review 下 approve / reject 共用 /review，以动作名区分结论（决策 23）
       await reviewTask(taskId, action.action === 'approve', options.input);

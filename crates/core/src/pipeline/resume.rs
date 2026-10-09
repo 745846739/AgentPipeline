@@ -82,7 +82,7 @@ pub async fn apply_resume(
     let cursor = match request.cursor_id.as_deref() {
         Some(cursor_id) => store.get_cursor(cursor_id).await?,
         None => store.resolve_sole_cursor(task_id).await?.ok_or_else(|| {
-            Error::Conflict("该任务有多条活跃游标，必须显式提供 cursor_id（决策 91）".into())
+            Error::Conflict("该任务有多条活跃游标，必须显式提供 cursor_id".into())
         })?,
     };
     if cursor.task_id != task_id {
@@ -198,7 +198,7 @@ pub async fn apply_action(
                     }
                     StageLanding::Terminal => {
                         return Err(Error::Cursor(format!(
-                            "阶段 {} 没有下一阶段，judge_disagreement continue 无处放行（决策 135）",
+                            "阶段 {} 没有下一阶段，judge_disagreement continue 无处放行",
                             cursor.stage
                         )));
                     }
@@ -216,9 +216,7 @@ pub async fn apply_action(
                 } else {
                     ignored.join("、")
                 };
-                reason = Some(format!(
-                    "dependency_overridden：忽略失败依赖 {detail}（决策 116）"
-                ));
+                reason = Some(format!("dependency_overridden：忽略失败依赖 {detail}"));
                 let advanced = advance_one(store, cursor, Landing::Stay, &reason).await?;
                 store
                     .set_task_status(task_id, crate::types::TaskStatus::Queued)
@@ -270,10 +268,7 @@ pub async fn apply_action(
                 advance_one(store, cursor, Landing::Entry(stage, node), &reason).await?
             }
             SkipLanding::Forbidden => {
-                return Err(Error::Validation(format!(
-                    "阶段 {} 无 skip（决策 86）",
-                    cursor.stage
-                )));
+                return Err(Error::Validation(format!("阶段 {} 无 skip", cursor.stage)));
             }
         },
         ResumeAction::Goto => {
@@ -293,7 +288,7 @@ pub async fn apply_action(
             } else {
                 if stage == Stage::SyncCheck {
                     return Err(Error::Validation(
-                        "sync-check 不占游标行，不能作为 goto 目标（决策 107）".into(),
+                        "sync-check 不占游标行，不能作为 goto 目标".into(),
                     ));
                 }
                 // 决策 69：goto 落点 = entry_node(stage)。任意节点（如 merge.validate_input、
@@ -301,7 +296,7 @@ pub async fn apply_action(
                 let expected = entry_node(stage);
                 if node != expected || !stage_has_node(stage, node) {
                     return Err(Error::Validation(format!(
-                        "goto 落点必须是 {stage} 的入口节点 {expected}（决策 69）"
+                        "goto 落点必须是 {stage} 的入口节点 {expected}"
                     )));
                 }
                 // 决策 138：develop / test 的 retry_exhausted 走「带失败摘要回架构设计修订」时，

@@ -42,7 +42,7 @@ test.describe('前端 E2E ⑥：人工评审与返回修改', () => {
       await settleBundle(page, bundle);
 
       // 人工评审面板：预审报告 + diff 都可见（单测报告在 review 之前属正常缺省）
-      await expect(page.getByText('人工评审（review_mode = human）')).toBeVisible();
+      await expect(page.locator('.reviewform .title').first()).toHaveText('人工评审');
       await expect(page.getByText('agent 预审报告')).toBeVisible();
       await expect(page.locator('.reviewform')).toContainText('评审报告');
 

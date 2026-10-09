@@ -326,7 +326,7 @@
     {:else}
       <section class="analysis">
         <div class="running">
-          <span class="st run">分析中</span>正在触发 project_analysis 伪阶段…
+          <span class="st run">分析中</span>正在运行项目分析，稍候…
         </div>
       </section>
     {/if}

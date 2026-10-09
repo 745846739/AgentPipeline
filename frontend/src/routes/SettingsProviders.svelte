@@ -120,7 +120,7 @@
   </div>
 
   <p class="hintline">
-    provider 行 =（vendor, model, context_window）。api_key 明文存储，读接口只回显 <b>{API_KEY_MASK}</b>；
+    每行一个 provider，写明厂商、模型与上下文窗口。密钥明文存储，读接口只回显 <b>{API_KEY_MASK}</b>；
     密钥明文存于本机 <b>~/.agentpipeline</b>，目录权限 <b>0700</b>。
   </p>
 
@@ -151,7 +151,7 @@
     <div class="banner">
       <EmptyState
         state="还没有 provider。"
-        next="新增一行并填好 model 与 api_key，任务的阶段模型才会被解析。"
+        next="新增一行并填好模型与密钥两栏，任务的阶段模型才会被解析。"
         href="#/settings/projects"
         linkLabel="下一步：设置 · 项目"
       />
@@ -179,7 +179,7 @@
                   <!-- 决策 199 的定稿文案：正文只说动作与后果，编号不进正文（追溯见
                        design/frontend-design.md §12.3 的行为映射表）。title 放理由、不夹编号
                        ——`lib/copy-discipline.test.ts` 对 title 与模板文本一视同仁。 -->
-                  <span class="warnnote inline" title="厂商不在支持列表（supported_adapters）内">
+                  <span class="warnnote inline" title="厂商不在支持列表内">
                     ! 不支持这个厂商，该行已停用
                   </span>
                 {/if}
@@ -191,7 +191,7 @@
               </div>
               {#if !supported}
                 <div class="warnnote">
-                  该厂商不在 supported_adapters 内：此行走降级灰显，被 stage_configs 引用时配置加载会拒绝启动。
+                  该厂商已不在支持列表内：这一行会变灰停用，被阶段配置引用时配置加载会拒绝启动。
                 </div>
               {/if}
               {#if rowError?.id === p.id}<div class="reg-err">{rowError.message}</div>{/if}

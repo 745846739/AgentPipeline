@@ -3198,6 +3198,23 @@ config.rs}`、`tests/e2e/tests/integration/stage_boundary.rs`、`docs/testing.md
 
 **来源**：任务 `01M4CD59Y977ZQ0GMY9MPSFFMX` 两轮评审复盘 + 会话拷问（grilling 十条裁决）；落地 `crates/core/src/{types.rs, pipeline/model_invoke.rs, pipeline/model_request.rs}`、`docs/testing.md`
 
+### 决策 413 · 文案纪律规则 3 拔掉「扫描顺序有牙齿」：判据两两不相交 + 候选集单一事实源
+
+**起因**：决策 412 的收尾欠账。grill 第二轮已裁 Q3=C（收窄文件名剔除与 `STAGE_ID` 使两集合不相交 → 顺序无关）与 Q4=A（候选集单一事实源），但任务第三轮的修复（`3459932`）只做了 Q3=B——把 `STAGE_ID` 挪到连词剔除**之前**，用顺序保证正确：`frontend-design.md` §12.1 的「扫描顺序有牙齿」成了现势约束，下一次重排就是下一次回归（412 起因段的事故形态重演）；且 `STAGE_ID` 仍是手写正则字面量、口径正例只枚举了 5 枚候选中的 3 枚（`validate_output` 连正例都没有）——「按实现挑代表」的病根还在。
+
+**裁决**：
+
+1. **候选集单一事实源**：`STAGE_IDS` 数组构造 `STAGE_ID`，并进入连词 / snake 判据的让开名单；口径正例与文件名负例**遍历同一数组**（决策 412⑤ 的 testing.md 不变量由「改动判据型规则」激活——本条就是那次改动）。
+2. **五判据两两不相交（顺序无关的充分条件）**：连词 token 显式让开候选集（`develop-design` 不再可能被吃掉）；除 `FILENAME_EXT` 外的判据一律不贴扩展名（`sync-check.md` 整体归文件名）；独立词不接 `-`（`test-report` 的 `test` 归连词腹地）；snake 让开候选集（`validate_output` 归 A-2）与 `-` 后腹地。guard 挂在**判据自身**，不靠步骤顺序。
+3. **步骤表化 + 对拍**：`findHalfMixed` 的五步提成 `SCAN_STEPS` 步骤表，canonical 序只是习惯；用例以**逆序**跑同一批探针（候选集逐枚入探针），断言结果全等——顺序从语义降级为风格，「重排即回归」不再可能。
+4. **现势记档同步**：`frontend-design.md` §12.1 规则 3 行与 B5 段的「扫描顺序有牙齿 / 在 `STAGE_ID` 扫描之后剔」改写为「判据不相交」；决策 412 起因段是历史、`types.rs::REVIEW_REWORK_DISCIPLINE` 的立项实证是历史叙述，append-only 照旧不动。
+
+**验证**：新增 L1 两枚——「判据两两不相交」（候选集 × 其余判据、文件名形 × 全部判据逐对断言）与「canonical 序 = 逆序」对拍；既有口径正 / 负例改为遍历 `STAGE_IDS`（5 枚全过、全报 A-2）；`全站归零` / `登记表活性` 两枚既有全站用例不改一字而绿（guard 若误伤真文案它们先红）。前端 vitest 全量。
+
+**范围**：只动 `frontend/src/lib/copy-discipline.test.ts`（判据与用例同文件——门本来就长在测试里）、`design/frontend-design.md` 两处记档与本条；不动后端、不动 testing.md、豁免登记表 19 条一字未动。本次重构按决策 412① 在提交信息里显式声明，既有行为的回归用例即上述对拍与遍历。
+
+**来源**：grill-me 第二轮 Q3=C / Q4=A（用户「同意」）；决策 412 的红线与测试不变量；落地 `frontend/src/lib/copy-discipline.test.ts`、`design/frontend-design.md`
+
 ### 决策 414 · 五条收场尾句都按实际产出说话：产出注记（提议数 ∪ 改动文件数）+ 在打转两态（票 `foreman-work-record` 02）
 
 **起因**：决策 311「收场文案按实际提议数说话」只接了五条收场尾句的**第三条**（人按停），其余四条连提议数都不提；而 2026-10-08 实账里最贵的两句谎（394 / 405 逐字相同的「要接着查可以让我再来一轮（换个线索）」）恰恰出自「在打转」那条——那两轮**改了二十余处文件**，用户在 394 之前刚说过「直接改完啊」。把修复轮说成研究轮，是收口句对「本轮干了什么」的断言缺了改动文件这一个来源（决策 411 补的正是它）。

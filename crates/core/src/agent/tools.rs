@@ -965,7 +965,7 @@ impl ToolExecutor {
             }
             GateDecision::Propose => self.propose(call, ctx).await.map(Some),
             GateDecision::Refuse => Err(Error::Validation(format!(
-                "工具 {} 被 deny 档挡下（决策 206）：这个阶段的环境层权限已收到底，\
+                "工具 {} 被 deny 档挡下：这个阶段的环境层权限已收到底，\
                  文件、命令与技能拉取都不执行",
                 call.name
             ))),
@@ -1125,7 +1125,7 @@ impl ToolExecutor {
         let Some(sink) = &self.proposals else {
             // 不注入不放行：接上确认钮之前，需要人按键的动作只能被拒。
             return Err(Error::Validation(format!(
-                "工具 {} 需要值班经理按键确认，但本次运行没有接上提议通道（决策 188）\
+                "工具 {} 需要值班经理按键确认，但本次运行没有接上提议通道\
                  ——动作没有执行，也没有留下提议",
                 call.name
             )));
@@ -2591,7 +2591,7 @@ impl ToolExecutor {
                 .await?;
             }
             return Err(Error::PolicyDenied(format!(
-                "run_command 在 {} 阶段被禁用（决策 396）：本阶段的工作不需要执行命令，\
+                "run_command 在 {} 阶段被禁用：本阶段的工作不需要执行命令，\
                  请用 read_file / write_file / submit_metadata 完成收口。",
                 ctx.stage
             )));

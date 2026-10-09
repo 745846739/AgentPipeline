@@ -1088,9 +1088,7 @@ impl Executor {
             (Stage::Done, Node::Execute) => self.done_execute(task, cursor).await,
             (Stage::SyncCheck, Node::Execute) => {
                 // join 由 advance_join 统一执行（决策 107），游标永远不该指向这里
-                Err(Error::Validation(
-                    "sync-check 不占游标行（决策 107）".into(),
-                ))
+                Err(Error::Validation("sync-check 不占游标行".into()))
             }
             (Stage::Merge, Node::Execute) => self.merge().execute(task, cursor).await,
 
@@ -1803,9 +1801,8 @@ impl Executor {
                             .collect();
                         if refs.is_empty() || !dangling.is_empty() {
                             let name = s.get("name").and_then(|n| n.as_str()).unwrap_or("场景");
-                            test_blockers.push(format!(
-                                "high 场景「{name}」的 design_refs 缺失或悬空（决策 136）"
-                            ));
+                            test_blockers
+                                .push(format!("high 场景「{name}」的 design_refs 缺失或悬空"));
                         }
                     } else {
                         // medium/low：引用缺失仅 warning（决策 136）
@@ -2102,7 +2099,7 @@ impl Executor {
                                     Some((cursor.stage, cursor.node)),
                                     (Stage::DevelopDesign, Node::ValidateInput),
                                     crate::types::TransitionTrigger::Normal,
-                                    Some("游标分裂（决策 90）"),
+                                    Some("游标分裂"),
                                 )
                                 .await?;
                             for branch in [
@@ -2198,10 +2195,7 @@ impl Executor {
                         (Stage::Test, Node::Execute),
                         crate::types::TransitionTrigger::Kickback,
                         Some(
-                            kickback_reason(
-                                "merge 测试闸门失败，跳回 test.execute 复检（决策 85）",
-                            )
-                            .as_str(),
+                            kickback_reason("merge 测试闸门失败，跳回 test.execute 复检").as_str(),
                         ),
                     )
                     .await?;
@@ -2789,9 +2783,7 @@ fn sync_metadata_gaps(
         );
     }
     if !meta_has_key(test_meta, "test_scenarios") {
-        gaps.push(
-            "test-design 元数据缺 test_scenarios：引用完整性校验（决策 136）被整段跳过".into(),
-        );
+        gaps.push("test-design 元数据缺 test_scenarios：引用完整性校验被整段跳过".into());
     }
     gaps
 }

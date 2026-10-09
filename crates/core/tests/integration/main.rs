@@ -14,6 +14,7 @@
 
 mod command_funnel;
 mod conversation_archive;
+mod copy_payloads;
 mod cursor_lifecycle;
 mod egress;
 mod env_mode;

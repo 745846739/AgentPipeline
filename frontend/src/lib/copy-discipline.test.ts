@@ -21,8 +21,39 @@
  * 第二条规则（ux-audit-3 票 08）：同一张扫描面、同一条边界，再钉「面向用户的文案里
  * 不出现字面 Markdown 强调星号 `**…**`」——设置两页走查当场的唯一新问题，剥注释后
  * 全站实测恰 4 处。判据天然放过掩码 `***`（`NOTIFY_SECRET_MASK`，有意设计）。
+ *
+ * 第三条规则（本票扩面，决策 199 的落地）：**半中半英**——A-1「含汉字 + snake_case 内部符号」、
+ * A-2「含汉字 + 阶段 id（`architect-design` / `develop-design` / `test-design` / `sync-check` /
+ * `validate_output`）或独立词 `develop|review|test`」。既有两条规则管不到这类（它们不含「决策 N」）；
+ * 扫描面是标签间文本 + **任意属性值**（组件文本型 props——`state=` / `next=` / `linkLabel=` 这类
+ * 渲染成屏上正文的 prop 与标准属性是同一种文案，按名字白名单堵会留下「注进门不变红」的面，
+ * 评审场景 6 实证）+ 字符串字面量。**逐段逐 token 报告、豁免按 token 逐命中匹配**（段级匹配会让
+ * 同段的豁免符号掩蔽真违例，评审实证的缺口）。产物文件名（`review-diff.diff` / `test-report.md`
+ * / `test_result.json`）在 A-1 / A-2 两条判据上**一致负向放过**（B5 边界由排除本身承担，
+ * 登记表不留行使不到的死条目）。
+ *
+ * 第四条规则（同一张扩面的后端半边）：**API 报文与落库渲染字段也是页面文案**（toast /
+ * `.reg-err` / dossier / 现场页签 / TimelineView 读它们），而既有门只扫 `frontend/src`。规则 4 只扫
+ * **三类构造形态**的字符串字面量——① `ApiError::…("…")` / `Error::…("…")` / `error: Some("…")`
+ * ② `test_blockers` 类载荷 push ③ **流转原因载荷**（`reason = Some(…)` 赋值与
+ * `insert_transition(…, Some("…"))` 实参——reason 落 `kanban_transitions` 后由 TimelineView 原文渲染，
+ * 评审场景 5 实证：resume.rs 的 `（决策 116）` 正是从这个缺口溜过的）。
+ * `tracing::` 日志、`#[test]` 断言消息、system prompt、CLI `--help` 不在形态内（口径用例钉住，
+ * 防规则烂成误报）。**整库搜改是红线**，门与改法同源同口径。
+ *
+ * **B 类边界登记表**（规则 3 的豁免，只收 B 类、不收「暂时不想改」）：
+ * B1 键名标签与键名校验 / B2 动作句键名引用 / B3 域词表词（词表收录的工具名等）/
+ * B4 mono 读数徽章 / B5 产物文件名作对照（**不由登记表承担**：`FILENAME_EXT` /
+ * `HYPHEN_TOKEN` 两形态在 A-1 / A-2 两判据上一致剔除产物文件名——五判据两两不相交
+ * （连词 token 显式让开阶段 id 候选集），剔与扫谁先谁后都不改变结果，登记表不收
+ * 行使不到的死条目）。
+ * 条目数入断言，
+ * 每条另有活性断言，让「悄悄烂掉」可见。
+ *
+ * **判别问句**（登记表每条理由都是它的答案）：删掉这个符号，这句话还说清会发生什么、
+ * 你该做什么吗？说得清 → 摘；说不清 → 留（B 类，进登记表）但同句要有人话。
  */
-import { readFileSync, readdirSync, statSync } from 'node:fs';
+import { existsSync, readFileSync, readdirSync, statSync } from 'node:fs';
 import { join, relative, resolve } from 'node:path';
 import { describe, expect, it } from 'vitest';
 
@@ -211,5 +242,629 @@ describe('文案纪律 · 面向用户的文案里不出现字面 Markdown 强�
     expect(hits[0].snippet).toContain('保存的是**整体覆盖**');
     // .ts 字符串字面量同样算（不是只有模板才报）
     expect(findLiteralStars("note('闸门**不改写**')", false)).toHaveLength(1);
+  });
+});
+
+/* ══════════════════════ 规则 3：前端半中半英（A-1 / A-2）══════════════════════ */
+
+/** 汉字判据：段内有汉字才可能是「人话句里夹符号」（纯英文键名标签天然放过）。 */
+const HAN = /\p{Script=Han}/u;
+
+/**
+ * A-2 阶段 / 节点 id **候选集**——判据正则与口径用例共用这一份（决策 412「判据型用例
+ * 遍历候选集」）：新增阶段 id 只改这里，`STAGE_ID` 与正 / 负例自动跟着走。
+ */
+const STAGE_IDS = ['architect-design', 'develop-design', 'test-design', 'sync-check', 'validate_output'] as const;
+const STAGE_ID_ALT = STAGE_IDS.join('|');
+
+/** 后接 `.扩展名` 就是产物文件名的一半（B5）——除 `FILENAME_EXT` 外的判据一律让开，
+ *  「扫谁」与「剔谁」才两两不相交、步骤先后不改变结果。 */
+const NOT_FILENAME = '(?!\\.[A-Za-z0-9])';
+
+/** A-1：snake_case 内部符号（小写字母开头、至少一段 `_`）——不接在 `-` 后（连词 token 的腹地，
+ *  让给 `HYPHEN_TOKEN`）、不与候选集相交（`validate_output` 归 A-2 阶段 id）、不贴扩展名。 */
+const SNAKE = new RegExp(`\\b(?<!-)(?!${STAGE_ID_ALT}\\b)[a-z][a-z0-9]*(?:_[a-z0-9]+)+\\b${NOT_FILENAME}`);
+/** A-2：阶段 / 节点 id 全称——候选集构造；不匹配 `sync-check.md` 这类文件名的前半（让给 `FILENAME_EXT`）。 */
+const STAGE_ID = new RegExp(`\\b(?:${STAGE_ID_ALT})\\b${NOT_FILENAME}`);
+/** A-2：独立词形态的阶段名——不接 `-`（`test-report` 的 `test` 是连词 token 的腹地）、不贴扩展名。 */
+const STAGE_WORD = new RegExp(`\\b(?:develop|review|test)\\b(?!-)${NOT_FILENAME}`);
+/** A-2 负向排除（B5，形态一）：带扩展名的产物文件名——`sync-check.md` 这类
+ *  「阶段 id 形状的文件名」整体是文件名（B5 对照物），不是阶段 id。 */
+const FILENAME_EXT =
+  /\b[\w-]+\.(?:diff|md|log|json|txt|ts|js|yaml|yml|toml|html|css|png|svg)\b/g;
+/** A-2 负向排除（B5，形态二）：连词 token（`review-diff` / `stage-name` 连写）——连词备选
+ *  `(?:review|test|develop|architect)-[\w-]+` 与 `*-design` 形阶段 id 相交，**显式让开候选集**
+ *  （不相交则 `develop-design` 会被整体吃掉——评审实证的遮蔽缺口）。 */
+const HYPHEN_TOKEN = new RegExp(`\\b(?!${STAGE_ID_ALT})(?:review|test|develop|architect)-[\\w-]+\\b${NOT_FILENAME}`, 'g');
+
+interface CopySegment {
+  /** 段文本（注释已剥）。 */
+  readonly seg: string;
+  /** 段在原文中的字节偏移（maskComments 等长，行号可回对原文）。 */
+  readonly offset: number;
+}
+
+/**
+ * 渲染近似：用户看到的是**值**不是表达式——字面段照留，`{…}` / `${…}` 表达式只取其中的
+ * 字符串字面量（`base_url {x ?? '默认'}` 渲染出 `默认`，`评审：{task.review_mode}`
+ * 渲染出的是值、不带字段名）。这样 `评审：{task.review_mode}` 不误报、
+ * `base_url 默认` 这类徽章如实报。
+ */
+function renderedApprox(seg: string): string {
+  let out = '';
+  let depth = 0;
+  let cur = '';
+  for (let i = 0; i < seg.length; i++) {
+    const c = seg[i];
+    if (c === '{' || (c === '$' && seg[i + 1] === '{')) {
+      if (depth === 0) {
+        out += cur;
+        cur = '';
+      }
+      if (c === '$') i++;
+      depth++;
+      continue;
+    }
+    if (depth > 0 && c === '}') {
+      depth--;
+      if (depth === 0) {
+        for (const sm of cur.matchAll(/'([^']*)'|"([^"]*)"/g)) out += `${sm[1] ?? ''}${sm[2] ?? ''}`;
+        cur = '';
+      }
+      continue;
+    }
+    if (depth > 0) cur += c;
+    else out += c;
+  }
+  // 不平衡兜底：同样只取表达式里的字符串字面量（不把裸代码当文案）
+  if (depth > 0) for (const sm of cur.matchAll(/'([^']*)'|"([^"]*)"/g)) out += `${sm[1] ?? ''}${sm[2] ?? ''}`;
+  return out;
+}
+
+/**
+ * 从（已剥注释的）源码里提取字符串字面量段。
+ * 单/双引号遇到换行即判未闭合（防孤立 `'` 吞掉大段代码）；模板字面量允许跨行，
+ * 且按 `${…}` 深度配平——嵌套反引号（`… ${f ? 'a' : `b${x}`}`）整段算一个模板。
+ */
+function extractStringLiterals(masked: string, out: CopySegment[], base = 0): void {
+  let i = 0;
+  while (i < masked.length) {
+    const c = masked[i];
+    if (c === "'" || c === '"') {
+      const start = i;
+      let j = i + 1;
+      while (j < masked.length && masked[j] !== c && masked[j] !== '\n') {
+        if (masked[j] === '\\') j++;
+        j++;
+      }
+      if (j < masked.length && masked[j] === c) {
+        out.push({ seg: masked.slice(start + 1, j), offset: base + start + 1 });
+        i = j + 1;
+      } else {
+        i = start + 1; // 未闭合：跳过这枚引号，不当段
+      }
+      continue;
+    }
+    if (c === '`') {
+      const start = i;
+      let j = i + 1;
+      let depth = 0;
+      while (j < masked.length) {
+        if (masked[j] === '\\') {
+          j += 2;
+          continue;
+        }
+        if (masked[j] === '$' && masked[j + 1] === '{') {
+          depth++;
+          j += 2;
+          continue;
+        }
+        if (depth > 0 && masked[j] === '}') {
+          depth--;
+          j++;
+          continue;
+        }
+        if (depth === 0 && masked[j] === '`') break;
+        j++;
+      }
+      if (j < masked.length) {
+        out.push({ seg: masked.slice(start + 1, j), offset: base + start + 1 });
+        i = j + 1;
+      } else {
+        i = start + 1;
+      }
+      continue;
+    }
+    i++;
+  }
+}
+
+/**
+ * 提取一份源码里**面向用户的 copy 段**（注释已剥）：
+ * `.svelte` = 标签间文本 + **任意属性值**（标准属性与组件文本型 props 同类，见 `attrRe`）
+ * + script 内字符串（`<style>` 不进扫描面）；`.ts` = 字符串与模板字面量。
+ */
+function extractCopySegments(text: string, html: boolean): { masked: string; segments: CopySegment[] } {
+  const masked = maskComments(text, html);
+  const segments: CopySegment[] = [];
+  if (!html) {
+    extractStringLiterals(masked, segments);
+    return { masked, segments };
+  }
+  const blockRe = /(<script[^>]*>[\s\S]*?<\/script>)|(<style[^>]*>[\s\S]*?<\/style>)/g;
+  const blocks = [...masked.matchAll(blockRe)].map((m) => ({
+    start: m.index,
+    end: m.index + m[0].length,
+    script: !!m[1],
+  }));
+  const blockAt = (i: number) => blocks.find((b) => i >= b.start && i < b.end);
+  // 标签间文本（跳过 script / style 区间）
+  let inTag = false;
+  let buf = '';
+  let bufStart = 0;
+  let wasSkip = false;
+  for (let i = 0; i < masked.length; i++) {
+    const b = blockAt(i);
+    if (b) {
+      if (buf.trim()) segments.push({ seg: buf, offset: bufStart });
+      buf = '';
+      wasSkip = true;
+      continue;
+    }
+    if (wasSkip) {
+      wasSkip = false;
+      bufStart = i;
+    }
+    const c = masked[i];
+    if (c === '<') {
+      if (buf.trim()) segments.push({ seg: buf, offset: bufStart });
+      buf = '';
+      inTag = true;
+      continue;
+    }
+    if (c === '>' && inTag) {
+      inTag = false;
+      bufStart = i + 1;
+      continue;
+    }
+    if (!inTag) {
+      if (!buf) bufStart = i;
+      buf += c;
+    }
+  }
+  if (buf.trim()) segments.push({ seg: buf, offset: bufStart });
+  // 任意属性值（引号值与 {...} 表达式值）——**组件文本型 props**（`state=` / `next=` /
+  // `linkLabel=` 这类渲染成屏上正文的 prop）与标准属性是同一种文案；按名字白名单只堵
+  // 已知名字，新组件的文本 prop 注入门不会变红（评审场景 6 实证）。名字侧排除空白与
+  // `"'=<>/{}，避免把标签间文本里的 `x = "…"` 误当属性。
+  const attrRe = /[^\s"'=<>/{}]+\s*=\s*(?:"([^"]*)"|\{([^{}]*)\}|'([^']*)')/g;
+  for (const m of masked.matchAll(attrRe)) {
+    if (blockAt(m.index)) continue;
+    // `{…}` 表达式值**连花括号一起进段**：renderedApprox 靠花括号把表达式剥掉、只留其中的
+    // 字符串字面量——直接推进裸表达式会把 `source={task.pending_reason?.message ?? '需要…'}`
+    // 里的字段名当成文案（评审后补的实证假阳性）；值本身是字面量时照样如实报。
+    const raw = m[1] ?? m[3];
+    segments.push({ seg: raw !== undefined ? raw : `{${m[2]}}`, offset: m.index });
+  }
+  // script 内的字符串
+  for (const b of blocks) {
+    if (b.script) extractStringLiterals(masked.slice(b.start, b.end), segments, b.start);
+  }
+  return { masked, segments };
+}
+
+export interface HalfMixedHit {
+  /** 1 起的行号。 */
+  readonly line: number;
+  /** 命中哪条判据。 */
+  readonly rule: 'A-1' | 'A-2';
+  /** 命中的符号。 */
+  readonly token: string;
+  /** 渲染近似文本（截断，供登记表匹配与定位）。 */
+  readonly text: string;
+}
+
+/** 扫描步骤：剔（等长挖空、不报）与扫（挖空并报一条）。判据两两不相交，**先后不改变结果**
+ * （对拍用例钉「原序 = 逆序」）——canonical 顺序只是「先剔明显不是文案的、再逐判据扫」的习惯。 */
+type ScanStep =
+  | { readonly kind: 'strip'; readonly re: RegExp }
+  | { readonly kind: 'sweep'; readonly re: RegExp; readonly rule: 'A-1' | 'A-2' };
+
+const SCAN_STEPS: readonly ScanStep[] = [
+  { kind: 'strip', re: FILENAME_EXT },
+  { kind: 'sweep', re: STAGE_ID, rule: 'A-2' },
+  { kind: 'strip', re: HYPHEN_TOKEN },
+  { kind: 'sweep', re: SNAKE, rule: 'A-1' },
+  { kind: 'sweep', re: STAGE_WORD, rule: 'A-2' },
+];
+
+/**
+ * 在一份源码里找「人话句里夹内部符号」（注释已剥）——**逐段、逐 token** 报告：
+ * 一段里有几枚符号就报几条（段级「只报首个命中」会让第二枚符号无人看，评审实证的缺口），
+ * 豁免才能按 token 逐命中比对。
+ *
+ * **判据两两不相交，步骤顺序不改变结果**（对拍用例钉「原序 = 逆序」）：候选集（`STAGE_IDS`）
+ * 是单一事实源——连词 token 显式让开它（否则 `develop-design` 这类 id 会被连词备选整体吃掉，
+ * 评审实证的遮蔽缺口），除 `FILENAME_EXT` 外的判据都不贴扩展名（`sync-check.md` 整体归文件名），
+ * 独立词不接 `-`，snake 让开候选集与连词腹地。顺序从「有牙齿」变成「习惯」，正是这批 guard
+ * 换来的：谁先谁后结果一致（决策 413）。
+ */
+export function findHalfMixed(text: string, html: boolean): HalfMixedHit[] {
+  return findMixedIn(text, html, SCAN_STEPS);
+}
+
+/** 按给定步骤表跑一遍——对拍用例以逆序调用，钉住「顺序不改变结果」这条不变量。 */
+function findMixedIn(text: string, html: boolean, steps: readonly ScanStep[]): HalfMixedHit[] {
+  const { masked, segments } = extractCopySegments(text, html);
+  const out: HalfMixedHit[] = [];
+  for (const { seg, offset } of segments) {
+    const rendered = renderedApprox(seg);
+    if (!HAN.test(rendered)) continue;
+    const loc = lineOf(masked, offset);
+    const snippet = rendered.trim().slice(0, 110);
+    // 命中即把该区间挖空（等长替换，偏移不漂）：同一符号不跨判据重复报
+    //（`validate_output` 只归 A-2——snake 判据已让开候选集），也不被独立词判据二次命中。
+    let rest = rendered;
+    for (const step of steps) {
+      if (step.kind === 'strip') {
+        rest = rest.replace(new RegExp(step.re.source, 'g'), ' ');
+        continue;
+      }
+      for (const m of rest.matchAll(new RegExp(step.re.source, 'g'))) {
+        out.push({ ...loc, rule: step.rule, token: m[0], text: snippet });
+        rest = rest.slice(0, m.index) + ' '.repeat(m[0].length) + rest.slice(m.index + m[0].length);
+      }
+    }
+  }
+  return out;
+}
+
+function lineOf(masked: string, offset: number): { line: number } {
+  return { line: masked.slice(0, offset).split('\n').length };
+}
+
+/**
+ * B 类豁免登记表——**只收 B1–B4，不收「暂时不想改」**。
+ * 每条 = 位置（相对 `src/` 的文件）+ 命中的 token + B 类编号 + 一句理由
+ * （理由即判别问句的答案）。条目数入断言（见规则 3 的用例），改了文案导致条目失效同样会红；
+ * 另有「每条都被行使」的活性断言——登记表不收行使不到的死条目
+ * （B5 产物文件名由 `FILENAME_EXT` / `HYPHEN_TOKEN` 在 A-1 / A-2 两判据的一致负向排除承担，
+ * 不在此表）。
+ */
+interface CopyExemption {
+  readonly file: string;
+  readonly match: string;
+  readonly boundary: 'B1' | 'B2' | 'B3' | 'B4';
+  readonly reason: string;
+}
+
+const EXEMPTIONS: readonly CopyExemption[] = [
+  // B1 键名标签与键名校验：键名即「在填哪一项 / 哪个键不合格」，摘掉说不清
+  { file: 'components/settings/ProjectForm.svelte', match: 'local_path', boundary: 'B1', reason: '表单键名标签：标签主体就是配置键，键名即「在填哪一项」。' },
+  { file: 'components/settings/ProviderForm.svelte', match: 'context_window', boundary: 'B1', reason: '表单键名标签：键名与输入框一一对应，摘掉悬空。' },
+  { file: 'components/settings/ProviderForm.svelte', match: 'base_url', boundary: 'B1', reason: '表单键名标签：可选项说明挂在键名后，键名是主语。' },
+  { file: 'components/settings/StageConfigForm.svelte', match: 'provider_id', boundary: 'B1', reason: '表单键名标签：留空 / 填写规则直接挂在键名后。' },
+  { file: 'components/settings/StageConfigForm.svelte', match: 'persona_path', boundary: 'B1', reason: '表单键名标签：路径格式要求挂在键名后，摘键名不知指哪项。' },
+  { file: 'components/settings/StageConfigForm.svelte', match: 'persona_append', boundary: 'B1', reason: '表单键名标签：追加指令的可选项说明挂在键名后。' },
+  { file: 'lib/stageConfigs.ts', match: 'max_tokens', boundary: 'B1', reason: '键名校验：报错必须点名是哪个键不合格。' },
+  { file: 'lib/stageConfigs.ts', match: 'idle_timeout_sec', boundary: 'B1', reason: '键名校验：负值报错点名键，用户才知道改哪一格。' },
+  { file: 'lib/stageConfigs.ts', match: 'max_duration_sec', boundary: 'B1', reason: '键名校验：负值报错点名键。' },
+  { file: 'lib/stageConfigs.ts', match: 'max_rounds', boundary: 'B1', reason: '键名校验：正整数要求点名键。' },
+  { file: 'lib/stageConfigs.ts', match: 'watch_token_budget', boundary: 'B1', reason: '键名校验：正整数要求点名键。' },
+  { file: 'lib/stageConfigs.ts', match: 'skills_json', boundary: 'B1', reason: '键名校验：结构错误点名键并给改法。' },
+  { file: 'lib/stageConfigs.ts', match: 'node_overrides_json', boundary: 'B1', reason: '键名校验：JSON 结构错误点名键。' },
+  { file: 'lib/providers.ts', match: 'context_window', boundary: 'B1', reason: '键名校验：值域错误点名键，用户才知道改哪一格。' },
+  // B2 动作句键名引用：指令的宾语就是这个键（句式「base_url 要留空 / 写成…」）
+  { file: 'lib/providers.ts', match: 'base_url', boundary: 'B2', reason: '动作句键名引用：「要留空 / 写成…」操作的对象就是这个键，摘掉不知道改什么。' },
+  // B3 域词表词：词表收录的工具名，句义依赖其名
+  { file: 'routes/SettingsTools.svelte', match: 'run_command', boundary: 'B3', reason: '域词表词：run_command 是词表收录的工具名（白名单模式条目），主语即它。' },
+  { file: 'routes/SettingsTools.svelte', match: 'offload_run', boundary: 'B3', reason: '域词表词：offload_run 是外发动作面的工具名，说清「只认显式调」靠它。' },
+  // B4 mono 读数徽章：键名 + 值的读数形制
+  { file: 'routes/SettingsProviders.svelte', match: 'base_url', boundary: 'B4', reason: 'mono 读数徽章：键名是徽章的固定前缀，值跟在其后。' },
+  { file: 'routes/SettingsStages.svelte', match: 'max_tokens', boundary: 'B4', reason: 'mono 读数徽章：temp / max_tokens 读数并排，键名即读数标签。' },
+];
+
+/** 豁免判定的唯一实现：**按（文件, token）逐命中匹配**——段级 `text.includes` 会让同段的豁免符号掩蔽真违例。 */
+function isExempt(rel: string, token: string): boolean {
+  return EXEMPTIONS.some((e) => e.file === rel && e.match === token);
+}
+
+describe('文案纪律 · 规则 3：人话句里不夹内部符号（半中半英 A-1 / A-2）', () => {
+  it('口径正例：A-1 snake_case 夹在汉字句里命中，A-2 阶段词命中', () => {
+    const a1 = findHalfMixed('<p>以下为 project_analysis 探测到的事实</p>', true);
+    expect(a1).toHaveLength(1);
+    expect(a1[0].rule).toBe('A-1');
+    expect(a1[0].token).toBe('project_analysis');
+    expect(a1[0].line).toBe(1);
+    // 逐 token 报告：段里两枚阶段词各报一条（旧的「段级只报首个」会让第二枚无人看）
+    const a2 = findHalfMixed('<div>单元测试结果尚未生成（review 在 test 之前）。</div>', true);
+    expect(a2.map((h) => h.token)).toEqual(['review', 'test']);
+    expect(a2.every((h) => h.rule === 'A-2')).toBe(true);
+    // 阶段 / 节点 id 正例**遍历候选集**（决策 412：判据型用例不得只挑代表——上上轮评审
+    // 抓到的漏网正是「正例按实现挑、只剩幸存者」）：5 枚全过、全报 A-2
+    for (const id of STAGE_IDS) {
+      const ids = findHalfMixed(`<p>说明：${id} 阶段的产物会落到任务目录。</p>`, true);
+      expect(ids.map((h) => h.token), id).toEqual([id]);
+      expect(ids[0].rule, id).toBe('A-2');
+    }
+    // 连词形阶段 id 在汉字句里必须报得出——连词备选曾把它们整体吃掉（评审实证的遮蔽缺口），
+    // 现由 HYPHEN_TOKEN 显式让开候选集从构造上根治
+    expect(findHalfMixed('<p>同步检查 sync-check 不占游标行</p>', true)).toHaveLength(1);
+    // .ts 字符串字面量同样在扫描面
+    expect(findHalfMixed("throw new Error('split_task 需要提供拆分方案');", false)).toHaveLength(1);
+    // 组件文本型 props 在扫描面：EmptyState 的 next= 与标准属性同类（评审场景 6）
+    const prop = findHalfMixed('<EmptyState next="新增一行并填好 secret_token 才能用。" />', true);
+    expect(prop).toHaveLength(1);
+    expect(prop[0].token).toBe('secret_token');
+    // 表达式值里的**字面量**照报（表达式剥掉后用户看到的就是它）
+    expect(findHalfMixed("<p title={ok ? '已保存（stage_configs）' : ''}>正文</p>", true)).toHaveLength(1);
+  });
+
+  it('口径负例：纯英文键名、文件名连写、徽章掩码不命中；注释不算', () => {
+    // B1 键名标签不含汉字 → 不是「人话句夹符号」
+    expect(findHalfMixed('<span>idle_timeout_sec</span>', true)).toEqual([]);
+    // A-2 负向排除：产物文件名连写
+    expect(findHalfMixed('<div>评审差异（review-diff.diff）尚未生成或不可读。</div>', true)).toEqual([]);
+    expect(findHalfMixed('<div>test-report.md 尚未生成。</div>', true)).toEqual([]);
+    // B5 负向排除同样盖住 A-1：带下划线的产物文件名不算 snake_case 内部符号
+    expect(findHalfMixed('<div>任务的 test_result.json 还没生成。</div>', true)).toEqual([]);
+    // 阶段 id 形状的产物文件名仍是文件名（除 FILENAME_EXT 外的判据一律不贴扩展名）——
+    // 负例同样**遍历候选集**，B5 不因步骤顺序调整而破
+    for (const id of STAGE_IDS) {
+      expect(findHalfMixed(`<div>${id}.md 还没生成。</div>`, true), id).toEqual([]);
+    }
+    // 但裸阶段 id 仍要报——文件名形让开不等于裸形也让开（遮蔽缺口的正向反面）
+    expect(findHalfMixed('<div>这是 develop-design 的产物。</div>', true)).toHaveLength(1);
+    // 掩码徽章（无汉字）
+    expect(findHalfMixed('<span class="mono">api_key ***</span>', true)).toEqual([]);
+    expect(findHalfMixed('const badge = `ctx ${n} · max_tokens ${t}`;', false)).toEqual([]);
+    // 注释与 HTML 注释剥掉后不算
+    expect(findHalfMixed('<!-- 下面会用 project_analysis -->\n<p>正文</p>', true)).toEqual([]);
+    expect(findHalfMixed('// stage_configs 的校验\nexport const x = 1;', false)).toEqual([]);
+    // 表达式里的字段名渲染出的是值，不算（渲染近似）
+    expect(findHalfMixed('<span>评审：{task.review_mode}</span>', true)).toEqual([]);
+    // 表达式型 prop 同理：字段名（pending_reason）不是文案，花括号连同进段才剥得掉
+    expect(findHalfMixed("<MarkdownView source={task.pending_reason?.message ?? '需要你决定。'} />", true)).toEqual([]);
+  });
+
+  it('判据两两不相交：阶段 id 只归 STAGE_ID、文件名形只归 FILENAME_EXT、连词 token 只归 HYPHEN（决策 413）', () => {
+    // RegExp.prototype.test 在 /g 下会推进 lastIndex——一律去掉 flag 再问
+    const matches = (re: RegExp, s: string): boolean => new RegExp(re.source).test(s);
+    const others = (exclude: RegExp): readonly (readonly [string, RegExp])[] =>
+      (
+        [
+          ['STAGE_ID', STAGE_ID],
+          ['HYPHEN_TOKEN', HYPHEN_TOKEN],
+          ['SNAKE', SNAKE],
+          ['STAGE_WORD', STAGE_WORD],
+        ] as const
+      ).filter(([, re]) => re !== exclude);
+    for (const id of STAGE_IDS) {
+      expect(matches(STAGE_ID, id), `STAGE_ID 漏 ${id}`).toBe(true);
+      for (const [name, re] of others(STAGE_ID)) {
+        expect(matches(re, id), `${name} 吃掉候选 ${id}`).toBe(false);
+      }
+      const file = `${id}.md`;
+      expect(matches(FILENAME_EXT, file), `FILENAME_EXT 漏 ${file}`).toBe(true);
+      for (const [name, re] of others(FILENAME_EXT)) {
+        expect(matches(re, file), `${name} 命中文件名 ${file}`).toBe(false);
+      }
+    }
+    // 连词 token 是 HYPHEN 的腹地：独立词与阶段 id 判据不碰
+    expect(matches(HYPHEN_TOKEN, 'review-diff')).toBe(true);
+    expect(matches(STAGE_WORD, 'review-diff')).toBe(false);
+    expect(matches(STAGE_ID, 'review-diff')).toBe(false);
+    // 独立词是 STAGE_WORD 的腹地：其余判据都不碰
+    expect(matches(STAGE_WORD, 'review')).toBe(true);
+    for (const [name, re] of others(STAGE_WORD)) {
+      expect(matches(re, 'review'), `${name} 命中独立词 review`).toBe(false);
+    }
+  });
+
+  it('步骤顺序不改变结果：canonical 序与逆序在同一批探针上全等（顺序只是习惯，不是语义）', () => {
+    const probes: (readonly [string, boolean])[] = [
+      ['<p>以下为 project_analysis 探测到的事实</p>', true],
+      ['<div>单元测试结果尚未生成（review 在 test 之前）。</div>', true],
+      ['<div>这是 develop-design 的产物。</div>', true],
+      ['<div>评审差异（review-diff.diff）尚未生成或不可读。</div>', true],
+      ['<div>test-report.md 尚未生成。</div>', true],
+      ['<div>任务的 test_result.json 还没生成。</div>', true],
+      ["throw new Error('split_task 需要提供拆分方案');", false],
+      ['<EmptyState next="新增一行并填好 secret_token 才能用。" />', true],
+    ];
+    // 候选集逐枚入探针：id 正例形与文件名负例形（决策 412 的遍历在对拍里同样成立）
+    for (const id of STAGE_IDS) {
+      probes.push([`<p>说明：${id} 阶段的产物会落到任务目录。</p>`, true], [`<div>${id}.md 还没生成。</div>`, true]);
+    }
+    const key = (h: HalfMixedHit): string => `${h.rule}:${h.token}:${h.line}`;
+    const reversed: readonly ScanStep[] = [...SCAN_STEPS].reverse();
+    for (const [text, html] of probes) {
+      const base = findHalfMixed(text, html).map(key).sort();
+      const swapped = findMixedIn(text, html, reversed).map(key).sort();
+      expect(swapped, text).toEqual(base);
+    }
+  });
+
+  it('全站归零：命中全部落在 B 类登记表内（豁免仅经登记表、按 token 逐命中）', () => {
+    const violations: string[] = [];
+    for (const file of files) {
+      const rel = relative(srcRoot, file).replaceAll('\\', '/');
+      for (const hit of findHalfMixed(readFileSync(file, 'utf8'), file.endsWith('.svelte'))) {
+        if (!isExempt(rel, hit.token)) violations.push(`${rel}:${hit.line}: [${hit.rule}:${hit.token}] ${hit.text}`);
+      }
+    }
+    expect(violations).toEqual([]);
+  });
+
+  it('豁免按 token 逐命中匹配：同段的豁免符号掩蔽不了真违例', () => {
+    const hits = findHalfMixed('<span>local_path 与 sneaky_flag 同段出现</span>', true);
+    expect(hits.map((h) => h.token)).toEqual(['local_path', 'sneaky_flag']);
+    expect(isExempt('components/settings/ProjectForm.svelte', 'local_path')).toBe(true);
+    expect(hits.filter((h) => !isExempt('components/settings/ProjectForm.svelte', h.token)).map((h) => h.token)).toEqual([
+      'sneaky_flag',
+    ]);
+  });
+
+  it('登记表只收 B 类：条目数固定、每条理由非空、四类边界各至少一条', () => {
+    expect(EXEMPTIONS.length).toBe(19);
+    expect(EXEMPTIONS.every((e) => e.reason.trim().length > 0)).toBe(true);
+    for (const b of ['B1', 'B2', 'B3', 'B4'] as const) {
+      expect(EXEMPTIONS.some((e) => e.boundary === b)).toBe(true);
+    }
+    // B5 产物文件名由 FILENAME_EXT / HYPHEN_TOKEN 的一致负向排除承担（见「口径负例」三条文件名用例），
+    // 登记表不留行使不到的死条目。登记的位置必须在扫描面里（防登记到不存在的文件）。
+    const relFiles = files.map((f) => relative(srcRoot, f).replaceAll('\\', '/'));
+    expect(EXEMPTIONS.every((e) => relFiles.includes(e.file))).toBe(true);
+  });
+
+  it('登记表每条都被行使：条目的 token 在其文件里真实命中（死条目 = 计数保护失效）', () => {
+    const live = new Set<string>();
+    for (const file of files) {
+      const rel = relative(srcRoot, file).replaceAll('\\', '/');
+      for (const hit of findHalfMixed(readFileSync(file, 'utf8'), file.endsWith('.svelte'))) {
+        live.add(`${rel} ${hit.token}`);
+      }
+    }
+    for (const e of EXEMPTIONS) {
+      expect(live.has(`${e.file} ${e.match}`), `死条目：${e.file} / ${e.match}`).toBe(true);
+    }
+  });
+
+  it('扫描面与既有两门共用同一份清单（测试 / bench 文件不在内）', () => {
+    expect(files.some((f) => /\.(test|spec|bench)\.ts$/.test(f))).toBe(false);
+  });
+});
+
+/* ══════════════════════ 规则 4：后端直呈报文窄扫 ═══════════════════════ */
+
+/** 内部编号（含全角与「决策 130 / 137」连写）与票据号：规则 4 的两类编号形态。 */
+const BACKEND_REF = new RegExp(
+  String.raw`决策\s*[0-9０-９]{1,3}(?:\s*[/、]\s*[0-9０-９]{1,3})*|票\s*[0-9０-９]{1,3}[①②③④⑤⑥⑦⑧⑨⑩⑪⑫⑬⑭⑮]?(?:\s*[/、]\s*[0-9０-９]{1,3})*`,
+  'g',
+);
+
+/** 构造形态的提取方式（三类形态的字面量位置不同，见下）。 */
+type LiteralMode =
+  /** 字面量须在构造 `(` 后第一个位置（允许空白 / 换行 / `format!(` 包一层）——①② 的形状。 */
+  | 'leading'
+  /** 取调用窗内的首个字符串字面量——③ 流转原因在实参**尾部**，前面还有 task_id / from / to 等实参。 */
+  | 'first-quote';
+
+interface BackendPattern {
+  readonly re: RegExp;
+  readonly mode: LiteralMode;
+}
+
+/**
+ * 三类构造形态（**整库搜改是红线**，门只认这些）：
+ * ① 报文构造器 / error 字段 ② `test_blockers` 类载荷 push
+ * ③ **流转原因载荷**（落库渲染字段）——`reason = Some(…)` 赋值与
+ * `insert_transition(…, Some("…"))` 实参（reason 落 `kanban_transitions` 后由
+ * TimelineView 原文渲染；评审场景 5 实证 resume.rs 的 `（决策 116）` 从这个缺口溜过）。
+ */
+const BACKEND_CONSTRUCTORS: readonly BackendPattern[] = [
+  { re: /ApiError::[a-z_]+\s*\(/g, mode: 'leading' },
+  { re: /\bError::[A-Za-z]+\s*\(/g, mode: 'leading' },
+  { re: /\berror:\s*Some\s*\(/g, mode: 'leading' },
+  { re: /\b(?:test_blockers|dev_blockers|metadata_gaps|gaps|warnings)\s*\.push\s*\(/g, mode: 'leading' },
+  { re: /\breason\s*=\s*Some\s*\(/g, mode: 'leading' },
+  { re: /\binsert_transition(?:_in_tx)?\s*\(/g, mode: 'first-quote' },
+];
+
+export interface BackendRef {
+  readonly line: number;
+  readonly match: string;
+  readonly snippet: string;
+}
+
+/** 在一段 Rust 源码里找**构造形态内**的编号（注释已剥；日志 / 断言 / prompt / CLI 不在形态内）。 */
+export function findBackendCopyRefs(text: string): BackendRef[] {
+  const masked = maskComments(text, false);
+  const out: BackendRef[] = [];
+  for (const { re, mode } of BACKEND_CONSTRUCTORS) {
+    re.lastIndex = 0;
+    for (const m of masked.matchAll(re)) {
+      const window = masked.slice(m.index + m[0].length, m.index + m[0].length + 400);
+      const lit = mode === 'leading' ? window.match(/^\s*(?:format!\s*\(\s*)?"([^"]*)"/s) : window.match(/"([^"]*)"/s);
+      if (!lit) continue;
+      const bad = lit[1].match(BACKEND_REF);
+      if (!bad) continue;
+      // 行号对回**字面量**（报文本体）所在行，而非构造器行
+      const quoteAt = m.index + m[0].length + (lit.index ?? 0) + lit[0].indexOf('"');
+      const { line } = lineOf(masked, quoteAt);
+      out.push({ line, match: bad[0], snippet: lit[1].trim().slice(0, 110) });
+    }
+  }
+  return out;
+}
+
+/** 后端扫描面：`crates` 下的全部 `.rs`，`tests/` / `benches/` 目录除外（与前端同一边界）。 */
+function collectCratesFiles(dir: string): string[] {
+  const out: string[] = [];
+  for (const name of readdirSync(dir)) {
+    const p = join(dir, name);
+    if (statSync(p).isDirectory()) {
+      if (name === 'tests' || name === 'benches' || name === 'node_modules') continue;
+      out.push(...collectCratesFiles(p));
+    } else if (name.endsWith('.rs')) out.push(p);
+  }
+  return out;
+}
+
+/** vitest 从 `frontend/` 运行，仓根的 crates 在 `../crates`（兼容从仓根直跑）。 */
+const cratesRoot = [resolve(process.cwd(), '../crates'), resolve(process.cwd(), 'crates')].find(existsSync);
+
+describe('文案纪律 · 规则 4：后端直呈报文里不出现内部编号（三类构造形态窄扫）', () => {
+  it('口径正例：报文构造器、error 字段、载荷 push、流转原因的字面量命中（含多行 format!）', () => {
+    expect(findBackendCopyRefs('ApiError::bad_request("只有终态任务可以归档（决策 34）")')).toHaveLength(1);
+    expect(findBackendCopyRefs('error: Some("标终态（票 02②）".into()),')).toHaveLength(1);
+    expect(findBackendCopyRefs('test_blockers.push(format!("high 场景 design_refs 缺失（决策 136）"));')).toHaveLength(1);
+    const multiline = [
+      'return Err(Error::Validation(format!(',
+      '    "阶段 {} 无 skip（决策 86）",',
+      ')));',
+    ].join('\n');
+    expect(findBackendCopyRefs(multiline)).toHaveLength(1);
+    expect(findBackendCopyRefs(multiline)[0].line).toBe(2);
+    // ③ 流转原因（落库渲染字段）：reason 赋值与 insert_transition 实参——
+    // 评审场景 5 的漏网（resume.rs `（决策 116）`）与场景 7 的门缺口由这两条钉住
+    expect(
+      findBackendCopyRefs('reason = Some(format!("dependency_overridden：忽略失败依赖 {detail}（决策 116）"));'),
+    ).toHaveLength(1);
+    expect(
+      findBackendCopyRefs('insert_transition(task_id, &cursor.branch, None, to, Trigger::Normal, Some("游标分裂（决策 90）"))'),
+    ).toHaveLength(1);
+    // 实参尾部的字面量被 kickback_reason(…) 包一层也要抓到（first-quote 提取）
+    expect(
+      findBackendCopyRefs(
+        'insert_transition(task_id, b, from, to, Trigger::Kickback, Some(kickback_reason("merge 测试闸门失败（决策 85）").as_str()))',
+      ),
+    ).toHaveLength(1);
+  });
+
+  it('口径负例：日志、断言消息、注释、prompt 与 CLI 报文不在形态内（防误报烂门）', () => {
+    expect(findBackendCopyRefs('tracing::warn!(task = %id, "脏工作区（不阻塞，决策 61）")')).toEqual([]);
+    expect(findBackendCopyRefs('assert_eq!(offloaded, 1, "卸载文件应真实落盘（决策 148）");')).toEqual([]);
+    expect(findBackendCopyRefs('.expect("放弃分支必须真的落账（决策 304）");')).toEqual([]);
+    expect(findBackendCopyRefs('// 决策 3 的日志口径（照旧）')).toEqual([]);
+    expect(findBackendCopyRefs('println!("  --allowed-origin <ORIGIN>（决策 157）：");')).toEqual([]);
+    // 形态对但没有编号 → 不命中
+    expect(findBackendCopyRefs('Error::Task(format!("技能不存在：{name}"))')).toEqual([]);
+    // 裸 Some(…) 不在流转构造上下文——落库形态必须落在 reason 赋值 / insert_transition 实参里（正例③）
+    expect(findBackendCopyRefs('let hint = Some("游标分裂（决策 90）");')).toEqual([]);
+    // 非渲染的命令台账载荷字段不在形态内（`stderr_preview` 无任何组件渲染，triage 依据见 §12.1）
+    expect(findBackendCopyRefs('stderr_preview: Some("run_command 在本阶段被禁用（决策 396）".into()),')).toEqual([]);
+  });
+
+  it('全站归零：crates 窄形态命中 0（tests / benches 目录不在扫描面）', () => {
+    expect(cratesRoot, 'crates 目录应存在').toBeDefined();
+    const hits: string[] = [];
+    for (const file of collectCratesFiles(cratesRoot!)) {
+      const rel = relative(resolve(cratesRoot!, '..'), file).replaceAll('\\', '/');
+      for (const ref of findBackendCopyRefs(readFileSync(file, 'utf8'))) {
+        hits.push(`${rel}:${ref.line}: 报文里出现「${ref.match}」｜ ${ref.snippet}`);
+      }
+    }
+    expect(hits).toEqual([]);
   });
 });

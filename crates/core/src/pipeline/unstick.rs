@@ -220,7 +220,7 @@ pub async fn unstick(
                 &crate::storage::observability::RunOutcome {
                     status: Some(NodeStatus::Timeout),
                     error: Some(format!(
-                        "unstick：有主但心跳停了 {}s，判定僵死并标终态（决策 210⑧）",
+                        "unstick：有主但心跳停了 {}s，判定僵死并标终态",
                         evidence
                             .detail
                             .get("heartbeat_seconds_ago")

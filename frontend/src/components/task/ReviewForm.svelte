@@ -43,7 +43,7 @@
 
 <div class="reviewform">
   {#if !actionsOnly}
-    <div class="title cond">人工评审（review_mode = human）</div>
+    <div class="title cond">人工评审</div>
 
     {#if stale}
       <div class="notice">变更 diff 正在重新生成，请稍候再评审。</div>
@@ -62,7 +62,7 @@
           <DiffView parsed={diff} {raw} />
         </div>
       {:else}
-        <div class="hint">review-diff.diff 尚未生成或不可读。</div>
+        <div class="hint">评审差异（review-diff.diff）尚未生成或不可读。</div>
       {/if}
     </section>
 
@@ -80,14 +80,14 @@
       {#if unitTestReport}
         <MarkdownView source={unitTestReport} />
       {:else}
-        <div class="hint">单元测试结果尚未生成（review 在 test 之前）。</div>
+        <div class="hint">单元测试结果尚未生成（评审在测试之前）。</div>
       {/if}
     </section>
   {/if}
 
   <label class="comment">
     <span class="hint">打回意见（可选）</span>
-    <textarea class="input" rows="3" bind:value={comments} placeholder="打回时随流转原因带给 develop…"></textarea>
+    <textarea class="input" rows="3" bind:value={comments} placeholder="打回时随流转原因带给开发阶段…"></textarea>
   </label>
 
   <div class="actions" class:dock-acts={actionsOnly}>

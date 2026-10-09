@@ -837,7 +837,7 @@ impl KanbanScheduler {
                     &crate::storage::observability::RunOutcome {
                         status: Some(NodeStatus::Timeout),
                         error: Some(format!(
-                            "项目级 run（{}）心跳停止 {idle}s，判定中断并标终态（决策 212）：\
+                            "项目级 run（{}）心跳停止 {idle}s，判定中断并标终态：\
                              analyze 端点那条收尾路径在进程被杀 / 重启时跑不到",
                             run.agent_type
                         )),

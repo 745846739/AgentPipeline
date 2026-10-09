@@ -209,7 +209,7 @@ impl FileToolPolicy {
                     .collect::<Vec<_>>()
                     .join("；");
                 return Err(Error::PolicyDenied(format!(
-                    "路径不在本节点的写入面白名单内（决策 395）：{}。本节点允许写入：{allowed}",
+                    "路径不在本节点的写入面白名单内：{}。本节点允许写入：{allowed}",
                     resolved.display()
                 )));
             }

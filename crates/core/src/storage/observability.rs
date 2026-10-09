@@ -420,7 +420,7 @@ impl Store {
                 *id,
                 &RunOutcome {
                     status: Some(crate::types::NodeStatus::Timeout),
-                    error: Some("进程重启：项目级 run 成了孤儿，标终态（决策 212 / 票 13）".into()),
+                    error: Some("进程重启：项目级 run 成了孤儿，标终态".into()),
                     ..Default::default()
                 },
             )
@@ -464,7 +464,7 @@ impl Store {
                 &RunOutcome {
                     status: Some(NodeStatus::Cancelled),
                     duration_ms: (now - run.started_at).num_milliseconds().max(0) as u64,
-                    error: Some("进程重启：这一轮在上一进程退出时还在跑，标终态（票 02②）".into()),
+                    error: Some("进程重启：这一轮在上一进程退出时还在跑，标终态".into()),
                     cancel_origin: Some(CANCEL_ORIGIN_RESTART),
                     ..Default::default()
                 },

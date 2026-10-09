@@ -34,7 +34,7 @@
   </div>
 
   {#if ready}
-    <p class="hintline lead">以下为 project_analysis 探测到的事实，确认无误后即可创建任务。</p>
+    <p class="hintline lead">以下是探测到的事实，确认无误后即可创建任务。</p>
     <ul>
       {#each items as item (item.key)}
         <li class:miss={!item.ok}>

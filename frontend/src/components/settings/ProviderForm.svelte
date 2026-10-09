@@ -139,8 +139,8 @@
 
   {#if !supported && draft.vendor.trim()}
     <div class="warn">
-      厂商 <span class="mono">{draft.vendor.trim()}</span> 不在 supported_adapters
-      （{SUPPORTED_ADAPTERS.join(' / ')}）内：该行会降级灰显，被 stage_configs 引用时配置加载会拒绝启动。
+      厂商 <span class="mono">{draft.vendor.trim()}</span> 不在支持列表
+      （{SUPPORTED_ADAPTERS.join(' / ')}）内：该行会变灰停用，被阶段配置引用时配置加载会拒绝启动。
     </div>
   {/if}
 

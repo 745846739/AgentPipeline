@@ -783,12 +783,12 @@ async fn model_context_window(
         .find(|p| p.id == provider_id)
         .ok_or_else(|| {
             Error::Config(format!(
-                "provider {provider_id} 未注册，无法确定模型上下文窗口（决策 110）"
+                "provider {provider_id} 未注册，无法确定模型上下文窗口"
             ))
         })?;
     if provider.context_window == 0 {
         return Err(Error::Config(format!(
-            "provider {}（{}）未登记 context_window，无法进行 L0 容量预估（决策 110）",
+            "provider {}（{}）未登记 context_window，无法进行 L0 容量预估",
             provider.id, provider.model
         )));
     }

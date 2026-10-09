@@ -6,6 +6,7 @@
 //! `make smoke` 走 `-- smoke::`——编译不再按层收敛，执行仍然按层收敛。
 
 mod api_contract;
+mod copy_error_bodies;
 mod lan_bind;
 mod market;
 mod port_stability;
