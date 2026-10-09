@@ -8904,3 +8904,135 @@ async fn a_failed_tool_is_logged_too() {
     );
     assert_eq!(failure.name.as_deref(), Some("no_such_tool"));
 }
+
+// ────── 文案纪律（测试场景 4 · AC-2）：sync-check 闸门载荷的人话面 ─────
+
+/// dossier 元数据卡的 `metadata_gaps` / `test_blockers` **落库载荷**：摘内部编号、
+/// 保留人话语义（测试场景 4 步骤 2）。
+///
+/// 与 `degraded_stage_metadata_blocks_the_sync_gate` / `intact_metadata_with_a_dangling_ref_still_blocks`
+/// 的分工：那两条钉「拦不拦」，这一条钉「拦下时说的话」——载荷经 sync_decision 落库、
+/// 由界面元数据卡原文渲染，出现「（决策 136）」就是把内部编号漏给了用户。
+/// 源面字面量的窄扫在 `copy_payloads.rs::executor_payload_literals_carry_no_internal_refs`。
+#[tokio::test]
+async fn sync_gate_payloads_speak_plain_human_without_internal_refs() {
+    use crate::copy_payloads::internal_ref;
+    let no_ref = |what: &str, text: &str| {
+        if let Some(found) = internal_ref(text) {
+            panic!("{what}残留内部编号「{found}」：{text}");
+        }
+    };
+
+    // ── 形态甲：设计元数据被掏空 → metadata_gaps 点名缺项（回溯反馈同文）──
+    let ctx = setup("true", Settings::default()).await;
+    let mut script = Script::new();
+    design_scripts_with_raw_execute(
+        &mut script,
+        r#"{"readiness": true}"#,
+        r#"{"readiness": true}"#,
+    );
+    ctx.agent.set_script(script);
+    testkit::seed_task(&ctx.store, "t-copy-gaps", "p1")
+        .await
+        .unwrap();
+    admit(&ctx, "t-copy-gaps").await;
+    let _ = ctx.executor.run("t-copy-gaps").await;
+
+    let decision = ctx
+        .store
+        .stage_output_metadata("t-copy-gaps", Stage::SyncCheck, "sync_decision")
+        .await
+        .unwrap()
+        .expect("闸门应当落了 sync-decision");
+    let gaps: Vec<String> = decision["metadata_gaps"]
+        .as_array()
+        .map(|a| {
+            a.iter()
+                .filter_map(|g| g.as_str().map(String::from))
+                .collect()
+        })
+        .unwrap_or_default();
+    assert!(!gaps.is_empty(), "缺项清单应非空：{decision}");
+    for g in &gaps {
+        no_ref("metadata_gaps 载荷", g);
+        assert!(
+            g.contains("元数据缺"),
+            "人话语义保留（说清缺的是元数据）：{g}"
+        );
+    }
+    assert!(
+        gaps.iter().any(|g| g.contains("acceptance_criteria")),
+        "缺项要点名字段（语义不随摘编号而丢）：{gaps:?}"
+    );
+    assert!(
+        gaps.iter().any(|g| g.contains("test_scenarios")),
+        "缺项要点名字段（语义不随摘编号而丢）：{gaps:?}"
+    );
+
+    // ── 形态乙：high 场景 design_refs 悬空 → test_blockers 点名场景 ──
+    let ctx = setup("true", Settings::default()).await;
+    let arch = serde_json::to_string(&ArchitectExecuteMetadata {
+        readiness: true,
+        acceptance_criteria: vec![AcceptanceCriterion {
+            id: "AC-1".into(),
+            description: "能登录".into(),
+        }],
+        ..Default::default()
+    })
+    .unwrap();
+    let test = serde_json::to_string(&TestDesignMetadata {
+        readiness: true,
+        test_scenarios: vec![TestScenario {
+            id: "S-1".into(),
+            name: "登录成功".into(),
+            description: "登录".into(),
+            preconditions: vec![],
+            steps: vec![],
+            expected_result: "成功".into(),
+            priority: agentpipeline_core::types::ScenarioPriority::High,
+            design_refs: vec!["AC-9".into()],
+        }],
+        ..Default::default()
+    })
+    .unwrap();
+    let mut script = Script::new();
+    design_scripts_with_raw_execute(&mut script, &arch, &test);
+    ctx.agent.set_script(script);
+    testkit::seed_task(&ctx.store, "t-copy-refs", "p1")
+        .await
+        .unwrap();
+    admit(&ctx, "t-copy-refs").await;
+    let _ = ctx.executor.run("t-copy-refs").await;
+
+    let decision = ctx
+        .store
+        .stage_output_metadata("t-copy-refs", Stage::SyncCheck, "sync_decision")
+        .await
+        .unwrap()
+        .expect("闸门应当落了 sync-decision");
+    let blockers: Vec<String> = decision["test_blockers"]
+        .as_array()
+        .map(|a| {
+            a.iter()
+                .filter_map(|b| b.as_str().map(String::from))
+                .collect()
+        })
+        .unwrap_or_default();
+    assert!(
+        !blockers.is_empty(),
+        "悬空引用应进 blocker 清单：{decision}"
+    );
+    for b in &blockers {
+        no_ref("test_blockers 载荷", b);
+    }
+    assert!(
+        blockers
+            .iter()
+            .any(|b| b.contains("design_refs 缺失或悬空")),
+        "人话语义保留（说清哪个引用怎么了）：{blockers:?}"
+    );
+    assert!(
+        blockers.iter().any(|b| b.contains("登录成功")),
+        "场景名要保留（用户得知道是哪一条）：{blockers:?}"
+    );
+}
