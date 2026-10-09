@@ -857,3 +857,195 @@ async fn merging_a_repair_lands_the_branch_and_cleans_up() {
         "合入成功后分支被删"
     );
 }
+
+/// 决策 415 的三条 L2 共用现场：带 origin 的项目行 + 一个已落带标记 commit 的修复
+/// worktree（三条用例的差别只在「远端怎么变」，那一步留在各自体内）。
+///
+/// 裸仓（第 7 项）必须一并带回：它是 origin 的宿主，drop 即 TempDir 析构、远端随之蒸发。
+async fn committed_remote_repair() -> (
+    TestHome,
+    Store,
+    ManualClock,
+    Repo,
+    Repo,
+    agentpipeline_core::pipeline::repair::RepairSession,
+    String,
+) {
+    let home = TestHome::new().unwrap();
+    let clock = ManualClock::fixed();
+    let store = Store::open(home.home().clone(), Arc::new(clock.clone()))
+        .await
+        .unwrap();
+    let (repo, bare) = Repo::with_remote().unwrap();
+    let project = project_for(&repo, "true");
+    store.create_project(&project).await.unwrap();
+    let sid = foreman_session(&store).await;
+
+    let session = start_repair(home.home(), repo.path(), "main", &new_repair_id(), &sid)
+        .await
+        .unwrap();
+    std::fs::write(session.worktree.join("added.rs"), "pub fn y() {}\n").unwrap();
+    let _ = commit_repair(
+        &session,
+        "补一个文件",
+        agentpipeline_core::clock::Clock::now(&clock),
+    )
+    .await
+    .unwrap();
+    (home, store, clock, repo, bare, session, sid)
+}
+
+/// 决策 415 / 票 deploy-divergence 02：合入前 fetch——远端基准前进了、本地引用没人刷过，
+/// 合入必须落在**新尖端 + repair**（而不是旧基线上的提交），且回执说清基线位移。
+///
+/// 事故形状逐项复刻：修复 worktree 从 origin/main（`old`）切出 → 远端 main 前进到 `new`
+/// （本地 origin/main 引用保持陈旧）→ 按下合入。修复前的代码读陈旧引用判「基准没动」、
+/// rebase no-op，main 落在 old 之上的 repair——远端那条提交就此失踪。
+#[tokio::test]
+async fn a_merge_after_the_origin_moved_lands_on_the_new_tip_and_says_so() {
+    use agentpipeline_core::pipeline::foreman_actions::run_repair;
+    use agentpipeline_core::pipeline::repair::{propose_repair, RepairOutcome};
+
+    let (_home, store, _clock, repo, _bare, session, sid) = committed_remote_repair().await;
+
+    // 远端 main 前进一步，而本地的 origin/main 引用保持陈旧（没人 fetch 过）：
+    // 在 main 上提交 → push → 本地 main 与 origin/main 引用都拨回 old。
+    let old = repo.head("main");
+    repo.advance_main("upstream.md", "# 上游前进了一步\n");
+    repo.git(&["push", "origin", "main"]);
+    let new = repo.head("main");
+    repo.git(&["reset", "--hard", &old]);
+    repo.git(&["update-ref", "refs/remotes/origin/main", &old]);
+    assert_ne!(old, new, "前置：远端确实前进了");
+
+    let outcome = RepairOutcome {
+        repair_id: session.repair_id.clone(),
+        worktree_path: session.worktree.display().to_string(),
+        branch: session.branch.clone(),
+        base_ref: session.base_ref.clone(),
+        base_commit: old.clone(),
+        gate_passed: true,
+        gate: vec![],
+        commit: None,
+        diff: None,
+        diff_stat: None,
+    };
+    let project = project_for(&repo, "true");
+    let proposal = propose_repair(&store, &sid, &project, &outcome)
+        .await
+        .unwrap();
+
+    let receipt = run_repair(&store, &proposal).await.unwrap().unwrap();
+
+    // ① main = 新尖端 + repair：远端那条提交必须在 main 的历史里（修复前它会失踪）。
+    assert!(
+        Git.contains(repo.path(), "main", &new).await.unwrap(),
+        "main 必须包含远端新尖端 {new}，实际：{}",
+        repo.head("main")
+    );
+    assert!(repo.exists("added.rs"), "repair 本身也要在 main 上");
+    assert!(repo.exists("upstream.md"), "远端那条提交的改动要在工作区里");
+    // ② 回执说清基线位移与落点（票面验收：「基线 … → …」）。
+    assert!(receipt.contains("已合入"), "{receipt}");
+    assert!(
+        receipt.contains(&format!("基线 {} → {}", &old[..7], &new[..7])),
+        "回执要说清基线位移：{receipt}"
+    );
+    assert!(receipt.contains("已 rebase 合入"), "{receipt}");
+    assert!(receipt.contains("main 现在落在"), "{receipt}");
+    assert!(receipt.contains("领先 origin/main"), "{receipt}");
+    // ③ 现场照常回收。
+    assert!(!session.worktree.exists(), "worktree 被回收");
+}
+
+/// 决策 415 / 票 deploy-divergence 02：origin 取不到 → 拒执，且文案说清「取不到 origin」
+/// （不是「闸门没过」那种含糊话），仓库一个字节都不动。
+#[tokio::test]
+async fn an_unreachable_origin_refuses_the_merge_and_names_the_reason() {
+    use agentpipeline_core::pipeline::foreman_actions::run_repair;
+    use agentpipeline_core::pipeline::repair::{propose_repair, RepairOutcome};
+
+    let (_home, store, _clock, repo, _bare, session, sid) = committed_remote_repair().await;
+
+    // 远端路径不再存在（检出被挪走 / 挂载掉了）。
+    repo.git(&[
+        "remote",
+        "set-url",
+        "origin",
+        "/nonexistent/agentpipeline-origin.git",
+    ]);
+    let before = repo.head("main");
+
+    let outcome = RepairOutcome {
+        repair_id: session.repair_id.clone(),
+        worktree_path: session.worktree.display().to_string(),
+        branch: session.branch.clone(),
+        base_ref: session.base_ref.clone(),
+        base_commit: before.clone(),
+        gate_passed: true,
+        gate: vec![],
+        commit: None,
+        diff: None,
+        diff_stat: None,
+    };
+    let project = project_for(&repo, "true");
+    let proposal = propose_repair(&store, &sid, &project, &outcome)
+        .await
+        .unwrap();
+
+    let err = run_repair(&store, &proposal).await.unwrap_err();
+    let msg = err.to_string();
+    assert!(
+        msg.contains("取不到 origin"),
+        "文案要说清取不到 origin：{msg}"
+    );
+    assert!(
+        msg.contains("不敢断言基准"),
+        "……以及为什么这构成拒执：{msg}"
+    );
+
+    // 仓库一个字节都不动：main 停在原地、worktree 与分支都还在（拒执不回收）。
+    assert_eq!(repo.head("main"), before, "main 不该被改写");
+    assert!(session.worktree.exists(), "拒执不回收现场");
+    assert!(repo.branch_exists(&session.branch), "分支保留");
+}
+
+/// 决策 415 / 评审加固：worktree 建好**之后** origin 被整个摘掉——base_ref 仍写着
+/// `origin/main`，本地那份 remote-tracking 引用再也不会被刷新，正是事故读数的形状。
+/// 静默放行等于重演事故，必须拒执且说清「已经没有 origin」。
+#[tokio::test]
+async fn an_origin_removed_after_the_worktree_was_cut_is_also_refused() {
+    use agentpipeline_core::pipeline::foreman_actions::run_repair;
+    use agentpipeline_core::pipeline::repair::{propose_repair, RepairOutcome};
+
+    let (_home, store, _clock, repo, _bare, session, sid) = committed_remote_repair().await;
+
+    repo.git(&["remote", "remove", "origin"]);
+    let before = repo.head("main");
+
+    let outcome = RepairOutcome {
+        repair_id: session.repair_id.clone(),
+        worktree_path: session.worktree.display().to_string(),
+        branch: session.branch.clone(),
+        base_ref: session.base_ref.clone(),
+        base_commit: before.clone(),
+        gate_passed: true,
+        gate: vec![],
+        commit: None,
+        diff: None,
+        diff_stat: None,
+    };
+    let project = project_for(&repo, "true");
+    let proposal = propose_repair(&store, &sid, &project, &outcome)
+        .await
+        .unwrap();
+
+    let err = run_repair(&store, &proposal).await.unwrap_err();
+    let msg = err.to_string();
+    assert!(
+        msg.contains("已经没有 origin"),
+        "文案要说清 origin 已不在：{msg}"
+    );
+    assert_eq!(repo.head("main"), before, "main 不该被改写");
+    assert!(session.worktree.exists(), "拒执不回收现场");
+}

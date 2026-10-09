@@ -674,6 +674,87 @@ pub fn gate_failure_note(readings: &[GateReading]) -> String {
     }
 }
 
+/// 合入前刷新 `origin` 并读回 `origin/{default_branch}` 的**新**尖端（决策 415）。
+///
+/// 为什么这条路上 fetch 失败必须**拒执**，而建 worktree 那处「fetch 失败不阻断」
+/// （[`crate::git::Git::init_worktree_named`]）：那里旧基准只让修复的起点旧一点，改动
+/// 本身照常成立；这里「基准有没有前进」直接决定合入落在哪条线上——拿一份没人刷新过
+/// 的本地引用判「没前进」，正是 2026-10-08 `/opt/AgentPipeline` 的 main 停在 2.5 小时
+/// 前基线上的事故（`.scratch/deploy-divergence/issues/02`）。离线时宁可不合。
+///
+/// 三种读数：`Ok(Some(tip))` 取到了；`Ok(None)` 这个仓没有 `origin` 远端（基准本来就
+/// 是本地分支，谈不上陈旧）；`Err` 有远端但取不到——调用方必须拒执。
+///
+/// 住在修复域而不是 `git.rs`：主树的 `git.rs` 正被另一批在飞的改动占着，两批未提交
+/// 改动同文件必然互相覆盖；等那边落地后再收敛成一份（票面形状 1 的预构步因此未做，
+/// 落地记录里如实记）。
+pub async fn fetch_origin_tip(repo_path: &Path, default_branch: &str) -> Result<Option<String>> {
+    let repo_path = repo_path.to_path_buf();
+    let default_branch = default_branch.to_string();
+    crate::git::blocking(move || {
+        let repo = git2::Repository::open(&repo_path).map_err(crate::git::gerr)?;
+        let mut remote = match repo.find_remote("origin") {
+            Ok(r) => r,
+            // 只有「远端不存在」才是合法的 None（纯本地仓）；别的错误照实上传，
+            // 不许把一次真失败折叠成「没有 origin」——调用方据此拒执。
+            Err(e) if e.code() == git2::ErrorCode::NotFound => return Ok(None),
+            Err(e) => return Err(crate::git::gerr(e)),
+        };
+        let mut opts = git2::FetchOptions::new();
+        opts.prune(git2::FetchPrune::On);
+        remote
+            .fetch::<&str>(&[], Some(&mut opts), None)
+            .map_err(crate::git::gerr)?;
+        let tip = repo
+            .revparse_single(&format!("origin/{default_branch}"))
+            .and_then(|o| o.peel_to_commit())
+            .map_err(crate::git::gerr)?;
+        Ok(Some(tip.id().to_string()))
+    })
+    .await
+}
+
+/// 合入回执里的「基准与落点」读数（纯函数，决策 415）。
+///
+/// 说三件事，且只说读得出的：
+/// - **基线位移**：提议载荷记的 `base_commit` 与 fetch 后的远端尖端**不同**时才说话。
+///   「已 rebase 合入」半句**只在 rebase 真的动了分支时**才跟上（`rebased`）——基线动了
+///   而 rebase no-op（远端回退、修复分支已含新基准）的场合，只报位移事实，不编一句没跑过的动作；
+/// - **落点**：合入后默认分支站在哪个提交。**恒在**——它不依赖 origin 是否存在；
+/// - **与 origin 的关系**：领先几个提交（合入的修复本身就在其上）；读不到 / 没有 origin 就不编。
+pub fn merge_receipt_note(
+    base_commit: &str,
+    origin_tip: Option<&str>,
+    default_branch: &str,
+    merged_commit: &str,
+    ahead_of_origin: Option<usize>,
+    rebased: bool,
+) -> String {
+    fn short(oid: &str) -> &str {
+        oid.get(..7).unwrap_or(oid)
+    }
+    let mut parts = Vec::new();
+    if let Some(tip) = origin_tip {
+        if tip != base_commit {
+            let shift = format!("基线 {} → {}", short(base_commit), short(tip));
+            parts.push(if rebased {
+                format!("{shift}，已 rebase 合入")
+            } else {
+                shift
+            });
+        }
+    }
+    let landing = match ahead_of_origin {
+        Some(n) => format!(
+            "{default_branch} 现在落在 {}（领先 origin/{default_branch} {n} 个提交）",
+            short(merged_commit)
+        ),
+        None => format!("{default_branch} 现在落在 {}", short(merged_commit)),
+    };
+    parts.push(landing);
+    parts.join("；")
+}
+
 /// 修复的判据：这个项目能不能修（有没有 git 仓、有没有默认分支）。
 ///
 /// 报错要说得清「为什么不能修」，而不是让调用方去猜一个 `Err`。
@@ -691,4 +772,114 @@ pub fn repair_supported(project: &crate::types::Project) -> Result<()> {
         )));
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::merge_receipt_note;
+
+    /// 基线真的动了且 rebase 真的跑了：位移要说清「从哪到哪」，落点两个读数都在
+    /// （决策 415 裁决 2）。
+    #[test]
+    fn a_moved_base_is_spoken_with_both_endpoints() {
+        let note = merge_receipt_note(
+            "d4e11b9f00000000000000000000000000000000",
+            Some("a7f4785f00000000000000000000000000000000"),
+            "main",
+            "9f0e1d2c00000000000000000000000000000000",
+            Some(2),
+            true,
+        );
+        assert!(note.contains("基线 d4e11b9 → a7f4785"), "{note}");
+        assert!(note.contains("已 rebase 合入"), "{note}");
+        assert!(
+            note.contains("main 现在落在 9f0e1d2（领先 origin/main 2 个提交）"),
+            "{note}"
+        );
+    }
+
+    /// 基线动了但 rebase 是 no-op（远端回退、修复分支已含新基准）：只报位移事实，
+    /// **不许编一句没跑过的「已 rebase」**（评审抓出的说谎面）。
+    #[test]
+    fn a_moved_base_that_needed_no_rebase_does_not_claim_one() {
+        let note = merge_receipt_note(
+            "a7f4785f00000000000000000000000000000000",
+            Some("d4e11b9f00000000000000000000000000000000"),
+            "main",
+            "9f0e1d2c00000000000000000000000000000000",
+            Some(1),
+            false,
+        );
+        assert!(note.contains("基线 a7f4785 → d4e11b9"), "{note}");
+        assert!(!note.contains("rebase"), "no-op 不许自称 rebase 过：{note}");
+    }
+
+    /// 基线没动：位移那句**不出现**（没什么可说的），落点读数照说——回执不是只在
+    /// 出事时才有内容，「合入后 main 站在哪」每次都该答（决策 415 裁决 2）。
+    #[test]
+    fn an_unmoved_base_still_reports_where_main_landed() {
+        let tip = "a7f4785f00000000000000000000000000000000";
+        let note = merge_receipt_note(
+            tip,
+            Some(tip),
+            "main",
+            "9f0e1d2c00000000000000000000000000000000",
+            Some(1),
+            false,
+        );
+        assert!(!note.contains("基线"), "没动就别提基线：{note}");
+        assert!(note.contains("main 现在落在 9f0e1d2"), "{note}");
+    }
+
+    /// 领先数读不到：只报落点，**不编一个数**（决策 415 裁决 2 的「读不到就不编」）。
+    #[test]
+    fn an_unreadable_ahead_count_never_gets_invented() {
+        let note = merge_receipt_note(
+            "d4e11b9f00000000000000000000000000000000",
+            Some("a7f4785f00000000000000000000000000000000"),
+            "main",
+            "9f0e1d2c00000000000000000000000000000000",
+            None,
+            true,
+        );
+        assert!(
+            note.contains("main 现在落在 9f0e1d2")
+                && !note.contains('（')
+                && !note.contains("领先"),
+            "{note}"
+        );
+    }
+
+    /// 基线没动 + 领先数读不到（决策 412 的候选集遍历：措辞矩阵的最后一个空格）：
+    /// 只剩落点一句，一个修饰语都不带。
+    #[test]
+    fn an_unmoved_base_with_an_unreadable_ahead_reports_the_bare_landing() {
+        let tip = "a7f4785f00000000000000000000000000000000";
+        let note = merge_receipt_note(
+            tip,
+            Some(tip),
+            "main",
+            "9f0e1d2c00000000000000000000000000000000",
+            None,
+            false,
+        );
+        assert_eq!(note, "main 现在落在 9f0e1d2");
+    }
+
+    /// 本地仓（无 origin）：位移与领先数无从谈起，但**落点照报**——它是合入返回值里
+    /// 就有的读数，不该被 origin 的缺席一起吞掉（评审抓出的缺失面）。
+    #[test]
+    fn a_repo_without_origin_still_reports_where_main_landed() {
+        let note = merge_receipt_note(
+            "d4e11b9f00000000000000000000000000000000",
+            None,
+            "main",
+            "9f0e1d2c00000000000000000000000000000000",
+            None,
+            false,
+        );
+        assert!(!note.contains("基线"), "没有 origin 就没有基线可谈：{note}");
+        assert!(!note.contains("领先"), "没有 origin 就没有领先可谈：{note}");
+        assert!(note.contains("main 现在落在 9f0e1d2"), "{note}");
+    }
 }

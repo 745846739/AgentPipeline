@@ -45,9 +45,24 @@
 
 **验收**：
 
-- [ ] L2 集成：用裸 origin 夹具建 repair worktree → **让裸仓的 `main` 前进一条** → 合入 →
-      断言 `main` = **新尖端 + repair**（而不是旧基线上的提交）
-- [ ] L2 集成：同一用例断言**回执里出现「基线 … → …」**
-- [ ] L2 集成：origin 指向不存在的路径 → **拒执**，且文案说清「取不到 origin」（不是「闸门没过」那种含糊话）
-- [ ] L1 单元（若抽出 fetch 时有纯函数可钉）：fetch 结果的判定（取到 / 取不到 / 远端不存在）各一条
-- [ ] 手工面：一次「修复轮 + 紧接着一次部署」连跑，两端都不需要人 ssh 上去清分支（与 01 的手工面共用）
+- [x] L2 集成：用裸 origin 夹具建 repair worktree → **让裸仓的 `main` 前进一条** → 合入 →
+      断言 `main` = **新尖端 + repair**（而不是旧基线上的提交）——`tests/integration/repair.rs::a_merge_after_the_origin_moved_lands_on_the_new_tip_and_says_so`
+- [x] L2 集成：同一用例断言**回执里出现「基线 … → …」**（同上用例，另钉「已 rebase 合入」「main 现在落在」「领先 origin/main」）
+- [x] L2 集成：origin 指向不存在的路径 → **拒执**，且文案说清「取不到 origin」（不是「闸门没过」那种含糊话）——`an_unreachable_origin_refuses_the_merge_and_names_the_reason`（另断言 main 一个提交不动、worktree 与分支保留）
+- [x] L1 单元（若抽出 fetch 时有纯函数可钉）：fetch 结果的判定（取到 / 取不到 / 远端不存在）各一条——**偏差**：fetch 本体不是纯函数，L1 钉的是回执纯函数 `merge_receipt_note` **六条**（位移两端 / no-op 不自称 rebase / 没动不提基线 / 读不到不编数 / 没动×读不到只剩裸落点 / 无 origin 仍报落点）；「取到 / 取不到 / 远端不存在」三态由下面三条 L2 真 git 用例覆盖
+- [ ] 手工面：一次「修复轮 + 紧接着一次部署」连跑，两端都不需要人 ssh 上去清分支（与 01 的手工面共用）——**未做**（需要 106 现场，随部署同车验收）
+
+**Status:** done（已实现，决策 415，2026-10-09）
+
+## 落地记录（2026-10-09）
+
+**实现**：`repair.rs` 两个新函数——`fetch_origin_tip`（合入前 fetch，--prune；三种读数：取到 `Some(tip)` / 无 origin `None` / 取不到 `Err`）与 `merge_receipt_note`（回执纯函数：基线位移句只在真动了时出现 + 落点 + 领先数读不到不编）；`foreman_actions.rs::run_repair` 在 rebase 之前接 fetch（失败 → `Error::Conflict`「取不到 origin（…），不敢断言基准是否前进——没有合入」，提议保持 pending 可重按），合入后回执补「基线 xxx → yyy，已 rebase 合入；main 现在落在 zzz（领先 origin/main N 个提交）」。
+
+**与票面形状的两处偏差（如实记）**：
+
+1. **形状 1「抽出可复用的 fetch（预构）」未做**：票面要求把 `init_worktree_named` 里那 6 行 fetch 搬出来两处共用，但施工时主树 `git.rs` 正被并行任务（决策 413）占脏——两批未提交改动同文件必然互相覆盖（上一票踩过）。fetch 因此住在修复域 `repair.rs`（语义上这里也确实与建 worktree 那处**相反**：失败不阻断 vs 失败拒执，共用一份反而要给它加一个「失败算不算错」的参数）。等 413 落地后再收敛，函数 doc 里已注明。
+2. **L1 那条的形态**：票面写的是「fetch 结果的判定各一条」，实际 fetch 不是纯函数（真网络面），L1 改钉 `merge_receipt_note` 六条（评审后从四条补齐，见下），fetch 三态由 L2 真 git 用例覆盖（见验收第 4 条）。
+
+**评审轮（code-review 双轴，2026-10-10）**：抓出三个已修的缺陷——① 回执把「已 rebase 合入」写成恒在，rebase no-op（远端回退、修复分支已含新基准）时会编一句没跑过的动作 → `rebased` 改由「rebase 前 HEAD vs rebase 结果的 head」实测（读不到按「没跑过」报），L1 补 `a_moved_base_that_needed_no_rebase_does_not_claim_one`；② 落点读数在 origin 缺席时整句消失 → 落点**恒在**、无 origin 仍报（L1 `a_repo_without_origin_still_reports_where_main_landed`）；③ **建 worktree 之后 origin 被摘**是事故读数的另一半，原实现静默放行 → `base_ref` 来自 `origin/…` 而 fetch 读不到 origin 时同样拒执（L2 `an_origin_removed_after_the_worktree_was_cut_is_also_refused`）。另按决策 412 的候选集不变量把措辞矩阵补到全格（L1 `an_unmoved_base_with_an_unreadable_ahead_reports_the_bare_landing`）。判断型气味（fetch 与建 worktree 那处的重复、`merge_receipt_note` 五参数据团）经权衡**有意保留**，理由记在函数 doc。
+
+**验证**：L1 `repair.rs` 6 条新全绿；L2 `tests/integration/repair.rs` 3 条新全绿（裸 origin 夹具 + `remote set-url` 指向不存在路径 + `remote remove origin`）；合并新基线（5fa7476，含决策 413/416）后隔离 worktree 全量 `cargo test -p agentpipeline-core` **lib 828 通过 / integration 547 通过 · 4 ignored · 0 失败**，fmt + clippy（-D warnings）干净。手工面未做（见上）。

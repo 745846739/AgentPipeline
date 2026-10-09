@@ -28,7 +28,8 @@
 //!
 //! 故这里的变体选择是有意义的，不是随手挑：
 //! - `Error::Validation` → 400（参数不对、动作名不存在）
-//! - `Error::Conflict` → 409（情况变了：闸门没过、基准冲突、提议缺载荷）
+//! - `Error::Conflict` → 409（情况变了：闸门没过、基准冲突、提议缺载荷、取不到 origin——
+//!   最后这条同样是「按下时的基准读数不再可信」，按不动的那颗钮配一颗说得清理由的 409）
 //! - `Error::Task` → 404（台账里那个东西不在：项目不存在）
 
 use std::path::Path;
@@ -89,13 +90,20 @@ pub async fn run_env(
     Ok(Some(outcome.content))
 }
 
-/// 按下一条修复提议：**先 rebase 检查，再合入**。
+/// 按下一条修复提议：**先取新基准，再 rebase 检查，然后合入**。
 ///
 /// 指纹换义（决策 212①）就落在这里：普通提议的拒执判据是「任务状态变了吗」，而修复执行的是
 /// 「合入一个分支」——分支不会因为别的事变迁而失效，会变的是**基准**。故执行时先走 merge
 /// 阶段已有的 `rebase_onto_with_auto_resolve`：
 /// - 能干净 rebase（或自动解决冲突）→ 合入；
 /// - 冲突 → **拒执**，并把冲突文件列给你（那是你要动手的地方）。
+///
+/// rebase 之前还有一道 **fetch**（决策 415）：这条路上「基准有没有前进」的判定读的是
+/// `origin/{default}`，而全仓唯一的 fetch 在建 worktree 那条路上（且失败不阻断）——
+/// 不 fetch 就是在拿一份可能躺了几个小时的本地引用判基准，2026-10-08 的合入事故正是
+/// 这样落在陈旧基线上的。取不到 origin → **拒执**（离线时宁可不合）；基准来自 origin
+/// 而仓里 origin 已经不在（建 worktree 之后被摘掉）同样拒执——那正是「读数陈旧」的
+/// 另一半，静默放行等于把事故重演一遍。
 pub async fn run_repair(store: &Store, proposal: &ForemanProposal) -> Result<Option<String>> {
     let outcome = repair_outcome_of(proposal)?;
     if !outcome.gate_passed {
@@ -117,25 +125,83 @@ pub async fn run_repair(store: &Store, proposal: &ForemanProposal) -> Result<Opt
     let repo = Path::new(&project.local_path);
     let session = RepairSession::from_outcome(&outcome, &proposal.session_id);
 
-    // ① 基准前进 / 冲突：以「能不能干净 rebase」为准（指纹换义）
-    if let crate::git::AutoRebaseOutcome::Conflict { files } = crate::git::Git
+    // ① 合入前 fetch（决策 415）：把 origin 的新尖端取回来，才谈得上「基准有没有前进」。
+    //    与建 worktree 那处的「fetch 失败不阻断」相反：这条路上旧读数会直接把合入引到
+    //    错误的基线上，取不到就拒执。
+    let origin_tip =
+        match crate::pipeline::repair::fetch_origin_tip(repo, &project.default_branch).await {
+            Ok(tip) => tip,
+            Err(e) => {
+                return Err(Error::Conflict(format!(
+                "取不到 origin（{e}），不敢断言基准是否前进——没有合入。修好网络/远端之后再按一次。"
+            )));
+            }
+        };
+    // 基准来自 origin 而 origin 没了：base_ref 仍会解析到一份**再也不会刷新**的本地引用，
+    // 正是事故读数的形状——拒执，不静默放行。
+    if origin_tip.is_none() && session.base_ref.starts_with("origin/") {
+        return Err(Error::Conflict(format!(
+            "基准来自 {}，但这个仓已经没有 origin 远端——不敢断言基准是否前进，没有合入。",
+            session.base_ref
+        )));
+    }
+
+    // ② 基准前进 / 冲突：以「能不能干净 rebase」为准（指纹换义）。fetch 之后这一步读到的
+    //    `origin/{default}` 已经是新尖端，rebase 会真的把修复垫到最新基准上。
+    //    `rebased` 记下 rebase 是否**真的动了分支**（no-op 时不许在回执里自称 rebase 过）。
+    let head_before_rebase = crate::git::Git
+        .rev_parse(&session.worktree, "HEAD")
+        .await
+        .ok();
+    let rebase_outcome = crate::git::Git
         .rebase_onto_with_auto_resolve(&session.worktree, &session.base_ref)
-        .await?
-    {
+        .await?;
+    if let crate::git::AutoRebaseOutcome::Conflict { files } = &rebase_outcome {
         return Err(Error::Conflict(format!(
             "修复分支与基准冲突（{}），没有合入——先解决这几处再按：{}",
             files.len(),
             files.join("、")
         )));
     }
+    let rebased = match (&head_before_rebase, &rebase_outcome) {
+        (Some(before), crate::git::AutoRebaseOutcome::Clean { head })
+        | (Some(before), crate::git::AutoRebaseOutcome::AutoResolved { head, .. }) => {
+            before != head
+        }
+        // 读不到 rebase 前的 HEAD：宁可按「没跑过」报（不编一句没跑过的动作）。
+        _ => false,
+    };
 
-    // ② 合入（与 merge 阶段同一个 git 出口）+ 回收（合入成功 → 删分支、删 worktree）
-    crate::git::Git
+    // ③ 合入（与 merge 阶段同一个 git 出口）+ 回收（合入成功 → 删分支、删 worktree）
+    let merged = crate::git::Git
         .merge_into_default_branch(repo, &project.default_branch, &session.branch)
         .await?;
     finish_repair(repo, &session, true).await?;
+
+    // ④ 回执补读数（决策 415）：基线位移的事实 + main 的落点与它和 origin 的关系。
+    //    领先数读不到就只报落点，不编一个数。
+    let ahead = if origin_tip.is_some() {
+        crate::git::Git
+            .ahead_count(
+                repo,
+                &format!("origin/{}", project.default_branch),
+                &project.default_branch,
+            )
+            .await
+            .ok()
+    } else {
+        None
+    };
+    let note = crate::pipeline::repair::merge_receipt_note(
+        &outcome.base_commit,
+        origin_tip.as_deref(),
+        &project.default_branch,
+        &merged.commit,
+        ahead,
+        rebased,
+    );
     Ok(Some(format!(
-        "已合入 {} → {} 并回收修复 worktree（分支已删）",
+        "已合入 {} → {} 并回收修复 worktree（分支已删）。{note}",
         session.branch, project.default_branch
     )))
 }

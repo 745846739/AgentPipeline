@@ -3230,6 +3230,21 @@ config.rs}`、`tests/e2e/tests/integration/stage_boundary.rs`、`docs/testing.md
 
 **来源**：`.scratch/foreman-work-record/issues/02`（事故账 `incident-2026-10-08.md` 的问题三）；落地 `crates/core/src/pipeline/foreman/{changes.rs, runner.rs}`、`crates/core/tests/integration/foreman.rs`
 
+### 决策 415 · 修复合入前必 fetch，取不到就拒执；回执带基线位移与落点读数（票 `deploy-divergence` 02）
+
+**起因**：2026-10-08 部署事故的另一半（票 02）：11:08 那条「合入修复分支 → main」执行后，106 检出的 `main` 停在 **2.5 小时前基线**上的提交，`origin/main...main` = **6 1**，部署继续失败在 `git pull --ff-only`（与票 01 同一失败面、不同成因）。根因不是少了校验，是**读数陈旧**：`run_repair` 有「先 rebase 再合入」（决策 212①），但 rebase 的基准从**本地 `origin/main` 引用**解析，而全仓唯一的 fetch 在建 worktree 那条路上（且明确「fetch 失败不阻断」），`repair.rs` / `foreman_actions.rs` 里没有任何 fetch——11:08 的判定读到的是 08:25 起没人刷新过的引用（仍是 `d4e11b9`），得出「HEAD 已是 base 后代 → Clean（no-op）」，随后合入走真 ff 把 `main` 移到陈旧基线上的提交。且它是**静默的**：回执只说「已合入」，人读到的是好消息。
+
+**裁决**：
+
+1. **合入前 fetch，失败即拒执**（`repair.rs::fetch_origin_tip`，在 rebase 之前调用）：与建 worktree 那处的「fetch 失败不阻断」**语义相反**——那里旧基准只让修复起点旧一点、改动本身照常成立，这条路上旧读数会直接把合入引到错误的基线上，离线时宁可不合。拒执文案说清「取不到 origin，不敢断言基准是否前进」（不是「闸门没过」那种含糊话）。本地仓（无 origin 远端）返回 `None` 照旧往下走——没有远端的仓谈不上「基准新鲜度」；但**基准来自 `origin/…` 而 origin 在建 worktree 之后被摘掉**是第三种拒执（评审补的面）：`base_ref` 仍会解析到一份再也不会刷新的本地引用，正是事故读数的形状，静默放行等于把事故重演一遍。fetch（--prune）住在**修复域**而不是 `git.rs`：主树 `git.rs` 当时被并行任务（决策 416）占脏，两批未提交改动同文件必然互相覆盖；票面形状 1 的「抽出共享 fetch 预构」一步因此未做，等 416 落地后再收敛成一份（如实记在票面落地记录）。
+2. **基线位移写进回执，但不因位移拒执**：fetch 后把提议载荷里的 `base_commit` 与 `origin/{default}` 新尖端比对，位移时回执出现「基线 d4e11b9 → a7f4785」。**不要求人再按一次、不因基线前进而拒执**——rebase 已经保证结果正确，再加一道按键会让「白天有人推了 main」变成修复永远合不进去。
+3. **回执补两个读数**（今天只有「已合入」三个字），且**只说读得出的**（`merge_receipt_note` 纯函数，评审后定形）：落点「main 现在落在 zzz」**恒在**——它来自合入返回值，不依赖 origin 是否存在；「已 rebase 合入」半句只在 rebase **真的动了分支**时跟上（no-op 时不许编一句没跑过的动作）；与 origin 的关系（领先数）读不到就只报落点，**不编一个数**。读数从 `merge_into_default_branch` 的返回值与 `ahead_count` 拿，不加新的 git 出口。
+4. **零新增路由分支**：拒执走既有的 `Error::Conflict`（409），提议保持 pending、可重按——与「基准冲突拒执」同一条路，不新增 `GateFailureKind`、不加路由分支（票面 Q10 的 A 案）。
+
+**验证**：L1 `repair.rs` **6 条**——`a_moved_base_is_spoken_with_both_endpoints`（位移两端短哈希 + 落点两个读数）/ `a_moved_base_that_needed_no_rebase_does_not_claim_one`（no-op 不许自称 rebase 过）/ `an_unmoved_base_still_reports_where_main_landed`（没动不提基线、落点照说）/ `an_unreadable_ahead_count_never_gets_invented`（读不到不编数）/ `an_unmoved_base_with_an_unreadable_ahead_reports_the_bare_landing`（决策 412 候选集遍历：措辞矩阵最后一个空格，只剩裸落点一句）/ `a_repo_without_origin_still_reports_where_main_landed`（无 origin 位移与领先无从谈起，落点照报）。L2 `tests/integration/repair.rs` **3 条**（真 git + 裸 origin 夹具）——`a_merge_after_the_origin_moved_lands_on_the_new_tip_and_says_so`（事故逐项复刻：worktree 从 origin/main 切出 → 远端 main 前进、本地 origin/main 引用拨回陈旧 → 合入；断言 main = **新尖端 + repair**（远端那条提交不失踪）+ 回执含「基线 xxx → yyy」「已 rebase 合入」「main 现在落在」「领先 origin/main」+ 现场照常回收）、`an_unreachable_origin_refuses_the_merge_and_names_the_reason`（origin 指向不存在路径 → 拒执且文案含「取不到 origin」「不敢断言基准」、main 一个提交不动、worktree 与分支保留）、`an_origin_removed_after_the_worktree_was_cut_is_also_refused`（评审补：origin 被摘掉 → 拒执「已经没有 origin」、main 不动、现场保留）。隔离 worktree（基点 5fa7476）`cargo test -p agentpipeline-core` 全套 **lib 828 通过 / integration 547 通过 · 4 ignored · 0 失败**，fmt + clippy（-D warnings）干净。
+
+**来源**：`.scratch/deploy-divergence/issues/02`（2026-10-08 部署事故 `01M4CDY9…` 复盘的第二条机制）；落地 `crates/core/src/pipeline/{repair.rs, foreman_actions.rs}`、`crates/core/tests/integration/repair.rs`
+
 ### 决策 416 · test 产出落提交 + 工作区守卫确定性打回 + merge 自动留痕兜底 + 「环境受阻」一等 pending（票 `test-output-commit` 01）
 
 **起因**：2026-10-09 任务 `01M4CD59Y977ZQ0GMY9MPSFFMX` 走到 merge 卡死：`pending_reason = {"type":"retry_exhausted","message":"git 错误：unstaged changes exist in workdir; class=Rebase (29)"}`，动作集只有「重试合并」与「终止任务」——重试必然同样失败，这是一个没有出口的死锁。三段拆开各自都对、接起来是死路：① test.execute 把集成测试写进 worktree，而 `TEST_EX_SYSTEM` 的输出步骤**没有「落提交」**（对比 develop 有决策 391 的提交契约）；② merge 阶段 A 第 (2) 步是 libgit2 rebase，要求工作区干净；③ 节点错误处置把这条 git 报错归成 `retry_exhausted`，配一颗必然重败的钮。历史上没炸穿是因为 `run_command` 在 test.execute 仍广告着（决策 396 只禁了 review / test_design），agent 会不会顺手 commit 全凭那次的自觉——非确定。人工解除（worktree 补提交 `96b095f` + resume goto merge.execute）时 pre-commit 又拦下一次真缺陷（未使用的 `use`）——「跳过钩子直接合」不是出路。票面给出 A / B / C 三个候选形态、triage 选 A 并把验收②并入；本决策**三层全落**，因为三层各堵一段：A 管「产出没人提交」（根治），B 管「漏网的在合入前自愈」（兜底），C 管「真撞上时别把人引向必然失败的路」（止损）——只落 A，模型漏一步就回今天这个坑；只落 B / C，产出照样没人提交。
