@@ -11,6 +11,11 @@
 //! 否则 `https://` 会吃掉行尾真命中）→ HTML；`[^*\n]+` 至少要一个非星非换行字符，
 //! 故掩码 `***` 天然不命中）——这是场景 8「hits === []」的独立第二实现，两边一起烂时
 //! 至少 Rust 这半边会红。
+//!
+//! **2026-10-10 处置（edf8b95 的后续）**：`.scratch/` 整体移出版本库后，读
+//! `IMPLEMENTATION.md` 的场景 13–17 照 `landing_shape_readings_once` 的先例摘
+//! `#[ignore]`（本地 `--ignored` 复跑）；产品侧行号/内容双钉的场景 9–11 照旧全跑，
+//! 行号随 a0ece2a 在 TaskDetail 上方的 +1 行随迁。
 use std::collections::BTreeSet;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -655,9 +660,9 @@ fn scene_09_detail_fold_band_820_1099() {
         ],
     );
     assert_eq!(
-        line_n(&root, "frontend/src/routes/TaskDetail.svelte", 680).trim(),
+        line_n(&root, "frontend/src/routes/TaskDetail.svelte", 681).trim(),
         "@media (min-width: 820px) and (max-width: 1099px) {",
-        "场景 9：媒体查询落在 680 行（决策 393 之前 677；决策 215 的块体 669–681 随迁到 672–684）"
+        "场景 9：媒体查询落在 681 行（决策 393 之前 677；决策 215 的块体随迁 672–684；评审台账 a0ece2a 于上方 +1 行 → 681，块体 673–685）"
     );
     let geo = read(&root, "frontend/e2e/ux2-geometry.spec.ts");
     assert!(
@@ -697,12 +702,12 @@ fn scene_10_band_boundaries_1100_and_819() {
     );
     // <479 档的 display:block 双保险仍在原位（票 01 面一格不动的源码侧牙齿）
     assert_eq!(
-        line_n(&root, rel, 894).trim(),
+        line_n(&root, rel, 895).trim(),
         ".detail.split {",
-        "场景 10：<479 档 .detail.split 规则位移"
+        "场景 10：<479 档 .detail.split 规则位移（a0ece2a 于上方 +1 行，894 → 895）"
     );
     assert_eq!(
-        line_n(&root, rel, 895).trim(),
+        line_n(&root, rel, 896).trim(),
         "display: block;",
         "场景 10：<479 档 display:block 被动"
     );
@@ -727,7 +732,8 @@ fn scene_11_detail_other_rules_untouched() {
     // diff 读数，已摘到 `#[ignore]` 的 `landing_shape_readings_once`（按分支取数不是闸门
     // 判据）。实测读数（(13,0)，落地提交 116745b）留档于
     // `.scratch/ux-audit-3/IMPLEMENTATION.md`；下面按**文件内容**的行号/内容双钉照旧全跑。
-    // 既有的 `overflow-x: auto`（决策 393 前在 961 行的预存在规则）必须落在本票改动块（现 672–684）之外
+    // 既有的 `overflow-x: auto`（决策 393 前在 961 行的预存在规则）必须落在本票改动块
+    // （决策 393 随迁 672–684；a0ece2a +1 行 → 现 673–685）之外
     let td = read(&root, rel);
     let overflow_lines: Vec<usize> = td
         .lines()
@@ -736,27 +742,27 @@ fn scene_11_detail_other_rules_untouched() {
         .map(|(i, _)| i + 1)
         .collect();
     assert!(
-        overflow_lines.iter().all(|n| !(672..=684).contains(n)),
-        "场景 11：overflow-x 渗进本票改动块（行号随决策 393 的 +3 行迁移）→ 行 {overflow_lines:?}"
+        overflow_lines.iter().all(|n| !(673..=685).contains(n)),
+        "场景 11：overflow-x 渗进本票改动块（行号随决策 393 / a0ece2a 随迁）→ 行 {overflow_lines:?}"
     );
-    // 桌面 / 窄档既有规则逐条在原位（行号 + 内容双钉）
+    // 桌面 / 窄档既有规则逐条在原位（行号 + 内容双钉；a0ece2a 于上方 +1 行）
     assert_eq!(
-        line_n(&root, rel, 666).trim(),
+        line_n(&root, rel, 667).trim(),
         "max-width: 1240px;",
         "场景 11：桌面档 max-width 被动"
     );
     assert_eq!(
-        line_n(&root, rel, 668).trim(),
+        line_n(&root, rel, 669).trim(),
         "grid-template-columns: minmax(0, 1fr) 320px;",
         "场景 11：桌面档列串被动"
     );
     assert_eq!(
-        line_n(&root, rel, 669).trim(),
+        line_n(&root, rel, 670).trim(),
         "gap: 18px;",
         "场景 11：gap 被动"
     );
     assert_eq!(
-        line_n(&root, rel, 670).trim(),
+        line_n(&root, rel, 671).trim(),
         "align-items: start;",
         "场景 11：align-items 被动"
     );
@@ -790,6 +796,7 @@ fn scene_12_geometry_test_has_no_overflow_assertion() {
 
 /// 场景 13（AC-5 / 复核票）：票 02/06/11/12 复核后关闭，探针值与 14 passed 复跑留档；冻结面不动。
 #[test]
+#[ignore = "锚在 .scratch/ux-audit-3/IMPLEMENTATION.md 上（edf8b95 起移出版本库，闸门克隆无此目录）：本地 --ignored 复跑；判据不是分支无关回归"]
 fn scene_13_recheck_tickets_recorded_and_frozen() {
     let root = root();
     let impl_md = read(&root, ".scratch/ux-audit-3/IMPLEMENTATION.md");
@@ -822,6 +829,7 @@ fn scene_13_recheck_tickets_recorded_and_frozen() {
 
 /// 场景 14（AC-6 / 新开票）：票 07/09/10 新开无缺陷——记录即关，探针值入档。
 #[test]
+#[ignore = "锚在 .scratch/ux-audit-3/IMPLEMENTATION.md 上（edf8b95 起移出版本库，闸门克隆无此目录）：本地 --ignored 复跑；判据不是分支无关回归"]
 fn scene_14_new_tickets_recorded_as_no_defect() {
     let root = root();
     let impl_md = read(&root, ".scratch/ux-audit-3/IMPLEMENTATION.md");
@@ -863,6 +871,7 @@ fn scene_14_new_tickets_recorded_as_no_defect() {
 
 /// 场景 15（AC-6 / wontfix）：票 01/03/04 维持 wontfix——记档 + 无回归 + 溢出列证据。
 #[test]
+#[ignore = "锚在 .scratch/ux-audit-3/IMPLEMENTATION.md 上（edf8b95 起移出版本库，闸门克隆无此目录）：本地 --ignored 复跑；判据不是分支无关回归"]
 fn scene_15_wontfix_tickets_kept_and_code_untouched() {
     let root = root();
     let impl_md = read(&root, ".scratch/ux-audit-3/IMPLEMENTATION.md");
@@ -886,6 +895,7 @@ fn scene_15_wontfix_tickets_kept_and_code_untouched() {
 
 /// 场景 16（AC-7 / 闸门）：五条本地闸门结果入档（本阶段另行实跑，命令台账见 test-report.md）。
 #[test]
+#[ignore = "锚在 .scratch/ux-audit-3/IMPLEMENTATION.md 上（edf8b95 起移出版本库，闸门克隆无此目录）：本地 --ignored 复跑；判据不是分支无关回归"]
 fn scene_16_gate_summary_documented() {
     let root = root();
     let impl_md = read(&root, ".scratch/ux-audit-3/IMPLEMENTATION.md");
@@ -907,6 +917,7 @@ fn scene_16_gate_summary_documented() {
 
 /// 场景 17（AC-7 / 改动范围）：产品改动只落 frontend/src + frontend/e2e；证据文件冻结；四段 message 可反查。
 #[test]
+#[ignore = "锚在 .scratch/ux-audit-3/IMPLEMENTATION.md 上（edf8b95 起移出版本库，闸门克隆无此目录）：本地 --ignored 复跑；判据不是分支无关回归"]
 fn scene_17_change_scope_and_evidence_freeze() {
     let root = root();
     let impl_md = read(&root, ".scratch/ux-audit-3/IMPLEMENTATION.md");

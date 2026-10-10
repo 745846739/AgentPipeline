@@ -50,6 +50,12 @@
 //!    沿用票文件自身目录的锚点——两种写法在语料里都真实可达，故链接目标只要在
 //!    「票文件目录」或「轮次根」任一锚下解析到真实文件即算可达（被点名的票文件
 //!    本身必须存在，这由 `=前轮 NN` 的票号存在性断言单独硬证）。观察项见报告。
+//! 5. **2026-10-10 处置（edf8b95 的后续）**：`.scratch/`（过程草稿区）整体移出版本库并
+//!    加入 .gitignore，闸门克隆里不再有审计工件——凡读 `.scratch/ux-audit-3/**` 的场景
+//!    照场景 6 的先例摘 `#[ignore]`（判据不再是分支无关回归，工件在本地时 `--ignored`
+//!    复跑）；场景 13 的「Markdown 不被误挡」被新 .gitignore 口径整体取代，场景 15 的
+//!    提交粒度不变量终结于 edf8b95 本身（该提交清空了 issues/ 的树）。产品侧的
+//!    行号/内容双钉不受影响，照旧全跑。
 
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
@@ -368,6 +374,7 @@ fn find_named(root: &Path, name: &str) -> PathBuf {
 
 /// 骨架先落盘：INDEX 与占位壳同落、占位可证、回填在更晚的提交、正文不早于骨架。
 #[test]
+#[ignore = "锚在 .scratch/ 审计工件上（edf8b95 起移出版本库，闸门克隆无此目录）：工件在本地时 --ignored 复跑；判据不是分支无关回归"]
 fn scene_01_index_skeleton_lands_with_placeholders_before_backfill() {
     let root = root();
     assert!(
@@ -457,6 +464,7 @@ fn scene_01_index_skeleton_lands_with_placeholders_before_backfill() {
 
 /// 候选编号集合与 NN-slug 文件集合相等，每条正文四栏齐备且无占位标记。
 #[test]
+#[ignore = "锚在 .scratch/ 审计工件上（edf8b95 起移出版本库，闸门克隆无此目录）：工件在本地时 --ignored 复跑；判据不是分支无关回归"]
 fn scene_02_every_candidate_has_a_body_with_four_fields() {
     let root = root();
     let index = read(&root, INDEX_REL);
@@ -526,6 +534,7 @@ fn scene_02_every_candidate_has_a_body_with_four_fields() {
 
 /// 票 18/21/22 三条各有结论（落四档）+ 判据，且与源码现状逐条对得上。
 #[test]
+#[ignore = "锚在 .scratch/ 审计工件上（edf8b95 起移出版本库，闸门克隆无此目录）：工件在本地时 --ignored 复跑；判据不是分支无关回归"]
 fn scene_03_three_named_rechecks_have_conclusions_and_criteria() {
     let root = root();
     let bodies = bodies_texts(&root);
@@ -666,6 +675,7 @@ fn walk_source_hits(root: &Path, needle: &str) -> Vec<String> {
 
 /// 证据等级 ∈ {实测, 代码, 未验证} 且与出处形态一致；抽查的行号 100% 命中。
 #[test]
+#[ignore = "锚在 .scratch/ 审计工件上（edf8b95 起移出版本库，闸门克隆无此目录）：工件在本地时 --ignored 复跑；判据不是分支无关回归"]
 fn scene_04_evidence_levels_are_traceable_with_source_spot_checks() {
     let root = root();
     for (rel, txt) in bodies_texts(&root) {
@@ -750,6 +760,7 @@ fn scene_04_evidence_levels_are_traceable_with_source_spot_checks() {
 
 /// 「与前轮关联」取值合法、点名的前轮票号全部可达、wontfix 不复活、决策 215/216/217 未动。
 #[test]
+#[ignore = "锚在 .scratch/ 审计工件上（edf8b95 起移出版本库，闸门克隆无此目录）：工件在本地时 --ignored 复跑；判据不是分支无关回归"]
 fn scene_05_prior_round_links_resolve_and_wontfix_stays_closed() {
     let root = root();
     let prior_dir2 = root.join(".scratch/ux-audit-2/issues");
@@ -968,6 +979,7 @@ fn scene_06_product_code_zero_diff_and_sole_allowed_changes() {
 
 /// 新 spec 存在、文件级 skip 守卫在首位、14 例、只 import 既有 harness/scripts 导出。
 #[test]
+#[ignore = "锚在 .scratch/ 审计工件上（edf8b95 起移出版本库，闸门克隆无此目录）：工件在本地时 --ignored 复跑；判据不是分支无关回归"]
 fn scene_07_new_spec_exists_and_skips_by_default() {
     let root = root();
     let spec = read(&root, SPEC_REL);
@@ -1115,6 +1127,7 @@ fn scene_09_prior_audit_specs_untouched() {
 
 /// README 四条复现命令齐备、命令指向的文件真实存在、「未验证」清单与票面双向一致。
 #[test]
+#[ignore = "锚在 .scratch/ 审计工件上（edf8b95 起移出版本库，闸门克隆无此目录）：工件在本地时 --ignored 复跑；判据不是分支无关回归"]
 fn scene_10_readme_lists_reproducible_commands_and_unverified_items() {
     let root = root();
     let readme = read(&root, AUDIT_README_REL);
@@ -1165,6 +1178,7 @@ fn scene_10_readme_lists_reproducible_commands_and_unverified_items() {
 
 /// 候选池冻结在 A∪B∪C 三源：逐行可归类、C 组 0 条、编号连续、无全量重扫痕迹。
 #[test]
+#[ignore = "锚在 .scratch/ 审计工件上（edf8b95 起移出版本库，闸门克隆无此目录）：工件在本地时 --ignored 复跑；判据不是分支无关回归"]
 fn scene_11_candidate_pool_frozen_to_three_sources() {
     let root = root();
     let index = read(&root, INDEX_REL);
@@ -1211,6 +1225,7 @@ fn scene_11_candidate_pool_frozen_to_three_sources() {
 
 /// 正文七栏齐备、边界/建议非空、叠词表合法、只到「建议」层（无 What to build）。
 #[test]
+#[ignore = "锚在 .scratch/ 审计工件上（edf8b95 起移出版本库，闸门克隆无此目录）：工件在本地时 --ignored 复跑；判据不是分支无关回归"]
 fn scene_12_body_shape_stops_at_suggestion_layer() {
     let root = root();
     for (rel, txt) in bodies_texts(&root) {
@@ -1244,6 +1259,7 @@ fn scene_12_body_shape_stops_at_suggestion_layer() {
 
 /// PNG 被 .gitignore 挡住、Markdown 不被误挡、形态照 :25-28 先例、status 无二进制噪声。
 #[test]
+#[ignore = "edf8b95 起 .scratch/ 整体不入库：「Markdown 不被误挡」判据被新 .gitignore 口径取代——截图不入库改由 .scratch/ 一行统一承担"]
 fn scene_13_png_ignored_markdown_tracked() {
     let root = root();
 
@@ -1299,6 +1315,7 @@ fn scene_13_png_ignored_markdown_tracked() {
 
 /// harness 造不出的档不冒充「实测」；凡标「实测」必有可引用读数。
 #[test]
+#[ignore = "锚在 .scratch/ 审计工件上（edf8b95 起移出版本库，闸门克隆无此目录）：工件在本地时 --ignored 复跑；判据不是分支无关回归"]
 fn scene_14_unfalsifiable_states_never_claimed_as_measured() {
     let root = root();
     let unseedable = ["context_overflow", "重试耗尽", "并发安装", "真重启"];
@@ -1325,6 +1342,7 @@ fn scene_14_unfalsifiable_states_never_claimed_as_measured() {
 
 /// 任一中断点上都有一份自足清单：文件自足、状态列回填、无悬空引用、提交粒度无空目录态。
 #[test]
+#[ignore = "工件已移出版本库（edf8b95）；「凡触及 issues/ 的提交目录非空」的不变量也终结于该提交本身——判据整体失效，本地留档复查用"]
 fn scene_15_interruptible_selfcontained_checklist() {
     let root = root();
     let rels = body_rels(&root);
