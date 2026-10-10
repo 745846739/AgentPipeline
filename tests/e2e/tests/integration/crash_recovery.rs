@@ -157,6 +157,7 @@ fn pipeline_script(task_id: &str, stall_at: &[(Stage, Node)]) -> Script {
             approved: true,
             review_report_path: Some("review-report.md".into()),
             required_changes: vec![],
+            ..Default::default()
         });
     staged(&mut s, Stage::Test, Node::Execute, stall_at)
         .write_file("test-report.md", "# 测试报告\n全部通过\n")

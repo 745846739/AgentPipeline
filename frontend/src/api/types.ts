@@ -191,6 +191,24 @@ export interface TaskDetail {
   allowed_actions: AllowedAction[];
   depends_on: string[];
   blocks: string[];
+  /** 评审轮间台账（票 review-round-ledger 01）。null = 无评审产出或旧产出。 */
+  review_ledger: ReviewLedger | null;
+}
+
+/**
+ * 评审轮间台账（票 review-round-ledger 01 L3）：面板渲染成
+ * 「第 N 轮 · 上轮 M 条已改 k · 本轮新增 j」。后端从 review 投影出这四个数，
+ * 不把整份 metadata 搬给前端。
+ */
+export interface ReviewLedger {
+  /** 第几轮（1-based）。 */
+  round: number;
+  /** 上一轮 required_changes 总条数（M）。 */
+  prev_total: number;
+  /** 上一轮中本轮判定「改完」的条数（k）。 */
+  prev_resolved: number;
+  /** 本轮新增发现条数（j）。 */
+  new_count: number;
 }
 
 export interface Transition {

@@ -1048,6 +1048,35 @@ pub struct ReviewRequiredChange {
     pub finding: Option<String>,
 }
 
+/// 上一轮 `required_changes` 的逐条核对结论（票 `review-round-ledger` 01）。
+///
+/// 报告「逐条核对」栏的**结构化投影**：落库后由面板渲染成「上轮 M 条已改 k」。
+/// 不复用 [`ReviewRequiredChange`]——那是「本轮要求改什么」，这是「上轮要求的改没改完」，
+/// 语义相反（一个是待办、一个是核销），合并在一处会让打回反馈段误把核销项当成新要求回灌。
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
+pub struct ReviewChangeCheck {
+    pub path: String,
+    pub action: FileAction,
+    /// 核销结论。`Partial` 的差在哪写进 [`ReviewChangeCheck::note`]。
+    pub resolution: ChangeResolution,
+    /// 「部分 / 未改」时的差在哪（一两句话）；`Resolved` 不填。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(description = "部分/未改时差在哪（一两句）；改完不填")]
+    pub note: Option<String>,
+}
+
+/// 逐条核对的三档结论（票 `review-round-ledger` 01）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum ChangeResolution {
+    /// 改完。
+    Resolved,
+    /// 没改。
+    Unresolved,
+    /// 改了一部分，还差一截（差在 `note`）。
+    Partial,
+}
+
 /// review.execute 的 submit_metadata。
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize, JsonSchema)]
 pub struct ReviewResult {
@@ -1056,6 +1085,42 @@ pub struct ReviewResult {
     pub review_report_path: Option<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub required_changes: Vec<ReviewRequiredChange>,
+    /// 本次评审是第几轮（1-based）。**不在模型的产出契约里**——由编排侧在落库时按
+    /// 「该任务已**成功收口**的 review.execute run 数 + 1」推导写入（`Store::review_round_count`，
+    /// 决策：轮数不依赖报告正文；数成功的行不数 run 行，节点内重试与超时梯子的失败行
+    /// 都属同一轮）。`0` = 旧产出（本字段落地前）或非 review 场景，面板据此判定「无台账」。
+    /// `skip_serializing_if`：未盖章时序列化形状与本字段落地前逐字节相同
+    /// ——`review_required_changes_segment` 等读回方拿到的旧 metadata 不凭空多一个 `"round":0`。
+    #[serde(default, skip_serializing_if = "is_zero_round")]
+    pub round: u32,
+    /// 上一轮 `required_changes` 的逐条核对（报告「逐条核对」栏的结构化投影）。
+    /// 首轮为空——空即不渲染，不塞「无上一轮」占位进结构化字段。
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub prev_change_checks: Vec<ReviewChangeCheck>,
+    /// 本轮新增、上一轮不存在的发现（报告「本轮新增」栏的结构化投影）。
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub new_findings: Vec<ReviewRequiredChange>,
+}
+
+/// `ReviewResult::round` 的「未盖章」判据（`skip_serializing_if`）。
+fn is_zero_round(round: &u32) -> bool {
+    *round == 0
+}
+
+/// 评审轮间台账的**前端投影**（票 `review-round-ledger` 01 L3）。
+///
+/// 从 [`ReviewResult`] 投影出「第 N 轮 · 上轮 M 条已改 k · 本轮新增 j」所需的四个数，
+/// 不把整份 metadata（含 findings 正文）搬给前端。`Store::review_ledger` 是唯一取数口。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ReviewLedger {
+    /// 第几轮（1-based）。
+    pub round: u32,
+    /// 上一轮 `required_changes` 总条数（M）。
+    pub prev_total: u32,
+    /// 上一轮中本轮判定「改完」的条数（k）。
+    pub prev_resolved: u32,
+    /// 本轮新增发现条数（j）。
+    pub new_count: u32,
 }
 
 /// test.execute 的 submit_metadata。
@@ -1770,6 +1835,31 @@ pub fn stage_may_use_ask(stage: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 票 review-round-ledger 01：旧产出（无新字段）向后兼容——读不炸、未盖章时序列化
+    /// 形状与本字段落地前逐字节相同（`review_required_changes_segment` 等读回方不凭空
+    /// 多一个 `"round":0`）。
+    #[test]
+    fn review_result_is_backward_compatible_and_only_stamps_round_when_set() {
+        let legacy = serde_json::json!({
+            "approved": false,
+            "review_report_path": "review-report.md",
+            "required_changes": []
+        });
+        let parsed: ReviewResult = serde_json::from_value(legacy).unwrap();
+        assert_eq!(parsed.round, 0, "旧产出 round 走默认 0");
+        assert!(parsed.prev_change_checks.is_empty());
+        assert!(parsed.new_findings.is_empty());
+
+        let wire = serde_json::to_value(&parsed).unwrap();
+        assert!(wire.get("round").is_none(), "round=0 不该被序列化出来");
+        assert!(wire.get("prev_change_checks").is_none());
+        assert!(wire.get("new_findings").is_none());
+
+        let mut stamped = parsed;
+        stamped.round = 2;
+        assert_eq!(serde_json::to_value(&stamped).unwrap()["round"], 2);
+    }
 
     /// 决策 406：红线的形状不可被悄悄削弱——**两条都得在**（声明 + 补回归用例），且不许
     /// 把 `docs/testing.md` 的「候选集」规矩混进来：红线管「改什么」，测试规矩管「怎么写

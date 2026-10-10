@@ -19,6 +19,7 @@ import type {
   BranchCursor,
   NodeCommand,
   NodeConversation,
+  ReviewLedger,
 } from '../api/types';
 import { parseUnifiedDiff, type ParsedDiff } from '../lib/diff';
 import { completion } from './completion.svelte';
@@ -85,6 +86,12 @@ class TaskDetailStore {
   diffError = $state<string | null>(null);
   /** merge 审批但 diff 缺失 → 基准已前移 / 尚未生成（ticket 21 提示）。 */
   diffStale = $state(false);
+  /**
+   * 评审轮间台账（票 review-round-ledger 01）：「第 N 轮 · 上轮 M 已改 k · 新增 j」。
+   * `$state.raw`——详情加载时整份换新一次，没有逐条热读（决策 417 同款理由）。
+   * null = 无评审产出或旧产出，档案盒不渲染台账行。
+   */
+  reviewLedger = $state.raw<ReviewLedger | null>(null);
 
   busyKey = $state<string | null>(null);
   actionError = $state<string | null>(null);
@@ -145,6 +152,8 @@ class TaskDetailStore {
         pendingReason: detail.task.pending_reason,
         refetchRequested: false,
       };
+      // 评审轮间台账随详情一起取（票 review-round-ledger 01）。
+      this.reviewLedger = detail.review_ledger ?? null;
       // 完成横幅触发源：详情页 SSE 之外的对齐 refetch（票 08）。
       // 首次装载即已是 done → 无迁移，不弹（刷新不重弹）。
       completion.observeAll([{ id: taskId, status: detail.task.status, title: detail.task.title }]);
@@ -192,6 +201,7 @@ class TaskDetailStore {
     this.diffRaw = null;
     this.diffError = null;
     this.diffStale = false;
+    this.reviewLedger = null;
     this.actionError = null;
   }
 

@@ -212,6 +212,28 @@ describe('详情页装载失败不留上一个任务（票 01 / R2-01）', () =>
     expect(taskDetail.error).toBeNull();
     expect(mocks.sync).toHaveBeenCalledWith(['B']);
   });
+
+  it('评审轮间台账随详情解析进来；换任务重载收走（票 review-round-ledger 01）', async () => {
+    const ledger = { round: 2, prev_total: 3, prev_resolved: 1, new_count: 4 };
+    mocks.getTask.mockResolvedValue({
+      task: task('B', '另一个任务'),
+      cursors: [],
+      allowed_actions: [],
+      review_ledger: ledger,
+    });
+    await taskDetail.load('B');
+    expect(taskDetail.reviewLedger).toEqual(ledger);
+
+    // 换到无台账的任务 → 收走上一份（resetTaskContent 清空）
+    mocks.getTask.mockResolvedValue({
+      task: task('C', '第三个任务'),
+      cursors: [],
+      allowed_actions: [],
+      review_ledger: null,
+    });
+    await taskDetail.load('C');
+    expect(taskDetail.reviewLedger).toBeNull();
+  });
 });
 
 describe('现场页签的批量装载（决策 361，票 03）', () => {

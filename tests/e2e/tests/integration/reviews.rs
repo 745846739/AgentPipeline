@@ -63,6 +63,7 @@ async fn e2e_03_review_rejection_pends_then_goto_develop_and_re_review_passes() 
                 action: agentpipeline_core::types::FileAction::Modify,
                 finding: Some("add 未按设计处理负数入参：按 design.md AC-1 改为 saturating".into()),
             }],
+            ..Default::default()
         },
     );
     f.agent.set_script(script);
@@ -151,6 +152,7 @@ async fn e2e_03_review_rejection_pends_then_goto_develop_and_re_review_passes() 
             approved: true,
             review_report_path: Some("review-report.md".into()),
             required_changes: vec![],
+            ..Default::default()
         },
     );
     rework
@@ -244,6 +246,7 @@ async fn human_review_flow_task(f: &Flow, task_id: &str) {
             approved: true,
             review_report_path: Some("review-report.md".into()),
             required_changes: vec![],
+            ..Default::default()
         },
     );
     f.agent.set_script(script);
@@ -344,6 +347,7 @@ async fn e2e_04_human_reject_of_a_failing_review_also_lands_the_rework_turn() {
                 action: agentpipeline_core::types::FileAction::Modify,
                 finding: Some("断言恒真：改为断言具体返回值".into()),
             }],
+            ..Default::default()
         },
     );
     f.agent.set_script(script);
@@ -367,6 +371,7 @@ async fn e2e_04_human_reject_of_a_failing_review_also_lands_the_rework_turn() {
             approved: true,
             review_report_path: Some("review-report.md".into()),
             required_changes: vec![],
+            ..Default::default()
         },
     );
     rework

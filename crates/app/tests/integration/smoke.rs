@@ -318,6 +318,7 @@ fn pipeline_script(script: &mut Script, task_id: &str) {
             approved: true,
             review_report_path: Some("review-report.md".into()),
             required_changes: vec![],
+            ..Default::default()
         });
     script
         .for_node(Stage::Test, Node::Execute)

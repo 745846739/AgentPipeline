@@ -628,6 +628,7 @@ async fn e2e_merge_empty_branch_kicks_back_to_develop_without_test() {
             approved: true,
             review_report_path: Some("review-report.md".into()),
             required_changes: vec![],
+            ..Default::default()
         });
     script
         .for_node(Stage::Test, Node::Execute)
@@ -821,6 +822,7 @@ async fn e2e_merge_gate_environment_does_not_burn_gate_failures() {
             approved: true,
             review_report_path: Some("review-report.md".into()),
             required_changes: vec![],
+            ..Default::default()
         });
     // develop 闸门**之后**才漂移：test 落一个声明不符的工具链文件并提交进任务分支
     // （106 的现实里这一步是部署 / 重启换掉了服务 env；这里必须提交——未跟踪的文件

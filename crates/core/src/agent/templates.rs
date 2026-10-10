@@ -288,11 +288,18 @@ const REVIEW_EX_SYSTEM: &str = r#"你是代码评审 agent。评审变更代码�
 ### {file_path}
 - 问题：...
 - 建议：...
+## 上一轮 required_changes 逐条核对
+{首轮显式写「首轮，无上一轮」；后续轮逐条核对：每条给 改完 / 未改 / 部分，未改与部分写清差在哪}
+## 本轮新增
+{本轮发现、上一轮不存在的问题单独一栏；首轮写「首轮，全部发现均为新增」}
 ## 必须修改项
 
 ## submit_metadata 字段
 - approved: boolean
-- required_changes: ReviewRequiredChange[]（approved=false 时；允许包含设计符合性与测试质量问题；每项 finding 必填发现摘要——错在哪、该改成什么，一两句话）"#;
+- required_changes: ReviewRequiredChange[]（approved=false 时；允许包含设计符合性与测试质量问题；每项 finding 必填发现摘要——错在哪、该改成什么，一两句话）
+- prev_change_checks: ReviewChangeCheck[]（「上一轮逐条核对」栏的结构化投影，逐条填 path/action/resolution(resolved|unresolved|partial)/note；首轮为空数组）
+- new_findings: ReviewRequiredChange[]（「本轮新增」栏的结构化投影；首轮 = 全部发现）
+（两栏必须与报告同栏逐条一致并落进结构化字段；轮数不在你这里填，由系统落库时推导）"#;
 
 const TEST_EX_SYSTEM: &str = r#"你是测试 agent。根据测试场景文档编写集成测试代码并执行。
 
@@ -373,6 +380,33 @@ mod tests {
                 "{stage}.{node} 模板缺少结构化输出要求"
             );
         }
+    }
+
+    /// 票 review-round-ledger 01：评审报告的两栏 + 结构化字段都在模板里钉住。
+    /// 少了任一栏，模型就不知道要产出「逐条核对 / 本轮新增」，落库字段会永远为空。
+    #[test]
+    fn review_template_carries_the_two_ledger_columns_and_structured_fields() {
+        let system = system_template(Stage::Review, Node::Execute);
+        // 报告两栏
+        assert!(
+            system.contains("上一轮 required_changes 逐条核对"),
+            "报告缺「逐条核对」栏"
+        );
+        assert!(system.contains("本轮新增"), "报告缺「本轮新增」栏");
+        // 首轮不脑补的显式口径
+        assert!(
+            system.contains("首轮，无上一轮"),
+            "首轮要显式写「无上一轮」，不让模型脑补"
+        );
+        // 结构化字段（两栏的落库投影）
+        assert!(
+            system.contains("prev_change_checks"),
+            "submit_metadata 缺逐条核对字段"
+        );
+        assert!(
+            system.contains("new_findings"),
+            "submit_metadata 缺本轮新增字段"
+        );
     }
 
     #[test]

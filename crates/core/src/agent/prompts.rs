@@ -204,6 +204,12 @@ pub struct PromptSegments {
     pub user_input: Option<String>,
     /// review 打回后 develop 重入必须修改项（决策 133）。
     pub review_required_changes: Option<String>,
+    /// review execute 的**轮间上下文**（票 `review-round-ledger` 01）：本轮是第几轮 +
+    /// 上一轮 `required_changes` 清单（供模型逐条核对「改完 / 未改 / 部分」）。
+    /// 首轮为「首轮，无上一轮」的显式提示——**不让模型自己脑补**（模板要求首轮显式写这句）。
+    /// 只在 `(Review, Execute)` 渲染；与 `review_required_changes`（那是 develop 重入段）
+    /// 是两回事：一个给评审看「上轮要你改什么」，一个给开发看「这轮必须改什么」。
+    pub review_round_ledger: Option<String>,
     /// develop / test 重试耗尽的失败摘要（决策 138）。
     pub retry_feedback: Option<String>,
     /// develop 重入的零提交事实与落提交指令（决策 391）：`develop_code_gate` 的确定性
@@ -235,6 +241,10 @@ pub fn build_user_prompt(main: &str, segments: &PromptSegments) -> String {
         (
             "## 评审必须修改项",
             segments.review_required_changes.as_deref(),
+        ),
+        (
+            "## 评审轮间上下文（第几轮 + 上一轮必须修改项）",
+            segments.review_round_ledger.as_deref(),
         ),
         ("## 重试历史摘要", segments.retry_feedback.as_deref()),
         ("## 零提交事实与落提交指令", segments.zero_commit.as_deref()),
@@ -736,6 +746,7 @@ mod tests {
             gate_recheck: Some("A".into()),
             backtrack_feedback: Some("B".into()),
             review_required_changes: Some("D".into()),
+            review_round_ledger: Some("J".into()),
             user_input: Some("E".into()),
             retry_feedback: Some("C".into()),
             zero_commit: Some("G".into()),
@@ -748,6 +759,9 @@ mod tests {
         let b = out.find("## 上游回溯反馈").unwrap();
         let e = out.find("## 用户补充输入").unwrap();
         let d = out.find("## 评审必须修改项").unwrap();
+        let j = out
+            .find("## 评审轮间上下文（第几轮 + 上一轮必须修改项）")
+            .unwrap();
         let c = out.find("## 重试历史摘要").unwrap();
         let g = out.find("## 零提交事实与落提交指令").unwrap();
         let h = out.find("## 未申报变更事实与补申报指令").unwrap();
@@ -755,7 +769,7 @@ mod tests {
         let f = out
             .find("## 续接简报（超时空白重跑，不带全卷转录）")
             .unwrap();
-        assert!(a < b && b < e && e < d && d < c && c < g && g < h && h < i && i < f);
+        assert!(a < b && b < e && e < d && d < j && j < c && c < g && g < h && h < i && i < f);
     }
 
     /// 票 04：空白重跑的简报段被渲染，且是**独立一段**（不是塞进别的段里）。

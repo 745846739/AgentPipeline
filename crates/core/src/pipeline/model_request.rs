@@ -498,6 +498,10 @@ async fn load_segments(ctx: &AttemptCtx<'_>) -> Result<PromptSegments> {
         } else {
             review_required_changes_segment(ctx.store, ctx.task, ctx.cursor).await?
         },
+        // 票 review-round-ledger 01：轮间上下文（第几轮 + 上一轮清单）。**不看
+        // `review_rework_as_turn`**——那是 develop 重入的开关；本段是 review 自己首轮起跑
+        // 就要知道的「你在第几轮、上轮要你改什么」，每一轮 review 都要渲染。
+        review_round_ledger: review_round_ledger_segment(ctx.store, ctx.task, ctx.cursor).await?,
         retry_feedback: architect_reentry_segment(
             home,
             &ctx.task.id,
@@ -748,6 +752,78 @@ async fn review_required_changes_segment(
     // 决策 406：本段是**无转录时的降级通道**（决策 387 之后真打回走 turn），红线两处
     // 共挂一份——只挂 turn 会在降级路径上丢掉这条纪律。
     out.push_str(crate::types::REVIEW_REWORK_DISCIPLINE);
+    Ok(Some(out))
+}
+
+/// 票 `review-round-ledger` 01：review execute 的轮间上下文——本轮是第几轮 +
+/// 上一轮 `required_changes` 清单，供模型逐条核对（报告「上一轮逐条核对」栏）。
+///
+/// 只在 `(Review, Execute)` 渲染。轮数取自 [`Store::review_round_count`]（已成功收口的
+/// review.execute run 数 + 1；节点内重试与超时梯子的失败行都属同一轮，不另起一轮）；
+/// 上一轮清单取自**此刻仍在库里的** review 报告 metadata（本轮的 `submit_metadata` 还没
+/// 落库，故读到的正是上一轮那份）。本段渲染在本轮开 run 之前，故排除项传 `None`。
+///
+/// 首轮**显式**给「无上一轮」——模板要求报告首轮写死这句，不让模型自己脑补。
+async fn review_round_ledger_segment(
+    store: &Store,
+    task: &Task,
+    cursor: &NodeCursor,
+) -> Result<Option<String>> {
+    if cursor.stage != Stage::Review || cursor.node != Node::Execute {
+        return Ok(None);
+    }
+    let round = store.review_round_count(&task.id, None).await?;
+    let prev = store
+        .stage_output_metadata(&task.id, Stage::Review, OUTPUT_REVIEW_REPORT)
+        .await?
+        .and_then(|meta| serde_json::from_value::<crate::types::ReviewResult>(meta).ok());
+
+    if round <= 1 {
+        // 首轮：显式提示，不让模型虚构上一轮
+        return Ok(Some(
+            "本轮是第 1 轮评审（**首轮，无上一轮**）。\n\
+             报告的「上一轮 required_changes 逐条核对」栏显式写「首轮，无上一轮」，不要虚构上一轮内容；\n\
+             「本轮新增」栏 = 本轮全部发现。"
+                .to_string(),
+        ));
+    }
+
+    let mut out = format!("本轮是第 {round} 轮评审。\n");
+    match prev {
+        Some(review) if !review.required_changes.is_empty() => {
+            out.push_str(&format!(
+                "上一轮（第 {} 轮）的 required_changes（共 {} 条）：\n",
+                round - 1,
+                review.required_changes.len()
+            ));
+            for change in &review.required_changes {
+                // finding 一并交出去（票 spec a2）：逐条核对要判「差在哪」，只有
+                // action + path 时模型得靠回忆猜上一轮说的是什么。
+                match change.finding.as_deref() {
+                    Some(finding) => out.push_str(&format!(
+                        "- {} `{}`：{}\n",
+                        change.action.label(),
+                        change.path,
+                        finding
+                    )),
+                    None => {
+                        out.push_str(&format!("- {} `{}`\n", change.action.label(), change.path))
+                    }
+                }
+            }
+            out.push_str(
+                "请在报告「上一轮 required_changes 逐条核对」栏逐条核对：改完 / 未改 / 部分（未改与部分写清差在哪）；\n\
+                 本轮新发现（上一轮不存在的）列进「本轮新增」栏。",
+            );
+        }
+        // 上一轮通过（无必须修改项）或上一轮没落结构化清单：核对栏如实写，不虚构
+        _ => {
+            out.push_str(
+                "上一轮评审已通过（或未留下结构化必须修改项），「上一轮逐条核对」栏据此填写；\n\
+                 本轮新发现列进「本轮新增」栏。",
+            );
+        }
+    }
     Ok(Some(out))
 }
 
@@ -2771,5 +2847,210 @@ mod tests {
         let norm = |s: &str| s.replace(&home_prefix, "<HOME>");
         insta::assert_snapshot!("assembled_system_prompt", norm(&plan.system));
         insta::assert_snapshot!("assembled_user_prompt", norm(&plan.user));
+    }
+
+    // ───────────────── 票 review-round-ledger 01：轮间上下文段 ─────────────────
+
+    /// 首轮：显式「无上一轮」——不让模型脑补（模板要求首轮写死这句，报告据此照抄）。
+    #[tokio::test]
+    async fn review_round_ledger_first_round_says_no_previous() {
+        let (_tmp, _home, store, task, _proj, _settings, _cursor) = base().await;
+        let cursor = cursor_of(Stage::Review, Node::Execute);
+        let seg = review_round_ledger_segment(&store, &task, &cursor)
+            .await
+            .unwrap()
+            .expect("首轮必须渲染上下文（给「无上一轮」的显式提示）");
+        assert!(seg.contains("第 1 轮"), "要写明第 1 轮：{seg}");
+        assert!(seg.contains("无上一轮"), "首轮要显式写「无上一轮」：{seg}");
+        assert!(seg.contains("本轮全部发现"), "首轮新增栏口径：{seg}");
+    }
+
+    /// 非 review 节点不渲染——段只挂 `(Review, Execute)`。
+    #[tokio::test]
+    async fn review_round_ledger_only_rendered_for_review_execute() {
+        let (_tmp, _home, store, task, _proj, _settings, _cursor) = base().await;
+        let develop = cursor_of(Stage::Develop, Node::Execute);
+        assert!(
+            review_round_ledger_segment(&store, &task, &develop)
+                .await
+                .unwrap()
+                .is_none(),
+            "develop 节点不该带评审轮间上下文"
+        );
+    }
+
+    /// 第 2 轮：给轮数 + 上一轮 required_changes 清单，供逐条核对。
+    #[tokio::test]
+    async fn review_round_ledger_second_round_lists_previous_changes() {
+        let (_tmp, _home, store, task, _proj, _settings, _cursor) = base().await;
+        // 真实 cursor_id（create_task 落的那条）——insert_run 的 cursor_id 外键要它。
+        let real_cursor = store.load_live_cursors(&task.id).await.unwrap()[0].clone();
+        // 第 1 轮已成功收口（轮数只认 success 行）→ 本轮段渲染时读出第 2 轮
+        let first_round = store
+            .insert_run(&crate::storage::observability::NewRun {
+                task_id: task.id.clone(),
+                cursor_id: real_cursor.cursor_id.clone(),
+                stage: Stage::Review,
+                node: Node::Execute,
+                attempt: 1,
+                agent_type: "main".into(),
+                parent_run_id: None,
+                prompt_template_hash: None,
+                process_group_id: None,
+            })
+            .await
+            .unwrap();
+        store
+            .finish_run(
+                first_round,
+                &crate::storage::observability::RunOutcome {
+                    status: Some(crate::types::NodeStatus::Success),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        // 上一轮的 required_changes 落进 stage_output metadata（本轮 submit 尚未覆盖它）
+        let prev = crate::types::ReviewResult {
+            approved: false,
+            review_report_path: Some("review-report.md".into()),
+            required_changes: vec![crate::types::ReviewRequiredChange {
+                path: "src/lib.rs".into(),
+                action: crate::types::FileAction::Modify,
+                finding: Some("断言恒真".into()),
+            }],
+            ..Default::default()
+        };
+        store
+            .upsert_stage_output(
+                &task.id,
+                Stage::Review,
+                OUTPUT_REVIEW_REPORT,
+                "review-report.md",
+                Some(&serde_json::to_value(&prev).unwrap()),
+            )
+            .await
+            .unwrap();
+
+        let cursor = cursor_of(Stage::Review, Node::Execute);
+        let seg = review_round_ledger_segment(&store, &task, &cursor)
+            .await
+            .unwrap()
+            .expect("第 2 轮必须渲染上下文");
+        assert!(seg.contains("第 2 轮"), "要写明第 2 轮：{seg}");
+        assert!(seg.contains("src/lib.rs"), "要列上一轮清单：{seg}");
+        assert!(
+            seg.contains("断言恒真"),
+            "逐条核对要判「差在哪」，上一轮的 finding 必须一并交出去（spec a2）：{seg}"
+        );
+        assert!(seg.contains("逐条核对"), "要给逐条核对指令：{seg}");
+    }
+
+    /// 轮数只认**成功收口的那一轮**（票 01 的推导口径）。一轮里的失败行属于同一轮：
+    /// 决策 278 的节点内重试**不落** `continued_from_run_id`、超时梯子空白重跑那档
+    /// （决策 320）的续接素材 `from_run_id = None` 同样不落链——按「非续接 run 行」数，
+    /// 首轮重试一次就会被盖成「第 2 轮」（spec 发现 c1 的回归闸）。
+    #[tokio::test]
+    async fn review_round_count_counts_only_successful_verdict_runs() {
+        let (_tmp, _home, store, task, _proj, _settings, _cursor) = base().await;
+        let real_cursor = store.load_live_cursors(&task.id).await.unwrap()[0].clone();
+        let seed = |agent: &'static str, status: Option<crate::types::NodeStatus>| {
+            let store = &store;
+            let task_id = task.id.clone();
+            let cursor_id = real_cursor.cursor_id.clone();
+            async move {
+                let run_id = store
+                    .insert_run(&crate::storage::observability::NewRun {
+                        task_id,
+                        cursor_id,
+                        stage: Stage::Review,
+                        node: Node::Execute,
+                        attempt: 1,
+                        agent_type: agent.into(),
+                        parent_run_id: None,
+                        prompt_template_hash: None,
+                        process_group_id: None,
+                    })
+                    .await
+                    .unwrap();
+                if let Some(status) = status {
+                    store
+                        .finish_run(
+                            run_id,
+                            &crate::storage::observability::RunOutcome {
+                                status: Some(status),
+                                ..Default::default()
+                            },
+                        )
+                        .await
+                        .unwrap();
+                }
+                run_id
+            }
+        };
+        // 段渲染时本轮 run 行还没开立 → 第 1 轮
+        assert_eq!(
+            store.review_round_count(&task.id, None).await.unwrap(),
+            1,
+            "一行都没有 = 首轮"
+        );
+        // 首轮在跑：排除项指向自己，读数不变
+        let inflight = seed("main", None).await;
+        assert_eq!(
+            store
+                .review_round_count(&task.id, Some(inflight))
+                .await
+                .unwrap(),
+            1
+        );
+        // 决策 278 的节点内重试失败行（fresh、不落链）→ 仍是第 1 轮
+        seed("main", Some(crate::types::NodeStatus::Failed)).await;
+        assert_eq!(
+            store
+                .review_round_count(&task.id, Some(inflight))
+                .await
+                .unwrap(),
+            1,
+            "节点内重试的失败行属同一轮"
+        );
+        // 超时梯子：带链的续接行与不带链的空白重跑行都不另起一轮
+        seed("main", Some(crate::types::NodeStatus::Timeout)).await;
+        seed("main", Some(crate::types::NodeStatus::Timeout)).await;
+        assert_eq!(
+            store
+                .review_round_count(&task.id, Some(inflight))
+                .await
+                .unwrap(),
+            1,
+            "超时梯子的行（含空白重跑那档不落链的）都属同一轮"
+        );
+        // 首轮收口 success：盖章若发生在收口之后，按 id 排除自己仍读出第 1 轮
+        store
+            .finish_run(
+                inflight,
+                &crate::storage::observability::RunOutcome {
+                    status: Some(crate::types::NodeStatus::Success),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            store
+                .review_round_count(&task.id, Some(inflight))
+                .await
+                .unwrap(),
+            1,
+            "按 id 排除自己：读数不依赖收口顺序"
+        );
+        // 已出过一轮结论 → 下一轮是第 2 轮
+        assert_eq!(store.review_round_count(&task.id, None).await.unwrap(), 2);
+        // 子代理复用同一 stage/node 的 success 行不计入
+        seed("sub:critic", Some(crate::types::NodeStatus::Success)).await;
+        assert_eq!(
+            store.review_round_count(&task.id, None).await.unwrap(),
+            2,
+            "子代理 run 不计入轮数"
+        );
     }
 }

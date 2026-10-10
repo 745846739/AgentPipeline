@@ -518,6 +518,80 @@ impl Store {
         Ok(count as u32)
     }
 
+    /// 该任务**当前这次 review 是第几轮**（票 `review-round-ledger` 01）。
+    ///
+    /// 轮数 = 该任务 `review.execute` **已成功收口**的 run 数 + 1（本轮还没轮到收口；盖章
+    /// 那一刻按 `exclude_run_id` 把自己排除在外）。只数主 agent 自己开的那一轮
+    /// （`agent_type = 'main'`，口径同 [`Self::count_node_owning_runs`] 的白名单精神，排除
+    /// 子代理复用同一 stage/node 的 run）。
+    ///
+    /// **为什么数「成功的行」而不是数 run 行 / 数非续接行**：一轮里失败的那些行属于同一轮。
+    /// - 节点内重试（决策 278）每次 `begin` 一条新 run 行且**不落** `continued_from_run_id`
+    ///   （红线③只在 round 0 落链，而失败重试时往往根本没有续接素材）——按「非续接行」数，
+    ///   首轮重试一次就会被盖成「第 2 轮」；
+    /// - 超时梯子第 3 档的空白重跑（决策 320）拿的续接素材 `from_run_id = None`，同样不落链；
+    /// - 一轮里**恰好一行**能走到 `success`：`post_process`（盖章就发生在它里面）在
+    ///   `finish_run` 之前跑，失败的 attempt 收成 failed / timeout / cancelled，成功那一次
+    ///   才收 success——于是「成功的行数」= 已出过结论的轮数，与重试、超时梯子、中止都无关。
+    ///
+    /// `exclude_run_id` = 正在跑的这条 run（盖章时它多半还是 `running`，但按 id 排除不依赖
+    /// 收口顺序）；轮间上下文段渲染时本轮 run 行还没开立，传 `None`。
+    ///
+    /// 调用点：review execute 收到 `submit_metadata` 落库时，把本读数写进
+    /// [`crate::types::ReviewResult::round`]。**不在模型的产出契约里**——模型数不清自己是第几轮。
+    pub async fn review_round_count(
+        &self,
+        task_id: &str,
+        exclude_run_id: Option<i64>,
+    ) -> Result<u32> {
+        let count: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM kanban_node_runs
+             WHERE task_id = ? AND stage = 'review' AND node = 'execute'
+               AND agent_type = 'main' AND status = 'success'
+               AND (? IS NULL OR id <> ?)",
+        )
+        .bind(task_id)
+        .bind(exclude_run_id)
+        .bind(exclude_run_id)
+        .fetch_one(self.pool())
+        .await?;
+        Ok(count as u32 + 1)
+    }
+
+    /// 评审轮间台账的前端投影（票 `review-round-ledger` 01 L3）。
+    ///
+    /// 从 review 报告的 stage_output metadata 投影出「第 N 轮 · 上轮 M 已改 k · 新增 j」
+    /// 所需的四个数。`None` = 尚无评审产出、或旧产出（`round` 未盖章 = 0）——前端据此
+    /// 不渲染台账行。
+    pub async fn review_ledger(&self, task_id: &str) -> Result<Option<crate::types::ReviewLedger>> {
+        let Some(meta) = self
+            .stage_output_metadata(
+                task_id,
+                Stage::Review,
+                crate::pipeline::events::OUTPUT_REVIEW_REPORT,
+            )
+            .await?
+        else {
+            return Ok(None);
+        };
+        let Ok(review) = serde_json::from_value::<crate::types::ReviewResult>(meta) else {
+            return Ok(None);
+        };
+        if review.round == 0 {
+            return Ok(None); // 旧产出：无台账
+        }
+        Ok(Some(crate::types::ReviewLedger {
+            round: review.round,
+            prev_total: review.prev_change_checks.len() as u32,
+            prev_resolved: review
+                .prev_change_checks
+                .iter()
+                .filter(|c| c.resolution == crate::types::ChangeResolution::Resolved)
+                .count() as u32,
+            new_count: review.new_findings.len() as u32,
+        }))
+    }
+
     /// 该节点**从最新一条 run 往回连续是 timeout** 的条数（决策 320）。
     ///
     /// 超时自动续接的计数口：连续超时 1–2 次续接上一轮转录、第 3 次降级空白重跑、

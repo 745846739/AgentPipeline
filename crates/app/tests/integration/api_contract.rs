@@ -527,6 +527,74 @@ async fn task_detail_returns_allowed_actions_for_pending_cursor() {
     assert_eq!(actions[1]["kind"], "side_effect");
 }
 
+// ─────────────── GET /tasks/{id} · review_ledger（票 review-round-ledger 01 L3）───────────────
+
+#[tokio::test]
+async fn task_detail_projects_the_review_round_ledger() {
+    let api = api().await;
+    seed(&api, "t1").await;
+
+    // 无评审产出 → review_ledger 为 null
+    let (_, body) = get(&api, "/tasks/t1").await;
+    assert!(body["review_ledger"].is_null(), "无评审产出不该有台账");
+
+    // 落一份盖章的第 2 轮评审结果：上轮 3 条（2 改完）、本轮新增 4 条
+    use agentpipeline_core::types::{
+        ChangeResolution, FileAction, ReviewChangeCheck, ReviewRequiredChange, ReviewResult,
+    };
+    let stamped = ReviewResult {
+        approved: false,
+        review_report_path: Some("review-report.md".into()),
+        required_changes: vec![],
+        round: 2,
+        prev_change_checks: vec![
+            ReviewChangeCheck {
+                path: "a.rs".into(),
+                action: FileAction::Modify,
+                resolution: ChangeResolution::Resolved,
+                note: None,
+            },
+            ReviewChangeCheck {
+                path: "b.rs".into(),
+                action: FileAction::Modify,
+                resolution: ChangeResolution::Resolved,
+                note: None,
+            },
+            ReviewChangeCheck {
+                path: "c.rs".into(),
+                action: FileAction::Create,
+                resolution: ChangeResolution::Unresolved,
+                note: Some("仍缺 AC-2 覆盖".into()),
+            },
+        ],
+        new_findings: (0..4)
+            .map(|i| ReviewRequiredChange {
+                path: format!("d{i}.rs"),
+                action: FileAction::Modify,
+                finding: Some("空指针".into()),
+            })
+            .collect(),
+    };
+    api.state
+        .store
+        .upsert_stage_output(
+            "t1",
+            Stage::Review,
+            "review_report",
+            "review-report.md",
+            Some(&serde_json::to_value(&stamped).unwrap()),
+        )
+        .await
+        .unwrap();
+
+    let (_, body) = get(&api, "/tasks/t1").await;
+    let ledger = &body["review_ledger"];
+    assert_eq!(ledger["round"], 2);
+    assert_eq!(ledger["prev_total"], 3);
+    assert_eq!(ledger["prev_resolved"], 2);
+    assert_eq!(ledger["new_count"], 4);
+}
+
 // ─────────────────────────── POST /resume（决策 91 / 49 / 防连点）───────────────────────────
 
 #[tokio::test]

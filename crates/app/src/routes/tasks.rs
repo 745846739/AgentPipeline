@@ -245,6 +245,14 @@ pub async fn detail(
         .await
         .map_err(map_core_error)?;
 
+    // 票 review-round-ledger 01 L3：评审轮间台账投影（第 N 轮 · 上轮 M 已改 k · 新增 j）。
+    // 无评审产出 / 旧产出 → null，前端不渲染台账行。
+    let review_ledger = state
+        .store
+        .review_ledger(&id)
+        .await
+        .map_err(map_core_error)?;
+
     Ok(etag_response(
         &format!("task-detail|{id}"),
         &headers,
@@ -254,6 +262,7 @@ pub async fn detail(
             "allowed_actions": actions,
             "depends_on": depends_on,
             "blocks": blocks,
+            "review_ledger": review_ledger,
         }),
     ))
 }

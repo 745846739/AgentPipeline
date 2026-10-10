@@ -55,6 +55,7 @@ fn review_pass(script: &mut Script) {
             approved: true,
             review_report_path: Some("review-report.md".into()),
             required_changes: vec![],
+            ..Default::default()
         });
 }
 
@@ -89,6 +90,7 @@ async fn e2e_review_out_of_scope_write_is_denied_and_flow_continues() {
             approved: true,
             review_report_path: Some("review-report.md".into()),
             required_changes: vec![],
+            ..Default::default()
         });
     test_pass(&mut script);
     f.agent.set_script(script);
@@ -138,6 +140,7 @@ async fn e2e_review_run_command_is_stage_denied_without_side_effects() {
             approved: true,
             review_report_path: Some("review-report.md".into()),
             required_changes: vec![],
+            ..Default::default()
         });
     test_pass(&mut script);
     f.agent.set_script(script);

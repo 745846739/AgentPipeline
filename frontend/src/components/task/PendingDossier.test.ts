@@ -80,3 +80,78 @@ describe('PendingDossier · 移动版动作坞的收展（决策 281）', () => 
     expect(screen.queryByRole('button', { name: /等你拍板/ })).toBeNull();
   });
 });
+
+// ─────────── 票 review-round-ledger 01：评审轮间台账行 ───────────
+
+const reviewReason: PendingReason = {
+  type: 'user_decision',
+  stage: 'review',
+  node: 'validate_output',
+  message: '评审不通过，等你拍板',
+  context: { kind: 'review' },
+};
+
+const reviewCursors: BranchCursor[] = [
+  {
+    cursor_id: 'c-review',
+    branch: 'main',
+    stage: 'review',
+    node: 'validate_output',
+    status: 'pending',
+    validate_attempts: 0,
+    skipped_to_join: false,
+    pending_reason: reviewReason,
+  },
+];
+
+describe('PendingDossier · 评审轮间台账（票 review-round-ledger 01）', () => {
+  it('agent 打回拍板时显示「第 N 轮 · 上轮 M 已改 k · 本轮新增 j」', () => {
+    render(PendingDossier, {
+      props: {
+        reason: reviewReason,
+        cursors: reviewCursors,
+        actions: [],
+        reviewLedger: { round: 2, prev_total: 3, prev_resolved: 2, new_count: 4 },
+      },
+    });
+    const ledger = screen.getByTestId('review-ledger');
+    expect(ledger.textContent).toContain('第 2 轮');
+    expect(ledger.textContent).toContain('上轮 3 条已改 2');
+    expect(ledger.textContent).toContain('本轮新增 4');
+  });
+
+  it('首轮显式标「无上一轮」，不虚构上轮读数', () => {
+    render(PendingDossier, {
+      props: {
+        reason: reviewReason,
+        cursors: reviewCursors,
+        actions: [],
+        reviewLedger: { round: 1, prev_total: 0, prev_resolved: 0, new_count: 2 },
+      },
+    });
+    const ledger = screen.getByTestId('review-ledger');
+    expect(ledger.textContent).toContain('第 1 轮');
+    expect(ledger.textContent).toContain('无上一轮');
+    // 首轮也有新增数：收敛曲线的起点（spec a1）
+    expect(ledger.textContent).toContain('本轮新增 2');
+  });
+
+  it('无台账（旧产出 / 无评审）→ 不渲染台账行', () => {
+    render(PendingDossier, {
+      props: { reason: reviewReason, cursors: reviewCursors, actions: [], reviewLedger: null },
+    });
+    expect(screen.queryByTestId('review-ledger')).toBeNull();
+  });
+
+  it('非评审拍板点（merge_approval）即便带着台账也不渲染——闸门只在评审打回那刻露', () => {
+    render(PendingDossier, {
+      props: {
+        reason,
+        cursors,
+        actions: mergeActions,
+        reviewLedger: { round: 2, prev_total: 3, prev_resolved: 2, new_count: 4 },
+      },
+    });
+    expect(screen.queryByTestId('review-ledger')).toBeNull();
+  });
+});

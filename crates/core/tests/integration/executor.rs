@@ -230,6 +230,7 @@ fn implementation_scripts(script: &mut Script, task_id: &str) {
             approved: true,
             review_report_path: Some("review-report.md".into()),
             required_changes: vec![],
+            ..Default::default()
         });
     script
         .for_node(Stage::Test, Node::Execute)
@@ -3743,6 +3744,7 @@ async fn develop_gate_kicks_back_dirty_worktree_then_recovers_after_commit() {
             approved: true,
             review_report_path: Some("review-report.md".into()),
             required_changes: vec![],
+            ..Default::default()
         });
     script
         .for_node(Stage::Test, Node::Execute)
@@ -3852,6 +3854,7 @@ async fn test_gate_kicks_back_uncommitted_test_output_before_merge() {
             approved: true,
             review_report_path: Some("review-report.md".into()),
             required_changes: vec![],
+            ..Default::default()
         });
     // test 第一轮：集成测试写进工作区但不提交，然后交 passed=true（事故现场）
     script
@@ -5140,6 +5143,7 @@ async fn parent_spawns_readonly_subagent_and_gets_summary_back() {
             approved: true,
             review_report_path: Some("review-report.md".into()),
             required_changes: vec![],
+            ..Default::default()
         });
     script
         .for_node(Stage::Test, Node::Execute)
@@ -5227,6 +5231,7 @@ async fn subagent_round_cap_follows_the_configured_number() {
             approved: true,
             review_report_path: Some("review-report.md".into()),
             required_changes: vec![],
+            ..Default::default()
         });
     script
         .for_node(Stage::Test, Node::Execute)
@@ -5324,6 +5329,7 @@ async fn subagent_can_search_the_worktree_with_search_content() {
             approved: true,
             review_report_path: Some("review-report.md".into()),
             required_changes: vec![],
+            ..Default::default()
         });
     script
         .for_node(Stage::Test, Node::Execute)
@@ -5573,6 +5579,7 @@ fn develop_finishes_cleanly(script: &mut Script, task_id: &str) {
             approved: true,
             review_report_path: Some("review-report.md".into()),
             required_changes: vec![],
+            ..Default::default()
         });
     script
         .for_node(Stage::Test, Node::Execute)
@@ -5881,6 +5888,7 @@ async fn subagent_tool_set_is_read_only() {
             approved: true,
             review_report_path: Some("review-report.md".into()),
             required_changes: vec![],
+            ..Default::default()
         });
     script
         .for_node(Stage::Test, Node::Execute)
@@ -5989,6 +5997,7 @@ async fn subagent_run_row_carries_parent_and_agent_type() {
             approved: true,
             review_report_path: Some("review-report.md".into()),
             required_changes: vec![],
+            ..Default::default()
         });
     script
         .for_node(Stage::Test, Node::Execute)
@@ -6081,6 +6090,7 @@ async fn subagent_tokens_are_counted_once_on_its_own_run() {
             approved: true,
             review_report_path: Some("review-report.md".into()),
             required_changes: vec![],
+            ..Default::default()
         });
     script
         .for_node(Stage::Test, Node::Execute)
@@ -6168,6 +6178,7 @@ async fn subagent_does_not_inherit_declared_tools() {
             approved: true,
             review_report_path: Some("review-report.md".into()),
             required_changes: vec![],
+            ..Default::default()
         });
     script
         .for_node(Stage::Test, Node::Execute)
@@ -6374,6 +6385,7 @@ async fn subagent_cannot_execute_tools_outside_its_readonly_set() {
             approved: true,
             review_report_path: Some("review-report.md".into()),
             required_changes: vec![],
+            ..Default::default()
         });
     script
         .for_node(Stage::Test, Node::Execute)
@@ -6670,6 +6682,7 @@ fn rework_scripts(script: &mut Script, task_id: &str) {
             approved: true,
             review_report_path: Some("review-report.md".into()),
             required_changes: vec![],
+            ..Default::default()
         });
     script
         .for_node(Stage::Test, Node::Execute)
@@ -6697,6 +6710,7 @@ async fn review_rework_feedback_is_a_prefixed_turn_at_the_end_of_the_carried_tra
                 action: agentpipeline_core::types::FileAction::Modify,
                 finding: Some("add 未按设计处理负数入参：按 AC-1 改为 saturating".into()),
             }],
+            ..Default::default()
         },
     )
     .await;
@@ -6790,6 +6804,7 @@ async fn review_rework_turn_degrades_when_required_changes_carry_no_finding() {
                 action: agentpipeline_core::types::FileAction::Modify,
                 finding: None,
             }],
+            ..Default::default()
         },
     )
     .await;
@@ -9042,6 +9057,7 @@ async fn an_ordinary_restart_does_not_inject_the_review_rework_turn() {
                                     action: FileAction::Modify,
                                     finding: Some("边界没处理".into()),
                                 }],
+                                ..Default::default()
                             })
                             .unwrap(),
                         ),

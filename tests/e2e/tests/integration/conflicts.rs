@@ -46,6 +46,7 @@ async fn e2e_05_merge_rebase_conflict_kicks_back_develop_with_conflict_files() {
             approved: true,
             review_report_path: Some("review-report.md".into()),
             required_changes: vec![],
+            ..Default::default()
         },
     );
     f.agent.set_script(script);

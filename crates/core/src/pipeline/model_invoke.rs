@@ -2159,18 +2159,24 @@ impl AgentNodeKind {
                 MetadataView::default()
             }
             AgentNodeKind::ReviewExecute => {
-                let m: crate::types::ReviewResult = serde_json::from_value(value.clone())?;
+                let mut m: crate::types::ReviewResult = serde_json::from_value(value.clone())?;
+                // 票 review-round-ledger 01：轮数**不在模型的产出契约里**（模型数不清自己是
+                // 第几轮），由编排侧落库时按「已成功收口的 review.execute run 数 + 1」推导写入，
+                // 并按 run id 排除自己（口径与理由见 `Store::review_round_count`：节点内重试与
+                // 超时梯子的失败行都属同一轮，数 run 行会把一次重试顶成新一轮）。
+                m.round = inv.store.review_round_count(&task.id, Some(run_id)).await?;
                 let path = m
                     .review_report_path
                     .clone()
                     .unwrap_or_else(|| "review-report.md".into());
+                let persisted = serde_json::to_value(&m)?;
                 inv.store
                     .upsert_stage_output(
                         &task.id,
                         Stage::Review,
                         OUTPUT_REVIEW_REPORT,
                         &path,
-                        Some(&value),
+                        Some(&persisted),
                     )
                     .await?;
                 // review 的判定在 validate_output（纯代码）做，execute 只产出
@@ -2479,6 +2485,7 @@ mod tests {
                     approved: true,
                     review_report_path: Some("review-report.md".into()),
                     required_changes: vec![],
+                    ..Default::default()
                 })),
             )
             .await
@@ -2500,6 +2507,7 @@ mod tests {
                         action: crate::types::FileAction::Modify,
                         finding: Some("断言恒真".into()),
                     }],
+                    ..Default::default()
                 })),
             )
             .await

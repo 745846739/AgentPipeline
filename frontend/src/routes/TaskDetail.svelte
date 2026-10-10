@@ -635,6 +635,7 @@
       onreloaddiff={() => void taskDetail.loadDiff(pendingType === 'human_review' ? 'review-diff.diff' : 'merge-proposal.diff')}
       reviewReport={taskDetail.getFile('review-report.md')?.content ?? null}
       unitTestReport={taskDetail.getFile('test-report.md')?.content ?? null}
+      reviewLedger={taskDetail.reviewLedger}
       onsubmitreview={(approved, comments) => void taskDetail.submitReview(approved, comments).catch(() => undefined)}
     />
   {/if}

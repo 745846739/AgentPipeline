@@ -1,5 +1,5 @@
 <script lang="ts">
-  import type { AllowedAction, BranchCursor, PendingKind, PendingReason } from '../../api/types';
+  import type { AllowedAction, BranchCursor, PendingKind, PendingReason, ReviewLedger } from '../../api/types';
   import type { ParsedDiff } from '../../lib/diff';
   import { pendingLabel } from '../../lib/pipeline';
   import PendingActions from '../board/PendingActions.svelte';
@@ -35,6 +35,8 @@
     /** human_review 三件套。 */
     reviewReport?: string | null;
     unitTestReport?: string | null;
+    /** 评审轮间台账（票 review-round-ledger 01）：agent 打回时人一眼看出收敛还是发散。 */
+    reviewLedger?: ReviewLedger | null;
     onsubmitreview?: (approved: boolean, comments?: string) => void;
   }
 
@@ -57,6 +59,7 @@
     onreloaddiff,
     reviewReport = null,
     unitTestReport = null,
+    reviewLedger = null,
     onsubmitreview,
   }: Props = $props();
 
@@ -67,6 +70,17 @@
       cursors.find((c) => c.status === 'pending'),
   );
   const conflicts = $derived(reason.context?.conflict_task_ids ?? []);
+
+  /**
+   * 台账行只在**评审打回拍板**那一刻露（票 review-round-ledger 01）：agent 模式打回落
+   * `user_decision`+`kind=review`，那是人判断「在收敛还是发散」的地方。human_review 模式
+   * 没有 agent 产出（`reviewLedger` 自然为 null），merge_approval 之后评审已过、不再是拍板点。
+   */
+  const showReviewLedger = $derived(
+    reviewLedger !== null &&
+      pendingType === 'user_decision' &&
+      reason.context?.kind === 'review',
+  );
 
   /** dock 模式：量取固定动作坞高度，供详情内容留出底边距（theme-6 §5 转写 3）。 */
   let dockH = $state(0);
@@ -106,6 +120,22 @@
   <i class="dface" aria-hidden="true"><Sprite name="foreman" /></i>
 {/snippet}
 
+<!-- 票 review-round-ledger 01：评审轮间台账——「第 N 轮 · 上轮 M 已改 k · 本轮新增 j」。
+     收敛（新增少、上轮改完多）与发散（新增多、上轮没改完）一眼可辨，不必人工 diff 两份报告。 -->
+{#snippet reviewLedgerBlock()}
+  {#if showReviewLedger && reviewLedger}
+    <div class="rledger" data-testid="review-ledger">
+      {#if reviewLedger.round <= 1}
+        第 1 轮（首轮，无上一轮）· 本轮新增 {reviewLedger.new_count}
+      {:else if reviewLedger.prev_total > 0}
+        第 {reviewLedger.round} 轮 · 上轮 {reviewLedger.prev_total} 条已改 {reviewLedger.prev_resolved} · 本轮新增 {reviewLedger.new_count}
+      {:else}
+        第 {reviewLedger.round} 轮 · 上轮通过 · 本轮新增 {reviewLedger.new_count}
+      {/if}
+    </div>
+  {/if}
+{/snippet}
+
 {#if dock}
   <aside class="dock" class:closed={!open} aria-label="待办" bind:clientHeight={dockH}>
     <!-- 决策 281：手柄是唯一常驻物；收起态 ▲ / 展开态 ▼（光标画在 app.css 的 .dock-head） -->
@@ -115,6 +145,7 @@
 
     {#if open}
       {@render infoBlock()}
+      {@render reviewLedgerBlock()}
 
       {#if pendingType === 'merge_approval'}
         <DiffReviewPanel
@@ -174,6 +205,7 @@
     {@render foreman()}
     <div class="dmain">
       {@render infoBlock()}
+      {@render reviewLedgerBlock()}
 
       {#if pendingType === 'merge_approval'}
         <div class="grp">恢复动作</div>
@@ -321,6 +353,17 @@
     color: var(--text-3);
     letter-spacing: 0.08em;
     margin: 12px 0 7px;
+  }
+  /* 评审轮间台账行（票 review-round-ledger 01）：读数行，次级色不抢阻塞原因的视觉主位 */
+  .rledger {
+    color: var(--text-2);
+    font-size: 12px;
+    letter-spacing: 0.02em;
+    margin: 0 0 8px;
+    padding: 4px 8px;
+    border-left: 2px solid var(--pending);
+    background: var(--pane);
+    overflow-wrap: anywhere;
   }
   .linklike {
     color: var(--text-hi);
