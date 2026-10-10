@@ -899,7 +899,7 @@ port = 8788
 # Caddy / Nginx），「手机访问」页的配对二维码指向它。形状与 allowed_origins 同一种：
 # scheme://host[:port]、**不带路径**；写错在解析期 fail fast（CLI `--public-base-url` 覆盖它）。
 # 不配 = 没有这一层，手机直连本机 / 局域网（照旧按网卡枚举拼地址）。
-# public_base_url = "https://106.12.12.6:3389"
+# public_base_url = "https://203.0.113.10:3389"
 
 # 应用自己终止 TLS（决策 335，106 的形态：没有反代，应用直接对外）。
 # **两个必须一起给**——只给一个在解析期 fail fast 并点名缺哪个；两个都不给 = 明文。
@@ -909,8 +909,8 @@ port = 8788
 # ——实测「TLS 下什么都打不开而 curl --http1.1 正常」，见 serve.rs::alpn_protocols）；
 # 握手失败只记一行日志、继续监听（公网上的扫描器是日常）。
 # 与配对闸门的关系：**别在前面再放反代**——转发源地址恒为回环，闸门会整体失效（决策 335/336）。
-# tls_cert = "/etc/agentpipeline/tls/106.12.12.6.pem"
-# tls_key  = "/etc/agentpipeline/tls/106.12.12.6-key.pem"
+# tls_cert = "/etc/agentpipeline/tls/203.0.113.10.pem"
+# tls_key  = "/etc/agentpipeline/tls/203.0.113.10-key.pem"
 
 [pipeline]
 validate_retry_max = 3

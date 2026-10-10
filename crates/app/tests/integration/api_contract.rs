@@ -9962,7 +9962,7 @@ async fn server_info_reports_the_public_entry_alongside_a_loopback_bind() {
     let home = TestHome::new().unwrap();
     let (store, _clock) = home.setup().await.unwrap();
     let state = AppState::new(store, home.home().clone(), Settings::default(), PORT)
-        .with_public_base_url(Some("https://106.12.12.6:3389".to_string()));
+        .with_public_base_url(Some("https://203.0.113.10:3389".to_string()));
     let router = build_router(state);
 
     let (status, body) = json_body(
@@ -9975,13 +9975,13 @@ async fn server_info_reports_the_public_entry_alongside_a_loopback_bind() {
     .await;
     assert_eq!(status, StatusCode::OK, "{body}");
     assert_eq!(body["loopback_only"], true, "绑定事实不因配了入口而改变");
-    assert_eq!(body["public_base_url"], "https://106.12.12.6:3389");
+    assert_eq!(body["public_base_url"], "https://203.0.113.10:3389");
     assert_eq!(
         body["addresses"].as_array().map(Vec::len),
         Some(1),
         "只列公网入口：{body}"
     );
-    assert_eq!(body["addresses"][0]["url"], "https://106.12.12.6:3389");
+    assert_eq!(body["addresses"][0]["url"], "https://203.0.113.10:3389");
     assert_eq!(body["addresses"][0]["preferred"], true);
 }
 
@@ -10002,10 +10002,10 @@ async fn qr_svg_accepts_the_public_entry_and_still_rejects_strangers() {
     let home = TestHome::new().unwrap();
     let (store, _clock) = home.setup().await.unwrap();
     let state = AppState::new(store, home.home().clone(), Settings::default(), PORT)
-        .with_public_base_url(Some("https://106.12.12.6:3389".to_string()));
+        .with_public_base_url(Some("https://203.0.113.10:3389".to_string()));
     let router = build_router(state);
 
-    let paired = app::routes::server_info::pairing_url("https://106.12.12.6:3389", "PAIRTOKEN");
+    let paired = app::routes::server_info::pairing_url("https://203.0.113.10:3389", "PAIRTOKEN");
     let (status, _) = json_body(
         router
             .clone()

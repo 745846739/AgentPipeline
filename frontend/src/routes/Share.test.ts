@@ -119,13 +119,13 @@ describe('手机访问页 · 没有配对令牌时不画码（决策 189）', ()
       host: '127.0.0.1',
       loopback_only: true,
       bind_source: 'startup',
-      public_base_url: 'https://106.12.12.6:3389',
-      addresses: [{ interface: '公网入口', url: 'https://106.12.12.6:3389', preferred: true }],
+      public_base_url: 'https://203.0.113.10:3389',
+      addresses: [{ interface: '公网入口', url: 'https://203.0.113.10:3389', preferred: true }],
     });
     mocks.fetchPairingToken.mockResolvedValue({ token: 'tok' });
     render(Share);
 
-    const img = await screen.findByAltText('扫码访问 https://106.12.12.6:3389/?pair=tok');
+    const img = await screen.findByAltText('扫码访问 https://203.0.113.10:3389/?pair=tok');
     expect(img.getAttribute('src')).toContain('pair%3Dtok');
     // 那句「手机现在连不上这台机器」与它的钮都不该出现
     expect(screen.queryByText('手机现在连不上这台机器')).toBeNull();

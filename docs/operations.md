@@ -1,6 +1,8 @@
 # 并发隔离与运维设计
 
 > 拆分自 agent-pipeline.md（原 §12）。章节编号与决策编号保持拆分前不变，导读地图见 [README.md](README.md)。
+>
+> **脱敏说明**：本文档中的服务器地址统一用 RFC 5737 文档保留地址 `203.0.113.10` 占位（原文为真实公网 IP），实际部署时请替换为你自己的服务器地址。
 
 ## 12. 并发隔离与运维设计
 
@@ -1375,13 +1377,13 @@ CONTEXT_ALERTS = {
 
 > **这一节记的是「Caddy 反代 + Basic」那一代的做法与它踩过的坑（证书怎么签、裸 IP 为什么不能按域名索引、443/80 在安全组里没放行）。结局是撤掉了 Caddy**：反代把「请求是不是来自本机」这件事抹平了（转发源地址恒为 `127.0.0.1`），于是后端的两条豁免同时命中，应用自己的配对令牌在 106 上**整体失效**，只能靠 Caddy 那层 Basic 顶替——也就是外面那一层成了唯一的门，而应用里那套「按设备可重置」的凭据用不上。**现状与做法见 §12.18**（应用自己终止 TLS，决策 335；全站配对闸门，决策 336）。下面保留的内容里，证书签发、信任链边界、设备侧装 CA 三段**仍然有效**，其余（Caddy 配置、Basic、反代相关验证）只作历史。
 
-**为什么必须上 HTTPS。** 浏览器推送（service worker + Push API）只在**安全上下文**里可用：`https://…` 或本机 `localhost`。106 是裸 IP（`106.12.12.6`）且只有明文 `http://…:3333`，手机上打开它既注册不了 service worker、也订不了推送——「锁屏收推送」这件事必须先把安全上下文建起来。本机开发不受影响（`localhost` 本身就是安全上下文，不需要 CA 也不需要 Caddy）。
+**为什么必须上 HTTPS。** 浏览器推送（service worker + Push API）只在**安全上下文**里可用：`https://…` 或本机 `localhost`。106 是裸 IP（`203.0.113.10`）且只有明文 `http://…:3333`，手机上打开它既注册不了 service worker、也订不了推送——「锁屏收推送」这件事必须先把安全上下文建起来。本机开发不受影响（`localhost` 本身就是安全上下文，不需要 CA 也不需要 Caddy）。
 
-**信任链的边界（一条硬约束）。** 根 CA 生成在**开发机**上，**根 CA 私钥永不上 106**：服务器被拿下时偷走的只有一张已签发的叶子证书与它的私钥（换一张重签即可，重签不碰任何设备上的信任），而不是整条信任链的根（那意味着攻击者可以给任意域名签一张被你的设备信任的证书）。**上机的只有两项**：叶子证书 `106.12.12.6.pem` 与它的私钥 `106.12.12.6-key.pem`。
+**信任链的边界（一条硬约束）。** 根 CA 生成在**开发机**上，**根 CA 私钥永不上 106**：服务器被拿下时偷走的只有一张已签发的叶子证书与它的私钥（换一张重签即可，重签不碰任何设备上的信任），而不是整条信任链的根（那意味着攻击者可以给任意域名签一张被你的设备信任的证书）。**上机的只有两项**：叶子证书 `203.0.113.10.pem` 与它的私钥 `203.0.113.10-key.pem`。
 
 > **⚠️ 切换前先读这一条：拆明文会让配对令牌在 106 上失去牙齿。**
 >
-> 配对守卫（§12.16、决策 167 / 182⑦）的豁免判据是**来源地址是否回环**，而守卫整体只在**绑非回环地址**时才启用。Caddy 与后端同机，它转发过来的请求源地址就是 `127.0.0.1`；后端一旦按本节的方案改绑 `127.0.0.1`，`lan_mode()` 也变假——**两条豁免同时命中，等于 `https://106.12.12.6` 上的写请求与 `/foreman/*` 全都不再要求令牌**（不装 CA 的浏览器点一次「继续访问」就能全程使用，包括花 token 的对讲台）。这不是「比以前安全一点还是差一点」的取舍，而是**今天那层保护会消失**，故**切换被显式挂起**（决策 323 如实记）。
+> 配对守卫（§12.16、决策 167 / 182⑦）的豁免判据是**来源地址是否回环**，而守卫整体只在**绑非回环地址**时才启用。Caddy 与后端同机，它转发过来的请求源地址就是 `127.0.0.1`；后端一旦按本节的方案改绑 `127.0.0.1`，`lan_mode()` 也变假——**两条豁免同时命中，等于 `https://203.0.113.10` 上的写请求与 `/foreman/*` 全都不再要求令牌**（不装 CA 的浏览器点一次「继续访问」就能全程使用，包括花 token 的对讲台）。这不是「比以前安全一点还是差一点」的取舍，而是**今天那层保护会消失**，故**切换被显式挂起**（决策 323 如实记）。
 >
 > 两条出路，选一条再动服务器（都不需要改后端代码、都能与 CA 那一套并存）：
 >
@@ -1406,10 +1408,10 @@ mkcert -CAROOT                    # 根 CA 在哪：rootCA.pem + rootCA-key.pem
 
 ```bash
 cd ~/ca-106                              # 建议单独放一个目录，别混进仓库
-mkcert -cert-file 106.12.12.6.pem -key-file 106.12.12.6-key.pem 106.12.12.6
-openssl x509 -in 106.12.12.6.pem -noout -text | grep -A2 'Subject Alternative Name'
-#   → DNS:…（若有）IP Address:106.12.12.6
-openssl x509 -in 106.12.12.6.pem -noout -enddate      # 有效期（mkcert 缺省约 27 个月）
+mkcert -cert-file 203.0.113.10.pem -key-file 203.0.113.10-key.pem 203.0.113.10
+openssl x509 -in 203.0.113.10.pem -noout -text | grep -A2 'Subject Alternative Name'
+#   → DNS:…（若有）IP Address:203.0.113.10
+openssl x509 -in 203.0.113.10.pem -noout -enddate      # 有效期（mkcert 缺省约 27 个月）
 ```
 
 **注意两条**：① **不要**把 `-cert-file` 指到 `.pem` 之外的格式上（Caddy 直接读 PEM）；② `~/ca-106/` 与 `$(mkcert -CAROOT)` 都**不要**提交进仓库（`.gitignore` 已挡住 `*.pem`，但根 CA 目录在仓库外更稳妥）。
@@ -1417,11 +1419,11 @@ openssl x509 -in 106.12.12.6.pem -noout -enddate      # 有效期（mkcert 缺�
 **上机（在开发机上执行）。** 证书与私钥放到 Caddy 的固定目录，权限只给 Caddy 那个用户：
 
 ```bash
-scp 106.12.12.6.pem 106.12.12.6-key.pem root@106.12.12.6:/tmp/
-ssh root@106.12.12.6 'install -d -m 755 /etc/caddy/certs && install -m 644 /tmp/106.12.12.6.pem /etc/caddy/certs/106.12.12.6.pem && install -m 600 /tmp/106.12.12.6-key.pem /etc/caddy/certs/106.12.12.6-key.pem && rm -f /tmp/106.12.12.6*.pem'
+scp 203.0.113.10.pem 203.0.113.10-key.pem root@203.0.113.10:/tmp/
+ssh root@203.0.113.10 'install -d -m 755 /etc/caddy/certs && install -m 644 /tmp/203.0.113.10.pem /etc/caddy/certs/203.0.113.10.pem && install -m 600 /tmp/203.0.113.10-key.pem /etc/caddy/certs/203.0.113.10-key.pem && rm -f /tmp/203.0.113.10*.pem'
 # 服务以 `caddy` 用户跑（EPEL 包固定），私钥必须让那个组读得到——`0600 root:root`
 # 会让它起不来并报 `open …-key.pem: permission denied`（2026-09-29 实测踩到）：
-ssh root@106.12.12.6 'chown root:caddy /etc/caddy/certs/106.12.12.6-key.pem && chmod 640 /etc/caddy/certs/106.12.12.6-key.pem && chown root:caddy /etc/caddy/certs && chmod 750 /etc/caddy/certs'
+ssh root@203.0.113.10 'chown root:caddy /etc/caddy/certs/203.0.113.10-key.pem && chmod 640 /etc/caddy/certs/203.0.113.10-key.pem && chown root:caddy /etc/caddy/certs && chmod 750 /etc/caddy/certs'
 ```
 
 **106 上的 Caddy（装一次，之后只管 reload）。**
@@ -1438,15 +1440,15 @@ cat >/etc/caddy/Caddyfile <<'CADDY'
 	auto_https off
 }
 
-# **站点块写成 `:443, :3389` 兜底，不要写 `https://106.12.12.6`**。
+# **站点块写成 `:443, :3389` 兜底，不要写 `https://203.0.113.10`**。
 # 两个端口都听是有意的：443 与 80 在云安全组里**没放行**，而 **3389 恰好放行**（探测
-# 得 `Connection refused` 而非超时即可判定放行）——现在入口是 https://106.12.12.6:3389/，
+# 得 `Connection refused` 而非超时即可判定放行）——现在入口是 https://203.0.113.10:3389/，
 # 将来放行了 443 不用改配置，只把 URL 里的端口去掉。——裸 IP 访问时客户端按
 # RFC 6066 **不发 SNI**（curl 与浏览器都一样），按域名索引的站点块拿不到证书，握手当场
 # `tlsv1 alert internal error`（2026-09-29 实测踩到）。`:443` 让这张静态证书成为无 SNI
 # 连接的默认证书；这台机器 443 上只服务这一个应用，兜底不扩大暴露面。
 :443, :3389 {
-	tls /etc/caddy/certs/106.12.12.6.pem /etc/caddy/certs/106.12.12.6-key.pem
+	tls /etc/caddy/certs/203.0.113.10.pem /etc/caddy/certs/203.0.113.10-key.pem
 
 	# 出路 ①（决策 332）：全站一层 HTTP Basic。Caddy 与后端同机，转发源地址必然是
 	# 127.0.0.1，后端改绑之后 lan_mode() 也变假——守卫的两条豁免同时命中，外面这一层
@@ -1464,7 +1466,7 @@ cat >/etc/caddy/Caddyfile <<'CADDY'
 }
 
 # 443 之外不留明文旁路：用 80 直接回 404（不重定向，避免误把明文流量送到应用上）
-http://106.12.12.6 {
+http://203.0.113.10 {
 	respond 404
 }
 CADDY
@@ -1483,23 +1485,23 @@ curl -sS -N -k --max-time 26 -u 'me:<口令>' https://127.0.0.1/foreman/stream |
 
 ```bash
 # ① 外网确认 https 入口可用（这一步过了才动手；明文此刻还在，随时可退）
-curl -sS -o /dev/null -w '%{http_code}\n' --cacert ~/ca-106/rootCA.pem https://106.12.12.6:3389/   # → 401 = 通
+curl -sS -o /dev/null -w '%{http_code}\n' --cacert ~/ca-106/rootCA.pem https://203.0.113.10:3389/   # → 401 = 通
 
 # ② 清理「界面那一级」的绑定覆盖（决策 186 的 DB 覆盖压过 config）：回环发一次 clear 即可。
 #    106 上实测 bind_source 一直是 `startup`，本来就没人按过「绑定全网卡」，这条是空操作。
-ssh -i ~/.ssh/106.key -o IdentitiesOnly=yes root@106.12.12.6 'curl -sX DELETE http://127.0.0.1:3333/server/lan'
+ssh -i ~/.ssh/106.key -o IdentitiesOnly=yes root@203.0.113.10 'curl -sX DELETE http://127.0.0.1:3333/server/lan'
 
 # ③ 改 unit 的启动参数（绑定优先级最高的一级）并重启。**那台机器上没有 config.toml**——
 #    绑定就是 unit 定的，所以不需要写 config（写了也只是声明式默认，flag 压过它）。
-ssh -i ~/.ssh/106.key -o IdentitiesOnly=yes root@106.12.12.6 '
+ssh -i ~/.ssh/106.key -o IdentitiesOnly=yes root@203.0.113.10 '
   cp /etc/systemd/system/agent-pipeline.service /root/agent-pipeline.service.bak-$(date +%Y%m%d-%H%M)
   sed -i "s|--host 0.0.0.0 --port 3333|--host 127.0.0.1 --port 3333|" /etc/systemd/system/agent-pipeline.service
   systemctl daemon-reload && systemctl restart agent-pipeline'
 
 # ④ 验证（三条都要）
-ssh -i ~/.ssh/106.key -o IdentitiesOnly=yes root@106.12.12.6 'ss -ltnp | grep 3333'   # → 只剩 127.0.0.1:3333
-curl -m 8 -sS -o /dev/null -w '%{http_code}\n' http://106.12.12.6:3333/ || echo '明文入口已关（connection refused）'
-curl -sS -o /dev/null -w '%{http_code}\n' --cacert ~/ca-106/rootCA.pem -u 'me:<口令>' https://106.12.12.6:3389/   # → 200
+ssh -i ~/.ssh/106.key -o IdentitiesOnly=yes root@203.0.113.10 'ss -ltnp | grep 3333'   # → 只剩 127.0.0.1:3333
+curl -m 8 -sS -o /dev/null -w '%{http_code}\n' http://203.0.113.10:3333/ || echo '明文入口已关（connection refused）'
+curl -sS -o /dev/null -w '%{http_code}\n' --cacert ~/ca-106/rootCA.pem -u 'me:<口令>' https://203.0.113.10:3389/   # → 200
 ```
 
 **手机与设备侧。** 每台要用推送的设备装一次根 CA 描述文件并显式信任：iPhone 用 **Safari**（不是微信/QQ 内置浏览器）打开 `$(mkcert -CAROOT)/rootCA.pem`（先把 `rootCA.pem` 拷到一台能访问的机器上，或用 AirDrop / 邮件发过去）→ 设置 → 已下载描述文件 → 安装 → 通用 → 关于本机 → 证书信任设置 → **打开**「mkcert …」那一项（少这一步 Safari 仍报不受信任）。**只有根证书上机，根 CA 私钥不上机**——这也是为什么描述文件可以从开发机分发而不是让 106 自己签。
@@ -1508,9 +1510,9 @@ curl -sS -o /dev/null -w '%{http_code}\n' --cacert ~/ca-106/rootCA.pem -u 'me:<�
 
 ```bash
 cd ~/ca-106
-mkcert -cert-file 106.12.12.6.pem -key-file 106.12.12.6-key.pem 106.12.12.6   # 同一条命令重签
-scp 106.12.12.6.pem 106.12.12.6-key.pem root@106.12.12.6:/etc/caddy/certs/
-ssh root@106.12.12.6 'systemctl reload caddy'
+mkcert -cert-file 203.0.113.10.pem -key-file 203.0.113.10-key.pem 203.0.113.10   # 同一条命令重签
+scp 203.0.113.10.pem 203.0.113.10-key.pem root@203.0.113.10:/etc/caddy/certs/
+ssh root@203.0.113.10 'systemctl reload caddy'
 ```
 
 **Basic 口令的轮换（出路 ① 的要付的那一次维护）。** 口令明文**只在开发机** `~/ca-106/basic-auth.txt`（600，2026-09-29 生成）；服务器上只有 Caddyfile 里那串 bcrypt 哈希，反推不出口令——忘了就直接换一串（各设备下次访问重新弹一次）：
@@ -1519,16 +1521,16 @@ ssh root@106.12.12.6 'systemctl reload caddy'
 PW=$(LC_ALL=C tr -dc 'A-Za-z0-9' </dev/urandom | head -c 24)
 # 注意：106 上是 Caddy 2.6.4，`caddy hash-password` **只认 --plaintext**（走 stdin 会报
 # `Error: EOF`，实测）；这一步口令会短暂出现在服务器进程表里，换完即散。
-HASH=$(ssh -i ~/.ssh/106.key -o IdentitiesOnly=yes root@106.12.12.6 "caddy hash-password --plaintext '$PW'")
+HASH=$(ssh -i ~/.ssh/106.key -o IdentitiesOnly=yes root@203.0.113.10 "caddy hash-password --plaintext '$PW'")
 # 改 Caddyfile 的 basicauth 块（把 me 那一行换成新哈希），然后：
-ssh -i ~/.ssh/106.key -o IdentitiesOnly=yes root@106.12.12.6 'caddy validate --config /etc/caddy/Caddyfile && systemctl reload caddy'
+ssh -i ~/.ssh/106.key -o IdentitiesOnly=yes root@203.0.113.10 'caddy validate --config /etc/caddy/Caddyfile && systemctl reload caddy'
 printf '用户名 me\n口令 %s\n' "$PW" > ~/ca-106/basic-auth.txt && chmod 600 ~/ca-106/basic-auth.txt
 ```
 
 
 **已知变数，如实记。** ① Apple 对「用户自装 CA」在 Safari 里的信任姿态是政策面的事，未来若收紧，退路是补一个真域名走标准证书（CA 那一套换掉，其余不动）；② 证书到期是**手动**动作，没有自动续期——`openssl x509 -enddate` 是唯一的提醒，记在运维日历里；③ 106 的 `443` 对外开放这件事本身**不增加暴露面**（`3333` 今天就在公网上），增加暴露面的是「拆掉明文入口之后令牌失效」那一条（见上面的警告框）。
 
-**现状（2026-09-29 晚，切换已完成；**这一代的做法已被决策 335 撤除，见 §12.18**）。** 106 上的入口现在**只有一条**：**`https://106.12.12.6:3389/`**（Caddy 全站 Basic；443 与 80 也都在听，但被云安全组挡着，放行之后把 URL 里的端口去掉即可）。落地清单：Caddy 2.6.4（EPEL 直装）+ mkcert 叶子证书（IP SAN，2028-12-29 到期，根 CA 私钥只在开发机）+ 全站 `basicauth` + 后端改绑回环（unit 的 `--host 127.0.0.1`）+ 明文入口关闭。**外网实测**：无凭据 401 / 带凭据 200（HTTP/2，返回应用本体）/ 经代理 `/server-info`、`/tasks`、`/notify/settings` 均 200 / `/foreman/stream` 26 秒内见心跳帧 / `http://106.12.12.6:3333/` 已是 `connection refused`。**为什么是 3389**：443 与 80 在云安全组里没放行（服务器侧没有防火墙挡着；外网探测 443/80/8443/8080/8888/8000 一律超时），3389 恰好放行（探测得 `Connection refused` 而非超时，即包能到、只是当时没服务在听）——Caddyfile 写成 `:443, :3389`，将来放行 443 无需改配置。
+**现状（2026-09-29 晚，切换已完成；**这一代的做法已被决策 335 撤除，见 §12.18**）。** 106 上的入口现在**只有一条**：**`https://203.0.113.10:3389/`**（Caddy 全站 Basic；443 与 80 也都在听，但被云安全组挡着，放行之后把 URL 里的端口去掉即可）。落地清单：Caddy 2.6.4（EPEL 直装）+ mkcert 叶子证书（IP SAN，2028-12-29 到期，根 CA 私钥只在开发机）+ 全站 `basicauth` + 后端改绑回环（unit 的 `--host 127.0.0.1`）+ 明文入口关闭。**外网实测**：无凭据 401 / 带凭据 200（HTTP/2，返回应用本体）/ 经代理 `/server-info`、`/tasks`、`/notify/settings` 均 200 / `/foreman/stream` 26 秒内见心跳帧 / `http://203.0.113.10:3333/` 已是 `connection refused`。**为什么是 3389**：443 与 80 在云安全组里没放行（服务器侧没有防火墙挡着；外网探测 443/80/8443/8080/8888/8000 一律超时），3389 恰好放行（探测得 `Connection refused` 而非超时，即包能到、只是当时没服务在听）——Caddyfile 写成 `:443, :3389`，将来放行 443 无需改配置。
 
 **手机访问指向公网入口（决策 334，切换带出来的那个缺口已收口）。** 后端绑回环之后，「手机访问」页原先会走进两条错路：① 判据只看绑定形态，于是永远显示「手机现在连不上这台机器」并递上一颗**按得动**的「绑定全网卡」钮（经反代进来的请求源地址是 `127.0.0.1`，回环豁免命中）——按下去等于把刚关掉的明文入口装回来；② 配对二维码按后端自己的绑定地址拼 URL（网卡候选 + 回环），那台机器的 eth0 是私网、3333 又只在回环上听，指向的是不可达地址。修法是给应用一个**公网入口**（`[server] public_base_url`，形状与 `allowed_origins` 同一种：`scheme://host[:port]`、不带路径）：
 
@@ -1536,25 +1538,25 @@ printf '用户名 me\n口令 %s\n' "$PW" > ~/ca-106/basic-auth.txt && chmod 600 
 # ① 106：把入口写进 unit 的启动参数（那台机器上没有 config.toml，绑定本来就由 unit 定）
 #    老二进制不认识这个参数会同一条规矩**静默忽略**（`parse_serve_args` 的宽容姿态），
 #    故这一步可以先做、也可以在部署之后做。
-ssh -i ~/.ssh/106.key -o IdentitiesOnly=yes root@106.12.12.6 '
+ssh -i ~/.ssh/106.key -o IdentitiesOnly=yes root@203.0.113.10 '
   cp /etc/systemd/system/agent-pipeline.service /root/agent-pipeline.service.bak-$(date +%Y%m%d-%H%M)
-  sed -i "s|--host 127.0.0.1 --port 3333|--host 127.0.0.1 --port 3333 --public-base-url https://106.12.12.6:3389|" \
+  sed -i "s|--host 127.0.0.1 --port 3333|--host 127.0.0.1 --port 3333 --public-base-url https://203.0.113.10:3389|" \
     /etc/systemd/system/agent-pipeline.service
   systemctl daemon-reload && systemctl restart agent-pipeline && systemctl is-active agent-pipeline'
 
 # ② 外网验证：/server-info 要同时给出「只绑回环」与那个入口，地址表里只有它一项
-curl -sS --cacert ~/ca-106/rootCA.pem -u 'me:<口令>' https://106.12.12.6:3389/server-info \
+curl -sS --cacert ~/ca-106/rootCA.pem -u 'me:<口令>' https://203.0.113.10:3389/server-info \
   | python3 -c 'import json,sys; d=json.load(sys.stdin); print(d["loopback_only"], d["public_base_url"], d["addresses"])'
-#   → True https://106.12.12.6:3389 [{'interface': '公网入口', 'url': 'https://106.12.12.6:3389', 'preferred': True}]
+#   → True https://203.0.113.10:3389 [{'interface': '公网入口', 'url': 'https://203.0.113.10:3389', 'preferred': True}]
 
 # ③ 二维码端点认这个入口（带令牌的配对 URL 与原样渲染）
 curl -sS -o /dev/null -w '%{http_code}\n' --cacert ~/ca-106/rootCA.pem -u 'me:<口令>' \
-  'https://106.12.12.6:3389/server-info/qr.svg?url=https%3A%2F%2F106.12.12.6%3A3389%2F%3Fpair%3Dtest'   # → 200
+  'https://203.0.113.10:3389/server-info/qr.svg?url=https%3A%2F%2F203.0.113.10%3A3389%2F%3Fpair%3Dtest'   # → 200
 ```
 
-**已落地（2026-09-29，本段命令逐条执行）**：unit 的 `ExecStart` 带上了 `--public-base-url https://106.12.12.6:3389` 并重启；外网实测 `/server-info` 经代理返回 `loopback_only=true` + `public_base_url="https://106.12.12.6:3389"` + 地址表只剩 `[{interface:"公网入口", url:"https://106.12.12.6:3389", preferred:true}]`；二维码端点带令牌的配对 URL **200**、缺省目标 **200**、白名单外 origin **400**；本机 chromium 打开 `https://106.12.12.6:3389/#/share`（Basic 凭据 + 忽略证书）时页面画出的正是指向该入口的码（`.picked` = `https://106.12.12.6:3389/?pair=…`），`.gate` 与「绑定全网卡 / 改回只绑本机」两颗钮**都为 0**，service worker 在信任根 CA 的浏览器里照常注册（scope `https://106.12.12.6:3389/`）。
+**已落地（2026-09-29，本段命令逐条执行）**：unit 的 `ExecStart` 带上了 `--public-base-url https://203.0.113.10:3389` 并重启；外网实测 `/server-info` 经代理返回 `loopback_only=true` + `public_base_url="https://203.0.113.10:3389"` + 地址表只剩 `[{interface:"公网入口", url:"https://203.0.113.10:3389", preferred:true}]`；二维码端点带令牌的配对 URL **200**、缺省目标 **200**、白名单外 origin **400**；本机 chromium 打开 `https://203.0.113.10:3389/#/share`（Basic 凭据 + 忽略证书）时页面画出的正是指向该入口的码（`.picked` = `https://203.0.113.10:3389/?pair=…`），`.gate` 与「绑定全网卡 / 改回只绑本机」两颗钮**都为 0**，service worker 在信任根 CA 的浏览器里照常注册（scope `https://203.0.113.10:3389/`）。
 
-改完这一页应当：画出**指向 `https://106.12.12.6:3389/?pair=…` 的二维码**、不再出现「手机现在连不上这台机器」与两颗改绑钮、底部改为说清入口来自哪里。**注意这一页仍要在能读到令牌的入口打开**（106 上经反代进来的请求算本机，故从任何设备进站都读得到；见下面的警告框）。另外：`~/.zcode/skills/agentpipeline-deploy-106/SKILL.md` 已同步（入口、验证命令、3389 这个事实、这一条参数）。
+改完这一页应当：画出**指向 `https://203.0.113.10:3389/?pair=…` 的二维码**、不再出现「手机现在连不上这台机器」与两颗改绑钮、底部改为说清入口来自哪里。**注意这一页仍要在能读到令牌的入口打开**（106 上经反代进来的请求算本机，故从任何设备进站都读得到；见下面的警告框）。另外：`~/.zcode/skills/agentpipeline-deploy-106/SKILL.md` 已同步（入口、验证命令、3389 这个事实、这一条参数）。
 
 ### 12.18 106 的入口：**应用自己终止 TLS**，没有反代、没有 Basic（决策 335 / 336）
 
@@ -1565,20 +1567,20 @@ curl -sS -o /dev/null -w '%{http_code}\n' --cacert ~/ca-106/rootCA.pem -u 'me:<�
 **证书落位（root 可读即可，应用以 root 跑）。** 证书与私钥从 Caddy 的目录搬到应用自己的目录——**私钥只给 root**（原来是 `root:caddy` 640，因为 Caddy 以 `caddy` 用户跑）：
 
 ```bash
-ssh -i ~/.ssh/106.key -o IdentitiesOnly=yes root@106.12.12.6 '
+ssh -i ~/.ssh/106.key -o IdentitiesOnly=yes root@203.0.113.10 '
   install -d -m 700 /etc/agentpipeline/tls
-  install -m 644 /etc/caddy/certs/106.12.12.6.pem     /etc/agentpipeline/tls/106.12.12.6.pem
-  install -m 600 /etc/caddy/certs/106.12.12.6-key.pem /etc/agentpipeline/tls/106.12.12.6-key.pem
+  install -m 644 /etc/caddy/certs/203.0.113.10.pem     /etc/agentpipeline/tls/203.0.113.10.pem
+  install -m 600 /etc/caddy/certs/203.0.113.10-key.pem /etc/agentpipeline/tls/203.0.113.10-key.pem
   ls -l /etc/agentpipeline/tls'
 ```
 
 **改 unit 并重启（顺序要紧：先腾出 3389，再让应用去绑它）。**
 
 ```bash
-ssh -i ~/.ssh/106.key -o IdentitiesOnly=yes root@106.12.12.6 '
+ssh -i ~/.ssh/106.key -o IdentitiesOnly=yes root@203.0.113.10 '
   cp /etc/systemd/system/agent-pipeline.service /root/agent-pipeline.service.bak-$(date +%Y%m%d-%H%M)
   systemctl disable --now caddy                      # ① 先让 3389/443/80 空出来
-  sed -i "s|^ExecStart=.*|ExecStart=/opt/AgentPipeline/target/release/agent-pipeline serve --host 0.0.0.0 --port 3389 --tls-cert /etc/agentpipeline/tls/106.12.12.6.pem --tls-key /etc/agentpipeline/tls/106.12.12.6-key.pem --public-base-url https://106.12.12.6:3389|" \
+  sed -i "s|^ExecStart=.*|ExecStart=/opt/AgentPipeline/target/release/agent-pipeline serve --host 0.0.0.0 --port 3389 --tls-cert /etc/agentpipeline/tls/203.0.113.10.pem --tls-key /etc/agentpipeline/tls/203.0.113.10-key.pem --public-base-url https://203.0.113.10:3389|" \
     /etc/systemd/system/agent-pipeline.service
   systemctl daemon-reload && systemctl restart agent-pipeline
   sleep 2; ss -ltnp | grep -E "3389|3333"; systemctl is-active agent-pipeline'
@@ -1589,30 +1591,30 @@ ssh -i ~/.ssh/106.key -o IdentitiesOnly=yes root@106.12.12.6 '
 ```bash
 # ① 入口在、TLS 是应用自己谈的、未配对只得到配对页（401 + text/html）
 curl -sS -o /tmp/p.html -w '%{http_code} %{http_version} %{content_type}\n' \
-  --cacert ~/ca-106/rootCA.pem https://106.12.12.6:3389/          # → 401 2 text/html; charset=utf-8
+  --cacert ~/ca-106/rootCA.pem https://203.0.113.10:3389/          # → 401 2 text/html; charset=utf-8
 grep -c '还没配对' /tmp/p.html                                     # → 1
 
 # ② 接口未带凭据一律 403 + kind（不再是 Basic 那种 401 challenge）
-curl -sS --cacert ~/ca-106/rootCA.pem https://106.12.12.6:3389/tasks | head -c 120
+curl -sS --cacert ~/ca-106/rootCA.pem https://203.0.113.10:3389/tasks | head -c 120
 
 # ③ 配对链接进得去，并且种下 cookie（这就是「手机扫一次」的全部）
-TOK=$(ssh -i ~/.ssh/106.key -o IdentitiesOnly=yes root@106.12.12.6 \
+TOK=$(ssh -i ~/.ssh/106.key -o IdentitiesOnly=yes root@203.0.113.10 \
       'curl -s http://127.0.0.1:3389/pairing/token' | python3 -c 'import json,sys;print(json.load(sys.stdin)["token"])')
-curl -sS -D- -o /dev/null --cacert ~/ca-106/rootCA.pem "https://106.12.12.6:3389/?pair=$TOK" | grep -i '^set-cookie'
+curl -sS -D- -o /dev/null --cacert ~/ca-106/rootCA.pem "https://203.0.113.10:3389/?pair=$TOK" | grep -i '^set-cookie'
 
 # ④ 明文入口彻底没了（3333 与 80/443 都不该有人听）
-curl -m 5 -sS -o /dev/null -w '%{http_code}\n' http://106.12.12.6:3333/ || echo '明文已关（connection refused）'
+curl -m 5 -sS -o /dev/null -w '%{http_code}\n' http://203.0.113.10:3333/ || echo '明文已关（connection refused）'
 ```
 
-**配对（每台设备一次，之后不再问）。** 手机扫「手机访问」页上那张码（`https://106.12.12.6:3389/?pair={token}`）——这一次导航就是配对：应用放行并种下 cookie，此后直接输地址、点书签、刷新都进得去。**换设备或怀疑泄露**：在那台跑服务的机器上（`http://127.0.0.1:3389/#/share`，本机来源豁免）点「重置配对」，旧令牌与旧 cookie **立刻失效**，各设备重扫一次。**手机为什么要装根 CA**：自签证书对浏览器是不受信任的，装上并显式信任之后（§12.17 那一节的做法不变）推送与 service worker 才在安全上下文里；不装也能用（点一次「继续访问」），只是推送用不了。
+**配对（每台设备一次，之后不再问）。** 手机扫「手机访问」页上那张码（`https://203.0.113.10:3389/?pair={token}`）——这一次导航就是配对：应用放行并种下 cookie，此后直接输地址、点书签、刷新都进得去。**换设备或怀疑泄露**：在那台跑服务的机器上（`http://127.0.0.1:3389/#/share`，本机来源豁免）点「重置配对」，旧令牌与旧 cookie **立刻失效**，各设备重扫一次。**手机为什么要装根 CA**：自签证书对浏览器是不受信任的，装上并显式信任之后（§12.17 那一节的做法不变）推送与 service worker 才在安全上下文里；不装也能用（点一次「继续访问」），只是推送用不了。
 
-**回滚（退回 Caddy 那一代）。** 证书还在 `/etc/caddy/certs/`，Caddyfile 也没删：`systemctl disable --now agent-pipeline` → 把 unit 的 `ExecStart` 换回 `--host 127.0.0.1 --port 3333 --public-base-url https://106.12.12.6:3389` → `systemctl enable --now caddy` → `systemctl start agent-pipeline`。**注意回滚会把配对闸门一起关掉**（源地址变回环），那是决策 332 那代的老账（§12.17 的警告框）。
+**回滚（退回 Caddy 那一代）。** 证书还在 `/etc/caddy/certs/`，Caddyfile 也没删：`systemctl disable --now agent-pipeline` → 把 unit 的 `ExecStart` 换回 `--host 127.0.0.1 --port 3333 --public-base-url https://203.0.113.10:3389` → `systemctl enable --now caddy` → `systemctl start agent-pipeline`。**注意回滚会把配对闸门一起关掉**（源地址变回环），那是决策 332 那代的老账（§12.17 的警告框）。
 
-**已落地（2026-09-30，本节命令逐条执行）。** 106 上现在的形态：unit 的 `ExecStart` 走 `--host 0.0.0.0 --port 3389 --tls-cert /etc/agentpipeline/tls/106.12.12.6.pem --tls-key …-key.pem --public-base-url https://106.12.12.6:3389`；**Caddy 已 `disable --now`**（证书仍留在 `/etc/caddy/certs/`，回滚要用）；旧 unit 备份在 `/root/agent-pipeline.service.bak-20260930-*`。**外网实测（开发机 → 106，真跨境路径）**：未配对导航 **401 + 配对页**（带 CA、不带任何凭据）；`/tasks` **403 + `kind: pairing_required`**；`/?pair=<token>` **200 + `Set-Cookie`**（无 `Secure`）；`/sw.js`、`/manifest.webmanifest`、`/icons/*` 一律 **403**；`http://106.12.12.6:3333/` 与 `http://…:3389/` **都不通**（明文旁路全关）。**真浏览器（Playwright chromium，忽略证书错误）**：① 未配对 → 配对页（`#url` 由脚本填上，证明 JS 在 401 响应体里照跑）；② 扫码（`?pair=`）→ 应用完整起来（对讲台/看板渲染、真实读数）；③ **同容器新开一页打开裸地址 → 直接进站**（导航那条路只有 cookie 能授权，故这条即 cookie 的验收）；④ **升级前配过的设备**（只有 localStorage、没有 cookie）打开裸地址 → 配对页把它自动迁移到 `/?pair=<本机那份>` → 进站（**老设备不必重扫**，前提是令牌没重置过）。
+**已落地（2026-09-30，本节命令逐条执行）。** 106 上现在的形态：unit 的 `ExecStart` 走 `--host 0.0.0.0 --port 3389 --tls-cert /etc/agentpipeline/tls/203.0.113.10.pem --tls-key …-key.pem --public-base-url https://203.0.113.10:3389`；**Caddy 已 `disable --now`**（证书仍留在 `/etc/caddy/certs/`，回滚要用）；旧 unit 备份在 `/root/agent-pipeline.service.bak-20260930-*`。**外网实测（开发机 → 106，真跨境路径）**：未配对导航 **401 + 配对页**（带 CA、不带任何凭据）；`/tasks` **403 + `kind: pairing_required`**；`/?pair=<token>` **200 + `Set-Cookie`**（无 `Secure`）；`/sw.js`、`/manifest.webmanifest`、`/icons/*` 一律 **403**；`http://203.0.113.10:3333/` 与 `http://…:3389/` **都不通**（明文旁路全关）。**真浏览器（Playwright chromium，忽略证书错误）**：① 未配对 → 配对页（`#url` 由脚本填上，证明 JS 在 401 响应体里照跑）；② 扫码（`?pair=`）→ 应用完整起来（对讲台/看板渲染、真实读数）；③ **同容器新开一页打开裸地址 → 直接进站**（导航那条路只有 cookie 能授权，故这条即 cookie 的验收）；④ **升级前配过的设备**（只有 localStorage、没有 cookie）打开裸地址 → 配对页把它自动迁移到 `/?pair=<本机那份>` → 进站（**老设备不必重扫**，前提是令牌没重置过）。
 
 **切换时实测抓到的两个坑（都已修进代码，写在这里免得下次又踩）**：① 配对 cookie 一开始带 `Secure`，而**明文形态下浏览器直接拒收**，于是「配对成功却整页空白」——外壳的子资源（`/assets/*.js`、`/sw.js`）既带不了自定义头、地址里又没有 `?pair=`，只能靠这个 cookie 过闸门（决策 336 的账，`stream.rs::enrollment_cookie` 有注释与反向单测）；② TLS 的 ALPN 一开始宣告了 `h2`，而**本工作区的 axum 没开 `http2` 特性**——客户端谈成 h2 便按 h2 发 preface、服务端按 h1 解析，连接当场重置：症状是 TLS 形态下**什么都打不开**而 `curl --http1.1` 完全正常，最容易误判成证书坏了（`serve.rs::alpn_protocols` 有注释与单测）。
 
-**在 106 本机上打开这一页**（要读配对令牌时）走 `https://127.0.0.1:3389/`：证书 SAN 里只有 `106.12.12.6`，浏览器会报名字不匹配——点一次「继续」即可（回环来源豁免，令牌读得到）；命令行用 `curl -sk https://127.0.0.1:3389/pairing/token`。**明文发往 3389 只会拿到空响应**（那不是故障，是往 TLS 端口发明文）。
+**在 106 本机上打开这一页**（要读配对令牌时）走 `https://127.0.0.1:3389/`：证书 SAN 里只有 `203.0.113.10`，浏览器会报名字不匹配——点一次「继续」即可（回环来源豁免，令牌读得到）；命令行用 `curl -sk https://127.0.0.1:3389/pairing/token`。**明文发往 3389 只会拿到空响应**（那不是故障，是往 TLS 端口发明文）。
 
 **闸门转绿（2026-09-30，决策 337 / 338 / 339 / 342 / 343 / 345）。** 上面那条「闸门是红的」的实情已收口。前后红过**九处**，没有一处是环境玄学：① 真红的是 `crates/core/src/rtk.rs::probe_attributes_each_failure`——Linux 上 exec 一个**还开着写 fd** 的文件回 `ETXTBSY`（`Text file busy`），而 `cargo test` 是几百条用例**并排**跑的，别的用例 fork 出来的子进程会把那时开着的写 fd 一起继承走；修法是把假 shim 的**写**交给子进程（`sh -c 'cat > "$1" && chmod 755 "$1"'`），写 fd 就只活在它自己肚子里，窗从形状上关掉，而不是重试等它过去。② `frontend/e2e/ux2-geometry.spec.ts:137` 那条**不是让位算错**——**上一版这里记错了**（把它记成「档案盒压根没进入吸顶状态」）：探针实测吸顶是好的（滚 22–140px 恒为 `dossierTop=94 / tagTop=80`，顶栏下沿 78），红的是**取样点**——这份夹具的页面只能滚 156px，用例写的 `scrollTo(0, 500)` 被夹到 156，采到的是 sticky 的**行程末端**（行程受包含块即网格行的下沿所限，`dossierTop` 掉到 86、铭牌跟着上移 8px → 相交 6px），现在是「钉住之后、离场之前」取样并**先断言确实吸顶**。③ talk 的「发送失败摆成两轮」是一条**真实的共存窗**（重取回包落地那一刻，台账那一行与本地那条同时在场；20 次里红 2 次），判据从「收尾时判一次」搬到**渲染**上，窗从形状上不存在。④ `agent::bounded_read::tests::crossing_the_threshold_raises_exactly_one_claimable_note` 在**数 yield 等另一个线程**（「卡着的」那个减法在**阻塞池线程**里做），换成**有上限的真实时间窗**（2ms 一跳等 5s）。⑤ **第五处红在生产代码上**，是前四处修完、闸门第一次走到集成那一杆（`crates/core/tests/integration/command_funnel.rs`）才露出来的：`RealProcessKiller::kill_process_group` 把「负 pid = 进程组」这条语义交给**外部的 `kill` 命令**去解析，而各家实现并不一致——**procps-ng 的 `kill`（Ubuntu 24.04 = runner，`kill --version` 实测即此）只按 `-PGID` 的第一个数字字符算**（`kill -TERM -7511` 打的是**进程组 7**；`-1234` 会变成 `kill -1`），**退出码 0、stderr 一个字没有**，该杀的进程组一个都没动；macOS 的 BSD `kill` 与 106 的 util-linux `kill` 都按负 pid 办，故这个洞**在开发机与生产机上都看不见**。修法是改走 `libc::kill(-pgid, SIGTERM)`（`libc` 早就在依赖树里，不新增依赖）、非 0 再 `SIGKILL`。**顺带解掉的一个怪事**：那几趟红里 runner 总在用例失败后 12–15 秒报 `The runner has received a shutdown signal`（紧跟 `make ... Terminated`），修完第五处之后同一套跑法**不再出现**——与「那一发打在了别的进程组上」相符。⑥ **第六处红在用例侧，而且只在闸门走到 app 集成那一杆时才露头**（`crates/app/tests/integration/api_contract.rs::proposals_endpoint_lists_only_the_pending_ones_of_that_session`）：它断言「未决提议**按创建顺序**返回」，而那个读端口的顺序来自 `ORDER BY id ASC`（ULID 序）——**同毫秒内两条的先后由 ULID 的随机尾段定**，创建先后并不等价于 id 先后。这条是**高频**偶发：本地十次红三次，CI 上同一个 commit（8fb33ff）一绿一红。修法是用例**按 id 比、按 id 找行**断言（顺序从来不是这条用例的主题，「只给这一班未决的」才是）；班次列表那条用过的 `advance_secs` 在这里**不管用**——它拨的是排序键 `last_active_at`，而这条的排序键是 id（ULID 由系统时钟铸，测试里拨不动）。修后本地连跑 12 次零红、app 集成 224 条连过两遍。⑦ **第七处在装置上**（`crates/core/tests/integration/web_fetch.rs` 的 TinyHttp，notify / foreman 两族测试共用）：满载整套并跑时，它把「连上了但报文还没到」的连接也计一次命中，500ms 读超时又被当成「对端停手」，于是 `wait_hits` 一放行、调用方读到的 `first_request_line` / `request_head` 就是空串——满载四趟红两趟（两条 notify 用例各中一回；单跑复现不了，bluebubbles 那条单跑 12/12 绿）。修法在装置侧：读超时只当「再等一拍」（3s 总时限兜底），计数收窄为「这条请求已收全、三样读数都已写好」之后才 +1（决策 342）。⑧ **第八处在用例与装置的交界上**（`executor.rs` 的 `wait_for_a_held_running_run`）：它抓任务的**第一条** active run，而 `init.execute`（纯代码节点）的 run 完成得快但**不是零耗时**——本地 5ms 轮询窗内 init 早已跑完、抓到的直接是会挂起的 agent run；runner 满载时 init 跑得慢，测试抓到的是 **init 的 run**，随后才拨时钟 400s，executor 起的 agent run `started_at` 落在**拨后**，看门狗看它是新鲜的——`timed_out_runs` 空了，断言当场红（3225215 那趟 check，`a_terminal_run_frees_its_ownership_even_when_the_future_never_returns`）。这颗雷是同文件既有注释记载过的（ladder 那条钉了节点，这两条没钉）；修法：t-stuck / t-chain 改用 `wait_for_running_validate_input` 把等待钉在会挂起的 agent 节点上——agent 节点的心跳只在响应之后刷，run Running 之后不会再有触碰，拨时钟后它必然陈旧（决策 343）。⑨ **第九处在另一会话的 PWA 用例对构建产物的隐含假设上**（决策 340 的 `pairing_lan_unpaired_can_still_fetch_install_assets`）：test 杆**不装 Node**（check.yml 注释写明的设计，`build.rs` 对缺失的 `frontend/dist` 生成**空资产表**，这一态由既有两条资产契约用例明确接受），而它无条件断言四条安装资产 **200**；runner 上 dist 缺失 → 图标 404 → 红（5746d72 那趟，run 36667897838）。本地有 dist 所以两侧都绿、只有 runner 红。修法沿既有双态先例：空表时断 **404**——闸门拦的是 403，对照组三条 403 证明闸门在岗，404 即「放行了、但表里没有」的证据，两层不冒充（决策 345）；check.yml 的注释同步补上第三条用例。**明确没做**：不放宽那几条断言、不给 e2e 加重试、不动那 6px 的布局（让位规则本身是对的）、不给 `probe` / `rewrite` 加 ETXTBSY 重试（生产的形态够不着那扇窗：装 shim 与 exec shim 之间没有并发的 fork）。本地四杆（`make check` 四档）逐杆复验通过；**第五处在 runner 上单跑 5 次全绿、整条集成二进制 463 passed / 0 failed**（临时 debug 分支实测，该分支与它的工作流已删）；main 的复跑结论：8fb33ff（第五处修复）那趟 check（run 36655849488）四杆全绿，5e42661 那趟（run 36657804133）同样全绿，`deploy-106` 由 `workflow_run` 自动接力并成功（run 36658496820，`/opt/deploy.sh` 的探针修正之后）；其间另一个会话手动的 `workflow_dispatch`（run 36657083180）红出的正是第六处——同一份代码一绿一红，恰是「绿靠运气」的实证。第六 / 七处的修复已随 3225215 push 上去，它的 `check`（run 36665212472）lint / frontend 全绿，test 杆 653 条单元全过、core 集成 462 过 / 1 红——红的是**第八处**（⑧ 的老雷，与 339 / 342 无关：proposals 与 notify 两条判据在该趟全过）；⑥⑦ 已随 3225215 验收（run 36665212472 的红是 ⑧）；⑧ 已随 5746d72 验收（run 36667897838 的 core 集成 **463 全过**，红的是 ⑨）；⑨ 的修复随这一段同一次 push，紧接的那趟 `check` 是整段的完整复验。此后 `deploy.yml` 照 `workflow_run` 自动接力，手动 `workflow_dispatch` 那条口子照旧保留（「check 自己挂了要重推一遍 106」）。
 
@@ -1633,7 +1635,7 @@ curl -sk -o /dev/null --max-time 10 -w "%{http_code}" https://127.0.0.1:3389/ | 
 修法照上一条的惯例（unit 手管，先备份后改）：
 
 ```bash
-ssh -i ~/.ssh/106.key -o IdentitiesOnly=yes root@106.12.12.6 '
+ssh -i ~/.ssh/106.key -o IdentitiesOnly=yes root@203.0.113.10 '
   cp -a /etc/systemd/system/agent-pipeline.service /root/agent-pipeline.service.bak-20261007-toolchain
   # 在 Environment=USER=root 之后补两行：
   #   Environment=PATH=/root/.cargo/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin

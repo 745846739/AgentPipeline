@@ -432,10 +432,10 @@ mod tests {
         let built = build_addresses(
             &[addr("en0", "192.168.1.10", true)],
             8787,
-            Some("https://106.12.12.6:3389"),
+            Some("https://203.0.113.10:3389"),
         );
         assert_eq!(built.len(), 1, "只列公网入口，不列手机够不着的网卡地址");
-        assert_eq!(built[0].url, "https://106.12.12.6:3389");
+        assert_eq!(built[0].url, "https://203.0.113.10:3389");
         assert!(built[0].preferred, "它就该是首选（也只会是唯一一项）");
         assert_eq!(built[0].interface, PUBLIC_ENTRY_LABEL);
     }
@@ -456,15 +456,15 @@ mod tests {
             "回环两项恒在：本机打开验证要复用同一端点"
         );
 
-        let with = qr_whitelist(Some("https://106.12.12.6:3389"), &lan, 8787);
+        let with = qr_whitelist(Some("https://203.0.113.10:3389"), &lan, 8787);
         assert_eq!(
             with.first().map(String::as_str),
-            Some("https://106.12.12.6:3389"),
+            Some("https://203.0.113.10:3389"),
             "公网入口排最前：配了它，默认那张码就该指外面那道门"
         );
         // 配对 URL（origin + `?pair=`）必须落在白名单里，否则手机上那张码根本渲染不出来
         assert!(qr_url_allowed(
-            &pairing_url("https://106.12.12.6:3389", "TOK"),
+            &pairing_url("https://203.0.113.10:3389", "TOK"),
             &with
         ));
         assert!(!qr_url_allowed("https://evil.example/?pair=TOK", &with));

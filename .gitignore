@@ -20,14 +20,8 @@ crates/desktop/gen/schemas/
 # 并行子代理工作树（临时）
 .worktrees/
 
-# 原型截图与真应用截图（可由 .scratch/shots/capture*.mjs / e2e/screenshots.spec.ts 重新生成，不入库）
-.scratch/shots/**/*.png
-# UI/UX 审计截图（可由 UX_AUDIT=1 跑 e2e/ux-audit.spec.ts 重新生成，不入库）
-.scratch/ux-audit/*.png
-# 第二轮审计截图（可由 UX_AUDIT2=1 跑 e2e/ux-audit-2.spec.ts 重新生成，不入库）
-.scratch/ux-audit-2/*.png
-# 第三轮审计截图（可由 UX_AUDIT3=1 跑 e2e/ux-audit-3.spec.ts 重新生成，不入库）
-.scratch/ux-audit-3/*.png
+# 过程草稿区（.scratch/）：截图、审计、issue、临时笔记等，整体不入库
+.scratch/
 
 # 本机工具产物，与本项目无关：cargo-sweep 的时间戳文件、ZCode 客户端的会话目录
 sweep.timestamp

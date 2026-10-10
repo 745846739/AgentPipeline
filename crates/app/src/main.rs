@@ -165,7 +165,7 @@ mod tests {
     /// 非法形态**启动期**就失败（不是等到手机上扫出一张打不开的码）。
     #[test]
     fn serve_args_accept_public_base_url_in_both_forms() {
-        let split: Vec<String> = ["--public-base-url", "HTTPS://106.12.12.6:3389/"]
+        let split: Vec<String> = ["--public-base-url", "HTTPS://203.0.113.10:3389/"]
             .iter()
             .map(|s| s.to_string())
             .collect();
@@ -174,7 +174,7 @@ mod tests {
                 .unwrap()
                 .public_base_url_override
                 .as_deref(),
-            Some("https://106.12.12.6:3389"),
+            Some("https://203.0.113.10:3389"),
             "归一：小写化 + 剥尾部斜杠（否则二维码会拼出 `//?pair=…`）"
         );
         let inline: Vec<String> = ["--public-base-url=https://ap.example.com"]
@@ -188,7 +188,7 @@ mod tests {
                 .as_deref(),
             Some("https://ap.example.com")
         );
-        for bad in ["106.12.12.6:3389", "https://ap.example.com/app"] {
+        for bad in ["203.0.113.10:3389", "https://ap.example.com/app"] {
             let args: Vec<String> = vec!["--public-base-url".into(), bad.into()];
             assert!(
                 parse_serve_args(&args).is_err(),

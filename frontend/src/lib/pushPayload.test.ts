@@ -52,15 +52,15 @@ describe('推送报文的归一（payload → 通知形状）', () => {
 });
 
 describe('点通知去哪儿（payload → 导航目标）', () => {
-  const origin = 'https://106.12.12.6';
+  const origin = 'https://203.0.113.10';
 
   it('认自己那几条 hash 深链：拼成同源绝对地址', () => {
-    expect(notificationTarget('#/task/t1', origin)).toBe('https://106.12.12.6/#/task/t1');
+    expect(notificationTarget('#/task/t1', origin)).toBe('https://203.0.113.10/#/task/t1');
     expect(notificationTarget('#/task/t1?run=42', origin)).toBe(
-      'https://106.12.12.6/#/task/t1?run=42',
+      'https://203.0.113.10/#/task/t1?run=42',
     );
     expect(notificationTarget('#/talk?session=s1', origin)).toBe(
-      'https://106.12.12.6/#/talk?session=s1',
+      'https://203.0.113.10/#/talk?session=s1',
     );
   });
 
@@ -76,8 +76,8 @@ describe('点通知去哪儿（payload → 导航目标）', () => {
       '#//evil.example',
       'javascript:alert(1)',
     ]) {
-      expect(notificationTarget(url, origin)).toBe('https://106.12.12.6/#/');
+      expect(notificationTarget(url, origin)).toBe('https://203.0.113.10/#/');
     }
-    expect(notificationTarget('#/', origin)).toBe('https://106.12.12.6/#/');
+    expect(notificationTarget('#/', origin)).toBe('https://203.0.113.10/#/');
   });
 });

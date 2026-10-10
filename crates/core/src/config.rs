@@ -285,7 +285,7 @@ pub struct ServerConfig {
     pub host: String,
     /// **手机实际访问的那个入口**（决策 334）：反向代理 / 公网域名后面部署时，手机够得着的
     /// 是代理那一个 origin，而不是本进程绑的 `host:port`（106 上后端绑回环、门外是 Caddy 的
-    /// `https://106.12.12.6:3389`）。
+    /// `https://203.0.113.10:3389`）。
     ///
     /// 形状与 `allowed_origins` 同一种：`scheme://host[:port]`、**不带路径**（经
     /// `normalize_origin` 归一，解析期 fail fast）；CLI `--public-base-url` 覆盖它。
@@ -1978,13 +1978,13 @@ mod tests {
         let cfg = Config::from_toml(
             r#"
             [server]
-            public_base_url = "https://106.12.12.6:3389"
+            public_base_url = "https://203.0.113.10:3389"
             "#,
         )
         .unwrap();
         assert_eq!(
             cfg.server.public_base_url.as_deref(),
-            Some("https://106.12.12.6:3389")
+            Some("https://203.0.113.10:3389")
         );
         // 不配 = None（本机 / 局域网直连形态；不是空串那种「配了但没意义」的第三态）
         assert!(Config::from_toml("[server]\nport = 8788\n")
@@ -1994,9 +1994,9 @@ mod tests {
             .is_none());
 
         for bad in [
-            "106.12.12.6:3389",             // 缺 scheme
-            "https://106.12.12.6:3389/app", // 带路径：二维码是 origin 加 `/?pair=…`，多一段路径必然拼错
-            "ftp://106.12.12.6",            // scheme 不支持
+            "203.0.113.10:3389",             // 缺 scheme
+            "https://203.0.113.10:3389/app", // 带路径：二维码是 origin 加 `/?pair=…`，多一段路径必然拼错
+            "ftp://203.0.113.10",            // scheme 不支持
         ] {
             let toml = format!("[server]\npublic_base_url = \"{bad}\"\n");
             let err = Config::from_toml(&toml).unwrap_err().to_string();

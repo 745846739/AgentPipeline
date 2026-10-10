@@ -29,7 +29,7 @@ const LAN = { loopback_only: false, public_base_url: null };
 /** 只绑回环、没有公网入口：手机真的够不着（决策 186 的改绑指引）。 */
 const LOOPBACK = { loopback_only: true, public_base_url: null };
 /** 只绑回环**但有公网入口**：106 的形态——后端在回环上听，门外是 Caddy（决策 334）。 */
-const PUBLIC_ENTRY = { loopback_only: true, public_base_url: 'https://106.12.12.6:3389' };
+const PUBLIC_ENTRY = { loopback_only: true, public_base_url: 'https://203.0.113.10:3389' };
 
 describe('sharePanel（决策 189）', () => {
   it('有地址、有令牌 → 画带令牌的码，形状与后端 pairing_url 同约定', () => {
@@ -136,13 +136,13 @@ describe('phoneCanReach（决策 334：绑回环 ≠ 手机够不着）', () => 
   it('配了公网入口就走二维码那条路，而不是改绑指引', () => {
     const panel = sharePanel({
       info: PUBLIC_ENTRY,
-      addresses: [{ url: 'https://106.12.12.6:3389' }],
+      addresses: [{ url: 'https://203.0.113.10:3389' }],
       selected: null,
       token: 'tok',
     });
     expect(panel).toEqual({
       kind: 'paired-qr',
-      target: 'https://106.12.12.6:3389/?pair=tok',
+      target: 'https://203.0.113.10:3389/?pair=tok',
     });
   });
 });
@@ -150,7 +150,7 @@ describe('phoneCanReach（决策 334：绑回环 ≠ 手机够不着）', () => 
 describe('qrCaption（决策 334：这句话说错了，人就往错的方向查）', () => {
   it('有公网入口 → 说清走的是那个入口、后端只绑回环', () => {
     const text = qrCaption(PUBLIC_ENTRY);
-    expect(text).toContain('https://106.12.12.6:3389');
+    expect(text).toContain('https://203.0.113.10:3389');
     expect(text).toContain('反向代理');
     expect(text).not.toContain('同一 Wi-Fi');
   });
