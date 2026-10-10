@@ -14,7 +14,7 @@
 #
 #   make check          提交前必过全量（lint + test + frontend + e2e-frontend）
 #   make check-lint     fmt --check + clippy -D warnings
-#   make check-test     cargo test --workspace
+#   make check-test     cargo test --workspace + 前端单测（票 gate-frontend-tests 01）
 #   make check-frontend 前端单元 + 类型检查 + 构建
 #   make check-e2e      前端 E2E（含产物新鲜度守卫，决策 166）
 #   make hooks          安装 pre-commit 闸门（决策 348，core.hooksPath → scripts/hooks）
@@ -88,8 +88,16 @@ check-lint:
 #
 # 日常改动用分层子目标（unit / integration / api / e2e / smoke）；
 # 本目标留给提交前的那一次完整验证。
+#
+# 前端单测进闸门（票 gate-frontend-tests 01，选型 C）：本仓项目注册
+# `test_framework = make check-test`，闸门在**任务 worktree** 里跑这条——worktree
+# 没有 node_modules，前端步先做依赖兜底（口径照 deploy 脚本：缺失或锁文件更新才装）。
 check-test:
 	cargo test --workspace
+	if [ ! -d frontend/node_modules ] || [ frontend/package-lock.json -nt frontend/node_modules ]; then \
+		cd frontend && npm ci --no-audit --no-fund; \
+	fi
+	cd frontend && npm test
 
 check-frontend:
 	cd frontend && npm test

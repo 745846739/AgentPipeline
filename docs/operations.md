@@ -423,7 +423,7 @@ CREATE TABLE IF NOT EXISTS kanban_node_commands (
 | 阶段.节点 | 系统执行的命令 |
 |---|---|
 | init.execute | `git worktree add`、`git branch` |
-| develop.validate_output | `lint_command`（如已配置，决策 139）+ 按 `test_framework` 构建的单元测试命令（如 `cargo test` / `pytest` / `npm test`） |
+| develop.validate_output | `lint_command`（如已配置，决策 139）+ 按 `test_framework` 构建的单元测试命令（如 `cargo test` / `pytest` / `npm test`；本仓为原始命令 `make check-test`，含前端单测——决策 419） |
 | review.validate_output | 无（纯代码判断 approved） |
 | test.execute | 按 `test_framework` 构建的集成测试命令（由 agent 通过 `run_command` 触发，agent 驱动的命令） |
 | test.validate_output | 无（读 `test_result` 元数据判断） |

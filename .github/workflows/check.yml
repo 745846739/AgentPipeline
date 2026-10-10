@@ -81,7 +81,9 @@ jobs:
   # `pairing_lan_unpaired_can_still_fetch_install_assets` 的 404 支——闸门放行的证据
   # 在无产物时是「不是 403」，决策 345），故本 job 不需要前端产物。
   test:
-    name: test（cargo test --workspace）
+    # 票 gate-frontend-tests 01：check-test 扩面后本 job 也跑前端单测（与 frontend job
+    # 重复跑 vitest 是选型 C 已接受的代价），node 环境照 frontend job 的口径备好。
+    name: test（cargo test --workspace + 前端单测）
     runs-on: ubuntu-latest
     timeout-minutes: 45
     steps:
@@ -90,6 +92,14 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           cache-on-failure: true
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "24"
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+      - name: 装前端依赖
+        run: npm ci --no-audit --no-fund
+        working-directory: frontend
       - name: 工具链自证
         run: rustc -vV
       - run: make check-test

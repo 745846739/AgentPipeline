@@ -3814,6 +3814,316 @@ async fn develop_gate_kicks_back_dirty_worktree_then_recovers_after_commit() {
     assert_eq!(names, vec!["approve", "return"], "应走到 merge 待审批");
 }
 
+/// 票 gate-frontend-tests 01：闸门的**测试命令**失败 = develop.validate_output 红并
+/// 打回 execute。既有 develop 闸门用例全用 `setup("true")` 让测试命令静音——本票
+/// （`make check-test` 扩面）之后它第一次成为真牙，两条用例钉住「配置了但没生效」的反面：
+/// 本条钉**失败面**——打回、失败输出落 `gate-output-develop.log`（agent 改代码的唯一
+/// 证据 + 耗尽时 pending 载体的取数源）、成因文件带 `kind=test`；重试耗尽停在 pending。
+/// （日志按 stage 命名、重跑覆盖——所以「恢复→绿」那条不能在这里断言日志内容，
+/// 覆盖语义下恢复轮会把失败证据换成空文件，见下一条。）
+#[tokio::test]
+async fn a_failing_test_command_kicks_develop_validate_output_back_and_leaves_the_evidence() {
+    let ctx = setup("true", Settings::default()).await;
+    let home_root = ctx._home.home().root().to_path_buf();
+    let gate = home_root.join("test-gate.sh");
+    std::fs::write(
+        &gate,
+        "#!/bin/sh\necho \"FRONTEND_SUITE_FAIL: copy-discipline.test.ts › 缺覆盖\"\nexit 1\n",
+    )
+    .unwrap();
+    ctx.store
+        .update_project(
+            "p1",
+            None,
+            None,
+            Some(&format!("sh {}", gate.display())),
+            None,
+        )
+        .await
+        .unwrap();
+
+    let mut script = Script::new();
+    design_scripts(&mut script);
+    script
+        .for_node(Stage::Develop, Node::Execute)
+        .write_file(
+            "src/lib.rs",
+            "pub fn add(a: i32, b: i32) -> i32 { a + b }\n#[test]\nfn adds() { assert_eq!(add(1, 2), 3); }\n",
+        )
+        .write_file("tests/acceptance.rs", "#[test]\nfn ok() {}\n")
+        .run_command("git add -A && git -c user.name=f -c user.email=f@l commit -m 'feat: task t-gf'")
+        .submit(&CodeChanges {
+            branch_name: "kanban/t-gf".into(),
+            changed_files: vec![
+                FileChangeSpec {
+                    path: "src/lib.rs".into(),
+                    action: FileAction::Create,
+                    content_hash: None,
+                },
+                FileChangeSpec {
+                    path: "tests/acceptance.rs".into(),
+                    action: FileAction::Create,
+                    content_hash: None,
+                },
+            ],
+            unit_test_files: vec![],
+            no_changes: false,
+        })
+        .text("首轮收口");
+    // 之后每一轮都照交申报：闸门连败到 validate_attempts 上限，耗尽停在 validate 层的
+    // pending（成因载体来自闸门落盘的 facts，不是 execute 侧的「没等到 submit_metadata」）。
+    script
+        .for_node(Stage::Develop, Node::Execute)
+        .submit(&CodeChanges {
+            branch_name: "kanban/t-gf".into(),
+            changed_files: vec![
+                FileChangeSpec {
+                    path: "src/lib.rs".into(),
+                    action: FileAction::Create,
+                    content_hash: None,
+                },
+                FileChangeSpec {
+                    path: "tests/acceptance.rs".into(),
+                    action: FileAction::Create,
+                    content_hash: None,
+                },
+            ],
+            unit_test_files: vec![],
+            no_changes: false,
+        })
+        .text("重入收口一");
+    script
+        .for_node(Stage::Develop, Node::Execute)
+        .submit(&CodeChanges {
+            branch_name: "kanban/t-gf".into(),
+            changed_files: vec![
+                FileChangeSpec {
+                    path: "src/lib.rs".into(),
+                    action: FileAction::Create,
+                    content_hash: None,
+                },
+                FileChangeSpec {
+                    path: "tests/acceptance.rs".into(),
+                    action: FileAction::Create,
+                    content_hash: None,
+                },
+            ],
+            unit_test_files: vec![],
+            no_changes: false,
+        })
+        .text("重入收口二");
+    script
+        .for_node(Stage::Develop, Node::Execute)
+        .submit(&CodeChanges {
+            branch_name: "kanban/t-gf".into(),
+            changed_files: vec![
+                FileChangeSpec {
+                    path: "src/lib.rs".into(),
+                    action: FileAction::Create,
+                    content_hash: None,
+                },
+                FileChangeSpec {
+                    path: "tests/acceptance.rs".into(),
+                    action: FileAction::Create,
+                    content_hash: None,
+                },
+            ],
+            unit_test_files: vec![],
+            no_changes: false,
+        })
+        .text("重入收口三");
+    ctx.agent.set_script(script);
+    testkit::seed_task(&ctx.store, "t-gf", "p1").await.unwrap();
+    admit(&ctx, "t-gf").await;
+
+    ctx.executor.run("t-gf").await.unwrap();
+
+    // ① 测试命令失败打回 develop.execute：NodeRetry 流转存在，不得穿越 review / merge
+    let transitions = ctx.store.list_transitions("t-gf").await.unwrap();
+    assert!(
+        transitions.iter().any(|t| t.to_stage == Stage::Develop
+            && t.to_node == Node::Execute
+            && t.trigger == TransitionTrigger::NodeRetry),
+        "测试命令失败必须打回 develop.execute：{transitions:?}"
+    );
+    assert!(
+        !transitions
+            .iter()
+            .any(|t| t.to_stage == Stage::Review || t.to_stage == Stage::Merge),
+        "闸门一直失败不得穿越到 review / merge：{transitions:?}"
+    );
+
+    // ② 失败输出落在证据文件里；成因文件带 kind=test（决策 392 ④的 pending 载体取数源）
+    let log = std::fs::read_to_string(
+        ctx.store
+            .home()
+            .task_file("t-gf", "gate-output-develop.log"),
+    )
+    .expect("闸门输出日志应已落盘");
+    assert!(
+        log.contains("FRONTEND_SUITE_FAIL"),
+        "日志要含闸门命令的失败输出：{log}"
+    );
+    let facts = std::fs::read_to_string(
+        ctx.store
+            .home()
+            .task_file("t-gf", "gate-failure-develop.json"),
+    )
+    .expect("成因文件应已落盘");
+    assert!(facts.contains("\"test\""), "成因应为 test：{facts}");
+
+    // ③ 耗尽后停在 pending，载体带闸门失败成因（分类 test、累计次数、日志路径）
+    let task = ctx.store.get_task("t-gf").await.unwrap();
+    assert_eq!(task.status, TaskStatus::Pending);
+    let live = ctx.store.load_live_cursors("t-gf").await.unwrap();
+    assert_eq!(
+        live[0].pending_reason.as_ref().unwrap().kind,
+        PendingKind::RetryExhausted
+    );
+    let carrier = live[0]
+        .pending_reason
+        .as_ref()
+        .unwrap()
+        .context
+        .as_ref()
+        .and_then(|c| c.gate_failure.as_ref())
+        .expect("pending 载体应携带闸门失败成因");
+    assert_eq!(carrier.kind, "test", "分类应是测试用例失败：{carrier:?}");
+    assert!(carrier.failures >= 2, "累计次数应随打回递增：{carrier:?}");
+    assert!(
+        carrier.log_path.ends_with("gate-output-develop.log"),
+        "载体要指到闸门日志：{carrier:?}"
+    );
+}
+
+/// 同上一条的**恢复面**：闸门第 1 次失败打回、第 2 次通过 → 全链走到 merge 待审批。
+/// 恢复轮的放行即「改坏的前端用例修好 → 闸门绿」的流水线语义。
+#[tokio::test]
+async fn a_recovered_test_command_run_proceeds_past_develop_to_merge_approval() {
+    let ctx = setup("true", Settings::default()).await;
+    let home_root = ctx._home.home().root().to_path_buf();
+    let gate = home_root.join("test-gate.sh");
+    std::fs::write(
+        &gate,
+        format!(
+            "#!/bin/sh\n\
+             d=\"{}\"\n\
+             n=$(cat \"$d\" 2>/dev/null || echo 0)\n\
+             n=$((n+1))\n\
+             echo $n > \"$d\"\n\
+             if [ \"$n\" -eq 1 ]; then\n\
+               echo \"FRONTEND_SUITE_FAIL: copy-discipline.test.ts › 缺覆盖\"\n\
+               exit 1\n\
+             fi\n\
+             exit 0\n",
+            home_root.join("test-gate-count").display()
+        ),
+    )
+    .unwrap();
+    ctx.store
+        .update_project(
+            "p1",
+            None,
+            None,
+            Some(&format!("sh {}", gate.display())),
+            None,
+        )
+        .await
+        .unwrap();
+
+    let mut script = Script::new();
+    design_scripts(&mut script);
+    script
+        .for_node(Stage::Develop, Node::Execute)
+        .write_file(
+            "src/lib.rs",
+            "pub fn add(a: i32, b: i32) -> i32 { a + b }\n#[test]\nfn adds() { assert_eq!(add(1, 2), 3); }\n",
+        )
+        .write_file("tests/acceptance.rs", "#[test]\nfn ok() {}\n")
+        .run_command("git add -A && git -c user.name=f -c user.email=f@l commit -m 'feat: task t-gf2'")
+        .submit(&CodeChanges {
+            branch_name: "kanban/t-gf2".into(),
+            changed_files: vec![
+                FileChangeSpec {
+                    path: "src/lib.rs".into(),
+                    action: FileAction::Create,
+                    content_hash: None,
+                },
+                FileChangeSpec {
+                    path: "tests/acceptance.rs".into(),
+                    action: FileAction::Create,
+                    content_hash: None,
+                },
+            ],
+            unit_test_files: vec![],
+            no_changes: false,
+        })
+        .text("首轮收口");
+    script
+        .for_node(Stage::Develop, Node::Execute)
+        .submit(&CodeChanges {
+            branch_name: "kanban/t-gf2".into(),
+            changed_files: vec![
+                FileChangeSpec {
+                    path: "src/lib.rs".into(),
+                    action: FileAction::Create,
+                    content_hash: None,
+                },
+                FileChangeSpec {
+                    path: "tests/acceptance.rs".into(),
+                    action: FileAction::Create,
+                    content_hash: None,
+                },
+            ],
+            unit_test_files: vec![],
+            no_changes: false,
+        });
+    script
+        .for_node(Stage::Review, Node::Execute)
+        .submit(&ReviewResult {
+            approved: true,
+            review_report_path: Some("review-report.md".into()),
+            required_changes: vec![],
+            ..Default::default()
+        });
+    script
+        .for_node(Stage::Test, Node::Execute)
+        .submit(&TestResult {
+            passed: true,
+            test_report_path: Some("test-report.md".into()),
+            failures: vec![],
+            gate_recheck: false,
+        });
+    ctx.agent.set_script(script);
+    testkit::seed_task(&ctx.store, "t-gf2", "p1").await.unwrap();
+    admit(&ctx, "t-gf2").await;
+
+    ctx.executor.run("t-gf2").await.unwrap();
+
+    // 打回发生（第一轮确实红过），随后恢复放行：成因文件清除（过期证据不许误注入），
+    // 全链走到 merge 待审批。
+    let transitions = ctx.store.list_transitions("t-gf2").await.unwrap();
+    assert!(
+        transitions.iter().any(|t| t.to_stage == Stage::Develop
+            && t.to_node == Node::Execute
+            && t.trigger == TransitionTrigger::NodeRetry),
+        "第一轮闸门失败必须打回 develop.execute：{transitions:?}"
+    );
+    let facts = ctx
+        .store
+        .home()
+        .task_file("t-gf2", "gate-failure-develop.json");
+    assert!(
+        !facts.exists(),
+        "闸门放行后成因文件必须清除，否则下一轮 pending 会报过期成因"
+    );
+    let task = ctx.store.get_task("t-gf2").await.unwrap();
+    assert_eq!(task.status, TaskStatus::Pending);
+    let actions = ctx.store.allowed_actions_for_task("t-gf2").await.unwrap();
+    let names: Vec<&str> = actions.iter().map(|a| a.action.as_str()).collect();
+    assert_eq!(names, vec!["approve", "return"], "应走到 merge 待审批");
+}
+
 /// 决策 416 A（事故原形，test 阶段）：test.execute 把集成测试写进工作区却从不落提交、
 /// 还交了 passed=true → test.validate_output 打回 test.execute，**不穿越到 merge**
 /// （01M4CD59 正是在 merge 的 rebase 上撞死的），事实段落盘可直读。

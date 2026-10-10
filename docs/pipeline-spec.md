@@ -69,7 +69,7 @@
 |---|---|
 | **validate_input** | 跳过（sync-check 已确保输入充分） |
 | **execute** | develop agent 在 **worktree 内**读取 `dev-plan.md`，编写业务代码和单元测试。文件写入"先清后写"保证幂等 |
-| **validate_output** | **纯代码**（决策 62 / 139）：系统先执行 `lint_command`（如已配置，决策 139），再按 `test_framework` 执行单元测试命令（记录到 `kanban_node_commands`，超时用 `test_command_timeout_sec`）。**两者 exit code 均为 0 → next_stage**；任一非 0 → 重新进入 execute（prompt 追加失败输出，修复代码或用例）。validate_attempts +1，超过 → pending(retry_exhausted)，动作集含"带失败摘要回架构设计"（决策 138） |
+| **validate_output** | **纯代码**（决策 62 / 139）：系统先执行 `lint_command`（如已配置，决策 139），再按 `test_framework` 执行单元测试命令（记录到 `kanban_node_commands`，超时用 `test_command_timeout_sec`）。**两者 exit code 均为 0 → next_stage**；任一非 0 → 重新进入 execute（prompt 追加失败输出，修复代码或用例）。validate_attempts +1，超过 → pending(retry_exhausted)，动作集含"带失败摘要回架构设计"（决策 138）。带空格的 `test_framework` 值按**原始命令**执行（决策 419：本仓注册 `make check-test`，闸门因此同时跑 cargo 全量与前端单测） |
 | **next** | `[review]` |
 
 ### review

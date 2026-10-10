@@ -12,6 +12,7 @@ mod common;
 mod conflicts;
 mod crash_recovery;
 mod deps;
+mod gate_frontend_tests;
 mod gates;
 mod happy_path;
 mod join_and_skip;
