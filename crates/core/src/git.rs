@@ -132,6 +132,33 @@ fn open(path: &Path) -> Result<git2::Repository> {
     git2::Repository::open(path).map_err(gerr)
 }
 
+/// fetch `origin`（--prune）——全仓唯一的一份 fetch（决策 415 形状 1 的预构）。
+///
+/// 两处调用，**失败语义由调用方决定**，这正是这份实现必须只有一份、而失败处置
+/// 必须留在调用方的原因：
+/// - 建 worktree（[`Git::init_worktree_named`]）：失败**不阻断**（离线场景），照旧用
+///   本地引用当基准——旧基准只让修复的起点旧一点，改动本身照常成立；
+/// - 修复合入（[`crate::pipeline::repair::fetch_origin_tip`]）：失败**即拒执**——这条
+///   路上「基准有没有前进」的判定直接决定合入落在哪条线上，取不到就不敢断言
+///   （决策 415，2026-10-08 事故）。
+///
+/// 三种读数：`Ok(true)` 取到了；`Ok(false)` 这个仓没有 `origin` 远端（没有可取的）；
+/// `Err` 有远端但取不到——只有「远端不存在」是合法的 false，别的错误照实上传，
+/// 不许把一次真失败折叠成「没有 origin」。
+pub(crate) fn fetch_origin(repo: &git2::Repository) -> Result<bool> {
+    let mut remote = match repo.find_remote("origin") {
+        Ok(r) => r,
+        Err(e) if e.code() == git2::ErrorCode::NotFound => return Ok(false),
+        Err(e) => return Err(gerr(e)),
+    };
+    let mut opts = git2::FetchOptions::new();
+    opts.prune(git2::FetchPrune::On);
+    remote
+        .fetch::<&str>(&[], Some(&mut opts), None)
+        .map_err(gerr)?;
+    Ok(true)
+}
+
 /// 索引态那一字符（`git status --short` 的 X 位）；无索引态改动时是空格。
 /// 未跟踪文件两列都是 `?`（与 porcelain 一致）——git2 只置 `WT_NEW`，这里补上前一列。
 fn index_state(s: git2::Status) -> char {
@@ -722,14 +749,9 @@ impl Git {
                 Ok(_) => {}
             }
             let has_origin = repo.find_remote("origin").is_ok();
-            if has_origin {
-                // fetch 失败不阻断（离线场景），但基准优先用 origin
-                if let Ok(mut remote) = repo.find_remote("origin") {
-                    let mut opts = git2::FetchOptions::new();
-                    opts.prune(git2::FetchPrune::On);
-                    let _ = remote.fetch::<&str>(&[], Some(&mut opts), None);
-                }
-            }
+            // fetch 失败不阻断（离线场景），但基准优先用 origin；fetch 本体是全仓
+            // 唯一一份（决策 415），失败怎么处置由这里（忽略）与修复合入（拒执）各自决定。
+            let _ = fetch_origin(&repo);
             let base = if has_origin {
                 format!("origin/{default_branch}")
             } else {

@@ -67,6 +67,71 @@ async fn init_prefers_origin_default_branch_when_remote_exists() {
     assert_eq!(head, repo.head("origin/main"));
 }
 
+/// fetch 失败**不阻断**建 worktree（与修复合入那条路的「取不到就拒执」相反，决策 415）：
+/// origin 指向不存在的路径时，仍以本地已有的 `origin/main` 引用为基准把 worktree 建出来。
+///
+/// 这条语义与修复侧的拒执语义共用同一份 fetch 实现（`git.rs::fetch_origin`），
+/// 失败怎么处置由调用方各自决定——这条钉住的是「不阻断」那一侧。
+#[tokio::test]
+async fn init_survives_an_unreachable_origin_and_still_bases_on_the_local_ref() {
+    let (repo, _remote) = Repo::with_remote().unwrap();
+    let stale = repo.head("origin/main");
+    repo.git(&[
+        "remote",
+        "set-url",
+        "origin",
+        "/nonexistent/agentpipeline-gone",
+    ]);
+    let home = TestHome::new().unwrap();
+    let worktree = home.home().worktree_path("t1");
+
+    let base = Git
+        .init_worktree(repo.path(), "t1", &worktree, "main")
+        .await
+        .unwrap();
+    assert_eq!(
+        base, "origin/main",
+        "有 remote（哪怕取不到）仍以 origin/{{default_branch}} 为基准"
+    );
+    assert_eq!(
+        Git.rev_parse(&worktree, "HEAD").await.unwrap(),
+        stale,
+        "fetch 失败不该阻断：worktree 落在本地已有的 origin/main 引用上"
+    );
+}
+
+/// fetch 成功时 init **真的刷新基准**（共享 fetch 成功侧的钉，决策 415 形状 1）：
+/// 远端 `main` 前进、本地 `origin/main` 引用被拨回陈旧之后，init 必须把引用刷到
+/// 新尖端再建 worktree——删掉 `init_worktree_named` 里的 fetch，本条即红。
+#[tokio::test]
+async fn init_refreshes_the_base_from_the_moved_origin() {
+    let (repo, _remote) = Repo::with_remote().unwrap();
+    let stale = repo.head("origin/main");
+    repo.write("src/lib.rs", "pub fn add(a: i32) -> i32 { a * 2 }\n");
+    repo.commit_all("feat: 远端 main 前进一条");
+    repo.git(&["push", "origin", "main"]);
+    // 拨回本地引用，复刻「远端动了、本地没人刷新」——正是 init 那次 fetch 要治的读数。
+    repo.git(&["update-ref", "refs/remotes/origin/main", &stale]);
+    let home = TestHome::new().unwrap();
+    let worktree = home.home().worktree_path("t1");
+
+    let base = Git
+        .init_worktree(repo.path(), "t1", &worktree, "main")
+        .await
+        .unwrap();
+    assert_eq!(base, "origin/main");
+    assert_ne!(
+        repo.head("origin/main"),
+        stale,
+        "fetch 应把本地 origin/main 引用刷到远端新尖端"
+    );
+    assert_eq!(
+        Git.rev_parse(&worktree, "HEAD").await.unwrap(),
+        repo.head("origin/main"),
+        "worktree 落在刷新后的基准上"
+    );
+}
+
 #[tokio::test]
 async fn init_rejects_unborn_head_with_explicit_error() {
     let home = TestHome::new().unwrap();

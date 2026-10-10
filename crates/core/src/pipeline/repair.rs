@@ -685,26 +685,18 @@ pub fn gate_failure_note(readings: &[GateReading]) -> String {
 /// 三种读数：`Ok(Some(tip))` 取到了；`Ok(None)` 这个仓没有 `origin` 远端（基准本来就
 /// 是本地分支，谈不上陈旧）；`Err` 有远端但取不到——调用方必须拒执。
 ///
-/// 住在修复域而不是 `git.rs`：主树的 `git.rs` 正被另一批在飞的改动占着，两批未提交
-/// 改动同文件必然互相覆盖；等那边落地后再收敛成一份（票面形状 1 的预构步因此未做，
-/// 落地记录里如实记）。
+/// fetch 本体是全仓唯一一份 `crate::git::fetch_origin`（决策 415 形状 1 的预构，
+/// 413/416 落地后收敛；链接用普通代码体——目标是 `pub(crate)`，从公开 doc 链过去
+/// 会招 rustdoc 私有项警告）；这个外壳只负责把「取到了 / 没有远端 / 取不到」变成修复域
+/// 的三态读数——失败怎么处置由调用方各自决定，本路径拒执。
 pub async fn fetch_origin_tip(repo_path: &Path, default_branch: &str) -> Result<Option<String>> {
     let repo_path = repo_path.to_path_buf();
     let default_branch = default_branch.to_string();
     crate::git::blocking(move || {
         let repo = git2::Repository::open(&repo_path).map_err(crate::git::gerr)?;
-        let mut remote = match repo.find_remote("origin") {
-            Ok(r) => r,
-            // 只有「远端不存在」才是合法的 None（纯本地仓）；别的错误照实上传，
-            // 不许把一次真失败折叠成「没有 origin」——调用方据此拒执。
-            Err(e) if e.code() == git2::ErrorCode::NotFound => return Ok(None),
-            Err(e) => return Err(crate::git::gerr(e)),
-        };
-        let mut opts = git2::FetchOptions::new();
-        opts.prune(git2::FetchPrune::On);
-        remote
-            .fetch::<&str>(&[], Some(&mut opts), None)
-            .map_err(crate::git::gerr)?;
+        if !crate::git::fetch_origin(&repo)? {
+            return Ok(None);
+        }
         let tip = repo
             .revparse_single(&format!("origin/{default_branch}"))
             .and_then(|o| o.peel_to_commit())
