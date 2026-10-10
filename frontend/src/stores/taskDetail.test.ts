@@ -6,6 +6,7 @@
  * 留着就等于把六颗拍板按钮挂到一个坏 id 上。
  */
 
+import { types as nodeUtilTypes } from 'node:util';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import type { ConversationSummary, NodeCommand, NodeConversation, Task } from '../api/types';
 import { emptyTaskDetailState } from '../realtime/reduce';
@@ -30,6 +31,8 @@ const mocks = vi.hoisted(() => {
     splitTask: vi.fn(),
     modelOverrideTask: vi.fn(),
     sync: vi.fn(),
+    /** 每条喂进归约器的第一参（能耗修复钉的就是它是不是裸对象）。 */
+    reduceArgs: [] as unknown[],
   };
 });
 
@@ -55,6 +58,20 @@ vi.mock('../realtime/connection', () => ({
     dispose = vi.fn();
   },
 }));
+
+// 归约器本体不动，只把它的第一参记下来——能耗修复要钉的正是「喂进去的是不是裸对象」。
+vi.mock('../realtime/reduce', async (importOriginal) => {
+  const mod = await importOriginal<typeof import('../realtime/reduce')>();
+  type ReduceState = Parameters<typeof mod.reduceTaskDetail>[0];
+  type ReduceEvent = Parameters<typeof mod.reduceTaskDetail>[1];
+  return {
+    ...mod,
+    reduceTaskDetail: (state: ReduceState, event: ReduceEvent) => {
+      mocks.reduceArgs.push(state);
+      return mod.reduceTaskDetail(state, event);
+    },
+  };
+});
 
 function task(id: string, title: string): Task {  return {
     id,
@@ -129,6 +146,7 @@ beforeEach(() => {
 
 afterEach(() => {
   vi.clearAllMocks();
+  mocks.reduceArgs.length = 0;
 });
 
 describe('详情页装载失败不留上一个任务（票 01 / R2-01）', () => {
@@ -630,5 +648,93 @@ describe('落地即清（决策 362②）：正文到手后收走该 run 的直�
 
     expect(taskDetail.state.liveDeltas.map((d) => d.run_id)).toEqual([1, 2, 2]);
     expect(taskDetail.state.liveDroppedRuns).toEqual({ 1: true });
+  });
+});
+
+/**
+ * 归约喂裸对象（能耗修复）。
+ *
+ * 钉的是**接线**而不是毫秒数：`$state` 会深度代理整个 state，于是 `liveDeltas` / `liveTools`
+ * 变成 Proxy 数组，而两条热路径都要逐条读它们——① 归约器每个 SSE 事件
+ * `[...state.liveDeltas, delta]`；② `$derived(buildTaskScene(taskDetail.state))`（`SceneTimeline`）
+ * 每个到达的 delta 都从零重跑一遍全量 `map + sort`。穿代理的逐下标读在 1 万条增量上比裸读慢
+ * 两个数量级（139 倍），长 run 因此把主线程推过 Safari 的能耗阈值（真机实测 CPU 0.13 → 0.63+，
+ * 栈顶是 JSC 的 `operationSpreadGeneric` / `ProxyObject`）。修复是 `state` 用 `$state.raw`
+ * ——只整份换新时通知、不代理内部结构，读写两侧都拿到裸对象。
+ *
+ * 为什么不设性能闸：毫秒在 CI 上必然抖动，做成断言就是引进一条必然 flaky 的门
+ * （同 `taskScene.bench.ts` 的口径——只记录、不设闸）。所以这里锁两件**确定性**的事：
+ * ① 归约器收到的 state **不是代理**（谁把 `$state.raw` 改回 `$state`，`isProxy` 当场变红）；
+ * ② 各条写路径（连灌增量 / 换任务重置 / 落地即清 / 静默 refetch 搬运）之后，state 与它的
+ *    增量数组仍是裸对象——refetch 的 `{ ...state }` 搬运若重新引入代理，这条也会红。
+ */
+describe('归约喂裸对象（能耗修复）', () => {
+  const deltaEvent = (text: string) => ({
+    type: 'conversation_delta' as const,
+    task_id: 'A',
+    branch: 'main',
+    run_id: 77,
+    agent_type: 'main' as const,
+    role: 'assistant' as const,
+    text,
+    prompt_tokens: 1,
+    completion_tokens: 1,
+  });
+
+  it('归约器收到的 state 不是代理（$state.raw）', () => {
+    taskDetail.handleEvent(deltaEvent('第一条'));
+
+    const received = mocks.reduceArgs.at(-1);
+    expect(received).toBeDefined();
+    expect(nodeUtilTypes.isProxy(received)).toBe(false);
+    expect(nodeUtilTypes.isProxy(taskDetail.state)).toBe(false);
+    expect(taskDetail.state.liveDeltas.map((d) => d.text)).toEqual(['第一条']);
+  });
+
+  it('连灌增量：state 与其增量数组始终不是代理（不丢不重）', () => {
+    for (let i = 0; i < 50; i += 1) {
+      taskDetail.handleEvent(deltaEvent(`第 ${i} 条`));
+      expect(nodeUtilTypes.isProxy(taskDetail.state)).toBe(false);
+      expect(nodeUtilTypes.isProxy(taskDetail.state.liveDeltas)).toBe(false);
+    }
+
+    expect(taskDetail.state.liveDeltas).toHaveLength(50);
+    expect(taskDetail.state.liveSeq).toBe(50);
+    expect(taskDetail.state.liveDeltas.map((d) => d.text)).toEqual(
+      Array.from({ length: 50 }, (_, i) => `第 ${i} 条`),
+    );
+  });
+
+  it('换任务重置后 state 归零，增量数组仍是裸的', () => {
+    taskDetail.handleEvent(deltaEvent('残留'));
+
+    taskDetail['resetTaskContent']();
+
+    expect(taskDetail.state.liveDeltas).toEqual([]);
+    expect(nodeUtilTypes.isProxy(taskDetail.state.liveDeltas)).toBe(false);
+  });
+
+  it('静默 refetch 搬运之后，state 的增量数组仍是非代理', async () => {
+    taskDetail.handleEvent(deltaEvent('refetch 前'));
+    mocks.getTask.mockResolvedValue({
+      task: task('A', 'refetch'),
+      cursors: [],
+      allowed_actions: [],
+    });
+
+    await taskDetail.load('A', true);
+
+    // 增量被 refetch 保留（load 的语义），数组仍是裸的——`{ ...this.state }` 拿到的本就非代理。
+    expect(taskDetail.state.liveDeltas).toHaveLength(1);
+    expect(nodeUtilTypes.isProxy(taskDetail.state.liveDeltas)).toBe(false);
+  });
+
+  it('落地即清之后 state 与其增量数组仍是非代理', () => {
+    taskDetail.handleEvent(deltaEvent('直播中的增量'));
+
+    taskDetail['clearLandedLive']();
+
+    expect(nodeUtilTypes.isProxy(taskDetail.state)).toBe(false);
+    expect(nodeUtilTypes.isProxy(taskDetail.state.liveDeltas)).toBe(false);
   });
 });

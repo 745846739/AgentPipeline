@@ -45,7 +45,28 @@ export interface LoadedFile {
 
 class TaskDetailStore {
   id = $state<string | null>(null);
-  state = $state<TaskDetailState>(emptyTaskDetailState());
+
+  /**
+   * 详情状态本体。**`$state.raw` 而不是 `$state`**——本页要的响应性只有「整份换新」这一种。
+   *
+   * `$state` 会**深度代理**整个对象：`liveDeltas` / `liveTools` 变成 Proxy 数组，而两条热路径
+   * 都要逐条读它们——① 归约器每个 SSE 事件 `[...state.liveDeltas, delta]`；②
+   * `$derived(buildTaskScene(taskDetail.state))`（`SceneTimeline`）每个到达的 delta 都从零重跑
+   * 一遍全量 `map + sort`。穿代理的逐下标读实测（Chromium，1 万条增量）同一次「展开 + 截断」
+   * 在代理数组上 3.65 ms、裸数组上 0.026 ms，**慢 139 倍**，且随累积条数近似线性上升——一条
+   * 长 run 把主线程推到 Safari 的能耗阈值（真机复现：CPU 从 0.13 单调爬到 0.63+，栈顶是 JSC 的
+   * `operationSpreadGeneric` / `ProxyObject::getOwnPropertySlotByIndex`）。
+   *
+   * `$state.raw` 只在**重新赋值**时通知、不代理内部结构，而本 store 的每条写路径都是整份换新
+   * （`handleEvent` 用归约器的返回、`load` / `resetTaskContent` 整份替换），**没有任何一处就地
+   * 改嵌套字段**——故「只在赋值时通知」与本页语义恰好等价，而读写两侧都拿到裸对象。也不再需要
+   * 「展开时用镜像还是用 state」这类纪律：`{ ...this.state, … }` 拿到的本就是裸对象。
+   *
+   * `frontend/src/stores/taskDetail.test.ts` 的「归约喂裸对象（能耗修复）」用 `node:util` 的
+   * `isProxy` 钉住这条——改回 `$state` 时归约器与 `buildTaskScene` 都会重新吃代理，当场变红。
+   */
+  state = $state.raw<TaskDetailState>(emptyTaskDetailState());
+
   loading = $state(false);
   error = $state<string | null>(null);
   /** 失败的状态码（非 `ApiError` 记 0）：界面据此分开「这个 id 没有」与「没读到」（票 01）。 */
