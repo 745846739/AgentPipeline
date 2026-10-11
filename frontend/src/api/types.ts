@@ -1077,6 +1077,11 @@ export interface ForemanSessionMeta {
    * `watch`（值守台账——只读的一本账，票 04）。存量旧行由迁移 0030 落成 talk。
    */
   kind: string;
+  /**
+   * 执行引擎（决策 424④，票 talk-cli-engine 04）：`api` / `cli`。建会话时选定、
+   * 会话内锁定——没有改它的写路径。
+   */
+  engine: string;
   created_at: string;
   last_active_at: string;
   archived_at: string | null;
@@ -1340,6 +1345,13 @@ export interface NotifySettings {
 }
 
 /** 值守轮设置页的读数（决策 287 / 票 02）：开关 + provenance + 只读的节奏五个数。 */
+/** 对讲台默认引擎的读数（决策 424④，票 talk-cli-engine 04）。 */
+export interface ForemanEngineSettings {
+  engine: string;
+  /** `default` = 从没碰过设置；`settings` = 界面保存过（决策 257 口径）。 */
+  origin: string;
+}
+
 export interface ForemanWatchSettings {
   /** 全局开关：关掉 = 值守轮不再自己醒（跑都不跑）；在飞的那一轮不受影响。 */
   enabled: boolean;

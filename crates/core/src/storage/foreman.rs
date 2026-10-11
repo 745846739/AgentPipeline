@@ -918,6 +918,41 @@ impl Store {
     }
 
     /// 界面保存过值守开关吗（provenance 读数）：行存在 = 界面定的。
+    /// 对讲台的**默认引擎**（决策 424④，迁移 0047）：`+ 新班次` 不带参数时的缺省值。
+    /// 没有行 = 从没碰过设置 = `api`（与 foreman_watch 同一条「缺省即现状」口径）。
+    pub async fn foreman_default_engine(&self) -> Result<String> {
+        let engine: Option<String> =
+            sqlx::query_scalar("SELECT default_engine FROM kanban_foreman_settings WHERE id = 1")
+                .fetch_optional(self.pool())
+                .await?;
+        Ok(engine.unwrap_or_else(|| FOREMAN_ENGINE_API.to_string()))
+    }
+
+    /// 保存默认引擎。非法值由迁移 0047 的 CHECK 在写入点挡住；路由层先给可读错误。
+    pub async fn set_foreman_default_engine(&self, engine: &str) -> Result<()> {
+        let now = self.now();
+        sqlx::query(
+            "INSERT INTO kanban_foreman_settings (id, default_engine, updated_at)
+             VALUES (1, ?, ?)
+             ON CONFLICT(id) DO UPDATE SET
+                 default_engine = excluded.default_engine, updated_at = excluded.updated_at",
+        )
+        .bind(engine)
+        .bind(ts(now))
+        .execute(self.pool())
+        .await?;
+        Ok(())
+    }
+
+    /// 默认引擎这一格**保存过没有**（读数 provenance，决策 257 口径）。
+    pub async fn foreman_default_engine_has_override(&self) -> Result<bool> {
+        let row: Option<i64> =
+            sqlx::query_scalar("SELECT 1 FROM kanban_foreman_settings WHERE id = 1")
+                .fetch_optional(self.pool())
+                .await?;
+        Ok(row.is_some())
+    }
+
     pub async fn foreman_watch_has_override(&self) -> Result<bool> {
         let exists: Option<i64> =
             sqlx::query_scalar("SELECT 1 FROM kanban_foreman_watch WHERE id = 1")

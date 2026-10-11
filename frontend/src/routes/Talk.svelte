@@ -596,12 +596,15 @@
    * 建班 / 归档之后「落点在哪、台账怎么落」都是账的事。页面只递 `onReset`（清输入框草稿）
    * 与 `onArchived`（关对话框）两个回调，时点与改前逐拍一致。 */
 
-  /** 从界面按下「+ 新班次」（⋯ 菜单的第一项）。用户按的 = 一次换班，故 push 进地址。 */
-  async function newSession() {
+  /**
+   * 从界面按下「+ 新班次」。引擎**建会话时选定**（决策 424④）：不传 = 后端默认引擎
+   * （设置页可改）；`'cli'` = claude code。用户按的 = 一次换班，故 push 进地址。
+   */
+  async function newSession(engine?: string) {
     if (sending || busy) return;
     busy = true;
     try {
-      await talk.openFreshSession({ push: true, onReset: () => (input = '') });
+      await talk.openFreshSession({ push: true, onReset: () => (input = ''), engine });
     } catch (err) {
       talk.loadError = (err as Error).message;
       talk.loadErrorPairing = isPairingRequired(err);
@@ -1402,10 +1405,19 @@
             type="button"
             class="runchip plus"
             disabled={sending || busy}
-            title="开一个新班次"
+            title="开一个新班次（默认引擎，设置页可改）"
             onclick={() => void newSession()}
           >
             + 新班次
+          </button>
+          <button
+            type="button"
+            class="runchip plus"
+            disabled={sending || busy}
+            title="开一个 claude code 引擎的班次（引擎建班时选定，班内锁定）"
+            onclick={() => void newSession('cli')}
+          >
+            + 班次·claude
           </button>
           {#if currentId}
             <button
@@ -1458,7 +1470,18 @@
             onclick={() => {
               menuTrap.close(false);
               void newSession();
-            }}>+ 新班次</button
+            }}>+ 新班次（默认引擎）</button
+          >
+          <button
+            type="button"
+            class="mi plus"
+            data-menu-item
+            disabled={sending || busy}
+            title="引擎建班时选定，班内锁定（决策：CLI 引擎）"
+            onclick={() => {
+              menuTrap.close(false);
+              void newSession('cli');
+            }}>+ 新班次（claude code）</button
           >
           {#if session?.session || otherSessions.length > 0}
             <div class="mi-sep"></div>

@@ -167,6 +167,12 @@ pub fn build_router(state: AppState) -> Router {
             "/foreman-watch",
             get(routes::foreman_watch::settings).put(routes::foreman_watch::set_enabled),
         )
+        // ── 对讲台默认引擎（决策 424④，票 talk-cli-engine 04）──
+        // 机器级一行设置，路径不落 /foreman/* 的理由同 foreman-watch（未接线也要能读写）。
+        .route(
+            "/foreman-engine",
+            get(routes::foreman_engine::settings).put(routes::foreman_engine::set_engine),
+        )
         // ── 命令执行走 rtk 的开关（决策 297 / 票 03、05）──
         // 与 `/foreman-watch` 同族的机器级事实（**不是** `/foreman/*`：那族未接线时 503，
         // 而设置页要能读到「现在是缺省关」）。GET 带一次**活体探测**；PUT 探测失败也 200。

@@ -17,6 +17,9 @@ import SettingsForeman from './SettingsForeman.svelte';
 const mocks = vi.hoisted(() => ({
   getForemanWatch: vi.fn(),
   setForemanWatch: vi.fn(),
+  // 默认引擎（决策 424④）：本页新增的一格——测试不点它，但组件装载要读数。
+  getForemanEngine: vi.fn(),
+  setForemanEngine: vi.fn(),
 }));
 
 vi.mock('../api/client', () => mocks);
@@ -40,6 +43,8 @@ function readout(over: Partial<ForemanWatchSettings> = {}): ForemanWatchSettings
 beforeEach(() => {
   mocks.getForemanWatch.mockResolvedValue(readout());
   mocks.setForemanWatch.mockResolvedValue({ enabled: false, origin: 'settings' });
+  mocks.getForemanEngine.mockResolvedValue({ engine: 'api', origin: 'default' });
+  mocks.setForemanEngine.mockResolvedValue({ engine: 'cli', origin: 'settings' });
 });
 
 afterEach(() => {

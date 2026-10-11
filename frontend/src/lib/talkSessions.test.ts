@@ -32,6 +32,7 @@ function meta(id: string, lastActiveAt: string, title = id): ForemanSessionMeta 
     last_active_at: lastActiveAt,
     kind: 'talk',
     archived_at: null,
+    engine: 'api',
   };
 }
 

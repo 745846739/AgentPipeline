@@ -19,6 +19,7 @@ function meta(id: string, over: Partial<ForemanSessionMeta> = {}): ForemanSessio
     created_at: '2026-09-25T09:00:00Z',
     last_active_at: '2026-09-25T10:00:00Z',
     archived_at: null,
+    engine: 'api',
     ...over,
   };
 }

@@ -271,6 +271,10 @@ pub async fn create_session(
 #[derive(Debug, Deserialize)]
 pub struct RenameSessionBody {
     pub title: String,
+    /// 显式拒（决策 424④）：引擎建会话时选定、会话内锁定。serde 默认会静默忽略
+    /// 未知字段——那不是「锁定」，是「假装没看见」。给它一个确定读数。
+    #[serde(default)]
+    pub engine: Option<String>,
 }
 
 /// `PATCH /foreman/sessions/{id}`：改名。
@@ -281,6 +285,11 @@ pub async fn rename_session(
 ) -> ApiResult<impl IntoResponse> {
     if state.foreman.is_none() {
         return Err(foreman_unwired());
+    }
+    if body.engine.is_some() {
+        return Err(ApiError::bad_request(
+            "引擎在建会话时选定、会话内锁定——要换引擎请开新班次",
+        ));
     }
     let title = body.title.trim();
     if title.is_empty() {

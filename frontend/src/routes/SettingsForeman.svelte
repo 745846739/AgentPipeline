@@ -1,7 +1,7 @@
 <script lang="ts">
   import { onMount } from 'svelte';
-  import { getForemanWatch, setForemanWatch } from '../api/client';
-  import type { ForemanWatchSettings } from '../api/types';
+  import { getForemanEngine, getForemanWatch, setForemanEngine, setForemanWatch } from '../api/client';
+  import type { ForemanEngineSettings, ForemanWatchSettings } from '../api/types';
 
   /**
    * 值守轮设置页（`#/settings/foreman`，决策 287 / 票 02）。
@@ -40,7 +40,39 @@
 
   onMount(() => {
     void load();
+    void loadEngine().catch((err: unknown) => {
+      // 引擎读数失败不挡值守页：下一次进来再取（与 load 同一姿态）。
+      error = error ?? (err as Error).message;
+    });
   });
+
+  /** 默认引擎（决策 424④）：只影响**新**班次；既有班次班内锁定，不随它变。 */
+  let engine = $state<ForemanEngineSettings | null>(null);
+  let engineBusy = $state(false);
+
+  async function pickEngine(next: string) {
+    if (engine?.engine === next) return;
+    engineBusy = true;
+    try {
+      engine = await setForemanEngine(next);
+      note = {
+        kind: 'ok',
+        message:
+          next === 'cli'
+            ? '新班次默认用 claude code 引擎（本机登录态，只读权限面）；既有班次不变。'
+            : '新班次默认用 API 引擎；既有班次不变。',
+      };
+    } catch (err) {
+      note = { kind: 'bad', message: (err as Error).message };
+      await loadEngine();
+    } finally {
+      engineBusy = false;
+    }
+  }
+
+  async function loadEngine() {
+    engine = await getForemanEngine();
+  }
 
   async function toggle(enabled: boolean) {
     toggling = true;
@@ -125,6 +157,41 @@
         关掉的是「跑」：值守轮不再自己醒（有待办也不醒、不花钱），在飞的那一轮不受影响；
         打开后下一趟（不超过 10 秒）恢复，<b>不必重启</b>。想让它「跑着但别吵」去
         <a href="#/settings/notify">离线通知</a>——那是另一颗钮。
+      </p>
+    </section>
+
+    <section class="block" aria-labelledby="eng-head">
+      <h2 class="sec-title" id="eng-head">对讲台引擎</h2>
+      <div class="row">
+        <span class="sec-note inline">
+          新班次的默认引擎（{engine?.origin === 'settings' ? '界面保存的' : '缺省 API'}）。
+          引擎在<b>建班时选定、班内锁定</b>——这里只定「+ 新班次」开什么；要换既有班的引擎，开新班。
+        </span>
+      </div>
+      <div class="row">
+        <button
+          type="button"
+          class="btn"
+          class:active={engine?.engine === 'api'}
+          disabled={engineBusy}
+          onclick={() => void pickEngine('api')}
+        >
+          API 引擎
+        </button>
+        <button
+          type="button"
+          class="btn"
+          class:active={engine?.engine === 'cli'}
+          disabled={engineBusy}
+          title="本机 claude code：整段执行、只读权限面、班内 --resume 续接"
+          onclick={() => void pickEngine('cli')}
+        >
+          claude code（本机 CLI）
+        </button>
+      </div>
+      <p class="sec-note">
+        claude code 用本机已登录的 CLI（不用配密钥）；它只有只读权限面，改状态要走提议。
+        「测试连接」在 <a href="#/settings/providers">Provider 设置</a>里对 cli 类型做版本探测。
       </p>
     </section>
 

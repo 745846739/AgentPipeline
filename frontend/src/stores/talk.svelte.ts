@@ -925,9 +925,9 @@ class TalkStore {
    * 页面停在一片空白上（「一个班次都没有」且没有当前班次）。
    */
   async openFreshSession(
-    opts: { push?: boolean; onReset?: () => void } = {},
+    opts: { push?: boolean; onReset?: () => void; engine?: string } = {},
   ): Promise<void> {
-    const created = await createForemanSession();
+    const created = await createForemanSession(undefined, opts.engine);
     this.sessionList = [created.session, ...this.sessionList];
     this.resetLedger();
     opts.onReset?.();

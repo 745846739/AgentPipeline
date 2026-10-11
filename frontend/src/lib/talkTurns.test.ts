@@ -67,6 +67,7 @@ function sessionOf(messages: ForemanMessage[], proposals: ForemanProposal[] = []
       last_active_at: '2026-09-23T10:00:00Z',
       kind: 'talk',
       archived_at: null,
+      engine: 'api',
     },
     messages,
     proposals,

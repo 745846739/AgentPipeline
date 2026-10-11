@@ -6555,6 +6555,48 @@ async fn the_session_payload_says_whether_a_turn_is_running() {
 ///
 /// 一起测是刻意的——它们是同一条链（新建出来 → 列表里看到 → 改名 → 归档后从列表消失），
 /// 拆成四条会漏掉「新建的那条 id 在后三个操作里还认不认」。
+/// 默认引擎设置（决策 424④，票 talk-cli-engine 04）：缺省 api / provenance /
+/// 保存即读 / 非法值 400；改名端点对 engine 字段显式拒（锁定给确定读数，不静默忽略）。
+#[tokio::test]
+async fn foreman_default_engine_settings_and_lock_readout() {
+    let api = api_with_foreman(FakeAgent::new(Script::new())).await;
+
+    // 缺省 api + origin=default（从没碰过设置）。
+    let (status, body) = get(&api, "/foreman-engine").await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["engine"], "api");
+    assert_eq!(body["origin"], "default");
+
+    // 保存 cli → 重读换新、origin=settings。
+    let (status, body) = put(&api, "/foreman-engine", json!({"engine": "cli"})).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let (status, body) = get(&api, "/foreman-engine").await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["engine"], "cli");
+    assert_eq!(body["origin"], "settings");
+
+    // 非法值 400。
+    let (status, body) = put(&api, "/foreman-engine", json!({"engine": "codex"})).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+
+    // 锁定的确定读数：改名请求里夹带 engine → 400，不是静默忽略。
+    let (status, body) = post(&api, "/foreman/sessions", json!({"engine": "cli"})).await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+    let id = body["session"]["id"].as_str().unwrap().to_string();
+    let (status, body) = call(
+        &api,
+        request("PATCH", &format!("/foreman/sessions/{id}"))
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from(
+                json!({"title": "新名", "engine": "api"}).to_string(),
+            ))
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    assert!(body["error"].as_str().unwrap().contains("锁定"));
+}
+
 /// CLI 引擎会话（决策 424④，票 talk-cli-engine 02/04 的 API 面）：engine 建、
 /// engine 回显、非法值 400；没有改 engine 的写路径（锁定是形状）。
 #[tokio::test]

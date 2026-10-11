@@ -22,6 +22,7 @@ import type {
   NotifyPolitenessPayload,
   PushSubscriptionList,
   PushSubscriptionPayload,
+  ForemanEngineSettings,
   ForemanWatchSettings,
   OffloadSettings,
   OffloadWhitelist,
@@ -917,10 +918,25 @@ export function getForemanAttention(signal?: AbortSignal): Promise<ForemanAttent
 }
 
 /** 新开一个班次。标题留空 = 中性标题，第一句话说出来时按它命名（决策 204②）。 */
-export function createForemanSession(title?: string): Promise<{ session: ForemanSessionMeta }> {
+export function createForemanSession(
+  title?: string,
+  engine?: string,
+): Promise<{ session: ForemanSessionMeta }> {
   return request<{ session: ForemanSessionMeta }>('/foreman/sessions', {
     method: 'POST',
-    body: { title: title ?? null },
+    body: { title: title ?? null, engine: engine ?? null },
+  });
+}
+
+/** 对讲台默认引擎（决策 424④）：读数与保存。只影响**新**班次。 */
+export function getForemanEngine(): Promise<ForemanEngineSettings> {
+  return request<ForemanEngineSettings>('/foreman-engine');
+}
+
+export function setForemanEngine(engine: string): Promise<ForemanEngineSettings> {
+  return request<ForemanEngineSettings>('/foreman-engine', {
+    method: 'PUT',
+    body: { engine },
   });
 }
 

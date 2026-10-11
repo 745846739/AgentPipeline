@@ -93,6 +93,7 @@ function payload(over: Partial<ForemanSession> = {}): ForemanSession {
       last_active_at: '2026-09-25T00:10:00Z',
       kind: 'talk',
       archived_at: null,
+      engine: 'api',
     },
     messages: [],
     proposals: [],
@@ -456,6 +457,7 @@ function meta(id: string, over: Partial<ForemanSessionMeta> = {}): ForemanSessio
     created_at: '2026-09-25T00:00:00Z',
     last_active_at: '2026-09-25T00:10:00Z',
     archived_at: null,
+    engine: 'api',
     ...over,
   };
 }
