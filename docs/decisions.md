@@ -3468,3 +3468,23 @@ config.rs}`、`tests/e2e/tests/integration/stage_boundary.rs`、`docs/testing.md
 **验证**：迁移层 `foreman_started_at_migration.rs`（只迁到 0047 造老形态行、`Store::open` 后逐毫秒断言 started_at = 旧 created_at 且 created_at 一字未动、班次读数原样）；存储层 `close_refreshes_created_at_but_never_touches_started_at`（在途两刻同瞬 → 收口只刷 created_at + `last_active_at` 同刻）与 `a_system_row_logged_mid_round_has_an_earlier_created_at_than_the_reply`（时间序归位）；全轮 `a_say_round_stamps_the_start_and_finish_times_apart`（stub 从 `complete` 里推钟 30s，开工与收口之间有了真时间差）；L3 `message_wire_carries_both_the_start_and_finish_times`（两刻都上线、谁也不吞谁）。core 1424 全绿、app 契约绿、clippy / svelte-check 零告警。手工面（106 上重读事故账 394 / 407 两行：started_at 应为 00:48 / 02:12、created_at 保持旧值）留在票面 Comments，随下次部署兑现。
 
 **来源**：票 `foreman-work-record/03` 原文（实证出自 2026-10-08 班次 `01M4CDY9EC9M9FSSE236GJXYZC`）；关联决策 422④（(b) 版裁决）、415（读不到不编数）、211④ / 223（在途半截行的行数语义——本条只动时刻、不动行数语义）、252③（API 加性字段先接线）。
+
+### 决策 429 · stdio MCP 提议代理落地：暴露集 17 个（`repair` 不进）、summary 只挂写工具、读面台账先起账、通知不执行（票 `talk-cli-engine` 05，决策 427 的实施）
+
+**起因**：决策 427 的 spec 裁决后票 05 动工（2026-10-11，新 crate `agentpipeline-mcp-proxy` + 端点 `POST /foreman/proposals` / `GET /foreman/read/{tool}` + 迁移 0049 `origin` 列 + claude `--mcp-config` 挂载）。实现轮出现两处对 spec 字面的偏离与三处实现判断——偏离必须显式标注编号（AGENTS.md 纪律），连同双轴 code-review 抄出的两处口径失真，一并记档。
+
+**裁决**：
+
+1. **暴露集 17 个而非 18**：spec ⑥ 的 C+D 层 8 写收敛为 **7 写**——`repair` 不进 MCP 暴露集。修复提议的载荷不是「工具的调用参数」，是修复流程自己落的（`proposals.rs` 的 kind 注释），代理侧造不出合法的修复链 payload；模型真要发起修复，说的是任务族提议（`task` 写工具承担）。`tools/list` 的镜像断言按 17 钉（7 写 + 9 读 + 1 手写提议列表）。
+2. **`summary` 必填只挂 7 个写工具**：spec ⑥「每个 MCP 工具带必填 summary」的收窄——读工具与提议列表不产生「人按键之前唯一读的那一行」，强制摘要只会逼模型编话；「模型自己写的那句给人看的说明」这条约束只对写提议成立。
+3. **提议知识三处复用收成一处**：态势指纹的取法（`situation_for`：`args.task_id` 优先的决策 207 判据）与 SSE 广播的形状（`emit_proposal_event`）从 [`StoreProposalSink::propose`] 与 `create_cli_proposal` 的两份复写提取为共享助手——CLI 通道与进程内工具执行说同一套提议知识，判据只此一份，不另立第二份口径。
+4. **HTTP 读面台账先起账再执行**：code-review 抄出的失真——原实现执行成功后才 `record_start`、退出码恒 0，读失败在台账上「没发生过」。改判：动用即留痕（先起账），失败也收口，退出码记「这次读成没成」（成功 0 / 失败 1，错误文本进 stderr 预览）——没有进程跑起来，这一列在这根台账上记的就是通道动用的成败，不是进程退出码。
+5. **代理侧通知不执行**：`tools/call` 若以 JSON-RPC 通知（无 id）到达，跑了也没处回话，模型看不到结果还以为做了——通知直接吞掉、连执行都不执行（只有带 id 的请求才产生处理；`notifications/initialized` 等本就无需服务端动作，代理无状态也没有在途调用可取消）。钉子测试断言通知形态的 `tools/call` 一次 HTTP 调用都不发出。
+
+**边界照旧**：执行面零新增（人按键后仍走既有 `execute_proposal`，决策 424②）；配对令牌 + engine=cli 双闸；令牌经环境变量进代理不进 argv；`--strict-mcp-config` 收死 claude 的工具面（allowedTools = 只读 bash 白名单 + `mcp__agentpipeline`）；降级有界——代理缺席 / 配置失败只 warn 一行、回合照跑；读面 `ToolCallContext` 的占位值（空 task_id、Init/Execute、home 路径）是有意的——班次级的嘴不挂任务，九个 DB 读数一个不碰文件。
+
+**代价（接受）**：MCP 面比 spec 少一个工具（`repair` 走不了 CLI 通道）——损失由任务族提议兜住；读面台账一行不记进程语义（stdout/stdin 路径恒空）——审计面要的是「动用了没、成没成」。
+
+**验证**：mcp-proxy 9 测（暴露集镜像 17 断言、写工具必填 summary / 读工具不带、翻译形状、缺 summary 不出代理、通知不执行钉子、跨 crate 服务器名同源）；迁移 0049 用例（origin 回填 api + CHECK 挡非法值）；app 契约（端点校验面三闸、读面台账留痕）；workspace `cargo test` 全绿（0 failed）、前端 vitest 1217 全绿、fmt / clippy 零告警。
+
+**来源**：票 `talk-cli-engine/05` 实现轮（两处偏离已补记票面）；关联决策 427（spec 全文与本条的偏离对象）、424②（纪律边界）、207（态势指纹判据）、182（配对令牌）、247（同源第四处：广告集 / 执行白名单 / 人格纪律段 / MCP 名单）。
