@@ -3426,3 +3426,25 @@ config.rs}`、`tests/e2e/tests/integration/stage_boundary.rs`、`docs/testing.md
 **验证**：L1 四格（`turn_plan.rs`：输入高输出低 / 输入低输出高 / 都高 / 都低，外加「值守轮输入爆了不触硬界」一格钉死分档）；L2 两条（既有成本门用例改双读数断言 + 新增 `an_input_heavy_human_round_also_raises_the_soft_warning`：输入 3M×3 调用累计 9M 过线、生成 15 远低于 120k → 照跑不拦、落双读数软告警）；值守硬界用例 `the_token_budget_stops_the_watch_round_but_never_the_human_one` 前半逐字绿。core 集成 568 全绿、clippy 零告警。手工面（拿本账班次数据重演 407 轮）判据同构已被 L1 的 407 轮实参一格覆盖（5,163,470 > 5M / 38,054 < 120k → `WarnHuman`）。
 
 **来源**：票 `foreman-burns-without-guard/05` 原文（实证出自 2026-10-08 班次 `01M4CDY9EC9M9FSSE236GJXYZC`）；关联决策 292（分档与硬界的立意）、422①（判据面修订的裁决）、256（不加没人会调的配置项）、272③（通知门）。
+
+### 决策 427 · stdio MCP 提议代理的 spec 裁决：提议创建走新端点、读面补 DB 九读、暴露集一比一镜像 catalog（票 `talk-cli-engine` 05，决策 424② 的实施裁决）
+
+**起因**：决策 424② 只定了「翻译成对既有端点的 HTTP 调用」，实现轮查证（2026-10-11，票 05 转 spec 先行，先例 `deploy-divergence/03`：spec 不清不动工）发现缺口比票面更深——提议的诞生只在 API 值班长的**进程内**工具执行里（`run_proposal_tool` → `StoreProposalSink`），没有 HTTP 面；且 catalog 的 24 个工具**全部**是进程内执行，HTTP 面只有提议列表 / execute / reject 等少数几个，「对既有端点的调用」对提议创建连字面上都不成立。同轮查证另修两处票面笔误：态势快照刻意薄（briefing 只装「需要有人管的」，「按需查走 `read_task`」对 CLI 引擎不成立——CLI 的只读 bash 白名单够不到 SQLite）；provenance 不归 `attribution.rs`（那是播报归因四族，决策 227/238），提议行来路的既有先例是 `stopped_round`（决策 294）。
+
+**裁决**：
+
+1. **提议创建走新端点 `POST /foreman/proposals`**：载荷 `{tool, args, summary}`；校验面收在端点一处——tool 必须在暴露子集、args 过 `FOREMAN_TOOL_SPECS` 的 JSON-Schema、TTL 与既有提议同律。**执行面零新增**：执行仍走既有 `execute_proposal`，人按键后由主进程的进程内执行器跑——新增的只是「写一行提议」的入口，不是第二条执行路。
+2. **execute / reject 不进 MCP**：CLI 若能调 `execute_proposal` 就能自提自执，把「改状态只走提议、人按键才执行」（决策 424② 边界）整个绕穿。两者是人按钮专属。MCP 侧唯一的既有面读工具是「读本班次未决提议」——翻译既有 `GET /foreman/proposals?session=`，零新面。
+3. **读面本票补，只收 DB 读数九个**：通用端点 `GET /foreman/read/{tool}`，覆盖 `read_task` / `read_conversation` / `read_board` / `read_metrics` / `read_projects` / `read_stage_configs` / `read_skills` / `read_providers` / `read_diagnosis`。文件域（`read_file` / `list_dir` / `Skill` / `search_content`）、进程取证（`run_readonly`）、网页（`web_fetch`）留 CLI 原生工具承担——票面原判「读类不重复暴露」对这三类成立，对 DB 读数不成立。端点第二道闸校验 session 存在且 engine=cli（配对令牌仍是机器级第一道，决策 182）；每次读落命令台账（会话归属），与进程内读数的审计纪律同律。
+4. **提议 provenance 落 `ForemanProposal.origin`**：新列 `'api' | 'cli'`（迁移 + CHECK），前端提议徽章区分——人需要分辨「这是机器夜里提的」；执行路径归因照既有会话归属，零改动。
+5. **会话绑定**：session_id 经环境变量进代理、随载荷上报；端点校验「该 session 存在且 engine=cli」为第二道闸——顺带挡住「API 班次被来路不明的本地进程塞提议」。
+6. **MCP 暴露集 = 18 个工具，一比一镜像 catalog**：C+D 层 8 个写工具（`write_file` / `edit_file` / `run_command` / `repair` / `service` / `task` / `config` / `skills`）+ 提议列表 + DB 读数九个。MCP 工具名 = catalog 名、schema 直接从 `FOREMAN_TOOL_SPECS.parameters` 生成、`tools/list` 由 catalog.rs 单一事实源驱动——决策 247 的「三处同源」延伸到第四处（广告集 / 执行白名单 / 人格纪律段 / MCP 名单）；每个 MCP 工具带必填 `summary`（给人看的那句）。
+7. **已知让步（记档不立项）**：CLI 引擎的网页取数走 claude 原生 WebFetch，不经出口白名单治理（决策 179 的治理面盖不到它）——接受为让步记进票面，成真问题再另立票。
+
+**边界照旧**：`routes/foreman.rs` 既有端点语义一字不动（决策 424 边界）；代理无状态、崩了重启；C 层进 MCP 与 API 值班长 `ask` 档同一纪律——CLI 引擎只是把执行点统一收到了人按键后的主进程。
+
+**代价（接受）**：新增两根 HTTP 面（提议创建 POST + 只读通用 GET）——都在配对令牌 + engine=cli 双闸之下，且 POST 不带执行力；每会话一个 MCP 代理子进程（决策 424 已计）。
+
+**验证**：spec 层面——本条即票 05 动工的前置，「spec 不清不动工」解除、票 05 转 ready-for-agent；实现钉子在票 05 验收时兑现（端点校验面用例、MCP 名单与 catalog 同源的测试断言、origin 列迁移用例）。
+
+**来源**：grilling 拷问会话（2026-10-11，三轮：Q1–Q5 创建路 / 自执行 / 读面 / provenance / 会话绑定，Q6–Q9 读面子集 / 端点形状 / C 层进面 / 镜像命名）；关联决策 424（②的裁决与①③的落实）、207（提议机制）、247（单一事实源）、182（配对令牌）、294（stopped_round 先例）、179（出口治理——⑦的让步对象）。
