@@ -1796,6 +1796,12 @@
             {#if st === 'pending'}⏳{/if}
             {proposalShortLabel(p, now)} · {proposalToolLabel(p, toolLabels)}
             {#if st === 'pending'}· <span class="pleft">{proposalRemainingLabel(p, now)}</span>{/if}
+            {#if p.origin === 'cli'}
+              <!-- 来路（CLI 引擎一期）：这一条是 CLI 班次经提议通道进来的，通常产生在
+                   没人盯着的时段——名牌上多一枚标，与「来自被按停的话」同一族读数：
+                   只影响怎么读，不改能不能按。 -->
+              <span class="porigin">CLI</span>
+            {/if}
           </div>
           <!-- 摘要与提问同值班长回话的待遇（票 05 of talk-live-identity）：作者是模型，
                「它不写 markdown」是无法执行的纪律——原样插值只会把 `**` 与反引号吐给人。 -->
@@ -2683,6 +2689,13 @@
   }
   .pleft {
     color: var(--text-2);
+  }
+  /* CLI 来路标（CLI 引擎一期）：小、灰、放在名牌行尾——它不是状态，不用彩色。
+     像素纪律：无圆角、无描边、字号走 12 的档。 */
+  .porigin {
+    margin-left: 4px;
+    font-size: 12px;
+    color: var(--text-3);
   }
   .pacts {
     display: flex;

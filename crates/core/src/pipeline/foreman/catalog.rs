@@ -1,6 +1,8 @@
 use std::path::PathBuf;
 use std::sync::Arc;
 
+use serde_json::Value;
+
 use crate::agent::tools::{ToolCallContext, ToolExecutor};
 use crate::config::Settings;
 use crate::home::Home;
@@ -9,6 +11,7 @@ use crate::process::RealProcessKiller;
 use crate::sse::SseSink;
 use crate::storage::Store;
 use crate::types::{CommandSource, Node, Stage};
+use crate::Result;
 
 // ============================== 工具规格（从 foreman.rs 原地搬入，决策 351）
 
@@ -320,6 +323,124 @@ pub(super) fn mutates_something(name: &str) -> bool {
     crate::agent::tools::is_env_write_tool(name) || crate::agent::tools::is_service_write_tool(name)
 }
 
+// ── CLI 引擎的 HTTP 通道（决策 427，票 talk-cli-engine 05）─────────────────────
+//
+// 暴露名单在这里**逐条点名**，不派生（不按 `mutates_something` 筛）：这是安全边界
+// 本身，与 [`FOREMAN_TOOL_SPECS`] 同一姿态——「给 CLI 通道加一个工具」的改动必须
+// 在 diff 里显式可见，派生出来的名单会让加一个工具顺带扩了第二张嘴。
+
+/// CLI 通道可以**提议**的写工具（决策 427⑥ 的 C+D 层；`repair` 不在——见模块下方的
+/// 票注：修复提议的执行分支要主进程修复链产出的 `payload`，代理造不出它）。
+pub const CLI_PROPOSAL_TOOLS: [&str; 7] = [
+    "write_file",
+    "edit_file",
+    "run_command",
+    "service",
+    "task",
+    "config",
+    "skills",
+];
+
+/// CLI 读面的 DB 读数（决策 427③）：没有 HTTP 面、CLI 原生工具够不到的那九个。
+/// 文件域 / 进程取证 / 网页不在列——那些 CLI 原生工具承担。
+pub const CLI_READ_TOOLS: [&str; 9] = [
+    "read_task",
+    "read_conversation",
+    "read_board",
+    "read_metrics",
+    "read_projects",
+    "read_stage_configs",
+    "read_skills",
+    "read_providers",
+    "read_diagnosis",
+];
+
+/// 按 [`FOREMAN_TOOL_SPECS`] 的参数 schema **浅校验**一组参数（决策 427① 的校验面）。
+///
+/// 「浅」的边界：只查 schema 自己写明的东西——必填齐不齐、类型对不对、enum 收不收、
+/// 多出来的键拒不拒（schema 的 properties 就是全集，不认 additionalProperties）。
+/// 语义层的校验（动作名存在、task_id 真有那条任务、resume_action 合法）**不在这里**——
+/// 那是执行点与既有端点的职责（同一套校验，不是第二套）；这里挡的是「参数根本不是
+/// 这个工具的形状」与「键名打错」这类连执行都不该到的一档。
+pub fn validate_args_against_spec(tool: &str, args: &Value) -> Result<()> {
+    let Some(spec) = FOREMAN_TOOL_SPECS.iter().find(|s| s.name == tool) else {
+        return Err(crate::Error::Validation(format!(
+            "未知工具：{tool}（不在 CLI 通道的暴露名单里）"
+        )));
+    };
+    let schema: serde_json::Value = serde_json::from_str(spec.parameters).map_err(|e| {
+        crate::Error::Validation(format!("工具 {tool} 的 schema 不是合法 JSON：{e}"))
+    })?;
+    let obj = args
+        .as_object()
+        .ok_or_else(|| crate::Error::Validation(format!("工具 {tool} 的参数必须是 JSON 对象")))?;
+    let props = schema
+        .get("properties")
+        .and_then(|p| p.as_object())
+        .cloned()
+        .unwrap_or_default();
+    for key in obj.keys() {
+        if !props.contains_key(key) {
+            return Err(crate::Error::Validation(format!(
+                "工具 {tool} 不认参数「{key}」"
+            )));
+        }
+    }
+    for key in schema
+        .get("required")
+        .and_then(|r| r.as_array())
+        .into_iter()
+        .flatten()
+        .filter_map(|v| v.as_str())
+    {
+        if !obj.contains_key(key) {
+            return Err(crate::Error::Validation(format!(
+                "工具 {tool} 缺必填参数「{key}」"
+            )));
+        }
+    }
+    for (key, value) in obj {
+        let Some(prop) = props.get(key) else { continue };
+        check_type(tool, key, value, prop)?;
+        if let Some(enum_values) = prop.get("enum").and_then(|e| e.as_array()) {
+            if !enum_values.contains(value) {
+                return Err(crate::Error::Validation(format!(
+                    "工具 {tool} 的参数「{key}」取值 {value} 不在允许的取值里"
+                )));
+            }
+        }
+    }
+    Ok(())
+}
+
+/// schema 的 `type` 对单个值的一档校验（`integer` 不收 `1.5`，`number` 两者都收）。
+fn check_type(tool: &str, key: &str, value: &Value, prop: &serde_json::Value) -> Result<()> {
+    let Some(type_name) = prop.get("type").and_then(|t| t.as_str()) else {
+        return Ok(());
+    };
+    let ok = match type_name {
+        "string" => value.is_string(),
+        "boolean" => value.is_boolean(),
+        "integer" => value.as_i64().is_some(),
+        "number" => value.is_number(),
+        "array" => value.is_array(),
+        "object" => value.is_object(),
+        // 认不出的 type 不装懂：schema 是我们自己的常量，走到这里说明 schema 写坏了。
+        _ => {
+            return Err(crate::Error::Validation(format!(
+                "工具 {tool} 的 schema 写了不认识的类型「{type_name}」"
+            )))
+        }
+    };
+    if ok {
+        Ok(())
+    } else {
+        Err(crate::Error::Validation(format!(
+            "工具 {tool} 的参数「{key}」应是 {type_name}"
+        )))
+    }
+}
+
 /// 值班长此刻**真正拿得到**的工具名（决策 206 的 `deny` 档：连广告都不给）。
 ///
 /// 广告集（[`ForemanRunner::tool_defs`]）与执行点白名单
@@ -446,4 +567,69 @@ pub fn foreman_tooling(
         }
     };
     (tools, foreman_ctx(home, session_id))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    /// 暴露名单里的每个名字都必须真的在 catalog 里——白名单里一个打错的名字，
+    /// 模型看得见一个调不通的工具（与决策 247 的「同源」理由同一条）。
+    #[test]
+    fn cli_channel_lists_only_name_catalog_tools() {
+        for tool in CLI_PROPOSAL_TOOLS.iter().chain(CLI_READ_TOOLS.iter()) {
+            assert!(
+                FOREMAN_TOOL_SPECS.iter().any(|s| s.name == *tool),
+                "CLI 通道名单里的 {tool} 不在 FOREMAN_TOOL_SPECS 里"
+            );
+        }
+    }
+
+    /// `repair` 不在 CLI 通道（票 05 的票注）：修复提议的执行分支要主进程修复链产出的
+    /// `payload`，代理造不出它。这一条钉住的是「别顺手把它加回去」。
+    #[test]
+    fn repair_is_not_exposed_to_the_cli_channel() {
+        assert!(!CLI_PROPOSAL_TOOLS.contains(&"repair"));
+    }
+
+    #[test]
+    fn the_validator_accepts_well_shaped_args() {
+        assert!(validate_args_against_spec(
+            "task",
+            &json!({"action": "cancel", "task_id": "01KX"})
+        )
+        .is_ok());
+        // 全可选参数的工具：空对象也合法
+        assert!(validate_args_against_spec("read_board", &json!({})).is_ok());
+    }
+
+    #[test]
+    fn the_validator_rejects_malformed_args() {
+        // 未知工具
+        assert!(validate_args_against_spec("teleport", &json!({})).is_err());
+        // 不在名单里的工具（repair 由名字本身拒：schema 存在但工具不在写名单——
+        // 注意校验器只认 schema，白名单的判断在端点）
+        // 缺必填
+        assert!(validate_args_against_spec("task", &json!({})).is_err());
+        // 多出来的键（键名打错）
+        assert!(validate_args_against_spec(
+            "task",
+            &json!({"action": "cancel", "task_id": "t", "taask_id": "x"})
+        )
+        .is_err());
+        // 类型不对
+        assert!(
+            validate_args_against_spec("task", &json!({"action": "cancel", "task_id": 42}))
+                .is_err()
+        );
+        // enum 不收
+        assert!(validate_args_against_spec("task", &json!({"action": "teleport"})).is_err());
+        // 根不是对象
+        assert!(validate_args_against_spec("task", &json!("cancel")).is_err());
+        // integer 不收小数
+        assert!(
+            validate_args_against_spec("read_task", &json!({"task_id": "t", "runs": 1.5})).is_err()
+        );
+    }
 }

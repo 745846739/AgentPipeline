@@ -151,7 +151,17 @@ pub fn build_router(state: AppState) -> Router {
         // (工具, 参数) 走既有的那条端点，同一套校验、同一套闸门。这里能做的三件事是
         // 一次一按、过期、态势变化的拒执（决策 207 的三条硬约束）。
         .route("/foreman/commands", get(routes::foreman::commands))
-        .route("/foreman/proposals", get(routes::foreman::proposals))
+        .route(
+            "/foreman/proposals",
+            get(routes::foreman::proposals).post(routes::foreman_proxy::create_proposal),
+        )
+        // CLI 通道的读面（决策 427③，票 talk-cli-engine 05）：DB 九读的通用端点，
+        // stdio MCP 代理的翻译目标之一。校验面在 handler 一处（工具白名单 + schema
+        // 浅校验 + engine=cli 第二道闸）；每次读落命令台账。
+        .route(
+            "/foreman/read/{tool}",
+            get(routes::foreman_proxy::read_tool),
+        )
         .route(
             "/foreman/proposals/{id}/execute",
             post(routes::foreman::execute_proposal),

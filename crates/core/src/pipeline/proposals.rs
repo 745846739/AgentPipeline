@@ -10,10 +10,13 @@
 use std::sync::Arc;
 
 use futures::future::BoxFuture;
+use serde_json::Value;
 
 use crate::agent::tools::{ProposalRequest, ProposalSink};
 use crate::sse::{SseEvent, SseSink};
-use crate::storage::proposals::{ForemanProposalKind, NewForemanProposal};
+use crate::storage::proposals::{
+    ForemanProposal, ForemanProposalKind, NewForemanProposal, FOREMAN_PROPOSAL_ORIGIN_CLI,
+};
 use crate::storage::Store;
 use crate::Result;
 
@@ -34,23 +37,7 @@ impl ProposalSink for StoreProposalSink {
         let store = self.store.clone();
         let sse = self.sse.clone();
         Box::pin(async move {
-            // 态势指纹只在**参数里带 `task_id`** 时取（决策 207 的拒执判据）。
-            //
-            // 规则是**一条**而不是每个工具一个开关：任务族的提议都能回答「它当时说的是哪个
-            // 任务、那时是什么样」，而文件 / 命令族的提议**没有**态势可判——那种情况下提议
-            // 的成立与否由端点自己的校验回答（同一套校验，不是第二套）。
-            //
-            // **判据取 `args.task_id`，不是 `ProposalRequest.task_id`**：后者是**调用上下文**
-            // 的归属，而值班长不挂任务（`foreman_ctx` 给它空 task_id）；任务族的提议把 id 放在
-            // **参数**里（`{"action":"cancel","task_id":"t1"}`）。照上下文取的话指纹**永远是
-            // None**，而「执行时态势变了就拒执」这条规则会静默失效——一条按下去要在**当时**
-            // 才成立的事，靠的就是它。
-            let situation = match task_id_of(&request) {
-                Some(task_id) => {
-                    Some(super::foreman::situation_fingerprint(&store, &task_id).await?)
-                }
-                None => None,
-            };
+            let situation = situation_for(&store, &request).await?;
             let summary = proposal_summary(&request);
             let proposal = store
                 .create_foreman_proposal(NewForemanProposal {
@@ -63,20 +50,12 @@ impl ProposalSink for StoreProposalSink {
                     // 走的是另一条路：它的载荷不是「工具的调用参数」）。
                     kind: ForemanProposalKind::ApiCall,
                     payload: None,
+                    // 进程内工具执行提出的案：来路恒 `api`（决策 427）。CLI 通道不走这个
+                    // sink——它经 HTTP 端点（`create_cli_proposal`）进来，来路才是 `cli`。
+                    origin: crate::storage::proposals::FOREMAN_PROPOSAL_ORIGIN_API,
                 })
                 .await?;
-            if !proposal.session_id.is_empty() {
-                sse.emit(SseEvent::ForemanProposal {
-                    task_id: String::new(),
-                    branch: String::new(),
-                    session_id: proposal.session_id.clone(),
-                    proposal_id: proposal.id.clone(),
-                    tool: proposal.tool.clone(),
-                    status: proposal.status.as_str().to_string(),
-                    summary: proposal.summary.clone(),
-                    expires_at: proposal.expires_at.to_rfc3339(),
-                });
-            }
+            emit_proposal_event(&sse, &proposal);
             // 回灌给模型的那句话把它**止在此处**：写工具调用不是一次失败，模型该接着把话
             // 说完（「我已经提了这件事，等值班经理按键」），而不是换一个写法再试一遍。
             Ok(format!(
@@ -87,6 +66,89 @@ impl ProposalSink for StoreProposalSink {
             ))
         })
     }
+}
+
+/// CLI 通道的提议创建（决策 427①，票 talk-cli-engine 05）。
+///
+/// HTTP 端点（`POST /foreman/proposals`）过完校验面之后走这里落库——**与进程内工具执行
+/// 共用同一套提议知识**：态势指纹的取法（`situation_for`）与 SSE 广播的形状
+/// （`emit_proposal_event`）都是 [`StoreProposalSink::propose`] 里的同一份，不另立第二份口径。
+/// 差别只有两处：来路是 [`FOREMAN_PROPOSAL_ORIGIN_CLI`]，summary 由调用方（端点）转交——
+/// MCP 工具的 `summary` 参数是模型自己写的「给人看的那句」，端点校验它非空但不改写。
+///
+/// 端点的校验面（工具白名单 / schema / engine=cli 闸）**不在这里**：那是 HTTP 边界的
+/// 职责，这里假定进来的参数已经过了闸（core 的集成测试直接调它，也一样先过闸再进）。
+pub async fn create_cli_proposal(
+    store: &Store,
+    sse: &Arc<dyn SseSink>,
+    session_id: &str,
+    tool: &str,
+    args: &Value,
+    summary: &str,
+) -> Result<ForemanProposal> {
+    let situation = situation_for(
+        store,
+        &ProposalRequest {
+            session_id: Some(session_id.to_string()),
+            task_id: None,
+            tool: tool.to_string(),
+            args: args.clone(),
+        },
+    )
+    .await?;
+    let proposal = store
+        .create_foreman_proposal(NewForemanProposal {
+            session_id: session_id.to_string(),
+            tool: tool.to_string(),
+            args: args.clone(),
+            summary: summary.to_string(),
+            situation,
+            kind: ForemanProposalKind::ApiCall,
+            payload: None,
+            origin: FOREMAN_PROPOSAL_ORIGIN_CLI,
+        })
+        .await?;
+    emit_proposal_event(sse, &proposal);
+    Ok(proposal)
+}
+
+/// 态势指纹只在**参数里带 `task_id`** 时取（决策 207 的拒执判据）。
+///
+/// 规则是**一条**而不是每个工具一个开关：任务族的提议都能回答「它当时说的是哪个
+/// 任务、那时是什么样」，而文件 / 命令族的提议**没有**态势可判——那种情况下提议
+/// 的成立与否由端点自己的校验回答（同一套校验，不是第二套）。
+///
+/// **判据取 `args.task_id`，不是 `ProposalRequest.task_id`**：后者是**调用上下文**
+/// 的归属，而值班长不挂任务（`foreman_ctx` 给它空 task_id）；任务族的提议把 id 放在
+/// **参数**里（`{"action":"cancel","task_id":"t1"}`）。照上下文取的话指纹**永远是
+/// None**，而「执行时态势变了就拒执」这条规则会静默失效——一条按下去要在**当时**
+/// 才成立的事，靠的就是它。
+async fn situation_for(store: &Store, request: &ProposalRequest) -> Result<Option<Value>> {
+    match task_id_of(request) {
+        Some(task_id) => Ok(Some(
+            super::foreman::situation_fingerprint(store, &task_id).await?,
+        )),
+        None => Ok(None),
+    }
+}
+
+/// 提议事件只对**挂了班次**的提议广播（会话为空 = 与对讲台无关，无人可听）。
+///
+/// 进程内工具执行与 CLI 通道（决策 427）走同一份形状——事件的字段口径只此一处。
+fn emit_proposal_event(sse: &Arc<dyn SseSink>, proposal: &ForemanProposal) {
+    if proposal.session_id.is_empty() {
+        return;
+    }
+    sse.emit(SseEvent::ForemanProposal {
+        task_id: String::new(),
+        branch: String::new(),
+        session_id: proposal.session_id.clone(),
+        proposal_id: proposal.id.clone(),
+        tool: proposal.tool.clone(),
+        status: proposal.status.as_str().to_string(),
+        summary: proposal.summary.clone(),
+        expires_at: proposal.expires_at.to_rfc3339(),
+    });
 }
 
 /// 这条提议说的是哪个任务（`None` = 与任务无关）。

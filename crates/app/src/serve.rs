@@ -874,7 +874,10 @@ pub async fn serve(options: ServeOptions) -> anyhow::Result<ServerHandle> {
             settings.clone(),
             runtime.resume_hook.clone(),
             sse.clone(),
-        ))),
+        )))
+        // MCP 提议通道的回连地址（决策 427）：**实际绑定**的端口——首选端口被占
+        // 退让时（决策 213）配置文件里那一份不是真的，代理会连错地方。
+        .with_mcp_base_url(format!("http://127.0.0.1:{}", bound.port())),
     );
     // 值守轮（决策 209④ / 票 06）：与调度器的 10s tick 分开驱动——它要花模型的钱，
     // 且「醒不醒」的判据在 `ForemanRunner::watch` 里（有待办 + 去抖窗口到期）。

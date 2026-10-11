@@ -4283,6 +4283,7 @@ async fn maintenance_keeps_foreman_messages_forever_and_still_purges_the_rest() 
         .create_foreman_proposal(agentpipeline_core::storage::proposals::NewForemanProposal {
             kind: agentpipeline_core::storage::proposals::ForemanProposalKind::ApiCall,
             payload: None,
+            origin: agentpipeline_core::storage::proposals::FOREMAN_PROPOSAL_ORIGIN_API,
             session_id: sid.clone(),
             tool: "write_file".into(),
             args: serde_json::json!({"path": "notes.md"}),
@@ -4399,6 +4400,7 @@ async fn scheduler_maintenance_expires_proposals_and_purges_them_by_age() {
         .create_foreman_proposal(agentpipeline_core::storage::proposals::NewForemanProposal {
             kind: agentpipeline_core::storage::proposals::ForemanProposalKind::ApiCall,
             payload: None,
+            origin: agentpipeline_core::storage::proposals::FOREMAN_PROPOSAL_ORIGIN_API,
             session_id: sid.clone(),
             tool: "write_file".into(),
             args: serde_json::json!({"path": "notes.md"}),
@@ -6613,6 +6615,7 @@ impl LlmClient for StallingAfter {
                         agentpipeline_core::storage::proposals::NewForemanProposal {
                             kind: agentpipeline_core::storage::proposals::ForemanProposalKind::ApiCall,
                             payload: None,
+                            origin: agentpipeline_core::storage::proposals::FOREMAN_PROPOSAL_ORIGIN_API,
                             session_id,
                             tool: "task".into(),
                             args: serde_json::json!({"task_id": "t1", "action": "resume"}),
@@ -6845,6 +6848,7 @@ async fn a_failed_turn_invalidates_the_proposals_it_left_behind() {
             .create_foreman_proposal(agentpipeline_core::storage::proposals::NewForemanProposal {
                 kind: agentpipeline_core::storage::proposals::ForemanProposalKind::ApiCall,
                 payload: None,
+                origin: agentpipeline_core::storage::proposals::FOREMAN_PROPOSAL_ORIGIN_API,
                 session_id: sid.clone(),
                 tool: "write_file".into(),
                 args: serde_json::json!({"path": format!("notes-{i}.md"), "content": "x"}),
@@ -6902,6 +6906,7 @@ async fn a_failed_turn_only_invalidates_the_proposals_of_its_own_round() {
     let new_proposal = |tool: &str| agentpipeline_core::storage::proposals::NewForemanProposal {
         kind: agentpipeline_core::storage::proposals::ForemanProposalKind::ApiCall,
         payload: None,
+        origin: agentpipeline_core::storage::proposals::FOREMAN_PROPOSAL_ORIGIN_API,
         session_id: sid.clone(),
         tool: tool.into(),
         args: serde_json::json!({"path": "notes.md", "content": "x"}),
@@ -6978,6 +6983,7 @@ impl LlmClient for ProposeThenFail {
                     agentpipeline_core::storage::proposals::NewForemanProposal {
                         kind: agentpipeline_core::storage::proposals::ForemanProposalKind::ApiCall,
                         payload: None,
+                        origin: agentpipeline_core::storage::proposals::FOREMAN_PROPOSAL_ORIGIN_API,
                         session_id,
                         tool: "write_file".into(),
                         args: serde_json::json!({"path": "during-round.md", "content": "x"}),

@@ -14,6 +14,7 @@
 //! 读数在票 06 收口，这里未知行先落台账（跳过计数进 [`CliTurnOutput::skipped_lines`]）。
 
 use std::collections::BTreeMap;
+use std::os::unix::fs::OpenOptionsExt;
 use std::path::Path;
 use std::sync::Arc;
 
@@ -25,7 +26,7 @@ use crate::exec::{CommandOutput, CommandOwner, CommandRequest, CommandRunner, Re
 use crate::sse::{Channel, SseEvent, SseSink, ToolPhase};
 use crate::storage::Store;
 use crate::types::{CommandSource, Node, Stage};
-use crate::Result;
+use crate::{Error, Result};
 
 /// 一期的 CLI 引擎二进制（决策 423⑥：一期只做 claude code；经 PATH 解析）。
 pub const CLI_FOREMAN_BINARY: &str = "claude";
@@ -49,6 +50,100 @@ pub const CLI_REBUILD_DIGEST_MESSAGES: usize = 40;
 
 /// 重建告知的标记（决策 424③「不静默」）：system 行与重建输入各带一次。
 pub const CLI_REBUILT_MARK: &str = "【引擎会话重建】";
+
+// ── MCP 提议通道（决策 427，票 talk-cli-engine 05）────────────────────────────
+
+/// MCP 服务器名（claude 侧看到的工具前缀是 `mcp__agentpipeline__<工具名>`）。
+/// 与 `agentpipeline-mcp-proxy` crate 的 `MCP_SERVER_NAME` 由测试跨仓钉住同值。
+pub const CLI_MCP_SERVER_NAME: &str = "agentpipeline";
+
+/// 代理二进制的文件名：与主服务**同一安装目录的兄弟件**（打包一起走，
+/// `current_exe` 的兄弟目录就是它的位置）。找不到时不挂 MCP——回合照跑，
+/// 只是这一轮没有提议通道（降级有界：日志一行，不另立开关）。
+pub const CLI_MCP_PROXY_BINARY: &str = "agentpipeline-mcp-proxy";
+
+/// `--mcp-config` 的挂载 JSON（决策 427⑤）：代理是 claude 的**子进程**，三个
+/// 事实经环境变量进它——服务地址、配对令牌（不进 argv：argv 会进进程列表）、
+/// 班次绑定。`--strict-mcp-config`（由 [`run_cli_turn_with_runner`] 加）保证
+/// claude 只看见这一个 MCP 服务器：值班长的工具面不允许被用户级配置扩出去。
+pub fn mcp_config_json(
+    proxy_program: &str,
+    base_url: &str,
+    token: &str,
+    session_id: &str,
+) -> String {
+    serde_json::json!({
+        "mcpServers": {
+            CLI_MCP_SERVER_NAME: {
+                "command": proxy_program,
+                "args": [],
+                "env": {
+                    "AGENTPIPELINE_BASE_URL": base_url,
+                    "AGENTPIPELINE_TOKEN": token,
+                    "AGENTPIPELINE_SESSION_ID": session_id,
+                },
+            }
+        }
+    })
+    .to_string()
+}
+
+/// 一份**挂在本回合上的 MCP 配置文件**：临时目录里 0600 的新件（里面带着配对
+/// 令牌，权限不能宽），Drop 即删——文件的生命周期就是这一回合的命令行。
+pub struct McpConfigFile {
+    path: std::path::PathBuf,
+}
+
+impl McpConfigFile {
+    /// 代理在场才写；返回 `None` = 本回合不挂 MCP（代理不在场 / 写失败都已各自记过）。
+    pub fn create(
+        proxy_program: &Path,
+        base_url: &str,
+        token: &str,
+        session_id: &str,
+    ) -> Result<Option<McpConfigFile>> {
+        if !proxy_program.is_file() {
+            return Ok(None);
+        }
+        let program = proxy_program
+            .to_str()
+            .ok_or_else(|| Error::Config("MCP 代理程序路径不是 UTF-8".into()))?;
+        let path =
+            std::env::temp_dir().join(format!("agentpipeline-mcp-{}.json", ulid::Ulid::new()));
+        let file = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(&path)?;
+        serde_json::to_writer_pretty(
+            file,
+            &serde_json::from_str::<serde_json::Value>(&mcp_config_json(
+                program, base_url, token, session_id,
+            ))?,
+        )?;
+        Ok(Some(McpConfigFile { path }))
+    }
+
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+}
+
+impl Drop for McpConfigFile {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.path);
+    }
+}
+
+/// 代理二进制的落点：测试缝优先，生产找主服务可执行文件的兄弟目录。
+pub fn resolve_mcp_proxy_program(override_path: Option<&Path>) -> Option<std::path::PathBuf> {
+    if let Some(p) = override_path {
+        return Some(p.to_path_buf());
+    }
+    let exe = std::env::current_exe().ok()?;
+    let sibling = exe.parent()?.join(CLI_MCP_PROXY_BINARY);
+    sibling.is_file().then_some(sibling)
+}
 
 /// 一次 CLI 回合的超时上限。它是**整段回合**的墙钟（claude 自带工具循环可能合法地
 /// 跑几分钟），与流水线逐调用的空闲界（决策 288）不同层——空闲判死由 CLI 自己的
@@ -90,6 +185,9 @@ pub struct CliTurnRequest {
     /// 台账归属（决策 204④）：值班长的命令挂会话——挂了记录器（流式路径）就
     /// 必须恰好一个归属，探针那种无归属形态只在无记录器时合法。
     pub session_id: String,
+    /// MCP 配置文件的路径（决策 427，票 05）：`Some` = 本回合挂提议通道。
+    /// 路径由 [`McpConfigFile`] 造、Drop 即删，这里只借用路径形状。
+    pub mcp_config_path: Option<std::path::PathBuf>,
 }
 
 /// 跑一轮：组装 argv → 经 exec 收口 spawn（决策 297）→ 逐行解析 stream-json。
@@ -119,6 +217,14 @@ pub async fn run_cli_turn_with_runner(
     program: &str,
     req: CliTurnRequest,
 ) -> Result<CliTurnOutput> {
+    // MCP 提议通道（决策 427）：白名单放行这一族的全部工具——它们的「写」都是
+    // 提议，真正的执行闸在人按键那头。`--strict-mcp-config` 关掉用户级 MCP 服务器：
+    // 值班长的工具面不允许被外部配置扩出去。
+    let allowed_tools = if req.mcp_config_path.is_some() {
+        format!("{CLI_READONLY_BASH},mcp__{CLI_MCP_SERVER_NAME}")
+    } else {
+        CLI_READONLY_BASH.to_string()
+    };
     let mut args: Vec<String> = vec![
         "-p".into(),
         req.message.clone(),
@@ -132,8 +238,13 @@ pub async fn run_cli_turn_with_runner(
         "--disallowedTools".into(),
         CLI_WRITE_DENIED.into(),
         "--allowedTools".into(),
-        CLI_READONLY_BASH.into(),
+        allowed_tools,
     ];
+    if let Some(config_path) = &req.mcp_config_path {
+        args.push("--mcp-config".into());
+        args.push(config_path.display().to_string());
+        args.push("--strict-mcp-config".into());
+    }
     if let Some(id) = &req.resume_session_id {
         args.push("--resume".into());
         args.push(id.clone());
@@ -653,6 +764,73 @@ pub(crate) fn cli_system_prompt(persona: Option<&str>) -> String {
 mod tests {
     use super::*;
 
+    /// `--mcp-config` 的形状（决策 427⑤）：三件事实都经环境变量进代理子进程，
+    /// 令牌不进 argv（argv 会进进程列表——配置文件是 0600 的，进程列表不是）。
+    #[test]
+    fn the_mcp_config_carries_the_three_facts_in_env() {
+        let config = mcp_config_json(
+            "/opt/agentpipeline/bin/agentpipeline-mcp-proxy",
+            "http://127.0.0.1:8788",
+            "tok-1",
+            "s-cli",
+        );
+        let parsed: serde_json::Value = serde_json::from_str(&config).unwrap();
+        let server = &parsed["mcpServers"][CLI_MCP_SERVER_NAME];
+        assert_eq!(
+            server["command"],
+            "/opt/agentpipeline/bin/agentpipeline-mcp-proxy"
+        );
+        assert_eq!(
+            server["env"]["AGENTPIPELINE_BASE_URL"],
+            "http://127.0.0.1:8788"
+        );
+        assert_eq!(server["env"]["AGENTPIPELINE_TOKEN"], "tok-1");
+        assert_eq!(server["env"]["AGENTPIPELINE_SESSION_ID"], "s-cli");
+        // args 为空：令牌只走 env，不走 argv。
+        assert_eq!(server["args"], serde_json::json!([]));
+    }
+
+    /// 配置文件：代理在场才写、0600、Drop 即删；代理不在场返回 None（降级）。
+    #[test]
+    fn the_mcp_config_file_is_private_and_gone_after_the_turn() {
+        let dir = std::env::temp_dir();
+        let proxy = dir.join(format!("fake-mcp-proxy-{}", ulid::Ulid::new()));
+        std::fs::write(&proxy, "#!/bin/sh\nexit 0\n").unwrap();
+        let config = McpConfigFile::create(&proxy, "http://127.0.0.1:8788", "tok-1", "s-cli")
+            .unwrap()
+            .expect("代理在场应有配置文件");
+        let body = std::fs::read(config.path()).unwrap();
+        assert!(String::from_utf8_lossy(&body).contains("AGENTPIPELINE_TOKEN"));
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(config.path())
+                .unwrap()
+                .permissions()
+                .mode();
+            assert_eq!(mode & 0o777, 0o600, "带着令牌的文件不能比私有更宽");
+        }
+        let path = config.path().to_path_buf();
+        drop(config);
+        assert!(!path.exists(), "Drop 即删：配置文件不许活过这一回合");
+        std::fs::remove_file(&proxy).unwrap();
+    }
+
+    #[test]
+    fn a_missing_proxy_means_no_config() {
+        let missing = std::env::temp_dir().join(format!("no-such-proxy-{}", ulid::Ulid::new()));
+        assert!(
+            McpConfigFile::create(&missing, "http://127.0.0.1:8788", "t", "s")
+                .unwrap()
+                .is_none()
+        );
+        // 测试缝的 override 原样带出（存在与否由 is_file 在 create 里判）。
+        assert_eq!(
+            resolve_mcp_proxy_program(Some(&missing)).as_deref(),
+            Some(missing.as_path())
+        );
+    }
+
     fn output(stdout: &str, exit: Option<i32>) -> CommandOutput {
         CommandOutput {
             command_id: None,
@@ -779,6 +957,7 @@ mod tests {
                 resume_session_id: None,
                 timeout_sec: 30,
                 session_id: String::new(),
+                mcp_config_path: None,
             },
         )
         .await

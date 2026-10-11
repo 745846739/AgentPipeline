@@ -6619,6 +6619,197 @@ async fn foreman_sessions_carry_engine_and_reject_unknown_engine() {
     assert!(body["error"].as_str().unwrap().contains("引擎"));
 }
 
+// ── CLI 通道（决策 427，票 talk-cli-engine 05）：提议创建 + DB 读面 ──────────────
+
+#[tokio::test]
+async fn the_cli_channel_creates_proposals_with_cli_origin_behind_its_gates() {
+    let api = api_with_foreman(FakeAgent::new(Script::new())).await;
+    let (_, body) = post(&api, "/foreman/sessions", json!({"engine": "cli"})).await;
+    let session_id = body["session"]["id"].as_str().unwrap().to_string();
+
+    // 正路：落一条提议，来路标 `cli`，进该班次的未决清单。
+    let (status, body) = post(
+        &api,
+        "/foreman/proposals",
+        json!({
+            "session_id": session_id,
+            "tool": "task",
+            "args": {"action": "cancel", "task_id": "t1"},
+            "summary": "取消任务 t1"
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["origin"], "cli");
+    assert_eq!(body["tool"], "task");
+    assert_eq!(body["status"], "pending");
+    let proposal_id = body["id"].as_str().unwrap().to_string();
+    let (_, listed) = get(&api, &format!("/foreman/proposals?session={session_id}")).await;
+    assert_eq!(listed["proposals"].as_array().unwrap().len(), 1);
+    assert_eq!(listed["proposals"][0]["id"], json!(proposal_id));
+    assert_eq!(listed["proposals"][0]["origin"], "cli");
+
+    // 第一道闸之外的第二道：API 班次不收 CLI 通道的提议。
+    let (_, body) = post(&api, "/foreman/sessions", json!({})).await;
+    let api_session = body["session"]["id"].as_str().unwrap().to_string();
+    let (status, body) = post(
+        &api,
+        "/foreman/proposals",
+        json!({
+            "session_id": api_session,
+            "tool": "task",
+            "args": {"action": "cancel", "task_id": "t1"},
+            "summary": "取消任务 t1"
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    assert!(
+        body["error"].as_str().unwrap().contains("CLI 引擎"),
+        "{body}"
+    );
+
+    // 班次不存在是 404——与「引擎不对」分开说。
+    let (status, body) = post(
+        &api,
+        "/foreman/proposals",
+        json!({
+            "session_id": "01NOPE",
+            "tool": "task",
+            "args": {"action": "cancel", "task_id": "t1"},
+            "summary": "取消任务 t1"
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND, "{body}");
+    assert!(body["error"].as_str().unwrap().contains("班次不存在"));
+
+    // 白名单：repair 不在 CLI 通道（执行分支要主进程修复链的 payload，代理造不出）。
+    let (status, body) = post(
+        &api,
+        "/foreman/proposals",
+        json!({
+            "session_id": session_id,
+            "tool": "repair",
+            "args": {"project_id": "p1", "action": "start"},
+            "summary": "拉一个修复 worktree"
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    assert!(
+        body["error"].as_str().unwrap().contains("暴露名单"),
+        "{body}"
+    );
+
+    // schema 浅校验：缺必填 / 键名打错 / enum 不收 / summary 空，全部 400。
+    for (args, summary) in [
+        (json!({}), "取消任务 t1"),
+        (json!({"action": "cancel", "taask_id": "t1"}), "取消任务 t1"),
+        (
+            json!({"action": "teleport", "task_id": "t1"}),
+            "取消任务 t1",
+        ),
+        (json!({"action": "cancel", "task_id": "t1"}), "   "),
+    ] {
+        let (status, body) = post(
+            &api,
+            "/foreman/proposals",
+            json!({"session_id": session_id, "tool": "task", "args": args, "summary": summary}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    }
+    // 被拒的那些一条都没落库。
+    let (_, listed) = get(&api, &format!("/foreman/proposals?session={session_id}")).await;
+    assert_eq!(
+        listed["proposals"].as_array().unwrap().len(),
+        1,
+        "校验面拒掉的载荷不许留行：{listed}"
+    );
+}
+
+#[tokio::test]
+async fn the_cli_read_face_serves_db_reads_only_and_leaves_a_ledger_row() {
+    let api = api_with_foreman(FakeAgent::new(Script::new())).await;
+    let (_, body) = post(&api, "/foreman/sessions", json!({"engine": "cli"})).await;
+    let session_id = body["session"]["id"].as_str().unwrap().to_string();
+
+    // 正路：read_board 在空 home 也照常应答（读数不是命令，空班是合法状态）。
+    let (status, body) = get(
+        &api,
+        &format!(
+            "/foreman/read/read_board?session={session_id}&args={}",
+            urlencoding_qs(json!({}))
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["tool"], "read_board");
+    let content = body["content"].as_str().unwrap();
+    assert!(
+        content.contains("board") || content.contains("tasks"),
+        "{content}"
+    );
+
+    // 台账一行：HTTP 读面每次动用都留痕（会话归属）。
+    let (_, commands) = get(&api, &format!("/foreman/commands?session={session_id}")).await;
+    let rows = commands["commands"].as_array().unwrap();
+    assert_eq!(rows.len(), 1, "{commands}");
+    assert!(rows[0]["command"]
+        .as_str()
+        .unwrap()
+        .starts_with("read_board "));
+
+    // 白名单：文件域不在读面上（CLI 原生工具承担）。
+    let (status, body) = get(
+        &api,
+        &format!(
+            "/foreman/read/read_file?session={session_id}&args={}",
+            urlencoding_qs(json!({"path": "README.md"}))
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    assert!(
+        body["error"].as_str().unwrap().contains("CLI 读面"),
+        "{body}"
+    );
+
+    // 第二道闸：API 班次不收；缺必填参数 400。
+    let (_, body) = post(&api, "/foreman/sessions", json!({})).await;
+    let api_session = body["session"]["id"].as_str().unwrap().to_string();
+    let (status, body) = get(
+        &api,
+        &format!("/foreman/read/read_board?session={api_session}"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    let (status, body) = get(
+        &api,
+        &format!("/foreman/read/read_task?session={session_id}"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    assert!(
+        body["error"].as_str().unwrap().contains("task_id"),
+        "{body}"
+    );
+}
+
+/// 查询参数里那段 JSON 的 url 编码（测试内手写的百分号编码，未保留字符集按 RFC 3986）。
+fn urlencoding_qs(args: Value) -> String {
+    args.to_string()
+        .bytes()
+        .map(|b| match b {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                (b as char).to_string()
+            }
+            _ => format!("%{b:02X}"),
+        })
+        .collect()
+}
+
 #[tokio::test]
 async fn foreman_sessions_can_be_created_renamed_and_archived() {
     let api = api_with_foreman(FakeAgent::new(Script::new())).await;
@@ -7688,6 +7879,7 @@ async fn seed_proposal(api: &Api, session_id: &str, tool: &str, args: Value) -> 
         .create_foreman_proposal(NewForemanProposal {
             kind: agentpipeline_core::storage::proposals::ForemanProposalKind::ApiCall,
             payload: None,
+            origin: agentpipeline_core::storage::proposals::FOREMAN_PROPOSAL_ORIGIN_API,
             session_id: session_id.to_string(),
             tool: tool.to_string(),
             args,
@@ -7886,6 +8078,7 @@ async fn a_proposal_whose_situation_changed_is_refused() {
         .create_foreman_proposal(NewForemanProposal {
             kind: agentpipeline_core::storage::proposals::ForemanProposalKind::ApiCall,
             payload: None,
+            origin: agentpipeline_core::storage::proposals::FOREMAN_PROPOSAL_ORIGIN_API,
             session_id: sid.clone(),
             tool: "task".into(),
             args: json!({"task_id": task_id, "action": "resume"}),
@@ -8473,6 +8666,7 @@ async fn seed_repair_proposal(
         .create_foreman_proposal(NewForemanProposal {
             kind: agentpipeline_core::storage::proposals::ForemanProposalKind::Repair,
             payload: Some(serde_json::to_value(outcome).unwrap()),
+            origin: agentpipeline_core::storage::proposals::FOREMAN_PROPOSAL_ORIGIN_API,
             session_id: session_id.to_string(),
             tool: "repair".to_string(),
             args: json!({"project_id": project_id}),

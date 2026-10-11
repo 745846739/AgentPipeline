@@ -64,6 +64,14 @@ pub const FOREMAN_PROPOSAL_EXPIRED: &str = "expired";
 /// 一次列出的提议上限（照会话列表的精神：这是给人看的清单，不是分页数据源）。
 pub const FOREMAN_PROPOSAL_LIST_LIMIT: usize = 200;
 
+/// 提议的**来路**（决策 427，迁移 0049）：它是谁提的。
+///
+/// `api` = API 值班长进程内工具执行提出的（决策 207 的既有语义）；`cli` = CLI 引擎
+/// 会话经 stdio MCP 代理 + HTTP 端点进来的。这一列只加信息、不改执行语义——人按键
+/// 之前有权分辨「这是机器夜里提的」；执行路径按 `(tool, args)` 跑，不看它。
+pub const FOREMAN_PROPOSAL_ORIGIN_API: &str = "api";
+pub const FOREMAN_PROPOSAL_ORIGIN_CLI: &str = "cli";
+
 /// 提议的状态（决策 207 的四个状态）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ForemanProposalStatus {
@@ -125,6 +133,9 @@ pub struct ForemanProposal {
     /// 人按停那一轮提的悬空提议**不作废**（显式修订 233③），于是这一列是它与正常来路的
     /// 提议之间唯一的差别——提议提在一轮没说完的话里，按之前值得多看一眼。
     pub stopped_round: bool,
+    /// **来路**（决策 427）：[`FOREMAN_PROPOSAL_ORIGIN_API`] / [`FOREMAN_PROPOSAL_ORIGIN_CLI`]。
+    /// 与 `stopped_round` 同族——来路列只加信息，不改执行语义。
+    pub origin: String,
     pub created_at: DateTime<Utc>,
     pub expires_at: DateTime<Utc>,
     pub status: ForemanProposalStatus,
@@ -150,11 +161,14 @@ pub struct NewForemanProposal {
     pub kind: ForemanProposalKind,
     /// 修复类的现场。
     pub payload: Option<Value>,
+    /// 来路（决策 427）。构造点**必须显式给**：API 通道给 `api`、HTTP 代理通道给 `cli`
+    /// ——来路是安全语义，不设缺省值，新增调用点漏写就是编译错误。
+    pub origin: &'static str,
 }
 
 const PROPOSAL_COLUMNS: &str = "id, session_id, tool, args_json, summary, situation_json, kind, \
-                                payload_json, claimed_at, stopped_round, created_at, expires_at, \
-                                status, resolved_at";
+                                payload_json, claimed_at, stopped_round, origin, created_at, \
+                                expires_at, status, resolved_at";
 
 #[derive(FromRow)]
 struct ForemanProposalRow {
@@ -168,6 +182,7 @@ struct ForemanProposalRow {
     payload_json: Option<String>,
     claimed_at: Option<String>,
     stopped_round: i64,
+    origin: String,
     created_at: String,
     expires_at: String,
     status: String,
@@ -199,6 +214,7 @@ impl ForemanProposalRow {
                 .transpose()?,
             claimed_at: self.claimed_at.as_deref().map(parse_ts).transpose()?,
             stopped_round: self.stopped_round != 0,
+            origin: self.origin,
             created_at: parse_ts(&self.created_at)?,
             expires_at: parse_ts(&self.expires_at)?,
             // status 决定这一轮在界面上是什么模样，认不出时按「已作废」读（见 `parse`），
@@ -229,8 +245,8 @@ impl Store {
         sqlx::query(
             "INSERT INTO kanban_foreman_proposals
              (id, session_id, tool, args_json, summary, situation_json, kind, payload_json,
-              claimed_at, created_at, expires_at, status, resolved_at)
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, NULL, ?, ?, ?, NULL)",
+              claimed_at, stopped_round, origin, created_at, expires_at, status, resolved_at)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, NULL, 0, ?, ?, ?, ?, NULL)",
         )
         .bind(&id)
         .bind(&new.session_id)
@@ -240,6 +256,7 @@ impl Store {
         .bind(new.situation.as_ref().map(Value::to_string))
         .bind(new.kind.as_str())
         .bind(new.payload.as_ref().map(Value::to_string))
+        .bind(new.origin)
         .bind(ts(now))
         .bind(ts(expires_at))
         .bind(FOREMAN_PROPOSAL_PENDING)
@@ -255,6 +272,7 @@ impl Store {
             kind: new.kind,
             payload: new.payload,
             claimed_at: None,
+            origin: new.origin.to_string(),
             // 落库时**恒 false**：来路这一列只由「人按停」那条路事后标（决策 294），
             // 而它标注的是「提出它的那一轮后来被停了」——落这一行时那件事还没发生。
             stopped_round: false,

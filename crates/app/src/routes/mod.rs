@@ -3,6 +3,7 @@
 pub mod compaction;
 pub mod foreman;
 pub mod foreman_engine;
+pub mod foreman_proxy;
 pub mod foreman_watch;
 pub mod market;
 pub mod notify;

@@ -51,6 +51,7 @@ function proposal(over: Partial<ForemanProposal> = {}): ForemanProposal {
     status: 'pending',
     // 来路（决策 294 / 票 09）：这个替身造的是正常来路的提议
     stopped_round: false,
+    origin: 'api',
     created_at: '2026-09-23T10:01:00Z',
     expires_at: '2026-09-23T10:11:00Z',
     resolved_at: null,

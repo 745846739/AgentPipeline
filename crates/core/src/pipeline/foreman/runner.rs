@@ -433,6 +433,13 @@ pub struct ForemanRunner {
     /// 回合至多 `settings.cli_engine_concurrency` 个，超限排队。一个 runner 一座闸
     /// ——`say` 与 `watch` 都经 [`Self::respond_cli`]，漏不掉。
     cli_limiter: Arc<tokio::sync::Semaphore>,
+    /// MCP 代理二进制的路径（决策 427，票 talk-cli-engine 05 的测试缝）：
+    /// `None` = 找主服务可执行文件的兄弟目录（同一次安装装出来的兄弟件）。
+    mcp_proxy_path: Option<std::path::PathBuf>,
+    /// MCP 代理回连的服务地址（决策 427）：**由 app 层给实际绑定的端口**——
+    /// 首选端口被占退让时（决策 213）core 侧没有任何一份对的读数，`Settings` 里
+    /// 也没有端口。`None` = 不挂提议通道（serve 忘了接时的降级形态）。
+    mcp_base_url: Option<String>,
 }
 
 impl ForemanRunner {
@@ -472,12 +479,27 @@ impl ForemanRunner {
             human_turns: HumanTurns::default(),
             cli_program: None,
             cli_limiter,
+            mcp_proxy_path: None,
+            mcp_base_url: None,
         }
     }
 
     /// 注入 CLI 引擎的程序路径（票 talk-cli-engine 02 的测试缝）。
     pub fn with_cli_program(mut self, program: std::path::PathBuf) -> Self {
         self.cli_program = Some(program);
+        self
+    }
+
+    /// 注入 MCP 代理二进制的路径（决策 427 / 票 talk-cli-engine 05 的测试缝）。
+    pub fn with_mcp_proxy_path(mut self, path: std::path::PathBuf) -> Self {
+        self.mcp_proxy_path = Some(path);
+        self
+    }
+
+    /// 注入 MCP 代理回连的服务地址（决策 427）：生产由 app 层给**实际绑定**的端口
+    /// （首选端口被占退让时 `settings.server.port` 不是真的那个，决策 213）。
+    pub fn with_mcp_base_url(mut self, base_url: String) -> Self {
+        self.mcp_base_url = Some(base_url);
         self
     }
 
@@ -1676,6 +1698,37 @@ impl ForemanRunner {
     ///
     /// 一期边界：停钮（决策 294）在 CLI 轮内不生效——CLI 是单进程整段执行，中途没有
     /// 检查点，超时由 [`cli_engine::CLI_TURN_TIMEOUT_SEC`] 兜底；流式三声道票 03 接。
+    /// MCP 配置文件（决策 427 / 票 talk-cli-engine 05）：代理在场才写。返回 `None`
+    /// 的三种来由各自记一行——「没有提议通道」不是错误，是降级，升格成回合失败
+    /// 会把「代理没装」变成「对讲台不能用」，比例失衡。
+    async fn mcp_config_for_cli_turn(&self, session_id: &str) -> Option<cli_engine::McpConfigFile> {
+        let proxy = cli_engine::resolve_mcp_proxy_program(self.mcp_proxy_path.as_deref());
+        let Some(proxy) = proxy else {
+            tracing::warn!(
+                "MCP 代理二进制不在场（找主服务可执行文件的兄弟目录），本回合不挂提议通道"
+            );
+            return None;
+        };
+        let token = match self.store.pairing_token().await {
+            Ok(token) => token,
+            Err(e) => {
+                tracing::warn!("配对令牌读不出来（{e}），本回合不挂提议通道");
+                return None;
+            }
+        };
+        let Some(base_url) = self.mcp_base_url.clone() else {
+            tracing::warn!("MCP 回连地址没给（serve 层应 with_mcp_base_url），本回合不挂提议通道");
+            return None;
+        };
+        match cli_engine::McpConfigFile::create(&proxy, &base_url, &token, session_id) {
+            Ok(config) => config,
+            Err(e) => {
+                tracing::warn!("MCP 配置文件写不出来（{e}），本回合不挂提议通道");
+                None
+            }
+        }
+    }
+
     async fn respond_cli(
         &self,
         session: &ForemanSession,
@@ -1712,6 +1765,11 @@ impl ForemanRunner {
             .cli_program
             .clone()
             .unwrap_or_else(|| std::path::PathBuf::from(cli_engine::CLI_FOREMAN_BINARY));
+        // MCP 提议通道（决策 427，票 talk-cli-engine 05）：代理在场才挂。令牌与
+        // 班次绑定经配置文件（0600、Drop 即删）进 claude 的子进程；代理不在场 /
+        // 令牌读不出来 / 配置写失败，回合都照跑——只是这一轮没有提议通道，
+        // 降级各自记一行，不立开关、不上报错误。
+        let mcp_config = self.mcp_config_for_cli_turn(&session.id).await;
         // 并发闸门（决策 423④）：一个回合（含其重建尝试）持一个许可，超限在这里排队。
         let _cli_permit = self
             .cli_limiter
@@ -1725,6 +1783,7 @@ impl ForemanRunner {
             resume_session_id: resume,
             timeout_sec: cli_engine::CLI_TURN_TIMEOUT_SEC,
             session_id: session.id.clone(),
+            mcp_config_path: mcp_config.as_ref().map(|f| f.path().to_path_buf()),
         };
 
         let program_str = program

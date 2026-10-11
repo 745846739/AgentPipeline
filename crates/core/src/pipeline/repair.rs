@@ -650,6 +650,8 @@ pub async fn propose_repair(
             situation: Some(situation),
             kind: crate::storage::proposals::ForemanProposalKind::Repair,
             payload: Some(serde_json::to_value(outcome)?),
+            // 修复提议由修复流程（进程内）落，来路恒 `api`（决策 427）。
+            origin: crate::storage::proposals::FOREMAN_PROPOSAL_ORIGIN_API,
         })
         .await
 }

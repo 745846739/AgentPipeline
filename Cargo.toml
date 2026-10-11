@@ -3,6 +3,7 @@ resolver = "2"
 members = [
     "crates/core",
     "crates/app",
+    "crates/mcp-proxy",
     "crates/testkit",
     "tests/e2e",
 ]

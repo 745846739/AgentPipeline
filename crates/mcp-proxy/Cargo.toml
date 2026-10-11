@@ -1,0 +1,16 @@
+[package]
+name = "agentpipeline-mcp-proxy"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "AgentPipeline 对讲台 CLI 引擎的 stdio MCP 薄代理（决策 427）：把 MCP 工具调用翻译成对既有 foreman HTTP 面的调用"
+
+# 二进制名与包名一致（cargo 默认）：主服务用 current_exe 的兄弟目录找它（票 05）。
+
+[dependencies]
+agentpipeline-core.workspace = true
+futures.workspace = true
+reqwest.workspace = true
+serde_json.workspace = true
+tokio = { workspace = true, features = ["full"] }

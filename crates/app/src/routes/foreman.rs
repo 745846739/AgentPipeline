@@ -1016,7 +1016,7 @@ pub fn proposal_status_label(status: ForemanProposalStatus) -> &'static str {
 ///
 /// `status` / `expires_at` 原样出去：界面的按钮灰不灰**由前端按 `expires_at` 自己算**
 /// （到点即灰，不必等后端把它标成 expired），而后端那份 status 是权威的最终态。
-fn proposal_wire(p: &ForemanProposal) -> serde_json::Value {
+pub(crate) fn proposal_wire(p: &ForemanProposal) -> serde_json::Value {
     json!({
         "id": p.id,
         "session_id": p.session_id,
@@ -1027,6 +1027,9 @@ fn proposal_wire(p: &ForemanProposal) -> serde_json::Value {
         // 来路（决策 294 / 票 09）：它来自一轮被人按停的话——那一条的正文里有一句
         // 没说完的结论，按之前多看一眼。界面据此在卡片上多写一行（不另加钮）。
         "stopped_round": p.stopped_round,
+        // 来路（决策 427 / 票 talk-cli-engine 05）：`api` = 值班长当面对话提的，
+        // `cli` = CLI 引擎班次经 MCP 代理进来的。面板按它分辨「机器夜里提的」。
+        "origin": p.origin,
         // 形态与载荷（票 12）：前端按 `kind` 决定渲染哪一块（diff + 闸门读数 vs 参数摘要）
         "kind": p.kind.as_str(),
         "payload": p.payload,

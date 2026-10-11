@@ -39,6 +39,7 @@ impl Fixture {
             .create_foreman_proposal(NewForemanProposal {
                 kind: agentpipeline_core::storage::proposals::ForemanProposalKind::ApiCall,
                 payload: None,
+                origin: agentpipeline_core::storage::proposals::FOREMAN_PROPOSAL_ORIGIN_API,
                 session_id: self.session_id.clone(),
                 tool: tool.to_string(),
                 args,
@@ -381,6 +382,7 @@ async fn args_and_situation_round_trip() {
         .create_foreman_proposal(NewForemanProposal {
             kind: agentpipeline_core::storage::proposals::ForemanProposalKind::ApiCall,
             payload: None,
+            origin: agentpipeline_core::storage::proposals::FOREMAN_PROPOSAL_ORIGIN_API,
             session_id: fx.session_id.clone(),
             tool: "task_action".into(),
             args: args.clone(),

@@ -51,6 +51,7 @@ impl ProposalSink for RecordingSink {
                 .create_foreman_proposal(NewForemanProposal {
                     kind: agentpipeline_core::storage::proposals::ForemanProposalKind::ApiCall,
                     payload: None,
+                    origin: agentpipeline_core::storage::proposals::FOREMAN_PROPOSAL_ORIGIN_API,
                     session_id,
                     tool,
                     args,

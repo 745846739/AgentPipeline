@@ -1261,6 +1261,12 @@ export interface ForemanProposal {
    * 「那份结论没说完，按之前多看一眼」。地位同 `expires_at`：只影响怎么读，不影响能不能按。
    */
   stopped_round: boolean;
+  /**
+   * **来路**（CLI 引擎一期）：`api` = 值班长当面对话提的；`cli` = CLI 引擎班次经
+   * MCP 提议通道进来的（通常产生在没人盯着的时段）。面板按它在名牌上多挂一枚
+   * 「CLI」标——地位与 `stopped_round` 同族：只影响怎么读，不影响能不能按。
+   */
+  origin: 'api' | 'cli';
   created_at: string;
   /**
    * 有效期到点（决策 207：TTL 10 分钟）。**前端按它自己算过期**，不等后端标。

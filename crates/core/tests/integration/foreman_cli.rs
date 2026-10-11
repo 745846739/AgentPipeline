@@ -76,6 +76,11 @@ fn write_script(path: &PathBuf, body: &str) {
 
 impl Fixture {
     async fn new(resume_fails: bool) -> Self {
+        Self::build(resume_fails, false).await
+    }
+
+    /// `mcp` = 额外造一个假的「代理二进制」并挂到 runner 上（票 05 的 args 断言用）。
+    async fn build(resume_fails: bool, mcp: bool) -> Self {
         let home = TestHome::new().unwrap();
         let store = Store::open(home.home().clone(), Arc::new(ManualClock::fixed()))
             .await
@@ -89,7 +94,7 @@ impl Fixture {
             &script_body(&fake_log.display().to_string(), resume_fails),
         );
         let recorder = Arc::new(testkit::SseRecorder::new());
-        let runner = ForemanRunner::new(
+        let mut runner = ForemanRunner::new(
             store.clone(),
             Settings::default(),
             home.home().clone(),
@@ -97,6 +102,13 @@ impl Fixture {
             recorder.clone(),
         )
         .with_cli_program(script);
+        if mcp {
+            let proxy = bin.join("agentpipeline-mcp-proxy");
+            std::fs::write(&proxy, "#!/bin/sh\nexit 0\n").unwrap();
+            runner = runner
+                .with_mcp_proxy_path(proxy)
+                .with_mcp_base_url("http://127.0.0.1:8788".into());
+        }
         Fixture {
             _home: home,
             store,
@@ -452,4 +464,67 @@ async fn first_turn_failure_is_a_turn_error_with_ledger() {
         messages.iter().any(|m| m.role == "system"),
         "失败轮落 system 账：{messages:?}"
     );
+}
+
+// ── MCP 提议通道（决策 427，票 talk-cli-engine 05）────────────────────────────
+
+/// 代理在场时本回合挂上 `--mcp-config`：flags、白名单放行、strict 三件都咬在
+/// 日志证据上；回合收口后临时配置文件**一个都不剩**（Drop 即删——里面带着令牌）。
+#[tokio::test]
+async fn cli_turn_attaches_the_mcp_proposal_channel_when_the_proxy_is_present() {
+    let f = Fixture::build(false, true).await;
+    let session_id = f.cli_session().await;
+    let turn = f
+        .runner
+        .say(Some(&session_id), "在吗")
+        .await
+        .expect("CLI 回合应成功");
+    assert_eq!(turn.reply, "你好，值班经理。");
+    let calls = f.calls();
+    assert_eq!(calls.len(), 1, "{calls:?}");
+    let call = &calls[0];
+    assert!(call.contains("--mcp-config "), "{call}");
+    assert!(call.contains("--strict-mcp-config"), "{call}");
+    assert!(
+        call.contains(
+            format!(
+                "mcp__{}",
+                agentpipeline_core::pipeline::foreman::CLI_MCP_SERVER_NAME
+            )
+            .as_str()
+        ),
+        "allowedTools 里要有 MCP 族放行：{call}"
+    );
+    // 配置文件用完即删：临时目录里不许留任何 agentpipeline-mcp-*.json。
+    let leftovers: Vec<_> = std::fs::read_dir(std::env::temp_dir())
+        .unwrap()
+        .filter_map(|e| e.ok())
+        .filter(|e| {
+            e.file_name()
+                .to_string_lossy()
+                .starts_with("agentpipeline-mcp-")
+        })
+        .collect();
+    assert!(
+        leftovers.is_empty(),
+        "临时 MCP 配置文件没清干净：{:?}",
+        leftovers.iter().map(|e| e.path()).collect::<Vec<_>>()
+    );
+}
+
+/// 代理不在场 = 本回合没有提议通道，但回合照跑（降级有界，不升格成失败）。
+#[tokio::test]
+async fn cli_turn_runs_without_the_proposal_channel_when_the_proxy_is_missing() {
+    // 不带 mcp 缝的 Fixture 不挂代理（current_exe 的兄弟目录在测试环境没有真代理——
+    // 就算有，也不给 base_url，照样走 None 的降级分支）。
+    let f = Fixture::new(false).await;
+    let session_id = f.cli_session().await;
+    let turn = f
+        .runner
+        .say(Some(&session_id), "在吗")
+        .await
+        .expect("没有代理，回合也应成功");
+    assert_eq!(turn.reply, "你好，值班经理。");
+    let calls = f.calls();
+    assert!(!calls[0].contains("--mcp-config"), "{:?}", calls[0]);
 }
