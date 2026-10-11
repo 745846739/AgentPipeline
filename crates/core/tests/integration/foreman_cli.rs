@@ -14,6 +14,7 @@ use std::sync::Arc;
 use agentpipeline_core::agent::client::{AgentResponse, LlmClient, LlmRequest};
 use agentpipeline_core::config::Settings;
 use agentpipeline_core::pipeline::foreman::ForemanRunner;
+use agentpipeline_core::sse::{Channel, SseEvent, ToolPhase};
 use agentpipeline_core::storage::foreman::{FOREMAN_ENGINE_CLI, FOREMAN_SESSION_KIND_TALK};
 use agentpipeline_core::storage::Store;
 use futures::future::BoxFuture;
@@ -37,6 +38,8 @@ struct Fixture {
     runner: ForemanRunner,
     /// 假 claude 的参数日志：每次调用一行（参数折行拍平）。
     fake_log: PathBuf,
+    /// SSE 录制器：流式桥的断言口（票 talk-cli-engine 03）。
+    recorder: Arc<testkit::SseRecorder>,
 }
 
 /// 假 claude：把 argv 拍平记进日志（消息里的换行不能把日志行弄碎，断言按次计数）。
@@ -85,12 +88,13 @@ impl Fixture {
             &script,
             &script_body(&fake_log.display().to_string(), resume_fails),
         );
+        let recorder = Arc::new(testkit::SseRecorder::new());
         let runner = ForemanRunner::new(
             store.clone(),
             Settings::default(),
             home.home().clone(),
             Arc::new(NeverLlm) as Arc<dyn LlmClient>,
-            Arc::new(testkit::SseRecorder::new()),
+            recorder.clone(),
         )
         .with_cli_program(script);
         Fixture {
@@ -98,6 +102,33 @@ impl Fixture {
             store,
             runner,
             fake_log,
+            recorder,
+        }
+    }
+
+    /// 带自定义脚本的构造（流式用例用：脚本要发 partial 事件行）。
+    async fn with_script(home: TestHome, store: Store, body: &str) -> Self {
+        let bin = home.scratch_dir("bin");
+        std::fs::create_dir_all(&bin).unwrap();
+        let script = bin.join("fake-claude");
+        let fake_log = bin.join("calls.log");
+        let wrapper = format!("#!/bin/sh\nFAKE_LOG='{}'\n", fake_log.display());
+        write_script(&script, &format!("{wrapper}{body}"));
+        let recorder = Arc::new(testkit::SseRecorder::new());
+        let runner = ForemanRunner::new(
+            store.clone(),
+            Settings::default(),
+            home.home().clone(),
+            Arc::new(NeverLlm) as Arc<dyn LlmClient>,
+            recorder.clone(),
+        )
+        .with_cli_program(script);
+        Fixture {
+            _home: home,
+            store,
+            runner,
+            fake_log,
+            recorder,
         }
     }
 
@@ -204,6 +235,83 @@ async fn resume_failure_rebuilds_with_digest_and_notice() {
             .any(|m| m.role == "system" && m.content.contains("已用台账摘要重建")),
         "重建必须显式告知（不静默）：{messages:?}"
     );
+}
+
+/// 真回合的流式桥（票 talk-cli-engine 03）：partial 增量实时出 SSE（带位置戳）、
+/// 工具事件 Start/End 成对、原始 stream-json 行不出现在事件流、收口行是权威值。
+#[tokio::test]
+async fn cli_turn_streams_three_channels_live() {
+    let home = TestHome::new().unwrap();
+    let store = Store::open(home.home().clone(), Arc::new(ManualClock::fixed()))
+        .await
+        .unwrap();
+    let f = Fixture::with_script(
+        home,
+        store,
+        r#"echo '{"type":"system","subtype":"init","session_id":"sess-1"}'
+echo '{"type":"stream_event","event":{"type":"content_block_delta","delta":{"type":"thinking_delta","thinking":"思"}}}'
+echo '{"type":"stream_event","event":{"type":"content_block_delta","delta":{"type":"text_delta","text":"逐字"}}}'
+echo '{"type":"assistant","message":{"content":[{"type":"tool_use","id":"t1","name":"Read","input":{"file_path":"a.rs"}}]}}'
+echo '{"type":"user","message":{"content":[{"type":"tool_result","tool_use_id":"t1","is_error":false,"content":"文件内容"}]}}'
+echo '{"type":"result","subtype":"success","is_error":false,"result":"查完了。","usage":{"input_tokens":9,"output_tokens":4}}'
+"#,
+    )
+    .await;
+    let session_id = f.cli_session().await;
+    let turn = f.runner.say(Some(&session_id), "查一下").await.unwrap();
+    assert_eq!(turn.reply, "查完了。", "收口权威值");
+
+    let events = f.recorder.events();
+    let deltas: Vec<_> = events
+        .iter()
+        .filter_map(|e| match e {
+            SseEvent::ConversationDelta {
+                channel, text, seq, ..
+            } => Some((*channel, text.as_str(), *seq)),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(deltas.len(), 2, "逐字文本 + 思考：{deltas:?}");
+    assert_eq!(deltas[0].0, Channel::Reasoning);
+    assert_eq!(deltas[1].0, Channel::Content);
+    assert!(
+        deltas.iter().all(|(_, _, seq)| seq.is_some()),
+        "增量都带位置戳"
+    );
+    let tools: Vec<_> = events
+        .iter()
+        .filter_map(|e| match e {
+            SseEvent::ToolEvent {
+                tool,
+                phase,
+                result,
+                ..
+            } => Some((tool.as_str(), *phase, result.as_deref())),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(tools.len(), 2, "Start + End：{tools:?}");
+    assert_eq!(tools[0].0, "Read");
+    assert_eq!(tools[0].1, ToolPhase::Start);
+    assert_eq!(tools[1].1, ToolPhase::End);
+    assert_eq!(tools[1].2, Some("文件内容"));
+    assert!(
+        events
+            .iter()
+            .all(|e| !matches!(e, SseEvent::CommandOutput { .. })),
+        "原始 stream-json 行不外发"
+    );
+
+    // 台账收口：in_flight 行写成完整行，终态以收口为准。
+    let messages = f
+        .store
+        .list_foreman_messages(&session_id, 10, None)
+        .await
+        .unwrap();
+    let assistant: Vec<_> = messages.iter().filter(|m| m.role == "assistant").collect();
+    assert_eq!(assistant.len(), 1);
+    assert_eq!(assistant[0].content, "查完了。");
+    assert_eq!(assistant[0].status, None);
 }
 
 #[tokio::test]

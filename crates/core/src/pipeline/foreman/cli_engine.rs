@@ -15,10 +15,15 @@
 
 use std::collections::BTreeMap;
 use std::path::Path;
+use std::sync::Arc;
 
+use super::{push_foreman_live_delta, LiveTurn, FOREMAN_AGENT_TYPE};
 use super::{ForemanSegment, ForemanTrace, FOREMAN_TOOL_RESULT_MAX_CHARS};
 use crate::agent::tools::CommandFinish;
+use crate::agent::tools::CommandSse;
 use crate::exec::{CommandOutput, CommandOwner, CommandRequest, CommandRunner, Rewrite, SpawnForm};
+use crate::sse::{Channel, SseEvent, SseSink, ToolPhase};
+use crate::storage::Store;
 use crate::types::{CommandSource, Node, Stage};
 use crate::Result;
 
@@ -77,6 +82,9 @@ pub struct CliTurnRequest {
     /// `--resume` 的续接锚；`None` = 开新 CLI 会话。
     pub resume_session_id: Option<String>,
     pub timeout_sec: u64,
+    /// 台账归属（决策 204④）：值班长的命令挂会话——挂了记录器（流式路径）就
+    /// 必须恰好一个归属，探针那种无归属形态只在无记录器时合法。
+    pub session_id: String,
 }
 
 /// 跑一轮：组装 argv → 经 exec 收口 spawn（决策 297）→ 逐行解析 stream-json。
@@ -111,6 +119,9 @@ pub async fn run_cli_turn_with_runner(
         req.message.clone(),
         "--output-format".into(),
         "stream-json".into(),
+        // 逐字（票 talk-cli-engine 03）：partial 才有 text_delta / thinking_delta，
+        // 没有它一次 assistant 消息只在收齐后整段出现——三声道就成了三声闷响。
+        "--include-partial-messages".into(),
         "--append-system-prompt".into(),
         req.system_prompt.clone(),
         "--disallowedTools".into(),
@@ -134,7 +145,7 @@ pub async fn run_cli_turn_with_runner(
     );
     let owner = CommandOwner {
         task_id: None,
-        session_id: None,
+        session_id: (!req.session_id.is_empty()).then_some(req.session_id.clone()),
         run_id: None,
         stage: Stage::Init,
         node: Node::Execute,
@@ -166,6 +177,211 @@ pub async fn run_cli_turn_with_runner(
         })
         .await?;
     Ok(parse_stream_json(&out))
+}
+
+/// 实时桥（票 talk-cli-engine 03）：exec 收口的**逐行推流**翻译成对讲台事件。
+///
+/// exec 的流式机构只会发 `SseEvent::CommandOutput`（推的是命令输出行）——值班长
+/// 要的是 `ConversationDelta` / `ToolEvent`。桥坐在两者之间：收到 CommandOutput
+/// 就把那一行当 stream-json 事件翻译，**原始行不外发**（stream-json 的行不是给人
+/// 看的命令输出）；其余事件原样转发。
+///
+/// 翻译口径：
+/// - `stream_event/content_block_delta` 的 `text_delta` / `thinking_delta` →
+///   `ConversationDelta`（content / reasoning 声道，决策 244），随广播推进在途现场
+///   （`push_foreman_live_delta`，位置戳随事件走）；
+/// - `assistant` 消息里的 `tool_use` → `ToolEvent::Start`（此刻完整 input 已知，
+///   且是 CLI 真去执行之前——与 API 路径的发射位同时态）；
+/// - `user` 消息里的 `tool_result` → `ToolEvent::End` / `Error`（带结果文本）。
+pub struct CliBridgeSink {
+    inner: Arc<dyn SseSink>,
+    session_id: String,
+    live: Arc<LiveTurn>,
+    tools: std::sync::Mutex<BTreeMap<String, (String, String)>>,
+}
+
+impl CliBridgeSink {
+    pub fn new(inner: Arc<dyn SseSink>, session_id: &str, live: Arc<LiveTurn>) -> Self {
+        CliBridgeSink {
+            inner,
+            session_id: session_id.to_string(),
+            live,
+            tools: std::sync::Mutex::new(BTreeMap::new()),
+        }
+    }
+
+    fn emit_delta(&self, channel: Channel, text: &str) {
+        if text.is_empty() {
+            return;
+        }
+        let stamp = push_foreman_live_delta(&self.session_id, channel, text);
+        self.inner.emit(SseEvent::ConversationDelta {
+            task_id: String::new(),
+            branch: String::new(),
+            run_id: 0,
+            agent_type: FOREMAN_AGENT_TYPE.to_string(),
+            session_id: self.session_id.clone(),
+            channel,
+            role: "assistant".into(),
+            text: text.to_string(),
+            prompt_tokens: 0,
+            completion_tokens: 0,
+            ledger_id: stamp.map(|(id, _)| id),
+            seq: stamp.map(|(_, seq)| seq),
+        });
+    }
+
+    fn emit_tool(
+        &self,
+        tool: &str,
+        phase: ToolPhase,
+        args_summary: &str,
+        args: &str,
+        result: Option<&str>,
+    ) {
+        let stamp = self.live.reserve_event_seq();
+        self.inner.emit(SseEvent::ToolEvent {
+            task_id: String::new(),
+            branch: String::new(),
+            run_id: 0,
+            agent_type: FOREMAN_AGENT_TYPE.to_string(),
+            session_id: self.session_id.clone(),
+            tool: tool.to_string(),
+            phase,
+            args_summary: args_summary.to_string(),
+            args: args.to_string(),
+            result: result.map(str::to_string),
+            ledger_id: Some(stamp.0),
+            seq: Some(stamp.1),
+        });
+    }
+
+    /// 一行 stream-json 事件的翻译。同步、无锁外 I/O：它挂在逐行推流上。
+    pub(crate) fn translate(&self, line: &str) {
+        let Ok(v) = serde_json::from_str::<serde_json::Value>(line) else {
+            return;
+        };
+        match v.get("type").and_then(|t| t.as_str()) {
+            Some("stream_event") => {
+                let Some(ev) = v.get("event") else { return };
+                if ev.get("type").and_then(|t| t.as_str()) != Some("content_block_delta") {
+                    return;
+                }
+                let Some(delta) = ev.get("delta") else { return };
+                match delta.get("type").and_then(|t| t.as_str()) {
+                    Some("text_delta") => {
+                        let text = delta.get("text").and_then(|t| t.as_str()).unwrap_or("");
+                        self.emit_delta(Channel::Content, text);
+                    }
+                    Some("thinking_delta") => {
+                        let text = delta.get("thinking").and_then(|t| t.as_str()).unwrap_or("");
+                        self.emit_delta(Channel::Reasoning, text);
+                    }
+                    _ => {}
+                }
+            }
+            Some("assistant") => {
+                let Some(content) = v
+                    .get("message")
+                    .and_then(|m| m.get("content"))
+                    .and_then(|c| c.as_array())
+                else {
+                    return;
+                };
+                for block in content {
+                    if block.get("type").and_then(|t| t.as_str()) != Some("tool_use") {
+                        continue;
+                    }
+                    let id = block
+                        .get("id")
+                        .and_then(|i| i.as_str())
+                        .unwrap_or_default()
+                        .to_string();
+                    let name = block
+                        .get("name")
+                        .and_then(|n| n.as_str())
+                        .unwrap_or("unknown")
+                        .to_string();
+                    let input = block.get("input").cloned().unwrap_or_default();
+                    let args_full = truncate_chars(
+                        &serde_json::to_string(&input).unwrap_or_default(),
+                        FOREMAN_TOOL_RESULT_MAX_CHARS,
+                    );
+                    let args_summary = truncate_chars(&compact_json(&input), 200);
+                    self.tools
+                        .lock()
+                        .unwrap()
+                        .insert(id, (name.clone(), args_full.clone()));
+                    self.emit_tool(&name, ToolPhase::Start, &args_summary, &args_full, None);
+                }
+            }
+            Some("user") => {
+                let Some(content) = v
+                    .get("message")
+                    .and_then(|m| m.get("content"))
+                    .and_then(|c| c.as_array())
+                else {
+                    return;
+                };
+                for block in content {
+                    let Some(id) = block.get("tool_use_id").and_then(|i| i.as_str()) else {
+                        continue;
+                    };
+                    let Some((name, args)) = self.tools.lock().unwrap().remove(id) else {
+                        continue;
+                    };
+                    let is_err = block
+                        .get("is_error")
+                        .and_then(|e| e.as_bool())
+                        .unwrap_or(false);
+                    let result = block
+                        .get("content")
+                        .map(result_content_text)
+                        .map(|r| truncate_chars(&r, FOREMAN_TOOL_RESULT_MAX_CHARS));
+                    self.emit_tool(
+                        &name,
+                        if is_err {
+                            ToolPhase::Error
+                        } else {
+                            ToolPhase::End
+                        },
+                        &truncate_chars(&args, 200),
+                        &args,
+                        result.as_deref(),
+                    );
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
+impl SseSink for CliBridgeSink {
+    fn emit(&self, event: SseEvent) {
+        if let SseEvent::CommandOutput { chunk, .. } = &event {
+            self.translate(chunk);
+            return;
+        }
+        self.inner.emit(event);
+    }
+}
+
+/// 流式入口（票 talk-cli-engine 03）：exec 收口挂上记录器（领 command_id，逐行推流
+/// 才会发射）与桥 sink，其余与 [`run_cli_turn_with_runner`] 同一条。
+pub async fn run_cli_turn_streaming(
+    program: &str,
+    req: CliTurnRequest,
+    store: &Store,
+    bridge: CliBridgeSink,
+) -> Result<CliTurnOutput> {
+    let runner = CommandRunner::new(Arc::new(crate::process::RealProcessKiller))
+        .with_recorder(Arc::new(store.clone()))
+        .with_sse(CommandSse {
+            sink: Arc::new(bridge),
+            task_id: String::new(),
+            branch: String::new(),
+        });
+    run_cli_turn_with_runner(&runner, program, req).await
 }
 
 /// stream-json 逐行解析 → 一轮产出（纯函数，宽容口径见模块头）。
@@ -548,6 +764,7 @@ mod tests {
                 system_prompt: "测试".into(),
                 resume_session_id: None,
                 timeout_sec: 30,
+                session_id: String::new(),
             },
         )
         .await

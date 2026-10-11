@@ -1664,6 +1664,10 @@ impl ForemanRunner {
     ) -> Result<ForemanTurn> {
         let briefing = build_briefing(&self.store).await?;
         let briefing_json = serde_json::to_value(&briefing)?;
+        // 在途半截行（票 talk-cli-engine 03）：与 API 路径同一机构——开工即建，
+        // 逐字增量经 [`cli_engine::CliBridgeSink`] 推进现场，收口写成完整行。
+        let live =
+            LiveTurn::begin(self.store.clone(), &session.id, Some(briefing_json.clone())).await?;
         let question = input.transcript_text();
         // 人格读盘与 API 路径同一形状：坏人格配置要在花掉一次 CLI 调用之前就失败。
         let persona = match cfg.as_ref().and_then(|c| c.persona_path.as_deref()) {
@@ -1692,13 +1696,20 @@ impl ForemanRunner {
             system_prompt: cli_engine::cli_system_prompt(persona.as_deref()),
             resume_session_id: resume,
             timeout_sec: cli_engine::CLI_TURN_TIMEOUT_SEC,
+            session_id: session.id.clone(),
         };
 
-        let first = cli_engine::run_cli_turn_with_program(
-            program
-                .to_str()
-                .ok_or_else(|| Error::Config("CLI 引擎程序路径不是 UTF-8".into()))?,
+        let program_str = program
+            .to_str()
+            .ok_or_else(|| Error::Config("CLI 引擎程序路径不是 UTF-8".into()))?
+            .to_string();
+        let make_bridge =
+            || cli_engine::CliBridgeSink::new(self.sse.clone(), &session.id, live.clone());
+        let first = cli_engine::run_cli_turn_streaming(
+            &program_str,
             make_request(user_text.clone(), session.cli_session_id.clone()),
+            &self.store,
+            make_bridge(),
         )
         .await?;
         // resume 失败即重建（决策 424③）：失败信号来自那一次调用本身，当场重跑一次。
@@ -1714,18 +1725,19 @@ impl ForemanRunner {
                 "{}引擎侧会话已失效，本轮以台账摘要重建。\n\n{digest}\n\n{user_text}",
                 cli_engine::CLI_REBUILT_MARK
             );
-            cli_engine::run_cli_turn_with_program(
-                program
-                    .to_str()
-                    .ok_or_else(|| Error::Config("CLI 引擎程序路径不是 UTF-8".into()))?,
+            cli_engine::run_cli_turn_streaming(
+                &program_str,
                 make_request(rebuilt_message, None),
+                &self.store,
+                make_bridge(),
             )
             .await?
         } else {
             first
         };
         if let Some(err) = out.error_text {
-            // 重建也失败 / 首轮即失败：外框（say / watch）会按类别落失败账。
+            // 在途行不留半截（与 API 路径同一条）：失败账由外框（say / watch）落。
+            live.discard("CLI 回合失败").await;
             return Err(Error::Llm(format!("CLI 引擎回合失败：{err}")));
         }
 
@@ -1762,22 +1774,24 @@ impl ForemanRunner {
         } else {
             out.reply.clone()
         };
-        self.store
-            .append_foreman_message(NewForemanMessage {
-                session_id: session.id.clone(),
-                role: FOREMAN_ROLE_ASSISTANT.to_string(),
-                content,
-                prompt_tokens: out.prompt_tokens,
-                completion_tokens: out.completion_tokens,
-                briefing_json: Some(briefing_json),
-                traces_json,
-                segments_json,
-                // CLI 一期没有写面（决策 424①）：改动清单恒空（不落空数组）。
-                changed_files_json: None,
-                thinking: (!out.thinking.trim().is_empty()).then_some(out.thinking.clone()),
-                ask_json: None,
-            })
-            .await?;
+        // 收口（票 talk-cli-engine 03）：写开工建的那条在途行，而不是追加新行——
+        // 台账最终形状与 API 路径逐字一致（一次回话 = user 行 + assistant 行），
+        // 终态以这里的权威值为准，直播途中的节流刷写全部作废。
+        live.close(NewForemanMessage {
+            session_id: session.id.clone(),
+            role: FOREMAN_ROLE_ASSISTANT.to_string(),
+            content,
+            prompt_tokens: out.prompt_tokens,
+            completion_tokens: out.completion_tokens,
+            briefing_json: Some(briefing_json),
+            traces_json,
+            segments_json,
+            // CLI 一期没有写面（决策 424①）：改动清单恒空（不落空数组）。
+            changed_files_json: None,
+            thinking: (!out.thinking.trim().is_empty()).then_some(out.thinking.clone()),
+            ask_json: None,
+        })
+        .await?;
 
         Ok(ForemanTurn {
             session: session.clone(),
