@@ -3488,3 +3488,21 @@ config.rs}`、`tests/e2e/tests/integration/stage_boundary.rs`、`docs/testing.md
 **验证**：mcp-proxy 9 测（暴露集镜像 17 断言、写工具必填 summary / 读工具不带、翻译形状、缺 summary 不出代理、通知不执行钉子、跨 crate 服务器名同源）；迁移 0049 用例（origin 回填 api + CHECK 挡非法值）；app 契约（端点校验面三闸、读面台账留痕）；workspace `cargo test` 全绿（0 failed）、前端 vitest 1217 全绿、fmt / clippy 零告警。
 
 **来源**：票 `talk-cli-engine/05` 实现轮（两处偏离已补记票面）；关联决策 427（spec 全文与本条的偏离对象）、424②（纪律边界）、207（态势指纹判据）、182（配对令牌）、247（同源第四处：广告集 / 执行白名单 / 人格纪律段 / MCP 名单）。
+### 决策 430 · 提议卡带「读法」：多义指令先说读法再动手，`reading` 列随卡下发（票 `foreman-work-record` 04，决策 422⑤ 的实施）
+
+**起因**：2026-10-08 班次 `01M4CDY9EC9M9FSSE236GJXYZC` 的最后一轮——用户只说 `push` 四个字符，两种读法都活着（屏幕上是「已合入 → main」，本仓合入后紧接着的 push 就是 `git push origin main`；上一轮结尾刚说过「要续跑我提 `resume: continue`，等你按」），模型的推理原文自己写着 "Ambiguous. Should first get board?"——**它看见了歧义，然后默默挑了一种**，落了一张 `task {action: resume, …}` 的卡。那张卡从提出到作废没被按过，轮的终点是「没有人在回答你」。问一句几乎零成本，猜错方向会去动另一个任务的游标——代价不对称，而它自己知道有歧义。
+
+**裁决**（照 422⑤ 的 (a)+(b)，两半闭环）：
+
+1. **(a) 治根在提示面**：工具纪律加一条「一条指令有**两种读法**时，不要默默挑一种动手」——拿不准就用 `ask` 问一句（决策 265 的选项问话）；有把握推进的把读法写进动作的 `reading` 参数。`reading` 半句只在**会动手的工具在场时**教（调用点按 `!mutating.is_empty()` 门控，与广告面同一条门——没有会落卡的工具时它无处可去）；追问半句永远在场。
+2. **(b) 兜底在卡面**：迁移 0050 给 `kanban_foreman_proposals` 加可空 `reading` 列——模型把它作为调用参数递进来，执行点（`ToolExecutor::propose`）**摘走**再落卡，`args` 回净：参数是「执行时按它走既有端点」的原样数据，卡面字段留在里面会被端点当成多余的键。空串与白空按没带处理（写了却不说，等于没说）。wire 加性出场（`proposal_wire` 出原话，没说出 `null`），前端卡面在摘要下多一行「读法：{原话}」，null 不渲染。
+3. **供给面一处**：`reading` 参数的 schema 由 `tool_defs` 统一注入给「会动手」的工具（判据 `mutates_something` 与闸门同一份事实源），九份参数表不各抄一遍；只读工具不注入——它的调用不落卡，塞一个用不上的参数是在教模型说废话。
+4. **可空、存量不编数**：读法是「这一次有没有歧义」的陈述，不是每张卡都有——NULL = 没说，不回填。与 428 的回填不同：那里旧 `created_at` 里恰好存着开工时刻、有东西可抄；这里没有可抄的东西，占位文就是编数（415 同款）。
+5. **修复提议恒 `None`**：修复卡的诊断结论由 `conclusion` 承载（它进 commit message），读法是多义指令下工具调用卡的事。
+6. **边界**：「提议要不要人按」的纪律（207 / 216）一字未动——`reading` 与 `stopped_round` 同族：只加信息、不改执行语义，只影响怎么读、不影响能不能按。CLI 引擎通道（427 / 429）的提议暂不接 `reading`：CLI 会话的提示面不走这套工具纪律，接它是另一张票的事；(c)（提议作废后自动重提）仍留在值守唤醒面，范围另算（422⑤ 原话）。
+
+**代价（接受）**：一条迁移（`ALTER TABLE` 加可空列，无回填）；工具 schema 注入多一处逻辑（单点）；提示词多一行。
+
+**验证**：迁移层 `foreman_proposal_reading_migration.rs`（老形态行 `Store::open` 后 `reading` 为 NULL、其余列原样；样板第三份副本顺手收进 `testkit::migrations::migrate_up_to`——rule of three）；存储层 `the_reading_round_trips_through_the_store_and_silence_stays_none`；闸点 `the_reading_is_lifted_out_of_the_args_and_the_args_stay_clean` / `a_call_without_a_reading_lands_a_card_with_none`（摘取、回净、缺席三态）；广告面 `the_reading_parameter_is_advertised_to_mutating_tools_only`（逐工具与 `mutates_something` 相等）；提示面 `the_discipline_tells_the_model_to_state_its_reading_before_acting`；L3 `proposal_wire_carries_the_reading_and_its_absence`。core 1430 全绿、app 353 全绿、前端 1217 全绿、§12.3 新行过 behavior-map、clippy / fmt / svelte-check 干净。评审两轴：Standards 无硬违规（采纳两处——迁移样板收拢、提示面门控对齐）；Spec 无缺失。手工面（409 / 410 / 411 三轮重演）留在票面，随部署兑现。
+
+**来源**：票 `foreman-work-record/04` 原文（实证出自 2026-10-08 班次 `01M4CDY9EC9M9FSSE236GJXYZC`，同 422⑤）；关联决策 422⑤（(a)+(b) 方向）、207 / 216（人按纪律，本条不动）、265（`ask` 结构化选项问话）、415（读不到不编数）、428（迁移姿态先例）、427 / 429（CLI 通道的边界）。
