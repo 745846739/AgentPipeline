@@ -53,6 +53,9 @@ impl ProposalSink for StoreProposalSink {
                     // 进程内工具执行提出的案：来路恒 `api`（决策 427）。CLI 通道不走这个
                     // sink——它经 HTTP 端点（`create_cli_proposal`）进来，来路才是 `cli`。
                     origin: crate::storage::proposals::FOREMAN_PROPOSAL_ORIGIN_API,
+                    // 读法（决策 430）：执行点已把 `reading` 从参数里摘走递进来——
+                    // 这里只递话，不再碰参数。
+                    reading: request.reading.clone(),
                 })
                 .await?;
             emit_proposal_event(&sse, &proposal);
@@ -93,6 +96,7 @@ pub async fn create_cli_proposal(
             task_id: None,
             tool: tool.to_string(),
             args: args.clone(),
+            reading: None,
         },
     )
     .await?;
@@ -106,6 +110,9 @@ pub async fn create_cli_proposal(
             kind: ForemanProposalKind::ApiCall,
             payload: None,
             origin: FOREMAN_PROPOSAL_ORIGIN_CLI,
+            // 读法（决策 430 的边界）：CLI 通道暂不接——CLI 会话的提示面不走
+            // 这套工具纪律，模型没有递读法的地方；接它是另一张票的事。
+            reading: None,
         })
         .await?;
     emit_proposal_event(sse, &proposal);
@@ -264,6 +271,7 @@ mod tests {
             task_id: None,
             tool: tool.into(),
             args,
+            reading: None,
         }
     }
 

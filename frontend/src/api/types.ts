@@ -1267,6 +1267,13 @@ export interface ForemanProposal {
    * 「CLI」标——地位与 `stopped_round` 同族：只影响怎么读，不影响能不能按。
    */
   origin: 'api' | 'cli';
+  /**
+   * **读法**（决策 430 / 票 foreman-work-record 04）：模型对一条多义指令的陈述——
+   * 「我按哪种读法理解的、依据对话里哪一句」。有这一行，按键前就看得到它理解成了
+   * 哪一头；`null` = 没说（多数卡没有歧义）。加性可选：只影响怎么读，不影响能不能按，
+   * 地位同 `stopped_round`。
+   */
+  reading?: string | null;
   created_at: string;
   /**
    * 有效期到点（决策 207：TTL 10 分钟）。**前端按它自己算过期**，不等后端标。

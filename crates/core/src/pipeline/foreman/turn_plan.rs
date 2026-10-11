@@ -406,13 +406,42 @@ fn tool_defs(available: &[&'static str]) -> Vec<ToolDef> {
     FOREMAN_TOOL_SPECS
         .iter()
         .filter(|spec| available.contains(&spec.name))
-        .map(|spec| ToolDef {
-            name: spec.name.to_string(),
-            description: spec.description.to_string(),
-            parameters: serde_json::from_str(spec.parameters)
-                .expect("清单里的参数 schema 必须是合法 JSON（单测钉住）"),
+        .map(|spec| {
+            let mut parameters: serde_json::Value = serde_json::from_str(spec.parameters)
+                .expect("清单里的参数 schema 必须是合法 JSON（单测钉住）");
+            // 读法参数（决策 430）：**只注入给会动手的工具**——只有它们会落提议卡，
+            // 读法是卡面的字段；只读工具的调用不落卡，塞一个用不上的参数是在教模型
+            // 说废话。注入在广告这一处做（不是九份 schema 各抄一遍），参数表保持
+            // 每个工具自己的形状，「同一件事只写一份」在这里是字面成立的。
+            if mutates_something(spec.name) {
+                if let Some(props) = parameters
+                    .get_mut("properties")
+                    .and_then(|p| p.as_object_mut())
+                {
+                    props.insert("reading".to_string(), reading_parameter());
+                }
+            }
+            ToolDef {
+                name: spec.name.to_string(),
+                description: spec.description.to_string(),
+                parameters,
+            }
         })
         .collect()
+}
+
+/// 读法参数的 schema（决策 430 / 票 foreman-work-record 04）。
+///
+/// 九个会动手的工具共用这一份描述文字；写成函数而不是常量，是因为它以
+/// `serde_json::Value` 注进各工具的 `properties`（参数表是 JSON 文本常量，
+/// 拼字符串会让「注入」退化成「第二份要漂移的副本」）。
+fn reading_parameter() -> serde_json::Value {
+    serde_json::json!({
+        "type": "string",
+        "description": "可选：这条指令若有多种读法，写明你按哪种理解、依据对话里的哪一句\
+             （例：按「把 main 推到远端」理解，依据是屏幕上的「已合入 → main」）。\
+             没有歧义就不要填。",
+    })
 }
 
 /// 系统提示词：`[须知][人格][工具纪律]`，人格可被 `persona_path` / `persona_append` 覆盖。
@@ -464,11 +493,41 @@ fn system_prompt(
         ));
     }
     out.push_str(&attribution_discipline());
+    out.push_str(&ambiguity_discipline(!mutating.is_empty()));
     out.push_str(
         "- 快照里已经有的（待拍板原因、在跑、失败、项目清单）不要再查一遍。\n\
          - 引用工位结论时必须标出它来自哪个工位、哪次运行。\n\
          - 你不知道的事就说不知道。",
     );
+    out
+}
+
+/// 多义指令的纪律（决策 430 / 票 foreman-work-record 04）——治根的那一半。
+///
+/// 事故形状（2026-10-08，班次 `01M4CDY9…` 的最后一轮）：指令只有 `push` 四个字符，
+/// 两种读法都有前文（屏幕上是「已合入 → main」，上一轮结尾刚说过「要续跑我提
+/// `resume: continue`」），模型的推理原文自己写着 "Ambiguous. Should first get
+/// board?"——**它看见了歧义，然后默默挑了一种**落了一张卡，轮的终点是
+/// 「没有人在回答你」。问一句几乎零成本，猜错方向会去动另一个任务的游标。
+///
+/// 两条出路都给，与卡面那一半（提议的 `reading` 列）闭环：能问就问（`ask` 工具，
+/// 决策 265 的结构化选项问话）；有把握推进就把读法写进动作参数 `reading`——
+/// 它随卡落库、随卡下发，按键的人在卡面上读得到「它按哪种读法理解、依据哪一句」。
+///
+/// `reading` 那半句**只在会动手的工具在场时教**（调用点按 `!mutating.is_empty()` 门控）
+/// ——它是卡面的字段，没有会落卡的工具时无处可去，教一个不存在的参数正是
+/// 「广告与事实漂移」要挡的那类事。追问那半句永远在场：该问就问，不挑工具集的场合。
+fn ambiguity_discipline(has_mutating_tools: bool) -> String {
+    let mut out = "- 一条指令有**两种读法**时，不要默默挑一种动手：\
+         拿不准就用 `ask` 问一句（「你要的是 A，还是 B？」）"
+        .to_string();
+    if has_mutating_tools {
+        out.push_str(
+            "；确实有把握推进的，把读法写进这个动作的 `reading` 参数\
+             ——「我按 X 理解，依据是你说的『……』」，它会随提议卡给值班经理看",
+        );
+    }
+    out.push_str("。\n");
     out
 }
 
@@ -699,6 +758,62 @@ mod tests {
         let plan = TurnPlan::assemble(facts(&s, &window, "问题"));
         assert!(plan.user_prompt.is_empty(), "user 槽位恒空（不变量 3）");
         assert!(plan.system_prompt.contains("## 工具纪律"));
+    }
+
+    /// 多义指令的纪律在场（决策 430 / 票 foreman-work-record 04，(a) 治根的那一半）：
+    /// 提示词要说清「先说读法再动手」的两条出路——追问（`ask`）或把读法写进
+    /// `reading` 参数。那条事故轮的模型自己都想到了歧义，缺的就是一句教它说出口的纪律。
+    #[test]
+    fn the_discipline_tells_the_model_to_state_its_reading_before_acting() {
+        let s = settings();
+        let window = vec![row(1, FOREMAN_ROLE_USER, "问题")];
+        let plan = TurnPlan::assemble(facts(&s, &window, "问题"));
+        assert!(
+            plan.system_prompt.contains("两种读法"),
+            "多义纪律在场：{:#}",
+            plan.system_prompt
+        );
+        assert!(plan.system_prompt.contains("`reading` 参数"));
+        assert!(plan.system_prompt.contains("`ask`"), "追问那条出路也在");
+    }
+
+    /// 读法参数**只广告给会动手的工具**（决策 430，(b) 兜底的那一半）：九个会落卡的工具
+    /// 的 schema 里都有 `reading`，只读工具的一个都没有——读法是卡面的字段，
+    /// 不落卡的调用没有地方放它。注入只此一处（`tool_defs`），九份参数表不各抄一遍。
+    #[test]
+    fn the_reading_parameter_is_advertised_to_mutating_tools_only() {
+        let all: Vec<&'static str> = FOREMAN_TOOL_SPECS.iter().map(|s| s.name).collect();
+        let defs = tool_defs(&all);
+        for def in &defs {
+            let has_reading = def.parameters["properties"]
+                .as_object()
+                .expect("properties 是对象")
+                .contains_key("reading");
+            assert_eq!(
+                has_reading,
+                mutates_something(&def.name),
+                "工具 {} 的 reading 广告与「会动手」判据不一致",
+                def.name
+            );
+            if has_reading {
+                assert_eq!(
+                    def.parameters["properties"]["reading"]["type"], "string",
+                    "reading 是一句陈述，恒为字符串"
+                );
+            }
+        }
+        // 点名两条边界：D 层的 `task`（恒提议）有、只读的 `read_task` 没有——
+        // 计数不写死（广告清单演进时这条不用跟着改），一致性判据交给上面的逐条相等。
+        let def_of = |n: &str| defs.iter().find(|d| d.name == n).expect("清单里必有");
+        assert!(def_of("task").parameters["properties"]
+            .get("reading")
+            .is_some());
+        assert!(
+            def_of("read_task").parameters["properties"]
+                .get("reading")
+                .is_none(),
+            "只读工具没有读法参数"
+        );
     }
 
     #[test]

@@ -3,44 +3,20 @@
 //! 最高风险的一步是回填的诚实性：旧 `created_at` 里存的恰好就是开工时刻（事故账的
 //! 病根正是它），迁移把它**原样**抄进 `started_at`、`created_at` 一字不动——存量行的
 //! 收口时刻已不可考，不许拿任何近似值冒充。做法照 `foreman_sessions_migration.rs` 的
-//! 先例：只跑到 0047，用原始 SQL 造出老形态的行，再走 `Store::open`（跑全量迁移）核对。
+//! 先例（样板已收进 `testkit::migrations::migrate_up_to`）：只跑到 0047，用原始 SQL
+//! 造出老形态的行，再走 `Store::open`（跑全量迁移）核对。
 
-use std::borrow::Cow;
 use std::sync::Arc;
 
 use agentpipeline_core::storage::foreman::FOREMAN_SESSION_KIND_TALK;
 use agentpipeline_core::storage::Store;
-use sqlx::sqlite::{SqliteConnectOptions, SqlitePoolOptions};
-use testkit::{ManualClock, TestHome};
-
-/// 把库迁到 `0047`（0048 之前的那一版）。
-async fn migrate_to_0047(db: &std::path::Path) -> sqlx::SqlitePool {
-    let mut migrator = sqlx::migrate!("src/storage/migrations");
-    migrator.migrations = Cow::Owned(
-        migrator
-            .migrations
-            .iter()
-            .filter(|m| m.version <= 47)
-            .cloned()
-            .collect(),
-    );
-    let options = SqliteConnectOptions::new()
-        .filename(db)
-        .create_if_missing(true)
-        .foreign_keys(true);
-    let pool = SqlitePoolOptions::new()
-        .max_connections(1)
-        .connect_with(options)
-        .await
-        .unwrap();
-    migrator.run(&pool).await.unwrap();
-    pool
-}
+use testkit::{migrations::migrate_up_to, ManualClock, TestHome};
 
 #[tokio::test]
 async fn the_started_at_backfill_copies_the_old_created_at_and_touches_nothing_else() {
     let home = TestHome::new().unwrap();
-    let pool = migrate_to_0047(&home.home().db_path()).await;
+    let mut migrator = sqlx::migrate!("src/storage/migrations");
+    let pool = migrate_up_to(&home.home().db_path(), 47, &mut migrator).await;
 
     // 老形态：一个班次 + 一对 user / assistant 行。assistant 行的 created_at 是**开工**
     // 时刻（事故账的口径）——00:48:23 开工的那一轮，台账里只有这个钟点。

@@ -1030,6 +1030,9 @@ pub(crate) fn proposal_wire(p: &ForemanProposal) -> serde_json::Value {
         // 来路（决策 427 / 票 talk-cli-engine 05）：`api` = 值班长当面对话提的，
         // `cli` = CLI 引擎班次经 MCP 代理进来的。面板按它分辨「机器夜里提的」。
         "origin": p.origin,
+        // 读法（决策 430 / 票 foreman-work-record 04）：多义指令下它按哪种读法理解、
+        // 依据哪一句。加性可选——`None` 出 null，老前端不读它照旧工作。
+        "reading": p.reading,
         // 形态与载荷（票 12）：前端按 `kind` 决定渲染哪一块（diff + 闸门读数 vs 参数摘要）
         "kind": p.kind.as_str(),
         "payload": p.payload,
@@ -1509,6 +1512,45 @@ mod tests {
         assert_eq!(
             wire["created_at"], "2026-10-11T01:26:25+00:00",
             "定稿（收口）时刻在场"
+        );
+    }
+
+    /// **读法随卡下发**（决策 430，票 foreman-work-record 04）：`proposal_wire` 是卡面的
+    /// 唯一序列化点——有读法的卡 `reading` 出原话，没说的出 `null`（加性可选，
+    /// 老前端不读照旧）。值级守它，与上一条同一姿态。
+    #[test]
+    fn proposal_wire_carries_the_reading_and_its_absence() {
+        use agentpipeline_core::storage::proposals::{ForemanProposal, ForemanProposalKind};
+        use chrono::{TimeZone, Utc};
+        let base = || ForemanProposal {
+            id: "01ABC".into(),
+            session_id: "s1".into(),
+            tool: "task".into(),
+            args: serde_json::json!({"action": "resume", "task_id": "t1"}),
+            summary: "让任务 t1 的 continue 继续".into(),
+            situation: None,
+            kind: ForemanProposalKind::ApiCall,
+            payload: None,
+            claimed_at: None,
+            stopped_round: false,
+            origin: "api".to_string(),
+            reading: Some("我按「把 main 推到远端」理解，依据是屏幕上的「已合入 → main」".into()),
+            created_at: Utc.with_ymd_and_hms(2026, 10, 11, 11, 8, 37).unwrap(),
+            expires_at: Utc.with_ymd_and_hms(2026, 10, 11, 11, 18, 37).unwrap(),
+            status: agentpipeline_core::storage::proposals::ForemanProposalStatus::Pending,
+            resolved_at: None,
+        };
+        let wire = super::proposal_wire(&base());
+        assert!(
+            wire["reading"].as_str().unwrap().contains("已合入 → main"),
+            "读法原话随卡出场"
+        );
+        let mut silent = base();
+        silent.reading = None;
+        assert_eq!(
+            super::proposal_wire(&silent)["reading"],
+            serde_json::Value::Null,
+            "没说读法的卡出 null，不编空串"
         );
     }
 }

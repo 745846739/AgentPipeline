@@ -21,6 +21,7 @@ pub mod git_fixture;
 pub mod home;
 pub mod killer;
 pub mod log_capture;
+pub mod migrations;
 pub mod mock_llm;
 pub mod repo_fixture;
 pub mod script;

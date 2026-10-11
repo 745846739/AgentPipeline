@@ -341,6 +341,11 @@ pub struct ProposalRequest {
     pub task_id: Option<String>,
     pub tool: String,
     pub args: serde_json::Value,
+    /// **读法**（决策 430 / 票 foreman-work-record 04）：模型对一条多义指令的
+    /// 「我按哪种读法理解的、依据哪一句」。调用参数里带 `reading` 字符串时由执行点
+    /// 摘走递到这里（`args` 回净——它是卡面字段，不是任何端点的参数）；没带就是
+    /// `None`，多数卡没有歧义。随卡落库、随卡下发，按键前看得见它理解成了哪一头。
+    pub reading: Option<String>,
 }
 
 /// 提议写入接缝（决策 188 / 207）。
@@ -1123,7 +1128,22 @@ impl ToolExecutor {
 
     /// 把一次调用落成提议（决策 188 / 207），返回回灌进对话的那句话。
     async fn propose(&self, call: &ToolCall, ctx: &ToolCallContext) -> Result<ToolOutcome> {
-        let args = Self::args(call)?;
+        let mut args = Self::args(call)?;
+        // 读法（决策 430 / 票 foreman-work-record 04）：多义指令的「我按哪种读法理解」。
+        // 模型把它作为调用参数递进来（工具纪律那一段教的），这里**摘走**再落卡：
+        // `args` 是「执行时按它走既有端点」的原样参数，卡面字段留在里面会被端点
+        // 当成多余的键——读法随卡（`reading` 列 / 卡面那一行），不随参数。
+        // 空串与白空按没带处理：写了却不说，等于没说。
+        let reading = match args.get("reading") {
+            Some(serde_json::Value::String(s)) => {
+                let s = s.trim();
+                (!s.is_empty()).then(|| s.to_string())
+            }
+            _ => None,
+        };
+        if let Some(map) = args.as_object_mut() {
+            map.remove("reading");
+        }
         let Some(sink) = &self.proposals else {
             // 不注入不放行：接上确认钮之前，需要人按键的动作只能被拒。
             return Err(Error::Validation(format!(
@@ -1138,6 +1158,7 @@ impl ToolExecutor {
                 task_id: (!ctx.task_id.is_empty()).then(|| ctx.task_id.clone()),
                 tool: call.name.clone(),
                 args,
+                reading,
             })
             .await?;
         Ok(ToolOutcome::ok(note))
@@ -4784,6 +4805,94 @@ mod tests {
             name: name.into(),
             arguments: args.to_string(),
         }
+    }
+
+    // ── 读法（决策 430 / 票 foreman-work-record 04）：读法随卡，不随参数 ──
+
+    struct RecordingSink(Mutex<Vec<ProposalRequest>>);
+
+    impl ProposalSink for RecordingSink {
+        fn propose(&self, request: ProposalRequest) -> BoxFuture<'static, Result<String>> {
+            self.0.lock().unwrap().push(request);
+            Box::pin(async { Ok("已生成一条待确认的提议（01ABC）。".to_string()) })
+        }
+    }
+
+    /// 多义指令的读法被**摘出参数、随卡落库**：模型把读法作为调用参数递进来
+    /// （工具纪律教的），执行点摘走它递给提议通道——`args` 回净，其余参数原样。
+    /// 参数是「执行时按它走既有端点」的原样数据，卡面字段留在里面会被端点当成
+    /// 多余的键。
+    #[tokio::test]
+    async fn the_reading_is_lifted_out_of_the_args_and_the_args_stay_clean() {
+        let Setup {
+            executor,
+            ctx,
+            _tmp,
+            ..
+        } = setup(Stage::ArchitectDesign);
+        let sink = Arc::new(RecordingSink(Mutex::new(Vec::new())));
+        let executor = executor.with_proposal_sink(sink.clone());
+        executor
+            .execute(
+                &call(
+                    "task",
+                    serde_json::json!({
+                        "action": "resume",
+                        "task_id": "01M4CD59",
+                        "resume_action": "continue",
+                        "reading":
+                            " 我按续跑那个任务理解，依据是上一轮说过「要续跑我提 resume: continue」。 "
+                    }),
+                ),
+                &ctx,
+            )
+            .await
+            .unwrap();
+        let got = sink.0.lock().unwrap();
+        assert_eq!(got.len(), 1, "调用落了一条提议");
+        let req = &got[0];
+        assert_eq!(
+            req.reading.as_deref(),
+            Some("我按续跑那个任务理解，依据是上一轮说过「要续跑我提 resume: continue」。"),
+            "读法被摘走（白空修掉——写了却不说，等于没说）"
+        );
+        assert!(
+            req.args.get("reading").is_none(),
+            "参数回净：卡面字段不随参数走"
+        );
+        assert_eq!(req.args["action"], "resume", "其余参数原样");
+        drop(got);
+        drop(_tmp);
+    }
+
+    /// 没带 `reading` 的调用照常落卡，读法是 `None`——多数卡没有歧义，
+    /// 不给「没说」编一个空读数。
+    #[tokio::test]
+    async fn a_call_without_a_reading_lands_a_card_with_none() {
+        let Setup {
+            executor,
+            ctx,
+            _tmp,
+            ..
+        } = setup(Stage::ArchitectDesign);
+        let sink = Arc::new(RecordingSink(Mutex::new(Vec::new())));
+        let executor = executor.with_proposal_sink(sink.clone());
+        executor
+            .execute(
+                &call(
+                    "task",
+                    serde_json::json!({"action": "cancel", "task_id": "t1"}),
+                ),
+                &ctx,
+            )
+            .await
+            .unwrap();
+        let got = sink.0.lock().unwrap();
+        assert_eq!(got.len(), 1);
+        assert_eq!(got[0].reading, None);
+        assert_eq!(got[0].args["action"], "cancel");
+        drop(got);
+        drop(_tmp);
     }
 
     #[tokio::test]

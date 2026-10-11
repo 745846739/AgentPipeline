@@ -4,45 +4,21 @@
 //! 迁移要新建会话表、给消息加列并回填、把命令表整个重建（`task_id` 改可空 + 加 `session_id`）。
 //! 中间任何一步写错，用户打开应用看到的是一条「迁移失败」——而不是一个还能用的台账。
 //!
-//! 做法：用 sqlx 的迁移器**只跑到 0011**，用原始 SQL 造出老形态的行，再走 `Store::open`
+//! 做法：用 sqlx 的迁移器**只跑到 0011**（样板在 `testkit::migrations::migrate_up_to`），
+//! 用原始 SQL 造出老形态的行，再走 `Store::open`
 //! （它跑全量迁移）确认：不炸、老消息进了第一个会话、老命令还在、且仍是任务口径。
 
-use std::borrow::Cow;
 use std::sync::Arc;
 
 use agentpipeline_core::storage::foreman::FOREMAN_SESSION_KIND_TALK;
 use agentpipeline_core::storage::Store;
-use sqlx::sqlite::{SqliteConnectOptions, SqlitePoolOptions};
-use testkit::{ManualClock, TestHome};
-
-/// 把库迁到 `0011`（即 0012 之前的那一版）。
-async fn migrate_to_0011(db: &std::path::Path) -> sqlx::SqlitePool {
-    let mut migrator = sqlx::migrate!("src/storage/migrations");
-    migrator.migrations = Cow::Owned(
-        migrator
-            .migrations
-            .iter()
-            .filter(|m| m.version <= 11)
-            .cloned()
-            .collect(),
-    );
-    let options = SqliteConnectOptions::new()
-        .filename(db)
-        .create_if_missing(true)
-        .foreign_keys(true);
-    let pool = SqlitePoolOptions::new()
-        .max_connections(1)
-        .connect_with(options)
-        .await
-        .unwrap();
-    migrator.run(&pool).await.unwrap();
-    pool
-}
+use testkit::{migrations::migrate_up_to, ManualClock, TestHome};
 
 #[tokio::test]
 async fn a_legacy_database_migrates_and_its_messages_land_in_the_first_session() {
     let home = TestHome::new().unwrap();
-    let pool = migrate_to_0011(&home.home().db_path()).await;
+    let mut migrator = sqlx::migrate!("src/storage/migrations");
+    let pool = migrate_up_to(&home.home().db_path(), 11, &mut migrator).await;
 
     // 老形态的数据：项目 / 任务（命令的归属，旧表 task_id NOT NULL）+ 两条对讲台消息 + 一条命令。
     sqlx::query(
@@ -138,7 +114,8 @@ async fn a_legacy_database_migrates_and_its_messages_land_in_the_first_session()
 async fn an_empty_legacy_database_gains_no_session() {
     // 没有消息就没有「第一次值班」这回事：新库从零开始，首个会话在第一次说话时创建。
     let home = TestHome::new().unwrap();
-    let pool = migrate_to_0011(&home.home().db_path()).await;
+    let mut migrator = sqlx::migrate!("src/storage/migrations");
+    let pool = migrate_up_to(&home.home().db_path(), 11, &mut migrator).await;
     pool.close().await;
 
     let clock = ManualClock::fixed();

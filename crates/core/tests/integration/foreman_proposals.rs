@@ -40,6 +40,7 @@ impl Fixture {
                 kind: agentpipeline_core::storage::proposals::ForemanProposalKind::ApiCall,
                 payload: None,
                 origin: agentpipeline_core::storage::proposals::FOREMAN_PROPOSAL_ORIGIN_API,
+                reading: None,
                 session_id: self.session_id.clone(),
                 tool: tool.to_string(),
                 args,
@@ -61,6 +62,65 @@ impl Fixture {
             .as_str()
             .to_string()
     }
+}
+
+/// 读法随卡落库、随卡读回（决策 430 / 票 foreman-work-record 04）：带读法的提议
+/// 原话存在那一格里；没说的读法读回来是 `None`——「没说」不编成空串。
+#[tokio::test]
+async fn the_reading_round_trips_through_the_store_and_silence_stays_none() {
+    let fx = fixture().await;
+    let with = fx
+        .store
+        .create_foreman_proposal(NewForemanProposal {
+            session_id: fx.session_id.clone(),
+            tool: "task".into(),
+            args: json!({"action": "resume", "task_id": "t1"}),
+            summary: "让任务 t1 的 continue 继续".into(),
+            situation: None,
+            kind: agentpipeline_core::storage::proposals::ForemanProposalKind::ApiCall,
+            payload: None,
+            origin: agentpipeline_core::storage::proposals::FOREMAN_PROPOSAL_ORIGIN_API,
+            reading: Some(
+                "我按「续跑那个任务」理解，依据是上一轮说过「要续跑我提 resume: continue」。"
+                    .into(),
+            ),
+        })
+        .await
+        .unwrap();
+    let got = fx
+        .store
+        .get_foreman_proposal(&with.id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        got.reading.as_deref(),
+        Some("我按「续跑那个任务」理解，依据是上一轮说过「要续跑我提 resume: continue」。"),
+        "读法原话原样读回"
+    );
+
+    let silent = fx
+        .store
+        .create_foreman_proposal(NewForemanProposal {
+            session_id: fx.session_id.clone(),
+            tool: "write_file".into(),
+            args: json!({"path": "a.md", "content": "x"}),
+            summary: "写入文件 a.md".into(),
+            situation: None,
+            kind: agentpipeline_core::storage::proposals::ForemanProposalKind::ApiCall,
+            payload: None,
+            origin: agentpipeline_core::storage::proposals::FOREMAN_PROPOSAL_ORIGIN_API,
+            reading: None,
+        })
+        .await
+        .unwrap();
+    let got = fx
+        .store
+        .get_foreman_proposal(&silent.id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(got.reading, None, "没说就是没说，不编");
 }
 
 /// 有效期由**存储层**按决策 207 的 10 分钟给，不由调用方各写一遍。
@@ -383,6 +443,7 @@ async fn args_and_situation_round_trip() {
             kind: agentpipeline_core::storage::proposals::ForemanProposalKind::ApiCall,
             payload: None,
             origin: agentpipeline_core::storage::proposals::FOREMAN_PROPOSAL_ORIGIN_API,
+            reading: None,
             session_id: fx.session_id.clone(),
             tool: "task_action".into(),
             args: args.clone(),

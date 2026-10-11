@@ -112,6 +112,7 @@ async fn origin_is_checked_at_the_write_point() {
             situation: None,
             kind: agentpipeline_core::storage::proposals::ForemanProposalKind::ApiCall,
             payload: None,
+            reading: None,
             origin: FOREMAN_PROPOSAL_ORIGIN_CLI,
         })
         .await
@@ -134,6 +135,7 @@ async fn origin_is_checked_at_the_write_point() {
             situation: None,
             kind: agentpipeline_core::storage::proposals::ForemanProposalKind::ApiCall,
             payload: None,
+            reading: None,
             origin: "mcp",
         })
         .await;

@@ -1,0 +1,17 @@
+-- 决策 430（票 foreman-work-record 04）：提议卡面带「我按哪种读法理解的」那一格。
+--
+-- 事故形状（2026-10-08，班次 01M4CDY9EC9M9FSSE236GJXYZC 的最后一轮）：用户只说了
+-- `push`（4 个字符），屏幕上是「已合入 → main」、上一轮结尾刚说过「要续跑我提
+-- `resume: continue`，等你按」——两种读法都活着，模型的推理原文自己写着
+-- "Ambiguous. Should first get board?"，然后**默默挑了一种**落了一张
+-- `task {action: resume, ...}` 的卡。卡片落地前后没有任何一处表明它理解成了什么，
+-- 轮的终点是「没有人在回答你」。
+--
+-- reading：模型对一条**多义指令**的读法陈述（按哪种理解 + 依据对话里哪一句）。
+-- 只加信息、不改执行语义——执行路径按 `(tool, args)` 跑，不看它（与 stopped_round /
+-- 迁移 0049 的来路列同一姿态）。
+--
+-- **可空、存量不回填**：读法是「这一次调用有没有歧义」的陈述，不是每张卡都有；
+-- NULL = 没说（多数卡没有歧义，或那一次它没说）。不拿空串冒充「没有」，
+-- 与 briefing_json / traces_json 同一条「没有 ≠ 空集」口径。
+ALTER TABLE kanban_foreman_proposals ADD COLUMN reading TEXT;

@@ -652,6 +652,9 @@ pub async fn propose_repair(
             payload: Some(serde_json::to_value(outcome)?),
             // 修复提议由修复流程（进程内）落，来路恒 `api`（决策 427）。
             origin: crate::storage::proposals::FOREMAN_PROPOSAL_ORIGIN_API,
+            // 修复提议没有「读法」：诊断结论由 `conclusion` 承载（它进 commit message），
+            // 读法是**多义指令**下工具调用卡的事，修复流程自落的卡恒 None。
+            reading: None,
         })
         .await
 }

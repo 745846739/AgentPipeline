@@ -136,6 +136,15 @@ pub struct ForemanProposal {
     /// **来路**（决策 427）：[`FOREMAN_PROPOSAL_ORIGIN_API`] / [`FOREMAN_PROPOSAL_ORIGIN_CLI`]。
     /// 与 `stopped_round` 同族——来路列只加信息，不改执行语义。
     pub origin: String,
+    /// **读法**（决策 430 / 票 foreman-work-record 04）：模型对一条**多义指令**的陈述
+    /// ——「我按哪种读法理解的、依据对话里哪一句」。
+    ///
+    /// 只加信息、不改执行语义（与 `stopped_round` 同族）：执行按 `(tool, args)` 跑，
+    /// 不看它。`None` = 没说（多数卡没有歧义）——人按键前读卡面，有这一行就知道
+    /// 它是猜的哪一头；没有这一行不代表没歧义，那要靠提示面那一半（工具纪律）
+    /// 去治。**参数不掺它**：它随卡落库，从 `args` 里摘走后才落（见
+    /// `ToolExecutor::propose`），原样执行的纪律（`args` 的文档）不被一个卡面字段打破。
+    pub reading: Option<String>,
     pub created_at: DateTime<Utc>,
     pub expires_at: DateTime<Utc>,
     pub status: ForemanProposalStatus,
@@ -164,11 +173,14 @@ pub struct NewForemanProposal {
     /// 来路（决策 427）。构造点**必须显式给**：API 通道给 `api`、HTTP 代理通道给 `cli`
     /// ——来路是安全语义，不设缺省值，新增调用点漏写就是编译错误。
     pub origin: &'static str,
+    /// 读法（决策 430）。`None` = 没说；修复流程自落的卡恒 `None`（它的
+    /// `conclusion` 已承载诊断，读法是工具调用卡的事）。
+    pub reading: Option<String>,
 }
 
 const PROPOSAL_COLUMNS: &str = "id, session_id, tool, args_json, summary, situation_json, kind, \
-                                payload_json, claimed_at, stopped_round, origin, created_at, \
-                                expires_at, status, resolved_at";
+                                payload_json, claimed_at, stopped_round, origin, reading, \
+                                created_at, expires_at, status, resolved_at";
 
 #[derive(FromRow)]
 struct ForemanProposalRow {
@@ -183,6 +195,7 @@ struct ForemanProposalRow {
     claimed_at: Option<String>,
     stopped_round: i64,
     origin: String,
+    reading: Option<String>,
     created_at: String,
     expires_at: String,
     status: String,
@@ -215,6 +228,9 @@ impl ForemanProposalRow {
             claimed_at: self.claimed_at.as_deref().map(parse_ts).transpose()?,
             stopped_round: self.stopped_round != 0,
             origin: self.origin,
+            // 读法是**观测类**字段（storage/mod.rs 的 Q6 分类）：老行没有它（迁移 0050
+            // 前落的卡），NULL 就是「没说」，不报错也不编。
+            reading: self.reading,
             created_at: parse_ts(&self.created_at)?,
             expires_at: parse_ts(&self.expires_at)?,
             // status 决定这一轮在界面上是什么模样，认不出时按「已作废」读（见 `parse`），
@@ -245,8 +261,9 @@ impl Store {
         sqlx::query(
             "INSERT INTO kanban_foreman_proposals
              (id, session_id, tool, args_json, summary, situation_json, kind, payload_json,
-              claimed_at, stopped_round, origin, created_at, expires_at, status, resolved_at)
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, NULL, 0, ?, ?, ?, ?, NULL)",
+              claimed_at, stopped_round, origin, reading, created_at, expires_at, status,
+              resolved_at)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, NULL, 0, ?, ?, ?, ?, ?, NULL)",
         )
         .bind(&id)
         .bind(&new.session_id)
@@ -257,6 +274,7 @@ impl Store {
         .bind(new.kind.as_str())
         .bind(new.payload.as_ref().map(Value::to_string))
         .bind(new.origin)
+        .bind(new.reading.clone())
         .bind(ts(now))
         .bind(ts(expires_at))
         .bind(FOREMAN_PROPOSAL_PENDING)
@@ -276,6 +294,7 @@ impl Store {
             // 落库时**恒 false**：来路这一列只由「人按停」那条路事后标（决策 294），
             // 而它标注的是「提出它的那一轮后来被停了」——落这一行时那件事还没发生。
             stopped_round: false,
+            reading: new.reading,
             created_at: now,
             expires_at,
             status: ForemanProposalStatus::Pending,

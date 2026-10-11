@@ -852,6 +852,7 @@ async fn a_repair_proposal_survives_the_night() {
             kind: ForemanProposalKind::ApiCall,
             payload: None,
             origin: agentpipeline_core::storage::proposals::FOREMAN_PROPOSAL_ORIGIN_API,
+            reading: None,
         })
         .await
         .unwrap();

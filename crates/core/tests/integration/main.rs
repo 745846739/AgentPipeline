@@ -25,6 +25,7 @@ mod foreman;
 mod foreman_cli;
 mod foreman_golden;
 mod foreman_proposal_origin_migration;
+mod foreman_proposal_reading_migration;
 mod foreman_proposals;
 mod foreman_sessions_migration;
 mod foreman_started_at_migration;
