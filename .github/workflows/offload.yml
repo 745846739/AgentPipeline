@@ -1,12 +1,17 @@
-# 重活外发(票 runner-offload/04/06):把确定性重活(cargo test / clippy / 构建)从
-# 106(2核/1GB/40G)搬到 GitHub hosted runner(4 核 16GB,公仓标准档免费)。
+# 重活外发(票 runner-offload/04/06,e2e 二期票 09):把确定性重活(cargo test / clippy /
+# 构建 / e2e 走查)从 106(2核/1GB/40G)搬到 GitHub hosted runner(4 核 16GB,公仓标准档免费)。
 #
 # 形态由共识钉死:
 #   · 输入 = 分支名 + commit SHA + 一条白名单命令——**只外发已提交状态**,未提交改动
-#     不外发;命令白名单(cargo test / clippy / build 前缀,无组合符)是工具层的**防注入面**
-#     (票 06),工作流侧不重复校验——能走到这里的调用者已经过了那道闸;
+#     不外发;命令白名单(cargo 三件套 + e2e 两件,可前置 NAME=value 环境变量赋值,无组合符)
+#     是工具层的**防注入面**(票 06/09),工作流侧不重复校验——能走到这里的调用者已经过了
+#     那道闸;
+#   · e2e 命令(playwright 走查)在 frontend/ 下跑(与本地 `cd frontend && …` 同一形态),
+#     其余命令在仓根跑——working-directory 按 command 形态分流;
 #   · 结果只回**文本**(退出码 + 日志),不回传任何产物——106→GitHub 实测约 197KB/s,
-#     73MB 二进制要 6 分钟以上,「只取结果」是共识决策;
+#     73MB 二进制要 6 分钟以上,「只取结果」是共识决策;e2e 的截图/报告例外地留在
+#     **GitHub artifact**(票 09,决策 382①),工具回执只带名字与取回方式,要看图的人
+#     用 `gh run download` 或网页;
 #   · 不碰 secrets(与 check.yml 同一姿态:默认门不打真网络,决策 142/194)。
 #
 # 触发者是 106 上的 agent(offload_run 工具,票 06):`gh workflow run` + `gh run list`
@@ -23,8 +28,12 @@ on:
         description: '要验证的 commit SHA'
         required: true
       command:
-        description: '白名单命令(cargo test / cargo clippy / cargo build 前缀)'
+        description: '白名单命令(cargo test/clippy/build、npx playwright test、bash scripts/e2e-artifacts.sh,可前置 NAME=value 赋值)'
         required: true
+      e2e:
+        description: '是否为 e2e/playwright 外发(offload_run 按 offload_artifact_name 判定后传入;人手 dispatch 不填 = false)'
+        required: false
+        default: 'false'
 
 # 同一分支只留最新一轮外发:agent 侧是串行循环,过期的验证没有意义。
 concurrency:
@@ -70,8 +79,41 @@ jobs:
           # 缓存按分支隔离:kanban 分支各自的增量互不污染。
           prefix-key: offload-${{ inputs.branch }}
       - run: rustup component add clippy rustfmt
+      # e2e 外发(票 09):前置三步只在 e2e 轮跑,cargo 命令一个都不白付。
+      #   ① 前端依赖与浏览器(npm ci 必须先于 ②——artifacts.sh 的前端构建要 node_modules);
+      #   ② 产物新鲜度守卫(scripts/e2e-artifacts.sh:前端源码比 dist 新先 npm run build,
+      #      再 cargo build -p app)——**必须在轮内跑**:每次 dispatch 都是全新 runner,
+      #      单独外发这条命令的构建产物不会留到 playwright 那一轮(票 09 review);
+      #   ③ 命令本体在 frontend/ 下跑(与本地 `cd frontend && UX_AUDIT=1 npx playwright
+      #      test` 同一形态);harness 的被测二进制缺省取 repoRoot/target/debug。
+      # 分流判据是工具层传来的 `e2e` 输入(工具层按 offload_artifact_name 判定)——
+      # 工作流不自己 contains,两份判据会漂。
+      - if: inputs.e2e == 'true'
+        name: 前端依赖与浏览器(e2e 前置一)
+        run: |
+          cd frontend
+          npm ci --no-audit --no-fund
+          npx playwright install --with-deps chromium
+      - if: inputs.e2e == 'true'
+        name: 产物新鲜度守卫 + 被测二进制构建(e2e 前置二)
+        run: bash scripts/e2e-artifacts.sh
+      # playwright 之外的命令在仓根跑(scripts/e2e-artifacts.sh 与 cargo 都按仓根路径
+      # 写)。三目用 `&& ||` 模拟——表达式里没有真三元。
       - id: command
+        working-directory: ${{ inputs.e2e == 'true' && 'frontend' || '.' }}
         run: ${{ env.OFFLOAD_COMMAND }}
+      # 产物通道(票 09,决策 382①):e2e 的截图/报告留 artifact,不回传 106。
+      # `if: always()`——失败轮的截图(only-on-failure)恰恰是最要看的;绿轮可能
+      # 一张都没有,if-no-files-found: ignore 兜住。
+      - if: always() && inputs.e2e == 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: offload-e2e-${{ inputs.sha }}
+          path: |
+            .scratch/ux-audit*/
+            frontend/test-results/
+            frontend/playwright-report/
+          if-no-files-found: ignore
       - if: always()
         name: 结果落 summary(文本回传的载体)
         run: |

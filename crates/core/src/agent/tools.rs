@@ -3031,6 +3031,10 @@ impl ToolExecutor {
         let started = std::time::Instant::now();
         // dispatch 之前记下的墙钟（RFC3339 UTC）：轮询的 createdAt 过滤线。
         let started_iso = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
+        // e2e 分流的唯一判据在工具层（[`offload_artifact_name`]），经 dispatch 输入传给
+        // 工作流——工作流不自己 contains：Rust 前缀语义与 YAML 子串语义是两份判据，
+        // `cargo test # playwright test` 那类就会漂（票 09 review）。
+        let e2e = offload_artifact_name(command, sha).is_some();
         self.offload_shell(
             ctx,
             &format!("git push origin {branch}"),
@@ -3041,7 +3045,8 @@ impl ToolExecutor {
             ctx,
             &format!(
                 "gh workflow run offload.yml --ref {branch} -f branch={branch} \
-                 -f sha={sha} -f command='{command}'"
+                 -f sha={sha} -f command='{command}' -f e2e={}",
+                if e2e { "true" } else { "false" }
             ),
             OFFLOAD_STEP_TIMEOUT_SEC,
         )
@@ -3067,9 +3072,9 @@ impl ToolExecutor {
                     ctx,
                     &format!(
                         "gh run list --workflow=offload.yml --branch {branch} --limit 10 \
-                         --json databaseId,status,conclusion,headSha,createdAt \
+                         --json databaseId,status,conclusion,headSha,createdAt,url \
                          --jq '.[] | {{id: .databaseId, s: .status, c: (.conclusion // \"-\"), \
-                         short: .headSha[0:12], at: .createdAt}}'"
+                         short: .headSha[0:12], at: .createdAt, u: (.url // \"-\")}}'"
                     ),
                     OFFLOAD_STEP_TIMEOUT_SEC,
                 )
@@ -3083,13 +3088,13 @@ impl ToolExecutor {
             found = rows
                 .iter()
                 .find(|r| r.at >= started_iso && r.short == sha_prefix && r.s == "completed")
-                .map(|r| (r.id, r.c.clone()));
+                .map(|r| (r.id, r.c.clone(), r.u.clone()));
             if found.is_some() || std::time::Instant::now() >= deadline {
                 break;
             }
             tokio::time::sleep(self.offload_poll_interval).await;
         }
-        let Some((run_id, conclusion)) = found else {
+        let Some((run_id, conclusion, run_url)) = found else {
             let hint = if ever_saw_row {
                 String::new()
             } else {
@@ -3113,9 +3118,23 @@ impl ToolExecutor {
             .await?;
         let tail = log_tail(&log.stdout, OFFLOAD_LOG_TAIL_LINES);
         let elapsed = format_duration(started.elapsed());
+        // 产物通道（票 09，决策 382①）：e2e 命令的截图 / 报告留在 GitHub artifact，
+        // 回执只带名字与取回方式——「产物不回传」的共识不变（runner → 106 实测
+        // ~197KB/s），要看图的人 `gh run download` 或开网页。
+        let artifact_line = match offload_artifact_name(command, sha) {
+            Some(name) if run_url.is_empty() || run_url == "-" => format!(
+                "\n产物：GitHub artifact `{name}`（截图/报告不回传；\
+                 取回：gh run download {run_id} -n {name}）"
+            ),
+            Some(name) => format!(
+                "\n产物：GitHub artifact `{name}`（截图/报告不回传；\
+                 取回：gh run download {run_id} -n {name}，或网页 {run_url}）"
+            ),
+            None => String::new(),
+        };
         Ok(format!(
             "外发完成：command=`{command}` branch={branch} sha={} run={run_id} \
-             conclusion={conclusion} 耗时={elapsed}\n\
+             conclusion={conclusion} 耗时={elapsed}{artifact_line}\n\
              \x20—— GitHub Actions 日志尾部（最多 {OFFLOAD_LOG_TAIL_LINES} 行）——\n{tail}",
             &sha[..sha.len().min(12)],
         ))
@@ -3933,23 +3952,69 @@ const OFFLOAD_STEP_TIMEOUT_SEC: u64 = 300;
 const OFFLOAD_FALLBACK_TIMEOUT_SEC: u64 = 1800;
 const OFFLOAD_LOG_TAIL_LINES: usize = 200;
 
-/// 外发命令白名单（票 runner-offload/06 的**防注入面**）：只放行三类前缀的单条 cargo
-/// 命令。组合符 / 命令替换 / 重定向 / 引号 / `$` 一概拒——前缀白名单拦不住「后半段
-/// 藏着的东西」，这些字符在 cargo 命令里也没有正当用途；工作流的 `command` 输入
-/// 因此可以不重复校验（能走到 dispatch 的串已经过了这道闸）。
+/// 外发命令白名单（票 runner-offload/06 的**防注入面**；票 09 按决策 382① 扩 e2e）：
+/// 只放行白名单前缀的单条命令——cargo 三件套 + e2e 两件（构建守卫脚本 / playwright
+/// 走查）。组合符 / 命令替换 / 重定向 / 引号 / `$` 一概拒——前缀白名单拦不住「后半段
+/// 藏着的东西」，这些字符在 cargo / playwright 命令里也没有正当用途；工作流的 `command`
+/// 输入因此可以不重复校验（能走到 dispatch 的串已经过了这道闸）。
 pub(crate) fn offload_command_allowed(command: &str) -> Result<()> {
     offload_command_shape_allowed(command)?;
     let c = command.trim();
+    // 前缀匹配吃两种形态：裸命令，或**前导环境变量赋值**（票 09 的 `UX_AUDIT=1 …`）——
+    // 剥掉赋值后的余部照旧过同一份前缀表。剥取的词法边界见 [`strip_env_assignments`]。
     if !OFFLOAD_COMMAND_PREFIXES
         .iter()
-        .any(|p| c == *p || c.starts_with(&format!("{p} ")))
+        .any(|p| matches_offload_prefix(c, p))
+        && !strip_env_assignments(c).is_some_and(|base| {
+            OFFLOAD_COMMAND_PREFIXES
+                .iter()
+                .any(|p| matches_offload_prefix(base, p))
+        })
     {
         return Err(Error::Validation(format!(
-            "外发只收这三类前缀的命令：{}（收到 {c:?}）",
+            "外发只收这些前缀的命令：{}（收到 {c:?}；命令前可带 NAME=value 形态的环境变量赋值）",
             OFFLOAD_COMMAND_PREFIXES.join(" / ")
         )));
     }
     Ok(())
+}
+
+/// 单前缀命中（整串相等，或 `前缀␣` 开头）——白名单与 artifact 判据共用一份，
+/// 不留第二份可漂的实现。
+fn matches_offload_prefix(base: &str, prefix: &str) -> bool {
+    base == prefix || base.starts_with(prefix) && base[prefix.len()..].starts_with(' ')
+}
+
+/// 剥掉命令的**前导环境变量赋值**（票 runner-offload/09）：`UX_AUDIT=1 npx playwright test`
+/// → `Some("npx playwright test")`。词法收窄到 shell 赋值的最保守子形——`NAME` 是
+/// `[A-Z_][A-Z0-9_]*`（小写与数字开头一律不算赋值，故 `ux_audit=1 …` 整串仍按命令判、
+/// 前缀表不命中即拒），`value` 到下一个空白为止、可为空（`FOO= cmd` 把 FOO 置空是合法
+/// shell）；一连多个赋值逐个剥。value 的内容**不在这里审**：引号 / `$` / 组合符已被
+/// [`offload_command_shape_allowed`] 全局拒掉，能活到这一步的 value 注入不了任何东西。
+/// 剥不掉（首词不是赋值形）返回 `None`。
+fn strip_env_assignments(command: &str) -> Option<&str> {
+    let mut rest = command;
+    let mut stripped = false;
+    while let Some((name, tail)) = rest.split_once('=') {
+        let name_ok = !name.is_empty()
+            && !name.contains(char::is_whitespace)
+            && name.chars().enumerate().all(|(i, ch)| {
+                ch.is_ascii_uppercase() || ch == '_' || (i > 0 && ch.is_ascii_digit())
+            });
+        if !name_ok {
+            break;
+        }
+        stripped = true;
+        rest = match tail.split_once(' ') {
+            Some((_, after)) => after.trim_start(),
+            // value 是最后一个词 = 整条命令只剩赋值：余部为空，前缀表必然不命中
+            None => "",
+        };
+        if rest.is_empty() {
+            break;
+        }
+    }
+    stripped.then_some(rest)
 }
 
 /// 外发命令的**结构**防注入面（决策 398）：组合符 / 命令替换 / 重定向 / 引号 / `$`
@@ -3958,7 +4023,10 @@ pub(crate) fn offload_command_allowed(command: &str) -> Result<()> {
 /// 才准上远端」，跟口味无关，谁都不能放宽。
 pub(crate) fn offload_command_shape_allowed(command: &str) -> Result<()> {
     let c = command.trim();
-    const FORBIDDEN: [&str; 9] = [";", "&", "|", "`", "$(", "$", "\n", ">", "<"];
+    // `\t` / `\r` 也在列（票 09 review）：它们是 shell 的分词符或词内噪声，但前缀
+    // 白名单与环境变量剥取都只按 `' '` 分词——`UX_AUDIT=1<TAB>x npx playwright test`
+    // 会在 runner 上把 `x` 当命令执行，白名单看不见。控制字符在合法命令里没有位置。
+    const FORBIDDEN: [&str; 11] = [";", "&", "|", "`", "$(", "$", "\n", "\t", "\r", ">", "<"];
     if let Some(hit) = FORBIDDEN.iter().find(|f| c.contains(*f)) {
         return Err(Error::Validation(format!(
             "外发命令不含组合符 / 命令替换 / 重定向（命中 {hit:?}）：只放行单条命令"
@@ -4005,12 +4073,38 @@ pub(crate) fn offload_branch_allowed(branch: &str) -> Result<()> {
 }
 
 /// 白名单前缀（与 [`offload_command_allowed`] 同源；`cargo build` 之后的 flag 由 GitHub
-/// 侧的 1.98 工具链吃）。
-const OFFLOAD_COMMAND_PREFIXES: [&str; 3] = ["cargo test", "cargo clippy", "cargo build"];
+/// 侧的 1.98 工具链吃）。e2e 两件是票 09（决策 382①）扩的：构建守卫脚本照常在仓根跑；
+/// playwright 走查由工作流按 `working-directory: frontend` 跑（与本地 `cd frontend && …`
+/// 同一形态），环境变量赋值前缀（`UX_AUDIT=1 …`）由 [`strip_env_assignments`] 承接。
+const OFFLOAD_COMMAND_PREFIXES: [&str; 5] = [
+    "cargo test",
+    "cargo clippy",
+    "cargo build",
+    "npx playwright test",
+    "bash scripts/e2e-artifacts.sh",
+];
+
+/// playwright 走查的前缀（e2e 分流的判据：只有它产截图 / 报告、也只有它需要在
+/// frontend/ 下跑——工作流的分流不由自己再判，工具层经 dispatch 的 `e2e` 输入传过去）。
+const OFFLOAD_PLAYWRIGHT_PREFIX: &str = "npx playwright test";
+
+/// e2e 外发的 artifact 名（票 runner-offload/09）：只有 playwright 走查产截图 / 报告
+/// （构建守卫脚本不产任何产物）；返回 `None` = 该命令没有可上传的产物（工作流侧
+/// 不再自判，见 [`offload_dispatch_and_collect`] 的 `e2e` 输入）。名字带**全量** sha
+/// ——工作流上传与回执指引各写各的，靠「同一串」对上，不靠后缀约定。
+pub(crate) fn offload_artifact_name(command: &str, sha: &str) -> Option<String> {
+    let c = command.trim();
+    let is_playwright = [Some(c), strip_env_assignments(c)]
+        .into_iter()
+        .flatten()
+        .any(|b| matches_offload_prefix(b, OFFLOAD_PLAYWRIGHT_PREFIX));
+    is_playwright.then(|| format!("offload-e2e-{sha}"))
+}
 
 /// `gh run list --jq` 的一行（外发轮询的解析口径）：`short` 是 jq 侧截短的 headSha
 /// 前缀——40 位 hex 全量会被输出脱敏打码（见轮询处的注释），不能过 Rust 的手；
-/// `at` 是 run 的 createdAt（RFC3339 UTC，字典序可比），轮询只认 dispatch 之后创建的 run。
+/// `at` 是 run 的 createdAt（RFC3339 UTC，字典序可比），轮询只认 dispatch 之后创建的 run；
+/// `u` 是 run 页面 URL（票 09：e2e 回执指引「网页看图」用；老 gh 不认这个字段时缺省空）。
 #[derive(Debug, serde::Deserialize)]
 struct GhRunRow {
     id: u64,
@@ -4018,6 +4112,8 @@ struct GhRunRow {
     c: String,
     short: String,
     at: String,
+    #[serde(default)]
+    u: String,
 }
 
 /// 日志尾部：取最后 `take` 行（与 [`last_lines`] 的口径一致，这里吃原始文本）。
@@ -6136,6 +6232,72 @@ mod tests {
         }
     }
 
+    /// e2e 外发的白名单扩展（票 09，决策 382①）：两条新前缀 + 环境变量赋值前缀形态。
+    /// 赋值剥取的词法边界与防注入负例都在这一组里钉住。
+    #[test]
+    fn offload_whitelist_admits_e2e_commands_with_env_assignment_prefixes() {
+        for ok in [
+            // 前缀原形与带 flag 形
+            "bash scripts/e2e-artifacts.sh",
+            "UX_AUDIT=1 npx playwright test",
+            "UX_AUDIT=1 npx playwright test --project=chromium e2e/ux-audit-3.spec.ts",
+            // 多个赋值逐个剥（走查的实际用法：指被测二进制）
+            "UX_AUDIT3=1 AGENTPIPELINE_E2E_BIN=../target/debug/agent-pipeline npx playwright test",
+            // 空值赋值是合法 shell
+            "FOO= cargo test",
+            "UX_AUDIT= cargo test",
+            // 赋值前后的空白照 trim 收
+            "  UX_AUDIT=1  npx playwright test  ",
+        ] {
+            assert!(offload_command_allowed(ok).is_ok(), "应放行: {ok:?}");
+        }
+        for bad in [
+            // 赋值之后不是白名单前缀 = 拒（白名单管的是余部，不是放行一切）
+            "UX_AUDIT=1 rm -rf /",
+            "UX_AUDIT=1 npx playwright install --with-deps chromium",
+            "UX_AUDIT=1",
+            "UX_AUDIT=1 FOO=2",
+            // 词法边界：小写与带连字符的名字不算赋值，整串按命令判、不命中前缀
+            "ux_audit=1 npx playwright test",
+            "UX-AUDIT=1 npx playwright test",
+            // 不带赋值的 playwright install 不在白名单
+            "npx playwright install chromium",
+            "npx mocha test",
+            // 赋值形态不豁免结构防注入面（组合符 / 替换 / 重定向照旧全局拒）
+            "UX_AUDIT=1 npx playwright test; rm -rf /",
+            "UX_AUDIT=$(id) npx playwright test",
+            "UX_AUDIT=`id` npx playwright test",
+            "UX_AUDIT=1 npx playwright test > /tmp/x",
+            "UX_AUDIT=a b cargo test",
+            // tab 是 shell 分词符但白名单只按空格分词——`UX_AUDIT=1<TAB>x npx …` 会把
+            // `x` 当命令执行，结构面必须整串拒（票 09 review）
+            "UX_AUDIT=1\tx npx playwright test",
+            "cargo\ttest",
+        ] {
+            assert!(offload_command_allowed(bad).is_err(), "应拒绝: {bad:?}");
+        }
+    }
+
+    /// artifact 名只跟 playwright 走查走（票 09）：构建守卫脚本与 cargo 命令没有产物，
+    /// 回执不指引；名字带全量 sha，与工作流的上传名同一串。
+    #[test]
+    fn offload_artifact_name_follows_only_playwright_commands() {
+        let sha = "a".repeat(40);
+        assert_eq!(
+            offload_artifact_name("UX_AUDIT=1 npx playwright test", &sha),
+            Some(format!("offload-e2e-{sha}"))
+        );
+        assert_eq!(
+            offload_artifact_name("npx playwright test --project=chromium", &sha),
+            Some(format!("offload-e2e-{sha}"))
+        );
+        assert_eq!(
+            offload_artifact_name("bash scripts/e2e-artifacts.sh", &sha),
+            None
+        );
+        assert_eq!(offload_artifact_name("cargo test --workspace", &sha), None);
+    }
+
     /// 测试夹具：真 repo（干净 / 脏由调用方定）+ 假 `gh` / `git` 脚本目录 + Store + 记录器。
     struct OffloadFixture {
         _tmp: tempfile::TempDir,
@@ -6263,7 +6425,7 @@ mod tests {
     /// 就写死，会被自己人 createdAt 过滤线挡掉：at 早于 dispatch）。
     fn gh_row(sha: &str, id: u64, status: &str, conclusion: &str) -> String {
         format!(
-            "echo '{{\"id\":{id},\"s\":\"{status}\",\"c\":\"{conclusion}\",\"short\":\"{}\",\"at\":\"'$(date -u +%Y-%m-%dT%H:%M:%SZ)'\"}}'",
+            "echo '{{\"id\":{id},\"s\":\"{status}\",\"c\":\"{conclusion}\",\"short\":\"{}\",\"at\":\"'$(date -u +%Y-%m-%dT%H:%M:%SZ)'\",\"u\":\"https://github.com/acme/pipeline/actions/runs/{id}\"}}'",
             &sha[..12]
         )
     }
@@ -6416,6 +6578,46 @@ mod tests {
         // dispatch 必须带 --ref（106 真实链路验收抓的 bug）：不带则 run 记在默认
         // 分支头上，轮询的分支过滤永远查空。
         assert!(argv.contains("[--ref]"), "argv: {argv}");
+    }
+
+    /// e2e 命令的回执带 artifact 名与取回方式（票 09）：cargo 命令不带这一行
+    ///（happy path 用例顺带钉住），playwright 命令带名字 + download 指引 + run URL。
+    #[tokio::test]
+    async fn offload_run_of_a_playwright_command_names_the_artifact_in_the_receipt() {
+        let f = offload_fixture(gh_happy, false).await;
+        let out = f
+            .executor
+            .execute(
+                &call(
+                    "offload_run",
+                    serde_json::json!({"command": "UX_AUDIT=1 npx playwright test"}),
+                ),
+                &f.ctx,
+            )
+            .await
+            .unwrap();
+        assert!(out.content.contains("外发完成"), "{}", out.content);
+        assert!(
+            out.content.contains("offload-e2e-"),
+            "回执应带 artifact 名: {}",
+            out.content
+        );
+        assert!(
+            out.content.contains("gh run download 42 -n offload-e2e-"),
+            "回执应带 download 指引: {}",
+            out.content
+        );
+        assert!(
+            out.content
+                .contains("https://github.com/acme/pipeline/actions/runs/42"),
+            "回执应带 run 页面 URL: {}",
+            out.content
+        );
+        assert!(
+            !out.content.contains("已回退"),
+            "链路通就不该回退: {}",
+            out.content
+        );
     }
 
     #[tokio::test]

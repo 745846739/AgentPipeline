@@ -119,14 +119,17 @@ pub const TOOL_SPECS: [ToolSpec; 9] = [
     ToolSpec {
         name: OFFLOAD_RUN,
         description: "把一条重活命令外发给 GitHub Actions 跑（设置里「重活外发」开着才可用）。\
-                      只收 cargo test / cargo clippy / cargo build 前缀的命令，且只外发\
+                      只收 cargo test / cargo clippy / cargo build / \
+                      npx playwright test / bash scripts/e2e-artifacts.sh 前缀的命令\
+                      （命令前可带 NAME=value 形态的环境变量赋值，如 UX_AUDIT=1），且只外发\
                       **已提交**状态：当前分支会推到远端，工作区必须干净。\
-                      **只外发本机预计要跑几分钟以上的重活**（全量测试套件、冷构建）：\
+                      **只外发本机预计要跑几分钟以上的重活**（全量测试套件、冷构建、e2e 走查）：\
                       外发一轮有约 10 秒的链路固定开销、远端缓存还可能冷，本机几十秒\
                       就能跑完的增量检查 / 构建走 run_command 更快（实测净亏）。\
+                      e2e 命令的截图/报告留在 GitHub artifact（回执带名字与取回方式）。\
                       外发链路本身出问题会自动回退本机执行并说明；远端命令失败会带回\
                       退出码与日志尾部。",
-        parameters: r#"{"type":"object","properties":{"command":{"type":"string","description":"要外发的命令（仅 cargo test / cargo clippy / cargo build 前缀；不含 ; & | ` 换行 重定向 等组合符）"}},"required":["command"]}"#,
+        parameters: r#"{"type":"object","properties":{"command":{"type":"string","description":"要外发的命令（cargo test / cargo clippy / cargo build / npx playwright test / bash scripts/e2e-artifacts.sh 前缀，可前置 NAME=value 环境变量赋值；不含 ; & | ` 换行 重定向 等组合符）"}},"required":["command"]}"#,
     },
 ];
 
