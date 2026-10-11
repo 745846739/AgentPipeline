@@ -46,6 +46,9 @@ flate2 = "1"
 # 契约测试要造形状正确的推送订阅（pwa-webpush 02）：p256dh / auth 是 base64url ——
 # 与 core 同一条理由（0.22 已在依赖树里，提为直接依赖不引新下载）。
 base64.workspace = true
+# h2 真握手测试（决策 421，票 05）：axum 开 http2 后 h2 已在依赖树里（hyper 服务端 h2
+# 就是用它编的），提为 dev 依赖给测试当 h2 **客户端**，不引新下载。
+h2 = "0.4"
 tempfile.workspace = true
 testkit.workspace = true
 tokio = { workspace = true, features = ["full", "test-util"] }

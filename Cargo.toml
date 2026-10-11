@@ -15,7 +15,7 @@ license = "MIT"
 
 [workspace.dependencies]
 anyhow = "1"
-axum = { version = "0.8", features = ["macros"] }
+axum = { version = "0.8", features = ["macros", "http2"] }
 # Web Push 的 base64url 无填充编解码（票 pwa-webpush 02）：0.22 已在依赖树里
 # （rustls 一带的传递依赖），提为直接依赖不引新下载。
 base64 = "0.22"

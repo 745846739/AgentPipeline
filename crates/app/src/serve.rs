@@ -210,7 +210,7 @@ impl Transport {
             .with_context(|| {
                 format!("证书与私钥不配对（或证书链有误）：{cert_path} / {key_path}")
             })?;
-        // ALPN：**只宣告 http/1.1**（理由见 `alpn_protocols`）。
+        // ALPN：h2 与 http/1.1 都宣告（理由与历史教训见 `alpn_protocols`）。
         config.alpn_protocols = alpn_protocols();
         tracing::info!(cert = cert_path, key = key_path, "TLS 终止在本进程内");
         Ok(Transport::Tls(tokio_rustls::TlsAcceptor::from(Arc::new(
@@ -219,20 +219,22 @@ impl Transport {
     }
 }
 
-/// TLS 上宣告的 ALPN 名单（决策 335）：**只有 `http/1.1`**。
+/// TLS 上宣告的 ALPN 名单（决策 335 立此项；决策 421 起为 **`h2` + `http/1.1`**，票 05）。
 ///
-/// **为什么不能带 `h2`——实测的（2026-09-30）**：一开始两个都宣告了，理由是「浏览器谈 h2
-/// 才拿得到 HTTP/2」。可这个工作区的 axum 是 `features = ["macros"]`（默认特性里**没有
-/// `http2`**），hyper 的 auto builder 于是不会讲 h2：客户端见 ALPN 谈成 h2 便按 h2 发
-/// preface，服务端按 h1 解析——**连接当场被重置**。症状是 TLS 形态下**什么都打不开**
-/// （`curl` 报 `unexpected eof while reading` / `Connection reset by peer`），而
-/// `curl --http1.1` 一切正常：正因为错在「宣告了做不到的事」，不在 TLS 本身。
+/// **历史教训（2026-09-30 实测，留着别删）**：本名单曾经两个都宣告，可那时 axum 是
+/// `features = ["macros"]`（默认特性里**没有 `http2`**），hyper 的 auto builder 讲不了
+/// h2：客户端见 ALPN 谈成 h2 便按 h2 发 preface，服务端按 h1 解析——**连接当场被重置**。
+/// 症状是 TLS 形态下**什么都打不开**（`curl` 报 `unexpected eof while reading` /
+/// `Connection reset by peer`），而 `curl --http1.1` 一切正常：错在「宣告了做不到的事」，
+/// 不在 TLS 本身。当年因此退回只宣告 h1。
 ///
-/// 只宣告 h1 之后，TLS 形态与明文形态**行为一致**（都是 h1，SSE 的长连接照旧是已经验过
-/// 的那条路）。要上 h2 得先给 axum 开 `http2` 特性再验一轮握手与 SSE——那是另一笔账，
-/// 且这笔账**必须由真握手来结**（配置层的单测只能钉住「名单里没有 h2」这件事）。
+/// 现在 axum 已开 `http2` 特性（工作区 `Cargo.toml`），宣告的能力真的会讲——而这条纪律
+/// **不再只靠注释守**：`alpn_h2_negotiates_and_speaks_http2` 用真握手结这笔账（客户端只
+/// 收 h2，名单若虚报，这条会以当年一模一样的方式炸给你看）。浏览器在 TLS 上见 ALPN 谈成
+/// h2 就走多路复用；**明文形态不受影响**：浏览器不讲 h2c，本地桌面端照旧 h1——h2 只在
+/// TLS 上出现，这半句是故意的，别「顺手」给明文也加上。
 fn alpn_protocols() -> Vec<Vec<u8>> {
-    vec![b"http/1.1".to_vec()]
+    vec![b"h2".to_vec(), b"http/1.1".to_vec()]
 }
 
 /// 一次 TLS 握手愿意等的上限（决策 374）。
@@ -1165,19 +1167,18 @@ mod tests {
 
     /// 传输层的构造只做两件事：都没给 → 明文；给了就读盘解析、**失败即报**（决策 335）。
     ///
-    /// 真握手（客户端认证书、HTTP/2、SSE 不被缓冲）在 106 上按 `docs/operations.md` §12.17
-    /// 手验 + 每次部署由 `deploy.yml` 的外部检查打一发 https——**本仓不为它引证书生成依赖**
-    /// （rcgen 会带进 4 个新 crate，而这里要钉的是「配置错得响不响」，那几条用不着真证书）。
-    /// **`h2` 不许回到 ALPN 名单里**，除非 axum 那一侧真的开了 `http2` 特性（见 `alpn_protocols`
-    /// 的注释：宣告做不到的协议会让 TLS 形态整条打不开，而 `curl --http1.1` 却是好的——
-    /// 那是最容易误判成「证书有问题」的一种失败）。
+    /// 真握手（客户端认证书、HTTP/2、SSE 不被缓冲）**在本仓自己结账**（决策 421，票 05）：
+    /// 嵌入的静态自签证书对（`tests/fixtures/`，不为此引 rcgen）+ 真 h2 客户端，见
+    /// `alpn_h2_negotiates_and_speaks_http2`。历史纪律不变——**宣告的能力必须真会讲**（
+    /// `alpn_protocols` 注释里 2026-09-30 那次事故：宣告讲不了的 h2 让 TLS 形态整条打不开，
+    /// 而 `curl --http1.1` 却是好的，最容易误判成「证书有问题」）。本测试只钉名单的**形状**；
+    /// 「讲不讲得了」由真握手那条钉。
     #[test]
-    fn alpn_advertises_http11_only() {
-        let protocols = super::alpn_protocols();
-        assert_eq!(protocols, vec![b"http/1.1".to_vec()]);
-        assert!(
-            !protocols.iter().any(|p| p == b"h2"),
-            "h2 必须先给 axum 开 http2 特性再宣告"
+    fn alpn_advertises_h2_and_http11() {
+        assert_eq!(
+            super::alpn_protocols(),
+            vec![b"h2".to_vec(), b"http/1.1".to_vec()],
+            "ALPN 名单变了必须连着真握手测试一起改（alpn_h2_negotiates_and_speaks_http2）"
         );
     }
 
@@ -1715,6 +1716,15 @@ mod tests {
         }
     }
 
+    /// 把嵌入的测试证书对写进 `dir`（slowloris 与 h2 真握手两组用例共用一份夹具）。
+    fn write_test_tls_pair(dir: &std::path::Path) -> (std::path::PathBuf, std::path::PathBuf) {
+        let cert = dir.join("cert.pem");
+        let key = dir.join("key.pem");
+        std::fs::write(&cert, include_str!("../tests/fixtures/tls-test-cert.pem")).unwrap();
+        std::fs::write(&key, include_str!("../tests/fixtures/tls-test-key.pem")).unwrap();
+        (cert, key)
+    }
+
     /// slowloris 回归：一条「握了 TCP 却不发 ClientHello」的连接**不得**阻塞别的客户端。
     ///
     /// 旧实现把握手 await 在唯一的 accept 任务里且无超时——本测试在旧代码上会卡死在
@@ -1724,10 +1734,7 @@ mod tests {
         use axum::serve::Listener as _;
         // ① 服务端：测试证书走与生产**同一**解析路径（Transport::from_pem）。
         let dir = tempfile::tempdir().unwrap();
-        let cert = dir.path().join("cert.pem");
-        let key = dir.path().join("key.pem");
-        std::fs::write(&cert, include_str!("../tests/fixtures/tls-test-cert.pem")).unwrap();
-        std::fs::write(&key, include_str!("../tests/fixtures/tls-test-key.pem")).unwrap();
+        let (cert, key) = write_test_tls_pair(dir.path());
         let Transport::Tls(acceptor) =
             Transport::from_pem(Some(cert.to_str().unwrap()), Some(key.to_str().unwrap()))
                 .expect("测试证书应能解析")
@@ -1786,5 +1793,309 @@ mod tests {
             .expect("3s 内应等到服务端的收尸")
             .expect("read 不应报错");
         assert_eq!(eof, 0, "半开连接应被服务端主动关闭（读到 EOF）");
+    }
+
+    // ── 决策 421（票 05）：h2 上 TLS——宣告的能力必须真会讲 ──
+    //
+    // 服务端走**生产同一条接线**（`Transport::from_pem` → `TlsListener` →
+    // `into_serving_service`，axum 的 auto builder 靠 ALPN + preface 判协议），真 router、
+    // 真 store（TestHome 供库，不碰进程环境变量——见 port_stability.rs 文件头对
+    // `install_env` 并发干扰的警告，故不在这里用 `serve(ServeOptions)`）。客户端**只收
+    // h2**：服务端若讲不了，连接会以 2026-09-30 事故一模一样的方式被重置——这正是要钉住的
+    // 失败形状（「宣告了做不到的事」），而不是只看握手是否成功。
+    //
+    // 106 上的 curl --http2 验收（票 05 §验收第一条）由本组测试**预演**：同一接线、同一
+    // 协商机制；部署后仍按 operations.md §12.18 手验一遍真公网链路（本机与公网两条
+    // 核对命令都在那一节）。
+
+    /// 起一套带 TLS 的完整应用，返回绑定地址、TestHome（保目录）与 state（SSE 测试往
+    /// `state.sse` 推真事件）。证书写进家目录——TestHome 独占临时目录，句柄活着目录就在。
+    async fn spawn_tls_app() -> (std::net::SocketAddr, testkit::TestHome, AppState) {
+        use agentpipeline_core::config::Settings;
+
+        let home = testkit::TestHome::new().unwrap();
+        let (store, _clock) = home.setup().await.unwrap();
+        let state = AppState::new(store, home.home().clone(), Settings::default(), 8787);
+        let router = crate::build_router(state.clone());
+
+        let (cert, key) = write_test_tls_pair(home.home().root());
+        let Transport::Tls(acceptor) =
+            Transport::from_pem(Some(cert.to_str().unwrap()), Some(key.to_str().unwrap()))
+                .expect("测试证书应能解析")
+        else {
+            panic!("给了证书就必须是 TLS");
+        };
+
+        let (inner, bound) = bind_listener("127.0.0.1", 0).await.unwrap();
+        let mut listener = TlsListener::new(inner, acceptor);
+        listener.handshake_timeout = Duration::from_secs(5);
+        tokio::spawn(async move {
+            axum::serve(
+                listener.tap_io(|_: &mut _| {}),
+                into_serving_service(router),
+            )
+            .await
+            .expect("测试服务器不应报错退出");
+        });
+        (bound, home, state)
+    }
+
+    /// **只收 h2** 的 TLS 客户端（测试自签证书不校验；ALPN 名单只放 h2——服务端讲不了
+    /// 的话，`h2::client::handshake` 会吃到的就是 h1 错误位，用例必炸）。
+    async fn h2_connect(bound: std::net::SocketAddr) -> h2::client::SendRequest<axum::body::Bytes> {
+        let provider = Arc::new(rustls::crypto::ring::default_provider());
+        let schemes = provider
+            .signature_verification_algorithms
+            .supported_schemes();
+        let mut client_cfg = rustls::ClientConfig::builder_with_provider(provider)
+            .with_safe_default_protocol_versions()
+            .expect("默认协议版本应可用")
+            .dangerous()
+            .with_custom_certificate_verifier(Arc::new(NoVerify { schemes }))
+            .with_no_client_auth();
+        client_cfg.alpn_protocols = vec![b"h2".to_vec()];
+        let connector = tokio_rustls::TlsConnector::from(Arc::new(client_cfg));
+        let tcp = tokio::net::TcpStream::connect(bound).await.unwrap();
+        let name = rustls::pki_types::ServerName::try_from("127.0.0.1".to_string())
+            .expect("IP 形态的 ServerName");
+        let tls = tokio::time::timeout(Duration::from_secs(5), connector.connect(name, tcp))
+            .await
+            .expect("TLS 握手必须在 5s 内完成")
+            .expect("TLS 握手应成功（证书不校验）");
+        assert_eq!(
+            tls.get_ref().1.alpn_protocol(),
+            Some(&b"h2"[..]),
+            "ALPN 必须谈成 h2（服务端名单宣告了它）"
+        );
+        let (send_request, connection) = h2::client::handshake(tls)
+            .await
+            .expect("h2 握手应成功——服务端讲不了 h2 时这里就是当年事故的重置现场");
+        tokio::spawn(async move {
+            let _ = connection.await;
+        });
+        send_request
+    }
+
+    /// 在 h2 连接上发一个 GET，回（状态码，响应头，收流）。
+    async fn h2_get(
+        send_request: &mut h2::client::SendRequest<axum::body::Bytes>,
+        bound: std::net::SocketAddr,
+        path: &str,
+        accept_encoding: Option<&str>,
+    ) -> (
+        axum::http::StatusCode,
+        axum::http::HeaderMap,
+        h2::RecvStream,
+    ) {
+        let mut builder = axum::http::Request::builder()
+            .method("GET")
+            .uri(format!("https://{bound}{path}"));
+        if let Some(enc) = accept_encoding {
+            builder = builder.header("accept-encoding", enc);
+        }
+        let request = builder.body(()).unwrap();
+        tokio::time::timeout(Duration::from_secs(5), send_request.clone().ready())
+            .await
+            .expect("h2 连接必须可用")
+            .expect("send_request 应就绪");
+        let (response, _flow) = send_request.send_request(request, false).unwrap();
+        let response = tokio::time::timeout(Duration::from_secs(10), response)
+            .await
+            .expect("响应必须在 10s 内到")
+            .expect("响应应成功");
+        let status = response.status();
+        let headers = response.headers().clone();
+        (status, headers, response.into_body())
+    }
+
+    /// 把 h2 响应体读到 EOF（排空——普通端点的读法），途中照常归还流控容量。
+    async fn drain_body(mut recv: h2::RecvStream) {
+        loop {
+            match tokio::time::timeout(Duration::from_secs(5), recv.data()).await {
+                Ok(Some(Ok(c))) => {
+                    let _ = recv.flow_control().release_capacity(c.len());
+                }
+                Ok(Some(Err(e))) => panic!("读响应体出错：{e}"),
+                Ok(None) => break,
+                Err(_) => panic!("读响应体不应超时"),
+            }
+        }
+    }
+
+    /// 把 h2 收流读到第一个含 `data:` 的帧边界（`\n\n`）；等不到/流出错/流提前收尾都算炸。
+    async fn read_sse_frame_until_data(recv: &mut h2::RecvStream) -> String {
+        let mut buf: Vec<u8> = Vec::new();
+        let got = tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                match recv.data().await {
+                    Some(Ok(chunk)) => {
+                        buf.extend_from_slice(&chunk);
+                        let _ = recv.flow_control().release_capacity(chunk.len());
+                        if buf.windows(2).any(|w| w == b"\n\n")
+                            && buf.windows(5).any(|w| w == b"data:")
+                        {
+                            return;
+                        }
+                    }
+                    Some(Err(e)) => panic!("h2 流出错：{e}"),
+                    None => panic!("SSE 流提前收尾——事件还没来流就断了"),
+                }
+            }
+        })
+        .await;
+        assert!(got.is_ok(), "10s 内没等到带 data 的帧");
+        String::from_utf8_lossy(&buf).into_owned()
+    }
+
+    /// 种 t1 任务（SSE / 压缩两条用例共用；`/tasks/t1/{stream,commands}` 要有东西可读）。
+    async fn seed_t1(state: &AppState) {
+        let repo = testkit::Repo::clean().unwrap();
+        testkit::seed_project(&state.store, "proj-t1", "示例", repo.path(), "main")
+            .await
+            .unwrap();
+        testkit::seed_task(&state.store, "t1", "proj-t1")
+            .await
+            .unwrap();
+        std::mem::forget(repo); // 仓目录必须活到测试结束（路径已写进库里）
+    }
+
+    /// ALPN 谈成 h2 之后，服务端必须**真的讲 h2**（决策 421，票 05）。
+    ///
+    /// 这条是 `alpn_advertises_h2_and_http11` 的实弹版本：客户端 ALPN 只收 h2，握手后发
+    /// 一个真 GET——名单若虚报（axum 的 http2 特性没开、auto builder 退回 h1），这里会以
+    /// 2026-09-30 事故一模一样的方式炸（连接被重置 / h2 握手失败），而不是无声地降级。
+    #[tokio::test]
+    async fn alpn_h2_negotiates_and_speaks_http2() {
+        let (bound, _home, _state) = spawn_tls_app().await;
+        let mut h2 = h2_connect(bound).await;
+        let (status, _headers, mut recv) = h2_get(&mut h2, bound, "/projects", None).await;
+        assert_eq!(status, axum::http::StatusCode::OK);
+        let mut bytes = Vec::new();
+        loop {
+            match tokio::time::timeout(Duration::from_secs(5), recv.data()).await {
+                Ok(Some(Ok(c))) => {
+                    let _ = recv.flow_control().release_capacity(c.len());
+                    bytes.extend_from_slice(&c);
+                }
+                Ok(Some(Err(e))) => panic!("读响应体出错：{e}"),
+                Ok(None) => break,
+                Err(_) => panic!("读响应体不应超时"),
+            }
+        }
+        let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap_or_else(|e| {
+            panic!(
+                "h2 上拿到的应是 JSON：{e}；{}",
+                String::from_utf8_lossy(&bytes)
+            )
+        });
+        assert!(
+            json.get("projects").is_some() || json.is_array(),
+            "响应形状不像 /projects：{json}"
+        );
+    }
+
+    /// SSE over h2 仍**逐条到达**（票 05 §验收）：流开着的时候推一个真事件，它必须自己
+    /// 成帧穿过 h2 的流控，而不是等缓冲 / 流收尾才成批吐出。事件是往 `state.sse` 真推的，
+    /// 走的是生产订阅路径——不是夹具自己拼帧。
+    #[tokio::test]
+    async fn sse_over_h2_delivers_a_pushed_event_without_batching() {
+        use agentpipeline_core::sse::SseEvent;
+        use agentpipeline_core::types::{Node, Stage};
+
+        let (bound, _home, state) = spawn_tls_app().await;
+        seed_t1(&state).await;
+
+        let mut h2 = h2_connect(bound).await;
+        let (status, headers, mut recv) = h2_get(&mut h2, bound, "/tasks/t1/stream", None).await;
+        assert_eq!(status, axum::http::StatusCode::OK);
+        let content_type = headers
+            .get("content-type")
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or_default();
+        assert!(
+            content_type.starts_with("text/event-stream"),
+            "{content_type}"
+        );
+
+        state.sse.publish(SseEvent::NodeStarted {
+            task_id: "t1".into(),
+            branch: "develop-design".into(),
+            stage: Stage::DevelopDesign,
+            node: Node::Execute,
+            attempt: 1,
+            run_id: 1,
+        });
+        let frame = read_sse_frame_until_data(&mut recv).await;
+        assert!(frame.contains("node_started"), "推的事件应到达：{frame:?}");
+        // 流没收尾：连接与流都活着（SSE 在 h2 上不是「读一次就 EOF」的形状）
+        assert!(!recv.is_end_stream());
+    }
+
+    /// 压缩排除规则在 h2 下与 h1 **同判**（票 05 §验收：票 01 的排除规则不因传输形态漂移）：
+    /// JSON 端点照压（`content-encoding: gzip`），事件流照旧不压。
+    #[tokio::test]
+    async fn h2_compression_exclusions_match_h1() {
+        let (bound, _home, state) = spawn_tls_app().await;
+        seed_t1(&state).await;
+        // 压缩谓词有 32 字节下限（DefaultPredicate 的 SizeAbove，见 api_contract 的
+        // seed_long_command 同一条注释）：播一条带长 preview 的命令让「压了没有」可判。
+        {
+            use agentpipeline_core::agent::tools::{CommandFinish, CommandRecorder, CommandStart};
+            use agentpipeline_core::types::CommandSource;
+            let id = state
+                .store
+                .record_start(CommandStart {
+                    task_id: Some("t1".into()),
+                    session_id: None,
+                    run_id: None,
+                    stage: agentpipeline_core::types::Stage::Test,
+                    node: agentpipeline_core::types::Node::Execute,
+                    source: CommandSource::System,
+                    command: "cargo test --all".into(),
+                    cwd: "/tmp".into(),
+                    original_command: None,
+                })
+                .await
+                .unwrap();
+            state
+                .store
+                .record_finish(
+                    id,
+                    CommandFinish {
+                        exit_code: Some(0),
+                        stdout_preview: Some("测试输出行 · ".repeat(80)),
+                        duration_ms: 12,
+                        ..Default::default()
+                    },
+                )
+                .await
+                .unwrap();
+        }
+
+        let mut h2 = h2_connect(bound).await;
+        let (status, headers, recv) =
+            h2_get(&mut h2, bound, "/tasks/t1/commands", Some("gzip")).await;
+        assert_eq!(status, axum::http::StatusCode::OK);
+        assert_eq!(
+            headers
+                .get("content-encoding")
+                .and_then(|v| v.to_str().ok()),
+            Some("gzip"),
+            "JSON 端点在 h2 下也应压缩"
+        );
+        drain_body(recv).await;
+
+        let (status, headers, _recv) = h2_get(
+            &mut h2,
+            bound,
+            "/tasks/t1/stream",
+            Some("gzip, deflate, br"),
+        )
+        .await;
+        assert_eq!(status, axum::http::StatusCode::OK);
+        assert!(
+            headers.get("content-encoding").is_none(),
+            "事件流在 h2 下被压了——压缩缓冲会让直播看起来卡住"
+        );
     }
 }

@@ -3311,3 +3311,15 @@ config.rs}`、`tests/e2e/tests/integration/stage_boundary.rs`、`docs/testing.md
 **验证**：`tools.rs` 三条新牙——`offload_whitelist_admits_e2e_commands_with_env_assignment_prefixes`（正例 7 形含多赋值/空值/空白 trim；反例 15 形：赋值后非白名单前缀、纯赋值串、小写与连字符名字、playwright install、赋值形态不豁免结构面、tab 分词逃逸与 tab 直入命令）、`offload_artifact_name_follows_only_playwright_commands`（playwright 命中带全量 sha 名、artifacts.sh 与 cargo 为 `None`）、`offload_run_of_a_playwright_command_names_the_artifact_in_the_receipt`（假 gh 带 url 字段，回执含 artifact 名 + download 指引 + run URL、链路通不回退、dispatch 串带 `-f e2e=true`）；既有 17 条 offload 用例照旧全绿（gh_row 夹具补 `u` 字段，`serde(default)` 兜老输出形）。**真实链路验收（106 用一个自然 e2e 任务跑一轮外发、截图从 artifact 取回）顺延到下一个自然任务**——与本票其余观察项同一口径，不专门造任务。
 
 **来源**：票 `.scratch/runner-offload/issues/09-e2e-offload.md`；决策 382①（范围与前置）、381③（防注入纪律）、398（结构面）；review 修正三项（tab 分词洞、Rust↔YAML 双判据收敛为 `e2e` 输入、e2e 轮内补构建守卫）；落地 `crates/core/src/agent/{tools.rs,catalog.rs}`、`.github/workflows/offload.yml`。
+
+### 决策 421 · h2 上 TLS：axum 开 `http2` 特性、ALPN 重新宣告 `h2`，真握手入仓验收（票 `scene-read-path-perf` 05，决议 5 的实施）
+
+**起因**：决策 335 当年退回「只宣告 http/1.1」的原因是 axum 没开 `http2` 特性——宣告了讲不了的 h2，客户端按 h2 发 preface、服务端按 h1 解析，TLS 形态整条打不开（2026-09-30 实测事故，`alpn_protocols` 注释留着这段）。用户主场景是手机 Safari 经公网访问 106，h2 的多路复用让常驻 SSE 不再各占一个 HTTP/1.1 连接槽、高 RTT 链路省掉若干轮往返——批一（压缩 / 命令聚合等）在 106 验收通过后，这笔回来结。
+
+**裁决**：**① 传输层翻面**——工作区 `Cargo.toml` 给 axum 开 `http2`；`alpn_protocols()` 改为 `[h2, http/1.1]`；历史注释改写为新现状但**事故教训留着别删**（它正是「宣告的能力必须真会讲」这条纪律的出处）。**明文形态一行不动**：浏览器不讲 h2c，本地桌面端照旧 h1——h2 只在 TLS 上出现，这条写进注释防止有人「顺手」给明文也加上。**② 验收不再外包给部署**——原口径「真握手在 106 手验 + CI 外网检查兜底」升级为**仓内真握手**：测试基建里本就有嵌入的自签证书对与 rustls 客户端（决策 374 的 slowloris 用例铺的），补一个 h2 客户端 dev 依赖（`h2` 已在依赖树里，hyper 服务端 h2 就是它编的，不引新下载）即可以 2026-09-30 事故**一模一样的形状**当测试——客户端 ALPN **只收 h2**、发真 h2 请求；服务端若讲不了，这条以当年同样的方式炸，而不是无声降级。服务端走**生产同一条接线**（`Transport::from_pem` → `TlsListener` → `into_serving_service`），不引 rcgen、不用 `serve(ServeOptions)`（后者碰进程环境变量，与 port_stability 的 install_env 并发互踩）。**③ SSE 与压缩在 h2 下重验**——流开着时往 `state.sse` 真推一个事件，它必须自己成帧穿过 h2 流控（「逐条到达」），而不是等缓冲成批吐出；压缩排除规则与 h1 同判（JSON 端点照压——用例先播一条带长 preview 的命令，`DefaultPredicate` 有 32 字节 `SizeAbove` 下限，空列表判不了「压了没有」；事件流照旧不压）。
+
+**边界照旧**：`ServerConfig` 的三道启动期检查与握手超时（决策 374）一行未动；`alpn_advertises_h2_and_http11` 仍钉名单形状——「讲不讲得了」由真握手三条钉（名单形状与实弹各管一层）。**代价（接受）**：测试起真 TLS 服务 + 真 h2 客户端，三条用例合计 <1s；`h2` 提为 dev 依赖零新增下载。**106 上的 `curl --http2` 实测与首屏读数顺延到下一次部署后的自然复验**（operations.md §12.17 那节已补核对命令），不专门造部署。
+
+**验证**：`serve.rs` 三条新牙——`alpn_h2_negotiates_and_speaks_http2`（ALPN 谈成 h2 + 真 h2 GET 拿回 JSON）、`sse_over_h2_delivers_a_pushed_event_without_batching`（真事件成帧到达、流不收尾）、`h2_compression_exclusions_match_h1`（`/commands` 带 `content-encoding: gzip`、`/tasks/t1/stream` 不带）；守卫改形 `alpn_advertises_h2_and_http11`。app 全 crate 349 条全绿；`make check-lint` 绿。
+
+**来源**：票 `.scratch/scene-read-path-perf/issues/05-http2.md`（spec 决议 5）；决策 335（TLS 终止与当年教训）、374（握手超时与测试夹具）、361（压缩排除规则）；历史叙述与核对命令同步进 `docs/operations.md` §12.18 与 `docs/testing.md` §2 的 335 行。
