@@ -113,6 +113,14 @@ pub const FOREMAN_MAX_ROUNDS: usize = 1000;
 /// 票 09 的停钮是它的动作面）；同一条线在人的那一轮上只落一条**软告警**（只落账不拦）。
 pub const FOREMAN_WATCH_TOKEN_BUDGET: u32 = 120_000;
 
+/// 人的那一轮的**输入参考线**（临时值，决策 426）：软告警判据的双读数之一。
+///
+/// 不是硬界——人的那一轮无硬界（决策 292 立意不动），它只是「这一轮读了多少」该被看见的
+/// 那条线。量级是**百万**：2026-10-08 班次 `01M4CDY9EC9M9FSSE236GJXYZC` 单轮最贵输入
+/// 5.16M（会响一声）、次贵 3.27M / 1.14M（不响）——临时线定为 5M，跑一段自然使用后按
+/// 台账分布修线（决策 426）；别沿用 120k，那是生成侧的量级。
+pub const FOREMAN_HUMAN_INPUT_TOKEN_LINE: u32 = 5_000_000;
+
 /// 值班长回话完成通知（决策 272③）的**门**：`say` 轮至少动过这么多次工具，才算
 /// 「干了一轮活」、才叫通知出口。判据是这一轮自己的产出（`traces.len()`），收口处
 /// 现成可得——不用墙上时钟、不加配置项（决策 256 的尺子：没人会调的旋钮比没有更坏）。
@@ -447,6 +455,8 @@ impl ForemanRunner {
             llm,
             store.clone(),
         ));
+        // 0 在解析期已被拒（validate）；程序内构造按 1 兜底——
+        // 与 sub_agent_max_rounds 的同一条口径（config.rs 先例）。
         let cli_limiter = Arc::new(tokio::sync::Semaphore::new(
             settings.cli_engine_concurrency.max(1),
         ));
@@ -1088,7 +1098,7 @@ impl ForemanRunner {
             // 故「已经不划算的下一轮」根本不会发出去。**分档**：值守轮触顶即停（出循环走
             // 收口路径，部分结论 + 【未收口】）；人的那一轮无硬界（终点由人决定），
             // 只把这条线记下来，收口时落一条软告警（只落账不拦）。
-            match cost_verdict(input.is_watch(), tokens.1, token_line) {
+            match cost_verdict(input.is_watch(), tokens.0, tokens.1, token_line) {
                 CostVerdict::KeepGoing => {}
                 CostVerdict::WarnHuman => cost_warned = true,
                 CostVerdict::StopWatch => {
@@ -1591,9 +1601,12 @@ impl ForemanRunner {
         let mut content = if input.is_watch() {
             format!("{FOREMAN_WATCH_MARK}{reply}")
         } else if cost_warned {
+            // 双读数（决策 426）：「读了多少」与「生成了多少」都摆出来——旧文案只报生成，
+            // 输入爆、输出小的形态整班零响。判据双读数在 `cost_verdict`，文案同处一处改两处生效。
             format!(
-                "{reply}\n\n{OPERATION_LOG_MARK}这一轮已烧 {} 生成 token，过了值守轮那条预算线（{}）——人的那一轮没有硬界，继续还是停由你定。",
-                tokens.1, token_line
+                "{reply}\n\n{OPERATION_LOG_MARK}这一轮已读 {} / 已生成 {} token\
+                 （值守轮预算线 {} 生成、输入参考线 {}）——人的那一轮没有硬界，继续还是停由你定。",
+                tokens.0, tokens.1, token_line, FOREMAN_HUMAN_INPUT_TOKEN_LINE
             )
         } else {
             reply.clone()
@@ -1728,8 +1741,10 @@ impl ForemanRunner {
         )
         .await?;
         // resume 失败即重建（决策 424③）：失败信号来自那一次调用本身，当场重跑一次。
+        // **超时不算**（决策 425 的「超时与失败分开说」同精神）：15 分钟没回来的会话
+        // 多半还活着，重烧一轮既贵、又把超时误报成「引擎侧会话已失效」。
         let resume_was_set = session.cli_session_id.is_some();
-        let first_failed = first.error_text.is_some();
+        let first_failed = first.error_text.is_some() && !first.timed_out;
         let out = if first_failed && resume_was_set {
             let recent = self
                 .store

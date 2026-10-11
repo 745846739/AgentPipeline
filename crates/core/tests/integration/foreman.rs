@@ -5983,6 +5983,8 @@ struct TalkyThenStop {
     fail_kind: &'static str,
     /// 每次调用的生成 token 读数（成本门按它算）。
     completion_tokens: u32,
+    /// 每次调用的输入 token 读数（决策 426：人的那一轮软告警判双读数）。
+    prompt_tokens: u32,
 }
 
 impl LlmClient for TalkyThenStop {
@@ -5991,11 +5993,12 @@ impl LlmClient for TalkyThenStop {
         _request: LlmRequest,
     ) -> futures::future::BoxFuture<'static, agentpipeline_core::Result<AgentResponse>> {
         let n = self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
-        let (stop_after, fail_at, fail_kind, tokens) = (
+        let (stop_after, fail_at, fail_kind, tokens, prompt) = (
             self.stop_after,
             self.fail_at,
             self.fail_kind,
             self.completion_tokens,
+            self.prompt_tokens,
         );
         Box::pin(async move {
             if fail_at.is_some_and(|from| n >= from) {
@@ -6016,7 +6019,7 @@ impl LlmClient for TalkyThenStop {
                         arguments: r#"{"task_id":"t1"}"#.into(),
                     }]
                 },
-                prompt_tokens: 10,
+                prompt_tokens: prompt,
                 completion_tokens: tokens,
                 ..Default::default()
             })
@@ -6045,6 +6048,7 @@ async fn the_token_budget_stops_the_watch_round_but_never_the_human_one() {
         fail_at: None,
         fail_kind: "llm_idle_timeout",
         completion_tokens: 5,
+        prompt_tokens: 10,
     }) as Arc<dyn LlmClient>);
     note(
         &h,
@@ -6106,6 +6110,7 @@ async fn the_token_budget_stops_the_watch_round_but_never_the_human_one() {
         fail_at: None,
         fail_kind: "llm_idle_timeout",
         completion_tokens: 5,
+        prompt_tokens: 10,
     }) as Arc<dyn LlmClient>);
     let sid = h2.session().await;
     let turn = runner2.say(Some(&sid), "盯着 t1").await.unwrap();
@@ -6127,13 +6132,54 @@ async fn the_token_budget_stops_the_watch_round_but_never_the_human_one() {
     let last = stored.last().unwrap();
     assert_eq!(last.role, "assistant");
     assert!(
-        last.content.contains("这一轮已烧 30 生成 token") && last.content.contains("没有硬界"),
-        "软告警落在该轮台账上（只落账不拦）：{}",
+        last.content.contains("这一轮已读 60 / 已生成 30 token")
+            && last.content.contains("没有硬界"),
+        "软告警落在该轮台账上，且带双读数（只落账不拦）：{}",
         last.content
     );
     assert!(
         !stored.iter().any(|m| m.role == "system"),
         "软告警不另起系统消息（避免刷屏）：{stored:?}"
+    );
+}
+
+/// 软告警的双读数（决策 426）：**输入过参考线也响**——407 轮的形状（输入 5.16M、
+/// 生成 38k）在旧判据下整班零响。这一格是本票存在的理由，别让它退化。
+#[tokio::test]
+async fn an_input_heavy_human_round_also_raises_the_soft_warning() {
+    let h = Harness::seeded().await;
+    let sid = h.session().await;
+    // 每次调用输入 3M、生成 5：第三次门槛检查时累计 6M 过 5M 参考线，而生成侧离 120k 很远。
+    let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let runner = h.runner_with_llm(Arc::new(TalkyThenStop {
+        calls: calls.clone(),
+        stop_after: Some(3),
+        fail_at: None,
+        fail_kind: "llm_idle_timeout",
+        completion_tokens: 5,
+        prompt_tokens: 3_000_000,
+    }) as Arc<dyn LlmClient>);
+
+    let turn = runner.say(Some(&sid), "盘点一下台账").await.unwrap();
+    assert_eq!(
+        calls.load(std::sync::atomic::Ordering::SeqCst),
+        3,
+        "人的那一轮没有硬界：过线照跑，直到模型自己说完"
+    );
+    assert!(
+        !turn.reply.contains(FOREMAN_PARTIAL_TURN_MARK),
+        "输入参考线不是硬界，不该拦：{}",
+        turn.reply
+    );
+    let stored = h.store.list_foreman_messages(&sid, 10, None).await.unwrap();
+    let last = stored.last().unwrap();
+    assert_eq!(last.role, "assistant");
+    assert!(
+        last.content
+            .contains("这一轮已读 9000000 / 已生成 15 token")
+            && last.content.contains("没有硬界"),
+        "输入爆、输出小的轮要响一声软告警：{}",
+        last.content
     );
 }
 
@@ -6150,6 +6196,7 @@ async fn a_mid_turn_failure_keeps_what_was_already_said() {
         fail_at: Some(3),
         fail_kind: "llm_idle_timeout",
         completion_tokens: 5,
+        prompt_tokens: 10,
     }) as Arc<dyn LlmClient>);
 
     // ① 错误照旧报出来（失败记账、通知、悬空提议作废都指望它）

@@ -62,7 +62,8 @@ use super::attribution::attribution_discipline;
 use super::catalog::{foreman_available_tools_except, mutates_something, FOREMAN_TOOL_SPECS};
 use super::conversation::{COMPACTION_MARK, FOREMAN_TALK_DIGEST_MARK, FOREMAN_WATCH_DIGEST_MARK};
 use super::runner::{
-    FOREMAN_BASELINE, FOREMAN_PERSONA, FOREMAN_WATCH_TOOL_DENY, OPERATION_LOG_MARK,
+    FOREMAN_BASELINE, FOREMAN_HUMAN_INPUT_TOKEN_LINE, FOREMAN_PERSONA, FOREMAN_WATCH_TOOL_DENY,
+    OPERATION_LOG_MARK,
 };
 use super::{FOREMAN_AGENT_TYPE, FOREMAN_STAGE_KEY};
 
@@ -141,18 +142,34 @@ pub enum CostVerdict {
     StopWatch,
 }
 
-/// 成本门的判据（纯）。
+/// 成本门的判据（纯；决策 292 分档，判据面由决策 426 修订为双读数）。
 ///
-/// 分档是这条线的全部意义：值守轮没有人在场，触顶即停；人的那一轮无硬界——同一根线
-/// 在那里只说明「已经烧了这么多」。
-pub fn cost_verdict(is_watch: bool, generated_tokens: u32, line: u32) -> CostVerdict {
-    if generated_tokens < line {
-        return CostVerdict::KeepGoing;
-    }
+/// 分档是这条线的全部意义：值守轮没有人在场，触顶即停；人的那一轮无硬界——线在那里
+/// 只说明「已经烧了这么多」。
+///
+/// - **值守轮**：硬界一字不改（决策 292）——只看**生成** token，触顶即停。输入侧
+///   再爆也不停：值守轮的失控形态是「重复查同一件事」，量在生成侧。
+/// - **人的那一轮**：软告警改**双读数**——生成过线（照旧）**或**输入过参考线
+///   （[`FOREMAN_HUMAN_INPUT_TOKEN_LINE`]，临时 5M）都响一声。旧判据只看生成，
+///   「输入爆、输出小」的形态整班零响（2026-10-08 班：输入 12.2M / 输出 0.2M，
+///   软告警命中 0 次）。
+pub fn cost_verdict(
+    is_watch: bool,
+    input_tokens: u32,
+    generated_tokens: u32,
+    line: u32,
+) -> CostVerdict {
     if is_watch {
-        CostVerdict::StopWatch
-    } else {
+        return if generated_tokens >= line {
+            CostVerdict::StopWatch
+        } else {
+            CostVerdict::KeepGoing
+        };
+    }
+    if generated_tokens >= line || input_tokens >= FOREMAN_HUMAN_INPUT_TOKEN_LINE {
         CostVerdict::WarnHuman
+    } else {
+        CostVerdict::KeepGoing
     }
 }
 
@@ -775,23 +792,67 @@ mod tests {
 
     #[test]
     fn the_cost_line_stops_a_watch_turn_and_only_warns_a_human_one() {
-        assert_eq!(cost_verdict(true, 0, 120_000), CostVerdict::KeepGoing);
-        assert_eq!(cost_verdict(true, 119_999, 120_000), CostVerdict::KeepGoing);
-        assert_eq!(cost_verdict(true, 120_000, 120_000), CostVerdict::StopWatch);
-        assert_eq!(cost_verdict(true, 999_999, 120_000), CostVerdict::StopWatch);
-        // 同一根线在人的那一轮只落软告警（终点由人定，决策 292）。
+        // 值守轮：硬界一字不改（决策 292）——只看生成 token，输入爆了也不停。
+        assert_eq!(cost_verdict(true, 0, 0, 120_000), CostVerdict::KeepGoing);
         assert_eq!(
-            cost_verdict(false, 119_999, 120_000),
+            cost_verdict(true, 0, 119_999, 120_000),
             CostVerdict::KeepGoing
         );
         assert_eq!(
-            cost_verdict(false, 120_000, 120_000),
+            cost_verdict(true, 0, 120_000, 120_000),
+            CostVerdict::StopWatch
+        );
+        assert_eq!(
+            cost_verdict(true, 0, 999_999, 120_000),
+            CostVerdict::StopWatch
+        );
+        assert_eq!(
+            cost_verdict(true, 9_999_999, 119_999, 120_000),
+            CostVerdict::KeepGoing,
+            "值守轮的失控形态在生成侧：输入爆了照样不触那条硬界"
+        );
+        // 同一根线在人的那一轮只落软告警（终点由人定，决策 292）。
+        assert_eq!(
+            cost_verdict(false, 0, 119_999, 120_000),
+            CostVerdict::KeepGoing
+        );
+        assert_eq!(
+            cost_verdict(false, 0, 120_000, 120_000),
             CostVerdict::WarnHuman
         );
         assert_eq!(
-            cost_verdict(false, 999_999, 120_000),
+            cost_verdict(false, 0, 999_999, 120_000),
             CostVerdict::WarnHuman
         );
+    }
+
+    /// 软告警的双读数四格（决策 426）：生成过线照旧响，**输入过参考线也响**——
+    /// 「输入爆、输出小」是本班开销的主力形态（三轮占全班输入 78.6%），旧判据对它零响。
+    #[test]
+    fn the_human_round_soft_warning_fires_on_either_reading() {
+        let (line, input_line) = (120_000, FOREMAN_HUMAN_INPUT_TOKEN_LINE);
+        // 输入高、输出低（407 轮的形状：5.16M / 38k）——旧判据漏掉的那一格，本票要的就是它。
+        assert_eq!(
+            cost_verdict(false, input_line, 38_054, line),
+            CostVerdict::WarnHuman
+        );
+        // 刚好压线也算过（与生成侧同一姿态：`>=`）。
+        assert_eq!(
+            cost_verdict(false, input_line - 1, 0, line),
+            CostVerdict::KeepGoing
+        );
+        // 输入低、输出高：旧判据的形状，照旧响。
+        assert_eq!(
+            cost_verdict(false, 1_000, line, line),
+            CostVerdict::WarnHuman
+        );
+        // 都高：照旧响。
+        assert_eq!(
+            cost_verdict(false, input_line, line, line),
+            CostVerdict::WarnHuman
+        );
+        // 都低：不响。
+        assert_eq!(cost_verdict(false, 1_000, 10, line), CostVerdict::KeepGoing);
     }
 
     #[test]
