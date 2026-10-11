@@ -2,6 +2,8 @@ use std::sync::{Arc, Mutex};
 
 use serde::{Deserialize, Serialize};
 
+use super::cli_engine;
+use super::conversation;
 use crate::agent::client::{LlmClient, LlmRequest, Message};
 use crate::agent::providers::is_context_window;
 use crate::agent::tools::{ToolCallContext, ToolExecutor};
@@ -415,6 +417,10 @@ pub struct ForemanRunner {
     watch_failures: Mutex<WatchFailureState>,
     /// 人的那一轮的在飞计数（决策 289 / 票 03，见 [`HumanTurns`]）。
     human_turns: HumanTurns,
+    /// CLI 引擎的程序路径（决策 423/424，票 talk-cli-engine 02 的测试缝）：
+    /// `None` = 「claude」经 PATH 解析。缝在**程序路径**上——Argv 名字解析走
+    /// 父进程 PATH，PATH 前置影子不到它（票 01 探针的同一教训）。
+    cli_program: Option<std::path::PathBuf>,
 }
 
 impl ForemanRunner {
@@ -447,7 +453,14 @@ impl ForemanRunner {
             compaction: Mutex::new(CompactionCache::default()),
             watch_failures: Mutex::new(WatchFailureState::default()),
             human_turns: HumanTurns::default(),
+            cli_program: None,
         }
+    }
+
+    /// 注入 CLI 引擎的程序路径（票 talk-cli-engine 02 的测试缝）。
+    pub fn with_cli_program(mut self, program: std::path::PathBuf) -> Self {
+        self.cli_program = Some(program);
+        self
     }
 
     /// 注入托管动作的执行者（决策 210② / 票 08）。
@@ -878,6 +891,11 @@ impl ForemanRunner {
         cfg: Option<crate::types::StageConfig>,
         cancel: Option<&TurnCancel>,
     ) -> Result<ForemanTurn> {
+        // CLI 引擎分支（决策 423/424，票 talk-cli-engine 02）：整段交给本机 CLI，
+        // 不进下面的 LLM 工具循环——两条路在 `ForemanTurn` 的合同上汇合。
+        if session.engine == crate::storage::foreman::FOREMAN_ENGINE_CLI {
+            return self.respond_cli(session, input, cfg, cancel).await;
+        }
         let briefing = build_briefing(&self.store).await?;
         // 有效设置（long-run-budget 票 02）：启动冻结的 settings 之上叠 DB 覆盖层
         // （`kanban_compaction`，NULL 列 = 读 config 值）——与流水线侧
@@ -1622,6 +1640,153 @@ impl ForemanRunner {
             completion_tokens: tokens.1,
             briefing,
             traces,
+        })
+    }
+
+    /// CLI 引擎的一轮（决策 423/424，票 talk-cli-engine 02）：整段交给本机 CLI。
+    ///
+    /// 与 API 路径（[`Self::respond_inner`]）共享的合同只有 `ForemanTurn` 与台账形状：
+    /// user 行已在 `say` 落库，这里收口 assistant 行。无在途半截行——边流边写的机构
+    /// （`begin_foreman_inflight` + 节流刷写）是流式桥的载体，票 03 才接。
+    ///
+    /// 续接（决策 424③）：`session.cli_session_id` 在场就 `--resume`；**resume 失败
+    /// 即重建**——不静默、当轮落一条 system 账，重建输入带台账摘要，降级只有一条
+    /// 代码路径；不做后台存活探测（为罕见事件不养常驻路径）。
+    ///
+    /// 一期边界：停钮（决策 294）在 CLI 轮内不生效——CLI 是单进程整段执行，中途没有
+    /// 检查点，超时由 [`cli_engine::CLI_TURN_TIMEOUT_SEC`] 兜底；流式三声道票 03 接。
+    async fn respond_cli(
+        &self,
+        session: &ForemanSession,
+        input: TurnInput,
+        cfg: Option<crate::types::StageConfig>,
+        _cancel: Option<&TurnCancel>,
+    ) -> Result<ForemanTurn> {
+        let briefing = build_briefing(&self.store).await?;
+        let briefing_json = serde_json::to_value(&briefing)?;
+        let question = input.transcript_text();
+        // 人格读盘与 API 路径同一形状：坏人格配置要在花掉一次 CLI 调用之前就失败。
+        let persona = match cfg.as_ref().and_then(|c| c.persona_path.as_deref()) {
+            Some(path) => {
+                let full = self.home.root().join(path);
+                Some(std::fs::read_to_string(&full).map_err(|e| {
+                    Error::Config(format!(
+                        "foreman persona_path 不可读（{}）：{e}",
+                        full.display()
+                    ))
+                })?)
+            }
+            None => None,
+        };
+        // 态势每轮前缀（决策 424⑥）：会话历史归 CLI 自持，新鲜事实每轮喂。
+        let user_text = format!(
+            "【夜班态势 · 本轮快照】\n{}\n\n{question}",
+            briefing.render()
+        );
+        let program = self
+            .cli_program
+            .clone()
+            .unwrap_or_else(|| std::path::PathBuf::from(cli_engine::CLI_FOREMAN_BINARY));
+        let make_request = |message: String, resume: Option<String>| cli_engine::CliTurnRequest {
+            message,
+            system_prompt: cli_engine::cli_system_prompt(persona.as_deref()),
+            resume_session_id: resume,
+            timeout_sec: cli_engine::CLI_TURN_TIMEOUT_SEC,
+        };
+
+        let first = cli_engine::run_cli_turn_with_program(
+            program
+                .to_str()
+                .ok_or_else(|| Error::Config("CLI 引擎程序路径不是 UTF-8".into()))?,
+            make_request(user_text.clone(), session.cli_session_id.clone()),
+        )
+        .await?;
+        // resume 失败即重建（决策 424③）：失败信号来自那一次调用本身，当场重跑一次。
+        let resume_was_set = session.cli_session_id.is_some();
+        let first_failed = first.error_text.is_some();
+        let out = if first_failed && resume_was_set {
+            let recent = self
+                .store
+                .list_foreman_messages(&session.id, cli_engine::CLI_REBUILD_DIGEST_MESSAGES, None)
+                .await?;
+            let digest = conversation::summarize_input(&recent, None);
+            let rebuilt_message = format!(
+                "{}引擎侧会话已失效，本轮以台账摘要重建。\n\n{digest}\n\n{user_text}",
+                cli_engine::CLI_REBUILT_MARK
+            );
+            cli_engine::run_cli_turn_with_program(
+                program
+                    .to_str()
+                    .ok_or_else(|| Error::Config("CLI 引擎程序路径不是 UTF-8".into()))?,
+                make_request(rebuilt_message, None),
+            )
+            .await?
+        } else {
+            first
+        };
+        if let Some(err) = out.error_text {
+            // 重建也失败 / 首轮即失败：外框（say / watch）会按类别落失败账。
+            return Err(Error::Llm(format!("CLI 引擎回合失败：{err}")));
+        }
+
+        // CLI 侧 session id 回填（决策 424③）：首轮领到、重建换新，都走这一处。
+        if let Some(id) = &out.cli_session_id {
+            if session.cli_session_id.as_deref() != Some(id.as_str()) {
+                self.store
+                    .set_foreman_cli_session_id(&session.id, id)
+                    .await?;
+            }
+        }
+        if resume_was_set && first_failed {
+            // 重建不静默（决策 424③）：当轮显式告知，system 行进台账。
+            self.store
+                .append_foreman_message(NewForemanMessage::system(
+                    session.id.clone(),
+                    format!(
+                        "{}引擎侧会话已失效，已用台账摘要重建，本轮继续。",
+                        cli_engine::CLI_REBUILT_MARK
+                    ),
+                ))
+                .await?;
+        }
+
+        let traces_json = (!out.traces.is_empty())
+            .then(|| serde_json::to_value(&out.traces))
+            .transpose()?;
+        let segments_json = (!out.segments.is_empty())
+            .then(|| serde_json::to_value(&out.segments))
+            .transpose()?;
+        // 值守轮的播报标记由后端加（与 API 路径同一姿态）：模型不该有机会说错。
+        let content = if input.is_watch() {
+            format!("{FOREMAN_WATCH_MARK}{}", out.reply)
+        } else {
+            out.reply.clone()
+        };
+        self.store
+            .append_foreman_message(NewForemanMessage {
+                session_id: session.id.clone(),
+                role: FOREMAN_ROLE_ASSISTANT.to_string(),
+                content,
+                prompt_tokens: out.prompt_tokens,
+                completion_tokens: out.completion_tokens,
+                briefing_json: Some(briefing_json),
+                traces_json,
+                segments_json,
+                // CLI 一期没有写面（决策 424①）：改动清单恒空（不落空数组）。
+                changed_files_json: None,
+                thinking: (!out.thinking.trim().is_empty()).then_some(out.thinking.clone()),
+                ask_json: None,
+            })
+            .await?;
+
+        Ok(ForemanTurn {
+            session: session.clone(),
+            reply: out.reply,
+            stopped: false,
+            prompt_tokens: out.prompt_tokens,
+            completion_tokens: out.completion_tokens,
+            briefing,
+            traces: out.traces,
         })
     }
 

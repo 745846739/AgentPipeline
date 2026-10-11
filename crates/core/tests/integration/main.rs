@@ -22,6 +22,7 @@ mod env_mode;
 mod executor;
 mod factory;
 mod foreman;
+mod foreman_cli;
 mod foreman_golden;
 mod foreman_proposals;
 mod foreman_sessions_migration;

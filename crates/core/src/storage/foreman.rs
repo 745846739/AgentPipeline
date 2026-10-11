@@ -60,6 +60,11 @@ pub const FOREMAN_WATCH_SESSION_TITLE: &str = "值守台账";
 pub const FOREMAN_MESSAGE_IN_FLIGHT: &str = "in_flight";
 pub const FOREMAN_MESSAGE_INTERRUPTED: &str = "interrupted";
 
+/// 会话执行引擎（决策 423/424，迁移 0046）：进程内 LLM（现状语义）。
+pub const FOREMAN_ENGINE_API: &str = "api";
+/// 会话执行引擎：本机 CLI agent 整段执行器（决策 423 形状 A）。
+pub const FOREMAN_ENGINE_CLI: &str = "cli";
+
 /// 一次列出的会话上限（不分页，照 `SESSION_PAGE_LIMIT` 的精神）。
 ///
 /// 班次是**按天/按班**的粒度，不是按调用——一个人一晚上不会新建 50 个班次。
@@ -92,6 +97,13 @@ pub struct ForemanSession {
     /// [`FOREMAN_SESSION_KIND_WATCH`]。迁移 0030 起带 CHECK，库里的值只可能是这两个；
     /// 认不出的值原样带出去（与 `role` 同一条「观测字段不兜底」的口径）。
     pub kind: String,
+    /// 执行引擎（决策 423/424，迁移 0046）：[`FOREMAN_ENGINE_API`] 或
+    /// [`FOREMAN_ENGINE_CLI`]。建会话时选定、会话内锁定（424④）——锁是形状给的：
+    /// 没有改 engine 的写路径，`--resume` 也跨不了引擎。
+    pub engine: String,
+    /// CLI 引擎侧的会话 id（决策 424③）：`--resume` 的续接锚，首轮成功后回填。
+    /// `None` = 还没跑过 CLI 轮，或引擎是 api（「没有」不落空串）。
+    pub cli_session_id: Option<String>,
     pub created_at: DateTime<Utc>,
     /// 最近一次说话的时间。列表按它倒序（决策 204⑦）。
     pub last_active_at: DateTime<Utc>,
@@ -241,6 +253,8 @@ struct ForemanSessionRow {
     id: String,
     title: String,
     kind: String,
+    engine: String,
+    cli_session_id: Option<String>,
     created_at: String,
     last_active_at: String,
     archived_at: Option<String>,
@@ -252,6 +266,8 @@ impl ForemanSessionRow {
             id: self.id,
             title: self.title,
             kind: self.kind,
+            engine: self.engine,
+            cli_session_id: self.cli_session_id,
             created_at: parse_ts(&self.created_at)?,
             last_active_at: parse_ts(&self.last_active_at)?,
             archived_at: self.archived_at.as_deref().map(parse_ts).transpose()?,
@@ -320,7 +336,8 @@ const FOREMAN_MESSAGE_COLUMNS: &str = "id, session_id, role, content, prompt_tok
                                        segments_json, changed_files_json, thinking, ask_json, \
                                        status, seq, interrupted_at, created_at";
 
-const FOREMAN_SESSION_COLUMNS: &str = "id, title, kind, created_at, last_active_at, archived_at";
+const FOREMAN_SESSION_COLUMNS: &str =
+    "id, title, kind, engine, cli_session_id, created_at, last_active_at, archived_at";
 
 impl Store {
     /// 值班长这一轮的**落库状态读数**（决策 310 判据③）：提议数 / 任务状态 / 游标位置。
@@ -469,6 +486,20 @@ impl Store {
         kind: &str,
         title: &str,
     ) -> Result<ForemanSession> {
+        self.create_foreman_session_with_engine(kind, title, FOREMAN_ENGINE_API)
+            .await
+    }
+
+    /// 新建一个**指定身份与引擎**的班次（决策 424④）。
+    ///
+    /// 引擎在建会话时选定、此后无写路径（会话内锁定）；非法引擎值由迁移 0046 的
+    /// CHECK 在写入点挡住（这里不再预校验，读侧也不防坏数据——与 kind 同一口径）。
+    pub async fn create_foreman_session_with_engine(
+        &self,
+        kind: &str,
+        title: &str,
+        engine: &str,
+    ) -> Result<ForemanSession> {
         let now = self.now();
         let id = ulid::Ulid::new().to_string();
         let title = if title.trim().is_empty() {
@@ -477,12 +508,14 @@ impl Store {
             title.trim().to_string()
         };
         sqlx::query(
-            "INSERT INTO kanban_foreman_sessions (id, title, kind, created_at, last_active_at, archived_at)
-             VALUES (?, ?, ?, ?, ?, NULL)",
+            "INSERT INTO kanban_foreman_sessions
+             (id, title, kind, engine, cli_session_id, created_at, last_active_at, archived_at)
+             VALUES (?, ?, ?, ?, NULL, ?, ?, NULL)",
         )
         .bind(&id)
         .bind(&title)
         .bind(kind)
+        .bind(engine)
         .bind(ts(now))
         .bind(ts(now))
         .execute(self.pool())
@@ -491,10 +524,27 @@ impl Store {
             id,
             title,
             kind: kind.to_string(),
+            engine: engine.to_string(),
+            cli_session_id: None,
             created_at: now,
             last_active_at: now,
             archived_at: None,
         })
+    }
+
+    /// 回填 CLI 引擎侧的会话 id（决策 424③）：首轮成功后写，之后每轮 `--resume` 用它续接。
+    /// 只在拿到**新的** id 时写；重建后 id 会变，也走这里。
+    pub async fn set_foreman_cli_session_id(
+        &self,
+        session_id: &str,
+        cli_session_id: &str,
+    ) -> Result<()> {
+        sqlx::query("UPDATE kanban_foreman_sessions SET cli_session_id = ? WHERE id = ?")
+            .bind(cli_session_id)
+            .bind(session_id)
+            .execute(self.pool())
+            .await?;
+        Ok(())
     }
 
     /// 改名。返回改后的会话；会话不存在时 `None`（路由据此回 404）。

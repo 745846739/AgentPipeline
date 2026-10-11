@@ -6555,6 +6555,28 @@ async fn the_session_payload_says_whether_a_turn_is_running() {
 ///
 /// 一起测是刻意的——它们是同一条链（新建出来 → 列表里看到 → 改名 → 归档后从列表消失），
 /// 拆成四条会漏掉「新建的那条 id 在后三个操作里还认不认」。
+/// CLI 引擎会话（决策 424④，票 talk-cli-engine 02/04 的 API 面）：engine 建、
+/// engine 回显、非法值 400；没有改 engine 的写路径（锁定是形状）。
+#[tokio::test]
+async fn foreman_sessions_carry_engine_and_reject_unknown_engine() {
+    let api = api_with_foreman(FakeAgent::new(Script::new())).await;
+
+    // 缺省 = api（存量行为不变）。
+    let (status, body) = post(&api, "/foreman/sessions", json!({})).await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+    assert_eq!(body["session"]["engine"], "api");
+
+    // 显式 cli：回显给前端做会话内锁定提示。
+    let (status, body) = post(&api, "/foreman/sessions", json!({"engine": "cli"})).await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+    assert_eq!(body["session"]["engine"], "cli");
+
+    // 非法值 400：CHECK 在库里挡写入点，路由层先给可读错误。
+    let (status, body) = post(&api, "/foreman/sessions", json!({"engine": "codex-cli"})).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    assert!(body["error"].as_str().unwrap().contains("引擎"));
+}
+
 #[tokio::test]
 async fn foreman_sessions_can_be_created_renamed_and_archived() {
     let api = api_with_foreman(FakeAgent::new(Script::new())).await;

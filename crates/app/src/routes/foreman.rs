@@ -219,6 +219,10 @@ pub struct CreateSessionBody {
     /// 可选标题。缺省（或全空白）= 中性标题「新班次」，第一句话说出来时按它命名。
     #[serde(default)]
     pub title: Option<String>,
+    /// 执行引擎（决策 424④）：`api`（缺省）/ `cli`。建会话时选定、会话内锁定——
+    /// 没有改 engine 的写路径，选错了就开新班次。
+    #[serde(default)]
+    pub engine: Option<String>,
 }
 
 /// `POST /foreman/sessions`：新开一个班次。
@@ -238,9 +242,24 @@ pub async fn create_session(
             "班次标题最多 {SESSION_TITLE_MAX_CHARS} 个字"
         )));
     }
+    let engine = body
+        .engine
+        .as_deref()
+        .unwrap_or(agentpipeline_core::storage::foreman::FOREMAN_ENGINE_API);
+    if engine != agentpipeline_core::storage::foreman::FOREMAN_ENGINE_API
+        && engine != agentpipeline_core::storage::foreman::FOREMAN_ENGINE_CLI
+    {
+        return Err(ApiError::bad_request(format!(
+            "未知引擎：{engine}（可选 api / cli）"
+        )));
+    }
     let session = state
         .store
-        .create_foreman_session(&title)
+        .create_foreman_session_with_engine(
+            agentpipeline_core::storage::foreman::FOREMAN_SESSION_KIND_TALK,
+            &title,
+            engine,
+        )
         .await
         .map_err(map_core_error)?;
     Ok((
@@ -1252,6 +1271,7 @@ fn session_wire(s: &ForemanSession) -> serde_json::Value {
         "id": s.id,
         "title": s.title,
         "kind": s.kind,
+        "engine": s.engine,
         "created_at": s.created_at.to_rfc3339(),
         "last_active_at": s.last_active_at.to_rfc3339(),
         "archived_at": s.archived_at.map(|t| t.to_rfc3339()),
