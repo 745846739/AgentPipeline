@@ -3448,3 +3448,23 @@ config.rs}`、`tests/e2e/tests/integration/stage_boundary.rs`、`docs/testing.md
 **验证**：spec 层面——本条即票 05 动工的前置，「spec 不清不动工」解除、票 05 转 ready-for-agent；实现钉子在票 05 验收时兑现（端点校验面用例、MCP 名单与 catalog 同源的测试断言、origin 列迁移用例）。
 
 **来源**：grilling 拷问会话（2026-10-11，三轮：Q1–Q5 创建路 / 自执行 / 读面 / provenance / 会话绑定，Q6–Q9 读面子集 / 端点形状 / C 层进面 / 镜像命名）；关联决策 424（②的裁决与①③的落实）、207（提议机制）、247（单一事实源）、182（配对令牌）、294（stopped_round 先例）、179（出口治理——⑦的让步对象）。
+
+### 决策 428 · 台账行的两刻分立：`started_at` 记开工、`created_at` 归还「说完」（票 `foreman-work-record` 03，决策 422④ 的实施）
+
+**起因**：事故账（2026-10-08，班次 `01M4CDY9EC9M9FSSE236GJXYZC`）里每一对 user / assistant 行的 `created_at` 只差 10–30ms——那不是「回得快」，是 assistant 行的时刻写在**开工**那一刻（`begin_foreman_inflight` 建在途半截行时），收口的 UPDATE 不刷它。394 / 407 两轮各跑 38 / 48 分钟，台账只留下开工钟点——「谁说的、依据什么」这条可追溯链上，「说的时刻」被记成了「开工的时刻」。决策 422④ 拍板选 (b)：另加一列、两个时刻都留，一条迁移的代价接受。
+
+**裁决**：
+
+1. **两刻分立，各归各位**：迁移 0048 给 `kanban_foreman_messages` 加 `started_at`（开工时刻，`begin_foreman_inflight` 建半截行时写定）；`close_foreman_inflight` 的 UPDATE 同时把 `created_at` 刷成收口时刻、`started_at` 不在 SET 里。「一轮跑多久」从两列相减得到，不再需要从 traces / 提议时间戳近似倒推。
+2. **存量行不编数**：旧 `created_at` 里存的恰好就是开工时刻，迁移把它**原样**抄进 `started_at`；`created_at` 保持不动——存量行的收口时刻已不可考，不拿 `last_active_at` 之类的近似值冒充（决策 415「读不到不编数」同款姿态）。旧数据「说的时刻」如实缺失，只剩开工时刻。
+3. **排序一字不改**：消费方（对讲台 `talkTurns`）照旧按 `created_at` 字符串排序——收口刷过之后，一轮进行中落下的 system 行（「提议已执行」等，时刻早于收口）自然排到 assistant 行**之前**，与它发生的时刻一致；今天 assistant 行顶着开工钟点把整轮的产出提前到轮头、轮中 system 行反而落在回话后面的错序顺带归位。票头散文里「排到 assistant 行之后」与验收条「之前」自相矛盾，按机制推演取**之前**（验收条自洽），票面 Comments 记档。
+4. **其余行两刻同瞬**：user / system 行与直落的 assistant 行（`append_foreman_message` / `append_foreman_user_message`）照旧落行即定稿，`started_at` = `created_at` = 落行时刻——迁移回填全表一行 UPDATE，不做按 role 的分支（诚实且无第二份口径）。
+5. **API 面加性出场**：`message_wire` 加 `started_at`（RFC3339，恒在场，老客户端不读不受影响）；前端 `types.ts` 加可选字段——对讲台本票不显示钟点，线先接上（决策 252③「将来要显示时不必再改线」同一姿态）。
+
+**边界照旧**：前端排序与渲染逻辑一字不改；`update_foreman_inflight` 的节流刷写不碰两列；`mark_orphan_foreman_inflights` 的中断行两刻都停在开工（中断是终态，「跑多久」对它无意义）；在途期间的直播读数（`created_at` = 开工时刻）与今天一致。
+
+**代价（接受）**：一条迁移（`ALTER TABLE` + 全表回填一行 UPDATE）；既有读数「assistant 行的 created_at ≈ user 行」从此变成「assistant 行 created_at = 收口时刻」——没有任何代码消费这个巧合（`round_since` / `record_interrupted_turn` 读的都是 user 行），实证过零改动面。
+
+**验证**：迁移层 `foreman_started_at_migration.rs`（只迁到 0047 造老形态行、`Store::open` 后逐毫秒断言 started_at = 旧 created_at 且 created_at 一字未动、班次读数原样）；存储层 `close_refreshes_created_at_but_never_touches_started_at`（在途两刻同瞬 → 收口只刷 created_at + `last_active_at` 同刻）与 `a_system_row_logged_mid_round_has_an_earlier_created_at_than_the_reply`（时间序归位）；全轮 `a_say_round_stamps_the_start_and_finish_times_apart`（stub 从 `complete` 里推钟 30s，开工与收口之间有了真时间差）；L3 `message_wire_carries_both_the_start_and_finish_times`（两刻都上线、谁也不吞谁）。core 1424 全绿、app 契约绿、clippy / svelte-check 零告警。手工面（106 上重读事故账 394 / 407 两行：started_at 应为 00:48 / 02:12、created_at 保持旧值）留在票面 Comments，随下次部署兑现。
+
+**来源**：票 `foreman-work-record/03` 原文（实证出自 2026-10-08 班次 `01M4CDY9EC9M9FSSE236GJXYZC`）；关联决策 422④（(b) 版裁决）、415（读不到不编数）、211④ / 223（在途半截行的行数语义——本条只动时刻、不动行数语义）、252③（API 加性字段先接线）。
