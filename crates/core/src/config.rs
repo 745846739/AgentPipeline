@@ -57,6 +57,10 @@ pub struct Settings {
     pub semantic_conflict_check: bool,
     pub cross_family_judge: bool,
     pub max_concurrent_tasks: usize,
+    /// CLI 引擎的 per-engine 并发上限（决策 423④，票 talk-cli-engine 06）：
+    /// 同时在跑的本机 CLI 回合至多这么多，超限排队。**0 不是「无上限」**：
+    /// 解析期即拒（[`Self::validate`]），与 sub_agent_max_rounds 同一立场。
+    pub cli_engine_concurrency: usize,
     pub allow_dirty_worktree_merge: bool,
     /// `run_command` 的出口放行主机（决策 179，票 12）：精确主机 / `*.example.com` / `*`。
     ///
@@ -163,6 +167,7 @@ impl Default for Settings {
             semantic_conflict_check: true,
             cross_family_judge: false,
             max_concurrent_tasks: 5,
+            cli_engine_concurrency: 2,
             allow_dirty_worktree_merge: false,
             egress_allow_hosts: Vec::new(),
             egress_allow_all: false,
@@ -206,6 +211,7 @@ pub struct PipelineOverrides {
     pub semantic_conflict_check: Option<bool>,
     pub cross_family_judge: Option<bool>,
     pub max_concurrent_tasks: Option<usize>,
+    pub cli_engine_concurrency: Option<usize>,
     pub allow_dirty_worktree_merge: Option<bool>,
     pub egress_allow_hosts: Option<Vec<String>>,
     pub egress_allow_all: Option<bool>,
@@ -256,6 +262,7 @@ impl PipelineOverrides {
             semantic_conflict_check,
             cross_family_judge,
             max_concurrent_tasks,
+            cli_engine_concurrency,
             allow_dirty_worktree_merge,
             egress_allow_hosts,
             egress_allow_all,
@@ -715,6 +722,11 @@ impl Config {
         // 不是「让它一直跑」。与 `watch_token_budget` 同一姿态（正整数，缺省给足）；
         // 静默把它当「无限」的代价是子代理烧到 `max_duration` 才停，而那一刻没人看得懂
         // 为什么。**这条只拦配置文件那一半**：程序内构造按 1 兜底（见 `subagent` 取用点）。
+        if self.pipeline.cli_engine_concurrency == Some(0) {
+            return Err(Error::Config(
+                "[pipeline] cli_engine_concurrency 必须是正整数（0 不是「无上限」这一档）".into(),
+            ));
+        }
         if self.pipeline.sub_agent_max_rounds == Some(0) {
             return Err(Error::Config(
                 "[pipeline] sub_agent_max_rounds 必须是正整数（0 不是「无上限」这一档）".into(),
@@ -1551,6 +1563,19 @@ mod tests {
 
         let err = Config::from_toml("[pipeline]\nsub_agent_max_rounds = 0\n").unwrap_err();
         assert!(err.to_string().contains("sub_agent_max_rounds"), "{err}");
+    }
+
+    /// 决策 423④（票 talk-cli-engine 06）：CLI 引擎并发缺省 **2**、可覆盖、0 被拒
+    /// （与 sub_agent_max_rounds 同一立场：静默当无限会让本机进程/订阅配额失控）。
+    #[test]
+    fn cli_engine_concurrency_defaults_to_2_and_refuses_zero() {
+        assert_eq!(Settings::default().cli_engine_concurrency, 2);
+
+        let cfg = Config::from_toml("[pipeline]\ncli_engine_concurrency = 4\n").unwrap();
+        assert_eq!(cfg.settings().cli_engine_concurrency, 4);
+
+        let err = Config::from_toml("[pipeline]\ncli_engine_concurrency = 0\n").unwrap_err();
+        assert!(err.to_string().contains("cli_engine_concurrency"), "{err}");
     }
 
     /// 决策 283：操作环境的两个开关走通解析与合并，且**互不携带**。

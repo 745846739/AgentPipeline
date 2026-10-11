@@ -115,6 +115,7 @@ graph TD
 | `semantic_conflict_check` | true | 开启 architect 阶段的第二层语义冲突比对（§6） |
 | `cross_family_judge` | false | 开启后 agent 型 validate_output 首判不合格时调用 `validator_cross_check` 伪阶段异族复判（决策 134 / 135）；开启但伪阶段未配置 provider → 配置加载 fail fast |
 | `max_concurrent_tasks` | 5 | 同时执行的任务数上限（决策 21 / 36），在 scheduler `start_task` 处准入；名额占用 = `status ∈ {running, pending}`（决策 117） |
+| `cli_engine_concurrency` | 2 | CLI 引擎（对讲台 × 本机 claude code，决策 423）同时在跑的回合上限，超限排队；0 被拒（无「无上限」档，票 talk-cli-engine 06） |
 | `allow_dirty_worktree_merge` | false | 允许在目标分支工作区不干净时合入；false 时进入 pending 由用户决定 |
 | `egress_allow_hosts` | `[]` | `run_command` 的出口放行主机（决策 179）：精确主机 / `*.example.com`（子域通配，落在点边界上）/ `*`。**默认空 = 只放行回环**；写错在解析期 fail fast。只约束 agent 主动经 `run_command` 发起的调用，**不是安全边界**（残余风险见 [operations.md](operations.md) §12.15） |
 | `egress_allow_all` | false | 显式放行全部出口（决策 179）。默认 `false`——未配置时**不得**静默变成「全部放行」；两个方向的代价不对称，故默认取保守侧。**两条路问同一份策略**（决策 283）：它同时管 `run_command` 与网口 `web_fetch`——后者此前读不到它，于是报错里印的那句「或置 `egress_allow_all = true`」照做之后也不生效 |

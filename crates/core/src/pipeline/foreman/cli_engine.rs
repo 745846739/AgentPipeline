@@ -567,6 +567,14 @@ fn parse_stream_json(out: &CommandOutput) -> CliTurnOutput {
     }
     // 回话正文：result 事件的 `result` 是收口权威；没有它（异常收口）用攒的文本段兜底。
     o.reply = reply_authoritative.unwrap_or_else(|| text_parts.join(""));
+    // fail-fast 读数（决策 423⑤，票 talk-cli-engine 06）：退出码 0 却解析不出任何
+    // 回话正文——已知事件结构漂移的确定信号，不当静默成功。跳过的行数一并给出。
+    if o.exit_code == Some(0) && o.error_text.is_none() && o.reply.trim().is_empty() {
+        o.error_text = Some(format!(
+            "CLI 回合退出码 0 但解析不出回话正文（stream-json 结构漂移？{} 行未识别）",
+            o.skipped_lines
+        ));
+    }
     o
 }
 

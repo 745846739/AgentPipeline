@@ -421,6 +421,10 @@ pub struct ForemanRunner {
     /// `None` = 「claude」经 PATH 解析。缝在**程序路径**上——Argv 名字解析走
     /// 父进程 PATH，PATH 前置影子不到它（票 01 探针的同一教训）。
     cli_program: Option<std::path::PathBuf>,
+    /// CLI 引擎的并发闸门（决策 423④，票 talk-cli-engine 06）：同时在跑的 CLI
+    /// 回合至多 `settings.cli_engine_concurrency` 个，超限排队。一个 runner 一座闸
+    /// ——`say` 与 `watch` 都经 [`Self::respond_cli`]，漏不掉。
+    cli_limiter: Arc<tokio::sync::Semaphore>,
 }
 
 impl ForemanRunner {
@@ -443,6 +447,9 @@ impl ForemanRunner {
             llm,
             store.clone(),
         ));
+        let cli_limiter = Arc::new(tokio::sync::Semaphore::new(
+            settings.cli_engine_concurrency.max(1),
+        ));
         ForemanRunner {
             store,
             settings,
@@ -454,6 +461,7 @@ impl ForemanRunner {
             watch_failures: Mutex::new(WatchFailureState::default()),
             human_turns: HumanTurns::default(),
             cli_program: None,
+            cli_limiter,
         }
     }
 
@@ -1691,6 +1699,13 @@ impl ForemanRunner {
             .cli_program
             .clone()
             .unwrap_or_else(|| std::path::PathBuf::from(cli_engine::CLI_FOREMAN_BINARY));
+        // 并发闸门（决策 423④）：一个回合（含其重建尝试）持一个许可，超限在这里排队。
+        let _cli_permit = self
+            .cli_limiter
+            .clone()
+            .acquire_owned()
+            .await
+            .map_err(|_| Error::Llm("CLI 并发闸门已关闭".into()))?;
         let make_request = |message: String, resume: Option<String>| cli_engine::CliTurnRequest {
             message,
             system_prompt: cli_engine::cli_system_prompt(persona.as_deref()),

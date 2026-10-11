@@ -314,6 +314,108 @@ echo '{"type":"result","subtype":"success","is_error":false,"result":"查完了�
     assert_eq!(assistant[0].status, None);
 }
 
+/// per-engine 并发上限（决策 423④，票 talk-cli-engine 06）：cap=1 时两个并发回合
+/// **串行**（日志里 start 与 end 交替，不出现连续两个 start），且排队的不丢、都跑完。
+#[tokio::test]
+async fn cli_turns_serialize_under_concurrency_cap() {
+    let home = TestHome::new().unwrap();
+    let store = Store::open(home.home().clone(), Arc::new(ManualClock::fixed()))
+        .await
+        .unwrap();
+    let bin = home.scratch_dir("bin");
+    std::fs::create_dir_all(&bin).unwrap();
+    let script = bin.join("fake-claude");
+    let log = bin.join("timing.log");
+    let log = log.display().to_string();
+    let settings = Settings {
+        cli_engine_concurrency: 1,
+        ..Default::default()
+    };
+    let body = format!(
+        r#"#!/bin/sh
+printf 'start
+' >> '{log}'
+sleep 0.4
+printf 'end
+' >> '{log}'
+echo '{{"type":"system","subtype":"init","session_id":"sess-1"}}'
+echo '{{"type":"result","subtype":"success","is_error":false,"result":"好","usage":{{"input_tokens":1,"output_tokens":1}}}}'
+"#
+    );
+    write_script(&script, &body);
+    let runner = ForemanRunner::new(
+        store.clone(),
+        settings,
+        home.home().clone(),
+        Arc::new(NeverLlm) as Arc<dyn LlmClient>,
+        Arc::new(testkit::SseRecorder::new()),
+    )
+    .with_cli_program(script);
+    let s1 = store
+        .create_foreman_session_with_engine(FOREMAN_SESSION_KIND_TALK, "", FOREMAN_ENGINE_CLI)
+        .await
+        .unwrap()
+        .id;
+    let s2 = store
+        .create_foreman_session_with_engine(FOREMAN_SESSION_KIND_TALK, "", FOREMAN_ENGINE_CLI)
+        .await
+        .unwrap()
+        .id;
+    let (r1, r2) = tokio::join!(
+        runner.say(Some(&s1), "第一句"),
+        runner.say(Some(&s2), "第二句"),
+    );
+    assert!(r1.is_ok(), "排队的不丢：{r1:?}");
+    assert!(r2.is_ok(), "排队的不丢：{r2:?}");
+    let timing = std::fs::read_to_string(&log).unwrap();
+    let lines: Vec<&str> = timing.lines().collect();
+    assert_eq!(lines.len(), 4, "start/end 各两次：{timing:?}");
+    for pair in lines.chunks(2) {
+        assert_eq!(
+            pair[0], "start",
+            "串行：start 后紧跟 end（cap=1）: {timing:?}"
+        );
+        assert_eq!(pair[1], "end");
+    }
+}
+
+/// 退出码 0 却解析不出回话正文（票 talk-cli-engine 06）：已知结构漂移的确定信号，
+/// fail-fast 不静默成功；读数带未识别行数。
+#[tokio::test]
+async fn empty_reply_with_zero_exit_fails_fast() {
+    let home = TestHome::new().unwrap();
+    let store = Store::open(home.home().clone(), Arc::new(ManualClock::fixed()))
+        .await
+        .unwrap();
+    let bin = home.scratch_dir("bin");
+    std::fs::create_dir_all(&bin).unwrap();
+    let script = bin.join("fake-claude");
+    write_script(
+        &script,
+        r#"#!/bin/sh
+echo '{"type":"mystery-event","payload":1}'
+exit 0
+"#,
+    );
+    let runner = ForemanRunner::new(
+        store.clone(),
+        Settings::default(),
+        home.home().clone(),
+        Arc::new(NeverLlm) as Arc<dyn LlmClient>,
+        Arc::new(testkit::SseRecorder::new()),
+    )
+    .with_cli_program(script);
+    let session = store
+        .create_foreman_session_with_engine(FOREMAN_SESSION_KIND_TALK, "", FOREMAN_ENGINE_CLI)
+        .await
+        .unwrap();
+    let err = runner
+        .say(Some(&session.id), "在吗")
+        .await
+        .expect_err("零正文要报错");
+    assert!(err.to_string().contains("解析不出回话正文"), "{err}");
+}
+
 #[tokio::test]
 async fn first_turn_failure_is_a_turn_error_with_ledger() {
     let home = TestHome::new().unwrap();
