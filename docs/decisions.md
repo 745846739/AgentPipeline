@@ -3323,3 +3323,87 @@ config.rs}`、`tests/e2e/tests/integration/stage_boundary.rs`、`docs/testing.md
 **验证**：`serve.rs` 三条新牙——`alpn_h2_negotiates_and_speaks_http2`（ALPN 谈成 h2 + 真 h2 GET 拿回 JSON）、`sse_over_h2_delivers_a_pushed_event_without_batching`（真事件成帧到达、流不收尾）、`h2_compression_exclusions_match_h1`（`/commands` 带 `content-encoding: gzip`、`/tasks/t1/stream` 不带）；守卫改形 `alpn_advertises_h2_and_http11`。app 全 crate 349 条全绿；`make check-lint` 绿。
 
 **来源**：票 `.scratch/scene-read-path-perf/issues/05-http2.md`（spec 决议 5）；决策 335（TLS 终止与当年教训）、374（握手超时与测试夹具）、361（压缩排除规则）；历史叙述与核对命令同步进 `docs/operations.md` §12.18 与 `docs/testing.md` §2 的 335 行。
+
+### 决策 422 · 积压票批裁决：六张票的方向定案（gate-failure-attribution 02 / foreman-work-record 03·04 / foreman-burns-without-guard 05 / deploy-divergence 01 / task-conversation-replay 01）
+
+**起因**：ready-for-agent 队列清空（票 scene-read-path-perf 05 于 2026-10-11 收口），剩余积压全部卡在裁决上——needs-triage ×4（形状已写好、只差定级定方向）、needs-info ×1（等真实使用证据）、ready-for-human ×1（卡在决策 292 的判据方向，票面明说「得有人拍板」）。用户发起批裁决，六问六答一次定案。
+
+**裁决**：
+
+1. **foreman-burns-without-guard/05（原 ready-for-human）→ 选 (b)**：人的那一轮软告警改**双读数（输入 + 输出）**，**不加硬界**——决策 292 的立意（人的那一轮由人定终点）不动，判据面由本条修订；临时线定为**输入 5M**（本班实证最贵一轮输入 5.16M 会响一声，次贵的 3.27M / 1.14M 不响），跑一段自然使用后按台账分布修线——线的量级是百万，不沿用 120k。
+2. **deploy-divergence/01 → 出路 2 + 1 都做、2 先行；出路 3 不做**。决策 415 只修了「合入在陈旧基线上」那一半，`[repair]` 提交仍会留在部署检出 `/opt/AgentPipeline` 的 main 上且不推 origin（本地 ahead 1）——雷还活着。出路 2（deploy.sh ff 失败时报挡路提交）由票 01 承载（服务器侧脚本，不进仓，改完整脚本抄票面留档）；出路 1（修复轮跑独立克隆、部署检出只做部署）拆新票 `deploy-divergence/03`，spec 先行（克隆供给、回流路径、fetch 语义、静态断言落点四条待裁）。
+3. **gate-failure-attribution/02 → ready-for-agent，排下一轮头位**：形状验收票面已齐，已烧两次（决策 388 的 12 条连发 + 407 轮白跑的 finish）。
+4. **foreman-work-record/03 → 选 (b)**：`kanban_foreman_messages` 加 `started_at` 列（开工时刻）、`created_at` 回收口时刻，两个时刻都留，一条迁移的代价拍板接受。**存量行不编数**：旧 `created_at` 里存的恰好就是开工时刻，回填 `started_at = created_at`、`created_at` 保持不动（收口时刻已不可考，不拿近似值冒充，决策 415「读不到不编数」同款）。
+5. **foreman-work-record/04 → (a)+(b) 一起做**：行为层治根（多义指令先把读法说出来再动）+ 产品层兜底（提议卡面写明按哪种读法理解、依据哪一句），单做任一半都不闭环；(c)（提议作废后自动重提）不塞进本票，值守唤醒面范围另算。
+6. **task-conversation-replay/01 → 维持 needs-info，取证由「纯等报障」改「主动观察」**：挂进 `106-stability/11` 的顺延观察清单——下一个自然任务跑到中途时刷新一次任务详情页、记录对话前半段可见性，有实锤才按既有 reopen 条件触发。
+
+**边界照旧**：本条是裁决记录，不落代码——各票动工时各自的实现决策照常走自己的决策条目；决策 292 的其余面（值守轮 120k 硬界、OPERATION_LOG_MARK 文案口径）一字不动。
+
+**代价（接受）**：foreman-work-record/03 多付一条迁移；deploy-divergence/03 多付一份克隆磁盘与一次 spec 流程。
+
+**验证**：票面层——五张票 Status 改写并带裁决依据、新票 `deploy-divergence/03` 落位（ready-for-agent，spec 先行）、`106-stability/11` 观察清单加任务对话取证一项；无代码改动、无测试新增（各票验收在其动工轮兑现）。
+
+**来源**：六张票原文（实证均出自 2026-10-08 班次 `01M4CDY9EC9M9FSSE236GJXYZC` 的事故账）；关联决策 292（人的那一轮无硬界）、388（闸门超时连发通知）、415（合入前 fetch）、364（任务对话 needs-info 挂起）、210③④（修复轮）、330（部署闸门）。
+
+### 决策 423 · 本机 CLI agent 引擎接入：形状 A（整段执行器）+ provider `kind=cli`（票 `talk-cli-engine` 00）
+
+**起因**：用户提出让对讲台与看板各阶对接本机已安装配置好的 claude code、codex 等 CLI agent。可行性调研确认现状——agent 驱动全部走进程内 `LlmClient`（两族协议），CLI 子进程能力已有唯一收口 `exec.rs`（决策 297）。经三轮拷问（grilling）定案接入形状。
+
+**裁决**：
+
+1. **形状 A：CLI 作为整段执行器**。会话/阶段整体交给 CLI 无头模式（`claude -p` / `codex exec`），CLI 自带工具循环干活，流水线保留确定性闸门兜底；形状 B（CLI 当模型传输层、工具仍走流水线内置 8 工具）不做——工程量翻倍且与 CLI 设计初衷打架。实时性在 A 下不丢：CLI 的 stream-json 事件流翻译成既有 SSE 声道。SDK 调研佐证：Claude Agent SDK（TS/Python）与 codex CLI 的官方集成形状本质都是「CLI 子进程 + JSON 事件流」，Rust 侧经 `exec.rs` 直连是等价物。
+2. **建模：provider 表加 `kind=cli`**，不另立「引擎」概念——决策 105（任务级覆盖）、111（正规化）、160（测试连接探针跑 `claude --version`）的形状全部免费复用；`model` 字段映射 CLI 的 `--model` 参数。CLI 用本机自己的登录态，不进决策 112 的密钥存储体系。
+3. **混用：按「阶段 × 任务」自由混用** API agent 与 CLI 引擎（复用决策 105 的覆盖机制）——review 阶段换异族引擎即异族复判从 prompt 层升维到引擎层。
+4. **并发：per-engine 并发上限**进全局配置参数表（默认 2），调度器派发前查槽位——CLI 的资源画像（本机进程 + 订阅配额）与远端 API 不同，不复用同一并发数。
+5. **版本漂移三件套**：启动探测版本号（provider 配置存已知兼容范围，超界拒启）+ 解析宽容 + 解析失败 fail-fast 落台账并在看板标红——不静默解析出错。
+6. **范围分期**：一期对讲台 × claude code（见决策 424）；看板各阶接入、codex 第二实现与 `CliAgent` trait 双实现收敛留二期——单实现收敛不了抽象形状，codex 是返工压力测试。
+
+**边界**：本条是方向定案，不落代码（决策 422 形状）；看板各阶段接 CLI 的 submit_metadata 获取方式与权限面映射留二期各自决策；决策 395/396 的写入面白名单对 API agent 路径一字不动。
+
+**代价（接受）**：provider 概念不纯（`kind=cli` 的 provider 自带工具循环，`LlmClient` 不适用，需并行的 `CliAgent` 入口）；`exec.rs` 多一类长生命周期子进程（心跳/超时语义要核对）。
+
+**验证**：票面层——`.scratch/talk-cli-engine/` spec 与六张带阻塞边的票落位；无代码改动（实现验收在各票动工轮兑现）。
+
+**来源**：grilling 拷问会话（2026-10-11，三轮十二问）；关联决策 5（LLM 调用方式）、105/111/160（provider 体系）、112（密钥）、297（exec 收口）、330/381/398/420（外发——与本条方向不同：外发是单条命令出仓，本条是整段会话交给本机引擎）、395/396（写入面白名单）。
+
+### 决策 424 · 对讲台 CLI 引擎一期：只读权限面 + stdio MCP 提议通道 + `--resume` 续接（票 `talk-cli-engine` 01–06）
+
+**起因**：决策 423⑥ 的一期落点。对讲台（值班长，决策 176/182）换 CLI 引擎后，最大的纪律风险是 CLI 自带 Bash 等工具可绕过「提议 → 人确认」（决策 207）直接改状态——一期必答题。
+
+**裁决**：
+
+1. **权限面只读**：对讲台会话里的 claude code 允许读仓库、跑只读命令；写文件与改状态一律禁（权限参数收口）。值班长手里不该有写刀，要动手的活由它开提议走流水线变成正经任务；「对讲台顺手改代码」明确排除（绕过 review/test 闸门，决策 395 白名单思路的反面）。
+2. **提议通道 = stdio MCP 薄代理**：每会话起一个无状态小子进程，把 MCP 工具调用翻译成对既有 `routes/foreman.rs` 端点的 HTTP 调用，鉴权复用配对令牌（决策 182）；不新增服务面、代理崩了重启即可。暴露集合是 `catalog.rs`（决策 247 单一事实源）里**状态变更类**的子集——读类工具由 CLI 原生工具承担，不重复暴露；MCP 是同一批工具规格的第二个传输绑定，不是第二份清单。CLI 自带的 subagent（Task 工具）覆盖 `spawn_sub_agent`，后者不进 MCP。
+3. **续接用 `--resume`**：CLI session id 落对讲台会话表（加列），上下文由 CLI 自持；**`--resume` 失败即触发重建**——不静默、当轮显式告知「引擎侧会话已失效，已用摘要重建」，摘要取自既有会话落库；不做后台存活探测（为罕见事件不养常驻路径），降级只有一条代码路径。
+4. **引擎建会话时选定、会话内锁定**：全局配置给默认引擎，新建会话可改，中途不给换（CLI 会话绑死引擎，要换开新会话）。
+5. **流式三声道全接**（决策 244）：文本逐字、工具事件、thinking 全部从 stream-json 翻译到既有 SSE 声道；工具事件是 CLI 原生工具的形状（Read/Bash 等），前端 Talk 页适配展示——CLI 引擎下体验不得比 API 引擎倒退。
+6. **态势注入 = 首轮 + 每轮**：首轮系统 prompt 注入角色与纪律；看板态势/任务台账等易变事实每轮作为消息前缀追加——会话历史归 CLI 管，新鲜事实每轮喂；稳定前缀在前、易变在后，与决策 299 的 prompt cache 前缀不冲突。
+
+**边界**：提议 → 人确认机制（决策 207）与 `routes/foreman.rs` 端点语义一字不动——CLI 不新增第二条改状态的路；看板各阶的 CLI 接入不在本条范围（决策 423⑥ 二期）。
+
+**代价（接受）**：每会话多一个 MCP 代理子进程；CLI 版本漂移风险由决策 423⑤ 三件套承接；`claude -p` 的 stream-json 输出格式不是稳定契约，解析器按宽容处理。
+
+**验证**：票面层——六张票（01 探针与 kind=cli 基座 / 02 会话执行回路 / 03 三声道桥接 / 04 引擎选择器与锁定 / 05 MCP 提议代理 / 06 并发与 fail-fast 读数）落 `.scratch/talk-cli-engine/issues/`；测试钉子在各票验收时兑现（FakeCliAdapter 走决策 142/148 的 FakeAgent 接缝，真 CLI 窄跑按 testing.md §10 选层）。
+
+**来源**：grilling 拷问会话（2026-10-11）；关联决策 423（根决策）、176/182（值班长与对讲台）、207（提议机制）、244（三声道）、247（工具清单单一事实源）、252（哨兵不解析）、299（cache 前缀）、204/209（班次与值守轮）、142/148（FakeAgent 边界）。
+
+### 决策 425 · repair 闸门回执三态：读数记「超时」、回执把超时与失败分开说（票 `gate-failure-attribution` 02，决策 422③ 的实施）
+
+**起因**：407 轮的 finish 回执把一次 600s 超时（冷缓存首编译）逐字报成「闸门没过（test）：退出码 -1」，值班长把冷编译当测试失败白跑一轮；决策 388 的 12 条连发同根——超时与失败共用一个回执形状。决策 422③ 定级 ready-for-agent 并排头位。
+
+**裁决**：
+
+1. **终态下沉进读数**：`GateReading` 加 `timed_out`（`#[serde(default)]`——存量提议载荷没有这个字段，读不出即「没超时」，不编数），`run_gate_command` 从命令收口的 `CommandOutput.timed_out`（决策 297 已有）如实填入。退出码 -1 从此只是超时的**结果**，不是它的身份。
+2. **判据锚在第一条没过的读数**（`gate_timed_out` / `first_failed_reading`）：「lint 真失败 + test 超时」的混合里这一轮的本质是失败——先没过的那条说话（决策 412 的候选枚举姿态，有测试钉住）。
+3. **整条回执一个出处**（`gate_failed_receipt`，finish 与 deliver 共用）：超时支 =「闸门超时」+ 实测用时 + **阈值带数**（「达到阈值 600s」）+「冷编译常见，可直接重跑一次」+「可直接再调一次 finish」，且**不出现**「闸门没过」；失败支逐字照旧（「没过」+ 退出码 +「改完再调一次」）。全文日志路径与读数行两种终态都保留——它是模型下一步的唯一证据入口。
+4. **没有 settings 的两处摘要不带数**：提议卡面（`propose_repair`）与合入前置检查（`run_repair`）的 `gate_failure_note` 超时支只点名旋钮（「达到 test_command_timeout_sec 阈值」）——阈值数字只在 settings 在手的回执层出现；两支共用一份 `gate_timeout_note`，措辞不漂。
+5. **组合闸门同治**：deliver 的任务工作区组合闸门超时时包壳改说「闸门超时」，note 用带数摘要（settings 在手）——票面只点名 finish，但这三处是同一份 `run_repair_gate`，单治一处等于把同形病留两处。
+6. **前端卡面同形状**：`repairGateLabel` 超时读数写「test 超时」不写「失败(-1)」（`timed_out` 可选字段，存量载荷自然回落旧形状）。
+
+**边界照旧**：不动闸门跑哪些命令、不动 `test_command_timeout_sec` 取值、不碰流水线侧闸门（票 01 的地盘）；`test_command_timeout_sec` 本身照旧只管 lint 与 test 两条线。
+
+**代价（接受）**：`RepairRound::GateFailed` / `RepairConclusion::GateFailed` 去掉 `note` 字段（回执在工具层拼，枚举只交读数，两处调用方同轮改）；一条守恒是措辞级——超时支的下一步指针从「改完再调一次」换成了「可直接再调一次」，这是票面形状 2 的本意（重跑无需改代码）。
+
+**验证**：`tests/integration/repair.rs`（闸门级：真 `sleep 30` 撞 2s 线 + 回执断言「超时」且不含「闸门没过」+ 混合情形判据 + 收口不变式无 commit/diff/提议）；`foreman.rs`（finish 走工具的回执）；`repair_deliver.rs`（deliver 走工具的回执 + 不 resume 不落补丁）；前端 `proposals.test.ts`（卡面 label 超时支）；全仓 1840 后端 + 1214 前端全绿，clippy / svelte-check 零告警。手工面验收（冷缓存 `cargo test` 配 600s 线复跑）留在票面 Comments 兑现。
+
+**来源**：票 `gate-failure-attribution/02` 原文（实证出自 2026-10-08 班次 `01M4CDY9EC9M9FSSE236GJXYZC` 的 407 轮回执）；关联决策 388（同族代价：600s 超时连发 12 条通知）、297（命令收口的 `timed_out` 读数）、422③（定级与排序）、210④（闸门不过不出 diff）、11（读数落提议）。
