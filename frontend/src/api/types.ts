@@ -1167,6 +1167,14 @@ export interface ForemanMessage {
    * 时间线把「已中断 + 这一刻」摆在名牌旁边——**可选**：老后端不发（加性改动）。
    */
   interrupted_at?: string | null;
+  /**
+   * **开工时刻**（迁移 0048，票 foreman-work-record 03）：这一行开始存在的时刻。
+   *
+   * assistant 轮上它是这轮开工那一刻，`created_at` 是收口（说完）时刻——「一轮跑多久」
+   * 两列相减可得；其余行两刻同一瞬间。**可选**：老后端不发（加性改动）；存量行由迁移
+   * 把旧 `created_at` 原样抄入（旧收口时刻不可考、不编数）。
+   */
+  started_at?: string | null;
 }
 
 /**

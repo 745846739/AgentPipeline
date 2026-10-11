@@ -4116,6 +4116,150 @@ async fn session_totals_ignore_in_flight_rows() {
     );
 }
 
+/// 台账行的**两刻分立**（票 foreman-work-record 03，决策 422④ (b) 版）：在途半截行
+/// `created_at` = `started_at` = 开工时刻（前端直播读的正是它，行为不变）；收口把
+/// `created_at` 刷成**说完**时刻、`started_at` 一字不动——「一轮跑多久」两列相减可得。
+#[tokio::test]
+async fn close_refreshes_created_at_but_never_touches_started_at() {
+    let h = Harness::empty().await;
+    let sid = h.session().await;
+    h.store
+        .append_foreman_user_message(&sid, "修一下 t1")
+        .await
+        .unwrap();
+
+    let row = h.store.begin_foreman_inflight(&sid, None).await.unwrap();
+    let started = h.clock.now();
+    // 在途：两刻同瞬（都是开工时刻），直播读的 created_at 与今天一致。
+    let inflight = h
+        .store
+        .list_foreman_messages(&sid, 10, None)
+        .await
+        .unwrap()
+        .into_iter()
+        .find(|m| m.id == row)
+        .unwrap();
+    assert_eq!(inflight.status.as_deref(), Some(FOREMAN_MESSAGE_IN_FLIGHT));
+    assert_eq!(inflight.created_at, started);
+    assert_eq!(inflight.started_at, Some(started));
+
+    h.clock.advance_secs(60);
+    h.store
+        .close_foreman_inflight(row, NewForemanMessage::assistant(&sid, "说完了"), 0)
+        .await
+        .unwrap();
+
+    let closed = h
+        .store
+        .list_foreman_messages(&sid, 10, None)
+        .await
+        .unwrap()
+        .into_iter()
+        .find(|m| m.id == row)
+        .unwrap();
+    assert_eq!(closed.status, None);
+    assert_eq!(closed.started_at, Some(started), "开工时刻一字不动");
+    assert_eq!(closed.created_at, h.clock.now(), "created_at 刷成收口时刻");
+    // 收口时刻与会话的「最近说话」同刻（既有语义，顺带锚住）。
+    let session = h.store.get_foreman_session(&sid).await.unwrap().unwrap();
+    assert_eq!(session.last_active_at, closed.created_at);
+}
+
+/// 一轮**进行中**落下的 system 行，收口之后按 `created_at` 排在 assistant 行**之前**
+/// （票 foreman-work-record 03，时间序归位）：开工 t0、「提议已执行」落在 t0+60、
+/// 收口在 t0+120——按 `created_at` 排序的消费方（对讲台 `talkTurns`）把 system 行摆到
+/// 这轮回话前面，与它发生的时刻一致。
+#[tokio::test]
+async fn a_system_row_logged_mid_round_has_an_earlier_created_at_than_the_reply() {
+    let h = Harness::empty().await;
+    let sid = h.session().await;
+    let row = h.store.begin_foreman_inflight(&sid, None).await.unwrap();
+    h.clock.advance_secs(60);
+    h.store
+        .append_foreman_message(NewForemanMessage::system(&sid, "提议已执行"))
+        .await
+        .unwrap();
+    h.clock.advance_secs(60);
+    h.store
+        .close_foreman_inflight(row, NewForemanMessage::assistant(&sid, "说完了"), 0)
+        .await
+        .unwrap();
+
+    let msgs = h.store.list_foreman_messages(&sid, 10, None).await.unwrap();
+    let system = msgs.iter().find(|m| m.role == "system").unwrap();
+    let assistant = msgs.iter().find(|m| m.id == row).unwrap();
+    assert!(
+        system.created_at < assistant.created_at,
+        "system（{}）要早于 assistant 收口（{}）",
+        system.created_at,
+        assistant.created_at
+    );
+}
+
+/// 一开口就把时钟推 30s 的 stub（票 foreman-work-record 03）：开工与收口之间要有
+/// 时间差，而轮次循环里我们控得住的只有模型调用本身——fake 时钟从 `complete` 里推进。
+struct SlowModel {
+    calls: Arc<std::sync::atomic::AtomicUsize>,
+    clock: ManualClock,
+}
+
+impl LlmClient for SlowModel {
+    fn complete(
+        &self,
+        _request: LlmRequest,
+    ) -> futures::future::BoxFuture<'static, agentpipeline_core::Result<AgentResponse>> {
+        let n = self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
+        let clock = self.clock.clone();
+        Box::pin(async move {
+            clock.advance_secs(30);
+            Ok(AgentResponse {
+                content: Some(format!("第 {n} 步的回话。")),
+                tool_calls: Vec::new(),
+                prompt_tokens: 10,
+                completion_tokens: 5,
+                ..Default::default()
+            })
+        })
+    }
+}
+
+/// 全轮走一遍（票 foreman-work-record 03，验收②）：一轮的 assistant 行 `created_at`
+/// **晚于**同轮 user 行、与会话 `last_active_at` 同刻（都是收口时刻）；`started_at`
+/// 是开工时刻。
+#[tokio::test]
+async fn a_say_round_stamps_the_start_and_finish_times_apart() {
+    let h = Harness::seeded().await;
+    let sid = h.session().await;
+    let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let runner = h.runner_with_llm(Arc::new(SlowModel {
+        calls: calls.clone(),
+        clock: h.clock.clone(),
+    }));
+
+    runner.say(Some(&sid), "修一下 t1").await.unwrap();
+    assert_eq!(
+        calls.load(std::sync::atomic::Ordering::SeqCst),
+        1,
+        "没有工具调用，一轮一次模型调用就说完"
+    );
+
+    let msgs = h.store.list_foreman_messages(&sid, 10, None).await.unwrap();
+    let user = msgs.iter().find(|m| m.role == "user").unwrap();
+    let assistant = msgs.iter().find(|m| m.role == "assistant").unwrap();
+    assert_eq!(
+        assistant.started_at,
+        Some(user.created_at),
+        "开工时刻：开工与 user 落行在同一 tick（假时钟不动就不走）"
+    );
+    assert_eq!(
+        assistant.created_at,
+        user.created_at + chrono::Duration::seconds(30),
+        "说完时刻 = 开工 + 30s（stub 推的钟）"
+    );
+    let session = h.store.get_foreman_session(&sid).await.unwrap().unwrap();
+    assert_eq!(session.last_active_at, assistant.created_at);
+}
+
 /// 保留期**只摘消息表**（票 04，显式修订决策 182④「对讲台与全仓同一把保留期尺」与
 /// 决策 204⑦「归档不保护消息」——豁免之后，归档与否、超龄与否都不再删对话消息）。
 ///

@@ -26,6 +26,7 @@ mod foreman_cli;
 mod foreman_golden;
 mod foreman_proposals;
 mod foreman_sessions_migration;
+mod foreman_started_at_migration;
 mod git_chain;
 mod llm_smoke;
 mod model_requests;

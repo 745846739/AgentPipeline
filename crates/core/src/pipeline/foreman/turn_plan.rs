@@ -541,6 +541,7 @@ mod tests {
             status: None,
             seq: 0,
             interrupted_at: None,
+            started_at: None,
             created_at: DateTime::<Utc>::from_timestamp(1_700_000_000 + id, 0).unwrap(),
         }
     }

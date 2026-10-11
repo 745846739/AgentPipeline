@@ -1377,6 +1377,10 @@ fn message_wire(m: &ForemanMessage) -> serde_json::Value {
         // 中断时刻（迁移 0036，票 03）：`status = "interrupted"` 的行记下什么时候断的，
         // 时间线把「已中断 + 那一刻」一起摆出来。其余行恒 null。
         "interrupted_at": m.interrupted_at.map(|t| t.to_rfc3339()),
+        // 开工时刻（迁移 0048，票 foreman-work-record 03）：assistant 轮上它是这轮开工
+        // 那一刻，`created_at` 是收口（说完）时刻——「一轮跑多久」两列相减可得。恒在场
+        // 的加性字段：存量行由迁移回填（旧 created_at 原样抄入），其余行两刻同瞬。
+        "started_at": m.started_at.map(|t| t.to_rfc3339()),
     })
 }
 
@@ -1465,5 +1469,43 @@ mod tests {
         ] {
             assert!(src.contains(present), "四族要经 {present} 走");
         }
+    }
+
+    /// **两刻都上线**（迁移 0048，票 foreman-work-record 03）：`started_at`（开工）与
+    /// `created_at`（收口/定稿）在 wire 上是两个字段，谁也不能吞掉谁——审计「一轮跑
+    /// 多久」读的就是这一对。`message_wire` 是唯一序列化点，单测守它即可。
+    #[test]
+    fn message_wire_carries_both_the_start_and_finish_times() {
+        use agentpipeline_core::storage::foreman::ForemanMessage;
+        use chrono::{TimeZone, Utc};
+
+        let m = ForemanMessage {
+            id: 1,
+            session_id: "s1".into(),
+            role: "assistant".into(),
+            content: "说完了。".into(),
+            prompt_tokens: 0,
+            completion_tokens: 0,
+            briefing_json: None,
+            traces_json: None,
+            segments_json: None,
+            changed_files_json: None,
+            thinking: None,
+            ask_json: None,
+            status: None,
+            seq: 0,
+            interrupted_at: None,
+            started_at: Some(Utc.with_ymd_and_hms(2026, 10, 11, 0, 48, 23).unwrap()),
+            created_at: Utc.with_ymd_and_hms(2026, 10, 11, 1, 26, 25).unwrap(),
+        };
+        let wire = super::message_wire(&m);
+        assert_eq!(
+            wire["started_at"], "2026-10-11T00:48:23+00:00",
+            "开工时刻在场"
+        );
+        assert_eq!(
+            wire["created_at"], "2026-10-11T01:26:25+00:00",
+            "定稿（收口）时刻在场"
+        );
     }
 }

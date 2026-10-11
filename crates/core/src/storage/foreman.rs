@@ -159,6 +159,14 @@ pub struct ForemanMessage {
     /// **中断时刻**（迁移 0036，票 03）：`status = 'interrupted'` 的行记下什么时候断的，
     /// 时间线据此把「已中断」与断的那一刻一起摆出来。其余行恒 `None`。
     pub interrupted_at: Option<DateTime<Utc>>,
+    /// **开工时刻**（迁移 0048，票 foreman-work-record 03）：这一行**开始**存在的时刻。
+    ///
+    /// assistant 轮上它是这轮开工（[`Self::begin_foreman_inflight`] 建半截行）那一刻，
+    /// `created_at` 则在收口时刷成**说完**时刻（[`Self::close_foreman_inflight`]）——
+    /// 「一轮跑多久」从两列相减得到。其余行两刻同一瞬间（落行即定稿）。存量行由迁移
+    /// 把旧 `created_at` 原样抄进来——它存的恰好就是开工时刻；旧 `created_at` 不动，
+    /// 存量行的收口时刻不可考、不编数。
+    pub started_at: Option<DateTime<Utc>>,
     pub created_at: DateTime<Utc>,
 }
 
@@ -292,6 +300,7 @@ struct ForemanMessageRow {
     status: Option<String>,
     seq: i64,
     interrupted_at: Option<String>,
+    started_at: Option<String>,
     created_at: String,
 }
 
@@ -320,6 +329,7 @@ impl ForemanMessageRow {
             status: self.status,
             seq: self.seq.max(0),
             interrupted_at: self.interrupted_at.as_deref().map(parse_ts).transpose()?,
+            started_at: self.started_at.as_deref().map(parse_ts).transpose()?,
             created_at: parse_ts(&self.created_at)?,
         })
     }
@@ -334,7 +344,7 @@ fn parse_json(raw: &str) -> Result<Value> {
 const FOREMAN_MESSAGE_COLUMNS: &str = "id, session_id, role, content, prompt_tokens, \
                                        completion_tokens, briefing_json, traces_json, \
                                        segments_json, changed_files_json, thinking, ask_json, \
-                                       status, seq, interrupted_at, created_at";
+                                       status, seq, interrupted_at, started_at, created_at";
 
 const FOREMAN_SESSION_COLUMNS: &str =
     "id, title, kind, engine, cli_session_id, created_at, last_active_at, archived_at";
@@ -597,8 +607,9 @@ impl Store {
         let id: i64 = sqlx::query_scalar(
             "INSERT INTO kanban_foreman_messages
              (session_id, role, content, prompt_tokens, completion_tokens, briefing_json,
-              traces_json, segments_json, changed_files_json, thinking, ask_json, created_at)
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) RETURNING id",
+              traces_json, segments_json, changed_files_json, thinking, ask_json, started_at,
+              created_at)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) RETURNING id",
         )
         .bind(&msg.session_id)
         .bind(&msg.role)
@@ -611,6 +622,7 @@ impl Store {
         .bind(msg.changed_files_json.as_ref().map(Value::to_string))
         .bind(msg.thinking.as_deref())
         .bind(msg.ask_json.as_ref().map(Value::to_string))
+        .bind(ts(now))
         .bind(ts(now))
         .fetch_one(&mut *tx)
         .await?;
@@ -632,6 +644,10 @@ impl Store {
     ///
     /// 不刷 `last_active_at`：会话的「最近说话」由真落了话的那次刷新（收口那一下），
     /// 在途只是把这一轮的现场建出来——建了但没跑完的轮（丢弃 / 中断）不该把班次顶上去。
+    ///
+    /// 这一写同时定下 [`ForemanMessage::started_at`]（迁移 0048，票 foreman-work-record 03）：
+    /// 开工时刻在建行那一刻落定，收口的 UPDATE 只刷 `created_at`、不碰这一列——
+    /// 「一轮跑多久」从两列相减得到。
     pub async fn begin_foreman_inflight(
         &self,
         session_id: &str,
@@ -641,13 +657,14 @@ impl Store {
         let id: i64 = sqlx::query_scalar(
             "INSERT INTO kanban_foreman_messages
              (session_id, role, content, prompt_tokens, completion_tokens, briefing_json,
-              status, created_at)
-             VALUES (?, ?, '', 0, 0, ?, ?, ?) RETURNING id",
+              status, started_at, created_at)
+             VALUES (?, ?, '', 0, 0, ?, ?, ?, ?) RETURNING id",
         )
         .bind(session_id)
         .bind(FOREMAN_ROLE_ASSISTANT)
         .bind(briefing_json.as_ref().map(Value::to_string))
         .bind(FOREMAN_MESSAGE_IN_FLIGHT)
+        .bind(ts(now))
         .bind(ts(now))
         .fetch_one(self.pool())
         .await?;
@@ -685,6 +702,11 @@ impl Store {
     /// 与 [`Self::append_foreman_message`] 同一形状的落库（同一事务刷 `last_active_at`），
     /// 差别只有「写已有的那一行」而不是追加——于是收口后台账仍是「一次回话 = user 行 +
     /// assistant 行」两行，边流边写不改变行数语义，只改变中途是否可见（spec 决策 1）。
+    ///
+    /// **`created_at` 在这里刷成收口时刻**（迁移 0048，票 foreman-work-record 03）：它是
+    /// 「这一行定稿的时刻」，而开工那一瞬已由 [`ForemanMessage::started_at`] 承载——
+    /// 不刷新的话「说的时刻」永远是开工时刻（事故账 394 / 407 那两轮只差 10–30ms 的
+    /// 病根）。[`ForemanMessage::started_at`] 原样不动。
     pub async fn close_foreman_inflight(
         &self,
         row_id: i64,
@@ -697,7 +719,7 @@ impl Store {
             "UPDATE kanban_foreman_messages
              SET content = ?, prompt_tokens = ?, completion_tokens = ?, briefing_json = ?,
                  traces_json = ?, segments_json = ?, changed_files_json = ?, thinking = ?,
-                 ask_json = ?, seq = ?, status = NULL
+                 ask_json = ?, seq = ?, status = NULL, created_at = ?
              WHERE id = ?",
         )
         .bind(&msg.content)
@@ -710,6 +732,7 @@ impl Store {
         .bind(msg.thinking.as_deref())
         .bind(msg.ask_json.as_ref().map(Value::to_string))
         .bind(seq as i64)
+        .bind(ts(now))
         .bind(row_id)
         .execute(&mut *tx)
         .await?;
@@ -783,12 +806,13 @@ impl Store {
         let id: i64 = sqlx::query_scalar(
             "INSERT INTO kanban_foreman_messages
              (session_id, role, content, prompt_tokens, completion_tokens, briefing_json,
-              traces_json, thinking, created_at)
-             VALUES (?, ?, ?, 0, 0, NULL, NULL, NULL, ?) RETURNING id",
+              traces_json, thinking, started_at, created_at)
+             VALUES (?, ?, ?, 0, 0, NULL, NULL, NULL, ?, ?) RETURNING id",
         )
         .bind(session_id)
         .bind(FOREMAN_ROLE_USER)
         .bind(content)
+        .bind(ts(now))
         .bind(ts(now))
         .fetch_one(&mut *tx)
         .await?;
