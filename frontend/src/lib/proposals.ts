@@ -220,7 +220,8 @@ export function repairActionLabel(p: ForemanProposal): string {
  * 闸门那一行的读数（票 12：闸门读数显示在那条提议上）。
  *
  * 没过闸门的修复**根本没有 diff**（决策 210④），所以这一行的措辞要说清「为什么没有补丁」——
- * 否则人会以为是加载失败。
+ * 否则人会以为是加载失败。超时与失败分开说（票 gate-failure-attribution/02）：被时限砍断
+ * 不写「失败」——冷缓存下首编译超时是常态，把它当失败会引人去「改代码」。
  */
 export function repairGateLabel(p: ForemanProposal): string | null {
   if (!isRepairProposal(p)) return null;
@@ -228,7 +229,11 @@ export function repairGateLabel(p: ForemanProposal): string | null {
   if (gate.length === 0) return '闸门：未记录';
   const passed = p.payload?.gate_passed ?? false;
   const steps = gate
-    .map((g) => `${g.kind} ${g.exit_code === 0 ? '过' : `失败(${g.exit_code})`}`)
+    .map((g) =>
+      g.timed_out
+        ? `${g.kind} 超时`
+        : `${g.kind} ${g.exit_code === 0 ? '过' : `失败(${g.exit_code})`}`,
+    )
     .join(' / ');
   return passed ? `闸门：${steps}` : `闸门未过，没有补丁：${steps}`;
 }

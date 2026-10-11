@@ -346,8 +346,9 @@ async fn a_failed_gate_round_stops_before_commit_diff_and_proposal() {
     .unwrap();
 
     match round {
-        RepairRound::GateFailed { gate, note } => {
+        RepairRound::GateFailed { gate } => {
             assert_ne!(gate[0].exit_code, 0, "闸门读数要如实记失败");
+            let note = gate_failure_note(&gate);
             assert!(note.contains("test"), "失败说明要点名是哪一步：{note}");
         }
         other => panic!("闸门不过时不该走到 commit / diff / 提议：{other:?}"),
@@ -373,6 +374,128 @@ async fn a_failed_gate_round_stops_before_commit_diff_and_proposal() {
             .is_empty(),
         "闸门不过时不该有提议：那会让人以为有东西可合"
     );
+}
+
+/// 票 gate-failure-attribution/02：test 那条线被时限砍断时，读数记「超时」、回执说
+/// 「超时」——不再与真失败同形。407 轮的教训：冷缓存下 `cargo test` 首编译约 12.5 分钟，
+/// 600s 的线把它砍断后回执照说「闸门没过」，值班长把一次冷编译当成了测试失败去改代码。
+#[tokio::test]
+async fn a_timed_out_test_gate_is_reported_as_timeout_not_failure() {
+    use agentpipeline_core::pipeline::repair::{
+        finish_repair_round, gate_failed_receipt, RepairRound,
+    };
+
+    let (home, store, clock, repo) = fixture().await;
+    let project = project_for(&repo, "sleep 30"); // 必然过不了 2s 的线
+    let settings = agentpipeline_core::config::Settings {
+        test_command_timeout_sec: 2,
+        ..Default::default()
+    };
+    let session = start_repair(
+        home.home(),
+        repo.path(),
+        "main",
+        &new_repair_id(),
+        &foreman_session(&store).await,
+    )
+    .await
+    .unwrap();
+    std::fs::write(session.worktree.join("half_done.rs"), "pub fn half() {}\n").unwrap();
+
+    let round = finish_repair_round(
+        &store,
+        home.home(),
+        &settings,
+        &killer(),
+        &project,
+        &session,
+        "改了一半",
+        None,
+        agentpipeline_core::clock::Clock::now(&clock),
+    )
+    .await
+    .unwrap();
+
+    let RepairRound::GateFailed { gate } = round else {
+        panic!("超时也是闸门不过：不该走到 commit / diff / 提议");
+    };
+    assert!(
+        gate[0].timed_out,
+        "读数要如实记下「被时限砍断」：{:?}",
+        gate[0]
+    );
+    assert_ne!(gate[0].exit_code, 0);
+
+    // 回执（工具层拿这些件拼）：「超时」+ 实测用时 + 阈值带数 + 冷编译提示，
+    // 且**不出现**「闸门没过」——两种终态不许共用一个形状。
+    let receipt = gate_failed_receipt(
+        "**没有出 diff、也没有提提议**",
+        "finish",
+        &gate,
+        settings.test_command_timeout_sec,
+    );
+    assert!(receipt.contains("超时"), "{receipt}");
+    assert!(!receipt.contains("闸门没过"), "超时不是失败：{receipt}");
+    assert!(receipt.contains("阈值 2s"), "阈值要带数：{receipt}");
+    assert!(receipt.contains("冷编译常见"), "{receipt}");
+    assert!(
+        receipt.contains("可直接再调一次 finish"),
+        "下一步的口子要保留：{receipt}"
+    );
+
+    // 收口不变式与真失败共用：没有 commit、没有 diff 文件、没有提议。
+    assert_eq!(
+        repo.head("main"),
+        repo.head(&session.branch),
+        "闸门不过就不该有 commit"
+    );
+    assert!(
+        !home
+            .home()
+            .worktrees_dir()
+            .join(format!("repair-{}.diff", session.repair_id))
+            .exists(),
+        "超时同样不该落 diff 文件"
+    );
+    assert!(
+        store
+            .list_pending_foreman_proposals(&session.session_id)
+            .await
+            .unwrap()
+            .is_empty(),
+        "超时同样不该有提议"
+    );
+}
+
+/// 判据的两个候选（决策 412 的枚举姿态）：「lint 真失败 + test 超时」的混合里，
+/// 这一轮的本质是**失败**——判据锚在第一条没过的读数上，先没过的那条说话。
+#[tokio::test]
+async fn a_real_failure_before_a_timeout_classifies_the_round_as_failure() {
+    use agentpipeline_core::pipeline::repair::{gate_failed_receipt, gate_timed_out, GateReading};
+
+    let reading = |kind: &str, exit_code: i32, timed_out: bool| GateReading {
+        kind: kind.into(),
+        command: format!("{kind} 命令"),
+        exit_code,
+        duration_ms: 1_000,
+        output_path: None,
+        output_preview: String::new(),
+        timed_out,
+    };
+    let mixed = vec![
+        reading("lint", 1, false),
+        reading("test", -1, true), // 没跑到：闸门停在 lint，这条只是假设的形状
+    ];
+    assert!(
+        !gate_timed_out(&mixed),
+        "先没过的是真失败：这一轮不许报成超时"
+    );
+    let receipt = gate_failed_receipt("某种开场", "finish", &mixed, 600);
+    assert!(receipt.contains("闸门没过"), "{receipt}");
+    assert!(receipt.contains("lint 退出码 1"), "{receipt}");
+
+    let only_timeout = vec![reading("lint", 0, false), reading("test", -1, true)];
+    assert!(gate_timed_out(&only_timeout));
 }
 
 /// 收口序列的后半：闸门过了 → 带标记的 commit + diff 落盘 + **一条不设 TTL 的修复提议**。

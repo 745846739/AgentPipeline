@@ -297,6 +297,22 @@ describe('修复提议：合入而不是执行，闸门读数说清有没有补�
     expect(isRepairProposal(failed)).toBe(true);
   });
 
+  it('超时的读数不说「失败」——冷编译被时限砍断是常态（票 gate-failure-attribution/02）', () => {
+    const timedOut = repair({
+      payload: {
+        ...repair().payload!,
+        gate_passed: false,
+        gate: [
+          { ...repair().payload!.gate[0], exit_code: -1, timed_out: true },
+        ],
+        diff: null,
+      },
+    });
+    const label = repairGateLabel(timedOut)!;
+    expect(label).toContain('超时');
+    expect(label).not.toContain('失败');
+  });
+
   it('普通提议不走修复那一块', () => {
     expect(isRepairProposal(proposal())).toBe(false);
     expect(repairGateLabel(proposal())).toBeNull();

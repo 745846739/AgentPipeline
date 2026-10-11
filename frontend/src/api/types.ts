@@ -1216,6 +1216,8 @@ export interface RepairPayload {
     duration_ms: number;
     output_path: string | null;
     output_preview: string;
+    /** 被 lint/test 时限砍断（票 gate-failure-attribution/02）；存量载荷没有这个字段。 */
+    timed_out?: boolean;
   }[];
   commit: string | null;
   diff: string | null;

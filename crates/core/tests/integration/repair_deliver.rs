@@ -69,9 +69,19 @@ impl Harness {
     }
 
     fn runner_with_steward(&self, script: Script, steward: Arc<RecordingSteward>) -> ForemanRunner {
+        self.runner_with_settings(script, steward, Settings::default())
+    }
+
+    /// 非缺省设置的那一种构造（闸门超时用例要配一个小 `test_command_timeout_sec`）。
+    fn runner_with_settings(
+        &self,
+        script: Script,
+        steward: Arc<RecordingSteward>,
+        settings: Settings,
+    ) -> ForemanRunner {
         ForemanRunner::new(
             self.store.clone(),
-            Settings::default(),
+            settings,
             self._home.home().clone(),
             Arc::new(FakeAgent::new(script)) as Arc<dyn LlmClient>,
             Arc::new(SseRecorder::new()),
@@ -531,6 +541,50 @@ async fn a_repair_gate_failure_delivers_nothing() {
     );
     assert!(steward.calls.lock().unwrap().is_empty());
     assert!(!wt.join("fix.txt").exists(), "闸门不过不落补丁");
+    assert!(h
+        .store
+        .list_pending_foreman_proposals(&turn.session.id)
+        .await
+        .unwrap()
+        .is_empty());
+}
+
+/// 票 gate-failure-attribution/02：deliver 的闸门被时限砍断时，回执说「超时」——
+/// 与 finish 同门（同一份收口），包壳也不许再写「闸门没过」。
+#[tokio::test]
+async fn a_timed_out_deliver_gate_receipt_says_timeout_not_failure() {
+    let h = Harness::new().await;
+    let repo = Repo::clean().unwrap();
+    h.git_project(&repo, "sleep 30").await; // 必然过不了 2s 的线
+    testkit::seed_task(&h.store, "t1", "p1").await.unwrap();
+    let wt = task_worktree(&h, &repo).await;
+    park_task(&h.store, "t1", PendingKind::RetryExhausted, "重试耗尽").await;
+    h.store
+        .set_stewardship("t1", Some(&Stewardship::enabled_now(h.clock.now())))
+        .await
+        .unwrap();
+    let rid = prepared_repair(&h, &repo, "修复的正文\n").await;
+
+    let settings = Settings {
+        test_command_timeout_sec: 2,
+        ..Default::default()
+    };
+    let steward = RecordingSteward::new();
+    let runner =
+        h.runner_with_settings(deliver_script("p1", &rid, "t1"), steward.clone(), settings);
+    let turn = runner.say(None, "修好了没有").await.unwrap();
+
+    let receipt = &turn.traces[0].result;
+    assert!(receipt.contains("超时"), "{receipt}");
+    assert!(
+        !receipt.contains("闸门没过"),
+        "超时不是失败，不能再用「没过」的形状：{receipt}"
+    );
+    assert!(
+        steward.calls.lock().unwrap().is_empty(),
+        "闸门不过：不 resume"
+    );
+    assert!(!wt.join("fix.txt").exists(), "补丁要撤回");
     assert!(h
         .store
         .list_pending_foreman_proposals(&turn.session.id)

@@ -73,6 +73,11 @@ pub struct GateReading {
     /// 命令全文的落点（`gate-output-repair-{id}-{kind}.log`）。
     pub output_path: Option<String>,
     pub output_preview: String,
+    /// 被 lint/test 时限砍断（票 gate-failure-attribution/02）：退出码 -1 只是它的结果，
+    /// 不是它的身份——冷缓存下首编译超时是常态，回执要把「超时」与「失败」分开说。
+    /// `#[serde(default)]`：存量提议载荷里没有这个字段（读不出即「没超时」，不编数）。
+    #[serde(default)]
+    pub timed_out: bool,
 }
 
 /// 一次修复的起点：建好 worktree（票 10）。
@@ -158,11 +163,9 @@ pub async fn repair_session_for(
 /// 一次修复轮的收口结果（决策 210④⑤ / 票 11、12）。
 #[derive(Debug, Clone, PartialEq)]
 pub enum RepairRound {
-    /// 闸门没过：**没有 commit、没有 diff、没有提议**——「改完」这句话还不成立。
-    GateFailed {
-        gate: Vec<GateReading>,
-        note: String,
-    },
+    /// 闸门没过（含超时）：**没有 commit、没有 diff、没有提议**——「改完」这句话还不成立。
+    /// 回执由工具层按 [`gate_failed_receipt`] 拼（超时与失败分开说，票 gate-failure-attribution/02）。
+    GateFailed { gate: Vec<GateReading> },
     /// 闸门过了：已 commit（带标记）、已出 diff、已落一条不设 TTL 的提议。
     ///
     /// `outcome` 是**装箱**的：它是这一族里唯一的大载荷（272 字节，其余变体只有几十），
@@ -199,7 +202,7 @@ pub async fn finish_repair_round(
     )
     .await?
     {
-        RepairConclusion::GateFailed { gate, note } => Ok(RepairRound::GateFailed { gate, note }),
+        RepairConclusion::GateFailed { gate } => Ok(RepairRound::GateFailed { gate }),
         RepairConclusion::Done(outcome) => {
             let proposal =
                 propose_and_note_awaiting(store, &session.session_id, project, &outcome, task_id)
@@ -218,10 +221,7 @@ pub async fn finish_repair_round(
 /// 带标记的 commit 并出 diff；没过返回失败读数——「改完」这句话还不成立，两条路都一样。
 #[derive(Debug, Clone, PartialEq)]
 pub enum RepairConclusion {
-    GateFailed {
-        gate: Vec<GateReading>,
-        note: String,
-    },
+    GateFailed { gate: Vec<GateReading> },
     Done(Box<RepairOutcome>),
 }
 
@@ -248,10 +248,8 @@ pub async fn conclude_repair_round(
     .await?;
     let failed = gate.iter().any(|r| r.exit_code != 0);
     if failed {
-        return Ok(RepairConclusion::GateFailed {
-            note: gate_failure_note(&gate),
-            gate,
-        });
+        // 回执的措辞在工具层拼（那里才有动作名与阈值）——这里只交读数本身。
+        return Ok(RepairConclusion::GateFailed { gate });
     }
 
     let commit = commit_repair(session, conclusion, now).await?;
@@ -439,6 +437,8 @@ async fn run_gate_command(
         duration_ms: out.duration_ms,
         output_path: Some(full_path.display().to_string()),
         output_preview: preview,
+        // 超时与「跑完了但退出码非零」从此是两种读数（票 gate-failure-attribution/02）。
+        timed_out: out.timed_out,
     })
 }
 
@@ -659,9 +659,12 @@ pub fn new_repair_id() -> String {
     ulid::Ulid::new().to_string()
 }
 
-/// 修复闸门失败时说清「哪一步没过」（票 11：播报失败原因，lint 还是 test）。
+/// 修复闸门失败时说清「哪一步、什么终态」（票 11：播报失败原因；票 gate-failure-attribution/02：
+/// 超时与失败分开说）。给的是**读数摘要**——提议卡面与合入前置检查那两处没有阈值可用
+/// （只点名旋钮不带数），阈值带数的那条整回执在 [`gate_failed_receipt`]。
 pub fn gate_failure_note(readings: &[GateReading]) -> String {
-    match readings.iter().find(|r| r.exit_code != 0) {
+    match first_failed_reading(readings) {
+        Some(r) if r.timed_out => gate_timeout_note(r, None),
         Some(r) => format!(
             "闸门没过（{}）：`{}` 退出码 {}，用时 {}ms。完整输出在 {}",
             r.kind,
@@ -671,6 +674,76 @@ pub fn gate_failure_note(readings: &[GateReading]) -> String {
             r.output_path.as_deref().unwrap_or("（未落盘）")
         ),
         None => "闸门没过（读数缺失）".to_string(),
+    }
+}
+
+/// 第一条**没过**的读数（闸门停在那条，它后面的读数本就不存在）。
+pub fn first_failed_reading(readings: &[GateReading]) -> Option<&GateReading> {
+    readings.iter().find(|r| r.exit_code != 0)
+}
+
+/// 超时那一支的读数摘要（票 gate-failure-attribution/02）。
+///
+/// `timeout_sec` 给了就**带数**（「达到阈值 600s」）——工具回执有 settings 可用；
+/// 读数摘要的两处（提议卡面 / 合入前置检查）没有，只点名旋钮。超时不是失败：
+/// 冷缓存下 `cargo test` 首编译远超 600s 是常态，把超时当失败会引人去「改代码」。
+pub fn gate_timeout_note(r: &GateReading, timeout_sec: Option<u64>) -> String {
+    let threshold = match timeout_sec {
+        Some(s) => format!("达到阈值 {s}s（test_command_timeout_sec）"),
+        None => "达到 test_command_timeout_sec 阈值".to_string(),
+    };
+    format!(
+        "闸门超时（{}）：`{}` 用时 {}ms（{}）。冷编译常见，可直接重跑一次。完整输出在 {}",
+        r.kind,
+        r.command,
+        r.duration_ms,
+        threshold,
+        r.output_path.as_deref().unwrap_or("（未落盘）")
+    )
+}
+
+/// 修复闸门是不是**因超时**没过（票 gate-failure-attribution/02）。
+///
+/// 判据锚在**第一条没过的读数**上（[`first_failed_reading`]）：「lint 真失败 + test 超时」
+/// 的混合里这一轮的本质是失败——先没过的那条说话。
+pub fn gate_timed_out(readings: &[GateReading]) -> bool {
+    first_failed_reading(readings).is_some_and(|r| r.timed_out)
+}
+
+/// 修复闸门「没过」的**整条回执**（票 gate-failure-attribution/02：超时与失败分开说）。
+///
+/// `opening` 说清「因此什么没发生」（finish 与 deliver 各有一句），`action` 是下一步
+/// 要再调的动作名。超时那一支：回执带「超时」字样 + 实测用时 + 阈值（带数）+
+/// 「冷编译常见，可直接重跑一次」，且**不出现**「闸门没过」；失败那一支逐字照旧。
+/// 「完整输出在 …」与读数行两种终态都保留——全文日志是模型下一步的唯一证据入口。
+pub fn gate_failed_receipt(
+    opening: &str,
+    action: &str,
+    gate: &[GateReading],
+    timeout_sec: u64,
+) -> String {
+    let readings = gate
+        .iter()
+        .map(|r| {
+            if r.timed_out {
+                format!("{} 超时", r.kind)
+            } else {
+                format!("{} 退出码 {}", r.kind, r.exit_code)
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("、");
+    if gate_timed_out(gate) {
+        let r = first_failed_reading(gate).expect("gate_timed_out 已判过：第一条没过的读数在场");
+        format!(
+            "闸门超时，{opening}：{}\n读数：{readings}。可直接再调一次 {action}。",
+            gate_timeout_note(r, Some(timeout_sec)),
+        )
+    } else {
+        format!(
+            "闸门没过，{opening}：{}\n读数：{readings}。改完再调一次 {action}。",
+            gate_failure_note(gate)
+        )
     }
 }
 

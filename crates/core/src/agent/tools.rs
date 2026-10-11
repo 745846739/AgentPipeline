@@ -246,8 +246,10 @@ enum DeliverAttempt {
     /// 补丁已落、commit 已成；自动 resume 走没走成都算交付（answer 里说清下一步）。
     Delivered { answer: String },
     /// 任务工作区里的**组合**闸门没过（修复本身在修复 worktree 过了闸门）：补丁已撤、
-    /// 没 resume、没提议——照票 11.1「没过就播报失败、不出 diff」。
-    GateFailedInTaskWorktree { note: String },
+    /// 没 resume、没提议——照票 11.1「没过就播报失败、不出 diff」。`timed_out` 由
+    /// [`crate::pipeline::repair::gate_timed_out`] 判（票 gate-failure-attribution/02）：
+    /// 包壳的「没过/超时」二字跟着它走，不许把超时说成失败。
+    GateFailedInTaskWorktree { note: String, timed_out: bool },
     /// 授权或前提不满足：工作区一个字没动，原样回落「等合入」（提议照落）。
     Fallback { reason: String },
 }
@@ -1977,14 +1979,16 @@ impl ToolExecutor {
                 )
                 .await?
                 {
-                    repair::RepairRound::GateFailed { gate, note } => Ok(ToolOutcome::ok(format!(
-                        "闸门没过，**没有出 diff、也没有提提议**：{note}\n\
-                         读数：{}。改完再调一次 finish。",
-                        gate.iter()
-                            .map(|r| format!("{} 退出码 {}", r.kind, r.exit_code))
-                            .collect::<Vec<_>>()
-                            .join("、")
-                    ))),
+                    repair::RepairRound::GateFailed { gate } => Ok(ToolOutcome::ok(
+                        // 回执整条由 repair 域拼（票 gate-failure-attribution/02：
+                        // 超时与失败分开说，包壳的「没过」二字不许盖住超时那一支）。
+                        repair::gate_failed_receipt(
+                            "**没有出 diff、也没有提提议**",
+                            "finish",
+                            &gate,
+                            self.settings.test_command_timeout_sec,
+                        ),
+                    )),
                     repair::RepairRound::Proposed { summary, .. } => {
                         // 「等修复合入」的两处留痕在 `finish_repair_round` 里（那里才有完整的
                         // 序列），这里只负责把话说明白。
@@ -2059,14 +2063,13 @@ impl ToolExecutor {
                 )
                 .await?
                 {
-                    repair::RepairConclusion::GateFailed { note, gate } => {
-                        return Ok(ToolOutcome::ok(format!(
-                            "闸门没过，**没有落补丁、没有 resume、也没有提提议**：{note}\n\
-                             读数：{}。改完再调一次 deliver。",
-                            gate.iter()
-                                .map(|r| format!("{} 退出码 {}", r.kind, r.exit_code))
-                                .collect::<Vec<_>>()
-                                .join("、")
+                    repair::RepairConclusion::GateFailed { gate } => {
+                        return Ok(ToolOutcome::ok(repair::gate_failed_receipt(
+                            // 与 finish 同门：超时与失败分开说（票 gate-failure-attribution/02）。
+                            "**没有落补丁、没有 resume、也没有提提议**",
+                            "deliver",
+                            &gate,
+                            self.settings.test_command_timeout_sec,
                         )));
                     }
                     repair::RepairConclusion::Done(outcome) => outcome,
@@ -2076,10 +2079,15 @@ impl ToolExecutor {
                     .await?
                 {
                     DeliverAttempt::Delivered { answer } => Ok(ToolOutcome::ok(answer)),
-                    DeliverAttempt::GateFailedInTaskWorktree { note } => {
+                    DeliverAttempt::GateFailedInTaskWorktree { note, timed_out } => {
+                        let head = if timed_out {
+                            "补丁与任务工作区合起来的闸门超时"
+                        } else {
+                            "补丁与任务工作区合起来的闸门没过"
+                        };
                         Ok(ToolOutcome::ok(format!(
-                            "补丁与任务工作区合起来的闸门没过——补丁已撤、任务 worktree 回到\
-                             原状，**没有 resume、也没有提提议**：{note}\n\
+                            "{head}——补丁已撤、任务 worktree 回到原状，\
+                             **没有 resume、也没有提提议**：{note}\n\
                              修复分支 {} 还在：可以改一版再 deliver，或改走 finish 落\
                              「等合入」的提议。",
                             outcome.branch
@@ -2301,8 +2309,17 @@ impl ToolExecutor {
         .await?;
         if gate.iter().any(|r| r.exit_code != 0) {
             let _ = crate::git::Git.reset_hard_clean(wt, "HEAD").await;
+            // 超时那一支的 note 用带数的读数摘要（这里 settings 在手）；失败照旧走摘要。
+            let note = match crate::pipeline::repair::first_failed_reading(&gate) {
+                Some(r) if r.timed_out => crate::pipeline::repair::gate_timeout_note(
+                    r,
+                    Some(self.settings.test_command_timeout_sec),
+                ),
+                _ => crate::pipeline::repair::gate_failure_note(&gate),
+            };
             return Ok(DeliverAttempt::GateFailedInTaskWorktree {
-                note: crate::pipeline::repair::gate_failure_note(&gate),
+                note,
+                timed_out: crate::pipeline::repair::gate_timed_out(&gate),
             });
         }
 

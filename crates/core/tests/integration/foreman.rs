@@ -5271,6 +5271,73 @@ async fn the_repair_tool_opens_a_worktree_and_lands_a_proposal() {
     );
 }
 
+/// 票 gate-failure-attribution/02：finish 的闸门被时限砍断时，**工具回执**说「超时」
+/// 并留重跑口——不与真失败同形。这一条必须走工具（闸门级用例在 tests/repair.rs）：
+/// 「闸门没过，……」那个包壳在工具层，它才是模型实际读到的那句话。
+#[tokio::test]
+async fn a_timed_out_finish_gate_receipt_says_timeout_not_failure() {
+    use agentpipeline_core::pipeline::repair::{new_repair_id, start_repair};
+    use agentpipeline_core::types::EnvMode;
+
+    let h = Harness::empty().await;
+    let repo = Repo::clean().unwrap();
+    h.git_project(&repo, "sleep 30").await; // 必然过不了 2s 的线
+    h.foreman_env(EnvMode::Auto).await;
+    let settings = Settings {
+        test_command_timeout_sec: 2,
+        ..Default::default()
+    };
+
+    // 修复现场：worktree 拉起 + 一笔「改完」的改动，然后 finish 撞上超时的闸门。
+    let sid = h.store.create_foreman_session("").await.unwrap().id;
+    let session = start_repair(h._home.home(), repo.path(), "main", &new_repair_id(), &sid)
+        .await
+        .unwrap();
+    std::fs::write(session.worktree.join("fixed.rs"), "pub fn fixed() {}\n").unwrap();
+
+    let mut script = Script::new();
+    script.for_foreman().tool(
+        "repair",
+        serde_json::json!({
+            "action": "finish",
+            "project_id": "p1",
+            "repair_id": session.repair_id,
+            "conclusion": "补上缺的约束",
+        }),
+    );
+    script.for_foreman().text("改完了。");
+    let turn = h
+        .runner_with(settings, FakeAgent::new(script))
+        .say(None, "改完了吗")
+        .await
+        .unwrap();
+
+    assert!(turn.traces[0].ok);
+    let receipt = &turn.traces[0].result;
+    assert!(receipt.contains("超时"), "{receipt}");
+    assert!(
+        !receipt.contains("闸门没过"),
+        "超时不是失败，不能再用「没过」的形状：{receipt}"
+    );
+    assert!(receipt.contains("冷编译常见"), "{receipt}");
+    assert!(
+        receipt.contains("可直接再调一次 finish"),
+        "下一步的口子要保留：{receipt}"
+    );
+    // 收口不变式照旧：没有提议、没有 commit。
+    assert!(h
+        .store
+        .list_pending_foreman_proposals(&turn.session.id)
+        .await
+        .unwrap()
+        .is_empty());
+    assert_eq!(
+        repo.head("main"),
+        repo.head(&session.branch),
+        "闸门不过就不该有 commit"
+    );
+}
+
 /// `discard`：不修了就回收——**保留分支**（它是唯一的证据），并覆盖「又调了一次」那一支。
 ///
 /// 与「没人按」那条回收路是两回事：那一条是维护作业在行被删之前收的（票 12），这一条是
