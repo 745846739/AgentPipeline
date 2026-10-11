@@ -917,7 +917,6 @@ impl Store {
         Ok(())
     }
 
-    /// 界面保存过值守开关吗（provenance 读数）：行存在 = 界面定的。
     /// 对讲台的**默认引擎**（决策 424④，迁移 0047）：`+ 新班次` 不带参数时的缺省值。
     /// 没有行 = 从没碰过设置 = `api`（与 foreman_watch 同一条「缺省即现状」口径）。
     pub async fn foreman_default_engine(&self) -> Result<String> {
@@ -953,6 +952,7 @@ impl Store {
         Ok(row.is_some())
     }
 
+    /// 界面保存过值守开关吗（provenance 读数）：行存在 = 界面定的。
     pub async fn foreman_watch_has_override(&self) -> Result<bool> {
         let exists: Option<i64> =
             sqlx::query_scalar("SELECT 1 FROM kanban_foreman_watch WHERE id = 1")

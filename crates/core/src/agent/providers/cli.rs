@@ -153,7 +153,7 @@ pub async fn probe_program_with_runner(
             latency_ms: latency(),
             kind: Some("cli_binary_missing".into()),
             message: format!(
-                "探测不到本机命令 `{CLI_BINARY}`：PATH 中不存在或无法启动。请先安装并登录 claude code（决策 423：CLI 用本机登录态）"
+                "探测不到本机命令 `{CLI_BINARY}`：PATH 中不存在或无法启动。请先安装并登录 claude code（它用本机登录态，无需在此配密钥）"
             ),
             raw: None,
         };
@@ -176,7 +176,7 @@ pub async fn probe_program_with_runner(
             ok: false,
             latency_ms: latency(),
             kind: Some("cli_version_unparsable".into()),
-            message: "版本输出解析不出 semver（CLI 版本漂移？按决策 423⑤ 收口：fail-fast 不猜）"
+            message: "版本输出解析不出 semver（CLI 版本漂移？fail-fast 不猜，请核对 claude 版本）"
                 .into(),
             raw: Some(preview(&output.stdout).unwrap_or_default()),
         };

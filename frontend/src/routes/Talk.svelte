@@ -1477,7 +1477,7 @@
             class="mi plus"
             data-menu-item
             disabled={sending || busy}
-            title="引擎建班时选定，班内锁定（决策：CLI 引擎）"
+            title="引擎建班时选定、班内锁定——要换请开新班次"
             onclick={() => {
               menuTrap.close(false);
               void newSession('cli');

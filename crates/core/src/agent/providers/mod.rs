@@ -1027,8 +1027,14 @@ mod tests {
 
     #[test]
     fn every_supported_adapter_maps_to_a_family() {
-        // 决策 103：白名单改它要发版——扩白名单而漏适配器族，此测试直接红
+        // 决策 103：白名单改它要发版——扩白名单而漏适配器族，此测试直接红。
+        // 例外是 cli（决策 423）：它在白名单里是为了配置面（存储/设置页/探针），
+        // **故意没有**适配器族——LLM 流式通道必须对它显式挡住（cli_vendor_has_no_llm_adapter_family）。
         for vendor in crate::config::SUPPORTED_ADAPTERS {
+            if vendor == cli::CLI_VENDOR {
+                assert!(adapter_family(vendor).is_err(), "cli vendor 不该有适配器族");
+                continue;
+            }
             assert!(
                 adapter_family(vendor).is_ok(),
                 "vendor {vendor} 在白名单内但没有适配器族"

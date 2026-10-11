@@ -32,6 +32,8 @@ pub const CLI_FOREMAN_BINARY: &str = "claude";
 
 /// 写类工具的显式禁单（决策 424①）：无头模式下这些工具没有许可人，本来就会被拒——
 /// 显式再禁一遍是**形状**（读代码的人不用去查无头模式的缺省语义才知道值班长没有写刀）。
+/// 两个 PlanMode 不是写类，是**会话形态**：值班长的对话不走「先出计划再问许可」的那套
+/// 交互（无头模式下它没有意义，还会改变回话的形状），一并关掉。
 pub const CLI_WRITE_DENIED: &str = "Edit,Write,MultiEdit,NotebookEdit,EnterPlanMode,ExitPlanMode";
 
 /// Bash 的**只读白名单**（决策 424①「允许跑只读命令」的落地）：
@@ -69,6 +71,9 @@ pub struct CliTurnOutput {
     pub cli_session_id: Option<String>,
     /// 进程退出码；`None` = 没跑起来（与 exec 收口同一口径）。
     pub exit_code: Option<i32>,
+    /// 超时收口过（exec 杀了进程组）。重建判据看它：**超时不算会话失效**——
+    /// 15 分钟没回来的会话多半还活着，重烧一轮既贵又把超时误报成「会话失效」。
+    pub timed_out: bool,
     /// 失败读数（退出码非零 / `result.is_error` / 没跑起来）：**重建判定**看它。
     pub error_text: Option<String>,
     /// 宽容跳过的未知行数（决策 423⑤：不炸流，但留个读数）。
@@ -388,6 +393,7 @@ pub async fn run_cli_turn_streaming(
 fn parse_stream_json(out: &CommandOutput) -> CliTurnOutput {
     let mut o = CliTurnOutput {
         exit_code: out.exit_code,
+        timed_out: out.timed_out,
         ..Default::default()
     };
     let mut text_parts: Vec<String> = Vec::new();
