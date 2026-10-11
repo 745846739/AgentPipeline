@@ -12,7 +12,11 @@ use crate::types::{Provider, StageConfig};
 use crate::{Error, Result};
 
 /// v1 代码支持的适配器集合（决策 103：硬编码常量，改它要发版）。
-pub const SUPPORTED_ADAPTERS: [&str; 3] = ["openai", "anthropic", "deepseek"];
+///
+/// `cli` 是本机 CLI agent 引擎（决策 423②）：进白名单是为了 provider 配置面
+/// （存储 / 设置页 / 探针），它**没有** HTTP 适配器族——`adapter_family` 对它
+/// 显式报错，消费面见票 talk-cli-engine 02 起。
+pub const SUPPORTED_ADAPTERS: [&str; 4] = ["openai", "anthropic", "deepseek", "cli"];
 
 /// 全局参数（见 [docs/overview.md] §3 全表；`env_mode` 的档位语义另见
 /// [docs/glossary.md] 的「权限档位」条，两处不重复写）。
@@ -2214,6 +2218,18 @@ mod tests {
         };
         let report = validate_startup(&inputs).unwrap();
         assert_eq!(report.demoted_providers, vec!["p1".to_string()]);
+    }
+
+    /// CLI 引擎 vendor 在白名单内（决策 423②）：启动校验不降级——
+    /// 它能否真用由探针（票 01）说了算，不在这里静默关掉。
+    #[test]
+    fn cli_vendor_is_not_demoted() {
+        let inputs = StartupInputs {
+            providers: vec![provider("p1", "cli", true)],
+            ..Default::default()
+        };
+        let report = validate_startup(&inputs).unwrap();
+        assert!(report.demoted_providers.is_empty());
     }
 
     #[test]

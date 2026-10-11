@@ -187,7 +187,9 @@ pub async fn test(
         ),
         None => {
             let api_key = body.api_key.clone().filter(|k| k != "***");
-            if api_key.is_none() {
+            // CLI 引擎（决策 423②）用本机登录态，没有密钥概念——不适用「缺 api_key」的 400。
+            let key_optional = body.vendor == agentpipeline_core::agent::providers::cli::CLI_VENDOR;
+            if api_key.is_none() && !key_optional {
                 return Err(ApiError::bad_request(
                     "缺少 api_key：未命中已存 provider 时必须显式提供（或传 id 沿用已存密钥）",
                 ));

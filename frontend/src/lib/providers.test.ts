@@ -8,6 +8,7 @@ import {
   draftFromProvider,
   emptyProviderDraft,
   isApiKeyMask,
+  isCliVendor,
   isSupportedAdapter,
   validateProviderDraft,
 } from './providers';
@@ -143,5 +144,24 @@ describe('buildProviderTest（决策 160：测试连接）', () => {
   it('base_url 空串省略', () => {
     const payload = buildProviderTest(emptyProviderDraft(), null);
     expect(payload.base_url).toBeUndefined();
+  });
+});
+
+describe('CLI 引擎 vendor（决策 423，票 talk-cli-engine 01）', () => {
+  it('cli 在受支持适配器白名单里', () => {
+    expect(isSupportedAdapter('cli')).toBe(true);
+    expect(isCliVendor('cli')).toBe(true);
+    expect(isCliVendor(' cli ')).toBe(true);
+    expect(isCliVendor('openai')).toBe(false);
+  });
+
+  it('cli 的 model 可留空（--model 透传，用 CLI 默认模型）', () => {
+    const draft = { ...emptyProviderDraft(), vendor: 'cli', model: '' };
+    expect(validateProviderDraft(draft)).toBeNull();
+  });
+
+  it('非 cli 的 model 仍然必填', () => {
+    const draft = { ...emptyProviderDraft(), vendor: 'anthropic', model: '' };
+    expect(validateProviderDraft(draft)?.field).toBe('model');
   });
 });

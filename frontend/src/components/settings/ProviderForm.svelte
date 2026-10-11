@@ -8,6 +8,7 @@
     buildProviderTest,
     draftFromProvider,
     emptyProviderDraft,
+    isCliVendor,
     isSupportedAdapter,
     validateProviderDraft,
     type ProviderDraft,
@@ -34,8 +35,13 @@
   );
 
   const supported = $derived(isSupportedAdapter(draft.vendor.trim()));
+  const cli = $derived(isCliVendor(draft.vendor));
   const keyPlaceholder = $derived(
-    isNew ? 'sk-…（可留空，本机代理可匿名）' : `已保存；保持 ${API_KEY_MASK} 即不修改`,
+    cli
+      ? '本机登录态，无需密钥'
+      : isNew
+        ? 'sk-…（可留空，本机代理可匿名）'
+        : `已保存；保持 ${API_KEY_MASK} 即不修改`,
   );
 
   let localError = $state<ProviderFieldError | null>(null);
@@ -102,7 +108,7 @@
       <input
         class="input mono"
         bind:value={draft.model}
-        placeholder="gpt-4o / claude-… / deepseek-chat"
+        placeholder={cli ? '留空 = CLI 默认模型（--model 透传）' : 'gpt-4o / claude-… / deepseek-chat'}
         aria-invalid={invalidAttr('model')}
         aria-describedby={describedBy('model')}
       />

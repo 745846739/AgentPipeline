@@ -12,6 +12,7 @@
 //!
 //! 加新测试文件：把文件放进本目录，并在下面加一行 `mod <文件名>;`。
 
+mod cli_probe;
 mod command_funnel;
 mod conversation_archive;
 mod copy_payloads;

@@ -1719,6 +1719,24 @@ async fn provider_test_without_id_requires_explicit_key() {
     assert_eq!(status, StatusCode::BAD_REQUEST);
     assert!(body["error"].as_str().unwrap().contains("api_key"));
 
+    // CLI 引擎（决策 423②）：本机登录态没有密钥概念——同形请求不 400，
+    // 探针走本机二进制，结论随机器（装了=绿/没装=cli_binary_missing），但必是 200。
+    let (status, body) = post(
+        &api,
+        "/providers/test",
+        serde_json::json!({
+            "vendor": agentpipeline_core::agent::providers::cli::CLI_VENDOR,
+            "model": "",
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let kind = body["test"]["kind"].as_str();
+    assert!(
+        kind.is_none() || kind.unwrap().starts_with("cli_"),
+        "探针类别应是 CLI 分支的：{body}"
+    );
+
     // 未知 vendor 在适配器族白名单（决策 103）处被挡，给可读结论而非 500
     let (status, body) = post(
         &api,

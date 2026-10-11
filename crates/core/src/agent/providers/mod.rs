@@ -14,6 +14,7 @@
 //!   Anthropic 的 prompt 计量归一为 input + cache_read + cache_creation。
 
 pub mod anthropic;
+pub mod cli;
 pub mod openai;
 
 use std::collections::BTreeMap;
@@ -688,6 +689,13 @@ pub(crate) fn adapter_family(vendor: &str) -> Result<&'static dyn Adapter> {
         Ok(&openai::OpenAiCompatible)
     } else if vendor == "anthropic" {
         Ok(&anthropic::Anthropic)
+    } else if vendor == cli::CLI_VENDOR {
+        // 决策 423：CLI 是自带工具循环的整段执行器，不是 HTTP 协议族——
+        // 白名单放它进来是为了 provider 配置面（存储 / 设置页 / 探针），
+        // 但 LLM 流式通道必须在这里显式挡住，不能让流水线阶段静默选中它。
+        Err(Error::Llm(format!(
+            "vendor {vendor} 是本机 CLI agent 引擎：不走 LLM 流式通道——它是整段执行器，对讲台消费面随 CLI 引擎会话启用"
+        )))
     } else {
         Err(Error::Llm(format!("vendor {vendor} 尚无适配器族实现")))
     }
@@ -717,6 +725,10 @@ pub struct ConnectionTest {
 pub async fn test_provider_connection(provider: &Provider) -> ConnectionTest {
     let started = Instant::now();
     let latency = |started: Instant| started.elapsed().as_millis() as u64;
+    // CLI 引擎不走 HTTP 探针（决策 423）：探的是本机二进制与版本兼容性。
+    if provider.vendor == cli::CLI_VENDOR {
+        return cli::probe_cli_provider(provider).await;
+    }
     let adapter = match adapter_family(&provider.vendor) {
         Ok(a) => a,
         Err(e) => {
@@ -934,6 +946,17 @@ fn advance_idle_deadline(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// CLI vendor 不给适配器族：LLM 流式通道必须显式挡住它（决策 423，票 talk-cli-engine 01）。
+    #[test]
+    fn cli_vendor_has_no_llm_adapter_family() {
+        let msg = match adapter_family(cli::CLI_VENDOR) {
+            Ok(_) => panic!("cli vendor 不该有适配器族"),
+            Err(e) => e.to_string(),
+        };
+        assert!(msg.contains("CLI"), "报错要点名 CLI：{msg}");
+        assert!(msg.contains("整段执行器"), "报错要给读法：{msg}");
+    }
 
     /// 收到字节 → 界往后挪到「此刻 + 空闲界」。
     #[test]

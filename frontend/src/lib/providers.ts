@@ -13,8 +13,16 @@ import type {
  * 实际能分发的厂商见 `crates/core/src/agent/providers/mod.rs`（openai / deepseek / anthropic）。
  * 这里是与当前后端实现对齐的**前端常量**；后端补出 baseline/adapters 端点后应改为读取接口。
  */
-export const SUPPORTED_ADAPTERS = ['openai', 'deepseek', 'anthropic'] as const;
+export const SUPPORTED_ADAPTERS = ['openai', 'deepseek', 'anthropic', 'cli'] as const;
 export type SupportedAdapter = (typeof SUPPORTED_ADAPTERS)[number];
+
+/**
+ * 本机 CLI agent 引擎（决策 423②）：没有密钥概念（本机登录态），
+ * `model` 是 CLI `--model` 参数的透传、可留空。
+ */
+export function isCliVendor(vendor: string): boolean {
+  return vendor.trim() === 'cli';
+}
 
 /** 读接口回显的 api_key 掩码（routes/providers.rs）。 */
 export const API_KEY_MASK = '***';
@@ -88,7 +96,10 @@ export function isUsableBaseUrl(raw: string): boolean {
 /** 表单校验；返回 null 表示通过。 */
 export function validateProviderDraft(draft: ProviderDraft): ProviderFieldError | null {
   if (!draft.vendor.trim()) return { field: 'vendor', message: '请填写厂商（vendor）。' };
-  if (!draft.model.trim()) return { field: 'model', message: '请填写模型名（model）。' };
+  // CLI 引擎（决策 423②）：model 是 --model 透传，留空 = 用 CLI 默认模型。
+  if (!draft.model.trim() && !isCliVendor(draft.vendor)) {
+    return { field: 'model', message: '请填写模型名（model）。' };
+  }
   if (!Number.isInteger(draft.context_window) || draft.context_window <= 0) {
     return { field: 'context_window', message: 'context_window 必须是正整数。' };
   }
