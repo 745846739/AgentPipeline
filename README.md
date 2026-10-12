@@ -1,82 +1,115 @@
+<div align="center">
+
 # AgentPipeline
 
-Kanban 式流水线驱动的本地多 agent 开发管线：`init → architect-design → develop-design / test-design（并行）→ sync-check → develop → review → test → merge → done`。
+### 像素机房 · 夜班流水线
 
-设计文档（唯一事实来源）在 [docs/](docs/README.md)；本文只讲怎么把代码跑起来。
+把你的一句话需求丢上流水线，从**架构设计 → 开发 → 评审 → 测试 → 合并**都由一队本地 agent 自己跑；
+你只在它卡住时拍板。
 
-## 环境
+[![check](https://github.com/745846739/AgentPipeline/actions/workflows/check.yml/badge.svg)](https://github.com/745846739/AgentPipeline/actions/workflows/check.yml)
+[![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
+[![Rust](https://img.shields.io/badge/Rust-1.80%2B-orange?logo=rust&logoColor=white)](rust-toolchain.toml)
+[![Svelte](https://img.shields.io/badge/Svelte-5-ff3e00?logo=svelte&logoColor=white)](frontend)
 
-- Rust 1.80+（当前验证于 1.98）。仓库根的 `rust-toolchain.toml` **钉住精确版本 `1.98.0`**
-  （决策 175）——不用 `stable` 通道：`stable` 会让 rustup 在构建途中把工具链换掉，造成
-  整棵依赖树重编且闸门中断。首次构建会自动下载该版本（一次），此后固定不变。
-- `git` 能力由 **git2（libgit2 绑定）** 提供，无需系统 git（决策 12；测试 fixture 仍走系统 git CLI 作脚手架，决策 146 修订）
-- SQLite 由 sqlx 内嵌编译，无需单独安装
+<img src="docs/images/board-dark.png" alt="AgentPipeline 看板" width="920" />
 
-## 构建与运行
+<sub>看板即流水线：每一列是一个阶段，卡片带着它在流水线上的实时位置与阻塞原因。</sub>
+
+</div>
+
+---
+
+## 这是什么
+
+**AgentPipeline 是一个跑在本机的多 agent 开发管线。** 你在看板上新建一张卡（一句话需求），它会被拆进一条固定的十阶段流水线，由不同角色的 agent 依次接手：拆需求、出架构、并行写开发方案与测试方案、实现代码、评审、跑测试、合入。整个过程你只做两件事——**看图**，和它卡住时**拍板**。
+
+它是为「一个人想同时推进好几件事、又不想把方向盘交出去」的场景设计的：
+
+- **流水线是确定的，agent 是受限的。** 越界、重试、打回、汇聚都由代码里的状态机管；agent 只在需要语义判断的节点被调用，产出必须是结构化数据，不允许自由文本在节点间漂移。
+- **一切都在本机。** 单二进制、内嵌前端、SQLite，数据全落在 `~/.agentpipeline/`。你的代码和会话不出这台机器（除非你自己把它暴露到局域网）。
+- **它只在真需要你的时候打扰你。** 其余时间它自己往下走；「一个事件只打扰人一次」是写进调度器的硬约束。
+
+## 特性
+
+- **🎯 流水线即看板** — 十阶段 DAG（`init → architect-design → develop-design / test-design → sync-check → develop → review → test → merge → done`）直接渲染成一排泳道；任务卡的列位、游标、阻塞原因一眼可见。
+- **🧵 真并行 + 汇聚屏障** — 设计阶段两条独立游标并行推进（各自看各自的边界），`sync-check` 在所有游标都到达边界后只执行一次。
+- **🗣 值班长 · 对讲台** — 一个任务无关的对话 agent，向你汇报夜班态势、能读能提议；**改状态的动作一律生成「提议」等你按键**，它给建议、你拍板（见下）。
+- **📦 本地优先 · 单二进制** — 前端 `dist` 在编译期内嵌，`cargo build --release` 出一条可执行文件；axum 同源托管 UI 与 API，打开 `http://127.0.0.1:8788` 即用。没装 Node 也能编译（退化为「前端未构建」提示页）。
+- **🖥 桌面 App + 手机扫码** — 可打包成 Tauri 桌面壳（dmg），也能让同局域网的手机扫码看板（写操作需配对）。
+- **🛡 质量闸门即 CI** — `make check = lint + test + frontend + e2e`；GitHub runner 上跑的是**同一套 `make` 命令**，部署挂在闸门结论之后。
+- **🔍 可观测性内置** — 后端一条 SSE 事件流驱动全程；指标页给出成功率 / 各阶段耗时 / 重试率 / 首过率 / 逃逸事件。
+- **🧬 异族复判（防错误放大）** — 设计类节点的自动判定若判「不合格」，会先请**另一个厂商**的强档模型复判一次；分歧上交人工终审，而不是顺着单一模型的自负越走越远。
+- **🔒 worktree 隔离** — 每个任务一个 git worktree，互不踩脚；git 能力由 git2（libgit2）提供，无需系统 git。
+- **🧪 确定性、可测试** — 默认测试门**不打真网络**（真 LLM / 真 GitHub 都是 `#[ignore]` + 环境变量的双锁），CI 里不需要任何 secret。
+
+## 界面
+
+<table>
+<tr>
+<td width="50%"><img src="docs/images/talk.png" alt="对讲台" /><br/><sub><b>对讲台</b> — 与值班长对话；它把待拍板的事编成提议卡，动手指令等按键。</sub></td>
+<td width="50%"><img src="docs/images/task-detail.png" alt="任务详情" /><br/><sub><b>任务详情</b> — 时间线、会话、命令、产出文件、diff 一屏到底；合入前看清每一处改动。</sub></td>
+</tr>
+<tr>
+<td width="50%"><img src="docs/images/mobile-share.png" alt="手机访问" /><br/><sub><b>手机访问</b> — 同一 Wi-Fi 扫码即可看板；二维码自带配对令牌。</sub></td>
+<td width="50%"><img src="docs/images/metrics.png" alt="全局指标" /><br/><sub><b>全局指标</b> — 成功率、各阶段耗时与重试率、首过率、逃逸事件。</sub></td>
+</tr>
+</table>
+
+## 快速开始
+
+### 依赖
+
+- **Rust 1.80+**（仓库根的 `rust-toolchain.toml` 钉住精确版本 `1.98.0`，首次构建自动下载一次）
+- **Node.js** — 只有构建前端时需要；不装也能编出 API 可用的后端
+- 无需系统 `git`（走 git2 / libgit2），无需单独安装 SQLite（sqlx 内嵌编译）
+
+### 跑起来
 
 ```bash
-make build    # 前端依赖（按需）→ vite build → 内嵌 dist → cargo build --release
-make run      # 等价于 build + 启动
+git clone https://github.com/745846739/AgentPipeline.git
+cd AgentPipeline
+make hooks     # 接管 pre-commit 闸门（新克隆 / 换机后先跑一次）
+make run       # 前端构建 → 编译 → 启动，浏览器打开 http://127.0.0.1:8788
 ```
 
-产物是单二进制 `./target/release/agent-pipeline`：前端 dist 在编译期内嵌（决策 155），
-axum 同源托管 UI 与 API，浏览器打开 `http://127.0.0.1:8788` 即用（端口见配置 `[server]`，
-`--port` 可覆盖）。手动等价：`cd frontend && npm ci && npm run build && cargo build --release`。
+首次启动后，到界面「**模型与密钥**」页配置一个 provider（DeepSeek / OpenAI / Anthropic 等），才能新建任务——未配置时创建会明确报错。
 
-- 不装 Node 也能 `cargo build --release`：API 照常可用，访问 `/` 会得到「前端未构建」提示页（决策 155）。
-- 前端热更开发：`cd frontend && npm run dev`（vite 把 API 代理到本机 axum，见 frontend/vite.config.ts）。
-
-### 桌面形态（Tauri 壳，决策 156）
+<details>
+<summary>手动等价命令 / 前端热更开发</summary>
 
 ```bash
-make desktop       # 出 dmg（crates/desktop/target/release/bundle/dmg/）
-make desktop-run   # debug 壳直接跑，窗口导航到内嵌同源服务
+# 等价于 make run
+cd frontend && npm ci && npm run build && cd .. && cargo build --release
+
+# 前端热更（vite 把 API 代理到本机 axum）
+cd frontend && npm run dev
 ```
 
-桌面壳只是外壳：壳内调用 `app::serve(ServeOptions)` 起服，**端口不指定**——用 `[server] port`
-（缺省 8788），于是二维码地址、手机书签、桌面窗口地址跨重启都指着同一个号码（决策 213；此前是
-`port_override = Some(0)`，每次重启换一个临时端口，手机存过的网址就失效了）。真被别的程序占着时
-退让到临时端口而不是拒绝开窗（`port_fallback_to_ephemeral`），退让会经 `/server-info` 的
-`port_source` 报到「手机访问」页上。窗口加载 `http://127.0.0.1:{port}`（同源零 CORS），传输层与
-web 形态完全一致（决策 153）。
-壳是独立 workspace（自带 Cargo.lock），tauri 依赖树不进 `make check-lint` / `make check-test` 闸门。
+</details>
 
-打包边界（决策 168）：`bundle.targets` 只列 `dmg`——dmg 里已含 `.app`（拖入「应用程序」即得，
-本机开发也不必再从 `bundle/macos/` 取），故不再额外落一份裸 `.app` 到产物目录。
-
-数据全部落在 `~/.agentpipeline/`（可用环境变量 `AGENTPIPELINE_HOME` 覆盖，测试即靠它隔离）。
-首次启动后到 `POST /providers` 配置一个 provider，才能创建任务（未配置时创建任务会明确报错，决策 56）。
-
-### 手机扫码访问（决策 167）
-
-桌面壳或 web 形态都能让手机通过局域网接入：打开应用内「**手机访问**」页（`#/share`）扫二维码即可。
-只读页面（看板 / 会话 / 指标 / 分享页）扫开就能看；**写操作与对讲台需配对**（见下方警告）。
+### 桌面 App
 
 ```bash
-# web：绑定全网卡后，到「手机访问」页扫码
+make desktop       # 出 dmg → crates/desktop/target/release/bundle/dmg/
+make desktop-run   # debug 壳直接跑
+```
+
+桌面壳只是外壳：壳内起的是同一个同源服务，端口沿用配置（缺省 `8788`）、跨重启不变，所以二维码、手机书签、桌面窗口地址永远指着同一个号码。
+
+### 手机访问与局域网
+
+桌面壳或 web 形态都能让手机接入。打开应用内「**手机访问**」页扫二维码即可；只读页面（看板 / 会话 / 指标 / 分享页）扫开就能看，**写操作与对讲台需要配对**。
+
+```bash
+# web：绑定全网卡后到「手机访问」页扫码
 ./target/release/agent-pipeline serve --host 0.0.0.0
 
 # 桌面壳：设环境变量开启局域网（默认仍只绑回环）
 AGENTPIPELINE_LAN=1 make desktop-run
 ```
 
-手机加载的页面与 API **同源**（内嵌 dist 同源托管，决策 155），因此**无需** `--allowed-origin`：
-跨源防护（决策 128）只拦异源写请求，同源写请求恒带客户端头，天然通过。
-地址由后端枚举网卡择优给出（私网优先、VPN/Docker 虚拟网卡降级，决策 167）；
-若只绑了回环地址，页面会提示「127.0.0.1 在手机上指向手机自己」并给出开启步骤。
-
-> **写请求与对话需配对**（决策 167 推迟、决策 182⑦ 落地）：绑定**非回环**地址时启用**配对令牌**——
-> 只读页面（看板 / 会话 / 指标 / 分享页）在局域网里照旧直接可看，**所有写请求与全部
-> `/foreman/*`（对讲台）需要 `X-AgentPipeline-Token`**，缺失或不匹配即 403「这台设备还没配对」。
-> 令牌由服务端生成、**长期有效**（不随启动重生成）：本机 `GET /pairing/token` 读取（**仅回环可读**），
-> `POST /pairing/reset` 一键重置换一枚；配对 URL 的形状是 `{base}/?pair={token}`。
-> **默认回环绑定（本机使用）不要求任何配对**。两点仍需注意：只读页面里的会话与任务内容是明文展示的、
-> 同网段可看；且服务端这层之外没有别的防线，请勿在公共 Wi-Fi 下开启，更稳妥可用 SSH 隧道 / Tailscale。
-> 前端消费 `?pair=` 这条链路（`main.ts` 启动时收取 → localStorage → 从地址栏抹掉 → 之后作为
-> `X-AgentPipeline-Token` 头带上，含只读 GET），以及令牌与局域网态势的完整交代，
-> 记在 [docs/operations.md](docs/operations.md) §12.16。
-
-### 局域网访问（决策 157）
+> ⚠️ **安全边界**：绑定**非回环**地址时，所有写请求与 `/foreman/*` 需要配对令牌（`X-AgentPipeline-Token`，缺失即 403「这台设备还没配对」）；令牌长期有效，本机 `GET /pairing/token` 读取（仅回环可读）、`POST /pairing/reset` 一键重置。默认回环绑定（本机使用）不要求配对。只读页面里的任务是明文展示的、同网段可看——**服务能触发真实 LLM 调用并读取全部会话，请勿在公共 Wi-Fi 下开启**，更稳妥可用 SSH 隧道 / Tailscale。
 
 若要让**另一台电脑的浏览器**直接打开本机页面（页面 origin 与 API 不同源），才需要显式放行该 origin：
 
@@ -84,74 +117,127 @@ AGENTPIPELINE_LAN=1 make desktop-run
 ./target/release/agent-pipeline serve --host 0.0.0.0 --allowed-origin http://192.168.1.10:8788
 ```
 
-`--allowed-origin` 可重复（配置文件等价写法 `[server] allowed_origins = [...]`，非法值启动即报错）；
-`127.0.0.1` / `localhost` 恒放行，前缀伪装（`...:8788.evil.com`）始终被拦。
-注意：服务能触发真实 LLM 调用并读取全部会话，暴露到局域网前请自行评估网段安全（更稳妥可用 SSH 隧道 / Tailscale）。
+`127.0.0.1` / `localhost` 恒放行，前缀伪装（`...:8788.evil.com`）始终被拦；跨源防护只拦异源写请求。完整交代见 [docs/operations.md](docs/operations.md) §12.16。
 
-## 质量闸门
+## 工作原理
 
-**提交前必过**（决策 147 / 166）：`make check` = `lint` + `test` + `frontend` + `e2e`。
+每个任务是一条固定的 DAG。设计阶段两条游标并行，之后汇聚进入串行链路；评审与合入失败会按类型打回上游。
 
-```bash
-make check           # 提交前必过：以下四项全跑
-make check-lint      # cargo fmt --check + cargo clippy -D warnings
-make check-test      # 全量测试（L1 单元 + L2 集成 + L3 API + L4 场景 + 冒烟）
-make check-frontend  # 前端：vitest + svelte-check + vite build
-make check-e2e       # 前端 E2E（playwright 17 例；前置产物新鲜度守卫）
-# 分层子集
-make unit            # 只跑单元层
-make integration     # core 的 L2 集成（游标 / git / scheduler）
-make api             # L3 API 契约（in-process axum router）
-make e2e             # L4 场景
-make smoke           # 启动冒烟（spawn 真二进制）
-make fmt             # 格式化（写回）
-# 构建缓存清理（非闸门，随时可跑）
-make sweep           # 只清可再生的缓存（增量缓存 / deps/*.rcgu.o / cargo doc），保留第三方 rlib
+```mermaid
+graph TD
+    init --> architect-design
+    architect-design --> develop-design
+    architect-design --> test-design
+
+    develop-design --> sync-check
+    test-design --> sync-check
+
+    sync-check -->|proceed| develop
+    sync-check -->|backtrack| architect-design
+
+    develop --> review
+    review -->|approved| test
+    review -->|rejected| develop
+
+    test --> merge
+    merge -->|合入| done
+    merge -->|返回修改 / 冲突打回| develop
+    merge -->|测试闸门失败| test
 ```
 
-**Makefile 是闸门的唯一权威定义**（决策 168）：原先并存的 `justfile` 已删除——
-开发机上未装 `just`，两份定义只会在改动时漂移，而 Makefile 是实际被执行的入口。
-`justfile` 独有的分层目标（`unit` / `integration` / `api` / `e2e` / `smoke` / `fmt`）
-已按原语义搬进 Makefile，名字不变。
+**每个阶段内部是三个节点**，重试与阻塞都在这里收口：
 
-**构建缓存会只增不减**，而这件事 `cargo-sweep` 看不见——它按**访问时间**判「过时」，
-可这里的堆积按时间算全是**新**的（实测 `--stamp` 报 0、`--time 4` 只有 61 MiB，而项目
-实占 29 GB）。`make sweep` 只删**可再生**的中间产物：增量缓存、`deps/*.rcgu.o` 这类
-增量编译每次会话产生、cargo 从不回收的一次性目标文件、`cargo doc` 产物；第三方
-rlib / rmeta 一律保留，故清完不必重编整棵依赖树。`DRY=1 make sweep` 只报将删什么。
-核选项仍是 `make clean`（连第三方产物一起删，下次是冷编，本机实测约 20 分钟）。
+```mermaid
+graph LR
+    validate_input -->|通过| execute
+    validate_input -->|不充分| pending
+    execute --> validate_output
+    validate_output -->|通过| next_stage
+    validate_output -->|不通过| execute
+    validate_output -->|重试耗尽| pending
+```
 
-**产物新鲜度守卫（决策 166）：** `check-e2e` 跑用例前先确保被测对象是当前源码——
-前端源码比 `frontend/dist` 新则重建 dist，随后 `cargo build -p app`（dist 变化经
-`crates/app/build.rs` 的 `rerun-if-changed` 传递，二进制必然跟着重编）。没有这一步，
-改了代码不重建就会得到「旧二进制的绿」。
+几条贯穿全局的约束：
 
-**闸门跑在两处（决策 330）**：本地 `make check`，以及 GitHub runner 上的
-`.github/workflows/check.yml`（四个并行 job：lint / test / frontend / e2e，**只调 `make check-*`**，
-不另写一套命令——决策 168 说定 Makefile 是唯一权威）。默认门**不打真网络**（决策 142 / 194 的双锁），
-故 CI 里不需要任何 secret。**部署挂在 check 的结论之后**：`deploy.yml` 改由 `workflow_run` 触发，
-结论为 `success` **且**被验 commit 仍是 main 尖端时才部署——push 到 main 不再无门直部。
+- **无状态节点** — 节点不持内部状态，产出写进任务目录文件，靠文件路径在节点间传递信息。
+- **结构化流转** — 节点间信息必须符合数据模型定义，不允许自由文本。
+- **代码优先** — 固定流程（状态流转、数据组装、文件操作）用代码实现，只在需要语义分析 / 判断时才接 agent。
+- **执行位置的唯一事实源是游标** — 串行阶段一条 `main` 游标，并行阶段两条；进程重启后据游标行恢复。
 
-当前状态：**Rust 848 个用例全过**（另有 2 个 `#[ignore]` 真 LLM 冒烟：单节点 + 全流程），
-`fmt` / `clippy -D warnings` 干净；前端 **290 个 vitest 全过** + `svelte-check` 0 error /
-0 warning + **33 条 playwright E2E 全过**（共 35 例，2 例截图证据默认 skip，见下）（`make check-e2e`）。
+卡住的任务进入 `pending`（带原因：输入不充分 / 冲突等待 / 重试耗尽 / 合并审批 / 环境受阻…），你在看板上按恢复动作（继续 / 跳过 / 跳转）放行即可。
 
-## 代码结构
+## 值班长 · 对讲台
+
+对讲台是这个项目最像「有人值夜班」的那部分：一个**任务无关**的对话 agent，向你汇报当前夜班态势并给出建议。它的边界写死在实现里——
+
+- **它能读、能提议。** 深挖时自己调只读工具（台账 `read_task` / `read_conversation`、环境读数 `read_board` / `read_metrics` / `read_stage_configs` …），每轮拿到一份态势快照。
+- **它动手要你按键。** 文件与命令这两层由**权限档位**管（`ask` 每次生成提议等你按确认钮 → `auto` 直接执行 → `deny` 连工具都看不到）；而本服务自己的写接口（建任务 / 拍板 / 合入 / 改配置 / 装技能）**恒为提议**，不看档位。
+- **它的回复里永远没有按钮。** 确认钮在提议那一轮、选项钮在提问轮——都在时间线里，不在回复文本里。
+- **故意缺席的动作**：重置配对令牌、局域网开关、仓名单增删——判据是「改的是**谁能访问这台机器**」，这类事连工具名都没有。
+
+## 可靠性与可观测性
+
+- **质量闸门**：`make check` 一次跑齐 lint（`fmt --check` + `clippy -D warnings`）、Rust 全量测试、前端（vitest + svelte-check + build）、Playwright E2E。Makefile 是闸门的**唯一权威定义**，本地与 CI 调的是同一批 `make` 目标。
+- **产物新鲜度守卫**：E2E 跑用例前先确保被测对象是当前源码（前端源码更新则重建 dist，二进制随之重编），杜绝「改了代码不重建得到的绿」。
+- **单条事件流**：后端只有一条 SSE 事件流，类型契约集中在一处，前端据此实时刷新看板与时间线。
+- **中止即收口**：手动暂停会让在飞的那一轮收口、游标挂起并**保留位置**，而不是丢掉当前进度。
+- **判断力不外包给单一模型**：设计类自动判定不合格时走异族复判，分歧交人工。
+
+当前状态：`make check` 的四道闸（lint / test / frontend / e2e）在 CI 上全绿——要真数，跑一遍 `make check` 就有；动态结论看仓库顶部的 check 徽章。
+
+## 项目结构
 
 ```
 crates/core/     核心库
   pipeline/      图拓扑、条件边路由、落点表、游标谓词
-  agent/         LLM 接缝、工具执行、结构化输出解析、FileToolPolicy、上下文压缩、prompt 组装
+  agent/         LLM 接缝、工具执行、结构化输出解析、上下文压缩、prompt 组装
   storage/       SQLite（sqlx migrations）、游标生命周期、冲突比对、旁路动作事务
   scheduler/     KanbanScheduler.tick 六项职责
-  git.rs         git2 封装（worktree / rebase / 合入写回 / 重置清理 / 项目探测，决策 12）
+  git.rs         git2 封装（worktree / rebase / 合入写回 / 重置清理 / 项目探测）
   actions.rs     allowed_actions 权威表与端点配对
   sse.rs         唯一事件流的类型契约
 crates/app/      二进制 + axum router（lib 形态供 tower oneshot 测试）
-crates/testkit/  测试基建：临时 home、git fixture、FakeAgent、断言助手（决策 146 / 148）
+crates/desktop/  Tauri 桌面壳（独立 workspace）
+crates/testkit/  测试基建：临时 home、git fixture、FakeAgent、断言助手
+frontend/        Svelte 5 + Vite（像素主题，深浅两套）
 tests/e2e/       L4 场景
 ```
 
-四条可测试性接缝（决策 143）已就位：`Clock` trait、`AGENTPIPELINE_HOME`、`ProcessKiller` trait、手动驱动的 `scheduler.tick()`。
+五条可测试性接缝已就位：`Clock` trait、`AGENTPIPELINE_HOME` 隔离、`ProcessKiller` trait、手动驱动的 `scheduler.tick()`、仓访问的远端地址替换点。
 
-**实现进度与剩余工作见 [docs/testing.md](docs/testing.md) §11。**
+## 文档
+
+设计文档是**唯一事实来源**，入口见 [docs/README.md](docs/README.md)：
+
+| 文件 | 内容 |
+|---|---|
+| [docs/overview.md](docs/overview.md) | 流程图、全局约束（G1–G15）、全局配置参数表 |
+| [docs/data-model.md](docs/data-model.md) | 任务主结构、阶段输入输出、Pending → Resume 映射 |
+| [docs/pipeline-spec.md](docs/pipeline-spec.md) | 各节点详细流程、并发分支同步、幂等性、异常处理 |
+| [docs/agents.md](docs/agents.md) | Tool 定义、各节点 Prompt 模板、阶段级 Agent 配置 |
+| [docs/implementation.md](docs/implementation.md) | 流水线拓扑、executor、KanbanScheduler、数据库表 |
+| [docs/operations.md](docs/operations.md) | worktree、成本、取消、可观测性、通知、锁、配对与局域网、HTTPS 入口 |
+| [docs/testing.md](docs/testing.md) | 测试设计：可测试性接缝、FakeAgent/testkit、各层用例目录、质量闸门 |
+| [docs/decisions.md](docs/decisions.md) | 决策日志（#1–#430，只追加；「为什么这样定」都在这） |
+| [docs/glossary.md](docs/glossary.md) | 领域术语表 |
+| [design/frontend-design.md](design/frontend-design.md) | 前端交互骨架与页面元素（视觉方向：像素机房） |
+
+## 开发
+
+```bash
+make check           # 提交前必过：lint + test + frontend + e2e
+make check-lint      # cargo fmt --check + cargo clippy -D warnings
+make check-test      # 全量测试（L1 单元 + L2 集成 + L3 API + L4 场景 + 冒烟）
+make check-frontend  # vitest + svelte-check + vite build
+make check-e2e       # Playwright E2E（前置产物新鲜度守卫）
+make unit integration api smoke   # 分层子集
+make sweep           # 只清可再生的构建缓存（保留第三方 rlib）
+```
+
+提交受 pre-commit 钩子接管（跑 lint 层），所以**克隆 / 换机后先跑一次 `make hooks`**。改动前请读 [docs/testing.md](docs/testing.md) 的用例目录与五条可测试性接缝；界面层的可追溯性走 [design/frontend-design.md](design/frontend-design.md) §12.3 的「行为 / 规则 → 实现位置」表。
+
+## 许可
+
+[MIT](LICENSE) © 2026 泽运
+
+<div align="center"><sub>用 Rust、git2 与一点点像素执念搭的夜班机房。</sub></div>
