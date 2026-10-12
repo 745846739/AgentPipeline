@@ -824,7 +824,8 @@ test.describe('对讲台 · 对话（票 03）', () => {
     const row = page.locator('.talk-head .runrow');
     await expect(row).toBeVisible();
     await expect(page.locator('.timeline .runrow'), '班次行不该还在时间线里').toHaveCount(0);
-    await expect(row.locator('.runchip.plus')).toBeInViewport();
+    // 引擎选择器（决策 424）起行里有两颗 +（默认 / claude），「在视口」对任一颗成立即可
+    await expect(row.locator('.runchip.plus').first()).toBeInViewport();
     await expect(page.locator('.talk-head .runchip[aria-pressed="true"]')).toHaveCount(1);
     // 页头高度没因它变：**页头 = 标题那一行**。拿 `<h1>` 的行盒当基准而不是写死数字——
     // 改字号/行距时它会自己跟上，而「班次行把页头撑高」照样红（班次行一旦换行或高于标题行，
@@ -1088,8 +1089,9 @@ test.describe('对讲台 · 折行档（决策 192 / 218）', () => {
     await more.click();
     await expect(more).toHaveAttribute('aria-expanded', 'true');
     await expect(menu).toBeVisible();
-    // 第一项是「+ 新班次」（这一页最常按的一颗，也是班次动作的唯一入口）
-    await expect(menu.locator('button').first()).toHaveText('+ 新班次');
+    // 第一项是「+ 新班次（默认引擎）」（这一页最常按的一颗；决策 424 起它后面还跟着
+    // claude code 那一颗，「三条出口」与首项键盘语义对两颗一视同仁）
+    await expect(menu.locator('button').first()).toHaveText('+ 新班次（默认引擎）');
     // 行高按触控来（≥44px），不复用 20px 的芯片尺寸
     const plus = await menu.locator('button').first().boundingBox();
     expect(plus?.height ?? 0).toBeGreaterThanOrEqual(44);
@@ -1619,7 +1621,12 @@ test.describe('对讲台 · 班次（决策 204）', () => {
     // 只认班次 chip。
     const chips = row.locator('.runchip:not(.plus):not(.act):not(.arch-toggle)');
     await expect(chips).toHaveCount(0);
-    await expect(row.locator('.runchip.plus')).toHaveText('+ 新班次');
+    // 决策 424 起 + 有两颗：默认引擎那颗沿用旧文案，claude code 那颗文案不同——
+    // 各按名字认领，谁也不能只凭 `.plus` 类独占这一行
+    await expect(row.locator('.runchip.plus', { hasText: '+ 新班次' })).toHaveText('+ 新班次');
+    await expect(row.locator('.runchip.plus', { hasText: '班次·claude' })).toHaveText(
+      '+ 班次·claude',
+    );
     await expect(row.locator('.runchip.act')).toHaveCount(0);
 
     // ② 它**不在滚动容器里**（决策 218 Q15：原先长在 `.timeline` 里面，于是随对话上移）；
@@ -1646,8 +1653,8 @@ test.describe('对讲台 · 班次（决策 204）', () => {
     // ⑤ 换会话 ≠ 换看板：状态区的急停（派生自全局看板）一个字都不动
     const stopText = await page.locator('.zone-status .turn.warn').first().innerText();
 
-    // ⑥ 新建一个班次：切过去、时间线回到空态、急停仍在
-    await row.locator('.runchip.plus').click();
+    // ⑥ 新建一个班次：切过去、时间线回到空态、急停仍在（按名字点默认引擎那颗）
+    await row.locator('.runchip.plus', { hasText: '+ 新班次' }).click();
     await expect(chips).toHaveCount(2);
     await expect(page.locator('.timeline .turn')).toHaveCount(0);
     await expect(row.locator('.runchip.now')).toContainText('新班次');
@@ -1752,9 +1759,11 @@ test.describe('对讲台 · 班次（决策 204）', () => {
 
     // 本机开一班新的（⋯ 的第一项），拿到一条干净的当前班次。
     // 按**名字**找它而不是 `/新班次/`：本组共用一个 app，上一群用例开出来的班次
-    // 默认标题就叫「新班次 <时间>」，正则于是同时命中两枚按钮（实测 strict mode 报错）。
+    // 默认标题就叫「新班次 <时间>」，正则于是同时命中两枚按钮（实测 strict mode 报错）；
+    // 决策 424 起裸串 `+ 新班次` 也命中两枚菜单项了（默认引擎 / claude code），
+    // 故指名要默认引擎那一颗。
     await more.click();
-    await menu.getByRole('button', { name: '+ 新班次' }).click();
+    await menu.getByRole('button', { name: '+ 新班次（默认引擎）' }).click();
     await expect(page.locator('.timeline .turn')).toHaveCount(0);
 
     // 说一句话（POST 被拖住）
@@ -1813,7 +1822,10 @@ test.describe('对讲台 · 班次（决策 204）', () => {
     // 先**离开**它：它刚建出来时是最活跃的那一条，故装载后当前班次正是它——
     // 那样一来它的增量带的就是 `session_id == currentId`，压根不是「别的班次」
     await page.locator('.talk-head .more').click();
-    await page.locator('#talk-session-menu').getByRole('button', { name: '+ 新班次' }).click();
+    await page
+      .locator('#talk-session-menu')
+      .getByRole('button', { name: '+ 新班次（默认引擎）' })
+      .click();
     await expect(page.locator('.talk-head .sess-name')).not.toHaveText('远端那一班');
     // 等那条 SSE 真的连上（增量会广播到所有订阅者，接不上就什么都收不到）
     await page.waitForTimeout(1500);
